@@ -162,3 +162,71 @@ func (s *SubtransSLRU) GetParent(xid storage.TransactionID) (storage.Transaction
 		storage.TransactionID(le[3])<<24
 	return parent, nil
 }
+
+// ScanParents reads every segment file under the SLRU directory and returns the
+// recorded subxid → parent links (gap G5 read path / restore-on-restart). It is
+// the inverse of the page/segment arithmetic in subtransLocate + SetParent:
+//
+//	xid = segNo*subtransXactsPerSegment
+//	    + pageInSeg*subtransXactsPerPage
+//	    + xidInPage
+//
+// Only slots whose parent is a normal XID (>= FirstNormalTransactionID) are
+// returned; zero slots — never-written entries, and the bootstrap-zeroed 0000
+// segment created by initdb — are skipped, so a freshly-initialised cluster
+// scans to an empty map. A segment that was extended only far enough to hold its
+// highest written slot yields a short final page; whatever bytes exist are
+// decoded and any trailing partial slot is ignored. Mirrors the structure of
+// clog.go's SLRU backfill on the recovery path.
+func (s *SubtransSLRU) ScanParents() (map[storage.TransactionID]storage.TransactionID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make(map[storage.TransactionID]storage.TransactionID)
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return out, nil
+		}
+		return nil, fmt.Errorf("subtrans slru: readdir %q: %w", s.dir, err)
+	}
+
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		// Segment files are named exactly "%04X" (4 uppercase hex digits).
+		var segNo uint64
+		if n, perr := fmt.Sscanf(name, "%04X", &segNo); perr != nil || n != 1 || len(name) != 4 {
+			continue
+		}
+		segPath := filepath.Join(s.dir, name)
+		data, rerr := os.ReadFile(segPath)
+		if rerr != nil {
+			return nil, fmt.Errorf("subtrans slru: read %q: %w", segPath, rerr)
+		}
+		segBase := segNo * subtransXactsPerSegment
+		// Walk every complete 4-byte slot; a slot maps to its XID via the page
+		// layout (subtransPagesPerSegment pages of subtransXactsPerPage slots).
+		nSlots := len(data) / subtransBytesPerXact
+		for slot := 0; slot < nSlots; slot++ {
+			off := slot * subtransBytesPerXact
+			parent := storage.TransactionID(data[off]) |
+				storage.TransactionID(data[off+1])<<8 |
+				storage.TransactionID(data[off+2])<<16 |
+				storage.TransactionID(data[off+3])<<24
+			if parent < FirstNormalTransactionID {
+				continue // zero/unset slot, or a non-normal parent we never write
+			}
+			pageInSeg := uint64(off) / uint64(storage.BlockSize)
+			xidInPage := (uint64(off) % uint64(storage.BlockSize)) / subtransBytesPerXact
+			xid := storage.TransactionID(segBase + pageInSeg*subtransXactsPerPage + xidInPage)
+			if xid < FirstNormalTransactionID {
+				continue
+			}
+			out[xid] = parent
+		}
+	}
+	return out, nil
+}

@@ -1,7 +1,9 @@
 package mvcc
 
 import (
+	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -56,6 +58,42 @@ func (m *SubxactMap) EnablePersistence(dir string) error {
 	m.slru = slru
 	m.mu.Unlock()
 	return nil
+}
+
+// RestoreFromSLRU reloads every persisted parent link from the on-disk
+// pg_subtrans SLRU into the in-memory map (gap G5 read path / restore-on-restart).
+// It must be called after EnablePersistence; a nil SLRU returns an error so a
+// mis-wired caller fails loudly rather than silently restoring nothing. Returns
+// the number of links restored.
+//
+// Restored links are merged into the existing parents map (in-memory entries
+// registered before the restore are preserved; a persisted link overwrites an
+// in-memory entry for the same subxid, which cannot differ in a correct cluster).
+// Abort status is NOT restored — PG's pg_subtrans stores only parent links, and
+// abort/commit status lives in CLOG / in-memory (see Register / MarkAborted).
+//
+// Note: PostgreSQL zeroes pg_subtrans on startup (subtrans.c StartupSUBTRANS);
+// goopg deliberately restores it so subxact parentage survives a restart for the
+// G5 consumers (durable standby resolution, 2PC, post-backend-exit readers). This
+// only redirects a sub-XID to its top-level ancestor; the ancestor's own
+// commit/abort decision is unchanged, so it never makes a tuple more visible.
+func (m *SubxactMap) RestoreFromSLRU() (int, error) {
+	m.mu.RLock()
+	slru := m.slru
+	m.mu.RUnlock()
+	if slru == nil {
+		return 0, fmt.Errorf("subxact map: RestoreFromSLRU called before EnablePersistence")
+	}
+	links, err := slru.ScanParents()
+	if err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	for subxid, parent := range links {
+		m.parents[subxid] = parent
+	}
+	m.mu.Unlock()
+	return len(links), nil
 }
 
 // Register records that subxid is a child of parentXid. Must be called
@@ -291,17 +329,36 @@ func (m *Manager) markSubxactAborted(subxid storage.TransactionID) {
 
 // RegisterSubXid records that subxid is a child of parentXid.
 // Called when a subtransaction first writes (lazy XID allocation).
+// When a persistent SubxactMap is attached (SetSubxactMap), the link is written
+// through to it — and thus to the on-disk pg_subtrans SLRU (M0117-0003).
 func (m *Manager) RegisterSubXid(subxid, parentXid storage.TransactionID) {
+	if sm := m.attachedSubxactMap(); sm != nil {
+		sm.Register(subxid, parentXid)
+		return
+	}
 	m.addSubxactEntry(subxid, parentXid)
 }
 
 // MarkSubxactAborted records that subxid was individually rolled back.
 func (m *Manager) MarkSubxactAborted(subxid storage.TransactionID) {
+	if sm := m.attachedSubxactMap(); sm != nil {
+		sm.MarkAborted(subxid)
+		return
+	}
 	m.markSubxactAborted(subxid)
+}
+
+// attachedSubxactMap returns the persistent SubxactMap installed via
+// SetSubxactMap, or nil when none is attached (the default v0 path).
+func (m *Manager) attachedSubxactMap() *SubxactMap {
+	return m.subxactMap.Load()
 }
 
 // TopLevelXid resolves xid to its top-level ancestor.
 func (m *Manager) TopLevelXid(xid storage.TransactionID) storage.TransactionID {
+	if sm := m.attachedSubxactMap(); sm != nil {
+		return sm.TopLevelXid(xid)
+	}
 	m.subxactMu.RLock()
 	defer m.subxactMu.RUnlock()
 	if m.subxactParents == nil {
@@ -319,6 +376,9 @@ func (m *Manager) TopLevelXid(xid storage.TransactionID) storage.TransactionID {
 
 // IsAborted reports whether xid was individually rolled back.
 func (m *Manager) IsAborted(xid storage.TransactionID) bool {
+	if sm := m.attachedSubxactMap(); sm != nil {
+		return sm.IsAborted(xid)
+	}
 	m.subxactMu.RLock()
 	v := m.subxactAborted[xid]
 	m.subxactMu.RUnlock()
@@ -327,6 +387,9 @@ func (m *Manager) IsAborted(xid storage.TransactionID) bool {
 
 // IsSubxact reports whether xid is a registered subxact XID.
 func (m *Manager) IsSubxact(xid storage.TransactionID) bool {
+	if sm := m.attachedSubxactMap(); sm != nil {
+		return sm.IsSubxact(xid)
+	}
 	m.subxactMu.RLock()
 	_, ok := m.subxactParents[xid]
 	m.subxactMu.RUnlock()
@@ -340,4 +403,28 @@ type subxactFields struct {
 	subxactMu      sync.RWMutex
 	subxactParents map[storage.TransactionID]storage.TransactionID
 	subxactAborted map[storage.TransactionID]bool
+
+	// subxactMap, when non-nil, is the persistent pg_subtrans-backed store
+	// installed by initdb.Open via SetSubxactMap (M0117-0003). When attached it
+	// is the authoritative subxact store: RegisterSubXid/MarkSubxactAborted write
+	// through to it (and thus to the on-disk SLRU), and TopLevelXid/IsAborted/
+	// IsSubxact resolve from it. nil (the default, and every test) keeps the pure
+	// in-memory subxactParents/subxactAborted behaviour byte-identical to v0.
+	//
+	// Stored in an atomic pointer (not under subxactMu) because TupleVisibleSubxact
+	// consults the resolver on the per-tuple visibility hot path: a plain
+	// load-the-attachment must be lock-free so the nil (default) case costs one
+	// atomic load, not an extra RWMutex acquisition per tuple. Set once at startup
+	// before any query runs (initdb.Open), so a relaxed atomic load is sufficient.
+	subxactMap atomic.Pointer[SubxactMap]
+}
+
+// SetSubxactMap installs the persistent pg_subtrans-backed subxact store
+// (M0117-0003), mirroring SetCLog. After this call the Manager routes all
+// subxact registration and resolution through m (so parent links are persisted
+// to and restored from the on-disk pg_subtrans SLRU). Passing nil restores the
+// pure in-memory v0 behaviour. Intended to be called once during startup/recovery
+// wiring (initdb.Open), after the map has been restored via RestoreFromSLRU.
+func (m *Manager) SetSubxactMap(sm *SubxactMap) {
+	m.subxactMap.Store(sm)
 }
