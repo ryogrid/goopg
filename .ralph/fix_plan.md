@@ -1006,6 +1006,36 @@ Porting validates goopg's WAL record format compatibility with upstream.
       - Action: 001_basic CLI tier ported (loop #17). Resume = promote WD-002
         when goopg gains the index access methods the server-tier workload
         needs (hash/gin/gist/spgist/brin) + FPI extraction for 002.
+      - **PROGRESS 2026-06-14 (loop #17):** `002_save_fullpage.pl` ported as a
+        self-promoting reproduction `TestPort_PgWaldump002SaveFullpage`
+        (`internal/testport/pgwaldump_savefullpage_test.go`). It drives the full
+        `pg_waldump --save-fullpage --relation` extraction (goopg emits
+        PG-compatible FPIs via the checkpointer FPI epoch, writes a full
+        `RelFileLocator` spc=1663/db/relNumber, and `pg_relation_filenode`
+        returns the reloid that matches), and asserts the upstream filename
+        format + page-LSN ≤ file-LSN ordering — but currently `t.Skip`s on a
+        REAL goopg blocker it uncovered: **goopg writes `xl_prev` as a 1-based
+        LSN on disk**, so `pg_waldump` (0-based, anchored on the segment file
+        name) aborts the record-chain walk at the 2nd record (`incorrect
+        prev-link 0/1000029 at 0/10000A0`, constant +1). Origin: `internal/wal/
+        writer.go` (~L1346/L1491 `start=writePos+leading+1`) → `insert_pos.go`
+        `reserveLocked t.prev=old` → `format.go:263 encodeRecordXLog` writes it
+        verbatim. Fixing it is a coordinated WAL encode↔decode change (goopg's
+        own recovery decode + the M0102 walsender must stay consistent), so it
+        is its own WAL-correctness loop — see deferral ledger + design doc
+        `0110-0002`. The test auto-promotes once `xl_prev` is emitted 0-based.
+      - **ALSO UNCOVERED (loop #17):** `TestPort_WALPgWaldumpCompat` (row W-001,
+        M0101-0003, `pass_required=yes`) is **silently red**: goopg's WAL
+        segment names are now native PG-format (TLI=1 prefix, e.g.
+        `000000010000000000000001`), but W-001 still parses them as plain hex
+        segment numbers (`strconv.ParseUint(name,16,64)` overflows on 24 hex
+        chars) and rewrites a timeline alias, so it `t.Fatal`s at "no WAL
+        segments found" before running `pg_waldump`. Oracle tests are excluded
+        from `go test ./...`, so this escaped notice. Repair (own follow-up,
+        M0101-0003): switch W-001 to native-PG segment discovery (reuse
+        `listWALSegments`/`isHex24` from the new file), then it will hit the
+        same prev-link blocker → it should `t.Skip` on it too until the WAL fix
+        lands.
 
 ### pg_amcheck (5 tests — excluded → candidate)
 
