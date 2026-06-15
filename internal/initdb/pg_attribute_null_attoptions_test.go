@@ -19,16 +19,17 @@ import (
 // being formatted → ERRORDATA_STACK_SIZE PANIC at every backend start.
 func TestPgAttributeRowEmitsNullForOptionalArrayColumns(t *testing.T) {
 	row := pgAttributeRow(2684, nailedAttr{Name: "nspname", TypeOID: 19, Num: 1, Len: 64, NotNull: true})
-	if len(row) != 24 {
-		t.Fatalf("pgAttributeRow: expected 24 columns, got %d", len(row))
+	if len(row) != 25 {
+		t.Fatalf("pgAttributeRow: expected 25 columns, got %d", len(row))
 	}
-	// The four trailing nullable columns in pg_attribute that
-	// RelationGetIndexAttOptions inspects.
+	// The four trailing nullable varlena columns that
+	// RelationGetIndexAttOptions inspects, plus attstattarget (also NULL).
 	nullable := map[int]string{
 		20: "attacl",
 		21: "attoptions",
 		22: "attfdwoptions",
 		23: "attmissingval",
+		24: "attstattarget",
 	}
 	for idx, name := range nullable {
 		if !row[idx].IsNull() {

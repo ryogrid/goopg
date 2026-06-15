@@ -105,6 +105,65 @@ func TestRegclassCast_ParamLookup(t *testing.T) {
 	}
 }
 
+// TestTableoidColumnName pins the RowDescription field NAME for a bare
+// `tableoid` system-column projection. resolveColumnRefAt lowers
+// `tableoid` on a non-partitioned base relation to a constant
+// TableOidExpr; pre-fix the planner's targetMeta had no case for that
+// node so the output column was labelled `?column?` instead of
+// `tableoid`. pg_dump's getNamespaces does PQfnumber(res,"tableoid")
+// and segfaults (SIGSEGV) when that returns -1, so the label is
+// load-bearing for pg_dump parity (DU-002 slice 3). The value path is
+// already covered by TestTableoidRegclass_NonPartitioned.
+func TestTableoidColumnName(t *testing.T) {
+	addr, _, stop := startCopyExecServer(t)
+	defer stop()
+
+	colonIdx := strings.LastIndex(addr, ":")
+	if colonIdx < 0 {
+		t.Fatalf("addr: %s", addr)
+	}
+	host, port := addr[:colonIdx], addr[colonIdx+1:]
+	dsn := "host=" + host + " port=" + port + " user=postgres dbname=postgres sslmode=disable"
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+
+	for _, q := range []string{
+		`DROP TABLE IF EXISTS toid_name`,
+		`CREATE TABLE toid_name (a int, b text)`,
+		`INSERT INTO toid_name VALUES (1, 'x')`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatalf("setup %q: %v", q, err)
+		}
+	}
+
+	// Both bare and table-qualified references must label the field
+	// `tableoid` in the RowDescription.
+	for _, q := range []string{
+		`SELECT tableoid FROM toid_name`,
+		`SELECT toid_name.tableoid FROM toid_name`,
+	} {
+		rows, err := db.QueryContext(ctx, q)
+		if err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+		cols, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			t.Fatalf("%s: Columns: %v", q, err)
+		}
+		rows.Close()
+		if len(cols) != 1 || cols[0] != "tableoid" {
+			t.Fatalf("%s: column names = %v, want [tableoid]", q, cols)
+		}
+	}
+}
+
 // TestTableoidRegclass_Partitioned pins the per-leaf partition union
 // wrapping (planFromTable's partition arm calling wrapWithTableoid)
 // plus the rangeBinding.tableOidColIdx accounting that makes

@@ -1098,6 +1098,661 @@ object support.
         Design doc `0110-0001` extended (Connection-setup compatibility section).
         Resume = add `oid` to the `pg_roles` view, then continue getRoles →
         getTablespaces → getNamespaces… per setup_connection's query order.
+      - **PROGRESS 2026-06-15 (loop #23):** **DU-002 slice 1 (`pg_roles.oid`)
+        LANDED** — collectRoleNames' `SELECT oid, rolname FROM pg_roles ORDER BY 1`
+        now works. (commit `20d242a2`.)
+      - **PROGRESS 2026-06-15 (loop #24):** **DU-002 slice 2 (`acldefault()`)
+        LANDED.** getNamespaces runs `acldefault('n', n.nspowner)`; added the
+        `acldefault("char", oid)` builtin (`internal/executor/expr.go`,
+        `evalAclDefault`) mirroring `acldefault_sql()` in `acl.c` — computes
+        hard-wired default privileges per object-type char and renders aclitem[]
+        text (`acldefault('n', 10)` → `{postgres=UC/postgres}`). Already seeded in
+        pg_proc (OID 3943); only the executor handler was missing. Unit guard
+        `executor.TestEvalAclDefault` pins all 13 object types + privilege order.
+        Verified live: full getNamespaces query returns all 6 columns correctly.
+        **Next blocker (precise):** pg_dump still SEGFAULTs in "reading schemas"
+        because `n.tableoid` (first projected column) comes back labelled
+        `?column?` instead of `tableoid`, so `PQfnumber(res,"tableoid")` → -1 and
+        the client reads out of bounds (`column number -1 is out of range 0..5`,
+        exit 139). The value is correct (2615); only the RowDescription field name
+        is wrong — for EVERY table, so it's a planner output-column-naming bug for
+        the `tableoid` system column. Resume = fix `tableoid` column labelling,
+        then continue getTypes → getTables… per pg_dump's getter order.
+      - **PROGRESS 2026-06-16 (loop #26):** **DU-002 slice 3 (`tableoid` column
+        label) LANDED.** Root cause: `resolveColumnRefAt` lowers a bare `tableoid`
+        on a non-partitioned base relation to a constant `*TableOidExpr`, but the
+        planner's `targetMeta` (`internal/planner/planner.go`) had no case for that
+        node (only the cast-wrapped `tableoid::regclass` form), so it fell through
+        to `?column?`. Fix = added a `*TableOidExpr` arm returning `("tableoid",
+        oid)`, mirroring the existing `*CTIDExpr` → `"ctid"` case. Analyzer/executor
+        naming twins operate on the parser AST (still `*parser.ColumnRef`) and were
+        already correct. Unit guard `server.TestTableoidColumnName`. Verified live
+        via `TestPort_PgDumpConnectionSetup`: pg_dump now passes "reading schemas"
+        (no segfault) and advances to getTables.
+        **Next blocker (precise):** getTables fails with `relation "pg_depend" does
+        not exist` — pg_dump's getTables joins `pg_class LEFT JOIN pg_depend` (and
+        `pg_tablespace`, `pg_am`, `pg_class tc` for TOAST). Resume = add a
+        `pg_depend` catalog view (slice 4), then continue the getter battery.
+      - **PROGRESS 2026-06-16 (loop #27):** **DU-002 slice 4 (getTables catalog
+        views) LANDED.** getTables (`pg_dump.c:7080-7239`) touches three relations
+        not previously exposed to the SQL query layer; all three added as virtual
+        catalog views in `internal/catalog/catalog.go` (next to `pg_am`), schemas
+        matching upstream exactly: **`pg_depend`** (OID 2608) — empty (goopg keeps
+        no dependency graph → LEFT JOIN yields NULL owning_tab/owning_col,
+        is_identity_sequence=false); **`pg_tablespace`** (OID 1213) — bootstrap
+        pg_default(1663)/pg_global(1664) + M0095-0003 runtime in-place tablespaces,
+        OID-ordered (`tablespaceVirtualRows`, read-locked); **`pg_foreign_table`**
+        (OID 3118) — empty (no FDW support). Unit guards
+        `catalog.TestPgTablespaceVirtualView` + `catalog.TestPgDependAndForeignTableViews`.
+        Build clean; catalog/executor/server/planner suites PASS.
+        **Next blocker (precise):** getTables now resolves all relations but fails
+        with `function array_remove does not exist` — used to strip
+        `check_option=…` from `c.reloptions`. Resume = add the `array_remove()`
+        scalar builtin (slice 5), then continue the getter battery.
+      - **PROGRESS 2026-06-16 (loop #28):** **DU-002 slice 5 (`array_remove()`
+        scalar builtin) LANDED.** getTables' `reloptions` projection
+        `array_remove(array_remove(c.reloptions,'check_option=local'),
+        'check_option=cascaded')` aborted with `function array_remove does not
+        exist`. The function was already seeded in `pg_proc` (OID 3167); only the
+        executor handler was missing (dispatch fell through to
+        `evalStoredRoutineFuncCall` → 42883). Added the `array_remove(anyarray,
+        anyelement)` case to `evalFuncCall` (`internal/executor/expr.go`, beside
+        `array_append`/`array_cat`): removes every element equal to arg 2 from
+        goopg's text-array form (`parseTextArray`/`formatTextArray`); formatted
+        element-text equality matching the sibling array builtins (NULL element →
+        the `"NULL"` placeholder), NULL array → NULL (PG array_remove is NotStrict
+        on the element, array-strict). Unit guards `executor.TestEvalArrayRemove`
+        + `executor.TestEvalArrayRemoveNested`. Build/vet clean; executor suite
+        PASS; `TestPort_PgDumpConnectionSetup` PASS (getTables now completes).
+        **Next blocker (precise):** pg_dump's `getFuncs` query LEFT-JOINs
+        `pg_init_privs` (diffing stored `proacl` vs. initial privileges), which
+        goopg does not expose → `relation "pg_init_privs" does not exist`. Resume
+        = add the `pg_init_privs` virtual view (empty — no extension-installed
+        initial privileges) as slice 6, then continue the getter battery.
+      - **PROGRESS 2026-06-16 (loop #29):** **DU-002 slice 6 (`pg_init_privs`
+        virtual view) LANDED.** `getFuncs` (like `getTables`/`getTypes`/…)
+        LEFT-JOINs `pg_init_privs pip ON (p.oid=pip.objoid AND
+        pip.classoid='pg_proc'::regclass AND pip.objsubid=0)` to diff stored
+        `proacl` vs. initial privileges; the missing relation aborted with
+        `relation "pg_init_privs" does not exist`. Added the `pg_init_privs`
+        virtual view (`internal/catalog/catalog.go`, beside the slice-4
+        `pg_depend`/`pg_tablespace`/`pg_foreign_table` block) with PG's exact
+        schema (`objoid oid, classoid oid, objsubid int4, privtype "char",
+        initprivs aclitem[]`, OID 3394, and — like the upstream catalog — NO `oid`
+        system column). **Empty by construction**: goopg installs no extensions
+        and snapshots no initdb ACLs, so the LEFT JOIN yields NULL `pip.initprivs`
+        and the `proacl IS DISTINCT FROM pip.initprivs` predicate degenerates to
+        "dump the full ACL" (correct). Build/gofmt/vet clean; catalog + executor
+        suites PASS; `TestPort_PgDumpConnectionSetup` PASS (getFuncs now resolves
+        `pg_init_privs`). **Next blocker (precise):** `getFuncs` projects
+        `p.pronargs`, `p.proacl`, `p.proowner` and filters on `pg_cast`/
+        `pg_transform`, none exposed → `column p.pronargs does not exist`. Resume
+        = add those three `pg_proc` columns (`internal/initdb/pg_proc_view.go`)
+        plus the empty `pg_cast`/`pg_transform` views as slice 7.
+      - **PROGRESS 2026-06-16 (loop #30):** **DU-002 slice 7 (`pg_proc`
+        `pronargs`/`proacl`/`proowner` + `pg_cast`/`pg_transform` views) LANDED.**
+        `getFuncs` projects `p.pronargs, …, p.proacl, …, p.proowner` and admits a
+        `pg_catalog` function only via `EXISTS` over `pg_cast.castfunc` /
+        `pg_transform.trffromsql|trftosql`; it aborted at `column p.pronargs does
+        not exist`. Added three columns to `registerPgProcView`
+        (`internal/initdb/pg_proc_view.go`): `pronargs int2` = `len(proargtypes)`,
+        `proacl aclitem[]` = NULL (no per-routine grants), `proowner oid` = 10
+        (bootstrap superuser) — updated **both** row-builders (builtinProcs loop +
+        user-routine loop, sibling paths). Added empty `pg_cast` (OID 2605) and
+        `pg_transform` (OID 3576) virtual views (`internal/catalog/catalog.go`,
+        beside `pg_init_privs`) with PG's exact schemas; both empty by construction
+        (goopg registers no user casts/transforms → both `EXISTS` always false →
+        only built-in funcs/casts excluded, correct). `castfunc`/`trffromsql`/
+        `trftosql` typed `oid` (PG uses oid-compatible `regproc`) so `p.oid = …`
+        resolves. Build/gofmt/vet clean; catalog + initdb suites PASS
+        (`TestPgProcViewRendersRoutine` updated for the new column positions +
+        asserts pronargs/proacl/proowner); `TestPort_PgDumpConnectionSetup` PASS —
+        `getFuncs` now completes. **Next blocker (precise):** `getProcLangs` runs
+        `SELECT … FROM pg_language WHERE lanispl ORDER BY oid`; goopg has no
+        `pg_language` view → `relation "pg_language" does not exist`. Resume = add
+        an empty `pg_language` virtual view as slice 8 (built-in PLs are filtered
+        by `lanispl`, so empty is correct — only user PLs are dumped).
+      - **PROGRESS 2026-06-16 (loop #31):** **DU-002 slice 8 (`pg_language`
+        view) LANDED.** `getProcLangs` runs `SELECT tableoid, oid, lanname,
+        lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl,
+        acldefault('l', lanowner) AS acldefault, lanowner FROM pg_language WHERE
+        lanispl ORDER BY oid`; it aborted at `relation "pg_language" does not
+        exist`. Added the empty `pg_language` virtual view
+        (`internal/catalog/catalog.go`, OID 2612, beside `pg_transform`) with the
+        `pg_language.h` schema (`oid, lanname name, lanowner oid, lanispl bool,
+        lanpltrusted bool, lanplcallfoid oid, laninline oid, lanvalidator oid,
+        lanacl aclitem[]`). Empty by construction: `WHERE lanispl` filters out the
+        built-in `internal`/`c`/`sql` langs (lanispl=false, never dumped), and
+        goopg has no user PLs. `lanowner` typed `oid` so `acldefault('l',
+        lanowner)` resolves. Build/gofmt/vet clean; catalog + initdb suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS — `getProcLangs` now completes.
+        **Next blocker (precise):** `getOperators` runs `SELECT tableoid, oid,
+        oprname, oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid
+        AS oprcode FROM pg_operator`; goopg has no `pg_operator` view → `relation
+        "pg_operator" does not exist`. Resume = add an empty `pg_operator` virtual
+        view as slice 9 (built-in operators live in pg_catalog, filtered out by
+        namespace dumpability, so empty is correct — only user operators dumped).
+      - **PROGRESS 2026-06-16 (loop #32):** **DU-002 slice 9 (`pg_operator`
+        view) LANDED.** `getOperators` runs `SELECT tableoid, oid, oprname,
+        oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid AS
+        oprcode FROM pg_operator`; it aborted at `relation "pg_operator" does
+        not exist`. Added the empty `pg_operator` virtual view
+        (`internal/catalog/catalog.go`, OID 2617, beside `pg_language`) with the
+        `pg_operator.h` schema (`oid, oprname name, oprnamespace oid, oprowner
+        oid, oprkind char, oprcanmerge bool, oprcanhash bool, oprleft oid,
+        oprright oid, oprresult oid, oprcom oid, oprnegate oid, oprcode oid,
+        oprrest oid, oprjoin oid`). Empty by construction: getOperators reads all
+        operators and filters out system-defined ones at dump-out time by
+        namespace dumpability — built-ins live in pg_catalog (never dumped),
+        goopg defines no user operators. `oprcode` is regproc in PG but
+        oid-compatible → typed `oid` so `oprcode::oid` resolves as a no-op.
+        Build/gofmt/vet clean; `TestPort_PgDumpConnectionSetup` PASS —
+        `getOperators` now completes. **Next blocker (precise):** `getOpclasses`
+        runs `SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner
+        FROM pg_opclass`; goopg has no `pg_opclass` view → `relation
+        "pg_opclass" does not exist`. Resume = add an empty `pg_opclass` virtual
+        view as slice 10 (built-in operator classes live in pg_catalog, filtered
+        out by namespace dumpability, so empty is correct).
+      - **PROGRESS 2026-06-16 (loop #33):** **DU-002 slice 10 (`pg_opclass`
+        view) LANDED.** `getOpclasses` runs `SELECT tableoid, oid, opcmethod,
+        opcname, opcnamespace, opcowner FROM pg_opclass`; it aborted at
+        `relation "pg_opclass" does not exist`. Added the empty `pg_opclass`
+        virtual view (`internal/catalog/catalog.go`, OID 2616, beside
+        `pg_operator`) with the `pg_opclass.h` schema (`oid, opcmethod oid,
+        opcname name, opcnamespace oid, opcowner oid, opcfamily oid, opcintype
+        oid, opcdefault bool, opckeytype oid`). Empty by construction:
+        getOpclasses reads all operator classes and filters out system-defined
+        ones at dump-out time by namespace dumpability — built-ins live in
+        pg_catalog (never dumped), goopg defines no user operator classes.
+        Build/gofmt/vet clean; catalog + initdb suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS — `getOpclasses` now completes.
+        **Next blocker (precise):** `getOpfamilies` runs `SELECT tableoid, oid,
+        opfmethod, opfname, opfnamespace, opfowner FROM pg_opfamily`; goopg has
+        no `pg_opfamily` view → `relation "pg_opfamily" does not exist`. Resume
+        = add an empty `pg_opfamily` virtual view as slice 11 (built-in operator
+        families live in pg_catalog, filtered out by namespace dumpability, so
+        empty is correct).
+      - **PROGRESS 2026-06-16 (loop #34):** **DU-002 slice 11 (`pg_opfamily`
+        view) LANDED.** `getOpfamilies` runs `SELECT tableoid, oid, opfmethod,
+        opfname, opfnamespace, opfowner FROM pg_opfamily`; it aborted at
+        `relation "pg_opfamily" does not exist`. Added the empty `pg_opfamily`
+        virtual view (`internal/catalog/catalog.go`, OID 2753, beside
+        `pg_opclass`) with the `pg_opfamily.h` schema (`oid, opfmethod oid,
+        opfname name, opfnamespace oid, opfowner oid`). Empty by construction:
+        getOpfamilies reads all operator families and filters out system-defined
+        ones at dump-out time by namespace dumpability — built-ins live in
+        pg_catalog (never dumped), goopg defines no user operator families.
+        Build/gofmt/vet clean; catalog + initdb suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS — `getOpfamilies` now completes.
+        **Next blocker (precise):** `getTSParsers` runs `SELECT tableoid, oid,
+        prsname, prsnamespace, prsstart::oid, prstoken::oid, prsend::oid,
+        prsheadline::oid, prslextype::oid FROM pg_ts_parser`; goopg has no
+        `pg_ts_parser` view → `relation "pg_ts_parser" does not exist`. Resume =
+        add an empty `pg_ts_parser` virtual view as slice 12 (built-in
+        text-search parsers live in pg_catalog, filtered out by namespace
+        dumpability, so empty is correct).
+      - **PROGRESS 2026-06-16 (loop #35):** **DU-002 slice 12 (`pg_ts_parser`
+        view) LANDED.** `getTSParsers` runs `SELECT tableoid, oid, prsname,
+        prsnamespace, prsstart::oid, prstoken::oid, prsend::oid,
+        prsheadline::oid, prslextype::oid FROM pg_ts_parser`; it aborted at
+        `relation "pg_ts_parser" does not exist`. Added the empty `pg_ts_parser`
+        virtual view (`internal/catalog/catalog.go`, OID 3601, beside
+        `pg_opfamily`) with the `pg_ts_parser.h` schema (`oid, prsname name,
+        prsnamespace oid, prsstart/prstoken/prsend/prsheadline/prslextype
+        regproc`); `::oid` casts are no-ops (regproc is oid-compatible). Empty by
+        construction: built-in TS parsers live in pg_catalog (never dumped),
+        goopg defines no user TS parsers. Build/gofmt/vet clean; catalog +
+        initdb suites PASS; `TestPort_PgDumpConnectionSetup` PASS — `getTSParsers`
+        now completes, and `getTSDictionaries` (`FROM pg_ts_dict`) ALSO passes:
+        `pg_ts_dict` already exists as a real nailed on-disk catalog seeded by
+        initdb, so it needed no new view. **Next blocker (precise):**
+        `getTSTemplates` runs `SELECT tableoid, oid, tmplname, tmplnamespace,
+        tmplinit::oid, tmpllexize::oid FROM pg_ts_template`; goopg has no
+        `pg_ts_template` view → `relation "pg_ts_template" does not exist`.
+        Resume = add an empty `pg_ts_template` virtual view as slice 13
+        (built-in TS templates live in pg_catalog, filtered out by namespace
+        dumpability, so empty is correct).
+      - **PROGRESS 2026-06-16 (loop #36):** **DU-002 slice 13 (`pg_ts_template`
+        view) LANDED.** `getTSTemplates` runs `SELECT tableoid, oid, tmplname,
+        tmplnamespace, tmplinit::oid, tmpllexize::oid FROM pg_ts_template`; it
+        aborted at `relation "pg_ts_template" does not exist`. Added the empty
+        `pg_ts_template` virtual view (`internal/catalog/catalog.go`, OID 3764,
+        beside `pg_ts_parser`) with the `pg_ts_template.h` schema (`oid,
+        tmplname name, tmplnamespace oid, tmplinit regproc, tmpllexize
+        regproc`); `::oid` casts are no-ops (regproc is oid-compatible). Empty
+        by construction: built-in TS templates live in pg_catalog (filtered out
+        by namespace dumpability), goopg defines no user TS templates.
+        Build/gofmt/vet clean; catalog + initdb suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS — `getTSTemplates` now completes.
+        **CORRECTION:** slice 12's note that `getTSDictionaries`/`pg_ts_dict`
+        "already passes" was a MISREAD — `getTSDictionaries` runs AFTER
+        `getTSTemplates`, so the dump aborted at `getTSTemplates` before ever
+        reaching it. **Next blocker (precise):** `getTSDictionaries` runs
+        `SELECT tableoid, oid, dictname, dictnamespace, dictowner, dicttemplate,
+        dictinitoption FROM pg_ts_dict` → `relation "pg_ts_dict" does not
+        exist`. Although initdb seeds a `pg_class` entry for pg_ts_dict (OID
+        3600), goopg's query layer resolves system catalogs via the in-memory
+        virtual-view registry, NOT the on-disk heap, so the seeded row is
+        invisible to pg_dump's SELECT. Resume = add an empty `pg_ts_dict`
+        virtual view as slice 14 (built-in TS dictionaries live in pg_catalog,
+        filtered out by namespace dumpability, so empty is correct).
+      - **PROGRESS 2026-06-16 (loop #37):** **DU-002 slice 14 (`pg_ts_dict`
+        view) LANDED.** `getTSDictionaries` runs `SELECT tableoid, oid,
+        dictname, dictnamespace, dictowner, dicttemplate, dictinitoption FROM
+        pg_ts_dict`; it aborted at `relation "pg_ts_dict" does not exist`. Added
+        the empty `pg_ts_dict` virtual view (`internal/catalog/catalog.go`, OID
+        3600, beside `pg_ts_template`) with the `pg_ts_dict.h` schema (`oid,
+        dictname name, dictnamespace oid, dictowner oid, dicttemplate oid,
+        dictinitoption text`); `dicttemplate` is an `oid` FK to pg_ts_template
+        (not a regproc), `dictinitoption` is text. Empty by construction:
+        built-in TS dictionaries live in pg_catalog (filtered out by namespace
+        dumpability), goopg defines no user TS dictionaries. Build/gofmt/vet
+        clean; catalog + initdb suites PASS; `TestPort_PgDumpConnectionSetup`
+        PASS — `getTSDictionaries` now completes. **Next blocker (precise):**
+        `getTSConfigurations` runs `SELECT tableoid, oid, cfgname, cfgnamespace,
+        cfgowner, cfgparser FROM pg_ts_config` → `relation "pg_ts_config" does
+        not exist`. Resume = add an empty `pg_ts_config` virtual view as slice
+        15 (built-in TS configs live in pg_catalog, filtered out by namespace
+        dumpability, so empty is correct).
+      - **PROGRESS 2026-06-16 (loop #38):** **DU-002 slice 15 (`pg_ts_config`
+        view) LANDED.** `getTSConfigurations` runs `SELECT tableoid, oid,
+        cfgname, cfgnamespace, cfgowner, cfgparser FROM pg_ts_config`; it aborted
+        at `relation "pg_ts_config" does not exist`. Added the empty
+        `pg_ts_config` virtual view (`internal/catalog/catalog.go`, OID 3602,
+        beside `pg_ts_dict`) with the `pg_ts_config.h` schema (`oid, cfgname
+        name, cfgnamespace oid, cfgowner oid, cfgparser oid`); `cfgparser` is an
+        `oid` FK to pg_ts_parser. Empty by construction: built-in TS configs
+        live in pg_catalog (filtered out by namespace dumpability), goopg
+        defines no user TS configs. Build/gofmt/vet clean; catalog + initdb
+        suites PASS; `TestPort_PgDumpConnectionSetup` PASS — `getTSConfigurations`
+        now completes. **Next blocker (precise, confirmed empirically):**
+        `getForeignDataWrappers` runs `SELECT tableoid, oid, fdwname, fdwowner,
+        fdwhandler::pg_catalog.regproc, fdwvalidator::pg_catalog.regproc,
+        fdwacl, …, array_to_string(…fdwoptions…) AS fdwoptions FROM
+        pg_foreign_data_wrapper` → `relation "pg_foreign_data_wrapper" does not
+        exist`. Resume = add an empty `pg_foreign_data_wrapper` virtual view as
+        slice 16 (goopg has no FDWs by default, so empty is correct; fdwhandler/
+        fdwvalidator are oid cols cast to regproc by pg_dump).
+      - **PROGRESS 2026-06-16 (loop #39):** **DU-002 slice 16
+        (`pg_foreign_data_wrapper` view) LANDED.** `getForeignDataWrappers` runs
+        `SELECT tableoid, oid, fdwname, fdwowner, fdwhandler::pg_catalog.regproc,
+        fdwvalidator::pg_catalog.regproc, fdwacl, acldefault('F', fdwowner) AS
+        acldefault, array_to_string(ARRAY(SELECT … FROM
+        pg_options_to_table(fdwoptions) …), …) AS fdwoptions FROM
+        pg_foreign_data_wrapper`; it aborted at `relation "pg_foreign_data_wrapper"
+        does not exist`. Added the empty `pg_foreign_data_wrapper` virtual view
+        (`internal/catalog/catalog.go`, OID 2328, beside `pg_ts_config`) with the
+        `pg_foreign_data_wrapper.h` schema (`oid, fdwname name, fdwowner oid,
+        fdwhandler oid, fdwvalidator oid, fdwacl aclitem[], fdwoptions text[]`);
+        `fdwhandler`/`fdwvalidator` are oid FKs to pg_proc. Empty by construction:
+        goopg defines no FDWs, only user-defined FDWs are dumped. Build/gofmt/vet
+        clean; catalog + initdb suites PASS; `TestPort_PgDumpConnectionSetup`
+        PASS. **Next blocker (precise, confirmed empirically — NOT the predicted
+        pg_foreign_server):** the relation now resolves but the query advances to
+        `column "option_name" does not exist`. The ARRAY subquery selects from
+        `pg_options_to_table(fdwoptions)`, an SRF with output columns
+        `(option_name, option_value)`. goopg seeds `pg_options_to_table` in
+        pg_proc (OID 2289) but does NOT implement it as an executable FROM-clause
+        SRF, so the subquery columns are unresolvable at plan time even with an
+        empty outer view (goopg resolves subquery columns during planning
+        regardless of outer emptiness). Resume = slice 17: implement
+        `pg_options_to_table` as a FROM-clause SRF (`text[]` of `name=value` →
+        rows `(option_name, option_value)`). Then getForeignServers
+        (`pg_foreign_server`) / getUserMappings (`pg_user_mappings`).
+      - **PROGRESS 2026-06-16 (loop #40):** **DU-002 slice 17
+        (`pg_options_to_table` FROM-clause SRF) LANDED.** The
+        `getForeignDataWrappers` ARRAY subquery expands `fdwoptions` via
+        `pg_options_to_table(fdwoptions)`; goopg seeded it in pg_proc (OID 2289)
+        but never implemented it executably, so planning aborted at `column
+        "option_name" does not exist`. Wired the standard FROM-SRF path
+        (mirrors `pg_partition_tree`/`unnest`): parser known-builtin switch
+        (`internal/parser/select.go`); plan node `PgOptionsToTable` +
+        `planPgOptionsToTable` (`internal/planner/plan.go`, `planner.go`) with
+        two `text` cols `option_name`/`option_value` (AS-alias overridable);
+        `FoldConstants`/`walkPlanExprs` cases (`foldconst.go`, `unnest.go`);
+        executor op `pgOptionsToTableOp`
+        (`internal/executor/operators_pg_options_to_table.go`) — evaluates the
+        `text[]` arg against the outer lateral row, splits each element at the
+        FIRST `=` (later `=` stay in value, bare name → NULL value), faithful to
+        `untransformRelOptions` in `src/backend/foreign/foreign.c`. **Sibling
+        path fixed (non-obvious):** the analyzer (`internal/analyzer/analyzer.go`
+        `tableFuncColumns`) derives FROM-SRF columns INDEPENDENTLY and runs
+        BEFORE the planner; without a case there, bare `option_name` failed
+        analysis before FROM was ever planned (executor was correct — `SELECT *`
+        worked, named columns didn't). Added the case there too. 4 unit tests
+        (`TestPgOptionsToTable*`) PASS; parser/planner/analyzer/executor/catalog
+        suites PASS; build/gofmt/vet clean; `TestPort_PgDumpConnectionSetup`
+        PASS. **Next blocker (precise, empirical — NOT the predicted
+        pg_foreign_server):** `column "fdwoptions" does not exist`. `fdwoptions`
+        is a CORRELATED reference to the outer `pg_foreign_data_wrapper` row, and
+        goopg cannot resolve a FROM-clause SRF arg that reaches up into an OUTER
+        query level from inside a scalar/ARRAY subquery (verified: same-level
+        `FROM t, LATERAL pg_options_to_table(t.opts)` resolves fine). Resume =
+        slice 18: thread the outer scope into the analyzer's + planner's
+        FROM-clause SRF argument resolution (analyzer `tableFuncColumns` caller's
+        scope chain + `planTableFuncRangeVar` `lateralCtx`). Then getForeignServers
+        (`pg_foreign_server`) / getUserMappings (`pg_user_mappings`).
+      - **PROGRESS 2026-06-16 (loop #41):** **DU-002 slice 18 (correlated
+        FROM-clause SRF argument resolution) LANDED.** `getForeignDataWrappers`'
+        `ARRAY(SELECT … FROM pg_options_to_table(fdwoptions))` references
+        `fdwoptions` from the OUTER `pg_foreign_data_wrapper` row; planning
+        aborted at `42703 column "fdwoptions" does not exist`. Root cause: the
+        planner resolved the SRF arg against a context built only from same-level
+        FROM siblings (`planFromClause`), and the lexical-scope parent
+        (`planParent`) was attached to the SELECT's resolveContext only AFTER
+        FROM planning ran — so a correlated arg with no left-siblings had no path
+        up to the outer scope. Fix (`internal/planner/planner.go`
+        `planPgOptionsToTable`, +1 line at the dispatch call to pass `cat`):
+        build the arg-resolution context chaining up to `planParent`, mirroring
+        the existing `generate_series` precedent (no siblings →
+        `&resolveContext{cat: cat, parent: planParent}`; siblings-but-no-parent →
+        copy + set parent). `fdwoptions` then resolves to an `OuterColumnRef` the
+        executor evaluates per outer row. **Analyzer needed NO change** — its
+        `tableFuncColumns` builds the SRF *output* columns but never resolves the
+        arg expr (verified empirically: the 42703 came from the planner at the
+        `opts` byte offset, analysis passed). The earlier working-set prediction
+        that the analyzer also needed threading was refuted. Guards:
+        `TestPlanPgOptionsToTableCorrelatedArg` (`internal/planner` — ARRAY,
+        scalar, same-level LATERAL forms) + `TestPgOptionsToTableCorrelatedArg`
+        (`internal/executor` — per-outer-row eval, no out-of-range crash). build/
+        gofmt/vet clean; planner/analyzer/executor/parser/catalog suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** `getForeignDataWrappers` now passes end-to-end; pg_dump
+        advances to `getForeignServers` → `relation "pg_foreign_server" does not
+        exist`. That query also expands `srvoptions` through the now-working
+        correlated `pg_options_to_table(srvoptions)` ARRAY subquery, so slice 19
+        is purely the empty `pg_foreign_server` virtual view (`pg_foreign_server.h`
+        schema: oid, srvname, srvowner, srvfdw, srvtype, srvversion, srvacl,
+        srvoptions text[]; empty by construction like pg_foreign_data_wrapper).
+        Then getUserMappings (`pg_user_mappings`).
+      - **PROGRESS 2026-06-16 (loop #42):** **DU-002 slice 19
+        (`pg_foreign_server` view) LANDED.** `getForeignServers` runs `SELECT
+        tableoid, oid, srvname, srvowner, srvfdw, srvtype, srvversion, srvacl,
+        acldefault('S', srvowner) AS acldefault, array_to_string(ARRAY(SELECT …
+        FROM pg_options_to_table(srvoptions) …), …) AS srvoptions FROM
+        pg_foreign_server`; it aborted at `relation "pg_foreign_server" does not
+        exist`. Added the empty `pg_foreign_server` virtual view
+        (`internal/catalog/catalog.go`, OID 1417, beside
+        `pg_foreign_data_wrapper`) with the `pg_foreign_server.h` schema (`oid,
+        srvname name, srvowner oid, srvfdw oid, srvtype text, srvversion text,
+        srvacl aclitem[], srvoptions text[]`). Empty by construction: goopg
+        defines no foreign servers (no CREATE SERVER); the correlated
+        `pg_options_to_table(srvoptions)` ARRAY subquery (slice 18, already
+        working) is never evaluated — no new SRF work. build/gofmt/vet clean;
+        catalog suite PASS; `TestPort_PgDumpConnectionSetup` PASS. **Next blocker
+        (precise, empirical — NOT the predicted pg_user_mappings):**
+        `getForeignServers` passes; because goopg has no foreign servers,
+        getUserMappings short-circuits with no catalog query, and pg_dump
+        advances to getDefaultACLs → `relation "pg_default_acl" does not exist`.
+        Resume = slice 20: add the empty `pg_default_acl` virtual view
+        (`pg_default_acl.h`, OID 826: oid, defaclrole oid, defaclnamespace oid,
+        defaclobjtype "char", defaclacl aclitem[]; empty by construction).
+      - **PROGRESS 2026-06-16 (loop #43):** **DU-002 slice 20
+        (`pg_default_acl` view) LANDED.** `getDefaultACLs` runs `SELECT oid,
+        tableoid, defaclrole, defaclnamespace, defaclobjtype, defaclacl, CASE
+        WHEN defaclnamespace = 0 THEN acldefault(CASE WHEN defaclobjtype = 'S'
+        THEN 's'::"char" ELSE defaclobjtype END, defaclrole) ELSE '{}' END AS
+        acldefault FROM pg_default_acl`; it aborted at `relation
+        "pg_default_acl" does not exist`. Added the empty `pg_default_acl`
+        virtual view (`internal/catalog/catalog.go`, OID 826, beside
+        `pg_foreign_server`) with the `pg_default_acl.h` schema (`oid, defaclrole
+        oid, defaclnamespace oid, defaclobjtype "char", defaclacl aclitem[]`).
+        Empty by construction: goopg defines no default-ACL entries (no ALTER
+        DEFAULT PRIVILEGES); the CASE/acldefault projection is never evaluated —
+        no new expression work. build/gofmt/vet clean; catalog suite PASS;
+        `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** `getDefaultACLs` passes; pg_dump advances to
+        getConversions → `relation "pg_conversion" does not exist` (`SELECT
+        tableoid, oid, conname, connamespace, conowner FROM pg_conversion`).
+        Resume = slice 21: add the `pg_conversion` virtual view
+        (`pg_conversion.h`, OID 2607). NOTE: PG ships ~130 built-in conversions
+        there, but pg_dump filters them as built-ins, so an empty view may
+        suffice — verify empirically with the port test.
+      - **PROGRESS 2026-06-16 (loop #44):** **DU-002 slice 21
+        (`pg_conversion` view) LANDED.** `getConversions` runs `SELECT tableoid,
+        oid, conname, connamespace, conowner FROM pg_conversion` ("find all
+        conversions, including builtin conversions; we filter out system-defined
+        conversions at dump-out time"); it aborted at `relation "pg_conversion"
+        does not exist`. Added the empty `pg_conversion` virtual view
+        (`internal/catalog/catalog.go`, OID 2607, beside `pg_default_acl`) with
+        the `pg_conversion.h` schema (`oid, conname name, connamespace oid,
+        conowner oid, conforencoding int4, contoencoding int4, conproc
+        regproc(oid), condefault bool`). Although PG ships ~130 built-in
+        conversions, every one is in pg_catalog and filtered out at dump-out time
+        (`selectDumpableObject` → DUMP_COMPONENT_NONE), so the **empty** view (0
+        rows) gives an identical dump — confirmed empirically. build/gofmt/vet
+        clean; catalog suite PASS; `TestPort_PgDumpConnectionSetup` PASS. **Next
+        blocker (precise, empirical):** `getConversions` passes; pg_dump advances
+        to getCasts → `relation "pg_range" does not exist` (`SELECT tableoid,
+        oid, castsource, casttarget, castfunc, castcontext, castmethod FROM
+        pg_cast c WHERE NOT EXISTS ( SELECT 1 FROM pg_range r WHERE c.castsource =
+        r.rngtypid AND c.casttarget = r.rngmultitypid ) ORDER BY 3,4`) —
+        `pg_cast` exists, but the NOT EXISTS subquery references `pg_range`, which
+        does not. Resume = slice 22: add the `pg_range` virtual view
+        (`pg_range.h`, OID 3541). goopg defines no range types, so an empty view
+        should suffice — verify empirically with the port test.
+      - **PROGRESS 2026-06-16 (loop #45):** **DU-002 slice 22 (`pg_range` view)
+        LANDED.** `getCasts` runs `SELECT tableoid, oid, castsource, casttarget,
+        castfunc, castcontext, castmethod FROM pg_cast c WHERE NOT EXISTS ( SELECT
+        1 FROM pg_range r WHERE c.castsource = r.rngtypid AND c.casttarget =
+        r.rngmultitypid ) ORDER BY 3,4`; `pg_cast` existed but the NOT EXISTS
+        subquery referenced `pg_range`, so it aborted at `relation "pg_range" does
+        not exist`. Added the empty `pg_range` virtual view
+        (`internal/catalog/catalog.go`, OID 3541, beside `pg_conversion`) with the
+        `pg_range.h` schema — note `pg_range` has **no** `oid` column; `rngtypid`
+        is the key (`rngtypid oid, rngsubtype oid, rngmultitypid oid, rngcollation
+        oid, rngsubopc oid, rngcanonical regproc(oid), rngsubdiff regproc(oid)`).
+        goopg defines no range types, so the NOT EXISTS is always true and the
+        **empty** view (0 rows) gives an identical dump — confirmed empirically.
+        build/gofmt/vet clean; catalog suite PASS; `TestPort_PgDumpConnectionSetup`
+        PASS. **Next blocker (precise, empirical):** `getCasts` passes; pg_dump
+        advances to getEventTriggers → `relation "pg_event_trigger" does not
+        exist` (`SELECT e.tableoid, e.oid, evtname, evtenabled, evtevent,
+        evtowner, array_to_string(array(select quote_literal(x) from
+        unnest(evttags) as t(x)), ', ') as evttags, e.evtfoid::regproc as evtfname
+        FROM pg_event_trigger e ORDER BY e.oid`). Resume = slice 23: add the
+        `pg_event_trigger` virtual view (`pg_event_trigger.h`, OID 3466). goopg
+        defines no event triggers, so an empty view should suffice — verify
+        empirically with the port test.
+      - **PROGRESS 2026-06-16 (loop #47):** **DU-002 slice 23 LANDED**
+        (`pg_event_trigger` view + correlated `unnest()` arg fix). Two gaps fixed
+        together: (a) added the empty `pg_event_trigger` virtual view
+        (`internal/catalog/catalog.go`, OID 3466, `pg_event_trigger.h` schema:
+        `oid, evtname name, evtevent name, evtowner oid, evtfoid oid, evtenabled
+        "char", evttags text[]`) — goopg has no event triggers so 0 rows dumps
+        identically; (b) with the relation present the query then hit `column
+        "evttags" does not exist` — the SAME correlated FROM-clause SRF arg bug as
+        slice 18 but for `unnest`. `planFromUnnest` built its arg context from
+        same-level lateral siblings only, never chaining up to `planParent`. Fix
+        mirrors `planPgOptionsToTable`/`planGenerateSeries`:
+        `ctx := &resolveContext{parent: planParent}` + copy-and-reparent the
+        lateral siblings when they have no parent. build/gofmt/vet clean; catalog
+        + planner suites PASS; new guard `TestPlanUnnestCorrelatedArg` PASS;
+        `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** getEventTriggers passes; pg_dump advances to the per-table
+        attribute dump (getTableAttrs) → `column a.attstattarget does not exist`.
+        That query reads many `pg_attribute`/`pg_constraint`/`pg_type` columns
+        goopg's views do not expose (attstattarget, attstorage, attfdwoptions,
+        attcompression, attidentity, atthasmissing, attmissingval, attgenerated,
+        conislocal, …). Resume = slice 24: broaden those catalog columns — a
+        DEEPER slice than the empty-view additions.
+      - **PROGRESS 2026-06-16 (loop #48):** **DU-002 slice 24 LANDED**
+        (`pg_attribute.attstattarget`). getTableAttrs reads `a.attstattarget`;
+        goopg's pg_attribute already exposed every other column it reads
+        (attstorage/attcompression/attidentity/atthasmissing/attmissingval/
+        attgenerated/attfdwoptions/attcollation/attislocal/atthasdef), so only
+        `attstattarget` was missing — a single-column slice, not the broad-column
+        slice the prior note predicted. PG18 declares it a NULLABLE `int2`
+        (`CATALOG_VARLEN`, `BKI_FORCE_NULL`). Added in lockstep to all 4 sibling
+        layouts: `catalog.PGAttributeColumns` (queryable schema),
+        `initdb.pgAttrColDefs`+`pgAttributeRow` (nailed heap), and
+        `pgAttributeColumnsPG18`+`buildUserPGAttributeRow` (user heap). **Appended
+        LAST, not at PG18-canonical #4** — goopg's heap is already non-canonical
+        and `DecodePGAttributePhysicalRow` reads fields by hardcoded byte offset;
+        a trailing always-NULL column (like the existing 4) keeps every offset
+        valid, and the null bitmap 3→4 bytes stays within MAXALIGN(8) so
+        t_hoff=32 is unchanged. SELECT resolves by name → pg_dump reads NULL →
+        treats as default stats target (-1). Left `initdb.pgAttributeAttrs`
+        (relcache-init tupdesc; already a separately-divergent layout) untouched
+        — fully-canonical on-disk pg_attribute is a larger PG-standby task out of
+        scope. build/gofmt/vet clean; catalog+initdb+executor suites PASS (count
+        assertions updated in TestPGAttributeColumnsCount,
+        TestBootstrappedPGAttributeRowsReadable,
+        TestPgAttributeRowEmitsNullForOptionalArrayColumns);
+        `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** getTableAttrs passes; pg_dump advances to partition-key
+        detection → `relation "pg_partitioned_table" does not exist` (`SELECT
+        partrelid FROM pg_partitioned_table WHERE (SELECT c.oid FROM pg_opclass …)
+        = ANY(partclass)`). Resume = slice 25: add the empty
+        `pg_partitioned_table` virtual view (`pg_partitioned_table.h`, OID 3350)
+        — back to the empty-view pattern.
+      - **PROGRESS 2026-06-16 (loop #49):** **DU-002 slice 25 LANDED**
+        (empty `pg_partitioned_table` virtual view, OID 3350). pg_dump's
+        partition-key probe (`SELECT partrelid FROM pg_partitioned_table WHERE
+        (SELECT c.oid FROM pg_opclass …) = ANY(partclass)`) now resolves. goopg
+        surfaces partition membership via `pg_class.relkind='p'/'P'`+
+        `pg_inherits`, not a per-partition-key heap, so 0 rows is correct; with
+        0 rows `= ANY(partclass)` is never evaluated. Added in
+        `internal/catalog/catalog.go` beside `pg_range`/`pg_event_trigger`;
+        schema matches `pg_partitioned_table.h` (partrelid oid, partstrat "char",
+        partnatts int2, partdefid oid, partattrs int2vector→int2[], partclass
+        oidvector→oid[], partcollation oidvector→oid[], partexprs pg_node_tree).
+        build/gofmt/vet clean; catalog suite PASS; `TestPort_PgDumpConnectionSetup`
+        PASS. **Next blocker (precise, empirical):** pg_dump advances to per-table
+        trigger collection (`getTriggers`) → `relation "pg_trigger" does not
+        exist` (`SELECT t.tgrelid, t.tgname, pg_get_triggerdef(...) … FROM
+        unnest('{}'::oid[]) AS src(tbloid) JOIN pg_trigger t ON …`). Resume =
+        slice 26: add the empty `pg_trigger` virtual view (`pg_trigger.h`, OID
+        2620) — empty-view pattern (no user triggers; unnest('{}') source is
+        empty so the JOIN/pg_get_triggerdef never evaluate).
+      - **PROGRESS 2026-06-16 (loop #50):** **DU-002 slice 26 LANDED**
+        (empty `pg_trigger` virtual view, OID 2620). pg_dump's `getTriggers`
+        probe (`SELECT t.tgrelid, t.tgname, pg_get_triggerdef(...) … FROM
+        unnest('{}'::oid[]) AS src(tbloid) JOIN pg_trigger t ON …`) now resolves.
+        goopg has no user triggers, so 0 rows is correct; the unnest('{}')
+        source is empty so the JOIN/pg_get_triggerdef never evaluate. Added in
+        `internal/catalog/catalog.go` beside `pg_partitioned_table`; schema
+        matches `pg_trigger.h` (oid, tgrelid oid, tgparentid oid, tgname name,
+        tgfoid oid, tgtype int2, tgenabled "char", tgisinternal bool,
+        tgconstrrelid/tgconstrindid/tgconstraint oid, tgdeferrable bool,
+        tginitdeferred bool, tgnargs int2, tgattr int2vector→int2[], tgargs
+        bytea, tgqual pg_node_tree, tgoldtable/tgnewtable name).
+        build/gofmt/vet clean; catalog suite PASS; `TestPort_PgDumpConnectionSetup`
+        PASS. **Next blocker (precise, empirical):** pg_dump advances to rule
+        collection (`getRules`) → `relation "pg_rewrite" does not exist`
+        (`SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type,
+        is_instead, ev_enabled FROM pg_rewrite ORDER BY oid`). Resume = slice
+        27: add the empty `pg_rewrite` virtual view (`pg_rewrite.h`, OID 2618) —
+        empty-view pattern (no user rules; ORDER BY oid over empty = 0 rows).
+      - **PROGRESS 2026-06-16 (loop #51):** **DU-002 slices 27 + 28 LANDED.**
+        (27) Empty `pg_rewrite` virtual view (OID 2618) in
+        `internal/catalog/catalog.go` beside `pg_trigger` — pg_dump's `getRules`
+        probe (`SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type,
+        is_instead, ev_enabled FROM pg_rewrite ORDER BY oid`) now resolves (no
+        user rules → 0 rows). Schema per `pg_rewrite.h` (oid, rulename name,
+        ev_class oid, ev_type "char", ev_enabled "char", is_instead bool, ev_qual
+        pg_node_tree, ev_action pg_node_tree). (28) Appended PG18's `pubgencols`
+        ("char") column to `pg_publication` in
+        `internal/initdb/replication_views.go` — pg_dump's `getPublications`
+        probe (`SELECT … p.pubviaroot, p.pubgencols FROM pg_publication p`) now
+        resolves; goopg does not publish generated columns so 'n'(none) is
+        emitted per row. build/gofmt/vet clean; catalog + analyzer + initdb
+        publication suites PASS; `TestPort_PgDumpConnectionSetup` PASS.
+        **Next blocker (precise, empirical):** pg_dump advances to large-object
+        collection (`getBlobs`) → `relation "pg_largeobject_metadata" does not
+        exist` (`SELECT oid, lomowner, lomacl, acldefault('L', lomowner) AS
+        acldefault FROM pg_largeobject_metadata ORDER BY lomowner,
+        lomacl::pg_catalog.text, oid`). Resume = slice 29: add the empty
+        `pg_largeobject_metadata` virtual view (`pg_largeobject_metadata.h`, OID
+        2995) — empty-view pattern (no large objects; cols oid, lomowner oid,
+        lomacl aclitem[]).
+      - **PROGRESS 2026-06-16 (loop #52):** **DU-002 slice 29 LANDED.** Empty
+        `pg_largeobject_metadata` virtual view (OID 2995) in
+        `internal/catalog/catalog.go` beside `pg_rewrite` — pg_dump's `getBlobs`
+        probe (`SELECT oid, lomowner, lomacl, acldefault('L', lomowner) AS
+        acldefault FROM pg_largeobject_metadata ORDER BY lomowner,
+        lomacl::pg_catalog.text, oid`) now resolves (no large objects → 0 rows;
+        the `acldefault` projection is never evaluated over the empty set).
+        Schema per `pg_largeobject_metadata.h` (oid, lomowner oid, lomacl
+        aclitem[]). build/gofmt/vet clean; catalog suite PASS;
+        `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** pg_dump advances to dependency collection
+        (`getDependencies`) → `relation "pg_amproc" does not exist` (a
+        `pg_depend` UNION that joins `pg_amop` and `pg_amproc` for opfamily
+        member dependencies). Resume = slice 30: add the empty `pg_amop`
+        (`pg_amop.h`, OID 2602) + `pg_amproc` (`pg_amproc.h`, OID 2603) virtual
+        views — empty-view pattern (no user opclasses feeding this dump path →
+        0 rows).
+      - **PROGRESS 2026-06-16 (loop #53):** **DU-002 slice 30 LANDED.** Empty
+        `pg_amop` (OID 2602) + `pg_amproc` (OID 2603) virtual views in
+        `internal/catalog/catalog.go` beside `pg_largeobject_metadata` — pg_dump's
+        `getDependencies` `pg_depend` UNION joining both for opfamily member
+        dependencies now resolves (no user opclasses → 0 rows each). Schemas per
+        `pg_amop.h` (oid, amopfamily, amoplefttype, amoprighttype, amopstrategy
+        int2, amoppurpose "char", amopopr, amopmethod, amopsortfamily) and
+        `pg_amproc.h` (oid, amprocfamily, amproclefttype, amprocrighttype,
+        amprocnum int2, amproc regproc). build/gofmt/vet clean; catalog suite
+        PASS; `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** pg_dump advances to security-label collection
+        (`getSecLabels`) → `relation "pg_seclabels" does not exist` (`SELECT
+        label, provider, classoid, objoid, objsubid FROM pg_catalog.pg_seclabels
+        ORDER BY classoid, objoid, objsubid`). Resume = slice 31: add the empty
+        `pg_seclabels` virtual view (stock PG: system view over pg_seclabel +
+        pg_shseclabel; goopg has no SECURITY LABEL → 0 rows). Cols the query
+        needs: label text, provider text, classoid oid, objoid oid, objsubid int4
+        (full view also carries objtype text, objnamespace oid, objname text).
+      - **PROGRESS 2026-06-16 (loop #54):** **DU-002 slice 31 LANDED.** Empty
+        `pg_seclabels` virtual view (unused OID 3597) in
+        `internal/catalog/catalog.go` beside `pg_amproc` — pg_dump's `getSecLabels`
+        `SELECT label, provider, classoid, objoid, objsubid FROM
+        pg_catalog.pg_seclabels ORDER BY classoid, objoid, objsubid` now resolves
+        (goopg has no SECURITY LABEL → 0 rows). `pg_seclabels` is a VIEW (no oid
+        column). Cols: objoid oid, classoid oid, objsubid int4, objtype text,
+        objnamespace oid, objname text, provider text, label text. build/gofmt/vet
+        clean; catalog suite PASS; `TestPort_PgDumpConnectionSetup` PASS.
+        **Next blocker (precise, empirical):** pg_dump advances to sequence
+        collection (`getSequences`) → `relation "pg_sequence" does not exist`
+        (`SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement,
+        seqmax, seqmin, seqcache, seqcycle, last_value, is_called FROM
+        pg_catalog.pg_sequence, pg_get_sequence_data(seqrelid) ORDER BY
+        seqrelid`). Resume = slice 32: `pg_sequence` is a REAL catalog (one row
+        per sequence relation) joined with the SRF `pg_get_sequence_data`. The
+        slice must FIRST verify whether goopg supports CREATE SEQUENCE — if no
+        sequences, an empty `pg_sequence` view (0 rows) suffices, BUT the
+        `pg_get_sequence_data(seqrelid)` function call must ALSO resolve (not a
+        view). pg_sequence cols (`pg_sequence.h`): seqrelid oid, seqtypid oid,
+        seqstart int8, seqincrement int8, seqmax int8, seqmin int8, seqcache int8,
+        seqcycle bool.
+      - **PROGRESS 2026-06-16 (loop #55):** **DU-002 slice 32 LANDED.** Empty
+        `pg_sequence` virtual view (OID 2224, 0 rows) in
+        `internal/catalog/catalog.go` + `pg_get_sequence_data(regclass)`
+        registered as a FROM-clause SRF (last_value int8, is_called bool) across
+        `tableFuncColumns` (analyzer — the actual gate, runs before the planner),
+        `planPgGetSequenceData`/`PgGetSequenceData` (planner), and
+        `pgGetSequenceDataOp` (executor, 0 rows). `getSequences`'s implicit-LATERAL
+        comma join now resolves. CREATE SEQUENCE *is* supported, but goopg
+        sequences are skipped from the `pg_class` virtual view (Virtual, no View)
+        so pg_dump never discovers a relkind='S' relation — empty pg_sequence is
+        consistent and the SRF is never invoked over the empty left side. **Full
+        sequence-dump (sequences as relkind='S' in pg_class + seqrelid population)
+        is a larger follow-up slice — NOT done here.** build/gofmt/vet clean;
+        catalog/analyzer/planner/executor suites PASS; new regression tests
+        `TestPgGetSequenceDataGetSequencesQuery`/`TestPgGetSequenceDataSchema`
+        PASS; `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** `pg_dump: error: could not parse result of
+        current_schemas()` — pg_dump parses the `name[]` text-array literal from
+        `current_schemas(true)`; goopg does not render it in the `{a,b}`
+        array-literal form `parsePGArray` expects (cf. the orthogonal
+        text[]-from-heap array-encoding note below). Resume = slice 33: make
+        `current_schemas()` emit a parseable `name[]` array literal over the wire.
+      - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
+        reading a `text[]` column back from the heap yields the binary array
+        encoding (Datum KindString carrying raw bytes) rather than the text
+        representation `expandArrayDatum` parses; a plain `SELECT opts FROM t`
+        over a text[] column reproduces it. Irrelevant to the pg_dump path
+        (pg_foreign_data_wrapper/pg_foreign_server are empty, so the correlated
+        SRF never evaluates a non-empty options array). Track separately if a
+        real text[]-column expansion path is ever needed.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

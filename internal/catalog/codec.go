@@ -124,9 +124,20 @@ func PGClassColumns() []Column {
 }
 
 // PGAttributeColumns returns the column schema for pg_attribute heap rows.
-// Matches the 24-column PG18 canonical layout written by initdb.pgAttrColDefs.
-// The physical heap encoding follows this column order, so the schema must
-// agree with it for the executor's decoder to read correct values.
+// Matches the 25-column layout written by initdb.pgAttrColDefs. The physical
+// heap encoding follows this column order, so the schema must agree with it
+// for the executor's decoder to read correct values.
+//
+// NOTE: attstattarget is appended LAST rather than placed at its PG18-canonical
+// position (#4, after atttypid). goopg's on-disk pg_attribute layout is already
+// non-canonical (it omits attcacheoff and orders attlen before attnum), and the
+// fixed-offset physical decoder (DecodePGAttributePhysicalRow) reads attrelid/
+// attname/atttypid/attnum/attnotnull/attisdropped by hardcoded byte offset.
+// Appending attstattarget as a nullable trailing column (always NULL, exactly
+// like attacl/attoptions/attfdwoptions/attmissingval) keeps every existing byte
+// offset valid and grows the null bitmap 3→4 bytes within the same MAXALIGN(8)
+// boundary (t_hoff stays 32). SELECT resolves columns by name, so the trailing
+// position is transparent to queries such as pg_dump's getTableAttrs.
 func PGAttributeColumns() []Column {
 	cols := []Column{
 		{Name: "attrelid", Type: Type{Name: "oid"}},
@@ -153,6 +164,7 @@ func PGAttributeColumns() []Column {
 		{Name: "attoptions", Type: Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: Type{Name: "text"}},
 		{Name: "attmissingval", Type: Type{Name: "text"}},
+		{Name: "attstattarget", Type: Type{Name: "int2"}},
 	}
 	for i := range cols {
 		cols[i].Ordinal = i
@@ -598,12 +610,12 @@ func decodePGBool(v byte, field string) (bool, error) {
 
 // PGIndexRow holds the fields from pg_index needed for catalog recovery.
 type PGIndexRow struct {
-	IndexRelid  uint32  // indexrelid
-	IndRelid    uint32  // indrelid (owning table OID)
-	IndNAtts    int16   // indnatts
-	IndKey      []int16 // attnum values for each indexed column
-	IndIsUnique bool    // indisunique
-	IndIsPrimary bool   // indisprimary
+	IndexRelid   uint32  // indexrelid
+	IndRelid     uint32  // indrelid (owning table OID)
+	IndNAtts     int16   // indnatts
+	IndKey       []int16 // attnum values for each indexed column
+	IndIsUnique  bool    // indisunique
+	IndIsPrimary bool    // indisprimary
 }
 
 const (
@@ -611,14 +623,14 @@ const (
 	// pg_index physical heap tuple up to (and including) the padding byte
 	// before indkey. Layout: indexrelid[4] + indrelid[4] + indnatts[2] +
 	// indnkeyatts[2] + 11 bool fields[11] + 1 pad = 24 bytes.
-	pgIndexFixedSize        = 24
-	pgIndexOffIndexRelid    = 0
-	pgIndexOffIndRelid      = 4
-	pgIndexOffIndNAtts      = 8
-	pgIndexOffIndIsUnique   = 12
-	pgIndexOffIndIsPrimary  = 14
+	pgIndexFixedSize       = 24
+	pgIndexOffIndexRelid   = 0
+	pgIndexOffIndRelid     = 4
+	pgIndexOffIndNAtts     = 8
+	pgIndexOffIndIsUnique  = 12
+	pgIndexOffIndIsPrimary = 14
 	// indkey int2vector starts at offset 24 after the 1-byte alignment pad.
-	pgIndexOffIndKey        = 24
+	pgIndexOffIndKey = 24
 )
 
 // DecodePGIndexPhysicalRow decodes the PG18 physical on-disk format of a
@@ -675,15 +687,16 @@ type PGStatisticRow struct {
 
 // pgStatisticPhysicalFixed is the byte length of the fixed-size prefix of a
 // pg_statistic physical tuple. Layout (with C-struct alignment):
-//   starelid[4] staattnum[2] stainherit[1] pad[1] stanullfrac[4] stawidth[4]
-//   stadistinct[4] stakind1[2] stakind2[2] stakind3[2] stakind4[2] stakind5[2]
-//   pad[2] staop1..5[20] stacoll1..5[20] = 72 bytes
+//
+//	starelid[4] staattnum[2] stainherit[1] pad[1] stanullfrac[4] stawidth[4]
+//	stadistinct[4] stakind1[2] stakind2[2] stakind3[2] stakind4[2] stakind5[2]
+//	pad[2] staop1..5[20] stacoll1..5[20] = 72 bytes
 const pgStatisticPhysicalFixed = 72
 
 const (
 	pgStatOffStaRelid    = 0
 	pgStatOffStaAttNum   = 4
-	pgStatOffStaNullFrac = 8  // after bool + 1 pad → aligned to 4
+	pgStatOffStaNullFrac = 8 // after bool + 1 pad → aligned to 4
 	pgStatOffStaWidth    = 12
 	pgStatOffStaDistinct = 16
 	pgStatOffStaKind1    = 20

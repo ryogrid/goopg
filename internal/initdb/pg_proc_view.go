@@ -108,6 +108,29 @@ func typeNameToOIDStr(typName string) string {
 	}
 }
 
+// langNameToOIDStr maps a procedural-language NAME to its pg_language OID string.
+// goopg's pg_proc view stores prolang as oid (matching PG's catalog) so pg_dump's
+// dumpFunc join `pg_language l ON l.oid = p.prolang` resolves. The 3 built-in
+// languages (internal/c/sql) live in pg_language (see catalog.go); their OIDs come
+// from postgres/src/include/catalog/pg_language.dat. A user routine recorded with a
+// language not yet present in pg_language (e.g. plpgsql, which goopg does not install
+// by default and which has a dynamic OID in PG) returns "0" (InvalidOid): a numeric
+// value safe to materialise into the oid column, though dumpFunc's join will not
+// resolve for such a function until the PL is added to pg_language (tracked
+// separately). M0110-0001 (DU-002 slice 42).
+func langNameToOIDStr(lang string) string {
+	switch strings.ToLower(lang) {
+	case "internal":
+		return "12"
+	case "c":
+		return "13"
+	case "sql":
+		return "14"
+	default:
+		return "0"
+	}
+}
+
 // builtinProcRow holds the fixed values for a built-in pg_proc row.
 // proargtypes is a space-separated list of OID strings (oidvector format).
 // retType is the return type OID string.
@@ -127,11 +150,11 @@ type builtinProcRow struct {
 // RI_FKey_* trigger functions (required for btree_index LIKE/ILIKE tests).
 var builtinProcs = []builtinProcRow{
 	// abs variants (sorted by proargtypes OID for determinism)
-	{oid: 1395, name: "abs", namespace: "11", lang: "12", retType: "20", argTypes: "20", src: "int8abs"},       // abs(int8)
-	{oid: 1396, name: "abs", namespace: "11", lang: "12", retType: "21", argTypes: "21", src: "int2abs"},       // abs(int2)
-	{oid: 1397, name: "abs", namespace: "11", lang: "12", retType: "23", argTypes: "23", src: "int4abs"},       // abs(int4)
-	{oid: 1398, name: "abs", namespace: "11", lang: "12", retType: "700", argTypes: "700", src: "float4abs"},   // abs(float4)
-	{oid: 1705, name: "abs", namespace: "11", lang: "12", retType: "701", argTypes: "701", src: "float8abs"},   // abs(float8)
+	{oid: 1395, name: "abs", namespace: "11", lang: "12", retType: "20", argTypes: "20", src: "int8abs"},         // abs(int8)
+	{oid: 1396, name: "abs", namespace: "11", lang: "12", retType: "21", argTypes: "21", src: "int2abs"},         // abs(int2)
+	{oid: 1397, name: "abs", namespace: "11", lang: "12", retType: "23", argTypes: "23", src: "int4abs"},         // abs(int4)
+	{oid: 1398, name: "abs", namespace: "11", lang: "12", retType: "700", argTypes: "700", src: "float4abs"},     // abs(float4)
+	{oid: 1705, name: "abs", namespace: "11", lang: "12", retType: "701", argTypes: "701", src: "float8abs"},     // abs(float8)
 	{oid: 1704, name: "abs", namespace: "11", lang: "12", retType: "1700", argTypes: "1700", src: "numeric_abs"}, // abs(numeric)
 	// RI_FKey trigger functions (no args, return trigger)
 	{oid: 1654, name: "RI_FKey_cascade_del", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_cascade_del"},
@@ -154,10 +177,42 @@ var builtinProcs = []builtinProcRow{
 //   - oid: routine OID (text — pg_class etc. also use text OIDs).
 //   - proname: routine name (unqualified).
 //   - pronamespace: schema OID — 11 for pg_catalog, 2200 for public.
-//   - prolang: language OID (text "12" for internal, "14" for SQL, "13" for C).
+//   - prolang: language OID (oid "12" for internal, "14" for SQL, "13" for C).
+//     Typed oid (NOT text) to match PG's pg_proc.prolang and the physical
+//     pg_proc catalog: pg_dump's dumpFunc joins `pg_language l ON l.oid =
+//     p.prolang`, and an oid=text comparison silently yields 0 rows.
 //   - prorettype: return-type OID (text).
 //   - proargtypes: space-separated arg-type OIDs (oidvector format).
+//   - pronargs: number of input arguments (int2 = len(proargtypes)).
+//   - proacl: access privileges (aclitem[]); always NULL — goopg tracks no
+//     per-routine grants, so pg_dump treats every routine as default-privileged.
+//   - proowner: owning role OID; always 10 (bootstrap superuser).
 //   - prosrc: function body source.
+//   - probin: on-disk binary path for C-language functions; always NULL
+//     (goopg has no C functions). dumpFunc reads it to emit `AS '<probin>'`.
+//   - proconfig: per-function GUC SET clauses (text[]); always NULL — goopg
+//     tracks no per-function SET, so dumpFunc emits no `SET ...` lines.
+//   - procost: planner's estimated per-row execution cost (float4). Mirrors
+//     PG's CREATE FUNCTION default — 1 for internal/C-language functions,
+//     100 for all others. goopg stores no explicit cost, so it derives this
+//     from the routine's language.
+//   - prorows: planner's estimated result-row count for set-returning
+//     functions (float4). Mirrors PG's CREATE FUNCTION default — 1000 for
+//     set-returning functions, 0 for everything else. dumpFunc reads it to
+//     emit `ROWS <n>` for SRFs.
+//   - protrftypes: OID array (oidvector) of argument types whose transforms
+//     the function uses; always NULL — goopg supports no transforms, so
+//     dumpFunc emits no `TRANSFORM FOR TYPE ...` clause.
+//   - proparallel: parallel-safety marker (char) — 's' safe / 'r' restricted /
+//     'u' unsafe. Mirrors PG's CREATE FUNCTION default of 'u' (unsafe) for
+//     every routine; goopg tracks no parallel-safety, so dumpFunc emits
+//     `PARALLEL UNSAFE` (the default, so effectively nothing) for all.
+//   - prosupport: OID of the function's planner support function (regproc/oid).
+//     Always 0 — goopg has no planner support functions; PG's CREATE FUNCTION
+//     default is likewise 0, so dumpFunc emits no `SUPPORT ...` clause.
+//
+// pronargs/proacl/proowner were added for pg_dump's getFuncs SELECT (M0110-0001
+// DU-002 slice 7), which projects `p.pronargs, …, p.proacl, …, p.proowner`.
 func registerPgProcView(cat *catalog.InMemory) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
@@ -166,15 +221,26 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "oid", Type: catalog.Type{Name: "oid"}},
 			{Name: "proname", Type: catalog.Type{Name: "text"}},
 			{Name: "pronamespace", Type: catalog.Type{Name: "oid"}},
-			{Name: "prolang", Type: catalog.Type{Name: "text"}},
+			{Name: "prolang", Type: catalog.Type{Name: "oid"}},
 			{Name: "prorettype", Type: catalog.Type{Name: "oid"}},
 			{Name: "proargtypes", Type: catalog.Type{Name: "oidvector"}},
+			{Name: "pronargs", Type: catalog.Type{Name: "int2"}},
+			{Name: "proacl", Type: catalog.Type{Name: "aclitem[]"}},
+			{Name: "proowner", Type: catalog.Type{Name: "oid"}},
 			{Name: "prosrc", Type: catalog.Type{Name: "text"}},
 			{Name: "provolatile", Type: catalog.Type{Name: "text"}},
 			{Name: "prosecdef", Type: catalog.Type{Name: "bool"}},
 			{Name: "proleakproof", Type: catalog.Type{Name: "bool"}},
 			{Name: "proisstrict", Type: catalog.Type{Name: "bool"}},
 			{Name: "prokind", Type: catalog.Type{Name: "text"}},
+			{Name: "proretset", Type: catalog.Type{Name: "bool"}},
+			{Name: "probin", Type: catalog.Type{Name: "text"}},
+			{Name: "proconfig", Type: catalog.Type{Name: "text[]"}},
+			{Name: "procost", Type: catalog.Type{Name: "float4"}},
+			{Name: "prorows", Type: catalog.Type{Name: "float4"}},
+			{Name: "protrftypes", Type: catalog.Type{Name: "oidvector"}},
+			{Name: "proparallel", Type: catalog.Type{Name: "char"}},
+			{Name: "prosupport", Type: catalog.Type{Name: "oid"}},
 		},
 		Virtual: true,
 	}
@@ -189,12 +255,23 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				b.lang,
 				b.retType,
 				b.argTypes,
+				fmt.Sprintf("%d", len(strings.Fields(b.argTypes))), // pronargs
+				"",   // proacl: NULL (default privileges)
+				"10", // proowner: bootstrap superuser
 				b.src,
-				"v",    // provolatile: volatile
-				"f",    // prosecdef
-				"f",    // proleakproof
-				"f",    // proisstrict
-				"f",    // prokind: function
+				"v", // provolatile: volatile
+				"f", // prosecdef
+				"f", // proleakproof
+				"f", // proisstrict
+				"f", // prokind: function
+				"f", // proretset: built-in stubs (abs/RI_FKey) are not SRFs
+				"",  // probin: NULL (internal funcs have no on-disk binary path)
+				"",  // proconfig: NULL (no per-function GUC SET clauses)
+				"1", // procost: internal-language default (DEFAULT_FUNCTION_COST)
+				"0", // prorows: built-in stubs (abs/RI_FKey) are not SRFs
+				"",  // protrftypes: NULL (goopg supports no transforms)
+				"u", // proparallel: unsafe (PG CREATE FUNCTION default)
+				"0", // prosupport: 0 (no planner support function)
 			})
 		}
 		// Append user-defined routines.
@@ -238,19 +315,48 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			if r.IsProcedure {
 				prokind = "p" // procedure
 			}
+			retset := "f"
+			if r.ReturnsSet {
+				retset = "t"
+			}
+			// procost: PG's CREATE FUNCTION default — 1 for internal/C-language
+			// functions, 100 for all others (DEFAULT_FUNCTION_COST vs the
+			// higher cost charged to interpreted languages).
+			procost := "100"
+			switch strings.ToLower(r.Language) {
+			case "internal", "c":
+				procost = "1"
+			}
+			// prorows: PG's CREATE FUNCTION default — 1000 estimated result
+			// rows for set-returning functions, 0 for everything else.
+			prorows := "0"
+			if r.ReturnsSet {
+				prorows = "1000"
+			}
 			rows = append(rows, []string{
 				fmt.Sprintf("%d", r.OID),
 				r.Name,
 				ns,
-				r.Language,
+				langNameToOIDStr(r.Language), // prolang: oid (matches PG; resolves dumpFunc join)
 				typeNameToOIDStr(r.ReturnType.Name),
 				strings.Join(argOIDs, " "),
+				fmt.Sprintf("%d", len(r.ArgTypes)), // pronargs
+				"",                                 // proacl: NULL (default privileges)
+				"10",                               // proowner: bootstrap superuser
 				r.Body,
 				volatile,
 				secdef,
 				leakproof,
 				strict,
 				prokind,
+				retset,
+				"",      // probin: NULL (goopg has no C-language functions)
+				"",      // proconfig: NULL (goopg tracks no per-function GUC SET)
+				procost, // procost: language-derived (1 internal/C, else 100)
+				prorows, // prorows: 1000 for SRFs, 0 otherwise
+				"",      // protrftypes: NULL (goopg supports no transforms)
+				"u",     // proparallel: unsafe (PG CREATE FUNCTION default)
+				"0",     // prosupport: 0 (no planner support function)
 			})
 		}
 		return rows

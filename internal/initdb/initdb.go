@@ -5753,7 +5753,10 @@ func pgClassReltablespaceFor(isShared bool) executor.Datum {
 	return executor.NewIntDatum(0)
 }
 
-// pgAttrColDefs returns the 24 pg_attribute column descriptors.
+// pgAttrColDefs returns the 25 pg_attribute column descriptors. attstattarget
+// is appended last (not at its PG18-canonical position #4); see
+// catalog.PGAttributeColumns for the rationale (preserves the fixed-offset
+// physical decoder and keeps t_hoff stable). Always emitted NULL.
 func pgAttrColDefs() []catalog.Column {
 	return []catalog.Column{
 		{Name: "attrelid", Type: catalog.Type{Name: "oid"}},
@@ -5780,6 +5783,7 @@ func pgAttrColDefs() []catalog.Column {
 		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attmissingval", Type: catalog.Type{Name: "text"}},
+		{Name: "attstattarget", Type: catalog.Type{Name: "int2"}},
 	}
 }
 
@@ -5859,6 +5863,7 @@ func pgAttributeRow(relOID uint32, a nailedAttr) executor.Row {
 		executor.NullDatum, // attoptions
 		executor.NullDatum, // attfdwoptions
 		executor.NullDatum, // attmissingval
+		executor.NullDatum, // attstattarget (PG18 BKI_FORCE_NULL default)
 	}
 }
 

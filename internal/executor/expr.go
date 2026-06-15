@@ -5488,8 +5488,22 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	case "current_database":
 		return NewStringDatum("postgres"), nil
-	case "current_schema", "current_schemas":
+	case "current_schema":
 		return currentSchemaFromSearchPath(ctx)
+	case "current_schemas":
+		// current_schemas(include_implicit boolean) -> name[]. Returns the
+		// schemas in the effective search path that actually exist, rendered as
+		// a `{a,b}` text array literal so clients (e.g. pg_dump's parsePGArray)
+		// can parse it. When include_implicit is true, the implicitly-searched
+		// pg_catalog is prepended (mirrors PG's current_schemas semantics).
+		includeImplicit := false
+		if len(x.Args) >= 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err == nil && !v.IsNull() {
+				includeImplicit = v.BoolValue()
+			}
+		}
+		return currentSchemasArray(ctx, includeImplicit)
 
 	// generate_series used as a scalar expression (not FROM clause).
 	// Returns the start value only — full SRF semantics require planner rework.
@@ -6859,6 +6873,33 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 		}
 		return NewStringDatum(""), nil
+	case "pg_get_function_identity_arguments":
+		// pg_get_function_identity_arguments(oid) → text: the argument list
+		// needed to identify the function for ALTER/DROP FUNCTION. Upstream
+		// (ruleutils.c print_function_arguments) differs from
+		// pg_get_function_arguments only by print_defaults=false — it omits
+		// DEFAULT clauses. goopg's buildFunctionArguments never emits defaults,
+		// so the identity form is identical to the full argument list here.
+		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
+			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
+				if rs := ctx.Catalog.Routines(); rs != nil {
+					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
+						return NewStringDatum(buildFunctionArguments(r)), nil
+					}
+				}
+			}
+		}
+		return NewStringDatum(""), nil
+	case "pg_get_function_sqlbody":
+		// pg_get_function_sqlbody(oid) → text: the deparsed SQL-standard body
+		// of a `LANGUAGE sql ... BEGIN ATOMIC` function (PG14+). Returns NULL
+		// for any routine that is not a SQL-language function with an inlined
+		// standard body (e.g. C, internal, plpgsql, or quoted-string SQL
+		// bodies). goopg has no BEGIN ATOMIC support — no routine carries a
+		// parsed prosqlbody — so this is NULL for every routine, which also
+		// matches what pg_dump's dumpFunc expects for such functions.
+		return NullDatum, nil
 	case "pg_get_function_result":
 		// pg_get_function_result(oid) → text: return type
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
@@ -8081,6 +8122,42 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(formatTextArray(elems)), nil
 		}
 
+	case "array_remove":
+		// array_remove(anyarray, anyelement) → anyarray — removes every element
+		// equal to the second argument from a 1-D array. pg_dump's getTables strips
+		// the view check_option markers from reloptions with a nested
+		// array_remove(array_remove(c.reloptions,'check_option=local'),
+		// 'check_option=cascaded'). M0110-0001 / DU-002 slice 5.
+		//
+		// PG's array_remove is NotStrict on the element (a NULL element removes the
+		// array's NULL entries) but returns NULL for a NULL array. Element matching
+		// uses the type's default btree equality; goopg's text-array representation
+		// compares the formatted element text, with a NULL element matching the
+		// "NULL" placeholder produced by the array_append/_cat siblings.
+		if len(x.Args) == 2 {
+			arrD, e1 := evalExpr(x.Args[0], row, ctx)
+			elemD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			if arrD.IsNull() {
+				return NullDatum, nil
+			}
+			target := "NULL"
+			if !elemD.IsNull() {
+				target = elemD.Format()
+			}
+			src := parseTextArray(arrD.StringValue())
+			out := make([]string, 0, len(src))
+			for _, e := range src {
+				if e == target {
+					continue
+				}
+				out = append(out, e)
+			}
+			return NewStringDatum(formatTextArray(out)), nil
+		}
+
 	case "array_dims":
 		// array_dims(anyarray) → text — returns '[1:N]' for a 1-D array of N elements.
 		if len(x.Args) == 1 {
@@ -8402,6 +8479,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// for a row in the named relation. M0097-0038.
 	case "currtid2":
 		return evalCurrtid2(x, row, ctx)
+	// acldefault("char", oid) → aclitem[]: the hard-wired default access
+	// privileges for a newly-created object of the given type. pg_dump's
+	// getNamespaces/getTypes/getTables/... call it as the baseline to diff
+	// against the stored *acl column. M0110-0001 / DU-002 slice 2.
+	case "acldefault":
+		return evalAclDefault(x, row, ctx)
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.
@@ -8431,6 +8514,133 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 
 	return evalStoredRoutineFuncCall(x, row, ctx)
+}
+
+// ACL privilege bits, mirroring src/include/nodes/parsenodes.h. Used by
+// evalAclDefault to compute hard-wired default privileges.
+const (
+	aclInsert      = 1 << 0  // 'a'
+	aclSelect      = 1 << 1  // 'r'
+	aclUpdate      = 1 << 2  // 'w'
+	aclDelete      = 1 << 3  // 'd'
+	aclTruncate    = 1 << 4  // 'D'
+	aclReferences  = 1 << 5  // 'x'
+	aclTrigger     = 1 << 6  // 't'
+	aclExecute     = 1 << 7  // 'X'
+	aclUsage       = 1 << 8  // 'U'
+	aclCreate      = 1 << 9  // 'C'
+	aclCreateTemp  = 1 << 10 // 'T'
+	aclConnect     = 1 << 11 // 'c'
+	aclSet         = 1 << 12 // 's'
+	aclAlterSystem = 1 << 13 // 'A'
+	aclMaintain    = 1 << 14 // 'm'
+)
+
+// aclPrivString renders a privilege bitmask to its canonical letter string,
+// emitting letters in PostgreSQL's fixed ACL_ALL_RIGHTS_STR order
+// ("arwdDxtXUCTcsAm", src/include/utils/acl.h). e.g. USAGE|CREATE → "UC".
+func aclPrivString(mask int) string {
+	const order = "arwdDxtXUCTcsAm"
+	bits := [...]int{
+		aclInsert, aclSelect, aclUpdate, aclDelete, aclTruncate,
+		aclReferences, aclTrigger, aclExecute, aclUsage, aclCreate,
+		aclCreateTemp, aclConnect, aclSet, aclAlterSystem, aclMaintain,
+	}
+	var b strings.Builder
+	for i, bit := range bits {
+		if mask&bit != 0 {
+			b.WriteByte(order[i])
+		}
+	}
+	return b.String()
+}
+
+// aclRoleNameForOID resolves a role OID to the name aclitemout would print.
+// goopg has the single bootstrap superuser "postgres" (OID 10,
+// BOOTSTRAP_SUPERUSERID); any other OID falls back to its numeric form, which
+// is what PostgreSQL emits for a since-dropped role.
+func aclRoleNameForOID(oid int64) string {
+	if oid == 10 {
+		return "postgres"
+	}
+	return strconv.FormatInt(oid, 10)
+}
+
+// evalAclDefault implements acldefault("char" objtype, oid ownerId) → aclitem[].
+// It mirrors acldefault()/acldefault_sql() in src/backend/utils/adt/acl.c: it
+// computes the hard-wired default access privileges for a newly-created object
+// of the given type and renders them as the text form of an aclitem[] array,
+// e.g. acldefault('n', 10) → "{postgres=UC/postgres}". The world (PUBLIC) entry
+// is emitted first, then the owner entry, each only when non-empty. NULL input
+// yields NULL. M0110-0001 / DU-002 slice 2.
+func evalAclDefault(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 2 {
+		return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(),
+			Message: "acldefault(\"char\", oid) requires exactly 2 arguments"}
+	}
+	typeArg, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	ownerArg, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	if typeArg.IsNull() || ownerArg.IsNull() {
+		return NullDatum, nil
+	}
+	objtype := typeArg.Format()
+	if objtype == "" {
+		return NullDatum, &ExecError{Code: "22P02", Pos: x.Pos(),
+			Message: "invalid input syntax for type \"char\""}
+	}
+
+	var worldDefault, ownerDefault int
+	switch objtype[0] {
+	case 'c': // OBJECT_COLUMN — no extra privileges
+	case 'r': // OBJECT_TABLE
+		ownerDefault = aclInsert | aclSelect | aclUpdate | aclDelete |
+			aclTruncate | aclReferences | aclTrigger | aclMaintain
+	case 's': // OBJECT_SEQUENCE
+		ownerDefault = aclUsage | aclSelect | aclUpdate
+	case 'd': // OBJECT_DATABASE
+		worldDefault = aclCreateTemp | aclConnect
+		ownerDefault = aclCreate | aclCreateTemp | aclConnect
+	case 'f': // OBJECT_FUNCTION
+		worldDefault = aclExecute
+		ownerDefault = aclExecute
+	case 'l': // OBJECT_LANGUAGE
+		worldDefault = aclUsage
+		ownerDefault = aclUsage
+	case 'L': // OBJECT_LARGEOBJECT
+		ownerDefault = aclSelect | aclUpdate
+	case 'n': // OBJECT_SCHEMA
+		ownerDefault = aclUsage | aclCreate
+	case 't': // OBJECT_TABLESPACE
+		ownerDefault = aclCreate
+	case 'F': // OBJECT_FDW
+		ownerDefault = aclUsage
+	case 'S': // OBJECT_FOREIGN_SERVER
+		ownerDefault = aclUsage
+	case 'T': // OBJECT_TYPE / OBJECT_DOMAIN
+		worldDefault = aclUsage
+		ownerDefault = aclUsage
+	case 'p': // OBJECT_PARAMETER_ACL
+		ownerDefault = aclSet | aclAlterSystem
+	default:
+		return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(),
+			Message: fmt.Sprintf("unrecognized object type abbreviation: %c", objtype[0])}
+	}
+
+	ownerName := aclRoleNameForOID(ownerArg.Int)
+	var items []string
+	if worldDefault != 0 {
+		items = append(items, "="+aclPrivString(worldDefault)+"/"+ownerName)
+	}
+	if ownerDefault != 0 {
+		items = append(items, ownerName+"="+aclPrivString(ownerDefault)+"/"+ownerName)
+	}
+	return NewStringDatum("{" + strings.Join(items, ",") + "}"), nil
 }
 
 // evalCurrtid2 implements currtid2(relname text, tid tid) → tid.
@@ -9626,14 +9836,20 @@ func charTypeDisplayForm(b byte) string {
 // search_path and returning the first schema that exists. Built-in schemas
 // (pg_catalog, information_schema, public) are always considered present.
 // Returns NullDatum if no schema on the path exists.
-func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {
+// searchPathSchemas returns the schemas in the effective search_path that
+// actually exist, in search-path order. Shared by current_schema (scalar,
+// first entry) and current_schemas (array). $user expands to the connection
+// user; built-in schemas (pg_catalog/information_schema/public) always exist,
+// user schemas are confirmed via the catalog.
+func searchPathSchemas(ctx *Context) []string {
 	searchPath := `"$user", public` // default
-	if ctx.GetSetting != nil {
+	if ctx != nil && ctx.GetSetting != nil {
 		if v, ok := ctx.GetSetting("search_path"); ok {
 			searchPath = v
 		}
 	}
 	user := "postgres"
+	var out []string
 	for _, rawSchema := range strings.Split(searchPath, ",") {
 		s := strings.TrimSpace(rawSchema)
 		s = strings.Trim(s, `"'`)
@@ -9646,16 +9862,48 @@ func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {
 		lc := strings.ToLower(s)
 		switch lc {
 		case "pg_catalog", "information_schema", "public":
-			return NewStringDatum(lc), nil
+			out = append(out, lc)
+			continue
 		}
 		// User-created schemas: check if a table with this schema prefix exists.
-		if ctx.Catalog != nil {
+		if ctx != nil && ctx.Catalog != nil {
 			if _, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: s}); ok {
-				return NewStringDatum(s), nil
+				out = append(out, s)
 			}
 		}
 	}
-	return NullDatum, nil
+	return out
+}
+
+func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {
+	schemas := searchPathSchemas(ctx)
+	if len(schemas) == 0 {
+		return NullDatum, nil
+	}
+	return NewStringDatum(schemas[0]), nil
+}
+
+// currentSchemasArray renders the existing search-path schemas as a `{a,b}`
+// text array literal (name[]). When includeImplicit is true, the implicitly
+// searched pg_catalog is prepended unless already explicitly present.
+func currentSchemasArray(ctx *Context, includeImplicit bool) (Datum, error) {
+	schemas := searchPathSchemas(ctx)
+	if includeImplicit {
+		hasPgCatalog := false
+		for _, s := range schemas {
+			if s == "pg_catalog" {
+				hasPgCatalog = true
+				break
+			}
+		}
+		if !hasPgCatalog {
+			schemas = append([]string{"pg_catalog"}, schemas...)
+		}
+	}
+	if len(schemas) == 0 {
+		return NewStringDatum("{}"), nil
+	}
+	return NewStringDatum("{" + strings.Join(schemas, ",") + "}"), nil
 }
 
 func isValidBoolInput(v string) bool {

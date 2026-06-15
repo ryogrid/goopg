@@ -103,16 +103,22 @@ func TestPGClassColumnsCount(t *testing.T) {
 }
 
 // TestPGAttributeColumnsCount checks the pg_attribute schema column count.
-// The schema must match the PG18 canonical 24-column layout written by initdb.
+// The schema is the 25-column layout written by initdb.pgAttrColDefs:
+// 24 leading columns plus attstattarget appended last (DU-002 slice 24).
 func TestPGAttributeColumnsCount(t *testing.T) {
 	cols := PGAttributeColumns()
-	if got := len(cols); got != 24 {
-		t.Errorf("PGAttributeColumns: len=%d want 24", got)
+	if got := len(cols); got != 25 {
+		t.Errorf("PGAttributeColumns: len=%d want 25", got)
 	}
-	// Verify key columns are present at the right ordinals.
-	wantCols := []struct{ ord int; name string }{
+	// Verify key columns are present at the right ordinals. attstattarget is
+	// the trailing column (ordinal 24); the leading 24 are unchanged.
+	wantCols := []struct {
+		ord  int
+		name string
+	}{
 		{0, "attrelid"}, {1, "attname"}, {2, "atttypid"}, {4, "attnum"},
 		{10, "attcompression"}, {11, "attnotnull"}, {16, "attisdropped"},
+		{24, "attstattarget"},
 	}
 	for _, wc := range wantCols {
 		if wc.ord >= len(cols) {
@@ -166,7 +172,10 @@ func TestBuiltinTypeOIDs(t *testing.T) {
 // TestTypeNameToOIDRoundTrip verifies that TypeNameToOID and OIDToTypeName
 // are inverses for the canonical type names (M0030-0005).
 func TestTypeNameToOIDRoundTrip(t *testing.T) {
-	pairs := []struct{ name string; oid uint32 }{
+	pairs := []struct {
+		name string
+		oid  uint32
+	}{
 		{"bool", OIDBool},
 		{"bytea", OIDBytea},
 		{"int8", OIDInt8},
@@ -198,7 +207,10 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 
 // TestTypeNameToOIDAlternativeNames verifies type name aliases resolve correctly.
 func TestTypeNameToOIDAlternativeNames(t *testing.T) {
-	cases := []struct{ alias string; wantOID uint32 }{
+	cases := []struct {
+		alias   string
+		wantOID uint32
+	}{
 		{"integer", OIDInt4},
 		{"int", OIDInt4},
 		{"bigint", OIDInt8},

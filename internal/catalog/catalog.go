@@ -3412,6 +3412,785 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.tables["pg_catalog.pg_am"] = pgAm
 
+	// pg_depend — dependency catalog (OID 2608).
+	// goopg does not maintain a general dependency graph (sequence ownership,
+	// extension membership, etc. are not tracked), so this view is empty. pg_dump
+	// LEFT JOINs pg_depend in getTables to discover a sequence's owning column;
+	// with no rows the join yields NULL owning_tab/owning_col and
+	// is_identity_sequence=false, which is the correct result for a server that
+	// has no recorded dependencies. The schema matches PG's pg_depend exactly so
+	// that the catalog-query column references (classid, objid, objsubid,
+	// refclassid, refobjid, refobjsubid, deptype) resolve. M0110-0001 (DU-002).
+	pgDepend := &Table{
+		Schema: "pg_catalog", Name: "pg_depend", Virtual: true,
+		Columns: []Column{
+			{Name: "classid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "objid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "objsubid", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "refclassid", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "refobjid", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "refobjsubid", Type: Type{Name: "int4"}, Ordinal: 5},
+			{Name: "deptype", Type: Type{Name: "char"}, Ordinal: 6},
+		},
+		OID: 2608,
+	}
+	pgDepend.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_depend"] = pgDepend
+
+	// pg_tablespace — tablespace catalog (OID 1213). The on-disk shared heap
+	// (initialized by initdb with pg_default/pg_global) is not wired into the SQL
+	// query layer, so expose a virtual view: the two bootstrap tablespaces plus
+	// any in-place tablespaces in the runtime registry (CREATE TABLESPACE,
+	// M0095-0003). pg_dump's getTables LEFT JOINs it for spcname; \db and other
+	// clients read it directly. M0110-0001 (DU-002). Schema matches PG's
+	// pg_tablespace (oid, spcname, spcowner, spcacl, spcoptions).
+	pgTablespace := &Table{
+		Schema: "pg_catalog", Name: "pg_tablespace", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "spcname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "spcowner", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "spcacl", Type: Type{Name: "aclitem[]"}, Ordinal: 3},
+			{Name: "spcoptions", Type: Type{Name: "text[]"}, Ordinal: 4},
+		},
+		OID: 1213,
+	}
+	pgTablespace.VirtualRows = c.tablespaceVirtualRows
+	c.tables["pg_catalog.pg_tablespace"] = pgTablespace
+
+	// pg_foreign_table — foreign-table catalog (OID 3118). goopg implements no
+	// foreign-data wrappers, so this view is always empty. pg_dump's getTables
+	// runs a `SELECT ftserver FROM pg_foreign_table WHERE ftrelid = c.oid`
+	// subquery in the relkind='f' branch; with no foreign tables it returns no
+	// rows (the branch is never taken for goopg relations anyway). Schema matches
+	// PG's pg_foreign_table (ftrelid, ftserver, ftoptions). M0110-0001 (DU-002).
+	pgForeignTable := &Table{
+		Schema: "pg_catalog", Name: "pg_foreign_table", Virtual: true,
+		Columns: []Column{
+			{Name: "ftrelid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "ftserver", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "ftoptions", Type: Type{Name: "text[]"}, Ordinal: 2},
+		},
+		OID: 3118,
+	}
+	pgForeignTable.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_foreign_table"] = pgForeignTable
+
+	// pg_init_privs — initial-privileges catalog (OID 3394). PG records here the
+	// privileges an object had immediately after initdb (privtype 'i') or after
+	// an extension installed it (privtype 'e'); pg_dump diffs the object's current
+	// *acl against this to dump only the privilege changes a user made. goopg
+	// installs no extensions and does not snapshot initdb-time ACLs, so this view
+	// is empty by construction. pg_dump's getTables/getFuncs/getTypes/… LEFT JOIN
+	// `pg_init_privs pip ON (c.oid=pip.objoid AND pip.classoid='<catalog>'::regclass
+	// AND pip.objsubid=0)`; with no rows the join yields NULL pip.initprivs, so the
+	// `relacl IS DISTINCT FROM pip.initprivs` predicate degenerates to "dump the
+	// full ACL", which is correct for a server that tracks no initial privileges.
+	// Schema matches PG's pg_init_privs (objoid, classoid, objsubid, privtype,
+	// initprivs); like the upstream catalog it has NO oid system column.
+	// M0110-0001 (DU-002).
+	pgInitPrivs := &Table{
+		Schema: "pg_catalog", Name: "pg_init_privs", Virtual: true,
+		Columns: []Column{
+			{Name: "objoid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "objsubid", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "privtype", Type: Type{Name: "char"}, Ordinal: 3},
+			{Name: "initprivs", Type: Type{Name: "aclitem[]"}, Ordinal: 4},
+		},
+		OID: 3394,
+	}
+	pgInitPrivs.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_init_privs"] = pgInitPrivs
+
+	// pg_cast — cast catalog (OID 2605). goopg registers no user-defined casts, so
+	// this view is empty. pg_dump's getFuncs runs `EXISTS (SELECT 1 FROM pg_cast
+	// WHERE pg_cast.oid > <g_last_builtin_oid> AND p.oid = pg_cast.castfunc)` to
+	// pull in pg_catalog functions referenced by a user cast; with no rows the
+	// subquery is always false, so only the genuine namespace/ACL predicates
+	// select rows (correct — built-in casts are never dumped). Schema matches PG's
+	// pg_cast (oid, castsource, casttarget, castfunc, castcontext, castmethod).
+	// castfunc is typed oid (not regproc) so the `p.oid = pg_cast.castfunc`
+	// comparison resolves with goopg's oid equality operator. M0110-0001 (DU-002).
+	pgCast := &Table{
+		Schema: "pg_catalog", Name: "pg_cast", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "castsource", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "casttarget", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "castfunc", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "castcontext", Type: Type{Name: "char"}, Ordinal: 4},
+			{Name: "castmethod", Type: Type{Name: "char"}, Ordinal: 5},
+		},
+		OID: 2605,
+	}
+	pgCast.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_cast"] = pgCast
+
+	// pg_transform — transform catalog (OID 3576). goopg implements no
+	// language-transform objects, so this view is empty. pg_dump's getFuncs runs
+	// `EXISTS (SELECT 1 FROM pg_transform WHERE pg_transform.oid > <g_last_builtin_oid>
+	// AND (p.oid = pg_transform.trffromsql OR p.oid = pg_transform.trftosql))`; with
+	// no rows the subquery is always false. Schema matches PG's pg_transform (oid,
+	// trftype, trflang, trffromsql, trftosql); trffromsql/trftosql are typed oid
+	// (PG uses regproc, which is oid-compatible) so the `p.oid = …` comparisons
+	// resolve. M0110-0001 (DU-002).
+	pgTransform := &Table{
+		Schema: "pg_catalog", Name: "pg_transform", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "trftype", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "trflang", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "trffromsql", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "trftosql", Type: Type{Name: "oid"}, Ordinal: 4},
+		},
+		OID: 3576,
+	}
+	pgTransform.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_transform"] = pgTransform
+
+	// pg_language — procedural-language catalog (OID 2612). pg_dump's getProcLangs
+	// runs `SELECT tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline,
+	// lanvalidator, lanacl, acldefault('l', lanowner) AS acldefault, lanowner FROM
+	// pg_language WHERE lanispl ORDER BY oid`. The `WHERE lanispl` predicate selects
+	// only user-installed procedural languages — the built-in internal/c/sql langs
+	// have lanispl=false and are never dumped. goopg installs no user PLs, so
+	// getProcLangs still finds nothing. BUT dumpFunc joins pg_proc to pg_language
+	// WITHOUT a lanispl filter (`WHERE p.oid=$1 AND l.oid=p.prolang`) purely to
+	// fetch lanname for the function's prolang; with 0 rows that join returns
+	// "0 rows instead of one" and aborts the dump. So this view is populated with
+	// the 3 built-in BKI rows (internal/c/sql, OIDs 12/13/14) matching initdb's
+	// pgLanguageInitialEntries(); all three have lanispl=false so getProcLangs's
+	// `WHERE lanispl` still returns 0. Schema matches PG's pg_language (oid,
+	// lanname name, lanowner oid, lanispl bool, lanpltrusted bool, lanplcallfoid oid,
+	// laninline oid, lanvalidator oid, lanacl aclitem[]); lanowner is typed oid so
+	// `acldefault('l', lanowner)` resolves. lanvalidator=0 (no validators) and
+	// lanacl=NULL (default privileges) for all rows. M0110-0001 (DU-002 slice 42).
+	pgLanguage := &Table{
+		Schema: "pg_catalog", Name: "pg_language", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "lanname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "lanowner", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "lanispl", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "lanpltrusted", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "lanplcallfoid", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "laninline", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "lanvalidator", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "lanacl", Type: Type{Name: "aclitem[]"}, Ordinal: 8},
+		},
+		OID: 2612,
+	}
+	// 3 built-in languages from postgres/src/include/catalog/pg_language.dat
+	// (oid, lanname, lanowner=10, lanispl=f, lanpltrusted, lanplcallfoid=0,
+	// laninline, lanvalidator=0, lanacl=NULL). sql is trusted with laninline=2511.
+	pgLanguage.VirtualRows = func() [][]string {
+		return [][]string{
+			{"12", "internal", "10", "f", "f", "0", "0", "0", ""},
+			{"13", "c", "10", "f", "f", "0", "0", "0", ""},
+			{"14", "sql", "10", "f", "t", "0", "2511", "0", ""},
+		}
+	}
+	c.tables["pg_catalog.pg_language"] = pgLanguage
+
+	// pg_operator — operator catalog (OID 2617). pg_dump's getOperators runs
+	// `SELECT tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft,
+	// oprright, oprcode::oid AS oprcode FROM pg_operator` — it reads ALL operators
+	// (built-ins included) and filters out system-defined ones at dump-out time by
+	// namespace dumpability. goopg defines no user operators, and the built-ins are
+	// in pg_catalog (never dumped), so this view is correctly empty (0 rows).
+	// Schema matches PG's pg_operator (pg_operator.h): oprcode is regproc in PG but
+	// oid-compatible, so it is typed oid here and `oprcode::oid` resolves as a no-op.
+	// M0110-0001 (DU-002 slice 9).
+	pgOperator := &Table{
+		Schema: "pg_catalog", Name: "pg_operator", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "oprname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "oprnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "oprowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "oprkind", Type: Type{Name: "char"}, Ordinal: 4},
+			{Name: "oprcanmerge", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "oprcanhash", Type: Type{Name: "bool"}, Ordinal: 6},
+			{Name: "oprleft", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "oprright", Type: Type{Name: "oid"}, Ordinal: 8},
+			{Name: "oprresult", Type: Type{Name: "oid"}, Ordinal: 9},
+			{Name: "oprcom", Type: Type{Name: "oid"}, Ordinal: 10},
+			{Name: "oprnegate", Type: Type{Name: "oid"}, Ordinal: 11},
+			{Name: "oprcode", Type: Type{Name: "oid"}, Ordinal: 12},
+			{Name: "oprrest", Type: Type{Name: "oid"}, Ordinal: 13},
+			{Name: "oprjoin", Type: Type{Name: "oid"}, Ordinal: 14},
+		},
+		OID: 2617,
+	}
+	pgOperator.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_operator"] = pgOperator
+
+	// pg_opclass — operator-class catalog (OID 2616). pg_dump's getOpclasses runs
+	// `SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM
+	// pg_opclass` — it reads ALL operator classes and filters out system-defined
+	// ones at dump-out time by namespace dumpability. goopg defines no user
+	// operator classes, and the built-ins are in pg_catalog (never dumped), so this
+	// view is correctly empty (0 rows). Schema matches PG's pg_opclass
+	// (pg_opclass.h). M0110-0001 (DU-002 slice 10).
+	pgOpclass := &Table{
+		Schema: "pg_catalog", Name: "pg_opclass", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "opcmethod", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "opcname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "opcnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "opcowner", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "opcfamily", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "opcintype", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "opcdefault", Type: Type{Name: "bool"}, Ordinal: 7},
+			{Name: "opckeytype", Type: Type{Name: "oid"}, Ordinal: 8},
+		},
+		OID: 2616,
+	}
+	pgOpclass.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_opclass"] = pgOpclass
+
+	// pg_opfamily — operator-family catalog (OID 2753). pg_dump's getOpfamilies
+	// runs `SELECT tableoid, oid, opfmethod, opfname, opfnamespace, opfowner FROM
+	// pg_opfamily` — it reads ALL operator families and filters out system-defined
+	// ones at dump-out time by namespace dumpability. goopg defines no user
+	// operator families, and the built-ins are in pg_catalog (never dumped), so
+	// this view is correctly empty (0 rows). Schema matches PG's pg_opfamily
+	// (pg_opfamily.h). M0110-0001 (DU-002 slice 11).
+	pgOpfamily := &Table{
+		Schema: "pg_catalog", Name: "pg_opfamily", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "opfmethod", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "opfname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "opfnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "opfowner", Type: Type{Name: "oid"}, Ordinal: 4},
+		},
+		OID: 2753,
+	}
+	pgOpfamily.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_opfamily"] = pgOpfamily
+
+	// pg_ts_parser — text-search parser catalog (OID 3601). pg_dump's
+	// getTSParsers runs `SELECT tableoid, oid, prsname, prsnamespace,
+	// prsstart::oid, prstoken::oid, prsend::oid, prsheadline::oid,
+	// prslextype::oid FROM pg_ts_parser` — it reads ALL TS parsers and filters
+	// out system-defined ones at dump-out time by namespace dumpability. goopg
+	// defines no user TS parsers, and the built-ins are in pg_catalog (never
+	// dumped), so this view is correctly empty (0 rows). The ::oid casts in the
+	// query are no-ops since the prs* columns are regproc (oid-compatible).
+	// Schema matches PG's pg_ts_parser (pg_ts_parser.h). M0110-0001 (DU-002
+	// slice 12).
+	pgTSParser := &Table{
+		Schema: "pg_catalog", Name: "pg_ts_parser", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "prsname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "prsnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "prsstart", Type: Type{Name: "regproc"}, Ordinal: 3},
+			{Name: "prstoken", Type: Type{Name: "regproc"}, Ordinal: 4},
+			{Name: "prsend", Type: Type{Name: "regproc"}, Ordinal: 5},
+			{Name: "prsheadline", Type: Type{Name: "regproc"}, Ordinal: 6},
+			{Name: "prslextype", Type: Type{Name: "regproc"}, Ordinal: 7},
+		},
+		OID: 3601,
+	}
+	pgTSParser.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_ts_parser"] = pgTSParser
+
+	// pg_ts_template — text-search template catalog (OID 3764). pg_dump's
+	// getTSTemplates runs `SELECT tableoid, oid, tmplname, tmplnamespace,
+	// tmplinit::oid, tmpllexize::oid FROM pg_ts_template` — it reads ALL TS
+	// templates and filters out system-defined ones at dump-out time by
+	// namespace dumpability. goopg defines no user TS templates, and the
+	// built-ins live in pg_catalog (never dumped), so this view is correctly
+	// empty (0 rows). The ::oid casts in the query are no-ops since the tmpl*
+	// columns are regproc (oid-compatible). Schema matches PG's pg_ts_template
+	// (pg_ts_template.h). M0110-0001 (DU-002 slice 13).
+	pgTSTemplate := &Table{
+		Schema: "pg_catalog", Name: "pg_ts_template", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "tmplname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "tmplnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "tmplinit", Type: Type{Name: "regproc"}, Ordinal: 3},
+			{Name: "tmpllexize", Type: Type{Name: "regproc"}, Ordinal: 4},
+		},
+		OID: 3764,
+	}
+	pgTSTemplate.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_ts_template"] = pgTSTemplate
+
+	// pg_ts_dict — text-search dictionary catalog (OID 3600). pg_dump's
+	// getTSDictionaries runs `SELECT tableoid, oid, dictname, dictnamespace,
+	// dictowner, dicttemplate, dictinitoption FROM pg_ts_dict` — it reads ALL
+	// TS dictionaries and filters out system-defined ones at dump-out time by
+	// namespace dumpability. goopg defines no user TS dictionaries, and the
+	// built-ins live in pg_catalog (never dumped), so this view is correctly
+	// empty (0 rows). dicttemplate is an oid FK to pg_ts_template (not a
+	// regproc); dictinitoption is text. Schema matches PG's pg_ts_dict
+	// (pg_ts_dict.h). M0110-0001 (DU-002 slice 14).
+	pgTSDict := &Table{
+		Schema: "pg_catalog", Name: "pg_ts_dict", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "dictname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "dictnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "dictowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "dicttemplate", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "dictinitoption", Type: Type{Name: "text"}, Ordinal: 5},
+		},
+		OID: 3600,
+	}
+	pgTSDict.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_ts_dict"] = pgTSDict
+
+	// pg_ts_config — text-search configuration catalog (OID 3602). pg_dump's
+	// getTSConfigurations runs `SELECT tableoid, oid, cfgname, cfgnamespace,
+	// cfgowner, cfgparser FROM pg_ts_config` — it reads ALL TS configurations
+	// and filters out system-defined ones at dump-out time by namespace
+	// dumpability. goopg defines no user TS configurations, and the built-ins
+	// live in pg_catalog (never dumped), so this view is correctly empty (0
+	// rows). cfgparser is an oid FK to pg_ts_parser. Schema matches PG's
+	// pg_ts_config (pg_ts_config.h). M0110-0001 (DU-002 slice 15).
+	pgTSConfig := &Table{
+		Schema: "pg_catalog", Name: "pg_ts_config", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "cfgname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "cfgnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "cfgowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "cfgparser", Type: Type{Name: "oid"}, Ordinal: 4},
+		},
+		OID: 3602,
+	}
+	pgTSConfig.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_ts_config"] = pgTSConfig
+
+	// pg_foreign_data_wrapper — foreign-data wrapper catalog (OID 2328).
+	// pg_dump's getForeignDataWrappers runs `SELECT tableoid, oid, fdwname,
+	// fdwowner, fdwhandler::pg_catalog.regproc, fdwvalidator::pg_catalog.regproc,
+	// fdwacl, acldefault('F', fdwowner) AS acldefault,
+	// array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' ||
+	// quote_literal(option_value) FROM pg_options_to_table(fdwoptions) ORDER BY
+	// option_name), E',\n    ') AS fdwoptions FROM pg_foreign_data_wrapper` — it
+	// reads ALL FDWs and dumps the user-defined ones. goopg defines no FDWs (no
+	// CREATE FOREIGN DATA WRAPPER), so this view is correctly empty (0 rows); the
+	// pg_options_to_table SRF in the ARRAY subquery is therefore never evaluated.
+	// Schema matches PG's pg_foreign_data_wrapper (pg_foreign_data_wrapper.h):
+	// oid, fdwname name, fdwowner oid, fdwhandler oid (FK to pg_proc),
+	// fdwvalidator oid (FK to pg_proc), fdwacl aclitem[], fdwoptions text[].
+	// M0110-0001 (DU-002 slice 16).
+	pgForeignDataWrapper := &Table{
+		Schema: "pg_catalog", Name: "pg_foreign_data_wrapper", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "fdwname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "fdwowner", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "fdwhandler", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "fdwvalidator", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "fdwacl", Type: Type{Name: "aclitem[]"}, Ordinal: 5},
+			{Name: "fdwoptions", Type: Type{Name: "text[]"}, Ordinal: 6},
+		},
+		OID: 2328,
+	}
+	pgForeignDataWrapper.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_foreign_data_wrapper"] = pgForeignDataWrapper
+
+	// pg_foreign_server — foreign-server catalog (OID 1417). pg_dump's
+	// getForeignServers runs `SELECT tableoid, oid, srvname, srvowner,
+	// srvfdw, srvtype, srvversion, srvacl,
+	// acldefault('S', srvowner) AS acldefault,
+	// array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' ||
+	// quote_literal(option_value) FROM pg_options_to_table(srvoptions) ORDER BY
+	// option_name), E',\n    ') AS srvoptions FROM pg_foreign_server` after
+	// getForeignDataWrappers. goopg defines no foreign servers (no CREATE SERVER),
+	// so this view is correctly empty (0 rows); the correlated
+	// pg_options_to_table(srvoptions) ARRAY subquery (slice 18) is therefore never
+	// evaluated. Schema matches PG's pg_foreign_server (pg_foreign_server.h):
+	// oid, srvname name, srvowner oid, srvfdw oid (FK to pg_foreign_data_wrapper),
+	// srvtype text, srvversion text, srvacl aclitem[], srvoptions text[].
+	// M0110-0001 (DU-002 slice 19).
+	pgForeignServer := &Table{
+		Schema: "pg_catalog", Name: "pg_foreign_server", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "srvname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "srvowner", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "srvfdw", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "srvtype", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "srvversion", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "srvacl", Type: Type{Name: "aclitem[]"}, Ordinal: 6},
+			{Name: "srvoptions", Type: Type{Name: "text[]"}, Ordinal: 7},
+		},
+		OID: 1417,
+	}
+	pgForeignServer.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_foreign_server"] = pgForeignServer
+
+	// pg_default_acl — default-ACL catalog (OID 826). After getForeignServers,
+	// pg_dump's getUserMappings short-circuits (no foreign servers → no catalog
+	// query), so the next catalog query is getDefaultACLs:
+	//   SELECT oid, tableoid, defaclrole, defaclnamespace, defaclobjtype,
+	//   defaclacl, CASE WHEN defaclnamespace = 0 THEN acldefault(CASE WHEN
+	//   defaclobjtype = 'S' THEN 's'::"char" ELSE defaclobjtype END, defaclrole)
+	//   ELSE '{}' END AS acldefault FROM pg_default_acl
+	// goopg defines no default-ACL entries (no ALTER DEFAULT PRIVILEGES), so this
+	// view is correctly empty (0 rows); the CASE/acldefault projection is never
+	// evaluated. Schema matches PG's pg_default_acl (pg_default_acl.h):
+	// oid, defaclrole oid, defaclnamespace oid, defaclobjtype "char",
+	// defaclacl aclitem[]. M0110-0001 (DU-002 slice 20).
+	pgDefaultACL := &Table{
+		Schema: "pg_catalog", Name: "pg_default_acl", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "defaclrole", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "defaclnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "defaclobjtype", Type: Type{Name: "char"}, Ordinal: 3},
+			{Name: "defaclacl", Type: Type{Name: "aclitem[]"}, Ordinal: 4},
+		},
+		OID: 826,
+	}
+	pgDefaultACL.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_default_acl"] = pgDefaultACL
+
+	// pg_conversion — encoding-conversion catalog (OID 2607). After
+	// getDefaultACLs, pg_dump's getConversions runs:
+	//   SELECT tableoid, oid, conname, connamespace, conowner FROM pg_conversion
+	// (pg_dump.c getConversions: "find all conversions, including builtin
+	// conversions; we filter out system-defined conversions at dump-out time").
+	// PG ships ~130 built-in conversions, but every one lives in the pg_catalog
+	// namespace and is filtered out at dump-out time (selectDumpableObject marks
+	// pg_catalog objects DUMP_COMPONENT_NONE). goopg defines no user conversions
+	// (no CREATE CONVERSION), so an empty view (0 rows) is correct — pg_dump finds
+	// nothing dumpable, identical to the built-ins-only PG outcome. Schema matches
+	// PG's pg_conversion (pg_conversion.h): oid, conname name, connamespace oid,
+	// conowner oid, conforencoding int4, contoencoding int4, conproc regproc(oid),
+	// condefault bool. M0110-0001 (DU-002 slice 21).
+	pgConversion := &Table{
+		Schema: "pg_catalog", Name: "pg_conversion", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "conname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "connamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "conowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "conforencoding", Type: Type{Name: "int4"}, Ordinal: 4},
+			{Name: "contoencoding", Type: Type{Name: "int4"}, Ordinal: 5},
+			{Name: "conproc", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "condefault", Type: Type{Name: "bool"}, Ordinal: 7},
+		},
+		OID: 2607,
+	}
+	pgConversion.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_conversion"] = pgConversion
+
+	// pg_range — range-type catalog (OID 3541). After getConversions, pg_dump's
+	// getCasts runs:
+	//   SELECT tableoid, oid, castsource, casttarget, castfunc, castcontext,
+	//   castmethod FROM pg_cast c WHERE NOT EXISTS ( SELECT 1 FROM pg_range r
+	//   WHERE c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid )
+	//   ORDER BY 3,4
+	// (pg_dump.c getCasts: range types' auto-generated casts are excluded via the
+	// NOT EXISTS against pg_range so they aren't dumped separately). goopg defines
+	// no range types (no CREATE TYPE ... AS RANGE), so an empty view (0 rows) is
+	// correct — the NOT EXISTS is always true, matching PG's outcome when no user
+	// range types exist. Schema matches PG's pg_range (pg_range.h): NOTE pg_range
+	// has NO oid column; rngtypid is the key. Cols: rngtypid oid, rngsubtype oid,
+	// rngmultitypid oid, rngcollation oid, rngsubopc oid, rngcanonical regproc(oid),
+	// rngsubdiff regproc(oid). M0110-0001 (DU-002 slice 22).
+	pgRange := &Table{
+		Schema: "pg_catalog", Name: "pg_range", Virtual: true,
+		Columns: []Column{
+			{Name: "rngtypid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "rngsubtype", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "rngmultitypid", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "rngcollation", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "rngsubopc", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "rngcanonical", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "rngsubdiff", Type: Type{Name: "oid"}, Ordinal: 6},
+		},
+		OID: 3541,
+	}
+	pgRange.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_range"] = pgRange
+
+	// pg_event_trigger — event-trigger catalog (OID 3466). After getCasts,
+	// pg_dump's getEventTriggers runs:
+	//   SELECT e.tableoid, e.oid, evtname, evtenabled, evtevent, evtowner,
+	//   array_to_string(array(select quote_literal(x) from unnest(evttags) as
+	//   t(x)), ', ') as evttags, e.evtfoid::regproc as evtfname FROM
+	//   pg_event_trigger e ORDER BY e.oid
+	// (pg_dump.c getEventTriggers). goopg defines no event triggers (no CREATE
+	// EVENT TRIGGER), so an empty view (0 rows) is correct — pg_dump finds
+	// nothing dumpable, identical to a stock PG cluster with no user event
+	// triggers. With 0 rows the unnest(evttags)/array_to_string projection is
+	// never evaluated, so the empty text[] column is fine. Schema matches PG's
+	// pg_event_trigger (pg_event_trigger.h): oid, evtname name, evtevent name,
+	// evtowner oid, evtfoid oid, evtenabled "char", evttags text[].
+	// M0110-0001 (DU-002 slice 23).
+	pgEventTrigger := &Table{
+		Schema: "pg_catalog", Name: "pg_event_trigger", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "evtname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "evtevent", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "evtowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "evtfoid", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "evtenabled", Type: Type{Name: "char"}, Ordinal: 5},
+			{Name: "evttags", Type: Type{Name: "text[]"}, Ordinal: 6},
+		},
+		OID: 3466,
+	}
+	pgEventTrigger.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_event_trigger"] = pgEventTrigger
+
+	// pg_partitioned_table — partition-key catalog (OID 3350). After
+	// getEventTriggers, pg_dump's getTableAttrs / collectComments path probes
+	// partitioning metadata. The query that first hits this catalog is:
+	//   SELECT partrelid FROM pg_partitioned_table WHERE (SELECT c.oid FROM
+	//   pg_opclass c JOIN pg_am a ON c.opcmethod = a.oid WHERE opcname =
+	//   'enum_ops' AND opcnamespace = 'pg_catalog'::regnamespace AND amname =
+	//   'hash') = ANY(partclass)
+	// goopg surfaces partition membership through pg_class.relkind='p'/'P' and
+	// pg_inherits, not a separate per-partition-key heap, so an empty view (0
+	// rows) is correct here — no user partitioned tables exist in the dumped
+	// schema, identical to a stock PG cluster with none. With 0 rows the
+	// `= ANY(partclass)` predicate is never evaluated, so the oidvector column
+	// is fine. Schema matches PG's pg_partitioned_table (pg_partitioned_table.h):
+	// partrelid oid, partstrat "char", partnatts int2, partdefid oid, partattrs
+	// int2vector, partclass oidvector, partcollation oidvector, partexprs
+	// pg_node_tree. goopg represents int2vector/oidvector as int2[]/oid[] (see
+	// pg_index indkey/indclass). M0110-0001 (DU-002 slice 25).
+	pgPartitionedTable := &Table{
+		Schema: "pg_catalog", Name: "pg_partitioned_table", Virtual: true,
+		Columns: []Column{
+			{Name: "partrelid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "partstrat", Type: Type{Name: "char"}, Ordinal: 1},
+			{Name: "partnatts", Type: Type{Name: "int2"}, Ordinal: 2},
+			{Name: "partdefid", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "partattrs", Type: Type{Name: "int2[]"}, Ordinal: 4},
+			{Name: "partclass", Type: Type{Name: "oid[]"}, Ordinal: 5},
+			{Name: "partcollation", Type: Type{Name: "oid[]"}, Ordinal: 6},
+			{Name: "partexprs", Type: Type{Name: "pg_node_tree"}, Ordinal: 7},
+		},
+		OID: 3350,
+	}
+	pgPartitionedTable.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_partitioned_table"] = pgPartitionedTable
+
+	// pg_trigger — trigger catalog (OID 2620). After getTableAttrs, pg_dump's
+	// getTriggers probes per-table triggers. The query that first hits this
+	// catalog is:
+	//   SELECT t.tgrelid, t.tgname, pg_catalog.pg_get_triggerdef(t.oid, false)
+	//   AS tgdef, t.tgenabled, t.tableoid, t.oid, t.tgparentid <> 0 AS
+	//   tgispartition FROM unnest('{}'::pg_catalog.oid[]) AS src(tbloid) JOIN
+	//   pg_catalog.pg_trigger t ON (src.tbloid = t.tgrelid) LEFT JOIN
+	//   pg_catalog.pg_trigger u ON (u.oid = t.tgparentid) WHERE ((NOT
+	//   t.tgisinternal AND t.tgparentid = 0) OR t.tgenabled != u.tgenabled)
+	//   ORDER BY t.tgrelid, t.tgname
+	// goopg has no user-defined triggers, so an empty view (0 rows) is correct,
+	// identical to a stock PG cluster with none. The unnest('{}') source is
+	// empty so the JOIN and pg_get_triggerdef are never evaluated. Schema
+	// matches PG's pg_trigger (pg_trigger.h): tgrelid oid, tgparentid oid,
+	// tgname name, tgfoid oid, tgtype int2, tgenabled "char", tgisinternal bool,
+	// tgconstrrelid oid, tgconstrindid oid, tgconstraint oid, tgdeferrable bool,
+	// tginitdeferred bool, tgnargs int2, tgattr int2vector, tgargs bytea, tgqual
+	// pg_node_tree, tgoldtable name, tgnewtable name. goopg represents
+	// int2vector as int2[] (see pg_index indkey). M0110-0001 (DU-002 slice 26).
+	pgTrigger := &Table{
+		Schema: "pg_catalog", Name: "pg_trigger", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "tgrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "tgparentid", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "tgname", Type: Type{Name: "name"}, Ordinal: 3},
+			{Name: "tgfoid", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "tgtype", Type: Type{Name: "int2"}, Ordinal: 5},
+			{Name: "tgenabled", Type: Type{Name: "char"}, Ordinal: 6},
+			{Name: "tgisinternal", Type: Type{Name: "bool"}, Ordinal: 7},
+			{Name: "tgconstrrelid", Type: Type{Name: "oid"}, Ordinal: 8},
+			{Name: "tgconstrindid", Type: Type{Name: "oid"}, Ordinal: 9},
+			{Name: "tgconstraint", Type: Type{Name: "oid"}, Ordinal: 10},
+			{Name: "tgdeferrable", Type: Type{Name: "bool"}, Ordinal: 11},
+			{Name: "tginitdeferred", Type: Type{Name: "bool"}, Ordinal: 12},
+			{Name: "tgnargs", Type: Type{Name: "int2"}, Ordinal: 13},
+			{Name: "tgattr", Type: Type{Name: "int2[]"}, Ordinal: 14},
+			{Name: "tgargs", Type: Type{Name: "bytea"}, Ordinal: 15},
+			{Name: "tgqual", Type: Type{Name: "pg_node_tree"}, Ordinal: 16},
+			{Name: "tgoldtable", Type: Type{Name: "name"}, Ordinal: 17},
+			{Name: "tgnewtable", Type: Type{Name: "name"}, Ordinal: 18},
+		},
+		OID: 2620,
+	}
+	pgTrigger.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_trigger"] = pgTrigger
+
+	// pg_rewrite — rewrite-rule catalog (OID 2618). After getTriggers, pg_dump's
+	// getRules dumps any ON SELECT/INSERT/UPDATE/DELETE rules. The query that
+	// first hits this catalog is:
+	//   SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type,
+	//   is_instead, ev_enabled FROM pg_rewrite ORDER BY oid
+	// goopg has no user-defined rules, so an empty view (0 rows) is correct,
+	// identical to a stock PG cluster with none. (Stock PG does carry the
+	// internal "_RETURN" SELECT rule per view in pg_rewrite, but goopg has no
+	// stored user views feeding this dump path, so 0 rows matches what pg_dump
+	// would emit for this cluster.) Schema matches PG's pg_rewrite
+	// (pg_rewrite.h): oid, rulename name, ev_class oid, ev_type "char",
+	// ev_enabled "char", is_instead bool, ev_qual pg_node_tree, ev_action
+	// pg_node_tree. M0110-0001 (DU-002 slice 27).
+	pgRewrite := &Table{
+		Schema: "pg_catalog", Name: "pg_rewrite", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "rulename", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "ev_class", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "ev_type", Type: Type{Name: "char"}, Ordinal: 3},
+			{Name: "ev_enabled", Type: Type{Name: "char"}, Ordinal: 4},
+			{Name: "is_instead", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "ev_qual", Type: Type{Name: "pg_node_tree"}, Ordinal: 6},
+			{Name: "ev_action", Type: Type{Name: "pg_node_tree"}, Ordinal: 7},
+		},
+		OID: 2618,
+	}
+	pgRewrite.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_rewrite"] = pgRewrite
+
+	// pg_largeobject_metadata — large-object ownership/ACL catalog (OID 2995).
+	// After getRules, pg_dump's getBlobs probes large objects with:
+	//   SELECT oid, lomowner, lomacl, acldefault('L', lomowner) AS acldefault
+	//   FROM pg_largeobject_metadata ORDER BY lomowner, lomacl::pg_catalog.text, oid
+	// goopg has no large-object support, so an empty view (0 rows) is correct,
+	// identical to a stock PG cluster with no large objects. Because the row set
+	// is empty, the acldefault('L', lomowner) projection is never evaluated.
+	// Schema matches PG's pg_largeobject_metadata (pg_largeobject_metadata.h):
+	// oid, lomowner oid, lomacl aclitem[]. M0110-0001 (DU-002 slice 29).
+	pgLargeobjectMetadata := &Table{
+		Schema: "pg_catalog", Name: "pg_largeobject_metadata", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "lomowner", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "lomacl", Type: Type{Name: "aclitem[]"}, Ordinal: 2},
+		},
+		OID: 2995,
+	}
+	pgLargeobjectMetadata.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_largeobject_metadata"] = pgLargeobjectMetadata
+
+	// pg_amop — access-method operator catalog (OID 2602). After getBlobs,
+	// pg_dump's getDependencies issues a pg_depend UNION that joins both pg_amop
+	// and pg_amproc to resolve operator-family member dependencies (so they are
+	// not dumped as standalone objects). goopg has no user-defined operator
+	// classes/families feeding this dump path, so an empty view (0 rows) is
+	// correct, identical to a stock PG cluster with no user opclasses. Schema
+	// matches PG's pg_amop (pg_amop.h): oid, amopfamily oid, amoplefttype oid,
+	// amoprighttype oid, amopstrategy int2, amoppurpose "char", amopopr oid,
+	// amopmethod oid, amopsortfamily oid. M0110-0001 (DU-002 slice 30).
+	pgAmop := &Table{
+		Schema: "pg_catalog", Name: "pg_amop", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "amopfamily", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "amoplefttype", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "amoprighttype", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "amopstrategy", Type: Type{Name: "int2"}, Ordinal: 4},
+			{Name: "amoppurpose", Type: Type{Name: "char"}, Ordinal: 5},
+			{Name: "amopopr", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "amopmethod", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "amopsortfamily", Type: Type{Name: "oid"}, Ordinal: 8},
+		},
+		OID: 2602,
+	}
+	pgAmop.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_amop"] = pgAmop
+
+	// pg_amproc — access-method support-procedure catalog (OID 2603). Joined
+	// alongside pg_amop in the same getDependencies pg_depend UNION (see pg_amop
+	// above). goopg has no user-defined operator classes/families, so an empty
+	// view (0 rows) is correct. Schema matches PG's pg_amproc (pg_amproc.h):
+	// oid, amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum
+	// int2, amproc regproc. M0110-0001 (DU-002 slice 30).
+	pgAmproc := &Table{
+		Schema: "pg_catalog", Name: "pg_amproc", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "amprocfamily", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "amproclefttype", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "amprocrighttype", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "amprocnum", Type: Type{Name: "int2"}, Ordinal: 4},
+			{Name: "amproc", Type: Type{Name: "regproc"}, Ordinal: 5},
+		},
+		OID: 2603,
+	}
+	pgAmproc.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_amproc"] = pgAmproc
+
+	// pg_seclabels — system view exposing security labels (a join over the
+	// pg_seclabel + pg_shseclabel catalogs). After getDependencies, pg_dump's
+	// getSecLabels issues:
+	//   SELECT label, provider, classoid, objoid, objsubid
+	//   FROM pg_catalog.pg_seclabels ORDER BY classoid, objoid, objsubid
+	// to dump SECURITY LABEL statements. goopg supports no SECURITY LABEL, so an
+	// empty view (0 rows) is correct, identical to a stock PG cluster with no
+	// security labels. pg_seclabels is a VIEW, so it has no oid column; we register
+	// it under an unused virtual OID (3597). The full upstream view schema also
+	// exposes objtype/objnamespace/objname, included here for parity with
+	// catalog-introspection queries. M0110-0001 (DU-002 slice 31).
+	pgSeclabels := &Table{
+		Schema: "pg_catalog", Name: "pg_seclabels", Virtual: true,
+		Columns: []Column{
+			{Name: "objoid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "objsubid", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "objtype", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "objnamespace", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "objname", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "provider", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "label", Type: Type{Name: "text"}, Ordinal: 7},
+		},
+		OID: 3597,
+	}
+	pgSeclabels.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_seclabels"] = pgSeclabels
+
+	// pg_sequence — per-sequence parameter catalog (OID 2224, one row per
+	// sequence relation). After getTables, pg_dump's getSequences issues:
+	//   SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement,
+	//     seqmax, seqmin, seqcache, seqcycle, last_value, is_called
+	//   FROM pg_catalog.pg_sequence, pg_get_sequence_data(seqrelid)
+	//   ORDER BY seqrelid
+	// (an implicit-LATERAL comma join with the set-returning function
+	// pg_get_sequence_data, which supplies the runtime last_value/is_called).
+	// goopg's sequence virtual tables are skipped from the pg_class virtual view
+	// (Virtual && View==nil; see the pg_class VirtualRows builder above), so
+	// pg_dump's getTables never discovers a relkind='S' relation and no sequence
+	// is ever dumped. An empty pg_sequence (0 rows) is therefore consistent with
+	// the current relation-discovery story, and pg_get_sequence_data is never
+	// invoked over the empty set. Full sequence-dump support (surfacing sequences
+	// as relkind='S' in pg_class, then populating seqrelid here from the sequence
+	// registry) is a larger follow-up slice. pg_sequence is a real catalog with
+	// no `oid` system column; cols match pg_sequence.h (PG18, SequenceRelationId
+	// 2224): seqrelid oid, seqtypid oid, seqstart int8, seqincrement int8,
+	// seqmax int8, seqmin int8, seqcache int8, seqcycle bool. M0110-0001
+	// (DU-002 slice 32). pg_get_sequence_data is registered as a FROM-clause SRF
+	// in internal/planner/planner.go.
+	pgSequence := &Table{
+		Schema: "pg_catalog", Name: "pg_sequence", Virtual: true,
+		Columns: []Column{
+			{Name: "seqrelid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "seqtypid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "seqstart", Type: Type{Name: "int8"}, Ordinal: 2},
+			{Name: "seqincrement", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "seqmax", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "seqmin", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "seqcache", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "seqcycle", Type: Type{Name: "bool"}, Ordinal: 7},
+		},
+		OID: 2224,
+	}
+	pgSequence.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_sequence"] = pgSequence
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {
@@ -4309,6 +5088,31 @@ func (c *InMemory) CreateExtension(name, schema, version, database string, ifNot
 		database: database,
 	}
 	return nil
+}
+
+// tablespaceVirtualRows is the VirtualRows callback for the pg_tablespace view.
+// It returns the two bootstrap tablespaces (pg_default OID 1663, pg_global OID
+// 1664, owned by the bootstrap superuser per pg_tablespace.dat) followed by any
+// in-place tablespaces in the runtime registry, ordered by OID for stable
+// output. Columns: oid, spcname, spcowner, spcacl (NULL = default), spcoptions
+// (NULL). Runtime in-place tablespaces report spcowner=10 (bootstrap superuser);
+// goopg does not resolve the recorded owner name to a role OID. M0110-0001.
+func (c *InMemory) tablespaceVirtualRows() [][]string {
+	rows := [][]string{
+		{"1663", "pg_default", "10", "", ""},
+		{"1664", "pg_global", "10", "", ""},
+	}
+	c.mu.RLock()
+	extra := make([]*tablespaceRow, 0, len(c.tablespaces))
+	for _, ts := range c.tablespaces {
+		extra = append(extra, ts)
+	}
+	c.mu.RUnlock()
+	sort.Slice(extra, func(i, j int) bool { return extra[i].oid < extra[j].oid })
+	for _, ts := range extra {
+		rows = append(rows, []string{strconv.FormatUint(uint64(ts.oid), 10), ts.name, "10", "", ""})
+	}
+	return rows
 }
 
 // CreateTablespace records an in-place tablespace in the runtime registry and

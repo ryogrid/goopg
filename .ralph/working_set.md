@@ -1,36 +1,42 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity, slice 1: pg_roles.oid.
-COMPLETE + committed (loop #23). Next loop resumes at the acldefault() blocker.
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 44 COMPLETE
+and (to be) pushed. NOTHING in flight; next loop starts on slice 45 (populate
+pg_attribute columns in pg_dump's getTableAttrs path).
 
-=== WHAT LANDED (loop #23) ===
-pg_dump's collectRoleNames issues
-  SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1   (pg_dump.c:10548)
-to build its role-oid → name map. goopg's pg_roles virtual view lacked an oid
-column, aborting the dump right after connection setup. Added oid at ordinal 0
-carrying OID 10 (BOOTSTRAP_SUPERUSERID, the postgres superuser; pg_authid.dat),
-shifting rolname/rolsuper/rolcanlogin to ordinals 1-3.
+=== DONE (loop #67) — DU-002 slice 44 ===
+Added the `pg_get_function_sqlbody(oid)` executor dispatch case.
+Root cause: seed pg_proc already registered it (OID 6197,
+internal/initdb/pg_proc_seed_data.go) but the big func switch in
+internal/executor/expr.go had NO case → dumpFunc's EXECUTE raised 42883.
+Fix: added a case (right before pg_get_function_result) returning NullDatum
+unconditionally — sqlbody only deparses LANGUAGE sql ... BEGIN ATOMIC bodies
+(PG14+), which goopg never parses, so NULL for every routine is correct and
+matches what pg_dump expects for quoted-body SQL functions.
+**pg_dump now runs to completion (exit 0)** end-to-end.
+Files: internal/executor/expr.go (new case),
+internal/executor/pg_get_function_sqlbody_test.go (NEW: TestPgGetFunctionSqlbody
++ ...UnknownOID), internal/testport/pgdump_connsetup_test.go (header slice 44 +
+promoted exit-0 branch asserts CREATE TABLE/ALTER OWNER/COPY + logs slice-45
+target), docs/design/0110-0001-pg-dump-tap-port.md (slice 44 entry + guard note).
+Gates: gofmt/build clean; executor pkg PASS (1.4s);
+TestPort_PgDumpConnectionSetup PASS (exit 0, asserts archive entry).
+tpch-spotcheck N/A (catalog builtin addition; no executor row-path/codec change).
 
-Empirical probe (real pg_dump --no-sync postgres vs live goopg) confirms pg_dump
-now passes collectRoleNames and advances to getNamespaces.
+=== NEXT STEP — DU-002 slice 45 (pg_attribute columns in dump) ===
+pg_dump exits 0 but the dump is CONTENT-incomplete: emitted
+`CREATE TABLE public.foo (\n)` has an EMPTY column list (no `id integer,
+name text`) plus a malformed `WITH (""='')` reloptions clause. Two gaps:
+ 1. getTableAttrs' per-table pg_attribute query (attname/atttypid/attnotnull/
+    atttypmod/attstattarget/...) returns NO rows for user tables → no columns.
+ 2. reloptions ARRAY subquery yields one empty element → `WITH (""='')`.
+Find getTableAttrs' SQL in postgres/src/bin/pg_dump/pg_dump.c (pg_search_symbols
+'getTableAttrs') and run it against goopg to see which column/predicate yields
+0 rows. Likely pg_attribute virtual view lacks user-table rows, or a join/WHERE
+(attnum>0, NOT attisdropped, atttypid resolution) filters them out. Then RUN
+`go test -count=1 -v -run TestPort_PgDumpConnectionSetup ./internal/testport/`
+— once columns appear, tighten the test to assert `id integer`/`name text`.
 
-Files:
-- internal/catalog/catalog.go (pgRoles Columns + VirtualRows)
-- internal/catalog/catalog_test.go (TestPgCatalogBootstrapViews: oid assertions)
-- internal/testport/pgdump_connsetup_test.go (next-blocker marker comment)
-- docs/design/0110-0001-pg-dump-tap-port.md (catalog-parity slice list)
+ORTHOGONAL PRE-EXISTING (track separately): plpgsql user functions can't be
+dumped (plpgsql not in pg_language → prolang=0 → dumpFunc join still 0 rows).
 
-Key symbols: BuildDefaultRegistry pgRoles (catalog.go); collectRoleNames
-(pg_dump.c); TestPort_PgDumpConnectionSetup (logs remaining gap).
-
-Gates: build/gofmt/vet clean; catalog + testport (TestPgCatalog*, TestSyntax_
-Catalog_PgRoles, TestPort_PgDump*) PASS. No query-path change → TPC-H N/A.
-
-=== NEXT STEP (resume candidate) ===
-DU-002 slice 2: getNamespaces. pg_dump runs
-  SELECT n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl,
-         acldefault('n', n.nspowner) AS acldefault FROM pg_namespace n
-→ fails: "function acldefault does not exist". Need: acldefault() builtin
-(2-arg: type-char, owner-oid → aclitem[]) + pg_namespace columns tableoid,
-nspowner, nspacl. Then walk getTypes/getTables/etc. one group per loop.
-Other open (larger): M0110-0003 AC-003 003_check feature tiers; M0110-0002
-002_save_fullpage (PG-format heap WAL FPI); M0095-0003 recvlogical; M0117-0006/7/8
-(Effort-L CLOG rewrites, dedicated session).
+Other open (larger, untouched): M0110-0003 AC-003 003_check feature tiers;
+M0110-0002 002_save_fullpage; M0095-0003 recvlogical; M0117-0006/7/8 (CLOG).

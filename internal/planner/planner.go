@@ -1654,6 +1654,17 @@ func nodeReferencesOuter(n Node) bool {
 		return exprContainsColumnRef(x.Arg) ||
 			exprContainsColumnRef(x.StartBlock) ||
 			exprContainsColumnRef(x.EndBlock)
+	case *PgGetSequenceData:
+		// pg_dump's getSequences comma-joins pg_get_sequence_data(seqrelid) with
+		// pg_sequence; the seqrelid argument is a correlated *ColumnRef against
+		// the left sibling, so route the wrapping Join through the per-outer-row
+		// lateral driver. DU-002 slice 32 (M0110-0001).
+		for _, a := range x.Args {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
 	}
 	// General case: walk the plan tree for OuterColumnRef expressions.
 	return planHasOuterRef(n)
@@ -3011,6 +3022,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "pg_get_sequence_data") {
+		return planPgGetSequenceData(rv, sourceIdx, lateralCtx)
+	}
 	if strings.EqualFold(tf.Name, "verify_heapam") {
 		return planVerifyHeapam(rv, sourceIdx, lateralCtx)
 	}
@@ -3073,6 +3087,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		tbl := &catalog.Table{Name: alias, Columns: cols}
 		b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 		return node, b, nil
+	}
+	if strings.EqualFold(tf.Name, "pg_options_to_table") {
+		return planPgOptionsToTable(rv, cat, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "unnest") {
 		return planFromUnnest(rv, sourceIdx, lateralCtx)
@@ -3439,6 +3456,61 @@ func planGenerateSubscripts(rv parser.RangeVar, sourceIdx int16, lateralCtx *res
 }
 
 // row with a single column of the given colType. Used for parse_ident etc.
+// planPgOptionsToTable plans FROM pg_options_to_table(text[]) — splits each
+// "name=value" (or bare "name") option element into (option_name, option_value)
+// rows. Output columns are option_name/option_value (text), overridable by an
+// AS alias(col, col) list. DU-002 slice 17 (M0110-0001).
+func planPgOptionsToTable(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) == 0 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "function pg_options_to_table() does not exist"}
+	}
+	// Build arg context: lateral siblings + outer-scope parent chain so a
+	// CORRELATED array argument — e.g. pg_dump's
+	// `ARRAY(SELECT … FROM pg_options_to_table(fdwoptions))` where
+	// fdwoptions references the outer pg_foreign_data_wrapper row — resolves
+	// up the lexical scope. Mirrors generate_series. DU-002 slice 18.
+	argCtx := &resolveContext{cat: cat, parent: planParent}
+	if lateralCtx != nil {
+		if lateralCtx.parent == nil {
+			cp := *lateralCtx
+			cp.parent = planParent
+			argCtx = &cp
+		} else {
+			argCtx = lateralCtx
+		}
+	}
+	arg, err := resolveExpr(tf.Args[0], argCtx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_options_to_table"
+	}
+	nameCol, valueCol := "option_name", "option_value"
+	if len(rv.Columns) >= 1 {
+		nameCol = rv.Columns[0]
+	}
+	if len(rv.Columns) >= 2 {
+		valueCol = rv.Columns[1]
+	}
+	textType := catalog.Type{Name: "text"}
+	schema := Schema{
+		SchemaColumn{Name: nameCol, Type: textType, SourceTableIdx: sourceIdx},
+		SchemaColumn{Name: valueCol, Type: textType, SourceTableIdx: sourceIdx},
+	}
+	cols := []catalog.Column{
+		{Name: nameCol, Type: textType, Ordinal: 0},
+		{Name: valueCol, Type: textType, Ordinal: 1},
+	}
+	node := &PgOptionsToTable{pos: tf.Pos(), Arg: arg, schema: schema}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
 // planFromUnnest plans FROM unnest(array_expr [, ...]) alias(col [, ...]).
 // Single-arg: expands one array into one row per element. M0097-0035.
 // Multi-arg: zips multiple arrays, NULL-padding shorter ones. M0097-0xxx.
@@ -3448,9 +3520,20 @@ func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveCont
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
 			Message: "unnest requires at least 1 argument"}
 	}
-	ctx := &resolveContext{}
+	// Build arg context: lateral siblings + outer-scope parent chain so a
+	// CORRELATED unnest argument — e.g. pg_dump's getEventTriggers
+	// `array(select quote_literal(x) from unnest(evttags) as t(x))` where
+	// evttags references the outer pg_event_trigger row — resolves up the
+	// lexical scope. Mirrors generate_series / pg_options_to_table. DU-002 slice 23.
+	ctx := &resolveContext{parent: planParent}
 	if lateralCtx != nil {
-		ctx = lateralCtx
+		if lateralCtx.parent == nil {
+			cp := *lateralCtx
+			cp.parent = planParent
+			ctx = &cp
+		} else {
+			ctx = lateralCtx
+		}
 	}
 	alias := rv.Alias
 	if alias == "" {
@@ -3677,6 +3760,54 @@ func planPgAvailableWalSummaries(rv parser.RangeVar, sourceIdx int16) (Node, ran
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgAvailableWalSummaries{pos: tf.Pos(), schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgGetSequenceData routes a FROM-clause invocation of
+// pg_get_sequence_data(regclass) into a PgGetSequenceData plan node. pg_dump's
+// getSequences comma-joins it with pg_catalog.pg_sequence
+// (`FROM pg_sequence, pg_get_sequence_data(seqrelid)`); the seqrelid argument is
+// a correlated reference to the sibling pg_sequence range-table entry, so it is
+// resolved against the lateral outer context (mirrors planPgGetPublicationTables
+// / planVerifyHeapam). goopg's pg_sequence view is empty, so the operator is
+// never executed and always returns 0 rows (last_value int8, is_called bool).
+// M0110-0001 (DU-002 slice 32).
+func planPgGetSequenceData(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
+	args := make([]Expr, 0, len(tf.Args))
+	for _, a := range tf.Args {
+		resolved, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		args = append(args, resolved)
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_get_sequence_data"
+	}
+	colNames := []string{"last_value", "is_called"}
+	if len(rv.Columns) > 0 {
+		for i := range colNames {
+			if i < len(rv.Columns) {
+				colNames[i] = rv.Columns[i]
+			}
+		}
+	}
+	colTypes := []string{"int8", "bool"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgGetSequenceData{pos: tf.Pos(), Args: args, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -7696,6 +7827,16 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	}
 	if _, ok := e.(*CTIDExpr); ok {
 		return "ctid", catalog.Type{Name: "tid"}
+	}
+	// Bare `tableoid` on a non-partitioned base relation resolves to a
+	// constant TableOidExpr (resolveColumnRefAt). Preserve the system-column
+	// label so `SELECT tableoid FROM t` reports the field name as `tableoid`
+	// rather than `?column?` — pg_dump's getNamespaces does
+	// PQfnumber(res,"tableoid") and segfaults on a -1 (column not found).
+	// The cast-wrapped form (`tableoid::regclass`) is handled in the CastExpr
+	// arm below. (DU-002 slice 3)
+	if _, ok := e.(*TableOidExpr); ok {
+		return "tableoid", catalog.Type{Name: "oid"}
 	}
 	// merge_action() uses the function name as the column label. M0100-0007.
 	if _, ok := e.(*MergeActionExpr); ok {

@@ -835,3 +835,64 @@ func pgPathElem(arr string, n int) string {
 	}
 	return parts[n-1]
 }
+
+// TestPgLanguageBuiltinRows verifies the pg_language virtual view exposes the 3
+// built-in BKI languages (internal/c/sql, OIDs 12/13/14). pg_dump's dumpFunc
+// joins pg_proc to pg_language WITHOUT a lanispl filter purely to fetch lanname
+// for the function's prolang; an empty view returns "0 rows instead of one" and
+// aborts the dump. All three rows MUST have lanispl=f so getProcLangs's
+// `WHERE lanispl` predicate still selects nothing (no user PLs to dump).
+// M0110-0001 (DU-002 slice 42).
+func TestPgLanguageBuiltinRows(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_language"})
+	if !ok || tbl.VirtualRows == nil {
+		t.Fatal("pg_language virtual table not registered")
+	}
+	colIdx := map[string]int{}
+	for i, col := range tbl.Columns {
+		colIdx[col.Name] = i
+	}
+	rows := tbl.VirtualRows()
+	if len(rows) != 3 {
+		t.Fatalf("pg_language returned %d rows; want exactly 3 (internal/c/sql)", len(rows))
+	}
+	// oid -> expected (lanname, lanpltrusted, laninline)
+	want := map[string]struct {
+		name      string
+		pltrusted string
+		inline    string
+	}{
+		"12": {"internal", "f", "0"},
+		"13": {"c", "f", "0"},
+		"14": {"sql", "t", "2511"},
+	}
+	for _, row := range rows {
+		oid := row[colIdx["oid"]]
+		w, found := want[oid]
+		if !found {
+			t.Errorf("unexpected pg_language row oid=%q", oid)
+			continue
+		}
+		if got := row[colIdx["lanname"]]; got != w.name {
+			t.Errorf("oid %s lanname = %q; want %q", oid, got, w.name)
+		}
+		// lanispl MUST be "f" for every built-in so getProcLangs returns 0 rows.
+		if got := row[colIdx["lanispl"]]; got != "f" {
+			t.Errorf("oid %s lanispl = %q; want f (built-ins must never be dumped)", oid, got)
+		}
+		if got := row[colIdx["lanpltrusted"]]; got != w.pltrusted {
+			t.Errorf("oid %s lanpltrusted = %q; want %q", oid, got, w.pltrusted)
+		}
+		if got := row[colIdx["laninline"]]; got != w.inline {
+			t.Errorf("oid %s laninline = %q; want %q", oid, got, w.inline)
+		}
+		if got := row[colIdx["lanowner"]]; got != "10" {
+			t.Errorf("oid %s lanowner = %q; want 10 (BOOTSTRAP_SUPERUSERID)", oid, got)
+		}
+		delete(want, oid)
+	}
+	if len(want) != 0 {
+		t.Errorf("pg_language missing expected rows: %v", want)
+	}
+}
