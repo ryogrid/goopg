@@ -43,14 +43,17 @@ package testport
 // and the empty `pg_operator` virtual view that `getOperators` reads (slice 9 —
 // built-in operators live in pg_catalog and are filtered out by namespace
 // dumpability, so an empty view is correct; only user-defined operators are
-// dumped).
-// **Next blocker (precise):** pg_dump's `getOpclasses` runs `SELECT tableoid,
-// oid, opcmethod, opcname, opcnamespace, opcowner FROM pg_opclass`, and goopg
-// has no `pg_opclass` catalog view, so the query fails with `relation
-// "pg_opclass" does not exist`. Adding an empty `pg_opclass` virtual view
-// (built-in operator classes live in pg_catalog and are filtered out by
+// dumped), and the empty `pg_opclass` virtual view that `getOpclasses` reads
+// (slice 10 — built-in operator classes live in pg_catalog and are filtered
+// out by namespace dumpability, so an empty view is correct; only user-defined
+// operator classes are dumped).
+// **Next blocker (precise):** pg_dump's `getOpfamilies` runs `SELECT tableoid,
+// oid, opfmethod, opfname, opfnamespace, opfowner FROM pg_opfamily`, and goopg
+// has no `pg_opfamily` catalog view, so the query fails with `relation
+// "pg_opfamily" does not exist`. Adding an empty `pg_opfamily` virtual view
+// (built-in operator families live in pg_catalog and are filtered out by
 // namespace dumpability, so an empty view is correct — only user-defined
-// operator classes are dumped) is the following DU-002 slice.
+// operator families are dumped) is the following DU-002 slice.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.

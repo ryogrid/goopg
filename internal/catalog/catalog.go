@@ -3610,6 +3610,31 @@ func (c *InMemory) registerSystemTables() {
 	pgOperator.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_operator"] = pgOperator
 
+	// pg_opclass — operator-class catalog (OID 2616). pg_dump's getOpclasses runs
+	// `SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM
+	// pg_opclass` — it reads ALL operator classes and filters out system-defined
+	// ones at dump-out time by namespace dumpability. goopg defines no user
+	// operator classes, and the built-ins are in pg_catalog (never dumped), so this
+	// view is correctly empty (0 rows). Schema matches PG's pg_opclass
+	// (pg_opclass.h). M0110-0001 (DU-002 slice 10).
+	pgOpclass := &Table{
+		Schema: "pg_catalog", Name: "pg_opclass", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "opcmethod", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "opcname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "opcnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "opcowner", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "opcfamily", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "opcintype", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "opcdefault", Type: Type{Name: "bool"}, Ordinal: 7},
+			{Name: "opckeytype", Type: Type{Name: "oid"}, Ordinal: 8},
+		},
+		OID: 2616,
+	}
+	pgOpclass.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_opclass"] = pgOpclass
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

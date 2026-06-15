@@ -1253,6 +1253,25 @@ object support.
         "pg_opclass" does not exist`. Resume = add an empty `pg_opclass` virtual
         view as slice 10 (built-in operator classes live in pg_catalog, filtered
         out by namespace dumpability, so empty is correct).
+      - **PROGRESS 2026-06-16 (loop #33):** **DU-002 slice 10 (`pg_opclass`
+        view) LANDED.** `getOpclasses` runs `SELECT tableoid, oid, opcmethod,
+        opcname, opcnamespace, opcowner FROM pg_opclass`; it aborted at
+        `relation "pg_opclass" does not exist`. Added the empty `pg_opclass`
+        virtual view (`internal/catalog/catalog.go`, OID 2616, beside
+        `pg_operator`) with the `pg_opclass.h` schema (`oid, opcmethod oid,
+        opcname name, opcnamespace oid, opcowner oid, opcfamily oid, opcintype
+        oid, opcdefault bool, opckeytype oid`). Empty by construction:
+        getOpclasses reads all operator classes and filters out system-defined
+        ones at dump-out time by namespace dumpability — built-ins live in
+        pg_catalog (never dumped), goopg defines no user operator classes.
+        Build/gofmt/vet clean; catalog + initdb suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS — `getOpclasses` now completes.
+        **Next blocker (precise):** `getOpfamilies` runs `SELECT tableoid, oid,
+        opfmethod, opfname, opfnamespace, opfowner FROM pg_opfamily`; goopg has
+        no `pg_opfamily` view → `relation "pg_opfamily" does not exist`. Resume
+        = add an empty `pg_opfamily` virtual view as slice 11 (built-in operator
+        families live in pg_catalog, filtered out by namespace dumpability, so
+        empty is correct).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

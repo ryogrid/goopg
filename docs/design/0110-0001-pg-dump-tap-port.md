@@ -259,6 +259,21 @@ fixed one logical group per loop:
    tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM pg_opclass` —
    goopg has no `pg_opclass` view (`relation "pg_opclass" does not exist`) — the
    following slice.
+10. **`pg_opclass` virtual view — DONE.** `getOpclasses` runs `SELECT tableoid,
+    oid, opcmethod, opcname, opcnamespace, opcowner FROM pg_opclass`; goopg had
+    no `pg_opclass` view, so the query aborted at `relation "pg_opclass" does
+    not exist`. Added the empty `pg_opclass` virtual view
+    (`internal/catalog/catalog.go`, OID 2616, beside `pg_operator`) with the
+    `pg_opclass.h` schema (`oid, opcmethod oid, opcname name, opcnamespace oid,
+    opcowner oid, opcfamily oid, opcintype oid, opcdefault bool, opckeytype
+    oid`). The view is **empty by construction**: `getOpclasses` reads all
+    operator classes and filters out system-defined ones at dump-out time by
+    namespace dumpability — the built-ins live in `pg_catalog` (never dumped),
+    and goopg defines no user operator classes. After this slice `getOpclasses`
+    completes; the next blocker is `getOpfamilies`' `SELECT tableoid, oid,
+    opfmethod, opfname, opfnamespace, opfowner FROM pg_opfamily` — goopg has no
+    `pg_opfamily` view (`relation "pg_opfamily" does not exist`) — the following
+    slice.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
