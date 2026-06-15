@@ -360,6 +360,32 @@ fixed one logical group per loop:
     `pg_foreign_data_wrapper` relation (`relation "pg_foreign_data_wrapper" does
     not exist`); an empty `pg_foreign_data_wrapper` virtual view is the following
     slice.
+16. **`pg_foreign_data_wrapper` virtual view — DONE.** `getForeignDataWrappers`
+    runs `SELECT tableoid, oid, fdwname, fdwowner, fdwhandler::pg_catalog.regproc,
+    fdwvalidator::pg_catalog.regproc, fdwacl, acldefault('F', fdwowner) AS
+    acldefault, array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' ||
+    quote_literal(option_value) FROM pg_options_to_table(fdwoptions) ORDER BY
+    option_name), E',\n    ') AS fdwoptions FROM pg_foreign_data_wrapper`; goopg
+    had no queryable `pg_foreign_data_wrapper` relation, so the query aborted at
+    `relation "pg_foreign_data_wrapper" does not exist`. Added the empty
+    `pg_foreign_data_wrapper` virtual view (`internal/catalog/catalog.go`, OID
+    2328, beside `pg_ts_config`) with the `pg_foreign_data_wrapper.h` schema
+    (`oid, fdwname name, fdwowner oid, fdwhandler oid, fdwvalidator oid, fdwacl
+    aclitem[], fdwoptions text[]`); `fdwhandler`/`fdwvalidator` are `oid` FKs to
+    `pg_proc`. Empty by construction: goopg defines no foreign-data wrappers (no
+    `CREATE FOREIGN DATA WRAPPER`), and only user-defined FDWs are dumped. After
+    this slice the relation resolves, but the query advances to a **new** blocker
+    (confirmed empirically): `column "option_name" does not exist`. The ARRAY
+    subquery selects from `pg_options_to_table(fdwoptions)`, a set-returning
+    function with output columns `(option_name, option_value)`. goopg seeds
+    `pg_options_to_table` in `pg_proc` (OID 2289) but does not implement it as an
+    executable FROM-clause SRF, so the subquery's column references are
+    unresolvable at plan time — even though the outer view is empty (goopg
+    resolves the subquery columns during planning regardless of outer
+    emptiness). Implementing `pg_options_to_table` as a FROM-clause SRF (`text[]`
+    of `name=value` options → rows of `(option_name, option_value)`) is the
+    following slice; `getForeignServers` (`pg_foreign_server`) and
+    `getUserMappings` (`pg_user_mappings`) follow.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

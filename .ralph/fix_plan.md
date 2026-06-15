@@ -1373,6 +1373,32 @@ object support.
         exist`. Resume = add an empty `pg_foreign_data_wrapper` virtual view as
         slice 16 (goopg has no FDWs by default, so empty is correct; fdwhandler/
         fdwvalidator are oid cols cast to regproc by pg_dump).
+      - **PROGRESS 2026-06-16 (loop #39):** **DU-002 slice 16
+        (`pg_foreign_data_wrapper` view) LANDED.** `getForeignDataWrappers` runs
+        `SELECT tableoid, oid, fdwname, fdwowner, fdwhandler::pg_catalog.regproc,
+        fdwvalidator::pg_catalog.regproc, fdwacl, acldefault('F', fdwowner) AS
+        acldefault, array_to_string(ARRAY(SELECT … FROM
+        pg_options_to_table(fdwoptions) …), …) AS fdwoptions FROM
+        pg_foreign_data_wrapper`; it aborted at `relation "pg_foreign_data_wrapper"
+        does not exist`. Added the empty `pg_foreign_data_wrapper` virtual view
+        (`internal/catalog/catalog.go`, OID 2328, beside `pg_ts_config`) with the
+        `pg_foreign_data_wrapper.h` schema (`oid, fdwname name, fdwowner oid,
+        fdwhandler oid, fdwvalidator oid, fdwacl aclitem[], fdwoptions text[]`);
+        `fdwhandler`/`fdwvalidator` are oid FKs to pg_proc. Empty by construction:
+        goopg defines no FDWs, only user-defined FDWs are dumped. Build/gofmt/vet
+        clean; catalog + initdb suites PASS; `TestPort_PgDumpConnectionSetup`
+        PASS. **Next blocker (precise, confirmed empirically — NOT the predicted
+        pg_foreign_server):** the relation now resolves but the query advances to
+        `column "option_name" does not exist`. The ARRAY subquery selects from
+        `pg_options_to_table(fdwoptions)`, an SRF with output columns
+        `(option_name, option_value)`. goopg seeds `pg_options_to_table` in
+        pg_proc (OID 2289) but does NOT implement it as an executable FROM-clause
+        SRF, so the subquery columns are unresolvable at plan time even with an
+        empty outer view (goopg resolves subquery columns during planning
+        regardless of outer emptiness). Resume = slice 17: implement
+        `pg_options_to_table` as a FROM-clause SRF (`text[]` of `name=value` →
+        rows `(option_name, option_value)`). Then getForeignServers
+        (`pg_foreign_server`) / getUserMappings (`pg_user_mappings`).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

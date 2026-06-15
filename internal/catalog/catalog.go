@@ -3752,6 +3752,36 @@ func (c *InMemory) registerSystemTables() {
 	pgTSConfig.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_ts_config"] = pgTSConfig
 
+	// pg_foreign_data_wrapper — foreign-data wrapper catalog (OID 2328).
+	// pg_dump's getForeignDataWrappers runs `SELECT tableoid, oid, fdwname,
+	// fdwowner, fdwhandler::pg_catalog.regproc, fdwvalidator::pg_catalog.regproc,
+	// fdwacl, acldefault('F', fdwowner) AS acldefault,
+	// array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' ||
+	// quote_literal(option_value) FROM pg_options_to_table(fdwoptions) ORDER BY
+	// option_name), E',\n    ') AS fdwoptions FROM pg_foreign_data_wrapper` — it
+	// reads ALL FDWs and dumps the user-defined ones. goopg defines no FDWs (no
+	// CREATE FOREIGN DATA WRAPPER), so this view is correctly empty (0 rows); the
+	// pg_options_to_table SRF in the ARRAY subquery is therefore never evaluated.
+	// Schema matches PG's pg_foreign_data_wrapper (pg_foreign_data_wrapper.h):
+	// oid, fdwname name, fdwowner oid, fdwhandler oid (FK to pg_proc),
+	// fdwvalidator oid (FK to pg_proc), fdwacl aclitem[], fdwoptions text[].
+	// M0110-0001 (DU-002 slice 16).
+	pgForeignDataWrapper := &Table{
+		Schema: "pg_catalog", Name: "pg_foreign_data_wrapper", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "fdwname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "fdwowner", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "fdwhandler", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "fdwvalidator", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "fdwacl", Type: Type{Name: "aclitem[]"}, Ordinal: 5},
+			{Name: "fdwoptions", Type: Type{Name: "text[]"}, Ordinal: 6},
+		},
+		OID: 2328,
+	}
+	pgForeignDataWrapper.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_foreign_data_wrapper"] = pgForeignDataWrapper
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

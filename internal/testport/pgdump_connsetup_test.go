@@ -63,21 +63,25 @@ package testport
 // are dumped), and the empty `pg_ts_config` virtual view that
 // `getTSConfigurations` reads (slice 15 — built-in text-search configurations
 // live in pg_catalog and are filtered out by namespace dumpability, so an empty
-// view is correct; only user-defined TS configurations are dumped).
-// **Next blocker (precise, confirmed empirically by this test):** pg_dump's
-// getForeignDataWrappers runs `SELECT tableoid, oid, fdwname, fdwowner,
-// fdwhandler::pg_catalog.regproc, fdwvalidator::pg_catalog.regproc, fdwacl, … ,
-// array_to_string(…fdwoptions…) AS fdwoptions FROM pg_foreign_data_wrapper`, and
-// goopg has no queryable `pg_foreign_data_wrapper` relation, so the query fails
-// with `relation "pg_foreign_data_wrapper" does not exist` (goopg's query layer
-// resolves system catalogs via the in-memory virtual-view registry, not the
-// on-disk heap). Adding an empty `pg_foreign_data_wrapper` virtual view is the
-// following DU-002 slice (built-in/no FDWs by default — goopg has none — so an
-// empty view is correct; only user-defined FDWs are dumped). NOTE: fdwhandler /
-// fdwvalidator are oid columns cast to regproc by pg_dump; getForeignServers
-// (reads `pg_foreign_server`) and getUserMappings (`pg_user_mappings`) follow.
-// RUN this test after each add to find the REAL next blocker rather than
-// trusting the predicted one.
+// view is correct; only user-defined TS configurations are dumped), and the
+// empty `pg_foreign_data_wrapper` virtual view that `getForeignDataWrappers`
+// reads (slice 16 — goopg defines no foreign-data wrappers, so an empty view is
+// correct; only user-defined FDWs are dumped, and the `pg_options_to_table`
+// SRF in the dump query's ARRAY subquery is never evaluated for an empty view).
+// **Next blocker (precise, confirmed empirically by this test):** the
+// getForeignDataWrappers query now resolves `pg_foreign_data_wrapper` but fails
+// with `column "option_name" does not exist`. The dump query's ARRAY subquery
+// selects from `pg_options_to_table(fdwoptions)`, a set-returning function whose
+// output columns are (option_name, option_value). goopg seeds `pg_options_to_table`
+// in pg_proc (OID 2289) but does not implement it as an executable FROM-clause
+// SRF, so the column references inside the subquery cannot be resolved at plan
+// time — even though the outer view is empty (goopg, unlike a lazy executor,
+// resolves the subquery's columns during planning regardless of outer
+// emptiness). Implementing `pg_options_to_table` as a FROM-clause SRF
+// (text[] of "name=value" options → rows of (option_name, option_value)) is the
+// following DU-002 slice. After that, getForeignServers (`pg_foreign_server`)
+// and getUserMappings (`pg_user_mappings`) follow. RUN this test after each add
+// to find the REAL next blocker rather than trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.
