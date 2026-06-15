@@ -64,8 +64,9 @@ func pgClassColumnsPG18() []catalog.Column {
 	}
 }
 
-// pgAttributeColumnsPG18 mirrors initdb.pgAttrColDefs — the canonical PG18
-// pg_attribute row layout (25 columns).
+// pgAttributeColumnsPG18 mirrors initdb.pgAttrColDefs — the goopg pg_attribute
+// row layout (25 columns). attstattarget is appended last (always NULL); see
+// catalog.PGAttributeColumns for why it is not at its PG18-canonical position.
 func pgAttributeColumnsPG18() []catalog.Column {
 	return []catalog.Column{
 		{Name: "attrelid", Type: catalog.Type{Name: "oid"}},
@@ -92,6 +93,7 @@ func pgAttributeColumnsPG18() []catalog.Column {
 		{Name: "attoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attfdwoptions", Type: catalog.Type{Name: "text"}},
 		{Name: "attmissingval", Type: catalog.Type{Name: "text"}},
+		{Name: "attstattarget", Type: catalog.Type{Name: "int2"}},
 	}
 }
 
@@ -276,8 +278,8 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 	}
 }
 
-// buildUserPGAttributeRow constructs a 25-column PG18-canonical pg_attribute
-// row for a user-defined column.
+// buildUserPGAttributeRow constructs a 25-column pg_attribute row for a
+// user-defined column (attstattarget appended last as NULL).
 func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 	typOID := catalog.TypeNameToOID(col.Type.Name)
 	attrs := userTypeAttrsForOID(typOID)
@@ -310,11 +312,12 @@ func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 		// attacl / attoptions / attfdwoptions / attmissingval are nullable
 		// varlena columns; PG18 stores NULL when unset. NullDatum signals
 		// EncodeRowPG to skip the column and the bitmap helper to clear
-		// its bit.
-		NullDatum,
-		NullDatum,
-		NullDatum,
-		NullDatum,
+		// its bit. attstattarget (last) is likewise NULL (PG18 default).
+		NullDatum, // attacl
+		NullDatum, // attoptions
+		NullDatum, // attfdwoptions
+		NullDatum, // attmissingval
+		NullDatum, // attstattarget
 	}
 }
 

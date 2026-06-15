@@ -111,14 +111,26 @@ package testport
 // the `array(select quote_literal(x) from unnest(evttags) as t(x))` projection
 // resolves `evttags` up to the outer pg_event_trigger row (mirrors slice 18's
 // pg_options_to_table fix) — confirmed empirically by this test.
-// **Next blocker (precise, confirmed empirically by this test):** the
-// getEventTriggers query now passes; pg_dump advances to the per-table
-// attribute dump (getTableAttrs), which fails with `column a.attstattarget does
-// not exist`. That query reads many `pg_attribute`/`pg_constraint`/`pg_type`
-// columns goopg's catalog views do not yet expose (attstattarget, attstorage,
-// attfdwoptions, attcompression, attidentity, atthasmissing, attmissingval,
-// attgenerated, conislocal, …). The next DU-002 slice broadens those catalog
-// columns; this is a deeper slice than the empty-view additions.
+// The getTableAttrs per-table attribute dump query reads `a.attstattarget`
+// (slice 24 — PG18's nullable int2 stats-target column). goopg's pg_attribute
+// already exposed attstorage/attcompression/attidentity/atthasmissing/
+// attmissingval/attgenerated/attfdwoptions/attcollation/attislocal, so only
+// attstattarget was missing. It was appended LAST (not at its PG18-canonical
+// position #4) to goopg's on-disk pg_attribute heap layout (pgAttrColDefs /
+// PGAttributeColumns / pgAttributeColumnsPG18 / buildUserPGAttributeRow), always
+// emitted NULL like the four trailing nullable varlena columns. Appending keeps
+// the fixed-offset physical decoder (DecodePGAttributePhysicalRow) valid and the
+// null bitmap 3→4 bytes stays within the same MAXALIGN(8) boundary (t_hoff=32),
+// so no positional reader breaks. SELECT resolves columns by name. pg_dump reads
+// NULL → treats it as the default stats target (-1). Confirmed empirically.
+// **Next blocker (precise, confirmed empirically by this test):** getTableAttrs
+// now passes; pg_dump advances to partition-key detection and fails with
+// `relation "pg_partitioned_table" does not exist` (query: `SELECT partrelid
+// FROM pg_partitioned_table WHERE (SELECT c.oid FROM pg_opclass …) =
+// ANY(partclass)`). The next DU-002 slice adds the empty `pg_partitioned_table`
+// virtual view (pg_partitioned_table.h, OID 3350) — back to the empty-view
+// pattern (goopg surfaces partition metadata in pg_class.relkind='p', not yet a
+// separate pg_partitioned_table heap).
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

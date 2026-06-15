@@ -427,12 +427,14 @@ func TestBootstrappedPGAttributeRowsReadable(t *testing.T) {
 		}
 	}
 
-	// Full PG18 column counts: pg_class=34, pg_attribute=24, pg_type=14.
+	// Full PG18 column counts: pg_class=34, pg_attribute=25, pg_type=14.
 	// These reflect the PG18 physical tuple layout written by bootstrapPg*Tuples
 	// (M0106-0008). The original goopg-only counts (8, 6, 7) are obsolete.
+	// pg_attribute grew 24→25 when attstattarget was appended (DU-002 slice 24)
+	// so pg_dump's getTableAttrs can read a.attstattarget.
 	for relOID, wantCount := range map[uint32]int{
 		catalog.RelationRelationId:  34,
-		catalog.AttributeRelationId: 24,
+		catalog.AttributeRelationId: 25,
 		catalog.TypeRelationId:      14,
 	} {
 		cols := byRelID[relOID]

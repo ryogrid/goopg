@@ -1576,6 +1576,36 @@ object support.
         attcompression, attidentity, atthasmissing, attmissingval, attgenerated,
         conislocal, …). Resume = slice 24: broaden those catalog columns — a
         DEEPER slice than the empty-view additions.
+      - **PROGRESS 2026-06-16 (loop #48):** **DU-002 slice 24 LANDED**
+        (`pg_attribute.attstattarget`). getTableAttrs reads `a.attstattarget`;
+        goopg's pg_attribute already exposed every other column it reads
+        (attstorage/attcompression/attidentity/atthasmissing/attmissingval/
+        attgenerated/attfdwoptions/attcollation/attislocal/atthasdef), so only
+        `attstattarget` was missing — a single-column slice, not the broad-column
+        slice the prior note predicted. PG18 declares it a NULLABLE `int2`
+        (`CATALOG_VARLEN`, `BKI_FORCE_NULL`). Added in lockstep to all 4 sibling
+        layouts: `catalog.PGAttributeColumns` (queryable schema),
+        `initdb.pgAttrColDefs`+`pgAttributeRow` (nailed heap), and
+        `pgAttributeColumnsPG18`+`buildUserPGAttributeRow` (user heap). **Appended
+        LAST, not at PG18-canonical #4** — goopg's heap is already non-canonical
+        and `DecodePGAttributePhysicalRow` reads fields by hardcoded byte offset;
+        a trailing always-NULL column (like the existing 4) keeps every offset
+        valid, and the null bitmap 3→4 bytes stays within MAXALIGN(8) so
+        t_hoff=32 is unchanged. SELECT resolves by name → pg_dump reads NULL →
+        treats as default stats target (-1). Left `initdb.pgAttributeAttrs`
+        (relcache-init tupdesc; already a separately-divergent layout) untouched
+        — fully-canonical on-disk pg_attribute is a larger PG-standby task out of
+        scope. build/gofmt/vet clean; catalog+initdb+executor suites PASS (count
+        assertions updated in TestPGAttributeColumnsCount,
+        TestBootstrappedPGAttributeRowsReadable,
+        TestPgAttributeRowEmitsNullForOptionalArrayColumns);
+        `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** getTableAttrs passes; pg_dump advances to partition-key
+        detection → `relation "pg_partitioned_table" does not exist` (`SELECT
+        partrelid FROM pg_partitioned_table WHERE (SELECT c.oid FROM pg_opclass …)
+        = ANY(partclass)`). Resume = slice 25: add the empty
+        `pg_partitioned_table` virtual view (`pg_partitioned_table.h`, OID 3350)
+        — back to the empty-view pattern.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

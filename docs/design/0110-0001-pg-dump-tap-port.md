@@ -580,6 +580,40 @@ fixed one logical group per loop:
     slice — deeper than the empty-view additions. Guard:
     `TestPlanUnnestCorrelatedArg` (`internal/planner` — plans the ARRAY, scalar,
     and same-level LATERAL forms of correlated `unnest`).
+24. **`pg_attribute.attstattarget` column — DONE.** The `getTableAttrs`
+    per-table attribute dump query (`pg_dump.c:9162`) reads `a.attstattarget`.
+    goopg's pg_attribute already exposed every other column getTableAttrs reads
+    (attstorage, attcompression, attidentity, atthasmissing, attmissingval,
+    attgenerated, attfdwoptions, attcollation, attislocal, atthasdef, …); only
+    `attstattarget` was missing. PG18 (`pg_attribute.h`) declares it a NULLABLE
+    `int2` in the `CATALOG_VARLEN` section (`BKI_FORCE_NULL`), distinct from the
+    pre-PG17 `int4 NOT NULL`. Added it as a single column to all four sibling
+    layouts in lockstep: `catalog.PGAttributeColumns` (the queryable schema used
+    for name resolution), `initdb.pgAttrColDefs` + `pgAttributeRow` (nailed
+    catalog heap write), and `pg18_user_catalog_rows.pgAttributeColumnsPG18` +
+    `buildUserPGAttributeRow` (user-table heap write). **It is appended LAST, not
+    placed at the PG18-canonical position #4** (after atttypid): goopg's on-disk
+    pg_attribute is already non-canonical (no `attcacheoff`, `attlen` before
+    `attnum`), and `catalog.DecodePGAttributePhysicalRow` reads attrelid/attname/
+    atttypid/attnum/attnotnull/attisdropped by **hardcoded byte offset**.
+    Appending a nullable trailing column that is always NULL (exactly like the
+    existing attacl/attoptions/attfdwoptions/attmissingval) keeps every byte
+    offset valid; the null bitmap grows 3→4 bytes but `MAXALIGN(8)` keeps
+    `t_hoff = 32`, so the data region and all positional readers are unchanged.
+    SELECT resolves columns by name, so pg_dump reads `a.attstattarget` → NULL,
+    which it treats as the default stats target (-1). Note: the relcache-init
+    tupdesc `initdb.pgAttributeAttrs` (what an attaching PG standby reads) is a
+    pre-existing, separately-divergent 24-col layout (it lists attstattarget#4 +
+    attcacheoff#8 but omits attfdwoptions/attmissingval) and was intentionally
+    left unchanged — making pg_attribute fully PG18-canonical on disk is a larger
+    PG-standby task out of this slice's scope. After this slice `getTableAttrs`
+    passes; the **new** blocker is `relation "pg_partitioned_table" does not
+    exist` (partition-key detection: `SELECT partrelid FROM pg_partitioned_table
+    WHERE (SELECT c.oid FROM pg_opclass …) = ANY(partclass)`) — back to the
+    empty-view pattern for the next slice. Guards: count assertions updated in
+    `catalog.TestPGAttributeColumnsCount` (24→25), `initdb.TestBootstrappedPG-
+    AttributeRowsReadable` (24→25), `initdb.TestPgAttributeRowEmitsNullForOptional-
+    ArrayColumns` (24→25 cols, attstattarget added to the NULL set).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
