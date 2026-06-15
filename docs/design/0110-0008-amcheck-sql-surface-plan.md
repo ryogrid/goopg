@@ -277,23 +277,40 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
   `internal/analyzer`, `internal/planner`, `internal/catalog`, `internal/executor`
   suites green; `go build ./...` + gofmt clean.
 
-- **Remaining for AC-002 — gap #4 (CTE not visible inside a FROM-subquery of the
-  main statement).** With gaps #1/#2/#2b/#3 closed, `002_nonesuch`'s
-  database-resolution bootstrap query now advances to its FINAL select, which is
+- **AC-002 gap #4 (CTE not visible inside a FROM-subquery of the main statement)
+  — LANDED.** With gaps #1/#2/#2b/#3 closed, `002_nonesuch`'s
+  database-resolution bootstrap query advanced to its FINAL select,
   `SELECT … FROM (SELECT … FROM filtered_databases) AS combined_records`, and
-  errors `relation "filtered_databases" does not exist`. Root cause isolated to a
-  minimal reproducer: `WITH x(a) AS (SELECT 1) SELECT a FROM (SELECT a FROM x) s`
-  → `relation "x" does not exist`. A WITH-clause CTE is **not in scope** when the
-  analyzer/planner resolves a derived-table subquery in the OUTER query's FROM
-  clause. (CTE→CTE references work — `WITH a AS (…), b AS (SELECT … FROM a) …` is
-  fine — so the gap is specifically the outer FROM-subquery not inheriting the
-  WITH scope.) This is a general CTE-scoping fix in the analyzer's
-  `buildSelectScope`/subquery-table synthesis and the planner's `planCTEs`
-  propagation into derived-table planning — its own bounded loop. Until it lands,
-  `002_nonesuch` self-skips via its preflight `query failed` probe.
+  errored `relation "filtered_databases" does not exist`. Root cause isolated to
+  a minimal reproducer: `WITH x(a) AS (SELECT 1) SELECT a FROM (SELECT a FROM x) s`
+  → `relation "x" does not exist`. The **analyzer** already resolved this
+  correctly (`resolveTable` walks the parent scope chain for CTEs); the bug was
+  in the **planner**. `planSubqueryRangeVar`'s non-correlated branch
+  (`lateralCtx == nil`) re-planned the derived table via `Plan(rv.Subquery, cat)`,
+  which re-runs `analyzer.Analyze` on the subquery **standalone** — without the
+  enclosing WITH scope — and rejects the CTE reference as a missing relation. The
+  fix routes that branch through `planSelectWithParent(rv.Subquery, cat, nil)`
+  (one line): it skips the analyzer re-pass (the outer `Plan()` already analyzed
+  the whole tree under the correct scope) and inherits the package-level
+  `planCTEs` map, so the CTE substitutes in. This mirrors the lateral branch,
+  which never had the bug. Regression coverage:
+  `executor.TestCompatCTEVisibleInFromSubquery` (single + two-level nesting,
+  end-to-end). `internal/planner/planner.go`.
 
-- **After #4:** S5 still needs the `verify_heapam`/`bt_index_check` SRFs to merely
-  *exist* in `pg_proc` for relation-resolution, LATERAL `c.oid` resolution, the
+- **Remaining for AC-002 — gap #5 (schema-qualified function in the FROM clause).**
+  With gap #4 closed, `002_nonesuch` advances past all bootstrap/skip probes into
+  the real per-relation assertions and surfaces a new general parser gap:
+  pg_amcheck builds each heap check as
+  `… FROM pg_catalog.pg_class c, "public".verify_heapam(...) v` — a
+  **schema-qualified** function call in FROM. goopg's parser only accepts an
+  **unqualified** function name as a FROM-clause table function, so the qualified
+  form errors `syntax error at or near "...(got ()"`. (Unqualified
+  `verify_heapam(...)` in FROM parses fine.) This is its own bounded loop in
+  `internal/parser`. Until it lands, `002_nonesuch` self-skips via its new gap-#5
+  preflight probe (runs `pg_amcheck postgres`, detects the
+  `verify_heapam( … syntax error` stdout signature).
+
+- **After #5:** S5 still needs LATERAL `c.oid` resolution at plan/exec time, the
   clog `XidStatusFunc` wiring, and the `AC-002`…`AC-005` TAP port + CSV flip.
 
 ## Deferral

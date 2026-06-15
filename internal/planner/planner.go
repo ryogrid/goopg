@@ -2561,7 +2561,19 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		}
 		inner, err = planSelectWithParent(rv.Subquery, cat, &latCtxWithCat)
 	} else {
-		inner, err = Plan(rv.Subquery, cat)
+		// Non-correlated derived table. Plan via planSelectWithParent
+		// (nil outer scope) rather than Plan(): the outer statement's
+		// Plan() already analyzed the whole tree — including this
+		// subquery — under the correct scope (with the WITH-list CTE
+		// names visible). Calling Plan() here would re-run the analyzer
+		// on the subquery STANDALONE, which cannot see the enclosing
+		// WITH scope and rejects a FROM-clause CTE reference with
+		// "relation \"x\" does not exist" (e.g.
+		//   WITH x(a) AS (SELECT 1) SELECT a FROM (SELECT a FROM x) s).
+		// planSelectWithParent skips the analyzer re-pass and inherits
+		// the package-level planCTEs map so the CTE substitutes in.
+		// Mirrors the lateral branch above. M0110-0003 AC-002 gap #4.
+		inner, err = planSelectWithParent(rv.Subquery, cat, nil)
 	}
 	if err != nil {
 		// LATERAL subquery fallback: when the inner subquery references outer
