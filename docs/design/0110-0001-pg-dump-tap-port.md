@@ -759,6 +759,25 @@ fixed one logical group per loop:
     array-literal form `parsePGArray` expects (cf. the orthogonal text[]-from-heap
     array-encoding note). The next slice must make `current_schemas()` emit a
     parseable `name[]` array literal over the wire.
+33. **`current_schemas(boolean)` → parseable `{a,b}` name[] literal — DONE.**
+    pg_dump's `selectDumpableNamespace` setup runs `SELECT
+    pg_catalog.current_schemas(false)` and feeds the result to `parsePGArray`,
+    which requires the `{a,b}` text-array form; goopg previously aliased
+    `current_schemas` to `current_schema` and returned a bare scalar, so pg_dump
+    aborted "could not parse result of current_schemas()". Fix is executor-only
+    (`internal/executor/expr.go`): a shared `searchPathSchemas(ctx)` resolver
+    collects the existing search-path schemas in order (built-in
+    pg_catalog/information_schema/public always exist; user schemas confirmed via
+    the catalog); `current_schema` returns the scalar first entry, while the new
+    `current_schemas(include_implicit)` renders them as a `{a,b}` literal,
+    prepending the implicitly-searched `pg_catalog` when `include_implicit` is
+    true (mirrors PG's `current_schemas` semantics). pg_proc already declared
+    rettype 1003 (`name[]`), so no catalog change was needed. Unit guard:
+    `executor.TestCurrentSchemasArrayLiteral`. After this slice pg_dump advances
+    into `dumpFunc`; the **new** blocker is `column "proretset" does not exist`
+    (`EXECUTE dumpFunc('1654')`) - the getFuncs/dumpFunc prepared query reads
+    `pg_proc.proretset` (the returns-set flag), which goopg's pg_proc virtual view
+    does not yet expose. The next slice must add `proretset` to the pg_proc view.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

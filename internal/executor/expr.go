@@ -5488,8 +5488,22 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return NullDatum, nil
 	case "current_database":
 		return NewStringDatum("postgres"), nil
-	case "current_schema", "current_schemas":
+	case "current_schema":
 		return currentSchemaFromSearchPath(ctx)
+	case "current_schemas":
+		// current_schemas(include_implicit boolean) -> name[]. Returns the
+		// schemas in the effective search path that actually exist, rendered as
+		// a `{a,b}` text array literal so clients (e.g. pg_dump's parsePGArray)
+		// can parse it. When include_implicit is true, the implicitly-searched
+		// pg_catalog is prepended (mirrors PG's current_schemas semantics).
+		includeImplicit := false
+		if len(x.Args) >= 1 {
+			v, err := evalExpr(x.Args[0], row, ctx)
+			if err == nil && !v.IsNull() {
+				includeImplicit = v.BoolValue()
+			}
+		}
+		return currentSchemasArray(ctx, includeImplicit)
 
 	// generate_series used as a scalar expression (not FROM clause).
 	// Returns the start value only — full SRF semantics require planner rework.
@@ -9795,14 +9809,20 @@ func charTypeDisplayForm(b byte) string {
 // search_path and returning the first schema that exists. Built-in schemas
 // (pg_catalog, information_schema, public) are always considered present.
 // Returns NullDatum if no schema on the path exists.
-func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {
+// searchPathSchemas returns the schemas in the effective search_path that
+// actually exist, in search-path order. Shared by current_schema (scalar,
+// first entry) and current_schemas (array). $user expands to the connection
+// user; built-in schemas (pg_catalog/information_schema/public) always exist,
+// user schemas are confirmed via the catalog.
+func searchPathSchemas(ctx *Context) []string {
 	searchPath := `"$user", public` // default
-	if ctx.GetSetting != nil {
+	if ctx != nil && ctx.GetSetting != nil {
 		if v, ok := ctx.GetSetting("search_path"); ok {
 			searchPath = v
 		}
 	}
 	user := "postgres"
+	var out []string
 	for _, rawSchema := range strings.Split(searchPath, ",") {
 		s := strings.TrimSpace(rawSchema)
 		s = strings.Trim(s, `"'`)
@@ -9815,16 +9835,48 @@ func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {
 		lc := strings.ToLower(s)
 		switch lc {
 		case "pg_catalog", "information_schema", "public":
-			return NewStringDatum(lc), nil
+			out = append(out, lc)
+			continue
 		}
 		// User-created schemas: check if a table with this schema prefix exists.
-		if ctx.Catalog != nil {
+		if ctx != nil && ctx.Catalog != nil {
 			if _, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: s}); ok {
-				return NewStringDatum(s), nil
+				out = append(out, s)
 			}
 		}
 	}
-	return NullDatum, nil
+	return out
+}
+
+func currentSchemaFromSearchPath(ctx *Context) (Datum, error) {
+	schemas := searchPathSchemas(ctx)
+	if len(schemas) == 0 {
+		return NullDatum, nil
+	}
+	return NewStringDatum(schemas[0]), nil
+}
+
+// currentSchemasArray renders the existing search-path schemas as a `{a,b}`
+// text array literal (name[]). When includeImplicit is true, the implicitly
+// searched pg_catalog is prepended unless already explicitly present.
+func currentSchemasArray(ctx *Context, includeImplicit bool) (Datum, error) {
+	schemas := searchPathSchemas(ctx)
+	if includeImplicit {
+		hasPgCatalog := false
+		for _, s := range schemas {
+			if s == "pg_catalog" {
+				hasPgCatalog = true
+				break
+			}
+		}
+		if !hasPgCatalog {
+			schemas = append([]string{"pg_catalog"}, schemas...)
+		}
+	}
+	if len(schemas) == 0 {
+		return NewStringDatum("{}"), nil
+	}
+	return NewStringDatum("{" + strings.Join(schemas, ",") + "}"), nil
 }
 
 func isValidBoolInput(v string) bool {

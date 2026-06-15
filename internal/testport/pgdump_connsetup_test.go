@@ -174,15 +174,20 @@ package testport
 // larger follow-up slice.) pg_sequence cols (pg_sequence.h): seqrelid oid,
 // seqtypid oid, seqstart int8, seqincrement int8, seqmax int8, seqmin int8,
 // seqcache int8, seqcycle bool.
+// (DU-002 slice 33) `current_schemas(boolean)` now returns a parseable `{a,b}`
+// name[] text array literal instead of a bare scalar string, so pg_dump's
+// `SELECT pg_catalog.current_schemas(false)` (selectDumpableNamespace setup)
+// parses via parsePGArray without aborting "could not parse result of
+// current_schemas()". current_schema stays scalar; the shared search-path
+// resolver (searchPathSchemas) backs both, and include_implicit prepends the
+// implicitly-searched pg_catalog (mirrors PG semantics). Fix is executor-only
+// (internal/executor/expr.go); pg_proc already declared rettype 1003 (name[]).
 // **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// advances past getSequences and fails with
-// `pg_dump: error: could not parse result of current_schemas()`. pg_dump's
-// findNamespace / dumpable-object setup calls current_schemas(true) and parses
-// the returned name[] (text-array) literal. goopg's current_schemas() result is
-// not rendered in the `{a,b}` array-literal text form pg_dump's parsePGArray
-// expects (likely the binary/KindString array encoding — cf. the orthogonal
-// text[]-from-heap note in working_set). The next DU-002 slice must make
-// current_schemas() return a parseable name[] array literal over the wire.
+// advances past current_schemas and fails in dumpFunc with
+// `column "proretset" does not exist` (EXECUTE dumpFunc('1654')). The
+// getFuncs/dumpFunc prepared query reads pg_proc.proretset (the
+// returns-set flag); goopg's pg_proc virtual view does not yet expose it. The
+// next DU-002 slice must add proretset to the pg_proc view.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker
