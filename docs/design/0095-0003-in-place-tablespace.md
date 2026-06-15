@@ -1,8 +1,9 @@
 # 0095-0003 — In-place tablespace foundation (CREATE/DROP TABLESPACE)
 
-**Status:** foundational slice landed (GUC + DDL + in-place directory +
-runtime registry). BASE_BACKUP per-tablespace tar emission and on-disk
-`pg_tablespace` heap visibility deferred (see Deferral).
+**Status:** complete for `011_in_place_tablespace.pl` (the test now PASSES).
+GUC + DDL + in-place version directory + runtime registry + BASE_BACKUP
+per-tablespace `<oid>.tar` emission all landed. On-disk `pg_tablespace` heap
+visibility remains an independent, out-of-scope capability (see Deferral).
 **Milestone:** M0095-0003 (`011_in_place_tablespace.pl`).
 **Related:** [0095-0003-pg-basebackup-execution.md](0095-0003-pg-basebackup-execution.md)
 (physical BASE_BACKUP streaming, already accepted).
@@ -92,22 +93,51 @@ supported query path.
   `…ExternalLocation` (0A000), `…QuoteInLocation` (42602).
 - `config.TestAllowInPlaceTablespacesGUC` (boot off, `ContextSuset`, settable);
   `config.TestSampleConfigCoversRegistry` covers the new sample entry.
+- `TestPort_PgBasebackup011InPlaceTablespace` (the upstream scenario end-to-end:
+  create an in-place tablespace, `pg_basebackup --format=tar --wal-method=none`,
+  assert `base.tar` + exactly one `<oid>.tar`).
+
+## BASE_BACKUP per-tablespace tier (landed loop #13, 2026-06-15)
+
+The remaining two pieces from the original Deferral both landed, making `011`
+pass:
+
+1. **Version directory.** `execCreateTablespace` now creates
+   `pg_tblspc/<oid>/PG_<major>_<catversion>` (not just `pg_tblspc/<oid>`),
+   faithful to `create_tablespace_directories`. The directory name is
+   `config.TablespaceVersionDirectory` = `"PG_" + MajorVersion + "_" +
+   CatalogVersionNo`. These version constants moved to the **leaf `config`
+   package** (`internal/config/version.go`) as the single source of truth:
+   `internal/initdb` (which `executor` cannot import — it would cycle, since
+   `initdb` imports `executor`) now references `config.MajorVersion` /
+   `config.CatalogVersionNo`, and `pgcontrol.go`'s `pgCatalogVersionNo` aliases
+   `config.CatalogVersionNo`.
+
+2. **Per-tablespace `<oid>.tar`.** `internal/server/basebackup.go`:
+   - `collectInPlaceTablespaces(dataDir)` scans `pg_tblspc` for numeric
+     subdirectories (goopg supports only in-place tablespaces, so every numeric
+     dir is one), sorted by OID. Mirrors the `pg_tblspc` scan in
+     `do_pg_backup_start` (`xlog.c:9040-9130`), whose in-place branch sets
+     `ti->path`/`ti->rpath` to the relative `pg_tblspc/<oid>`.
+   - `writeTablespaceList` now emits one `(oid, "pg_tblspc/<oid>", NULL)` row per
+     tablespace before the default NULL row (result-set 2).
+   - The base-tar walk (`emitBaseBackupTar`) ships the `pg_tblspc/<oid>`
+     directory entry but does **not** recurse into it — equivalent to
+     `sendDir`'s `skip_this_dir` for a tablespace whose `rpath` is inside PGDATA.
+   - After `base.tar`, for each tablespace, an `'n'` new-archive frame names
+     `"<oid>.tar"` with spclocation `pg_tblspc/<oid>`, then `emitTablespaceTar`
+     streams the version-dir tar (paths relative to `pg_tblspc/<oid>`, i.e.
+     `PG_<major>_<catversion>/…`), faithful to `sendTablespace`
+     (`basebackup.c:1136`). Tablespace files are added to the same backup
+     manifest with their PGDATA-relative path.
+
+   pg_basebackup writes each archive to `basedir/<archive_name>` in tar format
+   (`pg_basebackup.c:1187`), so the server's archive name directly produces the
+   `<oid>.tar` file the upstream test globs for.
 
 ## Deferral
 
-Two pieces remain for `011_in_place_tablespace.pl` to pass:
-
-1. **`pg_tblspc/<oid>/PG_18_<catversion>` version subdir** — `create_tablespace_-
-   directories` creates it eagerly (PG also creates it lazily via
-   `TablespaceCreateDbspace`). Needs the catversion string (single source of
-   truth in `internal/initdb`); land it alongside the BASE_BACKUP work, which
-   needs the same string.
-2. **BASE_BACKUP per-tablespace `<oid>.tar`** — `basebackup.c` ships each
-   non-default tablespace as its own tar with the tablespace path in the
-   `BASE_BACKUP` tablespace list. `internal/server/basebackup.go` must enumerate
-   the in-place tablespaces and emit one tar each; `pg_basebackup -D … -T`
-   relocation maps them on restore.
-
-`011` self-skips on (2) until both land. On-disk `pg_tablespace` heap visibility
-is a further, independent capability (shared-catalog runtime write) tracked
-separately.
+On-disk `pg_tablespace` heap visibility remains a further, independent
+capability (shared-catalog runtime write — no `RelFileNode` resolver for the
+shared `pg_tablespace` catalog) tracked separately; it is **not** needed by
+`011`, which exercises only the filesystem + BASE_BACKUP behavior.

@@ -727,40 +727,90 @@ func TestPort_PgBasebackup010ManifestChecksums(t *testing.T) {
 // postgres/src/bin/pg_basebackup/t/011_in_place_tablespace.pl.
 //
 // Upstream test: create an in-place tablespace
-// (`SET allow_in_place_tablespaces = on; CREATE TABLESPACE inplace LOCATION ''`),
+// (`SET allow_in_place_tablespaces = on; CREATE TABLESPACE inplace LOCATION ”`),
 // back the cluster up in tar format with --wal-method none, and assert the
 // backup contains base.tar plus exactly one per-tablespace `<oid>.tar`.
 //
-// NOTE (loop #28, 2026-06-14): the prior skip note here was STALE — it blamed
-// the BASE_BACKUP physical-streaming protocol, but that protocol is fully
-// implemented and exercised by TestPort_PgBasebackup010StreamWAL / 010FetchWAL
-// (-X stream / -X fetch). The REAL remaining blocker is the in-place
-// tablespace feature, which goopg does not have:
-//   1. the `allow_in_place_tablespaces` GUC (absent),
-//   2. `CREATE TABLESPACE <name> LOCATION ''` DDL — goopg parses only the
-//      TABLESPACE *clause* (and ignores it); there is no CREATE TABLESPACE
-//      statement, no pg_tablespace row insertion, and no in-place
-//      pg_tblspc/<oid> directory creation,
-//   3. BASE_BACKUP emitting each non-default tablespace as a separate
-//      `<oid>.tar` member (internal/server/basebackup.go — uncontaminated).
-//
-// Items (1)+(3) are uncontaminated; item (2) edits the parser/executor/catalog
-// packages, so the feature cannot land until those are clean. Resume point:
-// add the GUC + CREATE TABLESPACE DDL + per-tablespace tar emission, then
-// enable this test.
+// LANDED (2026-06-15, loop #13): the in-place tablespace feature shipped, so
+// this test now runs the real upstream scenario. The three prerequisites are
+// all in place:
+//  1. the `allow_in_place_tablespaces` GUC (config/defaults.go),
+//  2. `CREATE TABLESPACE <name> LOCATION ”` DDL creating an in-place
+//     pg_tblspc/<oid>/PG_<major>_<catversion> directory
+//     (parser/ddl.go + executor/operators_ddl.go execCreateTablespace),
+//  3. BASE_BACKUP emitting each non-default tablespace as a separate
+//     `<oid>.tar` member plus a tablespace-list row
+//     (internal/server/basebackup.go: collectInPlaceTablespaces /
+//     emitTablespaceTar / writeTablespaceList).
 func TestPort_PgBasebackup011InPlaceTablespace(t *testing.T) {
 	// upstream: postgres/src/bin/pg_basebackup/t/011_in_place_tablespace.pl
 	bin := clientToolBin(t, "pg_basebackup")
 	if bin == "" {
 		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
 	}
+	psqlBin := clientToolBin(t, "psql")
+	if psqlBin == "" {
+		t.Skip("psql not in PATH or postgres/local_install/bin")
+	}
+	c := newCluster(t, "pgbasebackup011_inplace")
+	if err := c.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
-	// BASE_BACKUP physical streaming is implemented (see 010StreamWAL); the
-	// real gap is the in-place tablespace feature (allow_in_place_tablespaces
-	// GUC + CREATE TABLESPACE ... LOCATION '' DDL + per-tablespace <oid>.tar).
-	t.Skip("in-place tablespace backup requires CREATE TABLESPACE DDL + " +
-		"allow_in_place_tablespaces GUC + per-tablespace tar emission " +
-		"(not BASE_BACKUP, which goopg already implements)")
+	host, port, err := net.SplitHostPort(c.ListenAddr())
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+
+	// Create an in-place tablespace. allow_in_place_tablespaces is PGC_SUSET
+	// and the SET + CREATE must share a single session, so run both through one
+	// `psql -c` simple-query (mirrors upstream's safe_psql heredoc). c.Query
+	// uses the extended protocol (one statement per call) and would not carry
+	// the SET into the CREATE.
+	libDir := filepath.Join(repoRoot(t), "postgres", "local_install", "lib")
+	psqlCmd := exec.Command(psqlBin,
+		"-h", host, "-p", port, "-U", "postgres",
+		"-v", "ON_ERROR_STOP=1",
+		"-c", "SET allow_in_place_tablespaces = on; CREATE TABLESPACE inplace LOCATION ''")
+	psqlCmd.Env = append(os.Environ(), "PGPASSWORD=", "LD_LIBRARY_PATH="+libDir)
+	if out, err := psqlCmd.CombinedOutput(); err != nil {
+		t.Fatalf("create in-place tablespace failed: %v\noutput:\n%s", err, string(out))
+	}
+
+	// Back it up in tar format with no WAL (upstream 011's invocation).
+	out := filepath.Join(t.TempDir(), "backup")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cmd := exec.Command(bin,
+		"-h", host, "-p", port, "-U", "postgres",
+		"-D", out,
+		"--format", "tar",
+		"--wal-method", "none",
+		"--no-sync")
+	cmd.Env = append(os.Environ(), "PGPASSWORD=", "LD_LIBRARY_PATH="+libDir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("pg_basebackup failed: %v\ncombined output:\n%s", err, string(output))
+	}
+
+	// base.tar must exist (the main data directory archive).
+	if _, err := os.Stat(filepath.Join(out, "base.tar")); err != nil {
+		t.Errorf("missing base.tar in backup: %v", err)
+	}
+
+	// Exactly one numeric-named <oid>.tar tablespace archive must exist —
+	// the upstream `glob "$backupdir/[0-9]*.tar"` assertion.
+	matches, err := filepath.Glob(filepath.Join(out, "[0-9]*.tar"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Errorf("expected exactly one tablespace tar, found %d: %v", len(matches), matches)
+	}
 }
 
 // TestPort_PgReceivewal020 ports postgres/src/bin/pg_basebackup/t/020_pg_receivewal.pl.

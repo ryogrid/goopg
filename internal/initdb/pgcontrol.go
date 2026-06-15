@@ -38,7 +38,7 @@ const pgControlFile = "global/pg_control"
 // PostgreSQL pg_control constants (PG18).
 const (
 	pgControlVersion      = 1800
-	pgCatalogVersionNo    = 202506291
+	pgCatalogVersionNo    = config.CatalogVersionNo
 	pgControlFileSize     = 8192
 	pgControlDataSize     = 296 // sizeof(ControlFileData) on x86_64
 	pgControlCRCOffset    = 292 // offsetof(ControlFileData, crc) on x86_64

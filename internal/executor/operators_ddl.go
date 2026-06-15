@@ -16,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -268,10 +269,16 @@ func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
 	// alone — matching how other DDL operators skip cluster-filesystem effects.
 	if o.ctx.DataDir != "" {
 		dir := filepath.Join(o.ctx.DataDir, "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
-		if mkErr := os.MkdirAll(dir, 0o700); mkErr != nil {
+		// Create the per-tablespace version subdirectory PG_<major>_<catversion>
+		// inside pg_tblspc/<oid>, faithful to create_tablespace_directories
+		// (tablespace.c). Relation files for this tablespace live under it;
+		// pg_basebackup expects it present so a restored cluster's relfiles
+		// resolve. MkdirAll creates the parent <oid> dir in the same call.
+		versionDir := filepath.Join(dir, config.TablespaceVersionDirectory)
+		if mkErr := os.MkdirAll(versionDir, 0o700); mkErr != nil {
 			// Roll back the registry insert so a retry can succeed.
 			o.ctx.Catalog.DropTablespace(s.Name)
-			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: fmt.Sprintf("could not create directory %q: %v", dir, mkErr)}
+			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: fmt.Sprintf("could not create directory %q: %v", versionDir, mkErr)}
 		}
 	}
 	return nil

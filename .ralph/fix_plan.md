@@ -254,6 +254,30 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
         version subdir (both need the catversion string, land together) + on-disk
         `pg_tablespace` heap visibility (shared-catalog runtime write — separate
         capability). recvlogical (030) still needs logical decoding.
+      - **PROGRESS 2026-06-15 (loop #13):** 011 now **PASSES** — the two deferred
+        pieces landed together. (a) **Version directory:** `execCreateTablespace`
+        creates `pg_tblspc/<oid>/PG_<major>_<catversion>` (was just
+        `pg_tblspc/<oid>`), faithful to `create_tablespace_directories`. The
+        version-dir name + catversion constants moved to the **leaf `config`
+        package** (`internal/config/version.go`: `MajorVersion`,
+        `CatalogVersionNo`, `TablespaceVersionDirectory`) as the single source of
+        truth — `executor` cannot import `initdb` (cycle: `initdb`→`executor`), so
+        `initdb.CatalogVersion`/`pgcontrol.go pgCatalogVersionNo` now reference
+        `config`. (b) **Per-tablespace `<oid>.tar`:** `internal/server/basebackup.go`
+        gained `collectInPlaceTablespaces` (scan `pg_tblspc` for numeric dirs),
+        `emitTablespaceTar` (version-dir tar, paths relative to the tablespace),
+        a `writeTablespaceList` that emits one `(oid, pg_tblspc/<oid>, NULL)` row
+        per tablespace, and a base-tar walk that ships the `pg_tblspc/<oid>` dir
+        entry without recursing (mirrors `sendDir` skip_this_dir). After base.tar,
+        each tablespace streams its own `'n'` archive frame `"<oid>.tar"` then its
+        tar; manifest entries accumulate across archives. `TestPort_PgBasebackup011-
+        InPlaceTablespace` skip removed → PASS (1.35s); CSV BB-011 + markdown
+        updated; design doc `0095-0003-in-place-tablespace.md` + README index →
+        complete. Gates: `go build ./...` clean; server `-race` green; 010
+        backup/stream/fetch/manifest tests no regression; executor/initdb/config
+        suites green. STILL DEFERRED: on-disk `pg_tablespace` heap visibility
+        (independent shared-catalog write, NOT needed by 011); recvlogical (030)
+        needs logical decoding.
 
 ## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
 

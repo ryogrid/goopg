@@ -79,7 +79,7 @@ func LoadOrCreateSystemID(dataDir string) (uint64, error) {
 // `PG_VERSION` file. It must match the major version goopg reports
 // in the `server_version` ParameterStatus during the wire-protocol
 // handshake (currently "18", aligned with PostgreSQL 18.x).
-const CatalogVersion = "18"
+const CatalogVersion = config.MajorVersion
 
 // Subdirs is the canonical list of directories goopg init creates
 // under the data directory. The list is exported so tests and the
