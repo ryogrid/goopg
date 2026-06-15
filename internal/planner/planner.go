@@ -3075,7 +3075,7 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		return node, b, nil
 	}
 	if strings.EqualFold(tf.Name, "pg_options_to_table") {
-		return planPgOptionsToTable(rv, sourceIdx, lateralCtx)
+		return planPgOptionsToTable(rv, cat, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "unnest") {
 		return planFromUnnest(rv, sourceIdx, lateralCtx)
@@ -3446,17 +3446,28 @@ func planGenerateSubscripts(rv parser.RangeVar, sourceIdx int16, lateralCtx *res
 // "name=value" (or bare "name") option element into (option_name, option_value)
 // rows. Output columns are option_name/option_value (text), overridable by an
 // AS alias(col, col) list. DU-002 slice 17 (M0110-0001).
-func planPgOptionsToTable(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+func planPgOptionsToTable(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
 	if len(tf.Args) == 0 {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
 			Message: "function pg_options_to_table() does not exist"}
 	}
-	ctx := &resolveContext{}
+	// Build arg context: lateral siblings + outer-scope parent chain so a
+	// CORRELATED array argument — e.g. pg_dump's
+	// `ARRAY(SELECT … FROM pg_options_to_table(fdwoptions))` where
+	// fdwoptions references the outer pg_foreign_data_wrapper row — resolves
+	// up the lexical scope. Mirrors generate_series. DU-002 slice 18.
+	argCtx := &resolveContext{cat: cat, parent: planParent}
 	if lateralCtx != nil {
-		ctx = lateralCtx
+		if lateralCtx.parent == nil {
+			cp := *lateralCtx
+			cp.parent = planParent
+			argCtx = &cp
+		} else {
+			argCtx = lateralCtx
+		}
 	}
-	arg, err := resolveExpr(tf.Args[0], ctx)
+	arg, err := resolveExpr(tf.Args[0], argCtx)
 	if err != nil {
 		return nil, rangeBinding{}, err
 	}

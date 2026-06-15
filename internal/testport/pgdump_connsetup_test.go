@@ -71,22 +71,26 @@ package testport
 // through (slice 17 — text[] of "name=value" options → rows of (option_name,
 // option_value); split at the first '=', bare names get a NULL value; mirrors
 // untransformRelOptions in src/backend/foreign/foreign.c; the analyzer's
-// tableFuncColumns sibling path was updated alongside the planner/executor).
+// tableFuncColumns sibling path was updated alongside the planner/executor),
+// and CORRELATED FROM-clause SRF argument resolution so the dump query's
+// `ARRAY(SELECT … FROM pg_options_to_table(fdwoptions))` resolves `fdwoptions`
+// as an outer reference to the enclosing pg_foreign_data_wrapper row (slice 18
+// — planPgOptionsToTable now chains its arg-resolution context up to planParent,
+// mirroring generate_series, so an outer column reaching down into the SRF arg
+// of a scalar/ARRAY subquery resolves to an OuterColumnRef the executor
+// evaluates per outer row; the analyzer needed no change — it builds the SRF's
+// output columns but never resolves the arg expression).
 // **Next blocker (precise, confirmed empirically by this test):** the
-// getForeignDataWrappers query now resolves both `pg_foreign_data_wrapper` and
-// `pg_options_to_table`, but fails with `column "fdwoptions" does not exist`.
-// The dump query's ARRAY subquery calls `pg_options_to_table(fdwoptions)` where
-// `fdwoptions` is a CORRELATED reference to the outer pg_foreign_data_wrapper
-// row, and goopg cannot resolve a FROM-clause SRF argument that references an
-// OUTER query level. (Verified: same-level explicit `FROM t, LATERAL
-// pg_options_to_table(t.opts)` resolves fine; the failure is specific to a
-// correlated reference reaching up out of a scalar/ARRAY subquery into the
-// SRF's argument expression.) The following DU-002 slice must thread the outer
-// scope into the analyzer's + planner's FROM-clause SRF argument resolution
-// (analyzer.go tableFuncColumns caller's scope chain + planTableFuncRangeVar's
-// lateralCtx). After that, getForeignServers (`pg_foreign_server`) and
-// getUserMappings (`pg_user_mappings`) follow. RUN this test after each add
-// to find the REAL next blocker rather than trusting the predicted one.
+// getForeignDataWrappers query now passes end-to-end; pg_dump advances to
+// getForeignServers and fails with `relation "pg_foreign_server" does not
+// exist`. The next DU-002 slice adds the empty `pg_foreign_server` virtual view
+// (`pg_foreign_server.h` schema: oid, srvname, srvowner, srvfdw, srvtype,
+// srvversion, srvacl, srvoptions text[]) — empty by construction, like
+// pg_foreign_data_wrapper, since goopg defines no foreign servers. That query
+// also expands `srvoptions` through the now-working correlated
+// `pg_options_to_table(srvoptions)` ARRAY subquery. After that, getUserMappings
+// (`pg_user_mappings`) follows. RUN this test after each add to find the REAL
+// next blocker rather than trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.

@@ -1432,6 +1432,47 @@ object support.
         FROM-clause SRF argument resolution (analyzer `tableFuncColumns` caller's
         scope chain + `planTableFuncRangeVar` `lateralCtx`). Then getForeignServers
         (`pg_foreign_server`) / getUserMappings (`pg_user_mappings`).
+      - **PROGRESS 2026-06-16 (loop #41):** **DU-002 slice 18 (correlated
+        FROM-clause SRF argument resolution) LANDED.** `getForeignDataWrappers`'
+        `ARRAY(SELECT … FROM pg_options_to_table(fdwoptions))` references
+        `fdwoptions` from the OUTER `pg_foreign_data_wrapper` row; planning
+        aborted at `42703 column "fdwoptions" does not exist`. Root cause: the
+        planner resolved the SRF arg against a context built only from same-level
+        FROM siblings (`planFromClause`), and the lexical-scope parent
+        (`planParent`) was attached to the SELECT's resolveContext only AFTER
+        FROM planning ran — so a correlated arg with no left-siblings had no path
+        up to the outer scope. Fix (`internal/planner/planner.go`
+        `planPgOptionsToTable`, +1 line at the dispatch call to pass `cat`):
+        build the arg-resolution context chaining up to `planParent`, mirroring
+        the existing `generate_series` precedent (no siblings →
+        `&resolveContext{cat: cat, parent: planParent}`; siblings-but-no-parent →
+        copy + set parent). `fdwoptions` then resolves to an `OuterColumnRef` the
+        executor evaluates per outer row. **Analyzer needed NO change** — its
+        `tableFuncColumns` builds the SRF *output* columns but never resolves the
+        arg expr (verified empirically: the 42703 came from the planner at the
+        `opts` byte offset, analysis passed). The earlier working-set prediction
+        that the analyzer also needed threading was refuted. Guards:
+        `TestPlanPgOptionsToTableCorrelatedArg` (`internal/planner` — ARRAY,
+        scalar, same-level LATERAL forms) + `TestPgOptionsToTableCorrelatedArg`
+        (`internal/executor` — per-outer-row eval, no out-of-range crash). build/
+        gofmt/vet clean; planner/analyzer/executor/parser/catalog suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** `getForeignDataWrappers` now passes end-to-end; pg_dump
+        advances to `getForeignServers` → `relation "pg_foreign_server" does not
+        exist`. That query also expands `srvoptions` through the now-working
+        correlated `pg_options_to_table(srvoptions)` ARRAY subquery, so slice 19
+        is purely the empty `pg_foreign_server` virtual view (`pg_foreign_server.h`
+        schema: oid, srvname, srvowner, srvfdw, srvtype, srvversion, srvacl,
+        srvoptions text[]; empty by construction like pg_foreign_data_wrapper).
+        Then getUserMappings (`pg_user_mappings`).
+      - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
+        reading a `text[]` column back from the heap yields the binary array
+        encoding (Datum KindString carrying raw bytes) rather than the text
+        representation `expandArrayDatum` parses; a plain `SELECT opts FROM t`
+        over a text[] column reproduces it. Irrelevant to the pg_dump path
+        (pg_foreign_data_wrapper/pg_foreign_server are empty, so the correlated
+        SRF never evaluates a non-empty options array). Track separately if a
+        real text[]-column expansion path is ever needed.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

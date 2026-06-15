@@ -4,7 +4,12 @@ package executor
 // FROM-clause SRF coverage. DU-002 slice 17 (M0110-0001). pg_dump's
 // getForeignDataWrappers expands fdwoptions through this SRF.
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
+)
 
 // TestPgOptionsToTableSplitsNameValue pins the core split-at-first-'='
 // semantics: each "name=value" element becomes (option_name, option_value);
@@ -73,6 +78,49 @@ func TestPgOptionsToTableEmptyArray(t *testing.T) {
 		"SELECT option_name, option_value FROM pg_options_to_table('{}'::text[])")
 	if len(rows) != 0 {
 		t.Fatalf("row count = %d, want 0", len(rows))
+	}
+}
+
+// TestPgOptionsToTableCorrelatedArg drives the real pg_dump shape: a
+// FROM-clause pg_options_to_table() whose array argument is a CORRELATED
+// reference to the OUTER query level inside a scalar subquery. The arg
+// resolves to an OuterColumnRef that the operator evaluates against the outer
+// row pushed onto ctx.OuterRows — once per outer row. Before DU-002 slice 18
+// (M0110-0001) this failed to PLAN with `42703 column "opts" does not exist`
+// because the FROM-SRF arg resolution did not chain up to the enclosing
+// query's lexical scope.
+//
+// Note: this asserts the correlated arg RESOLVES and the subquery is
+// evaluated per outer row (one result row per fdws row, no OuterColumnRef
+// out-of-range crash) — the exact expanded-option counts are NOT asserted
+// here because reading a text[] column back from the heap currently yields
+// the binary array encoding rather than the text representation
+// expandArrayDatum parses (a separate, pre-existing limitation orthogonal to
+// the correlation fix). The real pg_dump getForeignDataWrappers path is
+// unaffected: pg_foreign_data_wrapper is empty by construction, so the
+// subquery is never evaluated against a non-empty fdwoptions value — only
+// successful planning is required.
+func TestPgOptionsToTableCorrelatedArg(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if _, err := cat.CreateTable(parser.ObjectName{Name: "fdws"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true},
+		{Name: "opts", Type: catalog.Type{Name: "text[]"}},
+	}); err != nil {
+		t.Fatalf("CreateTable: %v", err)
+	}
+	runQueryRows(t, ctx, "INSERT INTO fdws(id, opts) VALUES (1, '{host=db1,port=5432}'::text[]), (2, '{a=1,b=2,c=3}'::text[])")
+
+	// Correlated scalar subquery: the SRF arg `opts` resolves up to the outer
+	// fdws row (OuterColumnRef) and is evaluated once per outer row.
+	rows := runQueryRows(t, ctx,
+		"SELECT id, (SELECT count(*) FROM pg_options_to_table(opts)) AS nopts FROM fdws ORDER BY id")
+	if len(rows) != 2 {
+		t.Fatalf("row count = %d, want 2 (one per outer fdws row); rows=%v", len(rows), rows)
+	}
+	if rows[0][0].Int != 1 || rows[1][0].Int != 2 {
+		t.Errorf("outer ids = (%d,%d), want (1,2)", rows[0][0].Int, rows[1][0].Int)
 	}
 }
 

@@ -1,53 +1,53 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 17
-(pg_options_to_table FROM-clause SRF) COMPLETE this loop. NOTHING in flight;
-next loop starts on slice 18 (correlated SRF-arg resolution).
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 18 (correlated
+FROM-clause SRF argument resolution) COMPLETE this loop. NOTHING in flight;
+next loop starts on slice 19 (empty pg_foreign_server virtual view).
 
-=== DONE (loop #40) — DU-002 slice 17 ===
-pg_dump's getForeignDataWrappers ARRAY subquery expands fdwoptions via
-pg_options_to_table(fdwoptions); planning aborted at `column "option_name"
-does not exist`. Implemented pg_options_to_table as a FROM-clause SRF
-(text[] of "name=value" → rows of (option_name text, option_value text);
-split at FIRST '=', bare name → NULL value; mirrors untransformRelOptions
-src/backend/foreign/foreign.c). Files:
-- internal/parser/select.go: added to FROM known-builtin SRF name switch.
-- internal/planner/plan.go: PgOptionsToTable node (Arg, schema) + Pos/Output.
-- internal/planner/planner.go: planPgOptionsToTable (two text cols, AS-alias
-  overridable, arg via lateralCtx); dispatch before unnest branch.
-- internal/planner/foldconst.go + unnest.go: FoldConstants + walkPlanExprs cases.
-- internal/executor/operators_pg_options_to_table.go: pgOptionsToTableOp
-  (eval arg vs outer lateral row, expandArrayDatum, strings.Cut at first '=').
-- internal/executor/executor.go: Build() dispatch case.
-- internal/analyzer/analyzer.go tableFuncColumns: SIBLING PATH — analyzer
-  derives FROM-SRF cols independently & runs BEFORE planner; without this case
-  bare `option_name` failed analysis before FROM planning (SELECT * worked but
-  named cols didn't — that was the non-obvious bug). Added the case.
-- 4 unit tests operators_pg_options_to_table_test.go (all PASS).
-- design doc 0110-0001 slice-17 block; pgdump_connsetup_test.go header (landed
-  list + next-blocker comment); fix_plan loop #40 entry.
-Gates: build/gofmt/vet clean; parser/planner/analyzer/executor/catalog suites
-PASS; TestPort_PgDumpConnectionSetup PASS. tpch-spotcheck N/A (additive new
-plan-node + SRF; zero existing query-path/row-count risk).
+=== DONE (loop #41) — DU-002 slice 18 ===
+getForeignDataWrappers' ARRAY(SELECT … FROM pg_options_to_table(fdwoptions))
+references fdwoptions from the OUTER pg_foreign_data_wrapper row; planning
+aborted at 42703 column "fdwoptions" does not exist. Root cause: the planner
+resolved the SRF arg against a context built only from same-level FROM siblings
+(planFromClause), and the lexical-scope parent (planParent) was attached to the
+SELECT ctx only AFTER FROM planning — so a correlated arg with no left-siblings
+had no path to the outer scope. Fix (planner-only):
+- internal/planner/planner.go planPgOptionsToTable: now takes `cat`; builds the
+  arg-resolution ctx chaining to planParent, mirroring generate_series (no
+  siblings → &resolveContext{cat,parent:planParent}; siblings-no-parent → copy
+  + set parent). Dispatch call (line ~3078) passes cat.
+- fdwoptions → OuterColumnRef; executor pgOptionsToTableOp.Open evaluates it
+  per outer row (ctx.OuterRows top). OuterColumnRef resolution in expr.go uses
+  ctx.OuterRows[len-Level], so it works regardless of the passed row.
+- ANALYZER NEEDED NO CHANGE (refutes the prior working-set prediction):
+  tableFuncColumns builds the SRF OUTPUT columns but never resolves the arg;
+  analysis already passed — the 42703 came from the planner at the `opts` byte
+  offset (verified empirically with a repro test).
+- Tests: TestPlanPgOptionsToTableCorrelatedArg (planner — ARRAY/scalar/LATERAL),
+  TestPgOptionsToTableCorrelatedArg (executor — per-outer-row eval). Both PASS.
+- Design doc 0110-0001 slice-18 block; pgdump_connsetup_test.go header updated;
+  fix_plan loop #41 entry.
+Gates: build/gofmt/vet clean; planner/analyzer/executor/parser/catalog suites
+PASS; TestPort_PgDumpConnectionSetup PASS. tpch-spotcheck N/A (additive
+correlation-scope fix on a new SRF path; zero existing query-path/row-count
+risk — generate_series already used this exact pattern).
 
-=== NEXT STEP — DU-002 slice 18 (correlated FROM-SRF argument) ===
-After slice 17 the subquery resolves but the query advances to a NEW
-empirically-confirmed blocker: `column "fdwoptions" does not exist`.
-pg_options_to_table(fdwoptions) — fdwoptions is a CORRELATED ref to the OUTER
-pg_foreign_data_wrapper row, inside a scalar ARRAY(...) subquery. goopg cannot
-resolve a FROM-clause SRF argument that reaches up into an OUTER query level.
-VERIFIED minimal repros (CREATE TABLE fdw(id int, opts text[])):
-  FAIL: SELECT id, ARRAY(SELECT option_name FROM pg_options_to_table(opts)
-        ORDER BY option_name) FROM fdw   → 42703 column "opts" does not exist
-  FAIL: SELECT id, (SELECT count(*) FROM pg_options_to_table(opts)) FROM fdw
-  PASS: SELECT id, x.option_name FROM fdw, LATERAL pg_options_to_table(opts) x
-So same-level explicit LATERAL works (lateralCtx threads sibling bindings); the
-gap is cross-query-level correlation flowing into the SRF arg. Slice 18 = thread
-the outer scope into BOTH the analyzer's FROM-SRF arg resolution (analyzer.go
-tableFuncColumns caller / synthesizeSubqueryTable scope chain) AND the planner's
-planTableFuncRangeVar (lateralCtx must include the enclosing subquery's outer
-scope). Look at how scalar/ARRAY subquery planning builds its resolveContext and
-whether the outer scope reaches FROM-clause SRF arg resolution. RUN
-TestPort_PgDumpConnectionSetup after to find the REAL next blocker (predicted:
-getForeignServers/pg_foreign_server, getUserMappings/pg_user_mappings — VERIFY).
+ORTHOGONAL PRE-EXISTING (do NOT conflate with slice 18): reading a text[]
+column back from the heap yields the BINARY array encoding (KindString w/ raw
+bytes), not the text repr expandArrayDatum parses; plain `SELECT opts FROM t`
+reproduces it. Irrelevant to pg_dump (the FDW views are empty, SRF never
+evaluates a non-empty options array). Track separately only if real
+text[]-column expansion is ever needed.
+
+=== NEXT STEP — DU-002 slice 19 (pg_foreign_server virtual view) ===
+After slice 18 getForeignDataWrappers passes end-to-end; pg_dump advances to
+getForeignServers → `relation "pg_foreign_server" does not exist`. Add the
+empty pg_foreign_server virtual view in internal/catalog/catalog.go (beside
+pg_foreign_data_wrapper, OID 1417 per pg_foreign_server.h): schema oid,
+srvname name, srvowner oid, srvfdw oid, srvtype text, srvversion text,
+srvacl aclitem[], srvoptions text[]. Empty by construction (goopg defines no
+foreign servers). The dump query already expands srvoptions via the now-working
+correlated pg_options_to_table(srvoptions) ARRAY subquery, so NO new SRF work.
+RUN TestPort_PgDumpConnectionSetup after to find the REAL next blocker
+(predicted: getUserMappings / pg_user_mappings — VERIFY).
 
 Other open (larger, untouched): M0110-0003 AC-003 003_check feature tiers;
 M0110-0002 002_save_fullpage; M0095-0003 recvlogical; M0117-0006/7/8 (Effort-L CLOG).

@@ -424,9 +424,46 @@ fixed one logical group per loop:
     cannot resolve a FROM-clause SRF argument that reaches up into an OUTER
     query level from inside a scalar/ARRAY subquery. (Same-level explicit
     `FROM t, LATERAL pg_options_to_table(t.opts)` resolves fine.) Threading the
-    outer scope into the analyzer's + planner's FROM-clause SRF argument
-    resolution is the following slice; `getForeignServers` (`pg_foreign_server`)
-    and `getUserMappings` (`pg_user_mappings`) follow.
+    outer scope into the planner's FROM-clause SRF argument resolution is the
+    following slice; `getForeignServers` (`pg_foreign_server`) and
+    `getUserMappings` (`pg_user_mappings`) follow.
+
+18. **Correlated FROM-clause SRF argument resolution — DONE.**
+    `getForeignDataWrappers`' ARRAY subquery
+    `ARRAY(SELECT … FROM pg_options_to_table(fdwoptions))` references
+    `fdwoptions` from the OUTER `pg_foreign_data_wrapper` row. The planner
+    resolved the SRF arg against a context built only from same-level FROM
+    siblings (`planFromClause`), and the lexical-scope `parent` (`planParent`)
+    was only attached to the SELECT's resolveContext *after* FROM planning had
+    already run — so a correlated arg with no left-siblings had no path up to
+    the outer scope and failed with `42703 column "fdwoptions" does not exist`.
+    Fix (`internal/planner/planner.go` `planPgOptionsToTable`): build the
+    arg-resolution context by chaining up to `planParent`, exactly mirroring
+    the existing `generate_series` precedent — when there are no lateral
+    siblings use `&resolveContext{cat: cat, parent: planParent}`; when there
+    are siblings but no parent, copy them and set `parent = planParent`. The
+    correlated `fdwoptions` then resolves to an `OuterColumnRef`, which the
+    executor (`pgOptionsToTableOp.Open`) evaluates against the outer row pushed
+    onto `ctx.OuterRows` — once per outer row. The analyzer needed **no**
+    change: `tableFuncColumns` builds the SRF's *output* columns but never
+    resolves the arg expression, so analysis already passed (verified
+    empirically — the 42703 came from the planner at the `opts` byte offset).
+    Guards: `TestPlanPgOptionsToTableCorrelatedArg` (`internal/planner` — plans
+    the ARRAY, scalar, and same-level LATERAL forms) and
+    `TestPgOptionsToTableCorrelatedArg` (`internal/executor` — drives a
+    correlated scalar subquery, asserting one result row per outer row with no
+    OuterColumnRef out-of-range crash; exact expanded-option counts are not
+    asserted because reading a `text[]` column back from the heap currently
+    yields the binary array encoding rather than the text representation
+    `expandArrayDatum` parses — a separate, pre-existing limitation orthogonal
+    to the correlation fix, and irrelevant to the real pg_dump path since
+    `pg_foreign_data_wrapper` is empty so the subquery never evaluates a
+    non-empty `fdwoptions`). After this slice `getForeignDataWrappers` passes
+    end-to-end; pg_dump advances to `getForeignServers` and the **new** blocker
+    is `relation "pg_foreign_server" does not exist`. That query also expands
+    `srvoptions` through the now-working correlated `pg_options_to_table`
+    subquery, so the next slice is purely the empty `pg_foreign_server` virtual
+    view; `getUserMappings` (`pg_user_mappings`) follows.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
