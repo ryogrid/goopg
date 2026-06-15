@@ -4228,6 +4228,30 @@ func (c *InMemory) UnregisterSchema(name string) {
 	delete(c.schemas, strings.ToLower(name))
 }
 
+// RegisterSchemaDuringRecovery is the idempotent version of RegisterSchema
+// used by the WAL-replay driver. Unlike RegisterSchema it takes the OID from
+// the WAL record (so the recovered registry matches what the pre-crash server
+// assigned) and advances nextOID past it so subsequent allocations do not
+// collide. Re-applying a record whose schema already exists is a no-op.
+// Mirrors RegisterDatabaseDuringRecovery (M0054-0001) / RegisterIndexDuringRecovery.
+func (c *InMemory) RegisterSchemaDuringRecovery(name string, oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	c.schemas[lc] = oid
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// UnregisterSchemaDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropSchema.
+func (c *InMemory) UnregisterSchemaDuringRecovery(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.schemas, strings.ToLower(name))
+}
+
 // CreateExtension records a CREATE EXTENSION install in the runtime
 // pg_extension registry. Called from the executor's execCreateExtension after
 // it has validated the extension name and resolved the default version/schema.

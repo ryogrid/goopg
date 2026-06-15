@@ -948,6 +948,18 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		return nil, fmt.Errorf("goopg: database DDL replay: %w", err)
 	}
 
+	// M0110-0003: restore user-created schemas (CREATE/DROP SCHEMA) from the
+	// WAL. Same rationale and ordering as the database DDL replay above —
+	// goopg has no per-schema on-disk namespace, so the catalog's schema
+	// registry is reconstructed here after physical replay so the next
+	// connection sees schemas that survived the restart.
+	if err := replaySchemaDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: schema DDL replay: %w", err)
+	}
+
 	// M0112: restore per-column planner statistics from pg_statistic.
 	// Non-fatal: if absent or malformed, the planner uses defaults until
 	// the next ANALYZE run.

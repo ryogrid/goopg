@@ -7401,6 +7401,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			}
 			// Schema is registered; unregister it.
 			o.ctx.Catalog.UnregisterSchema(schemaName)
+			// M0110-0003: persist the drop so it survives a restart (mirrors
+			// CREATE SCHEMA below / DROP DATABASE). Without this, a schema
+			// dropped at runtime would be re-registered by replaying its
+			// CREATE SCHEMA record on the next startup.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropSchema(schemaName)); werr != nil {
+					return fmt.Errorf("wal drop-schema: %w", werr)
+				}
+			}
 			if s.Behavior == parser.DropCascade {
 				// Collect routines to drop for NOTICE detail.
 				var droppedRoutines []string
@@ -7958,6 +7967,17 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// Register user-created schema so schema-qualified queries resolve correctly.
 		if s.ObjName.Name != "" {
 			im.RegisterSchema(s.ObjName.Name)
+			// M0110-0003: persist the schema so it survives a restart. goopg
+			// has no per-schema on-disk file namespace, so we record a WAL
+			// event the recovery driver replays into the schema registry
+			// (mirrors CREATE DATABASE, M0054-0001). The OID just assigned by
+			// RegisterSchema is carried so recovery restores the same OID.
+			if o.ctx.WAL != nil {
+				oid := im.SchemaOID(s.ObjName.Name)
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateSchema(s.ObjName.Name, oid)); werr != nil {
+					return fmt.Errorf("wal create-schema: %w", werr)
+				}
+			}
 		}
 	case "rule":
 		// Key format must match DROP RULE: ruleName@tableName.

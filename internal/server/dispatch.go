@@ -149,6 +149,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				norm := normalizeCompatSQL(sql)
 				if schemaName := schemaNameFromCreate(norm); schemaName != "" {
 					s.cfg.Catalog.RegisterSchema(schemaName)
+					// M0110-0003: persist so the schema survives a restart.
+					// This branch handles CREATE SCHEMA forms the parser
+					// rejects; the parsed CompatNoopStmt path emits the same
+					// record from execCompatNoop.
+					if s.cfg.WAL != nil {
+						if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+							oid := im.SchemaOID(schemaName)
+							if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateSchema(schemaName, oid)); werr != nil {
+								return s.writeQueryError(w, sqlstate.SystemError, werr.Error())
+							}
+						}
+					}
 				}
 			}
 			if err := w.WriteCommandComplete(tag); err != nil {

@@ -1159,6 +1159,33 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         tests are deferred under CSV row AC-002, blocked on `verify_heapam()` SRF
         + opclass catalog coverage. Resume = promote AC-002 (002_nonesuch first —
         only error-path catalog lookups) when those land.
+      - **PROGRESS 2026-06-15 (loop #20):** AC-003 **enabler** — `CREATE SCHEMA`
+        is now **durable across a server restart** (the recurring 003_check
+        blocker noted in loops #15/#19: a `--schema s1` run clean pre-restart
+        reported `no relations to check` post-restart because the schema
+        registration was in-memory-only). Mirrors the CREATE/DROP DATABASE
+        WAL-record mechanism (M0054-0001), NOT the pg_class heap-append: new
+        physical-replay-no-op record kinds `RecordKindCreateSchema`=34
+        (`kind|oid|nameLen|name`, OID carried) / `RecordKindDropSchema`=35
+        (`internal/wal/recovery.go`); verbatim-mirror recovery driver
+        `replaySchemaDDLRecords` (`internal/initdb/schema_ddl_recovery.go`)
+        wired into `open.go` after the database-DDL replay; idempotent catalog
+        hooks `Register/UnregisterSchemaDuringRecovery`. Emitted at all three
+        execution routes (parsed `CompatNoopStmt{schema}` in `execCompatNoop`,
+        the parser-rejected compat-no-op branch in dispatch, and `DROP SCHEMA`
+        in `execDropCompat`; all `WAL != nil`-guarded). Non-transactional (like
+        CREATE DATABASE). PG-standby visibility (pg_namespace heap row +
+        2684/2685 indexes) is explicitly OUT OF SCOPE — goopg resolves schemas
+        via the in-memory registry, not the index. Tests: wal codec round-trip
+        (`internal/wal/schema_ddl_test.go`), initdb Open→append→Close→Open
+        replay (`internal/initdb/schema_ddl_recovery_test.go`), and e2e
+        `TestPort_CreateSchemaSurvivesRestart`
+        (`internal/testport/create_schema_durability_test.go`, over-the-wire
+        CREATE/DROP across two restarts). Gates: build/vet clean; wal + catalog
+        + initdb + executor + server + amcheck-alltables/003 suites PASS, no
+        regression. Design doc `0110-0012-create-schema-wal-durability.md` +
+        README index. AC-003 stays `defer` (the remaining 003 tiers still need
+        the index AMs / column types / TOAST / multi-DB feature work).
       - **PROGRESS 2026-06-15 (loop #19):** AC-003 — the **central combined-
         corruption integration tier** of `003_check.pl` (its main check, :347-365)
         LANDED. The three sibling surrogates each inject ONE corruption on a
