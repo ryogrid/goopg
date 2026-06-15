@@ -3635,6 +3635,27 @@ func (c *InMemory) registerSystemTables() {
 	pgOpclass.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_opclass"] = pgOpclass
 
+	// pg_opfamily — operator-family catalog (OID 2753). pg_dump's getOpfamilies
+	// runs `SELECT tableoid, oid, opfmethod, opfname, opfnamespace, opfowner FROM
+	// pg_opfamily` — it reads ALL operator families and filters out system-defined
+	// ones at dump-out time by namespace dumpability. goopg defines no user
+	// operator families, and the built-ins are in pg_catalog (never dumped), so
+	// this view is correctly empty (0 rows). Schema matches PG's pg_opfamily
+	// (pg_opfamily.h). M0110-0001 (DU-002 slice 11).
+	pgOpfamily := &Table{
+		Schema: "pg_catalog", Name: "pg_opfamily", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "opfmethod", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "opfname", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "opfnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "opfowner", Type: Type{Name: "oid"}, Ordinal: 4},
+		},
+		OID: 2753,
+	}
+	pgOpfamily.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_opfamily"] = pgOpfamily
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

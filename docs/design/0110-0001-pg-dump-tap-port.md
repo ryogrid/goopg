@@ -274,6 +274,21 @@ fixed one logical group per loop:
     opfmethod, opfname, opfnamespace, opfowner FROM pg_opfamily` — goopg has no
     `pg_opfamily` view (`relation "pg_opfamily" does not exist`) — the following
     slice.
+11. **`pg_opfamily` virtual view — DONE.** `getOpfamilies` runs `SELECT
+    tableoid, oid, opfmethod, opfname, opfnamespace, opfowner FROM pg_opfamily`;
+    goopg had no `pg_opfamily` view, so the query aborted at `relation
+    "pg_opfamily" does not exist`. Added the empty `pg_opfamily` virtual view
+    (`internal/catalog/catalog.go`, OID 2753, beside `pg_opclass`) with the
+    `pg_opfamily.h` schema (`oid, opfmethod oid, opfname name, opfnamespace oid,
+    opfowner oid`). The view is **empty by construction**: `getOpfamilies` reads
+    all operator families and filters out system-defined ones at dump-out time
+    by namespace dumpability — the built-ins live in `pg_catalog` (never
+    dumped), and goopg defines no user operator families. After this slice
+    `getOpfamilies` completes; the next blocker is `getTSParsers`' `SELECT
+    tableoid, oid, prsname, prsnamespace, prsstart::oid, prstoken::oid,
+    prsend::oid, prsheadline::oid, prslextype::oid FROM pg_ts_parser` — goopg
+    has no `pg_ts_parser` view (`relation "pg_ts_parser" does not exist`) — the
+    following slice.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

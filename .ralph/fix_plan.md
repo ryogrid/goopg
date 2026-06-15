@@ -1272,6 +1272,25 @@ object support.
         = add an empty `pg_opfamily` virtual view as slice 11 (built-in operator
         families live in pg_catalog, filtered out by namespace dumpability, so
         empty is correct).
+      - **PROGRESS 2026-06-16 (loop #34):** **DU-002 slice 11 (`pg_opfamily`
+        view) LANDED.** `getOpfamilies` runs `SELECT tableoid, oid, opfmethod,
+        opfname, opfnamespace, opfowner FROM pg_opfamily`; it aborted at
+        `relation "pg_opfamily" does not exist`. Added the empty `pg_opfamily`
+        virtual view (`internal/catalog/catalog.go`, OID 2753, beside
+        `pg_opclass`) with the `pg_opfamily.h` schema (`oid, opfmethod oid,
+        opfname name, opfnamespace oid, opfowner oid`). Empty by construction:
+        getOpfamilies reads all operator families and filters out system-defined
+        ones at dump-out time by namespace dumpability — built-ins live in
+        pg_catalog (never dumped), goopg defines no user operator families.
+        Build/gofmt/vet clean; catalog + initdb suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS — `getOpfamilies` now completes.
+        **Next blocker (precise):** `getTSParsers` runs `SELECT tableoid, oid,
+        prsname, prsnamespace, prsstart::oid, prstoken::oid, prsend::oid,
+        prsheadline::oid, prslextype::oid FROM pg_ts_parser`; goopg has no
+        `pg_ts_parser` view → `relation "pg_ts_parser" does not exist`. Resume =
+        add an empty `pg_ts_parser` virtual view as slice 12 (built-in
+        text-search parsers live in pg_catalog, filtered out by namespace
+        dumpability, so empty is correct).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
