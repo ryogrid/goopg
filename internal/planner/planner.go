@@ -1641,6 +1641,13 @@ func nodeReferencesOuter(n Node) bool {
 			}
 		}
 		return false
+	case *VerifyHeapam:
+		// A correlated arg (e.g. verify_heapam(relation := c.oid)) resolves to a
+		// plain *ColumnRef against the left sibling's schema; route the wrapping
+		// Join through the per-outer-row lateral driver. M0110-0003 gap #6.
+		return exprContainsColumnRef(x.Arg) ||
+			exprContainsColumnRef(x.StartBlock) ||
+			exprContainsColumnRef(x.EndBlock)
 	}
 	// General case: walk the plan tree for OuterColumnRef expressions.
 	return planHasOuterRef(n)
@@ -2999,7 +3006,7 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
 	if strings.EqualFold(tf.Name, "verify_heapam") {
-		return planVerifyHeapam(rv, sourceIdx)
+		return planVerifyHeapam(rv, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "pg_partition_tree") || strings.EqualFold(tf.Name, "pg_partition_ancestors") {
 		// pg_partition_tree / pg_partition_ancestors — multi-row SRF that traverses
@@ -3677,14 +3684,25 @@ func planPgAvailableWalSummaries(rv parser.RangeVar, sourceIdx int16) (Node, ran
 // argument list type-checks) but carry no semantics here — see the VerifyHeapam
 // node doc. Output schema is the upstream SETOF (blkno int8, offnum int8,
 // attnum int4, msg text). M0110-0003.
-func planVerifyHeapam(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+func planVerifyHeapam(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
 	if len(tf.Args) == 0 {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
 			Message: "function verify_heapam() does not exist",
 			Hint:    "verify_heapam requires a relation argument"}
 	}
-	ctx := &resolveContext{}
+	// Resolve argument expressions against the lateral outer context so a
+	// correlated reference like `c.oid` in
+	//   FROM pg_catalog.pg_class c, verify_heapam(relation := c.oid, …) v
+	// (the implicit-LATERAL comma-join pg_amcheck emits) resolves against the
+	// sibling `pg_class c` range-table entry. Mirrors planPgGetPublicationTables;
+	// nodeReferencesOuter then routes the wrapping Join through its per-outer-row
+	// lateral driver, and verifyHeapamOp evaluates the arg against the bound
+	// outer slot. M0110-0003 gap #6.
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
 	arg, err := resolveExpr(tf.Args[0], ctx)
 	if err != nil {
 		return nil, rangeBinding{}, err

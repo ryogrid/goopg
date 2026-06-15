@@ -1,6 +1,6 @@
 # 0110-0008 — amcheck SQL surface wiring plan (M0110-0003)
 
-**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing landed (worktree `m0110-0003-amcheck-sql-surface`); S5 LATERAL/clog/TAP-port remain (merge blocked on a clean working tree)
+**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing + gap #6 LATERAL `c.oid` resolution landed (planner + executor OpNode-path forwarding); S5 clog `XidStatusFunc` + AC-002…AC-005 TAP-port remain. `002_nonesuch` now self-skips on gap #7 (connection/resolution-level behaviors).
 **Scope:** the `CREATE EXTENSION amcheck` + SRF SQL surface that wires the
 already-committed `internal/amcheck` engine to the wire protocol and promotes the
 deferred `AC-002`…`AC-005` pg_amcheck TAP tests.
@@ -314,18 +314,43 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
   (`internal/parser/named_arg_colon_equal_test.go`, quoted + bare schema forms,
   sibling to the existing `TestParseNamedArgColonEqualFromSRF`).
 
-- **Remaining for AC-002 — gap #6 (LATERAL `c.oid` resolution into the SRF's
-  arguments).** With gap #5 closed, `002_nonesuch` parses the per-relation heap
-  check and reaches the executor, surfacing the next gap: the implicit-LATERAL
-  comma-join `FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …)`
-  does not resolve the correlated `c.oid` inside the SRF's argument list against
-  the sibling `pg_class c` range-table entry, so verify_heapam errors
-  `column "oid" does not exist`. This is the same LATERAL-resolution follow-up
-  S3/S4 already record, now the live blocker. Until it lands, `002_nonesuch`
-  self-skips via its updated gap-#6 preflight probe (runs `pg_amcheck postgres`,
-  detects the `column "oid" does not exist` stdout signature).
+- **gap #6 (LATERAL `c.oid` resolution into the SRF's arguments) — LANDED.**
+  pg_amcheck's per-relation heap check is the implicit-LATERAL comma-join
+  `FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …) v
+  WHERE c.oid = <reloid>`. The fix was two-layered:
+  1. **Planner** — `planVerifyHeapam` now takes `lateralCtx` and resolves its
+     args against it (mirroring `planPgGetPublicationTables`), so `c.oid`
+     resolves to a `ColumnRef` against the sibling `pg_class c`; and
+     `nodeReferencesOuter` recognises a `*VerifyHeapam` with a correlated arg so
+     the wrapping `Join` is flagged `Lateral`. (`internal/planner/planner.go`.)
+  2. **Executor** — `verifyHeapamOp` implements `lateralBindable`
+     (`BindLateralOuter`) and evaluates its args via `evalExprSlot(arg,
+     outerSlot, …)`. Crucially, the server's **BuildFast/OpNode** path wraps a
+     Join's children in `opNodeOperator`, which previously hid the
+     `lateralBindable` interface from `joinOp.openLateral` — so the SRF arg
+     evaluated against a nil slot (`column ref oid/0 on nil slot`).
+     `opNodeOperator.BindLateralOuter` now forwards the binding to the wrapped
+     underlying op. (`internal/executor/operators_verify_heapam.go`,
+     `internal/executor/opnode.go`.)
 
-- **After #6:** S5 still needs the clog `XidStatusFunc` wiring (for the
+  Regression coverage:
+  `planner.TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem` (plan
+  resolves + `Lateral` flagged) and
+  `executor.TestVerifyHeapam_LateralCommaJoinViaFastPath` (corruption surfaces
+  through the comma-join driven via `BuildFastIterator`, proving the correlated
+  arg binds to the correct relation per outer row).
+
+- **Remaining for AC-002 — gap #7 (connection/resolution-level behaviors).** With
+  gap #6 closed, `002_nonesuch`'s heap check runs clean and the next gaps surface:
+  (a) database-name pattern resolution (`no connectable databases to check
+  matching "…"`), (b) non-existent role rejection (`role "…" does not exist`;
+  goopg accepts any role and exits 0), (c) per-database amcheck-installed
+  detection + `template1`/`template0` registration. These are independent of the
+  SQL surface. Until they land, `002_nonesuch` self-skips via its updated gap-#7
+  preflight probe (runs `pg_amcheck --username no_such_user postgres`, detects the
+  missing role rejection).
+
+- **After #7:** S5 still needs the clog `XidStatusFunc` wiring (for the
   clog-dependent verify_heapam tier), and the `AC-002`…`AC-005` TAP port + CSV
   flip.
 

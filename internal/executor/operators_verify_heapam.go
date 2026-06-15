@@ -33,6 +33,14 @@ type verifyHeapamOp struct {
 	plan *planner.VerifyHeapam
 	rows []Row
 	idx  int
+
+	// outerSlot carries the lateral outer row when this op sits on the right of
+	// a `Join.Lateral == true` — the implicit-LATERAL comma-join pg_amcheck
+	// emits (`FROM pg_class c, verify_heapam(relation := c.oid, …) v`). Bound by
+	// the parent joinOp via BindLateralOuter before each per-outer-row Open. nil
+	// means "no lateral binding" — the args must reduce to constants, the
+	// original non-lateral SRF entry path. M0110-0003 gap #6.
+	outerSlot SlotView
 }
 
 func newVerifyHeapamOp(p *planner.VerifyHeapam) *verifyHeapamOp {
@@ -41,6 +49,13 @@ func newVerifyHeapamOp(p *planner.VerifyHeapam) *verifyHeapamOp {
 
 func (o *verifyHeapamOp) Schema() planner.Schema { return o.plan.Output() }
 func (o *verifyHeapamOp) Close() error           { return nil }
+
+// BindLateralOuter binds the outer row's slot for lateral arg evaluation.
+// Called by joinOp before each per-outer-row Open when `plan.Lateral == true`.
+// Passing nil clears the binding. M0110-0003 gap #6.
+func (o *verifyHeapamOp) BindLateralOuter(slot SlotView) {
+	o.outerSlot = slot
+}
 
 func (o *verifyHeapamOp) Open(ctx *Context) error {
 	o.rows = nil
@@ -55,8 +70,11 @@ func (o *verifyHeapamOp) Open(ctx *Context) error {
 			Message: "verify_heapam requires an in-memory catalog"}
 	}
 
-	// Resolve the regclass argument to a heap relation.
-	argVal, err := evalExpr(o.plan.Arg, nil, ctx)
+	// Resolve the regclass argument to a heap relation. evalExprSlot threads the
+	// lateral outer slot (non-nil only under a Join.Lateral) so a correlated arg
+	// like `relation := c.oid` resolves against the outer FROM sibling; nil slot
+	// behaves like the original constant-arg path. M0110-0003 gap #6.
+	argVal, err := evalExprSlot(o.plan.Arg, o.outerSlot, ctx)
 	if err != nil {
 		return err
 	}
@@ -147,7 +165,7 @@ func (o *verifyHeapamOp) evalBlockArg(ctx *Context, e planner.Expr) (int64, bool
 	if e == nil {
 		return 0, false, nil
 	}
-	d, err := evalExpr(e, nil, ctx)
+	d, err := evalExprSlot(e, o.outerSlot, ctx)
 	if err != nil {
 		return 0, false, err
 	}

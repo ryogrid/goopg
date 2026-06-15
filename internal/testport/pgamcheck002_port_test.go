@@ -64,13 +64,20 @@ package testport
 // pg_catalog-qualified SRF name; it now discards a user-schema qualifier and
 // dispatches builtins by their bare lowercased name.
 //
-// REMAINING blocker is now #6: pg_amcheck's per-relation heap check is an
-// implicit-LATERAL comma-join whose SRF argument list references the sibling
+// UPDATE (M0110-0003, gap #6): FIXED — pg_amcheck's per-relation heap check is
+// an implicit-LATERAL comma-join whose SRF argument list references the sibling
 // relation (`FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …)`).
-// The query parses and reaches the executor, but the correlated `c.oid` inside
-// the SRF's arguments does not resolve, so verify_heapam errors with
-// `column "oid" does not exist`. The preflight below probes for it directly so
-// the test self-skips on #6 rather than failing.
+// The planner now resolves the correlated `c.oid` against the sibling range-table
+// entry (planVerifyHeapam threads lateralCtx) and the executor drives the SRF
+// per outer row through the Join.Lateral driver — verifyHeapamOp implements
+// lateralBindable, and the BuildFast/OpNode execution path (the server's
+// simple-protocol path) now forwards BindLateralOuter through opNodeOperator.
+//
+// REMAINING blocker is now #7: connection/resolution-level behaviors —
+// (a) database-name pattern resolution, (b) non-existent role rejection,
+// (c) per-database amcheck-installed detection + template DB registration. The
+// preflight below probes for them directly so the test self-skips on #7 rather
+// than failing.
 //
 // Like 001_basic, the bundled pg_amcheck links a PG-17+ libpq symbol
 // (PQcancelBlocking), so it is run with LD_LIBRARY_PATH pointed at
@@ -193,26 +200,48 @@ func TestPort_PgAmcheck002Nonesuch(t *testing.T) {
 			"template1/template0 are not registered in pg_database. stderr=%q", db.Stderr)
 	}
 
-	// Probe for remaining gap #6 (M0110-0003): pg_amcheck builds its
-	// per-relation heap check as
+	// Gap #6 (M0110-0003) is now FIXED: pg_amcheck builds its per-relation heap
+	// check as the implicit-LATERAL comma-join
 	//   ... FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …) v
-	// i.e. an implicit-LATERAL comma-join where the SRF's first argument is the
-	// correlated reference `c.oid`. The schema-qualified-SRF parser gap (#5) is
-	// now FIXED, so the query parses and reaches the planner/executor — but the
-	// correlated `c.oid` inside the SRF's argument list does not resolve against
-	// the sibling `pg_class c` range-table entry, so verify_heapam errors with
-	// `column "oid" does not exist`. That surfaces in pg_amcheck's per-relation
-	// stdout (`heap table "…": ERROR: column "oid" does not exist`) and also
-	// affects the assertions below. Self-skip with the precise blocker; the day
-	// LATERAL correlation into a FROM-clause SRF's arguments resolves, this
-	// clears and the full assertion set runs unchanged.
+	// where the SRF's first argument is the correlated reference `c.oid`. The
+	// planner now resolves that arg against the sibling `pg_class c` range-table
+	// entry (planVerifyHeapam threads lateralCtx) and the executor drives the SRF
+	// per outer row via the Join.Lateral per-outer-row driver (verifyHeapamOp
+	// implements lateralBindable; the BuildFast/OpNode path's opNodeOperator now
+	// forwards BindLateralOuter). Assert the prior failure signatures are gone so
+	// a regression re-surfaces here rather than silently downstream.
 	heap := runAmcheck(t, c, "postgres")
-	if strings.Contains(heap.Stdout, `column "oid" does not exist`) {
-		t.Skipf("AC-002 blocked on remaining gap #6: a FROM-clause SRF's "+
-			"argument list does not resolve the implicit-LATERAL correlated "+
-			"reference `c.oid` against the sibling comma-join relation "+
-			"(`FROM pg_catalog.pg_class c, \"public\".verify_heapam(relation := c.oid, …)`); "+
-			"verify_heapam errors with `column \"oid\" does not exist`. stdout=%q", heap.Stdout)
+	if strings.Contains(heap.Stdout, `column "oid" does not exist`) ||
+		strings.Contains(heap.Stdout, "on nil slot") {
+		t.Fatalf("AC-002 gap #6 regressed: verify_heapam's correlated LATERAL "+
+			"argument `c.oid` no longer resolves through the comma-join. stdout=%q", heap.Stdout)
+	}
+
+	// Probe for remaining gap #7 (M0110-0003): the gaps that surface once the
+	// heap check itself works are connection/resolution-level, not SQL-surface:
+	//   (a) database-name pattern resolution — pg_amcheck resolves each
+	//       --database argument as a connectable-name pattern and errors
+	//       `no connectable databases to check matching "<pat>"` for a name that
+	//       resolves to nothing (multi-pattern / substring / superstring cases);
+	//   (b) non-existent role rejection — connecting as a role that does not
+	//       exist must fail the connection with `role "<name>" does not exist`
+	//       (goopg currently accepts any role and exits 0);
+	//   (c) per-database amcheck-installed detection + template DB registration —
+	//       `skipping database "template1": amcheck is not installed`.
+	// These are independent of the LATERAL SRF surface this loop closed. Self-skip
+	// with the precise blocker until they land; the assertion set below then runs
+	// unchanged. Probe (b) as the representative, cheapest signal.
+	userProbe := runAmcheck(t, c, "--username", "no_such_user", "postgres")
+	if userProbe.ExitCode == 0 ||
+		!strings.Contains(userProbe.Stderr, `role "no_such_user" does not exist`) {
+		t.Skipf("AC-002 blocked on remaining gap #7: connection/resolution-level "+
+			"behaviors are unimplemented — (a) database-name pattern resolution "+
+			"(`no connectable databases to check matching \"…\"`), (b) non-existent "+
+			"role rejection (`role \"no_such_user\" does not exist`; goopg exits %d "+
+			"with stderr=%q), (c) per-database amcheck-installed detection + "+
+			"template1/template0 registration. The LATERAL verify_heapam surface "+
+			"(gap #6) is fixed and the heap check runs clean.",
+			userProbe.ExitCode, userProbe.Stderr)
 	}
 
 	// --- Non-existent databases ------------------------------------------

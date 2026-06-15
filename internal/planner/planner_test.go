@@ -992,12 +992,12 @@ func TestPlanResolutionErrors(t *testing.T) {
 		sql  string
 		code string
 	}{
-		{"SELECT * FROM nope", "42P01"},                                  // undefined_table
-		{"SELECT bogus FROM pgbench_accounts", "42703"},                  // undefined_column
-		{"INSERT INTO pgbench_history (nope) VALUES (1)", "42703"},       // undefined_column
-		{"UPDATE pgbench_accounts SET nope = 1 WHERE aid = $1", "42703"}, // undefined_column
+		{"SELECT * FROM nope", "42P01"},                                        // undefined_table
+		{"SELECT bogus FROM pgbench_accounts", "42703"},                        // undefined_column
+		{"INSERT INTO pgbench_history (nope) VALUES (1)", "42703"},             // undefined_column
+		{"UPDATE pgbench_accounts SET nope = 1 WHERE aid = $1", "42703"},       // undefined_column
 		{"INSERT INTO pgbench_history (tid, bid, aid) VALUES (1, 2)", "42601"}, // explicit col-list arity mismatch
-		{"SELECT 1 UNION SELECT 2, 3", "42601"},                          // set-op column-count mismatch
+		{"SELECT 1 UNION SELECT 2, 3", "42601"},                                // set-op column-count mismatch
 		{"SELECT aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", "42702"},
 		{"SELECT aid FROM pgbench_accounts HAVING aid > 0", "42803"},
 	}
@@ -1050,6 +1050,57 @@ func TestPlanLateralSrfArgResolvesAgainstLeftFromItem(t *testing.T) {
 	if got := out[0].Name; got != "attrs" {
 		t.Errorf("output col name = %q, want %q", got, "attrs")
 	}
+}
+
+// TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem pins the
+// M0110-0003 gap #6 fix: pg_amcheck builds each per-relation heap check as
+// an implicit-LATERAL comma-join
+//
+//	... FROM pg_catalog.pg_class c, verify_heapam(relation := c.oid, …) v
+//
+// where the SRF's first argument is the correlated reference `c.oid` into the
+// left sibling. Before the fix planVerifyHeapam resolved its args against an
+// empty context, so `c.oid` raised "column oid does not exist" at plan time.
+// Now the args resolve against the lateral outer context and the wrapping Join
+// is marked Lateral so the executor drives the SRF per outer row (mirrors
+// TestPlanLateralSrfArgResolvesAgainstLeftFromItem for pg_get_publication_tables).
+func TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "rels"}, []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT v.blkno FROM rels c, verify_heapam(relation := c.oid) v`
+	plan, err := Plan(parseOne(t, sql), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	out := plan.Output()
+	if len(out) != 1 || !strings.EqualFold(out[0].Name, "blkno") {
+		t.Fatalf("expected single output column 'blkno', got %+v", out)
+	}
+	// The wrapping Join must be flagged Lateral so the executor drives the SRF
+	// per outer row (BindLateralOuter), not as a materialise-both-sides cross
+	// join (which would evaluate the correlated arg against a nil outer slot).
+	if !planTreeHasLateralJoin(plan) {
+		t.Fatalf("expected a Lateral Join in the plan tree, got none:\n%s", plan)
+	}
+}
+
+// planTreeHasLateralJoin reports whether any Join in the plan tree has
+// Lateral == true. Helper for TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem.
+func planTreeHasLateralJoin(n Node) bool {
+	switch x := n.(type) {
+	case *Join:
+		if x.Lateral {
+			return true
+		}
+		return planTreeHasLateralJoin(x.Left) || planTreeHasLateralJoin(x.Right)
+	case *Project:
+		return planTreeHasLateralJoin(x.Child)
+	}
+	return false
 }
 
 // TestPlanFetchTableListAggDerivedSubquery pins the M0103-0008 rung-7
