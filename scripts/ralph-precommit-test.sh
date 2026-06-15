@@ -35,9 +35,22 @@ set -euo pipefail
 # `go list ./...` covers the whole module and relative paths resolve.
 cd "$(dirname "$0")/.."
 
+# Scope selector. "full" (default) runs the unit/component suite (Part 1) AND
+# the pgbench smoke (Part 2). "smoke" runs ONLY the pgbench smoke. The
+# .githooks/pre-commit hook uses "smoke" so EVERY commit pays the ~2-3 min
+# pgbench cost — the CI-parity workload the Ralph loop was otherwise blind to
+# (it only ran targeted `go test`, never pgbench, so the TPC-B concurrency
+# regression class slipped straight through to CI). The ~10 min unit suite is
+# still covered by CI and explicit agent runs, so the hook skips it to keep
+# per-commit latency acceptable. Override: RALPH_PRECOMMIT_SCOPE=smoke|full.
+SCOPE="${RALPH_PRECOMMIT_SCOPE:-full}"
+
 # --------------------------------------------------------------------------- #
-# Part 1 — unit/component Go suite
+# Part 1 — unit/component Go suite (full scope only)
 # --------------------------------------------------------------------------- #
+if [ "$SCOPE" = "smoke" ]; then
+  echo "ralph-precommit-test.sh: SCOPE=smoke — skipping Part 1 (unit/component suite); running pgbench smoke only"
+else
 
 # Keep this pattern in sync with the EXCLUDE list in
 # .github/workflows/test.yml ("Run unit and component tests").
@@ -69,6 +82,8 @@ if [ "${RALPH_PRECOMMIT_RACE:-0}" = "1" ]; then
   echo "ralph-precommit-test.sh: race pass PASS"
 fi
 
+fi  # end Part 1 (skipped when SCOPE=smoke)
+
 # --------------------------------------------------------------------------- #
 # Part 2 — pgbench smoke against a live goopg server
 #
@@ -76,7 +91,43 @@ fi
 # `pgbench -i` (load), then the standard / -N / -S workloads.
 # --------------------------------------------------------------------------- #
 
-PORT="${RALPH_PRECOMMIT_PGPORT:-5535}"
+# Pick a listen port that is actually free. A fixed port is unsafe here: a
+# stray goopg/PostgreSQL left over from a crashed run (or a concurrent loop) may
+# already hold it, in which case our `pg_isready` wait would connect to the
+# WRONG server and the gate would falsely pass (pgbench against the stray) or
+# fail confusingly ("could not read postmaster.pid"). So probe from the
+# requested port upward and use the first free one.
+port_in_use() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    # Compare the port field (last colon-separated token) of each LISTEN
+    # socket's local address, so 127.0.0.1:P / *:P / [::]:P all match P.
+    ss -ltn 2>/dev/null | awk -v port="$p" \
+      'NR>1 { n=split($4,a,":"); if (a[n]==port) found=1 } END { exit(found?0:1) }' \
+      && return 0
+    return 1
+  fi
+  # Fallback when ss is unavailable: a successful TCP connect => in use.
+  if (exec 3<>"/dev/tcp/127.0.0.1/$p") >/dev/null 2>&1; then
+    exec 3>&- 3<&- 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
+REQ_PORT="${RALPH_PRECOMMIT_PGPORT:-5535}"
+PORT=""
+for cand in $(seq "$REQ_PORT" $((REQ_PORT + 50))); do
+  if ! port_in_use "$cand"; then PORT="$cand"; break; fi
+done
+if [ -z "$PORT" ]; then
+  echo "ralph-precommit-test.sh: no free port in [$REQ_PORT, $((REQ_PORT + 50))]" >&2
+  exit 1
+fi
+if [ "$PORT" != "$REQ_PORT" ]; then
+  echo "ralph-precommit-test.sh: port $REQ_PORT busy; using free port $PORT instead"
+fi
+
 DATADIR="tmp/ralph-precommit-goopg-data"
 LOGFILE="tmp/ralph-precommit-goopg.log"
 CG_UNIT="ralph-precommit-goopg"

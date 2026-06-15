@@ -165,13 +165,29 @@ gofmt -l .          # must produce empty output
 go vet ./...
 ```
 
-## Pre-commit test gate — MANDATORY
+## Pre-commit test gate — MANDATORY (now machine-enforced)
 
-Before you create **any** commit, you MUST run the project's unit/component
-test suite, and it MUST pass cleanly:
+**This gate is now enforced by a git hook, not just by discipline.** Run once
+per clone to activate it:
 
 ```bash
-scripts/ralph-precommit-test.sh
+make install-hooks      # sets core.hooksPath=.githooks
+```
+
+After that, **every `git commit` automatically runs the CI-parity pgbench smoke**
+(`.githooks/pre-commit` → `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`:
+build → init → pgbench standard / `-N` / `-S`, ~2-3 min) and the commit is
+**rejected** if it fails. This closes the historical blind spot where the loop
+ran only targeted `go test` and never the pgbench workload, so the pgbench TPC-B
+concurrency-regression class reached CI undetected. **Do NOT bypass with
+`git commit --no-verify`** — that re-opens exactly that blind spot.
+
+The hook runs the pgbench smoke only (the ~10 min unit suite stays in CI and in
+the full gate below). Before you create **any** commit, you MUST still run the
+full unit/component suite yourself, and it MUST pass cleanly:
+
+```bash
+scripts/ralph-precommit-test.sh        # full scope: unit/component suite + pgbench smoke
 ```
 
 For executor/planner/codec changes, additionally run the TPC-H silent-regression
