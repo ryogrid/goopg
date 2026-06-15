@@ -681,6 +681,22 @@ fixed one logical group per loop:
     acldefault('L', lomowner) AS acldefault FROM pg_largeobject_metadata ORDER BY
     lomowner, lomacl::pg_catalog.text, oid`) — another empty-view slice next.
 
+29. **`pg_largeobject_metadata` empty virtual view — DONE.** pg_dump's
+    `getBlobs` collects large objects with `SELECT oid, lomowner, lomacl,
+    acldefault('L', lomowner) AS acldefault FROM pg_largeobject_metadata ORDER BY
+    lomowner, lomacl::pg_catalog.text, oid`. goopg has no large-object support,
+    so an empty view (0 rows) is correct; because the row set is empty the
+    `acldefault('L', lomowner)` projection is never evaluated (so no
+    `function acldefault does not exist` blocker surfaces). Added an empty
+    `pg_largeobject_metadata` virtual view (OID 2995) in
+    `internal/catalog/catalog.go` beside `pg_rewrite`. Schema matches
+    `pg_largeobject_metadata.h`: oid, lomowner oid, lomacl aclitem[]. After this
+    slice the large-object probe passes; the **new** blocker is `relation
+    "pg_amproc" does not exist` (dependency collection `getDependencies`: a
+    `pg_depend` UNION that joins `pg_amop` and `pg_amproc` to surface operator-
+    family member dependencies) — an empty-view slice for `pg_amop` (OID 2602)
+    and `pg_amproc` (OID 2603) is next.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

@@ -1666,6 +1666,23 @@ object support.
         `pg_largeobject_metadata` virtual view (`pg_largeobject_metadata.h`, OID
         2995) — empty-view pattern (no large objects; cols oid, lomowner oid,
         lomacl aclitem[]).
+      - **PROGRESS 2026-06-16 (loop #52):** **DU-002 slice 29 LANDED.** Empty
+        `pg_largeobject_metadata` virtual view (OID 2995) in
+        `internal/catalog/catalog.go` beside `pg_rewrite` — pg_dump's `getBlobs`
+        probe (`SELECT oid, lomowner, lomacl, acldefault('L', lomowner) AS
+        acldefault FROM pg_largeobject_metadata ORDER BY lomowner,
+        lomacl::pg_catalog.text, oid`) now resolves (no large objects → 0 rows;
+        the `acldefault` projection is never evaluated over the empty set).
+        Schema per `pg_largeobject_metadata.h` (oid, lomowner oid, lomacl
+        aclitem[]). build/gofmt/vet clean; catalog suite PASS;
+        `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** pg_dump advances to dependency collection
+        (`getDependencies`) → `relation "pg_amproc" does not exist` (a
+        `pg_depend` UNION that joins `pg_amop` and `pg_amproc` for opfamily
+        member dependencies). Resume = slice 30: add the empty `pg_amop`
+        (`pg_amop.h`, OID 2602) + `pg_amproc` (`pg_amproc.h`, OID 2603) virtual
+        views — empty-view pattern (no user opclasses feeding this dump path →
+        0 rows).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

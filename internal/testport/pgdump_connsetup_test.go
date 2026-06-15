@@ -137,14 +137,23 @@ package testport
 // replication_views.go, so getPublications' probe `SELECT … p.pubviaroot,
 // p.pubgencols FROM pg_publication p` no longer errors. goopg does not publish
 // generated columns, so 'n'(none) is emitted for every publication row.
-// **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// advances to large-object collection (getBlobs) and fails with
-// `relation "pg_largeobject_metadata" does not exist` (query: `SELECT oid,
+// (DU-002 slice 29) The empty `pg_largeobject_metadata` virtual view (OID 2995)
+// is now defined in internal/catalog/catalog.go, so getBlobs' probe `SELECT oid,
 // lomowner, lomacl, acldefault('L', lomowner) AS acldefault FROM
-// pg_largeobject_metadata ORDER BY lomowner, lomacl::pg_catalog.text, oid`).
-// The next DU-002 slice adds the empty `pg_largeobject_metadata` virtual view
-// (pg_largeobject_metadata.h, OID 2995) — goopg has no large objects, so 0 rows
-// is correct. Cols: oid, lomowner oid, lomacl aclitem[].
+// pg_largeobject_metadata ORDER BY lomowner, lomacl::pg_catalog.text, oid` no
+// longer errors (goopg has no large objects → 0 rows; the acldefault projection
+// is never evaluated over the empty set). Cols: oid, lomowner oid, lomacl aclitem[].
+// **Next blocker (precise, confirmed empirically by this test):** pg_dump
+// advances to dependency collection (getDependencies) and fails with
+// `relation "pg_amproc" does not exist` (query joins pg_depend with pg_amop and
+// pg_amproc to surface opfamily member dependencies). The next DU-002 slice adds
+// the empty `pg_amop` (OID 2602) + `pg_amproc` (OID 2603) virtual views — goopg
+// has no user-defined operator classes feeding this dump path, so 0 rows is
+// correct for this cluster. pg_amop cols (pg_amop.h): oid, amopfamily oid,
+// amoplefttype oid, amoprighttype oid, amopstrategy int2, amoppurpose "char",
+// amopopr oid, amopmethod oid, amopsortfamily oid. pg_amproc cols (pg_amproc.h):
+// oid, amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum int2,
+// amproc regproc.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

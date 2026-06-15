@@ -4040,6 +4040,27 @@ func (c *InMemory) registerSystemTables() {
 	pgRewrite.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_rewrite"] = pgRewrite
 
+	// pg_largeobject_metadata — large-object ownership/ACL catalog (OID 2995).
+	// After getRules, pg_dump's getBlobs probes large objects with:
+	//   SELECT oid, lomowner, lomacl, acldefault('L', lomowner) AS acldefault
+	//   FROM pg_largeobject_metadata ORDER BY lomowner, lomacl::pg_catalog.text, oid
+	// goopg has no large-object support, so an empty view (0 rows) is correct,
+	// identical to a stock PG cluster with no large objects. Because the row set
+	// is empty, the acldefault('L', lomowner) projection is never evaluated.
+	// Schema matches PG's pg_largeobject_metadata (pg_largeobject_metadata.h):
+	// oid, lomowner oid, lomacl aclitem[]. M0110-0001 (DU-002 slice 29).
+	pgLargeobjectMetadata := &Table{
+		Schema: "pg_catalog", Name: "pg_largeobject_metadata", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "lomowner", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "lomacl", Type: Type{Name: "aclitem[]"}, Ordinal: 2},
+		},
+		OID: 2995,
+	}
+	pgLargeobjectMetadata.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_largeobject_metadata"] = pgLargeobjectMetadata
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

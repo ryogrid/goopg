@@ -1,36 +1,33 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 26
-(pg_trigger empty view) COMPLETE this loop. NOTHING in flight; next loop
-starts on slice 27 (empty pg_rewrite virtual view).
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 29 COMPLETE
+this loop (commit pending push). NOTHING in flight; next loop starts on
+slice 30 (empty pg_amop + pg_amproc virtual views).
 
-=== DONE (loop #50) — DU-002 slice 26 ===
-Added empty `pg_trigger` virtual view (OID 2620) in
-internal/catalog/catalog.go beside pg_partitioned_table. pg_dump's
-getTriggers probe (`SELECT t.tgrelid, t.tgname, pg_get_triggerdef(...) … FROM
-unnest('{}'::oid[]) AS src(tbloid) JOIN pg_trigger t ON …`) now resolves
-instead of erroring. goopg has no user triggers, so 0 rows is correct; the
-unnest('{}') source is empty so the JOIN/pg_get_triggerdef never evaluate.
-Schema matches pg_trigger.h: oid, tgrelid oid, tgparentid oid, tgname name,
-tgfoid oid, tgtype int2, tgenabled "char", tgisinternal bool, tgconstrrelid
-oid, tgconstrindid oid, tgconstraint oid, tgdeferrable bool, tginitdeferred
-bool, tgnargs int2, tgattr int2vector→int2[], tgargs bytea, tgqual
-pg_node_tree, tgoldtable name, tgnewtable name. VirtualRows returns nil.
-Pure additive virtual view — zero existing query/row-count risk.
-Updated: catalog.go (view def), pgdump_connsetup_test.go (next-blocker header
-→ pg_rewrite), design doc 0110-0001 (slice-26 block), fix_plan loop #50 entry.
-Gates: build/gofmt/vet clean; catalog suite PASS;
-TestPort_PgDumpConnectionSetup PASS. tpch-spotcheck N/A (additive empty virtual
-catalog view only; no physical/codec/executor change).
+=== DONE (loop #52) — DU-002 slice 29 ===
+Empty `pg_largeobject_metadata` virtual view (OID 2995) in
+internal/catalog/catalog.go beside pg_rewrite. getBlobs probe
+`SELECT oid, lomowner, lomacl, acldefault('L', lomowner) AS acldefault FROM
+pg_largeobject_metadata ORDER BY lomowner, lomacl::pg_catalog.text, oid` now
+resolves (no large objects → 0 rows; acldefault projection never evaluates over
+empty set). Schema per pg_largeobject_metadata.h: oid, lomowner oid, lomacl
+aclitem[] (Type{Name:"aclitem[]"} — NOTE: Type struct has NO IsArray field; use
+the "name[]" string convention). VirtualRows returns nil.
+Updated: catalog.go, pgdump_connsetup_test.go (header → next blocker), design
+doc 0110-0001 (slice 29 block), fix_plan loop #52.
+Gates: build/gofmt/vet clean; catalog suite PASS; TestPort_PgDumpConnectionSetup
+PASS. tpch-spotcheck N/A (additive virtual catalog parity only; no physical/
+codec/executor change).
 
-=== NEXT STEP — DU-002 slice 27 (pg_rewrite empty view) ===
-pg_dump now fails: `relation "pg_rewrite" does not exist`. Query (getRules):
-`SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type, is_instead,
-ev_enabled FROM pg_rewrite ORDER BY oid`.
-Add empty pg_rewrite virtual view (pg_rewrite.h, OID 2618) in catalog.go beside
-pg_trigger. goopg has no user rules, so 0 rows is correct (ORDER BY oid over an
-empty relation yields no rows). Cols (pg_rewrite.h): oid, rulename name,
-ev_class oid, ev_type "char", ev_enabled "char", is_instead bool, ev_qual
-pg_node_tree, ev_action pg_node_tree. RUN TestPort_PgDumpConnectionSetup to
-confirm + find next blocker empirically.
+=== NEXT STEP — DU-002 slice 30 (pg_amop + pg_amproc empty views) ===
+pg_dump now fails: `relation "pg_amproc" does not exist`. Query (getDependencies)
+is a pg_depend UNION that joins pg_amop AND pg_amproc for opfamily member deps.
+Add BOTH empty virtual views in catalog.go beside pg_largeobject_metadata:
+- pg_amop (OID 2602, pg_amop.h): oid, amopfamily oid, amoplefttype oid,
+  amoprighttype oid, amopstrategy int2, amoppurpose "char", amopopr oid,
+  amopmethod oid, amopsortfamily oid.
+- pg_amproc (OID 2603, pg_amproc.h): oid, amprocfamily oid, amproclefttype oid,
+  amprocrighttype oid, amprocnum int2, amproc regproc.
+goopg has no user-defined opclasses feeding this dump path → 0 rows each.
+RUN TestPort_PgDumpConnectionSetup (-count=1) to confirm + find next blocker.
 
 ORTHOGONAL PRE-EXISTING (track separately): reading a text[] column back from
 the heap yields the BINARY array encoding (KindString raw bytes), not the text
