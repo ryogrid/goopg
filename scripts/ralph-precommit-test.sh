@@ -139,9 +139,17 @@ if [ "$PORT" != "$REQ_PORT" ]; then
   echo "ralph-precommit-test.sh: port $REQ_PORT busy; using free port $PORT instead"
 fi
 
-DATADIR="tmp/ralph-precommit-goopg-data"
-LOGFILE="tmp/ralph-precommit-goopg.log"
-CG_UNIT="ralph-precommit-goopg"
+# Per-run-unique data dir / log / systemd scope. Two gate runs can overlap (e.g.
+# a respawned Ralph loop committing — and thus firing its own pre-commit gate —
+# while you commit). Fixed names would then collide: a shared data dir corrupts,
+# and systemd refuses a second scope of the same name ("Unit
+# ralph-precommit-goopg.scope was already loaded"), failing the gate spuriously.
+# Suffixing with the PID keeps concurrent runs independent (the free-port probe
+# above handles the listen-port half of the same hazard).
+RUN_ID="$$"
+DATADIR="tmp/ralph-precommit-goopg-data-$RUN_ID"
+LOGFILE="tmp/ralph-precommit-goopg-$RUN_ID.log"
+CG_UNIT="ralph-precommit-goopg-$RUN_ID"
 
 # Prefer the project's pinned PG 18.3 client tools (pgbench / pg_isready) under
 # postgres/local_install/bin when present — that is the compatibility oracle
