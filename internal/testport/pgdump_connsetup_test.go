@@ -199,16 +199,20 @@ package testport
 // Slice 41 added pg_proc.prosupport (the OID of the function's planner support
 // function, oid; 0 for every goopg routine). With all 22 pg_proc columns
 // dumpFunc projects now resolving, the query plans and executes.
+// Slice 42 made dumpFunc's `pg_proc p, pg_language l WHERE p.oid=$1 AND
+// l.oid=p.prolang` join resolve: it populated pg_language's VirtualRows with the
+// 3 built-in language rows (internal/12, c/13, sql/14) AND retyped pg_proc.prolang
+// from text to oid (matching PG's catalog) so the join compares oid=oid instead of
+// oid=text — the latter silently returned "0 rows instead of one". Built-in stubs
+// already used OID-string langs; user routines now map name→OID via
+// langNameToOIDStr (plpgsql, absent from pg_language, → 0). This stays safe for
+// getProcLangs (its WHERE lanispl excludes all 3, which have lanispl=false).
 // **Next blocker (precise, confirmed empirically by this test):** pg_dump now
-// fails in dumpFunc with `query returned 0 rows instead of one` (EXECUTE
-// dumpFunc('1654')) — a different class of error. dumpFunc's query joins
-// `pg_catalog.pg_proc p, pg_catalog.pg_language l WHERE p.oid = $1 AND
-// l.oid = p.prolang` to fetch lanname, but goopg's pg_language virtual view
-// (internal/catalog/catalog.go) returns 0 rows, so the join over prolang=12
-// (internal) yields nothing. The next DU-002 slice must populate pg_language's
-// VirtualRows with the 3 built-in language rows (internal/12, c/13, sql/14);
-// this stays safe for getProcLangs (its WHERE lanispl still excludes all 3,
-// which have lanispl=false).
+// fails in dumpFunc with `function pg_catalog.pg_get_function_identity_arguments
+// does not exist` (EXECUTE dumpFunc('1654')). dumpFunc's SELECT projects
+// pg_get_function_arguments/identity_arguments/result(p.oid); goopg implements
+// none of these catalog functions yet. The next DU-002 slice must add a
+// pg_get_function_identity_arguments builtin (and likely its siblings).
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

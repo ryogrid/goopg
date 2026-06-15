@@ -108,6 +108,29 @@ func typeNameToOIDStr(typName string) string {
 	}
 }
 
+// langNameToOIDStr maps a procedural-language NAME to its pg_language OID string.
+// goopg's pg_proc view stores prolang as oid (matching PG's catalog) so pg_dump's
+// dumpFunc join `pg_language l ON l.oid = p.prolang` resolves. The 3 built-in
+// languages (internal/c/sql) live in pg_language (see catalog.go); their OIDs come
+// from postgres/src/include/catalog/pg_language.dat. A user routine recorded with a
+// language not yet present in pg_language (e.g. plpgsql, which goopg does not install
+// by default and which has a dynamic OID in PG) returns "0" (InvalidOid): a numeric
+// value safe to materialise into the oid column, though dumpFunc's join will not
+// resolve for such a function until the PL is added to pg_language (tracked
+// separately). M0110-0001 (DU-002 slice 42).
+func langNameToOIDStr(lang string) string {
+	switch strings.ToLower(lang) {
+	case "internal":
+		return "12"
+	case "c":
+		return "13"
+	case "sql":
+		return "14"
+	default:
+		return "0"
+	}
+}
+
 // builtinProcRow holds the fixed values for a built-in pg_proc row.
 // proargtypes is a space-separated list of OID strings (oidvector format).
 // retType is the return type OID string.
@@ -154,7 +177,10 @@ var builtinProcs = []builtinProcRow{
 //   - oid: routine OID (text — pg_class etc. also use text OIDs).
 //   - proname: routine name (unqualified).
 //   - pronamespace: schema OID — 11 for pg_catalog, 2200 for public.
-//   - prolang: language OID (text "12" for internal, "14" for SQL, "13" for C).
+//   - prolang: language OID (oid "12" for internal, "14" for SQL, "13" for C).
+//     Typed oid (NOT text) to match PG's pg_proc.prolang and the physical
+//     pg_proc catalog: pg_dump's dumpFunc joins `pg_language l ON l.oid =
+//     p.prolang`, and an oid=text comparison silently yields 0 rows.
 //   - prorettype: return-type OID (text).
 //   - proargtypes: space-separated arg-type OIDs (oidvector format).
 //   - pronargs: number of input arguments (int2 = len(proargtypes)).
@@ -195,7 +221,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "oid", Type: catalog.Type{Name: "oid"}},
 			{Name: "proname", Type: catalog.Type{Name: "text"}},
 			{Name: "pronamespace", Type: catalog.Type{Name: "oid"}},
-			{Name: "prolang", Type: catalog.Type{Name: "text"}},
+			{Name: "prolang", Type: catalog.Type{Name: "oid"}},
 			{Name: "prorettype", Type: catalog.Type{Name: "oid"}},
 			{Name: "proargtypes", Type: catalog.Type{Name: "oidvector"}},
 			{Name: "pronargs", Type: catalog.Type{Name: "int2"}},
@@ -311,7 +337,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				fmt.Sprintf("%d", r.OID),
 				r.Name,
 				ns,
-				r.Language,
+				langNameToOIDStr(r.Language), // prolang: oid (matches PG; resolves dumpFunc join)
 				typeNameToOIDStr(r.ReturnType.Name),
 				strings.Join(argOIDs, " "),
 				fmt.Sprintf("%d", len(r.ArgTypes)), // pronargs

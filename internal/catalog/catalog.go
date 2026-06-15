@@ -3554,11 +3554,18 @@ func (c *InMemory) registerSystemTables() {
 	// lanvalidator, lanacl, acldefault('l', lanowner) AS acldefault, lanowner FROM
 	// pg_language WHERE lanispl ORDER BY oid`. The `WHERE lanispl` predicate selects
 	// only user-installed procedural languages — the built-in internal/c/sql langs
-	// have lanispl=false and are never dumped. goopg installs no user PLs, so this
-	// view is correctly empty (0 rows). Schema matches PG's pg_language (oid,
+	// have lanispl=false and are never dumped. goopg installs no user PLs, so
+	// getProcLangs still finds nothing. BUT dumpFunc joins pg_proc to pg_language
+	// WITHOUT a lanispl filter (`WHERE p.oid=$1 AND l.oid=p.prolang`) purely to
+	// fetch lanname for the function's prolang; with 0 rows that join returns
+	// "0 rows instead of one" and aborts the dump. So this view is populated with
+	// the 3 built-in BKI rows (internal/c/sql, OIDs 12/13/14) matching initdb's
+	// pgLanguageInitialEntries(); all three have lanispl=false so getProcLangs's
+	// `WHERE lanispl` still returns 0. Schema matches PG's pg_language (oid,
 	// lanname name, lanowner oid, lanispl bool, lanpltrusted bool, lanplcallfoid oid,
 	// laninline oid, lanvalidator oid, lanacl aclitem[]); lanowner is typed oid so
-	// `acldefault('l', lanowner)` resolves. M0110-0001 (DU-002).
+	// `acldefault('l', lanowner)` resolves. lanvalidator=0 (no validators) and
+	// lanacl=NULL (default privileges) for all rows. M0110-0001 (DU-002 slice 42).
 	pgLanguage := &Table{
 		Schema: "pg_catalog", Name: "pg_language", Virtual: true,
 		Columns: []Column{
@@ -3574,7 +3581,16 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2612,
 	}
-	pgLanguage.VirtualRows = func() [][]string { return nil }
+	// 3 built-in languages from postgres/src/include/catalog/pg_language.dat
+	// (oid, lanname, lanowner=10, lanispl=f, lanpltrusted, lanplcallfoid=0,
+	// laninline, lanvalidator=0, lanacl=NULL). sql is trusted with laninline=2511.
+	pgLanguage.VirtualRows = func() [][]string {
+		return [][]string{
+			{"12", "internal", "10", "f", "f", "0", "0", "0", ""},
+			{"13", "c", "10", "f", "f", "0", "0", "0", ""},
+			{"14", "sql", "10", "f", "t", "0", "2511", "0", ""},
+		}
+	}
 	c.tables["pg_catalog.pg_language"] = pgLanguage
 
 	// pg_operator — operator catalog (OID 2617). pg_dump's getOperators runs

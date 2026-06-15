@@ -65,8 +65,11 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 	if row[2] != "2200" {
 		t.Errorf("pronamespace = %q, want 2200 (public OID)", row[2])
 	}
-	if row[3] != "plpgsql" {
-		t.Errorf("prolang = %q, want plpgsql", row[3])
+	// prolang is now the oid string (matches PG's pg_proc.prolang). plpgsql is
+	// not installed in goopg's pg_language, so it maps to "0" (InvalidOid); the
+	// 3 built-in langs (internal/c/sql) map to 12/13/14. DU-002 slice 42.
+	if row[3] != "0" {
+		t.Errorf("prolang = %q, want 0 (plpgsql not in pg_language)", row[3])
 	}
 	// prorettype is now the OID string for "int" (int4 = 23).
 	if row[4] != "23" {
@@ -377,6 +380,59 @@ func TestPgProcViewProsupport(t *testing.T) {
 		if rows[i][prosupport] != "0" {
 			t.Errorf("row %q prosupport = %q, want 0", rows[i][1], rows[i][prosupport])
 		}
+	}
+}
+
+// TestPgProcViewProlangOID pins the prolang column as oid-typed with OID-string
+// values (DU-002 slice 42). PG's pg_proc.prolang is oid; pg_dump's dumpFunc joins
+// `pg_language l ON l.oid = p.prolang`, so a text-typed prolang silently returns 0
+// rows ("0 rows instead of one") and aborts the dump. The built-in stubs use OID
+// "12" (internal); a user sql routine maps to "14".
+func TestPgProcViewProlangOID(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "sqlfn",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "sql",
+		Body:       "SELECT 1",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	// The prolang column must be oid-typed so the join compares oid=oid.
+	var prolangCol catalog.Column
+	for _, c := range tbl.Columns {
+		if c.Name == "prolang" {
+			prolangCol = c
+		}
+	}
+	if prolangCol.Type.Name != "oid" {
+		t.Fatalf("prolang column type = %q, want oid (text breaks dumpFunc join)", prolangCol.Type.Name)
+	}
+	rows := tbl.VirtualRows()
+	const prolang = 3
+	// Built-in RI_FKey_cascade_del (oid 1654) is an internal-language stub → "12".
+	var sawInternal, sawSQL bool
+	for _, r := range rows {
+		switch r[1] {
+		case "RI_FKey_cascade_del":
+			sawInternal = true
+			if r[prolang] != "12" {
+				t.Errorf("RI_FKey_cascade_del prolang = %q, want 12 (internal)", r[prolang])
+			}
+		case "sqlfn":
+			sawSQL = true
+			if r[prolang] != "14" {
+				t.Errorf("sqlfn prolang = %q, want 14 (sql)", r[prolang])
+			}
+		}
+	}
+	if !sawInternal || !sawSQL {
+		t.Fatalf("missing rows: sawInternal=%v sawSQL=%v", sawInternal, sawSQL)
 	}
 }
 

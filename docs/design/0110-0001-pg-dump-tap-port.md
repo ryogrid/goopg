@@ -896,6 +896,27 @@ fixed one logical group per loop:
     the 3 built-in language rows (internal/12, c/13, sql/14 — matching
     `pgLanguageInitialEntries()`); this stays safe for `getProcLangs` because all 3
     have `lanispl=false` (its `WHERE lanispl` still excludes them).
+42. **`pg_language` built-in rows + `pg_proc.prolang` oid type — DONE.** Two
+    coupled fixes made the `dumpFunc` join resolve. (a) Populated `pg_language`'s
+    `VirtualRows` (`internal/catalog/catalog.go`) with the 3 built-in language rows
+    (internal/12, c/13, sql/14) matching `pgLanguageInitialEntries()`;
+    `lanvalidator=0`, `lanacl=NULL`, and all `lanispl=f` (so `getProcLangs`' `WHERE
+    lanispl` still returns 0 — no user PLs to dump). (b) Retyped the `pg_proc` view's
+    `prolang` column from `text` to `oid` (`internal/initdb/pg_proc_view.go`),
+    matching PG's `pg_proc.prolang` and the physical pg_proc catalog
+    (`initdb.go`/`relcache_init.go`, already oid). The join `l.oid = p.prolang` was
+    comparing `oid = text`, which silently matched nothing → `0 rows instead of
+    one`; with both oid it resolves. Built-in stubs already emitted OID-string langs;
+    user routines now map name→OID via the new `langNameToOIDStr` helper (plpgsql,
+    not installed in goopg's `pg_language`, → `0`/InvalidOid — a plpgsql function's
+    dump-join is a separate future gap). Guards: `catalog.TestPgLanguageBuiltinRows`,
+    `initdb.TestPgProcViewProlangOID` (+ updated `TestPgProcViewRendersRoutine`).
+    After this slice the join resolves and `dumpFunc` advances; the **new** blocker
+    is `function pg_catalog.pg_get_function_identity_arguments does not exist`
+    (`EXECUTE dumpFunc('1654')`) — dumpFunc's SELECT projects
+    `pg_get_function_arguments`/`_identity_arguments`/`_result(p.oid)`, none of which
+    goopg implements yet. The next slice must add these catalog functions (starting
+    with `pg_get_function_identity_arguments`).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
