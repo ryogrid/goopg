@@ -5289,6 +5289,20 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if after, ok := strings.CutPrefix(name, "pg_catalog."); ok {
 		name = after
 	}
+	// Strip a *user* schema qualifier for the amcheck scalar builtins. Unlike
+	// most builtins, pg_amcheck qualifies bt_index_check / bt_index_parent_check
+	// with the amcheck extension's install schema (e.g. `"public".bt_index_check`),
+	// not pg_catalog — so the pg_catalog strip above misses them and dispatch
+	// would 42883. This mirrors the FROM-clause SRF path for verify_heapam, which
+	// discards the schema qualifier for known amcheck builtins
+	// (internal/parser/select.go, M0110-0003 AC-002 gap #5). Only the amcheck
+	// builtin names are stripped, so a same-named user function is unaffected.
+	if dot := strings.LastIndexByte(name, '.'); dot >= 0 {
+		switch name[dot+1:] {
+		case "bt_index_check", "bt_index_parent_check", "verify_heapam":
+			name = name[dot+1:]
+		}
+	}
 	switch name {
 	case "bt_index_check":
 		// amcheck B-tree structural verification (slice S4 of 0110-0008).

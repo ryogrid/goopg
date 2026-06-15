@@ -199,13 +199,20 @@ against a clean goopg cluster surfaced the precise remaining gaps:
 
 1. **Lateral outer-qual pushdown** — FIXED above. Was the dominant blocker for any
    `--table`/`--schema`-scoped run once a database held more than a lone heap table.
-2. **`bt_index_check` schema-qualified dispatch** — `pg_amcheck` calls the amcheck
-   functions schema-qualified (`"<amcheck-schema>".bt_index_check(...)`, e.g.
-   `public.bt_index_check`). `evalFuncCall` (`internal/executor/expr.go`) strips
-   only a `pg_catalog.` prefix before matching, so `public.bt_index_check` resolves
-   to `function public.bt_index_check does not exist` (42883). Any table with a
-   dependent index therefore still fails its index check. (Not fixed this loop —
-   the heap-side pushdown is the standalone unit of work; this is the next slice.)
+2. **`bt_index_check` schema-qualified dispatch** — FIXED below. `pg_amcheck` calls
+   the amcheck functions schema-qualified by the *amcheck install schema*
+   (`"<amcheck-schema>".bt_index_check(index := $1::regclass, heapallindexed := $2, …)`,
+   e.g. `public.bt_index_check`), not `pg_catalog`. `evalFuncCall`
+   (`internal/executor/expr.go`) stripped only a `pg_catalog.` prefix before
+   matching, so `public.bt_index_check` resolved to `function public.bt_index_check
+   does not exist` (42883), and any table with a dependent index failed its index
+   check even when healthy. The fix strips a *user*-schema qualifier for the amcheck
+   scalar builtins (`bt_index_check` / `bt_index_parent_check` / `verify_heapam`) —
+   the suffix after the last `.` is matched against the amcheck builtin set, and only
+   those names are stripped, so a same-named user function is unaffected. This
+   mirrors the FROM-clause SRF schema-strip already done for `verify_heapam`
+   (`internal/parser/select.go`, gap #5). The scalar parser already accepts the
+   `:=` named-arg spelling pg_amcheck emits (`parseFuncCallTail`, S5).
 3. **System-catalog heap resolution** — a whole-db `pg_amcheck postgres` run also
    checks `pg_catalog.*`; `verify_heapam` on `pg_type`/`pg_attribute`/`pg_class`
    reports `could not open relation` because `verifyHeapamResolveTable` /
@@ -221,11 +228,18 @@ never calls `verify_heapam()`. **(DONE — AC-002 is now `port`; the three gaps
 plus #6/#7a/#7b/#7c landed.)**
 
 For `AC-003`: the page-structural tier of `004_verify_heapam.pl` is ported (above),
-and the lateral outer-qual pushdown now lets `pg_amcheck` scope heap checks to a
-single relation in a multi-relation database. Remaining for `003_check.pl`
-(whole-database heap+btree orchestration): the `bt_index_check` schema-qualified
-dispatch (blocker #2) for the index side, and system-catalog heap resolution
-(blocker #3) for the empty pre-corruption whole-db run. `005_opclass_damage.pl`
-needs `CREATE OPERATOR CLASS` + `pg_amproc` catalog parity to inject the breaking
-sort-order via `UPDATE pg_amproc`. AC-003 stays `defer` until 003 and 005 land;
-next slice = `bt_index_check` schema-qualifier (blocker #2, small).
+the lateral outer-qual pushdown (blocker #1) now lets `pg_amcheck` scope heap checks
+to a single relation in a multi-relation database, and the `bt_index_check`
+schema-qualified dispatch (blocker #2) now lets a `--table`/`--schema`-scoped run
+check a relation's dependent btree indexes. End-to-end proof: a healthy *indexed*
+user table checks clean through the real binary
+(`TestPort_PgAmcheckBtreeIndexCheck`, `internal/testport/pgamcheck_btree_port_test.go`);
+the dispatch fix itself is hard-gated by `TestBtIndexCheck_SchemaQualifiedDispatch`
+(`internal/executor/operators_bt_index_check_test.go`). Remaining for `003_check.pl`
+(whole-database heap+btree orchestration): system-catalog heap resolution
+(blocker #3) for the empty pre-corruption whole-db run — `verify_heapam` on
+`pg_type`/`pg_attribute`/`pg_class` must resolve catalog relations to on-disk heap
+pages. `005_opclass_damage.pl` needs `CREATE OPERATOR CLASS` + `pg_amproc` catalog
+parity to inject the breaking sort-order via `UPDATE pg_amproc`. AC-003 stays
+`defer` until 003 and 005 land; next slice = system-catalog heap resolution
+(blocker #3).

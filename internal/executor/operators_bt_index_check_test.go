@@ -61,6 +61,33 @@ func TestBtIndexCheck_CleanIndexNoError(t *testing.T) {
 	}
 }
 
+// TestBtIndexCheck_SchemaQualifiedDispatch is the M0110-0003 AC-003 blocker #2
+// regression: pg_amcheck qualifies the amcheck scalar builtins with the
+// extension's install schema (e.g. `"public".bt_index_check(...)`), not
+// pg_catalog. evalFuncCall must strip that user-schema qualifier and still
+// dispatch the builtin — otherwise any table with a dependent index 42883s
+// ("function public.bt_index_check does not exist"). Mirrors the FROM-clause
+// SRF schema-strip for verify_heapam.
+func TestBtIndexCheck_SchemaQualifiedDispatch(t *testing.T) {
+	ctx, cleanup := btIndexCheckSetup(t)
+	defer cleanup()
+
+	for _, sql := range []string{
+		`SELECT public.bt_index_check('bic_a_idx')`,
+		`SELECT "public".bt_index_check('bic_a_idx', false)`,
+		`SELECT public.bt_index_parent_check('bic_a_idx')`,
+		`SELECT "public".bt_index_parent_check('bic_a_idx', false, false, false)`,
+		// The exact named-argument shape pg_amcheck emits (schema-qualified by
+		// the amcheck install schema, `:=` legacy named-arg spelling).
+		`SELECT public.bt_index_check(index := 'bic_a_idx', heapallindexed := false)`,
+		`SELECT "public".bt_index_parent_check(index := 'bic_a_idx', heapallindexed := false, rootdescend := false)`,
+	} {
+		if _, err := runQueryWithErr(ctx, sql); err != nil {
+			t.Errorf("%s: schema-qualified clean index raised: %v", sql, err)
+		}
+	}
+}
+
 // TestBtIndexCheck_DetectsCorruptMetapage clobbers the metapage magic and
 // confirms both functions raise (ERRCODE_INDEX_CORRUPTED) — the engine's
 // "meta page is corrupt" finding propagated through the SQL surface as an error.

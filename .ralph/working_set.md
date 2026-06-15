@@ -1,47 +1,38 @@
-Task: M0110-0003 (AC-003 pg_amcheck) — loop #8. LANDED the lateral outer-qual
-pushdown that unblocks relation-scoped pg_amcheck heap checks. Committed on
-align-data-structure-with-pg.
+Task: M0110-0003 (AC-003 pg_amcheck) — loop #9. LANDED blocker #2:
+bt_index_check schema-qualified dispatch. Committed on align-data-structure-with-pg.
 
 === WHAT LANDED (this loop) ===
-Live-wire diagnosis (temp GOOPG_DIAG_TRACE in server query.go, now removed)
-showed pg_amcheck's heap command is an implicit-LATERAL comma-join:
-  FROM pg_catalog.pg_class c, "<schema>".verify_heapam(relation := c.oid, …) v
-  WHERE c.oid = N
-goopg planned the outer-only `WHERE c.oid = N` ABOVE the lateral nested-loop, so
-verify_heapam was opened for EVERY pg_class row and raised
-"could not open relation: relation does not exist" on the first non-heap sibling
-(an index/sequence OID) → exit 2 on a HEALTHY target table whenever the DB held
->1 relation. (Explains why 004's single-table case worked but anything with an
-index/2nd table failed.)
+pg_amcheck calls the amcheck builtins qualified by the *install schema*
+(`"public".bt_index_check(index := $1::regclass, heapallindexed := $2, …)`),
+NOT pg_catalog. evalFuncCall (internal/executor/expr.go ~L5286) stripped only
+the `pg_catalog.` prefix, so `public.bt_index_check` → 42883 "function
+public.bt_index_check does not exist". Any healthy table with a dependent index
+failed its index check.
 
-Fix: internal/planner/pushdown.go
-- pushOuterQualsIntoLaterals(node): for a residual Filter whose direct child is a
-  Lateral Join, move each outer-only conjunct (sideLeft by index range AND name)
-  onto Join.Left as a Filter. Indices already align (left child = leading cols).
-- collectScanOutputNames: extracted shared name-walk; added *Values case (virtual
-  catalog relations like pg_class plan as *Values).
-- name guard lenient when leftNames empty (direct-child sideLeft is conclusive).
-- Wired in planner.go right after pushPredicatesIntoCrossJoins (else branch).
-No-op unless residual Filter's direct child is a Lateral join → ZERO TPC-H impact.
+Fix: internal/executor/expr.go — after the pg_catalog strip, if the name has a
+`.`, match the suffix against {bt_index_check, bt_index_parent_check,
+verify_heapam} and strip the schema for those only (same-named user funcs
+unaffected). Mirrors the FROM-clause SRF schema-strip for verify_heapam
+(parser/select.go gap #5). Scalar parser already accepts `:=` named args (S5).
 
-Files: internal/planner/pushdown.go, internal/planner/planner.go (call site),
-internal/planner/planner_test.go (NEW TestPlanOuterQualPushedBelowLateralJoin +
-findLateralJoin/exprMentionsColumnName helpers), docs/design/0110-0003 (2 new
-sections), .ralph/fix_plan.md, deferral_ledger.md.
+Files: internal/executor/expr.go (fix),
+internal/executor/operators_bt_index_check_test.go (NEW
+TestBtIndexCheck_SchemaQualifiedDispatch — positional + `:=` named-arg shapes),
+internal/testport/pgamcheck_btree_port_test.go (NEW
+TestPort_PgAmcheckBtreeIndexCheck — real pg_amcheck over a healthy indexed user
+table checks clean e2e), docs/design/0110-0003 (blocker #2 → FIXED + resume),
+docs/test-port CSV+md (AC-003 rationale).
 
-Gates: internal/planner + internal/executor suites PASS; go vet planner/server
-clean; 001/002/004 amcheck port tests PASS; build ./... + gofmt clean. TPC-H
-spotcheck SKIPPED (no data dir loaded in this tree; safe by lateral-only guard).
-e2e verified manually: pg_amcheck --table public.t (heap-only) and
---table … --no-dependent-indexes return exit 0 over a multi-table/indexed DB.
+Gates: bt_index_check unit tests PASS; all 4 pg_amcheck port tests PASS
+(001/002/004 + new btree); executor+parser+planner suites PASS; build ./... +
+gofmt + vet clean; ralph-state-guard OK (self-repair). TPC-H spotcheck SKIPPED
+(no data dir; change is amcheck-dispatch-only, zero TPC-H surface).
 
-=== NEXT STEP (resume) — AC-003 remainder, blocker #2 (small) ===
-bt_index_check schema-qualified dispatch: evalFuncCall (internal/executor/expr.go
-~L5286) strips only "pg_catalog." before matching, so pg_amcheck's
-`"public".bt_index_check(...)` → 42883 "function public.bt_index_check does not
-exist". Any table with a dependent index still fails. Fix = strip the amcheck
-install-schema qualifier for the amcheck builtins (bt_index_check /
-bt_index_parent_check / verify_heapam scalar paths). Then blocker #3 (system-
-catalog heap resolution in verifyHeapamResolveTable/LookupTableByOID) for the
-003_check whole-db pre-corruption clean run. 005_opclass_damage = CREATE OPERATOR
-CLASS + pg_amproc parity (large).
+=== NEXT STEP (resume) — AC-003 remainder, blocker #3 ===
+System-catalog heap resolution for the 003_check whole-db pre-corruption clean
+run: `verify_heapam` on pg_type/pg_attribute/pg_class reports "could not open
+relation" because verifyHeapamResolveTable / LookupTableByOID
+(internal/executor/operators_verify_heapam.go) does not resolve catalog
+relations to on-disk heap pages. Larger parity effort. After that:
+005_opclass_damage = CREATE OPERATOR CLASS + pg_amproc parity (UPDATE pg_amproc
+to inject breaking sort-order) — large. AC-003 stays `defer` until 003 and 005.
