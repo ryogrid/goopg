@@ -1700,7 +1700,11 @@ func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 	// the CTE with column name "?column?1" instead of "n", causing the recursive
 	// member to fail with "column n does not exist".
 	if len(cte.Columns) > 0 {
-		if len(cte.Columns) != len(cols) {
+		// PG (parse_cte.c analyzeCTE): the alias list must be empty or no
+		// LONGER than the output column set; a SHORTER list is allowed and the
+		// trailing columns keep their query-derived names. Only over-aliasing
+		// is the 42P10 error.
+		if len(cte.Columns) > len(cols) {
 			return analyzeError(cte.Pos(), "42P10",
 				fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(cols)))
 		}
@@ -1836,7 +1840,12 @@ func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		}
 	}
 	if len(cte.Columns) > 0 {
-		if len(cte.Columns) != len(innerCols) {
+		// PG (parse_cte.c analyzeCTE): a column-alias list shorter than the
+		// inner query's output is allowed — the extra trailing columns keep
+		// their query names. Only over-aliasing is the 42P10 error. pg_amcheck
+		// relies on this for its `exclude_raw (pattern_id, rgx) AS (SELECT
+		// NULL, NULL, NULL WHERE false)` empty-pattern CTE (AC-002).
+		if len(cte.Columns) > len(innerCols) {
 			return analyzeError(cte.Pos(), "42P10",
 				fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(innerCols)))
 		}

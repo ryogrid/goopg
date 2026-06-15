@@ -229,21 +229,70 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
   ArityMismatch,DefaultColumnNames}`. Full parser + analyzer suites green;
   `go build ./...` + gofmt + vet clean.
 
-- **Remaining for AC-002 — gap #3 (connection-level):** goopg does not reject a
-  connection to a non-existent database at startup. Two parts: (a) register the
-  standard `template1`/`template0` databases in `pg_database` (the default
-  catalog set is only `{"postgres"}`, yet `002_nonesuch` connects to `template1`);
-  (b) call `databaseRegistry.HasDatabase(params["database"])` after auth in
-  `internal/server/server.go`'s connection path and, on miss, send a FATAL
-  `ErrorResponse` with SQLSTATE `3D000` (`database "%s" does not exist`) and close
-  — guarded so the `Catalog == nil` / non-`databaseRegistry` embedded-test paths
-  keep their legacy behaviour (mirror `tryHandleDatabaseDDL`). This touches the
-  connection handshake (every connection), so it is its own bounded loop with the
-  full `internal/server` suite + a live-cluster smoke. Until it lands, the
-  `002_nonesuch` test self-skips via a dedicated `qqq`-rejection probe in its
-  preflight (so gaps #1+#2 being fixed do not flip the test SKIP→FAIL).
+- **AC-002 gap #3 (connection-level) LANDED** + a newly-surfaced gap #2b
+  (CTE column-alias under-aliasing). Two parts of gap #3 plus the bootstrap-query
+  follow-on:
+  1. **Bootstrap databases registered in `pg_database`.** `catalog.NewInMemory`
+     now seeds `{postgres, template1, template0}` (was `{postgres}` only). The
+     `pg_database` virtual rows carry each template's canonical PG attributes:
+     `template1` (oid 1, `datallowconn=t`, `datistemplate=t`), `template0` (oid 4,
+     `datallowconn=f`, `datistemplate=t`), mirroring initdb's `buildRow` seed.
+     pg_amcheck's database-list query filters `WHERE datallowconn AND
+     datconnlimit != -2`, so `template0` is correctly omitted from `--all` while
+     `template1` is included. File: `internal/catalog/catalog.go`.
+  2. **Non-existent-database connection rejection (3D000).** After `checkAuth`
+     succeeds in `internal/server/server.go`'s connection path, a non-replication
+     connection whose `database` param is absent from the registry is rejected
+     with a FATAL `ErrorResponse` SQLSTATE `3D000` (`database "%s" does not
+     exist`) and the connection closes — mirroring PG's post-authentication
+     `InitPostgres` check. Guarded for `Catalog == nil` / non-`databaseRegistry`
+     embedded-test paths (mirror `tryHandleDatabaseDDL`); replication connections
+     bind no database and are skipped. File: `internal/server/server.go`.
+  3. **gap #2b — CTE alias list shorter than the inner query (under-aliasing).**
+     pg_amcheck's empty-exclude-pattern CTE is `exclude_raw (pattern_id, rgx) AS
+     (SELECT NULL, NULL, NULL WHERE false)` — two aliases over three columns. PG
+     (`parse_cte.c analyzeCTE`, lines 583-585: "the alias list must be empty or
+     exactly as long … but we allow it to be shorter") accepts this; the trailing
+     unaliased column keeps its query name. goopg rejected it with 42P10 at SIX
+     sites — two in `analyzer.go` (`analyzeRecursiveCTE` VALUES anchor +
+     `registerAnalyzedCTE`) and **five** alias-validation blocks in
+     `planner/with.go` (the recursive-branch, the DML-CTE skip, the non-recursive
+     "Bypass Plan() entry", `planRecursiveCTE`'s non-recursive fallback, and the
+     recursive-UNION anchor). Fix: change every `len(cte.Columns) != len(cols)`
+     guard to `>` (over-aliasing only) and rename only the first
+     `len(cte.Columns)` columns, leaving the rest with their query names. Files:
+     `internal/analyzer/analyzer.go`, `internal/planner/with.go`. (The DML-CTE
+     block at `with.go` keeps its `== len(schema)` rename gate — it does not
+     error on under-aliasing, it merely skips the prefix rename; that path is not
+     exercised by amcheck and is left bounded.)
 
-- **After #3:** S5 still needs the `verify_heapam`/`bt_index_check` SRFs to merely
+  Tests: `server.TestConnectNonexistentDatabaseRejected` (FATAL 3D000 + close),
+  `server.TestConnectBootstrapDatabasesAccepted` (postgres/template1/template0
+  pass the check), `catalog.TestNewInMemorySeedsPostgresDatabase` (3 bootstrap
+  DBs), `analyzer.TestAnalyzeWithFewerColumnAliasesAccepted`,
+  `planner.TestPlanWithFewerColumnAliasesAccepted` (sibling twins). Live-cluster
+  smoke verified: `psql -d qqq` → `FATAL: database "qqq" does not exist`;
+  `pg_database` shows the three rows with correct `datallowconn`/`datistemplate`;
+  the amcheck filter yields `{postgres, template1}`. Full `internal/server`,
+  `internal/analyzer`, `internal/planner`, `internal/catalog`, `internal/executor`
+  suites green; `go build ./...` + gofmt clean.
+
+- **Remaining for AC-002 — gap #4 (CTE not visible inside a FROM-subquery of the
+  main statement).** With gaps #1/#2/#2b/#3 closed, `002_nonesuch`'s
+  database-resolution bootstrap query now advances to its FINAL select, which is
+  `SELECT … FROM (SELECT … FROM filtered_databases) AS combined_records`, and
+  errors `relation "filtered_databases" does not exist`. Root cause isolated to a
+  minimal reproducer: `WITH x(a) AS (SELECT 1) SELECT a FROM (SELECT a FROM x) s`
+  → `relation "x" does not exist`. A WITH-clause CTE is **not in scope** when the
+  analyzer/planner resolves a derived-table subquery in the OUTER query's FROM
+  clause. (CTE→CTE references work — `WITH a AS (…), b AS (SELECT … FROM a) …` is
+  fine — so the gap is specifically the outer FROM-subquery not inheriting the
+  WITH scope.) This is a general CTE-scoping fix in the analyzer's
+  `buildSelectScope`/subquery-table synthesis and the planner's `planCTEs`
+  propagation into derived-table planning — its own bounded loop. Until it lands,
+  `002_nonesuch` self-skips via its preflight `query failed` probe.
+
+- **After #4:** S5 still needs the `verify_heapam`/`bt_index_check` SRFs to merely
   *exist* in `pg_proc` for relation-resolution, LATERAL `c.oid` resolution, the
   clog `XidStatusFunc` wiring, and the `AC-002`…`AC-005` TAP port + CSV flip.
 

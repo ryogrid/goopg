@@ -85,6 +85,29 @@ func TestAnalyzeWithColumnAliasesRenameColumns(t *testing.T) {
 		"42703")
 }
 
+// TestAnalyzeWithFewerColumnAliasesAccepted: PG (parse_cte.c analyzeCTE)
+// allows a column-alias list SHORTER than the inner query's output — the
+// trailing unaliased columns keep their query-derived names. Only
+// over-aliasing is the 42P10 error. pg_amcheck (AC-002) depends on this for
+// its `exclude_raw (pattern_id, rgx) AS (SELECT NULL, NULL, NULL WHERE false)`
+// empty-pattern CTE: two aliases over three columns.
+func TestAnalyzeWithFewerColumnAliasesAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	// Two aliases over three output columns: must analyze cleanly.
+	if err := Analyze(parseOne(t,
+		"WITH e(pattern_id, rgx) AS (SELECT NULL, NULL, NULL WHERE false) SELECT * FROM e"),
+		cat); err != nil {
+		t.Errorf("under-aliased VALUES/SELECT CTE should analyze: %v", err)
+	}
+	// The aliased columns resolve under their new names, and the trailing
+	// unaliased column keeps the query-derived name.
+	if err := Analyze(parseOne(t,
+		"WITH a(x) AS (SELECT aid, bid FROM pgbench_accounts) SELECT x, bid FROM a"),
+		cat); err != nil {
+		t.Errorf("under-aliased CTE column resolution: %v", err)
+	}
+}
+
 // TestAnalyzeWithCTEShadowsBaseRelation: a CTE named after an
 // existing table shadows the table inside the SELECT. Mirrors
 // PostgreSQL — operationally useful for "factor out a tweaked

@@ -552,8 +552,9 @@ type InMemory struct {
 	routines *Routines
 	// databases is the set of database names the cluster knows
 	// about (M0054-0001). Populated by `CreateDatabase` and
-	// drained by `DropDatabase`. At startup the catalog seeds
-	// `"postgres"` (the conventional bootstrap DB); the recovery
+	// drained by `DropDatabase`. At startup the catalog seeds the
+	// three bootstrap databases `postgres`, `template1` and
+	// `template0` (mirroring initdb's pg_database); the recovery
 	// driver in `internal/initdb` re-applies WAL-logged
 	// CREATE/DROP DATABASE events on top. v0 still routes every
 	// relation through DefaultDBOid — the registry exists so
@@ -774,7 +775,7 @@ func NewInMemory() *InMemory {
 		nextOID:                FirstUserOID,
 		dbOid:                  DefaultDBOid,
 		routines:               NewRoutines(),
-		databases:              map[string]bool{"postgres": true},
+		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
 		partitionChildren:      make(map[uint32][]uint32),
 		indexPartitionChildren: make(map[uint32][]uint32),
 		inheritanceChildren:    make(map[uint32][]uint32),
@@ -2080,14 +2081,28 @@ func (c *InMemory) registerSystemTables() {
 		names := c.ListDatabases()
 		out := make([][]string, 0, len(names))
 		for _, n := range names {
+			// The bootstrap template databases carry their canonical PG
+			// attributes: template1 (oid 1) is connectable, template0
+			// (oid 4) is not (datallowconn=false), and both are templates
+			// (datistemplate=true). Mirrors initdb's pg_database seed
+			// (initdb.go buildRow). Clients such as pg_amcheck filter on
+			// `datallowconn AND datconnlimit != -2`, so template0 is
+			// correctly omitted from --all while template1 is included.
+			oid, datallowconn, datistemplate := "16384", "true", "false"
+			switch n {
+			case "template1":
+				oid, datallowconn, datistemplate = "1", "true", "true"
+			case "template0":
+				oid, datallowconn, datistemplate = "4", "false", "true"
+			}
 			out = append(out, []string{
-				"16384", // oid: conventional database OID (M0097-0021)
+				oid, // oid: conventional database OID (M0097-0021)
 				n,
-				"10",    // datdba: OID of owner (10 = postgres superuser)
-				"6",     // encoding: 6 = UTF8
-				"true",  // datallowconn: allow connections
-				"0",     // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
-				"false", // datistemplate: live databases are not templates
+				"10",          // datdba: OID of owner (10 = postgres superuser)
+				"6",           // encoding: 6 = UTF8
+				datallowconn,  // datallowconn: allow connections
+				"0",           // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
+				datistemplate, // datistemplate: true for template0/template1
 			})
 		}
 		return out

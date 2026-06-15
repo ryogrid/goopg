@@ -44,8 +44,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/activity"
+	"github.com/goopg/goopg/internal/auth"
 	"github.com/goopg/goopg/internal/autovacuum"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
@@ -705,6 +705,23 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	if !s.checkAuth(raw, r, w, params, logger) {
 		return
 	}
+
+	// M0110-0003 (AC-002 gap #3): reject a connection to a database that does
+	// not exist, mirroring PG's InitPostgres post-authentication 3D000
+	// `database "%s" does not exist`. goopg's in-memory database registry is the
+	// runtime source of truth (the on-disk pg_database is initdb-only). Skip for
+	// replication connections — a physical walsender binds no database, matching
+	// PG. Guarded for nil / non-registry catalogs exactly like
+	// tryHandleDatabaseDDL so embedded/test catalogs keep their prior behaviour.
+	if db := params["database"]; db != "" && !isReplication {
+		if reg, ok := s.cfg.Catalog.(databaseRegistry); ok && !reg.HasDatabase(db) {
+			s.writeFatal(w, sqlstate.InvalidCatalogName,
+				fmt.Sprintf("database %q does not exist", db))
+			logger.Info("connection rejected: unknown database", "database", db)
+			return
+		}
+	}
+
 	logger.Info("connection established")
 
 	// M0107-0001: session-level memory context. Acquired here and released
@@ -1029,8 +1046,8 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 	// Assign a ProcArray slot for this backend (M0107-0004). The slot is
 	// reused across all transactions on this connection; Begin clears and
 	// re-initialises it on each new transaction.
-	procNum := int32((pid-1) % uint32(mvcc.DefaultProcArraySize))
-	extended.ProcNum = procNum // thread through to executeExtendedQueryViaExecutor
+	procNum := int32((pid - 1) % uint32(mvcc.DefaultProcArraySize))
+	extended.ProcNum = procNum                                 // thread through to executeExtendedQueryViaExecutor
 	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum} // per-connection explicit transaction state (M0096-0005)
 	// On connection teardown (client disconnect, EOF, read error, admin
 	// shutdown — every `return` from the loop below), roll back any still-open
