@@ -805,6 +805,19 @@ fixed one logical group per loop:
     GUC SET clauses, `text[]`; NULL for every goopg routine). The next slice
     must add `proconfig` (always NULL) to the pg_proc view.
 
+36. **`pg_proc.proconfig` column — DONE.** dumpFunc projects `proconfig` (the
+    per-function GUC SET clauses, e.g. `SET search_path = ...`); goopg's
+    `pg_proc` virtual view did not expose it, so `EXECUTE dumpFunc('1654')`
+    aborted with `column "proconfig" does not exist`. Added the
+    `proconfig text[]` column: always NULL (`""`) for both built-in stubs and
+    user routines — goopg tracks no per-function `SET` clauses, so dumpFunc
+    emits no `SET ...` lines in a function's definition. Catalog-only change
+    (`internal/initdb/pg_proc_view.go`); guard `TestPgProcViewProconfig`. After
+    this slice pg_dump advances within `dumpFunc`; the **new** blocker is
+    `column "procost" does not exist` (`EXECUTE dumpFunc('1654')`) - dumpFunc
+    reads `pg_proc.procost` (the planner's estimated per-row execution cost,
+    `float4`). The next slice must add `procost` to the pg_proc view.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

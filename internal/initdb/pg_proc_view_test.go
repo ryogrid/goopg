@@ -172,6 +172,35 @@ func TestPgProcViewProbin(t *testing.T) {
 	}
 }
 
+// TestPgProcViewProconfig pins the proconfig column (DU-002 slice 36):
+// always NULL ("") for both built-in stubs and user routines — goopg tracks
+// no per-function GUC SET clauses. dumpFunc reads proconfig to emit `SET ...`
+// lines in a function's definition; NULL means it emits none.
+func TestPgProcViewProconfig(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "f",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "sql",
+		Body:       "SELECT 1",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	// proconfig is the last column (index 17), appended after probin (16).
+	const proconfig = 17
+	for i := range rows {
+		if rows[i][proconfig] != "" {
+			t.Errorf("row %q proconfig = %q, want \"\" (NULL)", rows[i][1], rows[i][proconfig])
+		}
+	}
+}
+
 // TestPgProcViewOrdering pins that the row order matches OID
 // ordering — an operator's `ORDER BY oid` is a no-op against this
 // view's natural order, which makes diff-based regression tests

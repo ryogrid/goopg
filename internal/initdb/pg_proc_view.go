@@ -164,6 +164,8 @@ var builtinProcs = []builtinProcRow{
 //   - prosrc: function body source.
 //   - probin: on-disk binary path for C-language functions; always NULL
 //     (goopg has no C functions). dumpFunc reads it to emit `AS '<probin>'`.
+//   - proconfig: per-function GUC SET clauses (text[]); always NULL — goopg
+//     tracks no per-function SET, so dumpFunc emits no `SET ...` lines.
 //
 // pronargs/proacl/proowner were added for pg_dump's getFuncs SELECT (M0110-0001
 // DU-002 slice 7), which projects `p.pronargs, …, p.proacl, …, p.proowner`.
@@ -189,6 +191,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "prokind", Type: catalog.Type{Name: "text"}},
 			{Name: "proretset", Type: catalog.Type{Name: "bool"}},
 			{Name: "probin", Type: catalog.Type{Name: "text"}},
+			{Name: "proconfig", Type: catalog.Type{Name: "text[]"}},
 		},
 		Virtual: true,
 	}
@@ -214,6 +217,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"f", // prokind: function
 				"f", // proretset: built-in stubs (abs/RI_FKey) are not SRFs
 				"",  // probin: NULL (internal funcs have no on-disk binary path)
+				"",  // proconfig: NULL (no per-function GUC SET clauses)
 			})
 		}
 		// Append user-defined routines.
@@ -279,6 +283,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				prokind,
 				retset,
 				"", // probin: NULL (goopg has no C-language functions)
+				"", // proconfig: NULL (goopg tracks no per-function GUC SET)
 			})
 		}
 		return rows

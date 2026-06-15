@@ -186,13 +186,14 @@ package testport
 // catalog.Routine.ReturnsSet for user routines, constant 'f' for built-in
 // stubs). Slice 35 added pg_proc.probin (the on-disk binary path for
 // C-language functions; always NULL for goopg's internal/SQL routines), so
-// dumpFunc advances past both.
+// dumpFunc advances past both. Slice 36 added pg_proc.proconfig (the
+// per-function GUC SET clauses, text[]; NULL for every goopg routine).
 // **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// fails in dumpFunc with `column "proconfig" does not exist` (EXECUTE
-// dumpFunc('1654')). dumpFunc reads pg_proc.proconfig (the per-function GUC
-// SET clauses, text[]; NULL for every goopg routine). goopg's pg_proc virtual
-// view does not yet expose it. The next DU-002 slice must add proconfig
-// (always NULL) to the pg_proc view.
+// fails in dumpFunc with `column "procost" does not exist` (EXECUTE
+// dumpFunc('1654')). dumpFunc reads pg_proc.procost (the planner's estimated
+// per-row execution cost, float4; PG default 1 for C/internal, 100 for
+// other-language functions). goopg's pg_proc virtual view does not yet expose
+// it. The next DU-002 slice must add procost to the pg_proc view.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker
