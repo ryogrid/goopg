@@ -91,15 +91,22 @@ package testport
 // defaclnamespace oid, defaclobjtype "char", defaclacl aclitem[]; empty by
 // construction, since goopg defines no default-ACL entries; the CASE/acldefault
 // projection is never evaluated).
+// The getConversions query reads the empty `pg_conversion` virtual view
+// (slice 21 — `pg_conversion.h` schema, OID 2607: oid, conname name,
+// connamespace oid, conowner oid, conforencoding int4, contoencoding int4,
+// conproc regproc(oid), condefault bool). PG ships ~130 built-in conversions,
+// but every one is in pg_catalog and filtered out at dump-out time, so the empty
+// view satisfies the dump identically — confirmed empirically by this test.
 // **Next blocker (precise, confirmed empirically by this test):** the
-// getDefaultACLs query now passes; pg_dump advances to getConversions, which
-// fails with `relation "pg_conversion" does not exist`. The query is
-// `SELECT tableoid, oid, conname, connamespace, conowner FROM pg_conversion`.
-// The next DU-002 slice adds the `pg_conversion` virtual view (`pg_conversion.h`
-// schema, OID 2607). Note: PG ships ~130 built-in conversions in pg_conversion,
-// so unlike the foreign/default-ACL views this is NOT empty by construction —
-// pg_dump filters them out as built-ins (conname/oid below the user-object
-// threshold), so an empty view may still satisfy the dump; verify empirically.
+// getConversions query now passes; pg_dump advances to getCasts, which fails
+// with `relation "pg_range" does not exist`. The query is
+// `SELECT tableoid, oid, castsource, casttarget, castfunc, castcontext,
+// castmethod FROM pg_cast c WHERE NOT EXISTS ( SELECT 1 FROM pg_range r WHERE
+// c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid ) ORDER BY 3,4`
+// (pg_cast already exists; the NOT EXISTS subquery references pg_range, which
+// does not). The next DU-002 slice adds the `pg_range` virtual view
+// (`pg_range.h` schema, OID 3541). goopg defines no range types, so an empty
+// view should suffice; verify empirically.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

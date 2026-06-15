@@ -503,6 +503,27 @@ fixed one logical group per loop:
     pg_conversion`). A `pg_conversion` virtual view (OID 2607) is the next
     slice — note PG ships ~130 built-in conversions there, but pg_dump filters
     them as built-ins, so an empty view may suffice (verify empirically).
+21. **`pg_conversion` virtual view — DONE.** `getConversions` runs
+    `SELECT tableoid, oid, conname, connamespace, conowner FROM pg_conversion`
+    ("find all conversions, including builtin conversions; we filter out
+    system-defined conversions at dump-out time"); goopg had no queryable
+    `pg_conversion` relation, so the query aborted at `relation "pg_conversion"
+    does not exist`. Added the empty `pg_conversion` virtual view
+    (`internal/catalog/catalog.go`, OID 2607, beside `pg_default_acl`) with the
+    `pg_conversion.h` schema (`oid, conname name, connamespace oid, conowner oid,
+    conforencoding int4, contoencoding int4, conproc regproc(oid), condefault
+    bool`). Although PG ships ~130 built-in conversions, every one lives in the
+    `pg_catalog` namespace and is filtered out at dump-out time
+    (`selectDumpableObject` marks `pg_catalog` objects `DUMP_COMPONENT_NONE`), so
+    the **empty** view (0 rows) produces an identical dump — confirmed
+    empirically: pg_dump now advances past `getConversions` to `getCasts`. The
+    **new** blocker is `relation "pg_range" does not exist` (`SELECT tableoid,
+    oid, castsource, casttarget, castfunc, castcontext, castmethod FROM pg_cast c
+    WHERE NOT EXISTS ( SELECT 1 FROM pg_range r WHERE c.castsource = r.rngtypid
+    AND c.casttarget = r.rngmultitypid ) ORDER BY 3,4`): `pg_cast` already exists,
+    but its `NOT EXISTS` subquery references `pg_range`, which does not. An empty
+    `pg_range` virtual view (OID 3541) is the next slice (goopg defines no range
+    types, so empty should suffice; verify empirically).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

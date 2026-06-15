@@ -3839,6 +3839,36 @@ func (c *InMemory) registerSystemTables() {
 	pgDefaultACL.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_default_acl"] = pgDefaultACL
 
+	// pg_conversion — encoding-conversion catalog (OID 2607). After
+	// getDefaultACLs, pg_dump's getConversions runs:
+	//   SELECT tableoid, oid, conname, connamespace, conowner FROM pg_conversion
+	// (pg_dump.c getConversions: "find all conversions, including builtin
+	// conversions; we filter out system-defined conversions at dump-out time").
+	// PG ships ~130 built-in conversions, but every one lives in the pg_catalog
+	// namespace and is filtered out at dump-out time (selectDumpableObject marks
+	// pg_catalog objects DUMP_COMPONENT_NONE). goopg defines no user conversions
+	// (no CREATE CONVERSION), so an empty view (0 rows) is correct — pg_dump finds
+	// nothing dumpable, identical to the built-ins-only PG outcome. Schema matches
+	// PG's pg_conversion (pg_conversion.h): oid, conname name, connamespace oid,
+	// conowner oid, conforencoding int4, contoencoding int4, conproc regproc(oid),
+	// condefault bool. M0110-0001 (DU-002 slice 21).
+	pgConversion := &Table{
+		Schema: "pg_catalog", Name: "pg_conversion", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "conname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "connamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "conowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "conforencoding", Type: Type{Name: "int4"}, Ordinal: 4},
+			{Name: "contoencoding", Type: Type{Name: "int4"}, Ordinal: 5},
+			{Name: "conproc", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "condefault", Type: Type{Name: "bool"}, Ordinal: 7},
+		},
+		OID: 2607,
+	}
+	pgConversion.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_conversion"] = pgConversion
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

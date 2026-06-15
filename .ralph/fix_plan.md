@@ -1508,6 +1508,29 @@ object support.
         (`pg_conversion.h`, OID 2607). NOTE: PG ships ~130 built-in conversions
         there, but pg_dump filters them as built-ins, so an empty view may
         suffice — verify empirically with the port test.
+      - **PROGRESS 2026-06-16 (loop #44):** **DU-002 slice 21
+        (`pg_conversion` view) LANDED.** `getConversions` runs `SELECT tableoid,
+        oid, conname, connamespace, conowner FROM pg_conversion` ("find all
+        conversions, including builtin conversions; we filter out system-defined
+        conversions at dump-out time"); it aborted at `relation "pg_conversion"
+        does not exist`. Added the empty `pg_conversion` virtual view
+        (`internal/catalog/catalog.go`, OID 2607, beside `pg_default_acl`) with
+        the `pg_conversion.h` schema (`oid, conname name, connamespace oid,
+        conowner oid, conforencoding int4, contoencoding int4, conproc
+        regproc(oid), condefault bool`). Although PG ships ~130 built-in
+        conversions, every one is in pg_catalog and filtered out at dump-out time
+        (`selectDumpableObject` → DUMP_COMPONENT_NONE), so the **empty** view (0
+        rows) gives an identical dump — confirmed empirically. build/gofmt/vet
+        clean; catalog suite PASS; `TestPort_PgDumpConnectionSetup` PASS. **Next
+        blocker (precise, empirical):** `getConversions` passes; pg_dump advances
+        to getCasts → `relation "pg_range" does not exist` (`SELECT tableoid,
+        oid, castsource, casttarget, castfunc, castcontext, castmethod FROM
+        pg_cast c WHERE NOT EXISTS ( SELECT 1 FROM pg_range r WHERE c.castsource =
+        r.rngtypid AND c.casttarget = r.rngmultitypid ) ORDER BY 3,4`) —
+        `pg_cast` exists, but the NOT EXISTS subquery references `pg_range`, which
+        does not. Resume = slice 22: add the `pg_range` virtual view
+        (`pg_range.h`, OID 3541). goopg defines no range types, so an empty view
+        should suffice — verify empirically with the port test.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text
