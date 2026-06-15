@@ -1149,6 +1149,26 @@ object support.
         with `function array_remove does not exist` — used to strip
         `check_option=…` from `c.reloptions`. Resume = add the `array_remove()`
         scalar builtin (slice 5), then continue the getter battery.
+      - **PROGRESS 2026-06-16 (loop #28):** **DU-002 slice 5 (`array_remove()`
+        scalar builtin) LANDED.** getTables' `reloptions` projection
+        `array_remove(array_remove(c.reloptions,'check_option=local'),
+        'check_option=cascaded')` aborted with `function array_remove does not
+        exist`. The function was already seeded in `pg_proc` (OID 3167); only the
+        executor handler was missing (dispatch fell through to
+        `evalStoredRoutineFuncCall` → 42883). Added the `array_remove(anyarray,
+        anyelement)` case to `evalFuncCall` (`internal/executor/expr.go`, beside
+        `array_append`/`array_cat`): removes every element equal to arg 2 from
+        goopg's text-array form (`parseTextArray`/`formatTextArray`); formatted
+        element-text equality matching the sibling array builtins (NULL element →
+        the `"NULL"` placeholder), NULL array → NULL (PG array_remove is NotStrict
+        on the element, array-strict). Unit guards `executor.TestEvalArrayRemove`
+        + `executor.TestEvalArrayRemoveNested`. Build/vet clean; executor suite
+        PASS; `TestPort_PgDumpConnectionSetup` PASS (getTables now completes).
+        **Next blocker (precise):** pg_dump's `getFuncs` query LEFT-JOINs
+        `pg_init_privs` (diffing stored `proacl` vs. initial privileges), which
+        goopg does not expose → `relation "pg_init_privs" does not exist`. Resume
+        = add the `pg_init_privs` virtual view (empty — no extension-installed
+        initial privileges) as slice 6, then continue the getter battery.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

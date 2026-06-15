@@ -8081,6 +8081,42 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewStringDatum(formatTextArray(elems)), nil
 		}
 
+	case "array_remove":
+		// array_remove(anyarray, anyelement) → anyarray — removes every element
+		// equal to the second argument from a 1-D array. pg_dump's getTables strips
+		// the view check_option markers from reloptions with a nested
+		// array_remove(array_remove(c.reloptions,'check_option=local'),
+		// 'check_option=cascaded'). M0110-0001 / DU-002 slice 5.
+		//
+		// PG's array_remove is NotStrict on the element (a NULL element removes the
+		// array's NULL entries) but returns NULL for a NULL array. Element matching
+		// uses the type's default btree equality; goopg's text-array representation
+		// compares the formatted element text, with a NULL element matching the
+		// "NULL" placeholder produced by the array_append/_cat siblings.
+		if len(x.Args) == 2 {
+			arrD, e1 := evalExpr(x.Args[0], row, ctx)
+			elemD, e2 := evalExpr(x.Args[1], row, ctx)
+			if e1 != nil || e2 != nil {
+				return NullDatum, nil
+			}
+			if arrD.IsNull() {
+				return NullDatum, nil
+			}
+			target := "NULL"
+			if !elemD.IsNull() {
+				target = elemD.Format()
+			}
+			src := parseTextArray(arrD.StringValue())
+			out := make([]string, 0, len(src))
+			for _, e := range src {
+				if e == target {
+					continue
+				}
+				out = append(out, e)
+			}
+			return NewStringDatum(formatTextArray(out)), nil
+		}
+
 	case "array_dims":
 		// array_dims(anyarray) → text — returns '[1:N]' for a 1-D array of N elements.
 		if len(x.Args) == 1 {

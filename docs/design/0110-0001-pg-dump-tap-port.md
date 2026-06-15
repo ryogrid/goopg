@@ -157,6 +157,28 @@ fixed one logical group per loop:
    scalar builtin `array_remove()` (used to strip `check_option=…` from
    `reloptions`), which is the following slice.
 
+5. **`array_remove()` scalar builtin (getTables) — DONE.** With its relations
+   resolved, the `getTables` query reached its `reloptions` projection
+   `array_remove(array_remove(c.reloptions,'check_option=local'),
+   'check_option=cascaded')` (pg_dump strips the two view `WITH CHECK OPTION`
+   markers so they are re-emitted as a separate `ALTER VIEW`), which aborted with
+   `function array_remove does not exist`. The function was already seeded in
+   `pg_proc` (OID 3167, `HandlerName "array_remove"`); only the executor handler
+   was missing, so dispatch fell through to `evalStoredRoutineFuncCall` → 42883.
+   Added the `array_remove(anyarray, anyelement)` case to `evalFuncCall`
+   (`internal/executor/expr.go`, beside `array_append`/`array_cat`): it removes
+   every element equal to the second argument from goopg's text-array
+   representation (`parseTextArray`/`formatTextArray`). Matching mirrors the
+   sibling array builtins — formatted element-text equality, with a NULL element
+   matching the `"NULL"` placeholder those siblings emit — and a NULL *array*
+   returns NULL (PG's array_remove is `NotStrict` on the element but
+   array-strict). Unit guards: `executor.TestEvalArrayRemove` (matching/no-match/
+   reloptions-strip/empty-result/NULL-array) and `executor.TestEvalArrayRemoveNested`
+   (the exact nested pg_dump form). After this slice `getTables` completes and
+   pg_dump advances to its function dump (`getFuncs`), where the next blocker is
+   the `pg_init_privs` catalog view (LEFT-JOINed to diff stored vs. initial
+   privileges) — the following slice.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

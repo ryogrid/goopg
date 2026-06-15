@@ -29,14 +29,16 @@ package testport
 // asserts the connection-setup handshake no longer fails: any non-zero exit
 // must NOT carry a setup_connection error signature. The full dump still fails
 // later on catalog-view parity. Closed gaps so far: collectRoleNames'
-// `pg_roles.oid` (DU-002 slice 1) and getNamespaces' `acldefault()` function
-// (DU-002 slice 2). **Next blocker (precise):** getNamespaces' first column
-// `n.tableoid` comes back labelled `?column?` instead of `tableoid` (the value
-// resolves correctly — 2615 — but the RowDescription field name is wrong), so
-// pg_dump's `PQfnumber(res, "tableoid")` returns -1 and the client segfaults
-// ("column number -1 is out of range 0..5", SIGSEGV / exit 139). This is a
-// planner output-column-naming bug for the `tableoid` system column (it affects
-// every table, not just virtual catalogs), tracked separately under DU-002.
+// `pg_roles.oid` (DU-002 slice 1), getNamespaces' `acldefault()` function
+// (slice 2), the `tableoid` output-column label (slice 3), getTables' catalog
+// views `pg_depend`/`pg_tablespace`/`pg_foreign_table` (slice 4), and the
+// `array_remove()` scalar builtin used to strip `check_option=…` from
+// `reloptions` (slice 5). **Next blocker (precise):** pg_dump's `getFuncs` query
+// LEFT-JOINs `pg_init_privs` (to diff stored `proacl` against the object's
+// initial privileges), which goopg does not expose, so the query fails with
+// `relation "pg_init_privs" does not exist`. Adding the `pg_init_privs` virtual
+// view (empty — goopg records no extension-installed initial privileges) is the
+// following DU-002 slice.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.
