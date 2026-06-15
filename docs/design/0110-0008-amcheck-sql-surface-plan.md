@@ -1,6 +1,6 @@
 # 0110-0008 — amcheck SQL surface wiring plan (M0110-0003)
 
-**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing + gap #6 LATERAL `c.oid` resolution + gap #7b non-existent-role rejection (handshake 28000) landed; S5 clog `XidStatusFunc` + AC-002…AC-005 TAP-port remain. `002_nonesuch` now self-skips on gap #7 (a)/(c) (database-pattern resolution + amcheck-installed detection) while asserting gap #7b as a regression guard.
+**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing + gap #6 LATERAL `c.oid` resolution + gap #7b non-existent-role rejection (handshake 28000) + gap #7a database-pattern resolution (row-valued `IS [NOT] NULL` semantics) landed; S5 clog `XidStatusFunc` + AC-002…AC-005 TAP-port remain. `002_nonesuch` now self-skips on gap #7c (per-database amcheck-installed detection) while asserting gaps #7a/#7b as regression guards.
 **Scope:** the `CREATE EXTENSION amcheck` + SRF SQL surface that wires the
 already-committed `internal/amcheck` engine to the wire protocol and promotes the
 deferred `AC-002`…`AC-005` pg_amcheck TAP tests.
@@ -358,17 +358,45 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
   `server.TestConnectSeededRoleAccepted` (positive twin); the `002_nonesuch`
   port test asserts the same end-to-end via the real `pg_amcheck` binary.
 
-- **Remaining for AC-002 — gap #7 (a)/(c).** With gap #7b closed, the remaining
-  connection/resolution-level behaviors are: (a) database-name pattern resolution
-  (`no connectable databases to check matching "…"`; goopg silently accepts the
-  pattern and exits 0), and (c) per-database amcheck-installed detection +
-  `template1`/`template0` registration. These are independent of the SQL surface.
-  Until they land, `002_nonesuch` self-skips via its updated probe (runs
-  `pg_amcheck --database qqq --database postgres`, detects the missing
-  `no connectable databases to check matching "qqq"` pattern-resolution error)
-  while asserting gap #7b as a regression guard.
+- **gap #7a (database-name pattern resolution) — LANDED.** pg_amcheck resolves
+  each `--database` argument as a connectable-name *pattern* and errors
+  `no connectable databases to check matching "<pat>"` when it resolves to nothing
+  (the multi-pattern / substring / superstring cases of `002_nonesuch`). goopg
+  previously accepted the pattern silently and exited 0. Root cause was in the
+  executor, not pg_amcheck-specific: pg_amcheck's `compile_database_list`
+  bootstrap query counts checkable databases per inclusion pattern with
+  `COUNT(*) FILTER (WHERE d IS NOT NULL)`, where `d` is a **whole-row reference**
+  to a CTE that is `LEFT OUTER JOIN`ed against the pattern. The planner expands a
+  whole-row variable into a `RowExpr` of its column refs; the executor's
+  `IsNullExpr` case evaluated that `RowExpr` to a composite Datum and called
+  `Datum.IsNull()` — but a constructed `RowExpr` is never itself a NULL Datum, so
+  `d IS NOT NULL` was wrongly `true` even for an outer-join non-match (all fields
+  null). Every inclusion pattern therefore looked checkable and the no-match error
+  never fired. The fix applies SQL/PG row-null semantics to a `RowExpr` operand of
+  `IS [NOT] NULL` (`executor.evalRowNullTest`): `row IS NULL` is true iff EVERY
+  field is null, `row IS NOT NULL` iff EVERY field is non-null — deliberately not
+  inverses, applied recursively to nested rows. So an unmatched pattern's
+  `include_pat.checkable` becomes 0 and pg_amcheck emits the no-match error
+  (`internal/executor/expr.go`). Regression tests:
+  `executor.TestRowValuedNullTest` (the not-inverse row-null truth table, fast)
+  and the `002_nonesuch` `patProbe` guard (end-to-end via the real `pg_amcheck`
+  binary: `--database qqq --database postgres` must exit 1 with
+  `no connectable databases to check matching "qqq"`).
 
-- **After #7:** S5 still needs the clog `XidStatusFunc` wiring (for the
+- **Remaining for AC-002 — gap #7c only.** With #7a/#7b closed, the sole remaining
+  blocker is per-database amcheck-installed detection: pg_amcheck runs
+  `amcheck_sql` (a `pg_extension ⋈ pg_namespace` lookup of `extname='amcheck'`) in
+  each connectable database and warns `skipping database "<db>": amcheck is not
+  installed` when amcheck is absent. goopg shares a single global catalog across
+  databases, so amcheck `CREATE EXTENSION`d in `postgres` also appears installed in
+  `template1`/`template0` and the warning never fires (template1 is checked instead
+  of skipped). This needs per-database extension-catalog isolation, a separate
+  (larger) change. Until it lands, `002_nonesuch` self-skips via its updated probe
+  (runs `pg_amcheck template1`, detects the missing
+  `skipping database "template1": amcheck is not installed` warning) while
+  asserting gaps #7a and #7b as regression guards.
+
+- **After #7c:** S5 still needs the clog `XidStatusFunc` wiring (for the
   clog-dependent verify_heapam tier), and the `AC-002`…`AC-005` TAP port + CSV
   flip.
 

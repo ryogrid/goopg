@@ -81,11 +81,22 @@ package testport
 // (the password/SCRAM paths already rejected unknown users). pg_amcheck's
 // `--username no_such_user` probe now fails the connection as upstream expects.
 //
-// REMAINING blocker is now #7 (a)/(c): connection/resolution-level behaviors —
-// (a) database-name pattern resolution and (c) per-database amcheck-installed
-// detection + template DB registration. The probe below keys on (a) so the test
-// self-skips on those rather than failing, while (7b) above is asserted as a
-// regression guard.
+// UPDATE (M0110-0003, gap #7a): FIXED — pg_amcheck resolves each --database arg
+// as a connectable-name *pattern* and now errors `no connectable databases to
+// check matching "<pat>"` for an unresolvable name. The bug was goopg mis-
+// evaluating `COUNT(*) FILTER (WHERE d IS NOT NULL)` over an outer-joined whole-
+// row reference `d`: a constructed RowExpr is never itself a NULL Datum, so
+// `d IS NOT NULL` was wrongly true for an outer-join non-match. The executor now
+// applies SQL/PG row null semantics to a RowExpr operand of IS [NOT] NULL
+// (evalRowNullTest), so an unmatched inclusion pattern's checkable count is 0.
+//
+// REMAINING blocker is now #7c only: per-database amcheck-installed detection
+// (`skipping database "template1": amcheck is not installed`). goopg's
+// pg_extension is a single global catalog, so amcheck installed in `postgres`
+// also appears installed in template1/template0; per-database extension-catalog
+// isolation is a separate (larger) change. The probe below keys on #7c so the
+// test self-skips on it rather than failing, while #7a/#7b above are asserted as
+// regression guards.
 //
 // Like 001_basic, the bundled pg_amcheck links a PG-17+ libpq symbol
 // (PQcancelBlocking), so it is run with LD_LIBRARY_PATH pointed at
@@ -242,29 +253,46 @@ func TestPort_PgAmcheck002Nonesuch(t *testing.T) {
 			roleProbe.ExitCode, roleProbe.Stderr)
 	}
 
-	// Probe for the remaining gap #7 pieces (M0110-0003): both are still
-	// connection/resolution-level and independent of the LATERAL SRF surface
-	// (gap #6) and the role check (gap #7b) already landed:
-	//   (a) database-name pattern resolution — pg_amcheck resolves each
-	//       --database argument as a connectable-name pattern and errors
-	//       `no connectable databases to check matching "<pat>"` for a name that
-	//       resolves to nothing (multi-pattern / substring / superstring cases);
-	//       goopg silently accepts the pattern and exits 0.
-	//   (c) per-database amcheck-installed detection + template DB registration —
-	//       `skipping database "template1": amcheck is not installed`.
-	// Self-skip with the precise blocker until they land; the assertion set below
-	// then runs unchanged. Probe (a) as the representative signal — it is the
-	// first assertion that would otherwise run.
+	// Gap #7a (M0110-0003) is now FIXED: pg_amcheck resolves each --database
+	// argument as a connectable-name *pattern* and errors `no connectable
+	// databases to check matching "<pat>"` for a name that resolves to nothing.
+	// The root cause was goopg's database-resolution bootstrap query mis-
+	// evaluating `COUNT(*) FILTER (WHERE d IS NOT NULL)` where `d` is a whole-row
+	// reference to an outer-joined CTE: a constructed RowExpr is never itself a
+	// NULL Datum, so `d IS NOT NULL` was wrongly true even for an outer-join
+	// non-match (all fields null), making every inclusion pattern appear
+	// checkable. The executor now applies SQL/PG row null semantics to a RowExpr
+	// operand of IS [NOT] NULL (evalRowNullTest: IS NOT NULL true iff EVERY field
+	// is non-null), so an unmatched pattern's include_pat.checkable becomes 0 and
+	// pg_amcheck emits the no-match error. Assert the prior "silently accepts the
+	// pattern / exits 0" behaviour is gone so a regression re-surfaces here.
 	patProbe := runAmcheck(t, c, "--database", "qqq", "--database", "postgres")
 	if patProbe.ExitCode == 0 ||
 		!strings.Contains(patProbe.Stderr, `no connectable databases to check matching "qqq"`) {
-		t.Skipf("AC-002 blocked on remaining gap #7 (a)/(c): connection/resolution-"+
-			"level behaviors are unimplemented — (a) database-name pattern resolution "+
-			"(`no connectable databases to check matching \"qqq\"`; goopg exits %d with "+
-			"stderr=%q), (c) per-database amcheck-installed detection + template1/"+
-			"template0 registration (`skipping database \"template1\": amcheck is not "+
-			"installed`). Gap #7b (non-existent role rejection) is fixed and the heap "+
-			"check (gap #6) runs clean.", patProbe.ExitCode, patProbe.Stderr)
+		t.Fatalf("AC-002 gap #7a regressed: an unresolvable --database pattern must "+
+			"fail with `no connectable databases to check matching \"qqq\"`; got "+
+			"exit=%d stderr=%q", patProbe.ExitCode, patProbe.Stderr)
+	}
+
+	// Probe for the remaining gap #7c (M0110-0003): per-database amcheck-installed
+	// detection. pg_amcheck runs `amcheck_sql` (a pg_extension ⋈ pg_namespace
+	// lookup of extname='amcheck') in each connectable database and, when amcheck
+	// is absent, warns `skipping database "<db>": amcheck is not installed`. goopg
+	// shares a single global catalog across databases, so amcheck CREATE EXTENSIONd
+	// in `postgres` also appears installed in template1/template0 — the warning
+	// never fires and template1 is checked instead of skipped. This needs
+	// per-database extension-catalog isolation, a separate (larger) change.
+	// Self-skip with the precise blocker until it lands; the full assertion set
+	// below — including the now-passing gap #7a pattern cases — then runs unchanged.
+	instProbe := runAmcheck(t, c, "template1")
+	if !strings.Contains(instProbe.Stderr, `skipping database "template1": amcheck is not installed`) {
+		t.Skipf("AC-002 blocked on remaining gap #7c: per-database amcheck-installed "+
+			"detection is unimplemented — goopg's pg_extension is a single global "+
+			"catalog, so amcheck installed in `postgres` also appears installed in "+
+			"template1/template0 and the `skipping database \"template1\": amcheck is "+
+			"not installed` warning never fires (got exit=%d stderr=%q). Gaps #7a "+
+			"(database-name pattern resolution) and #7b (non-existent role rejection) "+
+			"are fixed and the heap check (gap #6) runs clean.", instProbe.ExitCode, instProbe.Stderr)
 	}
 
 	// --- Non-existent databases ------------------------------------------

@@ -1,51 +1,50 @@
-Task: M0110-0003 (AC-002 amcheck) — loop #3. LANDED gap #7b (non-existent role
-rejection at connection handshake). Remaining: gap #7 (a) + (c), then clog
-XidStatusFunc wiring, then AC-002…AC-005 TAP port + CSV flip.
+Task: M0110-0003 (AC-002 amcheck) — loop #4. LANDED gap #7a (database-name
+pattern resolution via row-valued IS [NOT] NULL semantics). Remaining: gap #7c
+(per-database amcheck-installed detection), then clog XidStatusFunc wiring, then
+AC-002…AC-005 TAP port + CSV flip.
 
 === WHAT LANDED (this loop) — committed on align-data-structure-with-pg ===
-gap #7b: a connection whose role is absent from goopg's runtime role authority
-is now rejected after authentication with FATAL 28000 `role "%s" does not exist`,
-mirroring PG InitializeSessionUserId (utils/init/miscinit.c).
-- Authority = Server.roles (in-memory, seeded `postgres`, maintained by
-  CREATE/DROP ROLE) PLUS any UserStore (pg_auth) account.
-- The check is in the connection handshake right AFTER checkAuth (PG establishes
-  role before database), gated on `s.cfg.Catalog.(databaseRegistry)` + non-
-  replication — IDENTICAL gate to the gap #3 database-existence check, so
-  catalog-less wire-protocol unit tests and physical walsenders are unaffected.
-- The trust-auth path previously admitted any role (exit 0); password/SCRAM
-  already rejected unknown users in checkAuth. This closes the trust hole.
-- One test helper had to change: query_test.go dialAndComplete connected as
-  user "u" against real-catalog servers; now "postgres" (always seeded). No
-  caller asserts the username. (server_test.go's "u"/"alice" tests use
-  catalog-less servers → unaffected.)
+gap #7a: pg_amcheck `--database <pat>` now errors `no connectable databases to
+check matching "<pat>"` for an unresolvable name. Root cause was EXECUTOR-side,
+not amcheck-specific: `compile_database_list`'s bootstrap query uses
+`COUNT(*) FILTER (WHERE d IS NOT NULL)` where `d` is a whole-row ref to a
+LEFT-OUTER-JOINed CTE (planner expands whole-row → RowExpr). The IsNullExpr case
+evaluated the RowExpr to a composite Datum and called Datum.IsNull() — a
+constructed RowExpr is never a NULL Datum, so `d IS NOT NULL` was wrongly true
+for an outer-join non-match → every pattern looked checkable. Fix: SQL/PG
+row-null semantics for a RowExpr operand of IS [NOT] NULL
+(executor.evalRowNullTest: IS NULL true iff EVERY field null, IS NOT NULL iff
+EVERY field non-null; recursive on nested rows; NOT inverses).
 
-Files: internal/server/server.go (handshake role check),
-internal/server/role_exists_test.go (NEW: TestConnectNonexistentRoleRejected +
-TestConnectSeededRoleAccepted), internal/server/query_test.go (helper user),
-internal/testport/pgamcheck002_port_test.go (gap #7b now a regression guard;
-self-skip re-keyed to gap #7a), docs/design/0110-0008-amcheck-sql-surface-plan.md.
+Files: internal/executor/expr.go (IsNullExpr RowExpr branch ~line 681 +
+evalRowNullTest helper near evalMergeWholeRow), internal/executor/
+row_null_test_test.go (NEW: TestRowValuedNullTest truth table),
+internal/testport/pgamcheck002_port_test.go (gap #7a now regression-guard
+t.Fatalf at patProbe; self-skip re-keyed to gap #7c via `pg_amcheck template1`),
+docs/design/0110-0008-amcheck-sql-surface-plan.md.
 
-Key symbols: Server.serveConn handshake (server.go ~line 705), roleExists,
-databaseRegistry gate, writeFatal, sqlstate.InvalidAuthorizationSpecification.
+Key symbols: evalRowNullTest, IsNullExpr case in evalExprSlot, planner.RowExpr
+(whole-row var expansion at planner.go:9342), pg_amcheck compile_database_list
+include_pat CTE, amcheck_sql (pg_extension lookup).
 
-Gates run: go test ./internal/server PASS (full suite); cmd/goopg PASS;
-TestPort_PgAmcheck002Nonesuch SKIPs cleanly on gap #7 (a)/(c) (was FAIL after
-un-skip); gofmt+vet clean; make ralph-state-guard OK. TPC-H spotcheck NOT run —
-change is connection-admission only, touches no executor/planner/codec path, so
-row counts cannot change.
+Gates run: go test ./internal/executor ./internal/planner ./internal/analyzer
+./internal/server PASS; TestRowValuedNullTest PASS; TestPort_PgAmcheck002Nonesuch
+SKIPs cleanly on gap #7c (was SKIP on 7a); gofmt+vet clean; build ./... OK;
+make ralph-state-guard OK. No TPC-H spotcheck — IS-NULL change is scoped to
+RowExpr operands only (scalar IS NULL path untouched), no executor row-count path
+changed.
 
-=== NEXT STEP (resume point) — AC-002 gap #7 (a) then (c), each its own loop ===
-(a) database-name pattern resolution: pg_amcheck resolves each --database arg as
-    a connectable-name PATTERN and errors `no connectable databases to check
-    matching "<pat>"` when it resolves to nothing (multi-pattern / substring /
-    superstring). goopg silently accepts the pattern and exits 0. START HERE.
-    This is pg_amcheck CLIENT behavior driven by goopg's database-list bootstrap
-    query result — confirm whether the fix is goopg-side (query output shape) or
-    just that goopg returns the wrong db set. Inspect pg_amcheck.c
-    compile_database_list + the VALUES-CTE pattern query against goopg.
-(c) per-database amcheck-installed detection + template1/template0 amcheck
-    skip: `skipping database "template1": amcheck is not installed`.
-After gap #7: clog XidStatusFunc tier wiring, then AC-002…AC-005 TAP port + CSV
+=== NEXT STEP (resume point) — AC-002 gap #7c ===
+gap #7c: per-database amcheck-installed detection. pg_amcheck runs `amcheck_sql`
+(`SELECT n.nspname, x.extversion FROM pg_extension x JOIN pg_namespace n ON
+x.extnamespace=n.oid WHERE x.extname='amcheck'`) in each connectable DB and warns
+`skipping database "template1": amcheck is not installed` when it returns 0 rows.
+goopg's pg_extension is a single GLOBAL catalog, so amcheck CREATE EXTENSIONd in
+`postgres` ALSO shows in template1/template0 → warning never fires, template1 is
+checked instead of skipped (exit 0, empty stderr). NEEDS per-database
+extension-catalog isolation so pg_extension/pg_namespace amcheck rows are visible
+only in the DB where CREATE EXTENSION ran. This is a distinct, larger feature.
+After gap #7c: clog XidStatusFunc tier wiring, then AC-002…AC-005 TAP port + CSV
 flip (docs/test-port/postgres-oracle-port-status.csv).
 
 === CONTEXT ===
