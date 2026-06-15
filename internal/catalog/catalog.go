@@ -487,6 +487,12 @@ type Catalog interface {
 	RegisterSchema(name string)
 	// UnregisterSchema removes a schema from the registry. M0097-drop_if_exists.
 	UnregisterSchema(name string)
+	// CreateExtension records a CREATE EXTENSION install in the runtime
+	// pg_extension registry. schema is the install namespace name (defaulted by
+	// the caller), version the extension version string. When the extension
+	// already exists it returns nil if ifNotExists is set, else an error.
+	// M0110-0003 (amcheck SQL surface).
+	CreateExtension(name, schema, version string, ifNotExists bool) error
 	// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
 	// objType is "conversion", "operator", "rule", "text search configuration", etc.
 	RegisterCompatObject(objType, name string)
@@ -553,8 +559,9 @@ type InMemory struct {
 	routines *Routines
 	// databases is the set of database names the cluster knows
 	// about (M0054-0001). Populated by `CreateDatabase` and
-	// drained by `DropDatabase`. At startup the catalog seeds
-	// `"postgres"` (the conventional bootstrap DB); the recovery
+	// drained by `DropDatabase`. At startup the catalog seeds the
+	// three bootstrap databases `postgres`, `template1` and
+	// `template0` (mirroring initdb's pg_database); the recovery
 	// driver in `internal/initdb` re-applies WAL-logged
 	// CREATE/DROP DATABASE events on top. v0 still routes every
 	// relation through DefaultDBOid — the registry exists so
@@ -629,6 +636,22 @@ type InMemory struct {
 	// statisticsObjs tracks CREATE STATISTICS objects. Key = "schema.name" (lowercase).
 	// Populated by RegisterStatistics; read by pg_statistic_ext VirtualRows. M0097-0023.
 	statisticsObjs map[string]*StatisticsObject
+
+	// extensions tracks CREATE EXTENSION installs (e.g. amcheck), keyed by
+	// lowercase extension name. Backs the pg_extension virtual catalog read by
+	// pg_amcheck's "is amcheck installed?" probe. M0110-0003.
+	extensions map[string]*extensionRow
+}
+
+// extensionRow is one runtime CREATE EXTENSION record backing pg_extension.
+// The install namespace is stored by name and resolved to an OID at read time
+// (in pg_extension's VirtualRows), so it stays consistent if the schema set
+// changes. M0110-0003.
+type extensionRow struct {
+	oid     uint32
+	name    string
+	schema  string
+	version string
 }
 
 // commentKey is the composite key for pg_description.
@@ -759,7 +782,7 @@ func NewInMemory() *InMemory {
 		nextOID:                FirstUserOID,
 		dbOid:                  DefaultDBOid,
 		routines:               NewRoutines(),
-		databases:              map[string]bool{"postgres": true},
+		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
 		partitionChildren:      make(map[uint32][]uint32),
 		indexPartitionChildren: make(map[uint32][]uint32),
 		inheritanceChildren:    make(map[uint32][]uint32),
@@ -780,6 +803,7 @@ func NewInMemory() *InMemory {
 		roles:          make(map[string]struct{}),
 		comments:       make(map[commentKey]string),
 		statisticsObjs: make(map[string]*StatisticsObject),
+		extensions:     make(map[string]*extensionRow),
 	}
 	c.registerSystemTables()
 	return c
@@ -1932,6 +1956,58 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.tables["pg_catalog.pg_namespace"] = pgNamespace
 
+	// pg_extension — backs pg_amcheck's "is amcheck installed?" probe
+	// (M0110-0003):
+	//   SELECT n.nspname, x.extversion FROM pg_catalog.pg_extension x
+	//     JOIN pg_catalog.pg_namespace n ON x.extnamespace = n.oid
+	//   WHERE x.extname = 'amcheck'
+	// Rows come from the runtime extensions registry (CREATE EXTENSION). Column
+	// order, names, and OID match upstream pg_extension (ExtensionRelationId
+	// 3079, src/include/catalog/pg_extension.h). extconfig/extcondition are
+	// always NULL in goopg v0 (no extension config tables).
+	pgExtension := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_extension",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "extname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "extowner", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "extnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "extrelocatable", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "extversion", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "extconfig", Type: Type{Name: "oid[]"}, Ordinal: 6},
+			{Name: "extcondition", Type: Type{Name: "text[]"}, Ordinal: 7},
+		},
+		OID:     3079, // upstream's ExtensionRelationId
+		Virtual: true,
+	}
+	pgExtension.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		rows := make([]*extensionRow, 0, len(c.extensions))
+		for _, e := range c.extensions {
+			rows = append(rows, e)
+		}
+		// Sort by OID for deterministic output.
+		sort.Slice(rows, func(i, j int) bool { return rows[i].oid < rows[j].oid })
+		out := make([][]string, 0, len(rows))
+		for _, e := range rows {
+			nsOID := c.schemas[strings.ToLower(e.schema)]
+			out = append(out, []string{
+				strconv.Itoa(int(e.oid)), // oid
+				e.name,                   // extname
+				"10",                     // extowner (bootstrap superuser)
+				strconv.Itoa(int(nsOID)), // extnamespace
+				"f",                      // extrelocatable
+				e.version,                // extversion
+				"",                       // extconfig: NULL
+				"",                       // extcondition: NULL
+			})
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_extension"] = pgExtension
+
 	// pg_indexes view. HammerDB's checkschema step queries
 	// `select tablename, indexname from pg_indexes where
 	// NOTE: pg_indexes is a VIEW (not a catalog table); OID 11024 is assigned
@@ -2026,14 +2102,28 @@ func (c *InMemory) registerSystemTables() {
 		names := c.ListDatabases()
 		out := make([][]string, 0, len(names))
 		for _, n := range names {
+			// The bootstrap template databases carry their canonical PG
+			// attributes: template1 (oid 1) is connectable, template0
+			// (oid 4) is not (datallowconn=false), and both are templates
+			// (datistemplate=true). Mirrors initdb's pg_database seed
+			// (initdb.go buildRow). Clients such as pg_amcheck filter on
+			// `datallowconn AND datconnlimit != -2`, so template0 is
+			// correctly omitted from --all while template1 is included.
+			oid, datallowconn, datistemplate := "16384", "true", "false"
+			switch n {
+			case "template1":
+				oid, datallowconn, datistemplate = "1", "true", "true"
+			case "template0":
+				oid, datallowconn, datistemplate = "4", "false", "true"
+			}
 			out = append(out, []string{
-				"16384", // oid: conventional database OID (M0097-0021)
+				oid, // oid: conventional database OID (M0097-0021)
 				n,
-				"10",    // datdba: OID of owner (10 = postgres superuser)
-				"6",     // encoding: 6 = UTF8
-				"true",  // datallowconn: allow connections
-				"0",     // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
-				"false", // datistemplate: live databases are not templates
+				"10",          // datdba: OID of owner (10 = postgres superuser)
+				"6",           // encoding: 6 = UTF8
+				datallowconn,  // datallowconn: allow connections
+				"0",           // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
+				datistemplate, // datistemplate: true for template0/template1
 			})
 		}
 		return out
@@ -4108,6 +4198,33 @@ func (c *InMemory) UnregisterSchema(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.schemas, strings.ToLower(name))
+}
+
+// CreateExtension records a CREATE EXTENSION install in the runtime
+// pg_extension registry. Called from the executor's execCreateExtension after
+// it has validated the extension name and resolved the default version/schema.
+// M0110-0003.
+func (c *InMemory) CreateExtension(name, schema, version string, ifNotExists bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	if _, ok := c.extensions[lc]; ok {
+		if ifNotExists {
+			return nil
+		}
+		return fmt.Errorf("extension %q already exists", name)
+	}
+	if schema == "" {
+		schema = "public"
+	}
+	c.nextOID++
+	c.extensions[lc] = &extensionRow{
+		oid:     c.nextOID,
+		name:    name,
+		schema:  schema,
+		version: version,
+	}
+	return nil
 }
 
 // allSchemasLocked returns all (name, oid) pairs. Must be called with mu held.

@@ -85,6 +85,29 @@ func TestAnalyzeWithColumnAliasesRenameColumns(t *testing.T) {
 		"42703")
 }
 
+// TestAnalyzeWithFewerColumnAliasesAccepted: PG (parse_cte.c analyzeCTE)
+// allows a column-alias list SHORTER than the inner query's output — the
+// trailing unaliased columns keep their query-derived names. Only
+// over-aliasing is the 42P10 error. pg_amcheck (AC-002) depends on this for
+// its `exclude_raw (pattern_id, rgx) AS (SELECT NULL, NULL, NULL WHERE false)`
+// empty-pattern CTE: two aliases over three columns.
+func TestAnalyzeWithFewerColumnAliasesAccepted(t *testing.T) {
+	cat := analyzerCatalog(t)
+	// Two aliases over three output columns: must analyze cleanly.
+	if err := Analyze(parseOne(t,
+		"WITH e(pattern_id, rgx) AS (SELECT NULL, NULL, NULL WHERE false) SELECT * FROM e"),
+		cat); err != nil {
+		t.Errorf("under-aliased VALUES/SELECT CTE should analyze: %v", err)
+	}
+	// The aliased columns resolve under their new names, and the trailing
+	// unaliased column keeps the query-derived name.
+	if err := Analyze(parseOne(t,
+		"WITH a(x) AS (SELECT aid, bid FROM pgbench_accounts) SELECT x, bid FROM a"),
+		cat); err != nil {
+		t.Errorf("under-aliased CTE column resolution: %v", err)
+	}
+}
+
 // TestAnalyzeWithCTEShadowsBaseRelation: a CTE named after an
 // existing table shadows the table inside the SELECT. Mirrors
 // PostgreSQL — operationally useful for "factor out a tweaked
@@ -163,5 +186,44 @@ func TestAnalyzeWithCTEErrorsBubbleUp(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no_such_col") {
 		t.Errorf("err = %v; want it to mention no_such_col", err)
+	}
+}
+
+// TestAnalyzeWithValuesCTEColumnAliases: a CTE whose body is a VALUES list
+// derives its column count from the first row, so explicit column aliases
+// matching that arity are accepted (not rejected with 42P10 "inner query
+// produces 0 columns"). pg_amcheck's database-resolution query uses this
+// shape (`include_raw (pattern_id, rgx) AS (VALUES (0,'^(x)$'), …)`).
+// Mirrors the VALUES anchor handling in analyzeRecursiveCTE — these two
+// paths must stay in sync. Regression for M0110-0003 / AC-002.
+func TestAnalyzeWithValuesCTEColumnAliases(t *testing.T) {
+	cat := analyzerCatalog(t)
+	stmt := parseOne(t,
+		"WITH v(pattern_id, rgx) AS (VALUES (0, '^(x)$'), (1, '^(y)$')) SELECT pattern_id, rgx FROM v")
+	if err := Analyze(stmt, cat); err != nil {
+		t.Errorf("Analyze VALUES-CTE with column aliases: %v", err)
+	}
+}
+
+// TestAnalyzeWithValuesCTEArityMismatch: with the VALUES column count now
+// derived, an alias-list whose arity differs from the VALUES row width is
+// still correctly rejected with 42P10 (i.e. the derivation feeds the same
+// arity check, it doesn't bypass it).
+func TestAnalyzeWithValuesCTEArityMismatch(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"WITH v(a, b, c) AS (VALUES (0, '^(x)$')) SELECT * FROM v",
+		"42P10")
+}
+
+// TestAnalyzeWithValuesCTEDefaultColumnNames: without an explicit alias
+// list, a VALUES-CTE exposes default "columnN" names, resolvable in the
+// outer query.
+func TestAnalyzeWithValuesCTEDefaultColumnNames(t *testing.T) {
+	cat := analyzerCatalog(t)
+	stmt := parseOne(t,
+		"WITH v AS (VALUES (1, 2), (3, 4)) SELECT column1, column2 FROM v")
+	if err := Analyze(stmt, cat); err != nil {
+		t.Errorf("Analyze VALUES-CTE default column names: %v", err)
 	}
 }

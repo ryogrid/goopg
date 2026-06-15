@@ -127,6 +127,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execAlterAggregateRename(s)
 	case *parser.CreateOpClassStmt:
 		return nil, o.execCreateOpClass(s)
+	case *parser.CreateExtensionStmt:
+		return nil, o.execCreateExtension(s)
 	case *parser.CompatNoopStmt:
 		return nil, o.execCompatNoop(s)
 	case *parser.CommentOnStmt:
@@ -149,6 +151,45 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execDropDomain(s)
 	}
 	return nil, &ExecError{Code: "0A000", Pos: o.plan.Pos(), Message: fmt.Sprintf("DDL %T not supported in v0 executor", o.plan.Stmt)}
+}
+
+// knownExtensions maps a lowercase extension name to its default version.
+// goopg ships only the built-in extensions whose SQL surface it actually
+// implements; CREATE EXTENSION of any other name errors as if the control
+// file were missing, mirroring PG. M0110-0003.
+var knownExtensions = map[string]string{
+	"amcheck": "1.4", // PG 18 contrib/amcheck default version
+}
+
+// execCreateExtension handles CREATE EXTENSION by inserting a pg_extension
+// catalog row via the runtime registry (Catalog.CreateExtension). It mirrors
+// PG's CreateExtension (commands/extension.c): an unknown extension errors as
+// if its control file is missing; the install namespace defaults to public.
+// M0110-0003 — wires pg_amcheck's "is amcheck installed?" probe; promotes the
+// pg_amcheck 002_nonesuch TAP test.
+func (o *ddlOp) execCreateExtension(s *parser.CreateExtensionStmt) error {
+	defaultVersion, known := knownExtensions[strings.ToLower(s.Name)]
+	if !known {
+		// PG: errcode_for_file_access on ENOENT → ERRCODE_UNDEFINED_FILE (58P01).
+		return &ExecError{
+			Code:    "58P01",
+			Pos:     s.Pos(),
+			Message: fmt.Sprintf("could not open extension control file: extension %q is not available", s.Name),
+		}
+	}
+	version := s.Version
+	if version == "" {
+		version = defaultVersion
+	}
+	schema := s.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	if err := o.ctx.Catalog.CreateExtension(s.Name, schema, version, s.IfNotExists); err != nil {
+		// Only failure mode is a duplicate without IF NOT EXISTS.
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
 }
 
 // execCreatePublication / execDropPublication / execCreateSubscription
@@ -421,8 +462,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 			if parent.PartitionMethod != "" {
 				return &ExecError{Code: "42809", Pos: s.Pos(),
-					Message:  fmt.Sprintf("cannot inherit from partitioned table %q", parentName.Name),
-					Detail: "This operation is not supported for partitioned tables."}
+					Message: fmt.Sprintf("cannot inherit from partitioned table %q", parentName.Name),
+					Detail:  "This operation is not supported for partitioned tables."}
 			}
 			inheritParents = append(inheritParents, parent)
 			// Append parent columns (deep copy to avoid aliasing).
@@ -548,12 +589,12 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Name:             c.Name,
 				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
 				DeclaredTypeName: declaredTypeName,
-				NotNull:         c.NotNull || c.IdentityColumn || isSerialCol,
-				GeneratedExpr:   c.GeneratedExpr,
-				GeneratedAlways: c.GeneratedAlways,
-				DefaultExpr:     c.DefaultExpr,
-				IdentityColumn:  c.IdentityColumn,
-				IdentityStart:   c.IdentityStart,
+				NotNull:          c.NotNull || c.IdentityColumn || isSerialCol,
+				GeneratedExpr:    c.GeneratedExpr,
+				GeneratedAlways:  c.GeneratedAlways,
+				DefaultExpr:      c.DefaultExpr,
+				IdentityColumn:   c.IdentityColumn,
+				IdentityStart:    c.IdentityStart,
 			})
 		}
 		for _, item := range s.BodyOrder {
@@ -1282,6 +1323,7 @@ func deriveStatisticsName(statName, srcTableName, dstTableName string) string {
 	}
 	return dstTableName + "_" + statName
 }
+
 // likeIndexColsMatch returns true when two index column lists are identical
 // (case-insensitive). Empty-string entries (expression columns) match each other.
 func likeIndexColsMatch(a, b []string) bool {
@@ -3084,7 +3126,9 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 	if s.SetLogged != "" {
 		tbl, ok := o.lookupTableWithSearch(s.Name)
 		if !ok {
-			if s.IfExists { return nil }
+			if s.IfExists {
+				return nil
+			}
 			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
 		}
 		_ = tbl
@@ -4695,9 +4739,9 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 						continue // already in set
 					}
 					// Collect tbl and all its partition ancestors (full chain) so
-				// that FK constraints on a parent partitioned table are found.
-				tblNames := []string{strings.ToLower(tbl.Name)}
-				for oid := tbl.PartitionParentOID; oid != 0; {
+					// that FK constraints on a parent partitioned table are found.
+					tblNames := []string{strings.ToLower(tbl.Name)}
+					for oid := tbl.PartitionParentOID; oid != 0; {
 						anc, ok := im.LookupTableByOID(oid)
 						if !ok {
 							break
@@ -7828,9 +7872,9 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 	}
 	// classOID constants match PostgreSQL system catalog OIDs.
 	const (
-		oidPgClass          = 1259 // pg_class: tables, indexes, views
-		oidPgConstraint     = 2606 // pg_constraint
-		oidPgStatisticExt   = 3381 // pg_statistic_ext
+		oidPgClass        = 1259 // pg_class: tables, indexes, views
+		oidPgConstraint   = 2606 // pg_constraint
+		oidPgStatisticExt = 3381 // pg_statistic_ext
 	)
 	switch s.ObjKind {
 	case "table":

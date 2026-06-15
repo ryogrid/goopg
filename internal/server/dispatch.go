@@ -1818,6 +1818,8 @@ func ddlTag(stmt parser.Stmt) string {
 		return "CREATE DOMAIN"
 	case *parser.DropDomainStmt:
 		return "DROP DOMAIN"
+	case *parser.CreateExtensionStmt:
+		return "CREATE EXTENSION"
 	}
 	// CompatNoopStmt carries its own tag. M0097-0016.
 	if ns, ok := stmt.(*parser.CompatNoopStmt); ok && ns.Tag != "" {

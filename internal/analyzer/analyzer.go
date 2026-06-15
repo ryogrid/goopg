@@ -1540,6 +1540,21 @@ func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Col
 			colName = colAliases[0]
 		}
 		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "oid"}, Ordinal: 0}}
+	case "verify_heapam":
+		// verify_heapam(regclass, ...) → (blkno int8, offnum int8, attnum int4,
+		// msg text). Mirrors planVerifyHeapam. M0110-0003.
+		names := []string{"blkno", "offnum", "attnum", "msg"}
+		types := []string{"int8", "int8", "int4", "text"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
 	default:
 		// generate_series and unknown SRFs: 1 int8 column named after
 		// the alias. Preserves pre-M0103-0008 behaviour.
@@ -1701,7 +1716,11 @@ func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 	// the CTE with column name "?column?1" instead of "n", causing the recursive
 	// member to fail with "column n does not exist".
 	if len(cte.Columns) > 0 {
-		if len(cte.Columns) != len(cols) {
+		// PG (parse_cte.c analyzeCTE): the alias list must be empty or no
+		// LONGER than the output column set; a SHORTER list is allowed and the
+		// trailing columns keep their query-derived names. Only over-aliasing
+		// is the 42P10 error.
+		if len(cte.Columns) > len(cols) {
 			return analyzeError(cte.Pos(), "42P10",
 				fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(cols)))
 		}
@@ -1799,31 +1818,52 @@ func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		innerCtx.rels = rels
 	}
 	innerCols := make([]catalog.Column, 0, len(cte.Query.Targets))
-	for _, tgt := range cte.Query.Targets {
-		// A top-level `*` / `t.*` in the CTE body must materialise into
-		// the inner scope's concrete columns — analyzeExpr rejects a
-		// bare StarExpr ("'*' is not allowed here"). Mirrors
-		// synthesizeSubqueryTable's derived-table star handling; keep
-		// the two in sync. M0097-0003.
-		if star, ok := tgt.Expr.(*parser.StarExpr); ok {
-			innerCols = append(innerCols, expandInnerStarColumns(star, innerCtx)...)
-			continue
+	if len(cte.Query.Targets) == 0 && len(cte.Query.ValuesRows) > 0 {
+		// VALUES-list CTE body (e.g. `cte (a, b) AS (VALUES (1,'x'),
+		// (2,'y'))`): there are no Targets, so the column count comes
+		// from the first VALUES row. Default names are "column1",
+		// "column2", … and types are "unknown" (the planner resolves
+		// exact types from the row literals). This mirrors the VALUES
+		// anchor handling in analyzeRecursiveCTE — keep the two in sync.
+		// pg_amcheck's database-resolution query relies on this shape
+		// (`include_raw (pattern_id, rgx) AS (VALUES (0,'^(x)$'), …)`).
+		// M0110-0003 / AC-002.
+		nCols := len(cte.Query.ValuesRows[0])
+		for i := 0; i < nCols; i++ {
+			innerCols = append(innerCols, catalog.Column{Name: fmt.Sprintf("column%d", i+1), Type: catalog.Type{Name: "unknown"}, Ordinal: i})
 		}
-		name := tgt.Alias
-		if name == "" {
-			name = deriveAnalyzerTargetName(tgt.Expr)
+	} else {
+		for _, tgt := range cte.Query.Targets {
+			// A top-level `*` / `t.*` in the CTE body must materialise into
+			// the inner scope's concrete columns — analyzeExpr rejects a
+			// bare StarExpr ("'*' is not allowed here"). Mirrors
+			// synthesizeSubqueryTable's derived-table star handling; keep
+			// the two in sync. M0097-0003.
+			if star, ok := tgt.Expr.(*parser.StarExpr); ok {
+				innerCols = append(innerCols, expandInnerStarColumns(star, innerCtx)...)
+				continue
+			}
+			name := tgt.Alias
+			if name == "" {
+				name = deriveAnalyzerTargetName(tgt.Expr)
+			}
+			if name == "" {
+				name = fmt.Sprintf("?column?%d", len(innerCols)+1)
+			}
+			typ, err := analyzeExpr(tgt.Expr, innerCtx)
+			if err != nil {
+				return err
+			}
+			innerCols = append(innerCols, catalog.Column{Name: name, Type: typ})
 		}
-		if name == "" {
-			name = fmt.Sprintf("?column?%d", len(innerCols)+1)
-		}
-		typ, err := analyzeExpr(tgt.Expr, innerCtx)
-		if err != nil {
-			return err
-		}
-		innerCols = append(innerCols, catalog.Column{Name: name, Type: typ})
 	}
 	if len(cte.Columns) > 0 {
-		if len(cte.Columns) != len(innerCols) {
+		// PG (parse_cte.c analyzeCTE): a column-alias list shorter than the
+		// inner query's output is allowed — the extra trailing columns keep
+		// their query names. Only over-aliasing is the 42P10 error. pg_amcheck
+		// relies on this for its `exclude_raw (pattern_id, rgx) AS (SELECT
+		// NULL, NULL, NULL WHERE false)` empty-pattern CTE (AC-002).
+		if len(cte.Columns) > len(innerCols) {
 			return analyzeError(cte.Pos(), "42P10",
 				fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(innerCols)))
 		}

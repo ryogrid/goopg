@@ -1848,6 +1848,32 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
       - Blocked on a clean tree only insofar as committing to the main tree is
         blocked by the foreign WIP; the btree files themselves are NOT contaminated,
         so the fix can land in a worktree off clean HEAD.
+      - **PROGRESS 2026-06-15 (loop #20):** AC-002 bootstrap-query gaps **#3 +
+        #2b LANDED** in worktree `m0110-0003-amcheck-sql-surface` (off clean HEAD
+        `b8dd6403`, building on the gap #1/#2 commit). (a) `catalog.NewInMemory`
+        seeds `{postgres, template1, template0}` and `pg_database` virtual rows
+        carry each template's canonical attrs (template1 oid1 allowconn=t
+        istemplate=t; template0 oid4 allowconn=f istemplate=t) — the amcheck DB
+        filter `datallowconn AND datconnlimit != -2` now yields `{postgres,
+        template1}`. (b) `internal/server/server.go` rejects a non-replication
+        connection to an unregistered database after auth with FATAL 3D000
+        `database "%s" does not exist` (guarded for nil/non-registry catalogs like
+        `tryHandleDatabaseDDL`). (c) gap #2b: PG allows a CTE alias list SHORTER
+        than the inner query (`parse_cte.c` 583-585) — fixed all 6 `!=`→`>` alias
+        guards (2 in `analyzer.go`, 4 in `planner/with.go`, incl. the easily-missed
+        3-tab "Bypass Plan() entry" block) + rename only the aliased prefix.
+        Tests: `server.TestConnect{NonexistentDatabaseRejected,BootstrapDatabasesAccepted}`,
+        `catalog.TestNewInMemorySeedsPostgresDatabase`,
+        `{analyzer,planner}.Test*FewerColumnAliasesAccepted`. Live smoke verified
+        (psql -d qqq → FATAL 3D000; pg_database 3 rows). Full server/analyzer/
+        planner/catalog/executor suites green; gofmt/build clean. Design `0110-0008`
+        extended. **NEW gap #4 surfaced + isolated** (deferred, own loop): a
+        WITH-CTE is not visible inside a FROM-subquery of the OUTER statement —
+        `WITH x(a) AS (SELECT 1) SELECT a FROM (SELECT a FROM x) s` →
+        `relation "x" does not exist`. `002_nonesuch` still self-skips (its final
+        `SELECT … FROM (… filtered_databases) …` hits gap #4). Resume = fix CTE
+        scope propagation into outer FROM-subqueries (analyzer `buildSelectScope`/
+        subquery synthesis + planner `planCTEs` into derived-table planning).
 
 - [x] **M0110-0007 — B-tree split must maintain the old right sibling's prev-link**
       - **DONE 2026-06-14 (loop #30).** `insertIntoBlock`
