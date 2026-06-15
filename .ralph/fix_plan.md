@@ -1640,6 +1640,214 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         ("Real-producer end-to-end validation"). STILL DEFERRED: the catalog-coupled
         `HeapEntryFormer` impl + the `CREATE EXTENSION amcheck`/SRF SQL surface
         (AC-002-promoting, blocked on a clean tree).
+      - **PROGRESS 2026-06-15 (loop #9):** added the last unvalidated real-producer
+        mutator — **page deletion** via `btree.VacuumIndexPages` (the deletion-path
+        mirror of the split validation that surfaced M0110-0007). New
+        `internal/amcheck/verify_nbtree_pagedel_test.go` empties interior leaves of
+        a live multi-level tree and runs every engine tier over the post-deletion
+        pages. Single + non-adjacent multi interior-leaf deletion are clean (all
+        tiers silent — validates `unlinkEmptyLeaf`'s three-way relink + the engine's
+        deleted-page exemptions on real layout). **Adjacent interior-leaf deletion
+        in one pass surfaced a genuine goopg bug → filed M0110-0010:**
+        `unlinkEmptyLeaf` relinks neighbours from pointers captured before any
+        unlink, so a survivor's `btpo_prev`/`btpo_next` is left pointing at a block
+        deleted in the same pass, breaking the leaf sibling chain (both the WAL
+        emitter and FPI fallback share it). The sibling-link tier correctly flags
+        `... points to deleted block`; pinned by
+        `TestVerifyBtreeEngineDetectsStaleSiblingLinkAfterAdjacentLeafDeletion`
+        (flips to silence when M0110-0010 lands). `go test -race ./internal/amcheck
+        ./internal/access/btree` PASS; gofmt/vet clean; **zero contaminated files
+        touched** (all new test code + design `0110-0005`). Landed on worktree
+        branch `m0110-amcheck-pagedel` (commit 443ea473) off clean HEAD b8dd6403 —
+        the main tree still carries the foreign gen-column WIP.
+      - **PROGRESS 2026-06-15 (loop #13):** the **amcheck SQL surface Slices S1+S2
+        LANDED** (design `0110-0008`) on worktree branch
+        `m0110-0003-amcheck-sql-surface` (commit 6f3a6f1b) off clean HEAD b8dd6403.
+        Picked up a prior loop's uncommitted WIP sitting in worktree
+        `m0110-amcheck-sql` (CREATE EXTENSION + pg_extension), verified, and
+        committed it there — escaping the main-tree foreign-WIP block via worktree
+        isolation. S1 = `CREATE EXTENSION [IF NOT EXISTS] name [WITH][SCHEMA][VERSION]
+        [CASCADE]` DDL (`parser.CreateExtensionStmt`/`parseCreateExtensionTail` →
+        planner DDL passthrough → `CREATE EXTENSION` tag → `ddlOp.execCreateExtension`;
+        unknown→58P01, duplicate→42710, built-in allow-list `amcheck→1.4`). S2 =
+        `pg_extension` virtual catalog (OID 3079, upstream column shape;
+        extconfig/extcondition NULL) + `InMemory.CreateExtension` registry, backing
+        pg_amcheck's `pg_extension⋈pg_namespace` install probe (`pg_amcheck.c:173`).
+        Tests `parser.TestParseCreateExtension` (5 shapes) +
+        `testport.TestPort_AmcheckCreateExtension` (probe lifecycle) PASS. Gates:
+        gofmt/vet clean; parser/catalog/executor/planner/server unit tests PASS;
+        build OK; TPC-H spotcheck SKIPPED (no data; change is purely additive).
+        **Remaining: S3 `verify_heapam` SRF, S4 `bt_index_check`/`bt_index_parent_check`
+        SRFs, S5 TAP port** (`002_nonesuch`…`005`). AC-002's server-side requirement
+        is now satisfied; promoting it still needs S5 + the SRFs to exist in `pg_proc`.
+        Merge to the active branch still awaits a clean tree. Resume = Slice S3.
+      - **PROGRESS 2026-06-15 (loop #14):** the **amcheck SQL surface Slice S3
+        LANDED** — the `verify_heapam(regclass, ...)` SRF executor (design
+        `0110-0008`) on worktree branch `m0110-0003-amcheck-sql-surface`
+        (commit 8154404c, on top of S1+S2 6f3a6f1b, off clean HEAD b8dd6403).
+        It is the thin wire adapter over the committed `internal/amcheck` heap
+        engine: new `VerifyHeapam` plan node + `planVerifyHeapam` dispatch +
+        FoldConstants/walkPlanExprs cases (`planner/{plan,planner,foldconst,
+        unnest}.go`); parser FROM-SRF recognition (`parser/select.go`); analyzer
+        `tableFuncColumns` 4-column shape so explicit `SELECT blkno FROM ...`
+        resolves, not just `SELECT *` (`analyzer/analyzer.go` — sibling path to
+        the planner's table-func dispatch, the bug that made the first test fail);
+        new executor op (`executor/operators_verify_heapam.go` + `executor.go`
+        dispatch) that resolves the regclass arg → heap relation, fills a
+        `PageSource` from the buffer pool (copy-per-block, no held pins), passes
+        `nblocks` + `RelDesc.Natts`/`NextXid`/`RelFrozenXid`, and streams each
+        `amcheck.HeapRelReport` as `(blkno,offnum,attnum,msg)` (attnum NULL for
+        page/header-level findings). Output SETOF (blkno int8, offnum int8,
+        attnum int4, msg text) mirrors upstream. Tests PASS:
+        `TestVerifyHeapam_{CleanTableNoReports,DetectsInjectedCorruption,
+        StartBlockOutOfRange}` — the clean-table → 0-rows case through the full
+        parse→plan→execute stack is the no-false-positive gate. Gates: gofmt
+        clean (additions); vet clean; build OK; executor/planner/analyzer/parser/
+        catalog/server/amcheck unit tests PASS; TPC-H spotcheck SKIPPED (no data
+        dir in worktree; change is purely additive, touches no existing query
+        path). Two intentional S3→S5 follow-ups (documented in 0110-0008):
+        (1) clog-backed `XidStatusFunc` — disabled (nil) because the executor
+        `Context` has no clog handle yet, so the clog-dependent HOT-chain tier is
+        off; page-structural + natts + xmin/xmax bounds tiers are active;
+        (2) named-arg + LATERAL call shape pg_amcheck emits (`relation := c.oid`
+        correlated on pg_class) — goopg's parser has no `:=` named-arg syntax, so
+        S3 supports **positional** args only. **Remaining: S4 bt_index_check/
+        bt_index_parent_check SRFs, S5 TAP port.** Merge to the active branch
+        still awaits a clean tree. Resume = Slice S4.
+      - **PROGRESS 2026-06-15 (loop #15):** the **amcheck SQL surface Slice S4
+        LANDED** — `bt_index_check` / `bt_index_parent_check` scalar `void`
+        functions (design `0110-0008`) on worktree branch
+        `m0110-0003-amcheck-sql-surface` (commit b7c1b78c, on top of S3 8154404c,
+        off clean HEAD b8dd6403). Unlike S3's FROM-clause SRF, these are
+        SELECT-list scalar functions (pg_amcheck issues
+        `SELECT bt_index_check(c.oid, false) FROM pg_class c, pg_index i …`), so
+        they live in `evalFuncCall` dispatch (`executor/expr.go`) with `exprType`
+        returning `void` (OID 2278, `planner/planner.go`). New
+        `executor/operators_bt_index_check.go` resolves the index regclass
+        (OID/name) → `IndexRelFileNode`, fills a `PageSource` from the buffer
+        pool, and drives the committed engine's structural tiers
+        (`VerifyBtreePage`/`VerifyBtreeItemOrder` per block,
+        `VerifyBtreeLevelSiblingLinks` per level via leftmost-descent,
+        `VerifyBtreeParentDownlinks` per internal page on parent-check); any
+        `[]amcheck.BtreeReport` finding raises `XX002` (ERRCODE_INDEX_CORRUPTED),
+        clean index → void. Tests PASS:
+        `TestBtIndexCheck_{CleanIndexNoError (no-false-positive gate, both funcs,
+        all positional shapes), DetectsCorruptMetapage, NonexistentIndex}`.
+        Gates: gofmt clean (also fixed pre-existing expr.go import disorder); vet
+        clean; build OK; executor/planner/analyzer/parser/amcheck unit tests PASS;
+        TPC-H spotcheck SKIPPED (no data dir in worktree; additive, no query-path
+        change). Three intentional S4→S5 follow-ups (documented in 0110-0008):
+        (1) `heapallindexed` heap↔index completeness (needs MVCC heap-entry-set
+        former; default pg_amcheck probe passes `false`); (2) `rootdescend`/
+        `checkunique` deeper parent-check tiers; (3) named-arg `:=`/LATERAL
+        (positional-only, shared with S3). **Remaining: S5 TAP port + named-arg/
+        clog wiring; MERGE (human clears foreign gen-column WIP).** Resume =
+        Slice S5 in the same worktree.
+      - **PROGRESS 2026-06-15 (loop #16):** the **amcheck SQL surface Slice S5
+        named-argument parsing LANDED** (commit 42e67873, on top of S4 b7c1b78c,
+        off clean HEAD b8dd6403). pg_amcheck emits the legacy `name := value`
+        named-arg spelling — `bt_index_check(index := c.oid, heapallindexed :=
+        false)` and the FROM-clause SRF `verify_heapam(relation := c.oid,
+        on_error_stop := false, …)`. goopg stripped `=>` positionally (M0097-0003)
+        only in the expr path (`parseFuncCallTail`). This loop extends BOTH the
+        expr path AND the FROM-SRF arg loop (`parseRangeVar`) — the **sibling
+        path**, which previously stripped no names at all — to accept `:=`/`=>`
+        and map positionally. Arg-names that lex as unreserved keywords (`index`,
+        `skip`) are accepted via the gated `isNamedArgNameToken` helper (the
+        `:=`/`=>` lookahead disambiguates). Positional order already matches the
+        S3/S4 executors, so the strip binds correctly; `c.oid` parses to a
+        `ColumnRef`. Tests PASS: `parser.TestParseNamedArgColonEqual{,FromSRF,
+        EquivalentToFatArrow}` (both scalar funcs, full 6-arg FROM-SRF with
+        correlated `c.oid` first, `:=`≡`=>` equivalence). Gates: gofmt clean (my
+        edits; left pre-existing select.go drift untouched), vet clean, build OK,
+        parser/analyzer/planner suites PASS, executor amcheck tests PASS; TPC-H
+        spotcheck SKIPPED (no data dir; parser-only additive). Parser-only, zero
+        contaminated files. **Remaining for S5:** (a) LATERAL resolution of the
+        `c.oid` outer ref at plan/exec time (planner change — its own bounded loop
+        per the M0072-hang precedent); (b) clog `XidStatusFunc` wiring; (c) the
+        AC-002..AC-005 TAP port; (d) MERGE (human clears foreign gen-column WIP).
+      - **PROGRESS 2026-06-15 (loop #19):** the **AC-002 bootstrap-query SQL-engine
+        gaps #1 + #2 LANDED** (worktree branch `m0110-0003-amcheck-sql-surface`,
+        commit c91512ba on top of a74c7036, off clean HEAD b8dd6403). The
+        `002_nonesuch` port drives real `pg_amcheck`, whose database/relation
+        resolution queries (`pg_amcheck.c compile_database_list` /
+        `compile_relation_list_one_db`) hit two GENERAL goopg SQL gaps, neither
+        amcheck-specific: **#1** `index` rejected as a CTE name — `parseCTE`→
+        `parseIdent` accepts an unreserved/col_name keyword, but the post-`,`
+        look-ahead guard in `parseWithClause` only allowed `TokenIdent`/
+        `TokenQuotedIdent`, so `WITH a AS (…), index AS (…)` errored; guard now
+        mirrors `parseIdent` (reserved keywords still rejected). **#2** a VALUES
+        list backing a CTE reported 0 columns — `analyzer.registerAnalyzedCTE`
+        built columns only from `cte.Query.Targets` (empty for VALUES) → 42P10;
+        it now derives the count from the first `ValuesRows` row when `Targets`
+        is empty, mirroring the VALUES anchor in `analyzeRecursiveCTE` (sibling
+        path). Tests: `parser.TestParseCTENamedIndex`, `analyzer.TestAnalyzeWith
+        ValuesCTE{ColumnAliases,ArityMismatch,DefaultColumnNames}`. Gates: full
+        parser+analyzer suites PASS; `go build ./...`+gofmt+vet clean; zero
+        contaminated files. **Remaining AC-002 gap #3 (connection-level):** goopg
+        does not reject a connection to a non-existent database at startup —
+        needs (a) `template1`/`template0` registered in `pg_database` (default
+        set is only `{"postgres"}`, yet `002_nonesuch` connects to `template1`)
+        and (b) a `HasDatabase` check after auth in `server.go` returning FATAL
+        3D000 `database "%s" does not exist` (guarded like `tryHandleDatabaseDDL`
+        for nil/non-registry catalogs). Touches the connection handshake (every
+        connection) → its own bounded loop with the full `internal/server` suite +
+        a live-cluster smoke. `TestPort_PgAmcheck002Nonesuch` self-skips via a new
+        `qqq`-rejection preflight probe so #1+#2 do not flip it SKIP→FAIL. Design
+        doc `0110-0008` updated. Resume = AC-002 gap #3.
+
+- [x] **M0110-0010 — B-tree vacuum: relink LIVE siblings when deleting adjacent empty leaves**
+      - **DONE 2026-06-15 (loop #10).** Landed on worktree branch
+        `m0110-amcheck-pagedel` (commit 08ec6b20) off clean HEAD b8dd6403 — the
+        main tree still carries the foreign gen-column WIP, so the btree fix
+        (btree files are NOT contaminated) lands in the worktree.
+        `unlinkEmptyLeaf` / `unlinkEmptyLeafFPI`
+        (`internal/access/btree/btree_vacuum.go`) now relink the nearest **live**
+        siblings instead of the PHASE-1-captured neighbours. New `liveSibling`
+        walk skips any `BTDeleted`/`BTHalfDead` page (PHASE 1 stamps every target
+        leaf before any unlink, and `recycleBlock` does not wipe pages, so the
+        chain through dead pages stays navigable) and returns the nearest live
+        left/right block — order-independent, so `CompleteDeferredDeletions`
+        (block-order, post-crash) is correct too. Mirrors PG
+        `_bt_unlink_halfdead_page`. **No WAL format change:** the `BtreeUnlinkPage`
+        record already carries arbitrary sibling blocks and `replayBtreeUnlinkPage`
+        applies whatever it names; only the computed values changed. Both the
+        WAL-emit path and the FPI fallback share the computation (sibling paths
+        agree). DoD met: detection test flipped to silence
+        (`TestVerifyBtreeEngineSilentAfterAdjacentLeafDeletion`); new storage-layer
+        `TestVacuumIndexPagesAdjacentLeafRunRelinksLiveSiblings` asserts every
+        survivor links only to live blocks + a bidirectionally intact chain.
+        Gates: `go test -race ./internal/access/btree ./internal/amcheck
+        ./internal/wal ./internal/mvcc ./internal/storage` PASS; `go build ./...`
+        clean; gofmt/vet clean; TPC-H spotcheck Q12=2/Q13=33 (canonical).
+        Design doc `docs/design/0110-0010-btree-vacuum-adjacent-leaf-relink.md`
+        + README index.
+      - **Discovered 2026-06-15 (loop #9)** by the new real-producer page-deletion
+        validation (`internal/amcheck/verify_nbtree_pagedel_test.go`); detection
+        pinned by `TestVerifyBtreeEngineDetectsStaleSiblingLinkAfterAdjacentLeafDeletion`.
+      - Symptom: when `VacuumIndexPages` empties two or more **adjacent** leaves in
+        a single pass (the common case for a range `DELETE` + `VACUUM`), the
+        surviving siblings at the run's edges end up with `btpo_next`/`btpo_prev`
+        pointing at a block that was itself deleted in the same pass. The on-disk
+        leaf sibling chain is left structurally broken. amcheck's sibling-link tier
+        flags `downlink or sibling link points to deleted block`.
+      - Root cause: `unlinkEmptyLeaf` / `unlinkEmptyLeafFPI`
+        (`internal/access/btree/btree_vacuum.go`) relink neighbours from
+        `emptyLeafInfo.prev`/`.next` captured at PHASE-1 scan time, **before** any
+        leaf is unlinked. For `L0→L1→L2→L3→L4` with `L1,L2,L3` emptied,
+        `unlink(L1)` sets `L0.next=L2` and `unlink(L3)` sets `L4.prev=L2` — both now
+        reference the deleted `L2`.
+      - Required (mirrors PG `_bt_unlink_halfdead_page` + the M0110-0007 split fix):
+        re-read the CURRENT left/right siblings at unlink time (skipping/deferring a
+        neighbour that is itself half-dead), and fold the corrected sibling blocks
+        into the unlink WAL record + replay. This is a WAL/concurrency change — run
+        `go test -race ./internal/access/btree ./internal/wal ./internal/mvcc
+        ./internal/storage` plus the recovery/replay path, and the TPC-H spotcheck.
+        Write a design doc (`docs/design/0110-00NN-btree-vacuum-adjacent-leaf-relink.md`)
+        first. DoD: flip the detection test to a silence assertion.
+      - Blocked on a clean tree only insofar as committing to the main tree is
+        blocked by the foreign WIP; the btree files themselves are NOT contaminated,
+        so the fix can land in a worktree off clean HEAD.
 
 - [x] **M0110-0007 — B-tree split must maintain the old right sibling's prev-link**
       - **DONE 2026-06-14 (loop #30).** `insertIntoBlock`
@@ -1832,7 +2040,7 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
 
 ### Sub-milestones
 
-- [ ] **M0117-0001**
+- [x] **M0117-0001** — DONE (branch `m0117-0001-xid-precedes` off b8dd6403; design `docs/design/0117-0001-xid-precedes-horizon-comparison.md`). Added `storage.XIDPrecedes`, routed `catalog.DatFrozenXID` + checkpointer `TruncateCLOGFn` through it, made `mvcc.txnPrecedes` delegate; pinned by `internal/storage/xid_test.go`. Gates: build + `go test ./internal/storage/... ./internal/mvcc/... ./internal/catalog/... ./internal/initdb/...` PASS. Pending human merge (foreign M0100-0010 WIP holds the main tree).
       - Summary: Wraparound-safe XID horizon comparison (gap M2; P0/correctness).
         Add exported `storage.XIDPrecedes(a, b)` (mirroring `clog.go`'s `txnPrecedes`
         / PG `TransactionIdPrecedes`) and use it for horizon selection in
@@ -1841,7 +2049,11 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
       - Author `docs/design/0117-0001-xid-precedes-horizon-comparison.md` and index it before coding.
       - Gate: `go test ./internal/mvcc/... ./internal/catalog/...` (+ unit tests near 2^32). Effort: S.
 
-- [ ] **M0117-0002**
+- [x] **M0117-0002** — DONE (branch `m0117-0002-clog-visibility-fallback`, commit `b3d5b448`
+      off clean HEAD `b8dd6403`; design `docs/design/0117-0002-visibility-clog-fallback.md`,
+      indexed). Pending human merge (foreign gen-column WIP holds the main tree).
+      Verified loop #18: the stacked worktree chain (0001→0008) builds clean and
+      `go test -race ./internal/mvcc/...` PASS off clean HEAD.
       - Summary: Runtime CLOG-consulting visibility fallback (gap G4; P1). Add a CLOG
         fallback in `Snapshot.SeesCommittedXID` for in-window XIDs not classified by
         the in-memory `InProgress`/`Aborted` arrays, keeping the arrays as the fast
@@ -1849,7 +2061,10 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
       - Author `docs/design/0117-0002-visibility-clog-fallback.md` and index it before coding.
       - Gate: TPC-H spot-check (`scripts/tpch-spotcheck.sh`, Q12=2/Q13=35) + `go test -race ./internal/mvcc/...`. Effort: M.
 
-- [ ] **M0117-0003**
+- [x] **M0117-0003** — DONE (branch `m0117-0003-pg-subtrans-restore`, commit `24b09523`
+      off clean HEAD `b8dd6403`; design `docs/design/0117-0003-pg-subtrans-restore-on-restart.md`,
+      indexed). Pending human merge. Verified loop #18 via the stacked-chain build +
+      `go test -race ./internal/mvcc/...` PASS off clean HEAD.
       - Summary: `pg_subtrans` restore-on-restart (gap G5 read path; P1). Wire
         `SubxactMap.EnablePersistence` into the `internal/initdb/open.go` recovery
         sequence and load persisted parent links from the `pg_subtrans` SLRU back into
@@ -1857,7 +2072,10 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
       - Author `docs/design/0117-0003-pg-subtrans-restore-on-restart.md` and index it before coding.
       - Gate: standby-attach E2E + `go test -race ./internal/mvcc/...`. Effort: M.
 
-- [ ] **M0117-0004**
+- [x] **M0117-0004** — DONE (branch `m0117-0004-clog-sub-committed`, commit `f6d3d36c`
+      off clean HEAD `b8dd6403`; design `docs/design/0117-0004-clog-sub-committed-lane.md`,
+      indexed). Pending human merge. Verified loop #18 via the stacked-chain build +
+      `go test -race ./internal/mvcc/...` PASS off clean HEAD.
       - Summary: `SUB_COMMITTED` (0x03) CLOG lane (gap G5 SUB_COMMITTED; P1; builds on
         M0117-0003). Generate the 0x03 lane in the commit path (`mirrorToSLRUUnlocked`)
         for committed subxacts whose parent is still in-progress, and read it back in
@@ -1865,7 +2083,11 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
       - Author `docs/design/0117-0004-clog-sub-committed-lane.md` and index it before coding.
       - Gate: extend the dual-store consistency test + `go test -race ./internal/mvcc/...`. Effort: S–M.
 
-- [ ] **M0117-0005**
+- [x] **M0117-0005** — DONE (branch `m0117-0005-clog-incremental-flush-group-commit`,
+      commit `5fcdb27b` off clean HEAD `b8dd6403`; design
+      `docs/design/0117-0005-clog-incremental-flush-group-commit.md`, indexed). Pending
+      human merge. Verified loop #18 via the stacked-chain build +
+      `go test -race ./internal/mvcc/...` PASS off clean HEAD.
       - Summary: Incremental flush + group commit (gap G7; P2). Make `CLog.flush`
         write only changed pages/segments (not the whole flat file) and add a
         group-commit batching layer (lock-free queue, mirroring PG's
@@ -1874,22 +2096,85 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
       - Author `docs/design/0117-0005-clog-incremental-flush-group-commit.md` and index it before coding.
       - Gate: `go test -race ./internal/mvcc/...` + commit-throughput sanity check. Effort: M.
 
-- [ ] **M0117-0006**
+- [ ] **M0117-0006** — Part A DONE; Part B/C DEFERRED (Effort-L memory-model rewrite of the
+      highest-blast-radius subsystem, decomposed; see deferral ledger 2026-06-15).
+      Branch `m0117-0006-clog-slru-buffer-pool` (off `5fcdb27b`; design
+      `docs/design/0117-0006-clog-slru-buffer-pool.md`, indexed).
+      - **Part A (landed):** the `transaction_buffers` GUC (`defaults.go` +
+        `postgresql.conf.sample`, PGC_POSTMASTER, boot_val 0, max 1GiB/BLCKSZ; raw buffer
+        count == PG's GUC_UNIT_BLOCKS value) + `EffectiveCLOGBuffers` (faithful port of
+        `clog.c:CLOGShmemBuffers + SimpleLruAutotuneBuffers`) + `clogBufferPool`
+        (`internal/mvcc/clog_bufferpool.go`): bounded LRU page cache over the 2-bit SLRU
+        representation backed by the `pg_xact/` segment files (fault-in, LRU eviction with
+        dirty writeback, clear-then-set lane update ≙ `TransactionIdSetStatusBit`, per-segment
+        fsync in `flushDirty`). NOT wired into the live path — blast radius nil. Pinned by
+        `internal/mvcc/clog_bufferpool_test.go` incl. a sibling-path encode↔encode equivalence
+        test vs `mirrorToSLRUUnlocked`.
+      - **Part B (deferred):** wire `CLog.GetStatus`/`setStatus` (+ bulk callers, `loadFromSLRU`,
+        `HighestKnownXID`, `TruncateCLOG`, `distributeToBanks`) through the pool. Resume point /
+        open questions in the design doc: mirror-disabled fallback, OR-vs-clear-then-set semantics
+        (keep the M0117-0004 visibility invariant), truncation-via-page-invalidation.
+      - **Part C (deferred):** remove the resident `banks` + `global/pg_xact` flat file (the 2-bit
+        collapse, 16× memory reduction).
       - Summary: SLRU buffer pool / 2-bit collapse (gap G6; P2; follows M0117-0005).
         Replace the fully-resident per-bank byte slices with a bounded page-cache over
         the 2-bit SLRU representation (LRU eviction; `transaction_buffers` GUC).
-      - Author `docs/design/0117-0006-clog-slru-buffer-pool.md` and index it before coding.
       - Gate: `go test -race ./internal/mvcc/...`; full mvcc/wal/initdb suites; re-init data dir (memory-model change). Effort: L.
+      - Gates run (Part A): `go build ./...` PASS; `go test -race ./internal/mvcc/...` PASS;
+        `go test ./internal/config/...` PASS (GUC + sample coverage); `go test
+        ./internal/initdb/... ./internal/server/...` PASS; gofmt/vet clean. TPC-H spotcheck SKIPs
+        under worktree isolation — no-op (no live CLOG path changed).
 
 - [ ] **M0117-0007**
       - Summary: Async-commit LSN tracking (gap G8; P2; feature-gated on a real
         `synchronous_commit=off` path). Add per-group commit-LSN tracking
         (`CLOG_XACTS_PER_LSN_GROUP`) and gate honoring a committed status / hint-bit
         setting on WAL flush position.
-      - Author `docs/design/0117-0007-clog-async-commit-lsn.md` and index it before coding.
+      - Author `docs/design/0117-0007-clog-async-commit-lsn.md` and index it before coding. (DONE — design indexed.)
       - Gate: `go test -race ./internal/mvcc/...` + recovery E2E. Effort: L.
+      - **Part A (landed):** the async-commit per-LSN-group tracking on the M0117-0006 buffer pool
+        (`internal/mvcc/clog_bufferpool.go`), composing infrastructure with nil live blast radius
+        (the pool is not yet the live store — M0117-0006 Part B deferred): `clogXactsPerLSNGroup=32`
+        / `clogLSNsPerPage=clogXactsPerPage/32=1024` + `lsnIndexInPage` (= PG `GetLSNIndex` minus the
+        `slotno*CLOG_LSNS_PER_PAGE` base, since each `clogPageSlot` owns its `groupLSN[1024]uint64`);
+        `setStatusWithLSN(xid,status,lsn)` raises `groupLSN[lsnIndexInPage]` to `max(…,lsn)`
+        (≙ `TransactionIdSetPageStatusInternal`; `setStatus` = `setStatusWithLSN(…,0)`, byte-identical
+        for LSN-free callers; `lsn==0` ≙ `InvalidXLogRecPtr` no-op); `groupLSNFor` read side
+        (≙ the `*lsn` out-param of `TransactionIdGetStatus`); an injected `flushWAL func(uint64) error`
+        barrier (nil ⇒ off, default) that `writePageToDisk`/`flushDirty` call with the page's max group
+        LSN BEFORE writing the page out (≙ `XLogFlush` in `SlruPhysicalWritePage`), to be wired to
+        `wal.Writer.FlushUpTo` when the pool goes live. `groupLSN` is in-memory only (zeroed on
+        fault-in ≙ PG never persisting it). Pinned by `internal/mvcc/clog_bufferpool_lsn_test.go`
+        (GetLSNIndex arithmetic, max-LSN monotonicity, zeroed-on-reopen vs durable status bits,
+        barrier-fires-before-write ordering for both flushDirty + eviction).
+      - **Part B (deferred):** live `synchronous_commit=off` activation — wire `flushWAL` to the live
+        WAL writer, thread the commit-record LSN from the commit path into `setStatusWithLSN`, and skip
+        the inline per-commit WAL fsync (rely on the page-write barrier). Changes the live durability
+        path ⇒ needs the full TPC-H Q12/Q13 + crash-recovery/standby E2E (SKIP under worktree
+        isolation). Defers with M0117-0006 Part B (the barrier only fires once the pool is the live
+        store). Resume point in the design doc.
+      - Gates run (Part A): `go build ./...` PASS; `go test -race ./internal/mvcc/...` PASS;
+        `go test ./internal/config/... ./internal/initdb/... ./internal/server/...` PASS;
+        `TestE2E_PhysicalReplication{,Sync}` PASS; gofmt/vet clean. TPC-H spotcheck SKIPs under worktree
+        isolation — no-op (no live CLOG path changed).
 
-- [ ] **M0117-0008**
+- [ ] **M0117-0008** — Part A DONE; Part B DEFERRED (branch `m0117-0008-datfrozenxid-persist`,
+      commit `3ff00365` off the m0117-0007 chain tip `1f1100e8`; design
+      `docs/design/0117-0008-datfrozenxid-persistence.md`, indexed). Pending human merge.
+      - **Part A (done):** dual-store consistency for all 4 CLOG status codes
+        (IN_PROGRESS/Unknown 0x00, COMMITTED 0x01, ABORTED 0x02, SUB_COMMITTED 0x03)
+        is already satisfied by the M0117-0004 chain — `clog_dual_store_consistency_test.go`
+        round-trips every lane flat-file↔SLRU across adjacent lanes, a page boundary,
+        two segments, and a TruncateCLOG.
+      - **Part B (deferred):** on-disk in-place `pg_database.datfrozenxid` persistence at
+        VACUUM end is NOT Effort-S — goopg has no runtime shared-catalog RelFileNode
+        resolver (pg_database is shared at `global/1262`), the only catalog-heap
+        precedent (`syncTableToCatalogHeap`) appends rows rather than overwriting a
+        field in place, and a faithful `heap_inplace_update` needs buffer-lock + WAL +
+        a PG-standby-attach E2E (SKIPs under worktree isolation). goopg's own CLOG
+        truncation reads in-memory `cat.DatFrozenXID()` directly, so the persisted tuple
+        is purely external (standby/tooling) parity. Design doc carries the 5-step
+        Part-B plan; deferral-ledger line added.
       - Summary: Persist `datfrozenxid` in the `pg_database` catalog tuple at VACUUM
         end (rather than only computing it on demand) and extend the dual-store
         consistency tests for round-trip coverage of all status codes.
