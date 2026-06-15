@@ -1118,6 +1118,21 @@ object support.
         is wrong — for EVERY table, so it's a planner output-column-naming bug for
         the `tableoid` system column. Resume = fix `tableoid` column labelling,
         then continue getTypes → getTables… per pg_dump's getter order.
+      - **PROGRESS 2026-06-16 (loop #26):** **DU-002 slice 3 (`tableoid` column
+        label) LANDED.** Root cause: `resolveColumnRefAt` lowers a bare `tableoid`
+        on a non-partitioned base relation to a constant `*TableOidExpr`, but the
+        planner's `targetMeta` (`internal/planner/planner.go`) had no case for that
+        node (only the cast-wrapped `tableoid::regclass` form), so it fell through
+        to `?column?`. Fix = added a `*TableOidExpr` arm returning `("tableoid",
+        oid)`, mirroring the existing `*CTIDExpr` → `"ctid"` case. Analyzer/executor
+        naming twins operate on the parser AST (still `*parser.ColumnRef`) and were
+        already correct. Unit guard `server.TestTableoidColumnName`. Verified live
+        via `TestPort_PgDumpConnectionSetup`: pg_dump now passes "reading schemas"
+        (no segfault) and advances to getTables.
+        **Next blocker (precise):** getTables fails with `relation "pg_depend" does
+        not exist` — pg_dump's getTables joins `pg_class LEFT JOIN pg_depend` (and
+        `pg_tablespace`, `pg_am`, `pg_class tc` for TOAST). Resume = add a
+        `pg_depend` catalog view (slice 4), then continue the getter battery.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

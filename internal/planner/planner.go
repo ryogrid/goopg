@@ -7697,6 +7697,16 @@ func targetMeta(e Expr, t parser.ResTarget) (string, catalog.Type) {
 	if _, ok := e.(*CTIDExpr); ok {
 		return "ctid", catalog.Type{Name: "tid"}
 	}
+	// Bare `tableoid` on a non-partitioned base relation resolves to a
+	// constant TableOidExpr (resolveColumnRefAt). Preserve the system-column
+	// label so `SELECT tableoid FROM t` reports the field name as `tableoid`
+	// rather than `?column?` — pg_dump's getNamespaces does
+	// PQfnumber(res,"tableoid") and segfaults on a -1 (column not found).
+	// The cast-wrapped form (`tableoid::regclass`) is handled in the CastExpr
+	// arm below. (DU-002 slice 3)
+	if _, ok := e.(*TableOidExpr); ok {
+		return "tableoid", catalog.Type{Name: "oid"}
+	}
 	// merge_action() uses the function name as the column label. M0100-0007.
 	if _, ok := e.(*MergeActionExpr); ok {
 		return "merge_action", catalog.Type{Name: "text"}

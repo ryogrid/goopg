@@ -100,16 +100,26 @@ fixed one logical group per loop:
    Unit guard: `executor.TestEvalAclDefault` (+ `TestEvalAclDefaultEdgeCases`)
    pins all 13 object types and the privilege-letter order (`ACL_ALL_RIGHTS_STR`
    = `arwdDxtXUCTcsAm`).
-3. **`tableoid` column label (getNamespaces) — NEXT.** With `acldefault()` in
+3. **`tableoid` column label (getNamespaces) — DONE.** With `acldefault()` in
    place the getNamespaces query *executes* (verified live: all six columns
-   return correct values), but pg_dump still **segfaults** during "reading
-   schemas": its first projected column `n.tableoid` comes back labelled
-   `?column?` instead of `tableoid`, so `PQfnumber(res, "tableoid")` returns -1
-   and `PQgetvalue(res, i, -1)` reads out of bounds (`column number -1 is out of
-   range 0..5`, SIGSEGV / exit 139). The *value* resolves correctly (2615); only
-   the RowDescription field name is wrong, and it is wrong for **every** table
-   (real and virtual), so this is a planner output-column-naming bug for the
-   `tableoid` system column, not a catalog-row gap. Fix that next.
+   return correct values), but pg_dump **segfaulted** during "reading
+   schemas": its first projected column `n.tableoid` came back labelled
+   `?column?` instead of `tableoid`, so `PQfnumber(res, "tableoid")` returned -1
+   and `PQgetvalue(res, i, -1)` read out of bounds (`column number -1 is out of
+   range 0..5`, SIGSEGV / exit 139). The *value* resolved correctly (2615); only
+   the RowDescription field name was wrong, and it was wrong for **every** table
+   (real and virtual): a planner output-column-naming gap, not a catalog-row gap.
+   Root cause: `resolveColumnRefAt` lowers a bare `tableoid` on a
+   non-partitioned base relation to a constant `*TableOidExpr`, but the planner's
+   `targetMeta` (`internal/planner/planner.go`) had no case for that node — only
+   the cast-wrapped form (`tableoid::regclass`) was handled — so it fell through
+   to `?column?`. Fix: added a `*TableOidExpr` arm to `targetMeta` returning
+   `("tableoid", oid)`, mirroring the existing `*CTIDExpr` → `"ctid"` case. The
+   analyzer/executor twins (`deriveAnalyzerTargetName`, `deriveTargetName`)
+   operate on the *parser* AST where `tableoid` is still a `*parser.ColumnRef`
+   and already returned the right name, so no change was needed there. Unit
+   guard: `server.TestTableoidColumnName` asserts the RowDescription field name
+   for both bare and table-qualified `tableoid` projections.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

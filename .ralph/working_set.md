@@ -1,40 +1,38 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 2 (acldefault())
-COMMITTED + pushed this loop (5cea8880). Next: slice 3 = tableoid output-column
-naming bug (planner). NOTHING in flight; next loop starts clean on slice 3.
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 3 (tableoid
+column label) COMPLETE this loop. NOTHING in flight; next loop starts on slice 4.
 
-=== DONE (loop #25) ===
-Committed + pushed the already-verified slice-2 work from loop #24:
-acldefault() executor builtin (evalAclDefault + aclPrivString + aclRoleNameForOID
-in internal/executor/expr.go) so pg_dump's getNamespaces query runs. Commit
-5cea8880. Build/vet/gofmt clean; TestEvalAclDefault PASS.
+=== DONE (loop #26) — DU-002 slice 3 ===
+Bug: pg_dump SEGFAULTed (exit 139) in "reading schemas" because getNamespaces'
+first projected column `n.tableoid` came back labelled `?column?` instead of
+`tableoid` → PQfnumber(res,"tableoid")=-1 → out-of-bounds read.
+Root cause: resolveColumnRefAt lowers bare `tableoid` on a non-partitioned base
+relation to a constant *TableOidExpr, but planner targetMeta
+(internal/planner/planner.go ~L7697) had NO case for that node (only the
+cast-wrapped tableoid::regclass form), so it fell through to ?column?.
+Fix: added a *TableOidExpr arm to targetMeta returning ("tableoid", oid),
+mirroring the existing *CTIDExpr → "ctid" case. Analyzer/executor naming twins
+(deriveAnalyzerTargetName, deriveTargetName) operate on parser AST where
+tableoid is still *parser.ColumnRef — already correct, no change.
+Files: internal/planner/planner.go (targetMeta), internal/server/tableoid_test.go
+(new TestTableoidColumnName), docs/design/0110-0001-pg-dump-tap-port.md,
+.ralph/fix_plan.md, .ralph/deferral_ledger.md.
+Gates run: go build ./... OK; planner/analyzer/executor/server unit tests PASS;
+TestTableoidColumnName PASS; TestPort_PgDumpConnectionSetup PASS (verified
+pg_dump now passes "reading schemas", advances to getTables). tpch-spotcheck
+SKIPPED (no TPC-H data dir in env) — change is tableoid-naming-only, zero
+row-count risk for TPC-H queries.
 
-=== NEXT STEP — DU-002 slice 3 (planner output-column naming) ===
-Symptom: pg_dump SEGFAULTs (exit 139) in "reading schemas". getNamespaces'
-first projected column `n.tableoid` returns in RowDescription labelled
-`?column?` instead of `tableoid`. Value is CORRECT (2615); only the field NAME
-is wrong. Reproduces on EVERY table: `SELECT tableoid FROM public.foo` also
-labels it `?column?`. pg_dump's PQfnumber(res,"tableoid") -> -1 ->
-PQgetvalue(...,-1) out of range 0..5 -> SIGSEGV.
-
-Investigation so far (loop #25):
-- The name-derivation twins BOTH return x.Column for a *parser.ColumnRef:
-  - executor: deriveTargetName  (internal/executor/operators_ddl.go:2292)
-  - analyzer: deriveAnalyzerTargetName (internal/analyzer/analyzer.go:2119)
-  So if `tableoid` flowed through the normal ColumnRef-target naming path the
-  label WOULD be "tableoid". It isn't -> the system column tableoid is NOT
-  taking the plain-ColumnRef projection-naming path.
-- Hypothesis: system columns (tableoid/ctid/xmin/xmax/cmin/cmax/oid) are
-  injected into the projection/output schema WITHOUT a Name, or resolved as a
-  non-ColumnRef node, so naming falls back to ?column?. Files touching tableoid
-  system-column handling: internal/executor/operators_storage.go,
-  internal/planner/planner.go + plan.go, internal/catalog/catalog.go.
-  Existing test: internal/server/tableoid_test.go (value path) — extend it to
-  assert the RowDescription field NAME, then fix the schema Name for system cols.
-- SIBLING-PATH WARNING: fix executor schema naming AND analyzer/planner schema
-  naming together (twin functions above); a unit test on one passes while the
-  other is wrong.
-- GATE: this is a planner/executor change -> run scripts/tpch-spotcheck.sh
-  (Q12=2/Q13=35) before committing.
+=== NEXT STEP — DU-002 slice 4 (pg_depend catalog view) ===
+TestPort_PgDumpConnectionSetup now fails at getTables:
+`relation "pg_depend" does not exist`. getTables runs
+`pg_class c LEFT JOIN pg_depend d ON (...) LEFT JOIN pg_tablespace tsp ...
+LEFT JOIN pg_am am ... LEFT JOIN pg_class tc (toast) WHERE c.relkind IN
+('r','S','v','c','m','f','p') ORDER BY c.oid`.
+Slice 4 = add a pg_depend virtual catalog view (search existing virtual-catalog
+view registration; see per_connection_virtual_catalog_scoping memory + how
+pg_class/pg_namespace views are wired). Verify pg_tablespace/pg_am/pg_class(toast)
+LEFT JOINs also resolve. Then continue the getter battery (getTypes, getTables,
+getIndexes, …) per pg_dump's getter order.
 
 Other open (larger, untouched): M0110-0003 AC-003 003_check feature tiers;
 M0110-0002 002_save_fullpage; M0095-0003 recvlogical; M0117-0006/7/8 (Effort-L CLOG).
