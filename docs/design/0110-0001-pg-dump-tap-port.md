@@ -524,6 +524,26 @@ fixed one logical group per loop:
     but its `NOT EXISTS` subquery references `pg_range`, which does not. An empty
     `pg_range` virtual view (OID 3541) is the next slice (goopg defines no range
     types, so empty should suffice; verify empirically).
+22. **`pg_range` virtual view — DONE.** `getCasts` runs `SELECT tableoid, oid,
+    castsource, casttarget, castfunc, castcontext, castmethod FROM pg_cast c WHERE
+    NOT EXISTS ( SELECT 1 FROM pg_range r WHERE c.castsource = r.rngtypid AND
+    c.casttarget = r.rngmultitypid ) ORDER BY 3,4` (range types' auto-generated
+    casts are excluded so they aren't dumped separately); `pg_cast` existed but the
+    `NOT EXISTS` subquery referenced `pg_range`, which did not, so the query aborted
+    at `relation "pg_range" does not exist`. Added the empty `pg_range` virtual view
+    (`internal/catalog/catalog.go`, OID 3541, beside `pg_conversion`) with the
+    `pg_range.h` schema — note `pg_range` has **no** `oid` column; `rngtypid` is the
+    key (`rngtypid oid, rngsubtype oid, rngmultitypid oid, rngcollation oid,
+    rngsubopc oid, rngcanonical regproc(oid), rngsubdiff regproc(oid)`). goopg
+    defines no range types, so the `NOT EXISTS` is always true and the **empty**
+    view (0 rows) produces an identical dump — confirmed empirically: pg_dump now
+    advances past `getCasts` to `getEventTriggers`. The **new** blocker is
+    `relation "pg_event_trigger" does not exist` (`SELECT e.tableoid, e.oid,
+    evtname, evtenabled, evtevent, evtowner, array_to_string(array(select
+    quote_literal(x) from unnest(evttags) as t(x)), ', ') as evttags,
+    e.evtfoid::regproc as evtfname FROM pg_event_trigger e ORDER BY e.oid`). An
+    empty `pg_event_trigger` virtual view (OID 3466) is the next slice (goopg
+    defines no event triggers, so empty should suffice; verify empirically).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

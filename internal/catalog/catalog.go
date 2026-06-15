@@ -3869,6 +3869,36 @@ func (c *InMemory) registerSystemTables() {
 	pgConversion.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_conversion"] = pgConversion
 
+	// pg_range — range-type catalog (OID 3541). After getConversions, pg_dump's
+	// getCasts runs:
+	//   SELECT tableoid, oid, castsource, casttarget, castfunc, castcontext,
+	//   castmethod FROM pg_cast c WHERE NOT EXISTS ( SELECT 1 FROM pg_range r
+	//   WHERE c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid )
+	//   ORDER BY 3,4
+	// (pg_dump.c getCasts: range types' auto-generated casts are excluded via the
+	// NOT EXISTS against pg_range so they aren't dumped separately). goopg defines
+	// no range types (no CREATE TYPE ... AS RANGE), so an empty view (0 rows) is
+	// correct — the NOT EXISTS is always true, matching PG's outcome when no user
+	// range types exist. Schema matches PG's pg_range (pg_range.h): NOTE pg_range
+	// has NO oid column; rngtypid is the key. Cols: rngtypid oid, rngsubtype oid,
+	// rngmultitypid oid, rngcollation oid, rngsubopc oid, rngcanonical regproc(oid),
+	// rngsubdiff regproc(oid). M0110-0001 (DU-002 slice 22).
+	pgRange := &Table{
+		Schema: "pg_catalog", Name: "pg_range", Virtual: true,
+		Columns: []Column{
+			{Name: "rngtypid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "rngsubtype", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "rngmultitypid", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "rngcollation", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "rngsubopc", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "rngcanonical", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "rngsubdiff", Type: Type{Name: "oid"}, Ordinal: 6},
+		},
+		OID: 3541,
+	}
+	pgRange.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_range"] = pgRange
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

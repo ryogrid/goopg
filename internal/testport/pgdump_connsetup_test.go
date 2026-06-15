@@ -97,16 +97,21 @@ package testport
 // conproc regproc(oid), condefault bool). PG ships ~130 built-in conversions,
 // but every one is in pg_catalog and filtered out at dump-out time, so the empty
 // view satisfies the dump identically — confirmed empirically by this test.
-// **Next blocker (precise, confirmed empirically by this test):** the
-// getConversions query now passes; pg_dump advances to getCasts, which fails
-// with `relation "pg_range" does not exist`. The query is
-// `SELECT tableoid, oid, castsource, casttarget, castfunc, castcontext,
-// castmethod FROM pg_cast c WHERE NOT EXISTS ( SELECT 1 FROM pg_range r WHERE
-// c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid ) ORDER BY 3,4`
-// (pg_cast already exists; the NOT EXISTS subquery references pg_range, which
-// does not). The next DU-002 slice adds the `pg_range` virtual view
-// (`pg_range.h` schema, OID 3541). goopg defines no range types, so an empty
-// view should suffice; verify empirically.
+// The getCasts query reads the empty `pg_range` virtual view (slice 22 —
+// `pg_range.h` schema, OID 3541, NO oid column: rngtypid oid, rngsubtype oid,
+// rngmultitypid oid, rngcollation oid, rngsubopc oid, rngcanonical regproc(oid),
+// rngsubdiff regproc(oid)). goopg defines no range types, so the NOT EXISTS is
+// always true and the empty view satisfies the dump identically — confirmed
+// empirically by this test.
+// **Next blocker (precise, confirmed empirically by this test):** the getCasts
+// query now passes; pg_dump advances to getEventTriggers, which fails with
+// `relation "pg_event_trigger" does not exist`. The query is
+// `SELECT e.tableoid, e.oid, evtname, evtenabled, evtevent, evtowner,
+// array_to_string(array(select quote_literal(x) from unnest(evttags) as t(x)),
+// ', ') as evttags, e.evtfoid::regproc as evtfname FROM pg_event_trigger e
+// ORDER BY e.oid`. The next DU-002 slice adds the `pg_event_trigger` virtual
+// view (`pg_event_trigger.h` schema, OID 3466). goopg defines no event
+// triggers, so an empty view should suffice; verify empirically.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

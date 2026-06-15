@@ -1531,6 +1531,29 @@ object support.
         does not. Resume = slice 22: add the `pg_range` virtual view
         (`pg_range.h`, OID 3541). goopg defines no range types, so an empty view
         should suffice — verify empirically with the port test.
+      - **PROGRESS 2026-06-16 (loop #45):** **DU-002 slice 22 (`pg_range` view)
+        LANDED.** `getCasts` runs `SELECT tableoid, oid, castsource, casttarget,
+        castfunc, castcontext, castmethod FROM pg_cast c WHERE NOT EXISTS ( SELECT
+        1 FROM pg_range r WHERE c.castsource = r.rngtypid AND c.casttarget =
+        r.rngmultitypid ) ORDER BY 3,4`; `pg_cast` existed but the NOT EXISTS
+        subquery referenced `pg_range`, so it aborted at `relation "pg_range" does
+        not exist`. Added the empty `pg_range` virtual view
+        (`internal/catalog/catalog.go`, OID 3541, beside `pg_conversion`) with the
+        `pg_range.h` schema — note `pg_range` has **no** `oid` column; `rngtypid`
+        is the key (`rngtypid oid, rngsubtype oid, rngmultitypid oid, rngcollation
+        oid, rngsubopc oid, rngcanonical regproc(oid), rngsubdiff regproc(oid)`).
+        goopg defines no range types, so the NOT EXISTS is always true and the
+        **empty** view (0 rows) gives an identical dump — confirmed empirically.
+        build/gofmt/vet clean; catalog suite PASS; `TestPort_PgDumpConnectionSetup`
+        PASS. **Next blocker (precise, empirical):** `getCasts` passes; pg_dump
+        advances to getEventTriggers → `relation "pg_event_trigger" does not
+        exist` (`SELECT e.tableoid, e.oid, evtname, evtenabled, evtevent,
+        evtowner, array_to_string(array(select quote_literal(x) from
+        unnest(evttags) as t(x)), ', ') as evttags, e.evtfoid::regproc as evtfname
+        FROM pg_event_trigger e ORDER BY e.oid`). Resume = slice 23: add the
+        `pg_event_trigger` virtual view (`pg_event_trigger.h`, OID 3466). goopg
+        defines no event triggers, so an empty view should suffice — verify
+        empirically with the port test.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

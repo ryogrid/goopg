@@ -1,39 +1,41 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 21 (empty
-pg_conversion virtual view) COMPLETE this loop. NOTHING in flight;
-next loop starts on slice 22 (pg_range virtual view).
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 22 (empty
+pg_range virtual view) COMPLETE this loop. NOTHING in flight;
+next loop starts on slice 23 (pg_event_trigger virtual view).
 
-=== DONE (loop #44) — DU-002 slice 21 ===
-getConversions runs `SELECT tableoid, oid, conname, connamespace, conowner
-FROM pg_conversion` → aborted at `relation "pg_conversion" does not exist`.
-Fix (catalog-only, mirrors slice 20):
-- internal/catalog/catalog.go: added empty pg_conversion virtual view,
-  OID 2607 (pg_conversion.h), beside pg_default_acl. Cols: oid, conname
-  name, connamespace oid, conowner oid, conforencoding int4, contoencoding
-  int4, conproc oid, condefault bool. VirtualRows = nil. Although PG ships
-  ~130 built-in conversions, all are in pg_catalog and filtered out at
-  dump-out time (selectDumpableObject → DUMP_COMPONENT_NONE), so the EMPTY
-  view gives an identical dump — VERIFIED empirically.
-- Design doc 0110-0001 slice-21 block added; pgdump_connsetup_test.go
-  header updated (next blocker → pg_range); fix_plan loop #44 entry.
+=== DONE (loop #45) — DU-002 slice 22 ===
+getCasts runs `SELECT tableoid, oid, castsource, casttarget, castfunc,
+castcontext, castmethod FROM pg_cast c WHERE NOT EXISTS ( SELECT 1 FROM
+pg_range r WHERE c.castsource = r.rngtypid AND c.casttarget =
+r.rngmultitypid ) ORDER BY 3,4` → aborted at `relation "pg_range" does
+not exist`. Fix (catalog-only, mirrors slices 20/21):
+- internal/catalog/catalog.go: added empty pg_range virtual view,
+  OID 3541 (pg_range.h), beside pg_conversion. NOTE: pg_range has NO oid
+  column; rngtypid is the key. Cols: rngtypid oid, rngsubtype oid,
+  rngmultitypid oid, rngcollation oid, rngsubopc oid, rngcanonical
+  regproc(oid), rngsubdiff regproc(oid). VirtualRows = nil. goopg defines
+  no range types → NOT EXISTS always true → empty view gives identical
+  dump — VERIFIED empirically.
+- Design doc 0110-0001 slice-22 block added; pgdump_connsetup_test.go
+  header updated (next blocker → pg_event_trigger); fix_plan loop #45 entry.
 Gates: build/gofmt/vet clean; catalog suite PASS;
 TestPort_PgDumpConnectionSetup PASS. tpch-spotcheck N/A (additive empty
 virtual view; zero query-path/row-count risk).
 
-=== NEXT STEP — DU-002 slice 22 (pg_range virtual view) ===
-After slice 21, getConversions passes. pg_dump advances to getCasts →
-`relation "pg_range" does not exist` (VERIFIED empirically by
+=== NEXT STEP — DU-002 slice 23 (pg_event_trigger virtual view) ===
+After slice 22, getCasts passes. pg_dump advances to getEventTriggers →
+`relation "pg_event_trigger" does not exist` (VERIFIED empirically by
 TestPort_PgDumpConnectionSetup). The query is:
-  SELECT tableoid, oid, castsource, casttarget, castfunc, castcontext,
-  castmethod FROM pg_cast c WHERE NOT EXISTS ( SELECT 1 FROM pg_range r
-  WHERE c.castsource = r.rngtypid AND c.casttarget = r.rngmultitypid )
-  ORDER BY 3,4
-pg_cast already EXISTS; the NOT EXISTS subquery references pg_range, which
-does not. Add the pg_range virtual view in internal/catalog/catalog.go
-(beside pg_conversion), OID 3541 (pg_range.h CATALOG(pg_range,3541,...)).
-Cols (pg_range.h): rngtypid oid, rngsubtype oid, rngmultitypid oid,
-rngcollation oid, rngsubopc oid, rngcanonical regproc/oid, rngsubdiff
-regproc/oid. NOTE: pg_range has NO oid column (rngtypid is the key). goopg
-defines no range types → EMPTY view likely suffices — VERIFY empirically.
+  SELECT e.tableoid, e.oid, evtname, evtenabled, evtevent, evtowner,
+  array_to_string(array(select quote_literal(x) from unnest(evttags) as
+  t(x)), ', ') as evttags, e.evtfoid::regproc as evtfname FROM
+  pg_event_trigger e ORDER BY e.oid
+Add the pg_event_trigger virtual view in internal/catalog/catalog.go
+(beside pg_range), OID 3466 (pg_event_trigger.h CATALOG(pg_event_trigger,
+3466,...)). Cols (pg_event_trigger.h): oid, evtname name, evtevent name,
+evtowner oid, evtfoid oid, evtenabled "char", evttags text[]. goopg
+defines no event triggers → EMPTY view likely suffices — VERIFY
+empirically. NOTE the query uses unnest(evttags) + array_to_string; with
+0 rows that projection is never evaluated, so empty text[] col is fine.
 
 ORTHOGONAL PRE-EXISTING (track separately, irrelevant to empty pg_dump views):
 reading a text[] column back from the heap yields the BINARY array encoding
