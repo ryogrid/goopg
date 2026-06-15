@@ -1212,6 +1212,26 @@ object support.
         `pg_language` view → `relation "pg_language" does not exist`. Resume = add
         an empty `pg_language` virtual view as slice 8 (built-in PLs are filtered
         by `lanispl`, so empty is correct — only user PLs are dumped).
+      - **PROGRESS 2026-06-16 (loop #31):** **DU-002 slice 8 (`pg_language`
+        view) LANDED.** `getProcLangs` runs `SELECT tableoid, oid, lanname,
+        lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl,
+        acldefault('l', lanowner) AS acldefault, lanowner FROM pg_language WHERE
+        lanispl ORDER BY oid`; it aborted at `relation "pg_language" does not
+        exist`. Added the empty `pg_language` virtual view
+        (`internal/catalog/catalog.go`, OID 2612, beside `pg_transform`) with the
+        `pg_language.h` schema (`oid, lanname name, lanowner oid, lanispl bool,
+        lanpltrusted bool, lanplcallfoid oid, laninline oid, lanvalidator oid,
+        lanacl aclitem[]`). Empty by construction: `WHERE lanispl` filters out the
+        built-in `internal`/`c`/`sql` langs (lanispl=false, never dumped), and
+        goopg has no user PLs. `lanowner` typed `oid` so `acldefault('l',
+        lanowner)` resolves. Build/gofmt/vet clean; catalog + initdb suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS — `getProcLangs` now completes.
+        **Next blocker (precise):** `getOperators` runs `SELECT tableoid, oid,
+        oprname, oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid
+        AS oprcode FROM pg_operator`; goopg has no `pg_operator` view → `relation
+        "pg_operator" does not exist`. Resume = add an empty `pg_operator` virtual
+        view as slice 9 (built-in operators live in pg_catalog, filtered out by
+        namespace dumpability, so empty is correct — only user operators dumped).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

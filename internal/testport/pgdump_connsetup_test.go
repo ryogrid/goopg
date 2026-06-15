@@ -37,14 +37,16 @@ package testport
 // `getFuncs`/`getTables`/… LEFT-JOIN to diff stored vs. initial privileges
 // (slice 6), and the `pg_proc` columns `pronargs`/`proacl`/`proowner` plus the
 // empty `pg_cast`/`pg_transform` catalog views that `getFuncs` projects and
-// filters on (slice 7). **Next blocker (precise):** pg_dump's `getProcLangs`
-// runs `SELECT … lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator,
-// lanacl, acldefault('l', lanowner) AS acldefault, lanowner FROM pg_language
-// WHERE lanispl ORDER BY oid`, and goopg has no `pg_language` catalog view, so
-// the query fails with `relation "pg_language" does not exist`. Adding an empty
-// `pg_language` virtual view (built-in PLs are filtered out by `lanispl`, so an
-// empty view is correct — only user-installed PLs are dumped) is the following
-// DU-002 slice.
+// filters on (slice 7), and the empty `pg_language` virtual view that
+// `getProcLangs` reads (slice 8 — built-in PLs are filtered out by `WHERE
+// lanispl`, so an empty view is correct; only user-installed PLs are dumped).
+// **Next blocker (precise):** pg_dump's `getOperators` runs `SELECT tableoid,
+// oid, oprname, oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid
+// AS oprcode FROM pg_operator`, and goopg has no `pg_operator` catalog view, so
+// the query fails with `relation "pg_operator" does not exist`. Adding an empty
+// `pg_operator` virtual view (built-in operators live in pg_catalog and are
+// filtered out by namespace dumpability, so an empty view is correct — only
+// user-defined operators are dumped) is the following DU-002 slice.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.

@@ -3549,6 +3549,34 @@ func (c *InMemory) registerSystemTables() {
 	pgTransform.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_transform"] = pgTransform
 
+	// pg_language — procedural-language catalog (OID 2612). pg_dump's getProcLangs
+	// runs `SELECT tableoid, oid, lanname, lanpltrusted, lanplcallfoid, laninline,
+	// lanvalidator, lanacl, acldefault('l', lanowner) AS acldefault, lanowner FROM
+	// pg_language WHERE lanispl ORDER BY oid`. The `WHERE lanispl` predicate selects
+	// only user-installed procedural languages — the built-in internal/c/sql langs
+	// have lanispl=false and are never dumped. goopg installs no user PLs, so this
+	// view is correctly empty (0 rows). Schema matches PG's pg_language (oid,
+	// lanname name, lanowner oid, lanispl bool, lanpltrusted bool, lanplcallfoid oid,
+	// laninline oid, lanvalidator oid, lanacl aclitem[]); lanowner is typed oid so
+	// `acldefault('l', lanowner)` resolves. M0110-0001 (DU-002).
+	pgLanguage := &Table{
+		Schema: "pg_catalog", Name: "pg_language", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "lanname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "lanowner", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "lanispl", Type: Type{Name: "bool"}, Ordinal: 3},
+			{Name: "lanpltrusted", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "lanplcallfoid", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "laninline", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "lanvalidator", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "lanacl", Type: Type{Name: "aclitem[]"}, Ordinal: 8},
+		},
+		OID: 2612,
+	}
+	pgLanguage.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_language"] = pgLanguage
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

@@ -223,6 +223,24 @@ fixed one logical group per loop:
    lanispl` — goopg has no `pg_language` view (`relation "pg_language" does not
    exist`) — the following slice.
 
+8. **`pg_language` virtual view — DONE.** `getProcLangs` runs `SELECT tableoid,
+   oid, lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator, lanacl,
+   acldefault('l', lanowner) AS acldefault, lanowner FROM pg_language WHERE
+   lanispl ORDER BY oid`; goopg had no `pg_language` view, so the query aborted at
+   `relation "pg_language" does not exist`. Added the empty `pg_language` virtual
+   view (`internal/catalog/catalog.go`, OID 2612, beside `pg_transform`) with the
+   `pg_language.h` schema (`oid, lanname name, lanowner oid, lanispl bool,
+   lanpltrusted bool, lanplcallfoid oid, laninline oid, lanvalidator oid, lanacl
+   aclitem[]`). The view is **empty by construction**: the `WHERE lanispl`
+   predicate admits only user-installed procedural languages — the built-in
+   `internal`/`c`/`sql` languages have `lanispl = false` and are filtered out (PG
+   never dumps them), and goopg installs no user PLs. `lanowner` is typed `oid` so
+   `acldefault('l', lanowner)` resolves. After this slice `getProcLangs` completes;
+   the next blocker is `getOperators`' `SELECT tableoid, oid, oprname,
+   oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid AS oprcode FROM
+   pg_operator` — goopg has no `pg_operator` view (`relation "pg_operator" does not
+   exist`) — the following slice.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining
