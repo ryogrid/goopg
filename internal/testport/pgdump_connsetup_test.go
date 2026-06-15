@@ -80,17 +80,21 @@ package testport
 // of a scalar/ARRAY subquery resolves to an OuterColumnRef the executor
 // evaluates per outer row; the analyzer needed no change — it builds the SRF's
 // output columns but never resolves the arg expression).
+// The getForeignServers query reads the empty `pg_foreign_server` virtual view
+// (slice 19 — `pg_foreign_server.h` schema: oid, srvname name, srvowner oid,
+// srvfdw oid, srvtype text, srvversion text, srvacl aclitem[], srvoptions
+// text[]; empty by construction, like pg_foreign_data_wrapper, since goopg
+// defines no foreign servers; the correlated `pg_options_to_table(srvoptions)`
+// ARRAY subquery is never evaluated).
 // **Next blocker (precise, confirmed empirically by this test):** the
-// getForeignDataWrappers query now passes end-to-end; pg_dump advances to
-// getForeignServers and fails with `relation "pg_foreign_server" does not
-// exist`. The next DU-002 slice adds the empty `pg_foreign_server` virtual view
-// (`pg_foreign_server.h` schema: oid, srvname, srvowner, srvfdw, srvtype,
-// srvversion, srvacl, srvoptions text[]) — empty by construction, like
-// pg_foreign_data_wrapper, since goopg defines no foreign servers. That query
-// also expands `srvoptions` through the now-working correlated
-// `pg_options_to_table(srvoptions)` ARRAY subquery. After that, getUserMappings
-// (`pg_user_mappings`) follows. RUN this test after each add to find the REAL
-// next blocker rather than trusting the predicted one.
+// getForeignServers query now passes; because goopg has no foreign servers,
+// getUserMappings short-circuits without a catalog query, and pg_dump advances
+// to getDefaultACLs, which fails with `relation "pg_default_acl" does not
+// exist`. The next DU-002 slice adds the empty `pg_default_acl` virtual view
+// (`pg_default_acl.h` schema, OID 826: oid, defaclrole oid, defaclnamespace
+// oid, defaclobjtype "char", defaclacl aclitem[]) — empty by construction,
+// since goopg defines no default-ACL entries. RUN this test after each add to
+// find the REAL next blocker rather than trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.

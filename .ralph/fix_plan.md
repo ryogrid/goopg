@@ -1465,6 +1465,28 @@ object support.
         schema: oid, srvname, srvowner, srvfdw, srvtype, srvversion, srvacl,
         srvoptions text[]; empty by construction like pg_foreign_data_wrapper).
         Then getUserMappings (`pg_user_mappings`).
+      - **PROGRESS 2026-06-16 (loop #42):** **DU-002 slice 19
+        (`pg_foreign_server` view) LANDED.** `getForeignServers` runs `SELECT
+        tableoid, oid, srvname, srvowner, srvfdw, srvtype, srvversion, srvacl,
+        acldefault('S', srvowner) AS acldefault, array_to_string(ARRAY(SELECT …
+        FROM pg_options_to_table(srvoptions) …), …) AS srvoptions FROM
+        pg_foreign_server`; it aborted at `relation "pg_foreign_server" does not
+        exist`. Added the empty `pg_foreign_server` virtual view
+        (`internal/catalog/catalog.go`, OID 1417, beside
+        `pg_foreign_data_wrapper`) with the `pg_foreign_server.h` schema (`oid,
+        srvname name, srvowner oid, srvfdw oid, srvtype text, srvversion text,
+        srvacl aclitem[], srvoptions text[]`). Empty by construction: goopg
+        defines no foreign servers (no CREATE SERVER); the correlated
+        `pg_options_to_table(srvoptions)` ARRAY subquery (slice 18, already
+        working) is never evaluated — no new SRF work. build/gofmt/vet clean;
+        catalog suite PASS; `TestPort_PgDumpConnectionSetup` PASS. **Next blocker
+        (precise, empirical — NOT the predicted pg_user_mappings):**
+        `getForeignServers` passes; because goopg has no foreign servers,
+        getUserMappings short-circuits with no catalog query, and pg_dump
+        advances to getDefaultACLs → `relation "pg_default_acl" does not exist`.
+        Resume = slice 20: add the empty `pg_default_acl` virtual view
+        (`pg_default_acl.h`, OID 826: oid, defaclrole oid, defaclnamespace oid,
+        defaclobjtype "char", defaclacl aclitem[]; empty by construction).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

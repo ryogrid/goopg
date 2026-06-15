@@ -3782,6 +3782,37 @@ func (c *InMemory) registerSystemTables() {
 	pgForeignDataWrapper.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_foreign_data_wrapper"] = pgForeignDataWrapper
 
+	// pg_foreign_server — foreign-server catalog (OID 1417). pg_dump's
+	// getForeignServers runs `SELECT tableoid, oid, srvname, srvowner,
+	// srvfdw, srvtype, srvversion, srvacl,
+	// acldefault('S', srvowner) AS acldefault,
+	// array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' ||
+	// quote_literal(option_value) FROM pg_options_to_table(srvoptions) ORDER BY
+	// option_name), E',\n    ') AS srvoptions FROM pg_foreign_server` after
+	// getForeignDataWrappers. goopg defines no foreign servers (no CREATE SERVER),
+	// so this view is correctly empty (0 rows); the correlated
+	// pg_options_to_table(srvoptions) ARRAY subquery (slice 18) is therefore never
+	// evaluated. Schema matches PG's pg_foreign_server (pg_foreign_server.h):
+	// oid, srvname name, srvowner oid, srvfdw oid (FK to pg_foreign_data_wrapper),
+	// srvtype text, srvversion text, srvacl aclitem[], srvoptions text[].
+	// M0110-0001 (DU-002 slice 19).
+	pgForeignServer := &Table{
+		Schema: "pg_catalog", Name: "pg_foreign_server", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "srvname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "srvowner", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "srvfdw", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "srvtype", Type: Type{Name: "text"}, Ordinal: 4},
+			{Name: "srvversion", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "srvacl", Type: Type{Name: "aclitem[]"}, Ordinal: 6},
+			{Name: "srvoptions", Type: Type{Name: "text[]"}, Ordinal: 7},
+		},
+		OID: 1417,
+	}
+	pgForeignServer.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_foreign_server"] = pgForeignServer
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

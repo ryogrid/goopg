@@ -465,6 +465,27 @@ fixed one logical group per loop:
     subquery, so the next slice is purely the empty `pg_foreign_server` virtual
     view; `getUserMappings` (`pg_user_mappings`) follows.
 
+19. **`pg_foreign_server` virtual view — DONE.** `getForeignServers` runs
+    `SELECT tableoid, oid, srvname, srvowner, srvfdw, srvtype, srvversion,
+    srvacl, acldefault('S', srvowner) AS acldefault,
+    array_to_string(ARRAY(SELECT quote_ident(option_name) || ' ' ||
+    quote_literal(option_value) FROM pg_options_to_table(srvoptions) ORDER BY
+    option_name), E',\n    ') AS srvoptions FROM pg_foreign_server`; goopg had
+    no queryable `pg_foreign_server` relation, so the query aborted at
+    `relation "pg_foreign_server" does not exist`. Added the empty
+    `pg_foreign_server` virtual view (`internal/catalog/catalog.go`, OID 1417,
+    beside `pg_foreign_data_wrapper`) with the `pg_foreign_server.h` schema
+    (`oid, srvname name, srvowner oid, srvfdw oid, srvtype text, srvversion
+    text, srvacl aclitem[], srvoptions text[]`); goopg defines no foreign
+    servers (no `CREATE SERVER`), so it is correctly empty (0 rows) and the
+    correlated `pg_options_to_table(srvoptions)` ARRAY subquery (slice 18,
+    already working) is never evaluated — no new SRF work. After this slice
+    `getForeignServers` passes; pg_dump advances and — because goopg has no
+    foreign servers, `getUserMappings` short-circuits without a catalog query —
+    the **new** blocker is `getDefaultACLs`: `relation "pg_default_acl" does
+    not exist`. An empty `pg_default_acl` virtual view (OID 826) is the next
+    slice.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining
