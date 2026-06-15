@@ -1,47 +1,36 @@
-Task: M0110-0001 — pg_dump connection-setup compatibility (enabler for DU-002+).
-COMPLETE + committed (loop #22). Next loop starts clean unless picking up the
-resume candidate below.
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity, slice 1: pg_roles.oid.
+COMPLETE + committed (loop #23). Next loop resumes at the acldefault() blocker.
 
-=== WHAT LANDED (loop #22) ===
-An empirical probe (real `pg_dump --no-sync postgres` vs a live goopg server)
-showed pg_dump aborting in setup_connection() BEFORE any catalog query. Closed
-two gap classes so it now completes the handshake and reaches its first catalog
-query:
-- 3 unregistered GUCs added as accepted no-ops: synchronize_seqscans,
-  transaction_timeout (PG17+), row_security (config/defaults.go + sample; boot
-  on/0/on per guc_tables.c).
-- `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`: the server
-  simple-query string fast-path mis-routed `SET TRANSACTION …` to handleSet
-  (`unrecognized configuration parameter "TRANSACTION"`). New query.go case
-  routes `SET [LOCAL|SESSION] TRANSACTION …` / `SET SESSION CHARACTERISTICS …`
-  to the executor (existing SetTransactionStmt, M0096-0002). Parser's
-  transaction-mode loop now consumes the comma (it stopped at it).
+=== WHAT LANDED (loop #23) ===
+pg_dump's collectRoleNames issues
+  SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1   (pg_dump.c:10548)
+to build its role-oid → name map. goopg's pg_roles virtual view lacked an oid
+column, aborting the dump right after connection setup. Added oid at ordinal 0
+carrying OID 10 (BOOTSTRAP_SUPERUSERID, the postgres superuser; pg_authid.dat),
+shifting rolname/rolsuper/rolcanlogin to ordinals 1-3.
+
+Empirical probe (real pg_dump --no-sync postgres vs live goopg) confirms pg_dump
+now passes collectRoleNames and advances to getNamespaces.
 
 Files:
-- internal/config/defaults.go (3 GUCs), internal/config/postgresql.conf.sample
-- internal/server/query.go (SET TRANSACTION routing case)
-- internal/parser/parser.go (parseSet transaction-mode comma)
-- tests: internal/testport/pgdump_connsetup_test.go
-  (TestPort_PgDumpConnectionSetup), internal/config/pgdump_gucs_test.go,
-  internal/parser/set_transaction_test.go
-- docs/design/0110-0001-pg-dump-tap-port.md (Connection-setup section)
-- .ralph/fix_plan.md (loop #22 PROGRESS), .ralph/deferral_ledger.md
+- internal/catalog/catalog.go (pgRoles Columns + VirtualRows)
+- internal/catalog/catalog_test.go (TestPgCatalogBootstrapViews: oid assertions)
+- internal/testport/pgdump_connsetup_test.go (next-blocker marker comment)
+- docs/design/0110-0001-pg-dump-tap-port.md (catalog-parity slice list)
 
-Key symbols: BuildDefaultRegistry GUC registrations; handleQuery SET-dispatch
-switch (query.go); parseSet KwTransaction loop; SetTransactionStmt/setTransactionOp.
+Key symbols: BuildDefaultRegistry pgRoles (catalog.go); collectRoleNames
+(pg_dump.c); TestPort_PgDumpConnectionSetup (logs remaining gap).
 
-Gates: build/gofmt/vet clean; config + parser + server suites PASS; pg_dump 001
-+ new connection-setup test PASS. TPC-H spotcheck N/A (no query-path change;
-additive GUCs + SET-dispatch routing only).
+Gates: build/gofmt/vet clean; catalog + testport (TestPgCatalog*, TestSyntax_
+Catalog_PgRoles, TestPort_PgDump*) PASS. No query-path change → TPC-H N/A.
 
 === NEXT STEP (resume candidate) ===
-DU-002+ catalog-view parity. PRECISE first blocker: getRoles
-`SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1` fails — goopg's
-pg_roles view lacks an `oid` column. Add it, then walk setup_connection's query
-order (getTablespaces/getNamespaces/getTypes/getTables…). Each catalog query is
-a small fix but there are many — bound to one logical group per loop.
-Other open (all larger): M0110-0003 AC-003 003_check feature tiers (index AMs /
-box/int4range/int4[] / EXTERNAL TOAST / multi-DB), 005_opclass_damage (needs
-runtime pg_amproc write goopg lacks); M0110-0002 002_save_fullpage (PG-format
-heap WAL FPI, high blast radius); M0095-0003 recvlogical (logical decoding);
-M0117-0006/7/8 (Effort-L CLOG rewrites, dedicated session).
+DU-002 slice 2: getNamespaces. pg_dump runs
+  SELECT n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl,
+         acldefault('n', n.nspowner) AS acldefault FROM pg_namespace n
+→ fails: "function acldefault does not exist". Need: acldefault() builtin
+(2-arg: type-char, owner-oid → aclitem[]) + pg_namespace columns tableoid,
+nspowner, nspacl. Then walk getTypes/getTables/etc. one group per loop.
+Other open (larger): M0110-0003 AC-003 003_check feature tiers; M0110-0002
+002_save_fullpage (PG-format heap WAL FPI); M0095-0003 recvlogical; M0117-0006/7/8
+(Effort-L CLOG rewrites, dedicated session).

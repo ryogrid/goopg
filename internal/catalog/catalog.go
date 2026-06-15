@@ -2172,15 +2172,21 @@ func (c *InMemory) registerSystemTables() {
 		Schema: "pg_catalog",
 		Name:   "pg_roles",
 		Columns: []Column{
-			{Name: "rolname", Type: Type{Name: "text"}, Ordinal: 0},
-			{Name: "rolsuper", Type: Type{Name: "text"}, Ordinal: 1},
-			{Name: "rolcanlogin", Type: Type{Name: "text"}, Ordinal: 2},
+			// oid first: pg_dump's collectRoleNames issues
+			// `SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1`
+			// to build its role-oid → name map (pg_dump.c:10548).
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "rolname", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "rolsuper", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "rolcanlogin", Type: Type{Name: "text"}, Ordinal: 3},
 		},
 		OID:     1260, // upstream's AuthIdRelationId
 		Virtual: true,
 	}
 	pgRoles.VirtualRows = func() [][]string {
-		return [][]string{{"postgres", "t", "t"}}
+		// OID 10 = BOOTSTRAP_SUPERUSERID (postgres superuser),
+		// per postgres/src/include/catalog/pg_authid.dat.
+		return [][]string{{"10", "postgres", "t", "t"}}
 	}
 	c.tables["pg_catalog.pg_roles"] = pgRoles
 

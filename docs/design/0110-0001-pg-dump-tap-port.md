@@ -77,10 +77,20 @@ unreachable. Two classes of gap were closed:
    the comma, leaving trailing tokens).
 
 After this slice pg_dump completes `setup_connection()` and proceeds into its
-catalog-dump phase. The next blocker is catalog-view parity: the first catalog
-query `SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1` (getRoles) fails
-because goopg's `pg_roles` view lacks an `oid` column — the start of the
-DU-002+ catalog work below.
+catalog-dump phase, where it hits catalog-view parity gaps (DU-002+ below),
+fixed one logical group per loop:
+
+1. **`pg_roles.oid` (collectRoleNames) — LANDED.** pg_dump's `collectRoleNames`
+   issues `SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1`
+   (`pg_dump.c:10548`) to build its role-oid → name map. goopg's `pg_roles`
+   virtual view (`internal/catalog/catalog.go`) gained an `oid` column at
+   ordinal 0 carrying OID 10 (`BOOTSTRAP_SUPERUSERID`, the `postgres`
+   superuser, per `pg_authid.dat`).
+2. **`acldefault()` (getNamespaces) — NEXT.** pg_dump then runs
+   `SELECT n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl,
+   acldefault('n', n.nspowner) AS acldefault FROM pg_namespace n`, which fails
+   with `function acldefault does not exist`. Needs the `acldefault()` builtin
+   plus `pg_namespace` columns (`tableoid`, `nspowner`, `nspacl`).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -106,6 +116,7 @@ first, per the fix_plan action).
 
 `go test -v -run TestPort_PgDump001Basic ./internal/testport/` → PASS.
 `go test -v -run TestPort_PgDumpConnectionSetup ./internal/testport/` → PASS
-(passes connection setup; logs the pg_roles.oid gap).
+(passes connection setup + collectRoleNames; logs the next gap: `acldefault()`
+in getNamespaces).
 `go test ./internal/config/ ./internal/parser/ ./internal/server/` → PASS.
 `go run ./cmd/gen-oracle-port-status` regenerates the status markdown.

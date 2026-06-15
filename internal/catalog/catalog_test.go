@@ -164,6 +164,22 @@ func TestPgCatalogBootstrapViews(t *testing.T) {
 	if len(got) != 1 || got[0][1] != "items" {
 		t.Errorf("pg_tables rows=%v want one (public, items, postgres)", got)
 	}
+
+	// pg_dump's collectRoleNames runs
+	// `SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1`
+	// (pg_dump.c:10548), so pg_roles must expose oid as its first
+	// column carrying the postgres superuser's OID 10.
+	roles, _ := c.LookupTable(parser.ObjectName{Name: "pg_roles"})
+	if roles.Columns[0].Name != "oid" || roles.Columns[0].Type.Name != "oid" {
+		t.Errorf("pg_roles col0=%+v want {oid oid}", roles.Columns[0])
+	}
+	if roles.Columns[1].Name != "rolname" {
+		t.Errorf("pg_roles col1=%s want rolname", roles.Columns[1].Name)
+	}
+	rrows := roles.VirtualRows()
+	if len(rrows) != 1 || rrows[0][0] != "10" || rrows[0][1] != "postgres" {
+		t.Errorf("pg_roles rows=%v want one (10, postgres, t, t)", rrows)
+	}
 }
 
 // TestPgClassExposesRelNatts pins the M0103-0008 rung-14 surface:
@@ -713,7 +729,6 @@ func TestPgBackendMemoryContextsPathArrayValues(t *testing.T) {
 			count, cacheLevel, cacheElem)
 	}
 }
-
 
 // TestViewConstraintDepTracking verifies the RegisterViewConstraintDep,
 // ViewsDependingOnConstraint, UnregisterViewConstraintDeps, and

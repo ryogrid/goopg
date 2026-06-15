@@ -28,8 +28,9 @@ package testport
 // This test drives the real pg_dump binary against a live goopg server and
 // asserts the connection-setup handshake no longer fails: any non-zero exit
 // must NOT carry a setup_connection error signature. The full dump still fails
-// later on catalog-view parity (the next gap is `pg_roles` lacking an `oid`
-// column — getRoles), which is the broad DU-002+ work tracked separately; this
+// later on catalog-view parity (collectRoleNames' `pg_roles.oid` gap is now
+// closed; the next gap is the `acldefault()` function missing in getNamespaces),
+// which is the broad DU-002+ work tracked separately; this
 // test is the regression guard for the connection-setup slice and a marker for
 // the next blocker. It auto-tightens (asserts exit 0) once a clean dump works.
 //
