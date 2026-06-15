@@ -957,6 +957,32 @@ fixed one logical group per loop:
     user tables, and the reloptions `ARRAY` subquery yields one empty element.
     The next slice must populate `pg_attribute` columns in the dump path and
     suppress the empty reloption.
+  - **Slice 45 — typed unnest elements join catalog columns
+    (`internal/executor/operators_from_unnest.go`).** `getTableAttrs` reads
+    columns via `FROM unnest('{16403}'::oid[]) AS src(tbloid) JOIN pg_attribute
+    a ON src.tbloid = a.attrelid`. The join matched **nothing** because
+    `expandArrayDatum` returns every array element as a text `KindString`
+    (`s:16403`), whose `datumKey` differs from the `KindInt` key a catalog `oid`
+    column (`pg_attribute.attrelid`, written via `NewIntDatum`) derives — so the
+    hash join bucketed the two sides apart. `coerceUnnestElem` now casts each
+    element to its declared output-schema type (oid/xid/int/float/numeric/bool
+    family only; text stays a string; a cast failure falls back to the raw
+    element) before the row is materialised, in **both** the single-arg and
+    multi-arg unnest paths. With this the join key lines up and `pg_attribute`
+    rows flow. Guards: `executor.TestCoerceUnnestElem_*` (join-key parity,
+    text-unchanged, NULL pass-through, bad-value fallback).
+  - **Slice 46 (NEXT) — unnest-join right-side projection offset.** With the key
+    fixed, the join now matches but pg_dump fails with `invalid column numbering
+    in table "foo"`: it requires each table's rows ordered by `attnum`, sequential
+    from 1. Empirically the join *condition* resolves `a.attrelid` correctly
+    (combined index 1) but the *projection* of right-side columns is **not shifted
+    by the 1-column unnest (left) prefix** — `a.attname` resolves to combined
+    index 1 (returns `attrelid`=16403) and `a.attnum` to combined index 4
+    (returns `attlen`=4 for `integer`). A direct `pg_attribute` scan returns the
+    correct `1=id, 2=name`, so the bug is isolated to right-side column-ref
+    resolution in a join whose left input is `FromUnnest` (sibling-path
+    disagreement: join-condition resolution shifts, projection resolution does
+    not). This is the next DU-002 slice.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

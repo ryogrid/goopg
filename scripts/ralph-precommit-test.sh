@@ -35,14 +35,22 @@ set -euo pipefail
 # `go list ./...` covers the whole module and relative paths resolve.
 cd "$(dirname "$0")/.."
 
-# Scope selector. "full" (default) runs the unit/component suite (Part 1) AND
-# the pgbench smoke (Part 2). "smoke" runs ONLY the pgbench smoke. The
-# .githooks/pre-commit hook uses "smoke" so EVERY commit pays the ~2-3 min
-# pgbench cost — the CI-parity workload the Ralph loop was otherwise blind to
-# (it only ran targeted `go test`, never pgbench, so the TPC-B concurrency
-# regression class slipped straight through to CI). The ~10 min unit suite is
-# still covered by CI and explicit agent runs, so the hook skips it to keep
-# per-commit latency acceptable. Override: RALPH_PRECOMMIT_SCOPE=smoke|full.
+# Scope selector — three values, chosen to avoid running the same work twice
+# across the manual pre-commit step and the commit hook:
+#
+#   full  (default) Part 1 (unit/component suite) AND Part 2 (pgbench smoke).
+#   units           Part 1 only — the agent's mandatory manual pre-commit run.
+#   smoke           Part 2 only — what .githooks/pre-commit runs on EVERY commit.
+#
+# Division of labour (no duplication): the agent runs `units` by hand to clear
+# the ~10 min unit suite once per change; the commit hook runs `smoke` (~2-3 min
+# pgbench) on every commit. Together that is full CI parity with each part run
+# once. `full` remains for one-shot local runs (e.g. exercising pgbench yourself
+# before committing a concurrency/executor change) — using it means the hook's
+# `smoke` re-runs pgbench, which is harmless defense-in-depth, not required.
+# The pgbench smoke is the CI-parity workload the Ralph loop was otherwise blind
+# to (it only ran targeted `go test`, so the TPC-B concurrency regression class
+# slipped straight through to CI). Override: RALPH_PRECOMMIT_SCOPE=units|smoke|full.
 SCOPE="${RALPH_PRECOMMIT_SCOPE:-full}"
 
 # --------------------------------------------------------------------------- #
@@ -90,6 +98,9 @@ fi  # end Part 1 (skipped when SCOPE=smoke)
 # Mirrors the test.yml steps: build goopg, init a data dir, start the server,
 # `pgbench -i` (load), then the standard / -N / -S workloads.
 # --------------------------------------------------------------------------- #
+if [ "$SCOPE" = "units" ]; then
+  echo "ralph-precommit-test.sh: SCOPE=units — skipping Part 2 (pgbench smoke); the commit hook runs it"
+else
 
 # Pick a listen port that is actually free. A fixed port is unsafe here: a
 # stray goopg/PostgreSQL left over from a crashed run (or a concurrent loop) may
@@ -214,6 +225,8 @@ pgbench -i              -h 127.0.0.1 -p "$PORT" -U postgres postgres
 pgbench -T 30 -c 2 -j 2 -P 5    -h 127.0.0.1 -p "$PORT" -U postgres postgres
 pgbench -T 30 -c 2 -j 2 -P 5 -N -h 127.0.0.1 -p "$PORT" -U postgres postgres
 pgbench -T 30 -c 2 -j 2 -P 5 -S -h 127.0.0.1 -p "$PORT" -U postgres postgres
+
+fi  # end Part 2 (skipped when SCOPE=units)
 
 # --------------------------------------------------------------------------- #
 # Part 3 — optional plan-diff gate (RALPH_PRECOMMIT_PLAN_DIFF=1 to enable)

@@ -182,13 +182,21 @@ ran only targeted `go test` and never the pgbench workload, so the pgbench TPC-B
 concurrency-regression class reached CI undetected. **Do NOT bypass with
 `git commit --no-verify`** — that re-opens exactly that blind spot.
 
-The hook runs the pgbench smoke only (the ~10 min unit suite stays in CI and in
-the full gate below). Before you create **any** commit, you MUST still run the
-full unit/component suite yourself, and it MUST pass cleanly:
+The hook runs the **pgbench smoke only**. So you do NOT run pgbench by hand —
+that would run it twice (once manually, once in the hook). Your manual,
+mandatory pre-commit job is the **unit/component suite**, which the hook does
+not run; it MUST pass cleanly before you commit:
 
 ```bash
-scripts/ralph-precommit-test.sh        # full scope: unit/component suite + pgbench smoke
+RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh   # unit/component suite only
 ```
+
+Division of labour: `units` (you, once per change) + the hook's `smoke` (every
+commit) = full CI parity, each part run once. Run the `full` scope
+(`scripts/ralph-precommit-test.sh`, unit suite + pgbench) only when you want to
+exercise pgbench locally before committing — e.g. a concurrency / executor /
+storage change; the hook's `smoke` then re-runs pgbench as harmless
+defense-in-depth.
 
 For executor/planner/codec changes, additionally run the TPC-H silent-regression
 spot-check (fresh capped server + Q12/Q13 canonical row counts, ~1 min; skips

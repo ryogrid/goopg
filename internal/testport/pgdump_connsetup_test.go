@@ -223,13 +223,21 @@ package testport
 // runs to completion (exit 0)** — connection setup + the full catalog dump
 // pipeline work end-to-end. The test is promoted to assert the table's archive
 // entry (CREATE TABLE / ALTER TABLE OWNER / COPY) is emitted.
-// **Next blocker (slice 45, confirmed empirically by this dump):** the emitted
-// `CREATE TABLE public.foo (\n)` has an EMPTY column list (no `id integer,
-// name text`) plus a malformed `WITH (""='')` reloptions clause. getTableAttrs'
-// per-table pg_attribute query returns no rows for user tables, and the
-// reloptions ARRAY subquery yields one empty element. The next DU-002 slice
-// must populate pg_attribute columns in the dump path and suppress the empty
-// reloption.
+// Slice 45 made typed unnest elements join catalog columns
+// (internal/executor/operators_from_unnest.go): getTableAttrs reads columns via
+// `FROM unnest('{oid}'::oid[]) AS src(tbloid) JOIN pg_attribute a ON
+// src.tbloid = a.attrelid`, but expandArrayDatum returns each element as a text
+// KindString whose datumKey differs from the KindInt key an oid catalog column
+// derives, so the hash join matched nothing (empty column list above).
+// coerceUnnestElem now casts each element to its declared output type, so the
+// join key lines up and pg_attribute rows flow.
+// **Next blocker (slice 46, confirmed empirically by this dump):** pg_dump now
+// fails with `invalid column numbering in table "foo"` (exit 1). The join
+// condition resolves a.attrelid correctly but the PROJECTION of right-side
+// columns is not shifted by the 1-column unnest (left) prefix — a.attname
+// returns attrelid (16403) and a.attnum returns attlen (4). A direct
+// pg_attribute scan returns the correct 1=id/2=name, so the bug is isolated to
+// right-side column-ref resolution in a join whose left input is FromUnnest.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
