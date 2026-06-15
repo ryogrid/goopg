@@ -1701,6 +1701,28 @@ object support.
         pg_shseclabel; goopg has no SECURITY LABEL → 0 rows). Cols the query
         needs: label text, provider text, classoid oid, objoid oid, objsubid int4
         (full view also carries objtype text, objnamespace oid, objname text).
+      - **PROGRESS 2026-06-16 (loop #54):** **DU-002 slice 31 LANDED.** Empty
+        `pg_seclabels` virtual view (unused OID 3597) in
+        `internal/catalog/catalog.go` beside `pg_amproc` — pg_dump's `getSecLabels`
+        `SELECT label, provider, classoid, objoid, objsubid FROM
+        pg_catalog.pg_seclabels ORDER BY classoid, objoid, objsubid` now resolves
+        (goopg has no SECURITY LABEL → 0 rows). `pg_seclabels` is a VIEW (no oid
+        column). Cols: objoid oid, classoid oid, objsubid int4, objtype text,
+        objnamespace oid, objname text, provider text, label text. build/gofmt/vet
+        clean; catalog suite PASS; `TestPort_PgDumpConnectionSetup` PASS.
+        **Next blocker (precise, empirical):** pg_dump advances to sequence
+        collection (`getSequences`) → `relation "pg_sequence" does not exist`
+        (`SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement,
+        seqmax, seqmin, seqcache, seqcycle, last_value, is_called FROM
+        pg_catalog.pg_sequence, pg_get_sequence_data(seqrelid) ORDER BY
+        seqrelid`). Resume = slice 32: `pg_sequence` is a REAL catalog (one row
+        per sequence relation) joined with the SRF `pg_get_sequence_data`. The
+        slice must FIRST verify whether goopg supports CREATE SEQUENCE — if no
+        sequences, an empty `pg_sequence` view (0 rows) suffices, BUT the
+        `pg_get_sequence_data(seqrelid)` function call must ALSO resolve (not a
+        view). pg_sequence cols (`pg_sequence.h`): seqrelid oid, seqtypid oid,
+        seqstart int8, seqincrement int8, seqmax int8, seqmin int8, seqcache int8,
+        seqcycle bool.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

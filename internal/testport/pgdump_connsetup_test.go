@@ -152,16 +152,28 @@ package testport
 // amopmethod oid, amopsortfamily oid. pg_amproc cols (pg_amproc.h): oid,
 // amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum int2,
 // amproc regproc.
+// (DU-002 slice 31) The empty `pg_seclabels` virtual view (OID 3597) is now
+// defined in internal/catalog/catalog.go, so getSecLabels' query `SELECT label,
+// provider, classoid, objoid, objsubid FROM pg_catalog.pg_seclabels ORDER BY
+// classoid, objoid, objsubid` no longer errors (goopg supports no SECURITY LABEL
+// → 0 rows). pg_seclabels is a system VIEW (no oid column); cols: objoid oid,
+// classoid oid, objsubid int4, objtype text, objnamespace oid, objname text,
+// provider text, label text.
 // **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// advances to security-label collection (getSecLabels) and fails with
-// `relation "pg_seclabels" does not exist`. Query:
-//   SELECT label, provider, classoid, objoid, objsubid
-//   FROM pg_catalog.pg_seclabels ORDER BY classoid, objoid, objsubid
-// The next DU-002 slice adds the empty `pg_seclabels` virtual view — in stock PG
-// this is a system view over pg_seclabel + pg_shseclabel; goopg supports no
-// SECURITY LABEL, so 0 rows is correct. Cols the query needs: label text,
-// provider text, classoid oid, objoid oid, objsubid int4 (full view schema also
-// carries objtype text, objnamespace oid, objname text).
+// advances to sequence collection (getSequences) and fails with
+// `relation "pg_sequence" does not exist`. Query:
+//   SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement,
+//     seqmax, seqmin, seqcache, seqcycle, last_value, is_called
+//   FROM pg_catalog.pg_sequence, pg_get_sequence_data(seqrelid) ORDER BY seqrelid
+// pg_sequence is a real catalog (one row per sequence relation) joined with the
+// set-returning function pg_get_sequence_data (runtime last_value/is_called).
+// The next DU-002 slice must decide: if goopg has no sequence support an empty
+// `pg_sequence` view (0 rows) suffices — BUT the LATERAL pg_get_sequence_data
+// call must also resolve (a function, not a view). Verify whether goopg supports
+// CREATE SEQUENCE before assuming 0 rows; if sequences exist, the view + function
+// must return real data. pg_sequence cols (pg_sequence.h): seqrelid oid,
+// seqtypid oid, seqstart int8, seqincrement int8, seqmax int8, seqmin int8,
+// seqcache int8, seqcycle bool.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

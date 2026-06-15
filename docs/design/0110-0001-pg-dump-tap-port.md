@@ -709,12 +709,29 @@ fixed one logical group per loop:
     `pg_amproc` (OID 2603, `pg_amproc.h`): oid, amprocfamily oid, amproclefttype
     oid, amprocrighttype oid, amprocnum int2, amproc regproc. After this slice
     the dependency-collection UNION passes; the **new** blocker is `relation
-    "pg_seclabels" does not exist` (security-label collection `getSecLabels`:
-    `SELECT label, provider, classoid, objoid, objsubid FROM
-    pg_catalog.pg_seclabels ORDER BY classoid, objoid, objsubid`). In stock PG
-    `pg_seclabels` is a system view over `pg_seclabel` + `pg_shseclabel`; goopg
-    supports no SECURITY LABEL, so an empty-view slice (cols: label text,
-    provider text, classoid oid, objoid oid, objsubid int4) is next.
+    "pg_seclabels" does not exist` (security-label collection `getSecLabels`).
+
+31. **`pg_seclabels` empty virtual view — DONE.** pg_dump's `getSecLabels`
+    issues `SELECT label, provider, classoid, objoid, objsubid FROM
+    pg_catalog.pg_seclabels ORDER BY classoid, objoid, objsubid` to dump
+    `SECURITY LABEL` statements. In stock PG `pg_seclabels` is a system view over
+    `pg_seclabel` + `pg_shseclabel`; goopg supports no SECURITY LABEL, so an empty
+    view (0 rows) is correct. `pg_seclabels` is a VIEW (no oid column), registered
+    under an unused virtual OID (3597) beside `pg_amproc` in
+    `internal/catalog/catalog.go`. Cols (full upstream view schema): objoid oid,
+    classoid oid, objsubid int4, objtype text, objnamespace oid, objname text,
+    provider text, label text. After this slice security-label collection passes;
+    the **new** blocker is `relation "pg_sequence" does not exist` (sequence
+    collection `getSequences`: `SELECT seqrelid, format_type(seqtypid, NULL),
+    seqstart, seqincrement, seqmax, seqmin, seqcache, seqcycle, last_value,
+    is_called FROM pg_catalog.pg_sequence, pg_get_sequence_data(seqrelid) ORDER BY
+    seqrelid`). `pg_sequence` is a real catalog (one row per sequence relation)
+    joined with the set-returning function `pg_get_sequence_data`. The next slice
+    must decide: if goopg has no sequence support an empty `pg_sequence` view (0
+    rows) suffices, BUT the `pg_get_sequence_data(seqrelid)` call must also resolve
+    (a function, not a view) — verify CREATE SEQUENCE support before assuming 0
+    rows. pg_sequence cols (`pg_sequence.h`): seqrelid oid, seqtypid oid, seqstart
+    int8, seqincrement int8, seqmax int8, seqmin int8, seqcache int8, seqcycle bool.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

@@ -4109,6 +4109,34 @@ func (c *InMemory) registerSystemTables() {
 	pgAmproc.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_amproc"] = pgAmproc
 
+	// pg_seclabels — system view exposing security labels (a join over the
+	// pg_seclabel + pg_shseclabel catalogs). After getDependencies, pg_dump's
+	// getSecLabels issues:
+	//   SELECT label, provider, classoid, objoid, objsubid
+	//   FROM pg_catalog.pg_seclabels ORDER BY classoid, objoid, objsubid
+	// to dump SECURITY LABEL statements. goopg supports no SECURITY LABEL, so an
+	// empty view (0 rows) is correct, identical to a stock PG cluster with no
+	// security labels. pg_seclabels is a VIEW, so it has no oid column; we register
+	// it under an unused virtual OID (3597). The full upstream view schema also
+	// exposes objtype/objnamespace/objname, included here for parity with
+	// catalog-introspection queries. M0110-0001 (DU-002 slice 31).
+	pgSeclabels := &Table{
+		Schema: "pg_catalog", Name: "pg_seclabels", Virtual: true,
+		Columns: []Column{
+			{Name: "objoid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "objsubid", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "objtype", Type: Type{Name: "text"}, Ordinal: 3},
+			{Name: "objnamespace", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "objname", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "provider", Type: Type{Name: "text"}, Ordinal: 6},
+			{Name: "label", Type: Type{Name: "text"}, Ordinal: 7},
+		},
+		OID: 3597,
+	}
+	pgSeclabels.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_seclabels"] = pgSeclabels
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {
