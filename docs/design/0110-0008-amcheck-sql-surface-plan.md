@@ -1,6 +1,6 @@
 # 0110-0008 — amcheck SQL surface wiring plan (M0110-0003)
 
-**Status:** planned (execute-ready; blocked on a clean working tree)
+**Status:** S1+S2 landed (worktree `m0110-0003-amcheck-sql-surface`); S3–S5 remain (merge blocked on a clean working tree)
 **Scope:** the `CREATE EXTENSION amcheck` + SRF SQL surface that wires the
 already-committed `internal/amcheck` engine to the wire protocol and promotes the
 deferred `AC-002`…`AC-005` pg_amcheck TAP tests.
@@ -140,8 +140,39 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
 `postgres/src/include/catalog/pg_extension.h`. Validate against PG 18.3 via
 `postgres/local_install/bin/pg_amcheck` + `psql \dx`.
 
+## Implementation status
+
+- **Slices S1 + S2 — LANDED** (worktree `m0110-0003-amcheck-sql-surface`, off clean
+  HEAD `b8dd6403`; isolated from the main-tree foreign gen-column WIP per
+  `worktree_isolation_escapes_foreign_wip_block`). Delivered:
+  - **S1 (DDL):** `parser.CreateExtensionStmt` + `parseCreateExtensionTail`
+    (`internal/parser/ast.go`, `ddl.go`) parsing
+    `CREATE EXTENSION [IF NOT EXISTS] name [WITH] [SCHEMA s] [VERSION v] [CASCADE]`
+    in any option order; planner DDL passthrough (`internal/planner/planner.go`);
+    `CREATE EXTENSION` command tag (`internal/server/dispatch.go`);
+    `ddlOp.execCreateExtension` (`internal/executor/operators_ddl.go`) — unknown
+    extension → `58P01` (ERRCODE_UNDEFINED_FILE, "control file" message), duplicate
+    without IF NOT EXISTS → `42710`. Built-in allow-list `knownExtensions`
+    (`amcheck` → `1.4`).
+  - **S2 (`pg_extension` + install probe):** `pg_extension` virtual catalog
+    (OID 3079, upstream column order/names; `extconfig`/`extcondition` NULL) +
+    `InMemory.CreateExtension` runtime registry, `extnamespace` resolved to OID at
+    read time (`internal/catalog/catalog.go`). Backs pg_amcheck's
+    `pg_extension ⋈ pg_namespace` install probe (`pg_amcheck.c:173`).
+  - Tests: `parser.TestParseCreateExtension` (5 shapes),
+    `testport.TestPort_AmcheckCreateExtension` (pre-install 0 rows → install →
+    1 row `(public, 1.4)` → duplicate errors → IF NOT EXISTS idempotent →
+    unknown extension errors). Both PASS.
+- **Remaining:** S3 `verify_heapam` SRF, S4 `bt_index_check`/`bt_index_parent_check`
+  SRFs, S5 port the `AC-002`…`AC-005` pg_amcheck TAP tests. Per the scope
+  refinement above, `002_nonesuch` (`AC-002`) exercises only `CREATE EXTENSION
+  amcheck` + the install probe, so S1+S2 satisfy its *server-side* requirement;
+  promoting `AC-002` to `port` still needs S5 (the TAP port itself) plus the SRFs
+  to merely *exist* in `pg_proc`.
+
 ## Deferral
 
-This loop produced the plan only (documentation); no engine/wire code changed —
-the surface remains blocked on a clean tree. Resume point is **Slice S1** above.
-See `.ralph/deferral_ledger.md`.
+S1+S2 landed (above) in worktree `m0110-0003-amcheck-sql-surface`; S3–S5 remain.
+Merging the worktree to the active branch still waits for a clean tree (the
+main-tree foreign gen-column WIP). Resume point is **Slice S3** (`verify_heapam`
+SRF). See `.ralph/deferral_ledger.md`.

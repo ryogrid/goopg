@@ -147,6 +147,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateDomainStmt, *parser.DropDomainStmt,
 		*parser.CreateAggregateStmt,
 		*parser.AlterAggregateRenameStmt,
+		*parser.CreateExtensionStmt,
 		*parser.CreateOpClassStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
@@ -256,7 +257,7 @@ type resolveContext struct {
 	// walking through a lateralSibling context, so OuterColumnRef
 	// nodes get the correct level for the executor's OuterRows stack.
 	// M0097-0065.
-	lateralSibling   bool
+	lateralSibling bool
 	// allowMergeAction enables resolution of merge_action() FuncCall to
 	// MergeActionExpr in MERGE RETURNING context. M0100-0007.
 	allowMergeAction bool
@@ -1023,8 +1024,8 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// Decision: try to resolve each ORDER BY key against the PS output schema first.
 	// If ALL keys resolve in PS output → sort after PS.
 	// If ANY key only resolves in child schema → sort before PS (pre-sort).
-	var selectSrfPending *ProjectSet  // set when SRF is detected; applied after sort
-	var selectSrfPreSort bool         // true → sort BEFORE PS
+	var selectSrfPending *ProjectSet // set when SRF is detected; applied after sort
+	var selectSrfPreSort bool        // true → sort BEFORE PS
 	// Also run SRF detection when agg != nil: an aggregate result row can be
 	// expanded by generate_series/unnest in the same SELECT list. M0097-0035.
 	if ps == nil && !needsWindowStage(s) {
@@ -1965,8 +1966,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		defer viewPlanDepth.Add(-1)
 		if depth > maxViewPlanDepth {
 			return nil, rangeBinding{}, &PlanError{
-				Pos:  rv.Pos(),
-				Code: "42P10",
+				Pos:     rv.Pos(),
+				Code:    "42P10",
 				Message: fmt.Sprintf("view %q has a circular definition", tbl.QualifiedName()),
 			}
 		}
@@ -4402,8 +4403,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 						}
 					}
 					return nil, nil, nil, nil, &PlanError{
-						Pos:    fc.Pos(),
-						Code:   "42803",
+						Pos:     fc.Pos(),
+						Code:    "42803",
 						Message: fmt.Sprintf(`column "%s" must appear in the GROUP BY clause or be used in an aggregate function`, qualName),
 						Detail:  "Direct arguments of an ordered-set aggregate must use only grouped columns.",
 					}
@@ -4441,7 +4442,11 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// PG calls sfunc once per row when multiple aggregates share the same transition state.
 	// This eliminates duplicate NOTICE/side-effect calls for identical sfunc invocations. M0097-0035.
 	{
-		type stateKey struct{ sfunc, stype, argKey, initcond string; distinct bool; filterKey string }
+		type stateKey struct {
+			sfunc, stype, argKey, initcond string
+			distinct                       bool
+			filterKey                      string
+		}
 		slotByKey := map[stateKey]int{}
 		nextSlot := 0
 		for i := range plannedAggs {
@@ -5687,7 +5692,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 						name, nDirect, nOrder),
 				}
 			}
-				// Validate that direct arg types are compatible with ordering column types.
+			// Validate that direct arg types are compatible with ordering column types.
 			for i, argE := range fc.Args {
 				resolvedArg, aerr := resolveExpr(argE, inputCtx)
 				if aerr != nil {
@@ -6637,9 +6642,9 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		// generic "missing FROM-clause entry" error.
 		if insert.OnConflict != nil && insert.OnConflict.Action == OnConflictActionUpdate {
 			retCtx.bindings = append(retCtx.bindings, rangeBinding{
-				table:           tbl,
-				alias:           "excluded",
-				qualifiedOnly:   true,
+				table:            tbl,
+				alias:            "excluded",
+				qualifiedOnly:    true,
 				notReferenceable: true,
 			})
 		}
