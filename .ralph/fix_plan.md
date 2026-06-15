@@ -1644,6 +1644,28 @@ object support.
         is_instead, ev_enabled FROM pg_rewrite ORDER BY oid`). Resume = slice
         27: add the empty `pg_rewrite` virtual view (`pg_rewrite.h`, OID 2618) —
         empty-view pattern (no user rules; ORDER BY oid over empty = 0 rows).
+      - **PROGRESS 2026-06-16 (loop #51):** **DU-002 slices 27 + 28 LANDED.**
+        (27) Empty `pg_rewrite` virtual view (OID 2618) in
+        `internal/catalog/catalog.go` beside `pg_trigger` — pg_dump's `getRules`
+        probe (`SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type,
+        is_instead, ev_enabled FROM pg_rewrite ORDER BY oid`) now resolves (no
+        user rules → 0 rows). Schema per `pg_rewrite.h` (oid, rulename name,
+        ev_class oid, ev_type "char", ev_enabled "char", is_instead bool, ev_qual
+        pg_node_tree, ev_action pg_node_tree). (28) Appended PG18's `pubgencols`
+        ("char") column to `pg_publication` in
+        `internal/initdb/replication_views.go` — pg_dump's `getPublications`
+        probe (`SELECT … p.pubviaroot, p.pubgencols FROM pg_publication p`) now
+        resolves; goopg does not publish generated columns so 'n'(none) is
+        emitted per row. build/gofmt/vet clean; catalog + analyzer + initdb
+        publication suites PASS; `TestPort_PgDumpConnectionSetup` PASS.
+        **Next blocker (precise, empirical):** pg_dump advances to large-object
+        collection (`getBlobs`) → `relation "pg_largeobject_metadata" does not
+        exist` (`SELECT oid, lomowner, lomacl, acldefault('L', lomowner) AS
+        acldefault FROM pg_largeobject_metadata ORDER BY lomowner,
+        lomacl::pg_catalog.text, oid`). Resume = slice 29: add the empty
+        `pg_largeobject_metadata` virtual view (`pg_largeobject_metadata.h`, OID
+        2995) — empty-view pattern (no large objects; cols oid, lomowner oid,
+        lomacl aclitem[]).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

@@ -127,13 +127,24 @@ package testport
 // defined in internal/catalog/catalog.go, so the getTriggers probe
 // `SELECT t.tgrelid … FROM unnest('{}'::oid[]) … JOIN pg_catalog.pg_trigger t …`
 // no longer errors.
+// (DU-002 slice 27) The empty `pg_rewrite` virtual view (OID 2618) is now
+// defined in internal/catalog/catalog.go, so the getRules probe
+// `SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type, is_instead,
+// ev_enabled FROM pg_rewrite ORDER BY oid` no longer errors (goopg has no user
+// rules → 0 rows).
+// (DU-002 slice 28) `pg_publication.pubgencols` (PG18 "char" column,
+// publish-generated-columns mode) was appended in internal/initdb/
+// replication_views.go, so getPublications' probe `SELECT … p.pubviaroot,
+// p.pubgencols FROM pg_publication p` no longer errors. goopg does not publish
+// generated columns, so 'n'(none) is emitted for every publication row.
 // **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// advances to rule collection (getRules) and fails with
-// `relation "pg_rewrite" does not exist` (query: `SELECT tableoid, oid,
-// rulename, ev_class AS ruletable, ev_type, is_instead, ev_enabled FROM
-// pg_rewrite ORDER BY oid`). The next DU-002 slice adds the empty `pg_rewrite`
-// virtual view (pg_rewrite.h, OID 2618) — goopg has no user rules, so 0 rows
-// is correct (an ORDER BY oid over an empty relation yields no rows).
+// advances to large-object collection (getBlobs) and fails with
+// `relation "pg_largeobject_metadata" does not exist` (query: `SELECT oid,
+// lomowner, lomacl, acldefault('L', lomowner) AS acldefault FROM
+// pg_largeobject_metadata ORDER BY lomowner, lomacl::pg_catalog.text, oid`).
+// The next DU-002 slice adds the empty `pg_largeobject_metadata` virtual view
+// (pg_largeobject_metadata.h, OID 2995) — goopg has no large objects, so 0 rows
+// is correct. Cols: oid, lomowner oid, lomacl aclitem[].
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

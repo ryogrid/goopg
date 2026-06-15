@@ -655,6 +655,32 @@ fixed one logical group per loop:
     oid, rulename, ev_class AS ruletable, ev_type, is_instead, ev_enabled FROM
     pg_rewrite ORDER BY oid`) — another empty-view slice next.
 
+27. **`pg_rewrite` empty virtual view — DONE.** After `getTriggers`, pg_dump's
+    `getRules` collects rewrite rules with `SELECT tableoid, oid, rulename,
+    ev_class AS ruletable, ev_type, is_instead, ev_enabled FROM pg_rewrite ORDER
+    BY oid`. goopg has no user-defined rules, so an empty view (0 rows) is
+    correct (an `ORDER BY oid` over an empty relation yields no rows). Added an
+    empty `pg_rewrite` virtual view (OID 2618) in `internal/catalog/catalog.go`
+    beside `pg_trigger`. Schema matches `pg_rewrite.h`: oid, rulename name,
+    ev_class oid, ev_type "char", ev_enabled "char", is_instead bool, ev_qual
+    pg_node_tree, ev_action pg_node_tree. After this slice the rule probe passes;
+    the **new** blocker is `column p.pubgencols does not exist` (publication
+    collection `getPublications`).
+
+28. **`pg_publication.pubgencols` column — DONE.** pg_dump's `getPublications`
+    issues `SELECT p.tableoid, p.oid, p.pubname, p.pubowner, p.puballtables,
+    p.pubinsert, p.pubupdate, p.pubdelete, p.pubtruncate, p.pubviaroot,
+    p.pubgencols FROM pg_publication p`. goopg's `pg_publication` (a virtual
+    view backed by the `*catalog.PubSub` registry, in
+    `internal/initdb/replication_views.go`) lacked PG18's `pubgencols` column.
+    Appended `pubgencols` ("char": 'n'=none, 's'=stored generated columns —
+    see `pg_publication.h`); goopg does not publish generated columns, so 'n' is
+    emitted for every publication row. After this slice the publication probe
+    passes; the **new** blocker is `relation "pg_largeobject_metadata" does not
+    exist` (large-object collection `getBlobs`: `SELECT oid, lomowner, lomacl,
+    acldefault('L', lomowner) AS acldefault FROM pg_largeobject_metadata ORDER BY
+    lomowner, lomacl::pg_catalog.text, oid`) — another empty-view slice next.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

@@ -4010,6 +4010,36 @@ func (c *InMemory) registerSystemTables() {
 	pgTrigger.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_trigger"] = pgTrigger
 
+	// pg_rewrite — rewrite-rule catalog (OID 2618). After getTriggers, pg_dump's
+	// getRules dumps any ON SELECT/INSERT/UPDATE/DELETE rules. The query that
+	// first hits this catalog is:
+	//   SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type,
+	//   is_instead, ev_enabled FROM pg_rewrite ORDER BY oid
+	// goopg has no user-defined rules, so an empty view (0 rows) is correct,
+	// identical to a stock PG cluster with none. (Stock PG does carry the
+	// internal "_RETURN" SELECT rule per view in pg_rewrite, but goopg has no
+	// stored user views feeding this dump path, so 0 rows matches what pg_dump
+	// would emit for this cluster.) Schema matches PG's pg_rewrite
+	// (pg_rewrite.h): oid, rulename name, ev_class oid, ev_type "char",
+	// ev_enabled "char", is_instead bool, ev_qual pg_node_tree, ev_action
+	// pg_node_tree. M0110-0001 (DU-002 slice 27).
+	pgRewrite := &Table{
+		Schema: "pg_catalog", Name: "pg_rewrite", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "rulename", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "ev_class", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "ev_type", Type: Type{Name: "char"}, Ordinal: 3},
+			{Name: "ev_enabled", Type: Type{Name: "char"}, Ordinal: 4},
+			{Name: "is_instead", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "ev_qual", Type: Type{Name: "pg_node_tree"}, Ordinal: 6},
+			{Name: "ev_action", Type: Type{Name: "pg_node_tree"}, Ordinal: 7},
+		},
+		OID: 2618,
+	}
+	pgRewrite.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_rewrite"] = pgRewrite
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

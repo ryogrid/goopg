@@ -102,13 +102,13 @@ func registerStatReplicationView(cat *catalog.InMemory, senders *wal.Senders, wr
 				formatLSN(s.WriteLSN),
 				formatLSN(s.FlushLSN),
 				formatLSN(s.ReplayLSN),
-				"00:00:00", // write_lag: lag intervals not wired in v0
-				"00:00:00", // flush_lag
-				"00:00:00", // replay_lag
+				"00:00:00",                               // write_lag: lag intervals not wired in v0
+				"00:00:00",                               // flush_lag
+				"00:00:00",                               // replay_lag
 				syncPriority(syncRep, s.ApplicationName), // sync_priority
 				syncState(syncRep, s.ApplicationName),    // sync_state
-				"",         // reply_time: not tracked per-message in v0
-				s.SlotName, // slot_name
+				"",                                       // reply_time: not tracked per-message in v0
+				s.SlotName,                               // slot_name
 				hitsStr,
 				missesStr,
 				residentStr,
@@ -302,18 +302,18 @@ func registerReplicationSlotsView(cat *catalog.InMemory, slots *wal.Slots) error
 				sl.Name,
 				sl.Plugin,
 				string(sl.Kind),
-				"",                          // datoid: no oid mapping for db names yet
+				"", // datoid: no oid mapping for db names yet
 				sl.Database,
-				"f",                         // temporary: temp slots deferred
+				"f", // temporary: temp slots deferred
 				boolText(sl.Active),
-				"",                          // active_pid: not yet tracked per-slot
-				"0",                         // xmin: physical-slot xmin tracking deferred
+				"",  // active_pid: not yet tracked per-slot
+				"0", // xmin: physical-slot xmin tracking deferred
 				formatXmin(sl.CatalogXmin),
 				formatLSN(sl.RestartLSN),
 				formatLSN(sl.ConfirmedFlushLSN),
 				slotWalStatus(sl),
-				"",                          // safe_wal_size: not yet computed
-				"f",                         // two_phase: 2PC decoding out of scope
+				"",  // safe_wal_size: not yet computed
+				"f", // two_phase: 2PC decoding out of scope
 			})
 		}
 		return out
@@ -348,6 +348,11 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 			{Name: "pubdelete", Type: catalog.Type{Name: "bool"}},
 			{Name: "pubtruncate", Type: catalog.Type{Name: "bool"}},
 			{Name: "pubviaroot", Type: catalog.Type{Name: "bool"}},
+			// pubgencols (PG18): generated-column publish mode. 'n'(none) if
+			// generated column data is not published, 's'(stored) if it is.
+			// pg_dump's getPublications selects this column. goopg does not
+			// publish generated columns, so 'n' is correct. See pg_publication.h.
+			{Name: "pubgencols", Type: catalog.Type{Name: "char"}},
 		},
 		Virtual: true,
 	}
@@ -360,13 +365,14 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 			out = append(out, []string{
 				fmt.Sprintf("%d", pub.OID),
 				pub.Name,
-				"",                            // pubowner: roles aren't OID-stable yet
+				"", // pubowner: roles aren't OID-stable yet
 				boolText(pub.AllTables),
 				boolText(pub.PublishInsert),
 				boolText(pub.PublishUpdate),
 				boolText(pub.PublishDelete),
-				"f",                            // pubtruncate: M0008-out-of-scope
-				"f",                            // pubviaroot: out of scope
+				"f", // pubtruncate: M0008-out-of-scope
+				"f", // pubviaroot: out of scope
+				"n", // pubgencols: generated cols not published
 			})
 		}
 		return out
@@ -399,11 +405,11 @@ func registerPublicationViews(cat *catalog.InMemory, ps *catalog.PubSub) error {
 			for _, qname := range pub.Tables {
 				relOID := lookupRelOID(cat, qname)
 				out = append(out, []string{
-					"",                         // oid of the pg_publication_rel row itself
+					"", // oid of the pg_publication_rel row itself
 					fmt.Sprintf("%d", pub.OID),
 					relOID,
-					"",                         // prqual: row filter — out of scope
-					"",                         // prattrs: column list — out of scope
+					"", // prqual: row filter — out of scope
+					"", // prattrs: column list — out of scope
 				})
 			}
 		}
@@ -480,17 +486,17 @@ func registerSubscriptionViews(cat *catalog.InMemory, ps *catalog.PubSub) error 
 		for _, sub := range ps.Subscriptions() {
 			out = append(out, []string{
 				fmt.Sprintf("%d", sub.OID),
-				"",                                // subdbid
+				"", // subdbid
 				sub.Name,
-				"",                                // subowner
+				"", // subowner
 				boolText(sub.Enabled),
-				"f",                               // subbinary
-				"f",                               // substream
-				"d",                               // subtwophasestate disabled
-				"f",                               // subdisableonerr
+				"f", // subbinary
+				"f", // substream
+				"d", // subtwophasestate disabled
+				"f", // subdisableonerr
 				sub.Conninfo,
 				sub.SlotName,
-				"local",                           // subsynccommit
+				"local", // subsynccommit
 				formatStringList(sub.Publications),
 			})
 		}
