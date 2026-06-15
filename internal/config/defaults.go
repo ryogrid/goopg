@@ -681,6 +681,32 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// transaction_timeout (PG 17+). pg_dump's setup_connection disables it
+	// (SET transaction_timeout = 0) alongside the other timeouts; goopg does
+	// not enforce it, but SET must succeed. Mirrors guc_tables.c.
+	r.MustRegister(NewVariable(Variable{
+		Name: "transaction_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "0",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// synchronize_seqscans. pg_dump's setup_connection turns this off (SET
+	// synchronize_seqscans TO off) so a dump's row ordering is stable. goopg
+	// has no synchronized-scan optimization, so the value is a no-op, but the
+	// SET must succeed. Boot default mirrors guc_tables.c (on).
+	r.MustRegister(NewVariable(Variable{
+		Name: "synchronize_seqscans", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// row_security. pg_dump's setup_connection sets this (off unless
+	// --enable-row-security). goopg has no row-level security, so it is a
+	// no-op, but the SET must succeed. Boot default mirrors guc_tables.c (on).
+	r.MustRegister(NewVariable(Variable{
+		Name: "row_security", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 
 	// Logging GUCs. Stubs so `SET log_statement = 'all'` and
 	// related psql / connection-pool wrappers don't trip.

@@ -1071,6 +1071,33 @@ object support.
         deferred under CSV row E-002 pending the catalog-view parity + dump
         /restore round-trip enumerated in `docs/design/0110-0001-pg-dump-tap-port.md`.
         Resume point: 002_pg_dump (schema dump) then 003 (round-trip).
+      - **PROGRESS 2026-06-15 (loop #22):** **pg_dump connection-setup
+        compatibility LANDED** — the enabler for DU-002+. An empirical probe
+        (real `pg_dump --no-sync postgres` vs a live goopg server) showed pg_dump
+        aborting in `setup_connection()` *before* any catalog query. Two gap
+        classes closed: (a) three unregistered GUCs `synchronize_seqscans` /
+        `transaction_timeout` (PG 17+) / `row_security` added as accepted no-ops
+        in `internal/config/defaults.go` (+ `postgresql.conf.sample`; boot
+        on/0/on per guc_tables.c); (b) `SET TRANSACTION ISOLATION LEVEL
+        REPEATABLE READ, READ ONLY` — the server simple-query string fast-path
+        (`internal/server/query.go`) mis-routed `SET TRANSACTION …` to the GUC
+        setter (`unrecognized configuration parameter "TRANSACTION"`); a new case
+        routes `SET [LOCAL|SESSION] TRANSACTION …` / `SET SESSION CHARACTERISTICS
+        …` to the parser-based executor (existing `SetTransactionStmt`,
+        M0096-0002), and the parser's transaction-mode loop now consumes the
+        comma in `REPEATABLE READ, READ ONLY` (it stopped at the comma). pg_dump
+        now completes setup_connection and reaches its first catalog query.
+        **Next blocker (precise):** getRoles `SELECT oid, rolname FROM
+        pg_catalog.pg_roles ORDER BY 1` → goopg's `pg_roles` view lacks an `oid`
+        column. That is the start of the broad catalog-view parity (DU-002+).
+        Tests: `TestPort_PgDumpConnectionSetup` (e2e regression guard, self-
+        promoting — logs the pg_roles.oid gap, auto-tightens to exit-0 on a clean
+        dump), `config.TestPgDumpConnectionSetupGUCs`,
+        `parser.TestParseSetTransactionCommaSeparated`. Gates: build/gofmt/vet
+        clean; config + parser + server suites + pg_dump 001 PASS, no regression.
+        Design doc `0110-0001` extended (Connection-setup compatibility section).
+        Resume = add `oid` to the `pg_roles` view, then continue getRoles →
+        getTablespaces → getNamespaces… per setup_connection's query order.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
