@@ -49,15 +49,21 @@ package testport
 // operator classes are dumped), and the empty `pg_opfamily` virtual view that
 // `getOpfamilies` reads (slice 11 — built-in operator families live in
 // pg_catalog and are filtered out by namespace dumpability, so an empty view is
-// correct; only user-defined operator families are dumped).
-// **Next blocker (precise):** pg_dump's `getTSParsers` runs `SELECT tableoid,
-// oid, prsname, prsnamespace, prsstart::oid, prstoken::oid, prsend::oid,
-// prsheadline::oid, prslextype::oid FROM pg_ts_parser`, and goopg has no
-// `pg_ts_parser` catalog view, so the query fails with `relation
-// "pg_ts_parser" does not exist`. Adding an empty `pg_ts_parser` virtual view
-// (built-in text-search parsers live in pg_catalog and are filtered out by
-// namespace dumpability, so an empty view is correct — only user-defined TS
-// parsers are dumped) is the following DU-002 slice.
+// correct; only user-defined operator families are dumped), and the empty
+// `pg_ts_parser` virtual view that `getTSParsers` reads (slice 12 — built-in
+// text-search parsers live in pg_catalog and are filtered out by namespace
+// dumpability, so an empty view is correct; only user-defined TS parsers are
+// dumped).
+// (getTSDictionaries reads `pg_ts_dict`, which already exists as a real nailed
+// on-disk catalog seeded by initdb, so that getter passed without a new view.)
+// **Next blocker (precise):** pg_dump's `getTSTemplates` runs `SELECT tableoid,
+// oid, tmplname, tmplnamespace, tmplinit::oid, tmpllexize::oid FROM
+// pg_ts_template`, and goopg has no `pg_ts_template` catalog view, so the query
+// fails with `relation "pg_ts_template" does not exist`. Adding an empty
+// `pg_ts_template` virtual view (built-in text-search templates live in
+// pg_catalog and are filtered out by namespace dumpability, so an empty view is
+// correct — only user-defined TS templates are dumped) is the following DU-002
+// slice.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.

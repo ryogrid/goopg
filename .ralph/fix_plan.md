@@ -1291,6 +1291,27 @@ object support.
         add an empty `pg_ts_parser` virtual view as slice 12 (built-in
         text-search parsers live in pg_catalog, filtered out by namespace
         dumpability, so empty is correct).
+      - **PROGRESS 2026-06-16 (loop #35):** **DU-002 slice 12 (`pg_ts_parser`
+        view) LANDED.** `getTSParsers` runs `SELECT tableoid, oid, prsname,
+        prsnamespace, prsstart::oid, prstoken::oid, prsend::oid,
+        prsheadline::oid, prslextype::oid FROM pg_ts_parser`; it aborted at
+        `relation "pg_ts_parser" does not exist`. Added the empty `pg_ts_parser`
+        virtual view (`internal/catalog/catalog.go`, OID 3601, beside
+        `pg_opfamily`) with the `pg_ts_parser.h` schema (`oid, prsname name,
+        prsnamespace oid, prsstart/prstoken/prsend/prsheadline/prslextype
+        regproc`); `::oid` casts are no-ops (regproc is oid-compatible). Empty by
+        construction: built-in TS parsers live in pg_catalog (never dumped),
+        goopg defines no user TS parsers. Build/gofmt/vet clean; catalog +
+        initdb suites PASS; `TestPort_PgDumpConnectionSetup` PASS — `getTSParsers`
+        now completes, and `getTSDictionaries` (`FROM pg_ts_dict`) ALSO passes:
+        `pg_ts_dict` already exists as a real nailed on-disk catalog seeded by
+        initdb, so it needed no new view. **Next blocker (precise):**
+        `getTSTemplates` runs `SELECT tableoid, oid, tmplname, tmplnamespace,
+        tmplinit::oid, tmpllexize::oid FROM pg_ts_template`; goopg has no
+        `pg_ts_template` view → `relation "pg_ts_template" does not exist`.
+        Resume = add an empty `pg_ts_template` virtual view as slice 13
+        (built-in TS templates live in pg_catalog, filtered out by namespace
+        dumpability, so empty is correct).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -3656,6 +3656,33 @@ func (c *InMemory) registerSystemTables() {
 	pgOpfamily.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_opfamily"] = pgOpfamily
 
+	// pg_ts_parser — text-search parser catalog (OID 3601). pg_dump's
+	// getTSParsers runs `SELECT tableoid, oid, prsname, prsnamespace,
+	// prsstart::oid, prstoken::oid, prsend::oid, prsheadline::oid,
+	// prslextype::oid FROM pg_ts_parser` — it reads ALL TS parsers and filters
+	// out system-defined ones at dump-out time by namespace dumpability. goopg
+	// defines no user TS parsers, and the built-ins are in pg_catalog (never
+	// dumped), so this view is correctly empty (0 rows). The ::oid casts in the
+	// query are no-ops since the prs* columns are regproc (oid-compatible).
+	// Schema matches PG's pg_ts_parser (pg_ts_parser.h). M0110-0001 (DU-002
+	// slice 12).
+	pgTSParser := &Table{
+		Schema: "pg_catalog", Name: "pg_ts_parser", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "prsname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "prsnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "prsstart", Type: Type{Name: "regproc"}, Ordinal: 3},
+			{Name: "prstoken", Type: Type{Name: "regproc"}, Ordinal: 4},
+			{Name: "prsend", Type: Type{Name: "regproc"}, Ordinal: 5},
+			{Name: "prsheadline", Type: Type{Name: "regproc"}, Ordinal: 6},
+			{Name: "prslextype", Type: Type{Name: "regproc"}, Ordinal: 7},
+		},
+		OID: 3601,
+	}
+	pgTSParser.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_ts_parser"] = pgTSParser
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

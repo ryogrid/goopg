@@ -289,6 +289,26 @@ fixed one logical group per loop:
     prsend::oid, prsheadline::oid, prslextype::oid FROM pg_ts_parser` — goopg
     has no `pg_ts_parser` view (`relation "pg_ts_parser" does not exist`) — the
     following slice.
+12. **`pg_ts_parser` virtual view — DONE.** `getTSParsers` runs `SELECT
+    tableoid, oid, prsname, prsnamespace, prsstart::oid, prstoken::oid,
+    prsend::oid, prsheadline::oid, prslextype::oid FROM pg_ts_parser`; goopg had
+    no `pg_ts_parser` view, so the query aborted at `relation "pg_ts_parser"
+    does not exist`. Added the empty `pg_ts_parser` virtual view
+    (`internal/catalog/catalog.go`, OID 3601, beside `pg_opfamily`) with the
+    `pg_ts_parser.h` schema (`oid, prsname name, prsnamespace oid, prsstart
+    regproc, prstoken regproc, prsend regproc, prsheadline regproc, prslextype
+    regproc`); the `::oid` casts in the query are no-ops since `regproc` is
+    oid-compatible. The view is **empty by construction**: `getTSParsers` reads
+    all TS parsers and filters out system-defined ones at dump-out time by
+    namespace dumpability — the built-ins live in `pg_catalog` (never dumped),
+    and goopg defines no user TS parsers. After this slice `getTSParsers`
+    completes, and `getTSDictionaries` (`SELECT ... FROM pg_ts_dict`) also
+    passes — `pg_ts_dict` already exists as a real nailed on-disk catalog
+    seeded by initdb, so it needed no new view. The next blocker is
+    `getTSTemplates`' `SELECT tableoid, oid, tmplname, tmplnamespace,
+    tmplinit::oid, tmpllexize::oid FROM pg_ts_template` — goopg has no
+    `pg_ts_template` view (`relation "pg_ts_template" does not exist`) — the
+    following slice.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
