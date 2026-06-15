@@ -58,11 +58,19 @@ package testport
 // CTE; it now uses planSelectWithParent (skips the re-analyze, inherits the
 // planCTEs scope), mirroring the lateral branch.
 //
-// REMAINING blocker is now #5: pg_amcheck's per-relation heap check
-// schema-qualifies the verify_heapam() function in the FROM clause
-// (`"public".verify_heapam(...)`), which goopg's parser rejects — only an
-// UNqualified FROM-clause table function parses. The preflight below probes
-// for it directly so the test self-skips on #5 rather than failing.
+// UPDATE (M0110-0003, gap #5): FIXED — a schema-qualified function call in the
+// FROM clause (`"public".verify_heapam(...)`) now parses as a TableFunc. The
+// FROM-clause range-var path previously only accepted an unqualified or
+// pg_catalog-qualified SRF name; it now discards a user-schema qualifier and
+// dispatches builtins by their bare lowercased name.
+//
+// REMAINING blocker is now #6: pg_amcheck's per-relation heap check is an
+// implicit-LATERAL comma-join whose SRF argument list references the sibling
+// relation (`FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …)`).
+// The query parses and reaches the executor, but the correlated `c.oid` inside
+// the SRF's arguments does not resolve, so verify_heapam errors with
+// `column "oid" does not exist`. The preflight below probes for it directly so
+// the test self-skips on #6 rather than failing.
 //
 // Like 001_basic, the bundled pg_amcheck links a PG-17+ libpq symbol
 // (PQcancelBlocking), so it is run with LD_LIBRARY_PATH pointed at
@@ -185,24 +193,26 @@ func TestPort_PgAmcheck002Nonesuch(t *testing.T) {
 			"template1/template0 are not registered in pg_database. stderr=%q", db.Stderr)
 	}
 
-	// Probe for remaining gap #5 (M0110-0003): pg_amcheck builds its
+	// Probe for remaining gap #6 (M0110-0003): pg_amcheck builds its
 	// per-relation heap check as
-	//   ... FROM pg_catalog.pg_class c, "public".verify_heapam(...) v
-	// i.e. a SCHEMA-QUALIFIED function call in the FROM clause. goopg's
-	// parser only accepts an UNqualified function name as a FROM-clause
-	// table function, so the qualified form fails with `syntax error at or
-	// near "...(got ()"`. That surfaces in pg_amcheck's per-relation stdout
-	// (`verify_heapam(... syntax error ...`) and also breaks the database
-	// pattern-resolution assertions below (the relation-gathering query also
-	// schema-qualifies functions). Self-skip with the precise blocker; the
-	// day schema-qualified FROM-clause functions parse, this clears and the
-	// full assertion set runs unchanged.
+	//   ... FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …) v
+	// i.e. an implicit-LATERAL comma-join where the SRF's first argument is the
+	// correlated reference `c.oid`. The schema-qualified-SRF parser gap (#5) is
+	// now FIXED, so the query parses and reaches the planner/executor — but the
+	// correlated `c.oid` inside the SRF's argument list does not resolve against
+	// the sibling `pg_class c` range-table entry, so verify_heapam errors with
+	// `column "oid" does not exist`. That surfaces in pg_amcheck's per-relation
+	// stdout (`heap table "…": ERROR: column "oid" does not exist`) and also
+	// affects the assertions below. Self-skip with the precise blocker; the day
+	// LATERAL correlation into a FROM-clause SRF's arguments resolves, this
+	// clears and the full assertion set runs unchanged.
 	heap := runAmcheck(t, c, "postgres")
-	if strings.Contains(heap.Stdout, "verify_heapam(") && strings.Contains(heap.Stdout, "syntax error") {
-		t.Skipf("AC-002 blocked on remaining gap #5: goopg's parser rejects a "+
-			"schema-qualified function call in the FROM clause "+
-			"(`\"public\".verify_heapam(...)`); only unqualified FROM-clause table "+
-			"functions parse. stdout=%q", heap.Stdout)
+	if strings.Contains(heap.Stdout, `column "oid" does not exist`) {
+		t.Skipf("AC-002 blocked on remaining gap #6: a FROM-clause SRF's "+
+			"argument list does not resolve the implicit-LATERAL correlated "+
+			"reference `c.oid` against the sibling comma-join relation "+
+			"(`FROM pg_catalog.pg_class c, \"public\".verify_heapam(relation := c.oid, …)`); "+
+			"verify_heapam errors with `column \"oid\" does not exist`. stdout=%q", heap.Stdout)
 	}
 
 	// --- Non-existent databases ------------------------------------------

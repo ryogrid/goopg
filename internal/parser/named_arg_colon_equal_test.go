@@ -94,6 +94,72 @@ func TestParseNamedArgColonEqualFromSRF(t *testing.T) {
 	}
 }
 
+// TestParseSchemaQualifiedFromSRF covers M0110-0003 AC-002 gap #5: pg_amcheck
+// builds each per-relation heap check as
+//
+//	FROM pg_catalog.pg_class c, "public".verify_heapam(...) v
+//
+// i.e. it qualifies the SRF with the *relation's* schema (here public), not
+// pg_catalog. Previously goopg's FROM-clause range-var path only accepted an
+// unqualified or pg_catalog-qualified SRF name, so the user-schema-qualified
+// form fell through to the derived-subquery branch and failed with
+// `expected ')' after subquery in FROM (got ()`. The parser must now dispatch a
+// schema-qualified `name(args)` in FROM as a TableFunc, discarding the schema
+// qualifier and dispatching builtins (verify_heapam) by their bare lowercased
+// name. Both the quoted (`"public".`) and bare (`public.`) qualifiers are
+// covered, since pg_amcheck quotes identifiers.
+func TestParseSchemaQualifiedFromSRF(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "quoted_schema",
+			sql: `SELECT v.blkno FROM pg_catalog.pg_class c, ` +
+				`"public".verify_heapam(relation := c.oid, on_error_stop := false, ` +
+				`check_toast := false, skip := 'none', startblock := 0, endblock := 0) v`,
+		},
+		{
+			name: "bare_schema",
+			sql: `SELECT v.blkno FROM pg_catalog.pg_class c, ` +
+				`public.verify_heapam(relation := c.oid, on_error_stop := false, ` +
+				`check_toast := false, skip := 'none', startblock := 0, endblock := 0) v`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmts, err := Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse error: %v", err)
+			}
+			sel, ok := stmts[0].(*SelectStmt)
+			if !ok {
+				t.Fatalf("expected *SelectStmt, got %T", stmts[0])
+			}
+			var tf *TableFuncRef
+			for i := range sel.From {
+				if sel.From[i].TableFunc != nil {
+					tf = sel.From[i].TableFunc
+					break
+				}
+			}
+			if tf == nil {
+				t.Fatalf("no TableFuncRef found in FROM clause")
+			}
+			// Schema qualifier is discarded; the builtin dispatches by bare name.
+			if tf.Name != "verify_heapam" {
+				t.Fatalf("expected verify_heapam SRF, got %q", tf.Name)
+			}
+			if len(tf.Args) != 6 {
+				t.Fatalf("expected 6 positional args after name-stripping, got %d", len(tf.Args))
+			}
+			if _, ok := tf.Args[0].(*ColumnRef); !ok {
+				t.Fatalf("expected first arg to be *ColumnRef (c.oid), got %T", tf.Args[0])
+			}
+		})
+	}
+}
+
 // TestParseNamedArgColonEqualEquivalentToFatArrow confirms `:=` and `=>` produce
 // the same positional argument list, so the two spellings are interchangeable.
 func TestParseNamedArgColonEqualEquivalentToFatArrow(t *testing.T) {

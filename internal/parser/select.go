@@ -192,8 +192,7 @@ func (p *parser) parseSelect() (Stmt, error) {
 	// UNION, INTERSECT, EXCEPT, ORDER, LIMIT, OFFSET, FETCH, or FOR.
 	isSemiOrEOF := p.cur().Kind == TokenSymbol && p.cur().Value == ";" ||
 		p.cur().Kind == TokenEOF
-	isSetOpOrClause := (p.cur().Kind == TokenKeyword && (
-		p.cur().Keyword == KwUnion ||
+	isSetOpOrClause := (p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwUnion ||
 		p.cur().Keyword == KwIntersect ||
 		p.cur().Keyword == KwExcept ||
 		p.cur().Keyword == KwOrder ||
@@ -227,7 +226,7 @@ func (p *parser) parseSelect() (Stmt, error) {
 			}
 			return nil, &SyntaxError{Pos: errPos, Message: p.selectIntoErrMsg, Raw: true}
 		default:
-			p.advance()                   // consume INTO
+			p.advance()                  // consume INTO
 			_ = p.acceptKeyword(KwTable) // optional TABLE keyword
 			name, err := p.parseObjectName()
 			if err != nil {
@@ -1256,18 +1255,37 @@ func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
 	// the function name with "expected ')' after subquery in FROM
 	// (got ()". See M0103-0008 rung 13 / docs/design/0103-0019-*.
 	srfFuncName := ""
-	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" &&
-		(obj.Schema == "" || strings.EqualFold(obj.Schema, "pg_catalog")) {
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 		lower := strings.ToLower(obj.Name)
+		isKnownBuiltin := false
 		switch lower {
 		case "generate_series", "pg_input_error_info", "parse_ident",
 			"pg_get_publication_tables", "pg_available_wal_summaries",
 			"verify_heapam", "unnest", "generate_subscripts":
-			srfFuncName = lower
-		default:
-			// Accept any other name(args) in FROM as a potential user-defined SRF.
-			// Only do this in FROM clause context to avoid breaking INSERT INTO t (cols).
-			if fromClause {
+			isKnownBuiltin = true
+		}
+		switch {
+		case obj.Schema == "" || strings.EqualFold(obj.Schema, "pg_catalog"):
+			// Unqualified or pg_catalog-qualified.
+			if isKnownBuiltin {
+				srfFuncName = lower
+			} else if fromClause {
+				// Accept any other name(args) in FROM as a potential user-defined SRF.
+				// Only do this in FROM clause context to avoid breaking INSERT INTO t (cols).
+				srfFuncName = obj.Name
+			}
+		case fromClause:
+			// Schema-qualified by a user schema, e.g. `"public".verify_heapam(...)`.
+			// pg_amcheck builds each per-relation heap check as
+			//   FROM pg_catalog.pg_class c, "public".verify_heapam(...) v
+			// i.e. it qualifies the SRF with the *relation's* schema, not
+			// pg_catalog. The schema qualifier is discarded here; dispatch is by
+			// bare name. Known builtins use the lowercased canonical name so the
+			// executor's name switch matches; everything else passes through as a
+			// user-defined SRF. M0110-0003 AC-002 gap #5.
+			if isKnownBuiltin {
+				srfFuncName = lower
+			} else {
 				srfFuncName = obj.Name
 			}
 		}
@@ -1959,7 +1977,7 @@ func (p *parser) parseExprPrec(min int) (Expr, error) {
 				var zone Expr
 				if p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "interval") {
 					if p.peek(1).Kind == TokenStringLit {
-						p.advance() // INTERVAL
+						p.advance()           // INTERVAL
 						strTok := p.advance() // string literal
 						zone = &StringConst{pos: strTok.Pos, Value: strTok.Value}
 					}
@@ -2631,10 +2649,10 @@ func (p *parser) tryTypedLiteral() (Expr, bool) {
 					typName = name // WITHOUT TIME ZONE = plain time/timestamp
 				}
 				pos := t.Pos
-				p.advance() // type name (time/timestamp)
-				p.advance() // WITH/WITHOUT
-				p.advance() // time
-				p.advance() // zone
+				p.advance()           // type name (time/timestamp)
+				p.advance()           // WITH/WITHOUT
+				p.advance()           // time
+				p.advance()           // zone
 				strTok := p.advance() // string literal
 				return &TypedStringLit{pos: pos, Type: typName, Value: strTok.Value}, true
 			}
@@ -3213,8 +3231,8 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 		if variadic && p.cur().Kind == TokenIdent && strings.EqualFold(p.cur().Value, "array") &&
 			p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "[" {
 			expandStart := len(fc.Args) // index of first expanded element
-			p.advance() // array
-			p.advance() // [
+			p.advance()                 // array
+			p.advance()                 // [
 			if !(p.cur().Kind == TokenSymbol && p.cur().Value == "]") {
 				first, ferr := p.parseExpr()
 				if ferr != nil {

@@ -297,21 +297,37 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
   `executor.TestCompatCTEVisibleInFromSubquery` (single + two-level nesting,
   end-to-end). `internal/planner/planner.go`.
 
-- **Remaining for AC-002 — gap #5 (schema-qualified function in the FROM clause).**
-  With gap #4 closed, `002_nonesuch` advances past all bootstrap/skip probes into
-  the real per-relation assertions and surfaces a new general parser gap:
+- **AC-002 gap #5 (schema-qualified function in the FROM clause) — LANDED.**
   pg_amcheck builds each heap check as
   `… FROM pg_catalog.pg_class c, "public".verify_heapam(...) v` — a
-  **schema-qualified** function call in FROM. goopg's parser only accepts an
-  **unqualified** function name as a FROM-clause table function, so the qualified
-  form errors `syntax error at or near "...(got ()"`. (Unqualified
-  `verify_heapam(...)` in FROM parses fine.) This is its own bounded loop in
-  `internal/parser`. Until it lands, `002_nonesuch` self-skips via its new gap-#5
-  preflight probe (runs `pg_amcheck postgres`, detects the
-  `verify_heapam( … syntax error` stdout signature).
+  **schema-qualified** function call in FROM. goopg's `parseRangeVar` only
+  dispatched an SRF when the name was **unqualified or pg_catalog-qualified**
+  (`obj.Schema == "" || strings.EqualFold(obj.Schema, "pg_catalog")`); a
+  user-schema qualifier (`public`) fell through to the derived-subquery branch
+  and errored `expected ')' after subquery in FROM (got ()`. Fix
+  (`internal/parser/select.go`, `parseRangeVar`): restructure the gate so that in
+  FROM-clause context a **schema-qualified** `name(args)` is also accepted — the
+  schema qualifier is discarded and dispatch is by bare name (builtins by their
+  lowercased canonical name so the executor's name switch matches; everything
+  else as a user-defined SRF). The pre-existing unqualified / pg_catalog behavior
+  is preserved exactly. Regression: `TestParseSchemaQualifiedFromSRF`
+  (`internal/parser/named_arg_colon_equal_test.go`, quoted + bare schema forms,
+  sibling to the existing `TestParseNamedArgColonEqualFromSRF`).
 
-- **After #5:** S5 still needs LATERAL `c.oid` resolution at plan/exec time, the
-  clog `XidStatusFunc` wiring, and the `AC-002`…`AC-005` TAP port + CSV flip.
+- **Remaining for AC-002 — gap #6 (LATERAL `c.oid` resolution into the SRF's
+  arguments).** With gap #5 closed, `002_nonesuch` parses the per-relation heap
+  check and reaches the executor, surfacing the next gap: the implicit-LATERAL
+  comma-join `FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …)`
+  does not resolve the correlated `c.oid` inside the SRF's argument list against
+  the sibling `pg_class c` range-table entry, so verify_heapam errors
+  `column "oid" does not exist`. This is the same LATERAL-resolution follow-up
+  S3/S4 already record, now the live blocker. Until it lands, `002_nonesuch`
+  self-skips via its updated gap-#6 preflight probe (runs `pg_amcheck postgres`,
+  detects the `column "oid" does not exist` stdout signature).
+
+- **After #6:** S5 still needs the clog `XidStatusFunc` wiring (for the
+  clog-dependent verify_heapam tier), and the `AC-002`…`AC-005` TAP port + CSV
+  flip.
 
 ## Deferral
 
