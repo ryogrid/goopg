@@ -33,12 +33,14 @@ package testport
 // (slice 2), the `tableoid` output-column label (slice 3), getTables' catalog
 // views `pg_depend`/`pg_tablespace`/`pg_foreign_table` (slice 4), and the
 // `array_remove()` scalar builtin used to strip `check_option=…` from
-// `reloptions` (slice 5). **Next blocker (precise):** pg_dump's `getFuncs` query
-// LEFT-JOINs `pg_init_privs` (to diff stored `proacl` against the object's
-// initial privileges), which goopg does not expose, so the query fails with
-// `relation "pg_init_privs" does not exist`. Adding the `pg_init_privs` virtual
-// view (empty — goopg records no extension-installed initial privileges) is the
-// following DU-002 slice.
+// `reloptions` (slice 5), and the empty `pg_init_privs` virtual view that
+// `getFuncs`/`getTables`/… LEFT-JOIN to diff stored vs. initial privileges
+// (slice 6). **Next blocker (precise):** pg_dump's `getFuncs` SELECT projects
+// `p.pronargs`, `p.proacl`, `p.proowner` and filters on the `pg_cast`/
+// `pg_transform` catalogs, none of which goopg's `pg_proc` virtual view / catalog
+// expose, so the query fails with `column p.pronargs does not exist`. Adding
+// those three `pg_proc` columns plus the (empty) `pg_cast`/`pg_transform` views
+// is the following DU-002 slice.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.

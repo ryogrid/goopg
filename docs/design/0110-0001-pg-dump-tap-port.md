@@ -179,6 +179,24 @@ fixed one logical group per loop:
    the `pg_init_privs` catalog view (LEFT-JOINed to diff stored vs. initial
    privileges) — the following slice.
 
+6. **`pg_init_privs` virtual catalog view — DONE.** `getFuncs` (like
+   `getTables`/`getTypes`/…) LEFT-JOINs `pg_init_privs pip ON (p.oid=pip.objoid
+   AND pip.classoid='pg_proc'::regclass AND pip.objsubid=0)` to diff the object's
+   stored `*acl` against its initial (initdb/extension-installed) privileges; the
+   missing relation aborted the query with `relation "pg_init_privs" does not
+   exist`. Added the `pg_init_privs` virtual view (`internal/catalog/catalog.go`,
+   beside the slice-4 `pg_depend`/`pg_tablespace`/`pg_foreign_table` block) with
+   PG's exact schema (`objoid oid, classoid oid, objsubid int4, privtype "char",
+   initprivs aclitem[]`, OID 3394, and — like the upstream catalog — NO `oid`
+   system column). It is **empty by construction**: goopg installs no extensions
+   and snapshots no initdb-time ACLs, so the LEFT JOIN yields NULL `pip.initprivs`
+   and the `proacl IS DISTINCT FROM pip.initprivs` predicate degenerates to "dump
+   the full ACL", which is correct for a server that records no initial
+   privileges. After this slice `getFuncs` resolves `pg_init_privs`; the next
+   blocker is the `pg_proc` view's missing `pronargs`/`proacl`/`proowner` columns
+   (plus the `pg_cast`/`pg_transform` views the getFuncs filter references) — the
+   following slice.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

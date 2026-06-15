@@ -1169,6 +1169,26 @@ object support.
         goopg does not expose → `relation "pg_init_privs" does not exist`. Resume
         = add the `pg_init_privs` virtual view (empty — no extension-installed
         initial privileges) as slice 6, then continue the getter battery.
+      - **PROGRESS 2026-06-16 (loop #29):** **DU-002 slice 6 (`pg_init_privs`
+        virtual view) LANDED.** `getFuncs` (like `getTables`/`getTypes`/…)
+        LEFT-JOINs `pg_init_privs pip ON (p.oid=pip.objoid AND
+        pip.classoid='pg_proc'::regclass AND pip.objsubid=0)` to diff stored
+        `proacl` vs. initial privileges; the missing relation aborted with
+        `relation "pg_init_privs" does not exist`. Added the `pg_init_privs`
+        virtual view (`internal/catalog/catalog.go`, beside the slice-4
+        `pg_depend`/`pg_tablespace`/`pg_foreign_table` block) with PG's exact
+        schema (`objoid oid, classoid oid, objsubid int4, privtype "char",
+        initprivs aclitem[]`, OID 3394, and — like the upstream catalog — NO `oid`
+        system column). **Empty by construction**: goopg installs no extensions
+        and snapshots no initdb ACLs, so the LEFT JOIN yields NULL `pip.initprivs`
+        and the `proacl IS DISTINCT FROM pip.initprivs` predicate degenerates to
+        "dump the full ACL" (correct). Build/gofmt/vet clean; catalog + executor
+        suites PASS; `TestPort_PgDumpConnectionSetup` PASS (getFuncs now resolves
+        `pg_init_privs`). **Next blocker (precise):** `getFuncs` projects
+        `p.pronargs`, `p.proacl`, `p.proowner` and filters on `pg_cast`/
+        `pg_transform`, none exposed → `column p.pronargs does not exist`. Resume
+        = add those three `pg_proc` columns (`internal/initdb/pg_proc_view.go`)
+        plus the empty `pg_cast`/`pg_transform` views as slice 7.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

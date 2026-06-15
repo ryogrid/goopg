@@ -3476,6 +3476,33 @@ func (c *InMemory) registerSystemTables() {
 	pgForeignTable.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_foreign_table"] = pgForeignTable
 
+	// pg_init_privs — initial-privileges catalog (OID 3394). PG records here the
+	// privileges an object had immediately after initdb (privtype 'i') or after
+	// an extension installed it (privtype 'e'); pg_dump diffs the object's current
+	// *acl against this to dump only the privilege changes a user made. goopg
+	// installs no extensions and does not snapshot initdb-time ACLs, so this view
+	// is empty by construction. pg_dump's getTables/getFuncs/getTypes/… LEFT JOIN
+	// `pg_init_privs pip ON (c.oid=pip.objoid AND pip.classoid='<catalog>'::regclass
+	// AND pip.objsubid=0)`; with no rows the join yields NULL pip.initprivs, so the
+	// `relacl IS DISTINCT FROM pip.initprivs` predicate degenerates to "dump the
+	// full ACL", which is correct for a server that tracks no initial privileges.
+	// Schema matches PG's pg_init_privs (objoid, classoid, objsubid, privtype,
+	// initprivs); like the upstream catalog it has NO oid system column.
+	// M0110-0001 (DU-002).
+	pgInitPrivs := &Table{
+		Schema: "pg_catalog", Name: "pg_init_privs", Virtual: true,
+		Columns: []Column{
+			{Name: "objoid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "classoid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "objsubid", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "privtype", Type: Type{Name: "char"}, Ordinal: 3},
+			{Name: "initprivs", Type: Type{Name: "aclitem[]"}, Ordinal: 4},
+		},
+		OID: 3394,
+	}
+	pgInitPrivs.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_init_privs"] = pgInitPrivs
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {
