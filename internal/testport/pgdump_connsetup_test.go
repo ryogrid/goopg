@@ -56,21 +56,23 @@ package testport
 // dumped), and the empty `pg_ts_template` virtual view that `getTSTemplates`
 // reads (slice 13 — built-in text-search templates live in pg_catalog and are
 // filtered out by namespace dumpability, so an empty view is correct; only
-// user-defined TS templates are dumped).
-// **Next blocker (precise):** pg_dump's `getTSDictionaries` runs `SELECT
-// tableoid, oid, dictname, dictnamespace, dictowner, dicttemplate,
-// dictinitoption FROM pg_ts_dict`, and goopg has no queryable `pg_ts_dict`
-// relation, so the query fails with `relation "pg_ts_dict" does not exist`.
-// (Although initdb seeds a `pg_class` entry for pg_ts_dict at OID 3600, goopg's
-// query layer resolves these system catalogs via the in-memory virtual-view
-// registry, not the on-disk heap — so the on-disk row is invisible to pg_dump's
-// SELECT.) Adding an empty `pg_ts_dict` virtual view (built-in TS dictionaries
-// live in pg_catalog and are filtered out by namespace dumpability, so an empty
-// view is correct — only user-defined TS dictionaries are dumped) is the
-// following DU-002 slice. NOTE: getTSDictionaries runs AFTER getTSTemplates in
-// pg_dump's getter battery, which is why this blocker only surfaced once slice
-// 13 cleared pg_ts_template; the prior loop's "pg_ts_dict already passes" note
-// was a misread (the dump aborted at getTSTemplates before reaching it).
+// user-defined TS templates are dumped), and the empty `pg_ts_dict` virtual
+// view that `getTSDictionaries` reads (slice 14 — built-in text-search
+// dictionaries live in pg_catalog and are filtered out by namespace
+// dumpability, so an empty view is correct; only user-defined TS dictionaries
+// are dumped).
+// **Next blocker (precise):** pg_dump's `getTSConfigurations` runs `SELECT
+// tableoid, oid, cfgname, cfgnamespace, cfgowner, cfgparser FROM pg_ts_config`,
+// and goopg has no queryable `pg_ts_config` relation, so the query fails with
+// `relation "pg_ts_config" does not exist`. (Although initdb seeds a `pg_class`
+// entry for pg_ts_config, goopg's query layer resolves these system catalogs
+// via the in-memory virtual-view registry, not the on-disk heap — so the
+// on-disk row is invisible to pg_dump's SELECT.) Adding an empty `pg_ts_config`
+// virtual view (built-in TS configurations live in pg_catalog and are filtered
+// out by namespace dumpability, so an empty view is correct — only user-defined
+// TS configurations are dumped) is the following DU-002 slice. NOTE:
+// getTSConfigurations runs AFTER getTSDictionaries in pg_dump's getter battery,
+// which is why this blocker only surfaced once slice 14 cleared pg_ts_dict.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.

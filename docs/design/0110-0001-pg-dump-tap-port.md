@@ -328,6 +328,21 @@ fixed one logical group per loop:
     slice 13 cleared `pg_ts_template`; the slice-12 note that "pg_ts_dict
     already passes" was a misread — the dump aborted at `getTSTemplates` before
     reaching it.)
+14. **`pg_ts_dict` virtual view — DONE.** `getTSDictionaries` runs `SELECT
+    tableoid, oid, dictname, dictnamespace, dictowner, dicttemplate,
+    dictinitoption FROM pg_ts_dict`; goopg had no queryable `pg_ts_dict`
+    relation, so the query aborted at `relation "pg_ts_dict" does not exist`.
+    Added the empty `pg_ts_dict` virtual view (`internal/catalog/catalog.go`,
+    OID 3600, beside `pg_ts_template`) with the `pg_ts_dict.h` schema (`oid,
+    dictname name, dictnamespace oid, dictowner oid, dicttemplate oid,
+    dictinitoption text`); `dicttemplate` is an `oid` FK to `pg_ts_template`
+    (not a regproc). Empty by construction: built-in TS dictionaries live in
+    `pg_catalog` (filtered out by namespace dumpability), and goopg defines no
+    user TS dictionaries. After this slice `getTSDictionaries` completes; the
+    next blocker is `getTSConfigurations`' `SELECT tableoid, oid, cfgname,
+    cfgnamespace, cfgowner, cfgparser FROM pg_ts_config` — goopg has no
+    queryable `pg_ts_config` relation (`relation "pg_ts_config" does not
+    exist`); an empty `pg_ts_config` virtual view is the following slice.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

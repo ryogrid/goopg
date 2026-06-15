@@ -1336,6 +1336,24 @@ object support.
         invisible to pg_dump's SELECT. Resume = add an empty `pg_ts_dict`
         virtual view as slice 14 (built-in TS dictionaries live in pg_catalog,
         filtered out by namespace dumpability, so empty is correct).
+      - **PROGRESS 2026-06-16 (loop #37):** **DU-002 slice 14 (`pg_ts_dict`
+        view) LANDED.** `getTSDictionaries` runs `SELECT tableoid, oid,
+        dictname, dictnamespace, dictowner, dicttemplate, dictinitoption FROM
+        pg_ts_dict`; it aborted at `relation "pg_ts_dict" does not exist`. Added
+        the empty `pg_ts_dict` virtual view (`internal/catalog/catalog.go`, OID
+        3600, beside `pg_ts_template`) with the `pg_ts_dict.h` schema (`oid,
+        dictname name, dictnamespace oid, dictowner oid, dicttemplate oid,
+        dictinitoption text`); `dicttemplate` is an `oid` FK to pg_ts_template
+        (not a regproc), `dictinitoption` is text. Empty by construction:
+        built-in TS dictionaries live in pg_catalog (filtered out by namespace
+        dumpability), goopg defines no user TS dictionaries. Build/gofmt/vet
+        clean; catalog + initdb suites PASS; `TestPort_PgDumpConnectionSetup`
+        PASS — `getTSDictionaries` now completes. **Next blocker (precise):**
+        `getTSConfigurations` runs `SELECT tableoid, oid, cfgname, cfgnamespace,
+        cfgowner, cfgparser FROM pg_ts_config` → `relation "pg_ts_config" does
+        not exist`. Resume = add an empty `pg_ts_config` virtual view as slice
+        15 (built-in TS configs live in pg_catalog, filtered out by namespace
+        dumpability, so empty is correct).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

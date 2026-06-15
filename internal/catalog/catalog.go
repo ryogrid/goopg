@@ -3706,6 +3706,30 @@ func (c *InMemory) registerSystemTables() {
 	pgTSTemplate.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_ts_template"] = pgTSTemplate
 
+	// pg_ts_dict — text-search dictionary catalog (OID 3600). pg_dump's
+	// getTSDictionaries runs `SELECT tableoid, oid, dictname, dictnamespace,
+	// dictowner, dicttemplate, dictinitoption FROM pg_ts_dict` — it reads ALL
+	// TS dictionaries and filters out system-defined ones at dump-out time by
+	// namespace dumpability. goopg defines no user TS dictionaries, and the
+	// built-ins live in pg_catalog (never dumped), so this view is correctly
+	// empty (0 rows). dicttemplate is an oid FK to pg_ts_template (not a
+	// regproc); dictinitoption is text. Schema matches PG's pg_ts_dict
+	// (pg_ts_dict.h). M0110-0001 (DU-002 slice 14).
+	pgTSDict := &Table{
+		Schema: "pg_catalog", Name: "pg_ts_dict", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "dictname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "dictnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "dictowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "dicttemplate", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "dictinitoption", Type: Type{Name: "text"}, Ordinal: 5},
+		},
+		OID: 3600,
+	}
+	pgTSDict.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_ts_dict"] = pgTSDict
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {
