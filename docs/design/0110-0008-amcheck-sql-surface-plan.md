@@ -1,6 +1,6 @@
 # 0110-0008 — amcheck SQL surface wiring plan (M0110-0003)
 
-**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing + gap #6 LATERAL `c.oid` resolution + gap #7b non-existent-role rejection (handshake 28000) + gap #7a database-pattern resolution (row-valued `IS [NOT] NULL` semantics) + gap #7c per-database `pg_extension` scoping landed. **`002_nonesuch` now fully passes (no self-skip); AC-002 promoted to `port`/`yes`.** Remaining: S5 clog `XidStatusFunc` wiring + `AC-004`/`AC-005` TAP-port (003/004/005 under new CSV row `AC-003`).
+**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing + gap #6 LATERAL `c.oid` resolution + gap #7b non-existent-role rejection (handshake 28000) + gap #7a database-pattern resolution (row-valued `IS [NOT] NULL` semantics) + gap #7c per-database `pg_extension` scoping + **gap #8 clog-backed `XidStatusFunc` wiring** landed. **`002_nonesuch` now fully passes (no self-skip); AC-002 promoted to `port`/`yes`.** Remaining: `AC-004`/`AC-005` TAP-port (003/004/005 under new CSV row `AC-003` — real on-disk corruption injection + opclass catalog parity).
 **Scope:** the `CREATE EXTENSION amcheck` + SRF SQL surface that wires the
 already-committed `internal/amcheck` engine to the wire protocol and promotes the
 deferred `AC-002`…`AC-005` pg_amcheck TAP tests.
@@ -105,7 +105,7 @@ type-check; their execution is exercised by `003`/`004`, not `002`.
 | **S2** | `pg_extension` catalog relation + the §1 probe answerable; seed `pg_proc` rows for the three SRFs (exist, not yet callable) | **AC-002** (`002_nonesuch`) | `catalog/catalog.go`, `planner/planner.go` (FROM whitelist) |
 | **S3 ✅** | `verify_heapam(...)` SRF executor — a **thin adapter** over `amcheck.VerifyHeapRelation` (the block loop lives in the engine, `verify_heapam_relation.go`): fills a `PageSource` from the buffer pool, passes `nblocks` + `RelDesc.Natts`/`NextXid`/`RelFrozenXid` (clog-backed `XidStatusFunc` deferred — no clog handle in the executor yet), streams `HeapRelReport`s as `(blkno,offnum,attnum,msg)` rows | (toward AC-004 heap path) | `planner/{plan,planner,foldconst,unnest}.go`, `parser/select.go`, `analyzer/analyzer.go`, new `executor/operators_verify_heapam.go` + `executor.go` |
 | **S4 ✅** | `bt_index_check` / `bt_index_parent_check` scalar `void` functions over `amcheck.VerifyBtree*` — they are SELECT-list scalars (not FROM SRFs like verify_heapam), so they live in `evalFuncCall` dispatch; structural tiers (`VerifyBtreePage`/`VerifyBtreeItemOrder` per block, `VerifyBtreeLevelSiblingLinks` per level via leftmost-descent, `VerifyBtreeParentDownlinks` per internal page on parent-check) raise `XX002` on findings; `heapallindexed`/`rootdescend`/`checkunique` args accepted, deeper tiers deferred to S5 | (toward AC-003/004 index path) | `planner/planner.go` (`exprType` void), `executor/expr.go` (dispatch), new `executor/operators_bt_index_check.go` |
-| **S5 (partial)** | named-arg `:=`/`=>` parsing in both expr + FROM-SRF paths ✅; then LATERAL resolution of `c.oid`, clog `XidStatusFunc`, port `002`→`005` TAP tests, flip CSV `AC-002…AC-005`→`port`, regen md | **AC-002…AC-005** | `parser/select.go` ✅; `internal/testport/pgamcheck_port_test.go`, `docs/test-port/*` |
+| **S5 (partial)** | named-arg `:=`/`=>` parsing ✅; LATERAL resolution of `c.oid` ✅ (gap #6); clog `XidStatusFunc` ✅ (gap #8); `002_nonesuch` ported + AC-002→`port` ✅; remaining: port `003/004/005` TAP tests under `AC-003`, flip CSV `AC-003`→`port`, regen md | **AC-002 ✅ / AC-003…AC-005** | `parser/select.go` ✅; `mvcc/manager.go` ✅; `executor/operators_verify_heapam.go` ✅; `internal/testport/pgamcheck_port_test.go`, `docs/test-port/*` |
 
 New-file slices (the executor ops, the testport additions) touch **zero**
 contaminated files; only S1/S2's parser/dispatch/catalog edits and S3/S4's
@@ -418,17 +418,35 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
   `003_check.pl`/`004_verify_heapam.pl`/`005_opclass_damage.pl` remainder (real
   on-disk corruption injection + opclass catalog parity).
 
-- **After #7c:** S5 still needs the clog `XidStatusFunc` wiring (for the
-  clog-dependent verify_heapam tier), and the `AC-004`/`AC-005` TAP port (003/004/
-  005 under the new `AC-003` row).
+- **gap #8 — clog-backed `XidStatusFunc` LANDED.** The verify_heapam SRF now
+  enables the clog-dependent HOT-chain corruption tier (previously disabled with a
+  nil `XidStatus`). The wiring did **not** need a new clog handle on
+  `executor.Context` as the S3 follow-up predicted: `Context.TxnMgr`
+  (`*mvcc.Manager`) already holds the `CLog` (installed via `SetCLog`), so a new
+  snapshot-independent classifier `mvcc.Manager.ClassifyXID(xid)
+  → XidVisibilityStatus` (in-progress from the proc array, committed/aborted from
+  the in-memory aborted set + the durable CLOG, out-of-range → unknown) is the
+  single seam. `executor.verifyHeapamXidStatus(ctx)` adapts it to
+  `amcheck.XidStatusFunc`, mapping the current backend's own `ctx.Tx.XID` to
+  `XidStatusCurrent` (kept distinct from in-progress so a verify_heapam run inside
+  a writing txn does not flag its own tuples), mirroring upstream
+  `get_xid_status`. Tests: `mvcc.TestClassifyXID` /
+  `TestClassifyXID_ClogAbortedFallback`; the existing
+  `TestVerifyHeapam_*` pipeline tests now exercise the live clog tier (no false
+  positives on a healthy table).
+
+- **After #8:** S5's remaining work is the `AC-004`/`AC-005` TAP port (003/004/
+  005 under the new `AC-003` row): a real on-disk corruption-injection harness and
+  opclass catalog parity for `005_opclass_damage.pl`.
 
 ## Deferral
 
-S1+S2+S3+S4 landed (above) in worktree `m0110-0003-amcheck-sql-surface`; S5
-remains. Merging the worktree to the active branch still waits for a clean tree
-(the main-tree foreign gen-column WIP). Resume point is **Slice S5** (port the
-`AC-002`…`AC-005` pg_amcheck TAP tests, add named-arg/LATERAL + clog wiring).
-See `.ralph/deferral_ledger.md`.
+S1+S2+S3+S4 plus the S5 SQL-engine gaps (#6 LATERAL, #7a/#7b/#7c, #8 clog
+`XidStatusFunc`) have landed on the active branch; `002_nonesuch`/AC-002 is
+`port`/`yes`. Resume point is the **`AC-003` TAP port**: port `003_check.pl` /
+`004_verify_heapam.pl` / `005_opclass_damage.pl`, which need a real on-disk
+corruption-injection harness and opclass catalog parity for `005`, then flip the
+`AC-003` CSV row to `port`/`yes` and regen the md. See `.ralph/deferral_ledger.md`.
 
 **S4 carries three intentional follow-ups** (recorded so S5 does not re-discover
 them):
@@ -455,11 +473,12 @@ them):
 **S3 carries two intentional follow-ups** (recorded so S5 does not re-discover
 them):
 
-1. **clog-backed `XidStatusFunc`** — the executor `Context` has no clog handle
-   (only `TxnMgr`, which does not hold the `CLog`), so the operator passes a nil
-   `XidStatus`, which disables exactly the clog-dependent HOT-chain tier. The
-   page-structural, natts, and xmin/xmax numeric-bounds tiers (all clog-free) are
-   active. Wiring clog through `Context` enables the remaining tier.
+1. **clog-backed `XidStatusFunc`** — **LANDED as gap #8** (see above). The
+   original note assumed `Context.TxnMgr` "does not hold the `CLog`"; that was
+   wrong — the `Manager` holds the `CLog` via `SetCLog`, so no `Context` change was
+   needed. `mvcc.Manager.ClassifyXID` + `executor.verifyHeapamXidStatus` wire the
+   tier; all four tiers (page-structural, natts, xmin/xmax bounds, clog-dependent
+   HOT-chain) are now active.
 2. **named-argument + LATERAL call shape** — pg_amcheck itself issues
    `verify_heapam(relation := c.oid, on_error_stop := false, …)` correlated
    against `pg_class` (a LATERAL cross join with `:=` named args). **Named-argument

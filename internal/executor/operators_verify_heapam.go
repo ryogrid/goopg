@@ -15,15 +15,17 @@ package executor
 // Open() and replays them in Next(), so a read or range error surfaces eagerly
 // (matching the upstream SRF's first-call ereport) rather than mid-stream.
 //
-// Scope (this slice): the page-structural, natts, and xmin/xmax numeric-bounds
-// tiers, which need no clog. The clog-dependent HOT-chain tier is left disabled
-// (nil XidStatusFunc) because the executor has no clog handle yet; wiring it,
-// plus the named-argument / LATERAL call shape pg_amcheck itself emits, is the
-// S3→S5 follow-up recorded in the deferral ledger. M0110-0003.
+// Scope: the page-structural, natts, and xmin/xmax numeric-bounds tiers PLUS the
+// clog-dependent HOT-chain tier. S5 wired the latter: verifyHeapamXidStatus
+// turns the live mvcc.Manager into the engine's XidStatusFunc (committed/aborted
+// from the CLOG + aborted set, in-progress from the proc array, the current
+// backend's own XID kept distinct), so the previously-disabled clog tier now
+// runs. M0110-0003.
 
 import (
 	"github.com/goopg/goopg/internal/amcheck"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -100,6 +102,12 @@ func (o *verifyHeapamOp) Open(ctx *Context) error {
 			NextXid:      uint32(ctx.TxnMgr.NextXID()),
 			RelFrozenXid: uint32(tbl.RelFrozenXID),
 		},
+		// Clog-backed xmin classifier: enables the HOT-chain corruption tier
+		// (S5 of docs/design/0110-0008). Committed / aborted come from the CLOG
+		// + in-memory aborted set, in-progress from the proc array, and the
+		// current backend's own XID is kept distinct so a verify_heapam run
+		// inside a writing transaction does not flag its own tuples.
+		XidStatus: verifyHeapamXidStatus(ctx),
 	}
 	if sb, ok2, err2 := o.evalBlockArg(ctx, o.plan.StartBlock); err2 != nil {
 		return err2
@@ -173,6 +181,41 @@ func (o *verifyHeapamOp) evalBlockArg(ctx *Context, e planner.Expr) (int64, bool
 		return 0, false, nil
 	}
 	return d.Int, true, nil
+}
+
+// verifyHeapamXidStatus builds the engine's XidStatusFunc from the live MVCC
+// manager, the clog-backed seam the S3 operator left disabled (nil). It mirrors
+// upstream get_xid_status (verify_heapam.c): the current backend's own XID maps
+// to XidStatusCurrent (so a verify_heapam run inside a writing txn never flags
+// its own in-flight tuples), and every other normal xid is classified by
+// mvcc.Manager.ClassifyXID into in-progress / committed / aborted, with an
+// out-of-range xid resolving to XidStatusUnknown (which disables the
+// clog-dependent checks for that tuple). The engine resolves the bootstrap (1)
+// and frozen (2) xids before ever calling this, so they need no handling here.
+// Returns nil when no manager is wired, which keeps the page-bytes-only tiers
+// working exactly as before.
+func verifyHeapamXidStatus(ctx *Context) amcheck.XidStatusFunc {
+	if ctx.TxnMgr == nil {
+		return nil
+	}
+	mgr := ctx.TxnMgr
+	selfXID := ctx.Tx.XID
+	return func(xid uint32) amcheck.XidCommitStatus {
+		tid := storage.TransactionID(xid)
+		if selfXID != storage.InvalidTransactionID && tid == selfXID {
+			return amcheck.XidStatusCurrent
+		}
+		switch mgr.ClassifyXID(tid) {
+		case mvcc.XidVisInProgress:
+			return amcheck.XidStatusInProgress
+		case mvcc.XidVisCommitted:
+			return amcheck.XidStatusCommitted
+		case mvcc.XidVisAborted:
+			return amcheck.XidStatusAborted
+		default:
+			return amcheck.XidStatusUnknown
+		}
+	}
 }
 
 // verifyHeapamResolveTable converts a KindInt OID or KindString name Datum to
