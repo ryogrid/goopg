@@ -90,13 +90,17 @@ package testport
 // applies SQL/PG row null semantics to a RowExpr operand of IS [NOT] NULL
 // (evalRowNullTest), so an unmatched inclusion pattern's checkable count is 0.
 //
-// REMAINING blocker is now #7c only: per-database amcheck-installed detection
-// (`skipping database "template1": amcheck is not installed`). goopg's
-// pg_extension is a single global catalog, so amcheck installed in `postgres`
-// also appears installed in template1/template0; per-database extension-catalog
-// isolation is a separate (larger) change. The probe below keys on #7c so the
-// test self-skips on it rather than failing, while #7a/#7b above are asserted as
-// regression guards.
+// UPDATE (M0110-0003, gap #7c): FIXED — per-database amcheck-installed detection
+// (`skipping database "template1": amcheck is not installed`). goopg shares one
+// in-memory catalog across databases, so pg_extension is now scoped to the
+// connecting database: CREATE EXTENSION records the database it ran in, and the
+// executor swaps in a database-scoped pg_extension view (Context.ExtensionRows →
+// catalog.ExtensionRowsForDB). amcheck installed in `postgres` is therefore
+// invisible in template1/template0, so pg_amcheck's per-database probe returns 0
+// rows there and emits the skip warning. With #7c closed this is the LAST gap
+// for 002_nonesuch: the full command_checks_all assertion set now runs and the
+// test is pass-required (CSV row AC-002 → port). All gaps #6/#7a/#7b/#7c above
+// are asserted as regression guards; no self-skip remains.
 //
 // Like 001_basic, the bundled pg_amcheck links a PG-17+ libpq symbol
 // (PQcancelBlocking), so it is run with LD_LIBRARY_PATH pointed at
@@ -274,25 +278,22 @@ func TestPort_PgAmcheck002Nonesuch(t *testing.T) {
 			"exit=%d stderr=%q", patProbe.ExitCode, patProbe.Stderr)
 	}
 
-	// Probe for the remaining gap #7c (M0110-0003): per-database amcheck-installed
-	// detection. pg_amcheck runs `amcheck_sql` (a pg_extension ⋈ pg_namespace
-	// lookup of extname='amcheck') in each connectable database and, when amcheck
-	// is absent, warns `skipping database "<db>": amcheck is not installed`. goopg
-	// shares a single global catalog across databases, so amcheck CREATE EXTENSIONd
-	// in `postgres` also appears installed in template1/template0 — the warning
-	// never fires and template1 is checked instead of skipped. This needs
-	// per-database extension-catalog isolation, a separate (larger) change.
-	// Self-skip with the precise blocker until it lands; the full assertion set
-	// below — including the now-passing gap #7a pattern cases — then runs unchanged.
+	// Gap #7c (M0110-0003) is now FIXED: pg_extension is scoped to the connecting
+	// database, so amcheck CREATE EXTENSIONd in `postgres` is invisible to a
+	// connection bound to template1. pg_amcheck runs `amcheck_sql` (a pg_extension
+	// ⋈ pg_namespace lookup of extname='amcheck') in each connectable database;
+	// in template1 it now returns 0 rows and pg_amcheck warns `skipping database
+	// "template1": amcheck is not installed`. goopg shares one in-memory catalog
+	// across databases, so the executor swaps in a database-scoped pg_extension
+	// view (Context.ExtensionRows → catalog.ExtensionRowsForDB(connection
+	// database)); CREATE EXTENSION records the database it ran in. Assert the
+	// warning fires so a regression in the per-database scoping re-surfaces here.
 	instProbe := runAmcheck(t, c, "template1")
 	if !strings.Contains(instProbe.Stderr, `skipping database "template1": amcheck is not installed`) {
-		t.Skipf("AC-002 blocked on remaining gap #7c: per-database amcheck-installed "+
-			"detection is unimplemented — goopg's pg_extension is a single global "+
-			"catalog, so amcheck installed in `postgres` also appears installed in "+
-			"template1/template0 and the `skipping database \"template1\": amcheck is "+
-			"not installed` warning never fires (got exit=%d stderr=%q). Gaps #7a "+
-			"(database-name pattern resolution) and #7b (non-existent role rejection) "+
-			"are fixed and the heap check (gap #6) runs clean.", instProbe.ExitCode, instProbe.Stderr)
+		t.Fatalf("AC-002 gap #7c regressed: amcheck installed only in `postgres` must "+
+			"not appear installed in template1; pg_amcheck must warn `skipping database "+
+			"\"template1\": amcheck is not installed`. got exit=%d stderr=%q",
+			instProbe.ExitCode, instProbe.Stderr)
 	}
 
 	// --- Non-existent databases ------------------------------------------

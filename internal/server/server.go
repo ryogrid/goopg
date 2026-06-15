@@ -864,7 +864,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app, sessCtx, pid)
+	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app, params["database"], sessCtx, pid)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -1072,14 +1072,15 @@ func (s *Server) rollbackOpenTxnOnTeardown(connTx *connTxState, logger *slog.Log
 	}
 }
 
-func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName string, sessCtx *mctx.Context, pid uint32) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mctx.Context, pid uint32) {
 	extended := newExtendedState()
 	// Assign a ProcArray slot for this backend (M0107-0004). The slot is
 	// reused across all transactions on this connection; Begin clears and
 	// re-initialises it on each new transaction.
 	procNum := int32((pid - 1) % uint32(mvcc.DefaultProcArraySize))
-	extended.ProcNum = procNum                                 // thread through to executeExtendedQueryViaExecutor
-	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum} // per-connection explicit transaction state (M0096-0005)
+	extended.ProcNum = procNum                                                 // thread through to executeExtendedQueryViaExecutor
+	extended.DBName = dbName                                                   // scopes pg_extension per database (M0110-0003 gap #7c)
+	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum, DBName: dbName} // per-connection explicit transaction state (M0096-0005); DBName scopes pg_extension (M0110-0003 gap #7c)
 	// On connection teardown (client disconnect, EOF, read error, admin
 	// shutdown — every `return` from the loop below), roll back any still-open
 	// explicit transaction so its XID is released from the ProcArray and any

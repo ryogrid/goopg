@@ -18,7 +18,8 @@ type extendedState struct {
 	statements   map[string]*preparedStatement
 	portals      map[string]*portalState
 	syncRequired bool
-	ProcNum      int32 // backend's ProcArray slot; forwarded to Begin calls
+	ProcNum      int32  // backend's ProcArray slot; forwarded to Begin calls
+	DBName       string // connection's database; scopes pg_extension (M0110-0003 gap #7c)
 }
 
 type preparedStatement struct {
@@ -89,19 +90,19 @@ func (s *Server) handleParseFrame(state *extendedState, payload []byte) *extende
 	pr := payloadReader{buf: payload}
 	name, err := pr.readCString()
 	if err != nil {
-		return protoViolation("invalid Parse message: " + err.Error(), "server.handleParseFrame")
+		return protoViolation("invalid Parse message: "+err.Error(), "server.handleParseFrame")
 	}
 	query, err := pr.readCString()
 	if err != nil {
-		return protoViolation("invalid Parse message: " + err.Error(), "server.handleParseFrame")
+		return protoViolation("invalid Parse message: "+err.Error(), "server.handleParseFrame")
 	}
 	nTypeOIDs, err := pr.readUint16()
 	if err != nil {
-		return protoViolation("invalid Parse message: " + err.Error(), "server.handleParseFrame")
+		return protoViolation("invalid Parse message: "+err.Error(), "server.handleParseFrame")
 	}
 	for i := 0; i < int(nTypeOIDs); i++ {
 		if _, err := pr.readUint32(); err != nil {
-			return protoViolation("invalid Parse message: " + err.Error(), "server.handleParseFrame")
+			return protoViolation("invalid Parse message: "+err.Error(), "server.handleParseFrame")
 		}
 	}
 	if !pr.done() {
@@ -120,11 +121,11 @@ func (s *Server) handleBindFrame(state *extendedState, payload []byte) *extended
 	pr := payloadReader{buf: payload}
 	portalName, err := pr.readCString()
 	if err != nil {
-		return protoViolation("invalid Bind message: " + err.Error(), "server.handleBindFrame")
+		return protoViolation("invalid Bind message: "+err.Error(), "server.handleBindFrame")
 	}
 	statementName, err := pr.readCString()
 	if err != nil {
-		return protoViolation("invalid Bind message: " + err.Error(), "server.handleBindFrame")
+		return protoViolation("invalid Bind message: "+err.Error(), "server.handleBindFrame")
 	}
 	stmt, ok := state.statements[statementName]
 	if !ok {
@@ -137,20 +138,20 @@ func (s *Server) handleBindFrame(state *extendedState, payload []byte) *extended
 
 	nParamFormats, err := pr.readUint16()
 	if err != nil {
-		return protoViolation("invalid Bind message: " + err.Error(), "server.handleBindFrame")
+		return protoViolation("invalid Bind message: "+err.Error(), "server.handleBindFrame")
 	}
 	paramFormats := make([]uint16, 0, nParamFormats)
 	for i := 0; i < int(nParamFormats); i++ {
 		f, err := pr.readUint16()
 		if err != nil {
-			return protoViolation("invalid Bind message: " + err.Error(), "server.handleBindFrame")
+			return protoViolation("invalid Bind message: "+err.Error(), "server.handleBindFrame")
 		}
 		paramFormats = append(paramFormats, f)
 	}
 
 	nParams, err := pr.readUint16()
 	if err != nil {
-		return protoViolation("invalid Bind message: " + err.Error(), "server.handleBindFrame")
+		return protoViolation("invalid Bind message: "+err.Error(), "server.handleBindFrame")
 	}
 	if len(paramFormats) != 0 && len(paramFormats) != 1 && len(paramFormats) != int(nParams) {
 		return protoViolation("invalid Bind message: parameter format code count mismatch", "server.handleBindFrame")
@@ -173,7 +174,7 @@ func (s *Server) handleBindFrame(state *extendedState, payload []byte) *extended
 		}
 		vlen, err := pr.readInt32()
 		if err != nil {
-			return protoViolation("invalid Bind message: " + err.Error(), "server.handleBindFrame")
+			return protoViolation("invalid Bind message: "+err.Error(), "server.handleBindFrame")
 		}
 		if vlen < -1 {
 			return protoViolation("invalid Bind message: negative parameter length", "server.handleBindFrame")
@@ -184,20 +185,20 @@ func (s *Server) handleBindFrame(state *extendedState, payload []byte) *extended
 		}
 		b, err := pr.readBytes(int(vlen))
 		if err != nil {
-			return protoViolation("invalid Bind message: " + err.Error(), "server.handleBindFrame")
+			return protoViolation("invalid Bind message: "+err.Error(), "server.handleBindFrame")
 		}
 		params = append(params, boundParam{Text: string(b)})
 	}
 
 	nResultFormats, err := pr.readUint16()
 	if err != nil {
-		return protoViolation("invalid Bind message: " + err.Error(), "server.handleBindFrame")
+		return protoViolation("invalid Bind message: "+err.Error(), "server.handleBindFrame")
 	}
 	resultFormats := make([]uint16, 0, nResultFormats)
 	for i := 0; i < int(nResultFormats); i++ {
 		f, err := pr.readUint16()
 		if err != nil {
-			return protoViolation("invalid Bind message: " + err.Error(), "server.handleBindFrame")
+			return protoViolation("invalid Bind message: "+err.Error(), "server.handleBindFrame")
 		}
 		resultFormats = append(resultFormats, f)
 	}
@@ -229,11 +230,11 @@ func (s *Server) handleDescribeFrame(state *extendedState, payload []byte, w *pr
 	pr := payloadReader{buf: payload}
 	kind, err := pr.readByte()
 	if err != nil {
-		return protoViolation("invalid Describe message: " + err.Error(), "server.handleDescribeFrame"), nil
+		return protoViolation("invalid Describe message: "+err.Error(), "server.handleDescribeFrame"), nil
 	}
 	name, err := pr.readCString()
 	if err != nil {
-		return protoViolation("invalid Describe message: " + err.Error(), "server.handleDescribeFrame"), nil
+		return protoViolation("invalid Describe message: "+err.Error(), "server.handleDescribeFrame"), nil
 	}
 	if !pr.done() {
 		return protoViolation("invalid Describe message: trailing bytes", "server.handleDescribeFrame"), nil
@@ -293,11 +294,11 @@ func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, p
 	pr := payloadReader{buf: payload}
 	portalName, err := pr.readCString()
 	if err != nil {
-		return protoViolation("invalid Execute message: " + err.Error(), "server.handleExecuteFrame"), nil
+		return protoViolation("invalid Execute message: "+err.Error(), "server.handleExecuteFrame"), nil
 	}
 	maxRows, err := pr.readInt32()
 	if err != nil {
-		return protoViolation("invalid Execute message: " + err.Error(), "server.handleExecuteFrame"), nil
+		return protoViolation("invalid Execute message: "+err.Error(), "server.handleExecuteFrame"), nil
 	}
 	if !pr.done() {
 		return protoViolation("invalid Execute message: trailing bytes", "server.handleExecuteFrame"), nil
@@ -313,7 +314,7 @@ func (s *Server) handleExecuteFrame(ctx context.Context, state *extendedState, p
 	}
 
 	if portal.Result == nil {
-		res, qerr := s.executeExtendedQuery(ctx, sess, portal.Statement.Query, portal.Params, state.ProcNum)
+		res, qerr := s.executeExtendedQuery(ctx, sess, portal.Statement.Query, portal.Params, state.ProcNum, state.DBName)
 		if qerr != nil {
 			return &extendedMessageError{Code: qerr.Code, Message: qerr.Message, Position: qerr.Position, Routine: "server.handleExecuteFrame"}, nil
 		}
@@ -375,11 +376,11 @@ func (s *Server) handleCloseFrame(state *extendedState, payload []byte) *extende
 	pr := payloadReader{buf: payload}
 	kind, err := pr.readByte()
 	if err != nil {
-		return protoViolation("invalid Close message: " + err.Error(), "server.handleCloseFrame")
+		return protoViolation("invalid Close message: "+err.Error(), "server.handleCloseFrame")
 	}
 	name, err := pr.readCString()
 	if err != nil {
-		return protoViolation("invalid Close message: " + err.Error(), "server.handleCloseFrame")
+		return protoViolation("invalid Close message: "+err.Error(), "server.handleCloseFrame")
 	}
 	if !pr.done() {
 		return protoViolation("invalid Close message: trailing bytes", "server.handleCloseFrame")
@@ -402,7 +403,7 @@ func (s *Server) handleCloseFrame(state *extendedState, payload []byte) *extende
 	}
 }
 
-func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32, dbName string) (*extendedQueryResult, *extendedQueryError) {
 	trimmed, matchable, upper, empty := normalizeSimpleQuery(query)
 	if empty {
 		return &extendedQueryResult{Empty: true}, nil
@@ -504,7 +505,7 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 		}
 	}
 	if s.cfg.hasStorage() {
-		return s.executeExtendedQueryViaExecutor(ctx, sess, trimmed, params, procNum)
+		return s.executeExtendedQueryViaExecutor(ctx, sess, trimmed, params, procNum, dbName)
 	}
 
 	if len(params) > 0 {

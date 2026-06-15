@@ -341,6 +341,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.PrepStmtsRows = prepStmts.ListRows
 	}
 
+	// Wire the per-database pg_extension view (M0110-0003 gap #7c): goopg shares
+	// one in-memory catalog across all databases, so pg_extension is scoped to
+	// the connecting database here. Mirrors the extended-query path in
+	// executeExtendedQueryViaExecutor.
+	if connTx != nil {
+		s.wireExtensionRows(ectx, connTx.DBName)
+	}
+
 	// Update pg_stat_activity before dispatching.
 	// M0107-0005: use procNum (int32) for the atomic hot path.
 	if reg := s.cfg.Activity; reg != nil && connTx != nil {
@@ -1301,6 +1309,23 @@ func coerceExecParam(d executor.Datum, targetType string) executor.Datum {
 // state so BEGIN/COMMIT/ROLLBACK can open/close real TxnMgr transactions.
 // undoEnumDDLForRollback reverses enum DDL (ADD VALUE, RENAME TO, CREATE TYPE AS ENUM)
 // recorded in connTx.  Must be called before connTx.End() on ROLLBACK paths.  M0097-0022.
+// extensionLister is implemented by catalogs that can scope pg_extension rows
+// to a single database (catalog.InMemory). M0110-0003 (AC-002 gap #7c).
+type extensionLister interface {
+	ExtensionRowsForDB(db string) [][]string
+}
+
+// wireExtensionRows installs the per-database pg_extension view on ectx so an
+// extension installed in one database is invisible in another (PostgreSQL's
+// pg_extension is per-database; goopg shares one in-memory catalog). Used by
+// both the simple- and extended-query executor paths. M0110-0003 (gap #7c).
+func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
+	ectx.CurrentDatabase = dbName
+	if el, ok := s.cfg.Catalog.(extensionLister); ok {
+		ectx.ExtensionRows = func() [][]string { return el.ExtensionRowsForDB(dbName) }
+	}
+}
+
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
 	if connTx == nil {
 		return

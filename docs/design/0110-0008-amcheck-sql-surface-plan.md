@@ -1,6 +1,6 @@
 # 0110-0008 — amcheck SQL surface wiring plan (M0110-0003)
 
-**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing + gap #6 LATERAL `c.oid` resolution + gap #7b non-existent-role rejection (handshake 28000) + gap #7a database-pattern resolution (row-valued `IS [NOT] NULL` semantics) landed; S5 clog `XidStatusFunc` + AC-002…AC-005 TAP-port remain. `002_nonesuch` now self-skips on gap #7c (per-database amcheck-installed detection) while asserting gaps #7a/#7b as regression guards.
+**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing + gap #6 LATERAL `c.oid` resolution + gap #7b non-existent-role rejection (handshake 28000) + gap #7a database-pattern resolution (row-valued `IS [NOT] NULL` semantics) + gap #7c per-database `pg_extension` scoping landed. **`002_nonesuch` now fully passes (no self-skip); AC-002 promoted to `port`/`yes`.** Remaining: S5 clog `XidStatusFunc` wiring + `AC-004`/`AC-005` TAP-port (003/004/005 under new CSV row `AC-003`).
 **Scope:** the `CREATE EXTENSION amcheck` + SRF SQL surface that wires the
 already-committed `internal/amcheck` engine to the wire protocol and promotes the
 deferred `AC-002`…`AC-005` pg_amcheck TAP tests.
@@ -383,22 +383,44 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
   binary: `--database qqq --database postgres` must exit 1 with
   `no connectable databases to check matching "qqq"`).
 
-- **Remaining for AC-002 — gap #7c only.** With #7a/#7b closed, the sole remaining
-  blocker is per-database amcheck-installed detection: pg_amcheck runs
-  `amcheck_sql` (a `pg_extension ⋈ pg_namespace` lookup of `extname='amcheck'`) in
-  each connectable database and warns `skipping database "<db>": amcheck is not
-  installed` when amcheck is absent. goopg shares a single global catalog across
-  databases, so amcheck `CREATE EXTENSION`d in `postgres` also appears installed in
-  `template1`/`template0` and the warning never fires (template1 is checked instead
-  of skipped). This needs per-database extension-catalog isolation, a separate
-  (larger) change. Until it lands, `002_nonesuch` self-skips via its updated probe
-  (runs `pg_amcheck template1`, detects the missing
-  `skipping database "template1": amcheck is not installed` warning) while
-  asserting gaps #7a and #7b as regression guards.
+- **gap #7c (per-database amcheck-installed detection) — LANDED.** pg_amcheck
+  runs `amcheck_sql` (a `pg_extension ⋈ pg_namespace` lookup of
+  `extname='amcheck'`) in each connectable database and warns `skipping database
+  "<db>": amcheck is not installed` when amcheck is absent. goopg shares a single
+  in-memory catalog across databases, so amcheck `CREATE EXTENSION`d in `postgres`
+  previously also appeared installed in `template1`/`template0`, the warning never
+  fired, and template1 was checked instead of skipped. Fix: **scope pg_extension
+  to the connecting database** — mirroring PostgreSQL, where `pg_extension` is a
+  per-database catalog.
+  - `catalog.extensionRow` gains a `database` field; `CreateExtension` records the
+    connecting database (defaulted empty = visible everywhere, for direct/embedded
+    callers). A new `(*InMemory).ExtensionRowsForDB(db)` filters the global
+    registry to rows scoped to `db` (or unscoped); the table-level `VirtualRows`
+    callback shares the same locked builder with an empty filter (returns all).
+  - The connecting database is threaded from the startup packet
+    (`params["database"]`) → `connTxState.DBName` / `extendedState.DBName` →
+    `executor.Context.CurrentDatabase`. The server wires
+    `Context.ExtensionRows = ExtensionRowsForDB(DBName)` in **both** the simple-
+    (`dispatch.go`) and extended-query (`dispatch_extended.go`) paths via the
+    shared `Server.wireExtensionRows` helper, so the two sibling paths agree.
+  - `valuesOp.Open` swaps in `ctx.ExtensionRows()` for the `pg_extension` virtual
+    table when present, exactly like the existing per-connection
+    `pg_prepared_statements` lister. `execCreateExtension` passes
+    `o.ctx.CurrentDatabase` to `CreateExtension`.
+  - Unit tests: `catalog.TestExtensionRowsForDB{,_UnscopedVisibleEverywhere}`,
+    `TestExtensionVirtualRowsGlobal`. `TestPort_PgAmcheck002Nonesuch` now runs the
+    **full** `command_checks_all` assertion set (no self-skip) and asserts the
+    template1 skip warning as a regression guard.
+
+- **AC-002 promoted.** With #7c closed, `002_nonesuch` is the first fully passing
+  pg_amcheck server-dependent TAP test. CSV split: `AC-002` →
+  `002_nonesuch.pl`/`port`/`yes`; new `AC-003` carries the still-deferred
+  `003_check.pl`/`004_verify_heapam.pl`/`005_opclass_damage.pl` remainder (real
+  on-disk corruption injection + opclass catalog parity).
 
 - **After #7c:** S5 still needs the clog `XidStatusFunc` wiring (for the
-  clog-dependent verify_heapam tier), and the `AC-002`…`AC-005` TAP port + CSV
-  flip.
+  clog-dependent verify_heapam tier), and the `AC-004`/`AC-005` TAP port (003/004/
+  005 under the new `AC-003` row).
 
 ## Deferral
 

@@ -358,6 +358,18 @@ type Context struct {
 	// Wired by the server from the per-connection preparedStatements store.
 	PrepStmtsRows func() [][]string
 
+	// CurrentDatabase is the name of the database this connection is bound to
+	// (from the startup packet). Used to scope per-database catalogs such as
+	// pg_extension. Empty in embedded/test contexts. M0110-0003 (AC-002 gap #7c).
+	CurrentDatabase string
+
+	// ExtensionRows, when non-nil, is called by the valuesOp that backs
+	// pg_extension to return the rows visible in CurrentDatabase. pg_extension is
+	// per-database in PostgreSQL but goopg shares one in-memory catalog, so the
+	// server wires this to catalog.ExtensionRowsForDB(CurrentDatabase) to filter
+	// the global registry per connecting database. M0110-0003 (AC-002 gap #7c).
+	ExtensionRows func() [][]string
+
 	// NonSuperuserRole, when non-empty, means the session is currently running
 	// under a non-superuser role (set via SET SESSION AUTHORIZATION). Privilege
 	// checks that require superuser (e.g. LEAKPROOF function attribute) must

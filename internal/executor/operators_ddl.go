@@ -185,7 +185,7 @@ func (o *ddlOp) execCreateExtension(s *parser.CreateExtensionStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	if err := o.ctx.Catalog.CreateExtension(s.Name, schema, version, s.IfNotExists); err != nil {
+	if err := o.ctx.Catalog.CreateExtension(s.Name, schema, version, o.ctx.CurrentDatabase, s.IfNotExists); err != nil {
 		// Only failure mode is a duplicate without IF NOT EXISTS.
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
