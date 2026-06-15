@@ -1,40 +1,45 @@
-Task: M0110-0003 (pg_amcheck) — loop #15. COMPLETE for the heap-table
-file-removal corruption tier of 003_check.pl. Committed.
+Task: M0110-0003 (pg_amcheck) — loop #16. Extended the 002_nonesuch.pl port
+(AC-002, already `port`) with two more faithful sections. COMMITTED-pending.
 
 === WHAT LANDED (this loop) ===
-goopg now detects a removed HEAP main fork as corruption, the companion to
-loop #14's index fork. Mirrors upstream verify_heapam opening the relation's
-main fork (RelationGetNumberOfBlocks → mdnblocks fails for a removed file).
-Root cause it fixes: goopg smgr opens files with os.O_CREATE, so Pool.NBlocks
-on a removed heap fork RECREATED it empty → VerifyHeapRelation reported the
-table "clean" (silent false negative).
+TestPort_PgAmcheck002Nonesuch now covers two later sections of the upstream .pl:
+- the big `--no-strict-names` multi-pattern case (per-arg-kind warnings:
+  no-heap-tables / no-btree-indexes / no-relations / no-connectable-databases,
+  anchored by the existent `postgres.pg_catalog.pg_class` so exit stays 0);
+- the cross-database "existent objects in the wrong databases" case
+  (template1 / another_db / no_such_database; CREATE TABLE/INDEX + CREATE DATABASE).
+Both PASS. No engine code changed — pure faithful test transcription + docs.
 Files:
-- internal/storage/smgr.go: + Manager.RelPath(rel) — data-dir-relative
-  base/<db>/<relfile> path (forward slashes), faithful to upstream relpath().
-- internal/storage/bufpool.go: + Pool.RelPath delegate.
-- internal/executor/operators_verify_heapam.go: verifyHeapamOp.Open calls
-  ctx.Pool.Exists(rel) BEFORE NBlocks; absent → ExecError 58030
-  (ERRCODE_IO_ERROR, what errcode_for_file_access yields for ENOENT)
-  `could not open file "%s": No such file or directory` via Pool.RelPath.
-- internal/executor/operators_verify_heapam_test.go: + TestVerifyHeapam_
-  DetectsMissingRelationFile (drops fork via DropRelation, asserts msg).
-- internal/testport/pgamcheck003_missingheap_test.go (NEW): e2e through the
-  real pg_amcheck, stop→unlink→restart, exit 2 + verbatim report, asserts the
-  fork is NOT recreated on restart. PASS 7.0s.
-Docs: CSV AC-003 rationale + md regenerated; design 0110-0003 appended
-("Missing-heap-relation-file tier"); fix_plan + deferral ledger updated.
-Gates: go build ./... clean; full internal/testport pg_amcheck suite PASS
-(20.4s); internal/executor + internal/storage PASS; go vet clean.
-NOTE: gofmt -l still flags internal/storage/bufpool.go for PRE-EXISTING drift
-(statePin alignment L34-40 + double blanks L728/L1333) — NOT my edit; my
-RelPath hunk is clean (confirmed via gofmt -d). Left untouched per loop #14.
+- internal/testport/pgamcheck002_port_test.go (+2 sections; header UPDATE note;
+  inline comments documenting the two deferred sections at their call sites).
+- docs/test-port/postgres-oracle-port-status.csv (AC-002 rationale extended);
+  .md regenerated via `go run ./cmd/gen-oracle-port-status`.
+- docs/design/0110-0003-pg-amcheck-tap-port.md (+ "002_nonesuch coverage
+  extension" section incl. the two residuals).
+- .ralph/deferral_ledger.md (loop #16 entry).
+Gates: go build ./... clean; gofmt clean; vet clean; full internal/testport
+pg_amcheck suite PASS (20.4s). TPC-H spotcheck N/A (no engine change, no data dir).
+
+=== TWO DEFERRED RESIDUALS of 002_nonesuch.pl (NOT ported) ===
+1. `datconnlimit = -2` invalid-database filter: needs a runtime pg_database
+   shared-catalog write goopg lacks (UPDATE is a silent no-op; see memory
+   goopg_no_runtime_shared_catalog_inplace_update). Separate capability.
+2. `--exclude-schema` cases: NEW ENGINE BUG. pg_amcheck's exclude-CTE anti-join
+   (`... LEFT OUTER JOIN exclude_pat ep WHERE ep.pattern_id IS NULL`) PANICS the
+   backend. Pinned to the `toast` sub-CTE: a 5-col `exclude_pat` VALUES build
+   relation gets a build-side filter carrying combined-join-schema column
+   indices → `index out of range [43] with length 5` in MaterializedSlot.Get
+   via joinOp.Open→drainRowsCtx→filterOp.Next→evalExprSlot. The 4-way `index`
+   sub-CTE (same anti-join, relation on outer side) does NOT crash. Repro: see
+   deferral ledger / design doc. Planner/executor column-remap defect; safe fix
+   needs full TPC-H row-count gates (column-index bugs = most expensive failure).
 
 === NEXT STEP (resume) ===
-AC-003 stays `defer`. Both file-removal cases done; remaining 003_check tiers
-are unsupported-feature/corruption: hash/gist/gin/brin/spgist index AMs,
-box/int4range/int4[] types, STORAGE EXTERNAL TOAST corruption, page-overwrite
-mechanics for unsupported relkinds, multi-DB orchestration; and
-005_opclass_damage (CREATE OPERATOR CLASS + pg_amproc parity). Other open
-milestones: M0095-0003 recvlogical (030, logical decoding, large); M0110-0001
-pg_dump 002; M0110-0002 pg_waldump 002 (PG-format heap WAL FPI); M0117-0006/7/8
-(Effort-L CLOG memory-model, defer to full-gate sessions).
+Either: (a) fix residual #2 (the toast-CTE build-side column-index panic — a
+GENERAL planner correctness fix worth its own gated loop; start at
+operators_join_agg.go drainRowsCtx + how build-side filter predicate column
+indices are assigned relative to the join's narrow build input); or (b) move to
+another open milestone: M0095-0003 recvlogical (030, logical decoding, large);
+M0110-0001 pg_dump 002 (catalog parity); M0110-0002 pg_waldump 002 (PG-format
+heap WAL FPI); AC-003 remaining 003_check tiers (index AMs / types / TOAST
+corruption) + 005_opclass_damage; M0117-0006/7/8 (Effort-L, defer).

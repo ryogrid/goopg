@@ -102,6 +102,20 @@ package testport
 // test is pass-required (CSV row AC-002 → port). All gaps #6/#7a/#7b/#7c above
 // are asserted as regression guards; no self-skip remains.
 //
+// UPDATE (M0110-0003, coverage extension): the port now also covers
+// 002_nonesuch.pl's later sections — the big `--no-strict-names` multi-pattern
+// case (per-argument-kind warnings: "no heap tables"/"no btree indexes"/"no
+// relations"/"no connectable databases" matching, with the one existent
+// `postgres.pg_catalog.pg_class` anchor keeping exit 0) and the cross-database
+// "existent objects in the wrong databases" case (objects that exist in
+// `postgres` but are referenced under template1/another_db/no_such_database).
+// Two of the .pl's sections remain DEFERRED, documented inline at their call
+// sites: (1) the `datconnlimit = -2` invalid-database filter (needs a runtime
+// pg_database shared-catalog write goopg lacks), and (2) the `--exclude-schema`
+// cases (pg_amcheck's exclude-CTE anti-join PANICS the backend with a
+// build-side column-index out-of-range — a separate planner defect tracked as
+// an M0110-0003 residual).
+//
 // Like 001_basic, the bundled pg_amcheck links a PG-17+ libpq symbol
 // (PQcancelBlocking), so it is run with LD_LIBRARY_PATH pointed at
 // postgres/local_install/lib.
@@ -388,4 +402,116 @@ func TestPort_PgAmcheck002Nonesuch(t *testing.T) {
 	checkAmcheck(t, c, "ungrammatical exclude-database",
 		[]string{"--no-strict-names", "--exclude-database", "a.b"}, 2,
 		[]string{`pg_amcheck: error: improper qualified name \(too many dotted names\): a\.b`})
+
+	// --- Non-existent databases, schemas, tables, and indexes ------------
+	// Use --no-strict-names and a single existent table (postgres.pg_catalog.pg_class)
+	// so we only get warnings about the failed pattern matches, not an error.
+	// Each unmatched pattern emits a warning categorised by its argument kind:
+	// --table → "no heap tables", --index → "no btree indexes", --relation →
+	// "no relations", and a database part that resolves to nothing →
+	// "no connectable databases".
+	checkAmcheck(t, c, "many unmatched patterns and one matched pattern under --no-strict-names",
+		[]string{
+			"--no-strict-names",
+			"--table", "no_such_table",
+			"--table", "no*such*table",
+			"--index", "no_such_index",
+			"--index", "no*such*index",
+			"--relation", "no_such_relation",
+			"--relation", "no*such*relation",
+			"--database", "no_such_database",
+			"--database", "no*such*database",
+			"--relation", "none.none",
+			"--relation", "none.none.none",
+			"--relation", "postgres.none.none",
+			"--relation", "postgres.pg_catalog.none",
+			"--relation", "postgres.none.pg_class",
+			"--table", "postgres.pg_catalog.pg_class", // This exists
+		}, 0,
+		[]string{
+			`pg_amcheck: warning: no heap tables to check matching "no_such_table"`,
+			`pg_amcheck: warning: no heap tables to check matching "no\*such\*table"`,
+			`pg_amcheck: warning: no btree indexes to check matching "no_such_index"`,
+			`pg_amcheck: warning: no btree indexes to check matching "no\*such\*index"`,
+			`pg_amcheck: warning: no relations to check matching "no_such_relation"`,
+			`pg_amcheck: warning: no relations to check matching "no\*such\*relation"`,
+			`pg_amcheck: warning: no heap tables to check matching "no\*such\*table"`,
+			`pg_amcheck: warning: no connectable databases to check matching "no_such_database"`,
+			`pg_amcheck: warning: no connectable databases to check matching "no\*such\*database"`,
+			`pg_amcheck: warning: no relations to check matching "none\.none"`,
+			`pg_amcheck: warning: no connectable databases to check matching "none\.none\.none"`,
+			`pg_amcheck: warning: no relations to check matching "postgres\.none\.none"`,
+			`pg_amcheck: warning: no relations to check matching "postgres\.pg_catalog\.none"`,
+			`pg_amcheck: warning: no relations to check matching "postgres\.none\.pg_class"`,
+		})
+
+	// --- Invalid / partially dropped database won't be targeted ----------
+	// NOT PORTED (deferred, AC-002 residual #1). 002_nonesuch.pl marks a
+	// database invalid with `UPDATE pg_database SET datconnlimit = -2` and
+	// asserts pg_amcheck's database-resolution query filters it out. goopg
+	// has no runtime in-place update of on-disk shared catalogs (pg_database
+	// is initdb-only; the in-memory InMemory catalog is the runtime truth and
+	// exposes no datconnlimit write path) — see memory
+	// goopg_no_runtime_shared_catalog_inplace_update. The UPDATE is silently a
+	// no-op, so regression_invalid stays connectable and pg_amcheck reaches it
+	// (emitting `skipping database "regression_invalid": amcheck is not
+	// installed` + `no relations to check` instead of the expected `no
+	// connectable databases to check matching "regression_invalid"`). Porting
+	// this section requires the runtime pg_database.datconnlimit write
+	// capability, which is a separate milestone, not an amcheck concern.
+
+	// --- Existent objects but in databases where they do not exist -------
+	if err := runSQLSimple(t, c, "CREATE TABLE public.foo (f integer)"); err != nil {
+		t.Fatalf("CREATE TABLE public.foo: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_idx ON foo(f)"); err != nil {
+		t.Fatalf("CREATE INDEX foo_idx: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DATABASE another_db"); err != nil {
+		t.Fatalf("CREATE DATABASE another_db: %v", err)
+	}
+
+	checkAmcheck(t, c, "existent objects in the wrong databases",
+		[]string{
+			"--database", "postgres",
+			"--no-strict-names",
+			"--table", "template1.public.foo",
+			"--table", "another_db.public.foo",
+			"--table", "no_such_database.public.foo",
+			"--index", "template1.public.foo_idx",
+			"--index", "another_db.public.foo_idx",
+			"--index", "no_such_database.public.foo_idx",
+		}, 1,
+		[]string{
+			`pg_amcheck: warning: skipping database "template1": amcheck is not installed`,
+			`pg_amcheck: warning: no heap tables to check matching "template1\.public\.foo"`,
+			`pg_amcheck: warning: no heap tables to check matching "another_db\.public\.foo"`,
+			`pg_amcheck: warning: no connectable databases to check matching "no_such_database\.public\.foo"`,
+			`pg_amcheck: warning: no btree indexes to check matching "template1\.public\.foo_idx"`,
+			`pg_amcheck: warning: no btree indexes to check matching "another_db\.public\.foo_idx"`,
+			`pg_amcheck: warning: no connectable databases to check matching "no_such_database\.public\.foo_idx"`,
+			`pg_amcheck: error: no relations to check`,
+		})
+
+	// --- Schema exclusion patterns ---------------------------------------
+	// NOT PORTED (deferred, AC-002 residual #2 — a genuine engine BUG, filed
+	// separately). 002_nonesuch.pl's final two cases pass `--exclude-schema`,
+	// which makes pg_amcheck issue a relation-gathering query with an
+	// `exclude_raw (...) AS (VALUES ...)`/`exclude_pat` CTE and an anti-join
+	// `... LEFT OUTER JOIN exclude_pat ep ON (...) WHERE ep.pattern_id IS NULL`.
+	// goopg PANICS the backend on this query shape — specifically the `toast`
+	// sub-CTE, where a CTE-backed relation is the probe side and the 5-column
+	// `exclude_pat` VALUES relation is the build side: a build-side filter
+	// predicate carries combined-join-schema column indices (e.g. index 43)
+	// but is evaluated against the 5-wide build slot →
+	// `runtime error: index out of range [43] with length 5` in
+	// executor.MaterializedSlot.Get (slot.go), via joinOp.Open → drainRowsCtx
+	// → filterOp.Next → evalExprSlot. The 4-way `index` sub-CTE (same anti-join
+	// shape, but `relation` on the outer side) does NOT crash, so the bug is a
+	// build-side predicate column-remap when the inner/build input is a narrow
+	// VALUES/CTE relation. This is a planner/executor column-indexing defect,
+	// not amcheck-specific; fixing it safely needs the full TPC-H row-count
+	// gates (column-index bugs are this project's most expensive failure mode).
+	// Tracked as M0110-0003 residual; see deferral ledger. The two
+	// exclude-schema cases promote once the panic is fixed.
 }
