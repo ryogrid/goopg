@@ -4061,6 +4061,54 @@ func (c *InMemory) registerSystemTables() {
 	pgLargeobjectMetadata.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_largeobject_metadata"] = pgLargeobjectMetadata
 
+	// pg_amop — access-method operator catalog (OID 2602). After getBlobs,
+	// pg_dump's getDependencies issues a pg_depend UNION that joins both pg_amop
+	// and pg_amproc to resolve operator-family member dependencies (so they are
+	// not dumped as standalone objects). goopg has no user-defined operator
+	// classes/families feeding this dump path, so an empty view (0 rows) is
+	// correct, identical to a stock PG cluster with no user opclasses. Schema
+	// matches PG's pg_amop (pg_amop.h): oid, amopfamily oid, amoplefttype oid,
+	// amoprighttype oid, amopstrategy int2, amoppurpose "char", amopopr oid,
+	// amopmethod oid, amopsortfamily oid. M0110-0001 (DU-002 slice 30).
+	pgAmop := &Table{
+		Schema: "pg_catalog", Name: "pg_amop", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "amopfamily", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "amoplefttype", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "amoprighttype", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "amopstrategy", Type: Type{Name: "int2"}, Ordinal: 4},
+			{Name: "amoppurpose", Type: Type{Name: "char"}, Ordinal: 5},
+			{Name: "amopopr", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "amopmethod", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "amopsortfamily", Type: Type{Name: "oid"}, Ordinal: 8},
+		},
+		OID: 2602,
+	}
+	pgAmop.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_amop"] = pgAmop
+
+	// pg_amproc — access-method support-procedure catalog (OID 2603). Joined
+	// alongside pg_amop in the same getDependencies pg_depend UNION (see pg_amop
+	// above). goopg has no user-defined operator classes/families, so an empty
+	// view (0 rows) is correct. Schema matches PG's pg_amproc (pg_amproc.h):
+	// oid, amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum
+	// int2, amproc regproc. M0110-0001 (DU-002 slice 30).
+	pgAmproc := &Table{
+		Schema: "pg_catalog", Name: "pg_amproc", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "amprocfamily", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "amproclefttype", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "amprocrighttype", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "amprocnum", Type: Type{Name: "int2"}, Ordinal: 4},
+			{Name: "amproc", Type: Type{Name: "regproc"}, Ordinal: 5},
+		},
+		OID: 2603,
+	}
+	pgAmproc.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_amproc"] = pgAmproc
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

@@ -697,6 +697,25 @@ fixed one logical group per loop:
     family member dependencies) — an empty-view slice for `pg_amop` (OID 2602)
     and `pg_amproc` (OID 2603) is next.
 
+30. **`pg_amop` + `pg_amproc` empty virtual views — DONE.** pg_dump's
+    `getDependencies` issues a `pg_depend` UNION that joins both `pg_amop` and
+    `pg_amproc` to resolve operator-family member dependencies (so they are not
+    dumped as standalone objects). goopg has no user-defined operator
+    classes/families feeding this dump path, so empty views (0 rows each) are
+    correct. Added both beside `pg_largeobject_metadata` in
+    `internal/catalog/catalog.go`. Schemas: `pg_amop` (OID 2602, `pg_amop.h`):
+    oid, amopfamily oid, amoplefttype oid, amoprighttype oid, amopstrategy int2,
+    amoppurpose "char", amopopr oid, amopmethod oid, amopsortfamily oid;
+    `pg_amproc` (OID 2603, `pg_amproc.h`): oid, amprocfamily oid, amproclefttype
+    oid, amprocrighttype oid, amprocnum int2, amproc regproc. After this slice
+    the dependency-collection UNION passes; the **new** blocker is `relation
+    "pg_seclabels" does not exist` (security-label collection `getSecLabels`:
+    `SELECT label, provider, classoid, objoid, objsubid FROM
+    pg_catalog.pg_seclabels ORDER BY classoid, objoid, objsubid`). In stock PG
+    `pg_seclabels` is a system view over `pg_seclabel` + `pg_shseclabel`; goopg
+    supports no SECURITY LABEL, so an empty-view slice (cols: label text,
+    provider text, classoid oid, objoid oid, objsubid int4) is next.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

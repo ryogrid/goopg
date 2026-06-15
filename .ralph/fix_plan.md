@@ -1683,6 +1683,24 @@ object support.
         (`pg_amop.h`, OID 2602) + `pg_amproc` (`pg_amproc.h`, OID 2603) virtual
         views — empty-view pattern (no user opclasses feeding this dump path →
         0 rows).
+      - **PROGRESS 2026-06-16 (loop #53):** **DU-002 slice 30 LANDED.** Empty
+        `pg_amop` (OID 2602) + `pg_amproc` (OID 2603) virtual views in
+        `internal/catalog/catalog.go` beside `pg_largeobject_metadata` — pg_dump's
+        `getDependencies` `pg_depend` UNION joining both for opfamily member
+        dependencies now resolves (no user opclasses → 0 rows each). Schemas per
+        `pg_amop.h` (oid, amopfamily, amoplefttype, amoprighttype, amopstrategy
+        int2, amoppurpose "char", amopopr, amopmethod, amopsortfamily) and
+        `pg_amproc.h` (oid, amprocfamily, amproclefttype, amprocrighttype,
+        amprocnum int2, amproc regproc). build/gofmt/vet clean; catalog suite
+        PASS; `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** pg_dump advances to security-label collection
+        (`getSecLabels`) → `relation "pg_seclabels" does not exist` (`SELECT
+        label, provider, classoid, objoid, objsubid FROM pg_catalog.pg_seclabels
+        ORDER BY classoid, objoid, objsubid`). Resume = slice 31: add the empty
+        `pg_seclabels` virtual view (stock PG: system view over pg_seclabel +
+        pg_shseclabel; goopg has no SECURITY LABEL → 0 rows). Cols the query
+        needs: label text, provider text, classoid oid, objoid oid, objsubid int4
+        (full view also carries objtype text, objnamespace oid, objname text).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

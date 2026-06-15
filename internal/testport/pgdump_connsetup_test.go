@@ -143,17 +143,25 @@ package testport
 // pg_largeobject_metadata ORDER BY lomowner, lomacl::pg_catalog.text, oid` no
 // longer errors (goopg has no large objects → 0 rows; the acldefault projection
 // is never evaluated over the empty set). Cols: oid, lomowner oid, lomacl aclitem[].
-// **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// advances to dependency collection (getDependencies) and fails with
-// `relation "pg_amproc" does not exist` (query joins pg_depend with pg_amop and
-// pg_amproc to surface opfamily member dependencies). The next DU-002 slice adds
-// the empty `pg_amop` (OID 2602) + `pg_amproc` (OID 2603) virtual views — goopg
-// has no user-defined operator classes feeding this dump path, so 0 rows is
-// correct for this cluster. pg_amop cols (pg_amop.h): oid, amopfamily oid,
-// amoplefttype oid, amoprighttype oid, amopstrategy int2, amoppurpose "char",
-// amopopr oid, amopmethod oid, amopsortfamily oid. pg_amproc cols (pg_amproc.h):
-// oid, amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum int2,
+// (DU-002 slice 30) The empty `pg_amop` (OID 2602) + `pg_amproc` (OID 2603)
+// virtual views are now defined in internal/catalog/catalog.go, so
+// getDependencies' pg_depend UNION that joins both to surface opfamily member
+// dependencies no longer errors (goopg has no user-defined operator classes →
+// 0 rows each). pg_amop cols (pg_amop.h): oid, amopfamily oid, amoplefttype oid,
+// amoprighttype oid, amopstrategy int2, amoppurpose "char", amopopr oid,
+// amopmethod oid, amopsortfamily oid. pg_amproc cols (pg_amproc.h): oid,
+// amprocfamily oid, amproclefttype oid, amprocrighttype oid, amprocnum int2,
 // amproc regproc.
+// **Next blocker (precise, confirmed empirically by this test):** pg_dump
+// advances to security-label collection (getSecLabels) and fails with
+// `relation "pg_seclabels" does not exist`. Query:
+//   SELECT label, provider, classoid, objoid, objsubid
+//   FROM pg_catalog.pg_seclabels ORDER BY classoid, objoid, objsubid
+// The next DU-002 slice adds the empty `pg_seclabels` virtual view — in stock PG
+// this is a system view over pg_seclabel + pg_shseclabel; goopg supports no
+// SECURITY LABEL, so 0 rows is correct. Cols the query needs: label text,
+// provider text, classoid oid, objoid oid, objsubid int4 (full view schema also
+// carries objtype text, objnamespace oid, objname text).
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker
