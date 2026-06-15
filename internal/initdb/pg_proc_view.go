@@ -185,6 +185,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "proleakproof", Type: catalog.Type{Name: "bool"}},
 			{Name: "proisstrict", Type: catalog.Type{Name: "bool"}},
 			{Name: "prokind", Type: catalog.Type{Name: "text"}},
+			{Name: "proretset", Type: catalog.Type{Name: "bool"}},
 		},
 		Virtual: true,
 	}
@@ -208,6 +209,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"f", // proleakproof
 				"f", // proisstrict
 				"f", // prokind: function
+				"f", // proretset: built-in stubs (abs/RI_FKey) are not SRFs
 			})
 		}
 		// Append user-defined routines.
@@ -251,6 +253,10 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			if r.IsProcedure {
 				prokind = "p" // procedure
 			}
+			retset := "f"
+			if r.ReturnsSet {
+				retset = "t"
+			}
 			rows = append(rows, []string{
 				fmt.Sprintf("%d", r.OID),
 				r.Name,
@@ -267,6 +273,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				leakproof,
 				strict,
 				prokind,
+				retset,
 			})
 		}
 		return rows

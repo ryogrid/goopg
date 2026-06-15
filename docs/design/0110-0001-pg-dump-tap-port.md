@@ -779,6 +779,19 @@ fixed one logical group per loop:
     `pg_proc.proretset` (the returns-set flag), which goopg's pg_proc virtual view
     does not yet expose. The next slice must add `proretset` to the pg_proc view.
 
+34. **`pg_proc.proretset` column — DONE.** dumpFunc projects `proretset` to
+    decide whether to emit `RETURNS SETOF`; goopg's `pg_proc` virtual view
+    (`internal/initdb/pg_proc_view.go`) did not expose it, so `EXECUTE
+    dumpFunc('1654')` aborted with `column "proretset" does not exist`. Added the
+    `proretset bool` column: built-in stubs (abs variants, RI_FKey_* triggers)
+    are not SRFs so render `'f'`; user routines render `'t'`/`'f'` from the
+    existing `catalog.Routine.ReturnsSet` (RETURNS SETOF, M0097-0020). Catalog-
+    only change. After this slice pg_dump advances within `dumpFunc`; the **new**
+    blocker is `column "probin" does not exist` (`EXECUTE dumpFunc('1654')`) -
+    dumpFunc reads `pg_proc.probin` (the on-disk binary path for C-language
+    functions, NULL for every internal/SQL routine goopg has). The next slice
+    must add `probin` (always NULL) to the pg_proc view.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

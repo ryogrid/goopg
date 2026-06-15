@@ -182,12 +182,15 @@ package testport
 // resolver (searchPathSchemas) backs both, and include_implicit prepends the
 // implicitly-searched pg_catalog (mirrors PG semantics). Fix is executor-only
 // (internal/executor/expr.go); pg_proc already declared rettype 1003 (name[]).
+// Slice 34 added pg_proc.proretset (the returns-set boolean flag; backed by
+// catalog.Routine.ReturnsSet for user routines, constant 'f' for built-in
+// stubs), so dumpFunc advances past proretset.
 // **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// advances past current_schemas and fails in dumpFunc with
-// `column "proretset" does not exist` (EXECUTE dumpFunc('1654')). The
-// getFuncs/dumpFunc prepared query reads pg_proc.proretset (the
-// returns-set flag); goopg's pg_proc virtual view does not yet expose it. The
-// next DU-002 slice must add proretset to the pg_proc view.
+// fails in dumpFunc with `column "probin" does not exist` (EXECUTE
+// dumpFunc('1654')). dumpFunc reads pg_proc.probin (the on-disk binary path
+// for C-language functions; NULL for every internal/SQL routine goopg has).
+// goopg's pg_proc virtual view does not yet expose it. The next DU-002 slice
+// must add probin (always NULL) to the pg_proc view.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

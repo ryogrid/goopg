@@ -96,6 +96,53 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 	}
 }
 
+// TestPgProcViewProretset pins the proretset column (DU-002 slice 34):
+// built-in stubs are never SRFs ('f'); a user routine reflects
+// catalog.Routine.ReturnsSet. dumpFunc reads this to decide RETURNS SETOF.
+func TestPgProcViewProretset(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "gen",
+		ReturnType: catalog.Type{Name: "int"},
+		ReturnsSet: true,
+		Language:   "sql",
+		Body:       "SELECT 1",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "scalar",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "sql",
+		Body:       "SELECT 1",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	// proretset is the last column (index 15).
+	const proretset = 15
+	// Built-in stubs: never SRFs.
+	for i := range builtinProcs {
+		if rows[i][proretset] != "f" {
+			t.Errorf("built-in stub %q proretset = %q, want f", rows[i][1], rows[i][proretset])
+		}
+	}
+	userRows := rows[len(builtinProcs):]
+	// Insertion order: gen (SETOF), scalar.
+	if userRows[0][1] != "gen" || userRows[0][proretset] != "t" {
+		t.Errorf("gen proretset = %q, want t", userRows[0][proretset])
+	}
+	if userRows[1][1] != "scalar" || userRows[1][proretset] != "f" {
+		t.Errorf("scalar proretset = %q, want f", userRows[1][proretset])
+	}
+}
+
 // TestPgProcViewOrdering pins that the row order matches OID
 // ordering — an operator's `ORDER BY oid` is a no-op against this
 // view's natural order, which makes diff-based regression tests
