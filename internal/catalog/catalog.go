@@ -3503,6 +3503,52 @@ func (c *InMemory) registerSystemTables() {
 	pgInitPrivs.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_init_privs"] = pgInitPrivs
 
+	// pg_cast — cast catalog (OID 2605). goopg registers no user-defined casts, so
+	// this view is empty. pg_dump's getFuncs runs `EXISTS (SELECT 1 FROM pg_cast
+	// WHERE pg_cast.oid > <g_last_builtin_oid> AND p.oid = pg_cast.castfunc)` to
+	// pull in pg_catalog functions referenced by a user cast; with no rows the
+	// subquery is always false, so only the genuine namespace/ACL predicates
+	// select rows (correct — built-in casts are never dumped). Schema matches PG's
+	// pg_cast (oid, castsource, casttarget, castfunc, castcontext, castmethod).
+	// castfunc is typed oid (not regproc) so the `p.oid = pg_cast.castfunc`
+	// comparison resolves with goopg's oid equality operator. M0110-0001 (DU-002).
+	pgCast := &Table{
+		Schema: "pg_catalog", Name: "pg_cast", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "castsource", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "casttarget", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "castfunc", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "castcontext", Type: Type{Name: "char"}, Ordinal: 4},
+			{Name: "castmethod", Type: Type{Name: "char"}, Ordinal: 5},
+		},
+		OID: 2605,
+	}
+	pgCast.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_cast"] = pgCast
+
+	// pg_transform — transform catalog (OID 3576). goopg implements no
+	// language-transform objects, so this view is empty. pg_dump's getFuncs runs
+	// `EXISTS (SELECT 1 FROM pg_transform WHERE pg_transform.oid > <g_last_builtin_oid>
+	// AND (p.oid = pg_transform.trffromsql OR p.oid = pg_transform.trftosql))`; with
+	// no rows the subquery is always false. Schema matches PG's pg_transform (oid,
+	// trftype, trflang, trffromsql, trftosql); trffromsql/trftosql are typed oid
+	// (PG uses regproc, which is oid-compatible) so the `p.oid = …` comparisons
+	// resolve. M0110-0001 (DU-002).
+	pgTransform := &Table{
+		Schema: "pg_catalog", Name: "pg_transform", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "trftype", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "trflang", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "trffromsql", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "trftosql", Type: Type{Name: "oid"}, Ordinal: 4},
+		},
+		OID: 3576,
+	}
+	pgTransform.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_transform"] = pgTransform
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

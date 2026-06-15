@@ -197,6 +197,32 @@ fixed one logical group per loop:
    (plus the `pg_cast`/`pg_transform` views the getFuncs filter references) — the
    following slice.
 
+7. **`pg_proc` `pronargs`/`proacl`/`proowner` + `pg_cast`/`pg_transform` views —
+   DONE.** `getFuncs` projects `p.pronargs, p.proargtypes, p.prorettype, p.proacl,
+   acldefault('f', p.proowner) AS acldefault, p.pronamespace, p.proowner` and its
+   `WHERE` admits a `pg_catalog` function only if it is referenced by a user cast
+   (`EXISTS (SELECT 1 FROM pg_cast WHERE pg_cast.oid > <last_builtin> AND
+   p.oid = pg_cast.castfunc)`) or transform (`pg_transform.trffromsql/trftosql`);
+   the query aborted at `column p.pronargs does not exist`. Added three columns to
+   the `pg_proc` virtual view (`internal/initdb/pg_proc_view.go`,
+   `registerPgProcView`): `pronargs int2` = number of input args
+   (`len(proargtypes)`), `proacl aclitem[]` = NULL (goopg tracks no per-routine
+   grants — pg_dump treats every routine as default-privileged), `proowner oid` =
+   10 (bootstrap superuser). Both row-builders — the `builtinProcs` loop and the
+   user-routine loop (sibling paths) — were updated together. Added the empty
+   `pg_cast` (OID 2605: `oid, castsource, casttarget, castfunc, castcontext,
+   castmethod`) and `pg_transform` (OID 3576: `oid, trftype, trflang, trffromsql,
+   trftosql`) virtual views (`internal/catalog/catalog.go`, beside `pg_init_privs`);
+   goopg registers no user casts/transforms, so both are **empty by construction**
+   and the two `EXISTS` subqueries are always false — only the genuine
+   namespace/ACL predicates select rows (built-in casts/functions are never
+   dumped, which is correct). `castfunc`/`trffromsql`/`trftosql` are typed `oid`
+   (PG uses `regproc`, which is oid-compatible) so the `p.oid = …` comparisons
+   resolve under goopg's oid equality operator. After this slice `getFuncs`
+   completes; the next blocker is `getProcLangs`' `SELECT … FROM pg_language WHERE
+   lanispl` — goopg has no `pg_language` view (`relation "pg_language" does not
+   exist`) — the following slice.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

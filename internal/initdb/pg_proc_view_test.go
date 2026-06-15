@@ -57,7 +57,7 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 	// User routine is appended after built-ins.
 	row := rows[len(rows)-1]
 	// Columns: oid, proname, pronamespace, prolang, prorettype,
-	//          proargtypes, prosrc.
+	//          proargtypes, pronargs, proacl, proowner, prosrc.
 	if row[1] != "add" {
 		t.Errorf("proname = %q, want add", row[1])
 	}
@@ -76,8 +76,20 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 	if row[5] != "23 23" {
 		t.Errorf("proargtypes = %q, want \"23 23\" (int4 OID twice)", row[5])
 	}
-	if row[6] != "BEGIN RETURN $1 + $2; END" {
-		t.Errorf("prosrc = %q", row[6])
+	// pronargs = number of input args (DU-002 slice 7).
+	if row[6] != "2" {
+		t.Errorf("pronargs = %q, want 2", row[6])
+	}
+	// proacl is NULL (default privileges).
+	if row[7] != "" {
+		t.Errorf("proacl = %q, want \"\" (NULL)", row[7])
+	}
+	// proowner = bootstrap superuser OID 10.
+	if row[8] != "10" {
+		t.Errorf("proowner = %q, want 10", row[8])
+	}
+	if row[9] != "BEGIN RETURN $1 + $2; END" {
+		t.Errorf("prosrc = %q", row[9])
 	}
 	if row[0] == "" || row[0] == "0" {
 		t.Errorf("oid = %q, want non-zero text", row[0])

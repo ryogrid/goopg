@@ -1189,6 +1189,29 @@ object support.
         `pg_transform`, none exposed → `column p.pronargs does not exist`. Resume
         = add those three `pg_proc` columns (`internal/initdb/pg_proc_view.go`)
         plus the empty `pg_cast`/`pg_transform` views as slice 7.
+      - **PROGRESS 2026-06-16 (loop #30):** **DU-002 slice 7 (`pg_proc`
+        `pronargs`/`proacl`/`proowner` + `pg_cast`/`pg_transform` views) LANDED.**
+        `getFuncs` projects `p.pronargs, …, p.proacl, …, p.proowner` and admits a
+        `pg_catalog` function only via `EXISTS` over `pg_cast.castfunc` /
+        `pg_transform.trffromsql|trftosql`; it aborted at `column p.pronargs does
+        not exist`. Added three columns to `registerPgProcView`
+        (`internal/initdb/pg_proc_view.go`): `pronargs int2` = `len(proargtypes)`,
+        `proacl aclitem[]` = NULL (no per-routine grants), `proowner oid` = 10
+        (bootstrap superuser) — updated **both** row-builders (builtinProcs loop +
+        user-routine loop, sibling paths). Added empty `pg_cast` (OID 2605) and
+        `pg_transform` (OID 3576) virtual views (`internal/catalog/catalog.go`,
+        beside `pg_init_privs`) with PG's exact schemas; both empty by construction
+        (goopg registers no user casts/transforms → both `EXISTS` always false →
+        only built-in funcs/casts excluded, correct). `castfunc`/`trffromsql`/
+        `trftosql` typed `oid` (PG uses oid-compatible `regproc`) so `p.oid = …`
+        resolves. Build/gofmt/vet clean; catalog + initdb suites PASS
+        (`TestPgProcViewRendersRoutine` updated for the new column positions +
+        asserts pronargs/proacl/proowner); `TestPort_PgDumpConnectionSetup` PASS —
+        `getFuncs` now completes. **Next blocker (precise):** `getProcLangs` runs
+        `SELECT … FROM pg_language WHERE lanispl ORDER BY oid`; goopg has no
+        `pg_language` view → `relation "pg_language" does not exist`. Resume = add
+        an empty `pg_language` virtual view as slice 8 (built-in PLs are filtered
+        by `lanispl`, so empty is correct — only user PLs are dumped).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

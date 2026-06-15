@@ -35,12 +35,16 @@ package testport
 // `array_remove()` scalar builtin used to strip `check_option=…` from
 // `reloptions` (slice 5), and the empty `pg_init_privs` virtual view that
 // `getFuncs`/`getTables`/… LEFT-JOIN to diff stored vs. initial privileges
-// (slice 6). **Next blocker (precise):** pg_dump's `getFuncs` SELECT projects
-// `p.pronargs`, `p.proacl`, `p.proowner` and filters on the `pg_cast`/
-// `pg_transform` catalogs, none of which goopg's `pg_proc` virtual view / catalog
-// expose, so the query fails with `column p.pronargs does not exist`. Adding
-// those three `pg_proc` columns plus the (empty) `pg_cast`/`pg_transform` views
-// is the following DU-002 slice.
+// (slice 6), and the `pg_proc` columns `pronargs`/`proacl`/`proowner` plus the
+// empty `pg_cast`/`pg_transform` catalog views that `getFuncs` projects and
+// filters on (slice 7). **Next blocker (precise):** pg_dump's `getProcLangs`
+// runs `SELECT … lanname, lanpltrusted, lanplcallfoid, laninline, lanvalidator,
+// lanacl, acldefault('l', lanowner) AS acldefault, lanowner FROM pg_language
+// WHERE lanispl ORDER BY oid`, and goopg has no `pg_language` catalog view, so
+// the query fails with `relation "pg_language" does not exist`. Adding an empty
+// `pg_language` virtual view (built-in PLs are filtered out by `lanispl`, so an
+// empty view is correct — only user-installed PLs are dumped) is the following
+// DU-002 slice.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.

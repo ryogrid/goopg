@@ -127,11 +127,11 @@ type builtinProcRow struct {
 // RI_FKey_* trigger functions (required for btree_index LIKE/ILIKE tests).
 var builtinProcs = []builtinProcRow{
 	// abs variants (sorted by proargtypes OID for determinism)
-	{oid: 1395, name: "abs", namespace: "11", lang: "12", retType: "20", argTypes: "20", src: "int8abs"},       // abs(int8)
-	{oid: 1396, name: "abs", namespace: "11", lang: "12", retType: "21", argTypes: "21", src: "int2abs"},       // abs(int2)
-	{oid: 1397, name: "abs", namespace: "11", lang: "12", retType: "23", argTypes: "23", src: "int4abs"},       // abs(int4)
-	{oid: 1398, name: "abs", namespace: "11", lang: "12", retType: "700", argTypes: "700", src: "float4abs"},   // abs(float4)
-	{oid: 1705, name: "abs", namespace: "11", lang: "12", retType: "701", argTypes: "701", src: "float8abs"},   // abs(float8)
+	{oid: 1395, name: "abs", namespace: "11", lang: "12", retType: "20", argTypes: "20", src: "int8abs"},         // abs(int8)
+	{oid: 1396, name: "abs", namespace: "11", lang: "12", retType: "21", argTypes: "21", src: "int2abs"},         // abs(int2)
+	{oid: 1397, name: "abs", namespace: "11", lang: "12", retType: "23", argTypes: "23", src: "int4abs"},         // abs(int4)
+	{oid: 1398, name: "abs", namespace: "11", lang: "12", retType: "700", argTypes: "700", src: "float4abs"},     // abs(float4)
+	{oid: 1705, name: "abs", namespace: "11", lang: "12", retType: "701", argTypes: "701", src: "float8abs"},     // abs(float8)
 	{oid: 1704, name: "abs", namespace: "11", lang: "12", retType: "1700", argTypes: "1700", src: "numeric_abs"}, // abs(numeric)
 	// RI_FKey trigger functions (no args, return trigger)
 	{oid: 1654, name: "RI_FKey_cascade_del", namespace: "11", lang: "12", retType: "2279", argTypes: "", src: "RI_FKey_cascade_del"},
@@ -157,7 +157,14 @@ var builtinProcs = []builtinProcRow{
 //   - prolang: language OID (text "12" for internal, "14" for SQL, "13" for C).
 //   - prorettype: return-type OID (text).
 //   - proargtypes: space-separated arg-type OIDs (oidvector format).
+//   - pronargs: number of input arguments (int2 = len(proargtypes)).
+//   - proacl: access privileges (aclitem[]); always NULL — goopg tracks no
+//     per-routine grants, so pg_dump treats every routine as default-privileged.
+//   - proowner: owning role OID; always 10 (bootstrap superuser).
 //   - prosrc: function body source.
+//
+// pronargs/proacl/proowner were added for pg_dump's getFuncs SELECT (M0110-0001
+// DU-002 slice 7), which projects `p.pronargs, …, p.proacl, …, p.proowner`.
 func registerPgProcView(cat *catalog.InMemory) error {
 	tbl := &catalog.Table{
 		Schema: "pg_catalog",
@@ -169,6 +176,9 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "prolang", Type: catalog.Type{Name: "text"}},
 			{Name: "prorettype", Type: catalog.Type{Name: "oid"}},
 			{Name: "proargtypes", Type: catalog.Type{Name: "oidvector"}},
+			{Name: "pronargs", Type: catalog.Type{Name: "int2"}},
+			{Name: "proacl", Type: catalog.Type{Name: "aclitem[]"}},
+			{Name: "proowner", Type: catalog.Type{Name: "oid"}},
 			{Name: "prosrc", Type: catalog.Type{Name: "text"}},
 			{Name: "provolatile", Type: catalog.Type{Name: "text"}},
 			{Name: "prosecdef", Type: catalog.Type{Name: "bool"}},
@@ -189,12 +199,15 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				b.lang,
 				b.retType,
 				b.argTypes,
+				fmt.Sprintf("%d", len(strings.Fields(b.argTypes))), // pronargs
+				"",   // proacl: NULL (default privileges)
+				"10", // proowner: bootstrap superuser
 				b.src,
-				"v",    // provolatile: volatile
-				"f",    // prosecdef
-				"f",    // proleakproof
-				"f",    // proisstrict
-				"f",    // prokind: function
+				"v", // provolatile: volatile
+				"f", // prosecdef
+				"f", // proleakproof
+				"f", // proisstrict
+				"f", // prokind: function
 			})
 		}
 		// Append user-defined routines.
@@ -245,6 +258,9 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				r.Language,
 				typeNameToOIDStr(r.ReturnType.Name),
 				strings.Join(argOIDs, " "),
+				fmt.Sprintf("%d", len(r.ArgTypes)), // pronargs
+				"",                                 // proacl: NULL (default privileges)
+				"10",                               // proowner: bootstrap superuser
 				r.Body,
 				volatile,
 				secdef,
