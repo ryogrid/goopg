@@ -343,6 +343,23 @@ fixed one logical group per loop:
     cfgnamespace, cfgowner, cfgparser FROM pg_ts_config` — goopg has no
     queryable `pg_ts_config` relation (`relation "pg_ts_config" does not
     exist`); an empty `pg_ts_config` virtual view is the following slice.
+15. **`pg_ts_config` virtual view — DONE.** `getTSConfigurations` runs `SELECT
+    tableoid, oid, cfgname, cfgnamespace, cfgowner, cfgparser FROM pg_ts_config`;
+    goopg had no queryable `pg_ts_config` relation, so the query aborted at
+    `relation "pg_ts_config" does not exist`. Added the empty `pg_ts_config`
+    virtual view (`internal/catalog/catalog.go`, OID 3602, beside `pg_ts_dict`)
+    with the `pg_ts_config.h` schema (`oid, cfgname name, cfgnamespace oid,
+    cfgowner oid, cfgparser oid`); `cfgparser` is an `oid` FK to `pg_ts_parser`.
+    Empty by construction: built-in TS configurations live in `pg_catalog`
+    (filtered out by namespace dumpability), and goopg defines no user TS
+    configurations. After this slice `getTSConfigurations` completes; the next
+    blocker (confirmed empirically) is `getForeignDataWrappers`' `SELECT
+    tableoid, oid, fdwname, fdwowner, fdwhandler::pg_catalog.regproc,
+    fdwvalidator::pg_catalog.regproc, fdwacl, …, array_to_string(…fdwoptions…)
+    AS fdwoptions FROM pg_foreign_data_wrapper` — goopg has no queryable
+    `pg_foreign_data_wrapper` relation (`relation "pg_foreign_data_wrapper" does
+    not exist`); an empty `pg_foreign_data_wrapper` virtual view is the following
+    slice.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

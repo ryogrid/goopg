@@ -1354,6 +1354,25 @@ object support.
         not exist`. Resume = add an empty `pg_ts_config` virtual view as slice
         15 (built-in TS configs live in pg_catalog, filtered out by namespace
         dumpability, so empty is correct).
+      - **PROGRESS 2026-06-16 (loop #38):** **DU-002 slice 15 (`pg_ts_config`
+        view) LANDED.** `getTSConfigurations` runs `SELECT tableoid, oid,
+        cfgname, cfgnamespace, cfgowner, cfgparser FROM pg_ts_config`; it aborted
+        at `relation "pg_ts_config" does not exist`. Added the empty
+        `pg_ts_config` virtual view (`internal/catalog/catalog.go`, OID 3602,
+        beside `pg_ts_dict`) with the `pg_ts_config.h` schema (`oid, cfgname
+        name, cfgnamespace oid, cfgowner oid, cfgparser oid`); `cfgparser` is an
+        `oid` FK to pg_ts_parser. Empty by construction: built-in TS configs
+        live in pg_catalog (filtered out by namespace dumpability), goopg
+        defines no user TS configs. Build/gofmt/vet clean; catalog + initdb
+        suites PASS; `TestPort_PgDumpConnectionSetup` PASS — `getTSConfigurations`
+        now completes. **Next blocker (precise, confirmed empirically):**
+        `getForeignDataWrappers` runs `SELECT tableoid, oid, fdwname, fdwowner,
+        fdwhandler::pg_catalog.regproc, fdwvalidator::pg_catalog.regproc,
+        fdwacl, …, array_to_string(…fdwoptions…) AS fdwoptions FROM
+        pg_foreign_data_wrapper` → `relation "pg_foreign_data_wrapper" does not
+        exist`. Resume = add an empty `pg_foreign_data_wrapper` virtual view as
+        slice 16 (goopg has no FDWs by default, so empty is correct; fdwhandler/
+        fdwvalidator are oid cols cast to regproc by pg_dump).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

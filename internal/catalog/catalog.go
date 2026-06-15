@@ -3730,6 +3730,28 @@ func (c *InMemory) registerSystemTables() {
 	pgTSDict.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_ts_dict"] = pgTSDict
 
+	// pg_ts_config — text-search configuration catalog (OID 3602). pg_dump's
+	// getTSConfigurations runs `SELECT tableoid, oid, cfgname, cfgnamespace,
+	// cfgowner, cfgparser FROM pg_ts_config` — it reads ALL TS configurations
+	// and filters out system-defined ones at dump-out time by namespace
+	// dumpability. goopg defines no user TS configurations, and the built-ins
+	// live in pg_catalog (never dumped), so this view is correctly empty (0
+	// rows). cfgparser is an oid FK to pg_ts_parser. Schema matches PG's
+	// pg_ts_config (pg_ts_config.h). M0110-0001 (DU-002 slice 15).
+	pgTSConfig := &Table{
+		Schema: "pg_catalog", Name: "pg_ts_config", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "cfgname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "cfgnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "cfgowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "cfgparser", Type: Type{Name: "oid"}, Ordinal: 4},
+		},
+		OID: 3602,
+	}
+	pgTSConfig.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_ts_config"] = pgTSConfig
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

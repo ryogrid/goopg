@@ -60,19 +60,24 @@ package testport
 // view that `getTSDictionaries` reads (slice 14 — built-in text-search
 // dictionaries live in pg_catalog and are filtered out by namespace
 // dumpability, so an empty view is correct; only user-defined TS dictionaries
-// are dumped).
-// **Next blocker (precise):** pg_dump's `getTSConfigurations` runs `SELECT
-// tableoid, oid, cfgname, cfgnamespace, cfgowner, cfgparser FROM pg_ts_config`,
-// and goopg has no queryable `pg_ts_config` relation, so the query fails with
-// `relation "pg_ts_config" does not exist`. (Although initdb seeds a `pg_class`
-// entry for pg_ts_config, goopg's query layer resolves these system catalogs
-// via the in-memory virtual-view registry, not the on-disk heap — so the
-// on-disk row is invisible to pg_dump's SELECT.) Adding an empty `pg_ts_config`
-// virtual view (built-in TS configurations live in pg_catalog and are filtered
-// out by namespace dumpability, so an empty view is correct — only user-defined
-// TS configurations are dumped) is the following DU-002 slice. NOTE:
-// getTSConfigurations runs AFTER getTSDictionaries in pg_dump's getter battery,
-// which is why this blocker only surfaced once slice 14 cleared pg_ts_dict.
+// are dumped), and the empty `pg_ts_config` virtual view that
+// `getTSConfigurations` reads (slice 15 — built-in text-search configurations
+// live in pg_catalog and are filtered out by namespace dumpability, so an empty
+// view is correct; only user-defined TS configurations are dumped).
+// **Next blocker (precise, confirmed empirically by this test):** pg_dump's
+// getForeignDataWrappers runs `SELECT tableoid, oid, fdwname, fdwowner,
+// fdwhandler::pg_catalog.regproc, fdwvalidator::pg_catalog.regproc, fdwacl, … ,
+// array_to_string(…fdwoptions…) AS fdwoptions FROM pg_foreign_data_wrapper`, and
+// goopg has no queryable `pg_foreign_data_wrapper` relation, so the query fails
+// with `relation "pg_foreign_data_wrapper" does not exist` (goopg's query layer
+// resolves system catalogs via the in-memory virtual-view registry, not the
+// on-disk heap). Adding an empty `pg_foreign_data_wrapper` virtual view is the
+// following DU-002 slice (built-in/no FDWs by default — goopg has none — so an
+// empty view is correct; only user-defined FDWs are dumped). NOTE: fdwhandler /
+// fdwvalidator are oid columns cast to regproc by pg_dump; getForeignServers
+// (reads `pg_foreign_server`) and getUserMappings (`pg_user_mappings`) follow.
+// RUN this test after each add to find the REAL next blocker rather than
+// trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.
