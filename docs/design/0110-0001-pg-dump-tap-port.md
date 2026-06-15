@@ -302,13 +302,32 @@ fixed one logical group per loop:
     all TS parsers and filters out system-defined ones at dump-out time by
     namespace dumpability — the built-ins live in `pg_catalog` (never dumped),
     and goopg defines no user TS parsers. After this slice `getTSParsers`
-    completes, and `getTSDictionaries` (`SELECT ... FROM pg_ts_dict`) also
-    passes — `pg_ts_dict` already exists as a real nailed on-disk catalog
-    seeded by initdb, so it needed no new view. The next blocker is
-    `getTSTemplates`' `SELECT tableoid, oid, tmplname, tmplnamespace,
-    tmplinit::oid, tmpllexize::oid FROM pg_ts_template` — goopg has no
-    `pg_ts_template` view (`relation "pg_ts_template" does not exist`) — the
-    following slice.
+    completes; the next blocker is `getTSTemplates`' `SELECT tableoid, oid,
+    tmplname, tmplnamespace, tmplinit::oid, tmpllexize::oid FROM pg_ts_template`
+    — goopg has no `pg_ts_template` view (`relation "pg_ts_template" does not
+    exist`) — the following slice.
+13. **`pg_ts_template` virtual view — DONE.** `getTSTemplates` runs `SELECT
+    tableoid, oid, tmplname, tmplnamespace, tmplinit::oid, tmpllexize::oid FROM
+    pg_ts_template`; goopg had no `pg_ts_template` view, so the query aborted at
+    `relation "pg_ts_template" does not exist`. Added the empty `pg_ts_template`
+    virtual view (`internal/catalog/catalog.go`, OID 3764, beside
+    `pg_ts_parser`) with the `pg_ts_template.h` schema (`oid, tmplname name,
+    tmplnamespace oid, tmplinit regproc, tmpllexize regproc`); the `::oid` casts
+    are no-ops since `regproc` is oid-compatible. Empty by construction:
+    built-in TS templates live in `pg_catalog` (filtered out by namespace
+    dumpability), and goopg defines no user TS templates. After this slice
+    `getTSTemplates` completes; the next blocker is `getTSDictionaries`' `SELECT
+    tableoid, oid, dictname, dictnamespace, dictowner, dicttemplate,
+    dictinitoption FROM pg_ts_dict` — goopg has no **queryable** `pg_ts_dict`
+    relation (`relation "pg_ts_dict" does not exist`). Although initdb seeds a
+    `pg_class` entry for pg_ts_dict at OID 3600, goopg's query layer resolves
+    these system catalogs through the in-memory virtual-view registry, not the
+    on-disk heap, so the seeded row is invisible to pg_dump's SELECT; an empty
+    `pg_ts_dict` virtual view is the following slice. (NOTE: `getTSDictionaries`
+    runs AFTER `getTSTemplates`, which is why this blocker only surfaced once
+    slice 13 cleared `pg_ts_template`; the slice-12 note that "pg_ts_dict
+    already passes" was a misread — the dump aborted at `getTSTemplates` before
+    reaching it.)
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

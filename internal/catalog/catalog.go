@@ -3683,6 +3683,29 @@ func (c *InMemory) registerSystemTables() {
 	pgTSParser.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_ts_parser"] = pgTSParser
 
+	// pg_ts_template — text-search template catalog (OID 3764). pg_dump's
+	// getTSTemplates runs `SELECT tableoid, oid, tmplname, tmplnamespace,
+	// tmplinit::oid, tmpllexize::oid FROM pg_ts_template` — it reads ALL TS
+	// templates and filters out system-defined ones at dump-out time by
+	// namespace dumpability. goopg defines no user TS templates, and the
+	// built-ins live in pg_catalog (never dumped), so this view is correctly
+	// empty (0 rows). The ::oid casts in the query are no-ops since the tmpl*
+	// columns are regproc (oid-compatible). Schema matches PG's pg_ts_template
+	// (pg_ts_template.h). M0110-0001 (DU-002 slice 13).
+	pgTSTemplate := &Table{
+		Schema: "pg_catalog", Name: "pg_ts_template", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "tmplname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "tmplnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "tmplinit", Type: Type{Name: "regproc"}, Ordinal: 3},
+			{Name: "tmpllexize", Type: Type{Name: "regproc"}, Ordinal: 4},
+		},
+		OID: 3764,
+	}
+	pgTSTemplate.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_ts_template"] = pgTSTemplate
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

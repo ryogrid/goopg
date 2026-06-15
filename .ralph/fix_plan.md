@@ -1312,6 +1312,30 @@ object support.
         Resume = add an empty `pg_ts_template` virtual view as slice 13
         (built-in TS templates live in pg_catalog, filtered out by namespace
         dumpability, so empty is correct).
+      - **PROGRESS 2026-06-16 (loop #36):** **DU-002 slice 13 (`pg_ts_template`
+        view) LANDED.** `getTSTemplates` runs `SELECT tableoid, oid, tmplname,
+        tmplnamespace, tmplinit::oid, tmpllexize::oid FROM pg_ts_template`; it
+        aborted at `relation "pg_ts_template" does not exist`. Added the empty
+        `pg_ts_template` virtual view (`internal/catalog/catalog.go`, OID 3764,
+        beside `pg_ts_parser`) with the `pg_ts_template.h` schema (`oid,
+        tmplname name, tmplnamespace oid, tmplinit regproc, tmpllexize
+        regproc`); `::oid` casts are no-ops (regproc is oid-compatible). Empty
+        by construction: built-in TS templates live in pg_catalog (filtered out
+        by namespace dumpability), goopg defines no user TS templates.
+        Build/gofmt/vet clean; catalog + initdb suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS — `getTSTemplates` now completes.
+        **CORRECTION:** slice 12's note that `getTSDictionaries`/`pg_ts_dict`
+        "already passes" was a MISREAD — `getTSDictionaries` runs AFTER
+        `getTSTemplates`, so the dump aborted at `getTSTemplates` before ever
+        reaching it. **Next blocker (precise):** `getTSDictionaries` runs
+        `SELECT tableoid, oid, dictname, dictnamespace, dictowner, dicttemplate,
+        dictinitoption FROM pg_ts_dict` → `relation "pg_ts_dict" does not
+        exist`. Although initdb seeds a `pg_class` entry for pg_ts_dict (OID
+        3600), goopg's query layer resolves system catalogs via the in-memory
+        virtual-view registry, NOT the on-disk heap, so the seeded row is
+        invisible to pg_dump's SELECT. Resume = add an empty `pg_ts_dict`
+        virtual view as slice 14 (built-in TS dictionaries live in pg_catalog,
+        filtered out by namespace dumpability, so empty is correct).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
