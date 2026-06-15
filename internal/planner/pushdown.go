@@ -366,6 +366,26 @@ func walkColumnRefs(e Expr, onIdx func(int), onOuter func()) {
 		walkColumnRefs(x.Else, onIdx, onOuter)
 	case *ExtractExpr:
 		walkColumnRefs(x.Source, onIdx, onOuter)
+	case *CastExpr:
+		// A cast can wrap an outer-side ColumnRef (e.g. `cast(outer.col AS
+		// text) = inner.col`). Missing this case made classifyConjunctSide
+		// blind to the wrapped ref, so a mixed conjunct could be misread as
+		// single-side and wrongly pushed below a LEFT JOIN. Keep in lockstep
+		// with shiftColumnRefsBy's CastExpr case.
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+	case *IsNullExpr:
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+	case *IsBoolExpr:
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+	case *IsDistinctFromExpr:
+		walkColumnRefs(x.Left, onIdx, onOuter)
+		walkColumnRefs(x.Right, onIdx, onOuter)
+	case *CollateExpr:
+		walkColumnRefs(x.Operand, onIdx, onOuter)
+	case *RowExpr:
+		for _, el := range x.Elems {
+			walkColumnRefs(el, onIdx, onOuter)
+		}
 	}
 }
 

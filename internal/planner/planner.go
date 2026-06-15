@@ -9532,6 +9532,27 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		}
 	case *ExtractExpr:
 		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: shiftColumnRefsBy(x.Source, delta)}
+	case *IsNullExpr:
+		// `expr IS [NOT] NULL`. The operand can hold inner-side ColumnRefs
+		// (e.g. pg_amcheck's `ep.nsp_regex IS NULL` in the exclude-pattern
+		// anti-join). It MUST be shifted in lockstep with walkColumnRefs'
+		// IsNullExpr case — omitting it left the operand ref at its
+		// outer-cumulative index after the conjunct was pushed below a LEFT
+		// JOIN, panicking "index out of range" in Slot.Get (same failure
+		// mode as the InExpr gap above).
+		return &IsNullExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), Negated: x.Negated}
+	case *IsBoolExpr:
+		return &IsBoolExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}
+	case *IsDistinctFromExpr:
+		return &IsDistinctFromExpr{pos: x.Pos(), Left: shiftColumnRefsBy(x.Left, delta), Right: shiftColumnRefsBy(x.Right, delta), Negated: x.Negated}
+	case *CollateExpr:
+		return &CollateExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), CollationName: x.CollationName}
+	case *RowExpr:
+		elems := make([]Expr, len(x.Elems))
+		for i, el := range x.Elems {
+			elems[i] = shiftColumnRefsBy(el, delta)
+		}
+		return &RowExpr{pos: x.Pos(), Elems: elems, Types: x.Types}
 	default:
 		return e
 	}
