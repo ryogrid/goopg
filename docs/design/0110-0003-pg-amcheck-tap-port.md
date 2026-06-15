@@ -384,6 +384,46 @@ EXTERNAL` TOAST corruption, the page-overwrite mechanics for those unsupported
 relkinds, and multi-database orchestration. `005_opclass_damage` (CREATE
 OPERATOR CLASS + `pg_amproc` parity) also remains. These keep AC-003 `defer`.
 
+## Combined-corruption integration tier (AC-003 main check, 2026-06-15)
+
+The three sub-tiers above each inject exactly **one** corruption on a
+single-relation fixture. But the central assertion of `003_check.pl` — its main
+check (`:347-365`) — is an *integration* property none of them proves: upstream
+plans several **different** corruptions across a database, applies them all in a
+**single** `perform_all_corruptions` stop → corrupt → restart cycle
+(`:107-119`), then runs `pg_amcheck` **once** over the database and asserts that
+**all three** corruption classes are reported *together* in one pass:
+
+```
+$index_missing_relation_fork_re = qr/index ".*" lacks a main relation fork/
+$line_pointer_corruption_re     = qr/line pointer/
+$missing_file_re                = qr/could not open file ".*": No such file or directory/
+```
+
+The property under test is that `pg_amcheck`'s per-relation dispatch does **not**
+abort on the first corrupt relation — the removed-heap-file case raises an ERROR
+(`58030`), not a corruption row — but keeps enumerating and reports every
+distinct corruption class. A regression where that first ERROR tore down the run
+would pass all three isolated surrogates yet be caught here.
+
+`TestPort_PgAmcheck003CombinedCorruption`
+(`internal/testport/pgamcheck003_combined_test.go`) reproduces this on the
+goopg-supported relkind subset: three `public` tables (`tfork` + dependent btree
+`tfork_idx`, `tfile`, `tpage`), corrupted in one restart cycle by removing
+`tfork_idx`'s fork, removing `tfile`'s heap file, and overwriting `tpage`'s first
+line pointer (reusing `corruptFirstLinePointerLength`). A single
+one-`--table`-per-relation run must exit 2 with all three regexes on stdout and
+empty stderr. Verified PASS — goopg's dispatch already reports all three (zero
+engine change; this is a pure faithful port of the integration assertion).
+
+**Surfaced gap (separate, out of scope for this tier):** the relations live in
+`public`, not a custom schema, because goopg does **not** persist a `CREATE
+SCHEMA` `pg_namespace` row across a server restart — a first `--schema s1` run
+checked clean pre-corruption but reported `no relations to check in schemas
+matching "s1"` after the restart this tier requires. That catalog-durability gap
+is independent of corruption dispatch; every AC-003 surrogate already scopes to
+`public` for the same reason.
+
 ## 002_nonesuch.pl coverage extension (loop #16)
 
 `TestPort_PgAmcheck002Nonesuch` (AC-002, already `port`) was extended to two

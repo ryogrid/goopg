@@ -1159,6 +1159,33 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         tests are deferred under CSV row AC-002, blocked on `verify_heapam()` SRF
         + opclass catalog coverage. Resume = promote AC-002 (002_nonesuch first —
         only error-path catalog lookups) when those land.
+      - **PROGRESS 2026-06-15 (loop #19):** AC-003 — the **central combined-
+        corruption integration tier** of `003_check.pl` (its main check, :347-365)
+        LANDED. The three sibling surrogates each inject ONE corruption on a
+        single-relation fixture; none proves the property 003_check's main check
+        actually asserts — that pg_amcheck reports MULTIPLE distinct corruption
+        classes across a multi-relation DB in ONE pass without aborting on the
+        first corrupt relation (the removed-heap-file case raises ERROR 58030, not
+        a corruption row). New `TestPort_PgAmcheck003CombinedCorruption`
+        (`internal/testport/pgamcheck003_combined_test.go`) injects all three —
+        removed btree index fork (`tfork_idx`), removed heap file (`tfile`),
+        overwritten heap line pointer (`tpage`, reusing `corruptFirstLinePointer-
+        Length`) — in a SINGLE stop→corrupt→restart cycle (mirroring
+        `perform_all_corruptions`), then asserts one scoped run reports all three
+        upstream-verbatim regexes together (`index .* lacks a main relation fork`
+        + `line pointer` + `could not open file .*: No such file or directory`)
+        with exit 2 and empty stderr. PASS (11.1s); full pg_amcheck port suite PASS
+        (33.7s, no regression). **Pure faithful port, ZERO engine change** — goopg's
+        per-relation dispatch already reports all three. Surfaced a SEPARATE gap
+        (out of scope): goopg does not persist a `CREATE SCHEMA` `pg_namespace` row
+        across restart (a first `--schema s1` run was clean pre-corruption but
+        reported `no relations to check` post-restart), so the fixture uses
+        `public` + one `--table` per relation like every AC-003 surrogate. Gates:
+        gofmt + `go vet ./internal/testport` clean; build clean. CSV AC-003 +
+        markdown + design doc `0110-0003` (new "Combined-corruption integration
+        tier" section) updated. AC-003 stays `defer` (hash/gist/gin/brin/spgist
+        AMs, box/int4range/int4[] types, STORAGE EXTERNAL TOAST, multi-DB
+        orchestration; 005_opclass_damage still need feature work).
       - **PROGRESS 2026-06-15 (loop #15):** AC-003 — the **heap-table file-removal
         corruption tier** of `003_check.pl` LANDED (the companion to loop #14's
         index fork). `003_check` removes an ordinary table's backing file

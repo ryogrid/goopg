@@ -1,32 +1,43 @@
-Task: M0110-0003 (pg_amcheck 002_nonesuch) — loop #18. PORTED the final two
-`--exclude-schema` sections of 002_nonesuch.pl, unblocked by loop #17's residual-#2
-planner fix. COMPLETE + committed.
+Task: M0110-0003 (pg_amcheck 003_check) — loop #19. PORTED the central
+combined-corruption integration tier of 003_check.pl (its main check :347-365).
+COMPLETE + ready to commit.
 
 === WHAT LANDED (this loop) ===
-The two `--all --exclude-schema …` cases (upstream .pl :377-418) — whose exclude-CTE
-anti-join PANICKED the backend before commit 36a085dc — now run end-to-end (exit 1,
-`no relations to check`). They are the e2e regression guard for that planner fix.
-Pure faithful test transcription; zero engine change.
+New `TestPort_PgAmcheck003CombinedCorruption`
+(internal/testport/pgamcheck003_combined_test.go). The three sibling surrogates
+(MissingIndexFork, MissingHeapFile, 004 page-overwrite) each inject ONE
+corruption on a single-relation fixture. This tier injects all THREE classes —
+removed btree index fork (tfork_idx), removed heap file (tfile), overwritten
+heap line pointer (tpage, reusing corruptFirstLinePointerLength) — in a SINGLE
+stop→corrupt→restart cycle (mirrors perform_all_corruptions :107-119), then
+asserts ONE scoped pg_amcheck run reports all three upstream-verbatim regexes
+together (exit 2, empty stderr). Proves pg_amcheck dispatch does NOT abort on the
+first corrupt relation (removed-file case raises ERROR 58030). PURE faithful
+port, ZERO engine change — goopg already does this.
 
 Files:
-- internal/testport/pgamcheck002_port_test.go (replaced the deferred residual-#2
-  block with the two ported checkAmcheck cases; updated file header)
-- docs/test-port/postgres-oracle-port-status.csv (AC-002 rationale: exclude-schema
-  ported, only datconnlimit=-2 residual remains) + regenerated .md
-- docs/design/0110-0003-pg-amcheck-tap-port.md (residual #2 → "ported" section;
-  now "One deferred residual")
-- .ralph/fix_plan.md (002_nonesuch row → PORTED)
-- .ralph/deferral_ledger.md (loop #18 entry)
+- internal/testport/pgamcheck003_combined_test.go (new)
+- docs/test-port/postgres-oracle-port-status.csv (AC-003 rationale) + regen .md
+- docs/design/0110-0003-pg-amcheck-tap-port.md (new "Combined-corruption
+  integration tier" section)
+- .ralph/fix_plan.md (loop #19 PROGRESS), .ralph/deferral_ledger.md (loop #19)
 
-Gates: vet/gofmt/build clean. TestPort_PgAmcheck002Nonesuch PASS (1.9s). Full
-pg_amcheck port suite PASS (21.5s). state-guard self-repaired OK. TPC-H spotcheck
-N/A (test-only loop, no executor/planner/codec change).
+Gates: gofmt + `go vet ./internal/testport` clean; build clean.
+TestPort_PgAmcheck003CombinedCorruption PASS (11.1s); full pg_amcheck port suite
+PASS (33.7s, no regression). TPC-H spotcheck N/A (test-only, zero engine change).
+
+=== SURFACED (separate gap, out of scope) ===
+goopg does NOT persist a `CREATE SCHEMA` pg_namespace row across a server
+restart: a first `--schema s1` run was clean pre-corruption but reported `no
+relations to check in schemas matching "s1"` after the required restart. Fixture
+therefore uses `public` + one `--table` per relation (as every AC-003 surrogate
+does). Catalog-durability capability, independent of amcheck.
 
 === NEXT STEP (resume) ===
-002_nonesuch is fully ported except residual #1 (datconnlimit=-2 invalid-database
-filter), which is BLOCKED on a runtime pg_database shared-catalog write goopg lacks
-(goopg_no_runtime_shared_catalog_inplace_update) — a separate capability/milestone.
-Other open M0110-0003 work: AC-003 remaining 003_check tiers (hash/gist/gin/brin/
-spgist AMs, box/int4range/int4[] types, STORAGE EXTERNAL TOAST, multi-DB orchestration)
-+ 005_opclass_damage. Other milestones: M0095-0003 recvlogical (030, logical decoding,
-large); M0110-0001 pg_dump 002; M0110-0002 pg_waldump 002; M0117-0006/7/8 (Effort-L, defer).
+Commit + push this loop. AC-003 remaining 003_check tiers all need missing
+features: hash/gist/gin/brin/spgist index AMs, box/int4range/int4[] column types,
+STORAGE EXTERNAL TOAST corruption, multi-DB orchestration; 005_opclass_damage
+(CREATE OPERATOR CLASS + pg_amproc parity). Other open: M0095-0003 recvlogical
+(030, logical decoding, large); M0110-0001 pg_dump 002 (catalog parity);
+M0110-0002 pg_waldump 002 (index AMs + FPI); M0117-0006/7/8 (Effort-L, defer).
+The CREATE SCHEMA cross-restart durability gap is a candidate small standalone task.
