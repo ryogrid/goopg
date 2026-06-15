@@ -342,8 +342,12 @@ func (p *parser) parseCreate() (Stmt, error) {
 	// pg_extension row (e.g. amcheck). M0110-0003.
 	case p.acceptIdentKeyword("extension"):
 		return p.parseCreateExtensionTail(t.Pos)
+	// CREATE TABLESPACE name [OWNER role] LOCATION 'dir' [WITH (opts)] — in-place
+	// developer/regression tablespace support. M0095-0003.
+	case p.acceptKeyword(KwTablespace):
+		return p.parseCreateTablespaceTail(t.Pos)
 	}
-	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, TRIGGER, or EXTENSION after CREATE")
+	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, TRIGGER, EXTENSION, or TABLESPACE after CREATE")
 }
 
 // parseCreateExtensionTail parses the tail of
@@ -395,6 +399,68 @@ func (p *parser) parseCreateExtensionTail(pos int) (Stmt, error) {
 			return stmt, nil
 		}
 	}
+}
+
+// parseCreateTablespaceTail parses the tail of
+//
+//	CREATE TABLESPACE name [OWNER role] LOCATION 'dir' [WITH (opt = val, …)]
+//
+// after the TABLESPACE keyword. Mirrors gram.y's CreateTableSpaceStmt. The
+// LOCATION string is mandatory in the grammar; an empty location requests an
+// in-place tablespace (validated against allow_in_place_tablespaces by the
+// executor). M0095-0003.
+func (p *parser) parseCreateTablespaceTail(pos int) (Stmt, error) {
+	stmt := &CreateTablespaceStmt{pos: pos}
+	// Tablespace name.
+	tok := p.cur()
+	if tok.Kind != TokenIdent && tok.Kind != TokenKeyword && tok.Kind != TokenQuotedIdent {
+		return nil, p.errAtCur("expected tablespace name")
+	}
+	stmt.Name = tok.Value
+	p.advance()
+	// Optional OWNER role.
+	if p.acceptIdentKeyword("owner") {
+		// PG allows OWNER [=] role; accept an optional '=' ("=" is TokenOperator).
+		if c := p.cur(); (c.Kind == TokenOperator || c.Kind == TokenSymbol) && c.Value == "=" {
+			p.advance()
+		}
+		ot := p.cur()
+		if ot.Kind != TokenIdent && ot.Kind != TokenKeyword && ot.Kind != TokenQuotedIdent && ot.Kind != TokenStringLit {
+			return nil, p.errAtCur("expected owner role after OWNER")
+		}
+		stmt.Owner = ot.Value
+		p.advance()
+	}
+	// LOCATION 'dir' (mandatory).
+	if !p.acceptIdentKeyword("location") {
+		return nil, p.errAtCur("expected LOCATION in CREATE TABLESPACE")
+	}
+	lt := p.cur()
+	if lt.Kind != TokenStringLit {
+		return nil, p.errAtCur("expected location string after LOCATION")
+	}
+	stmt.Location = lt.Value
+	p.advance()
+	// Optional WITH ( option = value, … ) — parsed but currently ignored.
+	if p.acceptKeyword(KwWith) {
+		if c := p.cur(); c.Kind != TokenSymbol || c.Value != "(" {
+			return nil, p.errAtCur("expected '(' after WITH")
+		}
+		p.advance() // consume '('
+		for {
+			c := p.cur()
+			if c.Kind == TokenEOF {
+				return nil, p.errAtCur("unterminated WITH option list")
+			}
+			if c.Kind == TokenSymbol && c.Value == ")" {
+				p.advance()
+				break
+			}
+			stmt.Options = append(stmt.Options, c.Value)
+			p.advance()
+		}
+	}
+	return stmt, nil
 }
 
 // parseCreateAggregateTail picks up after "CREATE AGGREGATE".  It parses just
@@ -2925,6 +2991,24 @@ func (p *parser) parseDrop() (Stmt, error) {
 	if cur := p.cur(); cur.Kind == TokenIdent &&
 		(cur.Value == "tuple" || cur.Value == "instance" || cur.Value == "rewrite") {
 		return nil, p.errSyntaxAtCur()
+	}
+	// DROP TABLESPACE [IF EXISTS] name — removes the runtime tablespace registry
+	// entry and its in-place pg_tblspc/<oid> directory. M0095-0003.
+	if p.acceptKeyword(KwTablespace) {
+		ifExists := false
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			ifExists = true
+		}
+		nt := p.cur()
+		if nt.Kind != TokenIdent && nt.Kind != TokenKeyword && nt.Kind != TokenQuotedIdent {
+			return nil, p.errAtCur("expected tablespace name")
+		}
+		name := nt.Value
+		p.advance()
+		return &DropTablespaceStmt{pos: t.Pos, IfExists: ifExists, Name: name}, nil
 	}
 	// DROP DATABASE [IF EXISTS] name — goopg is single-database; always reports does-not-exist.
 	if p.acceptIdentKeyword("database") {

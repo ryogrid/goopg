@@ -148,6 +148,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateAggregateStmt,
 		*parser.AlterAggregateRenameStmt,
 		*parser.CreateExtensionStmt,
+		*parser.CreateTablespaceStmt, *parser.DropTablespaceStmt,
 		*parser.CreateOpClassStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 

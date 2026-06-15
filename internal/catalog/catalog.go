@@ -495,6 +495,14 @@ type Catalog interface {
 	// per-database in PostgreSQL); empty means visible everywhere.
 	// M0110-0003 (amcheck SQL surface).
 	CreateExtension(name, schema, version, database string, ifNotExists bool) error
+	// CreateTablespace records a CREATE TABLESPACE in the runtime tablespace
+	// registry and returns the freshly allocated OID (used by the executor to
+	// create the in-place pg_tblspc/<oid> directory). An existing name returns a
+	// "tablespace already exists" error. M0095-0003 (in-place tablespace).
+	CreateTablespace(name, owner, location string) (uint32, error)
+	// DropTablespace removes a tablespace from the runtime registry, returning its
+	// OID and whether it was present. M0095-0003.
+	DropTablespace(name string) (uint32, bool)
 	// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
 	// objType is "conversion", "operator", "rule", "text search configuration", etc.
 	RegisterCompatObject(objType, name string)
@@ -643,6 +651,14 @@ type InMemory struct {
 	// lowercase extension name. Backs the pg_extension virtual catalog read by
 	// pg_amcheck's "is amcheck installed?" probe. M0110-0003.
 	extensions map[string]*extensionRow
+
+	// tablespaces tracks CREATE TABLESPACE in-place tablespaces, keyed by
+	// lowercase tablespace name. The bootstrap pg_default/pg_global tablespaces
+	// are NOT held here (they live in the on-disk pg_tablespace heap); this is the
+	// runtime registry for developer/regression in-place tablespaces, used to
+	// reject duplicates and to map a dropped name back to its OID/directory.
+	// M0095-0003 (in-place tablespace).
+	tablespaces map[string]*tablespaceRow
 }
 
 // extensionRow is one runtime CREATE EXTENSION record backing pg_extension.
@@ -663,6 +679,17 @@ type extensionRow struct {
 	schema   string
 	version  string
 	database string
+}
+
+// tablespaceRow is one runtime CREATE TABLESPACE record (in-place tablespaces
+// only). The in-place directory is pg_tblspc/<oid> under the data dir. owner is
+// recorded for completeness; location is the (canonicalized) LOCATION string,
+// which is empty for an in-place tablespace. M0095-0003.
+type tablespaceRow struct {
+	oid      uint32
+	name     string
+	owner    string
+	location string
 }
 
 // commentKey is the composite key for pg_description.
@@ -815,6 +842,7 @@ func NewInMemory() *InMemory {
 		comments:       make(map[commentKey]string),
 		statisticsObjs: make(map[string]*StatisticsObject),
 		extensions:     make(map[string]*extensionRow),
+		tablespaces:    make(map[string]*tablespaceRow),
 	}
 	c.registerSystemTables()
 	return c
@@ -4226,6 +4254,43 @@ func (c *InMemory) CreateExtension(name, schema, version, database string, ifNot
 		database: database,
 	}
 	return nil
+}
+
+// CreateTablespace records an in-place tablespace in the runtime registry and
+// returns the freshly allocated OID. A name already present returns a duplicate
+// error mirroring PG's get_tablespace_oid collision message. The caller (the DDL
+// executor) is responsible for the pg_-prefix reserved-name check and for
+// creating the pg_tblspc/<oid> directory. M0095-0003.
+func (c *InMemory) CreateTablespace(name, owner, location string) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	if _, ok := c.tablespaces[lc]; ok {
+		return 0, fmt.Errorf("tablespace %q already exists", name)
+	}
+	c.nextOID++
+	oid := c.nextOID
+	c.tablespaces[lc] = &tablespaceRow{
+		oid:      oid,
+		name:     name,
+		owner:    owner,
+		location: location,
+	}
+	return oid, nil
+}
+
+// DropTablespace removes a tablespace from the runtime registry, returning its
+// OID and whether it was present. M0095-0003.
+func (c *InMemory) DropTablespace(name string) (uint32, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	ts, ok := c.tablespaces[lc]
+	if !ok {
+		return 0, false
+	}
+	delete(c.tablespaces, lc)
+	return ts.oid, true
 }
 
 // ExtensionRowsForDB returns the pg_extension virtual rows visible to a

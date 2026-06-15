@@ -1,36 +1,45 @@
-Task: M0110-0003 (AC-003 pg_amcheck) — loop #11. Ported the whole-database
-relation-enumeration tier + REFUTED the previously-assumed blocker #3.
+Task: M0095-0003 (011_in_place_tablespace) — loop #12. Landed the in-place
+tablespace FOUNDATION. The tree is now CLEAN (the foreign gen-column WIP that
+hard-blocked parser/executor/catalog edits for 15+ loops is gone), which
+unblocked this.
 
 === WHAT LANDED (this loop) ===
-003_check.pl's clean-db path runs the *default* pg_amcheck (no scoping), which
-enumerates every checkable relation and dispatches verify_heapam/bt_index_check
-per relation — a tier distinct from the single-`--table` path. New
-TestPort_PgAmcheckAllTables (internal/testport/pgamcheck_alltables_port_test.go)
-drives the real binary over a goopg DB mixing the relkinds 003_check builds that
-goopg supports (heap table, btree indexes incl. UNIQUE, sequence, view, matview)
-in user schema s1. --schema s1 run = clean (exit 0); unscoped whole-database run
-(reaches pg_catalog.*) = ALSO clean (exit 0).
+allow_in_place_tablespaces GUC (PGC_SUSET, boot off) + CREATE/DROP TABLESPACE
+DDL end-to-end:
+- config/defaults.go + postgresql.conf.sample (DEVELOPER OPTIONS section)
+- parser/ast.go: CreateTablespaceStmt, DropTablespaceStmt
+- parser/ddl.go: parseCreateTablespaceTail + DROP TABLESPACE dispatch.
+  KEY GOTCHA: `tablespace` is an unreserved KEYWORD (KwTablespace), so dispatch
+  must use acceptKeyword(KwTablespace), NOT acceptIdentKeyword (which only
+  matches TokenIdent). `owner`/`location` ARE plain idents (acceptIdentKeyword
+  ok). `=` is TokenOperator.
+- planner/planner.go: both added to DDL passthrough case list
+- executor/operators_ddl.go: execCreateTablespace/execDropTablespace — create/
+  remove pg_tblspc/<oid> under ctx.DataDir; reads GUC via ctx.GetSetting.
+  Upstream-verbatim errors: 42602 quote, 42P17 absolute-path (also empty-loc +
+  GUC off), 42939 reserved pg_ name, 42710 dup, 42704 missing; external
+  absolute LOCATION → 0A000 (goopg can't relocate relfiles).
+- catalog/catalog.go: tablespaces registry + CreateTablespace/DropTablespace on
+  the Catalog interface (InMemory is the sole implementer).
+- server/dispatch.go: CREATE/DROP TABLESPACE command tags.
 
-KEY FINDING: blocker #3 ("system-catalog heap resolution") is NOT a real blocker.
-goopg never feeds its system catalogs to pg_amcheck's heap-check dispatch, so the
-default whole-db run is clean with no verify_heapam-on-catalog gap. Prior
-working_set/fix_plan/design-doc claims corrected.
+Tests: parser (3), catalog (1), executor (7, incl. real-temp-dir create/drop),
+config (1) — all PASS. Suites parser/catalog/config/planner/executor/server
+green; gofmt+vet+build clean. TPC-H spotcheck SKIPPED (no data dir; safe by
+construction — only new DDL statement types added to passthrough). Design
+docs/design/0095-0003-in-place-tablespace.md + README index (status: partial).
 
-Files: internal/testport/pgamcheck_alltables_port_test.go (NEW, self-promoting +
-hard-asserts blocker #1/#2 non-regression), docs/design/0110-0003 (blocker #3
-correction + enumeration-tier section), CSV AC-003 rationale + regenerated md,
-.ralph/fix_plan.md (loop #11 progress note).
+=== NEXT STEP (resume) — 011 remainder ===
+011_in_place_tablespace.pl still self-skips on BASE_BACKUP. To make it pass:
+(a) internal/server/basebackup.go must enumerate in-place tablespaces and emit
+    one <oid>.tar each (pg_basebackup -T relocation on restore);
+(b) create the pg_tblspc/<oid>/PG_18_<catversion> version subdir in
+    execCreateTablespace (faithful to create_tablespace_directories) — needs the
+    catversion string, single source of truth in internal/initdb
+    (pgCatalogVersionNo=202506291, CatalogVersion="18"); land (a)+(b) together.
+On-disk pg_tablespace heap visibility = separate shared-catalog-write capability
+(no RelFileNode resolver for shared pg_tablespace); defer, not needed by 011.
 
-Gates: pg_amcheck port suite PASS (001/002/004 + btree + alltables, 7.2s);
-TestPort_PgAmcheckAllTables PASS clean (not skipped); gofmt + go vet
-./internal/testport clean. TPC-H spotcheck SKIPPED (no data dir; test-only,
-zero TPC-H surface).
-
-=== NEXT STEP (resume) — AC-003 remainder ===
-003_check.pl proper now blocked ONLY on feature/corruption work (no catalog-heap
-gap): (a) hash/gist/gin/brin/spgist index AMs goopg lacks (s5 relations), (b)
-box/int4range/int4[] column types, (c) STORAGE EXTERNAL TOAST corruption, (d)
-multi-database (db1/db2/db3) orchestration, (e) file-removal/first-page-overwrite
-corruption mechanics + per-relation expected reports. Each is multi-milestone.
-005_opclass_damage = CREATE OPERATOR CLASS + pg_amproc parity. AC-003 stays
-`defer`. The clean enumeration/dispatch tier goopg CAN do is now fully covered.
+NOTE: tree is clean now — other long-deferred items (M0110-0003 AC-003 needs
+index AMs/types/opclass; M0117 Part B = Effort-L CLOG memory-model, full-gate)
+remain the genuinely large ones.

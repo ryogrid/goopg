@@ -1184,6 +1184,33 @@ type CreateExtensionStmt struct {
 func (s *CreateExtensionStmt) Pos() int  { return s.pos }
 func (s *CreateExtensionStmt) stmtNode() {}
 
+// CreateTablespaceStmt — `CREATE TABLESPACE name [OWNER role] LOCATION 'dir' [WITH (opts)]`.
+// goopg supports only the developer/regression-test in-place form (empty LOCATION
+// with allow_in_place_tablespaces on), which creates pg_tblspc/<oid> as a real
+// directory. Mirrors gram.y's CreateTableSpaceStmt. M0095-0003 (011 in-place tablespace).
+type CreateTablespaceStmt struct {
+	pos      int
+	Name     string
+	Owner    string // optional OWNER role; "" → current user
+	Location string // LOCATION string literal; "" → in-place tablespace
+	Options  []string
+}
+
+func (s *CreateTablespaceStmt) Pos() int  { return s.pos }
+func (s *CreateTablespaceStmt) stmtNode() {}
+
+// DropTablespaceStmt — `DROP TABLESPACE [IF EXISTS] name`. Removes the runtime
+// tablespace registry entry and its in-place pg_tblspc/<oid> directory.
+// M0095-0003 (011 in-place tablespace).
+type DropTablespaceStmt struct {
+	pos      int
+	IfExists bool
+	Name     string
+}
+
+func (s *DropTablespaceStmt) Pos() int  { return s.pos }
+func (s *DropTablespaceStmt) stmtNode() {}
+
 // AlterSequenceStmt — `ALTER SEQUENCE [IF EXISTS] name [option …]`. M0097-0009.
 type AlterSequenceStmt struct {
 	pos          int

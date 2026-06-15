@@ -230,6 +230,30 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
         on a clean tree (same gen-column WIP that holds the amcheck SQL surface).
         Skip note in `TestPort_PgBasebackup011InPlaceTablespace` corrected to match.
         recvlogical (030) still needs the logical replication / decoding protocol.
+      - **PROGRESS 2026-06-15 (loop #12):** 011 items (1)+(2-core) LANDED on the now
+        **clean tree** (the foreign gen-column WIP that blocked the parser/executor/
+        catalog edits is gone). Delivered the in-place tablespace foundation:
+        `allow_in_place_tablespaces` GUC (PGC_SUSET, boot off, +sample entry);
+        `CreateTablespaceStmt`/`DropTablespaceStmt` AST; `CREATE TABLESPACE name
+        [OWNER [=] role] LOCATION 'dir' [WITH (opts)]` + `DROP TABLESPACE [IF EXISTS]
+        name` parser (`KwTablespace` is an unreserved keyword → `acceptKeyword`, not
+        `acceptIdentKeyword` — fixed the matching that initially fell through);
+        planner DDL passthrough; `execCreateTablespace`/`execDropTablespace` (in-place
+        `pg_tblspc/<oid>` dir create/remove + runtime registry); catalog
+        `CreateTablespace`/`DropTablespace` registry; `CREATE/DROP TABLESPACE` command
+        tags. Upstream-verbatim errors (42602 quote, 42P17 absolute-path / empty-loc-
+        GUC-off, 42939 reserved pg_ name, 42710 dup, 42704 missing); external absolute
+        LOCATION → 0A000 (goopg can't relocate relfiles). Design doc
+        `docs/design/0095-0003-in-place-tablespace.md` + README index. Tests: parser
+        (3), catalog (1), executor (7 incl. real-temp-dir create/drop), config (1) —
+        all PASS; full parser/catalog/config/planner/executor/server suites green;
+        gofmt+vet clean; build clean. TPC-H spotcheck SKIPPED (no data dir in this
+        tree; safe by construction — only NEW DDL statement types added to passthrough
+        lists, zero existing query path touched). DEFERRED (011 still self-skips):
+        BASE_BACKUP per-tablespace `<oid>.tar` + the `pg_tblspc/<oid>/PG_18_<cat>`
+        version subdir (both need the catversion string, land together) + on-disk
+        `pg_tablespace` heap visibility (shared-catalog runtime write — separate
+        capability). recvlogical (030) still needs logical decoding.
 
 ## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
 

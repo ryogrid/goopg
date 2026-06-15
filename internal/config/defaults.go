@@ -582,10 +582,19 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// allow_in_place_tablespaces — developer/regression option permitting
+	// CREATE TABLESPACE ... LOCATION '' to create an in-place tablespace directly
+	// inside pg_tblspc. PGC_SUSET, GUC_NOT_IN_SAMPLE, boot off (guc_tables.c).
+	// M0095-0003.
+	r.MustRegister(NewVariable(Variable{
+		Name: "allow_in_place_tablespaces", Type: TypeBool, BootVal: "off",
+		Context: ContextSuset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 	// seq_page_cost — planner cost estimate for sequential page fetch.
 	r.MustRegister(NewVariable(Variable{
 		Name: "seq_page_cost", Type: TypeReal, BootVal: "1.0",
-		MinVal: 0, MaxVal: 1<<30,
+		MinVal: 0, MaxVal: 1 << 30,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
@@ -769,7 +778,7 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_sender_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "60s",
-		MinVal: 0, MaxVal: 1<<30,
+		MinVal: 0, MaxVal: 1 << 30,
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))
