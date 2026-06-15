@@ -241,6 +241,25 @@ fixed one logical group per loop:
    pg_operator` — goopg has no `pg_operator` view (`relation "pg_operator" does not
    exist`) — the following slice.
 
+9. **`pg_operator` virtual view — DONE.** `getOperators` runs `SELECT tableoid,
+   oid, oprname, oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid
+   AS oprcode FROM pg_operator`; goopg had no `pg_operator` view, so the query
+   aborted at `relation "pg_operator" does not exist`. Added the empty
+   `pg_operator` virtual view (`internal/catalog/catalog.go`, OID 2617, beside
+   `pg_language`) with the `pg_operator.h` schema (`oid, oprname name,
+   oprnamespace oid, oprowner oid, oprkind char, oprcanmerge bool, oprcanhash
+   bool, oprleft oid, oprright oid, oprresult oid, oprcom oid, oprnegate oid,
+   oprcode oid, oprrest oid, oprjoin oid`). The view is **empty by
+   construction**: `getOperators` reads all operators (built-ins included) and
+   filters out system-defined ones at dump-out time by namespace dumpability —
+   the built-ins live in `pg_catalog` (never dumped), and goopg defines no user
+   operators. `oprcode` is `regproc` in PG but oid-compatible, so it is typed
+   `oid` and the `oprcode::oid` cast resolves as a no-op. After this slice
+   `getOperators` completes; the next blocker is `getOpclasses`' `SELECT
+   tableoid, oid, opcmethod, opcname, opcnamespace, opcowner FROM pg_opclass` —
+   goopg has no `pg_opclass` view (`relation "pg_opclass" does not exist`) — the
+   following slice.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

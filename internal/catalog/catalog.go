@@ -3577,6 +3577,39 @@ func (c *InMemory) registerSystemTables() {
 	pgLanguage.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_language"] = pgLanguage
 
+	// pg_operator — operator catalog (OID 2617). pg_dump's getOperators runs
+	// `SELECT tableoid, oid, oprname, oprnamespace, oprowner, oprkind, oprleft,
+	// oprright, oprcode::oid AS oprcode FROM pg_operator` — it reads ALL operators
+	// (built-ins included) and filters out system-defined ones at dump-out time by
+	// namespace dumpability. goopg defines no user operators, and the built-ins are
+	// in pg_catalog (never dumped), so this view is correctly empty (0 rows).
+	// Schema matches PG's pg_operator (pg_operator.h): oprcode is regproc in PG but
+	// oid-compatible, so it is typed oid here and `oprcode::oid` resolves as a no-op.
+	// M0110-0001 (DU-002 slice 9).
+	pgOperator := &Table{
+		Schema: "pg_catalog", Name: "pg_operator", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "oprname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "oprnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "oprowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "oprkind", Type: Type{Name: "char"}, Ordinal: 4},
+			{Name: "oprcanmerge", Type: Type{Name: "bool"}, Ordinal: 5},
+			{Name: "oprcanhash", Type: Type{Name: "bool"}, Ordinal: 6},
+			{Name: "oprleft", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "oprright", Type: Type{Name: "oid"}, Ordinal: 8},
+			{Name: "oprresult", Type: Type{Name: "oid"}, Ordinal: 9},
+			{Name: "oprcom", Type: Type{Name: "oid"}, Ordinal: 10},
+			{Name: "oprnegate", Type: Type{Name: "oid"}, Ordinal: 11},
+			{Name: "oprcode", Type: Type{Name: "oid"}, Ordinal: 12},
+			{Name: "oprrest", Type: Type{Name: "oid"}, Ordinal: 13},
+			{Name: "oprjoin", Type: Type{Name: "oid"}, Ordinal: 14},
+		},
+		OID: 2617,
+	}
+	pgOperator.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_operator"] = pgOperator
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

@@ -1232,6 +1232,27 @@ object support.
         "pg_operator" does not exist`. Resume = add an empty `pg_operator` virtual
         view as slice 9 (built-in operators live in pg_catalog, filtered out by
         namespace dumpability, so empty is correct — only user operators dumped).
+      - **PROGRESS 2026-06-16 (loop #32):** **DU-002 slice 9 (`pg_operator`
+        view) LANDED.** `getOperators` runs `SELECT tableoid, oid, oprname,
+        oprnamespace, oprowner, oprkind, oprleft, oprright, oprcode::oid AS
+        oprcode FROM pg_operator`; it aborted at `relation "pg_operator" does
+        not exist`. Added the empty `pg_operator` virtual view
+        (`internal/catalog/catalog.go`, OID 2617, beside `pg_language`) with the
+        `pg_operator.h` schema (`oid, oprname name, oprnamespace oid, oprowner
+        oid, oprkind char, oprcanmerge bool, oprcanhash bool, oprleft oid,
+        oprright oid, oprresult oid, oprcom oid, oprnegate oid, oprcode oid,
+        oprrest oid, oprjoin oid`). Empty by construction: getOperators reads all
+        operators and filters out system-defined ones at dump-out time by
+        namespace dumpability — built-ins live in pg_catalog (never dumped),
+        goopg defines no user operators. `oprcode` is regproc in PG but
+        oid-compatible → typed `oid` so `oprcode::oid` resolves as a no-op.
+        Build/gofmt/vet clean; `TestPort_PgDumpConnectionSetup` PASS —
+        `getOperators` now completes. **Next blocker (precise):** `getOpclasses`
+        runs `SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner
+        FROM pg_opclass`; goopg has no `pg_opclass` view → `relation
+        "pg_opclass" does not exist`. Resume = add an empty `pg_opclass` virtual
+        view as slice 10 (built-in operator classes live in pg_catalog, filtered
+        out by namespace dumpability, so empty is correct).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
