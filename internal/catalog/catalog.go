@@ -3412,6 +3412,70 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.tables["pg_catalog.pg_am"] = pgAm
 
+	// pg_depend — dependency catalog (OID 2608).
+	// goopg does not maintain a general dependency graph (sequence ownership,
+	// extension membership, etc. are not tracked), so this view is empty. pg_dump
+	// LEFT JOINs pg_depend in getTables to discover a sequence's owning column;
+	// with no rows the join yields NULL owning_tab/owning_col and
+	// is_identity_sequence=false, which is the correct result for a server that
+	// has no recorded dependencies. The schema matches PG's pg_depend exactly so
+	// that the catalog-query column references (classid, objid, objsubid,
+	// refclassid, refobjid, refobjsubid, deptype) resolve. M0110-0001 (DU-002).
+	pgDepend := &Table{
+		Schema: "pg_catalog", Name: "pg_depend", Virtual: true,
+		Columns: []Column{
+			{Name: "classid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "objid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "objsubid", Type: Type{Name: "int4"}, Ordinal: 2},
+			{Name: "refclassid", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "refobjid", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "refobjsubid", Type: Type{Name: "int4"}, Ordinal: 5},
+			{Name: "deptype", Type: Type{Name: "char"}, Ordinal: 6},
+		},
+		OID: 2608,
+	}
+	pgDepend.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_depend"] = pgDepend
+
+	// pg_tablespace — tablespace catalog (OID 1213). The on-disk shared heap
+	// (initialized by initdb with pg_default/pg_global) is not wired into the SQL
+	// query layer, so expose a virtual view: the two bootstrap tablespaces plus
+	// any in-place tablespaces in the runtime registry (CREATE TABLESPACE,
+	// M0095-0003). pg_dump's getTables LEFT JOINs it for spcname; \db and other
+	// clients read it directly. M0110-0001 (DU-002). Schema matches PG's
+	// pg_tablespace (oid, spcname, spcowner, spcacl, spcoptions).
+	pgTablespace := &Table{
+		Schema: "pg_catalog", Name: "pg_tablespace", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "spcname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "spcowner", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "spcacl", Type: Type{Name: "aclitem[]"}, Ordinal: 3},
+			{Name: "spcoptions", Type: Type{Name: "text[]"}, Ordinal: 4},
+		},
+		OID: 1213,
+	}
+	pgTablespace.VirtualRows = c.tablespaceVirtualRows
+	c.tables["pg_catalog.pg_tablespace"] = pgTablespace
+
+	// pg_foreign_table — foreign-table catalog (OID 3118). goopg implements no
+	// foreign-data wrappers, so this view is always empty. pg_dump's getTables
+	// runs a `SELECT ftserver FROM pg_foreign_table WHERE ftrelid = c.oid`
+	// subquery in the relkind='f' branch; with no foreign tables it returns no
+	// rows (the branch is never taken for goopg relations anyway). Schema matches
+	// PG's pg_foreign_table (ftrelid, ftserver, ftoptions). M0110-0001 (DU-002).
+	pgForeignTable := &Table{
+		Schema: "pg_catalog", Name: "pg_foreign_table", Virtual: true,
+		Columns: []Column{
+			{Name: "ftrelid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "ftserver", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "ftoptions", Type: Type{Name: "text[]"}, Ordinal: 2},
+		},
+		OID: 3118,
+	}
+	pgForeignTable.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_foreign_table"] = pgForeignTable
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {
@@ -4309,6 +4373,31 @@ func (c *InMemory) CreateExtension(name, schema, version, database string, ifNot
 		database: database,
 	}
 	return nil
+}
+
+// tablespaceVirtualRows is the VirtualRows callback for the pg_tablespace view.
+// It returns the two bootstrap tablespaces (pg_default OID 1663, pg_global OID
+// 1664, owned by the bootstrap superuser per pg_tablespace.dat) followed by any
+// in-place tablespaces in the runtime registry, ordered by OID for stable
+// output. Columns: oid, spcname, spcowner, spcacl (NULL = default), spcoptions
+// (NULL). Runtime in-place tablespaces report spcowner=10 (bootstrap superuser);
+// goopg does not resolve the recorded owner name to a role OID. M0110-0001.
+func (c *InMemory) tablespaceVirtualRows() [][]string {
+	rows := [][]string{
+		{"1663", "pg_default", "10", "", ""},
+		{"1664", "pg_global", "10", "", ""},
+	}
+	c.mu.RLock()
+	extra := make([]*tablespaceRow, 0, len(c.tablespaces))
+	for _, ts := range c.tablespaces {
+		extra = append(extra, ts)
+	}
+	c.mu.RUnlock()
+	sort.Slice(extra, func(i, j int) bool { return extra[i].oid < extra[j].oid })
+	for _, ts := range extra {
+		rows = append(rows, []string{strconv.FormatUint(uint64(ts.oid), 10), ts.name, "10", "", ""})
+	}
+	return rows
 }
 
 // CreateTablespace records an in-place tablespace in the runtime registry and

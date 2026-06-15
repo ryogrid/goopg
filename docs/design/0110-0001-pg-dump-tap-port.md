@@ -121,6 +121,42 @@ fixed one logical group per loop:
    guard: `server.TestTableoidColumnName` asserts the RowDescription field name
    for both bare and table-qualified `tableoid` projections.
 
+4. **getTables catalog views (`pg_depend`, `pg_tablespace`,
+   `pg_foreign_table`) — DONE.** With `tableoid` labelling fixed, pg_dump
+   advances to its `getTables` query (`pg_dump.c:7080-7239`), which is one large
+   `SELECT … FROM pg_class c LEFT JOIN pg_depend d … LEFT JOIN pg_tablespace tsp
+   … LEFT JOIN pg_am am … LEFT JOIN pg_class tc (toast)` plus a relkind='f'
+   subquery against `pg_foreign_table`. Three relations it touches were not
+   exposed to the SQL query layer, so the query aborted with `relation "…" does
+   not exist` (one per loop iteration of the live probe). All three were added as
+   virtual catalog views in `internal/catalog/catalog.go`, alongside the existing
+   `pg_am` view, with schemas matching upstream exactly so every column reference
+   resolves:
+   - **`pg_depend`** (OID 2608, columns classid/objid/objsubid/refclassid/
+     refobjid/refobjsubid/deptype) — **empty**. goopg keeps no general dependency
+     graph (sequence ownership, extension membership, etc. are untracked), so the
+     LEFT JOIN yields NULL `owning_tab`/`owning_col` and `is_identity_sequence`
+     = false — the correct result for a server with no recorded dependencies.
+   - **`pg_tablespace`** (OID 1213, columns oid/spcname/spcowner/spcacl/
+     spcoptions) — the on-disk shared heap (initdb seeds pg_default/pg_global) is
+     not wired into the query layer, so the view returns the two bootstrap rows
+     (OID 1663 `pg_default`, 1664 `pg_global`, owner 10) plus any in-place
+     tablespaces in the M0095-0003 runtime registry, ordered by OID
+     (`InMemory.tablespaceVirtualRows`, read-locked). Runtime tablespaces report
+     `spcowner` = 10; goopg does not resolve the recorded owner-name to a role
+     OID. For user relations `c.reltablespace` is 0, so the join correctly yields
+     NULL `reltablespace` (the default tablespace).
+   - **`pg_foreign_table`** (OID 3118, columns ftrelid/ftserver/ftoptions) —
+     **empty**; goopg implements no foreign-data wrappers, so the relkind='f'
+     `foreignserver` subquery returns no rows (and the branch never fires for
+     goopg relations).
+   Unit guards: `catalog.TestPgTablespaceVirtualView` (bootstrap rows + a runtime
+   tablespace surfacing at the correct OID-ordered position),
+   `catalog.TestPgDependAndForeignTableViews` (empty views, exact schema). After
+   this slice `getTables` resolves all its relations; the next blocker is the
+   scalar builtin `array_remove()` (used to strip `check_option=…` from
+   `reloptions`), which is the following slice.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

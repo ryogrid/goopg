@@ -1133,6 +1133,22 @@ object support.
         not exist` — pg_dump's getTables joins `pg_class LEFT JOIN pg_depend` (and
         `pg_tablespace`, `pg_am`, `pg_class tc` for TOAST). Resume = add a
         `pg_depend` catalog view (slice 4), then continue the getter battery.
+      - **PROGRESS 2026-06-16 (loop #27):** **DU-002 slice 4 (getTables catalog
+        views) LANDED.** getTables (`pg_dump.c:7080-7239`) touches three relations
+        not previously exposed to the SQL query layer; all three added as virtual
+        catalog views in `internal/catalog/catalog.go` (next to `pg_am`), schemas
+        matching upstream exactly: **`pg_depend`** (OID 2608) — empty (goopg keeps
+        no dependency graph → LEFT JOIN yields NULL owning_tab/owning_col,
+        is_identity_sequence=false); **`pg_tablespace`** (OID 1213) — bootstrap
+        pg_default(1663)/pg_global(1664) + M0095-0003 runtime in-place tablespaces,
+        OID-ordered (`tablespaceVirtualRows`, read-locked); **`pg_foreign_table`**
+        (OID 3118) — empty (no FDW support). Unit guards
+        `catalog.TestPgTablespaceVirtualView` + `catalog.TestPgDependAndForeignTableViews`.
+        Build clean; catalog/executor/server/planner suites PASS.
+        **Next blocker (precise):** getTables now resolves all relations but fails
+        with `function array_remove does not exist` — used to strip
+        `check_option=…` from `c.reloptions`. Resume = add the `array_remove()`
+        scalar builtin (slice 5), then continue the getter battery.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
