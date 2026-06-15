@@ -207,12 +207,19 @@ package testport
 // already used OID-string langs; user routines now map name→OID via
 // langNameToOIDStr (plpgsql, absent from pg_language, → 0). This stays safe for
 // getProcLangs (its WHERE lanispl excludes all 3, which have lanispl=false).
+// Slice 43 added the `pg_get_function_identity_arguments(oid)` builtin to the
+// executor's function dispatch. The seed pg_proc already registered its OID
+// (2232), but the executor lacked a case, so the call raised 42883. Upstream
+// (ruleutils.c print_function_arguments) differs from pg_get_function_arguments
+// only by print_defaults=false; goopg emits no DEFAULT clauses, so the identity
+// form reuses buildFunctionArguments and is byte-identical to the full arg list.
+// (Its siblings pg_get_function_arguments/result were already implemented.)
 // **Next blocker (precise, confirmed empirically by this test):** pg_dump now
-// fails in dumpFunc with `function pg_catalog.pg_get_function_identity_arguments
-// does not exist` (EXECUTE dumpFunc('1654')). dumpFunc's SELECT projects
-// pg_get_function_arguments/identity_arguments/result(p.oid); goopg implements
-// none of these catalog functions yet. The next DU-002 slice must add a
-// pg_get_function_identity_arguments builtin (and likely its siblings).
+// fails in dumpFunc with `function pg_get_function_sqlbody does not exist`
+// (EXECUTE dumpFunc('1654')). dumpFunc projects pg_get_function_sqlbody(p.oid)
+// (PG14+; the deparsed SQL-standard function body for LANGUAGE sql functions
+// written with BEGIN ATOMIC). goopg has no such builtin yet; the next DU-002
+// slice must add it (NULL for non-SQL / non-atomic routines mirrors PG).
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

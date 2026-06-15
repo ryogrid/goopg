@@ -6873,6 +6873,24 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 		}
 		return NewStringDatum(""), nil
+	case "pg_get_function_identity_arguments":
+		// pg_get_function_identity_arguments(oid) → text: the argument list
+		// needed to identify the function for ALTER/DROP FUNCTION. Upstream
+		// (ruleutils.c print_function_arguments) differs from
+		// pg_get_function_arguments only by print_defaults=false — it omits
+		// DEFAULT clauses. goopg's buildFunctionArguments never emits defaults,
+		// so the identity form is identical to the full argument list here.
+		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
+			oidArg, err := evalExpr(x.Args[0], row, ctx)
+			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
+				if rs := ctx.Catalog.Routines(); rs != nil {
+					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
+						return NewStringDatum(buildFunctionArguments(r)), nil
+					}
+				}
+			}
+		}
+		return NewStringDatum(""), nil
 	case "pg_get_function_result":
 		// pg_get_function_result(oid) → text: return type
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {

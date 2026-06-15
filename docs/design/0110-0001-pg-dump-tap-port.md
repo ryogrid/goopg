@@ -917,6 +917,24 @@ fixed one logical group per loop:
     `pg_get_function_arguments`/`_identity_arguments`/`_result(p.oid)`, none of which
     goopg implements yet. The next slice must add these catalog functions (starting
     with `pg_get_function_identity_arguments`).
+43. **`pg_get_function_identity_arguments(oid)` builtin — DONE.** The seed
+    `pg_proc` already registered this function (OID 2232, `pg_proc_seed_data.go`),
+    and its siblings `pg_get_function_arguments`/`pg_get_function_result` already
+    had executor cases — only `pg_get_function_identity_arguments` lacked a
+    dispatch case in `internal/executor/expr.go`, so the call raised 42883
+    "function ... does not exist". Added the case mirroring `pg_get_function_arguments`:
+    look up the routine by OID and return `buildFunctionArguments(r)`. Upstream
+    (`ruleutils.c` `print_function_arguments`) differs from `pg_get_function_arguments`
+    only by `print_defaults=false` (identity omits DEFAULT clauses); goopg's
+    `buildFunctionArguments` never emits defaults, so the identity form is
+    byte-identical to the full argument list. Guard:
+    `executor.TestPgGetFunctionIdentityArguments` (+ `…OutMode` for mode prefixes).
+    After this slice `dumpFunc` advances past the call; the **new** blocker is
+    `function pg_get_function_sqlbody does not exist` (`EXECUTE dumpFunc('1654')`) —
+    dumpFunc also projects `pg_get_function_sqlbody(p.oid)` (PG14+; the deparsed
+    SQL-standard body of `LANGUAGE sql … BEGIN ATOMIC` functions). goopg has no
+    such builtin yet; the next slice must add it (NULL for non-SQL/non-atomic
+    routines mirrors PG).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
