@@ -401,30 +401,41 @@ further faithful sections of the upstream `.pl`:
   `no_such_database`; pg_amcheck (connected only to `postgres`) warns it cannot
   reach them and finally errors `no relations to check` (exit 1).
 
-### Two deferred residuals
+### `--exclude-schema` sections — ported (was a separate engine bug)
 
-1. **`datconnlimit = -2` invalid-database filter.** The `.pl` marks a database
-   invalid via `UPDATE pg_database SET datconnlimit = -2` and asserts
-   pg_amcheck's database-resolution query filters it out. goopg has no runtime
-   in-place update of on-disk shared catalogs (`pg_database` is initdb-only; the
-   in-memory catalog exposes no `datconnlimit` write path), so the UPDATE is a
-   silent no-op and the database stays connectable. Blocked on the runtime
-   shared-catalog-write capability, not an amcheck concern.
+Passing `--exclude-schema` makes pg_amcheck issue a relation-gathering query
+with an `exclude_raw (...) AS (VALUES ...)` / `exclude_pat` CTE and an anti-join
+`... LEFT OUTER JOIN exclude_pat ep ON (...) WHERE ep.pattern_id IS NULL`. goopg
+previously **panicked the backend** on this shape — pinned to the `toast`
+sub-CTE, where a CTE-backed relation is the probe side and the 5-column
+`exclude_pat` VALUES relation is the build side: a build-side filter predicate
+carried a combined-join-schema column index (43) but was evaluated against the
+5-wide build slot → `runtime error: index out of range [43] with length 5` in
+`executor.MaterializedSlot.Get` via `joinOp.Open → drainRowsCtx → filterOp.Next
+→ evalExprSlot`. The structurally similar 4-way `index` sub-CTE (same anti-join,
+but `relation` on the outer side) did **not** crash, isolating the defect to
+build-side predicate column remapping when the inner/build input is a narrow
+VALUES/CTE relation.
 
-2. **`--exclude-schema` cases — a separate engine bug.** Passing
-   `--exclude-schema` makes pg_amcheck issue a relation-gathering query with an
-   `exclude_raw (...) AS (VALUES ...)` / `exclude_pat` CTE and an anti-join
-   `... LEFT OUTER JOIN exclude_pat ep ON (...) WHERE ep.pattern_id IS NULL`.
-   goopg **panics the backend** on this shape — pinned to the `toast` sub-CTE,
-   where a CTE-backed relation is the probe side and the 5-column `exclude_pat`
-   VALUES relation is the build side: a build-side filter predicate carries
-   combined-join-schema column indices (e.g. index 43) but is evaluated against
-   the 5-wide build slot → `runtime error: index out of range [43] with length
-   5` in `executor.MaterializedSlot.Get` via `joinOp.Open → drainRowsCtx →
-   filterOp.Next → evalExprSlot`. The structurally similar 4-way `index`
-   sub-CTE (same anti-join, but `relation` on the outer side) does **not** crash,
-   isolating the defect to build-side predicate column remapping when the
-   inner/build input is a narrow VALUES/CTE relation. This is a
-   planner/executor column-indexing defect (not amcheck-specific); a safe fix
-   must clear the full TPC-H row-count gates, since column-index bugs are this
-   project's most expensive failure mode. Tracked as an M0110-0003 residual.
+Root cause was the recurring sibling-path divergence between the two LEFT JOIN
+inner-only pushdown helpers: `classifyConjunctSide`/`walkColumnRefs`
+(`internal/planner/pushdown.go`) decided the conjunct was inner-only and
+pushable, while `shiftColumnRefsBy` (`internal/planner/planner.go`) failed to
+rebase the inner `IS NULL` ref by `-leftWidth` — neither switch enumerated
+`*IsNullExpr` and its sub-expr-bearing siblings. Fixed by commit `36a085dc`
+(M0110-0003 residual #2): both helpers now enumerate every sub-expr-bearing
+`Expr` kind, so the inner ref is rebased to the build slot's width and the
+anti-join runs to completion. Both `--all --exclude-schema …` cases (`.pl`
+:377-418) are now ported in `TestPort_PgAmcheck002Nonesuch` (exit 1,
+`no relations to check`) and stand as the end-to-end regression guard for the
+planner fix.
+
+### One deferred residual
+
+**`datconnlimit = -2` invalid-database filter.** The `.pl` marks a database
+invalid via `UPDATE pg_database SET datconnlimit = -2` and asserts pg_amcheck's
+database-resolution query filters it out. goopg has no runtime in-place update
+of on-disk shared catalogs (`pg_database` is initdb-only; the in-memory catalog
+exposes no `datconnlimit` write path), so the UPDATE is a silent no-op and the
+database stays connectable. Blocked on the runtime shared-catalog-write
+capability, not an amcheck concern.

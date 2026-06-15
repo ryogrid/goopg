@@ -109,12 +109,14 @@ package testport
 // `postgres.pg_catalog.pg_class` anchor keeping exit 0) and the cross-database
 // "existent objects in the wrong databases" case (objects that exist in
 // `postgres` but are referenced under template1/another_db/no_such_database).
-// Two of the .pl's sections remain DEFERRED, documented inline at their call
-// sites: (1) the `datconnlimit = -2` invalid-database filter (needs a runtime
-// pg_database shared-catalog write goopg lacks), and (2) the `--exclude-schema`
-// cases (pg_amcheck's exclude-CTE anti-join PANICS the backend with a
-// build-side column-index out-of-range — a separate planner defect tracked as
-// an M0110-0003 residual).
+// The port now also covers 002_nonesuch.pl's final `--exclude-schema` sections
+// (.pl :377-418): both `--all --exclude-schema …` cases — whose exclude-CTE
+// anti-join previously PANICKED the backend with a build-side column-index
+// out-of-range — run to completion (exit 1, `no relations to check`) after the
+// LEFT JOIN inner-only pushdown shift/classify fix (commit 36a085dc,
+// M0110-0003 residual #2). One .pl section remains DEFERRED, documented inline
+// at its call site: the `datconnlimit = -2` invalid-database filter (needs a
+// runtime pg_database shared-catalog write goopg lacks).
 //
 // Like 001_basic, the bundled pg_amcheck links a PG-17+ libpq symbol
 // (PQcancelBlocking), so it is run with LD_LIBRARY_PATH pointed at
@@ -494,24 +496,58 @@ func TestPort_PgAmcheck002Nonesuch(t *testing.T) {
 		})
 
 	// --- Schema exclusion patterns ---------------------------------------
-	// NOT PORTED (deferred, AC-002 residual #2 — a genuine engine BUG, filed
-	// separately). 002_nonesuch.pl's final two cases pass `--exclude-schema`,
-	// which makes pg_amcheck issue a relation-gathering query with an
-	// `exclude_raw (...) AS (VALUES ...)`/`exclude_pat` CTE and an anti-join
-	// `... LEFT OUTER JOIN exclude_pat ep ON (...) WHERE ep.pattern_id IS NULL`.
-	// goopg PANICS the backend on this query shape — specifically the `toast`
-	// sub-CTE, where a CTE-backed relation is the probe side and the 5-column
-	// `exclude_pat` VALUES relation is the build side: a build-side filter
-	// predicate carries combined-join-schema column indices (e.g. index 43)
-	// but is evaluated against the 5-wide build slot →
-	// `runtime error: index out of range [43] with length 5` in
-	// executor.MaterializedSlot.Get (slot.go), via joinOp.Open → drainRowsCtx
-	// → filterOp.Next → evalExprSlot. The 4-way `index` sub-CTE (same anti-join
-	// shape, but `relation` on the outer side) does NOT crash, so the bug is a
-	// build-side predicate column-remap when the inner/build input is a narrow
-	// VALUES/CTE relation. This is a planner/executor column-indexing defect,
-	// not amcheck-specific; fixing it safely needs the full TPC-H row-count
-	// gates (column-index bugs are this project's most expensive failure mode).
-	// Tracked as M0110-0003 residual; see deferral ledger. The two
-	// exclude-schema cases promote once the panic is fixed.
+	// 002_nonesuch.pl's final two sections (.pl :377-418). pg_amcheck's
+	// --exclude-schema makes the relation-gathering query build an
+	// `exclude_raw (...) AS (VALUES ...)` / `exclude_pat` CTE and anti-join it
+	// (`... LEFT OUTER JOIN exclude_pat ep ON (...) WHERE ep.pattern_id IS
+	// NULL`). This query shape previously PANICKED the goopg backend: in the
+	// `toast` sub-CTE the 5-column `exclude_pat` VALUES relation is the join's
+	// build/inner side, and a build-side filter predicate carried a
+	// combined-join-schema column index (43) that was evaluated against the
+	// 5-wide build slot → `runtime error: index out of range [43] with length
+	// 5` in executor.MaterializedSlot.Get (joinOp.Open → drainRowsCtx →
+	// filterOp.Next). Root cause was the recurring sibling-path divergence
+	// between the two LEFT JOIN inner-only pushdown helpers — classifyConjunct
+	// Side/walkColumnRefs decided the conjunct pushable while shiftColumnRefsBy
+	// failed to rebase the inner `IS NULL` ref by -leftWidth (neither switch
+	// enumerated *IsNullExpr et al.). Fixed by commit 36a085dc (M0110-0003
+	// residual #2): both helpers now enumerate every sub-expr-bearing Expr
+	// kind, so the inner ref is rebased to the build slot's width and the
+	// anti-join runs to completion. These two cases are the end-to-end
+	// regression guard for that fix.
+
+	// Check with only schema exclusion patterns: excluding every schema that
+	// holds a checkable relation leaves nothing to check (.pl :380-397).
+	checkAmcheck(t, c, "schema exclusion patterns exclude all relations",
+		[]string{
+			"--all",
+			"--no-strict-names",
+			"--exclude-schema", "public",
+			"--exclude-schema", "pg_catalog",
+			"--exclude-schema", "pg_toast",
+			"--exclude-schema", "information_schema",
+		}, 1,
+		[]string{
+			`pg_amcheck: warning: skipping database "template1": amcheck is not installed`,
+			`pg_amcheck: error: no relations to check`,
+		})
+
+	// Check that exclusion patterns override inclusion patterns: even though
+	// pg_catalog.pg_class is explicitly included, `--exclude-schema '*'`
+	// excludes every schema, so nothing remains to check (.pl :399-418).
+	checkAmcheck(t, c, "schema exclusion pattern overrides all inclusion patterns",
+		[]string{
+			"--all",
+			"--no-strict-names",
+			"--schema", "public",
+			"--schema", "pg_catalog",
+			"--schema", "pg_toast",
+			"--schema", "information_schema",
+			"--table", "pg_catalog.pg_class",
+			"--exclude-schema", "*",
+		}, 1,
+		[]string{
+			`pg_amcheck: warning: skipping database "template1": amcheck is not installed`,
+			`pg_amcheck: error: no relations to check`,
+		})
 }
