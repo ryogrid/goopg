@@ -847,6 +847,20 @@ fixed one logical group per loop:
     `oidvector`; NULL when the function uses no transforms — the case for
     every goopg routine). The next slice must add `protrftypes` to the pg_proc
     view.
+39. **`pg_proc.protrftypes` column — DONE.** dumpFunc projects `protrftypes`
+    (the OID array of argument types whose transforms the function uses); goopg's
+    `pg_proc` virtual view did not expose it, so `EXECUTE dumpFunc('1654')`
+    aborted with `column "protrftypes" does not exist`. Added the
+    `protrftypes oidvector` column, always NULL — goopg supports no transforms,
+    so `dumpFunc` emits no `TRANSFORM FOR TYPE ...` clause for any routine
+    (built-in stubs and user routines alike). Catalog-only change
+    (`internal/initdb/pg_proc_view.go`); guard `TestPgProcViewProtrftypes`.
+    After this slice pg_dump advances within `dumpFunc`; the **new** blocker is
+    `column "proparallel" does not exist` (`EXECUTE dumpFunc('1654')`) - dumpFunc
+    reads `pg_proc.proparallel` (the parallel-safety marker, `char`: `'s'` safe /
+    `'r'` restricted / `'u'` unsafe; PG's `CREATE FUNCTION` default is `'u'`
+    unsafe — the case for every goopg routine). The next slice must add
+    `proparallel` to the pg_proc view.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

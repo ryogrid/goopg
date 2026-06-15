@@ -174,6 +174,9 @@ var builtinProcs = []builtinProcRow{
 //     functions (float4). Mirrors PG's CREATE FUNCTION default — 1000 for
 //     set-returning functions, 0 for everything else. dumpFunc reads it to
 //     emit `ROWS <n>` for SRFs.
+//   - protrftypes: OID array (oidvector) of argument types whose transforms
+//     the function uses; always NULL — goopg supports no transforms, so
+//     dumpFunc emits no `TRANSFORM FOR TYPE ...` clause.
 //
 // pronargs/proacl/proowner were added for pg_dump's getFuncs SELECT (M0110-0001
 // DU-002 slice 7), which projects `p.pronargs, …, p.proacl, …, p.proowner`.
@@ -202,6 +205,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "proconfig", Type: catalog.Type{Name: "text[]"}},
 			{Name: "procost", Type: catalog.Type{Name: "float4"}},
 			{Name: "prorows", Type: catalog.Type{Name: "float4"}},
+			{Name: "protrftypes", Type: catalog.Type{Name: "oidvector"}},
 		},
 		Virtual: true,
 	}
@@ -230,6 +234,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"",  // proconfig: NULL (no per-function GUC SET clauses)
 				"1", // procost: internal-language default (DEFAULT_FUNCTION_COST)
 				"0", // prorows: built-in stubs (abs/RI_FKey) are not SRFs
+				"",  // protrftypes: NULL (goopg supports no transforms)
 			})
 		}
 		// Append user-defined routines.
@@ -312,6 +317,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"",      // proconfig: NULL (goopg tracks no per-function GUC SET)
 				procost, // procost: language-derived (1 internal/C, else 100)
 				prorows, // prorows: 1000 for SRFs, 0 otherwise
+				"",      // protrftypes: NULL (goopg supports no transforms)
 			})
 		}
 		return rows

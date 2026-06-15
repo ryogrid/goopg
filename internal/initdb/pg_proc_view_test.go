@@ -296,6 +296,34 @@ func TestPgProcViewProrows(t *testing.T) {
 	}
 }
 
+// TestPgProcViewProtrftypes pins the protrftypes column (DU-002 slice 39):
+// always NULL — goopg supports no transforms, so dumpFunc emits no
+// `TRANSFORM FOR TYPE ...` clause for any routine, built-in or user-defined.
+func TestPgProcViewProtrftypes(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "myfunc",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "sql",
+		Body:       "SELECT 1",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	// protrftypes is the last column (index 20), appended after prorows (19).
+	const protrftypes = 20
+	for i := range rows {
+		if rows[i][protrftypes] != "" {
+			t.Errorf("row %q protrftypes = %q, want NULL (empty)", rows[i][1], rows[i][protrftypes])
+		}
+	}
+}
+
 // TestPgProcViewOrdering pins that the row order matches OID
 // ordering — an operator's `ORDER BY oid` is a no-op against this
 // view's natural order, which makes diff-based regression tests
