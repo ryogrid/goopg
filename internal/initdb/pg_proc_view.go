@@ -177,6 +177,10 @@ var builtinProcs = []builtinProcRow{
 //   - protrftypes: OID array (oidvector) of argument types whose transforms
 //     the function uses; always NULL — goopg supports no transforms, so
 //     dumpFunc emits no `TRANSFORM FOR TYPE ...` clause.
+//   - proparallel: parallel-safety marker (char) — 's' safe / 'r' restricted /
+//     'u' unsafe. Mirrors PG's CREATE FUNCTION default of 'u' (unsafe) for
+//     every routine; goopg tracks no parallel-safety, so dumpFunc emits
+//     `PARALLEL UNSAFE` (the default, so effectively nothing) for all.
 //
 // pronargs/proacl/proowner were added for pg_dump's getFuncs SELECT (M0110-0001
 // DU-002 slice 7), which projects `p.pronargs, …, p.proacl, …, p.proowner`.
@@ -206,6 +210,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "procost", Type: catalog.Type{Name: "float4"}},
 			{Name: "prorows", Type: catalog.Type{Name: "float4"}},
 			{Name: "protrftypes", Type: catalog.Type{Name: "oidvector"}},
+			{Name: "proparallel", Type: catalog.Type{Name: "char"}},
 		},
 		Virtual: true,
 	}
@@ -235,6 +240,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"1", // procost: internal-language default (DEFAULT_FUNCTION_COST)
 				"0", // prorows: built-in stubs (abs/RI_FKey) are not SRFs
 				"",  // protrftypes: NULL (goopg supports no transforms)
+				"u", // proparallel: unsafe (PG CREATE FUNCTION default)
 			})
 		}
 		// Append user-defined routines.
@@ -318,6 +324,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				procost, // procost: language-derived (1 internal/C, else 100)
 				prorows, // prorows: 1000 for SRFs, 0 otherwise
 				"",      // protrftypes: NULL (goopg supports no transforms)
+				"u",     // proparallel: unsafe (PG CREATE FUNCTION default)
 			})
 		}
 		return rows

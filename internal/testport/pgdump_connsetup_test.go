@@ -194,12 +194,14 @@ package testport
 // for set-returning functions, float4; 1000 for SRFs, 0 otherwise).
 // Slice 39 added pg_proc.protrftypes (the OID array of argument types whose
 // transforms the function uses, oidvector; NULL for every goopg routine).
+// Slice 40 added pg_proc.proparallel (the parallel-safety marker, char; 'u'
+// unsafe for every goopg routine, mirroring PG's CREATE FUNCTION default).
 // **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// fails in dumpFunc with `column "proparallel" does not exist` (EXECUTE
-// dumpFunc('1654')). dumpFunc reads pg_proc.proparallel (the parallel-safety
-// marker, char: 's' safe / 'r' restricted / 'u' unsafe; PG's CREATE FUNCTION
-// default is 'u' unsafe — the case for every goopg routine). The next DU-002
-// slice must add proparallel to the pg_proc view.
+// fails in dumpFunc with `column "prosupport" does not exist` (EXECUTE
+// dumpFunc('1654')). dumpFunc reads pg_proc.prosupport (the OID of the
+// function's planner support function; regproc/oid. PG's CREATE FUNCTION
+// default is 0 — no support function, the case for every goopg routine). The
+// next DU-002 slice must add prosupport to the pg_proc view.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

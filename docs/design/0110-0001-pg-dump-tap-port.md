@@ -861,6 +861,20 @@ fixed one logical group per loop:
     `'r'` restricted / `'u'` unsafe; PG's `CREATE FUNCTION` default is `'u'`
     unsafe — the case for every goopg routine). The next slice must add
     `proparallel` to the pg_proc view.
+40. **`pg_proc.proparallel` column — DONE.** dumpFunc projects `proparallel`
+    (the parallel-safety marker); goopg's `pg_proc` virtual view did not expose
+    it, so `EXECUTE dumpFunc('1654')` aborted with `column "proparallel" does
+    not exist`. Added the `proparallel char` column, always `'u'` (unsafe) —
+    goopg tracks no parallel-safety, mirroring PG's `CREATE FUNCTION` default, so
+    `dumpFunc` emits `PARALLEL UNSAFE` (the default) for every routine (built-in
+    stubs and user routines alike). Catalog-only change
+    (`internal/initdb/pg_proc_view.go`); guard `TestPgProcViewProparallel`.
+    After this slice pg_dump advances within `dumpFunc`; the **new** blocker is
+    `column "prosupport" does not exist` (`EXECUTE dumpFunc('1654')`) - dumpFunc
+    reads `pg_proc.prosupport` (the OID of the function's planner support
+    function, `regproc`/`oid`; PG's `CREATE FUNCTION` default is `0` — no support
+    function, the case for every goopg routine). The next slice must add
+    `prosupport` to the pg_proc view.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

@@ -324,6 +324,34 @@ func TestPgProcViewProtrftypes(t *testing.T) {
 	}
 }
 
+// TestPgProcViewProparallel pins the proparallel column (DU-002 slice 40):
+// always 'u' (unsafe) — goopg tracks no parallel-safety, mirroring PG's
+// CREATE FUNCTION default, so dumpFunc emits PARALLEL UNSAFE for every routine.
+func TestPgProcViewProparallel(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "myfunc",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "sql",
+		Body:       "SELECT 1",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	// proparallel is the last column (index 21), appended after protrftypes (20).
+	const proparallel = 21
+	for i := range rows {
+		if rows[i][proparallel] != "u" {
+			t.Errorf("row %q proparallel = %q, want u (unsafe)", rows[i][1], rows[i][proparallel])
+		}
+	}
+}
+
 // TestPgProcViewOrdering pins that the row order matches OID
 // ordering — an operator's `ORDER BY oid` is a no-op against this
 // view's natural order, which makes diff-based regression tests
