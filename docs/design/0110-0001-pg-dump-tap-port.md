@@ -86,11 +86,30 @@ fixed one logical group per loop:
    virtual view (`internal/catalog/catalog.go`) gained an `oid` column at
    ordinal 0 carrying OID 10 (`BOOTSTRAP_SUPERUSERID`, the `postgres`
    superuser, per `pg_authid.dat`).
-2. **`acldefault()` (getNamespaces) — NEXT.** pg_dump then runs
+2. **`acldefault()` (getNamespaces) — LANDED.** pg_dump then runs
    `SELECT n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl,
-   acldefault('n', n.nspowner) AS acldefault FROM pg_namespace n`, which fails
-   with `function acldefault does not exist`. Needs the `acldefault()` builtin
-   plus `pg_namespace` columns (`tableoid`, `nspowner`, `nspacl`).
+   acldefault('n', n.nspowner) AS acldefault FROM pg_namespace n`, which failed
+   with `function acldefault does not exist`. Added the `acldefault("char", oid)`
+   builtin to the executor (`internal/executor/expr.go`, `evalAclDefault`),
+   mirroring `acldefault()`/`acldefault_sql()` in
+   `src/backend/utils/adt/acl.c`: it computes the hard-wired default privileges
+   per object-type char and renders them as aclitem[] text, e.g.
+   `acldefault('n', 10)` → `{postgres=UC/postgres}`. The function was already
+   seeded in `pg_proc` (OID 3943); only the executor handler was missing. The
+   `pg_namespace` columns (`oid`, `nspname`, `nspowner`, `nspacl`) already exist.
+   Unit guard: `executor.TestEvalAclDefault` (+ `TestEvalAclDefaultEdgeCases`)
+   pins all 13 object types and the privilege-letter order (`ACL_ALL_RIGHTS_STR`
+   = `arwdDxtXUCTcsAm`).
+3. **`tableoid` column label (getNamespaces) — NEXT.** With `acldefault()` in
+   place the getNamespaces query *executes* (verified live: all six columns
+   return correct values), but pg_dump still **segfaults** during "reading
+   schemas": its first projected column `n.tableoid` comes back labelled
+   `?column?` instead of `tableoid`, so `PQfnumber(res, "tableoid")` returns -1
+   and `PQgetvalue(res, i, -1)` reads out of bounds (`column number -1 is out of
+   range 0..5`, SIGSEGV / exit 139). The *value* resolves correctly (2615); only
+   the RowDescription field name is wrong, and it is wrong for **every** table
+   (real and virtual), so this is a planner output-column-naming bug for the
+   `tableoid` system column, not a catalog-row gap. Fix that next.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -116,7 +135,9 @@ first, per the fix_plan action).
 
 `go test -v -run TestPort_PgDump001Basic ./internal/testport/` → PASS.
 `go test -v -run TestPort_PgDumpConnectionSetup ./internal/testport/` → PASS
-(passes connection setup + collectRoleNames; logs the next gap: `acldefault()`
-in getNamespaces).
+(passes connection setup + collectRoleNames + getNamespaces' `acldefault()`;
+logs the next gap: the `tableoid` `?column?` mislabel that segfaults pg_dump in
+"reading schemas").
+`go test -v -run TestEvalAclDefault ./internal/executor/` → PASS.
 `go test ./internal/config/ ./internal/parser/ ./internal/server/` → PASS.
 `go run ./cmd/gen-oracle-port-status` regenerates the status markdown.

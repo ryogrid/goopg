@@ -8402,6 +8402,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// for a row in the named relation. M0097-0038.
 	case "currtid2":
 		return evalCurrtid2(x, row, ctx)
+	// acldefault("char", oid) → aclitem[]: the hard-wired default access
+	// privileges for a newly-created object of the given type. pg_dump's
+	// getNamespaces/getTypes/getTables/... call it as the baseline to diff
+	// against the stored *acl column. M0110-0001 / DU-002 slice 2.
+	case "acldefault":
+		return evalAclDefault(x, row, ctx)
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.
@@ -8431,6 +8437,133 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	}
 
 	return evalStoredRoutineFuncCall(x, row, ctx)
+}
+
+// ACL privilege bits, mirroring src/include/nodes/parsenodes.h. Used by
+// evalAclDefault to compute hard-wired default privileges.
+const (
+	aclInsert      = 1 << 0  // 'a'
+	aclSelect      = 1 << 1  // 'r'
+	aclUpdate      = 1 << 2  // 'w'
+	aclDelete      = 1 << 3  // 'd'
+	aclTruncate    = 1 << 4  // 'D'
+	aclReferences  = 1 << 5  // 'x'
+	aclTrigger     = 1 << 6  // 't'
+	aclExecute     = 1 << 7  // 'X'
+	aclUsage       = 1 << 8  // 'U'
+	aclCreate      = 1 << 9  // 'C'
+	aclCreateTemp  = 1 << 10 // 'T'
+	aclConnect     = 1 << 11 // 'c'
+	aclSet         = 1 << 12 // 's'
+	aclAlterSystem = 1 << 13 // 'A'
+	aclMaintain    = 1 << 14 // 'm'
+)
+
+// aclPrivString renders a privilege bitmask to its canonical letter string,
+// emitting letters in PostgreSQL's fixed ACL_ALL_RIGHTS_STR order
+// ("arwdDxtXUCTcsAm", src/include/utils/acl.h). e.g. USAGE|CREATE → "UC".
+func aclPrivString(mask int) string {
+	const order = "arwdDxtXUCTcsAm"
+	bits := [...]int{
+		aclInsert, aclSelect, aclUpdate, aclDelete, aclTruncate,
+		aclReferences, aclTrigger, aclExecute, aclUsage, aclCreate,
+		aclCreateTemp, aclConnect, aclSet, aclAlterSystem, aclMaintain,
+	}
+	var b strings.Builder
+	for i, bit := range bits {
+		if mask&bit != 0 {
+			b.WriteByte(order[i])
+		}
+	}
+	return b.String()
+}
+
+// aclRoleNameForOID resolves a role OID to the name aclitemout would print.
+// goopg has the single bootstrap superuser "postgres" (OID 10,
+// BOOTSTRAP_SUPERUSERID); any other OID falls back to its numeric form, which
+// is what PostgreSQL emits for a since-dropped role.
+func aclRoleNameForOID(oid int64) string {
+	if oid == 10 {
+		return "postgres"
+	}
+	return strconv.FormatInt(oid, 10)
+}
+
+// evalAclDefault implements acldefault("char" objtype, oid ownerId) → aclitem[].
+// It mirrors acldefault()/acldefault_sql() in src/backend/utils/adt/acl.c: it
+// computes the hard-wired default access privileges for a newly-created object
+// of the given type and renders them as the text form of an aclitem[] array,
+// e.g. acldefault('n', 10) → "{postgres=UC/postgres}". The world (PUBLIC) entry
+// is emitted first, then the owner entry, each only when non-empty. NULL input
+// yields NULL. M0110-0001 / DU-002 slice 2.
+func evalAclDefault(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
+	if len(x.Args) != 2 {
+		return NullDatum, &ExecError{Code: "42883", Pos: x.Pos(),
+			Message: "acldefault(\"char\", oid) requires exactly 2 arguments"}
+	}
+	typeArg, err := evalExpr(x.Args[0], row, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	ownerArg, err := evalExpr(x.Args[1], row, ctx)
+	if err != nil {
+		return NullDatum, err
+	}
+	if typeArg.IsNull() || ownerArg.IsNull() {
+		return NullDatum, nil
+	}
+	objtype := typeArg.Format()
+	if objtype == "" {
+		return NullDatum, &ExecError{Code: "22P02", Pos: x.Pos(),
+			Message: "invalid input syntax for type \"char\""}
+	}
+
+	var worldDefault, ownerDefault int
+	switch objtype[0] {
+	case 'c': // OBJECT_COLUMN — no extra privileges
+	case 'r': // OBJECT_TABLE
+		ownerDefault = aclInsert | aclSelect | aclUpdate | aclDelete |
+			aclTruncate | aclReferences | aclTrigger | aclMaintain
+	case 's': // OBJECT_SEQUENCE
+		ownerDefault = aclUsage | aclSelect | aclUpdate
+	case 'd': // OBJECT_DATABASE
+		worldDefault = aclCreateTemp | aclConnect
+		ownerDefault = aclCreate | aclCreateTemp | aclConnect
+	case 'f': // OBJECT_FUNCTION
+		worldDefault = aclExecute
+		ownerDefault = aclExecute
+	case 'l': // OBJECT_LANGUAGE
+		worldDefault = aclUsage
+		ownerDefault = aclUsage
+	case 'L': // OBJECT_LARGEOBJECT
+		ownerDefault = aclSelect | aclUpdate
+	case 'n': // OBJECT_SCHEMA
+		ownerDefault = aclUsage | aclCreate
+	case 't': // OBJECT_TABLESPACE
+		ownerDefault = aclCreate
+	case 'F': // OBJECT_FDW
+		ownerDefault = aclUsage
+	case 'S': // OBJECT_FOREIGN_SERVER
+		ownerDefault = aclUsage
+	case 'T': // OBJECT_TYPE / OBJECT_DOMAIN
+		worldDefault = aclUsage
+		ownerDefault = aclUsage
+	case 'p': // OBJECT_PARAMETER_ACL
+		ownerDefault = aclSet | aclAlterSystem
+	default:
+		return NullDatum, &ExecError{Code: "XX000", Pos: x.Pos(),
+			Message: fmt.Sprintf("unrecognized object type abbreviation: %c", objtype[0])}
+	}
+
+	ownerName := aclRoleNameForOID(ownerArg.Int)
+	var items []string
+	if worldDefault != 0 {
+		items = append(items, "="+aclPrivString(worldDefault)+"/"+ownerName)
+	}
+	if ownerDefault != 0 {
+		items = append(items, ownerName+"="+aclPrivString(ownerDefault)+"/"+ownerName)
+	}
+	return NewStringDatum("{" + strings.Join(items, ",") + "}"), nil
 }
 
 // evalCurrtid2 implements currtid2(relname text, tid tid) → tid.

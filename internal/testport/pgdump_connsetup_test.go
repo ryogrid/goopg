@@ -28,11 +28,18 @@ package testport
 // This test drives the real pg_dump binary against a live goopg server and
 // asserts the connection-setup handshake no longer fails: any non-zero exit
 // must NOT carry a setup_connection error signature. The full dump still fails
-// later on catalog-view parity (collectRoleNames' `pg_roles.oid` gap is now
-// closed; the next gap is the `acldefault()` function missing in getNamespaces),
-// which is the broad DU-002+ work tracked separately; this
-// test is the regression guard for the connection-setup slice and a marker for
-// the next blocker. It auto-tightens (asserts exit 0) once a clean dump works.
+// later on catalog-view parity. Closed gaps so far: collectRoleNames'
+// `pg_roles.oid` (DU-002 slice 1) and getNamespaces' `acldefault()` function
+// (DU-002 slice 2). **Next blocker (precise):** getNamespaces' first column
+// `n.tableoid` comes back labelled `?column?` instead of `tableoid` (the value
+// resolves correctly — 2615 — but the RowDescription field name is wrong), so
+// pg_dump's `PQfnumber(res, "tableoid")` returns -1 and the client segfaults
+// ("column number -1 is out of range 0..5", SIGSEGV / exit 139). This is a
+// planner output-column-naming bug for the `tableoid` system column (it affects
+// every table, not just virtual catalogs), tracked separately under DU-002.
+// This test is the regression guard for the connection-setup slice and a marker
+// for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
+// works.
 //
 // Like the other client-tool ports the bundled pg_dump links a PG-17+ libpq
 // symbol, so it runs with LD_LIBRARY_PATH pointed at postgres/local_install/lib
@@ -102,6 +109,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// Still blocked downstream on catalog-view parity. Confirm the failure is a
 	// post-setup catalog/query error, not a setup_connection failure, and log
 	// the precise next blocker so the next loop has a target.
-	t.Logf("pg_dump passes connection setup; remaining DU-002 catalog-parity gap: stderr=%q",
-		strings.TrimSpace(res.Stderr))
+	t.Logf("pg_dump passes connection setup; remaining DU-002 catalog-parity gap: "+
+		"exit=%d stderr=%q stdout(%d bytes)=%q",
+		res.ExitCode, strings.TrimSpace(res.Stderr), len(res.Stdout), res.Stdout)
 }

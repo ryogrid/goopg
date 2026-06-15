@@ -1098,6 +1098,26 @@ object support.
         Design doc `0110-0001` extended (Connection-setup compatibility section).
         Resume = add `oid` to the `pg_roles` view, then continue getRoles →
         getTablespaces → getNamespaces… per setup_connection's query order.
+      - **PROGRESS 2026-06-15 (loop #23):** **DU-002 slice 1 (`pg_roles.oid`)
+        LANDED** — collectRoleNames' `SELECT oid, rolname FROM pg_roles ORDER BY 1`
+        now works. (commit `20d242a2`.)
+      - **PROGRESS 2026-06-15 (loop #24):** **DU-002 slice 2 (`acldefault()`)
+        LANDED.** getNamespaces runs `acldefault('n', n.nspowner)`; added the
+        `acldefault("char", oid)` builtin (`internal/executor/expr.go`,
+        `evalAclDefault`) mirroring `acldefault_sql()` in `acl.c` — computes
+        hard-wired default privileges per object-type char and renders aclitem[]
+        text (`acldefault('n', 10)` → `{postgres=UC/postgres}`). Already seeded in
+        pg_proc (OID 3943); only the executor handler was missing. Unit guard
+        `executor.TestEvalAclDefault` pins all 13 object types + privilege order.
+        Verified live: full getNamespaces query returns all 6 columns correctly.
+        **Next blocker (precise):** pg_dump still SEGFAULTs in "reading schemas"
+        because `n.tableoid` (first projected column) comes back labelled
+        `?column?` instead of `tableoid`, so `PQfnumber(res,"tableoid")` → -1 and
+        the client reads out of bounds (`column number -1 is out of range 0..5`,
+        exit 139). The value is correct (2615); only the RowDescription field name
+        is wrong — for EVERY table, so it's a planner output-column-naming bug for
+        the `tableoid` system column. Resume = fix `tableoid` column labelling,
+        then continue getTypes → getTables… per pg_dump's getter order.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
