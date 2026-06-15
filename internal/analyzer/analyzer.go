@@ -1796,28 +1796,44 @@ func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		innerCtx.rels = rels
 	}
 	innerCols := make([]catalog.Column, 0, len(cte.Query.Targets))
-	for _, tgt := range cte.Query.Targets {
-		// A top-level `*` / `t.*` in the CTE body must materialise into
-		// the inner scope's concrete columns — analyzeExpr rejects a
-		// bare StarExpr ("'*' is not allowed here"). Mirrors
-		// synthesizeSubqueryTable's derived-table star handling; keep
-		// the two in sync. M0097-0003.
-		if star, ok := tgt.Expr.(*parser.StarExpr); ok {
-			innerCols = append(innerCols, expandInnerStarColumns(star, innerCtx)...)
-			continue
+	if len(cte.Query.Targets) == 0 && len(cte.Query.ValuesRows) > 0 {
+		// VALUES-list CTE body (e.g. `cte (a, b) AS (VALUES (1,'x'),
+		// (2,'y'))`): there are no Targets, so the column count comes
+		// from the first VALUES row. Default names are "column1",
+		// "column2", … and types are "unknown" (the planner resolves
+		// exact types from the row literals). This mirrors the VALUES
+		// anchor handling in analyzeRecursiveCTE — keep the two in sync.
+		// pg_amcheck's database-resolution query relies on this shape
+		// (`include_raw (pattern_id, rgx) AS (VALUES (0,'^(x)$'), …)`).
+		// M0110-0003 / AC-002.
+		nCols := len(cte.Query.ValuesRows[0])
+		for i := 0; i < nCols; i++ {
+			innerCols = append(innerCols, catalog.Column{Name: fmt.Sprintf("column%d", i+1), Type: catalog.Type{Name: "unknown"}, Ordinal: i})
 		}
-		name := tgt.Alias
-		if name == "" {
-			name = deriveAnalyzerTargetName(tgt.Expr)
+	} else {
+		for _, tgt := range cte.Query.Targets {
+			// A top-level `*` / `t.*` in the CTE body must materialise into
+			// the inner scope's concrete columns — analyzeExpr rejects a
+			// bare StarExpr ("'*' is not allowed here"). Mirrors
+			// synthesizeSubqueryTable's derived-table star handling; keep
+			// the two in sync. M0097-0003.
+			if star, ok := tgt.Expr.(*parser.StarExpr); ok {
+				innerCols = append(innerCols, expandInnerStarColumns(star, innerCtx)...)
+				continue
+			}
+			name := tgt.Alias
+			if name == "" {
+				name = deriveAnalyzerTargetName(tgt.Expr)
+			}
+			if name == "" {
+				name = fmt.Sprintf("?column?%d", len(innerCols)+1)
+			}
+			typ, err := analyzeExpr(tgt.Expr, innerCtx)
+			if err != nil {
+				return err
+			}
+			innerCols = append(innerCols, catalog.Column{Name: name, Type: typ})
 		}
-		if name == "" {
-			name = fmt.Sprintf("?column?%d", len(innerCols)+1)
-		}
-		typ, err := analyzeExpr(tgt.Expr, innerCtx)
-		if err != nil {
-			return err
-		}
-		innerCols = append(innerCols, catalog.Column{Name: name, Type: typ})
 	}
 	if len(cte.Columns) > 0 {
 		if len(cte.Columns) != len(innerCols) {

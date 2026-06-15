@@ -39,6 +39,14 @@ package testport
 // handshake. Promote AC-002 to `port` once they are implemented and this test
 // stops skipping.
 //
+// UPDATE (M0110-0003, parser/analyzer slice): gaps #1 and #2 are FIXED —
+// parseWithClause now accepts an unreserved/col_name keyword (`index`) as a
+// CTE name, and analyzer.registerAnalyzedCTE derives a VALUES-list CTE's
+// column count from its first row (mirroring analyzeRecursiveCTE). The
+// remaining blocker is #3 (connection-level non-existent-database rejection
+// + template1/template0 registration in pg_database); the preflight below now
+// probes for it directly so the test self-skips on #3 rather than failing.
+//
 // Like 001_basic, the bundled pg_amcheck links a PG-17+ libpq symbol
 // (PQcancelBlocking), so it is run with LD_LIBRARY_PATH pointed at
 // postgres/local_install/lib.
@@ -140,6 +148,24 @@ func TestPort_PgAmcheck002Nonesuch(t *testing.T) {
 		t.Skipf("AC-002 blocked: pg_amcheck's bootstrap queries hit goopg SQL gaps "+
 			"(see file header) — `index` as a CTE name, VALUES-list-as-CTE column "+
 			"derivation, and non-existent-database connect rejection. stderr=%q", pre.Stderr)
+	}
+
+	// Blockers #1 (`index` CTE name) and #2 (VALUES-list-as-CTE column
+	// derivation) are fixed (M0110-0003, loop landing the parser/analyzer
+	// slices), so the bootstrap "query failed" signature above may already be
+	// gone. The remaining blocker #3 is connection-level: goopg does not yet
+	// reject a connection to a non-existent database at startup (3D000), and
+	// template1/template0 are not registered in pg_database. Until then
+	// pg_amcheck reaches the relation query for `qqq` instead of failing with
+	// `database "qqq" does not exist`, so the first assertion below would FAIL
+	// rather than the suite skipping. Probe for that gap and self-skip with the
+	// precise remaining blocker; the day #3 lands this clears and the full
+	// assertion set runs unchanged.
+	db := runAmcheck(t, c, "qqq")
+	if !strings.Contains(db.Stderr, `database "qqq" does not exist`) {
+		t.Skipf("AC-002 blocked on remaining gap #3: goopg does not reject a "+
+			"connection to a non-existent database at startup (3D000), and "+
+			"template1/template0 are not registered in pg_database. stderr=%q", db.Stderr)
 	}
 
 	// --- Non-existent databases ------------------------------------------

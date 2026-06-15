@@ -200,11 +200,52 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
   `c.oid` lands as a `ColumnRef`, but the planner/executor still need to resolve
   that outer reference per-row. That, plus the clog `XidStatusFunc` wiring and the
   TAP port itself, is the rest of S5.
-- **Remaining:** S5 port the `AC-002`…`AC-005` pg_amcheck TAP tests. Per the scope
-  refinement above, `002_nonesuch` (`AC-002`) exercises only `CREATE EXTENSION
-  amcheck` + the install probe, so S1+S2 satisfy its *server-side* requirement;
-  promoting `AC-002` to `port` still needs S5 (the TAP port itself) plus the SRFs
-  to merely *exist* in `pg_proc`.
+- **S5 (in progress) — AC-002 bootstrap-query SQL-engine gaps #1+#2 LANDED**
+  (parser + analyzer, zero contaminated files): the `002_nonesuch` port runs the
+  real `pg_amcheck` end-to-end, and its bootstrap queries (database/relation
+  resolution in `pg_amcheck.c compile_database_list` / `compile_relation_list_one_db`)
+  hit two general goopg SQL-engine gaps — neither amcheck-specific:
+  1. **`index` rejected as a CTE name.** The relation-gathering query declares a
+     CTE literally named `index`. `parseCTE`→`parseIdent` already accepts an
+     unreserved/col_name keyword as an identifier, but the post-`,` look-ahead
+     guard in `parseWithClause` only allowed `TokenIdent`/`TokenQuotedIdent`, so
+     `WITH a AS (…), index AS (…)` was wrongly rejected with "expected CTE name
+     after ','". Fix: the guard now also accepts a `TokenKeyword` that
+     `IsColNameKeyword` admits — mirroring `parseIdent` exactly. A reserved
+     keyword (e.g. `select`) is still rejected. File: `internal/parser/with.go`.
+  2. **VALUES-list-as-CTE reports 0 columns.** The database-resolution query uses
+     `include_raw (pattern_id, rgx) AS (VALUES (0,'^(x)$'), …)`. The non-recursive
+     `analyzer.registerAnalyzedCTE` built the CTE's column set only from
+     `cte.Query.Targets`, which is empty for a VALUES body → the alias-arity check
+     errored "has 2 column aliases but inner query produces 0 columns". Fix:
+     when `Targets` is empty and `ValuesRows` is non-empty, derive the column
+     count from the first VALUES row (`column1`, `column2`, … / type `unknown`) —
+     mirroring the VALUES anchor already handled in `analyzeRecursiveCTE` (a
+     sibling-path fix; the two paths must stay in sync). File:
+     `internal/analyzer/analyzer.go`.
+
+  Tests: `parser.TestParseCTENamedIndex` (first-position + comma-position `index`,
+  reserved-keyword still rejected); `analyzer.TestAnalyzeWithValuesCTE{ColumnAliases,
+  ArityMismatch,DefaultColumnNames}`. Full parser + analyzer suites green;
+  `go build ./...` + gofmt + vet clean.
+
+- **Remaining for AC-002 — gap #3 (connection-level):** goopg does not reject a
+  connection to a non-existent database at startup. Two parts: (a) register the
+  standard `template1`/`template0` databases in `pg_database` (the default
+  catalog set is only `{"postgres"}`, yet `002_nonesuch` connects to `template1`);
+  (b) call `databaseRegistry.HasDatabase(params["database"])` after auth in
+  `internal/server/server.go`'s connection path and, on miss, send a FATAL
+  `ErrorResponse` with SQLSTATE `3D000` (`database "%s" does not exist`) and close
+  — guarded so the `Catalog == nil` / non-`databaseRegistry` embedded-test paths
+  keep their legacy behaviour (mirror `tryHandleDatabaseDDL`). This touches the
+  connection handshake (every connection), so it is its own bounded loop with the
+  full `internal/server` suite + a live-cluster smoke. Until it lands, the
+  `002_nonesuch` test self-skips via a dedicated `qqq`-rejection probe in its
+  preflight (so gaps #1+#2 being fixed do not flip the test SKIP→FAIL).
+
+- **After #3:** S5 still needs the `verify_heapam`/`bt_index_check` SRFs to merely
+  *exist* in `pg_proc` for relation-resolution, LATERAL `c.oid` resolution, the
+  clog `XidStatusFunc` wiring, and the `AC-002`…`AC-005` TAP port + CSV flip.
 
 ## Deferral
 

@@ -36,7 +36,17 @@ func (p *parser) parseWithClause() (*WithClause, error) {
 		// "expected CTE name after ," diagnostic at the SELECT
 		// keyword's position rather than a generic syntax error
 		// from inside parseCTE.
-		if p.cur().Kind != TokenIdent && p.cur().Kind != TokenQuotedIdent {
+		//
+		// A CTE name may be an unreserved / col_name / type_func
+		// keyword (e.g. `index`, used verbatim by pg_amcheck's
+		// relation-gathering CTE). parseCTE → parseIdent accepts
+		// those, so this look-ahead guard must too — otherwise
+		// `WITH a AS (...), index AS (...)` is wrongly rejected with
+		// "expected CTE name after ','". Mirror parseIdent's
+		// keyword-as-identifier rule exactly. (M0110-0003 / AC-002.)
+		tk := p.cur()
+		if tk.Kind != TokenIdent && tk.Kind != TokenQuotedIdent &&
+			!(tk.Kind == TokenKeyword && IsColNameKeyword(Keyword(tk.Value))) {
 			return nil, p.errAtCur("expected CTE name after ','")
 		}
 	}

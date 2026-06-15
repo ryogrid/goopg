@@ -165,3 +165,42 @@ func TestAnalyzeWithCTEErrorsBubbleUp(t *testing.T) {
 		t.Errorf("err = %v; want it to mention no_such_col", err)
 	}
 }
+
+// TestAnalyzeWithValuesCTEColumnAliases: a CTE whose body is a VALUES list
+// derives its column count from the first row, so explicit column aliases
+// matching that arity are accepted (not rejected with 42P10 "inner query
+// produces 0 columns"). pg_amcheck's database-resolution query uses this
+// shape (`include_raw (pattern_id, rgx) AS (VALUES (0,'^(x)$'), …)`).
+// Mirrors the VALUES anchor handling in analyzeRecursiveCTE — these two
+// paths must stay in sync. Regression for M0110-0003 / AC-002.
+func TestAnalyzeWithValuesCTEColumnAliases(t *testing.T) {
+	cat := analyzerCatalog(t)
+	stmt := parseOne(t,
+		"WITH v(pattern_id, rgx) AS (VALUES (0, '^(x)$'), (1, '^(y)$')) SELECT pattern_id, rgx FROM v")
+	if err := Analyze(stmt, cat); err != nil {
+		t.Errorf("Analyze VALUES-CTE with column aliases: %v", err)
+	}
+}
+
+// TestAnalyzeWithValuesCTEArityMismatch: with the VALUES column count now
+// derived, an alias-list whose arity differs from the VALUES row width is
+// still correctly rejected with 42P10 (i.e. the derivation feeds the same
+// arity check, it doesn't bypass it).
+func TestAnalyzeWithValuesCTEArityMismatch(t *testing.T) {
+	cat := analyzerCatalog(t)
+	expectAnalyzeCode(t, cat,
+		"WITH v(a, b, c) AS (VALUES (0, '^(x)$')) SELECT * FROM v",
+		"42P10")
+}
+
+// TestAnalyzeWithValuesCTEDefaultColumnNames: without an explicit alias
+// list, a VALUES-CTE exposes default "columnN" names, resolvable in the
+// outer query.
+func TestAnalyzeWithValuesCTEDefaultColumnNames(t *testing.T) {
+	cat := analyzerCatalog(t)
+	stmt := parseOne(t,
+		"WITH v AS (VALUES (1, 2), (3, 4)) SELECT column1, column2 FROM v")
+	if err := Analyze(stmt, cat); err != nil {
+		t.Errorf("Analyze VALUES-CTE default column names: %v", err)
+	}
+}
