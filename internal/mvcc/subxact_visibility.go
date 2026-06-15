@@ -232,7 +232,10 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 		return true
 	}
 	if h.Infomask&storage.HeapXmaxCommitted != 0 {
-		return false
+		// HeapXmaxCommitted cached that xmax committed, but this snapshot
+		// may have been taken before xmax committed (xmax was in-progress
+		// when the snapshot was taken, e.g. origSnap in EPQ re-evaluation).
+		return !snap.SeesCommittedXID(h.Xmax)
 	}
 	return !SeesCommittedXIDWithSubxacts(snap, h.Xmax, r)
 }

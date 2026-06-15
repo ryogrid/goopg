@@ -1196,6 +1196,11 @@ type LockedRel struct {
 	Alias      string // FROM-clause alias for diagnostics; empty when bare table
 	Strength   LockStrength
 	WaitPolicy LockWaitPolicy
+	// ColOffset is the first output-column index of this relation in the
+	// SELECT result schema. Set by resolveLockedRels from rangeBinding.offset
+	// so the executor can merge EPQ-refetched values at the correct position
+	// even when the locked table is not the leftmost in the join (M0100-0010).
+	ColOffset int
 }
 
 // LockRows is the upstream-shape wrapper that adds row-lock

@@ -1069,6 +1069,10 @@ type PartitionOfClause struct {
 	// ColDefaults holds per-column DEFAULT expression overrides declared in the
 	// PARTITION OF column-override list, e.g. `(b DEFAULT 1)`. M0097-0023.
 	ColDefaults []PartitionColDefault
+	// ColGeneratedExprs holds GENERATED ALWAYS AS expression overrides declared
+	// in the PARTITION OF column-override list, e.g.
+	// `(d WITH OPTIONS GENERATED ALWAYS AS (a + b + 1000) STORED)`. M0100-0010.
+	ColGeneratedExprs []PartitionColGenerated
 	// DuplicateColumn is non-empty when a column name appears more than once
 	// in the PARTITION OF column override list (e.g. `(b NOT NULL, b DEFAULT 1, ...)`).
 	// The executor returns an error when this is set.
@@ -1080,6 +1084,13 @@ type PartitionOfClause struct {
 type PartitionColDefault struct {
 	ColName string
 	Expr    Expr
+}
+
+// PartitionColGenerated holds a GENERATED ALWAYS AS expression override for a
+// single column in a PARTITION OF column-override list. M0100-0010.
+type PartitionColGenerated struct {
+	ColName string
+	Expr    string // raw SQL expression text (without wrapping parens)
 }
 
 // PartitionCheckConstraint is a named CHECK constraint declared in a PARTITION

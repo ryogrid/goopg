@@ -156,13 +156,25 @@ func (o *projectOp) Next() (TupleSlot, error) {
 	if err != nil {
 		return nil, err
 	}
-	in := slotRow(inSlot)
 	for i, t := range o.targets {
-		v, err := evalExpr(t, in, o.ctx)
+		v, err := evalExprSlot(t, inSlot, o.ctx)
 		if err != nil {
 			return nil, err
 		}
 		o.out[i] = v
+	}
+	// propagate hasCTID so downstream operators can access the row's TID.
+	switch v := inSlot.(type) {
+	case *Slot:
+		o.slot.hasCTID = v.hasCTID
+		o.slot.ctidBlock = v.ctidBlock
+		o.slot.ctidOff = v.ctidOff
+	case *MaterializedSlot:
+		o.slot.hasCTID = v.hasCTID
+		o.slot.ctidBlock = v.ctidBlock
+		o.slot.ctidOff = v.ctidOff
+	default:
+		o.slot.hasCTID = false
 	}
 	// M0092-0002: the returned slot ALIASES o.out, which is
 	// overwritten on the next Next() call. Audited consumers

@@ -446,14 +446,12 @@ func lockingTargetMatches(name string, rels []scopeRel) bool {
 }
 
 func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
+	// Build CTE scope so the INSERT's SELECT body (including subqueries)
+	// can reference modifying CTEs by name. M0100-0010.
+	var cteCtx *scope
 	if s.With != nil {
-		// Stage A: validate the CTE definitions (so type errors
-		// inside the CTE bodies surface even though the INSERT
-		// VALUES path doesn't yet consume them). The planner /
-		// executor integration for WITH-prefixed INSERTs lands in
-		// 0016-0002.
-		ctx := &scope{cat: cat}
-		if err := analyzeWith(s.With, ctx); err != nil {
+		cteCtx = &scope{cat: cat}
+		if err := analyzeWith(s.With, cteCtx); err != nil {
 			return err
 		}
 	}
@@ -462,8 +460,9 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 		return err
 	}
 	// INSERT … SELECT: analyze the SELECT sub-statement and skip VALUES checks.
+	// Pass cteCtx as parent so the SELECT sees modifying CTE names.
 	if s.Select != nil {
-		return analyzeSelectWithParent(s.Select, cat, nil)
+		return analyzeSelectWithParent(s.Select, cat, cteCtx)
 	}
 	if len(s.Rows) == 0 {
 		return analyzeError(s.Pos(), "42601", "INSERT requires at least one row")
@@ -646,10 +645,17 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 		return err
 	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
+	// Register CTEs first so FROM-clause tables can reference them. M0100-0010.
+	if s.With != nil {
+		if err := analyzeWith(s.With, ctx); err != nil {
+			return err
+		}
+	}
 	// Add FROM-clause tables to scope so WHERE / SET expressions can reference
 	// their columns (e.g. `UPDATE t SET i = b.j FROM other b WHERE ...`). M0097-0065.
+	// Use resolveTable (CTE-aware) so modifying CTEs in WITH are found.
 	for _, rv := range s.From {
-		fromTbl, err := lookupTable(cat, rv)
+		fromTbl, err := resolveTable(ctx, rv)
 		if err != nil {
 			return err
 		}
@@ -658,11 +664,6 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 			alias = rv.Name
 		}
 		ctx.rels = append(ctx.rels, scopeRel{table: fromTbl, alias: alias})
-	}
-	if s.With != nil {
-		if err := analyzeWith(s.With, ctx); err != nil {
-			return err
-		}
 	}
 	if err := analyzeWhere(s.Where, ctx); err != nil {
 		return err
@@ -702,11 +703,17 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 		return err
 	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
+	// Register CTEs first so USING-clause tables can reference them. M0100-0010.
+	if s.With != nil {
+		if err := analyzeWith(s.With, ctx); err != nil {
+			return err
+		}
+	}
 	// Add USING-clause tables to scope so WHERE / RETURNING expressions
 	// can reference their columns. Mirrors analyzeUpdate's FROM handling.
-	// M0097-0076.
+	// M0097-0076. Use resolveTable (CTE-aware) so modifying CTEs in WITH are found.
 	for _, rv := range s.Using {
-		useTbl, err := lookupTable(cat, rv)
+		useTbl, err := resolveTable(ctx, rv)
 		if err != nil {
 			return err
 		}
@@ -715,11 +722,6 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 			alias = rv.Name
 		}
 		ctx.rels = append(ctx.rels, scopeRel{table: useTbl, alias: alias})
-	}
-	if s.With != nil {
-		if err := analyzeWith(s.With, ctx); err != nil {
-			return err
-		}
 	}
 	if err := analyzeWhere(s.Where, ctx); err != nil {
 		return err
@@ -1326,6 +1328,12 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 			if strings.EqualFold(x.Column, "ctid") && !matched.qualifiedOnly {
 				return catalog.Type{Name: "tid"}, true, nil
 			}
+			// DML CTE tables have no columns registered; the planner
+			// resolves column types at execution time from the
+			// materialized CTE result. Accept any column ref.
+			if matched.table.IsDMLCTE {
+				return catalog.Type{}, true, nil
+			}
 			// Use qualified "table.col" format to match PG output.
 			qualifier := matched.alias
 			if qualifier == "" {
@@ -1347,6 +1355,14 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 		}
 		col, ok := lookupColumn(rel.table, x.Column)
 		if !ok {
+			// DML CTE tables have no columns registered; accept any unqualified column ref.
+			if rel.table.IsDMLCTE {
+				if found != nil {
+					return catalog.Type{}, false, analyzeError(x.Pos(), "42702", fmt.Sprintf("column reference %q is ambiguous", x.Column))
+				}
+				t := catalog.Type{}
+				found = &t
+			}
 			continue
 		}
 		// Skip USING-hidden columns from right side of JOIN USING. M0097-0003.
@@ -1738,11 +1754,13 @@ func analyzeWith(with *parser.WithClause, ctx *scope) error {
 			// Data-modifying CTE (INSERT/UPDATE/DELETE/MERGE).
 			// Analysis is handled by the DML-specific planner when
 			// the CTE is planned; register with an empty table so
-			// the outer query knows the name exists.
+			// the outer query knows the name exists. IsDMLCTE lets
+			// resolveColumnRefTypeAt accept any column ref on this
+			// table without strict validation.
 			if ctx.ctes == nil {
 				ctx.ctes = make(map[string]*catalog.Table)
 			}
-			ctx.ctes[strings.ToLower(cte.Name)] = &catalog.Table{Name: cte.Name}
+			ctx.ctes[strings.ToLower(cte.Name)] = &catalog.Table{Name: cte.Name, IsDMLCTE: true}
 			continue
 		}
 

@@ -386,6 +386,8 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		for _, uc := range n.UnnestCols {
 			walkExprTree(uc.ArrExpr, visit)
 		}
+	case *LockRows:
+		walkPlanExprs(n.Child, visit)
 	}
 }
 

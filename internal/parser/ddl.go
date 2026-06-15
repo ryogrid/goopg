@@ -1369,6 +1369,40 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 								Expr:    expr,
 							})
 						}
+					} else if depth == 1 && !inTableConstraint && t.Kind == TokenKeyword && t.Keyword == KwWith && curColName != "" {
+						// WITH OPTIONS GENERATED ALWAYS AS (expr) STORED — child-partition
+						// generated-column expression override. M0100-0010.
+						p.advance() // consume WITH
+						if p.acceptIdentKeyword("options") && p.acceptIdentKeyword("generated") && p.acceptIdentKeyword("always") {
+							if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
+								p.advance() // consume AS
+								if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+									p.advance() // consume (
+									var exprToks []string
+									exprDepth := 1
+									for exprDepth > 0 && p.cur().Kind != TokenEOF {
+										tok := p.cur()
+										if tok.Kind == TokenSymbol && tok.Value == "(" {
+											exprDepth++
+											exprToks = append(exprToks, tok.Value)
+										} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+											exprDepth--
+											if exprDepth > 0 {
+												exprToks = append(exprToks, tok.Value)
+											}
+										} else {
+											exprToks = append(exprToks, tok.Value)
+										}
+										p.advance()
+									}
+									_ = p.acceptIdentKeyword("stored")
+									poc.ColGeneratedExprs = append(poc.ColGeneratedExprs, PartitionColGenerated{
+										ColName: curColName,
+										Expr:    strings.Join(exprToks, " "),
+									})
+								}
+							}
+						}
 					} else {
 						p.advance()
 					}

@@ -112,10 +112,14 @@ func (s *Slot) Row() Row { return Row(s.Cells) }
 // Materialize implements TupleSlot — returns an independent
 // MaterializedSlot with a deep copy of Cells.
 func (s *Slot) Materialize() *MaterializedSlot {
-	return &MaterializedSlot{
+	ms := &MaterializedSlot{
 		schema: s.schema,
 		row:    cloneRowOwned(Row(s.Cells)),
 	}
+	ms.hasCTID = s.hasCTID
+	ms.ctidBlock = s.ctidBlock
+	ms.ctidOff = s.ctidOff
+	return ms
 }
 
 // Release implements TupleSlot — no-op for concrete slots.
@@ -141,13 +145,17 @@ func (s *Slot) fillFromTupleSlot(ts TupleSlot) {
 	copy(s.Cells, row)
 	s.schema = ts.Schema()
 	s.HasRow = true
-	// M0097-0062: propagate ctid from MaterializedSlot so CTIDExpr
-	// evaluates correctly through the opnode pipeline.
-	if ms, ok := ts.(*MaterializedSlot); ok && ms.hasCTID {
-		s.hasCTID = true
-		s.ctidBlock = ms.ctidBlock
-		s.ctidOff = ms.ctidOff
-	} else {
+	// propagate ctid so CTIDExpr evaluates correctly through the pipeline.
+	switch v := ts.(type) {
+	case *MaterializedSlot:
+		s.hasCTID = v.hasCTID
+		s.ctidBlock = v.ctidBlock
+		s.ctidOff = v.ctidOff
+	case *Slot:
+		s.hasCTID = v.hasCTID
+		s.ctidBlock = v.ctidBlock
+		s.ctidOff = v.ctidOff
+	default:
 		s.hasCTID = false
 	}
 }

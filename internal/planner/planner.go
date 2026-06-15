@@ -1476,7 +1476,7 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 		policy := lockWaitPolicyFromParser(lc.WaitPolicy)
 		if len(lc.Targets) == 0 {
 			for _, b := range ctx.bindings {
-				out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy})
+				out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy, ColOffset: b.offset})
 			}
 			continue
 		}
@@ -1486,7 +1486,7 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 				return nil, &PlanError{Pos: lc.Pos(), Code: "42P01",
 					Message: fmt.Sprintf("relation %q in FOR UPDATE/SHARE clause not found in FROM clause", name)}
 			}
-			out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy})
+			out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy, ColOffset: b.offset})
 		}
 	}
 	return out, nil
@@ -6541,7 +6541,7 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 }
 
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
-	restore, _, err := preplanWithClause(s.With, cat)
+	restore, dmlPlans, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -6650,7 +6650,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		insert.Returning = retExprs
 		insert.ReturningSchema = retSchema
 	}
-	return insert, nil
+	return wrapDMLCTEPrefix(insert, dmlPlans), nil
 }
 
 // planOnConflict resolves the parser-level ON CONFLICT clause into
@@ -7018,7 +7018,7 @@ func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ct
 }
 
 func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
-	restore, _, err := preplanWithClause(s.With, cat)
+	restore, dmlPlans, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -7104,7 +7104,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 			upd.Returning = retExprs
 			upd.ReturningSchema = retSchema
 		}
-		return upd, nil
+		return wrapDMLCTEPrefix(upd, dmlPlans), nil
 	}
 
 	ctx := singleBindingContext(tbl, s.Target.Alias)
@@ -7142,11 +7142,11 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		upd.Returning = retExprs
 		upd.ReturningSchema = retSchema
 	}
-	return upd, nil
+	return wrapDMLCTEPrefix(upd, dmlPlans), nil
 }
 
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
-	restore, _, err := preplanWithClause(s.With, cat)
+	restore, dmlPlans, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -7220,7 +7220,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 			del.Returning = retExprs
 			del.ReturningSchema = retSchema
 		}
-		return del, nil
+		return wrapDMLCTEPrefix(del, dmlPlans), nil
 	}
 
 	ctx := singleBindingContext(tbl, s.Target.Alias)
@@ -7256,7 +7256,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		del.Returning = retExprs
 		del.ReturningSchema = retSchema
 	}
-	return del, nil
+	return wrapDMLCTEPrefix(del, dmlPlans), nil
 }
 
 // planMerge converts a MERGE INTO statement into a Merge plan node.

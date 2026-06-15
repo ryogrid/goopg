@@ -204,8 +204,8 @@ func TestPgClassExposesRelNatts(t *testing.T) {
 	if natts == nil {
 		t.Fatal("pg_class.relnatts column not declared")
 	}
-	if natts.Type.Name != "int4" {
-		t.Errorf("pg_class.relnatts type=%q want int4", natts.Type.Name)
+	if natts.Type.Name != "int2" {
+		t.Errorf("pg_class.relnatts type=%q want int2 (PG18 physical type)", natts.Type.Name)
 	}
 
 	rows := pgClass.VirtualRows()

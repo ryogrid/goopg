@@ -1574,6 +1574,18 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			}
 		}
 	}
+	// Apply GENERATED ALWAYS AS expression overrides from the PARTITION OF column
+	// list (e.g. `d WITH OPTIONS GENERATED ALWAYS AS (a + b + 1000) STORED`).
+	// M0100-0010.
+	for _, cg := range poc.ColGeneratedExprs {
+		for i := range tbl.Columns {
+			if strings.EqualFold(tbl.Columns[i].Name, cg.ColName) {
+				tbl.Columns[i].GeneratedExpr = cg.Expr
+				tbl.Columns[i].GeneratedAlways = true
+				break
+			}
+		}
+	}
 	// Record for rollback.
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})

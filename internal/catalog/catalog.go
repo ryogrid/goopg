@@ -217,6 +217,13 @@ type Table struct {
 	// column-level CHECK constraints. M0097-0014.
 	CheckConstraints []string
 
+	// IsDMLCTE marks a synthetic table created from a data-modifying CTE
+	// (WITH ... AS (UPDATE/DELETE/INSERT)). The analyzer uses this to allow
+	// any column reference on the CTE in FROM/USING clauses without strict
+	// column-existence validation — the planner resolves column types from
+	// the materialized CTE result at execution time.
+	IsDMLCTE bool
+
 	// NamedChecks holds named CHECK constraints (name + expression).
 	// Parallel to CheckConstraints; populated when the constraint has an
 	// explicit CONSTRAINT name clause. Index i of NamedChecks corresponds to
@@ -1625,54 +1632,46 @@ func (c *InMemory) registerSystemTables() {
 	pgClass := &Table{
 		Schema: "pg_catalog",
 		Name:   "pg_class",
+		// Columns match the PG18-canonical 34-column pg_class tupdesc written by
+		// syncTableToCatalogHeap / pgClassColumnsPG18(). This alignment is required
+		// so that scanMatching can decode physical pg_class heap tuples for UPDATE
+		// (e.g. "UPDATE pg_class SET reltuples = ... WHERE oid = ...").
+		// M0100-0010: sysupd2/sysmerge2 concurrent-update blocking fix.
 		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
-			{Name: "relname", Type: Type{Name: "text"}, Ordinal: 1},
-			{Name: "relkind", Type: Type{Name: "text"}, Ordinal: 2},
-			{Name: "relnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
-			// Additional columns required by vacuumdb catalog query (M0095-0004).
-			{Name: "relpersistence", Type: Type{Name: "text"}, Ordinal: 4},
-			{Name: "reltoastrelid", Type: Type{Name: "oid"}, Ordinal: 5},
-			{Name: "relpages", Type: Type{Name: "int4"}, Ordinal: 6},
-			// relispopulated: true for tables/views, reflects IsPopulated for matviews.
-			// M0097-0013.
-			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 7},
-			// relnatts: number of user columns. Required by PG's
-			// CREATE SUBSCRIPTION column-list probe (M0103-0008 rung 14):
-			//   `… (array_length(gpt.attrs,1) = c.relnatts) … FROM pg_class c …`
-			// where `gpt = pg_get_publication_tables(...)`.
-			{Name: "relnatts", Type: Type{Name: "int4"}, Ordinal: 8},
-			// relreplident: replica identity setting. Required by PG's
-			// CREATE SUBSCRIPTION tablesync probe (M0103-0008 rung 16):
-			//   `SELECT c.oid, c.relreplident, c.relkind FROM pg_class c …`
-			// 'd' = REPLICA_IDENTITY_DEFAULT (PG default for tables).
-			{Name: "relreplident", Type: Type{Name: "char"}, Ordinal: 9},
-			// relchecks: number of CHECK constraints. Always 0 in goopg v0.
-			{Name: "relchecks", Type: Type{Name: "int2"}, Ordinal: 10},
-			// Additional columns used by psql \d+ meta-commands. M0097-0028.
-			{Name: "relhasindex", Type: Type{Name: "bool"}, Ordinal: 11},
-			{Name: "relhasrules", Type: Type{Name: "bool"}, Ordinal: 12},
-			{Name: "relhastriggers", Type: Type{Name: "bool"}, Ordinal: 13},
-			{Name: "relrowsecurity", Type: Type{Name: "bool"}, Ordinal: 14},
-			{Name: "relforcerowsecurity", Type: Type{Name: "bool"}, Ordinal: 15},
-			{Name: "relhasoids", Type: Type{Name: "bool"}, Ordinal: 16},
-			{Name: "relispartition", Type: Type{Name: "bool"}, Ordinal: 17},
-			{Name: "reltablespace", Type: Type{Name: "oid"}, Ordinal: 18},
-			{Name: "reloftype", Type: Type{Name: "oid"}, Ordinal: 19},
-			{Name: "reloptions", Type: Type{Name: "text[]"}, Ordinal: 20},
-			// relam: access method OID. 2=heap for tables, method OID for indexes.
-			// Required by psql \d+ and pg_class.relam joins with pg_am. M0097-0023.
-			{Name: "relam", Type: Type{Name: "oid"}, Ordinal: 21},
-			// relfilenode: storage file node OID. Equals the table OID when first
-			// created; changes on REINDEX/CLUSTER. Exposed so that regress tests
-			// can detect filenode changes (create_index.sql REINDEX section).
-			{Name: "relfilenode", Type: Type{Name: "oid"}, Ordinal: 22},
-			// relpartbound: partition bound expression tree for partition children.
-			// Stores the pre-formatted "FOR VALUES ..." string; pg_get_expr returns it as-is.
-			{Name: "relpartbound", Type: Type{Name: "pg_node_tree"}, Ordinal: 23},
-			// relhassubclass: true if any child tables (inheritance or partition children)
-			// or child indexes (partition index children) exist. M0097-0026.
-			{Name: "relhassubclass", Type: Type{Name: "bool"}, Ordinal: 24},
+			{Name: "oid",                 Type: Type{Name: "oid"},          Ordinal: 0},
+			{Name: "relname",             Type: Type{Name: "name"},         Ordinal: 1},
+			{Name: "relnamespace",        Type: Type{Name: "oid"},          Ordinal: 2},
+			{Name: "reltype",             Type: Type{Name: "oid"},          Ordinal: 3},
+			{Name: "reloftype",           Type: Type{Name: "oid"},          Ordinal: 4},
+			{Name: "relowner",            Type: Type{Name: "oid"},          Ordinal: 5},
+			{Name: "relam",               Type: Type{Name: "oid"},          Ordinal: 6},
+			{Name: "relfilenode",         Type: Type{Name: "oid"},          Ordinal: 7},
+			{Name: "reltablespace",       Type: Type{Name: "oid"},          Ordinal: 8},
+			{Name: "relpages",            Type: Type{Name: "int4"},         Ordinal: 9},
+			{Name: "reltuples",           Type: Type{Name: "float4"},       Ordinal: 10},
+			{Name: "relallvisible",       Type: Type{Name: "int4"},         Ordinal: 11},
+			{Name: "relallfrozen",        Type: Type{Name: "int4"},         Ordinal: 12},
+			{Name: "reltoastrelid",       Type: Type{Name: "oid"},          Ordinal: 13},
+			{Name: "relhasindex",         Type: Type{Name: "bool"},         Ordinal: 14},
+			{Name: "relisshared",         Type: Type{Name: "bool"},         Ordinal: 15},
+			{Name: "relpersistence",      Type: Type{Name: "char"},         Ordinal: 16},
+			{Name: "relkind",             Type: Type{Name: "char"},         Ordinal: 17},
+			{Name: "relnatts",            Type: Type{Name: "int2"},         Ordinal: 18},
+			{Name: "relchecks",           Type: Type{Name: "int2"},         Ordinal: 19},
+			{Name: "relhasrules",         Type: Type{Name: "bool"},         Ordinal: 20},
+			{Name: "relhastriggers",      Type: Type{Name: "bool"},         Ordinal: 21},
+			{Name: "relhassubclass",      Type: Type{Name: "bool"},         Ordinal: 22},
+			{Name: "relrowsecurity",      Type: Type{Name: "bool"},         Ordinal: 23},
+			{Name: "relforcerowsecurity", Type: Type{Name: "bool"},         Ordinal: 24},
+			{Name: "relispopulated",      Type: Type{Name: "bool"},         Ordinal: 25},
+			{Name: "relreplident",        Type: Type{Name: "char"},         Ordinal: 26},
+			{Name: "relispartition",      Type: Type{Name: "bool"},         Ordinal: 27},
+			{Name: "relrewrite",          Type: Type{Name: "oid"},          Ordinal: 28},
+			{Name: "relfrozenxid",        Type: Type{Name: "xid"},          Ordinal: 29},
+			{Name: "relminmxid",          Type: Type{Name: "xid"},          Ordinal: 30},
+			{Name: "relacl",              Type: Type{Name: "aclitem[]"},    Ordinal: 31},
+			{Name: "reloptions",          Type: Type{Name: "text[]"},       Ordinal: 32},
+			{Name: "relpartbound",        Type: Type{Name: "pg_node_tree"}, Ordinal: 33},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -1734,36 +1733,40 @@ func (c *InMemory) registerSystemTables() {
 				relpers = "t"
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(t.OID)),     // oid: numeric OID (M0103-0008 rung 16)
-				t.Name,                       // relname
-				relkind,                      // relkind
-				strconv.Itoa(int(nsOID)),     // relnamespace: schema OID
-				relpers,                      // relpersistence
-				"0",                          // reltoastrelid: no TOAST table
-				"0",                          // relpages: estimated page count
-				populated,                    // relispopulated
-				strconv.Itoa(len(t.Columns)), // relnatts: number of user columns
-				"d",                          // relreplident: REPLICA_IDENTITY_DEFAULT
-				"0",                          // relchecks: number of CHECK constraints
-				hasIdx,                       // relhasindex
-				"f",                          // relhasrules
-				"f",                          // relhastriggers
-				"f",                          // relrowsecurity
-				"f",                          // relforcerowsecurity
-				"f",                          // relhasoids
-				isPartition,                  // relispartition
-				"0",                          // reltablespace
-				"0",                          // reloftype
-				"",                           // reloptions: empty (NULL via TypedVirtualCell empty-string fallback)
-				"2",                          // relam: heap access method OID (OID 2)
-				strconv.Itoa(int(t.OID)),     // relfilenode: equals OID (no rewrite tracking in v0)
-				partBound,                    // relpartbound: partition bound string for children
-				func() string {
-					if len(c.partitionChildren[t.OID]) > 0 {
-						return "t"
-					}
-					return "f"
-				}(), // relhassubclass
+				strconv.Itoa(int(t.OID)),     // 0:  oid
+				t.Name,                       // 1:  relname
+				strconv.Itoa(int(nsOID)),     // 2:  relnamespace
+				"0",                          // 3:  reltype
+				"0",                          // 4:  reloftype
+				"10",                         // 5:  relowner (bootstrap superuser)
+				"2",                          // 6:  relam (heap=2)
+				strconv.Itoa(int(t.OID)),     // 7:  relfilenode
+				"0",                          // 8:  reltablespace
+				"0",                          // 9:  relpages
+				"0",                          // 10: reltuples
+				"0",                          // 11: relallvisible
+				"0",                          // 12: relallfrozen
+				"0",                          // 13: reltoastrelid
+				hasIdx,                       // 14: relhasindex
+				"f",                          // 15: relisshared
+				relpers,                      // 16: relpersistence
+				relkind,                      // 17: relkind
+				strconv.Itoa(len(t.Columns)), // 18: relnatts
+				"0",                          // 19: relchecks
+				"f",                          // 20: relhasrules
+				"f",                          // 21: relhastriggers
+				func() string { if len(c.partitionChildren[t.OID]) > 0 { return "t" }; return "f" }(), // 22: relhassubclass
+				"f",                          // 23: relrowsecurity
+				"f",                          // 24: relforcerowsecurity
+				populated,                    // 25: relispopulated
+				"d",                          // 26: relreplident
+				isPartition,                  // 27: relispartition
+				"0",                          // 28: relrewrite
+				"0",                          // 29: relfrozenxid
+				"1",                          // 30: relminmxid
+				"",                           // 31: relacl (NULL)
+				"",                           // 32: reloptions (NULL)
+				partBound,                    // 33: relpartbound
 			})
 		}
 		// Emit index rows (relkind='i'/'I') so pg_class can be used to count indexes.
@@ -1809,31 +1812,40 @@ func (c *InMemory) registerSystemTables() {
 				idxHasSubclass = "t"
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(idx.OID)),  // oid
-				idx.Name,                    // relname
-				idxRelkind,                  // relkind: 'I' if partitioned, 'i' otherwise
-				strconv.Itoa(int(idxNsOID)), // relnamespace
-				idxPers,                     // relpersistence
-				"0",                         // reltoastrelid
-				"0",                         // relpages
-				"t",                         // relispopulated
-				"0",                         // relnatts
-				"n",                         // relreplident: not applicable for indexes
-				"0",                         // relchecks
-				"f",                         // relhasindex
-				"f",                         // relhasrules
-				"f",                         // relhastriggers
-				"f",                         // relrowsecurity
-				"f",                         // relforcerowsecurity
-				"f",                         // relhasoids
-				"f",                         // relispartition
-				"0",                         // reltablespace
-				"0",                         // reloftype
-				"",                          // reloptions: NULL
-				idxRelam,                    // relam: index access method OID
-				strconv.Itoa(int(idx.OID)),  // relfilenode: equals OID
-				"",                          // relpartbound: indexes are never partition children
-				idxHasSubclass,              // relhassubclass: true if partitioned index
+				strconv.Itoa(int(idx.OID)),  // 0:  oid
+				idx.Name,                    // 1:  relname
+				strconv.Itoa(int(idxNsOID)), // 2:  relnamespace
+				"0",                         // 3:  reltype
+				"0",                         // 4:  reloftype
+				"10",                        // 5:  relowner
+				idxRelam,                    // 6:  relam
+				strconv.Itoa(int(idx.OID)),  // 7:  relfilenode
+				"0",                         // 8:  reltablespace
+				"0",                         // 9:  relpages
+				"-1",                        // 10: reltuples (-1 = unknown for indexes)
+				"0",                         // 11: relallvisible
+				"0",                         // 12: relallfrozen
+				"0",                         // 13: reltoastrelid
+				"f",                         // 14: relhasindex
+				"f",                         // 15: relisshared
+				idxPers,                     // 16: relpersistence
+				idxRelkind,                  // 17: relkind
+				"0",                         // 18: relnatts
+				"0",                         // 19: relchecks
+				"f",                         // 20: relhasrules
+				"f",                         // 21: relhastriggers
+				idxHasSubclass,              // 22: relhassubclass
+				"f",                         // 23: relrowsecurity
+				"f",                         // 24: relforcerowsecurity
+				"t",                         // 25: relispopulated
+				"n",                         // 26: relreplident
+				"f",                         // 27: relispartition
+				"0",                         // 28: relrewrite
+				"0",                         // 29: relfrozenxid
+				"1",                         // 30: relminmxid
+				"",                          // 31: relacl (NULL)
+				"",                          // 32: reloptions (NULL)
+				"",                          // 33: relpartbound
 			})
 		}
 		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
@@ -1841,31 +1853,40 @@ func (c *InMemory) registerSystemTables() {
 		//   SELECT oid::int8 FROM pg_class WHERE relname = 'pg_class'
 		// must return 1259. M0097-0029.
 		out = append(out, []string{
-			"1259",     // oid
-			"pg_class", // relname
-			"r",        // relkind = regular table
-			"11",       // relnamespace = pg_catalog
-			"p",        // relpersistence
-			"0",        // reltoastrelid
-			"0",        // relpages
-			"t",        // relispopulated
-			"25",       // relnatts: 25 columns (including relhassubclass added M0097-0026)
-			"n",        // relreplident
-			"0",        // relchecks
-			"t",        // relhasindex (pg_class itself has indexes)
-			"f",        // relhasrules
-			"f",        // relhastriggers
-			"f",        // relrowsecurity
-			"f",        // relforcerowsecurity
-			"f",        // relhasoids
-			"f",        // relispartition
-			"0",        // reltablespace
-			"0",        // reloftype
-			"",         // reloptions: NULL
-			"2",        // relam: heap access method OID
-			"1259",     // relfilenode: equals OID for pg_class
-			"",         // relpartbound: pg_class is not a partition child
-			"f",        // relhassubclass: pg_class itself has no subclasses
+			"1259",     // 0:  oid
+			"pg_class", // 1:  relname
+			"11",       // 2:  relnamespace (pg_catalog OID=11)
+			"0",        // 3:  reltype
+			"0",        // 4:  reloftype
+			"10",       // 5:  relowner
+			"2",        // 6:  relam (heap)
+			"1259",     // 7:  relfilenode
+			"0",        // 8:  reltablespace
+			"0",        // 9:  relpages
+			"0",        // 10: reltuples
+			"0",        // 11: relallvisible
+			"0",        // 12: relallfrozen
+			"0",        // 13: reltoastrelid
+			"t",        // 14: relhasindex
+			"t",        // 15: relisshared (pg_class is a shared catalog)
+			"p",        // 16: relpersistence
+			"r",        // 17: relkind
+			"34",       // 18: relnatts (34 columns, PG18-canonical)
+			"0",        // 19: relchecks
+			"f",        // 20: relhasrules
+			"f",        // 21: relhastriggers
+			"f",        // 22: relhassubclass
+			"f",        // 23: relrowsecurity
+			"f",        // 24: relforcerowsecurity
+			"t",        // 25: relispopulated
+			"n",        // 26: relreplident
+			"f",        // 27: relispartition
+			"0",        // 28: relrewrite
+			"0",        // 29: relfrozenxid
+			"1",        // 30: relminmxid
+			"",         // 31: relacl (NULL)
+			"",         // 32: reloptions (NULL)
+			"",         // 33: relpartbound
 		})
 		return out
 	}
