@@ -1,6 +1,6 @@
 # 0110-0008 — amcheck SQL surface wiring plan (M0110-0003)
 
-**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing landed (worktree `m0110-0003-amcheck-sql-surface`); S5 LATERAL/clog/TAP-port remain (merge blocked on a clean working tree)
+**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing + gap #6 LATERAL `c.oid` resolution + gap #7b non-existent-role rejection (handshake 28000) + gap #7a database-pattern resolution (row-valued `IS [NOT] NULL` semantics) + gap #7c per-database `pg_extension` scoping + **gap #8 clog-backed `XidStatusFunc` wiring** landed. **`002_nonesuch` now fully passes (no self-skip); AC-002 promoted to `port`/`yes`.** Remaining: `AC-004`/`AC-005` TAP-port (003/004/005 under new CSV row `AC-003` — real on-disk corruption injection + opclass catalog parity).
 **Scope:** the `CREATE EXTENSION amcheck` + SRF SQL surface that wires the
 already-committed `internal/amcheck` engine to the wire protocol and promotes the
 deferred `AC-002`…`AC-005` pg_amcheck TAP tests.
@@ -105,7 +105,7 @@ type-check; their execution is exercised by `003`/`004`, not `002`.
 | **S2** | `pg_extension` catalog relation + the §1 probe answerable; seed `pg_proc` rows for the three SRFs (exist, not yet callable) | **AC-002** (`002_nonesuch`) | `catalog/catalog.go`, `planner/planner.go` (FROM whitelist) |
 | **S3 ✅** | `verify_heapam(...)` SRF executor — a **thin adapter** over `amcheck.VerifyHeapRelation` (the block loop lives in the engine, `verify_heapam_relation.go`): fills a `PageSource` from the buffer pool, passes `nblocks` + `RelDesc.Natts`/`NextXid`/`RelFrozenXid` (clog-backed `XidStatusFunc` deferred — no clog handle in the executor yet), streams `HeapRelReport`s as `(blkno,offnum,attnum,msg)` rows | (toward AC-004 heap path) | `planner/{plan,planner,foldconst,unnest}.go`, `parser/select.go`, `analyzer/analyzer.go`, new `executor/operators_verify_heapam.go` + `executor.go` |
 | **S4 ✅** | `bt_index_check` / `bt_index_parent_check` scalar `void` functions over `amcheck.VerifyBtree*` — they are SELECT-list scalars (not FROM SRFs like verify_heapam), so they live in `evalFuncCall` dispatch; structural tiers (`VerifyBtreePage`/`VerifyBtreeItemOrder` per block, `VerifyBtreeLevelSiblingLinks` per level via leftmost-descent, `VerifyBtreeParentDownlinks` per internal page on parent-check) raise `XX002` on findings; `heapallindexed`/`rootdescend`/`checkunique` args accepted, deeper tiers deferred to S5 | (toward AC-003/004 index path) | `planner/planner.go` (`exprType` void), `executor/expr.go` (dispatch), new `executor/operators_bt_index_check.go` |
-| **S5 (partial)** | named-arg `:=`/`=>` parsing in both expr + FROM-SRF paths ✅; then LATERAL resolution of `c.oid`, clog `XidStatusFunc`, port `002`→`005` TAP tests, flip CSV `AC-002…AC-005`→`port`, regen md | **AC-002…AC-005** | `parser/select.go` ✅; `internal/testport/pgamcheck_port_test.go`, `docs/test-port/*` |
+| **S5 (partial)** | named-arg `:=`/`=>` parsing ✅; LATERAL resolution of `c.oid` ✅ (gap #6); clog `XidStatusFunc` ✅ (gap #8); `002_nonesuch` ported + AC-002→`port` ✅; remaining: port `003/004/005` TAP tests under `AC-003`, flip CSV `AC-003`→`port`, regen md | **AC-002 ✅ / AC-003…AC-005** | `parser/select.go` ✅; `mvcc/manager.go` ✅; `executor/operators_verify_heapam.go` ✅; `internal/testport/pgamcheck_port_test.go`, `docs/test-port/*` |
 
 New-file slices (the executor ops, the testport additions) touch **zero**
 contaminated files; only S1/S2's parser/dispatch/catalog edits and S3/S4's
@@ -314,28 +314,139 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
   (`internal/parser/named_arg_colon_equal_test.go`, quoted + bare schema forms,
   sibling to the existing `TestParseNamedArgColonEqualFromSRF`).
 
-- **Remaining for AC-002 — gap #6 (LATERAL `c.oid` resolution into the SRF's
-  arguments).** With gap #5 closed, `002_nonesuch` parses the per-relation heap
-  check and reaches the executor, surfacing the next gap: the implicit-LATERAL
-  comma-join `FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …)`
-  does not resolve the correlated `c.oid` inside the SRF's argument list against
-  the sibling `pg_class c` range-table entry, so verify_heapam errors
-  `column "oid" does not exist`. This is the same LATERAL-resolution follow-up
-  S3/S4 already record, now the live blocker. Until it lands, `002_nonesuch`
-  self-skips via its updated gap-#6 preflight probe (runs `pg_amcheck postgres`,
-  detects the `column "oid" does not exist` stdout signature).
+- **gap #6 (LATERAL `c.oid` resolution into the SRF's arguments) — LANDED.**
+  pg_amcheck's per-relation heap check is the implicit-LATERAL comma-join
+  `FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …) v
+  WHERE c.oid = <reloid>`. The fix was two-layered:
+  1. **Planner** — `planVerifyHeapam` now takes `lateralCtx` and resolves its
+     args against it (mirroring `planPgGetPublicationTables`), so `c.oid`
+     resolves to a `ColumnRef` against the sibling `pg_class c`; and
+     `nodeReferencesOuter` recognises a `*VerifyHeapam` with a correlated arg so
+     the wrapping `Join` is flagged `Lateral`. (`internal/planner/planner.go`.)
+  2. **Executor** — `verifyHeapamOp` implements `lateralBindable`
+     (`BindLateralOuter`) and evaluates its args via `evalExprSlot(arg,
+     outerSlot, …)`. Crucially, the server's **BuildFast/OpNode** path wraps a
+     Join's children in `opNodeOperator`, which previously hid the
+     `lateralBindable` interface from `joinOp.openLateral` — so the SRF arg
+     evaluated against a nil slot (`column ref oid/0 on nil slot`).
+     `opNodeOperator.BindLateralOuter` now forwards the binding to the wrapped
+     underlying op. (`internal/executor/operators_verify_heapam.go`,
+     `internal/executor/opnode.go`.)
 
-- **After #6:** S5 still needs the clog `XidStatusFunc` wiring (for the
-  clog-dependent verify_heapam tier), and the `AC-002`…`AC-005` TAP port + CSV
-  flip.
+  Regression coverage:
+  `planner.TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem` (plan
+  resolves + `Lateral` flagged) and
+  `executor.TestVerifyHeapam_LateralCommaJoinViaFastPath` (corruption surfaces
+  through the comma-join driven via `BuildFastIterator`, proving the correlated
+  arg binds to the correct relation per outer row).
+
+- **gap #7b (non-existent role rejection) — LANDED.** A connection whose role is
+  absent from goopg's runtime role authority is now rejected after authentication
+  with `FATAL` SQLSTATE `28000` `role "%s" does not exist`, mirroring PG's
+  `InitializeSessionUserId` (`utils/init/miscinit.c`). The authority is the
+  server's in-memory role set (`Server.roles`, seeded with `postgres` and
+  maintained by `CREATE`/`DROP ROLE`) plus any configured `UserStore` (pg_auth)
+  account. The trust-auth handshake path previously admitted any role and the
+  backend exited 0; the password/SCRAM paths already rejected unknown users inside
+  `checkAuth`, so this closes the trust-auth hole. The check sits in the
+  connection handshake right after `checkAuth` (PG establishes the role before the
+  database) and is gated on a real catalog registry + non-replication connection,
+  exactly like the gap #3 database-existence check, so catalog-less wire-protocol
+  unit tests and physical walsenders keep their prior behaviour
+  (`internal/server/server.go`). Regression tests:
+  `server.TestConnectNonexistentRoleRejected` (FATAL 28000 + EOF) and
+  `server.TestConnectSeededRoleAccepted` (positive twin); the `002_nonesuch`
+  port test asserts the same end-to-end via the real `pg_amcheck` binary.
+
+- **gap #7a (database-name pattern resolution) — LANDED.** pg_amcheck resolves
+  each `--database` argument as a connectable-name *pattern* and errors
+  `no connectable databases to check matching "<pat>"` when it resolves to nothing
+  (the multi-pattern / substring / superstring cases of `002_nonesuch`). goopg
+  previously accepted the pattern silently and exited 0. Root cause was in the
+  executor, not pg_amcheck-specific: pg_amcheck's `compile_database_list`
+  bootstrap query counts checkable databases per inclusion pattern with
+  `COUNT(*) FILTER (WHERE d IS NOT NULL)`, where `d` is a **whole-row reference**
+  to a CTE that is `LEFT OUTER JOIN`ed against the pattern. The planner expands a
+  whole-row variable into a `RowExpr` of its column refs; the executor's
+  `IsNullExpr` case evaluated that `RowExpr` to a composite Datum and called
+  `Datum.IsNull()` — but a constructed `RowExpr` is never itself a NULL Datum, so
+  `d IS NOT NULL` was wrongly `true` even for an outer-join non-match (all fields
+  null). Every inclusion pattern therefore looked checkable and the no-match error
+  never fired. The fix applies SQL/PG row-null semantics to a `RowExpr` operand of
+  `IS [NOT] NULL` (`executor.evalRowNullTest`): `row IS NULL` is true iff EVERY
+  field is null, `row IS NOT NULL` iff EVERY field is non-null — deliberately not
+  inverses, applied recursively to nested rows. So an unmatched pattern's
+  `include_pat.checkable` becomes 0 and pg_amcheck emits the no-match error
+  (`internal/executor/expr.go`). Regression tests:
+  `executor.TestRowValuedNullTest` (the not-inverse row-null truth table, fast)
+  and the `002_nonesuch` `patProbe` guard (end-to-end via the real `pg_amcheck`
+  binary: `--database qqq --database postgres` must exit 1 with
+  `no connectable databases to check matching "qqq"`).
+
+- **gap #7c (per-database amcheck-installed detection) — LANDED.** pg_amcheck
+  runs `amcheck_sql` (a `pg_extension ⋈ pg_namespace` lookup of
+  `extname='amcheck'`) in each connectable database and warns `skipping database
+  "<db>": amcheck is not installed` when amcheck is absent. goopg shares a single
+  in-memory catalog across databases, so amcheck `CREATE EXTENSION`d in `postgres`
+  previously also appeared installed in `template1`/`template0`, the warning never
+  fired, and template1 was checked instead of skipped. Fix: **scope pg_extension
+  to the connecting database** — mirroring PostgreSQL, where `pg_extension` is a
+  per-database catalog.
+  - `catalog.extensionRow` gains a `database` field; `CreateExtension` records the
+    connecting database (defaulted empty = visible everywhere, for direct/embedded
+    callers). A new `(*InMemory).ExtensionRowsForDB(db)` filters the global
+    registry to rows scoped to `db` (or unscoped); the table-level `VirtualRows`
+    callback shares the same locked builder with an empty filter (returns all).
+  - The connecting database is threaded from the startup packet
+    (`params["database"]`) → `connTxState.DBName` / `extendedState.DBName` →
+    `executor.Context.CurrentDatabase`. The server wires
+    `Context.ExtensionRows = ExtensionRowsForDB(DBName)` in **both** the simple-
+    (`dispatch.go`) and extended-query (`dispatch_extended.go`) paths via the
+    shared `Server.wireExtensionRows` helper, so the two sibling paths agree.
+  - `valuesOp.Open` swaps in `ctx.ExtensionRows()` for the `pg_extension` virtual
+    table when present, exactly like the existing per-connection
+    `pg_prepared_statements` lister. `execCreateExtension` passes
+    `o.ctx.CurrentDatabase` to `CreateExtension`.
+  - Unit tests: `catalog.TestExtensionRowsForDB{,_UnscopedVisibleEverywhere}`,
+    `TestExtensionVirtualRowsGlobal`. `TestPort_PgAmcheck002Nonesuch` now runs the
+    **full** `command_checks_all` assertion set (no self-skip) and asserts the
+    template1 skip warning as a regression guard.
+
+- **AC-002 promoted.** With #7c closed, `002_nonesuch` is the first fully passing
+  pg_amcheck server-dependent TAP test. CSV split: `AC-002` →
+  `002_nonesuch.pl`/`port`/`yes`; new `AC-003` carries the still-deferred
+  `003_check.pl`/`004_verify_heapam.pl`/`005_opclass_damage.pl` remainder (real
+  on-disk corruption injection + opclass catalog parity).
+
+- **gap #8 — clog-backed `XidStatusFunc` LANDED.** The verify_heapam SRF now
+  enables the clog-dependent HOT-chain corruption tier (previously disabled with a
+  nil `XidStatus`). The wiring did **not** need a new clog handle on
+  `executor.Context` as the S3 follow-up predicted: `Context.TxnMgr`
+  (`*mvcc.Manager`) already holds the `CLog` (installed via `SetCLog`), so a new
+  snapshot-independent classifier `mvcc.Manager.ClassifyXID(xid)
+  → XidVisibilityStatus` (in-progress from the proc array, committed/aborted from
+  the in-memory aborted set + the durable CLOG, out-of-range → unknown) is the
+  single seam. `executor.verifyHeapamXidStatus(ctx)` adapts it to
+  `amcheck.XidStatusFunc`, mapping the current backend's own `ctx.Tx.XID` to
+  `XidStatusCurrent` (kept distinct from in-progress so a verify_heapam run inside
+  a writing txn does not flag its own tuples), mirroring upstream
+  `get_xid_status`. Tests: `mvcc.TestClassifyXID` /
+  `TestClassifyXID_ClogAbortedFallback`; the existing
+  `TestVerifyHeapam_*` pipeline tests now exercise the live clog tier (no false
+  positives on a healthy table).
+
+- **After #8:** S5's remaining work is the `AC-004`/`AC-005` TAP port (003/004/
+  005 under the new `AC-003` row): a real on-disk corruption-injection harness and
+  opclass catalog parity for `005_opclass_damage.pl`.
 
 ## Deferral
 
-S1+S2+S3+S4 landed (above) in worktree `m0110-0003-amcheck-sql-surface`; S5
-remains. Merging the worktree to the active branch still waits for a clean tree
-(the main-tree foreign gen-column WIP). Resume point is **Slice S5** (port the
-`AC-002`…`AC-005` pg_amcheck TAP tests, add named-arg/LATERAL + clog wiring).
-See `.ralph/deferral_ledger.md`.
+S1+S2+S3+S4 plus the S5 SQL-engine gaps (#6 LATERAL, #7a/#7b/#7c, #8 clog
+`XidStatusFunc`) have landed on the active branch; `002_nonesuch`/AC-002 is
+`port`/`yes`. Resume point is the **`AC-003` TAP port**: port `003_check.pl` /
+`004_verify_heapam.pl` / `005_opclass_damage.pl`, which need a real on-disk
+corruption-injection harness and opclass catalog parity for `005`, then flip the
+`AC-003` CSV row to `port`/`yes` and regen the md. See `.ralph/deferral_ledger.md`.
 
 **S4 carries three intentional follow-ups** (recorded so S5 does not re-discover
 them):
@@ -362,11 +473,12 @@ them):
 **S3 carries two intentional follow-ups** (recorded so S5 does not re-discover
 them):
 
-1. **clog-backed `XidStatusFunc`** — the executor `Context` has no clog handle
-   (only `TxnMgr`, which does not hold the `CLog`), so the operator passes a nil
-   `XidStatus`, which disables exactly the clog-dependent HOT-chain tier. The
-   page-structural, natts, and xmin/xmax numeric-bounds tiers (all clog-free) are
-   active. Wiring clog through `Context` enables the remaining tier.
+1. **clog-backed `XidStatusFunc`** — **LANDED as gap #8** (see above). The
+   original note assumed `Context.TxnMgr` "does not hold the `CLog`"; that was
+   wrong — the `Manager` holds the `CLog` via `SetCLog`, so no `Context` change was
+   needed. `mvcc.Manager.ClassifyXID` + `executor.verifyHeapamXidStatus` wire the
+   tier; all four tiers (page-structural, natts, xmin/xmax bounds, clog-dependent
+   HOT-chain) are now active.
 2. **named-argument + LATERAL call shape** — pg_amcheck itself issues
    `verify_heapam(relation := c.oid, on_error_stop := false, …)` correlated
    against `pg_class` (a LATERAL cross join with `:=` named args). **Named-argument

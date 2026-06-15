@@ -91,6 +91,16 @@ func evalBtIndexCheck(x *planner.FuncCall, row Row, ctx *Context, parentCheck bo
 	}
 
 	rel := ctx.Catalog.IndexRelFileNode(idx)
+	// Mirror upstream bt_index_check_callback's smgrexists(MAIN_FORKNUM) guard
+	// (verify_nbtree.c:318): an index whose main relation fork is missing (e.g.
+	// the backing file was removed on disk, the pg_amcheck file-removal
+	// corruption scenario) is reported as ERRCODE_INDEX_CORRUPTED, not silently
+	// treated as an empty/clean index. This must run BEFORE NBlocks, which opens
+	// the rel with O_CREATE and would otherwise recreate the fork as empty.
+	if !ctx.Pool.Exists(rel) {
+		return NullDatum, &ExecError{Code: "XX002", Pos: x.Pos(),
+			Message: fmt.Sprintf("index \"%s\" lacks a main relation fork", idx.Name)}
+	}
 	nblocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return NullDatum, err

@@ -9,10 +9,11 @@
 // the raw-bytes layout at the same API boundary.
 //
 // Migration status (Phase C.2):
-//   migrated (full concrete dispatch, no interface per row):
-//     OpSeqScan, OpFilter, OpProject, OpLimit
-//   adapter (legacy Operator interface, one type-assert per Next call):
-//     all other operator kinds
+//
+//	migrated (full concrete dispatch, no interface per row):
+//	  OpSeqScan, OpFilter, OpProject, OpLimit
+//	adapter (legacy Operator interface, one type-assert per Next call):
+//	  all other operator kinds
 //
 // Phase C.2 changes from C.1:
 //   - OpNode children are now int32 slab indices (noChild = -1) instead of
@@ -59,9 +60,9 @@ import (
 // Operators like projectOp must evaluate targets even when Cells is empty
 // (the target expressions may be constants that don't reference input).
 type Slot struct {
-	schema  planner.Schema
-	Cells   []Datum
-	HasRow  bool // false == DML nil-row; true == real row (may have 0 cols)
+	schema planner.Schema
+	Cells  []Datum
+	HasRow bool // false == DML nil-row; true == real row (may have 0 cols)
 	// M0097-0062: ctid system column forwarded from MaterializedSlot.
 	// Set by fillFromTupleSlot when the incoming TupleSlot is a
 	// *MaterializedSlot that carries ctid info (seqScanOp path).
@@ -260,7 +261,7 @@ type filterState struct {
 
 // projectState is the per-node state for OpProject.
 type projectState struct {
-	schemaIdx int32        // index into opTreeSlab.schemas; no GC-traced schema pointer here
+	schemaIdx int32 // index into opTreeSlab.schemas; no GC-traced schema pointer here
 	ctx       *Context
 	srcSlot   Slot         // temp slot for the child's output
 	outCells  []Datum      // persistent output buffer, reused across Next calls
@@ -349,6 +350,28 @@ func (w *opNodeOperator) Next() (TupleSlot, error) {
 
 func (w *opNodeOperator) Close() error           { return opClose(w.tree, w.idx) }
 func (w *opNodeOperator) Schema() planner.Schema { return w.schema }
+
+// BindLateralOuter forwards the lateral outer-row binding to the wrapped
+// underlying operator when this opNodeOperator fronts a FROM-clause SRF
+// (e.g. verify_heapam / pg_get_publication_tables) that implements
+// lateralBindable. The BuildFast (OpNode) path — the server's simple-protocol
+// execution path — wraps a Join's children in opNodeOperator, so without this
+// forwarder joinOp.openLateral's `right.(lateralBindable)` fast-path would
+// never fire and a correlated SRF argument (e.g. verify_heapam(relation :=
+// c.oid) in the comma-join pg_amcheck emits) would evaluate against a nil
+// outer slot ("column ref oid/0 on nil slot"). The SRF leaf is built via the
+// default OpAdapter case, so the underlying op lives in an *opAdapterState.
+// M0110-0003 gap #6.
+func (w *opNodeOperator) BindLateralOuter(slot SlotView) {
+	if w.tree == nil || int(w.idx) < 0 || int(w.idx) >= len(w.tree.ops) {
+		return
+	}
+	if s, ok := w.tree.ops[w.idx].state.(*opAdapterState); ok {
+		if b, ok := s.op.(lateralBindable); ok {
+			b.BindLateralOuter(slot)
+		}
+	}
+}
 
 // ---------------------------------------------------------------------------
 // OpIterator — wraps an opTreeSlab as an Operator for backward-compatible wiring.

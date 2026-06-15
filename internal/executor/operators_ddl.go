@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -129,6 +132,10 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreateOpClass(s)
 	case *parser.CreateExtensionStmt:
 		return nil, o.execCreateExtension(s)
+	case *parser.CreateTablespaceStmt:
+		return nil, o.execCreateTablespace(s)
+	case *parser.DropTablespaceStmt:
+		return nil, o.execDropTablespace(s)
 	case *parser.CompatNoopStmt:
 		return nil, o.execCompatNoop(s)
 	case *parser.CommentOnStmt:
@@ -185,9 +192,115 @@ func (o *ddlOp) execCreateExtension(s *parser.CreateExtensionStmt) error {
 	if schema == "" {
 		schema = "public"
 	}
-	if err := o.ctx.Catalog.CreateExtension(s.Name, schema, version, s.IfNotExists); err != nil {
+	if err := o.ctx.Catalog.CreateExtension(s.Name, schema, version, o.ctx.CurrentDatabase, s.IfNotExists); err != nil {
 		// Only failure mode is a duplicate without IF NOT EXISTS.
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	return nil
+}
+
+// inPlaceTablespacesEnabled reports the session-effective
+// allow_in_place_tablespaces GUC. Defaults to false when no GetSetting hook is
+// wired (embedded/test contexts), matching PG's boot value. M0095-0003.
+func (o *ddlOp) inPlaceTablespacesEnabled() bool {
+	if o.ctx.GetSetting == nil {
+		return false
+	}
+	v, ok := o.ctx.GetSetting("allow_in_place_tablespaces")
+	if !ok {
+		return false
+	}
+	switch strings.ToLower(v) {
+	case "on", "true", "yes", "1":
+		return true
+	default:
+		return false
+	}
+}
+
+// execCreateTablespace handles CREATE TABLESPACE. goopg supports only the
+// developer/regression in-place form (empty LOCATION with
+// allow_in_place_tablespaces on), which creates pg_tblspc/<oid> as a real
+// directory and records the tablespace in the runtime registry. It mirrors PG's
+// CreateTableSpace (commands/tablespace.c) error semantics: a location with a
+// single quote, a non-absolute non-in-place location, and a reserved "pg_"
+// name all raise the upstream-verbatim errors. External (absolute-path)
+// tablespaces are rejected as unsupported because goopg cannot relocate relation
+// files. M0095-0003.
+func (o *ddlOp) execCreateTablespace(s *parser.CreateTablespaceStmt) error {
+	location := s.Location
+	// PG: disallow quotes, else CREATE DATABASE would be at risk.
+	if strings.Contains(location, "'") {
+		return &ExecError{Code: "42602", Pos: s.Pos(), Message: "tablespace location cannot contain single quotes"}
+	}
+	inPlace := o.inPlaceTablespacesEnabled() && len(location) == 0
+	if !inPlace {
+		if !filepath.IsAbs(location) {
+			// Mirrors PG: "tablespace location must be an absolute path"
+			// (ERRCODE_INVALID_OBJECT_DEFINITION). Also the path empty
+			// LOCATION takes when allow_in_place_tablespaces is off.
+			return &ExecError{Code: "42P17", Pos: s.Pos(), Message: "tablespace location must be an absolute path"}
+		}
+		// An absolute external location is valid in PG but goopg cannot relocate
+		// relation files into an arbitrary directory, so this is unsupported.
+		return &ExecError{
+			Code:    "0A000",
+			Pos:     s.Pos(),
+			Message: "tablespaces with an external location are not supported",
+			Hint:    "Set allow_in_place_tablespaces and use LOCATION '' for an in-place tablespace.",
+		}
+	}
+	// Disallow creation of tablespaces named "pg_xxx"; reserved for system use.
+	if len(s.Name) >= 3 && strings.EqualFold(s.Name[:3], "pg_") {
+		return &ExecError{
+			Code:    "42939",
+			Pos:     s.Pos(),
+			Message: fmt.Sprintf("unacceptable tablespace name %q", s.Name),
+			Detail:  `The prefix "pg_" is reserved for system tablespaces.`,
+		}
+	}
+	oid, err := o.ctx.Catalog.CreateTablespace(s.Name, s.Owner, location)
+	if err != nil {
+		// Only failure mode is a duplicate name.
+		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
+	}
+	// Create the in-place directory pg_tblspc/<oid> under the data dir. When no
+	// data dir is configured (embedded/test contexts), the registry entry stands
+	// alone — matching how other DDL operators skip cluster-filesystem effects.
+	if o.ctx.DataDir != "" {
+		dir := filepath.Join(o.ctx.DataDir, "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
+		// Create the per-tablespace version subdirectory PG_<major>_<catversion>
+		// inside pg_tblspc/<oid>, faithful to create_tablespace_directories
+		// (tablespace.c). Relation files for this tablespace live under it;
+		// pg_basebackup expects it present so a restored cluster's relfiles
+		// resolve. MkdirAll creates the parent <oid> dir in the same call.
+		versionDir := filepath.Join(dir, config.TablespaceVersionDirectory)
+		if mkErr := os.MkdirAll(versionDir, 0o700); mkErr != nil {
+			// Roll back the registry insert so a retry can succeed.
+			o.ctx.Catalog.DropTablespace(s.Name)
+			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: fmt.Sprintf("could not create directory %q: %v", versionDir, mkErr)}
+		}
+	}
+	return nil
+}
+
+// execDropTablespace handles DROP TABLESPACE [IF EXISTS] name. It removes the
+// runtime registry entry and the in-place pg_tblspc/<oid> directory. A missing
+// tablespace without IF EXISTS raises the upstream-verbatim
+// "tablespace ... does not exist" (ERRCODE_UNDEFINED_OBJECT). M0095-0003.
+func (o *ddlOp) execDropTablespace(s *parser.DropTablespaceStmt) error {
+	oid, found := o.ctx.Catalog.DropTablespace(s.Name)
+	if !found {
+		if s.IfExists {
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("tablespace %q does not exist", s.Name)}
+	}
+	if o.ctx.DataDir != "" {
+		dir := filepath.Join(o.ctx.DataDir, "pg_tblspc", strconv.FormatUint(uint64(oid), 10))
+		if rmErr := os.RemoveAll(dir); rmErr != nil {
+			return &ExecError{Code: "58P01", Pos: s.Pos(), Message: fmt.Sprintf("could not remove directory %q: %v", dir, rmErr)}
+		}
 	}
 	return nil
 }
@@ -6303,10 +6416,23 @@ func catalogDBOids(ctx *Context) []uint32 {
 	return oids
 }
 
-// namespaceOIDForSchema maps a schema name to its pg_catalog namespace OID.
-func namespaceOIDForSchema(schema string) uint32 {
+// namespaceOIDForSchema maps a schema name to its namespace OID. The system
+// schemas resolve to their fixed OIDs; a user schema created via CREATE SCHEMA
+// resolves to the OID the catalog assigned it (so a user table's pg_class row
+// carries a relnamespace that the restart-recovery path can reverse-map back to
+// the schema name — M0110-0003). An unregistered or nil-catalog schema falls
+// back to pg_catalog, preserving the pre-M0110-0003 behaviour.
+func namespaceOIDForSchema(cat catalog.Catalog, schema string) uint32 {
 	if schema == "" || schema == "public" {
 		return catalog.PublicNamespaceOID
+	}
+	if schema == "pg_catalog" {
+		return catalog.PGCatalogNamespaceOID
+	}
+	if cat != nil {
+		if oid := cat.SchemaOID(schema); oid != 0 {
+			return oid
+		}
 	}
 	return catalog.PGCatalogNamespaceOID
 }
@@ -6326,11 +6452,11 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(tbl))
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(ctx.Catalog, tbl))
 	if err != nil {
 		return fmt.Errorf("pg_class: %w", err)
 	}
-	relnamespace := namespaceOIDForSchema(tbl.Schema)
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, tbl.Schema)
 	if err := insertPgClassOidIndexEntry(ctx, tbl.OID, classTID); err != nil {
 		return fmt.Errorf("pg_class_oid_index: %w", err)
 	}
@@ -6385,11 +6511,11 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(idx))
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx))
 	if err != nil {
 		return fmt.Errorf("pg_class for index: %w", err)
 	}
-	relnamespace := namespaceOIDForSchema(idx.Schema)
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema)
 	if err := insertPgClassOidIndexEntry(ctx, idx.OID, classTID); err != nil {
 		return fmt.Errorf("pg_class_oid_index for index: %w", err)
 	}
@@ -7288,6 +7414,15 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 			}
 			// Schema is registered; unregister it.
 			o.ctx.Catalog.UnregisterSchema(schemaName)
+			// M0110-0003: persist the drop so it survives a restart (mirrors
+			// CREATE SCHEMA below / DROP DATABASE). Without this, a schema
+			// dropped at runtime would be re-registered by replaying its
+			// CREATE SCHEMA record on the next startup.
+			if o.ctx.WAL != nil {
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeDropSchema(schemaName)); werr != nil {
+					return fmt.Errorf("wal drop-schema: %w", werr)
+				}
+			}
 			if s.Behavior == parser.DropCascade {
 				// Collect routines to drop for NOTICE detail.
 				var droppedRoutines []string
@@ -7845,6 +7980,17 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		// Register user-created schema so schema-qualified queries resolve correctly.
 		if s.ObjName.Name != "" {
 			im.RegisterSchema(s.ObjName.Name)
+			// M0110-0003: persist the schema so it survives a restart. goopg
+			// has no per-schema on-disk file namespace, so we record a WAL
+			// event the recovery driver replays into the schema registry
+			// (mirrors CREATE DATABASE, M0054-0001). The OID just assigned by
+			// RegisterSchema is carried so recovery restores the same OID.
+			if o.ctx.WAL != nil {
+				oid := im.SchemaOID(s.ObjName.Name)
+				if _, _, werr := o.ctx.WAL.Append(wal.EncodeCreateSchema(s.ObjName.Name, oid)); werr != nil {
+					return fmt.Errorf("wal create-schema: %w", werr)
+				}
+			}
 		}
 	case "rule":
 		// Key format must match DROP RULE: ruleName@tableName.

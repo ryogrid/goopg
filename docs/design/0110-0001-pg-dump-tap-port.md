@@ -47,6 +47,58 @@ binaries and validates the CLI surface the rest of the test suite depends on.
 Test function: `TestPort_PgDump001Basic`. CSV row `DU-001` → `port`,
 `pass_required=yes`. The umbrella row `E-002` retains the deferred remainder.
 
+## Connection-setup compatibility (enabler for 002–010)
+
+Before pg_dump runs *any* catalog query it executes a fixed handshake in
+`setup_connection()` (`postgres/src/bin/pg_dump/pg_dump.c`): a battery of `SET`
+commands plus `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY` for a
+consistent snapshot. An empirical probe (real `pg_dump --no-sync postgres`
+against a live goopg server) showed goopg aborting this handshake before
+reaching the first catalog query, so the catalog-parity work below was
+unreachable. Two classes of gap were closed:
+
+1. **Unregistered GUCs.** `synchronize_seqscans`, `transaction_timeout`
+   (PG 17+) and `row_security` were not in the GUC registry, so the
+   corresponding `SET` failed with `unrecognized configuration parameter`.
+   Added as accepted no-ops in `internal/config/defaults.go` (boot defaults
+   mirror `guc_tables.c`: on/0/on) + `postgresql.conf.sample` entries. goopg
+   enforces none of them (no synchronized scans, no per-txn timeout, no RLS),
+   but `SET` must succeed.
+2. **`SET TRANSACTION` mis-routing.** The server's simple-query string
+   fast-path (`internal/server/query.go`) matched the generic `SET ` prefix and
+   handed `TRANSACTION ISOLATION LEVEL …` to `handleSet`, which read
+   `TRANSACTION` as a GUC name (`unrecognized configuration parameter
+   "TRANSACTION"`). A new case routes `SET [LOCAL|SESSION] TRANSACTION …` and
+   `SET SESSION CHARACTERISTICS …` through the parser-based executor, which
+   already builds a `SetTransactionStmt` (M0096-0002) and applies the isolation
+   level. The `"TRANSACTION "` trailing space distinguishes it from the
+   `transaction_timeout` GUC. The parser's transaction-mode loop also now
+   consumes the comma in `REPEATABLE READ, READ ONLY` (it previously stopped at
+   the comma, leaving trailing tokens).
+
+After this slice pg_dump completes `setup_connection()` and proceeds into its
+catalog-dump phase, where it hits catalog-view parity gaps (DU-002+ below),
+fixed one logical group per loop:
+
+1. **`pg_roles.oid` (collectRoleNames) — LANDED.** pg_dump's `collectRoleNames`
+   issues `SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1`
+   (`pg_dump.c:10548`) to build its role-oid → name map. goopg's `pg_roles`
+   virtual view (`internal/catalog/catalog.go`) gained an `oid` column at
+   ordinal 0 carrying OID 10 (`BOOTSTRAP_SUPERUSERID`, the `postgres`
+   superuser, per `pg_authid.dat`).
+2. **`acldefault()` (getNamespaces) — NEXT.** pg_dump then runs
+   `SELECT n.tableoid, n.oid, n.nspname, n.nspowner, n.nspacl,
+   acldefault('n', n.nspowner) AS acldefault FROM pg_namespace n`, which fails
+   with `function acldefault does not exist`. Needs the `acldefault()` builtin
+   plus `pg_namespace` columns (`tableoid`, `nspowner`, `nspacl`).
+
+Regression guard: `TestPort_PgDumpConnectionSetup`
+(`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
+no `setup_connection()` error signature appears; it logs the remaining
+catalog-parity blocker and auto-tightens to assert exit 0 once a clean dump
+works. Unit guards: `config.TestPgDumpConnectionSetupGUCs`,
+`parser.TestParseSetTransactionCommaSeparated`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
@@ -63,4 +115,8 @@ first, per the fix_plan action).
 ## Verification
 
 `go test -v -run TestPort_PgDump001Basic ./internal/testport/` → PASS.
+`go test -v -run TestPort_PgDumpConnectionSetup ./internal/testport/` → PASS
+(passes connection setup + collectRoleNames; logs the next gap: `acldefault()`
+in getNamespaces).
+`go test ./internal/config/ ./internal/parser/ ./internal/server/` → PASS.
 `go run ./cmd/gen-oracle-port-status` regenerates the status markdown.

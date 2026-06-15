@@ -376,6 +376,38 @@ func (m *Manager) NBlocks(rel RelFileNode) (BlockNumber, error) {
 	return f.nBlocks(), nil
 }
 
+// Exists reports whether rel's backing fork file is present on disk, mirroring
+// PostgreSQL's smgrexists(MAIN_FORKNUM). It must NOT consult the open-file
+// cache or go through relFile: relFile opens with O_CREATE and would silently
+// recreate a fork that was removed out from under us (e.g. the pg_amcheck
+// missing-relation-fork corruption scenario), turning a removed file into an
+// empty one. A pure stat of the on-disk path is the faithful test — every open
+// relation always has an on-disk file (relFile creates it eagerly), so a
+// stat-only check never reports a live relation as absent.
+func (m *Manager) Exists(rel RelFileNode) bool {
+	_, err := os.Stat(m.relPath(rel))
+	return err == nil
+}
+
+// RelPath returns rel's fork path relative to the data directory, using forward
+// slashes (e.g. "base/5/16407"). It mirrors PostgreSQL's relpath() so callers
+// can build the upstream-verbatim `could not open file "%s"` message when a
+// fork is found missing (the pg_amcheck heap file-removal corruption scenario).
+func (m *Manager) RelPath(rel RelFileNode) string {
+	base := "base/" + fmt.Sprint(rel.DBOid)
+	switch rel.Fork {
+	case MainFork:
+		return base + "/" + fmt.Sprint(rel.RelOid)
+	case FSMFork:
+		return base + "/" + fmt.Sprintf("%d_fsm", rel.RelOid)
+	case VisibilityMapFork:
+		return base + "/" + fmt.Sprintf("%d_vm", rel.RelOid)
+	case InitFork:
+		return base + "/" + fmt.Sprintf("%d_init", rel.RelOid)
+	}
+	return base + "/" + fmt.Sprintf("%d_fork%d", rel.RelOid, rel.Fork)
+}
+
 // Sync issues fdatasync(2) on rel's backing file. Used by the
 // checkpointer to make sure dirty buffers we already wrote are
 // durable before we advance the redo pointer.

@@ -25,7 +25,7 @@ import (
 // are rejected at Bind time); we feed them through to
 // executor.Context.Params and let the executor's expression
 // evaluator coerce inside ParamRef.
-func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32) (*extendedQueryResult, *extendedQueryError) {
+func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *config.SessionRegistry, query string, params []boundParam, procNum int32, dbName string) (*extendedQueryResult, *extendedQueryError) {
 	stmts, err := parser.Parse(query)
 	if err != nil {
 		msg, extra := syntaxErrorMsg(err)
@@ -109,6 +109,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.Ctx = ctx
 	ectx.Pool = s.cfg.Pool
 	ectx.Catalog = s.cfg.Catalog
+	s.wireExtensionRows(ectx, dbName) // per-database pg_extension (M0110-0003 gap #7c)
 	ectx.TxnMgr = s.cfg.TxnMgr
 	ectx.Tx = tx
 	ectx.Snap = snap

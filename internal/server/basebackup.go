@@ -64,6 +64,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/initdb"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
@@ -219,8 +220,17 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 		return err
 	}
 
-	// --- result-set 2: tablespace list (one NULL row for default) ---
-	if err := writeTablespaceList(w); err != nil {
+	// Enumerate in-place tablespaces (pg_tblspc/<oid>) up front: the list
+	// drives both result-set 2 (one row per tablespace) and the per-tablespace
+	// <oid>.tar archives streamed after base.tar.
+	tblspcs, err := collectInPlaceTablespaces(s.cfg.DataDir)
+	if err != nil {
+		return s.writeQueryError(w, sqlstate.InternalError,
+			fmt.Sprintf("BASE_BACKUP: tablespaces: %v", err))
+	}
+
+	// --- result-set 2: tablespace list (default NULL row + one per tablespace) ---
+	if err := writeTablespaceList(w, tblspcs); err != nil {
 		return err
 	}
 	if err := w.WriteCommandComplete("SELECT"); err != nil {
@@ -279,6 +289,24 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 		return s.writeStreamingError(w, sqlstate.InternalError,
 			fmt.Sprintf("BASE_BACKUP: tar: %v", err))
 	}
+
+	// --- per-tablespace archives: one <oid>.tar per in-place tablespace,
+	// streamed after base.tar. Each begins with its own 'n' (new-archive)
+	// frame naming "<oid>.tar" with the PGDATA-relative spclocation, followed
+	// by the tablespace's version-dir tar bytes. Manifest entries accumulate
+	// into the same list so the backup manifest covers tablespace files.
+	for _, ts := range tblspcs {
+		if err := newArchiveFrame(w, strconv.FormatUint(uint64(ts.oid), 10)+".tar", ts.relPath); err != nil {
+			return err
+		}
+		tsEntries, err := emitTablespaceTar(ctx, streamer, ts, mck)
+		if err != nil {
+			return s.writeStreamingError(w, sqlstate.InternalError,
+				fmt.Sprintf("BASE_BACKUP: tablespace %d: %v", ts.oid, err))
+		}
+		entries = append(entries, tsEntries...)
+	}
+
 	// Final progress report at end-of-archive (upstream parity).
 	if err := writeProgressFrame(w, streamer.bytesDone); err != nil {
 		return err
@@ -360,13 +388,25 @@ func writeRecPtrResult(w *protocol.FrameWriter, lsn uint64, tli uint32) error {
 // Note: this does NOT terminate with CommandComplete — caller
 // follows with one shared CommandComplete("SELECT") to match
 // upstream's `bbsink_copystream_begin_backup` framing.
-func writeTablespaceList(w *protocol.FrameWriter) error {
+func writeTablespaceList(w *protocol.FrameWriter, tblspcs []inPlaceTablespace) error {
 	if err := w.WriteRowDescription([]protocol.FieldDescription{
 		{Name: "spcoid", TypeOID: 26 /* oid */, TypeSize: 4, TypeModifier: -1, Format: 0},
 		{Name: "spclocation", TypeOID: oidText, TypeSize: -1, TypeModifier: -1, Format: 0},
 		{Name: "size", TypeOID: oidInt8, TypeSize: 8, TypeModifier: -1, Format: 0},
 	}); err != nil {
 		return err
+	}
+	// One row per non-default tablespace, then the default tablespace's
+	// NULL/NULL/NULL row last — matching the order BASE_BACKUP streams the
+	// archives (tablespaces first, base.tar last) in upstream. goopg streams
+	// base.tar first, but the tablespace-list ordering is informational for
+	// tar-format clients, so we keep the upstream row order for parity.
+	for _, ts := range tblspcs {
+		oid := []byte(strconv.FormatUint(uint64(ts.oid), 10))
+		loc := []byte(ts.relPath)
+		if err := w.WriteDataRow([][]byte{oid, loc, nil}); err != nil {
+			return err
+		}
 	}
 	return w.WriteDataRow([][]byte{nil, nil, nil})
 }
@@ -626,6 +666,17 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 			entries = append(entries, entry{abs: "", rel: filepath.Join("pg_wal", "summaries"), info: info, isFile: false})
 			return filepath.SkipDir
 		}
+		// pg_tblspc/<oid> in-place tablespace directories: ship the directory
+		// entry into base.tar (so the placeholder exists) but do NOT recurse —
+		// the tablespace's version dir + relfiles are streamed as a separate
+		// <oid>.tar archive. Mirrors basebackup.c sendDir's skip_this_dir for a
+		// tablespace whose rpath lives inside PGDATA.
+		if info.IsDir() && filepath.ToSlash(filepath.Dir(rel)) == "pg_tblspc" {
+			if _, perr := strconv.ParseUint(filepath.Base(rel), 10, 32); perr == nil {
+				entries = append(entries, entry{abs: path, rel: rel, info: info, isFile: false})
+				return filepath.SkipDir
+			}
+		}
 		base := filepath.Base(rel)
 		if info.IsDir() {
 			if _, skip := excludeDirContents[base]; skip {
@@ -768,6 +819,127 @@ func appendWALSegments(tw *tar.Writer, dataDir string, tli uint32, segSize int64
 		}
 	}
 	return nil
+}
+
+// inPlaceTablespace describes an in-place tablespace discovered under
+// $DataDir/pg_tblspc/<oid>. goopg only supports in-place tablespaces
+// (CREATE TABLESPACE ... LOCATION ” with allow_in_place_tablespaces), so
+// every numeric directory entry under pg_tblspc is one. relPath is the
+// PGDATA-relative location reported to pg_basebackup ("pg_tblspc/<oid>"),
+// matching ti->path/ti->rpath in xlog.c's in-place branch.
+type inPlaceTablespace struct {
+	oid     uint32
+	dir     string // absolute path: $DataDir/pg_tblspc/<oid>
+	relPath string // PGDATA-relative: "pg_tblspc/<oid>"
+}
+
+// collectInPlaceTablespaces enumerates the in-place tablespaces of a data
+// directory by scanning pg_tblspc for numeric subdirectories. The result is
+// sorted by OID so the archive stream and tablespace-list result-set agree.
+// Mirrors the pg_tblspc scan in do_pg_backup_start (xlog.c:9040-9130).
+func collectInPlaceTablespaces(dataDir string) ([]inPlaceTablespace, error) {
+	tblspcDir := filepath.Join(dataDir, "pg_tblspc")
+	ents, err := os.ReadDir(tblspcDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []inPlaceTablespace
+	for _, e := range ents {
+		if !e.IsDir() {
+			continue
+		}
+		oid, perr := strconv.ParseUint(e.Name(), 10, 32)
+		if perr != nil {
+			continue // non-numeric entry is not a tablespace
+		}
+		out = append(out, inPlaceTablespace{
+			oid:     uint32(oid),
+			dir:     filepath.Join(tblspcDir, e.Name()),
+			relPath: "pg_tblspc/" + e.Name(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].oid < out[j].oid })
+	return out, nil
+}
+
+// emitTablespaceTar streams the contents of one in-place tablespace as a
+// standalone POSIX-ustar archive (the <oid>.tar member). Per upstream
+// sendTablespace (basebackup.c:1136), only the version directory
+// (PG_<major>_<catversion>) and its files are shipped, with tar paths made
+// relative to the tablespace directory — i.e. the version dir entry plus
+// "<version-dir>/<relfile>" for each file. Manifest entries are recorded with
+// their PGDATA-relative path ("pg_tblspc/<oid>/<version-dir>/<relfile>") so the
+// backup manifest covers tablespace files too.
+func emitTablespaceTar(ctx context.Context, out io.Writer, ts inPlaceTablespace, mck manifestChecksumKind) ([]manifestEntry, error) {
+	tw := tar.NewWriter(out)
+	var manifest []manifestEntry
+
+	verDir := config.TablespaceVersionDirectory
+	verAbs := filepath.Join(ts.dir, verDir)
+
+	// The version directory may not exist if the tablespace was created
+	// outside goopg's CREATE TABLESPACE path; treat its absence as an empty
+	// tablespace (no error), mirroring sendTablespace's ENOENT tolerance.
+	verInfo, err := os.Stat(verAbs)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, tw.Close()
+		}
+		return nil, err
+	}
+
+	// Directory entry for the version dir itself (permission carrier).
+	if err := writeTarDir(tw, verDir+"/", verInfo.ModTime(), verInfo.Mode().Perm()); err != nil {
+		return nil, err
+	}
+
+	err = filepath.Walk(verAbs, func(path string, info fs.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == verAbs {
+			return nil // already emitted the version-dir entry
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(ts.dir, path)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return writeTarDir(tw, rel+"/", info.ModTime(), info.Mode().Perm())
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if err := writeTarFileWithMode(tw, rel, data, info.ModTime(), info.Mode().Perm()); err != nil {
+			return err
+		}
+		algo, cksum := "", ""
+		if name, ok := mck.checksumFile(data); ok {
+			algo, cksum = mck.algoName(), name
+		}
+		manifest = append(manifest, manifestEntry{
+			path:  ts.relPath + "/" + filepath.ToSlash(rel),
+			size:  int64(len(data)),
+			mtime: info.ModTime(),
+			algo:  algo,
+			cksum: cksum,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	return manifest, nil
 }
 
 // writeTarFile / writeTarFileWithMode / writeTarDir are thin

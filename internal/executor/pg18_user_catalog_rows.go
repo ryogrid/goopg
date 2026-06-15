@@ -99,12 +99,12 @@ func pgAttributeColumnsPG18() []catalog.Column {
 // a PG18-canonical pg_attribute row: typlen (attlen), typbyval (attbyval),
 // typalign (attalign), typstorage (attstorage).
 type userTypeAttrs struct {
-		TypLen        int16 // -1 == variable-length
-		TypByVal      bool
-		TypAlign      byte // 'c' | 's' | 'i' | 'd'
-		TypStorage    byte // 'p' | 'e' | 'x' | 'm'
-		TypCollation  uint32
-	}
+	TypLen       int16 // -1 == variable-length
+	TypByVal     bool
+	TypAlign     byte // 'c' | 's' | 'i' | 'd'
+	TypStorage   byte // 'p' | 'e' | 'x' | 'm'
+	TypCollation uint32
+}
 
 // userTypeAttrsForOID returns the PG18 pg_type attributes for the OIDs that
 // user CREATE TABLE can produce. Values match
@@ -186,7 +186,7 @@ const (
 // buildUserPGClassRow constructs a 34-column PG18-canonical pg_class row for
 // a user-defined table. Mirrors initdb.pgClassRow's per-column ordering and
 // default values.
-func buildUserPGClassRow(tbl *catalog.Table) Row {
+func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	relkind := "r"
 	if tbl.PartitionMethod != "" {
 		relkind = "p" // partitioned table
@@ -197,82 +197,82 @@ func buildUserPGClassRow(tbl *catalog.Table) Row {
 	}
 	isPartition := tbl.PartitionParentOID != 0
 	return Row{
-		NewIntDatum(int64(tbl.OID)),                                  // oid
-		NewStringDatum(tbl.Name),                                     // relname (name)
-		NewIntDatum(int64(namespaceOIDForSchema(tbl.Schema))),        // relnamespace
-		NewIntDatum(0),                                               // reltype (no composite type seeded yet)
-		NewIntDatum(0),                                               // reloftype
-		NewIntDatum(bootstrapSuperuserOID),                           // relowner
-		NewIntDatum(pgHeapAccessMethodOID),                           // relam
-		NewIntDatum(relfilenode),                                     // relfilenode
-		NewIntDatum(0),                                               // reltablespace (default per-db tablespace)
-		NewIntDatum(0),                                               // relpages
-		NewIntDatum(0),                                               // reltuples (float4 here; stored 0 == 0.0)
-		NewIntDatum(0),                                               // relallvisible
-		NewIntDatum(0),                                               // relallfrozen
-		NewIntDatum(0),                                               // reltoastrelid
-		NewBoolDatum(false),                                          // relhasindex (updated by CREATE INDEX later)
-		NewBoolDatum(false),                                          // relisshared
-		NewStringDatum("p"),                                          // relpersistence
-		NewStringDatum(relkind),                                      // relkind
-		NewIntDatum(int64(len(tbl.Columns))),                         // relnatts
-		NewIntDatum(0),                                               // relchecks
-		NewBoolDatum(false),                                          // relhasrules
-		NewBoolDatum(false),                                          // relhastriggers
-		NewBoolDatum(false),                                          // relhassubclass
-		NewBoolDatum(false),                                          // relrowsecurity
-		NewBoolDatum(false),                                          // relforcerowsecurity
-		NewBoolDatum(true),                                           // relispopulated
-		NewStringDatum("n"),                                          // relreplident (REPLICA_IDENTITY_DEFAULT)
-		NewBoolDatum(isPartition),                                    // relispartition
-		NewIntDatum(0),                                               // relrewrite
-		NewIntDatum(minFrozenXID),                                    // relfrozenxid
-		NewIntDatum(minFrozenMXID),                                   // relminmxid
-		NewStringDatum("{}"),                                         // relacl (encoded as empty aclitem[] ArrayType)
-		NewStringDatum("{}"),                                         // reloptions (encoded as empty text[] ArrayType)
-		NewStringDatum(""),                                           // relpartbound (NULL-equivalent empty pg_node_tree)
+		NewIntDatum(int64(tbl.OID)),                                // oid
+		NewStringDatum(tbl.Name),                                   // relname (name)
+		NewIntDatum(int64(namespaceOIDForSchema(cat, tbl.Schema))), // relnamespace
+		NewIntDatum(0),                                             // reltype (no composite type seeded yet)
+		NewIntDatum(0),                                             // reloftype
+		NewIntDatum(bootstrapSuperuserOID),                         // relowner
+		NewIntDatum(pgHeapAccessMethodOID),                         // relam
+		NewIntDatum(relfilenode),                                   // relfilenode
+		NewIntDatum(0),                                             // reltablespace (default per-db tablespace)
+		NewIntDatum(0),                                             // relpages
+		NewIntDatum(0),                                             // reltuples (float4 here; stored 0 == 0.0)
+		NewIntDatum(0),                                             // relallvisible
+		NewIntDatum(0),                                             // relallfrozen
+		NewIntDatum(0),                                             // reltoastrelid
+		NewBoolDatum(false),                                        // relhasindex (updated by CREATE INDEX later)
+		NewBoolDatum(false),                                        // relisshared
+		NewStringDatum("p"),                                        // relpersistence
+		NewStringDatum(relkind),                                    // relkind
+		NewIntDatum(int64(len(tbl.Columns))),                       // relnatts
+		NewIntDatum(0),                                             // relchecks
+		NewBoolDatum(false),                                        // relhasrules
+		NewBoolDatum(false),                                        // relhastriggers
+		NewBoolDatum(false),                                        // relhassubclass
+		NewBoolDatum(false),                                        // relrowsecurity
+		NewBoolDatum(false),                                        // relforcerowsecurity
+		NewBoolDatum(true),                                         // relispopulated
+		NewStringDatum("n"),                                        // relreplident (REPLICA_IDENTITY_DEFAULT)
+		NewBoolDatum(isPartition),                                  // relispartition
+		NewIntDatum(0),                                             // relrewrite
+		NewIntDatum(minFrozenXID),                                  // relfrozenxid
+		NewIntDatum(minFrozenMXID),                                 // relminmxid
+		NewStringDatum("{}"),                                       // relacl (encoded as empty aclitem[] ArrayType)
+		NewStringDatum("{}"),                                       // reloptions (encoded as empty text[] ArrayType)
+		NewStringDatum(""),                                         // relpartbound (NULL-equivalent empty pg_node_tree)
 	}
 }
 
 // buildUserPGClassRowForIndex constructs the 34-column PG18-canonical
 // pg_class row for a user-defined index.
-func buildUserPGClassRowForIndex(idx *catalog.Index) Row {
+func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 	natts := int64(len(idx.Columns))
 	return Row{
 		NewIntDatum(int64(idx.OID)),
 		NewStringDatum(idx.Name),
-		NewIntDatum(int64(namespaceOIDForSchema(idx.Schema))),
-		NewIntDatum(0),                                               // reltype
-		NewIntDatum(0),                                               // reloftype
-		NewIntDatum(bootstrapSuperuserOID),                           // relowner
-		NewIntDatum(pgBTreeAccessMethodOID),                          // relam
-		NewIntDatum(int64(idx.OID)),                                  // relfilenode
-		NewIntDatum(0),                                               // reltablespace
-		NewIntDatum(0),                                               // relpages
-		NewIntDatum(0),                                               // reltuples
-		NewIntDatum(0),                                               // relallvisible
-		NewIntDatum(0),                                               // relallfrozen
-		NewIntDatum(0),                                               // reltoastrelid
-		NewBoolDatum(false),                                          // relhasindex (indexes never have indexes themselves)
-		NewBoolDatum(false),                                          // relisshared
-		NewStringDatum("p"),                                          // relpersistence
-		NewStringDatum("i"),                                          // relkind
-		NewIntDatum(natts),                                           // relnatts
-		NewIntDatum(0),                                               // relchecks
-		NewBoolDatum(false),                                          // relhasrules
-		NewBoolDatum(false),                                          // relhastriggers
-		NewBoolDatum(false),                                          // relhassubclass
-		NewBoolDatum(false),                                          // relrowsecurity
-		NewBoolDatum(false),                                          // relforcerowsecurity
-		NewBoolDatum(true),                                           // relispopulated
-		NewStringDatum("n"),                                          // relreplident
-		NewBoolDatum(false),                                          // relispartition
-		NewIntDatum(0),                                               // relrewrite
-		NewIntDatum(minFrozenXID),                                    // relfrozenxid
-		NewIntDatum(minFrozenMXID),                                   // relminmxid
-		NewStringDatum("{}"),                                         // relacl
-		NewStringDatum("{}"),                                         // reloptions
-		NewStringDatum(""),                                           // relpartbound
+		NewIntDatum(int64(namespaceOIDForSchema(cat, idx.Schema))),
+		NewIntDatum(0),                      // reltype
+		NewIntDatum(0),                      // reloftype
+		NewIntDatum(bootstrapSuperuserOID),  // relowner
+		NewIntDatum(pgBTreeAccessMethodOID), // relam
+		NewIntDatum(int64(idx.OID)),         // relfilenode
+		NewIntDatum(0),                      // reltablespace
+		NewIntDatum(0),                      // relpages
+		NewIntDatum(0),                      // reltuples
+		NewIntDatum(0),                      // relallvisible
+		NewIntDatum(0),                      // relallfrozen
+		NewIntDatum(0),                      // reltoastrelid
+		NewBoolDatum(false),                 // relhasindex (indexes never have indexes themselves)
+		NewBoolDatum(false),                 // relisshared
+		NewStringDatum("p"),                 // relpersistence
+		NewStringDatum("i"),                 // relkind
+		NewIntDatum(natts),                  // relnatts
+		NewIntDatum(0),                      // relchecks
+		NewBoolDatum(false),                 // relhasrules
+		NewBoolDatum(false),                 // relhastriggers
+		NewBoolDatum(false),                 // relhassubclass
+		NewBoolDatum(false),                 // relrowsecurity
+		NewBoolDatum(false),                 // relforcerowsecurity
+		NewBoolDatum(true),                  // relispopulated
+		NewStringDatum("n"),                 // relreplident
+		NewBoolDatum(false),                 // relispartition
+		NewIntDatum(0),                      // relrewrite
+		NewIntDatum(minFrozenXID),           // relfrozenxid
+		NewIntDatum(minFrozenMXID),          // relminmxid
+		NewStringDatum("{}"),                // relacl
+		NewStringDatum("{}"),                // reloptions
+		NewStringDatum(""),                  // relpartbound
 	}
 }
 
@@ -282,31 +282,31 @@ func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 	typOID := catalog.TypeNameToOID(col.Type.Name)
 	attrs := userTypeAttrsForOID(typOID)
 	return Row{
-		NewIntDatum(int64(tbl.OID)),               // attrelid
-		NewStringDatum(col.Name),                  // attname (name)
-		NewIntDatum(int64(typOID)),                // atttypid
-		NewIntDatum(int64(attrs.TypLen)),          // attlen
-		NewIntDatum(int64(col.Ordinal + 1)),       // attnum (1-based)
-		NewIntDatum(-1),                           // atttypmod
-		NewIntDatum(0),                            // attndims
-		NewBoolDatum(attrs.TypByVal),              // attbyval
-		NewStringDatum(string(attrs.TypAlign)),    // attalign
-		NewStringDatum(string(attrs.TypStorage)),  // attstorage
-		NewStringDatum(""),                        // attcompression (PG18 default: '\0' meaning "default")
-		NewBoolDatum(col.NotNull),                 // attnotnull
-		NewBoolDatum(col.DefaultExpr != nil),      // atthasdef
-		NewBoolDatum(false),                       // atthasmissing
-		NewStringDatum(""),                        // attidentity
-		NewStringDatum(attGeneratedFor(col)),      // attgenerated
-		NewBoolDatum(false),                       // attisdropped
-		NewBoolDatum(!col.Inherited),              // attislocal
+		NewIntDatum(int64(tbl.OID)),              // attrelid
+		NewStringDatum(col.Name),                 // attname (name)
+		NewIntDatum(int64(typOID)),               // atttypid
+		NewIntDatum(int64(attrs.TypLen)),         // attlen
+		NewIntDatum(int64(col.Ordinal + 1)),      // attnum (1-based)
+		NewIntDatum(-1),                          // atttypmod
+		NewIntDatum(0),                           // attndims
+		NewBoolDatum(attrs.TypByVal),             // attbyval
+		NewStringDatum(string(attrs.TypAlign)),   // attalign
+		NewStringDatum(string(attrs.TypStorage)), // attstorage
+		NewStringDatum(""),                       // attcompression (PG18 default: '\0' meaning "default")
+		NewBoolDatum(col.NotNull),                // attnotnull
+		NewBoolDatum(col.DefaultExpr != nil),     // atthasdef
+		NewBoolDatum(false),                      // atthasmissing
+		NewStringDatum(""),                       // attidentity
+		NewStringDatum(attGeneratedFor(col)),     // attgenerated
+		NewBoolDatum(false),                      // attisdropped
+		NewBoolDatum(!col.Inherited),             // attislocal
 		func() Datum {
 			if col.Inherited {
 				return NewIntDatum(1)
 			}
 			return NewIntDatum(0)
-		}(),                                       // attinhcount
-		NewIntDatum(int64(attrs.TypCollation)),    // attcollation
+		}(), // attinhcount
+		NewIntDatum(int64(attrs.TypCollation)), // attcollation
 		// attacl / attoptions / attfdwoptions / attmissingval are nullable
 		// varlena columns; PG18 stores NULL when unset. NullDatum signals
 		// EncodeRowPG to skip the column and the bitmap helper to clear
@@ -382,27 +382,27 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 	zeros16 := make([]int16, n)
 
 	return Row{
-		NewIntDatum(int64(idx.OID)),                          // indexrelid
-		NewIntDatum(int64(tableOIDForIndex(idx))),            // indrelid
-		NewIntDatum(natts),                                   // indnatts
-		NewIntDatum(natts),                                   // indnkeyatts
-		NewBoolDatum(idx.Unique),                             // indisunique
-		NewBoolDatum(false),                                  // indnullsnotdistinct
-		NewBoolDatum(idx.Primary),                            // indisprimary
-		NewBoolDatum(false),                                  // indisexclusion
-		NewBoolDatum(true),                                   // indimmediate
-		NewBoolDatum(false),                                  // indisclustered
-		NewBoolDatum(true),                                   // indisvalid
-		NewBoolDatum(false),                                  // indcheckxmin
-		NewBoolDatum(true),                                   // indisready
-		NewBoolDatum(true),                                   // indislive
-		NewBoolDatum(false),                                  // indisreplident
-		NewBytesDatum(pgInt2VectorBytes(attnums)),            // indkey
-		NewBytesDatum(pgOIDVectorBytes(zeros32)),             // indcollation
-		NewBytesDatum(pgOIDVectorBytes(zeros32)),             // indclass
-		NewBytesDatum(pgInt2VectorBytes(zeros16)),            // indoption
-		NullDatum,                                            // indexprs (NULL)
-		NullDatum,                                            // indpred  (NULL)
+		NewIntDatum(int64(idx.OID)),               // indexrelid
+		NewIntDatum(int64(tableOIDForIndex(idx))), // indrelid
+		NewIntDatum(natts),                        // indnatts
+		NewIntDatum(natts),                        // indnkeyatts
+		NewBoolDatum(idx.Unique),                  // indisunique
+		NewBoolDatum(false),                       // indnullsnotdistinct
+		NewBoolDatum(idx.Primary),                 // indisprimary
+		NewBoolDatum(false),                       // indisexclusion
+		NewBoolDatum(true),                        // indimmediate
+		NewBoolDatum(false),                       // indisclustered
+		NewBoolDatum(true),                        // indisvalid
+		NewBoolDatum(false),                       // indcheckxmin
+		NewBoolDatum(true),                        // indisready
+		NewBoolDatum(true),                        // indislive
+		NewBoolDatum(false),                       // indisreplident
+		NewBytesDatum(pgInt2VectorBytes(attnums)), // indkey
+		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indcollation
+		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indclass
+		NewBytesDatum(pgInt2VectorBytes(zeros16)), // indoption
+		NullDatum, // indexprs (NULL)
+		NullDatum, // indpred  (NULL)
 	}
 }
 
@@ -534,37 +534,37 @@ func buildUserPGStatisticRow(tableOID uint32, attNum int16, stats catalog.Column
 	}
 
 	return Row{
-		NewIntDatum(int64(tableOID)),      // starelid
-		NewIntDatum(int64(attNum)),        // staattnum
-		NewBoolDatum(false),               // stainherit
-		NewStringDatum(nullFracStr),       // stanullfrac (float4 as varlena text)
-		NewIntDatum(8),                    // stawidth (avg col width, placeholder)
-		NewStringDatum(distinctStr),       // stadistinct (float4 as varlena text)
-		NewIntDatum(int64(stakind1)),      // stakind1
-		NewIntDatum(int64(stakind2)),      // stakind2
-		NewIntDatum(0),                    // stakind3
-		NewIntDatum(0),                    // stakind4
-		NewIntDatum(0),                    // stakind5
-		NewIntDatum(int64(staop1)),        // staop1
-		NewIntDatum(0),                    // staop2
-		NewIntDatum(0),                    // staop3
-		NewIntDatum(0),                    // staop4
-		NewIntDatum(0),                    // staop5
-		NewIntDatum(0),                    // stacoll1
-		NewIntDatum(0),                    // stacoll2
-		NewIntDatum(0),                    // stacoll3
-		NewIntDatum(0),                    // stacoll4
-		NewIntDatum(0),                    // stacoll5
-		stanumbers1,                       // stanumbers1
-		stanumbers2,                       // stanumbers2
-		NullDatum,                         // stanumbers3
-		NullDatum,                         // stanumbers4
-		NullDatum,                         // stanumbers5
-		stavalues1,                        // stavalues1
-		stavalues2,                        // stavalues2
-		NullDatum,                         // stavalues3
-		NullDatum,                         // stavalues4
-		NullDatum,                         // stavalues5
+		NewIntDatum(int64(tableOID)), // starelid
+		NewIntDatum(int64(attNum)),   // staattnum
+		NewBoolDatum(false),          // stainherit
+		NewStringDatum(nullFracStr),  // stanullfrac (float4 as varlena text)
+		NewIntDatum(8),               // stawidth (avg col width, placeholder)
+		NewStringDatum(distinctStr),  // stadistinct (float4 as varlena text)
+		NewIntDatum(int64(stakind1)), // stakind1
+		NewIntDatum(int64(stakind2)), // stakind2
+		NewIntDatum(0),               // stakind3
+		NewIntDatum(0),               // stakind4
+		NewIntDatum(0),               // stakind5
+		NewIntDatum(int64(staop1)),   // staop1
+		NewIntDatum(0),               // staop2
+		NewIntDatum(0),               // staop3
+		NewIntDatum(0),               // staop4
+		NewIntDatum(0),               // staop5
+		NewIntDatum(0),               // stacoll1
+		NewIntDatum(0),               // stacoll2
+		NewIntDatum(0),               // stacoll3
+		NewIntDatum(0),               // stacoll4
+		NewIntDatum(0),               // stacoll5
+		stanumbers1,                  // stanumbers1
+		stanumbers2,                  // stanumbers2
+		NullDatum,                    // stanumbers3
+		NullDatum,                    // stanumbers4
+		NullDatum,                    // stanumbers5
+		stavalues1,                   // stavalues1
+		stavalues2,                   // stavalues2
+		NullDatum,                    // stavalues3
+		NullDatum,                    // stavalues4
+		NullDatum,                    // stavalues5
 	}
 }
 
@@ -574,11 +574,11 @@ func pgFloat4ArrayBytes(vals []float32) []byte {
 	total := hdrSize + 4*len(vals)
 	buf := make([]byte, total)
 	binary.LittleEndian.PutUint32(buf[0:4], uint32(total)<<2)
-	binary.LittleEndian.PutUint32(buf[4:8], 1)    // ndim
-	binary.LittleEndian.PutUint32(buf[8:12], 0)   // dataoffset (no nulls)
+	binary.LittleEndian.PutUint32(buf[4:8], 1)     // ndim
+	binary.LittleEndian.PutUint32(buf[8:12], 0)    // dataoffset (no nulls)
 	binary.LittleEndian.PutUint32(buf[12:16], 700) // float4 OID
 	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(vals)))
-	binary.LittleEndian.PutUint32(buf[20:24], 1)  // lbound=1
+	binary.LittleEndian.PutUint32(buf[20:24], 1) // lbound=1
 	for i, v := range vals {
 		binary.LittleEndian.PutUint32(buf[hdrSize+4*i:hdrSize+4*i+4], math.Float32bits(v))
 	}
@@ -661,37 +661,37 @@ func pgTypeColumnsPG18() []catalog.Column {
 // goopg basebackup can read it correctly. M0097-0022.
 func buildUserPGTypeRowForEnum(et *catalog.EnumType) Row {
 	return Row{
-		NewIntDatum(int64(et.OID)),          // oid
-		NewStringDatum(et.Name),             // typname (name type)
+		NewIntDatum(int64(et.OID)),                     // oid
+		NewStringDatum(et.Name),                        // typname (name type)
 		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),  // typowner
-		NewIntDatum(4),                      // typlen (enum = 4 bytes, like oid)
-		NewBoolDatum(false),                 // typbyval
-		NewStringDatum("e"),                 // typtype = 'e' (enum)
-		NewStringDatum("E"),                 // typcategory = TYPCATEGORY_ENUM
-		NewBoolDatum(false),                 // typispreferred
-		NewBoolDatum(true),                  // typisdefined
-		NewStringDatum(","),                 // typdelim
-		NewIntDatum(0),                      // typrelid
-		NewIntDatum(0),                      // typsubscript
-		NewIntDatum(0),                      // typelem
-		NewIntDatum(0),                      // typarray
-		NewIntDatum(0),                      // typinput
-		NewIntDatum(0),                      // typoutput
-		NewIntDatum(0),                      // typreceive
-		NewIntDatum(0),                      // typsend
-		NewIntDatum(0),                      // typmodin
-		NewIntDatum(0),                      // typmodout
-		NewIntDatum(0),                      // typanalyze
-		NewStringDatum("i"),                 // typalign = 'i' (int-aligned, 4-byte)
-		NewStringDatum("p"),                 // typstorage = 'p' (plain)
-		NewBoolDatum(false),                 // typnotnull
-		NewIntDatum(0),                      // typbasetype
-		NewIntDatum(-1),                     // typtypmod
-		NewIntDatum(0),                      // typndims
-		NewIntDatum(0),                      // typcollation
-		NullDatum,                           // typdefaultbin (NULL)
-		NullDatum,                           // typdefault (NULL)
-		NullDatum,                           // typacl (NULL)
+		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(4),                                 // typlen (enum = 4 bytes, like oid)
+		NewBoolDatum(false),                            // typbyval
+		NewStringDatum("e"),                            // typtype = 'e' (enum)
+		NewStringDatum("E"),                            // typcategory = TYPCATEGORY_ENUM
+		NewBoolDatum(false),                            // typispreferred
+		NewBoolDatum(true),                             // typisdefined
+		NewStringDatum(","),                            // typdelim
+		NewIntDatum(0),                                 // typrelid
+		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(0),                                 // typelem
+		NewIntDatum(0),                                 // typarray
+		NewIntDatum(0),                                 // typinput
+		NewIntDatum(0),                                 // typoutput
+		NewIntDatum(0),                                 // typreceive
+		NewIntDatum(0),                                 // typsend
+		NewIntDatum(0),                                 // typmodin
+		NewIntDatum(0),                                 // typmodout
+		NewIntDatum(0),                                 // typanalyze
+		NewStringDatum("i"),                            // typalign = 'i' (int-aligned, 4-byte)
+		NewStringDatum("p"),                            // typstorage = 'p' (plain)
+		NewBoolDatum(false),                            // typnotnull
+		NewIntDatum(0),                                 // typbasetype
+		NewIntDatum(-1),                                // typtypmod
+		NewIntDatum(0),                                 // typndims
+		NewIntDatum(0),                                 // typcollation
+		NullDatum,                                      // typdefaultbin (NULL)
+		NullDatum,                                      // typdefault (NULL)
+		NullDatum,                                      // typacl (NULL)
 	}
 }

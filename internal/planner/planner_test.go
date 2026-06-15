@@ -992,12 +992,12 @@ func TestPlanResolutionErrors(t *testing.T) {
 		sql  string
 		code string
 	}{
-		{"SELECT * FROM nope", "42P01"},                                  // undefined_table
-		{"SELECT bogus FROM pgbench_accounts", "42703"},                  // undefined_column
-		{"INSERT INTO pgbench_history (nope) VALUES (1)", "42703"},       // undefined_column
-		{"UPDATE pgbench_accounts SET nope = 1 WHERE aid = $1", "42703"}, // undefined_column
+		{"SELECT * FROM nope", "42P01"},                                        // undefined_table
+		{"SELECT bogus FROM pgbench_accounts", "42703"},                        // undefined_column
+		{"INSERT INTO pgbench_history (nope) VALUES (1)", "42703"},             // undefined_column
+		{"UPDATE pgbench_accounts SET nope = 1 WHERE aid = $1", "42703"},       // undefined_column
 		{"INSERT INTO pgbench_history (tid, bid, aid) VALUES (1, 2)", "42601"}, // explicit col-list arity mismatch
-		{"SELECT 1 UNION SELECT 2, 3", "42601"},                          // set-op column-count mismatch
+		{"SELECT 1 UNION SELECT 2, 3", "42601"},                                // set-op column-count mismatch
 		{"SELECT aid FROM pgbench_accounts a JOIN pgbench_history h ON a.aid = h.aid", "42702"},
 		{"SELECT aid FROM pgbench_accounts HAVING aid > 0", "42803"},
 	}
@@ -1049,6 +1049,138 @@ func TestPlanLateralSrfArgResolvesAgainstLeftFromItem(t *testing.T) {
 	}
 	if got := out[0].Name; got != "attrs" {
 		t.Errorf("output col name = %q, want %q", got, "attrs")
+	}
+}
+
+// TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem pins the
+// M0110-0003 gap #6 fix: pg_amcheck builds each per-relation heap check as
+// an implicit-LATERAL comma-join
+//
+//	... FROM pg_catalog.pg_class c, verify_heapam(relation := c.oid, …) v
+//
+// where the SRF's first argument is the correlated reference `c.oid` into the
+// left sibling. Before the fix planVerifyHeapam resolved its args against an
+// empty context, so `c.oid` raised "column oid does not exist" at plan time.
+// Now the args resolve against the lateral outer context and the wrapping Join
+// is marked Lateral so the executor drives the SRF per outer row (mirrors
+// TestPlanLateralSrfArgResolvesAgainstLeftFromItem for pg_get_publication_tables).
+func TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "rels"}, []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT v.blkno FROM rels c, verify_heapam(relation := c.oid) v`
+	plan, err := Plan(parseOne(t, sql), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	out := plan.Output()
+	if len(out) != 1 || !strings.EqualFold(out[0].Name, "blkno") {
+		t.Fatalf("expected single output column 'blkno', got %+v", out)
+	}
+	// The wrapping Join must be flagged Lateral so the executor drives the SRF
+	// per outer row (BindLateralOuter), not as a materialise-both-sides cross
+	// join (which would evaluate the correlated arg against a nil outer slot).
+	if !planTreeHasLateralJoin(plan) {
+		t.Fatalf("expected a Lateral Join in the plan tree, got none:\n%s", plan)
+	}
+}
+
+// planTreeHasLateralJoin reports whether any Join in the plan tree has
+// Lateral == true. Helper for TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem.
+func planTreeHasLateralJoin(n Node) bool {
+	switch x := n.(type) {
+	case *Join:
+		if x.Lateral {
+			return true
+		}
+		return planTreeHasLateralJoin(x.Left) || planTreeHasLateralJoin(x.Right)
+	case *Project:
+		return planTreeHasLateralJoin(x.Child)
+	}
+	return false
+}
+
+// findLateralJoin returns the first Lateral Join in the plan tree, or nil.
+func findLateralJoin(n Node) *Join {
+	switch x := n.(type) {
+	case *Join:
+		if x.Lateral {
+			return x
+		}
+		if j := findLateralJoin(x.Left); j != nil {
+			return j
+		}
+		return findLateralJoin(x.Right)
+	case *Project:
+		return findLateralJoin(x.Child)
+	case *Filter:
+		return findLateralJoin(x.Child)
+	}
+	return nil
+}
+
+// exprMentionsColumnName reports whether e contains a named ColumnRef for name.
+func exprMentionsColumnName(e Expr, name string) bool {
+	found := false
+	visitColumnRefsByName(e, func(n string) {
+		if strings.EqualFold(n, name) {
+			found = true
+		}
+	})
+	return found
+}
+
+// TestPlanOuterQualPushedBelowLateralJoin pins the lateral outer-qual
+// pushdown that unblocks pg_amcheck's relation-scoped heap probes. The
+// pg_amcheck heap command is
+//
+//	SELECT v.* FROM pg_catalog.pg_class c, verify_heapam(relation := c.oid) v
+//	  WHERE c.oid = N
+//
+// where the WHERE restricts only the outer (left) relation. Without the
+// pushdown, the residual Filter sits ABOVE the lateral nested-loop, so
+// verify_heapam is opened for EVERY pg_class row and raises "could not open
+// relation" on the first non-heap relation (an index/sequence OID) before the
+// filter can drop it. pushOuterQualsIntoLaterals moves the outer-only qual onto
+// the join's outer child so the SRF is only opened for the matching relation —
+// matching PostgreSQL's nested-loop qual placement. M0110-0003.
+func TestPlanOuterQualPushedBelowLateralJoin(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "rels"}, []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT v.blkno FROM rels c, verify_heapam(relation := c.oid) v WHERE c.oid = 16404`
+	plan, err := Plan(parseOne(t, sql), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	j := findLateralJoin(plan)
+	if j == nil {
+		t.Fatalf("expected a Lateral Join in the plan, got none:\n%s", plan)
+	}
+	// The outer-only qual must now live as a Filter on the join's LEFT child,
+	// so the lateral RHS is opened only for outer rows that pass it.
+	lf, ok := j.Left.(*Filter)
+	if !ok {
+		t.Fatalf("lateral Join.Left is %T, want *Filter carrying the pushed qual:\n%s", j.Left, plan)
+	}
+	if !exprMentionsColumnName(lf.Predicate, "oid") {
+		t.Errorf("pushed Filter predicate does not mention oid: %v", lf.Predicate)
+	}
+	// And it must no longer remain in a Filter ABOVE the lateral join (which is
+	// where it would force per-outer-row evaluation of the SRF).
+	if f, ok := plan.(*Filter); ok && exprMentionsColumnName(f.Predicate, "oid") {
+		t.Errorf("oid qual still sits above the lateral join: %v", f.Predicate)
+	}
+	if p, ok := plan.(*Project); ok {
+		if f, ok := p.Child.(*Filter); ok && exprMentionsColumnName(f.Predicate, "oid") {
+			t.Errorf("oid qual still sits above the lateral join (under Project): %v", f.Predicate)
+		}
 	}
 }
 

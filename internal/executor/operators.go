@@ -88,14 +88,19 @@ func (o *valuesOp) Open(ctx *Context) error {
 		// lister when available rather than the static empty VirtualRows.
 		if tbl.Name == "pg_prepared_statements" && ctx != nil && ctx.PrepStmtsRows != nil {
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.PrepStmtsRows())
+		} else if tbl.Name == "pg_extension" && ctx != nil && ctx.ExtensionRows != nil {
+			// pg_extension is per-database: use the per-connection,
+			// database-scoped lister so an extension installed in one database
+			// is invisible in another. M0110-0003 (AC-002 gap #7c).
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.ExtensionRows())
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}
 	}
 	return nil
 }
-func (o *valuesOp) Schema() planner.Schema  { return o.schema }
-func (o *valuesOp) Close() error            { return nil }
+func (o *valuesOp) Schema() planner.Schema { return o.schema }
+func (o *valuesOp) Close() error           { return nil }
 
 func (o *valuesOp) Next() (TupleSlot, error) {
 	if o.idx >= len(o.rows) {
@@ -254,18 +259,18 @@ func (o *filterOp) Next() (TupleSlot, error) {
 // the last emitted row). tieKeyExprs are the ORDER BY key expressions evaluated
 // against each row via evalExpr.
 type limitOp struct {
-	child        Operator
-	limitExpr    planner.Expr
-	offsetExpr   planner.Expr
-	limitCount   int64 // -1 for no limit
-	offsetCount  int64
-	emitted      int64
-	skipped      int64
-	withTies     bool
-	tieKeyExprs  []planner.Expr
-	tieKeyVals   Row // key values of last emitted row (set when emitted==limitCount)
-	inTiesPhase  bool
-	ctx          *Context
+	child       Operator
+	limitExpr   planner.Expr
+	offsetExpr  planner.Expr
+	limitCount  int64 // -1 for no limit
+	offsetCount int64
+	emitted     int64
+	skipped     int64
+	withTies    bool
+	tieKeyExprs []planner.Expr
+	tieKeyVals  Row // key values of last emitted row (set when emitted==limitCount)
+	inTiesPhase bool
+	ctx         *Context
 }
 
 func newLimitOp(plan *planner.Limit, child Operator) *limitOp {

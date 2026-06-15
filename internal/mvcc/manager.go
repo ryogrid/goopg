@@ -675,6 +675,71 @@ func (m *Manager) HasAbortedXID(xid storage.TransactionID) bool {
 	return idx < n && m.abortedXIDs[idx] == xid
 }
 
+// XidVisibilityStatus is the coarse, snapshot-independent commit classification
+// of a transaction id. It mirrors the in-range cases of upstream's
+// get_xid_status (verify_heapam.c) and exists for callers — chiefly amcheck's
+// verify_heapam HOT-chain checks — that need to know whether a past xid
+// committed, aborted, or is still running, rather than whether it is visible
+// under one snapshot. The current-backend's-own-xid case (upstream
+// XID_IS_CURRENT_XID) is the caller's to detect, because the Manager classifies
+// it as in-progress (it is in the proc array) and only the caller knows its own
+// XID.
+type XidVisibilityStatus int
+
+const (
+	// XidVisUnknown means the xid is out of the cluster's valid range
+	// (invalid, or not yet assigned) and so undeterminable, matching upstream's
+	// xmin_commit_status_ok == false.
+	XidVisUnknown XidVisibilityStatus = iota
+	// XidVisInProgress means a currently-running transaction owns xid.
+	XidVisInProgress
+	// XidVisCommitted means xid is settled and committed.
+	XidVisCommitted
+	// XidVisAborted means xid is settled and aborted (rolled back / crashed).
+	XidVisAborted
+)
+
+// ClassifyXID resolves xid's commit status from the proc array (in-progress),
+// the in-memory aborted set, and the durable CLOG, without reference to any
+// snapshot. It is the seam amcheck's verify_heapam SRF wires to: committed /
+// aborted feed the clog-dependent HOT-chain checks, in-progress gates the
+// in-progress branch, and an out-of-range xid disables those checks for the
+// tuple (mirroring upstream get_xid_status returning xmin_commit_status_ok ==
+// false). A normal xid below NextXID that is neither active nor recorded as
+// aborted is treated as committed, matching snapshot visibility's "settled and
+// not aborted ⇒ committed" assumption (and TransactionIdDidCommit, which yields
+// committed for any in-range xid without an aborted CLOG entry).
+func (m *Manager) ClassifyXID(xid storage.TransactionID) XidVisibilityStatus {
+	if xid == storage.InvalidTransactionID {
+		return XidVisUnknown
+	}
+	// Not yet assigned ⇒ out of the cluster's valid range (upstream's
+	// "xid >= next_xid" bound in get_xid_status).
+	if xid >= m.NextXID() {
+		return XidVisUnknown
+	}
+	if m.xidInProgress(xid) {
+		return XidVisInProgress
+	}
+	// A rolled-back xact may have no durable CLOG entry yet; the in-memory
+	// aborted list is authoritative for this server's lifetime.
+	if m.HasAbortedXID(xid) {
+		return XidVisAborted
+	}
+	m.abortedMu.RLock()
+	clog := m.clog
+	m.abortedMu.RUnlock()
+	if clog != nil {
+		switch clog.GetStatus(xid) {
+		case TxnStatusCommitted:
+			return XidVisCommitted
+		case TxnStatusAborted:
+			return XidVisAborted
+		}
+	}
+	return XidVisCommitted
+}
+
 // XactMarker discriminates the two transaction-end markers fed to
 // the M0008 logical decoder via SetXactMarkerLogger. Mirrors the
 // upstream xact-end records.

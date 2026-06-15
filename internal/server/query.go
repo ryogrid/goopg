@@ -69,6 +69,27 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			return s.handleShowAll(w, sess)
 		}
 		return s.handleShow(w, sess, name)
+	// SET [LOCAL|SESSION] TRANSACTION <mode> and SET SESSION CHARACTERISTICS AS
+	// TRANSACTION <mode> set transaction characteristics (isolation level,
+	// read-only), NOT a GUC. They must be routed through the parser-based
+	// executor (which builds a SetTransactionStmt) before the generic "SET "
+	// case below, otherwise handleSet mis-reads "TRANSACTION" as a GUC name and
+	// fails with `unrecognized configuration parameter "TRANSACTION"`. pg_dump's
+	// setup_connection issues `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ,
+	// READ ONLY`. The "TRANSACTION " trailing space distinguishes this from the
+	// transaction_timeout GUC ("SET TRANSACTION_TIMEOUT ...").
+	case strings.HasPrefix(upper, "SET TRANSACTION "),
+		strings.HasPrefix(upper, "SET LOCAL TRANSACTION "),
+		strings.HasPrefix(upper, "SET SESSION TRANSACTION "),
+		strings.HasPrefix(upper, "SET SESSION CHARACTERISTICS "):
+		if s.cfg.hasStorage() {
+			return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
+		}
+		// No storage backend (bare protocol server): accept as a no-op.
+		if err := w.WriteCommandComplete("SET"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	// SET LOCAL SESSION AUTHORIZATION name — must check before generic "SET LOCAL ".
 	case strings.HasPrefix(upper, "SET LOCAL SESSION AUTHORIZATION "),
 		upper == "SET LOCAL SESSION AUTHORIZATION":

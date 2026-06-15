@@ -886,6 +886,22 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: system catalog load: %w", err)
 	}
+	// M0110-0003: restore user-created schemas (CREATE/DROP SCHEMA) from the
+	// WAL BEFORE loading user tables. goopg has no per-schema on-disk namespace,
+	// so the catalog's schema registry is reconstructed here from the WAL
+	// records (RecordKindCreateSchema/DropSchema). It must run before
+	// loadUserTablesFromHeap / loadUserIndexesFromHeap so those passes can
+	// reverse-map a recovered pg_class.relnamespace OID back to the schema name
+	// (cat.SchemaNameForOID) — otherwise a user-schema table would be reloaded
+	// under the wrong schema. Same WAL-replay mechanism as the database DDL
+	// replay below.
+	if err := replaySchemaDDLRecords(filepath.Join(abs, "pg_wal"), cat); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: schema DDL replay: %w", err)
+	}
+
 	// M0114: try the fast-start catalog cache (pg_goopg_catalog_cache.json).
 	// If the JSON snapshot is present and valid, populate the catalog directly
 	// without scanning pg_class/pg_attribute pages. Falls through to the heap
@@ -1949,6 +1965,13 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 			schema = "pg_catalog"
 		} else if recovered.physical && tr.RelNamespace == catalog.PublicNamespaceOID {
 			schema = "public"
+		} else if name := cat.SchemaNameForOID(tr.RelNamespace); name != "" {
+			// M0110-0003: a user table created in a CREATE SCHEMA namespace
+			// carries that schema's OID in relnamespace (written by
+			// syncTableToCatalogHeap via namespaceOIDForSchema). The schema
+			// registry was restored above (replaySchemaDDLRecords), so reverse-map
+			// the OID back to the schema name to reload the table in its schema.
+			schema = name
 		}
 
 		tbl := &catalog.Table{
@@ -2342,6 +2365,11 @@ func loadUserIndexesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *
 			schema = "pg_catalog"
 		} else if ir.nsp == catalog.PublicNamespaceOID {
 			schema = "public"
+		} else if name := cat.SchemaNameForOID(ir.nsp); name != "" {
+			// M0110-0003: reverse-map a user schema's namespace OID (sibling of
+			// the loadUserTablesFromHeap path) so a user-schema index reloads in
+			// its schema.
+			schema = name
 		}
 		cat.RegisterIndexDuringRecovery(schema, ir.name, pgIdx.indRelid, colNames, pgIdx.isUnique, "btree", pgIdx.isPrimary, ir.oid)
 	}

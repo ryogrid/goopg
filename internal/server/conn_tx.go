@@ -38,10 +38,10 @@ import (
 // Subsequent FETCHes advance/retreat Pos without re-running the query.
 // Pos is the *next* row index for a forward fetch; ranges [0, len(Rows)].
 type cursorEntry struct {
-	SQL         string          // raw SQL containing the DECLARE … FOR <select>
-	Rows        []executor.Row  // all result rows, nil until Materialized
-	Schema      planner.Schema  // output schema from the first execution
-	Pos         int             // current position: 0 = before first row, len(Rows) = past last
+	SQL          string         // raw SQL containing the DECLARE … FOR <select>
+	Rows         []executor.Row // all result rows, nil until Materialized
+	Schema       planner.Schema // output schema from the first execution
+	Pos          int            // current position: 0 = before first row, len(Rows) = past last
 	Materialized bool
 }
 
@@ -61,6 +61,10 @@ type connTxState struct {
 	// Assigned once at connection start in serveConn; used to pass an
 	// explicit procNum to Manager.Begin on every statement.
 	ProcNum int32
+	// DBName is the database this connection is bound to (from the startup
+	// packet). Assigned once at connection start; used to scope per-database
+	// catalogs such as pg_extension. M0110-0003 (AC-002 gap #7c).
+	DBName string
 	// TempTableShadows maps table name → original permanent *catalog.Table.
 	// Populated when CREATE TEMP TABLE shadows a permanent table. M0097-0003.
 	TempTableShadows map[string]*catalog.Table

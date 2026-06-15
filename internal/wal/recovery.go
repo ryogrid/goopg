@@ -413,6 +413,25 @@ const (
 	// recovery driver in internal/initdb replays it against the CLog.
 	RecordKindClogTruncate byte = 33
 
+	// RecordKindCreateSchema records a `CREATE SCHEMA <name>` event so the
+	// catalog's in-memory schema registry (which backs pg_namespace lookups
+	// and schema-qualified relation resolution) survives a restart. goopg's
+	// CREATE SCHEMA is a catalog-only side effect with no per-schema on-disk
+	// file namespace, so the physical redo path is a no-op (applyRecord
+	// returns (false, nil)); the recovery driver in internal/initdb scans the
+	// WAL for these records after physical replay and re-registers each schema
+	// with its original OID. Mirrors RecordKindCreateDatabase (M0054-0001).
+	// Format:
+	//   kind(1) | oid(4) | nameLen(2) | name(nameLen bytes)
+	RecordKindCreateSchema byte = 34
+
+	// RecordKindDropSchema records a `DROP SCHEMA <name>` event. Counterpart
+	// to RecordKindCreateSchema; the recovery driver removes the name from the
+	// catalog instead of adding it. The OID is not needed on drop.
+	// Format:
+	//   kind(1) | nameLen(2) | name(nameLen bytes)
+	RecordKindDropSchema byte = 35
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -530,6 +549,66 @@ func DecodeDropDatabase(payload []byte) (name string, err error) {
 	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
 	if len(payload) < 3+nameLen {
 		return "", fmt.Errorf("wal: drop-database payload truncated (need %d bytes)", 3+nameLen)
+	}
+	return string(payload[3 : 3+nameLen]), nil
+}
+
+// EncodeCreateSchema encodes a CREATE SCHEMA event (M0110-0003 schema
+// durability). The OID is carried so recovery re-registers the schema with
+// the same identifier the live server assigned.
+// Format: kind(1) | oid(4) | nameLen(2) | name(nameLen bytes).
+func EncodeCreateSchema(name string, oid uint32) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 7+len(name))
+	out[0] = RecordKindCreateSchema
+	binary.LittleEndian.PutUint32(out[1:5], oid)
+	binary.LittleEndian.PutUint16(out[5:7], uint16(len(name)))
+	copy(out[7:], name)
+	return out
+}
+
+// DecodeCreateSchema decodes a RecordKindCreateSchema payload.
+func DecodeCreateSchema(payload []byte) (name string, oid uint32, err error) {
+	if len(payload) < 7 {
+		return "", 0, fmt.Errorf("wal: create-schema payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindCreateSchema {
+		return "", 0, fmt.Errorf("wal: record kind %d is not create-schema", payload[0])
+	}
+	oid = binary.LittleEndian.Uint32(payload[1:5])
+	nameLen := int(binary.LittleEndian.Uint16(payload[5:7]))
+	if len(payload) < 7+nameLen {
+		return "", 0, fmt.Errorf("wal: create-schema payload truncated (need %d bytes)", 7+nameLen)
+	}
+	return string(payload[7 : 7+nameLen]), oid, nil
+}
+
+// EncodeDropSchema encodes a DROP SCHEMA event (M0110-0003 schema durability).
+// Format: kind(1) | nameLen(2) | name(nameLen bytes).
+func EncodeDropSchema(name string) []byte {
+	if len(name) > 0xFFFF {
+		name = name[:0xFFFF]
+	}
+	out := make([]byte, 3+len(name))
+	out[0] = RecordKindDropSchema
+	binary.LittleEndian.PutUint16(out[1:3], uint16(len(name)))
+	copy(out[3:], name)
+	return out
+}
+
+// DecodeDropSchema decodes a RecordKindDropSchema payload.
+func DecodeDropSchema(payload []byte) (name string, err error) {
+	if len(payload) < 3 {
+		return "", fmt.Errorf("wal: drop-schema payload too short (%d bytes)", len(payload))
+	}
+	if payload[0] != RecordKindDropSchema {
+		return "", fmt.Errorf("wal: record kind %d is not drop-schema", payload[0])
+	}
+	nameLen := int(binary.LittleEndian.Uint16(payload[1:3]))
+	if len(payload) < 3+nameLen {
+		return "", fmt.Errorf("wal: drop-schema payload truncated (need %d bytes)", 3+nameLen)
 	}
 	return string(payload[3 : 3+nameLen]), nil
 }
@@ -2255,6 +2334,14 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// physical replay and re-applies them to the catalog's database
 		// list.
 		return false, nil
+	case RecordKindCreateSchema, RecordKindDropSchema:
+		// CREATE/DROP SCHEMA records (M0110-0003) carry only the schema
+		// name (+ OID for create); goopg has no per-schema file namespace,
+		// so the physical replay path has nothing to do. The recovery
+		// driver in internal/initdb/schema_ddl_recovery.go scans the WAL
+		// for these records after physical replay and re-applies them to
+		// the catalog's schema registry.
+		return false, nil
 	case RecordKindCreateIndex, RecordKindDropIndex:
 		// CREATE/DROP INDEX records (M0079-0001) carry the catalog
 		// metadata that goopg's heap representation cannot fully
@@ -2331,6 +2418,8 @@ func nativeApplyRecordKindKnown(kind byte) bool {
 		RecordKindClogTruncate,
 		RecordKindCreateDatabase,
 		RecordKindDropDatabase,
+		RecordKindCreateSchema,
+		RecordKindDropSchema,
 		RecordKindCreateIndex,
 		RecordKindDropIndex,
 		RecordKindXactAssignment,

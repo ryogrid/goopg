@@ -2,6 +2,7 @@ package mvcc
 
 import (
 	"errors"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -474,5 +475,99 @@ func TestXactMarkerLoggerErrorAbortsCommit(t *testing.T) {
 	// Txn must still be in-progress (not removed from active set).
 	if got := m.ActiveCount(); got != 1 {
 		t.Errorf("ActiveCount=%d want 1 (commit failed, tx still in-progress)", got)
+	}
+}
+
+// TestClassifyXID covers the snapshot-independent commit classifier amcheck's
+// verify_heapam SRF consults (M0110-0003 S5). It asserts the four in-range
+// cases plus the out-of-range / invalid sentinels, and that a CLOG-recorded
+// abort with no in-memory aborted-set entry still classifies as aborted.
+func TestClassifyXID(t *testing.T) {
+	m := NewManager()
+
+	// Committed top-level xact: settled, below NextXID, not aborted ⇒ committed.
+	txC, err := m.Begin(IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xidC, err := m.AssignXID(txC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txC.XID = xidC
+	if err := m.Commit(txC); err != nil {
+		t.Fatal(err)
+	}
+
+	// Aborted top-level xact: recorded in the in-memory aborted set.
+	txA, err := m.Begin(IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xidA, err := m.AssignXID(txA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txA.XID = xidA
+	if err := m.Rollback(txA); err != nil {
+		t.Fatal(err)
+	}
+
+	// In-progress xact: still in the proc array.
+	txI, err := m.Begin(IsolationReadCommitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xidI, err := m.AssignXID(txI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txI.XID = xidI
+
+	cases := []struct {
+		name string
+		xid  storage.TransactionID
+		want XidVisibilityStatus
+	}{
+		{"committed", xidC, XidVisCommitted},
+		{"aborted", xidA, XidVisAborted},
+		{"in-progress", xidI, XidVisInProgress},
+		{"future/unassigned", m.NextXID() + 5, XidVisUnknown},
+		{"invalid", storage.InvalidTransactionID, XidVisUnknown},
+	}
+	for _, tc := range cases {
+		if got := m.ClassifyXID(tc.xid); got != tc.want {
+			t.Errorf("ClassifyXID(%s xid=%d) = %v, want %v", tc.name, tc.xid, got, tc.want)
+		}
+	}
+}
+
+// TestClassifyXID_ClogAbortedFallback proves the CLOG path: an xid the in-memory
+// aborted set has forgotten (e.g. a recovered abort) but the durable CLOG marks
+// aborted still classifies as aborted, not the committed fallback.
+func TestClassifyXID_ClogAbortedFallback(t *testing.T) {
+	m := NewManager()
+	m.SetNextXID(1000) // advance the range so xid 50 is "in-range" (below NextXID)
+
+	clog, err := OpenCLog(filepath.Join(t.TempDir(), "pg_xact"))
+	if err != nil {
+		t.Fatalf("OpenCLog: %v", err)
+	}
+	m.SetCLog(clog)
+
+	const recoveredAbort = storage.TransactionID(50)
+	if err := clog.SetAborted(recoveredAbort); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.ClassifyXID(recoveredAbort); got != XidVisAborted {
+		t.Errorf("ClassifyXID(clog-aborted xid=%d) = %v, want XidVisAborted", recoveredAbort, got)
+	}
+
+	const recoveredCommit = storage.TransactionID(60)
+	if err := clog.SetCommitted(recoveredCommit); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.ClassifyXID(recoveredCommit); got != XidVisCommitted {
+		t.Errorf("ClassifyXID(clog-committed xid=%d) = %v, want XidVisCommitted", recoveredCommit, got)
 	}
 }

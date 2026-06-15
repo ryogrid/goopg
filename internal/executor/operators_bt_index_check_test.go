@@ -11,6 +11,7 @@ package executor
 
 import (
 	"encoding/binary"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/access/btree"
@@ -61,6 +62,33 @@ func TestBtIndexCheck_CleanIndexNoError(t *testing.T) {
 	}
 }
 
+// TestBtIndexCheck_SchemaQualifiedDispatch is the M0110-0003 AC-003 blocker #2
+// regression: pg_amcheck qualifies the amcheck scalar builtins with the
+// extension's install schema (e.g. `"public".bt_index_check(...)`), not
+// pg_catalog. evalFuncCall must strip that user-schema qualifier and still
+// dispatch the builtin — otherwise any table with a dependent index 42883s
+// ("function public.bt_index_check does not exist"). Mirrors the FROM-clause
+// SRF schema-strip for verify_heapam.
+func TestBtIndexCheck_SchemaQualifiedDispatch(t *testing.T) {
+	ctx, cleanup := btIndexCheckSetup(t)
+	defer cleanup()
+
+	for _, sql := range []string{
+		`SELECT public.bt_index_check('bic_a_idx')`,
+		`SELECT "public".bt_index_check('bic_a_idx', false)`,
+		`SELECT public.bt_index_parent_check('bic_a_idx')`,
+		`SELECT "public".bt_index_parent_check('bic_a_idx', false, false, false)`,
+		// The exact named-argument shape pg_amcheck emits (schema-qualified by
+		// the amcheck install schema, `:=` legacy named-arg spelling).
+		`SELECT public.bt_index_check(index := 'bic_a_idx', heapallindexed := false)`,
+		`SELECT "public".bt_index_parent_check(index := 'bic_a_idx', heapallindexed := false, rootdescend := false)`,
+	} {
+		if _, err := runQueryWithErr(ctx, sql); err != nil {
+			t.Errorf("%s: schema-qualified clean index raised: %v", sql, err)
+		}
+	}
+}
+
 // TestBtIndexCheck_DetectsCorruptMetapage clobbers the metapage magic and
 // confirms both functions raise (ERRCODE_INDEX_CORRUPTED) — the engine's
 // "meta page is corrupt" finding propagated through the SQL surface as an error.
@@ -106,5 +134,48 @@ func TestBtIndexCheck_NonexistentIndex(t *testing.T) {
 
 	if _, err := runQueryWithErr(ctx, "SELECT bt_index_check('no_such_index')"); err == nil {
 		t.Fatal("nonexistent index did not raise")
+	}
+}
+
+// TestBtIndexCheck_DetectsMissingRelationFork is the M0110-0003 file-removal
+// corruption tier: it mirrors upstream bt_index_check_callback's
+// smgrexists(MAIN_FORKNUM) guard (verify_nbtree.c:318) and pg_amcheck
+// 003_check.pl's "reports missing main relation fork" assertion. An index whose
+// backing file has been removed on disk must raise ERRCODE_INDEX_CORRUPTED with
+// the verbatim "lacks a main relation fork" message — it must NOT be silently
+// recreated as an empty (and therefore falsely "clean") index by NBlocks'
+// O_CREATE open. Covers both bt_index_check and bt_index_parent_check.
+func TestBtIndexCheck_DetectsMissingRelationFork(t *testing.T) {
+	ctx, cleanup := btIndexCheckSetup(t)
+	defer cleanup()
+
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("expected in-memory catalog")
+	}
+	idx, ok := im.LookupIndex(parser.ObjectName{Name: "bic_a_idx"})
+	if !ok {
+		t.Fatal("index bic_a_idx not found")
+	}
+	rel := ctx.Catalog.IndexRelFileNode(idx)
+
+	// Remove the index's backing fork file out from under the engine, mimicking
+	// the on-disk file removal pg_amcheck's 003_check performs while stopped.
+	if err := ctx.Pool.Manager().DropRelation(rel); err != nil {
+		t.Fatalf("drop index fork: %v", err)
+	}
+
+	for _, sql := range []string{
+		"SELECT bt_index_check('bic_a_idx')",
+		"SELECT bt_index_parent_check('bic_a_idx')",
+	} {
+		_, err := runQueryWithErr(ctx, sql)
+		if err == nil {
+			t.Errorf("%s: missing relation fork not detected", sql)
+			continue
+		}
+		if !strings.Contains(err.Error(), "lacks a main relation fork") {
+			t.Errorf("%s: got %q, want substring %q", sql, err.Error(), "lacks a main relation fork")
+		}
 	}
 }

@@ -149,6 +149,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				norm := normalizeCompatSQL(sql)
 				if schemaName := schemaNameFromCreate(norm); schemaName != "" {
 					s.cfg.Catalog.RegisterSchema(schemaName)
+					// M0110-0003: persist so the schema survives a restart.
+					// This branch handles CREATE SCHEMA forms the parser
+					// rejects; the parsed CompatNoopStmt path emits the same
+					// record from execCompatNoop.
+					if s.cfg.WAL != nil {
+						if im, ok := s.cfg.Catalog.(*catalog.InMemory); ok {
+							oid := im.SchemaOID(schemaName)
+							if _, _, werr := s.cfg.WAL.Append(wal.EncodeCreateSchema(schemaName, oid)); werr != nil {
+								return s.writeQueryError(w, sqlstate.SystemError, werr.Error())
+							}
+						}
+					}
 				}
 			}
 			if err := w.WriteCommandComplete(tag); err != nil {
@@ -339,6 +351,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	// Wire pg_prepared_statements session rows into the executor context.
 	if prepStmts != nil {
 		ectx.PrepStmtsRows = prepStmts.ListRows
+	}
+
+	// Wire the per-database pg_extension view (M0110-0003 gap #7c): goopg shares
+	// one in-memory catalog across all databases, so pg_extension is scoped to
+	// the connecting database here. Mirrors the extended-query path in
+	// executeExtendedQueryViaExecutor.
+	if connTx != nil {
+		s.wireExtensionRows(ectx, connTx.DBName)
 	}
 
 	// Update pg_stat_activity before dispatching.
@@ -1301,6 +1321,23 @@ func coerceExecParam(d executor.Datum, targetType string) executor.Datum {
 // state so BEGIN/COMMIT/ROLLBACK can open/close real TxnMgr transactions.
 // undoEnumDDLForRollback reverses enum DDL (ADD VALUE, RENAME TO, CREATE TYPE AS ENUM)
 // recorded in connTx.  Must be called before connTx.End() on ROLLBACK paths.  M0097-0022.
+// extensionLister is implemented by catalogs that can scope pg_extension rows
+// to a single database (catalog.InMemory). M0110-0003 (AC-002 gap #7c).
+type extensionLister interface {
+	ExtensionRowsForDB(db string) [][]string
+}
+
+// wireExtensionRows installs the per-database pg_extension view on ectx so an
+// extension installed in one database is invisible in another (PostgreSQL's
+// pg_extension is per-database; goopg shares one in-memory catalog). Used by
+// both the simple- and extended-query executor paths. M0110-0003 (gap #7c).
+func (s *Server) wireExtensionRows(ectx *executor.Context, dbName string) {
+	ectx.CurrentDatabase = dbName
+	if el, ok := s.cfg.Catalog.(extensionLister); ok {
+		ectx.ExtensionRows = func() [][]string { return el.ExtensionRowsForDB(dbName) }
+	}
+}
+
 func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
 	if connTx == nil {
 		return
@@ -1820,6 +1857,10 @@ func ddlTag(stmt parser.Stmt) string {
 		return "DROP DOMAIN"
 	case *parser.CreateExtensionStmt:
 		return "CREATE EXTENSION"
+	case *parser.CreateTablespaceStmt:
+		return "CREATE TABLESPACE"
+	case *parser.DropTablespaceStmt:
+		return "DROP TABLESPACE"
 	}
 	// CompatNoopStmt carries its own tag. M0097-0016.
 	if ns, ok := stmt.(*parser.CompatNoopStmt); ok && ns.Tag != "" {

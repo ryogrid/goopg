@@ -240,6 +240,9 @@
 #statement_timeout = 0                  # 0-2147483647 ms; 0 disables
 #lock_timeout = 0                       # 0-2147483647 ms; 0 disables
 #idle_in_transaction_session_timeout = 0  # 0-2147483647 ms; 0 disables
+#transaction_timeout = 0                 # 0-2147483647 ms; 0 disables
+#synchronize_seqscans = on              # accepted; goopg has no synchronized scans
+#row_security = on                      # accepted; goopg has no row-level security
 #client_min_messages = 'notice'         # debug5..debug1 | log | notice |
                                         # warning | error
 #default_transaction_isolation = 'read committed'
@@ -283,6 +286,16 @@
                                         # (SIGHUP to apply)
 #max_prepared_transactions = 0          # 0-262143; zero disables 2PC
                                         # (change requires restart)
+
+
+#------------------------------------------------------------------------------
+# DEVELOPER OPTIONS
+#------------------------------------------------------------------------------
+
+#allow_in_place_tablespaces = off       # developer-only: permits
+                                        # CREATE TABLESPACE ... LOCATION ''
+                                        # to create a tablespace directly
+                                        # inside pg_tblspc (for testing)
 
 
 #------------------------------------------------------------------------------

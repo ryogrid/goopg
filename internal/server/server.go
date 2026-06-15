@@ -706,6 +706,37 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
+	// M0110-0003 (AC-002 gap #7b): reject a connection whose role does not exist,
+	// mirroring PG's InitializeSessionUserId FATAL 28000 `role "%s" does not
+	// exist` (utils/init/miscinit.c). goopg's in-memory role set (seeded with
+	// `postgres`, maintained by CREATE/DROP ROLE) together with any UserStore
+	// (pg_auth) account form the runtime authority for which roles exist. The
+	// trust auth method never consults either store, so without this an unknown
+	// role would connect and the backend would exit 0 — pg_amcheck's
+	// `--username no_such_user` probe expects the connection to fail. The
+	// password/SCRAM paths already reject unknown users inside checkAuth; this
+	// closes the trust-auth hole and matches PG, which checks the role after
+	// authentication regardless of method. Gated on a real catalog registry
+	// (exactly like the database check below) so bare wire-protocol unit tests,
+	// which connect as arbitrary trust-auth users against a catalog-less Server,
+	// keep their prior behaviour.
+	if user != "" && !isReplication {
+		if _, isRegistry := s.cfg.Catalog.(databaseRegistry); isRegistry {
+			known := s.roleExists(user)
+			if !known && s.cfg.UserStore != nil {
+				if _, ok := s.cfg.UserStore.Lookup(user); ok {
+					known = true
+				}
+			}
+			if !known {
+				s.writeFatal(w, sqlstate.InvalidAuthorizationSpecification,
+					fmt.Sprintf("role %q does not exist", user))
+				logger.Info("connection rejected: unknown role", "role", user)
+				return
+			}
+		}
+	}
+
 	// M0110-0003 (AC-002 gap #3): reject a connection to a database that does
 	// not exist, mirroring PG's InitPostgres post-authentication 3D000
 	// `database "%s" does not exist`. goopg's in-memory database registry is the
@@ -833,7 +864,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app, sessCtx, pid)
+	s.runPostStartupLoop(connCtx, cancelEntry, r, w, sess, logger, isReplication, app, params["database"], sessCtx, pid)
 }
 
 // isReplicationStartupParam interprets the StartupMessage `replication`
@@ -1041,14 +1072,15 @@ func (s *Server) rollbackOpenTxnOnTeardown(connTx *connTxState, logger *slog.Log
 	}
 }
 
-func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName string, sessCtx *mctx.Context, pid uint32) {
+func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mctx.Context, pid uint32) {
 	extended := newExtendedState()
 	// Assign a ProcArray slot for this backend (M0107-0004). The slot is
 	// reused across all transactions on this connection; Begin clears and
 	// re-initialises it on each new transaction.
 	procNum := int32((pid - 1) % uint32(mvcc.DefaultProcArraySize))
-	extended.ProcNum = procNum                                 // thread through to executeExtendedQueryViaExecutor
-	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum} // per-connection explicit transaction state (M0096-0005)
+	extended.ProcNum = procNum                                                 // thread through to executeExtendedQueryViaExecutor
+	extended.DBName = dbName                                                   // scopes pg_extension per database (M0110-0003 gap #7c)
+	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum, DBName: dbName} // per-connection explicit transaction state (M0096-0005); DBName scopes pg_extension (M0110-0003 gap #7c)
 	// On connection teardown (client disconnect, EOF, read error, admin
 	// shutdown — every `return` from the loop below), roll back any still-open
 	// explicit transaction so its XID is released from the ProcArray and any

@@ -203,7 +203,8 @@ func TestUserPGClassRowFixedFieldsOID(t *testing.T) {
 			{Name: "src", Type: catalog.Type{Name: "text"}, NotNull: true, Ordinal: 1},
 		},
 	}
-	row := buildUserPGClassRow(tbl)
+	// public resolves to its fixed OID without a catalog.
+	row := buildUserPGClassRow(nil, tbl)
 	cols := pgClassColumnsPG18()
 	if len(row) != len(cols) {
 		t.Fatalf("row len=%d, schema len=%d", len(row), len(cols))
@@ -225,7 +226,6 @@ func TestUserPGClassRowFixedFieldsOID(t *testing.T) {
 		t.Errorf("relname[9] = %d, want 0 (NUL padding)", name[9])
 	}
 }
-
 
 // TestSyncTableStampsHeapHasVarWidthOnPGClassRow pins M0106-0010 batched-49:
 // the pg_class row written by `syncTableToCatalogHeap` for a user CREATE
@@ -329,7 +329,6 @@ func TestPgRowHasVarWidthDetectsVarlenaCols(t *testing.T) {
 		t.Errorf("pgRowHasVarWidth(varCols, nullVarRow) = true, want false (null varlena does not stamp HEAP_HASVARWIDTH)")
 	}
 }
-
 
 // TestBuildUserPGAttributeRowEncodesTypCollation pins that runtime DDL emits
 // PG18-canonical attcollation values: DEFAULT_COLLATION_OID (100) for

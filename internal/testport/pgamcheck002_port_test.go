@@ -64,13 +64,59 @@ package testport
 // pg_catalog-qualified SRF name; it now discards a user-schema qualifier and
 // dispatches builtins by their bare lowercased name.
 //
-// REMAINING blocker is now #6: pg_amcheck's per-relation heap check is an
-// implicit-LATERAL comma-join whose SRF argument list references the sibling
+// UPDATE (M0110-0003, gap #6): FIXED — pg_amcheck's per-relation heap check is
+// an implicit-LATERAL comma-join whose SRF argument list references the sibling
 // relation (`FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …)`).
-// The query parses and reaches the executor, but the correlated `c.oid` inside
-// the SRF's arguments does not resolve, so verify_heapam errors with
-// `column "oid" does not exist`. The preflight below probes for it directly so
-// the test self-skips on #6 rather than failing.
+// The planner now resolves the correlated `c.oid` against the sibling range-table
+// entry (planVerifyHeapam threads lateralCtx) and the executor drives the SRF
+// per outer row through the Join.Lateral driver — verifyHeapamOp implements
+// lateralBindable, and the BuildFast/OpNode execution path (the server's
+// simple-protocol path) now forwards BindLateralOuter through opNodeOperator.
+//
+// UPDATE (M0110-0003, gap #7b): FIXED — a connection whose role does not exist
+// is now rejected after authentication with FATAL 28000 `role "%s" does not
+// exist`, mirroring PG's InitializeSessionUserId. goopg's in-memory role set
+// (seeded `postgres`, maintained by CREATE/DROP ROLE) plus any UserStore
+// account is the runtime authority; the trust-auth handshake path consults it
+// (the password/SCRAM paths already rejected unknown users). pg_amcheck's
+// `--username no_such_user` probe now fails the connection as upstream expects.
+//
+// UPDATE (M0110-0003, gap #7a): FIXED — pg_amcheck resolves each --database arg
+// as a connectable-name *pattern* and now errors `no connectable databases to
+// check matching "<pat>"` for an unresolvable name. The bug was goopg mis-
+// evaluating `COUNT(*) FILTER (WHERE d IS NOT NULL)` over an outer-joined whole-
+// row reference `d`: a constructed RowExpr is never itself a NULL Datum, so
+// `d IS NOT NULL` was wrongly true for an outer-join non-match. The executor now
+// applies SQL/PG row null semantics to a RowExpr operand of IS [NOT] NULL
+// (evalRowNullTest), so an unmatched inclusion pattern's checkable count is 0.
+//
+// UPDATE (M0110-0003, gap #7c): FIXED — per-database amcheck-installed detection
+// (`skipping database "template1": amcheck is not installed`). goopg shares one
+// in-memory catalog across databases, so pg_extension is now scoped to the
+// connecting database: CREATE EXTENSION records the database it ran in, and the
+// executor swaps in a database-scoped pg_extension view (Context.ExtensionRows →
+// catalog.ExtensionRowsForDB). amcheck installed in `postgres` is therefore
+// invisible in template1/template0, so pg_amcheck's per-database probe returns 0
+// rows there and emits the skip warning. With #7c closed this is the LAST gap
+// for 002_nonesuch: the full command_checks_all assertion set now runs and the
+// test is pass-required (CSV row AC-002 → port). All gaps #6/#7a/#7b/#7c above
+// are asserted as regression guards; no self-skip remains.
+//
+// UPDATE (M0110-0003, coverage extension): the port now also covers
+// 002_nonesuch.pl's later sections — the big `--no-strict-names` multi-pattern
+// case (per-argument-kind warnings: "no heap tables"/"no btree indexes"/"no
+// relations"/"no connectable databases" matching, with the one existent
+// `postgres.pg_catalog.pg_class` anchor keeping exit 0) and the cross-database
+// "existent objects in the wrong databases" case (objects that exist in
+// `postgres` but are referenced under template1/another_db/no_such_database).
+// The port now also covers 002_nonesuch.pl's final `--exclude-schema` sections
+// (.pl :377-418): both `--all --exclude-schema …` cases — whose exclude-CTE
+// anti-join previously PANICKED the backend with a build-side column-index
+// out-of-range — run to completion (exit 1, `no relations to check`) after the
+// LEFT JOIN inner-only pushdown shift/classify fix (commit 36a085dc,
+// M0110-0003 residual #2). One .pl section remains DEFERRED, documented inline
+// at its call site: the `datconnlimit = -2` invalid-database filter (needs a
+// runtime pg_database shared-catalog write goopg lacks).
 //
 // Like 001_basic, the bundled pg_amcheck links a PG-17+ libpq symbol
 // (PQcancelBlocking), so it is run with LD_LIBRARY_PATH pointed at
@@ -193,26 +239,77 @@ func TestPort_PgAmcheck002Nonesuch(t *testing.T) {
 			"template1/template0 are not registered in pg_database. stderr=%q", db.Stderr)
 	}
 
-	// Probe for remaining gap #6 (M0110-0003): pg_amcheck builds its
-	// per-relation heap check as
+	// Gap #6 (M0110-0003) is now FIXED: pg_amcheck builds its per-relation heap
+	// check as the implicit-LATERAL comma-join
 	//   ... FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …) v
-	// i.e. an implicit-LATERAL comma-join where the SRF's first argument is the
-	// correlated reference `c.oid`. The schema-qualified-SRF parser gap (#5) is
-	// now FIXED, so the query parses and reaches the planner/executor — but the
-	// correlated `c.oid` inside the SRF's argument list does not resolve against
-	// the sibling `pg_class c` range-table entry, so verify_heapam errors with
-	// `column "oid" does not exist`. That surfaces in pg_amcheck's per-relation
-	// stdout (`heap table "…": ERROR: column "oid" does not exist`) and also
-	// affects the assertions below. Self-skip with the precise blocker; the day
-	// LATERAL correlation into a FROM-clause SRF's arguments resolves, this
-	// clears and the full assertion set runs unchanged.
+	// where the SRF's first argument is the correlated reference `c.oid`. The
+	// planner now resolves that arg against the sibling `pg_class c` range-table
+	// entry (planVerifyHeapam threads lateralCtx) and the executor drives the SRF
+	// per outer row via the Join.Lateral per-outer-row driver (verifyHeapamOp
+	// implements lateralBindable; the BuildFast/OpNode path's opNodeOperator now
+	// forwards BindLateralOuter). Assert the prior failure signatures are gone so
+	// a regression re-surfaces here rather than silently downstream.
 	heap := runAmcheck(t, c, "postgres")
-	if strings.Contains(heap.Stdout, `column "oid" does not exist`) {
-		t.Skipf("AC-002 blocked on remaining gap #6: a FROM-clause SRF's "+
-			"argument list does not resolve the implicit-LATERAL correlated "+
-			"reference `c.oid` against the sibling comma-join relation "+
-			"(`FROM pg_catalog.pg_class c, \"public\".verify_heapam(relation := c.oid, …)`); "+
-			"verify_heapam errors with `column \"oid\" does not exist`. stdout=%q", heap.Stdout)
+	if strings.Contains(heap.Stdout, `column "oid" does not exist`) ||
+		strings.Contains(heap.Stdout, "on nil slot") {
+		t.Fatalf("AC-002 gap #6 regressed: verify_heapam's correlated LATERAL "+
+			"argument `c.oid` no longer resolves through the comma-join. stdout=%q", heap.Stdout)
+	}
+
+	// Gap #7b (M0110-0003) is now FIXED: a connection whose role does not exist
+	// is rejected after authentication with FATAL 28000 `role "%s" does not
+	// exist`, mirroring PG's InitializeSessionUserId (utils/init/miscinit.c).
+	// goopg's in-memory role set (seeded with `postgres`, maintained by
+	// CREATE/DROP ROLE) together with any UserStore (pg_auth) account is the
+	// runtime authority for which roles exist; the trust-auth handshake path now
+	// consults it instead of accepting any role. Assert the prior "accepts any
+	// role / exits 0" behaviour is gone so a regression re-surfaces here rather
+	// than silently downstream.
+	roleProbe := runAmcheck(t, c, "--username", "no_such_user", "postgres")
+	if roleProbe.ExitCode == 0 ||
+		!strings.Contains(roleProbe.Stderr, `role "no_such_user" does not exist`) {
+		t.Fatalf("AC-002 gap #7b regressed: a connection as a non-existent role "+
+			"must fail with `role \"no_such_user\" does not exist`; got exit=%d stderr=%q",
+			roleProbe.ExitCode, roleProbe.Stderr)
+	}
+
+	// Gap #7a (M0110-0003) is now FIXED: pg_amcheck resolves each --database
+	// argument as a connectable-name *pattern* and errors `no connectable
+	// databases to check matching "<pat>"` for a name that resolves to nothing.
+	// The root cause was goopg's database-resolution bootstrap query mis-
+	// evaluating `COUNT(*) FILTER (WHERE d IS NOT NULL)` where `d` is a whole-row
+	// reference to an outer-joined CTE: a constructed RowExpr is never itself a
+	// NULL Datum, so `d IS NOT NULL` was wrongly true even for an outer-join
+	// non-match (all fields null), making every inclusion pattern appear
+	// checkable. The executor now applies SQL/PG row null semantics to a RowExpr
+	// operand of IS [NOT] NULL (evalRowNullTest: IS NOT NULL true iff EVERY field
+	// is non-null), so an unmatched pattern's include_pat.checkable becomes 0 and
+	// pg_amcheck emits the no-match error. Assert the prior "silently accepts the
+	// pattern / exits 0" behaviour is gone so a regression re-surfaces here.
+	patProbe := runAmcheck(t, c, "--database", "qqq", "--database", "postgres")
+	if patProbe.ExitCode == 0 ||
+		!strings.Contains(patProbe.Stderr, `no connectable databases to check matching "qqq"`) {
+		t.Fatalf("AC-002 gap #7a regressed: an unresolvable --database pattern must "+
+			"fail with `no connectable databases to check matching \"qqq\"`; got "+
+			"exit=%d stderr=%q", patProbe.ExitCode, patProbe.Stderr)
+	}
+
+	// Gap #7c (M0110-0003) is now FIXED: pg_extension is scoped to the connecting
+	// database, so amcheck CREATE EXTENSIONd in `postgres` is invisible to a
+	// connection bound to template1. pg_amcheck runs `amcheck_sql` (a pg_extension
+	// ⋈ pg_namespace lookup of extname='amcheck') in each connectable database;
+	// in template1 it now returns 0 rows and pg_amcheck warns `skipping database
+	// "template1": amcheck is not installed`. goopg shares one in-memory catalog
+	// across databases, so the executor swaps in a database-scoped pg_extension
+	// view (Context.ExtensionRows → catalog.ExtensionRowsForDB(connection
+	// database)); CREATE EXTENSION records the database it ran in. Assert the
+	// warning fires so a regression in the per-database scoping re-surfaces here.
+	instProbe := runAmcheck(t, c, "template1")
+	if !strings.Contains(instProbe.Stderr, `skipping database "template1": amcheck is not installed`) {
+		t.Fatalf("AC-002 gap #7c regressed: amcheck installed only in `postgres` must "+
+			"not appear installed in template1; pg_amcheck must warn `skipping database "+
+			"\"template1\": amcheck is not installed`. got exit=%d stderr=%q",
+			instProbe.ExitCode, instProbe.Stderr)
 	}
 
 	// --- Non-existent databases ------------------------------------------
@@ -307,4 +404,150 @@ func TestPort_PgAmcheck002Nonesuch(t *testing.T) {
 	checkAmcheck(t, c, "ungrammatical exclude-database",
 		[]string{"--no-strict-names", "--exclude-database", "a.b"}, 2,
 		[]string{`pg_amcheck: error: improper qualified name \(too many dotted names\): a\.b`})
+
+	// --- Non-existent databases, schemas, tables, and indexes ------------
+	// Use --no-strict-names and a single existent table (postgres.pg_catalog.pg_class)
+	// so we only get warnings about the failed pattern matches, not an error.
+	// Each unmatched pattern emits a warning categorised by its argument kind:
+	// --table → "no heap tables", --index → "no btree indexes", --relation →
+	// "no relations", and a database part that resolves to nothing →
+	// "no connectable databases".
+	checkAmcheck(t, c, "many unmatched patterns and one matched pattern under --no-strict-names",
+		[]string{
+			"--no-strict-names",
+			"--table", "no_such_table",
+			"--table", "no*such*table",
+			"--index", "no_such_index",
+			"--index", "no*such*index",
+			"--relation", "no_such_relation",
+			"--relation", "no*such*relation",
+			"--database", "no_such_database",
+			"--database", "no*such*database",
+			"--relation", "none.none",
+			"--relation", "none.none.none",
+			"--relation", "postgres.none.none",
+			"--relation", "postgres.pg_catalog.none",
+			"--relation", "postgres.none.pg_class",
+			"--table", "postgres.pg_catalog.pg_class", // This exists
+		}, 0,
+		[]string{
+			`pg_amcheck: warning: no heap tables to check matching "no_such_table"`,
+			`pg_amcheck: warning: no heap tables to check matching "no\*such\*table"`,
+			`pg_amcheck: warning: no btree indexes to check matching "no_such_index"`,
+			`pg_amcheck: warning: no btree indexes to check matching "no\*such\*index"`,
+			`pg_amcheck: warning: no relations to check matching "no_such_relation"`,
+			`pg_amcheck: warning: no relations to check matching "no\*such\*relation"`,
+			`pg_amcheck: warning: no heap tables to check matching "no\*such\*table"`,
+			`pg_amcheck: warning: no connectable databases to check matching "no_such_database"`,
+			`pg_amcheck: warning: no connectable databases to check matching "no\*such\*database"`,
+			`pg_amcheck: warning: no relations to check matching "none\.none"`,
+			`pg_amcheck: warning: no connectable databases to check matching "none\.none\.none"`,
+			`pg_amcheck: warning: no relations to check matching "postgres\.none\.none"`,
+			`pg_amcheck: warning: no relations to check matching "postgres\.pg_catalog\.none"`,
+			`pg_amcheck: warning: no relations to check matching "postgres\.none\.pg_class"`,
+		})
+
+	// --- Invalid / partially dropped database won't be targeted ----------
+	// NOT PORTED (deferred, AC-002 residual #1). 002_nonesuch.pl marks a
+	// database invalid with `UPDATE pg_database SET datconnlimit = -2` and
+	// asserts pg_amcheck's database-resolution query filters it out. goopg
+	// has no runtime in-place update of on-disk shared catalogs (pg_database
+	// is initdb-only; the in-memory InMemory catalog is the runtime truth and
+	// exposes no datconnlimit write path) — see memory
+	// goopg_no_runtime_shared_catalog_inplace_update. The UPDATE is silently a
+	// no-op, so regression_invalid stays connectable and pg_amcheck reaches it
+	// (emitting `skipping database "regression_invalid": amcheck is not
+	// installed` + `no relations to check` instead of the expected `no
+	// connectable databases to check matching "regression_invalid"`). Porting
+	// this section requires the runtime pg_database.datconnlimit write
+	// capability, which is a separate milestone, not an amcheck concern.
+
+	// --- Existent objects but in databases where they do not exist -------
+	if err := runSQLSimple(t, c, "CREATE TABLE public.foo (f integer)"); err != nil {
+		t.Fatalf("CREATE TABLE public.foo: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_idx ON foo(f)"); err != nil {
+		t.Fatalf("CREATE INDEX foo_idx: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DATABASE another_db"); err != nil {
+		t.Fatalf("CREATE DATABASE another_db: %v", err)
+	}
+
+	checkAmcheck(t, c, "existent objects in the wrong databases",
+		[]string{
+			"--database", "postgres",
+			"--no-strict-names",
+			"--table", "template1.public.foo",
+			"--table", "another_db.public.foo",
+			"--table", "no_such_database.public.foo",
+			"--index", "template1.public.foo_idx",
+			"--index", "another_db.public.foo_idx",
+			"--index", "no_such_database.public.foo_idx",
+		}, 1,
+		[]string{
+			`pg_amcheck: warning: skipping database "template1": amcheck is not installed`,
+			`pg_amcheck: warning: no heap tables to check matching "template1\.public\.foo"`,
+			`pg_amcheck: warning: no heap tables to check matching "another_db\.public\.foo"`,
+			`pg_amcheck: warning: no connectable databases to check matching "no_such_database\.public\.foo"`,
+			`pg_amcheck: warning: no btree indexes to check matching "template1\.public\.foo_idx"`,
+			`pg_amcheck: warning: no btree indexes to check matching "another_db\.public\.foo_idx"`,
+			`pg_amcheck: warning: no connectable databases to check matching "no_such_database\.public\.foo_idx"`,
+			`pg_amcheck: error: no relations to check`,
+		})
+
+	// --- Schema exclusion patterns ---------------------------------------
+	// 002_nonesuch.pl's final two sections (.pl :377-418). pg_amcheck's
+	// --exclude-schema makes the relation-gathering query build an
+	// `exclude_raw (...) AS (VALUES ...)` / `exclude_pat` CTE and anti-join it
+	// (`... LEFT OUTER JOIN exclude_pat ep ON (...) WHERE ep.pattern_id IS
+	// NULL`). This query shape previously PANICKED the goopg backend: in the
+	// `toast` sub-CTE the 5-column `exclude_pat` VALUES relation is the join's
+	// build/inner side, and a build-side filter predicate carried a
+	// combined-join-schema column index (43) that was evaluated against the
+	// 5-wide build slot → `runtime error: index out of range [43] with length
+	// 5` in executor.MaterializedSlot.Get (joinOp.Open → drainRowsCtx →
+	// filterOp.Next). Root cause was the recurring sibling-path divergence
+	// between the two LEFT JOIN inner-only pushdown helpers — classifyConjunct
+	// Side/walkColumnRefs decided the conjunct pushable while shiftColumnRefsBy
+	// failed to rebase the inner `IS NULL` ref by -leftWidth (neither switch
+	// enumerated *IsNullExpr et al.). Fixed by commit 36a085dc (M0110-0003
+	// residual #2): both helpers now enumerate every sub-expr-bearing Expr
+	// kind, so the inner ref is rebased to the build slot's width and the
+	// anti-join runs to completion. These two cases are the end-to-end
+	// regression guard for that fix.
+
+	// Check with only schema exclusion patterns: excluding every schema that
+	// holds a checkable relation leaves nothing to check (.pl :380-397).
+	checkAmcheck(t, c, "schema exclusion patterns exclude all relations",
+		[]string{
+			"--all",
+			"--no-strict-names",
+			"--exclude-schema", "public",
+			"--exclude-schema", "pg_catalog",
+			"--exclude-schema", "pg_toast",
+			"--exclude-schema", "information_schema",
+		}, 1,
+		[]string{
+			`pg_amcheck: warning: skipping database "template1": amcheck is not installed`,
+			`pg_amcheck: error: no relations to check`,
+		})
+
+	// Check that exclusion patterns override inclusion patterns: even though
+	// pg_catalog.pg_class is explicitly included, `--exclude-schema '*'`
+	// excludes every schema, so nothing remains to check (.pl :399-418).
+	checkAmcheck(t, c, "schema exclusion pattern overrides all inclusion patterns",
+		[]string{
+			"--all",
+			"--no-strict-names",
+			"--schema", "public",
+			"--schema", "pg_catalog",
+			"--schema", "pg_toast",
+			"--schema", "information_schema",
+			"--table", "pg_catalog.pg_class",
+			"--exclude-schema", "*",
+		}, 1,
+		[]string{
+			`pg_amcheck: warning: skipping database "template1": amcheck is not installed`,
+			`pg_amcheck: error: no relations to check`,
+		})
 }

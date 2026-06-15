@@ -680,6 +680,20 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		return evalFuncCall(x, slotToRow(slot), ctx)
 	case *planner.IsNullExpr:
 		// IS [NOT] NULL never propagates NULL — it always returns a boolean.
+		// A row-valued operand follows SQL/PG row null semantics: `row IS NULL`
+		// is true iff every field is null, `row IS NOT NULL` iff every field is
+		// non-null. These are NOT inverses — a row mixing null and non-null
+		// fields is false for both — so the RowExpr case cannot reuse the scalar
+		// path below (a constructed RowExpr is never itself a NULL Datum, which
+		// would make `whole_row IS NOT NULL` wrongly true for an outer-join NULL
+		// row). M0110-0003 (pg_amcheck AC-002 gap #7a).
+		if re, ok := x.Operand.(*planner.RowExpr); ok {
+			res, err := evalRowNullTest(re, x.Negated, slot, ctx)
+			if err != nil {
+				return Datum{}, err
+			}
+			return NewBoolDatum(res), nil
+		}
 		operand, err := evalExprSlot(x.Operand, slot, ctx)
 		if err != nil {
 			return Datum{}, err
@@ -5274,6 +5288,20 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// versions of the same built-in functions.
 	if after, ok := strings.CutPrefix(name, "pg_catalog."); ok {
 		name = after
+	}
+	// Strip a *user* schema qualifier for the amcheck scalar builtins. Unlike
+	// most builtins, pg_amcheck qualifies bt_index_check / bt_index_parent_check
+	// with the amcheck extension's install schema (e.g. `"public".bt_index_check`),
+	// not pg_catalog — so the pg_catalog strip above misses them and dispatch
+	// would 42883. This mirrors the FROM-clause SRF path for verify_heapam, which
+	// discards the schema qualifier for known amcheck builtins
+	// (internal/parser/select.go, M0110-0003 AC-002 gap #5). Only the amcheck
+	// builtin names are stripped, so a same-named user function is unaffected.
+	if dot := strings.LastIndexByte(name, '.'); dot >= 0 {
+		switch name[dot+1:] {
+		case "bt_index_check", "bt_index_parent_check", "verify_heapam":
+			name = name[dot+1:]
+		}
 	}
 	switch name {
 	case "bt_index_check":
@@ -10071,6 +10099,50 @@ func evalRowExpr(x *planner.RowExpr, slot SlotView, ctx *Context) (Datum, error)
 		return NullDatum, nil
 	}
 	return NewStringDatum("(" + strings.Join(parts, ",") + ")"), nil
+}
+
+// evalRowNullTest implements PostgreSQL's row-valued IS [NOT] NULL semantics
+// for a RowExpr operand (e.g. a whole-row variable `tbl` expanded by the
+// planner into a RowExpr of its column refs):
+//
+//	row IS NULL      → true iff EVERY field is null
+//	row IS NOT NULL  → true iff EVERY field is non-null
+//
+// These are deliberately not inverses — a row mixing null and non-null fields
+// returns false for both — and the rule applies recursively to nested row
+// fields. This is what lets `whole_row IS NOT NULL` correctly report false for
+// an outer-join non-match (all fields null), as in pg_amcheck's database
+// resolution query `COUNT(*) FILTER (WHERE d IS NOT NULL)`. M0110-0003.
+func evalRowNullTest(re *planner.RowExpr, negated bool, slot SlotView, ctx *Context) (bool, error) {
+	for _, el := range re.Elems {
+		if sub, ok := el.(*planner.RowExpr); ok {
+			// Nested row: recurse with the same test (per SQL standard).
+			ok2, err := evalRowNullTest(sub, negated, slot, ctx)
+			if err != nil {
+				return false, err
+			}
+			if !ok2 {
+				return false, nil
+			}
+			continue
+		}
+		d, err := evalExprSlot(el, slot, ctx)
+		if err != nil {
+			return false, err
+		}
+		if negated {
+			// IS NOT NULL: any null field fails the all-non-null requirement.
+			if d.IsNull() {
+				return false, nil
+			}
+		} else {
+			// IS NULL: any non-null field fails the all-null requirement.
+			if !d.IsNull() {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
 }
 
 // evalMergeWholeRow formats a pre-materialised row as a composite text value

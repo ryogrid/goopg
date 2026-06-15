@@ -1293,6 +1293,9 @@ func (p *parser) parseSet() (Stmt, error) {
 			default:
 				goto setTxDone
 			}
+			// Transaction modes may be comma-separated, e.g. pg_dump's
+			// `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY`.
+			_ = p.acceptSymbol(",")
 		}
 	setTxDone:
 		return st, nil

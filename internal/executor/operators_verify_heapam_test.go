@@ -10,9 +10,11 @@ package executor
 
 import (
 	"encoding/binary"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -120,6 +122,134 @@ func TestVerifyHeapam_StartBlockOutOfRange(t *testing.T) {
 	if err == nil {
 		t.Fatal("out-of-range startblock did not error")
 	}
+}
+
+// TestVerifyHeapam_DetectsMissingRelationFile pins the heap file-removal tier of
+// 003_check.pl (plan_to_remove_relation_file on an ordinary table → the
+// `could not open file "<path>": No such file or directory` report). Removing
+// the heap's backing main fork must surface as an error BEFORE NBlocks, which
+// opens with O_CREATE and would otherwise recreate the file as an empty 0-block
+// relation — silently reporting the table clean (a false negative).
+func TestVerifyHeapam_DetectsMissingRelationFile(t *testing.T) {
+	ctx, cleanup := verifyHeapamSetup(t)
+	defer cleanup()
+
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "vh"})
+	if !ok {
+		t.Fatal("table vh not found")
+	}
+	rel := ctx.Catalog.RelFileNode(tbl)
+
+	// Remove the heap's backing fork file out from under the engine, mimicking
+	// the on-disk file removal pg_amcheck's 003_check performs while stopped.
+	if err := ctx.Pool.Manager().DropRelation(rel); err != nil {
+		t.Fatalf("drop heap fork: %v", err)
+	}
+
+	_, err := runQueryWithErr(ctx, "SELECT blkno, offnum, attnum, msg FROM verify_heapam('vh')")
+	if err == nil {
+		t.Fatal("missing relation file not detected")
+	}
+	if !strings.Contains(err.Error(), "could not open file") ||
+		!strings.Contains(err.Error(), "No such file or directory") {
+		t.Errorf("got %q, want substring %q / %q",
+			err.Error(), "could not open file", "No such file or directory")
+	}
+}
+
+// TestVerifyHeapam_LateralCommaJoinViaFastPath pins the M0110-0003 gap #6 fix:
+// pg_amcheck runs each per-relation heap check as the implicit-LATERAL comma-join
+//
+//	SELECT v.* FROM pg_class c, verify_heapam(relation := c.oid, …) v WHERE c.relname = '…'
+//
+// where the SRF's relation argument is the correlated reference `c.oid` into the
+// left sibling. The bug had two layers: planVerifyHeapam resolved args against an
+// empty context (fixed by threading lateralCtx) AND the server's BuildFast/OpNode
+// execution path wraps a Join's children in opNodeOperator, which did not forward
+// the lateral outer-row binding — so the SRF arg evaluated against a nil slot
+// ("column ref oid/0 on nil slot"). This test drives the join through
+// BuildFastIterator (the server's simple-protocol path, NOT the legacy Build path
+// runQuery uses) so the opNodeOperator forwarding is exercised, and injects a real
+// corruption so the assertion proves the correlated arg bound to the CORRECT
+// relation per outer row (a nil/empty binding would report zero rows).
+func TestVerifyHeapam_LateralCommaJoinViaFastPath(t *testing.T) {
+	ctx, cleanup := verifyHeapamSetup(t)
+	defer cleanup()
+
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "vh"})
+	if !ok {
+		t.Fatal("table vh not found")
+	}
+	rel := ctx.Catalog.RelFileNode(tbl)
+
+	// Inject the same deterministic line-pointer corruption as
+	// TestVerifyHeapam_DetectsInjectedCorruption so a finding must surface.
+	s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatalf("Pin block 0: %v", err)
+	}
+	item, err := storage.PageGetItemID(s.Page(), 1)
+	if err != nil {
+		ctx.Pool.Unpin(s)
+		t.Fatalf("PageGetItemID: %v", err)
+	}
+	setItemIDRaw(s.Page(), 1, item.Offset+1, storage.ItemIDNormal, item.Length)
+	ctx.Pool.MarkDirty(s)
+	ctx.Pool.Unpin(s)
+
+	sql := `SELECT v.blkno, v.offnum, v.msg FROM pg_class c, verify_heapam(relation := c.oid) v WHERE c.relname = 'vh'`
+	rows, err := runQueryFastVH(t, ctx, sql)
+	if err != nil {
+		t.Fatalf("%s: %v", sql, err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("lateral comma-join produced no rows: the correlated `c.oid` did " +
+			"not bind to relation vh through the Join.Lateral driver (gap #6 regressed)")
+	}
+	if got := rows[0][0].Int; got != 0 {
+		t.Errorf("blkno = %d, want 0", got)
+	}
+	if got := rows[0][1].Int; got != 1 {
+		t.Errorf("offnum = %d, want 1 (corrupted slot)", got)
+	}
+}
+
+// runQueryFastVH executes sql through BuildFastIterator (the OpNode fast-iterator
+// path the server uses for simple-protocol queries) and returns the result rows.
+// Distinct from runQuery, which uses the legacy Build path. M0110-0003 gap #6.
+func runQueryFastVH(t *testing.T, ctx *Context, sql string) ([]Row, error) {
+	t.Helper()
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := planner.Plan(stmts[0], ctx.Catalog)
+	if err != nil {
+		return nil, err
+	}
+	it, err := BuildFastIterator(plan)
+	if err != nil {
+		return nil, err
+	}
+	if err := it.Open(ctx); err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var rows []Row
+	for {
+		slot, err := it.Next()
+		if err == EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if slot == nil {
+			break
+		}
+		rows = append(rows, slotRow(slot))
+	}
+	return rows, nil
 }
 
 func itoaVH(n int) string {

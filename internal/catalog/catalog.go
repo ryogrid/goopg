@@ -483,6 +483,10 @@ type Catalog interface {
 	TablesInSchema(schemaName string) []parser.ObjectName
 	// SchemaExists reports whether a schema has been registered.
 	SchemaExists(name string) bool
+	// SchemaOID returns the OID of a registered schema (0 if not found). Used by
+	// syncTableToCatalogHeap to stamp a user table's pg_class.relnamespace with
+	// the real schema OID so the schema survives a restart (M0110-0003).
+	SchemaOID(name string) uint32
 	// RegisterSchema records a user-created schema. M0097-drop_if_exists.
 	RegisterSchema(name string)
 	// UnregisterSchema removes a schema from the registry. M0097-drop_if_exists.
@@ -491,8 +495,18 @@ type Catalog interface {
 	// pg_extension registry. schema is the install namespace name (defaulted by
 	// the caller), version the extension version string. When the extension
 	// already exists it returns nil if ifNotExists is set, else an error.
+	// database scopes the install to the connecting database (pg_extension is
+	// per-database in PostgreSQL); empty means visible everywhere.
 	// M0110-0003 (amcheck SQL surface).
-	CreateExtension(name, schema, version string, ifNotExists bool) error
+	CreateExtension(name, schema, version, database string, ifNotExists bool) error
+	// CreateTablespace records a CREATE TABLESPACE in the runtime tablespace
+	// registry and returns the freshly allocated OID (used by the executor to
+	// create the in-place pg_tblspc/<oid> directory). An existing name returns a
+	// "tablespace already exists" error. M0095-0003 (in-place tablespace).
+	CreateTablespace(name, owner, location string) (uint32, error)
+	// DropTablespace removes a tablespace from the runtime registry, returning its
+	// OID and whether it was present. M0095-0003.
+	DropTablespace(name string) (uint32, bool)
 	// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
 	// objType is "conversion", "operator", "rule", "text search configuration", etc.
 	RegisterCompatObject(objType, name string)
@@ -641,17 +655,45 @@ type InMemory struct {
 	// lowercase extension name. Backs the pg_extension virtual catalog read by
 	// pg_amcheck's "is amcheck installed?" probe. M0110-0003.
 	extensions map[string]*extensionRow
+
+	// tablespaces tracks CREATE TABLESPACE in-place tablespaces, keyed by
+	// lowercase tablespace name. The bootstrap pg_default/pg_global tablespaces
+	// are NOT held here (they live in the on-disk pg_tablespace heap); this is the
+	// runtime registry for developer/regression in-place tablespaces, used to
+	// reject duplicates and to map a dropped name back to its OID/directory.
+	// M0095-0003 (in-place tablespace).
+	tablespaces map[string]*tablespaceRow
 }
 
 // extensionRow is one runtime CREATE EXTENSION record backing pg_extension.
 // The install namespace is stored by name and resolved to an OID at read time
 // (in pg_extension's VirtualRows), so it stays consistent if the schema set
 // changes. M0110-0003.
+//
+// database records the name of the database the extension was created in. In
+// PostgreSQL pg_extension is a per-database catalog, so an extension installed
+// in one database is invisible in every other. goopg shares a single in-memory
+// catalog across all databases, so this field is the scope marker used to
+// filter pg_extension rows per connecting database (see ExtensionRowsForDB).
+// Empty means "visible in every database" (legacy/direct-call inserts).
+// M0110-0003 (AC-002 gap #7c).
 type extensionRow struct {
-	oid     uint32
-	name    string
-	schema  string
-	version string
+	oid      uint32
+	name     string
+	schema   string
+	version  string
+	database string
+}
+
+// tablespaceRow is one runtime CREATE TABLESPACE record (in-place tablespaces
+// only). The in-place directory is pg_tblspc/<oid> under the data dir. owner is
+// recorded for completeness; location is the (canonicalized) LOCATION string,
+// which is empty for an in-place tablespace. M0095-0003.
+type tablespaceRow struct {
+	oid      uint32
+	name     string
+	owner    string
+	location string
 }
 
 // commentKey is the composite key for pg_description.
@@ -804,6 +846,7 @@ func NewInMemory() *InMemory {
 		comments:       make(map[commentKey]string),
 		statisticsObjs: make(map[string]*StatisticsObject),
 		extensions:     make(map[string]*extensionRow),
+		tablespaces:    make(map[string]*tablespaceRow),
 	}
 	c.registerSystemTables()
 	return c
@@ -1662,40 +1705,40 @@ func (c *InMemory) registerSystemTables() {
 		// (e.g. "UPDATE pg_class SET reltuples = ... WHERE oid = ...").
 		// M0100-0010: sysupd2/sysmerge2 concurrent-update blocking fix.
 		Columns: []Column{
-			{Name: "oid",                 Type: Type{Name: "oid"},          Ordinal: 0},
-			{Name: "relname",             Type: Type{Name: "name"},         Ordinal: 1},
-			{Name: "relnamespace",        Type: Type{Name: "oid"},          Ordinal: 2},
-			{Name: "reltype",             Type: Type{Name: "oid"},          Ordinal: 3},
-			{Name: "reloftype",           Type: Type{Name: "oid"},          Ordinal: 4},
-			{Name: "relowner",            Type: Type{Name: "oid"},          Ordinal: 5},
-			{Name: "relam",               Type: Type{Name: "oid"},          Ordinal: 6},
-			{Name: "relfilenode",         Type: Type{Name: "oid"},          Ordinal: 7},
-			{Name: "reltablespace",       Type: Type{Name: "oid"},          Ordinal: 8},
-			{Name: "relpages",            Type: Type{Name: "int4"},         Ordinal: 9},
-			{Name: "reltuples",           Type: Type{Name: "float4"},       Ordinal: 10},
-			{Name: "relallvisible",       Type: Type{Name: "int4"},         Ordinal: 11},
-			{Name: "relallfrozen",        Type: Type{Name: "int4"},         Ordinal: 12},
-			{Name: "reltoastrelid",       Type: Type{Name: "oid"},          Ordinal: 13},
-			{Name: "relhasindex",         Type: Type{Name: "bool"},         Ordinal: 14},
-			{Name: "relisshared",         Type: Type{Name: "bool"},         Ordinal: 15},
-			{Name: "relpersistence",      Type: Type{Name: "char"},         Ordinal: 16},
-			{Name: "relkind",             Type: Type{Name: "char"},         Ordinal: 17},
-			{Name: "relnatts",            Type: Type{Name: "int2"},         Ordinal: 18},
-			{Name: "relchecks",           Type: Type{Name: "int2"},         Ordinal: 19},
-			{Name: "relhasrules",         Type: Type{Name: "bool"},         Ordinal: 20},
-			{Name: "relhastriggers",      Type: Type{Name: "bool"},         Ordinal: 21},
-			{Name: "relhassubclass",      Type: Type{Name: "bool"},         Ordinal: 22},
-			{Name: "relrowsecurity",      Type: Type{Name: "bool"},         Ordinal: 23},
-			{Name: "relforcerowsecurity", Type: Type{Name: "bool"},         Ordinal: 24},
-			{Name: "relispopulated",      Type: Type{Name: "bool"},         Ordinal: 25},
-			{Name: "relreplident",        Type: Type{Name: "char"},         Ordinal: 26},
-			{Name: "relispartition",      Type: Type{Name: "bool"},         Ordinal: 27},
-			{Name: "relrewrite",          Type: Type{Name: "oid"},          Ordinal: 28},
-			{Name: "relfrozenxid",        Type: Type{Name: "xid"},          Ordinal: 29},
-			{Name: "relminmxid",          Type: Type{Name: "xid"},          Ordinal: 30},
-			{Name: "relacl",              Type: Type{Name: "aclitem[]"},    Ordinal: 31},
-			{Name: "reloptions",          Type: Type{Name: "text[]"},       Ordinal: 32},
-			{Name: "relpartbound",        Type: Type{Name: "pg_node_tree"}, Ordinal: 33},
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "relname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "relnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "reltype", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "reloftype", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "relowner", Type: Type{Name: "oid"}, Ordinal: 5},
+			{Name: "relam", Type: Type{Name: "oid"}, Ordinal: 6},
+			{Name: "relfilenode", Type: Type{Name: "oid"}, Ordinal: 7},
+			{Name: "reltablespace", Type: Type{Name: "oid"}, Ordinal: 8},
+			{Name: "relpages", Type: Type{Name: "int4"}, Ordinal: 9},
+			{Name: "reltuples", Type: Type{Name: "float4"}, Ordinal: 10},
+			{Name: "relallvisible", Type: Type{Name: "int4"}, Ordinal: 11},
+			{Name: "relallfrozen", Type: Type{Name: "int4"}, Ordinal: 12},
+			{Name: "reltoastrelid", Type: Type{Name: "oid"}, Ordinal: 13},
+			{Name: "relhasindex", Type: Type{Name: "bool"}, Ordinal: 14},
+			{Name: "relisshared", Type: Type{Name: "bool"}, Ordinal: 15},
+			{Name: "relpersistence", Type: Type{Name: "char"}, Ordinal: 16},
+			{Name: "relkind", Type: Type{Name: "char"}, Ordinal: 17},
+			{Name: "relnatts", Type: Type{Name: "int2"}, Ordinal: 18},
+			{Name: "relchecks", Type: Type{Name: "int2"}, Ordinal: 19},
+			{Name: "relhasrules", Type: Type{Name: "bool"}, Ordinal: 20},
+			{Name: "relhastriggers", Type: Type{Name: "bool"}, Ordinal: 21},
+			{Name: "relhassubclass", Type: Type{Name: "bool"}, Ordinal: 22},
+			{Name: "relrowsecurity", Type: Type{Name: "bool"}, Ordinal: 23},
+			{Name: "relforcerowsecurity", Type: Type{Name: "bool"}, Ordinal: 24},
+			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 25},
+			{Name: "relreplident", Type: Type{Name: "char"}, Ordinal: 26},
+			{Name: "relispartition", Type: Type{Name: "bool"}, Ordinal: 27},
+			{Name: "relrewrite", Type: Type{Name: "oid"}, Ordinal: 28},
+			{Name: "relfrozenxid", Type: Type{Name: "xid"}, Ordinal: 29},
+			{Name: "relminmxid", Type: Type{Name: "xid"}, Ordinal: 30},
+			{Name: "relacl", Type: Type{Name: "aclitem[]"}, Ordinal: 31},
+			{Name: "reloptions", Type: Type{Name: "text[]"}, Ordinal: 32},
+			{Name: "relpartbound", Type: Type{Name: "pg_node_tree"}, Ordinal: 33},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -1779,18 +1822,23 @@ func (c *InMemory) registerSystemTables() {
 				"0",                          // 19: relchecks
 				"f",                          // 20: relhasrules
 				"f",                          // 21: relhastriggers
-				func() string { if len(c.partitionChildren[t.OID]) > 0 { return "t" }; return "f" }(), // 22: relhassubclass
-				"f",                          // 23: relrowsecurity
-				"f",                          // 24: relforcerowsecurity
-				populated,                    // 25: relispopulated
-				"d",                          // 26: relreplident
-				isPartition,                  // 27: relispartition
-				"0",                          // 28: relrewrite
-				"0",                          // 29: relfrozenxid
-				"1",                          // 30: relminmxid
-				"",                           // 31: relacl (NULL)
-				"",                           // 32: reloptions (NULL)
-				partBound,                    // 33: relpartbound
+				func() string {
+					if len(c.partitionChildren[t.OID]) > 0 {
+						return "t"
+					}
+					return "f"
+				}(), // 22: relhassubclass
+				"f",         // 23: relrowsecurity
+				"f",         // 24: relforcerowsecurity
+				populated,   // 25: relispopulated
+				"d",         // 26: relreplident
+				isPartition, // 27: relispartition
+				"0",         // 28: relrewrite
+				"0",         // 29: relfrozenxid
+				"1",         // 30: relminmxid
+				"",          // 31: relacl (NULL)
+				"",          // 32: reloptions (NULL)
+				partBound,   // 33: relpartbound
 			})
 		}
 		// Emit index rows (relkind='i'/'I') so pg_class can be used to count indexes.
@@ -1981,30 +2029,14 @@ func (c *InMemory) registerSystemTables() {
 		OID:     3079, // upstream's ExtensionRelationId
 		Virtual: true,
 	}
+	// The global VirtualRows returns every extension row (dbFilter==""); the
+	// executor swaps in a per-connection, database-scoped view via
+	// ExtensionRowsForDB so an extension installed in one database is invisible
+	// in another (mirrors PostgreSQL's per-database pg_extension). M0110-0003.
 	pgExtension.VirtualRows = func() [][]string {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		rows := make([]*extensionRow, 0, len(c.extensions))
-		for _, e := range c.extensions {
-			rows = append(rows, e)
-		}
-		// Sort by OID for deterministic output.
-		sort.Slice(rows, func(i, j int) bool { return rows[i].oid < rows[j].oid })
-		out := make([][]string, 0, len(rows))
-		for _, e := range rows {
-			nsOID := c.schemas[strings.ToLower(e.schema)]
-			out = append(out, []string{
-				strconv.Itoa(int(e.oid)), // oid
-				e.name,                   // extname
-				"10",                     // extowner (bootstrap superuser)
-				strconv.Itoa(int(nsOID)), // extnamespace
-				"f",                      // extrelocatable
-				e.version,                // extversion
-				"",                       // extconfig: NULL
-				"",                       // extcondition: NULL
-			})
-		}
-		return out
+		return c.extensionRowsLocked("")
 	}
 	c.tables["pg_catalog.pg_extension"] = pgExtension
 
@@ -2140,15 +2172,21 @@ func (c *InMemory) registerSystemTables() {
 		Schema: "pg_catalog",
 		Name:   "pg_roles",
 		Columns: []Column{
-			{Name: "rolname", Type: Type{Name: "text"}, Ordinal: 0},
-			{Name: "rolsuper", Type: Type{Name: "text"}, Ordinal: 1},
-			{Name: "rolcanlogin", Type: Type{Name: "text"}, Ordinal: 2},
+			// oid first: pg_dump's collectRoleNames issues
+			// `SELECT oid, rolname FROM pg_catalog.pg_roles ORDER BY 1`
+			// to build its role-oid → name map (pg_dump.c:10548).
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "rolname", Type: Type{Name: "text"}, Ordinal: 1},
+			{Name: "rolsuper", Type: Type{Name: "text"}, Ordinal: 2},
+			{Name: "rolcanlogin", Type: Type{Name: "text"}, Ordinal: 3},
 		},
 		OID:     1260, // upstream's AuthIdRelationId
 		Virtual: true,
 	}
 	pgRoles.VirtualRows = func() [][]string {
-		return [][]string{{"postgres", "t", "t"}}
+		// OID 10 = BOOTSTRAP_SUPERUSERID (postgres superuser),
+		// per postgres/src/include/catalog/pg_authid.dat.
+		return [][]string{{"10", "postgres", "t", "t"}}
 	}
 	c.tables["pg_catalog.pg_roles"] = pgRoles
 
@@ -4182,6 +4220,27 @@ func (c *InMemory) SchemaOID(name string) uint32 {
 	return c.schemas[strings.ToLower(name)]
 }
 
+// SchemaNameForOID returns the registered schema name for the given namespace
+// OID ("" if no schema carries that OID). It is the reverse of SchemaOID and is
+// used by the restart recovery path (loadUserTablesFromHeap /
+// loadUserIndexesFromHeap) to reconstruct a user table's schema from the
+// pg_class.relnamespace OID recovered from the heap. Pre-populated system
+// schemas (pg_catalog/public) are handled by their fixed OIDs at the call site;
+// this resolves user schemas registered via CREATE SCHEMA. M0110-0003.
+func (c *InMemory) SchemaNameForOID(oid uint32) string {
+	if oid == 0 {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for name, o := range c.schemas {
+		if o == oid {
+			return name
+		}
+	}
+	return ""
+}
+
 // RegisterSchema records a user-created schema. Called from execCreateSchema.
 func (c *InMemory) RegisterSchema(name string) {
 	c.mu.Lock()
@@ -4200,11 +4259,35 @@ func (c *InMemory) UnregisterSchema(name string) {
 	delete(c.schemas, strings.ToLower(name))
 }
 
+// RegisterSchemaDuringRecovery is the idempotent version of RegisterSchema
+// used by the WAL-replay driver. Unlike RegisterSchema it takes the OID from
+// the WAL record (so the recovered registry matches what the pre-crash server
+// assigned) and advances nextOID past it so subsequent allocations do not
+// collide. Re-applying a record whose schema already exists is a no-op.
+// Mirrors RegisterDatabaseDuringRecovery (M0054-0001) / RegisterIndexDuringRecovery.
+func (c *InMemory) RegisterSchemaDuringRecovery(name string, oid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	c.schemas[lc] = oid
+	if oid >= c.nextOID {
+		c.nextOID = oid + 1
+	}
+}
+
+// UnregisterSchemaDuringRecovery is the idempotent counterpart used for
+// replaying RecordKindDropSchema.
+func (c *InMemory) UnregisterSchemaDuringRecovery(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.schemas, strings.ToLower(name))
+}
+
 // CreateExtension records a CREATE EXTENSION install in the runtime
 // pg_extension registry. Called from the executor's execCreateExtension after
 // it has validated the extension name and resolved the default version/schema.
 // M0110-0003.
-func (c *InMemory) CreateExtension(name, schema, version string, ifNotExists bool) error {
+func (c *InMemory) CreateExtension(name, schema, version, database string, ifNotExists bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	lc := strings.ToLower(name)
@@ -4219,12 +4302,94 @@ func (c *InMemory) CreateExtension(name, schema, version string, ifNotExists boo
 	}
 	c.nextOID++
 	c.extensions[lc] = &extensionRow{
-		oid:     c.nextOID,
-		name:    name,
-		schema:  schema,
-		version: version,
+		oid:      c.nextOID,
+		name:     name,
+		schema:   schema,
+		version:  version,
+		database: database,
 	}
 	return nil
+}
+
+// CreateTablespace records an in-place tablespace in the runtime registry and
+// returns the freshly allocated OID. A name already present returns a duplicate
+// error mirroring PG's get_tablespace_oid collision message. The caller (the DDL
+// executor) is responsible for the pg_-prefix reserved-name check and for
+// creating the pg_tblspc/<oid> directory. M0095-0003.
+func (c *InMemory) CreateTablespace(name, owner, location string) (uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	if _, ok := c.tablespaces[lc]; ok {
+		return 0, fmt.Errorf("tablespace %q already exists", name)
+	}
+	c.nextOID++
+	oid := c.nextOID
+	c.tablespaces[lc] = &tablespaceRow{
+		oid:      oid,
+		name:     name,
+		owner:    owner,
+		location: location,
+	}
+	return oid, nil
+}
+
+// DropTablespace removes a tablespace from the runtime registry, returning its
+// OID and whether it was present. M0095-0003.
+func (c *InMemory) DropTablespace(name string) (uint32, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	ts, ok := c.tablespaces[lc]
+	if !ok {
+		return 0, false
+	}
+	delete(c.tablespaces, lc)
+	return ts.oid, true
+}
+
+// ExtensionRowsForDB returns the pg_extension virtual rows visible to a
+// connection bound to database `db`. Because goopg shares one in-memory catalog
+// across all databases, this filters the runtime extension registry to rows
+// scoped to `db` (plus any unscoped legacy rows), mirroring PostgreSQL's
+// per-database pg_extension catalog. An empty `db` returns every row (no
+// connection context — e.g. embedded/test callers). M0110-0003 (AC-002 gap #7c).
+func (c *InMemory) ExtensionRowsForDB(db string) [][]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.extensionRowsLocked(db)
+}
+
+// extensionRowsLocked builds the pg_extension virtual rows, optionally filtered
+// to the rows visible in database `dbFilter`. An empty `dbFilter` includes every
+// row; otherwise a row is included when it was created in `dbFilter` or carries
+// no database scope (legacy/direct-call inserts). Must hold c.mu (R or W).
+// M0110-0003 (AC-002 gap #7c).
+func (c *InMemory) extensionRowsLocked(dbFilter string) [][]string {
+	rows := make([]*extensionRow, 0, len(c.extensions))
+	for _, e := range c.extensions {
+		if dbFilter != "" && e.database != "" && e.database != dbFilter {
+			continue
+		}
+		rows = append(rows, e)
+	}
+	// Sort by OID for deterministic output.
+	sort.Slice(rows, func(i, j int) bool { return rows[i].oid < rows[j].oid })
+	out := make([][]string, 0, len(rows))
+	for _, e := range rows {
+		nsOID := c.schemas[strings.ToLower(e.schema)]
+		out = append(out, []string{
+			strconv.Itoa(int(e.oid)), // oid
+			e.name,                   // extname
+			"10",                     // extowner (bootstrap superuser)
+			strconv.Itoa(int(nsOID)), // extnamespace
+			"f",                      // extrelocatable
+			e.version,                // extversion
+			"",                       // extconfig: NULL
+			"",                       // extcondition: NULL
+		})
+	}
+	return out
 }
 
 // allSchemasLocked returns all (name, oid) pairs. Must be called with mu held.

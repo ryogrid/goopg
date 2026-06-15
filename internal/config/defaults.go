@@ -582,10 +582,19 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// allow_in_place_tablespaces — developer/regression option permitting
+	// CREATE TABLESPACE ... LOCATION '' to create an in-place tablespace directly
+	// inside pg_tblspc. PGC_SUSET, GUC_NOT_IN_SAMPLE, boot off (guc_tables.c).
+	// M0095-0003.
+	r.MustRegister(NewVariable(Variable{
+		Name: "allow_in_place_tablespaces", Type: TypeBool, BootVal: "off",
+		Context: ContextSuset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 	// seq_page_cost — planner cost estimate for sequential page fetch.
 	r.MustRegister(NewVariable(Variable{
 		Name: "seq_page_cost", Type: TypeReal, BootVal: "1.0",
-		MinVal: 0, MaxVal: 1<<30,
+		MinVal: 0, MaxVal: 1 << 30,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
@@ -669,6 +678,32 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "idle_in_transaction_session_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "0",
 		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// transaction_timeout (PG 17+). pg_dump's setup_connection disables it
+	// (SET transaction_timeout = 0) alongside the other timeouts; goopg does
+	// not enforce it, but SET must succeed. Mirrors guc_tables.c.
+	r.MustRegister(NewVariable(Variable{
+		Name: "transaction_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "0",
+		MinVal: 0, MaxVal: 2147483647,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// synchronize_seqscans. pg_dump's setup_connection turns this off (SET
+	// synchronize_seqscans TO off) so a dump's row ordering is stable. goopg
+	// has no synchronized-scan optimization, so the value is a no-op, but the
+	// SET must succeed. Boot default mirrors guc_tables.c (on).
+	r.MustRegister(NewVariable(Variable{
+		Name: "synchronize_seqscans", Type: TypeBool, BootVal: "on",
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// row_security. pg_dump's setup_connection sets this (off unless
+	// --enable-row-security). goopg has no row-level security, so it is a
+	// no-op, but the SET must succeed. Boot default mirrors guc_tables.c (on).
+	r.MustRegister(NewVariable(Variable{
+		Name: "row_security", Type: TypeBool, BootVal: "on",
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
@@ -769,7 +804,7 @@ func BuildDefaultRegistry() *Registry {
 	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "wal_sender_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "60s",
-		MinVal: 0, MaxVal: 1<<30,
+		MinVal: 0, MaxVal: 1 << 30,
 		Context: ContextSigHup,
 		Scope:   ScopeServer,
 	}))

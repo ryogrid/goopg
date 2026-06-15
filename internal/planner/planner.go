@@ -148,6 +148,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateAggregateStmt,
 		*parser.AlterAggregateRenameStmt,
 		*parser.CreateExtensionStmt,
+		*parser.CreateTablespaceStmt, *parser.DropTablespaceStmt,
 		*parser.CreateOpClassStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
@@ -894,6 +895,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 					node = pushPredicatesIntoCrossJoins(node)
 				}
 			}
+			// Push outer-only quals below a LATERAL join onto its outer
+			// child so a side-effecting lateral RHS (e.g. verify_heapam)
+			// is only opened for outer rows that pass the restriction.
+			// See pushOuterQualsIntoLaterals in pushdown.go.
+			node = pushOuterQualsIntoLaterals(node)
 		}
 	}
 
@@ -1641,6 +1647,13 @@ func nodeReferencesOuter(n Node) bool {
 			}
 		}
 		return false
+	case *VerifyHeapam:
+		// A correlated arg (e.g. verify_heapam(relation := c.oid)) resolves to a
+		// plain *ColumnRef against the left sibling's schema; route the wrapping
+		// Join through the per-outer-row lateral driver. M0110-0003 gap #6.
+		return exprContainsColumnRef(x.Arg) ||
+			exprContainsColumnRef(x.StartBlock) ||
+			exprContainsColumnRef(x.EndBlock)
 	}
 	// General case: walk the plan tree for OuterColumnRef expressions.
 	return planHasOuterRef(n)
@@ -2999,7 +3012,7 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
 	if strings.EqualFold(tf.Name, "verify_heapam") {
-		return planVerifyHeapam(rv, sourceIdx)
+		return planVerifyHeapam(rv, sourceIdx, lateralCtx)
 	}
 	if strings.EqualFold(tf.Name, "pg_partition_tree") || strings.EqualFold(tf.Name, "pg_partition_ancestors") {
 		// pg_partition_tree / pg_partition_ancestors — multi-row SRF that traverses
@@ -3677,14 +3690,25 @@ func planPgAvailableWalSummaries(rv parser.RangeVar, sourceIdx int16) (Node, ran
 // argument list type-checks) but carry no semantics here — see the VerifyHeapam
 // node doc. Output schema is the upstream SETOF (blkno int8, offnum int8,
 // attnum int4, msg text). M0110-0003.
-func planVerifyHeapam(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+func planVerifyHeapam(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
 	tf := rv.TableFunc
 	if len(tf.Args) == 0 {
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
 			Message: "function verify_heapam() does not exist",
 			Hint:    "verify_heapam requires a relation argument"}
 	}
-	ctx := &resolveContext{}
+	// Resolve argument expressions against the lateral outer context so a
+	// correlated reference like `c.oid` in
+	//   FROM pg_catalog.pg_class c, verify_heapam(relation := c.oid, …) v
+	// (the implicit-LATERAL comma-join pg_amcheck emits) resolves against the
+	// sibling `pg_class c` range-table entry. Mirrors planPgGetPublicationTables;
+	// nodeReferencesOuter then routes the wrapping Join through its per-outer-row
+	// lateral driver, and verifyHeapamOp evaluates the arg against the bound
+	// outer slot. M0110-0003 gap #6.
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
 	arg, err := resolveExpr(tf.Args[0], ctx)
 	if err != nil {
 		return nil, rangeBinding{}, err
@@ -9508,6 +9532,27 @@ func shiftColumnRefsBy(e Expr, delta int) Expr {
 		}
 	case *ExtractExpr:
 		return &ExtractExpr{pos: x.Pos(), Field: x.Field, Source: shiftColumnRefsBy(x.Source, delta)}
+	case *IsNullExpr:
+		// `expr IS [NOT] NULL`. The operand can hold inner-side ColumnRefs
+		// (e.g. pg_amcheck's `ep.nsp_regex IS NULL` in the exclude-pattern
+		// anti-join). It MUST be shifted in lockstep with walkColumnRefs'
+		// IsNullExpr case — omitting it left the operand ref at its
+		// outer-cumulative index after the conjunct was pushed below a LEFT
+		// JOIN, panicking "index out of range" in Slot.Get (same failure
+		// mode as the InExpr gap above).
+		return &IsNullExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), Negated: x.Negated}
+	case *IsBoolExpr:
+		return &IsBoolExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), TestTrue: x.TestTrue, TestFalse: x.TestFalse, Negated: x.Negated}
+	case *IsDistinctFromExpr:
+		return &IsDistinctFromExpr{pos: x.Pos(), Left: shiftColumnRefsBy(x.Left, delta), Right: shiftColumnRefsBy(x.Right, delta), Negated: x.Negated}
+	case *CollateExpr:
+		return &CollateExpr{pos: x.Pos(), Operand: shiftColumnRefsBy(x.Operand, delta), CollationName: x.CollationName}
+	case *RowExpr:
+		elems := make([]Expr, len(x.Elems))
+		for i, el := range x.Elems {
+			elems[i] = shiftColumnRefsBy(el, delta)
+		}
+		return &RowExpr{pos: x.Pos(), Elems: elems, Types: x.Types}
 	default:
 		return e
 	}

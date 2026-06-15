@@ -230,6 +230,54 @@ missing SQL features; sub-milestones 0004–0008 implement those features.
         on a clean tree (same gen-column WIP that holds the amcheck SQL surface).
         Skip note in `TestPort_PgBasebackup011InPlaceTablespace` corrected to match.
         recvlogical (030) still needs the logical replication / decoding protocol.
+      - **PROGRESS 2026-06-15 (loop #12):** 011 items (1)+(2-core) LANDED on the now
+        **clean tree** (the foreign gen-column WIP that blocked the parser/executor/
+        catalog edits is gone). Delivered the in-place tablespace foundation:
+        `allow_in_place_tablespaces` GUC (PGC_SUSET, boot off, +sample entry);
+        `CreateTablespaceStmt`/`DropTablespaceStmt` AST; `CREATE TABLESPACE name
+        [OWNER [=] role] LOCATION 'dir' [WITH (opts)]` + `DROP TABLESPACE [IF EXISTS]
+        name` parser (`KwTablespace` is an unreserved keyword → `acceptKeyword`, not
+        `acceptIdentKeyword` — fixed the matching that initially fell through);
+        planner DDL passthrough; `execCreateTablespace`/`execDropTablespace` (in-place
+        `pg_tblspc/<oid>` dir create/remove + runtime registry); catalog
+        `CreateTablespace`/`DropTablespace` registry; `CREATE/DROP TABLESPACE` command
+        tags. Upstream-verbatim errors (42602 quote, 42P17 absolute-path / empty-loc-
+        GUC-off, 42939 reserved pg_ name, 42710 dup, 42704 missing); external absolute
+        LOCATION → 0A000 (goopg can't relocate relfiles). Design doc
+        `docs/design/0095-0003-in-place-tablespace.md` + README index. Tests: parser
+        (3), catalog (1), executor (7 incl. real-temp-dir create/drop), config (1) —
+        all PASS; full parser/catalog/config/planner/executor/server suites green;
+        gofmt+vet clean; build clean. TPC-H spotcheck SKIPPED (no data dir in this
+        tree; safe by construction — only NEW DDL statement types added to passthrough
+        lists, zero existing query path touched). DEFERRED (011 still self-skips):
+        BASE_BACKUP per-tablespace `<oid>.tar` + the `pg_tblspc/<oid>/PG_18_<cat>`
+        version subdir (both need the catversion string, land together) + on-disk
+        `pg_tablespace` heap visibility (shared-catalog runtime write — separate
+        capability). recvlogical (030) still needs logical decoding.
+      - **PROGRESS 2026-06-15 (loop #13):** 011 now **PASSES** — the two deferred
+        pieces landed together. (a) **Version directory:** `execCreateTablespace`
+        creates `pg_tblspc/<oid>/PG_<major>_<catversion>` (was just
+        `pg_tblspc/<oid>`), faithful to `create_tablespace_directories`. The
+        version-dir name + catversion constants moved to the **leaf `config`
+        package** (`internal/config/version.go`: `MajorVersion`,
+        `CatalogVersionNo`, `TablespaceVersionDirectory`) as the single source of
+        truth — `executor` cannot import `initdb` (cycle: `initdb`→`executor`), so
+        `initdb.CatalogVersion`/`pgcontrol.go pgCatalogVersionNo` now reference
+        `config`. (b) **Per-tablespace `<oid>.tar`:** `internal/server/basebackup.go`
+        gained `collectInPlaceTablespaces` (scan `pg_tblspc` for numeric dirs),
+        `emitTablespaceTar` (version-dir tar, paths relative to the tablespace),
+        a `writeTablespaceList` that emits one `(oid, pg_tblspc/<oid>, NULL)` row
+        per tablespace, and a base-tar walk that ships the `pg_tblspc/<oid>` dir
+        entry without recursing (mirrors `sendDir` skip_this_dir). After base.tar,
+        each tablespace streams its own `'n'` archive frame `"<oid>.tar"` then its
+        tar; manifest entries accumulate across archives. `TestPort_PgBasebackup011-
+        InPlaceTablespace` skip removed → PASS (1.35s); CSV BB-011 + markdown
+        updated; design doc `0095-0003-in-place-tablespace.md` + README index →
+        complete. Gates: `go build ./...` clean; server `-race` green; 010
+        backup/stream/fetch/manifest tests no regression; executor/initdb/config
+        suites green. STILL DEFERRED: on-disk `pg_tablespace` heap visibility
+        (independent shared-catalog write, NOT needed by 011); recvlogical (030)
+        needs logical decoding.
 
 ## M0096 — RC Isolation-Test Suite: Feature Implementation & Spec Pass (filed 2026-05-12)
 
@@ -1023,6 +1071,33 @@ object support.
         deferred under CSV row E-002 pending the catalog-view parity + dump
         /restore round-trip enumerated in `docs/design/0110-0001-pg-dump-tap-port.md`.
         Resume point: 002_pg_dump (schema dump) then 003 (round-trip).
+      - **PROGRESS 2026-06-15 (loop #22):** **pg_dump connection-setup
+        compatibility LANDED** — the enabler for DU-002+. An empirical probe
+        (real `pg_dump --no-sync postgres` vs a live goopg server) showed pg_dump
+        aborting in `setup_connection()` *before* any catalog query. Two gap
+        classes closed: (a) three unregistered GUCs `synchronize_seqscans` /
+        `transaction_timeout` (PG 17+) / `row_security` added as accepted no-ops
+        in `internal/config/defaults.go` (+ `postgresql.conf.sample`; boot
+        on/0/on per guc_tables.c); (b) `SET TRANSACTION ISOLATION LEVEL
+        REPEATABLE READ, READ ONLY` — the server simple-query string fast-path
+        (`internal/server/query.go`) mis-routed `SET TRANSACTION …` to the GUC
+        setter (`unrecognized configuration parameter "TRANSACTION"`); a new case
+        routes `SET [LOCAL|SESSION] TRANSACTION …` / `SET SESSION CHARACTERISTICS
+        …` to the parser-based executor (existing `SetTransactionStmt`,
+        M0096-0002), and the parser's transaction-mode loop now consumes the
+        comma in `REPEATABLE READ, READ ONLY` (it stopped at the comma). pg_dump
+        now completes setup_connection and reaches its first catalog query.
+        **Next blocker (precise):** getRoles `SELECT oid, rolname FROM
+        pg_catalog.pg_roles ORDER BY 1` → goopg's `pg_roles` view lacks an `oid`
+        column. That is the start of the broad catalog-view parity (DU-002+).
+        Tests: `TestPort_PgDumpConnectionSetup` (e2e regression guard, self-
+        promoting — logs the pg_roles.oid gap, auto-tightens to exit-0 on a clean
+        dump), `config.TestPgDumpConnectionSetupGUCs`,
+        `parser.TestParseSetTransactionCommaSeparated`. Gates: build/gofmt/vet
+        clean; config + parser + server suites + pg_dump 001 PASS, no regression.
+        Design doc `0110-0001` extended (Connection-setup compatibility section).
+        Resume = add `oid` to the `pg_roles` view, then continue getRoles →
+        getTablespaces → getNamespaces… per setup_connection's query order.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
@@ -1103,7 +1178,7 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         | Test | Status | Rationale |
         |------|--------|-----------|
         | `postgres/src/bin/pg_amcheck/t/001_basic.pl` | **PORTED 2026-06-13 (CLI tier)** | `TestPort_PgAmcheck001Basic` (`internal/testport/pgamcheck_port_test.go`). 14-line CLI-only test (`program_help_ok`/`program_version_ok`/`program_options_handling_ok`) — decided by the binary's arg parser before any server connection. New `runToolWithLib` helper sets `LD_LIBRARY_PATH=postgres/local_install/lib` (bundled pg_amcheck links `PQcancelBlocking`, a PG 17+ libpq symbol absent from older host libpq). CSV row AC-001 → port. Design: `docs/design/0110-0003-pg-amcheck-tap-port.md`. |
-        | `postgres/src/bin/pg_amcheck/t/002_nonesuch.pl` | UNIMPLEMENTED (deferred AC-002) | Handles non-existent database/relation; still issues catalog queries against a live server. |
+        | `postgres/src/bin/pg_amcheck/t/002_nonesuch.pl` | **PORTED (AC-002 → port)** | `TestPort_PgAmcheck002Nonesuch`. Full pattern-resolution assertion set incl. both final `--all --exclude-schema` sections (.pl :377-418, ported loop #18 after the residual-#2 planner panic fix 36a085dc). One section deferred: `datconnlimit=-2` invalid-database filter (runtime shared-catalog write goopg lacks). |
         | `postgres/src/bin/pg_amcheck/t/003_check.pl` | UNIMPLEMENTED (deferred AC-002) | Runs actual heap/btree corruption checks against a server. |
         | `postgres/src/bin/pg_amcheck/t/004_verify_heapam.pl` | UNIMPLEMENTED (deferred AC-002) | `verify_heapam()` function required (not in goopg). |
         | `postgres/src/bin/pg_amcheck/t/005_opclass_damage.pl` | UNIMPLEMENTED (deferred AC-002) | Operator-class damage detection; requires opclass system catalog parity. |
@@ -1111,6 +1186,220 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         tests are deferred under CSV row AC-002, blocked on `verify_heapam()` SRF
         + opclass catalog coverage. Resume = promote AC-002 (002_nonesuch first —
         only error-path catalog lookups) when those land.
+      - **PROGRESS 2026-06-15 (loop #20):** AC-003 **enabler** — `CREATE SCHEMA`
+        is now **durable across a server restart** (the recurring 003_check
+        blocker noted in loops #15/#19: a `--schema s1` run clean pre-restart
+        reported `no relations to check` post-restart because the schema
+        registration was in-memory-only). Mirrors the CREATE/DROP DATABASE
+        WAL-record mechanism (M0054-0001), NOT the pg_class heap-append: new
+        physical-replay-no-op record kinds `RecordKindCreateSchema`=34
+        (`kind|oid|nameLen|name`, OID carried) / `RecordKindDropSchema`=35
+        (`internal/wal/recovery.go`); verbatim-mirror recovery driver
+        `replaySchemaDDLRecords` (`internal/initdb/schema_ddl_recovery.go`)
+        wired into `open.go` after the database-DDL replay; idempotent catalog
+        hooks `Register/UnregisterSchemaDuringRecovery`. Emitted at all three
+        execution routes (parsed `CompatNoopStmt{schema}` in `execCompatNoop`,
+        the parser-rejected compat-no-op branch in dispatch, and `DROP SCHEMA`
+        in `execDropCompat`; all `WAL != nil`-guarded). Non-transactional (like
+        CREATE DATABASE). PG-standby visibility (pg_namespace heap row +
+        2684/2685 indexes) is explicitly OUT OF SCOPE — goopg resolves schemas
+        via the in-memory registry, not the index. Tests: wal codec round-trip
+        (`internal/wal/schema_ddl_test.go`), initdb Open→append→Close→Open
+        replay (`internal/initdb/schema_ddl_recovery_test.go`), and e2e
+        `TestPort_CreateSchemaSurvivesRestart`
+        (`internal/testport/create_schema_durability_test.go`, over-the-wire
+        CREATE/DROP across two restarts). Gates: build/vet clean; wal + catalog
+        + initdb + executor + server + amcheck-alltables/003 suites PASS, no
+        regression. Design doc `0110-0012-create-schema-wal-durability.md` +
+        README index. AC-003 stays `defer` (the remaining 003 tiers still need
+        the index AMs / column types / TOAST / multi-DB feature work).
+      - **PROGRESS 2026-06-15 (loop #21):** AC-003 — **user-schema TABLE
+        durability across restart** (completes loop #20's CREATE SCHEMA work) and
+        the **schema-scoped 003_check tier** ported. Loop #20 made the schema
+        name/OID survive a restart, but a table created in a user schema still
+        reloaded under the wrong namespace: the write side `namespaceOIDForSchema`
+        collapsed every non-`public` schema to the `pg_catalog` OID (11) so `s1.t`
+        was written `relnamespace=11` and the read side `loadUserTablesFromHeap`
+        reloaded it as `pg_catalog.t` → `pg_amcheck --schema s1` found no
+        relations post-restart (the exact 003_check symptom logged in loops
+        #15/#19). Fix makes the sibling encode/decode pair agree on the **real
+        schema OID** from the registry 0110-0012 restores: `namespaceOIDForSchema(
+        cat, schema)` resolves a registered user schema via `cat.SchemaOID`;
+        `loadUserTablesFromHeap` + `loadUserIndexesFromHeap` reverse-map a
+        non-system `relnamespace` via the new `cat.SchemaNameForOID`;
+        `replaySchemaDDLRecords` moved **before** table load in `open.go` so the
+        registry is populated when the reverse-map runs; `SchemaOID` promoted onto
+        the `Catalog` interface. No new durability machinery — only corrects the
+        value written to an existing `pg_class` column so the heap-scan recovery
+        is lossless. New e2e `TestPort_PgAmcheck003SchemaScoped`
+        (`internal/testport/pgamcheck003_schemascoped_test.go`): corrupts
+        `s1.t003sc`'s heap file across a stop→corrupt→restart cycle and asserts a
+        `--schema s1` run reports the missing file (exit 2) — proving schema + its
+        table survived with correct association end-to-end. Unit gates
+        `TestSchemaOIDNameRoundTrip` + `TestNamespaceOIDForSchemaResolvesUserSchema`.
+        Sibling-path class [[pattern_sibling_paths_must_agree]]. Gates:
+        build/vet/gofmt clean; catalog + initdb + executor + server + full
+        pg_amcheck testport + `TestPort_CreateSchemaSurvivesRestart` PASS (no
+        regression); TPC-H spotcheck SKIP (no data dir; change touches only
+        non-`public` namespace resolution, public tables byte-identical). Design
+        doc `0110-0013-user-schema-table-durability.md` + README + CSV AC-003 +
+        markdown. PG-standby user-schema visibility stays out of scope. AC-003
+        stays `defer`.
+      - **PROGRESS 2026-06-15 (loop #19):** AC-003 — the **central combined-
+        corruption integration tier** of `003_check.pl` (its main check, :347-365)
+        LANDED. The three sibling surrogates each inject ONE corruption on a
+        single-relation fixture; none proves the property 003_check's main check
+        actually asserts — that pg_amcheck reports MULTIPLE distinct corruption
+        classes across a multi-relation DB in ONE pass without aborting on the
+        first corrupt relation (the removed-heap-file case raises ERROR 58030, not
+        a corruption row). New `TestPort_PgAmcheck003CombinedCorruption`
+        (`internal/testport/pgamcheck003_combined_test.go`) injects all three —
+        removed btree index fork (`tfork_idx`), removed heap file (`tfile`),
+        overwritten heap line pointer (`tpage`, reusing `corruptFirstLinePointer-
+        Length`) — in a SINGLE stop→corrupt→restart cycle (mirroring
+        `perform_all_corruptions`), then asserts one scoped run reports all three
+        upstream-verbatim regexes together (`index .* lacks a main relation fork`
+        + `line pointer` + `could not open file .*: No such file or directory`)
+        with exit 2 and empty stderr. PASS (11.1s); full pg_amcheck port suite PASS
+        (33.7s, no regression). **Pure faithful port, ZERO engine change** — goopg's
+        per-relation dispatch already reports all three. Surfaced a SEPARATE gap
+        (out of scope): goopg does not persist a `CREATE SCHEMA` `pg_namespace` row
+        across restart (a first `--schema s1` run was clean pre-corruption but
+        reported `no relations to check` post-restart), so the fixture uses
+        `public` + one `--table` per relation like every AC-003 surrogate. Gates:
+        gofmt + `go vet ./internal/testport` clean; build clean. CSV AC-003 +
+        markdown + design doc `0110-0003` (new "Combined-corruption integration
+        tier" section) updated. AC-003 stays `defer` (hash/gist/gin/brin/spgist
+        AMs, box/int4range/int4[] types, STORAGE EXTERNAL TOAST, multi-DB
+        orchestration; 005_opclass_damage still need feature work).
+      - **PROGRESS 2026-06-15 (loop #15):** AC-003 — the **heap-table file-removal
+        corruption tier** of `003_check.pl` LANDED (the companion to loop #14's
+        index fork). `003_check` removes an ordinary table's backing file
+        (`plan_to_remove_relation_file('db1','s2.t1')`, :275) and asserts
+        pg_amcheck reports `could not open file ".*": No such file or directory`
+        (exit 2, :327/:357-365). Same `os.O_CREATE` hazard: `verifyHeapamOp.Open`'s
+        `Pool.NBlocks` would recreate the removed heap fork as an empty 0-block
+        file → `VerifyHeapRelation` reports the table *clean* (silent false
+        negative). Fix reuses the stat-only seam: `verifyHeapamOp.Open` calls
+        `ctx.Pool.Exists(rel)` BEFORE `NBlocks`; absent → `58030` (ERRCODE_IO_ERROR,
+        what `mdopenfork`'s `errcode_for_file_access` yields for ENOENT) with the
+        verbatim `could not open file "%s": No such file or directory`. The path is
+        built by new `storage.Manager.RelPath`/`Pool.RelPath` (data-dir-relative
+        `base/<db>/<relfile>`, faithful to upstream `relpath()`). Unit gate
+        `TestVerifyHeapam_DetectsMissingRelationFile` (drops fork, asserts msg).
+        E2E `TestPort_PgAmcheck003MissingHeapFile`
+        (`internal/testport/pgamcheck003_missingheap_test.go`) drives the real
+        pg_amcheck over stop→unlink→restart (exit 2 + verbatim report) AND asserts
+        the fork is NOT recreated on restart — PASS (7.0s). Gates: `go build ./...`
+        clean; full `internal/testport` pg_amcheck suite PASS (20.4s);
+        `internal/executor` + `internal/storage` PASS; vet clean. CSV AC-003 +
+        markdown + design doc `0110-0003` updated. STILL DEFERRED (AC-003 stays
+        `defer`): hash/gist/gin/brin/spgist index AMs, box/int4range/int4[] types,
+        STORAGE EXTERNAL TOAST corruption, page-overwrite for unsupported
+        relkinds, multi-DB orchestration; 005_opclass_damage.
+      - **PROGRESS 2026-06-15 (loop #14):** AC-003 — the **index file-removal
+        (missing-main-relation-fork) corruption tier** of `003_check.pl` LANDED.
+        goopg's smgr opens relation files with `os.O_CREATE`, so `Pool.NBlocks`
+        on a removed fork silently RECREATED it as an empty 0-block file → the
+        btree engine reported the index *clean* (a silent false negative exactly
+        where PG reports corruption). Fix mirrors `bt_index_check_callback`'s
+        `smgrexists(MAIN_FORKNUM)` guard (`verify_nbtree.c:318`): new stat-only
+        `storage.Manager.Exists`/`Pool.Exists` (pure `os.Stat(relPath)`, never the
+        `O_CREATE` `relFile` path — every live rel has an on-disk file, so a stat
+        never false-negatives a live rel nor recreates a removed one), called in
+        `evalBtIndexCheck` BEFORE `NBlocks`; absent → `XX002`
+        (ERRCODE_INDEX_CORRUPTED) with verbatim `index "%s" lacks a main relation
+        fork`. Covers `bt_index_check` + `bt_index_parent_check`. Unit gate
+        `TestBtIndexCheck_DetectsMissingRelationFork` (drops the fork, asserts the
+        message). E2E `TestPort_PgAmcheck003MissingIndexFork`
+        (`internal/testport/pgamcheck003_missingfork_test.go`) drives the real
+        pg_amcheck over the full stop→unlink→restart lifecycle (exit 2 + verbatim
+        report) AND asserts goopg does NOT recreate the fork on restart (the
+        load-bearing property a unit test can't prove) — PASS (7.3s). Gates:
+        `go build ./...` clean; full `internal/testport` pg_amcheck suite PASS
+        (13.8s); `internal/executor` + `internal/storage` PASS; vet clean. CSV
+        AC-003 rationale + markdown + design doc `0110-0003` updated. STILL
+        DEFERRED (AC-003 stays `defer`): heap-table file-removal (`could not open
+        file` message needs a typed missing-file error from smgr), the
+        hash/gist/gin/brin/spgist index AMs, box/int4range/int4[] types, STORAGE
+        EXTERNAL TOAST corruption, multi-DB orchestration; 005_opclass_damage
+        (CREATE OPERATOR CLASS + pg_amproc parity).
+      - **PROGRESS 2026-06-15 (loop #11):** AC-003 — **whole-database
+        relation-enumeration tier ported + blocker #3 hypothesis REFUTED**.
+        `003_check.pl`'s clean-db path runs the *default* `pg_amcheck` (no
+        scoping), which enumerates every checkable relation and dispatches
+        `verify_heapam`/`bt_index_check` per relation — a distinct tier from the
+        single-`--table` path. New `TestPort_PgAmcheckAllTables`
+        (`internal/testport/pgamcheck_alltables_port_test.go`) drives the real
+        binary over a goopg DB mixing the relkinds `003_check` builds that goopg
+        supports (heap table, several btree indexes incl. UNIQUE, sequence, view,
+        materialized view) in a user schema; a `--schema s1` run checks the
+        heap+btree subset and skips the view/sequence — **clean (exit 0)**. It
+        also drives the *unscoped whole-database* run (which would reach
+        `pg_catalog.*`) — **also clean (exit 0)**, which empirically REFUTES the
+        prior blocker #3 ("system-catalog heap resolution"): goopg never feeds its
+        system catalogs to pg_amcheck's heap-check dispatch, so there is no
+        `verify_heapam`-on-catalog gap to close. The dispatch fixes (blocker #1
+        lateral pushdown, blocker #2 install-schema `bt_index_check`) are asserted
+        as hard regressions. Remaining `003_check` blockers are now purely
+        feature/corruption — hash/gist/gin/brin/spgist AMs goopg lacks,
+        box/int4range/int4[] types, STORAGE EXTERNAL TOAST corruption, multi-DB
+        orchestration, and the file-removal/page-overwrite corruption mechanics
+        (multi-milestone). Gates: full `internal/testport` pg_amcheck suite PASS
+        (001/002/004 + btree + alltables); gofmt + `go vet ./internal/testport`
+        clean. Design doc `0110-0003` + CSV AC-003 + markdown updated. AC-003 stays
+        `defer` (003 + 005 need the feature work above).
+      - **PROGRESS 2026-06-15 (loop #8):** AC-003 enabler — **lateral
+        outer-qual pushdown** landed (`pushOuterQualsIntoLaterals` in
+        `internal/planner/pushdown.go`), the dominant blocker for
+        relation-scoped `pg_amcheck` runs. Live-wire diagnosis showed
+        pg_amcheck's heap command is an implicit-LATERAL comma-join
+        `FROM pg_catalog.pg_class c, "<schema>".verify_heapam(relation := c.oid,
+        …) v WHERE c.oid = N`; goopg planned the residual `WHERE c.oid = N`
+        *above* the lateral nested-loop, so `verify_heapam` was opened for EVERY
+        pg_class row and raised `could not open relation` on the first non-heap
+        sibling (an index/sequence OID) before the filter could drop it — exit 2
+        on a perfectly healthy target whenever the DB held >1 relation. The new
+        pass moves an outer-only conjunct (sideLeft by index AND name;
+        `collectScanOutputNames` now covers the `*Values` virtual-catalog node)
+        onto the lateral join's outer child, matching PG's nested-loop qual
+        placement. No-op unless the residual Filter's direct child is a Lateral
+        join → zero impact on non-lateral shapes (all of TPC-H). After the fix
+        `pg_amcheck --table public.t` and `--table … --no-dependent-indexes`
+        return exit 0 over a multi-table/indexed DB (verified end-to-end). Regression
+        `TestPlanOuterQualPushedBelowLateralJoin` (planner_test.go). Gates: full
+        `internal/planner` + `internal/executor` suites PASS; `go vet`
+        planner/server clean; 001/002/004 amcheck port tests PASS; build ./...
+        clean; gofmt clean. TPC-H spotcheck SKIPPED (no data dir loaded in this
+        tree) — safe by construction (lateral-only guard). Diagnostic also
+        pinned the two AC-003 remainders for `003_check`: (#2) `bt_index_check`
+        schema-qualified dispatch (`public.bt_index_check does not exist` —
+        `evalFuncCall` strips only `pg_catalog.`), and (#3) system-catalog heap
+        resolution in `verifyHeapamResolveTable`/`LookupTableByOID`. Design doc
+        `0110-0003` extended (lateral-pushdown + 003_check-blockers sections).
+        Resume = bt_index_check schema-qualifier (blocker #2, small).
+      - **PROGRESS 2026-06-15 (loop #7):** AC-003 — the **page-structural heap
+        tier of `004_verify_heapam.pl`** is ported as
+        `TestPort_PgAmcheck004VerifyHeapam`
+        (`internal/testport/pgamcheck004_port_test.go`), driving the real
+        pg_amcheck binary against a live goopg cluster end-to-end. Mirrors
+        upstream's stop→seek/overwrite→restart corruption mechanism: inits with
+        `--no-data-checksums` (upstream `no_data_checksums=>1`; goopg now defaults
+        checksums ON, which would otherwise trip the storage-manager checksum
+        verify before verify_heapam sees the damage), CREATE EXTENSION amcheck,
+        inserts rows, locates the heap file by globbing `base/*/<reloid>` (goopg's
+        storage dbOid ≠ pg_database.oid), stops cleanly, overwrites the first line
+        pointer's length on block 0 to 0x7FFF so lp_off+lp_len>BLCKSZ, restarts,
+        re-CREATE EXTENSION amcheck (runtime-only install per gap #7c doesn't
+        survive restart), and asserts pg_amcheck exits 2 with the upstream-verbatim
+        `line pointer to page offset N with length 32767 ends beyond maximum page
+        offset 8192` report on stdout. PASS (3.1s); 001/002 still PASS. CSV AC-003
+        rationale + design doc 0110-0003 + README index updated. NOT ported
+        (goopg-divergent): 004's MVCC/attribute + TOAST tiers corrupt PG's on-disk
+        varatt_external pointer layout (goopg uses chunk-relation TOAST). AC-003
+        stays `defer` — `003_check` (whole-db orchestration; needs system-catalog
+        heap pages to verify cleanly) and `005_opclass_damage` (CREATE OPERATOR
+        CLASS + pg_amproc parity) remain.
       - **PROGRESS 2026-06-14 (loop #51):** the **page-structural core of
         `verify_heapam()` landed** as a standalone `internal/amcheck` engine
         (`VerifyHeapPage`), following the engine-first/wire-later pattern (cf. the
