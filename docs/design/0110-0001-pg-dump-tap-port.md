@@ -818,6 +818,21 @@ fixed one logical group per loop:
     reads `pg_proc.procost` (the planner's estimated per-row execution cost,
     `float4`). The next slice must add `procost` to the pg_proc view.
 
+37. **`pg_proc.procost` column — DONE.** dumpFunc projects `procost` (the
+    planner's estimated per-row execution cost); goopg's `pg_proc` virtual view
+    did not expose it, so `EXECUTE dumpFunc('1654')` aborted with
+    `column "procost" does not exist`. Added the `procost float4` column,
+    mirroring PG's `CREATE FUNCTION` default in `compute_function_attributes`:
+    `1` for internal/C-language functions (`DEFAULT_FUNCTION_COST`), `100` for
+    all other languages. Built-in stubs (internal language) emit `1`; user
+    routines derive the cost from `catalog.Routine.Language`. Catalog-only
+    change (`internal/initdb/pg_proc_view.go`); guard `TestPgProcViewProcost`.
+    After this slice pg_dump advances within `dumpFunc`; the **new** blocker is
+    `column "prorows" does not exist` (`EXECUTE dumpFunc('1654')`) - dumpFunc
+    reads `pg_proc.prorows` (the estimated result-row count for set-returning
+    functions, `float4`; PG default `0` for non-SRFs, `1000` for SRFs). The
+    next slice must add `prorows` to the pg_proc view.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

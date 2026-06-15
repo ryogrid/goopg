@@ -201,6 +201,53 @@ func TestPgProcViewProconfig(t *testing.T) {
 	}
 }
 
+// TestPgProcViewProcost pins the procost column (DU-002 slice 37):
+// built-in stubs (internal language) cost 1; a user routine's cost is
+// derived from its language — 1 for internal/C, 100 for all others.
+// dumpFunc reads procost to emit `COST <n>` when it differs from the default.
+func TestPgProcViewProcost(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "plf",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "plpgsql",
+		Body:       "BEGIN RETURN 1; END",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "cf",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "c",
+		Body:       "cfunc",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	// procost is the last column (index 18), appended after proconfig (17).
+	const procost = 18
+	// Built-in stubs are internal-language: cost 1.
+	for i := range builtinProcs {
+		if rows[i][procost] != "1" {
+			t.Errorf("built-in stub %q procost = %q, want 1", rows[i][1], rows[i][procost])
+		}
+	}
+	userRows := rows[len(builtinProcs):]
+	// Insertion order: plf (plpgsql → 100), cf (c → 1).
+	if userRows[0][1] != "plf" || userRows[0][procost] != "100" {
+		t.Errorf("plf procost = %q, want 100", userRows[0][procost])
+	}
+	if userRows[1][1] != "cf" || userRows[1][procost] != "1" {
+		t.Errorf("cf procost = %q, want 1", userRows[1][procost])
+	}
+}
+
 // TestPgProcViewOrdering pins that the row order matches OID
 // ordering — an operator's `ORDER BY oid` is a no-op against this
 // view's natural order, which makes diff-based regression tests

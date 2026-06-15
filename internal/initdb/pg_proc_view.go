@@ -166,6 +166,10 @@ var builtinProcs = []builtinProcRow{
 //     (goopg has no C functions). dumpFunc reads it to emit `AS '<probin>'`.
 //   - proconfig: per-function GUC SET clauses (text[]); always NULL — goopg
 //     tracks no per-function SET, so dumpFunc emits no `SET ...` lines.
+//   - procost: planner's estimated per-row execution cost (float4). Mirrors
+//     PG's CREATE FUNCTION default — 1 for internal/C-language functions,
+//     100 for all others. goopg stores no explicit cost, so it derives this
+//     from the routine's language.
 //
 // pronargs/proacl/proowner were added for pg_dump's getFuncs SELECT (M0110-0001
 // DU-002 slice 7), which projects `p.pronargs, …, p.proacl, …, p.proowner`.
@@ -192,6 +196,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "proretset", Type: catalog.Type{Name: "bool"}},
 			{Name: "probin", Type: catalog.Type{Name: "text"}},
 			{Name: "proconfig", Type: catalog.Type{Name: "text[]"}},
+			{Name: "procost", Type: catalog.Type{Name: "float4"}},
 		},
 		Virtual: true,
 	}
@@ -218,6 +223,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"f", // proretset: built-in stubs (abs/RI_FKey) are not SRFs
 				"",  // probin: NULL (internal funcs have no on-disk binary path)
 				"",  // proconfig: NULL (no per-function GUC SET clauses)
+				"1", // procost: internal-language default (DEFAULT_FUNCTION_COST)
 			})
 		}
 		// Append user-defined routines.
@@ -265,6 +271,14 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			if r.ReturnsSet {
 				retset = "t"
 			}
+			// procost: PG's CREATE FUNCTION default — 1 for internal/C-language
+			// functions, 100 for all others (DEFAULT_FUNCTION_COST vs the
+			// higher cost charged to interpreted languages).
+			procost := "100"
+			switch strings.ToLower(r.Language) {
+			case "internal", "c":
+				procost = "1"
+			}
 			rows = append(rows, []string{
 				fmt.Sprintf("%d", r.OID),
 				r.Name,
@@ -282,8 +296,9 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				strict,
 				prokind,
 				retset,
-				"", // probin: NULL (goopg has no C-language functions)
-				"", // proconfig: NULL (goopg tracks no per-function GUC SET)
+				"",      // probin: NULL (goopg has no C-language functions)
+				"",      // proconfig: NULL (goopg tracks no per-function GUC SET)
+				procost, // procost: language-derived (1 internal/C, else 100)
 			})
 		}
 		return rows
