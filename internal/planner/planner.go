@@ -8179,6 +8179,9 @@ func exprType(e Expr) catalog.Type {
 			"pg_database_size", "pg_relation_size", "pg_total_relation_size",
 			"pg_indexes_size", "pg_table_size":
 			return catalog.Type{Name: "int8"}
+		case "bt_index_check", "bt_index_parent_check":
+			// amcheck verification functions RETURN void (slice S4 of 0110-0008).
+			return catalog.Type{Name: "void"}
 		case "round", "ceil", "ceiling", "floor", "trunc", "sign":
 			// Preserve input numeric type; default to numeric when unknown.
 			if len(x.Args) > 0 {

@@ -1,6 +1,6 @@
 # 0110-0008 — amcheck SQL surface wiring plan (M0110-0003)
 
-**Status:** S1+S2+S3 landed (worktree `m0110-0003-amcheck-sql-surface`); S4–S5 remain (merge blocked on a clean working tree)
+**Status:** S1+S2+S3+S4 landed (worktree `m0110-0003-amcheck-sql-surface`); S5 remains (merge blocked on a clean working tree)
 **Scope:** the `CREATE EXTENSION amcheck` + SRF SQL surface that wires the
 already-committed `internal/amcheck` engine to the wire protocol and promotes the
 deferred `AC-002`…`AC-005` pg_amcheck TAP tests.
@@ -104,7 +104,7 @@ type-check; their execution is exercised by `003`/`004`, not `002`.
 | **S1** | `CREATE EXTENSION amcheck` DDL: parse → dispatch → executor → `pg_extension` row + `pg_namespace` resolve | — | parser `ast.go`/`ddl.go`, `server/dispatch.go`, `executor/operators_ddl.go`, `catalog/catalog.go` |
 | **S2** | `pg_extension` catalog relation + the §1 probe answerable; seed `pg_proc` rows for the three SRFs (exist, not yet callable) | **AC-002** (`002_nonesuch`) | `catalog/catalog.go`, `planner/planner.go` (FROM whitelist) |
 | **S3 ✅** | `verify_heapam(...)` SRF executor — a **thin adapter** over `amcheck.VerifyHeapRelation` (the block loop lives in the engine, `verify_heapam_relation.go`): fills a `PageSource` from the buffer pool, passes `nblocks` + `RelDesc.Natts`/`NextXid`/`RelFrozenXid` (clog-backed `XidStatusFunc` deferred — no clog handle in the executor yet), streams `HeapRelReport`s as `(blkno,offnum,attnum,msg)` rows | (toward AC-004 heap path) | `planner/{plan,planner,foldconst,unnest}.go`, `parser/select.go`, `analyzer/analyzer.go`, new `executor/operators_verify_heapam.go` + `executor.go` |
-| **S4** | `bt_index_check` / `bt_index_parent_check` SRFs over `amcheck.VerifyBtree*` (+ heapallindexed) | AC-003/004 (index path) | `planner/plan.go`, new `executor/operators_bt_index_check.go` |
+| **S4 ✅** | `bt_index_check` / `bt_index_parent_check` scalar `void` functions over `amcheck.VerifyBtree*` — they are SELECT-list scalars (not FROM SRFs like verify_heapam), so they live in `evalFuncCall` dispatch; structural tiers (`VerifyBtreePage`/`VerifyBtreeItemOrder` per block, `VerifyBtreeLevelSiblingLinks` per level via leftmost-descent, `VerifyBtreeParentDownlinks` per internal page on parent-check) raise `XX002` on findings; `heapallindexed`/`rootdescend`/`checkunique` args accepted, deeper tiers deferred to S5 | (toward AC-003/004 index path) | `planner/planner.go` (`exprType` void), `executor/expr.go` (dispatch), new `executor/operators_bt_index_check.go` |
 | **S5** | port `002`→`005` TAP tests; flip CSV `AC-002…AC-005`→`port`; regen md | — | `internal/testport/pgamcheck_port_test.go`, `docs/test-port/*` |
 
 New-file slices (the executor ops, the testport additions) touch **zero**
@@ -163,8 +163,19 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
     `testport.TestPort_AmcheckCreateExtension` (pre-install 0 rows → install →
     1 row `(public, 1.4)` → duplicate errors → IF NOT EXISTS idempotent →
     unknown extension errors). Both PASS.
-- **Remaining:** S3 `verify_heapam` SRF, S4 `bt_index_check`/`bt_index_parent_check`
-  SRFs, S5 port the `AC-002`…`AC-005` pg_amcheck TAP tests. Per the scope
+- **S4 `bt_index_check` / `bt_index_parent_check`** (landed, executor +
+    planner): scalar `void` functions in `executor/operators_bt_index_check.go`,
+    dispatched from `evalFuncCall` (they are SELECT-list scalars, *not* FROM-clause
+    SRFs — `SELECT bt_index_check(c.oid, false) FROM pg_class c, pg_index i …`),
+    with `exprType` returning `void` (OID 2278). Each resolves the index regclass
+    (OID or name), fills a `PageSource` from the buffer pool over the index's
+    `IndexRelFileNode`, and drives the engine's structural tiers; any
+    `[]amcheck.BtreeReport` finding raises `XX002` (ERRCODE_INDEX_CORRUPTED) with
+    the first message + a multi-finding DETAIL. Clean index → `void`.
+    Tests: `executor.TestBtIndexCheck_{CleanIndexNoError (no-false-positive gate,
+    both funcs, all positional shapes), DetectsCorruptMetapage (clobbered magic →
+    raise), NonexistentIndex}`. All PASS.
+- **Remaining:** S5 port the `AC-002`…`AC-005` pg_amcheck TAP tests. Per the scope
   refinement above, `002_nonesuch` (`AC-002`) exercises only `CREATE EXTENSION
   amcheck` + the install probe, so S1+S2 satisfy its *server-side* requirement;
   promoting `AC-002` to `port` still needs S5 (the TAP port itself) plus the SRFs
@@ -172,10 +183,31 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
 
 ## Deferral
 
-S1+S2+S3 landed (above) in worktree `m0110-0003-amcheck-sql-surface`; S4–S5
-remain. Merging the worktree to the active branch still waits for a clean tree
-(the main-tree foreign gen-column WIP). Resume point is **Slice S4**
-(`bt_index_check` / `bt_index_parent_check` SRFs). See `.ralph/deferral_ledger.md`.
+S1+S2+S3+S4 landed (above) in worktree `m0110-0003-amcheck-sql-surface`; S5
+remains. Merging the worktree to the active branch still waits for a clean tree
+(the main-tree foreign gen-column WIP). Resume point is **Slice S5** (port the
+`AC-002`…`AC-005` pg_amcheck TAP tests, add named-arg/LATERAL + clog wiring).
+See `.ralph/deferral_ledger.md`.
+
+**S4 carries three intentional follow-ups** (recorded so S5 does not re-discover
+them):
+
+1. **`heapallindexed` (heap↔index completeness)** — the deepest tier. The engine
+   seam exists (`amcheck.VerifyBtreeHeapAllIndexedRelation` +
+   `CollectBtreeLeafEntries`), and the executor already has the heap-tuple →
+   index-key encoder (`encodeIndexKeyFromCols`), but forming the MVCC-visible
+   heap entry set (which tuples *should* be indexed) is the missing piece. The
+   default pg_amcheck B-tree probe passes `heapallindexed := false`, so S4 serves
+   it; the arg is accepted and the structural tiers always run.
+2. **`rootdescend` / `checkunique`** (`bt_index_parent_check` only) — accepted but
+   their bt_index_parent_check-specific deeper checks (root-to-leaf re-descent,
+   cross-entry uniqueness) are not yet wired; the parent-downlink structural tier
+   is active.
+3. **named-argument + LATERAL call shape** — pg_amcheck issues
+   `bt_index_check(index := c.oid, heapallindexed := false)` correlated against
+   `pg_class ⋈ pg_index`. goopg's parser has no `name := value` syntax, so S4 is
+   **positional-only** (`bt_index_check('ix')`, `bt_index_check('ix', false)`),
+   shared with S3's identical follow-up — the named-arg + LATERAL plumbing is S5.
 
 **S3 carries two intentional follow-ups** (recorded so S5 does not re-discover
 them):
