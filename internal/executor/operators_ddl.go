@@ -6416,10 +6416,23 @@ func catalogDBOids(ctx *Context) []uint32 {
 	return oids
 }
 
-// namespaceOIDForSchema maps a schema name to its pg_catalog namespace OID.
-func namespaceOIDForSchema(schema string) uint32 {
+// namespaceOIDForSchema maps a schema name to its namespace OID. The system
+// schemas resolve to their fixed OIDs; a user schema created via CREATE SCHEMA
+// resolves to the OID the catalog assigned it (so a user table's pg_class row
+// carries a relnamespace that the restart-recovery path can reverse-map back to
+// the schema name — M0110-0003). An unregistered or nil-catalog schema falls
+// back to pg_catalog, preserving the pre-M0110-0003 behaviour.
+func namespaceOIDForSchema(cat catalog.Catalog, schema string) uint32 {
 	if schema == "" || schema == "public" {
 		return catalog.PublicNamespaceOID
+	}
+	if schema == "pg_catalog" {
+		return catalog.PGCatalogNamespaceOID
+	}
+	if cat != nil {
+		if oid := cat.SchemaOID(schema); oid != 0 {
+			return oid
+		}
 	}
 	return catalog.PGCatalogNamespaceOID
 }
@@ -6439,11 +6452,11 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(tbl))
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRow(ctx.Catalog, tbl))
 	if err != nil {
 		return fmt.Errorf("pg_class: %w", err)
 	}
-	relnamespace := namespaceOIDForSchema(tbl.Schema)
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, tbl.Schema)
 	if err := insertPgClassOidIndexEntry(ctx, tbl.OID, classTID); err != nil {
 		return fmt.Errorf("pg_class_oid_index: %w", err)
 	}
@@ -6498,11 +6511,11 @@ func syncIndexToCatalogHeap(ctx *Context, idx *catalog.Index) error {
 		RelOid: catalog.RelationRelationId,
 		Fork:   storage.MainFork,
 	}
-	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(idx))
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForIndex(ctx.Catalog, idx))
 	if err != nil {
 		return fmt.Errorf("pg_class for index: %w", err)
 	}
-	relnamespace := namespaceOIDForSchema(idx.Schema)
+	relnamespace := namespaceOIDForSchema(ctx.Catalog, idx.Schema)
 	if err := insertPgClassOidIndexEntry(ctx, idx.OID, classTID); err != nil {
 		return fmt.Errorf("pg_class_oid_index for index: %w", err)
 	}

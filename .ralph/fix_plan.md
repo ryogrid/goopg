@@ -1186,6 +1186,38 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         regression. Design doc `0110-0012-create-schema-wal-durability.md` +
         README index. AC-003 stays `defer` (the remaining 003 tiers still need
         the index AMs / column types / TOAST / multi-DB feature work).
+      - **PROGRESS 2026-06-15 (loop #21):** AC-003 — **user-schema TABLE
+        durability across restart** (completes loop #20's CREATE SCHEMA work) and
+        the **schema-scoped 003_check tier** ported. Loop #20 made the schema
+        name/OID survive a restart, but a table created in a user schema still
+        reloaded under the wrong namespace: the write side `namespaceOIDForSchema`
+        collapsed every non-`public` schema to the `pg_catalog` OID (11) so `s1.t`
+        was written `relnamespace=11` and the read side `loadUserTablesFromHeap`
+        reloaded it as `pg_catalog.t` → `pg_amcheck --schema s1` found no
+        relations post-restart (the exact 003_check symptom logged in loops
+        #15/#19). Fix makes the sibling encode/decode pair agree on the **real
+        schema OID** from the registry 0110-0012 restores: `namespaceOIDForSchema(
+        cat, schema)` resolves a registered user schema via `cat.SchemaOID`;
+        `loadUserTablesFromHeap` + `loadUserIndexesFromHeap` reverse-map a
+        non-system `relnamespace` via the new `cat.SchemaNameForOID`;
+        `replaySchemaDDLRecords` moved **before** table load in `open.go` so the
+        registry is populated when the reverse-map runs; `SchemaOID` promoted onto
+        the `Catalog` interface. No new durability machinery — only corrects the
+        value written to an existing `pg_class` column so the heap-scan recovery
+        is lossless. New e2e `TestPort_PgAmcheck003SchemaScoped`
+        (`internal/testport/pgamcheck003_schemascoped_test.go`): corrupts
+        `s1.t003sc`'s heap file across a stop→corrupt→restart cycle and asserts a
+        `--schema s1` run reports the missing file (exit 2) — proving schema + its
+        table survived with correct association end-to-end. Unit gates
+        `TestSchemaOIDNameRoundTrip` + `TestNamespaceOIDForSchemaResolvesUserSchema`.
+        Sibling-path class [[pattern_sibling_paths_must_agree]]. Gates:
+        build/vet/gofmt clean; catalog + initdb + executor + server + full
+        pg_amcheck testport + `TestPort_CreateSchemaSurvivesRestart` PASS (no
+        regression); TPC-H spotcheck SKIP (no data dir; change touches only
+        non-`public` namespace resolution, public tables byte-identical). Design
+        doc `0110-0013-user-schema-table-durability.md` + README + CSV AC-003 +
+        markdown. PG-standby user-schema visibility stays out of scope. AC-003
+        stays `defer`.
       - **PROGRESS 2026-06-15 (loop #19):** AC-003 — the **central combined-
         corruption integration tier** of `003_check.pl` (its main check, :347-365)
         LANDED. The three sibling surrogates each inject ONE corruption on a

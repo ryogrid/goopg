@@ -483,6 +483,10 @@ type Catalog interface {
 	TablesInSchema(schemaName string) []parser.ObjectName
 	// SchemaExists reports whether a schema has been registered.
 	SchemaExists(name string) bool
+	// SchemaOID returns the OID of a registered schema (0 if not found). Used by
+	// syncTableToCatalogHeap to stamp a user table's pg_class.relnamespace with
+	// the real schema OID so the schema survives a restart (M0110-0003).
+	SchemaOID(name string) uint32
 	// RegisterSchema records a user-created schema. M0097-drop_if_exists.
 	RegisterSchema(name string)
 	// UnregisterSchema removes a schema from the registry. M0097-drop_if_exists.
@@ -4208,6 +4212,27 @@ func (c *InMemory) SchemaOID(name string) uint32 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.schemas[strings.ToLower(name)]
+}
+
+// SchemaNameForOID returns the registered schema name for the given namespace
+// OID ("" if no schema carries that OID). It is the reverse of SchemaOID and is
+// used by the restart recovery path (loadUserTablesFromHeap /
+// loadUserIndexesFromHeap) to reconstruct a user table's schema from the
+// pg_class.relnamespace OID recovered from the heap. Pre-populated system
+// schemas (pg_catalog/public) are handled by their fixed OIDs at the call site;
+// this resolves user schemas registered via CREATE SCHEMA. M0110-0003.
+func (c *InMemory) SchemaNameForOID(oid uint32) string {
+	if oid == 0 {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for name, o := range c.schemas {
+		if o == oid {
+			return name
+		}
+	}
+	return ""
 }
 
 // RegisterSchema records a user-created schema. Called from execCreateSchema.

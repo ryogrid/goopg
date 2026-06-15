@@ -92,11 +92,15 @@ func TestPort_PgAmcheck003CombinedCorruption(t *testing.T) {
 	//   tfile                     — heap file will be removed
 	//   tpage                     — heap page line pointer will be overwritten
 	//
-	// All live in the public schema: goopg does not persist a CREATE SCHEMA
-	// pg_namespace row across a server restart (a separate catalog-durability gap
-	// — every AC-003 surrogate scopes to public for the same reason), so a custom
-	// schema would vanish on the restart this tier requires. The run is scoped
-	// with one --table per relation, mirroring TestPort_PgAmcheck003MissingHeapFile.
+	// All live in the public schema and the run is scoped with one --table per
+	// relation, mirroring TestPort_PgAmcheck003MissingHeapFile. (User-schema
+	// durability across the restart this tier requires was the historical reason
+	// for the public workaround; it is now fixed — CREATE SCHEMA via WAL replay
+	// in loop #20 and user-schema TABLE relnamespace round-trip in loop #21 — and
+	// the genuinely schema-scoped `--schema s1` corruption tier is covered by
+	// TestPort_PgAmcheck003SchemaScoped. This combined tier keeps public because
+	// its value is the multi-relation single-pass property, orthogonal to schema
+	// scoping.)
 	for _, stmt := range []string{
 		"CREATE TABLE tfork (a int, b text)",
 		"INSERT INTO tfork SELECT g, 'row-' || g FROM generate_series(1, 200) g",
