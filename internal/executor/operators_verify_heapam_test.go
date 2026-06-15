@@ -10,6 +10,7 @@ package executor
 
 import (
 	"encoding/binary"
+	"strings"
 	"testing"
 
 	"github.com/goopg/goopg/internal/parser"
@@ -120,6 +121,39 @@ func TestVerifyHeapam_StartBlockOutOfRange(t *testing.T) {
 	_, err := runQueryWithErr(ctx, "SELECT * FROM verify_heapam('vh', false, false, 'none', 999, 999)")
 	if err == nil {
 		t.Fatal("out-of-range startblock did not error")
+	}
+}
+
+// TestVerifyHeapam_DetectsMissingRelationFile pins the heap file-removal tier of
+// 003_check.pl (plan_to_remove_relation_file on an ordinary table → the
+// `could not open file "<path>": No such file or directory` report). Removing
+// the heap's backing main fork must surface as an error BEFORE NBlocks, which
+// opens with O_CREATE and would otherwise recreate the file as an empty 0-block
+// relation — silently reporting the table clean (a false negative).
+func TestVerifyHeapam_DetectsMissingRelationFile(t *testing.T) {
+	ctx, cleanup := verifyHeapamSetup(t)
+	defer cleanup()
+
+	tbl, ok := ctx.Catalog.LookupTable(parser.ObjectName{Name: "vh"})
+	if !ok {
+		t.Fatal("table vh not found")
+	}
+	rel := ctx.Catalog.RelFileNode(tbl)
+
+	// Remove the heap's backing fork file out from under the engine, mimicking
+	// the on-disk file removal pg_amcheck's 003_check performs while stopped.
+	if err := ctx.Pool.Manager().DropRelation(rel); err != nil {
+		t.Fatalf("drop heap fork: %v", err)
+	}
+
+	_, err := runQueryWithErr(ctx, "SELECT blkno, offnum, attnum, msg FROM verify_heapam('vh')")
+	if err == nil {
+		t.Fatal("missing relation file not detected")
+	}
+	if !strings.Contains(err.Error(), "could not open file") ||
+		!strings.Contains(err.Error(), "No such file or directory") {
+		t.Errorf("got %q, want substring %q / %q",
+			err.Error(), "could not open file", "No such file or directory")
 	}
 }
 

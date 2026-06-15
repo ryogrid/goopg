@@ -328,11 +328,58 @@ The fix adds a stat-only existence probe that never goes through the
   additionally asserts the fork was **not** recreated during startup/recovery
   (the load-bearing property a unit test cannot prove).
 
+## Missing-heap-relation-file tier (AC-003 file-removal corruption, 2026-06-15)
+
+The companion to the index case above: `003_check.pl` also removes an **ordinary
+table's** backing file (`plan_to_remove_relation_file('db1', 's2.t1')`,
+`003_check.pl:275`). For a removed **heap** main fork the expected stdout is
+
+```
+could not open file "<path>": No such file or directory
+```
+
+with exit status 2 (`003_check.pl:327`, `:357-365`). Upstream raises this when
+`verify_heapam` opens the relation's main fork via
+`RelationGetNumberOfBlocks` → `mdnblocks` → `mdopenfork`, whose
+`errcode_for_file_access()` maps the `ENOENT` open failure to `ERRCODE_IO_ERROR`
+(`fd.c`, the default branch).
+
+### goopg gap and fix
+
+The same `os.O_CREATE` hazard applies: `verifyHeapamOp.Open`'s
+`ctx.Pool.NBlocks(rel)` would recreate the removed heap fork as an empty 0-block
+file, and `amcheck.VerifyHeapRelation` over zero blocks reports the table *clean*
+— a silent false negative. The fix reuses the same stat-only seam as the index
+case:
+
+- `verifyHeapamOp.Open` calls `ctx.Pool.Exists(rel)` **before** `NBlocks`;
+  absent → `ExecError{Code:"58030"}` (`ERRCODE_IO_ERROR`) with the verbatim
+  `could not open file "%s": No such file or directory` message.
+- The `<path>` is built by new `storage.Manager.RelPath` / `Pool.RelPath`, which
+  return the data-dir-relative fork path (`base/<dboid>/<relfilenode>`, forward
+  slashes) faithful to upstream `relpath()`. The test matches `.*` for the path,
+  so goopg's storage-`dbOid`-keyed directory needs no special handling.
+
+pg_amcheck turns the SRF's per-relation query error into a stdout corruption
+report (exit 2), exactly as it does for the index `lacks a main relation fork`
+message.
+
+### Tests
+
+- `TestVerifyHeapam_DetectsMissingRelationFile`
+  (`internal/executor/operators_verify_heapam_test.go`) — hard gate: drops the
+  heap's backing file via `DropRelation` and asserts the SRF raises the verbatim
+  message.
+- `TestPort_PgAmcheck003MissingHeapFile`
+  (`internal/testport/pgamcheck003_missingheap_test.go`) — e2e proof through the
+  real `pg_amcheck` binary over the full stop → unlink → restart lifecycle,
+  additionally asserting the fork was **not** recreated during startup/recovery.
+
 ### Still remaining for `003_check.pl`
 
-The heap-table file-removal case (expected `could not open file ".*": No such
-file or directory`) is **not** yet ported: goopg's smgr would likewise recreate a
-removed heap file, and the errno-shaped message would need the storage layer to
-surface a typed missing-file error or the relation path. That, the unsupported
-index AMs, the `box`/`int4range`/`int4[]` types, `STORAGE EXTERNAL` TOAST
-corruption, and multi-database orchestration keep AC-003 `defer`.
+With both file-removal cases (index fork + heap file) now ported, the remaining
+blockers are purely feature/corruption: the unsupported index AMs
+(hash/gist/gin/brin/spgist), the `box`/`int4range`/`int4[]` types, `STORAGE
+EXTERNAL` TOAST corruption, the page-overwrite mechanics for those unsupported
+relkinds, and multi-database orchestration. `005_opclass_damage` (CREATE
+OPERATOR CLASS + `pg_amproc` parity) also remains. These keep AC-003 `defer`.

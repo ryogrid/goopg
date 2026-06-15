@@ -433,6 +433,12 @@ func (p *Pool) Exists(rel RelFileNode) bool {
 	return p.mgr.Exists(rel)
 }
 
+// RelPath returns rel's fork path relative to the data directory (e.g.
+// "base/5/16407"), for building the upstream-verbatim missing-file message.
+func (p *Pool) RelPath(rel RelFileNode) string {
+	return p.mgr.RelPath(rel)
+}
+
 // Manager exposes the underlying storage manager.
 func (p *Pool) Manager() *Manager { return p.mgr }
 

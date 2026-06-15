@@ -1159,6 +1159,31 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         tests are deferred under CSV row AC-002, blocked on `verify_heapam()` SRF
         + opclass catalog coverage. Resume = promote AC-002 (002_nonesuch first —
         only error-path catalog lookups) when those land.
+      - **PROGRESS 2026-06-15 (loop #15):** AC-003 — the **heap-table file-removal
+        corruption tier** of `003_check.pl` LANDED (the companion to loop #14's
+        index fork). `003_check` removes an ordinary table's backing file
+        (`plan_to_remove_relation_file('db1','s2.t1')`, :275) and asserts
+        pg_amcheck reports `could not open file ".*": No such file or directory`
+        (exit 2, :327/:357-365). Same `os.O_CREATE` hazard: `verifyHeapamOp.Open`'s
+        `Pool.NBlocks` would recreate the removed heap fork as an empty 0-block
+        file → `VerifyHeapRelation` reports the table *clean* (silent false
+        negative). Fix reuses the stat-only seam: `verifyHeapamOp.Open` calls
+        `ctx.Pool.Exists(rel)` BEFORE `NBlocks`; absent → `58030` (ERRCODE_IO_ERROR,
+        what `mdopenfork`'s `errcode_for_file_access` yields for ENOENT) with the
+        verbatim `could not open file "%s": No such file or directory`. The path is
+        built by new `storage.Manager.RelPath`/`Pool.RelPath` (data-dir-relative
+        `base/<db>/<relfile>`, faithful to upstream `relpath()`). Unit gate
+        `TestVerifyHeapam_DetectsMissingRelationFile` (drops fork, asserts msg).
+        E2E `TestPort_PgAmcheck003MissingHeapFile`
+        (`internal/testport/pgamcheck003_missingheap_test.go`) drives the real
+        pg_amcheck over stop→unlink→restart (exit 2 + verbatim report) AND asserts
+        the fork is NOT recreated on restart — PASS (7.0s). Gates: `go build ./...`
+        clean; full `internal/testport` pg_amcheck suite PASS (20.4s);
+        `internal/executor` + `internal/storage` PASS; vet clean. CSV AC-003 +
+        markdown + design doc `0110-0003` updated. STILL DEFERRED (AC-003 stays
+        `defer`): hash/gist/gin/brin/spgist index AMs, box/int4range/int4[] types,
+        STORAGE EXTERNAL TOAST corruption, page-overwrite for unsupported
+        relkinds, multi-DB orchestration; 005_opclass_damage.
       - **PROGRESS 2026-06-15 (loop #14):** AC-003 — the **index file-removal
         (missing-main-relation-fork) corruption tier** of `003_check.pl` LANDED.
         goopg's smgr opens relation files with `os.O_CREATE`, so `Pool.NBlocks`

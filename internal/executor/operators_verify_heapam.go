@@ -23,6 +23,8 @@ package executor
 // runs. M0110-0003.
 
 import (
+	"fmt"
+
 	"github.com/goopg/goopg/internal/amcheck"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -121,6 +123,21 @@ func (o *verifyHeapamOp) Open(ctx *Context) error {
 	}
 
 	rel := ctx.Catalog.RelFileNode(tbl)
+	// Mirror upstream verify_heapam opening the relation's main fork: a heap
+	// whose backing file was removed on disk (the pg_amcheck heap file-removal
+	// corruption scenario, 003_check.pl's plan_to_remove_relation_file on an
+	// ordinary table) makes RelationGetNumberOfBlocks → mdnblocks fail with
+	// `could not open file "<path>": No such file or directory`. This must run
+	// BEFORE NBlocks, which opens the rel with O_CREATE and would otherwise
+	// recreate the fork as an empty 0-block file — silently reporting the table
+	// clean (a false negative exactly where PG reports corruption). 58030 is
+	// ERRCODE_IO_ERROR, what mdopenfork's errcode_for_file_access() yields for an
+	// ENOENT ("No such file") open failure (its default branch, fd.c).
+	if !ctx.Pool.Exists(rel) {
+		return &ExecError{Code: "58030", Pos: o.plan.Pos(),
+			Message: fmt.Sprintf("could not open file %q: No such file or directory",
+				ctx.Pool.RelPath(rel))}
+	}
 	nblocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return err
