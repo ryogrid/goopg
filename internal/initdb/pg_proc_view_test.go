@@ -143,6 +143,35 @@ func TestPgProcViewProretset(t *testing.T) {
 	}
 }
 
+// TestPgProcViewProbin pins the probin column (DU-002 slice 35):
+// always NULL ("") for both built-in stubs and user routines — goopg has
+// no C-language functions with an on-disk binary path. dumpFunc projects
+// probin to emit `AS '<probin>', '<prosrc>'` for C functions.
+func TestPgProcViewProbin(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "f",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "sql",
+		Body:       "SELECT 1",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	// probin is the last column (index 16), appended after proretset (15).
+	const probin = 16
+	for i := range rows {
+		if rows[i][probin] != "" {
+			t.Errorf("row %q probin = %q, want \"\" (NULL)", rows[i][1], rows[i][probin])
+		}
+	}
+}
+
 // TestPgProcViewOrdering pins that the row order matches OID
 // ordering — an operator's `ORDER BY oid` is a no-op against this
 // view's natural order, which makes diff-based regression tests

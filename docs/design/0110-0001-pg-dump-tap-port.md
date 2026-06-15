@@ -792,6 +792,19 @@ fixed one logical group per loop:
     functions, NULL for every internal/SQL routine goopg has). The next slice
     must add `probin` (always NULL) to the pg_proc view.
 
+35. **`pg_proc.probin` column — DONE.** dumpFunc projects `probin` (the
+    on-disk binary path for C-language functions) alongside `prosrc`; goopg's
+    `pg_proc` virtual view did not expose it, so `EXECUTE dumpFunc('1654')`
+    aborted with `column "probin" does not exist`. Added the `probin text`
+    column: always NULL (`""`) for both built-in stubs and user routines —
+    goopg has no C-language functions with an on-disk binary path. Catalog-only
+    change (`internal/initdb/pg_proc_view.go`); guard
+    `TestPgProcViewProbin`. After this slice pg_dump advances within `dumpFunc`;
+    the **new** blocker is `column "proconfig" does not exist` (`EXECUTE
+    dumpFunc('1654')`) - dumpFunc reads `pg_proc.proconfig` (the per-function
+    GUC SET clauses, `text[]`; NULL for every goopg routine). The next slice
+    must add `proconfig` (always NULL) to the pg_proc view.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

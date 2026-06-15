@@ -162,6 +162,8 @@ var builtinProcs = []builtinProcRow{
 //     per-routine grants, so pg_dump treats every routine as default-privileged.
 //   - proowner: owning role OID; always 10 (bootstrap superuser).
 //   - prosrc: function body source.
+//   - probin: on-disk binary path for C-language functions; always NULL
+//     (goopg has no C functions). dumpFunc reads it to emit `AS '<probin>'`.
 //
 // pronargs/proacl/proowner were added for pg_dump's getFuncs SELECT (M0110-0001
 // DU-002 slice 7), which projects `p.pronargs, …, p.proacl, …, p.proowner`.
@@ -186,6 +188,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "proisstrict", Type: catalog.Type{Name: "bool"}},
 			{Name: "prokind", Type: catalog.Type{Name: "text"}},
 			{Name: "proretset", Type: catalog.Type{Name: "bool"}},
+			{Name: "probin", Type: catalog.Type{Name: "text"}},
 		},
 		Virtual: true,
 	}
@@ -210,6 +213,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"f", // proisstrict
 				"f", // prokind: function
 				"f", // proretset: built-in stubs (abs/RI_FKey) are not SRFs
+				"",  // probin: NULL (internal funcs have no on-disk binary path)
 			})
 		}
 		// Append user-defined routines.
@@ -274,6 +278,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				strict,
 				prokind,
 				retset,
+				"", // probin: NULL (goopg has no C-language functions)
 			})
 		}
 		return rows
