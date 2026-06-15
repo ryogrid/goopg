@@ -832,6 +832,21 @@ fixed one logical group per loop:
     reads `pg_proc.prorows` (the estimated result-row count for set-returning
     functions, `float4`; PG default `0` for non-SRFs, `1000` for SRFs). The
     next slice must add `prorows` to the pg_proc view.
+38. **`pg_proc.prorows` column — DONE.** dumpFunc projects `prorows` (the
+    planner's estimated result-row count for set-returning functions); goopg's
+    `pg_proc` virtual view did not expose it, so `EXECUTE dumpFunc('1654')`
+    aborted with `column "prorows" does not exist`. Added the `prorows float4`
+    column, mirroring PG's `CREATE FUNCTION` default: `1000` for set-returning
+    functions, `0` for everything else. Built-in stubs (none are SRFs) emit
+    `0`; user routines derive the value from `catalog.Routine.ReturnsSet`.
+    Catalog-only change (`internal/initdb/pg_proc_view.go`); guard
+    `TestPgProcViewProrows`. After this slice pg_dump advances within
+    `dumpFunc`; the **new** blocker is `column "protrftypes" does not exist`
+    (`EXECUTE dumpFunc('1654')`) - dumpFunc reads `pg_proc.protrftypes` (the
+    OID array of argument types whose transforms the function uses,
+    `oidvector`; NULL when the function uses no transforms — the case for
+    every goopg routine). The next slice must add `protrftypes` to the pg_proc
+    view.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

@@ -190,12 +190,14 @@ package testport
 // per-function GUC SET clauses, text[]; NULL for every goopg routine).
 // Slice 37 added pg_proc.procost (the planner's estimated per-row execution
 // cost, float4; 1 for internal/C, 100 for other-language routines).
+// Slice 38 added pg_proc.prorows (the planner's estimated result-row count
+// for set-returning functions, float4; 1000 for SRFs, 0 otherwise).
 // **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// fails in dumpFunc with `column "prorows" does not exist` (EXECUTE
-// dumpFunc('1654')). dumpFunc reads pg_proc.prorows (the planner's estimated
-// result-row count for set-returning functions, float4; PG default 0 for
-// non-SRFs, 1000 for SRFs). goopg's pg_proc virtual view does not yet expose
-// it. The next DU-002 slice must add prorows to the pg_proc view.
+// fails in dumpFunc with `column "protrftypes" does not exist` (EXECUTE
+// dumpFunc('1654')). dumpFunc reads pg_proc.protrftypes (the OID array of
+// argument types whose transforms the function uses, oidvector; NULL when
+// the function has no transforms — the case for every goopg routine). The
+// next DU-002 slice must add protrftypes to the pg_proc view.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

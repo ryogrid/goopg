@@ -248,6 +248,54 @@ func TestPgProcViewProcost(t *testing.T) {
 	}
 }
 
+// TestPgProcViewProrows pins the prorows column (DU-002 slice 38):
+// 1000 estimated result rows for set-returning functions, 0 otherwise —
+// mirrors PG's CREATE FUNCTION default. dumpFunc reads prorows to emit
+// `ROWS <n>` for SRFs.
+func TestPgProcViewProrows(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "gen",
+		ReturnType: catalog.Type{Name: "int"},
+		ReturnsSet: true,
+		Language:   "sql",
+		Body:       "SELECT 1",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "scalar",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "sql",
+		Body:       "SELECT 1",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	// prorows is the last column (index 19), appended after procost (18).
+	const prorows = 19
+	// Built-in stubs are never SRFs: 0.
+	for i := range builtinProcs {
+		if rows[i][prorows] != "0" {
+			t.Errorf("built-in stub %q prorows = %q, want 0", rows[i][1], rows[i][prorows])
+		}
+	}
+	userRows := rows[len(builtinProcs):]
+	// Insertion order: gen (SETOF → 1000), scalar (→ 0).
+	if userRows[0][1] != "gen" || userRows[0][prorows] != "1000" {
+		t.Errorf("gen prorows = %q, want 1000", userRows[0][prorows])
+	}
+	if userRows[1][1] != "scalar" || userRows[1][prorows] != "0" {
+		t.Errorf("scalar prorows = %q, want 0", userRows[1][prorows])
+	}
+}
+
 // TestPgProcViewOrdering pins that the row order matches OID
 // ordering — an operator's `ORDER BY oid` is a no-op against this
 // view's natural order, which makes diff-based regression tests
