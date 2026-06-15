@@ -181,6 +181,9 @@ var builtinProcs = []builtinProcRow{
 //     'u' unsafe. Mirrors PG's CREATE FUNCTION default of 'u' (unsafe) for
 //     every routine; goopg tracks no parallel-safety, so dumpFunc emits
 //     `PARALLEL UNSAFE` (the default, so effectively nothing) for all.
+//   - prosupport: OID of the function's planner support function (regproc/oid).
+//     Always 0 — goopg has no planner support functions; PG's CREATE FUNCTION
+//     default is likewise 0, so dumpFunc emits no `SUPPORT ...` clause.
 //
 // pronargs/proacl/proowner were added for pg_dump's getFuncs SELECT (M0110-0001
 // DU-002 slice 7), which projects `p.pronargs, …, p.proacl, …, p.proowner`.
@@ -211,6 +214,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "prorows", Type: catalog.Type{Name: "float4"}},
 			{Name: "protrftypes", Type: catalog.Type{Name: "oidvector"}},
 			{Name: "proparallel", Type: catalog.Type{Name: "char"}},
+			{Name: "prosupport", Type: catalog.Type{Name: "oid"}},
 		},
 		Virtual: true,
 	}
@@ -241,6 +245,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"0", // prorows: built-in stubs (abs/RI_FKey) are not SRFs
 				"",  // protrftypes: NULL (goopg supports no transforms)
 				"u", // proparallel: unsafe (PG CREATE FUNCTION default)
+				"0", // prosupport: 0 (no planner support function)
 			})
 		}
 		// Append user-defined routines.
@@ -325,6 +330,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				prorows, // prorows: 1000 for SRFs, 0 otherwise
 				"",      // protrftypes: NULL (goopg supports no transforms)
 				"u",     // proparallel: unsafe (PG CREATE FUNCTION default)
+				"0",     // prosupport: 0 (no planner support function)
 			})
 		}
 		return rows

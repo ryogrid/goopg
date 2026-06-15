@@ -869,12 +869,33 @@ fixed one logical group per loop:
     `dumpFunc` emits `PARALLEL UNSAFE` (the default) for every routine (built-in
     stubs and user routines alike). Catalog-only change
     (`internal/initdb/pg_proc_view.go`); guard `TestPgProcViewProparallel`.
-    After this slice pg_dump advances within `dumpFunc`; the **new** blocker is
+    After this slice pg_dump advanced within `dumpFunc`; the next blocker was
     `column "prosupport" does not exist` (`EXECUTE dumpFunc('1654')`) - dumpFunc
     reads `pg_proc.prosupport` (the OID of the function's planner support
     function, `regproc`/`oid`; PG's `CREATE FUNCTION` default is `0` — no support
     function, the case for every goopg routine). The next slice must add
     `prosupport` to the pg_proc view.
+41. **`pg_proc.prosupport` column — DONE.** dumpFunc projects `prosupport`
+    (the OID of the function's planner support function, `regproc`/`oid`); goopg's
+    `pg_proc` virtual view did not expose it, so `EXECUTE dumpFunc('1654')` aborted
+    with `column "prosupport" does not exist`. Added the `prosupport oid` column,
+    always `0` (no support function) — goopg has no planner support functions,
+    mirroring PG's `CREATE FUNCTION` default, so `dumpFunc` emits no `SUPPORT …`
+    clause for any routine (built-in stubs and user routines alike). Catalog-only
+    change (`internal/initdb/pg_proc_view.go`); guard `TestPgProcViewProsupport`.
+    After this slice all 22 columns `dumpFunc` projects from `pg_proc` resolve and
+    the query plans/executes; the **new** blocker is a *different class* of error —
+    `query returned 0 rows instead of one` (`EXECUTE dumpFunc('1654')`). dumpFunc's
+    query is `… FROM pg_catalog.pg_proc p, pg_catalog.pg_language l WHERE p.oid = $1
+    AND l.oid = p.prolang` (it joins to `pg_language` purely to fetch `lanname`).
+    goopg's `pg_language` virtual view (`internal/catalog/catalog.go`) deliberately
+    returns **0 rows** — that was correct for `getProcLangs`' `… WHERE lanispl`
+    predicate (built-in langs have `lanispl=false` and are never dumped), but the
+    `dumpFunc` join has no such filter, so the join over `prolang=12` (internal)
+    yields nothing. The next slice must populate `pg_language`'s `VirtualRows` with
+    the 3 built-in language rows (internal/12, c/13, sql/14 — matching
+    `pgLanguageInitialEntries()`); this stays safe for `getProcLangs` because all 3
+    have `lanispl=false` (its `WHERE lanispl` still excludes them).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

@@ -352,6 +352,34 @@ func TestPgProcViewProparallel(t *testing.T) {
 	}
 }
 
+// TestPgProcViewProsupport pins the prosupport column (DU-002 slice 41):
+// always "0" — goopg has no planner support functions, mirroring PG's
+// CREATE FUNCTION default, so dumpFunc emits no `SUPPORT ...` clause.
+func TestPgProcViewProsupport(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "myfunc",
+		ReturnType: catalog.Type{Name: "int"},
+		Language:   "sql",
+		Body:       "SELECT 1",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	// prosupport is the last column (index 22), appended after proparallel (21).
+	const prosupport = 22
+	for i := range rows {
+		if rows[i][prosupport] != "0" {
+			t.Errorf("row %q prosupport = %q, want 0", rows[i][1], rows[i][prosupport])
+		}
+	}
+}
+
 // TestPgProcViewOrdering pins that the row order matches OID
 // ordering — an operator's `ORDER BY oid` is a no-op against this
 // view's natural order, which makes diff-based regression tests

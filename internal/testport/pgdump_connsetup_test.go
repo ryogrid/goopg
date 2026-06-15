@@ -196,12 +196,19 @@ package testport
 // transforms the function uses, oidvector; NULL for every goopg routine).
 // Slice 40 added pg_proc.proparallel (the parallel-safety marker, char; 'u'
 // unsafe for every goopg routine, mirroring PG's CREATE FUNCTION default).
-// **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// fails in dumpFunc with `column "prosupport" does not exist` (EXECUTE
-// dumpFunc('1654')). dumpFunc reads pg_proc.prosupport (the OID of the
-// function's planner support function; regproc/oid. PG's CREATE FUNCTION
-// default is 0 — no support function, the case for every goopg routine). The
-// next DU-002 slice must add prosupport to the pg_proc view.
+// Slice 41 added pg_proc.prosupport (the OID of the function's planner support
+// function, oid; 0 for every goopg routine). With all 22 pg_proc columns
+// dumpFunc projects now resolving, the query plans and executes.
+// **Next blocker (precise, confirmed empirically by this test):** pg_dump now
+// fails in dumpFunc with `query returned 0 rows instead of one` (EXECUTE
+// dumpFunc('1654')) — a different class of error. dumpFunc's query joins
+// `pg_catalog.pg_proc p, pg_catalog.pg_language l WHERE p.oid = $1 AND
+// l.oid = p.prolang` to fetch lanname, but goopg's pg_language virtual view
+// (internal/catalog/catalog.go) returns 0 rows, so the join over prolang=12
+// (internal) yields nothing. The next DU-002 slice must populate pg_language's
+// VirtualRows with the 3 built-in language rows (internal/12, c/13, sql/14);
+// this stays safe for getProcLangs (its WHERE lanispl still excludes all 3,
+// which have lanispl=false).
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker
