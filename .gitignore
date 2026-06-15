@@ -78,6 +78,9 @@ config.json
 create_pg_super_document/
 serena/
 
+# Claude Code worktree directories — git worktrees, not project source.
+.claude/worktrees/
+
 # Serena MCP tooling state (project metadata + per-project memories).
 .serena/
 
