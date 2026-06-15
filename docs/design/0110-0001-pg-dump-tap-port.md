@@ -543,7 +543,43 @@ fixed one logical group per loop:
     quote_literal(x) from unnest(evttags) as t(x)), ', ') as evttags,
     e.evtfoid::regproc as evtfname FROM pg_event_trigger e ORDER BY e.oid`). An
     empty `pg_event_trigger` virtual view (OID 3466) is the next slice (goopg
-    defines no event triggers, so empty should suffice; verify empirically).
+    defines no event triggers, so empty should suffice; verify empirically) —
+    plus the correlated `unnest(evttags)` arg resolution noted below.
+23. **`pg_event_trigger` virtual view + correlated `unnest()` arg — DONE.**
+    `getEventTriggers` runs `SELECT e.tableoid, e.oid, evtname, evtenabled,
+    evtevent, evtowner, array_to_string(array(select quote_literal(x) from
+    unnest(evttags) as t(x)), ', ') as evttags, e.evtfoid::regproc as evtfname
+    FROM pg_event_trigger e ORDER BY e.oid`. Two gaps, fixed together:
+    (a) goopg had no queryable `pg_event_trigger` relation. Added the empty
+    `pg_event_trigger` virtual view (`internal/catalog/catalog.go`, OID 3466,
+    beside `pg_range`) with the `pg_event_trigger.h` schema (`oid, evtname name,
+    evtevent name, evtowner oid, evtfoid oid, evtenabled "char", evttags
+    text[]`). goopg defines no event triggers (no `CREATE EVENT TRIGGER`), so the
+    empty view (0 rows) produces an identical dump.
+    (b) With the relation present, the query then failed at `column "evttags"
+    does not exist` — the **same correlated FROM-clause SRF arg bug as slice 18**,
+    but for `unnest` rather than `pg_options_to_table`. The `array(select … from
+    unnest(evttags) …)` subquery references `evttags` from the OUTER
+    `pg_event_trigger` row, but `planFromUnnest` (`internal/planner/planner.go`)
+    built its arg-resolution context from same-level lateral siblings only
+    (`ctx := &resolveContext{}; if lateralCtx != nil { ctx = lateralCtx }`),
+    never chaining up to `planParent`, so a correlated arg with no left-siblings
+    had no path to the outer scope. Fix mirrors `planPgOptionsToTable` /
+    `planGenerateSeries`: build `ctx := &resolveContext{parent: planParent}` and,
+    when lateral siblings exist with no parent, copy them and set `parent =
+    planParent`. `evttags` then resolves to an `OuterColumnRef` the executor
+    evaluates per outer row. With 0 rows the projection never evaluates, so the
+    `text[]`-from-heap binary-decode limitation (orthogonal, pre-existing) does
+    not bite the real pg_dump path. After this slice `getEventTriggers` passes
+    end-to-end; pg_dump advances into the per-table attribute dump
+    (`getTableAttrs`) and the **new** blocker is `column a.attstattarget does not
+    exist` — that query reads many `pg_attribute`/`pg_constraint`/`pg_type`
+    columns goopg's views do not yet expose (`attstattarget, attstorage,
+    attfdwoptions, attcompression, attidentity, atthasmissing, attmissingval,
+    attgenerated, conislocal, …`). Broadening those catalog columns is the next
+    slice — deeper than the empty-view additions. Guard:
+    `TestPlanUnnestCorrelatedArg` (`internal/planner` — plans the ARRAY, scalar,
+    and same-level LATERAL forms of correlated `unnest`).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

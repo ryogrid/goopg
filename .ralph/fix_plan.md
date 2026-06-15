@@ -1554,6 +1554,28 @@ object support.
         `pg_event_trigger` virtual view (`pg_event_trigger.h`, OID 3466). goopg
         defines no event triggers, so an empty view should suffice — verify
         empirically with the port test.
+      - **PROGRESS 2026-06-16 (loop #47):** **DU-002 slice 23 LANDED**
+        (`pg_event_trigger` view + correlated `unnest()` arg fix). Two gaps fixed
+        together: (a) added the empty `pg_event_trigger` virtual view
+        (`internal/catalog/catalog.go`, OID 3466, `pg_event_trigger.h` schema:
+        `oid, evtname name, evtevent name, evtowner oid, evtfoid oid, evtenabled
+        "char", evttags text[]`) — goopg has no event triggers so 0 rows dumps
+        identically; (b) with the relation present the query then hit `column
+        "evttags" does not exist` — the SAME correlated FROM-clause SRF arg bug as
+        slice 18 but for `unnest`. `planFromUnnest` built its arg context from
+        same-level lateral siblings only, never chaining up to `planParent`. Fix
+        mirrors `planPgOptionsToTable`/`planGenerateSeries`:
+        `ctx := &resolveContext{parent: planParent}` + copy-and-reparent the
+        lateral siblings when they have no parent. build/gofmt/vet clean; catalog
+        + planner suites PASS; new guard `TestPlanUnnestCorrelatedArg` PASS;
+        `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** getEventTriggers passes; pg_dump advances to the per-table
+        attribute dump (getTableAttrs) → `column a.attstattarget does not exist`.
+        That query reads many `pg_attribute`/`pg_constraint`/`pg_type` columns
+        goopg's views do not expose (attstattarget, attstorage, attfdwoptions,
+        attcompression, attidentity, atthasmissing, attmissingval, attgenerated,
+        conislocal, …). Resume = slice 24: broaden those catalog columns — a
+        DEEPER slice than the empty-view additions.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

@@ -103,15 +103,22 @@ package testport
 // rngsubdiff regproc(oid)). goopg defines no range types, so the NOT EXISTS is
 // always true and the empty view satisfies the dump identically — confirmed
 // empirically by this test.
-// **Next blocker (precise, confirmed empirically by this test):** the getCasts
-// query now passes; pg_dump advances to getEventTriggers, which fails with
-// `relation "pg_event_trigger" does not exist`. The query is
-// `SELECT e.tableoid, e.oid, evtname, evtenabled, evtevent, evtowner,
-// array_to_string(array(select quote_literal(x) from unnest(evttags) as t(x)),
-// ', ') as evttags, e.evtfoid::regproc as evtfname FROM pg_event_trigger e
-// ORDER BY e.oid`. The next DU-002 slice adds the `pg_event_trigger` virtual
-// view (`pg_event_trigger.h` schema, OID 3466). goopg defines no event
-// triggers, so an empty view should suffice; verify empirically.
+// The getEventTriggers query reads the empty `pg_event_trigger` virtual view
+// (slice 23 — `pg_event_trigger.h` schema, OID 3466: oid, evtname name, evtevent
+// name, evtowner oid, evtfoid oid, evtenabled "char", evttags text[]). goopg
+// defines no event triggers, so the empty view dumps identically. The same slice
+// also fixed correlated FROM-clause `unnest()` arg resolution in the planner so
+// the `array(select quote_literal(x) from unnest(evttags) as t(x))` projection
+// resolves `evttags` up to the outer pg_event_trigger row (mirrors slice 18's
+// pg_options_to_table fix) — confirmed empirically by this test.
+// **Next blocker (precise, confirmed empirically by this test):** the
+// getEventTriggers query now passes; pg_dump advances to the per-table
+// attribute dump (getTableAttrs), which fails with `column a.attstattarget does
+// not exist`. That query reads many `pg_attribute`/`pg_constraint`/`pg_type`
+// columns goopg's catalog views do not yet expose (attstattarget, attstorage,
+// attfdwoptions, attcompression, attidentity, atthasmissing, attmissingval,
+// attgenerated, conislocal, …). The next DU-002 slice broadens those catalog
+// columns; this is a deeper slice than the empty-view additions.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

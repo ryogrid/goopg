@@ -3899,6 +3899,36 @@ func (c *InMemory) registerSystemTables() {
 	pgRange.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_range"] = pgRange
 
+	// pg_event_trigger — event-trigger catalog (OID 3466). After getCasts,
+	// pg_dump's getEventTriggers runs:
+	//   SELECT e.tableoid, e.oid, evtname, evtenabled, evtevent, evtowner,
+	//   array_to_string(array(select quote_literal(x) from unnest(evttags) as
+	//   t(x)), ', ') as evttags, e.evtfoid::regproc as evtfname FROM
+	//   pg_event_trigger e ORDER BY e.oid
+	// (pg_dump.c getEventTriggers). goopg defines no event triggers (no CREATE
+	// EVENT TRIGGER), so an empty view (0 rows) is correct — pg_dump finds
+	// nothing dumpable, identical to a stock PG cluster with no user event
+	// triggers. With 0 rows the unnest(evttags)/array_to_string projection is
+	// never evaluated, so the empty text[] column is fine. Schema matches PG's
+	// pg_event_trigger (pg_event_trigger.h): oid, evtname name, evtevent name,
+	// evtowner oid, evtfoid oid, evtenabled "char", evttags text[].
+	// M0110-0001 (DU-002 slice 23).
+	pgEventTrigger := &Table{
+		Schema: "pg_catalog", Name: "pg_event_trigger", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "evtname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "evtevent", Type: Type{Name: "name"}, Ordinal: 2},
+			{Name: "evtowner", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "evtfoid", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "evtenabled", Type: Type{Name: "char"}, Ordinal: 5},
+			{Name: "evttags", Type: Type{Name: "text[]"}, Ordinal: 6},
+		},
+		OID: 3466,
+	}
+	pgEventTrigger.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_event_trigger"] = pgEventTrigger
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

@@ -3506,9 +3506,20 @@ func planFromUnnest(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveCont
 		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
 			Message: "unnest requires at least 1 argument"}
 	}
-	ctx := &resolveContext{}
+	// Build arg context: lateral siblings + outer-scope parent chain so a
+	// CORRELATED unnest argument — e.g. pg_dump's getEventTriggers
+	// `array(select quote_literal(x) from unnest(evttags) as t(x))` where
+	// evttags references the outer pg_event_trigger row — resolves up the
+	// lexical scope. Mirrors generate_series / pg_options_to_table. DU-002 slice 23.
+	ctx := &resolveContext{parent: planParent}
 	if lateralCtx != nil {
-		ctx = lateralCtx
+		if lateralCtx.parent == nil {
+			cp := *lateralCtx
+			cp.parent = planParent
+			ctx = &cp
+		} else {
+			ctx = lateralCtx
+		}
 	}
 	alias := rv.Alias
 	if alias == "" {
