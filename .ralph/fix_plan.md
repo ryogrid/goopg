@@ -1111,6 +1111,31 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         tests are deferred under CSV row AC-002, blocked on `verify_heapam()` SRF
         + opclass catalog coverage. Resume = promote AC-002 (002_nonesuch first —
         only error-path catalog lookups) when those land.
+      - **PROGRESS 2026-06-15 (loop #11):** AC-003 — **whole-database
+        relation-enumeration tier ported + blocker #3 hypothesis REFUTED**.
+        `003_check.pl`'s clean-db path runs the *default* `pg_amcheck` (no
+        scoping), which enumerates every checkable relation and dispatches
+        `verify_heapam`/`bt_index_check` per relation — a distinct tier from the
+        single-`--table` path. New `TestPort_PgAmcheckAllTables`
+        (`internal/testport/pgamcheck_alltables_port_test.go`) drives the real
+        binary over a goopg DB mixing the relkinds `003_check` builds that goopg
+        supports (heap table, several btree indexes incl. UNIQUE, sequence, view,
+        materialized view) in a user schema; a `--schema s1` run checks the
+        heap+btree subset and skips the view/sequence — **clean (exit 0)**. It
+        also drives the *unscoped whole-database* run (which would reach
+        `pg_catalog.*`) — **also clean (exit 0)**, which empirically REFUTES the
+        prior blocker #3 ("system-catalog heap resolution"): goopg never feeds its
+        system catalogs to pg_amcheck's heap-check dispatch, so there is no
+        `verify_heapam`-on-catalog gap to close. The dispatch fixes (blocker #1
+        lateral pushdown, blocker #2 install-schema `bt_index_check`) are asserted
+        as hard regressions. Remaining `003_check` blockers are now purely
+        feature/corruption — hash/gist/gin/brin/spgist AMs goopg lacks,
+        box/int4range/int4[] types, STORAGE EXTERNAL TOAST corruption, multi-DB
+        orchestration, and the file-removal/page-overwrite corruption mechanics
+        (multi-milestone). Gates: full `internal/testport` pg_amcheck suite PASS
+        (001/002/004 + btree + alltables); gofmt + `go vet ./internal/testport`
+        clean. Design doc `0110-0003` + CSV AC-003 + markdown updated. AC-003 stays
+        `defer` (003 + 005 need the feature work above).
       - **PROGRESS 2026-06-15 (loop #8):** AC-003 enabler — **lateral
         outer-qual pushdown** landed (`pushOuterQualsIntoLaterals` in
         `internal/planner/pushdown.go`), the dominant blocker for

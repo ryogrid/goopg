@@ -213,12 +213,16 @@ against a clean goopg cluster surfaced the precise remaining gaps:
    mirrors the FROM-clause SRF schema-strip already done for `verify_heapam`
    (`internal/parser/select.go`, gap #5). The scalar parser already accepts the
    `:=` named-arg spelling pg_amcheck emits (`parseFuncCallTail`, S5).
-3. **System-catalog heap resolution** — a whole-db `pg_amcheck postgres` run also
-   checks `pg_catalog.*`; `verify_heapam` on `pg_type`/`pg_attribute`/`pg_class`
-   reports `could not open relation` because `verifyHeapamResolveTable` /
-   `LookupTableByOID` does not resolve catalog relations to on-disk heap pages.
-   This is the larger parity effort `003_check`'s empty pre-corruption whole-db run
-   depends on.
+3. **System-catalog heap resolution** — *was hypothesised as a blocker; empirically
+   it is NOT (corrected 2026-06-15, see "Whole-database enumeration tier" below).*
+   The earlier diagnosis predicted that a whole-db `pg_amcheck postgres` run would
+   also check `pg_catalog.*` and that `verify_heapam` on `pg_type`/`pg_class` would
+   report `could not open relation`. Driving the *real* default whole-database run
+   against a live goopg cluster shows exit 0 / empty output: goopg's `pg_class`
+   enumeration does not present its system catalogs to `pg_amcheck` as checkable
+   heap relations, so the per-relation dispatch loop never opens them and the clean
+   whole-db run succeeds. The remaining `003_check.pl` blockers are therefore the
+   *feature/corruption* requirements, not catalog heap resolution (see below).
 
 ## Resume point
 
@@ -241,5 +245,36 @@ the dispatch fix itself is hard-gated by `TestBtIndexCheck_SchemaQualifiedDispat
 `pg_type`/`pg_attribute`/`pg_class` must resolve catalog relations to on-disk heap
 pages. `005_opclass_damage.pl` needs `CREATE OPERATOR CLASS` + `pg_amproc` catalog
 parity to inject the breaking sort-order via `UPDATE pg_amproc`. AC-003 stays
-`defer` until 003 and 005 land; next slice = system-catalog heap resolution
-(blocker #3).
+`defer` until 003 and 005 land.
+
+## Whole-database enumeration tier + blocker #3 correction (AC-003, 2026-06-15)
+
+The single-`--table` path (`TestPort_PgAmcheckBtreeIndexCheck`) only exercises one
+relation. `003_check.pl`'s clean-database path (db3 is left uncorrupted) instead
+runs the *default* `pg_amcheck` — no scoping — which enumerates **every** checkable
+relation in the database and dispatches `verify_heapam` per heap / `bt_index_check`
+per btree. That relation-enumeration + per-relation dispatch loop is a distinct tier
+(pg_amcheck's `pg_class`/`pg_namespace`/`pg_am` selection query, not the
+single-relation fast path).
+
+`TestPort_PgAmcheckAllTables` (`internal/testport/pgamcheck_alltables_port_test.go`)
+covers it against a live goopg cluster over a database mixing the relkinds
+`003_check` builds that goopg supports — a heap table, several btree indexes
+(incl. a UNIQUE index), a sequence, a view, and a materialized view — in a user
+schema `s1`. A `--schema s1` run checks the heap + btree subset and silently skips
+the view/sequence; it is **clean (exit 0, empty output)**. The test additionally
+drives the *unscoped whole-database* run (which would also reach `pg_catalog.*`)
+and logs its result: it too is **clean (exit 0)**, which empirically refutes the
+prior blocker #3 hypothesis (item 3 above) — goopg never feeds its system catalogs
+to pg_amcheck's heap-check dispatch, so no `verify_heapam`-on-catalog gap exists to
+close. The dispatch fixes (blocker #1 lateral pushdown, blocker #2 install-schema
+`bt_index_check`) are asserted as hard regressions; any other not-yet-clean result
+self-skips with the captured blocker.
+
+**Remaining `003_check.pl` blockers** are now purely feature/corruption, not catalog
+heap resolution: (a) the hash/gist/gin/brin/spgist index AMs goopg lacks (s5's
+"corruption must not error" relations), (b) the `box`/`int4range`/`int4[]` column
+types, (c) `STORAGE EXTERNAL` TOAST-file corruption, (d) multi-database
+(db1/db2/db3) orchestration, and (e) the file-removal / first-page-overwrite
+corruption mechanics with their per-relation expected reports. These are
+multi-milestone; AC-003 stays `defer`.
