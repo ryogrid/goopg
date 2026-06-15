@@ -1,52 +1,49 @@
-Task: M0110-0003 (AC-002 amcheck) — loop #4. LANDED gap #7a (database-name
-pattern resolution via row-valued IS [NOT] NULL semantics). Remaining: gap #7c
-(per-database amcheck-installed detection), then clog XidStatusFunc wiring, then
-AC-002…AC-005 TAP port + CSV flip.
+Task: M0110-0003 (AC-003 pg_amcheck) — loop #7. LANDED the page-structural heap
+tier of 004_verify_heapam.pl as TestPort_PgAmcheck004VerifyHeapam, the first
+end-to-end on-disk-corruption → pg_amcheck reproduction against a live goopg
+cluster. Committed on align-data-structure-with-pg.
 
-=== WHAT LANDED (this loop) — committed on align-data-structure-with-pg ===
-gap #7a: pg_amcheck `--database <pat>` now errors `no connectable databases to
-check matching "<pat>"` for an unresolvable name. Root cause was EXECUTOR-side,
-not amcheck-specific: `compile_database_list`'s bootstrap query uses
-`COUNT(*) FILTER (WHERE d IS NOT NULL)` where `d` is a whole-row ref to a
-LEFT-OUTER-JOINed CTE (planner expands whole-row → RowExpr). The IsNullExpr case
-evaluated the RowExpr to a composite Datum and called Datum.IsNull() — a
-constructed RowExpr is never a NULL Datum, so `d IS NOT NULL` was wrongly true
-for an outer-join non-match → every pattern looked checkable. Fix: SQL/PG
-row-null semantics for a RowExpr operand of IS [NOT] NULL
-(executor.evalRowNullTest: IS NULL true iff EVERY field null, IS NOT NULL iff
-EVERY field non-null; recursive on nested rows; NOT inverses).
+=== WHAT LANDED (this loop) ===
+internal/testport/pgamcheck004_port_test.go (NEW): drives real pg_amcheck vs a
+live goopg cluster, mirroring upstream stop→seek/overwrite→restart:
+- init with --no-data-checksums (upstream no_data_checksums=>1). goopg now
+  DEFAULTS data checksums ON (cmd/goopg/main.go:183) — with them on, overwriting
+  page bytes trips the storage-manager checksum verify ("invalid page in block 0
+  … checksum verification failed") before verify_heapam sees the damage.
+- locate heap file by globbing base/*/<reloid>: goopg's storage dbOid (5 for
+  postgres) ≠ pg_database.oid (16384). reloid filename = pg_class.oid (no
+  separate relfilenode in v0; catalog RelFileNode uses table.OID).
+- corrupt: first line pointer (slot 1) is the 4-byte LE ItemId at offset 24,
+  packed offset(15)|flags<<15|length<<17; set length=0x7FFF so lp_off+lp_len >
+  BLCKSZ → engine emits verbatim "line pointer to page offset N with length
+  32767 ends beyond maximum page offset 8192".
+- re-CREATE EXTENSION amcheck AFTER restart: install is runtime-only (gap #7c
+  per-db pg_extension scoping) and does NOT survive a server restart.
+- assert pg_amcheck exit 2 + report on stdout (pg_amcheck prints corruption to
+  STDOUT, not stderr).
 
-Files: internal/executor/expr.go (IsNullExpr RowExpr branch ~line 681 +
-evalRowNullTest helper near evalMergeWholeRow), internal/executor/
-row_null_test_test.go (NEW: TestRowValuedNullTest truth table),
-internal/testport/pgamcheck002_port_test.go (gap #7a now regression-guard
-t.Fatalf at patProbe; self-skip re-keyed to gap #7c via `pg_amcheck template1`),
-docs/design/0110-0008-amcheck-sql-surface-plan.md.
+Files: internal/testport/pgamcheck004_port_test.go (new), CSV AC-003 rationale,
+docs/design/0110-0003-pg-amcheck-tap-port.md (004 section + AC-002 done),
+docs/design/README.md (0110-0003 row), .ralph/fix_plan.md, deferral_ledger.md.
 
-Key symbols: evalRowNullTest, IsNullExpr case in evalExprSlot, planner.RowExpr
-(whole-row var expansion at planner.go:9342), pg_amcheck compile_database_list
-include_pat CTE, amcheck_sql (pg_extension lookup).
+Gates: gofmt clean; go vet ./internal/testport clean; TestPort_PgAmcheck001/002/
+004 all PASS; internal/amcheck + internal/mvcc PASS. gen-oracle-port-status
+regenerated the .md. No TPC-H spotcheck (test-only, new file; no planner/codec/
+executor row path touched).
 
-Gates run: go test ./internal/executor ./internal/planner ./internal/analyzer
-./internal/server PASS; TestRowValuedNullTest PASS; TestPort_PgAmcheck002Nonesuch
-SKIPs cleanly on gap #7c (was SKIP on 7a); gofmt+vet clean; build ./... OK;
-make ralph-state-guard OK. No TPC-H spotcheck — IS-NULL change is scoped to
-RowExpr operands only (scalar IS NULL path untouched), no executor row-count path
-changed.
-
-=== NEXT STEP (resume point) — AC-002 gap #7c ===
-gap #7c: per-database amcheck-installed detection. pg_amcheck runs `amcheck_sql`
-(`SELECT n.nspname, x.extversion FROM pg_extension x JOIN pg_namespace n ON
-x.extnamespace=n.oid WHERE x.extname='amcheck'`) in each connectable DB and warns
-`skipping database "template1": amcheck is not installed` when it returns 0 rows.
-goopg's pg_extension is a single GLOBAL catalog, so amcheck CREATE EXTENSIONd in
-`postgres` ALSO shows in template1/template0 → warning never fires, template1 is
-checked instead of skipped (exit 0, empty stderr). NEEDS per-database
-extension-catalog isolation so pg_extension/pg_namespace amcheck rows are visible
-only in the DB where CREATE EXTENSION ran. This is a distinct, larger feature.
-After gap #7c: clog XidStatusFunc tier wiring, then AC-002…AC-005 TAP port + CSV
-flip (docs/test-port/postgres-oracle-port-status.csv).
+=== NEXT STEP (resume point) — AC-003 remainder ===
+Two tests remain to promote AC-003 → port:
+- 003_check.pl: whole-database pg_amcheck orchestration. Blocker = goopg's
+  SYSTEM-CATALOG heap pages must verify cleanly through verify_heapam (upstream
+  asserts an empty `pg_amcheck <db>` run before corruption). Today the 004 port
+  restricts to the user table to dodge catalog-page false positives — quantify
+  which catalog pages trip the engine first.
+- 005_opclass_damage.pl: needs CREATE OPERATOR CLASS + pg_amproc catalog parity
+  to inject a breaking sort order via UPDATE pg_amproc, then --checkunique. Large
+  new catalog/DDL surface.
+NOT portable faithfully: 004's MVCC/attribute + TOAST tiers (PG varatt_external
+vs goopg chunk-relation TOAST).
 
 === CONTEXT ===
-Main tree is clean — commit engine work directly on align-data-structure-with-pg.
-.ralph/fix_plan.md is churned by the driver — progress recorded here + ledger.
+Main tree clean (foreign gen-column WIP that blocked loops #51–65 is GONE).
+Commit engine work directly on align-data-structure-with-pg.

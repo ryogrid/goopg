@@ -112,9 +112,52 @@ pins them precisely for the next unblocked loop.
   the precise blocker (self-promoting).
 - `go run ./cmd/gen-oracle-port-status` regenerated the `.md` view.
 
+## 004_verify_heapam.pl — page-structural heap tier (AC-003, partial)
+
+`TestPort_PgAmcheck004VerifyHeapam` (`internal/testport/pgamcheck004_port_test.go`)
+ports the faithful subset of `004_verify_heapam.pl`: the page-structural
+line-pointer corruption tier, driven through the real `pg_amcheck` binary against
+a live goopg cluster.
+
+Mechanism (mirrors upstream's stop → seek/overwrite → restart):
+1. Init the cluster with `--no-data-checksums` (upstream `init(no_data_checksums
+   => 1)`). goopg now defaults checksums **on**; with them on, overwriting page
+   bytes trips goopg's storage-manager checksum verification (`invalid page in
+   block 0 … checksum verification failed`) before `verify_heapam` inspects the
+   corruption.
+2. `CREATE EXTENSION amcheck`, create `t004(a bigint, b text, c text)`, insert a
+   few short-value rows (single block 0, no TOAST).
+3. Locate the heap file by globbing `base/*/<reloid>` — goopg's storage dbOid is
+   **not** the value `pg_database.oid` reports, so the glob matches on the unique
+   relation-OID filename instead of trusting the catalog database OID.
+4. Stop cleanly (shutdown checkpoint flushes the page), overwrite the first line
+   pointer's length on block 0 to `0x7FFF` so `lp_off + lp_len > BLCKSZ`, restart.
+5. `CREATE EXTENSION amcheck` again — its install is runtime-only (gap #7c
+   per-database `pg_extension` scoping) and does not survive a restart.
+6. Run `pg_amcheck --table public.t004 postgres`; assert exit 2 and the
+   upstream-verbatim `line pointer to page offset N with length 32767 ends beyond
+   maximum page offset 8192` report on stdout.
+
+Scoping adaptation: upstream runs `pg_amcheck <db>` over the whole database and
+asserts an empty pre-corruption run; goopg's system-catalog heap pages do not yet
+round-trip cleanly through `verify_heapam` (a separate parity effort), so the
+check is restricted to the single user table. The corruption-detection behaviour
+under test — the heap line-pointer tier on a user relation — is unchanged.
+
+Not ported (goopg-divergent): the MVCC/attribute and TOAST tiers of 004 corrupt
+PG's on-disk `varatt_external` pointer layout, which goopg does not use (oversized
+values live in a chunk relation). A byte-for-byte port of those cases would assert
+against bytes goopg never writes.
+
 ## Resume point
 
 Promote `AC-002` to `port` (and stop the skip) once the three SQL gaps above are
 implemented — `002_nonesuch` then passes with no further amcheck work, since it
-never calls `verify_heapam()`. 003–005 remain gated on the verify_heapam SRF
-with LATERAL outer-column resolution and operator-class catalog parity.
+never calls `verify_heapam()`. **(DONE — AC-002 is now `port`; the three gaps
+plus #6/#7a/#7b/#7c landed.)**
+
+For `AC-003`: the page-structural tier of `004_verify_heapam.pl` is ported (above).
+Remaining: `003_check.pl` (whole-database heap+btree orchestration; needs the
+system-catalog heap pages to verify cleanly), and `005_opclass_damage.pl` (needs
+`CREATE OPERATOR CLASS` + `pg_amproc` catalog parity to inject the breaking
+sort-order via `UPDATE pg_amproc`). AC-003 stays `defer` until 003 and 005 land.

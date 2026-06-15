@@ -1111,6 +1111,28 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         tests are deferred under CSV row AC-002, blocked on `verify_heapam()` SRF
         + opclass catalog coverage. Resume = promote AC-002 (002_nonesuch first —
         only error-path catalog lookups) when those land.
+      - **PROGRESS 2026-06-15 (loop #7):** AC-003 — the **page-structural heap
+        tier of `004_verify_heapam.pl`** is ported as
+        `TestPort_PgAmcheck004VerifyHeapam`
+        (`internal/testport/pgamcheck004_port_test.go`), driving the real
+        pg_amcheck binary against a live goopg cluster end-to-end. Mirrors
+        upstream's stop→seek/overwrite→restart corruption mechanism: inits with
+        `--no-data-checksums` (upstream `no_data_checksums=>1`; goopg now defaults
+        checksums ON, which would otherwise trip the storage-manager checksum
+        verify before verify_heapam sees the damage), CREATE EXTENSION amcheck,
+        inserts rows, locates the heap file by globbing `base/*/<reloid>` (goopg's
+        storage dbOid ≠ pg_database.oid), stops cleanly, overwrites the first line
+        pointer's length on block 0 to 0x7FFF so lp_off+lp_len>BLCKSZ, restarts,
+        re-CREATE EXTENSION amcheck (runtime-only install per gap #7c doesn't
+        survive restart), and asserts pg_amcheck exits 2 with the upstream-verbatim
+        `line pointer to page offset N with length 32767 ends beyond maximum page
+        offset 8192` report on stdout. PASS (3.1s); 001/002 still PASS. CSV AC-003
+        rationale + design doc 0110-0003 + README index updated. NOT ported
+        (goopg-divergent): 004's MVCC/attribute + TOAST tiers corrupt PG's on-disk
+        varatt_external pointer layout (goopg uses chunk-relation TOAST). AC-003
+        stays `defer` — `003_check` (whole-db orchestration; needs system-catalog
+        heap pages to verify cleanly) and `005_opclass_damage` (CREATE OPERATOR
+        CLASS + pg_amproc parity) remain.
       - **PROGRESS 2026-06-14 (loop #51):** the **page-structural core of
         `verify_heapam()` landed** as a standalone `internal/amcheck` engine
         (`VerifyHeapPage`), following the engine-first/wire-later pattern (cf. the
