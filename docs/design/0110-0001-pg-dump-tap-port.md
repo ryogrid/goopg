@@ -633,6 +633,28 @@ fixed one logical group per loop:
     `SELECT t.tgrelid, t.tgname, pg_get_triggerdef(...) … FROM unnest('{}'::oid[])
     AS src(tbloid) JOIN pg_trigger t ON …`) — another empty-view slice next.
 
+26. **`pg_trigger` empty virtual view — DONE.** After `getTableAttrs`, pg_dump's
+    `getTriggers` collects per-table triggers with `SELECT t.tgrelid, t.tgname,
+    pg_catalog.pg_get_triggerdef(t.oid, false) AS tgdef, t.tgenabled, t.tableoid,
+    t.oid, t.tgparentid <> 0 AS tgispartition FROM unnest('{}'::pg_catalog.oid[])
+    AS src(tbloid) JOIN pg_catalog.pg_trigger t ON (src.tbloid = t.tgrelid) LEFT
+    JOIN pg_catalog.pg_trigger u ON (u.oid = t.tgparentid) WHERE ((NOT
+    t.tgisinternal AND t.tgparentid = 0) OR t.tgenabled != u.tgenabled) ORDER BY
+    t.tgrelid, t.tgname`. goopg has no user-defined triggers, so an empty view (0
+    rows) is correct; the `unnest('{}')` source is empty so the JOIN and
+    `pg_get_triggerdef` are never evaluated. Added an empty `pg_trigger` virtual
+    view (OID 2620) in `internal/catalog/catalog.go` beside
+    `pg_partitioned_table`. Schema matches `pg_trigger.h`: oid, tgrelid oid,
+    tgparentid oid, tgname name, tgfoid oid, tgtype int2, tgenabled "char",
+    tgisinternal bool, tgconstrrelid oid, tgconstrindid oid, tgconstraint oid,
+    tgdeferrable bool, tginitdeferred bool, tgnargs int2, tgattr int2vector,
+    tgargs bytea, tgqual pg_node_tree, tgoldtable name, tgnewtable name — with
+    int2vector represented as int2[] per goopg's pg_index `indkey` convention.
+    After this slice the trigger probe passes; the **new** blocker is `relation
+    "pg_rewrite" does not exist` (rule collection `getRules`: `SELECT tableoid,
+    oid, rulename, ev_class AS ruletable, ev_type, is_instead, ev_enabled FROM
+    pg_rewrite ORDER BY oid`) — another empty-view slice next.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

@@ -123,20 +123,17 @@ package testport
 // null bitmap 3→4 bytes stays within the same MAXALIGN(8) boundary (t_hoff=32),
 // so no positional reader breaks. SELECT resolves columns by name. pg_dump reads
 // NULL → treats it as the default stats target (-1). Confirmed empirically.
-// (DU-002 slice 25) The empty `pg_partitioned_table` virtual view (OID 3350)
-// is now defined in internal/catalog/catalog.go, so the partition-key probe
-// `SELECT partrelid FROM pg_partitioned_table WHERE … = ANY(partclass)` no
-// longer errors.
+// (DU-002 slice 26) The empty `pg_trigger` virtual view (OID 2620) is now
+// defined in internal/catalog/catalog.go, so the getTriggers probe
+// `SELECT t.tgrelid … FROM unnest('{}'::oid[]) … JOIN pg_catalog.pg_trigger t …`
+// no longer errors.
 // **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// advances to per-table trigger collection (getTriggers) and fails with
-// `relation "pg_trigger" does not exist` (query: `SELECT t.tgrelid, t.tgname,
-// pg_catalog.pg_get_triggerdef(t.oid, false) AS tgdef, t.tgenabled, t.tableoid,
-// t.oid, t.tgparentid <> 0 AS tgispartition FROM unnest('{}'::pg_catalog.oid[])
-// AS src(tbloid) JOIN pg_catalog.pg_trigger t ON (src.tbloid = t.tgrelid) LEFT
-// JOIN pg_catalog.pg_trigger u ON (u.oid = t.tgparentid) WHERE …`). The next
-// DU-002 slice adds the empty `pg_trigger` virtual view (pg_trigger.h, OID
-// 2620) — goopg has no user triggers, so 0 rows is correct; the unnest('{}')
-// source is empty so the JOIN and pg_get_triggerdef are never evaluated.
+// advances to rule collection (getRules) and fails with
+// `relation "pg_rewrite" does not exist` (query: `SELECT tableoid, oid,
+// rulename, ev_class AS ruletable, ev_type, is_instead, ev_enabled FROM
+// pg_rewrite ORDER BY oid`). The next DU-002 slice adds the empty `pg_rewrite`
+// virtual view (pg_rewrite.h, OID 2618) — goopg has no user rules, so 0 rows
+// is correct (an ORDER BY oid over an empty relation yields no rows).
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

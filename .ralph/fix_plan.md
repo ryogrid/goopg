@@ -1625,6 +1625,25 @@ object support.
         slice 26: add the empty `pg_trigger` virtual view (`pg_trigger.h`, OID
         2620) — empty-view pattern (no user triggers; unnest('{}') source is
         empty so the JOIN/pg_get_triggerdef never evaluate).
+      - **PROGRESS 2026-06-16 (loop #50):** **DU-002 slice 26 LANDED**
+        (empty `pg_trigger` virtual view, OID 2620). pg_dump's `getTriggers`
+        probe (`SELECT t.tgrelid, t.tgname, pg_get_triggerdef(...) … FROM
+        unnest('{}'::oid[]) AS src(tbloid) JOIN pg_trigger t ON …`) now resolves.
+        goopg has no user triggers, so 0 rows is correct; the unnest('{}')
+        source is empty so the JOIN/pg_get_triggerdef never evaluate. Added in
+        `internal/catalog/catalog.go` beside `pg_partitioned_table`; schema
+        matches `pg_trigger.h` (oid, tgrelid oid, tgparentid oid, tgname name,
+        tgfoid oid, tgtype int2, tgenabled "char", tgisinternal bool,
+        tgconstrrelid/tgconstrindid/tgconstraint oid, tgdeferrable bool,
+        tginitdeferred bool, tgnargs int2, tgattr int2vector→int2[], tgargs
+        bytea, tgqual pg_node_tree, tgoldtable/tgnewtable name).
+        build/gofmt/vet clean; catalog suite PASS; `TestPort_PgDumpConnectionSetup`
+        PASS. **Next blocker (precise, empirical):** pg_dump advances to rule
+        collection (`getRules`) → `relation "pg_rewrite" does not exist`
+        (`SELECT tableoid, oid, rulename, ev_class AS ruletable, ev_type,
+        is_instead, ev_enabled FROM pg_rewrite ORDER BY oid`). Resume = slice
+        27: add the empty `pg_rewrite` virtual view (`pg_rewrite.h`, OID 2618) —
+        empty-view pattern (no user rules; ORDER BY oid over empty = 0 rows).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

@@ -3963,6 +3963,53 @@ func (c *InMemory) registerSystemTables() {
 	pgPartitionedTable.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_partitioned_table"] = pgPartitionedTable
 
+	// pg_trigger — trigger catalog (OID 2620). After getTableAttrs, pg_dump's
+	// getTriggers probes per-table triggers. The query that first hits this
+	// catalog is:
+	//   SELECT t.tgrelid, t.tgname, pg_catalog.pg_get_triggerdef(t.oid, false)
+	//   AS tgdef, t.tgenabled, t.tableoid, t.oid, t.tgparentid <> 0 AS
+	//   tgispartition FROM unnest('{}'::pg_catalog.oid[]) AS src(tbloid) JOIN
+	//   pg_catalog.pg_trigger t ON (src.tbloid = t.tgrelid) LEFT JOIN
+	//   pg_catalog.pg_trigger u ON (u.oid = t.tgparentid) WHERE ((NOT
+	//   t.tgisinternal AND t.tgparentid = 0) OR t.tgenabled != u.tgenabled)
+	//   ORDER BY t.tgrelid, t.tgname
+	// goopg has no user-defined triggers, so an empty view (0 rows) is correct,
+	// identical to a stock PG cluster with none. The unnest('{}') source is
+	// empty so the JOIN and pg_get_triggerdef are never evaluated. Schema
+	// matches PG's pg_trigger (pg_trigger.h): tgrelid oid, tgparentid oid,
+	// tgname name, tgfoid oid, tgtype int2, tgenabled "char", tgisinternal bool,
+	// tgconstrrelid oid, tgconstrindid oid, tgconstraint oid, tgdeferrable bool,
+	// tginitdeferred bool, tgnargs int2, tgattr int2vector, tgargs bytea, tgqual
+	// pg_node_tree, tgoldtable name, tgnewtable name. goopg represents
+	// int2vector as int2[] (see pg_index indkey). M0110-0001 (DU-002 slice 26).
+	pgTrigger := &Table{
+		Schema: "pg_catalog", Name: "pg_trigger", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "tgrelid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "tgparentid", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "tgname", Type: Type{Name: "name"}, Ordinal: 3},
+			{Name: "tgfoid", Type: Type{Name: "oid"}, Ordinal: 4},
+			{Name: "tgtype", Type: Type{Name: "int2"}, Ordinal: 5},
+			{Name: "tgenabled", Type: Type{Name: "char"}, Ordinal: 6},
+			{Name: "tgisinternal", Type: Type{Name: "bool"}, Ordinal: 7},
+			{Name: "tgconstrrelid", Type: Type{Name: "oid"}, Ordinal: 8},
+			{Name: "tgconstrindid", Type: Type{Name: "oid"}, Ordinal: 9},
+			{Name: "tgconstraint", Type: Type{Name: "oid"}, Ordinal: 10},
+			{Name: "tgdeferrable", Type: Type{Name: "bool"}, Ordinal: 11},
+			{Name: "tginitdeferred", Type: Type{Name: "bool"}, Ordinal: 12},
+			{Name: "tgnargs", Type: Type{Name: "int2"}, Ordinal: 13},
+			{Name: "tgattr", Type: Type{Name: "int2[]"}, Ordinal: 14},
+			{Name: "tgargs", Type: Type{Name: "bytea"}, Ordinal: 15},
+			{Name: "tgqual", Type: Type{Name: "pg_node_tree"}, Ordinal: 16},
+			{Name: "tgoldtable", Type: Type{Name: "name"}, Ordinal: 17},
+			{Name: "tgnewtable", Type: Type{Name: "name"}, Ordinal: 18},
+		},
+		OID: 2620,
+	}
+	pgTrigger.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_trigger"] = pgTrigger
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {
