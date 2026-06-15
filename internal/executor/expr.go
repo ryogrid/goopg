@@ -1,18 +1,18 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"math"
 	"math/big"
 	mathrand "math/rand"
-	"bytes"
-	"encoding/base64"
 	"regexp"
 	"strconv"
 	"strings"
@@ -4926,10 +4926,10 @@ func planIsIndexScanBased(n planner.Node) bool {
 // corrSubqHashInfo holds the components extracted from a hash-joinable
 // correlated scalar subquery plan: Project(Filter(SeqScan, col = OuterColumnRef)).
 type corrSubqHashInfo struct {
-	scan      *planner.SeqScan // inner table to scan
-	scanColIdx int              // index of the join key column in SeqScan output
-	outerRef  *planner.OuterColumnRef // outer column reference for join key lookup
-	projExpr  planner.Expr            // project expression to evaluate for result
+	scan       *planner.SeqScan        // inner table to scan
+	scanColIdx int                     // index of the join key column in SeqScan output
+	outerRef   *planner.OuterColumnRef // outer column reference for join key lookup
+	projExpr   planner.Expr            // project expression to evaluate for result
 }
 
 // extractCorrSubqHashInfo detects the pattern
@@ -5276,6 +5276,11 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		name = after
 	}
 	switch name {
+	case "bt_index_check":
+		// amcheck B-tree structural verification (slice S4 of 0110-0008).
+		return evalBtIndexCheck(x, row, ctx, false)
+	case "bt_index_parent_check":
+		return evalBtIndexCheck(x, row, ctx, true)
 	case "current_timestamp", "now", "transaction_timestamp", "statement_timestamp":
 		return NewTimeDatum(ctx.Now), nil
 	case "current_date":
@@ -8445,8 +8450,8 @@ func evalCurrtid2(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// Index: not supported.
 	if _, isIdx := ctx.Catalog.LookupIndex(parser.ObjectName{Name: relname}); isIdx {
 		return NullDatum, &ExecError{Code: "0A000", Pos: x.Pos(),
-			Message:  fmt.Sprintf("cannot open relation %q", relname),
-			Detail: "This operation is not supported for indexes."}
+			Message: fmt.Sprintf("cannot open relation %q", relname),
+			Detail:  "This operation is not supported for indexes."}
 	}
 
 	tbl, found := ctx.Catalog.LookupTable(parser.ObjectName{Name: relname})

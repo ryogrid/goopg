@@ -155,11 +155,11 @@ func TestBaseBackupWireProtocolFraming(t *testing.T) {
 	// Iterate CopyData / CopyDone frames, then assert trailing
 	// result-set + ReadyForQuery.
 	var (
-		archiveName  string
-		archivePath  string
-		gotProgress  int
-		tarBytes     bytes.Buffer
-		copyDoneIdx  = -1
+		archiveName string
+		archivePath string
+		gotProgress int
+		tarBytes    bytes.Buffer
+		copyDoneIdx = -1
 	)
 	for i := 7; i < len(frames); i++ {
 		f := frames[i]
@@ -240,13 +240,13 @@ func TestBaseBackupWireProtocolFraming(t *testing.T) {
 	// excluded files absent, excluded-dir-contents absent but dirs present.
 	tr := tar.NewReader(&tarBytes)
 	var (
-		names              []string
-		sawLabel           bool
-		sawPgControl       bool
-		sawBase1_1259      bool
-		sawPgReplslotDir   bool
-		sawPgStatTmpDir    bool
-		lastFile           string
+		names            []string
+		sawLabel         bool
+		sawPgControl     bool
+		sawBase1_1259    bool
+		sawPgReplslotDir bool
+		sawPgStatTmpDir  bool
+		lastFile         string
 	)
 	for {
 		hdr, err := tr.Next()
@@ -385,6 +385,24 @@ func TestBaseBackupParseOptions(t *testing.T) {
 			name: "unknown_key_tolerated",
 			in:   "(LABEL 'x', SOMETHING_NEW 'y')",
 			want: baseBackupOptions{Label: "x"},
+		},
+		{
+			// pg_basebackup -X fetch sends a bare `WAL` boolean option.
+			name: "wal_fetch_new_syntax",
+			in:   "(LABEL 'x', WAL, MANIFEST 'no')",
+			want: baseBackupOptions{Label: "x", Manifest: "no", IncludeWAL: true},
+		},
+		{
+			// Legacy walsender clients send `WAL` as a bare keyword.
+			name: "wal_fetch_legacy",
+			in:   "LABEL 'tag' PROGRESS WAL",
+			want: baseBackupOptions{Label: "tag", Progress: true, IncludeWAL: true},
+		},
+		{
+			// An explicit false value disables WAL inclusion.
+			name: "wal_explicit_false",
+			in:   "(WAL 'f')",
+			want: baseBackupOptions{IncludeWAL: false},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

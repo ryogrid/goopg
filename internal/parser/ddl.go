@@ -338,8 +338,63 @@ func (p *parser) parseCreate() (Stmt, error) {
 			p.advance()
 		}
 		return &CompatNoopStmt{pos: t.Pos, Tag: "CREATE SCHEMA", ObjType: "schema", ObjName: ObjectName{Name: schemaName}}, nil
+	// CREATE EXTENSION name [WITH] [SCHEMA s] [VERSION v] [CASCADE] — inserts a
+	// pg_extension row (e.g. amcheck). M0110-0003.
+	case p.acceptIdentKeyword("extension"):
+		return p.parseCreateExtensionTail(t.Pos)
 	}
-	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after CREATE")
+	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, TRIGGER, or EXTENSION after CREATE")
+}
+
+// parseCreateExtensionTail parses the tail of
+//
+//	CREATE EXTENSION [IF NOT EXISTS] name [WITH] [SCHEMA s] [VERSION v] [CASCADE]
+//
+// after the EXTENSION keyword. Mirrors gram.y's CreateExtensionStmt option
+// list (the options may appear in any order). M0110-0003.
+func (p *parser) parseCreateExtensionTail(pos int) (Stmt, error) {
+	stmt := &CreateExtensionStmt{pos: pos}
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwNot); err != nil {
+			return nil, err
+		}
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return nil, err
+		}
+		stmt.IfNotExists = true
+	}
+	// Extension name (identifier, keyword-as-ident, or quoted string).
+	tok := p.cur()
+	if tok.Kind != TokenIdent && tok.Kind != TokenKeyword && tok.Kind != TokenStringLit {
+		return nil, p.errAtCur("expected extension name")
+	}
+	stmt.Name = tok.Value
+	p.advance()
+	// Optional WITH before the option list.
+	_ = p.acceptKeyword(KwWith)
+	// Option list: SCHEMA name | VERSION version | CASCADE, any order.
+	for {
+		switch {
+		case p.acceptIdentKeyword("schema"):
+			nt := p.cur()
+			if nt.Kind != TokenIdent && nt.Kind != TokenKeyword && nt.Kind != TokenStringLit {
+				return nil, p.errAtCur("expected schema name after SCHEMA")
+			}
+			stmt.Schema = nt.Value
+			p.advance()
+		case p.acceptIdentKeyword("version"):
+			nt := p.cur()
+			if nt.Kind != TokenIdent && nt.Kind != TokenKeyword && nt.Kind != TokenStringLit {
+				return nil, p.errAtCur("expected version after VERSION")
+			}
+			stmt.Version = nt.Value
+			p.advance()
+		case p.acceptKeyword(KwCascade):
+			stmt.Cascade = true
+		default:
+			return stmt, nil
+		}
+	}
 }
 
 // parseCreateAggregateTail picks up after "CREATE AGGREGATE".  It parses just
@@ -1019,7 +1074,8 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 
 // parseCreateRecursiveViewTail handles CREATE [OR REPLACE] RECURSIVE VIEW name(cols) AS query.
 // The recursive view is stored as a plain view whose body is a CTE:
-//   WITH RECURSIVE name(cols) AS (query) SELECT * FROM name
+//
+//	WITH RECURSIVE name(cols) AS (query) SELECT * FROM name
 func (p *parser) parseCreateRecursiveViewTail(pos int, orReplace bool) (Stmt, error) {
 	stmt := &CreateViewStmt{pos: pos, OrReplace: orReplace}
 	name, err := p.parseObjectName()
@@ -1368,6 +1424,40 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 								ColName: curColName,
 								Expr:    expr,
 							})
+						}
+					} else if depth == 1 && !inTableConstraint && t.Kind == TokenKeyword && t.Keyword == KwWith && curColName != "" {
+						// WITH OPTIONS GENERATED ALWAYS AS (expr) STORED — child-partition
+						// generated-column expression override. M0100-0010.
+						p.advance() // consume WITH
+						if p.acceptIdentKeyword("options") && p.acceptIdentKeyword("generated") && p.acceptIdentKeyword("always") {
+							if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwAs {
+								p.advance() // consume AS
+								if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+									p.advance() // consume (
+									var exprToks []string
+									exprDepth := 1
+									for exprDepth > 0 && p.cur().Kind != TokenEOF {
+										tok := p.cur()
+										if tok.Kind == TokenSymbol && tok.Value == "(" {
+											exprDepth++
+											exprToks = append(exprToks, tok.Value)
+										} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+											exprDepth--
+											if exprDepth > 0 {
+												exprToks = append(exprToks, tok.Value)
+											}
+										} else {
+											exprToks = append(exprToks, tok.Value)
+										}
+										p.advance()
+									}
+									_ = p.acceptIdentKeyword("stored")
+									poc.ColGeneratedExprs = append(poc.ColGeneratedExprs, PartitionColGenerated{
+										ColName: curColName,
+										Expr:    strings.Join(exprToks, " "),
+									})
+								}
+							}
 						}
 					} else {
 						p.advance()
@@ -1818,9 +1908,9 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 				case p.acceptIdentKeyword("statistics"):
 				case p.acceptIdentKeyword("storage"):
-				if isIncluding {
-					likeKey += ":+storage"
-				}
+					if isIncluding {
+						likeKey += ":+storage"
+					}
 				case p.acceptIdentKeyword("generated"):
 					if isIncluding {
 						likeKey += ":+generated"
@@ -4425,8 +4515,8 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		// PRIMARY KEY USING INDEX name — adopt existing index. Treat as no-op.
 		if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
-			p.acceptKeyword(KwIndex)  // consume INDEX keyword
-			_, _ = p.parseIdent()     // consume index name
+			p.acceptKeyword(KwIndex) // consume INDEX keyword
+			_, _ = p.parseIdent()    // consume index name
 			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
 		}
 		if !p.acceptSymbol("(") {

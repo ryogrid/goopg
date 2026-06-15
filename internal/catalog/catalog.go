@@ -217,6 +217,13 @@ type Table struct {
 	// column-level CHECK constraints. M0097-0014.
 	CheckConstraints []string
 
+	// IsDMLCTE marks a synthetic table created from a data-modifying CTE
+	// (WITH ... AS (UPDATE/DELETE/INSERT)). The analyzer uses this to allow
+	// any column reference on the CTE in FROM/USING clauses without strict
+	// column-existence validation — the planner resolves column types from
+	// the materialized CTE result at execution time.
+	IsDMLCTE bool
+
 	// NamedChecks holds named CHECK constraints (name + expression).
 	// Parallel to CheckConstraints; populated when the constraint has an
 	// explicit CONSTRAINT name clause. Index i of NamedChecks corresponds to
@@ -421,20 +428,20 @@ type Index struct {
 	// columns (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil
 	// when Columns[i] == "" (expression column); nil for plain column names.
 	// Not persisted to JSON (parser.Expr is not JSON-serializable).
-	ColExprs        []*parser.Expr
+	ColExprs []*parser.Expr
 	// ColExprStrings is a pre-serialized SQL string for each expression column
 	// (parallel to ColExprs). Non-empty when Columns[i]=="" and the executor
 	// has serialized the expression via defaultExprToSQL. M0097-0023.
-	ColExprStrings  []string
-	HasPredicate    bool         // true if this is a partial index (has a WHERE clause)
-	Predicate       parser.Expr  // WHERE predicate expression (nil if no WHERE clause)
+	ColExprStrings []string
+	HasPredicate   bool        // true if this is a partial index (has a WHERE clause)
+	Predicate      parser.Expr // WHERE predicate expression (nil if no WHERE clause)
 	// PredicateString is a pre-serialized SQL string for the WHERE predicate.
 	// Set by the executor at CREATE INDEX time. M0097-0023.
 	PredicateString string
-	IncludeColumns  []string     // non-key covering columns from INCLUDE (…)
-	IsConstraint   bool     // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
-	IsExclusion    bool     // true when index backs an EXCLUDE USING constraint
-	ExclusionOp    string   // per-column exclusion operator (e.g. "=")
+	IncludeColumns  []string // non-key covering columns from INCLUDE (…)
+	IsConstraint    bool     // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
+	IsExclusion     bool     // true when index backs an EXCLUDE USING constraint
+	ExclusionOp     string   // per-column exclusion operator (e.g. "=")
 	// PartitionParentOID is the OID of the parent index for partition index
 	// trees (ALTER INDEX parent ATTACH PARTITION child). Zero if not a partition
 	// index child. M0097-0023.
@@ -480,6 +487,12 @@ type Catalog interface {
 	RegisterSchema(name string)
 	// UnregisterSchema removes a schema from the registry. M0097-drop_if_exists.
 	UnregisterSchema(name string)
+	// CreateExtension records a CREATE EXTENSION install in the runtime
+	// pg_extension registry. schema is the install namespace name (defaulted by
+	// the caller), version the extension version string. When the extension
+	// already exists it returns nil if ifNotExists is set, else an error.
+	// M0110-0003 (amcheck SQL surface).
+	CreateExtension(name, schema, version string, ifNotExists bool) error
 	// RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
 	// objType is "conversion", "operator", "rule", "text search configuration", etc.
 	RegisterCompatObject(objType, name string)
@@ -546,8 +559,9 @@ type InMemory struct {
 	routines *Routines
 	// databases is the set of database names the cluster knows
 	// about (M0054-0001). Populated by `CreateDatabase` and
-	// drained by `DropDatabase`. At startup the catalog seeds
-	// `"postgres"` (the conventional bootstrap DB); the recovery
+	// drained by `DropDatabase`. At startup the catalog seeds the
+	// three bootstrap databases `postgres`, `template1` and
+	// `template0` (mirroring initdb's pg_database); the recovery
 	// driver in `internal/initdb` re-applies WAL-logged
 	// CREATE/DROP DATABASE events on top. v0 still routes every
 	// relation through DefaultDBOid — the registry exists so
@@ -622,6 +636,22 @@ type InMemory struct {
 	// statisticsObjs tracks CREATE STATISTICS objects. Key = "schema.name" (lowercase).
 	// Populated by RegisterStatistics; read by pg_statistic_ext VirtualRows. M0097-0023.
 	statisticsObjs map[string]*StatisticsObject
+
+	// extensions tracks CREATE EXTENSION installs (e.g. amcheck), keyed by
+	// lowercase extension name. Backs the pg_extension virtual catalog read by
+	// pg_amcheck's "is amcheck installed?" probe. M0110-0003.
+	extensions map[string]*extensionRow
+}
+
+// extensionRow is one runtime CREATE EXTENSION record backing pg_extension.
+// The install namespace is stored by name and resolved to an OID at read time
+// (in pg_extension's VirtualRows), so it stays consistent if the schema set
+// changes. M0110-0003.
+type extensionRow struct {
+	oid     uint32
+	name    string
+	schema  string
+	version string
 }
 
 // commentKey is the composite key for pg_description.
@@ -746,24 +776,24 @@ const PostgresDBOid uint32 = 5
 // virtual views.
 func NewInMemory() *InMemory {
 	c := &InMemory{
-		tables:              make(map[string]*Table),
-		indexes:             make(map[string]*Index),
-		byTable:             make(map[uint32]map[string]*Index),
-		nextOID:             FirstUserOID,
-		dbOid:               DefaultDBOid,
-		routines:            NewRoutines(),
-		databases:           map[string]bool{"postgres": true},
-		partitionChildren:        make(map[uint32][]uint32),
-		indexPartitionChildren:   make(map[uint32][]uint32),
-		inheritanceChildren: make(map[uint32][]uint32),
-		enumTypes:           make(map[string]*EnumType),
-		domains:             make(map[string]*Domain),
-		compositeTypeNames:  make(map[string]bool),
-		compositeTypeFields: make(map[string][]CompositeField),
-		constraintViewDeps:  make(map[string][]string),
-		opClassHashFuncs:    make(map[string]string),
-		opClassSchemas:      make(map[string]string),
-		userAggregates:      make(map[string]*UserAggregate),
+		tables:                 make(map[string]*Table),
+		indexes:                make(map[string]*Index),
+		byTable:                make(map[uint32]map[string]*Index),
+		nextOID:                FirstUserOID,
+		dbOid:                  DefaultDBOid,
+		routines:               NewRoutines(),
+		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
+		partitionChildren:      make(map[uint32][]uint32),
+		indexPartitionChildren: make(map[uint32][]uint32),
+		inheritanceChildren:    make(map[uint32][]uint32),
+		enumTypes:              make(map[string]*EnumType),
+		domains:                make(map[string]*Domain),
+		compositeTypeNames:     make(map[string]bool),
+		compositeTypeFields:    make(map[string][]CompositeField),
+		constraintViewDeps:     make(map[string][]string),
+		opClassHashFuncs:       make(map[string]string),
+		opClassSchemas:         make(map[string]string),
+		userAggregates:         make(map[string]*UserAggregate),
 		schemas: map[string]uint32{
 			"pg_catalog":         11,
 			"public":             2200,
@@ -773,6 +803,7 @@ func NewInMemory() *InMemory {
 		roles:          make(map[string]struct{}),
 		comments:       make(map[commentKey]string),
 		statisticsObjs: make(map[string]*StatisticsObject),
+		extensions:     make(map[string]*extensionRow),
 	}
 	c.registerSystemTables()
 	return c
@@ -1625,54 +1656,46 @@ func (c *InMemory) registerSystemTables() {
 	pgClass := &Table{
 		Schema: "pg_catalog",
 		Name:   "pg_class",
+		// Columns match the PG18-canonical 34-column pg_class tupdesc written by
+		// syncTableToCatalogHeap / pgClassColumnsPG18(). This alignment is required
+		// so that scanMatching can decode physical pg_class heap tuples for UPDATE
+		// (e.g. "UPDATE pg_class SET reltuples = ... WHERE oid = ...").
+		// M0100-0010: sysupd2/sysmerge2 concurrent-update blocking fix.
 		Columns: []Column{
-			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
-			{Name: "relname", Type: Type{Name: "text"}, Ordinal: 1},
-			{Name: "relkind", Type: Type{Name: "text"}, Ordinal: 2},
-			{Name: "relnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
-			// Additional columns required by vacuumdb catalog query (M0095-0004).
-			{Name: "relpersistence", Type: Type{Name: "text"}, Ordinal: 4},
-			{Name: "reltoastrelid", Type: Type{Name: "oid"}, Ordinal: 5},
-			{Name: "relpages", Type: Type{Name: "int4"}, Ordinal: 6},
-			// relispopulated: true for tables/views, reflects IsPopulated for matviews.
-			// M0097-0013.
-			{Name: "relispopulated", Type: Type{Name: "bool"}, Ordinal: 7},
-			// relnatts: number of user columns. Required by PG's
-			// CREATE SUBSCRIPTION column-list probe (M0103-0008 rung 14):
-			//   `… (array_length(gpt.attrs,1) = c.relnatts) … FROM pg_class c …`
-			// where `gpt = pg_get_publication_tables(...)`.
-			{Name: "relnatts", Type: Type{Name: "int4"}, Ordinal: 8},
-			// relreplident: replica identity setting. Required by PG's
-			// CREATE SUBSCRIPTION tablesync probe (M0103-0008 rung 16):
-			//   `SELECT c.oid, c.relreplident, c.relkind FROM pg_class c …`
-			// 'd' = REPLICA_IDENTITY_DEFAULT (PG default for tables).
-			{Name: "relreplident", Type: Type{Name: "char"}, Ordinal: 9},
-			// relchecks: number of CHECK constraints. Always 0 in goopg v0.
-			{Name: "relchecks", Type: Type{Name: "int2"}, Ordinal: 10},
-			// Additional columns used by psql \d+ meta-commands. M0097-0028.
-			{Name: "relhasindex", Type: Type{Name: "bool"}, Ordinal: 11},
-			{Name: "relhasrules", Type: Type{Name: "bool"}, Ordinal: 12},
-			{Name: "relhastriggers", Type: Type{Name: "bool"}, Ordinal: 13},
-			{Name: "relrowsecurity", Type: Type{Name: "bool"}, Ordinal: 14},
-			{Name: "relforcerowsecurity", Type: Type{Name: "bool"}, Ordinal: 15},
-			{Name: "relhasoids", Type: Type{Name: "bool"}, Ordinal: 16},
-			{Name: "relispartition", Type: Type{Name: "bool"}, Ordinal: 17},
-			{Name: "reltablespace", Type: Type{Name: "oid"}, Ordinal: 18},
-			{Name: "reloftype", Type: Type{Name: "oid"}, Ordinal: 19},
-			{Name: "reloptions", Type: Type{Name: "text[]"}, Ordinal: 20},
-			// relam: access method OID. 2=heap for tables, method OID for indexes.
-			// Required by psql \d+ and pg_class.relam joins with pg_am. M0097-0023.
-			{Name: "relam", Type: Type{Name: "oid"}, Ordinal: 21},
-			// relfilenode: storage file node OID. Equals the table OID when first
-			// created; changes on REINDEX/CLUSTER. Exposed so that regress tests
-			// can detect filenode changes (create_index.sql REINDEX section).
-			{Name: "relfilenode", Type: Type{Name: "oid"}, Ordinal: 22},
-			// relpartbound: partition bound expression tree for partition children.
-			// Stores the pre-formatted "FOR VALUES ..." string; pg_get_expr returns it as-is.
-			{Name: "relpartbound", Type: Type{Name: "pg_node_tree"}, Ordinal: 23},
-			// relhassubclass: true if any child tables (inheritance or partition children)
-			// or child indexes (partition index children) exist. M0097-0026.
-			{Name: "relhassubclass", Type: Type{Name: "bool"}, Ordinal: 24},
+			{Name: "oid",                 Type: Type{Name: "oid"},          Ordinal: 0},
+			{Name: "relname",             Type: Type{Name: "name"},         Ordinal: 1},
+			{Name: "relnamespace",        Type: Type{Name: "oid"},          Ordinal: 2},
+			{Name: "reltype",             Type: Type{Name: "oid"},          Ordinal: 3},
+			{Name: "reloftype",           Type: Type{Name: "oid"},          Ordinal: 4},
+			{Name: "relowner",            Type: Type{Name: "oid"},          Ordinal: 5},
+			{Name: "relam",               Type: Type{Name: "oid"},          Ordinal: 6},
+			{Name: "relfilenode",         Type: Type{Name: "oid"},          Ordinal: 7},
+			{Name: "reltablespace",       Type: Type{Name: "oid"},          Ordinal: 8},
+			{Name: "relpages",            Type: Type{Name: "int4"},         Ordinal: 9},
+			{Name: "reltuples",           Type: Type{Name: "float4"},       Ordinal: 10},
+			{Name: "relallvisible",       Type: Type{Name: "int4"},         Ordinal: 11},
+			{Name: "relallfrozen",        Type: Type{Name: "int4"},         Ordinal: 12},
+			{Name: "reltoastrelid",       Type: Type{Name: "oid"},          Ordinal: 13},
+			{Name: "relhasindex",         Type: Type{Name: "bool"},         Ordinal: 14},
+			{Name: "relisshared",         Type: Type{Name: "bool"},         Ordinal: 15},
+			{Name: "relpersistence",      Type: Type{Name: "char"},         Ordinal: 16},
+			{Name: "relkind",             Type: Type{Name: "char"},         Ordinal: 17},
+			{Name: "relnatts",            Type: Type{Name: "int2"},         Ordinal: 18},
+			{Name: "relchecks",           Type: Type{Name: "int2"},         Ordinal: 19},
+			{Name: "relhasrules",         Type: Type{Name: "bool"},         Ordinal: 20},
+			{Name: "relhastriggers",      Type: Type{Name: "bool"},         Ordinal: 21},
+			{Name: "relhassubclass",      Type: Type{Name: "bool"},         Ordinal: 22},
+			{Name: "relrowsecurity",      Type: Type{Name: "bool"},         Ordinal: 23},
+			{Name: "relforcerowsecurity", Type: Type{Name: "bool"},         Ordinal: 24},
+			{Name: "relispopulated",      Type: Type{Name: "bool"},         Ordinal: 25},
+			{Name: "relreplident",        Type: Type{Name: "char"},         Ordinal: 26},
+			{Name: "relispartition",      Type: Type{Name: "bool"},         Ordinal: 27},
+			{Name: "relrewrite",          Type: Type{Name: "oid"},          Ordinal: 28},
+			{Name: "relfrozenxid",        Type: Type{Name: "xid"},          Ordinal: 29},
+			{Name: "relminmxid",          Type: Type{Name: "xid"},          Ordinal: 30},
+			{Name: "relacl",              Type: Type{Name: "aclitem[]"},    Ordinal: 31},
+			{Name: "reloptions",          Type: Type{Name: "text[]"},       Ordinal: 32},
+			{Name: "relpartbound",        Type: Type{Name: "pg_node_tree"}, Ordinal: 33},
 		},
 		OID:     1259, // upstream's RelationRelationId
 		Virtual: true,
@@ -1734,31 +1757,40 @@ func (c *InMemory) registerSystemTables() {
 				relpers = "t"
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(t.OID)),     // oid: numeric OID (M0103-0008 rung 16)
-				t.Name,                       // relname
-				relkind,                      // relkind
-				strconv.Itoa(int(nsOID)),     // relnamespace: schema OID
-				relpers,                      // relpersistence
-				"0",                          // reltoastrelid: no TOAST table
-				"0",                          // relpages: estimated page count
-				populated,                    // relispopulated
-				strconv.Itoa(len(t.Columns)), // relnatts: number of user columns
-				"d",                          // relreplident: REPLICA_IDENTITY_DEFAULT
-				"0",                          // relchecks: number of CHECK constraints
-				hasIdx,                       // relhasindex
-				"f",                          // relhasrules
-				"f",                          // relhastriggers
-				"f",                          // relrowsecurity
-				"f",                          // relforcerowsecurity
-				"f",                          // relhasoids
-				isPartition,                  // relispartition
-				"0",                          // reltablespace
-				"0",                          // reloftype
-				"",                           // reloptions: empty (NULL via TypedVirtualCell empty-string fallback)
-				"2",                          // relam: heap access method OID (OID 2)
-				strconv.Itoa(int(t.OID)),     // relfilenode: equals OID (no rewrite tracking in v0)
-				partBound,                    // relpartbound: partition bound string for children
-				func() string { if len(c.partitionChildren[t.OID]) > 0 { return "t" }; return "f" }(), // relhassubclass
+				strconv.Itoa(int(t.OID)),     // 0:  oid
+				t.Name,                       // 1:  relname
+				strconv.Itoa(int(nsOID)),     // 2:  relnamespace
+				"0",                          // 3:  reltype
+				"0",                          // 4:  reloftype
+				"10",                         // 5:  relowner (bootstrap superuser)
+				"2",                          // 6:  relam (heap=2)
+				strconv.Itoa(int(t.OID)),     // 7:  relfilenode
+				"0",                          // 8:  reltablespace
+				"0",                          // 9:  relpages
+				"0",                          // 10: reltuples
+				"0",                          // 11: relallvisible
+				"0",                          // 12: relallfrozen
+				"0",                          // 13: reltoastrelid
+				hasIdx,                       // 14: relhasindex
+				"f",                          // 15: relisshared
+				relpers,                      // 16: relpersistence
+				relkind,                      // 17: relkind
+				strconv.Itoa(len(t.Columns)), // 18: relnatts
+				"0",                          // 19: relchecks
+				"f",                          // 20: relhasrules
+				"f",                          // 21: relhastriggers
+				func() string { if len(c.partitionChildren[t.OID]) > 0 { return "t" }; return "f" }(), // 22: relhassubclass
+				"f",                          // 23: relrowsecurity
+				"f",                          // 24: relforcerowsecurity
+				populated,                    // 25: relispopulated
+				"d",                          // 26: relreplident
+				isPartition,                  // 27: relispartition
+				"0",                          // 28: relrewrite
+				"0",                          // 29: relfrozenxid
+				"1",                          // 30: relminmxid
+				"",                           // 31: relacl (NULL)
+				"",                           // 32: reloptions (NULL)
+				partBound,                    // 33: relpartbound
 			})
 		}
 		// Emit index rows (relkind='i'/'I') so pg_class can be used to count indexes.
@@ -1804,31 +1836,40 @@ func (c *InMemory) registerSystemTables() {
 				idxHasSubclass = "t"
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(idx.OID)),  // oid
-				idx.Name,                    // relname
-				idxRelkind,                  // relkind: 'I' if partitioned, 'i' otherwise
-				strconv.Itoa(int(idxNsOID)), // relnamespace
-				idxPers,                     // relpersistence
-				"0",                         // reltoastrelid
-				"0",                         // relpages
-				"t",                         // relispopulated
-				"0",                         // relnatts
-				"n",                         // relreplident: not applicable for indexes
-				"0",                         // relchecks
-				"f",                         // relhasindex
-				"f",                         // relhasrules
-				"f",                         // relhastriggers
-				"f",                         // relrowsecurity
-				"f",                         // relforcerowsecurity
-				"f",                         // relhasoids
-				"f",                         // relispartition
-				"0",                         // reltablespace
-				"0",                         // reloftype
-				"",                          // reloptions: NULL
-				idxRelam,                    // relam: index access method OID
-				strconv.Itoa(int(idx.OID)), // relfilenode: equals OID
-				"",                          // relpartbound: indexes are never partition children
-				idxHasSubclass,              // relhassubclass: true if partitioned index
+				strconv.Itoa(int(idx.OID)),  // 0:  oid
+				idx.Name,                    // 1:  relname
+				strconv.Itoa(int(idxNsOID)), // 2:  relnamespace
+				"0",                         // 3:  reltype
+				"0",                         // 4:  reloftype
+				"10",                        // 5:  relowner
+				idxRelam,                    // 6:  relam
+				strconv.Itoa(int(idx.OID)),  // 7:  relfilenode
+				"0",                         // 8:  reltablespace
+				"0",                         // 9:  relpages
+				"-1",                        // 10: reltuples (-1 = unknown for indexes)
+				"0",                         // 11: relallvisible
+				"0",                         // 12: relallfrozen
+				"0",                         // 13: reltoastrelid
+				"f",                         // 14: relhasindex
+				"f",                         // 15: relisshared
+				idxPers,                     // 16: relpersistence
+				idxRelkind,                  // 17: relkind
+				"0",                         // 18: relnatts
+				"0",                         // 19: relchecks
+				"f",                         // 20: relhasrules
+				"f",                         // 21: relhastriggers
+				idxHasSubclass,              // 22: relhassubclass
+				"f",                         // 23: relrowsecurity
+				"f",                         // 24: relforcerowsecurity
+				"t",                         // 25: relispopulated
+				"n",                         // 26: relreplident
+				"f",                         // 27: relispartition
+				"0",                         // 28: relrewrite
+				"0",                         // 29: relfrozenxid
+				"1",                         // 30: relminmxid
+				"",                          // 31: relacl (NULL)
+				"",                          // 32: reloptions (NULL)
+				"",                          // 33: relpartbound
 			})
 		}
 		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
@@ -1836,31 +1877,40 @@ func (c *InMemory) registerSystemTables() {
 		//   SELECT oid::int8 FROM pg_class WHERE relname = 'pg_class'
 		// must return 1259. M0097-0029.
 		out = append(out, []string{
-			"1259",     // oid
-			"pg_class", // relname
-			"r",        // relkind = regular table
-			"11",       // relnamespace = pg_catalog
-			"p",        // relpersistence
-			"0",        // reltoastrelid
-			"0",        // relpages
-			"t",        // relispopulated
-			"25",       // relnatts: 25 columns (including relhassubclass added M0097-0026)
-			"n",        // relreplident
-			"0",        // relchecks
-			"t",        // relhasindex (pg_class itself has indexes)
-			"f",        // relhasrules
-			"f",        // relhastriggers
-			"f",        // relrowsecurity
-			"f",        // relforcerowsecurity
-			"f",        // relhasoids
-			"f",        // relispartition
-			"0",        // reltablespace
-			"0",        // reloftype
-			"",         // reloptions: NULL
-			"2",        // relam: heap access method OID
-			"1259",     // relfilenode: equals OID for pg_class
-			"",         // relpartbound: pg_class is not a partition child
-			"f",        // relhassubclass: pg_class itself has no subclasses
+			"1259",     // 0:  oid
+			"pg_class", // 1:  relname
+			"11",       // 2:  relnamespace (pg_catalog OID=11)
+			"0",        // 3:  reltype
+			"0",        // 4:  reloftype
+			"10",       // 5:  relowner
+			"2",        // 6:  relam (heap)
+			"1259",     // 7:  relfilenode
+			"0",        // 8:  reltablespace
+			"0",        // 9:  relpages
+			"0",        // 10: reltuples
+			"0",        // 11: relallvisible
+			"0",        // 12: relallfrozen
+			"0",        // 13: reltoastrelid
+			"t",        // 14: relhasindex
+			"t",        // 15: relisshared (pg_class is a shared catalog)
+			"p",        // 16: relpersistence
+			"r",        // 17: relkind
+			"34",       // 18: relnatts (34 columns, PG18-canonical)
+			"0",        // 19: relchecks
+			"f",        // 20: relhasrules
+			"f",        // 21: relhastriggers
+			"f",        // 22: relhassubclass
+			"f",        // 23: relrowsecurity
+			"f",        // 24: relforcerowsecurity
+			"t",        // 25: relispopulated
+			"n",        // 26: relreplident
+			"f",        // 27: relispartition
+			"0",        // 28: relrewrite
+			"0",        // 29: relfrozenxid
+			"1",        // 30: relminmxid
+			"",         // 31: relacl (NULL)
+			"",         // 32: reloptions (NULL)
+			"",         // 33: relpartbound
 		})
 		return out
 	}
@@ -1905,6 +1955,58 @@ func (c *InMemory) registerSystemTables() {
 		return out
 	}
 	c.tables["pg_catalog.pg_namespace"] = pgNamespace
+
+	// pg_extension — backs pg_amcheck's "is amcheck installed?" probe
+	// (M0110-0003):
+	//   SELECT n.nspname, x.extversion FROM pg_catalog.pg_extension x
+	//     JOIN pg_catalog.pg_namespace n ON x.extnamespace = n.oid
+	//   WHERE x.extname = 'amcheck'
+	// Rows come from the runtime extensions registry (CREATE EXTENSION). Column
+	// order, names, and OID match upstream pg_extension (ExtensionRelationId
+	// 3079, src/include/catalog/pg_extension.h). extconfig/extcondition are
+	// always NULL in goopg v0 (no extension config tables).
+	pgExtension := &Table{
+		Schema: "pg_catalog",
+		Name:   "pg_extension",
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "extname", Type: Type{Name: "name"}, Ordinal: 1},
+			{Name: "extowner", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "extnamespace", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "extrelocatable", Type: Type{Name: "bool"}, Ordinal: 4},
+			{Name: "extversion", Type: Type{Name: "text"}, Ordinal: 5},
+			{Name: "extconfig", Type: Type{Name: "oid[]"}, Ordinal: 6},
+			{Name: "extcondition", Type: Type{Name: "text[]"}, Ordinal: 7},
+		},
+		OID:     3079, // upstream's ExtensionRelationId
+		Virtual: true,
+	}
+	pgExtension.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		rows := make([]*extensionRow, 0, len(c.extensions))
+		for _, e := range c.extensions {
+			rows = append(rows, e)
+		}
+		// Sort by OID for deterministic output.
+		sort.Slice(rows, func(i, j int) bool { return rows[i].oid < rows[j].oid })
+		out := make([][]string, 0, len(rows))
+		for _, e := range rows {
+			nsOID := c.schemas[strings.ToLower(e.schema)]
+			out = append(out, []string{
+				strconv.Itoa(int(e.oid)), // oid
+				e.name,                   // extname
+				"10",                     // extowner (bootstrap superuser)
+				strconv.Itoa(int(nsOID)), // extnamespace
+				"f",                      // extrelocatable
+				e.version,                // extversion
+				"",                       // extconfig: NULL
+				"",                       // extcondition: NULL
+			})
+		}
+		return out
+	}
+	c.tables["pg_catalog.pg_extension"] = pgExtension
 
 	// pg_indexes view. HammerDB's checkschema step queries
 	// `select tablename, indexname from pg_indexes where
@@ -2000,14 +2102,28 @@ func (c *InMemory) registerSystemTables() {
 		names := c.ListDatabases()
 		out := make([][]string, 0, len(names))
 		for _, n := range names {
+			// The bootstrap template databases carry their canonical PG
+			// attributes: template1 (oid 1) is connectable, template0
+			// (oid 4) is not (datallowconn=false), and both are templates
+			// (datistemplate=true). Mirrors initdb's pg_database seed
+			// (initdb.go buildRow). Clients such as pg_amcheck filter on
+			// `datallowconn AND datconnlimit != -2`, so template0 is
+			// correctly omitted from --all while template1 is included.
+			oid, datallowconn, datistemplate := "16384", "true", "false"
+			switch n {
+			case "template1":
+				oid, datallowconn, datistemplate = "1", "true", "true"
+			case "template0":
+				oid, datallowconn, datistemplate = "4", "false", "true"
+			}
 			out = append(out, []string{
-				"16384", // oid: conventional database OID (M0097-0021)
+				oid, // oid: conventional database OID (M0097-0021)
 				n,
-				"10",    // datdba: OID of owner (10 = postgres superuser)
-				"6",     // encoding: 6 = UTF8
-				"true",  // datallowconn: allow connections
-				"0",     // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
-				"false", // datistemplate: live databases are not templates
+				"10",          // datdba: OID of owner (10 = postgres superuser)
+				"6",           // encoding: 6 = UTF8
+				datallowconn,  // datallowconn: allow connections
+				"0",           // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
+				datistemplate, // datistemplate: true for template0/template1
 			})
 		}
 		return out
@@ -2662,10 +2778,10 @@ func (c *InMemory) registerSystemTables() {
 					row[15] = "f"
 				}
 				row[16] = fmt.Sprintf("%d", nc.InhCount) // coninhcount
-				row[17] = "f"                             // connoinherit
-				row[18] = "f"                             // conperiod
-				row[24] = nc.Expr                         // conbin
-				row[25] = "t"                             // conenforced: always true in v0
+				row[17] = "f"                            // connoinherit
+				row[18] = "f"                            // conperiod
+				row[24] = nc.Expr                        // conbin
+				row[25] = "t"                            // conenforced: always true in v0
 				out = append(out, row)
 			}
 		}
@@ -2948,26 +3064,26 @@ func (c *InMemory) registerSystemTables() {
 			out = append(out, []string{
 				fmt.Sprintf("%d", idx.OID),       // indexrelid
 				fmt.Sprintf("%d", idx.Table.OID), // indrelid
-				fmt.Sprintf("%d", natts),          // indnatts
-				fmt.Sprintf("%d", nkeyatts),       // indnkeyatts
-				boolStr(idx.Unique),               // indisunique
-				"f",                               // indnullsnotdistinct
-				boolStr(idx.Primary),              // indisprimary
-				boolStr(idx.IsExclusion),          // indisexclusion
-				"t",                               // indimmediate
-				"f",                               // indisclustered
-				"t",                               // indisvalid
-				"f",                               // indcheckxmin
-				"t",                               // indisready
-				"t",                               // indislive
-				"f",                               // indisreplident
-				indkey,                            // indkey
-				buildZeroVec(nkeyatts),            // indcollation
-				indclass,                          // indclass
-				buildZeroVec(nkeyatts),            // indoption
-				"",                                // indexprs (NULL)
-				"",                                // indpred (NULL)
-				"",                                // indcoloptions (NULL)
+				fmt.Sprintf("%d", natts),         // indnatts
+				fmt.Sprintf("%d", nkeyatts),      // indnkeyatts
+				boolStr(idx.Unique),              // indisunique
+				"f",                              // indnullsnotdistinct
+				boolStr(idx.Primary),             // indisprimary
+				boolStr(idx.IsExclusion),         // indisexclusion
+				"t",                              // indimmediate
+				"f",                              // indisclustered
+				"t",                              // indisvalid
+				"f",                              // indcheckxmin
+				"t",                              // indisready
+				"t",                              // indislive
+				"f",                              // indisreplident
+				indkey,                           // indkey
+				buildZeroVec(nkeyatts),           // indcollation
+				indclass,                         // indclass
+				buildZeroVec(nkeyatts),           // indoption
+				"",                               // indexprs (NULL)
+				"",                               // indpred (NULL)
+				"",                               // indcoloptions (NULL)
 			})
 		}
 		return out
@@ -4084,6 +4200,33 @@ func (c *InMemory) UnregisterSchema(name string) {
 	delete(c.schemas, strings.ToLower(name))
 }
 
+// CreateExtension records a CREATE EXTENSION install in the runtime
+// pg_extension registry. Called from the executor's execCreateExtension after
+// it has validated the extension name and resolved the default version/schema.
+// M0110-0003.
+func (c *InMemory) CreateExtension(name, schema, version string, ifNotExists bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lc := strings.ToLower(name)
+	if _, ok := c.extensions[lc]; ok {
+		if ifNotExists {
+			return nil
+		}
+		return fmt.Errorf("extension %q already exists", name)
+	}
+	if schema == "" {
+		schema = "public"
+	}
+	c.nextOID++
+	c.extensions[lc] = &extensionRow{
+		oid:     c.nextOID,
+		name:    name,
+		schema:  schema,
+		version: version,
+	}
+	return nil
+}
+
 // allSchemasLocked returns all (name, oid) pairs. Must be called with mu held.
 func (c *InMemory) allSchemasLocked() []struct {
 	name string
@@ -4496,6 +4639,37 @@ func (c *InMemory) AllTables() []*Table {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
 	return out
+}
+
+// DatFrozenXID returns the minimum RelFrozenXID across all user (non-virtual,
+// non-system) tables that have a valid relfrozenxid, or 0 when none do. This
+// is the cluster-wide datfrozenxid candidate: every XID strictly below it is
+// frozen in every user heap, so CLOG status for those XIDs can be truncated.
+// Mirrors PG's per-database datfrozenxid = min(pg_class.relfrozenxid) computed
+// at the end of VACUUM (vac_update_datfrozenxid). System relations are
+// excluded because goopg does not freeze them; including their default-zero
+// relfrozenxid would pin truncation at 0. Does NOT mutate any catalog state.
+func (c *InMemory) DatFrozenXID() storage.TransactionID {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var oldest storage.TransactionID
+	for _, t := range c.tables {
+		if t.Virtual || IsSystemRelation(t.OID) {
+			continue
+		}
+		if t.RelFrozenXID == storage.InvalidTransactionID {
+			continue
+		}
+		// Select the oldest relfrozenxid using wraparound-safe modular
+		// comparison (mirrors PG vac_update_datfrozenxid's
+		// TransactionIdPrecedes). Plain `<` would mis-order XIDs that
+		// straddle the 2^32 boundary and pick a too-recent horizon,
+		// truncating CLOG status still needed by older frozen tuples.
+		if oldest == storage.InvalidTransactionID || storage.XIDPrecedes(t.RelFrozenXID, oldest) {
+			oldest = t.RelFrozenXID
+		}
+	}
+	return oldest
 }
 
 // AllUserViews returns deep copies of every user-created non-materialized view.

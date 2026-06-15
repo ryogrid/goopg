@@ -1,8 +1,8 @@
 package executor
 
 import (
-	"fmt"
 	"context"
+	"fmt"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
@@ -92,6 +92,13 @@ type lockRowsOp struct {
 	// Used by EXISTS (SELECT ... FOR UPDATE) to stop after the first match
 	// instead of scanning the full inner table. M0100-0005.
 	maxDrain int
+
+	// filterPred / filterCols: extracted from the child chain at Open time.
+	// When stampLock follows a committed-update CTID chain to a live successor
+	// (EPQ for SELECT FOR UPDATE), the filter predicate is re-evaluated against
+	// the new row — matching PostgreSQL's EvalPlanQualFetchRowMark behaviour.
+	filterPred planner.Expr
+	filterCols []catalog.Column
 }
 
 type pendingLockedRow struct {
@@ -112,6 +119,75 @@ type pendingLockedRow struct {
 
 func newLockRowsOp(p *planner.LockRows, child Operator) *lockRowsOp {
 	return &lockRowsOp{plan: p, child: child}
+}
+
+// findFilterPred walks the child chain past Project wrappers and returns the
+// predicate of the first filterOp found. Returns nil when no filter is present.
+func findFilterPred(op Operator) planner.Expr {
+	for {
+		switch v := op.(type) {
+		case *filterOp:
+			return v.pred
+		case *projectOp:
+			op = v.child
+		default:
+			return nil
+		}
+	}
+}
+
+// filterPredMaxColRef returns the maximum ColumnRef.Index found anywhere in
+// expr, or -1 if there are none. Used to detect when a filter predicate
+// references columns from a non-locked join input so EPQ recheck can be safely
+// skipped (M0100-0010).
+func filterPredMaxColRef(expr planner.Expr) int {
+	max := -1
+	var walk func(planner.Expr)
+	walk = func(e planner.Expr) {
+		if e == nil {
+			return
+		}
+		if cr, ok := e.(*planner.ColumnRef); ok {
+			if cr.Index > max {
+				max = cr.Index
+			}
+			return
+		}
+		switch x := e.(type) {
+		case *planner.BinaryOp:
+			walk(x.Left)
+			walk(x.Right)
+		case *planner.UnaryOp:
+			walk(x.Operand)
+		case *planner.CastExpr:
+			walk(x.Operand)
+		case *planner.IsNullExpr:
+			walk(x.Operand)
+		case *planner.IsBoolExpr:
+			walk(x.Operand)
+		case *planner.IsDistinctFromExpr:
+			walk(x.Left)
+			walk(x.Right)
+		case *planner.FuncCall:
+			for _, a := range x.Args {
+				walk(a)
+			}
+		case *planner.CaseExpr:
+			walk(x.Operand)
+			for _, w := range x.Whens {
+				walk(w.When)
+				walk(w.Then)
+			}
+			walk(x.Else)
+		case *planner.InExpr:
+			walk(x.Operand)
+			for _, v := range x.List {
+				walk(v)
+			}
+		}
+	}
+	walk(expr)
+	return max
 }
 
 // currentTIDProvider is the interface a scan leaf implements to
@@ -146,6 +222,97 @@ func findScanLeaf(op Operator) currentTIDProvider {
 			// delegates to whichever child is currently active (left while
 			// !leftDone, right once leftDone). M0100-0005 follow-up.
 			return v
+		case *joinOp:
+			// For joins, prefer the left (outer) child because its scan
+			// cursor stays at the current row while the inner scan loops.
+			// When the left child is not a real-table scan (e.g. a VALUES
+			// or correlated subquery), fall back to the right child so that
+			// FOR UPDATE OF a real table still gets a TID even when the
+			// planner reordered the join to put VALUES outermost.
+			if left := findScanLeaf(v.left); left != nil {
+				return left
+			}
+			op = v.right
+		case *nestedLoopIndexJoinOp:
+			// Prefer outer; fall back to inner (indexScanOp) when outer is
+			// not a real-table scan (e.g. VALUES, subquery).
+			if left := findScanLeaf(v.outer); left != nil {
+				return left
+			}
+			return v.inner
+		case *multiHashJoinOp:
+			// Hash join: the probe side scans the driving (non-build) table.
+			// When probeOp has not yet been assigned (pre-Open), fall through.
+			if v.probeOp != nil {
+				if p := findScanLeaf(v.probeOp); p != nil {
+					return p
+				}
+			}
+			// Fall back: check build children for a real-table scan.
+			for _, c := range v.children {
+				if p := findScanLeaf(c); p != nil {
+					return p
+				}
+			}
+			return nil
+		default:
+			return nil
+		}
+	}
+}
+
+// findScanLeafForRel finds the currentTIDProvider for a specific relation
+// (identified by its storage.RelFileNode), preferring the leftmost occurrence.
+// Called after o.child.Open so seqScanOp.rel and indexScanOp.ctx are set.
+// Used to ensure the lockRowsOp captures TIDs from the correct scan in complex
+// joins where the locked table is not the leftmost leaf (M0100-0010).
+func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) currentTIDProvider {
+	for {
+		switch v := op.(type) {
+		case *seqScanOp:
+			if v.rel == targetRel {
+				return v
+			}
+			return nil
+		case *indexScanOp:
+			if v.ctx != nil && v.ctx.Catalog.RelFileNode(v.plan.Table) == targetRel {
+				return v
+			}
+			return nil
+		case *projectOp:
+			op = v.child
+		case *filterOp:
+			op = v.child
+		case *setOp:
+			// setOp implements currentTIDProvider for partition unions;
+			// we can't check its target rel, fall back to generic findScanLeaf.
+			return nil
+		case *joinOp:
+			if left := findScanLeafForRel(v.left, targetRel); left != nil {
+				return left
+			}
+			op = v.right
+		case *nestedLoopIndexJoinOp:
+			if left := findScanLeafForRel(v.outer, targetRel); left != nil {
+				return left
+			}
+			if v.inner != nil && v.inner.ctx != nil &&
+				v.inner.ctx.Catalog.RelFileNode(v.inner.plan.Table) == targetRel {
+				return v.inner
+			}
+			return nil
+		case *multiHashJoinOp:
+			if v.probeOp != nil {
+				if p := findScanLeafForRel(v.probeOp, targetRel); p != nil {
+					return p
+				}
+			}
+			for _, c := range v.children {
+				if p := findScanLeafForRel(c, targetRel); p != nil {
+					return p
+				}
+			}
+			return nil
 		default:
 			return nil
 		}
@@ -225,7 +392,33 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
-	o.scan = findScanLeaf(o.child)
+	// Prefer the scan for the first physical locked relation so that
+	// the TID tracked by drainAndStamp comes from the right table.
+	// This matters when the locked table is not the leftmost scan leaf
+	// in a complex join (e.g. FOR UPDATE OF jt where jt is not outer).
+	o.scan = findScanLeaf(o.child) // default fallback
+	for i := range o.plan.Locks {
+		if o.plan.Locks[i].Table != nil {
+			targetRel := ctx.Catalog.RelFileNode(o.plan.Locks[i].Table)
+			if scan := findScanLeafForRel(o.child, targetRel); scan != nil {
+				o.scan = scan
+			}
+			break
+		}
+	}
+	// Extract filter predicate for EPQ re-eval after CTID chain follow.
+	o.filterPred = findFilterPred(o.child)
+	if len(o.plan.Locks) > 0 && o.plan.Locks[0].Table != nil {
+		o.filterCols = o.plan.Locks[0].Table.Columns
+	}
+	// Only keep filterPred for EPQ if all ColumnRefs it contains are within
+	// the locked-table column range. Predicates that reference other join
+	// inputs (e.g. a VALUES clause) have column indices beyond filterCols;
+	// evaluating them against only the re-fetched heap tuple would return an
+	// out-of-range error and incorrectly skip the row (M0100-0010).
+	if o.filterPred != nil && filterPredMaxColRef(o.filterPred) >= len(o.filterCols) {
+		o.filterPred = nil
+	}
 	return nil
 }
 
@@ -248,13 +441,57 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 	// When stampLock followed a committed-update chain, refetch the row
 	// from the live successor slot so callers see updated values.
 	if entry.newPtrValid {
-		if row, err := o.refetchRow(entry.rel, entry.newPtr); err != nil {
+		if newLockedCols, err := o.refetchRow(entry.rel, entry.newPtr); err != nil {
 			return nil, err
-		} else if row != nil {
-			return asSlot(o.Schema(), row), nil
+		} else if newLockedCols != nil {
+			// Merge the re-fetched locked-table values into the full join row
+			// for every LockedRel that references the same physical relation.
+			// Using lk.ColOffset (set by the planner from rangeBinding.offset)
+			// handles two important cases:
+			//   1. Self-joins: same table at multiple offsets (e.g. jointest a
+			//      at 0 and jointest b at 2) — both ranges are updated.
+			//   2. Non-leftmost locked table: e.g. FOR UPDATE OF jt where jt
+			//      columns are at offset 4, not 0.
+			merged := cloneRow(entry.row)
+			applied := false
+			for _, lk := range o.plan.Locks {
+				if lk.Table == nil {
+					continue
+				}
+				if o.ctx.Catalog.RelFileNode(lk.Table) != entry.rel {
+					continue
+				}
+				for i, v := range newLockedCols {
+					pos := lk.ColOffset + i
+					if pos < len(merged) {
+						merged[pos] = v
+					}
+				}
+				applied = true
+			}
+			if !applied {
+				// Fallback when no LockedRel matched (should not happen for
+				// well-formed plans; assume offset 0 for safety).
+				for i, v := range newLockedCols {
+					if i < len(merged) {
+						merged[i] = v
+					}
+				}
+			}
+			ms := SlotFromRow(o.Schema(), merged)
+			ms.hasCTID = true
+			ms.ctidBlock = uint32(entry.newPtr.Block)
+			ms.ctidOff = entry.newPtr.Offset
+			return ms, nil
 		}
 	}
-	return asSlot(o.Schema(), entry.row), nil
+	ms := SlotFromRow(o.Schema(), entry.row)
+	if entry.haveTID {
+		ms.hasCTID = true
+		ms.ctidBlock = uint32(entry.ptr.Block)
+		ms.ctidOff = entry.ptr.Offset
+	}
+	return ms, nil
 }
 
 // drainAndStamp runs phases 1 and 2 of the two-pass protocol:
@@ -266,10 +503,11 @@ func (o *lockRowsOp) Next() (TupleSlot, error) {
 // and emits the row-lock WAL record.
 func (o *lockRowsOp) drainAndStamp() error {
 	o.drained = true
-	hitLimit := false
+	successCount := 0
 	for {
-		if o.maxDrain > 0 && len(o.pending) >= o.maxDrain {
-			hitLimit = true
+		// Stop once we have acquired enough successfully locked rows.
+		if o.maxDrain > 0 && successCount >= o.maxDrain {
+			_ = o.child.Close()
 			break
 		}
 		slot, err := o.child.Next()
@@ -279,10 +517,10 @@ func (o *lockRowsOp) drainAndStamp() error {
 		if err != nil {
 			return err
 		}
-		// Materialize at retention boundary: lockRowsOp's two-pass
-		// protocol holds rows across the entire stamp loop.
-		// (M0071-0010 Stage B.)
-		row := slot.Materialize().Row()
+		// Materialize at retention boundary: rows may be held until
+		// stampLock completes (potentially blocking on a concurrent xmax).
+		ms := slot.Materialize()
+		row := ms.Row()
 		entry := pendingLockedRow{row: row}
 		if o.scan != nil {
 			if rel, ptr, ok := o.scan.currentTID(); ok {
@@ -291,68 +529,76 @@ func (o *lockRowsOp) drainAndStamp() error {
 				entry.haveTID = true
 			}
 		}
+		// Fallback: ctid embedded in slot by eager NL join operator when the
+		// scan was drained and closed during Open() (M0100-0010).
+		if !entry.haveTID && ms.hasCTID && len(o.plan.Locks) > 0 && o.plan.Locks[0].Table != nil {
+			entry.rel = o.ctx.Catalog.RelFileNode(o.plan.Locks[0].Table)
+			entry.ptr = storage.ItemPointer{Block: storage.BlockNumber(ms.ctidBlock), Offset: ms.ctidOff}
+			entry.haveTID = true
+		}
+		if entry.haveTID {
+			successor, followed, epqSkipped, err := o.stampLock(entry.rel, entry.ptr)
+			if err != nil {
+				return err
+			}
+			if epqSkipped {
+				// EPQ recheck rejected the updated row — the row no longer
+				// satisfies the WHERE predicate. Do not yield it; continue
+				// draining the child scan for more qualifying candidates.
+				// This matches PG's EvalPlanQualFetchRowMark behaviour where
+				// a failed recheck causes the scan to advance to the next row.
+				continue
+			}
+			if followed && successor != (storage.ItemPointer{}) {
+				entry.newPtr = successor
+				entry.newPtrValid = true
+			}
+		}
 		o.pending = append(o.pending, entry)
-	}
-	// When we stopped early (maxDrain limit hit), the child scan still holds
-	// its page RLock. Close the child to release it before the stamp pass
-	// acquires exclusive page locks — otherwise we deadlock. M0100-0005.
-	if hitLimit {
-		_ = o.child.Close()
-	}
-	for i := range o.pending {
-		e := &o.pending[i]
-		if !e.haveTID {
-			continue
-		}
-		successor, followed, err := o.stampLock(e.rel, e.ptr)
-		if err != nil {
-			return err
-		}
-		if followed {
-			e.newPtr = successor
-			e.newPtrValid = true
-		}
+		successCount++
 	}
 	return nil
 }
 
 // stampLock acquires a tuple-level lock and stamps the lock-only xmax on the
-// heap tuple at ptr. Returns (successorPtr, followed, err):
+// heap tuple at ptr. Returns (successorPtr, followed, epqSkipped, err):
 //   - followed=false: stamped at ptr (or nothing stamped for dead-end cases)
 //   - followed=true: followed a committed-update CTID chain; successorPtr is the
 //     live tuple that was stamped. Caller should update entry.newPtr.
+//   - epqSkipped=true: EPQ recheck filter rejected the row; caller must not
+//     yield this row and should continue draining for more candidates.
 //
 // When a real non-lock-only xmax from another xact is present:
 //   - If the xmax is still in-progress: waits for it (produces <waiting ...>
 //     in isolation tests) and then checks the final state.
 //   - If the xmax committed: follows the CTID chain to the live successor.
 //   - If the xmax aborted: the row is live; re-stamps at original ptr.
-func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer) (storage.ItemPointer, bool, error) {
+func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer) (storage.ItemPointer, bool, bool, error) {
 	// M0093: SELECT FOR UPDATE/SHARE stamps lock-only xmax with the
 	// transaction's XID; materialise it BEFORE acquiring the tuple
 	// lock so the lock holder's identity is the real XID (mismatched
 	// holder identity breaks UPDATE's blocks-on-foreign-lock check).
 	if err := o.ctx.MaterializeWriterXID(); err != nil {
-		return storage.ItemPointer{}, false, err
+		return storage.ItemPointer{}, false, false, err
 	}
 	// Acquire the tuple-level lock first so a concurrent UPDATE
 	// that races with us can't slip through between the xmax
 	// stamp and the lock registration.
 	if err := o.ctx.acquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
-		return storage.ItemPointer{}, false, err
+		return storage.ItemPointer{}, false, false, err
 	}
 	return o.stampLockInner(rel, ptr, 0)
 }
 
 // stampLockInner is the recursive inner loop for stampLock, bounded by depth
 // to prevent infinite chains. depth=0 on first call.
-func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPointer, depth int) (storage.ItemPointer, bool, error) {
+func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPointer, depth int) (storage.ItemPointer, bool, bool, error) {
 	if depth > 16 {
-		return storage.ItemPointer{}, false, nil // chain too deep
+		return storage.ItemPointer{}, false, false, nil // chain too deep
 	}
 	slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 	if err != nil {
-		return storage.ItemPointer{}, false, err
+		return storage.ItemPointer{}, false, false, err
 	}
 	slot.Lock()
 	// M0100-0005f + M0100-0005-lcku: handle real non-lock-only xmax from
@@ -375,7 +621,7 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 			// Preserve M0100-0005f: do not overwrite real updater's xmax.
 			slot.Unlock()
 			o.ctx.Pool.Unpin(slot)
-			return storage.ItemPointer{}, false, nil
+			return storage.ItemPointer{}, false, false, nil
 		}
 
 		xmax := tup.Header.Xmax
@@ -384,26 +630,28 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		o.ctx.Pool.Unpin(slot)
 
 		// Wait for in-progress updater to commit or abort.
-		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
+		isActive := o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax)
+		if isActive {
 			qctx := o.ctx.Ctx
 			if qctx == nil {
 				qctx = context.Background()
 			}
 			if werr := o.ctx.TxnMgr.WaitForXID(qctx, xmax); werr != nil {
 				// Context cancelled — skip this row silently.
-				return storage.ItemPointer{}, false, nil
+				return storage.ItemPointer{}, false, false, nil
 			}
 		}
 
 		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
 			// Updater rolled back: row is live at original ptr. Stamp it.
-			return o.stampAtPtr(rel, ptr)
+			ptr2, followed2, err2 := o.stampAtPtr(rel, ptr)
+			return ptr2, followed2, false, err2
 		}
 
 		// Updater committed: under RR/SER raise a serialization error.
 		// Under RC: follow CTID chain to find the live successor.
 		if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
-			return storage.ItemPointer{}, false, &ExecError{
+			return storage.ItemPointer{}, false, false, &ExecError{
 				Code:    "40001",
 				Message: "could not serialize access due to concurrent update",
 			}
@@ -411,38 +659,50 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		next := ctid
 		if next.Block == ptr.Block && next.Offset == ptr.Offset {
 			// CTID points to self — deleted row, no live successor.
-			return storage.ItemPointer{}, false, nil
+			return storage.ItemPointer{}, false, false, nil
 		}
 		// Acquire lockmgr lock on the successor before reading it.
 		if err := o.ctx.acquireTupleLock(rel, next, o.tupleLockMode()); err != nil {
-			return storage.ItemPointer{}, false, err
+			return storage.ItemPointer{}, false, false, err
 		}
-		succ, _, err := o.stampLockInner(rel, next, depth+1)
+		succ, _, succEPQSkipped, err := o.stampLockInner(rel, next, depth+1)
 		if err != nil {
-			return storage.ItemPointer{}, false, err
+			return storage.ItemPointer{}, false, false, err
 		}
 		if succ == (storage.ItemPointer{}) {
-			return storage.ItemPointer{}, false, nil
+			// Propagate epqSkipped from recursive call so callers further
+			// up the chain know the row was rejected by EPQ, not just deleted.
+			return storage.ItemPointer{}, false, succEPQSkipped, nil
+		}
+		// EPQ re-eval: re-evaluate filter predicate against the live successor
+		// row, matching PostgreSQL's EvalPlanQualFetchRowMark behaviour. This
+		// fires any side-effecting quals (e.g. noisy_oper NOTICEs) against the
+		// updated row values. If the filter no longer passes, skip the row and
+		// signal the caller to continue draining for more candidates.
+		if o.filterPred != nil && len(o.filterCols) > 0 {
+			if skip := o.epqRecheckFilter(rel, succ); skip {
+				return storage.ItemPointer{}, false, true, nil // epqSkipped
+			}
 		}
 		// Indicate that the entry's row data should be refetched.
-		return succ, true, nil
+		return succ, true, false, nil
 	}
 
 	// Tuple is live (no real updater xmax from another xact). Stamp it.
 	if gerr != nil {
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
-		return storage.ItemPointer{}, false, nil
+		return storage.ItemPointer{}, false, false, nil
 	}
 	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, o.ctx.Tx.XID, o.lockStrength); err != nil {
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
-		return storage.ItemPointer{}, false, err
+		return storage.ItemPointer{}, false, false, err
 	}
 	derr := markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, o.lockStrength)
 	slot.Unlock()
 	o.ctx.Pool.Unpin(slot)
-	return ptr, false, derr
+	return ptr, false, false, derr
 }
 
 // stampAtPtr stamps a lock-only xmax at ptr. Used when the original updater's
@@ -477,6 +737,33 @@ func (o *lockRowsOp) stampAtPtr(rel storage.RelFileNode, ptr storage.ItemPointer
 	slot.Unlock()
 	o.ctx.Pool.Unpin(slot)
 	return ptr, false, derr
+}
+
+// epqRecheckFilter reads the heap tuple at (rel, ptr), decodes it using
+// o.filterCols, and re-evaluates o.filterPred. Returns true (skip) when the
+// predicate fails or the tuple cannot be read. Returns false (keep) when the
+// predicate passes — side-effecting quals fire as a result.
+func (o *lockRowsOp) epqRecheckFilter(rel storage.RelFileNode, ptr storage.ItemPointer) (skip bool) {
+	slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+	if err != nil {
+		return true
+	}
+	slot.RLock()
+	tup, gerr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+	slot.RUnlock()
+	o.ctx.Pool.Unpin(slot)
+	if gerr != nil {
+		return true
+	}
+	row, decErr := DecodeHeapTupleRow(o.filterCols, tup, nil)
+	if decErr != nil {
+		return true
+	}
+	pv, perr := evalExpr(o.filterPred, row, o.ctx)
+	if perr != nil || pv.IsNull() || pv.Kind != KindBool || !pv.BoolValue() {
+		return true
+	}
+	return false
 }
 
 // refetchRow reads and decodes the heap tuple at (rel, ptr) using the table

@@ -1708,21 +1708,25 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 		case *Filter:
 			collect(x.Child)
 		case *Project:
-			// M0063-0001: SubqueryAlias-style Projects (view
-			// rename wrapper) bound an isolated subquery scope.
-			// Advance `off` by the projected schema width but do
-			// NOT recurse into the Child — its scans are inner-
-			// scope and must not enter the outer FROM-bindings
-			// scanMap.
-			if x.IsolatedScope {
-				off += len(x.Output())
-				return
-			}
-			collect(x.Child)
+			// Any Project in the join-tree subtree passed to collect()
+			// is a subquery-derived table — its inner scans are in a
+			// separate planning scope and must NOT contribute entries to
+			// the outer scanMap (doing so would count their raw scan
+			// widths instead of the projected output width, causing the
+			// outer-scan offsets to be wrong).
+			//
+			// For IsolatedScope=true (M0063-0001 view-rename wrapper) this
+			// was already the contract. Extend it to all Projects:
+			// advance `off` by the projected output width and stop.
+			off += len(x.Output())
 		case *Sort:
 			collect(x.Child)
 		case *Aggregate:
 			collect(x.Child)
+		case *Values:
+			// Values node with non-empty schema (e.g. FROM (VALUES (r1), (r2)) AS t).
+			// Advance off by the output width so sibling scans stay aligned.
+			off += len(x.Output())
 		}
 	}
 	collect(node)

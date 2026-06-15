@@ -189,6 +189,16 @@ func foldPlanConstantsInner(node Node) {
 		}
 	case *PgAvailableWalSummaries:
 		// no sub-expressions to fold
+	case *VerifyHeapam:
+		if n.Arg != nil {
+			n.Arg = FoldConstants(n.Arg)
+		}
+		if n.StartBlock != nil {
+			n.StartBlock = FoldConstants(n.StartBlock)
+		}
+		if n.EndBlock != nil {
+			n.EndBlock = FoldConstants(n.EndBlock)
+		}
 	}
 }
 

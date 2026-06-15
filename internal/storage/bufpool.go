@@ -239,7 +239,11 @@ type WALFlusher interface {
 }
 
 // LogBtreeSplitFunc emits one atomic WAL record covering a B-tree page split.
-type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, leftPage, rightPage Page) (LSN, error)
+// On a non-rightmost split sibBlk is the old right sibling whose btpo_prev is
+// relinked to rightBlk and sibPage its post-relink image, so the relink is
+// crash-atomic with the split; on a rightmost split sibBlk is
+// InvalidBlockNumber and sibPage is nil.
+type LogBtreeSplitFunc func(rel RelFileNode, leftBlk, rightBlk BlockNumber, leftPage, rightPage Page, sibBlk BlockNumber, sibPage Page) (LSN, error)
 
 // LogHeapInsertFunc emits one logical heap-insert redo record.
 type LogHeapInsertFunc func(rel RelFileNode, blk BlockNumber, lineSlot uint16, tuple []byte) (LSN, error)

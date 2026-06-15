@@ -191,3 +191,34 @@ func TestParseSelectWithoutCTEUnchanged(t *testing.T) {
 		t.Errorf("plain SELECT got With=%v, want nil", sel.With)
 	}
 }
+
+// TestParseCTENamedIndex: an unreserved keyword (`index`) is a legal CTE
+// name. pg_amcheck's relation-gathering query (pg_amcheck.c
+// compile_relation_list_one_db) declares a CTE literally named "index" as
+// a SUBSEQUENT element of a comma-separated WITH list, which exercised the
+// look-ahead guard in parseWithClause. Regression for M0110-0003 / AC-002.
+func TestParseCTENamedIndex(t *testing.T) {
+	// `index` as the first CTE (parseCTE → parseIdent path).
+	if _, err := Parse("WITH index AS (SELECT 1) SELECT * FROM index"); err != nil {
+		t.Fatalf("first-position `index` CTE: %v", err)
+	}
+	// `index` after a comma (the post-',' look-ahead guard path — the one
+	// that wrongly rejected it before the fix).
+	stmts, err := Parse("WITH a AS (SELECT 1), index AS (SELECT 2) SELECT * FROM index")
+	if err != nil {
+		t.Fatalf("comma-position `index` CTE: %v", err)
+	}
+	sel := stmts[0].(*SelectStmt)
+	if len(sel.With.CTEs) != 2 {
+		t.Fatalf("got %d CTEs, want 2", len(sel.With.CTEs))
+	}
+	if sel.With.CTEs[1].Name != "index" {
+		t.Errorf("second CTE name = %q, want %q", sel.With.CTEs[1].Name, "index")
+	}
+
+	// A reserved keyword (e.g. `select`) must STILL be rejected after a
+	// comma — the guard widened only to unreserved/col_name keywords.
+	if _, err := Parse("WITH a AS (SELECT 1), select AS (SELECT 2) SELECT 1"); err == nil {
+		t.Error("comma-position reserved keyword `select` as CTE name: want error, got nil")
+	}
+}

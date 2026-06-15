@@ -744,7 +744,13 @@ func (bt *BTree) ResetStats() {
 // Pool.MarkDirty, which is correct under the limited
 // crash-consistency contract (split atomicity is best-effort
 // without this hook).
-type LogSplitFunc func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) (storage.LSN, error)
+//
+// On a non-rightmost split the page that used to be left's right
+// sibling is relinked (btpo_prev → rightBlk) under the same record;
+// callers pass it as sibBlk with its post-relink image as sibPage.
+// On a rightmost split sibBlk is storage.InvalidBlockNumber and
+// sibPage is nil.
+type LogSplitFunc func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error)
 
 // Options carries optional dependencies for Open/Create. The zero
 // value works for tests and callers that don't need WAL-backed
@@ -791,8 +797,8 @@ func adaptPoolLogSplit(pool *storage.Pool) LogSplitFunc {
 	if hook == nil {
 		return nil
 	}
-	return func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) (storage.LSN, error) {
-		return hook(rel, leftBlk, rightBlk, leftPage, rightPage)
+	return func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error) {
+		return hook(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage)
 	}
 }
 
@@ -1440,6 +1446,12 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	// redistribute items, stamp the high key, then drop both
 	// latches before walking up.
 	op := readOpaque(slot.Page())
+	// The block that is currently left's right sibling (if any).
+	// After the split the new right page is spliced between them, so
+	// this sibling's btpo_prev must be relinked from blk to rightBlk
+	// (done below, atomically with the split). InvalidBlockNumber
+	// here means a rightmost split with no sibling to relink.
+	oldNext := op.Next
 	// M0055-0005 Phase D: prefer recycled blocks before
 	// extending the file.
 	rightSlot, rightBlk, err := bt.pinNewOrRecycled()
@@ -1539,18 +1551,54 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 	op.Flags |= BTIncompleteSplit
 	writeOpaque(slot.Page(), op)
 
+	// Non-rightmost split: the page that was left's right sibling
+	// still has btpo_prev pointing at the left block. Relink it to
+	// the new right page so the doubly-linked sibling chain stays
+	// consistent — btpo_prev is load-bearing (btree_vacuum.go reads
+	// op.Prev and WAL-logs RightSibNewPrev to relink siblings on
+	// page deletion; a stale left-link there would relink the wrong
+	// page). PostgreSQL does exactly this in _bt_split, stamping the
+	// original right sibling under the same atomic split WAL record.
+	// Lock order is strictly left→right (blk → rightBlk → oldNext),
+	// matching _bt_split, so it cannot deadlock against a concurrent
+	// split descending from the left.
+	sibBlk := oldNext
+	var sibSlot *storage.Slot
+	if sibBlk != storage.InvalidBlockNumber {
+		sibSlot, err = bt.pinW(sibBlk)
+		if err != nil {
+			rightSlot.Unlock()
+			bt.pool.Unpin(rightSlot)
+			bt.unpinW(slot)
+			return fmt.Errorf("btree: pin old right sibling %d: %w", sibBlk, err)
+		}
+		sibOp := readOpaque(sibSlot.Page())
+		sibOp.Prev = rightBlk
+		writeOpaque(sibSlot.Page(), sibOp)
+	}
+
 	// Atomic split WAL record (Landing 3a). When a writer is
-	// available, emit ONE record covering both pages and stamp
-	// the resulting LSN onto both page headers; this guarantees
+	// available, emit ONE record covering both pages (plus the
+	// relinked old right sibling on a non-rightmost split) and stamp
+	// the resulting LSN onto every page header; this guarantees
 	// crash recovery never observes the half-split state where
 	// left's right-link points at a right block whose disk image
-	// is the bare smgr.Extend init page. When no writer is wired
-	// (test helpers, pre-runtime callers), fall back to the
-	// per-page FPI path via MarkDirty — losing split atomicity
-	// but keeping the in-memory tree correct.
+	// is the bare smgr.Extend init page, nor the half-relinked state
+	// where the old sibling's btpo_prev still points at the left
+	// block. When no writer is wired (test helpers, pre-runtime
+	// callers), fall back to the per-page FPI path via MarkDirty —
+	// losing split atomicity but keeping the in-memory tree correct.
 	if bt.logSplit != nil {
-		lsn, lerr := bt.logSplit(bt.rel, blk, rightBlk, slot.Page(), rightSlot.Page())
+		var sibPage storage.Page
+		if sibSlot != nil {
+			sibPage = sibSlot.Page()
+		}
+		lsn, lerr := bt.logSplit(bt.rel, blk, rightBlk, slot.Page(), rightSlot.Page(), sibBlk, sibPage)
 		if lerr != nil {
+			if sibSlot != nil {
+				sibSlot.Unlock()
+				bt.pool.Unpin(sibSlot)
+			}
 			rightSlot.Unlock()
 			bt.pool.Unpin(rightSlot)
 			bt.unpinW(slot)
@@ -1558,9 +1606,19 @@ func (bt *BTree) insertIntoBlock(blk storage.BlockNumber, path []storage.BlockNu
 		}
 		bt.pool.MarkDirtyWithLSNLocked(slot, lsn)
 		bt.pool.MarkDirtyWithLSNLocked(rightSlot, lsn)
+		if sibSlot != nil {
+			bt.pool.MarkDirtyWithLSNLocked(sibSlot, lsn)
+		}
 	} else {
 		bt.pool.MarkDirty(slot)
 		bt.pool.MarkDirty(rightSlot)
+		if sibSlot != nil {
+			bt.pool.MarkDirty(sibSlot)
+		}
+	}
+	if sibSlot != nil {
+		sibSlot.Unlock()
+		bt.pool.Unpin(sibSlot)
 	}
 
 	// The separator key going up is the smallest key in the right page.

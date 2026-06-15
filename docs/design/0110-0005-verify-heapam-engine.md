@@ -5,7 +5,16 @@ Milestone: M0110-0003
 Date: 2026-06-14 (extended 2026-06-14, loop #52: infomask-only header invariants;
 loop #55: B-tree index verification (`verify_nbtree`) page-structural tier;
 loop #58: B-tree cross-page sibling-link tier;
-loop #59: B-tree cross-level downlink tier (`bt_child_check`))
+loop #59: B-tree cross-level downlink tier (`bt_child_check`);
+loop #62: heap clog-dependent HOT-chain tier (xmin commit-status checks),
+completing the heap engine to logic-complete parity;
+loop #64: real-producer false-positive validation — surfaced & fixed a vacuum
+MAXALIGN bug, see "Real-producer false-positive validation" below;
+loop #23 (2026-06-14): heap xmin numeric-bounds tier (`check_tuple_visibility`'s
+future / cluster-min / rel-min xid-range checks), see "Heap xmin numeric-bounds
+tier" below;
+loop #24 (2026-06-14): heap xmax numeric-bounds tier (the plain-XID xmax sibling
+of the xmin check), see "Heap xmax numeric-bounds tier" below)
 
 > Scope note: this doc now covers both amcheck verify engines in
 > `internal/amcheck` — the heap-page checker (`verify_heapam.go`, the bulk of
@@ -205,7 +214,11 @@ goopg's own codec, not a port; recorded here as out-of-scope for the port.
   `XID_IN_PROGRESS` status, i.e. clog. Resume with the tier-3 clog wiring.
 - `check_tuple_header`'s heap-only-but-not-updated invariant — deferred until
   goopg stamps `HEAP_UPDATED` (see above).
-- `check_tuple_visibility` xmin/xmax bounds + multixact (tier 3) — needs clog.
+- `check_tuple_visibility` xmin/xmax numeric bounds — **DONE** (loops #23/#24,
+  clog-independent; see the "Heap xmin/xmax numeric-bounds tier" sections).
+  Multixact-member bounds (`check_mxid_valid_in_rel`) + the multixact update-xid
+  path stay deferred: goopg has no on-disk multixact, so there is no relation
+  multixact horizon (`relminmxid`/`oldest_mxact`/`next_mxact`) to compare against.
 - `check_tuple_attribute` per-attribute TOAST validation — goopg-divergent
   on-disk format (see the relation-natts tier above); a goopg-faithful version
   is a reimplementation against goopg's codec, not a verify_heapam.c port.
@@ -575,6 +588,339 @@ child whose negative-infinity item is correctly skipped; an internal child with 
 *real* key below the bound (skip applies only to item 0); a leaf parent and the
 metapage (both nil); a damaged parent; and a dangling child downlink (both →
 damaged-page finding).
+
+## Heap clog-dependent HOT-chain tier (2026-06-14)
+
+The heap engine's last update-chain tier — the three checks that need to know
+each tuple's xmin commit status — is now ported, completing the heap side to
+logic-complete parity with the B-tree side. These mirror `verify_heapam.c`'s
+second and third update-chain loops (`verify_heapam.c:759-833`):
+
+1. **in-progress xmin → committed xmin** (`:759`): a chain root whose xmin is
+   still in progress cannot have produced a successor whose xmin has committed.
+2. **aborted xmin → in-progress/committed xmin** (`:791`/`:797`): a chain root
+   whose xmin aborted cannot have produced a live successor.
+3. **root of chain but heap-only** (`:831`, the separate third loop): a tuple
+   with a committed/in-progress xmin and no predecessor must not be heap-only —
+   a chain starts with a normal tuple or a redirect, never a heap-only tuple.
+
+### Decoupling seam: `XidStatusFunc`
+
+Upstream fills a per-offset `xmin_commit_status[]` / `xmin_commit_status_ok[]`
+array from `get_xid_status` (a clog + proc-array lookup). To keep the engine free
+of the contaminated `internal/mvcc` package and fully unit-testable, the port
+injects the status as a callback, `XidStatusFunc func(xid uint32) XidCommitStatus`,
+threaded through the new entry point `VerifyHeapPageWithXminStatus(p, blkno, rel,
+xidStatus)`. `XidCommitStatus` is the branch-relevant subset of upstream's enum:
+`Unknown` (= `xmin_commit_status_ok == false`; gates the check off), `Committed`,
+`InProgress`, `Aborted`, and `Current` (upstream `XID_IS_CURRENT_XID`, kept
+distinct so a current-transaction xmin trips neither the in-progress nor the
+root-of-chain check). The bootstrap (1) and frozen (2, or the
+`HEAP_XMIN_COMMITTED | HEAP_XMIN_INVALID` hint pair) xids resolve to committed
+without consulting the callback, mirroring `get_xid_status`'s special-casing.
+
+The page-bytes-only entry points (`VerifyHeapPage`, `VerifyHeapPageWithRel`)
+pass a nil callback, which leaves `xminStatusOK` false for every tuple and
+disables exactly these three checks — their output is byte-for-byte unchanged
+(regression-guarded by `TestVerifyHeapPage_NilXminStatusDisablesClogChecks`).
+
+The reported offset and xmins are verbatim from upstream: the message names the
+**current** tuple's offset and the **frozen-resolved** xmins of both tuples.
+
+Still deferred (the MVCC/attribute tier): xmin/xmax numeric bounds against the
+cluster's xid range, multixact member validation, and TOAST-pointer validation
+(goopg's TOAST is a separate chunk relation, so `check_tuple_attribute` is
+goopg-divergent, not merely deferred). The SQL surface — `CREATE EXTENSION
+amcheck` + the `verify_heapam` SRF that supplies `RelDesc` and a clog-backed
+`XidStatusFunc` — remains blocked on a clean tree (a separate live session holds
+uncommitted gen-column WIP across parser/planner/executor/catalog).
+
+### Testing (clog tier)
+
+`verify_heapam_test.go` gains a `mapXidStatus` builder (map-backed
+`XidStatusFunc`, missing xid → `Unknown`) and 10 tests: the three positive
+corruption cases (in-progress→committed, aborted→committed, aborted→in-progress,
+each isolated so only the clog report appears); the heap-only-root positive; and
+false-positive guards — a heap-only tuple with a predecessor (legit chain tail),
+an aborted heap-only root (gated off), a current-xid root, an unknown-status
+root, a nil callback (proves page-bytes-only callers unchanged), and a frozen
+xmin that resolves to committed without the callback being consulted.
+
+## Relation-walking driver (`verify_heapam_relation.go`)
+
+The per-page entry points (`VerifyHeapPage*`) check one page; the SRF must walk a
+whole relation. `VerifyHeapRelation(src PageSource, nblocks, opts)` ports the
+**outer loop** of the `verify_heapam()` SRF body
+(`verify_heapam.c:367-405,480-501`): the empty-relation early exit
+(`nblocks == 0` → no rows), block-range resolution from the `startblock` /
+`endblock` SRF args (`*int64`, nil = SQL NULL → 0 / nblocks-1) with the
+upstream-worded `ERRCODE_INVALID_PARAMETER_VALUE` range errors
+(`starting/ending block number must be between 0 and N`), and the block
+iteration that runs each page through `verifyHeapPage` and tags every finding
+with its block number (`HeapRelReport{Blkno, Offset, Msg}`, mapping 1:1 to the
+SRF's `(blkno, offnum, msg)` output rows; `attnum` is always -1 for these
+structural checks and is supplied by the SRF).
+
+This reuses the same `PageSource func(BlockNumber)(Page,error)` seam the B-tree
+relation walkers already take, making the heap and index sides symmetric: the
+SRF fills the seam from the buffer manager, tests from a map. Keeping the block
+loop in the engine (not in the eventual `verify_heapam` executor op) reduces SQL
+slice **S3** (docs/design/0110-0008) to a thin adapter — fill a `PageSource`,
+pass `nblocks` + `RelDesc.Natts` + a clog-backed `XidStatusFunc`, stream the
+returned rows — and lets the block-iteration logic be unit-tested without an
+execution context.
+
+Deliberately **out of scope** here, matching where upstream draws the line: the
+relkind / relam guard (`verify_heapam.c:333-349`) and relation open/lock are
+catalog- and goopg-storage-coupled, so they stay in the SRF executor (S3); the
+caller invokes `VerifyHeapRelation` only on a heap relation. The toast walk
+(`check_toast`, goopg-divergent) and the read-stream skip-pages optimisation are
+buffer-manager concerns, also left to the wire layer.
+
+### Testing (relation tier)
+
+`verify_heapam_relation_test.go` adds a `heapMapSource` builder (map-backed
+`PageSource`) and 9 tests: clean multi-block relation (asserts every in-range
+block is actually read), empty-relation early exit (source never touched),
+finding tagged with its non-zero block, ordered findings across blocks,
+`startblock`/`endblock` sub-range restriction, the two range-validation error
+messages (plus the negative-value case), a surfaced read error, nil-source
+rejection, and the `RelDesc` option threading through to the per-page natts
+check (off without `Rel`, on with it — which by the same seam covers
+`XidStatusFunc` forwarding).
+
+## Real-producer false-positive validation (loop #64, 2026-06-14)
+
+The per-page tests inject corruption by hand (`setItemID` + direct byte pokes) —
+the only way to produce damage, since the clean storage API refuses to write it.
+That leaves the complementary risk untested: does the engine stay *silent* on a
+page produced by goopg's *real* on-disk mutators? A divergence between the
+engine's page-byte assumptions and what storage actually writes would make the
+eventual `verify_heapam()` SRF report corruption on healthy user tables — the
+most expensive compatibility-bug class in this project.
+
+`verify_heapam_realpage_test.go` closes that gap: six tests drive the real
+producers and assert zero findings — a same-page HOT chain built via
+`storage.PageStampHotOldTuple` + a heap-only successor (mirroring the executor's
+`tryApplyHOTUpdate`), the same chain after `PageSetItemIDRedirect` pruning, a
+`VacuumHeapPage`-pruned page, a `NewHeapTupleWithNulls` nullable multi-attribute
+tuple, the HOT chain through the clog tier, and the whole-relation driver over a
+mix of all three real page shapes.
+
+**Bug surfaced and fixed:** the vacuumed-page test failed — goopg's vacuum
+repack kernel (`storage.VacuumHeapPageBySlots`) re-laid surviving tuples with
+`upper -= len(body)`, **without MAXALIGN**, producing line-pointer offsets that
+are not 8-byte aligned. This is a genuine latent data bug, not a test artifact:
+its sibling the insert path (`PageAddHeapTuple`) deliberately MAXALIGNs, with a
+comment (M0106-0010) noting that a non-aligned offset segfaults a PG18 standby's
+`heap_deform_tuple` on the first SELECT. The engine faithfully ports PG's
+"line pointer ... is not maximally aligned" check, so it correctly flagged the
+vacuumed page. Fix: `upper -= maxAlign8(len(e.body))` in the repack loop,
+restoring sibling-path agreement (`pattern_sibling_paths_must_agree`). The
+repack never needs more space than survivors already occupied (each was inserted
+with the same alignment; vacuum only removes tuples), so the change cannot
+overflow the page. Verified: `internal/storage`, `internal/vacuum`,
+`internal/wal` (replay shares the kernel), `internal/executor`, `internal/mvcc`
+all green under `-race`.
+
+## Heap xmin numeric-bounds tier (2026-06-14)
+
+The clog-dependent HOT-chain tier resolves *what a tuple's xmin committed to*;
+this tier checks the prior, cheaper question `get_xid_status` asks first: is the
+xmin even a plausible transaction id for this cluster? It ports the
+`XID_IN_FUTURE` / `XID_PRECEDES_CLUSTERMIN` / `XID_PRECEDES_RELMIN` arms of
+`verify_heapam.c:check_tuple_visibility` (driven by `get_xid_status`'s bound
+comparisons), reporting the three upstream-verbatim messages:
+
+- `xmin %u equals or exceeds next valid transaction ID %u:%u`
+- `xmin %u precedes oldest valid transaction ID %u:%u`
+- `xmin %u precedes relation freeze threshold %u:%u`
+
+**Inputs.** Three new `RelDesc` fields carry the cluster/relation xid range the
+SQL surface (the `verify_heapam` SRF) will supply: `NextXid`
+(`TransamVariables->nextXid`; goopg `mvcc.Manager.NextXID`), `OldestXid` (cluster
+freeze horizon), and `RelFrozenXid` (this relation's `pg_class.relfrozenxid`).
+`checkXminBounds` enforces `OldestXid <= xmin < NextXid` and
+`xmin >= RelFrozenXid`, in `get_xid_status`'s comparison order (future, then
+cluster-min, then rel-min) so an xmin in `[OldestXid, RelFrozenXid)` is reported
+as a freeze-threshold violation while one below `OldestXid` is a cluster-min
+violation — matching `relfrozenxid >= oldestXid`.
+
+**Gating.** `NextXid == 0` is the unset sentinel that disables the whole tier
+(a live cluster's nextXid is always `>= FirstNormalTransactionID = 3`), so the
+page-bytes-only (`VerifyHeapPage`) and natts-only (`VerifyHeapPageWithRel` with a
+bare `Natts`) callers see no behaviour change. `OldestXid`/`RelFrozenXid == 0`
+disable only their own arm, leaving the future-xid check active. Special xids are
+always in bounds, mirroring `get_xid_status`'s quick check: InvalidTransactionId
+(0) is a silent non-check (`XID_INVALID` returns false with no report) and
+bootstrap (1) / frozen (2) are implicitly valid; `headerXmin` resolves the
+both-hint-bits frozen representation to 2 so a frozen tuple never trips the
+future-xid arm. The check runs on every valid `LP_NORMAL` tuple independent of
+`check_tuple_header` success, matching upstream's order (visibility runs before
+the header-garbled early return); the xmin field (`off+0..4`) is always inside
+the line-pointer length already validated.
+
+**Divergence.** PG works in `FullTransactionId` (epoch:xid) space with
+wraparound-aware comparisons; goopg has no on-disk xid epoch (a goopg cluster's
+monotonic uint32 nextXid has not wrapped), so the comparisons are plain unsigned
+— exactly equivalent to upstream within epoch 0 — and the messages embed the
+epoch as a literal `0` (`EpochFromFullTransactionId` is always 0).
+
+**Testing (`verify_heapam_xminbounds_test.go`).** Eight tests stamp a clean
+tuple's xmin via `setXmin` against a `[50, 200)` range with freeze threshold 80:
+future (`xmin=250`), the boundary `xmin == NextXid` (the `>=` arm), cluster-min
+(`xmin=30`), rel-min (`xmin=70`, exercising the ordering), the in-bounds silent
+case, the `NextXid==0` disabled-tier case, the unset-`OldestXid` no-false-report
+case, and bootstrap/frozen special xids below `OldestXid` staying silent.
+
+This tier is purely additive to the engine; the clog-dependent commit-status
+tier (resolved separately by `resolveXminStatus`) is unchanged.
+
+## Heap xmax numeric-bounds tier (2026-06-14, loop #24)
+
+The sibling of the xmin tier: it ports the plain-XID xmax sanity check of
+`verify_heapam.c:check_tuple_visibility` (lines 1466-1496, driven by the same
+`get_xid_status` bound comparisons), reporting the three upstream-verbatim
+messages for a deleting transaction's xmax:
+
+- `xmax %u equals or exceeds next valid transaction ID %u:%u`
+- `xmax %u precedes oldest valid transaction ID %u:%u`
+- `xmax %u precedes relation freeze threshold %u:%u`
+
+**Inputs.** Reuses the `RelDesc.NextXid`/`OldestXid`/`RelFrozenXid` horizons
+already carried for the xmin tier; no new fields. `checkXmaxBounds` enforces the
+same `OldestXid <= xmax < NextXid` and `xmax >= RelFrozenXid` invariant in
+`get_xid_status`'s comparison order (future, cluster-min, rel-min).
+
+**Gating.** Page-structural, mirroring the path upstream takes to *reach* the
+plain-XID xmax check:
+
+- `HEAP_XMAX_IS_MULTI` set → upstream routes through the multixact path
+  (`check_mxid_valid_in_rel` + the multixact's update xid). goopg has no on-disk
+  multixact and `RelDesc` carries no multixact horizons, so the update xid is not
+  page-structurally resolvable — skipped (a valid goopg page never sets this bit,
+  so skipping cannot miss a real-page case). This is the deferred multixact work.
+- `HEAP_XMAX_INVALID` set → upstream returns early (tuple live, line 1371) before
+  any xmax bounds check — skipped (via `storage.HeapXmaxInvalid`).
+- `HEAP_XMAX_IS_LOCKED_ONLY` (`storage.IsHeapTupleLockOnly`) → upstream returns
+  early (line 1383) — skipped (the xmax is a row lock, not a delete).
+- raw `xmax == 0` (InvalidTransactionId) → `get_xid_status`'s `XID_INVALID` arm
+  (line 1470) marks the tuple live and reports nothing — skipped.
+- bootstrap (1) / frozen (2) xmax → special xids, always in bounds.
+- `NextXid == 0` (unset sentinel) disables the whole tier; `OldestXid` /
+  `RelFrozenXid == 0` disable only their own arm — identical to the xmin tier.
+
+**Divergence from upstream — clog-independence.** Upstream only *reaches* the
+xmax check after proving the inserter committed (it returns `false` earlier
+otherwise). That ordering governs checkability/visibility, not the numeric
+invariant: any xmax set on a valid goopg page is a real xid within range
+regardless of xmin status. Keeping this tier clog-callback-free (like
+`checkXminBounds`) means it cannot false-positive on a valid page and needs
+neither clog nor the proc array. Epoch handling is the literal-`0` plain-unsigned
+treatment described for the xmin tier.
+
+**Testing (`verify_heapam_xmaxbounds_test.go`).** Twelve tests stamp a clean
+tuple's xmax via `setXmax` against the same `[50, 200)` / freeze-80 range:
+future (`xmax=250`), the boundary `xmax == NextXid`, cluster-min (`xmax=30`),
+rel-min (`xmax=70`, exercising the ordering), the in-bounds silent case, the
+`xmax==0` live-tuple silent case, the three gate-skip cases
+(`HEAP_XMAX_INVALID` / lock-only / multi each with an out-of-range raw value),
+the `NextXid==0` disabled-tier case, the unset-`OldestXid` no-false-report case,
+and bootstrap/frozen special xids below `OldestXid` staying silent.
+
+The remaining `check_tuple_visibility` work — multixact-member bounds
+(`check_mxid_valid_in_rel`) and the multixact update-xid path — stays deferred:
+goopg has no on-disk multixact, so it is corruption-only territory with no
+relation-level multixact horizon to compare against.
+
+## Real-producer B-tree validation (and a split bug it surfaced)
+
+Every B-tree tier above was unit-tested against hand-constructed pages (the only
+way to inject corruption). Mirroring the heap engine's real-producer guard
+(`verify_heapam_realpage_test.go`, which surfaced the `VacuumHeapPageBySlots`
+MAXALIGN bug), `internal/amcheck/verify_nbtree_realtree_test.go` now drives the
+**real** `btree.Create`/`Insert`/split machinery — building live multi-level
+trees and running every tier over the on-disk pages — as a false-positive guard
+and an on-disk-format-drift guard.
+
+It splits into two outcomes by insertion order, which is itself the finding:
+
+- **Sorted (append-only) inserts** split only the rightmost page of a level (no
+  right sibling), so every tier — per-page structure, item-order, cross-level
+  downlinks, the sibling-link walk, and the heapallindexed round-trip — stays
+  silent. Covered for int4, int8, and variable-length varchar keys (the last
+  exercising the opaque-area high key directly).
+
+- **Shuffled inserts** force middle-of-level splits and expose a genuine goopg
+  btree correctness gap: `splitAndInsert` (`internal/access/btree/btree.go`
+  ~L1454-1466 / L1522) links the new right page's `btpo_prev` to the left page
+  and the left page's `btpo_next` to the new page, but **never updates the OLD
+  right sibling's `btpo_prev`** to point at the new middle page. After any
+  non-rightmost split that sibling's left-link is left stale. The sibling-link
+  tier correctly flags it (`left link/right link pair ... not in agreement`);
+  all other tiers stay silent (they do not read `btpo_prev`).
+
+  `btpo_prev` is load-bearing in goopg, not vestigial: page deletion
+  (`internal/access/btree/btree_vacuum.go`) reads `op.Prev` to find the left
+  sibling and WAL-logs `RightSibNewPrev` to relink it. A stale left-link can
+  therefore mislead page-deletion relinking and any backward navigation. PG
+  avoids this by updating the original right sibling's left-link inside the
+  atomic `_bt_split` WAL record. The fix is tracked as a separate
+  WAL/concurrency task (it must fold the old right sibling into the split WAL
+  record + replay, with `-race` and recovery gates) rather than landing blind in
+  an engine loop. `TestVerifyBtreeEngineDetectsStaleSiblingLinkOnRealTree` pins
+  the current (buggy) behaviour as a detection assertion and must flip to a
+  silence assertion when the split is fixed.
+
+## Real-producer page-deletion validation (and a vacuum bug it surfaced)
+
+The real-tree harness above only ever built trees with `Create`/`Insert`/split.
+It never exercised the *other* load-bearing on-disk mutator: **page deletion via
+`btree.VacuumIndexPages`**, which empties leaves whose entries all point at dead
+heap TIDs and then `unlinkEmptyLeaf`s them — rewriting the left sibling's
+`btpo_next`, the right sibling's `btpo_prev`, removing the leaf's parent downlink,
+and flagging the leaf `BTDeleted`. That is the deletion-path mirror of the split
+relink the previous section's bug lived in, and it had no end-to-end check that
+goopg's real output is amcheck-clean.
+
+`internal/amcheck/verify_nbtree_pagedel_test.go` drives the real
+`VacuumIndexPages` over live multi-level trees and runs every tier (per-page,
+item-order, cross-level downlinks, sibling-link walk, heapallindexed round-trip)
+over the post-deletion pages. It splits into clean cases and a detection case:
+
+- **Single interior-leaf deletion** and **multiple non-adjacent interior-leaf
+  deletions** in one pass are fully consistent — every tier stays silent. This
+  validates `unlinkEmptyLeaf`'s three-way relink (left `Next` → right sibling,
+  right `Prev` → left sibling, parent downlink removal) and the engine's
+  deleted-page exemptions against goopg's real layout.
+
+- **Adjacent interior-leaf deletion** exposes a genuine goopg correctness gap.
+  `unlinkEmptyLeaf` relinks neighbours from pointers captured at PHASE-1 scan time
+  (`emptyLeafInfo.prev/next`), **before any leaf is unlinked**. When a neighbour
+  is itself one of the leaves deleted in the same pass, those pointers go stale:
+  for `L0→L1→L2→L3→L4` with `L1,L2,L3` emptied, `unlink(L1)` sets `L0.next=L2`,
+  `unlink(L3)` sets `L4.prev=L2` — so the surviving edges `L0.next` and `L4.prev`
+  end up pointing at the **deleted** block `L2`. The leaf sibling chain is left
+  structurally broken; the sibling-link tier correctly flags `downlink or sibling
+  link points to deleted block`, while every other tier stays silent
+  (`CollectBtreeLeafEntries` tolerates the broken chain by skipping deleted pages,
+  so the survivor count is still exact). Both the WAL-emitter path
+  (`unlinkEmptyLeaf`) and the FPI fallback (`unlinkEmptyLeafFPI`) share the bug —
+  both trust the stale captured pointers.
+
+  An adjacent dead-tuple run is the common case for a range `DELETE` + `VACUUM`,
+  so this corrupts the on-disk sibling chain (load-bearing for backward scans and
+  future page-deletion relinking) in ordinary operation. Upstream avoids it:
+  `_bt_unlink_halfdead_page` re-reads the **current** left/right siblings at
+  unlink time and defers when a sibling is itself half-dead, rather than trusting
+  pointers captured earlier in the pass. The fix is tracked as **M0110-0010**
+  (re-read live siblings / defer adjacent unlinks; a WAL/concurrency change that
+  must fold the corrected sibling blocks into the unlink record + replay, with
+  `-race` and recovery gates) rather than landing blind in an engine loop —
+  exactly how the split bug above became M0110-0007.
+  `TestVerifyBtreeEngineDetectsStaleSiblingLinkAfterAdjacentLeafDeletion` pins the
+  current (buggy) behaviour and must flip to a silence assertion when M0110-0010
+  lands.
 
 ## Upstream references
 

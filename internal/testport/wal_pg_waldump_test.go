@@ -10,18 +10,19 @@ package testport
 //  1. Start a goopg cluster (which now writes PG-compatible WAL).
 //  2. Run a small workload: CREATE TABLE + INSERT 100 rows + CHECKPOINT.
 //  3. Stop the cluster cleanly.
-//  4. Enumerate pg_wal/ segments.
-//  5. For each segment, create a filesystem alias with the PostgreSQL-format
-//     name (timeline=1 prefix) if needed, then run pg_waldump --quiet.
-//  6. Assert pg_waldump exits 0 for every segment.
+//  4. Enumerate pg_wal/ segments (native PG-format names, TLI=1 prefix).
+//  5. Run pg_waldump --quiet directly on each segment (pg_waldump infers the
+//     timeline and start LSN from the filename — no alias rewriting needed).
+//  6. Assert no structural error (notably "incorrect prev-link") for any
+//     segment — this is the regression guard for the xl_prev seeding fix in
+//     internal/wal/writer.go (detectWritePos). End-of-WAL on the trailing
+//     segment is expected and ignored.
 
 import (
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -70,84 +71,38 @@ CHECKPOINT;
 		t.Logf("shutdown warning: %v", err)
 	}
 
-	// Locate the data dir and WAL segments.
+	// Locate the data dir and WAL segments. goopg now names segments in
+	// native PostgreSQL format (TLI=1 prefix, e.g. 000000010000000000000001 —
+	// M0101-0001), so pg_waldump locates each one directly with
+	// -p <walDir> <segment-name> and infers the timeline and start LSN from
+	// the filename. No alias rewriting or manual -s is needed (the previous
+	// version parsed the full 24-hex name with ParseUint, which overflows
+	// uint64 and silently skipped every segment → "no WAL segments found").
 	walDir := filepath.Join(c.DataDir(), "pg_wal")
-	entries, err := os.ReadDir(walDir)
-	if err != nil {
-		t.Fatalf("read pg_wal: %v", err)
-	}
-
-	var segs []string
-	for _, e := range entries {
-		if e.IsDir() || len(e.Name()) != 24 {
-			continue
-		}
-		// Goopg names segments as 24-hex segment-number; skip non-hex.
-		if _, err := strconv.ParseUint(e.Name(), 16, 64); err != nil {
-			continue
-		}
-		segs = append(segs, e.Name())
-	}
+	segs := listWALSegments(t, walDir)
 	if len(segs) == 0 {
 		t.Fatal("no WAL segments found in pg_wal/")
 	}
-	sort.Strings(segs)
+	t.Logf("found %d WAL segment(s); running pg_waldump", len(segs))
 
-	// pg_waldump expects files named with a timeline prefix
-	// (e.g. 000000010000000000000000). goopg uses timeline=0 in the
-	// filename but embeds timeline=1 in the page headers (M0101-0001).
-	// Create timeline=1 aliases so pg_waldump can locate the files.
-	t.Logf("found %d WAL segment(s); creating timeline=1 aliases and running pg_waldump", len(segs))
 	for i, seg := range segs {
-		origPath := filepath.Join(walDir, seg)
-
-		// Determine the alias name: strip the timeline prefix (first 8
-		// hex chars = "00000000") and prepend timeline=1 ("00000001").
-		// goopg segment names are plain 24-char hex numbers with the
-		// segment number in positions 8-23 (after skipping TLI zeros).
-		aliasName := "00000001" + seg[8:]
-		aliasPath := filepath.Join(walDir, aliasName)
-
-		raw, err := os.ReadFile(origPath)
-		if err != nil {
-			t.Fatalf("read segment %s: %v", seg, err)
-		}
-		if err := os.WriteFile(aliasPath, raw, 0o600); err != nil {
-			t.Fatalf("write alias %s: %v", aliasName, err)
-		}
-		defer os.Remove(aliasPath)
-
-		// Determine the -s (start LSN) from the segment number.
-		// goopg LSNs are 1-based byte offsets; segment 0 starts at byte 1.
-		segNum, _ := strconv.ParseUint(seg, 16, 64)
-		segSize := int64(16 * 1024 * 1024) // DefaultSegmentSize = 16 MiB
-		startByte := int64(segNum) * segSize
-		// Convert to PG XLogRecPtr (0-based, high32/low32 format).
-		startXLSN := ""
-		if startByte == 0 {
-			startXLSN = "0/1"
-		} else {
-			pos := uint64(startByte)
-			startXLSN = fmt.Sprintf("%X/%X", pos>>32, uint32(pos))
-		}
-
-		args := []string{
-			"--quiet",
-			"-t", "1",
-			"-s", startXLSN,
-			"-p", walDir,
-			aliasName,
-		}
-		out, err := exec.Command(waldump, args...).CombinedOutput()
-		outStr := strings.TrimSpace(string(out))
-		if err != nil {
+		res, _ := util.RunCommand(util.CommandSpec{
+			Name:    waldump,
+			Args:    []string{"--quiet", "-p", walDir, seg},
+			Env:     []string{"LD_LIBRARY_PATH=" + libDir},
+			Timeout: 30e9,
+		})
+		outStr := strings.TrimSpace(res.Stdout + "\n" + res.Stderr)
+		if res.ExitCode != 0 {
 			// pg_waldump exits non-zero when it encounters the zero-fill
 			// at the end of a partially-written segment ("invalid record
 			// length ... got 0") or an "end of WAL" marker. These are
 			// expected for the last segment in a live or freshly-stopped
 			// cluster. Only treat it as a real failure if the error output
-			// indicates a structural problem with the page headers themselves
-			// (wrong magic, bad CRC, xl_prev mismatch, etc.).
+			// indicates a structural problem with the record chain itself
+			// (wrong magic, bad CRC, xl_prev mismatch, etc.). The
+			// "incorrect prev-link" check is the regression guard for the
+			// xl_prev seeding fix in internal/wal/writer.go (detectWritePos).
 			isEndOfWAL := strings.Contains(outStr, "invalid record length") ||
 				strings.Contains(outStr, "end of WAL") ||
 				strings.Contains(outStr, "no start WAL location")
@@ -156,20 +111,17 @@ CHECKPOINT;
 				strings.Contains(outStr, "incorrect resource manager") ||
 				(strings.Contains(outStr, "error:") && !isEndOfWAL)
 			if hasStructuralError {
-				t.Errorf("pg_waldump segment %s (alias %s) structural error: %v\n%s",
-					seg, aliasName, err, outStr)
+				t.Errorf("pg_waldump segment %s structural error:\n%s", seg, outStr)
 			} else {
 				t.Logf("segment %d/%d (%s): pg_waldump OK (end-of-WAL: %s)",
 					i+1, len(segs), seg, outStr)
 			}
 		} else {
-			t.Logf("segment %d/%d (%s): pg_waldump OK%s", i+1, len(segs), seg,
-				func() string {
-					if outStr != "" {
-						return ": " + outStr
-					}
-					return ""
-				}())
+			suffix := ""
+			if outStr != "" {
+				suffix = ": " + outStr
+			}
+			t.Logf("segment %d/%d (%s): pg_waldump OK%s", i+1, len(segs), seg, suffix)
 		}
 	}
 }
@@ -202,4 +154,3 @@ func buildInsertSQL(n int) string {
 	b.WriteByte(';')
 	return b.String()
 }
-

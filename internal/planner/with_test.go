@@ -105,6 +105,27 @@ func TestPlanWithColumnAliasArityMismatch(t *testing.T) {
 	}
 }
 
+// TestPlanWithFewerColumnAliasesAccepted: PG (parse_cte.c analyzeCTE) allows a
+// column-alias list SHORTER than the inner query's output; the trailing
+// columns keep their query names. Only over-aliasing errors. Sibling of the
+// analyzer's TestAnalyzeWithFewerColumnAliasesAccepted — both twins must agree.
+// pg_amcheck (AC-002) emits `exclude_raw (pattern_id, rgx) AS (SELECT NULL,
+// NULL, NULL WHERE false)` (two aliases over three columns) and its bootstrap
+// query reaches the planner, so the analyzer fix alone is insufficient.
+func TestPlanWithFewerColumnAliasesAccepted(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	for _, sql := range []string{
+		// Two aliases over three SELECT columns (the amcheck shape).
+		"WITH e(pattern_id, rgx) AS (SELECT 1, 2, 3) SELECT * FROM e",
+		// One alias over two columns reading a base table.
+		"WITH a(x) AS (SELECT aid, bid FROM pgbench_accounts) SELECT x FROM a",
+	} {
+		if _, err := Plan(parseOne(t, sql), cat); err != nil {
+			t.Errorf("under-aliased CTE should plan, got %v\n  sql=%s", err, sql)
+		}
+	}
+}
+
 // TestPlanWithoutCTEUnchanged is the regression guard: a SELECT
 // without a WITH clause goes through the existing planner path
 // byte-for-byte unchanged. Without this, a future refactor that

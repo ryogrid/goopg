@@ -195,15 +195,16 @@ func TestInitCommandAllowGroupAccess(t *testing.T) {
 
 // TestInitCommandDataChecksums drives the -k/--data-checksums and
 // --no-data-checksums flags (upstream initdb -k) through the CLI and asserts
-// pg_control's data_checksum_version reflects the requested mode.
-// --no-data-checksums (the current goopg default) overrides -k.
+// pg_control's data_checksum_version reflects the requested mode. Matching
+// upstream PG 18, goopg defaults checksums ON, so a plain `init` yields
+// version 1; --no-data-checksums disables and overrides -k.
 func TestInitCommandDataChecksums(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		args     []string
 		wantVers uint32
 	}{
-		{"default-off", []string{}, 0},
+		{"default-on", []string{}, 1},
 		{"k-short", []string{"-k"}, 1},
 		{"long", []string{"--data-checksums"}, 1},
 		{"no-data-checksums", []string{"--no-data-checksums"}, 0},

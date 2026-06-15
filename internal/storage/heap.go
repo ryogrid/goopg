@@ -42,6 +42,30 @@ const (
 	FrozenTransactionID TransactionID = 2
 )
 
+// XIDPrecedes reports whether a is logically before b in modulo-2^32 XID space
+// (the half of the circle older than b). Mirrors PostgreSQL's
+// TransactionIdPrecedes (`postgres/src/backend/access/transam/transam.c`):
+//
+//	int32 diff = (int32) (id1 - id2);
+//	return diff < 0;
+//
+// Plain unsigned `<` is WRONG for XID horizon comparisons because the XID space
+// wraps at 2^32: after wraparound a freshly assigned XID has a *smaller* numeric
+// value than an older one, so `<` would treat the newer XID as older and pick
+// the wrong VACUUM/CLOG-truncation horizon. The signed-difference trick orders
+// XIDs by their position on the modular circle relative to b, which is correct
+// for any two XIDs less than 2^31 apart — the invariant PG maintains via the
+// wraparound-prevention (anti-wraparound autovacuum) machinery.
+//
+// XID 0 (InvalidTransactionID) and the other low sentinels are NOT special-
+// cased here; callers must screen them out (e.g. via TransactionIdIsNormal-
+// style `xid >= FirstNormalTransactionID` checks) before comparing, exactly as
+// upstream does. This is the single source of truth for modular XID ordering;
+// internal/mvcc's txnPrecedes delegates to it so the two cannot drift.
+func XIDPrecedes(a, b TransactionID) bool {
+	return int32(a-b) < 0
+}
+
 // HeapTupleHeader infomask flag bits. Values mirror upstream's
 // `postgres/src/include/access/htup_details.h` so future
 // pg_waldump compat / on-disk format work doesn't have to
@@ -775,7 +799,16 @@ func VacuumHeapPageBySlots(p Page, deadSlots []uint16) (HeapPageVacuumStats, err
 	}
 	upper := special
 	for _, e := range survivors {
-		upper -= len(e.body)
+		// MAXALIGN the tuple offset, exactly as the insert path does
+		// (PageAddHeapTuple: alignedSize = maxAlign8(len(raw))). The repack
+		// is the insert path's sibling: a survivor re-laid at a non-8-byte
+		// boundary segfaults a PG18 standby's heap_deform_tuple on the first
+		// SELECT and trips amcheck's "not maximally aligned" check. The
+		// line-pointer Length still reports the real body length; the trailing
+		// 0..7 padding bytes were already zeroed above. Survivors were placed
+		// with this same alignment by the insert path, so the aligned footprint
+		// never exceeds the space they originally occupied.
+		upper -= maxAlign8(len(e.body))
 		copy(p[upper:upper+len(e.body)], e.body)
 		item, err := readItemID(p, e.idx)
 		if err != nil {

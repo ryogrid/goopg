@@ -398,6 +398,21 @@ const (
 	// invalidation is implicit in the kind byte rather than encoded as a flag.
 	RecordKindXactCommitInval byte = 32
 
+	// RecordKindClogTruncate logs a CLOG (pg_xact) truncation: the oldest
+	// XID whose commit status is still retained. Emitted by
+	// mvcc.CLog.TruncateCLOG after VACUUM/freeze advances the cluster
+	// datfrozenxid, so a standby learns the new valid xid before the next
+	// checkpoint and crash recovery re-applies the (idempotent) truncation.
+	// Mirrors PG's XLOG_CLOG record with op CLOG_TRUNCATE (see
+	// postgres/src/backend/access/transam/clog.c:WriteTruncateXlogRec and
+	// clog_redo's CLOG_TRUNCATE branch, postgres/src/include/access/clog.h
+	// xl_clog_truncate). goopg carries only the oldestXid (the cutoff page is
+	// derivable and the cluster is single-database), so the wire format is
+	// "kind(1) | oldestXid(4)" = 5 bytes — identical to the xact markers.
+	// Physical page recovery is a no-op (clog is a write-behind cache); the
+	// recovery driver in internal/initdb replays it against the CLog.
+	RecordKindClogTruncate byte = 33
+
 	// RecordKindCanonical wraps a PG-canonical XLogRecord body (block
 	// references + main data) so a PG18 standby can replay catalog heap and
 	// btree insertions that goopg performs during DDL. The 7-byte envelope
@@ -426,8 +441,12 @@ const (
 
 	pageImageHeaderSize = 14
 	// btreeSplitHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
-	// Fork(1) + LeftBlk(4) + RightBlk(4) = 18.
-	btreeSplitHeaderSize = 18
+	// Fork(1) + LeftBlk(4) + RightBlk(4) + SibBlk(4) = 22.
+	// SibBlk is the old right sibling whose btpo_prev is relinked
+	// to RightBlk on a non-rightmost split; it is
+	// storage.InvalidBlockNumber for a rightmost split (no third
+	// page follows in the payload).
+	btreeSplitHeaderSize = 22
 	// heapInsertHeaderSize: kind(1) + DBOid(4) + RelOid(4) +
 	// Fork(1) + Block(4) + LineSlot(2) = 16.
 	heapInsertHeaderSize = 16
@@ -775,6 +794,29 @@ func EncodeXactCommitInval(xid storage.TransactionID) []byte {
 	out[0] = RecordKindXactCommitInval
 	binary.LittleEndian.PutUint32(out[1:5], uint32(xid))
 	return out
+}
+
+// EncodeClogTruncate encodes a CLOG_TRUNCATE record carrying oldestXid — the
+// oldest XID whose commit status is still retained after the truncation.
+// Wire format: "kind(1) | oldestXid(4)" = 5 bytes. Mirrors PG's
+// WriteTruncateXlogRec (postgres/src/backend/access/transam/clog.c:1029).
+func EncodeClogTruncate(xid storage.TransactionID) []byte {
+	out := make([]byte, xactRecordSize)
+	out[0] = RecordKindClogTruncate
+	binary.LittleEndian.PutUint32(out[1:5], uint32(xid))
+	return out
+}
+
+// DecodeClogTruncate decodes a RecordKindClogTruncate payload, returning the
+// retained oldestXid.
+func DecodeClogTruncate(payload []byte) (storage.TransactionID, error) {
+	if len(payload) != xactRecordSize {
+		return 0, fmt.Errorf("wal: clog-truncate payload len %d (want %d)", len(payload), xactRecordSize)
+	}
+	if payload[0] != RecordKindClogTruncate {
+		return 0, fmt.Errorf("wal: record kind %d is not clog-truncate", payload[0])
+	}
+	return storage.TransactionID(binary.LittleEndian.Uint32(payload[1:5])), nil
 }
 
 // ProcessCommittedInvalidationMessages unlinks both pg_internal.init files
@@ -1906,36 +1948,66 @@ func DecodeBtreeInsert(payload []byte) (rel storage.RelFileNode, blk storage.Blo
 	return
 }
 
-// EncodeBtreeSplit encodes one atomic B-tree split record. Both
-// pages must be exactly storage.BlockSize bytes; the record
-// embeds them in left-then-right order so replay applies the new
-// right page before any reader could follow left's right-link to
+// EncodeBtreeSplit encodes one atomic B-tree split record. The left
+// and right pages must be exactly storage.BlockSize bytes; the
+// record embeds them in left-then-right order so replay applies the
+// new right page before any reader could follow left's right-link to
 // it.
-func EncodeBtreeSplit(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) ([]byte, error) {
+//
+// On a NON-rightmost split the page that used to be left's right
+// sibling has its btpo_prev relinked from leftBlk to rightBlk;
+// callers pass that block as sibBlk with its post-relink image as
+// sibPage, and the record carries a third page so the relink is
+// crash-atomic with the split (mirrors PostgreSQL _bt_split, which
+// locks and stamps the original right sibling under the same WAL
+// record — nbtxlog.c xl_btree_split + the SPLIT redo applying the
+// rnext page). On a RIGHTMOST split sibBlk is
+// storage.InvalidBlockNumber and sibPage must be nil; no third page
+// follows.
+func EncodeBtreeSplit(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) ([]byte, error) {
 	if len(leftPage) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-split left page is %d bytes, want %d", len(leftPage), storage.BlockSize)
 	}
 	if len(rightPage) != storage.BlockSize {
 		return nil, fmt.Errorf("wal: btree-split right page is %d bytes, want %d", len(rightPage), storage.BlockSize)
 	}
-	out := make([]byte, btreeSplitHeaderSize+2*storage.BlockSize)
+	hasSib := sibBlk != storage.InvalidBlockNumber
+	if hasSib && len(sibPage) != storage.BlockSize {
+		return nil, fmt.Errorf("wal: btree-split sibling page is %d bytes, want %d", len(sibPage), storage.BlockSize)
+	}
+	if !hasSib && sibPage != nil {
+		return nil, fmt.Errorf("wal: btree-split rightmost split must not carry a sibling page")
+	}
+	nPages := 2
+	if hasSib {
+		nPages = 3
+	}
+	out := make([]byte, btreeSplitHeaderSize+nPages*storage.BlockSize)
 	out[0] = RecordKindBtreeSplit
 	binary.LittleEndian.PutUint32(out[1:5], rel.DBOid)
 	binary.LittleEndian.PutUint32(out[5:9], rel.RelOid)
 	out[9] = byte(rel.Fork)
 	binary.LittleEndian.PutUint32(out[10:14], uint32(leftBlk))
 	binary.LittleEndian.PutUint32(out[14:18], uint32(rightBlk))
+	binary.LittleEndian.PutUint32(out[18:22], uint32(sibBlk))
 	copy(out[btreeSplitHeaderSize:btreeSplitHeaderSize+storage.BlockSize], leftPage)
-	copy(out[btreeSplitHeaderSize+storage.BlockSize:], rightPage)
+	copy(out[btreeSplitHeaderSize+storage.BlockSize:btreeSplitHeaderSize+2*storage.BlockSize], rightPage)
+	if hasSib {
+		copy(out[btreeSplitHeaderSize+2*storage.BlockSize:], sibPage)
+	}
 	return out, nil
 }
 
 // DecodeBtreeSplit returns the rel + (left,right) blocks + page
-// images carried by a BtreeSplit record payload.
-func DecodeBtreeSplit(payload []byte) (rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, err error) {
-	want := btreeSplitHeaderSize + 2*storage.BlockSize
-	if len(payload) != want {
-		err = fmt.Errorf("wal: invalid btree-split payload len %d (want %d)", len(payload), want)
+// images carried by a BtreeSplit record payload. On a non-rightmost
+// split sibBlk is the old right sibling and sibPage its relinked
+// image; on a rightmost split sibBlk is storage.InvalidBlockNumber
+// and sibPage is nil.
+func DecodeBtreeSplit(payload []byte) (rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page, err error) {
+	want2 := btreeSplitHeaderSize + 2*storage.BlockSize
+	want3 := btreeSplitHeaderSize + 3*storage.BlockSize
+	if len(payload) != want2 && len(payload) != want3 {
+		err = fmt.Errorf("wal: invalid btree-split payload len %d (want %d or %d)", len(payload), want2, want3)
 		return
 	}
 	if payload[0] != RecordKindBtreeSplit {
@@ -1949,10 +2021,20 @@ func DecodeBtreeSplit(payload []byte) (rel storage.RelFileNode, leftBlk, rightBl
 	}
 	leftBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[10:14]))
 	rightBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[14:18]))
+	sibBlk = storage.BlockNumber(binary.LittleEndian.Uint32(payload[18:22]))
+	hasSib := len(payload) == want3
+	if hasSib != (sibBlk != storage.InvalidBlockNumber) {
+		err = fmt.Errorf("wal: btree-split sibBlk/payload-length mismatch (sibBlk=%d len=%d)", sibBlk, len(payload))
+		return
+	}
 	leftPage = make(storage.Page, storage.BlockSize)
 	copy(leftPage, payload[btreeSplitHeaderSize:btreeSplitHeaderSize+storage.BlockSize])
 	rightPage = make(storage.Page, storage.BlockSize)
-	copy(rightPage, payload[btreeSplitHeaderSize+storage.BlockSize:])
+	copy(rightPage, payload[btreeSplitHeaderSize+storage.BlockSize:btreeSplitHeaderSize+2*storage.BlockSize])
+	if hasSib {
+		sibPage = make(storage.Page, storage.BlockSize)
+		copy(sibPage, payload[btreeSplitHeaderSize+2*storage.BlockSize:])
+	}
 	return
 }
 
@@ -2156,6 +2238,15 @@ func ApplyRecord(mgr *storage.Manager, r Record) (bool, error) {
 		// same transaction; this record carries no additional data.
 		_ = ProcessCommittedInvalidationMessages(mgr.DataDir(), defaultRecoveryDBOid)
 		return false, nil
+	case RecordKindClogTruncate:
+		// CLOG truncation marker (G9). Physical page recovery is a no-op: the
+		// clog (pg_xact) is a write-behind cache whose authoritative state is
+		// the WAL. The recovery driver in internal/initdb scans the WAL for
+		// this record after physical replay and re-applies the (idempotent)
+		// truncation to the CLog, which has no access to mvcc.Manager from
+		// here. Mirrors PG clog_redo's CLOG_TRUNCATE branch
+		// (postgres/src/backend/access/transam/clog.c:1131).
+		return false, nil
 	case RecordKindCreateDatabase, RecordKindDropDatabase:
 		// CREATE/DROP DATABASE records (M0054-0001) carry only a database
 		// name; goopg v0 has no per-database file namespacing, so the
@@ -2237,6 +2328,7 @@ func nativeApplyRecordKindKnown(kind byte) bool {
 		RecordKindXactCommit,
 		RecordKindXactAbort,
 		RecordKindXactCommitInval,
+		RecordKindClogTruncate,
 		RecordKindCreateDatabase,
 		RecordKindDropDatabase,
 		RecordKindCreateIndex,
@@ -3214,7 +3306,7 @@ func replayHeapPruneOpt(mgr *storage.Manager, r Record) error {
 // left → right so a reader following left's right-link from the
 // post-replay state always finds a real right page on disk.
 func replayBtreeSplit(mgr *storage.Manager, payload []byte) error {
-	rel, leftBlk, rightBlk, leftPage, rightPage, err := DecodeBtreeSplit(payload)
+	rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage, err := DecodeBtreeSplit(payload)
 	if err != nil {
 		return err
 	}
@@ -3223,6 +3315,15 @@ func replayBtreeSplit(mgr *storage.Manager, payload []byte) error {
 	}
 	if err := writeBlockOrExtend(mgr, rel, rightBlk, rightPage); err != nil {
 		return fmt.Errorf("apply right block %d: %w", rightBlk, err)
+	}
+	// Non-rightmost split: relink the old right sibling's btpo_prev
+	// to the new right page. Applied last; the sibling already
+	// exists on disk (it predates the split) so this is always a
+	// WriteBlock, never an Extend.
+	if sibBlk != storage.InvalidBlockNumber {
+		if err := writeBlockOrExtend(mgr, rel, sibBlk, sibPage); err != nil {
+			return fmt.Errorf("apply old-right-sibling block %d: %w", sibBlk, err)
+		}
 	}
 	return nil
 }

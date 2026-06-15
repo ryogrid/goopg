@@ -446,14 +446,12 @@ func lockingTargetMatches(name string, rels []scopeRel) bool {
 }
 
 func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
+	// Build CTE scope so the INSERT's SELECT body (including subqueries)
+	// can reference modifying CTEs by name. M0100-0010.
+	var cteCtx *scope
 	if s.With != nil {
-		// Stage A: validate the CTE definitions (so type errors
-		// inside the CTE bodies surface even though the INSERT
-		// VALUES path doesn't yet consume them). The planner /
-		// executor integration for WITH-prefixed INSERTs lands in
-		// 0016-0002.
-		ctx := &scope{cat: cat}
-		if err := analyzeWith(s.With, ctx); err != nil {
+		cteCtx = &scope{cat: cat}
+		if err := analyzeWith(s.With, cteCtx); err != nil {
 			return err
 		}
 	}
@@ -462,8 +460,9 @@ func analyzeInsert(s *parser.InsertStmt, cat catalog.Catalog) error {
 		return err
 	}
 	// INSERT … SELECT: analyze the SELECT sub-statement and skip VALUES checks.
+	// Pass cteCtx as parent so the SELECT sees modifying CTE names.
 	if s.Select != nil {
-		return analyzeSelectWithParent(s.Select, cat, nil)
+		return analyzeSelectWithParent(s.Select, cat, cteCtx)
 	}
 	if len(s.Rows) == 0 {
 		return analyzeError(s.Pos(), "42601", "INSERT requires at least one row")
@@ -646,10 +645,17 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 		return err
 	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
+	// Register CTEs first so FROM-clause tables can reference them. M0100-0010.
+	if s.With != nil {
+		if err := analyzeWith(s.With, ctx); err != nil {
+			return err
+		}
+	}
 	// Add FROM-clause tables to scope so WHERE / SET expressions can reference
 	// their columns (e.g. `UPDATE t SET i = b.j FROM other b WHERE ...`). M0097-0065.
+	// Use resolveTable (CTE-aware) so modifying CTEs in WITH are found.
 	for _, rv := range s.From {
-		fromTbl, err := lookupTable(cat, rv)
+		fromTbl, err := resolveTable(ctx, rv)
 		if err != nil {
 			return err
 		}
@@ -658,11 +664,6 @@ func analyzeUpdate(s *parser.UpdateStmt, cat catalog.Catalog) error {
 			alias = rv.Name
 		}
 		ctx.rels = append(ctx.rels, scopeRel{table: fromTbl, alias: alias})
-	}
-	if s.With != nil {
-		if err := analyzeWith(s.With, ctx); err != nil {
-			return err
-		}
 	}
 	if err := analyzeWhere(s.Where, ctx); err != nil {
 		return err
@@ -702,11 +703,17 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 		return err
 	}
 	ctx := &scope{rels: []scopeRel{{table: tbl, alias: s.Target.Alias}}, cat: cat}
+	// Register CTEs first so USING-clause tables can reference them. M0100-0010.
+	if s.With != nil {
+		if err := analyzeWith(s.With, ctx); err != nil {
+			return err
+		}
+	}
 	// Add USING-clause tables to scope so WHERE / RETURNING expressions
 	// can reference their columns. Mirrors analyzeUpdate's FROM handling.
-	// M0097-0076.
+	// M0097-0076. Use resolveTable (CTE-aware) so modifying CTEs in WITH are found.
 	for _, rv := range s.Using {
-		useTbl, err := lookupTable(cat, rv)
+		useTbl, err := resolveTable(ctx, rv)
 		if err != nil {
 			return err
 		}
@@ -715,11 +722,6 @@ func analyzeDelete(s *parser.DeleteStmt, cat catalog.Catalog) error {
 			alias = rv.Name
 		}
 		ctx.rels = append(ctx.rels, scopeRel{table: useTbl, alias: alias})
-	}
-	if s.With != nil {
-		if err := analyzeWith(s.With, ctx); err != nil {
-			return err
-		}
 	}
 	if err := analyzeWhere(s.Where, ctx); err != nil {
 		return err
@@ -1326,6 +1328,12 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 			if strings.EqualFold(x.Column, "ctid") && !matched.qualifiedOnly {
 				return catalog.Type{Name: "tid"}, true, nil
 			}
+			// DML CTE tables have no columns registered; the planner
+			// resolves column types at execution time from the
+			// materialized CTE result. Accept any column ref.
+			if matched.table.IsDMLCTE {
+				return catalog.Type{}, true, nil
+			}
 			// Use qualified "table.col" format to match PG output.
 			qualifier := matched.alias
 			if qualifier == "" {
@@ -1347,6 +1355,14 @@ func resolveColumnRefTypeAt(x *parser.ColumnRef, ctx *scope) (catalog.Type, bool
 		}
 		col, ok := lookupColumn(rel.table, x.Column)
 		if !ok {
+			// DML CTE tables have no columns registered; accept any unqualified column ref.
+			if rel.table.IsDMLCTE {
+				if found != nil {
+					return catalog.Type{}, false, analyzeError(x.Pos(), "42702", fmt.Sprintf("column reference %q is ambiguous", x.Column))
+				}
+				t := catalog.Type{}
+				found = &t
+			}
 			continue
 		}
 		// Skip USING-hidden columns from right side of JOIN USING. M0097-0003.
@@ -1524,6 +1540,21 @@ func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Col
 			colName = colAliases[0]
 		}
 		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "oid"}, Ordinal: 0}}
+	case "verify_heapam":
+		// verify_heapam(regclass, ...) → (blkno int8, offnum int8, attnum int4,
+		// msg text). Mirrors planVerifyHeapam. M0110-0003.
+		names := []string{"blkno", "offnum", "attnum", "msg"}
+		types := []string{"int8", "int8", "int4", "text"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
 	default:
 		// generate_series and unknown SRFs: 1 int8 column named after
 		// the alias. Preserves pre-M0103-0008 behaviour.
@@ -1685,7 +1716,11 @@ func analyzeRecursiveCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 	// the CTE with column name "?column?1" instead of "n", causing the recursive
 	// member to fail with "column n does not exist".
 	if len(cte.Columns) > 0 {
-		if len(cte.Columns) != len(cols) {
+		// PG (parse_cte.c analyzeCTE): the alias list must be empty or no
+		// LONGER than the output column set; a SHORTER list is allowed and the
+		// trailing columns keep their query-derived names. Only over-aliasing
+		// is the 42P10 error.
+		if len(cte.Columns) > len(cols) {
 			return analyzeError(cte.Pos(), "42P10",
 				fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(cols)))
 		}
@@ -1738,11 +1773,13 @@ func analyzeWith(with *parser.WithClause, ctx *scope) error {
 			// Data-modifying CTE (INSERT/UPDATE/DELETE/MERGE).
 			// Analysis is handled by the DML-specific planner when
 			// the CTE is planned; register with an empty table so
-			// the outer query knows the name exists.
+			// the outer query knows the name exists. IsDMLCTE lets
+			// resolveColumnRefTypeAt accept any column ref on this
+			// table without strict validation.
 			if ctx.ctes == nil {
 				ctx.ctes = make(map[string]*catalog.Table)
 			}
-			ctx.ctes[strings.ToLower(cte.Name)] = &catalog.Table{Name: cte.Name}
+			ctx.ctes[strings.ToLower(cte.Name)] = &catalog.Table{Name: cte.Name, IsDMLCTE: true}
 			continue
 		}
 
@@ -1781,31 +1818,52 @@ func registerAnalyzedCTE(cte *parser.CommonTableExpr, ctx *scope) error {
 		innerCtx.rels = rels
 	}
 	innerCols := make([]catalog.Column, 0, len(cte.Query.Targets))
-	for _, tgt := range cte.Query.Targets {
-		// A top-level `*` / `t.*` in the CTE body must materialise into
-		// the inner scope's concrete columns — analyzeExpr rejects a
-		// bare StarExpr ("'*' is not allowed here"). Mirrors
-		// synthesizeSubqueryTable's derived-table star handling; keep
-		// the two in sync. M0097-0003.
-		if star, ok := tgt.Expr.(*parser.StarExpr); ok {
-			innerCols = append(innerCols, expandInnerStarColumns(star, innerCtx)...)
-			continue
+	if len(cte.Query.Targets) == 0 && len(cte.Query.ValuesRows) > 0 {
+		// VALUES-list CTE body (e.g. `cte (a, b) AS (VALUES (1,'x'),
+		// (2,'y'))`): there are no Targets, so the column count comes
+		// from the first VALUES row. Default names are "column1",
+		// "column2", … and types are "unknown" (the planner resolves
+		// exact types from the row literals). This mirrors the VALUES
+		// anchor handling in analyzeRecursiveCTE — keep the two in sync.
+		// pg_amcheck's database-resolution query relies on this shape
+		// (`include_raw (pattern_id, rgx) AS (VALUES (0,'^(x)$'), …)`).
+		// M0110-0003 / AC-002.
+		nCols := len(cte.Query.ValuesRows[0])
+		for i := 0; i < nCols; i++ {
+			innerCols = append(innerCols, catalog.Column{Name: fmt.Sprintf("column%d", i+1), Type: catalog.Type{Name: "unknown"}, Ordinal: i})
 		}
-		name := tgt.Alias
-		if name == "" {
-			name = deriveAnalyzerTargetName(tgt.Expr)
+	} else {
+		for _, tgt := range cte.Query.Targets {
+			// A top-level `*` / `t.*` in the CTE body must materialise into
+			// the inner scope's concrete columns — analyzeExpr rejects a
+			// bare StarExpr ("'*' is not allowed here"). Mirrors
+			// synthesizeSubqueryTable's derived-table star handling; keep
+			// the two in sync. M0097-0003.
+			if star, ok := tgt.Expr.(*parser.StarExpr); ok {
+				innerCols = append(innerCols, expandInnerStarColumns(star, innerCtx)...)
+				continue
+			}
+			name := tgt.Alias
+			if name == "" {
+				name = deriveAnalyzerTargetName(tgt.Expr)
+			}
+			if name == "" {
+				name = fmt.Sprintf("?column?%d", len(innerCols)+1)
+			}
+			typ, err := analyzeExpr(tgt.Expr, innerCtx)
+			if err != nil {
+				return err
+			}
+			innerCols = append(innerCols, catalog.Column{Name: name, Type: typ})
 		}
-		if name == "" {
-			name = fmt.Sprintf("?column?%d", len(innerCols)+1)
-		}
-		typ, err := analyzeExpr(tgt.Expr, innerCtx)
-		if err != nil {
-			return err
-		}
-		innerCols = append(innerCols, catalog.Column{Name: name, Type: typ})
 	}
 	if len(cte.Columns) > 0 {
-		if len(cte.Columns) != len(innerCols) {
+		// PG (parse_cte.c analyzeCTE): a column-alias list shorter than the
+		// inner query's output is allowed — the extra trailing columns keep
+		// their query names. Only over-aliasing is the 42P10 error. pg_amcheck
+		// relies on this for its `exclude_raw (pattern_id, rgx) AS (SELECT
+		// NULL, NULL, NULL WHERE false)` empty-pattern CTE (AC-002).
+		if len(cte.Columns) > len(innerCols) {
 			return analyzeError(cte.Pos(), "42P10",
 				fmt.Sprintf("CTE %q has %d column aliases but inner query produces %d columns", cte.Name, len(cte.Columns), len(innerCols)))
 		}

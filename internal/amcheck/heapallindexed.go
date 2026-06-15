@@ -5,9 +5,14 @@
 // first one that crosses the index↔heap boundary, so it follows the same
 // engine-first/wire-later pattern as the rest of the package: this file ports
 // the Bloom-filter fingerprint+probe core as a pure function over two entry
-// sets, and the SQL surface (bt_index_check(index, heapallindexed => true)) that
-// produces those sets from a live index walk + heap scan is wired in a later
-// loop once the tree is clean. See docs/design/0110-0007-amcheck-heapallindexed.md.
+// sets. The two relation-walk producers that fill those sets from a live
+// relation's page bytes are also in the engine — the index leaf-level walk
+// (CollectBtreeLeafEntries in heapallindexed_relation.go) and the heap
+// line-pointer walk (CollectHeapIndexEntries in heapallindexed_heapscan.go) —
+// so the SQL surface (bt_index_check(index, heapallindexed => true)) reduces to
+// a thin adapter that supplies the two PageSources and the TupleDesc-coupled
+// HeapEntryFormer, wired in a later loop once the tree is clean. See
+// docs/design/0110-0007-amcheck-heapallindexed.md.
 //
 // Upstream algorithm (verify_nbtree.c):
 //

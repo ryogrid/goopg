@@ -58,6 +58,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -247,7 +248,33 @@ func (s *Server) replyBaseBackup(ctx context.Context, w *protocol.FrameWriter, a
 	}
 	wantManifest := opts.Manifest == "yes" || opts.Manifest == "force-encode"
 	mck, _ := parseManifestChecksumKind(opts.ManifestChecksums) // validated at entry
-	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, startTLI, segSize, mck)
+
+	// -X fetch (BASE_BACKUP WAL): compute the inclusive [start,end] WAL
+	// segment range to append to the tar. Mirrors basebackup.c:439-442
+	// — XLByteToSeg(startptr) .. XLByteToPrevSeg(endptr). startptr is the
+	// 0-based redo point (baseLSN0); endptr is the 0-based stop LSN sampled
+	// now (emitBaseBackupTar reads files but writes no WAL, so WrittenLSN
+	// is stable across the call).
+	var walStartSeg, walEndSeg uint64
+	if opts.IncludeWAL {
+		walStartSeg = baseLSN0 / uint64(segSize)
+		endLSN0 := baseLSN0
+		if s.cfg.WAL != nil {
+			if wlsn := s.cfg.WAL.WrittenLSN(); wlsn > 0 {
+				endLSN0 = wlsn - 1
+			}
+		}
+		if endLSN0 == 0 {
+			walEndSeg = walStartSeg
+		} else {
+			walEndSeg = (endLSN0 - 1) / uint64(segSize)
+		}
+		if walEndSeg < walStartSeg {
+			walEndSeg = walStartSeg
+		}
+	}
+
+	entries, err := emitBaseBackupTar(ctx, streamer, s.cfg.DataDir, opts.Label, baseLSN0, startTLI, segSize, mck, opts.IncludeWAL, walStartSeg, walEndSeg)
 	if err != nil {
 		return s.writeStreamingError(w, sqlstate.InternalError,
 			fmt.Sprintf("BASE_BACKUP: tar: %v", err))
@@ -522,7 +549,14 @@ type manifestEntry struct {
 // tracks needed WAL via "WAL-Ranges", never as Files[] entries, and a
 // concurrent `-X stream` rewrites those segments on the client side,
 // which would otherwise break checksum verification.
-func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN uint64, tli uint32, segSize int64, mck manifestChecksumKind) ([]manifestEntry, error) {
+//
+// pg_wal contents are never part of the directory walk — pg_wal is shipped
+// as an empty directory (plus the archive_status/summaries empty subdirs PG
+// emits), mirroring basebackup.c sendDir():1385-1407. When `includeWAL` is
+// set (the BASE_BACKUP `WAL` option / `pg_basebackup -X fetch`), the in-range
+// segments [walStartSeg, walEndSeg] are appended to the still-open tar after
+// the data files, mirroring the basebackup.c:408-560 includewal block.
+func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string, startLSN uint64, tli uint32, segSize int64, mck manifestChecksumKind, includeWAL bool, walStartSeg, walEndSeg uint64) ([]manifestEntry, error) {
 	tw := tar.NewWriter(out)
 
 	var manifest []manifestEntry
@@ -581,6 +615,17 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 			pgControlPath = path
 			return nil
 		}
+		// pg_wal is never walked: ship it as an empty directory (plus the
+		// archive_status/summaries empty subdirs PG also emits) so a
+		// recovering standby can stat the paths. WAL segments are appended
+		// separately, only when the client requested WAL inclusion
+		// (-X fetch). Mirrors basebackup.c sendDir():1385-1407.
+		if filepath.ToSlash(rel) == "pg_wal" && info.IsDir() {
+			entries = append(entries, entry{abs: path, rel: rel, info: info, isFile: false})
+			entries = append(entries, entry{abs: "", rel: filepath.Join("pg_wal", "archive_status"), info: info, isFile: false})
+			entries = append(entries, entry{abs: "", rel: filepath.Join("pg_wal", "summaries"), info: info, isFile: false})
+			return filepath.SkipDir
+		}
 		base := filepath.Base(rel)
 		if info.IsDir() {
 			if _, skip := excludeDirContents[base]; skip {
@@ -635,10 +680,94 @@ func emitBaseBackupTar(ctx context.Context, out io.Writer, dataDir, label string
 		record(filepath.Join("global", "pg_control"), data, pgControlMTime)
 	}
 
+	// 4. WAL inclusion (-X fetch): append the [walStartSeg, walEndSeg]
+	// segments to the still-open tar under pg_wal/, plus any timeline
+	// history files. Mirrors the basebackup.c:408-560 includewal block,
+	// including its contiguity sanity check. Appended WAL is intentionally
+	// NOT recorded in the manifest Files[] — PG tracks it via WAL-Ranges.
+	if includeWAL {
+		if err := appendWALSegments(tw, dataDir, tli, segSize, walStartSeg, walEndSeg); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := tw.Close(); err != nil {
 		return nil, err
 	}
 	return manifest, nil
+}
+
+// appendWALSegments scans <dataDir>/pg_wal and appends the WAL segments in
+// the inclusive segment range [startSeg, endSeg] to the open tar, oldest
+// first, followed by any timeline history files. It mirrors upstream's
+// includewal logic: it enforces that the range is fully covered with no
+// gaps (basebackup.c:484-520) and errors otherwise, since a backup that
+// requested WAL but cannot supply the consistency range is unusable.
+func appendWALSegments(tw *tar.Writer, dataDir string, tli uint32, segSize int64, startSeg, endSeg uint64) error {
+	walDir := filepath.Join(dataDir, "pg_wal")
+	des, err := os.ReadDir(walDir)
+	if err != nil {
+		return err
+	}
+	type walSeg struct {
+		name  string
+		segno uint64
+	}
+	var segs []walSeg
+	var historyFiles []string
+	for _, de := range des {
+		if de.IsDir() {
+			continue
+		}
+		name := de.Name()
+		if _, segno, ok := wal.ParseXLogFileName(name, segSize); ok {
+			if segno >= startSeg && segno <= endSeg {
+				segs = append(segs, walSeg{name: name, segno: segno})
+			}
+		} else if strings.HasSuffix(name, ".history") {
+			historyFiles = append(historyFiles, name)
+		}
+	}
+	// Oldest first, so a segment is shipped before it can be recycled
+	// (compareWalFileNames in basebackup.c).
+	sort.Slice(segs, func(i, j int) bool { return segs[i].segno < segs[j].segno })
+
+	// Contiguity sanity check: the range must be fully covered.
+	if len(segs) == 0 || segs[0].segno != startSeg {
+		return fmt.Errorf("could not find WAL file %q", wal.XLogFileName(tli, startSeg, segSize))
+	}
+	for i := 1; i < len(segs); i++ {
+		if segs[i].segno != segs[i-1].segno+1 {
+			return fmt.Errorf("could not find WAL file %q", wal.XLogFileName(tli, segs[i-1].segno+1, segSize))
+		}
+	}
+	if segs[len(segs)-1].segno != endSeg {
+		return fmt.Errorf("could not find WAL file %q", wal.XLogFileName(tli, endSeg, segSize))
+	}
+
+	for _, ws := range segs {
+		data, err := os.ReadFile(filepath.Join(walDir, ws.name))
+		if err != nil {
+			return err
+		}
+		if err := writeTarFileWithMode(tw, "pg_wal/"+ws.name, data, time.Now(), 0o600); err != nil {
+			return err
+		}
+	}
+	// Timeline history files are tiny and useful for debugging; PG always
+	// ships them all (basebackup.c:608-635). goopg single-timeline clusters
+	// usually have none.
+	sort.Strings(historyFiles)
+	for _, h := range historyFiles {
+		data, err := os.ReadFile(filepath.Join(walDir, h))
+		if err != nil {
+			return err
+		}
+		if err := writeTarFileWithMode(tw, "pg_wal/"+h, data, time.Now(), 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // writeTarFile / writeTarFileWithMode / writeTarDir are thin
@@ -801,6 +930,12 @@ type baseBackupOptions struct {
 	ManifestChecksums string
 	Target            string // "client" by default; goopg ignores non-client targets
 	Wait              int    // 0 means "don't wait for WAL"; goopg treats both the same
+	// IncludeWAL is the upstream BASE_BACKUP `WAL` boolean. pg_basebackup
+	// sets it for `-X fetch` (FETCH_WAL) — see pg_basebackup.c:1905-1906
+	// (`AppendPlainCommandOption(&buf, ..., "WAL")`). When set the server
+	// appends the in-range pg_wal segments to the backup tar instead of
+	// relying on a concurrent `-X stream` walsender connection.
+	IncludeWAL bool
 }
 
 // parseBaseBackupOptions parses upstream PG17+ grammar
@@ -853,6 +988,11 @@ func parseBaseBackupOptionList(body string) (baseBackupOptions, error) {
 			}
 		case "MANIFEST_CHECKSUMS":
 			opts.ManifestChecksums = strings.ToUpper(trimSingleQuotes(val))
+		case "WAL":
+			// PG15+ sends `WAL` as a bare boolean option (no value) for
+			// `-X fetch`. defGetBoolean treats a value-less option as true;
+			// honour an explicit false ('f'/'off'/'0') for completeness.
+			opts.IncludeWAL = parseOptionBool(val, true)
 		case "CHECKPOINT", "TABLESPACE_MAP", "VERIFY_CHECKSUMS", "MAX_RATE",
 			"NOVERIFY_CHECKSUMS", "COMPRESSION",
 			"COMPRESSION_DETAIL", "INCREMENTAL":
@@ -880,6 +1020,10 @@ func parseBaseBackupLegacyKeywords(raw string) (baseBackupOptions, error) {
 			}
 		case "PROGRESS":
 			opts.Progress = true
+		case "WAL":
+			// Legacy walsender clients (`BASE_BACKUP ... WAL`) request
+			// in-tar WAL with a bare keyword; it never carries a value.
+			opts.IncludeWAL = true
 		case "MANIFEST":
 			if i+1 < len(toks) {
 				opts.Manifest = strings.ToLower(trimSingleQuotes(toks[i+1]))
@@ -895,6 +1039,22 @@ func parseBaseBackupLegacyKeywords(raw string) (baseBackupOptions, error) {
 		}
 	}
 	return opts, nil
+}
+
+// parseOptionBool interprets a BASE_BACKUP boolean option value the way
+// upstream defGetBoolean does: an absent value means "present, so true",
+// while an explicit value is parsed as a PG boolean literal.
+func parseOptionBool(val string, defaultWhenEmpty bool) bool {
+	val = strings.TrimSpace(trimSingleQuotes(val))
+	if val == "" {
+		return defaultWhenEmpty
+	}
+	switch strings.ToLower(val) {
+	case "f", "false", "off", "0", "n", "no":
+		return false
+	default:
+		return true
+	}
 }
 
 // splitOptionsCSV splits at commas that aren't inside single quotes.
@@ -970,18 +1130,4 @@ func tokenizeLegacyOptions(raw string) []string {
 	}
 	flush()
 	return out
-}
-
-// parseGoopgWalName parses a goopg-format WAL segment filename
-// (%024X segno) and returns the segment number. ok=false for
-// non-WAL or invalid names.
-func parseGoopgWalName(name string) (segno uint64, ok bool) {
-	if len(name) != 24 {
-		return 0, false
-	}
-	v, err := strconv.ParseUint(name, 16, 64)
-	if err != nil {
-		return 0, false
-	}
-	return v, true
 }

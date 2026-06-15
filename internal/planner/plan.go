@@ -1129,6 +1129,26 @@ type PgPartitionTree struct {
 func (n *PgPartitionTree) Pos() int       { return n.pos }
 func (n *PgPartitionTree) Output() Schema { return n.schema }
 
+// VerifyHeapam is the FROM-clause SRF plan node for amcheck's
+// verify_heapam(regclass, ...) — slice S3 of docs/design/0110-0008. It carries
+// the relation argument plus the optional startblock / endblock block-range
+// arguments; the executor op resolves the relation, walks its heap blocks
+// through the committed internal/amcheck engine (VerifyHeapRelation), and emits
+// one (blkno, offnum, attnum, msg) row per structural-corruption finding. The
+// remaining SRF arguments (on_error_stop, check_toast, skip) are accepted by the
+// parser but have no effect — check_toast is goopg-divergent (see 0110-0005) and
+// the others do not change which structural checks run. M0110-0003.
+type VerifyHeapam struct {
+	pos        int
+	Arg        Expr // the regclass relation argument (required)
+	StartBlock Expr // startblock int8 (optional, nil = whole relation)
+	EndBlock   Expr // endblock int8 (optional, nil = whole relation)
+	schema     Schema
+}
+
+func (n *VerifyHeapam) Pos() int       { return n.pos }
+func (n *VerifyHeapam) Output() Schema { return n.schema }
+
 // Insert — writes rows from Source into Table. ColumnIndex maps each
 // source column to a target heap-tuple ordinal; columns not listed
 // receive NULL (or their declared default once defaults are wired).
@@ -1196,6 +1216,11 @@ type LockedRel struct {
 	Alias      string // FROM-clause alias for diagnostics; empty when bare table
 	Strength   LockStrength
 	WaitPolicy LockWaitPolicy
+	// ColOffset is the first output-column index of this relation in the
+	// SELECT result schema. Set by resolveLockedRels from rangeBinding.offset
+	// so the executor can merge EPQ-refetched values at the correct position
+	// even when the locked table is not the leftmost in the join (M0100-0010).
+	ColOffset int
 }
 
 // LockRows is the upstream-shape wrapper that adds row-lock

@@ -1,35 +1,57 @@
-Task: M0095-0003 (pg_basebackup TAP port) — SHA-family backup-manifest
-checksum oracle coverage.
+Task: M0110-0003 (AC-002 pg_amcheck 002_nonesuch promotion) — loop #22. Landed
+AC-002 gap #5 (schema-qualified SRF in FROM clause). A NEW gap #6 surfaced and
+was isolated — that is the next loop.
 
-LANDED loop #9 (committing): test-only increment hardening loop #8's manifest
-work. New TestPort_PgBasebackup010ManifestChecksums in
-internal/testport/pgbasebackup_port_test.go — subtests SHA224/SHA256/SHA384/
-SHA512 drive `pg_basebackup --manifest-checksums=<algo>` against one live
-goopg cluster (one cluster, 4 backups into separate tempdirs). Each subtest:
-asserts every Files[] entry's Checksum-Algorithm == requested algo;
-independently recomputes the per-file checksum from disk (sha256.Sum224/Sum256,
-sha512.Sum384/Sum512, lowercase hex — matches manifestChecksumKind.checksumFile);
-recomputes the always-SHA-256 Manifest-Checksum over the doc prefix; runs
-upstream `pg_verifybackup -n` which ACCEPTS all four. Added crypto/sha512 import.
-Server side already complete (loop #8: checksumFile/algoName in basebackup.go).
+=== WHAT LANDED (this loop) ===
+Worktree `.claude/worktrees/m0110-amcheck-sql` branch `m0110-0003-amcheck-sql-surface`,
+commit d8d03c7b (on top of b542aeba, off clean HEAD b8dd6403). Parser fix:
+- gap #5: a schema-qualified function call in FROM (`"public".verify_heapam(...)`)
+  was rejected. parseRangeVar only dispatched an SRF when the name was unqualified
+  or pg_catalog-qualified (`obj.Schema=="" || EqualFold(obj.Schema,"pg_catalog")`);
+  a user-schema qualifier (public) fell through to the derived-subquery branch →
+  `expected ')' after subquery in FROM (got ()`. Fix: restructure the gate so in
+  FROM-clause context a schema-qualified `name(args)` is also accepted — schema
+  qualifier discarded, dispatch by bare name (builtins by lowercased canonical
+  name so executor's name switch matches; else user-defined SRF). Unqualified /
+  pg_catalog path preserved exactly. (internal/parser/select.go ~line 1257)
+Regression: parser.TestParseSchemaQualifiedFromSRF (quoted + bare schema forms),
+sibling to TestParseNamedArgColonEqualFromSRF.
+Updated the 002 test header + flipped the gap-#5 preflight probe to a gap-#6 probe;
+design 0110-0008 + deferral ledger updated. Also gofmt'd 3 pre-existing
+violations in select.go (HEAD was already gofmt-dirty there).
 
-Gates run loop #9: go test TestPort_PgBasebackup010ManifestChecksums PASS (1.78s,
-4/4 subtests); go test TestPort_PgBasebackup010* PASS (5.84s, no regression);
-gofmt clean; go vet ./internal/testport/ clean; go test -c compile OK;
-gen-oracle-port-status regen OK; make ralph-state-guard (before status block).
+Files (all in worktree): internal/parser/select.go,
+internal/parser/named_arg_colon_equal_test.go (new test),
+internal/testport/pgamcheck002_port_test.go (header + gap-#6 probe),
+docs/design/0110-0008-amcheck-sql-surface-plan.md.
 
-CONTAMINATION (unchanged from loops #5-8): 18 files modified at identical mtime
-(catalog.go, operators_lockrows.go, parser/ddl.go, planner/*, analyzer,
-dispatch, …) + untracked gen_override_test.go files — a single foreign WIP
-snapshot, NOT mine. Do NOT git add -A. Commit ONLY my files: the test file,
-docs/test-port CSV + markdown, fix_plan.md, working_set.md.
+Key symbols: parser.parseRangeVar (srfFuncName gate, isKnownBuiltin switch);
+analyzer.resolveTable + planner LATERAL path (next loop's targets).
 
-Next step: M0095-0003 `-X fetch` (WAL-fetch path) is the next FEATURE increment:
-parse the BASE_BACKUP `WAL` boolean option (basebackup.go baseBackupOptions +
-parseBaseBackupOptionList), then after emitting the data-dir tar append the
-in-range WAL segments to the SAME open tar under pg_wal/ with goopg→PG 24-char
-segment-name conversion (mirror basebackup.c includewal block, lines 408-520;
-reuse the goopg→PG WAL conversion from replication.go replyStartReplication).
-011/020/recvlogical still blocked on in-place-tablespace BASE_BACKUP + logical
-replication protocol. M0110-0003 SQL surface still needs the foreign WIP
-stashed/committed by a human (it edits catalog.go/parser/dispatch).
+Gates run: go test ./internal/{parser,analyzer,planner,executor,server} PASS;
+TestPort_PgAmcheck002Nonesuch now SKIPs cleanly on gap #6 (was FAIL); go build PASS;
+gofmt/vet clean. TPC-H spotcheck SKIP (worktree no data dir; parser-only,
+row-count-neutral).
+
+=== NEXT STEP (resume point) — AC-002 gap #6, its OWN bounded loop ===
+pg_amcheck builds each per-relation heap check as an implicit-LATERAL comma-join:
+  ... FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …) v
+The query now PARSES and reaches the executor (gap #5 fixed), but the correlated
+`c.oid` inside the SRF's ARGUMENT list does not resolve against the sibling
+`pg_class c` range-table entry, so verify_heapam errors `column "oid" does not
+exist`. Fix = LATERAL/correlated-reference resolution for a FROM-clause SRF whose
+args reference an outer/sibling relation (planner + executor, plan/exec time).
+CAUTION: a prior full LATERAL/Q9-rebind attempt HUNG (M0072-0002) — BOUND the
+change and verify incrementally. Continue in the SAME worktree branch off its tip
+(d8d03c7b). When it lands, 002_nonesuch's gap-#6 preflight probe clears → run
+TestPort_PgAmcheck002Nonesuch; expect the NEXT gap (clog XidStatusFunc wiring for
+the clog-dependent verify_heapam tier, then AC-002..AC-005 CSV flip).
+
+=== CONTEXT (unchanged) ===
+Foreign gen-column WIP in the MAIN tree — do NOT commit engine code in the MAIN
+tree. ALL new engine work lands in worktrees off clean HEAD b8dd6403
+(worktree_isolation_escapes_foreign_wip_block). Merge of the worktree chains
+(M0110 amcheck-sql now at d8d03c7b + amcheck-pagedel + M0117 0001->0008) awaits a
+HUMAN clearing the foreign WIP. CAUTION: .ralph/fix_plan.md is churned by the
+driver (md5 changes mid-loop; line numbers shift) — fix_plan progress for this
+loop is recorded in the deferral ledger + this working_set instead.

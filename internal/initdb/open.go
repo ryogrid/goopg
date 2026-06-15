@@ -379,8 +379,8 @@ func Open(opts OpenOptions) (*Runtime, error) {
 	// Atomic B-tree split record (Landing 3a of M0002 — see
 	// docs/design/0002-0002-btree-concurrency.md). Same import-cycle
 	// dodge as logFPI.
-	logBtreeSplit := func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page) (storage.LSN, error) {
-		payload, err := wal.EncodeBtreeSplit(rel, leftBlk, rightBlk, leftPage, rightPage)
+	logBtreeSplit := func(rel storage.RelFileNode, leftBlk, rightBlk storage.BlockNumber, leftPage, rightPage storage.Page, sibBlk storage.BlockNumber, sibPage storage.Page) (storage.LSN, error) {
+		payload, err := wal.EncodeBtreeSplit(rel, leftBlk, rightBlk, leftPage, rightPage, sibBlk, sibPage)
 		if err != nil {
 			return 0, err
 		}
@@ -686,6 +686,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: enable pg_xact slru mirror: %w", err)
 	}
+	// M0117-0003: wire the persistent pg_subtrans SLRU so subtransaction
+	// parentage survives a restart (gap G5 read path). EnablePersistence opens
+	// the bootstrapped pg_subtrans/ directory (created by initdb) for write-through
+	// of every RegisterSubXid; RestoreFromSLRU reloads the previously-persisted
+	// parent links back into memory before any query can run; SetSubxactMap makes
+	// the Manager route all subxact registration/resolution through it. Unlike PG
+	// (which zeroes pg_subtrans on startup) goopg restores it for durable subxact
+	// resolution by an attached standby / 2PC / post-backend-exit readers.
+	subxactMap := mvcc.NewSubxactMap()
+	if err := subxactMap.EnablePersistence(filepath.Join(abs, "pg_subtrans")); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: enable pg_subtrans slru: %w", err)
+	}
+	if _, err := subxactMap.RestoreFromSLRU(); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: restore pg_subtrans: %w", err)
+	}
+	txnMgr.SetSubxactMap(subxactMap)
 	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker) error {
 		var payload []byte
 		switch kind {
@@ -991,6 +1013,33 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		}
 	}
 
+	// G1/G9: install the CLOG truncate WAL hook NOW — after replayCLogFromWAL
+	// has finished re-applying any CLOG_TRUNCATE records (which call
+	// TruncateCLOG with a nil logger so recovery does not recursively append
+	// to the WAL). From here on, every live TruncateCLOG (driven by the
+	// checkpointer's TruncateCLOGFn) emits a durable RecordKindClogTruncate so
+	// a standby learns the new valid xid and a subsequent crash recovery can
+	// re-apply the idempotent truncation. Mirrors PG's WriteTruncateXlogRec
+	// (postgres/src/backend/access/transam/clog.c:1029). Best-effort flush:
+	// the truncation is durable-ordered after the checkpoint marker, so the
+	// record need not block; the next checkpoint/flush persists it.
+	if walWriter != nil {
+		clog.SetTruncateLogger(func(oldestXid storage.TransactionID) error {
+			payload := wal.EncodeClogTruncate(oldestXid)
+			_, endLSN, err := walWriter.Append(payload)
+			if err != nil {
+				return err
+			}
+			if ferr := walWriter.FlushUpTo(endLSN); ferr != nil {
+				// Non-fatal: the record is in the WAL buffer and the next
+				// checkpoint flush will persist it; the physical clog removal
+				// already happened durable-ordered after a checkpoint.
+				slog.Default().Warn("clog-truncate WAL flush failed", "err", ferr)
+			}
+			return nil
+		})
+	}
+
 	// Replication-slot registry. The retention path on the
 	// checkpointer (wired below in cmd/goopg start once the GUC
 	// values are known) consults this to decide which WAL
@@ -1047,6 +1096,38 @@ func Open(opts OpenOptions) (*Runtime, error) {
 			return catalog.WithRelCacheInitLock(func() error {
 				return bootstrapRelcacheInitFiles(abs)
 			})
+		},
+		// G1: durable-ordered CLOG truncation. After each checkpoint is on
+		// disk, truncate pg_xact up to a conservative horizon and emit a
+		// CLOG_TRUNCATE WAL record (via the truncate logger installed on the
+		// clog above). The horizon is min(datfrozenxid, OldestXmin):
+		//   - datfrozenxid = min(relfrozenxid) across user tables — every XID
+		//     below it is frozen in every user heap, so its status is dead;
+		//   - OldestXmin guards against truncating status still consultable by
+		//     any in-progress or future snapshot.
+		// TruncateCLOG itself never drops the page containing the horizon, is
+		// idempotent, and is nil-safe on the logger. Conservative by design:
+		// when no user table has a relfrozenxid yet, datfrozenxid is 0 and we
+		// skip truncation entirely (truncate less when in doubt).
+		TruncateCLOGFn: func() error {
+			datFrozen := cat.DatFrozenXID()
+			if datFrozen < mvcc.FirstNormalTransactionID {
+				return nil // nothing frozen yet — never truncate
+			}
+			horizon := datFrozen
+			// horizon = min(datfrozenxid, OldestXmin) using wraparound-safe
+			// modular comparison (PG TransactionIdPrecedes), not plain `<`,
+			// which would mis-order XIDs across the 2^32 boundary and let
+			// truncation overrun the snapshot horizon. The `< FirstNormal`
+			// guards stay plain — they are TransactionIdIsNormal sentinel
+			// checks against the bootstrap constant, not horizon comparisons.
+			if ox := txnMgr.OldestXmin(); ox != 0 && storage.XIDPrecedes(ox, horizon) {
+				horizon = ox
+			}
+			if horizon < mvcc.FirstNormalTransactionID {
+				return nil
+			}
+			return clog.TruncateCLOG(horizon)
 		},
 	})
 

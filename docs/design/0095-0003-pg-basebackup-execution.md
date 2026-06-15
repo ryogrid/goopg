@@ -133,6 +133,8 @@ assertion updated from `T/D/C/Z` (4 frames) to `T/D/C/C/Z` (5 frames).
   binary; passes with `-X none --no-manifest --no-sync`; verifies extracted
   `backup_label`, `global/pg_control`, and `PG_VERSION`.
 - `TestPort_PgBasebackup010StreamWAL` — `-X stream` variant (M0102 walsender).
+- `TestPort_PgBasebackup010FetchWAL` (new, 2026-06-14) — `-X fetch` variant;
+  server appends the in-range WAL to the tar (see "WAL inclusion" below).
 - `TestPort_PgBasebackup010Manifest` (new, 2026-06-14) — runs pg_basebackup
   WITHOUT `--no-manifest` (default CRC32C manifest); independently recomputes
   every `Files[]` CRC32C and the SHA-256 `Manifest-Checksum`, then runs the
@@ -182,10 +184,83 @@ algorithm is rejected early with `FeatureNotSupported`. `force-encode`
 (`--manifest-force-encode`) and any non-UTF-8 path switch the entry to
 `"Encoded-Path": "<hex>"`, matching `AddFileToBackupManifest`.
 
+## WAL inclusion (`-X fetch`, 2026-06-14)
+
+`pg_basebackup -X fetch` (FETCH_WAL) sends the BASE_BACKUP `WAL` boolean
+option (`pg_basebackup.c:1905-1906`,
+`AppendPlainCommandOption(&buf, ..., "WAL")`) and, unlike `-X stream`, opens
+**no** second replication connection: the WAL needed to make the backup
+self-consistent must be appended to the data tar by the server. goopg now
+mirrors upstream's `includewal` block (`basebackup.c:408-560`):
+
+- **`WAL` option parsing** (`baseBackupOptions.IncludeWAL`) — accepted in both
+  the PG15+ option-list form (a bare `WAL` flag; `parseOptionBool` honours an
+  explicit `'f'`/`off`/`0` false) and the legacy keyword form.
+- **pg_wal is never walked.** The directory walk now ships `pg_wal` as an
+  *empty* directory plus the `pg_wal/archive_status` and `pg_wal/summaries`
+  empty subdirs PG emits (`sendDir():1385-1407`). Previously goopg shipped the
+  full `pg_wal` contents on *every* backup (a deviation); now WAL is only
+  present when the client asked for it — matching PG for `-X none`/`-X stream`
+  (the stream path rewrites `pg_wal` client-side anyway).
+- **In-range segment append** (`appendWALSegments`). When `IncludeWAL` is set,
+  after the data files + `global/pg_control` the server appends the segments in
+  the inclusive range `[XLByteToSeg(startptr), XLByteToPrevSeg(endptr)]` under
+  `pg_wal/`, oldest first, where `startptr` is the 0-based redo point and
+  `endptr` is the 0-based stop LSN (`WrittenLSN()-1`). goopg's on-disk WAL
+  names are already PG-compatible (`wal.formatSegmentName` →
+  `%08X%08X%08X`), so segment selection parses each name via
+  `wal.ParseXLogFileName` and compares segment numbers — no goopg→PG name
+  conversion is required. The upstream contiguity sanity check
+  (`basebackup.c:484-520`) is preserved: a missing segment inside the range is
+  a hard error naming the first absent file. Any `*.history` files are shipped
+  too (always, per upstream). Appended WAL is deliberately **not** recorded in
+  the manifest `Files[]` — PG tracks it via `WAL-Ranges` only.
+
+Verified by `TestPort_PgBasebackup010FetchWAL` (new): drives the real
+`pg_basebackup -X fetch` against a live goopg cluster and asserts the extracted
+`backup_label`/`global/pg_control`/`PG_VERSION` **plus** that the START WAL
+segment named in `backup_label` is present among the fetched `pg_wal/`
+segments — the defining invariant that the WAL came from the server tar (fetch
+streams nothing separately). `-X none`/`-X stream`/manifest tests still pass
+(no regression). Parser cases added to `TestBaseBackupParseOptions`.
+
+## pg_receivewal streaming tier (BB-020) + READ_REPLICATION_SLOT
+
+`020_pg_receivewal.pl` drives the `pg_receivewal` client, which streams WAL
+to a directory over the physical replication protocol. Previously only the
+CLI/option-validation tier was ported; the slot-management + streaming tier
+was deferred "pending replication protocol in goopg". That protocol now
+exists (the same physical walsender path `pg_basebackup -X stream` uses), so
+`TestPort_PgReceivewal020` now reproduces upstream's
+**create-slot → stream → drop** sequence end-to-end against a live cluster:
+
+1. `pg_receivewal --slot S --create-slot` → `CREATE_REPLICATION_SLOT S PHYSICAL`;
+   the slot is then asserted present in `pg_replication_slots` (`slot_type =
+   'physical'`).
+2. `pg_receivewal --slot S -D dir` streams WAL into `dir` while the test
+   generates WAL; the test asserts a 24-hex WAL segment (optionally
+   `.partial`, since pg_receivewal only renames on a segment boundary) lands
+   in `dir`, then kills the streamer.
+3. `pg_receivewal --slot S --drop-slot` → `DROP_REPLICATION_SLOT S`; the slot
+   is asserted gone.
+
+**Engine gap closed: `READ_REPLICATION_SLOT`.** Step 2 surfaced a real gap —
+`pg_receivewal`, when streaming *with* a slot, issues `READ_REPLICATION_SLOT
+<name>` (PG 15+, `walsender.c:ReadReplicationSlot`) before
+`START_REPLICATION` to learn the slot's restart LSN/timeline. goopg's
+walsender rejected it with a syntax error and pg_receivewal looped on
+reconnect. `internal/server/replication.go` now handles it
+(`replyReadReplicationSlot`): a single three-column row
+`(slot_type text, restart_lsn text, restart_tli int8)` — `('physical', 'X/X',
+1)` for an existing physical slot (NULL LSN/tli when no position is reserved),
+all-NULL for an absent/invalidated slot, and `feature_not_supported` for a
+logical slot — mirroring upstream verbatim. Covered by
+`TestReplicationReadReplicationSlot` (server unit test, the sibling of the
+CREATE/DROP slot tests). `restart_tli` is always 1 because goopg operates on a
+single timeline (see `0005-0001`).
+
 ## Out of scope (follow-ups)
 
-- `-X fetch` — `-X stream` landed (M0102 walsender); fetch still needs the
-  WAL-fetch path.
 - Server-side compression (gzip/lz4/zstd) — needs `bbsink_gzip/lz4/zstd`
   parity.
 - Tablespaces beyond the default — out of v0 scope (M0095-0003 011 stays

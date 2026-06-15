@@ -477,7 +477,7 @@ type TableFuncRef struct {
 	pos            int
 	Name           string
 	Args           []Expr
-	WithOrdinality bool     // WITH ORDINALITY appends a bigint ordinal column
+	WithOrdinality bool            // WITH ORDINALITY appends a bigint ordinal column
 	RowsFuncs      []RowsFromEntry // non-nil when ROWS FROM(...) syntax was used
 }
 
@@ -962,7 +962,7 @@ type CreateTableStmt struct {
 	// With carries the option list from `WITH (k = v, …)`. We keep it
 	// as a string→string map; the analyzer interprets known options
 	// (fillfactor, autovacuum_*, …) and rejects the rest.
-	With map[string]string
+	With     map[string]string
 	WithOIDS bool // true when WITH OIDS or WITH (oids[=true]) is present
 	// PartitionBy is non-nil when `PARTITION BY {LIST|RANGE|HASH} (col, …)` is present.
 	// M0096-0007.
@@ -1030,10 +1030,10 @@ func (s *CreateTableStmt) stmtNode() {}
 
 // PartitionByClause describes a PARTITION BY … clause.  M0096-0007.
 type PartitionByClause struct {
-	pos      int
-	Method   string   // "LIST", "RANGE", or "HASH"
-	KeyCols  []string // partition key column names; empty string for expression keys
-	KeyExprs []Expr   // expression-based partition keys; nil for plain column keys (M0097-0023)
+	pos        int
+	Method     string   // "LIST", "RANGE", or "HASH"
+	KeyCols    []string // partition key column names; empty string for expression keys
+	KeyExprs   []Expr   // expression-based partition keys; nil for plain column keys (M0097-0023)
 	OpClasses  []string // operator class per key col (empty string = default); M0097-0027
 	Collations []string // per-key collation name ("" = default, i.e. not shown); M0097-0023
 }
@@ -1069,6 +1069,10 @@ type PartitionOfClause struct {
 	// ColDefaults holds per-column DEFAULT expression overrides declared in the
 	// PARTITION OF column-override list, e.g. `(b DEFAULT 1)`. M0097-0023.
 	ColDefaults []PartitionColDefault
+	// ColGeneratedExprs holds GENERATED ALWAYS AS expression overrides declared
+	// in the PARTITION OF column-override list, e.g.
+	// `(d WITH OPTIONS GENERATED ALWAYS AS (a + b + 1000) STORED)`. M0100-0010.
+	ColGeneratedExprs []PartitionColGenerated
 	// DuplicateColumn is non-empty when a column name appears more than once
 	// in the PARTITION OF column override list (e.g. `(b NOT NULL, b DEFAULT 1, ...)`).
 	// The executor returns an error when this is set.
@@ -1080,6 +1084,13 @@ type PartitionOfClause struct {
 type PartitionColDefault struct {
 	ColName string
 	Expr    Expr
+}
+
+// PartitionColGenerated holds a GENERATED ALWAYS AS expression override for a
+// single column in a PARTITION OF column-override list. M0100-0010.
+type PartitionColGenerated struct {
+	ColName string
+	Expr    string // raw SQL expression text (without wrapping parens)
 }
 
 // PartitionCheckConstraint is a named CHECK constraint declared in a PARTITION
@@ -1153,6 +1164,25 @@ type CreateSequenceStmt struct {
 
 func (s *CreateSequenceStmt) Pos() int  { return s.pos }
 func (s *CreateSequenceStmt) stmtNode() {}
+
+// CreateExtensionStmt — `CREATE EXTENSION [IF NOT EXISTS] name
+//
+//	[WITH] [SCHEMA schema_name] [VERSION version] [CASCADE]`.
+//
+// The executor inserts a pg_extension catalog row. goopg supports only the
+// built-in extensions whose SQL surface it implements (e.g. amcheck); unknown
+// names error like PG's missing control file. M0110-0003 (amcheck SQL surface).
+type CreateExtensionStmt struct {
+	pos         int
+	Name        string
+	IfNotExists bool
+	Schema      string // optional SCHEMA clause; "" → default (public)
+	Version     string // optional VERSION clause; "" → extension default
+	Cascade     bool
+}
+
+func (s *CreateExtensionStmt) Pos() int  { return s.pos }
+func (s *CreateExtensionStmt) stmtNode() {}
 
 // AlterSequenceStmt — `ALTER SEQUENCE [IF EXISTS] name [option …]`. M0097-0009.
 type AlterSequenceStmt struct {
@@ -1747,12 +1777,12 @@ type CreateFunctionStmt struct {
 // AlterFunctionStmt — `ALTER FUNCTION name([argtypes]) attribute ...`
 // Updates mutable function/procedure attributes (volatile, security, leakproof, strict).
 type AlterFunctionStmt struct {
-	pos             int
-	Name            ObjectName
-	Args            []FunctionArg // nil means no arg list given (applies to all overloads)
-	IsProcedure     bool
-	IsRoutine       bool   // ALTER ROUTINE: applies to both functions and procedures (M0097-0022)
-	RenameTo        string // RENAME TO new_name (M0097-0022)
+	pos         int
+	Name        ObjectName
+	Args        []FunctionArg // nil means no arg list given (applies to all overloads)
+	IsProcedure bool
+	IsRoutine   bool   // ALTER ROUTINE: applies to both functions and procedures (M0097-0022)
+	RenameTo    string // RENAME TO new_name (M0097-0022)
 	// Updated attributes (nil = not changed)
 	Volatile        *string // "v", "s", "i"
 	SecurityDefiner *bool
@@ -1829,8 +1859,8 @@ type DropProcedureStmt struct {
 	pos      int
 	IfExists bool
 	Name     ObjectName
-	Names    []ObjectName   // additional names for multi-name DROP (DROP PROCEDURE a, b)
-	Args     []FunctionArg  // nil when no parenthesised arg list was given
+	Names    []ObjectName  // additional names for multi-name DROP (DROP PROCEDURE a, b)
+	Args     []FunctionArg // nil when no parenthesised arg list was given
 	Behavior DropBehavior
 	ObjKind  string // "procedure" or "routine" (default "procedure")
 }
@@ -1891,12 +1921,12 @@ func (s *DropTypeStmt) stmtNode() {}
 
 // CreateDomainStmt — CREATE DOMAIN name [AS] base_type [constraints]. M0097-0017.
 type CreateDomainStmt struct {
-	pos            int
-	Name           string
-	Schema         string
-	BaseType       string   // base type name
-	NotNull        bool
-	CheckInValues  []string // allowed values from CHECK (VALUE IN ('a','b','c')), M0097-domain-check
+	pos           int
+	Name          string
+	Schema        string
+	BaseType      string // base type name
+	NotNull       bool
+	CheckInValues []string // allowed values from CHECK (VALUE IN ('a','b','c')), M0097-domain-check
 }
 
 func (s *CreateDomainStmt) Pos() int  { return s.pos }

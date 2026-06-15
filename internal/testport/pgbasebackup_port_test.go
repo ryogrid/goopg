@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/goopg/goopg/internal/testutil/cluster"
 )
@@ -294,6 +295,130 @@ func TestPort_PgBasebackup010StreamWAL(t *testing.T) {
 		}
 		t.Errorf("expected >=1 streamed WAL segment in pg_wal/, found none; entries=%v", names)
 	}
+}
+
+// TestPort_PgBasebackup010FetchWAL exercises the upstream "-X fetch"
+// (FETCH_WAL) sub-case of 010_pg_basebackup.pl. Unlike -X stream, fetch
+// opens NO second replication connection: pg_basebackup sends the
+// BASE_BACKUP `WAL` boolean option (pg_basebackup.c:1905-1906) and the
+// server must append the in-range pg_wal segments to the backup tar
+// itself (basebackup.c:408-560 includewal block). The defining property
+// is therefore that the extracted pg_wal/ holds the WAL covering the
+// backup's start LSN even though nothing streamed it — it can only have
+// come from the server-side tar.
+func TestPort_PgBasebackup010FetchWAL(t *testing.T) {
+	bin := clientToolBin(t, "pg_basebackup")
+	if bin == "" {
+		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
+	}
+	c := newCluster(t, "pgbasebackup010_fetch")
+	if err := c.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	// Seed a small table so the backup carries real heap pages and the
+	// pre-backup checkpoint has WAL to cover.
+	if _, err := c.Query(context.Background(),
+		`CREATE TABLE pgbb_fetch_seed (a int)`); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := c.Query(context.Background(),
+		`INSERT INTO pgbb_fetch_seed VALUES (1), (2), (3)`); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	host, port, err := net.SplitHostPort(c.ListenAddr())
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "backup")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	cmd := exec.Command(bin,
+		"-h", host,
+		"-p", port,
+		"-U", "postgres",
+		"-D", out,
+		// -X fetch sets the BASE_BACKUP WAL option; the WAL must arrive
+		// inside the data tar over the single connection — no walsender.
+		"-X", "fetch",
+		"--no-sync",
+		"--no-manifest",
+		"-l", "TestPort_PgBasebackup010FetchWAL")
+	cmd.Env = append(os.Environ(), "PGPASSWORD=")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("pg_basebackup -X fetch failed: %v\ncombined output:\n%s", err, string(output))
+	}
+
+	for _, rel := range []string{"backup_label", "global/pg_control", "PG_VERSION"} {
+		if _, err := os.Stat(filepath.Join(out, rel)); err != nil {
+			t.Errorf("missing %s in extracted backup: %v", rel, err)
+		}
+	}
+
+	// The extracted pg_wal/ must hold at least one 24-char WAL segment that
+	// the server placed in the tar (fetch streams nothing separately).
+	walEntries, err := os.ReadDir(filepath.Join(out, "pg_wal"))
+	if err != nil {
+		t.Fatalf("read pg_wal in extracted backup: %v", err)
+	}
+	segNames := map[string]struct{}{}
+	for _, e := range walEntries {
+		if !e.IsDir() && len(e.Name()) == 24 {
+			segNames[e.Name()] = struct{}{}
+		}
+	}
+	if len(segNames) == 0 {
+		var names []string
+		for _, e := range walEntries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("expected >=1 fetched WAL segment in pg_wal/, found none; entries=%v", names)
+	}
+
+	// Stronger check: the START WAL segment named in backup_label must be
+	// among the fetched segments, proving the includewal range covers the
+	// backup's consistency point.
+	labelBytes, err := os.ReadFile(filepath.Join(out, "backup_label"))
+	if err != nil {
+		t.Fatalf("read backup_label: %v", err)
+	}
+	startSeg := parseBackupLabelStartSegment(t, string(labelBytes))
+	if _, ok := segNames[startSeg]; !ok {
+		var names []string
+		for n := range segNames {
+			names = append(names, n)
+		}
+		t.Errorf("START WAL segment %s from backup_label not present among fetched WAL %v", startSeg, names)
+	}
+}
+
+// parseBackupLabelStartSegment extracts the WAL segment file name from the
+// "START WAL LOCATION: X/Y (file ZZZZ...)" line of a backup_label.
+func parseBackupLabelStartSegment(t *testing.T, label string) string {
+	t.Helper()
+	for _, line := range strings.Split(label, "\n") {
+		if !strings.HasPrefix(line, "START WAL LOCATION:") {
+			continue
+		}
+		_, after, ok := strings.Cut(line, "(file ")
+		if !ok {
+			break
+		}
+		seg, _, ok := strings.Cut(after, ")")
+		if !ok {
+			break
+		}
+		return strings.TrimSpace(seg)
+	}
+	t.Fatalf("could not find START WAL LOCATION file in backup_label:\n%s", label)
+	return ""
 }
 
 // TestPort_PgBasebackup010Manifest exercises the upstream backup-manifest
@@ -601,12 +726,28 @@ func TestPort_PgBasebackup010ManifestChecksums(t *testing.T) {
 // TestPort_PgBasebackup011InPlaceTablespace ports
 // postgres/src/bin/pg_basebackup/t/011_in_place_tablespace.pl.
 //
-// Upstream tests: backup of a cluster containing an in-place tablespace.
-// All sub-cases require a running primary with pg_basebackup physical streaming.
+// Upstream test: create an in-place tablespace
+// (`SET allow_in_place_tablespaces = on; CREATE TABLESPACE inplace LOCATION ''`),
+// back the cluster up in tar format with --wal-method none, and assert the
+// backup contains base.tar plus exactly one per-tablespace `<oid>.tar`.
 //
-// Deferred entirely: in-place tablespace backup requires physical streaming
-// replication (--wal-method none still needs BASE_BACKUP protocol) which is
-// not yet implemented in goopg v0.
+// NOTE (loop #28, 2026-06-14): the prior skip note here was STALE — it blamed
+// the BASE_BACKUP physical-streaming protocol, but that protocol is fully
+// implemented and exercised by TestPort_PgBasebackup010StreamWAL / 010FetchWAL
+// (-X stream / -X fetch). The REAL remaining blocker is the in-place
+// tablespace feature, which goopg does not have:
+//   1. the `allow_in_place_tablespaces` GUC (absent),
+//   2. `CREATE TABLESPACE <name> LOCATION ''` DDL — goopg parses only the
+//      TABLESPACE *clause* (and ignores it); there is no CREATE TABLESPACE
+//      statement, no pg_tablespace row insertion, and no in-place
+//      pg_tblspc/<oid> directory creation,
+//   3. BASE_BACKUP emitting each non-default tablespace as a separate
+//      `<oid>.tar` member (internal/server/basebackup.go — uncontaminated).
+//
+// Items (1)+(3) are uncontaminated; item (2) edits the parser/executor/catalog
+// packages, so the feature cannot land until those are clean. Resume point:
+// add the GUC + CREATE TABLESPACE DDL + per-tablespace tar emission, then
+// enable this test.
 func TestPort_PgBasebackup011InPlaceTablespace(t *testing.T) {
 	// upstream: postgres/src/bin/pg_basebackup/t/011_in_place_tablespace.pl
 	bin := clientToolBin(t, "pg_basebackup")
@@ -614,10 +755,12 @@ func TestPort_PgBasebackup011InPlaceTablespace(t *testing.T) {
 		t.Skip("pg_basebackup not in PATH or postgres/local_install/bin")
 	}
 
-	// All sub-cases require BASE_BACKUP physical streaming.
-	// Deferred until goopg implements pg_basebackup-compatible replication protocol.
-	t.Skip("in-place tablespace backup requires physical streaming replication " +
-		"(BASE_BACKUP protocol) not yet implemented in goopg v0")
+	// BASE_BACKUP physical streaming is implemented (see 010StreamWAL); the
+	// real gap is the in-place tablespace feature (allow_in_place_tablespaces
+	// GUC + CREATE TABLESPACE ... LOCATION '' DDL + per-tablespace <oid>.tar).
+	t.Skip("in-place tablespace backup requires CREATE TABLESPACE DDL + " +
+		"allow_in_place_tablespaces GUC + per-tablespace tar emission " +
+		"(not BASE_BACKUP, which goopg already implements)")
 }
 
 // TestPort_PgReceivewal020 ports postgres/src/bin/pg_basebackup/t/020_pg_receivewal.pl.
@@ -708,11 +851,143 @@ func TestPort_PgReceivewal020(t *testing.T) {
 		t.Fatalf("expected 'none' in --compress=none:1 error; got %q", res.Stdout+res.Stderr)
 	}
 
-	// WAL streaming, slot creation/drop, and compression sub-cases deferred:
-	// goopg v0 does not implement the pg_receivewal streaming replication protocol.
-	// Remove this Skip when goopg supports START_REPLICATION / WAL receiver protocol.
-	t.Skip("pg_receivewal streaming and slot management require replication protocol " +
-		"not yet implemented in goopg v0")
+	// ----------------------------------------------------------------------
+	// Slot-management + WAL-streaming execution tier.
+	//
+	// Previously deferred ("goopg v0 does not implement the pg_receivewal
+	// streaming replication protocol"). goopg now exposes the full physical
+	// walsender path pg_receivewal drives — IDENTIFY_SYSTEM,
+	// CREATE_REPLICATION_SLOT name PHYSICAL [RESERVE_WAL], START_REPLICATION,
+	// DROP_REPLICATION_SLOT, and the pg_replication_slots view
+	// (internal/server/replication.go) — the same protocol the working
+	// TestPort_PgBasebackup010StreamWAL `-X stream` test exercises. This tier
+	// reproduces upstream 020's slot create -> stream -> drop sequence against
+	// a live goopg cluster.
+	c := newCluster(t, "pgreceivewal020")
+	if err := c.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if err := c.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	host, port, err := net.SplitHostPort(c.ListenAddr())
+	if err != nil {
+		t.Fatalf("split host/port: %v", err)
+	}
+	connArgs := []string{"-h", host, "-p", port, "-U", "postgres"}
+	const slotName = "pgrecvwal_test"
+
+	// Upstream: command_ok([pg_receivewal --slot test --create-slot]) creating
+	// a replication slot. pg_receivewal sends CREATE_REPLICATION_SLOT ... PHYSICAL.
+	createArgs := append([]string{"--slot=" + slotName, "--create-slot", "--if-not-exists",
+		"--directory=" + streamDir}, connArgs...)
+	res = runTool(t, bin, createArgs...)
+	if res.ExitCode != 0 {
+		t.Fatalf("--create-slot exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+	}
+
+	// Upstream: $primary->slot($slot_name) — the slot is now visible in
+	// pg_replication_slots as a physical slot.
+	rows, err := c.Query(context.Background(),
+		"SELECT slot_type FROM pg_replication_slots WHERE slot_name = '"+slotName+"'")
+	if err != nil {
+		t.Fatalf("query pg_replication_slots: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row for slot %q in pg_replication_slots, got %d (%v)", slotName, len(rows), rows)
+	}
+	if got := rows[0][0]; got != "physical" {
+		t.Errorf("slot_type = %q, want %q", got, "physical")
+	}
+
+	// Stream WAL into a fresh directory via the slot. pg_receivewal runs until
+	// killed; it opens the current segment as <name>.partial as soon as it
+	// starts receiving WAL.
+	recvDir := t.TempDir()
+	streamArgs := append([]string{"--slot=" + slotName, "--directory=" + recvDir, "--no-sync", "--verbose"}, connArgs...)
+	stream := exec.Command(bin, streamArgs...)
+	stream.Env = append(os.Environ(), "PGPASSWORD=")
+	var streamErr bytes.Buffer
+	stream.Stdout = &streamErr
+	stream.Stderr = &streamErr
+	if err := stream.Start(); err != nil {
+		t.Fatalf("start pg_receivewal stream: %v", err)
+	}
+	streamKilled := false
+	killStream := func() {
+		if !streamKilled {
+			_ = stream.Process.Kill()
+			_ = stream.Wait()
+			streamKilled = true
+		}
+	}
+	defer killStream()
+
+	// Generate WAL while polling for a streamed segment to appear. The walfile
+	// is created once pg_receivewal receives the first records. (lib/pq's
+	// extended protocol rejects multi-statement strings, so each statement is
+	// issued separately.)
+	if _, err := c.Query(context.Background(), "CREATE TABLE IF NOT EXISTS pgrecvwal_seed (a int)"); err != nil {
+		t.Fatalf("create seed table: %v", err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	var streamed string
+	for time.Now().Before(deadline) {
+		_, _ = c.Query(context.Background(), "INSERT INTO pgrecvwal_seed VALUES (1),(2),(3)")
+		entries, _ := os.ReadDir(recvDir)
+		for _, e := range entries {
+			name := e.Name()
+			base := strings.TrimSuffix(name, ".partial")
+			// WAL segment file names are 24 hex chars (TLI + logid + segno).
+			if !e.IsDir() && len(base) == 24 && isHex(base) {
+				streamed = name
+				break
+			}
+		}
+		if streamed != "" {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if streamed == "" {
+		entries, _ := os.ReadDir(recvDir)
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		killStream()
+		t.Fatalf("pg_receivewal streamed no WAL segment within timeout; dir=%v\npg_receivewal output:\n%s",
+			names, streamErr.String())
+	}
+	killStream()
+
+	// Upstream: command_ok([pg_receivewal --slot test --drop-slot]) dropping
+	// the replication slot via DROP_REPLICATION_SLOT.
+	dropArgs := append([]string{"--slot=" + slotName, "--drop-slot"}, connArgs...)
+	res = runTool(t, bin, dropArgs...)
+	if res.ExitCode != 0 {
+		t.Fatalf("--drop-slot exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	rows, err = c.Query(context.Background(),
+		"SELECT count(*) FROM pg_replication_slots WHERE slot_name = '"+slotName+"'")
+	if err != nil {
+		t.Fatalf("query pg_replication_slots after drop: %v", err)
+	}
+	if len(rows) != 1 || rows[0][0] != "0" {
+		t.Errorf("slot %q still present after --drop-slot: %v", slotName, rows)
+	}
+}
+
+// isHex reports whether s consists solely of hexadecimal digits.
+func isHex(s string) bool {
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 // TestPort_PgRecvlogical030 ports postgres/src/bin/pg_basebackup/t/030_pg_recvlogical.pl.

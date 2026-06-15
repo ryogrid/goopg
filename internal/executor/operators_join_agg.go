@@ -11,7 +11,17 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage"
 )
+
+// joinRowCTID carries the heap tuple identifier captured for one left-side row
+// during the eager nested-loop drain. Used by lockRowsOp when the scan has
+// been closed before drainAndStamp runs (M0100-0010).
+type joinRowCTID struct {
+	rel     storage.RelFileNode
+	ptr     storage.ItemPointer
+	hasCTID bool
+}
 
 // joinOp is a join operator that dispatches on plan.Algo.
 // Hash joins use lazy materialization (M0036): joined rows are
@@ -60,6 +70,11 @@ type joinOp struct {
 	lazyProbeSlot     *MaterializedSlot
 	lazyVirtualOut    *VirtualSlot
 	lazyOuterOnlySlot *MaterializedSlot
+
+	// M0100-0010: ctid captured per left-row during eager NL drain so
+	// lockRowsOp can stamp tuple locks after the scan is closed.
+	leftCTIDs     []joinRowCTID
+	rowSourceLeft []int
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -103,15 +118,16 @@ func (o *joinOp) Open(ctx *Context) error {
 		return err
 	}
 
-	leftRows, err := drainRowsCtx(o.left, ctx)
+	leftScanLeaf := findScanLeaf(o.left)
+	leftRows, leftCTIDs, err := drainRowsCtxCTID(o.left, ctx, leftScanLeaf)
 	if err != nil {
 		return err
 	}
+	o.leftCTIDs = leftCTIDs
 	rightRows, err := drainRowsCtx(o.right, ctx)
 	if err != nil {
 		return err
 	}
-
 
 	leftWidth := len(o.left.Schema())
 	rightWidth := len(o.right.Schema())
@@ -299,9 +315,15 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 			matched = true
 			rightMatched[j] = true
 			o.rows = append(o.rows, joined)
+			if o.leftCTIDs != nil {
+				o.rowSourceLeft = append(o.rowSourceLeft, i)
+			}
 		}
 		if !matched && (o.plan.Type == planner.JoinTypeLeft || o.plan.Type == planner.JoinTypeFull) {
 			o.rows = append(o.rows, concatRows(l, nullRight))
+			if o.leftCTIDs != nil {
+				o.rowSourceLeft = append(o.rowSourceLeft, i)
+			}
 		}
 	}
 
@@ -331,6 +353,9 @@ func (o *joinOp) runNestedLoop(leftRows, rightRows []Row, leftWidth, rightWidth 
 				}
 			}
 			o.rows = append(o.rows, merged)
+			if o.leftCTIDs != nil {
+				o.rowSourceLeft = append(o.rowSourceLeft, -1) // no left source
+			}
 		}
 	}
 	return nil
@@ -715,7 +740,23 @@ func (o *joinOp) Next() (TupleSlot, error) {
 		return nil, EOF
 	}
 	row := o.rows[o.idx]
+	idx := o.idx
 	o.idx++
+	// M0100-0010: propagate left-side ctid through the join so lockRowsOp
+	// can stamp tuple locks even after the scan was eagerly drained/closed.
+	if o.leftCTIDs != nil && idx < len(o.rowSourceLeft) {
+		li := o.rowSourceLeft[idx]
+		if li >= 0 && li < len(o.leftCTIDs) {
+			lc := o.leftCTIDs[li]
+			if lc.hasCTID {
+				ms := SlotFromRow(o.Schema(), row)
+				ms.hasCTID = true
+				ms.ctidBlock = uint32(lc.ptr.Block)
+				ms.ctidOff = lc.ptr.Offset
+				return ms, nil
+			}
+		}
+	}
 	return asSlot(o.Schema(), row), nil
 }
 
@@ -881,6 +922,8 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 
 func (o *joinOp) Close() error {
 	o.rows = nil
+	o.leftCTIDs = nil
+	o.rowSourceLeft = nil
 	o.lazyHash = nil
 	o.lazyProbe = nil
 	o.lazyRow = nil
@@ -2694,6 +2737,49 @@ func drainRowsCtx(op Operator, ctx *Context) ([]Row, error) {
 			copy(dup, row)
 		}
 		rows = append(rows, dup)
+		n++
+	}
+}
+
+// drainRowsCtxCTID drains op like drainRowsCtx and additionally captures the
+// currentTID from scanLeaf (if non-nil) after each yielded slot, returning a
+// parallel ctid slice. Callers must call op.Open before this and must not call
+// op.Close after (the drain loop reaches EOF naturally). Used by eager NL join
+// to preserve left-side heap ctids through the drain so lockRowsOp can stamp
+// tuple locks after the scan has been closed (M0100-0010).
+func drainRowsCtxCTID(op Operator, ctx *Context, scanLeaf currentTIDProvider) ([]Row, []joinRowCTID, error) {
+	rows := make([]Row, 0)
+	var ctids []joinRowCTID
+	if scanLeaf != nil {
+		ctids = make([]joinRowCTID, 0)
+	}
+	n := 0
+	for {
+		if ctx != nil && ctx.Ctx != nil && n%1000 == 0 {
+			if err := ctx.Ctx.Err(); err != nil {
+				return nil, nil, &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+			}
+		}
+		slot, err := op.Next()
+		if err == EOF {
+			return rows, ctids, nil
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+		row := slotRow(slot)
+		var dup Row
+		if rowHasArena(row) {
+			dup = cloneRowOwned(row)
+		} else {
+			dup = acquireRow(len(row))
+			copy(dup, row)
+		}
+		rows = append(rows, dup)
+		if scanLeaf != nil {
+			rel, ptr, ok := scanLeaf.currentTID()
+			ctids = append(ctids, joinRowCTID{rel: rel, ptr: ptr, hasCTID: ok})
+		}
 		n++
 	}
 }

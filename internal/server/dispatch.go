@@ -589,6 +589,9 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// a CTE named "q" in query 1 must not bleed into query 2 (they may
 		// produce different rows). CTEWriteFence is cleared for the same reason.
 		ectx.CTEWriteFence = nil
+		ectx.CTENewToOld = nil
+		ectx.CTESelfModifiedErrors = nil
+		ectx.CTESelfModErr = nil
 		ectx.InDMLCTE = false
 		ectx.CTERowCache = nil
 
@@ -1815,6 +1818,8 @@ func ddlTag(stmt parser.Stmt) string {
 		return "CREATE DOMAIN"
 	case *parser.DropDomainStmt:
 		return "DROP DOMAIN"
+	case *parser.CreateExtensionStmt:
+		return "CREATE EXTENSION"
 	}
 	// CompatNoopStmt carries its own tag. M0097-0016.
 	if ns, ok := stmt.(*parser.CompatNoopStmt); ok && ns.Tag != "" {

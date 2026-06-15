@@ -77,7 +77,10 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 			}
 			schema := body.Output()
 			if len(cte.Columns) > 0 {
-				if len(cte.Columns) != len(schema) {
+				// PG (parse_cte.c analyzeCTE) allows an alias list shorter than
+				// the inner query's output — trailing columns keep their query
+				// names; only over-aliasing is the 42P10 error.
+				if len(cte.Columns) > len(schema) {
 					restore()
 					return nil, nil, &PlanError{
 						Pos:     cte.Pos(),
@@ -87,7 +90,11 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 				}
 				renamed := make(Schema, len(schema))
 				for i, c := range schema {
-					renamed[i] = SchemaColumn{Name: cte.Columns[i], Type: c.Type}
+					name := c.Name
+					if i < len(cte.Columns) {
+						name = cte.Columns[i]
+					}
+					renamed[i] = SchemaColumn{Name: name, Type: c.Type}
 				}
 				schema = renamed
 			}
@@ -163,7 +170,10 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 		}
 		schema := body.Output()
 		if len(cte.Columns) > 0 {
-			if len(cte.Columns) != len(schema) {
+			// PG (parse_cte.c analyzeCTE) allows an alias list shorter than the
+			// inner query's output — trailing columns keep their query names;
+			// only over-aliasing is the 42P10 error.
+			if len(cte.Columns) > len(schema) {
 				restore()
 				return nil, nil, &PlanError{
 					Pos:     cte.Pos(),
@@ -173,7 +183,11 @@ func preplanWithClause(with *parser.WithClause, cat catalog.Catalog) (restore fu
 			}
 			renamed := make(Schema, len(schema))
 			for i, c := range schema {
-				renamed[i] = SchemaColumn{Name: cte.Columns[i], Type: c.Type}
+				name := c.Name
+				if i < len(cte.Columns) {
+					name = cte.Columns[i]
+				}
+				renamed[i] = SchemaColumn{Name: name, Type: c.Type}
 			}
 			schema = renamed
 		}
@@ -208,7 +222,9 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
 		}
 		schema := body.Output()
 		if len(cte.Columns) > 0 {
-			if len(cte.Columns) != len(schema) {
+			// Under-aliasing is allowed (PG parse_cte.c); only over-aliasing
+			// is the 42P10 error. Trailing columns keep their query names.
+			if len(cte.Columns) > len(schema) {
 				return nil, &PlanError{
 					Pos:     cte.Pos(),
 					Code:    "42P10",
@@ -217,7 +233,11 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
 			}
 			renamed := make(Schema, len(schema))
 			for i, c := range schema {
-				renamed[i] = SchemaColumn{Name: cte.Columns[i], Type: c.Type}
+				name := c.Name
+				if i < len(cte.Columns) {
+					name = cte.Columns[i]
+				}
+				renamed[i] = SchemaColumn{Name: name, Type: c.Type}
 			}
 			schema = renamed
 		}
@@ -283,7 +303,9 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
 	// `WITH RECURSIVE t(n) AS (SELECT 1 UNION ALL ...)`. Mirror the renaming
 	// that the non-recursive CTE path does at lines 165-178.
 	if len(cte.Columns) > 0 {
-		if len(cte.Columns) != len(anchorSchema) {
+		// Under-aliasing is allowed (PG parse_cte.c); only over-aliasing is the
+		// 42P10 error. Trailing columns keep their query-derived names.
+		if len(cte.Columns) > len(anchorSchema) {
 			if hadEntry {
 				planCTEs[key] = savedEntry
 			}
@@ -295,7 +317,11 @@ func planRecursiveCTE(cte *parser.CommonTableExpr, cat catalog.Catalog) (Node, e
 		}
 		renamed := make(Schema, len(anchorSchema))
 		for i, c := range anchorSchema {
-			renamed[i] = SchemaColumn{Name: cte.Columns[i], Type: c.Type}
+			name := c.Name
+			if i < len(cte.Columns) {
+				name = cte.Columns[i]
+			}
+			renamed[i] = SchemaColumn{Name: name, Type: c.Type}
 		}
 		anchorSchema = renamed
 	}
@@ -482,7 +508,6 @@ func (w *recRefWalker) walkFromExpr(fexpr parser.FromExpr, inSub, inExceptRight 
 		w.walkRangeVar(j.Right, inSub, inExceptRight, isOuter)
 	}
 }
-
 
 // dmlCTEPlan holds a single data-modifying CTE plan and its output schema.
 type dmlCTEPlan struct {

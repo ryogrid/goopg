@@ -6,16 +6,21 @@ import (
 )
 
 // TestNewInMemorySeedsPostgresDatabase pins the M0054-0001 invariant
-// that a fresh catalog reports the conventional `postgres` bootstrap
-// database. Connection-startup probes
-// (`SELECT 1 FROM pg_database WHERE datname='postgres'`) depend on it.
+// that a fresh catalog reports the three conventional bootstrap
+// databases (`postgres`, `template1`, `template0`), mirroring initdb's
+// pg_database seed. Connection-startup probes
+// (`SELECT 1 FROM pg_database WHERE datname='postgres'`) and pg_amcheck's
+// database-list resolution (M0110-0003 AC-002) depend on them.
 func TestNewInMemorySeedsPostgresDatabase(t *testing.T) {
 	c := NewInMemory()
-	if !c.HasDatabase("postgres") {
-		t.Error("fresh catalog should have postgres in the database registry")
+	for _, want := range []string{"postgres", "template1", "template0"} {
+		if !c.HasDatabase(want) {
+			t.Errorf("fresh catalog should have %q in the database registry", want)
+		}
 	}
-	if got := c.ListDatabases(); len(got) != 1 || got[0] != "postgres" {
-		t.Errorf("ListDatabases = %v, want [postgres]", got)
+	got := c.ListDatabases()
+	if len(got) != 3 {
+		t.Errorf("ListDatabases = %v, want the 3 bootstrap databases", got)
 	}
 }
 

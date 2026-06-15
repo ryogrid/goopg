@@ -52,6 +52,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newPgGetPublicationTablesOp(p)), nil
 	case *planner.PgAvailableWalSummaries:
 		return maybeInstrument(p, newPgAvailableWalSummariesOp(p)), nil
+	case *planner.VerifyHeapam:
+		return maybeInstrument(p, newVerifyHeapamOp(p)), nil
 	case *planner.ProjectSet:
 		child, err := Build(p.Child)
 		if err != nil {

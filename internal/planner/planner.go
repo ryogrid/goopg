@@ -147,6 +147,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		*parser.CreateDomainStmt, *parser.DropDomainStmt,
 		*parser.CreateAggregateStmt,
 		*parser.AlterAggregateRenameStmt,
+		*parser.CreateExtensionStmt,
 		*parser.CreateOpClassStmt:
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
@@ -256,7 +257,7 @@ type resolveContext struct {
 	// walking through a lateralSibling context, so OuterColumnRef
 	// nodes get the correct level for the executor's OuterRows stack.
 	// M0097-0065.
-	lateralSibling   bool
+	lateralSibling bool
 	// allowMergeAction enables resolution of merge_action() FuncCall to
 	// MergeActionExpr in MERGE RETURNING context. M0100-0007.
 	allowMergeAction bool
@@ -1023,8 +1024,8 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	// Decision: try to resolve each ORDER BY key against the PS output schema first.
 	// If ALL keys resolve in PS output → sort after PS.
 	// If ANY key only resolves in child schema → sort before PS (pre-sort).
-	var selectSrfPending *ProjectSet  // set when SRF is detected; applied after sort
-	var selectSrfPreSort bool         // true → sort BEFORE PS
+	var selectSrfPending *ProjectSet // set when SRF is detected; applied after sort
+	var selectSrfPreSort bool        // true → sort BEFORE PS
 	// Also run SRF detection when agg != nil: an aggregate result row can be
 	// expanded by generate_series/unnest in the same SELECT list. M0097-0035.
 	if ps == nil && !needsWindowStage(s) {
@@ -1476,7 +1477,7 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 		policy := lockWaitPolicyFromParser(lc.WaitPolicy)
 		if len(lc.Targets) == 0 {
 			for _, b := range ctx.bindings {
-				out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy})
+				out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy, ColOffset: b.offset})
 			}
 			continue
 		}
@@ -1486,7 +1487,7 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 				return nil, &PlanError{Pos: lc.Pos(), Code: "42P01",
 					Message: fmt.Sprintf("relation %q in FOR UPDATE/SHARE clause not found in FROM clause", name)}
 			}
-			out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy})
+			out = append(out, LockedRel{Table: b.table, Alias: b.alias, Strength: strength, WaitPolicy: policy, ColOffset: b.offset})
 		}
 	}
 	return out, nil
@@ -1965,8 +1966,8 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 		defer viewPlanDepth.Add(-1)
 		if depth > maxViewPlanDepth {
 			return nil, rangeBinding{}, &PlanError{
-				Pos:  rv.Pos(),
-				Code: "42P10",
+				Pos:     rv.Pos(),
+				Code:    "42P10",
 				Message: fmt.Sprintf("view %q has a circular definition", tbl.QualifiedName()),
 			}
 		}
@@ -2560,7 +2561,19 @@ func planSubqueryRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int
 		}
 		inner, err = planSelectWithParent(rv.Subquery, cat, &latCtxWithCat)
 	} else {
-		inner, err = Plan(rv.Subquery, cat)
+		// Non-correlated derived table. Plan via planSelectWithParent
+		// (nil outer scope) rather than Plan(): the outer statement's
+		// Plan() already analyzed the whole tree — including this
+		// subquery — under the correct scope (with the WITH-list CTE
+		// names visible). Calling Plan() here would re-run the analyzer
+		// on the subquery STANDALONE, which cannot see the enclosing
+		// WITH scope and rejects a FROM-clause CTE reference with
+		// "relation \"x\" does not exist" (e.g.
+		//   WITH x(a) AS (SELECT 1) SELECT a FROM (SELECT a FROM x) s).
+		// planSelectWithParent skips the analyzer re-pass and inherits
+		// the package-level planCTEs map so the CTE substitutes in.
+		// Mirrors the lateral branch above. M0110-0003 AC-002 gap #4.
+		inner, err = planSelectWithParent(rv.Subquery, cat, nil)
 	}
 	if err != nil {
 		// LATERAL subquery fallback: when the inner subquery references outer
@@ -2984,6 +2997,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	}
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
+	}
+	if strings.EqualFold(tf.Name, "verify_heapam") {
+		return planVerifyHeapam(rv, sourceIdx)
 	}
 	if strings.EqualFold(tf.Name, "pg_partition_tree") || strings.EqualFold(tf.Name, "pg_partition_ancestors") {
 		// pg_partition_tree / pg_partition_ancestors — multi-row SRF that traverses
@@ -3648,6 +3664,60 @@ func planPgAvailableWalSummaries(rv parser.RangeVar, sourceIdx int16) (Node, ran
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgAvailableWalSummaries{pos: tf.Pos(), schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planVerifyHeapam routes a FROM-clause verify_heapam(regclass, ...) invocation
+// into a VerifyHeapam plan node (slice S3 of docs/design/0110-0008). The first
+// positional argument is the relation; the optional 5th/6th positional arguments
+// (matching the upstream signature relation, on_error_stop, check_toast, skip,
+// startblock, endblock) are the block-range bounds. The intermediate
+// on_error_stop / check_toast / skip arguments are accepted (so the upstream
+// argument list type-checks) but carry no semantics here — see the VerifyHeapam
+// node doc. Output schema is the upstream SETOF (blkno int8, offnum int8,
+// attnum int4, msg text). M0110-0003.
+func planVerifyHeapam(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) == 0 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "function verify_heapam() does not exist",
+			Hint:    "verify_heapam requires a relation argument"}
+	}
+	ctx := &resolveContext{}
+	arg, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	var startBlock, endBlock Expr
+	if len(tf.Args) >= 5 {
+		if startBlock, err = resolveExpr(tf.Args[4], ctx); err != nil {
+			return nil, rangeBinding{}, err
+		}
+	}
+	if len(tf.Args) >= 6 {
+		if endBlock, err = resolveExpr(tf.Args[5], ctx); err != nil {
+			return nil, rangeBinding{}, err
+		}
+	}
+
+	alias := rv.Alias
+	if alias == "" {
+		alias = "verify_heapam"
+	}
+	colNames := []string{"blkno", "offnum", "attnum", "msg"}
+	colTypes := []string{"int8", "int8", "int4", "text"}
+	if len(rv.Columns) >= len(colNames) {
+		colNames = rv.Columns[:len(colNames)]
+	}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	node := &VerifyHeapam{pos: tf.Pos(), Arg: arg, StartBlock: startBlock, EndBlock: endBlock, schema: schema}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }
@@ -4402,8 +4472,8 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 						}
 					}
 					return nil, nil, nil, nil, &PlanError{
-						Pos:    fc.Pos(),
-						Code:   "42803",
+						Pos:     fc.Pos(),
+						Code:    "42803",
 						Message: fmt.Sprintf(`column "%s" must appear in the GROUP BY clause or be used in an aggregate function`, qualName),
 						Detail:  "Direct arguments of an ordered-set aggregate must use only grouped columns.",
 					}
@@ -4441,7 +4511,11 @@ func buildAggregateStage(s *parser.SelectStmt, child Node, inputCtx *resolveCont
 	// PG calls sfunc once per row when multiple aggregates share the same transition state.
 	// This eliminates duplicate NOTICE/side-effect calls for identical sfunc invocations. M0097-0035.
 	{
-		type stateKey struct{ sfunc, stype, argKey, initcond string; distinct bool; filterKey string }
+		type stateKey struct {
+			sfunc, stype, argKey, initcond string
+			distinct                       bool
+			filterKey                      string
+		}
 		slotByKey := map[stateKey]int{}
 		nextSlot := 0
 		for i := range plannedAggs {
@@ -5687,7 +5761,7 @@ func buildAggregateCall(fc *parser.FuncCall, inputCtx *resolveContext, cat catal
 						name, nDirect, nOrder),
 				}
 			}
-				// Validate that direct arg types are compatible with ordering column types.
+			// Validate that direct arg types are compatible with ordering column types.
 			for i, argE := range fc.Args {
 				resolvedArg, aerr := resolveExpr(argE, inputCtx)
 				if aerr != nil {
@@ -6541,7 +6615,7 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 }
 
 func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
-	restore, _, err := preplanWithClause(s.With, cat)
+	restore, dmlPlans, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -6637,9 +6711,9 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		// generic "missing FROM-clause entry" error.
 		if insert.OnConflict != nil && insert.OnConflict.Action == OnConflictActionUpdate {
 			retCtx.bindings = append(retCtx.bindings, rangeBinding{
-				table:           tbl,
-				alias:           "excluded",
-				qualifiedOnly:   true,
+				table:            tbl,
+				alias:            "excluded",
+				qualifiedOnly:    true,
 				notReferenceable: true,
 			})
 		}
@@ -6650,7 +6724,7 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 		insert.Returning = retExprs
 		insert.ReturningSchema = retSchema
 	}
-	return insert, nil
+	return wrapDMLCTEPrefix(insert, dmlPlans), nil
 }
 
 // planOnConflict resolves the parser-level ON CONFLICT clause into
@@ -7018,7 +7092,7 @@ func applyUpdateAssign(a parser.UpdateAssign, tbl *catalog.Table, set []Expr, ct
 }
 
 func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
-	restore, _, err := preplanWithClause(s.With, cat)
+	restore, dmlPlans, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -7104,7 +7178,7 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 			upd.Returning = retExprs
 			upd.ReturningSchema = retSchema
 		}
-		return upd, nil
+		return wrapDMLCTEPrefix(upd, dmlPlans), nil
 	}
 
 	ctx := singleBindingContext(tbl, s.Target.Alias)
@@ -7142,11 +7216,11 @@ func planUpdate(s *parser.UpdateStmt, cat catalog.Catalog) (Node, error) {
 		upd.Returning = retExprs
 		upd.ReturningSchema = retSchema
 	}
-	return upd, nil
+	return wrapDMLCTEPrefix(upd, dmlPlans), nil
 }
 
 func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
-	restore, _, err := preplanWithClause(s.With, cat)
+	restore, dmlPlans, err := preplanWithClause(s.With, cat)
 	if err != nil {
 		return nil, err
 	}
@@ -7220,7 +7294,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 			del.Returning = retExprs
 			del.ReturningSchema = retSchema
 		}
-		return del, nil
+		return wrapDMLCTEPrefix(del, dmlPlans), nil
 	}
 
 	ctx := singleBindingContext(tbl, s.Target.Alias)
@@ -7256,7 +7330,7 @@ func planDelete(s *parser.DeleteStmt, cat catalog.Catalog) (Node, error) {
 		del.Returning = retExprs
 		del.ReturningSchema = retSchema
 	}
-	return del, nil
+	return wrapDMLCTEPrefix(del, dmlPlans), nil
 }
 
 // planMerge converts a MERGE INTO statement into a Merge plan node.
@@ -8117,6 +8191,9 @@ func exprType(e Expr) catalog.Type {
 			"pg_database_size", "pg_relation_size", "pg_total_relation_size",
 			"pg_indexes_size", "pg_table_size":
 			return catalog.Type{Name: "int8"}
+		case "bt_index_check", "bt_index_parent_check":
+			// amcheck verification functions RETURN void (slice S4 of 0110-0008).
+			return catalog.Type{Name: "void"}
 		case "round", "ceil", "ceiling", "floor", "trunc", "sign":
 			// Preserve input numeric type; default to numeric when unknown.
 			if len(x.Args) > 0 {

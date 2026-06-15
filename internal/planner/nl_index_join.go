@@ -479,6 +479,24 @@ func tryBuildNLI(j *Join, cat catalog.Catalog) (*NestedLoopIndexJoin, bool) {
 		}
 	}
 
+	// Fallback rebind: for outer types not covered above (e.g. Values,
+	// SeqScan-of-right), the combined-schema index may exceed the outer
+	// slot width (when inner=left and outer=right, outer cols start at
+	// leftWidth in the combined schema but at 0 in the outer slot).
+	// Rebind by name when out of range.
+	for _, k := range keys {
+		cr, ok := k.(*ColumnRef)
+		if !ok || cr.Name == "" {
+			continue
+		}
+		if cr.Index >= 0 && cr.Index < len(outerSchema) {
+			continue
+		}
+		if newIdx := findUniqueColumnIndex(outerSchema, cr.Name, 0); newIdx >= 0 {
+			cr.Index = newIdx
+		}
+	}
+
 	// Build the inner IndexScan. For single-column indexes we
 	// keep using `Key` for backward compatibility with all
 	// existing single-column callers / tests; for composite
@@ -806,6 +824,13 @@ func pickInnerSide(j *Join, leftCol, rightCol *ColumnRef, leftWidth int) (*SeqSc
 		// ColumnRefs un-rebind'd. The HashJoin path keeps the
 		// canonical Left ⋈ Right schema and works correctly.
 		if _, rightIsAgg := j.Right.(*Aggregate); rightIsAgg {
+			return nil, nil, nil
+		}
+		// Also decline when outer=right is a *Values node: the schema
+		// flip (outer ++ inner vs original Left ++ Right) can't be
+		// corrected by remapWithBindings because Values columns are not
+		// tracked in the scanMap. Fall through to the hash-join path.
+		if _, rightIsValues := j.Right.(*Values); rightIsValues {
 			return nil, nil, nil
 		}
 		return lss, leftSideRef, rightSideRef

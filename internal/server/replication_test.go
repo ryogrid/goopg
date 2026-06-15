@@ -226,6 +226,61 @@ func TestReplicationCreateAndDropSlot(t *testing.T) {
 	}
 }
 
+// TestReplicationReadReplicationSlot covers READ_REPLICATION_SLOT
+// (PG 15+), the command pg_receivewal issues before START_REPLICATION to
+// learn a physical slot's restart position. The reply is a single
+// three-column row (slot_type, restart_lsn, restart_tli): populated for an
+// existing physical slot, all-NULL for an absent one.
+func TestReplicationReadReplicationSlot(t *testing.T) {
+	addr, _, stop := startReplicationTestServer(t)
+	defer stop()
+	conn, r, w := dialReplication(t, addr)
+	defer conn.Close()
+
+	sendQuery(t, w, `CREATE_REPLICATION_SLOT primary PHYSICAL`)
+	_ = readUntilReadyForQuery(t, r)
+
+	// Existing physical slot: physical / non-NULL LSN / tli=1.
+	sendQuery(t, w, `READ_REPLICATION_SLOT primary`)
+	frames := readUntilReadyForQuery(t, r)
+	if frames[0].Type != protocol.MsgRowDescription {
+		t.Fatalf("READ_REPLICATION_SLOT first frame = %c, want T", frames[0].Type)
+	}
+	if frames[1].Type != protocol.MsgDataRow {
+		t.Fatalf("READ_REPLICATION_SLOT second frame = %c, want D", frames[1].Type)
+	}
+	cells := decodeDataRow(t, frames[1].Payload)
+	if len(cells) != 3 {
+		t.Fatalf("READ_REPLICATION_SLOT row col count = %d, want 3", len(cells))
+	}
+	if string(cells[0]) != "physical" {
+		t.Errorf("slot_type = %q, want physical", cells[0])
+	}
+	if cells[1] == nil {
+		t.Errorf("restart_lsn = NULL, want a reserved LSN")
+	}
+	if string(cells[2]) != "1" {
+		t.Errorf("restart_tli = %q, want 1", cells[2])
+	}
+	if frames[2].Type != protocol.MsgCommandComplete ||
+		!hasCommandTag(frames[2].Payload, "READ_REPLICATION_SLOT") {
+		t.Errorf("READ_REPLICATION_SLOT third frame = (%c, %q), want C+tag", frames[2].Type, frames[2].Payload)
+	}
+
+	// Absent slot: all three columns NULL.
+	sendQuery(t, w, `READ_REPLICATION_SLOT nonesuch`)
+	frames = readUntilReadyForQuery(t, r)
+	if frames[1].Type != protocol.MsgDataRow {
+		t.Fatalf("READ_REPLICATION_SLOT(nonesuch) second frame = %c, want D", frames[1].Type)
+	}
+	cells = decodeDataRow(t, frames[1].Payload)
+	for i, c := range cells {
+		if c != nil {
+			t.Errorf("absent-slot col[%d] = %q, want NULL", i, c)
+		}
+	}
+}
+
 // TestReplicationCreateLogicalSlot covers CREATE_REPLICATION_SLOT
 // name LOGICAL pgoutput (M0103-0004): a libpq subscriber sends this
 // immediately after the startup handshake when CREATE SUBSCRIPTION

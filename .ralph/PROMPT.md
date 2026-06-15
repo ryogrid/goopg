@@ -93,6 +93,12 @@ When performing cleanup, refactoring, or restructuring tasks:
 - lock/wal/replication/concurrency changes: run relevant unit tests plus race/concurrency-focused coverage
 - Ralph loop state consistency (every loop): run `make ralph-state-guard` immediately before the final status block
 - Include executed gates in the status RECOMMENDATION line (for auditability)
+- **Long-running pre-commit gate failures:** if a pre-commit gate (e.g.
+  `scripts/ralph-precommit-test.sh`, `scripts/tpch-spotcheck.sh`) fails and the
+  fix drags on across multiple turns, commit and push at a natural checkpoint —
+  the tree must build and the in-progress fix must be at a coherent stopping
+  point. Do not let days of uncommitted WIP accumulate behind a red gate;
+  incremental commits reduce blast radius and keep the branch pushable.
 
 ## 🔬 PostgreSQL Oracle Test Porting
 

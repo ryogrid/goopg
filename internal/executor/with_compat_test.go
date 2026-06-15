@@ -101,3 +101,42 @@ func TestCompatCTEChainedSiblings(t *testing.T) {
 		t.Errorf("y = %+v, want 2", rows[0][0])
 	}
 }
+
+// TestCompatCTEVisibleInFromSubquery exercises a WITH-list CTE
+// referenced from inside a derived-table (FROM-clause subquery)
+// of the OUTER statement — the AC-002 gap #4 shape that
+// pg_amcheck's 002_nonesuch bootstrap query hits:
+//
+//	WITH x(a) AS (SELECT 1) SELECT a FROM (SELECT a FROM x) s
+//
+// Before the planSubqueryRangeVar fix the non-correlated derived
+// table was re-planned via Plan(), which re-ran the analyzer on
+// the subquery standalone (no enclosing WITH scope) and rejected
+// the CTE reference with `relation "x" does not exist`. Pins that
+// the CTE substitutes in and the row flows through end-to-end.
+func TestCompatCTEVisibleInFromSubquery(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	rows := runQuery(t, ctx,
+		"WITH x(a) AS (SELECT 1) SELECT a FROM (SELECT a FROM x) s")
+	if len(rows) != 1 || len(rows[0]) != 1 {
+		t.Fatalf("rows=%d cols=%d, want 1×1", len(rows), len(rows[0]))
+	}
+	if rows[0][0].Kind != KindInt || rows[0][0].Int != 1 {
+		t.Errorf("a = %+v, want 1", rows[0][0])
+	}
+
+	// Two-level nesting: CTE visible through two stacked derived
+	// tables. Fresh fixture — runQuery caches CTE results on the
+	// executor Context, so reusing ctx across queries with a
+	// same-named CTE would surface the prior value (a harness
+	// artifact; the server uses a fresh Context per query).
+	ctx2, _, cleanup2 := newDDLFixture(t)
+	defer cleanup2()
+	rows = runQuery(t, ctx2,
+		"WITH x(a) AS (SELECT 7) SELECT s.a FROM (SELECT a FROM (SELECT a FROM x) t) s")
+	if len(rows) != 1 || rows[0][0].Int != 7 {
+		t.Fatalf("nested: got %+v, want single row [7]", rows)
+	}
+}
