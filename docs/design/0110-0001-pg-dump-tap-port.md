@@ -485,6 +485,24 @@ fixed one logical group per loop:
     the **new** blocker is `getDefaultACLs`: `relation "pg_default_acl" does
     not exist`. An empty `pg_default_acl` virtual view (OID 826) is the next
     slice.
+20. **`pg_default_acl` virtual view — DONE.** `getDefaultACLs` runs
+    `SELECT oid, tableoid, defaclrole, defaclnamespace, defaclobjtype, defaclacl,
+    CASE WHEN defaclnamespace = 0 THEN acldefault(CASE WHEN defaclobjtype = 'S'
+    THEN 's'::"char" ELSE defaclobjtype END, defaclrole) ELSE '{}' END AS
+    acldefault FROM pg_default_acl`; goopg had no queryable `pg_default_acl`
+    relation, so the query aborted at `relation "pg_default_acl" does not
+    exist`. Added the empty `pg_default_acl` virtual view
+    (`internal/catalog/catalog.go`, OID 826, beside `pg_foreign_server`) with
+    the `pg_default_acl.h` schema (`oid, defaclrole oid, defaclnamespace oid,
+    defaclobjtype "char", defaclacl aclitem[]`); goopg defines no default-ACL
+    entries (no `ALTER DEFAULT PRIVILEGES`), so it is correctly empty (0 rows)
+    and the `CASE`/`acldefault` projection is never evaluated — no new
+    expression work. After this slice `getDefaultACLs` passes; pg_dump advances
+    to `getConversions`, and the **new** blocker is `relation "pg_conversion"
+    does not exist` (`SELECT tableoid, oid, conname, connamespace, conowner FROM
+    pg_conversion`). A `pg_conversion` virtual view (OID 2607) is the next
+    slice — note PG ships ~130 built-in conversions there, but pg_dump filters
+    them as built-ins, so an empty view may suffice (verify empirically).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

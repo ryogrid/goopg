@@ -1487,6 +1487,27 @@ object support.
         Resume = slice 20: add the empty `pg_default_acl` virtual view
         (`pg_default_acl.h`, OID 826: oid, defaclrole oid, defaclnamespace oid,
         defaclobjtype "char", defaclacl aclitem[]; empty by construction).
+      - **PROGRESS 2026-06-16 (loop #43):** **DU-002 slice 20
+        (`pg_default_acl` view) LANDED.** `getDefaultACLs` runs `SELECT oid,
+        tableoid, defaclrole, defaclnamespace, defaclobjtype, defaclacl, CASE
+        WHEN defaclnamespace = 0 THEN acldefault(CASE WHEN defaclobjtype = 'S'
+        THEN 's'::"char" ELSE defaclobjtype END, defaclrole) ELSE '{}' END AS
+        acldefault FROM pg_default_acl`; it aborted at `relation
+        "pg_default_acl" does not exist`. Added the empty `pg_default_acl`
+        virtual view (`internal/catalog/catalog.go`, OID 826, beside
+        `pg_foreign_server`) with the `pg_default_acl.h` schema (`oid, defaclrole
+        oid, defaclnamespace oid, defaclobjtype "char", defaclacl aclitem[]`).
+        Empty by construction: goopg defines no default-ACL entries (no ALTER
+        DEFAULT PRIVILEGES); the CASE/acldefault projection is never evaluated —
+        no new expression work. build/gofmt/vet clean; catalog suite PASS;
+        `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** `getDefaultACLs` passes; pg_dump advances to
+        getConversions → `relation "pg_conversion" does not exist` (`SELECT
+        tableoid, oid, conname, connamespace, conowner FROM pg_conversion`).
+        Resume = slice 21: add the `pg_conversion` virtual view
+        (`pg_conversion.h`, OID 2607). NOTE: PG ships ~130 built-in conversions
+        there, but pg_dump filters them as built-ins, so an empty view may
+        suffice — verify empirically with the port test.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

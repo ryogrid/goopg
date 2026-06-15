@@ -3813,6 +3813,32 @@ func (c *InMemory) registerSystemTables() {
 	pgForeignServer.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_foreign_server"] = pgForeignServer
 
+	// pg_default_acl — default-ACL catalog (OID 826). After getForeignServers,
+	// pg_dump's getUserMappings short-circuits (no foreign servers → no catalog
+	// query), so the next catalog query is getDefaultACLs:
+	//   SELECT oid, tableoid, defaclrole, defaclnamespace, defaclobjtype,
+	//   defaclacl, CASE WHEN defaclnamespace = 0 THEN acldefault(CASE WHEN
+	//   defaclobjtype = 'S' THEN 's'::"char" ELSE defaclobjtype END, defaclrole)
+	//   ELSE '{}' END AS acldefault FROM pg_default_acl
+	// goopg defines no default-ACL entries (no ALTER DEFAULT PRIVILEGES), so this
+	// view is correctly empty (0 rows); the CASE/acldefault projection is never
+	// evaluated. Schema matches PG's pg_default_acl (pg_default_acl.h):
+	// oid, defaclrole oid, defaclnamespace oid, defaclobjtype "char",
+	// defaclacl aclitem[]. M0110-0001 (DU-002 slice 20).
+	pgDefaultACL := &Table{
+		Schema: "pg_catalog", Name: "pg_default_acl", Virtual: true,
+		Columns: []Column{
+			{Name: "oid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "defaclrole", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "defaclnamespace", Type: Type{Name: "oid"}, Ordinal: 2},
+			{Name: "defaclobjtype", Type: Type{Name: "char"}, Ordinal: 3},
+			{Name: "defaclacl", Type: Type{Name: "aclitem[]"}, Ordinal: 4},
+		},
+		OID: 826,
+	}
+	pgDefaultACL.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_default_acl"] = pgDefaultACL
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

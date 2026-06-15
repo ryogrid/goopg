@@ -86,15 +86,22 @@ package testport
 // text[]; empty by construction, like pg_foreign_data_wrapper, since goopg
 // defines no foreign servers; the correlated `pg_options_to_table(srvoptions)`
 // ARRAY subquery is never evaluated).
+// The getDefaultACLs query reads the empty `pg_default_acl` virtual view
+// (slice 20 — `pg_default_acl.h` schema, OID 826: oid, defaclrole oid,
+// defaclnamespace oid, defaclobjtype "char", defaclacl aclitem[]; empty by
+// construction, since goopg defines no default-ACL entries; the CASE/acldefault
+// projection is never evaluated).
 // **Next blocker (precise, confirmed empirically by this test):** the
-// getForeignServers query now passes; because goopg has no foreign servers,
-// getUserMappings short-circuits without a catalog query, and pg_dump advances
-// to getDefaultACLs, which fails with `relation "pg_default_acl" does not
-// exist`. The next DU-002 slice adds the empty `pg_default_acl` virtual view
-// (`pg_default_acl.h` schema, OID 826: oid, defaclrole oid, defaclnamespace
-// oid, defaclobjtype "char", defaclacl aclitem[]) — empty by construction,
-// since goopg defines no default-ACL entries. RUN this test after each add to
-// find the REAL next blocker rather than trusting the predicted one.
+// getDefaultACLs query now passes; pg_dump advances to getConversions, which
+// fails with `relation "pg_conversion" does not exist`. The query is
+// `SELECT tableoid, oid, conname, connamespace, conowner FROM pg_conversion`.
+// The next DU-002 slice adds the `pg_conversion` virtual view (`pg_conversion.h`
+// schema, OID 2607). Note: PG ships ~130 built-in conversions in pg_conversion,
+// so unlike the foreign/default-ACL views this is NOT empty by construction —
+// pg_dump filters them out as built-ins (conname/oid below the user-object
+// threshold), so an empty view may still satisfy the dump; verify empirically.
+// RUN this test after each add to find the REAL next blocker rather than
+// trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
 // works.
