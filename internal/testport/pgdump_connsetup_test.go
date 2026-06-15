@@ -214,17 +214,26 @@ package testport
 // only by print_defaults=false; goopg emits no DEFAULT clauses, so the identity
 // form reuses buildFunctionArguments and is byte-identical to the full arg list.
 // (Its siblings pg_get_function_arguments/result were already implemented.)
-// **Next blocker (precise, confirmed empirically by this test):** pg_dump now
-// fails in dumpFunc with `function pg_get_function_sqlbody does not exist`
-// (EXECUTE dumpFunc('1654')). dumpFunc projects pg_get_function_sqlbody(p.oid)
-// (PG14+; the deparsed SQL-standard function body for LANGUAGE sql functions
-// written with BEGIN ATOMIC). goopg has no such builtin yet; the next DU-002
-// slice must add it (NULL for non-SQL / non-atomic routines mirrors PG).
+// Slice 44 added the `pg_get_function_sqlbody(oid)` builtin (seed pg_proc OID
+// 6197 was registered but the executor lacked a dispatch case → 42883 in
+// dumpFunc's EXECUTE). It returns NULL for every routine: the builtin yields a
+// deparsed SQL-standard body only for `LANGUAGE sql ... BEGIN ATOMIC`
+// functions (PG14+), which goopg never parses, so NULL is correct and matches
+// what pg_dump expects for quoted-body SQL functions. With that, **pg_dump now
+// runs to completion (exit 0)** — connection setup + the full catalog dump
+// pipeline work end-to-end. The test is promoted to assert the table's archive
+// entry (CREATE TABLE / ALTER TABLE OWNER / COPY) is emitted.
+// **Next blocker (slice 45, confirmed empirically by this dump):** the emitted
+// `CREATE TABLE public.foo (\n)` has an EMPTY column list (no `id integer,
+// name text`) plus a malformed `WITH (""='')` reloptions clause. getTableAttrs'
+// per-table pg_attribute query returns no rows for user tables, and the
+// reloptions ARRAY subquery yields one empty element. The next DU-002 slice
+// must populate pg_attribute columns in the dump path and suppress the empty
+// reloption.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
-// This test is the regression guard for the connection-setup slice and a marker
-// for the next blocker. It auto-tightens (asserts exit 0) once a clean dump
-// works.
+// This test is the regression guard for the whole exit-0 dump pipeline and a
+// marker for the next blocker.
 //
 // Like the other client-tool ports the bundled pg_dump links a PG-17+ libpq
 // symbol, so it runs with LD_LIBRARY_PATH pointed at postgres/local_install/lib
@@ -284,10 +293,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	}
 
 	if res.ExitCode == 0 {
-		// A clean dump now works end-to-end — the broad catalog-view parity has
-		// landed. This test should be promoted to assert the dump contents.
-		t.Logf("pg_dump succeeded (exit 0); connection setup + catalog dump both work — "+
-			"promote this test to assert dump output. stdout len=%d", len(res.Stdout))
+		// pg_dump now runs to completion (slice 44 closed the last dumpFunc
+		// blocker, pg_get_function_sqlbody). The dump reaches the per-object
+		// emit stage and writes the table's archive entry, so assert the
+		// CREATE TABLE statement and the schema/owner scaffolding are present —
+		// this is the regression guard for the whole exit-0 pipeline.
+		want := []string{
+			"CREATE TABLE public.foo (",
+			"ALTER TABLE public.foo OWNER TO",
+			"COPY public.foo",
+		}
+		for _, sub := range want {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump output missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// **Next blocker (slice 45, confirmed empirically by this dump):** the
+		// column list is EMPTY — pg_dump emits `CREATE TABLE public.foo (\n)`
+		// with no `id integer, name text`, plus a malformed `WITH (""='')`
+		// reloptions clause. getTableAttrs' per-table pg_attribute query
+		// (attname/atttypid/attnotnull/…) is returning no rows for user tables,
+		// and the reloptions ARRAY subquery yields a single empty element. The
+		// next DU-002 slice must populate pg_attribute for user-table columns in
+		// the dump path and suppress the empty reloption. Not asserted here yet
+		// so this stays the forward marker, not a hard failure.
+		if !strings.Contains(res.Stdout, "id integer") {
+			t.Logf("DU-002 slice 45 target: pg_dump emits an empty column list "+
+				"(getTableAttrs / pg_attribute returns no columns); full stdout=%q", res.Stdout)
+		}
 		return
 	}
 

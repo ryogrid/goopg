@@ -935,12 +935,34 @@ fixed one logical group per loop:
     SQL-standard body of `LANGUAGE sql … BEGIN ATOMIC` functions). goopg has no
     such builtin yet; the next slice must add it (NULL for non-SQL/non-atomic
     routines mirrors PG).
+44. **`pg_get_function_sqlbody(oid)` builtin — DONE; pg_dump now reaches exit 0.**
+    The seed `pg_proc` already registered this function (OID 6197,
+    `pg_proc_seed_data.go`), but the executor lacked a dispatch case in
+    `internal/executor/expr.go`, so `dumpFunc`'s `EXECUTE dumpFunc('1654')`
+    raised 42883. Added a case returning `NullDatum` unconditionally:
+    `pg_get_function_sqlbody` deparses a standard body only for
+    `LANGUAGE sql … BEGIN ATOMIC` functions (PG14+); goopg never parses a
+    `prosqlbody`, so NULL for every routine is correct and matches what pg_dump
+    expects for quoted-body SQL functions. Guards:
+    `executor.TestPgGetFunctionSqlbody` (+ `…UnknownOID`). With this, **pg_dump
+    runs to completion (exit 0)** — connection setup and the entire catalog-dump
+    pipeline (roles, namespaces, tables, funcs, langs, operators, opclasses,
+    TS objects, FDWs, …) now resolve end-to-end. `TestPort_PgDumpConnectionSetup`
+    is promoted from a "no setup regression" guard to asserting the table's
+    archive entry (`CREATE TABLE public.foo (`, `ALTER TABLE … OWNER TO`,
+    `COPY public.foo`). The **new** blocker (slice 45) is *content* parity, not a
+    hard error: the emitted `CREATE TABLE public.foo (\n)` has an **empty column
+    list** (no `id integer, name text`) and a malformed `WITH (""='')` reloptions
+    clause — `getTableAttrs`' per-table `pg_attribute` query returns no rows for
+    user tables, and the reloptions `ARRAY` subquery yields one empty element.
+    The next slice must populate `pg_attribute` columns in the dump path and
+    suppress the empty reloption.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
-no `setup_connection()` error signature appears; it logs the remaining
-catalog-parity blocker and auto-tightens to assert exit 0 once a clean dump
-works. Unit guards: `config.TestPgDumpConnectionSetupGUCs`,
+no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
+0, so the test also asserts the table's archive entry is emitted and logs the
+remaining column-content gap (slice 45). Unit guards: `config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`.
 
 ## Deferred (002–010) — catalog surface estimate

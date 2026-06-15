@@ -6891,6 +6891,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 		}
 		return NewStringDatum(""), nil
+	case "pg_get_function_sqlbody":
+		// pg_get_function_sqlbody(oid) → text: the deparsed SQL-standard body
+		// of a `LANGUAGE sql ... BEGIN ATOMIC` function (PG14+). Returns NULL
+		// for any routine that is not a SQL-language function with an inlined
+		// standard body (e.g. C, internal, plpgsql, or quoted-string SQL
+		// bodies). goopg has no BEGIN ATOMIC support — no routine carries a
+		// parsed prosqlbody — so this is NULL for every routine, which also
+		// matches what pg_dump's dumpFunc expects for such functions.
+		return NullDatum, nil
 	case "pg_get_function_result":
 		// pg_get_function_result(oid) → text: return type
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
