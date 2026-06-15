@@ -686,6 +686,28 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: enable pg_xact slru mirror: %w", err)
 	}
+	// M0117-0003: wire the persistent pg_subtrans SLRU so subtransaction
+	// parentage survives a restart (gap G5 read path). EnablePersistence opens
+	// the bootstrapped pg_subtrans/ directory (created by initdb) for write-through
+	// of every RegisterSubXid; RestoreFromSLRU reloads the previously-persisted
+	// parent links back into memory before any query can run; SetSubxactMap makes
+	// the Manager route all subxact registration/resolution through it. Unlike PG
+	// (which zeroes pg_subtrans on startup) goopg restores it for durable subxact
+	// resolution by an attached standby / 2PC / post-backend-exit readers.
+	subxactMap := mvcc.NewSubxactMap()
+	if err := subxactMap.EnablePersistence(filepath.Join(abs, "pg_subtrans")); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: enable pg_subtrans slru: %w", err)
+	}
+	if _, err := subxactMap.RestoreFromSLRU(); err != nil {
+		_ = pool.Close()
+		_ = walWriter.Close()
+		_ = mgr.Close()
+		return nil, fmt.Errorf("goopg: restore pg_subtrans: %w", err)
+	}
+	txnMgr.SetSubxactMap(subxactMap)
 	txnMgr.SetXactMarkerLogger(func(xid storage.TransactionID, kind mvcc.XactMarker) error {
 		var payload []byte
 		switch kind {
@@ -1093,7 +1115,13 @@ func Open(opts OpenOptions) (*Runtime, error) {
 				return nil // nothing frozen yet — never truncate
 			}
 			horizon := datFrozen
-			if ox := txnMgr.OldestXmin(); ox != 0 && ox < horizon {
+			// horizon = min(datfrozenxid, OldestXmin) using wraparound-safe
+			// modular comparison (PG TransactionIdPrecedes), not plain `<`,
+			// which would mis-order XIDs across the 2^32 boundary and let
+			// truncation overrun the snapshot horizon. The `< FirstNormal`
+			// guards stay plain — they are TransactionIdIsNormal sentinel
+			// checks against the bootstrap constant, not horizon comparisons.
+			if ox := txnMgr.OldestXmin(); ox != 0 && storage.XIDPrecedes(ox, horizon) {
 				horizon = ox
 			}
 			if horizon < mvcc.FirstNormalTransactionID {

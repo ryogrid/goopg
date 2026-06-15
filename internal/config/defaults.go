@@ -192,6 +192,23 @@ func BuildDefaultRegistry() *Registry {
 		Scope:   ScopeServer,
 	}))
 
+	// transaction_buffers sizes the dedicated CLOG (commit-log) SLRU buffer
+	// pool — the number of BLCKSZ pages of the 2-bit transaction-status cache
+	// held resident at once (gap G6 / M0117-0006). Mirrors upstream's
+	// guc_tables.c entry: PGC_POSTMASTER, RESOURCES_MEM, GUC_UNIT_BLOCKS, with
+	// 0 meaning "auto-tune from a fraction of shared_buffers" (see
+	// clog.c:CLOGShmemBuffers → mvcc.EffectiveCLOGBuffers). The raw integer is a
+	// count of buffers (one block == one CLOG buffer upstream, so the stored
+	// value matches PG's GUC_UNIT_BLOCKS value); goopg registers it unit-less
+	// because the config layer has no 8 kB block unit. Max is
+	// SLRU_MAX_ALLOWED_BUFFERS = 1 GiB / BLCKSZ.
+	r.MustRegister(NewVariable(Variable{
+		Name: "transaction_buffers", Type: TypeInt, BootVal: "0",
+		MinVal: 0, MaxVal: (1 << 30) / 8192,
+		Context: ContextPostmaster,
+		Scope:   ScopeServer,
+	}))
+
 	// WAL & checkpointer GUCs (milestone 0002). Names, units, ranges,
 	// and defaults mirror upstream's
 	// postgres/src/backend/utils/misc/guc_tables.c entries.

@@ -34,6 +34,8 @@ func writeStatuses(t *testing.T, c *CLog, set []xidStatus) {
 			err = c.SetCommitted(s.xid)
 		case TxnStatusAborted:
 			err = c.SetAborted(s.xid)
+		case TxnStatusSubCommitted:
+			err = c.SetSubCommitted(s.xid)
 		default:
 			t.Fatalf("writeStatuses: unsupported status %d for xid %d", s.want, s.xid)
 		}
@@ -82,12 +84,16 @@ func TestCLogDualStoreConsistency(t *testing.T) {
 		{FirstNormalTransactionID, TxnStatusCommitted}, // 3: first normal XID, lane 3 of byte 0
 		{4, TxnStatusAborted},                          // adjacent lanes catch wrong bit-shift
 		{5, TxnStatusCommitted},
+		{6, TxnStatusSubCommitted}, // 0x03 lane adjacent to 4/5 catches bit-shift drift
+		{7, TxnStatusSubCommitted}, // two adjacent sub-committed lanes
 		{100, TxnStatusAborted},
+		{200, TxnStatusSubCommitted}, // sub-committed in the same first page
 		{1000, TxnStatusCommitted},
 		{pageBoundary - 1, TxnStatusCommitted}, // 32767: last XID of page 0
 		{pageBoundary, TxnStatusAborted},       // 32768: first XID of page 1 (crosses boundary)
 		{pageBoundary + 1, TxnStatusCommitted},
-		{pageBoundary + 1234, TxnStatusAborted}, // well into page 1
+		{pageBoundary + 2, TxnStatusSubCommitted}, // sub-committed on page 1
+		{pageBoundary + 1234, TxnStatusAborted},   // well into page 1
 	}
 	writeStatuses(t, c, set)
 
@@ -129,6 +135,93 @@ func TestCLogDualStoreConsistency(t *testing.T) {
 	}
 }
 
+// TestCLogSubCommittedResolvesViaParent pins the DidCommit resolution of a
+// SUB_COMMITTED lane, mirroring PG transam.c TransactionIdDidCommit: a
+// sub-committed subtransaction is committed iff its top-level parent is
+// committed. The parent link is supplied by a parentOf callback (the role the
+// M0117-0003 SubxactMap fills in production).
+func TestCLogSubCommittedResolvesViaParent(t *testing.T) {
+	dir := t.TempDir()
+	c, err := OpenCLog(filepath.Join(dir, "pg_xact_flat"))
+	if err != nil {
+		t.Fatalf("OpenCLog: %v", err)
+	}
+	if err := c.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact")); err != nil {
+		t.Fatalf("EnablePGSLRUMirror: %v", err)
+	}
+
+	// Parents: top-level XIDs with terminal status.
+	const (
+		committedParent  = storage.TransactionID(10)
+		abortedParent    = storage.TransactionID(20)
+		inProgressParent = storage.TransactionID(30) // never gets a CLOG status
+	)
+	if err := c.SetCommitted(committedParent); err != nil {
+		t.Fatalf("SetCommitted(parent): %v", err)
+	}
+	if err := c.SetAborted(abortedParent); err != nil {
+		t.Fatalf("SetAborted(parent): %v", err)
+	}
+
+	// Sub-committed children, each linked to a parent above.
+	const (
+		childOfCommitted  = storage.TransactionID(11)
+		childOfAborted    = storage.TransactionID(21)
+		childOfInProgress = storage.TransactionID(31)
+		orphanChild       = storage.TransactionID(41) // no parent link
+	)
+	for _, child := range []storage.TransactionID{childOfCommitted, childOfAborted, childOfInProgress, orphanChild} {
+		if err := c.SetSubCommitted(child); err != nil {
+			t.Fatalf("SetSubCommitted(%d): %v", child, err)
+		}
+		if got := c.GetStatus(child); got != TxnStatusSubCommitted {
+			t.Fatalf("GetStatus(%d) = %d, want SubCommitted (raw lane preserved)", child, got)
+		}
+	}
+
+	parents := map[storage.TransactionID]storage.TransactionID{
+		childOfCommitted:  committedParent,
+		childOfAborted:    abortedParent,
+		childOfInProgress: inProgressParent,
+		// orphanChild deliberately absent → parentOf returns 0.
+	}
+	parentOf := func(x storage.TransactionID) storage.TransactionID { return parents[x] }
+
+	cases := []struct {
+		xid  storage.TransactionID
+		want bool
+		why  string
+	}{
+		{committedParent, true, "directly committed top-level"},
+		{abortedParent, false, "directly aborted top-level"},
+		{childOfCommitted, true, "sub-committed child resolves to committed parent"},
+		{childOfAborted, false, "sub-committed child resolves to aborted parent"},
+		{childOfInProgress, false, "sub-committed child whose parent never committed"},
+		{orphanChild, false, "sub-committed child with no parent link (PG missing-entry branch)"},
+		{BootstrapTransactionID, true, "bootstrap XID short-circuits committed"},
+		{FrozenTransactionID, true, "frozen XID short-circuits committed"},
+		{storage.TransactionID(99999), false, "never-seen XID is not committed"},
+	}
+	for _, tc := range cases {
+		if got := c.DidCommit(tc.xid, parentOf); got != tc.want {
+			t.Errorf("DidCommit(%d) = %v, want %v (%s)", tc.xid, got, tc.want, tc.why)
+		}
+	}
+
+	// A nil parentOf cannot resolve a sub-committed XID → false.
+	if c.DidCommit(childOfCommitted, nil) {
+		t.Errorf("DidCommit(childOfCommitted, nil) = true, want false (no resolver)")
+	}
+
+	// SUB_COMMITTED round-trips through the durable SLRU mirror.
+	fresh := freshFromSLRU(t, filepath.Join(dir, "pg_xact"))
+	for _, child := range []storage.TransactionID{childOfCommitted, childOfAborted, childOfInProgress, orphanChild} {
+		if got := fresh.GetStatus(child); got != TxnStatusSubCommitted {
+			t.Errorf("SLRU-derived GetStatus(%d) = %d, want SubCommitted (0x03 lane round-trip)", child, got)
+		}
+	}
+}
+
 // TestCLogTruncateKeepsStoresConsistent writes committed/aborted XIDs spanning
 // two SLRU segments (clogXactsPerSegment == 1048576), truncates at a cutoff
 // inside the second segment, and asserts that:
@@ -162,9 +255,9 @@ func TestCLogTruncateKeepsStoresConsistent(t *testing.T) {
 	// Retained set lives in segment 1, straddling the cutoff so we exercise
 	// both the dropped prefix and the kept tail within the same segment.
 	above := []xidStatus{
-		{seg1, TxnStatusAborted},                            // first XID of segment 1
-		{seg1 + 100, TxnStatusCommitted},                    // just below cutoff page boundary
-		{seg1 + storage.TransactionID(clogXactsPerPage) + 7, TxnStatusAborted},  // page 1 of seg 1 (>= cutoff)
+		{seg1, TxnStatusAborted},         // first XID of segment 1
+		{seg1 + 100, TxnStatusCommitted}, // just below cutoff page boundary
+		{seg1 + storage.TransactionID(clogXactsPerPage) + 7, TxnStatusAborted},     // page 1 of seg 1 (>= cutoff)
 		{seg1 + storage.TransactionID(clogXactsPerPage)*3 + 9, TxnStatusCommitted}, // deeper into seg 1
 	}
 	writeStatuses(t, c, below)

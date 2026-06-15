@@ -58,6 +58,15 @@ type Manager struct {
 	abortedMu   sync.RWMutex
 	abortedXIDs []storage.TransactionID
 
+	// clog, when non-nil, is the durable commit log attached to every snapshot
+	// this Manager captures (M0117-0002). It lets Snapshot.SeesCommittedXID fall
+	// back to the persistent CLOG for in-window XIDs the in-memory arrays cannot
+	// classify (recovered aborts the rebuilt-empty abortedXIDs list has
+	// forgotten). nil (the default) keeps the pure in-memory v0 behaviour;
+	// installed by the server/initdb.Open recovery wiring via SetCLog. Read under
+	// abortedMu (cheap, already taken in captureSnapshot's neighbourhood).
+	clog *CLog
+
 	xactMarkerMu sync.RWMutex
 	xactMarker   func(storage.TransactionID, XactMarker) error
 
@@ -141,6 +150,19 @@ func (m *Manager) ReplayXactAbort(xid storage.TransactionID) {
 // the bootstrap path to snapshot transaction state across restarts.
 func (m *Manager) NextXID() storage.TransactionID {
 	return m.xidgen.Peek()
+}
+
+// SetCLog installs the durable commit log consulted as the visibility fallback
+// for in-window XIDs (M0117-0002). After this call every snapshot captured by
+// this Manager carries c, so Snapshot.SeesCommittedXID consults the persistent
+// CLOG for XIDs the in-memory InProgress/Aborted arrays cannot classify (e.g. a
+// recovered abort the rebuilt-empty abortedXIDs list has forgotten). Passing nil
+// disables the fallback (restores the pure in-memory v0 behaviour). Intended to
+// be called once during startup/recovery wiring (initdb.Open).
+func (m *Manager) SetCLog(c *CLog) {
+	m.abortedMu.Lock()
+	m.clog = c
+	m.abortedMu.Unlock()
 }
 
 // xidWarnAge is how many XIDs before uint32 overflow to emit a warning.
@@ -735,6 +757,10 @@ func (m *Manager) captureSnapshot() Snapshot {
 		aborted = make([]storage.TransactionID, len(m.abortedXIDs))
 		copy(aborted, m.abortedXIDs)
 	}
+	// M0117-0002: attach the durable commit log (nil unless SetCLog was called)
+	// so the snapshot can fall back to the CLOG for in-window XIDs the in-memory
+	// arrays cannot classify.
+	clog := m.clog
 	m.abortedMu.RUnlock()
 
 	return Snapshot{
@@ -742,6 +768,7 @@ func (m *Manager) captureSnapshot() Snapshot {
 		Xmax:       xmax,
 		InProgress: inProgress,
 		Aborted:    aborted,
+		clog:       clog,
 	}
 }
 
