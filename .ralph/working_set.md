@@ -1,49 +1,47 @@
-Task: M0110-0003 (AC-003 pg_amcheck) — loop #7. LANDED the page-structural heap
-tier of 004_verify_heapam.pl as TestPort_PgAmcheck004VerifyHeapam, the first
-end-to-end on-disk-corruption → pg_amcheck reproduction against a live goopg
-cluster. Committed on align-data-structure-with-pg.
+Task: M0110-0003 (AC-003 pg_amcheck) — loop #8. LANDED the lateral outer-qual
+pushdown that unblocks relation-scoped pg_amcheck heap checks. Committed on
+align-data-structure-with-pg.
 
 === WHAT LANDED (this loop) ===
-internal/testport/pgamcheck004_port_test.go (NEW): drives real pg_amcheck vs a
-live goopg cluster, mirroring upstream stop→seek/overwrite→restart:
-- init with --no-data-checksums (upstream no_data_checksums=>1). goopg now
-  DEFAULTS data checksums ON (cmd/goopg/main.go:183) — with them on, overwriting
-  page bytes trips the storage-manager checksum verify ("invalid page in block 0
-  … checksum verification failed") before verify_heapam sees the damage.
-- locate heap file by globbing base/*/<reloid>: goopg's storage dbOid (5 for
-  postgres) ≠ pg_database.oid (16384). reloid filename = pg_class.oid (no
-  separate relfilenode in v0; catalog RelFileNode uses table.OID).
-- corrupt: first line pointer (slot 1) is the 4-byte LE ItemId at offset 24,
-  packed offset(15)|flags<<15|length<<17; set length=0x7FFF so lp_off+lp_len >
-  BLCKSZ → engine emits verbatim "line pointer to page offset N with length
-  32767 ends beyond maximum page offset 8192".
-- re-CREATE EXTENSION amcheck AFTER restart: install is runtime-only (gap #7c
-  per-db pg_extension scoping) and does NOT survive a server restart.
-- assert pg_amcheck exit 2 + report on stdout (pg_amcheck prints corruption to
-  STDOUT, not stderr).
+Live-wire diagnosis (temp GOOPG_DIAG_TRACE in server query.go, now removed)
+showed pg_amcheck's heap command is an implicit-LATERAL comma-join:
+  FROM pg_catalog.pg_class c, "<schema>".verify_heapam(relation := c.oid, …) v
+  WHERE c.oid = N
+goopg planned the outer-only `WHERE c.oid = N` ABOVE the lateral nested-loop, so
+verify_heapam was opened for EVERY pg_class row and raised
+"could not open relation: relation does not exist" on the first non-heap sibling
+(an index/sequence OID) → exit 2 on a HEALTHY target table whenever the DB held
+>1 relation. (Explains why 004's single-table case worked but anything with an
+index/2nd table failed.)
 
-Files: internal/testport/pgamcheck004_port_test.go (new), CSV AC-003 rationale,
-docs/design/0110-0003-pg-amcheck-tap-port.md (004 section + AC-002 done),
-docs/design/README.md (0110-0003 row), .ralph/fix_plan.md, deferral_ledger.md.
+Fix: internal/planner/pushdown.go
+- pushOuterQualsIntoLaterals(node): for a residual Filter whose direct child is a
+  Lateral Join, move each outer-only conjunct (sideLeft by index range AND name)
+  onto Join.Left as a Filter. Indices already align (left child = leading cols).
+- collectScanOutputNames: extracted shared name-walk; added *Values case (virtual
+  catalog relations like pg_class plan as *Values).
+- name guard lenient when leftNames empty (direct-child sideLeft is conclusive).
+- Wired in planner.go right after pushPredicatesIntoCrossJoins (else branch).
+No-op unless residual Filter's direct child is a Lateral join → ZERO TPC-H impact.
 
-Gates: gofmt clean; go vet ./internal/testport clean; TestPort_PgAmcheck001/002/
-004 all PASS; internal/amcheck + internal/mvcc PASS. gen-oracle-port-status
-regenerated the .md. No TPC-H spotcheck (test-only, new file; no planner/codec/
-executor row path touched).
+Files: internal/planner/pushdown.go, internal/planner/planner.go (call site),
+internal/planner/planner_test.go (NEW TestPlanOuterQualPushedBelowLateralJoin +
+findLateralJoin/exprMentionsColumnName helpers), docs/design/0110-0003 (2 new
+sections), .ralph/fix_plan.md, deferral_ledger.md.
 
-=== NEXT STEP (resume point) — AC-003 remainder ===
-Two tests remain to promote AC-003 → port:
-- 003_check.pl: whole-database pg_amcheck orchestration. Blocker = goopg's
-  SYSTEM-CATALOG heap pages must verify cleanly through verify_heapam (upstream
-  asserts an empty `pg_amcheck <db>` run before corruption). Today the 004 port
-  restricts to the user table to dodge catalog-page false positives — quantify
-  which catalog pages trip the engine first.
-- 005_opclass_damage.pl: needs CREATE OPERATOR CLASS + pg_amproc catalog parity
-  to inject a breaking sort order via UPDATE pg_amproc, then --checkunique. Large
-  new catalog/DDL surface.
-NOT portable faithfully: 004's MVCC/attribute + TOAST tiers (PG varatt_external
-vs goopg chunk-relation TOAST).
+Gates: internal/planner + internal/executor suites PASS; go vet planner/server
+clean; 001/002/004 amcheck port tests PASS; build ./... + gofmt clean. TPC-H
+spotcheck SKIPPED (no data dir loaded in this tree; safe by lateral-only guard).
+e2e verified manually: pg_amcheck --table public.t (heap-only) and
+--table … --no-dependent-indexes return exit 0 over a multi-table/indexed DB.
 
-=== CONTEXT ===
-Main tree clean (foreign gen-column WIP that blocked loops #51–65 is GONE).
-Commit engine work directly on align-data-structure-with-pg.
+=== NEXT STEP (resume) — AC-003 remainder, blocker #2 (small) ===
+bt_index_check schema-qualified dispatch: evalFuncCall (internal/executor/expr.go
+~L5286) strips only "pg_catalog." before matching, so pg_amcheck's
+`"public".bt_index_check(...)` → 42883 "function public.bt_index_check does not
+exist". Any table with a dependent index still fails. Fix = strip the amcheck
+install-schema qualifier for the amcheck builtins (bt_index_check /
+bt_index_parent_check / verify_heapam scalar paths). Then blocker #3 (system-
+catalog heap resolution in verifyHeapamResolveTable/LookupTableByOID) for the
+003_check whole-db pre-corruption clean run. 005_opclass_damage = CREATE OPERATOR
+CLASS + pg_amproc parity (large).

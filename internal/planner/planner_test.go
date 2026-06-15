@@ -1103,6 +1103,87 @@ func planTreeHasLateralJoin(n Node) bool {
 	return false
 }
 
+// findLateralJoin returns the first Lateral Join in the plan tree, or nil.
+func findLateralJoin(n Node) *Join {
+	switch x := n.(type) {
+	case *Join:
+		if x.Lateral {
+			return x
+		}
+		if j := findLateralJoin(x.Left); j != nil {
+			return j
+		}
+		return findLateralJoin(x.Right)
+	case *Project:
+		return findLateralJoin(x.Child)
+	case *Filter:
+		return findLateralJoin(x.Child)
+	}
+	return nil
+}
+
+// exprMentionsColumnName reports whether e contains a named ColumnRef for name.
+func exprMentionsColumnName(e Expr, name string) bool {
+	found := false
+	visitColumnRefsByName(e, func(n string) {
+		if strings.EqualFold(n, name) {
+			found = true
+		}
+	})
+	return found
+}
+
+// TestPlanOuterQualPushedBelowLateralJoin pins the lateral outer-qual
+// pushdown that unblocks pg_amcheck's relation-scoped heap probes. The
+// pg_amcheck heap command is
+//
+//	SELECT v.* FROM pg_catalog.pg_class c, verify_heapam(relation := c.oid) v
+//	  WHERE c.oid = N
+//
+// where the WHERE restricts only the outer (left) relation. Without the
+// pushdown, the residual Filter sits ABOVE the lateral nested-loop, so
+// verify_heapam is opened for EVERY pg_class row and raises "could not open
+// relation" on the first non-heap relation (an index/sequence OID) before the
+// filter can drop it. pushOuterQualsIntoLaterals moves the outer-only qual onto
+// the join's outer child so the SRF is only opened for the matching relation —
+// matching PostgreSQL's nested-loop qual placement. M0110-0003.
+func TestPlanOuterQualPushedBelowLateralJoin(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "rels"}, []catalog.Column{
+		{Name: "oid", Type: catalog.Type{Name: "oid"}, Ordinal: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sql := `SELECT v.blkno FROM rels c, verify_heapam(relation := c.oid) v WHERE c.oid = 16404`
+	plan, err := Plan(parseOne(t, sql), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	j := findLateralJoin(plan)
+	if j == nil {
+		t.Fatalf("expected a Lateral Join in the plan, got none:\n%s", plan)
+	}
+	// The outer-only qual must now live as a Filter on the join's LEFT child,
+	// so the lateral RHS is opened only for outer rows that pass it.
+	lf, ok := j.Left.(*Filter)
+	if !ok {
+		t.Fatalf("lateral Join.Left is %T, want *Filter carrying the pushed qual:\n%s", j.Left, plan)
+	}
+	if !exprMentionsColumnName(lf.Predicate, "oid") {
+		t.Errorf("pushed Filter predicate does not mention oid: %v", lf.Predicate)
+	}
+	// And it must no longer remain in a Filter ABOVE the lateral join (which is
+	// where it would force per-outer-row evaluation of the SRF).
+	if f, ok := plan.(*Filter); ok && exprMentionsColumnName(f.Predicate, "oid") {
+		t.Errorf("oid qual still sits above the lateral join: %v", f.Predicate)
+	}
+	if p, ok := plan.(*Project); ok {
+		if f, ok := p.Child.(*Filter); ok && exprMentionsColumnName(f.Predicate, "oid") {
+			t.Errorf("oid qual still sits above the lateral join (under Project): %v", f.Predicate)
+		}
+	}
+}
+
 // TestPlanFetchTableListAggDerivedSubquery pins the M0103-0008 rung-7
 // gap surfaced by dropping the t.Skip on
 // `internal/testport/pgoutput_interop_test.go::TestPort_PgoutputInteropGoopgToPG`.

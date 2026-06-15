@@ -894,6 +894,11 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 					node = pushPredicatesIntoCrossJoins(node)
 				}
 			}
+			// Push outer-only quals below a LATERAL join onto its outer
+			// child so a side-effecting lateral RHS (e.g. verify_heapam)
+			// is only opened for outer rows that pass the restriction.
+			// See pushOuterQualsIntoLaterals in pushdown.go.
+			node = pushOuterQualsIntoLaterals(node)
 		}
 	}
 

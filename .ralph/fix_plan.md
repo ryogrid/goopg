@@ -1111,6 +1111,35 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         tests are deferred under CSV row AC-002, blocked on `verify_heapam()` SRF
         + opclass catalog coverage. Resume = promote AC-002 (002_nonesuch first —
         only error-path catalog lookups) when those land.
+      - **PROGRESS 2026-06-15 (loop #8):** AC-003 enabler — **lateral
+        outer-qual pushdown** landed (`pushOuterQualsIntoLaterals` in
+        `internal/planner/pushdown.go`), the dominant blocker for
+        relation-scoped `pg_amcheck` runs. Live-wire diagnosis showed
+        pg_amcheck's heap command is an implicit-LATERAL comma-join
+        `FROM pg_catalog.pg_class c, "<schema>".verify_heapam(relation := c.oid,
+        …) v WHERE c.oid = N`; goopg planned the residual `WHERE c.oid = N`
+        *above* the lateral nested-loop, so `verify_heapam` was opened for EVERY
+        pg_class row and raised `could not open relation` on the first non-heap
+        sibling (an index/sequence OID) before the filter could drop it — exit 2
+        on a perfectly healthy target whenever the DB held >1 relation. The new
+        pass moves an outer-only conjunct (sideLeft by index AND name;
+        `collectScanOutputNames` now covers the `*Values` virtual-catalog node)
+        onto the lateral join's outer child, matching PG's nested-loop qual
+        placement. No-op unless the residual Filter's direct child is a Lateral
+        join → zero impact on non-lateral shapes (all of TPC-H). After the fix
+        `pg_amcheck --table public.t` and `--table … --no-dependent-indexes`
+        return exit 0 over a multi-table/indexed DB (verified end-to-end). Regression
+        `TestPlanOuterQualPushedBelowLateralJoin` (planner_test.go). Gates: full
+        `internal/planner` + `internal/executor` suites PASS; `go vet`
+        planner/server clean; 001/002/004 amcheck port tests PASS; build ./...
+        clean; gofmt clean. TPC-H spotcheck SKIPPED (no data dir loaded in this
+        tree) — safe by construction (lateral-only guard). Diagnostic also
+        pinned the two AC-003 remainders for `003_check`: (#2) `bt_index_check`
+        schema-qualified dispatch (`public.bt_index_check does not exist` —
+        `evalFuncCall` strips only `pg_catalog.`), and (#3) system-catalog heap
+        resolution in `verifyHeapamResolveTable`/`LookupTableByOID`. Design doc
+        `0110-0003` extended (lateral-pushdown + 003_check-blockers sections).
+        Resume = bt_index_check schema-qualifier (blocker #2, small).
       - **PROGRESS 2026-06-15 (loop #7):** AC-003 — the **page-structural heap
         tier of `004_verify_heapam.pl`** is ported as
         `TestPort_PgAmcheck004VerifyHeapam`

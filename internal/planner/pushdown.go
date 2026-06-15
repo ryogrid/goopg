@@ -50,6 +50,123 @@ func pushPredicatesIntoCrossJoins(node Node) Node {
 	return f
 }
 
+// collectScanOutputNames adds the output column names of every
+// SeqScan/IndexScan/Project/Aggregate in n's subtree into names. It
+// is the shared name-gathering walk behind allColumnRefNamesInScope
+// and the lateral outer-qual scope check.
+func collectScanOutputNames(n Node, names map[string]bool) {
+	if n == nil {
+		return
+	}
+	switch x := n.(type) {
+	case *SeqScan:
+		for _, col := range x.Output() {
+			names[col.Name] = true
+		}
+	case *IndexScan:
+		for _, col := range x.Output() {
+			names[col.Name] = true
+		}
+	case *MultiHashJoin:
+		for _, t := range x.Tables {
+			collectScanOutputNames(t, names)
+		}
+	case *Join:
+		collectScanOutputNames(x.Left, names)
+		collectScanOutputNames(x.Right, names)
+	case *Filter:
+		collectScanOutputNames(x.Child, names)
+	case *Project:
+		for _, c := range x.Output() {
+			names[c.Name] = true
+		}
+	case *Sort:
+		collectScanOutputNames(x.Child, names)
+	case *Aggregate:
+		for _, c := range x.Output() {
+			names[c.Name] = true
+		}
+	case *Values:
+		// Virtual catalog relations (pg_class, pg_namespace, …) plan
+		// as a Values node with a VirtualSource; expose its columns so
+		// a qual over a catalog table is recognised in scope.
+		for _, c := range x.Output() {
+			names[c.Name] = true
+		}
+	}
+}
+
+// pushOuterQualsIntoLaterals pushes a residual WHERE conjunct that
+// references only the outer (left) side of a LATERAL join down onto
+// that join's outer child. A lateral nested-loop re-opens the right
+// side once per surviving outer row, so without this an outer-only
+// restriction invokes the lateral RHS for EVERY outer row. That is
+// merely wasteful for an ordinary data-returning RHS, but a
+// side-effecting RHS — pg_amcheck's `FROM pg_catalog.pg_class c,
+// verify_heapam(relation := c.oid) v WHERE c.oid = N` — raises an
+// error on the first non-heap relation (verify_heapam rejects an
+// index/sequence OID) instead of being skipped, aborting the whole
+// scan. PostgreSQL applies such a single-relation qual to the outer
+// scan before the nested loop; pushing it onto j.Left matches that
+// placement and makes pg_amcheck's relation-scoped probes resolve.
+//
+// Conservative by design: only the lateral Join that is the residual
+// Filter's direct child is considered (the FROM-root lateral
+// comma-join pg_amcheck emits), and each pushed conjunct must
+// reference columns only within the outer child's schema, checked by
+// both index range (classifyConjunctSide == sideLeft) and column
+// name (collectScanOutputNames). The outer child occupies the join's
+// leading columns, so a left-only conjunct's indices already align
+// with j.Left.Output() — no remapping needed.
+func pushOuterQualsIntoLaterals(node Node) Node {
+	f, ok := node.(*Filter)
+	if !ok {
+		return node
+	}
+	j, ok := f.Child.(*Join)
+	if !ok || !j.Lateral {
+		return node
+	}
+	leftWidth := len(j.Left.Output())
+	totalWidth := leftWidth + len(j.Right.Output())
+	leftNames := map[string]bool{}
+	collectScanOutputNames(j.Left, leftNames)
+
+	var pushed, remaining []Expr
+	for _, c := range splitAnd(f.Predicate) {
+		if classifyConjunctSide(c, leftWidth, totalWidth) != sideLeft {
+			remaining = append(remaining, c)
+			continue
+		}
+		// Name-in-scope guard against width-based mis-classification.
+		// j.Left is the join's direct left child, so a sideLeft verdict
+		// (all ColumnRef indices < leftWidth) already pins the refs to
+		// the left output; the name check is only an extra safety, so a
+		// node whose columns we can't enumerate (empty leftNames) still
+		// pushes on the conclusive index classification.
+		allIn := true
+		visitColumnRefsByName(c, func(name string) {
+			if !leftNames[name] {
+				allIn = false
+			}
+		})
+		if !allIn && len(leftNames) > 0 {
+			remaining = append(remaining, c)
+			continue
+		}
+		pushed = append(pushed, c)
+	}
+	if len(pushed) == 0 {
+		return node
+	}
+	j.Left = &Filter{pos: pushed[0].Pos(), Child: j.Left, Predicate: combineAnd(pushed)}
+	if len(remaining) == 0 {
+		return j
+	}
+	f.Predicate = combineAnd(remaining)
+	return f
+}
+
 // allColumnRefNamesInScope reports whether every named ColumnRef in
 // c references a column that appears in the output schema of at
 // least one SeqScan/IndexScan in j's subtree. Used to guard
@@ -58,43 +175,8 @@ func pushPredicatesIntoCrossJoins(node Node) Node {
 // width range but actually point at tables outside the subtree.
 func allColumnRefNamesInScope(c Expr, j *Join) bool {
 	names := map[string]bool{}
-	var collect func(Node)
-	collect = func(n Node) {
-		if n == nil {
-			return
-		}
-		switch x := n.(type) {
-		case *SeqScan:
-			for _, col := range x.Output() {
-				names[col.Name] = true
-			}
-		case *IndexScan:
-			for _, col := range x.Output() {
-				names[col.Name] = true
-			}
-		case *MultiHashJoin:
-			for _, t := range x.Tables {
-				collect(t)
-			}
-		case *Join:
-			collect(x.Left)
-			collect(x.Right)
-		case *Filter:
-			collect(x.Child)
-		case *Project:
-			for _, c := range x.Output() {
-				names[c.Name] = true
-			}
-		case *Sort:
-			collect(x.Child)
-		case *Aggregate:
-			for _, c := range x.Output() {
-				names[c.Name] = true
-			}
-		}
-	}
-	collect(j.Left)
-	collect(j.Right)
+	collectScanOutputNames(j.Left, names)
+	collectScanOutputNames(j.Right, names)
 	allIn := true
 	visitColumnRefsByName(c, func(name string) {
 		if !names[name] {

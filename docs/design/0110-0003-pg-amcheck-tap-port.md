@@ -149,6 +149,70 @@ PG's on-disk `varatt_external` pointer layout, which goopg does not use (oversiz
 values live in a chunk relation). A byte-for-byte port of those cases would assert
 against bytes goopg never writes.
 
+## Lateral outer-qual pushdown (relation-scoped probes) — AC-003 enabler
+
+`pg_amcheck` builds each per-relation heap check as an implicit-LATERAL
+comma-join with the target relation pinned in the WHERE clause (captured from the
+live wire protocol):
+
+```sql
+SELECT v.blkno, v.offnum, v.attnum, v.msg
+FROM pg_catalog.pg_class c, "public".verify_heapam(
+       relation := c.oid, on_error_stop := false, check_toast := true, skip := 'none'
+     ) v
+WHERE c.oid = <reloid> AND c.relpersistence != 't'
+```
+
+The `WHERE c.oid = N` restricts only the **outer** relation. goopg planned the
+residual `Filter` *above* the lateral nested-loop, so `verify_heapam` was opened
+for **every** `pg_class` row and the join only filtered afterwards. `verify_heapam`
+raises `could not open relation: relation does not exist` when handed a non-heap
+OID (an index, sequence, …), so the first sibling relation in the catalog aborted
+the whole scan with exit 2 — even though the user's target table was perfectly
+healthy. This is why `--table public.t` worked only when the database held no
+other non-heap relations (the 004 single-table case) and failed the moment an
+index or second table existed.
+
+Fix: `pushOuterQualsIntoLaterals` (`internal/planner/pushdown.go`), run right
+after `pushPredicatesIntoCrossJoins`. For a residual `Filter` whose direct child
+is a `Lateral` `Join`, each conjunct that references only the outer (left) side —
+verified by both index range (`classifyConjunctSide == sideLeft`) and column name
+(`collectScanOutputNames`, now including the `*Values` node that backs virtual
+catalog relations like `pg_class`) — is moved onto the join's outer child as a
+`Filter`. The outer child occupies the join's leading columns, so a left-only
+conjunct's indices already align with `j.Left.Output()` (no remapping). This
+matches PostgreSQL's nested-loop qual placement: a single-relation restriction is
+applied to the outer scan before the inner side is opened per row.
+
+Scope/blast radius: the pass is a no-op unless the residual filter's direct child
+is a `Lateral` join, so non-lateral query shapes (all of TPC-H, ordinary
+comma/`JOIN` queries) are untouched. Regression: `TestPlanOuterQualPushedBelowLateralJoin`
+(`internal/planner/planner_test.go`) asserts the qual lands on `Join.Left` and no
+longer sits above the lateral join. After the fix, `pg_amcheck --table public.t`
+and `--table public.t --no-dependent-indexes` return exit 0 over a multi-table /
+indexed database (verified end-to-end against a live cluster).
+
+## 003_check / whole-database blockers (diagnostic, AC-003 remainder)
+
+Driving the real `pg_amcheck postgres` (whole-db) and `--table`/`--schema` runs
+against a clean goopg cluster surfaced the precise remaining gaps:
+
+1. **Lateral outer-qual pushdown** — FIXED above. Was the dominant blocker for any
+   `--table`/`--schema`-scoped run once a database held more than a lone heap table.
+2. **`bt_index_check` schema-qualified dispatch** — `pg_amcheck` calls the amcheck
+   functions schema-qualified (`"<amcheck-schema>".bt_index_check(...)`, e.g.
+   `public.bt_index_check`). `evalFuncCall` (`internal/executor/expr.go`) strips
+   only a `pg_catalog.` prefix before matching, so `public.bt_index_check` resolves
+   to `function public.bt_index_check does not exist` (42883). Any table with a
+   dependent index therefore still fails its index check. (Not fixed this loop —
+   the heap-side pushdown is the standalone unit of work; this is the next slice.)
+3. **System-catalog heap resolution** — a whole-db `pg_amcheck postgres` run also
+   checks `pg_catalog.*`; `verify_heapam` on `pg_type`/`pg_attribute`/`pg_class`
+   reports `could not open relation` because `verifyHeapamResolveTable` /
+   `LookupTableByOID` does not resolve catalog relations to on-disk heap pages.
+   This is the larger parity effort `003_check`'s empty pre-corruption whole-db run
+   depends on.
+
 ## Resume point
 
 Promote `AC-002` to `port` (and stop the skip) once the three SQL gaps above are
@@ -156,8 +220,12 @@ implemented — `002_nonesuch` then passes with no further amcheck work, since i
 never calls `verify_heapam()`. **(DONE — AC-002 is now `port`; the three gaps
 plus #6/#7a/#7b/#7c landed.)**
 
-For `AC-003`: the page-structural tier of `004_verify_heapam.pl` is ported (above).
-Remaining: `003_check.pl` (whole-database heap+btree orchestration; needs the
-system-catalog heap pages to verify cleanly), and `005_opclass_damage.pl` (needs
-`CREATE OPERATOR CLASS` + `pg_amproc` catalog parity to inject the breaking
-sort-order via `UPDATE pg_amproc`). AC-003 stays `defer` until 003 and 005 land.
+For `AC-003`: the page-structural tier of `004_verify_heapam.pl` is ported (above),
+and the lateral outer-qual pushdown now lets `pg_amcheck` scope heap checks to a
+single relation in a multi-relation database. Remaining for `003_check.pl`
+(whole-database heap+btree orchestration): the `bt_index_check` schema-qualified
+dispatch (blocker #2) for the index side, and system-catalog heap resolution
+(blocker #3) for the empty pre-corruption whole-db run. `005_opclass_damage.pl`
+needs `CREATE OPERATOR CLASS` + `pg_amproc` catalog parity to inject the breaking
+sort-order via `UPDATE pg_amproc`. AC-003 stays `defer` until 003 and 005 land;
+next slice = `bt_index_check` schema-qualifier (blocker #2, small).
