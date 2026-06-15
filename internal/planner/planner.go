@@ -1654,6 +1654,17 @@ func nodeReferencesOuter(n Node) bool {
 		return exprContainsColumnRef(x.Arg) ||
 			exprContainsColumnRef(x.StartBlock) ||
 			exprContainsColumnRef(x.EndBlock)
+	case *PgGetSequenceData:
+		// pg_dump's getSequences comma-joins pg_get_sequence_data(seqrelid) with
+		// pg_sequence; the seqrelid argument is a correlated *ColumnRef against
+		// the left sibling, so route the wrapping Join through the per-outer-row
+		// lateral driver. DU-002 slice 32 (M0110-0001).
+		for _, a := range x.Args {
+			if exprContainsColumnRef(a) {
+				return true
+			}
+		}
+		return false
 	}
 	// General case: walk the plan tree for OuterColumnRef expressions.
 	return planHasOuterRef(n)
@@ -3011,6 +3022,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "pg_get_sequence_data") {
+		return planPgGetSequenceData(rv, sourceIdx, lateralCtx)
+	}
 	if strings.EqualFold(tf.Name, "verify_heapam") {
 		return planVerifyHeapam(rv, sourceIdx, lateralCtx)
 	}
@@ -3746,6 +3760,54 @@ func planPgAvailableWalSummaries(rv parser.RangeVar, sourceIdx int16) (Node, ran
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgAvailableWalSummaries{pos: tf.Pos(), schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planPgGetSequenceData routes a FROM-clause invocation of
+// pg_get_sequence_data(regclass) into a PgGetSequenceData plan node. pg_dump's
+// getSequences comma-joins it with pg_catalog.pg_sequence
+// (`FROM pg_sequence, pg_get_sequence_data(seqrelid)`); the seqrelid argument is
+// a correlated reference to the sibling pg_sequence range-table entry, so it is
+// resolved against the lateral outer context (mirrors planPgGetPublicationTables
+// / planVerifyHeapam). goopg's pg_sequence view is empty, so the operator is
+// never executed and always returns 0 rows (last_value int8, is_called bool).
+// M0110-0001 (DU-002 slice 32).
+func planPgGetSequenceData(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	ctx := lateralCtx
+	if ctx == nil {
+		ctx = &resolveContext{}
+	}
+	args := make([]Expr, 0, len(tf.Args))
+	for _, a := range tf.Args {
+		resolved, err := resolveExpr(a, ctx)
+		if err != nil {
+			return nil, rangeBinding{}, err
+		}
+		args = append(args, resolved)
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_get_sequence_data"
+	}
+	colNames := []string{"last_value", "is_called"}
+	if len(rv.Columns) > 0 {
+		for i := range colNames {
+			if i < len(rv.Columns) {
+				colNames[i] = rv.Columns[i]
+			}
+		}
+	}
+	colTypes := []string{"int8", "bool"}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	node := &PgGetSequenceData{pos: tf.Pos(), Args: args, schema: schema}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }

@@ -1554,6 +1554,22 @@ func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Col
 			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: "text"}, Ordinal: i}
 		}
 		return cols
+	case "pg_get_sequence_data":
+		// pg_get_sequence_data(regclass) → (last_value int8, is_called bool).
+		// Mirrors planPgGetSequenceData; pg_dump's getSequences comma-joins it
+		// with pg_catalog.pg_sequence. DU-002 slice 32 (M0110-0001).
+		names := []string{"last_value", "is_called"}
+		types := []string{"int8", "bool"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
 	case "verify_heapam":
 		// verify_heapam(regclass, ...) → (blkno int8, offnum int8, attnum int4,
 		// msg text). Mirrors planVerifyHeapam. M0110-0003.

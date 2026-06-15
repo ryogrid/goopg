@@ -159,21 +159,30 @@ package testport
 // → 0 rows). pg_seclabels is a system VIEW (no oid column); cols: objoid oid,
 // classoid oid, objsubid int4, objtype text, objnamespace oid, objname text,
 // provider text, label text.
-// **Next blocker (precise, confirmed empirically by this test):** pg_dump
-// advances to sequence collection (getSequences) and fails with
-// `relation "pg_sequence" does not exist`. Query:
-//   SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement,
-//     seqmax, seqmin, seqcache, seqcycle, last_value, is_called
-//   FROM pg_catalog.pg_sequence, pg_get_sequence_data(seqrelid) ORDER BY seqrelid
-// pg_sequence is a real catalog (one row per sequence relation) joined with the
-// set-returning function pg_get_sequence_data (runtime last_value/is_called).
-// The next DU-002 slice must decide: if goopg has no sequence support an empty
-// `pg_sequence` view (0 rows) suffices — BUT the LATERAL pg_get_sequence_data
-// call must also resolve (a function, not a view). Verify whether goopg supports
-// CREATE SEQUENCE before assuming 0 rows; if sequences exist, the view + function
-// must return real data. pg_sequence cols (pg_sequence.h): seqrelid oid,
+// (DU-002 slice 32) The empty `pg_sequence` virtual view (OID 2224) is now
+// defined in internal/catalog/catalog.go and `pg_get_sequence_data(regclass)`
+// is registered as a FROM-clause SRF (last_value int8, is_called bool) in the
+// analyzer (tableFuncColumns) + planner (planPgGetSequenceData) + executor, so
+// getSequences' query `SELECT seqrelid, format_type(seqtypid, NULL), seqstart,
+// … FROM pg_catalog.pg_sequence, pg_get_sequence_data(seqrelid) ORDER BY
+// seqrelid` (an implicit-LATERAL comma join) no longer errors. goopg's sequence
+// virtual tables are skipped from the pg_class virtual view (Virtual && no
+// View), so pg_dump's getTables never discovers a relkind='S' relation; an
+// empty pg_sequence (0 rows) is consistent with that, and pg_get_sequence_data
+// is never invoked over the empty set. (Full sequence-dump support — surfacing
+// sequences as relkind='S' in pg_class and populating seqrelid here — is a
+// larger follow-up slice.) pg_sequence cols (pg_sequence.h): seqrelid oid,
 // seqtypid oid, seqstart int8, seqincrement int8, seqmax int8, seqmin int8,
 // seqcache int8, seqcycle bool.
+// **Next blocker (precise, confirmed empirically by this test):** pg_dump
+// advances past getSequences and fails with
+// `pg_dump: error: could not parse result of current_schemas()`. pg_dump's
+// findNamespace / dumpable-object setup calls current_schemas(true) and parses
+// the returned name[] (text-array) literal. goopg's current_schemas() result is
+// not rendered in the `{a,b}` array-literal text form pg_dump's parsePGArray
+// expects (likely the binary/KindString array encoding — cf. the orthogonal
+// text[]-from-heap note in working_set). The next DU-002 slice must make
+// current_schemas() return a parseable name[] array literal over the wire.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker

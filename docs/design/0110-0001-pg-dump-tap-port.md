@@ -733,6 +733,33 @@ fixed one logical group per loop:
     rows. pg_sequence cols (`pg_sequence.h`): seqrelid oid, seqtypid oid, seqstart
     int8, seqincrement int8, seqmax int8, seqmin int8, seqcache int8, seqcycle bool.
 
+32. **`pg_sequence` empty virtual view + `pg_get_sequence_data` SRF — DONE.**
+    Two parts resolved `getSequences`'s `FROM pg_catalog.pg_sequence,
+    pg_get_sequence_data(seqrelid)` comma join (an implicit LATERAL): (a) an empty
+    `pg_sequence` virtual catalog (OID 2224, 0 rows) registered in
+    `internal/catalog/catalog.go` beside `pg_seclabels`, cols matching
+    `pg_sequence.h` (seqrelid oid, seqtypid oid, seqstart/seqincrement/seqmax/
+    seqmin/seqcache int8, seqcycle bool); (b) `pg_get_sequence_data(regclass)`
+    registered as a FROM-clause SRF returning (last_value int8, is_called bool) -
+    `tableFuncColumns` in `internal/analyzer/analyzer.go` (so the analyzer's
+    column resolution sees the shape; the analyzer runs *before* the planner and
+    was the actual gate), `planPgGetSequenceData` + the `PgGetSequenceData` plan
+    node in `internal/planner/`, and `pgGetSequenceDataOp` (0 rows) in
+    `internal/executor/`. CREATE SEQUENCE *is* supported, but goopg's sequence
+    virtual tables are skipped from the `pg_class` virtual view (Virtual with no
+    `View`), so pg_dump's `getTables` never discovers a relkind='S' relation to
+    dump - an empty `pg_sequence` is consistent with that, and the SRF is never
+    invoked over the empty left side. **Full sequence-dump support (surfacing
+    sequences as relkind='S' in pg_class, then populating seqrelid here from the
+    sequence registry) is a larger follow-up slice - tracked, not done here.**
+    After this slice sequence collection passes; the **new** blocker is
+    `pg_dump: error: could not parse result of current_schemas()` - pg_dump's
+    dumpable-object setup parses the `name[]` text-array literal returned by
+    `current_schemas(true)`, and goopg does not render it in the `{a,b}`
+    array-literal form `parsePGArray` expects (cf. the orthogonal text[]-from-heap
+    array-encoding note). The next slice must make `current_schemas()` emit a
+    parseable `name[]` array literal over the wire.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; it logs the remaining

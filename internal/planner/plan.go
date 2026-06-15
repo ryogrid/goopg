@@ -1089,6 +1089,25 @@ func (n *PgGetPublicationTables) Output() Schema { return n.schema }
 func (n *PgInputErrorInfo) Pos() int       { return n.pos }
 func (n *PgInputErrorInfo) Output() Schema { return n.schema }
 
+// PgGetSequenceData implements pg_get_sequence_data(regclass) as a FROM-clause
+// SRF. pg_dump's getSequences comma-joins it with pg_catalog.pg_sequence
+// (`FROM pg_sequence, pg_get_sequence_data(seqrelid)`) to read each sequence's
+// runtime (last_value int8, is_called bool). goopg's pg_sequence virtual view
+// is empty (sequences are not surfaced in pg_class, so pg_dump never discovers
+// one to dump), so this SRF is only ever planned, never executed over a
+// non-empty left side — it always returns 0 rows. The correlated seqrelid
+// argument is resolved against the lateral outer context so the comma-join
+// binds as a LATERAL join (mirrors PgGetPublicationTables). M0110-0001
+// (DU-002 slice 32).
+type PgGetSequenceData struct {
+	pos    int
+	Args   []Expr
+	schema Schema
+}
+
+func (n *PgGetSequenceData) Pos() int       { return n.pos }
+func (n *PgGetSequenceData) Output() Schema { return n.schema }
+
 // PgAvailableWalSummaries implements pg_available_wal_summaries() as a
 // FROM-clause SRF. Returns (tli int8, start_lsn pg_lsn, end_lsn pg_lsn)
 // for each available WAL summary file. goopg v0 has no WAL summarizer

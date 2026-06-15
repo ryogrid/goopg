@@ -4137,6 +4137,44 @@ func (c *InMemory) registerSystemTables() {
 	pgSeclabels.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_seclabels"] = pgSeclabels
 
+	// pg_sequence — per-sequence parameter catalog (OID 2224, one row per
+	// sequence relation). After getTables, pg_dump's getSequences issues:
+	//   SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement,
+	//     seqmax, seqmin, seqcache, seqcycle, last_value, is_called
+	//   FROM pg_catalog.pg_sequence, pg_get_sequence_data(seqrelid)
+	//   ORDER BY seqrelid
+	// (an implicit-LATERAL comma join with the set-returning function
+	// pg_get_sequence_data, which supplies the runtime last_value/is_called).
+	// goopg's sequence virtual tables are skipped from the pg_class virtual view
+	// (Virtual && View==nil; see the pg_class VirtualRows builder above), so
+	// pg_dump's getTables never discovers a relkind='S' relation and no sequence
+	// is ever dumped. An empty pg_sequence (0 rows) is therefore consistent with
+	// the current relation-discovery story, and pg_get_sequence_data is never
+	// invoked over the empty set. Full sequence-dump support (surfacing sequences
+	// as relkind='S' in pg_class, then populating seqrelid here from the sequence
+	// registry) is a larger follow-up slice. pg_sequence is a real catalog with
+	// no `oid` system column; cols match pg_sequence.h (PG18, SequenceRelationId
+	// 2224): seqrelid oid, seqtypid oid, seqstart int8, seqincrement int8,
+	// seqmax int8, seqmin int8, seqcache int8, seqcycle bool. M0110-0001
+	// (DU-002 slice 32). pg_get_sequence_data is registered as a FROM-clause SRF
+	// in internal/planner/planner.go.
+	pgSequence := &Table{
+		Schema: "pg_catalog", Name: "pg_sequence", Virtual: true,
+		Columns: []Column{
+			{Name: "seqrelid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "seqtypid", Type: Type{Name: "oid"}, Ordinal: 1},
+			{Name: "seqstart", Type: Type{Name: "int8"}, Ordinal: 2},
+			{Name: "seqincrement", Type: Type{Name: "int8"}, Ordinal: 3},
+			{Name: "seqmax", Type: Type{Name: "int8"}, Ordinal: 4},
+			{Name: "seqmin", Type: Type{Name: "int8"}, Ordinal: 5},
+			{Name: "seqcache", Type: Type{Name: "int8"}, Ordinal: 6},
+			{Name: "seqcycle", Type: Type{Name: "bool"}, Ordinal: 7},
+		},
+		OID: 2224,
+	}
+	pgSequence.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_sequence"] = pgSequence
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

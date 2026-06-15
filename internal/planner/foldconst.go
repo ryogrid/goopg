@@ -189,6 +189,10 @@ func foldPlanConstantsInner(node Node) {
 		}
 	case *PgAvailableWalSummaries:
 		// no sub-expressions to fold
+	case *PgGetSequenceData:
+		for i := range n.Args {
+			n.Args[i] = FoldConstants(n.Args[i])
+		}
 	case *PgOptionsToTable:
 		if n.Arg != nil {
 			n.Arg = FoldConstants(n.Arg)

@@ -1723,6 +1723,28 @@ object support.
         view). pg_sequence cols (`pg_sequence.h`): seqrelid oid, seqtypid oid,
         seqstart int8, seqincrement int8, seqmax int8, seqmin int8, seqcache int8,
         seqcycle bool.
+      - **PROGRESS 2026-06-16 (loop #55):** **DU-002 slice 32 LANDED.** Empty
+        `pg_sequence` virtual view (OID 2224, 0 rows) in
+        `internal/catalog/catalog.go` + `pg_get_sequence_data(regclass)`
+        registered as a FROM-clause SRF (last_value int8, is_called bool) across
+        `tableFuncColumns` (analyzer — the actual gate, runs before the planner),
+        `planPgGetSequenceData`/`PgGetSequenceData` (planner), and
+        `pgGetSequenceDataOp` (executor, 0 rows). `getSequences`'s implicit-LATERAL
+        comma join now resolves. CREATE SEQUENCE *is* supported, but goopg
+        sequences are skipped from the `pg_class` virtual view (Virtual, no View)
+        so pg_dump never discovers a relkind='S' relation — empty pg_sequence is
+        consistent and the SRF is never invoked over the empty left side. **Full
+        sequence-dump (sequences as relkind='S' in pg_class + seqrelid population)
+        is a larger follow-up slice — NOT done here.** build/gofmt/vet clean;
+        catalog/analyzer/planner/executor suites PASS; new regression tests
+        `TestPgGetSequenceDataGetSequencesQuery`/`TestPgGetSequenceDataSchema`
+        PASS; `TestPort_PgDumpConnectionSetup` PASS. **Next blocker (precise,
+        empirical):** `pg_dump: error: could not parse result of
+        current_schemas()` — pg_dump parses the `name[]` text-array literal from
+        `current_schemas(true)`; goopg does not render it in the `{a,b}`
+        array-literal form `parsePGArray` expects (cf. the orthogonal
+        text[]-from-heap array-encoding note below). Resume = slice 33: make
+        `current_schemas()` emit a parseable `name[]` array literal over the wire.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text
