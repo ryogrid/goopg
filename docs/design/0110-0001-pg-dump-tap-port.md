@@ -614,6 +614,24 @@ fixed one logical group per loop:
     `catalog.TestPGAttributeColumnsCount` (24→25), `initdb.TestBootstrappedPG-
     AttributeRowsReadable` (24→25), `initdb.TestPgAttributeRowEmitsNullForOptional-
     ArrayColumns` (24→25 cols, attstattarget added to the NULL set).
+25. **`pg_partitioned_table` empty virtual view — DONE.** After `getTableAttrs`,
+    pg_dump probes partition keys with `SELECT partrelid FROM pg_partitioned_table
+    WHERE (SELECT c.oid FROM pg_opclass c JOIN pg_am a ON c.opcmethod = a.oid
+    WHERE opcname = 'enum_ops' AND opcnamespace = 'pg_catalog'::regnamespace AND
+    amname = 'hash') = ANY(partclass)`. goopg surfaces partition membership via
+    `pg_class.relkind='p'/'P'` + `pg_inherits`, not a separate per-partition-key
+    heap, so an empty view (0 rows) is correct — no user partitioned tables in
+    the dumped schema. Added an empty `pg_partitioned_table` virtual view (OID
+    3350) in `internal/catalog/catalog.go` beside `pg_range`/`pg_event_trigger`.
+    Schema matches `pg_partitioned_table.h`: partrelid oid, partstrat "char",
+    partnatts int2, partdefid oid, partattrs int2vector, partclass oidvector,
+    partcollation oidvector, partexprs pg_node_tree — with int2vector/oidvector
+    represented as int2[]/oid[] per goopg's pg_index `indkey`/`indclass`
+    convention. With 0 rows `= ANY(partclass)` is never evaluated. After this
+    slice the partition probe passes; the **new** blocker is `relation
+    "pg_trigger" does not exist` (per-table trigger collection `getTriggers`:
+    `SELECT t.tgrelid, t.tgname, pg_get_triggerdef(...) … FROM unnest('{}'::oid[])
+    AS src(tbloid) JOIN pg_trigger t ON …`) — another empty-view slice next.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

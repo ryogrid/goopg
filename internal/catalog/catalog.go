@@ -3929,6 +3929,40 @@ func (c *InMemory) registerSystemTables() {
 	pgEventTrigger.VirtualRows = func() [][]string { return nil }
 	c.tables["pg_catalog.pg_event_trigger"] = pgEventTrigger
 
+	// pg_partitioned_table — partition-key catalog (OID 3350). After
+	// getEventTriggers, pg_dump's getTableAttrs / collectComments path probes
+	// partitioning metadata. The query that first hits this catalog is:
+	//   SELECT partrelid FROM pg_partitioned_table WHERE (SELECT c.oid FROM
+	//   pg_opclass c JOIN pg_am a ON c.opcmethod = a.oid WHERE opcname =
+	//   'enum_ops' AND opcnamespace = 'pg_catalog'::regnamespace AND amname =
+	//   'hash') = ANY(partclass)
+	// goopg surfaces partition membership through pg_class.relkind='p'/'P' and
+	// pg_inherits, not a separate per-partition-key heap, so an empty view (0
+	// rows) is correct here — no user partitioned tables exist in the dumped
+	// schema, identical to a stock PG cluster with none. With 0 rows the
+	// `= ANY(partclass)` predicate is never evaluated, so the oidvector column
+	// is fine. Schema matches PG's pg_partitioned_table (pg_partitioned_table.h):
+	// partrelid oid, partstrat "char", partnatts int2, partdefid oid, partattrs
+	// int2vector, partclass oidvector, partcollation oidvector, partexprs
+	// pg_node_tree. goopg represents int2vector/oidvector as int2[]/oid[] (see
+	// pg_index indkey/indclass). M0110-0001 (DU-002 slice 25).
+	pgPartitionedTable := &Table{
+		Schema: "pg_catalog", Name: "pg_partitioned_table", Virtual: true,
+		Columns: []Column{
+			{Name: "partrelid", Type: Type{Name: "oid"}, Ordinal: 0},
+			{Name: "partstrat", Type: Type{Name: "char"}, Ordinal: 1},
+			{Name: "partnatts", Type: Type{Name: "int2"}, Ordinal: 2},
+			{Name: "partdefid", Type: Type{Name: "oid"}, Ordinal: 3},
+			{Name: "partattrs", Type: Type{Name: "int2[]"}, Ordinal: 4},
+			{Name: "partclass", Type: Type{Name: "oid[]"}, Ordinal: 5},
+			{Name: "partcollation", Type: Type{Name: "oid[]"}, Ordinal: 6},
+			{Name: "partexprs", Type: Type{Name: "pg_node_tree"}, Ordinal: 7},
+		},
+		OID: 3350,
+	}
+	pgPartitionedTable.VirtualRows = func() [][]string { return nil }
+	c.tables["pg_catalog.pg_partitioned_table"] = pgPartitionedTable
+
 	// Update pg_settings to include more enable_* settings so sysviews.sql
 	// `select name, setting from pg_settings where name like 'enable%'` is non-empty.
 	pgSettings.VirtualRows = func() [][]string {

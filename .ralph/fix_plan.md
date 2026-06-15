@@ -1606,6 +1606,25 @@ object support.
         = ANY(partclass)`). Resume = slice 25: add the empty
         `pg_partitioned_table` virtual view (`pg_partitioned_table.h`, OID 3350)
         — back to the empty-view pattern.
+      - **PROGRESS 2026-06-16 (loop #49):** **DU-002 slice 25 LANDED**
+        (empty `pg_partitioned_table` virtual view, OID 3350). pg_dump's
+        partition-key probe (`SELECT partrelid FROM pg_partitioned_table WHERE
+        (SELECT c.oid FROM pg_opclass …) = ANY(partclass)`) now resolves. goopg
+        surfaces partition membership via `pg_class.relkind='p'/'P'`+
+        `pg_inherits`, not a per-partition-key heap, so 0 rows is correct; with
+        0 rows `= ANY(partclass)` is never evaluated. Added in
+        `internal/catalog/catalog.go` beside `pg_range`/`pg_event_trigger`;
+        schema matches `pg_partitioned_table.h` (partrelid oid, partstrat "char",
+        partnatts int2, partdefid oid, partattrs int2vector→int2[], partclass
+        oidvector→oid[], partcollation oidvector→oid[], partexprs pg_node_tree).
+        build/gofmt/vet clean; catalog suite PASS; `TestPort_PgDumpConnectionSetup`
+        PASS. **Next blocker (precise, empirical):** pg_dump advances to per-table
+        trigger collection (`getTriggers`) → `relation "pg_trigger" does not
+        exist` (`SELECT t.tgrelid, t.tgname, pg_get_triggerdef(...) … FROM
+        unnest('{}'::oid[]) AS src(tbloid) JOIN pg_trigger t ON …`). Resume =
+        slice 26: add the empty `pg_trigger` virtual view (`pg_trigger.h`, OID
+        2620) — empty-view pattern (no user triggers; unnest('{}') source is
+        empty so the JOIN/pg_get_triggerdef never evaluate).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

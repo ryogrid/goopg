@@ -1,49 +1,44 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 24
-(pg_attribute.attstattarget) COMPLETE this loop. NOTHING in flight; next loop
-starts on slice 25 (empty pg_partitioned_table virtual view).
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 25
+(pg_partitioned_table empty view) COMPLETE this loop. NOTHING in flight; next
+loop starts on slice 26 (empty pg_trigger virtual view).
 
-=== DONE (loop #48) — DU-002 slice 24 ===
-getTableAttrs reads `a.attstattarget`. goopg's pg_attribute already exposed
-every OTHER getTableAttrs column (attstorage/attcompression/attidentity/
-atthasmissing/attmissingval/attgenerated/attfdwoptions/attcollation/attislocal/
-atthasdef) — so only attstattarget was missing (single-column slice, NOT the
-broad-column slice prior notes predicted). PG18 = NULLABLE int2 (CATALOG_VARLEN
-BKI_FORCE_NULL). Added in lockstep to 4 sibling layouts:
-- internal/catalog/codec.go PGAttributeColumns (queryable schema, name resolve)
-- internal/initdb/initdb.go pgAttrColDefs + pgAttributeRow (nailed heap write)
-- internal/executor/pg18_user_catalog_rows.go pgAttributeColumnsPG18 +
-  buildUserPGAttributeRow (user-table heap write)
-APPENDED LAST (not PG18-canonical #4): goopg heap is already non-canonical and
-DecodePGAttributePhysicalRow (codec.go) reads attrelid/attname/atttypid/attnum/
-attnotnull/attisdropped by HARDCODED BYTE OFFSET. A trailing always-NULL column
-(like existing attacl/attoptions/attfdwoptions/attmissingval) keeps every offset
-valid; null bitmap 3→4 bytes stays within MAXALIGN(8) → t_hoff=32 unchanged.
-SELECT resolves by name → pg_dump reads NULL → default stats target -1.
-LEFT UNTOUCHED: initdb.pgAttributeAttrs (relcache-init tupdesc PG standby reads)
-— already a separately-divergent 24-col layout (lists attstattarget#4+attcacheoff#8,
-omits attfdwoptions/attmissingval); fully-canonical on-disk pg_attribute is a
-larger PG-standby task, out of scope.
-Tests: count assertions bumped 24→25 in catalog.TestPGAttributeColumnsCount,
-initdb.TestBootstrappedPGAttributeRowsReadable,
-initdb.TestPgAttributeRowEmitsNullForOptionalArrayColumns (added attstattarget
-to NULL set). Design doc 0110-0001 slice-24 block; pgdump_connsetup_test.go
-header updated (next blocker → pg_partitioned_table); fix_plan loop #48 entry.
-Gates: build/gofmt/vet clean; catalog+initdb+executor suites PASS;
-TestPort_PgDumpConnectionSetup PASS. tpch-spotcheck N/A (additive trailing NULL
-column on a catalog only; zero existing query row-count risk — column resolved
-by name, physical offsets/t_hoff unchanged).
+=== DONE (loop #49) — DU-002 slice 25 ===
+Added empty `pg_partitioned_table` virtual view (OID 3350) in
+internal/catalog/catalog.go beside pg_range/pg_event_trigger. pg_dump's
+partition-key probe (`SELECT partrelid FROM pg_partitioned_table WHERE (SELECT
+c.oid FROM pg_opclass …) = ANY(partclass)`) now resolves instead of erroring.
+goopg surfaces partition membership via pg_class.relkind='p'/'P' + pg_inherits,
+NOT a per-partition-key heap, so 0 rows is correct; with 0 rows the
+`= ANY(partclass)` predicate is never evaluated. Schema matches
+pg_partitioned_table.h: partrelid oid, partstrat "char", partnatts int2,
+partdefid oid, partattrs int2vector→int2[], partclass oidvector→oid[],
+partcollation oidvector→oid[], partexprs pg_node_tree (int2vector/oidvector
+represented as int2[]/oid[] per pg_index indkey/indclass convention).
+VirtualRows returns nil (empty). Pure additive virtual view — zero existing
+query/row-count risk.
+Updated: catalog.go (view def), pgdump_connsetup_test.go (next-blocker header
+→ pg_trigger), design doc 0110-0001 (slice-25 block), fix_plan loop #49 entry.
+Gates: build/gofmt/vet clean; catalog suite PASS;
+TestPort_PgDumpConnectionSetup PASS. tpch-spotcheck N/A (additive empty virtual
+catalog view only; no physical/codec/executor change).
 
-=== NEXT STEP — DU-002 slice 25 (pg_partitioned_table empty view) ===
-pg_dump now fails: `relation "pg_partitioned_table" does not exist`. Query:
-`SELECT partrelid FROM pg_partitioned_table WHERE (SELECT c.oid FROM pg_opclass
-c JOIN pg_am a ON c.opcmethod = a.oid WHERE opcname = 'enum_ops' AND
-opcnamespace = 'pg_catalog'::regnamespace AND amname = 'hash') = ANY(partclass)`.
-Add empty pg_partitioned_table virtual view (pg_partitioned_table.h, OID 3350:
-partrelid oid, partstrat "char", partnatts int2, partdefid oid, partattrs
-int2vector, partclass oidvector, partcollation oidvector, partexprs pg_node_tree)
-in internal/catalog/catalog.go beside pg_event_trigger/pg_range. goopg surfaces
-partition metadata via pg_class.relkind='p', not a separate heap, so empty view
-is correct for the dump (RUN test to confirm + find next blocker empirically).
+=== NEXT STEP — DU-002 slice 26 (pg_trigger empty view) ===
+pg_dump now fails: `relation "pg_trigger" does not exist`. Query (getTriggers):
+`SELECT t.tgrelid, t.tgname, pg_catalog.pg_get_triggerdef(t.oid, false) AS tgdef,
+t.tgenabled, t.tableoid, t.oid, t.tgparentid <> 0 AS tgispartition FROM
+unnest('{}'::pg_catalog.oid[]) AS src(tbloid) JOIN pg_catalog.pg_trigger t ON
+(src.tbloid = t.tgrelid) LEFT JOIN pg_catalog.pg_trigger u ON (u.oid =
+t.tgparentid) WHERE ((NOT t.tgisinternal AND t.tgparentid = 0) OR t.tgenabled !=
+u.tgenabled) ORDER BY t.tgrelid, t.tgname`.
+Add empty pg_trigger virtual view (pg_trigger.h, OID 2620) in catalog.go beside
+pg_partitioned_table. goopg has no user triggers, so 0 rows is correct; the
+unnest('{}') source is empty so the JOIN and pg_get_triggerdef are never
+evaluated. Cols (pg_trigger.h): oid, tgrelid oid, tgparentid oid, tgname name,
+tgfoid oid, tgtype int2, tgenabled "char", tgisinternal bool, tgconstrrelid oid,
+tgconstrindid oid, tgconstraint oid, tgdeferrable bool, tginitdeferred bool,
+tgnargs int2, tgattr int2vector→int2[], tgargs bytea, tgqual pg_node_tree,
+tgoldtable name, tgnewtable name. RUN TestPort_PgDumpConnectionSetup to confirm
++ find next blocker empirically.
 
 ORTHOGONAL PRE-EXISTING (track separately): reading a text[] column back from
 the heap yields the BINARY array encoding (KindString raw bytes), not the text
