@@ -1277,6 +1277,17 @@ func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
 		var args []Expr
 		if !(p.cur().Kind == TokenSymbol && p.cur().Value == ")") {
 			for {
+				// Named argument: `name => value` / `name := value` — strip the
+				// name and map positionally, mirroring parseFuncCallTail's
+				// expression-context handling (sibling path). pg_amcheck emits
+				// `verify_heapam(relation := c.oid, on_error_stop := false, …)` as
+				// a FROM-clause SRF, so this path must accept it too (M0110-0003 S5).
+				if isNamedArgNameToken(p.cur().Kind) &&
+					p.peek(1).Kind == TokenOperator &&
+					(p.peek(1).Value == "=>" || p.peek(1).Value == ":=") {
+					p.advance() // skip name
+					p.advance() // skip the `=>` / `:=` separator
+				}
 				// Accept (and ignore) a leading VARIADIC marker on this argument.
 				// libpqrcv's fetch_table_list probe emits the shape
 				// `pg_get_publication_tables(VARIADIC array_agg(...))` against a
@@ -3144,6 +3155,15 @@ func isNoParenFuncName(name string) bool {
 	return false
 }
 
+// isNamedArgNameToken reports whether a token of kind k may serve as the name
+// of a `name := value` / `name => value` named function argument. The name is
+// an identifier, a quoted identifier, or an unreserved keyword (e.g. `index`,
+// `skip` in pg_amcheck's amcheck calls); the trailing `:=`/`=>` lookahead the
+// callers apply makes accepting keywords here unambiguous.
+func isNamedArgNameToken(k TokenKind) bool {
+	return k == TokenIdent || k == TokenQuotedIdent || k == TokenKeyword
+}
+
 func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 	// '(' already on the cursor.
 	p.advance()
@@ -3165,12 +3185,20 @@ func (p *parser) parseFuncCallTail(pos int, name ObjectName) (Expr, error) {
 		fc.Distinct = true
 	}
 	for {
-		// Named argument: `name => value` — skip the name and use only the value.
-		// PostgreSQL named arguments are positionally mapped for built-ins. M0097-0003.
-		if (p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent) &&
-			p.peek(1).Kind == TokenOperator && p.peek(1).Value == "=>" {
+		// Named argument: `name => value` or the legacy `name := value` form —
+		// skip the name and use only the value. PostgreSQL named arguments are
+		// positionally mapped for built-ins. M0097-0003. The `:=` spelling is the
+		// pre-9.5 syntax that `pg_amcheck` still emits, e.g.
+		// `verify_heapam(relation := c.oid, on_error_stop := false, …)` and
+		// `bt_index_check(index := c.oid, heapallindexed := false)` (M0110-0003 S5).
+		// The name may itself be an unreserved keyword (e.g. `index`, `skip`); the
+		// trailing `:=`/`=>` lookahead disambiguates so accepting TokenKeyword here
+		// is unambiguous.
+		if isNamedArgNameToken(p.cur().Kind) &&
+			p.peek(1).Kind == TokenOperator &&
+			(p.peek(1).Value == "=>" || p.peek(1).Value == ":=") {
 			p.advance() // skip name
-			p.advance() // skip =>
+			p.advance() // skip the `=>` / `:=` separator
 		}
 		// VARIADIC marker — used by libpqrcv fetch_table_list against
 		// `pg_get_publication_tables(VARIADIC array_agg(...))` (M0103-0008

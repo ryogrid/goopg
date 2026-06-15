@@ -1,6 +1,6 @@
 # 0110-0008 — amcheck SQL surface wiring plan (M0110-0003)
 
-**Status:** S1+S2+S3+S4 landed (worktree `m0110-0003-amcheck-sql-surface`); S5 remains (merge blocked on a clean working tree)
+**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing landed (worktree `m0110-0003-amcheck-sql-surface`); S5 LATERAL/clog/TAP-port remain (merge blocked on a clean working tree)
 **Scope:** the `CREATE EXTENSION amcheck` + SRF SQL surface that wires the
 already-committed `internal/amcheck` engine to the wire protocol and promotes the
 deferred `AC-002`…`AC-005` pg_amcheck TAP tests.
@@ -105,7 +105,7 @@ type-check; their execution is exercised by `003`/`004`, not `002`.
 | **S2** | `pg_extension` catalog relation + the §1 probe answerable; seed `pg_proc` rows for the three SRFs (exist, not yet callable) | **AC-002** (`002_nonesuch`) | `catalog/catalog.go`, `planner/planner.go` (FROM whitelist) |
 | **S3 ✅** | `verify_heapam(...)` SRF executor — a **thin adapter** over `amcheck.VerifyHeapRelation` (the block loop lives in the engine, `verify_heapam_relation.go`): fills a `PageSource` from the buffer pool, passes `nblocks` + `RelDesc.Natts`/`NextXid`/`RelFrozenXid` (clog-backed `XidStatusFunc` deferred — no clog handle in the executor yet), streams `HeapRelReport`s as `(blkno,offnum,attnum,msg)` rows | (toward AC-004 heap path) | `planner/{plan,planner,foldconst,unnest}.go`, `parser/select.go`, `analyzer/analyzer.go`, new `executor/operators_verify_heapam.go` + `executor.go` |
 | **S4 ✅** | `bt_index_check` / `bt_index_parent_check` scalar `void` functions over `amcheck.VerifyBtree*` — they are SELECT-list scalars (not FROM SRFs like verify_heapam), so they live in `evalFuncCall` dispatch; structural tiers (`VerifyBtreePage`/`VerifyBtreeItemOrder` per block, `VerifyBtreeLevelSiblingLinks` per level via leftmost-descent, `VerifyBtreeParentDownlinks` per internal page on parent-check) raise `XX002` on findings; `heapallindexed`/`rootdescend`/`checkunique` args accepted, deeper tiers deferred to S5 | (toward AC-003/004 index path) | `planner/planner.go` (`exprType` void), `executor/expr.go` (dispatch), new `executor/operators_bt_index_check.go` |
-| **S5** | port `002`→`005` TAP tests; flip CSV `AC-002…AC-005`→`port`; regen md | — | `internal/testport/pgamcheck_port_test.go`, `docs/test-port/*` |
+| **S5 (partial)** | named-arg `:=`/`=>` parsing in both expr + FROM-SRF paths ✅; then LATERAL resolution of `c.oid`, clog `XidStatusFunc`, port `002`→`005` TAP tests, flip CSV `AC-002…AC-005`→`port`, regen md | **AC-002…AC-005** | `parser/select.go` ✅; `internal/testport/pgamcheck_port_test.go`, `docs/test-port/*` |
 
 New-file slices (the executor ops, the testport additions) touch **zero**
 contaminated files; only S1/S2's parser/dispatch/catalog edits and S3/S4's
@@ -175,6 +175,31 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
     Tests: `executor.TestBtIndexCheck_{CleanIndexNoError (no-false-positive gate,
     both funcs, all positional shapes), DetectsCorruptMetapage (clobbered magic →
     raise), NonexistentIndex}`. All PASS.
+- **S5 (in progress) — named-argument parser support LANDED** (parser only, zero
+  contaminated files): pg_amcheck emits its amcheck calls with the legacy
+  `name := value` named-argument spelling — `bt_index_check(index := c.oid,
+  heapallindexed := false)` and, as a FROM-clause SRF,
+  `verify_heapam(relation := c.oid, on_error_stop := false, …)`. goopg already
+  stripped the modern `name => value` spelling positionally (M0097-0003) in the
+  **expression** function-call path (`parseFuncCallTail`), but (a) only for `=>`,
+  not `:=`, and (b) **not at all** in the **FROM-clause SRF** arg loop
+  (`parseRangeVar`) — the sibling path. Both paths now accept `:=`/`=>` and strip
+  the name, mapping positionally; the verify_heapam executor's positional order
+  (`relation, on_error_stop, check_toast, skip, startblock, endblock`) and
+  bt_index_check's (`index` first) already match pg_amcheck's named order, so the
+  strip binds correctly. The argument *name* may be an unreserved keyword (e.g.
+  `index`, `skip`), so the token check accepts `TokenKeyword` too — unambiguous
+  because the `:=`/`=>` lookahead gates it (`isNamedArgNameToken`). Files:
+  `internal/parser/select.go` only. Tests:
+  `parser.TestParseNamedArgColonEqual{,FromSRF,EquivalentToFatArrow}` (4 cases:
+  both scalar funcs, the full 6-arg FROM-clause SRF with the correlated `c.oid`
+  first arg, and `:=`≡`=>` equivalence). All PASS; full parser/analyzer/planner
+  suites green. **Still remaining for the client query shape:** LATERAL
+  *resolution* — the FROM-clause `verify_heapam(relation := c.oid, …)` correlates
+  against `pg_class c` (an implicit-LATERAL comma-join). Parsing now succeeds and
+  `c.oid` lands as a `ColumnRef`, but the planner/executor still need to resolve
+  that outer reference per-row. That, plus the clog `XidStatusFunc` wiring and the
+  TAP port itself, is the rest of S5.
 - **Remaining:** S5 port the `AC-002`…`AC-005` pg_amcheck TAP tests. Per the scope
   refinement above, `002_nonesuch` (`AC-002`) exercises only `CREATE EXTENSION
   amcheck` + the install probe, so S1+S2 satisfy its *server-side* requirement;
@@ -205,9 +230,11 @@ them):
    is active.
 3. **named-argument + LATERAL call shape** — pg_amcheck issues
    `bt_index_check(index := c.oid, heapallindexed := false)` correlated against
-   `pg_class ⋈ pg_index`. goopg's parser has no `name := value` syntax, so S4 is
-   **positional-only** (`bt_index_check('ix')`, `bt_index_check('ix', false)`),
-   shared with S3's identical follow-up — the named-arg + LATERAL plumbing is S5.
+   `pg_class ⋈ pg_index`. **Named-argument parsing landed in S5** (see
+   "S5 (in progress)" above) — both `:=`/`=>` spellings are now stripped
+   positionally in both the expression and FROM-clause paths, so the call *parses*.
+   The remaining piece, shared with S3's identical follow-up, is **LATERAL
+   resolution** of the `c.oid` outer reference at plan/exec time.
 
 **S3 carries two intentional follow-ups** (recorded so S5 does not re-discover
 them):
@@ -219,8 +246,10 @@ them):
    active. Wiring clog through `Context` enables the remaining tier.
 2. **named-argument + LATERAL call shape** — pg_amcheck itself issues
    `verify_heapam(relation := c.oid, on_error_stop := false, …)` correlated
-   against `pg_class` (a LATERAL cross join with `:=` named args). goopg's parser
-   has no `name := value` argument syntax, so S3 supports **positional**
-   arguments only (`verify_heapam('t')`, `verify_heapam('t', false, false,
-   'none', 0, 5)`), verified by a direct Go executor test. The named-arg + LATERAL
-   plumbing the client query needs is part of the S5 TAP port.
+   against `pg_class` (a LATERAL cross join with `:=` named args). **Named-argument
+   parsing landed in S5** (see "S5 (in progress)" above): the FROM-clause SRF arg
+   loop now strips `:=`/`=>` names so the six-arg form parses with `c.oid` as the
+   first positional `ColumnRef`. The positional executor path (`verify_heapam('t')`,
+   `verify_heapam('t', false, false, 'none', 0, 5)`) is unchanged and still
+   verified by the direct Go executor test. The remaining piece is **LATERAL
+   resolution** of `c.oid`, part of the S5 TAP port.
