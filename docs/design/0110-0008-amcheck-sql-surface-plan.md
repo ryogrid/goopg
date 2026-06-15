@@ -1,6 +1,6 @@
 # 0110-0008 — amcheck SQL surface wiring plan (M0110-0003)
 
-**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing + gap #6 LATERAL `c.oid` resolution landed (planner + executor OpNode-path forwarding); S5 clog `XidStatusFunc` + AC-002…AC-005 TAP-port remain. `002_nonesuch` now self-skips on gap #7 (connection/resolution-level behaviors).
+**Status:** S1+S2+S3+S4 landed; S5 named-arg parsing + gap #6 LATERAL `c.oid` resolution + gap #7b non-existent-role rejection (handshake 28000) landed; S5 clog `XidStatusFunc` + AC-002…AC-005 TAP-port remain. `002_nonesuch` now self-skips on gap #7 (a)/(c) (database-pattern resolution + amcheck-installed detection) while asserting gap #7b as a regression guard.
 **Scope:** the `CREATE EXTENSION amcheck` + SRF SQL surface that wires the
 already-committed `internal/amcheck` engine to the wire protocol and promotes the
 deferred `AC-002`…`AC-005` pg_amcheck TAP tests.
@@ -340,15 +340,33 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
   through the comma-join driven via `BuildFastIterator`, proving the correlated
   arg binds to the correct relation per outer row).
 
-- **Remaining for AC-002 — gap #7 (connection/resolution-level behaviors).** With
-  gap #6 closed, `002_nonesuch`'s heap check runs clean and the next gaps surface:
-  (a) database-name pattern resolution (`no connectable databases to check
-  matching "…"`), (b) non-existent role rejection (`role "…" does not exist`;
-  goopg accepts any role and exits 0), (c) per-database amcheck-installed
-  detection + `template1`/`template0` registration. These are independent of the
-  SQL surface. Until they land, `002_nonesuch` self-skips via its updated gap-#7
-  preflight probe (runs `pg_amcheck --username no_such_user postgres`, detects the
-  missing role rejection).
+- **gap #7b (non-existent role rejection) — LANDED.** A connection whose role is
+  absent from goopg's runtime role authority is now rejected after authentication
+  with `FATAL` SQLSTATE `28000` `role "%s" does not exist`, mirroring PG's
+  `InitializeSessionUserId` (`utils/init/miscinit.c`). The authority is the
+  server's in-memory role set (`Server.roles`, seeded with `postgres` and
+  maintained by `CREATE`/`DROP ROLE`) plus any configured `UserStore` (pg_auth)
+  account. The trust-auth handshake path previously admitted any role and the
+  backend exited 0; the password/SCRAM paths already rejected unknown users inside
+  `checkAuth`, so this closes the trust-auth hole. The check sits in the
+  connection handshake right after `checkAuth` (PG establishes the role before the
+  database) and is gated on a real catalog registry + non-replication connection,
+  exactly like the gap #3 database-existence check, so catalog-less wire-protocol
+  unit tests and physical walsenders keep their prior behaviour
+  (`internal/server/server.go`). Regression tests:
+  `server.TestConnectNonexistentRoleRejected` (FATAL 28000 + EOF) and
+  `server.TestConnectSeededRoleAccepted` (positive twin); the `002_nonesuch`
+  port test asserts the same end-to-end via the real `pg_amcheck` binary.
+
+- **Remaining for AC-002 — gap #7 (a)/(c).** With gap #7b closed, the remaining
+  connection/resolution-level behaviors are: (a) database-name pattern resolution
+  (`no connectable databases to check matching "…"`; goopg silently accepts the
+  pattern and exits 0), and (c) per-database amcheck-installed detection +
+  `template1`/`template0` registration. These are independent of the SQL surface.
+  Until they land, `002_nonesuch` self-skips via its updated probe (runs
+  `pg_amcheck --database qqq --database postgres`, detects the missing
+  `no connectable databases to check matching "qqq"` pattern-resolution error)
+  while asserting gap #7b as a regression guard.
 
 - **After #7:** S5 still needs the clog `XidStatusFunc` wiring (for the
   clog-dependent verify_heapam tier), and the `AC-002`…`AC-005` TAP port + CSV

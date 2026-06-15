@@ -23,7 +23,11 @@ func dialAndComplete(t *testing.T, addr string) net.Conn {
 		t.Fatalf("dial: %v", err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	writeStartupPacket(t, conn, map[string]string{"user": "u"})
+	// Connect as the always-seeded "postgres" role: real-catalog test servers
+	// now reject connections from a role that does not exist (AC-002 gap #7b,
+	// PG's InitializeSessionUserId 28000). The username value is not asserted by
+	// any caller of this helper.
+	writeStartupPacket(t, conn, map[string]string{"user": "postgres"})
 	r := protocol.NewFrameReader(conn)
 	for {
 		f, err := r.ReadFrame()

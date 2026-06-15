@@ -73,11 +73,19 @@ package testport
 // lateralBindable, and the BuildFast/OpNode execution path (the server's
 // simple-protocol path) now forwards BindLateralOuter through opNodeOperator.
 //
-// REMAINING blocker is now #7: connection/resolution-level behaviors —
-// (a) database-name pattern resolution, (b) non-existent role rejection,
-// (c) per-database amcheck-installed detection + template DB registration. The
-// preflight below probes for them directly so the test self-skips on #7 rather
-// than failing.
+// UPDATE (M0110-0003, gap #7b): FIXED — a connection whose role does not exist
+// is now rejected after authentication with FATAL 28000 `role "%s" does not
+// exist`, mirroring PG's InitializeSessionUserId. goopg's in-memory role set
+// (seeded `postgres`, maintained by CREATE/DROP ROLE) plus any UserStore
+// account is the runtime authority; the trust-auth handshake path consults it
+// (the password/SCRAM paths already rejected unknown users). pg_amcheck's
+// `--username no_such_user` probe now fails the connection as upstream expects.
+//
+// REMAINING blocker is now #7 (a)/(c): connection/resolution-level behaviors —
+// (a) database-name pattern resolution and (c) per-database amcheck-installed
+// detection + template DB registration. The probe below keys on (a) so the test
+// self-skips on those rather than failing, while (7b) above is asserted as a
+// regression guard.
 //
 // Like 001_basic, the bundled pg_amcheck links a PG-17+ libpq symbol
 // (PQcancelBlocking), so it is run with LD_LIBRARY_PATH pointed at
@@ -217,31 +225,46 @@ func TestPort_PgAmcheck002Nonesuch(t *testing.T) {
 			"argument `c.oid` no longer resolves through the comma-join. stdout=%q", heap.Stdout)
 	}
 
-	// Probe for remaining gap #7 (M0110-0003): the gaps that surface once the
-	// heap check itself works are connection/resolution-level, not SQL-surface:
+	// Gap #7b (M0110-0003) is now FIXED: a connection whose role does not exist
+	// is rejected after authentication with FATAL 28000 `role "%s" does not
+	// exist`, mirroring PG's InitializeSessionUserId (utils/init/miscinit.c).
+	// goopg's in-memory role set (seeded with `postgres`, maintained by
+	// CREATE/DROP ROLE) together with any UserStore (pg_auth) account is the
+	// runtime authority for which roles exist; the trust-auth handshake path now
+	// consults it instead of accepting any role. Assert the prior "accepts any
+	// role / exits 0" behaviour is gone so a regression re-surfaces here rather
+	// than silently downstream.
+	roleProbe := runAmcheck(t, c, "--username", "no_such_user", "postgres")
+	if roleProbe.ExitCode == 0 ||
+		!strings.Contains(roleProbe.Stderr, `role "no_such_user" does not exist`) {
+		t.Fatalf("AC-002 gap #7b regressed: a connection as a non-existent role "+
+			"must fail with `role \"no_such_user\" does not exist`; got exit=%d stderr=%q",
+			roleProbe.ExitCode, roleProbe.Stderr)
+	}
+
+	// Probe for the remaining gap #7 pieces (M0110-0003): both are still
+	// connection/resolution-level and independent of the LATERAL SRF surface
+	// (gap #6) and the role check (gap #7b) already landed:
 	//   (a) database-name pattern resolution — pg_amcheck resolves each
 	//       --database argument as a connectable-name pattern and errors
 	//       `no connectable databases to check matching "<pat>"` for a name that
 	//       resolves to nothing (multi-pattern / substring / superstring cases);
-	//   (b) non-existent role rejection — connecting as a role that does not
-	//       exist must fail the connection with `role "<name>" does not exist`
-	//       (goopg currently accepts any role and exits 0);
+	//       goopg silently accepts the pattern and exits 0.
 	//   (c) per-database amcheck-installed detection + template DB registration —
 	//       `skipping database "template1": amcheck is not installed`.
-	// These are independent of the LATERAL SRF surface this loop closed. Self-skip
-	// with the precise blocker until they land; the assertion set below then runs
-	// unchanged. Probe (b) as the representative, cheapest signal.
-	userProbe := runAmcheck(t, c, "--username", "no_such_user", "postgres")
-	if userProbe.ExitCode == 0 ||
-		!strings.Contains(userProbe.Stderr, `role "no_such_user" does not exist`) {
-		t.Skipf("AC-002 blocked on remaining gap #7: connection/resolution-level "+
-			"behaviors are unimplemented — (a) database-name pattern resolution "+
-			"(`no connectable databases to check matching \"…\"`), (b) non-existent "+
-			"role rejection (`role \"no_such_user\" does not exist`; goopg exits %d "+
-			"with stderr=%q), (c) per-database amcheck-installed detection + "+
-			"template1/template0 registration. The LATERAL verify_heapam surface "+
-			"(gap #6) is fixed and the heap check runs clean.",
-			userProbe.ExitCode, userProbe.Stderr)
+	// Self-skip with the precise blocker until they land; the assertion set below
+	// then runs unchanged. Probe (a) as the representative signal — it is the
+	// first assertion that would otherwise run.
+	patProbe := runAmcheck(t, c, "--database", "qqq", "--database", "postgres")
+	if patProbe.ExitCode == 0 ||
+		!strings.Contains(patProbe.Stderr, `no connectable databases to check matching "qqq"`) {
+		t.Skipf("AC-002 blocked on remaining gap #7 (a)/(c): connection/resolution-"+
+			"level behaviors are unimplemented — (a) database-name pattern resolution "+
+			"(`no connectable databases to check matching \"qqq\"`; goopg exits %d with "+
+			"stderr=%q), (c) per-database amcheck-installed detection + template1/"+
+			"template0 registration (`skipping database \"template1\": amcheck is not "+
+			"installed`). Gap #7b (non-existent role rejection) is fixed and the heap "+
+			"check (gap #6) runs clean.", patProbe.ExitCode, patProbe.Stderr)
 	}
 
 	// --- Non-existent databases ------------------------------------------

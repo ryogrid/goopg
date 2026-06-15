@@ -1,59 +1,53 @@
-Task: M0110-0003 (AC-002 amcheck) — loop #2. LANDED gap #6 (LATERAL `c.oid`
-resolution into a FROM-clause SRF's args). A NEW gap #7 surfaced (next loop).
+Task: M0110-0003 (AC-002 amcheck) — loop #3. LANDED gap #7b (non-existent role
+rejection at connection handshake). Remaining: gap #7 (a) + (c), then clog
+XidStatusFunc wiring, then AC-002…AC-005 TAP port + CSV flip.
 
-=== WHAT LANDED (this loop) — committed directly on align-data-structure-with-pg ===
-The MAIN tree is now CLEAN (foreign gen-column WIP cleared by a human; the
-M0110 amcheck-sql worktree chain was merged — gap #5 at f0a75627). So engine
-work lands directly in the main tree again (no worktree needed).
+=== WHAT LANDED (this loop) — committed on align-data-structure-with-pg ===
+gap #7b: a connection whose role is absent from goopg's runtime role authority
+is now rejected after authentication with FATAL 28000 `role "%s" does not exist`,
+mirroring PG InitializeSessionUserId (utils/init/miscinit.c).
+- Authority = Server.roles (in-memory, seeded `postgres`, maintained by
+  CREATE/DROP ROLE) PLUS any UserStore (pg_auth) account.
+- The check is in the connection handshake right AFTER checkAuth (PG establishes
+  role before database), gated on `s.cfg.Catalog.(databaseRegistry)` + non-
+  replication — IDENTICAL gate to the gap #3 database-existence check, so
+  catalog-less wire-protocol unit tests and physical walsenders are unaffected.
+- The trust-auth path previously admitted any role (exit 0); password/SCRAM
+  already rejected unknown users in checkAuth. This closes the trust hole.
+- One test helper had to change: query_test.go dialAndComplete connected as
+  user "u" against real-catalog servers; now "postgres" (always seeded). No
+  caller asserts the username. (server_test.go's "u"/"alice" tests use
+  catalog-less servers → unaffected.)
 
-gap #6: pg_amcheck's per-relation heap check is the implicit-LATERAL comma-join
-  FROM pg_catalog.pg_class c, "public".verify_heapam(relation := c.oid, …) v
-  WHERE c.oid = <reloid>
-The correlated `c.oid` now resolves. Two-layer fix, mirroring the proven
-pg_get_publication_tables lateral pattern:
-- Planner (internal/planner/planner.go): planVerifyHeapam now takes lateralCtx
-  and resolves args against it (was empty resolveContext → "column oid does not
-  exist"); nodeReferencesOuter has a *VerifyHeapam case so the wrapping Join is
-  flagged Lateral. Call site planTableFuncRangeVar passes lateralCtx.
-- Executor: verifyHeapamOp implements lateralBindable (BindLateralOuter) + uses
-  evalExprSlot(arg, outerSlot, …) (operators_verify_heapam.go). KEY BUG: the
-  server's BuildFast/OpNode path wraps a Join's children in opNodeOperator, which
-  hid the lateralBindable interface from joinOp.openLateral → SRF arg evaluated
-  against nil slot ("column ref oid/0 on nil slot"). Fix:
-  opNodeOperator.BindLateralOuter forwards to the wrapped *opAdapterState op
-  (internal/executor/opnode.go).
-Regression tests: planner.TestPlanVerifyHeapamLateralArgResolvesAgainstLeftFromItem;
-executor.TestVerifyHeapam_LateralCommaJoinViaFastPath (corruption surfaces via
-the comma-join driven through BuildFastIterator — proves arg binds correct rel
-per outer row). 002_nonesuch probe advanced gap #6→#7.
+Files: internal/server/server.go (handshake role check),
+internal/server/role_exists_test.go (NEW: TestConnectNonexistentRoleRejected +
+TestConnectSeededRoleAccepted), internal/server/query_test.go (helper user),
+internal/testport/pgamcheck002_port_test.go (gap #7b now a regression guard;
+self-skip re-keyed to gap #7a), docs/design/0110-0008-amcheck-sql-surface-plan.md.
 
-Files: internal/planner/planner.go, internal/planner/planner_test.go,
-internal/executor/operators_verify_heapam.go, internal/executor/opnode.go,
-internal/executor/operators_verify_heapam_test.go,
-internal/testport/pgamcheck002_port_test.go,
-docs/design/0110-0008-amcheck-sql-surface-plan.md.
+Key symbols: Server.serveConn handshake (server.go ~line 705), roleExists,
+databaseRegistry gate, writeFatal, sqlstate.InvalidAuthorizationSpecification.
 
-Key symbols: planVerifyHeapam, nodeReferencesOuter, joinOp.openLateral,
-lateralBindable, verifyHeapamOp.BindLateralOuter, opNodeOperator.BindLateralOuter.
+Gates run: go test ./internal/server PASS (full suite); cmd/goopg PASS;
+TestPort_PgAmcheck002Nonesuch SKIPs cleanly on gap #7 (a)/(c) (was FAIL after
+un-skip); gofmt+vet clean; make ralph-state-guard OK. TPC-H spotcheck NOT run —
+change is connection-admission only, touches no executor/planner/codec path, so
+row counts cannot change.
 
-Gates run: go test ./internal/{planner,executor,analyzer,parser,server} PASS;
-gofmt+vet clean; TestPort_PgAmcheck002Nonesuch now SKIPs cleanly on gap #7
-(was FAIL). TPC-H spotcheck not run (parser/planner change is row-count-neutral
-for user queries; no executor row-shape change to existing ops).
-
-=== NEXT STEP (resume point) — AC-002 gap #7, its OWN bounded loop ===
-With gap #6 closed the heap check runs clean; the next 002_nonesuch failures are
-connection/resolution-level, NOT SQL surface:
-  (a) database-name pattern resolution — `no connectable databases to check
-      matching "<pat>"` for multi-pattern/substring/superstring db args;
-  (b) non-existent role rejection — `role "<name>" does not exist` (goopg accepts
-      any role, exits 0); START HERE, likely smallest.
-  (c) per-database amcheck-installed detection + template1/template0 registration
-      — `skipping database "template1": amcheck is not installed`.
-Each is an independent feature. After gap #7: clog XidStatusFunc tier wiring,
-then AC-002…AC-005 TAP port + CSV flip (docs/test-port/postgres-oracle-port-status.csv).
+=== NEXT STEP (resume point) — AC-002 gap #7 (a) then (c), each its own loop ===
+(a) database-name pattern resolution: pg_amcheck resolves each --database arg as
+    a connectable-name PATTERN and errors `no connectable databases to check
+    matching "<pat>"` when it resolves to nothing (multi-pattern / substring /
+    superstring). goopg silently accepts the pattern and exits 0. START HERE.
+    This is pg_amcheck CLIENT behavior driven by goopg's database-list bootstrap
+    query result — confirm whether the fix is goopg-side (query output shape) or
+    just that goopg returns the wrong db set. Inspect pg_amcheck.c
+    compile_database_list + the VALUES-CTE pattern query against goopg.
+(c) per-database amcheck-installed detection + template1/template0 amcheck
+    skip: `skipping database "template1": amcheck is not installed`.
+After gap #7: clog XidStatusFunc tier wiring, then AC-002…AC-005 TAP port + CSV
+flip (docs/test-port/postgres-oracle-port-status.csv).
 
 === CONTEXT ===
 Main tree is clean — commit engine work directly on align-data-structure-with-pg.
-.ralph/fix_plan.md is churned by the driver (md5 changes mid-loop) — progress
-recorded in deferral_ledger.md + this file.
+.ralph/fix_plan.md is churned by the driver — progress recorded here + ledger.

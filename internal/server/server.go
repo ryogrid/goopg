@@ -706,6 +706,37 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 		return
 	}
 
+	// M0110-0003 (AC-002 gap #7b): reject a connection whose role does not exist,
+	// mirroring PG's InitializeSessionUserId FATAL 28000 `role "%s" does not
+	// exist` (utils/init/miscinit.c). goopg's in-memory role set (seeded with
+	// `postgres`, maintained by CREATE/DROP ROLE) together with any UserStore
+	// (pg_auth) account form the runtime authority for which roles exist. The
+	// trust auth method never consults either store, so without this an unknown
+	// role would connect and the backend would exit 0 — pg_amcheck's
+	// `--username no_such_user` probe expects the connection to fail. The
+	// password/SCRAM paths already reject unknown users inside checkAuth; this
+	// closes the trust-auth hole and matches PG, which checks the role after
+	// authentication regardless of method. Gated on a real catalog registry
+	// (exactly like the database check below) so bare wire-protocol unit tests,
+	// which connect as arbitrary trust-auth users against a catalog-less Server,
+	// keep their prior behaviour.
+	if user != "" && !isReplication {
+		if _, isRegistry := s.cfg.Catalog.(databaseRegistry); isRegistry {
+			known := s.roleExists(user)
+			if !known && s.cfg.UserStore != nil {
+				if _, ok := s.cfg.UserStore.Lookup(user); ok {
+					known = true
+				}
+			}
+			if !known {
+				s.writeFatal(w, sqlstate.InvalidAuthorizationSpecification,
+					fmt.Sprintf("role %q does not exist", user))
+				logger.Info("connection rejected: unknown role", "role", user)
+				return
+			}
+		}
+	}
+
 	// M0110-0003 (AC-002 gap #3): reject a connection to a database that does
 	// not exist, mirroring PG's InitPostgres post-authentication 3D000
 	// `database "%s" does not exist`. goopg's in-memory database registry is the
