@@ -278,3 +278,61 @@ types, (c) `STORAGE EXTERNAL` TOAST-file corruption, (d) multi-database
 (db1/db2/db3) orchestration, and (e) the file-removal / first-page-overwrite
 corruption mechanics with their per-relation expected reports. These are
 multi-milestone; AC-003 stays `defer`.
+
+## Missing-main-relation-fork tier (AC-003 file-removal corruption, 2026-06-15)
+
+`003_check.pl`'s second corruption mechanism (alongside first-page overwrite) is
+**file removal** (`plan_to_remove_relation_file`): with the node stopped, the
+test `unlink()`s a relation's backing file, restarts, and asserts pg_amcheck
+reports it. For a removed **index** main fork the expected stdout is
+
+```
+index "<name>" lacks a main relation fork
+```
+
+with exit status 2 (`003_check.pl:328-329`, `:392-399`). Upstream raises this in
+`bt_index_check_callback` via `!smgrexists(RelationGetSmgr(indrel), MAIN_FORKNUM)`
+→ `ereport(ERROR, errcode(ERRCODE_INDEX_CORRUPTED), …)` (`verify_nbtree.c:318`).
+
+### goopg gap and fix
+
+goopg's storage manager opens relation files with `os.O_CREATE` (`smgr.go`
+`relFile`). A naive `Pool.NBlocks(rel)` on a removed fork therefore **recreates it
+as an empty 0-block file**, and the btree engine (`nblocks <= MetaBlock+1`) then
+reports the index as *clean* — a silent false negative exactly where PG reports
+corruption.
+
+The fix adds a stat-only existence probe that never goes through the
+`O_CREATE` open path:
+
+- `storage.Manager.Exists(rel) bool` — `os.Stat(relPath(rel))`, faithful to
+  `smgrexists(MAIN_FORKNUM)`. It deliberately does **not** consult the open-file
+  cache or `relFile`: every live relation always has an on-disk file (created
+  eagerly), so a pure stat never reports a live relation absent, and it never
+  recreates a removed one.
+- `storage.Pool.Exists(rel)` delegates to it.
+- `evalBtIndexCheck` (`operators_bt_index_check.go`) calls `ctx.Pool.Exists(rel)`
+  **before** `NBlocks`; absent → `ExecError{Code:"XX002"}` (ERRCODE_INDEX_CORRUPTED)
+  with the verbatim `index "%s" lacks a main relation fork` message. Covers both
+  `bt_index_check` and `bt_index_parent_check`.
+
+### Tests
+
+- `TestBtIndexCheck_DetectsMissingRelationFork`
+  (`internal/executor/operators_bt_index_check_test.go`) — hard gate: drops the
+  index's backing file via `DropRelation` and asserts both functions raise the
+  verbatim message.
+- `TestPort_PgAmcheck003MissingIndexFork`
+  (`internal/testport/pgamcheck003_missingfork_test.go`) — e2e proof through the
+  real `pg_amcheck` binary over the full stop → unlink → restart lifecycle. It
+  additionally asserts the fork was **not** recreated during startup/recovery
+  (the load-bearing property a unit test cannot prove).
+
+### Still remaining for `003_check.pl`
+
+The heap-table file-removal case (expected `could not open file ".*": No such
+file or directory`) is **not** yet ported: goopg's smgr would likewise recreate a
+removed heap file, and the errno-shaped message would need the storage layer to
+surface a typed missing-file error or the relation path. That, the unsupported
+index AMs, the `box`/`int4range`/`int4[]` types, `STORAGE EXTERNAL` TOAST
+corruption, and multi-database orchestration keep AC-003 `defer`.

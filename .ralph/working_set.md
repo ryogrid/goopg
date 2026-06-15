@@ -1,45 +1,39 @@
-Task: M0095-0003 (011_in_place_tablespace) — loop #12. Landed the in-place
-tablespace FOUNDATION. The tree is now CLEAN (the foreign gen-column WIP that
-hard-blocked parser/executor/catalog edits for 15+ loops is gone), which
-unblocked this.
+Task: M0110-0003 (pg_amcheck) — loop #14. COMPLETE for the index file-removal
+(missing-main-relation-fork) corruption tier of 003_check.pl. Ready to commit.
 
 === WHAT LANDED (this loop) ===
-allow_in_place_tablespaces GUC (PGC_SUSET, boot off) + CREATE/DROP TABLESPACE
-DDL end-to-end:
-- config/defaults.go + postgresql.conf.sample (DEVELOPER OPTIONS section)
-- parser/ast.go: CreateTablespaceStmt, DropTablespaceStmt
-- parser/ddl.go: parseCreateTablespaceTail + DROP TABLESPACE dispatch.
-  KEY GOTCHA: `tablespace` is an unreserved KEYWORD (KwTablespace), so dispatch
-  must use acceptKeyword(KwTablespace), NOT acceptIdentKeyword (which only
-  matches TokenIdent). `owner`/`location` ARE plain idents (acceptIdentKeyword
-  ok). `=` is TokenOperator.
-- planner/planner.go: both added to DDL passthrough case list
-- executor/operators_ddl.go: execCreateTablespace/execDropTablespace — create/
-  remove pg_tblspc/<oid> under ctx.DataDir; reads GUC via ctx.GetSetting.
-  Upstream-verbatim errors: 42602 quote, 42P17 absolute-path (also empty-loc +
-  GUC off), 42939 reserved pg_ name, 42710 dup, 42704 missing; external
-  absolute LOCATION → 0A000 (goopg can't relocate relfiles).
-- catalog/catalog.go: tablespaces registry + CreateTablespace/DropTablespace on
-  the Catalog interface (InMemory is the sole implementer).
-- server/dispatch.go: CREATE/DROP TABLESPACE command tags.
+goopg now detects a removed btree INDEX main fork as corruption, matching
+upstream bt_index_check_callback's smgrexists(MAIN_FORKNUM) guard
+(verify_nbtree.c:318). Root cause it fixes: goopg smgr opens files with
+os.O_CREATE, so Pool.NBlocks on a removed fork RECREATED it empty → engine
+reported the index "clean" (silent false negative).
+Files:
+- internal/storage/smgr.go: + Manager.Exists(rel) — pure os.Stat(relPath),
+  NOT via relFile (which O_CREATEs). Faithful smgrexists.
+- internal/storage/bufpool.go: + Pool.Exists delegate.
+- internal/executor/operators_bt_index_check.go: evalBtIndexCheck calls
+  ctx.Pool.Exists(rel) BEFORE NBlocks; absent → ExecError XX002
+  (ERRCODE_INDEX_CORRUPTED) `index "%s" lacks a main relation fork`. Covers
+  bt_index_check + bt_index_parent_check.
+- internal/executor/operators_bt_index_check_test.go: + TestBtIndexCheck_
+  DetectsMissingRelationFork (drops fork via DropRelation, asserts msg).
+- internal/testport/pgamcheck003_missingfork_test.go (NEW): e2e through the
+  real pg_amcheck binary, stop→unlink→restart, exit 2 + verbatim report, and
+  asserts the fork is NOT recreated on restart. PASS 7.3s.
+Docs: CSV AC-003 rationale + md regenerated; design 0110-0003 appended
+("Missing-main-relation-fork tier"); fix_plan + deferral ledger updated.
+Gates: go build ./... clean; full internal/testport pg_amcheck suite PASS
+(13.8s); internal/executor + internal/storage PASS; go vet testport clean.
+NOTE: gofmt -l flags internal/storage/bufpool.go for PRE-EXISTING drift
+(statePin alignment L34-40 + double blank L722) — NOT my edit; left untouched.
 
-Tests: parser (3), catalog (1), executor (7, incl. real-temp-dir create/drop),
-config (1) — all PASS. Suites parser/catalog/config/planner/executor/server
-green; gofmt+vet+build clean. TPC-H spotcheck SKIPPED (no data dir; safe by
-construction — only new DDL statement types added to passthrough). Design
-docs/design/0095-0003-in-place-tablespace.md + README index (status: partial).
-
-=== NEXT STEP (resume) — 011 remainder ===
-011_in_place_tablespace.pl still self-skips on BASE_BACKUP. To make it pass:
-(a) internal/server/basebackup.go must enumerate in-place tablespaces and emit
-    one <oid>.tar each (pg_basebackup -T relocation on restore);
-(b) create the pg_tblspc/<oid>/PG_18_<catversion> version subdir in
-    execCreateTablespace (faithful to create_tablespace_directories) — needs the
-    catversion string, single source of truth in internal/initdb
-    (pgCatalogVersionNo=202506291, CatalogVersion="18"); land (a)+(b) together.
-On-disk pg_tablespace heap visibility = separate shared-catalog-write capability
-(no RelFileNode resolver for shared pg_tablespace); defer, not needed by 011.
-
-NOTE: tree is clean now — other long-deferred items (M0110-0003 AC-003 needs
-index AMs/types/opclass; M0117 Part B = Effort-L CLOG memory-model, full-gate)
-remain the genuinely large ones.
+=== NEXT STEP (resume) ===
+AC-003 stays `defer`. Remaining (all larger / unrelated): heap-table
+file-removal (`could not open file ".*": No such file or directory` — needs
+smgr to surface a typed missing-file error/relpath; its O_CREATE open also
+recreates the file), hash/gist/gin/brin/spgist index AMs, box/int4range/int4[]
+types, STORAGE EXTERNAL TOAST corruption, multi-DB orchestration; and
+005_opclass_damage (CREATE OPERATOR CLASS + pg_amproc parity). Other open
+milestones: M0095-0003 recvlogical (logical decoding, large); M0110-0001
+pg_dump 002 (catalog parity); M0110-0002 pg_waldump 002 (PG-format heap WAL
+FPI); M0117-0006/7/8 (Effort-L CLOG memory-model, defer to full-gate sessions).

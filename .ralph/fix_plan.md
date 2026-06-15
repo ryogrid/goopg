@@ -1159,6 +1159,33 @@ functions (e.g. `bt_index_parent_check`, `verify_heapam`).
         tests are deferred under CSV row AC-002, blocked on `verify_heapam()` SRF
         + opclass catalog coverage. Resume = promote AC-002 (002_nonesuch first —
         only error-path catalog lookups) when those land.
+      - **PROGRESS 2026-06-15 (loop #14):** AC-003 — the **index file-removal
+        (missing-main-relation-fork) corruption tier** of `003_check.pl` LANDED.
+        goopg's smgr opens relation files with `os.O_CREATE`, so `Pool.NBlocks`
+        on a removed fork silently RECREATED it as an empty 0-block file → the
+        btree engine reported the index *clean* (a silent false negative exactly
+        where PG reports corruption). Fix mirrors `bt_index_check_callback`'s
+        `smgrexists(MAIN_FORKNUM)` guard (`verify_nbtree.c:318`): new stat-only
+        `storage.Manager.Exists`/`Pool.Exists` (pure `os.Stat(relPath)`, never the
+        `O_CREATE` `relFile` path — every live rel has an on-disk file, so a stat
+        never false-negatives a live rel nor recreates a removed one), called in
+        `evalBtIndexCheck` BEFORE `NBlocks`; absent → `XX002`
+        (ERRCODE_INDEX_CORRUPTED) with verbatim `index "%s" lacks a main relation
+        fork`. Covers `bt_index_check` + `bt_index_parent_check`. Unit gate
+        `TestBtIndexCheck_DetectsMissingRelationFork` (drops the fork, asserts the
+        message). E2E `TestPort_PgAmcheck003MissingIndexFork`
+        (`internal/testport/pgamcheck003_missingfork_test.go`) drives the real
+        pg_amcheck over the full stop→unlink→restart lifecycle (exit 2 + verbatim
+        report) AND asserts goopg does NOT recreate the fork on restart (the
+        load-bearing property a unit test can't prove) — PASS (7.3s). Gates:
+        `go build ./...` clean; full `internal/testport` pg_amcheck suite PASS
+        (13.8s); `internal/executor` + `internal/storage` PASS; vet clean. CSV
+        AC-003 rationale + markdown + design doc `0110-0003` updated. STILL
+        DEFERRED (AC-003 stays `defer`): heap-table file-removal (`could not open
+        file` message needs a typed missing-file error from smgr), the
+        hash/gist/gin/brin/spgist index AMs, box/int4range/int4[] types, STORAGE
+        EXTERNAL TOAST corruption, multi-DB orchestration; 005_opclass_damage
+        (CREATE OPERATOR CLASS + pg_amproc parity).
       - **PROGRESS 2026-06-15 (loop #11):** AC-003 — **whole-database
         relation-enumeration tier ported + blocker #3 hypothesis REFUTED**.
         `003_check.pl`'s clean-db path runs the *default* `pg_amcheck` (no
