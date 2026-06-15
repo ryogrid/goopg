@@ -1262,7 +1262,7 @@ func (p *parser) parseRangeVar(allowUserSRF ...bool) (RangeVar, error) {
 		switch lower {
 		case "generate_series", "pg_input_error_info", "parse_ident",
 			"pg_get_publication_tables", "pg_available_wal_summaries",
-			"unnest", "generate_subscripts":
+			"verify_heapam", "unnest", "generate_subscripts":
 			srfFuncName = lower
 		default:
 			// Accept any other name(args) in FROM as a potential user-defined SRF.

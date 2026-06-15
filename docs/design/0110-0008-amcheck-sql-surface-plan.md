@@ -1,6 +1,6 @@
 # 0110-0008 — amcheck SQL surface wiring plan (M0110-0003)
 
-**Status:** S1+S2 landed (worktree `m0110-0003-amcheck-sql-surface`); S3–S5 remain (merge blocked on a clean working tree)
+**Status:** S1+S2+S3 landed (worktree `m0110-0003-amcheck-sql-surface`); S4–S5 remain (merge blocked on a clean working tree)
 **Scope:** the `CREATE EXTENSION amcheck` + SRF SQL surface that wires the
 already-committed `internal/amcheck` engine to the wire protocol and promotes the
 deferred `AC-002`…`AC-005` pg_amcheck TAP tests.
@@ -103,7 +103,7 @@ type-check; their execution is exercised by `003`/`004`, not `002`.
 |-------|-------|----------|-------|
 | **S1** | `CREATE EXTENSION amcheck` DDL: parse → dispatch → executor → `pg_extension` row + `pg_namespace` resolve | — | parser `ast.go`/`ddl.go`, `server/dispatch.go`, `executor/operators_ddl.go`, `catalog/catalog.go` |
 | **S2** | `pg_extension` catalog relation + the §1 probe answerable; seed `pg_proc` rows for the three SRFs (exist, not yet callable) | **AC-002** (`002_nonesuch`) | `catalog/catalog.go`, `planner/planner.go` (FROM whitelist) |
-| **S3** | `verify_heapam(...)` SRF executor — now a **thin adapter** over `amcheck.VerifyHeapRelation` (the block loop already lives in the engine, `verify_heapam_relation.go`): fill a `PageSource` from smgr, pass `nblocks` + `RelDesc.Natts` + a clog-backed `XidStatusFunc`, stream `HeapRelReport`s as rows | AC-004 (heap path) | `planner/plan.go`, `planner/planner.go`, new `executor/operators_verify_heapam.go` |
+| **S3 ✅** | `verify_heapam(...)` SRF executor — a **thin adapter** over `amcheck.VerifyHeapRelation` (the block loop lives in the engine, `verify_heapam_relation.go`): fills a `PageSource` from the buffer pool, passes `nblocks` + `RelDesc.Natts`/`NextXid`/`RelFrozenXid` (clog-backed `XidStatusFunc` deferred — no clog handle in the executor yet), streams `HeapRelReport`s as `(blkno,offnum,attnum,msg)` rows | (toward AC-004 heap path) | `planner/{plan,planner,foldconst,unnest}.go`, `parser/select.go`, `analyzer/analyzer.go`, new `executor/operators_verify_heapam.go` + `executor.go` |
 | **S4** | `bt_index_check` / `bt_index_parent_check` SRFs over `amcheck.VerifyBtree*` (+ heapallindexed) | AC-003/004 (index path) | `planner/plan.go`, new `executor/operators_bt_index_check.go` |
 | **S5** | port `002`→`005` TAP tests; flip CSV `AC-002…AC-005`→`port`; regen md | — | `internal/testport/pgamcheck_port_test.go`, `docs/test-port/*` |
 
@@ -172,7 +172,23 @@ Functions: `postgres/contrib/amcheck/verify_heapam.c`,
 
 ## Deferral
 
-S1+S2 landed (above) in worktree `m0110-0003-amcheck-sql-surface`; S3–S5 remain.
-Merging the worktree to the active branch still waits for a clean tree (the
-main-tree foreign gen-column WIP). Resume point is **Slice S3** (`verify_heapam`
-SRF). See `.ralph/deferral_ledger.md`.
+S1+S2+S3 landed (above) in worktree `m0110-0003-amcheck-sql-surface`; S4–S5
+remain. Merging the worktree to the active branch still waits for a clean tree
+(the main-tree foreign gen-column WIP). Resume point is **Slice S4**
+(`bt_index_check` / `bt_index_parent_check` SRFs). See `.ralph/deferral_ledger.md`.
+
+**S3 carries two intentional follow-ups** (recorded so S5 does not re-discover
+them):
+
+1. **clog-backed `XidStatusFunc`** — the executor `Context` has no clog handle
+   (only `TxnMgr`, which does not hold the `CLog`), so the operator passes a nil
+   `XidStatus`, which disables exactly the clog-dependent HOT-chain tier. The
+   page-structural, natts, and xmin/xmax numeric-bounds tiers (all clog-free) are
+   active. Wiring clog through `Context` enables the remaining tier.
+2. **named-argument + LATERAL call shape** — pg_amcheck itself issues
+   `verify_heapam(relation := c.oid, on_error_stop := false, …)` correlated
+   against `pg_class` (a LATERAL cross join with `:=` named args). goopg's parser
+   has no `name := value` argument syntax, so S3 supports **positional**
+   arguments only (`verify_heapam('t')`, `verify_heapam('t', false, false,
+   'none', 0, 5)`), verified by a direct Go executor test. The named-arg + LATERAL
+   plumbing the client query needs is part of the S5 TAP port.

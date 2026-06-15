@@ -1129,6 +1129,26 @@ type PgPartitionTree struct {
 func (n *PgPartitionTree) Pos() int       { return n.pos }
 func (n *PgPartitionTree) Output() Schema { return n.schema }
 
+// VerifyHeapam is the FROM-clause SRF plan node for amcheck's
+// verify_heapam(regclass, ...) — slice S3 of docs/design/0110-0008. It carries
+// the relation argument plus the optional startblock / endblock block-range
+// arguments; the executor op resolves the relation, walks its heap blocks
+// through the committed internal/amcheck engine (VerifyHeapRelation), and emits
+// one (blkno, offnum, attnum, msg) row per structural-corruption finding. The
+// remaining SRF arguments (on_error_stop, check_toast, skip) are accepted by the
+// parser but have no effect — check_toast is goopg-divergent (see 0110-0005) and
+// the others do not change which structural checks run. M0110-0003.
+type VerifyHeapam struct {
+	pos        int
+	Arg        Expr // the regclass relation argument (required)
+	StartBlock Expr // startblock int8 (optional, nil = whole relation)
+	EndBlock   Expr // endblock int8 (optional, nil = whole relation)
+	schema     Schema
+}
+
+func (n *VerifyHeapam) Pos() int       { return n.pos }
+func (n *VerifyHeapam) Output() Schema { return n.schema }
+
 // Insert — writes rows from Source into Table. ColumnIndex maps each
 // source column to a target heap-tuple ordinal; columns not listed
 // receive NULL (or their declared default once defaults are wired).

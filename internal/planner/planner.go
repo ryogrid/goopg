@@ -2986,6 +2986,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 	if strings.EqualFold(tf.Name, "pg_available_wal_summaries") {
 		return planPgAvailableWalSummaries(rv, sourceIdx)
 	}
+	if strings.EqualFold(tf.Name, "verify_heapam") {
+		return planVerifyHeapam(rv, sourceIdx)
+	}
 	if strings.EqualFold(tf.Name, "pg_partition_tree") || strings.EqualFold(tf.Name, "pg_partition_ancestors") {
 		// pg_partition_tree / pg_partition_ancestors — multi-row SRF that traverses
 		// the catalog partition hierarchy. Uses the PgPartitionTree plan node which
@@ -3649,6 +3652,60 @@ func planPgAvailableWalSummaries(rv parser.RangeVar, sourceIdx int16) (Node, ran
 	}
 	tbl := &catalog.Table{Name: alias, Columns: cols}
 	node := &PgAvailableWalSummaries{pos: tf.Pos(), schema: schema}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
+// planVerifyHeapam routes a FROM-clause verify_heapam(regclass, ...) invocation
+// into a VerifyHeapam plan node (slice S3 of docs/design/0110-0008). The first
+// positional argument is the relation; the optional 5th/6th positional arguments
+// (matching the upstream signature relation, on_error_stop, check_toast, skip,
+// startblock, endblock) are the block-range bounds. The intermediate
+// on_error_stop / check_toast / skip arguments are accepted (so the upstream
+// argument list type-checks) but carry no semantics here — see the VerifyHeapam
+// node doc. Output schema is the upstream SETOF (blkno int8, offnum int8,
+// attnum int4, msg text). M0110-0003.
+func planVerifyHeapam(rv parser.RangeVar, sourceIdx int16) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) == 0 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "function verify_heapam() does not exist",
+			Hint:    "verify_heapam requires a relation argument"}
+	}
+	ctx := &resolveContext{}
+	arg, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	var startBlock, endBlock Expr
+	if len(tf.Args) >= 5 {
+		if startBlock, err = resolveExpr(tf.Args[4], ctx); err != nil {
+			return nil, rangeBinding{}, err
+		}
+	}
+	if len(tf.Args) >= 6 {
+		if endBlock, err = resolveExpr(tf.Args[5], ctx); err != nil {
+			return nil, rangeBinding{}, err
+		}
+	}
+
+	alias := rv.Alias
+	if alias == "" {
+		alias = "verify_heapam"
+	}
+	colNames := []string{"blkno", "offnum", "attnum", "msg"}
+	colTypes := []string{"int8", "int8", "int4", "text"}
+	if len(rv.Columns) >= len(colNames) {
+		colNames = rv.Columns[:len(colNames)]
+	}
+	schema := make(Schema, len(colNames))
+	cols := make([]catalog.Column, len(colNames))
+	for i := range colNames {
+		schema[i] = SchemaColumn{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, SourceTableIdx: sourceIdx}
+		cols[i] = catalog.Column{Name: colNames[i], Type: catalog.Type{Name: colTypes[i]}, Ordinal: i}
+	}
+	node := &VerifyHeapam{pos: tf.Pos(), Arg: arg, StartBlock: startBlock, EndBlock: endBlock, schema: schema}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
 	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 	return node, b, nil
 }

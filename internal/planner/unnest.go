@@ -354,6 +354,16 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 	case *PgAvailableWalSummaries:
 		// no sub-expressions to walk
+	case *VerifyHeapam:
+		if n.Arg != nil {
+			walkExprTree(n.Arg, visit)
+		}
+		if n.StartBlock != nil {
+			walkExprTree(n.StartBlock, visit)
+		}
+		if n.EndBlock != nil {
+			walkExprTree(n.EndBlock, visit)
+		}
 	case *MultiHashJoin:
 		for _, tbl := range n.Tables {
 			walkPlanExprs(tbl, visit)

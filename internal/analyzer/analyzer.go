@@ -1524,6 +1524,21 @@ func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Col
 			colName = colAliases[0]
 		}
 		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "oid"}, Ordinal: 0}}
+	case "verify_heapam":
+		// verify_heapam(regclass, ...) → (blkno int8, offnum int8, attnum int4,
+		// msg text). Mirrors planVerifyHeapam. M0110-0003.
+		names := []string{"blkno", "offnum", "attnum", "msg"}
+		types := []string{"int8", "int8", "int4", "text"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: types[i]}, Ordinal: i}
+		}
+		return cols
 	default:
 		// generate_series and unknown SRFs: 1 int8 column named after
 		// the alias. Preserves pre-M0103-0008 behaviour.
