@@ -66,21 +66,26 @@ package testport
 // view is correct; only user-defined TS configurations are dumped), and the
 // empty `pg_foreign_data_wrapper` virtual view that `getForeignDataWrappers`
 // reads (slice 16 — goopg defines no foreign-data wrappers, so an empty view is
-// correct; only user-defined FDWs are dumped, and the `pg_options_to_table`
-// SRF in the dump query's ARRAY subquery is never evaluated for an empty view).
+// correct; only user-defined FDWs are dumped), and the `pg_options_to_table`
+// FROM-clause SRF that the dump query's ARRAY subquery expands `fdwoptions`
+// through (slice 17 — text[] of "name=value" options → rows of (option_name,
+// option_value); split at the first '=', bare names get a NULL value; mirrors
+// untransformRelOptions in src/backend/foreign/foreign.c; the analyzer's
+// tableFuncColumns sibling path was updated alongside the planner/executor).
 // **Next blocker (precise, confirmed empirically by this test):** the
-// getForeignDataWrappers query now resolves `pg_foreign_data_wrapper` but fails
-// with `column "option_name" does not exist`. The dump query's ARRAY subquery
-// selects from `pg_options_to_table(fdwoptions)`, a set-returning function whose
-// output columns are (option_name, option_value). goopg seeds `pg_options_to_table`
-// in pg_proc (OID 2289) but does not implement it as an executable FROM-clause
-// SRF, so the column references inside the subquery cannot be resolved at plan
-// time — even though the outer view is empty (goopg, unlike a lazy executor,
-// resolves the subquery's columns during planning regardless of outer
-// emptiness). Implementing `pg_options_to_table` as a FROM-clause SRF
-// (text[] of "name=value" options → rows of (option_name, option_value)) is the
-// following DU-002 slice. After that, getForeignServers (`pg_foreign_server`)
-// and getUserMappings (`pg_user_mappings`) follow. RUN this test after each add
+// getForeignDataWrappers query now resolves both `pg_foreign_data_wrapper` and
+// `pg_options_to_table`, but fails with `column "fdwoptions" does not exist`.
+// The dump query's ARRAY subquery calls `pg_options_to_table(fdwoptions)` where
+// `fdwoptions` is a CORRELATED reference to the outer pg_foreign_data_wrapper
+// row, and goopg cannot resolve a FROM-clause SRF argument that references an
+// OUTER query level. (Verified: same-level explicit `FROM t, LATERAL
+// pg_options_to_table(t.opts)` resolves fine; the failure is specific to a
+// correlated reference reaching up out of a scalar/ARRAY subquery into the
+// SRF's argument expression.) The following DU-002 slice must thread the outer
+// scope into the analyzer's + planner's FROM-clause SRF argument resolution
+// (analyzer.go tableFuncColumns caller's scope chain + planTableFuncRangeVar's
+// lateralCtx). After that, getForeignServers (`pg_foreign_server`) and
+// getUserMappings (`pg_user_mappings`) follow. RUN this test after each add
 // to find the REAL next blocker rather than trusting the predicted one.
 // This test is the regression guard for the connection-setup slice and a marker
 // for the next blocker. It auto-tightens (asserts exit 0) once a clean dump

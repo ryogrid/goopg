@@ -1540,6 +1540,20 @@ func tableFuncColumns(funcName, alias string, colAliases []string) []catalog.Col
 			colName = colAliases[0]
 		}
 		return []catalog.Column{{Name: colName, Type: catalog.Type{Name: "oid"}, Ordinal: 0}}
+	case "pg_options_to_table":
+		// pg_options_to_table(text[]) → (option_name text, option_value text).
+		// Mirrors planPgOptionsToTable. DU-002 slice 17 (M0110-0001).
+		names := []string{"option_name", "option_value"}
+		for i := range names {
+			if i < len(colAliases) && colAliases[i] != "" {
+				names[i] = colAliases[i]
+			}
+		}
+		cols := make([]catalog.Column, len(names))
+		for i := range names {
+			cols[i] = catalog.Column{Name: names[i], Type: catalog.Type{Name: "text"}, Ordinal: i}
+		}
+		return cols
 	case "verify_heapam":
 		// verify_heapam(regclass, ...) → (blkno int8, offnum int8, attnum int4,
 		// msg text). Mirrors planVerifyHeapam. M0110-0003.

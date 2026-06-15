@@ -354,6 +354,10 @@ func walkPlanExprs(node Node, visit func(Expr)) {
 		}
 	case *PgAvailableWalSummaries:
 		// no sub-expressions to walk
+	case *PgOptionsToTable:
+		if n.Arg != nil {
+			walkExprTree(n.Arg, visit)
+		}
 	case *VerifyHeapam:
 		if n.Arg != nil {
 			walkExprTree(n.Arg, visit)

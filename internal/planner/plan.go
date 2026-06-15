@@ -178,9 +178,9 @@ func (*IntervalLit) exprNode()  {}
 // ExtractExpr mirrors parser.ExtractExpr. Field is the
 // lower-cased calendar component the executor switches on.
 type ExtractExpr struct {
-	pos            int
-	Field          string
-	Source         Expr
+	pos    int
+	Field  string
+	Source Expr
 	// SourceTypeName carries the declared type of Source (e.g. "time", "timestamp").
 	// The executor uses it to reject fields that are invalid for time-only types. M0097-0004.
 	SourceTypeName string
@@ -199,9 +199,9 @@ func (*ExtractExpr) exprNode()  {}
 // key in that case so the SubPlan executes only once across
 // all outer rows. (M0058-0001.)
 type InExpr struct {
-	pos         int
-	Operand     Expr
-	Negated     bool
+	pos     int
+	Operand Expr
+	Negated bool
 	// NotEqualAny marks `x != ANY(list)` semantics: true if operand is
 	// not equal to at least one element in List (OR of != comparisons).
 	// Distinct from Negated which means NOT IN (AND of != comparisons).
@@ -317,7 +317,7 @@ func (*SubqueryExpr) exprNode()  {}
 type MultiAssignSubqRow struct {
 	pos             int
 	Plan            Node
-	NCols           int  // expected number of output columns
+	NCols           int // expected number of output columns
 	IsNonCorrelated bool
 }
 
@@ -523,22 +523,22 @@ func (n *SeqScan) Output() Schema { return n.schema }
 //   - HighKey non-nil means inclusive upper bound (col <= HighKey).
 //   - Either bound may be nil for an open-ended range.
 type IndexScan struct {
-	pos     int
-	Table   *catalog.Table
-	Alias   string // FROM-clause alias; empty when not specified. M0062-0002
+	pos   int
+	Table *catalog.Table
+	Alias string // FROM-clause alias; empty when not specified. M0062-0002
 	// preserves the alias when an `IndexScan` is substituted for a
 	// `SeqScan` (e.g. by `mhj_input_rewrite`); without it,
 	// `buildBindingsPosMap` cannot disambiguate self-joins like Q8's
 	// `nation n1, nation n2` after one side flips to IndexScan.
-	Index   *catalog.Index
-	Key     Expr  // non-nil for single-column equality scan (LowKey==HighKey implied)
-	Keys    []Expr // M0054-0006-followup-Q9-composite: multi-column equality probe.
+	Index *catalog.Index
+	Key   Expr   // non-nil for single-column equality scan (LowKey==HighKey implied)
+	Keys  []Expr // M0054-0006-followup-Q9-composite: multi-column equality probe.
 	// Keys[i] binds Index.Columns[i] in declared order. When non-empty, takes
 	// priority over Key. len(Keys) == len(Index.Columns) means a full equality
 	// probe (no suffix padding); a shorter prefix is rejected by the planner
 	// to keep the executor probe path purely equality-shaped.
-	LowKey  Expr  // inclusive lower bound for range scan; nil = no lower bound
-	HighKey Expr  // inclusive upper bound for range scan; nil = no upper bound
+	LowKey  Expr // inclusive lower bound for range scan; nil = no lower bound
+	HighKey Expr // inclusive upper bound for range scan; nil = no upper bound
 	schema  Schema
 }
 
@@ -577,10 +577,10 @@ func (n *NestedLoopIndexJoin) Output() Schema { return n.schema }
 // of the full table schema). When the VM bit is not set for a page the
 // executor falls back to a regular heap fetch.
 type IndexOnlyScan struct {
-	pos     int
-	Table   *catalog.Table
-	Index   *catalog.Index
-	Key     Expr
+	pos   int
+	Table *catalog.Table
+	Index *catalog.Index
+	Key   Expr
 	// Keys mirrors IndexScan.Keys: a full multi-column equality probe
 	// (one Expr per Index.Columns entry, in declared order). When set,
 	// takes priority over Key. Carries the M0054-0006 composite probe
@@ -646,43 +646,43 @@ const (
 // their keys and merges the two ordered streams, preserving
 // RIGHT/FULL outer-row semantics.
 type Join struct {
-		pos       int
-		Type      JoinType
-		Algo      JoinAlgo
-		Left      Node
-		Right     Node
-		Predicate Expr
-		LeftKey   Expr // populated when Algo == JoinAlgoHash
-		RightKey  Expr
-		BuildLeft bool // hash join: build on left input instead of right
-		// UsingLeftCols / UsingRightCols hold the ABSOLUTE column
-		// indices (relative to the merged schema) of the USING
-		// columns from the left and right sides respectively.
-		// Set only for FULL JOIN USING / FULL JOIN NATURAL. The
-		// executor uses them to coalesce unmatched right-row output:
-		// when the left side is NULL (right-only row), each
-		// UsingLeftCols[i] is set to the value at UsingRightCols[i].
-		// M0097-0060.
-		UsingLeftCols  []int
-		UsingRightCols []int
-		// Lateral marks the right child as referencing the left
-		// child's columns through a FROM-clause LATERAL SRF (M0103-0008).
-		// The executor must drive the right per-outer-row, binding the
-		// left row as the lateral outer slot (BindLateralOuter contract)
-		// instead of materialising both sides up front.
-		Lateral bool
-		schema  Schema
-	}
+	pos       int
+	Type      JoinType
+	Algo      JoinAlgo
+	Left      Node
+	Right     Node
+	Predicate Expr
+	LeftKey   Expr // populated when Algo == JoinAlgoHash
+	RightKey  Expr
+	BuildLeft bool // hash join: build on left input instead of right
+	// UsingLeftCols / UsingRightCols hold the ABSOLUTE column
+	// indices (relative to the merged schema) of the USING
+	// columns from the left and right sides respectively.
+	// Set only for FULL JOIN USING / FULL JOIN NATURAL. The
+	// executor uses them to coalesce unmatched right-row output:
+	// when the left side is NULL (right-only row), each
+	// UsingLeftCols[i] is set to the value at UsingRightCols[i].
+	// M0097-0060.
+	UsingLeftCols  []int
+	UsingRightCols []int
+	// Lateral marks the right child as referencing the left
+	// child's columns through a FROM-clause LATERAL SRF (M0103-0008).
+	// The executor must drive the right per-outer-row, binding the
+	// left row as the lateral outer slot (BindLateralOuter contract)
+	// instead of materialising both sides up front.
+	Lateral bool
+	schema  Schema
+}
 
 func (n *Join) Pos() int       { return n.pos }
 func (n *Join) Output() Schema { return n.schema }
 
 // AggregateCall is one aggregate function invocation in an Aggregate node.
 type AggregateCall struct {
-	pos      int
-	Name     string
-	Arg      Expr // nil for count(*)
-	Arg2     Expr // second arg for two-argument aggregates (regr_*, covar_*, corr)
+	pos  int
+	Name string
+	Arg  Expr // nil for count(*)
+	Arg2 Expr // second arg for two-argument aggregates (regr_*, covar_*, corr)
 	// ExtraArgs holds the 3rd and subsequent arguments for user-defined
 	// multi-arg aggregates (e.g. aggfns(a, b, c) where Arg=a, Arg2=b, ExtraArgs=[c]).
 	ExtraArgs []Expr
@@ -820,7 +820,6 @@ type CTEScan struct {
 	schema Schema
 }
 
-
 // CTEDMLPrefix executes data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE)
 // before the outer query. DMls are executed in order; each plan's RETURNING
 // rows are collected into ctx.MaterializedCTEs[Names[i]] for CTEScan
@@ -832,8 +831,8 @@ type CTEDMLPrefix struct {
 	Body  Node     // outer query plan
 }
 
-func (n *CTEDMLPrefix) Pos() int      { return n.pos }
-func (n *CTEDMLPrefix) nodeTag()      {}
+func (n *CTEDMLPrefix) Pos() int       { return n.pos }
+func (n *CTEDMLPrefix) nodeTag()       {}
 func (n *CTEDMLPrefix) Output() Schema { return n.Body.Output() }
 
 // MaterializedCTEScan reads rows from a pre-executed DML CTE stored in
@@ -846,8 +845,8 @@ type MaterializedCTEScan struct {
 	schema Schema
 }
 
-func (n *MaterializedCTEScan) Pos() int      { return n.pos }
-func (n *MaterializedCTEScan) nodeTag()      {}
+func (n *MaterializedCTEScan) Pos() int       { return n.pos }
+func (n *MaterializedCTEScan) nodeTag()       {}
 func (n *MaterializedCTEScan) Output() Schema { return n.schema }
 
 func (n *CTEScan) Pos() int       { return n.pos }
@@ -895,10 +894,10 @@ func (n *MultiHashJoin) Output() Schema { return n.schema }
 
 // Limit — caps the number of rows; both fields are optional.
 type Limit struct {
-	pos      int
-	Child    Node
-	Limit    Expr // nil when no limit
-	Offset   Expr // nil when no offset
+	pos    int
+	Child  Node
+	Limit  Expr // nil when no limit
+	Offset Expr // nil when no offset
 	// WithTies is true when FETCH FIRST n ROWS WITH TIES was used. M0097-0042.
 	WithTies bool
 	// TiesKeys holds the ORDER BY expressions for WITH TIES comparison.
@@ -1015,7 +1014,6 @@ type PgInputErrorInfo struct {
 	schema Schema
 }
 
-
 // PgGetPublicationTables implements pg_get_publication_tables(VARIADIC text[])
 // as a FROM-clause SRF. It walks the PubSub registry, filtering by the supplied
 // publication-name list, and returns one row per (publication, table) pair.
@@ -1029,7 +1027,6 @@ type PgGetPublicationTables struct {
 	Args   []Expr // raw VARIADIC argument list (text[] or text values)
 	schema Schema
 }
-
 
 // ProjectSet evaluates a single set-returning function call per Child row
 // and emits each row of its composite result as one output row.
@@ -1108,9 +1105,9 @@ func (n *PgAvailableWalSummaries) Output() Schema { return n.schema }
 // the FROM clause (e.g. `FROM parse_ident(...) AS a`). The function result
 // is returned as a single column named ColName with type ColType. M0097-0003.
 type ScalarFuncScan struct {
-	pos     int
-	Func    Expr
-	schema  Schema
+	pos    int
+	Func   Expr
+	schema Schema
 }
 
 func (n *ScalarFuncScan) Pos() int       { return n.pos }
@@ -1120,14 +1117,30 @@ func (n *ScalarFuncScan) Output() Schema { return n.schema }
 // pg_partition_ancestors. It traverses the catalog partition hierarchy and
 // returns one row per node (table or index). M0097-0023.
 type PgPartitionTree struct {
-	pos         int
-	FuncName    string // "pg_partition_tree" or "pg_partition_ancestors"
-	Arg         Expr   // the input regclass expression
-	schema      Schema
+	pos      int
+	FuncName string // "pg_partition_tree" or "pg_partition_ancestors"
+	Arg      Expr   // the input regclass expression
+	schema   Schema
 }
 
 func (n *PgPartitionTree) Pos() int       { return n.pos }
 func (n *PgPartitionTree) Output() Schema { return n.schema }
+
+// PgOptionsToTable is the FROM-clause SRF plan node for
+// pg_options_to_table(text[]). It parses each "name=value" (or bare "name")
+// element of the option array into a row of (option_name text, option_value
+// text); option_value is NULL when the element has no '='. Mirrors
+// untransformRelOptions / pg_options_to_table in
+// src/backend/foreign/foreign.c. DU-002 slice 17 (M0110-0001) — pg_dump's
+// getForeignDataWrappers expands fdwoptions via this SRF.
+type PgOptionsToTable struct {
+	pos    int
+	Arg    Expr // the input text[] expression
+	schema Schema
+}
+
+func (n *PgOptionsToTable) Pos() int       { return n.pos }
+func (n *PgOptionsToTable) Output() Schema { return n.schema }
 
 // VerifyHeapam is the FROM-clause SRF plan node for amcheck's
 // verify_heapam(regclass, ...) — slice S3 of docs/design/0110-0008. It carries
@@ -1326,10 +1339,10 @@ type Update struct {
 	// (which may reference both target and FROM columns) to select
 	// matching rows. Set expressions are also evaluated against the
 	// combined (target ++ from...) row.
-	FromTables    []*catalog.Table
-	FromScans     []Node // one per FROM table (may be SeqScan or subquery node)
-	FromSchema    Schema     // combined schema of all FROM tables
-	FromPred      Expr       // WHERE predicate over combined row (nil = no filter)
+	FromTables []*catalog.Table
+	FromScans  []Node // one per FROM table (may be SeqScan or subquery node)
+	FromSchema Schema // combined schema of all FROM tables
+	FromPred   Expr   // WHERE predicate over combined row (nil = no filter)
 }
 
 func (n *Update) Pos() int       { return n.pos }
@@ -1373,8 +1386,8 @@ const (
 
 // MergeWhenClause is the planned form of one WHEN arm.
 type MergeWhenClause struct {
-	Matched  bool
-	BySource bool // true for WHEN NOT MATCHED BY SOURCE. M0100-0007.
+	Matched   bool
+	BySource  bool // true for WHEN NOT MATCHED BY SOURCE. M0100-0007.
 	Condition Expr // nil when no AND condition
 	Action    MergeActionKind
 
@@ -1393,11 +1406,11 @@ type MergeWhenClause struct {
 type Merge struct {
 	pos             int
 	Target          *catalog.Table
-	Source          Node            // USING clause scan
-	On              Expr            // join condition (source cols at offset len(Target.Columns))
+	Source          Node // USING clause scan
+	On              Expr // join condition (source cols at offset len(Target.Columns))
 	Clauses         []*MergeWhenClause
-	Returning       []Expr          // RETURNING expressions (nil if absent)
-	ReturningSchema Schema          // output schema when Returning != nil
+	Returning       []Expr // RETURNING expressions (nil if absent)
+	ReturningSchema Schema // output schema when Returning != nil
 }
 
 func (n *Merge) Pos() int       { return n.pos }
@@ -1418,7 +1431,7 @@ func (n *DDL) Output() Schema { return nil }
 type TransactionVerb int
 
 const (
-	TxBegin      TransactionVerb = iota
+	TxBegin TransactionVerb = iota
 	TxCommit
 	TxRollback
 	TxSavepoint  // SAVEPOINT name
@@ -1444,7 +1457,7 @@ type Utility struct {
 	Stmt parser.Stmt
 }
 
-func (n *Utility) Pos() int       { return n.pos }
+func (n *Utility) Pos() int { return n.pos }
 func (n *Utility) Output() Schema {
 	switch stmt := n.Stmt.(type) {
 	case *parser.ShowStmt:

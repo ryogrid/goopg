@@ -3074,6 +3074,9 @@ func planTableFuncRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx in
 		b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
 		return node, b, nil
 	}
+	if strings.EqualFold(tf.Name, "pg_options_to_table") {
+		return planPgOptionsToTable(rv, sourceIdx, lateralCtx)
+	}
 	if strings.EqualFold(tf.Name, "unnest") {
 		return planFromUnnest(rv, sourceIdx, lateralCtx)
 	}
@@ -3439,6 +3442,50 @@ func planGenerateSubscripts(rv parser.RangeVar, sourceIdx int16, lateralCtx *res
 }
 
 // row with a single column of the given colType. Used for parse_ident etc.
+// planPgOptionsToTable plans FROM pg_options_to_table(text[]) — splits each
+// "name=value" (or bare "name") option element into (option_name, option_value)
+// rows. Output columns are option_name/option_value (text), overridable by an
+// AS alias(col, col) list. DU-002 slice 17 (M0110-0001).
+func planPgOptionsToTable(rv parser.RangeVar, sourceIdx int16, lateralCtx *resolveContext) (Node, rangeBinding, error) {
+	tf := rv.TableFunc
+	if len(tf.Args) == 0 {
+		return nil, rangeBinding{}, &PlanError{Pos: tf.Pos(), Code: "42883",
+			Message: "function pg_options_to_table() does not exist"}
+	}
+	ctx := &resolveContext{}
+	if lateralCtx != nil {
+		ctx = lateralCtx
+	}
+	arg, err := resolveExpr(tf.Args[0], ctx)
+	if err != nil {
+		return nil, rangeBinding{}, err
+	}
+	alias := rv.Alias
+	if alias == "" {
+		alias = "pg_options_to_table"
+	}
+	nameCol, valueCol := "option_name", "option_value"
+	if len(rv.Columns) >= 1 {
+		nameCol = rv.Columns[0]
+	}
+	if len(rv.Columns) >= 2 {
+		valueCol = rv.Columns[1]
+	}
+	textType := catalog.Type{Name: "text"}
+	schema := Schema{
+		SchemaColumn{Name: nameCol, Type: textType, SourceTableIdx: sourceIdx},
+		SchemaColumn{Name: valueCol, Type: textType, SourceTableIdx: sourceIdx},
+	}
+	cols := []catalog.Column{
+		{Name: nameCol, Type: textType, Ordinal: 0},
+		{Name: valueCol, Type: textType, Ordinal: 1},
+	}
+	node := &PgOptionsToTable{pos: tf.Pos(), Arg: arg, schema: schema}
+	tbl := &catalog.Table{Name: alias, Columns: cols}
+	b := rangeBinding{table: tbl, alias: alias, offset: 0, sourceIdx: sourceIdx}
+	return node, b, nil
+}
+
 // planFromUnnest plans FROM unnest(array_expr [, ...]) alias(col [, ...]).
 // Single-arg: expands one array into one row per element. M0097-0035.
 // Multi-arg: zips multiple arrays, NULL-padding shorter ones. M0097-0xxx.

@@ -189,6 +189,10 @@ func foldPlanConstantsInner(node Node) {
 		}
 	case *PgAvailableWalSummaries:
 		// no sub-expressions to fold
+	case *PgOptionsToTable:
+		if n.Arg != nil {
+			n.Arg = FoldConstants(n.Arg)
+		}
 	case *VerifyHeapam:
 		if n.Arg != nil {
 			n.Arg = FoldConstants(n.Arg)
@@ -396,11 +400,11 @@ func foldCaseExpr(x *CaseExpr) Expr {
 
 // literalValue holds the Go-native value of a planner literal expression.
 type literalValue struct {
-	kind    string // "int", "str", "num", "bool"
-	intV    int64
-	strV    string
-	boolV   bool
-	numStr  string // raw decimal text for KindNumeric
+	kind   string // "int", "str", "num", "bool"
+	intV   int64
+	strV   string
+	boolV  bool
+	numStr string // raw decimal text for KindNumeric
 }
 
 // toLiteralValue extracts a Go-native value from a planner literal expression.
@@ -645,4 +649,3 @@ func cmpResult(op parser.OpCode, cmp int) bool {
 	}
 	return false
 }
-

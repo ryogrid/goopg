@@ -64,6 +64,8 @@ func Build(plan planner.Node) (Operator, error) {
 		return maybeInstrument(p, newScalarFuncScanOp(p)), nil
 	case *planner.PgPartitionTree:
 		return maybeInstrument(p, newPgPartitionTreeOp(p)), nil
+	case *planner.PgOptionsToTable:
+		return maybeInstrument(p, newPgOptionsToTableOp(p)), nil
 	case *planner.CTEScan:
 		// CTEScan wraps the inlined CTE body. Use cteScanOp which materializes
 		// all rows on first Open() and replays them on subsequent Open() calls
@@ -301,10 +303,10 @@ type utilityNoOp struct{ plan *planner.Utility }
 
 func newUtilityNoOp(p *planner.Utility) *utilityNoOp { return &utilityNoOp{plan: p} }
 
-func (o *utilityNoOp) Schema() planner.Schema { return nil }
-func (o *utilityNoOp) Open(*Context) error    { return nil }
+func (o *utilityNoOp) Schema() planner.Schema   { return nil }
+func (o *utilityNoOp) Open(*Context) error      { return nil }
 func (o *utilityNoOp) Next() (TupleSlot, error) { return nil, EOF }
-func (o *utilityNoOp) Close() error           { return nil }
+func (o *utilityNoOp) Close() error             { return nil }
 
 // Run is a convenience that opens an operator, drains it into a slice
 // of rows, then closes. Production paths use Open/Next/Close

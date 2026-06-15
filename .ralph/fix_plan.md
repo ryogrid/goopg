@@ -1399,6 +1399,39 @@ object support.
         `pg_options_to_table` as a FROM-clause SRF (`text[]` of `name=value` →
         rows `(option_name, option_value)`). Then getForeignServers
         (`pg_foreign_server`) / getUserMappings (`pg_user_mappings`).
+      - **PROGRESS 2026-06-16 (loop #40):** **DU-002 slice 17
+        (`pg_options_to_table` FROM-clause SRF) LANDED.** The
+        `getForeignDataWrappers` ARRAY subquery expands `fdwoptions` via
+        `pg_options_to_table(fdwoptions)`; goopg seeded it in pg_proc (OID 2289)
+        but never implemented it executably, so planning aborted at `column
+        "option_name" does not exist`. Wired the standard FROM-SRF path
+        (mirrors `pg_partition_tree`/`unnest`): parser known-builtin switch
+        (`internal/parser/select.go`); plan node `PgOptionsToTable` +
+        `planPgOptionsToTable` (`internal/planner/plan.go`, `planner.go`) with
+        two `text` cols `option_name`/`option_value` (AS-alias overridable);
+        `FoldConstants`/`walkPlanExprs` cases (`foldconst.go`, `unnest.go`);
+        executor op `pgOptionsToTableOp`
+        (`internal/executor/operators_pg_options_to_table.go`) — evaluates the
+        `text[]` arg against the outer lateral row, splits each element at the
+        FIRST `=` (later `=` stay in value, bare name → NULL value), faithful to
+        `untransformRelOptions` in `src/backend/foreign/foreign.c`. **Sibling
+        path fixed (non-obvious):** the analyzer (`internal/analyzer/analyzer.go`
+        `tableFuncColumns`) derives FROM-SRF columns INDEPENDENTLY and runs
+        BEFORE the planner; without a case there, bare `option_name` failed
+        analysis before FROM was ever planned (executor was correct — `SELECT *`
+        worked, named columns didn't). Added the case there too. 4 unit tests
+        (`TestPgOptionsToTable*`) PASS; parser/planner/analyzer/executor/catalog
+        suites PASS; build/gofmt/vet clean; `TestPort_PgDumpConnectionSetup`
+        PASS. **Next blocker (precise, empirical — NOT the predicted
+        pg_foreign_server):** `column "fdwoptions" does not exist`. `fdwoptions`
+        is a CORRELATED reference to the outer `pg_foreign_data_wrapper` row, and
+        goopg cannot resolve a FROM-clause SRF arg that reaches up into an OUTER
+        query level from inside a scalar/ARRAY subquery (verified: same-level
+        `FROM t, LATERAL pg_options_to_table(t.opts)` resolves fine). Resume =
+        slice 18: thread the outer scope into the analyzer's + planner's
+        FROM-clause SRF argument resolution (analyzer `tableFuncColumns` caller's
+        scope chain + `planTableFuncRangeVar` `lateralCtx`). Then getForeignServers
+        (`pg_foreign_server`) / getUserMappings (`pg_user_mappings`).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
