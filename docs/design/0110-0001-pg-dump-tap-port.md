@@ -1644,6 +1644,22 @@ fixed one logical group per loop:
     `vb varbit(16)`, `vbs varbit(16)[]` columns in `TestPort_PgDumpConnectionSetup`
     (asserting the rendered `bit(8)` / `bit varying(16)` spellings) and new rows in
     `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`.
+  - **Slice 76 — `pg_lsn` (+ its array type) (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** The WAL log-sequence-number type (`pg_lsn`
+    OID 3220) and its array (`_pg_lsn` 3221) are already seeded in
+    `pg_type_seed_data.go` (and `pg_lsn` is supported by the analyzer/executor
+    for arithmetic and comparison), but neither had been wired into the pg_dump
+    catalog-codec path, so a `pg_lsn` column fell back to `text` (OID 25). Back to
+    the plain 3-site pattern (no typmod): `pg_lsn` is an 8-byte by-value type
+    (`typlen=8`, `typbyval=t`, `typalign='d'`, `typstorage='p'`; array
+    `typalign='d'`, `typstorage='x'`). `oidToBuiltinTypeName` already returned
+    `"pg_lsn"` for the scalar (used by older paths) but had no array case, and
+    `formatTypeOID` had neither — both gained `pg_lsn` / `pg_lsn[]` cases. The
+    parser accepts `pg_lsn` as a generic identifier (no multi-word / typmod
+    handling needed). Guarded by the `arr` fixture's `lsn pg_lsn`, `lsns
+    pg_lsn[]` columns in `TestPort_PgDumpConnectionSetup` and new rows in
+    `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1704,7 +1720,8 @@ polygon[]`, `ln line`, `lns line[]`, `circ circle`, and `circs circle[]`;
 slice 73 adds the full-text-search family `tsv tsvector`, `tsvs tsvector[]`,
 `tsq tsquery`, and `tsqs tsquery[]`; slice 74 adds `xm xml`, `xms xml[]`, `mny
 money`, and `mnys money[]`; slice 75 adds the typmod-bearing `bv bit(8)`, `bvs
-bit(8)[]`, `vb varbit(16)`, and `vbs varbit(16)[]`.
+bit(8)[]`, `vb varbit(16)`, and `vbs varbit(16)[]`; slice 76 adds `lsn pg_lsn`
+and `lsns pg_lsn[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

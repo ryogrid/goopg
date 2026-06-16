@@ -194,6 +194,8 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDVarbit: // 1562 varbit -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDPgLsn: // 3220 pg_lsn -- pg_type.dat: typlen 8, typbyval t, typalign 'd', typstorage 'p'
+		return userTypeAttrs{TypLen: 8, TypByVal: true, TypAlign: 'd', TypStorage: 'p'}
 	case catalog.OIDArrayBool: // 1000 _bool -- pg_type.dat: typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBytea: // 1001 _bytea -- element bytea typalign 'i', typstorage 'x'
@@ -268,6 +270,8 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayVarbit: // 1563 _varbit -- element varbit typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayPgLsn: // 3221 _pg_lsn -- element pg_lsn typalign 'd', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 }

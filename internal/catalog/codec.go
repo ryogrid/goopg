@@ -107,6 +107,11 @@ const (
 	// format_type renders `bit(n)` / `bit varying(n)`.
 	OIDBit    uint32 = 1560
 	OIDVarbit uint32 = 1562
+	// DU-002 slice 76: pg_lsn (the WAL log-sequence-number type). Seeded in
+	// pg_type (see initdb/pg_type_seed_data.go) so a PG standby can resolve the
+	// OID. It is an 8-byte by-value type with no typmod, so format_type renders
+	// the bare type name.
+	OIDPgLsn uint32 = 3220
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -172,6 +177,9 @@ const (
 	// its typmod and re-appends [] (e.g. `bit(8)[]`, `bit varying(8)[]`).
 	OIDArrayBit    uint32 = 1561
 	OIDArrayVarbit uint32 = 1563
+	// DU-002 slice 76: the pg_lsn array type. pg_lsn has no typmod, so
+	// format_type renders the bare element name with a [] suffix.
+	OIDArrayPgLsn uint32 = 3221
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -254,6 +262,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayBit
 	case OIDVarbit:
 		return OIDArrayVarbit
+	case OIDPgLsn:
+		return OIDArrayPgLsn
 	}
 	return 0
 }
@@ -338,6 +348,8 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDBit, true
 	case OIDArrayVarbit:
 		return OIDVarbit, true
+	case OIDArrayPgLsn:
+		return OIDPgLsn, true
 	}
 	return 0, false
 }
@@ -1188,6 +1200,8 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDBit
 	case "varbit", "bit varying":
 		return OIDVarbit
+	case "pg_lsn":
+		return OIDPgLsn
 	default:
 		return OIDText // safe fallback
 	}
@@ -1274,6 +1288,8 @@ func OIDToTypeName(oid uint32) string {
 		return "bit"
 	case OIDVarbit:
 		return "varbit"
+	case OIDPgLsn:
+		return "pg_lsn"
 	default:
 		return "text"
 	}

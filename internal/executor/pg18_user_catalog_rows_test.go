@@ -452,6 +452,9 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		{"bit", []int64{8}, 1561, "bit(8)[]"},
 		{"varbit", []int64{8}, 1563, "bit varying(8)[]"},
 		{"varbit", nil, 1563, "bit varying[]"},
+		// Slice 76: pg_lsn (_pg_lsn 3221). pg_lsn has no typmod, so the array
+		// renders as the bare element name with the [] suffix.
+		{"pg_lsn", nil, 3221, "pg_lsn[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}
@@ -503,6 +506,9 @@ func TestUserPGAttributeTypmod(t *testing.T) {
 		{"bit", []int64{8}, 8, "bit(8)"},
 		{"varbit", []int64{16}, 16, "bit varying(16)"},
 		{"varbit", nil, -1, "bit varying"},
+		// Slice 76: pg_lsn has no typmod, so atttypmod stays -1 and the scalar
+		// renders as its bare name.
+		{"pg_lsn", nil, -1, "pg_lsn"},
 		{"int4", []int64{}, -1, "integer"}, // typmod ignored for plain types
 	}
 	for _, tc := range cases {

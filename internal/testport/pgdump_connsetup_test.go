@@ -607,7 +607,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"circ circle, circs circle[], "+
 		"tsv tsvector, tsvs tsvector[], tsq tsquery, tsqs tsquery[], "+
 		"xm xml, xms xml[], mny money, mnys money[], "+
-		"bv bit(8), bvs bit(8)[], vb varbit(16), vbs varbit(16)[])"); err != nil {
+		"bv bit(8), bvs bit(8)[], vb varbit(16), vbs varbit(16)[], "+
+		"lsn pg_lsn, lsns pg_lsn[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -964,6 +965,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// (`vb`, 1562) + varbit[] (`vbs`, _varbit 1563). Both carry the bit length
 		// as typmod (raw, no VARHDRSZ), so format_type renders `bit(8)` /
 		// `bit varying(16)` and the arrays carry the element typmod.
+		// Slice 76 adds pg_lsn (`lsn`, 3220) + pg_lsn[] (`lsns`, _pg_lsn 3221).
+		// pg_lsn carries no typmod, so format_type renders the bare `pg_lsn` /
+		// `pg_lsn[]`.
 		// All are seeded in pg_type but were never wired into TypeNameToOID/
 		// OIDToTypeName, so each scalar fell back to text (OID 25) and the array
 		// paths had no OIDs. None carry a typmod, so each renders as the plain
@@ -1030,6 +1034,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"bvs bit(8)[]",
 			"vb bit varying(16)",
 			"vbs bit varying(16)[]",
+			"lsn pg_lsn",
+			"lsns pg_lsn[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

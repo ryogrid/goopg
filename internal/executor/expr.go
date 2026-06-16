@@ -218,6 +218,8 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "bit varying[]"
 	case 1187:
 		return "interval[]"
+	case 3221:
+		return "pg_lsn[]"
 	case 1231:
 		return "numeric[]"
 	case 2951:
@@ -10642,6 +10644,12 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 1563:
 		// _varbit: element typmod (bit varying(n)) carried onto the array. Slice 75.
 		return formatTypeOID(1562, typmod) + "[]"
+	case 3220:
+		// pg_lsn: no typmod, bare name. DU-002 slice 76.
+		return "pg_lsn"
+	case 3221:
+		// _pg_lsn: pg_lsn has no typmod, so the array is the bare name. Slice 76.
+		return "pg_lsn[]"
 	case 3802:
 		return "jsonb"
 	case 4072:
