@@ -2920,39 +2920,23 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2604,
 	}
+	// pg_attrdef holds ordinary column DEFAULTs, the generation expression of
+	// GENERATED ALWAYS AS (expr) STORED columns (pg_dump re-emits it inline,
+	// keyed on attgenerated='s' — DU-002 slice 59), and the implicit nextval()
+	// default of a SERIAL column (slice 121). attrDefRowsLocked builds the
+	// deterministic row set so this view and dependVirtualRows agree on the oids.
 	pgAttrdef.VirtualRows = func() [][]string {
 		c.mu.RLock()
 		defer c.mu.RUnlock()
-		var rows [][]string
-		var oid uint32 = 1
-		for _, tbl := range c.tables {
-			if tbl.Virtual {
-				continue
-			}
-			for _, col := range tbl.Columns {
-				// pg_attrdef holds both ordinary column DEFAULTs and the
-				// generation expression of GENERATED ALWAYS AS (expr) STORED
-				// columns. pg_dump fetches the expr via pg_get_expr(adbin) and,
-				// keyed on pg_attribute.attgenerated='s', re-emits it as the
-				// inline GENERATED clause (DU-002 slice 59). A column is never
-				// both, so DefaultExpr takes precedence over GeneratedExpr.
-				var adbin string
-				switch {
-				case col.DefaultExpr != nil:
-					adbin = formatExprForAttrdef(col.DefaultExpr)
-				case col.GeneratedExpr != "":
-					adbin = col.GeneratedExpr
-				default:
-					continue
-				}
-				rows = append(rows, []string{
-					fmt.Sprintf("%d", oid),
-					fmt.Sprintf("%d", tbl.OID),
-					fmt.Sprintf("%d", col.Ordinal+1),
-					adbin,
-				})
-				oid++
-			}
+		ar := c.attrDefRowsLocked()
+		rows := make([][]string, 0, len(ar))
+		for _, r := range ar {
+			rows = append(rows, []string{
+				strconv.FormatUint(uint64(r.oid), 10),
+				strconv.FormatUint(uint64(r.tableOID), 10),
+				strconv.Itoa(r.attnum),
+				r.adbin,
+			})
 		}
 		return rows
 	}
@@ -5592,6 +5576,29 @@ func (c *InMemory) dependVirtualRows() [][]string {
 			deptype,                    // 6: deptype    = AUTO ('a') / INTERNAL ('i')
 		})
 	}
+
+	// A SERIAL column's nextval() default records a NORMAL ('n') pg_depend link
+	// from the pg_attrdef row to the owned sequence. Combined with the AUTO ('a')
+	// OWNED-BY row above (sequence → table) and the table → attrdef edge pg_dump
+	// adds itself, this closes the table↔sequence dependency loop pg_dump breaks
+	// by emitting the default as a separate `ALTER TABLE ... SET DEFAULT
+	// nextval(...)` (repairTableAttrDefMultiLoop) — exactly upstream's behavior.
+	// The pg_attrdef.oid pg_dump scanned must equal this objid, so both come from
+	// the shared attrDefRowsLocked numbering. DU-002 slice 121.
+	for _, ad := range c.attrDefRowsLocked() {
+		if ad.seqOID == 0 {
+			continue
+		}
+		rows = append(rows, []string{
+			"2604",                                 // 0: classid    = pg_attrdef
+			strconv.FormatUint(uint64(ad.oid), 10), // 1: objid    = attrdef OID
+			"0",                                    // 2: objsubid
+			"1259",                                 // 3: refclassid = pg_class
+			strconv.FormatUint(uint64(ad.seqOID), 10), // 4: refobjid = sequence OID
+			"0", // 5: refobjsubid
+			"n", // 6: deptype   = NORMAL
+		})
+	}
 	return rows
 }
 
@@ -6719,6 +6726,94 @@ func (c *InMemory) TablesWithColumnOfType(typeName string) []*Table {
 		}
 	}
 	return out
+}
+
+// IsSerialTypeName reports whether a column type name is one of the SERIAL
+// pseudo-types. SERIAL columns store a plain integer with an implicit
+// nextval()-default and an owned sequence; pg_dump dumps that default + sequence
+// separately. DU-002 slice 121.
+func IsSerialTypeName(name string) bool {
+	switch strings.ToLower(name) {
+	case "serial", "serial4", "bigserial", "serial8", "smallserial", "serial2":
+		return true
+	default:
+		return false
+	}
+}
+
+// attrDefRow is one synthesized pg_attrdef entry. The same deterministic row set
+// feeds the pg_attrdef virtual table and the pg_depend NORMAL link from a SERIAL
+// column's default to its owned sequence, so both must agree on the synthetic
+// `oid`. seqOID is non-zero only for a SERIAL column (the sequence the nextval()
+// default references). DU-002 slice 121.
+type attrDefRow struct {
+	oid      uint32
+	tableOID uint32
+	attnum   int // 1-based
+	adbin    string
+	seqOID   uint32
+}
+
+// attrDefRowsLocked builds the deterministic pg_attrdef row set shared by the
+// pg_attrdef virtual table and dependVirtualRows. The caller MUST hold c.mu (R).
+// Tables are walked in sorted-key order so the synthetic oids are stable across
+// calls — pg_dump matches the pg_attrdef.oid it scanned against the pg_depend
+// objid, so the two producers cannot disagree. DU-002 slice 121.
+func (c *InMemory) attrDefRowsLocked() []attrDefRow {
+	// Index sequence relations by their bare (lowercased) name so a SERIAL
+	// column's default can resolve the owned sequence's pg_class OID.
+	seqOIDByName := make(map[string]uint32)
+	for _, t := range c.tables {
+		if t.IsSequence {
+			seqOIDByName[strings.ToLower(t.Name)] = t.OID
+		}
+	}
+	keys := make([]string, 0, len(c.tables))
+	for k, t := range c.tables {
+		if t.Virtual {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var rows []attrDefRow
+	var oid uint32 = 1
+	for _, k := range keys {
+		tbl := c.tables[k]
+		for _, col := range tbl.Columns {
+			var adbin string
+			var seqOID uint32
+			switch {
+			case IsSerialTypeName(col.Type.Name):
+				// SERIAL default = nextval('<schema>.<table>_<col>_seq'::regclass).
+				// pg_dump runs with search_path='' so the regclass is fully
+				// schema-qualified; goopg's pg_get_expr is a pass-through, so adbin
+				// must already carry that qualified form.
+				sch := strings.ToLower(tbl.Schema)
+				if sch == "" {
+					sch = "public"
+				}
+				seqName := strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+				adbin = fmt.Sprintf("nextval('%s.%s'::regclass)", sch, seqName)
+				seqOID = seqOIDByName[seqName]
+			case col.DefaultExpr != nil:
+				adbin = formatExprForAttrdef(col.DefaultExpr)
+			case col.GeneratedExpr != "":
+				adbin = col.GeneratedExpr
+			default:
+				continue
+			}
+			rows = append(rows, attrDefRow{
+				oid:      oid,
+				tableOID: tbl.OID,
+				attnum:   col.Ordinal + 1,
+				adbin:    adbin,
+				seqOID:   seqOID,
+			})
+			oid++
+		}
+	}
+	return rows
 }
 
 // formatExprForAttrdef converts a parsed default expression to a display string

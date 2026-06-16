@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"math"
 	"strconv"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 )
@@ -493,6 +494,21 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	if typOID == catalog.OIDBpChar && col.Type.Name == "char" && len(col.Type.Args) == 0 {
 		typOID = catalog.OIDChar
 	}
+	// SERIAL/BIGSERIAL/SMALLSERIAL are syntactic sugar: the stored column is a
+	// plain integer with a nextval() default + an owned sequence. pg_dump never
+	// emits "serial" — it renders the base integer type via format_type(atttypid)
+	// and dumps the DEFAULT + CREATE SEQUENCE separately. goopg keeps the catalog
+	// type name as the serial spelling (the INSERT auto-gen path keys on it), so
+	// remap atttypid here (and the physical attrs derived from it below) to int4/
+	// int8/int2 like upstream. DU-002 slice 121.
+	switch strings.ToLower(col.Type.Name) {
+	case "serial", "serial4":
+		typOID = catalog.OIDInt4
+	case "bigserial", "serial8":
+		typOID = catalog.OIDInt8
+	case "smallserial", "serial2":
+		typOID = catalog.OIDInt2
+	}
 	// A column whose declared type is a user-defined enum resolves to the text
 	// fallback above (TypeNameToOID knows only built-ins). Re-resolve it to the
 	// enum's dynamically-allocated pg_type OID so pg_attribute.atttypid points
@@ -563,24 +579,24 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		attrs = userTypeAttrsForOID(domainBaseOID)
 	}
 	return Row{
-		NewIntDatum(int64(tbl.OID)),                                     // attrelid
-		NewStringDatum(col.Name),                                        // attname (name)
-		NewIntDatum(int64(typOID)),                                      // atttypid
-		NewIntDatum(int64(attrs.TypLen)),                                // attlen
-		NewIntDatum(int64(col.Ordinal + 1)),                             // attnum (1-based)
-		NewIntDatum(typmod),                                             // atttypmod
-		NewIntDatum(attndims),                                           // attndims
-		NewBoolDatum(attrs.TypByVal),                                    // attbyval
-		NewStringDatum(string(attrs.TypAlign)),                          // attalign
-		NewStringDatum(string(attrs.TypStorage)),                        // attstorage
-		NewStringDatum(""),                                              // attcompression (PG18 default: '\0' meaning "default")
-		NewBoolDatum(col.NotNull),                                       // attnotnull
-		NewBoolDatum(col.DefaultExpr != nil || col.GeneratedExpr != ""), // atthasdef (generated cols carry their expr in pg_attrdef too)
-		NewBoolDatum(false),                                             // atthasmissing
-		NewStringDatum(attIdentityFor(col)),                             // attidentity
-		NewStringDatum(attGeneratedFor(col)),                            // attgenerated
-		NewBoolDatum(false),                                             // attisdropped
-		NewBoolDatum(!col.Inherited),                                    // attislocal
+		NewIntDatum(int64(tbl.OID)),              // attrelid
+		NewStringDatum(col.Name),                 // attname (name)
+		NewIntDatum(int64(typOID)),               // atttypid
+		NewIntDatum(int64(attrs.TypLen)),         // attlen
+		NewIntDatum(int64(col.Ordinal + 1)),      // attnum (1-based)
+		NewIntDatum(typmod),                      // atttypmod
+		NewIntDatum(attndims),                    // attndims
+		NewBoolDatum(attrs.TypByVal),             // attbyval
+		NewStringDatum(string(attrs.TypAlign)),   // attalign
+		NewStringDatum(string(attrs.TypStorage)), // attstorage
+		NewStringDatum(""),                       // attcompression (PG18 default: '\0' meaning "default")
+		NewBoolDatum(col.NotNull),                // attnotnull
+		NewBoolDatum(col.DefaultExpr != nil || col.GeneratedExpr != "" || catalog.IsSerialTypeName(col.Type.Name)), // atthasdef (generated cols + SERIAL nextval defaults carry their expr in pg_attrdef too)
+		NewBoolDatum(false),                  // atthasmissing
+		NewStringDatum(attIdentityFor(col)),  // attidentity
+		NewStringDatum(attGeneratedFor(col)), // attgenerated
+		NewBoolDatum(false),                  // attisdropped
+		NewBoolDatum(!col.Inherited),         // attislocal
 		func() Datum {
 			if col.Inherited {
 				return NewIntDatum(1)
@@ -1126,37 +1142,37 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		typdefaultbin = NewStringDatum(bin)
 	}
 	return Row{
-		NewIntDatum(int64(d.OID)),                             // oid
-		NewStringDatum(d.Name),                                // typname (name type)
-		NewIntDatum(int64(catalog.PublicNamespaceOID)),        // typnamespace = public
-		NewIntDatum(bootstrapSuperuserOID),                    // typowner
-		NewIntDatum(int64(attrs.TypLen)),                      // typlen (inherit base)
-		NewBoolDatum(attrs.TypByVal),                          // typbyval (inherit base)
-		NewStringDatum("d"),                                   // typtype = 'd' (domain)
-		NewStringDatum(string(typcategory)),                   // typcategory (inherit base)
-		NewBoolDatum(false),                                   // typispreferred
-		NewBoolDatum(true),                                    // typisdefined
-		NewStringDatum(","),                                   // typdelim
-		NewIntDatum(0),                                        // typrelid
-		NewIntDatum(0),                                        // typsubscript
-		NewIntDatum(0),                                        // typelem
-		NewIntDatum(0),                                        // typarray (no domain array type in this slice)
-		NewIntDatum(0),                                        // typinput
-		NewIntDatum(0),                                        // typoutput
-		NewIntDatum(0),                                        // typreceive
-		NewIntDatum(0),                                        // typsend
-		NewIntDatum(0),                                        // typmodin
-		NewIntDatum(0),                                        // typmodout
-		NewIntDatum(0),                                        // typanalyze
-		NewStringDatum(string(attrs.TypAlign)),                // typalign (inherit base)
-		NewStringDatum(string(attrs.TypStorage)),              // typstorage (inherit base)
-		NewBoolDatum(d.NotNull),                               // typnotnull (declared NOT NULL)
-		NewIntDatum(int64(baseOID)),                           // typbasetype
-		NewIntDatum(typmod),                                   // typtypmod (base typmod)
-		NewIntDatum(0),                                        // typndims
-		NewIntDatum(int64(attrs.TypCollation)),                // typcollation (inherit base)
-		typdefaultbin,                                         // typdefaultbin (rendered DEFAULT expr, NULL if none)
-		NullDatum,                                             // typdefault (NULL; pg_dump prefers typdefaultbin)
-		NullDatum,                                             // typacl (NULL)
+		NewIntDatum(int64(d.OID)),                      // oid
+		NewStringDatum(d.Name),                         // typname (name type)
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
+		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(int64(attrs.TypLen)),               // typlen (inherit base)
+		NewBoolDatum(attrs.TypByVal),                   // typbyval (inherit base)
+		NewStringDatum("d"),                            // typtype = 'd' (domain)
+		NewStringDatum(string(typcategory)),            // typcategory (inherit base)
+		NewBoolDatum(false),                            // typispreferred
+		NewBoolDatum(true),                             // typisdefined
+		NewStringDatum(","),                            // typdelim
+		NewIntDatum(0),                                 // typrelid
+		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(0),                                 // typelem
+		NewIntDatum(0),                                 // typarray (no domain array type in this slice)
+		NewIntDatum(0),                                 // typinput
+		NewIntDatum(0),                                 // typoutput
+		NewIntDatum(0),                                 // typreceive
+		NewIntDatum(0),                                 // typsend
+		NewIntDatum(0),                                 // typmodin
+		NewIntDatum(0),                                 // typmodout
+		NewIntDatum(0),                                 // typanalyze
+		NewStringDatum(string(attrs.TypAlign)),         // typalign (inherit base)
+		NewStringDatum(string(attrs.TypStorage)),       // typstorage (inherit base)
+		NewBoolDatum(d.NotNull),                        // typnotnull (declared NOT NULL)
+		NewIntDatum(int64(baseOID)),                    // typbasetype
+		NewIntDatum(typmod),                            // typtypmod (base typmod)
+		NewIntDatum(0),                                 // typndims
+		NewIntDatum(int64(attrs.TypCollation)),         // typcollation (inherit base)
+		typdefaultbin,                                  // typdefaultbin (rendered DEFAULT expr, NULL if none)
+		NullDatum,                                      // typdefault (NULL; pg_dump prefers typdefaultbin)
+		NullDatum,                                      // typacl (NULL)
 	}
 }

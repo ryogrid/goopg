@@ -1112,12 +1112,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		SetSequenceDataType(seqName, seqDataType)
 		// Record implicit ownership so DROP TABLE cascades to this sequence.
 		SetSequenceOwnedBy(seqName, strings.ToLower(s.Name.Name)+"."+strings.ToLower(c.Name))
-		// An IDENTITY column's backing sequence must be discoverable by pg_dump
-		// (relkind='S' in pg_class + its pg_depend deptype='i' row), so give it a
-		// catalog IsSequence relation just like an explicit CREATE SEQUENCE. SERIAL
-		// columns keep their prior catalog-less behavior (no pg_dump round-trip yet),
-		// so the table is only created for identity columns. M0110-0001 (slice 120).
-		if c.IdentityColumn {
+		// A SERIAL or IDENTITY column's backing sequence must be discoverable by
+		// pg_dump (relkind='S' in pg_class + its pg_depend row), so give it a catalog
+		// IsSequence relation just like an explicit CREATE SEQUENCE. A serial
+		// sequence's OWNED-BY link is AUTO ('a'), so pg_dump dumps it as a standalone
+		// CREATE SEQUENCE + ALTER SEQUENCE OWNED BY + a column SET DEFAULT
+		// nextval(...) (vs an identity column's INTERNAL 'i' ADD GENERATED form).
+		// M0110-0001 (slice 120 identity, slice 121 serial).
+		if c.IdentityColumn || isSerial {
 			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName)
 		}
 	}

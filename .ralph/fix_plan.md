@@ -2324,6 +2324,46 @@ object support.
         commit. **Next: slice 121** — SERIAL column pg_dump round-trip (CREATE SEQUENCE
         + column DEFAULT nextval + ALTER SEQUENCE OWNED BY, deptype='a'), or a
         table+sequence+view dependency-ordering case.
+      - **PROGRESS 2026-06-17 (loop #85):** **DU-002 slice 121 LANDED** —
+        SERIAL/BIGSERIAL columns dump byte-identically. The AUTO ('a') counterpart
+        to slice 120's IDENTITY ('i'), and the FIRST object whose default pg_dump
+        forces into a SEPARATE `ALTER TABLE ONLY … ALTER COLUMN … SET DEFAULT
+        nextval(…)` statement (not inline in CREATE TABLE). pg_dump's
+        `repairTableAttrDefMultiLoop` breaks the table↔sequence dependency loop
+        (`table →(pg_dump-added) attrdef →(pg_depend 'n') sequence →(pg_depend 'a'
+        OWNED BY) table`) by marking the attrdef separate; an un-owned `DEFAULT
+        nextval` stays inline, so the OWNED-BY edge is the trigger. A `serial`
+        emits `CREATE SEQUENCE … AS integer …` (int4 ≠ bigint default); a
+        `bigserial` omits `AS`. **Five coupled goopg changes:** (1)
+        `createSeqCatalogTable` now runs for serial too (was identity-only) → the
+        sequence is discoverable in pg_class relkind='S'; (2)
+        `buildUserPGAttributeRow` remaps `atttypid` serial→int4 / bigserial→int8 /
+        smallserial→int2 (catalog type-name stays the serial spelling so the INSERT
+        auto-gen path is untouched); (3) `atthasdef`=true for serial
+        (`catalog.IsSerialTypeName`); (4) NEW `InMemory.attrDefRowsLocked` — a
+        shared deterministic (sorted-key) builder feeding BOTH the `pg_attrdef`
+        virtual table AND `dependVirtualRows`, synthesizing
+        `adbin = nextval('<schema>.<tbl>_<col>_seq'::regclass)` (pg_get_expr is a
+        pass-through); (5) `dependVirtualRows` emits the `pg_depend` NORMAL ('n')
+        attrdef→sequence row using the SAME attrdef oid the view uses — the
+        sibling-path constraint (pg_dump matches scanned `pg_attrdef.oid` against
+        `pg_depend.objid`) that closes the loop. Test-only: the slice-90
+        empty-default guard was tightened to newline-anchored forms (`DEFAULT;\n` /
+        `DEFAULT \n`) — pg_dump's new `-- … Type: DEFAULT; Schema: …` section
+        comment (introduced by the separate serial defaults) was a false positive.
+        Fixtures `ser_tbl` (serial) + `bigser_tbl` (bigserial) verified
+        byte-identical to real pg_dump 18.3, with negative guards (no literal
+        `serial`/`bigserial`, no inline `DEFAULT nextval`). Files:
+        `internal/catalog/catalog.go` (IsSerialTypeName + attrDefRowsLocked +
+        attrdef→seq depend), `internal/executor/operators_ddl.go`
+        (createSeqCatalogTable for serial), `internal/executor/pg18_user_catalog_rows.go`
+        (atttypid remap + atthasdef), `internal/testport/pgdump_connsetup_test.go`
+        (fixtures + assertions + slice-90 guard), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 121 section). Gates: gofmt OK; `go build ./...` OK; catalog +
+        executor(full) + parser unit PASS; `TestPort_PgDumpConnectionSetup` PASS
+        (1.99s); pgbench pre-commit smoke on commit. **Next: slice 122** — a
+        table+sequence+VIEW dependency-ordering case, a multi-column/explicit-START
+        serial, or a mixed identity+serial table stressing the deptype graph.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

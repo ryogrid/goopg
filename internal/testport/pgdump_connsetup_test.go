@@ -637,6 +637,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table ident_def: %v", err)
 	}
 
+	// Slice 121: a SERIAL / BIGSERIAL column is the AUTO ('a') counterpart to
+	// slice 120's INTERNAL ('i') identity column. PG expands `serial` to a plain
+	// integer column NOT NULL with an owned sequence and a nextval() default;
+	// pg_dump never emits the word "serial". It dumps four coupled statements:
+	//   CREATE TABLE ... (id integer NOT NULL, ...)
+	//   CREATE SEQUENCE ..._id_seq AS integer ...        (AS integer: int4 ≠ bigint default)
+	//   ALTER SEQUENCE ..._id_seq OWNED BY t.id;         (deptype 'a')
+	//   ALTER TABLE ONLY t ALTER COLUMN id SET DEFAULT nextval('..._id_seq'::regclass);
+	// The SET DEFAULT is dumped SEPARATELY (not inline in CREATE TABLE) because the
+	// owned-sequence ↔ table dependency forms a loop pg_dump breaks via
+	// repairTableAttrDefMultiLoop. goopg now (a) gives the serial sequence a
+	// catalog IsSequence relation so pg_dump discovers it; (b) remaps the column's
+	// atttypid to int4/int8; (c) surfaces a pg_attrdef row whose adbin is the
+	// schema-qualified nextval(); (d) synthesizes the pg_depend NORMAL link from
+	// that attrdef to the sequence so the loop (and the separate SET DEFAULT) forms.
+	// bigserial omits the `AS integer` clause (int8 is the sequence default type).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ser_tbl (id serial, label text)"); err != nil {
+		t.Fatalf("create table ser_tbl: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.bigser_tbl (id bigserial, note text)"); err != nil {
+		t.Fatalf("create table bigser_tbl: %v", err)
+	}
+
 	// Slice 61: a RECURSIVE VIEW must survive the dump. PG stores a recursive
 	// view as a regular view over a WITH RECURSIVE CTE; pg_dump fetches the body
 	// via the SAME pg_get_viewdef path as a plain view and aborts the WHOLE dump
@@ -1486,6 +1509,43 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				t.Errorf("pg_dump emitted a spurious standalone/OWNED BY form for an identity sequence: %q\n  full stdout=%q", neg, res.Stdout)
 			}
 		}
+		// **Slice 121 (asserted):** a SERIAL / BIGSERIAL column round-trips as a
+		// plain integer column + standalone sequence + OWNED BY + a SEPARATE column
+		// SET DEFAULT nextval(). The column type must be the base integer (never
+		// "serial"); the sequence carries `AS integer` only for serial4 (int8 is the
+		// CREATE SEQUENCE default, so bigserial omits it). The SET DEFAULT must be a
+		// standalone `ALTER TABLE ONLY ... ALTER COLUMN ... SET DEFAULT` (the
+		// dependency-loop break), not inline in CREATE TABLE.
+		serialDefs := []string{
+			"CREATE TABLE public.ser_tbl (\n    id integer NOT NULL,\n    label text\n);",
+			"CREATE TABLE public.bigser_tbl (\n    id bigint NOT NULL,\n    note text\n);",
+			"CREATE SEQUENCE public.ser_tbl_id_seq\n    AS integer\n    START WITH 1\n    INCREMENT BY 1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 1;",
+			"CREATE SEQUENCE public.bigser_tbl_id_seq\n    START WITH 1\n    INCREMENT BY 1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 1;",
+			"ALTER SEQUENCE public.ser_tbl_id_seq OWNED BY public.ser_tbl.id;",
+			"ALTER SEQUENCE public.bigser_tbl_id_seq OWNED BY public.bigser_tbl.id;",
+			"ALTER TABLE ONLY public.ser_tbl ALTER COLUMN id SET DEFAULT nextval('public.ser_tbl_id_seq'::regclass);",
+			"ALTER TABLE ONLY public.bigser_tbl ALTER COLUMN id SET DEFAULT nextval('public.bigser_tbl_id_seq'::regclass);",
+			"SELECT pg_catalog.setval('public.ser_tbl_id_seq', 1, false);",
+			"SELECT pg_catalog.setval('public.bigser_tbl_id_seq', 1, false);",
+		}
+		for _, sub := range serialDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/mangled a SERIAL clause; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// A serial column must NOT emit the word "serial" anywhere, and its default
+		// must NOT be inlined into CREATE TABLE (the separate SET DEFAULT is required
+		// by the dependency-loop break).
+		for _, neg := range []string{
+			"id serial",
+			"id bigserial",
+			"id integer DEFAULT nextval",
+			"id bigint DEFAULT nextval",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump emitted a spurious serial/inline-default form: %q\n  full stdout=%q", neg, res.Stdout)
+			}
+		}
 		// **Slice 61 (asserted):** a RECURSIVE VIEW must round-trip. PG stores it
 		// as a regular view over a WITH RECURSIVE CTE and pg_dump re-emits a plain
 		// CREATE VIEW; goopg synthesizes the wrapped form into RawDef so
@@ -2008,12 +2068,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "zip text") {
 			t.Errorf("pg_dump rendered the domain column as its base type (slice-90 domain OID resolution regressed)\n  full stdout=%q", res.Stdout)
 		}
-		// A bare `DEFAULT` immediately closing the statement (`DEFAULT;` or
+		// A bare `DEFAULT` immediately closing the statement (`DEFAULT;\n` or
 		// `DEFAULT \n`) is the slice-90 empty-clause regression. Legitimate
 		// defaults (`DEFAULT 0;`, `DEFAULT 'n/a'::text;`) carry an expression
 		// between DEFAULT and the terminator, so this stays precise even with the
-		// slice-93 text-default domain present.
-		if strings.Contains(res.Stdout, "DEFAULT;") || strings.Contains(res.Stdout, "DEFAULT \n") {
+		// slice-93 text-default domain present. The checks are newline-anchored so
+		// they do NOT match pg_dump's `-- ... Type: DEFAULT; Schema: ...` section
+		// comment, which slice 121's separate SERIAL column defaults introduce.
+		if strings.Contains(res.Stdout, "DEFAULT;\n") || strings.Contains(res.Stdout, "DEFAULT \n") {
 			t.Errorf("pg_dump emitted a spurious empty DEFAULT on the domain (slice-90 pg_get_expr(NULL) regressed)\n  full stdout=%q", res.Stdout)
 		}
 		return
