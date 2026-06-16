@@ -606,7 +606,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"poly polygon, polys polygon[], ln line, lns line[], "+
 		"circ circle, circs circle[], "+
 		"tsv tsvector, tsvs tsvector[], tsq tsquery, tsqs tsquery[], "+
-		"xm xml, xms xml[], mny money, mnys money[])"); err != nil {
+		"xm xml, xms xml[], mny money, mnys money[], "+
+		"bv bit(8), bvs bit(8)[], vb varbit(16), vbs varbit(16)[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -959,6 +960,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// (`tsqs`, _tsquery 3645).
 		// Slice 74 adds xml (`xm`, 142) + xml[] (`xms`, _xml 143) and money
 		// (`mny`, 790) + money[] (`mnys`, _money 791). Neither carries a typmod.
+		// Slice 75 adds bit (`bv`, 1560) + bit[] (`bvs`, _bit 1561) and varbit
+		// (`vb`, 1562) + varbit[] (`vbs`, _varbit 1563). Both carry the bit length
+		// as typmod (raw, no VARHDRSZ), so format_type renders `bit(8)` /
+		// `bit varying(16)` and the arrays carry the element typmod.
 		// All are seeded in pg_type but were never wired into TypeNameToOID/
 		// OIDToTypeName, so each scalar fell back to text (OID 25) and the array
 		// paths had no OIDs. None carry a typmod, so each renders as the plain
@@ -1021,6 +1026,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"xms xml[]",
 			"mny money",
 			"mnys money[]",
+			"bv bit(8)",
+			"bvs bit(8)[]",
+			"vb bit varying(16)",
+			"vbs bit varying(16)[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

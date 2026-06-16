@@ -190,6 +190,10 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDMoney: // 790 money -- pg_type.dat: typlen 8, typbyval t, typalign 'd', typstorage 'p'
 		return userTypeAttrs{TypLen: 8, TypByVal: true, TypAlign: 'd', TypStorage: 'p'}
+	case catalog.OIDBit: // 1560 bit -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDVarbit: // 1562 varbit -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBool: // 1000 _bool -- pg_type.dat: typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBytea: // 1001 _bytea -- element bytea typalign 'i', typstorage 'x'
@@ -260,6 +264,10 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayMoney: // 791 _money -- element money typalign 'd', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayBit: // 1561 _bit -- element bit typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayVarbit: // 1563 _varbit -- element varbit typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 }
@@ -463,6 +471,11 @@ func pgAttTypmod(typOID uint32, args []int64) int64 {
 	case 1042, 1043: // character(n) / character varying(n): n + VARHDRSZ
 		if len(args) >= 1 {
 			return args[0] + 4
+		}
+	case 1560, 1562: // bit(n) / bit varying(n): the raw bit length, no VARHDRSZ
+		// (anybit_typmodin stores the length directly).
+		if len(args) >= 1 {
+			return args[0]
 		}
 	}
 	return -1

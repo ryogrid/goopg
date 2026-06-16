@@ -447,6 +447,11 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// renders as the bare element name with the [] suffix.
 		{"xml", nil, 143, "xml[]"},
 		{"money", nil, 791, "money[]"},
+		// Slice 75: bit and varbit. Both carry the element typmod (the raw bit
+		// length) onto the array; a bare varbit[] column has typmod -1.
+		{"bit", []int64{8}, 1561, "bit(8)[]"},
+		{"varbit", []int64{8}, 1563, "bit varying(8)[]"},
+		{"varbit", nil, 1563, "bit varying[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}
@@ -493,6 +498,11 @@ func TestUserPGAttributeTypmod(t *testing.T) {
 		{"varchar", []int64{64}, 68, "character varying(64)"},
 		{"varchar", nil, -1, "character varying"},
 		{"bpchar", []int64{10}, 14, "character(10)"},
+		// Slice 75: bit(n)/varbit(n) store the raw bit length as typmod (no
+		// VARHDRSZ); a bare varbit column has typmod -1 (unlimited).
+		{"bit", []int64{8}, 8, "bit(8)"},
+		{"varbit", []int64{16}, 16, "bit varying(16)"},
+		{"varbit", nil, -1, "bit varying"},
 		{"int4", []int64{}, -1, "integer"}, // typmod ignored for plain types
 	}
 	for _, tc := range cases {

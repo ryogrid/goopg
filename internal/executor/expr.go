@@ -129,6 +129,10 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "xml"
 	case 790:
 		return "money"
+	case 1560:
+		return "bit"
+	case 1562:
+		return "bit varying"
 	case 1186:
 		return "interval"
 	case 1266:
@@ -208,6 +212,10 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "xml[]"
 	case 791:
 		return "money[]"
+	case 1561:
+		return "bit[]"
+	case 1563:
+		return "bit varying[]"
 	case 1187:
 		return "interval[]"
 	case 1231:
@@ -10612,6 +10620,28 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 791:
 		// _money: money has no typmod, so the array is the bare name. Slice 74.
 		return "money[]"
+	case 1560:
+		// bit(n): atttypmod is the bit length stored raw (no VARHDRSZ), mirroring
+		// anybit_typmodout. A column always carries typmod (bare `bit` => bit(1)).
+		// DU-002 slice 75.
+		if typmod >= 0 {
+			return fmt.Sprintf("bit(%d)", typmod)
+		}
+		return "bit"
+	case 1562:
+		// bit varying(n): like bit, typmod is the raw bit length. A bare `varbit`
+		// column has typmod -1 (unlimited) => the bare name. DU-002 slice 75.
+		if typmod >= 0 {
+			return fmt.Sprintf("bit varying(%d)", typmod)
+		}
+		return "bit varying"
+	case 1561:
+		// _bit: element typmod (bit(n)) is carried onto the array; format the
+		// element then re-append []. DU-002 slice 75.
+		return formatTypeOID(1560, typmod) + "[]"
+	case 1563:
+		// _varbit: element typmod (bit varying(n)) carried onto the array. Slice 75.
+		return formatTypeOID(1562, typmod) + "[]"
 	case 3802:
 		return "jsonb"
 	case 4072:

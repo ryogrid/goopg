@@ -1621,6 +1621,30 @@ fixed one logical group per loop:
     `TestPort_PgDumpConnectionSetup` and the two new rows in
     `executor.TestUserPGAttributeArrayColumn`.
 
+  - **Slice 75 — `bit`/`varbit` (+ their array types) (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** Both scalar types (`bit` OID 1560, `varbit`
+    1562) and their array types (`_bit` 1561, `_varbit` 1563) are already seeded in
+    `pg_type_seed_data.go`, but neither had been wired into `TypeNameToOID`/
+    `OIDToTypeName`, so each scalar column fell back to `text` (OID 25). Unlike the
+    prior few slices, **both carry a typmod**: `bit(n)`/`bit varying(n)` store the
+    raw bit length as `atttypmod` with **no VARHDRSZ adjustment** (mirroring
+    `anybit_typmodin`/`anybit_typmodout`), so the 3-site pattern is extended with a
+    fourth site — a `bit`/`varbit` case in `pgAttTypmod` (returns `args[0]`
+    verbatim, not `+4`) — plus the typmod-aware `formatTypeOID` cases that render
+    `bit(n)` / `bit varying(n)` (and the array cases that format the element with
+    the carried typmod and re-append `[]`, like `_varchar`/`_numeric`). `format_type`
+    special-cases these to the SQL spellings `bit` / `bit varying` (see
+    `format_type_extended` `BITOID`/`VARBITOID`), so `oidToBuiltinTypeName` returns
+    `"bit"`/`"bit varying"` and their `[]` forms. Rows in `userTypeAttrsForOID`:
+    varlena `bit`/`varbit` `typlen=-1`, `typbyval=f`, `typalign='i'`,
+    `typstorage='x'`; arrays likewise (matching `pg_type.dat`/`pg_type_seed_data.go`).
+    The parser already maps `bit varying`→`varbit` and parses the `(n)` typmod +
+    `[]` suffix. Guarded by the `arr` fixture's `bv bit(8)`, `bvs bit(8)[]`,
+    `vb varbit(16)`, `vbs varbit(16)[]` columns in `TestPort_PgDumpConnectionSetup`
+    (asserting the rendered `bit(8)` / `bit varying(16)` spellings) and new rows in
+    `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
@@ -1679,7 +1703,8 @@ adds the geometric family `pt point`, `pts point[]`, `seg lseg`, `segs lseg[]`,
 polygon[]`, `ln line`, `lns line[]`, `circ circle`, and `circs circle[]`;
 slice 73 adds the full-text-search family `tsv tsvector`, `tsvs tsvector[]`,
 `tsq tsquery`, and `tsqs tsquery[]`; slice 74 adds `xm xml`, `xms xml[]`, `mny
-money`, and `mnys money[]`.
+money`, and `mnys money[]`; slice 75 adds the typmod-bearing `bv bit(8)`, `bvs
+bit(8)[]`, `vb varbit(16)`, and `vbs varbit(16)[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

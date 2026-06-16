@@ -101,6 +101,12 @@ const (
 	// carries a typmod, so format_type renders the bare type name.
 	OIDXML   uint32 = 142
 	OIDMoney uint32 = 790
+	// DU-002 slice 75: bit and varbit (bit varying). Both are seeded in pg_type
+	// (see initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs.
+	// Both carry a typmod (the bit length, stored raw with no VARHDRSZ), so
+	// format_type renders `bit(n)` / `bit varying(n)`.
+	OIDBit    uint32 = 1560
+	OIDVarbit uint32 = 1562
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -161,6 +167,11 @@ const (
 	// so format_type renders the bare element name with a [] suffix.
 	OIDArrayXML   uint32 = 143
 	OIDArrayMoney uint32 = 791
+	// DU-002 slice 75: the bit and varbit array types. Both carry the element
+	// typmod (bit length) onto the array, so format_type renders the element with
+	// its typmod and re-appends [] (e.g. `bit(8)[]`, `bit varying(8)[]`).
+	OIDArrayBit    uint32 = 1561
+	OIDArrayVarbit uint32 = 1563
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -239,6 +250,10 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayXML
 	case OIDMoney:
 		return OIDArrayMoney
+	case OIDBit:
+		return OIDArrayBit
+	case OIDVarbit:
+		return OIDArrayVarbit
 	}
 	return 0
 }
@@ -319,6 +334,10 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDXML, true
 	case OIDArrayMoney:
 		return OIDMoney, true
+	case OIDArrayBit:
+		return OIDBit, true
+	case OIDArrayVarbit:
+		return OIDVarbit, true
 	}
 	return 0, false
 }
@@ -1165,6 +1184,10 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDXML
 	case "money":
 		return OIDMoney
+	case "bit":
+		return OIDBit
+	case "varbit", "bit varying":
+		return OIDVarbit
 	default:
 		return OIDText // safe fallback
 	}
@@ -1247,6 +1270,10 @@ func OIDToTypeName(oid uint32) string {
 		return "xml"
 	case OIDMoney:
 		return "money"
+	case OIDBit:
+		return "bit"
+	case OIDVarbit:
+		return "varbit"
 	default:
 		return "text"
 	}
