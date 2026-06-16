@@ -320,6 +320,17 @@ package testport
 // `foo_mgr_fkey` carries `ON UPDATE CASCADE ON DELETE SET NULL`; both round-trip
 // byte-identically (pg_get_constraintdef emits ON UPDATE before ON DELETE,
 // mirroring ruleutils.c, and omits the default NO ACTION).
+// Slice 55 restored COMMENT ON COLUMN in the dump. goopg already parsed
+// COMMENT ON and populated pg_description (catalog.SetComment), and pg_dump
+// re-emits a COMMENT statement per pg_description row. The TABLE comment already
+// round-tripped, but the COLUMN comment was dropped: pg_dump emits the canonical
+// 3-part `COMMENT ON COLUMN schema.table.col` and goopg's parser handled only the
+// bare 2-part `table.col` (parseObjectName consumes two dotted parts; the column
+// case never read the trailing `.col`), so the 3-part form raised "expected IS
+// after object name" — an error the server's COMMENT fallback silently swallowed,
+// so nothing reached pg_description. parseCommentOnTail's column case now reads
+// the trailing `.col` when present, so both forms parse and the column comment
+// surfaces (unit guard: internal/parser/comment_on_test.go TestParseCommentOnColumn).
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
@@ -399,6 +410,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	}
 	if err := runSQLSimple(t, c, "CREATE TABLE s.widget (id integer PRIMARY KEY, label text)"); err != nil {
 		t.Fatalf("create table s.widget: %v", err)
+	}
+
+	// Slice 55: COMMENT ON {TABLE,COLUMN} must survive the dump. goopg parses
+	// COMMENT ON and populates pg_description via catalog.SetComment, and
+	// pg_dump collects comments with `SELECT description, classoid, objoid,
+	// objsubid FROM pg_catalog.pg_description ORDER BY …`, then re-emits a
+	// `COMMENT ON …` statement per object. A table comment is keyed (classoid=
+	// pg_class, objoid=table OID, objsubid=0); a column comment carries
+	// objsubid=attnum. This probes whether the populated virtual view round-trips.
+	if err := runSQLSimple(t, c, "COMMENT ON TABLE public.foo IS 'a foo table'"); err != nil {
+		t.Fatalf("comment on table foo: %v", err)
+	}
+	if err := runSQLSimple(t, c, "COMMENT ON COLUMN public.foo.name IS 'the name column'"); err != nil {
+		t.Fatalf("comment on column foo.name: %v", err)
 	}
 
 	res, err := util.RunCommand(util.CommandSpec{
@@ -566,6 +591,30 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		for _, sub := range check {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped a constraint; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// **Slice 55 closed (asserted):** COMMENT ON {TABLE,COLUMN} must survive
+		// the dump. goopg already parsed COMMENT ON and populated pg_description
+		// via catalog.SetComment, and pg_dump's collectComments query
+		// (`SELECT description, classoid, objoid, objsubid FROM
+		// pg_catalog.pg_description ORDER BY …`) re-emits a `COMMENT ON …` per
+		// object (table: objsubid=0; column: objsubid=attnum). The TABLE comment
+		// already round-tripped, but the COLUMN comment was dropped: pg_dump emits
+		// the canonical 3-part `COMMENT ON COLUMN schema.table.col`, and goopg's
+		// parser only handled the bare 2-part `table.col` — parseObjectName
+		// consumes two dotted parts and the column case never read the trailing
+		// `.col`, so the 3-part form raised "expected IS after object name". That
+		// parse error was silently swallowed by the server's COMMENT fallback, so
+		// the column comment never reached pg_description. The column case now
+		// reads the trailing `.col` when present, so both forms parse. Assert both
+		// comments round-trip — the regression guard for the fix.
+		comments := []string{
+			"COMMENT ON TABLE public.foo IS 'a foo table';",
+			"COMMENT ON COLUMN public.foo.name IS 'the name column';",
+		}
+		for _, sub := range comments {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a COMMENT; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
 		return

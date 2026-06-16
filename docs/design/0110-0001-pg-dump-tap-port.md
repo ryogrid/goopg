@@ -1188,6 +1188,29 @@ fixed one logical group per loop:
     `{fillfactor=70}` cell vs `""` for a plain table) and
     `executor.TestFillfactorOutOfBoundsRejected` (the 22023 bounds check).
 
+  - **Slice 55 — COMMENT ON COLUMN round-trip (`internal/parser/parser.go`).**
+    goopg already parsed `COMMENT ON {TABLE,COLUMN,…}` and populated
+    `pg_description` via `catalog.SetComment`, and pg_dump's `collectComments`
+    query (`SELECT description, classoid, objoid, objsubid FROM
+    pg_catalog.pg_description ORDER BY …`) re-emits a `COMMENT ON …` statement per
+    row (table comment: `objsubid=0`; column comment: `objsubid=attnum`). The
+    TABLE comment already round-tripped, but the COLUMN comment was silently
+    dropped: pg_dump emits the canonical **3-part** form `COMMENT ON COLUMN
+    schema.table.col`, while goopg's parser handled only the bare **2-part**
+    `table.col`. `parseObjectName` consumes at most two dotted parts, and
+    `parseCommentOnTail`'s column case mapped that to `{table=Schema, col=Name}`
+    without reading a trailing `.col`; the 3-part input therefore raised
+    `expected IS after object name`, and that parse error was silently swallowed
+    by the server's `COMMENT` no-op fallback, so the column comment never reached
+    `pg_description`. Fix: the column case now checks for a trailing `.col` after
+    `parseObjectName` — when present, the parsed name is the (optionally
+    schema-qualified) table and the trailing identifier is the column
+    (`schema.table.col`); otherwise the 2-part `table.col` mapping stands. The
+    executor (`execCommentOn`) already resolved a schema-qualified `ObjName` via
+    `LookupTable`, so no executor change was needed. Unit guard:
+    `parser.TestParseCommentOnColumn` (2-part and 3-part forms parse to the
+    correct table/column).
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
@@ -1206,13 +1229,16 @@ asserts a table-level composite PK and FK survive — `bar_pkey PRIMARY KEY (a, 
 and `baz_x_fkey FOREIGN KEY (x, y) REFERENCES public.bar(a, b) ON DELETE
 CASCADE`; slice 54 asserts a non-empty reloptions survives — `CREATE TABLE
 public.opt (…) WITH (fillfactor='70')` — plus a `CREATE SCHEMA s` + `s.widget`
-cross-namespace round-trip. Unit guards:
+cross-namespace round-trip; slice 55 asserts a TABLE comment and a COLUMN
+comment both round-trip — `COMMENT ON TABLE public.foo IS 'a foo table'` and
+`COMMENT ON COLUMN public.foo.name IS 'the name column'`. Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
 `executor.TestAlterTableAddForeignKeyCapturesActions`,
 `executor.TestCreateTableTableLevelCompositeForeignKey`,
 `executor.TestFillfactorSurfacesInPgClassReloptions`,
 `executor.TestFillfactorOutOfBoundsRejected`,
+`parser.TestParseCommentOnColumn`,
 `config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`.
 

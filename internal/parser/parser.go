@@ -1938,15 +1938,29 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 		}
 		cs.ObjName = name
 	case p.acceptKeyword(KwColumn):
-		// COLUMN table.col — parseObjectName reads "table.col" as Schema=table, Name=col.
+		// COLUMN [schema.]table.col. parseObjectName consumes up to two dotted
+		// parts; a trailing ".col" distinguishes the schema-qualified 3-part form
+		// (schema.table.col — the canonical form pg_dump itself emits) from the
+		// bare 2-part form (table.col). Both must round-trip dump→restore.
 		cs.ObjKind = "column"
 		name, err := p.parseObjectName()
 		if err != nil {
 			return nil, true, err
 		}
-		// Schema field holds table name; Name field holds column name.
-		cs.ObjName = ObjectName{Name: name.Schema}
-		cs.SubName = name.Name
+		if p.acceptSymbol(".") {
+			// 3-part schema.table.col: parseObjectName read schema.table; the
+			// remaining identifier is the column.
+			col, err := p.parseIdent()
+			if err != nil {
+				return nil, true, err
+			}
+			cs.ObjName = ObjectName{Schema: name.Schema, Name: name.Name}
+			cs.SubName = identText(col)
+		} else {
+			// 2-part table.col: parseObjectName read it as Schema=table, Name=col.
+			cs.ObjName = ObjectName{Name: name.Schema}
+			cs.SubName = name.Name
+		}
 	case p.acceptKeyword(KwConstraint):
 		cs.ObjKind = "constraint"
 		// constraint name
