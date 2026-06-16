@@ -618,7 +618,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"rcl regclass, rcls regclass[], rt regtype, rts regtype[], "+
 		"rcf regconfig, rcfs regconfig[], rdi regdictionary, rdis regdictionary[], "+
 		"rn regnamespace, rns regnamespace[], rr regrole, rrs regrole[], "+
-		"rco regcollation, rcos regcollation[])"); err != nil {
+		"rco regcollation, rcos regcollation[], "+
+		"iv int2vector, ivs int2vector[], ov oidvector, ovs oidvector[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -1101,6 +1102,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"rrs regrole[]",
 			"rco regcollation",
 			"rcos regcollation[]",
+			// Slice 81 adds the legacy vector types int2vector (22)/_int2vector
+			// (1006) and oidvector (30)/_oidvector (1013). Both were seeded in
+			// pg_type but mis-wired: format_type rendered OID 22/30 as the genuine
+			// _int2/_oid arrays ("smallint[]"/"oid[]") instead of their own bare
+			// names, and the codec had no name→OID entry so a declared column fell
+			// back to text (25). Now each round-trips as "int2vector"/"oidvector".
+			"iv int2vector",
+			"ivs int2vector[]",
+			"ov oidvector",
+			"ovs oidvector[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

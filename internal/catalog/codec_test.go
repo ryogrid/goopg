@@ -207,6 +207,10 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 		{"regnamespace", OIDRegnamespace},
 		{"regrole", OIDRegrole},
 		{"regcollation", OIDRegcollation},
+		// DU-002 slice 81: int2vector/oidvector round-trip their canonical names
+		// (NOT smallint[]/oid[], which are the genuine _int2/_oid array types).
+		{"int2vector", OIDInt2vector},
+		{"oidvector", OIDOidvector},
 	}
 	for _, p := range pairs {
 		gotOID := TypeNameToOID(p.name)

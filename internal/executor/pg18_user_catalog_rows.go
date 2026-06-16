@@ -222,6 +222,11 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		catalog.OIDRegrole,       // 4096
 		catalog.OIDRegcollation:  // 4191
 		return userTypeAttrs{TypLen: 4, TypByVal: true, TypAlign: 'i', TypStorage: 'p'}
+	// DU-002 slice 81: int2vector/oidvector -- pg_type.dat: typlen -1, typbyval f,
+	// typalign 'i', typstorage 'p' (plain varlena, no compression/TOAST).
+	case catalog.OIDInt2vector, // 22
+		catalog.OIDOidvector: // 30
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
 	case catalog.OIDArrayBool: // 1000 _bool -- pg_type.dat: typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBytea: // 1001 _bytea -- element bytea typalign 'i', typstorage 'x'
@@ -323,6 +328,11 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		catalog.OIDArrayRegnamespace,  // 4090 _regnamespace
 		catalog.OIDArrayRegrole,       // 4097 _regrole
 		catalog.OIDArrayRegcollation:  // 4192 _regcollation
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	// DU-002 slice 81: _int2vector (1006) / _oidvector (1013) -- element typalign
+	// 'i'; the array is varlena typstorage 'x'.
+	case catalog.OIDArrayInt2vector, // 1006 _int2vector
+		catalog.OIDArrayOidvector: // 1013 _oidvector
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}

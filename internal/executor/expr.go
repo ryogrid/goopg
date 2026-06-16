@@ -83,6 +83,8 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "text"
 	case 26:
 		return "oid"
+	case 22:
+		return "int2vector"
 	case 30:
 		return "oidvector"
 	case 700:
@@ -10499,7 +10501,10 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 21:
 		return "smallint"
 	case 22:
-		return "smallint[]"
+		// int2vector: a space-separated list of int2 (pg_index.indkey). NOT
+		// smallint[] — that is the genuine _int2 array type (OID 1005). DU-002
+		// slice 81.
+		return "int2vector"
 	case 23:
 		return "integer"
 	case 25:
@@ -10559,7 +10564,15 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 4192:
 		return "regcollation[]"
 	case 30:
-		return "oid[]"
+		// oidvector: a space-separated list of oid (pg_proc.proargtypes). NOT
+		// oid[] — that is the genuine _oid array type (OID 1028). DU-002 slice 81.
+		return "oidvector"
+	case 1006:
+		// _int2vector: int2vector has no typmod, so the array is the bare name + [].
+		return "int2vector[]"
+	case 1013:
+		// _oidvector: oidvector has no typmod, so the array is the bare name + [].
+		return "oidvector[]"
 	case 114:
 		return "json"
 	case 142:

@@ -148,6 +148,15 @@ const (
 	OIDRegnamespace  uint32 = 4089
 	OIDRegrole       uint32 = 4096
 	OIDRegcollation  uint32 = 4191
+	// DU-002 slice 81: the legacy OID/int2 vector types. int2vector is a
+	// space-separated list of int2 (used internally for pg_index.indkey);
+	// oidvector a space-separated list of oid (pg_proc.proargtypes). Both are
+	// declarable column types — format_type renders the bare names "int2vector"/
+	// "oidvector" (NOT "smallint[]"/"oid[]"; those are the genuine _int2/_oid
+	// array types 1005/1028). Seeded in pg_type (initdb/pg_type_seed_data.go) so a
+	// PG standby can resolve the OIDs; neither carries a typmod.
+	OIDInt2vector uint32 = 22
+	OIDOidvector  uint32 = 30
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -241,6 +250,11 @@ const (
 	OIDArrayRegnamespace  uint32 = 4090
 	OIDArrayRegrole       uint32 = 4097
 	OIDArrayRegcollation  uint32 = 4192
+	// DU-002 slice 81: the int2vector/oidvector array types (_int2vector 1006 /
+	// _oidvector 1013). Neither carries a typmod, so format_type renders the bare
+	// element name with a [] suffix ("int2vector[]"/"oidvector[]").
+	OIDArrayInt2vector uint32 = 1006
+	OIDArrayOidvector  uint32 = 1013
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -359,6 +373,10 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayRegrole
 	case OIDRegcollation:
 		return OIDArrayRegcollation
+	case OIDInt2vector:
+		return OIDArrayInt2vector
+	case OIDOidvector:
+		return OIDArrayOidvector
 	}
 	return 0
 }
@@ -479,6 +497,10 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDRegrole, true
 	case OIDArrayRegcollation:
 		return OIDRegcollation, true
+	case OIDArrayInt2vector:
+		return OIDInt2vector, true
+	case OIDArrayOidvector:
+		return OIDOidvector, true
 	}
 	return 0, false
 }
@@ -1365,6 +1387,10 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDRegrole
 	case "regcollation":
 		return OIDRegcollation
+	case "int2vector":
+		return OIDInt2vector
+	case "oidvector":
+		return OIDOidvector
 	default:
 		return OIDText // safe fallback
 	}
@@ -1487,6 +1513,10 @@ func OIDToTypeName(oid uint32) string {
 		return "regrole"
 	case OIDRegcollation:
 		return "regcollation"
+	case OIDInt2vector:
+		return "int2vector"
+	case OIDOidvector:
+		return "oidvector"
 	default:
 		return "text"
 	}

@@ -480,6 +480,12 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		{"regnamespace", nil, 4090, "regnamespace[]"},
 		{"regrole", nil, 4097, "regrole[]"},
 		{"regcollation", nil, 4192, "regcollation[]"},
+		// Slice 81: int2vector/oidvector (_int2vector 1006, _oidvector 1013). Neither
+		// carries a typmod, so each array renders as the bare element name + [].
+		// The element name is int2vector/oidvector (NOT smallint/oid) — these are
+		// distinct vector types, not the genuine _int2/_oid arrays.
+		{"int2vector", nil, 1006, "int2vector[]"},
+		{"oidvector", nil, 1013, "oidvector[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}
@@ -556,6 +562,10 @@ func TestUserPGAttributeTypmod(t *testing.T) {
 		{"regnamespace", nil, -1, "regnamespace"},
 		{"regrole", nil, -1, "regrole"},
 		{"regcollation", nil, -1, "regcollation"},
+		// Slice 81: int2vector/oidvector carry no typmod, so atttypmod stays -1 and
+		// each scalar renders as its bare vector name (NOT smallint[]/oid[]).
+		{"int2vector", nil, -1, "int2vector"},
+		{"oidvector", nil, -1, "oidvector"},
 		{"int4", []int64{}, -1, "integer"}, // typmod ignored for plain types
 	}
 	for _, tc := range cases {

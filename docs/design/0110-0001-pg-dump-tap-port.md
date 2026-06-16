@@ -1741,6 +1741,30 @@ fixed one logical group per loop:
     `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`, and
     new pairs in `catalog.TestTypeNameToOIDRoundTrip` (which also guards against a
     name collision routing `regproc` to text).
+  - **Slice 81 — the legacy vector types `int2vector` / `oidvector` (+ their array
+    types) (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`, `internal/executor/expr.go`).**
+    `int2vector` (22) is a space-separated list of `int2` (used internally for
+    `pg_index.indkey`); `oidvector` (30) a space-separated list of `oid`
+    (`pg_proc.proargtypes`). Both are declarable column types and were seeded in
+    `pg_type_seed_data.go`, but **mis-wired**: `formatTypeOID` rendered OID 22/30 as
+    `smallint[]` / `oid[]` — the renderings that belong to the *genuine* `_int2`
+    (1005) and `_oid` (1028) array types — instead of their own bare names, and the
+    codec had no `name→OID` entry, so a declared `oidvector` column fell back to
+    `text` (OID 25). Real PG's `format_type(30,-1)` is `oidvector`, not `oid[]` (the
+    vector types have `typcategory='A'` but are distinct from the array types). The
+    scalars are varlena `{typlen=-1, byval=f, align='i', storage='p'}` and the arrays
+    `_int2vector` (1006) / `_oidvector` (1013) are `{…, storage='x'}`; neither carries
+    a typmod, so this is the plain 3-site pattern plus the two `formatTypeOID`
+    corrections. `TypeNameToOID` / `OIDToTypeName` / `ArrayOIDForBase` /
+    `BaseOIDForArray` gained the scalar+array cases; `userTypeAttrsForOID` gained
+    grouped scalar+array cases; `oidToBuiltinTypeName` gained the missing
+    `int2vector` (22) case (`oidvector` was already correct), and `formatTypeOID`'s
+    22/30 cases were **fixed** to the bare vector names with new 1006/1013 array
+    cases. Guarded by the `arr` fixture's `iv int2vector` … `ovs oidvector[]`
+    columns in `TestPort_PgDumpConnectionSetup`, new rows in
+    `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`, and new
+    pairs in `catalog.TestTypeNameToOIDRoundTrip`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1811,7 +1835,9 @@ OID-reference (`reg*`) family `rp regproc`, `rps regproc[]`, `rpd regprocedure`,
 `roos regoperator[]`, `rcl regclass`, `rcls regclass[]`, `rt regtype`, `rts
 regtype[]`, `rcf regconfig`, `rcfs regconfig[]`, `rdi regdictionary`, `rdis
 regdictionary[]`, `rn regnamespace`, `rns regnamespace[]`, `rr regrole`, `rrs
-regrole[]`, `rco regcollation`, and `rcos regcollation[]`.
+regrole[]`, `rco regcollation`, and `rcos regcollation[]`; slice 81 adds the
+legacy vector types `iv int2vector`, `ivs int2vector[]`, `ov oidvector`, and `ovs
+oidvector[]` (and fixes the mis-rendering of OID 22/30 as `smallint[]`/`oid[]`).
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
