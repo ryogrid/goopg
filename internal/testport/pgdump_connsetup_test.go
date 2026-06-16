@@ -624,7 +624,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"tt timetz, tts timetz[], "+
 		"jp jsonpath, jps jsonpath[], "+
 		"rfc refcursor, rfcs refcursor[], "+
-		"acl aclitem, acls aclitem[])"); err != nil {
+		"acl aclitem, acls aclitem[], "+
+		"ch \"char\", chs \"char\"[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -1154,6 +1155,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// "aclitem"/"aclitem[]".
 			"acl aclitem",
 			"acls aclitem[]",
+			// Slice 87: the single-byte "char" type (18) + its array _char (1002).
+			// It shares the spelling "char" with bpchar; the quoted `"char"` form
+			// declares the real catalog type (no length arg), distinct from the
+			// fixture's `code char(4)` (bpchar). atttypid wrongly folded to bpchar
+			// (TypeNameToOID is name-only), so it round-tripped as character. The
+			// args-aware remap now resolves atttypid=18/1002 so format_type renders
+			// the quoted `"char"` / `"char"[]`.
+			"ch \"char\"",
+			"chs \"char\"[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

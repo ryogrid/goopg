@@ -269,6 +269,8 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x', TypCollation: defaultCollationOID}
 	case catalog.OIDArrayBpChar: // 1014 _bpchar -- element bpchar collation defaults
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x', TypCollation: defaultCollationOID}
+	case catalog.OIDArrayChar: // 1002 _char -- element "char" typcollation 0 (no collation)
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayOID: // 1028 _oid -- element oid typalign 'i', no collation
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayJSON: // 199 _json -- element json typalign 'i', typstorage 'x'
@@ -482,6 +484,15 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 // user-defined column (attstattarget appended last as NULL).
 func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 	typOID := catalog.TypeNameToOID(col.Type.Name)
+	// Disambiguate the single-byte "char" type (OID 18) from bpchar (1042):
+	// both arrive as catalog type name "char", but only the bpchar-equivalent
+	// unquoted `char` carries a length arg ([1]). A quoted `"char"` (the real
+	// catalog type) has no args, so TypeNameToOID's name-only lookup wrongly
+	// folds it to bpchar. Remap so pg_attribute reports atttypid=18 and the
+	// column round-trips through pg_dump as "char". DU-002 slice 87.
+	if typOID == catalog.OIDBpChar && col.Type.Name == "char" && len(col.Type.Args) == 0 {
+		typOID = catalog.OIDChar
+	}
 	// atttypmod carries the ELEMENT typmod even for array columns; compute it
 	// from the base OID before remapping typOID to the array (_typename) OID.
 	typmod := pgAttTypmod(typOID, col.Type.Args)

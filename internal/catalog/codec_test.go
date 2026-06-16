@@ -297,6 +297,29 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 	if OIDAclitem != 1033 || OIDArrayAclitem != 1034 {
 		t.Errorf("aclitem OIDs drifted: OIDAclitem=%d (want 1033), OIDArrayAclitem=%d (want 1034)", OIDAclitem, OIDArrayAclitem)
 	}
+
+	// DU-002 slice 87: the single-byte "char" type (18). Unlike the other
+	// slices its name→OID lookup is intentionally NOT inverse: TypeNameToOID
+	// folds the spelling "char" to bpchar because the catalog "char" vs
+	// bpchar(1) distinction is args-based and cannot be made from a name alone
+	// (buildUserPGAttributeRow does the args-aware remap). But OIDToTypeName(18)
+	// must reconstruct "char", and the char ↔ _char array mapping must hold so
+	// a `"char"[]` column resolves to _char (1002) and reconstructs from it.
+	if got := OIDToTypeName(OIDChar); got != "char" {
+		t.Errorf("OIDToTypeName(OIDChar) = %q, want %q", got, "char")
+	}
+	if got := TypeNameToOID("char"); got != OIDBpChar {
+		t.Errorf("TypeNameToOID(%q) = %d, want %d (bpchar — char/bpchar disambiguation is args-based)", "char", got, OIDBpChar)
+	}
+	if got := ArrayOIDForBase(OIDChar); got != OIDArrayChar {
+		t.Errorf("ArrayOIDForBase(OIDChar) = %d, want %d (_char)", got, OIDArrayChar)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayChar); !ok || got != OIDChar {
+		t.Errorf("BaseOIDForArray(OIDArrayChar) = (%d,%v), want (%d,true)", got, ok, OIDChar)
+	}
+	if OIDChar != 18 || OIDArrayChar != 1002 {
+		t.Errorf("char OIDs drifted: OIDChar=%d (want 18), OIDArrayChar=%d (want 1002)", OIDChar, OIDArrayChar)
+	}
 }
 
 // TestTypeNameToOIDAlternativeNames verifies type name aliases resolve correctly.

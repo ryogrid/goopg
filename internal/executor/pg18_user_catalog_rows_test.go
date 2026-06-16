@@ -505,6 +505,11 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// array renders as the bare element name + []. aclitem is the 16-byte
 		// access-control-list item type used internally for catalog *acl columns.
 		{"aclitem", nil, 1034, "aclitem[]"},
+		// Slice 87: the single-byte "char" type (_char 1002). A `"char"[]` column
+		// arrives as name "char" with no args (the quoted form); the args-aware
+		// remap resolves the element to OID 18 (not bpchar), so the array is
+		// _char (1002), rendered `"char"[]`. Distinct from bpchar's _bpchar (1014).
+		{"char", nil, 1002, "\"char\"[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}
@@ -526,6 +531,28 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 	row := buildUserPGAttributeRow(tbl, scalar)
 	if row[attndimsIdx].Int != 0 || row[atttypidIdx].Int != int64(catalog.OIDText) {
 		t.Errorf("scalar text: atttypid=%d attndims=%d want %d/0", row[atttypidIdx].Int, row[attndimsIdx].Int, catalog.OIDText)
+	}
+
+	// Slice 87: the scalar "char"/bpchar disambiguation. A quoted `"char"`
+	// column (name "char", no args) must resolve to atttypid=18 and render
+	// `"char"`; an unquoted `char` (the parser stamps args [1], i.e. bpchar(1))
+	// must stay bpchar (1042) and render `character(1)`. Both share the catalog
+	// type name "char", so only the args distinguish them.
+	realChar := catalog.Column{Name: "c", Type: catalog.Type{Name: "char"}, Ordinal: 0}
+	row = buildUserPGAttributeRow(tbl, realChar)
+	if got := row[atttypidIdx].Int; got != int64(catalog.OIDChar) {
+		t.Errorf("scalar \"char\": atttypid=%d want %d", got, catalog.OIDChar)
+	}
+	if got := formatTypeOID(row[atttypidIdx].Int, row[atttypmodIdx].Int); got != "\"char\"" {
+		t.Errorf("scalar \"char\": format_type=%q want %q", got, "\"char\"")
+	}
+	bpchar1 := catalog.Column{Name: "c", Type: catalog.Type{Name: "char", Args: []int64{1}}, Ordinal: 0}
+	row = buildUserPGAttributeRow(tbl, bpchar1)
+	if got := row[atttypidIdx].Int; got != int64(catalog.OIDBpChar) {
+		t.Errorf("scalar char(1): atttypid=%d want %d (bpchar)", got, catalog.OIDBpChar)
+	}
+	if got := formatTypeOID(row[atttypidIdx].Int, row[atttypmodIdx].Int); got != "character(1)" {
+		t.Errorf("scalar char(1): format_type=%q want %q", got, "character(1)")
 	}
 }
 

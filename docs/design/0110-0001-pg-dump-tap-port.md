@@ -1882,6 +1882,40 @@ fixed one logical group per loop:
     `executor.TestUserPGAttributeArrayColumn`, and a new `aclitem`/`_aclitem`
     round-trip block in `catalog.TestTypeNameToOIDRoundTrip`.
 
+  - **Slice 87 — the single-byte `"char"` type (+ its array `_char`)
+    (`internal/catalog/codec.go`, `internal/executor/expr.go`,
+    `internal/executor/pg18_user_catalog_rows.go`).** `"char"` (OID 18) is the
+    1-byte internal character type — distinct from `bpchar`/`character` (1042) —
+    used by catalog columns such as `pg_class.relkind` and declarable as a user
+    column via the quoted spelling `"char"`. Unlike every prior slice, its
+    name→OID lookup is **intentionally not invertible**: both `"char"` and
+    `bpchar(1)` arrive at the catalog as type name `"char"`, so a name-only
+    `TypeNameToOID` cannot disambiguate them. The parser already encodes the
+    difference in the args — the unquoted `char` form is folded to `bpchar(1)`
+    (length arg `[1]`), while a quoted `"char"` carries no arg
+    (`internal/parser/ddl.go:2635`). The fix therefore lives at the catalog-row
+    layer: `buildUserPGAttributeRow` remaps `bpchar`→`OIDChar` when the column's
+    type name is `"char"` **and** it has no length arg, so `pg_attribute.atttypid`
+    reports 18 (and `_char` 1002 for the array) and `format_type` renders the
+    quoted `"char"` / `"char"[]`. `TypeNameToOID("char")` is left returning
+    `bpchar` (the general, args-unaware callers — e.g. the value codec — keep
+    treating a length-1 `"char"` as a 1-byte string, so no encode/decode path
+    changes). This slice adds `OIDChar`/`OIDArrayChar` consts; the
+    `OIDChar`↔`OIDArrayChar` cases in `ArrayOIDForBase` / `BaseOIDForArray`; the
+    `OIDChar`→`"char"` case in `OIDToTypeName` (heap-loader reconstruction is
+    self-consistent: a reloaded `"char"` column has no arg and re-resolves to 18);
+    the array `case 1002` in `formatTypeOID` (the scalar 18 and array 1002 cases
+    in `oidToBuiltinTypeName` were already present); and `userTypeAttrsForOID`'s
+    `_char` case (`{-1, byval=f, align='i', storage='x'}`; the scalar 18 case was
+    already present). Both 18/1002 were already seeded in `pg_type_seed_data.go`
+    (char: typlen 1, byval t, align `'c'`, storage `'p'`, no collation). Guarded by
+    the `arr` fixture's `ch "char"` / `chs "char"[]` columns in
+    `TestPort_PgDumpConnectionSetup`, a `{"char", nil, 1002, "\"char\"[]"}` array
+    row plus a scalar `"char"`-vs-`char(1)` disambiguation assertion in
+    `executor.TestUserPGAttributeArrayColumn`, and a `char`/`_char` block (noting
+    the deliberate `TypeNameToOID("char")==bpchar` asymmetry) in
+    `catalog.TestTypeNameToOIDRoundTrip`.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits

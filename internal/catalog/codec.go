@@ -69,12 +69,19 @@ const (
 	OIDTimestamp   uint32 = 1114
 	OIDTimestampTZ uint32 = 1184
 	OIDBpChar      uint32 = 1042
-	OIDVarChar     uint32 = 1043
-	OIDNumeric     uint32 = 1700
-	OIDUUID        uint32 = 2950
-	OIDJSON        uint32 = 114
-	OIDJsonb       uint32 = 3802
-	OIDJsonpath    uint32 = 4072
+	// OIDChar is the single-byte internal "char" type (typname "char", OID 18),
+	// distinct from bpchar (1042). It shares the spelling "char" in declared
+	// column types; the parser only forces a length arg ([1], i.e. bpchar(1))
+	// on the unquoted `char` form — a quoted `"char"` arrives as name "char"
+	// with no args, which buildUserPGAttributeRow remaps to this OID so the
+	// column round-trips through pg_dump as "char". DU-002 slice 87.
+	OIDChar     uint32 = 18
+	OIDVarChar  uint32 = 1043
+	OIDNumeric  uint32 = 1700
+	OIDUUID     uint32 = 2950
+	OIDJSON     uint32 = 114
+	OIDJsonb    uint32 = 3802
+	OIDJsonpath uint32 = 4072
 	// DU-002 slice 85: refcursor is a varlena cursor-name reference (typstorage
 	// 'x', no typmod), so format_type renders the bare `refcursor`.
 	OIDRefcursor uint32 = 1790
@@ -206,7 +213,10 @@ const (
 	// `character[]`, and `oid[]`.
 	OIDArrayVarChar uint32 = 1015
 	OIDArrayBpChar  uint32 = 1014
-	OIDArrayOID     uint32 = 1028
+	// OIDArrayChar is _char (1002), the array peer of the single-byte "char"
+	// type (18). format_type renders it `"char"[]`. DU-002 slice 87.
+	OIDArrayChar uint32 = 1002
+	OIDArrayOID  uint32 = 1028
 	// DU-002 slice 69: the JSON family. json/jsonb are varlena with no typmod,
 	// so format_type renders these arrays as the bare `json[]` / `jsonb[]`.
 	OIDArrayJSON  uint32 = 199
@@ -420,6 +430,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayOidvector
 	case OIDAclitem:
 		return OIDArrayAclitem
+	case OIDChar:
+		return OIDArrayChar
 	}
 	return 0
 }
@@ -554,6 +566,8 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDOidvector, true
 	case OIDArrayAclitem:
 		return OIDAclitem, true
+	case OIDArrayChar:
+		return OIDChar, true
 	}
 	return 0, false
 }
@@ -1478,6 +1492,12 @@ func OIDToTypeName(oid uint32) string {
 		return "varchar"
 	case OIDBpChar:
 		return "bpchar"
+	case OIDChar:
+		// Single-byte "char" (18): the heap loader reconstructs the column as
+		// catalog.Type{Name:"char"} with no args, which buildUserPGAttributeRow
+		// re-resolves back to OID 18 (not bpchar) on the next catalog read.
+		// DU-002 slice 87.
+		return "char"
 	case OIDBool:
 		return "bool"
 	case OIDBytea:

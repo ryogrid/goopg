@@ -10680,6 +10680,9 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 1001:
 		// _bytea: bytea has no typmod, so the array is the bare name. Slice 67.
 		return "bytea[]"
+	case 1002:
+		// _char: array of the single-byte "char" type (18). Slice 87.
+		return "\"char\"[]"
 	case 1005:
 		return "smallint[]"
 	case 1007:
