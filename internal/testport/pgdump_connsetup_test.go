@@ -231,13 +231,15 @@ package testport
 // derives, so the hash join matched nothing (empty column list above).
 // coerceUnnestElem now casts each element to its declared output type, so the
 // join key lines up and pg_attribute rows flow.
-// **Next blocker (slice 46, confirmed empirically by this dump):** pg_dump now
-// fails with `invalid column numbering in table "foo"` (exit 1). The join
-// condition resolves a.attrelid correctly but the PROJECTION of right-side
-// columns is not shifted by the 1-column unnest (left) prefix — a.attname
-// returns attrelid (16403) and a.attnum returns attlen (4). A direct
-// pg_attribute scan returns the correct 1=id/2=name, so the bug is isolated to
-// right-side column-ref resolution in a join whose left input is FromUnnest.
+// Slice 46 closed the `invalid column numbering in table "foo"` blocker: the
+// join condition resolved a.attrelid correctly but the PROJECTION of right-side
+// columns was not shifted by the 1-column unnest (left) prefix — a.attname
+// returned attrelid (16403) and a.attnum returned attlen (4). Root cause was in
+// planner buildBindingsPosMap (internal/planner/bushy.go): leaf
+// SRF/table-function nodes (FromUnnest, GenerateSeries, ScalarFuncScan, …) did
+// not advance `off`, so remapTopProjection shifted right-side projection columns
+// DOWN by the SRF width. They now advance `off` by their output width, mirroring
+// the *Values case. pg_dump reaches exit 0 AND emits the real column list.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
@@ -316,18 +318,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				t.Errorf("pg_dump output missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
-		// **Next blocker (slice 45, confirmed empirically by this dump):** the
-		// column list is EMPTY — pg_dump emits `CREATE TABLE public.foo (\n)`
-		// with no `id integer, name text`, plus a malformed `WITH (""='')`
-		// reloptions clause. getTableAttrs' per-table pg_attribute query
-		// (attname/atttypid/attnotnull/…) is returning no rows for user tables,
-		// and the reloptions ARRAY subquery yields a single empty element. The
-		// next DU-002 slice must populate pg_attribute for user-table columns in
-		// the dump path and suppress the empty reloption. Not asserted here yet
-		// so this stays the forward marker, not a hard failure.
-		if !strings.Contains(res.Stdout, "id integer") {
-			t.Logf("DU-002 slice 45 target: pg_dump emits an empty column list "+
-				"(getTableAttrs / pg_attribute returns no columns); full stdout=%q", res.Stdout)
+		// **Slice 46 closed (asserted):** getTableAttrs reads columns via
+		// `FROM unnest('{oid}'::oid[]) src JOIN pg_attribute a ON
+		// src.tbloid = a.attrelid`. Slice 45 lined up the join key; slice 46
+		// fixed right-side projection offsetting in buildBindingsPosMap (leaf
+		// SRF/table-function nodes now advance `off`, mirroring *Values), so the
+		// projected attname/atttypid columns resolve to the correct combined
+		// indices instead of returning attrelid/attlen. The dump now emits the
+		// real column list, so assert both user columns appear in the
+		// CREATE TABLE body — this is the regression guard for the
+		// SRF-join-projection fix end-to-end.
+		cols := []string{"id integer", "name text"}
+		for _, sub := range cols {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump column list missing %q (SRF-join right-side projection regressed)\n  full stdout=%q", sub, res.Stdout)
+			}
 		}
 		return
 	}

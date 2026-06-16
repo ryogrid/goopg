@@ -1727,6 +1727,23 @@ func buildBindingsPosMap(node Node, bindings []rangeBinding) func(int) int {
 			// Values node with non-empty schema (e.g. FROM (VALUES (r1), (r2)) AS t).
 			// Advance off by the output width so sibling scans stay aligned.
 			off += len(x.Output())
+		case *FromUnnest, *GenerateSeries, *GenerateSubscripts,
+			*UserSrfScan, *ScalarFuncScan, *PgPartitionTree, *PgOptionsToTable,
+			*PgInputErrorInfo, *PgGetPublicationTables,
+			*PgAvailableWalSummaries, *PgGetSequenceData, *VerifyHeapam:
+			// FROM-clause set-returning / table functions are leaf
+			// nodes that contribute output columns but carry no
+			// scanKey to remap. Advance `off` by their output width
+			// (mirroring the *Values case) so any scan to their RIGHT
+			// gets the correct scanMap offset. Omitting these made
+			// `off` too low for downstream scans, so remapTopProjection
+			// shifted right-side projection columns down by the SRF's
+			// width — e.g. pg_dump's getTableAttrs
+			// `unnest('{oid}'::oid[]) src JOIN pg_attribute a` returned
+			// a scrambled row (DU-002 slice 46, M0110-0001). Their own
+			// columns need no remap: the posMap returns oldIdx unchanged
+			// for bindings absent from scanMap.
+			off += len(x.Output())
 		}
 	}
 	collect(node)

@@ -971,24 +971,36 @@ fixed one logical group per loop:
     multi-arg unnest paths. With this the join key lines up and `pg_attribute`
     rows flow. Guards: `executor.TestCoerceUnnestElem_*` (join-key parity,
     text-unchanged, NULL pass-through, bad-value fallback).
-  - **Slice 46 (NEXT) — unnest-join right-side projection offset.** With the key
-    fixed, the join now matches but pg_dump fails with `invalid column numbering
-    in table "foo"`: it requires each table's rows ordered by `attnum`, sequential
-    from 1. Empirically the join *condition* resolves `a.attrelid` correctly
-    (combined index 1) but the *projection* of right-side columns is **not shifted
-    by the 1-column unnest (left) prefix** — `a.attname` resolves to combined
-    index 1 (returns `attrelid`=16403) and `a.attnum` to combined index 4
-    (returns `attlen`=4 for `integer`). A direct `pg_attribute` scan returns the
-    correct `1=id, 2=name`, so the bug is isolated to right-side column-ref
-    resolution in a join whose left input is `FromUnnest` (sibling-path
-    disagreement: join-condition resolution shifts, projection resolution does
-    not). This is the next DU-002 slice.
+  - **Slice 46 — unnest-join right-side projection offset
+    (`internal/planner/bushy.go`).** With the join key fixed, pg_dump failed with
+    `invalid column numbering in table "foo"`: the join *condition* resolved
+    `a.attrelid` correctly (combined index 1) but the *projection* of right-side
+    columns was **not shifted by the 1-column unnest (left) prefix** — `a.attname`
+    resolved to combined index 1 (returned `attrelid`=16403) and `a.attnum` to
+    combined index 4 (returned `attlen`=4 for `integer`). Root cause:
+    `buildBindingsPosMap`'s `collect` walker advanced its running offset `off`
+    for `*Values` (and scans/Project) but **not** for leaf FROM-clause
+    set-returning / table-function nodes (`FromUnnest`, `GenerateSeries`,
+    `GenerateSubscripts`, `UserSrfScan`, `ScalarFuncScan`, and the `Pg*` table
+    functions). With `off` left too low, `remapTopProjection` shifted the
+    right-side scan's projection columns DOWN by the SRF's output width. Fix:
+    those node types now advance `off` by `len(x.Output())`, mirroring the
+    `*Values` case; their own columns need no remap (the posMap returns the old
+    index unchanged for bindings absent from `scanMap`). This is a sibling-path
+    fix — join-condition resolution already offset correctly via the binding
+    table; projection resolution went through `buildBindingsPosMap` and did not.
+    pg_dump now reaches exit 0 **and** emits the real column list
+    (`id integer, name text`). Guards:
+    `planner.TestSRFJoinRightProjectionOffset` (VALUES-left reference vs
+    unnest-left / generate_series-left projection-index parity) and the promoted
+    `TestPort_PgDumpConnectionSetup` column-list assertion.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
-0, so the test also asserts the table's archive entry is emitted and logs the
-remaining column-content gap (slice 45). Unit guards: `config.TestPgDumpConnectionSetupGUCs`,
+0, and as of slice 46 the test also asserts the table's archive entry **and the
+full column list** (`id integer`, `name text`) are emitted. Unit guards:
+`planner.TestSRFJoinRightProjectionOffset`, `config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`.
 
 ## Deferred (002–010) — catalog surface estimate
