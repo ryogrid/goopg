@@ -443,6 +443,10 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// array renders as the bare element name with the [] suffix.
 		{"tsvector", nil, 3643, "tsvector[]"},
 		{"tsquery", nil, 3645, "tsquery[]"},
+		// Slice 74: xml and money. Neither carries a typmod, so each array
+		// renders as the bare element name with the [] suffix.
+		{"xml", nil, 143, "xml[]"},
+		{"money", nil, 791, "money[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

@@ -605,7 +605,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"pth path, pths path[], bx box, bxs box[], "+
 		"poly polygon, polys polygon[], ln line, lns line[], "+
 		"circ circle, circs circle[], "+
-		"tsv tsvector, tsvs tsvector[], tsq tsquery, tsqs tsquery[])"); err != nil {
+		"tsv tsvector, tsvs tsvector[], tsq tsquery, tsqs tsquery[], "+
+		"xm xml, xms xml[], mny money, mnys money[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -956,6 +957,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// Slice 73 adds the full-text-search family: tsvector (`tsv`, 3614) +
 		// tsvector[] (`tsvs`, _tsvector 3643), tsquery (`tsq`, 3615) + tsquery[]
 		// (`tsqs`, _tsquery 3645).
+		// Slice 74 adds xml (`xm`, 142) + xml[] (`xms`, _xml 143) and money
+		// (`mny`, 790) + money[] (`mnys`, _money 791). Neither carries a typmod.
 		// All are seeded in pg_type but were never wired into TypeNameToOID/
 		// OIDToTypeName, so each scalar fell back to text (OID 25) and the array
 		// paths had no OIDs. None carry a typmod, so each renders as the plain
@@ -1014,6 +1017,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"tsvs tsvector[]",
 			"tsq tsquery",
 			"tsqs tsquery[]",
+			"xm xml",
+			"xms xml[]",
+			"mny money",
+			"mnys money[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

@@ -1599,6 +1599,27 @@ fixed one logical group per loop:
     Guarded by the `arr` fixture's `tsv tsvector`, `tsvs tsvector[]`, `tsq
     tsquery`, `tsqs tsquery[]` columns in `TestPort_PgDumpConnectionSetup` and the
     two new rows in `executor.TestUserPGAttributeArrayColumn`.
+  - **Slice 74 — `xml`/`money` (+ their array types) (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** Both scalar types (`xml` OID 142, `money` 790)
+    and their array types (`_xml` 143, `_money` 791) are already seeded in
+    `pg_type_seed_data.go`, but neither had been wired into `TypeNameToOID`/
+    `OIDToTypeName`, so each scalar column fell back to `text` (OID 25) and dumped
+    as `text`; the array paths had no OIDs. (`oidToBuiltinTypeName` already had the
+    scalar `xml` case from an earlier path, but `money` and both arrays were
+    missing, and nothing routed a column to those OIDs.) Same proven 3-site
+    pattern: scalar/array OID consts + their `TypeNameToOID`/`OIDToTypeName` and
+    `ArrayOIDForBase`/`BaseOIDForArray` cases, rows in `userTypeAttrsForOID`
+    (varlena `xml` `typlen=-1`, `typbyval=f`, `typalign='i'`, `typstorage='x'`;
+    fixed-width `money` `typlen=8`, `typbyval=t`, `typalign='d'`, `typstorage='p'`;
+    arrays `typlen=-1`, `typbyval=f`, `_xml` `typalign='i'`/`_money`
+    `typalign='d'`, `typstorage='x'` — matching `pg_type.dat` and the
+    `pg_type_seed_data.go` rows), and the new scalar+array cases in `formatTypeOID`
+    plus `oidToBuiltinTypeName`. Neither carries a typmod, so every column renders
+    as the plain `<type>` / `<type>[]`. Guarded by the `arr` fixture's `xm xml`,
+    `xms xml[]`, `mny money`, `mnys money[]` columns in
+    `TestPort_PgDumpConnectionSetup` and the two new rows in
+    `executor.TestUserPGAttributeArrayColumn`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1657,7 +1678,8 @@ adds the geometric family `pt point`, `pts point[]`, `seg lseg`, `segs lseg[]`,
 `pth path`, `pths path[]`, `bx box`, `bxs box[]`, `poly polygon`, `polys
 polygon[]`, `ln line`, `lns line[]`, `circ circle`, and `circs circle[]`;
 slice 73 adds the full-text-search family `tsv tsvector`, `tsvs tsvector[]`,
-`tsq tsquery`, and `tsqs tsquery[]`.
+`tsq tsquery`, and `tsqs tsquery[]`; slice 74 adds `xm xml`, `xms xml[]`, `mny
+money`, and `mnys money[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

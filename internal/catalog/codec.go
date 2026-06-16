@@ -96,6 +96,11 @@ const (
 	// Neither carries a typmod, so format_type renders the bare type name.
 	OIDTsvector uint32 = 3614
 	OIDTsquery  uint32 = 3615
+	// DU-002 slice 74: xml and money. Both are seeded in pg_type (see
+	// initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs. Neither
+	// carries a typmod, so format_type renders the bare type name.
+	OIDXML   uint32 = 142
+	OIDMoney uint32 = 790
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -152,6 +157,10 @@ const (
 	// typmod, so format_type renders the bare element name with a [] suffix.
 	OIDArrayTsvector uint32 = 3643
 	OIDArrayTsquery  uint32 = 3645
+	// DU-002 slice 74: the xml and money array types. Neither carries a typmod,
+	// so format_type renders the bare element name with a [] suffix.
+	OIDArrayXML   uint32 = 143
+	OIDArrayMoney uint32 = 791
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -226,6 +235,10 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayTsvector
 	case OIDTsquery:
 		return OIDArrayTsquery
+	case OIDXML:
+		return OIDArrayXML
+	case OIDMoney:
+		return OIDArrayMoney
 	}
 	return 0
 }
@@ -302,6 +315,10 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDTsvector, true
 	case OIDArrayTsquery:
 		return OIDTsquery, true
+	case OIDArrayXML:
+		return OIDXML, true
+	case OIDArrayMoney:
+		return OIDMoney, true
 	}
 	return 0, false
 }
@@ -1144,6 +1161,10 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDTsvector
 	case "tsquery":
 		return OIDTsquery
+	case "xml":
+		return OIDXML
+	case "money":
+		return OIDMoney
 	default:
 		return OIDText // safe fallback
 	}
@@ -1222,6 +1243,10 @@ func OIDToTypeName(oid uint32) string {
 		return "tsvector"
 	case OIDTsquery:
 		return "tsquery"
+	case OIDXML:
+		return "xml"
+	case OIDMoney:
+		return "money"
 	default:
 		return "text"
 	}

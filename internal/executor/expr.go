@@ -125,6 +125,10 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "tsvector"
 	case 3615:
 		return "tsquery"
+	case 142:
+		return "xml"
+	case 790:
+		return "money"
 	case 1186:
 		return "interval"
 	case 1266:
@@ -200,6 +204,10 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "tsvector[]"
 	case 3645:
 		return "tsquery[]"
+	case 143:
+		return "xml[]"
+	case 791:
+		return "money[]"
 	case 1187:
 		return "interval[]"
 	case 1231:
@@ -10596,6 +10604,14 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 3645:
 		// _tsquery: tsquery has no typmod, so the array is the bare name. Slice 73.
 		return "tsquery[]"
+	case 790:
+		return "money"
+	case 143:
+		// _xml: xml has no typmod, so the array is the bare name. Slice 74.
+		return "xml[]"
+	case 791:
+		// _money: money has no typmod, so the array is the bare name. Slice 74.
+		return "money[]"
 	case 3802:
 		return "jsonb"
 	case 4072:
