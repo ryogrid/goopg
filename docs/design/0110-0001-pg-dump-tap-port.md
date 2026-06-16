@@ -1402,6 +1402,24 @@ fixed one logical group per loop:
     `executor.TestUserPGAttributeArrayColumn`. Remaining gap: other element types
     (date[], timestamp[], uuid[], …) still fall back to their scalar OID until
     their array OID + `format_type` rendering land.
+  - **Slice 64 — float8/date/timestamp array columns (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`, `internal/executor/expr.go`).**
+    Extends the array-column set to the date/time + double-precision families,
+    closing part of slice 63's remaining gap. Identical proven 3-site pattern:
+    `ArrayOIDForBase`/`BaseOIDForArray` gain `float8↔_float8` (1022),
+    `date↔_date` (1182) and `timestamp↔_timestamp` (1115); `userTypeAttrsForOID`
+    gains the `_float8`/`_date`/`_timestamp` rows (all `typlen=-1`,
+    `typstorage='x'`; `_float8`/`_timestamp` use `typalign='d'` matching their
+    8-byte elements, `_date` uses `typalign='i'`); and `formatTypeOID` renders
+    1022 as `double precision[]`, 1182 as `date[]`, and 1115 as
+    `timestamp without time zone[]`. (The element scalar OIDs — `OIDFloat8` 701,
+    `OIDDate` 1082, `OIDTimestamp` 1114 — already existed; only the array
+    mappings were missing.) Guarded by the enriched `arr` fixture (`ratios double
+    precision[]`, `days date[]`, `moments timestamp[]`) in
+    `TestPort_PgDumpConnectionSetup` and the new rows in
+    `executor.TestUserPGAttributeArrayColumn`. Remaining gap: `uuid[]` and other
+    element types still fall back to their scalar OID — `uuid` additionally lacks
+    a scalar OID in `TypeNameToOID`, so it needs the scalar type wired first.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1444,7 +1462,8 @@ foo_rec;`; slice 62 asserts array-typed columns round-trip as their array type �
 `CREATE TABLE public.arr (` with `tags text[]`, `scores integer[]`, and `big
 bigint[]`; slice 63 extends the `arr` fixture so a `flags boolean[]` and a
 `prices numeric(10,2)[]` column also round-trip (the numeric array carrying its
-element precision/scale).
+element precision/scale); slice 64 extends it further with `ratios double
+precision[]`, `days date[]`, and `moments timestamp without time zone[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

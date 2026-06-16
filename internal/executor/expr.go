@@ -10389,6 +10389,14 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "text[]"
 	case 1016:
 		return "bigint[]"
+	case 1022:
+		return "double precision[]"
+	case 1115:
+		// _timestamp: element typmod (timestamp(p)) is carried onto the array;
+		// formatTypeOID(1114) has no typmod decode, so this is the bare name.
+		return "timestamp without time zone[]"
+	case 1182:
+		return "date[]"
 	case 1231:
 		// _numeric: format_type strips the array, formats the element with
 		// the carried typmod, then re-appends []. DU-002 slice 63.

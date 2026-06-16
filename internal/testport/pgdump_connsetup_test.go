@@ -571,9 +571,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// int2/int4/int8/text had array OID mappings. The numeric array additionally
 	// exercises the typmod path — format_type carries the element typmod onto the
 	// array, so `prices numeric(10,2)[]` must round-trip precision/scale.
+	// Slice 64 extends the row with double precision[], date[] and timestamp[]:
+	// these previously fell back to their scalar element OID because only
+	// int2/int4/int8/text/bool/numeric had array OID mappings. All three follow
+	// the proven 3-site pattern (array OID const + ArrayOID maps +
+	// userTypeAttrsForOID + formatTypeOID); float8/timestamp use 'd' alignment,
+	// date uses 'i'.
 	if err := runSQLSimple(t, c, "CREATE TABLE public.arr (id integer PRIMARY KEY, "+
 		"tags text[], scores integer[], big bigint[], "+
-		"flags boolean[], prices numeric(10,2)[])"); err != nil {
+		"flags boolean[], prices numeric(10,2)[], "+
+		"ratios double precision[], days date[], moments timestamp[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -876,6 +883,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// Slice 63 adds boolean[] and numeric(10,2)[]: bool/numeric now map to
 		// their array OIDs (_bool 1000, _numeric 1231), and the numeric array
 		// carries the element typmod so precision/scale survive the dump.
+		// Slice 64 adds double precision[], date[] and timestamp[]: float8/date/
+		// timestamp now map to their array OIDs (_float8 1022, _date 1182,
+		// _timestamp 1115) so each dumps with its declared array type.
 		arrCols := []string{
 			"CREATE TABLE public.arr (",
 			"tags text[]",
@@ -883,6 +893,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"big bigint[]",
 			"flags boolean[]",
 			"prices numeric(10,2)[]",
+			"ratios double precision[]",
+			"days date[]",
+			"moments timestamp without time zone[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

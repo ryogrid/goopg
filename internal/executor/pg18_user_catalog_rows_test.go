@@ -397,6 +397,10 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// typmod, so precision/scale must survive onto the array display.
 		{"bool", nil, 1000, "boolean[]"},
 		{"numeric", []int64{10, 2}, 1231, "numeric(10,2)[]"},
+		// Slice 64: float8/date/timestamp arrays (the date/time families).
+		{"float8", nil, 1022, "double precision[]"},
+		{"date", nil, 1182, "date[]"},
+		{"timestamp", nil, 1115, "timestamp without time zone[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}
