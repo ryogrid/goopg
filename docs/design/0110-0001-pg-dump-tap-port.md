@@ -2216,8 +2216,24 @@ and the explicitly-named `CONSTRAINT must_be_pos CHECK ((VALUE > 0))`. The token
 reconstruction normalizes spacing to PG's canonical form (`VALUE>0` → `VALUE > 0`).
 The `CHECK (VALUE IN (...))` form — which PG deparses to a
 `VALUE = ANY (ARRAY['a'::text, …])` ScalarArrayOpExpr, not the literal `IN` text —
-is a separate follow-up slice (its `CheckInValues` capture is still parsed but not
-yet emitted).
+lands in slice 97 below.
+
+Slice 97 closes the `CHECK (VALUE IN (...))` gap for **text** domains. goopg has
+long captured the membership list in `CreateDomainStmt.CheckInValues` (the executor
+keeps it on `Domain.CheckInValues` for runtime IN validation), but it emitted no
+`pg_constraint` row, so the check vanished from `pg_dump`. PG does not preserve the
+`IN` syntax — `ruleutils` deparses a domain `CHECK (VALUE IN ('red','green'))` to a
+`ScalarArrayOpExpr`: `VALUE = ANY (ARRAY['red'::text, 'green'::text])`. The executor
+now synthesizes that exact text in `domainInValuesCheckExpr` (single-quoted,
+embedded-quote-doubled literals, each cast `::text`) and feeds it through the
+slice-96 plumbing (`SetDomainCheck` → `pg_constraint` `contype='c'` row →
+`pg_get_constraintdef` double-wrap), yielding
+`CONSTRAINT colr_check CHECK ((VALUE = ANY (ARRAY['red'::text, 'green'::text])))` —
+byte-identical to real pg_dump 18.3, for both the auto-named and explicit-`CONSTRAINT`
+cases (the parser now also threads the explicit name into `CheckName` for the
+IN-values branch). Non-text base types (e.g. `character varying`, which PG wraps as
+`(VALUE)::text = ANY ((ARRAY[…])::text[])` with a base-type-specific coercion
+envelope) return `""` from the helper and stay runtime-only — a future slice.
 
 ## Deferred (002–010) — catalog surface estimate
 

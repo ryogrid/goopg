@@ -1771,6 +1771,23 @@ object support.
         `zip public.zipcode`, no `zip text`, no empty DEFAULT). **Next blocker:**
         run the test after adding the next object type (composite type / range
         type / domain CHECK constraint) to find the real next gap.
+      - **PROGRESS 2026-06-17 (loops #51–#60):** **DU-002 slices 91–97 LANDED**
+        (commits through `ac60813f` + this loop). Domain pg_dump fidelity built
+        out incrementally: NOT NULL (91), DEFAULT expression (92), text/varchar
+        string DEFAULT (93–94), base-type typmod e.g. `varchar(20)`/`numeric(10,2)`
+        (95), generic `CHECK (VALUE > 0)` predicate (96), and now **slice 97 —
+        `CHECK (VALUE IN (...))` for text domains**. goopg captured the IN list in
+        `CheckInValues` (runtime validation) but emitted no `pg_constraint` row, so
+        the check vanished from pg_dump. PG deparses it to a ScalarArrayOpExpr;
+        the executor (`domainInValuesCheckExpr`) now synthesizes
+        `VALUE = ANY (ARRAY['red'::text, 'green'::text])` and routes it through the
+        slice-96 `SetDomainCheck`→pg_constraint→pg_get_constraintdef plumbing,
+        byte-identical to real pg_dump 18.3 (auto-named + explicit-CONSTRAINT). The
+        parser now also threads the explicit name into `CheckName` for the IN-values
+        branch. Gates: parser/executor/catalog unit PASS; `TestPort_PgDumpConnectionSetup`
+        PASS (2.35s); pgbench pre-commit smoke on commit. **Next blocker:** varchar
+        IN-values needs the `(VALUE)::text = ANY ((ARRAY[…])::text[])` coercion
+        envelope (slice 98); or move to a new object type (composite / range).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

@@ -753,14 +753,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// real pg_dump 18.3. `posqty` uses the auto-generated `posqty_check` name;
 	// `named_chk` carries an explicit CONSTRAINT name. The token-reconstructed expr
 	// (`VALUE > 0`) matches PG's deparse spacing. The `VALUE IN (...)` form (which
-	// deparses to a `= ANY (ARRAY[...])` ScalarArrayOpExpr) is a separate follow-up.
+	// deparses to a `= ANY (ARRAY[...])` ScalarArrayOpExpr) is exercised by the
+	// `colr`/`named_in` text domains below (slice 97).
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.posqty AS integer CHECK (VALUE > 0)"); err != nil {
 		t.Fatalf("create domain posqty: %v", err)
 	}
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.named_chk AS integer CONSTRAINT must_be_pos CHECK (VALUE > 0)"); err != nil {
 		t.Fatalf("create domain named_chk: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk)"); err != nil {
+	// DU-002 slice 97: a `CHECK (VALUE IN (...))` over a text domain. goopg captures
+	// the membership list in CheckInValues (runtime validation) but previously emitted
+	// no pg_constraint row, so the check vanished from pg_dump. The executor now
+	// synthesizes PG's ScalarArrayOpExpr deparse — `VALUE = ANY (ARRAY['red'::text,
+	// 'green'::text])` — and stores it as conbin, so pg_get_constraintdef re-renders
+	// the inline `CONSTRAINT <name> CHECK ((...))` byte-identically to real pg_dump
+	// 18.3. `colr` is auto-named (colr_check); `named_in` carries an explicit name.
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.colr AS text CHECK (VALUE IN ('red','green'))"); err != nil {
+		t.Fatalf("create domain colr: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.named_in AS text CONSTRAINT must_be_color CHECK (VALUE IN ('red','green'))"); err != nil {
+		t.Fatalf("create domain named_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1385,6 +1399,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.named_chk AS integer",
 			"CONSTRAINT must_be_pos CHECK ((VALUE > 0))",
 			"nc public.named_chk",
+			// Slice 97: a `CHECK (VALUE IN (...))` over a text domain deparses to a
+			// ScalarArrayOpExpr — byte-identical to real pg_dump 18.3.
+			"CREATE DOMAIN public.colr AS text",
+			"CONSTRAINT colr_check CHECK ((VALUE = ANY (ARRAY['red'::text, 'green'::text])))",
+			"co public.colr",
+			"CREATE DOMAIN public.named_in AS text",
+			"CONSTRAINT must_be_color CHECK ((VALUE = ANY (ARRAY['red'::text, 'green'::text])))",
+			"ni public.named_in",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

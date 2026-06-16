@@ -5263,6 +5263,12 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 					if vals := p.tryParseCheckInValues(); vals != nil {
 						if stmt.CheckInValues == nil {
 							stmt.CheckInValues = vals
+							// Preserve the explicit CONSTRAINT name so the
+							// deparsed `= ANY (ARRAY[...])` round-trips with the
+							// right conname through pg_dump. DU-002 slice 97.
+							if stmt.CheckName == "" {
+								stmt.CheckName = cname.Value
+							}
 						}
 					} else {
 						// Generic CHECK expression: capture the raw predicate text

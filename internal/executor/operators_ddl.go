@@ -8666,12 +8666,45 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// Record a generic CHECK predicate (e.g. `VALUE > 0`) so pg_dump's
 	// getDomainConstraints surfaces it and dumpDomain re-emits the inline
 	// `CONSTRAINT <name> CHECK ((<expr>))` clause. DU-002 slice 96.
-	cat.SetDomainCheck(d, s.CheckName, s.CheckExpr)
+	//
+	// A `CHECK (VALUE IN (...))` form is captured separately as CheckInValues
+	// (used at runtime for membership validation). PG deparses it to a
+	// ScalarArrayOpExpr — `VALUE = ANY (ARRAY['a'::text, ...])` — so we synthesize
+	// the same text here and store it as the constraint's conbin, making it
+	// round-trip through pg_dump too. DU-002 slice 97.
+	checkExpr := s.CheckExpr
+	if checkExpr == "" && len(s.CheckInValues) > 0 {
+		checkExpr = domainInValuesCheckExpr(s.BaseType, s.CheckInValues)
+	}
+	cat.SetDomainCheck(d, s.CheckName, checkExpr)
 	// Write a pg_type heap row (typtype='d') so pg_dump's getTypes discovers the
 	// domain and a column of the domain type round-trips as its declared type.
 	// DU-002 slice 90.
 	syncDomainTypeToCatalogHeap(o.ctx, d)
 	return nil
+}
+
+// domainInValuesCheckExpr renders a `CHECK (VALUE IN (...))` domain constraint as
+// PG's deparsed ScalarArrayOpExpr text, so it round-trips through pg_dump via
+// pg_get_constraintdef. For a text base type PG emits a bare per-element `::text`
+// cast with no coercion wrapper:
+//
+//	VALUE = ANY (ARRAY['red'::text, 'green'::text])
+//
+// Other base types (e.g. character varying, which PG wraps as
+// `(VALUE)::text = ANY ((ARRAY[...])::text[])`) need a base-type-specific coercion
+// envelope and are left runtime-only for now (returns ""). DU-002 slice 97.
+func domainInValuesCheckExpr(baseType string, vals []string) string {
+	if strings.ToLower(strings.TrimSpace(baseType)) != "text" || len(vals) == 0 {
+		return ""
+	}
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		// PG quotes string literals with single quotes and doubles any embedded
+		// quote; mirror that so the deparse is byte-identical.
+		parts[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::text"
+	}
+	return "VALUE = ANY (ARRAY[" + strings.Join(parts, ", ") + "])"
 }
 
 func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {

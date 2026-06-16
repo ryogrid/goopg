@@ -1,36 +1,29 @@
-Task: DU-002 slice 96 — DOMAIN generic CHECK (VALUE <cmp>) survives pg_dump (COMPLETE, commit pending)
+Task: DU-002 slice 97 — `CHECK (VALUE IN (...))` over a text DOMAIN survives pg_dump (COMPLETE, commit pending)
 
 Files:
-- internal/parser/ast.go — CreateDomainStmt gains CheckExpr + CheckName.
-- internal/parser/ddl.go — parseCreateDomain now CAPTURES a generic (non-IN) CHECK
-  via new parseDomainCheckExpr (uppercases the VALUE placeholder; table twin
-  parseCheckExpr must NOT). Dead skipParenExpr removed.
-- internal/catalog/catalog.go — Domain gains CheckExpr/CheckName/CheckOID;
-  SetDomainCheck allocates the constraint OID + auto-name <domain>_check;
-  pg_constraint VirtualRows emits the contype='c' row keyed on contypid=domain OID;
-  AllDomains() snapshot accessor added.
-- internal/executor/operators_ddl.go — execCreateDomain calls cat.SetDomainCheck.
-- internal/executor/expr.go — pg_get_constraintdef renders `CHECK ((expr))` for a
-  domain check (iterates AllDomains by CheckOID).
-- internal/testport/pgdump_connsetup_test.go — fixtures posqty (auto-named) +
-  named_chk (explicit CONSTRAINT must_be_pos); dom cols pq/nc; domainDefs asserts
-  `CONSTRAINT posqty_check CHECK ((VALUE > 0))` etc.
-- docs/design/0110-0001-pg-dump-tap-port.md — slice 96 narrative.
+- internal/parser/ddl.go — IN-values CONSTRAINT branch now threads the explicit
+  constraint name into stmt.CheckName (was discarded).
+- internal/executor/operators_ddl.go — execCreateDomain synthesizes the deparse via
+  new domainInValuesCheckExpr(baseType, vals): for text base type returns
+  `VALUE = ANY (ARRAY['v'::text, ...])` (quote-doubled literals), then SetDomainCheck
+  routes it through the slice-96 pg_constraint plumbing. Non-text → "" (runtime-only).
+- internal/testport/pgdump_connsetup_test.go — fixtures colr (auto colr_check) +
+  named_in (CONSTRAINT must_be_color); dom cols co/ni; domainDefs asserts
+  `CONSTRAINT colr_check CHECK ((VALUE = ANY (ARRAY['red'::text, 'green'::text])))`.
+- docs/design/0110-0001-pg-dump-tap-port.md — slice 97 narrative.
+- .ralph/fix_plan.md — consolidated slices 91–97 progress note.
 
-Key symbols: parseDomainCheckExpr, CreateDomainStmt.CheckExpr/CheckName,
-SetDomainCheck, Domain.CheckOID, pg_constraint VirtualRows domain loop,
-pg_get_constraintdef domain branch.
+Key symbols: domainInValuesCheckExpr, CreateDomainStmt.CheckInValues/CheckName,
+SetDomainCheck, pg_constraint VirtualRows domain loop, pg_get_constraintdef domain branch.
 
-Findings: verified real pg_dump 18.3 — domain check dumps inline as
-`\n\tCONSTRAINT <name> CHECK ((<expr>))`. getDomainConstraints reads
-`WHERE contypid=$1 AND contype IN ('c','n')`. goopg lexer lowercases the VALUE
-keyword token → needed uppercase fix to match PG's deparse. The `CHECK (VALUE IN
-(...))` form deparses to `VALUE = ANY (ARRAY['a'::text,...])` (ScalarArrayOpExpr) —
-DEFERRED (CheckInValues still parsed, not emitted).
+Findings: verified real pg_dump 18.3 (/tmp/pgcheck_du97). text domain IN deparses to
+`CHECK ((VALUE = ANY (ARRAY['red'::text, 'green'::text])))`. varchar form is
+`CHECK (((VALUE)::text = ANY ((ARRAY['a'::character varying, ...])::text[])))` — needs
+a base-type coercion envelope, DEFERRED to slice 98.
 
-Gates run: go build parser/catalog/executor OK; go vet OK; parser+catalog+executor
-unit PASS; TestPort_PgDumpConnectionSetup PASS (2.2s); pre-commit pgbench smoke on commit.
+Gates run: go build+vet OK; parser+executor+catalog unit PASS;
+TestPort_PgDumpConnectionSetup PASS (2.35s); pre-commit pgbench smoke on commit.
 
-Next step: slice 97 candidates: (a) `CHECK (VALUE IN (...))` ANY/ARRAY deparse;
+Next step: slice 98 candidates: (a) varchar/char IN-values coercion-envelope deparse;
 (b) composite type CREATE TYPE AS (...) — third object type, dumpCompositeType;
-(c) domain COLLATE clause. ADD fixture, RUN test, let it report the real blocker.
+(c) range type. ADD fixture, RUN test, let it report the real blocker.
