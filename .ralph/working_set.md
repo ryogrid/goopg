@@ -1,32 +1,33 @@
-Task: DU-002 slice 106 — xml/oid/bit/varbit domain `CHECK (VALUE IN ...)` survive
+Task: DU-002 slice 107 — pg_lsn/tid/xid/cid domain `CHECK (VALUE IN ...)` survive
 pg_dump (COMPLETE, committing).
 
 Files:
-- internal/executor/operators_ddl.go — domainInValuesCheckExpr: new cases
-  `OIDXML` (lhsCast="text", reuses json mode), `OIDOID`
-  (domainInValuesCoerced(vals,"oid")), `OIDBit` (castType=`"bit"` QUOTED),
-  `OIDVarbit` (castType="bit varying"). Doc comment table + slice list extended.
-  NO parser change (slice 105's VALUE::text form covers xml).
-- internal/testport/pgdump_connsetup_test.go — fixtures xml_in/oid_in/bit_in/
-  vbit_in; columns xmli/oidi/biti/vbiti on public.dom; domainDefs assertions.
-- docs/design/0110-0001-pg-dump-tap-port.md — slice 106 section.
-- .ralph/fix_plan.md — loop #69 progress note.
+- internal/executor/operators_ddl.go — domainInValuesCheckExpr: 4 new bare
+  string-with-cast cases OIDPgLsn/OIDTid/OIDXid/OIDCid (castType = bare type
+  name, no coerce, no quoted cast). Doc table + excluded-types note + slice list
+  extended.
+- internal/testport/pgdump_connsetup_test.go — fixtures lsn_in/tid_in/xid_in/
+  cid_in; columns lsni/tidi/xidi/cidi on public.dom; domainDefs assertions.
+- docs/design/0110-0001-pg-dump-tap-port.md — slice 107 section.
+- .ralph/fix_plan.md — loop #70 progress note.
 
-Key symbols: domainInValuesCheckExpr (lhsCast + coerced + bare-cast modes),
-domainInValuesCoerced, catalog.OIDXML/OIDOID/OIDBit/OIDVarbit.
+Key symbols: domainInValuesCheckExpr, catalog.OIDPgLsn/OIDTid/OIDXid/OIDCid.
 
-Findings: verified real pg_dump 18.3 (/tmp/pgcheck_du106, cluster removed):
-  xml  → ((VALUE)::text = ANY (ARRAY['<a/>'::text, '<b>1</b>'::text]))
-  oid  → (VALUE = ANY (ARRAY[(1)::oid, (2)::oid, (3)::oid]))
-  bit  → (VALUE = ANY (ARRAY['1010'::"bit", '0101'::"bit"]))  ← cast QUOTED
-  varbit → (VALUE = ANY (ARRAY['101'::bit varying, '110'::bit varying]))
-xml round-trips byte-identically (verbatim text, no eq operator → lhsCast mode).
-timestamptz/interval/money still excluded (session-tz / normalization / lc_monetary).
+Findings: verified real pg_dump 18.3 (/tmp/pgcheck_du107, cluster removed):
+  pg_lsn → VALUE = ANY (ARRAY['16/B374D848'::pg_lsn, '0/0'::pg_lsn])
+  tid    → VALUE = ANY (ARRAY['(0,1)'::tid, '(1,2)'::tid])
+  xid    → VALUE = ANY (ARRAY['100'::xid, '200'::xid])
+  cid    → VALUE = ANY (ARRAY['5'::cid, '10'::cid])
+All native eq operators + canonical forms → bare string-with-cast, no quoting.
+EXCLUDED (probed): tsvector/tsquery normalize lexemes ('a b'→'''a'' ''b''');
+"char" (OID 18) — TypeNameToOID maps "char"→bpchar OID 1042, ::"char" needs
+parser quote-state. timestamptz/interval/money still excluded.
 
-Gates run: go build+vet OK; parser/catalog/executor unit PASS;
-TestPort_PgDumpConnectionSetup PASS (2.12s); pgbench pre-commit smoke on commit.
+Gates run: go build+vet OK; catalog/parser/executor unit PASS;
+TestPort_PgDumpConnectionSetup PASS (2.17s); pgbench pre-commit smoke on commit.
 
-Next step: slice 107 candidates: (a) NEW object type — composite CREATE TYPE
-AS (...) / range type / enum CHECK; or (b) the excluded base types need
-render-normalization (timestamptz session-tz, interval canonical form).
-ADD fixture, RUN real pg_dump, let it report the real blocker.
+Next step: slice 108 candidates — remaining excluded base types each need
+render-normalization (timestamptz session-tz, interval/tsvector/tsquery
+canonical form) or parser quote-state ("char"); OR move to a NEW object type
+(composite CREATE TYPE AS (...) / range type / enum CHECK). ADD fixture, RUN
+real pg_dump, let it report the real blocker.

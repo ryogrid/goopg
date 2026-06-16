@@ -8712,6 +8712,10 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 //	oid        VALUE = ANY (ARRAY[(1)::oid, (2)::oid, (3)::oid])
 //	bit(n)     VALUE = ANY (ARRAY['1010'::"bit", '0101'::"bit"])
 //	varbit     VALUE = ANY (ARRAY['101'::bit varying, '110'::bit varying])
+//	pg_lsn     VALUE = ANY (ARRAY['16/B374D848'::pg_lsn, '0/0'::pg_lsn])
+//	tid        VALUE = ANY (ARRAY['(0,1)'::tid, '(1,2)'::tid])
+//	xid        VALUE = ANY (ARRAY['100'::xid, '200'::xid])
+//	cid        VALUE = ANY (ARRAY['5'::cid, '10'::cid])
 //
 // text and bpchar have native equality operators, so PG emits a bare per-element
 // cast with no coercion wrapper. character varying has no varchar-eq operator and
@@ -8741,10 +8745,16 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 // (...)`, the cast-on-VALUE parse shape) so they use the `(VALUE)::text` lhsCast
 // form; both round-trip verbatim through `::text`. oid joins the per-element
 // coercion shape (`(N)::oid`). bit/varbit use the bare string-with-cast shape;
-// bit's cast type is quoted (`::"bit"`) by the deparser. timestamptz, interval
-// and money remain deliberately excluded — timestamptz re-renders the stored
-// constant in the session timezone, interval normalizes (e.g. '2 hours'→
-// '02:00:00'), and money depends on lc_monetary. Note jsonb byte-identity holds
+// bit's cast type is quoted (`::"bit"`) by the deparser. pg_lsn/tid/xid/cid all
+// have native equality operators and canonical input forms that round-trip
+// verbatim through the bare string-with-cast shape (`'16/B374D848'::pg_lsn`,
+// `'(0,1)'::tid`, `'100'::xid`, `'5'::cid`). timestamptz, interval, money,
+// tsvector and tsquery remain deliberately excluded — timestamptz re-renders the
+// stored constant in the session timezone, interval normalizes (e.g. '2 hours'→
+// '02:00:00'), money depends on lc_monetary, and tsvector/tsquery re-render their
+// lexemes with single quotes ('a b'→'''a'' ''b'''). The internal "char" type
+// (OID 18) is also excluded: TypeNameToOID maps "char" to bpchar (OID 1042), so
+// the quoted-vs-unquoted distinction needed to emit `::"char"` is not tracked. Note jsonb byte-identity holds
 // only for already-canonical values — non-scalar jsonb (e.g. objects) is
 // re-rendered with key reordering / whitespace normalization, so the fixtures use
 // canonical scalars.
@@ -8752,7 +8762,7 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 // DU-002 slices 97 (text), 98 (char/varchar), 99 (integer/numeric),
 // 100 (bigint/boolean/date), 101 (real/float8/timestamp/time/uuid),
 // 102 (smallint/bytea/inet), 103 (macaddr/macaddr8/cidr), 104 (name/jsonb),
-// 105 (json), 106 (xml/oid/bit/varbit).
+// 105 (json), 106 (xml/oid/bit/varbit), 107 (pg_lsn/tid/xid/cid).
 func domainInValuesCheckExpr(baseType string, vals []string) string {
 	if len(vals) == 0 {
 		return ""
@@ -8820,6 +8830,22 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		// bit varying has a native equality operator; the canonical bit-string
 		// form round-trips verbatim through `::bit varying`.
 		castType = "bit varying"
+	case catalog.OIDPgLsn:
+		// pg_lsn has a native equality operator; the canonical uppercase-hex
+		// form ('16/B374D848') round-trips verbatim through `::pg_lsn`.
+		castType = "pg_lsn"
+	case catalog.OIDTid:
+		// tid has a native equality operator; the canonical '(block,offset)'
+		// form round-trips verbatim through `::tid`.
+		castType = "tid"
+	case catalog.OIDXid:
+		// xid has a native equality operator; the decimal txid form round-trips
+		// verbatim through `::xid`.
+		castType = "xid"
+	case catalog.OIDCid:
+		// cid has a native equality operator; the decimal command-id form
+		// round-trips verbatim through `::cid`.
+		castType = "cid"
 	case catalog.OIDCidr:
 		// cidr has no cidr-eq operator, so PG coerces both sides to inet
 		// (the element cast stays ::cidr, the envelope is ::inet / ::inet[]).

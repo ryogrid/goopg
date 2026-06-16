@@ -2419,6 +2419,34 @@ domain AS-clause typmod (`bit(4)` / `bit varying`) was already handled by the
 slice-75 `format_type` work. Still excluded: `timestamptz`, `interval`, `money`
 (as above).
 
+### DU-002 slice 107 — `pg_lsn` / `tid` / `xid` / `cid`
+
+Slice 107 extends the IN-values deparse to four system-ish base types that all
+share the simplest render mode. Verified against real pg_dump 18.3
+(`/tmp/pgcheck_du107`):
+
+| base type | deparse |
+|---|---|
+| `pg_lsn` | `VALUE = ANY (ARRAY['16/B374D848'::pg_lsn, '0/0'::pg_lsn])` |
+| `tid` | `VALUE = ANY (ARRAY['(0,1)'::tid, '(1,2)'::tid])` |
+| `xid` | `VALUE = ANY (ARRAY['100'::xid, '200'::xid])` |
+| `cid` | `VALUE = ANY (ARRAY['5'::cid, '10'::cid])` |
+
+All four have native equality operators and canonical input forms that round-trip
+verbatim, so each joins the bare string-with-cast shape with no coercion envelope
+and no quoted cast (unlike `bit`). `pg_lsn`'s uppercase-hex LSN, `tid`'s
+`(block,offset)` pair, and the decimal `xid`/`cid` forms are all stored and
+re-emitted byte-for-byte.
+
+Two related types were probed and **deliberately excluded**: `tsvector` and
+`tsquery` re-render their lexemes with single quotes (`'a b'` → `'''a'' ''b'''`),
+so they normalize like `timestamptz`/`interval`. The internal `"char"` type
+(OID 18) is also excluded: `catalog.TypeNameToOID` maps the string `"char"` to
+`bpchar` (OID 1042), so the quoted-vs-unquoted distinction required to emit
+`::"char"` is not tracked — distinguishing it would need parser quote-state, out
+of scope for this slice. Still excluded base types: `timestamptz`, `interval`,
+`money`, `tsvector`, `tsquery`, `"char"`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -1951,6 +1951,26 @@ object support.
         `timestamptz`/`interval`/`money` remain excluded (session-tz re-render /
         normalization / lc_monetary); or move to a new object type (composite
         CREATE TYPE AS / range / enum CHECK).
+      - **PROGRESS 2026-06-17 (loop #70):** **DU-002 slice 107 LANDED** — four
+        system-ish base types (`pg_lsn`, `tid`, `xid`, `cid`), all the simplest
+        render mode. `domainInValuesCheckExpr`: each gets a bare string-with-cast
+        case (`castType` = the bare type name, no coerce envelope, no quoted cast)
+        → `VALUE = ANY (ARRAY['16/B374D848'::pg_lsn, '0/0'::pg_lsn])`,
+        `'(0,1)'::tid`, `'100'::xid`, `'5'::cid`. All have native equality
+        operators and canonical input forms that round-trip verbatim. Verified
+        byte-identical to real pg_dump 18.3 (`/tmp/pgcheck_du107`, cluster
+        removed). Empirically probed + **excluded**: `tsvector`/`tsquery`
+        (re-render lexemes single-quoted, `'a b'`→`'''a'' ''b'''`, like
+        timestamptz normalization); internal `"char"` (OID 18) — `TypeNameToOID`
+        maps `"char"`→bpchar OID 1042, so the quoted-cast `::"char"` distinction
+        needs parser quote-state (out of scope). Fixtures `lsn_in`/`tid_in`/
+        `xid_in`/`cid_in` + columns `lsni`/`tidi`/`xidi`/`cidi` on `public.dom`.
+        Gates: build+vet OK; parser/catalog/executor unit PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.17s); pgbench pre-commit smoke on
+        commit. **Next blocker:** remaining excluded base types
+        (`timestamptz`/`interval`/`money`/`tsvector`/`tsquery`/`"char"`) each need
+        render-normalization or parser quote-state; OR move to a new object type
+        (composite CREATE TYPE AS / range / enum CHECK).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text
