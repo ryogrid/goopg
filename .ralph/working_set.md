@@ -1,32 +1,32 @@
-Task: DU-002 slice 105 — `json` domain `CHECK (VALUE::text IN (...))` survives
+Task: DU-002 slice 106 — xml/oid/bit/varbit domain `CHECK (VALUE IN ...)` survive
 pg_dump (COMPLETE, committing).
 
 Files:
-- internal/parser/ddl.go — tryParseCheckInValues now accepts an optional
-  `::<typename>` cast after VALUE (via parseTypeNameAfterCast; cast type
-  discarded, deparse shape keyed on base type). First parser change since slice 99.
-- internal/executor/operators_ddl.go — domainInValuesCheckExpr: `case
-  catalog.OIDJSON` + new `lhsCast` render mode → `(VALUE)::text = ANY
-  (ARRAY['1'::text, '{"a": 1}'::text])` (LHS cast, array NOT re-cast). Doc table
-  + slice list extended.
-- internal/testport/pgdump_connsetup_test.go — fixture js_in (json), column jsi
-  on public.dom; domainDefs assert (uses object value '{"a": 1}').
-- docs/design/0110-0001-pg-dump-tap-port.md — slice 105 section.
-- .ralph/fix_plan.md — loop #68 progress note.
+- internal/executor/operators_ddl.go — domainInValuesCheckExpr: new cases
+  `OIDXML` (lhsCast="text", reuses json mode), `OIDOID`
+  (domainInValuesCoerced(vals,"oid")), `OIDBit` (castType=`"bit"` QUOTED),
+  `OIDVarbit` (castType="bit varying"). Doc comment table + slice list extended.
+  NO parser change (slice 105's VALUE::text form covers xml).
+- internal/testport/pgdump_connsetup_test.go — fixtures xml_in/oid_in/bit_in/
+  vbit_in; columns xmli/oidi/biti/vbiti on public.dom; domainDefs assertions.
+- docs/design/0110-0001-pg-dump-tap-port.md — slice 106 section.
+- .ralph/fix_plan.md — loop #69 progress note.
 
-Key symbols: domainInValuesCheckExpr (lhsCast mode), tryParseCheckInValues,
-parseTypeNameAfterCast, catalog.OIDJSON.
+Key symbols: domainInValuesCheckExpr (lhsCast + coerced + bare-cast modes),
+domainInValuesCoerced, catalog.OIDXML/OIDOID/OIDBit/OIDVarbit.
 
-Findings: verified real pg_dump 18.3 (/tmp/pgcheck_du105, cluster removed):
-  json → ((VALUE)::text = ANY (ARRAY['1'::text, '"hello"'::text, '{"a": 1}'::text]))
-json round-trips byte-identical EVEN for objects (verbatim text, no key reorder /
-whitespace norm) — strictly better than jsonb (slice 104, scalars only).
+Findings: verified real pg_dump 18.3 (/tmp/pgcheck_du106, cluster removed):
+  xml  → ((VALUE)::text = ANY (ARRAY['<a/>'::text, '<b>1</b>'::text]))
+  oid  → (VALUE = ANY (ARRAY[(1)::oid, (2)::oid, (3)::oid]))
+  bit  → (VALUE = ANY (ARRAY['1010'::"bit", '0101'::"bit"]))  ← cast QUOTED
+  varbit → (VALUE = ANY (ARRAY['101'::bit varying, '110'::bit varying]))
+xml round-trips byte-identically (verbatim text, no eq operator → lhsCast mode).
 timestamptz/interval/money still excluded (session-tz / normalization / lc_monetary).
 
 Gates run: go build+vet OK; parser/catalog/executor unit PASS;
-TestPort_PgDumpConnectionSetup PASS (2.07s); pgbench pre-commit smoke on commit.
+TestPort_PgDumpConnectionSetup PASS (2.12s); pgbench pre-commit smoke on commit.
 
-Next step: slice 106 candidates: (a) move to a NEW object type — composite
-CREATE TYPE AS (...) / range type / enum CHECK; or (b) the excluded base types
-need render-normalization (timestamptz session-tz, interval canonical form).
+Next step: slice 107 candidates: (a) NEW object type — composite CREATE TYPE
+AS (...) / range type / enum CHECK; or (b) the excluded base types need
+render-normalization (timestamptz session-tz, interval canonical form).
 ADD fixture, RUN real pg_dump, let it report the real blocker.

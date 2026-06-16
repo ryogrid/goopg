@@ -2394,6 +2394,31 @@ unlike `jsonb` (slice 104), `json` preserves the input text verbatim with no key
 reordering or whitespace normalization, so the fixture uses an object value to
 demonstrate this. Still excluded: `timestamptz`, `interval`, `money` (as above).
 
+### DU-002 slice 106 — `xml` / `oid` / `bit` / `varbit`
+
+Slice 106 extends the IN-values deparse to four more base types, exercising all
+three render modes. Verified against real pg_dump 18.3 (`/tmp/pgcheck_du106`):
+
+| base type | deparse |
+|---|---|
+| `xml` | `(VALUE)::text = ANY (ARRAY['<a/>'::text, '<b>1</b>'::text])` |
+| `oid` | `VALUE = ANY (ARRAY[(1)::oid, (2)::oid, (3)::oid])` |
+| `bit(4)` | `VALUE = ANY (ARRAY['1010'::"bit", '0101'::"bit"])` |
+| `varbit` | `VALUE = ANY (ARRAY['101'::bit varying, '110'::bit varying])` |
+
+`xml`, like `json`, has **no** equality operator, so its CHECK casts the LHS
+(`CHECK (VALUE::text IN (...))`) and reuses the `lhsCast` mode added in slice 105
+— demonstrating that mode generalizes beyond `json`. `xml` is stored and
+re-emitted verbatim, so the text round-trips byte-identically. `oid` joins the
+per-element coercion shape (`domainInValuesCoerced` → `(N)::oid`), like
+`bigint`/`real`: the IN-list `int4` literals are coerced per element. `bit`/`varbit`
+have native equality operators and use the bare string-with-cast shape; the only
+nuance is that the deparser **quotes** `bit`'s cast type (`::"bit"`) because `bit`
+is a non-standard type-name token, whereas `varbit` renders as `bit varying`. The
+domain AS-clause typmod (`bit(4)` / `bit varying`) was already handled by the
+slice-75 `format_type` work. Still excluded: `timestamptz`, `interval`, `money`
+(as above).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

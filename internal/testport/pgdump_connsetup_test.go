@@ -880,7 +880,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, `CREATE DOMAIN public.js_in AS json CHECK (VALUE::text IN ('1', '{"a": 1}'))`); err != nil {
 		t.Fatalf("create domain js_in: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in)"); err != nil {
+	// xml also lacks an equality operator, so it uses the same `VALUE::text IN`
+	// cast form as json (slice 105); xml is re-emitted verbatim, so it round-trips
+	// byte-identically. oid joins the per-element coercion shape (`(N)::oid`).
+	// bit(n)/varbit use the bare string-with-cast shape (bit's cast is quoted
+	// `::"bit"`). DU-002 slice 106.
+	if err := runSQLSimple(t, c, `CREATE DOMAIN public.xml_in AS xml CHECK (VALUE::text IN ('<a/>', '<b>1</b>'))`); err != nil {
+		t.Fatalf("create domain xml_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.oid_in AS oid CHECK (VALUE IN (1, 2, 3))"); err != nil {
+		t.Fatalf("create domain oid_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.bit_in AS bit(4) CHECK (VALUE IN ('1010', '0101'))"); err != nil {
+		t.Fatalf("create domain bit_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.vbit_in AS varbit CHECK (VALUE IN ('101', '110'))"); err != nil {
+		t.Fatalf("create domain vbit_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1594,6 +1611,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.js_in AS json",
 			"CONSTRAINT js_in_check CHECK (((VALUE)::text = ANY (ARRAY['1'::text, '{\"a\": 1}'::text])))",
 			"jsi public.js_in",
+			"CREATE DOMAIN public.xml_in AS xml",
+			"CONSTRAINT xml_in_check CHECK (((VALUE)::text = ANY (ARRAY['<a/>'::text, '<b>1</b>'::text])))",
+			"xmli public.xml_in",
+			"CREATE DOMAIN public.oid_in AS oid",
+			"CONSTRAINT oid_in_check CHECK ((VALUE = ANY (ARRAY[(1)::oid, (2)::oid, (3)::oid])))",
+			"oidi public.oid_in",
+			"CREATE DOMAIN public.bit_in AS bit(4)",
+			"CONSTRAINT bit_in_check CHECK ((VALUE = ANY (ARRAY['1010'::\"bit\", '0101'::\"bit\"])))",
+			"biti public.bit_in",
+			"CREATE DOMAIN public.vbit_in AS bit varying",
+			"CONSTRAINT vbit_in_check CHECK ((VALUE = ANY (ARRAY['101'::bit varying, '110'::bit varying])))",
+			"vbiti public.vbit_in",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

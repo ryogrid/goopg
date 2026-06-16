@@ -8708,6 +8708,10 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 //	name       VALUE = ANY (ARRAY['alice'::name, 'bob'::name])
 //	jsonb      VALUE = ANY (ARRAY['1'::jsonb, '"hello"'::jsonb])
 //	json       (VALUE)::text = ANY (ARRAY['1'::text, '{"a": 1}'::text])
+//	xml        (VALUE)::text = ANY (ARRAY['<a/>'::text, '<b>1</b>'::text])
+//	oid        VALUE = ANY (ARRAY[(1)::oid, (2)::oid, (3)::oid])
+//	bit(n)     VALUE = ANY (ARRAY['1010'::"bit", '0101'::"bit"])
+//	varbit     VALUE = ANY (ARRAY['101'::bit varying, '110'::bit varying])
 //
 // text and bpchar have native equality operators, so PG emits a bare per-element
 // cast with no coercion wrapper. character varying has no varchar-eq operator and
@@ -8733,17 +8737,22 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 // jsonb both have native equality operators, so they use the bare string-with-cast
 // shape (`'alice'::name`, `'1'::jsonb`); name is a plain string and jsonb scalars
 // (numbers, quoted strings) round-trip verbatim through jsonb's output function.
-// timestamptz, interval, money and json are deliberately excluded — timestamptz
-// re-renders the stored constant in the session timezone, interval normalizes
-// (e.g. '2 hours'→'02:00:00'), money depends on lc_monetary, and json has no
-// equality operator (its CHECK must be `VALUE::text IN (...)`, a cast-on-VALUE parse
-// shape this helper does not yet accept). Note jsonb byte-identity holds only for
-// already-canonical values — non-scalar jsonb (e.g. objects) is re-rendered with
-// key reordering / whitespace normalization, so the fixtures use canonical scalars.
+// json and xml have no equality operator (their CHECK must be `VALUE::text IN
+// (...)`, the cast-on-VALUE parse shape) so they use the `(VALUE)::text` lhsCast
+// form; both round-trip verbatim through `::text`. oid joins the per-element
+// coercion shape (`(N)::oid`). bit/varbit use the bare string-with-cast shape;
+// bit's cast type is quoted (`::"bit"`) by the deparser. timestamptz, interval
+// and money remain deliberately excluded — timestamptz re-renders the stored
+// constant in the session timezone, interval normalizes (e.g. '2 hours'→
+// '02:00:00'), and money depends on lc_monetary. Note jsonb byte-identity holds
+// only for already-canonical values — non-scalar jsonb (e.g. objects) is
+// re-rendered with key reordering / whitespace normalization, so the fixtures use
+// canonical scalars.
 // Other non-string base types return "".
 // DU-002 slices 97 (text), 98 (char/varchar), 99 (integer/numeric),
 // 100 (bigint/boolean/date), 101 (real/float8/timestamp/time/uuid),
-// 102 (smallint/bytea/inet), 103 (macaddr/macaddr8/cidr), 104 (name/jsonb).
+// 102 (smallint/bytea/inet), 103 (macaddr/macaddr8/cidr), 104 (name/jsonb),
+// 105 (json), 106 (xml/oid/bit/varbit).
 func domainInValuesCheckExpr(baseType string, vals []string) string {
 	if len(vals) == 0 {
 		return ""
@@ -8795,6 +8804,22 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		// object/array values round-trip byte-identically through `::text`.
 		castType = "text"
 		lhsCast = "text"
+	case catalog.OIDXML:
+		// xml has no equality operator either, so the CHECK casts VALUE to text
+		// (`CHECK (VALUE::text IN (...))`) — identical deparse shape to json:
+		// `(VALUE)::text = ANY (ARRAY['...'::text, ...])`. xml is stored and
+		// re-emitted verbatim, so the text round-trips byte-identically.
+		castType = "text"
+		lhsCast = "text"
+	case catalog.OIDBit:
+		// bit(n) has a native equality operator, so PG emits the bare
+		// string-with-cast shape. The cast type name is quoted (`::"bit"`)
+		// because `bit` is a non-standard type-name token in the deparser.
+		castType = `"bit"`
+	case catalog.OIDVarbit:
+		// bit varying has a native equality operator; the canonical bit-string
+		// form round-trips verbatim through `::bit varying`.
+		castType = "bit varying"
 	case catalog.OIDCidr:
 		// cidr has no cidr-eq operator, so PG coerces both sides to inet
 		// (the element cast stays ::cidr, the envelope is ::inet / ::inet[]).
@@ -8812,6 +8837,10 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 	case catalog.OIDInt8:
 		// bigint: the IN-list int4 literals are coerced per element to bigint.
 		return domainInValuesCoerced(vals, "bigint")
+	case catalog.OIDOID:
+		// oid: the IN-list int4 literals are coerced per element to oid
+		// (`(1)::oid`), the same per-element coercion shape bigint/real use.
+		return domainInValuesCoerced(vals, "oid")
 	case catalog.OIDFloat4:
 		// real: the IN-list numeric literals are coerced per element to real.
 		return domainInValuesCoerced(vals, "real")

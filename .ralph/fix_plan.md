@@ -1929,6 +1929,28 @@ object support.
         commit. **Next blocker:** `timestamptz`/`interval`/`money` remain excluded
         (session-tz re-render / normalization / lc_monetary); or move to a new object
         type (composite CREATE TYPE AS / range / enum CHECK).
+      - **PROGRESS 2026-06-17 (loop #69):** **DU-002 slice 106 LANDED** — four
+        more base types, exercising all three IN-values render modes. NO parser
+        change needed (slice 105's `VALUE::text IN` form covers xml; the others
+        are plain literal lists). `domainInValuesCheckExpr`: **`xml`** reuses the
+        `lhsCast` mode added for json in slice 105 — `(VALUE)::text = ANY
+        (ARRAY['<a/>'::text, '<b>1</b>'::text])` (xml has no eq operator, stored
+        verbatim, round-trips byte-identically), demonstrating that mode
+        generalizes beyond json; **`oid`** joins the per-element coercion shape
+        (`domainInValuesCoerced(vals,"oid")` → `VALUE = ANY (ARRAY[(1)::oid,
+        (2)::oid, (3)::oid])`, int4 literals coerced per element like bigint/real);
+        **`bit(4)`** uses the bare string-with-cast shape with a QUOTED cast type
+        (`'1010'::"bit"` — the deparser quotes `bit` as a non-standard type-name
+        token); **`varbit`** → `'101'::bit varying`. All verified byte-identical
+        to real pg_dump 18.3 (`/tmp/pgcheck_du106`, cluster removed). The domain
+        AS-clause typmod (`bit(4)`/`bit varying`) was already handled by slice-75
+        `format_type`. Fixtures `xml_in`/`oid_in`/`bit_in`/`vbit_in` + columns
+        `xmli`/`oidi`/`biti`/`vbiti` added to `public.dom`. Gates: build+vet OK;
+        parser/catalog/executor unit PASS; `TestPort_PgDumpConnectionSetup` PASS
+        (2.12s); pgbench pre-commit smoke on commit. **Next blocker:**
+        `timestamptz`/`interval`/`money` remain excluded (session-tz re-render /
+        normalization / lc_monetary); or move to a new object type (composite
+        CREATE TYPE AS / range / enum CHECK).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text
