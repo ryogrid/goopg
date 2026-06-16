@@ -1313,6 +1313,26 @@ fixed one logical group per loop:
     (`(w * h)`); PG's deparser may add normalizing parens — both restore to an
     equivalent stored generated column. Guarded end-to-end by
     `TestPort_PgDumpConnectionSetup` (the `gen` fixture table).
+  - **Slice 60 — MATERIALIZED VIEW round-trip (`internal/parser/ast.go`,
+    `internal/parser/ddl.go`, `internal/executor/operators_ddl.go`).** pg_dump
+    dumps a materialized view's `AS` clause through the SAME
+    `createViewAsClause` → `pg_get_viewdef` path it uses for a plain view
+    (`pg_dump.c` `dumpTableSchema`, `RELKIND_MATVIEW` branch emits `CREATE
+    MATERIALIZED VIEW … AS\n<body>\n  WITH NO DATA;`), and `createViewAsClause`
+    aborts the ENTIRE dump with `definition of view "v" appears to be empty
+    (length zero)` when `pg_get_viewdef` returns NULL/"". goopg's matview is
+    already surfaced in `pg_class` as `relkind='m'`, but `execCreateMatView`
+    captured the body only as the SELECT AST (`tbl.View`, used for REFRESH) and
+    never as raw text — `tbl.ViewDef` stayed `""`, so `pg_get_viewdef` returned
+    NULL and any matview made the whole dump fail (mirroring the slice-57 plain-VIEW
+    bug). Fix: `CreateMatViewStmt` gains a `RawDef` field, `parseCreateMatViewTail`
+    captures the verbatim body via `captureSrcSpan` (from the SELECT/WITH keyword
+    up to the optional `WITH [NO] DATA` clause, mirroring `parseCreateViewTail`),
+    and `execCreateMatView` stores it on `catalog.Table.ViewDef` exactly as the
+    plain-view path does (`vt.ViewDef = s.RawDef`). `pg_get_viewdef` already keys on
+    `View != nil && ViewDef != ""`, so it now echoes the matview body unchanged.
+    Guarded end-to-end by `TestPort_PgDumpConnectionSetup` (the `foo_mv` fixture)
+    and by the parser unit test `parser.TestParseCreateMatViewRawDef`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1345,7 +1365,10 @@ column list round-trips with the renamed columns — `CREATE VIEW
 public.foo_rview AS` followed by `SELECT id AS col_a, name AS col_b FROM
 public.foo;`; slice 59 asserts a STORED generated column round-trips with its
 generation clause — `CREATE TABLE public.gen (` and `area integer GENERATED
-ALWAYS AS (w * h) STORED`. Unit guards:
+ALWAYS AS (w * h) STORED`; slice 60 asserts a MATERIALIZED VIEW round-trips —
+`CREATE MATERIALIZED VIEW public.foo_mv AS` followed by the verbatim body
+`SELECT id, name FROM public.foo WHERE qty > 0` and the `WITH NO DATA;` clause.
+Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
 `executor.TestAlterTableAddForeignKeyCapturesActions`,
@@ -1358,6 +1381,7 @@ ALWAYS AS (w * h) STORED`. Unit guards:
 `config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`,
 `parser.TestParseCreateViewRawDef`,
+`parser.TestParseCreateMatViewRawDef`,
 `executor.TestApplyViewColumnAliases`.
 
 ## Deferred (002–010) — catalog surface estimate

@@ -65,6 +65,46 @@ func TestParseCreateViewRawDef(t *testing.T) {
 	}
 }
 
+// TestParseCreateMatViewRawDef pins that a materialized view's body text is
+// captured verbatim into CreateMatViewStmt.RawDef (trimmed of surrounding
+// whitespace; the trailing WITH [NO] DATA clause is NOT part of the body).
+// pg_get_viewdef echoes RawDef so pg_dump can reconstruct `CREATE MATERIALIZED
+// VIEW … AS <body> WITH NO DATA` (DU-002 slice 60).
+func TestParseCreateMatViewRawDef(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{
+			"CREATE MATERIALIZED VIEW mv AS SELECT id, name FROM public.d WHERE id > 0",
+			"SELECT id, name FROM public.d WHERE id > 0",
+		},
+		{
+			// the trailing WITH NO DATA clause is excluded from the body
+			"CREATE MATERIALIZED VIEW mv AS SELECT 1 WITH NO DATA",
+			"SELECT 1",
+		},
+		{
+			// WITH DATA (the default) is likewise excluded
+			"CREATE MATERIALIZED VIEW mv AS SELECT 1 WITH DATA",
+			"SELECT 1",
+		},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.src, err)
+		}
+		cv, ok := stmts[0].(*CreateMatViewStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T, want *CreateMatViewStmt", tc.src, stmts[0])
+		}
+		if cv.RawDef != tc.want {
+			t.Errorf("Parse(%q): RawDef=%q want %q", tc.src, cv.RawDef, tc.want)
+		}
+	}
+}
+
 // TestParseDropViewIfExists pins the DROP VIEW IF EXISTS shape
 // HammerDB uses for cleanup.
 func TestParseDropViewIfExists(t *testing.T) {

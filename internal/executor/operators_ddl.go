@@ -7264,6 +7264,11 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	}
 	// Store the SELECT AST as the view query (for REFRESH).
 	tbl.View = s.Query
+	// Store the raw body text so pg_get_viewdef can echo it for pg_dump, which
+	// dumps a matview's `AS` clause exactly like a plain view (createViewAsClause
+	// → pg_get_viewdef) and aborts the whole dump if it returns empty. Mirrors
+	// the plain-view path (vt.ViewDef = s.RawDef). M0110-0001 (DU-002 slice 60).
+	tbl.ViewDef = s.RawDef
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
 	}

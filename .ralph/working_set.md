@@ -1,43 +1,47 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 59 COMPLETE
-(committing this loop). NEXT loop starts on slice 60.
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 60 COMPLETE
+(committing this loop). NEXT loop starts on slice 61.
 NOTHING in flight after commit.
 
-=== DONE (loop #14) — DU-002 slice 59 (GENERATED STORED column round-trip) ===
-Gap (confirmed via pg_dump.c read + passing assert): `area integer GENERATED
-ALWAYS AS (w * h) STORED` dumped as a PLAIN `area integer` — the GENERATED
-clause was silently dropped. pg_dump (dumpTableSchema) prints the clause only
-when print_default is true, which requires BOTH pg_attribute.attgenerated='s'
-AND a pg_attrdef row (tbinfo->attrdefs[j] != NULL); getTableAttrs forces
-separate=false for generated cols so they stay inline. goopg already set
-attgenerated='s' (attGeneratedFor) but atthasdef was `DefaultExpr != nil`
-(false for a gen col) and pg_attrdef.VirtualRows only iterated DefaultExpr cols
-→ no attrdef row.
-FIX (2 sites):
-  - internal/executor/pg18_user_catalog_rows.go buildUserPGAttributeRow:
-    atthasdef = `col.DefaultExpr != nil || col.GeneratedExpr != ""`.
-  - internal/catalog/catalog.go pg_attrdef VirtualRows: switch — DefaultExpr →
-    formatExprForAttrdef; else GeneratedExpr → adbin=col.GeneratedExpr (verbatim,
-    a col is never both). pg_get_expr passes adbin through, so clause has single
-    parens `(w * h)` (PG may add normalizing parens; both restore equivalently).
-Files: pg18_user_catalog_rows.go, catalog.go (pg_attrdef loop ~2790),
-internal/testport/pgdump_connsetup_test.go (gen fixture + slice-59 asserts),
-docs/design/0110-0001-pg-dump-tap-port.md (slice 59 bullet + guard paragraph).
-Gates: gofmt clean; vet clean (catalog+executor); catalog+executor+parser suites
-PASS; TestPort_PgDumpConnectionSetup PASS (exit-0, gen col round-trips);
+=== DONE (this loop) — DU-002 slice 60 (MATERIALIZED VIEW round-trip) ===
+Gap (confirmed via pg_dump.c read + first-run PASS): a matview made pg_dump
+abort the WHOLE dump with `definition of view "v" appears to be empty (length
+zero)`. pg_dump dumps a matview's AS clause via the SAME createViewAsClause ->
+pg_get_viewdef path as a plain view (pg_dump.c dumpTableSchema RELKIND_MATVIEW
+branch: `CREATE MATERIALIZED VIEW … AS\n<body>\n  WITH NO DATA;`). goopg
+surfaces matviews in pg_class as relkind='m' (TestSyntax_DDL_MatViewPgClass) but
+execCreateMatView captured the body only as the SELECT AST (tbl.View, for
+REFRESH) — tbl.ViewDef stayed "" → pg_get_viewdef returned NULL. Exact slice-57
+plain-VIEW bug, repeated for the matview parse path.
+FIX (3 sites, all additive):
+  - internal/parser/ast.go: CreateMatViewStmt gains RawDef string.
+  - internal/parser/ddl.go parseCreateMatViewTail: bodyStart := p.cur() before
+    parseSelect; stmt.RawDef = p.captureSrcSpan(bodyStart.Pos, p.cur()) after
+    (excludes the trailing WITH [NO] DATA clause). Mirrors parseCreateViewTail.
+  - internal/executor/operators_ddl.go execCreateMatView: tbl.ViewDef = s.RawDef
+    (right after tbl.View = s.Query). pg_get_viewdef keys on View!=nil &&
+    ViewDef!="", so it now echoes the body unchanged.
+Files: ast.go, ddl.go, operators_ddl.go, internal/parser/view_test.go
+(TestParseCreateMatViewRawDef), internal/testport/pgdump_connsetup_test.go
+(foo_mv fixture + slice-60 asserts), docs/design/0110-0001-pg-dump-tap-port.md.
+Gates: gofmt clean; vet clean; build ./... ok; parser+executor+catalog suites
+PASS; matview subset PASS; TestPort_PgDumpConnectionSetup PASS first run
+(foo_mv round-trips); tpch-spotcheck SKIPPED (no data loaded — graceful);
 pgbench CI-parity smoke via pre-commit hook.
 
-=== NEXT STEP — DU-002 slice 60 ===
+=== NEXT STEP — DU-002 slice 61 ===
 Enrich the fixture to find the next REAL pg_dump gap. Candidates still open:
-  - IDENTITY column (GENERATED ... AS IDENTITY): attidentity hardcoded "" in
-    buildUserPGAttributeRow (line ~301) → NOT round-tripped. BUT needs a backing
-    SEQUENCE (sequences skipped from pg_class virtual view: Virtual && no View →
-    getTables never sees relkind='S'). Larger slice — sequence support first.
-  - SEQUENCE / serial column — same sequence-skip blocker.
-  - MATERIALIZED VIEW round-trip (separate parser/AST path; no RawDef captured).
-  - RECURSIVE view (WITH RECURSIVE …) — RawDef capture path may differ.
+  - IDENTITY column / SEQUENCE / serial — blocked: sequences are skipped from
+    pg_class virtual view (Virtual && no View → getTables never sees relkind='S').
+    Larger slice — sequence-as-relkind='S' support first.
+  - RECURSIVE view (CREATE RECURSIVE VIEW) — parseCreateRecursiveViewTail builds
+    a wrapped CTE AST but sets NO RawDef → pg_get_viewdef returns NULL → likely
+    aborts the dump (verify). Fix: capture/synthesize a RawDef for the recursive
+    form. NOTE PG reconstructs recursive views canonically; goopg echoes verbatim.
+  - Array-typed column (e.g. tags text[]) — check format_type path round-trips.
+  - ALTER TABLE ... SET DEFAULT / column-level non-trivial DEFAULT.
 ALWAYS: add ONE fixture element, run TestPort_PgDumpConnectionSetup, inspect the
-actual dump (temp t.Logf at the exit-0 return), confirm goopg doesn't already
-handle it before assuming a gap. Known-working: CHECK, DEFAULT now(), typmods,
-FKs, comments, ordered indexes, views, renamed-col views, GENERATED STORED cols.
+actual dump, confirm goopg doesn't already handle it before assuming a gap.
+Known-working: CHECK, DEFAULT now(), typmods, FKs, comments, ordered indexes,
+plain+renamed VIEWs, GENERATED STORED cols, MATERIALIZED VIEW.
 Known orthogonal: plpgsql user funcs can't dump (plpgsql absent from pg_language).
 NOTE: do NOT Edit .ralph/fix_plan.md (driver churns it mid-loop; Edit goes stale).

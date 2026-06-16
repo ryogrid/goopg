@@ -1334,6 +1334,11 @@ type CreateMatViewStmt struct {
 	WithNoData    bool
 	IfNotExists   bool
 	ColumnAliases []string // optional (col1, col2, ...) after the name
+	// RawDef is the raw SQL text of the matview body (everything after `AS`,
+	// before any `WITH [NO] DATA`), captured verbatim so pg_get_viewdef can
+	// echo it for pg_dump (which dumps a matview's body via createViewAsClause,
+	// exactly like a plain view). Empty when the source text was unavailable.
+	RawDef string
 }
 
 func (s *CreateMatViewStmt) Pos() int  { return s.pos }

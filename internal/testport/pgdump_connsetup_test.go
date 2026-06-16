@@ -524,6 +524,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table gen: %v", err)
 	}
 
+	// Slice 60: a MATERIALIZED VIEW must survive the dump. pg_dump dumps a
+	// matview's `AS` clause via the SAME createViewAsClause -> pg_get_viewdef
+	// path as a plain view (pg_dump.c dumpTableSchema, RELKIND_MATVIEW branch:
+	// `CREATE MATERIALIZED VIEW … AS\n<body>\n  WITH NO DATA;`), and aborts the
+	// ENTIRE dump with `definition of view "v" appears to be empty (length
+	// zero)` when pg_get_viewdef returns NULL/"". goopg captured the matview body
+	// only as the SELECT AST (tbl.View, for REFRESH) but never as raw text
+	// (tbl.ViewDef stayed ""), so any matview made pg_dump fail outright. The
+	// parser now captures the raw body (CreateMatViewStmt.RawDef via
+	// captureSrcSpan) and execCreateMatView stores it on catalog.Table.ViewDef,
+	// so pg_get_viewdef echoes it exactly as it does for a plain view.
+	if err := runSQLSimple(t, c, "CREATE MATERIALIZED VIEW public.foo_mv AS SELECT id, name FROM public.foo WHERE qty > 0"); err != nil {
+		t.Fatalf("create materialized view foo_mv: %v", err)
+	}
+
 	res, err := util.RunCommand(util.CommandSpec{
 		Name:    bin,
 		Args:    []string{"--no-sync", "postgres"},
@@ -781,6 +796,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "area integer GENERATED ALWAYS AS (w * h) STORED") {
 			t.Errorf("pg_dump dropped the GENERATED clause on a stored generated column\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 60 (asserted):** a MATERIALIZED VIEW must round-trip. pg_dump
+		// dumps the matview body via the same pg_get_viewdef path as a plain view
+		// and aborts the whole dump when it returns empty; goopg now stores the
+		// raw body on catalog.Table.ViewDef (parser RawDef capture + execCreateMatView
+		// wiring), so the `CREATE MATERIALIZED VIEW … AS <body> WITH NO DATA;`
+		// statement is emitted. Regression guard for the matview ViewDef wiring.
+		matViewDefs := []string{
+			"CREATE MATERIALIZED VIEW public.foo_mv AS",
+			"SELECT id, name FROM public.foo WHERE qty > 0",
+			"WITH NO DATA;",
+		}
+		for _, sub := range matViewDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a MATERIALIZED VIEW; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
 		}
 		return
 	}

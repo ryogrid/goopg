@@ -1257,6 +1257,9 @@ func (p *parser) parseCreateMatViewTail(pos int) (Stmt, error) {
 	if _, err := p.expectKeyword(KwAs); err != nil {
 		return nil, err
 	}
+	// Remember the body's starting token so the raw source span can be captured
+	// verbatim for pg_get_viewdef (mirrors parseCreateViewTail). M0110-0001 (DU-002).
+	bodyStart := p.cur()
 	inner, err := p.parseSelect()
 	if err != nil {
 		return nil, err
@@ -1266,6 +1269,9 @@ func (p *parser) parseCreateMatViewTail(pos int) (Stmt, error) {
 		return nil, &SyntaxError{Pos: pos, Message: "materialized view body did not produce SELECT"}
 	}
 	stmt.Query = sel
+	// p.cur() now points just past the body (at WITH [NO] DATA or EOF), so the
+	// span runs from the SELECT/WITH keyword up to the optional data clause.
+	stmt.RawDef = p.captureSrcSpan(bodyStart.Pos, p.cur())
 	// Optional WITH [NO] DATA clause. "NO" is a plain identifier, not a keyword.
 	if p.acceptKeyword(KwWith) {
 		if p.acceptIdentKeyword("no") {
