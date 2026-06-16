@@ -823,6 +823,18 @@ type Domain struct {
 	Name          string
 	OID           uint32
 	Base          Type // resolved base type
+	// BaseOID is the pg_type OID of the resolved base type, recorded at CREATE
+	// DOMAIN time. Zero means "derive from Base.Name via TypeNameToOID" (the
+	// built-in-base default). It is set explicitly for a user-defined enum base,
+	// whose OID is dynamically allocated and thus not derivable from the name
+	// (TypeNameToOID would fall back to text). With it the domain's pg_type row
+	// carries the correct typbasetype and pg_dump renders `AS public.<enum>`.
+	// DU-002 slice 109.
+	BaseOID uint32
+	// BaseIsEnum records that the base type is a user-defined enum, so the
+	// domain inherits the enum's physical layout (4-byte, int-aligned, plain
+	// storage, 'E' category) rather than the text fallback. DU-002 slice 109.
+	BaseIsEnum    bool
 	NotNull       bool
 	CheckInValues []string     // allowed values from CHECK (VALUE IN ...), M0097-domain-check
 	Default       parser.Expr  // DEFAULT expression AST, nil when no DEFAULT. DU-002 slice 92.

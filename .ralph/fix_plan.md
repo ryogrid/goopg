@@ -1992,6 +1992,31 @@ object support.
         `tsvector`/`tsquery`/`"char"` base types remain (each needs session-tz
         normalization, lexeme requoting, or parser quote-state); OR move to a new
         object type (composite CREATE TYPE AS / range / enum CHECK).
+      - **PROGRESS 2026-06-17 (loop #72):** **DU-002 slice 109 LANDED** — the
+        IN-values deparse now covers a domain over a **user-defined ENUM base
+        type** (`CREATE DOMAIN public.enum_in AS public.mood CHECK (VALUE IN
+        ('sad','happy'))`), the first move off built-in base types. Real pg_dump
+        18.3 emits `CREATE DOMAIN public.enum_in AS public.mood` +
+        `CONSTRAINT enum_in_check CHECK ((VALUE = ANY (ARRAY['sad'::public.mood,
+        'happy'::public.mood])))` — schema-qualified casts (pg_dump empties
+        search_path). TWO blockers cleared: (1) `buildUserPGTypeRowForDomain`
+        derived the base OID via `TypeNameToOID(d.Base.Name)`, which returns
+        `OIDText` as a *safe fallback* for any unknown name (incl. enums), so the
+        domain dumped `AS text`; fixed by recording the resolved base OID on
+        `catalog.Domain` (new `BaseOID`/`BaseIsEnum` fields, set in
+        `execCreateDomain` via new `enumForDomainBaseType` helper) and inheriting
+        enum physical attrs (4-byte/int-align/plain/'E'); `format_type` already
+        renders an enum OID as `public.<name>` (LookupEnumByOID, slice 88). (2)
+        `domainInValuesCheckExpr` hit the same fallback, mis-rendering `::text`;
+        fixed by detecting the enum **before** the switch. Enum labels round-trip
+        verbatim. Verified byte-identical to real pg_dump 18.3
+        (`/tmp/pgcheck_du109`, cluster removed). Fixture reuses `public.mood`;
+        new domain `enum_in` + column `eni`. Gates: build OK; catalog/parser unit
+        PASS; executor domain/enum unit PASS; `TestPort_PgDumpConnectionSetup`
+        PASS (2.42s); pgbench pre-commit smoke on commit. **Next blocker:** other
+        new object types (composite `CREATE TYPE AS (...)` / range), or the
+        remaining excluded base types (timestamptz session-tz, tsvector/tsquery
+        lexeme requote, `"char"` quote-state).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

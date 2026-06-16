@@ -8660,6 +8660,14 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	// Resolve a user-defined enum base type's dynamically-allocated OID and
+	// record it on the domain. TypeNameToOID falls back to text for enum names,
+	// so without this the pg_type row would carry typbasetype=text and pg_dump
+	// would render `AS text` instead of `AS public.<enum>`. DU-002 slice 109.
+	if et, ok := enumForDomainBaseType(cat, s.BaseType); ok {
+		d.BaseOID = et.OID
+		d.BaseIsEnum = true
+	}
 	// Record the DEFAULT expression so buildUserPGTypeRowForDomain can emit
 	// typdefaultbin and pg_dump re-renders `DEFAULT <expr>`. DU-002 slice 92.
 	d.Default = s.Default
@@ -8674,7 +8682,7 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// round-trip through pg_dump too. DU-002 slice 97.
 	checkExpr := s.CheckExpr
 	if checkExpr == "" && len(s.CheckInValues) > 0 {
-		checkExpr = domainInValuesCheckExpr(s.BaseType, s.CheckInValues)
+		checkExpr = domainInValuesCheckExpr(s.BaseType, s.CheckInValues, cat)
 	}
 	cat.SetDomainCheck(d, s.CheckName, checkExpr)
 	// Write a pg_type heap row (typtype='d') so pg_dump's getTypes discovers the
@@ -8770,8 +8778,8 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 // 100 (bigint/boolean/date), 101 (real/float8/timestamp/time/uuid),
 // 102 (smallint/bytea/inet), 103 (macaddr/macaddr8/cidr), 104 (name/jsonb),
 // 105 (json), 106 (xml/oid/bit/varbit), 107 (pg_lsn/tid/xid/cid),
-// 108 (interval/money).
-func domainInValuesCheckExpr(baseType string, vals []string) string {
+// 108 (interval/money), 109 (user-defined enum base type).
+func domainInValuesCheckExpr(baseType string, vals []string, cat *catalog.InMemory) string {
 	if len(vals) == 0 {
 		return ""
 	}
@@ -8787,6 +8795,21 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 	// (ARRAY['...'::T, ...])` — the LHS is cast but the array is NOT re-cast,
 	// since each element literal already has type T. Empty means not used.
 	var lhsCast string
+	// A user-defined enum base type must be detected before the switch:
+	// TypeNameToOID falls back to OIDText for an enum name, which would
+	// mis-render the cast as `::text`. Enums have a native equality operator, so
+	// PG emits the bare string-with-cast shape with the schema-qualified enum
+	// type name, e.g. `VALUE = ANY (ARRAY['red'::public.rgb, ...])`. pg_dump sets
+	// an empty search_path so the type is qualified; all goopg enums live in the
+	// public schema (see expr.go format_type). Each label round-trips verbatim
+	// (no normalization). DU-002 slice 109.
+	if et, ok := enumForDomainBaseType(cat, baseType); ok {
+		parts := make([]string, len(vals))
+		for i, v := range vals {
+			parts[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::public." + et.Name
+		}
+		return "VALUE = ANY (ARRAY[" + strings.Join(parts, ", ") + "])"
+	}
 	switch catalog.TypeNameToOID(baseType) {
 	case catalog.OIDText:
 		castType = "text"
@@ -8912,6 +8935,22 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		return "(VALUE)::" + coerceTo + " = ANY ((" + arr + ")::" + coerceTo + "[])"
 	}
 	return "VALUE = ANY (" + arr + ")"
+}
+
+// enumForDomainBaseType resolves a domain's base-type name to a user-defined
+// enum, if one exists. The parser stores the base type as either a bare name
+// (`rgb`) or schema-qualified (`public.rgb`); enums are keyed by bare name in
+// the catalog, so we strip any leading schema component before the lookup.
+// Returns nil,false for built-in base types or when no enum matches.
+func enumForDomainBaseType(cat *catalog.InMemory, baseType string) (*catalog.EnumType, bool) {
+	if cat == nil {
+		return nil, false
+	}
+	name := baseType
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		name = name[i+1:]
+	}
+	return cat.LookupEnum(name)
 }
 
 // domainInValuesCoerced renders the per-element coercion shape used by base types

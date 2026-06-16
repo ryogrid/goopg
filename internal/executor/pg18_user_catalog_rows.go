@@ -1087,8 +1087,21 @@ func pgTypeCategoryForOID(oid uint32) byte {
 // DEFAULT expression (pg_get_expr is a pass-through in goopg) so dumpDomain
 // re-emits `DEFAULT <expr>` — NULL when the domain has no default. DU-002 slice 92.
 func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
-	baseOID := catalog.TypeNameToOID(d.Base.Name)
+	baseOID := d.BaseOID
+	if baseOID == 0 {
+		baseOID = catalog.TypeNameToOID(d.Base.Name)
+	}
 	attrs := userTypeAttrsForOID(baseOID)
+	typcategory := pgTypeCategoryForOID(baseOID)
+	if d.BaseIsEnum {
+		// Enum OIDs are dynamically allocated, so userTypeAttrsForOID /
+		// pgTypeCategoryForOID can't case on them. A domain over an enum inherits
+		// the enum's physical layout: 4-byte, int-aligned, plain storage, 'E'
+		// category (mirrors the enum-column path in buildUserPGAttributeRow).
+		// DU-002 slice 109.
+		attrs = userTypeAttrs{TypLen: 4, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
+		typcategory = 'E'
+	}
 	typmod := pgAttTypmod(baseOID, d.Base.Args)
 	typdefaultbin := NullDatum
 	if bin := d.DefaultBin(); bin != "" {
@@ -1102,7 +1115,7 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		NewIntDatum(int64(attrs.TypLen)),                      // typlen (inherit base)
 		NewBoolDatum(attrs.TypByVal),                          // typbyval (inherit base)
 		NewStringDatum("d"),                                   // typtype = 'd' (domain)
-		NewStringDatum(string(pgTypeCategoryForOID(baseOID))), // typcategory (inherit base)
+		NewStringDatum(string(typcategory)),                   // typcategory (inherit base)
 		NewBoolDatum(false),                                   // typispreferred
 		NewBoolDatum(true),                                    // typisdefined
 		NewStringDatum(","),                                   // typdelim

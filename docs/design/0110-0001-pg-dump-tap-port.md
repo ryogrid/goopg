@@ -2473,6 +2473,48 @@ constant in the session timezone), `tsvector`/`tsquery` (re-render lexemes
 single-quoted, `'cat'` → `'''cat'''`), and the internal `"char"` (OID 18,
 quote-state not tracked).
 
+### Slice 109 — domain over a user-defined ENUM base type
+
+The IN-values deparse work so far covered only built-in base types. Slice 109
+moves to a **user-defined enum base type**: `CREATE DOMAIN public.enum_in AS
+public.mood CHECK (VALUE IN ('sad','happy'))`. Enums have a native equality
+operator, so PG emits the familiar bare string-with-cast shape — but the cast is
+**schema-qualified** (pg_dump empties `search_path`, so every user type is
+qualified). Verified against real pg_dump 18.3 (`/tmp/pgcheck_du109`):
+
+```
+CREATE DOMAIN public.enum_in AS public.mood
+	CONSTRAINT enum_in_check CHECK ((VALUE = ANY (ARRAY['sad'::public.mood, 'happy'::public.mood])));
+```
+
+Two distinct blockers had to be cleared (the first was the surprise):
+
+1. **`typbasetype` resolved to `text`.** `buildUserPGTypeRowForDomain` derived the
+   base OID via `catalog.TypeNameToOID(d.Base.Name)`, which returns `OIDText` as a
+   *safe fallback* for any unrecognized name — including an enum's. So the domain's
+   `pg_type` row carried `typbasetype = text` and `dumpDomain` rendered `AS text`.
+   Fixed by recording the resolved base OID on `catalog.Domain` at CREATE time
+   (new `BaseOID`/`BaseIsEnum` fields): `execCreateDomain` looks the enum up
+   (`enumForDomainBaseType`, stripping any schema prefix) and stores `et.OID`.
+   `buildUserPGTypeRowForDomain` now prefers `d.BaseOID` and, when the base is an
+   enum, inherits the enum's physical layout (4-byte, int-aligned, plain storage,
+   `'E'` category) instead of the text fallback — mirroring the enum-*column* path
+   in `buildUserPGAttributeRow`. `format_type(typbasetype)` already resolves an
+   enum OID to `public.<name>` via `LookupEnumByOID` (slice 88), so the
+   `AS public.mood` render falls out for free once `typbasetype` is correct.
+
+2. **The CHECK cast rendered as `::text`.** Same root cause inside
+   `domainInValuesCheckExpr`: the `TypeNameToOID` fallback steered an enum name
+   into the `OIDText` switch case (`'sad'::text`). Fixed by detecting the enum
+   **before** the switch and emitting `'sad'::public.<enum>` directly. Enum labels
+   round-trip verbatim (no output normalization), so the result is byte-identical.
+
+The domain *column* reference (`eni public.enum_in`) already round-tripped
+correctly before this slice — a column resolves to the domain by name regardless
+of the base type — so only the domain definition and its constraint needed the
+fix. Still excluded base types after slice 109 are unchanged from slice 108
+(`timestamptz`, `tsvector`/`tsquery`, internal `"char"`).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
