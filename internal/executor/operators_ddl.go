@@ -707,6 +707,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				GeneratedAlways:  c.GeneratedAlways,
 				DefaultExpr:      c.DefaultExpr,
 				IdentityColumn:   c.IdentityColumn,
+				IdentityAlways:   c.IdentityAlways,
 				IdentityStart:    c.IdentityStart,
 			})
 		}
@@ -1092,12 +1093,18 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			seqStart = c.IdentityStart
 		}
 		RegisterSequence(seqName, seqStart, 1, seqMin, seqMax, false)
-		// Set the data type so information_schema.sequences shows the correct type.
+		// Set the data type so information_schema.sequences shows the correct type
+		// AND pg_dump computes the right default min/max. The base-integer aliases
+		// (int2/smallint, int8/bigint) only reach here for IDENTITY columns (serial
+		// columns use the serialN spellings); without them a `bigint GENERATED AS
+		// IDENTITY` sequence got seqtypid=int4, so pg_dump's default_maxv was
+		// INT32_MAX and it emitted a spurious `MAXVALUE 9223372036854775807` instead
+		// of `NO MAXVALUE`. Mirrors the seqMin/seqMax switch above. DU-002 slice 120.
 		var seqDataType string
 		switch colTypeLow {
-		case "smallserial", "serial2":
+		case "smallserial", "serial2", "int2", "smallint":
 			seqDataType = "smallint"
-		case "bigserial", "serial8":
+		case "bigserial", "serial8", "int8", "bigint":
 			seqDataType = "bigint"
 		default:
 			seqDataType = "integer"
@@ -1105,6 +1112,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		SetSequenceDataType(seqName, seqDataType)
 		// Record implicit ownership so DROP TABLE cascades to this sequence.
 		SetSequenceOwnedBy(seqName, strings.ToLower(s.Name.Name)+"."+strings.ToLower(c.Name))
+		// An IDENTITY column's backing sequence must be discoverable by pg_dump
+		// (relkind='S' in pg_class + its pg_depend deptype='i' row), so give it a
+		// catalog IsSequence relation just like an explicit CREATE SEQUENCE. SERIAL
+		// columns keep their prior catalog-less behavior (no pg_dump round-trip yet),
+		// so the table is only created for identity columns. M0110-0001 (slice 120).
+		if c.IdentityColumn {
+			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName)
+		}
 	}
 
 	// If PARTITION BY, annotate the table with partition metadata
@@ -6980,37 +6995,52 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	if s.OwnedBy != "" {
 		SetSequenceOwnedBy(name, s.OwnedBy)
 	}
-	// Create a virtual catalog table for SELECT * FROM seq_name.
-	// Columns: last_value int8, log_cnt int8, is_called bool. M0097-0024.
-	if _, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		seqCols := []catalog.Column{
-			{Name: "last_value", Type: catalog.Type{Name: "int8"}, Ordinal: 0},
-			{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
-			{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
-		}
-		seqTbl, err2 := o.ctx.Catalog.CreateTable(s.Name, seqCols)
-		if err2 == nil {
-			seqTbl.Virtual = true
-			seqTbl.IsSequence = true
-			seqName := name // capture for closure
-			seqTbl.VirtualRows = func() [][]string {
-				lv, lc, called, ok2 := SequenceRowData(seqName)
-				if !ok2 {
-					return nil
-				}
-				calledStr := "f"
-				if called {
-					calledStr = "t"
-				}
-				return [][]string{{
-					fmt.Sprintf("%d", lv),
-					fmt.Sprintf("%d", lc),
-					calledStr,
-				}}
-			}
-		}
-	}
+	// Create a virtual catalog table for SELECT * FROM seq_name. This also
+	// surfaces the sequence in pg_class (relkind='S') / pg_depend / pg_sequence
+	// so pg_dump can discover and dump it. M0097-0024.
+	o.createSeqCatalogTable(s.Name, name)
 	return nil
+}
+
+// createSeqCatalogTable registers the virtual catalog relation that backs
+// `SELECT * FROM <seq>` (last_value / log_cnt / is_called) and marks it
+// IsSequence so it surfaces in pg_class (relkind='S'), pg_depend, and
+// pg_sequence — the rows pg_dump's getTables reads to discover and dump the
+// sequence. `name` is the registry key passed to RegisterSequence (bare or
+// schema-qualified; SequenceRowData resolves both). Shared by the explicit
+// CREATE SEQUENCE path and the implicit IDENTITY-column registration so an
+// identity sequence is discoverable by pg_dump. M0110-0001 (DU-002 slice 120).
+func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string) {
+	if _, ok := o.ctx.Catalog.(*catalog.InMemory); !ok {
+		return
+	}
+	seqCols := []catalog.Column{
+		{Name: "last_value", Type: catalog.Type{Name: "int8"}, Ordinal: 0},
+		{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
+		{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
+	}
+	seqTbl, err2 := o.ctx.Catalog.CreateTable(seqObjName, seqCols)
+	if err2 != nil {
+		return
+	}
+	seqTbl.Virtual = true
+	seqTbl.IsSequence = true
+	seqName := name // capture for closure
+	seqTbl.VirtualRows = func() [][]string {
+		lv, lc, called, ok2 := SequenceRowData(seqName)
+		if !ok2 {
+			return nil
+		}
+		calledStr := "f"
+		if called {
+			calledStr = "t"
+		}
+		return [][]string{{
+			fmt.Sprintf("%d", lv),
+			fmt.Sprintf("%d", lc),
+			calledStr,
+		}}
+	}
 }
 
 // validateSeqOwnedBy checks OWNED BY table.column before the sequence is
@@ -8767,7 +8797,7 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 // canonical-only contract as jsonb scalars. timestamptz, tsvector and tsquery
 // remain deliberately excluded — timestamptz re-renders the stored constant in the
 // session timezone, and tsvector/tsquery re-render their lexemes with single quotes
-// ('a b'→'''a'' ''b'''; bareword 'cat'→'''cat'''). The internal "char" type
+// ('a b'→”'a” ”b”'; bareword 'cat'→”'cat”'). The internal "char" type
 // (OID 18) is also excluded: TypeNameToOID maps "char" to bpchar (OID 1042), so
 // the quoted-vs-unquoted distinction needed to emit `::"char"` is not tracked. Note jsonb byte-identity holds
 // only for already-canonical values — non-scalar jsonb (e.g. objects) is

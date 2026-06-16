@@ -2288,6 +2288,42 @@ object support.
         surface beyond single sequences (e.g. an identity column's owned sequence
         `GENERATED … AS IDENTITY` via the `deptype='i'` path, or a table+sequence+
         view dependency-ordering case).
+      - **PROGRESS 2026-06-17 (loop #84):** **DU-002 slice 120 LANDED** — IDENTITY
+        columns (`GENERATED ALWAYS|BY DEFAULT AS IDENTITY`) now dump byte-identically:
+        the backing sequence emits `ALTER TABLE … ALTER COLUMN … ADD GENERATED …
+        AS IDENTITY (SEQUENCE NAME …)`, NOT a standalone `CREATE SEQUENCE` nor an
+        `ALTER SEQUENCE … OWNED BY`. This is the first MULTI-statement pg_dump object
+        beyond a single sequence. pg_dump keys `is_identity_sequence` on the
+        `pg_depend` deptype (`'i'` INTERNAL = identity vs `'a'` AUTO = OWNED BY) and
+        reads `pg_attribute.attidentity` (`'a'` ALWAYS / `'d'` BY DEFAULT) for the
+        keyword. **Five coupled changes:** (1) `catalog.Column.IdentityAlways` now
+        stores the KIND (parser captured it; catalog dropped it), plumbed via
+        `operators_ddl.go` CREATE TABLE build; (2) `attIdentityFor(col)` emits
+        attidentity `'a'`/`'d'` (was hardcoded empty); (3) `dependVirtualRows` flips
+        the synthesized pg_depend row to deptype=`'i'` when the owning column is an
+        identity column; (4) **discovery fix** — the implicit identity sequence was
+        registered in the executor registry but had NO catalog `IsSequence` relation,
+        so pg_dump never discovered it (absent from pg_class relkind='S' AND
+        dependVirtualRows' table scan); extracted `execCreateSequence`'s virtual-table
+        creation into `createSeqCatalogTable` and now call it for identity columns
+        (SERIAL keeps prior catalog-less behavior); (5) **latent-type fix** — the
+        `seqDataType` switch mapped a `bigint` identity column to `"integer"` (only
+        matched bigserial/serial8 spellings), so seqtypid=int4 while seqmax=INT64_MAX
+        → pg_dump emitted a spurious `MAXVALUE 9223372036854775807` instead of `NO
+        MAXVALUE`; switch now mirrors the seqMin/seqMax switch (int2/smallint, int8/
+        bigint), affecting only identity columns. Fixtures `ident_tbl` (integer ALWAYS)
+        + `ident_def` (bigint BY DEFAULT) verified byte-identical to real pg_dump 18.3
+        (`/tmp/pgref_du120`), with negative guards (no CREATE SEQUENCE / OWNED BY).
+        Files: `internal/catalog/catalog.go` (IdentityAlways + deptype='i'),
+        `internal/executor/operators_ddl.go` (plumbing + createSeqCatalogTable +
+        seqDataType fix), `internal/executor/pg18_user_catalog_rows.go` (attIdentityFor),
+        `internal/testport/pgdump_connsetup_test.go` (fixtures + assertions),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 120 section). Gates:
+        gofmt OK; `go build ./internal/...` OK; catalog + executor(full) + parser unit
+        PASS; `TestPort_PgDumpConnectionSetup` PASS (2.28s); pgbench pre-commit smoke on
+        commit. **Next: slice 121** — SERIAL column pg_dump round-trip (CREATE SEQUENCE
+        + column DEFAULT nextval + ALTER SEQUENCE OWNED BY, deptype='a'), or a
+        table+sequence+view dependency-ordering case.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text
