@@ -45,6 +45,26 @@ var AdvisoryLockRowsFunc func() [][]string
 // M0100-0006b.
 var VirtualSpecLockRowsFunc func() [][]string
 
+// SeqParams carries one sequence's pg_sequence parameter row, supplied by the
+// executor (which owns the runtime sequence registry) so the catalog can build
+// pg_sequence rows without importing the executor package. M0110-0001 (DU-002
+// slice 115).
+type SeqParams struct {
+	TypeOID   uint32 // seqtypid: 21 smallint / 23 integer / 20 bigint
+	Start     int64
+	Increment int64
+	Max       int64
+	Min       int64
+	Cache     int64
+	Cycle     bool
+}
+
+// SequenceParamsFunc is set by the executor at init. Given a sequence's
+// schema-qualified name (e.g. "public.s") it returns that sequence's
+// pg_sequence parameters. nil until the executor registers it (catalog-only
+// unit tests then see an empty pg_sequence). M0110-0001 (DU-002 slice 115).
+var SequenceParamsFunc func(qualifiedName string) (SeqParams, bool)
+
 // Type is the textual type tag plus an optional typmod argument list.
 // v0 keeps types as strings so the planner doesn't need a real type
 // system; the executor casts based on Type.Name until the type system
@@ -820,9 +840,9 @@ type EnumType struct {
 
 // Domain holds one user-defined domain type. M0097-0017.
 type Domain struct {
-	Name          string
-	OID           uint32
-	Base          Type // resolved base type
+	Name string
+	OID  uint32
+	Base Type // resolved base type
 	// BaseOID is the pg_type OID of the resolved base type, recorded at CREATE
 	// DOMAIN time. Zero means "derive from Base.Name via TypeNameToOID" (the
 	// built-in-base default). It is set explicitly for a user-defined enum base,
@@ -836,8 +856,8 @@ type Domain struct {
 	// storage, 'E' category) rather than the text fallback. DU-002 slice 109.
 	BaseIsEnum    bool
 	NotNull       bool
-	CheckInValues []string     // allowed values from CHECK (VALUE IN ...), M0097-domain-check
-	Default       parser.Expr  // DEFAULT expression AST, nil when no DEFAULT. DU-002 slice 92.
+	CheckInValues []string    // allowed values from CHECK (VALUE IN ...), M0097-domain-check
+	Default       parser.Expr // DEFAULT expression AST, nil when no DEFAULT. DU-002 slice 92.
 	// CheckExpr is the raw SQL text of a generic (non-IN) domain CHECK predicate,
 	// e.g. `VALUE > 0`. CheckName is the constraint name (auto-resolved to
 	// `<domain>_check` when the user gave none). CheckOID is the pg_constraint OID
@@ -4467,7 +4487,52 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2224,
 	}
-	pgSequence.VirtualRows = func() [][]string { return nil }
+	// One row per sequence relation, keyed by the sequence's pg_class OID
+	// (seqrelid). The OID lives on the sequence's virtual catalog table
+	// (IsSequence); the per-sequence parameters come from the executor's
+	// registry via SequenceParamsFunc. pg_dump's getSequences comma-joins this
+	// with pg_get_sequence_data(seqrelid). M0110-0001 (DU-002 slice 115).
+	pgSequence.VirtualRows = func() [][]string {
+		if SequenceParamsFunc == nil {
+			return nil
+		}
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		keys := make([]string, 0, len(c.tables))
+		for k, t := range c.tables {
+			if t.IsSequence {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		rows := make([][]string, 0, len(keys))
+		for _, k := range keys {
+			t := c.tables[k]
+			schema := t.Schema
+			if schema == "" {
+				schema = "public"
+			}
+			p, ok := SequenceParamsFunc(schema + "." + t.Name)
+			if !ok {
+				continue
+			}
+			cyc := "f"
+			if p.Cycle {
+				cyc = "t"
+			}
+			rows = append(rows, []string{
+				strconv.Itoa(int(t.OID)),           // 0: seqrelid
+				strconv.Itoa(int(p.TypeOID)),       // 1: seqtypid
+				strconv.FormatInt(p.Start, 10),     // 2: seqstart
+				strconv.FormatInt(p.Increment, 10), // 3: seqincrement
+				strconv.FormatInt(p.Max, 10),       // 4: seqmax
+				strconv.FormatInt(p.Min, 10),       // 5: seqmin
+				strconv.FormatInt(p.Cache, 10),     // 6: seqcache
+				cyc,                                // 7: seqcycle
+			})
+		}
+		return rows
+	}
 	c.tables["pg_catalog.pg_sequence"] = pgSequence
 
 	// Update pg_settings to include more enable_* settings so sysviews.sql

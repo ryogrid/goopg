@@ -312,7 +312,6 @@ func SetSequenceCurrentValue(name string, val int64) bool {
 	return true
 }
 
-
 // evalNextval implements nextval(sequence_name text) → int8.
 // Advances the sequence and returns the new value. Also stores the
 // value in ctx.LastSeqVal and ctx.CurrSeqVals for currval/lastval.
@@ -538,4 +537,49 @@ func AllSequenceInfos() []SeqInfo {
 		return true
 	})
 	return out
+}
+
+// init wires the catalog's pg_sequence (singular) row builder to the executor's
+// sequence registry. The catalog owns OID resolution (seqrelid); the executor
+// owns the per-sequence parameters. M0110-0001 (DU-002 slice 115).
+func init() {
+	catalog.SequenceParamsFunc = sequenceParamsForCatalog
+}
+
+// sequenceParamsForCatalog returns the pg_sequence parameter row for the named
+// sequence, or ok=false if no such sequence is registered. Called by the
+// catalog's pg_sequence VirtualRows for each IsSequence relation.
+func sequenceParamsForCatalog(qualifiedName string) (catalog.SeqParams, bool) {
+	s := LookupSequence(qualifiedName)
+	if s == nil {
+		return catalog.SeqParams{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dt := s.dataType
+	if dt == "" {
+		dt = "bigint"
+	}
+	return catalog.SeqParams{
+		TypeOID:   seqTypeOID(dt),
+		Start:     s.start,
+		Increment: s.increment,
+		Max:       s.max,
+		Min:       s.min,
+		Cache:     1, // goopg does not track per-sequence CACHE; PG default is 1
+		Cycle:     s.cycle,
+	}, true
+}
+
+// seqTypeOID maps a sequence's declared data type to its pg_type OID, which
+// pg_dump renders via format_type(seqtypid, NULL). bigint is the default.
+func seqTypeOID(dataType string) uint32 {
+	switch dataType {
+	case "smallint", "int2":
+		return 21
+	case "integer", "int", "int4":
+		return 23
+	default: // "bigint", "int8"
+		return 20
+	}
 }

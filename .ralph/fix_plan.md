@@ -2136,6 +2136,48 @@ object support.
         TYPE AS`) base-type domain families need full catalog support (no
         `OIDInt4Range`, no `int4range`/`CREATE TYPE AS` in `TypeNameToOID`), a
         multi-loop effort. Recommend pivoting off the domain-IN-values sub-track.
+      - **PROGRESS 2026-06-17 (loop #79):** **DU-002 slice 115 LANDED** — PIVOTED
+        off the (exhausted) domain-IN-values sub-track to the **sequence-dump**
+        object surface (the "larger follow-up slice" flagged in the slice-32
+        comment). pg_dump's getSequences comma-joins `pg_catalog.pg_sequence,
+        pg_get_sequence_data(seqrelid)`; both were stubs (empty view + 0-row SRF).
+        This slice lands the **two downstream links** of that chain:
+        (a) `pg_sequence` (singular, OID 2224) VirtualRows now emits one row per
+        IsSequence catalog table — seqrelid=the sequence's pg_class OID,
+        seqtypid (21/23/20 for smallint/integer/bigint), seqstart/seqincrement/
+        seqmax/seqmin/seqcache(=1)/seqcycle. OID resolution stays in the catalog
+        (iterates `c.tables` for `IsSequence`, like pg_class); per-sequence
+        params come from the executor's registry via a new `catalog.SeqParams`
+        struct + `catalog.SequenceParamsFunc` hook (mirrors `VirtualSpecLockRows‐
+        Func`; set in an executor `init()` → `sequenceParamsForCatalog` →
+        `LookupSequence`). No catalog→executor import.
+        (b) `pg_get_sequence_data(regclass)` is now a REAL SRF (was a 0-row stub):
+        evaluates its regclass arg via `evalExprSlot` (correlated lateral via
+        `BindLateralOuter`, exactly like verify_heapam; constant arg under a nil
+        outer slot), resolves it through `verifyHeapamResolveTable`, and projects
+        the sequence's existing VirtualRows `[last_value, log_cnt, is_called]`
+        tuple to `(last_value int8, is_called bool)` — single source of truth.
+        **Deliberately NOT in this slice (→ slice 116):** surfacing the sequence
+        in pg_class with `relkind='S'` so pg_dump *discovers* it and emits
+        `CREATE SEQUENCE` + `setval`. Flipping pg_class now (while these two links
+        worked) would let pg_dump find a sequence with no downstream data and
+        ERROR; conversely these links are inert until pg_class lists the
+        sequence, so the slice-115 changes are **regression-free** (the e2e
+        `TestPort_PgDumpConnectionSetup` fixture has no sequence → pg_sequence
+        stays empty there → dump output unchanged, verified). Tested directly via
+        `TestPgGetSequenceDataPopulated` (CREATE SEQUENCE → pg_sequence row +
+        getSequences-join shape + direct regclass call + post-nextval
+        last_value/is_called). Files: `internal/catalog/catalog.go` (SeqParams +
+        hook + pg_sequence builder), `internal/executor/operators_sequence.go`
+        (init hook + seqTypeOID), `internal/executor/operators_pg_get_sequence_data.go`
+        (real op). Gates: build+gofmt OK; catalog/planner/executor(full)/initdb
+        unit PASS; `TestPort_PgDumpConnectionSetup` PASS (2.19s, unchanged);
+        pgbench pre-commit smoke on commit. **Next: slice 116** — flip pg_class to
+        emit `relkind='S'` for IsSequence tables + add a sequence to the e2e
+        fixture and assert `CREATE SEQUENCE` round-trips byte-identically vs real
+        pg_dump 18.3 (verify the correlated-lateral SRF path under a non-empty
+        pg_sequence; check pg_dump's getOwnedSeqs/pg_depend handling for a
+        standalone sequence emits no spurious `OWNED BY`).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

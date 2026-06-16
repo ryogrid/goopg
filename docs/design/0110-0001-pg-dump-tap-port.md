@@ -2667,6 +2667,58 @@ range / composite (`CREATE TYPE AS`) base-type domains need full catalog support
 for those type families (no `OIDInt4Range`, no `int4range`/`CREATE TYPE AS` in
 `TypeNameToOID`) — a structural multi-loop task.
 
+### Slice 115 — sequence-dump downstream links (`pg_sequence` + `pg_get_sequence_data`)
+
+Slice 115 **pivots off** the now-exhausted domain-`IN`-values sub-track (slices
+98–114) to a new pg_dump object surface: **sequences**. pg_dump's `getSequences`
+runs an implicit-LATERAL comma join:
+
+```sql
+SELECT seqrelid, format_type(seqtypid, NULL), seqstart, seqincrement,
+       seqmax, seqmin, seqcache, seqcycle, last_value, is_called
+FROM pg_catalog.pg_sequence, pg_get_sequence_data(seqrelid)
+ORDER BY seqrelid
+```
+
+Both sides were stubs (DU-002 slice 32 added the empty `pg_sequence` view and a
+0-row `pg_get_sequence_data` SRF so the query merely parsed/planned). This slice
+makes the **two downstream links real**:
+
+1. **`pg_sequence` (singular, OID 2224)** — `VirtualRows` now emits one row per
+   `IsSequence` catalog table. `seqrelid` is the sequence's own pg_class OID
+   (read straight off the catalog `Table`, the same way the pg_class builder
+   iterates `c.tables`); the parameters (`seqtypid` 21/23/20 for
+   smallint/integer/bigint, `seqstart`, `seqincrement`, `seqmax`, `seqmin`,
+   `seqcache`=1, `seqcycle`) come from the executor's sequence registry via a new
+   `catalog.SeqParams` struct + `catalog.SequenceParamsFunc` hook. The hook
+   mirrors the existing `VirtualSpecLockRowsFunc` seam: the catalog declares the
+   var, the executor sets it in an `init()` (`sequenceParamsForCatalog` →
+   `LookupSequence`). OID resolution stays in the catalog; parameters stay in the
+   executor (their single source of truth) — no catalog→executor import.
+
+2. **`pg_get_sequence_data(regclass)`** — promoted from a 0-row stub to a real
+   SRF. It evaluates its regclass argument with `evalExprSlot` (the correlated
+   lateral case binds the outer `pg_sequence` row via `BindLateralOuter`, exactly
+   like `verify_heapam`; a constant argument resolves under a nil outer slot),
+   resolves it through `verifyHeapamResolveTable`, and projects the sequence's
+   existing `VirtualRows` tuple `[last_value, log_cnt, is_called]` down to
+   `(last_value int8, is_called bool)` — reusing the same runtime state
+   `SELECT * FROM <seq>` reads, so there is one source of truth for the value.
+
+**Deliberately out of scope (→ slice 116):** surfacing the sequence in pg_class
+with `relkind='S'`. pg_dump's `getTables` only discovers a sequence when pg_class
+lists it; until then these two links are inert. Flipping pg_class *now* would let
+pg_dump find a sequence whose `pg_sequence`/SRF data we had not yet wired and
+ERROR — so the order is: links first (this slice, regression-free), discovery
+second (slice 116, where the e2e fixture gains a sequence and asserts a
+byte-identical `CREATE SEQUENCE` + `setval`). Because the e2e
+`TestPort_PgDumpConnectionSetup` fixture creates no sequence, `pg_sequence` stays
+empty there and the dump is unchanged (verified PASS). Direct coverage is
+`executor.TestPgGetSequenceDataPopulated`: `CREATE SEQUENCE` → one `pg_sequence`
+row with the declared params, the full `getSequences`-join shape yielding
+`last_value`=start / `is_called`=false, a direct `'s'::regclass` call, and the
+post-`nextval` flip to `is_called`=true.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
