@@ -2105,6 +2105,37 @@ object support.
         parser quote-state) each need real engine work; range/composite/domain
         base-type families need full catalog support (no `OIDInt4Range`, no
         `int4range`/`CREATE TYPE AS` in `TypeNameToOID`) — a structural task.
+      - **PROGRESS 2026-06-17 (loop #78):** **DU-002 slice 114 LANDED** — the
+        IN-values deparse now covers domains over the full-text-search types
+        **`tsvector`** / **`tsquery`**, the last two slice-108 excluded base
+        types: `CREATE DOMAIN public.tsv_in AS tsvector CHECK (VALUE IN
+        ('''a'' ''b''', '''cat'' ''dog'''))` and the tsquery twin. Both have
+        native equality operators (`tsvector_eq`/`tsquery_eq`), so PG emits the
+        **bare string-with-cast** shape: `VALUE = ANY (ARRAY['''a'' ''b'''::tsvector,
+        ...])`. They were excluded only for output normalization (the output
+        functions single-quote lexemes, sort/dedup, strip positions, normalize
+        operator spacing) — NOT deparse shape — so the canonical-only-fixture
+        pattern (jsonb scalars / interval / timestamptz) applies: the fixtures pin
+        already-canonical lexeme forms that round-trip verbatim. goopg stores the
+        IN-list literals verbatim and re-escapes them for SQL output (no output
+        function), so its deparse matches the canonical oracle byte-for-byte. The
+        doubled single quotes in the literals are SQL escaping of the lexemes' own
+        quotes — `tryParseCheckInValues` unescapes them correctly (confirmed by the
+        passing end-to-end test). Two-arm engine change in `domainInValuesCheckExpr`
+        (`case catalog.OIDTsvector` → `"tsvector"`, `case catalog.OIDTsquery` →
+        `"tsquery"`); all other plumbing already present from FTS-column work
+        (`TypeNameToOID`→3614/3615, `userTypeAttrsForOID` typlen -1/'i'-align,
+        `format_type`). Verified byte-identical to real pg_dump 18.3
+        (`pg_get_constraintdef`, `/tmp/pgcheck_du114`). Fixtures: domains
+        `tsv_in`/`tsq_in` + columns `tsvi`/`tsqi`. Gates: build OK; catalog/parser
+        unit PASS; executor domain unit PASS; `TestPort_PgDumpConnectionSetup` PASS
+        (2.23s); pgbench pre-commit smoke on commit. **The EASY base-type track is
+        now exhausted.** Only internal `"char"` remains among base types (needs
+        parser quote-state to disambiguate `::"char"` from `bpchar`); the next
+        meaningful work is STRUCTURAL — range (`int4range`) / composite (`CREATE
+        TYPE AS`) base-type domain families need full catalog support (no
+        `OIDInt4Range`, no `int4range`/`CREATE TYPE AS` in `TypeNameToOID`), a
+        multi-loop effort. Recommend pivoting off the domain-IN-values sub-track.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

@@ -8912,6 +8912,21 @@ func domainInValuesCheckExpr(baseType string, vals []string, cat *catalog.InMemo
 		// canonical space-separated form, round-tripping verbatim through
 		// `::oidvector`. DU-002 slice 113.
 		castType = "oidvector"
+	case catalog.OIDTsvector:
+		// tsvector has a native equality operator (tsvector_eq), so PG emits the
+		// bare string-with-cast shape. Its output function renders lexemes in the
+		// canonical form (single-quoted, sorted, deduplicated, positions stripped
+		// when absent), so byte-identity holds only for already-canonical inputs
+		// (e.g. the lexeme set `'a' 'b'`), which round-trip verbatim through
+		// `::tsvector` — the same canonical-only contract as jsonb scalars /
+		// interval. DU-002 slice 114.
+		castType = "tsvector"
+	case catalog.OIDTsquery:
+		// tsquery has a native equality operator (tsquery_eq); the bare
+		// string-with-cast shape applies. Its output normalizes operator spacing
+		// and single-quotes lexemes, so the fixtures pin already-canonical forms
+		// (`'a' & 'b'`) that round-trip verbatim through `::tsquery`. DU-002 slice 114.
+		castType = "tsquery"
 	case catalog.OIDInterval:
 		// interval has a native equality operator. Its output function
 		// normalizes the stored value (e.g. '2 hours'→'02:00:00'), so byte

@@ -2630,6 +2630,43 @@ names. Excluded base types remaining after slice 113 are unchanged:
 `tsvector`/`tsquery` (output functions normalize+requote lexemes) and internal
 `"char"` (quoted-ident disambiguation from `bpchar` lost in the parser).
 
+### Slice 114 — domains over `tsvector` / `tsquery`
+
+```sql
+CREATE DOMAIN public.tsv_in AS tsvector
+	CONSTRAINT tsv_in_check CHECK ((VALUE = ANY (ARRAY['''a'' ''b'''::tsvector, '''cat'' ''dog'''::tsvector])));
+CREATE DOMAIN public.tsq_in AS tsquery
+	CONSTRAINT tsq_in_check CHECK ((VALUE = ANY (ARRAY['''a'' & ''b'''::tsquery, '''cat'' | ''dog'''::tsquery])));
+```
+
+The two full-text-search types — `tsvector` (a lexeme set) and `tsquery` (a
+lexeme boolean expression) — each have a native equality operator (`tsvector_eq`
+/ `tsquery_eq`), so PG emits the **bare string-with-cast** shape, no coercion
+envelope. They were excluded through slice 113 only because their output
+functions normalize the value: `tsvector_out` single-quotes each lexeme, sorts,
+deduplicates, and strips absent positions; `tsquery_out` normalizes operator
+spacing and single-quotes lexemes. Byte-identity therefore holds **only for
+already-canonical inputs** — the exact same canonical-only contract as jsonb
+scalars (slice 104), interval / money (slice 108), and timestamptz (slice 110).
+The fixtures pin canonical values: the SQL literal `'''a'' ''b'''` carries the
+tsvector value `'a' 'b'` (a two-lexeme set, the doubled single quotes being SQL
+escaping of the lexemes' own quotes), and `'''a'' & ''b'''` the tsquery `'a' &
+'b'`. goopg stores the IN-list literals verbatim and re-quotes them for SQL
+output (no output function, no normalization), so its deparse matches the
+already-canonical oracle. Verified against real pg_dump 18.3:
+`pg_get_constraintdef` emits the literals above (`/tmp/pgcheck_du114`).
+
+The engine change is two switch arms — `case catalog.OIDTsvector: castType =
+"tsvector"` and `case catalog.OIDTsquery: castType = "tsquery"`. All other
+plumbing was already present from FTS-type column work: `TypeNameToOID` →
+`OIDTsvector` (3614) / `OIDTsquery` (3615), `userTypeAttrsForOID` (typlen -1,
+typbyval f, typalign 'i') and `format_type` both render the bare names. **The
+EASY base-type track is now exhausted** — the only base type left is internal
+`"char"` (needs parser quote-state to disambiguate `::"char"` from `bpchar`);
+range / composite (`CREATE TYPE AS`) base-type domains need full catalog support
+for those type families (no `OIDInt4Range`, no `int4range`/`CREATE TYPE AS` in
+`TypeNameToOID`) — a structural multi-loop task.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

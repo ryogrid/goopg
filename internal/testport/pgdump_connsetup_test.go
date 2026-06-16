@@ -965,7 +965,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.ovec_in AS oidvector CHECK (VALUE IN ('1 2', '3 4'))"); err != nil {
 		t.Fatalf("create domain ovec_in: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in)"); err != nil {
+	// slice 114: domains over the full-text-search types tsvector / tsquery, the
+	// last two slice-108 excluded base types. Both have native equality operators
+	// (tsvector_eq / tsquery_eq), so PG emits the bare string-with-cast shape, but
+	// only already-canonical lexeme forms round-trip byte-identically (the output
+	// functions single-quote lexemes, sort/dedup, and normalize operator spacing).
+	// The fixtures pin canonical values: the SQL literal '''a'' ''b''' carries the
+	// tsvector value `'a' 'b'`. Verified byte-identical to real pg_dump 18.3
+	// (pg_get_constraintdef, /tmp/pgcheck_du114).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.tsv_in AS tsvector CHECK (VALUE IN ('''a'' ''b''', '''cat'' ''dog'''))"); err != nil {
+		t.Fatalf("create domain tsv_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.tsq_in AS tsquery CHECK (VALUE IN ('''a'' & ''b''', '''cat'' | ''dog'''))"); err != nil {
+		t.Fatalf("create domain tsq_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1743,6 +1757,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.ovec_in AS oidvector",
 			"CONSTRAINT ovec_in_check CHECK ((VALUE = ANY (ARRAY['1 2'::oidvector, '3 4'::oidvector])))",
 			"oveci public.ovec_in",
+			// slice 114: domains over the full-text-search types tsvector /
+			// tsquery. Native equality (tsvector_eq / tsquery_eq), so the bare
+			// string-with-cast shape; already-canonical lexeme forms round-trip
+			// verbatim through `::tsvector` / `::tsquery`. The doubled single
+			// quotes are SQL escaping of the lexemes' own single quotes.
+			"CREATE DOMAIN public.tsv_in AS tsvector",
+			"CONSTRAINT tsv_in_check CHECK ((VALUE = ANY (ARRAY['''a'' ''b'''::tsvector, '''cat'' ''dog'''::tsvector])))",
+			"tsvi public.tsv_in",
+			"CREATE DOMAIN public.tsq_in AS tsquery",
+			"CONSTRAINT tsq_in_check CHECK ((VALUE = ANY (ARRAY['''a'' & ''b'''::tsquery, '''cat'' | ''dog'''::tsquery])))",
+			"tsqi public.tsq_in",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {
