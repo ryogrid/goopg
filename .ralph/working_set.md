@@ -1,34 +1,33 @@
-Task: DU-002 slice 109 — domain over a user-defined ENUM base type round-trips
+Task: DU-002 slice 110 — domain over `timestamp with time zone` round-trips
 through pg_dump (COMPLETE, committing).
 
 Files:
-- internal/catalog/catalog.go — Domain struct: new BaseOID/BaseIsEnum fields
-  (resolved base OID; enum flag).
-- internal/executor/operators_ddl.go — execCreateDomain sets BaseOID/BaseIsEnum
-  via new enumForDomainBaseType helper; domainInValuesCheckExpr detects enum
-  BEFORE the switch (TypeNameToOID falls back to OIDText for enum names).
-- internal/executor/pg18_user_catalog_rows.go — buildUserPGTypeRowForDomain uses
-  d.BaseOID and inherits enum attrs (4B/int-align/plain/'E').
-- internal/testport/pgdump_connsetup_test.go — fixture enum_in AS public.mood;
-  column eni; domainDefs assertions.
-- docs/design/0110-0001-pg-dump-tap-port.md — slice 109 section.
-- .ralph/fix_plan.md — loop #72 progress note.
+- internal/executor/operators_ddl.go — domainInValuesCheckExpr: new
+  `case catalog.OIDTimestampTZ: castType = "timestamp with time zone"`.
+- internal/testport/pgdump_connsetup_test.go — fixture domain tstz_in; column
+  tstzi; domainDefs assertions (UTC `+00` canonical literals).
+- docs/design/0110-0001-pg-dump-tap-port.md — slice 110 section.
+- .ralph/fix_plan.md — loop #73 progress note.
 
-Key symbols: domainInValuesCheckExpr, enumForDomainBaseType, Domain.BaseOID/
-BaseIsEnum, buildUserPGTypeRowForDomain, catalog.LookupEnum/LookupEnumByOID.
+Key symbols: domainInValuesCheckExpr, catalog.OIDTimestampTZ (1184),
+buildUserPGTypeRowForDomain, format_type.
 
-Findings: real pg_dump 18.3 emits `CREATE DOMAIN public.enum_in AS public.mood`
-+ `CONSTRAINT enum_in_check CHECK ((VALUE = ANY (ARRAY['sad'::public.mood,
-'happy'::public.mood])))` — schema-qualified (empty search_path). TWO blockers:
-typbasetype resolved to text (TypeNameToOID OIDText fallback) → dumped AS text;
-and the CHECK cast mis-rendered ::text (same fallback). Both fixed. Enum labels
-round-trip verbatim. The domain COLUMN ref (eni public.enum_in) already worked.
+Findings: timestamptz was a slice-108 "excluded" base type only because PG's
+output function re-renders the stored instant in the session TimeZone GUC (same
+domain under Asia/Tokyo dumps `+09` literals). goopg's deparse is TZ-independent
+(emits verbatim stored CheckInValues literals — no output fn / conversion), so
+byte-identity holds once the fixture pins the UTC `+00` canonical form and the
+oracle is run under a UTC session. One-arm engine change; all other timestamptz
+plumbing (TypeNameToOID/userTypeAttrsForOID/pgTypeCategoryForOID/format_type for
+OID 1184) was already present from timestamptz-column work.
 
 Gates run: go build ./... OK; catalog/parser unit PASS; executor domain/enum
-unit PASS; TestPort_PgDumpConnectionSetup PASS (2.42s); pgbench pre-commit smoke
+unit PASS; TestPort_PgDumpConnectionSetup PASS (2.23s); pgbench pre-commit smoke
 on commit.
 
-Next step: slice 110 candidates — composite type domain (`CREATE TYPE AS (...)`)
-or range type as a domain base; OR the remaining excluded base types
-(timestamptz session-tz render, tsvector/tsquery lexeme requote, "char"
-quote-state). ADD fixture, RUN real pg_dump, let it report the real blocker.
+Next step: slice 111 candidates — the two remaining excluded base types:
+`tsvector`/`tsquery` (need the output-function lexeme normalize+quote so stored
+literals match dumped form), or internal `"char"` (needs parser quote-state
+preservation to disambiguate from bpchar in the base-OID resolution). OR move to
+composite (`CREATE TYPE AS (...)`) / range domain base types. ADD fixture, RUN
+real pg_dump under a fixed TZ, let it report the real blocker.

@@ -2017,6 +2017,32 @@ object support.
         new object types (composite `CREATE TYPE AS (...)` / range), or the
         remaining excluded base types (timestamptz session-tz, tsvector/tsquery
         lexeme requote, `"char"` quote-state).
+      - **PROGRESS 2026-06-17 (loop #73):** **DU-002 slice 110 LANDED** — the
+        IN-values deparse now covers a domain over **`timestamp with time zone`**
+        (`CREATE DOMAIN public.tstz_in AS timestamptz CHECK (VALUE IN
+        ('2020-01-01 00:00:00+00', '2021-06-15 12:30:00+00'))`), the first of the
+        three slice-108 excluded base types to be retired. timestamptz has a
+        native equality operator, so PG emits the bare string-with-cast shape
+        (`'2020-01-01 00:00:00+00'::timestamp with time zone, ...`) — identical to
+        `timestamp` (slice 95) except the verbose cast name. The reason it was
+        excluded is the **session-TimeZone re-render**: PG's output function
+        renders the stored instant in the connection's `TimeZone` GUC, so the same
+        domain dumped under `Asia/Tokyo` emits `+09` literals. Byte-identity holds
+        only for already-canonical literals, so the fixture pins the UTC (`+00`)
+        form and the real-pg_dump oracle was run under a UTC session
+        (`PGTZ=UTC`/`SET timezone='UTC'`). goopg's deparse is **TZ-independent**
+        (it emits the verbatim stored `CheckInValues` literals — no output
+        function, no conversion), so the single engine change is one switch arm in
+        `domainInValuesCheckExpr` (`case catalog.OIDTimestampTZ: castType =
+        "timestamp with time zone"`). Everything else was already in place from
+        the timestamptz-column work (`TypeNameToOID`/`userTypeAttrsForOID`/
+        `pgTypeCategoryForOID`/`format_type` all handle OID 1184). Fixture: new
+        domain `tstz_in` + column `tstzi`. Gates: build OK; catalog/parser unit
+        PASS; executor domain/enum unit PASS; `TestPort_PgDumpConnectionSetup`
+        PASS (2.23s); pgbench pre-commit smoke on commit. **Excluded base types
+        remaining:** `tsvector`/`tsquery` (output functions normalize+quote
+        lexemes), internal `"char"` (quoted-ident disambiguation from `bpchar`
+        lost in the parser — needs a parser quote-state change).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

@@ -2515,6 +2515,40 @@ of the base type — so only the domain definition and its constraint needed the
 fix. Still excluded base types after slice 109 are unchanged from slice 108
 (`timestamptz`, `tsvector`/`tsquery`, internal `"char"`).
 
+### Slice 110 — `timestamp with time zone`
+
+Slice 110 retires the first of the slice-108 excluded base types: a domain over
+`timestamptz`. `timestamp with time zone` has a native equality operator, so PG
+emits the bare string-with-cast shape — the same one `timestamp` (slice 95) uses,
+except the cast names the verbose `timestamp with time zone` form. Verified
+against real pg_dump 18.3 run under a **UTC session** (`PGTZ=UTC`, `SET timezone
+= 'UTC'`):
+
+```
+CREATE DOMAIN public.tstz_in AS timestamp with time zone
+	CONSTRAINT tstz_in_check CHECK ((VALUE = ANY (ARRAY['2020-01-01 00:00:00+00'::timestamp with time zone, '2021-06-15 12:30:00+00'::timestamp with time zone])));
+```
+
+The reason `timestamptz` was excluded is the **session-TimeZone re-render**: PG's
+`timestamptztypoutput` renders the stored instant in the connection's `TimeZone`
+GUC, so the *same* domain dumped under `Asia/Tokyo` emits `'2020-01-01
+09:00:00+09'` instead. Byte-identity therefore holds only when the IN-list
+literal is already in the session-TZ canonical form. The fixture pins the UTC
+(`+00`) canonical form and the real-pg_dump oracle was run under a UTC session, so
+the literals round-trip verbatim.
+
+Crucially, goopg's deparse is **TZ-independent**: `domainInValuesCheckExpr` emits
+the IN-list literals exactly as they were stored in `CheckInValues` (no output
+function, no TZ conversion), so the only requirement is that the fixture supply
+already-canonical literals. The single engine change is one switch arm —
+`case catalog.OIDTimestampTZ: castType = "timestamp with time zone"`. Everything
+else (`TypeNameToOID("timestamptz")` → `OIDTimestampTZ` (1184),
+`userTypeAttrsForOID`/`pgTypeCategoryForOID` for 1184, `format_type(1184)` →
+`"timestamp with time zone"`) was already in place from the timestamptz-column
+work. Excluded base types remaining after slice 110: `tsvector`/`tsquery` (output
+functions normalize and quote lexemes) and internal `"char"` (quoted-identifier
+disambiguation from `bpchar` is lost in the parser).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

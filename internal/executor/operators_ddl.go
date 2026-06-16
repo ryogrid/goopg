@@ -8819,6 +8819,15 @@ func domainInValuesCheckExpr(baseType string, vals []string, cat *catalog.InMemo
 		castType = "date"
 	case catalog.OIDTimestamp:
 		castType = "timestamp without time zone"
+	case catalog.OIDTimestampTZ:
+		// timestamp with time zone has a native equality operator, so PG emits
+		// the bare string-with-cast shape. The output function renders the value
+		// in the session TimeZone, so byte-identity holds only for inputs already
+		// in the session-TZ canonical form; the fixtures pin UTC (`+00` offset)
+		// against a UTC-session pg_dump so the literals round-trip verbatim
+		// through `::timestamp with time zone`. goopg stores the IN-list literals
+		// verbatim (no re-render), so its deparse is TZ-independent. DU-002 slice 110.
+		castType = "timestamp with time zone"
 	case catalog.OIDTime:
 		castType = "time without time zone"
 	case catalog.OIDUUID:
