@@ -845,7 +845,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.u_in AS uuid CHECK (VALUE IN ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'))"); err != nil {
 		t.Fatalf("create domain u_in: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in)"); err != nil {
+	// DU-002 slice 102: smallint (verbatim, like integer — small literals const-fold
+	// to int2 with no cast wrapper), bytea + inet (string-with-cast; their canonical
+	// input forms `\x` hex / dotted-quad-CIDR round-trip verbatim). Verified
+	// byte-identical to real pg_dump 18.3 (/tmp/pgcheck_du102). interval is excluded
+	// — PG normalizes the stored value ('2 hours'→'02:00:00'), not byte-identical.
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.si_in AS smallint CHECK (VALUE IN (10, 20, 30))"); err != nil {
+		t.Fatalf("create domain si_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, `CREATE DOMAIN public.by_in AS bytea CHECK (VALUE IN ('\xdeadbeef', '\xcafe'))`); err != nil {
+		t.Fatalf("create domain by_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.inet_in AS inet CHECK (VALUE IN ('192.168.0.1', '10.0.0.0/8'))"); err != nil {
+		t.Fatalf("create domain inet_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1532,6 +1546,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.u_in AS uuid",
 			"CONSTRAINT u_in_check CHECK ((VALUE = ANY (ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'::uuid])))",
 			"ui public.u_in",
+			"CREATE DOMAIN public.si_in AS smallint",
+			"CONSTRAINT si_in_check CHECK ((VALUE = ANY (ARRAY[10, 20, 30])))",
+			"sii public.si_in",
+			"CREATE DOMAIN public.by_in AS bytea",
+			`CONSTRAINT by_in_check CHECK ((VALUE = ANY (ARRAY['\xdeadbeef'::bytea, '\xcafe'::bytea])))`,
+			"byi public.by_in",
+			"CREATE DOMAIN public.inet_in AS inet",
+			"CONSTRAINT inet_in_check CHECK ((VALUE = ANY (ARRAY['192.168.0.1'::inet, '10.0.0.0/8'::inet])))",
+			"ineti public.inet_in",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

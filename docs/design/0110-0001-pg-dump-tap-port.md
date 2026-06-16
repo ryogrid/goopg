@@ -2313,6 +2313,26 @@ OID on dump. `timestamptz` is deliberately excluded: PG re-renders the stored
 constant in the session timezone (`'…+00'` → `'…+09'`), so a verbatim deparse
 from the raw token text would not be byte-identical.
 
+Slice 102 extends the deparse to three more base types. No parser change was
+needed — `smallint` IN-lists are integer literals and `bytea`/`inet` IN-lists are
+string literals, both already accepted. Verified against real pg_dump 18.3
+(`/tmp/pgcheck_du102`):
+
+| base type | deparse |
+|---|---|
+| `smallint` | `VALUE = ANY (ARRAY[10, 20, 30])` |
+| `bytea` | `VALUE = ANY (ARRAY['\xdeadbeef'::bytea, '\xcafe'::bytea])` |
+| `inet` | `VALUE = ANY (ARRAY['192.168.0.1'::inet, '10.0.0.0/8'::inet])` |
+
+`smallint` joins `integer`/`numeric`/`boolean` in the verbatim branch — small
+integer constants const-fold to `int2` with no cast wrapper. `bytea`/`inet` join
+the string-with-cast shape; their canonical input forms (`\x` hex for bytea,
+dotted-quad / CIDR for inet) round-trip verbatim. `interval` is deliberately
+excluded: PG normalizes the stored value (e.g. `'2 hours'` → `'02:00:00'`), so a
+verbatim deparse from the raw token text would not be byte-identical. `json` is
+deferred separately — it has no equality operator, so the CHECK must be written
+`VALUE::text IN (...)`, a different parse shape than `VALUE IN (...)`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

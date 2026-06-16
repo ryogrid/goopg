@@ -1850,6 +1850,24 @@ object support.
         pgbench pre-commit smoke on commit. **Next blocker:** non-byte-identical base types
         (timestamptz needs constant-render-in-session-tz); or move to a new object type
         (composite CREATE TYPE AS / range).
+      - **PROGRESS 2026-06-17 (loop #64):** **DU-002 slice 102 LANDED** — the IN-values
+        deparse now covers three more base types: `smallint`, `bytea`, `inet`. NO parser
+        change was needed — `smallint` IN-lists are integer literals and `bytea`/`inet`
+        IN-lists are string literals, both already accepted by `tryParseCheckInValues`.
+        `domainInValuesCheckExpr`: `OIDInt2` joins the verbatim integer branch
+        (`VALUE = ANY (ARRAY[10, 20, 30])` — small integer constants const-fold to int2
+        with no cast wrapper, confirmed via real pg_dump); `OIDBytea`/`OIDInet` join the
+        string-with-cast branch (`'\xdeadbeef'::bytea`, `'192.168.0.1'::inet`) — their
+        canonical input forms (`\x` hex / dotted-quad-CIDR) round-trip verbatim. All
+        verified byte-identical to real pg_dump 18.3 (`/tmp/pgcheck_du102`). `interval`
+        is deliberately EXCLUDED — PG normalizes the stored value (`'2 hours'`→`'02:00:00'`),
+        not byte-identical from the raw token; `json` is deferred (no eq operator, the
+        CHECK must be `VALUE::text IN (...)`, a different parse shape). Fixtures `si_in`,
+        `by_in`, `inet_in` + columns `sii`/`byi`/`ineti` added to `public.dom`. Gates:
+        build+vet OK; parser/catalog/executor unit PASS; `TestPort_PgDumpConnectionSetup`
+        PASS (2.05s); pgbench pre-commit smoke on commit. **Next blocker:** json/jsonb
+        (different `VALUE::text IN` parse shape); or move to a new object type
+        (composite CREATE TYPE AS / range / enum).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

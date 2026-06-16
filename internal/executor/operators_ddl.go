@@ -8692,9 +8692,12 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 //	text       VALUE = ANY (ARRAY['red'::text, 'green'::text])
 //	char(n)    VALUE = ANY (ARRAY['a'::bpchar, 'b'::bpchar])
 //	varchar    (VALUE)::text = ANY ((ARRAY['a'::character varying, ...])::text[])
+//	smallint   VALUE = ANY (ARRAY[10, 20, 30])
 //	integer    VALUE = ANY (ARRAY[1, 2, 3])
 //	numeric    VALUE = ANY (ARRAY[1.5, 2.5])
 //	bigint     VALUE = ANY (ARRAY[(100)::bigint, (200)::bigint])
+//	bytea      VALUE = ANY (ARRAY['\xdeadbeef'::bytea, '\xcafe'::bytea])
+//	inet       VALUE = ANY (ARRAY['192.168.0.1'::inet, '10.0.0.0/8'::inet])
 //	real       VALUE = ANY (ARRAY[(1.5)::real, (2.5)::real])
 //	float8     VALUE = ANY (ARRAY[(1.5)::double precision, (3.0)::double precision])
 //	boolean    VALUE = ANY (ARRAY[true, false])
@@ -8716,11 +8719,17 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 // bigint/real/float8 differ: the IN-list literals parse as int4/numeric constants
 // and PG coerces each to the base type, so every element is wrapped
 // `(N)::<basetype>`. date/timestamp/time/uuid mirror the string-with-cast shape
-// (`'…'::<basetype>`). timestamptz is deliberately excluded — PG re-renders the
-// stored constant in the session timezone, so a verbatim deparse from the raw
-// token text is not byte-identical. Other non-string base types return "".
+// (`'…'::<basetype>`). bytea/inet also use the string-with-cast shape; their
+// canonical input forms (bytea `\x` hex, inet dotted-quad/CIDR) round-trip
+// verbatim. smallint joins the verbatim integer branch — small integer literals
+// const-fold to int2 with no cast wrapper. timestamptz and interval are
+// deliberately excluded — PG re-renders the stored constant (session timezone for
+// timestamptz, normalized form e.g. '2 hours'→'02:00:00' for interval), so a
+// verbatim deparse from the raw token text is not byte-identical. Other non-string
+// base types return "".
 // DU-002 slices 97 (text), 98 (char/varchar), 99 (integer/numeric),
-// 100 (bigint/boolean/date), 101 (real/float8/timestamp/time/uuid).
+// 100 (bigint/boolean/date), 101 (real/float8/timestamp/time/uuid),
+// 102 (smallint/bytea/inet).
 func domainInValuesCheckExpr(baseType string, vals []string) string {
 	if len(vals) == 0 {
 		return ""
@@ -8740,12 +8749,17 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		castType = "time without time zone"
 	case catalog.OIDUUID:
 		castType = "uuid"
+	case catalog.OIDBytea:
+		castType = "bytea"
+	case catalog.OIDInet:
+		castType = "inet"
 	case catalog.OIDVarChar:
 		castType = "character varying"
 		coerceToText = true
-	case catalog.OIDInt4, catalog.OIDNumeric, catalog.OIDBool:
-		// integer/numeric literals and boolean keyword literals already carry the
-		// base type, so PG renders them verbatim (no quotes, no cast).
+	case catalog.OIDInt2, catalog.OIDInt4, catalog.OIDNumeric, catalog.OIDBool:
+		// smallint/integer/numeric literals and boolean keyword literals already
+		// carry (or const-fold to) the base type, so PG renders them verbatim (no
+		// quotes, no cast).
 		arr := "ARRAY[" + strings.Join(vals, ", ") + "]"
 		return "VALUE = ANY (" + arr + ")"
 	case catalog.OIDInt8:
