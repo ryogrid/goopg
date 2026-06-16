@@ -312,6 +312,12 @@ type Trigger struct {
 // ForeignKey describes one referential integrity constraint stored on a
 // child table. M0096-0011.
 type ForeignKey struct {
+	// Name and OID identify the constraint in pg_constraint (contype='f').
+	// Auto-assigned at DDL time using PG's convention <table>_<col>_fkey when
+	// no explicit CONSTRAINT name is given. A zero OID / empty Name means the
+	// FK predates constraint-catalog tracking and is invisible to pg_dump. DU-002 slice 51.
+	Name              string
+	OID               uint32
 	Columns           []string // columns in THIS table
 	RefTable          string   // referenced table name (unschemed)
 	RefColumns        []string // referenced columns (empty = use parent PK)
@@ -319,6 +325,23 @@ type ForeignKey struct {
 	OnUpdate          parser.FKAction
 	Deferrable        bool
 	InitiallyDeferred bool
+}
+
+// fkActionChar maps a parsed FK referential action to the single-char code
+// PostgreSQL stores in pg_constraint.confupdtype / confdeltype. DU-002 slice 51.
+func fkActionChar(a parser.FKAction) byte {
+	switch a {
+	case parser.FKActionRestrict:
+		return 'r'
+	case parser.FKActionCascade:
+		return 'c'
+	case parser.FKActionSetNull:
+		return 'n'
+	case parser.FKActionSetDefault:
+		return 'd'
+	default: // FKActionNoAction
+		return 'a'
+	}
 }
 
 // PartitionBound describes the bounds for a single partition child.
@@ -2927,6 +2950,85 @@ func (c *InMemory) registerSystemTables() {
 					row[19] = fmt.Sprintf("{%d}", colOrd)
 				}
 				row[25] = "t" // conenforced: always true in v0
+				out = append(out, row)
+			}
+		}
+		// Emit FOREIGN KEY constraints (contype='f', PG). pg_dump's getConstraints
+		// joins `pg_constraint c ON src.tbloid = c.conrelid WHERE contype='f'` and
+		// renders each via pg_get_constraintdef(c.oid). DU-002 slice 51.
+		for _, tbl := range c.tables {
+			if tbl.Virtual || tbl.OID == 0 {
+				continue
+			}
+			colOrd := make(map[string]int, len(tbl.Columns))
+			for i, col := range tbl.Columns {
+				colOrd[strings.ToLower(col.Name)] = i + 1
+			}
+			for _, fk := range tbl.ForeignKeys {
+				if fk.Name == "" || fk.OID == 0 {
+					continue
+				}
+				// Resolve the referenced table OID + referenced column ordinals.
+				var refTbl *Table
+				for _, cand := range c.tables {
+					if cand.Virtual || cand.OID == 0 {
+						continue
+					}
+					if strings.EqualFold(cand.Name, fk.RefTable) {
+						refTbl = cand
+						break
+					}
+				}
+				var confrelid uint32
+				refColOrd := map[string]int{}
+				if refTbl != nil {
+					confrelid = refTbl.OID
+					for i, col := range refTbl.Columns {
+						refColOrd[strings.ToLower(col.Name)] = i + 1
+					}
+				}
+				var conkey, confkey []string
+				for _, cn := range fk.Columns {
+					if ord, ok := colOrd[strings.ToLower(cn)]; ok {
+						conkey = append(conkey, fmt.Sprintf("%d", ord))
+					}
+				}
+				for _, cn := range fk.RefColumns {
+					if ord, ok := refColOrd[strings.ToLower(cn)]; ok {
+						confkey = append(confkey, fmt.Sprintf("%d", ord))
+					}
+				}
+				row := make([]string, 26)
+				row[0] = fmt.Sprintf("%d", fk.OID) // oid
+				row[1] = fk.Name                   // conname
+				row[2] = "2200"                    // connamespace (public)
+				row[3] = "f"                       // contype = foreign key
+				if fk.Deferrable {
+					row[4] = "t"
+				} else {
+					row[4] = "f" // condeferrable
+				}
+				if fk.InitiallyDeferred {
+					row[5] = "t"
+				} else {
+					row[5] = "f" // condeferred
+				}
+				row[6] = "t"                        // convalidated
+				row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
+				row[8] = "0"                        // contypid
+				row[9] = "0"                        // conindid (unique idx on ref tbl; unused by deparse)
+				row[10] = "0"                       // conparentid (0 → pg_dump WHERE conparentid=0 keeps it)
+				row[11] = fmt.Sprintf("%d", confrelid)
+				row[12] = string(fkActionChar(fk.OnUpdate)) // confupdtype
+				row[13] = string(fkActionChar(fk.OnDelete)) // confdeltype
+				row[14] = "s"                               // confmatchtype = MATCH SIMPLE
+				row[15] = "t"                               // conislocal
+				row[16] = "0"                               // coninhcount
+				row[17] = "f"                               // connoinherit
+				row[18] = "f"                               // conperiod
+				row[19] = "{" + strings.Join(conkey, ",") + "}"
+				row[20] = "{" + strings.Join(confkey, ",") + "}"
+				row[25] = "t" // conenforced
 				out = append(out, row)
 			}
 		}

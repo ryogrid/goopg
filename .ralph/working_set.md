@@ -1,39 +1,50 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 48 COMPLETE
-(committed this loop). NEXT loop starts on slice 49. NOTHING in flight after commit.
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 51 COMPLETE
+(committing this loop). NEXT loop starts on slice 52.
+NOTHING in flight after commit.
 
-=== DONE (loop #3) — DU-002 slice 48 (column type-modifier fidelity / atttypmod) ===
-After slice 47 the plain-table dump was byte-identical to upstream. Enriched the
-fixture with `amount numeric(10,2)` + `code character varying(8)` and found the
-next gap: both dumped as their BARE base type (numeric, character varying).
-Root cause: buildUserPGAttributeRow (internal/executor/pg18_user_catalog_rows.go)
-hardcoded atttypmod=-1, discarding catalog.Type.Args. pg_dump getTableAttrs reads
-format_type(atttypid, atttypmod), so -1 → unmodified type.
-Fix: new pgAttTypmod(typOID, args) computes PG-canonical atttypmod (numeric:
-((p<<16)|s)+VARHDRSZ; varchar/char: n+VARHDRSZ; else -1), wired into the
-atttypmod cell. Decode side: formatTypeOID (internal/executor/expr.go) already
-decoded char/varchar length but returned bare numeric → added the numeric branch
-(typmod>=4 → numeric(p,s)), mirroring numerictypmodout. Verified empirically:
-atttypmod 655366 for numeric(10,2); dump now emits `amount numeric(10,2)` and
-`code character varying(8)`.
-Files: internal/executor/pg18_user_catalog_rows.go (pgAttTypmod + wire),
-internal/executor/expr.go (formatTypeOID numeric decode),
-internal/executor/pg18_user_catalog_rows_test.go (TestUserPGAttributeTypmod),
-internal/testport/pgdump_connsetup_test.go (richer fixture + assertions + slice-48
-header), docs/design/0110-0001-pg-dump-tap-port.md (slice 48 section).
-Gates: gofmt/build clean; executor PASS; catalog+planner PASS;
-TestPort_PgDumpConnectionSetup PASS (asserts numeric(10,2)+varchar(8) round-trip);
-TestPort_PgDump* + Psql001Basic PASS; ralph-state-guard OK. pgbench CI-parity
-smoke runs in the pre-commit hook.
+=== DONE (loop #6) — DU-002 slice 51 (FOREIGN KEY constraints) ===
+Enriched the fixture: added `parent_id integer REFERENCES public.foo(id)` self-FK
+and a table-level `UNIQUE (code)`. UNIQUE already dumped (index-backed path), but
+the FK was silently dropped.
+ROOT CAUSE: catalog.ForeignKey had no Name/OID, so pg_constraint emitted no
+contype='f' row; pg_dump's getConstraints (`JOIN pg_constraint c ON
+src.tbloid=c.conrelid WHERE contype='f' AND conparentid=0`, pg_dump.c:8172) found
+nothing. Even if it had, pg_get_constraintdef handled only index-backed constraints.
+FIX (3 parts, sibling paths kept in sync):
+ (1) catalog.ForeignKey += Name+OID; auto-named <table>_<col>_fkey at DDL time in
+     BOTH the CREATE TABLE inline-REFERENCES path (operators_ddl.go ~line 991) and
+     the ALTER TABLE ADD FOREIGN KEY path (~line 3349, honours explicit name).
+ (2) pg_constraint.VirtualRows (catalog.go ~line 2960) emits the contype='f' row:
+     conkey/confkey ordinals, confrelid=ref table OID, confupdtype/confdeltype via
+     new fkActionChar helper, confmatchtype='s', conparentid=0. Also added
+     fkActionChar helper near the ForeignKey type.
+ (3) pg_get_constraintdef (expr.go ~line 6395) gained an FK branch +
+     buildForeignKeyDefString/fkActionClause (expr.go ~line 4189) mirroring
+     ruleutils.c: `FOREIGN KEY (cols) REFERENCES public.tbl(refcols)` fully
+     schema-qualified (search_path=''), ON UPDATE/ON DELETE/DEFERRABLE only when
+     non-default. NOTE: no space before the paren — `public.foo(id)` not `foo (id)`.
+Files: internal/catalog/catalog.go, internal/executor/expr.go,
+internal/executor/operators_ddl.go, internal/executor/operators_fk_constraintdef_test.go
+(new unit test), internal/testport/pgdump_connsetup_test.go (fixture + assertions),
+docs/design/0110-0001-pg-dump-tap-port.md (slice 51 section + guard list).
+Gates: gofmt/vet clean; build clean; catalog+executor+initdb+parser+server+planner
+PASS; TestForeignKeySurfacesInPgConstraint PASS; TestPort_PgDumpConnectionSetup PASS;
+pgbench CI-parity smoke runs in pre-commit hook.
 
-=== NEXT STEP — DU-002 slice 49 ===
-Re-run TestPort_PgDumpConnectionSetup with an even richer fixture to find the next
-schema-fidelity gap. Candidates to probe: PRIMARY KEY / UNIQUE constraints
-(ALTER TABLE ADD CONSTRAINT emission), CHECK constraints, a real reloptions table
-(WITH (fillfactor=70) — now that the empty-array case is fixed, a real reloption
-should pass through), a second schema, a SEQUENCE/serial column, foreign keys.
-RUN the TAP test first — it finds the REAL next blocker. Known orthogonal
-pre-existing: plpgsql user functions can't be dumped (plpgsql absent from
-pg_language → prolang=0 → dumpFunc join 0 rows).
+=== NEXT STEP — DU-002 slice 52 ===
+Enrich the fixture further to find the next REAL pg_dump gap. Candidates:
+  - Multi-column FK / FK with ON DELETE CASCADE (exercise the action clauses just
+    added — verify ON DELETE CASCADE round-trips, currently untested).
+  - SEQUENCE / serial column — sequences skipped from pg_class virtual view
+    (Virtual && no View), so getTables never sees relkind='S'; larger slice.
+  - a second user schema (CREATE SCHEMA s; table in it).
+  - real reloptions WITH (fillfactor=70).
+  - COMMENT ON TABLE/COLUMN round-trip.
+Known orthogonal pre-existing: plpgsql user functions can't be dumped (plpgsql
+absent from pg_language → prolang=0 → dumpFunc join 0 rows).
 
 Other open (larger, untouched): M0110-0003 AC-003 003_check feature tiers;
 M0110-0002 002_save_fullpage; M0095-0003 recvlogical; M0117-0006/7/8 (CLOG).
+
+NOTE: do NOT Edit .ralph/fix_plan.md (driver churns it mid-loop; Edit goes stale).
+Record progress here + deferral_ledger only.

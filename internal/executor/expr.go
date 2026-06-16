@@ -4186,6 +4186,75 @@ func buildConstraintDefString(idx *catalog.Index) string {
 	return def
 }
 
+// buildForeignKeyDefString builds the pg_get_constraintdef text for a FOREIGN
+// KEY constraint, mirroring ruleutils.c pg_get_constraintdef_worker. pg_dump
+// runs with search_path=” so the referenced relation is fully schema-qualified
+// (`REFERENCES public.foo(id)`). Referential actions other than NO ACTION and a
+// DEFERRABLE clause are appended; MATCH SIMPLE (the default) is omitted, as PG
+// does. DU-002 slice 51.
+func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) string {
+	var refTbl *catalog.Table
+	for _, t := range im.AllTables() {
+		if t.Virtual || t.OID == 0 {
+			continue
+		}
+		if strings.EqualFold(t.Name, fk.RefTable) {
+			refTbl = t
+			break
+		}
+	}
+	refSchema := "public"
+	refName := fk.RefTable
+	refCols := fk.RefColumns
+	if refTbl != nil {
+		if refTbl.Schema != "" {
+			refSchema = refTbl.Schema
+		}
+		refName = refTbl.Name
+		if len(refCols) == 0 {
+			// Default to the referenced table's primary-key columns.
+			for _, idx := range im.IndexesOnTable(refTbl) {
+				if idx.Primary {
+					refCols = idx.Columns
+					break
+				}
+			}
+		}
+	}
+	def := "FOREIGN KEY (" + strings.Join(fk.Columns, ", ") + ") REFERENCES " +
+		refSchema + "." + refName + "(" + strings.Join(refCols, ", ") + ")"
+	if act := fkActionClause(fk.OnUpdate); act != "" {
+		def += " ON UPDATE " + act
+	}
+	if act := fkActionClause(fk.OnDelete); act != "" {
+		def += " ON DELETE " + act
+	}
+	if fk.Deferrable {
+		def += " DEFERRABLE"
+		if fk.InitiallyDeferred {
+			def += " INITIALLY DEFERRED"
+		}
+	}
+	return def
+}
+
+// fkActionClause renders the SQL keyword for a non-default FK referential
+// action; NO ACTION (the default) returns "" so the clause is omitted. DU-002 slice 51.
+func fkActionClause(a parser.FKAction) string {
+	switch a {
+	case parser.FKActionRestrict:
+		return "RESTRICT"
+	case parser.FKActionCascade:
+		return "CASCADE"
+	case parser.FKActionSetNull:
+		return "SET NULL"
+	case parser.FKActionSetDefault:
+		return "SET DEFAULT"
+	default:
+		return ""
+	}
+}
+
 // evalMakeDate implements make_date(year, month, day) → date. M0097-0004.
 func evalMakeDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 3 {
@@ -6403,6 +6472,18 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 						def += " NO INHERIT"
 					}
 					return NewStringDatum(def), nil
+				}
+			}
+			// FOREIGN KEY constraints (contype='f'). pg_dump's getConstraints
+			// renders each FK via pg_get_constraintdef; with search_path='' the
+			// deparser fully schema-qualifies the referenced relation
+			// (`REFERENCES public.foo(id)`). DU-002 slice 51.
+			for _, tbl := range im.AllTables() {
+				for _, fk := range tbl.ForeignKeys {
+					if fk.OID == 0 || fk.OID != targetOID {
+						continue
+					}
+					return NewStringDatum(buildForeignKeyDefString(im, fk)), nil
 				}
 			}
 		}

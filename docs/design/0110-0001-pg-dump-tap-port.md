@@ -1089,6 +1089,35 @@ fixed one logical group per loop:
     suppressed by pg_dump's `ChooseConstraintName` match. Guard: the fixture
     asserts `id integer NOT NULL` in the dumped column list.
 
+  - **Slice 51 — FOREIGN KEY constraints (`contype='f'` + `pg_get_constraintdef`)
+    (`internal/catalog/catalog.go`, `internal/executor/expr.go`,
+    `internal/executor/operators_ddl.go`).** A column-level `REFERENCES` FK was
+    silently dropped from the dump while a sibling UNIQUE constraint dumped fine
+    (UNIQUE/PK/EXCLUDE go through the index-backed constraint path). pg_dump's
+    `getConstraints` joins `pg_constraint c ON src.tbloid = c.conrelid WHERE
+    contype = 'f' AND conparentid = 0` and renders each via
+    `pg_get_constraintdef(c.oid)` (`src/bin/pg_dump/pg_dump.c:8172`). goopg's
+    `catalog.ForeignKey` carried neither a name nor an OID, so `pg_constraint`
+    emitted no contype='f' row and the join returned nothing; even had it, the
+    deparser handled only index-backed constraints. Fix: (1) `catalog.ForeignKey`
+    gained `Name`+`OID`, auto-assigned at DDL time using PG's
+    `<table>_<col>_fkey` convention — both the CREATE TABLE inline-`REFERENCES`
+    path and the `ALTER TABLE … ADD FOREIGN KEY` path (the latter honours an
+    explicit `CONSTRAINT name`); (2) `pg_constraint.VirtualRows` emits the
+    contype='f' row — `conkey`/`confkey` from the referencing/referenced column
+    ordinals, `confrelid` = the referenced table OID, `confupdtype`/`confdeltype`
+    from the FK action (`fkActionChar`), `confmatchtype='s'` (MATCH SIMPLE),
+    `conparentid=0` so pg_dump's filter keeps it; (3) `pg_get_constraintdef`
+    gained an FK branch (`buildForeignKeyDefString`) mirroring ruleutils.c
+    `pg_get_constraintdef_worker` — `FOREIGN KEY (cols) REFERENCES
+    public.reltbl(refcols)` (fully schema-qualified because pg_dump runs with
+    `search_path=''`), appending `ON UPDATE`/`ON DELETE` and `DEFERRABLE` clauses
+    only when non-default and omitting MATCH SIMPLE, exactly as PG does. The
+    fixture's self-FK `parent_id integer REFERENCES public.foo(id)` now dumps as
+    `ADD CONSTRAINT foo_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES
+    public.foo(id)`. Guards: the integration fixture plus the unit test
+    `executor.TestForeignKeySurfacesInPgConstraint`.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
@@ -1098,8 +1127,11 @@ fixture so it also asserts the type modifiers `amount numeric(10,2)` and `code
 character varying(8)` round-trip; slice 49 further asserts the PRIMARY KEY
 `ADD CONSTRAINT` and the auto-named `CHECK ((qty >= 0))` constraint survive the
 dump; slice 50 asserts the PK column's implicit `NOT NULL` (`id integer NOT
-NULL`) survives the dump. Unit guards:
+NULL`) survives the dump; slice 51 asserts a `FOREIGN KEY` constraint and a
+`UNIQUE` constraint both round-trip (`foo_parent_id_fkey FOREIGN KEY (parent_id)
+REFERENCES public.foo(id)`, `foo_code_key UNIQUE (code)`). Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
+`executor.TestForeignKeySurfacesInPgConstraint`,
 `config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`.
 

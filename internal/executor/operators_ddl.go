@@ -990,7 +990,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Register FK constraints from inline REFERENCES clauses. M0096-0011.
 	for _, c := range s.Columns {
 		if c.RefTable.Name != "" {
+			// PG auto-names a single-column inline FK <table>_<col>_fkey and
+			// records it in pg_constraint (contype='f'); pg_dump's getConstraints
+			// reads that row and renders the ALTER TABLE ADD CONSTRAINT via
+			// pg_get_constraintdef. DU-002 slice 51.
+			fkName := tbl.Name + "_" + c.Name + "_fkey"
 			fk := catalog.ForeignKey{
+				Name:              fkName,
+				OID:               o.allocConstraintOID(fkName),
 				Columns:           []string{c.Name},
 				RefTable:          c.RefTable.Name,
 				RefColumns:        c.RefColumns,
@@ -3339,7 +3346,20 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable); !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
 			}
+			// Surface the FK in pg_constraint (contype='f') so pg_dump can
+			// re-emit it: honour an explicit CONSTRAINT name, else PG's
+			// <table>_<firstcol>_fkey auto-name. DU-002 slice 51.
+			fkName := act.ConstraintName
+			if fkName == "" {
+				firstCol := ""
+				if len(act.Columns) > 0 {
+					firstCol = act.Columns[0]
+				}
+				fkName = tbl.Name + "_" + firstCol + "_fkey"
+			}
 			fk := catalog.ForeignKey{
+				Name:       fkName,
+				OID:        o.allocConstraintOID(fkName),
 				Columns:    append([]string(nil), act.Columns...),
 				RefTable:   act.RefTable.Name,
 				RefColumns: append([]string(nil), act.RefColumns...),

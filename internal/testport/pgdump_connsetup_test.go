@@ -288,6 +288,24 @@ package testport
 // the same NOT NULL constraint on the ALTER TABLE ADD PRIMARY KEY sibling path
 // (which also sets attnotnull). pg_dump now emits `id integer NOT NULL`; the
 // auto-default name is suppressed by pg_dump's ChooseConstraintName match.
+// Slice 51 restored FOREIGN KEY constraints in the dump. A UNIQUE constraint
+// already dumped (the index-backed constraint path covers UNIQUE/PK/EXCLUDE),
+// but FKs were silently dropped: goopg's catalog.ForeignKey carried no name/OID,
+// so pg_constraint emitted no contype='f' row and pg_dump's getConstraints
+// (`JOIN pg_constraint c ON src.tbloid=c.conrelid WHERE contype='f'`) found
+// nothing. Fix: (1) catalog.ForeignKey gained Name+OID, auto-assigned at DDL
+// time using PG's <table>_<col>_fkey convention (CREATE TABLE inline REFERENCES
+// + ALTER TABLE ADD FOREIGN KEY paths); (2) pg_constraint.VirtualRows emits the
+// contype='f' row (conkey/confkey ordinals, confrelid = referenced table OID,
+// confupdtype/confdeltype from the FK action, confmatchtype='s'); (3)
+// pg_get_constraintdef gained an FK branch (buildForeignKeyDefString) that
+// mirrors ruleutils.c — `FOREIGN KEY (cols) REFERENCES public.reltbl(refcols)`
+// (fully schema-qualified since pg_dump runs with search_path=''), with
+// ON UPDATE/ON DELETE and DEFERRABLE clauses appended only when non-default.
+// The fixture's `parent_id integer REFERENCES public.foo(id)` self-FK now dumps
+// as `ADD CONSTRAINT foo_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES
+// public.foo(id)`; UNIQUE (code) → `foo_code_key UNIQUE (code)` guards the
+// already-working index-backed path.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
@@ -319,7 +337,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
 	if err := runSQLSimple(t, c, "CREATE TABLE public.foo (id integer PRIMARY KEY, name text, "+
-		"amount numeric(10,2), code character varying(8), qty integer DEFAULT 0 CHECK (qty >= 0))"); err != nil {
+		"amount numeric(10,2), code character varying(8), qty integer DEFAULT 0 CHECK (qty >= 0), "+
+		"parent_id integer REFERENCES public.foo(id), "+
+		"UNIQUE (code))"); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
 
@@ -430,9 +450,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// renders `CHECK ((expr))` for contype='c' constraints. Assert the
 		// auto-named column CHECK survives the dump round-trip — the regression
 		// guard for the fix. (The PRIMARY KEY ALTER-TABLE path already worked.)
+		// **Slice 51 closed (asserted):** a FOREIGN KEY was silently dropped —
+		// catalog.ForeignKey had no name/OID, so pg_constraint emitted no
+		// contype='f' row and pg_dump's getConstraints found nothing. The FK now
+		// gets a name+OID at DDL time, surfaces as a contype='f' pg_constraint
+		// row, and pg_get_constraintdef renders the schema-qualified definition.
+		// (UNIQUE already worked via the index-backed constraint path.)
 		check := []string{
 			"ADD CONSTRAINT foo_pkey PRIMARY KEY (id)",
 			"CONSTRAINT foo_qty_check CHECK ((qty >= 0))",
+			"ADD CONSTRAINT foo_code_key UNIQUE (code)",
+			"ADD CONSTRAINT foo_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.foo(id)",
 		}
 		for _, sub := range check {
 			if !strings.Contains(res.Stdout, sub) {
