@@ -707,7 +707,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.label AS text DEFAULT 'n/a'"); err != nil {
 		t.Fatalf("create domain label: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label)"); err != nil {
+	// Slice 94: a DOMAIN over `varchar` (character varying) with a STRING DEFAULT.
+	// Like slice 93's text domain, pg_get_expr decorates the coerced string Const
+	// with its target type — but for varchar the cast name is the MULTI-WORD
+	// canonical spelling `character varying`, not the user-typed `varchar` alias.
+	// Real pg_dump 18.3 emits `CREATE DOMAIN public.vcdef AS character varying
+	// DEFAULT 'na'::character varying;` (verified). goopg's DefaultBin now maps the
+	// base name through domainConstCastTypeName so the cast renders the format_type
+	// spelling instead of the bare alias. A bare `varchar` (no length) isolates the
+	// cast-name concern from base-type typmod capture (which the CREATE DOMAIN
+	// parser still discards — a separate gap).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.vcdef AS varchar DEFAULT 'na'"); err != nil {
+		t.Fatalf("create domain vcdef: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1308,6 +1321,11 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// pg_get_expr `::text` cast decoration.
 			"CREATE DOMAIN public.label AS text DEFAULT 'n/a'::text;",
 			"lbl public.label",
+			// Slice 94: a varchar DOMAIN with a string DEFAULT round-trips with the
+			// MULTI-WORD `::character varying` cast (format_type spelling, not the
+			// `varchar` alias).
+			"CREATE DOMAIN public.vcdef AS character varying DEFAULT 'na'::character varying;",
+			"vc public.vcdef",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

@@ -845,9 +845,28 @@ func (d *Domain) DefaultBin() string {
 	// round-trips as `DEFAULT 'foo'::text`. Integer defaults (slice 92) stay
 	// bare. DU-002 slice 93.
 	if _, ok := d.Default.(*parser.StringConst); ok && d.Base.Name != "" {
-		s += "::" + d.Base.Name
+		s += "::" + domainConstCastTypeName(d.Base.Name)
 	}
 	return s
+}
+
+// domainConstCastTypeName returns the type name PG's get_const_expr appends to a
+// coerced string Const defaulting a domain — i.e. format_type(basetype, -1), the
+// base type's canonical spelling WITHOUT a typmod. Most base names already match
+// that spelling (text→text, uuid→uuid); the two that differ are the
+// character-string types, whose user-facing aliases (varchar, char) deparse to
+// their format_type names. Note char/bpchar with typmod -1 renders as "bpchar"
+// (the internal name), not "character" — matching real pg_dump 18.3
+// (`DEFAULT 'ab'::bpchar`). DU-002 slice 94.
+func domainConstCastTypeName(baseName string) string {
+	switch baseName {
+	case "varchar", "character varying":
+		return "character varying"
+	case "char", "bpchar", "character":
+		return "bpchar"
+	default:
+		return baseName
+	}
 }
 
 // CompositeField describes one field in a user-defined composite type.

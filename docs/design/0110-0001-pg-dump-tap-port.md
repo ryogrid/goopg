@@ -2154,6 +2154,23 @@ now-legitimate substring `AS text DEFAULT` to the precise empty-clause forms
 regression for the no-default `zipcode`/`zipcode_nn` domains while admitting the
 new text default.
 
+Slice 94 extends the string-default decoration to a **multi-word** base type:
+a DOMAIN over `varchar` (`CREATE DOMAIN public.vcdef AS varchar DEFAULT 'na'`)
+round-trips as `CREATE DOMAIN public.vcdef AS character varying DEFAULT
+'na'::character varying;`. Slice 93 appended the bare `d.Base.Name` (`text`), but
+the user-typed `varchar`/`char` aliases differ from the canonical spelling
+`get_const_expr` uses, which is `format_type(consttype, -1)` — `character
+varying` for varchar, and `bpchar` (the internal name, *not* `character`) for
+char/bpchar, verified against real pg_dump 18.3 (`DEFAULT 'ab'::bpchar`). A new
+`domainConstCastTypeName` helper maps the base name to that spelling (falling
+through unchanged for `text`, `uuid`, … whose alias already equals the
+format_type name), and `Domain.DefaultBin()` routes the cast suffix through it.
+The fixture uses a **bare** `varchar` (no length) deliberately: the CREATE DOMAIN
+parser still discards the `(n)` type modifier (`stmt.BaseType` keeps only the
+name), so a `varchar(20)` domain would lose its `(20)` in both the base-type
+render and the cast — base-type typmod capture for domains is a separate,
+larger gap left for a future slice.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
