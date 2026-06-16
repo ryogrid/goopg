@@ -2416,6 +2416,35 @@ object support.
         case (view depends on table; verify topological emission ORDER, not just
         presence), or an explicit-START / non-default serial sequence (serial added
         via ALTER TABLE ADD COLUMN, or a serial with a manually-bumped value).
+      - **PROGRESS 2026-06-17 (loop #88):** **DU-002 slice 124 LANDED** — an
+        ADVANCED sequence dumps its setval with `is_called=TRUE`. Every prior
+        sequence slice (115–123) dumps `setval(name, start, false)` — the
+        never-called state; this is the FIRST slice over the called branch. After
+        `setval('public.bumped_seq', 42, true)` the process-global runtime state
+        (`seqRegistry`) is `current=42 / called=true`, so `SequenceRowData` returns
+        `last_value=42 / is_called=true`, the `pg_get_sequence_data` SRF projects
+        `(42, true)`, and pg_dump emits `SELECT pg_catalog.setval('public.bumped_seq',
+        42, true)`. The `true` is load-bearing (restore continues at 43, not 1); a
+        regression that hard-wired is_called=false would pass every never-called
+        slice yet silently corrupt sequence continuity. **No production code change**
+        — `SequenceRowData`'s called=true branch already returns `current` as
+        `last_value`; the slice is the regression guard. The setval state is observed
+        by the *separate* pg_dump connection because the registry is process-global.
+        Verified byte-identical vs real pg_dump 18.3 (reference `/tmp/du124_pgdata`),
+        with the exact `(42, true)` positive assert + three negative guards rejecting
+        the wrong forms (`(1, false)` never-called, `(42, false)` ignored-flag,
+        `(1, true)` ignored-value). Files: `internal/testport/pgdump_connsetup_test.go`
+        (bumped_seq fixture + setval + asserts), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 124 section). Gates: gofmt OK; `go build ./...` OK;
+        `TestPort_PgDumpConnectionSetup` PASS (1.93s); pgbench pre-commit smoke on
+        commit. **Discovered (→ slice 125):** `SequenceRowData`'s called=FALSE branch
+        returns `s.start` not `current+increment`, so `setval(seq, N, false)` with
+        `N != start` (e.g. `START WITH 5; setval(.., 30, false)`) diverges from real
+        pg_dump (goopg would emit 5, PG emits 30); fix touches the shared
+        `pg_sequences` view + `SELECT * FROM <seq>` sibling paths → its own task.
+        **Next: slice 125** — fix the called=false non-default-value divergence
+        above, OR a table+VIEW dependency-ordering case (verify topological emission
+        ORDER).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

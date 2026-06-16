@@ -3175,6 +3175,49 @@ matched `ser_tbl`'s legitimate serial default (its column is also named `id`), s
 the negatives are scoped with the `public.mix` table prefix. This locks the
 identity/serial deptype split against future regressions in `dependVirtualRows`.
 
+### Slice 124 — advanced sequence (`is_called=true` setval branch)
+
+Every prior sequence slice (115–123) dumps its `setval` as `(name, start, false)`
+— the **never-called** state. Slice 124 is the first over the **called** branch.
+After `setval('public.bumped_seq', 42, true)`, the sequence's process-global
+runtime state (`seqRegistry` in `operators_sequence.go`) is `current=42 /
+called=true`, so `SequenceRowData` returns `last_value=42 / is_called=true`, the
+`pg_get_sequence_data` SRF projects `(42, true)`, and pg_dump's `getSequences`
+emits:
+
+```sql
+CREATE SEQUENCE public.bumped_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+-- data section:
+SELECT pg_catalog.setval('public.bumped_seq', 42, true);
+```
+
+The bump lives only in the data-section `setval` (the `CREATE SEQUENCE` block is
+the plain default). The `true` is load-bearing: a restore replays it so the next
+`nextval` continues at 43 instead of restarting at 1 — a regression that
+hard-wired `is_called=false` would silently corrupt sequence continuity yet pass
+every never-called slice. The setval state is observed by the *separate* pg_dump
+connection because the registry is process-global, not session-local. **No
+production code change** — `SequenceRowData`'s `called=true` branch already
+returns `current` as `last_value`; this slice is the regression guard. Asserts:
+the exact `(42, true)` form is present; negatives reject the three wrong forms
+(`(1, false)` never-called, `(42, false)` ignored-called-flag, `(1, true)`
+ignored-value).
+
+**Discovered (deferred → slice 125 candidate):** `SequenceRowData`'s `called=false`
+branch returns `s.start` rather than the actual `current + increment`. For a
+sequence whose value was set with `setval(seq, N, false)` where `N != start`
+(e.g. `START WITH 5` then `setval(.., 30, false)`), real pg_dump 18.3 emits
+`setval('..', 30, false)` but goopg would emit `setval('..', 5, false)`. This
+slice deliberately avoids that case to stay byte-identical; the fix (return
+`current + increment` when not called, which equals `start` for a fresh sequence
+and `N` after `setval(.., N, false)`) touches the shared `pg_sequences` view and
+`SELECT * FROM <seq>` sibling paths and is therefore its own task.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

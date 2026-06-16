@@ -613,6 +613,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create sequence desc_bound_seq: %v", err)
 	}
 
+	// Slice 124: an ADVANCED sequence (is_called=true). Every prior sequence slice
+	// dumps its setval as `(name, N, false)` — the never-called state, where
+	// pg_get_sequence_data reports last_value=seqstart and is_called=false. This is
+	// the FIRST slice to exercise the is_called=TRUE branch: after `setval(seq, 42,
+	// true)` the sequence's runtime state is current=42 / called=true, so
+	// SequenceRowData returns last_value=42 / is_called=true and the SRF projects
+	// (42, true). pg_dump's getSequences then emits
+	// `SELECT pg_catalog.setval('public.bumped_seq', 42, true)` — the value+true
+	// form a restore must replay so the next nextval continues at 43 instead of
+	// restarting at 1. The setval state lives in the process-global seqRegistry
+	// (operators_sequence.go), so the separate pg_dump connection observes the bump.
+	// Regression guard for the advanced-sequence (called) dump path; a regression
+	// that hard-wired is_called=false (as the never-called slices would tolerate)
+	// would silently corrupt restored sequence continuity.
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.bumped_seq"); err != nil {
+		t.Fatalf("create sequence bumped_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "SELECT setval('public.bumped_seq', 42, true)"); err != nil {
+		t.Fatalf("setval bumped_seq: %v", err)
+	}
+
 	// Slice 120: an IDENTITY column's backing sequence is the first MULTI-statement
 	// pg_dump object beyond a standalone sequence. PG records the column→sequence
 	// link as a pg_depend INTERNAL ('i') row (vs the AUTO 'a' of an OWNED BY
@@ -1504,6 +1525,36 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// guarded above) and the plain descending seq must NOT emit MINVALUE/MAXVALUE.
 		if strings.Contains(res.Stdout, "CREATE SEQUENCE public.desc_seq\n    START WITH -1\n    INCREMENT BY -1\n    MINVALUE") {
 			t.Errorf("pg_dump emitted a spurious MINVALUE for a plain descending sequence\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 124 (asserted):** an ADVANCED sequence dumps its setval with
+		// is_called=TRUE and the bumped last_value. After `setval(bumped_seq, 42,
+		// true)` the runtime state is current=42 / called=true; pg_get_sequence_data
+		// reports (42, true) and pg_dump emits `setval('public.bumped_seq', 42,
+		// true)`. This is the first slice over the called branch — every other
+		// sequence dumps `(name, start, false)`. The CREATE SEQUENCE itself is the
+		// plain default block (the bump lives only in the data-section setval).
+		// Regression guard for SequenceRowData's called=true path + the SRF
+		// last_value/is_called projection.
+		bumpedSeqDefs := []string{
+			"CREATE SEQUENCE public.bumped_seq\n    START WITH 1\n    INCREMENT BY 1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 1;\n",
+			"SELECT pg_catalog.setval('public.bumped_seq', 42, true);",
+		}
+		for _, sub := range bumpedSeqDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/mangled the advanced-sequence dump; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// The advanced sequence must NOT dump as never-called (the regression a
+		// hard-wired is_called=false, or a SequenceRowData that ignored the bump and
+		// reported seqstart=1, would produce). Both wrong forms are guarded.
+		for _, neg := range []string{
+			"SELECT pg_catalog.setval('public.bumped_seq', 1, false);",
+			"SELECT pg_catalog.setval('public.bumped_seq', 42, false);",
+			"SELECT pg_catalog.setval('public.bumped_seq', 1, true);",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump emitted the wrong setval form for an advanced sequence: %q\n  full stdout=%q", neg, res.Stdout)
+			}
 		}
 		// **Slice 120 (asserted):** an IDENTITY column's backing sequence must dump
 		// via `ALTER TABLE ... ADD GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY (SEQUENCE
