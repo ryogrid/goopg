@@ -837,7 +837,17 @@ func (d *Domain) DefaultBin() string {
 	if d == nil || d.Default == nil {
 		return ""
 	}
-	return formatExprForAttrdef(d.Default)
+	s := formatExprForAttrdef(d.Default)
+	// pg_get_expr decorates a coerced string literal with its target type, e.g.
+	// `'foo'::text`, because PG's get_const_expr emits `::type` for every Const
+	// whose type is not self-evident from the literal (int4/numeric/bool are
+	// printed bare). A string literal defaulting a text/varchar domain therefore
+	// round-trips as `DEFAULT 'foo'::text`. Integer defaults (slice 92) stay
+	// bare. DU-002 slice 93.
+	if _, ok := d.Default.(*parser.StringConst); ok && d.Base.Name != "" {
+		s += "::" + d.Base.Name
+	}
+	return s
 }
 
 // CompositeField describes one field in a user-defined composite type.

@@ -1,33 +1,31 @@
-Task: DU-002 slice 92 — DOMAIN with DEFAULT survives pg_dump (COMPLETE, commit pending)
+Task: DU-002 slice 93 — text DOMAIN with string DEFAULT survives pg_dump (COMPLETE, commit pending)
 
 Files:
-- internal/parser/ast.go — CreateDomainStmt.Default Expr field
-- internal/parser/ddl.go — parseCreateDomain now parseExpr's the DEFAULT (was skipped)
-- internal/catalog/catalog.go — Domain.Default Expr + DefaultBin() (formatExprForAttrdef)
-- internal/executor/operators_ddl.go — execCreateDomain sets d.Default = s.Default
-- internal/executor/pg18_user_catalog_rows.go — buildUserPGTypeRowForDomain emits typdefaultbin
-- internal/testport/pgdump_connsetup_test.go — fixture CREATE DOMAIN public.qty AS integer
-  DEFAULT 0 + dom.q column; domainDefs asserts `CREATE DOMAIN public.qty AS integer DEFAULT 0;`
-- docs/design/0110-0001-pg-dump-tap-port.md — slice 92 narrative
+- internal/catalog/catalog.go — Domain.DefaultBin() now appends `::<base>` for a
+  *parser.StringConst default (PG get_const_expr cast decoration); scoped to domain
+  path, formatExprForAttrdef (column attrdef) untouched.
+- internal/testport/pgdump_connsetup_test.go — fixture CREATE DOMAIN public.label AS
+  text DEFAULT 'n/a' + dom.lbl column; domainDefs asserts
+  `CREATE DOMAIN public.label AS text DEFAULT 'n/a'::text;`; retargeted slice-90
+  empty-DEFAULT negative guard from `AS text DEFAULT` to `DEFAULT;`/`DEFAULT \n`.
+- docs/design/0110-0001-pg-dump-tap-port.md — slice 93 narrative.
 
-Key symbols: parseCreateDomain (KwDefault case), Domain.DefaultBin, formatExprForAttrdef,
-buildUserPGTypeRowForDomain (typdefaultbin slot), dumpDomain (pg_dump.c: typdefaultbin
-branch emits ` DEFAULT <expr>` verbatim, NOT literal-quoted).
+Key symbols: Domain.DefaultBin (StringConst cast branch), get_const_expr (PG oracle:
+casts every non-self-evident Const; int4/numeric/bool bare, text/varchar cast).
 
-Findings: integer const deparses identically goopg/PG (`DEFAULT 0`); TEXT default gains a
-`::text` cast in real PG (`'foo'::text`) that formatExprForAttrdef does NOT synthesize —
-so this slice uses an integer base. Verified real pg_dump 18.3 on throwaway cluster.
-parseExpr correctly stops at NOT/CHECK boundaries (tested DEFAULT 42 NOT NULL, NOT NULL
-DEFAULT 7, DEFAULT 'x' CHECK(...)). TestPort_PgDumpConnectionSetup PASS (1.88s).
+Findings: pg_dump dumpDomain uses pg_get_expr(typdefaultbin) verbatim (non-literal
+branch); goopg pg_get_expr is pass-through so DefaultBin string IS the emitted clause.
+Verified real pg_dump 18.3 emits `'n/a'::text`. Integer defaults stay bare.
+TestPort_PgDumpConnectionSetup PASS (1.6s).
 
-Gates run: build ./internal/... OK; go vet executor/catalog/parser OK;
-parser+catalog unit PASS; executor Domain|Type PASS; TestPort_PgDumpConnectionSetup PASS;
-pre-commit pgbench smoke runs on commit.
+Gates run: go vet catalog OK; catalog unit PASS; executor Domain|Type PASS;
+TestPort_PgDumpConnectionSetup PASS; pre-commit pgbench smoke runs on commit.
 
-Next step: slice 93 — next domain/object increment. Candidates:
-  (a) DOMAIN text DEFAULT with `::text` cast rendering (formatExprForAttrdef must emit cast
-      to match real PG `'foo'::text`) — extends slice 92.
-  (b) DOMAIN CHECK (VALUE IN (...)) — needs pg_constraint contype='c' row with contypid=
-      domain OID (currently 0) + pg_get_constraintdef deparse; verify real pg_dump first.
-  (c) composite type (CREATE TYPE AS (...)) — third object type.
+Next step: slice 94 — next domain/object increment. Candidates:
+  (a) DOMAIN CHECK (VALUE IN (...)) — needs pg_constraint contype='c' row with
+      contypid=domain OID (currently 0) + pg_get_constraintdef deparse; verify real
+      pg_dump first.
+  (b) composite type (CREATE TYPE AS (...)) — third object type; dumpCompositeType.
+  (c) varchar/char domain DEFAULT (cast renders `::character varying` — exercises the
+      DefaultBin base-name path for a multi-word type name).
 ADD fixture object, RUN TestPort_PgDumpConnectionSetup, let it report the real blocker.

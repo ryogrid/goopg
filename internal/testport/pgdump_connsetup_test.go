@@ -695,12 +695,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// rendered expr as typdefaultbin (pg_get_expr is a pass-through), so the dump
 	// renders `CREATE DOMAIN public.qty AS integer DEFAULT 0;`. An integer
 	// constant deparses identically in goopg (formatExprForAttrdef) and real PG
-	// (verified: `DEFAULT 0`); a text default would gain a `::text` cast that
-	// goopg does not synthesize, so this slice uses an integer base.
+	// (verified: `DEFAULT 0`).
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.qty AS integer DEFAULT 0"); err != nil {
 		t.Fatalf("create domain qty: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty)"); err != nil {
+	// Slice 93: a DOMAIN over text with a STRING-literal DEFAULT. pg_get_expr
+	// decorates a coerced string constant with its target type, so real pg_dump
+	// renders `CREATE DOMAIN public.label AS text DEFAULT 'n/a'::text;` (verified
+	// pg_dump 18.3). goopg's Domain.DefaultBin now appends `::<base>` for a
+	// StringConst default to match; integer defaults stay bare (slice 92).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.label AS text DEFAULT 'n/a'"); err != nil {
+		t.Fatalf("create domain label: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1297,6 +1304,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// Slice 92: the domain DEFAULT round-trips (integer const, no cast).
 			"CREATE DOMAIN public.qty AS integer DEFAULT 0;",
 			"q public.qty",
+			// Slice 93: a text DOMAIN with a string DEFAULT round-trips with the
+			// pg_get_expr `::text` cast decoration.
+			"CREATE DOMAIN public.label AS text DEFAULT 'n/a'::text;",
+			"lbl public.label",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {
@@ -1308,7 +1319,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "zip text") {
 			t.Errorf("pg_dump rendered the domain column as its base type (slice-90 domain OID resolution regressed)\n  full stdout=%q", res.Stdout)
 		}
-		if strings.Contains(res.Stdout, "AS text DEFAULT") {
+		// A bare `DEFAULT` immediately closing the statement (`DEFAULT;` or
+		// `DEFAULT \n`) is the slice-90 empty-clause regression. Legitimate
+		// defaults (`DEFAULT 0;`, `DEFAULT 'n/a'::text;`) carry an expression
+		// between DEFAULT and the terminator, so this stays precise even with the
+		// slice-93 text-default domain present.
+		if strings.Contains(res.Stdout, "DEFAULT;") || strings.Contains(res.Stdout, "DEFAULT \n") {
 			t.Errorf("pg_dump emitted a spurious empty DEFAULT on the domain (slice-90 pg_get_expr(NULL) regressed)\n  full stdout=%q", res.Stdout)
 		}
 		return

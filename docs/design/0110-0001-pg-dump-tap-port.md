@@ -2134,9 +2134,25 @@ string is exactly what the dump re-emits. The fixture uses an **integer** base:
 an integer constant deparses identically in goopg (`0`) and real PG 18.3
 (verified via a throwaway cluster: `DEFAULT 0`), whereas a text default gains a
 `::text` cast in PG (`'foo'::text`) that `formatExprForAttrdef` does not
-synthesize — matching that cast is deferred to a later slice. The existing
-negative guard (`AS text DEFAULT` must be absent) still protects the
-`pg_get_expr(NULL)` regression for the no-default `zipcode`/`zipcode_nn` domains.
+synthesize — matching that cast lands in slice 93.
+
+Slice 93 closes that gap: a text DOMAIN with a **string-literal** default
+(`CREATE DOMAIN public.label AS text DEFAULT 'n/a'`) round-trips as
+`CREATE DOMAIN public.label AS text DEFAULT 'n/a'::text;`. PG's `get_const_expr`
+appends a `::type` decoration to every `Const` whose type is not self-evident
+from its literal form — `int4`, `numeric`, and `bool` print bare, but `text`,
+`varchar`, and the like carry the cast. `Domain.DefaultBin()` now mirrors this:
+after deparsing via `formatExprForAttrdef`, it appends `::<base-type-name>` when
+the default is a `*parser.StringConst` (so `'n/a'` over `text` → `'n/a'::text`).
+The cast is scoped to the domain default path only — `formatExprForAttrdef`
+itself is unchanged, so `pg_attrdef.adbin` column-default rendering is untouched.
+Integer defaults (slice 92) stay bare because an `*IntegerConst` is not a
+`StringConst`. The slice-90 empty-DEFAULT negative guard was retargeted from the
+now-legitimate substring `AS text DEFAULT` to the precise empty-clause forms
+`DEFAULT;` / `DEFAULT \n` (a real default always carries an expression between
+`DEFAULT` and the terminator), so it still protects the `pg_get_expr(NULL)`
+regression for the no-default `zipcode`/`zipcode_nn` domains while admitting the
+new text default.
 
 ## Deferred (002–010) — catalog surface estimate
 
