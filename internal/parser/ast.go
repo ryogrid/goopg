@@ -943,6 +943,21 @@ type TableConstraintDef struct {
 	Method         string   // index method for EXCLUDE (e.g. "btree")
 }
 
+// TableForeignKeyDef describes a table-level FOREIGN KEY constraint, e.g.
+// `FOREIGN KEY (a, b) REFERENCES t (x, y) ON DELETE CASCADE`. This is the
+// multi-column sibling of the inline-on-column REFERENCES clause (whose fields
+// live on ColumnDef). Used in CreateTableStmt.TableForeignKeys. DU-002 slice 53.
+type TableForeignKeyDef struct {
+	Name              string     // explicit CONSTRAINT name; "" when anonymous
+	Columns           []string   // referencing (local) columns
+	RefTable          ObjectName // referenced table
+	RefColumns        []string   // referenced columns; empty = referenced table's PK
+	OnDelete          FKAction   // referential action for ON DELETE (default NO ACTION)
+	OnUpdate          FKAction   // referential action for ON UPDATE (default NO ACTION)
+	Deferrable        bool
+	InitiallyDeferred bool
+}
+
 // CreateTableStmt — `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name
 //
 //	(column_def [, …]) [WITH (option = value [, …])]`. Foreign keys,
@@ -1011,6 +1026,10 @@ type CreateTableStmt struct {
 	// TableExclusions holds anonymous EXCLUDE USING constraints (no CONSTRAINT name).
 	// Named ones are folded into NamedConstraints. M0097-0023.
 	TableExclusions []TableConstraintDef
+	// TableForeignKeys holds table-level FOREIGN KEY constraints (both anonymous
+	// and CONSTRAINT-named), e.g. `FOREIGN KEY (a, b) REFERENCES t (x, y)`. The
+	// inline-on-column REFERENCES sibling lives on ColumnDef instead. DU-002 slice 53.
+	TableForeignKeys []TableForeignKeyDef
 	// TableHasNoInheritCheck is true when any table-level CHECK constraint carries
 	// NO INHERIT. Partitioned tables reject such constraints. M0097-0023.
 	TableHasNoInheritCheck bool

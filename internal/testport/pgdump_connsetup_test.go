@@ -366,6 +366,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("alter table add fk: %v", err)
 	}
 
+	// Slice 53: a table-level (composite) FOREIGN KEY declared in the CREATE
+	// TABLE body must survive the dump. The parser previously treated table-level
+	// FKs as a no-op, so a multi-column `FOREIGN KEY (x, y) REFERENCES t (a, b)`
+	// never reached the catalog or pg_constraint. `bar` carries a composite PK so
+	// the FK has a multi-column referent.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.bar (a integer, b integer, PRIMARY KEY (a, b))"); err != nil {
+		t.Fatalf("create table bar: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.baz (x integer, y integer, "+
+		"FOREIGN KEY (x, y) REFERENCES public.bar (a, b) ON DELETE CASCADE)"); err != nil {
+		t.Fatalf("create table baz: %v", err)
+	}
+
 	res, err := util.RunCommand(util.CommandSpec{
 		Name:    bin,
 		Args:    []string{"--no-sync", "postgres"},
@@ -495,6 +508,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"ADD CONSTRAINT foo_code_key UNIQUE (code)",
 			"ADD CONSTRAINT foo_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.foo(id) ON DELETE CASCADE",
 			"ADD CONSTRAINT foo_mgr_fkey FOREIGN KEY (mgr_id) REFERENCES public.foo(id) ON UPDATE CASCADE ON DELETE SET NULL",
+			// **Slice 53 closed (asserted):** a table-level (composite) FOREIGN
+			// KEY in the CREATE TABLE body was silently dropped — the parser
+			// treated table-level FKs as a no-op, so the multi-column FK never
+			// reached the catalog/pg_constraint. The parser now stores it
+			// (anonymous form auto-named <table>_<firstcol>_fkey) and the executor
+			// registers it as a catalog FK; pg_constraint's conkey/confkey
+			// ordinals and pg_get_constraintdef's join were already multi-column
+			// aware. The composite PK on `bar` and the composite FK on `baz`
+			// round-trip byte-identically.
+			"ADD CONSTRAINT bar_pkey PRIMARY KEY (a, b)",
+			"ADD CONSTRAINT baz_x_fkey FOREIGN KEY (x, y) REFERENCES public.bar(a, b) ON DELETE CASCADE",
 		}
 		for _, sub := range check {
 			if !strings.Contains(res.Stdout, sub) {

@@ -1013,6 +1013,34 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		}
 	}
+	// Register table-level FOREIGN KEY constraints — the multi-column sibling of
+	// the inline REFERENCES loop above (`FOREIGN KEY (a, b) REFERENCES t (x, y)`).
+	// PG auto-names an unnamed table-level FK <table>_<firstcol>_fkey and records
+	// it in pg_constraint (contype='f'), where pg_dump's getConstraints renders it
+	// via pg_get_constraintdef (conkey/confkey ordinals are already multi-column
+	// aware). DU-002 slice 53.
+	for _, tfk := range s.TableForeignKeys {
+		fkName := tfk.Name
+		if fkName == "" {
+			firstCol := ""
+			if len(tfk.Columns) > 0 {
+				firstCol = tfk.Columns[0]
+			}
+			fkName = tbl.Name + "_" + firstCol + "_fkey"
+		}
+		fk := catalog.ForeignKey{
+			Name:              fkName,
+			OID:               o.allocConstraintOID(fkName),
+			Columns:           append([]string(nil), tfk.Columns...),
+			RefTable:          tfk.RefTable.Name,
+			RefColumns:        append([]string(nil), tfk.RefColumns...),
+			OnDelete:          tfk.OnDelete,
+			OnUpdate:          tfk.OnUpdate,
+			Deferrable:        tfk.Deferrable,
+			InitiallyDeferred: tfk.InitiallyDeferred,
+		}
+		tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
+	}
 	// Register implicit sequences for SERIAL / BIGSERIAL / SMALLSERIAL columns
 	// and GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
 	// Uses `cols` (not s.Columns) so LIKE-copied identity columns are also covered.

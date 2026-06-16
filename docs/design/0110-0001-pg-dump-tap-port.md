@@ -1137,6 +1137,30 @@ fixed one logical group per loop:
     before `ON DELETE`, mirroring ruleutils.c, and omits the default NO ACTION).
     Guards: the integration fixture plus the unit test
     `executor.TestAlterTableAddForeignKeyCapturesActions`.
+  - **Slice 53 — table-level (composite) FOREIGN KEY in `CREATE TABLE`
+    (`internal/parser/ast.go`, `internal/parser/ddl.go`,
+    `internal/executor/operators_ddl.go`).** The inline column-FK path (slices
+    51/52) handled only single-column `col … REFERENCES t (x)`. A table-level
+    `FOREIGN KEY (a, b) REFERENCES t (x, y)` — the only way to express a composite
+    FK — was a parser **no-op**: the `CONSTRAINT name FOREIGN KEY …` case simply
+    skipped tokens to the next comma/paren, and there was no anonymous
+    `FOREIGN KEY` branch at all, so a multi-column FK never reached the catalog,
+    `pg_constraint`, or pg_dump. Fix: (1) a new `TableForeignKeyDef` AST node and
+    `CreateTableStmt.TableForeignKeys` slice; (2) a shared parser helper
+    `parseTableForeignKey(name)` that parses `FOREIGN KEY (cols) REFERENCES t
+    [(refcols)] [ON DELETE/UPDATE action] [[NOT] DEFERRABLE [INITIALLY …]]`,
+    wired into **both** the CONSTRAINT-named and a new anonymous table-level
+    branch, with its action/deferrable grammar kept in lockstep with the inline
+    column path; (3) the executor registers each as a `catalog.ForeignKey`,
+    auto-naming an anonymous FK `<table>_<firstcol>_fkey` (PG's
+    `ChooseConstraintName` convention). No deparse/pg_constraint change was
+    needed — `buildForeignKeyDefString` already `strings.Join`s multiple columns
+    and the `conkey`/`confkey` ordinal loops already iterate `fk.Columns`/
+    `fk.RefColumns`. The fixture's new `bar (a, b)` composite PK and `baz`'s
+    `FOREIGN KEY (x, y) REFERENCES bar (a, b) ON DELETE CASCADE` round-trip
+    byte-identically. Guards: the integration fixture plus the unit test
+    `executor.TestCreateTableTableLevelCompositeForeignKey` (covers the anonymous
+    and named forms, multi-column `conkey`/`confkey`, and the composite deparse).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1151,10 +1175,14 @@ NULL`) survives the dump; slice 51 asserts a `FOREIGN KEY` constraint and a
 `UNIQUE` constraint both round-trip (`foo_parent_id_fkey FOREIGN KEY (parent_id)
 REFERENCES public.foo(id)`, `foo_code_key UNIQUE (code)`); slice 52 asserts FK
 referential actions survive — the inline self-FK's `ON DELETE CASCADE` and the
-ALTER-added `foo_mgr_fkey`'s `ON UPDATE CASCADE ON DELETE SET NULL`. Unit guards:
+ALTER-added `foo_mgr_fkey`'s `ON UPDATE CASCADE ON DELETE SET NULL`; slice 53
+asserts a table-level composite PK and FK survive — `bar_pkey PRIMARY KEY (a, b)`
+and `baz_x_fkey FOREIGN KEY (x, y) REFERENCES public.bar(a, b) ON DELETE
+CASCADE`. Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
 `executor.TestAlterTableAddForeignKeyCapturesActions`,
+`executor.TestCreateTableTableLevelCompositeForeignKey`,
 `config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`.
 

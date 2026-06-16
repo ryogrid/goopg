@@ -134,3 +134,98 @@ func TestAlterTableAddForeignKeyCapturesActions(t *testing.T) {
 		t.Errorf("buildForeignKeyDefString = %q, want %q", got, want)
 	}
 }
+
+// TestCreateTableTableLevelCompositeForeignKey verifies that a table-level
+// (composite) FOREIGN KEY declared in the CREATE TABLE body — `FOREIGN KEY
+// (a, b) REFERENCES t (x, y)` — is captured rather than silently dropped. The
+// parser previously treated table-level FKs as a no-op, so a multi-column FK
+// never reached the catalog, pg_constraint, or pg_dump. Both the anonymous and
+// CONSTRAINT-named forms are exercised. DU-002 slice 53.
+func TestCreateTableTableLevelCompositeForeignKey(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE bar (a integer, b integer, PRIMARY KEY (a, b))`); err != nil {
+		t.Fatalf("CREATE TABLE bar: %v", err)
+	}
+	// Anonymous table-level composite FK (auto-named <table>_<firstcol>_fkey).
+	if err := runDDL(t, ctx, `CREATE TABLE baz (x integer, y integer, `+
+		`FOREIGN KEY (x, y) REFERENCES bar (a, b) ON DELETE CASCADE)`); err != nil {
+		t.Fatalf("CREATE TABLE baz: %v", err)
+	}
+	// CONSTRAINT-named table-level composite FK.
+	if err := runDDL(t, ctx, `CREATE TABLE qux (x integer, y integer, `+
+		`CONSTRAINT qux_ref FOREIGN KEY (x, y) REFERENCES bar (a, b))`); err != nil {
+		t.Fatalf("CREATE TABLE qux: %v", err)
+	}
+
+	barTbl, ok := cat.LookupTable(parser.ObjectName{Name: "bar"})
+	if !ok {
+		t.Fatal("bar table not found")
+	}
+	bazTbl, ok := cat.LookupTable(parser.ObjectName{Name: "baz"})
+	if !ok {
+		t.Fatal("baz table not found")
+	}
+	if len(bazTbl.ForeignKeys) != 1 {
+		t.Fatalf("expected 1 FK on baz, got %d", len(bazTbl.ForeignKeys))
+	}
+	bazFK := bazTbl.ForeignKeys[0]
+	if bazFK.Name != "baz_x_fkey" {
+		t.Errorf("anonymous composite FK name = %q, want %q", bazFK.Name, "baz_x_fkey")
+	}
+	if len(bazFK.Columns) != 2 || bazFK.Columns[0] != "x" || bazFK.Columns[1] != "y" {
+		t.Errorf("FK Columns = %v, want [x y]", bazFK.Columns)
+	}
+	if len(bazFK.RefColumns) != 2 || bazFK.RefColumns[0] != "a" || bazFK.RefColumns[1] != "b" {
+		t.Errorf("FK RefColumns = %v, want [a b]", bazFK.RefColumns)
+	}
+	if bazFK.OnDelete != parser.FKActionCascade {
+		t.Errorf("OnDelete = %v, want CASCADE", bazFK.OnDelete)
+	}
+
+	// CONSTRAINT-named form keeps the explicit name.
+	quxTbl, ok := cat.LookupTable(parser.ObjectName{Name: "qux"})
+	if !ok {
+		t.Fatal("qux table not found")
+	}
+	if len(quxTbl.ForeignKeys) != 1 || quxTbl.ForeignKeys[0].Name != "qux_ref" {
+		t.Fatalf("expected qux FK named qux_ref, got %+v", quxTbl.ForeignKeys)
+	}
+
+	// pg_constraint must emit a contype='f' row with multi-column conkey/confkey.
+	pgcon, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_constraint"})
+	if !ok || pgcon.VirtualRows == nil {
+		t.Fatal("pg_constraint virtual table not found")
+	}
+	var r []string
+	for _, row := range pgcon.VirtualRows() {
+		if row[3] == "f" && row[1] == "baz_x_fkey" {
+			r = row
+			break
+		}
+	}
+	if r == nil {
+		t.Fatal("no contype='f' row for baz_x_fkey")
+	}
+	if r[11] != fmt.Sprintf("%d", barTbl.OID) {
+		t.Errorf("confrelid = %q, want %d (bar)", r[11], barTbl.OID)
+	}
+	if r[19] != "{1,2}" {
+		t.Errorf("conkey = %q, want {1,2}", r[19])
+	}
+	if r[20] != "{1,2}" {
+		t.Errorf("confkey = %q, want {1,2}", r[20])
+	}
+
+	// pg_get_constraintdef's FK branch must join multiple columns.
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+	got := buildForeignKeyDefString(im, bazFK)
+	want := "FOREIGN KEY (x, y) REFERENCES public.bar(a, b) ON DELETE CASCADE"
+	if got != want {
+		t.Errorf("buildForeignKeyDefString = %q, want %q", got, want)
+	}
+}

@@ -1803,6 +1803,15 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			// Anonymous EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
 			cdef := p.parseExcludeConstraint()
 			stmt.TableExclusions = append(stmt.TableExclusions, cdef)
+		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign {
+			// Anonymous table-level FOREIGN KEY (cols) REFERENCES t (cols) … —
+			// the multi-column sibling of the inline column REFERENCES clause.
+			// PG auto-names it <table>_<firstcol>_fkey at execution. DU-002 slice 53.
+			fk, err := p.parseTableForeignKey("")
+			if err != nil {
+				return nil, err
+			}
+			stmt.TableForeignKeys = append(stmt.TableForeignKeys, fk)
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint {
 			// Table-level CONSTRAINT name (PRIMARY KEY | UNIQUE | CHECK | FOREIGN KEY).
 			p.advance() // CONSTRAINT
@@ -1906,18 +1915,13 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					stmt.TableHasNoInheritCheck = true
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
-				// Already handled by FK parsing in parseColumnDef / REFERENCES
-				// at the column level. Table-level FOREIGN KEY is a no-op here.
-				for p.cur().Kind != TokenEOF {
-					t := p.cur()
-					if t.Kind == TokenSymbol && t.Value == ")" {
-						break
-					}
-					if t.Kind == TokenSymbol && t.Value == "," {
-						break
-					}
-					p.advance()
+				// CONSTRAINT name FOREIGN KEY (cols) REFERENCES t (cols) … —
+				// table-level (possibly composite) FK. DU-002 slice 53.
+				fk, err := p.parseTableForeignKey(constraintName)
+				if err != nil {
+					return nil, err
 				}
+				stmt.TableForeignKeys = append(stmt.TableForeignKeys, fk)
 			case p.acceptIdentKeyword("exclude"):
 				// CONSTRAINT name EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
 				cdef := p.parseExcludeConstraint()
@@ -3358,6 +3362,84 @@ func (p *parser) parseDrop() (Stmt, error) {
 		return &DropCompatStmt{pos: t.Pos, ObjType: "group", IfExists: ifExists, Names: names, Behavior: behavior}, nil
 	}
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, SEQUENCE, SCHEMA, TYPE, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after DROP")
+}
+
+// parseTableForeignKey parses a table-level FOREIGN KEY constraint, positioned
+// on the FOREIGN keyword:
+//
+//	FOREIGN KEY (cols) REFERENCES table [(refcols)]
+//	  [ON DELETE action] [ON UPDATE action]
+//	  [[NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]]
+//
+// The constraint name (or "" for an anonymous constraint) is supplied by the
+// caller. This is the multi-column sibling of the inline column REFERENCES path
+// in parseColumnDef; the action/deferrable grammar is kept in lockstep with it
+// so both round-trip identically through pg_constraint and pg_dump. DU-002 slice 53.
+func (p *parser) parseTableForeignKey(name string) (TableForeignKeyDef, error) {
+	fk := TableForeignKeyDef{Name: name}
+	p.advance() // FOREIGN
+	if _, err := p.expectKeyword(KwKey); err != nil {
+		return TableForeignKeyDef{}, err
+	}
+	if !p.acceptSymbol("(") {
+		return TableForeignKeyDef{}, p.errAtCur("expected '(' after FOREIGN KEY")
+	}
+	cols, err := p.parseColumnNameList()
+	if err != nil {
+		return TableForeignKeyDef{}, err
+	}
+	if !p.acceptSymbol(")") {
+		return TableForeignKeyDef{}, p.errAtCur("expected ')'")
+	}
+	fk.Columns = cols
+	if _, err := p.expectKeyword(KwReferences); err != nil {
+		return TableForeignKeyDef{}, err
+	}
+	refTable, err := p.parseObjectName()
+	if err != nil {
+		return TableForeignKeyDef{}, err
+	}
+	fk.RefTable = refTable
+	if p.acceptSymbol("(") {
+		refCols, err := p.parseColumnNameList()
+		if err != nil {
+			return TableForeignKeyDef{}, err
+		}
+		if !p.acceptSymbol(")") {
+			return TableForeignKeyDef{}, p.errAtCur("expected ')'")
+		}
+		fk.RefColumns = refCols
+	}
+	// ON DELETE / ON UPDATE referential-action clauses. ON is KwOn (reserved).
+	for p.acceptKeyword(KwOn) {
+		isDelete := p.acceptKeyword(KwDelete)
+		if !isDelete {
+			_ = p.acceptKeyword(KwUpdate)
+		}
+		action := parseFKAction(p)
+		if isDelete {
+			fk.OnDelete = action
+		} else {
+			fk.OnUpdate = action
+		}
+	}
+	// [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]; also accept a
+	// bare INITIALLY DEFERRED (implies DEFERRABLE), mirroring the inline path.
+	if p.acceptKeyword(KwNot) {
+		_, _ = p.expectKeyword(KwDeferrable)
+		fk.Deferrable = false
+	} else if p.acceptKeyword(KwDeferrable) {
+		fk.Deferrable = true
+		if p.acceptIdentKeyword("initially") {
+			fk.InitiallyDeferred = p.acceptIdentKeyword("deferred")
+			_ = p.acceptIdentKeyword("immediate")
+		}
+	} else if p.acceptIdentKeyword("initially") {
+		fk.Deferrable = true
+		fk.InitiallyDeferred = p.acceptIdentKeyword("deferred")
+		_ = p.acceptIdentKeyword("immediate")
+	}
+	return fk, nil
 }
 
 // parseExcludeConstraint parses the body of EXCLUDE USING method (col WITH op) [INCLUDE (cols)]
