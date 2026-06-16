@@ -6492,6 +6492,25 @@ func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
 }
 
+// syncDomainTypeToCatalogHeap writes a single pg_type row (typtype='d') for a
+// user-defined DOMAIN into the pg_type heap (OID 1247), mirroring
+// syncEnumTypeToCatalogHeap. pg_dump's getTypes reads pg_type to discover the
+// domain and dumpDomain re-renders it via typbasetype/typtypmod. DU-002 slice 90.
+func syncDomainTypeToCatalogHeap(ctx *Context, d *catalog.Domain) {
+	if !catalogHeapSyncAvailable(ctx) {
+		return
+	}
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForDomain(d)); err != nil {
+		return
+	}
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+}
+
 // deleteTypeFromCatalogHeap stamps xmax on the pg_type row for typeOID.
 // Called by execDropType so dropped enums don't leave orphan pg_type rows.
 // pg_type rows are written by syncEnumTypeToCatalogHeap using pgTypeColumnsPG18
@@ -8637,10 +8656,14 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 		return nil
 	}
 	baseType := catalog.Type{Name: s.BaseType}
-	_, err := cat.RegisterDomain(s.Name, baseType, s.NotNull, s.CheckInValues...)
+	d, err := cat.RegisterDomain(s.Name, baseType, s.NotNull, s.CheckInValues...)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	// Write a pg_type heap row (typtype='d') so pg_dump's getTypes discovers the
+	// domain and a column of the domain type round-trips as its declared type.
+	// DU-002 slice 90.
+	syncDomainTypeToCatalogHeap(o.ctx, d)
 	return nil
 }
 
@@ -8652,6 +8675,14 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 	for _, name := range s.Names {
 		if s.IfExists && o.dropSchemaQualifiedNotice(name) {
 			continue
+		}
+		// Stamp the pg_type heap row's xmax before the in-memory delete (need the
+		// OID while the domain still exists), mirroring execDropType. DU-002 slice 90.
+		if d, ok := cat.LookupDomain(name.Name); ok && catalogHeapSyncAvailable(o.ctx) {
+			if o.ctx.MaterializeWriterXID() == nil {
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.OID, o.ctx.Tx.XID)
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			}
 		}
 		// names = dropped tables (CASCADE) or blocking tables (RESTRICT).
 		names, err := cat.DropDomain(name.Name, false, s.Cascade)

@@ -2066,7 +2066,29 @@ slice 82 adds the `name` catalog identifier type `nm name` and `nms name[]` (the
 scalar display/attr paths predated this slice; only the codec `name→OID` and the
 `_name` array wiring were missing); slice 83 adds the `timetz` (`time with time
 zone`) type `tt timetz` and `tts timetz[]` (the codec had no `timetz→OID` entry
-and `formatTypeOID` had no scalar 1266 case, so it round-tripped as `text`). Unit guards:
+and `formatTypeOID` had no scalar 1266 case, so it round-tripped as `text`).
+
+Slices 88–89 introduced the first OBJECT type: a user-defined `ENUM`
+(`CREATE TYPE public.mood AS ENUM (...)`) and an enum-array column (`mood[]`),
+allocating the enum's auto-generated `_mood` array type so the column resolves
+to a distinct OID instead of folding to `text[]`. Slice 90 adds the second
+object type — a `DOMAIN` (`CREATE DOMAIN public.zipcode AS text`) and a column
+of the domain type. goopg had `CREATE DOMAIN` DDL but no `pg_type` row for the
+domain, so pg_dump's `getTypes` never discovered it (no `CREATE DOMAIN` emitted)
+and a domain column folded to its base (`zip text`). The slice adds
+`syncDomainTypeToCatalogHeap` (writes the `typtype='d'` row with
+`typbasetype`/`typcollation` inherited from the base so `dumpDomain` re-renders
+`CREATE DOMAIN ... AS format_type(typbasetype, typtypmod)` with no spurious
+`COLLATE`), a `buildUserPGAttributeRow` branch that re-resolves a domain column
+(keyed on `Column.DeclaredTypeName`, since `CREATE TABLE` stores the resolved
+base) to the domain's pg_type OID while reporting the base's physical layout,
+and `LookupDomain`/`LookupDomainByOID` on the `Catalog` interface so
+`format_type` renders `public.zipcode`. A NULL `typdefaultbin` additionally
+exposed a `pg_get_expr` bug: `pg_get_expr(NULL, …)` returned `''` (non-NULL),
+so `dumpDomain` emitted a spurious empty `DEFAULT `; it now returns NULL for a
+NULL node tree (empty-but-non-null still returns `''`, so partition-bound
+display is unaffected). Unit guards:
+`executor.TestUserPGAttributeDomainColumn`,
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
 `executor.TestAlterTableAddForeignKeyCapturesActions`,

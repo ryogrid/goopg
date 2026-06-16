@@ -513,6 +513,23 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			}
 		}
 	}
+	// A column whose declared type is a user-defined DOMAIN is stored with its
+	// type name already resolved to the BASE type (catalog.ResolveColumnType at
+	// CREATE TABLE), with the original domain name preserved in DeclaredTypeName.
+	// Re-resolve it to the domain's dynamically-allocated pg_type OID so
+	// pg_attribute.atttypid points at the domain and pg_dump's format_type
+	// renders the column as the domain name rather than the base type. The
+	// physical attributes (attlen/attbyval/attalign/attstorage/attcollation)
+	// follow the BASE type — the current typOID, since Type.Name is the resolved
+	// base — because a domain stores values exactly as its base. Scalar only in
+	// this slice. DU-002 slice 90.
+	domainBaseOID := uint32(0)
+	if cat != nil && col.DeclaredTypeName != "" && !col.Type.IsArray {
+		if d, ok := cat.LookupDomain(col.DeclaredTypeName); ok {
+			domainBaseOID = typOID
+			typOID = d.OID
+		}
+	}
 	// atttypmod carries the ELEMENT typmod even for array columns; compute it
 	// from the base OID before remapping typOID to the array (_typename) OID.
 	typmod := pgAttTypmod(typOID, col.Type.Args)
@@ -541,6 +558,9 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		// An enum's array type is a standard varlena array: -1 length,
 		// int-aligned (matching the 4-byte enum element), extended storage.
 		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case domainBaseOID != 0:
+		// A domain inherits its base type's physical layout. DU-002 slice 90.
+		attrs = userTypeAttrsForOID(domainBaseOID)
 	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                     // attrelid
@@ -1036,5 +1056,71 @@ func buildUserPGTypeRowForEnumArray(et *catalog.EnumType) Row {
 		NullDatum,                                      // typdefaultbin (NULL)
 		NullDatum,                                      // typdefault (NULL)
 		NullDatum,                                      // typacl (NULL)
+	}
+}
+
+// pgTypeCategoryForOID returns the PG18 pg_type.typcategory single-byte code for
+// a built-in base type OID, used when a domain inherits its base type's category.
+// It mirrors the typcategory values in postgres/src/include/catalog/pg_type.dat.
+// Unknown OIDs fall back to 'U' (TYPCATEGORY_USER). DU-002 slice 90.
+func pgTypeCategoryForOID(oid uint32) byte {
+	switch oid {
+	case catalog.OIDBool:
+		return 'B'
+	case catalog.OIDInt2, catalog.OIDInt4, catalog.OIDInt8, catalog.OIDFloat4, catalog.OIDFloat8, catalog.OIDNumeric, catalog.OIDOID:
+		return 'N'
+	case catalog.OIDChar, catalog.OIDText, catalog.OIDBpChar, catalog.OIDVarChar, catalog.OIDName:
+		return 'S'
+	default:
+		return 'U'
+	}
+}
+
+// buildUserPGTypeRowForDomain builds a 32-column pg_type Row for a user-defined
+// DOMAIN type (typtype='d'). A domain stores values physically as its base type,
+// so typlen/typbyval/typalign/typstorage/typcollation are inherited from the base
+// (resolved via userTypeAttrsForOID); typbasetype/typtypmod record the base so
+// pg_dump's dumpDomain can render `CREATE DOMAIN <name> AS format_type(typbasetype,
+// typtypmod)`. typcollation matches the base's so dumpDomain's collation CASE
+// (t.typcollation <> u.typcollation) yields 0 → no spurious COLLATE clause.
+// This basic slice carries no default and no array type (typdefault*/typarray=0);
+// typnotnull reflects the declared NOT NULL. DU-002 slice 90.
+func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
+	baseOID := catalog.TypeNameToOID(d.Base.Name)
+	attrs := userTypeAttrsForOID(baseOID)
+	typmod := pgAttTypmod(baseOID, d.Base.Args)
+	return Row{
+		NewIntDatum(int64(d.OID)),                             // oid
+		NewStringDatum(d.Name),                                // typname (name type)
+		NewIntDatum(int64(catalog.PublicNamespaceOID)),        // typnamespace = public
+		NewIntDatum(bootstrapSuperuserOID),                    // typowner
+		NewIntDatum(int64(attrs.TypLen)),                      // typlen (inherit base)
+		NewBoolDatum(attrs.TypByVal),                          // typbyval (inherit base)
+		NewStringDatum("d"),                                   // typtype = 'd' (domain)
+		NewStringDatum(string(pgTypeCategoryForOID(baseOID))), // typcategory (inherit base)
+		NewBoolDatum(false),                                   // typispreferred
+		NewBoolDatum(true),                                    // typisdefined
+		NewStringDatum(","),                                   // typdelim
+		NewIntDatum(0),                                        // typrelid
+		NewIntDatum(0),                                        // typsubscript
+		NewIntDatum(0),                                        // typelem
+		NewIntDatum(0),                                        // typarray (no domain array type in this slice)
+		NewIntDatum(0),                                        // typinput
+		NewIntDatum(0),                                        // typoutput
+		NewIntDatum(0),                                        // typreceive
+		NewIntDatum(0),                                        // typsend
+		NewIntDatum(0),                                        // typmodin
+		NewIntDatum(0),                                        // typmodout
+		NewIntDatum(0),                                        // typanalyze
+		NewStringDatum(string(attrs.TypAlign)),                // typalign (inherit base)
+		NewStringDatum(string(attrs.TypStorage)),              // typstorage (inherit base)
+		NewBoolDatum(d.NotNull),                               // typnotnull (declared NOT NULL)
+		NewIntDatum(int64(baseOID)),                           // typbasetype
+		NewIntDatum(typmod),                                   // typtypmod (base typmod)
+		NewIntDatum(0),                                        // typndims
+		NewIntDatum(int64(attrs.TypCollation)),                // typcollation (inherit base)
+		NullDatum,                                             // typdefaultbin (NULL)
+		NullDatum,                                             // typdefault (NULL)
+		NullDatum,                                             // typacl (NULL)
 	}
 }

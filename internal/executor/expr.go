@@ -6823,7 +6823,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil {
 				return Datum{}, err
 			}
-			if !treeArg.IsNull() && treeArg.StringValue() != "" {
+			// pg_get_expr(NULL, ...) → NULL (mirrors PG). A NULL node tree means
+			// the object has no such expression (e.g. a domain or column with no
+			// default); pg_dump distinguishes NULL from '' to decide whether to
+			// emit a DEFAULT clause, so collapsing NULL to '' produced a spurious
+			// empty `DEFAULT `. DU-002 slice 90.
+			if treeArg.IsNull() {
+				return NullDatum, nil
+			}
+			if treeArg.StringValue() != "" {
 				return NewStringDatum(treeArg.StringValue()), nil
 			}
 		}
@@ -8761,6 +8769,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					// dump round-trips as `public.mood[]`, not `text[]`. DU-002
 					// slice 89.
 					name = "public." + et.Name + "[]"
+				} else if dom, ok := ctx.Catalog.LookupDomainByOID(uint32(typeOID)); ok {
+					// A domain column carries the domain's dynamically-allocated
+					// pg_type OID; render it as the schema-qualified domain name
+					// (NOT the base type) so the dump round-trips as
+					// `public.zipcode`. DU-002 slice 90.
+					name = "public." + dom.Name
 				}
 			}
 			return NewStringDatum(name), nil

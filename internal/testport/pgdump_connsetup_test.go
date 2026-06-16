@@ -657,6 +657,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table moody: %v", err)
 	}
 
+	// Slice 90: a user-defined DOMAIN over a base type and a column that uses it
+	// must survive the dump. This is the second OBJECT type (after the enum in
+	// slices 88-89). pg_dump's getTypes collects the domain from pg_type
+	// (typtype='d'), dumpDomain reads typbasetype and renders `CREATE DOMAIN
+	// public.zipcode AS format_type(typbasetype, typtypmod)`; a column of the
+	// domain type renders via format_type(atttypid) as the schema-qualified
+	// domain name. goopg previously had NO pg_type row for a domain
+	// (syncEnumTypeToCatalogHeap had no domain twin), so getTypes never
+	// discovered it and the domain column folded to its base (`zip text`). New:
+	// syncDomainTypeToCatalogHeap writes the typtype='d' row; buildUserPGAttributeRow
+	// re-resolves a domain column (keyed on DeclaredTypeName, since CREATE TABLE
+	// stores the resolved base) to the domain OID; format_type/LookupDomainByOID
+	// renders the domain name. A NULL typdefaultbin also exposed a pg_get_expr
+	// bug — pg_get_expr(NULL) returned '' (non-NULL), so dumpDomain emitted a
+	// spurious `DEFAULT `; pg_get_expr now returns NULL for a NULL node tree.
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.zipcode AS text"); err != nil {
+		t.Fatalf("create domain zipcode: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode)"); err != nil {
+		t.Fatalf("create table dom: %v", err)
+	}
+
 	res, err := util.RunCommand(util.CommandSpec{
 		Name:    bin,
 		Args:    []string{"--no-sync", "postgres"},
@@ -1235,6 +1257,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// typarray points back at it) and suppresses it. Slice 89.
 		if strings.Contains(res.Stdout, "CREATE TYPE public._mood") {
 			t.Errorf("pg_dump emitted the auto-generated enum array type as a separate CREATE TYPE (slice-89 isarray suppression regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 90 (asserted):** a DOMAIN and a column using it must round-trip.
+		// The CREATE DOMAIN statement must carry NO spurious `DEFAULT ` clause
+		// (the pg_get_expr(NULL) fix), and the column must render as the
+		// schema-qualified domain name, not the base type.
+		domainDefs := []string{
+			"CREATE DOMAIN public.zipcode AS text;",
+			"CREATE TABLE public.dom (",
+			"zip public.zipcode",
+		}
+		for _, sub := range domainDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped the DOMAIN round-trip; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// The domain column must NOT fold back to its base type, and the domain
+		// definition must NOT carry an empty DEFAULT clause.
+		if strings.Contains(res.Stdout, "zip text") {
+			t.Errorf("pg_dump rendered the domain column as its base type (slice-90 domain OID resolution regressed)\n  full stdout=%q", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "AS text DEFAULT") {
+			t.Errorf("pg_dump emitted a spurious empty DEFAULT on the domain (slice-90 pg_get_expr(NULL) regressed)\n  full stdout=%q", res.Stdout)
 		}
 		return
 	}

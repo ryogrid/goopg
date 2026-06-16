@@ -668,6 +668,79 @@ func TestUserPGAttributeEnumArrayColumn(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeDomainColumn pins the DOMAIN column resolution (DU-002
+// slice 90). A column declared with a domain type is stored with its type name
+// already resolved to the base (CREATE TABLE → catalog.ResolveColumnType), with
+// the original domain name in DeclaredTypeName. buildUserPGAttributeRow must
+// re-resolve it to the domain's pg_type OID (so format_type renders the domain
+// name, not the base) while reporting the BASE type's physical layout.
+func TestUserPGAttributeDomainColumn(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		attndimsIdx   = 6
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	d, err := cat.RegisterDomain("zipcode", catalog.Type{Name: "text"}, false)
+	if err != nil {
+		t.Fatalf("RegisterDomain: %v", err)
+	}
+	tbl := &catalog.Table{Schema: "public", Name: "dom", OID: 16500}
+	// CREATE TABLE stores the base type name with the domain in DeclaredTypeName.
+	col := catalog.Column{Name: "zip", Type: catalog.Type{Name: "text"}, DeclaredTypeName: "zipcode", Ordinal: 1}
+	row := buildUserPGAttributeRow(cat, tbl, col)
+
+	if got := uint32(row[atttypidIdx].Int); got != d.OID {
+		t.Errorf("domain column: atttypid=%d want %d (domain OID)", got, d.OID)
+	}
+	if got := row[attndimsIdx].Int; got != 0 {
+		t.Errorf("domain column: attndims=%d want 0", got)
+	}
+	// Physical layout follows the base type (text: varlena, int-aligned, extended).
+	if got := row[attlenIdx].Int; got != -1 {
+		t.Errorf("domain column: attlen=%d want -1 (base text varlena)", got)
+	}
+	if got := row[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("domain column: attbyval=%v want false", got)
+	}
+	if got := row[attalignIdx].StringValue(); got != "i" {
+		t.Errorf("domain column: attalign=%q want \"i\"", got)
+	}
+	if got := row[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("domain column: attstorage=%q want \"x\" (base text extended)", got)
+	}
+
+	// The pg_type row carries typtype='d' and typbasetype=text so dumpDomain can
+	// re-render `CREATE DOMAIN ... AS text`.
+	const (
+		typtypeIdx     = 6
+		typnotnullIdx  = 24
+		typbasetypeIdx = 25
+	)
+	trow := buildUserPGTypeRowForDomain(d)
+	if got := trow[typtypeIdx].StringValue(); got != "d" {
+		t.Errorf("domain pg_type: typtype=%q want \"d\"", got)
+	}
+	if got := uint32(trow[typbasetypeIdx].Int); got != catalog.OIDText {
+		t.Errorf("domain pg_type: typbasetype=%d want %d (text)", got, catalog.OIDText)
+	}
+	if got := trow[typnotnullIdx].BoolValue(); got != false {
+		t.Errorf("domain pg_type: typnotnull=%v want false", got)
+	}
+
+	// LookupDomainByOID is the inverse used by format_type; the domain OID
+	// resolves to its name, and an unrelated built-in OID must NOT resolve.
+	if got, ok := cat.LookupDomainByOID(d.OID); !ok || got.Name != "zipcode" {
+		t.Errorf("LookupDomainByOID(%d)=%v,%v want zipcode,true", d.OID, got, ok)
+	}
+	if _, ok := cat.LookupDomainByOID(uint32(catalog.OIDText)); ok {
+		t.Errorf("LookupDomainByOID(text OID) unexpectedly resolved to a domain")
+	}
+}
+
 // TestUserPGAttributeTypmod pins the atttypmod computation for typmod-bearing
 // columns and the matching format_type round-trip (DU-002 slice 48). Before
 // this, buildUserPGAttributeRow hardcoded atttypmod=-1, so pg_dump rendered

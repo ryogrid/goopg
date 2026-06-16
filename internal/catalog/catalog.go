@@ -611,6 +611,13 @@ type Catalog interface {
 	// its auto-generated array type (`_name`), used by format_type to render an
 	// enum-array column (`mood[]`). DU-002 slice 89.
 	LookupEnumByArrayOID(oid uint32) (*EnumType, bool)
+	// LookupDomain finds a user-defined domain type by name (case-insensitive).
+	// Exposed on the interface so the catalog-row builders can resolve a domain
+	// column's type name to its pg_type OID. DU-002 slice 90.
+	LookupDomain(name string) (*Domain, bool)
+	// LookupDomainByOID finds a user-defined domain type by its pg_type OID, used
+	// by format_type to render a domain column's declared type. DU-002 slice 90.
+	LookupDomainByOID(oid uint32) (*Domain, bool)
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -6348,6 +6355,20 @@ func (c *InMemory) LookupDomain(name string) (*Domain, bool) {
 	defer c.mu.RUnlock()
 	d, ok := c.domains[k]
 	return d, ok
+}
+
+// LookupDomainByOID finds a domain type by its pg_type OID. Used by format_type
+// to render a domain column's declared type as its schema-qualified domain name
+// (not the base type). DU-002 slice 90.
+func (c *InMemory) LookupDomainByOID(oid uint32) (*Domain, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, d := range c.domains {
+		if d.OID == oid {
+			return d, true
+		}
+	}
+	return nil, false
 }
 
 // TablesWithColumnOfType returns all non-virtual tables that have at least one

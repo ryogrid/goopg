@@ -1745,6 +1745,32 @@ object support.
         array-literal form `parsePGArray` expects (cf. the orthogonal
         text[]-from-heap array-encoding note below). Resume = slice 33: make
         `current_schemas()` emit a parseable `name[]` array literal over the wire.
+      - **PROGRESS 2026-06-16 (loop #49):** **DU-002 slice 90 LANDED** (commit
+        pending). A user-defined `DOMAIN` (`CREATE DOMAIN public.zipcode AS text`)
+        and a column of the domain type now survive pg_dump — the second OBJECT
+        type after the enum (slices 88-89). goopg had CREATE DOMAIN DDL but no
+        `pg_type` row, so getTypes never discovered it (no `CREATE DOMAIN`
+        emitted) and a domain column folded to its base (`zip text`). Changes:
+        (a) `syncDomainTypeToCatalogHeap` + `buildUserPGTypeRowForDomain`
+        (`typtype='d'`, typbasetype/typlen/typalign/typstorage/typcollation
+        inherited from the base via `userTypeAttrsForOID`, so dumpDomain renders
+        `AS format_type(typbasetype, typtypmod)` with no spurious COLLATE), wired
+        into execCreateDomain; execDropDomain stamps the row's xmax.
+        (b) `buildUserPGAttributeRow` re-resolves a domain column to the domain
+        OID — keyed on `Column.DeclaredTypeName` (CREATE TABLE stores the
+        base-resolved name via catalog.ResolveColumnType) — while reporting the
+        BASE type's physical layout. (c) `LookupDomain`/`LookupDomainByOID` added
+        to the `Catalog` interface; format_type renders `public.zipcode`.
+        (d) **pg_get_expr(NULL,…) bug fixed**: it returned `''` (non-NULL), so
+        dumpDomain emitted a spurious empty `DEFAULT `; now returns NULL for a
+        NULL node tree (empty-but-non-null still `''`, so partition-bound display
+        is unaffected). Gates: catalog/analyzer/planner/parser/executor suites
+        PASS; new `TestUserPGAttributeDomainColumn` PASS; partition + pub_query
+        (pg_get_expr consumers) PASS; `TestPort_PgDumpConnectionSetup` PASS (real
+        pg_dump round-trip asserts `CREATE DOMAIN public.zipcode AS text;` +
+        `zip public.zipcode`, no `zip text`, no empty DEFAULT). **Next blocker:**
+        run the test after adding the next object type (composite type / range
+        type / domain CHECK constraint) to find the real next gap.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text
