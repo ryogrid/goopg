@@ -5138,21 +5138,31 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 	if baseTypeName.Schema != "" {
 		stmt.BaseType = baseTypeName.Schema + "." + baseTypeName.Name
 	}
-	// Skip optional type arguments like (5) or (8,2).
+	// Capture optional type-modifier arguments like (20) or (10,2) so the
+	// domain's base type round-trips through pg_dump with its declared length/
+	// precision: dumpDomain renders format_type(typbasetype, typtypmod), and a
+	// discarded typmod dumped varchar(20) as bare `character varying`. The cast
+	// PG appends to a string DEFAULT stays typmod-less (format_type(consttype,
+	// -1)), so only the base render needs these. DU-002 slice 95.
 	if p.acceptSymbol("(") {
-		depth := 1
-		for depth > 0 && p.cur().Kind != TokenEOF {
+		for {
 			t := p.cur()
-			if t.Kind == TokenSymbol && t.Value == "(" {
-				depth++
-			} else if t.Kind == TokenSymbol && t.Value == ")" {
-				depth--
-				if depth == 0 {
-					p.advance()
-					break
-				}
+			if t.Kind != TokenIntLit {
+				return nil, p.errAtCur("expected integer in type modifier")
 			}
 			p.advance()
+			n, err := strconv.ParseInt(t.Value, 10, 64)
+			if err != nil {
+				return nil, &SyntaxError{Pos: t.Pos, Message: "invalid integer: " + t.Value}
+			}
+			stmt.BaseTypeArgs = append(stmt.BaseTypeArgs, n)
+			if p.acceptSymbol(",") {
+				continue
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ',' or ')'")
+			}
+			break
 		}
 	}
 	// Accept array notation: int[], text[], etc. Append [] to the base type

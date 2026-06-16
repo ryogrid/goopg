@@ -1,32 +1,33 @@
-Task: DU-002 slice 94 — varchar DOMAIN with string DEFAULT survives pg_dump (COMPLETE, commit pending)
+Task: DU-002 slice 95 — DOMAIN base-type TYPMOD survives pg_dump (COMPLETE, commit pending)
 
 Files:
-- internal/catalog/catalog.go — new domainConstCastTypeName helper maps base name
-  to format_type(-1) spelling (varchar→character varying, char→bpchar, else
-  passthrough); Domain.DefaultBin routes the StringConst cast suffix through it.
-- internal/testport/pgdump_connsetup_test.go — fixture CREATE DOMAIN public.vcdef
-  AS varchar DEFAULT 'na' + dom.vc column; domainDefs asserts
-  `CREATE DOMAIN public.vcdef AS character varying DEFAULT 'na'::character varying;`.
-- docs/design/0110-0001-pg-dump-tap-port.md — slice 94 narrative.
+- internal/parser/ast.go — CreateDomainStmt gains BaseTypeArgs []int64.
+- internal/parser/ddl.go — parseCreateDomain now CAPTURES the `(n[,m])` base-type
+  modifier into stmt.BaseTypeArgs (was: skipped/discarded), mirroring parseColumnType.
+- internal/executor/operators_ddl.go — execCreateDomain threads BaseTypeArgs onto
+  catalog.Type{Name, Args} → RegisterDomain → d.Base.Args.
+- internal/testport/pgdump_connsetup_test.go — fixtures vc20/ch4/numd + dom.v20/c4/nd;
+  domainDefs asserts `character varying(20)`, `character(4) ... ::bpchar`, `numeric(10,2)`.
+- docs/design/0110-0001-pg-dump-tap-port.md — slice 95 narrative.
 
-Key symbols: domainConstCastTypeName (catalog), Domain.DefaultBin, get_const_expr
-(PG oracle: cast name = format_type(consttype, -1)).
+Key symbols: parseCreateDomain, CreateDomainStmt.BaseTypeArgs, execCreateDomain,
+buildUserPGTypeRowForDomain (pgAttTypmod(baseOID, d.Base.Args)), formatTypeOID.
 
-Findings: verified real pg_dump 18.3 — varchar→`::character varying`,
-char→`::bpchar` (internal name, NOT `character`), text→`::text`. Bare varchar (no
-length) chosen to isolate cast-name concern; CREATE DOMAIN parser DISCARDS the
-`(n)` typmod (ddl.go ~5142), so varchar(20)/char(4) domains lose their length in
-both base render and cast — separate larger gap (base-type typmod capture for
-domains). TestPort_PgDumpConnectionSetup PASS (2.1s).
+Findings: verified real pg_dump 18.3 — base render carries typmod
+(format_type(typbasetype, typtypmod)); the string-DEFAULT cast stays typmod-LESS
+(format_type(consttype, -1)) so varchar(20)→`::character varying`, char(4)→`::bpchar`,
+already produced by domainConstCastTypeName (no cast change). numeric default bare.
+Known residual divergence (unreachable here): formatTypeOID(1042,-1) returns
+`character` where real PG returns `bpchar` for a bare bpchar base name — part of
+broader format_type fidelity work.
 
-Gates run: go vet catalog OK; catalog unit PASS; TestPort_PgDumpConnectionSetup
-PASS; pre-commit pgbench smoke runs on commit.
+Gates run: go build parser/executor/catalog OK; go vet OK; parser+catalog unit PASS;
+executor Domain/PGType unit PASS; TestPort_PgDumpConnectionSetup PASS (2.2s);
+pre-commit pgbench smoke runs on commit.
 
-Next step: slice 95 — next domain/object increment. Candidates:
-  (a) char/bpchar domain bare DEFAULT (`AS character ... DEFAULT 'x'::bpchar`) —
-      exercises the bpchar branch of domainConstCastTypeName directly.
-  (b) DOMAIN base-type typmod capture (varchar(20)→`character varying(20)` +
-      `(20)`-less cast) — parser change in parseCreateDomain to keep type args.
-  (c) DOMAIN CHECK (VALUE ...) — needs pg_constraint contype='c' + pg_get_constraintdef.
-  (d) composite type (CREATE TYPE AS (...)) — third object type; dumpCompositeType.
+Next step: slice 96 — next domain/object increment. Candidates:
+  (a) DOMAIN CHECK (VALUE ...) — needs pg_constraint contype='c' for domains +
+      pg_get_constraintdef over a domain check (CheckInValues already parsed/stored).
+  (b) composite type (CREATE TYPE AS (...)) — third object type; dumpCompositeType.
+  (c) bare-bpchar base-name render (formatTypeOID(1042,-1) → bpchar) — format_type gap.
 ADD fixture object, RUN TestPort_PgDumpConnectionSetup, let it report the real blocker.

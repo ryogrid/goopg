@@ -2171,6 +2171,27 @@ name), so a `varchar(20)` domain would lose its `(20)` in both the base-type
 render and the cast — base-type typmod capture for domains is a separate,
 larger gap left for a future slice.
 
+Slice 95 closes that gap: a DOMAIN whose base type carries a **typmod**
+(`varchar(20)`, `char(4)`, `numeric(10,2)`) now round-trips the declared
+length/precision. `dumpDomain` renders the base via
+`format_type(typbasetype, typtypmod)`, so a discarded modifier dumped
+`varchar(20)` as bare `character varying`. `parseCreateDomain` previously
+*skipped* the `(n)` argument list; it now captures it into the new
+`CreateDomainStmt.BaseTypeArgs`, and `execCreateDomain` threads it onto
+`catalog.Domain.Base.Args`, so `pgAttTypmod` computes the canonical
+`typtypmod` and `formatTypeOID` renders `character varying(20)` /
+`character(4)` / `numeric(10,2)`. The cast `get_const_expr` appends to a
+string DEFAULT stays **typmod-less** — it is `format_type(consttype, -1)`, so
+`varchar(20)` → `::character varying` and `char(4)` → `::bpchar` (the internal
+name) — which `domainConstCastTypeName` already produced, so no cast change was
+needed (verified against real pg_dump 18.3:
+`CREATE DOMAIN public.ch4 AS character(4) DEFAULT 'ab'::bpchar;`). The numeric
+default deparses bare (`DEFAULT 1.5`, a self-evident numeric Const). The bare
+`bpchar`/`char` base *name* without a typmod remains a known divergence —
+`formatTypeOID(1042, -1)` returns `character` where real PG returns `bpchar` —
+but it is unreachable here because every typmod-bearing case carries an explicit
+length; bare-name base render is part of the broader format_type fidelity work.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

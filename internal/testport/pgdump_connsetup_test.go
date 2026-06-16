@@ -720,7 +720,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.vcdef AS varchar DEFAULT 'na'"); err != nil {
 		t.Fatalf("create domain vcdef: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef)"); err != nil {
+	// Slice 95: a DOMAIN whose base type carries a TYPMOD (varchar(20), char(4),
+	// numeric(10,2)) must round-trip the declared length/precision. pg_dump's
+	// dumpDomain renders the base via format_type(typbasetype, typtypmod); goopg's
+	// CREATE DOMAIN parser previously DISCARDED the `(n)` modifier, so typtypmod
+	// stayed -1 and varchar(20) dumped as bare `character varying` — a
+	// schema-fidelity loss. The parser now captures BaseTypeArgs and the executor
+	// threads them onto catalog.Domain.Base.Args, so pgAttTypmod yields the right
+	// typtypmod. The cast PG appends to a string DEFAULT stays typmod-less
+	// (format_type(consttype, -1)) — varchar(20)→`::character varying`,
+	// char(4)→`::bpchar` (internal name) — verified against real pg_dump 18.3. The
+	// numeric default deparses bare (a numeric Const is self-evident, no cast).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.vc20 AS varchar(20) DEFAULT 'na'"); err != nil {
+		t.Fatalf("create domain vc20: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.ch4 AS char(4) DEFAULT 'ab'"); err != nil {
+		t.Fatalf("create domain ch4: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.numd AS numeric(10,2) DEFAULT 1.5"); err != nil {
+		t.Fatalf("create domain numd: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1326,6 +1346,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// `varchar` alias).
 			"CREATE DOMAIN public.vcdef AS character varying DEFAULT 'na'::character varying;",
 			"vc public.vcdef",
+			// Slice 95: a typmod-bearing base type round-trips the declared length/
+			// precision. The base render carries the typmod (character varying(20),
+			// character(4), numeric(10,2)); the string DEFAULT's cast stays
+			// typmod-less (::character varying, ::bpchar). The numeric default is bare.
+			"CREATE DOMAIN public.vc20 AS character varying(20) DEFAULT 'na'::character varying;",
+			"v20 public.vc20",
+			"CREATE DOMAIN public.ch4 AS character(4) DEFAULT 'ab'::bpchar;",
+			"c4 public.ch4",
+			"CREATE DOMAIN public.numd AS numeric(10,2) DEFAULT 1.5;",
+			"nd public.numd",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

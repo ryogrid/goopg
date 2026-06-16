@@ -8655,7 +8655,7 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	if !ok {
 		return nil
 	}
-	baseType := catalog.Type{Name: s.BaseType}
+	baseType := catalog.Type{Name: s.BaseType, Args: s.BaseTypeArgs}
 	d, err := cat.RegisterDomain(s.Name, baseType, s.NotNull, s.CheckInValues...)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}

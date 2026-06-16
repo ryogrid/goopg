@@ -1996,7 +1996,8 @@ type CreateDomainStmt struct {
 	pos           int
 	Name          string
 	Schema        string
-	BaseType      string // base type name
+	BaseType      string  // base type name
+	BaseTypeArgs  []int64 // base-type modifier args: varchar(20)→[20], numeric(10,2)→[10,2]. DU-002 slice 95.
 	NotNull       bool
 	CheckInValues []string // allowed values from CHECK (VALUE IN ('a','b','c')), M0097-domain-check
 	Default       Expr     // DEFAULT expression AST, nil when no DEFAULT clause. DU-002 slice 92.
