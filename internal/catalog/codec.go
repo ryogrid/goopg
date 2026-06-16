@@ -119,6 +119,11 @@ const (
 	// format_type renders the bare type name.
 	OIDTxidSnapshot uint32 = 2970
 	OIDPgSnapshot   uint32 = 5038
+	// DU-002 slice 78: xid8 (the 64-bit full transaction-id type, the element
+	// of pg_snapshot). Seeded in pg_type (see initdb/pg_type_seed_data.go) so a
+	// PG standby can resolve the OID. It is an 8-byte by-value type with no
+	// typmod, so format_type renders the bare type name.
+	OIDXid8 uint32 = 5069
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -191,6 +196,9 @@ const (
 	// format_type renders the bare element name with a [] suffix.
 	OIDArrayTxidSnapshot uint32 = 2949
 	OIDArrayPgSnapshot   uint32 = 5039
+	// DU-002 slice 78: the xid8 array type. xid8 has no typmod, so format_type
+	// renders the bare element name with a [] suffix.
+	OIDArrayXid8 uint32 = 271
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -279,6 +287,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayTxidSnapshot
 	case OIDPgSnapshot:
 		return OIDArrayPgSnapshot
+	case OIDXid8:
+		return OIDArrayXid8
 	}
 	return 0
 }
@@ -369,6 +379,8 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDTxidSnapshot, true
 	case OIDArrayPgSnapshot:
 		return OIDPgSnapshot, true
+	case OIDArrayXid8:
+		return OIDXid8, true
 	}
 	return 0, false
 }
@@ -1225,6 +1237,8 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDTxidSnapshot
 	case "pg_snapshot":
 		return OIDPgSnapshot
+	case "xid8":
+		return OIDXid8
 	default:
 		return OIDText // safe fallback
 	}
@@ -1317,6 +1331,8 @@ func OIDToTypeName(oid uint32) string {
 		return "txid_snapshot"
 	case OIDPgSnapshot:
 		return "pg_snapshot"
+	case OIDXid8:
+		return "xid8"
 	default:
 		return "text"
 	}

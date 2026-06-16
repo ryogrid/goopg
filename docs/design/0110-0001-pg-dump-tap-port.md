@@ -1679,6 +1679,23 @@ fixed one logical group per loop:
     `txs txid_snapshot`, `txss txid_snapshot[]`, `pgs pg_snapshot`, `pgss
     pg_snapshot[]` columns in `TestPort_PgDumpConnectionSetup` and new rows in
     `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`.
+  - **Slice 78 — `xid8` (+ its array type) (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** `xid8` (OID 5069, array `_xid8` 271) is the
+    64-bit full-transaction-id type and the element of `pg_snapshot`. It is
+    already seeded in `pg_type_seed_data.go` and recognized as a known builtin by
+    the analyzer (`isKnownBuiltinType`), with input/cast/cmp support in
+    `expr.go` (M0097-0018), but had never been wired into the pg_dump
+    catalog-codec path, so an `xid8` column fell back to `text` (OID 25). It is
+    an 8-byte by-value type with no typmod, so this is the plain 3-site pattern:
+    the scalar is `typlen=8`, `typbyval=t`, `typalign='d'`, `typstorage='p'`; the
+    array is the varlena `typlen=-1`, `typbyval=f`, `typalign='d'`,
+    `typstorage='x'`. `TypeNameToOID` / `OIDToTypeName` / `ArrayOIDForBase` /
+    `BaseOIDForArray` gained the two cases; `oidToBuiltinTypeName` and
+    `formatTypeOID` gained scalar + array cases (none existed before). Guarded by
+    the `arr` fixture's `x8 xid8`, `x8s xid8[]` columns in
+    `TestPort_PgDumpConnectionSetup` and new rows in
+    `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1741,7 +1758,8 @@ slice 73 adds the full-text-search family `tsv tsvector`, `tsvs tsvector[]`,
 money`, and `mnys money[]`; slice 75 adds the typmod-bearing `bv bit(8)`, `bvs
 bit(8)[]`, `vb varbit(16)`, and `vbs varbit(16)[]`; slice 76 adds `lsn pg_lsn`
 and `lsns pg_lsn[]`; slice 77 adds the snapshot types `txs txid_snapshot`, `txss
-txid_snapshot[]`, `pgs pg_snapshot`, and `pgss pg_snapshot[]`.
+txid_snapshot[]`, `pgs pg_snapshot`, and `pgss pg_snapshot[]`; slice 78 adds `x8
+xid8` and `x8s xid8[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
