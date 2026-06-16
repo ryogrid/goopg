@@ -1,53 +1,46 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 57 COMPLETE
-(committing this loop). NEXT loop starts on slice 58.
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 58 COMPLETE
+(committing this loop). NEXT loop starts on slice 59.
 NOTHING in flight after commit.
 
-=== DONE (loop #12) — DU-002 slice 57 (VIEW round-trip via pg_get_viewdef) ===
-Real gap: a single user VIEW made pg_dump ABORT THE WHOLE DUMP —
-`definition of view "v" appears to be empty (length zero)`. pg_dump's
-createViewAsClause calls pg_get_viewdef(oid), which goopg stubbed to NULL.
-Side effect: table DATA emitted after the view never appeared either.
-FIX (raw-text capture, NOT a full deparser):
- - parser: parser struct keeps the original source string (p.src, set in
-   Parse). New captureSrcSpan(startPos, endTok) slices src text, trims
-   whitespace + trailing ';'. parseCreateViewTail stores the view body span on
-   CreateViewStmt.RawDef (excludes the trailing WITH CHECK OPTION clause).
- - catalog.Table: new ViewDef string field.
- - executor execCreateView: copies s.RawDef → vt.ViewDef (CreateView returns the
-   fresh table for both CREATE and CREATE OR REPLACE).
- - executor pg_get_viewdef (expr.go): resolves arg as OID (pg_dump) or name
-   (psql) → view → returns ViewDef + ";". pg_dump Asserts last char is ';',
-   strips it, wraps body in `CREATE VIEW … AS <body>`.
-Files: internal/parser/parser.go (src field + captureSrcSpan + p.src=input),
-internal/parser/ddl.go (parseCreateViewTail capture),
-internal/parser/ast.go (CreateViewStmt.RawDef),
-internal/catalog/catalog.go (Table.ViewDef field),
-internal/executor/operators_ddl.go (execCreateView stores ViewDef),
-internal/executor/expr.go (pg_get_viewdef impl),
-internal/parser/view_test.go (NEW TestParseCreateViewRawDef),
-internal/testport/pgdump_connsetup_test.go (CREATE VIEW fixture + slice-57 asserts + header),
-docs/design/0110-0001-pg-dump-tap-port.md (slice 57 entry + guard paragraph).
-FIDELITY GAP (documented/deferred): raw text is NOT schema-qualified — PG's
-deparser qualifies unqualified relation refs. Qualified views (fixture uses
-public.foo) restore cleanly under pg_dump's search_path=''; an unqualified view
-would fail to restore. RECURSIVE views + materialized views capture no RawDef
-yet (different parser paths) — follow-up.
-Gates: gofmt clean (touched files); vet clean (parser+executor); parser +
-catalog + executor + initdb suites PASS; new TestParseCreateViewRawDef PASS;
-TestPort_PgDumpConnectionSetup PASS (exit-0, view round-trips, DATA emits);
-pgbench CI-parity smoke via pre-commit hook.
+=== DONE (loop #13) — DU-002 slice 58 (VIEW explicit column-list round-trip) ===
+Real gap (probed empirically): `CREATE VIEW v (col_a, col_b) AS SELECT id, name
+FROM foo` dumped as `CREATE VIEW v AS SELECT id, name FROM foo` — the renamed
+column names were LOST (restored view exposed id/name, not col_a/col_b). PG's
+pg_get_viewdef bakes the names in as `expr AS cN`.
+FIX (raw-text splice, NOT a deparser): executor pg_get_viewdef now calls new
+`applyViewColumnAliases(rawDef, view.ViewColumnAliases)` when the view has an
+explicit column list (ViewColumnAliases was already populated by CreateView).
+It finds the top-level FROM boundary (findTopLevelFromKeyword — paren/bracket +
+quote aware so EXTRACT(.. FROM ..)/subqueries are safe), splits the select list
+on top-level commas (reused existing splitTopLevelCommas in plpgsql_runtime.go),
+appends ` AS <name>` (quoteViewIdent quotes only non-simple-lowercase idents).
+BAILS to raw text (names lost) when: item count != alias count, item is `*`/
+`x.*`, or item already has a top-level AS alias (hasTopLevelAsAlias). Documented
+fidelity gaps.
+Files: internal/executor/expr.go (pg_get_viewdef wiring + 4 new helpers near the
+array-literal quoting fns; NOTE splitTopLevelCommas already existed in
+plpgsql_runtime.go — reused, did NOT redeclare),
+internal/executor/viewdef_aliases_test.go (NEW TestApplyViewColumnAliases, 13
+cases), internal/testport/pgdump_connsetup_test.go (foo_rview fixture + slice-58
+asserts + header doc), docs/design/0110-0001-pg-dump-tap-port.md (slice 58 entry
++ guard paragraph + unit-guard list).
+Gates: gofmt clean; vet clean (executor); executor+parser+catalog suites PASS;
+TestApplyViewColumnAliases PASS; TestPort_PgDumpConnectionSetup PASS (exit-0,
+renamed-col view round-trips); pgbench CI-parity smoke via pre-commit hook.
 
-=== NEXT STEP — DU-002 slice 58 ===
+=== NEXT STEP — DU-002 slice 59 ===
 Enrich the fixture to find the next REAL pg_dump gap. Candidates probed/known:
-  - VIEW with renamed columns: CREATE VIEW v(a,b) AS … — RawDef body lacks the
-    aliases, so pg_dump would emit wrong column names. Likely a real gap.
-  - MATERIALIZED VIEW round-trip (no RawDef captured yet; needs its own path).
+  - MATERIALIZED VIEW round-trip (no RawDef captured yet; needs its own parser
+    path — CREATE MATERIALIZED VIEW likely a different AST node).
   - SEQUENCE / serial column — sequences skipped from pg_class virtual view
     (Virtual && no View), so getTables never sees relkind='S'; larger slice.
-  - Column DEFAULT expression (DEFAULT now()) — VERIFIED WORKS (slice-57 probe).
+  - RECURSIVE view (WITH RECURSIVE … ) — RawDef capture path may differ.
+  - GENERATED column / IDENTITY column round-trip.
 ALWAYS: add ONE fixture element, run TestPort_PgDumpConnectionSetup, inspect the
-actual dumped output (temporary PROBE t.Logf), confirm whether goopg already
-handles it before assuming a gap.
+actual dumped output (temporary PROBE t.Logf at the exit-0 return), confirm
+whether goopg already handles it before assuming a gap (CHECK constraints,
+DEFAULT now(), typmods, FKs, comments, ordered indexes ALL already work — seen in
+the slice-58 probe dump).
 Known orthogonal: plpgsql user funcs can't be dumped (plpgsql absent from
 pg_language). Server SILENTLY SWALLOWS parse errors on COMMENT/DDL stmts.
 

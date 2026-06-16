@@ -358,6 +358,13 @@ package testport
 // fidelity gap — qualified views like the fixture's round-trip cleanly under
 // pg_dump's search_path=''). RECURSIVE views and materialized views capture no
 // RawDef yet (follow-up).
+// Slice 58 extends VIEW fidelity to an explicit column list
+// (`CREATE VIEW v (c1, c2, …) AS …`). PG's pg_get_viewdef bakes the renamed
+// names into the select list as `expr AS cN`; goopg's applyViewColumnAliases
+// (internal/executor/expr.go) splices them into the captured raw body so the
+// restored view exposes the declared names, not the underlying ones. The
+// rewrite is unambiguous-only (top-level item count must match; bails to raw
+// text on `*`/`x.*`/already-aliased items — a documented fidelity gap).
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
@@ -490,6 +497,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// view restores under pg_dump's search_path='' setting.
 	if err := runSQLSimple(t, c, "CREATE VIEW public.foo_view AS SELECT id, name FROM public.foo WHERE qty > 0"); err != nil {
 		t.Fatalf("create view foo_view: %v", err)
+	}
+
+	// Slice 58: a VIEW created with an explicit column list renames its
+	// output columns. pg_dump fetches the body via pg_get_viewdef, which in PG
+	// bakes the renamed names into the SELECT as `expr AS cN`. goopg captures
+	// the body verbatim, so without alias splicing the dumped view would carry
+	// the underlying column names (id, name) instead of (col_a, col_b) — a
+	// silent fidelity loss. applyViewColumnAliases now splices the names in.
+	if err := runSQLSimple(t, c, "CREATE VIEW public.foo_rview (col_a, col_b) AS SELECT id, name FROM public.foo"); err != nil {
+		t.Fatalf("create view foo_rview: %v", err)
 	}
 
 	res, err := util.RunCommand(util.CommandSpec{
@@ -720,6 +737,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		for _, sub := range viewDefs {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped a VIEW; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// **Slice 58 (asserted):** a VIEW with an explicit column list must
+		// round-trip with the renamed column names. pg_get_viewdef now splices
+		// the `(col_a, col_b)` names into the select list as `AS` aliases, so the
+		// restored view exposes the declared column names rather than the
+		// underlying `id, name`. Regression guard for applyViewColumnAliases.
+		rviewDefs := []string{
+			"CREATE VIEW public.foo_rview AS",
+			"SELECT id AS col_a, name AS col_b FROM public.foo;",
+		}
+		for _, sub := range rviewDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped renamed view columns; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
 		return

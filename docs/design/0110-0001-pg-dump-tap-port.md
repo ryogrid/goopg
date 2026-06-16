@@ -1272,6 +1272,28 @@ fixed one logical group per loop:
     `parser.TestParseCreateViewRawDef` (body capture incl. trailing-`;` trim and
     `WITH CHECK OPTION` exclusion).
 
+  - **Slice 58 — VIEW with an explicit column list (`internal/executor/expr.go`).**
+    `CREATE VIEW v (c1, c2, …) AS …` renames the view's output columns. PG's
+    `pg_get_viewdef` bakes those names into the select list as `expr AS cN`, so
+    the dumped/restored view exposes the declared names. goopg captures the body
+    verbatim (slice 57) and the explicit names were already stored on
+    `catalog.Table.ViewColumnAliases`, but `pg_get_viewdef` echoed the raw body
+    unchanged — the restored view carried the *underlying* column names (e.g.
+    `id, name`) instead of the declared `(col_a, col_b)`, a silent fidelity loss.
+    Fix: `applyViewColumnAliases` splices the names into the raw select-list text
+    when the view has a column list. It is a deliberately small, raw-text rewrite
+    (no deparser): it finds the top-level `FROM` boundary (`findTopLevelFromKeyword`,
+    respecting paren/bracket depth and string/identifier literals so `EXTRACT(…
+    FROM …)` and subqueries are not mistaken for the clause), splits the select
+    list on top-level commas (the existing `splitTopLevelCommas`), and appends
+    ` AS <name>` (quoted via `quoteViewIdent` only when not a simple lowercase
+    identifier) to each item. **Bails to the raw text** (renamed names lost) when
+    it cannot rewrite unambiguously: top-level item count ≠ alias count, any item
+    is `*`/`x.*`, or any item already carries a top-level `AS` alias — documented
+    fidelity gaps for those uncommon shapes. Unit guard:
+    `executor.TestApplyViewColumnAliases` (13 cases incl. internal-comma/internal-FROM
+    protection, quoting, and every bail path).
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
@@ -1298,7 +1320,10 @@ plain secondary index, a partial index, and two ordered indexes all round-trip �
 0`, `… foo_name_desc_idx … (name DESC NULLS LAST)`, and `… foo_ord_idx … (name
 DESC, qty NULLS FIRST)`; slice 57 asserts a VIEW round-trips — `CREATE VIEW
 public.foo_view AS` followed by the verbatim body `SELECT id, name FROM
-public.foo WHERE qty > 0;`. Unit guards:
+public.foo WHERE qty > 0;`; slice 58 asserts a VIEW created with an explicit
+column list round-trips with the renamed columns — `CREATE VIEW
+public.foo_rview AS` followed by `SELECT id AS col_a, name AS col_b FROM
+public.foo;`. Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
 `executor.TestAlterTableAddForeignKeyCapturesActions`,
@@ -1309,7 +1334,9 @@ public.foo WHERE qty > 0;`. Unit guards:
 `parser.TestParseCreateIndexColOrders`,
 `catalog.TestBuildIndexDefColOrder`,
 `config.TestPgDumpConnectionSetupGUCs`,
-`parser.TestParseSetTransactionCommaSeparated`.
+`parser.TestParseSetTransactionCommaSeparated`,
+`parser.TestParseCreateViewRawDef`,
+`executor.TestApplyViewColumnAliases`.
 
 ## Deferred (002–010) — catalog surface estimate
 

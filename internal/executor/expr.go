@@ -5538,7 +5538,16 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if view == nil || view.View == nil || view.ViewDef == "" {
 			return NullDatum, nil
 		}
-		return NewStringDatum(view.ViewDef + ";"), nil
+		def := view.ViewDef
+		// A `CREATE VIEW v (c1, c2, …) AS …` explicit column list renames the
+		// view's output columns. PG's pg_get_viewdef bakes those names into the
+		// SELECT as `expr AS cN`; goopg captures the body verbatim (no deparser),
+		// so splice the aliases into the raw select-list text. Skipped (raw text
+		// returned) when the view has no explicit column list. M0110-0001 (DU-002).
+		if len(view.ViewColumnAliases) > 0 {
+			def = applyViewColumnAliases(def, view.ViewColumnAliases)
+		}
+		return NewStringDatum(def + ";"), nil
 	case "pg_collation_for":
 		// Return "POSIX" to match the C/POSIX locale used in regression tests.
 		// PG regression databases are created with --locale=C, so text values
@@ -9609,6 +9618,198 @@ func formatTextArrayWithNulls(elems []string, nulls []bool) string {
 	}
 	sb.WriteByte('}')
 	return sb.String()
+}
+
+// applyViewColumnAliases rewrites the top-level select-list of a view's raw
+// definition so each output column carries the explicit name from a
+// `CREATE VIEW v (c1, c2, …)` column list, mirroring how PostgreSQL's
+// pg_get_viewdef bakes the view column names into the SELECT as `expr AS cN`.
+// goopg captures the view body verbatim (no deparser), so the aliases are
+// spliced into the raw text.
+//
+// The rewrite is applied ONLY when it can be done unambiguously: the body must
+// begin with the SELECT keyword, the top-level select list must split into
+// exactly len(aliases) items, and no item may be a `*`/`x.*` star or already
+// carry a top-level `AS` alias. Otherwise the raw text is returned unchanged
+// (the renamed column names are then lost — a documented fidelity gap for these
+// uncommon shapes). Quoting/paren/bracket nesting and string/identifier
+// literals are respected when locating the FROM boundary and item commas.
+func applyViewColumnAliases(rawDef string, aliases []string) string {
+	if len(aliases) == 0 {
+		return rawDef
+	}
+	trimmed := strings.TrimLeft(rawDef, " \t\n\r")
+	const kw = "select"
+	if len(trimmed) < len(kw) || !strings.EqualFold(trimmed[:len(kw)], kw) {
+		return rawDef
+	}
+	rest := trimmed[len(kw):]
+	// Guard against matching e.g. "selected" — the SELECT keyword must be
+	// followed by a non-identifier byte (whitespace/paren).
+	if rest == "" || isViewIdentByte(rest[0]) {
+		return rawDef
+	}
+	// The select list ends at the first top-level FROM, or end-of-string when
+	// the view body has no FROM clause (e.g. `SELECT 1 AS x`).
+	selectList := rest
+	tail := ""
+	if from := findTopLevelFromKeyword(rest); from >= 0 {
+		selectList = rest[:from]
+		tail = rest[from:]
+	}
+	items := splitTopLevelCommas(selectList)
+	if len(items) != len(aliases) {
+		return rawDef
+	}
+	var sb strings.Builder
+	sb.WriteString(trimmed[:len(kw)]) // preserve the original SELECT casing
+	for i, item := range items {
+		expr := strings.TrimSpace(item)
+		if expr == "" || expr == "*" || strings.HasSuffix(expr, ".*") || hasTopLevelAsAlias(expr) {
+			return rawDef
+		}
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte(' ')
+		sb.WriteString(expr)
+		sb.WriteString(" AS ")
+		sb.WriteString(quoteViewIdent(aliases[i]))
+	}
+	if tail != "" {
+		sb.WriteByte(' ')
+		sb.WriteString(tail)
+	}
+	return sb.String()
+}
+
+// isViewIdentByte reports whether b can appear in an unquoted SQL identifier.
+func isViewIdentByte(b byte) bool {
+	return b == '_' || b == '$' ||
+		(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// findTopLevelFromKeyword returns the byte index of the first `FROM` keyword in
+// s that appears at paren/bracket depth 0 and outside string/identifier
+// literals, with identifier word boundaries on both sides; -1 if none.
+func findTopLevelFromKeyword(s string) int {
+	depth := 0
+	inSingle, inDouble := false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case inSingle:
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+				} else {
+					inSingle = false
+				}
+			}
+		case inDouble:
+			if c == '"' {
+				if i+1 < len(s) && s[i+1] == '"' {
+					i++
+				} else {
+					inDouble = false
+				}
+			}
+		case c == '\'':
+			inSingle = true
+		case c == '"':
+			inDouble = true
+		case c == '(' || c == '[':
+			depth++
+		case c == ')' || c == ']':
+			if depth > 0 {
+				depth--
+			}
+		case depth == 0 && (c == 'f' || c == 'F'):
+			if i+4 <= len(s) && strings.EqualFold(s[i:i+4], "from") {
+				prevOK := i == 0 || !isViewIdentByte(s[i-1])
+				nextOK := i+4 == len(s) || !isViewIdentByte(s[i+4])
+				if prevOK && nextOK {
+					return i
+				}
+			}
+		}
+	}
+	return -1
+}
+
+// hasTopLevelAsAlias reports whether expr contains an `AS` keyword at
+// paren/bracket depth 0 and outside literals — i.e. it already names its output
+// column. Such items are left untouched (the whole rewrite bails) to avoid
+// generating `expr AS old AS new`. A bare trailing alias without AS is not
+// detected (atypical alongside an explicit view column list).
+func hasTopLevelAsAlias(expr string) bool {
+	depth := 0
+	inSingle, inDouble := false, false
+	for i := 0; i < len(expr); i++ {
+		c := expr[i]
+		switch {
+		case inSingle:
+			if c == '\'' {
+				if i+1 < len(expr) && expr[i+1] == '\'' {
+					i++
+				} else {
+					inSingle = false
+				}
+			}
+		case inDouble:
+			if c == '"' {
+				if i+1 < len(expr) && expr[i+1] == '"' {
+					i++
+				} else {
+					inDouble = false
+				}
+			}
+		case c == '\'':
+			inSingle = true
+		case c == '"':
+			inDouble = true
+		case c == '(' || c == '[':
+			depth++
+		case c == ')' || c == ']':
+			if depth > 0 {
+				depth--
+			}
+		case depth == 0 && (c == 'a' || c == 'A'):
+			if i+2 <= len(expr) && strings.EqualFold(expr[i:i+2], "as") {
+				prevOK := i == 0 || !isViewIdentByte(expr[i-1])
+				nextOK := i+2 == len(expr) || !isViewIdentByte(expr[i+2])
+				if prevOK && nextOK {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// quoteViewIdent renders an alias as a SQL identifier, double-quoting it only
+// when it is not a simple lowercase identifier (mirrors PG's quote_identifier).
+func quoteViewIdent(s string) string {
+	simple := len(s) > 0
+	if simple {
+		c := s[0]
+		if !(c == '_' || (c >= 'a' && c <= 'z')) {
+			simple = false
+		}
+	}
+	if simple {
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if !(c == '_' || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+				simple = false
+				break
+			}
+		}
+	}
+	if simple {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 // applyPgFormat implements PostgreSQL's format() function for common specifiers:
