@@ -2388,6 +2388,34 @@ object support.
         commit. **Next: slice 123** — a table+sequence+VIEW dependency-ordering
         case (view depends on table; verify topological emission order), or a
         mixed identity+serial table stressing both deptype paths in one graph.
+      - **PROGRESS 2026-06-17 (loop #87):** **DU-002 slice 123 LANDED** — a table
+        mixing an IDENTITY column and a SERIAL column on one relation
+        (`CREATE TABLE public.mix (id integer GENERATED ALWAYS AS IDENTITY,
+        n serial, note text)`). Both columns own a sequence, but via DIFFERENT
+        pg_depend deptypes ('i' identity vs 'a' serial), so pg_dump emits a
+        DIFFERENT shape for each on the SAME table: the identity sequence is
+        embedded in `ALTER TABLE … ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME
+        …)` with NO standalone CREATE SEQUENCE / OWNED BY / SET DEFAULT, while the
+        serial sequence emits standalone CREATE SEQUENCE + OWNED BY + separate SET
+        DEFAULT. **No production code change** — slice-120 + slice-121 machinery
+        compose on one relation as-is; the slice is a regression guard for the
+        deptype sibling-path hazard (`dependVirtualRows` must tag the identity
+        sequence 'i' and the serial sequence 'a' on the same table; a mis-tag
+        flips the emitted shape). Verified byte-identical vs real pg_dump 18.3
+        (reference `/tmp/du123_pgdata`), with positive asserts for both shapes +
+        negative guards that the two paths never cross (no standalone CREATE
+        SEQUENCE / OWNED BY for `mix_id_seq`; no ADD GENERATED on column `n`; no
+        SET DEFAULT nextval on column `id`). The unqualified `id` negative was
+        initially too broad (matched `ser_tbl`'s own `id` serial default), so the
+        negatives are scoped with the `public.mix` table prefix. Files:
+        `internal/testport/pgdump_connsetup_test.go` (mix fixture + asserts +
+        cross-path negative guards), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 123 section). Gates: gofmt OK; `go build ./...` OK;
+        `TestPort_PgDumpConnectionSetup` PASS (2.01s); pgbench pre-commit smoke on
+        commit. **Next: slice 124** — a table+sequence+VIEW dependency-ordering
+        case (view depends on table; verify topological emission ORDER, not just
+        presence), or an explicit-START / non-default serial sequence (serial added
+        via ALTER TABLE ADD COLUMN, or a serial with a manually-bumped value).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

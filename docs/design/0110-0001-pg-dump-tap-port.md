@@ -3132,6 +3132,49 @@ byte-identically to real pg_dump 18.3 **and** adds negative guards that neither
 multi-attrdef-per-table path against future regressions in the oid numbering or
 the depend-row pairing.
 
+### Slice 123 — mixed identity + serial table (two deptypes on one relation)
+
+Slice 123 puts both an IDENTITY column (slice 120, INTERNAL `'i'`) and a SERIAL
+column (slice 121, AUTO `'a'`) on **one** table (`CREATE TABLE public.mix (id
+integer GENERATED ALWAYS AS IDENTITY, n serial, note text)`). Both columns own a
+sequence, but pg_dump emits a **different form** for each on the same relation —
+the deptype decides the shape:
+
+```sql
+CREATE TABLE public.mix (
+    id integer NOT NULL,
+    n integer NOT NULL,
+    note text
+);
+-- identity sequence: embedded in the IDENTITY clause, NO standalone CREATE
+-- SEQUENCE, NO OWNED BY, NO SET DEFAULT
+ALTER TABLE public.mix ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME public.mix_id_seq START WITH 1 INCREMENT BY 1 …
+);
+-- serial sequence: standalone CREATE SEQUENCE + OWNED BY + separate SET DEFAULT
+CREATE SEQUENCE public.mix_n_seq AS integer …;
+ALTER SEQUENCE public.mix_n_seq OWNED BY public.mix.n;
+ALTER TABLE ONLY public.mix ALTER COLUMN n SET DEFAULT nextval('public.mix_n_seq'::regclass);
+SELECT pg_catalog.setval('public.mix_id_seq', 1, false);
+SELECT pg_catalog.setval('public.mix_n_seq', 1, false);
+```
+
+**No production code change was required** — the slice-120 and slice-121
+machinery compose on one relation as-is. The verification value is the **deptype
+sibling-path hazard**: `dependVirtualRows` must tag the identity sequence's
+`pg_depend` row INTERNAL (`'i'`) and the serial sequence's AUTO (`'a'`) *on the
+same table*. If either were mis-classified, pg_dump would emit the wrong shape —
+a standalone `CREATE SEQUENCE public.mix_id_seq` for the identity sequence, or an
+`ADD GENERATED … AS IDENTITY` clause (and no SET DEFAULT) for the serial column.
+The slice asserts both forms round-trip byte-identically to real pg_dump 18.3
+**and** adds negative guards that the two paths never cross (no standalone
+`CREATE SEQUENCE`/`OWNED BY` for `mix_id_seq`; no `ADD GENERATED` on column `n`;
+no `SET DEFAULT nextval` on column `id`). One subtlety surfaced while writing the
+guards: an unqualified `ALTER COLUMN id SET DEFAULT nextval` negative falsely
+matched `ser_tbl`'s legitimate serial default (its column is also named `id`), so
+the negatives are scoped with the `public.mix` table prefix. This locks the
+identity/serial deptype split against future regressions in `dependVirtualRows`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

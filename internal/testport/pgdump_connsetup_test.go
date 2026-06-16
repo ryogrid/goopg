@@ -674,6 +674,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table mser: %v", err)
 	}
 
+	// Slice 123: a table mixing an IDENTITY column and a SERIAL column. Both own a
+	// sequence, but via DIFFERENT pg_depend deptypes — the identity sequence is an
+	// INTERNAL ('i') dependency (slice 120), the serial sequence is the attrdef
+	// ('a')/owned ('a') pair (slice 121). pg_dump routes each to a DIFFERENT
+	// emission form on the SAME table: the identity sequence is embedded inside
+	// `ALTER TABLE ... ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME ...)` with NO
+	// standalone CREATE SEQUENCE and NO `OWNED BY`, while the serial sequence emits
+	// a standalone CREATE SEQUENCE + `OWNED BY` + separate SET DEFAULT. If goopg's
+	// dependVirtualRows mis-classified either owned sequence (identity tagged 'a' or
+	// serial tagged 'i'), pg_dump would emit the wrong form — a standalone
+	// CREATE SEQUENCE for the identity sequence, or an IDENTITY clause for the
+	// serial column. This is the deptype sibling-path hazard: both paths must
+	// coexist on one relation's dependency graph. Verified byte-identical to real
+	// pg_dump 18.3 (/tmp/du123_pgdata).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.mix (id integer GENERATED ALWAYS AS IDENTITY, n serial, note text)"); err != nil {
+		t.Fatalf("create table mix: %v", err)
+	}
+
 	// Slice 61: a RECURSIVE VIEW must survive the dump. PG stores a recursive
 	// view as a regular view over a WITH RECURSIVE CTE; pg_dump fetches the body
 	// via the SAME pg_get_viewdef path as a plain view and aborts the WHOLE dump
@@ -1588,6 +1606,40 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		} {
 			if strings.Contains(res.Stdout, neg) {
 				t.Errorf("pg_dump cross-wired a multi-serial default to the wrong sequence: %q\n  full stdout=%q", neg, res.Stdout)
+			}
+		}
+		// **Slice 123 (asserted):** a table mixing an IDENTITY column and a SERIAL
+		// column. The two owned sequences travel DIFFERENT deptype paths and pg_dump
+		// emits a DIFFERENT form for each on the SAME table: the identity sequence is
+		// embedded in `ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME ...)` (no
+		// standalone CREATE SEQUENCE, no OWNED BY), while the serial sequence emits a
+		// standalone CREATE SEQUENCE + OWNED BY + separate SET DEFAULT. Regression
+		// guard for the identity('i')/serial('a') deptype split on one relation.
+		mixDefs := []string{
+			"CREATE TABLE public.mix (\n    id integer NOT NULL,\n    n integer NOT NULL,\n    note text\n);",
+			"ALTER TABLE public.mix ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (\n    SEQUENCE NAME public.mix_id_seq\n    START WITH 1\n    INCREMENT BY 1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 1\n);",
+			"CREATE SEQUENCE public.mix_n_seq\n    AS integer\n    START WITH 1\n    INCREMENT BY 1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 1;",
+			"ALTER SEQUENCE public.mix_n_seq OWNED BY public.mix.n;",
+			"ALTER TABLE ONLY public.mix ALTER COLUMN n SET DEFAULT nextval('public.mix_n_seq'::regclass);",
+			"SELECT pg_catalog.setval('public.mix_id_seq', 1, false);",
+			"SELECT pg_catalog.setval('public.mix_n_seq', 1, false);",
+		}
+		for _, sub := range mixDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/mangled a mixed identity+serial clause; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// The two deptype paths must NOT cross. The identity sequence has NO
+		// standalone CREATE SEQUENCE and NO OWNED BY; the serial column has NO
+		// IDENTITY clause and the identity column has NO nextval() SET DEFAULT.
+		for _, neg := range []string{
+			"CREATE SEQUENCE public.mix_id_seq",
+			"ALTER SEQUENCE public.mix_id_seq OWNED BY",
+			"public.mix ALTER COLUMN n ADD GENERATED",
+			"public.mix ALTER COLUMN id SET DEFAULT nextval",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump crossed the identity/serial deptype paths: %q\n  full stdout=%q", neg, res.Stdout)
 			}
 		}
 		// **Slice 61 (asserted):** a RECURSIVE VIEW must round-trip. PG stores it
