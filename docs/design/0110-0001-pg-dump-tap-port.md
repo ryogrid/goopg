@@ -2603,6 +2603,33 @@ The single engine change is one switch arm — `case catalog.OIDXid8: castType =
 unchanged: `tsvector`/`tsquery` (output functions normalize+requote lexemes) and
 internal `"char"` (quoted-ident disambiguation from `bpchar` lost in the parser).
 
+### Slice 113 — domains over `int2vector` / `oidvector`
+
+```sql
+CREATE DOMAIN public.i2v_in AS int2vector
+	CONSTRAINT i2v_in_check CHECK ((VALUE = ANY (ARRAY['1 2'::int2vector, '3 4'::int2vector])));
+CREATE DOMAIN public.ovec_in AS oidvector
+	CONSTRAINT ovec_in_check CHECK ((VALUE = ANY (ARRAY['1 2'::oidvector, '3 4'::oidvector])));
+```
+
+The two legacy vector types — `int2vector` (space-separated int2 list, e.g.
+`pg_index.indkey`) and `oidvector` (space-separated oid list, e.g.
+`pg_proc.proargtypes`) — each have a native equality operator (`int2vectoreq` /
+`oidvectoreq`), so PG emits the **simplest render mode**: the bare
+string-with-cast shape, no coercion envelope. Their output functions print the
+canonical space-separated form, so an already-canonical input (`'1 2'`)
+round-trips verbatim through `::int2vector` / `::oidvector`. Verified against real
+pg_dump 18.3: `pg_get_constraintdef` emits the literals above.
+
+The engine change is two switch arms — `case catalog.OIDInt2vector: castType =
+"int2vector"` and `case catalog.OIDOidvector: castType = "oidvector"`. All other
+plumbing was already present from the vector-column work (DU-002 slice 81):
+`TypeNameToOID("int2vector")` → `OIDInt2vector` (22) / `"oidvector"` →
+`OIDOidvector` (30), `userTypeAttrsForOID` and `format_type` both render the bare
+names. Excluded base types remaining after slice 113 are unchanged:
+`tsvector`/`tsquery` (output functions normalize+requote lexemes) and internal
+`"char"` (quoted-ident disambiguation from `bpchar` lost in the parser).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

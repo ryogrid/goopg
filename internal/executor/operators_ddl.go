@@ -8899,6 +8899,19 @@ func domainInValuesCheckExpr(baseType string, vals []string, cat *catalog.InMemo
 		// decimal form round-trips verbatim through `::xid8`. Same simplest render
 		// mode as xid/cid (slice 107). DU-002 slice 112.
 		castType = "xid8"
+	case catalog.OIDInt2vector:
+		// int2vector (the legacy space-separated int2 list, e.g. pg_index.indkey)
+		// has a native equality operator (int2vectoreq), so PG emits the bare
+		// string-with-cast shape. The output function renders the canonical
+		// space-separated form, so an already-canonical input ('1 2') round-trips
+		// verbatim through `::int2vector`. DU-002 slice 113.
+		castType = "int2vector"
+	case catalog.OIDOidvector:
+		// oidvector (the legacy space-separated oid list, e.g. pg_proc.proargtypes)
+		// likewise has a native equality operator (oidvectoreq) and renders the
+		// canonical space-separated form, round-tripping verbatim through
+		// `::oidvector`. DU-002 slice 113.
+		castType = "oidvector"
 	case catalog.OIDInterval:
 		// interval has a native equality operator. Its output function
 		// normalizes the stored value (e.g. '2 hours'→'02:00:00'), so byte

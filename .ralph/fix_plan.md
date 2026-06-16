@@ -2084,6 +2084,27 @@ object support.
         (parser quote-state). NOTE: range/composite base-type domains need full
         catalog support for those type families (no `OIDInt4Range`, no
         `int4range` in `TypeNameToOID`) — a larger task than a single switch arm.
+      - **PROGRESS 2026-06-17 (loop #76):** **DU-002 slice 113 LANDED** — the
+        IN-values deparse now covers domains over the two legacy **vector** types
+        **`int2vector`** / **`oidvector`**: `CREATE DOMAIN public.i2v_in AS
+        int2vector CHECK (VALUE IN ('1 2', '3 4'))` (and the oidvector twin).
+        Both have native equality operators (`int2vectoreq`/`oidvectoreq`), so PG
+        emits the **simplest render mode** — bare string-with-cast: `VALUE = ANY
+        (ARRAY['1 2'::int2vector, '3 4'::int2vector])`. The canonical
+        space-separated form round-trips verbatim through `::int2vector` /
+        `::oidvector`. Verified byte-identical to real pg_dump 18.3. Two-arm
+        engine change in `domainInValuesCheckExpr` (`case catalog.OIDInt2vector`
+        → `"int2vector"`, `case catalog.OIDOidvector` → `"oidvector"`); all other
+        plumbing already present from vector-column work (slice 81):
+        `TypeNameToOID`→22/30, `userTypeAttrsForOID`/`format_type` render the bare
+        names. Fixtures: domains `i2v_in`/`ovec_in` + columns `i2vi`/`oveci`.
+        Gates: build OK; catalog/parser unit PASS; executor domain unit PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.13s); pgbench pre-commit smoke
+        on commit. **EASY single-arm base types are now exhausted** — remaining
+        excluded base types (`tsvector`/`tsquery` requote, internal `"char"`
+        parser quote-state) each need real engine work; range/composite/domain
+        base-type families need full catalog support (no `OIDInt4Range`, no
+        `int4range`/`CREATE TYPE AS` in `TypeNameToOID`) — a structural task.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

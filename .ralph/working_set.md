@@ -1,31 +1,32 @@
-Task: DU-002 slice 112 — domain over `xid8` round-trips through pg_dump
+Task: DU-002 slice 113 — domains over int2vector / oidvector round-trip pg_dump
 (COMPLETE, committing).
 
 Files:
 - internal/executor/operators_ddl.go — domainInValuesCheckExpr: new
-  `case catalog.OIDXid8: castType = "xid8"` arm.
-- internal/testport/pgdump_connsetup_test.go — fixture domain x8_in; column
-  x8i; domainDefs assertions ('100'/'200'::xid8 literals).
-- docs/design/0110-0001-pg-dump-tap-port.md — slice 112 section.
-- .ralph/fix_plan.md — loop #75 progress note.
+  `case catalog.OIDInt2vector → "int2vector"` and `case catalog.OIDOidvector →
+  "oidvector"` arms.
+- internal/testport/pgdump_connsetup_test.go — fixture domains i2v_in/ovec_in;
+  columns i2vi/oveci; domainDefs assertions ('1 2'/'3 4'::int2vector|oidvector).
+- docs/design/0110-0001-pg-dump-tap-port.md — slice 113 section.
+- .ralph/fix_plan.md — loop #76 progress note.
 
-Key symbols: domainInValuesCheckExpr, catalog.OIDXid8 (5069),
-userTypeAttrsForOID, format_type/formatTypeOID (5069→"xid8").
+Key symbols: domainInValuesCheckExpr, catalog.OIDInt2vector (22) /
+OIDOidvector (30), TypeNameToOID, userTypeAttrsForOID, format_type.
 
-Findings: xid8 is the simplest render mode (bare string-with-cast, native eq,
-decimal form round-trips verbatim, no normalization) — same as xid/cid (slice
-107). All plumbing already present from xid8-column work (M0097-0018). Verified
-byte-identical to real pg_dump 18.3 (/tmp/pgcheck_du112).
+Findings: both vector types have native equality (int2vectoreq/oidvectoreq) →
+simplest render mode (bare string-with-cast). Canonical space-separated form
+('1 2') round-trips verbatim. All plumbing already present from vector-column
+work (slice 81). Verified byte-identical to real pg_dump 18.3 (temp cluster).
 
 Gates run: go build ./... OK; catalog/parser unit PASS; executor domain unit
-PASS; TestPort_PgDumpConnectionSetup PASS (2.27s); pgbench pre-commit smoke on
+PASS; TestPort_PgDumpConnectionSetup PASS (2.13s); pgbench pre-commit smoke on
 commit (githook).
 
-Next step: slice 113 candidates. EASY single-arm types are nearly exhausted.
-Remaining excluded base types (tsvector/tsquery output requote, internal
-"char" parser quote-state) each need real engine work. Range/composite-type
-domains (int4range, CREATE TYPE AS) need FULL catalog support for those type
-families — NO OIDInt4Range, no int4range in TypeNameToOID — a much larger task.
-Probe int2vector/oidvector (both produce bare string-with-cast; need to verify
-TypeNameToOID→OID + userTypeAttrsForOID + format_type all handle them) as the
-last cheap single-arm candidates before moving to a structural type family.
+Next step: EASY single-arm domain base types are EXHAUSTED. Slice 114+ must
+choose between (a) tsvector/tsquery — output functions normalize+requote
+lexemes, needs real engine work to match deparse; (b) internal "char" — parser
+loses quoted-ident disambiguation from bpchar; (c) STRUCTURAL: range
+(int4range) / composite (CREATE TYPE AS) base-type families — need full catalog
+support (no OIDInt4Range, no int4range in TypeNameToOID). Recommend pivoting off
+the domain-IN-values sub-track to a different DU-002 catalog-surface slice, or
+committing to the structural range/composite work as a multi-loop effort.
