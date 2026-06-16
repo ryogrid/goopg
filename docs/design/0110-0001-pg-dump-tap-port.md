@@ -2249,9 +2249,30 @@ the deparse PG actually emits (verified against real pg_dump 18.3, `/tmp/pgcheck
 cast with no coercion wrapper. `character varying` has no varchar-eq operator and
 reuses `text`'s, so PG coerces both sides to `text` — the `(VALUE)::text` left side
 and the `(ARRAY[…])::text[]` right side. The per-element cast always uses the base
-type's bare name with **no typmod**, even for `varchar(20)`/`char(4)`. Non-string
-base types still return `""` and stay runtime-only — a future slice would need the
-type's own deparse shape (e.g. integer `VALUE = ANY (ARRAY[1, 2])`).
+type's bare name with **no typmod**, even for `varchar(20)`/`char(4)`.
+
+Slice 99 extends the IN-values deparse to the numeric-family base types
+`integer` and `numeric`. Two changes were needed beyond the deparse branch:
+the CREATE DOMAIN parser (`tryParseCheckInValues`) previously accepted only
+**string** literals in the IN-list, so a numeric list like `IN (1, 2, 3)`
+silently failed the pattern match and fell through to `skipParenExpr` —
+producing **no constraint at all** (neither runtime validation nor dump). The
+parser now also accepts `TokenIntLit`/`TokenNumericLit` and stores the raw
+token text; the runtime membership check in `expr.go` already compares via the
+value's string form, so it works unchanged. The deparse (verified against real
+pg_dump 18.3, `/tmp/pgcheck_du99`):
+
+| base type | deparse |
+|---|---|
+| `integer` | `VALUE = ANY (ARRAY[1, 2, 3])` |
+| `numeric(10,2)` | `VALUE = ANY (ARRAY[1.5, 2.5])` |
+
+Integer/numeric literals already share the base type, so PG emits each element
+verbatim — no quotes and no per-element cast. `bigint` differs: its `int4`
+literals require coercion, so PG wraps each element `(N)::bigint`
+(`VALUE = ANY (ARRAY[(100)::bigint, (200)::bigint])`). That envelope, and any
+other non-string/non-numeric base type, still returns `""` and stays
+runtime-only — a future slice would add the per-type cast shape.
 
 ## Deferred (002–010) — catalog surface estimate
 

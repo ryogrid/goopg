@@ -791,7 +791,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.ch_in AS char(4) CHECK (VALUE IN ('a','b'))"); err != nil {
 		t.Fatalf("create domain ch_in: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in)"); err != nil {
+	// DU-002 slice 99: `CHECK (VALUE IN (...))` over numeric-family base types.
+	// integer/numeric literals already share the base type, so PG deparses the
+	// membership list verbatim — no quotes, no per-element cast: `VALUE = ANY
+	// (ARRAY[1, 2, 3])`. (bigint differs — its int4 literals are wrapped
+	// `(N)::bigint` — and is deferred to a later slice.) Until this slice the
+	// CREATE DOMAIN parser only captured *string* IN-lists, so numeric lists
+	// silently fell through and produced no constraint at all. Verified
+	// byte-identical to real pg_dump 18.3 (/tmp/pgcheck_du99).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.i_in AS integer CHECK (VALUE IN (1, 2, 3))"); err != nil {
+		t.Fatalf("create domain i_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.i_in_n AS integer CONSTRAINT must_set CHECK (VALUE IN (10, 20))"); err != nil {
+		t.Fatalf("create domain i_in_n: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.n_in AS numeric(10,2) CHECK (VALUE IN (1.5, 2.5))"); err != nil {
+		t.Fatalf("create domain n_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1436,6 +1453,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.ch_in AS character(4)",
 			"CONSTRAINT ch_in_check CHECK ((VALUE = ANY (ARRAY['a'::bpchar, 'b'::bpchar])))",
 			"chi public.ch_in",
+			// Slice 99: numeric-family IN-values. integer/numeric literals match the
+			// base type, so PG emits them verbatim — no quotes, no per-element cast.
+			"CREATE DOMAIN public.i_in AS integer",
+			"CONSTRAINT i_in_check CHECK ((VALUE = ANY (ARRAY[1, 2, 3])))",
+			"ii public.i_in",
+			"CREATE DOMAIN public.i_in_n AS integer",
+			"CONSTRAINT must_set CHECK ((VALUE = ANY (ARRAY[10, 20])))",
+			"iin public.i_in_n",
+			"CREATE DOMAIN public.n_in AS numeric(10,2)",
+			"CONSTRAINT n_in_check CHECK ((VALUE = ANY (ARRAY[1.5, 2.5])))",
+			"ni2 public.n_in",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

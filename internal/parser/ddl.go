@@ -5342,14 +5342,19 @@ func (p *parser) tryParseCheckInValues() []string {
 		p.idx = start
 		return nil
 	}
-	// Parse string literals.
+	// Parse the membership list. Accept string literals (text/varchar/bpchar
+	// domains) as well as integer and numeric literals (integer/numeric
+	// domains). The raw token value is stored verbatim; whether to quote it on
+	// deparse is decided later from the domain's base type. DU-002 slice 99.
 	var vals []string
 	for {
-		if p.cur().Kind != TokenStringLit {
+		switch p.cur().Kind {
+		case TokenStringLit, TokenIntLit, TokenNumericLit:
+			vals = append(vals, p.cur().Value)
+		default:
 			p.idx = start
 			return nil
 		}
-		vals = append(vals, p.cur().Value)
 		p.advance()
 		if p.acceptSymbol(",") {
 			continue

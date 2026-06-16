@@ -1799,6 +1799,21 @@ object support.
         pgbench pre-commit smoke on commit. **Next blocker:** non-string IN-values
         (e.g. integer `VALUE = ANY (ARRAY[1, 2])`) need per-type deparse; or move to a
         new object type (composite / range).
+      - **PROGRESS 2026-06-17 (loop #61):** **DU-002 slice 99 LANDED** — the IN-values
+        deparse now covers numeric-family base types `integer` and `numeric`. TWO
+        changes: (1) the CREATE DOMAIN parser (`tryParseCheckInValues`) previously
+        accepted only string literals, so a numeric list `IN (1, 2, 3)` silently fell
+        through to `skipParenExpr` and produced **no constraint at all** — it now also
+        accepts `TokenIntLit`/`TokenNumericLit` and stores the raw token text;
+        (2) `domainInValuesCheckExpr` gains an `OIDInt4`/`OIDNumeric` branch that emits
+        literals verbatim (no quotes, no per-element cast): `VALUE = ANY (ARRAY[1, 2, 3])`
+        / `VALUE = ANY (ARRAY[1.5, 2.5])`. Runtime membership check (string-compare in
+        `expr.go`) needed no change. All verified byte-identical to real pg_dump 18.3
+        (`/tmp/pgcheck_du99`). Fixtures `i_in`, `i_in_n` (named `must_set`), `n_in` +
+        columns `ii`/`iin`/`ni2` added to `public.dom`. Gates: executor/parser/catalog
+        unit PASS; `TestPort_PgDumpConnectionSetup` PASS (1.91s); pgbench pre-commit
+        smoke on commit. **Next blocker:** `bigint` IN-values need the `(N)::bigint`
+        per-element wrap; or move to a new object type (composite / range).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

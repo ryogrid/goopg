@@ -8692,13 +8692,21 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 //	text       VALUE = ANY (ARRAY['red'::text, 'green'::text])
 //	char(n)    VALUE = ANY (ARRAY['a'::bpchar, 'b'::bpchar])
 //	varchar    (VALUE)::text = ANY ((ARRAY['a'::character varying, ...])::text[])
+//	integer    VALUE = ANY (ARRAY[1, 2, 3])
+//	numeric    VALUE = ANY (ARRAY[1.5, 2.5])
 //
 // text and bpchar have native equality operators, so PG emits a bare per-element
 // cast with no coercion wrapper. character varying has no varchar-eq operator and
 // reuses text's, so PG coerces both sides to text — hence the `(VALUE)::text` /
 // `(...)::text[]` envelope. The per-element cast always uses the base type's bare
-// name (no typmod, even for varchar(20)/char(4)). Non-string base types are left
-// runtime-only (returns ""). DU-002 slices 97 (text) + 98 (char/varchar).
+// name (no typmod, even for varchar(20)/char(4)).
+//
+// integer and numeric domains store integer/numeric literals whose own type
+// already matches the base type, so PG emits the literal verbatim — no quotes
+// and no per-element cast (verified against real pg_dump 18.3). bigint differs
+// (its int4 literals are wrapped `(N)::bigint`) and is left runtime-only for now.
+// Other non-string base types also return "". DU-002 slices 97 (text),
+// 98 (char/varchar), 99 (integer/numeric).
 func domainInValuesCheckExpr(baseType string, vals []string) string {
 	if len(vals) == 0 {
 		return ""
@@ -8713,6 +8721,10 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 	case catalog.OIDVarChar:
 		castType = "character varying"
 		coerceToText = true
+	case catalog.OIDInt4, catalog.OIDNumeric:
+		// Numeric-family literals are rendered verbatim (no quotes, no cast).
+		arr := "ARRAY[" + strings.Join(vals, ", ") + "]"
+		return "VALUE = ANY (" + arr + ")"
 	default:
 		return ""
 	}
