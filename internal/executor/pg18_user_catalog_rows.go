@@ -160,6 +160,14 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDInterval: // 1186 interval -- pg_type.dat: typlen 16, typbyval f, typalign 'd', typstorage 'p'
 		return userTypeAttrs{TypLen: 16, TypByVal: false, TypAlign: 'd', TypStorage: 'p'}
+	case catalog.OIDInet: // 869 inet -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'm'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'm'}
+	case catalog.OIDCidr: // 650 cidr -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'm'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'm'}
+	case catalog.OIDMacaddr: // 829 macaddr -- pg_type.dat: typlen 6, typbyval f, typalign 'i', typstorage 'p'
+		return userTypeAttrs{TypLen: 6, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
+	case catalog.OIDMacaddr8: // 774 macaddr8 -- pg_type.dat: typlen 8, typbyval f, typalign 'i', typstorage 'p'
+		return userTypeAttrs{TypLen: 8, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
 	case catalog.OIDArrayBool: // 1000 _bool -- pg_type.dat: typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBytea: // 1001 _bytea -- element bytea typalign 'i', typstorage 'x'
@@ -200,6 +208,14 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayInterval: // 1187 _interval -- element interval typalign 'd', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayInet: // 1041 _inet -- element inet typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayCidr: // 651 _cidr -- element cidr typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayMacaddr: // 1040 _macaddr -- element macaddr typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayMacaddr8: // 775 _macaddr8 -- element macaddr8 typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 }

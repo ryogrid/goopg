@@ -598,7 +598,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"label varchar(20), labels varchar(20)[], "+
 		"code char(4), codes char(4)[], oids oid[], "+
 		"doc json, docs json[], jdoc jsonb, jdocs jsonb[], "+
-		"span interval, spans interval[])"); err != nil {
+		"span interval, spans interval[], "+
+		"ip inet, ips inet[], net cidr, nets cidr[], "+
+		"mac macaddr, macs macaddr[], mac8 macaddr8, mac8s macaddr8[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -934,6 +936,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// dumped as `text`; the array path had no _interval OID at all. A bare
 		// interval column carries typmod -1, so both render as the plain
 		// `interval` / `interval[]`.
+		// Slice 71 adds the network-address family: scalar inet (`ip`, OID 869) +
+		// inet[] (`ips`, _inet 1041), cidr (`net`, 650) + cidr[] (`nets`, 651),
+		// macaddr (`mac`, 829) + macaddr[] (`macs`, 1040), and macaddr8 (`mac8`,
+		// 774) + macaddr8[] (`mac8s`, 775). All are seeded in pg_type but had NOT
+		// been wired into TypeNameToOID/OIDToTypeName, so each scalar fell back to
+		// text (OID 25) and the array paths had no _net OIDs. None carry a typmod,
+		// so every column renders as the plain `<type>` / `<type>[]`.
 		arrCols := []string{
 			"CREATE TABLE public.arr (",
 			"tags text[]",
@@ -962,6 +971,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"jdocs jsonb[]",
 			"span interval",
 			"spans interval[]",
+			"ip inet",
+			"ips inet[]",
+			"net cidr",
+			"nets cidr[]",
+			"mac macaddr",
+			"macs macaddr[]",
+			"mac8 macaddr8",
+			"mac8s macaddr8[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

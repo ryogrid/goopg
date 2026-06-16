@@ -99,6 +99,14 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "timestamp without time zone"
 	case 1184:
 		return "timestamp with time zone"
+	case 650:
+		return "cidr"
+	case 774:
+		return "macaddr8"
+	case 829:
+		return "macaddr"
+	case 869:
+		return "inet"
 	case 1186:
 		return "interval"
 	case 1266:
@@ -148,6 +156,14 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "time without time zone[]"
 	case 1185:
 		return "timestamp with time zone[]"
+	case 651:
+		return "cidr[]"
+	case 775:
+		return "macaddr8[]"
+	case 1040:
+		return "macaddr[]"
+	case 1041:
+		return "inet[]"
 	case 1187:
 		return "interval[]"
 	case 1231:
@@ -10383,6 +10399,30 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "jsonb[]"
 	case 600:
 		return "point"
+	case 650:
+		// cidr: no typmod, bare name. DU-002 slice 71.
+		return "cidr"
+	case 651:
+		// _cidr: no typmod, bare element name + []. Slice 71.
+		return "cidr[]"
+	case 774:
+		// macaddr8: no typmod, bare name. Slice 71.
+		return "macaddr8"
+	case 775:
+		// _macaddr8: no typmod, bare element name + []. Slice 71.
+		return "macaddr8[]"
+	case 829:
+		// macaddr: no typmod, bare name. Slice 71.
+		return "macaddr"
+	case 869:
+		// inet: no typmod, bare name. Slice 71.
+		return "inet"
+	case 1040:
+		// _macaddr: no typmod, bare element name + []. Slice 71.
+		return "macaddr[]"
+	case 1041:
+		// _inet: no typmod, bare element name + []. Slice 71.
+		return "inet[]"
 	case 700:
 		return "real"
 	case 701:

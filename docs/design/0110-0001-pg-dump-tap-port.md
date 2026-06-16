@@ -1535,6 +1535,26 @@ fixed one logical group per loop:
     `arr` fixture's `span interval` + `spans interval[]` columns in
     `TestPort_PgDumpConnectionSetup` and the new `{"interval",nil,1187,
     "interval[]"}` row in `executor.TestUserPGAttributeArrayColumn`.
+  - **Slice 71 — network-address family `inet`/`cidr`/`macaddr`/`macaddr8`
+    (+ their array types)
+    (`internal/catalog/codec.go`, `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** All four scalar types (OIDs 869/650/829/774)
+    and their array types (1041/651/1040/775) are already seeded in
+    `pg_type_seed_data.go` so a PG standby can resolve the OIDs, but none had been
+    wired into `TypeNameToOID`/`OIDToTypeName`, so each scalar column fell back to
+    `text` (OID 25) and dumped as `text`; the array paths had no `_net` OIDs at
+    all. Same proven 3-site pattern: scalar/array OID consts + their
+    `TypeNameToOID`/`OIDToTypeName` and `ArrayOIDForBase`/`BaseOIDForArray` cases,
+    rows in `userTypeAttrsForOID` (scalar `inet`/`cidr` `typlen=-1`,
+    `typalign='i'`, `typstorage='m'`; `macaddr` `typlen=6` and `macaddr8`
+    `typlen=8`, both `typbyval=f`, `typalign='i'`, `typstorage='p'`; arrays
+    `typlen=-1`, `typalign='i'`, `typstorage='x'` — matching `pg_type.dat` and the
+    `pg_type_seed_data.go` rows), and the scalar+array cases in `formatTypeOID`
+    and `oidToBuiltinTypeName`. None carry a typmod, so every column renders as
+    the plain `<type>` / `<type>[]`. Guarded by the `arr` fixture's `ip inet`,
+    `ips inet[]`, `net cidr`, `nets cidr[]`, `mac macaddr`, `macs macaddr[]`,
+    `mac8 macaddr8`, `mac8s macaddr8[]` columns in `TestPort_PgDumpConnectionSetup`
+    and the four new rows in `executor.TestUserPGAttributeArrayColumn`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1586,7 +1606,9 @@ uuid` and a `ids uuid[]` column; slice 67 adds a scalar `blob bytea` and a
 varchar(20)[]`, `code char(4)`, `codes char(4)[]`, and `oids oid[]` — completing
 every simple scalar-OID-backed array type; slice 69 adds the JSON family `doc
 json`, `docs json[]`, `jdoc jsonb`, and `jdocs jsonb[]`; slice 70 adds a scalar
-`span interval` and a `spans interval[]` column.
+`span interval` and a `spans interval[]` column; slice 71 adds the
+network-address family `ip inet`, `ips inet[]`, `net cidr`, `nets cidr[]`, `mac
+macaddr`, `macs macaddr[]`, `mac8 macaddr8`, and `mac8s macaddr8[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

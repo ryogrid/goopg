@@ -1,40 +1,40 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 70 COMPLETE
-(committing this loop). NEXT loop starts on slice 71.
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 71 COMPLETE
+(committing this loop). NEXT loop starts on slice 72.
 NOTHING in flight after commit.
 
-=== DONE (this loop) — DU-002 slice 70 (interval scalar + array) ===
-Gap: interval (1186) was rendered by formatTypeOID AND oidToBuiltinTypeName
-(latter already had 1186→interval, 1187→interval[]) but was NEVER wired into
-TypeNameToOID/OIDToTypeName, so an interval column fell back to text (25) and
-dumped as `text`; the array path had no _interval (1187) OID at all.
+=== DONE (this loop) — DU-002 slice 71 (network-address family) ===
+Gap: inet (869)/cidr (650)/macaddr (829)/macaddr8 (774) + their arrays
+(_inet 1041, _cidr 651, _macaddr 1040, _macaddr8 775) are ALL seeded in
+pg_type_seed_data.go but were NEVER wired into TypeNameToOID/OIDToTypeName, so
+each scalar fell back to text (25) → dumped as `text`; array paths had no OID.
 FIX (proven 3-site additive pattern):
-  1. catalog/codec.go: OIDInterval=1186 const; OIDArrayInterval=1187 const;
-     cases in TypeNameToOID, OIDToTypeName, ArrayOIDForBase, BaseOIDForArray.
-  2. executor/pg18_user_catalog_rows.go userTypeAttrsForOID: 2 rows — scalar
-     (typlen 16, byval f, align 'd', storage 'p') + array (typlen -1, align 'd',
-     storage 'x'); verified vs pg_type_seed_data.go lines 98/99 + pg_type.dat.
-  3. executor/expr.go formatTypeOID: array case 1187→"interval[]" (scalar 1186
-     already existed). oidToBuiltinTypeName twin ALREADY had both — no change.
+  1. catalog/codec.go: scalar consts OIDInet/OIDCidr/OIDMacaddr/OIDMacaddr8;
+     array consts OIDArrayInet/Cidr/Macaddr/Macaddr8; cases in TypeNameToOID,
+     OIDToTypeName, ArrayOIDForBase, BaseOIDForArray.
+  2. executor/pg18_user_catalog_rows.go userTypeAttrsForOID: scalar inet/cidr
+     (typlen -1, align 'i', storage 'm'), macaddr (typlen 6, 'i','p'), macaddr8
+     (typlen 8, 'i','p'); 4 array rows (typlen -1,'i','x'). Verified vs
+     pg_type_seed_data.go lines 47/48/54/55/58/59/86/87.
+  3. executor/expr.go formatTypeOID + oidToBuiltinTypeName: scalar 650/774/829/869
+     + array 651/775/1040/1041 (all bare names, no typmod).
 Files: internal/catalog/codec.go, internal/executor/pg18_user_catalog_rows.go,
 internal/executor/expr.go, internal/executor/pg18_user_catalog_rows_test.go
-(+1 row interval), internal/testport/pgdump_connsetup_test.go (arr fixture
-+span/spans + asserts + doc), docs/design/0110-0001-pg-dump-tap-port.md.
-Gates: gofmt clean; build ./... ok; catalog PASS; executor array/typmod/coll
-tests PASS; TestPort_PgDumpConnectionSetup PASS (1.83s, no downstream logf
-under -v → ExitCode==0 assert block ran); pgbench CI-parity via pre-commit hook.
+(+4 array rows), internal/testport/pgdump_connsetup_test.go (arr fixture
++ip/ips/net/nets/mac/macs/mac8/mac8s + asserts + doc),
+docs/design/0110-0001-pg-dump-tap-port.md.
+Gates: gofmt clean; build ./... ok; catalog PASS; executor array/typmod tests
+PASS; TestPort_PgDumpConnectionSetup PASS (2.19s, no downstream logf under -v →
+ExitCode==0 assert block ran); pgbench CI-parity via pre-commit hook.
 
-=== NEXT STEP — DU-002 slice 71 ===
-Scalar+array column-type gaps now closed: int2/int4/int8/text/bool/numeric/
-float8/date/timestamp/float4/time/timestamptz/uuid/bytea/varchar/bpchar/oid/
-json/jsonb/interval. Remaining likely-small scalar gaps (fall back to text now):
-  - inet (869)/_inet (1041), cidr (650)/_cidr (651), macaddr (829)/_macaddr (1040),
-    macaddr8 (774)/_macaddr8 (775) — network types (NOT in pg_type seed? verify
-    via initdb/pg_type_seed_data.go before wiring — must be seeded so a PG standby
-    can read the OID).
+=== NEXT STEP — DU-002 slice 72 ===
+Remaining likely-small scalar gaps (fall back to text now, VERIFY seeded in
+pg_type_seed_data.go BEFORE wiring — must be seeded so a PG standby reads OID):
   - xml (142)/_xml (143); money (790)/_money (791); bit/varbit.
-Parser accepts ANY ident as a column type (parseColumnType), and execCreateTable
-does NOT reject unknown types — so schema-only dump just needs the OID maps wired.
-Larger slices (defer): IDENTITY columns + SEQUENCE objects (relkind 'S'),
+  - tsvector (3614)/_tsvector (3643), tsquery (3615)/_tsquery (3645).
+  - point/line/lseg/box/path/polygon/circle geometric family.
+Parser accepts ANY ident as a column type (parseColumnType); execCreateTable
+does NOT reject unknown types — schema-only dump just needs the OID maps wired.
+Larger slices (defer): IDENTITY cols + SEQUENCE objects (relkind 'S'),
 ENUM/composite/DOMAIN user types.
 ALWAYS: add fixture col(s), run TestPort_PgDumpConnectionSetup -v, confirm NO
 downstream logf prints (proves the ExitCode==0 assert block ran).

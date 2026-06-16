@@ -424,6 +424,12 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// Slice 70: interval (_interval 1187). A bare interval[] column has
 		// typmod -1, so the array renders as the bare element name + [].
 		{"interval", nil, 1187, "interval[]"},
+		// Slice 71: the network-address family. None carry a typmod, so each
+		// array renders as the bare element name with the [] suffix.
+		{"inet", nil, 1041, "inet[]"},
+		{"cidr", nil, 651, "cidr[]"},
+		{"macaddr", nil, 1040, "macaddr[]"},
+		{"macaddr8", nil, 775, "macaddr8[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

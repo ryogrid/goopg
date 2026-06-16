@@ -74,6 +74,13 @@ const (
 	OIDJSON        uint32 = 114
 	OIDJsonb       uint32 = 3802
 	OIDInterval    uint32 = 1186
+	// DU-002 slice 71: the network-address family. All are seeded in pg_type
+	// (see initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs.
+	// None carry a typmod, so format_type renders the bare type name.
+	OIDInet     uint32 = 869
+	OIDCidr     uint32 = 650
+	OIDMacaddr  uint32 = 829
+	OIDMacaddr8 uint32 = 774
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -111,6 +118,12 @@ const (
 	// array (interval fields/precision), but a bare `interval[]` column has
 	// typmod -1, so format_type renders it as the bare `interval[]`.
 	OIDArrayInterval uint32 = 1187
+	// DU-002 slice 71: the network-address array types. None carry a typmod, so
+	// format_type renders the bare element name with a [] suffix.
+	OIDArrayInet     uint32 = 1041
+	OIDArrayCidr     uint32 = 651
+	OIDArrayMacaddr  uint32 = 1040
+	OIDArrayMacaddr8 uint32 = 775
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -159,6 +172,14 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayJsonb
 	case OIDInterval:
 		return OIDArrayInterval
+	case OIDInet:
+		return OIDArrayInet
+	case OIDCidr:
+		return OIDArrayCidr
+	case OIDMacaddr:
+		return OIDArrayMacaddr
+	case OIDMacaddr8:
+		return OIDArrayMacaddr8
 	}
 	return 0
 }
@@ -209,6 +230,14 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDJsonb, true
 	case OIDArrayInterval:
 		return OIDInterval, true
+	case OIDArrayInet:
+		return OIDInet, true
+	case OIDArrayCidr:
+		return OIDCidr, true
+	case OIDArrayMacaddr:
+		return OIDMacaddr, true
+	case OIDArrayMacaddr8:
+		return OIDMacaddr8, true
 	}
 	return 0, false
 }
@@ -1025,6 +1054,14 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDJsonb
 	case "interval":
 		return OIDInterval
+	case "inet":
+		return OIDInet
+	case "cidr":
+		return OIDCidr
+	case "macaddr":
+		return OIDMacaddr
+	case "macaddr8":
+		return OIDMacaddr8
 	default:
 		return OIDText // safe fallback
 	}
@@ -1077,6 +1114,14 @@ func OIDToTypeName(oid uint32) string {
 		return "jsonb"
 	case OIDInterval:
 		return "interval"
+	case OIDInet:
+		return "inet"
+	case OIDCidr:
+		return "cidr"
+	case OIDMacaddr:
+		return "macaddr"
+	case OIDMacaddr8:
+		return "macaddr8"
 	default:
 		return "text"
 	}
