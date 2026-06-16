@@ -439,6 +439,10 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		{"polygon", nil, 1027, "polygon[]"},
 		{"line", nil, 629, "line[]"},
 		{"circle", nil, 719, "circle[]"},
+		// Slice 73: the full-text-search family. Neither carries a typmod, so each
+		// array renders as the bare element name with the [] suffix.
+		{"tsvector", nil, 3643, "tsvector[]"},
+		{"tsquery", nil, 3645, "tsquery[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

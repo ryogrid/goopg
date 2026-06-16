@@ -1578,6 +1578,27 @@ fixed one logical group per loop:
     `bxs box[]`, `poly polygon`, `polys polygon[]`, `ln line`, `lns line[]`,
     `circ circle`, `circs circle[]` columns in `TestPort_PgDumpConnectionSetup` and
     the seven new rows in `executor.TestUserPGAttributeArrayColumn`.
+  - **Slice 73 — full-text-search family `tsvector`/`tsquery` (+ their array
+    types) (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** Both scalar types (`tsvector` OID 3614,
+    `tsquery` 3615) and their array types (`_tsvector` 3643, `_tsquery` 3645) are
+    already seeded in `pg_type_seed_data.go`, but neither had been wired into
+    `TypeNameToOID`/`OIDToTypeName`, so each scalar column fell back to `text`
+    (OID 25) and dumped as `text` (the scalar `formatTypeOID(3614)→tsvector` /
+    `formatTypeOID(3615)→tsquery` cases existed but were dead — nothing routed a
+    column to those OIDs); the array paths had no OIDs at all. Same proven 3-site
+    pattern: scalar/array OID consts + their `TypeNameToOID`/`OIDToTypeName` and
+    `ArrayOIDForBase`/`BaseOIDForArray` cases, rows in `userTypeAttrsForOID`
+    (varlena `tsvector` `typlen=-1`, `typalign='i'`, `typstorage='x'`; `tsquery`
+    `typlen=-1`, `typalign='i'`, `typstorage='p'`; both scalars `typbyval=f`;
+    arrays `typlen=-1`, `typalign='i'`, `typstorage='x'` — matching `pg_type.dat`
+    and the `pg_type_seed_data.go` rows), and the new array cases in
+    `formatTypeOID` plus the scalar+array cases in `oidToBuiltinTypeName`. Neither
+    carries a typmod, so every column renders as the plain `<type>` / `<type>[]`.
+    Guarded by the `arr` fixture's `tsv tsvector`, `tsvs tsvector[]`, `tsq
+    tsquery`, `tsqs tsquery[]` columns in `TestPort_PgDumpConnectionSetup` and the
+    two new rows in `executor.TestUserPGAttributeArrayColumn`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1634,7 +1655,9 @@ network-address family `ip inet`, `ips inet[]`, `net cidr`, `nets cidr[]`, `mac
 macaddr`, `macs macaddr[]`, `mac8 macaddr8`, and `mac8s macaddr8[]`; slice 72
 adds the geometric family `pt point`, `pts point[]`, `seg lseg`, `segs lseg[]`,
 `pth path`, `pths path[]`, `bx box`, `bxs box[]`, `poly polygon`, `polys
-polygon[]`, `ln line`, `lns line[]`, `circ circle`, and `circs circle[]`.
+polygon[]`, `ln line`, `lns line[]`, `circ circle`, and `circs circle[]`;
+slice 73 adds the full-text-search family `tsv tsvector`, `tsvs tsvector[]`,
+`tsq tsquery`, and `tsqs tsquery[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

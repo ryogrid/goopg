@@ -91,6 +91,11 @@ const (
 	OIDPolygon uint32 = 604
 	OIDLine    uint32 = 628
 	OIDCircle  uint32 = 718
+	// DU-002 slice 73: the full-text-search family. Both are seeded in pg_type
+	// (see initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs.
+	// Neither carries a typmod, so format_type renders the bare type name.
+	OIDTsvector uint32 = 3614
+	OIDTsquery  uint32 = 3615
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -143,6 +148,10 @@ const (
 	OIDArrayPolygon uint32 = 1027
 	OIDArrayLine    uint32 = 629
 	OIDArrayCircle  uint32 = 719
+	// DU-002 slice 73: the full-text-search array types. Neither carries a
+	// typmod, so format_type renders the bare element name with a [] suffix.
+	OIDArrayTsvector uint32 = 3643
+	OIDArrayTsquery  uint32 = 3645
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -213,6 +222,10 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayLine
 	case OIDCircle:
 		return OIDArrayCircle
+	case OIDTsvector:
+		return OIDArrayTsvector
+	case OIDTsquery:
+		return OIDArrayTsquery
 	}
 	return 0
 }
@@ -285,6 +298,10 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDLine, true
 	case OIDArrayCircle:
 		return OIDCircle, true
+	case OIDArrayTsvector:
+		return OIDTsvector, true
+	case OIDArrayTsquery:
+		return OIDTsquery, true
 	}
 	return 0, false
 }
@@ -1123,6 +1140,10 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDLine
 	case "circle":
 		return OIDCircle
+	case "tsvector":
+		return OIDTsvector
+	case "tsquery":
+		return OIDTsquery
 	default:
 		return OIDText // safe fallback
 	}
@@ -1197,6 +1218,10 @@ func OIDToTypeName(oid uint32) string {
 		return "line"
 	case OIDCircle:
 		return "circle"
+	case OIDTsvector:
+		return "tsvector"
+	case OIDTsquery:
+		return "tsquery"
 	default:
 		return "text"
 	}

@@ -604,7 +604,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"pt point, pts point[], seg lseg, segs lseg[], "+
 		"pth path, pths path[], bx box, bxs box[], "+
 		"poly polygon, polys polygon[], ln line, lns line[], "+
-		"circ circle, circs circle[])"); err != nil {
+		"circ circle, circs circle[], "+
+		"tsv tsvector, tsvs tsvector[], tsq tsquery, tsqs tsquery[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -952,6 +953,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// 602) + path[] (`pths`, 1019), box (`bx`, 603) + box[] (`bxs`, 1020),
 		// polygon (`poly`, 604) + polygon[] (`polys`, 1027), line (`ln`, 628) +
 		// line[] (`lns`, 629), circle (`circ`, 718) + circle[] (`circs`, 719).
+		// Slice 73 adds the full-text-search family: tsvector (`tsv`, 3614) +
+		// tsvector[] (`tsvs`, _tsvector 3643), tsquery (`tsq`, 3615) + tsquery[]
+		// (`tsqs`, _tsquery 3645).
 		// All are seeded in pg_type but were never wired into TypeNameToOID/
 		// OIDToTypeName, so each scalar fell back to text (OID 25) and the array
 		// paths had no OIDs. None carry a typmod, so each renders as the plain
@@ -1006,6 +1010,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"lns line[]",
 			"circ circle",
 			"circs circle[]",
+			"tsv tsvector",
+			"tsvs tsvector[]",
+			"tsq tsquery",
+			"tsqs tsquery[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

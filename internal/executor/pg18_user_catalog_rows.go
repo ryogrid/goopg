@@ -182,6 +182,10 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: 24, TypByVal: false, TypAlign: 'd', TypStorage: 'p'}
 	case catalog.OIDCircle: // 718 circle -- pg_type.dat: typlen 24, typbyval f, typalign 'd', typstorage 'p'
 		return userTypeAttrs{TypLen: 24, TypByVal: false, TypAlign: 'd', TypStorage: 'p'}
+	case catalog.OIDTsvector: // 3614 tsvector -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDTsquery: // 3615 tsquery -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'p'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
 	case catalog.OIDArrayBool: // 1000 _bool -- pg_type.dat: typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBytea: // 1001 _bytea -- element bytea typalign 'i', typstorage 'x'
@@ -244,6 +248,10 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	case catalog.OIDArrayCircle: // 719 _circle -- element circle typalign 'd', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayTsvector: // 3643 _tsvector -- element tsvector typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayTsquery: // 3645 _tsquery -- element tsquery typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 }
