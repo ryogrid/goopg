@@ -1476,6 +1476,28 @@ fixed one logical group per loop:
     `executor.TestUserPGAttributeArrayColumn`. Remaining gaps unchanged:
     `varchar[]`/`bpchar[]` (typmod-bearing arrays), ENUM/composite/domain
     user-type columns, and IDENTITY/SEQUENCE columns.
+  - **Slice 68 — remaining simple scalar-backed arrays `varchar[]`/`bpchar[]`/
+    `oid[]` (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`, `internal/executor/expr.go`).**
+    The element scalars (`varchar` 1043, `bpchar` 1042, `oid` 26) already
+    round-tripped; their array forms `_varchar` (1015), `_bpchar` (1014) and
+    `_oid` (1028) were the gap. Same proven 3-site pattern: the three array-OID
+    consts (`OIDArrayVarChar`/`OIDArrayBpChar`/`OIDArrayOID`), their cases in
+    `ArrayOIDForBase`/`BaseOIDForArray`, the three rows in `userTypeAttrsForOID`
+    (`typlen=-1`, `typalign='i'`, `typstorage='x'`; `_varchar`/`_bpchar` carry
+    the element's default collation like `_text`), and the canonical
+    `formatTypeOID` cases. `_varchar`/`_bpchar` are **typmod-bearing** like
+    `_numeric` — they format the element with the carried typmod and re-append
+    `[]` (`formatTypeOID(1043,typmod)+"[]"` → `character varying(20)[]`,
+    `formatTypeOID(1042,typmod)+"[]"` → `character(4)[]`); `_oid` has no typmod so
+    it is the bare `oid[]`. Guarded by the `arr` fixture's `label varchar(20)` +
+    `labels varchar(20)[]` + `code char(4)` + `codes char(4)[]` + `oids oid[]`
+    columns in `TestPort_PgDumpConnectionSetup` and the new
+    `{"varchar",[]int64{20},1015,"character varying(20)[]"}`,
+    `{"bpchar",[]int64{10},1014,"character(10)[]"}`, `{"oid",nil,1028,"oid[]"}`
+    rows in `executor.TestUserPGAttributeArrayColumn`. This completes every
+    simple scalar-OID-backed array type; remaining gaps are now
+    ENUM/composite/domain user-type columns and IDENTITY/SEQUENCE columns.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1523,7 +1545,9 @@ precision[]`, `days date[]`, and `moments timestamp without time zone[]`;
 slice 65 extends it again with `speeds real[]`, `times time without time
 zone[]`, and `zoned timestamp with time zone[]`; slice 66 adds a scalar `tok
 uuid` and a `ids uuid[]` column; slice 67 adds a scalar `blob bytea` and a
-`blobs bytea[]` column.
+`blobs bytea[]` column; slice 68 adds `label varchar(20)`, `labels
+varchar(20)[]`, `code char(4)`, `codes char(4)[]`, and `oids oid[]` — completing
+every simple scalar-OID-backed array type.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

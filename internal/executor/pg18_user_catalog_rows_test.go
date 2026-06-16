@@ -411,6 +411,12 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// Slice 67: bytea array (_bytea 1001). bytea has no typmod, so the
 		// array renders as the bare element name with the [] suffix.
 		{"bytea", nil, 1001, "bytea[]"},
+		// Slice 68: the remaining simple scalar-backed arrays. varchar/bpchar
+		// carry the element typmod onto the array (like numeric); oid has none.
+		{"varchar", []int64{20}, 1015, "character varying(20)[]"},
+		{"varchar", nil, 1015, "character varying[]"},
+		{"bpchar", []int64{10}, 1014, "character(10)[]"},
+		{"oid", nil, 1028, "oid[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

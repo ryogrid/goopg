@@ -10414,6 +10414,16 @@ func formatTypeOID(typeOID, typmod int64) string {
 		// _numeric: format_type strips the array, formats the element with
 		// the carried typmod, then re-appends []. DU-002 slice 63.
 		return formatTypeOID(1700, typmod) + "[]"
+	case 1015:
+		// _varchar: element typmod (varchar(n)) is carried onto the array;
+		// format the element then re-append []. DU-002 slice 68.
+		return formatTypeOID(1043, typmod) + "[]"
+	case 1014:
+		// _bpchar: element typmod (char(n)) carried onto the array. Slice 68.
+		return formatTypeOID(1042, typmod) + "[]"
+	case 1028:
+		// _oid: oid has no typmod, so the array is the bare name. Slice 68.
+		return "oid[]"
 	case 1042:
 		if typmod > 4 {
 			return fmt.Sprintf("character(%d)", typmod-4)

@@ -594,7 +594,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"ratios double precision[], days date[], moments timestamp[], "+
 		"speeds real[], times time[], zoned timestamptz[], "+
 		"tok uuid, ids uuid[], "+
-		"blob bytea, blobs bytea[])"); err != nil {
+		"blob bytea, blobs bytea[], "+
+		"label varchar(20), labels varchar(20)[], "+
+		"code char(4), codes char(4)[], oids oid[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -911,6 +913,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// bytea[] (`blobs bytea[]`): _bytea (1001) is now in the array OID maps
 		// (ArrayOIDForBase/BaseOIDForArray + userTypeAttrsForOID + formatTypeOID),
 		// so the array dumps as `bytea[]` instead of falling back to scalar bytea.
+		// Slice 68 adds the remaining simple scalar-backed arrays: varchar(20)[]
+		// (_varchar 1015), char(4)[] (_bpchar 1014) and oid[] (_oid 1028). varchar/
+		// bpchar carry the element typmod onto the array (like numeric) so the
+		// declared length survives the dump; oid has no typmod.
 		arrCols := []string{
 			"CREATE TABLE public.arr (",
 			"tags text[]",
@@ -928,6 +934,11 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"ids uuid[]",
 			"blob bytea",
 			"blobs bytea[]",
+			"label character varying(20)",
+			"labels character varying(20)[]",
+			"code character(4)",
+			"codes character(4)[]",
+			"oids oid[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

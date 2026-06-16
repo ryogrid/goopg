@@ -93,6 +93,13 @@ const (
 	OIDArrayTime        uint32 = 1183
 	OIDArrayTimestampTZ uint32 = 1185
 	OIDArrayUUID        uint32 = 2951
+	// DU-002 slice 68: the remaining simple scalar-backed array types.
+	// _varchar/_bpchar carry the element typmod onto the array (like _numeric);
+	// _oid has no typmod. format_type renders these as `character varying[]`,
+	// `character[]`, and `oid[]`.
+	OIDArrayVarChar uint32 = 1015
+	OIDArrayBpChar  uint32 = 1014
+	OIDArrayOID     uint32 = 1028
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -129,6 +136,12 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayTimestampTZ
 	case OIDUUID:
 		return OIDArrayUUID
+	case OIDVarChar:
+		return OIDArrayVarChar
+	case OIDBpChar:
+		return OIDArrayBpChar
+	case OIDOID:
+		return OIDArrayOID
 	}
 	return 0
 }
@@ -167,6 +180,12 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDTimestampTZ, true
 	case OIDArrayUUID:
 		return OIDUUID, true
+	case OIDArrayVarChar:
+		return OIDVarChar, true
+	case OIDArrayBpChar:
+		return OIDBpChar, true
+	case OIDArrayOID:
+		return OIDOID, true
 	}
 	return 0, false
 }
