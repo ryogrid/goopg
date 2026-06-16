@@ -2771,6 +2771,62 @@ MAXVALUE 1000`, and the **absence** of any `OWNED BY`. Unit coverage:
 `executor.TestSequenceSurfacedInPgClass` (sequence appears in `pg_class` with
 `relkind='S'`, `relam=0`).
 
+### Slice 117 — typed (`AS smallint` / `AS integer`) and `CYCLE` sequences
+
+Slice 117 extends the slice-116 discovery path to the two remaining
+single-sequence DDL clauses pg_dump can emit: the `AS <type>` data-type clause and
+the trailing `CYCLE`. **No production code changed** — the executor already tracked
+both attributes end-to-end; this slice is a verification slice that pins the
+byte-exact output with new fixtures.
+
+The wiring was already complete before this slice:
+
+- `CREATE SEQUENCE ... AS smallint|integer` is parsed and `SetSequenceDataType`
+  records the declared type on the `seqState`; `seqTypeBounds` derives the
+  type's default min/max (smallint `1..32767`, integer `1..2147483647` ascending),
+  so the bounds match what real PG stores.
+- `sequenceParamsForCatalog` maps the data type to `seqtypid` via `seqTypeOID`
+  (`smallint→21`, `integer→23`, `bigint→20` default) and threads `seqcycle`
+  through into the `pg_sequence` row.
+- `formatTypeOID(21,NULL)="smallint"` and `formatTypeOID(23,NULL)="integer"`, so
+  pg_dump's `getSequences` query `format_type(seqtypid, NULL)` renders the right
+  type name.
+
+**Byte-exact output (verified vs pg_dump 18.3).** A typed sequence emits an
+`AS <type>` clause immediately after the header; because the type-derived
+`seqmax` equals pg_dump's own `default_maxv` for that type, the `MAXVALUE` clause
+is still suppressed to `NO MAXVALUE`:
+
+```sql
+CREATE SEQUENCE public.small_seq
+    AS smallint
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+```
+
+A bigint-default sequence (the slice-116 `plain_seq`/`num_seq`) emits **no**
+`AS` clause — pg_dump suppresses the data-type clause for the default. A `CYCLE`
+sequence sets `seqcycle=true`, which makes pg_dump append `CYCLE` as the final
+clause before the semicolon:
+
+```sql
+CREATE SEQUENCE public.cyc_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+    CYCLE;
+```
+
+The `TestPort_PgDumpConnectionSetup` fixture now creates `small_seq AS smallint`,
+`int_seq AS integer`, and `cyc_seq CYCLE`, and asserts the 4-space-indented blocks
+that pin pg_dump's exact clause order (`AS <type>` before `START WITH`, `CYCLE`
+last) plus the **absence** of a spurious `AS bigint` on any default sequence.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

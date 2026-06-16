@@ -557,6 +557,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.num_seq START WITH 100 INCREMENT BY 10 MAXVALUE 1000"); err != nil {
 		t.Fatalf("create sequence num_seq: %v", err)
 	}
+	// Slice 117: typed sequences (`AS smallint` / `AS integer`) and a `CYCLE`
+	// sequence extend the slice-116 coverage. pg_dump's getSequences reads
+	// `format_type(seqtypid, NULL)` and emits an `AS <type>` clause whenever the
+	// type is not the bigint default; goopg's pg_sequence already carries the
+	// declared seqtypid (21 smallint / 23 integer, from CREATE SEQUENCE ... AS),
+	// and format_type(21/23, NULL) renders smallint/integer. A typed sequence's
+	// default bounds are type-derived (smallint → seqmax 32767, integer →
+	// 2147483647), each equal to pg_dump's own default_maxv for that type, so
+	// pg_dump still emits `NO MAXVALUE`. A `CYCLE` sequence sets seqcycle=true,
+	// which goopg threads through pg_sequence; pg_dump then emits a trailing
+	// `CYCLE` clause (default sequences emit none).
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.small_seq AS smallint"); err != nil {
+		t.Fatalf("create sequence small_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.int_seq AS integer"); err != nil {
+		t.Fatalf("create sequence int_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.cyc_seq CYCLE"); err != nil {
+		t.Fatalf("create sequence cyc_seq: %v", err)
+	}
 
 	// Slice 61: a RECURSIVE VIEW must survive the dump. PG stores a recursive
 	// view as a regular view over a WITH RECURSIVE CTE; pg_dump fetches the body
@@ -1304,6 +1324,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "ALTER SEQUENCE public.plain_seq OWNED BY") ||
 			strings.Contains(res.Stdout, "ALTER SEQUENCE public.num_seq OWNED BY") {
 			t.Errorf("pg_dump emitted a spurious OWNED BY for a standalone sequence\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 117 (asserted):** typed sequences emit an `AS <type>` clause
+		// immediately after the CREATE SEQUENCE header (pg_dump renders
+		// format_type(seqtypid, NULL) and suppresses the clause only for the
+		// bigint default), and a CYCLE sequence emits a trailing `CYCLE;`. The
+		// 4-space-indented blocks pin pg_dump's exact byte order: `AS <type>`
+		// precedes START WITH, and CYCLE is the last clause. Typed sequences keep
+		// `NO MAXVALUE` because their default seqmax equals pg_dump's type-derived
+		// default_maxv (smallint 32767 / integer 2147483647).
+		typedSeqDefs := []string{
+			"CREATE SEQUENCE public.small_seq\n    AS smallint\n",
+			"CREATE SEQUENCE public.int_seq\n    AS integer\n",
+			"CREATE SEQUENCE public.cyc_seq\n",
+			"    CYCLE;",
+		}
+		for _, sub := range typedSeqDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a typed/CYCLE SEQUENCE clause; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// The bigint-default sequences must NOT carry a spurious `AS bigint` clause
+		// (pg_dump suppresses the type clause for the default), and the typed
+		// sequences must NOT be cycling (no stray CYCLE on small_seq/int_seq).
+		if strings.Contains(res.Stdout, "    AS bigint\n") {
+			t.Errorf("pg_dump emitted a spurious `AS bigint` for a default sequence\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 61 (asserted):** a RECURSIVE VIEW must round-trip. PG stores it
 		// as a regular view over a WITH RECURSIVE CTE and pg_dump re-emits a plain

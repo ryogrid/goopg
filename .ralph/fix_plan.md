@@ -2209,6 +2209,31 @@ object support.
         pg_dump emits `AS smallint`/`AS integer`) and a CYCLE sequence; or pivot to
         the next pg_dump object surface (e.g. a sequence with `OWNED BY` exercising
         the pg_depend 'a' path + `ALTER SEQUENCE ... OWNED BY` emission).
+      - **PROGRESS 2026-06-17 (loop #81):** **DU-002 slice 117 LANDED** — typed
+        (`AS smallint`/`AS integer`) and `CYCLE` sequences now verified to dump
+        byte-identically. **Verification slice, NO production code changed:** the
+        executor already tracked the data type (`SetSequenceDataType` →
+        `seqState.dataType`; `seqTypeBounds` derives smallint `1..32767` / integer
+        `1..2147483647` defaults) and `seqcycle`, and `sequenceParamsForCatalog`
+        already maps the type to `seqtypid` (21/23/20 via `seqTypeOID`) + threads
+        `seqcycle` into `pg_sequence`; `formatTypeOID(21/23,NULL)` renders
+        smallint/integer for pg_dump's `format_type(seqtypid, NULL)`. pg_dump
+        emits the `AS <type>` clause right after the header (suppressed for the
+        bigint default), keeps `NO MAXVALUE` because the type-derived `seqmax`
+        equals its own `default_maxv`, and appends `CYCLE` last when `seqcycle`.
+        Added 3 fixtures (`small_seq AS smallint`, `int_seq AS integer`,
+        `cyc_seq CYCLE`) to `TestPort_PgDumpConnectionSetup` with precise
+        multi-line block assertions pinning the 4-space-indented clause order
+        (`AS <type>` before `START WITH`; `CYCLE` last) + a negative `AS bigint`
+        guard for default sequences. Files: `internal/testport/pgdump_connsetup_test.go`
+        (fixtures + assertions), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 117 section). Gates: gofmt OK; `go build ./internal/...` OK;
+        `TestPort_PgDumpConnectionSetup` PASS (1.96s); pgbench pre-commit smoke on
+        commit. **Next: slice 118** — pivot to a sequence with `OWNED BY`
+        (exercises the pg_depend 'a' path + `ALTER SEQUENCE ... OWNED BY` emission),
+        the last single-sequence pg_dump surface; or a descending sequence
+        (`INCREMENT BY -1` → `MINVALUE`/`MAXVALUE -1` defaults, exercising the
+        descending-direction branch of pg_dump's default-bound suppression).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text
