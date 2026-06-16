@@ -154,6 +154,10 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'm'}
 	case catalog.OIDUUID: // 2950 -- pg_type.dat: typlen 16, typbyval f, typalign 'c', typstorage 'p'
 		return userTypeAttrs{TypLen: 16, TypByVal: false, TypAlign: 'c', TypStorage: 'p'}
+	case catalog.OIDJSON: // 114 json -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDJsonb: // 3802 jsonb -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBool: // 1000 _bool -- pg_type.dat: typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBytea: // 1001 _bytea -- element bytea typalign 'i', typstorage 'x'
@@ -187,6 +191,10 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 	case catalog.OIDArrayBpChar: // 1014 _bpchar -- element bpchar collation defaults
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x', TypCollation: defaultCollationOID}
 	case catalog.OIDArrayOID: // 1028 _oid -- element oid typalign 'i', no collation
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayJSON: // 199 _json -- element json typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayJsonb: // 3807 _jsonb -- element jsonb typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}

@@ -596,7 +596,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"tok uuid, ids uuid[], "+
 		"blob bytea, blobs bytea[], "+
 		"label varchar(20), labels varchar(20)[], "+
-		"code char(4), codes char(4)[], oids oid[])"); err != nil {
+		"code char(4), codes char(4)[], oids oid[], "+
+		"doc json, docs json[], jdoc jsonb, jdocs jsonb[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -917,6 +918,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// (_varchar 1015), char(4)[] (_bpchar 1014) and oid[] (_oid 1028). varchar/
 		// bpchar carry the element typmod onto the array (like numeric) so the
 		// declared length survives the dump; oid has no typmod.
+		// Slice 69 adds the JSON family: scalar json (`doc`, OID 114) + json[]
+		// (`docs`, _json 199) and scalar jsonb (`jdoc`, OID 3802) + jsonb[]
+		// (`jdocs`, _jsonb 3807). Both were previously absent from
+		// TypeNameToOID/OIDToTypeName, so a json/jsonb column fell back to text
+		// (OID 25) and dumped as `text`; the array path had no _json/_jsonb OID
+		// at all. json/jsonb are varlena with no typmod, so the arrays render as
+		// the bare `json[]` / `jsonb[]` (formatTypeOID already had the scalar
+		// cases 114/3802).
 		arrCols := []string{
 			"CREATE TABLE public.arr (",
 			"tags text[]",
@@ -939,6 +948,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"code character(4)",
 			"codes character(4)[]",
 			"oids oid[]",
+			"doc json",
+			"docs json[]",
+			"jdoc jsonb",
+			"jdocs jsonb[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

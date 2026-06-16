@@ -10375,6 +10375,12 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "json"
 	case 142:
 		return "xml"
+	case 199:
+		// _json: json has no typmod, so the array is the bare name. Slice 69.
+		return "json[]"
+	case 3807:
+		// _jsonb: jsonb has no typmod, so the array is the bare name. Slice 69.
+		return "jsonb[]"
 	case 600:
 		return "point"
 	case 700:

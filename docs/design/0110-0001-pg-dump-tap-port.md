@@ -1499,6 +1499,24 @@ fixed one logical group per loop:
     simple scalar-OID-backed array type; remaining gaps are now
     ENUM/composite/domain user-type columns and IDENTITY/SEQUENCE columns.
 
+  - **Slice 69 — JSON family `json`/`json[]` + `jsonb`/`jsonb[]`
+    (`internal/catalog/codec.go`, `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** `json` (OID 114) and `jsonb` (OID 3802) were
+    absent from `TypeNameToOID`/`OIDToTypeName`, so a `json`/`jsonb` column fell
+    back to `text` (OID 25) and dumped as `text`; the array path had no
+    `_json`/`_jsonb` OID at all. Same proven 3-site pattern: the two scalar-OID
+    consts (`OIDJSON`/`OIDJsonb`) + their `TypeNameToOID`/`OIDToTypeName` cases,
+    the two array-OID consts (`OIDArrayJSON` 199 / `OIDArrayJsonb` 3807) + cases
+    in `ArrayOIDForBase`/`BaseOIDForArray`, four rows in `userTypeAttrsForOID`
+    (`typlen=-1`, `typbyval=f`, `typalign='i'`, `typstorage='x'`, no collation —
+    matching `pg_type.dat`), and the array cases in the canonical `formatTypeOID`
+    (the scalar `114`→`json` / `3802`→`jsonb` cases already existed). json/jsonb
+    are varlena with **no typmod**, so the arrays render as the bare `json[]` /
+    `jsonb[]`. Guarded by the `arr` fixture's `doc json` + `docs json[]` + `jdoc
+    jsonb` + `jdocs jsonb[]` columns in `TestPort_PgDumpConnectionSetup` and the
+    new `{"json",nil,199,"json[]"}`, `{"jsonb",nil,3807,"jsonb[]"}` rows in
+    `executor.TestUserPGAttributeArrayColumn`.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
@@ -1547,7 +1565,8 @@ zone[]`, and `zoned timestamp with time zone[]`; slice 66 adds a scalar `tok
 uuid` and a `ids uuid[]` column; slice 67 adds a scalar `blob bytea` and a
 `blobs bytea[]` column; slice 68 adds `label varchar(20)`, `labels
 varchar(20)[]`, `code char(4)`, `codes char(4)[]`, and `oids oid[]` — completing
-every simple scalar-OID-backed array type.
+every simple scalar-OID-backed array type; slice 69 adds the JSON family `doc
+json`, `docs json[]`, `jdoc jsonb`, and `jdocs jsonb[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

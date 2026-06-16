@@ -417,6 +417,10 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		{"varchar", nil, 1015, "character varying[]"},
 		{"bpchar", []int64{10}, 1014, "character(10)[]"},
 		{"oid", nil, 1028, "oid[]"},
+		// Slice 69: the JSON family. json/jsonb are varlena with no typmod, so
+		// the arrays render as the bare element name with the [] suffix.
+		{"json", nil, 199, "json[]"},
+		{"jsonb", nil, 3807, "jsonb[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

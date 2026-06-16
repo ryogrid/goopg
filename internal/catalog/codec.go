@@ -71,6 +71,8 @@ const (
 	OIDVarChar     uint32 = 1043
 	OIDNumeric     uint32 = 1700
 	OIDUUID        uint32 = 2950
+	OIDJSON        uint32 = 114
+	OIDJsonb       uint32 = 3802
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -100,6 +102,10 @@ const (
 	OIDArrayVarChar uint32 = 1015
 	OIDArrayBpChar  uint32 = 1014
 	OIDArrayOID     uint32 = 1028
+	// DU-002 slice 69: the JSON family. json/jsonb are varlena with no typmod,
+	// so format_type renders these arrays as the bare `json[]` / `jsonb[]`.
+	OIDArrayJSON  uint32 = 199
+	OIDArrayJsonb uint32 = 3807
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -142,6 +148,10 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayBpChar
 	case OIDOID:
 		return OIDArrayOID
+	case OIDJSON:
+		return OIDArrayJSON
+	case OIDJsonb:
+		return OIDArrayJsonb
 	}
 	return 0
 }
@@ -186,6 +196,10 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDBpChar, true
 	case OIDArrayOID:
 		return OIDOID, true
+	case OIDArrayJSON:
+		return OIDJSON, true
+	case OIDArrayJsonb:
+		return OIDJsonb, true
 	}
 	return 0, false
 }
@@ -996,6 +1010,10 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDUUID
 	case "oid":
 		return OIDOID
+	case "json":
+		return OIDJSON
+	case "jsonb":
+		return OIDJsonb
 	default:
 		return OIDText // safe fallback
 	}
@@ -1042,6 +1060,10 @@ func OIDToTypeName(oid uint32) string {
 		return "uuid"
 	case OIDOID:
 		return "oid"
+	case OIDJSON:
+		return "json"
+	case OIDJsonb:
+		return "jsonb"
 	default:
 		return "text"
 	}
