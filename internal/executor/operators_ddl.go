@@ -3175,8 +3175,12 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, resolvedPred); err != nil {
 		return err
 	}
-	// Store INCLUDE columns, partial index flag, and predicate expression.
-	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil {
+	// Store INCLUDE columns, partial index flag, predicate expression, and the
+	// per-column ASC/DESC + NULLS ordering. The ordering is recorded only when
+	// at least one column is non-default so a plain index keeps empty slices and
+	// dumps byte-identically. DU-002 slice 56.
+	nonDefaultOrder := indexHasNonDefaultOrder(s.ColOrders)
+	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.HasPredicate = s.HasPredicate
 			idx.Predicate = s.Predicate
@@ -3184,9 +3188,31 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 				idx.PredicateString = defaultExprToSQL(s.Predicate)
 			}
 			idx.IncludeColumns = s.IncludeColumns
+			if nonDefaultOrder {
+				desc := make([]bool, len(s.ColOrders))
+				nullsFirst := make([]bool, len(s.ColOrders))
+				for i, ord := range s.ColOrders {
+					desc[i] = ord.Descending
+					nullsFirst[i] = ord.NullsFirst
+				}
+				idx.ColDescending = desc
+				idx.ColNullsFirst = nullsFirst
+			}
 		}
 	}
 	return nil
+}
+
+// indexHasNonDefaultOrder reports whether any key column carries a non-default
+// ASC/DESC + NULLS ordering (the btree default is ASC NULLS LAST, i.e.
+// Descending=false, NullsFirst=false). DU-002 slice 56.
+func indexHasNonDefaultOrder(orders []parser.IndexColOrder) bool {
+	for _, o := range orders {
+		if o.Descending || o.NullsFirst {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {

@@ -468,9 +468,16 @@ type Index struct {
 	// Set by the executor at CREATE INDEX time. M0097-0023.
 	PredicateString string
 	IncludeColumns  []string // non-key covering columns from INCLUDE (…)
-	IsConstraint    bool     // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
-	IsExclusion     bool     // true when index backs an EXCLUDE USING constraint
-	ExclusionOp     string   // per-column exclusion operator (e.g. "=")
+	// ColDescending / ColNullsFirst capture the per-key-column ASC/DESC + NULLS
+	// ordering, parallel to Columns. They mirror pg_index.indoption so
+	// BuildIndexDef (pg_get_indexdef) can reproduce a non-default ordering.
+	// Empty slices mean every key column is the default ASC NULLS LAST. DU-002
+	// slice 56.
+	ColDescending []bool
+	ColNullsFirst []bool
+	IsConstraint  bool   // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
+	IsExclusion   bool   // true when index backs an EXCLUDE USING constraint
+	ExclusionOp   string // per-column exclusion operator (e.g. "=")
 	// PartitionParentOID is the OID of the parent index for partition index
 	// trees (ALTER INDEX parent ATTACH PARTITION child). Zero if not a partition
 	// index child. M0097-0023.
@@ -5577,6 +5584,20 @@ func BuildIndexDef(idx *Index) string {
 			}
 		} else {
 			sb.WriteString(col)
+		}
+		// Per-column ASC/DESC + NULLS ordering, mirroring ruleutils.c
+		// pg_get_indexdef_worker: DESC defaults to NULLS FIRST (print NULLS LAST
+		// when overridden); ASC defaults to NULLS LAST (print NULLS FIRST when
+		// set). Defaults are suppressed so a plain index dumps byte-identically.
+		desc := i < len(idx.ColDescending) && idx.ColDescending[i]
+		nullsFirst := i < len(idx.ColNullsFirst) && idx.ColNullsFirst[i]
+		if desc {
+			sb.WriteString(" DESC")
+			if !nullsFirst {
+				sb.WriteString(" NULLS LAST")
+			}
+		} else if nullsFirst {
+			sb.WriteString(" NULLS FIRST")
 		}
 	}
 	sb.WriteByte(')')

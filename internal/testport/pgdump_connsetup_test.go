@@ -331,6 +331,17 @@ package testport
 // so nothing reached pg_description. parseCommentOnTail's column case now reads
 // the trailing `.col` when present, so both forms parse and the column comment
 // surfaces (unit guard: internal/parser/comment_on_test.go TestParseCommentOnColumn).
+// Slice 56 restored secondary-index ASC/DESC + NULLS FIRST/LAST ordering. A
+// plain CREATE INDEX round-trips via getIndexes -> pg_get_indexdef (distinct
+// from the index-backed constraint path); the plain and partial forms already
+// worked, but goopg's parseIndexColumnList parsed and then DISCARDED each key
+// column's ASC/DESC + NULLS modifiers, so a `(col DESC)` index round-tripped as
+// ascending — a silent semantic change. The parser now captures per-column
+// IndexColOrder into CreateIndexStmt.ColOrders, execCreateIndex stores it on
+// catalog.Index.ColDescending/ColNullsFirst (only when non-default), and
+// BuildIndexDef renders it with PG's default-suppression (DESC defaults NULLS
+// FIRST; ASC defaults NULLS LAST). A latent parser bug — `NULLS` (a bare ident)
+// being mis-read as an opclass name in `(col NULLS FIRST)` — was fixed alongside.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
@@ -424,6 +435,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	}
 	if err := runSQLSimple(t, c, "COMMENT ON COLUMN public.foo.name IS 'the name column'"); err != nil {
 		t.Fatalf("comment on column foo.name: %v", err)
+	}
+
+	// Slice 56: a plain (non-constraint) secondary index must survive the dump,
+	// AND its per-column ASC/DESC + NULLS FIRST/LAST ordering must be preserved.
+	// The UNIQUE (code) constraint round-trips via pg_dump's index-backed
+	// constraint path (ADD CONSTRAINT ... UNIQUE); a standalone CREATE INDEX
+	// instead flows through getIndexes -> pg_get_indexdef(indexrelid), a distinct
+	// path that emits a separate `CREATE INDEX ... USING btree (...)` statement.
+	// goopg parsed but SILENTLY DISCARDED the ordering modifiers, so a DESC index
+	// round-tripped as ASC — a silent semantic change. foo_name_idx guards the
+	// plain (all-default) path; the two ordered indexes guard each render branch.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_name_idx ON public.foo (name)"); err != nil {
+		t.Fatalf("create index foo_name_idx: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_qty_partial_idx ON public.foo (qty) WHERE qty > 0"); err != nil {
+		t.Fatalf("create partial index: %v", err)
+	}
+	// DESC NULLS LAST exercises the DESC branch with a non-default NULLS override.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_name_desc_idx ON public.foo (name DESC NULLS LAST)"); err != nil {
+		t.Fatalf("create DESC index: %v", err)
+	}
+	// A composite index mixing DESC (default NULLS FIRST, suppressed) with an
+	// ASC NULLS FIRST override exercises the remaining two render branches.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_ord_idx ON public.foo (name DESC, qty NULLS FIRST)"); err != nil {
+		t.Fatalf("create ordered composite index: %v", err)
 	}
 
 	res, err := util.RunCommand(util.CommandSpec{
@@ -615,6 +651,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped a COMMENT; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
+		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the
+		// index-backed constraint path. PG renders it `CREATE INDEX <name> ON
+		// <schema>.<table> USING btree (<cols>);`. goopg parsed ASC/DESC and NULLS
+		// FIRST/LAST modifiers but SILENTLY DISCARDED them, so a DESC index dumped
+		// as an ASC index — a silent semantic change. The parser now captures the
+		// per-column ordering into CreateIndexStmt.ColOrders, the executor stores
+		// it on catalog.Index.ColDescending/ColNullsFirst, and BuildIndexDef
+		// renders it with PG's default-suppression (DESC defaults NULLS FIRST; ASC
+		// defaults NULLS LAST). Assert each render branch round-trips.
+		indexDefs := []string{
+			// plain (all-default ASC NULLS LAST) — no ordering clause
+			"CREATE INDEX foo_name_idx ON public.foo USING btree (name);",
+			// partial index predicate (slice-56 regression guard — already worked)
+			"CREATE INDEX foo_qty_partial_idx ON public.foo USING btree (qty) WHERE qty > 0;",
+			// DESC with a non-default NULLS LAST override
+			"CREATE INDEX foo_name_desc_idx ON public.foo USING btree (name DESC NULLS LAST);",
+			// DESC (default NULLS FIRST suppressed) + ASC NULLS FIRST override
+			"CREATE INDEX foo_ord_idx ON public.foo USING btree (name DESC, qty NULLS FIRST);",
+		}
+		for _, sub := range indexDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/mangled a secondary index; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
 		return

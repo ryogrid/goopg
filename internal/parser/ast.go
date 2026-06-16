@@ -1148,6 +1148,20 @@ type CreateIndexStmt struct {
 	Predicate          Expr     // WHERE predicate expression (nil if no WHERE clause)
 	IncludeColumns     []string // non-key covering columns from INCLUDE (…)
 	OnOnly             bool     // ON ONLY — create on parent table without propagating to children
+	// ColOrders captures the per-key-column ASC/DESC + NULLS FIRST/LAST ordering,
+	// parallel to Columns (ColOrders[i] applies to Columns[i]). Mirrors PG's
+	// pg_index.indoption so pg_get_indexdef can reproduce a non-default ordering.
+	ColOrders []IndexColOrder
+}
+
+// IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key
+// column. Descending mirrors PG's INDOPTION_DESC; NullsFirst mirrors
+// INDOPTION_NULLS_FIRST. When the NULLS clause is omitted PG defaults NullsFirst
+// to Descending (NULLS FIRST is the default for DESC, NULLS LAST for ASC), so the
+// parser pre-resolves NullsFirst to that effective value.
+type IndexColOrder struct {
+	Descending bool
+	NullsFirst bool
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }

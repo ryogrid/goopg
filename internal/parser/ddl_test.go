@@ -114,6 +114,41 @@ func TestParseCreateIndex(t *testing.T) {
 	}
 }
 
+// TestParseCreateIndexColOrders pins the per-column ASC/DESC + NULLS FIRST/LAST
+// capture (DU-002 slice 56). goopg previously parsed and discarded these
+// modifiers, so a DESC index lost its ordering on dump. NullsFirst defaults to
+// the descending flag (NULLS FIRST is the btree default for DESC) unless an
+// explicit NULLS clause overrides it. Also guards that `NULLS` is not mis-read
+// as an opclass name in `(col NULLS FIRST)`.
+func TestParseCreateIndexColOrders(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []IndexColOrder
+	}{
+		{"CREATE INDEX i ON t (a)", []IndexColOrder{{false, false}}},
+		{"CREATE INDEX i ON t (a DESC)", []IndexColOrder{{true, true}}},
+		{"CREATE INDEX i ON t (a ASC)", []IndexColOrder{{false, false}}},
+		{"CREATE INDEX i ON t (a DESC NULLS LAST)", []IndexColOrder{{true, false}}},
+		{"CREATE INDEX i ON t (a NULLS FIRST)", []IndexColOrder{{false, true}}},
+		{"CREATE INDEX i ON t (a DESC, b NULLS FIRST)", []IndexColOrder{{true, true}, {false, true}}},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ci := stmts[0].(*CreateIndexStmt)
+		if len(ci.ColOrders) != len(c.want) {
+			t.Fatalf("Parse(%q): ColOrders=%+v want %+v", c.in, ci.ColOrders, c.want)
+		}
+		for i, w := range c.want {
+			if ci.ColOrders[i] != w {
+				t.Errorf("Parse(%q): ColOrders[%d]=%+v want %+v", c.in, i, ci.ColOrders[i], w)
+			}
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {

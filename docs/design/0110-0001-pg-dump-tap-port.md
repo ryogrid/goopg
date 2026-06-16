@@ -1211,6 +1211,38 @@ fixed one logical group per loop:
     `parser.TestParseCommentOnColumn` (2-part and 3-part forms parse to the
     correct table/column).
 
+  - **Slice 56 — secondary-index ASC/DESC + NULLS FIRST/LAST ordering
+    (`internal/parser/ddl.go`, `internal/parser/ast.go`,
+    `internal/catalog/catalog.go`, `internal/executor/operators_ddl.go`).** A
+    plain (non-constraint) `CREATE INDEX` round-trips through pg_dump's
+    `getIndexes` -> `pg_get_indexdef(indexrelid)` path (distinct from the
+    index-backed constraint path that UNIQUE/PK use). The plain and partial-index
+    forms already worked, but goopg's `parseIndexColumnList` **parsed and then
+    discarded** each key column's `ASC`/`DESC` and `NULLS FIRST`/`LAST`
+    modifiers, so a `CREATE INDEX … (col DESC)` round-tripped as an ascending
+    index — a silent semantic change (a descending index reads back ascending).
+    Fix threads the ordering end-to-end, mirroring PG's `pg_index.indoption`:
+    (1) the parser captures per-column `IndexColOrder{Descending, NullsFirst}`
+    into `CreateIndexStmt.ColOrders` (NullsFirst pre-resolved to the descending
+    flag — NULLS FIRST is the btree default for DESC, NULLS LAST for ASC — unless
+    an explicit NULLS clause overrides); (2) `catalog.Index` gains parallel
+    `ColDescending`/`ColNullsFirst` slices, populated by `execCreateIndex` only
+    when at least one column is non-default (a plain index keeps empty slices and
+    dumps byte-identically); (3) `BuildIndexDef` renders the ordering with PG's
+    default-suppression logic from `ruleutils.c pg_get_indexdef_worker` (DESC
+    prints `NULLS LAST` only when overridden; ASC prints `NULLS FIRST` only when
+    set). A pre-existing latent parser bug was also fixed: `NULLS` lexes as a bare
+    `TokenIdent`, so the greedy opclass-name detection mis-read `(col NULLS
+    FIRST)` as `col` with opclass `nulls`; the opclass branch now skips a
+    case-insensitive `nulls`. Durability note: goopg does not persist the
+    indoption bits to the on-disk `pg_index` heap, so an index's ordering would be
+    lost across a server restart; `pg_get_indexdef` reads the in-memory
+    `AllIndexes()` catalog, so the dump is faithful within a session (the test
+    path). On-disk indoption persistence is a separate follow-up. Unit guards:
+    `parser.TestParseCreateIndexColOrders` (all six ASC/DESC/NULLS captures incl.
+    the NULLS-as-opclass guard), `catalog.TestBuildIndexDefColOrder` (all four
+    render branches).
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
@@ -1231,7 +1263,11 @@ CASCADE`; slice 54 asserts a non-empty reloptions survives — `CREATE TABLE
 public.opt (…) WITH (fillfactor='70')` — plus a `CREATE SCHEMA s` + `s.widget`
 cross-namespace round-trip; slice 55 asserts a TABLE comment and a COLUMN
 comment both round-trip — `COMMENT ON TABLE public.foo IS 'a foo table'` and
-`COMMENT ON COLUMN public.foo.name IS 'the name column'`. Unit guards:
+`COMMENT ON COLUMN public.foo.name IS 'the name column'`; slice 56 asserts a
+plain secondary index, a partial index, and two ordered indexes all round-trip —
+`CREATE INDEX foo_name_idx … (name)`, `… foo_qty_partial_idx … (qty) WHERE qty >
+0`, `… foo_name_desc_idx … (name DESC NULLS LAST)`, and `… foo_ord_idx … (name
+DESC, qty NULLS FIRST)`. Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
 `executor.TestAlterTableAddForeignKeyCapturesActions`,
@@ -1239,6 +1275,8 @@ comment both round-trip — `COMMENT ON TABLE public.foo IS 'a foo table'` and
 `executor.TestFillfactorSurfacesInPgClassReloptions`,
 `executor.TestFillfactorOutOfBoundsRejected`,
 `parser.TestParseCommentOnColumn`,
+`parser.TestParseCreateIndexColOrders`,
+`catalog.TestBuildIndexDefColOrder`,
 `config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`.
 

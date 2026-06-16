@@ -2726,12 +2726,13 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '('")
 	}
-	cols, colExprs, opClassWithOptions, err := p.parseIndexColumnList()
+	cols, colExprs, colOrders, opClassWithOptions, err := p.parseIndexColumnList()
 	if err != nil {
 		return nil, err
 	}
 	stmt.Columns = cols
 	stmt.ColExprs = colExprs
+	stmt.ColOrders = colOrders
 	stmt.OpClassWithOptions = opClassWithOptions
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("expected ')'")
@@ -2820,9 +2821,10 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 // For expression entries the column name is stored as "" and the parsed
 // expression is returned in the parallel exprs slice. Simple column names
 // are stored verbatim with nil in exprs.
-func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
+func (p *parser) parseIndexColumnList() ([]string, []Expr, []IndexColOrder, string, error) {
 	var cols []string
 	var exprs []Expr
+	var orders []IndexColOrder
 	var opClassWithOptions string
 	for {
 		var colName string
@@ -2833,7 +2835,7 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
 			// Parse and capture the expression.
 			e, err := p.parseExpr()
 			if err != nil {
-				return nil, nil, "", err
+				return nil, nil, nil, "", err
 			}
 			colName = "" // expression — no simple column name
 			colExpr = e
@@ -2841,14 +2843,14 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
 			// Parenthesised expression: (expr)
 			e, err := p.parseExpr()
 			if err != nil {
-				return nil, nil, "", err
+				return nil, nil, nil, "", err
 			}
 			colName = ""
 			colExpr = e
 		} else {
 			tok, err := p.parseIdent()
 			if err != nil {
-				return nil, nil, "", err
+				return nil, nil, nil, "", err
 			}
 			colName = identText(tok)
 		}
@@ -2860,8 +2862,10 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
 		}
 
 		// Optional opclass name (bare ident that is not a known keyword
-		// and not ',' or ')')
-		if p.cur().Kind == TokenIdent {
+		// and not ',' or ')'). `NULLS` lexes as a bare TokenIdent, so guard
+		// against it here — otherwise `(col NULLS FIRST)` mis-reads NULLS as an
+		// opclass name and the trailing FIRST/LAST then fails to parse.
+		if p.cur().Kind == TokenIdent && !strings.EqualFold(p.cur().Value, "nulls") {
 			// This is the opclass name — capture it.
 			opClassName := p.cur().Value
 			p.advance()
@@ -2885,22 +2889,37 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
 			}
 		}
 
-		// Optional ASC/DESC
-		_ = p.acceptKeyword(KwAsc) || p.acceptKeyword(KwDesc)
+		// Optional ASC/DESC. NULLS FIRST is the btree default for DESC, NULLS
+		// LAST for ASC, so pre-resolve NullsFirst to the descending flag and let
+		// an explicit NULLS clause below override it (mirrors PG's indoption).
+		var order IndexColOrder
+		if p.acceptKeyword(KwDesc) {
+			order.Descending = true
+		} else {
+			_ = p.acceptKeyword(KwAsc)
+		}
+		order.NullsFirst = order.Descending
 
 		// Optional NULLS FIRST/LAST
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull {
 			p.advance() // NULLS
-			p.acceptIdentKeyword("first")
-			p.acceptIdentKeyword("last")
+			if p.acceptIdentKeyword("first") {
+				order.NullsFirst = true
+			} else if p.acceptIdentKeyword("last") {
+				order.NullsFirst = false
+			}
 		}
 		if p.acceptIdentKeyword("nulls") {
-			p.acceptIdentKeyword("first")
-			p.acceptIdentKeyword("last")
+			if p.acceptIdentKeyword("first") {
+				order.NullsFirst = true
+			} else if p.acceptIdentKeyword("last") {
+				order.NullsFirst = false
+			}
 		}
 
 		cols = append(cols, colName)
 		exprs = append(exprs, colExpr)
+		orders = append(orders, order)
 		if !p.acceptSymbol(",") {
 			break
 		}
@@ -2910,7 +2929,7 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
 			break
 		}
 	}
-	return cols, exprs, opClassWithOptions, nil
+	return cols, exprs, orders, opClassWithOptions, nil
 }
 
 // parseDrop dispatches on the next keyword after DROP.
