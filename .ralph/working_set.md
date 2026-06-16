@@ -1,29 +1,29 @@
-Task: DU-002 slice 97 — `CHECK (VALUE IN (...))` over a text DOMAIN survives pg_dump (COMPLETE, commit pending)
+Task: DU-002 slice 98 — `CHECK (VALUE IN (...))` over char/varchar domains survives
+pg_dump (COMPLETE, commit pending).
 
 Files:
-- internal/parser/ddl.go — IN-values CONSTRAINT branch now threads the explicit
-  constraint name into stmt.CheckName (was discarded).
-- internal/executor/operators_ddl.go — execCreateDomain synthesizes the deparse via
-  new domainInValuesCheckExpr(baseType, vals): for text base type returns
-  `VALUE = ANY (ARRAY['v'::text, ...])` (quote-doubled literals), then SetDomainCheck
-  routes it through the slice-96 pg_constraint plumbing. Non-text → "" (runtime-only).
-- internal/testport/pgdump_connsetup_test.go — fixtures colr (auto colr_check) +
-  named_in (CONSTRAINT must_be_color); dom cols co/ni; domainDefs asserts
-  `CONSTRAINT colr_check CHECK ((VALUE = ANY (ARRAY['red'::text, 'green'::text])))`.
-- docs/design/0110-0001-pg-dump-tap-port.md — slice 97 narrative.
-- .ralph/fix_plan.md — consolidated slices 91–97 progress note.
+- internal/executor/operators_ddl.go — domainInValuesCheckExpr is now OID-driven
+  (catalog.TypeNameToOID(baseType)) instead of string-matching "text". text→`::text`,
+  bpchar→`::bpchar` (bare shape); varchar→`(VALUE)::text = ANY ((ARRAY[…])::text[])`
+  coercion envelope. Non-string base types still return "".
+- internal/testport/pgdump_connsetup_test.go — fixtures vc_in (varchar, auto vc_in_check),
+  vc20_in (varchar(20), CONSTRAINT must_ab), ch_in (char(4), auto ch_in_check); dom cols
+  vci/vc20i/chi; domainDefs asserts each exact deparse.
+- docs/design/0110-0001-pg-dump-tap-port.md — slice 98 table (text/bpchar/varchar).
+- .ralph/fix_plan.md — loop #60 progress note.
 
-Key symbols: domainInValuesCheckExpr, CreateDomainStmt.CheckInValues/CheckName,
-SetDomainCheck, pg_constraint VirtualRows domain loop, pg_get_constraintdef domain branch.
+Key symbols: domainInValuesCheckExpr, catalog.TypeNameToOID (OIDText/OIDBpChar/OIDVarChar),
+SetDomainCheck, pg_get_constraintdef domain branch.
 
-Findings: verified real pg_dump 18.3 (/tmp/pgcheck_du97). text domain IN deparses to
-`CHECK ((VALUE = ANY (ARRAY['red'::text, 'green'::text])))`. varchar form is
-`CHECK (((VALUE)::text = ANY ((ARRAY['a'::character varying, ...])::text[])))` — needs
-a base-type coercion envelope, DEFERRED to slice 98.
+Findings: verified real pg_dump 18.3 (/tmp/pgcheck_du98). bpchar has native eq → bare
+shape like text; varchar borrows text's eq → coercion envelope. typmod never in element
+cast. NOTE: CREATE DOMAIN parser only accepts single-token base names — fixtures must use
+`varchar`/`char` aliases, NOT multi-word `character varying`/`character` (parseObjectName
+doesn't merge them; parseColumnType does, but CREATE DOMAIN uses parseObjectName).
 
-Gates run: go build+vet OK; parser+executor+catalog unit PASS;
-TestPort_PgDumpConnectionSetup PASS (2.35s); pre-commit pgbench smoke on commit.
+Gates run: go build+vet OK; executor/parser/catalog unit PASS;
+TestPort_PgDumpConnectionSetup PASS (1.64s); pgbench pre-commit smoke on commit.
 
-Next step: slice 98 candidates: (a) varchar/char IN-values coercion-envelope deparse;
-(b) composite type CREATE TYPE AS (...) — third object type, dumpCompositeType;
-(c) range type. ADD fixture, RUN test, let it report the real blocker.
+Next step: slice 99 candidates: (a) non-string IN-values (integer VALUE = ANY (ARRAY[1,2]));
+(b) new object type — composite CREATE TYPE AS (...) (dumpCompositeType) or range type.
+ADD fixture, RUN test, let it report the real blocker.

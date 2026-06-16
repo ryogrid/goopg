@@ -8686,25 +8686,47 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 
 // domainInValuesCheckExpr renders a `CHECK (VALUE IN (...))` domain constraint as
 // PG's deparsed ScalarArrayOpExpr text, so it round-trips through pg_dump via
-// pg_get_constraintdef. For a text base type PG emits a bare per-element `::text`
-// cast with no coercion wrapper:
+// pg_get_constraintdef. The exact deparse depends on the string base type's
+// equality operator (verified against real pg_dump 18.3):
 //
-//	VALUE = ANY (ARRAY['red'::text, 'green'::text])
+//	text       VALUE = ANY (ARRAY['red'::text, 'green'::text])
+//	char(n)    VALUE = ANY (ARRAY['a'::bpchar, 'b'::bpchar])
+//	varchar    (VALUE)::text = ANY ((ARRAY['a'::character varying, ...])::text[])
 //
-// Other base types (e.g. character varying, which PG wraps as
-// `(VALUE)::text = ANY ((ARRAY[...])::text[])`) need a base-type-specific coercion
-// envelope and are left runtime-only for now (returns ""). DU-002 slice 97.
+// text and bpchar have native equality operators, so PG emits a bare per-element
+// cast with no coercion wrapper. character varying has no varchar-eq operator and
+// reuses text's, so PG coerces both sides to text — hence the `(VALUE)::text` /
+// `(...)::text[]` envelope. The per-element cast always uses the base type's bare
+// name (no typmod, even for varchar(20)/char(4)). Non-string base types are left
+// runtime-only (returns ""). DU-002 slices 97 (text) + 98 (char/varchar).
 func domainInValuesCheckExpr(baseType string, vals []string) string {
-	if strings.ToLower(strings.TrimSpace(baseType)) != "text" || len(vals) == 0 {
+	if len(vals) == 0 {
+		return ""
+	}
+	var castType string
+	var coerceToText bool
+	switch catalog.TypeNameToOID(baseType) {
+	case catalog.OIDText:
+		castType = "text"
+	case catalog.OIDBpChar:
+		castType = "bpchar"
+	case catalog.OIDVarChar:
+		castType = "character varying"
+		coerceToText = true
+	default:
 		return ""
 	}
 	parts := make([]string, len(vals))
 	for i, v := range vals {
 		// PG quotes string literals with single quotes and doubles any embedded
 		// quote; mirror that so the deparse is byte-identical.
-		parts[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::text"
+		parts[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::" + castType
 	}
-	return "VALUE = ANY (ARRAY[" + strings.Join(parts, ", ") + "])"
+	arr := "ARRAY[" + strings.Join(parts, ", ") + "]"
+	if coerceToText {
+		return "(VALUE)::text = ANY ((" + arr + ")::text[])"
+	}
+	return "VALUE = ANY (" + arr + ")"
 }
 
 func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {

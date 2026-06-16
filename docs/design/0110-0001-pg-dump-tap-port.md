@@ -2231,9 +2231,27 @@ slice-96 plumbing (`SetDomainCheck` → `pg_constraint` `contype='c'` row →
 `CONSTRAINT colr_check CHECK ((VALUE = ANY (ARRAY['red'::text, 'green'::text])))` —
 byte-identical to real pg_dump 18.3, for both the auto-named and explicit-`CONSTRAINT`
 cases (the parser now also threads the explicit name into `CheckName` for the
-IN-values branch). Non-text base types (e.g. `character varying`, which PG wraps as
-`(VALUE)::text = ANY ((ARRAY[…])::text[])` with a base-type-specific coercion
-envelope) return `""` from the helper and stay runtime-only — a future slice.
+IN-values branch).
+
+Slice 98 extends the IN-values deparse to the two other string base types,
+`char(n)`/`bpchar` and `character varying`. `domainInValuesCheckExpr` is now
+OID-driven (`catalog.TypeNameToOID(baseType)` resolves the alias the parser stored)
+rather than string-matching `"text"`, so it covers all three string families with
+the deparse PG actually emits (verified against real pg_dump 18.3, `/tmp/pgcheck_du98`):
+
+| base type | deparse |
+|---|---|
+| `text` | `VALUE = ANY (ARRAY['red'::text, 'green'::text])` |
+| `char(n)`/`bpchar` | `VALUE = ANY (ARRAY['a'::bpchar, 'b'::bpchar])` |
+| `character varying` | `(VALUE)::text = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[])` |
+
+`text` and `bpchar` have native equality operators, so PG emits a bare per-element
+cast with no coercion wrapper. `character varying` has no varchar-eq operator and
+reuses `text`'s, so PG coerces both sides to `text` — the `(VALUE)::text` left side
+and the `(ARRAY[…])::text[]` right side. The per-element cast always uses the base
+type's bare name with **no typmod**, even for `varchar(20)`/`char(4)`. Non-string
+base types still return `""` and stay runtime-only — a future slice would need the
+type's own deparse shape (e.g. integer `VALUE = ANY (ARRAY[1, 2])`).
 
 ## Deferred (002–010) — catalog surface estimate
 

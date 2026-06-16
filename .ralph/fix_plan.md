@@ -1785,9 +1785,20 @@ object support.
         byte-identical to real pg_dump 18.3 (auto-named + explicit-CONSTRAINT). The
         parser now also threads the explicit name into `CheckName` for the IN-values
         branch. Gates: parser/executor/catalog unit PASS; `TestPort_PgDumpConnectionSetup`
-        PASS (2.35s); pgbench pre-commit smoke on commit. **Next blocker:** varchar
-        IN-values needs the `(VALUE)::text = ANY ((ARRAY[…])::text[])` coercion
-        envelope (slice 98); or move to a new object type (composite / range).
+        PASS (2.35s); pgbench pre-commit smoke on commit.
+      - **PROGRESS 2026-06-17 (loop #60):** **DU-002 slice 98 LANDED** — the IN-values
+        deparse now covers `char(n)`/`bpchar` and `character varying` domains, not just
+        text. `domainInValuesCheckExpr` is OID-driven (`catalog.TypeNameToOID`) instead
+        of string-matching `"text"`. bpchar mirrors the text shape with a `::bpchar`
+        element cast; varchar (no varchar-eq operator) gets PG's text-coercion envelope
+        `(VALUE)::text = ANY ((ARRAY['a'::character varying, …])::text[])`. The
+        per-element cast carries no typmod even for varchar(20)/char(4) — all verified
+        byte-identical to real pg_dump 18.3 (`/tmp/pgcheck_du98`). Fixtures `vc_in`,
+        `vc20_in` (named `must_ab`), `ch_in` + columns added to `public.dom`. Gates:
+        executor/parser/catalog unit PASS; `TestPort_PgDumpConnectionSetup` PASS (1.64s);
+        pgbench pre-commit smoke on commit. **Next blocker:** non-string IN-values
+        (e.g. integer `VALUE = ANY (ARRAY[1, 2])`) need per-type deparse; or move to a
+        new object type (composite / range).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

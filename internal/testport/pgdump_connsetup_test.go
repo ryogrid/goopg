@@ -774,7 +774,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.named_in AS text CONSTRAINT must_be_color CHECK (VALUE IN ('red','green'))"); err != nil {
 		t.Fatalf("create domain named_in: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in)"); err != nil {
+	// DU-002 slice 98: the same `CHECK (VALUE IN (...))` over char/varchar base
+	// types. char(n)/bpchar has a native equality operator, so PG deparses it with
+	// the same bare per-element-cast shape as text — `VALUE = ANY (ARRAY['a'::bpchar,
+	// ...])`. character varying has no varchar-eq operator and borrows text's, so PG
+	// wraps both sides in a text coercion envelope — `(VALUE)::text = ANY
+	// ((ARRAY['a'::character varying, ...])::text[])`. The per-element cast uses the
+	// bare base name with no typmod even when the domain is varchar(20)/char(4).
+	// Verified byte-identical to real pg_dump 18.3 (/tmp/pgcheck_du98).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.vc_in AS varchar CHECK (VALUE IN ('a','b'))"); err != nil {
+		t.Fatalf("create domain vc_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.vc20_in AS varchar(20) CONSTRAINT must_ab CHECK (VALUE IN ('a','b'))"); err != nil {
+		t.Fatalf("create domain vc20_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.ch_in AS char(4) CHECK (VALUE IN ('a','b'))"); err != nil {
+		t.Fatalf("create domain ch_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1407,6 +1424,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.named_in AS text",
 			"CONSTRAINT must_be_color CHECK ((VALUE = ANY (ARRAY['red'::text, 'green'::text])))",
 			"ni public.named_in",
+			// Slice 98: char/varchar IN-values. bpchar mirrors the text shape with a
+			// `::bpchar` element cast; varchar adds the `(VALUE)::text`/`::text[]`
+			// coercion envelope. typmod never appears in the element cast.
+			"CREATE DOMAIN public.vc_in AS character varying",
+			"CONSTRAINT vc_in_check CHECK (((VALUE)::text = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[])))",
+			"vci public.vc_in",
+			"CREATE DOMAIN public.vc20_in AS character varying(20)",
+			"CONSTRAINT must_ab CHECK (((VALUE)::text = ANY ((ARRAY['a'::character varying, 'b'::character varying])::text[])))",
+			"vc20i public.vc20_in",
+			"CREATE DOMAIN public.ch_in AS character(4)",
+			"CONSTRAINT ch_in_check CHECK ((VALUE = ANY (ARRAY['a'::bpchar, 'b'::bpchar])))",
+			"chi public.ch_in",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {
