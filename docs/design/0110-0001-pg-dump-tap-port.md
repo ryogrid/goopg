@@ -1660,6 +1660,25 @@ fixed one logical group per loop:
     handling needed). Guarded by the `arr` fixture's `lsn pg_lsn`, `lsns
     pg_lsn[]` columns in `TestPort_PgDumpConnectionSetup` and new rows in
     `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`.
+  - **Slice 77 — `txid_snapshot` / `pg_snapshot` (+ their array types)
+    (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** The transaction-snapshot types — the legacy
+    txid-based `txid_snapshot` (OID 2970, array `_txid_snapshot` 2949) and its
+    xid8-based successor `pg_snapshot` (OID 5038, array `_pg_snapshot` 5039) —
+    are already seeded in `pg_type_seed_data.go` (and supported by the
+    snapshot SRFs / I-O functions in `pg_proc_seed_data.go`), but neither had
+    been wired into the pg_dump catalog-codec path, so a snapshot column fell
+    back to `text` (OID 25). Both are varlena with no typmod, so this is the
+    plain 3-site pattern: `typlen=-1`, `typbyval=f`, `typalign='d'`,
+    `typstorage='x'` for both the scalars and the arrays. `TypeNameToOID` /
+    `OIDToTypeName` / `ArrayOIDForBase` / `BaseOIDForArray` gained the four
+    cases; `oidToBuiltinTypeName` and `formatTypeOID` gained scalar + array
+    cases (none existed before). The parser accepts both as generic identifiers
+    (no multi-word / typmod handling needed). Guarded by the `arr` fixture's
+    `txs txid_snapshot`, `txss txid_snapshot[]`, `pgs pg_snapshot`, `pgss
+    pg_snapshot[]` columns in `TestPort_PgDumpConnectionSetup` and new rows in
+    `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1721,7 +1740,8 @@ slice 73 adds the full-text-search family `tsv tsvector`, `tsvs tsvector[]`,
 `tsq tsquery`, and `tsqs tsquery[]`; slice 74 adds `xm xml`, `xms xml[]`, `mny
 money`, and `mnys money[]`; slice 75 adds the typmod-bearing `bv bit(8)`, `bvs
 bit(8)[]`, `vb varbit(16)`, and `vbs varbit(16)[]`; slice 76 adds `lsn pg_lsn`
-and `lsns pg_lsn[]`.
+and `lsns pg_lsn[]`; slice 77 adds the snapshot types `txs txid_snapshot`, `txss
+txid_snapshot[]`, `pgs pg_snapshot`, and `pgss pg_snapshot[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

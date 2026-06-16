@@ -608,7 +608,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"tsv tsvector, tsvs tsvector[], tsq tsquery, tsqs tsquery[], "+
 		"xm xml, xms xml[], mny money, mnys money[], "+
 		"bv bit(8), bvs bit(8)[], vb varbit(16), vbs varbit(16)[], "+
-		"lsn pg_lsn, lsns pg_lsn[])"); err != nil {
+		"lsn pg_lsn, lsns pg_lsn[], "+
+		"txs txid_snapshot, txss txid_snapshot[], "+
+		"pgs pg_snapshot, pgss pg_snapshot[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -968,6 +970,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// Slice 76 adds pg_lsn (`lsn`, 3220) + pg_lsn[] (`lsns`, _pg_lsn 3221).
 		// pg_lsn carries no typmod, so format_type renders the bare `pg_lsn` /
 		// `pg_lsn[]`.
+		// Slice 77 adds the snapshot types: txid_snapshot (`txs`, 2970) +
+		// txid_snapshot[] (`txss`, _txid_snapshot 2949) and pg_snapshot (`pgs`,
+		// 5038) + pg_snapshot[] (`pgss`, _pg_snapshot 5039). Neither carries a
+		// typmod, so format_type renders the bare names.
 		// All are seeded in pg_type but were never wired into TypeNameToOID/
 		// OIDToTypeName, so each scalar fell back to text (OID 25) and the array
 		// paths had no OIDs. None carry a typmod, so each renders as the plain
@@ -1036,6 +1042,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"vbs bit varying(16)[]",
 			"lsn pg_lsn",
 			"lsns pg_lsn[]",
+			"txs txid_snapshot",
+			"txss txid_snapshot[]",
+			"pgs pg_snapshot",
+			"pgss pg_snapshot[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

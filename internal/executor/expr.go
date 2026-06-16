@@ -149,6 +149,10 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "uuid"
 	case 3220:
 		return "pg_lsn"
+	case 2970:
+		return "txid_snapshot"
+	case 5038:
+		return "pg_snapshot"
 	// Array types
 	case 1000:
 		return "boolean[]"
@@ -220,6 +224,10 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "interval[]"
 	case 3221:
 		return "pg_lsn[]"
+	case 2949:
+		return "txid_snapshot[]"
+	case 5039:
+		return "pg_snapshot[]"
 	case 1231:
 		return "numeric[]"
 	case 2951:
@@ -10650,6 +10658,18 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 3221:
 		// _pg_lsn: pg_lsn has no typmod, so the array is the bare name. Slice 76.
 		return "pg_lsn[]"
+	case 2970:
+		// txid_snapshot: no typmod, bare name. DU-002 slice 77.
+		return "txid_snapshot"
+	case 2949:
+		// _txid_snapshot: no typmod, so the array is the bare name. Slice 77.
+		return "txid_snapshot[]"
+	case 5038:
+		// pg_snapshot: no typmod, bare name. DU-002 slice 77.
+		return "pg_snapshot"
+	case 5039:
+		// _pg_snapshot: no typmod, so the array is the bare name. Slice 77.
+		return "pg_snapshot[]"
 	case 3802:
 		return "jsonb"
 	case 4072:

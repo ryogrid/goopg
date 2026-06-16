@@ -112,6 +112,13 @@ const (
 	// OID. It is an 8-byte by-value type with no typmod, so format_type renders
 	// the bare type name.
 	OIDPgLsn uint32 = 3220
+	// DU-002 slice 77: the snapshot types. txid_snapshot is the legacy
+	// (pre-PG13) txid-based snapshot type; pg_snapshot is its xid8-based
+	// successor. Both are seeded in pg_type (see initdb/pg_type_seed_data.go)
+	// so a PG standby can resolve the OIDs. Both are varlena with no typmod, so
+	// format_type renders the bare type name.
+	OIDTxidSnapshot uint32 = 2970
+	OIDPgSnapshot   uint32 = 5038
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -180,6 +187,10 @@ const (
 	// DU-002 slice 76: the pg_lsn array type. pg_lsn has no typmod, so
 	// format_type renders the bare element name with a [] suffix.
 	OIDArrayPgLsn uint32 = 3221
+	// DU-002 slice 77: the snapshot array types. Neither carries a typmod, so
+	// format_type renders the bare element name with a [] suffix.
+	OIDArrayTxidSnapshot uint32 = 2949
+	OIDArrayPgSnapshot   uint32 = 5039
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -264,6 +275,10 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayVarbit
 	case OIDPgLsn:
 		return OIDArrayPgLsn
+	case OIDTxidSnapshot:
+		return OIDArrayTxidSnapshot
+	case OIDPgSnapshot:
+		return OIDArrayPgSnapshot
 	}
 	return 0
 }
@@ -350,6 +365,10 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDVarbit, true
 	case OIDArrayPgLsn:
 		return OIDPgLsn, true
+	case OIDArrayTxidSnapshot:
+		return OIDTxidSnapshot, true
+	case OIDArrayPgSnapshot:
+		return OIDPgSnapshot, true
 	}
 	return 0, false
 }
@@ -1202,6 +1221,10 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDVarbit
 	case "pg_lsn":
 		return OIDPgLsn
+	case "txid_snapshot":
+		return OIDTxidSnapshot
+	case "pg_snapshot":
+		return OIDPgSnapshot
 	default:
 		return OIDText // safe fallback
 	}
@@ -1290,6 +1313,10 @@ func OIDToTypeName(oid uint32) string {
 		return "varbit"
 	case OIDPgLsn:
 		return "pg_lsn"
+	case OIDTxidSnapshot:
+		return "txid_snapshot"
+	case OIDPgSnapshot:
+		return "pg_snapshot"
 	default:
 		return "text"
 	}
