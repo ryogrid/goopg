@@ -170,6 +170,12 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayTimestamp: // 1115 _timestamp -- element timestamp typalign 'd'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayFloat4: // 1021 _float4 -- element float4 typalign 'i'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayTime: // 1183 _time -- element time typalign 'd'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayTimestampTZ: // 1185 _timestamptz -- element timestamptz typalign 'd'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 }

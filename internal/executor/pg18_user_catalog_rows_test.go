@@ -401,6 +401,10 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		{"float8", nil, 1022, "double precision[]"},
 		{"date", nil, 1182, "date[]"},
 		{"timestamp", nil, 1115, "timestamp without time zone[]"},
+		// Slice 65: float4/time/timestamptz arrays.
+		{"float4", nil, 1021, "real[]"},
+		{"time", nil, 1183, "time without time zone[]"},
+		{"timestamptz", nil, 1185, "timestamp with time zone[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

@@ -1421,6 +1421,27 @@ fixed one logical group per loop:
     element types still fall back to their scalar OID — `uuid` additionally lacks
     a scalar OID in `TypeNameToOID`, so it needs the scalar type wired first.
 
+  - **Slice 65 — float4/time/timestamptz array columns (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`, `internal/executor/expr.go`).**
+    Extends the array-column set to the remaining scalar-OID-backed element types,
+    completing the date/time + floating-point families. Identical proven 3-site
+    pattern: `ArrayOIDForBase`/`BaseOIDForArray` gain `float4↔_float4` (1021),
+    `time↔_time` (1183) and `timestamptz↔_timestamptz` (1185);
+    `userTypeAttrsForOID` gains the `_float4`/`_time`/`_timestamptz` rows (all
+    `typlen=-1`, `typstorage='x'`; `_float4` uses `typalign='i'` matching its
+    4-byte element, `_time`/`_timestamptz` use `typalign='d'` matching their
+    8-byte elements); and `formatTypeOID` renders 1021 as `real[]`, 1183 as
+    `time without time zone[]`, and 1185 as `timestamp with time zone[]` (the
+    `oidToBuiltinTypeName` table already had 1021/1185 but was missing 1183, now
+    added). (The element scalar OIDs — `OIDFloat4` 700, `OIDTime` 1083,
+    `OIDTimestampTZ` 1184 — already existed; only the array mappings were missing.)
+    Guarded by the enriched `arr` fixture (`speeds real[]`, `times time[]`, `zoned
+    timestamptz[]`) in `TestPort_PgDumpConnectionSetup` and the new rows in
+    `executor.TestUserPGAttributeArrayColumn`. Remaining gap: `uuid[]` still needs
+    the scalar `uuid` type (OID 2950) wired into `TypeNameToOID` first; ENUM/
+    composite/domain user-type columns and IDENTITY/SEQUENCE columns are larger
+    slices.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
@@ -1463,7 +1484,9 @@ foo_rec;`; slice 62 asserts array-typed columns round-trip as their array type �
 bigint[]`; slice 63 extends the `arr` fixture so a `flags boolean[]` and a
 `prices numeric(10,2)[]` column also round-trip (the numeric array carrying its
 element precision/scale); slice 64 extends it further with `ratios double
-precision[]`, `days date[]`, and `moments timestamp without time zone[]`.
+precision[]`, `days date[]`, and `moments timestamp without time zone[]`;
+slice 65 extends it again with `speeds real[]`, `times time without time
+zone[]`, and `zoned timestamp with time zone[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

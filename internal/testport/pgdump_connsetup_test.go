@@ -577,10 +577,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// the proven 3-site pattern (array OID const + ArrayOID maps +
 	// userTypeAttrsForOID + formatTypeOID); float8/timestamp use 'd' alignment,
 	// date uses 'i'.
+	// Slice 65 extends it again with real[] (_float4 1021, 'i'), time[] (_time
+	// 1183, 'd') and timestamp with time zone[] (_timestamptz 1185, 'd') — the
+	// remaining scalar-OID-backed element types, same 3-site pattern.
 	if err := runSQLSimple(t, c, "CREATE TABLE public.arr (id integer PRIMARY KEY, "+
 		"tags text[], scores integer[], big bigint[], "+
 		"flags boolean[], prices numeric(10,2)[], "+
-		"ratios double precision[], days date[], moments timestamp[])"); err != nil {
+		"ratios double precision[], days date[], moments timestamp[], "+
+		"speeds real[], times time[], zoned timestamptz[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -886,6 +890,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// Slice 64 adds double precision[], date[] and timestamp[]: float8/date/
 		// timestamp now map to their array OIDs (_float8 1022, _date 1182,
 		// _timestamp 1115) so each dumps with its declared array type.
+		// Slice 65 adds real[], time[] and timestamp with time zone[]: float4/
+		// time/timestamptz now map to their array OIDs (_float4 1021, _time 1183,
+		// _timestamptz 1185) so each dumps with its declared array type.
 		arrCols := []string{
 			"CREATE TABLE public.arr (",
 			"tags text[]",
@@ -896,6 +903,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"ratios double precision[]",
 			"days date[]",
 			"moments timestamp without time zone[]",
+			"speeds real[]",
+			"times time without time zone[]",
+			"zoned timestamp with time zone[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

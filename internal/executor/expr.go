@@ -144,6 +144,8 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "timestamp without time zone[]"
 	case 1182:
 		return "date[]"
+	case 1183:
+		return "time without time zone[]"
 	case 1185:
 		return "timestamp with time zone[]"
 	case 1187:
@@ -10389,6 +10391,8 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "text[]"
 	case 1016:
 		return "bigint[]"
+	case 1021:
+		return "real[]"
 	case 1022:
 		return "double precision[]"
 	case 1115:
@@ -10397,6 +10401,12 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "timestamp without time zone[]"
 	case 1182:
 		return "date[]"
+	case 1183:
+		// _time: bare name, mirroring scalar 1083 (no typmod decode). Slice 65.
+		return "time without time zone[]"
+	case 1185:
+		// _timestamptz: bare name, mirroring scalar 1184. Slice 65.
+		return "timestamp with time zone[]"
 	case 1231:
 		// _numeric: format_type strips the array, formats the element with
 		// the carried typmod, then re-appends []. DU-002 slice 63.
