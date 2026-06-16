@@ -622,7 +622,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"iv int2vector, ivs int2vector[], ov oidvector, ovs oidvector[], "+
 		"nm name, nms name[], "+
 		"tt timetz, tts timetz[], "+
-		"jp jsonpath, jps jsonpath[])"); err != nil {
+		"jp jsonpath, jps jsonpath[], "+
+		"rfc refcursor, rfcs refcursor[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -1138,6 +1139,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// as "jsonpath"/"jsonpath[]" (distinct from json[]/jsonb[]).
 			"jp jsonpath",
 			"jps jsonpath[]",
+			// Slice 85: refcursor (cursor-name reference) + its array _refcursor.
+			// Neither display fn nor the codec had any refcursor wiring, so a
+			// declared `refcursor` column round-tripped as text. Now both survive
+			// as "refcursor"/"refcursor[]".
+			"rfc refcursor",
+			"rfcs refcursor[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

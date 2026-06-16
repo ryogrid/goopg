@@ -192,6 +192,9 @@ func oidToBuiltinTypeName(oid uint32) string {
 	case 4072:
 		// jsonpath: SQL/JSON path, varlena, bare name. DU-002 slice 84.
 		return "jsonpath"
+	case 1790:
+		// refcursor: cursor-name reference, varlena, bare name. DU-002 slice 85.
+		return "refcursor"
 	// Array types
 	case 1000:
 		return "boolean[]"
@@ -307,6 +310,9 @@ func oidToBuiltinTypeName(oid uint32) string {
 	case 4073:
 		// _jsonpath: jsonpath has no typmod, bare element name + []. Slice 84.
 		return "jsonpath[]"
+	case 2201:
+		// _refcursor: refcursor has no typmod, bare element name + []. Slice 85.
+		return "refcursor[]"
 	default:
 		return ""
 	}
@@ -10832,6 +10838,11 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 4073:
 		// _jsonpath: jsonpath has no typmod, so the array is the bare name. Slice 84.
 		return "jsonpath[]"
+	case 1790:
+		return "refcursor"
+	case 2201:
+		// _refcursor: refcursor has no typmod, so the array is the bare name. Slice 85.
+		return "refcursor[]"
 	default:
 		return "???"
 	}

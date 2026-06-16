@@ -220,6 +220,9 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 		// DU-002 slice 84: jsonpath (SQL/JSON path) round-trips its canonical
 		// name instead of falling back to text (the codec had no jsonpath→OID entry).
 		{"jsonpath", OIDJsonpath},
+		// DU-002 slice 85: refcursor (cursor-name reference) round-trips its
+		// canonical name instead of falling back to text.
+		{"refcursor", OIDRefcursor},
 	}
 	for _, p := range pairs {
 		gotOID := TypeNameToOID(p.name)
@@ -266,6 +269,18 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 	}
 	if OIDJsonpath != 4072 || OIDArrayJsonpath != 4073 {
 		t.Errorf("jsonpath OIDs drifted: OIDJsonpath=%d (want 4072), OIDArrayJsonpath=%d (want 4073)", OIDJsonpath, OIDArrayJsonpath)
+	}
+
+	// DU-002 slice 85: refcursor ↔ _refcursor array OID mapping round-trips, so a
+	// `refcursor[]` column resolves to _refcursor (2201) and reconstructs from it.
+	if got := ArrayOIDForBase(OIDRefcursor); got != OIDArrayRefcursor {
+		t.Errorf("ArrayOIDForBase(OIDRefcursor) = %d, want %d (_refcursor)", got, OIDArrayRefcursor)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayRefcursor); !ok || got != OIDRefcursor {
+		t.Errorf("BaseOIDForArray(OIDArrayRefcursor) = (%d,%v), want (%d,true)", got, ok, OIDRefcursor)
+	}
+	if OIDRefcursor != 1790 || OIDArrayRefcursor != 2201 {
+		t.Errorf("refcursor OIDs drifted: OIDRefcursor=%d (want 1790), OIDArrayRefcursor=%d (want 2201)", OIDRefcursor, OIDArrayRefcursor)
 	}
 }
 

@@ -1837,6 +1837,26 @@ fixed one logical group per loop:
     `{"jsonpath", nil, 4073, "jsonpath[]"}` row in
     `executor.TestUserPGAttributeArrayColumn`, and a new `jsonpath`/`_jsonpath`
     round-trip block in `catalog.TestTypeNameToOIDRoundTrip`.
+  - **Slice 85 — the `refcursor` type (+ its array `_refcursor`)
+    (`internal/catalog/codec.go`, `internal/executor/expr.go`,
+    `internal/executor/pg18_user_catalog_rows.go`).** `refcursor` (1790) is a
+    varlena cursor-name reference and a declarable column type; `format_type`
+    renders the bare `refcursor`. Unlike slice 84's `jsonpath`, `refcursor` had
+    **no wiring at all** in either display function or the codec, so a declared
+    `refcursor` column resolved to `text` (25) and round-tripped as text; the
+    array `_refcursor` (2201) was likewise unwired. Both 1790/2201 were already
+    seeded in `pg_type_seed_data.go`. This slice adds `OIDRefcursor`/
+    `OIDArrayRefcursor` consts plus the `refcursor`↔`_refcursor` cases in
+    `TypeNameToOID` / `OIDToTypeName` / `ArrayOIDForBase` / `BaseOIDForArray`; the
+    scalar 1790 and array 2201 cases in **both** `formatTypeOID`
+    (→ `refcursor`/`refcursor[]`) and `oidToBuiltinTypeName` (sibling display
+    paths kept in sync); and `userTypeAttrsForOID` cases for the scalar and the
+    array (both varlena `{typlen=-1, byval=f, align='i', storage='x'}`). Guarded
+    by the `arr` fixture's `rfc refcursor` / `rfcs refcursor[]` columns in
+    `TestPort_PgDumpConnectionSetup`, a new
+    `{"refcursor", nil, 2201, "refcursor[]"}` row in
+    `executor.TestUserPGAttributeArrayColumn`, and a new `refcursor`/`_refcursor`
+    round-trip block in `catalog.TestTypeNameToOIDRoundTrip`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

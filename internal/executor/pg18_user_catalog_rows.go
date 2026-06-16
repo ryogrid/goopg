@@ -162,6 +162,8 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDJsonpath: // 4072 jsonpath -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDRefcursor: // 1790 refcursor -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDInterval: // 1186 interval -- pg_type.dat: typlen 16, typbyval f, typalign 'd', typstorage 'p'
 		return userTypeAttrs{TypLen: 16, TypByVal: false, TypAlign: 'd', TypStorage: 'p'}
 	case catalog.OIDInet: // 869 inet -- pg_type.dat: typlen -1, typbyval f, typalign 'i', typstorage 'm'
@@ -272,6 +274,8 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 	case catalog.OIDArrayJsonb: // 3807 _jsonb -- element jsonb typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayJsonpath: // 4073 _jsonpath -- element jsonpath typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayRefcursor: // 2201 _refcursor -- element refcursor typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayInterval: // 1187 _interval -- element interval typalign 'd', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}

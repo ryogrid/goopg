@@ -498,6 +498,9 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// so the array renders as the bare element name + []. Distinct from json[]/
 		// jsonb[] — jsonpath stores compiled SQL/JSON path expressions.
 		{"jsonpath", nil, 4073, "jsonpath[]"},
+		// Slice 85: refcursor (_refcursor 2201). refcursor is varlena with no
+		// typmod, so the array renders as the bare element name + [].
+		{"refcursor", nil, 2201, "refcursor[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}
