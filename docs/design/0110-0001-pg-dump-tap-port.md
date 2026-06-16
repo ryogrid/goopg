@@ -1062,11 +1062,32 @@ fixed one logical group per loop:
     scans the owning table's `NamedChecks` and renders `CHECK ((expr))`
     (appending ` NO INHERIT` when set), mirroring PG's deparser's extra paren
     layer. The fixture's auto-named column CHECK now dumps as
-    `CONSTRAINT foo_qty_check CHECK ((qty >= 0))`. Known remaining divergence
-    (next slice): the implicit NOT NULL on a PRIMARY KEY column — goopg dumps
-    `id integer`, upstream `id integer NOT NULL`. Guard: the enriched
+    `CONSTRAINT foo_qty_check CHECK ((qty >= 0))`. Guard: the enriched
     `TestPort_PgDumpConnectionSetup` fixture asserts both the PRIMARY KEY
     ADD CONSTRAINT and the CHECK constraint survive the dump.
+
+  - **Slice 50 — implicit NOT NULL on a PRIMARY KEY column (named contype='n'
+    constraint) (`internal/executor/operators_ddl.go`).** goopg dumped the PK
+    column as bare `id integer`; upstream emits `id integer NOT NULL`. PG18's
+    pg_dump no longer derives the inline NOT NULL clause from `attnotnull` —
+    `getTableAttrs` LEFT-JOINs `pg_constraint co ON (a.attrelid = co.conrelid
+    AND co.contype = 'n' AND co.conkey = array[a.attnum])` and prints NOT NULL
+    only when `co.conname` is non-NULL (`determineNotNullFlags`/`dumpTableSchema`,
+    `src/bin/pg_dump/pg_dump.c`). goopg already emits contype='n'
+    `<table>_<col>_not_null` rows from `Table.NotNullConstraints`, and the PK
+    path already set the column's `attnotnull=true`, **but** the CREATE TABLE
+    NOT-NULL registration loop deliberately *excluded* PK columns (a `pkColSet`
+    skip), so no contype='n' row existed for them and the join found nothing.
+    Verified against real PG18: `id integer PRIMARY KEY` materialises a
+    `foo_id_not_null` (contype='n', conkey={1}) constraint alongside `foo_pkey`.
+    Fix: (1) drop the `pkColSet` exclusion so every not-null column — PK columns
+    included — registers its named NOT NULL constraint on CREATE TABLE; (2) add
+    the identical registration to the `ALTER TABLE … ADD PRIMARY KEY` sibling
+    path (`execAlterTableAddPrimaryKey`), which also flips `attnotnull`, guarding
+    against a duplicate when the column already carried a NOT NULL constraint.
+    pg_dump now prints `id integer NOT NULL`; the auto-default constraint name is
+    suppressed by pg_dump's `ChooseConstraintName` match. Guard: the fixture
+    asserts `id integer NOT NULL` in the dumped column list.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1076,7 +1097,8 @@ full column list** (`id integer`, `name text`) are emitted; slice 48 enriched th
 fixture so it also asserts the type modifiers `amount numeric(10,2)` and `code
 character varying(8)` round-trip; slice 49 further asserts the PRIMARY KEY
 `ADD CONSTRAINT` and the auto-named `CHECK ((qty >= 0))` constraint survive the
-dump. Unit guards:
+dump; slice 50 asserts the PK column's implicit `NOT NULL` (`id integer NOT
+NULL`) survives the dump. Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`.

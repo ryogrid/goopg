@@ -1305,17 +1305,6 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// explicit or inherited columns get auto-name <tablename>_<colname>_not_null.
 	// M0097-0023.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		pkColSet := make(map[string]bool, len(pkCols))
-		for _, pk := range pkCols {
-			pkColSet[strings.ToLower(pk)] = true
-		}
-		for _, nc := range s.NamedConstraints {
-			if nc.IsPrimary {
-				for _, pc := range nc.Columns {
-					pkColSet[strings.ToLower(pc)] = true
-				}
-			}
-		}
 		// Build set of explicit column defs that carry NOT NULL NO INHERIT.
 		explicitNoInherit := make(map[string]bool)
 		for _, origCol := range s.Columns {
@@ -1323,8 +1312,15 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				explicitNoInherit[strings.ToLower(origCol.Name)] = true
 			}
 		}
+		// PG18 records a contype='n' NOT NULL constraint for EVERY not-null
+		// column, INCLUDING primary-key columns (the PK implies NOT NULL, and
+		// PG materialises that as a separate `<table>_<col>_not_null` row in
+		// pg_constraint). pg_dump's getTableAttrs LEFT-JOINs pg_constraint on
+		// contype='n' to decide whether to print the inline NOT NULL clause, so
+		// PK columns must NOT be skipped here or their NOT NULL is lost from the
+		// dump (`id integer` instead of `id integer NOT NULL`). DU-002 slice 50.
 		for _, col := range tbl.Columns {
-			if !col.NotNull || pkColSet[strings.ToLower(col.Name)] {
+			if !col.NotNull {
 				continue
 			}
 			colKey := strings.ToLower(col.Name)
@@ -3939,10 +3935,33 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		idx.IsConstraint = true
 		idx.IncludeColumns = act.IncludeColumns
 	}
-	// PRIMARY KEY implies NOT NULL on all key columns (SQL standard).
+	// PRIMARY KEY implies NOT NULL on all key columns (SQL standard). PG18 also
+	// materialises that implication as a contype='n' `<table>_<col>_not_null`
+	// row in pg_constraint, which pg_dump LEFT-JOINs to decide whether to print
+	// the inline NOT NULL clause. Register one for any PK column that does not
+	// already carry a NOT NULL constraint, so an ALTER-added PK survives a dump
+	// round-trip identically to an inline CREATE TABLE PK. DU-002 slice 50.
+	im, _ := o.ctx.Catalog.(*catalog.InMemory)
 	for _, pkCol := range act.Columns {
-		if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
-			col.NotNull = true
+		col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol)
+		if !ok {
+			continue
+		}
+		alreadyHadNotNull := col.NotNull
+		col.NotNull = true
+		if im == nil || alreadyHadNotNull {
+			continue
+		}
+		hasConstraint := false
+		for _, nc := range tbl.NotNullConstraints {
+			if strings.EqualFold(nc.ColName, col.Name) {
+				hasConstraint = true
+				break
+			}
+		}
+		if !hasConstraint {
+			nnName := strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_not_null"
+			tbl.AddNotNull(nnName, col.Name, im.AllocOID(), false, true, 0)
 		}
 	}
 	return nil

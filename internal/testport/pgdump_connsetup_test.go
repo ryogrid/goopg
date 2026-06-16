@@ -273,9 +273,21 @@ package testport
 // (+ ` NO INHERIT` when set), mirroring PG's deparser. The fixture's column-level
 // `qty integer ... CHECK (qty >= 0)` now dumps as the auto-named
 // `CONSTRAINT foo_qty_check CHECK ((qty >= 0))`. (The PRIMARY KEY ALTER-TABLE
-// ADD CONSTRAINT path already worked; a known remaining divergence is the
-// implicit NOT NULL on a PRIMARY KEY column — goopg dumps `id integer`, PG
-// `id integer NOT NULL` — left for a follow-up slice.)
+// ADD CONSTRAINT path already worked.)
+// Slice 50 restored the implicit NOT NULL on a PRIMARY KEY column: goopg dumped
+// `id integer` where upstream PG dumps `id integer NOT NULL`. PG18's pg_dump no
+// longer reads attnotnull for the inline NOT NULL clause — getTableAttrs
+// LEFT-JOINs `pg_constraint co ON (a.attrelid=co.conrelid AND co.contype='n'
+// AND co.conkey=array[a.attnum])` and prints NOT NULL only when `co.conname` is
+// non-NULL. goopg set the PK column's attnotnull=true but DELIBERATELY skipped
+// PK columns when registering the named `<table>_<col>_not_null` contype='n'
+// rows (internal/executor/operators_ddl.go), so the join found nothing.
+// Verified against real PG18: `id integer PRIMARY KEY` produces a
+// `foo_id_not_null` (contype='n', conkey={1}) constraint alongside `foo_pkey`.
+// Fix: stop excluding PK columns from AddNotNull on CREATE TABLE, and register
+// the same NOT NULL constraint on the ALTER TABLE ADD PRIMARY KEY sibling path
+// (which also sets attnotnull). pg_dump now emits `id integer NOT NULL`; the
+// auto-default name is suppressed by pg_dump's ChooseConstraintName match.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
@@ -365,12 +377,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// real column list, so assert both user columns appear in the
 		// CREATE TABLE body — this is the regression guard for the
 		// SRF-join-projection fix end-to-end.
-		cols := []string{"id integer", "name text"}
+		cols := []string{"id integer NOT NULL", "name text"}
 		for _, sub := range cols {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump column list missing %q (SRF-join right-side projection regressed)\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
+		// **Slice 50 closed (asserted via the `id integer NOT NULL` entry above):**
+		// PG18's pg_dump prints the inline NOT NULL clause from a contype='n'
+		// pg_constraint LEFT JOIN, not from attnotnull. goopg set the PK column's
+		// attnotnull=true but skipped PK columns when registering named NOT NULL
+		// constraints, so the join found nothing and the column dumped as bare
+		// `id integer`. Registering the `foo_id_not_null` constraint (CREATE TABLE
+		// + ALTER ... ADD PRIMARY KEY paths) restores the inline NOT NULL — the
+		// regression guard is the `id integer NOT NULL` assertion in `cols`.
 		// **Slice 48 closed (asserted):** buildUserPGAttributeRow hardcoded
 		// atttypmod=-1, so every typmod-bearing column dumped as its bare base
 		// type (numeric(10,2) → numeric, character varying(8) → character
