@@ -1516,6 +1516,25 @@ fixed one logical group per loop:
     jsonb` + `jdocs jsonb[]` columns in `TestPort_PgDumpConnectionSetup` and the
     new `{"json",nil,199,"json[]"}`, `{"jsonb",nil,3807,"jsonb[]"}` rows in
     `executor.TestUserPGAttributeArrayColumn`.
+  - **Slice 70 — `interval`/`interval[]`
+    (`internal/catalog/codec.go`, `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** `interval` (OID 1186) was rendered by both
+    `formatTypeOID` and `oidToBuiltinTypeName` (the latter already mapped both
+    `1186`→`interval` and `1187`→`interval[]`) but had **never been wired into
+    `TypeNameToOID`/`OIDToTypeName`**, so an `interval` column fell back to `text`
+    (OID 25) and dumped as `text`; the array path had no `_interval` OID at all.
+    Same proven 3-site pattern: the scalar-OID const `OIDInterval` 1186 + its
+    `TypeNameToOID`/`OIDToTypeName` cases, the array-OID const `OIDArrayInterval`
+    1187 + cases in `ArrayOIDForBase`/`BaseOIDForArray`, two rows in
+    `userTypeAttrsForOID` (scalar `typlen=16`, `typbyval=f`, `typalign='d'`,
+    `typstorage='p'`; array `typlen=-1`, `typalign='d'`, `typstorage='x'` — matching
+    `pg_type.dat` OIDs 1186/1187 and the `pg_type_seed_data.go` rows), and the
+    array case in the canonical `formatTypeOID` (`1187`→`interval[]`; the scalar
+    `1186`→`interval` case already existed). A bare interval column has typmod
+    `-1`, so both render as the plain `interval` / `interval[]`. Guarded by the
+    `arr` fixture's `span interval` + `spans interval[]` columns in
+    `TestPort_PgDumpConnectionSetup` and the new `{"interval",nil,1187,
+    "interval[]"}` row in `executor.TestUserPGAttributeArrayColumn`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1566,7 +1585,8 @@ uuid` and a `ids uuid[]` column; slice 67 adds a scalar `blob bytea` and a
 `blobs bytea[]` column; slice 68 adds `label varchar(20)`, `labels
 varchar(20)[]`, `code char(4)`, `codes char(4)[]`, and `oids oid[]` — completing
 every simple scalar-OID-backed array type; slice 69 adds the JSON family `doc
-json`, `docs json[]`, `jdoc jsonb`, and `jdocs jsonb[]`.
+json`, `docs json[]`, `jdoc jsonb`, and `jdocs jsonb[]`; slice 70 adds a scalar
+`span interval` and a `spans interval[]` column.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

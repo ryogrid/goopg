@@ -73,6 +73,7 @@ const (
 	OIDUUID        uint32 = 2950
 	OIDJSON        uint32 = 114
 	OIDJsonb       uint32 = 3802
+	OIDInterval    uint32 = 1186
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -106,6 +107,10 @@ const (
 	// so format_type renders these arrays as the bare `json[]` / `jsonb[]`.
 	OIDArrayJSON  uint32 = 199
 	OIDArrayJsonb uint32 = 3807
+	// DU-002 slice 70: interval. _interval carries the element typmod onto the
+	// array (interval fields/precision), but a bare `interval[]` column has
+	// typmod -1, so format_type renders it as the bare `interval[]`.
+	OIDArrayInterval uint32 = 1187
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -152,6 +157,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayJSON
 	case OIDJsonb:
 		return OIDArrayJsonb
+	case OIDInterval:
+		return OIDArrayInterval
 	}
 	return 0
 }
@@ -200,6 +207,8 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDJSON, true
 	case OIDArrayJsonb:
 		return OIDJsonb, true
+	case OIDArrayInterval:
+		return OIDInterval, true
 	}
 	return 0, false
 }
@@ -1014,6 +1023,8 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDJSON
 	case "jsonb":
 		return OIDJsonb
+	case "interval":
+		return OIDInterval
 	default:
 		return OIDText // safe fallback
 	}
@@ -1064,6 +1075,8 @@ func OIDToTypeName(oid uint32) string {
 		return "json"
 	case OIDJsonb:
 		return "jsonb"
+	case OIDInterval:
+		return "interval"
 	default:
 		return "text"
 	}

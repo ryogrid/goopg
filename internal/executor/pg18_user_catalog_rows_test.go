@@ -421,6 +421,9 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// the arrays render as the bare element name with the [] suffix.
 		{"json", nil, 199, "json[]"},
 		{"jsonb", nil, 3807, "jsonb[]"},
+		// Slice 70: interval (_interval 1187). A bare interval[] column has
+		// typmod -1, so the array renders as the bare element name + [].
+		{"interval", nil, 1187, "interval[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

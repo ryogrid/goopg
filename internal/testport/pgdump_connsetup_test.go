@@ -597,7 +597,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"blob bytea, blobs bytea[], "+
 		"label varchar(20), labels varchar(20)[], "+
 		"code char(4), codes char(4)[], oids oid[], "+
-		"doc json, docs json[], jdoc jsonb, jdocs jsonb[])"); err != nil {
+		"doc json, docs json[], jdoc jsonb, jdocs jsonb[], "+
+		"span interval, spans interval[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -926,6 +927,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// at all. json/jsonb are varlena with no typmod, so the arrays render as
 		// the bare `json[]` / `jsonb[]` (formatTypeOID already had the scalar
 		// cases 114/3802).
+		// Slice 70 adds a scalar interval (`span`, OID 1186) and interval[]
+		// (`spans`, _interval 1187). interval was rendered in formatTypeOID/
+		// oidToBuiltinTypeName but had NOT been wired into catalog.TypeNameToOID/
+		// OIDToTypeName, so an `interval` column fell back to text (OID 25) and
+		// dumped as `text`; the array path had no _interval OID at all. A bare
+		// interval column carries typmod -1, so both render as the plain
+		// `interval` / `interval[]`.
 		arrCols := []string{
 			"CREATE TABLE public.arr (",
 			"tags text[]",
@@ -952,6 +960,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"docs json[]",
 			"jdoc jsonb",
 			"jdocs jsonb[]",
+			"span interval",
+			"spans interval[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

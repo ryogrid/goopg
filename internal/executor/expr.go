@@ -10450,6 +10450,10 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "timestamp with time zone"
 	case 1186:
 		return "interval"
+	case 1187:
+		// _interval: a bare interval[] column has typmod -1, so this is the
+		// bare element name with the [] suffix. DU-002 slice 70.
+		return "interval[]"
 	case 1700:
 		// numeric(precision,scale): atttypmod = ((p<<16)|s)+VARHDRSZ.
 		// Mirrors numerictypmodout. typmod<VARHDRSZ means no modifier.
