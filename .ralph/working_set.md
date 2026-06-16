@@ -1,51 +1,54 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 56 COMPLETE
-(committing this loop). NEXT loop starts on slice 57.
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 57 COMPLETE
+(committing this loop). NEXT loop starts on slice 58.
 NOTHING in flight after commit.
 
-=== DONE (loop #11) — DU-002 slice 56 (secondary-index ASC/DESC + NULLS ordering) ===
-Real gap: a plain `CREATE INDEX … (col DESC)` round-tripped through pg_dump as
-ASCENDING — goopg's parseIndexColumnList parsed ASC/DESC + NULLS FIRST/LAST but
-SILENTLY DISCARDED them (a descending index reads back ascending). Also fixed a
-latent parser bug: `NULLS` (a bare TokenIdent) was mis-read as an opclass name in
-`(col NULLS FIRST)`, so that form errored "expected ')'".
-FIX (threaded end-to-end, mirrors PG pg_index.indoption):
- - parser: parseIndexColumnList captures per-col IndexColOrder{Descending,
-   NullsFirst} → CreateIndexStmt.ColOrders; NullsFirst pre-resolved to Descending
-   (NULLS FIRST default for DESC, LAST for ASC) unless explicit NULLS overrides.
-   Opclass branch now skips a case-insensitive `nulls`.
- - catalog.Index: new parallel ColDescending/ColNullsFirst slices.
- - executor execCreateIndex (btree path): populates them ONLY when non-default
-   (plain index keeps empty slices → dumps byte-identically). indexHasNonDefaultOrder helper.
- - catalog.BuildIndexDef: renders ` DESC`/` NULLS LAST`/` NULLS FIRST` with PG's
-   default-suppression (ruleutils.c pg_get_indexdef_worker).
-Files: internal/parser/ddl.go (parseIndexColumnList + caller + nulls-opclass guard),
-internal/parser/ast.go (IndexColOrder type + ColOrders field),
-internal/catalog/catalog.go (Index fields + BuildIndexDef render),
-internal/executor/operators_ddl.go (execCreateIndex populate + helper),
-internal/parser/ddl_test.go (NEW TestParseCreateIndexColOrders),
-internal/catalog/index_def_order_test.go (NEW TestBuildIndexDefColOrder),
-internal/testport/pgdump_connsetup_test.go (fixture: 4 indexes + slice-56 asserts + header),
-docs/design/0110-0001-pg-dump-tap-port.md (slice 56 entry + guard list).
-DURABILITY NOTE (deferred): indoption bits NOT persisted to on-disk pg_index, so
-ordering is lost across restart; pg_get_indexdef reads in-memory AllIndexes so the
-dump is faithful within a session (the test path). On-disk indoption = follow-up.
-Gates: gofmt clean (touched files); vet clean; parser+catalog+executor+initdb
-suites PASS; new unit tests PASS; TestPort_PgDumpConnectionSetup PASS (exit-0, all
-4 index forms round-trip); pgbench CI-parity smoke via pre-commit hook.
+=== DONE (loop #12) — DU-002 slice 57 (VIEW round-trip via pg_get_viewdef) ===
+Real gap: a single user VIEW made pg_dump ABORT THE WHOLE DUMP —
+`definition of view "v" appears to be empty (length zero)`. pg_dump's
+createViewAsClause calls pg_get_viewdef(oid), which goopg stubbed to NULL.
+Side effect: table DATA emitted after the view never appeared either.
+FIX (raw-text capture, NOT a full deparser):
+ - parser: parser struct keeps the original source string (p.src, set in
+   Parse). New captureSrcSpan(startPos, endTok) slices src text, trims
+   whitespace + trailing ';'. parseCreateViewTail stores the view body span on
+   CreateViewStmt.RawDef (excludes the trailing WITH CHECK OPTION clause).
+ - catalog.Table: new ViewDef string field.
+ - executor execCreateView: copies s.RawDef → vt.ViewDef (CreateView returns the
+   fresh table for both CREATE and CREATE OR REPLACE).
+ - executor pg_get_viewdef (expr.go): resolves arg as OID (pg_dump) or name
+   (psql) → view → returns ViewDef + ";". pg_dump Asserts last char is ';',
+   strips it, wraps body in `CREATE VIEW … AS <body>`.
+Files: internal/parser/parser.go (src field + captureSrcSpan + p.src=input),
+internal/parser/ddl.go (parseCreateViewTail capture),
+internal/parser/ast.go (CreateViewStmt.RawDef),
+internal/catalog/catalog.go (Table.ViewDef field),
+internal/executor/operators_ddl.go (execCreateView stores ViewDef),
+internal/executor/expr.go (pg_get_viewdef impl),
+internal/parser/view_test.go (NEW TestParseCreateViewRawDef),
+internal/testport/pgdump_connsetup_test.go (CREATE VIEW fixture + slice-57 asserts + header),
+docs/design/0110-0001-pg-dump-tap-port.md (slice 57 entry + guard paragraph).
+FIDELITY GAP (documented/deferred): raw text is NOT schema-qualified — PG's
+deparser qualifies unqualified relation refs. Qualified views (fixture uses
+public.foo) restore cleanly under pg_dump's search_path=''; an unqualified view
+would fail to restore. RECURSIVE views + materialized views capture no RawDef
+yet (different parser paths) — follow-up.
+Gates: gofmt clean (touched files); vet clean (parser+executor); parser +
+catalog + executor + initdb suites PASS; new TestParseCreateViewRawDef PASS;
+TestPort_PgDumpConnectionSetup PASS (exit-0, view round-trips, DATA emits);
+pgbench CI-parity smoke via pre-commit hook.
 
-=== NEXT STEP — DU-002 slice 57 ===
-Enrich the fixture further to find the next REAL pg_dump gap. Candidates:
-  - VIEW round-trip: CREATE VIEW v AS SELECT … — does pg_dump emit CREATE VIEW
-    via pg_get_viewdef? Likely a real path to probe.
-  - column DEFAULT expression (e.g. DEFAULT now()) — does the DEFAULT survive in
-    the dumped CREATE TABLE / ALTER TABLE … SET DEFAULT?
-  - COMMENT ON INDEX / CONSTRAINT (3-part / `ON table`).
+=== NEXT STEP — DU-002 slice 58 ===
+Enrich the fixture to find the next REAL pg_dump gap. Candidates probed/known:
+  - VIEW with renamed columns: CREATE VIEW v(a,b) AS … — RawDef body lacks the
+    aliases, so pg_dump would emit wrong column names. Likely a real gap.
+  - MATERIALIZED VIEW round-trip (no RawDef captured yet; needs its own path).
   - SEQUENCE / serial column — sequences skipped from pg_class virtual view
     (Virtual && no View), so getTables never sees relkind='S'; larger slice.
+  - Column DEFAULT expression (DEFAULT now()) — VERIFIED WORKS (slice-57 probe).
 ALWAYS: add ONE fixture element, run TestPort_PgDumpConnectionSetup, inspect the
 actual dumped output (temporary PROBE t.Logf), confirm whether goopg already
-handles it before assuming a gap (slices 56's plain+partial index already worked).
+handles it before assuming a gap.
 Known orthogonal: plpgsql user funcs can't be dumped (plpgsql absent from
-pg_language). Server SILENTLY SWALLOWS parse errors on COMMENT stmts.
+pg_language). Server SILENTLY SWALLOWS parse errors on COMMENT/DDL stmts.
 
 NOTE: do NOT Edit .ralph/fix_plan.md (driver churns it mid-loop; Edit goes stale).

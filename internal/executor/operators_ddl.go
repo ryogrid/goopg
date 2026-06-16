@@ -2320,8 +2320,13 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			}
 		}
 	}
-	if _, err := o.ctx.Catalog.CreateView(s.Name, cols, s.Columns, s.Query, s.OrReplace); err != nil {
+	vt, err := o.ctx.Catalog.CreateView(s.Name, cols, s.Columns, s.Query, s.OrReplace)
+	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// Preserve the raw view body so pg_get_viewdef can echo it for pg_dump.
+	if vt != nil {
+		vt.ViewDef = s.RawDef
 	}
 	// Register view→PK-constraint dependencies so DROP CONSTRAINT RESTRICT
 	// can detect that this view relies on the constraint. M0097-0036.

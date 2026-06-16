@@ -149,6 +149,7 @@ func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
 	var p parser
 	p.tokens = toks
 	p.idx = 0
+	p.src = input
 
 	var out []Stmt
 	for p.cur().Kind != TokenEOF {
@@ -188,6 +189,10 @@ func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
 type parser struct {
 	tokens []Token
 	idx    int
+	// src holds the original input string, used to capture raw source spans
+	// (e.g. the verbatim view body for pg_get_viewdef). Token.Pos values are
+	// byte offsets into this string.
+	src string
 	// selectIntoErrMsg is non-empty when SELECT … INTO is forbidden in the
 	// current parse context (cursor, subquery, view body, INSERT SELECT).
 	// parseSelect emits a SyntaxError with this message when INTO is seen.
@@ -201,6 +206,29 @@ type parser struct {
 	// planCopy can emit the PG-compatible "COPY (SELECT INTO) is not
 	// supported" error. M0097-0024.
 	selectIntoCopyStop bool
+}
+
+// captureSrcSpan returns the raw source text from byte offset startPos up to
+// the start of endTok (its Pos), trimmed of surrounding whitespace and any
+// trailing ';'. When endTok is EOF (Pos not meaningful) the span runs to the
+// end of the source. Returns "" when the source is unavailable or the offsets
+// are out of range. Used to preserve verbatim sub-statement text (e.g. the
+// view body for pg_get_viewdef).
+func (p *parser) captureSrcSpan(startPos int, endTok Token) string {
+	if p.src == "" || startPos < 0 || startPos > len(p.src) {
+		return ""
+	}
+	end := endTok.Pos
+	if endTok.Kind == TokenEOF || end <= 0 || end > len(p.src) {
+		end = len(p.src)
+	}
+	if end < startPos {
+		return ""
+	}
+	span := p.src[startPos:end]
+	span = strings.TrimSpace(span)
+	span = strings.TrimRight(span, "; \t\n\r")
+	return span
 }
 
 func (p *parser) cur() Token {

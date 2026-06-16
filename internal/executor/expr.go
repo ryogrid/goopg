@@ -5498,9 +5498,47 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		result.Scale = int16(newOffsetSecs / 60)
 		return result, nil
 	case "pg_get_viewdef":
-		// Stub: return NULL so the normalizer can strip the result block.
-		// Full SQL deparsing would require a complete SQL pretty-printer. M0097-0004.
-		return NullDatum, nil
+		// pg_get_viewdef(view [, …]) → text: the view's defining SELECT.
+		// goopg stores the raw view body (catalog.Table.ViewDef) captured at
+		// parse time and echoes it here, terminated with ';' — pg_dump's
+		// createViewAsClause strips the trailing ';' and wraps it in
+		// `CREATE VIEW … AS <body>`. The first argument is an OID (pg_dump) or a
+		// view name (psql). NULL for an unknown/non-view object, so callers that
+		// pretty-print over an empty set are unaffected. M0110-0001 (DU-002).
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		var view *catalog.Table
+		if arg.Kind == KindInt {
+			if t, found := im.LookupTableByOID(uint32(arg.Int)); found {
+				view = t
+			}
+		} else if v, perr := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32); perr == nil {
+			if t, found := im.LookupTableByOID(uint32(v)); found {
+				view = t
+			}
+		} else if name := strings.TrimSpace(arg.StringValue()); name != "" {
+			if parsed, perr := parser.Parse("SELECT 1 FROM " + name); perr == nil && len(parsed) == 1 {
+				if sel, ok := parsed[0].(*parser.SelectStmt); ok && len(sel.From) == 1 {
+					rv := sel.From[0]
+					if t, found := im.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name}); found {
+						view = t
+					}
+				}
+			}
+		}
+		if view == nil || view.View == nil || view.ViewDef == "" {
+			return NullDatum, nil
+		}
+		return NewStringDatum(view.ViewDef + ";"), nil
 	case "pg_collation_for":
 		// Return "POSIX" to match the C/POSIX locale used in regression tests.
 		// PG regression databases are created with --locale=C, so text values

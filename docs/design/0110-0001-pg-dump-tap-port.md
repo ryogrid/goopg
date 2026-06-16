@@ -1243,6 +1243,35 @@ fixed one logical group per loop:
     the NULLS-as-opclass guard), `catalog.TestBuildIndexDefColOrder` (all four
     render branches).
 
+  - **Slice 57 — VIEW round-trip via `pg_get_viewdef` (`internal/parser/parser.go`,
+    `internal/parser/ddl.go`, `internal/parser/ast.go`,
+    `internal/catalog/catalog.go`, `internal/executor/operators_ddl.go`,
+    `internal/executor/expr.go`).** pg_dump fetches every view's defining query
+    via `pg_get_viewdef(oid)` in `createViewAsClause` and **aborts the entire
+    dump** with `definition of view "v" appears to be empty (length zero)` when
+    that returns NULL or "" — so a single user view made the whole dump fail (and
+    the table DATA emitted after it never appeared). goopg stubbed
+    `pg_get_viewdef` to NULL (it predated any deparser). Fix captures the raw view
+    body verbatim rather than building a full SQL deparser: (1) the parser now
+    keeps the original source string (`parser.src`) and a `captureSrcSpan` helper
+    slices the text between the `AS` body's first token and the next unconsumed
+    token, trimmed of whitespace and any trailing `;`; (2) `parseCreateViewTail`
+    stores it on `CreateViewStmt.RawDef` (the trailing `WITH CHECK OPTION` clause
+    is excluded — it is consumed after the span ends); (3) `execCreateView` copies
+    `RawDef` onto `catalog.Table.ViewDef` (works for `CREATE OR REPLACE` too —
+    `CreateView` returns the fresh table either way); (4) `pg_get_viewdef` looks
+    the view up by OID (pg_dump) or name (psql) and returns `ViewDef + ";"`.
+    pg_dump's `createViewAsClause` Asserts the last char is `;`, strips it, and
+    wraps the rest in `CREATE VIEW … AS <body>`, so the terminating `;` is
+    required. **Fidelity gap (documented):** PG's deparser fully schema-qualifies
+    unqualified relation references; goopg echoes the literal text, so a view that
+    referenced an unqualified table would fail to restore under pg_dump's
+    `search_path=''`. Qualified views (like the fixture's `public.foo`) round-trip
+    cleanly. RECURSIVE views and materialized views do not capture `RawDef` yet
+    (their bodies take different parser paths) — a follow-up. Unit guard:
+    `parser.TestParseCreateViewRawDef` (body capture incl. trailing-`;` trim and
+    `WITH CHECK OPTION` exclusion).
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
@@ -1267,7 +1296,9 @@ comment both round-trip — `COMMENT ON TABLE public.foo IS 'a foo table'` and
 plain secondary index, a partial index, and two ordered indexes all round-trip —
 `CREATE INDEX foo_name_idx … (name)`, `… foo_qty_partial_idx … (qty) WHERE qty >
 0`, `… foo_name_desc_idx … (name DESC NULLS LAST)`, and `… foo_ord_idx … (name
-DESC, qty NULLS FIRST)`. Unit guards:
+DESC, qty NULLS FIRST)`; slice 57 asserts a VIEW round-trips — `CREATE VIEW
+public.foo_view AS` followed by the verbatim body `SELECT id, name FROM
+public.foo WHERE qty > 0;`. Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
 `executor.TestAlterTableAddForeignKeyCapturesActions`,

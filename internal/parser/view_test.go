@@ -26,6 +26,45 @@ func TestParseCreateViewWithExplicitColumns(t *testing.T) {
 	}
 }
 
+// TestParseCreateViewRawDef pins that the raw view body text is captured
+// verbatim into CreateViewStmt.RawDef (trimmed of surrounding whitespace and
+// any trailing semicolon). pg_get_viewdef echoes RawDef so pg_dump can
+// reconstruct `CREATE VIEW … AS <body>` (DU-002 slice 57).
+func TestParseCreateViewRawDef(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{
+			"CREATE VIEW v AS SELECT id, name FROM public.d WHERE id > 0",
+			"SELECT id, name FROM public.d WHERE id > 0",
+		},
+		{
+			// trailing semicolon and whitespace are trimmed
+			"CREATE VIEW v AS   SELECT 1 ;",
+			"SELECT 1",
+		},
+		{
+			// the trailing WITH CHECK OPTION clause is NOT part of the body
+			"CREATE VIEW v AS SELECT id FROM d WHERE id > 0 WITH CHECK OPTION",
+			"SELECT id FROM d WHERE id > 0",
+		},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.src, err)
+		}
+		cv, ok := stmts[0].(*CreateViewStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T, want *CreateViewStmt", tc.src, stmts[0])
+		}
+		if cv.RawDef != tc.want {
+			t.Errorf("Parse(%q): RawDef=%q want %q", tc.src, cv.RawDef, tc.want)
+		}
+	}
+}
+
 // TestParseDropViewIfExists pins the DROP VIEW IF EXISTS shape
 // HammerDB uses for cleanup.
 func TestParseDropViewIfExists(t *testing.T) {

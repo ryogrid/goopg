@@ -1304,6 +1304,11 @@ type CreateViewStmt struct {
 	Name      ObjectName
 	Columns   []string // optional explicit column-name list
 	Query     *SelectStmt
+	// RawDef is the raw SQL text of the view body (everything after `AS`,
+	// trimmed of trailing whitespace/semicolons). Captured verbatim so
+	// pg_get_viewdef can echo it for pg_dump. Empty if the source text was
+	// unavailable to the parser.
+	RawDef string
 }
 
 func (s *CreateViewStmt) Pos() int  { return s.pos }

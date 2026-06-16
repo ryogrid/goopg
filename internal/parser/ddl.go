@@ -1123,6 +1123,10 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 		return nil, &SyntaxError{Pos: pos, Message: "view body did not produce SELECT"}
 	}
 	stmt.Query = sel
+	// Capture the raw source span of the view body (from the SELECT/VALUES/WITH
+	// keyword up to the next unconsumed token) so pg_get_viewdef can echo it
+	// verbatim for pg_dump. p.cur() now points just past the body.
+	stmt.RawDef = p.captureSrcSpan(cur.Pos, p.cur())
 	// Optional trailing WITH [CASCADED|LOCAL] CHECK OPTION clause.
 	// goopg accepts and ignores the clause (check enforcement not yet implemented).
 	if p.acceptKeyword(KwWith) {

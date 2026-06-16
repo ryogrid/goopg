@@ -188,6 +188,13 @@ type Table struct {
 	// scan.
 	View              *parser.SelectStmt
 	ViewColumnAliases []string
+	// ViewDef holds the raw SQL text of the view body (the SELECT after
+	// `AS`), captured verbatim at parse time. pg_get_viewdef returns it so
+	// pg_dump can reconstruct `CREATE VIEW … AS <body>`. Empty for non-views.
+	// Faithful to the literal text the user wrote; schema-qualification of
+	// unqualified relation references (which PG's deparser adds) is NOT
+	// performed — a known fidelity gap tracked in the pg_dump TAP port.
+	ViewDef string
 
 	// Stats holds the most recent ANALYZE output for this
 	// table. nil before ANALYZE has run; the planner treats nil

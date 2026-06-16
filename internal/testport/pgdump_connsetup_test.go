@@ -342,6 +342,22 @@ package testport
 // BuildIndexDef renders it with PG's default-suppression (DESC defaults NULLS
 // FIRST; ASC defaults NULLS LAST). A latent parser bug — `NULLS` (a bare ident)
 // being mis-read as an opclass name in `(col NULLS FIRST)` — was fixed alongside.
+// Slice 57 restored VIEW round-trip. pg_dump fetches every view's defining
+// query via `pg_get_viewdef(oid)` (createViewAsClause) and ABORTS THE WHOLE
+// DUMP with `definition of view "v" appears to be empty (length zero)` when it
+// returns NULL/"" — so a single view made the entire dump fail and the table
+// DATA after it never emitted. goopg stubbed pg_get_viewdef to NULL. Fix: the
+// parser now captures the raw view body (the SQL after `AS`) verbatim into
+// CreateViewStmt.RawDef via a new parser.captureSrcSpan (the parser keeps the
+// original source string), execCreateView stores it on catalog.Table.ViewDef,
+// and pg_get_viewdef echoes it terminated with ';' (pg_dump's
+// createViewAsClause strips the trailing ';' — it Asserts the last char is ';'
+// — and wraps the rest in `CREATE VIEW … AS <body>`). The body is faithful to
+// the literal text the user wrote; PG's deparser additionally schema-qualifies
+// unqualified relation references, which goopg does NOT do (a documented
+// fidelity gap — qualified views like the fixture's round-trip cleanly under
+// pg_dump's search_path=''). RECURSIVE views and materialized views capture no
+// RawDef yet (follow-up).
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
@@ -460,6 +476,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// ASC NULLS FIRST override exercises the remaining two render branches.
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_ord_idx ON public.foo (name DESC, qty NULLS FIRST)"); err != nil {
 		t.Fatalf("create ordered composite index: %v", err)
+	}
+
+	// Slice 57: a VIEW must survive the dump. pg_dump fetches the defining
+	// query via `pg_get_viewdef(oid)` (createViewAsClause), and aborts the
+	// ENTIRE dump with `definition of view "v" appears to be empty (length
+	// zero)` when it returns NULL/"". goopg stubbed pg_get_viewdef to NULL, so
+	// any view made pg_dump fail outright (and the table DATA after it never
+	// emitted). goopg now captures the raw view body at parse time
+	// (catalog.Table.ViewDef) and pg_get_viewdef echoes it terminated with ';'
+	// (pg_dump strips the trailing ';' and wraps it in `CREATE VIEW … AS`).
+	// The body references public.foo with a schema qualification, so the dumped
+	// view restores under pg_dump's search_path='' setting.
+	if err := runSQLSimple(t, c, "CREATE VIEW public.foo_view AS SELECT id, name FROM public.foo WHERE qty > 0"); err != nil {
+		t.Fatalf("create view foo_view: %v", err)
 	}
 
 	res, err := util.RunCommand(util.CommandSpec{
@@ -676,6 +706,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		for _, sub := range indexDefs {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped/mangled a secondary index; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// **Slice 57 (asserted):** a VIEW must round-trip. pg_dump aborts the
+		// whole dump when pg_get_viewdef returns empty; goopg now returns the
+		// captured raw view body, so the `CREATE VIEW … AS <body>` statement is
+		// emitted. Assert both the header and the verbatim body — the regression
+		// guard for the pg_get_viewdef fix.
+		viewDefs := []string{
+			"CREATE VIEW public.foo_view AS",
+			"SELECT id, name FROM public.foo WHERE qty > 0;",
+		}
+		for _, sub := range viewDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a VIEW; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
 		return
