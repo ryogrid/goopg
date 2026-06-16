@@ -2062,6 +2062,28 @@ object support.
         executor domain unit PASS; `TestPort_PgDumpConnectionSetup` PASS (2.24s);
         pgbench pre-commit smoke on commit. **Excluded base types remaining
         (unchanged):** `tsvector`/`tsquery`, internal `"char"`.
+      - **PROGRESS 2026-06-17 (loop #75):** **DU-002 slice 112 LANDED** — the
+        IN-values deparse now covers a domain over **`xid8`** (the full 64-bit
+        transaction id): `CREATE DOMAIN public.x8_in AS xid8 CHECK (VALUE IN
+        ('100', '200'))`. xid8 has a native equality operator, so PG emits the
+        **simplest render mode** — bare string-with-cast, no coercion envelope,
+        no quoted cast — identical to xid/cid (slice 107): `VALUE = ANY
+        (ARRAY['100'::xid8, '200'::xid8])`. The decimal input form round-trips
+        verbatim through `::xid8` (output prints the stored 64-bit value as
+        decimal, no normalization), so byte-identity is unconditional. Verified
+        byte-identical to real pg_dump 18.3 (`/tmp/pgcheck_du112`). One-arm
+        engine change in `domainInValuesCheckExpr` (`case catalog.OIDXid8:
+        castType = "xid8"`); all other plumbing was already present from the
+        xid8-column work (M0097-0018): `TypeNameToOID("xid8")`→5069,
+        `userTypeAttrsForOID(5069)` (typlen 8/'d' align/'p' storage),
+        `format_type(5069)`→`"xid8"`. Fixture: new domain `x8_in` + column `x8i`.
+        Gates: build OK; catalog/parser unit PASS; executor domain unit PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.27s); pgbench pre-commit smoke
+        on commit. **Excluded base types remaining (unchanged):**
+        `tsvector`/`tsquery` (output requotes lexemes), internal `"char"`
+        (parser quote-state). NOTE: range/composite base-type domains need full
+        catalog support for those type families (no `OIDInt4Range`, no
+        `int4range` in `TypeNameToOID`) — a larger task than a single switch arm.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

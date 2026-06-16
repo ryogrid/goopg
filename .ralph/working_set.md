@@ -1,31 +1,31 @@
-Task: DU-002 slice 111 — domain over `time with time zone` (timetz) round-trips
-through pg_dump (COMPLETE, committing).
+Task: DU-002 slice 112 — domain over `xid8` round-trips through pg_dump
+(COMPLETE, committing).
 
 Files:
 - internal/executor/operators_ddl.go — domainInValuesCheckExpr: new
-  `case catalog.OIDTimeTZ: castType = "time with time zone"` arm.
-- internal/testport/pgdump_connsetup_test.go — fixture domain ttz_in; column
-  ttzi; domainDefs assertions (canonical '12:30:00+09'/'23:59:59-05' literals).
-- docs/design/0110-0001-pg-dump-tap-port.md — slice 111 section.
-- .ralph/fix_plan.md — loop #74 progress note.
+  `case catalog.OIDXid8: castType = "xid8"` arm.
+- internal/testport/pgdump_connsetup_test.go — fixture domain x8_in; column
+  x8i; domainDefs assertions ('100'/'200'::xid8 literals).
+- docs/design/0110-0001-pg-dump-tap-port.md — slice 112 section.
+- .ralph/fix_plan.md — loop #75 progress note.
 
-Key symbols: domainInValuesCheckExpr, catalog.OIDTimeTZ (1266),
-userTypeAttrsForOID, format_type.
+Key symbols: domainInValuesCheckExpr, catalog.OIDXid8 (5069),
+userTypeAttrsForOID, format_type/formatTypeOID (5069→"xid8").
 
-Findings: timetz is lower-risk than timestamptz (slice 110) because timetz_out
-preserves the stored zone offset verbatim — it does NOT rotate into the session
-TimeZone GUC (unlike timestamptztypoutput). So byte-identity is unconditional
-for already-canonical literals; no UTC-session requirement. Verified against
-real pg_dump 18.3 (pg_get_constraintdef + '…'::timetz round-trip). All plumbing
-besides the one switch arm was already present from timetz-column slice 83.
+Findings: xid8 is the simplest render mode (bare string-with-cast, native eq,
+decimal form round-trips verbatim, no normalization) — same as xid/cid (slice
+107). All plumbing already present from xid8-column work (M0097-0018). Verified
+byte-identical to real pg_dump 18.3 (/tmp/pgcheck_du112).
 
 Gates run: go build ./... OK; catalog/parser unit PASS; executor domain unit
-PASS; TestPort_PgDumpConnectionSetup PASS (2.24s); pgbench pre-commit smoke on
+PASS; TestPort_PgDumpConnectionSetup PASS (2.27s); pgbench pre-commit smoke on
 commit (githook).
 
-Next step: slice 112 candidates — the two remaining slice-108 excluded base
-types: `tsvector`/`tsquery` (need output-fn lexeme normalize+quote so stored
-literals match dumped form) and internal `"char"` (parser quote-state
-preservation to disambiguate from bpchar in base-OID resolution). OR move to a
-composite (`CREATE TYPE AS (...)`) or range domain base type. ADD fixture, RUN
-real pg_dump under a fixed TZ, let it report the real blocker.
+Next step: slice 113 candidates. EASY single-arm types are nearly exhausted.
+Remaining excluded base types (tsvector/tsquery output requote, internal
+"char" parser quote-state) each need real engine work. Range/composite-type
+domains (int4range, CREATE TYPE AS) need FULL catalog support for those type
+families — NO OIDInt4Range, no int4range in TypeNameToOID — a much larger task.
+Probe int2vector/oidvector (both produce bare string-with-cast; need to verify
+TypeNameToOID→OID + userTypeAttrsForOID + format_type all handle them) as the
+last cheap single-arm candidates before moving to a structural type family.

@@ -8894,6 +8894,11 @@ func domainInValuesCheckExpr(baseType string, vals []string, cat *catalog.InMemo
 		// cid has a native equality operator; the decimal command-id form
 		// round-trips verbatim through `::cid`.
 		castType = "cid"
+	case catalog.OIDXid8:
+		// xid8 (full 64-bit transaction id) has a native equality operator; the
+		// decimal form round-trips verbatim through `::xid8`. Same simplest render
+		// mode as xid/cid (slice 107). DU-002 slice 112.
+		castType = "xid8"
 	case catalog.OIDInterval:
 		// interval has a native equality operator. Its output function
 		// normalizes the stored value (e.g. '2 hours'→'02:00:00'), so byte

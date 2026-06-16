@@ -2579,6 +2579,30 @@ it does for 1184; pg_dump does not emit typcategory into `CREATE DOMAIN`, so thi
 does not affect byte-identity.) Excluded base types remaining after slice 111 are
 unchanged: `tsvector`/`tsquery` and internal `"char"`.
 
+### Slice 112 — `xid8`
+
+Slice 112 adds a domain over `xid8` (the full 64-bit transaction id):
+
+```
+CREATE DOMAIN public.x8_in AS xid8
+	CONSTRAINT x8_in_check CHECK ((VALUE = ANY (ARRAY['100'::xid8, '200'::xid8])));
+```
+
+`xid8` has a native equality operator, so PG emits the **simplest render mode** —
+the bare string-with-cast shape, no coercion envelope, no quoted cast — exactly
+like `xid`/`cid` (slice 107). Its decimal input form round-trips verbatim through
+`::xid8` (the output function prints the stored 64-bit value as decimal with no
+normalization), so byte-identity is unconditional. Verified against real pg_dump
+18.3 (`/tmp/pgcheck_du112`): `pg_get_constraintdef` emits the literals above.
+
+The single engine change is one switch arm — `case catalog.OIDXid8: castType =
+"xid8"`. All other plumbing was already present from the xid8-column work
+(M0097-0018): `TypeNameToOID("xid8")` → `OIDXid8` (5069),
+`userTypeAttrsForOID(5069)` (typlen 8 / typbyval / `'d'` align / `'p'` storage),
+`format_type(5069)` → `"xid8"`. Excluded base types remaining after slice 112 are
+unchanged: `tsvector`/`tsquery` (output functions normalize+requote lexemes) and
+internal `"char"` (quoted-ident disambiguation from `bpchar` lost in the parser).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
