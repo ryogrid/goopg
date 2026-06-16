@@ -284,24 +284,24 @@ func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 	typOID := catalog.TypeNameToOID(col.Type.Name)
 	attrs := userTypeAttrsForOID(typOID)
 	return Row{
-		NewIntDatum(int64(tbl.OID)),              // attrelid
-		NewStringDatum(col.Name),                 // attname (name)
-		NewIntDatum(int64(typOID)),               // atttypid
-		NewIntDatum(int64(attrs.TypLen)),         // attlen
-		NewIntDatum(int64(col.Ordinal + 1)),      // attnum (1-based)
-		NewIntDatum(-1),                          // atttypmod
-		NewIntDatum(0),                           // attndims
-		NewBoolDatum(attrs.TypByVal),             // attbyval
-		NewStringDatum(string(attrs.TypAlign)),   // attalign
-		NewStringDatum(string(attrs.TypStorage)), // attstorage
-		NewStringDatum(""),                       // attcompression (PG18 default: '\0' meaning "default")
-		NewBoolDatum(col.NotNull),                // attnotnull
-		NewBoolDatum(col.DefaultExpr != nil),     // atthasdef
-		NewBoolDatum(false),                      // atthasmissing
-		NewStringDatum(""),                       // attidentity
-		NewStringDatum(attGeneratedFor(col)),     // attgenerated
-		NewBoolDatum(false),                      // attisdropped
-		NewBoolDatum(!col.Inherited),             // attislocal
+		NewIntDatum(int64(tbl.OID)),                     // attrelid
+		NewStringDatum(col.Name),                        // attname (name)
+		NewIntDatum(int64(typOID)),                      // atttypid
+		NewIntDatum(int64(attrs.TypLen)),                // attlen
+		NewIntDatum(int64(col.Ordinal + 1)),             // attnum (1-based)
+		NewIntDatum(pgAttTypmod(typOID, col.Type.Args)), // atttypmod
+		NewIntDatum(0),                                  // attndims
+		NewBoolDatum(attrs.TypByVal),                    // attbyval
+		NewStringDatum(string(attrs.TypAlign)),          // attalign
+		NewStringDatum(string(attrs.TypStorage)),        // attstorage
+		NewStringDatum(""),                              // attcompression (PG18 default: '\0' meaning "default")
+		NewBoolDatum(col.NotNull),                       // attnotnull
+		NewBoolDatum(col.DefaultExpr != nil),            // atthasdef
+		NewBoolDatum(false),                             // atthasmissing
+		NewStringDatum(""),                              // attidentity
+		NewStringDatum(attGeneratedFor(col)),            // attgenerated
+		NewBoolDatum(false),                             // attisdropped
+		NewBoolDatum(!col.Inherited),                    // attislocal
 		func() Datum {
 			if col.Inherited {
 				return NewIntDatum(1)
@@ -319,6 +319,35 @@ func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 		NullDatum, // attmissingval
 		NullDatum, // attstattarget
 	}
+}
+
+// pgAttTypmod computes the PG-canonical pg_attribute.atttypmod from a column's
+// declared type arguments (e.g. the (10,2) in numeric(10,2)). It mirrors the
+// per-type typmodin functions in PostgreSQL so that catalog clients — notably
+// pg_dump's getTableAttrs, which renders the column type via
+// format_type(atttypid, atttypmod) — recover the exact declared type. Without
+// this, every typmod-bearing column dumped as its bare base type (numeric(10,2)
+// → numeric, varchar(64) → character varying), a schema-fidelity loss.
+//
+// VARHDRSZ (4) is added for the varlena length-prefixed types, matching
+// anychar_typmodin (varchar/bpchar) and numerictypmodin in the backend; the
+// no-argument / unrecognised case returns -1 ("no modifier"), as PG does.
+// formatTypeOID decodes the same encoding. (DU-002 slice 48.)
+func pgAttTypmod(typOID uint32, args []int64) int64 {
+	switch typOID {
+	case 1700: // numeric/decimal: ((precision<<16) | scale) + VARHDRSZ
+		switch len(args) {
+		case 1:
+			return ((args[0] << 16) & 0xffffffff) + 4
+		case 2:
+			return ((args[0]<<16 | args[1]&0xffff) & 0xffffffff) + 4
+		}
+	case 1042, 1043: // character(n) / character varying(n): n + VARHDRSZ
+		if len(args) >= 1 {
+			return args[0] + 4
+		}
+	}
+	return -1
 }
 
 // attGeneratedFor returns the attgenerated discriminator: 's' for GENERATED

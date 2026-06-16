@@ -1020,12 +1020,40 @@ fixed one logical group per loop:
     every other array-typed virtual-catalog column (`proconfig`, `proacl`,
     `nspacl`, `datacl`, …) that previously decoded an absent value as `{""}`.
 
+  - **Slice 48 — column type-modifier fidelity (`atttypmod`)
+    (`internal/executor/pg18_user_catalog_rows.go`, `internal/executor/expr.go`).**
+    With the plain-table dump byte-identical to upstream, enriching the fixture
+    with `amount numeric(10,2)` and `code character varying(8)` exposed the next
+    gap: both columns dumped as their **bare base type** (`numeric`, `character
+    varying`). Root cause: `buildUserPGAttributeRow` hardcoded `atttypmod = -1`,
+    discarding the declared type arguments that the parser already captures in
+    `catalog.Type.Args`. pg_dump's getTableAttrs renders each column via
+    `format_type(a.atttypid, a.atttypmod)`, so with `atttypmod = -1` it always
+    got the unmodified type. Fix: new `pgAttTypmod(typOID, args)` computes the
+    **PG-canonical** `atttypmod`, mirroring the backend typmodin functions —
+    numeric: `((precision<<16) | scale) + VARHDRSZ`; `character`/`character
+    varying`: `length + VARHDRSZ`; everything else `-1` (no modifier). It is
+    wired into the `atttypmod` cell of the user pg_attribute row. The matching
+    decode side: `formatTypeOID` (goopg's `format_type`) already decoded the
+    `character`/`character varying` length but returned a bare `numeric`, so it
+    gained the numeric branch (`typmod >= VARHDRSZ` → `numeric(p,s)` via
+    `((typmod-VARHDRSZ)>>16)&0xffff`, `(typmod-VARHDRSZ)&0xffff`), matching
+    `numerictypmodout`. The CREATE TABLE now reproduces the declared precision
+    and length faithfully. Guards: `executor.TestUserPGAttributeTypmod` (pins the
+    atttypmod encoding **and** the format_type round-trip for numeric(10,2),
+    numeric(8,0), varchar(64), char(10), and the no-modifier cases) and the
+    enriched `TestPort_PgDumpConnectionSetup` fixture asserting `amount
+    numeric(10,2)` + `code character varying(8)` survive the dump.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
 0, and as of slice 46 the test also asserts the table's archive entry **and the
-full column list** (`id integer`, `name text`) are emitted. Unit guards:
-`planner.TestSRFJoinRightProjectionOffset`, `config.TestPgDumpConnectionSetupGUCs`,
+full column list** (`id integer`, `name text`) are emitted; slice 48 enriched the
+fixture so it also asserts the type modifiers `amount numeric(10,2)` and `code
+character varying(8)` round-trip. Unit guards:
+`planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
+`config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`.
 
 ## Deferred (002–010) — catalog surface estimate

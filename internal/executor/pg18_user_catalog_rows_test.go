@@ -369,3 +369,41 @@ func TestBuildUserPGAttributeRowEncodesTypCollation(t *testing.T) {
 		t.Errorf("name (OID 19) TypCollation=%d want %d", got, cCollationOID)
 	}
 }
+
+// TestUserPGAttributeTypmod pins the atttypmod computation for typmod-bearing
+// columns and the matching format_type round-trip (DU-002 slice 48). Before
+// this, buildUserPGAttributeRow hardcoded atttypmod=-1, so pg_dump rendered
+// every numeric(p,s)/varchar(n)/char(n) column as its bare base type — a
+// schema-fidelity loss. The stored value is PG-canonical (VARHDRSZ added for
+// numeric/char/varchar), so formatTypeOID decodes it identically to the
+// upstream typmodout functions.
+func TestUserPGAttributeTypmod(t *testing.T) {
+	const atttypmodIdx = 5 // 0-indexed: attrelid,attname,atttypid,attlen,attnum,atttypmod
+	tbl := &catalog.Table{Schema: "public", Name: "t", OID: 16500}
+	cases := []struct {
+		typeName    string
+		args        []int64
+		wantTypmod  int64
+		wantDisplay string
+	}{
+		{"numeric", []int64{10, 2}, 655366, "numeric(10,2)"}, // ((10<<16)|2)+4
+		{"numeric", []int64{8}, 524292, "numeric(8,0)"},      // ((8<<16)|0)+4
+		{"numeric", nil, -1, "numeric"},                      // no modifier
+		{"varchar", []int64{64}, 68, "character varying(64)"},
+		{"varchar", nil, -1, "character varying"},
+		{"bpchar", []int64{10}, 14, "character(10)"},
+		{"int4", []int64{}, -1, "integer"}, // typmod ignored for plain types
+	}
+	for _, tc := range cases {
+		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, Args: tc.args}, Ordinal: 0}
+		row := buildUserPGAttributeRow(tbl, col)
+		gotTypmod := row[atttypmodIdx].Int
+		if gotTypmod != tc.wantTypmod {
+			t.Errorf("%s%v: atttypmod=%d want %d", tc.typeName, tc.args, gotTypmod, tc.wantTypmod)
+		}
+		typOID := int64(catalog.TypeNameToOID(tc.typeName))
+		if got := formatTypeOID(typOID, gotTypmod); got != tc.wantDisplay {
+			t.Errorf("%s%v: format_type(%d,%d)=%q want %q", tc.typeName, tc.args, typOID, gotTypmod, got, tc.wantDisplay)
+		}
+	}
+}

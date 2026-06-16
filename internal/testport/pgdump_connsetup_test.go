@@ -250,6 +250,17 @@ package testport
 // reloptions/relacl read as NULL (PG's convention for no options / default
 // ACL) and the dumped CREATE TABLE has no WITH clause — byte-identical to
 // upstream pg_dump for a plain table.
+// Slice 48 restored column type modifiers in the dump: buildUserPGAttributeRow
+// (internal/executor/pg18_user_catalog_rows.go) hardcoded atttypmod=-1, so
+// pg_dump's getTableAttrs — which renders each column via
+// format_type(atttypid, atttypmod) — printed every typmod-bearing column as its
+// bare base type (numeric(10,2)→numeric, character varying(8)→character
+// varying). New pgAttTypmod computes the PG-canonical atttypmod from the
+// declared type args (numeric: ((p<<16)|s)+VARHDRSZ; varchar/char: n+VARHDRSZ),
+// and formatTypeOID gained the numeric-typmod decode (varchar/char display
+// already existed). The CREATE TABLE now reproduces the declared precision and
+// length faithfully. The fixture carries a numeric(10,2) + varchar(8) column to
+// guard the round-trip.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
@@ -280,7 +291,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
-	if err := runSQLSimple(t, c, "CREATE TABLE public.foo (id integer, name text)"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE TABLE public.foo (id integer, name text, "+
+		"amount numeric(10,2), code character varying(8))"); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
 
@@ -342,6 +354,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		for _, sub := range cols {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump column list missing %q (SRF-join right-side projection regressed)\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// **Slice 48 closed (asserted):** buildUserPGAttributeRow hardcoded
+		// atttypmod=-1, so every typmod-bearing column dumped as its bare base
+		// type (numeric(10,2) → numeric, character varying(8) → character
+		// varying), a schema-fidelity loss. pgAttTypmod now computes the
+		// PG-canonical atttypmod from the declared type args (VARHDRSZ added for
+		// numeric/varchar/char), and formatTypeOID decodes the numeric typmod
+		// (varchar/char display already existed). Assert the declared precision/
+		// length survive the dump round-trip — the regression guard for the fix.
+		typmodCols := []string{"amount numeric(10,2)", "code character varying(8)"}
+		for _, sub := range typmodCols {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a column type modifier; missing %q (atttypmod regressed)\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
 		// **Slice 47 closed (asserted):** the virtual pg_class view stored

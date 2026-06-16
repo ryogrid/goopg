@@ -10067,6 +10067,14 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 1186:
 		return "interval"
 	case 1700:
+		// numeric(precision,scale): atttypmod = ((p<<16)|s)+VARHDRSZ.
+		// Mirrors numerictypmodout. typmod<VARHDRSZ means no modifier.
+		if typmod >= 4 {
+			m := typmod - 4
+			precision := (m >> 16) & 0xffff
+			scale := m & 0xffff
+			return fmt.Sprintf("numeric(%d,%d)", precision, scale)
+		}
 		return "numeric"
 	case 2249:
 		return "record"
