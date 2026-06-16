@@ -261,6 +261,21 @@ package testport
 // already existed). The CREATE TABLE now reproduces the declared precision and
 // length faithfully. The fixture carries a numeric(10,2) + varchar(8) column to
 // guard the round-trip.
+// Slice 49 restored CHECK constraints in the dump. pg_dump fetches table CHECK
+// constraints with a query gated on `pg_class.relchecks > 0` and renders each
+// row via `pg_get_constraintdef(c.oid)`; goopg hardcoded the user-table
+// pg_class.relchecks to 0 (so the query was skipped entirely) AND
+// pg_get_constraintdef (internal/executor/expr.go) handled only index-backed
+// UNIQUE/PRIMARY KEY/EXCLUDE constraints (so a contype='c' OID returned NULL).
+// relchecks now counts the table's visible NamedChecks (name+OID, matching the
+// rows pg_constraint emits, so pg_dump's count-consistency assertion holds), and
+// pg_get_constraintdef gained a CHECK branch that renders `CHECK ((expr))`
+// (+ ` NO INHERIT` when set), mirroring PG's deparser. The fixture's column-level
+// `qty integer ... CHECK (qty >= 0)` now dumps as the auto-named
+// `CONSTRAINT foo_qty_check CHECK ((qty >= 0))`. (The PRIMARY KEY ALTER-TABLE
+// ADD CONSTRAINT path already worked; a known remaining divergence is the
+// implicit NOT NULL on a PRIMARY KEY column — goopg dumps `id integer`, PG
+// `id integer NOT NULL` — left for a follow-up slice.)
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
@@ -291,8 +306,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
-	if err := runSQLSimple(t, c, "CREATE TABLE public.foo (id integer, name text, "+
-		"amount numeric(10,2), code character varying(8))"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE TABLE public.foo (id integer PRIMARY KEY, name text, "+
+		"amount numeric(10,2), code character varying(8), qty integer DEFAULT 0 CHECK (qty >= 0))"); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
 
@@ -384,6 +399,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// reloptions clause — this is the regression guard for the fix.
 		if strings.Contains(res.Stdout, "WITH (") {
 			t.Errorf("pg_dump emitted a spurious reloptions WITH clause for a table with no options\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 49 closed (asserted):** a column-level CHECK was silently
+		// dropped from the dump. pg_dump gates its per-table CHECK query on
+		// `pg_class.relchecks > 0` and then renders each row via
+		// `pg_get_constraintdef(c.oid)`; goopg hardcoded relchecks=0 (so the
+		// query never ran) AND pg_get_constraintdef handled only index-backed
+		// constraints (so even a forced query returned NULL). relchecks now
+		// counts the table's visible NamedChecks, and pg_get_constraintdef
+		// renders `CHECK ((expr))` for contype='c' constraints. Assert the
+		// auto-named column CHECK survives the dump round-trip — the regression
+		// guard for the fix. (The PRIMARY KEY ALTER-TABLE path already worked.)
+		check := []string{
+			"ADD CONSTRAINT foo_pkey PRIMARY KEY (id)",
+			"CONSTRAINT foo_qty_check CHECK ((qty >= 0))",
+		}
+		for _, sub := range check {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a constraint; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
 		}
 		return
 	}

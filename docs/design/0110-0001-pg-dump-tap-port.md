@@ -1044,6 +1044,29 @@ fixed one logical group per loop:
     numeric(8,0), varchar(64), char(10), and the no-modifier cases) and the
     enriched `TestPort_PgDumpConnectionSetup` fixture asserting `amount
     numeric(10,2)` + `code character varying(8)` survive the dump.
+  - **Slice 49 — table CHECK constraints (`relchecks` + `pg_get_constraintdef`)
+    (`internal/catalog/catalog.go`, `internal/executor/expr.go`).** Enriching the
+    fixture with `id integer PRIMARY KEY` and `qty integer DEFAULT 0 CHECK
+    (qty >= 0)` showed the PRIMARY KEY already round-trips (the `ALTER TABLE …
+    ADD CONSTRAINT … PRIMARY KEY` path was complete) but the **column-level
+    CHECK was silently dropped**. Two independent causes, both required:
+    (1) pg_dump only queries per-table CHECK constraints when
+    `pg_class.relchecks > 0` and then *asserts* the returned row count equals
+    `relchecks` (`getTableAttrs`); goopg hardcoded the user-table `relchecks`
+    cell to `0`, so the query never ran. The cell now counts the table's visible
+    `NamedChecks` (those with a non-empty name **and** non-zero OID — exactly the
+    set `pg_constraint`'s `VirtualRows` emits as `contype='c'`, so the count
+    assertion holds). (2) `pg_get_constraintdef(c.oid)` — used to render each
+    CHECK row — handled only index-backed UNIQUE/PRIMARY KEY/EXCLUDE constraints
+    and returned NULL for a `contype='c'` OID. It gained a CHECK branch that
+    scans the owning table's `NamedChecks` and renders `CHECK ((expr))`
+    (appending ` NO INHERIT` when set), mirroring PG's deparser's extra paren
+    layer. The fixture's auto-named column CHECK now dumps as
+    `CONSTRAINT foo_qty_check CHECK ((qty >= 0))`. Known remaining divergence
+    (next slice): the implicit NOT NULL on a PRIMARY KEY column — goopg dumps
+    `id integer`, upstream `id integer NOT NULL`. Guard: the enriched
+    `TestPort_PgDumpConnectionSetup` fixture asserts both the PRIMARY KEY
+    ADD CONSTRAINT and the CHECK constraint survive the dump.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1051,7 +1074,9 @@ no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
 0, and as of slice 46 the test also asserts the table's archive entry **and the
 full column list** (`id integer`, `name text`) are emitted; slice 48 enriched the
 fixture so it also asserts the type modifiers `amount numeric(10,2)` and `code
-character varying(8)` round-trip. Unit guards:
+character varying(8)` round-trip; slice 49 further asserts the PRIMARY KEY
+`ADD CONSTRAINT` and the auto-named `CHECK ((qty >= 0))` constraint survive the
+dump. Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`.

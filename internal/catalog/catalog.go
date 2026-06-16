@@ -1799,6 +1799,17 @@ func (c *InMemory) registerSystemTables() {
 			} else if t.Temp {
 				relpers = "t"
 			}
+			// relchecks must equal the number of contype='c' rows pg_constraint
+			// emits for this table (the visible, named+OID'd CHECK constraints).
+			// pg_dump gates its per-table CHECK query on relchecks>0 and then
+			// asserts the row count matches exactly (getTableAttrs), so a 0 here
+			// silently drops every CHECK from the dumped CREATE TABLE. M0110-0001.
+			relchecks := 0
+			for _, nc := range t.NamedChecks {
+				if nc.Name != "" && nc.OID != 0 {
+					relchecks++
+				}
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // 0:  oid
 				t.Name,                       // 1:  relname
@@ -1819,7 +1830,7 @@ func (c *InMemory) registerSystemTables() {
 				relpers,                      // 16: relpersistence
 				relkind,                      // 17: relkind
 				strconv.Itoa(len(t.Columns)), // 18: relnatts
-				"0",                          // 19: relchecks
+				strconv.Itoa(relchecks),      // 19: relchecks
 				"f",                          // 20: relhasrules
 				"f",                          // 21: relhastriggers
 				func() string {

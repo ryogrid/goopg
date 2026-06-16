@@ -6385,6 +6385,27 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			return NewStringDatum(buildConstraintDefString(idx)), nil
 		}
+		// CHECK constraints are not index-backed; they live in the owning
+		// table's NamedChecks. pg_dump's getTableConstraints query selects
+		// `pg_get_constraintdef(c.oid)` for every contype='c' row, so without
+		// this branch the CHECK def comes back NULL and the constraint is
+		// silently dropped from the dumped CREATE TABLE. PG's deparser wraps the
+		// predicate in an extra paren layer (CHECK ((expr))), and appends
+		// NO INHERIT for a NO-INHERIT check; mirror that here. M0110-0001.
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			for _, tbl := range im.AllTables() {
+				for _, nc := range tbl.NamedChecks {
+					if nc.OID == 0 || nc.OID != targetOID {
+						continue
+					}
+					def := "CHECK ((" + nc.Expr + "))"
+					if nc.NoInherit {
+						def += " NO INHERIT"
+					}
+					return NewStringDatum(def), nil
+				}
+			}
+		}
 		return NullDatum, nil
 
 	case "array_to_string":
