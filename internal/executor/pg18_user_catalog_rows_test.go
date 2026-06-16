@@ -486,6 +486,10 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// distinct vector types, not the genuine _int2/_oid arrays.
 		{"int2vector", nil, 1006, "int2vector[]"},
 		{"oidvector", nil, 1013, "oidvector[]"},
+		// Slice 82: name (_name 1003). The name type carries no typmod, so the
+		// array renders as the bare element name + []. Distinct from text[] —
+		// name is the 64-byte fixed-length catalog identifier type.
+		{"name", nil, 1003, "name[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

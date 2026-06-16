@@ -334,6 +334,8 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 	case catalog.OIDArrayInt2vector, // 1006 _int2vector
 		catalog.OIDArrayOidvector: // 1013 _oidvector
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayName: // 1003 _name -- element name typcollation 'C'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x', TypCollation: cCollationOID}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 }

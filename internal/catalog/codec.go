@@ -157,6 +157,15 @@ const (
 	// PG standby can resolve the OIDs; neither carries a typmod.
 	OIDInt2vector uint32 = 22
 	OIDOidvector  uint32 = 30
+	// DU-002 slice 82: name (the 64-byte fixed-length identifier type, used
+	// internally for catalog name columns relname/attname/typname). Declarable
+	// as a column type; format_type renders the bare name "name". Seeded in
+	// pg_type (initdb/pg_type_seed_data.go) so a PG standby can resolve the OID.
+	// It carries no typmod. ("char" — OID 18, the 1-byte internal char distinct
+	// from char/bpchar — is deferred: the parser folds both quoted "char" and
+	// bare char to ct.Name="char", so disambiguating the two needs a parser
+	// change, not just a codec entry.)
+	OIDName uint32 = 19
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -255,6 +264,9 @@ const (
 	// element name with a [] suffix ("int2vector[]"/"oidvector[]").
 	OIDArrayInt2vector uint32 = 1006
 	OIDArrayOidvector  uint32 = 1013
+	// DU-002 slice 82: the name array type (_name 1003). No typmod, so
+	// format_type renders the bare element name with a [] suffix ("name[]").
+	OIDArrayName uint32 = 1003
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -297,6 +309,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayBpChar
 	case OIDOID:
 		return OIDArrayOID
+	case OIDName:
+		return OIDArrayName
 	case OIDJSON:
 		return OIDArrayJSON
 	case OIDJsonb:
@@ -421,6 +435,8 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDBpChar, true
 	case OIDArrayOID:
 		return OIDOID, true
+	case OIDArrayName:
+		return OIDName, true
 	case OIDArrayJSON:
 		return OIDJSON, true
 	case OIDArrayJsonb:
@@ -1391,6 +1407,8 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDInt2vector
 	case "oidvector":
 		return OIDOidvector
+	case "name":
+		return OIDName
 	default:
 		return OIDText // safe fallback
 	}
@@ -1517,6 +1535,8 @@ func OIDToTypeName(oid uint32) string {
 		return "int2vector"
 	case OIDOidvector:
 		return "oidvector"
+	case OIDName:
+		return "name"
 	default:
 		return "text"
 	}

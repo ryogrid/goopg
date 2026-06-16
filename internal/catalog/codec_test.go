@@ -211,6 +211,9 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 		// (NOT smallint[]/oid[], which are the genuine _int2/_oid array types).
 		{"int2vector", OIDInt2vector},
 		{"oidvector", OIDOidvector},
+		// DU-002 slice 82: name (the 64-byte identifier type) round-trips its
+		// canonical name instead of falling back to text.
+		{"name", OIDName},
 	}
 	for _, p := range pairs {
 		gotOID := TypeNameToOID(p.name)
@@ -221,6 +224,18 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 		if gotName != p.name {
 			t.Errorf("OIDToTypeName(%d) = %q, want %q", p.oid, gotName, p.name)
 		}
+	}
+
+	// DU-002 slice 82: name ↔ _name array OID mapping round-trips, so a
+	// `name[]` column resolves to _name (1003) and reconstructs from it.
+	if got := ArrayOIDForBase(OIDName); got != OIDArrayName {
+		t.Errorf("ArrayOIDForBase(OIDName) = %d, want %d (_name)", got, OIDArrayName)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayName); !ok || got != OIDName {
+		t.Errorf("BaseOIDForArray(OIDArrayName) = (%d,%v), want (%d,true)", got, ok, OIDName)
+	}
+	if OIDName != 19 || OIDArrayName != 1003 {
+		t.Errorf("name OIDs drifted: OIDName=%d (want 19), OIDArrayName=%d (want 1003)", OIDName, OIDArrayName)
 	}
 }
 

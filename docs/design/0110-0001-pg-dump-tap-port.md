@@ -1765,6 +1765,29 @@ fixed one logical group per loop:
     columns in `TestPort_PgDumpConnectionSetup`, new rows in
     `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`, and new
     pairs in `catalog.TestTypeNameToOIDRoundTrip`.
+  - **Slice 82 — the `name` catalog identifier type (+ its array `_name`)
+    (`internal/catalog/codec.go`, `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** `name` (19) is the 64-byte fixed-length type
+    used internally for catalog name columns (`relname`/`attname`/`typname`) and is
+    a declarable column type; `format_type(19,-1)` renders the bare `name`. The
+    scalar was *already* wired on every display/attr path — `formatTypeOID` (case
+    19), `oidToBuiltinTypeName` (case 19), and `userTypeAttrsForOID` (case 19, with
+    `typcollation=C_COLLATION_OID=950`) all predate this slice — but the **codec had
+    no `name→OID` entry**, so a declared `name` column round-tripped as `text` (25),
+    and the array `_name` (1003) had no `format_type`/array-OID wiring. Both `name`
+    (19) and `_name` (1003) were already seeded in `pg_type_seed_data.go`. This slice
+    adds only the missing array+codec wiring: `TypeNameToOID` / `OIDToTypeName` /
+    `ArrayOIDForBase` / `BaseOIDForArray` gained the `name`↔`_name` cases,
+    `userTypeAttrsForOID` gained the `_name` array case (varlena `{typlen=-1,
+    byval=f, align='i', storage='x'}` carrying the `C` element collation), and
+    `formatTypeOID` gained the 1003 case (→ `name[]`; `name` has no typmod). The
+    `"char"` type (18) is deliberately **deferred**: the parser folds both quoted
+    `"char"` and bare `char` to `ct.Name="char"`, so disambiguating the 1-byte
+    internal char from `bpchar` needs a parser change, not just a codec entry.
+    Guarded by the `arr` fixture's `nm name` / `nms name[]` columns in
+    `TestPort_PgDumpConnectionSetup`, a new `{"name", nil, 1003, "name[]"}` row in
+    `executor.TestUserPGAttributeArrayColumn`, and a new `name`/`_name` round-trip
+    block in `catalog.TestTypeNameToOIDRoundTrip`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1837,8 +1860,10 @@ regtype[]`, `rcf regconfig`, `rcfs regconfig[]`, `rdi regdictionary`, `rdis
 regdictionary[]`, `rn regnamespace`, `rns regnamespace[]`, `rr regrole`, `rrs
 regrole[]`, `rco regcollation`, and `rcos regcollation[]`; slice 81 adds the
 legacy vector types `iv int2vector`, `ivs int2vector[]`, `ov oidvector`, and `ovs
-oidvector[]` (and fixes the mis-rendering of OID 22/30 as `smallint[]`/`oid[]`).
-Unit guards:
+oidvector[]` (and fixes the mis-rendering of OID 22/30 as `smallint[]`/`oid[]`);
+slice 82 adds the `name` catalog identifier type `nm name` and `nms name[]` (the
+scalar display/attr paths predated this slice; only the codec `name→OID` and the
+`_name` array wiring were missing). Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
 `executor.TestAlterTableAddForeignKeyCapturesActions`,

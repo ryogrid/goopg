@@ -619,7 +619,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"rcf regconfig, rcfs regconfig[], rdi regdictionary, rdis regdictionary[], "+
 		"rn regnamespace, rns regnamespace[], rr regrole, rrs regrole[], "+
 		"rco regcollation, rcos regcollation[], "+
-		"iv int2vector, ivs int2vector[], ov oidvector, ovs oidvector[])"); err != nil {
+		"iv int2vector, ivs int2vector[], ov oidvector, ovs oidvector[], "+
+		"nm name, nms name[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -1112,6 +1113,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"ivs int2vector[]",
 			"ov oidvector",
 			"ovs oidvector[]",
+			// Slice 82 adds name (19)/_name (1003), the 64-byte fixed-length
+			// catalog identifier type. The scalar was already wired, but the
+			// codec had no name→OID entry so a declared `name` column fell back
+			// to text (25), and _name had no format_type/attr wiring. Now both
+			// round-trip as "name"/"name[]" (distinct from text/text[]).
+			"nm name",
+			"nms name[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

@@ -10573,6 +10573,9 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 1013:
 		// _oidvector: oidvector has no typmod, so the array is the bare name + [].
 		return "oidvector[]"
+	case 1003:
+		// _name: name has no typmod, so the array is the bare name + []. Slice 82.
+		return "name[]"
 	case 114:
 		return "json"
 	case 142:
