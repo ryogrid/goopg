@@ -1333,6 +1333,27 @@ fixed one logical group per loop:
     `View != nil && ViewDef != ""`, so it now echoes the matview body unchanged.
     Guarded end-to-end by `TestPort_PgDumpConnectionSetup` (the `foo_mv` fixture)
     and by the parser unit test `parser.TestParseCreateMatViewRawDef`.
+  - **Slice 61 — RECURSIVE VIEW round-trip (`internal/parser/ddl.go`).** A
+    `CREATE RECURSIVE VIEW` is dumped through the SAME `pg_get_viewdef` path as a
+    plain view, so a recursive view with an empty body aborts the WHOLE dump with
+    `definition of view "v" appears to be empty (length zero)` — the slice-57
+    blocker, repeated for the recursive parse path. `parseCreateRecursiveViewTail`
+    already built the wrapped-CTE AST (`WITH RECURSIVE name(cols) AS (body) SELECT
+    * FROM name`, used for execution) but set NO `RawDef`, so `pg_get_viewdef`
+    returned NULL. PostgreSQL stores a recursive view as a regular view over a
+    `WITH RECURSIVE` CTE and `pg_dump` re-emits it as a plain `CREATE VIEW`; goopg
+    now mirrors that by SYNTHESIZING the wrapped form into `RawDef`: `WITH
+    RECURSIVE name(cols) AS (<verbatim body>) SELECT cols FROM name`. The body is
+    captured verbatim via `captureSrcSpan`, the CTE header and outer projection
+    list the declared columns explicitly (PG expands the canonical column list;
+    goopg has no deparser, so it spells them out — the same documented fidelity
+    gap as the verbatim plain-view body), and the leading `WITH` keyword means
+    `applyViewColumnAliases` bails (it only rewrites bodies starting with
+    `SELECT`), so the column names come solely from the synthesized projection.
+    The CTE self-reference inside the body must be UNQUALIFIED (it binds to the
+    CTE name, not a schema-qualified relation), mirroring PG's CREATE RECURSIVE
+    VIEW rewrite. Guarded end-to-end by `TestPort_PgDumpConnectionSetup` (the
+    `foo_rec` fixture) and by `parser.TestParseCreateRecursiveViewRawDef`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1367,7 +1388,11 @@ public.foo;`; slice 59 asserts a STORED generated column round-trips with its
 generation clause — `CREATE TABLE public.gen (` and `area integer GENERATED
 ALWAYS AS (w * h) STORED`; slice 60 asserts a MATERIALIZED VIEW round-trips —
 `CREATE MATERIALIZED VIEW public.foo_mv AS` followed by the verbatim body
-`SELECT id, name FROM public.foo WHERE qty > 0` and the `WITH NO DATA;` clause.
+`SELECT id, name FROM public.foo WHERE qty > 0` and the `WITH NO DATA;` clause;
+slice 61 asserts a RECURSIVE VIEW round-trips — `CREATE VIEW public.foo_rec AS`
+followed by the synthesized wrapped-CTE body `WITH RECURSIVE foo_rec(n) AS
+(SELECT 1 UNION ALL SELECT n + 1 FROM foo_rec WHERE n < 5) SELECT n FROM
+foo_rec;`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
@@ -1382,6 +1407,7 @@ Unit guards:
 `parser.TestParseSetTransactionCommaSeparated`,
 `parser.TestParseCreateViewRawDef`,
 `parser.TestParseCreateMatViewRawDef`,
+`parser.TestParseCreateRecursiveViewRawDef`,
 `executor.TestApplyViewColumnAliases`.
 
 ## Deferred (002–010) — catalog surface estimate

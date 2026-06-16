@@ -539,6 +539,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create materialized view foo_mv: %v", err)
 	}
 
+	// Slice 61: a RECURSIVE VIEW must survive the dump. PG stores a recursive
+	// view as a regular view over a WITH RECURSIVE CTE; pg_dump fetches the body
+	// via the SAME pg_get_viewdef path as a plain view and aborts the WHOLE dump
+	// with `definition of view "v" appears to be empty (length zero)` when it
+	// returns NULL/"". goopg's recursive-view parser built the wrapped-CTE AST
+	// (for execution) but set NO RawDef, so pg_get_viewdef returned NULL and any
+	// recursive view killed the dump — the slice-57 blocker repeated for the
+	// recursive parse path. The parser now synthesizes the wrapped form
+	// `WITH RECURSIVE name(cols) AS (<body>) SELECT cols FROM name` into RawDef.
+	// The CTE self-reference is UNQUALIFIED (`foo_rec`, not `public.foo_rec`) — it
+	// binds to the CTE name, mirroring PG's CREATE RECURSIVE VIEW rewrite.
+	if err := runSQLSimple(t, c, "CREATE RECURSIVE VIEW public.foo_rec(n) AS "+
+		"SELECT 1 UNION ALL SELECT n + 1 FROM foo_rec WHERE n < 5"); err != nil {
+		t.Fatalf("create recursive view foo_rec: %v", err)
+	}
+
 	res, err := util.RunCommand(util.CommandSpec{
 		Name:    bin,
 		Args:    []string{"--no-sync", "postgres"},
@@ -811,6 +827,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		for _, sub := range matViewDefs {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped a MATERIALIZED VIEW; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// **Slice 61 (asserted):** a RECURSIVE VIEW must round-trip. PG stores it
+		// as a regular view over a WITH RECURSIVE CTE and pg_dump re-emits a plain
+		// CREATE VIEW; goopg synthesizes the wrapped form into RawDef so
+		// pg_get_viewdef returns a non-empty body instead of NULL (which aborts the
+		// whole dump). Assert the CREATE VIEW header and the wrapped-CTE body.
+		// Regression guard for the recursive-view RawDef synthesis.
+		recViewDefs := []string{
+			"CREATE VIEW public.foo_rec AS",
+			"WITH RECURSIVE foo_rec(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM foo_rec WHERE n < 5) SELECT n FROM foo_rec;",
+		}
+		for _, sub := range recViewDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a RECURSIVE VIEW; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
 		return

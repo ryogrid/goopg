@@ -1168,7 +1168,9 @@ func (p *parser) parseCreateRecursiveViewTail(pos int, orReplace bool) (Stmt, er
 	if _, err = p.expectKeyword(KwAs); err != nil {
 		return nil, err
 	}
-	// Parse the view body.
+	// Parse the view body. Remember its starting token so the raw source span
+	// can be captured verbatim for pg_get_viewdef. M0110-0001 (DU-002 slice 61).
+	bodyStart := p.cur()
 	old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 	p.selectIntoErrMsg = "views must not contain SELECT INTO"
 	p.selectIntoNoPos = true
@@ -1181,6 +1183,7 @@ func (p *parser) parseCreateRecursiveViewTail(pos int, orReplace bool) (Stmt, er
 	if !ok {
 		return nil, &SyntaxError{Pos: pos, Message: "recursive view body did not produce SELECT"}
 	}
+	rawBody := p.captureSrcSpan(bodyStart.Pos, p.cur())
 	// Wrap: WITH RECURSIVE name(cols) AS (body) SELECT * FROM name.
 	cte := &CommonTableExpr{
 		Name:    name.Name,
@@ -1197,6 +1200,22 @@ func (p *parser) parseCreateRecursiveViewTail(pos int, orReplace bool) (Stmt, er
 		From:    []RangeVar{{pos: pos, Name: name.Name}},
 	}
 	stmt.Query = outer
+	// Synthesize the wrapped-CTE form as the view's stored definition so
+	// pg_get_viewdef returns a non-empty body (a recursive view with no RawDef
+	// makes pg_dump abort the whole dump — the slice-57 blocker). PostgreSQL
+	// stores a recursive view as a regular view over a WITH RECURSIVE CTE and
+	// pg_dump re-emits it as a plain CREATE VIEW; goopg mirrors that by echoing
+	// `WITH RECURSIVE name(cols) AS (<body>) SELECT cols FROM name`. The outer
+	// projection lists the declared columns explicitly (PG expands the canonical
+	// list; goopg has no deparser, so it spells them out — a documented fidelity
+	// gap, like the verbatim plain-view body). The "WITH" prefix means
+	// applyViewColumnAliases bails (it only rewrites bodies starting with SELECT),
+	// so the column names come solely from this projection. M0110-0001 slice 61.
+	if rawBody != "" && len(cols) > 0 {
+		colList := strings.Join(cols, ", ")
+		stmt.RawDef = "WITH RECURSIVE " + name.Name + "(" + colList + ") AS (" +
+			rawBody + ") SELECT " + colList + " FROM " + name.Name
+	}
 	return stmt, nil
 }
 

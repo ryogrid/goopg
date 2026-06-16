@@ -105,6 +105,44 @@ func TestParseCreateMatViewRawDef(t *testing.T) {
 	}
 }
 
+// TestParseCreateRecursiveViewRawDef pins that a recursive view synthesizes the
+// wrapped-CTE form into CreateViewStmt.RawDef so pg_get_viewdef returns a
+// non-empty body (a recursive view with no RawDef makes pg_dump abort the whole
+// dump — the slice-57 blocker). PG stores a recursive view as a regular view
+// over a WITH RECURSIVE CTE and pg_dump re-emits it as a plain CREATE VIEW;
+// goopg mirrors that as `WITH RECURSIVE name(cols) AS (<body>) SELECT cols FROM
+// name`. The verbatim body is wrapped, not echoed bare. (DU-002 slice 61.)
+func TestParseCreateRecursiveViewRawDef(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{
+			"CREATE RECURSIVE VIEW nums(n) AS SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 5",
+			"WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT n FROM nums",
+		},
+		{
+			// multi-column list round-trips in both the CTE header and the
+			// outer projection
+			"CREATE RECURSIVE VIEW t(a, b) AS SELECT 1, 2 UNION ALL SELECT a + 1, b + 1 FROM t WHERE a < 3",
+			"WITH RECURSIVE t(a, b) AS (SELECT 1, 2 UNION ALL SELECT a + 1, b + 1 FROM t WHERE a < 3) SELECT a, b FROM t",
+		},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.src, err)
+		}
+		cv, ok := stmts[0].(*CreateViewStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T, want *CreateViewStmt", tc.src, stmts[0])
+		}
+		if cv.RawDef != tc.want {
+			t.Errorf("Parse(%q): RawDef=%q want %q", tc.src, cv.RawDef, tc.want)
+		}
+	}
+}
+
 // TestParseDropViewIfExists pins the DROP VIEW IF EXISTS shape
 // HammerDB uses for cleanup.
 func TestParseDropViewIfExists(t *testing.T) {
