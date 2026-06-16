@@ -592,6 +592,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.owned_seq OWNED BY owner_tbl.id"); err != nil {
 		t.Fatalf("create sequence owned_seq: %v", err)
 	}
+	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
+	// default-bound suppression, the mirror of the ascending branch verified by
+	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
+	// PG_INT64_MIN) and seqmax=-1, and seqstart=seqmax; pg_dump's default_minv/
+	// default_maxv flip to those same values when incby<0, so a plain
+	// `INCREMENT BY -1` sequence dumps `START WITH -1 / NO MINVALUE / NO MAXVALUE`
+	// (no min/max emitted). An explicit-bound descending sequence
+	// (`INCREMENT BY -2 MINVALUE -100 MAXVALUE -5`) differs from those defaults, so
+	// pg_dump emits both `MINVALUE -100` and `MAXVALUE -5` with `START WITH -5`
+	// (start defaults to maxv for a descending seq). goopg's execCreateSequence
+	// already computes the descending defaults identically (seqTypeBounds min,
+	// maxV=-1, start=maxV) and threads them through pg_sequence, so this is a
+	// verification slice; both blocks were confirmed byte-identical to real
+	// pg_dump 18.3 (/tmp/pgcheck_du119).
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.desc_seq INCREMENT BY -1"); err != nil {
+		t.Fatalf("create sequence desc_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.desc_bound_seq INCREMENT BY -2 MINVALUE -100 MAXVALUE -5"); err != nil {
+		t.Fatalf("create sequence desc_bound_seq: %v", err)
+	}
 
 	// Slice 61: a RECURSIVE VIEW must survive the dump. PG stores a recursive
 	// view as a regular view over a WITH RECURSIVE CTE; pg_dump fetches the body
@@ -1380,6 +1400,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped an OWNED BY sequence/owner; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// **Slice 119 (asserted):** descending sequences must round-trip through
+		// pg_dump's descending-direction default suppression. A plain
+		// `INCREMENT BY -1` sequence keeps NO MINVALUE/NO MAXVALUE (its seqmin=
+		// PG_INT64_MIN and seqmax=-1 equal pg_dump's descending default_minv/
+		// default_maxv) and starts at -1; an explicit-bound descending sequence
+		// emits both MINVALUE/MAXVALUE and starts at its maxv. The full 4-space
+		// blocks pin the exact byte order (START WITH < 0, INCREMENT BY < 0).
+		// Regression guard for the negative-direction default computation in
+		// execCreateSequence + the pg_sequence min/max/start threading.
+		descSeqDefs := []string{
+			"CREATE SEQUENCE public.desc_seq\n    START WITH -1\n    INCREMENT BY -1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 1;\n",
+			"CREATE SEQUENCE public.desc_bound_seq\n    START WITH -5\n    INCREMENT BY -2\n    MINVALUE -100\n    MAXVALUE -5\n    CACHE 1;\n",
+			"SELECT pg_catalog.setval('public.desc_seq', -1, false);",
+			"SELECT pg_catalog.setval('public.desc_bound_seq', -5, false);",
+		}
+		for _, sub := range descSeqDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a descending SEQUENCE clause; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// A descending sequence must NOT carry a spurious `AS bigint` (already
+		// guarded above) and the plain descending seq must NOT emit MINVALUE/MAXVALUE.
+		if strings.Contains(res.Stdout, "CREATE SEQUENCE public.desc_seq\n    START WITH -1\n    INCREMENT BY -1\n    MINVALUE") {
+			t.Errorf("pg_dump emitted a spurious MINVALUE for a plain descending sequence\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 61 (asserted):** a RECURSIVE VIEW must round-trip. PG stores it
 		// as a regular view over a WITH RECURSIVE CTE and pg_dump re-emits a plain

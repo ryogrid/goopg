@@ -2877,6 +2877,59 @@ a schema), and against an explicit `schema.table.column` otherwise. The
 + `owned_seq OWNED BY owner_tbl.id` and asserts the `ALTER SEQUENCE ... OWNED BY`
 statement plus the owning table's `CREATE TABLE`.
 
+### Slice 119 — descending sequences (negative-direction default suppression)
+
+Slice 119 is the **mirror** of the ascending default-bound work in slices 116/117:
+it verifies that a *descending* sequence (`INCREMENT BY < 0`) round-trips through
+pg_dump's negative-direction default suppression.
+
+**How pg_dump's defaults flip.** `dumpSequence` computes `default_minv`/
+`default_maxv` from the sign of the increment:
+
+```c
+default_minv = is_ascending ? 1            : PG_INT64_MIN;   /* bigint */
+default_maxv = is_ascending ? PG_INT64_MAX : -1;
+```
+
+So for a descending bigint sequence the defaults are `minv=PG_INT64_MIN`,
+`maxv=-1`, and the backend stores `seqstart=seqmax` (`-1`). pg_dump always emits
+`START WITH`/`INCREMENT BY`, then suppresses MIN/MAX only when they equal those
+flipped defaults. A plain `CREATE SEQUENCE … INCREMENT BY -1` therefore dumps:
+
+```sql
+CREATE SEQUENCE public.desc_seq
+    START WITH -1
+    INCREMENT BY -1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+SELECT pg_catalog.setval('public.desc_seq', -1, false);
+```
+
+An explicit-bound descending sequence (`INCREMENT BY -2 MINVALUE -100 MAXVALUE -5`)
+differs from the defaults, so both clauses emit and `START WITH` defaults to the
+maxv:
+
+```sql
+CREATE SEQUENCE public.desc_bound_seq
+    START WITH -5
+    INCREMENT BY -2
+    MINVALUE -100
+    MAXVALUE -5
+    CACHE 1;
+```
+
+**No production change.** `execCreateSequence` already computes the descending
+defaults identically to the PG backend — `seqTypeBounds` returns the type minimum,
+the direction branch sets `minV=type_min, maxV=-1` for `increment < 0`, and
+`start=maxV` — and `sequenceParamsForCatalog` threads `min`/`max`/`start` into
+`pg_sequence` unchanged. `SequenceRowData` returns `start` (not the internal
+`current = start - increment`) when the sequence is uncalled, so the `setval`
+last_value is `-1`, matching real pg_dump. This slice adds two fixtures
+(`desc_seq`, `desc_bound_seq`) to `TestPort_PgDumpConnectionSetup` with full
+4-space-indented block assertions; both were confirmed byte-identical to real
+pg_dump 18.3 (`/tmp/pgcheck_du119`).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
