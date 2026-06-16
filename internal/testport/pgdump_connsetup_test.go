@@ -620,7 +620,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"rn regnamespace, rns regnamespace[], rr regrole, rrs regrole[], "+
 		"rco regcollation, rcos regcollation[], "+
 		"iv int2vector, ivs int2vector[], ov oidvector, ovs oidvector[], "+
-		"nm name, nms name[])"); err != nil {
+		"nm name, nms name[], "+
+		"tt timetz, tts timetz[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -1120,6 +1121,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// round-trip as "name"/"name[]" (distinct from text/text[]).
 			"nm name",
 			"nms name[]",
+			// Slice 83: the timetz (time with time zone) type + its array
+			// _timetz. The scalar display path existed in oidToBuiltinTypeName
+			// (case 1266), but formatTypeOID had NO 1266 case and the codec had
+			// no timetz→OID entry, so a declared `timetz` column rendered/
+			// round-tripped as text; _timetz had no format_type/attr wiring.
+			// Now both survive as "time with time zone"/"time with time zone[]".
+			"tt time with time zone",
+			"tts time with time zone[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

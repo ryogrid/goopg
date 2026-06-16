@@ -1788,6 +1788,30 @@ fixed one logical group per loop:
     `TestPort_PgDumpConnectionSetup`, a new `{"name", nil, 1003, "name[]"}` row in
     `executor.TestUserPGAttributeArrayColumn`, and a new `name`/`_name` round-trip
     block in `catalog.TestTypeNameToOIDRoundTrip`.
+  - **Slice 83 — the `timetz` (`time with time zone`) type (+ its array `_timetz`)
+    (`internal/catalog/codec.go`, `internal/executor/expr.go`,
+    `internal/executor/pg18_user_catalog_rows.go`).** `timetz` (1266) is a
+    12-byte (8-byte time + 4-byte zone offset) date/time type and a declarable
+    column type; `format_type(1266,-1)` renders `time with time zone`. The display
+    path was only **partially** wired — `oidToBuiltinTypeName` had case 1266, but
+    `formatTypeOID` (the actual `format_type()` implementation that pg_dump reads
+    for the column type) had **no 1266 case**, so it fell through to its default,
+    and the **codec had no `timetz→OID` entry**, so a declared `timetz` column
+    round-tripped as `text` (25). The array `_timetz` (1270) had no
+    `format_type`/array-OID/attr wiring at all. Both `timetz` (1266) and `_timetz`
+    (1270) were already seeded in `pg_type_seed_data.go`. This slice adds the
+    missing wiring: `OIDTimeTZ`/`OIDArrayTimeTZ` consts plus the `timetz`↔`_timetz`
+    cases in `TypeNameToOID` / `OIDToTypeName` / `ArrayOIDForBase` /
+    `BaseOIDForArray`; the **scalar** `formatTypeOID` case 1266 (→ `time with time
+    zone`) that was missing, plus the array case 1270 (→ `time with time zone[]`)
+    in **both** `formatTypeOID` and `oidToBuiltinTypeName` (sibling display paths);
+    and `userTypeAttrsForOID` cases for the scalar (`{typlen=12, byval=f,
+    align='d', storage='p'}`) and the array (varlena `{typlen=-1, byval=f,
+    align='d', storage='x'}`). Guarded by the `arr` fixture's `tt timetz` /
+    `tts timetz[]` columns in `TestPort_PgDumpConnectionSetup`, a new
+    `{"timetz", nil, 1270, "time with time zone[]"}` row in
+    `executor.TestUserPGAttributeArrayColumn`, and a new `timetz`/`_timetz`
+    round-trip block in `catalog.TestTypeNameToOIDRoundTrip`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1863,7 +1887,9 @@ legacy vector types `iv int2vector`, `ivs int2vector[]`, `ov oidvector`, and `ov
 oidvector[]` (and fixes the mis-rendering of OID 22/30 as `smallint[]`/`oid[]`);
 slice 82 adds the `name` catalog identifier type `nm name` and `nms name[]` (the
 scalar display/attr paths predated this slice; only the codec `name→OID` and the
-`_name` array wiring were missing). Unit guards:
+`_name` array wiring were missing); slice 83 adds the `timetz` (`time with time
+zone`) type `tt timetz` and `tts timetz[]` (the codec had no `timetz→OID` entry
+and `formatTypeOID` had no scalar 1266 case, so it round-tripped as `text`). Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
 `executor.TestAlterTableAddForeignKeyCapturesActions`,

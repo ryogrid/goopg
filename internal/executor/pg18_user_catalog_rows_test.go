@@ -490,6 +490,10 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// array renders as the bare element name + []. Distinct from text[] —
 		// name is the 64-byte fixed-length catalog identifier type.
 		{"name", nil, 1003, "name[]"},
+		// Slice 83: timetz / time with time zone (_timetz 1270). timetz carries no
+		// typmod here (bare timetz[]), so the array renders as the bare element
+		// name + []. Distinct from time[] (1183) — timetz tracks a UTC offset.
+		{"timetz", nil, 1270, "time with time zone[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

@@ -220,6 +220,8 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "date[]"
 	case 1183:
 		return "time without time zone[]"
+	case 1270:
+		return "time with time zone[]"
 	case 1185:
 		return "timestamp with time zone[]"
 	case 651:
@@ -10681,6 +10683,9 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 1183:
 		// _time: bare name, mirroring scalar 1083 (no typmod decode). Slice 65.
 		return "time without time zone[]"
+	case 1270:
+		// _timetz: bare name, mirroring scalar 1266 (no typmod decode). Slice 83.
+		return "time with time zone[]"
 	case 1185:
 		// _timestamptz: bare name, mirroring scalar 1184. Slice 65.
 		return "timestamp with time zone[]"
@@ -10712,6 +10717,8 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "date"
 	case 1083:
 		return "time without time zone"
+	case 1266:
+		return "time with time zone"
 	case 1114:
 		return "timestamp without time zone"
 	case 1184:

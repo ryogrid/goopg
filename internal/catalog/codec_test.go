@@ -214,6 +214,9 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 		// DU-002 slice 82: name (the 64-byte identifier type) round-trips its
 		// canonical name instead of falling back to text.
 		{"name", OIDName},
+		// DU-002 slice 83: timetz (time with time zone) round-trips its canonical
+		// name instead of falling back to text (the codec had no timetz→OID entry).
+		{"timetz", OIDTimeTZ},
 	}
 	for _, p := range pairs {
 		gotOID := TypeNameToOID(p.name)
@@ -236,6 +239,18 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 	}
 	if OIDName != 19 || OIDArrayName != 1003 {
 		t.Errorf("name OIDs drifted: OIDName=%d (want 19), OIDArrayName=%d (want 1003)", OIDName, OIDArrayName)
+	}
+
+	// DU-002 slice 83: timetz ↔ _timetz array OID mapping round-trips, so a
+	// `timetz[]` column resolves to _timetz (1270) and reconstructs from it.
+	if got := ArrayOIDForBase(OIDTimeTZ); got != OIDArrayTimeTZ {
+		t.Errorf("ArrayOIDForBase(OIDTimeTZ) = %d, want %d (_timetz)", got, OIDArrayTimeTZ)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayTimeTZ); !ok || got != OIDTimeTZ {
+		t.Errorf("BaseOIDForArray(OIDArrayTimeTZ) = (%d,%v), want (%d,true)", got, ok, OIDTimeTZ)
+	}
+	if OIDTimeTZ != 1266 || OIDArrayTimeTZ != 1270 {
+		t.Errorf("timetz OIDs drifted: OIDTimeTZ=%d (want 1266), OIDArrayTimeTZ=%d (want 1270)", OIDTimeTZ, OIDArrayTimeTZ)
 	}
 }
 

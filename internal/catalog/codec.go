@@ -65,6 +65,7 @@ const (
 	OIDFloat8      uint32 = 701
 	OIDDate        uint32 = 1082
 	OIDTime        uint32 = 1083
+	OIDTimeTZ      uint32 = 1266
 	OIDTimestamp   uint32 = 1114
 	OIDTimestampTZ uint32 = 1184
 	OIDBpChar      uint32 = 1042
@@ -186,6 +187,7 @@ const (
 	OIDArrayTimestamp   uint32 = 1115
 	OIDArrayFloat4      uint32 = 1021
 	OIDArrayTime        uint32 = 1183
+	OIDArrayTimeTZ      uint32 = 1270
 	OIDArrayTimestampTZ uint32 = 1185
 	OIDArrayUUID        uint32 = 2951
 	// DU-002 slice 68: the remaining simple scalar-backed array types.
@@ -299,6 +301,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayFloat4
 	case OIDTime:
 		return OIDArrayTime
+	case OIDTimeTZ:
+		return OIDArrayTimeTZ
 	case OIDTimestampTZ:
 		return OIDArrayTimestampTZ
 	case OIDUUID:
@@ -425,6 +429,8 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDFloat4, true
 	case OIDArrayTime:
 		return OIDTime, true
+	case OIDArrayTimeTZ:
+		return OIDTimeTZ, true
 	case OIDArrayTimestampTZ:
 		return OIDTimestampTZ, true
 	case OIDArrayUUID:
@@ -1317,6 +1323,8 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDDate
 	case "time", "time without time zone":
 		return OIDTime
+	case "timetz", "time with time zone":
+		return OIDTimeTZ
 	case "timestamp", "timestamp without time zone":
 		return OIDTimestamp
 	case "timestamptz", "timestamp with time zone":
@@ -1445,6 +1453,8 @@ func OIDToTypeName(oid uint32) string {
 		return "date"
 	case OIDTime:
 		return "time"
+	case OIDTimeTZ:
+		return "timetz"
 	case OIDTimestamp:
 		return "timestamp"
 	case OIDTimestampTZ:

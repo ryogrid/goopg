@@ -146,6 +146,8 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: 4, TypByVal: true, TypAlign: 'i', TypStorage: 'p'}
 	case catalog.OIDTime: // 1083
 		return userTypeAttrs{TypLen: 8, TypByVal: true, TypAlign: 'd', TypStorage: 'p'}
+	case catalog.OIDTimeTZ: // 1266 timetz -- pg_type.dat: typlen 12, typbyval f, typalign 'd', typstorage 'p'
+		return userTypeAttrs{TypLen: 12, TypByVal: false, TypAlign: 'd', TypStorage: 'p'}
 	case catalog.OIDTimestamp: // 1114
 		return userTypeAttrs{TypLen: 8, TypByVal: true, TypAlign: 'd', TypStorage: 'p'}
 	case catalog.OIDTimestampTZ: // 1184
@@ -250,6 +252,8 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 	case catalog.OIDArrayFloat4: // 1021 _float4 -- element float4 typalign 'i'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayTime: // 1183 _time -- element time typalign 'd'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayTimeTZ: // 1270 _timetz -- element timetz typalign 'd'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	case catalog.OIDArrayTimestampTZ: // 1185 _timestamptz -- element timestamptz typalign 'd'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
