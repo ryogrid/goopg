@@ -2549,6 +2549,36 @@ work. Excluded base types remaining after slice 110: `tsvector`/`tsquery` (outpu
 functions normalize and quote lexemes) and internal `"char"` (quoted-identifier
 disambiguation from `bpchar` is lost in the parser).
 
+### Slice 111 — `time with time zone`
+
+Slice 111 adds a domain over `timetz`:
+
+```
+CREATE DOMAIN public.ttz_in AS time with time zone
+	CONSTRAINT ttz_in_check CHECK ((VALUE = ANY (ARRAY['12:30:00+09'::time with time zone, '23:59:59-05'::time with time zone])));
+```
+
+`time with time zone` has a native equality operator, so PG emits the bare
+string-with-cast shape (identical structure to slice 110's `timestamptz`). The
+key difference — and why timetz is **lower-risk than timestamptz** — is that
+`timetz_out` *preserves the stored zone offset verbatim*: unlike
+`timestamptztypoutput`, it does NOT rotate the value into the connection's
+`TimeZone` GUC. Verified against real pg_dump 18.3: the same domain dumped under
+`Asia/Tokyo` still emits `'12:30:00+09'`/`'23:59:59-05'`, so byte-identity holds
+*unconditionally* for already-canonical literals (no UTC-session requirement).
+The canonical `timetz_out` form is `HH:MM:SS±HH[:MM[:SS]]`; the fixture literals
+`'12:30:00+09'` and `'23:59:59-05'` are already canonical (confirmed by feeding
+them through `'…'::timetz` and `pg_get_constraintdef` on real PG).
+
+The single engine change is one switch arm — `case catalog.OIDTimeTZ: castType =
+"time with time zone"`. All other plumbing was already present from the
+timetz-column work (slice 83): `TypeNameToOID("timetz"/"time with time zone")` →
+`OIDTimeTZ` (1266), `userTypeAttrsForOID(1266)`, `format_type(1266)` → `"time
+with time zone"`. (`pgTypeCategoryForOID` falls to the `'U'` default for 1266 as
+it does for 1184; pg_dump does not emit typcategory into `CREATE DOMAIN`, so this
+does not affect byte-identity.) Excluded base types remaining after slice 111 are
+unchanged: `tsvector`/`tsquery` and internal `"char"`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

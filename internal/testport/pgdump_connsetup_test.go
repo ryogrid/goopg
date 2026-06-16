@@ -941,7 +941,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.tstz_in AS timestamptz CHECK (VALUE IN ('2020-01-01 00:00:00+00', '2021-06-15 12:30:00+00'))"); err != nil {
 		t.Fatalf("create domain tstz_in: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in)"); err != nil {
+	// slice 111: a domain over `time with time zone`. Native equality, so the
+	// bare string-with-cast shape. Unlike timestamptz, timetz's output preserves
+	// the stored zone offset verbatim (no session-TZ re-render), so the canonical
+	// 'HH:MM:SS±HH[:MM]' form round-trips byte-identically regardless of session TZ.
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.ttz_in AS timetz CHECK (VALUE IN ('12:30:00+09', '23:59:59-05'))"); err != nil {
+		t.Fatalf("create domain ttz_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1696,6 +1703,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.tstz_in AS timestamp with time zone",
 			"CONSTRAINT tstz_in_check CHECK ((VALUE = ANY (ARRAY['2020-01-01 00:00:00+00'::timestamp with time zone, '2021-06-15 12:30:00+00'::timestamp with time zone])))",
 			"tstzi public.tstz_in",
+			// slice 111: domain over time with time zone. timetz preserves the
+			// stored zone offset verbatim (no session-TZ re-render), so the
+			// canonical literals round-trip byte-identically through `::time with
+			// time zone` regardless of session TZ.
+			"CREATE DOMAIN public.ttz_in AS time with time zone",
+			"CONSTRAINT ttz_in_check CHECK ((VALUE = ANY (ARRAY['12:30:00+09'::time with time zone, '23:59:59-05'::time with time zone])))",
+			"ttzi public.ttz_in",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

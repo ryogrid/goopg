@@ -2043,6 +2043,25 @@ object support.
         remaining:** `tsvector`/`tsquery` (output functions normalize+quote
         lexemes), internal `"char"` (quoted-ident disambiguation from `bpchar`
         lost in the parser — needs a parser quote-state change).
+      - **PROGRESS 2026-06-17 (loop #74):** **DU-002 slice 111 LANDED** — the
+        IN-values deparse now covers a domain over **`time with time zone`**
+        (`CREATE DOMAIN public.ttz_in AS timetz CHECK (VALUE IN ('12:30:00+09',
+        '23:59:59-05'))`). Same bare string-with-cast shape as slice 110's
+        timestamptz, but **lower-risk**: `timetz_out` preserves the stored zone
+        offset verbatim (it does NOT rotate into the session `TimeZone` GUC, unlike
+        `timestamptztypoutput`), so byte-identity holds **unconditionally** for
+        already-canonical literals — no UTC-session requirement. Confirmed against
+        real pg_dump 18.3: `pg_get_constraintdef` emits `'12:30:00+09'::time with
+        time zone, '23:59:59-05'::time with time zone`, and both literals are
+        already canonical (`'…'::timetz` round-trips them verbatim). One-arm engine
+        change in `domainInValuesCheckExpr` (`case catalog.OIDTimeTZ: castType =
+        "time with time zone"`); all other plumbing was already present from the
+        timetz-column work (slice 83): `TypeNameToOID`→1266,
+        `userTypeAttrsForOID(1266)`, `format_type(1266)`. Fixture: new domain
+        `ttz_in` + column `ttzi`. Gates: build OK; catalog/parser unit PASS;
+        executor domain unit PASS; `TestPort_PgDumpConnectionSetup` PASS (2.24s);
+        pgbench pre-commit smoke on commit. **Excluded base types remaining
+        (unchanged):** `tsvector`/`tsquery`, internal `"char"`.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

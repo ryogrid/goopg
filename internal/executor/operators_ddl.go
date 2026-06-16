@@ -8830,6 +8830,14 @@ func domainInValuesCheckExpr(baseType string, vals []string, cat *catalog.InMemo
 		castType = "timestamp with time zone"
 	case catalog.OIDTime:
 		castType = "time without time zone"
+	case catalog.OIDTimeTZ:
+		// time with time zone has a native equality operator, so PG emits the
+		// bare string-with-cast shape. Unlike timestamptz, timetz's output
+		// function preserves the stored zone offset verbatim (it does NOT
+		// re-render in the session TimeZone), so the canonical
+		// 'HH:MM:SS±HH[:MM]' form round-trips byte-identically through `::time
+		// with time zone` regardless of session TZ. DU-002 slice 111.
+		castType = "time with time zone"
 	case catalog.OIDUUID:
 		castType = "uuid"
 	case catalog.OIDBytea:
