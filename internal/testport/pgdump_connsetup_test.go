@@ -675,7 +675,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.zipcode AS text"); err != nil {
 		t.Fatalf("create domain zipcode: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode)"); err != nil {
+	// Slice 91: a domain declared NOT NULL must round-trip the not-null
+	// constraint. pg_dump's dumpDomain reads pg_type.typnotnull and, for a
+	// PG17+ server with no separate named not-null constraint row
+	// (tyinfo->notnull == NULL — goopg emits no contype='n' pg_constraint row
+	// for domains), appends a bare ` NOT NULL` to the CREATE DOMAIN. goopg
+	// already stores catalog.Domain.NotNull and buildUserPGTypeRowForDomain
+	// already emits typnotnull from it, so the dump renders
+	// `CREATE DOMAIN public.zipcode_nn AS text NOT NULL;`. Without the flag the
+	// not-null was silently dropped (the bare-domain `zipcode` above is the
+	// typnotnull='f' regression guard for the no-constraint case).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.zipcode_nn AS text NOT NULL"); err != nil {
+		t.Fatalf("create domain zipcode_nn: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1266,6 +1279,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.zipcode AS text;",
 			"CREATE TABLE public.dom (",
 			"zip public.zipcode",
+			// Slice 91: the NOT NULL domain round-trips the not-null clause.
+			"CREATE DOMAIN public.zipcode_nn AS text NOT NULL;",
+			"zip_nn public.zipcode_nn",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

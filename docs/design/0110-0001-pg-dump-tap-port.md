@@ -2087,7 +2087,16 @@ and `LookupDomain`/`LookupDomainByOID` on the `Catalog` interface so
 exposed a `pg_get_expr` bug: `pg_get_expr(NULL, …)` returned `''` (non-NULL),
 so `dumpDomain` emitted a spurious empty `DEFAULT `; it now returns NULL for a
 NULL node tree (empty-but-non-null still returns `''`, so partition-bound
-display is unaffected). Unit guards:
+display is unaffected). Slice 91 extends the domain to carry a `NOT NULL`
+constraint (`CREATE DOMAIN public.zipcode_nn AS text NOT NULL`). pg_dump's
+`dumpDomain` reads `pg_type.typnotnull` and, against a PG17+ server with no
+separate named not-null constraint row (`tyinfo->notnull == NULL` — goopg emits
+no `contype='n'` `pg_constraint` row for domains), appends a bare ` NOT NULL` to
+the `CREATE DOMAIN`. `catalog.Domain.NotNull` and `buildUserPGTypeRowForDomain`
+already carried `typnotnull` from slice 90's `pg_type` emission, so the dump
+round-trips `CREATE DOMAIN public.zipcode_nn AS text NOT NULL;` with no code
+change — the slice is a regression guard for the not-null fidelity path (the
+bare `zipcode` domain is the complementary `typnotnull='f'` guard). Unit guards:
 `executor.TestUserPGAttributeDomainColumn`,
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
