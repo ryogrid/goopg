@@ -688,7 +688,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.zipcode_nn AS text NOT NULL"); err != nil {
 		t.Fatalf("create domain zipcode_nn: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn)"); err != nil {
+	// Slice 92: a domain with a DEFAULT expression must round-trip the default.
+	// pg_dump's dumpDomain reads pg_get_expr(typdefaultbin) and, when non-NULL,
+	// appends ` DEFAULT <expr>` verbatim. goopg's parser now keeps the DEFAULT
+	// expr (was previously skipped) and buildUserPGTypeRowForDomain emits the
+	// rendered expr as typdefaultbin (pg_get_expr is a pass-through), so the dump
+	// renders `CREATE DOMAIN public.qty AS integer DEFAULT 0;`. An integer
+	// constant deparses identically in goopg (formatExprForAttrdef) and real PG
+	// (verified: `DEFAULT 0`); a text default would gain a `::text` cast that
+	// goopg does not synthesize, so this slice uses an integer base.
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.qty AS integer DEFAULT 0"); err != nil {
+		t.Fatalf("create domain qty: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1282,6 +1294,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// Slice 91: the NOT NULL domain round-trips the not-null clause.
 			"CREATE DOMAIN public.zipcode_nn AS text NOT NULL;",
 			"zip_nn public.zipcode_nn",
+			// Slice 92: the domain DEFAULT round-trips (integer const, no cast).
+			"CREATE DOMAIN public.qty AS integer DEFAULT 0;",
+			"q public.qty",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

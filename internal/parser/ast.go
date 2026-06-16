@@ -1999,6 +1999,7 @@ type CreateDomainStmt struct {
 	BaseType      string // base type name
 	NotNull       bool
 	CheckInValues []string // allowed values from CHECK (VALUE IN ('a','b','c')), M0097-domain-check
+	Default       Expr     // DEFAULT expression AST, nil when no DEFAULT clause. DU-002 slice 92.
 }
 
 func (s *CreateDomainStmt) Pos() int  { return s.pos }

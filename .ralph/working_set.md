@@ -1,23 +1,33 @@
-Task: DU-002 slice 90 — user-defined DOMAIN survives pg_dump (COMPLETE, commit pending)
+Task: DU-002 slice 92 — DOMAIN with DEFAULT survives pg_dump (COMPLETE, commit pending)
 
 Files:
-- internal/catalog/catalog.go — LookupDomainByOID + Catalog interface (LookupDomain/LookupDomainByOID)
-- internal/executor/pg18_user_catalog_rows.go — buildUserPGTypeRowForDomain, pgTypeCategoryForOID, domain branch in buildUserPGAttributeRow
-- internal/executor/operators_ddl.go — syncDomainTypeToCatalogHeap, execCreateDomain wire, execDropDomain xmax stamp
-- internal/executor/expr.go — pg_get_expr(NULL)→NULL; format_type domain branch
-- internal/executor/pg18_user_catalog_rows_test.go — TestUserPGAttributeDomainColumn
-- internal/testport/pgdump_connsetup_test.go — fixture CREATE DOMAIN zipcode + dom table + asserts
-- docs/design/0110-0001-pg-dump-tap-port.md — slice 90 narrative
+- internal/parser/ast.go — CreateDomainStmt.Default Expr field
+- internal/parser/ddl.go — parseCreateDomain now parseExpr's the DEFAULT (was skipped)
+- internal/catalog/catalog.go — Domain.Default Expr + DefaultBin() (formatExprForAttrdef)
+- internal/executor/operators_ddl.go — execCreateDomain sets d.Default = s.Default
+- internal/executor/pg18_user_catalog_rows.go — buildUserPGTypeRowForDomain emits typdefaultbin
+- internal/testport/pgdump_connsetup_test.go — fixture CREATE DOMAIN public.qty AS integer
+  DEFAULT 0 + dom.q column; domainDefs asserts `CREATE DOMAIN public.qty AS integer DEFAULT 0;`
+- docs/design/0110-0001-pg-dump-tap-port.md — slice 92 narrative
 
-Key symbols: buildUserPGTypeRowForDomain, syncDomainTypeToCatalogHeap, LookupDomainByOID,
-Column.DeclaredTypeName (domain columns store base name + declared domain name).
+Key symbols: parseCreateDomain (KwDefault case), Domain.DefaultBin, formatExprForAttrdef,
+buildUserPGTypeRowForDomain (typdefaultbin slot), dumpDomain (pg_dump.c: typdefaultbin
+branch emits ` DEFAULT <expr>` verbatim, NOT literal-quoted).
 
-Findings: domain columns are stored with Type.Name=base (ResolveColumnType) and
-DeclaredTypeName=domain; key the attr-row remap off DeclaredTypeName, not Type.Name.
-pg_get_expr(NULL) must return NULL (not "") or dumpDomain emits spurious `DEFAULT `.
+Findings: integer const deparses identically goopg/PG (`DEFAULT 0`); TEXT default gains a
+`::text` cast in real PG (`'foo'::text`) that formatExprForAttrdef does NOT synthesize —
+so this slice uses an integer base. Verified real pg_dump 18.3 on throwaway cluster.
+parseExpr correctly stops at NOT/CHECK boundaries (tested DEFAULT 42 NOT NULL, NOT NULL
+DEFAULT 7, DEFAULT 'x' CHECK(...)). TestPort_PgDumpConnectionSetup PASS (1.88s).
 
-Gates run: catalog/analyzer/planner/parser/executor PASS; TestPort_PgDumpConnectionSetup PASS;
-partition + analyzer pub_query (pg_get_expr) PASS. Pre-commit hook (pgbench smoke) runs on commit.
+Gates run: build ./internal/... OK; go vet executor/catalog/parser OK;
+parser+catalog unit PASS; executor Domain|Type PASS; TestPort_PgDumpConnectionSetup PASS;
+pre-commit pgbench smoke runs on commit.
 
-Next step: commit. Then slice 91 = add next object type (composite type / range / domain CHECK)
-to the fixture, run the test, find the real next blocker.
+Next step: slice 93 — next domain/object increment. Candidates:
+  (a) DOMAIN text DEFAULT with `::text` cast rendering (formatExprForAttrdef must emit cast
+      to match real PG `'foo'::text`) — extends slice 92.
+  (b) DOMAIN CHECK (VALUE IN (...)) — needs pg_constraint contype='c' row with contypid=
+      domain OID (currently 0) + pg_get_constraintdef deparse; verify real pg_dump first.
+  (c) composite type (CREATE TYPE AS (...)) — third object type.
+ADD fixture object, RUN TestPort_PgDumpConnectionSetup, let it report the real blocker.

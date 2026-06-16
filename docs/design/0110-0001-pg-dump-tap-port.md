@@ -2114,6 +2114,30 @@ bare `zipcode` domain is the complementary `typnotnull='f'` guard). Unit guards:
 `parser.TestParseCreateRecursiveViewRawDef`,
 `executor.TestApplyViewColumnAliases`.
 
+Slice 92 extends the domain to carry a `DEFAULT` expression
+(`CREATE DOMAIN public.qty AS integer DEFAULT 0`). pg_dump's `dumpDomain` issues
+`pg_get_expr(t.typdefaultbin, 'pg_catalog.pg_type'::regclass) AS typdefaultbin`
+and, when that is non-NULL, appends ` DEFAULT <expr>` to the `CREATE DOMAIN`
+verbatim (the `typdefaultbin` branch is *not* literal-quoted; only the fallback
+`typdefault` text column is). Before this slice the parser **skipped** the
+`DEFAULT` clause entirely (`parseCreateDomain` consumed tokens until the next
+`NOT`/`NULL`/`CHECK`/`CONSTRAINT`/`COLLATE`/`;`), so the default was silently
+dropped. Now `parseCreateDomain` parses the expression with `parseExpr` (which
+stops at those same keyword boundaries — verified for `DEFAULT 42 NOT NULL`,
+`NOT NULL DEFAULT 7`, and `DEFAULT 'x' CHECK (...)`), stores it on
+`CreateDomainStmt.Default`, and `execCreateDomain` copies it to
+`catalog.Domain.Default`. `Domain.DefaultBin()` renders it via the shared
+`formatExprForAttrdef` (the same deparser used for `pg_attrdef.adbin`), and
+`buildUserPGTypeRowForDomain` emits that string as `typdefaultbin` (NULL when
+there is no default). goopg's `pg_get_expr` is a pass-through, so the rendered
+string is exactly what the dump re-emits. The fixture uses an **integer** base:
+an integer constant deparses identically in goopg (`0`) and real PG 18.3
+(verified via a throwaway cluster: `DEFAULT 0`), whereas a text default gains a
+`::text` cast in PG (`'foo'::text`) that `formatExprForAttrdef` does not
+synthesize — matching that cast is deferred to a later slice. The existing
+negative guard (`AS text DEFAULT` must be absent) still protects the
+`pg_get_expr(NULL)` regression for the no-default `zipcode`/`zipcode_nn` domains.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

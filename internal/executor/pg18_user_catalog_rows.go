@@ -1083,12 +1083,17 @@ func pgTypeCategoryForOID(oid uint32) byte {
 // pg_dump's dumpDomain can render `CREATE DOMAIN <name> AS format_type(typbasetype,
 // typtypmod)`. typcollation matches the base's so dumpDomain's collation CASE
 // (t.typcollation <> u.typcollation) yields 0 → no spurious COLLATE clause.
-// This basic slice carries no default and no array type (typdefault*/typarray=0);
-// typnotnull reflects the declared NOT NULL. DU-002 slice 90.
+// typnotnull reflects the declared NOT NULL; typdefaultbin carries the rendered
+// DEFAULT expression (pg_get_expr is a pass-through in goopg) so dumpDomain
+// re-emits `DEFAULT <expr>` — NULL when the domain has no default. DU-002 slice 92.
 func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 	baseOID := catalog.TypeNameToOID(d.Base.Name)
 	attrs := userTypeAttrsForOID(baseOID)
 	typmod := pgAttTypmod(baseOID, d.Base.Args)
+	typdefaultbin := NullDatum
+	if bin := d.DefaultBin(); bin != "" {
+		typdefaultbin = NewStringDatum(bin)
+	}
 	return Row{
 		NewIntDatum(int64(d.OID)),                             // oid
 		NewStringDatum(d.Name),                                // typname (name type)
@@ -1119,8 +1124,8 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		NewIntDatum(typmod),                                   // typtypmod (base typmod)
 		NewIntDatum(0),                                        // typndims
 		NewIntDatum(int64(attrs.TypCollation)),                // typcollation (inherit base)
-		NullDatum,                                             // typdefaultbin (NULL)
-		NullDatum,                                             // typdefault (NULL)
+		typdefaultbin,                                         // typdefaultbin (rendered DEFAULT expr, NULL if none)
+		NullDatum,                                             // typdefault (NULL; pg_dump prefers typdefaultbin)
 		NullDatum,                                             // typacl (NULL)
 	}
 }

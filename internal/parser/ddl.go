@@ -5196,26 +5196,15 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 				stmt.NotNull = false
 				continue
 			case KwDefault:
-				// Skip DEFAULT expression (consume until NOT/NULL/CHECK/CONSTRAINT/COLLATE/';')
+				// DEFAULT expr — parse the expression so it round-trips through
+				// pg_dump (typdefaultbin → pg_get_expr). parseExpr stops at the
+				// next NOT/NULL/CHECK/CONSTRAINT/COLLATE keyword or ';'. DU-002 slice 92.
 				p.advance()
-				for p.cur().Kind != TokenEOF {
-					if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
-						break
-					}
-					if p.cur().Kind == TokenKeyword {
-						kw := p.cur().Keyword
-						if kw == KwNot || kw == KwNull || kw == KwCheck || kw == KwConstraint {
-							break
-						}
-					}
-					if p.cur().Kind == TokenIdent {
-						v := strings.ToLower(p.cur().Value)
-						if v == "collate" {
-							break
-						}
-					}
-					p.advance()
+				expr, err := p.parseExpr()
+				if err != nil {
+					return nil, err
 				}
+				stmt.Default = expr
 				continue
 			case KwConstraint:
 				// CONSTRAINT name CHECK (…) — skip constraint name.

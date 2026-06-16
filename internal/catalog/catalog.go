@@ -824,7 +824,20 @@ type Domain struct {
 	OID           uint32
 	Base          Type // resolved base type
 	NotNull       bool
-	CheckInValues []string // allowed values from CHECK (VALUE IN ...), M0097-domain-check
+	CheckInValues []string     // allowed values from CHECK (VALUE IN ...), M0097-domain-check
+	Default       parser.Expr  // DEFAULT expression AST, nil when no DEFAULT. DU-002 slice 92.
+}
+
+// DefaultBin renders the domain's DEFAULT expression in the pre-formatted
+// pg_node_tree form goopg stores in pg_type.typdefaultbin (the same encoding
+// used for pg_attrdef.adbin). pg_dump reads it back via pg_get_expr, which is a
+// pass-through in goopg, so this string is what `CREATE DOMAIN ... DEFAULT <x>`
+// re-emits. Returns "" when the domain has no default. DU-002 slice 92.
+func (d *Domain) DefaultBin() string {
+	if d == nil || d.Default == nil {
+		return ""
+	}
+	return formatExprForAttrdef(d.Default)
 }
 
 // CompositeField describes one field in a user-defined composite type.

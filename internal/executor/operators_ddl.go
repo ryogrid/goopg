@@ -8660,6 +8660,9 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	// Record the DEFAULT expression so buildUserPGTypeRowForDomain can emit
+	// typdefaultbin and pg_dump re-renders `DEFAULT <expr>`. DU-002 slice 92.
+	d.Default = s.Default
 	// Write a pg_type heap row (typtype='d') so pg_dump's getTypes discovers the
 	// domain and a column of the domain type round-trips as its declared type.
 	// DU-002 slice 90.
