@@ -623,7 +623,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"nm name, nms name[], "+
 		"tt timetz, tts timetz[], "+
 		"jp jsonpath, jps jsonpath[], "+
-		"rfc refcursor, rfcs refcursor[])"); err != nil {
+		"rfc refcursor, rfcs refcursor[], "+
+		"acl aclitem, acls aclitem[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -1145,6 +1146,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// as "refcursor"/"refcursor[]".
 			"rfc refcursor",
 			"rfcs refcursor[]",
+			// Slice 86: aclitem (access-control-list item) + its array _aclitem.
+			// aclitem is used internally for catalog *acl columns (relacl, etc.)
+			// but had no codec name→OID entry, so a declared `aclitem` column fell
+			// back to text (25), and neither display fn rendered 1033/1034 — so the
+			// scalar/array round-tripped as text. Now both survive as
+			// "aclitem"/"aclitem[]".
+			"acl aclitem",
+			"acls aclitem[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

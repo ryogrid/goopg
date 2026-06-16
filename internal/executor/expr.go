@@ -195,6 +195,9 @@ func oidToBuiltinTypeName(oid uint32) string {
 	case 1790:
 		// refcursor: cursor-name reference, varlena, bare name. DU-002 slice 85.
 		return "refcursor"
+	case 1033:
+		// aclitem: access-control-list item, fixed-length, bare name. DU-002 slice 86.
+		return "aclitem"
 	// Array types
 	case 1000:
 		return "boolean[]"
@@ -313,6 +316,9 @@ func oidToBuiltinTypeName(oid uint32) string {
 	case 2201:
 		// _refcursor: refcursor has no typmod, bare element name + []. Slice 85.
 		return "refcursor[]"
+	case 1034:
+		// _aclitem: aclitem has no typmod, bare element name + []. Slice 86.
+		return "aclitem[]"
 	default:
 		return ""
 	}
@@ -10843,6 +10849,12 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 2201:
 		// _refcursor: refcursor has no typmod, so the array is the bare name. Slice 85.
 		return "refcursor[]"
+	case 1033:
+		// aclitem: access-control-list item, no typmod, bare name. Slice 86.
+		return "aclitem"
+	case 1034:
+		// _aclitem: aclitem has no typmod, so the array is the bare name. Slice 86.
+		return "aclitem[]"
 	default:
 		return "???"
 	}

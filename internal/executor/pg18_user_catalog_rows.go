@@ -233,6 +233,8 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 	case catalog.OIDInt2vector, // 22
 		catalog.OIDOidvector: // 30
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
+	case catalog.OIDAclitem: // 1033 aclitem -- pg_type.dat: typlen 16, typbyval f, typalign 'd', typstorage 'p'
+		return userTypeAttrs{TypLen: 16, TypByVal: false, TypAlign: 'd', TypStorage: 'p'}
 	case catalog.OIDArrayBool: // 1000 _bool -- pg_type.dat: typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBytea: // 1001 _bytea -- element bytea typalign 'i', typstorage 'x'
@@ -348,6 +350,8 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayName: // 1003 _name -- element name typcollation 'C'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x', TypCollation: cCollationOID}
+	case catalog.OIDArrayAclitem: // 1034 _aclitem -- pg_type.dat: typalign 'd', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 }

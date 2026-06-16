@@ -171,6 +171,12 @@ const (
 	// bare char to ct.Name="char", so disambiguating the two needs a parser
 	// change, not just a codec entry.)
 	OIDName uint32 = 19
+	// DU-002 slice 86: aclitem (the access-control-list item type, used
+	// internally for catalog *acl columns like pg_class.relacl). Declarable as a
+	// column type; format_type renders the bare name "aclitem". Seeded in pg_type
+	// (initdb/pg_type_seed_data.go) so a PG standby can resolve the OID. It carries
+	// no typmod (typlen 16, typbyval f, typalign 'd', typstorage 'p').
+	OIDAclitem uint32 = 1033
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -279,6 +285,9 @@ const (
 	// DU-002 slice 82: the name array type (_name 1003). No typmod, so
 	// format_type renders the bare element name with a [] suffix ("name[]").
 	OIDArrayName uint32 = 1003
+	// DU-002 slice 86: the aclitem array type (_aclitem 1034). No typmod, so
+	// format_type renders the bare element name with a [] suffix ("aclitem[]").
+	OIDArrayAclitem uint32 = 1034
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -409,6 +418,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayInt2vector
 	case OIDOidvector:
 		return OIDArrayOidvector
+	case OIDAclitem:
+		return OIDArrayAclitem
 	}
 	return 0
 }
@@ -541,6 +552,8 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDInt2vector, true
 	case OIDArrayOidvector:
 		return OIDOidvector, true
+	case OIDArrayAclitem:
+		return OIDAclitem, true
 	}
 	return 0, false
 }
@@ -1439,6 +1452,8 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDOidvector
 	case "name":
 		return OIDName
+	case "aclitem":
+		return OIDAclitem
 	default:
 		return OIDText // safe fallback
 	}
@@ -1573,6 +1588,8 @@ func OIDToTypeName(oid uint32) string {
 		return "oidvector"
 	case OIDName:
 		return "name"
+	case OIDAclitem:
+		return "aclitem"
 	default:
 		return "text"
 	}

@@ -223,6 +223,9 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 		// DU-002 slice 85: refcursor (cursor-name reference) round-trips its
 		// canonical name instead of falling back to text.
 		{"refcursor", OIDRefcursor},
+		// DU-002 slice 86: aclitem (access-control-list item) round-trips its
+		// canonical name instead of falling back to text.
+		{"aclitem", OIDAclitem},
 	}
 	for _, p := range pairs {
 		gotOID := TypeNameToOID(p.name)
@@ -281,6 +284,18 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 	}
 	if OIDRefcursor != 1790 || OIDArrayRefcursor != 2201 {
 		t.Errorf("refcursor OIDs drifted: OIDRefcursor=%d (want 1790), OIDArrayRefcursor=%d (want 2201)", OIDRefcursor, OIDArrayRefcursor)
+	}
+
+	// DU-002 slice 86: aclitem ↔ _aclitem array OID mapping round-trips, so an
+	// `aclitem[]` column resolves to _aclitem (1034) and reconstructs from it.
+	if got := ArrayOIDForBase(OIDAclitem); got != OIDArrayAclitem {
+		t.Errorf("ArrayOIDForBase(OIDAclitem) = %d, want %d (_aclitem)", got, OIDArrayAclitem)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayAclitem); !ok || got != OIDAclitem {
+		t.Errorf("BaseOIDForArray(OIDArrayAclitem) = (%d,%v), want (%d,true)", got, ok, OIDAclitem)
+	}
+	if OIDAclitem != 1033 || OIDArrayAclitem != 1034 {
+		t.Errorf("aclitem OIDs drifted: OIDAclitem=%d (want 1033), OIDArrayAclitem=%d (want 1034)", OIDAclitem, OIDArrayAclitem)
 	}
 }
 

@@ -501,6 +501,10 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// Slice 85: refcursor (_refcursor 2201). refcursor is varlena with no
 		// typmod, so the array renders as the bare element name + [].
 		{"refcursor", nil, 2201, "refcursor[]"},
+		// Slice 86: aclitem (_aclitem 1034). aclitem carries no typmod, so the
+		// array renders as the bare element name + []. aclitem is the 16-byte
+		// access-control-list item type used internally for catalog *acl columns.
+		{"aclitem", nil, 1034, "aclitem[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

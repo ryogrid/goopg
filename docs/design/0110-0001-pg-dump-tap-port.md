@@ -1857,6 +1857,30 @@ fixed one logical group per loop:
     `{"refcursor", nil, 2201, "refcursor[]"}` row in
     `executor.TestUserPGAttributeArrayColumn`, and a new `refcursor`/`_refcursor`
     round-trip block in `catalog.TestTypeNameToOIDRoundTrip`.
+  - **Slice 86 — the `aclitem` type (+ its array `_aclitem`)
+    (`internal/catalog/codec.go`, `internal/executor/expr.go`,
+    `internal/executor/pg18_user_catalog_rows.go`).** `aclitem` (1033) is the
+    16-byte access-control-list item type used internally for catalog `*acl`
+    columns (`pg_class.relacl`, `pg_database.datacl`, …) but is also a declarable
+    column type; `format_type` renders the bare `aclitem`. Like slice 85's
+    `refcursor`, the type had **no codec name→OID entry**, so a declared
+    `aclitem` column resolved to `text` (25) and round-tripped as text; neither
+    display function rendered 1033/1034 (the array name `aclitem[]`/`_aclitem`
+    was only handled in the empty-array encode path and initdb's own resolver,
+    not in the user-table DDL path). Both 1033/1034 were already seeded in
+    `pg_type_seed_data.go` (typlen 16, typbyval f, typalign `'d'`, typstorage
+    `'p'`; verified against upstream `pg_type.dat`). This slice adds
+    `OIDAclitem`/`OIDArrayAclitem` consts plus the `aclitem`↔`_aclitem` cases in
+    `TypeNameToOID` / `OIDToTypeName` / `ArrayOIDForBase` / `BaseOIDForArray`; the
+    scalar 1033 and array 1034 cases in **both** `formatTypeOID`
+    (→ `aclitem`/`aclitem[]`) and `oidToBuiltinTypeName` (sibling display paths
+    kept in sync); and `userTypeAttrsForOID` cases for the scalar
+    (`{16, byval=f, align='d', storage='p'}`) and the array
+    (`{-1, byval=f, align='d', storage='x'}`). Guarded by the `arr` fixture's
+    `acl aclitem` / `acls aclitem[]` columns in `TestPort_PgDumpConnectionSetup`,
+    a new `{"aclitem", nil, 1034, "aclitem[]"}` row in
+    `executor.TestUserPGAttributeArrayColumn`, and a new `aclitem`/`_aclitem`
+    round-trip block in `catalog.TestTypeNameToOIDRoundTrip`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
