@@ -1596,7 +1596,9 @@ type AlterTableAction struct {
 	// Foreign-key extras (only populated for AddForeignKey).
 	RefTable   ObjectName
 	RefColumns []string
-	Deferrable bool // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
+	Deferrable bool     // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
+	OnDelete   FKAction // referential action for ON DELETE (default NO ACTION)
+	OnUpdate   FKAction // referential action for ON UPDATE (default NO ACTION)
 
 	// AttachPartitionOf is populated for AlterTableAttachPartition.
 	// It holds the child table name and partition bounds. M0096-0007.

@@ -306,6 +306,20 @@ package testport
 // as `ADD CONSTRAINT foo_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES
 // public.foo(id)`; UNIQUE (code) → `foo_code_key UNIQUE (code)` guards the
 // already-working index-backed path.
+// Slice 52 restored FK referential actions (ON DELETE / ON UPDATE) in the dump.
+// The inline column-FK path already parsed and stored the action, but the
+// ALTER TABLE ADD FOREIGN KEY path silently dropped it: the parser never
+// consumed the `ON DELETE/UPDATE` clause (so the syntax would in fact error
+// before a comma/EOS), the AlterTableAction AST had no OnDelete/OnUpdate field,
+// and the executor never set catalog.ForeignKey.OnDelete/OnUpdate. Fix: (1) the
+// ALTER parser now parses the action clauses ahead of the [NOT] DEFERRABLE
+// trailer, reusing parseFKAction (mirroring the inline column path); (2)
+// AlterTableAction gained OnDelete/OnUpdate fields; (3) the executor's
+// AlterTableAddForeignKey branch copies them into the catalog FK. The fixture's
+// inline self-FK now carries `ON DELETE CASCADE`, and an ALTER-added
+// `foo_mgr_fkey` carries `ON UPDATE CASCADE ON DELETE SET NULL`; both round-trip
+// byte-identically (pg_get_constraintdef emits ON UPDATE before ON DELETE,
+// mirroring ruleutils.c, and omits the default NO ACTION).
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
@@ -338,9 +352,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 
 	if err := runSQLSimple(t, c, "CREATE TABLE public.foo (id integer PRIMARY KEY, name text, "+
 		"amount numeric(10,2), code character varying(8), qty integer DEFAULT 0 CHECK (qty >= 0), "+
-		"parent_id integer REFERENCES public.foo(id), "+
+		"parent_id integer REFERENCES public.foo(id) ON DELETE CASCADE, "+
+		"mgr_id integer, "+
 		"UNIQUE (code))"); err != nil {
 		t.Fatalf("create table: %v", err)
+	}
+
+	// Slice 52: the ALTER TABLE ADD FOREIGN KEY path must capture the ON
+	// UPDATE/ON DELETE referential actions, just like the inline column path.
+	// A non-default action here exercises the parser+executor fix end-to-end.
+	if err := runSQLSimple(t, c, "ALTER TABLE public.foo ADD CONSTRAINT foo_mgr_fkey "+
+		"FOREIGN KEY (mgr_id) REFERENCES public.foo (id) ON UPDATE CASCADE ON DELETE SET NULL"); err != nil {
+		t.Fatalf("alter table add fk: %v", err)
 	}
 
 	res, err := util.RunCommand(util.CommandSpec{
@@ -456,11 +479,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// gets a name+OID at DDL time, surfaces as a contype='f' pg_constraint
 		// row, and pg_get_constraintdef renders the schema-qualified definition.
 		// (UNIQUE already worked via the index-backed constraint path.)
+		// **Slice 52 closed (asserted):** FK referential actions (ON DELETE/ON
+		// UPDATE) must survive the dump. The inline column path already parsed
+		// and stored the action; the ALTER TABLE ADD FOREIGN KEY path silently
+		// dropped it (the parser never consumed the ON DELETE/UPDATE clause, the
+		// AST had no field, and the executor never set OnDelete/OnUpdate). Now
+		// both paths carry the action into pg_constraint, and
+		// pg_get_constraintdef renders ` ON UPDATE …`/` ON DELETE …` (ON UPDATE
+		// before ON DELETE, mirroring ruleutils.c). The inline self-FK carries
+		// ON DELETE CASCADE; the ALTER-added foo_mgr_fkey carries ON UPDATE
+		// CASCADE ON DELETE SET NULL — both round-trip byte-identically.
 		check := []string{
 			"ADD CONSTRAINT foo_pkey PRIMARY KEY (id)",
 			"CONSTRAINT foo_qty_check CHECK ((qty >= 0))",
 			"ADD CONSTRAINT foo_code_key UNIQUE (code)",
-			"ADD CONSTRAINT foo_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.foo(id)",
+			"ADD CONSTRAINT foo_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES public.foo(id) ON DELETE CASCADE",
+			"ADD CONSTRAINT foo_mgr_fkey FOREIGN KEY (mgr_id) REFERENCES public.foo(id) ON UPDATE CASCADE ON DELETE SET NULL",
 		}
 		for _, sub := range check {
 			if !strings.Contains(res.Stdout, sub) {

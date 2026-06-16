@@ -88,3 +88,49 @@ func TestForeignKeySurfacesInPgConstraint(t *testing.T) {
 		t.Errorf("buildForeignKeyDefString = %q, want %q", got, want)
 	}
 }
+
+// TestAlterTableAddForeignKeyCapturesActions verifies that the ALTER TABLE ADD
+// FOREIGN KEY path captures the ON DELETE / ON UPDATE referential actions
+// (previously dropped at the parser, AST, and executor), so they reach
+// pg_constraint and pg_get_constraintdef renders the ` ON UPDATE …`/` ON DELETE …`
+// clauses (ON UPDATE before ON DELETE, mirroring ruleutils.c). DU-002 slice 52.
+func TestAlterTableAddForeignKeyCapturesActions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE parent (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE parent: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE child (cid integer PRIMARY KEY, pid integer)`); err != nil {
+		t.Fatalf("CREATE TABLE child: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE child ADD CONSTRAINT child_pid_fkey `+
+		`FOREIGN KEY (pid) REFERENCES parent (id) ON UPDATE CASCADE ON DELETE SET NULL`); err != nil {
+		t.Fatalf("ALTER TABLE child ADD FK: %v", err)
+	}
+
+	childTbl, ok := cat.LookupTable(parser.ObjectName{Name: "child"})
+	if !ok {
+		t.Fatal("child table not found")
+	}
+	if len(childTbl.ForeignKeys) != 1 {
+		t.Fatalf("expected 1 FK, got %d", len(childTbl.ForeignKeys))
+	}
+	fk := childTbl.ForeignKeys[0]
+	if fk.OnUpdate != parser.FKActionCascade {
+		t.Errorf("OnUpdate = %v, want CASCADE", fk.OnUpdate)
+	}
+	if fk.OnDelete != parser.FKActionSetNull {
+		t.Errorf("OnDelete = %v, want SET NULL", fk.OnDelete)
+	}
+
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+	got := buildForeignKeyDefString(im, fk)
+	want := "FOREIGN KEY (pid) REFERENCES public.parent(id) ON UPDATE CASCADE ON DELETE SET NULL"
+	if got != want {
+		t.Errorf("buildForeignKeyDefString = %q, want %q", got, want)
+	}
+}

@@ -1117,6 +1117,26 @@ fixed one logical group per loop:
     `ADD CONSTRAINT foo_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES
     public.foo(id)`. Guards: the integration fixture plus the unit test
     `executor.TestForeignKeySurfacesInPgConstraint`.
+  - **Slice 52 — FK referential actions (`ON DELETE`/`ON UPDATE`) via
+    `ALTER TABLE` (`internal/parser/ast.go`, `internal/parser/ddl.go`,
+    `internal/executor/operators_ddl.go`).** Slice 51 wired actions through the
+    inline column-FK path, but the `ALTER TABLE … ADD FOREIGN KEY` path dropped
+    them at three layers: the parser never consumed the `ON DELETE`/`ON UPDATE`
+    clause (so the syntax in fact errored before the comma/end-of-statement), the
+    `AlterTableAction` AST had no `OnDelete`/`OnUpdate` field, and the executor's
+    `AlterTableAddForeignKey` branch never set `catalog.ForeignKey.OnDelete/
+    OnUpdate`. Fix: (1) the ALTER parser now parses the action clauses ahead of
+    the `[NOT] DEFERRABLE` trailer, reusing `parseFKAction` exactly as the inline
+    column path does; (2) `AlterTableAction` gained `OnDelete`/`OnUpdate` fields;
+    (3) the executor copies them into the catalog FK. With the catalog carrying
+    the action, `pg_constraint.confupdtype`/`confdeltype` (via `fkActionChar`) and
+    `pg_get_constraintdef` (via `fkActionClause`, already added in slice 51) emit
+    the clauses. The fixture's inline self-FK now carries `ON DELETE CASCADE`, and
+    an ALTER-added `foo_mgr_fkey` carries `ON UPDATE CASCADE ON DELETE SET NULL`;
+    both round-trip byte-identically (pg_get_constraintdef emits `ON UPDATE`
+    before `ON DELETE`, mirroring ruleutils.c, and omits the default NO ACTION).
+    Guards: the integration fixture plus the unit test
+    `executor.TestAlterTableAddForeignKeyCapturesActions`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1129,9 +1149,12 @@ character varying(8)` round-trip; slice 49 further asserts the PRIMARY KEY
 dump; slice 50 asserts the PK column's implicit `NOT NULL` (`id integer NOT
 NULL`) survives the dump; slice 51 asserts a `FOREIGN KEY` constraint and a
 `UNIQUE` constraint both round-trip (`foo_parent_id_fkey FOREIGN KEY (parent_id)
-REFERENCES public.foo(id)`, `foo_code_key UNIQUE (code)`). Unit guards:
+REFERENCES public.foo(id)`, `foo_code_key UNIQUE (code)`); slice 52 asserts FK
+referential actions survive — the inline self-FK's `ON DELETE CASCADE` and the
+ALTER-added `foo_mgr_fkey`'s `ON UPDATE CASCADE ON DELETE SET NULL`. Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
+`executor.TestAlterTableAddForeignKeyCapturesActions`,
 `config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`.
 

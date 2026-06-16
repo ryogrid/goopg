@@ -3363,6 +3363,8 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				Columns:    append([]string(nil), act.Columns...),
 				RefTable:   act.RefTable.Name,
 				RefColumns: append([]string(nil), act.RefColumns...),
+				OnDelete:   act.OnDelete,
+				OnUpdate:   act.OnUpdate,
 				Deferrable: act.Deferrable,
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)

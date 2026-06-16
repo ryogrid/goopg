@@ -4665,6 +4665,22 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				return AlterTableAction{}, p.errAtCur("expected ')'")
 			}
 		}
+		// Optional ON DELETE / ON UPDATE referential-action clauses, mirroring
+		// the inline column-FK path so actions survive into pg_constraint and
+		// pg_dump (DU-002 slice 52). ON is KwOn (reserved).
+		var onDelete, onUpdate FKAction
+		for p.acceptKeyword(KwOn) {
+			isDelete := p.acceptKeyword(KwDelete)
+			if !isDelete {
+				_ = p.acceptKeyword(KwUpdate)
+			}
+			action := parseFKAction(p)
+			if isDelete {
+				onDelete = action
+			} else {
+				onUpdate = action
+			}
+		}
 		// Optional [NOT] DEFERRABLE trailer.
 		deferrable := false
 		if p.acceptKeyword(KwNot) {
@@ -4680,6 +4696,8 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act.RefTable = refTable
 		act.RefColumns = refCols
 		act.Deferrable = deferrable
+		act.OnDelete = onDelete
+		act.OnUpdate = onUpdate
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 		// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
