@@ -284,6 +284,12 @@ type Table struct {
 	// Unlogged / Temp track relpersistence. 'u' for UNLOGGED, 't' for TEMP, 'p' for permanent.
 	Unlogged bool
 	Temp     bool
+
+	// Fillfactor stores the table's `WITH (fillfactor=N)` storage parameter
+	// (10–100). Zero means unset (PG's default 100 / no reloptions). pg_class's
+	// reloptions cell surfaces this as the text[] element `fillfactor=N`, which
+	// pg_dump renders back as `WITH (fillfactor='N')`. M0110-0001 (DU-002 slice 54).
+	Fillfactor int
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -1833,6 +1839,15 @@ func (c *InMemory) registerSystemTables() {
 					relchecks++
 				}
 			}
+			// reloptions surfaces the table's storage parameters as a text[]
+			// array literal (`{fillfactor=70}`). Empty → "" → planner maps it to
+			// SQL NULL (DU-002 slice 47), so a plain table emits no WITH clause;
+			// a non-empty one round-trips through pg_dump as `WITH
+			// (fillfactor='70')`. M0110-0001 (DU-002 slice 54).
+			reloptions := ""
+			if t.Fillfactor != 0 {
+				reloptions = "{fillfactor=" + strconv.Itoa(t.Fillfactor) + "}"
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // 0:  oid
 				t.Name,                       // 1:  relname
@@ -1871,7 +1886,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",         // 29: relfrozenxid
 				"1",         // 30: relminmxid
 				"",          // 31: relacl (NULL)
-				"",          // 32: reloptions (NULL)
+				reloptions,  // 32: reloptions ({fillfactor=N} or NULL)
 				partBound,   // 33: relpartbound
 			})
 		}

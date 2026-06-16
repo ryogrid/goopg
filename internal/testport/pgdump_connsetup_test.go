@@ -379,6 +379,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table baz: %v", err)
 	}
 
+	// Slice 54: a non-empty reloptions (`WITH (fillfactor=70)`) must surface in
+	// the dump. Slice 47 made an EMPTY reloptions read as SQL NULL (no WITH
+	// clause); the complementary case — an actually-set storage parameter — was
+	// silently dropped because goopg parsed+validated fillfactor but never
+	// persisted it on the catalog table, so pg_class.reloptions stayed NULL.
+	// `opt` carries it on its own table so the slice-47 "foo has no options"
+	// guard is unaffected.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.opt (id integer PRIMARY KEY) WITH (fillfactor=70)"); err != nil {
+		t.Fatalf("create table opt: %v", err)
+	}
+
+	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
+	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
+	// dumpable non-public namespace and qualifies the contained objects; this
+	// already worked, so it stands as a regression guard for the emit path.
+	if err := runSQLSimple(t, c, "CREATE SCHEMA s"); err != nil {
+		t.Fatalf("create schema s: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE s.widget (id integer PRIMARY KEY, label text)"); err != nil {
+		t.Fatalf("create table s.widget: %v", err)
+	}
+
 	res, err := util.RunCommand(util.CommandSpec{
 		Name:    bin,
 		Args:    []string{"--no-sync", "postgres"},
@@ -473,8 +495,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// NULL (PG's convention for a table with no options / default ACL)
 		// and no WITH clause is emitted. Assert the table dumps with no
 		// reloptions clause — this is the regression guard for the fix.
-		if strings.Contains(res.Stdout, "WITH (") {
-			t.Errorf("pg_dump emitted a spurious reloptions WITH clause for a table with no options\n  full stdout=%q", res.Stdout)
+		// The slice-47 bug surfaced an empty-string array element as `WITH
+		// (""='')`; guard that exact signature (a legitimate `WITH
+		// (fillfactor='70')` from slice 54's `opt` table is expected elsewhere).
+		if strings.Contains(res.Stdout, `WITH (""`) {
+			t.Errorf("pg_dump emitted a spurious empty-element reloptions WITH clause for a table with no options\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 54 closed (asserted):** a non-empty reloptions must survive the
+		// dump. goopg parsed and validated `WITH (fillfactor=70)` but never stored
+		// it on the catalog table, so pg_class.reloptions read NULL and the option
+		// vanished. catalog.Table.Fillfactor now persists it and the pg_class
+		// virtual view emits the `{fillfactor=70}` text[] cell, which pg_dump
+		// renders back as `WITH (fillfactor='70')`. Assert the round-trip.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.opt (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.opt\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (fillfactor='70')") {
+			t.Errorf("pg_dump dropped a non-empty reloptions; missing %q\n  full stdout=%q", "WITH (fillfactor='70')", res.Stdout)
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on
@@ -519,6 +556,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// round-trip byte-identically.
 			"ADD CONSTRAINT bar_pkey PRIMARY KEY (a, b)",
 			"ADD CONSTRAINT baz_x_fkey FOREIGN KEY (x, y) REFERENCES public.bar(a, b) ON DELETE CASCADE",
+			// **Slice 54:** a user-defined schema and a table inside it must
+			// round-trip. pg_dump emits `CREATE SCHEMA s;` for every dumpable
+			// non-public namespace and fully qualifies the contained objects.
+			"CREATE SCHEMA s;",
+			"CREATE TABLE s.widget (",
+			"ADD CONSTRAINT widget_pkey PRIMARY KEY (id)",
 		}
 		for _, sub := range check {
 			if !strings.Contains(res.Stdout, sub) {

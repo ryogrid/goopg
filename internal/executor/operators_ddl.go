@@ -946,6 +946,23 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Message: fmt.Sprintf("unrecognized parameter %q", k)}
 		}
 	}
+	// Extract and bounds-check the fillfactor storage parameter so it can be
+	// persisted on the catalog table (and surfaced through pg_class.reloptions
+	// for pg_dump). PG rejects values outside 10–100. M0110-0001 (DU-002 slice 54).
+	fillfactor := 0
+	if v, ok := s.With["fillfactor"]; ok {
+		ff, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"fillfactor\": %s", v)}
+		}
+		if ff < 10 || ff > 100 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", ff),
+				Detail:  "Valid values are between \"10\" and \"100\"."}
+		}
+		fillfactor = ff
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -979,6 +996,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	tbl.Unlogged = s.Unlogged
 	tbl.Temp = s.Temporary
+	tbl.Fillfactor = fillfactor
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

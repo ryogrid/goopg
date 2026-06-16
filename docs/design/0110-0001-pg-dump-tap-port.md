@@ -1162,6 +1162,32 @@ fixed one logical group per loop:
     `executor.TestCreateTableTableLevelCompositeForeignKey` (covers the anonymous
     and named forms, multi-column `conkey`/`confkey`, and the composite deparse).
 
+  - **Slice 54 — non-empty reloptions (`WITH (fillfactor=N)`) + a user schema
+    guard (`internal/catalog/catalog.go`,
+    `internal/executor/operators_ddl.go`).** Slice 47 made an *empty* reloptions
+    read as SQL NULL (no `WITH` clause). The complementary case — an
+    actually-set storage parameter — was silently dropped: goopg parsed and
+    bounds-validated `WITH (fillfactor=N)` into `CreateTableStmt.With` but never
+    persisted it on the catalog table, so the `pg_class` virtual view always
+    emitted `""` (NULL) for `reloptions` and pg_dump produced a bare `CREATE
+    TABLE`. Fix: (1) a new `catalog.Table.Fillfactor` field; (2) the executor's
+    CREATE TABLE path extracts `s.With["fillfactor"]`, bounds-checks it (PG's
+    `22023` for values outside 10–100, mirroring the existing CREATE INDEX
+    check), and assigns it to the new field; (3) the `pg_class` virtual view's
+    `reloptions` cell (index 32) emits the text[] literal `{fillfactor=N}` when
+    set — `""` (→ NULL via `TypedVirtualCell`, slice 47) otherwise. pg_dump's
+    `getTables` reads the array through `array_remove(…)`, `nonemptyReloptions`
+    sees one element, and the dump renders `WITH (fillfactor='70')`. The fixture
+    carries fillfactor on a dedicated `public.opt` table so the slice-47 "foo has
+    no options" guard is unaffected (that guard is tightened to the exact
+    empty-element bug signature `WITH ("` so a legitimate fillfactor `WITH`
+    clause does not trip it). The same slice adds a cross-namespace regression
+    guard: a user-defined `CREATE SCHEMA s` plus `s.widget` round-trip
+    byte-identically (already worked; now guarded). Unit guard:
+    `executor.TestFillfactorSurfacesInPgClassReloptions` (the persisted field +
+    `{fillfactor=70}` cell vs `""` for a plain table) and
+    `executor.TestFillfactorOutOfBoundsRejected` (the 22023 bounds check).
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
@@ -1178,11 +1204,15 @@ referential actions survive — the inline self-FK's `ON DELETE CASCADE` and the
 ALTER-added `foo_mgr_fkey`'s `ON UPDATE CASCADE ON DELETE SET NULL`; slice 53
 asserts a table-level composite PK and FK survive — `bar_pkey PRIMARY KEY (a, b)`
 and `baz_x_fkey FOREIGN KEY (x, y) REFERENCES public.bar(a, b) ON DELETE
-CASCADE`. Unit guards:
+CASCADE`; slice 54 asserts a non-empty reloptions survives — `CREATE TABLE
+public.opt (…) WITH (fillfactor='70')` — plus a `CREATE SCHEMA s` + `s.widget`
+cross-namespace round-trip. Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
 `executor.TestAlterTableAddForeignKeyCapturesActions`,
 `executor.TestCreateTableTableLevelCompositeForeignKey`,
+`executor.TestFillfactorSurfacesInPgClassReloptions`,
+`executor.TestFillfactorOutOfBoundsRejected`,
 `config.TestPgDumpConnectionSetupGUCs`,
 `parser.TestParseSetTransactionCommaSeparated`.
 
