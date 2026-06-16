@@ -467,6 +467,19 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		{"tid", nil, 1010, "tid[]"},
 		{"xid", nil, 1011, "xid[]"},
 		{"cid", nil, 1012, "cid[]"},
+		// Slice 80: the OID-reference ("reg*") family. None carry a typmod, so
+		// each array renders as the bare element name with the [] suffix.
+		{"regproc", nil, 1008, "regproc[]"},
+		{"regprocedure", nil, 2207, "regprocedure[]"},
+		{"regoper", nil, 2208, "regoper[]"},
+		{"regoperator", nil, 2209, "regoperator[]"},
+		{"regclass", nil, 2210, "regclass[]"},
+		{"regtype", nil, 2211, "regtype[]"},
+		{"regconfig", nil, 3735, "regconfig[]"},
+		{"regdictionary", nil, 3770, "regdictionary[]"},
+		{"regnamespace", nil, 4090, "regnamespace[]"},
+		{"regrole", nil, 4097, "regrole[]"},
+		{"regcollation", nil, 4192, "regcollation[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}
@@ -530,6 +543,19 @@ func TestUserPGAttributeTypmod(t *testing.T) {
 		{"tid", nil, -1, "tid"},
 		{"xid", nil, -1, "xid"},
 		{"cid", nil, -1, "cid"},
+		// Slice 80: the OID-reference ("reg*") family carries no typmod either, so
+		// atttypmod stays -1 and each scalar renders as its bare name.
+		{"regproc", nil, -1, "regproc"},
+		{"regprocedure", nil, -1, "regprocedure"},
+		{"regoper", nil, -1, "regoper"},
+		{"regoperator", nil, -1, "regoperator"},
+		{"regclass", nil, -1, "regclass"},
+		{"regtype", nil, -1, "regtype"},
+		{"regconfig", nil, -1, "regconfig"},
+		{"regdictionary", nil, -1, "regdictionary"},
+		{"regnamespace", nil, -1, "regnamespace"},
+		{"regrole", nil, -1, "regrole"},
+		{"regcollation", nil, -1, "regcollation"},
 		{"int4", []int64{}, -1, "integer"}, // typmod ignored for plain types
 	}
 	for _, tc := range cases {

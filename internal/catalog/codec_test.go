@@ -193,6 +193,20 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 		{"varchar", OIDVarChar},
 		{"numeric", OIDNumeric},
 		{"uuid", OIDUUID},
+		// DU-002 slice 80: the OID-reference ("reg*") family round-trips its
+		// canonical name. Also guards against name collisions with the existing
+		// scalar names above (e.g. "regproc" must not resolve to text).
+		{"regproc", OIDRegproc},
+		{"regprocedure", OIDRegprocedure},
+		{"regoper", OIDRegoper},
+		{"regoperator", OIDRegoperator},
+		{"regclass", OIDRegclass},
+		{"regtype", OIDRegtype},
+		{"regconfig", OIDRegconfig},
+		{"regdictionary", OIDRegdictionary},
+		{"regnamespace", OIDRegnamespace},
+		{"regrole", OIDRegrole},
+		{"regcollation", OIDRegcollation},
 	}
 	for _, p := range pairs {
 		gotOID := TypeNameToOID(p.name)

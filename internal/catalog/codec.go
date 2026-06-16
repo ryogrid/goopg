@@ -132,6 +132,22 @@ const (
 	OIDTid uint32 = 27
 	OIDXid uint32 = 28
 	OIDCid uint32 = 29
+	// DU-002 slice 80: the OID-reference ("reg*") family. Each is a 4-byte
+	// by-value alias for oid whose I/O function resolves the referenced object's
+	// name; declared as a column type they round-trip like oid. All are seeded in
+	// pg_type (see initdb/pg_type_seed_data.go) so a PG standby can resolve the
+	// OIDs. None carry a typmod, so format_type renders the bare type name.
+	OIDRegproc       uint32 = 24
+	OIDRegprocedure  uint32 = 2202
+	OIDRegoper       uint32 = 2203
+	OIDRegoperator   uint32 = 2204
+	OIDRegclass      uint32 = 2205
+	OIDRegtype       uint32 = 2206
+	OIDRegconfig     uint32 = 3734
+	OIDRegdictionary uint32 = 3769
+	OIDRegnamespace  uint32 = 4089
+	OIDRegrole       uint32 = 4096
+	OIDRegcollation  uint32 = 4191
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -212,6 +228,19 @@ const (
 	OIDArrayTid uint32 = 1010
 	OIDArrayXid uint32 = 1011
 	OIDArrayCid uint32 = 1012
+	// DU-002 slice 80: the OID-reference ("reg*") array types. None carry a
+	// typmod, so format_type renders the bare element name with a [] suffix.
+	OIDArrayRegproc       uint32 = 1008
+	OIDArrayRegprocedure  uint32 = 2207
+	OIDArrayRegoper       uint32 = 2208
+	OIDArrayRegoperator   uint32 = 2209
+	OIDArrayRegclass      uint32 = 2210
+	OIDArrayRegtype       uint32 = 2211
+	OIDArrayRegconfig     uint32 = 3735
+	OIDArrayRegdictionary uint32 = 3770
+	OIDArrayRegnamespace  uint32 = 4090
+	OIDArrayRegrole       uint32 = 4097
+	OIDArrayRegcollation  uint32 = 4192
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -308,6 +337,28 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayXid
 	case OIDCid:
 		return OIDArrayCid
+	case OIDRegproc:
+		return OIDArrayRegproc
+	case OIDRegprocedure:
+		return OIDArrayRegprocedure
+	case OIDRegoper:
+		return OIDArrayRegoper
+	case OIDRegoperator:
+		return OIDArrayRegoperator
+	case OIDRegclass:
+		return OIDArrayRegclass
+	case OIDRegtype:
+		return OIDArrayRegtype
+	case OIDRegconfig:
+		return OIDArrayRegconfig
+	case OIDRegdictionary:
+		return OIDArrayRegdictionary
+	case OIDRegnamespace:
+		return OIDArrayRegnamespace
+	case OIDRegrole:
+		return OIDArrayRegrole
+	case OIDRegcollation:
+		return OIDArrayRegcollation
 	}
 	return 0
 }
@@ -406,6 +457,28 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDXid, true
 	case OIDArrayCid:
 		return OIDCid, true
+	case OIDArrayRegproc:
+		return OIDRegproc, true
+	case OIDArrayRegprocedure:
+		return OIDRegprocedure, true
+	case OIDArrayRegoper:
+		return OIDRegoper, true
+	case OIDArrayRegoperator:
+		return OIDRegoperator, true
+	case OIDArrayRegclass:
+		return OIDRegclass, true
+	case OIDArrayRegtype:
+		return OIDRegtype, true
+	case OIDArrayRegconfig:
+		return OIDRegconfig, true
+	case OIDArrayRegdictionary:
+		return OIDRegdictionary, true
+	case OIDArrayRegnamespace:
+		return OIDRegnamespace, true
+	case OIDArrayRegrole:
+		return OIDRegrole, true
+	case OIDArrayRegcollation:
+		return OIDRegcollation, true
 	}
 	return 0, false
 }
@@ -1270,6 +1343,28 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDXid
 	case "cid":
 		return OIDCid
+	case "regproc":
+		return OIDRegproc
+	case "regprocedure":
+		return OIDRegprocedure
+	case "regoper":
+		return OIDRegoper
+	case "regoperator":
+		return OIDRegoperator
+	case "regclass":
+		return OIDRegclass
+	case "regtype":
+		return OIDRegtype
+	case "regconfig":
+		return OIDRegconfig
+	case "regdictionary":
+		return OIDRegdictionary
+	case "regnamespace":
+		return OIDRegnamespace
+	case "regrole":
+		return OIDRegrole
+	case "regcollation":
+		return OIDRegcollation
 	default:
 		return OIDText // safe fallback
 	}
@@ -1370,6 +1465,28 @@ func OIDToTypeName(oid uint32) string {
 		return "xid"
 	case OIDCid:
 		return "cid"
+	case OIDRegproc:
+		return "regproc"
+	case OIDRegprocedure:
+		return "regprocedure"
+	case OIDRegoper:
+		return "regoper"
+	case OIDRegoperator:
+		return "regoperator"
+	case OIDRegclass:
+		return "regclass"
+	case OIDRegtype:
+		return "regtype"
+	case OIDRegconfig:
+		return "regconfig"
+	case OIDRegdictionary:
+		return "regdictionary"
+	case OIDRegnamespace:
+		return "regnamespace"
+	case OIDRegrole:
+		return "regrole"
+	case OIDRegcollation:
+		return "regcollation"
 	default:
 		return "text"
 	}

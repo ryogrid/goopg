@@ -1716,6 +1716,31 @@ fixed one logical group per loop:
     Guarded by the `arr` fixture's `td tid`, `tds tid[]`, `xd xid`, `xds xid[]`,
     `cd cid`, `cds cid[]` columns in `TestPort_PgDumpConnectionSetup` and new
     rows in `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`.
+  - **Slice 80 — the OID-reference (`reg*`) family (+ their array types)
+    (`internal/catalog/codec.go`, `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** The eleven OID-alias types `regproc` (24),
+    `regprocedure` (2202), `regoper` (2203), `regoperator` (2204), `regclass`
+    (2205), `regtype` (2206), `regconfig` (3734), `regdictionary` (3769),
+    `regnamespace` (4089), `regrole` (4096), and `regcollation` (4191), plus their
+    `_reg*` array types (`1008`, `2207`, `2208`, `2209`, `2210`, `2211`, `3735`,
+    `3770`, `4090`, `4097`, `4192`). All eleven scalars are 4-byte by-value oid
+    aliases (`{typlen=4, byval=t, align='i', storage='p'}`) and each array is the
+    varlena `{typlen=-1, byval=f, align='i', storage='x'}`; none carry a typmod, so
+    this is the plain 3-site pattern. All were seeded in `pg_type_seed_data.go` (so
+    a PG standby resolves the OIDs) but were never wired into the codec OID
+    round-trip — so a declared `regclass` column fell back to `text` (OID 25) and
+    the arrays were unresolved. (The `::regclass`/`::regproc`/`::regtype` value
+    *casts* in `expr.go` and the catalog-column OID seeding in
+    `initdb.pgCatalogTypeOID` / `typeOIDForCatalogColumn` already mapped `regproc`
+    → 24 independently; those are separate paths and unchanged.) `TypeNameToOID` /
+    `OIDToTypeName` / `ArrayOIDForBase` / `BaseOIDForArray` gained the eleven
+    scalar+array cases; `userTypeAttrsForOID` gained grouped scalar+array cases;
+    `oidToBuiltinTypeName` and `formatTypeOID` gained the eleven scalar+array
+    cases. Guarded by the `arr` fixture's `rp regproc` … `rcos regcollation[]`
+    columns in `TestPort_PgDumpConnectionSetup`, new rows in
+    `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`, and
+    new pairs in `catalog.TestTypeNameToOIDRoundTrip` (which also guards against a
+    name collision routing `regproc` to text).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1780,7 +1805,13 @@ bit(8)[]`, `vb varbit(16)`, and `vbs varbit(16)[]`; slice 76 adds `lsn pg_lsn`
 and `lsns pg_lsn[]`; slice 77 adds the snapshot types `txs txid_snapshot`, `txss
 txid_snapshot[]`, `pgs pg_snapshot`, and `pgss pg_snapshot[]`; slice 78 adds `x8
 xid8` and `x8s xid8[]`; slice 79 adds the identifier types `td tid`, `tds
-tid[]`, `xd xid`, `xds xid[]`, `cd cid`, and `cds cid[]`.
+tid[]`, `xd xid`, `xds xid[]`, `cd cid`, and `cds cid[]`; slice 80 adds the
+OID-reference (`reg*`) family `rp regproc`, `rps regproc[]`, `rpd regprocedure`,
+`rpds regprocedure[]`, `ropr regoper`, `roprs regoper[]`, `roo regoperator`,
+`roos regoperator[]`, `rcl regclass`, `rcls regclass[]`, `rt regtype`, `rts
+regtype[]`, `rcf regconfig`, `rcfs regconfig[]`, `rdi regdictionary`, `rdis
+regdictionary[]`, `rn regnamespace`, `rns regnamespace[]`, `rr regrole`, `rrs
+regrole[]`, `rco regcollation`, and `rcos regcollation[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

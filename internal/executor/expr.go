@@ -164,6 +164,29 @@ func oidToBuiltinTypeName(oid uint32) string {
 	case 29:
 		// cid: 32-bit command id, bare name. Slice 79.
 		return "cid"
+	// DU-002 slice 80: the OID-reference ("reg*") family, bare names.
+	case 24:
+		return "regproc"
+	case 2202:
+		return "regprocedure"
+	case 2203:
+		return "regoper"
+	case 2204:
+		return "regoperator"
+	case 2205:
+		return "regclass"
+	case 2206:
+		return "regtype"
+	case 3734:
+		return "regconfig"
+	case 3769:
+		return "regdictionary"
+	case 4089:
+		return "regnamespace"
+	case 4096:
+		return "regrole"
+	case 4191:
+		return "regcollation"
 	// Array types
 	case 1000:
 		return "boolean[]"
@@ -247,6 +270,29 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "xid[]"
 	case 1012:
 		return "cid[]"
+	// DU-002 slice 80: the OID-reference ("reg*") array types, bare names + [].
+	case 1008:
+		return "regproc[]"
+	case 2207:
+		return "regprocedure[]"
+	case 2208:
+		return "regoper[]"
+	case 2209:
+		return "regoperator[]"
+	case 2210:
+		return "regclass[]"
+	case 2211:
+		return "regtype[]"
+	case 3735:
+		return "regconfig[]"
+	case 3770:
+		return "regdictionary[]"
+	case 4090:
+		return "regnamespace[]"
+	case 4097:
+		return "regrole[]"
+	case 4192:
+		return "regcollation[]"
 	case 1231:
 		return "numeric[]"
 	case 2951:
@@ -10466,6 +10512,52 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "xid"
 	case 29:
 		return "cid"
+	// DU-002 slice 80: the OID-reference ("reg*") family. No typmod, bare names.
+	case 24:
+		return "regproc"
+	case 2202:
+		return "regprocedure"
+	case 2203:
+		return "regoper"
+	case 2204:
+		return "regoperator"
+	case 2205:
+		return "regclass"
+	case 2206:
+		return "regtype"
+	case 3734:
+		return "regconfig"
+	case 3769:
+		return "regdictionary"
+	case 4089:
+		return "regnamespace"
+	case 4096:
+		return "regrole"
+	case 4191:
+		return "regcollation"
+	// DU-002 slice 80: the reg* array types. No typmod, bare element name + [].
+	case 1008:
+		return "regproc[]"
+	case 2207:
+		return "regprocedure[]"
+	case 2208:
+		return "regoper[]"
+	case 2209:
+		return "regoperator[]"
+	case 2210:
+		return "regclass[]"
+	case 2211:
+		return "regtype[]"
+	case 3735:
+		return "regconfig[]"
+	case 3770:
+		return "regdictionary[]"
+	case 4090:
+		return "regnamespace[]"
+	case 4097:
+		return "regrole[]"
+	case 4192:
+		return "regcollation[]"
 	case 30:
 		return "oid[]"
 	case 114:

@@ -208,6 +208,20 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: 4, TypByVal: true, TypAlign: 'i', TypStorage: 'p'}
 	case catalog.OIDCid: // 29 cid -- pg_type.dat: typlen 4, typbyval t, typalign 'i', typstorage 'p'
 		return userTypeAttrs{TypLen: 4, TypByVal: true, TypAlign: 'i', TypStorage: 'p'}
+	// DU-002 slice 80: the OID-reference ("reg*") family. All share oid's shape:
+	// pg_type.dat typlen 4, typbyval t, typalign 'i', typstorage 'p'.
+	case catalog.OIDRegproc, // 24
+		catalog.OIDRegprocedure,  // 2202
+		catalog.OIDRegoper,       // 2203
+		catalog.OIDRegoperator,   // 2204
+		catalog.OIDRegclass,      // 2205
+		catalog.OIDRegtype,       // 2206
+		catalog.OIDRegconfig,     // 3734
+		catalog.OIDRegdictionary, // 3769
+		catalog.OIDRegnamespace,  // 4089
+		catalog.OIDRegrole,       // 4096
+		catalog.OIDRegcollation:  // 4191
+		return userTypeAttrs{TypLen: 4, TypByVal: true, TypAlign: 'i', TypStorage: 'p'}
 	case catalog.OIDArrayBool: // 1000 _bool -- pg_type.dat: typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBytea: // 1001 _bytea -- element bytea typalign 'i', typstorage 'x'
@@ -295,6 +309,20 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 	case catalog.OIDArrayXid: // 1011 _xid -- element xid typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayCid: // 1012 _cid -- element cid typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	// DU-002 slice 80: the OID-reference ("reg*") array types. Each element is a
+	// 4-byte oid alias (typalign 'i'); the array is varlena typstorage 'x'.
+	case catalog.OIDArrayRegproc, // 1008 _regproc
+		catalog.OIDArrayRegprocedure,  // 2207 _regprocedure
+		catalog.OIDArrayRegoper,       // 2208 _regoper
+		catalog.OIDArrayRegoperator,   // 2209 _regoperator
+		catalog.OIDArrayRegclass,      // 2210 _regclass
+		catalog.OIDArrayRegtype,       // 2211 _regtype
+		catalog.OIDArrayRegconfig,     // 3735 _regconfig
+		catalog.OIDArrayRegdictionary, // 3770 _regdictionary
+		catalog.OIDArrayRegnamespace,  // 4090 _regnamespace
+		catalog.OIDArrayRegrole,       // 4097 _regrole
+		catalog.OIDArrayRegcollation:  // 4192 _regcollation
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}

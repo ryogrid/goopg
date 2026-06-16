@@ -612,7 +612,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"txs txid_snapshot, txss txid_snapshot[], "+
 		"pgs pg_snapshot, pgss pg_snapshot[], "+
 		"x8 xid8, x8s xid8[], "+
-		"td tid, tds tid[], xd xid, xds xid[], cd cid, cds cid[])"); err != nil {
+		"td tid, tds tid[], xd xid, xds xid[], cd cid, cds cid[], "+
+		"rp regproc, rps regproc[], rpd regprocedure, rpds regprocedure[], "+
+		"ropr regoper, roprs regoper[], roo regoperator, roos regoperator[], "+
+		"rcl regclass, rcls regclass[], rt regtype, rts regtype[], "+
+		"rcf regconfig, rcfs regconfig[], rdi regdictionary, rdis regdictionary[], "+
+		"rn regnamespace, rns regnamespace[], rr regrole, rrs regrole[], "+
+		"rco regcollation, rcos regcollation[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -983,6 +989,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// tid[] (`tds`, _tid 1010), xid (`xd`, 28) + xid[] (`xds`, _xid 1011), and
 		// cid (`cd`, 29) + cid[] (`cds`, _cid 1012). None carry a typmod, so
 		// format_type renders the bare names.
+		// Slice 80 adds the OID-reference ("reg*") family: regproc (24)/_regproc
+		// (1008), regprocedure (2202)/_regprocedure (2207), regoper (2203)/_regoper
+		// (2208), regoperator (2204)/_regoperator (2209), regclass (2205)/_regclass
+		// (2210), regtype (2206)/_regtype (2211), regconfig (3734)/_regconfig
+		// (3735), regdictionary (3769)/_regdictionary (3770), regnamespace (4089)/
+		// _regnamespace (4090), regrole (4096)/_regrole (4097), and regcollation
+		// (4191)/_regcollation (4192). Each is a 4-byte oid alias seeded in pg_type
+		// but never wired into TypeNameToOID/OIDToTypeName, so each scalar fell back
+		// to text (OID 25). None carry a typmod, so format_type renders the bare
+		// `<type>` / `<type>[]`.
 		// All are seeded in pg_type but were never wired into TypeNameToOID/
 		// OIDToTypeName, so each scalar fell back to text (OID 25) and the array
 		// paths had no OIDs. None carry a typmod, so each renders as the plain
@@ -1063,6 +1079,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"xds xid[]",
 			"cd cid",
 			"cds cid[]",
+			"rp regproc",
+			"rps regproc[]",
+			"rpd regprocedure",
+			"rpds regprocedure[]",
+			"ropr regoper",
+			"roprs regoper[]",
+			"roo regoperator",
+			"roos regoperator[]",
+			"rcl regclass",
+			"rcls regclass[]",
+			"rt regtype",
+			"rts regtype[]",
+			"rcf regconfig",
+			"rcfs regconfig[]",
+			"rdi regdictionary",
+			"rdis regdictionary[]",
+			"rn regnamespace",
+			"rns regnamespace[]",
+			"rr regrole",
+			"rrs regrole[]",
+			"rco regcollation",
+			"rcos regcollation[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {
