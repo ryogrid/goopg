@@ -1293,6 +1293,26 @@ fixed one logical group per loop:
     fidelity gaps for those uncommon shapes. Unit guard:
     `executor.TestApplyViewColumnAliases` (13 cases incl. internal-comma/internal-FROM
     protection, quoting, and every bail path).
+  - **Slice 59 — GENERATED ALWAYS AS (expr) STORED column round-trip
+    (`internal/executor/pg18_user_catalog_rows.go`, `internal/catalog/catalog.go`).**
+    pg_dump emits the inline `GENERATED ALWAYS AS (%s) STORED` clause only when a
+    column carries BOTH `pg_attribute.attgenerated='s'` AND a `pg_attrdef` row
+    whose `pg_get_expr(adbin)` yields the generation expression — `dumpTableSchema`'s
+    `print_default` gate requires `tbinfo->attrdefs[j] != NULL`, and
+    `getTableAttrs` forces `separate=false` for any generated column so it is
+    never deferred to an ALTER. goopg already set `attgenerated='s'`
+    (`attGeneratedFor`) but `atthasdef` was `col.DefaultExpr != nil` (false for a
+    generated column) and the `pg_attrdef` virtual view only iterated columns with
+    a `DefaultExpr`, so no attrdef row existed — pg_dump silently dropped the
+    GENERATED clause and the column dumped as a plain `area integer`, a
+    stored-vs-computed semantic loss on restore. Fix: `atthasdef` now reports true
+    when `GeneratedExpr != ""` as well, and `pg_attrdef.VirtualRows` emits a row
+    for generated columns with `adbin = col.GeneratedExpr` (a column is never both
+    DEFAULT and GENERATED, so `DefaultExpr` takes precedence). `pg_get_expr` passes
+    the stored string through verbatim, so the dumped clause carries single parens
+    (`(w * h)`); PG's deparser may add normalizing parens — both restore to an
+    equivalent stored generated column. Guarded end-to-end by
+    `TestPort_PgDumpConnectionSetup` (the `gen` fixture table).
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1323,7 +1343,9 @@ public.foo_view AS` followed by the verbatim body `SELECT id, name FROM
 public.foo WHERE qty > 0;`; slice 58 asserts a VIEW created with an explicit
 column list round-trips with the renamed columns — `CREATE VIEW
 public.foo_rview AS` followed by `SELECT id AS col_a, name AS col_b FROM
-public.foo;`. Unit guards:
+public.foo;`; slice 59 asserts a STORED generated column round-trips with its
+generation clause — `CREATE TABLE public.gen (` and `area integer GENERATED
+ALWAYS AS (w * h) STORED`. Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
 `executor.TestAlterTableAddForeignKeyCapturesActions`,

@@ -509,6 +509,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create view foo_rview: %v", err)
 	}
 
+	// Slice 59: a GENERATED ALWAYS AS (expr) STORED column must round-trip with
+	// its generation clause. pg_dump prints `GENERATED ALWAYS AS (%s) STORED`
+	// only when the column carries BOTH pg_attribute.attgenerated='s' AND a
+	// pg_attrdef row whose pg_get_expr(adbin) yields the expression (pg_dump.c
+	// dumpTableSchema: print_default requires tbinfo->attrdefs[j] != NULL).
+	// goopg already set attgenerated='s' but left atthasdef=false and emitted no
+	// pg_attrdef row for generated columns, so the GENERATED clause was silently
+	// dropped — the column dumped as a plain `area integer`, a stored-vs-computed
+	// semantic loss on restore. `gen` carries the generated column on its own
+	// table so the fix is isolated from foo's many asserts.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.gen (w integer, h integer, "+
+		"area integer GENERATED ALWAYS AS (w * h) STORED)"); err != nil {
+		t.Fatalf("create table gen: %v", err)
+	}
+
 	res, err := util.RunCommand(util.CommandSpec{
 		Name:    bin,
 		Args:    []string{"--no-sync", "postgres"},
@@ -752,6 +767,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped renamed view columns; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// **Slice 59 (asserted):** a GENERATED ALWAYS AS (expr) STORED column
+		// must round-trip with its generation clause. atthasdef now reports true
+		// for generated columns and pg_attrdef emits a row whose adbin is the raw
+		// generation expr, so pg_dump (keyed on attgenerated='s') re-emits the
+		// inline GENERATED clause. Regression guard for the atthasdef + pg_attrdef
+		// generated-column wiring. (goopg stores the expr verbatim, so the dumped
+		// clause has single parens; PG may add normalizing parens — both restore
+		// to an equivalent stored column.)
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.gen (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.gen\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "area integer GENERATED ALWAYS AS (w * h) STORED") {
+			t.Errorf("pg_dump dropped the GENERATED clause on a stored generated column\n  full stdout=%q", res.Stdout)
 		}
 		return
 	}

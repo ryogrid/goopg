@@ -284,24 +284,24 @@ func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 	typOID := catalog.TypeNameToOID(col.Type.Name)
 	attrs := userTypeAttrsForOID(typOID)
 	return Row{
-		NewIntDatum(int64(tbl.OID)),                     // attrelid
-		NewStringDatum(col.Name),                        // attname (name)
-		NewIntDatum(int64(typOID)),                      // atttypid
-		NewIntDatum(int64(attrs.TypLen)),                // attlen
-		NewIntDatum(int64(col.Ordinal + 1)),             // attnum (1-based)
-		NewIntDatum(pgAttTypmod(typOID, col.Type.Args)), // atttypmod
-		NewIntDatum(0),                                  // attndims
-		NewBoolDatum(attrs.TypByVal),                    // attbyval
-		NewStringDatum(string(attrs.TypAlign)),          // attalign
-		NewStringDatum(string(attrs.TypStorage)),        // attstorage
-		NewStringDatum(""),                              // attcompression (PG18 default: '\0' meaning "default")
-		NewBoolDatum(col.NotNull),                       // attnotnull
-		NewBoolDatum(col.DefaultExpr != nil),            // atthasdef
-		NewBoolDatum(false),                             // atthasmissing
-		NewStringDatum(""),                              // attidentity
-		NewStringDatum(attGeneratedFor(col)),            // attgenerated
-		NewBoolDatum(false),                             // attisdropped
-		NewBoolDatum(!col.Inherited),                    // attislocal
+		NewIntDatum(int64(tbl.OID)),                                     // attrelid
+		NewStringDatum(col.Name),                                        // attname (name)
+		NewIntDatum(int64(typOID)),                                      // atttypid
+		NewIntDatum(int64(attrs.TypLen)),                                // attlen
+		NewIntDatum(int64(col.Ordinal + 1)),                             // attnum (1-based)
+		NewIntDatum(pgAttTypmod(typOID, col.Type.Args)),                 // atttypmod
+		NewIntDatum(0),                                                  // attndims
+		NewBoolDatum(attrs.TypByVal),                                    // attbyval
+		NewStringDatum(string(attrs.TypAlign)),                          // attalign
+		NewStringDatum(string(attrs.TypStorage)),                        // attstorage
+		NewStringDatum(""),                                              // attcompression (PG18 default: '\0' meaning "default")
+		NewBoolDatum(col.NotNull),                                       // attnotnull
+		NewBoolDatum(col.DefaultExpr != nil || col.GeneratedExpr != ""), // atthasdef (generated cols carry their expr in pg_attrdef too)
+		NewBoolDatum(false),                                             // atthasmissing
+		NewStringDatum(""),                                              // attidentity
+		NewStringDatum(attGeneratedFor(col)),                            // attgenerated
+		NewBoolDatum(false),                                             // attisdropped
+		NewBoolDatum(!col.Inherited),                                    // attislocal
 		func() Datum {
 			if col.Inherited {
 				return NewIntDatum(1)

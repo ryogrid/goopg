@@ -2788,10 +2788,21 @@ func (c *InMemory) registerSystemTables() {
 				continue
 			}
 			for _, col := range tbl.Columns {
-				if col.DefaultExpr == nil {
+				// pg_attrdef holds both ordinary column DEFAULTs and the
+				// generation expression of GENERATED ALWAYS AS (expr) STORED
+				// columns. pg_dump fetches the expr via pg_get_expr(adbin) and,
+				// keyed on pg_attribute.attgenerated='s', re-emits it as the
+				// inline GENERATED clause (DU-002 slice 59). A column is never
+				// both, so DefaultExpr takes precedence over GeneratedExpr.
+				var adbin string
+				switch {
+				case col.DefaultExpr != nil:
+					adbin = formatExprForAttrdef(col.DefaultExpr)
+				case col.GeneratedExpr != "":
+					adbin = col.GeneratedExpr
+				default:
 					continue
 				}
-				adbin := formatExprForAttrdef(col.DefaultExpr)
 				rows = append(rows, []string{
 					fmt.Sprintf("%d", oid),
 					fmt.Sprintf("%d", tbl.OID),
