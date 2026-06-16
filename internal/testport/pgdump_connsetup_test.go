@@ -740,7 +740,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.numd AS numeric(10,2) DEFAULT 1.5"); err != nil {
 		t.Fatalf("create domain numd: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd)"); err != nil {
+	// Slice 96: a DOMAIN with a generic CHECK (VALUE <comparison>) constraint must
+	// round-trip the constraint. pg_dump's getDomainConstraints reads the check
+	// from pg_constraint (contypid = domain OID, contype='c') and dumpDomain emits
+	// it inline as `\n\tCONSTRAINT <name> CHECK ((<expr>))`. goopg previously
+	// DISCARDED a generic domain CHECK (the parser only captured CHECK (VALUE IN
+	// (...)) into CheckInValues, which was never rendered, and emitted no
+	// contype='c' pg_constraint row keyed on contypid). The parser now captures the
+	// raw predicate (CreateDomainStmt.CheckExpr/CheckName), the executor allocates a
+	// constraint OID (catalog.Domain.CheckOID) and emits the pg_constraint row, and
+	// pg_get_constraintdef renders `CHECK ((expr))` — verified byte-identical to
+	// real pg_dump 18.3. `posqty` uses the auto-generated `posqty_check` name;
+	// `named_chk` carries an explicit CONSTRAINT name. The token-reconstructed expr
+	// (`VALUE > 0`) matches PG's deparse spacing. The `VALUE IN (...)` form (which
+	// deparses to a `= ANY (ARRAY[...])` ScalarArrayOpExpr) is a separate follow-up.
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.posqty AS integer CHECK (VALUE > 0)"); err != nil {
+		t.Fatalf("create domain posqty: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.named_chk AS integer CONSTRAINT must_be_pos CHECK (VALUE > 0)"); err != nil {
+		t.Fatalf("create domain named_chk: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1356,6 +1376,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"c4 public.ch4",
 			"CREATE DOMAIN public.numd AS numeric(10,2) DEFAULT 1.5;",
 			"nd public.numd",
+			// Slice 96: a generic domain CHECK round-trips inline. The auto-named
+			// check uses `<domain>_check`; the explicitly-named one keeps its name.
+			// The predicate is double-wrapped by the deparser: CHECK ((VALUE > 0)).
+			"CREATE DOMAIN public.posqty AS integer",
+			"CONSTRAINT posqty_check CHECK ((VALUE > 0))",
+			"pq public.posqty",
+			"CREATE DOMAIN public.named_chk AS integer",
+			"CONSTRAINT must_be_pos CHECK ((VALUE > 0))",
+			"nc public.named_chk",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

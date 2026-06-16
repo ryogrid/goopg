@@ -8663,6 +8663,10 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	// Record the DEFAULT expression so buildUserPGTypeRowForDomain can emit
 	// typdefaultbin and pg_dump re-renders `DEFAULT <expr>`. DU-002 slice 92.
 	d.Default = s.Default
+	// Record a generic CHECK predicate (e.g. `VALUE > 0`) so pg_dump's
+	// getDomainConstraints surfaces it and dumpDomain re-emits the inline
+	// `CONSTRAINT <name> CHECK ((<expr>))` clause. DU-002 slice 96.
+	cat.SetDomainCheck(d, s.CheckName, s.CheckExpr)
 	// Write a pg_type heap row (typtype='d') so pg_dump's getTypes discovers the
 	// domain and a column of the domain type round-trips as its declared type.
 	// DU-002 slice 90.

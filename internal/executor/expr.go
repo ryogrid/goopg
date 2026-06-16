@@ -6715,6 +6715,17 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					return NewStringDatum(buildForeignKeyDefString(im, fk)), nil
 				}
 			}
+			// Domain CHECK constraints (contype='c', keyed on contypid). pg_dump's
+			// getDomainConstraints renders each via pg_get_constraintdef and
+			// dumpDomain emits `CONSTRAINT <name> <def>`; the deparser wraps the
+			// predicate in an extra paren layer (CHECK ((expr))), mirroring the
+			// table-CHECK path above. DU-002 slice 96.
+			for _, d := range im.AllDomains() {
+				if d.CheckOID == 0 || d.CheckOID != targetOID {
+					continue
+				}
+				return NewStringDatum("CHECK ((" + d.CheckExpr + "))"), nil
+			}
 		}
 		return NullDatum, nil
 

@@ -3539,6 +3539,43 @@ func (p *parser) parseExcludeConstraint() TableConstraintDef {
 	return cdef
 }
 
+// parseDomainCheckExpr is parseCheckExpr's domain twin: it reconstructs the raw
+// CHECK predicate but renders the domain value placeholder as uppercase `VALUE`,
+// matching PG's ruleutils deparse (pg_get_constraintdef). The shared
+// parseCheckExpr must NOT do this — in a TABLE check `value` may be a real column
+// name. String literals are left untouched (a literal `'value'` stays lowercase).
+// DU-002 slice 96.
+func (p *parser) parseDomainCheckExpr() (string, error) {
+	if !p.acceptSymbol("(") {
+		return "", p.errAtCur("expected '(' after CHECK")
+	}
+	depth := 1
+	var parts []string
+	for depth > 0 && p.cur().Kind != TokenEOF {
+		t := p.cur()
+		switch {
+		case t.Kind == TokenSymbol && t.Value == "(":
+			depth++
+			parts = append(parts, "(")
+		case t.Kind == TokenSymbol && t.Value == ")":
+			depth--
+			if depth == 0 {
+				p.advance()
+				return strings.Join(parts, " "), nil
+			}
+			parts = append(parts, ")")
+		case t.Kind == TokenStringLit:
+			parts = append(parts, "'"+strings.ReplaceAll(t.Value, "'", "''")+"'")
+		case (t.Kind == TokenIdent || t.Kind == TokenKeyword) && strings.EqualFold(t.Value, "value"):
+			parts = append(parts, "VALUE")
+		default:
+			parts = append(parts, t.Value)
+		}
+		p.advance()
+	}
+	return "", p.errAtCur("unterminated CHECK expression")
+}
+
 // parseCheckExpr parses `( expr )` after CHECK and returns the raw SQL expression
 // reconstructed from tokens. M0097-0014.
 func (p *parser) parseCheckExpr() (string, error) {
@@ -5217,9 +5254,9 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 				stmt.Default = expr
 				continue
 			case KwConstraint:
-				// CONSTRAINT name CHECK (…) — skip constraint name.
+				// CONSTRAINT name CHECK (…) — capture the explicit constraint name.
 				p.advance()
-				_, _ = p.parseIdent() // constraint name
+				cname, _ := p.parseIdent() // constraint name
 				// Fall through to CHECK handling below.
 				if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
 					p.advance()
@@ -5227,8 +5264,18 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 						if stmt.CheckInValues == nil {
 							stmt.CheckInValues = vals
 						}
-					} else if err := p.skipParenExpr(); err != nil {
-						return nil, err
+					} else {
+						// Generic CHECK expression: capture the raw predicate text
+						// (e.g. `VALUE > 0`) so it round-trips through pg_dump via
+						// pg_get_constraintdef. DU-002 slice 96.
+						expr, err := p.parseDomainCheckExpr()
+						if err != nil {
+							return nil, err
+						}
+						if stmt.CheckExpr == "" {
+							stmt.CheckExpr = expr
+							stmt.CheckName = cname.Value
+						}
 					}
 				}
 				continue
@@ -5238,8 +5285,15 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 					if stmt.CheckInValues == nil {
 						stmt.CheckInValues = vals
 					}
-				} else if err := p.skipParenExpr(); err != nil {
-					return nil, err
+				} else {
+					// Generic CHECK expression (auto-named <domain>_check). DU-002 slice 96.
+					expr, err := p.parseDomainCheckExpr()
+					if err != nil {
+						return nil, err
+					}
+					if stmt.CheckExpr == "" {
+						stmt.CheckExpr = expr
+					}
 				}
 				continue
 			}
@@ -5254,28 +5308,6 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 		break
 	}
 	return stmt, nil
-}
-
-// skipParenExpr skips a balanced parenthesised expression.
-func (p *parser) skipParenExpr() error {
-	if !p.acceptSymbol("(") {
-		return p.errAtCur("expected '('")
-	}
-	depth := 1
-	for depth > 0 && p.cur().Kind != TokenEOF {
-		t := p.cur()
-		if t.Kind == TokenSymbol && t.Value == "(" {
-			depth++
-		} else if t.Kind == TokenSymbol && t.Value == ")" {
-			depth--
-			if depth == 0 {
-				p.advance()
-				break
-			}
-		}
-		p.advance()
-	}
-	return nil
 }
 
 // tryParseCheckInValues tries to parse a CHECK (VALUE IN ('a','b','c')) pattern.

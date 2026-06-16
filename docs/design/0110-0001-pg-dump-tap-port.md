@@ -2192,6 +2192,33 @@ default deparses bare (`DEFAULT 1.5`, a self-evident numeric Const). The bare
 but it is unreachable here because every typmod-bearing case carries an explicit
 length; bare-name base render is part of the broader format_type fidelity work.
 
+Slice 96 restores a **domain CHECK constraint**. `dumpDomain` appends every
+domain check inline as `\n\tCONSTRAINT <name> <pg_get_constraintdef(oid)>`, and
+those checks are collected by `getDomainConstraints`
+(`SELECT … pg_get_constraintdef(oid) AS consrc, convalidated, contype FROM
+pg_constraint WHERE contypid = $1 AND contype IN ('c','n') ORDER BY conname`).
+goopg previously *discarded* a generic domain CHECK — `parseCreateDomain` only
+captured the `CHECK (VALUE IN (...))` form into `CheckInValues` (never rendered),
+and `pg_constraint` emitted no `contype='c'` row keyed on `contypid`, so a
+`CHECK (VALUE > 0)` silently vanished from the dump. The fix: (1) the parser
+captures the raw predicate into `CreateDomainStmt.CheckExpr`/`CheckName` via a new
+`parseDomainCheckExpr` (the table-check twin `parseCheckExpr`, but it renders the
+value placeholder as uppercase `VALUE` to match PG's ruleutils deparse — a TABLE
+check must NOT do this, since `value` may be a real column there); (2)
+`catalog.InMemory.SetDomainCheck` records the predicate and allocates a stable
+constraint OID (`Domain.CheckOID`, auto-naming `<domain>_check` when the user gave
+none); (3) the `pg_constraint` virtual view emits the `contype='c'` row with
+`contypid` = the domain OID (and `conrelid`=0); (4) `pg_get_constraintdef` renders
+`CHECK ((<expr>))`, double-wrapping the predicate exactly as PG does. Verified
+byte-identical to real pg_dump 18.3:
+`CREATE DOMAIN public.posqty AS integer\n\tCONSTRAINT posqty_check CHECK ((VALUE > 0));`
+and the explicitly-named `CONSTRAINT must_be_pos CHECK ((VALUE > 0))`. The token
+reconstruction normalizes spacing to PG's canonical form (`VALUE>0` → `VALUE > 0`).
+The `CHECK (VALUE IN (...))` form — which PG deparses to a
+`VALUE = ANY (ARRAY['a'::text, …])` ScalarArrayOpExpr, not the literal `IN` text —
+is a separate follow-up slice (its `CheckInValues` capture is still parsed but not
+yet emitted).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

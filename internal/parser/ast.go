@@ -2001,6 +2001,13 @@ type CreateDomainStmt struct {
 	NotNull       bool
 	CheckInValues []string // allowed values from CHECK (VALUE IN ('a','b','c')), M0097-domain-check
 	Default       Expr     // DEFAULT expression AST, nil when no DEFAULT clause. DU-002 slice 92.
+	// CheckExpr holds the raw SQL text of a generic (non-IN) domain CHECK
+	// expression, e.g. `VALUE > 0`. CheckName is the explicit CONSTRAINT name
+	// when one is given, "" for the auto-generated `<domain>_check`. The
+	// `CHECK (VALUE IN (...))` form is kept separately in CheckInValues (its
+	// ANY/ARRAY deparse is not yet rendered). DU-002 slice 96.
+	CheckExpr string
+	CheckName string
 }
 
 func (s *CreateDomainStmt) Pos() int  { return s.pos }

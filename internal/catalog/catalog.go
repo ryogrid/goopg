@@ -826,6 +826,15 @@ type Domain struct {
 	NotNull       bool
 	CheckInValues []string     // allowed values from CHECK (VALUE IN ...), M0097-domain-check
 	Default       parser.Expr  // DEFAULT expression AST, nil when no DEFAULT. DU-002 slice 92.
+	// CheckExpr is the raw SQL text of a generic (non-IN) domain CHECK predicate,
+	// e.g. `VALUE > 0`. CheckName is the constraint name (auto-resolved to
+	// `<domain>_check` when the user gave none). CheckOID is the pg_constraint OID
+	// allocated for the check so getDomainConstraints / pg_get_constraintdef can
+	// surface it. All empty/zero when the domain carries no generic CHECK. DU-002
+	// slice 96.
+	CheckExpr string
+	CheckName string
+	CheckOID  uint32
 }
 
 // DefaultBin renders the domain's DEFAULT expression in the pre-formatted
@@ -2969,6 +2978,38 @@ func (c *InMemory) registerSystemTables() {
 				row[25] = "t"                            // conenforced: always true in v0
 				out = append(out, row)
 			}
+		}
+		// Emit domain CHECK constraints (contype='c', keyed on contypid = the
+		// domain's pg_type OID rather than conrelid). pg_dump's
+		// getDomainConstraints reads `WHERE contypid = $1 AND contype IN ('c','n')`
+		// and renders each via pg_get_constraintdef. DU-002 slice 96.
+		for _, d := range c.domains {
+			if d.CheckExpr == "" || d.CheckOID == 0 {
+				continue
+			}
+			row := make([]string, 26)
+			row[0] = fmt.Sprintf("%d", d.CheckOID) // oid
+			row[1] = d.CheckName                   // conname
+			row[2] = "2200"                        // connamespace (public)
+			row[3] = "c"                           // contype = check
+			row[4] = "f"                           // condeferrable
+			row[5] = "f"                           // condeferred
+			row[6] = "t"                           // convalidated
+			row[7] = "0"                           // conrelid (none — domain check)
+			row[8] = fmt.Sprintf("%d", d.OID)      // contypid = domain OID
+			row[9] = "0"                           // conindid
+			row[10] = "0"                          // conparentid
+			row[11] = "0"                          // confrelid
+			row[12] = " "                          // confupdtype
+			row[13] = " "                          // confdeltype
+			row[14] = " "                          // confmatchtype
+			row[15] = "t"                          // conislocal
+			row[16] = "0"                          // coninhcount
+			row[17] = "f"                          // connoinherit
+			row[18] = "f"                          // conperiod
+			row[24] = d.CheckExpr                  // conbin
+			row[25] = "t"                          // conenforced: always true in v0
+			out = append(out, row)
 		}
 		// Emit UNIQUE, PRIMARY KEY, and EXCLUDE constraints from constraint-backed indexes.
 		for _, idx := range c.indexes {
@@ -6390,6 +6431,26 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, checkInV
 	return d, nil
 }
 
+// SetDomainCheck records a generic CHECK predicate on a domain and allocates a
+// pg_constraint OID for it. The constraint name defaults to PG's generated
+// `<domain>_check` when the caller passes "". No-op when expr is empty. The OID
+// is drawn from the same running counter as every other user object so it stays
+// stable and distinct. DU-002 slice 96.
+func (c *InMemory) SetDomainCheck(d *Domain, name, expr string) {
+	if d == nil || expr == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d.CheckExpr = expr
+	if name == "" {
+		name = d.Name + "_check"
+	}
+	d.CheckName = name
+	d.CheckOID = c.nextOID
+	c.nextOID++
+}
+
 // LookupDomain finds a domain by name (case-insensitive). M0097-0017.
 func (c *InMemory) LookupDomain(name string) (*Domain, bool) {
 	k := strings.ToLower(name)
@@ -6397,6 +6458,18 @@ func (c *InMemory) LookupDomain(name string) (*Domain, bool) {
 	defer c.mu.RUnlock()
 	d, ok := c.domains[k]
 	return d, ok
+}
+
+// AllDomains returns a snapshot slice of every registered domain. Used by
+// pg_get_constraintdef to find a domain CHECK constraint by its OID. DU-002 slice 96.
+func (c *InMemory) AllDomains() []*Domain {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]*Domain, 0, len(c.domains))
+	for _, d := range c.domains {
+		out = append(out, d)
+	}
+	return out
 }
 
 // LookupDomainByOID finds a domain type by its pg_type OID. Used by format_type
