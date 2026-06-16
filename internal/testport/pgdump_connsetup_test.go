@@ -240,6 +240,16 @@ package testport
 // not advance `off`, so remapTopProjection shifted right-side projection columns
 // DOWN by the SRF width. They now advance `off` by their output width, mirroring
 // the *Values case. pg_dump reaches exit 0 AND emits the real column list.
+// Slice 47 removed the spurious `WITH (""='')` reloptions clause from the
+// CREATE TABLE: the virtual pg_class view (internal/catalog/catalog.go) stored
+// relacl/reloptions as "" meaning NULL, but planner.TypedVirtualCell had no
+// array-type case, so the empty cell became a StringConst("") that the array
+// machinery parsed as a single empty-string element ({""}). pg_dump's
+// nonemptyReloptions then saw a non-empty array and emitted `WITH (""='')`.
+// TypedVirtualCell now maps an empty array-typed virtual cell to SQL NULL, so
+// reloptions/relacl read as NULL (PG's convention for no options / default
+// ACL) and the dumped CREATE TABLE has no WITH clause — byte-identical to
+// upstream pg_dump for a plain table.
 // RUN this test after each add to find the REAL next blocker rather than
 // trusting the predicted one.
 // This test is the regression guard for the whole exit-0 dump pipeline and a
@@ -333,6 +343,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump column list missing %q (SRF-join right-side projection regressed)\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// **Slice 47 closed (asserted):** the virtual pg_class view stored
+		// reloptions/relacl as "" (intended to mean NULL). TypedVirtualCell
+		// routed the empty cell through its default StringConst branch, and
+		// the array machinery parsed "" as a single empty-string element
+		// ({""}). pg_dump's getTables reads
+		// `array_remove(array_remove(c.reloptions,…),…)`, and
+		// nonemptyReloptions({""}) is true (strlen>2), so the CREATE TABLE
+		// gained a spurious `WITH (""='')` clause. TypedVirtualCell now maps
+		// an empty array-typed cell to SQL NULL, so reloptions/relacl are
+		// NULL (PG's convention for a table with no options / default ACL)
+		// and no WITH clause is emitted. Assert the table dumps with no
+		// reloptions clause — this is the regression guard for the fix.
+		if strings.Contains(res.Stdout, "WITH (") {
+			t.Errorf("pg_dump emitted a spurious reloptions WITH clause for a table with no options\n  full stdout=%q", res.Stdout)
 		}
 		return
 	}

@@ -2324,6 +2324,22 @@ func TypedVirtualCell(pos int, value, colType string) Expr {
 		if value != "" {
 			return &NumericConst{pos: pos, Value: value}
 		}
+	case "text[]", "_text", "aclitem[]", "_aclitem", "oid[]", "_oid",
+		"int2[]", "_int2", "int4[]", "_int4", "char[]", "_char",
+		"name[]", "_name", "float4[]", "_float4", "anyarray":
+		// Array-typed virtual-catalog columns. An empty cell denotes SQL NULL
+		// (the PostgreSQL convention for an absent reloptions / relacl /
+		// proconfig / … value), NOT an empty string. Routed through the
+		// default StringConst branch a bare "" is parsed by the array
+		// machinery as a single empty-string element ({""}), which made
+		// pg_dump emit a spurious `WITH (""='')` clause for a table with no
+		// reloptions (DU-002 slice 47: nonemptyReloptions saw strlen>2). A
+		// non-empty value is the array text literal ("{a,b}") and passes
+		// through verbatim.
+		if value == "" {
+			return &NullConst{pos: pos}
+		}
+		return &StringConst{pos: pos, Value: value}
 	}
 	return &StringConst{pos: pos, Value: value}
 }

@@ -994,6 +994,31 @@ fixed one logical group per loop:
     `planner.TestSRFJoinRightProjectionOffset` (VALUES-left reference vs
     unnest-left / generate_series-left projection-index parity) and the promoted
     `TestPort_PgDumpConnectionSetup` column-list assertion.
+  - **Slice 47 — array-typed virtual-catalog cell NULL handling
+    (`internal/planner/planner.go`).** With exit 0 and the column list correct,
+    the dumped `CREATE TABLE` still carried a spurious `WITH (""='')` reloptions
+    clause. Root cause: the virtual `pg_class` view
+    (`internal/catalog/catalog.go`) stores `relacl`/`reloptions` as `""`
+    (commented "NULL"), but `planner.TypedVirtualCell` — which converts a virtual
+    row's text cells to typed constants — had **no case for array column types**.
+    The empty cell fell through to the default `StringConst("")`, and goopg's
+    array machinery parses a bare `""` in a `text[]` context as a single
+    empty-string element (`{""}`), so `array_length(reloptions,1)` returned 1.
+    pg_dump's getTables reads
+    `array_remove(array_remove(c.reloptions,'check_option=local'),'check_option=cascaded')`
+    and its `nonemptyReloptions` test (`strlen(reloptions) > 2`) saw `{""}` as
+    non-empty, emitting `WITH (` + `fmtId("")` + `='')`. Fix: `TypedVirtualCell`
+    now maps an **empty** array-typed cell (`text[]`/`_text`, `aclitem[]`,
+    `oid[]`, `int2[]`/`int4[]`, `char[]`, `name[]`, `float4[]`, `anyarray`) to
+    `NullConst` — PostgreSQL's convention for an absent reloptions / default ACL
+    — while a non-empty cell passes through as the array text literal. The dumped
+    `CREATE TABLE` is now byte-identical to upstream for a plain table (no `WITH`
+    clause). Guards: `planner.TestTypedVirtualCell` (empty `text[]`/`aclitem[]`/
+    `oid[]`/`_text` → NULL; non-empty `{a,b}` passes through) and the
+    `TestPort_PgDumpConnectionSetup` no-`WITH (` assertion. This is the natural
+    PG-correct fix at the single type-conversion choke point, so it also repairs
+    every other array-typed virtual-catalog column (`proconfig`, `proacl`,
+    `nspacl`, `datacl`, …) that previously decoded an absent value as `{""}`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
