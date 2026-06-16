@@ -1812,6 +1812,31 @@ fixed one logical group per loop:
     `{"timetz", nil, 1270, "time with time zone[]"}` row in
     `executor.TestUserPGAttributeArrayColumn`, and a new `timetz`/`_timetz`
     round-trip block in `catalog.TestTypeNameToOIDRoundTrip`.
+  - **Slice 84 — the `jsonpath` (SQL/JSON path) type (+ its array `_jsonpath`)
+    (`internal/catalog/codec.go`, `internal/executor/expr.go`,
+    `internal/executor/pg18_user_catalog_rows.go`).** `jsonpath` (4072) is a
+    varlena type that stores a compiled SQL/JSON path expression and is a
+    declarable column type; `format_type(4072,-1)` renders the bare `jsonpath`.
+    The display path was wired **inconsistently** between the two sibling
+    functions: `formatTypeOID` already carried a scalar `case 4072` (added
+    speculatively alongside the json family in slice 69), but it was **dead code**
+    because the **codec had no `jsonpath→OID` entry** — a declared `jsonpath`
+    column resolved to `text` (25), so `formatTypeOID(4072)` was never reached.
+    Meanwhile `oidToBuiltinTypeName` lacked **even the scalar** 4072 case, and the
+    array `_jsonpath` (4073) had no `format_type`/array-OID/attr wiring in either
+    function. Both `jsonpath` (4072) and `_jsonpath` (4073) were already seeded in
+    `pg_type_seed_data.go`. This slice adds the missing wiring: `OIDJsonpath`/
+    `OIDArrayJsonpath` consts plus the `jsonpath`↔`_jsonpath` cases in
+    `TypeNameToOID` / `OIDToTypeName` / `ArrayOIDForBase` / `BaseOIDForArray`; the
+    array `formatTypeOID` case 4073 (→ `jsonpath[]`) and **both** the scalar 4072
+    and array 4073 cases in `oidToBuiltinTypeName` (sibling display paths brought
+    back into sync); and `userTypeAttrsForOID` cases for the scalar and the array
+    (both varlena `{typlen=-1, byval=f, align='i', storage='x'}`). Guarded by the
+    `arr` fixture's `jp jsonpath` / `jps jsonpath[]` columns in
+    `TestPort_PgDumpConnectionSetup`, a new
+    `{"jsonpath", nil, 4073, "jsonpath[]"}` row in
+    `executor.TestUserPGAttributeArrayColumn`, and a new `jsonpath`/`_jsonpath`
+    round-trip block in `catalog.TestTypeNameToOIDRoundTrip`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts

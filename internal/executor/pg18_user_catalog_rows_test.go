@@ -494,6 +494,10 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// typmod here (bare timetz[]), so the array renders as the bare element
 		// name + []. Distinct from time[] (1183) — timetz tracks a UTC offset.
 		{"timetz", nil, 1270, "time with time zone[]"},
+		// Slice 84: jsonpath (_jsonpath 4073). jsonpath is varlena with no typmod,
+		// so the array renders as the bare element name + []. Distinct from json[]/
+		// jsonb[] — jsonpath stores compiled SQL/JSON path expressions.
+		{"jsonpath", nil, 4073, "jsonpath[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

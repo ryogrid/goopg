@@ -217,6 +217,9 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 		// DU-002 slice 83: timetz (time with time zone) round-trips its canonical
 		// name instead of falling back to text (the codec had no timetz→OID entry).
 		{"timetz", OIDTimeTZ},
+		// DU-002 slice 84: jsonpath (SQL/JSON path) round-trips its canonical
+		// name instead of falling back to text (the codec had no jsonpath→OID entry).
+		{"jsonpath", OIDJsonpath},
 	}
 	for _, p := range pairs {
 		gotOID := TypeNameToOID(p.name)
@@ -251,6 +254,18 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 	}
 	if OIDTimeTZ != 1266 || OIDArrayTimeTZ != 1270 {
 		t.Errorf("timetz OIDs drifted: OIDTimeTZ=%d (want 1266), OIDArrayTimeTZ=%d (want 1270)", OIDTimeTZ, OIDArrayTimeTZ)
+	}
+
+	// DU-002 slice 84: jsonpath ↔ _jsonpath array OID mapping round-trips, so a
+	// `jsonpath[]` column resolves to _jsonpath (4073) and reconstructs from it.
+	if got := ArrayOIDForBase(OIDJsonpath); got != OIDArrayJsonpath {
+		t.Errorf("ArrayOIDForBase(OIDJsonpath) = %d, want %d (_jsonpath)", got, OIDArrayJsonpath)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayJsonpath); !ok || got != OIDJsonpath {
+		t.Errorf("BaseOIDForArray(OIDArrayJsonpath) = (%d,%v), want (%d,true)", got, ok, OIDJsonpath)
+	}
+	if OIDJsonpath != 4072 || OIDArrayJsonpath != 4073 {
+		t.Errorf("jsonpath OIDs drifted: OIDJsonpath=%d (want 4072), OIDArrayJsonpath=%d (want 4073)", OIDJsonpath, OIDArrayJsonpath)
 	}
 }
 

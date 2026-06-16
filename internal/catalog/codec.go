@@ -74,6 +74,7 @@ const (
 	OIDUUID        uint32 = 2950
 	OIDJSON        uint32 = 114
 	OIDJsonb       uint32 = 3802
+	OIDJsonpath    uint32 = 4072
 	OIDInterval    uint32 = 1186
 	// DU-002 slice 71: the network-address family. All are seeded in pg_type
 	// (see initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs.
@@ -201,6 +202,9 @@ const (
 	// so format_type renders these arrays as the bare `json[]` / `jsonb[]`.
 	OIDArrayJSON  uint32 = 199
 	OIDArrayJsonb uint32 = 3807
+	// DU-002 slice 84: jsonpath. _jsonpath is varlena with no typmod, so
+	// format_type renders the array as the bare `jsonpath[]`.
+	OIDArrayJsonpath uint32 = 4073
 	// DU-002 slice 70: interval. _interval carries the element typmod onto the
 	// array (interval fields/precision), but a bare `interval[]` column has
 	// typmod -1, so format_type renders it as the bare `interval[]`.
@@ -319,6 +323,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayJSON
 	case OIDJsonb:
 		return OIDArrayJsonb
+	case OIDJsonpath:
+		return OIDArrayJsonpath
 	case OIDInterval:
 		return OIDArrayInterval
 	case OIDInet:
@@ -447,6 +453,8 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDJSON, true
 	case OIDArrayJsonb:
 		return OIDJsonb, true
+	case OIDArrayJsonpath:
+		return OIDJsonpath, true
 	case OIDArrayInterval:
 		return OIDInterval, true
 	case OIDArrayInet:
@@ -1339,6 +1347,8 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDJSON
 	case "jsonb":
 		return OIDJsonb
+	case "jsonpath":
+		return OIDJsonpath
 	case "interval":
 		return OIDInterval
 	case "inet":
@@ -1469,6 +1479,8 @@ func OIDToTypeName(oid uint32) string {
 		return "json"
 	case OIDJsonb:
 		return "jsonb"
+	case OIDJsonpath:
+		return "jsonpath"
 	case OIDInterval:
 		return "interval"
 	case OIDInet:

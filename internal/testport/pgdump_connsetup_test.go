@@ -621,7 +621,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"rco regcollation, rcos regcollation[], "+
 		"iv int2vector, ivs int2vector[], ov oidvector, ovs oidvector[], "+
 		"nm name, nms name[], "+
-		"tt timetz, tts timetz[])"); err != nil {
+		"tt timetz, tts timetz[], "+
+		"jp jsonpath, jps jsonpath[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -1129,6 +1130,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// Now both survive as "time with time zone"/"time with time zone[]".
 			"tt time with time zone",
 			"tts time with time zone[]",
+			// Slice 84: the jsonpath (SQL/JSON path) type + its array _jsonpath.
+			// formatTypeOID already had the scalar case 4072 (dead until now), but
+			// oidToBuiltinTypeName lacked even the scalar, the array was wired in
+			// neither display fn, and the codec had no jsonpath→OID entry — so a
+			// declared `jsonpath` column round-tripped as text. Now both survive
+			// as "jsonpath"/"jsonpath[]" (distinct from json[]/jsonb[]).
+			"jp jsonpath",
+			"jps jsonpath[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {
