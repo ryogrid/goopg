@@ -566,9 +566,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// IsArray, and buildUserPGAttributeRow remaps the scalar OID to the array OID
 	// (text→_text 1009, int4→_int4 1007, int8→_int8 1016) with attndims=1.
 	// `arr` carries the array columns on its own table so foo's many asserts are
-	// untouched.
+	// untouched. Slice 63 extends the row with bool[] and numeric(p,s)[] columns:
+	// these previously fell back to their scalar element OID because only
+	// int2/int4/int8/text had array OID mappings. The numeric array additionally
+	// exercises the typmod path — format_type carries the element typmod onto the
+	// array, so `prices numeric(10,2)[]` must round-trip precision/scale.
 	if err := runSQLSimple(t, c, "CREATE TABLE public.arr (id integer PRIMARY KEY, "+
-		"tags text[], scores integer[], big bigint[])"); err != nil {
+		"tags text[], scores integer[], big bigint[], "+
+		"flags boolean[], prices numeric(10,2)[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -868,11 +873,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// the scalar OID to the array OID in buildUserPGAttributeRow, so each column
 		// dumps with its declared array type. Regression guard for the IsArray
 		// plumbing (parser → catalog.Type → pg_attribute.atttypid).
+		// Slice 63 adds boolean[] and numeric(10,2)[]: bool/numeric now map to
+		// their array OIDs (_bool 1000, _numeric 1231), and the numeric array
+		// carries the element typmod so precision/scale survive the dump.
 		arrCols := []string{
 			"CREATE TABLE public.arr (",
 			"tags text[]",
 			"scores integer[]",
 			"big bigint[]",
+			"flags boolean[]",
+			"prices numeric(10,2)[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

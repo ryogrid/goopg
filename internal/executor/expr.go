@@ -10379,6 +10379,8 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "real"
 	case 701:
 		return "double precision"
+	case 1000:
+		return "boolean[]"
 	case 1005:
 		return "smallint[]"
 	case 1007:
@@ -10387,6 +10389,10 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "text[]"
 	case 1016:
 		return "bigint[]"
+	case 1231:
+		// _numeric: format_type strips the array, formats the element with
+		// the carried typmod, then re-appends []. DU-002 slice 63.
+		return formatTypeOID(1700, typmod) + "[]"
 	case 1042:
 		if typmod > 4 {
 			return fmt.Sprintf("character(%d)", typmod-4)

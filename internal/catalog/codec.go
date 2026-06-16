@@ -72,13 +72,16 @@ const (
 	OIDNumeric     uint32 = 1700
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
-	// array columns. These mirror pg_type.typarray for int2/int4/int8/text and
-	// are the OIDs format_type renders as `smallint[]`/`integer[]`/`bigint[]`/
-	// `text[]`. DU-002 slice 62.
-	OIDArrayInt2 uint32 = 1005
-	OIDArrayInt4 uint32 = 1007
-	OIDArrayText uint32 = 1009
-	OIDArrayInt8 uint32 = 1016
+	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
+	// bool/numeric and are the OIDs format_type renders as `smallint[]`/
+	// `integer[]`/`bigint[]`/`text[]`/`boolean[]`/`numeric[]`. DU-002 slice 62
+	// (int2/int4/int8/text); slice 63 added bool/numeric.
+	OIDArrayBool    uint32 = 1000
+	OIDArrayInt2    uint32 = 1005
+	OIDArrayInt4    uint32 = 1007
+	OIDArrayText    uint32 = 1009
+	OIDArrayInt8    uint32 = 1016
+	OIDArrayNumeric uint32 = 1231
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -87,6 +90,8 @@ const (
 // array columns (int2/int4/int8/text). DU-002 slice 62.
 func ArrayOIDForBase(baseOID uint32) uint32 {
 	switch baseOID {
+	case OIDBool:
+		return OIDArrayBool
 	case OIDInt2:
 		return OIDArrayInt2
 	case OIDInt4:
@@ -95,6 +100,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayInt8
 	case OIDText:
 		return OIDArrayText
+	case OIDNumeric:
+		return OIDArrayNumeric
 	}
 	return 0
 }
@@ -105,6 +112,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 // DU-002 slice 62.
 func BaseOIDForArray(oid uint32) (uint32, bool) {
 	switch oid {
+	case OIDArrayBool:
+		return OIDBool, true
 	case OIDArrayInt2:
 		return OIDInt2, true
 	case OIDArrayInt4:
@@ -113,6 +122,8 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDInt8, true
 	case OIDArrayText:
 		return OIDText, true
+	case OIDArrayNumeric:
+		return OIDNumeric, true
 	}
 	return 0, false
 }

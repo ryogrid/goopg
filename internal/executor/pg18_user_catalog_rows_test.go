@@ -385,16 +385,21 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 	tbl := &catalog.Table{Schema: "public", Name: "t", OID: 16500}
 	cases := []struct {
 		typeName    string
+		args        []int64
 		wantTypOID  int64
 		wantDisplay string
 	}{
-		{"text", 1009, "text[]"},
-		{"int2", 1005, "smallint[]"},
-		{"int4", 1007, "integer[]"},
-		{"int8", 1016, "bigint[]"},
+		{"text", nil, 1009, "text[]"},
+		{"int2", nil, 1005, "smallint[]"},
+		{"int4", nil, 1007, "integer[]"},
+		{"int8", nil, 1016, "bigint[]"},
+		// Slice 63: bool/numeric arrays. The numeric array carries the element
+		// typmod, so precision/scale must survive onto the array display.
+		{"bool", nil, 1000, "boolean[]"},
+		{"numeric", []int64{10, 2}, 1231, "numeric(10,2)[]"},
 	}
 	for _, tc := range cases {
-		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true}, Ordinal: 0}
+		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}
 		row := buildUserPGAttributeRow(tbl, col)
 		if got := row[atttypidIdx].Int; got != tc.wantTypOID {
 			t.Errorf("%s[]: atttypid=%d want %d", tc.typeName, got, tc.wantTypOID)

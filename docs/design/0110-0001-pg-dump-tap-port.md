@@ -1379,9 +1379,29 @@ fixed one logical group per loop:
     `IsArray` via `catalog.BaseOIDForArray`, so an array column round-trips across
     restart (heap-write ↔ heap-read sibling paths kept in sync). Guarded
     end-to-end by `TestPort_PgDumpConnectionSetup` (the `arr` fixture) and by
-    `executor.TestUserPGAttributeArrayColumn`. Fidelity gap: only int2/int4/int8/
-    text arrays are mapped; other element types (numeric[], bool[], …) still fall
-    back to their scalar OID until their array OID + `format_type` rendering land.
+    `executor.TestUserPGAttributeArrayColumn`. (Slice 62 mapped int2/int4/int8/
+    text; slice 63 below extended the set to bool/numeric.)
+  - **Slice 63 — bool/numeric array columns (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`, `internal/executor/expr.go`).**
+    Slice 62 only mapped int2/int4/int8/text element types, so a `flags
+    boolean[]` or `prices numeric(10,2)[]` column silently fell back to its
+    scalar element OID and dumped as `boolean`/`numeric(10,2)` — the array
+    dimension was lost. The DDL and heap-loader paths were already generic (they
+    route through `catalog.ArrayOIDForBase`/`BaseOIDForArray`), so this slice only
+    extended the three element-type-keyed tables: `ArrayOIDForBase`/
+    `BaseOIDForArray` gain `bool↔_bool` (1000) and `numeric↔_numeric` (1231)
+    cases; `userTypeAttrsForOID` gains the `_bool`/`_numeric` rows (both `typlen=-1`,
+    `typalign='i'`, `typstorage='x'`); and `formatTypeOID` renders 1000 as
+    `boolean[]` and 1231 by recursing on the element type (`formatTypeOID(1700,
+    typmod) + "[]"`) so the carried element typmod yields `numeric(10,2)[]` rather
+    than a bare `numeric[]`. Because `atttypmod` already carries the ELEMENT typmod
+    (computed from the base OID before the array remap, slice 62), the
+    precision/scale round-trip needed no new plumbing. Guarded by the enriched
+    `arr` fixture (`flags boolean[]`, `prices numeric(10,2)[]`) in
+    `TestPort_PgDumpConnectionSetup` and the new bool/numeric rows in
+    `executor.TestUserPGAttributeArrayColumn`. Remaining gap: other element types
+    (date[], timestamp[], uuid[], …) still fall back to their scalar OID until
+    their array OID + `format_type` rendering land.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1422,7 +1442,9 @@ followed by the synthesized wrapped-CTE body `WITH RECURSIVE foo_rec(n) AS
 (SELECT 1 UNION ALL SELECT n + 1 FROM foo_rec WHERE n < 5) SELECT n FROM
 foo_rec;`; slice 62 asserts array-typed columns round-trip as their array type —
 `CREATE TABLE public.arr (` with `tags text[]`, `scores integer[]`, and `big
-bigint[]`.
+bigint[]`; slice 63 extends the `arr` fixture so a `flags boolean[]` and a
+`prices numeric(10,2)[]` column also round-trip (the numeric array carrying its
+element precision/scale).
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
