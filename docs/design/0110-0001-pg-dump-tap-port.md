@@ -2447,6 +2447,32 @@ so they normalize like `timestamptz`/`interval`. The internal `"char"` type
 of scope for this slice. Still excluded base types: `timestamptz`, `interval`,
 `money`, `tsvector`, `tsquery`, `"char"`.
 
+### DU-002 slice 108 — `interval` / `money`
+
+Slice 108 promotes `interval` and `money` out of the excluded set. Both have
+native equality operators and use the bare string-with-cast shape, so they were
+not blocked by a coercion envelope — the only reason they were previously excluded
+is output normalization. Verified against real pg_dump 18.3 (`/tmp/pgcheck_du108`):
+
+| base type | deparse |
+|---|---|
+| `interval` | `VALUE = ANY (ARRAY['1 day'::interval, '02:00:00'::interval, '1 year 2 mons'::interval])` |
+| `money` | `VALUE = ANY (ARRAY['$1.00'::money, '$2.50'::money])` |
+
+The catch is identical to the jsonb-scalar contract: byte identity holds **only for
+already-canonical inputs**. `interval`'s output function normalizes (`'2 hours'` →
+`'02:00:00'`), and `money`'s output depends on `lc_monetary` (the default C/POSIX
+locale yields `'$1.00'`). The fixtures therefore use values that are already in the
+type's canonical output form, so the stored→deparse round-trip in real PG produces
+the same literal goopg echoes. A non-canonical input (`'2 hours'`) or a non-C
+`lc_monetary` would diverge, so the slice is scoped to canonical fixtures and the
+contract is documented in `domainInValuesCheckExpr`.
+
+Still excluded base types after slice 108: `timestamptz` (re-renders the stored
+constant in the session timezone), `tsvector`/`tsquery` (re-render lexemes
+single-quoted, `'cat'` → `'''cat'''`), and the internal `"char"` (OID 18,
+quote-state not tracked).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

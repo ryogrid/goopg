@@ -8716,6 +8716,8 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 //	tid        VALUE = ANY (ARRAY['(0,1)'::tid, '(1,2)'::tid])
 //	xid        VALUE = ANY (ARRAY['100'::xid, '200'::xid])
 //	cid        VALUE = ANY (ARRAY['5'::cid, '10'::cid])
+//	interval   VALUE = ANY (ARRAY['1 day'::interval, '02:00:00'::interval])
+//	money      VALUE = ANY (ARRAY['$1.00'::money, '$2.50'::money])
 //
 // text and bpchar have native equality operators, so PG emits a bare per-element
 // cast with no coercion wrapper. character varying has no varchar-eq operator and
@@ -8748,11 +8750,16 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 // bit's cast type is quoted (`::"bit"`) by the deparser. pg_lsn/tid/xid/cid all
 // have native equality operators and canonical input forms that round-trip
 // verbatim through the bare string-with-cast shape (`'16/B374D848'::pg_lsn`,
-// `'(0,1)'::tid`, `'100'::xid`, `'5'::cid`). timestamptz, interval, money,
-// tsvector and tsquery remain deliberately excluded — timestamptz re-renders the
-// stored constant in the session timezone, interval normalizes (e.g. '2 hours'→
-// '02:00:00'), money depends on lc_monetary, and tsvector/tsquery re-render their
-// lexemes with single quotes ('a b'→'''a'' ''b'''). The internal "char" type
+// `'(0,1)'::tid`, `'100'::xid`, `'5'::cid`). interval and money also have native
+// equality operators and use the bare string-with-cast shape, but only their
+// canonical-output forms round-trip byte-identically: interval's output function
+// normalizes ('2 hours'→'02:00:00') and money's output depends on lc_monetary
+// (the default C/POSIX locale yields '$1.00'), so the fixtures use already-canonical
+// values ('1 day'/'02:00:00'/'1 year 2 mons', '$1.00'/'$2.50') — the same
+// canonical-only contract as jsonb scalars. timestamptz, tsvector and tsquery
+// remain deliberately excluded — timestamptz re-renders the stored constant in the
+// session timezone, and tsvector/tsquery re-render their lexemes with single quotes
+// ('a b'→'''a'' ''b'''; bareword 'cat'→'''cat'''). The internal "char" type
 // (OID 18) is also excluded: TypeNameToOID maps "char" to bpchar (OID 1042), so
 // the quoted-vs-unquoted distinction needed to emit `::"char"` is not tracked. Note jsonb byte-identity holds
 // only for already-canonical values — non-scalar jsonb (e.g. objects) is
@@ -8762,7 +8769,8 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 // DU-002 slices 97 (text), 98 (char/varchar), 99 (integer/numeric),
 // 100 (bigint/boolean/date), 101 (real/float8/timestamp/time/uuid),
 // 102 (smallint/bytea/inet), 103 (macaddr/macaddr8/cidr), 104 (name/jsonb),
-// 105 (json), 106 (xml/oid/bit/varbit), 107 (pg_lsn/tid/xid/cid).
+// 105 (json), 106 (xml/oid/bit/varbit), 107 (pg_lsn/tid/xid/cid),
+// 108 (interval/money).
 func domainInValuesCheckExpr(baseType string, vals []string) string {
 	if len(vals) == 0 {
 		return ""
@@ -8846,6 +8854,20 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		// cid has a native equality operator; the decimal command-id form
 		// round-trips verbatim through `::cid`.
 		castType = "cid"
+	case catalog.OIDInterval:
+		// interval has a native equality operator. Its output function
+		// normalizes the stored value (e.g. '2 hours'→'02:00:00'), so byte
+		// identity holds only for already-canonical inputs ('1 day',
+		// '02:00:00', '1 year 2 mons'), which round-trip verbatim through
+		// `::interval` — the same canonical-only contract as jsonb scalars.
+		castType = "interval"
+	case catalog.OIDMoney:
+		// money has a native equality operator. Its output depends on
+		// lc_monetary; under the default C/POSIX locale the canonical form is
+		// '$1.00', which round-trips verbatim through `::money`. Non-canonical
+		// inputs or a non-C lc_monetary would re-render, so the fixtures use
+		// the canonical C-locale form.
+		castType = "money"
 	case catalog.OIDCidr:
 		// cidr has no cidr-eq operator, so PG coerces both sides to inet
 		// (the element cast stays ::cidr, the envelope is ::inet / ::inet[]).

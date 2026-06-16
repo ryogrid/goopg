@@ -1971,6 +1971,27 @@ object support.
         (`timestamptz`/`interval`/`money`/`tsvector`/`tsquery`/`"char"`) each need
         render-normalization or parser quote-state; OR move to a new object type
         (composite CREATE TYPE AS / range / enum CHECK).
+      - **PROGRESS 2026-06-17 (loop #71):** **DU-002 slice 108 LANDED** —
+        `interval` and `money` promoted out of the excluded set. Both already had
+        native equality operators (no coercion envelope) — they were excluded only
+        for output normalization, not deparse shape. `domainInValuesCheckExpr`:
+        each gets a bare string-with-cast case (`castType` = `interval` / `money`)
+        → `VALUE = ANY (ARRAY['1 day'::interval, '02:00:00'::interval,
+        '1 year 2 mons'::interval])` and `VALUE = ANY (ARRAY['$1.00'::money,
+        '$2.50'::money])`. Byte identity holds only for already-canonical inputs
+        (interval's output normalizes `'2 hours'`→`'02:00:00'`; money's output
+        depends on `lc_monetary`, C/POSIX→`'$1.00'`), so the fixtures use canonical
+        values — the same canonical-only contract as jsonb scalars. Verified
+        byte-identical to real pg_dump 18.3 (`/tmp/pgcheck_du108`, cluster removed).
+        Re-probed + still **excluded**: `tsvector`/`tsquery` (lexemes re-render
+        single-quoted, bareword `'cat'`→`'''cat'''`); `timestamptz` (session-tz
+        re-render); `"char"` (OID 18, quote-state untracked). Fixtures `iv_in`/
+        `mny_in` + columns `ivi`/`mnyi` on `public.dom`. Gates: build+vet OK;
+        catalog/parser unit PASS; `TestPort_PgDumpConnectionSetup` PASS (2.19s);
+        pgbench pre-commit smoke on commit. **Next blocker:** only `timestamptz`/
+        `tsvector`/`tsquery`/`"char"` base types remain (each needs session-tz
+        normalization, lexeme requoting, or parser quote-state); OR move to a new
+        object type (composite CREATE TYPE AS / range / enum CHECK).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text
