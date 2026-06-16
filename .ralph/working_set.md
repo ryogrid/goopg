@@ -1,38 +1,33 @@
-Task: DU-002 slice 115 — sequence-dump downstream links (COMPLETE, committing).
-Pivoted off exhausted domain-IN-values track to the sequence object surface.
+Task: DU-002 slice 116 — surface sequences in pg_class (relkind='S', relam=0) so
+pg_dump discovers + dumps them. COMPLETE, committing.
 
 Files:
-- internal/catalog/catalog.go — added `SeqParams` struct + `SequenceParamsFunc`
-  hook (near VirtualSpecLockRowsFunc); replaced empty pg_sequence (OID 2224)
-  VirtualRows stub with a builder iterating `c.tables` for IsSequence (seqrelid=
-  Table.OID; params via the hook).
-- internal/executor/operators_sequence.go — `init()` sets
-  catalog.SequenceParamsFunc = sequenceParamsForCatalog (LookupSequence-backed);
-  + seqTypeOID helper (smallint=21/integer=23/bigint=20).
-- internal/executor/operators_pg_get_sequence_data.go — real SRF (was 0-row
-  stub): outerSlot+BindLateralOuter, evalExprSlot arg, verifyHeapamResolveTable,
-  project sequence VirtualRows [last_value,log_cnt,is_called] → (last_value,is_called).
-- internal/executor/operators_pg_get_sequence_data_test.go — TestPgGetSequenceDataPopulated.
-- docs/design/0110-0001-pg-dump-tap-port.md — Slice 115 section.
-- .ralph/fix_plan.md — loop #79 progress note.
+- internal/catalog/catalog.go — pg_class VirtualRows: added `!t.IsSequence` to the
+  system-virtual skip; `relam` is now a var ("2" default, "0" for sequences);
+  `IsSequence → relkind="S"` branch. Refreshed the now-stale pg_sequence builder
+  comment that claimed sequences were hidden.
+- internal/executor/operators_pg_get_sequence_data_test.go — TestSequenceSurfacedInPgClass
+  (sequence appears in pg_class, relkind='S', relam=0).
+- internal/testport/pgdump_connsetup_test.go — fixture: CREATE SEQUENCE plain_seq +
+  num_seq(START 100 INCREMENT 10 MAXVALUE 1000); assertions for default-suppressed
+  clauses, explicit params, and ABSENCE of OWNED BY (standalone seq).
+- docs/design/0110-0001-pg-dump-tap-port.md — Slice 116 section.
+- .ralph/fix_plan.md — loop #80 progress note.
 
-Key symbols: catalog.SeqParams, catalog.SequenceParamsFunc, pgSequence.VirtualRows,
-sequenceParamsForCatalog, seqTypeOID, pgGetSequenceDataOp, verifyHeapamResolveTable,
-evalExprSlot, LookupSequence, AllSequenceInfos.
+Key symbols: pgClass VirtualRows (catalog.go ~L1913), relam, relkind, t.IsSequence,
+RELKIND_HAS_TABLE_AM (PG excludes RELKIND_SEQUENCE → relam=0).
 
-Findings: sequences ARE catalog Tables (IsSequence, OID=seqrelid) created by
-execCreateSequence; metadata lives ONLY in executor seqRegistry (single source of
-truth) → hook pattern, no catalog→executor import. Links are inert until pg_class
-lists the sequence (relkind='S'), so this slice is regression-free; e2e fixture has
-no sequence so pg_sequence stays empty there (dump unchanged, verified).
+Findings: relam=0 is load-bearing — pg_amcheck's relation CTE only heap-verifies
+relam=HEAP_TABLE_AM_OID, so relam=0 keeps the storage-less virtual sequence out of
+verify_heapam (relam=2 would regress TestPort_PgAmcheck* which creates a sequence).
+pg_dump getTableAttrs skips sequences (continue), so pg_attribute fidelity is moot.
+Manual dump capture confirmed EXIT=0 + byte-identical output vs pg_dump 18.3, only
+OWNER TO (no OWNED BY) for a standalone sequence.
 
-Gates run: build+gofmt OK; catalog/planner/executor(full)/initdb unit PASS;
-TestPort_PgDumpConnectionSetup PASS (2.19s, unchanged); pgbench pre-commit smoke on commit.
+Gates run: build+gofmt OK; catalog/planner/initdb/executor(full) unit PASS;
+TestPort_PgDumpConnectionSetup PASS (2.29s, EXIT=0 verified); TestPort_PgAmcheck*
+PASS (42.8s); pgbench pre-commit smoke on commit.
 
-Next step: SLICE 116 — flip pg_class VirtualRows to emit relkind='S' for IsSequence
-tables (stop skipping at the `t.Virtual && t.View==nil && !t.IsMatView` continue);
-add a CREATE SEQUENCE to the TestPort_PgDumpConnectionSetup fixture; assert the dump
-emits a byte-identical `CREATE SEQUENCE` + `SELECT setval(...)` vs real pg_dump 18.3.
-Watch: correlated-lateral SRF path under non-empty pg_sequence; pg_dump getOwnedSeqs/
-pg_depend must NOT emit a spurious `OWNED BY` for a standalone sequence; sequence's
-relnatts=3 (last_value/log_cnt/is_called) — confirm pg_dump skips column dump for 'S'.
+Next step: SLICE 117 — typed sequences (AS smallint/AS integer via seqtypid 21/23,
+pg_dump emits `AS smallint`/`AS integer`) + a CYCLE sequence; or a sequence WITH
+OWNED BY exercising the pg_depend 'a' path + `ALTER SEQUENCE ... OWNED BY` emission.

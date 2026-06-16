@@ -2719,6 +2719,58 @@ row with the declared params, the full `getSequences`-join shape yielding
 `last_value`=start / `is_called`=false, a direct `'s'::regclass` call, and the
 post-`nextval` flip to `is_called`=true.
 
+### Slice 116 — surface sequences in `pg_class` (`relkind='S'`, `relam=0`)
+
+Slice 116 is the **keystone** that makes pg_dump *discover* a sequence and dump it.
+pg_dump's `getTables` selects `relkind IN ('r','S','v','c','m','f','p')`; until now
+goopg's `pg_class` `VirtualRows` builder skipped every system virtual table
+(`Virtual && View==nil && !IsMatView`), and user sequences — which are also virtual
+tables (`IsSequence`, OID = the sequence's pg_class OID) — were swept up in that skip.
+So `getTables` never saw a `relkind='S'` relation and no `CREATE SEQUENCE` was ever
+emitted. The slice adds an `!IsSequence` exception to the skip and an `IsSequence →
+relkind='S'` branch to the relkind selector. With slices 115's `pg_sequence` row and
+`pg_get_sequence_data` SRF already in place, the chain is complete:
+`getTables` (discovery) → `dumpSequence` (DDL from `pg_sequence`) → `dumpSequenceData`
+(`setval()` from the SRF).
+
+**`relam=0` is load-bearing, not cosmetic.** PostgreSQL stores `pg_class.relam=0`
+for sequences: `RELKIND_HAS_TABLE_AM` (pg_class.h) deliberately *excludes*
+`RELKIND_SEQUENCE` — a sequence uses the heap AM only at the relcache level
+(`rd_tableam`), never via `pg_class.relam` (so `DefineRelation` leaves
+`accessMethodId` invalid for a sequence). Emitting `relam=0` therefore matches real
+PG **and** keeps the storage-less virtual sequence out of `pg_amcheck`: its
+relation-selection CTE only heap-verifies relations with
+`relam = HEAP_TABLE_AM_OID`, so a `relam=0` sequence is never fed to `verify_heapam`
+(which would fail — the sequence has no heap blocks). Had we emitted `relam=2`
+(heap), the existing `TestPort_PgAmcheck*` runs that create a sequence would have
+started failing. (pg_dump never reads `relam` for a sequence, and `getTableAttrs`
+skips sequences entirely via `if (relkind == RELKIND_SEQUENCE) continue;`, so
+`pg_attribute` fidelity is irrelevant here.)
+
+**Byte-exact output (verified vs pg_dump 18.3).** A plain `CREATE SEQUENCE
+public.plain_seq` dumps with all-default clauses; an explicit one round-trips its
+parameters:
+
+```sql
+CREATE SEQUENCE public.plain_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+...
+SELECT pg_catalog.setval('public.plain_seq', 1, false);
+```
+
+A **standalone** sequence (no `OWNED BY`) has no `pg_depend` `'a'`/`'i'` row, so
+pg_dump emits **no** `ALTER SEQUENCE ... OWNED BY` (only the `OWNER TO` role ALTER,
+which every relation gets). The e2e `TestPort_PgDumpConnectionSetup` fixture now
+creates both a plain and an explicit-parameter sequence and asserts the exact
+default-suppressed clauses, the explicit `START WITH 100 / INCREMENT BY 10 /
+MAXVALUE 1000`, and the **absence** of any `OWNED BY`. Unit coverage:
+`executor.TestSequenceSurfacedInPgClass` (sequence appears in `pg_class` with
+`relkind='S'`, `relam=0`).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

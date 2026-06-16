@@ -124,3 +124,36 @@ func TestPgGetSequenceDataPopulated(t *testing.T) {
 		t.Errorf("post-nextval = (%d, %v), want (5, true)", arows[0][0].Int, arows[0][1].BoolValue())
 	}
 }
+
+// TestSequenceSurfacedInPgClass is the slice-116 keystone: a user sequence must
+// appear in pg_class with relkind='S' (so pg_dump's getTables — which selects
+// relkind IN ('r','S','v','c','m','f','p') — discovers it and dumps it via
+// dumpSequence) and relam=0 (PG sets pg_class.relam=0 for sequences;
+// RELKIND_HAS_TABLE_AM excludes RELKIND_SEQUENCE). relam=0 is load-bearing for
+// pg_amcheck parity: its relation CTE only heap-verifies relations with
+// relam=HEAP_TABLE_AM_OID, so a storage-less virtual sequence is excluded.
+// M0110-0001 (DU-002 slice 116).
+func TestSequenceSurfacedInPgClass(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE SEQUENCE public.numbers"); err != nil {
+		t.Fatalf("CREATE SEQUENCE: %v", err)
+	}
+
+	rows := runQueryRows(t, ctx,
+		"SELECT relname, relkind, relam, relnamespace FROM pg_catalog.pg_class "+
+			"WHERE relname = 'numbers'")
+	if len(rows) != 1 {
+		t.Fatalf("pg_class rows for sequence = %d, want 1 (sequence must be discoverable)", len(rows))
+	}
+	if got := rows[0][0].StringValue(); got != "numbers" {
+		t.Errorf("relname = %q, want \"numbers\"", got)
+	}
+	if got := rows[0][1].StringValue(); got != "S" {
+		t.Errorf("relkind = %q, want \"S\" (sequence)", got)
+	}
+	if got := rows[0][2].Int; got != 0 {
+		t.Errorf("relam = %d, want 0 (sequences have no table AM; keeps pg_amcheck out)", got)
+	}
+}

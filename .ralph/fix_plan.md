@@ -2178,6 +2178,37 @@ object support.
         pg_dump 18.3 (verify the correlated-lateral SRF path under a non-empty
         pg_sequence; check pg_dump's getOwnedSeqs/pg_depend handling for a
         standalone sequence emits no spurious `OWNED BY`).
+      - **PROGRESS 2026-06-17 (loop #80):** **DU-002 slice 116 LANDED** — the
+        **keystone** that makes pg_dump *discover* and dump sequences. pg_dump's
+        `getTables` selects `relkind IN ('r','S','v','c','m','f','p')`; goopg's
+        pg_class VirtualRows skipped all system virtual tables and swept up user
+        sequences (IsSequence virtual tables) in that skip, so no `relkind='S'`
+        relation was ever discovered. Added an `!IsSequence` exception to the skip
+        + an `IsSequence → relkind='S'` branch, completing the chain getTables →
+        dumpSequence (DDL from slice-115 `pg_sequence`) → dumpSequenceData
+        (`setval()` from slice-115 SRF). **`relam=0` is load-bearing:** PG stores
+        `pg_class.relam=0` for sequences (`RELKIND_HAS_TABLE_AM` excludes
+        `RELKIND_SEQUENCE`; the heap AM is used only at the relcache `rd_tableam`
+        level), and emitting 0 keeps the storage-less virtual sequence out of
+        pg_amcheck's heap CTE (`relam=HEAP_TABLE_AM_OID` gate) — relam=2 would have
+        regressed the existing `TestPort_PgAmcheck*` runs that create a sequence.
+        Verified vs pg_dump 18.3: plain `CREATE SEQUENCE` dumps byte-identically
+        (`START WITH 1 / INCREMENT BY 1 / NO MINVALUE / NO MAXVALUE / CACHE 1` +
+        `setval(...,1,false)`); explicit params round-trip; standalone sequence
+        emits NO `OWNED BY` (no pg_depend 'a'/'i' row), only `OWNER TO`. Files:
+        `internal/catalog/catalog.go` (pg_class skip+relkind+relam; pg_sequence
+        comment refresh), `internal/executor/operators_pg_get_sequence_data_test.go`
+        (TestSequenceSurfacedInPgClass), `internal/testport/pgdump_connsetup_test.go`
+        (2 fixture sequences + assertions incl. OWNED-BY absence),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 116 section). Gates:
+        build+gofmt OK; catalog/planner/initdb/executor(full) unit PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.29s, EXIT=0 confirmed via manual
+        dump capture); `TestPort_PgAmcheck*` PASS (42.8s, no sequence regression);
+        pgbench pre-commit smoke on commit. **Next: slice 117** — extend sequence
+        coverage to `AS smallint`/`AS integer` typed sequences (seqtypid 21/23 →
+        pg_dump emits `AS smallint`/`AS integer`) and a CYCLE sequence; or pivot to
+        the next pg_dump object surface (e.g. a sequence with `OWNED BY` exercising
+        the pg_depend 'a' path + `ALTER SEQUENCE ... OWNED BY` emission).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

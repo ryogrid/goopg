@@ -539,6 +539,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create materialized view foo_mv: %v", err)
 	}
 
+	// Slice 116: a standalone SEQUENCE must be DISCOVERED and dumped. pg_dump's
+	// getTables selects relkind IN ('r','S','v','c','m','f','p'); until this slice
+	// goopg hid sequences from the pg_class virtual view, so getTables never saw a
+	// relkind='S' relation and no CREATE SEQUENCE was emitted. pg_class now surfaces
+	// each IsSequence relation as relkind='S' (relam=0, keeping the storage-less
+	// virtual sequence out of pg_amcheck's heap CTE), so getTables discovers it and
+	// dumpSequence regenerates the DDL from pg_sequence (slice 115's params) plus a
+	// trailing setval() from pg_get_sequence_data (slice 115's SRF). A plain
+	// `CREATE SEQUENCE` dumps as `START WITH 1 / INCREMENT BY 1 / NO MINVALUE /
+	// NO MAXVALUE / CACHE 1`; an explicit one round-trips its parameters. A
+	// standalone sequence (no OWNED BY) has no pg_depend 'a'/'i' row, so pg_dump
+	// emits NO `ALTER SEQUENCE ... OWNED BY`.
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.plain_seq"); err != nil {
+		t.Fatalf("create sequence plain_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.num_seq START WITH 100 INCREMENT BY 10 MAXVALUE 1000"); err != nil {
+		t.Fatalf("create sequence num_seq: %v", err)
+	}
+
 	// Slice 61: a RECURSIVE VIEW must survive the dump. PG stores a recursive
 	// view as a regular view over a WITH RECURSIVE CTE; pg_dump fetches the body
 	// via the SAME pg_get_viewdef path as a plain view and aborts the WHOLE dump
@@ -1256,6 +1275,35 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped a MATERIALIZED VIEW; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// **Slice 116 (asserted):** a standalone SEQUENCE must round-trip. pg_dump's
+		// getTables now discovers the relkind='S' relation (pg_class surfaces each
+		// IsSequence table) and dumpSequence regenerates the DDL from pg_sequence
+		// (slice 115). A plain `CREATE SEQUENCE` emits all-default clauses; an
+		// explicit one round-trips START WITH / INCREMENT BY / MAXVALUE. The plain
+		// sequence's defaults pin pg_dump's exact byte output (NO MINVALUE / NO
+		// MAXVALUE / CACHE 1). A standalone sequence has no OWNED BY (no pg_depend
+		// 'a'/'i' row), so assert that clause is ABSENT. Regression guard for the
+		// pg_class relkind='S' / relam=0 surfacing.
+		seqDefs := []string{
+			"CREATE SEQUENCE public.plain_seq",
+			"CREATE SEQUENCE public.num_seq",
+			"START WITH 100",
+			"INCREMENT BY 10",
+			"MAXVALUE 1000",
+			"NO MINVALUE",
+			"NO MAXVALUE",
+			"CACHE 1;",
+		}
+		for _, sub := range seqDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a SEQUENCE; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// A standalone sequence (no OWNED BY) must NOT emit ALTER SEQUENCE OWNED BY.
+		if strings.Contains(res.Stdout, "ALTER SEQUENCE public.plain_seq OWNED BY") ||
+			strings.Contains(res.Stdout, "ALTER SEQUENCE public.num_seq OWNED BY") {
+			t.Errorf("pg_dump emitted a spurious OWNED BY for a standalone sequence\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 61 (asserted):** a RECURSIVE VIEW must round-trip. PG stores it
 		// as a regular view over a WITH RECURSIVE CTE and pg_dump re-emits a plain

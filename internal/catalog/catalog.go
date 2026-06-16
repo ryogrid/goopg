@@ -1911,13 +1911,30 @@ func (c *InMemory) registerSystemTables() {
 		out := make([][]string, 0, len(c.tables)+len(c.indexes))
 		for _, k := range keys {
 			t := c.tables[k]
-			if t.Virtual && t.View == nil && !t.IsMatView {
+			if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
 				// Skip system-catalog virtual tables (pg_class, pg_locks, etc.)
-				// but include user views (t.View != nil) and materialized views.
+				// but include user views (t.View != nil), materialized views, and
+				// user sequences (relkind='S'). Sequences are virtual tables too,
+				// but unlike system catalogs they must be discoverable by pg_dump's
+				// getTables (which selects relkind IN ('r','S','v','c','m','f','p'))
+				// so the sequence is dumped via dumpSequence. M0110-0001 (DU-002
+				// slice 116).
 				continue
 			}
 			relkind := "r"
-			if t.View != nil && !t.IsMatView {
+			// relam: heap (2) for ordinary relations; 0 for sequences. PG sets
+			// pg_class.relam=0 for sequences (RELKIND_HAS_TABLE_AM excludes
+			// RELKIND_SEQUENCE — see pg_class.h: sequences use the heap AM only at
+			// the relcache level, not via pg_class.relam). This is load-bearing for
+			// pg_amcheck parity: its relation CTE selects only relations with
+			// relam=HEAP_TABLE_AM_OID for heap verification, so relam=0 keeps the
+			// storage-less virtual sequence out of verify_heapam (which would fail).
+			// M0110-0001 (DU-002 slice 116).
+			relam := "2"
+			if t.IsSequence {
+				relkind = "S"
+				relam = "0"
+			} else if t.View != nil && !t.IsMatView {
 				relkind = "v"
 			} else if t.IsMatView {
 				relkind = "m"
@@ -1983,7 +2000,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",                          // 3:  reltype
 				"0",                          // 4:  reloftype
 				"10",                         // 5:  relowner (bootstrap superuser)
-				"2",                          // 6:  relam (heap=2)
+				relam,                        // 6:  relam (heap=2; 0 for sequences)
 				strconv.Itoa(int(t.OID)),     // 7:  relfilenode
 				"0",                          // 8:  reltablespace
 				"0",                          // 9:  relpages
@@ -4460,14 +4477,11 @@ func (c *InMemory) registerSystemTables() {
 	//   ORDER BY seqrelid
 	// (an implicit-LATERAL comma join with the set-returning function
 	// pg_get_sequence_data, which supplies the runtime last_value/is_called).
-	// goopg's sequence virtual tables are skipped from the pg_class virtual view
-	// (Virtual && View==nil; see the pg_class VirtualRows builder above), so
-	// pg_dump's getTables never discovers a relkind='S' relation and no sequence
-	// is ever dumped. An empty pg_sequence (0 rows) is therefore consistent with
-	// the current relation-discovery story, and pg_get_sequence_data is never
-	// invoked over the empty set. Full sequence-dump support (surfacing sequences
-	// as relkind='S' in pg_class, then populating seqrelid here from the sequence
-	// registry) is a larger follow-up slice. pg_sequence is a real catalog with
+	// As of DU-002 slice 116 the pg_class VirtualRows builder surfaces each
+	// IsSequence relation as relkind='S' (relam=0), so pg_dump's getTables
+	// discovers it and dumps it via dumpSequence; this pg_sequence row plus the
+	// pg_get_sequence_data SRF (slice 115) supply the CREATE SEQUENCE parameters
+	// and the trailing setval(). pg_sequence is a real catalog with
 	// no `oid` system column; cols match pg_sequence.h (PG18, SequenceRelationId
 	// 2224): seqrelid oid, seqtypid oid, seqstart int8, seqincrement int8,
 	// seqmax int8, seqmin int8, seqcache int8, seqcycle bool. M0110-0001
