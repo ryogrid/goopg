@@ -1887,6 +1887,26 @@ object support.
         `TestPort_PgDumpConnectionSetup` PASS (2.06s); pgbench pre-commit smoke on commit.
         **Next blocker:** json/jsonb (different `VALUE::text IN` parse shape); or move to
         a new object type (composite CREATE TYPE AS / range / enum).
+      - **PROGRESS 2026-06-17 (loop #67):** **DU-002 slice 104 LANDED** — the IN-values
+        deparse now covers two more base types with native equality operators: `name`
+        and `jsonb`. NO parser change was needed — both are string literals already
+        accepted by `tryParseCheckInValues`. `domainInValuesCheckExpr`: `OIDName`
+        (`'alice'::name`) and `OIDJsonb` (`'1'::jsonb`, `'"hello"'::jsonb`) join the
+        bare string-with-cast branch (no coercion envelope — both have their own eq
+        operator). All verified byte-identical to real pg_dump 18.3 (`/tmp/pgcheck_du104`).
+        **`jsonb` caveat:** byte-identity holds only for already-canonical jsonb values
+        — scalars (numbers, quoted strings) print identically, whereas objects are
+        re-rendered with key reordering / whitespace normalization, so the fixture uses
+        canonical scalars (`'1'`, `'"hello"'`). `json` is still deferred — it has NO
+        equality operator, so its CHECK must be `VALUE::text IN (...)`, a cast-on-VALUE
+        parse shape `tryParseCheckInValues` does not yet accept (next candidate; needs a
+        parser change). `timestamptz`/`interval`/`money` remain excluded (session-tz
+        re-render / normalization / lc_monetary). Fixtures `nm_in` (name), `jb_in`
+        (jsonb) + columns `nmi`/`jbi` added to `public.dom`. Gates: build+vet OK;
+        parser/catalog/executor unit PASS; `TestPort_PgDumpConnectionSetup` PASS (2.02s);
+        pgbench pre-commit smoke on commit. **Next blocker:** `json` (`VALUE::text IN`
+        parse-shape parser change); or move to a new object type (composite CREATE TYPE
+        AS / range / enum).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

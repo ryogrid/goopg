@@ -2352,6 +2352,27 @@ mechanism `varchar`→`text` uses (slice 98); the implementation generalised the
 old `coerceToText bool` flag into a `coerceTo string` target type so both
 `varchar`→`text` and `cidr`→`inet` share one code path.
 
+Slice 104 extends the deparse to two more base types with native equality
+operators. No parser change was needed — both are string literals. Verified
+against real pg_dump 18.3 (`/tmp/pgcheck_du104`):
+
+| base type | deparse |
+|---|---|
+| `name` | `VALUE = ANY (ARRAY['alice'::name, 'bob'::name])` |
+| `jsonb` | `VALUE = ANY (ARRAY['1'::jsonb, '"hello"'::jsonb])` |
+
+`name`/`jsonb` join the bare string-with-cast shape (`castType` = `name` / `jsonb`,
+no coercion envelope). `name` is a plain string and round-trips verbatim. `jsonb`
+has its own equality operator, so a bare `VALUE IN (...)` works — but byte-identity
+holds **only for already-canonical jsonb values**: scalars (`1`, `"hello"`) print
+identically, whereas non-scalar jsonb (objects) is re-rendered with key reordering
+and whitespace normalization. The fixtures therefore use canonical scalars.
+Deliberately still excluded: `timestamptz` (session-tz re-render), `interval`
+(normalized form), `money` (`lc_monetary`-dependent), and `json` — `json` has **no**
+equality operator, so its CHECK must be written `VALUE::text IN (...)`, a
+cast-on-`VALUE` parse shape `tryParseCheckInValues` does not yet accept (next
+candidate; needs a parser change to capture the `::text` cast on the left-hand side).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

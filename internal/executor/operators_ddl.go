@@ -8705,6 +8705,8 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 //	timestamp  VALUE = ANY (ARRAY['2020-01-01 00:00:00'::timestamp without time zone, ...])
 //	time       VALUE = ANY (ARRAY['12:00:00'::time without time zone, ...])
 //	uuid       VALUE = ANY (ARRAY['a0ee…'::uuid, 'b0ee…'::uuid])
+//	name       VALUE = ANY (ARRAY['alice'::name, 'bob'::name])
+//	jsonb      VALUE = ANY (ARRAY['1'::jsonb, '"hello"'::jsonb])
 //
 // text and bpchar have native equality operators, so PG emits a bare per-element
 // cast with no coercion wrapper. character varying has no varchar-eq operator and
@@ -8726,14 +8728,21 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 // string-with-cast shape (their canonical colon-form round-trips). cidr is special:
 // it has no cidr-eq operator and reuses inet's, so PG coerces both sides to inet —
 // the element cast stays `::cidr` but the envelope is `(VALUE)::inet = ANY
-// ((ARRAY[...])::inet[])` (same envelope mechanism as varchar→text). timestamptz
-// and interval are deliberately excluded — PG re-renders the stored constant
-// (session timezone for timestamptz, normalized form e.g. '2 hours'→'02:00:00' for
-// interval), so a verbatim deparse from the raw token text is not byte-identical.
+// ((ARRAY[...])::inet[])` (same envelope mechanism as varchar→text). name and
+// jsonb both have native equality operators, so they use the bare string-with-cast
+// shape (`'alice'::name`, `'1'::jsonb`); name is a plain string and jsonb scalars
+// (numbers, quoted strings) round-trip verbatim through jsonb's output function.
+// timestamptz, interval, money and json are deliberately excluded — timestamptz
+// re-renders the stored constant in the session timezone, interval normalizes
+// (e.g. '2 hours'→'02:00:00'), money depends on lc_monetary, and json has no
+// equality operator (its CHECK must be `VALUE::text IN (...)`, a cast-on-VALUE parse
+// shape this helper does not yet accept). Note jsonb byte-identity holds only for
+// already-canonical values — non-scalar jsonb (e.g. objects) is re-rendered with
+// key reordering / whitespace normalization, so the fixtures use canonical scalars.
 // Other non-string base types return "".
 // DU-002 slices 97 (text), 98 (char/varchar), 99 (integer/numeric),
 // 100 (bigint/boolean/date), 101 (real/float8/timestamp/time/uuid),
-// 102 (smallint/bytea/inet), 103 (macaddr/macaddr8/cidr).
+// 102 (smallint/bytea/inet), 103 (macaddr/macaddr8/cidr), 104 (name/jsonb).
 func domainInValuesCheckExpr(baseType string, vals []string) string {
 	if len(vals) == 0 {
 		return ""
@@ -8765,6 +8774,10 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		castType = "macaddr"
 	case catalog.OIDMacaddr8:
 		castType = "macaddr8"
+	case catalog.OIDName:
+		castType = "name"
+	case catalog.OIDJsonb:
+		castType = "jsonb"
 	case catalog.OIDCidr:
 		// cidr has no cidr-eq operator, so PG coerces both sides to inet
 		// (the element cast stays ::cidr, the envelope is ::inet / ::inet[]).
