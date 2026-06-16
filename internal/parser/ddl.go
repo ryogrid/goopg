@@ -5332,6 +5332,19 @@ func (p *parser) tryParseCheckInValues() []string {
 		return nil
 	}
 	p.advance() // consume VALUE
+	// Optionally accept a cast on the VALUE left-hand side, e.g.
+	// `CHECK (VALUE::text IN (...))`. Types without an equality operator (json)
+	// cannot use the bare `VALUE IN (...)` form, so the domain definition casts
+	// VALUE to a comparable type (text). The cast type itself is not retained —
+	// the deparse shape is decided from the domain's base type — but it must be
+	// consumed here so the pattern still matches. DU-002 slice 105 (json).
+	if p.cur().Kind == TokenOperator && p.cur().Value == "::" {
+		p.advance() // consume "::"
+		if _, err := p.parseTypeNameAfterCast(); err != nil {
+			p.idx = start
+			return nil
+		}
+	}
 	// Expect IN keyword.
 	if !p.acceptKeyword(KwIn) {
 		p.idx = start

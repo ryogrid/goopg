@@ -8707,6 +8707,7 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 //	uuid       VALUE = ANY (ARRAY['a0ee…'::uuid, 'b0ee…'::uuid])
 //	name       VALUE = ANY (ARRAY['alice'::name, 'bob'::name])
 //	jsonb      VALUE = ANY (ARRAY['1'::jsonb, '"hello"'::jsonb])
+//	json       (VALUE)::text = ANY (ARRAY['1'::text, '{"a": 1}'::text])
 //
 // text and bpchar have native equality operators, so PG emits a bare per-element
 // cast with no coercion wrapper. character varying has no varchar-eq operator and
@@ -8753,6 +8754,12 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 	// `(VALUE)::T = ANY ((ARRAY[...])::T[])`. Empty means no envelope (the base
 	// type's own eq operator is used directly).
 	var coerceTo string
+	// lhsCast handles the `VALUE::text IN (...)` source form (base types with no
+	// equality operator AND whose IN-list literals are already untyped string
+	// constants typed as the cast target). PG deparses `(VALUE)::T = ANY
+	// (ARRAY['...'::T, ...])` — the LHS is cast but the array is NOT re-cast,
+	// since each element literal already has type T. Empty means not used.
+	var lhsCast string
 	switch catalog.TypeNameToOID(baseType) {
 	case catalog.OIDText:
 		castType = "text"
@@ -8778,6 +8785,16 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		castType = "name"
 	case catalog.OIDJsonb:
 		castType = "jsonb"
+	case catalog.OIDJSON:
+		// json has no equality operator, so the CHECK casts VALUE to text
+		// (`CHECK (VALUE::text IN (...))`). PG deparses `(VALUE)::text = ANY
+		// (ARRAY['...'::text, ...])`: the LHS is cast but the array is not
+		// re-cast, because each IN-list literal is an untyped string constant
+		// already typed as text. Unlike jsonb, json preserves the input text
+		// verbatim (no key reordering / whitespace normalization), so even
+		// object/array values round-trip byte-identically through `::text`.
+		castType = "text"
+		lhsCast = "text"
 	case catalog.OIDCidr:
 		// cidr has no cidr-eq operator, so PG coerces both sides to inet
 		// (the element cast stays ::cidr, the envelope is ::inet / ::inet[]).
@@ -8811,6 +8828,9 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		parts[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::" + castType
 	}
 	arr := "ARRAY[" + strings.Join(parts, ", ") + "]"
+	if lhsCast != "" {
+		return "(VALUE)::" + lhsCast + " = ANY (" + arr + ")"
+	}
 	if coerceTo != "" {
 		return "(VALUE)::" + coerceTo + " = ANY ((" + arr + ")::" + coerceTo + "[])"
 	}

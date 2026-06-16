@@ -2368,10 +2368,31 @@ holds **only for already-canonical jsonb values**: scalars (`1`, `"hello"`) prin
 identically, whereas non-scalar jsonb (objects) is re-rendered with key reordering
 and whitespace normalization. The fixtures therefore use canonical scalars.
 Deliberately still excluded: `timestamptz` (session-tz re-render), `interval`
-(normalized form), `money` (`lc_monetary`-dependent), and `json` — `json` has **no**
-equality operator, so its CHECK must be written `VALUE::text IN (...)`, a
-cast-on-`VALUE` parse shape `tryParseCheckInValues` does not yet accept (next
-candidate; needs a parser change to capture the `::text` cast on the left-hand side).
+(normalized form), `money` (`lc_monetary`-dependent). `json` is handled in slice 105.
+
+### DU-002 slice 105 — `json` `CHECK (VALUE::text IN (...))`
+
+Slice 105 closes the long-deferred `json` case. `json` has **no** equality
+operator, so a bare `VALUE IN (...)` is invalid; the domain must cast the
+left-hand side, `CHECK (VALUE::text IN (...))`. This required the first
+parser change since slice 99: `tryParseCheckInValues` now accepts an optional
+`::<typename>` cast immediately after `VALUE` (consumed via
+`parseTypeNameAfterCast`, the cast type itself discarded — the deparse shape is
+decided from the domain's base type). Verified against real pg_dump 18.3
+(`/tmp/pgcheck_du105`):
+
+| base type | deparse |
+|---|---|
+| `json` | `(VALUE)::text = ANY (ARRAY['1'::text, '{"a": 1}'::text])` |
+
+This is a new deparse mode — `lhsCast` in `domainInValuesCheckExpr`: the LHS is
+cast (`(VALUE)::text`) but the array is **not** re-cast (unlike the `coerceTo`
+envelope used by `varchar`/`cidr`), because each IN-list literal is an untyped
+string constant already typed as the cast target `text`. Notably `json`
+round-trips **byte-identically even for object/array values** (`'{"a": 1}'`) —
+unlike `jsonb` (slice 104), `json` preserves the input text verbatim with no key
+reordering or whitespace normalization, so the fixture uses an object value to
+demonstrate this. Still excluded: `timestamptz`, `interval`, `money` (as above).
 
 ## Deferred (002–010) — catalog surface estimate
 

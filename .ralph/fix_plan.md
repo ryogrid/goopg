@@ -1907,6 +1907,28 @@ object support.
         pgbench pre-commit smoke on commit. **Next blocker:** `json` (`VALUE::text IN`
         parse-shape parser change); or move to a new object type (composite CREATE TYPE
         AS / range / enum).
+      - **PROGRESS 2026-06-17 (loop #68):** **DU-002 slice 105 LANDED** — `json`,
+        the long-deferred type with NO equality operator. A bare `VALUE IN (...)`
+        is invalid for json, so its CHECK casts the left-hand side:
+        `CHECK (VALUE::text IN ('1', '{"a": 1}'))`. **First parser change since
+        slice 99:** `tryParseCheckInValues` (`internal/parser/ddl.go`) now accepts
+        an optional `::<typename>` cast right after `VALUE` (consumed via
+        `parseTypeNameAfterCast`; the cast type is discarded — the deparse shape is
+        decided from the domain's base type). `domainInValuesCheckExpr`
+        (`internal/executor/operators_ddl.go`) gains `case catalog.OIDJSON` and a new
+        `lhsCast` render mode: `(VALUE)::text = ANY (ARRAY['1'::text, '{"a": 1}'::text])`
+        — the LHS is cast but the array is NOT re-cast (unlike the `coerceTo`
+        envelope of varchar/cidr), because each IN-list literal is an untyped string
+        constant already typed as the target `text`. Verified byte-identical to real
+        pg_dump 18.3 (`/tmp/pgcheck_du105`). **json beats jsonb on fidelity:** json
+        preserves the input text verbatim (no key reorder / whitespace normalization),
+        so the fixture uses an OBJECT value `'{"a": 1}'` to demonstrate byte-identity
+        that jsonb (slice 104) could not achieve. Fixture `js_in` (json) + column `jsi`
+        added to `public.dom`. Gates: build+vet OK; parser/catalog/executor unit PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.07s); pgbench pre-commit smoke on
+        commit. **Next blocker:** `timestamptz`/`interval`/`money` remain excluded
+        (session-tz re-render / normalization / lc_monetary); or move to a new object
+        type (composite CREATE TYPE AS / range / enum CHECK).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

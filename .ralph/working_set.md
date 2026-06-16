@@ -1,32 +1,32 @@
-Task: DU-002 slice 104 — `CHECK (VALUE IN (...))` over name/jsonb domains
-survives pg_dump (COMPLETE, committing).
+Task: DU-002 slice 105 — `json` domain `CHECK (VALUE::text IN (...))` survives
+pg_dump (COMPLETE, committing).
 
 Files:
-- internal/executor/operators_ddl.go — domainInValuesCheckExpr: OIDName
-  (`'alice'::name`) + OIDJsonb (`'1'::jsonb`) join the bare string-with-cast
-  branch (both have native eq operator → no coerceTo envelope). Doc-comment
-  table + slice list extended. NO parser change.
-- internal/testport/pgdump_connsetup_test.go — fixtures nm_in (name), jb_in
-  (jsonb); columns nmi/jbi on public.dom; domainDefs asserts.
-- docs/design/0110-0001-pg-dump-tap-port.md — slice 104 section (2-type table).
-- .ralph/fix_plan.md — loop #67 progress note.
+- internal/parser/ddl.go — tryParseCheckInValues now accepts an optional
+  `::<typename>` cast after VALUE (via parseTypeNameAfterCast; cast type
+  discarded, deparse shape keyed on base type). First parser change since slice 99.
+- internal/executor/operators_ddl.go — domainInValuesCheckExpr: `case
+  catalog.OIDJSON` + new `lhsCast` render mode → `(VALUE)::text = ANY
+  (ARRAY['1'::text, '{"a": 1}'::text])` (LHS cast, array NOT re-cast). Doc table
+  + slice list extended.
+- internal/testport/pgdump_connsetup_test.go — fixture js_in (json), column jsi
+  on public.dom; domainDefs assert (uses object value '{"a": 1}').
+- docs/design/0110-0001-pg-dump-tap-port.md — slice 105 section.
+- .ralph/fix_plan.md — loop #68 progress note.
 
-Key symbols: domainInValuesCheckExpr, domainInValuesCoerced, catalog.TypeNameToOID,
-tryParseCheckInValues.
+Key symbols: domainInValuesCheckExpr (lhsCast mode), tryParseCheckInValues,
+parseTypeNameAfterCast, catalog.OIDJSON.
 
-Findings: verified real pg_dump 18.3 (/tmp/pgcheck_du104, cluster removed):
-  name  → VALUE = ANY (ARRAY['alice'::name, 'bob'::name])
-  jsonb → VALUE = ANY (ARRAY['1'::jsonb, '"hello"'::jsonb])
-jsonb byte-identity holds ONLY for canonical scalars (objects re-render w/ key
-reorder + whitespace). json EXCLUDED — no eq op, CHECK must be `VALUE::text IN
-(...)` (cast-on-VALUE parse shape tryParseCheckInValues can't yet capture).
-money/timestamptz/interval excluded (lc_monetary / session-tz / normalization).
+Findings: verified real pg_dump 18.3 (/tmp/pgcheck_du105, cluster removed):
+  json → ((VALUE)::text = ANY (ARRAY['1'::text, '"hello"'::text, '{"a": 1}'::text]))
+json round-trips byte-identical EVEN for objects (verbatim text, no key reorder /
+whitespace norm) — strictly better than jsonb (slice 104, scalars only).
+timestamptz/interval/money still excluded (session-tz / normalization / lc_monetary).
 
 Gates run: go build+vet OK; parser/catalog/executor unit PASS;
-TestPort_PgDumpConnectionSetup PASS (2.02s); pgbench pre-commit smoke on commit.
+TestPort_PgDumpConnectionSetup PASS (2.07s); pgbench pre-commit smoke on commit.
 
-Next step: slice 105 candidates: (a) json via `VALUE::text IN (...)` — the
-big one, needs tryParseCheckInValues to accept a `::text` cast on the VALUE
-left-hand side, then emit the `(VALUE)::text = ANY (ARRAY['1'::text,...])` shape;
-(b) move to a new object type — composite CREATE TYPE AS (...) / range / enum
-CHECK. ADD fixture, RUN real pg_dump, let it report the real blocker.
+Next step: slice 106 candidates: (a) move to a NEW object type — composite
+CREATE TYPE AS (...) / range type / enum CHECK; or (b) the excluded base types
+need render-normalization (timestamptz session-tz, interval canonical form).
+ADD fixture, RUN real pg_dump, let it report the real blocker.

@@ -874,7 +874,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, `CREATE DOMAIN public.jb_in AS jsonb CHECK (VALUE IN ('1', '"hello"'))`); err != nil {
 		t.Fatalf("create domain jb_in: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in)"); err != nil {
+	// json has no equality operator, so the CHECK must cast VALUE to text. Unlike
+	// jsonb the input text round-trips verbatim, so an object value is byte-identical
+	// through pg_dump (no key reordering / whitespace normalization). DU-002 slice 105.
+	if err := runSQLSimple(t, c, `CREATE DOMAIN public.js_in AS json CHECK (VALUE::text IN ('1', '{"a": 1}'))`); err != nil {
+		t.Fatalf("create domain js_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1585,6 +1591,9 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.jb_in AS jsonb",
 			"CONSTRAINT jb_in_check CHECK ((VALUE = ANY (ARRAY['1'::jsonb, '\"hello\"'::jsonb])))",
 			"jbi public.jb_in",
+			"CREATE DOMAIN public.js_in AS json",
+			"CONSTRAINT js_in_check CHECK (((VALUE)::text = ANY (ARRAY['1'::text, '{\"a\": 1}'::text])))",
+			"jsi public.js_in",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {
