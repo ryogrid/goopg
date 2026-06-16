@@ -2364,6 +2364,30 @@ object support.
         (1.99s); pgbench pre-commit smoke on commit. **Next: slice 122** — a
         table+sequence+VIEW dependency-ordering case, a multi-column/explicit-START
         serial, or a mixed identity+serial table stressing the deptype graph.
+      - **PROGRESS 2026-06-17 (loop #86):** **DU-002 slice 122 LANDED** — a table
+        with TWO serial columns (`CREATE TABLE public.mser (a serial, b serial,
+        note text)`), the multi-column counterpart to slice 121's single-serial
+        table. **No production code change** — the slice-121 machinery
+        (`attrDefRowsLocked` + `dependVirtualRows`) generalizes to N columns
+        as-is. Verification value is the **sibling-path hazard**: each column's
+        `pg_attrdef` row must carry a distinct oid, and each attrdef→sequence
+        `pg_depend` NORMAL link must pair with the correct sequence; a collision
+        or crossed pairing would silently cross-wire the `nextval()` defaults
+        (`a → mser_b_seq`). `attrDefRowsLocked` numbers rows deterministically per
+        `(reloid, attnum)` sorted key, so oids are distinct + stably ordered.
+        Real pg_dump 18.3 emits, in column order, two `CREATE SEQUENCE AS integer`
+        / `OWNED BY` / `SET DEFAULT nextval()` / `setval` groups. Fixture `mser`
+        verified byte-identical (reference captured via real PG at
+        `/tmp/du122_pgdata`), with positive asserts for both sequence groups AND
+        negative guards that neither `SET DEFAULT` is cross-wired
+        (`a → mser_b_seq`, `b → mser_a_seq`). Files:
+        `internal/testport/pgdump_connsetup_test.go` (mser fixture + asserts +
+        cross-wire negative guards), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 122 section). Gates: gofmt OK; `go build ./...` OK;
+        `TestPort_PgDumpConnectionSetup` PASS (2.21s); pgbench pre-commit smoke on
+        commit. **Next: slice 123** — a table+sequence+VIEW dependency-ordering
+        case (view depends on table; verify topological emission order), or a
+        mixed identity+serial table stressing both deptype paths in one graph.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

@@ -660,6 +660,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table bigser_tbl: %v", err)
 	}
 
+	// Slice 122: a table with TWO serial columns. This is the multi-column
+	// counterpart to slice 121's single-serial table — it stresses the per-table
+	// attrdef builder (InMemory.attrDefRowsLocked) and the pg_depend synthesis
+	// (dependVirtualRows) with more than one owned sequence on one table. PG
+	// expands each serial into its own owned sequence (mser_a_seq, mser_b_seq) and
+	// pg_dump emits, in column order, two CREATE SEQUENCE / OWNED BY / SET DEFAULT
+	// / setval groups. The two attrdef rows must carry DISTINCT oids, each matched
+	// against the correct pg_depend NORMAL link, or pg_dump would mis-pair the
+	// nextval() defaults to the wrong sequence (sibling-path hazard). Verified
+	// byte-identical to real pg_dump 18.3 (/tmp/du122_pgdata).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.mser (a serial, b serial, note text)"); err != nil {
+		t.Fatalf("create table mser: %v", err)
+	}
+
 	// Slice 61: a RECURSIVE VIEW must survive the dump. PG stores a recursive
 	// view as a regular view over a WITH RECURSIVE CTE; pg_dump fetches the body
 	// via the SAME pg_get_viewdef path as a plain view and aborts the WHOLE dump
@@ -1544,6 +1558,36 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		} {
 			if strings.Contains(res.Stdout, neg) {
 				t.Errorf("pg_dump emitted a spurious serial/inline-default form: %q\n  full stdout=%q", neg, res.Stdout)
+			}
+		}
+		// **Slice 122 (asserted):** a table with TWO serial columns round-trips with
+		// one owned sequence + SET DEFAULT per column, in column order. Each column's
+		// attrdef must pair with its own sequence (distinct attrdef oids matched to
+		// distinct pg_depend NORMAL links); a mis-pair would cross-wire the nextval()
+		// defaults. Regression guard for the multi-attrdef-per-table path.
+		multiSerialDefs := []string{
+			"CREATE TABLE public.mser (\n    a integer NOT NULL,\n    b integer NOT NULL,\n    note text\n);",
+			"CREATE SEQUENCE public.mser_a_seq\n    AS integer\n    START WITH 1\n    INCREMENT BY 1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 1;",
+			"CREATE SEQUENCE public.mser_b_seq\n    AS integer\n    START WITH 1\n    INCREMENT BY 1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 1;",
+			"ALTER SEQUENCE public.mser_a_seq OWNED BY public.mser.a;",
+			"ALTER SEQUENCE public.mser_b_seq OWNED BY public.mser.b;",
+			"ALTER TABLE ONLY public.mser ALTER COLUMN a SET DEFAULT nextval('public.mser_a_seq'::regclass);",
+			"ALTER TABLE ONLY public.mser ALTER COLUMN b SET DEFAULT nextval('public.mser_b_seq'::regclass);",
+			"SELECT pg_catalog.setval('public.mser_a_seq', 1, false);",
+			"SELECT pg_catalog.setval('public.mser_b_seq', 1, false);",
+		}
+		for _, sub := range multiSerialDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/mangled a multi-serial clause; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// The two SET DEFAULTs must not be cross-wired (a→b_seq or b→a_seq).
+		for _, neg := range []string{
+			"ALTER COLUMN a SET DEFAULT nextval('public.mser_b_seq'::regclass)",
+			"ALTER COLUMN b SET DEFAULT nextval('public.mser_a_seq'::regclass)",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump cross-wired a multi-serial default to the wrong sequence: %q\n  full stdout=%q", neg, res.Stdout)
 			}
 		}
 		// **Slice 61 (asserted):** a RECURSIVE VIEW must round-trip. PG stores it

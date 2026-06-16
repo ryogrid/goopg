@@ -3094,6 +3094,44 @@ literal `serial`/`bigserial` and no *inline* `DEFAULT nextval` (the separate
 newline-anchored forms (`DEFAULT;\n` / `DEFAULT \n`) so it no longer false-
 matches pg_dump's new `-- … Type: DEFAULT; Schema: …` section comment.
 
+### Slice 122 — multi-serial table (two owned sequences on one table)
+
+Slice 122 is the multi-column counterpart to slice 121's single-serial table. A
+table with **two** `serial` columns (`CREATE TABLE public.mser (a serial, b
+serial, note text)`) expands into *two* owned sequences, and pg_dump emits — in
+column order — two `CREATE SEQUENCE` / `OWNED BY` / `SET DEFAULT` / `setval`
+groups:
+
+```sql
+CREATE TABLE public.mser (
+    a integer NOT NULL,
+    b integer NOT NULL,
+    note text
+);
+CREATE SEQUENCE public.mser_a_seq AS integer …;
+ALTER SEQUENCE public.mser_a_seq OWNED BY public.mser.a;
+CREATE SEQUENCE public.mser_b_seq AS integer …;
+ALTER SEQUENCE public.mser_b_seq OWNED BY public.mser.b;
+ALTER TABLE ONLY public.mser ALTER COLUMN a SET DEFAULT nextval('public.mser_a_seq'::regclass);
+ALTER TABLE ONLY public.mser ALTER COLUMN b SET DEFAULT nextval('public.mser_b_seq'::regclass);
+SELECT pg_catalog.setval('public.mser_a_seq', 1, false);
+SELECT pg_catalog.setval('public.mser_b_seq', 1, false);
+```
+
+**No production code change was required** — the slice-121 machinery generalizes
+to N columns as-is. The verification value is the **sibling-path hazard**: each
+column's `pg_attrdef` row must carry a *distinct* `oid`, and `dependVirtualRows`
+must pair each attrdef oid with the matching sequence in the NORMAL (`'n'`)
+`pg_depend` link. If two serial columns collided on one attrdef oid, or the
+attrdef→sequence pairing crossed (`a → mser_b_seq`), pg_dump would silently
+cross-wire the `nextval()` defaults to the wrong sequence. `attrDefRowsLocked`
+already numbers rows deterministically per `(reloid, attnum)` sorted key, so the
+oids are distinct and stably ordered. The slice asserts both sequences round-trip
+byte-identically to real pg_dump 18.3 **and** adds negative guards that neither
+`SET DEFAULT` is cross-wired (`a → mser_b_seq`, `b → mser_a_seq`). This locks the
+multi-attrdef-per-table path against future regressions in the oid numbering or
+the depend-row pairing.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
