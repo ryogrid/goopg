@@ -1868,6 +1868,25 @@ object support.
         PASS (2.05s); pgbench pre-commit smoke on commit. **Next blocker:** json/jsonb
         (different `VALUE::text IN` parse shape); or move to a new object type
         (composite CREATE TYPE AS / range / enum).
+      - **PROGRESS 2026-06-17 (loop #66):** **DU-002 slice 103 LANDED** — the IN-values
+        deparse now covers the MAC / network-address family that `inet` (slice 102)
+        began: `macaddr`, `macaddr8`, `cidr`. NO parser change was needed — all three
+        are string literals already accepted by `tryParseCheckInValues`.
+        `domainInValuesCheckExpr`: `OIDMacaddr`/`OIDMacaddr8` join the bare
+        string-with-cast branch (`'08:00:2b:01:02:03'::macaddr`,
+        `'…:04:05'::macaddr8`) — their canonical colon-form round-trips verbatim;
+        `OIDCidr` is SPECIAL — cidr has no cidr-eq operator and reuses inet's, so PG
+        coerces **both sides to inet**: `(VALUE)::inet = ANY ((ARRAY['192.168.0.0/24'::cidr,
+        '10.0.0.0/8'::cidr])::inet[])` (element cast stays `::cidr`, envelope is
+        `::inet`/`::inet[]`). This is the SAME coercion-envelope mechanism `varchar`→`text`
+        uses (slice 98); generalized the old `coerceToText bool` flag into a
+        `coerceTo string` target type so both share one code path. All verified
+        byte-identical to real pg_dump 18.3 (`/tmp/pgcheck_du103`). Fixtures `mac_in`,
+        `mac8_in`, `cidr_in` + columns `maci`/`mac8i`/`cidri` added to `public.dom`.
+        Gates: build+vet OK; parser/catalog/executor unit PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.06s); pgbench pre-commit smoke on commit.
+        **Next blocker:** json/jsonb (different `VALUE::text IN` parse shape); or move to
+        a new object type (composite CREATE TYPE AS / range / enum).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

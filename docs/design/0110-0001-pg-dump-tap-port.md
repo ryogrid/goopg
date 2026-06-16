@@ -2333,6 +2333,25 @@ verbatim deparse from the raw token text would not be byte-identical. `json` is
 deferred separately — it has no equality operator, so the CHECK must be written
 `VALUE::text IN (...)`, a different parse shape than `VALUE IN (...)`.
 
+Slice 103 extends the deparse to the MAC / network-address family that `inet`
+began. No parser change was needed — all three are string literals. Verified
+against real pg_dump 18.3 (`/tmp/pgcheck_du103`):
+
+| base type | deparse |
+|---|---|
+| `macaddr` | `VALUE = ANY (ARRAY['08:00:2b:01:02:03'::macaddr, '00:11:22:33:44:55'::macaddr])` |
+| `macaddr8` | `VALUE = ANY (ARRAY['08:00:2b:01:02:03:04:05'::macaddr8, '00:11:22:33:44:55:66:77'::macaddr8])` |
+| `cidr` | `(VALUE)::inet = ANY ((ARRAY['192.168.0.0/24'::cidr, '10.0.0.0/8'::cidr])::inet[])` |
+
+`macaddr`/`macaddr8` join the bare string-with-cast shape; their canonical
+colon-separated forms round-trip verbatim. `cidr` is special: it has no
+`cidr`-eq operator and reuses `inet`'s, so PG coerces **both sides to `inet`** —
+the per-element cast stays `::cidr` but the comparison is wrapped
+`(VALUE)::inet = ANY ((ARRAY[...])::inet[])`. This is the same coercion-envelope
+mechanism `varchar`→`text` uses (slice 98); the implementation generalised the
+old `coerceToText bool` flag into a `coerceTo string` target type so both
+`varchar`→`text` and `cidr`→`inet` share one code path.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

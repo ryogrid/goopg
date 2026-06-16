@@ -8722,20 +8722,28 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 // (`'…'::<basetype>`). bytea/inet also use the string-with-cast shape; their
 // canonical input forms (bytea `\x` hex, inet dotted-quad/CIDR) round-trip
 // verbatim. smallint joins the verbatim integer branch — small integer literals
-// const-fold to int2 with no cast wrapper. timestamptz and interval are
-// deliberately excluded — PG re-renders the stored constant (session timezone for
-// timestamptz, normalized form e.g. '2 hours'→'02:00:00' for interval), so a
-// verbatim deparse from the raw token text is not byte-identical. Other non-string
-// base types return "".
+// const-fold to int2 with no cast wrapper. macaddr/macaddr8 use the bare
+// string-with-cast shape (their canonical colon-form round-trips). cidr is special:
+// it has no cidr-eq operator and reuses inet's, so PG coerces both sides to inet —
+// the element cast stays `::cidr` but the envelope is `(VALUE)::inet = ANY
+// ((ARRAY[...])::inet[])` (same envelope mechanism as varchar→text). timestamptz
+// and interval are deliberately excluded — PG re-renders the stored constant
+// (session timezone for timestamptz, normalized form e.g. '2 hours'→'02:00:00' for
+// interval), so a verbatim deparse from the raw token text is not byte-identical.
+// Other non-string base types return "".
 // DU-002 slices 97 (text), 98 (char/varchar), 99 (integer/numeric),
 // 100 (bigint/boolean/date), 101 (real/float8/timestamp/time/uuid),
-// 102 (smallint/bytea/inet).
+// 102 (smallint/bytea/inet), 103 (macaddr/macaddr8/cidr).
 func domainInValuesCheckExpr(baseType string, vals []string) string {
 	if len(vals) == 0 {
 		return ""
 	}
 	var castType string
-	var coerceToText bool
+	// coerceTo holds the target type of PG's coercion envelope for base types
+	// that lack a direct equality operator: PG rewrites `VALUE IN (...)` as
+	// `(VALUE)::T = ANY ((ARRAY[...])::T[])`. Empty means no envelope (the base
+	// type's own eq operator is used directly).
+	var coerceTo string
 	switch catalog.TypeNameToOID(baseType) {
 	case catalog.OIDText:
 		castType = "text"
@@ -8753,9 +8761,18 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		castType = "bytea"
 	case catalog.OIDInet:
 		castType = "inet"
+	case catalog.OIDMacaddr:
+		castType = "macaddr"
+	case catalog.OIDMacaddr8:
+		castType = "macaddr8"
+	case catalog.OIDCidr:
+		// cidr has no cidr-eq operator, so PG coerces both sides to inet
+		// (the element cast stays ::cidr, the envelope is ::inet / ::inet[]).
+		castType = "cidr"
+		coerceTo = "inet"
 	case catalog.OIDVarChar:
 		castType = "character varying"
-		coerceToText = true
+		coerceTo = "text"
 	case catalog.OIDInt2, catalog.OIDInt4, catalog.OIDNumeric, catalog.OIDBool:
 		// smallint/integer/numeric literals and boolean keyword literals already
 		// carry (or const-fold to) the base type, so PG renders them verbatim (no
@@ -8781,8 +8798,8 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		parts[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::" + castType
 	}
 	arr := "ARRAY[" + strings.Join(parts, ", ") + "]"
-	if coerceToText {
-		return "(VALUE)::text = ANY ((" + arr + ")::text[])"
+	if coerceTo != "" {
+		return "(VALUE)::" + coerceTo + " = ANY ((" + arr + ")::" + coerceTo + "[])"
 	}
 	return "VALUE = ANY (" + arr + ")"
 }

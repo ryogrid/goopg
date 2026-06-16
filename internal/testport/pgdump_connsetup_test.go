@@ -859,7 +859,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.inet_in AS inet CHECK (VALUE IN ('192.168.0.1', '10.0.0.0/8'))"); err != nil {
 		t.Fatalf("create domain inet_in: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in)"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.mac_in AS macaddr CHECK (VALUE IN ('08:00:2b:01:02:03', '00:11:22:33:44:55'))"); err != nil {
+		t.Fatalf("create domain mac_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.mac8_in AS macaddr8 CHECK (VALUE IN ('08:00:2b:01:02:03:04:05', '00:11:22:33:44:55:66:77'))"); err != nil {
+		t.Fatalf("create domain mac8_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.cidr_in AS cidr CHECK (VALUE IN ('192.168.0.0/24', '10.0.0.0/8'))"); err != nil {
+		t.Fatalf("create domain cidr_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1555,6 +1564,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.inet_in AS inet",
 			"CONSTRAINT inet_in_check CHECK ((VALUE = ANY (ARRAY['192.168.0.1'::inet, '10.0.0.0/8'::inet])))",
 			"ineti public.inet_in",
+			"CREATE DOMAIN public.mac_in AS macaddr",
+			"CONSTRAINT mac_in_check CHECK ((VALUE = ANY (ARRAY['08:00:2b:01:02:03'::macaddr, '00:11:22:33:44:55'::macaddr])))",
+			"maci public.mac_in",
+			"CREATE DOMAIN public.mac8_in AS macaddr8",
+			"CONSTRAINT mac8_in_check CHECK ((VALUE = ANY (ARRAY['08:00:2b:01:02:03:04:05'::macaddr8, '00:11:22:33:44:55:66:77'::macaddr8])))",
+			"mac8i public.mac8_in",
+			"CREATE DOMAIN public.cidr_in AS cidr",
+			"CONSTRAINT cidr_in_check CHECK (((VALUE)::inet = ANY ((ARRAY['192.168.0.0/24'::cidr, '10.0.0.0/8'::cidr])::inet[])))",
+			"cidri public.cidr_in",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {
