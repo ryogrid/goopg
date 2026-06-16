@@ -168,6 +168,20 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: 6, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
 	case catalog.OIDMacaddr8: // 774 macaddr8 -- pg_type.dat: typlen 8, typbyval f, typalign 'i', typstorage 'p'
 		return userTypeAttrs{TypLen: 8, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
+	case catalog.OIDPoint: // 600 point -- pg_type.dat: typlen 16, typbyval f, typalign 'd', typstorage 'p'
+		return userTypeAttrs{TypLen: 16, TypByVal: false, TypAlign: 'd', TypStorage: 'p'}
+	case catalog.OIDLseg: // 601 lseg -- pg_type.dat: typlen 32, typbyval f, typalign 'd', typstorage 'p'
+		return userTypeAttrs{TypLen: 32, TypByVal: false, TypAlign: 'd', TypStorage: 'p'}
+	case catalog.OIDPath: // 602 path -- pg_type.dat: typlen -1, typbyval f, typalign 'd', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDBox: // 603 box -- pg_type.dat: typlen 32, typbyval f, typalign 'd', typstorage 'p'
+		return userTypeAttrs{TypLen: 32, TypByVal: false, TypAlign: 'd', TypStorage: 'p'}
+	case catalog.OIDPolygon: // 604 polygon -- pg_type.dat: typlen -1, typbyval f, typalign 'd', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDLine: // 628 line -- pg_type.dat: typlen 24, typbyval f, typalign 'd', typstorage 'p'
+		return userTypeAttrs{TypLen: 24, TypByVal: false, TypAlign: 'd', TypStorage: 'p'}
+	case catalog.OIDCircle: // 718 circle -- pg_type.dat: typlen 24, typbyval f, typalign 'd', typstorage 'p'
+		return userTypeAttrs{TypLen: 24, TypByVal: false, TypAlign: 'd', TypStorage: 'p'}
 	case catalog.OIDArrayBool: // 1000 _bool -- pg_type.dat: typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBytea: // 1001 _bytea -- element bytea typalign 'i', typstorage 'x'
@@ -216,6 +230,20 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayMacaddr8: // 775 _macaddr8 -- element macaddr8 typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayPoint: // 1017 _point -- element point typalign 'd', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayLseg: // 1018 _lseg -- element lseg typalign 'd', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayPath: // 1019 _path -- element path typalign 'd', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayBox: // 1020 _box -- element box typalign 'd', typstorage 'x' (typdelim ';')
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayPolygon: // 1027 _polygon -- element polygon typalign 'd', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayLine: // 629 _line -- element line typalign 'd', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayCircle: // 719 _circle -- element circle typalign 'd', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 }

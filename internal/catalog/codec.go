@@ -81,6 +81,16 @@ const (
 	OIDCidr     uint32 = 650
 	OIDMacaddr  uint32 = 829
 	OIDMacaddr8 uint32 = 774
+	// DU-002 slice 72: the geometric family. All are seeded in pg_type (see
+	// initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs. None
+	// carry a typmod, so format_type renders the bare type name.
+	OIDPoint   uint32 = 600
+	OIDLseg    uint32 = 601
+	OIDPath    uint32 = 602
+	OIDBox     uint32 = 603
+	OIDPolygon uint32 = 604
+	OIDLine    uint32 = 628
+	OIDCircle  uint32 = 718
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -124,6 +134,15 @@ const (
 	OIDArrayCidr     uint32 = 651
 	OIDArrayMacaddr  uint32 = 1040
 	OIDArrayMacaddr8 uint32 = 775
+	// DU-002 slice 72: the geometric array types. None carry a typmod, so
+	// format_type renders the bare element name with a [] suffix.
+	OIDArrayPoint   uint32 = 1017
+	OIDArrayLseg    uint32 = 1018
+	OIDArrayPath    uint32 = 1019
+	OIDArrayBox     uint32 = 1020
+	OIDArrayPolygon uint32 = 1027
+	OIDArrayLine    uint32 = 629
+	OIDArrayCircle  uint32 = 719
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -180,6 +199,20 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayMacaddr
 	case OIDMacaddr8:
 		return OIDArrayMacaddr8
+	case OIDPoint:
+		return OIDArrayPoint
+	case OIDLseg:
+		return OIDArrayLseg
+	case OIDPath:
+		return OIDArrayPath
+	case OIDBox:
+		return OIDArrayBox
+	case OIDPolygon:
+		return OIDArrayPolygon
+	case OIDLine:
+		return OIDArrayLine
+	case OIDCircle:
+		return OIDArrayCircle
 	}
 	return 0
 }
@@ -238,6 +271,20 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDMacaddr, true
 	case OIDArrayMacaddr8:
 		return OIDMacaddr8, true
+	case OIDArrayPoint:
+		return OIDPoint, true
+	case OIDArrayLseg:
+		return OIDLseg, true
+	case OIDArrayPath:
+		return OIDPath, true
+	case OIDArrayBox:
+		return OIDBox, true
+	case OIDArrayPolygon:
+		return OIDPolygon, true
+	case OIDArrayLine:
+		return OIDLine, true
+	case OIDArrayCircle:
+		return OIDCircle, true
 	}
 	return 0, false
 }
@@ -1062,6 +1109,20 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDMacaddr
 	case "macaddr8":
 		return OIDMacaddr8
+	case "point":
+		return OIDPoint
+	case "lseg":
+		return OIDLseg
+	case "path":
+		return OIDPath
+	case "box":
+		return OIDBox
+	case "polygon":
+		return OIDPolygon
+	case "line":
+		return OIDLine
+	case "circle":
+		return OIDCircle
 	default:
 		return OIDText // safe fallback
 	}
@@ -1122,6 +1183,20 @@ func OIDToTypeName(oid uint32) string {
 		return "macaddr"
 	case OIDMacaddr8:
 		return "macaddr8"
+	case OIDPoint:
+		return "point"
+	case OIDLseg:
+		return "lseg"
+	case OIDPath:
+		return "path"
+	case OIDBox:
+		return "box"
+	case OIDPolygon:
+		return "polygon"
+	case OIDLine:
+		return "line"
+	case OIDCircle:
+		return "circle"
 	default:
 		return "text"
 	}

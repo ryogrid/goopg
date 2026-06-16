@@ -430,6 +430,15 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		{"cidr", nil, 651, "cidr[]"},
 		{"macaddr", nil, 1040, "macaddr[]"},
 		{"macaddr8", nil, 775, "macaddr8[]"},
+		// Slice 72: the geometric family. None carry a typmod, so each array
+		// renders as the bare element name with the [] suffix.
+		{"point", nil, 1017, "point[]"},
+		{"lseg", nil, 1018, "lseg[]"},
+		{"path", nil, 1019, "path[]"},
+		{"box", nil, 1020, "box[]"},
+		{"polygon", nil, 1027, "polygon[]"},
+		{"line", nil, 629, "line[]"},
+		{"circle", nil, 719, "circle[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

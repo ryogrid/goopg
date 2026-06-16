@@ -600,7 +600,11 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"doc json, docs json[], jdoc jsonb, jdocs jsonb[], "+
 		"span interval, spans interval[], "+
 		"ip inet, ips inet[], net cidr, nets cidr[], "+
-		"mac macaddr, macs macaddr[], mac8 macaddr8, mac8s macaddr8[])"); err != nil {
+		"mac macaddr, macs macaddr[], mac8 macaddr8, mac8s macaddr8[], "+
+		"pt point, pts point[], seg lseg, segs lseg[], "+
+		"pth path, pths path[], bx box, bxs box[], "+
+		"poly polygon, polys polygon[], ln line, lns line[], "+
+		"circ circle, circs circle[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -943,6 +947,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// been wired into TypeNameToOID/OIDToTypeName, so each scalar fell back to
 		// text (OID 25) and the array paths had no _net OIDs. None carry a typmod,
 		// so every column renders as the plain `<type>` / `<type>[]`.
+		// Slice 72 adds the geometric family: point (`pt`, 600) + point[] (`pts`,
+		// _point 1017), lseg (`seg`, 601) + lseg[] (`segs`, 1018), path (`pth`,
+		// 602) + path[] (`pths`, 1019), box (`bx`, 603) + box[] (`bxs`, 1020),
+		// polygon (`poly`, 604) + polygon[] (`polys`, 1027), line (`ln`, 628) +
+		// line[] (`lns`, 629), circle (`circ`, 718) + circle[] (`circs`, 719).
+		// All are seeded in pg_type but were never wired into TypeNameToOID/
+		// OIDToTypeName, so each scalar fell back to text (OID 25) and the array
+		// paths had no OIDs. None carry a typmod, so each renders as the plain
+		// `<type>` / `<type>[]`.
 		arrCols := []string{
 			"CREATE TABLE public.arr (",
 			"tags text[]",
@@ -979,6 +992,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"macs macaddr[]",
 			"mac8 macaddr8",
 			"mac8s macaddr8[]",
+			"pt point",
+			"pts point[]",
+			"seg lseg",
+			"segs lseg[]",
+			"pth path",
+			"pths path[]",
+			"bx box",
+			"bxs box[]",
+			"poly polygon",
+			"polys polygon[]",
+			"ln line",
+			"lns line[]",
+			"circ circle",
+			"circs circle[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

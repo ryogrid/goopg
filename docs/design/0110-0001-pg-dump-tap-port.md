@@ -1555,6 +1555,29 @@ fixed one logical group per loop:
     `ips inet[]`, `net cidr`, `nets cidr[]`, `mac macaddr`, `macs macaddr[]`,
     `mac8 macaddr8`, `mac8s macaddr8[]` columns in `TestPort_PgDumpConnectionSetup`
     and the four new rows in `executor.TestUserPGAttributeArrayColumn`.
+  - **Slice 72 — geometric family `point`/`lseg`/`path`/`box`/`polygon`/`line`/
+    `circle` (+ their array types)
+    (`internal/catalog/codec.go`, `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** All seven scalar types (OIDs
+    600/601/602/603/604/628/718) and their array types
+    (1017/1018/1019/1020/1027/629/719) are already seeded in
+    `pg_type_seed_data.go`, but none had been wired into `TypeNameToOID`/
+    `OIDToTypeName`, so each scalar column fell back to `text` (OID 25) and dumped
+    as `text` (the lone `formatTypeOID(600)→point` case was dead — nothing routed a
+    `point` column to OID 600); the array paths had no OIDs at all. Same proven
+    3-site pattern: scalar/array OID consts + their `TypeNameToOID`/`OIDToTypeName`
+    and `ArrayOIDForBase`/`BaseOIDForArray` cases, rows in `userTypeAttrsForOID`
+    (fixed-width `point` `typlen=16`, `lseg`/`box` `typlen=32`, `line`/`circle`
+    `typlen=24`, all `typalign='d'`, `typstorage='p'`; varlena `path`/`polygon`
+    `typlen=-1`, `typalign='d'`, `typstorage='x'`; all scalars `typbyval=f`; arrays
+    `typlen=-1`, `typalign='d'`, `typstorage='x'` — matching `pg_type.dat` and the
+    `pg_type_seed_data.go` rows), and the scalar+array cases in `formatTypeOID` and
+    `oidToBuiltinTypeName`. None carry a typmod, so every column renders as the
+    plain `<type>` / `<type>[]`. Guarded by the `arr` fixture's `pt point`,
+    `pts point[]`, `seg lseg`, `segs lseg[]`, `pth path`, `pths path[]`, `bx box`,
+    `bxs box[]`, `poly polygon`, `polys polygon[]`, `ln line`, `lns line[]`,
+    `circ circle`, `circs circle[]` columns in `TestPort_PgDumpConnectionSetup` and
+    the seven new rows in `executor.TestUserPGAttributeArrayColumn`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1608,7 +1631,10 @@ every simple scalar-OID-backed array type; slice 69 adds the JSON family `doc
 json`, `docs json[]`, `jdoc jsonb`, and `jdocs jsonb[]`; slice 70 adds a scalar
 `span interval` and a `spans interval[]` column; slice 71 adds the
 network-address family `ip inet`, `ips inet[]`, `net cidr`, `nets cidr[]`, `mac
-macaddr`, `macs macaddr[]`, `mac8 macaddr8`, and `mac8s macaddr8[]`.
+macaddr`, `macs macaddr[]`, `mac8 macaddr8`, and `mac8s macaddr8[]`; slice 72
+adds the geometric family `pt point`, `pts point[]`, `seg lseg`, `segs lseg[]`,
+`pth path`, `pths path[]`, `bx box`, `bxs box[]`, `poly polygon`, `polys
+polygon[]`, `ln line`, `lns line[]`, `circ circle`, and `circs circle[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

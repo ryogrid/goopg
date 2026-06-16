@@ -107,6 +107,20 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "macaddr"
 	case 869:
 		return "inet"
+	case 600:
+		return "point"
+	case 601:
+		return "lseg"
+	case 602:
+		return "path"
+	case 603:
+		return "box"
+	case 604:
+		return "polygon"
+	case 628:
+		return "line"
+	case 718:
+		return "circle"
 	case 1186:
 		return "interval"
 	case 1266:
@@ -164,6 +178,20 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "macaddr[]"
 	case 1041:
 		return "inet[]"
+	case 1017:
+		return "point[]"
+	case 1018:
+		return "lseg[]"
+	case 1019:
+		return "path[]"
+	case 1020:
+		return "box[]"
+	case 1027:
+		return "polygon[]"
+	case 629:
+		return "line[]"
+	case 719:
+		return "circle[]"
 	case 1187:
 		return "interval[]"
 	case 1231:
@@ -10399,6 +10427,45 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "jsonb[]"
 	case 600:
 		return "point"
+	case 601:
+		// lseg: no typmod, bare name. DU-002 slice 72.
+		return "lseg"
+	case 602:
+		// path: no typmod, bare name. Slice 72.
+		return "path"
+	case 603:
+		// box: no typmod, bare name. Slice 72.
+		return "box"
+	case 604:
+		// polygon: no typmod, bare name. Slice 72.
+		return "polygon"
+	case 628:
+		// line: no typmod, bare name. Slice 72.
+		return "line"
+	case 718:
+		// circle: no typmod, bare name. Slice 72.
+		return "circle"
+	case 1017:
+		// _point: no typmod, bare element name + []. Slice 72.
+		return "point[]"
+	case 1018:
+		// _lseg: no typmod, bare element name + []. Slice 72.
+		return "lseg[]"
+	case 1019:
+		// _path: no typmod, bare element name + []. Slice 72.
+		return "path[]"
+	case 1020:
+		// _box: no typmod, bare element name + []. Slice 72.
+		return "box[]"
+	case 1027:
+		// _polygon: no typmod, bare element name + []. Slice 72.
+		return "polygon[]"
+	case 629:
+		// _line: no typmod, bare element name + []. Slice 72.
+		return "line[]"
+	case 719:
+		// _circle: no typmod, bare element name + []. Slice 72.
+		return "circle[]"
 	case 650:
 		// cidr: no typmod, bare name. DU-002 slice 71.
 		return "cidr"
