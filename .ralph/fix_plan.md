@@ -1829,6 +1829,27 @@ object support.
         **Next blocker:** remaining base types (timestamp/uuid/float) follow the same
         two shapes (verbatim vs string-with-cast); or move to a new object type
         (composite CREATE TYPE AS / range).
+      - **PROGRESS 2026-06-17 (loop #63):** **DU-002 slice 101 LANDED** — the IN-values
+        deparse now covers five more base types: `real`, `double precision`, `timestamp`,
+        `time`, `uuid`. NO parser change was needed — `real`/`float8` IN-lists are numeric
+        literals and `timestamp`/`time`/`uuid` IN-lists are string literals, both already
+        accepted by `tryParseCheckInValues`. `domainInValuesCheckExpr` gains: `OIDFloat4`
+        → `(N)::real`, `OIDFloat8` → `(N)::double precision` (both via the new shared
+        `domainInValuesCoerced` helper that `OIDInt8`/bigint now also uses — the IN-list
+        numeric literals parse as a narrower int4/numeric type than the base, so PG wraps
+        each per element); `OIDTimestamp`/`OIDTime`/`OIDUUID` join the string-with-cast
+        branch with castType `timestamp without time zone` / `time without time zone` /
+        `uuid`. All verified byte-identical to real pg_dump 18.3 (`/tmp/pgcheck_du101`).
+        `timestamptz` is deliberately EXCLUDED — PG re-renders the stored constant in the
+        session timezone (`'…+00'`→`'…+09'`), so a verbatim deparse from the raw token text
+        is not byte-identical. Fixtures `r_in`, `f8_in`, `ts_in`, `tm_in`, `u_in` (declared
+        via single-word base aliases real/float8/timestamp/time/uuid so the object-name
+        parser accepts them; pg_dump renders the canonical name from the OID) + columns
+        `ri`/`f8i`/`tsi`/`tmi`/`ui` added to `public.dom`. Gates: build+vet OK;
+        parser/catalog/executor unit PASS; `TestPort_PgDumpConnectionSetup` PASS (2.12s);
+        pgbench pre-commit smoke on commit. **Next blocker:** non-byte-identical base types
+        (timestamptz needs constant-render-in-session-tz); or move to a new object type
+        (composite CREATE TYPE AS / range).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

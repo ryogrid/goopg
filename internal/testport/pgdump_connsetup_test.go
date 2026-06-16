@@ -821,7 +821,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.d_in AS date CHECK (VALUE IN ('2020-01-01', '2021-06-15'))"); err != nil {
 		t.Fatalf("create domain d_in: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in)"); err != nil {
+	// DU-002 slice 101: real/double precision coerce their numeric IN-list
+	// literals per element (`(N)::real` / `(N)::double precision`); timestamp,
+	// time and uuid mirror the string-with-cast shape with their canonical
+	// base-type cast name. Single-word base aliases (real/float8/timestamp/time/
+	// uuid) are used so the CREATE DOMAIN object-name parser accepts them; pg_dump
+	// renders the canonical multi-word name from the OID regardless. Verified
+	// byte-identical to real pg_dump 18.3 (/tmp/pgcheck_du101). timestamptz is
+	// deliberately omitted — PG re-renders the stored constant in the session
+	// timezone, so a verbatim deparse from the raw token text is not byte-identical.
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.r_in AS real CHECK (VALUE IN (1.5, 2.5))"); err != nil {
+		t.Fatalf("create domain r_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.f8_in AS float8 CHECK (VALUE IN (1.5, 2.5, 3.0))"); err != nil {
+		t.Fatalf("create domain f8_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.ts_in AS timestamp CHECK (VALUE IN ('2020-01-01 00:00:00', '2021-06-15 12:30:00'))"); err != nil {
+		t.Fatalf("create domain ts_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.tm_in AS time CHECK (VALUE IN ('12:00:00', '13:30:00'))"); err != nil {
+		t.Fatalf("create domain tm_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.u_in AS uuid CHECK (VALUE IN ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'))"); err != nil {
+		t.Fatalf("create domain u_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1488,6 +1512,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.d_in AS date",
 			"CONSTRAINT d_in_check CHECK ((VALUE = ANY (ARRAY['2020-01-01'::date, '2021-06-15'::date])))",
 			"di public.d_in",
+			// Slice 101: real/double precision coerce each numeric literal
+			// `(N)::<type>`; timestamp/time/uuid are string-with-cast using the
+			// canonical multi-word base-type name. Base types declared via the
+			// single-word aliases real/float8/timestamp/time/uuid still dump with
+			// the canonical name (format_type from the OID).
+			"CREATE DOMAIN public.r_in AS real",
+			"CONSTRAINT r_in_check CHECK ((VALUE = ANY (ARRAY[(1.5)::real, (2.5)::real])))",
+			"ri public.r_in",
+			"CREATE DOMAIN public.f8_in AS double precision",
+			"CONSTRAINT f8_in_check CHECK ((VALUE = ANY (ARRAY[(1.5)::double precision, (2.5)::double precision, (3.0)::double precision])))",
+			"f8i public.f8_in",
+			"CREATE DOMAIN public.ts_in AS timestamp without time zone",
+			"CONSTRAINT ts_in_check CHECK ((VALUE = ANY (ARRAY['2020-01-01 00:00:00'::timestamp without time zone, '2021-06-15 12:30:00'::timestamp without time zone])))",
+			"tsi public.ts_in",
+			"CREATE DOMAIN public.tm_in AS time without time zone",
+			"CONSTRAINT tm_in_check CHECK ((VALUE = ANY (ARRAY['12:00:00'::time without time zone, '13:30:00'::time without time zone])))",
+			"tmi public.tm_in",
+			"CREATE DOMAIN public.u_in AS uuid",
+			"CONSTRAINT u_in_check CHECK ((VALUE = ANY (ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12'::uuid])))",
+			"ui public.u_in",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

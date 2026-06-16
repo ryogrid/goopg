@@ -8695,8 +8695,13 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 //	integer    VALUE = ANY (ARRAY[1, 2, 3])
 //	numeric    VALUE = ANY (ARRAY[1.5, 2.5])
 //	bigint     VALUE = ANY (ARRAY[(100)::bigint, (200)::bigint])
+//	real       VALUE = ANY (ARRAY[(1.5)::real, (2.5)::real])
+//	float8     VALUE = ANY (ARRAY[(1.5)::double precision, (3.0)::double precision])
 //	boolean    VALUE = ANY (ARRAY[true, false])
 //	date       VALUE = ANY (ARRAY['2020-01-01'::date, '2021-06-15'::date])
+//	timestamp  VALUE = ANY (ARRAY['2020-01-01 00:00:00'::timestamp without time zone, ...])
+//	time       VALUE = ANY (ARRAY['12:00:00'::time without time zone, ...])
+//	uuid       VALUE = ANY (ARRAY['a0ee…'::uuid, 'b0ee…'::uuid])
 //
 // text and bpchar have native equality operators, so PG emits a bare per-element
 // cast with no coercion wrapper. character varying has no varchar-eq operator and
@@ -8708,11 +8713,14 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 // already matches the base type, so PG emits the literal verbatim — no quotes
 // and no per-element cast (verified against real pg_dump 18.3). boolean is the
 // same verbatim shape (the IN-list keyword literals already have type bool).
-// bigint differs: the IN-list literals parse as int4 constants and PG coerces
-// each to bigint, so every element is wrapped `(N)::bigint`. date mirrors the
-// string-with-cast shape (`'…'::date`). Other non-string base types return "".
+// bigint/real/float8 differ: the IN-list literals parse as int4/numeric constants
+// and PG coerces each to the base type, so every element is wrapped
+// `(N)::<basetype>`. date/timestamp/time/uuid mirror the string-with-cast shape
+// (`'…'::<basetype>`). timestamptz is deliberately excluded — PG re-renders the
+// stored constant in the session timezone, so a verbatim deparse from the raw
+// token text is not byte-identical. Other non-string base types return "".
 // DU-002 slices 97 (text), 98 (char/varchar), 99 (integer/numeric),
-// 100 (bigint/boolean/date).
+// 100 (bigint/boolean/date), 101 (real/float8/timestamp/time/uuid).
 func domainInValuesCheckExpr(baseType string, vals []string) string {
 	if len(vals) == 0 {
 		return ""
@@ -8726,6 +8734,12 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		castType = "bpchar"
 	case catalog.OIDDate:
 		castType = "date"
+	case catalog.OIDTimestamp:
+		castType = "timestamp without time zone"
+	case catalog.OIDTime:
+		castType = "time without time zone"
+	case catalog.OIDUUID:
+		castType = "uuid"
 	case catalog.OIDVarChar:
 		castType = "character varying"
 		coerceToText = true
@@ -8736,12 +8750,13 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		return "VALUE = ANY (" + arr + ")"
 	case catalog.OIDInt8:
 		// bigint: the IN-list int4 literals are coerced per element to bigint.
-		parts := make([]string, len(vals))
-		for i, v := range vals {
-			parts[i] = "(" + v + ")::bigint"
-		}
-		arr := "ARRAY[" + strings.Join(parts, ", ") + "]"
-		return "VALUE = ANY (" + arr + ")"
+		return domainInValuesCoerced(vals, "bigint")
+	case catalog.OIDFloat4:
+		// real: the IN-list numeric literals are coerced per element to real.
+		return domainInValuesCoerced(vals, "real")
+	case catalog.OIDFloat8:
+		// double precision: numeric literals coerced per element.
+		return domainInValuesCoerced(vals, "double precision")
 	default:
 		return ""
 	}
@@ -8755,6 +8770,19 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 	if coerceToText {
 		return "(VALUE)::text = ANY ((" + arr + ")::text[])"
 	}
+	return "VALUE = ANY (" + arr + ")"
+}
+
+// domainInValuesCoerced renders the per-element coercion shape used by base types
+// whose IN-list literals parse as a different (narrower) numeric type than the
+// base, so PG wraps each literal `(N)::<castType>`: bigint (int4 → bigint), real
+// and double precision (numeric → float). DU-002 slices 100, 101.
+func domainInValuesCoerced(vals []string, castType string) string {
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		parts[i] = "(" + v + ")::" + castType
+	}
+	arr := "ARRAY[" + strings.Join(parts, ", ") + "]"
 	return "VALUE = ANY (" + arr + ")"
 }
 

@@ -2288,6 +2288,31 @@ and PG coerces each per element, so every element is wrapped `(N)::bigint`.
 element cast, exactly like `text`/`bpchar` with a different cast type. Other
 non-listed base types still return `""` and stay runtime-only.
 
+Slice 101 extends the deparse to five more base types. No parser change was
+needed — `real`/`float8` IN-lists are numeric literals and `timestamp`/`time`/
+`uuid` IN-lists are string literals, both already accepted. Verified against real
+pg_dump 18.3 (`/tmp/pgcheck_du101`):
+
+| base type | deparse |
+|---|---|
+| `real` | `VALUE = ANY (ARRAY[(1.5)::real, (2.5)::real])` |
+| `double precision` | `VALUE = ANY (ARRAY[(1.5)::double precision, (2.5)::double precision, (3.0)::double precision])` |
+| `timestamp without time zone` | `VALUE = ANY (ARRAY['2020-01-01 00:00:00'::timestamp without time zone, …])` |
+| `time without time zone` | `VALUE = ANY (ARRAY['12:00:00'::time without time zone, …])` |
+| `uuid` | `VALUE = ANY (ARRAY['a0ee…'::uuid, 'b0ee…'::uuid])` |
+
+`real`/`double precision` join `bigint` in the per-element coercion shape (the
+shared `domainInValuesCoerced` helper wraps each numeric literal `(N)::<type>`,
+because the IN-list literals parse as a narrower `int4`/`numeric` type than the
+base). `timestamp`/`time`/`uuid` join `date`/`text`/`bpchar` in the
+string-with-cast shape, each using its canonical (possibly multi-word) base-type
+cast name. The fixtures declare the base via the single-word aliases
+`real`/`float8`/`timestamp`/`time`/`uuid` so the CREATE DOMAIN object-name parser
+accepts them, but `format_type` re-renders the canonical multi-word name from the
+OID on dump. `timestamptz` is deliberately excluded: PG re-renders the stored
+constant in the session timezone (`'…+00'` → `'…+09'`), so a verbatim deparse
+from the raw token text would not be byte-identical.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
