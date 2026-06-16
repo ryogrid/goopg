@@ -577,6 +577,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// the proven 3-site pattern (array OID const + ArrayOID maps +
 	// userTypeAttrsForOID + formatTypeOID); float8/timestamp use 'd' alignment,
 	// date uses 'i'.
+	// Slice 66 adds a scalar uuid column (`tok`) and a uuid[] column (`ids`).
+	// uuid was the first scalar element type goopg had NOT wired into
+	// catalog.TypeNameToOID/OIDToTypeName, so a `uuid` column fell back to text
+	// (OID 25) and dumped as `text`; the array path had no _uuid OID at all.
+	// Slice 66 wires uuid (OID 2950, typlen 16, typalign 'c', typstorage 'p')
+	// and _uuid (OID 2951) through the same proven sites: scalar OID maps +
+	// array OID const + ArrayOID maps + userTypeAttrsForOID + formatTypeOID
+	// (2950/2951 already present in expr.go).
 	// Slice 65 extends it again with real[] (_float4 1021, 'i'), time[] (_time
 	// 1183, 'd') and timestamp with time zone[] (_timestamptz 1185, 'd') — the
 	// remaining scalar-OID-backed element types, same 3-site pattern.
@@ -584,7 +592,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"tags text[], scores integer[], big bigint[], "+
 		"flags boolean[], prices numeric(10,2)[], "+
 		"ratios double precision[], days date[], moments timestamp[], "+
-		"speeds real[], times time[], zoned timestamptz[])"); err != nil {
+		"speeds real[], times time[], zoned timestamptz[], "+
+		"tok uuid, ids uuid[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -893,6 +902,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// Slice 65 adds real[], time[] and timestamp with time zone[]: float4/
 		// time/timestamptz now map to their array OIDs (_float4 1021, _time 1183,
 		// _timestamptz 1185) so each dumps with its declared array type.
+		// Slice 66 adds a scalar uuid (`tok uuid`) and uuid[] (`ids uuid[]`):
+		// uuid (OID 2950) is now in TypeNameToOID/OIDToTypeName and _uuid (2951)
+		// in the array OID maps, so both dump with their declared types instead
+		// of falling back to text.
 		arrCols := []string{
 			"CREATE TABLE public.arr (",
 			"tags text[]",
@@ -906,6 +919,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"speeds real[]",
 			"times time without time zone[]",
 			"zoned timestamp with time zone[]",
+			"tok uuid",
+			"ids uuid[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

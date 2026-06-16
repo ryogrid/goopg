@@ -70,6 +70,7 @@ const (
 	OIDBpChar      uint32 = 1042
 	OIDVarChar     uint32 = 1043
 	OIDNumeric     uint32 = 1700
+	OIDUUID        uint32 = 2950
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -90,6 +91,7 @@ const (
 	OIDArrayFloat4      uint32 = 1021
 	OIDArrayTime        uint32 = 1183
 	OIDArrayTimestampTZ uint32 = 1185
+	OIDArrayUUID        uint32 = 2951
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -122,6 +124,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayTime
 	case OIDTimestampTZ:
 		return OIDArrayTimestampTZ
+	case OIDUUID:
+		return OIDArrayUUID
 	}
 	return 0
 }
@@ -156,6 +160,8 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDTime, true
 	case OIDArrayTimestampTZ:
 		return OIDTimestampTZ, true
+	case OIDArrayUUID:
+		return OIDUUID, true
 	}
 	return 0, false
 }
@@ -962,6 +968,8 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDTimestampTZ
 	case "numeric", "decimal":
 		return OIDNumeric
+	case "uuid":
+		return OIDUUID
 	case "oid":
 		return OIDOID
 	default:
@@ -1006,6 +1014,8 @@ func OIDToTypeName(oid uint32) string {
 		return "timestamptz"
 	case OIDNumeric:
 		return "numeric"
+	case OIDUUID:
+		return "uuid"
 	case OIDOID:
 		return "oid"
 	default:

@@ -405,6 +405,9 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		{"float4", nil, 1021, "real[]"},
 		{"time", nil, 1183, "time without time zone[]"},
 		{"timestamptz", nil, 1185, "timestamp with time zone[]"},
+		// Slice 66: uuid array (_uuid 2951). uuid is the first scalar element
+		// type wired into TypeNameToOID specifically to back its array.
+		{"uuid", nil, 2951, "uuid[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

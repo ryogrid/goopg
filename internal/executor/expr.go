@@ -10445,6 +10445,9 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "record"
 	case 2950:
 		return "uuid"
+	case 2951:
+		// _uuid: uuid has no typmod, so the array is the bare name. Slice 66.
+		return "uuid[]"
 	case 3614:
 		return "tsvector"
 	case 3615:

@@ -192,6 +192,7 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 		{"bpchar", OIDBpChar},
 		{"varchar", OIDVarChar},
 		{"numeric", OIDNumeric},
+		{"uuid", OIDUUID},
 	}
 	for _, p := range pairs {
 		gotOID := TypeNameToOID(p.name)

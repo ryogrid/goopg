@@ -1441,6 +1441,24 @@ fixed one logical group per loop:
     the scalar `uuid` type (OID 2950) wired into `TypeNameToOID` first; ENUM/
     composite/domain user-type columns and IDENTITY/SEQUENCE columns are larger
     slices.
+  - **Slice 66 — scalar `uuid` + `uuid[]` columns (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`, `internal/executor/expr.go`).**
+    `uuid` was the first scalar element type goopg had *not* wired into the
+    type-name maps, so a `uuid` column fell back to `text` (OID 25) and dumped as
+    `text`, and there was no `_uuid` array OID at all. This slice closes both: the
+    scalar half adds `OIDUUID` (2950) to the const block, the `uuid` case to
+    `TypeNameToOID`/`OIDToTypeName`; the array half adds `OIDArrayUUID` (2951),
+    the `uuid↔_uuid` cases to `ArrayOIDForBase`/`BaseOIDForArray`, the `_uuid` row
+    to `userTypeAttrsForOID`, and the `2951 → uuid[]` case to `formatTypeOID`
+    (`2950 → uuid` was already present). Per `pg_type.dat`, scalar `uuid` is
+    `typlen=16, typbyval=f, typalign='c', typstorage='p'`; the `_uuid` array row
+    follows the established goopg convention (`typlen=-1`, `typstorage='x'`,
+    element-`'c'` → array `typalign='i'`, matching `_bool`). Guarded by the `arr`
+    fixture's `tok uuid` + `ids uuid[]` columns in `TestPort_PgDumpConnectionSetup`,
+    the new `{"uuid", nil, 2951, "uuid[]"}` row in
+    `executor.TestUserPGAttributeArrayColumn`, and the `{"uuid", OIDUUID}` pair in
+    `catalog.TestTypeNameToOIDRoundTrip`. Remaining gaps: ENUM/composite/domain
+    user-type columns and IDENTITY/SEQUENCE columns are larger slices.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1486,7 +1504,8 @@ bigint[]`; slice 63 extends the `arr` fixture so a `flags boolean[]` and a
 element precision/scale); slice 64 extends it further with `ratios double
 precision[]`, `days date[]`, and `moments timestamp without time zone[]`;
 slice 65 extends it again with `speeds real[]`, `times time without time
-zone[]`, and `zoned timestamp with time zone[]`.
+zone[]`, and `zoned timestamp with time zone[]`; slice 66 adds a scalar `tok
+uuid` and a `ids uuid[]` column.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,
