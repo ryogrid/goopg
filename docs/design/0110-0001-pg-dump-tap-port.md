@@ -1460,6 +1460,23 @@ fixed one logical group per loop:
     `catalog.TestTypeNameToOIDRoundTrip`. Remaining gaps: ENUM/composite/domain
     user-type columns and IDENTITY/SEQUENCE columns are larger slices.
 
+  - **Slice 67 — `bytea[]` array column (`internal/catalog/codec.go`,
+    `internal/executor/pg18_user_catalog_rows.go`, `internal/executor/expr.go`).**
+    Scalar `bytea` (OID 17) was already wired through `TypeNameToOID`/
+    `OIDToTypeName`/`userTypeAttrsForOID`/`formatTypeOID`, so it round-tripped;
+    its array form `_bytea` (OID 1001) was the gap — a `bytea[]` column fell back
+    to scalar `bytea`. Identical proven 3-site pattern: `OIDArrayBytea` (1001) in
+    the const block, the `bytea↔_bytea` cases in `ArrayOIDForBase`/
+    `BaseOIDForArray`, the `_bytea` row in `userTypeAttrsForOID` (`typlen=-1`,
+    `typalign='i'`, `typstorage='x'`, matching `_bool`), and the `1001 → bytea[]`
+    case in the canonical `formatTypeOID` (bytea has no typmod, so the bare
+    element name with `[]`). Guarded by the `arr` fixture's `blob bytea` +
+    `blobs bytea[]` columns in `TestPort_PgDumpConnectionSetup` and the new
+    `{"bytea", nil, 1001, "bytea[]"}` row in
+    `executor.TestUserPGAttributeArrayColumn`. Remaining gaps unchanged:
+    `varchar[]`/`bpchar[]` (typmod-bearing arrays), ENUM/composite/domain
+    user-type columns, and IDENTITY/SEQUENCE columns.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits
@@ -1505,7 +1522,8 @@ element precision/scale); slice 64 extends it further with `ratios double
 precision[]`, `days date[]`, and `moments timestamp without time zone[]`;
 slice 65 extends it again with `speeds real[]`, `times time without time
 zone[]`, and `zoned timestamp with time zone[]`; slice 66 adds a scalar `tok
-uuid` and a `ids uuid[]` column.
+uuid` and a `ids uuid[]` column; slice 67 adds a scalar `blob bytea` and a
+`blobs bytea[]` column.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

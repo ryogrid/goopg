@@ -80,6 +80,7 @@ const (
 	// 62 (int2/int4/int8/text); slice 63 added bool/numeric; slice 64 added
 	// float8/date/timestamp; slice 65 added float4/time/timestamptz.
 	OIDArrayBool        uint32 = 1000
+	OIDArrayBytea       uint32 = 1001
 	OIDArrayInt2        uint32 = 1005
 	OIDArrayInt4        uint32 = 1007
 	OIDArrayText        uint32 = 1009
@@ -102,6 +103,8 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 	switch baseOID {
 	case OIDBool:
 		return OIDArrayBool
+	case OIDBytea:
+		return OIDArrayBytea
 	case OIDInt2:
 		return OIDArrayInt2
 	case OIDInt4:
@@ -138,6 +141,8 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 	switch oid {
 	case OIDArrayBool:
 		return OIDBool, true
+	case OIDArrayBytea:
+		return OIDBytea, true
 	case OIDArrayInt2:
 		return OIDInt2, true
 	case OIDArrayInt4:

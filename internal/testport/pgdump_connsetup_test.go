@@ -593,7 +593,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"flags boolean[], prices numeric(10,2)[], "+
 		"ratios double precision[], days date[], moments timestamp[], "+
 		"speeds real[], times time[], zoned timestamptz[], "+
-		"tok uuid, ids uuid[])"); err != nil {
+		"tok uuid, ids uuid[], "+
+		"blob bytea, blobs bytea[])"); err != nil {
 		t.Fatalf("create table arr: %v", err)
 	}
 
@@ -906,6 +907,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// uuid (OID 2950) is now in TypeNameToOID/OIDToTypeName and _uuid (2951)
 		// in the array OID maps, so both dump with their declared types instead
 		// of falling back to text.
+		// Slice 67 adds a scalar bytea (`blob bytea`, already round-tripped) and
+		// bytea[] (`blobs bytea[]`): _bytea (1001) is now in the array OID maps
+		// (ArrayOIDForBase/BaseOIDForArray + userTypeAttrsForOID + formatTypeOID),
+		// so the array dumps as `bytea[]` instead of falling back to scalar bytea.
 		arrCols := []string{
 			"CREATE TABLE public.arr (",
 			"tags text[]",
@@ -921,6 +926,8 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"zoned timestamp with time zone[]",
 			"tok uuid",
 			"ids uuid[]",
+			"blob bytea",
+			"blobs bytea[]",
 		}
 		for _, sub := range arrCols {
 			if !strings.Contains(res.Stdout, sub) {

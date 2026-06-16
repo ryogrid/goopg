@@ -408,6 +408,9 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// Slice 66: uuid array (_uuid 2951). uuid is the first scalar element
 		// type wired into TypeNameToOID specifically to back its array.
 		{"uuid", nil, 2951, "uuid[]"},
+		// Slice 67: bytea array (_bytea 1001). bytea has no typmod, so the
+		// array renders as the bare element name with the [] suffix.
+		{"bytea", nil, 1001, "bytea[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}

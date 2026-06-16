@@ -10383,6 +10383,9 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "double precision"
 	case 1000:
 		return "boolean[]"
+	case 1001:
+		// _bytea: bytea has no typmod, so the array is the bare name. Slice 67.
+		return "bytea[]"
 	case 1005:
 		return "smallint[]"
 	case 1007:

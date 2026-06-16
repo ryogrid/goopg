@@ -1,41 +1,39 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 66 COMPLETE
-(committing this loop). NEXT loop starts on slice 67.
+Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 67 COMPLETE
+(committing this loop). NEXT loop starts on slice 68.
 NOTHING in flight after commit.
 
-=== DONE (this loop) — DU-002 slice 66 (scalar uuid + uuid[] round-trip) ===
-Gap: uuid was the first scalar element type NOT wired into the type-name maps,
-so a `uuid` column fell back to text (OID 25) and dumped as `text`; there was
-no _uuid array OID at all.
-FIX (scalar half + array half, additive):
-  1. catalog/codec.go: OIDUUID=2950 const; OIDArrayUUID=2951 const; uuid↔_uuid
-     in ArrayOIDForBase & BaseOIDForArray; "uuid" case in TypeNameToOID &
-     OIDToTypeName.
-  2. executor/pg18_user_catalog_rows.go userTypeAttrsForOID: uuid (typlen 16,
-     byval f, align 'c', storage 'p' per pg_type.dat) + _uuid (typlen -1,
-     align 'i' [element-'c'→array 'i', matching _bool], storage 'x').
-  3. executor/expr.go formatTypeOID: added `case 2951: return "uuid[]"` (2950→
-     "uuid" was already present). NOTE: formatTypeOID is at expr.go:10344 — the
-     REAL one pg_dump format_type uses; a SEPARATE name-based fn at expr.go:~100
-     already had 2950/2951 but is NOT the one the test hits. Don't confuse them.
+=== DONE (this loop) — DU-002 slice 67 (bytea[] array round-trip) ===
+Gap: scalar `bytea` (OID 17) already round-tripped (wired in all 4 sites), but
+its array form `_bytea` (OID 1001) was missing, so a `bytea[]` column fell back
+to scalar `bytea`.
+FIX (proven 3-site pattern, array half only — additive):
+  1. catalog/codec.go: OIDArrayBytea=1001 const; bytea↔_bytea in ArrayOIDForBase
+     & BaseOIDForArray.
+  2. executor/pg18_user_catalog_rows.go userTypeAttrsForOID: _bytea row (typlen
+     -1, byval f, align 'i', storage 'x' — matches _bool).
+  3. executor/expr.go formatTypeOID (the REAL one at ~10344): added
+     `case 1001: return "bytea[]"` (bytea has no typmod → bare name). The
+     name-based twin at expr.go:~121 already had 1001→"bytea[]".
 Files: internal/catalog/codec.go, internal/executor/pg18_user_catalog_rows.go,
 internal/executor/expr.go, internal/executor/pg18_user_catalog_rows_test.go
-(+uuid case), internal/catalog/codec_test.go (+{"uuid",OIDUUID} roundtrip),
-internal/testport/pgdump_connsetup_test.go (arr fixture +tok uuid, ids uuid[] +
-asserts), docs/design/0110-0001-pg-dump-tap-port.md.
+(+{"bytea",nil,1001,"bytea[]"}), internal/testport/pgdump_connsetup_test.go
+(arr fixture +blob bytea, blobs bytea[] + asserts), docs/design/0110-0001-pg-dump-tap-port.md.
 Gates: gofmt clean; build ./... ok; catalog pkg PASS; executor TestUserPG* PASS;
-TestPort_PgDumpConnectionSetup PASS (exit-0 path — uuid asserts are inside the
-ExitCode==0 return block); pgbench CI-parity via pre-commit hook.
+TestPort_PgDumpConnectionSetup PASS (exit-0 path confirmed — no downstream logf
+under -v, so the arrCols asserts inside `if res.ExitCode==0` actually ran);
+pgbench CI-parity via pre-commit hook.
 
-=== NEXT STEP — DU-002 slice 67 ===
-Known-working array element types: int2/int4/int8/text/bool/numeric(typmod)/
-float8/date/timestamp/float4/time/timestamptz/uuid. ALL scalar-OID-backed
-array types now covered. Remaining candidates (all LARGER than 3-site pattern):
-  - IDENTITY column / SEQUENCE / serial — sequences skipped from pg_class
-    virtual view (Virtual && no View); needs relkind='S' support first.
-  - ALTER TABLE ... SET DEFAULT / column-level non-trivial DEFAULT.
-  - ENUM / composite / domain user type column (needs user pg_type rows).
-ALWAYS: add ONE+ fixture element, run TestPort_PgDumpConnectionSetup, confirm
-the ExitCode==0 path runs (asserts inside that block actually execute).
-NOTE: do NOT Edit .ralph/fix_plan.md (driver churns it mid-loop; Edit goes stale).
-NOTE: WSL cwd hazard — a `cd postgres` in a Bash compound persists; always cd
-back to /home/ryo/work/goopg/goopg or use absolute paths.
+=== NEXT STEP — DU-002 slice 68 ===
+Known-working array element types now: int2/int4/int8/text/bool/numeric(typmod)/
+float8/date/timestamp/float4/time/timestamptz/uuid/bytea.
+Remaining array candidates (still scalar-OID-backed, same 3-site pattern):
+  - varchar[]  → _varchar 1015 (typmod-bearing: format_type carries n+VARHDRSZ
+    onto the array, like _numeric 1231; reuse formatTypeOID(1043,typmod)+"[]").
+  - bpchar[]   → _bpchar 1014 (same typmod path, formatTypeOID(1042,typmod)+"[]").
+  - oid[]      → _oid 1028 (formatTypeOID already has 30→"oid[]"? NO, 30 is _xid;
+    _oid is 1028 — verify before use).
+Larger slices (defer): IDENTITY/SEQUENCE (relkind 'S'), ENUM/composite/domain.
+ALWAYS: add ONE+ fixture element, run TestPort_PgDumpConnectionSetup -v, confirm
+NO downstream logf line prints (proves the ExitCode==0 assert block ran).
+NOTE: do NOT Edit .ralph/fix_plan.md (driver churns it mid-loop).
+NOTE: WSL cwd hazard — a `cd postgres` in a Bash compound persists; use abs paths.
