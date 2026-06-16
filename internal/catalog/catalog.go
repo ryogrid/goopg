@@ -52,6 +52,13 @@ var VirtualSpecLockRowsFunc func() [][]string
 type Type struct {
 	Name string
 	Args []int64
+	// IsArray is true for a column declared with the SQL `[]` array suffix
+	// (e.g. `tags text[]`). Name still holds the element type ("text"); the
+	// array-ness is tracked separately so the runtime evaluator keeps using
+	// the element type while catalog builders (pg_attribute.atttypid →
+	// _text/_int4/…) and pg_dump's format_type render the array type.
+	// DU-002 slice 62.
+	IsArray bool
 }
 
 // Column is one column of a table.

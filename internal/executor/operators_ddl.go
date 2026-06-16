@@ -700,7 +700,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				serialTyp == "smallserial" || serialTyp == "serial2"
 			cols = append(cols, catalog.Column{
 				Name:             c.Name,
-				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
+				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...), IsArray: c.Type.IsArray},
 				DeclaredTypeName: declaredTypeName,
 				NotNull:          c.NotNull || c.IdentityColumn || isSerialCol,
 				GeneratedExpr:    c.GeneratedExpr,

@@ -1354,6 +1354,34 @@ fixed one logical group per loop:
     CTE name, not a schema-qualified relation), mirroring PG's CREATE RECURSIVE
     VIEW rewrite. Guarded end-to-end by `TestPort_PgDumpConnectionSetup` (the
     `foo_rec` fixture) and by `parser.TestParseCreateRecursiveViewRawDef`.
+  - **Slice 62 — array-typed column round-trip (`internal/catalog/catalog.go`,
+    `internal/catalog/codec.go`, `internal/executor/operators_ddl.go`,
+    `internal/executor/pg18_user_catalog_rows.go`, `internal/initdb/open.go`).**
+    `pg_dump` renders every column via `format_type(atttypid, atttypmod)`, which
+    only yields the `[]` suffix when `pg_attribute.atttypid` holds the array
+    (`_typename`) OID. The parser captured the SQL `[]` suffix
+    (`ColumnType.IsArray`, M0097-0071) but the CREATE TABLE path (`addCol`)
+    dropped it on the way into the catalog, so `buildUserPGAttributeRow` stored
+    the SCALAR element OID and every array column dumped as its element type
+    (`tags text`, not `tags text[]`) — a type-fidelity loss on restore.
+    `catalog.Type` now carries an `IsArray` field; `addCol` propagates it from the
+    parsed `ColumnType`; `buildUserPGAttributeRow` remaps the scalar OID to the
+    array OID via `catalog.ArrayOIDForBase` (text→`_text` 1009, int2→`_int2` 1005,
+    int4→`_int4` 1007, int8→`_int8` 1016 — the four element types `format_type`
+    already renders as arrays) and sets `attndims=1`, while `atttypmod` still
+    carries the ELEMENT typmod (computed from the base OID before the remap).
+    `userTypeAttrsForOID` gains the four array OID cases (`typlen=-1`,
+    `typstorage='x'`, `_int8` align `'d'`, `_text` default collation) so the heap
+    row's attlen/byval/align/storage/collation match PG. The runtime evaluator is
+    untouched — `Type.Name` still holds the element type, so only the catalog
+    builders see the array OID. The heap loader (`loadUserTablesFromHeap`)
+    reverse-maps the persisted array OID back to the element type and re-flags
+    `IsArray` via `catalog.BaseOIDForArray`, so an array column round-trips across
+    restart (heap-write ↔ heap-read sibling paths kept in sync). Guarded
+    end-to-end by `TestPort_PgDumpConnectionSetup` (the `arr` fixture) and by
+    `executor.TestUserPGAttributeArrayColumn`. Fidelity gap: only int2/int4/int8/
+    text arrays are mapped; other element types (numeric[], bool[], …) still fall
+    back to their scalar OID until their array OID + `format_type` rendering land.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1392,7 +1420,9 @@ ALWAYS AS (w * h) STORED`; slice 60 asserts a MATERIALIZED VIEW round-trips —
 slice 61 asserts a RECURSIVE VIEW round-trips — `CREATE VIEW public.foo_rec AS`
 followed by the synthesized wrapped-CTE body `WITH RECURSIVE foo_rec(n) AS
 (SELECT 1 UNION ALL SELECT n + 1 FROM foo_rec WHERE n < 5) SELECT n FROM
-foo_rec;`.
+foo_rec;`; slice 62 asserts array-typed columns round-trip as their array type —
+`CREATE TABLE public.arr (` with `tags text[]`, `scores integer[]`, and `big
+bigint[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

@@ -555,6 +555,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create recursive view foo_rec: %v", err)
 	}
 
+	// Slice 62: an array-typed column (text[]/integer[]/…) must survive the
+	// dump as its array type, not its bare element type. pg_dump renders each
+	// column via format_type(atttypid, atttypmod), which only yields the `[]`
+	// suffix when pg_attribute.atttypid holds the array (_typename) OID. The
+	// parser captured the `[]` suffix (ColumnType.IsArray) but dropped it on the
+	// way into the catalog, so buildUserPGAttributeRow stored the SCALAR OID and
+	// every array column dumped as its element type (`tags text`, not
+	// `tags text[]`) — a type-fidelity loss on restore. catalog.Type now carries
+	// IsArray, and buildUserPGAttributeRow remaps the scalar OID to the array OID
+	// (text→_text 1009, int4→_int4 1007, int8→_int8 1016) with attndims=1.
+	// `arr` carries the array columns on its own table so foo's many asserts are
+	// untouched.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.arr (id integer PRIMARY KEY, "+
+		"tags text[], scores integer[], big bigint[])"); err != nil {
+		t.Fatalf("create table arr: %v", err)
+	}
+
 	res, err := util.RunCommand(util.CommandSpec{
 		Name:    bin,
 		Args:    []string{"--no-sync", "postgres"},
@@ -842,6 +859,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		for _, sub := range recViewDefs {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped a RECURSIVE VIEW; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// **Slice 62 (asserted):** array-typed columns must round-trip as their
+		// array type. pg_dump renders columns via format_type(atttypid, atttypmod);
+		// the `[]` suffix only appears when atttypid is the array (_typename) OID.
+		// goopg now carries the parser's IsArray flag into the catalog and remaps
+		// the scalar OID to the array OID in buildUserPGAttributeRow, so each column
+		// dumps with its declared array type. Regression guard for the IsArray
+		// plumbing (parser → catalog.Type → pg_attribute.atttypid).
+		arrCols := []string{
+			"CREATE TABLE public.arr (",
+			"tags text[]",
+			"scores integer[]",
+			"big bigint[]",
+		}
+		for _, sub := range arrCols {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped an array column type; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
 		return

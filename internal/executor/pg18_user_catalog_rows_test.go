@@ -370,6 +370,52 @@ func TestBuildUserPGAttributeRowEncodesTypCollation(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeArrayColumn pins the pg_attribute row for an array-typed
+// column (DU-002 slice 62). A `tags text[]` column must store the array
+// (_typename) OID in atttypid, attndims=1, and the element typmod in atttypmod
+// so that pg_dump's format_type(atttypid, atttypmod) renders the `[]` suffix.
+// Before this, the parser's IsArray flag was dropped on the way into the
+// catalog, so the column dumped as its bare element type (`text`, not `text[]`).
+func TestUserPGAttributeArrayColumn(t *testing.T) {
+	const (
+		atttypidIdx  = 2
+		atttypmodIdx = 5
+		attndimsIdx  = 6
+	)
+	tbl := &catalog.Table{Schema: "public", Name: "t", OID: 16500}
+	cases := []struct {
+		typeName    string
+		wantTypOID  int64
+		wantDisplay string
+	}{
+		{"text", 1009, "text[]"},
+		{"int2", 1005, "smallint[]"},
+		{"int4", 1007, "integer[]"},
+		{"int8", 1016, "bigint[]"},
+	}
+	for _, tc := range cases {
+		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true}, Ordinal: 0}
+		row := buildUserPGAttributeRow(tbl, col)
+		if got := row[atttypidIdx].Int; got != tc.wantTypOID {
+			t.Errorf("%s[]: atttypid=%d want %d", tc.typeName, got, tc.wantTypOID)
+		}
+		if got := row[attndimsIdx].Int; got != 1 {
+			t.Errorf("%s[]: attndims=%d want 1", tc.typeName, got)
+		}
+		gotTypmod := row[atttypmodIdx].Int
+		if got := formatTypeOID(row[atttypidIdx].Int, gotTypmod); got != tc.wantDisplay {
+			t.Errorf("%s[]: format_type(%d,%d)=%q want %q", tc.typeName, row[atttypidIdx].Int, gotTypmod, got, tc.wantDisplay)
+		}
+	}
+	// A non-array column of the same element type must be unaffected:
+	// attndims=0 and the scalar OID.
+	scalar := catalog.Column{Name: "c", Type: catalog.Type{Name: "text"}, Ordinal: 0}
+	row := buildUserPGAttributeRow(tbl, scalar)
+	if row[attndimsIdx].Int != 0 || row[atttypidIdx].Int != int64(catalog.OIDText) {
+		t.Errorf("scalar text: atttypid=%d attndims=%d want %d/0", row[atttypidIdx].Int, row[attndimsIdx].Int, catalog.OIDText)
+	}
+}
+
 // TestUserPGAttributeTypmod pins the atttypmod computation for typmod-bearing
 // columns and the matching format_type round-trip (DU-002 slice 48). Before
 // this, buildUserPGAttributeRow hardcoded atttypmod=-1, so pg_dump rendered

@@ -70,7 +70,52 @@ const (
 	OIDBpChar      uint32 = 1042
 	OIDVarChar     uint32 = 1043
 	OIDNumeric     uint32 = 1700
+
+	// Array (_typename) OIDs for the element types goopg currently supports as
+	// array columns. These mirror pg_type.typarray for int2/int4/int8/text and
+	// are the OIDs format_type renders as `smallint[]`/`integer[]`/`bigint[]`/
+	// `text[]`. DU-002 slice 62.
+	OIDArrayInt2 uint32 = 1005
+	OIDArrayInt4 uint32 = 1007
+	OIDArrayText uint32 = 1009
+	OIDArrayInt8 uint32 = 1016
 )
+
+// ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
+// OID, or 0 when goopg has no array OID mapped for that base type. Mirrors the
+// pg_type.typarray column for the four element types goopg currently supports as
+// array columns (int2/int4/int8/text). DU-002 slice 62.
+func ArrayOIDForBase(baseOID uint32) uint32 {
+	switch baseOID {
+	case OIDInt2:
+		return OIDArrayInt2
+	case OIDInt4:
+		return OIDArrayInt4
+	case OIDInt8:
+		return OIDArrayInt8
+	case OIDText:
+		return OIDArrayText
+	}
+	return 0
+}
+
+// BaseOIDForArray is the inverse of ArrayOIDForBase: it maps a known array OID
+// back to its element scalar OID, returning ok=false for non-array OIDs. Used by
+// the heap loader to reconstruct an array column's catalog.Type on restart.
+// DU-002 slice 62.
+func BaseOIDForArray(oid uint32) (uint32, bool) {
+	switch oid {
+	case OIDArrayInt2:
+		return OIDInt2, true
+	case OIDArrayInt4:
+		return OIDInt4, true
+	case OIDArrayInt8:
+		return OIDInt8, true
+	case OIDArrayText:
+		return OIDText, true
+	}
+	return 0, false
+}
 
 // PGClassRow is the v0 on-disk shape of one pg_class tuple.
 // Only the subset of columns needed to reconstruct the in-memory

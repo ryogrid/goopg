@@ -152,6 +152,14 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: 8, TypByVal: true, TypAlign: 'd', TypStorage: 'p'}
 	case catalog.OIDNumeric: // 1700
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'm'}
+	case catalog.OIDArrayInt2: // 1005 _int2 -- pg_type.dat: typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayInt4: // 1007 _int4
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayText: // 1009 _text -- element collation defaults like text
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x', TypCollation: defaultCollationOID}
+	case catalog.OIDArrayInt8: // 1016 _int8 -- typalign 'd'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 }
@@ -282,6 +290,16 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 // user-defined column (attstattarget appended last as NULL).
 func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 	typOID := catalog.TypeNameToOID(col.Type.Name)
+	// atttypmod carries the ELEMENT typmod even for array columns; compute it
+	// from the base OID before remapping typOID to the array (_typename) OID.
+	typmod := pgAttTypmod(typOID, col.Type.Args)
+	attndims := int64(0)
+	if col.Type.IsArray {
+		if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
+			typOID = aoid
+			attndims = 1
+		}
+	}
 	attrs := userTypeAttrsForOID(typOID)
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                     // attrelid
@@ -289,8 +307,8 @@ func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 		NewIntDatum(int64(typOID)),                                      // atttypid
 		NewIntDatum(int64(attrs.TypLen)),                                // attlen
 		NewIntDatum(int64(col.Ordinal + 1)),                             // attnum (1-based)
-		NewIntDatum(pgAttTypmod(typOID, col.Type.Args)),                 // atttypmod
-		NewIntDatum(0),                                                  // attndims
+		NewIntDatum(typmod),                                             // atttypmod
+		NewIntDatum(attndims),                                           // attndims
 		NewBoolDatum(attrs.TypByVal),                                    // attbyval
 		NewStringDatum(string(attrs.TypAlign)),                          // attalign
 		NewStringDatum(string(attrs.TypStorage)),                        // attstorage
