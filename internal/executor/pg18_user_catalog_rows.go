@@ -202,6 +202,12 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	case catalog.OIDXid8: // 5069 xid8 -- pg_type.dat: typlen 8, typbyval t, typalign 'd', typstorage 'p'
 		return userTypeAttrs{TypLen: 8, TypByVal: true, TypAlign: 'd', TypStorage: 'p'}
+	case catalog.OIDTid: // 27 tid -- pg_type.dat: typlen 6, typbyval f, typalign 's', typstorage 'p'
+		return userTypeAttrs{TypLen: 6, TypByVal: false, TypAlign: 's', TypStorage: 'p'}
+	case catalog.OIDXid: // 28 xid -- pg_type.dat: typlen 4, typbyval t, typalign 'i', typstorage 'p'
+		return userTypeAttrs{TypLen: 4, TypByVal: true, TypAlign: 'i', TypStorage: 'p'}
+	case catalog.OIDCid: // 29 cid -- pg_type.dat: typlen 4, typbyval t, typalign 'i', typstorage 'p'
+		return userTypeAttrs{TypLen: 4, TypByVal: true, TypAlign: 'i', TypStorage: 'p'}
 	case catalog.OIDArrayBool: // 1000 _bool -- pg_type.dat: typalign 'i', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	case catalog.OIDArrayBytea: // 1001 _bytea -- element bytea typalign 'i', typstorage 'x'
@@ -284,6 +290,12 @@ func userTypeAttrsForOID(oid uint32) userTypeAttrs {
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	case catalog.OIDArrayXid8: // 271 _xid8 -- element xid8 typalign 'd', typstorage 'x'
 		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case catalog.OIDArrayTid: // 1010 _tid -- element tid typalign 's' -> array 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayXid: // 1011 _xid -- element xid typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case catalog.OIDArrayCid: // 1012 _cid -- element cid typalign 'i', typstorage 'x'
+		return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	}
 	return userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 }

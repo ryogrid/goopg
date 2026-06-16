@@ -462,6 +462,11 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		// Slice 78: xid8 (_xid8 271). xid8 has no typmod, so the array renders as
 		// the bare element name with the [] suffix.
 		{"xid8", nil, 271, "xid8[]"},
+		// Slice 79: tid/xid/cid (_tid 1010, _xid 1011, _cid 1012). None carry a
+		// typmod, so each array renders as the bare element name with the [] suffix.
+		{"tid", nil, 1010, "tid[]"},
+		{"xid", nil, 1011, "xid[]"},
+		{"cid", nil, 1012, "cid[]"},
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}
@@ -521,6 +526,10 @@ func TestUserPGAttributeTypmod(t *testing.T) {
 		{"pg_snapshot", nil, -1, "pg_snapshot"},
 		// Slice 78: xid8 carries no typmod either.
 		{"xid8", nil, -1, "xid8"},
+		// Slice 79: tid/xid/cid carry no typmod either.
+		{"tid", nil, -1, "tid"},
+		{"xid", nil, -1, "xid"},
+		{"cid", nil, -1, "cid"},
 		{"int4", []int64{}, -1, "integer"}, // typmod ignored for plain types
 	}
 	for _, tc := range cases {

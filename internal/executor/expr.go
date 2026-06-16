@@ -155,6 +155,15 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "pg_snapshot"
 	case 5069:
 		return "xid8"
+	case 27:
+		// tid: tuple identifier, bare name. DU-002 slice 79.
+		return "tid"
+	case 28:
+		// xid: 32-bit transaction id, bare name. Slice 79.
+		return "xid"
+	case 29:
+		// cid: 32-bit command id, bare name. Slice 79.
+		return "cid"
 	// Array types
 	case 1000:
 		return "boolean[]"
@@ -232,6 +241,12 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "pg_snapshot[]"
 	case 271:
 		return "xid8[]"
+	case 1010:
+		return "tid[]"
+	case 1011:
+		return "xid[]"
+	case 1012:
+		return "cid[]"
 	case 1231:
 		return "numeric[]"
 	case 2951:
@@ -10680,6 +10695,15 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 271:
 		// _xid8: xid8 has no typmod, so the array is the bare name. Slice 78.
 		return "xid8[]"
+	case 1010:
+		// _tid: tid has no typmod, so the array is the bare name. Slice 79.
+		return "tid[]"
+	case 1011:
+		// _xid: xid has no typmod, so the array is the bare name. Slice 79.
+		return "xid[]"
+	case 1012:
+		// _cid: cid has no typmod, so the array is the bare name. Slice 79.
+		return "cid[]"
 	case 3802:
 		return "jsonb"
 	case 4072:

@@ -1696,6 +1696,26 @@ fixed one logical group per loop:
     the `arr` fixture's `x8 xid8`, `x8s xid8[]` columns in
     `TestPort_PgDumpConnectionSetup` and new rows in
     `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`.
+  - **Slice 79 — `tid` / `xid` / `cid` (+ their array types)
+    (`internal/catalog/codec.go`, `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** `tid` (OID 27, array `_tid` 1010), `xid`
+    (OID 28, array `_xid` 1011), and `cid` (OID 29, array `_cid` 1012) are the
+    tuple-identifier / transaction-id / command-id system types. All three were
+    seeded in `pg_type_seed_data.go` and recognized by the analyzer, and the
+    scalar names already appeared in `formatTypeOID` (OIDs 27/28/29), but none
+    were wired into the codec OID round-trip (`TypeNameToOID` / `OIDToTypeName`)
+    nor into `oidToBuiltinTypeName`, and the three array OIDs had no entry in any
+    path — so a `tid`/`xid`/`cid` column fell back to `text` (OID 25) and the
+    arrays were unresolved. None carry a typmod, so this is the plain 3-site
+    pattern: scalars are `tid` `{typlen=6, byval=f, align='s', storage='p'}`,
+    `xid`/`cid` `{typlen=4, byval=t, align='i', storage='p'}`; each array is the
+    varlena `{typlen=-1, byval=f, align='i', storage='x'}`. `TypeNameToOID` /
+    `OIDToTypeName` / `ArrayOIDForBase` / `BaseOIDForArray` gained the three
+    scalar+array cases; `oidToBuiltinTypeName` gained scalar+array cases and
+    `formatTypeOID` gained the three array cases (the scalars already existed).
+    Guarded by the `arr` fixture's `td tid`, `tds tid[]`, `xd xid`, `xds xid[]`,
+    `cd cid`, `cds cid[]` columns in `TestPort_PgDumpConnectionSetup` and new
+    rows in `executor.TestUserPGAttributeArrayColumn` + `TestUserPGAttributeTypmod`.
 
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
@@ -1759,7 +1779,8 @@ money`, and `mnys money[]`; slice 75 adds the typmod-bearing `bv bit(8)`, `bvs
 bit(8)[]`, `vb varbit(16)`, and `vbs varbit(16)[]`; slice 76 adds `lsn pg_lsn`
 and `lsns pg_lsn[]`; slice 77 adds the snapshot types `txs txid_snapshot`, `txss
 txid_snapshot[]`, `pgs pg_snapshot`, and `pgss pg_snapshot[]`; slice 78 adds `x8
-xid8` and `x8s xid8[]`.
+xid8` and `x8s xid8[]`; slice 79 adds the identifier types `td tid`, `tds
+tid[]`, `xd xid`, `xds xid[]`, `cd cid`, and `cds cid[]`.
 Unit guards:
 `planner.TestSRFJoinRightProjectionOffset`, `executor.TestUserPGAttributeTypmod`,
 `executor.TestForeignKeySurfacesInPgConstraint`,

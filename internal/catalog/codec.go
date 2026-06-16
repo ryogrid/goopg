@@ -124,6 +124,14 @@ const (
 	// PG standby can resolve the OID. It is an 8-byte by-value type with no
 	// typmod, so format_type renders the bare type name.
 	OIDXid8 uint32 = 5069
+	// DU-002 slice 79: the transaction/tuple identifier types. tid is the 6-byte
+	// tuple identifier (block,offset); xid is the 32-bit transaction id; cid is
+	// the 32-bit command id. All three are seeded in pg_type (see
+	// initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs. None
+	// carry a typmod, so format_type renders the bare type name.
+	OIDTid uint32 = 27
+	OIDXid uint32 = 28
+	OIDCid uint32 = 29
 
 	// Array (_typename) OIDs for the element types goopg currently supports as
 	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
@@ -199,6 +207,11 @@ const (
 	// DU-002 slice 78: the xid8 array type. xid8 has no typmod, so format_type
 	// renders the bare element name with a [] suffix.
 	OIDArrayXid8 uint32 = 271
+	// DU-002 slice 79: the tid/xid/cid array types. None carry a typmod, so
+	// format_type renders the bare element name with a [] suffix.
+	OIDArrayTid uint32 = 1010
+	OIDArrayXid uint32 = 1011
+	OIDArrayCid uint32 = 1012
 )
 
 // ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
@@ -289,6 +302,12 @@ func ArrayOIDForBase(baseOID uint32) uint32 {
 		return OIDArrayPgSnapshot
 	case OIDXid8:
 		return OIDArrayXid8
+	case OIDTid:
+		return OIDArrayTid
+	case OIDXid:
+		return OIDArrayXid
+	case OIDCid:
+		return OIDArrayCid
 	}
 	return 0
 }
@@ -381,6 +400,12 @@ func BaseOIDForArray(oid uint32) (uint32, bool) {
 		return OIDPgSnapshot, true
 	case OIDArrayXid8:
 		return OIDXid8, true
+	case OIDArrayTid:
+		return OIDTid, true
+	case OIDArrayXid:
+		return OIDXid, true
+	case OIDArrayCid:
+		return OIDCid, true
 	}
 	return 0, false
 }
@@ -1239,6 +1264,12 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDPgSnapshot
 	case "xid8":
 		return OIDXid8
+	case "tid":
+		return OIDTid
+	case "xid":
+		return OIDXid
+	case "cid":
+		return OIDCid
 	default:
 		return OIDText // safe fallback
 	}
@@ -1333,6 +1364,12 @@ func OIDToTypeName(oid uint32) string {
 		return "pg_snapshot"
 	case OIDXid8:
 		return "xid8"
+	case OIDTid:
+		return "tid"
+	case OIDXid:
+		return "xid"
+	case OIDCid:
+		return "cid"
 	default:
 		return "text"
 	}
