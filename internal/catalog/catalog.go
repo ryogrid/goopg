@@ -57,6 +57,12 @@ type SeqParams struct {
 	Min       int64
 	Cache     int64
 	Cycle     bool
+	// OwnedBy is the lowercased "table.column" (optionally "schema.table.column")
+	// recorded by ALTER/CREATE SEQUENCE ... OWNED BY, or "" for a standalone
+	// sequence. The catalog uses it to synthesize the pg_depend AUTO ('a') row
+	// that pg_dump's getTables LEFT JOIN reads to emit `ALTER SEQUENCE ... OWNED
+	// BY`. M0110-0001 (DU-002 slice 118).
+	OwnedBy string
 }
 
 // SequenceParamsFunc is set by the executor at init. Given a sequence's
@@ -3729,14 +3735,17 @@ func (c *InMemory) registerSystemTables() {
 	c.tables["pg_catalog.pg_am"] = pgAm
 
 	// pg_depend — dependency catalog (OID 2608).
-	// goopg does not maintain a general dependency graph (sequence ownership,
-	// extension membership, etc. are not tracked), so this view is empty. pg_dump
-	// LEFT JOINs pg_depend in getTables to discover a sequence's owning column;
-	// with no rows the join yields NULL owning_tab/owning_col and
-	// is_identity_sequence=false, which is the correct result for a server that
-	// has no recorded dependencies. The schema matches PG's pg_depend exactly so
-	// that the catalog-query column references (classid, objid, objsubid,
-	// refclassid, refobjid, refobjsubid, deptype) resolve. M0110-0001 (DU-002).
+	// goopg does not maintain a general dependency graph (extension membership,
+	// function/type deps, etc. are not tracked), so this view is empty EXCEPT for
+	// the one dependency class pg_dump needs: a sequence's AUTO ('a') ownership of
+	// the column named by OWNED BY. pg_dump LEFT JOINs pg_depend in getTables
+	// (gated on relkind=RELKIND_SEQUENCE, objsubid=0, refclassid=pg_class,
+	// deptype IN ('a','i')) to discover owning_tab/owning_col, then dumpSequence
+	// emits `ALTER SEQUENCE ... OWNED BY <table>.<col>`. A standalone sequence has
+	// no such row and correctly yields NULL owning_tab. The schema matches PG's
+	// pg_depend exactly so the catalog-query column references (classid, objid,
+	// objsubid, refclassid, refobjid, refobjsubid, deptype) resolve. M0110-0001
+	// (DU-002 slice 118).
 	pgDepend := &Table{
 		Schema: "pg_catalog", Name: "pg_depend", Virtual: true,
 		Columns: []Column{
@@ -3750,7 +3759,7 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2608,
 	}
-	pgDepend.VirtualRows = func() [][]string { return nil }
+	pgDepend.VirtualRows = c.dependVirtualRows
 	c.tables["pg_catalog.pg_depend"] = pgDepend
 
 	// pg_tablespace — tablespace catalog (OID 1213). The on-disk shared heap
@@ -5469,6 +5478,103 @@ func (c *InMemory) tablespaceVirtualRows() [][]string {
 	sort.Slice(extra, func(i, j int) bool { return extra[i].oid < extra[j].oid })
 	for _, ts := range extra {
 		rows = append(rows, []string{strconv.FormatUint(uint64(ts.oid), 10), ts.name, "10", "", ""})
+	}
+	return rows
+}
+
+// dependVirtualRows builds pg_depend's only non-empty dependency class: the
+// AUTO ('a') link from an OWNED-BY sequence to the column it is tied to. Each
+// row matches what PG records for `ALTER/CREATE SEQUENCE ... OWNED BY t.c`:
+//
+//	classid     = pg_class (1259)   objid       = sequence's pg_class OID
+//	objsubid    = 0                 refclassid  = pg_class (1259)
+//	refobjid    = owning table OID  refobjsubid = owning column attnum (1-based)
+//	deptype     = 'a'
+//
+// pg_dump's getTables LEFT JOIN (gated on relkind=RELKIND_SEQUENCE) reads these
+// into owning_tab/owning_col so dumpSequence emits the ALTER SEQUENCE OWNED BY.
+// Standalone sequences have no OwnedBy and contribute no row. M0110-0001
+// (DU-002 slice 118).
+func (c *InMemory) dependVirtualRows() [][]string {
+	if SequenceParamsFunc == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// Index user tables by lower(schema)+"."+lower(name) for owner resolution.
+	// Only non-virtual relations can own a sequence (validateSeqOwnedBy rejects
+	// virtual relations), so the index excludes them.
+	type tblRef struct {
+		oid     uint32
+		columns []Column
+	}
+	byName := make(map[string]tblRef, len(c.tables))
+	seqKeys := make([]string, 0)
+	for k, t := range c.tables {
+		if t.IsSequence {
+			seqKeys = append(seqKeys, k)
+			continue
+		}
+		if t.Virtual && t.View == nil && !t.IsMatView {
+			continue
+		}
+		sch := strings.ToLower(t.Schema)
+		if sch == "" {
+			sch = "public"
+		}
+		byName[sch+"."+strings.ToLower(t.Name)] = tblRef{oid: t.OID, columns: t.Columns}
+	}
+	sort.Strings(seqKeys)
+
+	rows := make([][]string, 0, len(seqKeys))
+	for _, k := range seqKeys {
+		t := c.tables[k]
+		seqSchema := strings.ToLower(t.Schema)
+		if seqSchema == "" {
+			seqSchema = "public"
+		}
+		p, ok := SequenceParamsFunc(seqSchema + "." + t.Name)
+		if !ok || p.OwnedBy == "" {
+			continue
+		}
+		// Split "table.column" or "schema.table.column" (already lowercased).
+		ownedBy := strings.ToLower(p.OwnedBy)
+		lastDot := strings.LastIndex(ownedBy, ".")
+		if lastDot < 0 {
+			continue
+		}
+		colPart := ownedBy[lastDot+1:]
+		rest := ownedBy[:lastDot]
+		tblSchema := seqSchema // OWNED BY table must share the sequence's schema
+		tblName := rest
+		if firstDot := strings.Index(rest, "."); firstDot >= 0 {
+			tblSchema = rest[:firstDot]
+			tblName = rest[firstDot+1:]
+		}
+		ref, ok := byName[tblSchema+"."+tblName]
+		if !ok {
+			continue
+		}
+		attnum := 0
+		for _, col := range ref.columns {
+			if strings.EqualFold(col.Name, colPart) {
+				attnum = col.Ordinal + 1
+				break
+			}
+		}
+		if attnum == 0 {
+			continue
+		}
+		rows = append(rows, []string{
+			"1259",                     // 0: classid    = pg_class
+			strconv.Itoa(int(t.OID)),   // 1: objid      = sequence OID
+			"0",                        // 2: objsubid
+			"1259",                     // 3: refclassid = pg_class
+			strconv.Itoa(int(ref.oid)), // 4: refobjid   = owning table OID
+			strconv.Itoa(attnum),       // 5: refobjsubid = owning col attnum
+			"a",                        // 6: deptype    = AUTO
+		})
 	}
 	return rows
 }

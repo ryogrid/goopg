@@ -568,6 +568,7 @@ func sequenceParamsForCatalog(qualifiedName string) (catalog.SeqParams, bool) {
 		Min:       s.min,
 		Cache:     1, // goopg does not track per-sequence CACHE; PG default is 1
 		Cycle:     s.cycle,
+		OwnedBy:   s.ownedBy, // "table.column" for OWNED BY sequences; "" otherwise
 	}, true
 }
 

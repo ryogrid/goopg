@@ -2234,6 +2234,33 @@ object support.
         the last single-sequence pg_dump surface; or a descending sequence
         (`INCREMENT BY -1` → `MINVALUE`/`MAXVALUE -1` defaults, exercising the
         descending-direction branch of pg_dump's default-bound suppression).
+      - **PROGRESS 2026-06-17 (loop #82):** **DU-002 slice 118 LANDED** — a
+        sequence with `OWNED BY table.column` now dumps its trailing
+        `ALTER SEQUENCE ... OWNED BY ...;`. This is the **first non-empty
+        `pg_depend`**: pg_dump's `getTables` LEFT JOINs `pg_depend` (gated on
+        `relkind='S'`, `objsubid=0`, `refclassid=pg_class`, `deptype IN ('a','i')`)
+        to read `owning_tab`/`owning_col`; goopg returned an empty pg_depend so no
+        `OWNED BY` ever emitted despite the executor tracking `seqState.ownedBy`
+        end-to-end. Fix: (a) `catalog.SeqParams` gains `OwnedBy`, filled by
+        `sequenceParamsForCatalog` from `seqState.ownedBy`; (b) new
+        `InMemory.dependVirtualRows` synthesizes the AUTO ('a') row per OWNED-BY
+        sequence — `classid=refclassid=1259`, `objid=seq OID`, `objsubid=0`,
+        `refobjid=owning table OID`, `refobjsubid=attnum (Ordinal+1)`, `deptype='a'`
+        — resolving the owner against the sequence's own schema (unqualified clause)
+        or explicit `schema.table.column`. Standalone sequences contribute no row,
+        preserving the empty-view + "no spurious OWNED BY" guard. pg_dump emits
+        `ALTER SEQUENCE public.owned_seq OWNED BY public.owner_tbl.id;` (self-
+        qualified) and `getOwnedSeqs` ORs the table's dump bits so the CREATE
+        SEQUENCE still emits. Files: `internal/catalog/catalog.go` (SeqParams.OwnedBy
+        + dependVirtualRows + pg_depend comment), `internal/executor/operators_sequence.go`
+        (OwnedBy plumbing), `internal/testport/pgdump_connsetup_test.go` (owner_tbl +
+        owned_seq fixture + assertions), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 118 section). Gates: gofmt + `go build ./internal/...` OK;
+        catalog + executor(full) unit PASS; `TestPort_PgDumpConnectionSetup` PASS
+        (2.00s); pgbench pre-commit smoke on commit. **Next: slice 119** — a
+        descending sequence (`INCREMENT BY -1` → `MINVALUE`/`MAXVALUE -1` defaults,
+        the descending-direction branch of pg_dump's default-bound suppression), or
+        pivot to a multi-statement pg_dump object surface beyond single sequences.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

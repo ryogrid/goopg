@@ -577,6 +577,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.cyc_seq CYCLE"); err != nil {
 		t.Fatalf("create sequence cyc_seq: %v", err)
 	}
+	// Slice 118: a sequence with `OWNED BY table.column` is the last single-
+	// sequence pg_dump surface. PG records the link as a pg_depend AUTO ('a') row
+	// (classid/refclassid=pg_class, objid=seq oid, refobjid=table oid,
+	// refobjsubid=column attnum); pg_dump's getTables LEFT JOIN reads it into
+	// owning_tab/owning_col and dumpSequence emits a trailing
+	// `ALTER SEQUENCE public.owned_seq OWNED BY public.owner_tbl.id;`. goopg
+	// previously returned an empty pg_depend, so no OWNED BY ever dumped; the
+	// catalog now synthesizes the 'a' row from the executor's sequence registry
+	// (SeqParams.OwnedBy). The owning table must exist first (validateSeqOwnedBy).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.owner_tbl (id bigint, label text)"); err != nil {
+		t.Fatalf("create table owner_tbl: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.owned_seq OWNED BY owner_tbl.id"); err != nil {
+		t.Fatalf("create sequence owned_seq: %v", err)
+	}
 
 	// Slice 61: a RECURSIVE VIEW must survive the dump. PG stores a recursive
 	// view as a regular view over a WITH RECURSIVE CTE; pg_dump fetches the body
@@ -1349,6 +1364,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// sequences must NOT be cycling (no stray CYCLE on small_seq/int_seq).
 		if strings.Contains(res.Stdout, "    AS bigint\n") {
 			t.Errorf("pg_dump emitted a spurious `AS bigint` for a default sequence\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 118 (asserted):** a sequence with `OWNED BY table.column` must emit
+		// a trailing `ALTER SEQUENCE ... OWNED BY ...;`. pg_dump derives owning_tab/
+		// owning_col from the pg_depend AUTO ('a') row the catalog now synthesizes
+		// from SeqParams.OwnedBy; without it the join yields NULL and no OWNED BY is
+		// emitted. The owning table is dumped too (a plain CREATE TABLE). Regression
+		// guard for the pg_depend ownership-row synthesis.
+		ownedSeqDefs := []string{
+			"CREATE SEQUENCE public.owned_seq",
+			"ALTER SEQUENCE public.owned_seq OWNED BY public.owner_tbl.id;",
+			"CREATE TABLE public.owner_tbl (",
+		}
+		for _, sub := range ownedSeqDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped an OWNED BY sequence/owner; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
 		}
 		// **Slice 61 (asserted):** a RECURSIVE VIEW must round-trip. PG stores it
 		// as a regular view over a WITH RECURSIVE CTE and pg_dump re-emits a plain

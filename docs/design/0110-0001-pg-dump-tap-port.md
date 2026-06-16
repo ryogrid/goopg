@@ -2827,6 +2827,56 @@ The `TestPort_PgDumpConnectionSetup` fixture now creates `small_seq AS smallint`
 that pin pg_dump's exact clause order (`AS <type>` before `START WITH`, `CYCLE`
 last) plus the **absence** of a spurious `AS bigint` on any default sequence.
 
+### Slice 118 — sequence `OWNED BY table.column` (`pg_depend` AUTO row)
+
+Slice 118 closes the last single-sequence pg_dump surface: a sequence tied to a
+column via `OWNED BY`. This is the **first slice to require a non-empty
+`pg_depend`** — every prior catalog query treated it as the empty view.
+
+**How pg_dump finds ownership.** `getTables` LEFT JOINs `pg_depend`, gated on the
+relation being a sequence and the dependency being the column link:
+
+```sql
+LEFT JOIN pg_depend d ON
+  (c.relkind = 'S' AND d.classid = 'pg_class'::regclass AND d.objid = c.oid AND
+   d.objsubid = 0 AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a','i'))
+```
+
+It reads `d.refobjid AS owning_tab`, `d.refobjsubid AS owning_col`, and
+`(d.deptype = 'i') IS TRUE AS is_identity_sequence`. For a plain `OWNED BY`
+sequence the dependency is **AUTO (`'a'`)**, so `is_identity_sequence` is false and
+`dumpSequence` emits a trailing statement (PG self-qualifies the table reference):
+
+```sql
+ALTER SEQUENCE public.owned_seq OWNED BY public.owner_tbl.id;
+```
+
+`getOwnedSeqs` ORs the owning table's dump components into the sequence, so the
+`CREATE SEQUENCE` is still emitted; the AUTO row also feeds `getDependencies`,
+correctly ordering the sequence after its table (exactly what upstream PG records).
+
+**Production change.** goopg tracks the owner string (`seqState.ownedBy`,
+`"table.column"`) end-to-end via `ALTER/CREATE SEQUENCE ... OWNED BY`, but the
+catalog returned an empty `pg_depend`, so no `OWNED BY` ever dumped. Two changes
+close the gap:
+
+- `catalog.SeqParams` gains an `OwnedBy` field; `sequenceParamsForCatalog` fills it
+  from `seqState.ownedBy`.
+- `InMemory.dependVirtualRows` (wired to `pg_depend.VirtualRows`) iterates the
+  `IsSequence` relations, and for each with a non-empty `OwnedBy` resolves the
+  owning table OID + column attnum (1-based, `Ordinal+1`) from the catalog's own
+  table registry, emitting one row: `classid=refclassid=1259 (pg_class)`,
+  `objid=seq OID`, `objsubid=0`, `refobjid=table OID`, `refobjsubid=attnum`,
+  `deptype='a'`. Standalone sequences contribute no row, so the empty-view
+  behaviour (and the slice-116 "no spurious OWNED BY" guard) is preserved.
+
+The owner reference is resolved against the **sequence's own schema** when the
+`OWNED BY` clause is unqualified (PG requires the sequence and owning table to share
+a schema), and against an explicit `schema.table.column` otherwise. The
+`TestPort_PgDumpConnectionSetup` fixture creates `owner_tbl(id bigint, label text)`
++ `owned_seq OWNED BY owner_tbl.id` and asserts the `ALTER SEQUENCE ... OWNED BY`
+statement plus the owning table's `CREATE TABLE`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
