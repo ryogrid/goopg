@@ -6588,7 +6588,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		Fork:   storage.MainFork,
 	}
 	for _, col := range tbl.Columns {
-		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRow(tbl, col))
+		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRow(ctx.Catalog, tbl, col))
 		if err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
 		}

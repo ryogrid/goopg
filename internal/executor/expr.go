@@ -8731,6 +8731,17 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				}
 			}
 			name := formatTypeOID(typeOID, typmod)
+			if name == "???" && ctx != nil && ctx.Catalog != nil {
+				// A user-defined enum's pg_type OID is dynamically allocated,
+				// so formatTypeOID (built-ins only) returns the unknown
+				// sentinel. Resolve it to the enum's schema-qualified name.
+				// pg_dump runs with search_path='', under which format_type
+				// qualifies a non-visible type with its namespace; goopg enums
+				// live in public, hence the public. prefix. DU-002 slice 88.
+				if et, ok := ctx.Catalog.LookupEnumByOID(uint32(typeOID)); ok {
+					name = "public." + et.Name
+				}
+			}
 			return NewStringDatum(name), nil
 		}
 	case "pg_column_size":

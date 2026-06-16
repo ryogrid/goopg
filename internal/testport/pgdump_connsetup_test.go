@@ -629,6 +629,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table arr: %v", err)
 	}
 
+	// Slice 88: a user-defined ENUM type and a column that uses it must survive
+	// the dump. This is the first OBJECT type (CREATE TYPE) in the fixture —
+	// the simple scalar/array column types above are exhausted. pg_dump's
+	// getTypes collects the enum from pg_type (typtype='e'), dumpEnumType reads
+	// the ordered labels from pg_enum, and emits `CREATE TYPE public.mood AS
+	// ENUM (...)`. A column of the enum type renders via
+	// format_type(atttypid, atttypmod): goopg resolved the enum column to the
+	// text fallback (atttypid=25) because TypeNameToOID knows only built-ins, so
+	// it dumped as `feeling text` — a type-fidelity loss. buildUserPGAttributeRow
+	// now re-resolves a non-built-in column name through catalog.LookupEnum to
+	// the enum's dynamic pg_type OID, and format_type resolves that OID back to
+	// the schema-qualified name (LookupEnumByOID), so the column round-trips as
+	// `feeling public.mood` (pg_dump runs with search_path='', so format_type
+	// qualifies the non-visible enum). `moody` carries the enum column on its own
+	// table so the many `foo`/`arr` asserts are untouched.
+	if err := runSQLSimple(t, c, "CREATE TYPE public.mood AS ENUM ('sad', 'ok', 'happy')"); err != nil {
+		t.Fatalf("create type mood: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.moody (id integer PRIMARY KEY, feeling mood)"); err != nil {
+		t.Fatalf("create table moody: %v", err)
+	}
+
 	res, err := util.RunCommand(util.CommandSpec{
 		Name:    bin,
 		Args:    []string{"--no-sync", "postgres"},
@@ -1169,6 +1191,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped an array column type; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// **Slice 88 (asserted):** a user-defined ENUM type and a column using it
+		// must round-trip. pg_dump emits the CREATE TYPE … AS ENUM statement (one
+		// label per line) from pg_type + pg_enum, and the enum column renders as
+		// the schema-qualified enum name via format_type. Without the slice-88
+		// fix the column dumped as `feeling text` (TypeNameToOID's text fallback)
+		// and the type definition could still appear, silently changing the
+		// column's type on restore. Assert both the CREATE TYPE header with all
+		// three ordered labels and the enum-typed column in the CREATE TABLE.
+		enumDefs := []string{
+			"CREATE TYPE public.mood AS ENUM (",
+			"'sad'",
+			"'ok'",
+			"'happy'",
+			"CREATE TABLE public.moody (",
+			"feeling public.mood",
+		}
+		for _, sub := range enumDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/mangled the ENUM type round-trip; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// The enum column must NOT regress to the text fallback.
+		if strings.Contains(res.Stdout, "feeling text") {
+			t.Errorf("pg_dump rendered the enum column as text (slice-88 enum OID resolution regressed)\n  full stdout=%q", res.Stdout)
 		}
 		return
 	}

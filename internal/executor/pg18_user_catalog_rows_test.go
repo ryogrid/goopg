@@ -356,7 +356,7 @@ func TestBuildUserPGAttributeRowEncodesTypCollation(t *testing.T) {
 	const attcollationIdx = 19 // 0-indexed position in pgAttributeColumnsPG18()
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName}, Ordinal: 0}
-		row := buildUserPGAttributeRow(tbl, col)
+		row := buildUserPGAttributeRow(nil, tbl, col)
 		got := uint32(row[attcollationIdx].Int)
 		if got != tc.wantCollOID {
 			t.Errorf("%s: attcollation=%d want %d", tc.typeName, got, tc.wantCollOID)
@@ -513,7 +513,7 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, IsArray: true, Args: tc.args}, Ordinal: 0}
-		row := buildUserPGAttributeRow(tbl, col)
+		row := buildUserPGAttributeRow(nil, tbl, col)
 		if got := row[atttypidIdx].Int; got != tc.wantTypOID {
 			t.Errorf("%s[]: atttypid=%d want %d", tc.typeName, got, tc.wantTypOID)
 		}
@@ -528,7 +528,7 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 	// A non-array column of the same element type must be unaffected:
 	// attndims=0 and the scalar OID.
 	scalar := catalog.Column{Name: "c", Type: catalog.Type{Name: "text"}, Ordinal: 0}
-	row := buildUserPGAttributeRow(tbl, scalar)
+	row := buildUserPGAttributeRow(nil, tbl, scalar)
 	if row[attndimsIdx].Int != 0 || row[atttypidIdx].Int != int64(catalog.OIDText) {
 		t.Errorf("scalar text: atttypid=%d attndims=%d want %d/0", row[atttypidIdx].Int, row[attndimsIdx].Int, catalog.OIDText)
 	}
@@ -539,7 +539,7 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 	// must stay bpchar (1042) and render `character(1)`. Both share the catalog
 	// type name "char", so only the args distinguish them.
 	realChar := catalog.Column{Name: "c", Type: catalog.Type{Name: "char"}, Ordinal: 0}
-	row = buildUserPGAttributeRow(tbl, realChar)
+	row = buildUserPGAttributeRow(nil, tbl, realChar)
 	if got := row[atttypidIdx].Int; got != int64(catalog.OIDChar) {
 		t.Errorf("scalar \"char\": atttypid=%d want %d", got, catalog.OIDChar)
 	}
@@ -547,12 +547,67 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 		t.Errorf("scalar \"char\": format_type=%q want %q", got, "\"char\"")
 	}
 	bpchar1 := catalog.Column{Name: "c", Type: catalog.Type{Name: "char", Args: []int64{1}}, Ordinal: 0}
-	row = buildUserPGAttributeRow(tbl, bpchar1)
+	row = buildUserPGAttributeRow(nil, tbl, bpchar1)
 	if got := row[atttypidIdx].Int; got != int64(catalog.OIDBpChar) {
 		t.Errorf("scalar char(1): atttypid=%d want %d (bpchar)", got, catalog.OIDBpChar)
 	}
 	if got := formatTypeOID(row[atttypidIdx].Int, row[atttypmodIdx].Int); got != "character(1)" {
 		t.Errorf("scalar char(1): format_type=%q want %q", got, "character(1)")
+	}
+}
+
+// TestUserPGAttributeEnumColumn pins the enum-column resolution (DU-002 slice
+// 88). A column whose declared type is a user-defined enum must report
+// pg_attribute.atttypid = the enum's dynamic pg_type OID (not the text
+// fallback), and carry the enum's pg_type shape (4-byte, int-aligned, plain
+// storage). format_type(atttypid, -1) must then render the schema-qualified
+// enum name (pg_dump runs with search_path='') so the column dumps as
+// `feeling public.mood`, not `feeling text`.
+func TestUserPGAttributeEnumColumn(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		attndimsIdx   = 6
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	et, err := cat.RegisterEnum("mood", []string{"sad", "ok", "happy"})
+	if err != nil {
+		t.Fatalf("RegisterEnum: %v", err)
+	}
+	tbl := &catalog.Table{Schema: "public", Name: "moody", OID: 16500}
+	col := catalog.Column{Name: "feeling", Type: catalog.Type{Name: "mood"}, Ordinal: 1}
+	row := buildUserPGAttributeRow(cat, tbl, col)
+
+	if got := uint32(row[atttypidIdx].Int); got != et.OID {
+		t.Errorf("enum column: atttypid=%d want %d (enum OID)", got, et.OID)
+	}
+	if got := row[attlenIdx].Int; got != 4 {
+		t.Errorf("enum column: attlen=%d want 4", got)
+	}
+	if got := row[attndimsIdx].Int; got != 0 {
+		t.Errorf("enum column: attndims=%d want 0", got)
+	}
+	if got := row[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("enum column: attbyval=%v want false", got)
+	}
+	if got := row[attalignIdx].StringValue(); got != "i" {
+		t.Errorf("enum column: attalign=%q want \"i\"", got)
+	}
+	if got := row[attstorageIdx].StringValue(); got != "p" {
+		t.Errorf("enum column: attstorage=%q want \"p\"", got)
+	}
+
+	// LookupEnumByOID is the inverse used by format_type to render the column
+	// type. With the enum registered, the OID round-trips to its name; an
+	// unrelated built-in OID must NOT resolve to an enum (text stays text).
+	if got, ok := cat.LookupEnumByOID(et.OID); !ok || got.Name != "mood" {
+		t.Errorf("LookupEnumByOID(%d)=%v,%v want mood,true", et.OID, got, ok)
+	}
+	if _, ok := cat.LookupEnumByOID(uint32(catalog.OIDText)); ok {
+		t.Errorf("LookupEnumByOID(text OID) unexpectedly resolved to an enum")
 	}
 }
 
@@ -616,7 +671,7 @@ func TestUserPGAttributeTypmod(t *testing.T) {
 	}
 	for _, tc := range cases {
 		col := catalog.Column{Name: "c", Type: catalog.Type{Name: tc.typeName, Args: tc.args}, Ordinal: 0}
-		row := buildUserPGAttributeRow(tbl, col)
+		row := buildUserPGAttributeRow(nil, tbl, col)
 		gotTypmod := row[atttypmodIdx].Int
 		if gotTypmod != tc.wantTypmod {
 			t.Errorf("%s%v: atttypmod=%d want %d", tc.typeName, tc.args, gotTypmod, tc.wantTypmod)

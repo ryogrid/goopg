@@ -600,6 +600,13 @@ type Catalog interface {
 	// RenameTable renames a table/sequence/view by swapping its catalog key.
 	// Returns an error if old does not exist or new already exists. M0097-0024.
 	RenameTable(old, new parser.ObjectName) error
+	// LookupEnum finds a user-defined enum type by name (case-insensitive).
+	// Exposed on the interface so the catalog-row builders can resolve an enum
+	// column's type name to its pg_type OID. DU-002 slice 88.
+	LookupEnum(name string) (*EnumType, bool)
+	// LookupEnumByOID finds a user-defined enum type by its pg_type OID, used by
+	// format_type to render an enum column's declared type. DU-002 slice 88.
+	LookupEnumByOID(oid uint32) (*EnumType, bool)
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -5994,6 +6001,22 @@ func (c *InMemory) LookupEnum(name string) (*EnumType, bool) {
 	defer c.mu.RUnlock()
 	et, ok := c.enumTypes[k]
 	return et, ok
+}
+
+// LookupEnumByOID finds an enum type by its pg_type OID. DU-002 slice 88
+// (pg_dump enum round-trip): format_type resolves an enum column's
+// pg_attribute.atttypid back to the enum's schema-qualified name, and the
+// enum's OID is dynamically allocated at CREATE TYPE time, so a name-only
+// lookup is insufficient. Returns nil,false when no enum has the OID.
+func (c *InMemory) LookupEnumByOID(oid uint32) (*EnumType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, et := range c.enumTypes {
+		if et.OID == oid {
+			return et, true
+		}
+	}
+	return nil, false
 }
 
 // EnumLabelTooLong is returned by AddEnumValue when value exceeds 63 bytes.

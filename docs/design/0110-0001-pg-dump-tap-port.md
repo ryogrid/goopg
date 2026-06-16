@@ -1916,6 +1916,42 @@ fixed one logical group per loop:
     the deliberate `TypeNameToOID("char")==bpchar` asymmetry) in
     `catalog.TestTypeNameToOIDRoundTrip`.
 
+  - **Slice 88 — user-defined `ENUM` types and enum-typed columns
+    (`internal/catalog/catalog.go`, `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`).** The first **object** type in the fixture: the
+    simple scalar/array *column* types are exhausted (every `pg_type` base type
+    with a user-facing array peer is wired through slices 62–87). `CREATE TYPE …
+    AS ENUM` is already supported (the enum heap row goes to `pg_type` via
+    `syncEnumTypeToCatalogHeap`/`buildUserPGTypeRowForEnum` with `typtype='e'`,
+    and `pg_enum` is a virtual view populated from the in-memory `enumTypes`
+    registry), so pg_dump's `getTypes` + `dumpEnumType` already emit
+    `CREATE TYPE public.mood AS ENUM ('sad', 'ok', 'happy');`. The gap was the
+    enum **column**: an enum's `pg_type` OID is **dynamically allocated** at
+    `CREATE TYPE` time (user OID range), and `TypeNameToOID` knows only built-ins,
+    so an enum column folded to the `text` fallback (OID 25) — it dumped as
+    `feeling text`, a silent type change on restore. Two resolution sites close
+    it, both keyed on the dynamic OID so they cannot use a static `case`:
+    (1) `buildUserPGAttributeRow` now takes the `catalog.Catalog` and, when the
+    name resolves to the text fallback and is not an array, re-resolves it via
+    `LookupEnum` to the enum OID and stamps the enum `pg_type` shape (`attlen=4`,
+    `attbyval=f`, `attalign='i'`, `attstorage='p'`, no collation — mirroring
+    `buildUserPGTypeRowForEnum`); (2) the `format_type` evaluator, when
+    `formatTypeOID` returns the `"???"` unknown sentinel, resolves the OID back
+    through the new `LookupEnumByOID` and renders `public.<name>` (pg_dump runs
+    with `search_path=''`, under which `format_type` schema-qualifies a
+    non-visible type; goopg enums live in `public`). `LookupEnum` /
+    `LookupEnumByOID` are added to the `catalog.Catalog` interface (the
+    `SearchPathCatalog` wrapper forwards them via embedding; `InMemory` is the
+    sole concrete implementor). Scope is **scalar** enum columns: an enum array
+    column has no `_enum` array-type OID (none is allocated for user enums), so
+    the `!col.Type.IsArray` guard leaves it alone — out of scope, noted for a
+    later slice. Cross-restart enum persistence (no `loadUserEnumsFromHeap`) is
+    likewise out of scope: the dump test creates and dumps in one server session.
+    Guarded by `executor.TestUserPGAttributeEnumColumn` (enum column → enum OID +
+    enum `pg_type` shape, and the `LookupEnumByOID` inverse) and the
+    `CREATE TYPE public.mood`/`feeling public.mood` (plus no-`feeling text`)
+    assertions in `TestPort_PgDumpConnectionSetup` (real pg_dump round-trip).
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits

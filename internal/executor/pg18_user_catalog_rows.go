@@ -482,7 +482,7 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 
 // buildUserPGAttributeRow constructs a 25-column pg_attribute row for a
 // user-defined column (attstattarget appended last as NULL).
-func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
+func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalog.Column) Row {
 	typOID := catalog.TypeNameToOID(col.Type.Name)
 	// Disambiguate the single-byte "char" type (OID 18) from bpchar (1042):
 	// both arrive as catalog type name "char", but only the bpchar-equivalent
@@ -492,6 +492,21 @@ func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 	// column round-trips through pg_dump as "char". DU-002 slice 87.
 	if typOID == catalog.OIDBpChar && col.Type.Name == "char" && len(col.Type.Args) == 0 {
 		typOID = catalog.OIDChar
+	}
+	// A column whose declared type is a user-defined enum resolves to the text
+	// fallback above (TypeNameToOID knows only built-ins). Re-resolve it to the
+	// enum's dynamically-allocated pg_type OID so pg_attribute.atttypid points
+	// at the enum and pg_dump's format_type(atttypid, atttypmod) renders the
+	// column as the enum type rather than `text`. Only the text fallback is
+	// reconsidered, so built-in columns are untouched (no enum can shadow a
+	// built-in name). DU-002 slice 88 (scalar enum columns only; arrays of
+	// user enums have no _enum array OID and are out of scope).
+	enumOID := uint32(0)
+	if cat != nil && typOID == catalog.OIDText && !col.Type.IsArray {
+		if et, ok := cat.LookupEnum(col.Type.Name); ok {
+			typOID = et.OID
+			enumOID = et.OID
+		}
 	}
 	// atttypmod carries the ELEMENT typmod even for array columns; compute it
 	// from the base OID before remapping typOID to the array (_typename) OID.
@@ -504,6 +519,12 @@ func buildUserPGAttributeRow(tbl *catalog.Table, col catalog.Column) Row {
 		}
 	}
 	attrs := userTypeAttrsForOID(typOID)
+	if enumOID != 0 {
+		// Enum OIDs are dynamic, so userTypeAttrsForOID can't case on them.
+		// Mirror buildUserPGTypeRowForEnum's pg_type shape: a 4-byte,
+		// int-aligned, plain-storage, non-collatable value (like oid).
+		attrs = userTypeAttrs{TypLen: 4, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
+	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                     // attrelid
 		NewStringDatum(col.Name),                                        // attname (name)
