@@ -1952,6 +1952,44 @@ fixed one logical group per loop:
     `CREATE TYPE public.mood`/`feeling public.mood` (plus no-`feeling text`)
     assertions in `TestPort_PgDumpConnectionSetup` (real pg_dump round-trip).
 
+  - **Slice 89 — enum **array** columns (`feelings mood[]`) + two enabling fixes
+    (`internal/catalog/catalog.go`, `internal/executor/pg18_user_catalog_rows.go`,
+    `internal/executor/expr.go`, `internal/executor/operators_ddl.go`,
+    `internal/planner/planner.go`).** Slice 88 left enum **array** columns folding
+    to `text[]`. PostgreSQL auto-generates a `_name` array type alongside every
+    enum, so `RegisterEnum` now allocates **two** OIDs (the enum, then its array;
+    `EnumType.ArrayOID = OID+1`) and `syncEnumTypeToCatalogHeap` writes **both**
+    `pg_type` heap rows (`buildUserPGTypeRowForEnum` now stamps `typarray =
+    ArrayOID`; the new `buildUserPGTypeRowForEnumArray` writes the `_mood` row with
+    `typtype='b'`, `typcategory='A'`, `typelem = enumOID`, varlena/extended
+    shape). `buildUserPGAttributeRow` resolves a `mood[]` column to `ArrayOID`
+    (`attndims=1`, varlena array shape), and `format_type` renders it
+    `public.mood[]` via the new `LookupEnumByArrayOID`. `DROP TYPE` stamps both
+    rows. The array `pg_type` row is **required** because pg_dump's `getTableAttrs`
+    passes the *joined* `t.oid` (`LEFT JOIN pg_type t ON a.atttypid = t.oid`) to
+    `format_type` — a missing row joins to NULL and renders the column type blank.
+    Two pre-existing goopg gaps surfaced and are fixed here so the array type is
+    recognized as **auto-generated** (and not dumped as a bogus standalone
+    `CREATE TYPE public._mood`), which hinges on pg_dump's `getTypes` `isarray`
+    expression `typname[0] = '_' AND typelem != 0 AND (SELECT typarray FROM pg_type
+    te WHERE oid = pg_type.typelem) = oid`:
+    (a) **0-based `name` subscripting** — `array_subscript` treated every value as
+    a 1-based text-array literal, so `typname[0]` over a `name` returned NULL.
+    PostgreSQL indexes the fixed-length `name` pseudo-array 0-based by character;
+    `array_subscript` now returns the Nth rune when the operand is not a `{…}`
+    array literal.
+    (b) **correlated reference to an unaliased outer table** —
+    `bindingMatchesRelation` matched a binding by its *original table name* even
+    when it carried an alias, so the subquery's `pg_type.typelem` (meant for the
+    unaliased **outer** `pg_type`) wrongly bound to the inner `pg_type te`,
+    yielding NULL. PostgreSQL hides the original name once a FROM entry is aliased;
+    `bindingMatchesRelation` now matches an aliased binding **only** by its alias,
+    letting `pg_type.typelem` fall through to the outer scope as an
+    `OuterColumnRef`. Guarded by `executor.TestUserPGAttributeEnumArrayColumn`
+    (array column → `ArrayOID`, `attndims=1`, varlena shape; `LookupEnumByArrayOID`
+    inverse) and the `feelings public.mood[]` (plus no-`feelings text[]`,
+    no-`CREATE TYPE public._mood`) assertions in `TestPort_PgDumpConnectionSetup`.
+
 Regression guard: `TestPort_PgDumpConnectionSetup`
 (`internal/testport/pgdump_connsetup_test.go`) drives real pg_dump and asserts
 no `setup_connection()` error signature appears; as of slice 44 pg_dump exits

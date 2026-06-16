@@ -644,10 +644,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// `feeling public.mood` (pg_dump runs with search_path='', so format_type
 	// qualifies the non-visible enum). `moody` carries the enum column on its own
 	// table so the many `foo`/`arr` asserts are untouched.
+	//
+	// Slice 89 adds an enum ARRAY column (`feelings mood[]`). PostgreSQL
+	// auto-generates a `_mood` array type alongside every enum; goopg now
+	// allocates that second OID in RegisterEnum (EnumType.ArrayOID) so the array
+	// column resolves to a distinct OID instead of folding to `text[]`.
+	// format_type renders it as `public.mood[]` (LookupEnumByArrayOID).
 	if err := runSQLSimple(t, c, "CREATE TYPE public.mood AS ENUM ('sad', 'ok', 'happy')"); err != nil {
 		t.Fatalf("create type mood: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.moody (id integer PRIMARY KEY, feeling mood)"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE TABLE public.moody (id integer PRIMARY KEY, feeling mood, feelings mood[])"); err != nil {
 		t.Fatalf("create table moody: %v", err)
 	}
 
@@ -1207,15 +1213,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"'happy'",
 			"CREATE TABLE public.moody (",
 			"feeling public.mood",
+			// Slice 89: the enum ARRAY column renders via the enum's
+			// auto-generated array OID, not the text[] fallback.
+			"feelings public.mood[]",
 		}
 		for _, sub := range enumDefs {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped/mangled the ENUM type round-trip; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
-		// The enum column must NOT regress to the text fallback.
+		// The enum column must NOT regress to the text fallback (scalar slice 88
+		// or array slice 89).
 		if strings.Contains(res.Stdout, "feeling text") {
 			t.Errorf("pg_dump rendered the enum column as text (slice-88 enum OID resolution regressed)\n  full stdout=%q", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "feelings text[]") {
+			t.Errorf("pg_dump rendered the enum-array column as text[] (slice-89 array OID resolution regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// The auto-generated `_mood` array type must NOT dump as its own CREATE
+		// TYPE: pg_dump's getTypes isarray subquery recognizes it (base enum's
+		// typarray points back at it) and suppresses it. Slice 89.
+		if strings.Contains(res.Stdout, "CREATE TYPE public._mood") {
+			t.Errorf("pg_dump emitted the auto-generated enum array type as a separate CREATE TYPE (slice-89 isarray suppression regressed)\n  full stdout=%q", res.Stdout)
 		}
 		return
 	}

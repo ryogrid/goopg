@@ -607,6 +607,10 @@ type Catalog interface {
 	// LookupEnumByOID finds a user-defined enum type by its pg_type OID, used by
 	// format_type to render an enum column's declared type. DU-002 slice 88.
 	LookupEnumByOID(oid uint32) (*EnumType, bool)
+	// LookupEnumByArrayOID finds a user-defined enum type by the pg_type OID of
+	// its auto-generated array type (`_name`), used by format_type to render an
+	// enum-array column (`mood[]`). DU-002 slice 89.
+	LookupEnumByArrayOID(oid uint32) (*EnumType, bool)
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -796,9 +800,15 @@ type EnumValue struct {
 
 // EnumType holds one user-defined enum type. M0097-0017.
 type EnumType struct {
-	Name   string
-	OID    uint32
-	Values []EnumValue // ordered by SortOrder; each element stores its own sortorder
+	Name string
+	OID  uint32
+	// ArrayOID is the pg_type OID of the auto-generated array type (`_name`)
+	// that PostgreSQL creates alongside every enum. It is allocated from the
+	// same running counter as OID (OID, then ArrayOID) so a `mood[]` column
+	// can resolve to a distinct, stable OID and round-trip through pg_dump as
+	// `public.mood[]` rather than `text[]`. DU-002 slice 89.
+	ArrayOID uint32
+	Values   []EnumValue // ordered by SortOrder; each element stores its own sortorder
 }
 
 // Domain holds one user-defined domain type. M0097-0017.
@@ -5984,12 +5994,17 @@ func (c *InMemory) RegisterEnum(name string, values []string) (*EnumType, error)
 	for i, v := range values {
 		evs[i] = EnumValue{Label: v, SortOrder: float64(i + 1)}
 	}
+	// PostgreSQL allocates two OIDs per enum: the enum type itself, then its
+	// auto-generated array type (`_name`). Mirror that ordering so the base OID
+	// keeps its historic value and the array column has a distinct OID. DU-002
+	// slice 89.
 	et := &EnumType{
-		Name:   k,
-		OID:    c.nextOID,
-		Values: evs,
+		Name:     k,
+		OID:      c.nextOID,
+		ArrayOID: c.nextOID + 1,
+		Values:   evs,
 	}
-	c.nextOID++
+	c.nextOID += 2
 	c.enumTypes[k] = et
 	return et, nil
 }
@@ -6013,6 +6028,21 @@ func (c *InMemory) LookupEnumByOID(oid uint32) (*EnumType, bool) {
 	defer c.mu.RUnlock()
 	for _, et := range c.enumTypes {
 		if et.OID == oid {
+			return et, true
+		}
+	}
+	return nil, false
+}
+
+// LookupEnumByArrayOID finds a user-defined enum type by the pg_type OID of its
+// auto-generated array type (`_name`). Used by format_type to render an
+// enum-array column (`mood[]`) as the schema-qualified array name. DU-002
+// slice 89.
+func (c *InMemory) LookupEnumByArrayOID(oid uint32) (*EnumType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, et := range c.enumTypes {
+		if et.ArrayOID == oid {
 			return et, true
 		}
 	}

@@ -6479,6 +6479,13 @@ func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForEnum(et)); err != nil {
 		return
 	}
+	// Also write the auto-generated array type (`_name`) so a `mood[]` column's
+	// atttypid joins to a real pg_type row — pg_dump's getTableAttrs passes the
+	// joined t.oid to format_type, and a missing row renders the column type
+	// blank. DU-002 slice 89.
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForEnumArray(et)); err != nil {
+		return
+	}
 	// Mirror pg_type to the postgres database (DBOid=5) so sessions using
 	// the postgres db can find the new type row via SeqScan. This mirrors
 	// the pattern used by syncTableToCatalogHeap. M0097-0022.
@@ -8600,6 +8607,8 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		if et, ok := cat.LookupEnum(n); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.OID, o.ctx.Tx.XID)
+				// Also stamp the auto-generated array type row (`_name`). DU-002 slice 89.
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.ArrayOID, o.ctx.Tx.XID)
 				// Mirror pg_type to postgres db so the xmax stamp is visible via SeqScan.
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			}

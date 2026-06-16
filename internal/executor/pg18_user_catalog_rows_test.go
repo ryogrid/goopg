@@ -561,7 +561,7 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 // pg_attribute.atttypid = the enum's dynamic pg_type OID (not the text
 // fallback), and carry the enum's pg_type shape (4-byte, int-aligned, plain
 // storage). format_type(atttypid, -1) must then render the schema-qualified
-// enum name (pg_dump runs with search_path='') so the column dumps as
+// enum name (pg_dump runs with search_path=”) so the column dumps as
 // `feeling public.mood`, not `feeling text`.
 func TestUserPGAttributeEnumColumn(t *testing.T) {
 	const (
@@ -608,6 +608,63 @@ func TestUserPGAttributeEnumColumn(t *testing.T) {
 	}
 	if _, ok := cat.LookupEnumByOID(uint32(catalog.OIDText)); ok {
 		t.Errorf("LookupEnumByOID(text OID) unexpectedly resolved to an enum")
+	}
+}
+
+// TestUserPGAttributeEnumArrayColumn pins the enum-ARRAY resolution (DU-002
+// slice 89). A `mood[]` column must report pg_attribute.atttypid = the enum's
+// auto-generated array OID (et.ArrayOID = et.OID+1), attndims=1, and carry a
+// varlena-array pg_type shape (-1 length, int-aligned, extended storage).
+// format_type then renders it as `public.mood[]` via LookupEnumByArrayOID, so
+// the column dumps as `feelings public.mood[]`, not `feelings text[]`.
+func TestUserPGAttributeEnumArrayColumn(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		attndimsIdx   = 6
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	et, err := cat.RegisterEnum("mood", []string{"sad", "ok", "happy"})
+	if err != nil {
+		t.Fatalf("RegisterEnum: %v", err)
+	}
+	if et.ArrayOID != et.OID+1 {
+		t.Fatalf("enum ArrayOID=%d want OID+1=%d", et.ArrayOID, et.OID+1)
+	}
+	tbl := &catalog.Table{Schema: "public", Name: "moody", OID: 16500}
+	col := catalog.Column{Name: "feelings", Type: catalog.Type{Name: "mood", IsArray: true}, Ordinal: 2}
+	row := buildUserPGAttributeRow(cat, tbl, col)
+
+	if got := uint32(row[atttypidIdx].Int); got != et.ArrayOID {
+		t.Errorf("enum array column: atttypid=%d want %d (enum array OID)", got, et.ArrayOID)
+	}
+	if got := row[attndimsIdx].Int; got != 1 {
+		t.Errorf("enum array column: attndims=%d want 1", got)
+	}
+	if got := row[attlenIdx].Int; got != -1 {
+		t.Errorf("enum array column: attlen=%d want -1 (varlena)", got)
+	}
+	if got := row[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("enum array column: attbyval=%v want false", got)
+	}
+	if got := row[attalignIdx].StringValue(); got != "i" {
+		t.Errorf("enum array column: attalign=%q want \"i\"", got)
+	}
+	if got := row[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("enum array column: attstorage=%q want \"x\" (extended)", got)
+	}
+
+	// LookupEnumByArrayOID is the inverse used by format_type. The array OID
+	// resolves to the enum; the SCALAR OID must NOT resolve via the array path
+	// (it is reached through LookupEnumByOID instead).
+	if got, ok := cat.LookupEnumByArrayOID(et.ArrayOID); !ok || got.Name != "mood" {
+		t.Errorf("LookupEnumByArrayOID(%d)=%v,%v want mood,true", et.ArrayOID, got, ok)
+	}
+	if _, ok := cat.LookupEnumByArrayOID(et.OID); ok {
+		t.Errorf("LookupEnumByArrayOID(scalar enum OID) unexpectedly resolved")
 	}
 }
 

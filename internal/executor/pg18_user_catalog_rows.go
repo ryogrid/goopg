@@ -499,13 +499,18 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	// at the enum and pg_dump's format_type(atttypid, atttypmod) renders the
 	// column as the enum type rather than `text`. Only the text fallback is
 	// reconsidered, so built-in columns are untouched (no enum can shadow a
-	// built-in name). DU-002 slice 88 (scalar enum columns only; arrays of
-	// user enums have no _enum array OID and are out of scope).
+	// built-in name). DU-002 slice 88 (scalar), slice 89 (array): a `mood[]`
+	// column resolves to the enum's auto-generated array OID (et.ArrayOID).
 	enumOID := uint32(0)
-	if cat != nil && typOID == catalog.OIDText && !col.Type.IsArray {
+	enumArrayOID := uint32(0)
+	if cat != nil && typOID == catalog.OIDText {
 		if et, ok := cat.LookupEnum(col.Type.Name); ok {
-			typOID = et.OID
-			enumOID = et.OID
+			if col.Type.IsArray {
+				enumArrayOID = et.ArrayOID
+			} else {
+				typOID = et.OID
+				enumOID = et.OID
+			}
 		}
 	}
 	// atttypmod carries the ELEMENT typmod even for array columns; compute it
@@ -513,17 +518,29 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	typmod := pgAttTypmod(typOID, col.Type.Args)
 	attndims := int64(0)
 	if col.Type.IsArray {
-		if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
-			typOID = aoid
+		switch {
+		case enumArrayOID != 0:
+			// Enum array OIDs are dynamic, so ArrayOIDForBase can't case on them.
+			typOID = enumArrayOID
 			attndims = 1
+		default:
+			if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
+				typOID = aoid
+				attndims = 1
+			}
 		}
 	}
 	attrs := userTypeAttrsForOID(typOID)
-	if enumOID != 0 {
+	switch {
+	case enumOID != 0:
 		// Enum OIDs are dynamic, so userTypeAttrsForOID can't case on them.
 		// Mirror buildUserPGTypeRowForEnum's pg_type shape: a 4-byte,
 		// int-aligned, plain-storage, non-collatable value (like oid).
 		attrs = userTypeAttrs{TypLen: 4, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
+	case enumArrayOID != 0:
+		// An enum's array type is a standard varlena array: -1 length,
+		// int-aligned (matching the 4-byte enum element), extended storage.
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                     // attrelid
@@ -954,7 +971,7 @@ func buildUserPGTypeRowForEnum(et *catalog.EnumType) Row {
 		NewIntDatum(0),                                 // typrelid
 		NewIntDatum(0),                                 // typsubscript
 		NewIntDatum(0),                                 // typelem
-		NewIntDatum(0),                                 // typarray
+		NewIntDatum(int64(et.ArrayOID)),                // typarray (auto-generated `_name` array type; DU-002 slice 89)
 		NewIntDatum(0),                                 // typinput
 		NewIntDatum(0),                                 // typoutput
 		NewIntDatum(0),                                 // typreceive
@@ -964,6 +981,53 @@ func buildUserPGTypeRowForEnum(et *catalog.EnumType) Row {
 		NewIntDatum(0),                                 // typanalyze
 		NewStringDatum("i"),                            // typalign = 'i' (int-aligned, 4-byte)
 		NewStringDatum("p"),                            // typstorage = 'p' (plain)
+		NewBoolDatum(false),                            // typnotnull
+		NewIntDatum(0),                                 // typbasetype
+		NewIntDatum(-1),                                // typtypmod
+		NewIntDatum(0),                                 // typndims
+		NewIntDatum(0),                                 // typcollation
+		NullDatum,                                      // typdefaultbin (NULL)
+		NullDatum,                                      // typdefault (NULL)
+		NullDatum,                                      // typacl (NULL)
+	}
+}
+
+// buildUserPGTypeRowForEnumArray builds the pg_type row for an enum's
+// auto-generated array type (`_name`, OID et.ArrayOID). PostgreSQL creates this
+// alongside every enum; pg_dump's getTableAttrs LEFT JOINs pg_attribute to
+// pg_type on atttypid = t.oid and passes the joined t.oid to format_type, so a
+// `mood[]` column whose array type has no pg_type row joins to NULL and renders
+// as a blank type. The row's typarray=0 / typelem=enumOID, combined with the
+// base enum row's typarray=ArrayOID, makes pg_dump's getTypes isarray
+// subquery (`(SELECT typarray FROM pg_type WHERE oid = typelem) = oid`)
+// evaluate true so the array type is recognized as auto-generated and NOT
+// emitted as a separate CREATE TYPE. DU-002 slice 89.
+func buildUserPGTypeRowForEnumArray(et *catalog.EnumType) Row {
+	return Row{
+		NewIntDatum(int64(et.ArrayOID)),                // oid
+		NewStringDatum("_" + et.Name),                  // typname (array type name)
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
+		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(-1),                                // typlen (varlena array)
+		NewBoolDatum(false),                            // typbyval
+		NewStringDatum("b"),                            // typtype = 'b' (base)
+		NewStringDatum("A"),                            // typcategory = TYPCATEGORY_ARRAY
+		NewBoolDatum(false),                            // typispreferred
+		NewBoolDatum(true),                             // typisdefined
+		NewStringDatum(","),                            // typdelim
+		NewIntDatum(0),                                 // typrelid
+		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(int64(et.OID)),                     // typelem = the enum element type
+		NewIntDatum(0),                                 // typarray
+		NewIntDatum(0),                                 // typinput
+		NewIntDatum(0),                                 // typoutput
+		NewIntDatum(0),                                 // typreceive
+		NewIntDatum(0),                                 // typsend
+		NewIntDatum(0),                                 // typmodin
+		NewIntDatum(0),                                 // typmodout
+		NewIntDatum(0),                                 // typanalyze
+		NewStringDatum("i"),                            // typalign = 'i' (matches 4-byte enum element)
+		NewStringDatum("x"),                            // typstorage = 'x' (extended)
 		NewBoolDatum(false),                            // typnotnull
 		NewIntDatum(0),                                 // typbasetype
 		NewIntDatum(-1),                                // typtypmod

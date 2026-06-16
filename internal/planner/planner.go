@@ -9536,13 +9536,18 @@ func bindingMatchesRelation(b rangeBinding, table, schema string) bool {
 	if table == "" {
 		return schema != ""
 	}
-	if strings.EqualFold(table, b.table.Name) {
-		return true
+	// A relation with an explicit alias is referenceable ONLY by that alias —
+	// PostgreSQL hides the original table name once a FROM entry is aliased
+	// (`SELECT t.x FROM tbl t` is fine, `SELECT tbl.x FROM tbl t` is a 42712
+	// error). Matching the original name of an aliased binding is what made a
+	// correlated reference to an unaliased OUTER table (e.g. pg_dump's
+	// `… WHERE oid = pg_type.typelem` over `FROM pg_type`) wrongly bind to an
+	// inner same-named relation aliased as `te`, breaking the correlation.
+	// DU-002 slice 89.
+	if b.alias != "" {
+		return strings.EqualFold(table, b.alias)
 	}
-	if b.alias != "" && strings.EqualFold(table, b.alias) {
-		return true
-	}
-	return false
+	return strings.EqualFold(table, b.table.Name)
 }
 
 // tryPromoteIndexOnlyScan examines a freshly-built Project node and promotes

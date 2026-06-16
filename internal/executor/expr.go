@@ -6019,7 +6019,22 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, nil
 			}
 			n := idxDatum.Int
-			elems := parseTextArray(arr.StringValue())
+			sv := arr.StringValue()
+			if len(sv) < 2 || sv[0] != '{' {
+				// Not an array literal: a fixed-length pseudo-array type — most
+				// importantly `name` — is being subscripted. PostgreSQL indexes
+				// these 0-based and returns the Nth character (as "char").
+				// pg_dump's getTypes detects an auto-generated array type with
+				// `typname[0] = '_'`; without 0-based name subscripting that
+				// test is NULL and the array type wrongly dumps as a base type.
+				// DU-002 slice 89.
+				runes := []rune(sv)
+				if n < 0 || int(n) >= len(runes) {
+					return NullDatum, nil
+				}
+				return NewStringDatum(string(runes[n])), nil
+			}
+			elems := parseTextArray(sv)
 			if n < 1 || int(n) > len(elems) {
 				return NullDatum, nil
 			}
@@ -8740,6 +8755,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				// live in public, hence the public. prefix. DU-002 slice 88.
 				if et, ok := ctx.Catalog.LookupEnumByOID(uint32(typeOID)); ok {
 					name = "public." + et.Name
+				} else if et, ok := ctx.Catalog.LookupEnumByArrayOID(uint32(typeOID)); ok {
+					// A `mood[]` column carries the enum's auto-generated array
+					// OID; render it as the schema-qualified array name so the
+					// dump round-trips as `public.mood[]`, not `text[]`. DU-002
+					// slice 89.
+					name = "public." + et.Name + "[]"
 				}
 			}
 			return NewStringDatum(name), nil
