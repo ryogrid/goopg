@@ -5342,15 +5342,20 @@ func (p *parser) tryParseCheckInValues() []string {
 		p.idx = start
 		return nil
 	}
-	// Parse the membership list. Accept string literals (text/varchar/bpchar
-	// domains) as well as integer and numeric literals (integer/numeric
-	// domains). The raw token value is stored verbatim; whether to quote it on
-	// deparse is decided later from the domain's base type. DU-002 slice 99.
+	// Parse the membership list. Accept string literals (text/varchar/bpchar/date
+	// domains), integer and numeric literals (integer/numeric/bigint domains), and
+	// the boolean keyword literals true/false (boolean domains). The raw token
+	// value is stored verbatim; whether to quote/cast it on deparse is decided
+	// later from the domain's base type. DU-002 slices 99, 100.
 	var vals []string
 	for {
-		switch p.cur().Kind {
-		case TokenStringLit, TokenIntLit, TokenNumericLit:
+		switch {
+		case p.cur().Kind == TokenStringLit, p.cur().Kind == TokenIntLit, p.cur().Kind == TokenNumericLit:
 			vals = append(vals, p.cur().Value)
+		case p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwTrue || p.cur().Keyword == KwFalse):
+			// Boolean domain: CHECK (VALUE IN (true, false)). Store the canonical
+			// lowercase literal; deparse renders it verbatim (no quotes/cast).
+			vals = append(vals, string(p.cur().Keyword))
 		default:
 			p.idx = start
 			return nil

@@ -2268,11 +2268,25 @@ pg_dump 18.3, `/tmp/pgcheck_du99`):
 | `numeric(10,2)` | `VALUE = ANY (ARRAY[1.5, 2.5])` |
 
 Integer/numeric literals already share the base type, so PG emits each element
-verbatim — no quotes and no per-element cast. `bigint` differs: its `int4`
-literals require coercion, so PG wraps each element `(N)::bigint`
-(`VALUE = ANY (ARRAY[(100)::bigint, (200)::bigint])`). That envelope, and any
-other non-string/non-numeric base type, still returns `""` and stays
-runtime-only — a future slice would add the per-type cast shape.
+verbatim — no quotes and no per-element cast.
+
+Slice 100 extends the deparse to three more base types. The parser additionally
+accepts the boolean keyword literals `true`/`false` in the IN-list (stored as
+their canonical lowercase form); date/string literals were already accepted.
+Verified against real pg_dump 18.3 (`/tmp/pgcheck_du100`):
+
+| base type | deparse |
+|---|---|
+| `bigint` | `VALUE = ANY (ARRAY[(100)::bigint, (200)::bigint, (300)::bigint])` |
+| `boolean` | `VALUE = ANY (ARRAY[true, false])` |
+| `date` | `VALUE = ANY (ARRAY['2020-01-01'::date, '2021-06-15'::date])` |
+
+`bigint` differs from `integer`: the IN-list literals parse as `int4` constants
+and PG coerces each per element, so every element is wrapped `(N)::bigint`.
+`boolean` is the verbatim shape (the keyword literals already have type `bool`).
+`date` mirrors the string-with-cast shape — a quoted literal plus a bare `::date`
+element cast, exactly like `text`/`bpchar` with a different cast type. Other
+non-listed base types still return `""` and stay runtime-only.
 
 ## Deferred (002–010) — catalog surface estimate
 

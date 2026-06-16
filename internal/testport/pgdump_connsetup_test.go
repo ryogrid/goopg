@@ -808,7 +808,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.n_in AS numeric(10,2) CHECK (VALUE IN (1.5, 2.5))"); err != nil {
 		t.Fatalf("create domain n_in: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in)"); err != nil {
+	// DU-002 slice 100: bigint coerces its int4 IN-list literals per element
+	// (`(N)::bigint`); boolean keyword literals render verbatim; date mirrors the
+	// string-with-cast shape (`'…'::date`). Verified byte-identical to real
+	// pg_dump 18.3 (/tmp/pgcheck_du100).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.b_in AS bigint CHECK (VALUE IN (100, 200, 300))"); err != nil {
+		t.Fatalf("create domain b_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.bo_in AS boolean CHECK (VALUE IN (true, false))"); err != nil {
+		t.Fatalf("create domain bo_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.d_in AS date CHECK (VALUE IN ('2020-01-01', '2021-06-15'))"); err != nil {
+		t.Fatalf("create domain d_in: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -1464,6 +1477,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.n_in AS numeric(10,2)",
 			"CONSTRAINT n_in_check CHECK ((VALUE = ANY (ARRAY[1.5, 2.5])))",
 			"ni2 public.n_in",
+			// Slice 100: bigint coerces each int4 literal `(N)::bigint`; boolean
+			// keyword literals render verbatim; date is string-with-`::date`-cast.
+			"CREATE DOMAIN public.b_in AS bigint",
+			"CONSTRAINT b_in_check CHECK ((VALUE = ANY (ARRAY[(100)::bigint, (200)::bigint, (300)::bigint])))",
+			"bi public.b_in",
+			"CREATE DOMAIN public.bo_in AS boolean",
+			"CONSTRAINT bo_in_check CHECK ((VALUE = ANY (ARRAY[true, false])))",
+			"boi public.bo_in",
+			"CREATE DOMAIN public.d_in AS date",
+			"CONSTRAINT d_in_check CHECK ((VALUE = ANY (ARRAY['2020-01-01'::date, '2021-06-15'::date])))",
+			"di public.d_in",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {

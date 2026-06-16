@@ -1814,6 +1814,21 @@ object support.
         unit PASS; `TestPort_PgDumpConnectionSetup` PASS (1.91s); pgbench pre-commit
         smoke on commit. **Next blocker:** `bigint` IN-values need the `(N)::bigint`
         per-element wrap; or move to a new object type (composite / range).
+      - **PROGRESS 2026-06-17 (loop #62):** **DU-002 slice 100 LANDED** — the IN-values
+        deparse now covers three more base types: `bigint`, `boolean`, `date`. Parser
+        (`tryParseCheckInValues`) additionally accepts the boolean keyword literals
+        `true`/`false` (stored canonical-lowercase); date/string literals were already
+        accepted. `domainInValuesCheckExpr` gains: `OIDInt8` → per-element coercion
+        `VALUE = ANY (ARRAY[(100)::bigint, (200)::bigint])` (the IN-list int4 literals
+        are wrapped, mirroring PG); `OIDBool` joins the verbatim branch
+        `VALUE = ANY (ARRAY[true, false])`; `OIDDate` joins the string-with-cast branch
+        (`'2020-01-01'::date`). All verified byte-identical to real pg_dump 18.3
+        (`/tmp/pgcheck_du100`). Fixtures `b_in`, `bo_in`, `d_in` + columns `bi`/`boi`/`di`
+        added to `public.dom`. Gates: build+vet OK; parser/catalog/executor unit PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (1.94s); pgbench pre-commit smoke on commit.
+        **Next blocker:** remaining base types (timestamp/uuid/float) follow the same
+        two shapes (verbatim vs string-with-cast); or move to a new object type
+        (composite CREATE TYPE AS / range).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

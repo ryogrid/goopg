@@ -8694,6 +8694,9 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 //	varchar    (VALUE)::text = ANY ((ARRAY['a'::character varying, ...])::text[])
 //	integer    VALUE = ANY (ARRAY[1, 2, 3])
 //	numeric    VALUE = ANY (ARRAY[1.5, 2.5])
+//	bigint     VALUE = ANY (ARRAY[(100)::bigint, (200)::bigint])
+//	boolean    VALUE = ANY (ARRAY[true, false])
+//	date       VALUE = ANY (ARRAY['2020-01-01'::date, '2021-06-15'::date])
 //
 // text and bpchar have native equality operators, so PG emits a bare per-element
 // cast with no coercion wrapper. character varying has no varchar-eq operator and
@@ -8703,10 +8706,13 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 //
 // integer and numeric domains store integer/numeric literals whose own type
 // already matches the base type, so PG emits the literal verbatim — no quotes
-// and no per-element cast (verified against real pg_dump 18.3). bigint differs
-// (its int4 literals are wrapped `(N)::bigint`) and is left runtime-only for now.
-// Other non-string base types also return "". DU-002 slices 97 (text),
-// 98 (char/varchar), 99 (integer/numeric).
+// and no per-element cast (verified against real pg_dump 18.3). boolean is the
+// same verbatim shape (the IN-list keyword literals already have type bool).
+// bigint differs: the IN-list literals parse as int4 constants and PG coerces
+// each to bigint, so every element is wrapped `(N)::bigint`. date mirrors the
+// string-with-cast shape (`'…'::date`). Other non-string base types return "".
+// DU-002 slices 97 (text), 98 (char/varchar), 99 (integer/numeric),
+// 100 (bigint/boolean/date).
 func domainInValuesCheckExpr(baseType string, vals []string) string {
 	if len(vals) == 0 {
 		return ""
@@ -8718,12 +8724,23 @@ func domainInValuesCheckExpr(baseType string, vals []string) string {
 		castType = "text"
 	case catalog.OIDBpChar:
 		castType = "bpchar"
+	case catalog.OIDDate:
+		castType = "date"
 	case catalog.OIDVarChar:
 		castType = "character varying"
 		coerceToText = true
-	case catalog.OIDInt4, catalog.OIDNumeric:
-		// Numeric-family literals are rendered verbatim (no quotes, no cast).
+	case catalog.OIDInt4, catalog.OIDNumeric, catalog.OIDBool:
+		// integer/numeric literals and boolean keyword literals already carry the
+		// base type, so PG renders them verbatim (no quotes, no cast).
 		arr := "ARRAY[" + strings.Join(vals, ", ") + "]"
+		return "VALUE = ANY (" + arr + ")"
+	case catalog.OIDInt8:
+		// bigint: the IN-list int4 literals are coerced per element to bigint.
+		parts := make([]string, len(vals))
+		for i, v := range vals {
+			parts[i] = "(" + v + ")::bigint"
+		}
+		arr := "ARRAY[" + strings.Join(parts, ", ") + "]"
 		return "VALUE = ANY (" + arr + ")"
 	default:
 		return ""
