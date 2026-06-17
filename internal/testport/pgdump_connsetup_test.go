@@ -444,6 +444,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table uniqm: %v", err)
 	}
 
+	// Slice 131: a table-level UNIQUE constraint with an INCLUDE (covering) column
+	// must round-trip BOTH the auto-generated name and the `INCLUDE (...)` clause.
+	// PG folds the covering columns into the index, so `allIndexParams` (key +
+	// INCLUDE, indexcmds.c list_concat_copy) feeds ChooseIndexColumnNames →
+	// ChooseIndexNameAddition: the auto name therefore carries the INCLUDE columns
+	// too (`UNIQUE (a) INCLUDE (b)` → `uniqi_a_b_key`, NOT `uniqi_a_key`), verified
+	// empirically vs real pg_dump 18.3 (reference /tmp/du131_pgdata). pg_dump emits
+	// the constraint from pg_get_constraintdef, which appends ` INCLUDE (cols)` for
+	// a covering UNIQUE. goopg already: (a) names the index via
+	// autoIndexNameWithIncludes(keyCols+inclCols) and (b) renders the INCLUDE in
+	// buildConstraintDefString (internal/executor/expr.go), and stores the covering
+	// list on catalog.Index.IncludeColumns (operators_ddl.go) — but NO pg_dump
+	// round-trip previously exercised a constraint-backed UNIQUE with an INCLUDE
+	// column (the only INCLUDE coverage was an EXCLUDE-constraint unit test), so
+	// this slice locks the name-join + clause render. `uniqi` carries it on its own
+	// table so foo's many asserts are untouched.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.uniqi (a integer, b integer, c text, UNIQUE (a) INCLUDE (b))"); err != nil {
+		t.Fatalf("create table uniqi: %v", err)
+	}
+
 	// Slice 127: anonymous table-level CHECK constraints (written without an
 	// explicit CONSTRAINT name) must round-trip. PG's AddRelationNewConstraints
 	// auto-names each one at DDL time — "<table>_<col>_check" when the predicate
@@ -1426,6 +1446,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// Both the auto-generated name and the column list must follow the
 			// INDEX-key order, not the table order: `uniqm_b_a_key UNIQUE (b, a)`.
 			"ADD CONSTRAINT uniqm_b_a_key UNIQUE (b, a)",
+			// **Slice 131:** a UNIQUE constraint with an INCLUDE (covering) column.
+			// PG folds the covering column into the auto-generated name (key + INCLUDE
+			// → `uniqi_a_b_key`) and pg_get_constraintdef appends ` INCLUDE (b)`.
+			"ADD CONSTRAINT uniqi_a_b_key UNIQUE (a) INCLUDE (b)",
 			// **Slice 127:** anonymous table-level CHECK constraints round-trip
 			// inline with PG's auto-generated names. The multi-column predicate
 			// (`a < b`) gets the table-only name `chk_check`; the single-column
@@ -1456,6 +1480,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		} {
 			if strings.Contains(res.Stdout, neg) {
 				t.Errorf("pg_dump reordered a multi-column UNIQUE key into table order: %q\n  full stdout=%q", neg, res.Stdout)
+			}
+		}
+		// Slice 131 negative guards: a dropped INCLUDE clause would render the bare
+		// `uniqi_a_key UNIQUE (a)` (covering column lost → restored index no longer
+		// index-only-scannable); folding the covering column into the KEY would
+		// render `UNIQUE (a, b)` (a different uniqueness semantic).
+		for _, neg := range []string{
+			"ADD CONSTRAINT uniqi_a_key UNIQUE (a)",
+			"uniqi_a_b_key UNIQUE (a, b)",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump mangled a UNIQUE...INCLUDE constraint: %q\n  full stdout=%q", neg, res.Stdout)
 			}
 		}
 		// Slice 127 negative guards: the single-vs-multi-column naming must not

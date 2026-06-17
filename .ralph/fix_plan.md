@@ -2602,6 +2602,35 @@ object support.
         pre-commit smoke on commit. **Next: slice 130** — a table+VIEW
         dependency-ordering case (verify topological emission ORDER), OR a UNIQUE
         constraint with an INCLUDE column.
+      - **PROGRESS 2026-06-17 (loop #96):** **DU-002 slice 131 LANDED** — a
+        table-level UNIQUE constraint with an INCLUDE (covering) column
+        (`UNIQUE (a) INCLUDE (b)`) now has pg_dump round-trip coverage. **No
+        production change needed** (regression guard): empirically confirmed vs
+        real pg_dump 18.3 (reference `/tmp/du131_pgdata`) that PG folds the
+        covering column into the auto-generated constraint name — `allIndexParams
+        = list_concat_copy(indexParams, indexIncludingParams)` (indexcmds.c) feeds
+        `ChooseIndexColumnNames → ChooseIndexNameAddition`, so `UNIQUE (a)
+        INCLUDE (b)` is named `uniqi_a_b_key` (NOT `uniqi_a_key`), and
+        `pg_get_constraintdef` appends ` INCLUDE (b)`. goopg already matched BOTH
+        facets: `autoIndexNameWithIncludes(tbl, keyCols, inclCols, "key")`
+        (`internal/executor/operators_ddl.go`) joins key+include for the name, the
+        table-level UNIQUE path stores the covering list on
+        `catalog.Index.IncludeColumns`, and `buildConstraintDefString`
+        (`internal/executor/expr.go`) renders the ` INCLUDE (...)` clause — but NO
+        pg_dump round-trip previously exercised a constraint-backed UNIQUE+INCLUDE
+        (only an EXCLUDE-constraint unit test touched INCLUDE). This slice locks
+        the name-join + clause render: positive assert `ADD CONSTRAINT
+        uniqi_a_b_key UNIQUE (a) INCLUDE (b)` + 2 negative guards (dropped INCLUDE
+        → `uniqi_a_key UNIQUE (a)`; key/cover confusion → `uniqi_a_b_key UNIQUE
+        (a, b)`). Files: `internal/testport/pgdump_connsetup_test.go` (uniqi
+        fixture + asserts), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice
+        131). Gates: gofmt OK; `go build ./internal/...` OK;
+        `TestPort_PgDumpConnectionSetup` PASS (2.18s); `go test
+        ./internal/executor/ ./internal/catalog/` PASS; pgbench pre-commit smoke
+        on commit. **Next: slice 132** — a table+VIEW dependency-ordering case
+        (verify topological emission ORDER), OR a partial-index predicate
+        round-trip (`CREATE INDEX ... WHERE`), OR a UNIQUE NULLS NOT DISTINCT
+        constraint.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

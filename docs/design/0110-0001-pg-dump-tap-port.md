@@ -3413,6 +3413,42 @@ Positive asserts pin the full 4-space CREATE blocks (CACHE is the last clause fo
 a non-cycling sequence); negative guard rejects `cache_seq` falling back to
 `CACHE 1`. Verified byte-identical to real pg_dump 18.3.
 
+### Slice 131 — UNIQUE constraint with an INCLUDE (covering) column
+
+A table-level `UNIQUE (key) INCLUDE (cover)` constraint adds a covering column to
+the backing index without making it part of the uniqueness key. Two facets must
+round-trip through pg_dump and neither was previously exercised by the round-trip
+test (the only INCLUDE coverage was an EXCLUDE-constraint *unit* test):
+
+1. **Auto-generated name folds in the covering column.** PG builds
+   `allIndexParams = list_concat_copy(indexParams, indexIncludingParams)`
+   (`indexcmds.c`) and feeds the concatenation to
+   `ChooseIndexColumnNames → ChooseIndexNameAddition`, so the covering column lands
+   in the name too. `UNIQUE (a) INCLUDE (b)` is therefore named **`uniqi_a_b_key`**
+   (not `uniqi_a_key`), confirmed empirically against real pg_dump 18.3
+   (reference `/tmp/du131_pgdata`).
+2. **`pg_get_constraintdef` appends ` INCLUDE (cols)`.** pg_dump emits the
+   constraint from this deparse, which renders `UNIQUE (a) INCLUDE (b)`.
+
+**No production change needed** — goopg already matched both facets:
+`autoIndexNameWithIncludes(tbl, keyCols, inclCols, "key")`
+(`internal/executor/operators_ddl.go`) joins `keyCols+inclCols` for the name, the
+table-level UNIQUE path stores the covering list on `catalog.Index.IncludeColumns`,
+and `buildConstraintDefString` (`internal/executor/expr.go`) appends the
+` INCLUDE (...)` clause. This slice is the regression guard that locks the
+name-join + clause render.
+
+```sql
+CREATE TABLE public.uniqi (a integer, b integer, c text, UNIQUE (a) INCLUDE (b));
+-- → ALTER TABLE ONLY public.uniqi
+--       ADD CONSTRAINT uniqi_a_b_key UNIQUE (a) INCLUDE (b);
+```
+
+Positive assert pins `ADD CONSTRAINT uniqi_a_b_key UNIQUE (a) INCLUDE (b)`; two
+negative guards reject a dropped INCLUDE (`uniqi_a_key UNIQUE (a)`, covering column
+lost) and a key/cover confusion (`uniqi_a_b_key UNIQUE (a, b)`, a different
+uniqueness semantic). Verified byte-identical to real pg_dump 18.3.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
