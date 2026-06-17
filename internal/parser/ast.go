@@ -941,6 +941,12 @@ type TableConstraintDef struct {
 	IsExclusion    bool     // true for EXCLUDE USING constraints
 	ExclusionOp    string   // per-column operator (e.g. "=") for single-column EXCLUDE
 	Method         string   // index method for EXCLUDE (e.g. "btree")
+	// NullsNotDistinct is true when a UNIQUE constraint was declared
+	// `UNIQUE NULLS NOT DISTINCT (…)` (PostgreSQL 15+): NULL key values are
+	// treated as equal for uniqueness. Threads to the backing index's
+	// catalog.Index.NullsNotDistinct so pg_get_constraintdef re-emits it.
+	// DU-002 slice 135.
+	NullsNotDistinct bool
 }
 
 // TableForeignKeyDef describes a table-level FOREIGN KEY constraint, e.g.
@@ -1022,6 +1028,12 @@ type CreateTableStmt struct {
 	// TableUniques: TableUniqueIncludes[i] is the include list for TableUniques[i].
 	// May be shorter than TableUniques if trailing entries have no INCLUDE. M0097-0023.
 	TableUniqueIncludes [][]string
+	// TableUniqueNullsNotDistinct is parallel to TableUniques:
+	// TableUniqueNullsNotDistinct[i] is true when TableUniques[i] was declared
+	// `UNIQUE NULLS NOT DISTINCT (…)` (PostgreSQL 15+). May be shorter than
+	// TableUniques if trailing entries use the default NULLS DISTINCT.
+	// DU-002 slice 135.
+	TableUniqueNullsNotDistinct []bool
 	// PrimaryKeyInclude holds the INCLUDE covering columns for an anonymous
 	// table-level PRIMARY KEY constraint. M0097-0023.
 	PrimaryKeyInclude []string

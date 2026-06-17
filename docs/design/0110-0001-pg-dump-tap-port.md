@@ -3538,6 +3538,42 @@ would break equality SELECTs on such indexes). This slice pins the dump-fidelity
 layer only; a `NULLS NOT DISTINCT` index in goopg v0 still permits multiple NULLs.
 See the deferral ledger.
 
+### Slice 135 — `UNIQUE NULLS NOT DISTINCT` table/column constraint round-trip
+
+The CONSTRAINT sibling of slice 134. The same PostgreSQL 15+ `NULLS NOT DISTINCT`
+option can be declared on a `UNIQUE` *constraint* (`CREATE TABLE t (…, UNIQUE
+NULLS NOT DISTINCT (a))` / `ALTER TABLE … ADD CONSTRAINT … UNIQUE NULLS NOT
+DISTINCT (a)`), not just a bare `CREATE UNIQUE INDEX`. pg_dump reproduces an
+index-backed UNIQUE/PK constraint from `pg_get_constraintdef` (not
+`pg_get_indexdef`), and the deparse order **differs**: ruleutils.c
+`pg_get_constraintdef_worker` emits the clause **between** the keyword and the
+column list — `UNIQUE NULLS NOT DISTINCT (cols)` — whereas `pg_get_indexdef`
+trails it after the columns. The clause is emitted only for `CONSTRAINT_UNIQUE`,
+never for a `PRIMARY KEY` (whose columns are already NOT NULL).
+
+goopg's parser accepted-and-discarded the clause on a table-level UNIQUE (it never
+reached `CreateTableStmt`), and the backing index's `NullsNotDistinct` stayed
+`false`, so the constraint dumped as a plain `UNIQUE (a)` — the same silent loss
+of NULL-deduplication semantics as slice 134, on the constraint surface.
+
+**Production change:** capture the clause on the table-level UNIQUE constraint
+parser path (`ddl.go`, the `UNIQUE [NULLS NOT DISTINCT] (cols)` table-constraint
+case) into a new `CreateTableStmt.TableUniqueNullsNotDistinct []bool` riding
+parallel to `TableUniques` (mirrors the existing `TableUniqueIncludes`); add
+`TableConstraintDef.NullsNotDistinct` for the named-constraint AST; the executor's
+table-UNIQUE loop (`operators_ddl.go`) threads the flag onto
+`catalog.Index.NullsNotDistinct`; and `buildConstraintDefString`
+(`internal/executor/expr.go`) emits ` NULLS NOT DISTINCT` between the keyword and
+the column list for a non-primary UNIQUE. The round-trip test adds
+`public.uniqnnd (…, UNIQUE NULLS NOT DISTINCT (a))` and asserts the dump carries
+`ADD CONSTRAINT uniqnnd_a_key UNIQUE NULLS NOT DISTINCT (a)`, with the
+clause-count guard tightened to exactly two (slice 134 index + slice 135
+constraint) and a negative guard against the bare `UNIQUE (a)` regression.
+
+**Deferred (DU-002 follow-up):** enforcement at INSERT/UPDATE time, identical to
+slice 134 — the constraint shares the same backing-index key-encoding path
+(`encodeIndexKeyFromCols`). This slice pins the dump-fidelity layer only.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

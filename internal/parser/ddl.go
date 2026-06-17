@@ -1782,8 +1782,19 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				_ = p.acceptIdentKeyword("immediate")
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
-			// Table-level UNIQUE (cols) [INCLUDE (incl)] — create btree index. M0097-0028.
+			// Table-level UNIQUE [NULLS NOT DISTINCT] (cols) [INCLUDE (incl)] —
+			// create btree index. M0097-0028 / DU-002 slice 135.
 			p.advance()
+			// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) precedes the column
+			// list for a constraint (ruleutils.c emits `UNIQUE NULLS NOT DISTINCT
+			// (cols)`), unlike CREATE INDEX where the clause trails the columns.
+			nullsNotDistinct := false
+			if p.acceptIdentKeyword("nulls") {
+				nullsNotDistinct = p.acceptKeyword(KwNot)
+				if !p.acceptKeyword(KwDistinct) {
+					_ = p.acceptIdentKeyword("distinct")
+				}
+			}
 			if p.acceptSymbol("(") {
 				var cols []string
 				for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
@@ -1794,6 +1805,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				}
 				if len(cols) > 0 {
 					stmt.TableUniques = append(stmt.TableUniques, cols)
+					stmt.TableUniqueNullsNotDistinct = append(stmt.TableUniqueNullsNotDistinct, nullsNotDistinct)
 					// Optional INCLUDE (col, …). M0097-0023.
 					var incl []string
 					if p.acceptIdentKeyword("include") {

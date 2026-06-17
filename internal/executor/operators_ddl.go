@@ -1263,6 +1263,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.IsConstraint = true
 			idx.IncludeColumns = inclCols
+			// NULLS NOT DISTINCT (PG 15+) — record so pg_get_constraintdef
+			// re-emits `UNIQUE NULLS NOT DISTINCT (…)`. DU-002 slice 135.
+			if i < len(s.TableUniqueNullsNotDistinct) {
+				idx.NullsNotDistinct = s.TableUniqueNullsNotDistinct[i]
+			}
 		}
 	}
 	// Create indexes for anonymous EXCLUDE USING constraints. M0097-0023.

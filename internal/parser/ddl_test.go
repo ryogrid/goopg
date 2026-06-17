@@ -178,6 +178,41 @@ func TestParseCreateIndexNullsNotDistinct(t *testing.T) {
 	}
 }
 
+// TestParseTableUniqueNullsNotDistinct pins the PostgreSQL 15+ NULLS [NOT]
+// DISTINCT capture on a TABLE-level UNIQUE constraint (DU-002 slice 135). For a
+// constraint the clause precedes the column list (`UNIQUE NULLS NOT DISTINCT
+// (cols)`, ruleutils.c pg_get_constraintdef order), unlike CREATE INDEX where it
+// trails. The flag rides parallel to TableUniques so the backing index records
+// it and pg_get_constraintdef re-emits it. Only `NULLS NOT DISTINCT` sets it;
+// the bare/default `NULLS DISTINCT` and an omitted clause leave it false.
+func TestParseTableUniqueNullsNotDistinct(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"CREATE TABLE t (a int, b int, UNIQUE (a))", false},
+		{"CREATE TABLE t (a int, b int, UNIQUE NULLS DISTINCT (a))", false},
+		{"CREATE TABLE t (a int, b int, UNIQUE NULLS NOT DISTINCT (a))", true},
+		{"CREATE TABLE t (a int, b int, UNIQUE NULLS NOT DISTINCT (a) INCLUDE (b))", true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.TableUniques) != 1 {
+			t.Fatalf("Parse(%q): expected 1 table UNIQUE, got %d", c.in, len(ct.TableUniques))
+		}
+		if len(ct.TableUniqueNullsNotDistinct) != 1 {
+			t.Fatalf("Parse(%q): TableUniqueNullsNotDistinct len=%d want 1", c.in, len(ct.TableUniqueNullsNotDistinct))
+		}
+		if ct.TableUniqueNullsNotDistinct[0] != c.want {
+			t.Errorf("Parse(%q): NullsNotDistinct=%v want %v", c.in, ct.TableUniqueNullsNotDistinct[0], c.want)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {

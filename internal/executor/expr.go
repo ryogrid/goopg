@@ -4346,7 +4346,15 @@ func buildConstraintDefString(idx *catalog.Index) string {
 	} else {
 		keyword = "UNIQUE"
 	}
-	def := keyword + " " + keyCols
+	def := keyword
+	// NULLS NOT DISTINCT (PG 15+) precedes the column list for a UNIQUE
+	// constraint — ruleutils.c pg_get_constraintdef_worker emits
+	// `UNIQUE NULLS NOT DISTINCT (cols)` (only for CONSTRAINT_UNIQUE, never a
+	// PRIMARY KEY whose columns are already NOT NULL). DU-002 slice 135.
+	if !idx.Primary && idx.NullsNotDistinct {
+		def += " NULLS NOT DISTINCT"
+	}
+	def += " " + keyCols
 	if len(idx.IncludeColumns) > 0 {
 		def += " INCLUDE (" + strings.Join(idx.IncludeColumns, ", ") + ")"
 	}

@@ -464,6 +464,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table uniqi: %v", err)
 	}
 
+	// Slice 135: a table-level UNIQUE constraint declared `NULLS NOT DISTINCT`
+	// (PostgreSQL 15+) must round-trip via the index-backed CONSTRAINT path
+	// (`ALTER TABLE ... ADD CONSTRAINT name UNIQUE NULLS NOT DISTINCT (cols)`).
+	// This is the CONSTRAINT sibling of slice 134's CREATE INDEX surface: for a
+	// constraint ruleutils.c pg_get_constraintdef_worker emits the clause BETWEEN
+	// the keyword and the column list (`UNIQUE NULLS NOT DISTINCT (a)`), whereas
+	// pg_get_indexdef trails it after the columns. goopg's parser previously
+	// accepted-and-discarded the clause on a table-level UNIQUE and the backing
+	// index's NullsNotDistinct stayed false, so the constraint dumped as a plain
+	// `UNIQUE (a)` — a silent loss of the NULL-deduplication semantics on restore.
+	// The flag now rides parallel to TableUniques → catalog.Index.NullsNotDistinct
+	// → buildConstraintDefString. `uniqnnd` carries it on its own table so foo's
+	// many asserts are untouched. (Enforcement at INSERT/UPDATE remains deferred —
+	// dump-fidelity layer only, matching slice 134.)
+	if err := runSQLSimple(t, c, "CREATE TABLE public.uniqnnd (a integer, b integer, UNIQUE NULLS NOT DISTINCT (a))"); err != nil {
+		t.Fatalf("create table uniqnnd: %v", err)
+	}
+
 	// Slice 127: anonymous table-level CHECK constraints (written without an
 	// explicit CONSTRAINT name) must round-trip. PG's AddRelationNewConstraints
 	// auto-names each one at DDL time — "<table>_<col>_check" when the predicate
@@ -1465,6 +1483,11 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// PG folds the covering column into the auto-generated name (key + INCLUDE
 			// → `uniqi_a_b_key`) and pg_get_constraintdef appends ` INCLUDE (b)`.
 			"ADD CONSTRAINT uniqi_a_b_key UNIQUE (a) INCLUDE (b)",
+			// **Slice 135:** a table-level UNIQUE constraint declared NULLS NOT
+			// DISTINCT re-emits the clause BETWEEN the keyword and the column list
+			// (`UNIQUE NULLS NOT DISTINCT (a)`, ruleutils.c pg_get_constraintdef
+			// order) — distinct from CREATE INDEX where it trails the columns.
+			"ADD CONSTRAINT uniqnnd_a_key UNIQUE NULLS NOT DISTINCT (a)",
 			// **Slice 127:** anonymous table-level CHECK constraints round-trip
 			// inline with PG's auto-generated names. The multi-column predicate
 			// (`a < b`) gets the table-only name `chk_check`; the single-column
@@ -1587,11 +1610,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				t.Errorf("pg_dump dropped/mangled a secondary index; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
-		// Slice 134 (regression guard): a plain unique/secondary index must NOT
-		// gain a stray NULLS NOT DISTINCT — the flag is only set for the explicitly
-		// declared index. Guard that exactly one CREATE INDEX carries the clause.
-		if got := strings.Count(res.Stdout, "NULLS NOT DISTINCT"); got != 1 {
-			t.Errorf("expected exactly one NULLS NOT DISTINCT in dump, got %d\n  full stdout=%q", got, res.Stdout)
+		// Slice 134/135 (regression guard): a plain unique/secondary index or a
+		// default-distinct UNIQUE constraint must NOT gain a stray NULLS NOT
+		// DISTINCT — the flag is only set where explicitly declared. Exactly two
+		// clauses must appear: the slice-134 CREATE INDEX (foo_nnd_idx) and the
+		// slice-135 ADD CONSTRAINT (uniqnnd_a_key).
+		if got := strings.Count(res.Stdout, "NULLS NOT DISTINCT"); got != 2 {
+			t.Errorf("expected exactly two NULLS NOT DISTINCT in dump, got %d\n  full stdout=%q", got, res.Stdout)
+		}
+		// Slice 135 negative guard: dropping the clause would render the bare
+		// `uniqnnd_a_key UNIQUE (a)`, silently restoring with default NULLS DISTINCT
+		// (every NULL unique) instead of the declared NULLS-equal semantics.
+		if strings.Contains(res.Stdout, "ADD CONSTRAINT uniqnnd_a_key UNIQUE (a)") {
+			t.Errorf("pg_dump dropped NULLS NOT DISTINCT from a UNIQUE constraint\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 57 (asserted):** a VIEW must round-trip. pg_dump aborts the
 		// whole dump when pg_get_viewdef returns empty; goopg now returns the
