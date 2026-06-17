@@ -566,6 +566,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_ord_idx ON public.foo (name DESC, qty NULLS FIRST)"); err != nil {
 		t.Fatalf("create ordered composite index: %v", err)
 	}
+	// Slice 134: a UNIQUE index declared `NULLS NOT DISTINCT` (PostgreSQL 15+)
+	// must round-trip. goopg's parser accepted the clause but DISCARDED it, and
+	// pg_index.indnullsnotdistinct was hard-wired false, so pg_get_indexdef
+	// re-emitted the index as a plain `CREATE UNIQUE INDEX … (name)` — a silent
+	// loss of the NULL-deduplication semantics on restore (under the default
+	// NULLS DISTINCT, every NULL is unique; NULLS NOT DISTINCT treats them as
+	// equal). The flag now threads parser → catalog.Index.NullsNotDistinct →
+	// pg_index.indnullsnotdistinct, and BuildIndexDef re-emits the clause after
+	// the column list (mirroring ruleutils.c pg_get_indexdef_worker), so the
+	// dumped DDL preserves it. NOTE: enforcement of the NULLS-equal semantics at
+	// INSERT/UPDATE time is deferred (DU-002 follow-up); this slice pins the
+	// dump-fidelity layer only.
+	if err := runSQLSimple(t, c, "CREATE UNIQUE INDEX foo_nnd_idx ON public.foo (name) NULLS NOT DISTINCT"); err != nil {
+		t.Fatalf("create NULLS NOT DISTINCT unique index: %v", err)
+	}
 
 	// Slice 57: a VIEW must survive the dump. pg_dump fetches the defining
 	// query via `pg_get_viewdef(oid)` (createViewAsClause), and aborts the
@@ -1563,11 +1578,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE INDEX foo_name_desc_idx ON public.foo USING btree (name DESC NULLS LAST);",
 			// DESC (default NULLS FIRST suppressed) + ASC NULLS FIRST override
 			"CREATE INDEX foo_ord_idx ON public.foo USING btree (name DESC, qty NULLS FIRST);",
+			// Slice 134: NULLS NOT DISTINCT clause re-emitted after the column list
+			// (ruleutils.c order: (cols) [INCLUDE] NULLS NOT DISTINCT [WHERE]).
+			"CREATE UNIQUE INDEX foo_nnd_idx ON public.foo USING btree (name) NULLS NOT DISTINCT;",
 		}
 		for _, sub := range indexDefs {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped/mangled a secondary index; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// Slice 134 (regression guard): a plain unique/secondary index must NOT
+		// gain a stray NULLS NOT DISTINCT — the flag is only set for the explicitly
+		// declared index. Guard that exactly one CREATE INDEX carries the clause.
+		if got := strings.Count(res.Stdout, "NULLS NOT DISTINCT"); got != 1 {
+			t.Errorf("expected exactly one NULLS NOT DISTINCT in dump, got %d\n  full stdout=%q", got, res.Stdout)
 		}
 		// **Slice 57 (asserted):** a VIEW must round-trip. pg_dump aborts the
 		// whole dump when pg_get_viewdef returns empty; goopg now returns the

@@ -149,6 +149,35 @@ func TestParseCreateIndexColOrders(t *testing.T) {
 	}
 }
 
+// TestParseCreateIndexNullsNotDistinct pins the PostgreSQL 15+ NULLS [NOT]
+// DISTINCT capture (DU-002 slice 134). goopg previously parsed and discarded the
+// clause, so a NULLS NOT DISTINCT unique index dumped as a plain one — a silent
+// loss of the NULL-deduplication semantics. The bare/default `NULLS DISTINCT`
+// (and an omitted clause) must leave the flag false; only `NULLS NOT DISTINCT`
+// sets it. The clause may appear before or after WHERE/WITH in practice; here we
+// pin the canonical position (after the column list) plus the WHERE combination.
+func TestParseCreateIndexNullsNotDistinct(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"CREATE UNIQUE INDEX i ON t (a)", false},
+		{"CREATE UNIQUE INDEX i ON t (a) NULLS DISTINCT", false},
+		{"CREATE UNIQUE INDEX i ON t (a) NULLS NOT DISTINCT", true},
+		{"CREATE UNIQUE INDEX i ON t (a) NULLS NOT DISTINCT WHERE a > 0", true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ci := stmts[0].(*CreateIndexStmt)
+		if ci.NullsNotDistinct != c.want {
+			t.Errorf("Parse(%q): NullsNotDistinct=%v want %v", c.in, ci.NullsNotDistinct, c.want)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {

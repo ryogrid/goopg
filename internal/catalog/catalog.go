@@ -531,6 +531,10 @@ type Index struct {
 	IsConstraint  bool   // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
 	IsExclusion   bool   // true when index backs an EXCLUDE USING constraint
 	ExclusionOp   string // per-column exclusion operator (e.g. "=")
+	// NullsNotDistinct mirrors pg_index.indnullsnotdistinct: true when a UNIQUE
+	// index was declared `NULLS NOT DISTINCT` (PG 15+). pg_get_indexdef /
+	// BuildIndexDef re-emits the clause so pg_dump round-trips it. DU-002 slice 134.
+	NullsNotDistinct bool
 	// PartitionParentOID is the OID of the parent index for partition index
 	// trees (ALTER INDEX parent ATTACH PARTITION child). Zero if not a partition
 	// index child. M0097-0023.
@@ -3031,7 +3035,7 @@ func (c *InMemory) registerSystemTables() {
 				}
 				row[18] = "f"     // conperiod
 				row[24] = nc.Expr // conbin
-				row[25] = "t"                            // conenforced: always true in v0
+				row[25] = "t"     // conenforced: always true in v0
 				out = append(out, row)
 			}
 		}
@@ -3428,7 +3432,7 @@ func (c *InMemory) registerSystemTables() {
 				fmt.Sprintf("%d", natts),         // indnatts
 				fmt.Sprintf("%d", nkeyatts),      // indnkeyatts
 				boolStr(idx.Unique),              // indisunique
-				"f",                              // indnullsnotdistinct
+				boolStr(idx.NullsNotDistinct),    // indnullsnotdistinct
 				boolStr(idx.Primary),             // indisprimary
 				boolStr(idx.IsExclusion),         // indisexclusion
 				"t",                              // indimmediate
@@ -5974,6 +5978,12 @@ func BuildIndexDef(idx *Index) string {
 			sb.WriteString(col)
 		}
 		sb.WriteByte(')')
+	}
+	// NULLS NOT DISTINCT follows the (key) INCLUDE (incl) list and precedes WITH /
+	// WHERE, mirroring ruleutils.c pg_get_indexdef_worker. Only meaningful for a
+	// unique index. DU-002 slice 134.
+	if idx.NullsNotDistinct {
+		sb.WriteString(" NULLS NOT DISTINCT")
 	}
 	if idx.PredicateString != "" {
 		sb.WriteString(" WHERE ")

@@ -2685,6 +2685,43 @@ object support.
         DISTINCT constraint (NOTE: needs parser support — real feature, not a
         guard), OR a generated-column (`GENERATED ALWAYS AS ... STORED`)
         round-trip.
+      - **PROGRESS 2026-06-17 (loop #99):** **DU-002 slice 134 LANDED** — a
+        `CREATE UNIQUE INDEX … NULLS NOT DISTINCT` (PostgreSQL 15+) round-trip.
+        Partial-index and generated-column round-trips were already covered
+        (slices 56 / ~59), so the remaining slice-134 candidate — NULLS NOT
+        DISTINCT — was the only real feature. **Production change:** the parser
+        accepted-and-DISCARDED the clause and `pg_index.indnullsnotdistinct` was
+        hard-wired `false`, so a NULLS NOT DISTINCT unique index dumped as a plain
+        `CREATE UNIQUE INDEX … (col)` — a silent loss of the NULL-deduplication
+        semantics on restore (default NULLS DISTINCT = every NULL unique; NULLS
+        NOT DISTINCT = NULLs equal, ≤1 NULL per key). Threaded end to end:
+        `CreateIndexStmt.NullsNotDistinct` (parser, set only for `NULLS NOT
+        DISTINCT`) → `catalog.Index.NullsNotDistinct` (executor `execCreateIndex`)
+        → `pg_index.indnullsnotdistinct` (BOTH row builders: `catalog.go` virtual
+        view + `pg18_user_catalog_rows.go`) → `BuildIndexDef` re-emits ` NULLS NOT
+        DISTINCT` after the column list, mirroring ruleutils.c
+        `pg_get_indexdef_worker` order `(cols) [INCLUDE] NULLS NOT DISTINCT
+        [WHERE]`. **Deferred (ledger):** enforcement of the NULLS-equal semantics
+        at INSERT/UPDATE — `encodeIndexKeyFromCols` returns nil on any NULL key,
+        and making NULLs collide needs a NULL-sentinel encoding consistent across
+        insert-maintain / unique-check / index-scan-probe paths (divergence would
+        break equality SELECTs); dump-fidelity layer only this slice. Files:
+        `internal/parser/ast.go` (+`NullsNotDistinct` field),
+        `internal/parser/ddl.go` (set flag), `internal/catalog/catalog.go`
+        (Index field + BuildIndexDef + pg_index view),
+        `internal/executor/operators_ddl.go` (thread flag),
+        `internal/executor/pg18_user_catalog_rows.go` (pg_index row),
+        `internal/parser/ddl_test.go` (`TestParseCreateIndexNullsNotDistinct`),
+        `internal/testport/pgdump_connsetup_test.go` (slice-134 round-trip +
+        exactly-one-clause guard), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 134), `.ralph/deferral_ledger.md`. Gates: gofmt OK; `go build
+        ./internal/...` OK; `TestParseCreateIndexNullsNotDistinct` PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.50s); catalog+parser packages
+        PASS; executor Index/Unique tests PASS; pgbench pre-commit smoke on
+        commit. **Next: slice 135** — a `UNIQUE NULLS NOT DISTINCT` *table/column
+        constraint* (CREATE TABLE / ALTER TABLE ADD; separate parser path from
+        CREATE INDEX), OR enforcement of the slice-134 NULLS-equal semantics, OR
+        an exclusion-constraint (`EXCLUDE USING gist`) dump surface.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

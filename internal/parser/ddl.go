@@ -2835,10 +2835,12 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 			}
 		}
 	}
-	// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+ unique index option) — accept and discard.
+	// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+ unique index option).
 	// DISTINCT may be a reserved keyword token (KwDistinct), not just an identifier.
+	// `NULLS NOT DISTINCT` records the flag (treat NULLs as equal for uniqueness);
+	// the bare/default `NULLS DISTINCT` leaves it false. DU-002 slice 134.
 	if p.acceptIdentKeyword("nulls") {
-		_ = p.acceptKeyword(KwNot)
+		stmt.NullsNotDistinct = p.acceptKeyword(KwNot)
 		if !p.acceptKeyword(KwDistinct) {
 			_ = p.acceptIdentKeyword("distinct")
 		}

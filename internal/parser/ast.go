@@ -1162,6 +1162,11 @@ type CreateIndexStmt struct {
 	// parallel to Columns (ColOrders[i] applies to Columns[i]). Mirrors PG's
 	// pg_index.indoption so pg_get_indexdef can reproduce a non-default ordering.
 	ColOrders []IndexColOrder
+	// NullsNotDistinct is true when the index was declared with the PostgreSQL 15+
+	// `NULLS NOT DISTINCT` option (treat NULL key values as equal for uniqueness).
+	// Mirrors pg_index.indnullsnotdistinct so pg_get_indexdef can reproduce it.
+	// The default (omitted, or explicit `NULLS DISTINCT`) leaves this false.
+	NullsNotDistinct bool
 }
 
 // IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key

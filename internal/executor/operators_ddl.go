@@ -3321,7 +3321,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// at least one column is non-default so a plain index keeps empty slices and
 	// dumps byte-identically. DU-002 slice 56.
 	nonDefaultOrder := indexHasNonDefaultOrder(s.ColOrders)
-	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder {
+	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || s.NullsNotDistinct {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.HasPredicate = s.HasPredicate
 			idx.Predicate = s.Predicate
@@ -3329,6 +3329,9 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 				idx.PredicateString = defaultExprToSQL(s.Predicate)
 			}
 			idx.IncludeColumns = s.IncludeColumns
+			// NULLS NOT DISTINCT (PG 15+) — record so pg_index.indnullsnotdistinct
+			// and pg_get_indexdef reproduce it for pg_dump. DU-002 slice 134.
+			idx.NullsNotDistinct = s.NullsNotDistinct
 			if nonDefaultOrder {
 				desc := make([]bool, len(s.ColOrders))
 				nullsFirst := make([]bool, len(s.ColOrders))

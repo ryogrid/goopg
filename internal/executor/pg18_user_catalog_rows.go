@@ -737,7 +737,7 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 		NewIntDatum(natts),                        // indnatts
 		NewIntDatum(natts),                        // indnkeyatts
 		NewBoolDatum(idx.Unique),                  // indisunique
-		NewBoolDatum(false),                       // indnullsnotdistinct
+		NewBoolDatum(idx.NullsNotDistinct),        // indnullsnotdistinct (DU-002 slice 134)
 		NewBoolDatum(idx.Primary),                 // indisprimary
 		NewBoolDatum(false),                       // indisexclusion
 		NewBoolDatum(true),                        // indimmediate

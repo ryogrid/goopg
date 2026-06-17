@@ -3504,6 +3504,40 @@ the `REFERENCES public.bar` clause does not appear inside the `baz` table body
 complementing the slice-132 view-ordering guard so both dependency-edge classes
 pg_dump relies on are positionally locked.
 
+### Slice 134 — `CREATE UNIQUE INDEX … NULLS NOT DISTINCT` round-trip
+
+PostgreSQL 15 added the `NULLS NOT DISTINCT` index option: by default every NULL
+in a unique key is considered distinct (so a column can hold many NULL rows), but
+`NULLS NOT DISTINCT` treats NULLs as equal, allowing at most one NULL per key.
+pg_dump reproduces it from `pg_index.indnullsnotdistinct` via
+`pg_get_indexdef`, which appends ` NULLS NOT DISTINCT` after the column list
+(ruleutils.c `pg_get_indexdef_worker`: `(cols) [INCLUDE (incl)] NULLS NOT
+DISTINCT [WITH …] [WHERE …]`).
+
+goopg's parser *accepted but discarded* the clause (`ddl.go`: "accept and
+discard"), and `pg_index.indnullsnotdistinct` was hard-wired `false` in both the
+virtual-catalog row builder (`catalog.go`) and the static one
+(`pg18_user_catalog_rows.go`). So a `NULLS NOT DISTINCT` unique index dumped as a
+plain `CREATE UNIQUE INDEX … (col)` — a silent loss of the NULL-deduplication
+semantics on restore.
+
+**Production change:** thread the flag end to end — `CreateIndexStmt.NullsNotDistinct`
+(parser sets it only for `NULLS NOT DISTINCT`, leaving the default/`NULLS
+DISTINCT` false) → `catalog.Index.NullsNotDistinct` (executor `execCreateIndex`)
+→ `pg_index.indnullsnotdistinct` (both row builders) → `BuildIndexDef`
+re-emitting the clause in ruleutils order. The test adds
+`foo_nnd_idx … (name) NULLS NOT DISTINCT` and asserts the dumped DDL carries the
+clause exactly once (no stray clause on the other indexes).
+
+**Deferred (DU-002 follow-up):** *enforcement* of the NULLS-equal semantics at
+INSERT/UPDATE time. `encodeIndexKeyFromCols` returns nil on any NULL key column
+(so NULLs never collide); making NULLs collide for a `NullsNotDistinct` index
+requires a NULL-sentinel encoding that must stay byte-consistent across the
+insert-maintain, unique-check, **and** index-scan probe paths (a divergence there
+would break equality SELECTs on such indexes). This slice pins the dump-fidelity
+layer only; a `NULLS NOT DISTINCT` index in goopg v0 still permits multiple NULLs.
+See the deferral ledger.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
