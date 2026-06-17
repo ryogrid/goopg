@@ -4403,6 +4403,44 @@ asserts the `RETURNS integer` signature plus the exact one-line `LANGUAGE sql` /
 `AS $_$ SELECT 1; SELECT $1 + 7; $_$;` fragment. A body truncated at the inner `;`, a
 collapsed/normalized body, or a dropped statement surfaces exactly in the assertion.
 
+### Slice 159 — VARIADIC array parameter round-trip (real divergence fixed)
+
+Every prior function slice (148–158) declared only fixed, by-value IN parameters (a
+single unnamed `integer`); none exercised the VARIADIC argmode (`'v'`) or an array
+parameter type for a **function**. pg_dump reconstructs the CREATE FUNCTION signature
+from `pg_get_function_arguments(p.oid)`, which goopg answers via `buildFunctionArguments`
+(`expr.go`).
+
+**Bug found and fixed.** `buildFunctionArguments` gated *all* mode prefixes behind a
+`showMode` flag that was only set for procedures or for functions carrying an OUT/INOUT
+arg. A function whose only non-IN parameter was VARIADIC therefore had `showMode == false`,
+so the `VARIADIC ` prefix was **silently dropped** — `sum_variadic(VARIADIC arr integer[])`
+dumped as `sum_variadic(arr integer[])`, a function that no longer round-trips (the
+restored function is non-variadic). This diverges from PostgreSQL's
+`print_function_arguments`, which emits every non-default mode (`OUT`/`INOUT`/`VARIADIC`)
+regardless of routine kind and suppresses only the bare `IN ` for functions.
+
+The fix makes `OUT`/`INOUT`/`VARIADIC` prefixes unconditional in `buildFunctionArguments`
+and keeps the bare `IN ` prefix gated on `showMode` (procedures, or functions with an
+OUT/INOUT arg — preserving the existing convention asserted by
+`TestPgGetFunctionIdentityArgumentsOutMode`). The sibling reconstructor `buildFunctionDef`
+(`pg_get_functiondef`) had the mirror gap — it emitted mode prefixes only for procedures,
+dropping VARIADIC for functions — and was fixed the same way so the two arg-list builders
+stay in lockstep (per the sibling-paths rule). The `$`-free body `SELECT 1` keeps the plain
+`$$` delimiter (contrast `add_seven`'s `$1`, which escalates to `$_$`). Real pg_dump 18.3
+now renders:
+
+```
+CREATE FUNCTION public.sum_variadic(VARIADIC arr integer[]) RETURNS integer
+    LANGUAGE sql
+    AS $$ SELECT 1 $$;
+```
+
+The TAP test creates `public.sum_variadic(VARIADIC arr integer[]) … AS $$ SELECT 1 $$`
+and asserts the `VARIADIC arr integer[]` signature plus the `LANGUAGE sql` / `AS $$ SELECT
+1 $$;` fragment. A dropped VARIADIC prefix (arg rendered as a plain array IN param) or a
+mangled array type surfaces exactly in the assertion.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -11341,17 +11341,22 @@ func buildFunctionArguments(r *catalog.Routine) string {
 	parts := make([]string, len(r.ArgTypes))
 	for i, argType := range r.ArgTypes {
 		var part strings.Builder
-		// Mode prefix
-		if showMode && r.ArgModes != nil && i < len(r.ArgModes) {
+		// Mode prefix. OUT/INOUT/VARIADIC always carry their prefix (matching
+		// print_function_arguments, which prints every non-default mode regardless
+		// of routine kind); the bare IN prefix is only emitted when showMode is set
+		// (procedures, or functions that carry an OUT/INOUT arg).
+		if r.ArgModes != nil && i < len(r.ArgModes) {
 			switch r.ArgModes[i] {
-			case "i", "":
-				part.WriteString("IN ")
 			case "o":
 				part.WriteString("OUT ")
 			case "b":
 				part.WriteString("INOUT ")
 			case "v":
 				part.WriteString("VARIADIC ")
+			default: // "i" or ""
+				if showMode {
+					part.WriteString("IN ")
+				}
 			}
 		} else if showMode {
 			part.WriteString("IN ")
@@ -11390,17 +11395,21 @@ func buildFunctionDef(r *catalog.Routine) string {
 		if i > 0 {
 			sb.WriteString(", ")
 		}
-		// Procedure args include mode prefix
-		if r.IsProcedure && r.ArgModes != nil && i < len(r.ArgModes) {
+		// Mode prefix: OUT/INOUT/VARIADIC are emitted for both functions and
+		// procedures; the bare IN prefix is procedure-only (sibling of
+		// buildFunctionArguments).
+		if r.ArgModes != nil && i < len(r.ArgModes) {
 			switch r.ArgModes[i] {
-			case "i":
-				sb.WriteString("IN ")
 			case "o":
 				sb.WriteString("OUT ")
 			case "b":
 				sb.WriteString("INOUT ")
 			case "v":
 				sb.WriteString("VARIADIC ")
+			case "i", "":
+				if r.IsProcedure {
+					sb.WriteString("IN ")
+				}
 			}
 		}
 		if i < len(r.ArgNames) && r.ArgNames[i] != "" {

@@ -3434,6 +3434,34 @@ object support.
         clause (`protrftypes`, currently NULL — likely a feature gap), a non-`sql` LANGUAGE
         (e.g. `plpgsql`) body, or a function returning a composite/`RECORD` type.
 
+      - **PROGRESS 2026-06-17 (loop #126):** **DU-002 slice 159 LANDED — real
+        divergence fixed.** A function with a **VARIADIC array parameter**
+        (`public.sum_variadic(VARIADIC arr integer[])`) now round-trips through pg_dump.
+        Every prior function slice (148–158) declared only fixed by-value IN parameters
+        (a single unnamed `integer`); none exercised the VARIADIC argmode (`'v'`) or an
+        array parameter type for a function. **Bug:** pg_dump reconstructs the signature
+        from `pg_get_function_arguments(oid)` → goopg's `buildFunctionArguments`
+        (`expr.go`), which gated *all* mode prefixes behind a `showMode` flag set only
+        for procedures or functions with an OUT/INOUT arg. A function whose only non-IN
+        param was VARIADIC had `showMode==false`, so the `VARIADIC ` prefix was **silently
+        dropped** — `sum_variadic(VARIADIC arr integer[])` dumped as
+        `sum_variadic(arr integer[])` (a non-variadic, non-round-tripping function). Fix:
+        make `OUT`/`INOUT`/`VARIADIC` prefixes unconditional and keep the bare `IN `
+        prefix gated on `showMode` (preserving the convention asserted by
+        `TestPgGetFunctionIdentityArgumentsOutMode`). The sibling reconstructor
+        `buildFunctionDef` (`pg_get_functiondef`) had the mirror gap (mode prefixes
+        procedure-only) and was fixed the same way (sibling-paths rule). The `$`-free body
+        `SELECT 1` keeps the plain `$$` delimiter. Files:
+        `internal/executor/expr.go` (production fix),
+        `internal/testport/pgdump_connsetup_test.go` (fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 159 section). Gates: gofmt OK;
+        `go build ./internal/...` OK; `TestPgGetFunctionIdentityArguments*` PASS;
+        full `./internal/executor` + `./internal/parser` PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.58s, not skipped); pgbench pre-commit
+        smoke on commit. **Next: slice 160** — a `TRANSFORM FOR TYPE` clause
+        (`protrftypes`, likely a feature gap), a non-`sql` LANGUAGE (e.g. `plpgsql`) body,
+        or a function returning a composite/`RECORD` type.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

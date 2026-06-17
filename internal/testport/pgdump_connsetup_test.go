@@ -1637,6 +1637,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function add_seven: %v", err)
 	}
 
+	// Slice 159: a function with a VARIADIC parameter of an ARRAY type. Every
+	// prior function slice (148–158) declared only fixed, by-value IN parameters
+	// (single unnamed `integer`); none exercised the VARIADIC argmode ('v') or an
+	// array parameter type. This drives two paths nothing had reached for a
+	// pg_proc dump:
+	//   (1) CREATE FUNCTION stores argModes[i]='v' for the trailing parameter and
+	//       the array type name `integer[]` (operators_ddl.go ~5519/5511); and
+	//   (2) pg_dump reconstructs the CREATE FUNCTION signature from
+	//       pg_get_function_arguments(oid), which goopg answers via
+	//       buildFunctionArguments — that function maps argmode 'v' to the
+	//       `VARIADIC ` prefix and emits the canonical array type name, yielding
+	//       `VARIADIC arr integer[]`.
+	// The body has no `$`, so pg_dump keeps the plain `$$` dollar-quote delimiter
+	// (contrast add_seven's `$1`, which escalates to `$_$`). Clean positive: the
+	// argmode/array plumbing already exists; this slice is the first end-to-end
+	// pg_dump assertion that a VARIADIC array parameter round-trips.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.sum_variadic(VARIADIC arr integer[]) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$"); err != nil {
+		t.Fatalf("create function sum_variadic: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2229,6 +2249,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "    LANGUAGE sql\n    AS $_$ SELECT 1; SELECT $1 + 7; $_$;") {
 			t.Errorf("pg_dump dropped/mangled add_seven's multi-statement body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 159 (asserted):** the VARIADIC-array function (sum_variadic) must
+		// round-trip its parameter as `VARIADIC arr integer[]`. pg_dump builds the
+		// signature from pg_get_function_arguments(oid); goopg answers via
+		// buildFunctionArguments, which maps argmode 'v' to the `VARIADIC ` prefix
+		// and emits the canonical array type name. A dropped VARIADIC prefix (arg
+		// rendered as a plain array IN param) or a mangled array type surfaces here.
+		// The `$`-free body keeps the plain `$$` delimiter. Real pg_dump 18.3 renders:
+		//   CREATE FUNCTION public.sum_variadic(VARIADIC arr integer[]) RETURNS integer
+		//       LANGUAGE sql
+		//       AS $$ SELECT 1 $$;
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.sum_variadic(VARIADIC arr integer[]) RETURNS integer") {
+			t.Errorf("pg_dump dropped/mangled the sum_variadic VARIADIC-array signature\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "    LANGUAGE sql\n    AS $$ SELECT 1 $$;") {
+			t.Errorf("pg_dump dropped/mangled sum_variadic's body\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the
