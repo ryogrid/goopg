@@ -5149,6 +5149,36 @@ nested` (`ROW(1, 'a' || 'b')`, exercising recursion through the BinaryOp arm) ca
 fixture gains a `pair integer DEFAULT (1, 2)` column and asserts the dumped block contains
 `DEFAULT ROW(1, 2)`.
 
+### Slice 180 — interval-literal column DEFAULT (sibling-path divergence closed)
+
+Continuing the same audit (which `parser.Expr` node kinds does `validateDefaultExpr` accept yet neither
+renderer handles?), the next live gap is `*IntervalLit`. `DEFAULT INTERVAL '1' day` on an `interval`
+column parses to a `*IntervalLit` (the parser's `interval '<n>' <unit>` shape; `interval` is an accepted
+column type). `validateDefaultExpr` accepts it (it rejects only column refs / subqueries /
+aggregate-or-SRF calls and recurses into operator/cast/funccall operands — every other node falls through
+to `return nil`), so the node reaches `pg_attrdef.adbin` (atthasdef=true). Neither
+`catalog.formatExprForAttrdef` nor the executor twin `executor.defaultExprToSQL` had a `*IntervalLit`
+arm, so it fell through to `fmt.Sprintf("%v", e)` — a Go pointer string that corrupts the dumped
+`DEFAULT`. Example that was broken:
+
+```sql
+CREATE TABLE public.defcol (..., span interval DEFAULT INTERVAL '1' day);  -- *IntervalLit
+```
+
+Fix: both renderers gain a `*IntervalLit` case that renders `INTERVAL '<value>' <unit>` (the value body
+escaped for embedded quotes, mirroring the StringConst arm). PG const-folds the literal to an `interval`
+`Const` and `pg_get_expr` deparses it as `'1 day'::interval`; goopg has no interval output function, so
+it re-emits the equivalent native `INTERVAL '<n>' <unit>` literal form its own parser produces — valid,
+re-parseable SQL that round-trips to the same node. Both forms are accepted by goopg's parser and are
+semantically identical, so the dump→restore→re-dump cycle is stable (after restore the cast form would
+be stored, re-dumping idempotently). The two twins are kept in lockstep (catalog sits below executor in
+the import graph, so they cannot share code). Display-only; default evaluation and routing are untouched.
+
+`catalog.TestFormatExprForAttrdefExpr` gains `interval lit` (`INTERVAL '1' day`) and `interval lit multi`
+(`INTERVAL '90' day`, verbatim value body) cases. The TAP `defcol` fixture gains a
+`span interval DEFAULT INTERVAL '1' day` column and asserts the dumped block contains
+`DEFAULT INTERVAL '1' day`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

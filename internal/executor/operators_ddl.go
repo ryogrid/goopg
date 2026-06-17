@@ -2484,6 +2484,13 @@ func defaultExprToSQL(e parser.Expr) string {
 			elems = append(elems, defaultExprToSQL(el))
 		}
 		return "ROW(" + strings.Join(elems, ", ") + ")"
+	case *parser.IntervalLit:
+		// `DEFAULT INTERVAL '1' day`. Mirror the catalog twin
+		// (catalog.formatExprForAttrdef, DU-002 slice 180); keep the two in sync so
+		// the dump path and the proargdefaults path render identically. goopg has no
+		// interval output function, so it re-emits the native `INTERVAL '<n>' <unit>`
+		// literal form (PG's pg_get_expr would print the equivalent `'<n> <unit>'::interval`).
+		return "INTERVAL '" + strings.ReplaceAll(v.Value, "'", "''") + "' " + v.Unit
 	}
 	return fmt.Sprintf("%v", e)
 }

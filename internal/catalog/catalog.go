@@ -7090,6 +7090,21 @@ func formatExprForAttrdef(e parser.Expr) string {
 			elems = append(elems, formatExprForAttrdef(el))
 		}
 		return "ROW(" + strings.Join(elems, ", ") + ")"
+	case *parser.IntervalLit:
+		// `DEFAULT INTERVAL '1' day` on an interval column. validateDefaultExpr
+		// rejects only column refs / subqueries / aggregate-or-SRF calls and
+		// accepts every other node, so the parsed *IntervalLit reaches
+		// pg_attrdef.adbin (atthasdef=true). Without this case it fell through to
+		// fmt.Sprintf("%v", e) — a Go pointer string — corrupting the DEFAULT
+		// clause pg_dump re-emits (DU-002 slice 180). PG const-folds the literal
+		// and pg_get_expr deparses it as `'<n> <unit>'::interval`; goopg has no
+		// interval output function, so it re-emits the equivalent native
+		// `INTERVAL '<n>' <unit>` literal form its own parser produces (the
+		// `interval '<N>' <unit>` shape) — valid, re-parseable SQL that
+		// round-trips to the same node. Mirror executor.defaultExprToSQL (the
+		// proargdefaults twin) so the dump path and the runtime path render
+		// identically.
+		return "INTERVAL '" + strings.ReplaceAll(v.Value, "'", "''") + "' " + v.Unit
 	}
 	return fmt.Sprintf("%v", e)
 }

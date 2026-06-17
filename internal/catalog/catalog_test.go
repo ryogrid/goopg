@@ -1234,6 +1234,20 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 			}},
 			"ROW(1, 'a' || 'b')",
 		},
+		{
+			// `DEFAULT INTERVAL '1' day` on an interval column parses to a
+			// *IntervalLit. goopg re-emits its native INTERVAL literal form
+			// (PG would print `'1 day'::interval`); both round-trip (DU-002 slice 180).
+			"interval lit",
+			&parser.IntervalLit{Value: "1", Unit: "day"},
+			"INTERVAL '1' day",
+		},
+		{
+			// Multi-count interval (`INTERVAL '90' day`) — the value body renders verbatim.
+			"interval lit multi",
+			&parser.IntervalLit{Value: "90", Unit: "day"},
+			"INTERVAL '90' day",
+		},
 	}
 	for _, tc := range cases {
 		if got := formatExprForAttrdef(tc.expr); got != tc.want {

@@ -884,7 +884,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// string — corrupting the dumped DEFAULT. Both twins now emit the ROW(…)
 	// form PG's ruleutils always prints for a RowExpr. The `pair integer` column
 	// guards the row-constructor path end-to-end.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3], grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END, pair integer DEFAULT (1, 2))"); err != nil {
+	//
+	// Slice 180: a column DEFAULT that is an interval literal (`DEFAULT INTERVAL
+	// '1' day`) parses to a *IntervalLit. validateDefaultExpr accepts it (it
+	// rejects only column refs / subqueries / aggregate-or-SRF calls), so the
+	// node reaches pg_attrdef.adbin. Before this slice neither renderer had a
+	// *IntervalLit arm, so it fell through to fmt.Sprintf("%v", e) — a Go pointer
+	// string — corrupting the dumped DEFAULT. Both twins now emit the native
+	// `INTERVAL '<n>' <unit>` literal form (PG's pg_get_expr would deparse the
+	// const-folded value as `'1 day'::interval`; both are valid, re-parseable SQL
+	// that round-trips). The `span interval` column guards the interval-literal
+	// path end-to-end.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3], grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END, pair integer DEFAULT (1, 2), span interval DEFAULT INTERVAL '1' day)"); err != nil {
 		t.Fatalf("create table defcol with function-call default: %v", err)
 	}
 
@@ -2355,6 +2366,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// corrupt Go pointer string. Assert the row constructor survives intact.
 			if !strings.Contains(block, "DEFAULT ROW(1, 2)") {
 				t.Errorf("pg_dump dropped/corrupted the row-constructor default; want %q in defcol block\n  block=%q", "DEFAULT ROW(1, 2)", block)
+			}
+			// **Slice 180 (asserted):** an interval-literal default. The `span`
+			// column carries `DEFAULT INTERVAL '1' day`, parsed as a *IntervalLit.
+			// validateDefaultExpr accepts it; both renderers now emit the native
+			// `INTERVAL '<n>' <unit>` form. Before the fix the node fell through to
+			// fmt.Sprintf("%v", e), so the dumped DEFAULT was a corrupt Go pointer
+			// string. Assert the interval literal survives intact.
+			if !strings.Contains(block, "DEFAULT INTERVAL '1' day") {
+				t.Errorf("pg_dump dropped/corrupted the interval-literal default; want %q in defcol block\n  block=%q", "DEFAULT INTERVAL '1' day", block)
 			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently

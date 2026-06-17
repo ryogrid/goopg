@@ -3921,9 +3921,38 @@ object support.
         (slice 177). Gates: gofmt OK; `go vet ./internal/catalog/ ./internal/executor/` clean;
         `go build ./internal/executor/` OK; `TestFormatExprForAttrdefExpr` + executor default tests PASS;
         `TestPort_PgDumpConnectionSetup` PASS (3.10s, not skipped); pgbench pre-commit smoke on commit.
-        **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition routing); or
-        column STORAGE/COMPRESSION dump fidelity (needs parser keywords); or `*CaseExpr` column DEFAULT
-        (`DEFAULT CASE WHEN true THEN 1 ELSE 0 END`) if still falling through both renderers.
+      - **PROGRESS 2026-06-17 (loops #146–147):** **DU-002 slices 178 (`*CaseExpr`) + 179 (`*RowExpr`)
+        LANDED** (commits `eb54ed51`, `6d34c910`). Same fall-through-corruption audit: `DEFAULT CASE
+        WHEN true THEN 1 ELSE 0 END` and `DEFAULT (1, 2)` reached `pg_attrdef.adbin` but neither renderer
+        had an arm, so they rendered as Go pointer strings. Both twins gained `*CaseExpr` (single-line
+        CASE form) and `*RowExpr` (`ROW(…)`, the form PG's ruleutils always prints) arms. See design-doc
+        Slice 178/179 sections.
+      - **PROGRESS 2026-06-17 (loop #148):** **DU-002 slice 180 (`*IntervalLit`) LANDED — interval-literal
+        column DEFAULT round-trips through pg_dump; sibling-path divergence closed.** Completes the
+        Expr-node fall-through audit's last realistic gap: `DEFAULT INTERVAL '1' day` on an `interval`
+        column parses to a `*IntervalLit`. `validateDefaultExpr` accepts it (it rejects only column refs /
+        subqueries / aggregate-or-SRF calls; every other node falls through to `return nil`), so the node
+        reaches `pg_attrdef.adbin`, but neither `catalog.formatExprForAttrdef` nor the executor twin
+        `executor.defaultExprToSQL` had a `*IntervalLit` arm → both fell through to `fmt.Sprintf("%v", e)`
+        (a Go pointer string), corrupting the dumped DEFAULT. **Fix:** both twins gain a `*IntervalLit`
+        case rendering `INTERVAL '<value>' <unit>` (value body escaped for embedded quotes); goopg has no
+        interval output function, so it re-emits its native INTERVAL literal form (PG's pg_get_expr would
+        deparse the const-folded value as `'1 day'::interval`; both are valid, re-parseable, round-tripping
+        SQL). Kept in lockstep (catalog below executor in import graph). Display-only; eval/routing
+        untouched. Files: `internal/catalog/catalog.go` (+1 case), `internal/executor/operators_ddl.go`
+        (+1 case, twin), `internal/catalog/catalog_test.go` (`interval lit` + `interval lit multi` cases),
+        `internal/testport/pgdump_connsetup_test.go` (`defcol` gains `span interval DEFAULT INTERVAL '1'
+        day` + assertion `DEFAULT INTERVAL '1' day`), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 180 section). Gates: gofmt OK; `go vet ./internal/catalog/ ./internal/executor/` clean;
+        `go build ./internal/executor/` OK; `TestFormatExprForAttrdefExpr` PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (3.17s, not skipped); pgbench pre-commit smoke on commit.
+        **Next:** the distinct fall-through-corruption audit for column DEFAULTs is now near-exhausted —
+        remaining `parser.Expr` kinds (IsNullExpr/IsBoolExpr/IsDistinctFromExpr/CollateExpr/InExpr) are
+        contrived as column defaults. Faithfulness-only items remain (FuncCall `row`/COALESCE/NULLIF/
+        GREATEST/LEAST render lowercase vs PG's uppercase — round-trips fine). Higher-value next steps:
+        deferred MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition routing); or close the
+        `validateDefaultExpr` array/row/CASE/interval-element recursion gap (executor semantic change —
+        needs its own gates).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
