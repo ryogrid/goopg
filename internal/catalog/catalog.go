@@ -6940,6 +6940,24 @@ func formatExprForAttrdef(e parser.Expr) string {
 			return "true"
 		}
 		return "false"
+	case *parser.FuncCall:
+		// Function-call defaults (`DEFAULT now()`, `DEFAULT gen_random_uuid()`)
+		// are accepted by validateDefaultExpr, so the parsed *FuncCall reaches
+		// pg_attrdef.adbin. Without this case it fell through to fmt.Sprintf("%v")
+		// — a Go pointer string — corrupting the DEFAULT clause pg_dump re-emits
+		// (DU-002 slice 173). Mirror executor.defaultExprToSQL so the dump path
+		// (catalog) and the proargdefaults path (executor) agree: render
+		// `[schema.]name(arg, …)` with each argument recursively rendered. pg_dump
+		// runs with search_path='' so a schema-qualified call survives restore.
+		args := make([]string, 0, len(v.Args))
+		for _, a := range v.Args {
+			args = append(args, formatExprForAttrdef(a))
+		}
+		name := v.Name.Name
+		if v.Name.Schema != "" {
+			name = v.Name.Schema + "." + name
+		}
+		return name + "(" + strings.Join(args, ", ") + ")"
 	}
 	return fmt.Sprintf("%v", e)
 }

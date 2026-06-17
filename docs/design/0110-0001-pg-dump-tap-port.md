@@ -4938,6 +4938,41 @@ purely-local `own_col boolean` survives in the child's column list, and (3) none
 columns — including the merged `shared` — are re-emitted there. An ordering regression would flip
 the two parents; a merge/`Inherited` regression would re-emit `shared`/`a_only`/`b_only`.
 
+### Slice 173 — function-call column DEFAULT round-trip (real divergence fixed)
+
+The partition/inheritance slices (167–172) covered table *relationships*. Slice 173 returns to
+column-level fidelity: a column whose `DEFAULT` is a **function call** rather than a literal.
+
+```sql
+CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now());
+```
+
+`validateDefaultExpr` (`operators_ddl_partition.go`) accepts any non-aggregate, non-SRF `*FuncCall`
+in a DEFAULT, so the parsed call lands in `catalog.Column.DefaultExpr` and surfaces in
+`pg_attrdef.adbin` (the column carries `atthasdef=true`). pg_dump reads the default back via
+`pg_get_expr(adbin)` — a goopg pass-through — and re-emits it inline as `DEFAULT <expr>`.
+
+**The divergence.** The catalog-side renderer `formatExprForAttrdef` (`catalog.go`, the producer of
+`pg_attrdef.adbin`) handled only literal constants (`IntegerConst`/`NumericConst`/`StringConst`/
+`NullConst`/`BooleanConst`). A `*FuncCall` fell through to the `fmt.Sprintf("%v", e)` default arm,
+which prints a Go pointer/struct string (e.g. `&{0 {0  now} [] …}`). pg_dump therefore re-emitted a
+**corrupt** DEFAULT clause that fails to restore — a silent, restore-breaking loss. This was a
+sibling-path bug: the *other* default renderer, `executor.defaultExprToSQL` (used for
+`proargdefaults`), already rendered `FuncCall`/`CastExpr`/`UnaryOp`, but the catalog twin on the
+pg_dump path did not (the two cannot share code — `catalog` is below `executor` in the import graph).
+
+**Fix.** `formatExprForAttrdef` gains a `*parser.FuncCall` case mirroring `defaultExprToSQL`: it
+renders `[schema.]name(arg, …)`, recursively rendering each argument through itself (so literal
+arguments like `lpad('x', 5)` quote/pass through correctly). `now()` → `now()`; a schema-qualified
+call survives pg_dump's `search_path=''`. Routing and default *evaluation* are untouched — this is a
+display-only renderer feeding the dump path.
+
+The unit test `catalog.TestFormatExprForAttrdefFuncCall` pins the rendering (bare call,
+schema-qualified call, literal args, and the pre-existing literal branches as regression guards). The
+TAP test adds the `defcol` fixture and asserts both `DEFAULT now()` (the fix) and `DEFAULT 0` (the
+literal branch through the same dump path) survive inside the dumped `defcol` block. A render
+regression on the FuncCall would surface as a `0x…`/`&{…}` token instead of `now()`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

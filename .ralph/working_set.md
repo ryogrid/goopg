@@ -1,32 +1,33 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 172 (loop #139) — multi-parent legacy inheritance
-(`INHERITS (a, b)`) round-trips through pg_dump. CLEAN POSITIVE (verified, no fix
-needed): pinned as a regression guard on the slice-170 machinery.
+Last landed: DU-002 slice 173 (loop #140) — function-call column DEFAULT
+(`DEFAULT now()`) round-trips through pg_dump. REAL DIVERGENCE FIXED.
 
-Why it already works: the INHERITS column-merge dedup keeps a column present in
-both parents once (`shared`; M0097-0046, with the "merging multiple inherited
-definitions" notice); the slice-170 marker loop iterates the FULL merged column
-set so EVERY inherited column gets Inherited=true (attislocal=false), so pg_dump
-omits them; pg_inherits VirtualRows emits one row per parent with inhseqno=i+1
-from the ordered InheritsParentOIDs, so pg_dump re-emits the parents in the SAME
-declaration order.
+Bug: `formatExprForAttrdef` (catalog.go — the producer of `pg_attrdef.adbin`,
+which pg_dump reads back via pg_get_expr) handled ONLY literal constants; a
+`*parser.FuncCall` fell through to `fmt.Sprintf("%v", e)`, printing a Go
+pointer/struct string. So a `DEFAULT now()` column dumped a corrupt, restore-
+breaking DEFAULT clause. Sibling-path bug: `executor.defaultExprToSQL` (the
+proargdefaults renderer) already handled FuncCall, but the catalog twin on the
+pg_dump path did not (can't share code — catalog is below executor in imports).
 
-Fixture: minh_a(shared,a_only) + minh_b(shared,b_only) →
-minh_child(own_col) INHERITS (minh_a, minh_b). 3 assertions: (1) ordered
-`INHERITS (public.minh_a, public.minh_b)` clause, (2) local `own_col boolean`
-survives in the child block, (3) `shared`/`a_only`/`b_only` NOT re-emitted there.
+Fix: added a `*parser.FuncCall` case to `formatExprForAttrdef` mirroring
+`defaultExprToSQL` — renders `[schema.]name(arg, …)`, recursing on args.
+Display-only; routing + default evaluation untouched.
 
-Files: internal/testport/pgdump_connsetup_test.go (fixture + assertions),
-docs/design/0110-0001-pg-dump-tap-port.md (slice 172 section), .ralph/fix_plan.md
-(loop #139 note under M0110-0001).
-Gates: gofmt clean; go vet ./internal/testport/ clean;
-TestPort_PgDumpConnectionSetup PASS (2.56s, NOT skipped); pgbench pre-commit smoke
-on commit (.githooks/pre-commit).
+Files: internal/catalog/catalog.go (FuncCall case in formatExprForAttrdef),
+internal/catalog/catalog_test.go (TestFormatExprForAttrdefFuncCall),
+internal/testport/pgdump_connsetup_test.go (defcol fixture + 2 assertions),
+docs/design/0110-0001-pg-dump-tap-port.md (slice 173), .ralph/fix_plan.md.
+Gates: gofmt OK; go vet ./internal/testport/ clean; go build ./internal/... OK;
+TestFormatExprForAttrdefFuncCall + full catalog suite PASS;
+TestPort_PgDumpConnectionSetup PASS (2.72s, not skipped); pgbench pre-commit
+smoke on commit (.githooks/pre-commit).
 
-Next (slice 173 candidates): (1) dedicated MINVALUE/MAXVALUE keyword-AST-node —
-parser collapses keyword `MINVALUE` vs text-RANGE literal `'MINVALUE'` into the
-SAME StringConst{Value:"MINVALUE"}, so a literal text bound misrenders as the
-unbounded sentinel (HIGHER RISK: touches partition routing compareBoundToKey +
-catalog string bound representation; rare edge case). (2) column-level
-STORAGE/COMPRESSION dump fidelity (needs parser keywords). See deferral ledger.
+Next (slice 174 candidates): (1) CURRENT_TIMESTAMP keyword default — PG stores
+it in adbin WITHOUT parens (`CURRENT_TIMESTAMP`), but goopg parses it as a
+FuncCall{Name:"current_timestamp"} → would now render `current_timestamp()`
+(parens added); needs a keyword-vs-call distinction. (2) function-call default
+with literal args end-to-end (`DEFAULT lpad('x',5)` — unit-tested but no e2e).
+(3) deferred MINVALUE/MAXVALUE keyword-AST-node (HIGHER RISK: partition routing).
+(4) column STORAGE/COMPRESSION dump fidelity (needs parser keywords).

@@ -1062,3 +1062,43 @@ func TestPgInheritsEmitsLegacyInheritanceRows(t *testing.T) {
 		}
 	}
 }
+
+// TestFormatExprForAttrdefFuncCall guards the pg_attrdef.adbin renderer for
+// function-call column defaults (DU-002 slice 173). Before the fix a *FuncCall
+// fell through to fmt.Sprintf("%v", e) — a Go pointer string — so a
+// `DEFAULT now()` column dumped a corrupt DEFAULT clause. The renderer must emit
+// the call form (recursively rendering literal arguments) so pg_dump round-trips
+// it. Literal cases are included as regression guards on the existing branches.
+func TestFormatExprForAttrdefFuncCall(t *testing.T) {
+	cases := []struct {
+		name string
+		expr parser.Expr
+		want string
+	}{
+		{"now()", &parser.FuncCall{Name: parser.ObjectName{Name: "now"}}, "now()"},
+		{
+			"schema-qualified",
+			&parser.FuncCall{Name: parser.ObjectName{Schema: "pg_catalog", Name: "now"}},
+			"pg_catalog.now()",
+		},
+		{
+			"literal args",
+			&parser.FuncCall{
+				Name: parser.ObjectName{Name: "lpad"},
+				Args: []parser.Expr{
+					&parser.StringConst{Value: "x"},
+					&parser.IntegerConst{Value: 5},
+				},
+			},
+			"lpad('x', 5)",
+		},
+		{"int literal", &parser.IntegerConst{Value: 42}, "42"},
+		{"string literal", &parser.StringConst{Value: "pending"}, "'pending'"},
+		{"bool literal", &parser.BooleanConst{Value: true}, "true"},
+	}
+	for _, tc := range cases {
+		if got := formatExprForAttrdef(tc.expr); got != tc.want {
+			t.Errorf("%s: formatExprForAttrdef = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

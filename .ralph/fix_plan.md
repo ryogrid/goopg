@@ -3816,6 +3816,27 @@ object support.
         to the SAME `StringConst{Value:"MINVALUE"}` in the parser, so the literal misrenders as the
         unbounded sentinel — higher-risk, touches partition routing comparison), or column-level
         STORAGE/COMPRESSION dump fidelity (needs parser keywords).
+      - **PROGRESS 2026-06-17 (loop #140):** **DU-002 slice 173 LANDED — real divergence
+        fixed.** A column DEFAULT that is a **function call** (`DEFAULT now()`) corrupted the dump.
+        `validateDefaultExpr` accepts a non-aggregate/non-SRF `*FuncCall`, so the parsed call lands
+        in `Column.DefaultExpr` and surfaces in `pg_attrdef.adbin` (atthasdef=true); pg_dump re-emits
+        it inline via `pg_get_expr(adbin)` (goopg pass-through). But the catalog-side renderer
+        `formatExprForAttrdef` (the producer of adbin) handled ONLY literal constants — a `*FuncCall`
+        fell through to `fmt.Sprintf("%v", e)`, printing a Go pointer/struct string, so the dumped
+        `DEFAULT` clause was corrupt and restore-breaking. Sibling-path bug: `executor.defaultExprToSQL`
+        (the proargdefaults renderer) already handled FuncCall, but the catalog twin on the pg_dump
+        path did not (cannot share code — catalog is below executor in the import graph). **Fix:**
+        `formatExprForAttrdef` gains a `*parser.FuncCall` case mirroring `defaultExprToSQL` —
+        `[schema.]name(arg, …)` with each arg recursively rendered. Display-only; routing + default
+        evaluation untouched. Files: `internal/catalog/catalog.go` (FuncCall case),
+        `internal/catalog/catalog_test.go` (`TestFormatExprForAttrdefFuncCall`),
+        `internal/testport/pgdump_connsetup_test.go` (`defcol` fixture: `DEFAULT now()` + literal
+        `DEFAULT 0`; assertions both survive), `docs/design/0110-0001-pg-dump-tap-port.md` (slice 173).
+        Gates: gofmt OK; `go vet ./internal/testport/` clean; `go build ./internal/...` OK;
+        `TestFormatExprForAttrdefFuncCall` + full catalog suite PASS; `TestPort_PgDumpConnectionSetup`
+        PASS (2.72s, not skipped); pgbench pre-commit smoke on commit. **Next:** function-call defaults
+        with literal args / `CURRENT_TIMESTAMP` keyword form (stored without parens in PG); or the
+        deferred MINVALUE/MAXVALUE keyword-AST-node slice; or column STORAGE/COMPRESSION dump fidelity.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

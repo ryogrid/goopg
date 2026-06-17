@@ -814,6 +814,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create multi-parent inheritance child minh_child: %v", err)
 	}
 
+	// Slice 173: a column DEFAULT that is a FUNCTION CALL (`DEFAULT now()`) must
+	// round-trip. validateDefaultExpr accepts a non-aggregate, non-SRF *FuncCall,
+	// so the parsed call lands in catalog.Column.DefaultExpr and surfaces in
+	// pg_attrdef.adbin (atthasdef=true). pg_dump reads it back via
+	// pg_get_expr(adbin) (a goopg pass-through) and re-emits it inline as
+	// `DEFAULT <expr>`. The catalog-side renderer formatExprForAttrdef handled
+	// only literal constants; a *FuncCall fell through to fmt.Sprintf("%v", e) — a
+	// Go pointer string — so the dumped DEFAULT was corrupt (restore-breaking).
+	// formatExprForAttrdef now renders the call form (mirroring
+	// executor.defaultExprToSQL, the sibling proargdefaults renderer). A plain
+	// literal default (`status integer DEFAULT 0`) on the same table guards the
+	// pre-existing literal branch through the same dump path.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now())"); err != nil {
+		t.Fatalf("create table defcol with function-call default: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -2200,6 +2216,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				if strings.Contains(block, inheritedCol) {
 					t.Errorf("pg_dump re-emitted inherited column %q in minh_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
 				}
+			}
+		}
+		// **Slice 173 (asserted):** function-call column DEFAULT. defcol carries a
+		// `created timestamptz DEFAULT now()` column (FuncCall default) and a
+		// `status integer DEFAULT 0` column (literal default). Before the fix the
+		// FuncCall rendered as a Go pointer string in pg_attrdef.adbin, so the
+		// dumped DEFAULT clause was corrupt; formatExprForAttrdef now renders the
+		// call form. Assert both defaults survive inside the defcol block (the
+		// literal `DEFAULT 0` guards the pre-existing branch; `DEFAULT now()` guards
+		// the fix). A render regression on the FuncCall would surface as a
+		// `0x...`/`&{...}` token instead of `now()`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.defcol (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.defcol\n  full stdout=%q", res.Stdout)
+		}
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.defcol ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "DEFAULT now()") {
+				t.Errorf("pg_dump dropped/corrupted the function-call default; want %q in defcol block\n  block=%q", "DEFAULT now()", block)
+			}
+			if !strings.Contains(block, "DEFAULT 0") {
+				t.Errorf("pg_dump dropped the literal default; want %q in defcol block\n  block=%q", "DEFAULT 0", block)
 			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
