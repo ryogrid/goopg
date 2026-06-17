@@ -338,11 +338,21 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			case "internal", "c":
 				procost = "1"
 			}
+			// An explicit COST n on CREATE FUNCTION overrides the
+			// language-derived default; previously the parser discarded it, so
+			// dumpFunc never saw the non-default cost (silent divergence).
+			if r.Cost != "" {
+				procost = r.Cost
+			}
 			// prorows: PG's CREATE FUNCTION default — 1000 estimated result
-			// rows for set-returning functions, 0 for everything else.
+			// rows for set-returning functions, 0 for everything else. An
+			// explicit ROWS n (set-returning functions only) overrides it.
 			prorows := "0"
 			if r.ReturnsSet {
 				prorows = "1000"
+			}
+			if r.Rows != "" {
+				prorows = r.Rows
 			}
 			// proparallel: PG's CREATE FUNCTION default is 'u' (unsafe);
 			// PARALLEL SAFE/RESTRICTED record 's'/'r'. dumpFunc emits

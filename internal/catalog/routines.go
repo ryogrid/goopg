@@ -45,6 +45,8 @@ type Routine struct {
 	Strict          bool   // STRICT / CALLED ON NULL INPUT
 	Volatile        string // "v"=volatile (default), "s"=stable, "i"=immutable
 	Parallel        string // proparallel: "u"=unsafe (default), "s"=safe, "r"=restricted
+	Cost            string // procost: COST n override; "" = language default (1 internal/C, else 100)
+	Rows            string // prorows: ROWS n override for SRFs; "" = default (1000 for SRF, 0 otherwise)
 	SecurityDefiner bool   // SECURITY DEFINER
 	Leakproof       bool   // LEAKPROOF
 	IsProcedure     bool   // true when created via CREATE PROCEDURE

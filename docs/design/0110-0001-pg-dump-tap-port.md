@@ -4170,6 +4170,43 @@ unit test (`TestParseCreateFunctionParallel`) pins the four marker mappings.
 Procedures keep `'u'` (PG rejects PARALLEL on CREATE PROCEDURE), so the procedure
 path is unchanged.
 
+### Slice 151 — explicit `COST`/`ROWS` round-trip (real divergence fixed)
+
+Same shape as slice 150. The `pg_proc` virtual view derived `procost` purely from
+the language (1 for internal/C, 100 otherwise) and `prorows` purely from
+`ReturnsSet` (1000 for SRFs, else 0). But goopg's CREATE FUNCTION parser *parsed*
+the `COST n` / `ROWS n` clauses and **discarded the numeric** in
+`consumeFunctionAttribute` — so a `CREATE FUNCTION … COST 50` was silently reset
+to the language default on dump. A real round-trip divergence.
+
+This slice threads both values end-to-end:
+
+- **Parser** (`function.go`): new `CreateFunctionStmt.Cost`/`.Rows` (raw literal
+  text; `""` = no clause) captured from `COST n`/`ROWS n` in the attribute switch
+  (moved out of the consume-and-discard path).
+- **Catalog** (`routines.go`): new `Routine.Cost`/`.Rows` fields.
+- **Executor** (`operators_ddl.go`): `execCreateFunction` stores `s.Cost`/`s.Rows`.
+- **Virtual view** (`pg_proc_view.go`): `procost`/`prorows` use the stored override
+  when non-empty, else the language/SRF default.
+- **Sibling deparse** (`expr.go`): `pg_get_functiondef` emits ` COST n` when the
+  stored cost differs from the language default, and ` ROWS n` for SRFs when the
+  value is non-default (kept in sync per the sibling-paths rule).
+
+`dumpFunc` (`pg_dump.c:13556`) emits ` COST n` when `procost` differs from the
+language default and ` ROWS n` (`pg_dump.c:13571`) when `proretset='t'` and
+`prorows` is neither 0 nor 1000, so real pg_dump 18.3 renders:
+
+```
+CREATE FUNCTION public.add_four(integer) RETURNS integer
+    LANGUAGE sql COST 50
+    AS $_$ SELECT $1 + 4 $_$;
+```
+
+The TAP test creates `add_four … COST 50` and asserts the exact one-line
+`LANGUAGE sql COST 50` / `AS $_$ SELECT $1 + 4 $_$;` fragment. A parser unit test
+(`TestParseCreateFunctionCostRows`) pins COST/ROWS capture (including a fractional
+`COST 0.5` and a combined `COST 0.5 ROWS 200`).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

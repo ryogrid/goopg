@@ -1510,6 +1510,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function add_three: %v", err)
 	}
 
+	// Slice 151: a fourth user function carrying an explicit COST 50, so the dump
+	// exercises the pg_proc virtual view's `procost` column at a NON-default value
+	// (LANGUAGE sql's default cost is 100). goopg previously discarded the COST/ROWS
+	// numeric entirely (the parser parsed then dropped it; the view hardcoded the
+	// language-derived default), so an explicit COST/ROWS was silently reset on
+	// dump — a real divergence. dumpFunc (pg_dump.c:13556) appends ` COST 50` inline
+	// after `LANGUAGE sql` when procost differs from the language default.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.add_four(integer) RETURNS integer LANGUAGE sql COST 50 AS $$ SELECT $1 + 4 $$"); err != nil {
+		t.Fatalf("create function add_four: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -1969,6 +1980,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "    LANGUAGE sql PARALLEL SAFE\n    AS $_$ SELECT $1 + 3 $_$;") {
 			t.Errorf("pg_dump dropped/mangled add_three's PARALLEL SAFE clause or body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 151 (asserted):** the COST 50 function (add_four) must round-trip.
+		// procost is emitted by dumpFunc (pg_dump.c:13556) inline after the LANGUAGE
+		// line whenever it differs from the language default (100 for sql), so real
+		// pg_dump 18.3 renders:
+		//   CREATE FUNCTION public.add_four(integer) RETURNS integer
+		//       LANGUAGE sql COST 50
+		//       AS $_$ SELECT $1 + 4 $_$;
+		// Before this slice the view hardcoded procost=100 (the language default), so
+		// dumpFunc emitted nothing and the explicit COST was silently lost. Assert the
+		// exact one-line LANGUAGE/COST fragment.
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.add_four(integer) RETURNS integer") {
+			t.Errorf("pg_dump dropped/mangled the add_four signature\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "    LANGUAGE sql COST 50\n    AS $_$ SELECT $1 + 4 $_$;") {
+			t.Errorf("pg_dump dropped/mangled add_four's COST clause or body\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

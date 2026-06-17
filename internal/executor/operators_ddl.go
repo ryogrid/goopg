@@ -5574,6 +5574,8 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		Strict:          s.Strict,
 		Volatile:        volatile,
 		Parallel:        s.Parallel,
+		Cost:            s.Cost,
+		Rows:            s.Rows,
 		SecurityDefiner: s.SecurityDefiner,
 		Leakproof:       s.Leakproof,
 	}

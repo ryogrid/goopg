@@ -1931,6 +1931,8 @@ type CreateFunctionStmt struct {
 	IsReturnForm    bool   // PG14 RETURN expr body (no AS keyword, body stored as "SELECT expr")
 	Window          bool   // WINDOW attribute — marks function as a window function
 	Parallel        string // proparallel: "u"=unsafe (default), "s"=safe, "r"=restricted
+	Cost            string // procost: planner per-row cost override (COST n); "" = language default
+	Rows            string // prorows: SRF result-row estimate override (ROWS n); "" = default
 }
 
 // AlterFunctionStmt — `ALTER FUNCTION name([argtypes]) attribute ...`

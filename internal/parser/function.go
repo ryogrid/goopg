@@ -210,6 +210,24 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 				case "called":
 					// CALLED ON NULL INPUT — explicit not-strict
 					stmt.Strict = false
+				case "cost":
+					// COST <n> — planner per-row cost. Capture the numeric
+					// literal verbatim so the pg_proc view / dump can re-emit
+					// the non-default value (previously parsed-then-discarded).
+					p.advance()
+					if p.cur().Kind == TokenIntLit || p.cur().Kind == TokenNumericLit {
+						stmt.Cost = p.cur().Value
+						p.advance()
+					}
+					continue
+				case "rows":
+					// ROWS <n> — set-returning-function result-row estimate.
+					p.advance()
+					if p.cur().Kind == TokenIntLit || p.cur().Kind == TokenNumericLit {
+						stmt.Rows = p.cur().Value
+						p.advance()
+					}
+					continue
 				}
 			} else if cur.Kind == TokenKeyword && cur.Keyword == KwNot {
 				// NOT LEAKPROOF

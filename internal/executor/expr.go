@@ -11445,6 +11445,28 @@ func buildFunctionDef(r *catalog.Routine) string {
 		sb.WriteString(" PARALLEL RESTRICTED\n")
 	}
 
+	// COST — emitted only when non-default, matching pg_get_functiondef
+	// (ruleutils.c): default is 1 for internal/C, 100 otherwise.
+	if r.Cost != "" {
+		defaultCost := "100"
+		switch strings.ToLower(r.Language) {
+		case "internal", "c":
+			defaultCost = "1"
+		}
+		if r.Cost != defaultCost {
+			sb.WriteString(" COST ")
+			sb.WriteString(r.Cost)
+			sb.WriteByte('\n')
+		}
+	}
+
+	// ROWS — set-returning functions only; omitted at the 1000 default.
+	if r.ReturnsSet && r.Rows != "" && r.Rows != "0" && r.Rows != "1000" {
+		sb.WriteString(" ROWS ")
+		sb.WriteString(r.Rows)
+		sb.WriteByte('\n')
+	}
+
 	// Body
 	body := r.Body
 	if r.BeginAtomic {

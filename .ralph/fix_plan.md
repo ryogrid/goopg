@@ -3252,6 +3252,34 @@ object support.
         151** — a fresh pg_dump catalog-surface gap (e.g. SECURITY DEFINER /
         LEAKPROOF function clauses, a set-returning function's `ROWS` clause, or a
         `CREATE PROCEDURE` / prokind='p' round-trip).
+      - **PROGRESS 2026-06-17 (loop #116):** **DU-002 slice 151 LANDED** —
+        explicit `COST`/`ROWS` now round-trip; **another real divergence fixed**.
+        The `pg_proc` virtual view derived `procost` purely from language (1 for
+        internal/C, else 100) and `prorows` purely from `ReturnsSet` (1000 SRF /
+        0), and the CREATE FUNCTION parser *parsed* `COST n` / `ROWS n` then
+        **discarded the numeric** in `consumeFunctionAttribute` — so a
+        `CREATE FUNCTION … COST 50` was silently reset to the language default on
+        dump. Threaded both end-to-end: `CreateFunctionStmt.Cost/.Rows` (new, raw
+        literal text, ""=no clause), `Routine.Cost/.Rows` (new), `execCreateFunction`
+        stores them, the view emits the override when non-empty else the default,
+        and the sibling `pg_get_functiondef` deparser emits ` COST n`/` ROWS n` at
+        non-default values. `dumpFunc` (`pg_dump.c:13556/13571`) emits ` COST n`
+        when procost != language default and ` ROWS n` when proretset='t' and
+        prorows ∉ {0,1000}. Test adds `public.add_four(integer) … COST 50` and
+        asserts the exact one-line `LANGUAGE sql COST 50` /
+        `AS $_$ SELECT $1 + 4 $_$;` fragment; `TestParseCreateFunctionCostRows`
+        pins COST/ROWS capture (incl. fractional `COST 0.5` and `COST 0.5 ROWS
+        200`). Files: `internal/parser/{ast,function,function_test}.go`,
+        `internal/catalog/routines.go`,
+        `internal/executor/{operators_ddl,expr}.go`,
+        `internal/initdb/pg_proc_view.go`,
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK; `go build
+        ./internal/...` OK; `go vet ./internal/executor/` clean; parser + catalog
+        + initdb tests PASS; `TestPort_PgDumpConnectionSetup` PASS (2.62s, not
+        skipped); pgbench pre-commit smoke on commit. **Next: slice 152** — a
+        fresh pg_dump catalog-surface gap (SECURITY DEFINER / LEAKPROOF clauses,
+        an SRF `ROWS` *round-trip*, or a `CREATE PROCEDURE` / prokind='p' dump).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
