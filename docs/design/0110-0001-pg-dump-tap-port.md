@@ -5393,6 +5393,36 @@ inside each compound form (12 cases); `TestDefaultExprAcceptsConstantCompounds` 
 over-rejection by re-accepting the constant-only compound DEFAULTs the `defcol` fixture relies on.
 Validation-only: no change to how a valid DEFAULT is stored or evaluated.
 
+### Slice 187 — populate `pg_collation` virtual rows (built-in collations)
+
+The `pg_collation` virtual view (OID 3456) was registered as a stub whose `VirtualRows`
+returned `nil`, so `SELECT * FROM pg_collation`, psql `\dO`, and any collation-OID join
+saw an empty relation — a clear divergence from PostgreSQL, which always has the BKI-pinned
+built-in collations present. This is also the prerequisite for resolving a column's
+`attcollation` OID back to a name (the eventual per-column `COLLATE` round-trip work the
+parser currently discards at `internal/parser/ddl.go` — column `COLLATE` is consumed and
+ignored).
+
+The fix populates `VirtualRows` with the 7 built-in collations from PG18's
+`pg_collation.dat`: `default` (100), `C` (950), `POSIX` (951), `ucs_basic` (962),
+`unicode` (963), `pg_c_utf8` (811), `pg_unicode_fast` (6411). All are
+`collnamespace = 11` (pg_catalog), `collowner = 10` (bootstrap superuser),
+`collisdeterministic = t`, `collicurules = NULL`. libc rows (`C`, `POSIX`) carry
+`collcollate`/`collctype`; builtin/ICU rows carry `colllocale` and (for builtin) a
+`collversion` of `1`. These mirror initdb's `bootstrapPgCollationTuples` seed (the on-disk
+heap a PG standby reads); the values are duplicated in `internal/catalog/catalog.go`
+because the catalog package cannot import initdb (import cycle).
+
+All 7 rows are BKI-pinned (OID < `FirstNormalObjectId` 16384), so pg_dump skips them —
+this slice does not change any pg_dump fixture output. Its value is catalog-query parity
+(`\dO`) and unblocking future user-collation / per-column `COLLATE` work. As with every
+other virtual-catalog text column in goopg, an unset (NULL in PG) text field is rendered as
+`""`; the executor's `TypedVirtualCell` does not distinguish a text NULL from an empty
+string (a pre-existing, system-wide limitation of the `[][]string` virtual-row layer).
+
+`TestPgCollationVirtualRows` (`internal/catalog/pg_collation_virtual_test.go`) pins the row
+count (7), the 12-column width, and the full per-OID value vector against `pg_collation.dat`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

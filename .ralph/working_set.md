@@ -1,32 +1,28 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 186 (loop #154) — closed the `validateDefaultExpr`
-compound-expression recursion gap (column-DEFAULT validation correctness).
+Last landed: DU-002 slice 187 (loop #155) — populated the `pg_collation` virtual
+view (OID 3456) with the 7 built-in collations.
 
-`validateDefaultExpr` (internal/executor/operators_ddl_partition.go) rejects
-column refs / aggregates / subqueries / SRFs in a DEFAULT but only recursed into
-FuncCall args, BinaryOp, UnaryOp, CastExpr. An offending leaf hidden inside a
-compound node (ARRAY[…], CASE, row (a,b), IN-list, IS NULL, IS DISTINCT FROM,
-COLLATE, subscript, EXTRACT) slipped through → goopg accepted DEFAULTs PG rejects
-(42P17/42803/0A000). The defcol fixture (slice 181) round-trips exactly these
-compound shapes, which surfaced the gap.
+The view's `VirtualRows` was a `return nil` stub, so `SELECT * FROM pg_collation` /
+psql `\dO` / collation-OID joins saw an empty relation (divergence from PG).
+Filled it with `default`(100), `C`(950), `POSIX`(951), `ucs_basic`(962),
+`unicode`(963), `pg_c_utf8`(811), `pg_unicode_fast`(6411) from PG18's
+pg_collation.dat (collnamespace=11, collowner=10, collisdeterministic=t,
+collicurules=NULL; libc rows carry collcollate/collctype, builtin/ICU rows carry
+colllocale + collversion=1 for builtin). Mirrors initdb's
+bootstrapPgCollationTuples seed; duplicated in catalog.go (cannot import initdb —
+cycle). All OIDs < 16384 → pg_dump skips them, so no fixture output change; value
+is \dO parity + prerequisite for per-column COLLATE round-trip.
 
-Fix: added recursion arms for ArrayConstructorExpr, RowExpr, CaseExpr (Operand +
-each WHEN/THEN + ELSE), InExpr (Operand + List; populated Subquery → subquery
-rejection), IsNullExpr, IsBoolExpr, IsDistinctFromExpr, CollateExpr,
-ArraySubscriptExpr, ExtractExpr; folded ExistsExpr + ArraySubqueryExpr into the
-existing SubqueryExpr rejection arm. Validation-only (no change to how a valid
-DEFAULT is stored/evaluated).
+Files: internal/catalog/catalog.go (pgCollation.VirtualRows),
+internal/catalog/pg_collation_virtual_test.go (NEW — TestPgCollationVirtualRows),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 187), .ralph/fix_plan.md (loop-155).
+Gates: gofmt OK; go build ./... clean; ./internal/catalog/ PASS; new test PASS;
+pgbench pre-commit smoke on commit.
 
-Files: internal/executor/operators_ddl_partition.go,
-internal/executor/default_validate_test.go (NEW — TestDefaultExprRejectsNestedColumnRefs
-12 cases + TestDefaultExprAcceptsConstantCompounds over-rejection guard),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 186), .ralph/fix_plan.md (loop-154).
-Gates: gofmt OK; go build ./... clean; full ./internal/executor/ PASS (1.38s);
-new tests PASS; pgbench pre-commit smoke on commit.
-
-Next (slice 187 candidates): (1) deferred MINVALUE/MAXVALUE keyword-AST-node slice
-(HIGHER RISK: partition routing). (2) per-column COLLATE round-trip — parser
-currently IGNORES column COLLATE (ddl.go:2446); needs pg_collation population
-(VirtualRows returns nil today) so pg_dump resolves attcollation OID → name.
-(3) attfdwoptions (foreign-table only, NULL today — needs RELKIND_FOREIGN_TABLE).
+Next (slice 188 candidates): (1) per-column COLLATE round-trip — now unblocked on
+OID-resolution side; capture column COLLATE in parser (internal/parser/ddl.go:2448
+currently discards it) → store attcollation in pg_attribute heap (heap re-sync, see
+[[pg_attribute_alter_needs_heap_resync]]) → pg_dump emits COLLATE when attcollation
+≠ typcollation. (2) MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition
+routing). (3) attfdwoptions (foreign-table only, NULL today).

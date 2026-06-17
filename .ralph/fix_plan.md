@@ -4114,6 +4114,24 @@ object support.
         **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition routing); or
         per-column `COLLATE` round-trip (needs `pg_collation` population so pg_dump resolves the OID); or
         attfdwoptions (foreign-table only, NULL today).
+      - **PROGRESS 2026-06-17 (loop #155):** **DU-002 slice 187 LANDED — populated the
+        `pg_collation` virtual view with the 7 built-in collations.** The view (OID 3456) was a
+        `VirtualRows → nil` stub, so `SELECT * FROM pg_collation` / psql `\dO` / collation-OID joins
+        saw an empty relation (divergence from PG, which always has the BKI-pinned collations). Filled
+        `VirtualRows` with `default`(100), `C`(950), `POSIX`(951), `ucs_basic`(962), `unicode`(963),
+        `pg_c_utf8`(811), `pg_unicode_fast`(6411) from PG18's `pg_collation.dat` — `collnamespace=11`,
+        `collowner=10`, `collisdeterministic=t`, `collicurules=NULL`; libc rows carry collcollate/collctype,
+        builtin/ICU rows carry colllocale (+ collversion=1 for builtin). Mirrors initdb's
+        `bootstrapPgCollationTuples` seed; duplicated in `internal/catalog/catalog.go` because catalog
+        cannot import initdb (cycle). All OIDs < 16384 → pg_dump skips them (no fixture output change);
+        value is `\dO` parity + prerequisite for per-column `COLLATE` round-trip (parser still discards
+        column COLLATE at `internal/parser/ddl.go:2448`). Files: `internal/catalog/catalog.go`,
+        `internal/catalog/pg_collation_virtual_test.go` (NEW — `TestPgCollationVirtualRows`),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 187). Gates: gofmt OK; `go build ./...` clean;
+        full `./internal/catalog/` PASS (0.014s); new test PASS; pgbench pre-commit smoke on commit.
+        **Next:** per-column `COLLATE` round-trip now unblocked on the OID-resolution side (capture
+        column COLLATE in parser → store attcollation in pg_attribute heap → pg_dump emits clause when
+        attcollation ≠ typcollation); or MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

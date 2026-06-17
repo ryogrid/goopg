@@ -3622,7 +3622,30 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3456,
 	}
-	pgCollation.VirtualRows = func() [][]string { return nil }
+	// Populate the 7 built-in collations from PG18's pg_collation.dat so
+	// catalog queries (`SELECT * FROM pg_collation`, psql \dO, collation-OID
+	// joins) resolve names instead of seeing an empty relation. These mirror
+	// initdb's bootstrapPgCollationTuples seed (the on-disk heap a PG standby
+	// reads); the catalog package cannot import initdb (cycle), so the rows
+	// are duplicated here as the source of truth for goopg's own SQL queries.
+	// All are BKI-pinned (OID < 16384, nsp=pg_catalog=11, owner=10), so pg_dump
+	// skips them. collcollate/collctype carry libc-locale rows; colllocale
+	// carries builtin/ICU rows; unset fields are NULL (""). collisdeterministic
+	// is true for every BKI row; collicurules is NULL for all. DU-002 slice 187.
+	pgCollation.VirtualRows = func() [][]string {
+		// cols: oid, collname, collnamespace, collowner, collprovider,
+		//       collisdeterministic, collencoding, collcollate, collctype,
+		//       colllocale, collicurules, collversion
+		return [][]string{
+			{"100", "default", "11", "10", "d", "t", "-1", "", "", "", "", ""},
+			{"950", "C", "11", "10", "c", "t", "-1", "C", "C", "", "", ""},
+			{"951", "POSIX", "11", "10", "c", "t", "-1", "POSIX", "POSIX", "", "", ""},
+			{"962", "ucs_basic", "11", "10", "b", "t", "6", "", "", "C", "", "1"},
+			{"963", "unicode", "11", "10", "i", "t", "-1", "", "", "und", "", ""},
+			{"811", "pg_c_utf8", "11", "10", "b", "t", "6", "", "", "C.UTF-8", "", "1"},
+			{"6411", "pg_unicode_fast", "11", "10", "b", "t", "6", "", "", "PG_UNICODE_FAST", "", "1"},
+		}
+	}
 	c.tables["pg_catalog.pg_collation"] = pgCollation
 
 	// pg_policy — stores row-level security policies (OID 3256).
