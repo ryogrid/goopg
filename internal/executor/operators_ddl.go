@@ -1171,6 +1171,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					idx.ExclusionOp = "="
 					idx.IncludeColumns = nc.IncludeColumns
 					idx.IsConstraint = true
+					// DEFERRABLE [INITIALLY DEFERRED] rides the backing index so the
+					// deparse appends the clause and pg_constraint emits
+					// condeferrable/condeferred. Dump-fidelity only. DU-002 slice 143.
+					idx.Deferrable = nc.Deferrable
+					idx.InitiallyDeferred = nc.InitiallyDeferred
 				}
 			} else {
 				// Other exclusion operators: stub catalog entry; no enforcement in v0.
@@ -1340,6 +1345,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				idx.ExclusionOp = "="
 				idx.IncludeColumns = ec.IncludeColumns
 				idx.IsConstraint = true
+				// DEFERRABLE [INITIALLY DEFERRED] rides the backing index so the
+				// deparse appends the clause and pg_constraint emits
+				// condeferrable/condeferred. Dump-fidelity only. DU-002 slice 143.
+				idx.Deferrable = ec.Deferrable
+				idx.InitiallyDeferred = ec.InitiallyDeferred
 			}
 		} else {
 			if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, ec); err != nil {
@@ -4489,6 +4499,10 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	idx.IsExclusion = true
 	idx.ExclusionOp = ec.ExclusionOp
 	idx.IncludeColumns = ec.IncludeColumns
+	// DEFERRABLE [INITIALLY DEFERRED] rides the stub index so pg_get_constraintdef
+	// / pg_constraint re-emit the clause on dump (no enforcement in v0). DU-002 slice 143.
+	idx.Deferrable = ec.Deferrable
+	idx.InitiallyDeferred = ec.InitiallyDeferred
 	if sess, ok2 := o.ctx.Session.(*BasicSession); ok2 {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
 	}

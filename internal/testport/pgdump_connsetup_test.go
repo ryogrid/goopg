@@ -608,6 +608,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table pkcdef: %v", err)
 	}
 
+	// Slice 143: the EXCLUDE-constraint sibling — the last index-backed
+	// constraint kind that still DISCARDED the DEFERRABLE flag. parseExclude-
+	// Constraint stopped at the close-paren, so a trailing `DEFERRABLE INITIALLY
+	// DEFERRED` was silently dropped (anonymous + named). Now the parser captures
+	// the [NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE] trailer onto the
+	// TableConstraintDef (parseConstraintDeferrable, shared with UNIQUE/PK); the
+	// executor threads it onto the backing exclusion index (anonymous via the
+	// TableExclusions loop, named via NamedConstraints); buildConstraintDefString's
+	// EXCLUDE branch now appends the clause AND pg_constraint emits
+	// condeferrable/condeferred for contype='x'. A btree-equality exclusion is used
+	// so the index goes through the real createBTreeIndex path (method=btree
+	// preserved). pg_dump emits `ADD CONSTRAINT excldef_a_excl EXCLUDE USING btree
+	// (a WITH =) DEFERRABLE INITIALLY DEFERRED` (auto name) and `ADD CONSTRAINT
+	// exdef EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED` (named).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.excldef (a integer, b integer, EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED)"); err != nil {
+		t.Fatalf("create table excldef: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.exclndef (a integer, b integer, CONSTRAINT exdef EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED)"); err != nil {
+		t.Fatalf("create table exclndef: %v", err)
+	}
+
 	// Slice 127: anonymous table-level CHECK constraints (written without an
 	// explicit CONSTRAINT name) must round-trip. PG's AddRelationNewConstraints
 	// auto-names each one at DDL time — "<table>_<col>_check" when the predicate
@@ -1659,6 +1680,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"ADD CONSTRAINT pktdef_pkey PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED",
 			"ADD CONSTRAINT pkdef PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED",
 			"ADD CONSTRAINT pkcdef_pkey PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED",
+			// **Slice 143:** the EXCLUDE-constraint siblings — a DEFERRABLE trailer
+			// on an EXCLUDE constraint round-trips for both the anonymous form (auto
+			// name `excldef_a_excl`) and the named form (user name `exdef`). The
+			// EXCLUDE parser previously stopped at the close-paren, silently dropping
+			// the trailer; now buildConstraintDefString's EXCLUDE branch re-emits it.
+			"ADD CONSTRAINT excldef_a_excl EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED",
+			"ADD CONSTRAINT exdef EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED",
 			// **Slice 127:** anonymous table-level CHECK constraints round-trip
 			// inline with PG's auto-generated names. The multi-column predicate
 			// (`a < b`) gets the table-only name `chk_check`; the single-column
@@ -1855,6 +1883,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		} {
 			if strings.Contains(res.Stdout, neg) {
 				t.Errorf("pg_dump mangled a DEFERRABLE PRIMARY KEY constraint: %q", neg)
+			}
+		}
+		// Slice 143 negative guard: the EXCLUDE deferrable forms must not lose
+		// their trailer — neither the bare constraint (terminated by `;`) nor the
+		// half-clause `… DEFERRABLE;` (missing INITIALLY DEFERRED) may appear for
+		// the anonymous (`excldef_a_excl`) or named (`exdef`) forms.
+		for _, neg := range []string{
+			"ADD CONSTRAINT excldef_a_excl EXCLUDE USING btree (a WITH =);",
+			"ADD CONSTRAINT excldef_a_excl EXCLUDE USING btree (a WITH =) DEFERRABLE;",
+			"ADD CONSTRAINT exdef EXCLUDE USING btree (a WITH =);",
+			"ADD CONSTRAINT exdef EXCLUDE USING btree (a WITH =) DEFERRABLE;",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump mangled a DEFERRABLE EXCLUDE constraint: %q", neg)
 			}
 		}
 		if strings.Contains(res.Stdout, "ADD CONSTRAINT tuniq UNIQUE (a)") {

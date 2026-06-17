@@ -1897,6 +1897,11 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 		} else if p.acceptIdentKeyword("exclude") {
 			// Anonymous EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
 			cdef := p.parseExcludeConstraint()
+			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
+			// Captured onto the constraint def so the executor threads it onto the
+			// backing exclusion index and pg_get_constraintdef / pg_constraint
+			// re-emit the clause on dump. DU-002 slice 143.
+			p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
 			stmt.TableExclusions = append(stmt.TableExclusions, cdef)
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign {
 			// Anonymous table-level FOREIGN KEY (cols) REFERENCES t (cols) … —
@@ -2068,6 +2073,11 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				// CONSTRAINT name EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
 				cdef := p.parseExcludeConstraint()
 				cdef.Name = constraintName
+				// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
+				// IMMEDIATE] — captured (not discarded) so the executor threads it
+				// onto the backing exclusion index via the shared NamedConstraints
+				// loop and the dump re-emits the clause. DU-002 slice 143.
+				p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
 				stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
 			default:
 				// Unknown constraint type: skip to next comma/close-paren.

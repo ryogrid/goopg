@@ -4337,6 +4337,16 @@ func buildConstraintDefString(idx *catalog.Index) string {
 		if len(idx.IncludeColumns) > 0 {
 			def += " INCLUDE (" + strings.Join(idx.IncludeColumns, ", ") + ")"
 		}
+		// DEFERRABLE [INITIALLY DEFERRED] — ruleutils.c appends ` DEFERRABLE` for a
+		// deferrable EXCLUDE constraint (after the WHERE predicate, which goopg does
+		// not yet emit) and ` INITIALLY DEFERRED` when initially deferred (INITIALLY
+		// IMMEDIATE is the default, omitted like PG). DU-002 slice 143.
+		if idx.Deferrable {
+			def += " DEFERRABLE"
+			if idx.InitiallyDeferred {
+				def += " INITIALLY DEFERRED"
+			}
+		}
 		return def
 	}
 	keyCols := "(" + strings.Join(idx.Columns, ", ") + ")"

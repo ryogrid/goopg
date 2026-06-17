@@ -575,6 +575,82 @@ func TestParsePrimaryKeyDeferrable(t *testing.T) {
 	}
 }
 
+// TestParseExcludeDeferrable: the EXCLUDE-constraint sibling of the
+// UNIQUE/PRIMARY KEY DEFERRABLE slices. A `[NOT] DEFERRABLE [INITIALLY
+// DEFERRED|IMMEDIATE]` trailer after an EXCLUDE constraint body must be captured
+// (it was previously discarded — the parser stopped at the close-paren). Flags
+// land on TableExclusions[0] (anonymous) or the matching NamedConstraints entry
+// (named). DU-002 slice 143.
+func TestParseExcludeDeferrable(t *testing.T) {
+	// Anonymous table-level — flags land on TableExclusions[0].
+	anonCases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =))", false, false},
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =) INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =) NOT DEFERRABLE)", false, false},
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY IMMEDIATE)", true, false},
+	}
+	for _, c := range anonCases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.TableExclusions) != 1 {
+			t.Fatalf("Parse(%q): TableExclusions=%d, want 1", c.in, len(ct.TableExclusions))
+		}
+		ex := ct.TableExclusions[0]
+		if ex.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, ex.Deferrable, c.wantDefer)
+		}
+		if ex.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, ex.InitiallyDeferred, c.wantDeferred)
+		}
+	}
+
+	// Named — flags land on the matching exclusion NamedConstraints entry.
+	namedCases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, CONSTRAINT ex EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, CONSTRAINT ex EXCLUDE USING btree (a WITH =) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, CONSTRAINT ex EXCLUDE USING btree (a WITH =) NOT DEFERRABLE)", false, false},
+	}
+	for _, c := range namedCases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		var found *TableConstraintDef
+		for i := range ct.NamedConstraints {
+			if ct.NamedConstraints[i].IsExclusion {
+				found = &ct.NamedConstraints[i]
+				break
+			}
+		}
+		if found == nil {
+			t.Fatalf("Parse(%q): no exclusion NamedConstraint", c.in)
+		}
+		if found.Name != "ex" {
+			t.Errorf("Parse(%q): Name=%q want %q", c.in, found.Name, "ex")
+		}
+		if found.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, found.Deferrable, c.wantDefer)
+		}
+		if found.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, found.InitiallyDeferred, c.wantDeferred)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {

@@ -3853,6 +3853,60 @@ capture across all three forms). Same dump-fidelity scope caveat (no deferred
 full DEFERRABLE surface for UNIQUE and PRIMARY KEY constraints round-trips;
 exclusion-constraint (`EXCLUDE USING`) DEFERRABLE remains for a later slice.
 
+### Slice 143 — `DEFERRABLE` on an `EXCLUDE` constraint
+
+The exclusion-constraint sibling of slices 139–142 — the last index-backed
+constraint kind that still discarded the `DEFERRABLE` flag. A `[NOT] DEFERRABLE
+[INITIALLY DEFERRED | INITIALLY IMMEDIATE]` trailer on an `EXCLUDE` constraint,
+both anonymous (`EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED`)
+and named (`CONSTRAINT exdef EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY
+DEFERRED`), now round-trips. pg_dump emits `ADD CONSTRAINT excldef_a_excl EXCLUDE
+USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED` (auto name) and
+`ADD CONSTRAINT exdef EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY
+DEFERRED` (named).
+
+**The bug:** `parseExcludeConstraint` (`internal/parser/ddl.go`) stopped after
+the optional `INCLUDE (cols)` clause and returned, so a trailing `DEFERRABLE`
+keyword was left in the token stream — silently dropped for the named form
+(the surrounding `CONSTRAINT name …` parser swallowed it) and likewise unconsumed
+for the anonymous form. Additionally, `buildConstraintDefString`'s `EXCLUDE`
+branch returned *before* the shared `DEFERRABLE` append, so even a captured flag
+would not have re-emitted. The fix:
+
+1. **Parser** (`internal/parser/ddl.go`) — both EXCLUDE call sites (anonymous
+   `TableExclusions` append and named `NamedConstraints` append) now call
+   `parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)` (the
+   generic helper introduced for UNIQUE/PK in slices 141–142) after
+   `parseExcludeConstraint` returns. No new AST fields — `TableConstraintDef`
+   already carries `Deferrable` / `InitiallyDeferred`.
+2. **Executor** (`internal/executor/operators_ddl.go`) — all three exclusion
+   index-build paths now copy the flags onto `idx.Deferrable` /
+   `idx.InitiallyDeferred`: the named btree-equality path, the anonymous
+   btree-equality path, and `createExclusionIndexStub` (the non-`=` operator
+   path, which keeps the flags for dump-fidelity even though semantics are not
+   enforced in v0).
+3. **Deparse** (`internal/executor/expr.go`) — `buildConstraintDefString`'s
+   `EXCLUDE` branch now appends ` DEFERRABLE [INITIALLY DEFERRED]` (after the
+   `INCLUDE` clause; PG's WHERE predicate is not yet emitted) before returning,
+   mirroring the UNIQUE/PK branch. `pg_constraint` already emitted
+   `condeferrable` / `condeferred` from `idx.Deferrable` for `contype='x'`
+   (the row-builder is shared across all index-backed constraints).
+
+A btree-equality exclusion (`WITH =`) is used in the test so the backing index
+goes through the real `createBTreeIndex` path with `method=btree` preserved
+(`createExclusionIndexStub` hard-codes `btree`, so a `gist` method would not
+round-trip — a separate, pre-existing gap). The round-trip test adds
+`public.excldef` and `public.exclndef` and asserts both `ADD CONSTRAINT … EXCLUDE
+USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED` lines, with negative guards
+against the dropped-flag (`… (a WITH =);`) and partial-render
+(`… (a WITH =) DEFERRABLE;`) regressions for each name. Unit test:
+`TestParseExcludeDeferrable` (parser capture across the
+NOT/IMMEDIATE/DEFERRED/bare-INITIALLY/named forms). Same dump-fidelity scope
+caveat (no deferred *checking*). With slice 143 the **full** DEFERRABLE surface
+for UNIQUE, PRIMARY KEY, and EXCLUDE constraints round-trips; deferred-check
+*execution* (validate at COMMIT, not per-row) for all constraint kinds remains a
+separate transaction-machinery milestone.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

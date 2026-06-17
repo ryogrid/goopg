@@ -3016,6 +3016,49 @@ object support.
         DEFERRABLE on an EXCLUDE constraint (`EXCLUDE USING gist … DEFERRABLE`)
         dump surface, OR a fresh pg_dump catalog-surface gap.
 
+      - **PROGRESS 2026-06-17 (loop #108):** **DU-002 slice 143 LANDED** — the
+        EXCLUDE-constraint sibling of slices 139–142, the LAST index-backed
+        constraint kind that still discarded the DEFERRABLE flag. A `[NOT]
+        DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]` trailer on an EXCLUDE
+        constraint now round-trips for both the anonymous form
+        (`EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED`, auto name
+        `excldef_a_excl`) and the named form (`CONSTRAINT exdef EXCLUDE USING
+        btree (a WITH =) DEFERRABLE INITIALLY DEFERRED`, user name `exdef`).
+        **The bug:** `parseExcludeConstraint` stopped after the optional INCLUDE
+        clause and returned, so a trailing DEFERRABLE was silently dropped; AND
+        `buildConstraintDefString`'s EXCLUDE branch returned *before* the shared
+        DEFERRABLE append, so even a captured flag would not re-emit. 3 sites:
+        (1) parser (`internal/parser/ddl.go`) — both EXCLUDE call sites
+        (anonymous `TableExclusions` + named `NamedConstraints`) now call the
+        generic `parseConstraintDeferrable` (no new AST fields — `Table-
+        ConstraintDef.Deferrable`/`InitiallyDeferred` already exist); (2) executor
+        (`operators_ddl.go`) — all three exclusion index-build paths copy the
+        flags onto `idx.Deferrable`/`idx.InitiallyDeferred` (named btree-`=`,
+        anonymous btree-`=`, and `createExclusionIndexStub` for the non-`=`
+        operator path); (3) deparse (`expr.go`) — the EXCLUDE branch of
+        `buildConstraintDefString` now appends ` DEFERRABLE [INITIALLY DEFERRED]`
+        after INCLUDE. `pg_constraint` already emitted condeferrable/condeferred
+        for contype='x' (shared row-builder). A btree-`=` exclusion is used in
+        the test so the backing index keeps `method=btree` (the stub hard-codes
+        btree, so a gist method would not round-trip — pre-existing gap). **Scope:**
+        pure dump-fidelity — deferred CHECKING still not implemented (per-row).
+        With slice 143 the FULL UNIQUE+PK+EXCLUDE DEFERRABLE surface round-trips;
+        deferred-check *execution* (validate at COMMIT) for all kinds remains a
+        separate txn-machinery milestone. Tests: `TestParseExcludeDeferrable`
+        (parser, anonymous+named × NOT/IMMEDIATE/DEFERRED/bare-INITIALLY),
+        `TestPort_PgDumpConnectionSetup` (`excldef`/`exclndef` fixtures + 2
+        asserts + 4 negative guards). Files: `internal/parser/ddl.go`,
+        `internal/parser/ddl_test.go`, `internal/executor/operators_ddl.go`,
+        `internal/executor/expr.go`,
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK;
+        `go build ./...` OK; `go vet` OK; parser/catalog/executor suites PASS;
+        `TestParseExcludeDeferrable` PASS; `TestPort_PgDumpConnectionSetup` PASS
+        (2.58s); pgbench pre-commit smoke on commit. **Next: slice 144** —
+        a fresh pg_dump catalog-surface gap (DEFERRABLE surface now complete for
+        all constraint kinds), e.g. constraint comment round-trip or a
+        deferred-check execution spike.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).
