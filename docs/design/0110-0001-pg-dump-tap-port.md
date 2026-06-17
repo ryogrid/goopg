@@ -3943,6 +3943,43 @@ comments — on `foo_pkey` (PK), `foo_code_key` (UNIQUE), `foo_mgr_fkey` (FK), a
 `exdef` (EXCLUDE) — and asserts each `COMMENT ON CONSTRAINT …` line reappears in
 the dump. Pure dump-fidelity; no enforcement semantics involved.
 
+### Slice 145 — `COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA}` round-trip
+
+Slice 55 (TABLE/COLUMN) and slice 144 (every CONSTRAINT kind) closed the comment
+round-trip for relations and constraints; this slice extends it to the remaining
+`COMMENT ON` object kinds that pg_dump emits: VIEW, SEQUENCE, INDEX, and SCHEMA.
+
+**The bug:** `parseCommentOnTail` (`internal/parser/parser.go`) recognised only
+TABLE / INDEX / COLUMN / CONSTRAINT / STATISTICS. `COMMENT ON VIEW`, `COMMENT ON
+SEQUENCE`, and `COMMENT ON SCHEMA` fell through to the unsupported `default`
+branch (`return nil, false, nil`), so the server's COMMENT fallback silently
+swallowed the statement — the description never reached `pg_description` and
+pg_dump had nothing to re-emit. The INDEX kind *was* parsed and stored
+(`execCommentOn` keyed it under classoid=`pg_class`), but no test ever asserted it
+survived a real pg_dump, so the path was unguarded.
+
+**The fix:**
+
+1. `parseCommentOnTail` gains three branches: `VIEW` (via `KwView`), `SEQUENCE`
+   and `SCHEMA` (via `acceptIdentKeyword`, since neither is a lexer keyword). Each
+   reads a `parseObjectName` and sets `ObjKind` to `view` / `sequence` / `schema`.
+2. `execCommentOn` (`internal/executor/operators_ddl.go`) folds `view` and
+   `sequence` into the existing `table` case: views and sequences are `pg_class`
+   relations stored in the same table registry, so they share the classoid (1259)
+   and `LookupTable` path — pg_dump chooses the `COMMENT ON VIEW` / `… SEQUENCE`
+   keyword from `relkind`, and the stored `pg_description` row is keyword-agnostic.
+   A new `schema` case resolves the namespace OID via `im.SchemaOID(name)` and
+   keys the row under classoid=`pg_namespace` (2615).
+
+No catalog-schema change. The round-trip test adds four comments — on
+`public.foo_view` (VIEW), `public.plain_seq` (SEQUENCE), `public.foo_name_idx`
+(INDEX), and schema `s` (SCHEMA) — and asserts each `COMMENT ON <kind> …` line
+reappears verbatim in the dump. Verified against real pg_dump 18.3: the dump
+emits exactly `COMMENT ON VIEW public.foo_view IS '…';`,
+`COMMENT ON SEQUENCE public.plain_seq IS '…';`,
+`COMMENT ON INDEX public.foo_name_idx IS '…';`, and
+`COMMENT ON SCHEMA s IS '…';`. Pure dump-fidelity.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

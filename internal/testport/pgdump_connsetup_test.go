@@ -1481,6 +1481,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table dom: %v", err)
 	}
 
+	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
+	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
+	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
+	// branch and the server silently swallowed them, so the comment never reached
+	// pg_description. The INDEX case parsed and stored (classoid=pg_class) but was
+	// never asserted through pg_dump. The parser now recognises VIEW/SEQUENCE/
+	// SCHEMA, and execCommentOn keys views/sequences under pg_class (1259, shared
+	// LookupTable path) and schemas under pg_namespace (2615). pg_dump's
+	// collectComments re-emits a `COMMENT ON <kind> …` per object, the keyword
+	// chosen from relkind / namespace.
+	miscComments := []string{
+		"COMMENT ON VIEW public.foo_view IS 'a view comment'",
+		"COMMENT ON SEQUENCE public.plain_seq IS 'a sequence comment'",
+		"COMMENT ON INDEX public.foo_name_idx IS 'an index comment'",
+		"COMMENT ON SCHEMA s IS 'a schema comment'",
+	}
+	for _, sql := range miscComments {
+		if err := runSQLSimple(t, c, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
 	res, err := util.RunCommand(util.CommandSpec{
 		Name:    bin,
 		Args:    []string{"--no-sync", "postgres"},
@@ -1806,6 +1828,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"COMMENT ON CONSTRAINT foo_code_key ON public.foo IS 'unique code';",
 			"COMMENT ON CONSTRAINT foo_mgr_fkey ON public.foo IS 'manager fk';",
 			"COMMENT ON CONSTRAINT exdef ON public.exclndef IS 'exclusion comment';",
+			// **Slice 145 (asserted):** COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must
+			// round-trip. VIEW/SEQUENCE/SCHEMA were silently swallowed (parser had no
+			// branch); the INDEX path was wired but never asserted through pg_dump.
+			// Each line below exercises one previously-unhandled (or untested) kind.
+			"COMMENT ON VIEW public.foo_view IS 'a view comment';",
+			"COMMENT ON SEQUENCE public.plain_seq IS 'a sequence comment';",
+			"COMMENT ON INDEX public.foo_name_idx IS 'an index comment';",
+			"COMMENT ON SCHEMA s IS 'a schema comment';",
 		}
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {

@@ -8396,17 +8396,31 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 	}
 	// classOID constants match PostgreSQL system catalog OIDs.
 	const (
-		oidPgClass        = 1259 // pg_class: tables, indexes, views
+		oidPgClass        = 1259 // pg_class: tables, indexes, views, sequences
 		oidPgConstraint   = 2606 // pg_constraint
+		oidPgNamespace    = 2615 // pg_namespace: schemas
 		oidPgStatisticExt = 3381 // pg_statistic_ext
 	)
 	switch s.ObjKind {
-	case "table":
+	case "table", "view", "sequence":
+		// Views and sequences are pg_class relations stored in the same table
+		// registry as ordinary tables, so they share the classoid (1259) and
+		// LookupTable path. pg_dump chooses the COMMENT ON keyword from relkind;
+		// the stored pg_description row is keyword-agnostic. DU-002 slice 145.
 		tbl, ok := im.LookupTable(s.ObjName)
 		if !ok {
 			return nil
 		}
 		im.SetComment(oidPgClass, tbl.OID, 0, s.Description)
+	case "schema":
+		// Schemas live in pg_namespace (classoid 2615). Without this, a COMMENT
+		// ON SCHEMA was silently swallowed and never reached pg_description, so
+		// pg_dump could not re-emit it. DU-002 slice 145.
+		oid := im.SchemaOID(s.ObjName.Name)
+		if oid == 0 {
+			return nil
+		}
+		im.SetComment(oidPgNamespace, oid, 0, s.Description)
 	case "index":
 		idx, ok := im.LookupIndex(s.ObjName)
 		if !ok {

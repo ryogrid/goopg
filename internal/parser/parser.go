@@ -2015,6 +2015,34 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptKeyword(KwView):
+		// COMMENT ON VIEW [schema.]name IS '...'. Views are pg_class relations;
+		// pg_dump re-emits `COMMENT ON VIEW …`. DU-002 slice 145.
+		cs.ObjKind = "view"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("sequence"):
+		// COMMENT ON SEQUENCE [schema.]name IS '...'. Sequences are pg_class
+		// relations (relkind='S'); pg_dump re-emits `COMMENT ON SEQUENCE …`.
+		// DU-002 slice 145.
+		cs.ObjKind = "sequence"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("schema"):
+		// COMMENT ON SCHEMA name IS '...'. Schemas live in pg_namespace; pg_dump
+		// re-emits `COMMENT ON SCHEMA …`. DU-002 slice 145.
+		cs.ObjKind = "schema"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
 	default:
 		return nil, false, nil
 	}
