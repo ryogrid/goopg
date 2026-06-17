@@ -2797,6 +2797,43 @@ object support.
         path at ddl.go:~2537 currently absorbs the keyword WITHOUT setting
         col.Unique, a pre-existing gap).
 
+      - **PROGRESS 2026-06-17 (loop #102):** **DU-002 slice 137 LANDED** — the
+        INLINE *NAMED* column UNIQUE form: `a integer CONSTRAINT myuniq UNIQUE
+        NULLS NOT DISTINCT` (an explicit constraint name on a column-level
+        UNIQUE). pg_dump emits the index-backed constraint under the USER-given
+        name (`ADD CONSTRAINT myuniq UNIQUE NULLS NOT DISTINCT (a)`), not the
+        auto-generated `uniqcname_a_key`. **Production change:** fixed the
+        pre-existing gap flagged in slice 136 — goopg's `CONSTRAINT name UNIQUE`
+        column-constraint case (ddl.go named-constraint switch) absorbed the
+        UNIQUE keyword WITHOUT setting `col.Unique`, so NO backing index was
+        created at all and the constraint was SILENTLY DROPPED from the dump (a
+        stricter failure than slice 136's clause loss — the whole constraint
+        vanished). Threaded: `ColumnDef.UniqueConstraintName string` (parser now
+        keeps the previously-discarded constraint name, sets `col.Unique = true`,
+        and parses the optional `NULLS [NOT] DISTINCT` exactly as the anonymous
+        form) → executor inline column-UNIQUE loop uses it as the backing-index
+        name (which becomes the `pg_constraint` name), falling back to the auto
+        `tbl_col_key` when empty. `buildConstraintDefString` deparse is unchanged
+        (index-backed constraints share one render). **Deferred (ledger):**
+        INSERT/UPDATE enforcement — same `encodeIndexKeyFromCols` backing-index
+        path as slices 134/135/136; dump-fidelity layer only. Files:
+        `internal/parser/ast.go` (`ColumnDef.UniqueConstraintName`),
+        `internal/parser/ddl.go` (named UNIQUE col case sets Unique + name +
+        NULLS), `internal/executor/operators_ddl.go` (named-index name override),
+        `internal/parser/ddl_test.go`
+        (`TestParseColumnNamedUniqueNullsNotDistinct`),
+        `internal/testport/pgdump_connsetup_test.go` (`uniqcname` fixture +
+        `ADD CONSTRAINT myuniq UNIQUE NULLS NOT DISTINCT (a)` assert +
+        count-guard 3→4 + named negative guards),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 137),
+        `.ralph/deferral_ledger.md`. Gates: gofmt OK; `go build ./...` OK;
+        `go vet` OK; `TestParseColumnNamedUniqueNullsNotDistinct` PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.34s); parser/executor packages
+        PASS; pgbench pre-commit smoke on commit. **Next: slice 138** —
+        enforcement of the slice-134/135/136/137 NULLS-equal semantics at
+        INSERT/UPDATE, OR an exclusion-constraint (`EXCLUDE USING gist`) dump
+        surface, OR a named table-level `CONSTRAINT name UNIQUE` form check.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

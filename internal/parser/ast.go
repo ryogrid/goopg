@@ -892,6 +892,11 @@ type ColumnDef struct {
 	// catalog.Index.NullsNotDistinct so pg_get_constraintdef re-emits the
 	// clause. Only meaningful when Unique is true. DU-002 slice 136.
 	UniqueNullsNotDistinct bool
+	// UniqueConstraintName is the explicit constraint name from an inline named
+	// column UNIQUE (`a int CONSTRAINT myname UNIQUE`). Empty for the anonymous
+	// form, in which case the backing index name is auto-generated
+	// (`tbl_col_key`). Only meaningful when Unique is true. DU-002 slice 137.
+	UniqueConstraintName string
 	// GeneratedAlways is true for `GENERATED ALWAYS AS (expr) STORED` columns.
 	// M0096-0008.
 	GeneratedAlways bool

@@ -245,6 +245,43 @@ func TestParseColumnUniqueNullsNotDistinct(t *testing.T) {
 	}
 }
 
+// TestParseColumnNamedUniqueNullsNotDistinct pins the inline NAMED column UNIQUE
+// form (`a int CONSTRAINT myname UNIQUE [NULLS NOT DISTINCT]`) — DU-002 slice
+// 137. Before this slice the `CONSTRAINT name UNIQUE` column case absorbed the
+// keyword WITHOUT setting col.Unique, so no backing index was created (silent
+// loss). Now col.Unique is set, the explicit name rides on
+// ColumnDef.UniqueConstraintName, and the optional PG15+ NULLS NOT DISTINCT
+// clause is captured.
+func TestParseColumnNamedUniqueNullsNotDistinct(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		wantNND  bool
+	}{
+		{"CREATE TABLE t (a int CONSTRAINT myname UNIQUE)", "myname", false},
+		{"CREATE TABLE t (a int CONSTRAINT myname UNIQUE NULLS DISTINCT)", "myname", false},
+		{"CREATE TABLE t (a int CONSTRAINT myname UNIQUE NULLS NOT DISTINCT)", "myname", true},
+		{"CREATE TABLE t (a int CONSTRAINT u_a UNIQUE NULLS NOT DISTINCT, b text)", "u_a", true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		col := ct.Columns[0]
+		if !col.Unique {
+			t.Fatalf("Parse(%q): column a Unique=false, want true", c.in)
+		}
+		if col.UniqueConstraintName != c.wantName {
+			t.Errorf("Parse(%q): UniqueConstraintName=%q want %q", c.in, col.UniqueConstraintName, c.wantName)
+		}
+		if col.UniqueNullsNotDistinct != c.wantNND {
+			t.Errorf("Parse(%q): UniqueNullsNotDistinct=%v want %v", c.in, col.UniqueNullsNotDistinct, c.wantNND)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {

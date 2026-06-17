@@ -3606,6 +3606,38 @@ guard against the bare `UNIQUE (a)` regression.
 **Deferred (DU-002 follow-up):** enforcement at INSERT/UPDATE time, as in slices
 134/135 — same `encodeIndexKeyFromCols` backing-index path. Dump-fidelity only.
 
+### Slice 137 — inline *named* column `UNIQUE` round-trip
+
+The named sibling of slice 136. A column-level UNIQUE may carry an explicit
+constraint name — `CREATE TABLE t (a integer CONSTRAINT myuniq UNIQUE NULLS NOT
+DISTINCT, …)`. pg_dump emits the index-backed constraint under the **user-given**
+name (`ALTER TABLE … ADD CONSTRAINT myuniq UNIQUE NULLS NOT DISTINCT (a)`), not
+the auto-generated `<table>_<col>_key`.
+
+goopg's `CONSTRAINT name UNIQUE` column-constraint case (in `parseColumnDef`'s
+named-constraint switch) **absorbed the `UNIQUE` keyword without setting
+`col.Unique`** — so no backing index was ever created and the constraint was
+**silently dropped** from the dump entirely (a stricter failure than slice 136's
+clause loss: the whole constraint vanished, not just the NULLS option). The named
+PRIMARY KEY/CHECK column cases already worked; only named UNIQUE was a no-op.
+
+**Production change:** add `ColumnDef.UniqueConstraintName string` (`ast.go`);
+the named-constraint parser case (`ddl.go`) now keeps the parsed constraint name
+(previously discarded), sets `col.Unique = true`, records the name on
+`UniqueConstraintName`, and parses the optional `NULLS [NOT] DISTINCT` exactly as
+the anonymous form. The executor's inline column-UNIQUE loop (`operators_ddl.go`)
+uses `UniqueConstraintName` as the backing-index name when non-empty (which
+becomes the `pg_constraint` name), falling back to the auto-generated
+`<table>_<col>_key` otherwise. The `buildConstraintDefString` deparse path is
+unchanged (index-backed constraints share one render). The round-trip test adds
+`public.uniqcname (a integer CONSTRAINT myuniq UNIQUE NULLS NOT DISTINCT, …)` and
+asserts the dump carries `ADD CONSTRAINT myuniq UNIQUE NULLS NOT DISTINCT (a)`,
+with the clause-count guard tightened to exactly four and negative guards against
+both the auto-generated name (`uniqcname_a_key`) and the dropped-clause regression.
+
+**Deferred (DU-002 follow-up):** enforcement at INSERT/UPDATE time, as in slices
+134/135/136 — same `encodeIndexKeyFromCols` backing-index path. Dump-fidelity only.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

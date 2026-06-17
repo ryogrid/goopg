@@ -1240,7 +1240,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// e.g. `CREATE TABLE t (a int UNIQUE, b text)` — M0097-0028.
 	for _, c := range s.Columns {
 		if c.Unique {
-			idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + c.Name + "_key"}
+			// Named inline column UNIQUE (`CONSTRAINT myname UNIQUE`) uses the
+			// user-given name for the backing index/constraint; the anonymous
+			// form auto-generates `tbl_col_key`. DU-002 slice 137.
+			idxBaseName := tbl.Name + "_" + c.Name + "_key"
+			if c.UniqueConstraintName != "" {
+				idxBaseName = c.UniqueConstraintName
+			}
+			idxName := parser.ObjectName{Schema: s.Name.Schema, Name: idxBaseName}
 			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false); err != nil {
 				return err
 			}

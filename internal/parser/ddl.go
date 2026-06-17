@@ -2515,8 +2515,8 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			}
 		// CONSTRAINT name CHECK/PRIMARY KEY/UNIQUE/... column constraint.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint:
-			p.advance()           // CONSTRAINT
-			_, _ = p.parseIdent() // constraint name
+			p.advance()                   // CONSTRAINT
+			cnameTok, _ := p.parseIdent() // constraint name
 			switch {
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 				p.advance()
@@ -2544,8 +2544,20 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				col.Primary = true
 				col.NotNull = true
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
-				// CONSTRAINT name UNIQUE — absorb keyword (no Unique field on ColumnDef)
+				// CONSTRAINT name UNIQUE [NULLS [NOT] DISTINCT] — named inline
+				// column UNIQUE. Set col.Unique so the executor creates the
+				// backing index, and carry the explicit constraint name so
+				// pg_dump round-trips `ADD CONSTRAINT name UNIQUE (col)`.
+				// DU-002 slice 137.
 				p.advance()
+				col.Unique = true
+				col.UniqueConstraintName = identText(cnameTok)
+				if p.acceptIdentKeyword("nulls") {
+					col.UniqueNullsNotDistinct = p.acceptKeyword(KwNot)
+					if !p.acceptKeyword(KwDistinct) {
+						_ = p.acceptIdentKeyword("distinct")
+					}
+				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
 				// CONSTRAINT name REFERENCES table (cols) — FK; parsed below.
 				// Fall through to FK parsing path by continuing the outer loop.
