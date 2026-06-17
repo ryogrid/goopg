@@ -3462,6 +3462,36 @@ object support.
         (`protrftypes`, likely a feature gap), a non-`sql` LANGUAGE (e.g. `plpgsql`) body,
         or a function returning a composite/`RECORD` type.
 
+      - **PROGRESS 2026-06-17 (loop #127):** **DU-002 slice 160 LANDED — real
+        divergence fixed.** A function with a **DEFAULT parameter**
+        (`public.add_default(a integer, b integer DEFAULT 10)`) now round-trips through
+        pg_dump. Every prior function slice declared parameters *without* defaults, so the
+        ` DEFAULT <expr>` clause was never exercised end-to-end. **Bug:** pg_dump
+        reconstructs the CREATE FUNCTION signature from `pg_get_function_arguments(oid)` →
+        goopg's `buildFunctionArguments` (`expr.go`), which **never emitted the DEFAULT
+        clause** even though the parser captured `a.Default` and CREATE FUNCTION stored it
+        positionally in `catalog.Routine.ArgDefaults`. So `add_default(a integer, b integer
+        DEFAULT 10)` dumped as `add_default(a integer, b integer)` — a function that no
+        longer accepts the one-arg call form (non-round-tripping signature). Fix: append
+        ` DEFAULT <expr>` for input args (IN/INOUT/VARIADIC, never OUT — new `argIsInput`
+        helper), gated on a new `printDefaults bool` parameter mirroring PG's
+        `print_defaults` flag (`ruleutils.c:3420`): `pg_get_function_arguments` passes
+        `true`; `pg_get_function_identity_arguments` passes `false` (identity form omits
+        defaults). The sibling `buildFunctionDef` (`pg_get_functiondef`, also
+        `print_defaults=true` upstream) had the mirror gap and was fixed identically
+        (sibling-paths rule). Body `$1`/`$2` forces the `$_$` delimiter. Files:
+        `internal/executor/expr.go` (production fix),
+        `internal/executor/pg_get_function_identity_arguments_test.go`
+        (`TestPgGetFunctionArgumentsDefault` — full keeps DEFAULT, identity drops it),
+        `internal/testport/pgdump_connsetup_test.go` (fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 160 section). Gates: gofmt OK;
+        `go build ./internal/...` OK; `TestPgGetFunctionArgumentsDefault` +
+        `TestPgGetFunctionIdentityArguments*` PASS; full `./internal/executor` +
+        `./internal/parser` PASS; `TestPort_PgDumpConnectionSetup` PASS (2.70s, not
+        skipped); pgbench pre-commit smoke on commit. **Next: slice 161** — a
+        `TRANSFORM FOR TYPE` clause (`protrftypes`, likely a feature gap), a non-`sql`
+        LANGUAGE (e.g. `plpgsql`) body, or a function returning a composite/`RECORD` type.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

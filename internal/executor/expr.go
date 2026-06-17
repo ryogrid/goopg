@@ -7245,7 +7245,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if rs := ctx.Catalog.Routines(); rs != nil {
 					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
-						return NewStringDatum(buildFunctionArguments(r)), nil
+						return NewStringDatum(buildFunctionArguments(r, true)), nil
 					}
 				}
 			}
@@ -7256,14 +7256,14 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// needed to identify the function for ALTER/DROP FUNCTION. Upstream
 		// (ruleutils.c print_function_arguments) differs from
 		// pg_get_function_arguments only by print_defaults=false — it omits
-		// DEFAULT clauses. goopg's buildFunctionArguments never emits defaults,
-		// so the identity form is identical to the full argument list here.
+		// DEFAULT clauses. buildFunctionArguments takes printDefaults=false here,
+		// so the identity form drops any ` DEFAULT <expr>` carried by the full form.
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
 			oidArg, err := evalExpr(x.Args[0], row, ctx)
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if rs := ctx.Catalog.Routines(); rs != nil {
 					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
-						return NewStringDatum(buildFunctionArguments(r)), nil
+						return NewStringDatum(buildFunctionArguments(r, false)), nil
 					}
 				}
 			}
@@ -11320,9 +11320,14 @@ func parseTZHourMin(s string) (h, m int, ok bool) {
 	return n, 0, true
 }
 
-// buildFunctionArguments returns the argument list string for pg_get_function_arguments().
-// Format: "IN name type, OUT name type, ..." matching PG's pg_get_function_arguments.
-func buildFunctionArguments(r *catalog.Routine) string {
+// buildFunctionArguments returns the argument list string for
+// pg_get_function_arguments() / pg_get_function_identity_arguments(). Format:
+// "IN name type, OUT name type, ..." matching PG's print_function_arguments.
+// printDefaults mirrors PG's print_defaults flag: pg_get_function_arguments
+// passes true (so trailing input args carry their ` DEFAULT <expr>` clause),
+// while pg_get_function_identity_arguments passes false (defaults omitted, since
+// they are not part of the function's ALTER/DROP identity).
+func buildFunctionArguments(r *catalog.Routine, printDefaults bool) string {
 	if len(r.ArgTypes) == 0 {
 		return ""
 	}
@@ -11367,9 +11372,32 @@ func buildFunctionArguments(r *catalog.Routine) string {
 			part.WriteByte(' ')
 		}
 		part.WriteString(canonicalTypeName(argType.Name))
+		// DEFAULT clause. PG's print_function_arguments appends ` DEFAULT <expr>`
+		// only when print_defaults is set AND the argument is an input arg
+		// (IN/INOUT/VARIADIC) — output args never carry a default. goopg stores the
+		// deparse-canonical default expression positionally in ArgDefaults.
+		if printDefaults && i < len(r.ArgDefaults) && r.ArgDefaults[i] != "" && argIsInput(r.ArgModes, i) {
+			part.WriteString(" DEFAULT ")
+			part.WriteString(r.ArgDefaults[i])
+		}
 		parts[i] = part.String()
 	}
 	return strings.Join(parts, ", ")
+}
+
+// argIsInput reports whether the argument at index i is an input argument
+// (IN/INOUT/VARIADIC) — the only modes that can carry a DEFAULT. A nil/short
+// ArgModes slice means all-IN (per catalog.Routine.ArgModes convention).
+func argIsInput(modes []string, i int) bool {
+	if modes == nil || i >= len(modes) {
+		return true // all-IN
+	}
+	switch modes[i] {
+	case "o": // OUT
+		return false
+	default: // "i" (IN), "b" (INOUT), "v" (VARIADIC), "" (defaults to IN)
+		return true
+	}
 }
 
 // buildFunctionDef reconstructs the CREATE FUNCTION / CREATE PROCEDURE DDL
@@ -11417,6 +11445,13 @@ func buildFunctionDef(r *catalog.Routine) string {
 			sb.WriteByte(' ')
 		}
 		sb.WriteString(canonicalTypeName(argType.Name))
+		// DEFAULT clause: pg_get_functiondef calls print_function_arguments with
+		// print_defaults=true, so input args carry their ` DEFAULT <expr>` (sibling
+		// of buildFunctionArguments; output args never have a default).
+		if i < len(r.ArgDefaults) && r.ArgDefaults[i] != "" && argIsInput(r.ArgModes, i) {
+			sb.WriteString(" DEFAULT ")
+			sb.WriteString(r.ArgDefaults[i])
+		}
 	}
 	sb.WriteString(")\n")
 

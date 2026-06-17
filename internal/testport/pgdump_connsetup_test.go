@@ -1657,6 +1657,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function sum_variadic: %v", err)
 	}
 
+	// Slice 160: a function with a trailing parameter carrying a DEFAULT value
+	// (`b integer DEFAULT 10`). Every prior function slice declared parameters
+	// without defaults, so the ` DEFAULT <expr>` clause was never exercised
+	// end-to-end. This was a REAL DIVERGENCE: pg_dump reconstructs the CREATE
+	// FUNCTION signature from pg_get_function_arguments(oid), which goopg answers
+	// via buildFunctionArguments — and that reconstructor NEVER emitted the DEFAULT
+	// clause, even though the parser captured `a.Default` and CREATE FUNCTION stored
+	// it in catalog.Routine.ArgDefaults. So `add_default(a integer, b integer
+	// DEFAULT 10)` dumped as `add_default(a integer, b integer)` — a function that
+	// no longer accepts the one-arg call form, i.e. a non-round-tripping signature.
+	// Fix: buildFunctionArguments (and its sibling buildFunctionDef for
+	// pg_get_functiondef) now append ` DEFAULT <expr>` for input args, matching PG's
+	// print_function_arguments with print_defaults=true; the bare expression text is
+	// the deparse-canonical form goopg stores (`10`). The identity form
+	// (pg_get_function_identity_arguments, print_defaults=false) still drops the
+	// default — pinned by TestPgGetFunctionArgumentsDefault in the executor package.
+	// The body's `$1`/`$2` force pg_dump's appendStringLiteralDQ to the `$_$`
+	// delimiter (same as add_seven).
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.add_default(a integer, b integer DEFAULT 10) RETURNS integer LANGUAGE sql AS $$ SELECT $1 + $2 $$"); err != nil {
+		t.Fatalf("create function add_default: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2265,6 +2287,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "    LANGUAGE sql\n    AS $$ SELECT 1 $$;") {
 			t.Errorf("pg_dump dropped/mangled sum_variadic's body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 160 (asserted):** the DEFAULT-arg function (add_default) must
+		// round-trip its trailing parameter's default as `b integer DEFAULT 10`.
+		// pg_dump builds the signature from pg_get_function_arguments(oid); goopg's
+		// buildFunctionArguments now appends ` DEFAULT <expr>` for input args
+		// (print_defaults=true). A dropped DEFAULT clause (parameter rendered as a
+		// bare `b integer`) yields a function that rejects the one-arg call form —
+		// the exact divergence this slice fixes — and surfaces here. The `$1`/`$2`
+		// in the body force the `$_$` delimiter. Real pg_dump 18.3 renders:
+		//   CREATE FUNCTION public.add_default(a integer, b integer DEFAULT 10) RETURNS integer
+		//       LANGUAGE sql
+		//       AS $_$ SELECT $1 + $2 $_$;
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.add_default(a integer, b integer DEFAULT 10) RETURNS integer") {
+			t.Errorf("pg_dump dropped/mangled the add_default DEFAULT-arg signature\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "    LANGUAGE sql\n    AS $_$ SELECT $1 + $2 $_$;") {
+			t.Errorf("pg_dump dropped/mangled add_default's body\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

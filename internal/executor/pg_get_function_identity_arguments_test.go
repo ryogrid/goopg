@@ -99,3 +99,55 @@ func TestPgGetFunctionIdentityArgumentsOutMode(t *testing.T) {
 		t.Errorf("identity = %q, want %q", identity.StringValue(), want)
 	}
 }
+
+// TestPgGetFunctionArgumentsDefault pins DU-002 slice 160: a trailing input arg
+// with a DEFAULT must carry its ` DEFAULT <expr>` clause in the *full* argument
+// list (pg_get_function_arguments, print_defaults=true) but be DROPPED in the
+// identity form (pg_get_function_identity_arguments, print_defaults=false). PG's
+// print_function_arguments only appends the default for input args, so an OUT
+// arg with a (nonsensical) default value would never print one — argIsInput
+// enforces that.
+func TestPgGetFunctionArgumentsDefault(t *testing.T) {
+	cat := catalog.NewInMemory()
+	created, err := cat.Routines().Create(&catalog.Routine{
+		Name:        "add_default",
+		ArgNames:    []string{"a", "b"},
+		ArgTypes:    []catalog.Type{{Name: "integer"}, {Name: "integer"}},
+		ArgModes:    []string{"i", "i"},
+		ArgDefaults: []string{"", "10"},
+		ReturnType:  catalog.Type{Name: "integer"},
+		Language:    "sql",
+		Body:        "SELECT $1 + $2",
+	}, false)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	ctx := NewContext()
+	ctx.Catalog = cat
+	ctx.Now = time.Now()
+
+	oidArg := &planner.IntegerConst{Value: int64(created.OID)}
+
+	full, err := evalExpr(&planner.FuncCall{
+		Name: "pg_get_function_arguments",
+		Args: []planner.Expr{oidArg},
+	}, nil, ctx)
+	if err != nil {
+		t.Fatalf("pg_get_function_arguments: %v", err)
+	}
+	if got, want := full.StringValue(), "a integer, b integer DEFAULT 10"; got != want {
+		t.Errorf("full args = %q, want %q", got, want)
+	}
+
+	identity, err := evalExpr(&planner.FuncCall{
+		Name: "pg_get_function_identity_arguments",
+		Args: []planner.Expr{oidArg},
+	}, nil, ctx)
+	if err != nil {
+		t.Fatalf("pg_get_function_identity_arguments: %v", err)
+	}
+	if got, want := identity.StringValue(), "a integer, b integer"; got != want {
+		t.Errorf("identity args = %q, want %q (DEFAULT must be omitted)", got, want)
+	}
+}

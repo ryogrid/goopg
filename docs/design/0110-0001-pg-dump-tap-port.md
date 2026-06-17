@@ -4441,6 +4441,47 @@ and asserts the `VARIADIC arr integer[]` signature plus the `LANGUAGE sql` / `AS
 1 $$;` fragment. A dropped VARIADIC prefix (arg rendered as a plain array IN param) or a
 mangled array type surfaces exactly in the assertion.
 
+### Slice 160 — DEFAULT-parameter round-trip (real divergence fixed)
+
+Every prior function slice declared parameters without defaults, so the
+` DEFAULT <expr>` clause of a function/procedure argument was never exercised
+end-to-end. pg_dump reconstructs the CREATE FUNCTION signature from
+`pg_get_function_arguments(p.oid)`, which goopg answers via `buildFunctionArguments`
+(`expr.go`).
+
+**Bug found and fixed.** `buildFunctionArguments` *never* emitted the DEFAULT clause,
+even though the parser already captured the per-arg default (`a.Default`) and CREATE
+FUNCTION stored it positionally in `catalog.Routine.ArgDefaults`. So
+`add_default(a integer, b integer DEFAULT 10)` dumped as
+`add_default(a integer, b integer)` — restoring a function that no longer accepts the
+one-arg call form, i.e. a non-round-tripping signature. This diverges from PostgreSQL's
+`print_function_arguments`, which appends ` DEFAULT <expr>` for every trailing **input**
+arg when `print_defaults` is set (`ruleutils.c:3420`).
+
+The fix appends ` DEFAULT <expr>` for input args (IN/INOUT/VARIADIC — never OUT, enforced
+by the new `argIsInput` helper) in `buildFunctionArguments`, gated on a new
+`printDefaults bool` parameter that mirrors PG's `print_defaults` flag:
+`pg_get_function_arguments` passes `true`, while `pg_get_function_identity_arguments`
+passes `false` (the identity form omits defaults — they are not part of the
+ALTER/DROP identity, matching `ruleutils.c:3217`). The stored default text is already the
+deparse-canonical form goopg emits (`10`). The sibling reconstructor `buildFunctionDef`
+(`pg_get_functiondef`, which PG also calls with `print_defaults=true`) had the mirror gap
+and was fixed identically so the two arg-list builders stay in lockstep (sibling-paths
+rule). The body's `$1`/`$2` force pg_dump's `appendStringLiteralDQ` to the `$_$` delimiter
+(same as `add_seven`). Real pg_dump 18.3 now renders:
+
+```
+CREATE FUNCTION public.add_default(a integer, b integer DEFAULT 10) RETURNS integer
+    LANGUAGE sql
+    AS $_$ SELECT $1 + $2 $_$;
+```
+
+The TAP test creates `public.add_default(a integer, b integer DEFAULT 10) … AS $$ SELECT
+$1 + $2 $$` and asserts the `b integer DEFAULT 10` signature plus the `LANGUAGE sql` / `AS
+$_$ SELECT $1 + $2 $_$;` fragment. The full-vs-identity split is pinned directly by
+`TestPgGetFunctionArgumentsDefault` in the executor package (full form keeps the DEFAULT;
+identity form drops it).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
