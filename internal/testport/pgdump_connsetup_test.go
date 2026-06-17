@@ -444,6 +444,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table uniqm: %v", err)
 	}
 
+	// Slice 127: anonymous table-level CHECK constraints (written without an
+	// explicit CONSTRAINT name) must round-trip. PG's AddRelationNewConstraints
+	// auto-names each one at DDL time — "<table>_<col>_check" when the predicate
+	// references exactly one column, "<table>_check" for any other case — so the
+	// constraint surfaces in pg_constraint (contype='c') and pg_dump re-emits it
+	// inline in the CREATE TABLE. goopg previously stored these with an empty name
+	// and OID 0 (invisible to pg_constraint), so an anonymous table-level CHECK was
+	// SILENTLY DROPPED from the dump — only column-level CHECKs (foo_qty_check) and
+	// explicitly-named ones round-tripped. `chk` exercises the multi-column branch
+	// (`chk_check`); `chk1` exercises the single-column branch (`chk1_x_check`).
+	// Both carried on their own tables so foo's many asserts are untouched.
+	// Verified byte-identical to real pg_dump 18.3 (reference /tmp/du127_pgdata).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.chk (a integer, b integer, CHECK (a < b))"); err != nil {
+		t.Fatalf("create table chk: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.chk1 (x integer, CHECK (x > 0))"); err != nil {
+		t.Fatalf("create table chk1: %v", err)
+	}
+
 	// Slice 54: a non-empty reloptions (`WITH (fillfactor=70)`) must surface in
 	// the dump. Slice 47 made an EMPTY reloptions read as SQL NULL (no WITH
 	// clause); the complementary case — an actually-set storage parameter — was
@@ -1365,6 +1384,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// Both the auto-generated name and the column list must follow the
 			// INDEX-key order, not the table order: `uniqm_b_a_key UNIQUE (b, a)`.
 			"ADD CONSTRAINT uniqm_b_a_key UNIQUE (b, a)",
+			// **Slice 127:** anonymous table-level CHECK constraints round-trip
+			// inline with PG's auto-generated names. The multi-column predicate
+			// (`a < b`) gets the table-only name `chk_check`; the single-column
+			// predicate (`x > 0`) gets the column-qualified `chk1_x_check`. Both
+			// were silently dropped before (empty name + OID 0).
+			"CONSTRAINT chk_check CHECK ((a < b))",
+			"CONSTRAINT chk1_x_check CHECK ((x > 0))",
 		}
 		for _, sub := range check {
 			if !strings.Contains(res.Stdout, sub) {
@@ -1380,6 +1406,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		} {
 			if strings.Contains(res.Stdout, neg) {
 				t.Errorf("pg_dump reordered a multi-column UNIQUE key into table order: %q\n  full stdout=%q", neg, res.Stdout)
+			}
+		}
+		// Slice 127 negative guards: the single-vs-multi-column naming must not
+		// flip. A multi-column CHECK that wrongly took the single-column branch
+		// would name itself `chk_a_check`/`chk_b_check`; a single-column CHECK that
+		// took the multi-column branch would name itself `chk1_check`. Either is a
+		// silent constraint-name change on restore.
+		for _, neg := range []string{
+			"CONSTRAINT chk_a_check",
+			"CONSTRAINT chk_b_check",
+			"CONSTRAINT chk1_check ",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump mis-named an anonymous CHECK constraint: %q\n  full stdout=%q", neg, res.Stdout)
 			}
 		}
 		// **Slice 55 closed (asserted):** COMMENT ON {TABLE,COLUMN} must survive

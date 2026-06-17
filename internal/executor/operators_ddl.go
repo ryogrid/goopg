@@ -1336,8 +1336,17 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			tbl.AddCheck(autoName, c.CheckExpr, o.allocConstraintOID(autoName))
 		}
 	}
+	// Table-level CHECK constraints written without an explicit CONSTRAINT name
+	// (`CREATE TABLE t (..., CHECK (a < b))`) are anonymous in the parser, but
+	// PostgreSQL still assigns each one a catalog-visible auto-name at DDL time
+	// (AddRelationNewConstraints): a CHECK that references exactly one column
+	// becomes "<table>_<col>_check", any other case becomes "<table>_check".
+	// Giving them name+OID here makes them surface in pg_constraint (contype='c')
+	// and therefore in pg_dump — previously they were stored with an empty name
+	// and OID 0, so the dumped CREATE TABLE silently dropped them. DU-002 slice 127.
 	for _, chk := range s.TableChecks {
-		tbl.AddCheck("", chk, 0)
+		autoName := o.autoCheckName(tbl, chk)
+		tbl.AddCheck(autoName, chk, o.allocConstraintOID(autoName))
 	}
 	// Named table-level CHECK constraints from CONSTRAINT name CHECK (expr). M0097-0023.
 	for _, nc := range s.TableNamedChecks {
@@ -1522,6 +1531,110 @@ func (o *ddlOp) allocConstraintOID(name string) uint32 {
 		return 0
 	}
 	return o.ctx.Catalog.AllocOID()
+}
+
+// autoCheckName derives PostgreSQL's auto-generated name for an anonymous
+// table-level CHECK constraint. PG's AddRelationNewConstraints names a CHECK
+// that references exactly one column "<table>_<col>_check" and any other CHECK
+// (multiple columns, or none) "<table>_check"; the single-vs-multi decision is
+// made by counting the distinct columns the expression references (PG uses
+// pull_var_clause, which does not descend into sublinks). On a collision with an
+// existing constraint name on the table, ChooseConstraintName appends an
+// incrementing numeric suffix to the "check" label ("<base>1", "<base>2", …).
+// DU-002 slice 127.
+func (o *ddlOp) autoCheckName(tbl *catalog.Table, expr string) string {
+	base := tbl.Name + "_check"
+	if parsed, err := parser.ParseExpr(expr); err == nil {
+		var cols []string
+		collectCheckExprColumns(parsed, &cols)
+		seen := make(map[string]bool, len(cols))
+		var distinct []string
+		for _, c := range cols {
+			if !seen[c] {
+				seen[c] = true
+				distinct = append(distinct, c)
+			}
+		}
+		if len(distinct) == 1 {
+			base = tbl.Name + "_" + distinct[0] + "_check"
+		}
+	}
+	name := base
+	for i := 1; checkNameTaken(tbl, name); i++ {
+		name = base + strconv.Itoa(i)
+	}
+	return name
+}
+
+// checkNameTaken reports whether the table already carries a CHECK constraint
+// with the given name (used for ChooseConstraintName-style collision avoidance).
+func checkNameTaken(tbl *catalog.Table, name string) bool {
+	for _, nc := range tbl.NamedChecks {
+		if nc.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// collectCheckExprColumns walks a parsed CHECK expression and appends the
+// lowercased names of every bare column reference it finds to *out. Mirrors
+// PostgreSQL's pull_var_clause: subqueries (sublinks) are not descended into,
+// which is fine for the approximate single-vs-multi-column name decision.
+func collectCheckExprColumns(e parser.Expr, out *[]string) {
+	if e == nil {
+		return
+	}
+	switch n := e.(type) {
+	case *parser.ColumnRef:
+		if n.Column != "" {
+			*out = append(*out, strings.ToLower(n.Column))
+		}
+	case *parser.BinaryOp:
+		collectCheckExprColumns(n.Left, out)
+		collectCheckExprColumns(n.Right, out)
+	case *parser.UnaryOp:
+		collectCheckExprColumns(n.Operand, out)
+	case *parser.CastExpr:
+		collectCheckExprColumns(n.Operand, out)
+	case *parser.CollateExpr:
+		collectCheckExprColumns(n.Operand, out)
+	case *parser.IsNullExpr:
+		collectCheckExprColumns(n.Operand, out)
+	case *parser.IsBoolExpr:
+		collectCheckExprColumns(n.Operand, out)
+	case *parser.IsDistinctFromExpr:
+		collectCheckExprColumns(n.Left, out)
+		collectCheckExprColumns(n.Right, out)
+	case *parser.FuncCall:
+		for _, a := range n.Args {
+			collectCheckExprColumns(a, out)
+		}
+		collectCheckExprColumns(n.Filter, out)
+	case *parser.InExpr:
+		collectCheckExprColumns(n.Operand, out)
+		for _, v := range n.List {
+			collectCheckExprColumns(v, out)
+		}
+	case *parser.CaseExpr:
+		collectCheckExprColumns(n.Operand, out)
+		for _, w := range n.Whens {
+			collectCheckExprColumns(w.When, out)
+			collectCheckExprColumns(w.Then, out)
+		}
+		collectCheckExprColumns(n.Else, out)
+	case *parser.RowExpr:
+		for _, el := range n.Elems {
+			collectCheckExprColumns(el, out)
+		}
+	case *parser.ArrayConstructorExpr:
+		for _, el := range n.Elements {
+			collectCheckExprColumns(el, out)
+		}
+	case *parser.ArraySubscriptExpr:
+		collectCheckExprColumns(n.Base, out)
+		collectCheckExprColumns(n.Index, out)
+	}
 }
 
 // appendLikeChecks copies src's CHECK constraints (name + expression) into

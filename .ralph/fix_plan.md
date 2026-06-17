@@ -2501,10 +2501,35 @@ object support.
         gofmt OK; `go build ./...` OK; `TestPort_PgDumpConnectionSetup` PASS
         (2.06s); `go test ./internal/executor/ ./internal/catalog/` PASS
         (sibling-path + index-order coverage); pgbench pre-commit smoke on commit.
-        **Next: slice 127** — a table+VIEW dependency-ordering case (verify
-        topological emission ORDER), OR a multi-column CHECK constraint
-        (`CHECK (a < b)` referencing two columns), OR a UNIQUE constraint with an
-        INCLUDE column.
+      - **PROGRESS 2026-06-17 (loop #91):** **DU-002 slice 127 LANDED** — anonymous
+        table-level CHECK constraints (`CREATE TABLE t (..., CHECK (expr))` with no
+        explicit `CONSTRAINT name`) now round-trip. **Real production fix:** goopg
+        stored these with an empty name + OID 0 (`AddCheck("", chk, 0)`), which
+        `pg_constraint`'s VirtualRows skips, so an anonymous table-level CHECK was
+        SILENTLY DROPPED from the dump (only column-level `foo_qty_check` and
+        explicitly-named checks round-tripped). New `autoCheckName` in
+        `internal/executor/operators_ddl.go` mirrors PG's `AddRelationNewConstraints`:
+        re-parses the raw CHECK text, counts distinct column refs
+        (`collectCheckExprColumns`, a `pull_var_clause` analog that skips sublinks),
+        names a single-column CHECK `<table>_<col>_check` and any other
+        `<table>_check`, with `ChooseConstraintName`-style numeric-suffix collision
+        avoidance; then allocates an OID so it surfaces in pg_constraint (contype='c')
+        and `relchecks`. The render path (`pg_get_constraintdef` → `CHECK ((expr))`)
+        already handled named checks (slice 49). `CREATE TABLE public.chk (a integer,
+        b integer, CHECK (a < b))` → `CONSTRAINT chk_check CHECK ((a < b))` (multi-col
+        branch); `CREATE TABLE public.chk1 (x integer, CHECK (x > 0))` → `CONSTRAINT
+        chk1_x_check CHECK ((x > 0))` (single-col branch). Verified byte-identical vs
+        real pg_dump 18.3 (reference `/tmp/du127_pgdata`). Files:
+        `internal/executor/operators_ddl.go` (autoCheckName + collectCheckExprColumns
+        + checkNameTaken; TableChecks loop), `internal/testport/pgdump_connsetup_test.go`
+        (chk/chk1 fixtures + 2 positive asserts + 3 negative single-vs-multi guards),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 127). Gates: `go build
+        ./internal/executor/` OK; `TestPort_PgDumpConnectionSetup` PASS (2.7s);
+        `go test ./internal/executor/ ./internal/catalog/ ./internal/parser/` PASS;
+        pgbench pre-commit smoke on commit. **Next: slice 128** — a table+VIEW
+        dependency-ordering case (verify topological emission ORDER), OR a UNIQUE
+        constraint with an INCLUDE column, OR a NO-INHERIT table-level CHECK
+        (`CHECK (...) NO INHERIT`, exercises the ` NO INHERIT` deparse suffix).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

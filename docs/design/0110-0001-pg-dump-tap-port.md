@@ -3279,6 +3279,43 @@ regression (`uniqm_a_b_key` / `UNIQUE (a, b)`) that would silently reorder the
 constraint columns on restore. Verified byte-identical vs real pg_dump 18.3
 (reference `/tmp/du126_pgdata`).
 
+### Slice 127 — anonymous table-level CHECK constraints (auto-named)
+
+Slice 49 restored *column-level* CHECK constraints (`foo_qty_check`, auto-named
+`<table>_<col>_check`) and slice 96 the *domain* CHECK path; explicitly-named
+table CHECKs already round-tripped. The gap was the **anonymous table-level
+CHECK** — `CREATE TABLE t (..., CHECK (expr))` with no `CONSTRAINT name`. goopg
+stored these with an empty name and OID 0 (`AddCheck("", chk, 0)`), which
+`pg_constraint`'s `VirtualRows` skips, so the constraint was **silently dropped**
+from the dump (and `relchecks` undercounted).
+
+PostgreSQL's `AddRelationNewConstraints` (`src/backend/catalog/heap.c`) assigns
+every anonymous CHECK a name at DDL time via `ChooseConstraintName`: it counts
+the distinct columns the predicate references (`pull_var_clause`, which does not
+descend into sublinks) and names a single-column CHECK `<table>_<col>_check`,
+any other CHECK (multiple columns, or none) `<table>_check`; collisions get an
+incrementing numeric suffix on the `check` label (`<base>1`, `<base>2`, …).
+
+goopg now mirrors this: the `s.TableChecks` loop in
+`internal/executor/operators_ddl.go` calls a new `autoCheckName(tbl, expr)` that
+re-parses the raw CHECK text (`parser.ParseExpr`), walks it with
+`collectCheckExprColumns` to count distinct column refs, picks the
+single-vs-multi-column form, and resolves collisions against the table's
+existing CHECK names — then allocates an OID so the constraint surfaces in
+`pg_constraint` (contype='c') and `relchecks`. The render path
+(`pg_get_constraintdef` → `CHECK ((expr))`) already handled named checks
+(slice 49), so the named constraint now flows through unchanged.
+
+```sql
+CREATE TABLE public.chk  (a integer, b integer, CHECK (a < b));  -- → CONSTRAINT chk_check    CHECK ((a < b))
+CREATE TABLE public.chk1 (x integer,            CHECK (x > 0));  -- → CONSTRAINT chk1_x_check  CHECK ((x > 0))
+```
+
+`chk` exercises the multi-column branch, `chk1` the single-column branch.
+Positive asserts pin both names + inline rendering; negative guards reject a
+single-vs-multi flip (`chk_a_check` / `chk1_check`). Verified byte-identical to
+real pg_dump 18.3 (reference `/tmp/du127_pgdata`).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
