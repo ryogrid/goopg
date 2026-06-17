@@ -213,6 +213,38 @@ func TestParseTableUniqueNullsNotDistinct(t *testing.T) {
 	}
 }
 
+// TestParseColumnUniqueNullsNotDistinct pins the PostgreSQL 15+ NULLS [NOT]
+// DISTINCT capture on an INLINE column UNIQUE constraint (DU-002 slice 136).
+// `a int UNIQUE NULLS NOT DISTINCT` rides on ColumnDef.UniqueNullsNotDistinct so
+// the backing index records it and pg_get_constraintdef re-emits
+// `UNIQUE NULLS NOT DISTINCT (a)`. Only `NULLS NOT DISTINCT` sets it; the
+// bare/default `NULLS DISTINCT` and an omitted clause leave it false.
+func TestParseColumnUniqueNullsNotDistinct(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"CREATE TABLE t (a int UNIQUE)", false},
+		{"CREATE TABLE t (a int UNIQUE NULLS DISTINCT)", false},
+		{"CREATE TABLE t (a int UNIQUE NULLS NOT DISTINCT)", true},
+		{"CREATE TABLE t (a int UNIQUE NULLS NOT DISTINCT, b text)", true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		col := ct.Columns[0]
+		if !col.Unique {
+			t.Fatalf("Parse(%q): column a Unique=false, want true", c.in)
+		}
+		if col.UniqueNullsNotDistinct != c.want {
+			t.Errorf("Parse(%q): UniqueNullsNotDistinct=%v want %v", c.in, col.UniqueNullsNotDistinct, c.want)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {

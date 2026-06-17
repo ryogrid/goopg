@@ -482,6 +482,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table uniqnnd: %v", err)
 	}
 
+	// Slice 136: the INLINE-on-column sibling of slice 135 —
+	// `a integer UNIQUE NULLS NOT DISTINCT` (the clause follows the column's
+	// UNIQUE keyword). pg_dump emits the same index-backed constraint form as a
+	// table-level UNIQUE (`ADD CONSTRAINT uniqcnnd_a_key UNIQUE NULLS NOT
+	// DISTINCT (a)`), so the dump surface matches slice 135; the NEW production
+	// path is the parser+executor threading for the column form. goopg's inline
+	// column-UNIQUE parser previously had no slot for the clause: it would have
+	// left `NULLS NOT DISTINCT` unconsumed (parse error) or, post-fix, dropped it
+	// — so the backing index's NullsNotDistinct stayed false and the constraint
+	// dumped as a plain `UNIQUE (a)` (silent NULL-dedup loss). The flag now rides
+	// ColumnDef.UniqueNullsNotDistinct → catalog.Index.NullsNotDistinct →
+	// buildConstraintDefString. `uniqcnnd` carries it on its own table.
+	// (Enforcement at INSERT/UPDATE remains deferred — dump-fidelity layer only.)
+	if err := runSQLSimple(t, c, "CREATE TABLE public.uniqcnnd (a integer UNIQUE NULLS NOT DISTINCT, b integer)"); err != nil {
+		t.Fatalf("create table uniqcnnd: %v", err)
+	}
+
 	// Slice 127: anonymous table-level CHECK constraints (written without an
 	// explicit CONSTRAINT name) must round-trip. PG's AddRelationNewConstraints
 	// auto-names each one at DDL time — "<table>_<col>_check" when the predicate
@@ -1488,6 +1505,11 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// (`UNIQUE NULLS NOT DISTINCT (a)`, ruleutils.c pg_get_constraintdef
 			// order) — distinct from CREATE INDEX where it trails the columns.
 			"ADD CONSTRAINT uniqnnd_a_key UNIQUE NULLS NOT DISTINCT (a)",
+			// **Slice 136:** the INLINE-on-column sibling of slice 135. An inline
+			// `a integer UNIQUE NULLS NOT DISTINCT` dumps as the same index-backed
+			// constraint (`uniqcnnd_a_key UNIQUE NULLS NOT DISTINCT (a)`); the new
+			// path is the column-form parser+executor threading.
+			"ADD CONSTRAINT uniqcnnd_a_key UNIQUE NULLS NOT DISTINCT (a)",
 			// **Slice 127:** anonymous table-level CHECK constraints round-trip
 			// inline with PG's auto-generated names. The multi-column predicate
 			// (`a < b`) gets the table-only name `chk_check`; the single-column
@@ -1610,19 +1632,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				t.Errorf("pg_dump dropped/mangled a secondary index; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
-		// Slice 134/135 (regression guard): a plain unique/secondary index or a
+		// Slice 134/135/136 (regression guard): a plain unique/secondary index or a
 		// default-distinct UNIQUE constraint must NOT gain a stray NULLS NOT
-		// DISTINCT — the flag is only set where explicitly declared. Exactly two
-		// clauses must appear: the slice-134 CREATE INDEX (foo_nnd_idx) and the
-		// slice-135 ADD CONSTRAINT (uniqnnd_a_key).
-		if got := strings.Count(res.Stdout, "NULLS NOT DISTINCT"); got != 2 {
-			t.Errorf("expected exactly two NULLS NOT DISTINCT in dump, got %d\n  full stdout=%q", got, res.Stdout)
+		// DISTINCT — the flag is only set where explicitly declared. Exactly three
+		// clauses must appear: the slice-134 CREATE INDEX (foo_nnd_idx), the
+		// slice-135 table-level ADD CONSTRAINT (uniqnnd_a_key), and the slice-136
+		// inline-column ADD CONSTRAINT (uniqcnnd_a_key).
+		if got := strings.Count(res.Stdout, "NULLS NOT DISTINCT"); got != 3 {
+			t.Errorf("expected exactly three NULLS NOT DISTINCT in dump, got %d\n  full stdout=%q", got, res.Stdout)
 		}
-		// Slice 135 negative guard: dropping the clause would render the bare
-		// `uniqnnd_a_key UNIQUE (a)`, silently restoring with default NULLS DISTINCT
+		// Slice 135/136 negative guard: dropping the clause would render the bare
+		// `<name> UNIQUE (a)`, silently restoring with default NULLS DISTINCT
 		// (every NULL unique) instead of the declared NULLS-equal semantics.
 		if strings.Contains(res.Stdout, "ADD CONSTRAINT uniqnnd_a_key UNIQUE (a)") {
-			t.Errorf("pg_dump dropped NULLS NOT DISTINCT from a UNIQUE constraint\n  full stdout=%q", res.Stdout)
+			t.Errorf("pg_dump dropped NULLS NOT DISTINCT from a table-level UNIQUE constraint\n  full stdout=%q", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "ADD CONSTRAINT uniqcnnd_a_key UNIQUE (a)") {
+			t.Errorf("pg_dump dropped NULLS NOT DISTINCT from an inline-column UNIQUE constraint\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 57 (asserted):** a VIEW must round-trip. pg_dump aborts the
 		// whole dump when pg_get_viewdef returns empty; goopg now returns the

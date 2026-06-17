@@ -2484,6 +2484,16 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 			p.advance()
 			col.Unique = true
+			// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) follows the keyword
+			// for an inline column UNIQUE. Threaded into catalog.Index so
+			// pg_get_constraintdef re-emits `UNIQUE NULLS NOT DISTINCT (col)`.
+			// DU-002 slice 136.
+			if p.acceptIdentKeyword("nulls") {
+				col.UniqueNullsNotDistinct = p.acceptKeyword(KwNot)
+				if !p.acceptKeyword(KwDistinct) {
+					_ = p.acceptIdentKeyword("distinct")
+				}
+			}
 		// CHECK (expr) inline column constraint. M0097-0014.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 			p.advance()

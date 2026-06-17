@@ -1246,6 +1246,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 				idx.IsConstraint = true
+				// NULLS NOT DISTINCT (PG 15+) — record so pg_get_constraintdef
+				// re-emits `UNIQUE NULLS NOT DISTINCT (col)`. DU-002 slice 136.
+				idx.NullsNotDistinct = c.UniqueNullsNotDistinct
 			}
 		}
 	}

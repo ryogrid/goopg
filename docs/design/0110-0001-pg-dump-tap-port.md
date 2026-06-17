@@ -3574,6 +3574,38 @@ constraint) and a negative guard against the bare `UNIQUE (a)` regression.
 slice 134 — the constraint shares the same backing-index key-encoding path
 (`encodeIndexKeyFromCols`). This slice pins the dump-fidelity layer only.
 
+### Slice 136 — inline-column `UNIQUE NULLS NOT DISTINCT` round-trip
+
+The inline-on-column sibling of slice 135. The same PostgreSQL 15+ option can be
+written directly after a column's `UNIQUE` keyword — `CREATE TABLE t (a integer
+UNIQUE NULLS NOT DISTINCT, …)` — not only at the table-constraint level. pg_dump
+reproduces an inline column UNIQUE as the *same* index-backed constraint a
+table-level UNIQUE produces (`ALTER TABLE … ADD CONSTRAINT <table>_<col>_key
+UNIQUE NULLS NOT DISTINCT (a)` via `pg_get_constraintdef`), so the dump surface
+is identical to slice 135 — the new work is purely the column-form parser and
+executor threading.
+
+goopg's inline column-UNIQUE parser had **no slot** for the clause: the `KwUnique`
+column-constraint case set `col.Unique = true` and stopped, so a trailing `NULLS
+NOT DISTINCT` was left unconsumed (parse error) and, even once consumed, would be
+dropped — the backing index's `NullsNotDistinct` stayed `false` and the
+constraint dumped as a plain `UNIQUE (a)` (silent NULL-dedup loss).
+
+**Production change:** add `ColumnDef.UniqueNullsNotDistinct bool` (`ast.go`);
+parse the optional `NULLS [NOT] DISTINCT` after the inline `UNIQUE` keyword
+(`ddl.go`, reusing the table-level capture pattern); the executor's inline
+column-UNIQUE loop (`operators_ddl.go`) threads the flag onto
+`catalog.Index.NullsNotDistinct`. The `buildConstraintDefString` deparse path is
+unchanged from slice 135 (index-backed constraints share one render). The
+round-trip test adds `public.uniqcnnd (a integer UNIQUE NULLS NOT DISTINCT, …)`
+and asserts the dump carries `ADD CONSTRAINT uniqcnnd_a_key UNIQUE NULLS NOT
+DISTINCT (a)`, with the clause-count guard tightened to exactly three (slice 134
+index + slice 135 table constraint + slice 136 column constraint) and a negative
+guard against the bare `UNIQUE (a)` regression.
+
+**Deferred (DU-002 follow-up):** enforcement at INSERT/UPDATE time, as in slices
+134/135 — same `encodeIndexKeyFromCols` backing-index path. Dump-fidelity only.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

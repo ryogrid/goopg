@@ -887,6 +887,11 @@ type ColumnDef struct {
 	NotNull bool
 	Primary bool // inline `PRIMARY KEY` constraint
 	Unique  bool // inline `UNIQUE` constraint
+	// UniqueNullsNotDistinct is true when an inline column UNIQUE was declared
+	// `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+). It is threaded into
+	// catalog.Index.NullsNotDistinct so pg_get_constraintdef re-emits the
+	// clause. Only meaningful when Unique is true. DU-002 slice 136.
+	UniqueNullsNotDistinct bool
 	// GeneratedAlways is true for `GENERATED ALWAYS AS (expr) STORED` columns.
 	// M0096-0008.
 	GeneratedAlways bool
