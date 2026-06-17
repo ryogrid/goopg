@@ -1819,6 +1819,27 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						}
 					}
 					stmt.TableUniqueIncludes = append(stmt.TableUniqueIncludes, incl)
+					// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
+					// IMMEDIATE]. Captured (not discarded) so pg_get_constraintdef
+					// re-emits the clause on dump. DU-002 slice 139.
+					deferrable := false
+					initiallyDeferred := false
+					if p.acceptKeyword(KwNot) {
+						_ = p.acceptKeyword(KwDeferrable)
+					} else if p.acceptKeyword(KwDeferrable) {
+						deferrable = true
+					}
+					if p.acceptIdentKeyword("initially") {
+						if p.acceptIdentKeyword("deferred") {
+							// INITIALLY DEFERRED implies DEFERRABLE.
+							deferrable = true
+							initiallyDeferred = true
+						} else {
+							_ = p.acceptIdentKeyword("immediate")
+						}
+					}
+					stmt.TableUniqueDeferrable = append(stmt.TableUniqueDeferrable, deferrable)
+					stmt.TableUniqueInitiallyDeferred = append(stmt.TableUniqueInitiallyDeferred, initiallyDeferred)
 				}
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {

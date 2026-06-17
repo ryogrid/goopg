@@ -4358,6 +4358,16 @@ func buildConstraintDefString(idx *catalog.Index) string {
 	if len(idx.IncludeColumns) > 0 {
 		def += " INCLUDE (" + strings.Join(idx.IncludeColumns, ", ") + ")"
 	}
+	// DEFERRABLE [INITIALLY DEFERRED] — ruleutils.c appends ` DEFERRABLE` for a
+	// deferrable constraint and additionally ` INITIALLY DEFERRED` when the
+	// constraint is initially deferred (INITIALLY IMMEDIATE is the default and is
+	// omitted, like PG). DU-002 slice 139.
+	if idx.Deferrable {
+		def += " DEFERRABLE"
+		if idx.InitiallyDeferred {
+			def += " INITIALLY DEFERRED"
+		}
+	}
 	return def
 }
 

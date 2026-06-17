@@ -40,6 +40,25 @@ func TestBuildConstraintDefNullsNotDistinct(t *testing.T) {
 			idx:  &catalog.Index{Columns: []string{"a"}, Primary: true, NullsNotDistinct: true},
 			want: "PRIMARY KEY (a)",
 		},
+		{
+			// DEFERRABLE (immediate) appends ` DEFERRABLE` only; INITIALLY
+			// IMMEDIATE is the default and is omitted. DU-002 slice 139.
+			name: "unique deferrable initially immediate",
+			idx:  &catalog.Index{Columns: []string{"a"}, Deferrable: true},
+			want: "UNIQUE (a) DEFERRABLE",
+		},
+		{
+			// DEFERRABLE INITIALLY DEFERRED appends both clauses. DU-002 slice 139.
+			name: "unique deferrable initially deferred",
+			idx:  &catalog.Index{Columns: []string{"a"}, Deferrable: true, InitiallyDeferred: true},
+			want: "UNIQUE (a) DEFERRABLE INITIALLY DEFERRED",
+		},
+		{
+			// The DEFERRABLE clause trails INCLUDE, matching ruleutils.c order.
+			name: "unique include deferrable deferred",
+			idx:  &catalog.Index{Columns: []string{"a"}, IncludeColumns: []string{"b"}, Deferrable: true, InitiallyDeferred: true},
+			want: "UNIQUE (a) INCLUDE (b) DEFERRABLE INITIALLY DEFERRED",
+		},
 	}
 	for _, c := range cases {
 		if got := buildConstraintDefString(c.idx); got != c.want {

@@ -1044,6 +1044,14 @@ type CreateTableStmt struct {
 	// TableUniques if trailing entries use the default NULLS DISTINCT.
 	// DU-002 slice 135.
 	TableUniqueNullsNotDistinct []bool
+	// TableUniqueDeferrable / TableUniqueInitiallyDeferred are parallel to
+	// TableUniques: entry [i] is true when TableUniques[i] was declared
+	// `DEFERRABLE` / `DEFERRABLE INITIALLY DEFERRED`. May be shorter than
+	// TableUniques when trailing entries use the NOT DEFERRABLE default.
+	// pg_get_constraintdef re-emits the clause so pg_dump round-trips it.
+	// DU-002 slice 139.
+	TableUniqueDeferrable        []bool
+	TableUniqueInitiallyDeferred []bool
 	// PrimaryKeyInclude holds the INCLUDE covering columns for an anonymous
 	// table-level PRIMARY KEY constraint. M0097-0023.
 	PrimaryKeyInclude []string

@@ -532,6 +532,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table uniqtname: %v", err)
 	}
 
+	// Slice 139: a table-level UNIQUE constraint declared DEFERRABLE INITIALLY
+	// DEFERRED must round-trip the DEFERRABLE clause. The anonymous table-level
+	// UNIQUE parser case had NO DEFERRABLE branch at all (unlike PRIMARY KEY,
+	// which silently DISCARDED it), so `UNIQUE (a) DEFERRABLE INITIALLY DEFERRED`
+	// was a hard parse error — the whole CREATE TABLE failed. The parser now
+	// captures the [NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE] trailer into
+	// TableUniqueDeferrable/TableUniqueInitiallyDeferred (parallel to
+	// TableUniques); the executor threads them onto catalog.Index.Deferrable/
+	// InitiallyDeferred; pg_constraint now emits condeferrable/condeferred from
+	// the index and buildConstraintDefString (pg_get_constraintdef) appends
+	// ` DEFERRABLE INITIALLY DEFERRED` after the column list. pg_dump emits
+	// `ADD CONSTRAINT uniqdef_a_key UNIQUE (a) DEFERRABLE INITIALLY DEFERRED`.
+	// `uniqdef` carries it on its own table so foo's many asserts are untouched.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.uniqdef (a integer, b integer, UNIQUE (a) DEFERRABLE INITIALLY DEFERRED)"); err != nil {
+		t.Fatalf("create table uniqdef: %v", err)
+	}
+
 	// Slice 127: anonymous table-level CHECK constraints (written without an
 	// explicit CONSTRAINT name) must round-trip. PG's AddRelationNewConstraints
 	// auto-names each one at DDL time — "<table>_<col>_check" when the predicate
@@ -1555,6 +1572,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// UNIQUE parser case previously skipped the NULLS [NOT] DISTINCT clause
 			// and the `(` lookahead failed, silently dropping the whole constraint.
 			"ADD CONSTRAINT tuniq UNIQUE NULLS NOT DISTINCT (a)",
+			// **Slice 139:** a table-level UNIQUE constraint declared DEFERRABLE
+			// INITIALLY DEFERRED re-emits the ` DEFERRABLE INITIALLY DEFERRED`
+			// trailer (ruleutils.c order: after the column/INCLUDE list). The
+			// anonymous UNIQUE parser previously had no DEFERRABLE branch, so the
+			// constraint was a hard parse error; now it round-trips.
+			"ADD CONSTRAINT uniqdef_a_key UNIQUE (a) DEFERRABLE INITIALLY DEFERRED",
 			// **Slice 127:** anonymous table-level CHECK constraints round-trip
 			// inline with PG's auto-generated names. The multi-column predicate
 			// (`a < b`) gets the table-only name `chk_check`; the single-column
@@ -1711,6 +1734,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// the USER name (tuniq) WITH the clause; dropping it would render the bare
 		// `ADD CONSTRAINT tuniq UNIQUE (a)` (silent NULL-dedup loss), and the
 		// pre-slice parser bug dropped the whole constraint (no ADD CONSTRAINT line).
+		// Slice 139 negative guard: dropping the DEFERRABLE flags would render the
+		// bare `ADD CONSTRAINT uniqdef_a_key UNIQUE (a)` (terminated by ';'),
+		// silently restoring the constraint as NOT DEFERRABLE — a semantic change
+		// (a deferred constraint is only checked at COMMIT). Emitting DEFERRABLE
+		// without INITIALLY DEFERRED would also be wrong (default is IMMEDIATE).
+		for _, neg := range []string{
+			"ADD CONSTRAINT uniqdef_a_key UNIQUE (a);",
+			"ADD CONSTRAINT uniqdef_a_key UNIQUE (a) DEFERRABLE;",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump mangled a DEFERRABLE UNIQUE constraint: %q", neg)
+			}
+		}
 		if strings.Contains(res.Stdout, "ADD CONSTRAINT tuniq UNIQUE (a)") {
 			t.Errorf("pg_dump dropped NULLS NOT DISTINCT from a named table-level UNIQUE constraint\n  full stdout=%q", res.Stdout)
 		}

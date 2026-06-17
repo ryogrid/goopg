@@ -213,6 +213,50 @@ func TestParseTableUniqueNullsNotDistinct(t *testing.T) {
 	}
 }
 
+// TestParseTableUniqueDeferrable pins the DEFERRABLE [INITIALLY DEFERRED |
+// INITIALLY IMMEDIATE] capture on a TABLE-level UNIQUE constraint (DU-002
+// slice 139). The clause trails the column list (and any INCLUDE list); it was
+// previously a hard parse error for the anonymous UNIQUE form (no DEFERRABLE
+// branch existed, unlike PRIMARY KEY which silently discarded it). The two flags
+// ride parallel to TableUniques so the backing index records them and
+// pg_get_constraintdef / pg_constraint re-emit the clause. INITIALLY DEFERRED
+// implies DEFERRABLE; INITIALLY IMMEDIATE is the default and leaves both false.
+func TestParseTableUniqueDeferrable(t *testing.T) {
+	cases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, UNIQUE (a))", false, false},
+		{"CREATE TABLE t (a int, UNIQUE (a) NOT DEFERRABLE)", false, false},
+		{"CREATE TABLE t (a int, UNIQUE (a) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, UNIQUE (a) DEFERRABLE INITIALLY IMMEDIATE)", true, false},
+		{"CREATE TABLE t (a int, UNIQUE (a) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, UNIQUE (a) INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, b int, UNIQUE (a) INCLUDE (b) DEFERRABLE INITIALLY DEFERRED)", true, true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.TableUniques) != 1 {
+			t.Fatalf("Parse(%q): expected 1 table UNIQUE, got %d", c.in, len(ct.TableUniques))
+		}
+		if len(ct.TableUniqueDeferrable) != 1 || len(ct.TableUniqueInitiallyDeferred) != 1 {
+			t.Fatalf("Parse(%q): deferrable flag arrays len=%d/%d want 1/1", c.in,
+				len(ct.TableUniqueDeferrable), len(ct.TableUniqueInitiallyDeferred))
+		}
+		if ct.TableUniqueDeferrable[0] != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, ct.TableUniqueDeferrable[0], c.wantDefer)
+		}
+		if ct.TableUniqueInitiallyDeferred[0] != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, ct.TableUniqueInitiallyDeferred[0], c.wantDeferred)
+		}
+	}
+}
+
 // TestParseColumnUniqueNullsNotDistinct pins the PostgreSQL 15+ NULLS [NOT]
 // DISTINCT capture on an INLINE column UNIQUE constraint (DU-002 slice 136).
 // `a int UNIQUE NULLS NOT DISTINCT` rides on ColumnDef.UniqueNullsNotDistinct so

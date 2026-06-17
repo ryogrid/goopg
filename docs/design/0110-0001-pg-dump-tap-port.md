@@ -3670,6 +3670,58 @@ guard against the dropped-clause regression (`ADD CONSTRAINT tuniq UNIQUE (a)`).
 **Deferred (DU-002 follow-up):** enforcement at INSERT/UPDATE time, as in slices
 134/135/136/137 — same `encodeIndexKeyFromCols` backing-index path. Dump-fidelity only.
 
+### Slice 139 — `DEFERRABLE INITIALLY DEFERRED` table-level `UNIQUE` round-trip
+
+A constraint may be declared `DEFERRABLE [INITIALLY DEFERRED | INITIALLY
+IMMEDIATE]` — `CREATE TABLE t (a integer, …, UNIQUE (a) DEFERRABLE INITIALLY
+DEFERRED)`. A *deferred* constraint is checked at `COMMIT` rather than per-row, so
+the flag is a real semantic property, not cosmetic. pg_dump re-emits it from
+`pg_get_constraintdef`: `ALTER TABLE … ADD CONSTRAINT uniqdef_a_key UNIQUE (a)
+DEFERRABLE INITIALLY DEFERRED`.
+
+goopg's **anonymous** table-level UNIQUE parser case had **no `DEFERRABLE` branch
+at all** — unlike the PRIMARY KEY case, which *silently discarded* it. So
+`UNIQUE (a) DEFERRABLE …` was a **hard parse error**: the trailing `DEFERRABLE`
+token was unexpected after the column/INCLUDE list and the whole `CREATE TABLE`
+failed. Even if parsed, the index-backed constraint emitted `condeferrable='f'` /
+`condeferred='f'` hard-wired in `pg_constraint`, and `buildConstraintDefString`
+never rendered the clause.
+
+**Production change (4 sites):**
+1. **Parser** (`ddl.go`, anonymous table-level UNIQUE): captures the optional
+   `[NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` trailer
+   (`INITIALLY DEFERRED` implies `DEFERRABLE`; `INITIALLY IMMEDIATE` is the
+   default and leaves both flags false) into new `CreateTableStmt`
+   `TableUniqueDeferrable` / `TableUniqueInitiallyDeferred` arrays, parallel to
+   `TableUniques`.
+2. **Catalog** (`catalog.go`): new `Index.Deferrable` / `Index.InitiallyDeferred`
+   fields (mirror `pg_constraint.condeferrable` / `condeferred`).
+3. **Executor** (`operators_ddl.go`, table-level UNIQUE loop): threads the parsed
+   flags onto the backing index.
+4. **Deparse + catalog views**: `buildConstraintDefString` (`expr.go`) appends
+   ` DEFERRABLE` and, when initially deferred, ` INITIALLY DEFERRED` after the
+   column/INCLUDE list (ruleutils.c order; `INITIALLY IMMEDIATE` omitted as PG
+   does); the index-backed `pg_constraint` row (`catalog.go`) emits
+   `condeferrable`/`condeferred` from the index instead of hard-wired `'f'`.
+
+The round-trip test adds `public.uniqdef (a integer, b integer, UNIQUE (a)
+DEFERRABLE INITIALLY DEFERRED)` and asserts the dump carries `ADD CONSTRAINT
+uniqdef_a_key UNIQUE (a) DEFERRABLE INITIALLY DEFERRED`, with negative guards
+against both the dropped-flag regression (`… UNIQUE (a);`) and a partial render
+(`… UNIQUE (a) DEFERRABLE;` without the `INITIALLY DEFERRED`). Unit tests:
+`TestParseTableUniqueDeferrable` (parser capture across the NOT/IMMEDIATE/DEFERRED/
+bare-INITIALLY forms) and three new `TestBuildConstraintDefNullsNotDistinct` cases
+(deparse: DEFERRABLE, DEFERRABLE INITIALLY DEFERRED, and INCLUDE + DEFERRABLE
+ordering).
+
+**Scope note:** this is a pure dump-fidelity slice — goopg's executor does not yet
+implement *deferred* constraint checking (all constraints are checked immediately),
+so the restored constraint records the flag but is still enforced per-row.
+Deferred-check execution is a separate, larger transaction-machinery milestone.
+Limited to the anonymous table-level UNIQUE form; the named table-level / inline-
+column / PRIMARY KEY DEFERRABLE forms (which still discard the flag) are the next
+slices in this family.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

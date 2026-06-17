@@ -535,6 +535,13 @@ type Index struct {
 	// index was declared `NULLS NOT DISTINCT` (PG 15+). pg_get_indexdef /
 	// BuildIndexDef re-emits the clause so pg_dump round-trips it. DU-002 slice 134.
 	NullsNotDistinct bool
+	// Deferrable / InitiallyDeferred mirror pg_constraint.condeferrable /
+	// condeferred for the UNIQUE/PRIMARY KEY constraint this index backs: true
+	// when the constraint was declared `DEFERRABLE` / `DEFERRABLE INITIALLY
+	// DEFERRED`. pg_get_constraintdef re-emits the clause so pg_dump round-trips
+	// it. Only meaningful when IsConstraint is true. DU-002 slice 139.
+	Deferrable        bool
+	InitiallyDeferred bool
 	// PartitionParentOID is the OID of the parent index for partition index
 	// trees (ALTER INDEX parent ATTACH PARTITION child). Zero if not a partition
 	// index child. M0097-0023.
@@ -3097,8 +3104,17 @@ func (c *InMemory) registerSystemTables() {
 			row[1] = idx.Name
 			row[2] = "2200"
 			row[3] = contype
+			// condeferrable / condeferred: a DEFERRABLE [INITIALLY DEFERRED]
+			// UNIQUE/PK constraint round-trips the flags so pg_dump re-emits the
+			// clause. DU-002 slice 139.
 			row[4] = "f"
+			if idx.Deferrable {
+				row[4] = "t"
+			}
 			row[5] = "f"
+			if idx.InitiallyDeferred {
+				row[5] = "t"
+			}
 			row[6] = "t"
 			row[7] = fmt.Sprintf("%d", idx.Table.OID)
 			row[8] = "0"

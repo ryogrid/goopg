@@ -2862,6 +2862,45 @@ object support.
         slice-134–138 NULLS-equal semantics, OR an exclusion-constraint
         (`EXCLUDE USING gist`) dump surface, OR a named table-level CHECK with
         INCLUDE/expression edge cases.
+      - **PROGRESS 2026-06-17 (loop #104):** **DU-002 slice 139 LANDED** — a
+        table-level UNIQUE constraint declared `DEFERRABLE INITIALLY DEFERRED`
+        (`UNIQUE (a) DEFERRABLE INITIALLY DEFERRED`) now round-trips. pg_dump
+        emits `ADD CONSTRAINT uniqdef_a_key UNIQUE (a) DEFERRABLE INITIALLY
+        DEFERRED`. **Production change:** goopg's anonymous table-level UNIQUE
+        parser case had NO `DEFERRABLE` branch at all (unlike PRIMARY KEY, which
+        silently DISCARDED it), so `UNIQUE (a) DEFERRABLE …` was a HARD PARSE
+        ERROR — the whole CREATE TABLE failed. 4 sites: (1) parser
+        (`internal/parser/ddl.go`) captures `[NOT] DEFERRABLE [INITIALLY
+        DEFERRED|IMMEDIATE]` into new `CreateTableStmt.TableUniqueDeferrable` /
+        `TableUniqueInitiallyDeferred` arrays (INITIALLY DEFERRED implies
+        DEFERRABLE; IMMEDIATE is the default → both false); (2) new
+        `catalog.Index.Deferrable` / `InitiallyDeferred` fields
+        (`internal/catalog/catalog.go`); (3) executor table-level UNIQUE loop
+        (`internal/executor/operators_ddl.go`) threads the flags onto the backing
+        index; (4) deparse `buildConstraintDefString` (`internal/executor/expr.go`)
+        appends ` DEFERRABLE [INITIALLY DEFERRED]` after the column/INCLUDE list +
+        index-backed `pg_constraint` row emits `condeferrable`/`condeferred` from
+        the index (was hard-wired `'f'`). **Scope:** pure dump-fidelity — goopg
+        does not yet implement DEFERRED constraint CHECKING (all checked
+        immediately); flag is recorded + dumped but enforced per-row. Limited to
+        the anonymous table-level UNIQUE form. Tests:
+        `TestParseTableUniqueDeferrable` (parser, 7 forms),
+        3 new `TestBuildConstraintDefNullsNotDistinct` cases (deparse),
+        `TestPort_PgDumpConnectionSetup` (`uniqdef` fixture + assert + 2 negative
+        guards). Files: `internal/parser/ddl.go`, `internal/parser/ast.go`,
+        `internal/parser/ddl_test.go`, `internal/catalog/catalog.go`,
+        `internal/executor/operators_ddl.go`, `internal/executor/expr.go`,
+        `internal/executor/constraintdef_nnd_test.go`,
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`, `.ralph/deferral_ledger.md`.
+        Gates: gofmt OK; `go build ./...` OK; `go vet` OK; parser/catalog/executor
+        suites PASS; `TestParseTableUniqueDeferrable` PASS;
+        `TestBuildConstraintDefNullsNotDistinct` PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.55s); pgbench pre-commit smoke on
+        commit. **Next: slice 140** — DEFERRABLE on the named table-level / inline-
+        column / PRIMARY KEY UNIQUE forms (which still discard the flag), OR
+        INSERT/UPDATE enforcement of the slice-134–138 NULLS-equal semantics, OR an
+        exclusion-constraint (`EXCLUDE USING gist`) dump surface.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

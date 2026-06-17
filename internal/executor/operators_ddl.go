@@ -1281,6 +1281,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if i < len(s.TableUniqueNullsNotDistinct) {
 				idx.NullsNotDistinct = s.TableUniqueNullsNotDistinct[i]
 			}
+			// DEFERRABLE [INITIALLY DEFERRED] — record so pg_get_constraintdef /
+			// pg_constraint re-emit the clause on dump. DU-002 slice 139.
+			if i < len(s.TableUniqueDeferrable) {
+				idx.Deferrable = s.TableUniqueDeferrable[i]
+			}
+			if i < len(s.TableUniqueInitiallyDeferred) {
+				idx.InitiallyDeferred = s.TableUniqueInitiallyDeferred[i]
+			}
 		}
 	}
 	// Create indexes for anonymous EXCLUDE USING constraints. M0097-0023.

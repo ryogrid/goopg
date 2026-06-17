@@ -1,28 +1,29 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 138 (loop #103) — NAMED *table-level* UNIQUE
-(`CONSTRAINT tuniq UNIQUE NULLS NOT DISTINCT (a)`) dump-fidelity round-trip.
-Fixed the pre-existing gap: the named table-level UNIQUE parser case
-(`CONSTRAINT name UNIQUE (cols)`, ddl.go ~1907) did NOT parse the optional
-`NULLS [NOT] DISTINCT` clause that precedes the column list (unlike the
-anonymous table-level form taught by slice 135), so the `(` lookahead landed on
-`NULLS`, `acceptSymbol("(")` returned false, and the WHOLE named constraint was
-silently dropped from the table (and dump). Parser now parses the clause before
-the columns + records `TableConstraintDef.NullsNotDistinct` (field already
-existed from slice 135); executor `NamedConstraints` loop now sets
-`idx.NullsNotDistinct = nc.NullsNotDistinct` on the backing index →
-`buildConstraintDefString` re-emits it. pg_dump emits `ADD CONSTRAINT tuniq
-UNIQUE NULLS NOT DISTINCT (a)`.
-Files: internal/parser/ddl.go, internal/executor/operators_ddl.go,
-internal/parser/ddl_test.go (TestParseTableNamedUniqueNullsNotDistinct),
-internal/testport/pgdump_connsetup_test.go (uniqtname fixture, count-guard 4→5,
-negative guard), docs/design/0110-0001-pg-dump-tap-port.md, .ralph/deferral_ledger.md.
-Verified: TestParseTableNamedUniqueNullsNotDistinct PASS;
-TestBuildConstraintDefNullsNotDistinct PASS; TestPort_PgDumpConnectionSetup PASS
-(2.43s); gofmt/build/vet OK. Committed + pushed.
+Last landed: DU-002 slice 139 (loop #104) — DEFERRABLE INITIALLY DEFERRED on an
+ANONYMOUS table-level UNIQUE constraint round-trips through pg_dump.
+Fixed a HARD PARSE ERROR: goopg's anonymous table-level UNIQUE parser case had
+NO `DEFERRABLE` branch (unlike PRIMARY KEY, which silently discarded it), so
+`UNIQUE (a) DEFERRABLE …` failed the whole CREATE TABLE. 4 sites: parser captures
+`[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]` → new CreateTableStmt arrays
+TableUniqueDeferrable/TableUniqueInitiallyDeferred; new catalog.Index.Deferrable/
+InitiallyDeferred fields; executor table-level UNIQUE loop threads them;
+buildConstraintDefString appends ` DEFERRABLE [INITIALLY DEFERRED]` + pg_constraint
+emits condeferrable/condeferred from the index.
+Scope: pure dump-fidelity — goopg does NOT implement deferred constraint CHECKING
+(all checked immediately); flag dumped but enforced per-row.
+Files: internal/parser/ddl.go, internal/parser/ast.go, internal/parser/ddl_test.go,
+internal/catalog/catalog.go, internal/executor/operators_ddl.go,
+internal/executor/expr.go, internal/executor/constraintdef_nnd_test.go,
+internal/testport/pgdump_connsetup_test.go,
+docs/design/0110-0001-pg-dump-tap-port.md, .ralph/deferral_ledger.md.
+Verified: TestParseTableUniqueDeferrable PASS; TestBuildConstraintDefNullsNotDistinct
+PASS; TestPort_PgDumpConnectionSetup PASS (2.55s); parser/catalog/executor suites
+green; gofmt/build/vet OK. Committed + pushed.
 
-Next direction (slice 139): enforcement of the slice-134–138 NULLS-equal
-semantics at INSERT/UPDATE (encodeIndexKeyFromCols NULL-sentinel encoding gated
-on idx.NullsNotDistinct — riskier multi-encoding-site executor change), OR an
-exclusion-constraint (`EXCLUDE USING gist`) dump surface, OR a named table-level
-CHECK with INCLUDE/expression edge cases.
+Next direction (slice 140): DEFERRABLE on the NAMED table-level / inline-column /
+PRIMARY KEY UNIQUE forms (still discard the flag — mirror the anonymous form),
+OR INSERT/UPDATE enforcement of the slice-134–138 NULLS-equal semantics
+(riskier multi-encoding-site `encodeIndexKeyFromCols`), OR an exclusion-constraint
+(`EXCLUDE USING gist`) dump surface. The deferred-check EXECUTION (check at COMMIT
+not per-row) is a separate larger transaction-machinery milestone (ledger).
