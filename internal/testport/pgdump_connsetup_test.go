@@ -1488,6 +1488,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function add_one: %v", err)
 	}
 
+	// Slice 149: a second user function carrying explicit IMMUTABLE STRICT
+	// markers, so the dump exercises the pg_proc virtual view's `provolatile`
+	// ('i') and `proisstrict` ('t') columns end-to-end — slice 148 only proved
+	// the default 'v'/'f' path (add_one emits neither clause). pg_dump's dumpFunc
+	// (pg_dump.c:13531/13542) appends ` IMMUTABLE` when provolatile[0] != 'v' and
+	// ` STRICT` when proisstrict[0] == 't', both inline after `LANGUAGE sql`.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.add_two(integer) RETURNS integer LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1 + 2 $$"); err != nil {
+		t.Fatalf("create function add_two: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -1912,6 +1922,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if strings.Contains(res.Stdout, "SUPPORT 0") {
 			t.Errorf("pg_dump emitted invalid `SUPPORT 0` (prosupport must render regproc InvalidOid as '-')\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 149 (asserted):** the IMMUTABLE STRICT function (add_two) must
+		// round-trip with both clauses. Slice 148 only proved the all-default
+		// volatility/strict path; this slice drives the pg_proc virtual view's
+		// `provolatile`='i' and `proisstrict`='t' cells through getFuncs -> dumpFunc.
+		// dumpFunc appends ` IMMUTABLE` (provolatile[0] != 'v') then ` STRICT`
+		// (proisstrict[0] == 't') inline after `LANGUAGE sql`, so real pg_dump 18.3
+		// renders:
+		//   CREATE FUNCTION public.add_two(integer) RETURNS integer
+		//       LANGUAGE sql IMMUTABLE STRICT
+		//       AS $_$ SELECT $1 + 2 $_$;
+		// If the view typed/emitted either column wrong the clause would be dropped
+		// or misordered. Assert the exact one-line LANGUAGE/IMMUTABLE/STRICT fragment.
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.add_two(integer) RETURNS integer") {
+			t.Errorf("pg_dump dropped/mangled the add_two signature\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "    LANGUAGE sql IMMUTABLE STRICT\n    AS $_$ SELECT $1 + 2 $_$;") {
+			t.Errorf("pg_dump dropped/mangled add_two's IMMUTABLE STRICT clauses or body\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

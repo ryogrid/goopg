@@ -4101,6 +4101,34 @@ negative guard on `SUPPORT 0`. Unit guard: `initdb.TestPgProcViewProsupport`
 (now pins type=regproc and value=`-`). Pure dump-fidelity; no catalog-schema
 change.
 
+### Slice 149 — non-default volatility/strict round-trip (`IMMUTABLE STRICT`)
+
+Slice 148 asserted the `CREATE FUNCTION` body for `add_one`, but that function
+carries the all-default attribute set — `provolatile`='v', `proisstrict`='f' —
+so `dumpFunc` emits neither a volatility nor a `STRICT` clause. The
+`provolatile`/`proisstrict` columns of the `pg_proc` virtual view were therefore
+only ever exercised at their default values; a wrong type or value mapping for
+the non-default cells would have gone unnoticed.
+
+This slice adds a second function with explicit markers:
+
+```
+CREATE FUNCTION public.add_two(integer) RETURNS integer
+    LANGUAGE sql IMMUTABLE STRICT
+    AS $$ SELECT $1 + 2 $$;
+```
+
+`dumpFunc` (`pg_dump.c:13531`/`:13542`) appends ` IMMUTABLE` when
+`provolatile[0] != 'v'` and ` STRICT` when `proisstrict[0] == 't'`, both inline
+after `LANGUAGE sql`, so real pg_dump 18.3 renders `LANGUAGE sql IMMUTABLE
+STRICT`. goopg's CREATE FUNCTION executor stores `r.Volatile`='i' /
+`r.Strict`=true (the parser defaults `Volatile` to `v` and overrides to `i` for
+`IMMUTABLE`), and the view emits `provolatile`='i' (text) and `proisstrict`='t'
+(bool) verbatim, so the dump matched on the first run — a clean positive test, no
+production change. The test asserts the exact one-line
+`LANGUAGE sql IMMUTABLE STRICT` / `AS $_$ SELECT $1 + 2 $_$;` fragment. Pure
+dump-fidelity; no catalog-schema change.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

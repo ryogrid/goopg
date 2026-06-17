@@ -3191,6 +3191,38 @@ object support.
         (e.g. `COMMENT ON {COLLATION, EXTENSION, AGGREGATE}` round-trip), or the
         deferred-check execution spike.
 
+      - **PROGRESS 2026-06-17 (loop #113):** **DU-002 slice 148 LANDED** (commit
+        `859b72d7`) — `CREATE FUNCTION` round-trips byte-identically through
+        pg_dump; fixed a real `SUPPORT 0` defect. goopg's *virtual* `pg_proc`
+        view typed `prosupport` `oid`, emitting text `0`; `dumpFunc`
+        (`pg_dump.c:13575`) emits `SUPPORT <val>` whenever `strcmp(prosupport,
+        "-") != 0`, so the dump carried invalid `LANGUAGE sql SUPPORT 0`. Fix:
+        retype the virtual column `oid → regproc` + emit `-` in both row builders.
+        Files: `internal/initdb/pg_proc_view.go`, `pg_proc_view_test.go`,
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`.
+
+      - **PROGRESS 2026-06-17 (loop #114):** **DU-002 slice 149 LANDED** —
+        non-default volatility/strict now round-trips. Slice 148 asserted only
+        `add_one` (all-default attrs: `provolatile`='v', `proisstrict`='f'), so
+        the `pg_proc` virtual view's `provolatile`/`proisstrict` cells were never
+        exercised at non-default values. This slice adds
+        `public.add_two(integer) … IMMUTABLE STRICT` and asserts pg_dump emits the
+        exact one-line `LANGUAGE sql IMMUTABLE STRICT` / `AS $_$ SELECT $1 + 2
+        $_$;` fragment (`dumpFunc` `pg_dump.c:13531`/`:13542` appends ` IMMUTABLE`
+        when `provolatile[0] != 'v'` and ` STRICT` when `proisstrict[0] == 't'`).
+        goopg's executor already stores `r.Volatile`='i' / `r.Strict`=true and the
+        view emits them verbatim, so the dump matched on the first run — a clean
+        positive test, **no production change** (test + design-doc only). Files:
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK; `go build
+        ./internal/...` OK; `TestPort_PgDumpConnectionSetup` PASS (2.16s, not
+        skipped); pgbench pre-commit smoke on commit. **Next: slice 150** — a
+        fresh pg_dump catalog-surface gap (e.g. a SECURITY DEFINER / LEAKPROOF /
+        PARALLEL SAFE function exercising the remaining dumpFunc clauses, a
+        set-returning function's `ROWS` clause, or a `CREATE PROCEDURE` /
+        prokind='p' round-trip).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).
