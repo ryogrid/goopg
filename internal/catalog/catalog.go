@@ -147,6 +147,14 @@ type Column struct {
 	// compress; this is recorded purely so the column round-trips through pg_dump.
 	// DU-002 slice 183.
 	Compression string
+	// StatTarget is the per-column statistics target set via `ALTER COLUMN ...
+	// SET STATISTICS <n>`. nil means unset — PG stores attstattarget=NULL (the
+	// default, encoded as -1 to clients) and pg_dump emits no SET STATISTICS
+	// clause. A non-nil value >= 0 makes pg_dump re-emit `ALTER TABLE ONLY ...
+	// SET STATISTICS <n>`. goopg does not sample at a per-column granularity;
+	// this is recorded purely so the column round-trips through pg_dump.
+	// DU-002 slice 184.
+	StatTarget *int
 }
 
 // NamedCheckConstraint holds a CHECK constraint with an explicit name.

@@ -4034,6 +4034,33 @@ object support.
         `./internal/catalog/`, `./internal/executor/` PASS; `TestPort_PgDumpConnectionSetup` PASS (3.21s);
         pgbench pre-commit smoke on commit. **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node slice
         (HIGHER RISK: partition routing); or close the `validateDefaultExpr` array/row/CASE/InExpr recursion gap.
+      - **PROGRESS 2026-06-17 (loop #152):** **DU-002 slice 184 LANDED — per-column statistics target
+        (`ALTER COLUMN ... SET STATISTICS <n>`) round-trips through pg_dump.** The third sibling of slices
+        182/183, for `pg_attribute.attstattarget`. pg_dump's `dumpTableSchema` reads `a.attstattarget` and
+        emits `ALTER TABLE ONLY <t> ALTER COLUMN <c> SET STATISTICS <n>;` whenever `attstattarget >= 0`; the
+        PG18 default `NULL` (decoded as -1) emits nothing. The parser had **no SET STATISTICS arm in the
+        table ALTER-COLUMN path** (only the ALTER INDEX expression-column path), so the clause fell through
+        to the no-op consumer, and `buildUserPGAttributeRow` hardcoded `attstattarget=NULL`. **Fix (3 layers,
+        mirroring 182/183):** (1) parser — new `SET STATISTICS` arm in the table ALTER-COLUMN path emits
+        `AlterTableSetStatistics{CheckExpr=value, ColumnName}`; leading `-` (`SET STATISTICS -1` reset) is
+        accepted (`-` lexes as `TokenOperator`); (2) `buildUserPGAttributeRow` — emits the integer in
+        `attstattarget` when `Column.StatTarget != nil && *>= 0`, else NULL; (3) `AlterTableSetStatistics`
+        executor arm (table branch) parses `CheckExpr`, sets/clears `catalog.Column.StatTarget` (a `*int`:
+        nil=unset, so `SET STATISTICS 0` is distinguishable from "never set"), AND flushes through the same
+        delete-old-rows + `syncTableToCatalogHeap` re-sync path (load-bearing: pg_dump scans the persisted
+        heap). No CREATE TABLE threading needed (SET STATISTICS is ALTER-only). Dump-fidelity only (goopg does
+        not sample per-column targets). New field `catalog.Column.StatTarget *int`. Files:
+        `internal/catalog/catalog.go`, `internal/parser/ddl.go`,
+        `internal/executor/pg18_user_catalog_rows.go`, `internal/executor/operators_ddl.go`,
+        `internal/executor/pg18_user_catalog_rows_test.go` (`TestUserPGAttributeStatTargetOverride`),
+        `internal/parser/alter_test.go` (`TestParseAlterTableSetStatistics`),
+        `internal/testport/pgdump_connsetup_test.go` (`statcol` fixture + 2 positive + 1 negative assert),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 184 section). Gates: gofmt OK; `go vet
+        ./internal/parser/ ./internal/catalog/ ./internal/executor/` clean; full `./internal/parser/`,
+        `./internal/catalog/`, `./internal/executor/` PASS; `TestPort_PgDumpConnectionSetup` PASS (3.08s);
+        pgbench pre-commit smoke on commit. **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node slice
+        (HIGHER RISK: partition routing); or close the `validateDefaultExpr` array/row/CASE/InExpr recursion gap;
+        or other pg_dump per-column attribute gaps (attoptions / attfdwoptions are NULL today).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

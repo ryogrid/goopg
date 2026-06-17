@@ -639,6 +639,45 @@ func TestUserPGAttributeCompressionOverride(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeStatTargetOverride pins the per-column statistics-target
+// override (DU-002 slice 184). A column carrying an `ALTER COLUMN ... SET
+// STATISTICS <n>` result (catalog.Column.StatTarget) must report that value in
+// pg_attribute.attstattarget; pg_dump re-emits `ALTER TABLE ... SET STATISTICS
+// <n>` whenever attstattarget >= 0. The PG18 default is NULL, for which pg_dump
+// emits nothing; attstattarget was hardcoded NULL so a declared target was
+// silently dropped from the dump.
+func TestUserPGAttributeStatTargetOverride(t *testing.T) {
+	const attstattargetIdx = 24 // attstattarget position (last) in the user pg_attribute row
+	tbl := &catalog.Table{Name: "t", OID: 99003}
+
+	// No override: attstattarget is NULL (the PG18 default → no SET STATISTICS).
+	base := buildUserPGAttributeRow(nil, tbl, catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0})
+	if !base[attstattargetIdx].IsNull() {
+		t.Fatalf("column without override: attstattarget=%v want NULL", base[attstattargetIdx])
+	}
+
+	// Each explicit target (including 0, which disables stats) reports its value.
+	for _, want := range []int{0, 100, 10000} {
+		v := want
+		col := catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0, StatTarget: &v}
+		row := buildUserPGAttributeRow(nil, tbl, col)
+		if row[attstattargetIdx].IsNull() {
+			t.Errorf("SET STATISTICS %d: attstattarget=NULL want %d", want, want)
+			continue
+		}
+		if got := int(row[attstattargetIdx].Int); got != want {
+			t.Errorf("SET STATISTICS %d: attstattarget=%d want %d", want, got, want)
+		}
+	}
+
+	// A negative target (the reset sentinel) reports NULL — pg_dump emits nothing.
+	neg := -1
+	col := catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0, StatTarget: &neg}
+	if got := buildUserPGAttributeRow(nil, tbl, col)[attstattargetIdx]; !got.IsNull() {
+		t.Errorf("negative target: attstattarget=%v want NULL", got)
+	}
+}
+
 // TestUserPGAttributeEnumColumn pins the enum-column resolution (DU-002 slice
 // 88). A column whose declared type is a user-defined enum must report
 // pg_attribute.atttypid = the enum's dynamic pg_type OID (not the text

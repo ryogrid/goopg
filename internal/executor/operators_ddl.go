@@ -4157,6 +4157,51 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+		case parser.AlterTableSetStatistics:
+			// SET STATISTICS <n> — record the per-column statistics target on the
+			// catalog column AND rewrite the pg_attribute heap row so pg_dump
+			// observes the new attstattarget. pg_dump emits `ALTER TABLE ONLY ...
+			// ALTER COLUMN ... SET STATISTICS <n>` whenever attstattarget >= 0
+			// (pg_dump.c dumpTableSchema); the default (NULL/-1) emits nothing.
+			// Like SET STORAGE (slice 182) / SET COMPRESSION (slice 183), the
+			// in-memory mutation alone is invisible because pg_attribute is a heap
+			// populated at CREATE TABLE; the override must be flushed through the
+			// same delete-old-rows + re-sync path or the stale heap row keeps
+			// reporting NULL and the SET STATISTICS is silently dropped from the
+			// dump. `SET STATISTICS -1` (or a negative value) resets to the default
+			// and clears the override. goopg does not sample per-column statistics
+			// targets — dump-fidelity only. DU-002 slice 184.
+			if act.ColumnName != "" {
+				target, parseErr := strconv.Atoi(act.CheckExpr)
+				if parseErr != nil {
+					// No (or malformed) value: treat as reset to default.
+					target = -1
+				}
+				changed := false
+				for i := range tbl.Columns {
+					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+						if target < 0 {
+							tbl.Columns[i].StatTarget = nil
+						} else {
+							v := target
+							tbl.Columns[i].StatTarget = &v
+						}
+						changed = true
+						break
+					}
+				}
+				if changed && catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+			}
 		case parser.AlterTableAlterColumnSet:
 			// SET (options) on a column of a heap table: no-op in goopg v0.
 		case parser.AlterTableAlterColumnType:

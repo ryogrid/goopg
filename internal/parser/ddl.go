@@ -4747,6 +4747,30 @@ func (p *parser) parseAlter() (Stmt, error) {
 				})
 				return stmt, nil
 			}
+			// SET STATISTICS value — record the per-column statistics target on the
+			// catalog column for pg_dump round-trip fidelity. pg_dump emits an
+			// `ALTER TABLE ONLY ... ALTER COLUMN ... SET STATISTICS <n>` whenever
+			// attstattarget >= 0 (pg_dump.c dumpTableSchema); the default (-1) emits
+			// nothing. goopg does not sample statistics targets at this granularity;
+			// the value is recorded purely so the column round-trips. DU-002 slice 184.
+			if p.acceptIdentKeyword("statistics") {
+				statsVal := ""
+				if (p.cur().Kind == TokenOperator || p.cur().Kind == TokenSymbol) && p.cur().Value == "-" {
+					// SET STATISTICS -1 resets to the default.
+					statsVal = "-"
+					p.advance()
+				}
+				if p.cur().Kind == TokenIntLit {
+					statsVal += p.cur().Value
+					p.advance()
+				}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:       AlterTableSetStatistics,
+					ColumnName: colName,
+					CheckExpr:  statsVal,
+				})
+				return stmt, nil
+			}
 		}
 		// Check for TYPE newtype pattern.
 		// "type" is not in goopg's keyword map — arrives as TokenIdent.

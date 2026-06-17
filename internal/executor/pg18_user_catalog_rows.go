@@ -667,6 +667,16 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	if c := compressionNameToAttCode(col.Compression); c != 0 {
 		attCompressionStr = string(c)
 	}
+	// A per-column statistics target override (ALTER COLUMN ... SET STATISTICS
+	// <n>) sets pg_attribute.attstattarget to the value. pg_dump emits an
+	// `ALTER TABLE ONLY ... SET STATISTICS <n>` whenever attstattarget >= 0
+	// (pg_dump.c dumpTableSchema); the PG18 default is NULL (encoded as -1 to
+	// clients) for which pg_dump emits nothing. attstattarget was hardcoded to
+	// NULL so a declared target was silently dropped from the dump. DU-002 slice 184.
+	attStatTargetDatum := NullDatum
+	if col.StatTarget != nil && *col.StatTarget >= 0 {
+		attStatTargetDatum = NewIntDatum(int64(*col.StatTarget))
+	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),            // attrelid
 		NewStringDatum(col.Name),               // attname (name)
@@ -696,12 +706,13 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		// attacl / attoptions / attfdwoptions / attmissingval are nullable
 		// varlena columns; PG18 stores NULL when unset. NullDatum signals
 		// EncodeRowPG to skip the column and the bitmap helper to clear
-		// its bit. attstattarget (last) is likewise NULL (PG18 default).
-		NullDatum, // attacl
-		NullDatum, // attoptions
-		NullDatum, // attfdwoptions
-		NullDatum, // attmissingval
-		NullDatum, // attstattarget
+		// its bit. attstattarget (last) is NULL by default but carries the
+		// per-column SET STATISTICS override when one is set (DU-002 slice 184).
+		NullDatum,          // attacl
+		NullDatum,          // attoptions
+		NullDatum,          // attfdwoptions
+		NullDatum,          // attmissingval
+		attStatTargetDatum, // attstattarget (NULL default; integer override)
 	}
 }
 

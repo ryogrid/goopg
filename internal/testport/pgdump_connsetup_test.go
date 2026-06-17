@@ -935,6 +935,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("alter cmprcol.b set compression lz4: %v", err)
 	}
 
+	// Slice 184: a per-column statistics target must survive the dump. pg_dump
+	// emits `ALTER TABLE ONLY ... ALTER COLUMN ... SET STATISTICS <n>` whenever
+	// pg_attribute.attstattarget >= 0 (pg_dump.c dumpTableSchema). goopg recorded
+	// the target on catalog.Column.StatTarget, but the synthesized pg_attribute
+	// row hardcoded attstattarget=NULL (the default), so the target was silently
+	// dropped from the dump. `statcol.a` SET STATISTICS 100; `b` SET STATISTICS 0
+	// (a valid, non-default target that disables sampling); the untouched `d`
+	// must NOT re-emit.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.statcol (a integer, b integer, d integer)"); err != nil {
+		t.Fatalf("create table statcol: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.statcol ALTER COLUMN a SET STATISTICS 100"); err != nil {
+		t.Fatalf("alter statcol.a set statistics 100: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.statcol ALTER COLUMN b SET STATISTICS 0"); err != nil {
+		t.Fatalf("alter statcol.b set statistics 0: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -2470,6 +2488,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if strings.Contains(res.Stdout, "ALTER COLUMN d SET COMPRESSION") {
 			t.Errorf("pg_dump emitted a spurious SET COMPRESSION for an untouched column (cmprcol.d)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 184 (asserted):** per-column statistics targets. `statcol.a`
+		// got `SET STATISTICS 100` and `statcol.b` `SET STATISTICS 0`; both are
+		// non-default (attstattarget >= 0), so pg_dump must re-emit each as a
+		// standalone `ALTER TABLE ONLY public.statcol ALTER COLUMN <c> SET
+		// STATISTICS <n>;` (pg_dump.c dumpTableSchema). Before the fix
+		// attstattarget was hardcoded NULL, so neither statement appeared. The
+		// untouched `d` column (attstattarget NULL) must NOT produce one.
+		for _, sub := range []string{
+			"ALTER TABLE ONLY public.statcol ALTER COLUMN a SET STATISTICS 100;",
+			"ALTER TABLE ONLY public.statcol ALTER COLUMN b SET STATISTICS 0;",
+		} {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a column statistics target; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		if strings.Contains(res.Stdout, "ALTER COLUMN d SET STATISTICS") {
+			t.Errorf("pg_dump emitted a spurious SET STATISTICS for an untouched column (statcol.d)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

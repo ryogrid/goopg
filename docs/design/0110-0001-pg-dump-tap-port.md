@@ -5295,6 +5295,41 @@ and `TestParseCreateTableColumnCompression` pin both input forms. The TAP test a
 asserts the dump re-emits both `SET COMPRESSION` statements while the untouched `d` produces none.
 Dump-fidelity only: goopg does not TOAST/compress, so the method has no runtime effect.
 
+### Slice 184 — per-column statistics target (ALTER COLUMN ... SET STATISTICS) round-trip
+
+The third sibling in the slice 182/183 family, this time for `pg_attribute.attstattarget`: a
+per-column statistics target set via `ALTER TABLE ... ALTER COLUMN c SET STATISTICS <n>` was silently
+dropped from the dump. pg_dump's `dumpTableSchema` (pg_dump.c) reads `a.attstattarget` and emits
+
+```sql
+ALTER TABLE ONLY public.statcol ALTER COLUMN a SET STATISTICS 100;
+```
+
+whenever `attstattarget >= 0`; the PG18 default `NULL` (decoded as `-1` to clients) emits nothing.
+goopg's parser had no `SET STATISTICS` arm in the **table** ALTER-COLUMN path (only the `ALTER INDEX`
+expression-column path), so the clause fell through to the no-op consumer, and `buildUserPGAttributeRow`
+hardcoded `attstattarget=NULL`. Three layers were wired, mirroring slices 182/183:
+
+1. **Parser** — a new `SET STATISTICS` arm in the `ALTER TABLE ... ALTER COLUMN` path emits an
+   `AlterTableSetStatistics` action carrying the integer value in `CheckExpr` + `ColumnName`. A leading
+   `-` (`SET STATISTICS -1`, the reset-to-default form) is accepted; `-` lexes as `TokenOperator`.
+
+2. **`buildUserPGAttributeRow`** — when `Column.StatTarget != nil && *StatTarget >= 0` it emits that
+   integer in `attstattarget`; otherwise NULL (the default). `SET STATISTICS -1` clears the override
+   (back to NULL), matching PG, since pg_dump only emits for `>= 0`.
+
+3. **The `AlterTableSetStatistics` executor arm** (`operators_ddl.go`, table branch) parses `CheckExpr`,
+   sets/clears `catalog.Column.StatTarget` (a `*int`: nil = unset, so `SET STATISTICS 0` — a valid
+   non-default value that disables sampling — is distinguishable from "never set"), **and** flushes
+   through the same delete-old-rows + `syncTableToCatalogHeap` re-sync path slices 182/183 use — the
+   load-bearing step, since pg_dump scans the persisted `pg_attribute` heap, not the live catalog object.
+
+`TestUserPGAttributeStatTargetOverride` pins the datum mapping (0/100/10000 → integer, nil/negative →
+NULL). `TestParseAlterTableSetStatistics` pins the four parse forms (100, 0, -1, 10000). The TAP test
+adds a `statcol(a, b, d integer)` fixture — `a` `SET STATISTICS 100`, `b` `SET STATISTICS 0` — and
+asserts the dump re-emits both statements while the untouched `d` produces none. Dump-fidelity only:
+goopg does not sample per-column statistics targets, so the value has no runtime effect.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
