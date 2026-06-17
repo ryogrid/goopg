@@ -3347,6 +3347,36 @@ Positive assert pins the suffix; negative guard rejects a plain
 `CONSTRAINT chk2_y_check CHECK ((y > 0))\n` (flag dropped). Verified
 byte-identical to real pg_dump 18.3 (reference `/tmp/du128_pgdata`).
 
+### Slice 129 — named table-level CHECK with NO INHERIT
+
+The named analog of slice 128. A `CONSTRAINT c CHECK (expr) NO INHERIT` is parsed
+into a `PartitionCheckConstraint` (`CreateTableStmt.TableNamedChecks`), which had
+**no** `NoInherit` field — the parser detected the suffix only into the aggregate
+`TableHasNoInheritCheck` bool, and the executor stored named checks via
+`AddCheck` (NoInherit=false). So the named NO-INHERIT check dumped as a plain
+*inheritable* CHECK: `pg_get_constraintdef` dropped the suffix and
+`pg_constraint.connoinherit` reported `'f'` — the identical silent
+inheritance-semantics divergence as slice 128, but for the explicitly named form.
+
+The deparse path needed no change: `pg_get_constraintdef`'s CHECK branch and the
+`pg_constraint` `VirtualRows` row both already key off `NamedCheckConstraint.NoInherit`
+in the catalog (shared by anonymous auto-named and named checks). The fix threads
+the flag through the named path:
+
+- `parser`: `PartitionCheckConstraint.NoInherit bool`; the named-CHECK parse site
+  sets it on the just-appended entry once ` NO INHERIT` is consumed (the append
+  precedes the suffix parse, so it back-fills the last element).
+- `executor`: the `s.TableNamedChecks` loop now calls
+  `AddCheckWithNoInherit(nc.Name, nc.Expr, oid, nc.NoInherit)` instead of `AddCheck`.
+
+```sql
+CREATE TABLE public.chk3 (z integer, CONSTRAINT chk3_pos CHECK (z > 0) NO INHERIT);
+-- → CONSTRAINT chk3_pos CHECK ((z > 0)) NO INHERIT
+```
+
+Positive assert pins the named suffix; negative guard rejects a plain
+`CONSTRAINT chk3_pos CHECK ((z > 0))\n` (flag dropped).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

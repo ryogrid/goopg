@@ -1954,6 +1954,11 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				// anonymous branch appended an expr. DU-002 slice 128.
 				if anonCheck {
 					stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
+				} else if noInherit && len(stmt.TableNamedChecks) > 0 {
+					// Named branch appended before NO INHERIT was parsed; carry the
+					// per-constraint flag so the named NO-INHERIT check re-emits the
+					// suffix on dump. DU-002 slice 129.
+					stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NoInherit = true
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
 				// CONSTRAINT name FOREIGN KEY (cols) REFERENCES t (cols) … —

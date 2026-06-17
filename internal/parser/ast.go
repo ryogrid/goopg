@@ -1123,6 +1123,10 @@ type PartitionColGenerated struct {
 type PartitionCheckConstraint struct {
 	Name string // constraint name (from CONSTRAINT name CHECK (...))
 	Expr string // raw SQL expression text
+	// NoInherit is true for `CONSTRAINT c CHECK (...) NO INHERIT` (PG18
+	// connoinherit='t'); the dumped constraintdef must re-emit the ` NO INHERIT`
+	// suffix and pg_constraint must report connoinherit. DU-002 slice 129.
+	NoInherit bool
 }
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]

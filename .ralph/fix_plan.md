@@ -2573,6 +2573,35 @@ object support.
         (pg_foreign_data_wrapper/pg_foreign_server are empty, so the correlated
         SRF never evaluates a non-empty options array). Track separately if a
         real text[]-column expansion path is ever needed.
+      - **PROGRESS 2026-06-17 (loop #93):** **DU-002 slice 129 LANDED** — a NAMED
+        table-level CHECK with NO INHERIT (`CREATE TABLE t (..., CONSTRAINT c
+        CHECK (expr) NO INHERIT)`) now re-emits the ` NO INHERIT` suffix on dump.
+        The named analog of slice 128's anonymous fix: `PartitionCheckConstraint`
+        (`CreateTableStmt.TableNamedChecks`) had **no** `NoInherit` field — the
+        parser detected the suffix only into the aggregate `TableHasNoInheritCheck`
+        bool, and the executor stored named checks via `AddCheck` (NoInherit=false).
+        So a named NO-INHERIT check dumped as a plain *inheritable* CHECK
+        (`pg_get_constraintdef` dropped the suffix; `pg_constraint.connoinherit`
+        reported `'f'`) — the identical silent inheritance-semantics divergence, but
+        for the explicitly named form. The deparse path needed no change (both
+        `pg_get_constraintdef`'s CHECK branch and the `pg_constraint` VirtualRow
+        already key off `NamedCheckConstraint.NoInherit`, shared by anon-auto-named
+        and named checks). Fix: parser adds `PartitionCheckConstraint.NoInherit` and
+        back-fills it on the just-appended entry once ` NO INHERIT` is consumed
+        (the append precedes the suffix parse); executor's `TableNamedChecks` loop
+        calls `AddCheckWithNoInherit(nc.Name, nc.Expr, oid, nc.NoInherit)` instead
+        of `AddCheck`. `CREATE TABLE public.chk3 (z integer, CONSTRAINT chk3_pos
+        CHECK (z > 0) NO INHERIT)` → `CONSTRAINT chk3_pos CHECK ((z > 0)) NO INHERIT`.
+        Files: `internal/parser/ast.go` (NoInherit field), `internal/parser/ddl.go`
+        (named-CHECK parse back-fills flag), `internal/executor/operators_ddl.go`
+        (named loop uses AddCheckWithNoInherit), `internal/testport/pgdump_connsetup_test.go`
+        (chk3 fixture + positive assert + negative NO-INHERIT-dropped guard),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 129). Gates: `go build
+        ./...` OK; `TestPort_PgDumpConnectionSetup` PASS (2.3s); `go test
+        ./internal/parser/ ./internal/catalog/ ./internal/executor/` PASS; pgbench
+        pre-commit smoke on commit. **Next: slice 130** — a table+VIEW
+        dependency-ordering case (verify topological emission ORDER), OR a UNIQUE
+        constraint with an INCLUDE column.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

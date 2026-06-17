@@ -475,6 +475,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TABLE public.chk2 (y integer, CHECK (y > 0) NO INHERIT)"); err != nil {
 		t.Fatalf("create table chk2: %v", err)
 	}
+	// Slice 129: a NAMED table-level CHECK with NO INHERIT
+	// (`CONSTRAINT c CHECK (...) NO INHERIT`). The analog of slice 128 for the
+	// named branch: PartitionCheckConstraint had no NoInherit field, and the
+	// executor called AddCheck (NoInherit=false), so the dumped constraintdef
+	// DROPPED the ` NO INHERIT` suffix and pg_constraint reported connoinherit='f'
+	// — the same silent inheritance-semantics divergence, but for the explicitly
+	// named form. Fix threads the per-constraint flag through the named path.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.chk3 (z integer, CONSTRAINT chk3_pos CHECK (z > 0) NO INHERIT)"); err != nil {
+		t.Fatalf("create table chk3: %v", err)
+	}
 
 	// Slice 54: a non-empty reloptions (`WITH (fillfactor=70)`) must surface in
 	// the dump. Slice 47 made an EMPTY reloptions read as SQL NULL (no WITH
@@ -1408,6 +1418,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// re-emit the ` NO INHERIT` suffix; the per-check flag was previously
 			// discarded so the dump produced a plain inheritable CHECK.
 			"CONSTRAINT chk2_y_check CHECK ((y > 0)) NO INHERIT",
+			// **Slice 129:** a NAMED table-level CHECK with NO INHERIT must keep
+			// its user-given name AND re-emit the ` NO INHERIT` suffix; the
+			// PartitionCheckConstraint per-constraint flag was previously absent.
+			"CONSTRAINT chk3_pos CHECK ((z > 0)) NO INHERIT",
 		}
 		for _, sub := range check {
 			if !strings.Contains(res.Stdout, sub) {
@@ -1444,6 +1458,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// before `);`), silently changing its inheritance semantics on restore.
 		if strings.Contains(res.Stdout, "CONSTRAINT chk2_y_check CHECK ((y > 0))\n") {
 			t.Errorf("pg_dump dropped NO INHERIT from an anonymous CHECK\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 129 negative guard: dropping the per-constraint flag on the named
+		// path would render chk3_pos as a plain inheritable CHECK (terminated by a
+		// newline), silently changing its inheritance semantics on restore.
+		if strings.Contains(res.Stdout, "CONSTRAINT chk3_pos CHECK ((z > 0))\n") {
+			t.Errorf("pg_dump dropped NO INHERIT from a named CHECK\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 55 closed (asserted):** COMMENT ON {TABLE,COLUMN} must survive
 		// the dump. goopg already parsed COMMENT ON and populated pg_description

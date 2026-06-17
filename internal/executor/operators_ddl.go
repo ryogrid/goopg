@@ -1353,8 +1353,10 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		tbl.AddCheckWithNoInherit(autoName, chk, o.allocConstraintOID(autoName), noInherit)
 	}
 	// Named table-level CHECK constraints from CONSTRAINT name CHECK (expr). M0097-0023.
+	// A named `CONSTRAINT c CHECK (...) NO INHERIT` must keep its per-constraint
+	// flag so the dumped constraintdef re-emits the suffix. DU-002 slice 129.
 	for _, nc := range s.TableNamedChecks {
-		tbl.AddCheck(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name))
+		tbl.AddCheckWithNoInherit(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name), nc.NoInherit)
 	}
 	// Copy statistics from LIKE INCLUDING STATISTICS (or INCLUDING ALL) sources. M0097-0023.
 	if len(likeStatisticsSources) > 0 {
