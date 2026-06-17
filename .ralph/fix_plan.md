@@ -3369,6 +3369,28 @@ object support.
         procedure carrying an INOUT param (the `'b'` → `INOUT ` branch, the last
         unrendered argmode), or a STABLE / PARALLEL RESTRICTED volatility variant.
 
+      - **PROGRESS 2026-06-17 (loop #122):** **DU-002 slice 156 LANDED** — a
+        procedure carrying a single `INOUT` parameter, closing the argmode-render
+        coverage matrix (`IN`/`OUT`/`INOUT`) through pg_dump. Slice 155 reached the
+        `OUT ` branch (`proargmodes` element `'o'`); `INOUT ` (element `'b'`) was the
+        last mode prefix `pg_get_function_arguments` could emit that no slice had
+        driven end-to-end. A lone `'b'` element sets `showMode` (the
+        `m == "o" || m == "b"` detector in `expr.go`), so pg_dump rebuilds the
+        signature mode-qualified and writes the explicit `INOUT ` prefix
+        (`expr.go:11352`, `case "b"`). Parser maps `INOUT` → `FuncArgInout`
+        (`operators_ddl.go:5524`); `INSERT` body accepted by `validateSQLFunctionBody`.
+        **Clean positive (verified empirically), not a divergence** — the branch was
+        already wired. Test adds `public.proc_inout(INOUT x integer) LANGUAGE sql AS $$
+        INSERT … $$` and asserts `CREATE PROCEDURE public.proc_inout(INOUT x integer)`
+        + the `LANGUAGE sql` / `AS $$ … $$;` fragment. Files:
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK; `go build
+        ./internal/...` OK; `TestPort_PgDumpConnectionSetup` PASS (2.29s, not skipped);
+        pgbench pre-commit smoke on commit. **Next: slice 157** — a STABLE or PARALLEL
+        RESTRICTED volatility variant (`provolatile='s'` / `proparallel='r'` cells not
+        yet hit through pg_dump; same plumbing as slices 149/150), or a multi-statement
+        SQL-procedure body.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

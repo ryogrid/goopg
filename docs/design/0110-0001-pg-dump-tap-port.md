@@ -4318,6 +4318,30 @@ The TAP test creates `public.proc_out(a integer, OUT b integer) LANGUAGE sql AS 
 INSERT … $$` and asserts the `(IN a integer, OUT b integer)` signature plus the exact
 `LANGUAGE sql` / `AS $$ … $$;` fragment.
 
+### Slice 156 — INOUT-parameter procedure round-trip (coverage; clean positive)
+
+Slice 155 reached the `OUT ` argmode branch (`proargmodes` element `'o'`); the only
+mode prefix `pg_get_function_arguments` could still emit that no slice had driven
+end-to-end is `INOUT ` (element `'b'`). This slice adds a procedure with a **single
+`INOUT` parameter**. A lone `'b'` element is enough to trip the OUT/INOUT detector in
+the renderer (`expr.go`, where `m == "o" || m == "b"` sets `showMode`), so pg_dump
+rebuilds the signature mode-qualified and writes the explicit `INOUT ` prefix
+(`expr.go:11352`, `case "b"`). The parser maps `INOUT` to `FuncArgInout`
+(`operators_ddl.go:5524`). The `INSERT` body is accepted by `validateSQLFunctionBody`
+regardless of the INOUT shape, keeping the fixture pinned on the argmode render.
+Verified empirically — clean positive (the branch was already wired; this closes the
+argmode-render coverage matrix `IN`/`OUT`/`INOUT`). Real pg_dump 18.3 renders:
+
+```
+CREATE PROCEDURE public.proc_inout(INOUT x integer)
+    LANGUAGE sql
+    AS $$ INSERT INTO public.foo (id) VALUES (x) $$;
+```
+
+The TAP test creates `public.proc_inout(INOUT x integer) LANGUAGE sql AS $$ INSERT … $$`
+and asserts the `(INOUT x integer)` signature plus the exact `LANGUAGE sql` / `AS $$ …
+$$;` fragment.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
