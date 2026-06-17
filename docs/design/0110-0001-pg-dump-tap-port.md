@@ -4207,6 +4207,37 @@ The TAP test creates `add_four … COST 50` and asserts the exact one-line
 (`TestParseCreateFunctionCostRows`) pins COST/ROWS capture (including a fractional
 `COST 0.5` and a combined `COST 0.5 ROWS 200`).
 
+### Slice 152 — set-returning function `SETOF`/`ROWS` round-trip (real divergence fixed)
+
+`pg_dump` builds the `RETURNS` clause from `pg_get_function_result(p.oid)`, which in
+PG (`ruleutils.c`) prefixes the result type with `SETOF ` for set-returning
+functions. goopg's `pg_get_function_result` (`expr.go`) returned the **bare type
+name** regardless of `proretset`, so a `CREATE FUNCTION … RETURNS SETOF integer`
+was silently downgraded to a scalar `RETURNS integer` on dump — a real divergence
+(the `prorows`/`ROWS` plumbing from slice 151 already worked, but the SETOF marker
+on the result type itself was being dropped).
+
+This slice prefixes `SETOF ` on the result type in both sibling deparse paths
+(per the sibling-paths rule):
+
+- **`pg_get_function_result`** (`expr.go`): prepend `SETOF ` when `r.ReturnsSet`.
+  This is what the external `pg_dump` binary actually consumes.
+- **`pg_get_functiondef` / `buildFunctionDef`** (`expr.go`): emit `RETURNS SETOF …`
+  when `r.ReturnsSet`, keeping goopg's own deparser in sync.
+
+`dumpFunc` then appends ` ROWS 5` (`pg_dump.c:13571`) since `proretset='t'` and
+`prorows ∉ {0,1000}`, so real pg_dump 18.3 renders:
+
+```
+CREATE FUNCTION public.gen_series_lite(integer) RETURNS SETOF integer
+    LANGUAGE sql ROWS 5
+    AS $_$ SELECT $1 $_$;
+```
+
+The TAP test creates `gen_series_lite … RETURNS SETOF integer … ROWS 5` and asserts
+both the `RETURNS SETOF integer` signature and the one-line `LANGUAGE sql ROWS 5` /
+`AS $_$ SELECT $1 $_$;` fragment.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

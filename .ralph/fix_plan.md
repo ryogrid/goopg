@@ -3280,6 +3280,30 @@ object support.
         skipped); pgbench pre-commit smoke on commit. **Next: slice 152** — a
         fresh pg_dump catalog-surface gap (SECURITY DEFINER / LEAKPROOF clauses,
         an SRF `ROWS` *round-trip*, or a `CREATE PROCEDURE` / prokind='p' dump).
+      - **PROGRESS 2026-06-17 (loop #118):** **DU-002 slice 152 LANDED** —
+        set-returning functions now round-trip their `SETOF` result type;
+        **another real divergence fixed**. `pg_dump` builds the RETURNS clause
+        from `pg_get_function_result(oid)`, which in PG (`ruleutils.c`) prefixes
+        the result type with `SETOF ` for SRFs; goopg's `pg_get_function_result`
+        (`expr.go`) returned the **bare type name** regardless of `proretset`, so
+        a `RETURNS SETOF integer` function was silently downgraded to scalar
+        `RETURNS integer` on dump (the `prorows`/`ROWS` plumbing from slice 151
+        already worked — only the SETOF marker on the result type was dropped).
+        Prefixed `SETOF ` in both sibling deparse paths: `pg_get_function_result`
+        (what external pg_dump consumes) and `pg_get_functiondef`/`buildFunctionDef`
+        (goopg's own deparser), per the sibling-paths rule. `dumpFunc`
+        (`pg_dump.c:13571`) then appends ` ROWS 5` since proretset='t' and prorows
+        ∉ {0,1000}. Test adds `public.gen_series_lite(integer) RETURNS SETOF
+        integer … ROWS 5` and asserts the `RETURNS SETOF integer` signature plus
+        the one-line `LANGUAGE sql ROWS 5` / `AS $_$ SELECT $1 $_$;` fragment.
+        Files: `internal/executor/expr.go`,
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK; `go build
+        ./internal/...` OK; `go vet ./internal/executor/` clean; parser tests
+        PASS; executor function tests PASS; `TestPort_PgDumpConnectionSetup` PASS
+        (2.44s, not skipped); pgbench pre-commit smoke on commit. **Next: slice
+        153** — a fresh pg_dump catalog-surface gap (SECURITY DEFINER / LEAKPROOF
+        clauses, or a `CREATE PROCEDURE` / prokind='p' dump).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

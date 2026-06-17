@@ -7285,7 +7285,16 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if rs := ctx.Catalog.Routines(); rs != nil {
 					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil && !r.IsProcedure {
-						return NewStringDatum(canonicalTypeName(r.ReturnType.Name)), nil
+						// Set-returning functions carry a SETOF prefix on their
+						// result type, matching PG's pg_get_function_result
+						// (ruleutils.c). pg_dump uses this verbatim for the
+						// RETURNS clause, so dropping SETOF would silently
+						// downgrade an SRF to a scalar function on dump.
+						ret := canonicalTypeName(r.ReturnType.Name)
+						if r.ReturnsSet {
+							ret = "SETOF " + ret
+						}
+						return NewStringDatum(ret), nil
 					}
 				}
 			}
@@ -11405,6 +11414,9 @@ func buildFunctionDef(r *catalog.Routine) string {
 	// RETURNS clause (functions only) — 1-space indent like PG's deparser
 	if !r.IsProcedure {
 		sb.WriteString(" RETURNS ")
+		if r.ReturnsSet {
+			sb.WriteString("SETOF ")
+		}
 		sb.WriteString(canonicalTypeName(r.ReturnType.Name))
 		sb.WriteByte('\n')
 	}

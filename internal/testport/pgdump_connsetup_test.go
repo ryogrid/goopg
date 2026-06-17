@@ -1521,6 +1521,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function add_four: %v", err)
 	}
 
+	// Slice 152: a set-returning function with an explicit ROWS 5, so the dump
+	// exercises the SETOF result-type deparse together with prorows at a
+	// NON-default value. pg_dump builds the RETURNS clause from
+	// pg_get_function_result(oid), which in PG (ruleutils.c) prefixes the
+	// result type with `SETOF ` for set-returning functions. goopg previously
+	// returned the bare type name, so an SRF was silently downgraded to a
+	// scalar `RETURNS integer` on dump — a real divergence. dumpFunc
+	// (pg_dump.c:13571) additionally appends ` ROWS 5` when proretset='t' and
+	// prorows ∉ {0,1000}.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.gen_series_lite(integer) RETURNS SETOF integer LANGUAGE sql ROWS 5 AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function gen_series_lite: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -1996,6 +2009,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "    LANGUAGE sql COST 50\n    AS $_$ SELECT $1 + 4 $_$;") {
 			t.Errorf("pg_dump dropped/mangled add_four's COST clause or body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 152 (asserted):** a set-returning function round-trips with its
+		// SETOF result type AND non-default ROWS. pg_dump builds the RETURNS
+		// clause from pg_get_function_result(oid), which prefixes the type with
+		// `SETOF ` for SRFs; dumpFunc (pg_dump.c:13571) appends ` ROWS 5` when
+		// proretset='t' and prorows ∉ {0,1000}. Real pg_dump 18.3 renders:
+		//   CREATE FUNCTION public.gen_series_lite(integer) RETURNS SETOF integer
+		//       LANGUAGE sql ROWS 5
+		//       AS $_$ SELECT $1 $_$;
+		// Before this slice pg_get_function_result returned the bare type, so the
+		// SRF was downgraded to a scalar `RETURNS integer` on dump — a real
+		// divergence. Assert the SETOF signature and the LANGUAGE/ROWS fragment.
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.gen_series_lite(integer) RETURNS SETOF integer") {
+			t.Errorf("pg_dump dropped SETOF from gen_series_lite's result type\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "    LANGUAGE sql ROWS 5\n    AS $_$ SELECT $1 $_$;") {
+			t.Errorf("pg_dump dropped/mangled gen_series_lite's ROWS clause or body\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the
