@@ -707,6 +707,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("comment on column foo.name: %v", err)
 	}
 
+	// Slice 144: COMMENT ON CONSTRAINT must survive the dump for ALL constraint
+	// kinds, not just CHECK / NOT NULL. goopg parsed COMMENT ON CONSTRAINT and
+	// populated pg_description only for NamedChecks / NotNullConstraints, so a
+	// comment on an index-backed (PRIMARY KEY / UNIQUE / EXCLUDE) or FOREIGN KEY
+	// constraint was silently dropped — the lookup found no match and returned
+	// without calling SetComment. execCommentOn now also resolves index-backed
+	// constraints (the backing index OID is the pg_constraint OID) and FKs
+	// (stored on the child table), so pg_dump's collectComments re-emits a
+	// `COMMENT ON CONSTRAINT <name> ON <table> IS '...'` per object.
+	constraintComments := []string{
+		"COMMENT ON CONSTRAINT foo_pkey ON public.foo IS 'the primary key'",
+		"COMMENT ON CONSTRAINT foo_code_key ON public.foo IS 'unique code'",
+		"COMMENT ON CONSTRAINT foo_mgr_fkey ON public.foo IS 'manager fk'",
+		"COMMENT ON CONSTRAINT exdef ON public.exclndef IS 'exclusion comment'",
+	}
+	for _, sql := range constraintComments {
+		if err := runSQLSimple(t, c, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+
 	// Slice 56: a plain (non-constraint) secondary index must survive the dump,
 	// AND its per-column ASC/DESC + NULLS FIRST/LAST ordering must be preserved.
 	// The UNIQUE (code) constraint round-trips via pg_dump's index-backed
@@ -1775,6 +1796,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		comments := []string{
 			"COMMENT ON TABLE public.foo IS 'a foo table';",
 			"COMMENT ON COLUMN public.foo.name IS 'the name column';",
+			// **Slice 144 (asserted):** COMMENT ON CONSTRAINT must round-trip for
+			// every constraint kind. Before this slice, execCommentOn populated
+			// pg_description only for CHECK / NOT NULL constraints, so a comment on
+			// a PRIMARY KEY / UNIQUE / EXCLUDE (index-backed) or FOREIGN KEY
+			// constraint never reached pg_description and pg_dump dropped it. Each
+			// line below exercises one previously-unhandled kind.
+			"COMMENT ON CONSTRAINT foo_pkey ON public.foo IS 'the primary key';",
+			"COMMENT ON CONSTRAINT foo_code_key ON public.foo IS 'unique code';",
+			"COMMENT ON CONSTRAINT foo_mgr_fkey ON public.foo IS 'manager fk';",
+			"COMMENT ON CONSTRAINT exdef ON public.exclndef IS 'exclusion comment';",
 		}
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {

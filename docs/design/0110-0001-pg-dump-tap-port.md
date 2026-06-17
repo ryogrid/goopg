@@ -3907,6 +3907,42 @@ for UNIQUE, PRIMARY KEY, and EXCLUDE constraints round-trips; deferred-check
 *execution* (validate at COMMIT, not per-row) for all constraint kinds remains a
 separate transaction-machinery milestone.
 
+### Slice 144 — `COMMENT ON CONSTRAINT` round-trip for all constraint kinds
+
+Slice 55 made `COMMENT ON {TABLE,COLUMN}` survive the dump; this slice closes the
+constraint sibling for the kinds that were silently dropped. A `COMMENT ON
+CONSTRAINT <name> ON <table>` now round-trips for every constraint kind — not
+just CHECK and NOT NULL, but also PRIMARY KEY, UNIQUE, EXCLUDE (index-backed) and
+FOREIGN KEY.
+
+**The bug:** `execCommentOn` (`internal/executor/operators_ddl.go`) resolved the
+`constraint` object kind by scanning only `tbl.NamedChecks` and
+`tbl.NotNullConstraints`. A comment on any other named constraint matched nothing,
+so the function returned without calling `catalog.SetComment` — the description
+never reached `pg_description`, and pg_dump's `collectComments` had nothing to
+re-emit. The comment was accepted by the server (no error) but silently lost on
+dump.
+
+**The fix:** after the CHECK / NOT NULL scans, `execCommentOn`'s `constraint`
+case now also:
+
+1. Iterates `im.IndexesOnTable(tbl)` for an index whose `Name` matches the
+   constraint name and which backs a constraint (`IsConstraint || IsExclusion`).
+   The backing index OID *is* the `pg_constraint` OID (see the index-backed
+   branch of `pg_constraint`'s `VirtualRows`), so
+   `SetComment(2606, idx.OID, 0, desc)` keys the row correctly. This covers
+   PRIMARY KEY, UNIQUE, and EXCLUDE.
+2. Iterates `tbl.ForeignKeys` for a name match, using `fk.OID` (FK constraints
+   are stored on the child table, not as indexes; their OID populates
+   `pg_constraint` contype='f').
+
+No catalog-schema change: `pg_description` already exposes the comment rows, and
+pg_dump emits `COMMENT ON CONSTRAINT <name> ON <schema>.<table> IS '...'` once the
+row is keyed under classoid=`pg_constraint` (2606). The round-trip test adds four
+comments — on `foo_pkey` (PK), `foo_code_key` (UNIQUE), `foo_mgr_fkey` (FK), and
+`exdef` (EXCLUDE) — and asserts each `COMMENT ON CONSTRAINT …` line reappears in
+the dump. Pure dump-fidelity; no enforcement semantics involved.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

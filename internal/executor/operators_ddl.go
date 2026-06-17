@@ -8442,6 +8442,24 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 				return nil
 			}
 		}
+		// UNIQUE / PRIMARY KEY / EXCLUDE constraints are backed by indexes whose
+		// Name equals the constraint name; the index OID is the pg_constraint OID
+		// emitted by pg_constraint's VirtualRows. Without this, a COMMENT ON these
+		// constraint kinds was silently dropped and never reached pg_description,
+		// so pg_dump could not re-emit it. DU-002 slice 144.
+		for _, idx := range im.IndexesOnTable(tbl) {
+			if (idx.IsConstraint || idx.IsExclusion) && idx.OID != 0 && strings.EqualFold(idx.Name, s.SubName) {
+				im.SetComment(oidPgConstraint, idx.OID, 0, s.Description)
+				return nil
+			}
+		}
+		// FOREIGN KEY constraints (contype='f') are stored on the child table.
+		for _, fk := range tbl.ForeignKeys {
+			if strings.EqualFold(fk.Name, s.SubName) && fk.OID != 0 {
+				im.SetComment(oidPgConstraint, fk.OID, 0, s.Description)
+				return nil
+			}
+		}
 	case "statistics":
 		stat, ok := im.LookupStatistics(s.ObjName.Name)
 		if !ok {

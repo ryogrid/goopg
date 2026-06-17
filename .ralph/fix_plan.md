@@ -3058,6 +3058,38 @@ object support.
         a fresh pg_dump catalog-surface gap (DEFERRABLE surface now complete for
         all constraint kinds), e.g. constraint comment round-trip or a
         deferred-check execution spike.
+      - **PROGRESS 2026-06-17 (loop #109):** **DU-002 slice 144 LANDED** —
+        `COMMENT ON CONSTRAINT` now round-trips through pg_dump for ALL
+        constraint kinds, not just CHECK / NOT NULL. **The bug:** `execCommentOn`
+        (`internal/executor/operators_ddl.go`) resolved the `constraint` object
+        kind by scanning only `tbl.NamedChecks` and `tbl.NotNullConstraints`, so
+        a comment on a PRIMARY KEY / UNIQUE / EXCLUDE (index-backed) or FOREIGN
+        KEY constraint matched nothing and returned WITHOUT calling
+        `catalog.SetComment` — the description never reached `pg_description`, the
+        server accepted the statement with no error, and pg_dump's
+        `collectComments` had nothing to re-emit (silent loss on dump). **The
+        fix:** after the CHECK / NOT NULL scans, the `constraint` case also (1)
+        iterates `im.IndexesOnTable(tbl)` for an index whose `Name` matches and
+        which backs a constraint (`IsConstraint || IsExclusion`) — the backing
+        index OID *is* the `pg_constraint` OID, so `SetComment(2606, idx.OID, 0,
+        desc)` keys PK/UNIQUE/EXCLUDE correctly; and (2) iterates
+        `tbl.ForeignKeys` for a name match, using `fk.OID` (FKs are stored on the
+        child table, not as indexes). No catalog-schema change — `pg_description`
+        already exposed the rows and pg_dump emits `COMMENT ON CONSTRAINT <name>
+        ON <schema>.<table> IS '...'` once the row is keyed under
+        classoid=pg_constraint (2606). **Scope:** pure dump-fidelity. Test:
+        `TestPort_PgDumpConnectionSetup` adds four constraint comments
+        (`foo_pkey` PK, `foo_code_key` UNIQUE, `foo_mgr_fkey` FK, `exdef`
+        EXCLUDE) and asserts each `COMMENT ON CONSTRAINT …` line reappears.
+        Files: `internal/executor/operators_ddl.go`,
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK;
+        `go build ./...` OK; `go vet` OK; parser/catalog/executor suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.40s); pgbench pre-commit smoke
+        on commit. **Next: slice 145** — a fresh pg_dump catalog-surface gap,
+        e.g. `COMMENT ON SCHEMA`/`SEQUENCE`/`VIEW`/`INDEX` round-trip (the
+        execCommentOn `index` path is wired but untested through pg_dump), or a
+        deferred-check execution spike.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
