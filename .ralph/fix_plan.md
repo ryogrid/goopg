@@ -3638,6 +3638,38 @@ object support.
         remaining function-attribute gap is `TRANSFORM FOR TYPE` (`protrftypes` always
         NULL), a genuine feature gap; consider pivoting to a new object class (column
         `COLLATE`, table `STORAGE`/`COMPRESSION`, triggers, or ACL/GRANT dumping).
+      - **PROGRESS 2026-06-17 (loop #133):** **DU-002 slice 166 LANDED — real
+        divergence fixed.** Pivoted from function attributes to a new TABLE-level
+        attribute: relation persistence. An `UNLOGGED` table now round-trips through
+        pg_dump as `CREATE UNLOGGED TABLE` instead of being silently demoted to a plain
+        `CREATE TABLE`. pg_dump (`dumpTableSchema`, pg_dump.c) prepends the `UNLOGGED`
+        keyword based solely on `pg_class.relpersistence == RELPERSISTENCE_UNLOGGED`
+        (`'u'`). goopg's parser already captured `CreateTableStmt.Unlogged` and the
+        executor already stored it on `catalog.Table.Unlogged` (both predate this slice),
+        but the pg_class emitter `buildUserPGClassRow` HARDCODED `relpersistence` to `"p"`
+        — so an UNLOGGED table surfaced as permanent and dumped as plain `CREATE TABLE`,
+        dropping the crash-truncation semantics on reload (real divergence). **Fix
+        (catalog-metadata only, zero storage-path risk):** `buildUserPGClassRow` derives
+        `relpersistence` from `tbl.Unlogged` (`'u'`/`'p'`); a new `indexPersistence(idx)`
+        helper makes `buildUserPGClassRowForIndex` inherit the owning table's persistence
+        (PG indexes always share their table's persistence). Pure catalog-view change —
+        goopg does NOT alter WAL/storage behaviour for unlogged tables (separate, riskier
+        capability); only the dumped DDL is corrected. TEMP (`'t'`) tables are
+        session-local and never reach the on-disk catalog, so only the `'u'` branch is
+        reachable. Probed alternatives first: column `COLLATE` needs `pg_collation`
+        populated (currently an empty `VirtualRows`→nil stub — too heavy); `SET STORAGE`/
+        `COMPRESSION` lack parser keywords; GRANT/REVOKE lack statement support; triggers
+        store no body. UNLOGGED was the cleanest — infra already present, only the emitter
+        was wrong. Files: `internal/executor/pg18_user_catalog_rows.go` (relpersistence
+        from tbl.Unlogged + indexPersistence helper),
+        `internal/testport/pgdump_connsetup_test.go` (fixture `public.ulog` UNLOGGED w/ PK
+        + positive assertion + negative guard on foo/opt),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 166 section). Gates: gofmt OK;
+        `go build ./internal/...` OK; `go vet` clean; `TestPort_PgDumpConnectionSetup`
+        PASS (2.34s, not skipped); executor + catalog + parser suites PASS; pgbench
+        pre-commit smoke on commit. **Next: slice 167** — remaining untested table-level
+        attributes: table inheritance (`INHERITS`), partitioning (`PARTITION BY`/
+        `PARTITION OF`), or column-level `STORAGE`/`COMPRESSION` (needs parser keywords).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

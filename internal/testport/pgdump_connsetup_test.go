@@ -682,6 +682,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table opt: %v", err)
 	}
 
+	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
+	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
+	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
+	// already captured CreateTableStmt.Unlogged and the executor stored it on
+	// catalog.Table.Unlogged, but buildUserPGClassRow HARDCODED relpersistence
+	// to 'p', so an UNLOGGED table was silently demoted to a logged one in the
+	// dump (wrong DDL, loses the crash-truncation semantics on reload). The fix
+	// emits 'u' from tbl.Unlogged; the table's index inherits 'u' too. `ulog`
+	// carries a PRIMARY KEY so the index-persistence path is exercised. (TEMP
+	// tables are session-local and never reach the on-disk catalog, so only the
+	// 'u' branch is reachable here.)
+	if err := runSQLSimple(t, c, "CREATE UNLOGGED TABLE public.ulog (id integer PRIMARY KEY, payload text)"); err != nil {
+		t.Fatalf("create unlogged table ulog: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -1929,6 +1944,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (fillfactor='70')") {
 			t.Errorf("pg_dump dropped a non-empty reloptions; missing %q\n  full stdout=%q", "WITH (fillfactor='70')", res.Stdout)
+		}
+		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
+		// to a logged one because buildUserPGClassRow hardcoded relpersistence to
+		// 'p'. The emitter now derives 'u' from catalog.Table.Unlogged, so pg_dump
+		// re-emits the UNLOGGED keyword. Assert the round-trip, and guard that the
+		// plain logged tables did NOT pick up a spurious UNLOGGED keyword.
+		if !strings.Contains(res.Stdout, "CREATE UNLOGGED TABLE public.ulog (") {
+			t.Errorf("pg_dump dropped the UNLOGGED keyword; missing %q\n  full stdout=%q", "CREATE UNLOGGED TABLE public.ulog (", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "CREATE UNLOGGED TABLE public.foo (") ||
+			strings.Contains(res.Stdout, "CREATE UNLOGGED TABLE public.opt (") {
+			t.Errorf("pg_dump emitted a spurious UNLOGGED keyword on a permanent table\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

@@ -4673,6 +4673,38 @@ exact signature + `RETURNS TABLE(...)` + body fragment. Unit coverage:
 `TestPgGetFunctionResultReturnsTable` (input arg kept, table cols excluded, result = `TABLE(...)`)
 and `TestPgGetFunctionResultReturnsTableNoArgs` (empty arg list, full TABLE result).
 
+### Slice 166 — `UNLOGGED` table round-trip (real divergence fixed)
+
+Slices through 165 closed the function-attribute surface; slice 166 pivots to a new
+*table-level* attribute: relation persistence. pg_dump emits the `UNLOGGED` keyword for a
+table whose `pg_class.relpersistence == RELPERSISTENCE_UNLOGGED` (`'u'`) — `dumpTableSchema`
+(pg_dump.c) prepends `"UNLOGGED "` to `CREATE TABLE` based solely on that catalog char.
+
+**Divergence.** goopg's parser already captured `CreateTableStmt.Unlogged` (parser/ddl.go) and
+the executor already stored it on `catalog.Table.Unlogged` (operators_ddl.go) — both predate this
+slice. But the pg_class emitter `buildUserPGClassRow` (internal/executor/pg18_user_catalog_rows.go)
+**hardcoded** `relpersistence` to `"p"`. So an `UNLOGGED` table surfaced in the catalog as
+permanent and dumped as a plain `CREATE TABLE`, silently dropping the persistence semantics
+(on reload the table would be crash-durable, not truncated-on-recovery — a real divergence):
+
+```
+CREATE TABLE public.ulog (...)          -- goopg (wrong)
+CREATE UNLOGGED TABLE public.ulog (...) -- upstream
+```
+
+**Fix (catalog-metadata only, zero storage-path risk).** `buildUserPGClassRow` now derives
+`relpersistence` from `tbl.Unlogged` (`'u'` when set, else `'p'`). An index always shares its
+table's persistence in PG, so `buildUserPGClassRowForIndex` calls the new `indexPersistence(idx)`
+helper (`'u'` when `idx.Table.Unlogged`). This is a pure catalog-view change: goopg does **not**
+alter its WAL/storage behaviour for unlogged tables (that is a separate, riskier capability) —
+only the dumped DDL is corrected. TEMP tables (`'t'`) are session-local and never reach the
+on-disk catalog, so only the `'u'` branch is reachable through this emitter.
+
+The TAP test creates `CREATE UNLOGGED TABLE public.ulog (id integer PRIMARY KEY, payload text)`
+(the PRIMARY KEY exercises the index-persistence path) and asserts `CREATE UNLOGGED TABLE
+public.ulog (` appears, plus a negative guard that the permanent `foo`/`opt` tables did **not**
+gain a spurious `UNLOGGED` keyword.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

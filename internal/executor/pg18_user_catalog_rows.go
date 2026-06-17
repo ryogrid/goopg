@@ -401,6 +401,15 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		relfilenode = 0 // partitioned tables have no physical storage
 	}
 	isPartition := tbl.PartitionParentOID != 0
+	// relpersistence: 'u' for UNLOGGED tables, 'p' for permanent. pg_dump keys
+	// `CREATE UNLOGGED TABLE` off relpersistence == RELPERSISTENCE_UNLOGGED, so
+	// hardcoding 'p' silently demoted an UNLOGGED table to a logged one in the
+	// dump. (TEMP tables are session-local and never reach the on-disk catalog,
+	// so 't' is not produced here.)
+	relpersistence := "p"
+	if tbl.Unlogged {
+		relpersistence = "u"
+	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                // oid
 		NewStringDatum(tbl.Name),                                   // relname (name)
@@ -418,7 +427,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewIntDatum(0),                                             // reltoastrelid
 		NewBoolDatum(false),                                        // relhasindex (updated by CREATE INDEX later)
 		NewBoolDatum(false),                                        // relisshared
-		NewStringDatum("p"),                                        // relpersistence
+		NewStringDatum(relpersistence),                             // relpersistence
 		NewStringDatum(relkind),                                    // relkind
 		NewIntDatum(int64(len(tbl.Columns))),                       // relnatts
 		NewIntDatum(0),                                             // relchecks
@@ -439,6 +448,17 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	}
 }
 
+// indexPersistence returns the relpersistence char an index inherits from its
+// owning table ('u' for an index on an UNLOGGED table, 'p' otherwise). An index
+// always shares its table's persistence in PG, so this keeps the two pg_class
+// rows consistent for a standby / pg_amcheck reading the catalog.
+func indexPersistence(idx *catalog.Index) string {
+	if idx.Table != nil && idx.Table.Unlogged {
+		return "u"
+	}
+	return "p"
+}
+
 // buildUserPGClassRowForIndex constructs the 34-column PG18-canonical
 // pg_class row for a user-defined index.
 func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
@@ -447,37 +467,37 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 		NewIntDatum(int64(idx.OID)),
 		NewStringDatum(idx.Name),
 		NewIntDatum(int64(namespaceOIDForSchema(cat, idx.Schema))),
-		NewIntDatum(0),                      // reltype
-		NewIntDatum(0),                      // reloftype
-		NewIntDatum(bootstrapSuperuserOID),  // relowner
-		NewIntDatum(pgBTreeAccessMethodOID), // relam
-		NewIntDatum(int64(idx.OID)),         // relfilenode
-		NewIntDatum(0),                      // reltablespace
-		NewIntDatum(0),                      // relpages
-		NewIntDatum(0),                      // reltuples
-		NewIntDatum(0),                      // relallvisible
-		NewIntDatum(0),                      // relallfrozen
-		NewIntDatum(0),                      // reltoastrelid
-		NewBoolDatum(false),                 // relhasindex (indexes never have indexes themselves)
-		NewBoolDatum(false),                 // relisshared
-		NewStringDatum("p"),                 // relpersistence
-		NewStringDatum("i"),                 // relkind
-		NewIntDatum(natts),                  // relnatts
-		NewIntDatum(0),                      // relchecks
-		NewBoolDatum(false),                 // relhasrules
-		NewBoolDatum(false),                 // relhastriggers
-		NewBoolDatum(false),                 // relhassubclass
-		NewBoolDatum(false),                 // relrowsecurity
-		NewBoolDatum(false),                 // relforcerowsecurity
-		NewBoolDatum(true),                  // relispopulated
-		NewStringDatum("n"),                 // relreplident
-		NewBoolDatum(false),                 // relispartition
-		NewIntDatum(0),                      // relrewrite
-		NewIntDatum(minFrozenXID),           // relfrozenxid
-		NewIntDatum(minFrozenMXID),          // relminmxid
-		NewStringDatum("{}"),                // relacl
-		NewStringDatum("{}"),                // reloptions
-		NewStringDatum(""),                  // relpartbound
+		NewIntDatum(0),                        // reltype
+		NewIntDatum(0),                        // reloftype
+		NewIntDatum(bootstrapSuperuserOID),    // relowner
+		NewIntDatum(pgBTreeAccessMethodOID),   // relam
+		NewIntDatum(int64(idx.OID)),           // relfilenode
+		NewIntDatum(0),                        // reltablespace
+		NewIntDatum(0),                        // relpages
+		NewIntDatum(0),                        // reltuples
+		NewIntDatum(0),                        // relallvisible
+		NewIntDatum(0),                        // relallfrozen
+		NewIntDatum(0),                        // reltoastrelid
+		NewBoolDatum(false),                   // relhasindex (indexes never have indexes themselves)
+		NewBoolDatum(false),                   // relisshared
+		NewStringDatum(indexPersistence(idx)), // relpersistence (follows the owning table)
+		NewStringDatum("i"),                   // relkind
+		NewIntDatum(natts),                    // relnatts
+		NewIntDatum(0),                        // relchecks
+		NewBoolDatum(false),                   // relhasrules
+		NewBoolDatum(false),                   // relhastriggers
+		NewBoolDatum(false),                   // relhassubclass
+		NewBoolDatum(false),                   // relrowsecurity
+		NewBoolDatum(false),                   // relforcerowsecurity
+		NewBoolDatum(true),                    // relispopulated
+		NewStringDatum("n"),                   // relreplident
+		NewBoolDatum(false),                   // relispartition
+		NewIntDatum(0),                        // relrewrite
+		NewIntDatum(minFrozenXID),             // relfrozenxid
+		NewIntDatum(minFrozenMXID),            // relminmxid
+		NewStringDatum("{}"),                  // relacl
+		NewStringDatum("{}"),                  // reloptions
+		NewStringDatum(""),                    // relpartbound
 	}
 }
 
