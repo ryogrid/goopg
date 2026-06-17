@@ -875,7 +875,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// `CASE WHEN true THEN 1 ELSE 0 END` form (valid, re-parseable SQL; PG's
 	// pg_get_expr pretty-prints across lines but the dump round-trips either way).
 	// The `grade integer` column guards the CASE-expression path end-to-end.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3], grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END)"); err != nil {
+	//
+	// Slice 179: a column DEFAULT that is a parenthesised row constructor
+	// (`DEFAULT (1, 2)`) parses to a *RowExpr. validateDefaultExpr accepts it
+	// (it rejects only column refs / subqueries / aggregate-or-SRF calls), so
+	// the node reaches pg_attrdef.adbin. Before this slice neither renderer had
+	// a *RowExpr arm, so it fell through to fmt.Sprintf("%v", e) — a Go pointer
+	// string — corrupting the dumped DEFAULT. Both twins now emit the ROW(…)
+	// form PG's ruleutils always prints for a RowExpr. The `pair integer` column
+	// guards the row-constructor path end-to-end.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3], grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END, pair integer DEFAULT (1, 2))"); err != nil {
 		t.Fatalf("create table defcol with function-call default: %v", err)
 	}
 
@@ -2337,6 +2346,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// string. Assert the CASE survives intact.
 			if !strings.Contains(block, "DEFAULT CASE WHEN true THEN 1 ELSE 0 END") {
 				t.Errorf("pg_dump dropped/corrupted the case-expression default; want %q in defcol block\n  block=%q", "DEFAULT CASE WHEN true THEN 1 ELSE 0 END", block)
+			}
+			// **Slice 179 (asserted):** a row-constructor default. The `pair`
+			// column carries `DEFAULT (1, 2)`, parsed as a *RowExpr.
+			// validateDefaultExpr accepts it; both renderers now emit the ROW(…)
+			// keyword form PG's ruleutils always prints. Before the fix the node
+			// fell through to fmt.Sprintf("%v", e), so the dumped DEFAULT was a
+			// corrupt Go pointer string. Assert the row constructor survives intact.
+			if !strings.Contains(block, "DEFAULT ROW(1, 2)") {
+				t.Errorf("pg_dump dropped/corrupted the row-constructor default; want %q in defcol block\n  block=%q", "DEFAULT ROW(1, 2)", block)
 			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently

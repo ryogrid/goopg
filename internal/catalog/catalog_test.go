@@ -1215,6 +1215,25 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 			},
 			"CASE WHEN true THEN 1 WHEN false THEN 2 END",
 		},
+		{
+			// `DEFAULT (1, 2)` — the parenthesised row-constructor shorthand parses to a
+			// *RowExpr. PG's ruleutils always prints the ROW keyword (DU-002 slice 179).
+			"row constructor",
+			&parser.RowExpr{Elems: []parser.Expr{
+				&parser.IntegerConst{Value: 1}, &parser.IntegerConst{Value: 2},
+			}},
+			"ROW(1, 2)",
+		},
+		{
+			// Nested element render: `DEFAULT (1, 'a' || 'b')` exercises recursion through
+			// the BinaryOp arm from inside a RowExpr.
+			"row constructor nested",
+			&parser.RowExpr{Elems: []parser.Expr{
+				&parser.IntegerConst{Value: 1},
+				&parser.BinaryOp{Op: parser.OpConcat, Left: &parser.StringConst{Value: "a"}, Right: &parser.StringConst{Value: "b"}},
+			}},
+			"ROW(1, 'a' || 'b')",
+		},
 	}
 	for _, tc := range cases {
 		if got := formatExprForAttrdef(tc.expr); got != tc.want {

@@ -7072,6 +7072,24 @@ func formatExprForAttrdef(e parser.Expr) string {
 		}
 		b.WriteString(" END")
 		return b.String()
+	case *parser.RowExpr:
+		// `DEFAULT (1, 2)` parses to a *RowExpr — the parenthesised row-constructor
+		// shorthand (`(a, b)`; the explicit `ROW(a, b)` form parses to a FuncCall named
+		// "row" instead, handled above). validateDefaultExpr rejects only column refs /
+		// subqueries / aggregate-or-SRF calls and accepts every other node, so the parsed
+		// *RowExpr reaches pg_attrdef.adbin (atthasdef=true). Without this case it fell
+		// through to fmt.Sprintf("%v") — a Go pointer string — corrupting the DEFAULT
+		// clause pg_dump re-emits (DU-002 slice 179). PG's ruleutils always prints the ROW
+		// keyword for a RowExpr (get_rule_expr T_RowExpr: "SQL99 allows ROW to be omitted …
+		// but for simplicity we always print it"), so render `ROW(e1, e2, …)` with each
+		// element rendered recursively — matches PG's pg_get_expr deparse and re-parses to
+		// an equivalent node. Mirror executor.defaultExprToSQL (the proargdefaults twin) so
+		// the dump path and the runtime path agree.
+		elems := make([]string, 0, len(v.Elems))
+		for _, el := range v.Elems {
+			elems = append(elems, formatExprForAttrdef(el))
+		}
+		return "ROW(" + strings.Join(elems, ", ") + ")"
 	}
 	return fmt.Sprintf("%v", e)
 }

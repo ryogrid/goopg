@@ -5120,6 +5120,35 @@ this display-path slice.
 `defcol` fixture gains a `grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END` column and asserts
 the dumped block contains `DEFAULT CASE WHEN true THEN 1 ELSE 0 END`.
 
+### Slice 179 — row-constructor column DEFAULT (sibling-path divergence closed)
+
+Continuing the same audit, the next live gap is `*RowExpr`. The parenthesised row-constructor shorthand
+`DEFAULT (1, 2)` parses to a `*RowExpr` (the explicit `ROW(1, 2)` keyword form parses to a `FuncCall`
+named `row`, already handled by the FuncCall arm). `validateDefaultExpr` accepts a RowExpr (it falls
+through to `return nil`), so the node reaches `pg_attrdef.adbin`. Neither `catalog.formatExprForAttrdef`
+nor the executor twin `executor.defaultExprToSQL` had a `*RowExpr` arm, so it fell through to
+`fmt.Sprintf("%v", e)` — a Go pointer string that corrupts the dumped `DEFAULT`. Example that was
+broken:
+
+```sql
+CREATE TABLE public.defcol (..., pair integer DEFAULT (1, 2));  -- *RowExpr
+```
+
+Fix: both renderers gain a `*RowExpr` case that renders `ROW(e1, e2, …)`, recursively rendering each
+element through the same switch. PG's `ruleutils` always prints the `ROW` keyword for a RowExpr
+(`get_rule_expr`, `T_RowExpr`: *"SQL99 allows ROW to be omitted when there is more than one column, but
+for simplicity we always print it"*), so `ROW(1, 2)` matches PG's `pg_get_expr` deparse and re-parses to
+an equivalent node on restore (as a `FuncCall row`, which the evaluator handles identically). The two
+twins are kept in lockstep (catalog sits below executor in the import graph, so they cannot share code).
+Display-only; default evaluation and routing are untouched. As with the array/CASE slices,
+`validateDefaultExpr` still does not recurse into the row elements — the same pre-existing validation
+gap, out of scope for this display-path slice.
+
+`catalog.TestFormatExprForAttrdefExpr` gains `row constructor` (`ROW(1, 2)`) and `row constructor
+nested` (`ROW(1, 'a' || 'b')`, exercising recursion through the BinaryOp arm) cases. The TAP `defcol`
+fixture gains a `pair integer DEFAULT (1, 2)` column and asserts the dumped block contains
+`DEFAULT ROW(1, 2)`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

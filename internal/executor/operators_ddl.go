@@ -2474,6 +2474,16 @@ func defaultExprToSQL(e parser.Expr) string {
 		}
 		b.WriteString(" END")
 		return b.String()
+	case *parser.RowExpr:
+		// `DEFAULT (1, 2)` — the parenthesised row-constructor shorthand. Mirror the
+		// catalog twin (catalog.formatExprForAttrdef, DU-002 slice 179); keep the two in
+		// sync so the dump path and the proargdefaults path render identically. PG's
+		// ruleutils always prints the ROW keyword (get_rule_expr T_RowExpr).
+		var elems []string
+		for _, el := range v.Elems {
+			elems = append(elems, defaultExprToSQL(el))
+		}
+		return "ROW(" + strings.Join(elems, ", ") + ")"
 	}
 	return fmt.Sprintf("%v", e)
 }
