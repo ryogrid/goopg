@@ -3860,6 +3860,24 @@ object support.
         commit. **Next:** function-call default with literal args e2e (`DEFAULT lpad('x',5)`); deferred
         MINVALUE/MAXVALUE keyword-AST-node slice; or column STORAGE/COMPRESSION dump fidelity.
 
+      - **PROGRESS 2026-06-17 (loop #142):** **DU-002 slice 175 LANDED — function-call DEFAULT
+        with literal arguments round-trips end-to-end.** Slice 173 fixed the generic `*FuncCall`
+        renderer but only exercised a zero-arg call (`DEFAULT now()`); the recursive argument-render
+        path in `formatExprForAttrdef` (each arg through the same switch, joined with `, `) had NO
+        e2e coverage. Slice 175 adds a `label text DEFAULT lpad('x', 5)` column to the `defcol`
+        fixture. `validateDefaultExpr` accepts a non-aggregate, non-SRF `*FuncCall` regardless of
+        arity, so the parsed call — `StringConst('x')` + `IntegerConst(5)` args — reaches
+        `pg_attrdef.adbin`; `formatExprForAttrdef` renders `lpad('x', 5)` and pg_dump re-emits
+        `DEFAULT lpad('x', 5)`. **No renderer change needed** — pure coverage of the argument path
+        slice 173 introduced but left untested end-to-end (the `lpad('x', 5)` unit case already
+        existed in `TestFormatExprForAttrdefFuncCall`). Files: `internal/testport/pgdump_connsetup_test.go`
+        (`label` col + `DEFAULT lpad('x', 5)` assertion in the defcol block),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 175). Gates: gofmt OK; `go vet
+        ./internal/testport/` clean; `TestPort_PgDumpConnectionSetup` PASS (2.53s, not skipped);
+        pgbench pre-commit smoke on commit. **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node
+        slice (HIGHER RISK: partition routing); or column STORAGE/COMPRESSION dump fidelity (needs
+        parser keywords).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

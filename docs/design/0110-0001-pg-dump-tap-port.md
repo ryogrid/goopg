@@ -5013,6 +5013,28 @@ and `lpad('x', 5)` guard that ordinary calls keep their parens). The TAP test's 
 a `touched timestamptz DEFAULT CURRENT_TIMESTAMP` column and asserts the dumped block contains
 `DEFAULT CURRENT_TIMESTAMP` and **not** `current_timestamp()`.
 
+### Slice 175 — function-call DEFAULT with literal arguments (round-trip)
+
+Slice 173 fixed the generic `*FuncCall` renderer but only exercised a *zero-argument* call
+(`DEFAULT now()`). The recursive argument-rendering path in `formatExprForAttrdef` — each argument
+rendered through the same switch, joined with `, ` — had no end-to-end coverage. Slice 175 closes
+that with a call carrying literal arguments:
+
+```sql
+CREATE TABLE public.defcol (..., label text DEFAULT lpad('x', 5));
+```
+
+`validateDefaultExpr` accepts a non-aggregate, non-SRF `*FuncCall` regardless of arity (it only
+recurses into the arguments to reject column refs/subqueries), so the parsed call — with its
+`StringConst('x')` and `IntegerConst(5)` arguments — reaches `pg_attrdef.adbin`. `formatExprForAttrdef`
+renders the string literal as `'x'` and the integer as `5`, joins them with `, `, and emits
+`lpad('x', 5)`; pg_dump re-emits `DEFAULT lpad('x', 5)` inline. No renderer change was needed — this
+slice is pure coverage of the argument path that slice 173 introduced but left untested end-to-end.
+
+`catalog.TestFormatExprForAttrdefFuncCall` already unit-tests the `lpad('x', 5)` render. The TAP
+test's `defcol` fixture gains a `label text DEFAULT lpad('x', 5)` column and asserts the dumped block
+contains `DEFAULT lpad('x', 5)` (arguments intact).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

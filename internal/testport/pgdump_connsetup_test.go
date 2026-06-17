@@ -835,7 +835,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// special-cases the niladic form to emit `CURRENT_TIMESTAMP` (not
 	// `current_timestamp()`, which is invalid SQL on restore). The `touched`
 	// column guards that path.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP)"); err != nil {
+	//
+	// Slice 175: a function-call DEFAULT carrying LITERAL ARGUMENTS
+	// (`DEFAULT lpad('x', 5)`) must round-trip with its arguments intact. Slice
+	// 173 only exercised a zero-arg call (`now()`); the recursive argument
+	// rendering in formatExprForAttrdef (string literal `'x'` + integer literal
+	// `5`, joined with `, `) had no end-to-end coverage. validateDefaultExpr
+	// accepts a non-aggregate, non-SRF *FuncCall regardless of arity, so the
+	// parsed call (with its two literal args) reaches pg_attrdef.adbin and
+	// pg_dump re-emits `DEFAULT lpad('x', 5)`. The `label` column guards that.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5))"); err != nil {
 		t.Fatalf("create table defcol with function-call default: %v", err)
 	}
 
@@ -2262,6 +2271,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			}
 			if strings.Contains(strings.ToLower(block), "current_timestamp()") {
 				t.Errorf("pg_dump added spurious parens to CURRENT_TIMESTAMP (slice 174 regression)\n  block=%q", block)
+			}
+			// **Slice 175 (asserted):** function-call default with LITERAL
+			// ARGUMENTS. The `label` column carries `DEFAULT lpad('x', 5)`.
+			// formatExprForAttrdef renders the call with its arguments recursively
+			// (string literal `'x'`, integer literal `5`, joined with `, `); a
+			// regression in argument rendering would drop the args or corrupt them.
+			if !strings.Contains(block, "DEFAULT lpad('x', 5)") {
+				t.Errorf("pg_dump dropped/corrupted the function-call default args; want %q in defcol block\n  block=%q", "DEFAULT lpad('x', 5)", block)
 			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
