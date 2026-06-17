@@ -3477,6 +3477,33 @@ public.foo_view` (22700). The new positional assert computes
 view's offset is below the table's — guarding the topological order that restore
 correctness depends on, complementing the presence checks of the earlier slices.
 
+### Slice 133 — cross-table foreign-key dependency ordering (post-data split)
+
+A foreign key from `public.baz` to `public.bar` introduces a
+referencing→referenced edge. Unlike the view edge of slice 132, pg_dump does
+**not** order the two `CREATE TABLE` statements by it. Instead it *splits* the FK
+out of the table body into a separate `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN
+KEY` emitted in the **post-data** section, after every `CREATE TABLE`. That is
+how pg_dump breaks dependency cycles (mutual FKs) while still guaranteeing the
+referenced relation exists when the constraint is replayed.
+
+So the invariant to pin is not "bar before baz" but "the FK `ADD CONSTRAINT`
+after **both** tables". A regression that inlined the FK back into `CREATE TABLE
+public.baz`, or emitted the `ALTER` ahead of `CREATE TABLE public.bar`, would
+make `pg_restore` fail with `relation "public.bar" does not exist`. Slices 51/53
+already assert the `ADD CONSTRAINT baz_x_fkey ... REFERENCES public.bar(a, b)`
+*text* is present; none pinned its *position* relative to the two base tables.
+
+**No production change needed** — goopg already splits the cross-table FK into a
+post-data ALTER. Empirically verified against goopg's own pg_dump output (byte
+offsets): `CREATE TABLE public.bar (` at 16740 and `CREATE TABLE public.baz (` at
+16927 both precede `ADD CONSTRAINT baz_x_fkey` at 39048. The new positional
+assert (1) fails if the FK offset is below either table offset and (2) confirms
+the `REFERENCES public.bar` clause does not appear inside the `baz` table body
+(i.e. the FK was emitted as a separate post-data statement, not inlined),
+complementing the slice-132 view-ordering guard so both dependency-edge classes
+pg_dump relies on are positionally locked.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

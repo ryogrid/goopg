@@ -2657,6 +2657,34 @@ object support.
         on a constraint-backed path, OR a UNIQUE NULLS NOT DISTINCT constraint,
         OR a multi-table FK dependency-ordering case (referenced table before
         referencing).
+      - **PROGRESS 2026-06-17 (loop #98):** **DU-002 slice 133 LANDED** — a
+        cross-table FOREIGN-KEY dependency-ordering (post-data split) regression
+        guard. **No production change needed** (empirically verified vs goopg's
+        own pg_dump output): the FK from `public.baz` to `public.bar` introduces
+        a referencing→referenced edge, but — unlike the view edge of slice 132 —
+        pg_dump does NOT order the two `CREATE TABLE` statements by it. Instead it
+        SPLITS the FK out of the table body into a separate post-data `ALTER TABLE
+        ... ADD CONSTRAINT ... FOREIGN KEY`, emitted after every CREATE TABLE,
+        which is how pg_dump breaks mutual-FK cycles while still guaranteeing the
+        referenced relation exists at replay. The invariant pinned is therefore
+        "FK ADD CONSTRAINT after BOTH tables", not "bar before baz": a regression
+        that inlined the FK into `CREATE TABLE public.baz` or emitted the ALTER
+        ahead of `CREATE TABLE public.bar` would make pg_restore fail with
+        `relation "public.bar" does not exist`. Slices 51/53 only assert the
+        `ADD CONSTRAINT baz_x_fkey` TEXT is present; none pinned its POSITION.
+        Verified offsets: `CREATE TABLE public.bar (` @16740 and `public.baz (`
+        @16927 both precede `ADD CONSTRAINT baz_x_fkey` @39048 (post-data). New
+        assert: (1) fail if FK offset < either table offset; (2) confirm
+        `REFERENCES public.bar` is absent from the baz table body (FK was split,
+        not inlined). Files: `internal/testport/pgdump_connsetup_test.go`
+        (slice-133 positional + post-data-split assert), `docs/design/
+        0110-0001-pg-dump-tap-port.md` (Slice 133). Gates: gofmt OK; `go build
+        ./internal/...` OK; `TestPort_PgDumpConnectionSetup` PASS (1.97s);
+        pgbench pre-commit smoke on commit. **Next: slice 134** — a partial-index
+        predicate round-trip (`CREATE INDEX ... WHERE`), OR a UNIQUE NULLS NOT
+        DISTINCT constraint (NOTE: needs parser support — real feature, not a
+        guard), OR a generated-column (`GENERATED ALWAYS AS ... STORED`)
+        round-trip.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

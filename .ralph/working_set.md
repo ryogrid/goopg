@@ -1,21 +1,24 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 132 (loop #97) — table→VIEW dependency-ordering
-(topological emission) regression guard for pg_dump. NO production change:
-empirically verified vs goopg's own pg_dump output that `CREATE TABLE public.foo`
-is emitted BEFORE all three views that select from it (foo_view, foo_rview,
-foo_mv). pg_restore replays top-to-bottom with no forward refs, so a view ahead
-of its base table = unrestorable dump (`relation "public.foo" does not exist`).
-Slices 57/58/60 only asserted view TEXT PRESENCE; this slice pins POSITION via
-strings.Index offset comparison (table offset < each view offset). pg_dump
-topo-sorts its TocEntry DAG from goopg's pg_depend / getDependencies edges.
-Files: internal/testport/pgdump_connsetup_test.go (slice-132 positional assert),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 132), .ralph/fix_plan.md.
-Verified: TestPort_PgDumpConnectionSetup PASS (2.07s).
+Last landed: DU-002 slice 133 (loop #98) — cross-table FOREIGN-KEY
+dependency-ordering (post-data split) regression guard for pg_dump. NO
+production change: empirically verified vs goopg's own pg_dump output that the
+FK from public.baz → public.bar is SPLIT out of the table body into a separate
+post-data `ALTER TABLE ... ADD CONSTRAINT baz_x_fkey ... FOREIGN KEY`, emitted
+AFTER every CREATE TABLE (that is how pg_dump breaks mutual-FK cycles). Pinned
+invariant: FK ADD CONSTRAINT (@39048) after BOTH `CREATE TABLE public.bar`
+(@16740) and `public.baz` (@16927), AND `REFERENCES public.bar` is ABSENT from
+the baz table body (proves FK was split, not inlined). Slices 51/53 only
+asserted ADD CONSTRAINT text PRESENCE; this slice pins POSITION + post-data
+split, complementing slice 132's view-ordering guard (both dependency-edge
+classes now positionally locked).
+Files: internal/testport/pgdump_connsetup_test.go (slice-133 assert),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 133), .ralph/fix_plan.md.
+Verified: TestPort_PgDumpConnectionSetup PASS (1.97s).
 Committed + pushed.
 
-Next direction (slice 133): a partial-index predicate round-trip on a
-constraint-backed path, OR a UNIQUE NULLS NOT DISTINCT constraint (NOTE: parser
-has NO `NULLS NOT DISTINCT` support yet — would be a real feature, not a guard),
-OR a multi-table FK dependency-ordering case (referenced table before
-referencing table).
+Next direction (slice 134): a partial-index predicate round-trip
+(`CREATE INDEX ... WHERE`), OR a generated-column
+(`GENERATED ALWAYS AS ... STORED`) round-trip, OR a UNIQUE NULLS NOT DISTINCT
+constraint (NOTE: parser has NO `NULLS NOT DISTINCT` support yet — real
+feature, not a guard).

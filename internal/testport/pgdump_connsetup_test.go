@@ -1665,6 +1665,53 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				}
 			}
 		}
+		// **Slice 133 (asserted):** CROSS-TABLE FOREIGN-KEY dependency-ordering. A
+		// FK from `public.baz` to `public.bar` introduces a referencing→referenced
+		// edge, but unlike the view edge (slice 132) pg_dump does NOT order the two
+		// CREATE TABLE statements by it — instead it SPLITS the FK out of the table
+		// body into a separate `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY`
+		// emitted in the POST-DATA section, after every CREATE TABLE. That is how
+		// pg_dump breaks dependency cycles (mutual FKs) and guarantees the referenced
+		// relation exists when the constraint is replayed. So the invariant to pin is
+		// not "bar before baz" but "the FK ADD CONSTRAINT after BOTH tables": a
+		// regression that inlined the FK back into `CREATE TABLE public.baz`, or
+		// emitted the ALTER ahead of `CREATE TABLE public.bar`, would make
+		// pg_restore fail with `relation "public.bar" does not exist`. The existing
+		// slice-51/53 checks only assert the ADD CONSTRAINT TEXT is present; none
+		// pinned its POSITION relative to the two base tables. Empirically verified
+		// vs goopg's own pg_dump output: CREATE TABLE bar @16740 and baz @16927 both
+		// precede `ADD CONSTRAINT baz_x_fkey` @39048 (post-data). (strings.Index
+		// returns the first occurrence; each marker is a unique header.)
+		fkOff := strings.Index(res.Stdout, "ADD CONSTRAINT baz_x_fkey")
+		barOff := strings.Index(res.Stdout, "CREATE TABLE public.bar (")
+		bazOff := strings.Index(res.Stdout, "CREATE TABLE public.baz (")
+		switch {
+		case fkOff < 0:
+			t.Errorf("pg_dump missing ADD CONSTRAINT baz_x_fkey for FK dependency-order check\n  full stdout=%q", res.Stdout)
+		case barOff < 0:
+			t.Errorf("pg_dump missing CREATE TABLE public.bar for FK dependency-order check\n  full stdout=%q", res.Stdout)
+		case bazOff < 0:
+			t.Errorf("pg_dump missing CREATE TABLE public.baz for FK dependency-order check\n  full stdout=%q", res.Stdout)
+		default:
+			if fkOff < barOff {
+				t.Errorf("pg_dump emitted the FK ADD CONSTRAINT before its REFERENCED table — unrestorable dump: baz_x_fkey at %d precedes CREATE TABLE public.bar at %d\n  full stdout=%q",
+					fkOff, barOff, res.Stdout)
+			}
+			if fkOff < bazOff {
+				t.Errorf("pg_dump emitted the FK ADD CONSTRAINT before its OWNING table — unrestorable dump: baz_x_fkey at %d precedes CREATE TABLE public.baz at %d\n  full stdout=%q",
+					fkOff, bazOff, res.Stdout)
+			}
+		}
+		// The FK must be a separate post-data ALTER TABLE, NOT inlined into the
+		// CREATE TABLE public.baz body (which would order baz after bar and defeat
+		// cycle-breaking). Assert the cross-table FOREIGN KEY clause does not appear
+		// inside the baz table body, i.e. before the FK's own ALTER statement.
+		if bazOff >= 0 && fkOff >= 0 {
+			bazBody := res.Stdout[bazOff:fkOff]
+			if strings.Contains(bazBody, "REFERENCES public.bar") {
+				t.Errorf("pg_dump inlined the cross-table FK into CREATE TABLE public.baz instead of a post-data ALTER TABLE\n  baz body=%q", bazBody)
+			}
+		}
 		// **Slice 116 (asserted):** a standalone SEQUENCE must round-trip. pg_dump's
 		// getTables now discovers the relkind='S' relation (pg_class surfaces each
 		// IsSequence table) and dumpSequence regenerates the DDL from pg_sequence
