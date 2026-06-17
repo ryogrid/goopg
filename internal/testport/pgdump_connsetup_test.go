@@ -899,6 +899,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table defcol with function-call default: %v", err)
 	}
 
+	// Slice 182: a per-column storage override (`ALTER TABLE ... ALTER COLUMN
+	// ... SET STORAGE <mode>`) must survive the dump. pg_dump compares
+	// pg_attribute.attstorage against the column type's typstorage and emits the
+	// `ALTER TABLE ONLY ... SET STORAGE` statement only when they differ
+	// (pg_dump.c dumpTableSchema). goopg recorded the override on
+	// catalog.Column.Storage, but the synthesized pg_attribute row always
+	// reported the type default, so the override was silently dropped from the
+	// dump (a restore-breaking loss of the storage strategy). `storcol` carries
+	// the overrides on its own table so foo's many asserts are untouched. text
+	// defaults to EXTENDED ('x'); EXTERNAL ('e') and MAIN ('m') both differ, so
+	// both must re-emit; the untouched `d` column must NOT produce a SET STORAGE.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.storcol (a text, b text, d text)"); err != nil {
+		t.Fatalf("create table storcol: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.storcol ALTER COLUMN a SET STORAGE EXTERNAL"); err != nil {
+		t.Fatalf("alter storcol.a set storage external: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.storcol ALTER COLUMN b SET STORAGE MAIN"); err != nil {
+		t.Fatalf("alter storcol.b set storage main: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -2398,6 +2419,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(block, "1 IS DISTINCT FROM 2") {
 				t.Errorf("pg_dump dropped/corrupted the IS DISTINCT FROM default; want %q in defcol block\n  block=%q", "1 IS DISTINCT FROM 2", block)
 			}
+		}
+		// **Slice 182 (asserted):** per-column storage overrides. `storcol.a` was
+		// SET STORAGE EXTERNAL and `storcol.b` SET STORAGE MAIN; both differ from
+		// text's EXTENDED default, so pg_dump must re-emit each as a standalone
+		// `ALTER TABLE ONLY public.storcol ALTER COLUMN <c> SET STORAGE <mode>;`
+		// (pg_dump.c dumpTableSchema). Before the fix attstorage echoed the type
+		// default, so neither statement appeared. The untouched `d` column must
+		// NOT produce a SET STORAGE (its attstorage == typstorage).
+		for _, sub := range []string{
+			"ALTER TABLE ONLY public.storcol ALTER COLUMN a SET STORAGE EXTERNAL;",
+			"ALTER TABLE ONLY public.storcol ALTER COLUMN b SET STORAGE MAIN;",
+		} {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a column storage override; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		if strings.Contains(res.Stdout, "ALTER COLUMN d SET STORAGE") {
+			t.Errorf("pg_dump emitted a spurious SET STORAGE for an untouched column (storcol.d)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

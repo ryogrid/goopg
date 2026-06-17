@@ -511,6 +511,26 @@ func buildUserPGClassRowForIndex(cat catalog.Catalog, idx *catalog.Index) Row {
 	}
 }
 
+// storageNameToAttCode maps a column's storage-strategy name (as recorded by
+// ALTER COLUMN ... SET STORAGE: "plain"/"main"/"external"/"extended") to the
+// single-char pg_attribute.attstorage code PG uses ('p'/'m'/'e'/'x', matching
+// TYPSTORAGE_* in postgres/src/include/catalog/pg_type.h). Returns 0 for an
+// empty or unrecognized name, signalling "no override — use the type default".
+func storageNameToAttCode(name string) byte {
+	switch strings.ToLower(name) {
+	case "plain":
+		return 'p'
+	case "main":
+		return 'm'
+	case "external":
+		return 'e'
+	case "extended":
+		return 'x'
+	default:
+		return 0
+	}
+}
+
 // buildUserPGAttributeRow constructs a 25-column pg_attribute row for a
 // user-defined column (attstattarget appended last as NULL).
 func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalog.Column) Row {
@@ -608,19 +628,30 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		// A domain inherits its base type's physical layout. DU-002 slice 90.
 		attrs = userTypeAttrsForOID(domainBaseOID)
 	}
+	// A per-column storage override (ALTER COLUMN ... SET STORAGE) shadows the
+	// type's default storage in pg_attribute.attstorage. pg_dump compares
+	// attstorage against the column type's typstorage and emits an
+	// `ALTER TABLE ONLY ... ALTER COLUMN ... SET STORAGE <mode>` only when the
+	// two differ (pg_dump.c dumpTableSchema). attstorage echoed the type default
+	// unconditionally, so a SET STORAGE was silently dropped from the dump even
+	// though the executor recorded it on the catalog column. DU-002 slice 182.
+	attStorageChar := attrs.TypStorage
+	if c := storageNameToAttCode(col.Storage); c != 0 {
+		attStorageChar = c
+	}
 	return Row{
-		NewIntDatum(int64(tbl.OID)),              // attrelid
-		NewStringDatum(col.Name),                 // attname (name)
-		NewIntDatum(int64(typOID)),               // atttypid
-		NewIntDatum(int64(attrs.TypLen)),         // attlen
-		NewIntDatum(int64(col.Ordinal + 1)),      // attnum (1-based)
-		NewIntDatum(typmod),                      // atttypmod
-		NewIntDatum(attndims),                    // attndims
-		NewBoolDatum(attrs.TypByVal),             // attbyval
-		NewStringDatum(string(attrs.TypAlign)),   // attalign
-		NewStringDatum(string(attrs.TypStorage)), // attstorage
-		NewStringDatum(""),                       // attcompression (PG18 default: '\0' meaning "default")
-		NewBoolDatum(col.NotNull),                // attnotnull
+		NewIntDatum(int64(tbl.OID)),            // attrelid
+		NewStringDatum(col.Name),               // attname (name)
+		NewIntDatum(int64(typOID)),             // atttypid
+		NewIntDatum(int64(attrs.TypLen)),       // attlen
+		NewIntDatum(int64(col.Ordinal + 1)),    // attnum (1-based)
+		NewIntDatum(typmod),                    // atttypmod
+		NewIntDatum(attndims),                  // attndims
+		NewBoolDatum(attrs.TypByVal),           // attbyval
+		NewStringDatum(string(attrs.TypAlign)), // attalign
+		NewStringDatum(string(attStorageChar)), // attstorage
+		NewStringDatum(""),                     // attcompression (PG18 default: '\0' meaning "default")
+		NewBoolDatum(col.NotNull),              // attnotnull
 		NewBoolDatum(col.DefaultExpr != nil || col.GeneratedExpr != "" || catalog.IsSerialTypeName(col.Type.Name)), // atthasdef (generated cols + SERIAL nextval defaults carry their expr in pg_attrdef too)
 		NewBoolDatum(false),                  // atthasmissing
 		NewStringDatum(attIdentityFor(col)),  // attidentity

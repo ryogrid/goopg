@@ -4091,12 +4091,34 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				im.UnregisterInheritanceChild(parentTbl.OID, tbl.OID)
 			}
 		case parser.AlterTableSetStorage:
-			// SET STORAGE type — record on the catalog column for conflict detection.
+			// SET STORAGE type — record on the catalog column AND rewrite the
+			// pg_attribute heap row so pg_dump observes the new attstorage.
+			// pg_dump compares attstorage against the column type's typstorage and
+			// emits `ALTER TABLE ONLY ... SET STORAGE <mode>` only when they differ
+			// (pg_dump.c dumpTableSchema). The in-memory catalog mutation alone is
+			// invisible to pg_dump because pg_attribute is a heap populated at
+			// CREATE TABLE time; the override must be flushed through the same
+			// delete-old-rows + re-sync path DROP COLUMN / SET NOT NULL use, or the
+			// stale heap row keeps reporting the type default and the SET STORAGE
+			// is silently dropped from the dump. DU-002 slice 182.
 			if act.ColumnName != "" && act.StorageType != "" {
+				changed := false
 				for i := range tbl.Columns {
 					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
 						tbl.Columns[i].Storage = act.StorageType
+						changed = true
 						break
+					}
+				}
+				if changed && catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
 					}
 				}
 			}

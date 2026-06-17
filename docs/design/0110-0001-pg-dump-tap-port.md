@@ -5216,6 +5216,46 @@ Remaining unhandled `parser.Expr` kinds are `*CollateExpr` (collation-name quoti
 `*InExpr` (drags in the `validateDefaultExpr` non-recursion-into-`InExpr` validation gap and the
 subquery form) — both genuinely contrived as constant column defaults and deferred.
 
+### Slice 182 — per-column storage override (ALTER COLUMN ... SET STORAGE) round-trip
+
+Pivoting off the column-DEFAULT audit, this slice closes a real pg_dump feature gap: a per-column
+storage strategy set via `ALTER TABLE ... ALTER COLUMN c SET STORAGE {PLAIN|MAIN|EXTERNAL|EXTENDED}`
+was silently dropped from the dump. pg_dump's `dumpTableSchema` (pg_dump.c) reads `a.attstorage`
+and the column type's `t.typstorage`, and emits
+
+```sql
+ALTER TABLE ONLY public.storcol ALTER COLUMN a SET STORAGE EXTERNAL;
+```
+
+only when the two differ. goopg's parser already accepts the clause and the executor recorded the
+strategy on `catalog.Column.Storage`, but two layers dropped it:
+
+1. **`buildUserPGAttributeRow`** (`internal/executor/pg18_user_catalog_rows.go`) populated
+   `attstorage` unconditionally from the column type's default storage (`attrs.TypStorage`),
+   ignoring the `Column.Storage` override. So `attstorage` always equalled `typstorage` and pg_dump
+   never emitted the statement. Fix: a new `storageNameToAttCode` helper maps the strategy name
+   (`"plain"/"main"/"external"/"extended"`) to PG's single-char code (`'p'/'m'/'e'/'x'`,
+   `TYPSTORAGE_*`); when `Column.Storage` is set it shadows the type default in the emitted row.
+
+2. **The `AlterTableSetStorage` executor arm** (`internal/executor/operators_ddl.go`) only mutated
+   the in-memory `Column.Storage` — but `pg_attribute` is a heap populated by
+   `syncTableToCatalogHeap` at CREATE TABLE time, so the stale heap row kept reporting the type
+   default. Fix: after recording the override, flush it through the same delete-old-rows +
+   `syncTableToCatalogHeap` re-sync path DROP COLUMN / SET NOT NULL use (gated on
+   `catalogHeapSyncAvailable`), so the rewritten `pg_attribute` row carries the new `attstorage`.
+
+This was the load-bearing discovery — the row-builder override alone is invisible to pg_dump
+because pg_dump scans the persisted heap, not the live catalog object.
+
+`internal/executor/pg18_user_catalog_rows_test.go::TestUserPGAttributeStorageOverride` pins the
+char mapping for every strategy (plus the no-override and unrecognized-name fall-throughs to the
+type default). The TAP test adds a `storcol(a, b, d text)` fixture, sets `a EXTERNAL` and `b MAIN`,
+and asserts the dump re-emits both `ALTER TABLE ONLY public.storcol ALTER COLUMN ... SET STORAGE`
+statements while the untouched `d` column produces none (its `attstorage == typstorage`).
+
+This slice is dump-fidelity only: goopg does not TOAST, so the storage strategy has no runtime
+effect; it is recorded and round-tripped so a restored schema preserves the declared strategy.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

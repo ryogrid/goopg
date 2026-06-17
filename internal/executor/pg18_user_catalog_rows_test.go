@@ -556,6 +556,48 @@ func TestUserPGAttributeArrayColumn(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeStorageOverride pins the per-column storage override
+// (DU-002 slice 182). A column carrying an ALTER COLUMN ... SET STORAGE result
+// (catalog.Column.Storage) must report that strategy in pg_attribute.attstorage
+// rather than the type's default. pg_dump compares attstorage against the type's
+// typstorage and emits `ALTER TABLE ... SET STORAGE <mode>` only when they
+// differ; without the override attstorage always echoed the type default, so a
+// SET STORAGE was silently dropped from the dump.
+func TestUserPGAttributeStorageOverride(t *testing.T) {
+	const attstorageIdx = 9 // attstorage position in the user pg_attribute row
+	tbl := &catalog.Table{Name: "t", OID: 99001}
+
+	// No override: a text column reports its type default ('x' = extended).
+	base := buildUserPGAttributeRow(nil, tbl, catalog.Column{Name: "c", Type: catalog.Type{Name: "text"}, Ordinal: 0})
+	if got := base[attstorageIdx].StringValue(); got != "x" {
+		t.Fatalf("text column without override: attstorage=%q want \"x\" (extended)", got)
+	}
+
+	// Each SET STORAGE strategy maps to its single-char attstorage code.
+	for _, tc := range []struct {
+		storage string
+		want    string
+	}{
+		{"plain", "p"},
+		{"main", "m"},
+		{"external", "e"},
+		{"extended", "x"},
+		{"EXTERNAL", "e"}, // case-insensitive (parser lowercases, but be robust)
+	} {
+		col := catalog.Column{Name: "c", Type: catalog.Type{Name: "text"}, Ordinal: 0, Storage: tc.storage}
+		row := buildUserPGAttributeRow(nil, tbl, col)
+		if got := row[attstorageIdx].StringValue(); got != tc.want {
+			t.Errorf("SET STORAGE %s: attstorage=%q want %q", tc.storage, got, tc.want)
+		}
+	}
+
+	// An unrecognized strategy leaves the type default intact (no corruption).
+	bogus := catalog.Column{Name: "c", Type: catalog.Type{Name: "text"}, Ordinal: 0, Storage: "bogus"}
+	if got := buildUserPGAttributeRow(nil, tbl, bogus)[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("unrecognized storage: attstorage=%q want \"x\" (type default unchanged)", got)
+	}
+}
+
 // TestUserPGAttributeEnumColumn pins the enum-column resolution (DU-002 slice
 // 88). A column whose declared type is a user-defined enum must report
 // pg_attribute.atttypid = the enum's dynamic pg_type OID (not the text

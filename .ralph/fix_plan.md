@@ -3980,6 +3980,34 @@ object support.
         keywords); deferred MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition routing); or
         close the `validateDefaultExpr` array/row/CASE/InExpr recursion gap (executor semantic change —
         needs its own gates).
+      - **PROGRESS 2026-06-17 (loop #150):** **DU-002 slice 182 LANDED — per-column storage override
+        (`ALTER COLUMN ... SET STORAGE`) round-trips through pg_dump.** Pivoted off the (closed) column-DEFAULT
+        audit to a real pg_dump feature gap. pg_dump's `dumpTableSchema` reads `a.attstorage` + the type's
+        `t.typstorage` and emits `ALTER TABLE ONLY <t> ALTER COLUMN <c> SET STORAGE <mode>;` only when they
+        differ. The parser already accepts the clause and the executor recorded the strategy on
+        `catalog.Column.Storage`, but TWO layers dropped it: (1) `buildUserPGAttributeRow` populated
+        `attstorage` unconditionally from the type default (`attrs.TypStorage`), ignoring the override — so
+        `attstorage` always equalled `typstorage`; (2) **load-bearing discovery** — the row-builder override
+        alone is invisible to pg_dump because `pg_attribute` is a HEAP populated by `syncTableToCatalogHeap`
+        at CREATE TABLE time, and the `AlterTableSetStorage` executor arm only mutated the in-memory
+        `Column.Storage`, never rewriting the stale heap row. **Fix:** (a) new `storageNameToAttCode` helper
+        maps `plain/main/external/extended` → `'p'/'m'/'e'/'x'` (`TYPSTORAGE_*`), shadowing the type default
+        in the emitted row when `Column.Storage` is set; (b) the executor arm now flushes the override through
+        the same delete-old-rows + `syncTableToCatalogHeap` re-sync path DROP COLUMN / SET NOT NULL use
+        (gated on `catalogHeapSyncAvailable`). Dump-fidelity only: goopg doesn't TOAST, so storage has no
+        runtime effect; it's recorded + round-tripped so a restored schema preserves the declared strategy.
+        Files: `internal/executor/pg18_user_catalog_rows.go` (+helper, attstorage override),
+        `internal/executor/operators_ddl.go` (`AlterTableSetStorage` arm: heap re-sync),
+        `internal/executor/pg18_user_catalog_rows_test.go` (`TestUserPGAttributeStorageOverride`),
+        `internal/testport/pgdump_connsetup_test.go` (`storcol` fixture + 2 positive + 1 negative assert),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 182 section). Gates: gofmt OK; `go vet
+        ./internal/executor/ ./internal/testport/` clean; `go build ./internal/executor/` OK;
+        `TestUserPGAttributeStorageOverride` + full `./internal/executor/` package PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (3.02s, not skipped); pgbench pre-commit smoke on commit.
+        **Next:** column COMPRESSION dump fidelity (`attcompression`, analogous gap — pg_dump emits `SET
+        COMPRESSION` when attcompression differs; needs the same heap-resync wiring + the parser already
+        ignores the keyword so it'd need to record it); deferred MINVALUE/MAXVALUE keyword-AST-node slice
+        (HIGHER RISK: partition routing); or close the `validateDefaultExpr` recursion gap.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
