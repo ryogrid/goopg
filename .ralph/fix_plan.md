@@ -3515,6 +3515,33 @@ object support.
         DEFINER / LEAKPROOF / COST attribute (each already wired through the pg_proc view,
         so likely clean positives like this slice).
 
+      - **PROGRESS 2026-06-17 (loop #129):** **DU-002 slice 162 LANDED — real
+        divergence fixed.** A function whose RESULT type is an array
+        (`public.make_arr() RETURNS integer[]`) now round-trips through pg_dump. Slice 159
+        proved an array works as an *argument* type (`VARIADIC arr integer[]`), but the
+        *return*-type path was separate and BROKEN — a sibling-path divergence. The parser
+        stores an array type as the base name (`integer`) with `IsArray` set, not as
+        `integer[]`; the CREATE FUNCTION executor re-appends the `[]` suffix for argument
+        types (`operators_ddl.go:5510`) but PREVIOUSLY not for the return type. So
+        `catalog.Routine.ReturnType.Name` held the bare `integer`, the `pg_proc` view's
+        `typeNameToOIDStr` resolved `prorettype` to the scalar element OID 23 (not array OID
+        1007), and pg_dump's `format_type(prorettype)` emitted `RETURNS integer` — silently
+        dropping the array. **Fix (`operators_ddl.go`):** compute the return-type name the
+        same way as argument types (re-append `[]` when `s.ReturnType.IsArray`), so
+        `prorettype=1007`; `format_type(1007)` already renders `integer[]` (slice 159
+        exercised the same OID as an argument). Body `SELECT ARRAY[1, 2, 3]` is `$`-free
+        ($$ delimiter) and passes `validateSQLFunctionBody` (`checkSQLFuncReturnTypeBasic`
+        statically types only string/int literals, so `ARRAY[...]` is accepted). Files:
+        `internal/executor/operators_ddl.go` (return-type suffix re-append),
+        `internal/testport/pgdump_connsetup_test.go` (fixture + 2 assertions),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 162 section). Gates: gofmt OK;
+        `go build ./internal/...` OK; `TestPort_PgDumpConnectionSetup` PASS (2.32s, not
+        skipped); `go test ./internal/executor/` PASS; pgbench pre-commit smoke on commit.
+        **Next: slice 163** — the remaining function-attribute gaps are genuine features:
+        `TRANSFORM FOR TYPE` (`protrftypes` always NULL), a non-`sql` LANGUAGE (`plpgsql`)
+        body, a composite/`RECORD` return type, or `RETURNS TABLE` (maps to OUT params in
+        goopg's parser — a known divergence).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

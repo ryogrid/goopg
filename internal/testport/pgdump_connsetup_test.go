@@ -1701,6 +1701,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function gen_one: %v", err)
 	}
 
+	// Slice 162: a function whose RESULT type is an ARRAY (`RETURNS integer[]`).
+	// Slice 159 proved an array works as an ARGUMENT type (VARIADIC arr
+	// integer[]), but the return-type path was a separate, untested code path —
+	// and it was BROKEN. The parser stores an array type as the base name
+	// ("integer") with IsArray set, NOT as "integer[]". The CREATE FUNCTION
+	// executor re-appends the "[]" suffix for argument types (operators_ddl.go:
+	// 5510) but PREVIOUSLY did not for the return type — a sibling-path
+	// divergence. As a result catalog.Routine.ReturnType.Name was the bare
+	// "integer", so the pg_proc view's typeNameToOIDStr resolved prorettype to
+	// the SCALAR element OID 23 instead of the array OID 1007, and pg_dump
+	// rendered `RETURNS integer`, silently dropping the array. This slice adds
+	// the missing suffix re-append (operators_ddl.go) so prorettype=1007 and
+	// pg_dump's format_type(1007) yields `integer[]`. The body `SELECT ARRAY[1,
+	// 2, 3]` is `$`-free (plain `$$` delimiter) and validateSQLFunctionBody
+	// passes it: checkSQLFuncReturnTypeBasic only statically types string/int
+	// literals, so an ARRAY[...] expression is "undeterminable" and accepted.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.make_arr() RETURNS integer[] LANGUAGE sql AS $$ SELECT ARRAY[1, 2, 3] $$"); err != nil {
+		t.Fatalf("create function make_arr: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2343,6 +2363,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.gen_one() RETURNS SETOF integer\n    LANGUAGE sql\n    AS $$ SELECT 1 $$;") {
 			t.Errorf("pg_dump dropped/mangled gen_one's body or emitted a stray ROWS clause\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 162 (asserted):** the ARRAY-return function (make_arr) must
+		// round-trip its `RETURNS integer[]` clause. pg_dump renders the return
+		// type via the server's format_type(prorettype) — prorettype must be the
+		// array OID 1007 (which format_type renders "integer[]"), NOT the scalar
+		// element OID 23. Before the operators_ddl.go fix the array suffix was
+		// dropped at catalog-build time, so prorettype was 23 and the dump read
+		// `RETURNS integer`. Real pg_dump emits:
+		//   CREATE FUNCTION public.make_arr() RETURNS integer[]
+		//       LANGUAGE sql
+		//       AS $$ SELECT ARRAY[1, 2, 3] $$;
+		// A dropped/scalarized return type surfaces in the first assertion; a
+		// mangled body in the second.
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.make_arr() RETURNS integer[]") {
+			t.Errorf("pg_dump dropped/scalarized the make_arr integer[] return type\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.make_arr() RETURNS integer[]\n    LANGUAGE sql\n    AS $$ SELECT ARRAY[1, 2, 3] $$;") {
+			t.Errorf("pg_dump dropped/mangled make_arr's body or return clause\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

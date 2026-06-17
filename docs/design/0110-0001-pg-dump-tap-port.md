@@ -4511,6 +4511,37 @@ asserts the `RETURNS SETOF integer` signature plus the exact one-line `LANGUAGE 
 `AS $$ SELECT 1 $$;` fragment. A dropped SETOF (function restored as a plain
 scalar-returning function) or a stray `ROWS 1000` surfaces exactly in the assertion.
 
+### Slice 162 — array return type round-trip (real divergence fixed)
+
+Slice 159 proved an array works as an **argument** type (`VARIADIC arr integer[]`), but the
+**return** type is a separate code path — and it was broken. The parser stores an array type
+as the base name (`integer`) with `IsArray` set, **not** as `integer[]`. The CREATE FUNCTION
+executor re-appends the `[]` suffix when building argument types (`operators_ddl.go:5510`)
+but **did not** for the return type — a textbook sibling-path divergence (encode/decode-style
+twins drifting). As a result `catalog.Routine.ReturnType.Name` held the bare `integer`, so the
+runtime `pg_proc` view's `typeNameToOIDStr` resolved `prorettype` to the **scalar element OID
+23** instead of the **array OID 1007**, and pg_dump's `format_type(prorettype)` rendered
+`RETURNS integer` — silently dropping the array.
+
+**Production fix (`operators_ddl.go`).** Compute the return-type name the same way as argument
+types: re-append `[]` when `s.ReturnType.IsArray`, so `prorettype=1007`. `format_type(1007)`
+on the goopg server already renders `integer[]` (slice 159 exercised the same OID in the
+argument position). The body `SELECT ARRAY[1, 2, 3]` is `$`-free (plain `$$` delimiter) and
+passes `validateSQLFunctionBody`: `checkSQLFuncReturnTypeBasic` only statically types string/
+integer literals, so an `ARRAY[...]` expression is "undeterminable" and accepted. Real pg_dump
+18.3 renders:
+
+```
+CREATE FUNCTION public.make_arr() RETURNS integer[]
+    LANGUAGE sql
+    AS $$ SELECT ARRAY[1, 2, 3] $$;
+```
+
+The TAP test creates `public.make_arr() RETURNS integer[] … AS $$ SELECT ARRAY[1, 2, 3] $$`
+and asserts the `RETURNS integer[]` signature plus the exact one-line `LANGUAGE sql` /
+`AS $$ SELECT ARRAY[1, 2, 3] $$;` fragment. A scalarized return type (the pre-fix bug) or a
+mangled body surfaces exactly in the two assertions.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

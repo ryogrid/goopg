@@ -5554,6 +5554,15 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			return err
 		}
 	}
+	// Re-append the "[]" suffix for an array return type, mirroring the
+	// argument-type construction above (operators_ddl.go:5510). The parser
+	// stores arrays as a base name plus IsArray; the pg_proc view keys the
+	// prorettype OID off the bracketed name, so dropping the suffix here makes
+	// pg_dump emit the scalar element type instead of the array.
+	retTypeName := strings.ToLower(s.ReturnType.Name)
+	if s.ReturnType.IsArray {
+		retTypeName += "[]"
+	}
 	r := &catalog.Routine{
 		Schema:      schema,
 		Name:        s.Name.Name,
@@ -5562,7 +5571,14 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		ArgModes:    argModes,
 		ArgDefaults: argDefaults,
 		ReturnType: catalog.Type{
-			Name: strings.ToLower(s.ReturnType.Name),
+			// Mirror the argument-type path above: the parser stores an array
+			// return type as the base name (e.g. "integer") with IsArray set,
+			// NOT as "integer[]". Without re-appending the "[]" suffix the
+			// pg_proc view's typeNameToOIDStr resolves prorettype to the SCALAR
+			// element OID (23) instead of the array OID (1007), so pg_dump emits
+			// `RETURNS integer` and silently drops the array — a sibling-path
+			// divergence from how ArgTypes are built (operators_ddl.go:5510).
+			Name: retTypeName,
 			Args: append([]int64(nil), s.ReturnType.Args...),
 		},
 		ReturnsSet:      s.ReturnsSet,
