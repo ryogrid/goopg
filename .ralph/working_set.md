@@ -1,31 +1,30 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 160 (loop #127) — a function with a DEFAULT parameter
-(`public.add_default(a integer, b integer DEFAULT 10)`) round-trips through pg_dump.
-REAL DIVERGENCE FIX: `buildFunctionArguments` (expr.go, body of pg_get_function_arguments
-which pg_dump reads) NEVER emitted the ` DEFAULT <expr>` clause, even though the parser
-captured `a.Default` and CREATE FUNCTION stored it positionally in
-`catalog.Routine.ArgDefaults`. So `add_default(a integer, b integer DEFAULT 10)` dumped as
-`add_default(a integer, b integer)` — a function that rejects the one-arg call form.
-Fix: append ` DEFAULT <expr>` for INPUT args only (new `argIsInput` helper: IN/INOUT/
-VARIADIC yes, OUT no), gated on a new `printDefaults bool` param mirroring PG's
-print_defaults flag (ruleutils.c:3420). pg_get_function_arguments passes true;
-pg_get_function_identity_arguments passes false (identity drops defaults). Sibling
-`buildFunctionDef` (pg_get_functiondef, also print_defaults=true upstream) got the
-identical fix (sibling-paths rule).
+Last landed: DU-002 slice 161 (loop #128) — a SET-RETURNING function
+(`public.gen_one() RETURNS SETOF integer LANGUAGE sql AS $$ SELECT 1 $$`) round-trips
+through pg_dump. CLEAN POSITIVE (no production change). pg_dump's dumpFunc reads
+proretset/prorettype directly from pg_proc and renders `RETURNS SETOF <rettype>` when
+proretset='t'. The plumbing was already complete: parser strips SETOF + sets
+ReturnsSet=true (function.go:97); CREATE FUNCTION stores it on catalog.Routine.ReturnsSet
+(operators_ddl.go:5568); validateSQLFunctionBody skips the scalar single-column check when
+ReturnsSet (operators_ddl.go:5728); the runtime pg_proc view emits proretset='t' + the
+SRF-default prorows='1000' (pg_proc_view.go:330/351) with prorettype=element type
+(integer, OID 23). pg_dump suppresses the ROWS clause at the 1000 default, so no explicit
+ROWS in the dump; the `$`-free body keeps the plain `$$` delimiter.
 
-Files: internal/executor/expr.go (buildFunctionArguments ~11325 now takes printDefaults
-bool + argIsInput helper; buildFunctionDef arg loop; 2 call sites at ~7248/7266),
-internal/executor/pg_get_function_identity_arguments_test.go (TestPgGetFunctionArgumentsDefault),
-internal/testport/pgdump_connsetup_test.go (fixture ~1660, assertion ~2285),
-docs/design/0110-0001-pg-dump-tap-port.md (slice 160 section),
-.ralph/fix_plan.md (loop #127 PROGRESS).
-Verified: gofmt OK; go build ./internal/... OK; TestPgGetFunctionArgumentsDefault +
-TestPgGetFunctionIdentityArguments* PASS; ./internal/executor + ./internal/parser PASS;
-TestPort_PgDumpConnectionSetup PASS (2.70s, not skipped); pgbench pre-commit smoke on commit.
+Files: internal/testport/pgdump_connsetup_test.go (fixture ~1681, assertion ~2308),
+docs/design/0110-0001-pg-dump-tap-port.md (slice 161 section),
+.ralph/fix_plan.md (loop #128 PROGRESS).
+Verified: gofmt OK; go build ./internal/... OK; TestPort_PgDumpConnectionSetup PASS
+(2.17s, not skipped); pgbench pre-commit smoke on commit.
 
-Next direction (slice 161): a `TRANSFORM FOR TYPE` clause (protrftypes, currently NULL —
-likely a feature gap), a non-`sql` LANGUAGE (e.g. plpgsql, absent from pg_language →
-langOID 0, likely a gap) body, or a function returning a composite/RECORD type. NOTE:
-RETURNS TABLE maps to argmode 'o' not 't' in goopg (parser/function.go), so it dumps as OUT
-params + RETURNS record, NOT RETURNS TABLE(...) — a divergence, treat as a feature-gap slice.
+Next direction (slice 162): the remaining function-attribute cells are all already wired
+through the runtime pg_proc view (pg_proc_view.go), so each is likely a clean positive
+like slice 161 — STRICT (proisstrict), SECURITY DEFINER (prosecdef), LEAKPROOF
+(proleakproof), or COST n (procost override; pg_dump emits ` COST n` only when procost !=
+language default). Verify each by adding a fixture + assertion and running
+TestPort_PgDumpConnectionSetup. The likely REAL feature-gaps (treat as separate slices):
+`TRANSFORM FOR TYPE` (protrftypes always NULL), a non-`sql` LANGUAGE such as `plpgsql`
+(check pg_language → langNameToOIDStr), a composite/RECORD return type, and RETURNS TABLE
+(maps to argmode 'o' not 't' in goopg parser/function.go — dumps as OUT params, a known
+divergence).

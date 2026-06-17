@@ -4482,6 +4482,35 @@ $_$ SELECT $1 + $2 $_$;` fragment. The full-vs-identity split is pinned directly
 `TestPgGetFunctionArgumentsDefault` in the executor package (full form keeps the DEFAULT;
 identity form drops it).
 
+### Slice 161 — SETOF return clause round-trip (clean positive)
+
+Every prior function slice returned a single scalar (`RETURNS integer`/`void`), so the
+`proretset='t'` return-clause shape was never exercised end-to-end. pg_dump's `dumpFunc`
+reads `proretset` and `prorettype` directly from `pg_proc` (not via `pg_get_functiondef`)
+and renders `RETURNS SETOF <rettype>` when `proretset[0]=='t'`.
+
+**Clean positive — no production change.** The plumbing already exists end-to-end: the
+parser strips `SETOF` and sets `ReturnsSet=true` (`function.go:97`); CREATE FUNCTION stores
+it on `catalog.Routine.ReturnsSet` (`operators_ddl.go:5568`) and `validateSQLFunctionBody`
+then **skips** the single-column scalar-return check when `ReturnsSet` is set
+(`operators_ddl.go:5728`), so a body whose final statement yields a row set is accepted;
+and the runtime `pg_proc` view emits `proretset='t'` plus the SRF-default `prorows='1000'`
+(`pg_proc_view.go:330/351`), with `prorettype` set to the **element** type (`integer`,
+OID 23) — not an array type. pg_dump suppresses the `ROWS` clause when `prorows` is the
+1000 default, so the dump carries no explicit `ROWS`. The `$`-free body `SELECT 1` keeps
+the plain `$$` delimiter. Real pg_dump 18.3 renders:
+
+```
+CREATE FUNCTION public.gen_one() RETURNS SETOF integer
+    LANGUAGE sql
+    AS $$ SELECT 1 $$;
+```
+
+The TAP test creates `public.gen_one() RETURNS SETOF integer … AS $$ SELECT 1 $$` and
+asserts the `RETURNS SETOF integer` signature plus the exact one-line `LANGUAGE sql` /
+`AS $$ SELECT 1 $$;` fragment. A dropped SETOF (function restored as a plain
+scalar-returning function) or a stray `ROWS 1000` surfaces exactly in the assertion.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

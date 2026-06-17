@@ -1679,6 +1679,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function add_default: %v", err)
 	}
 
+	// Slice 161: a SET-RETURNING function (`RETURNS SETOF integer`). Every prior
+	// function slice returned a single scalar (`RETURNS integer`/`void`), so the
+	// proretset='t' return-clause shape was never exercised end-to-end. This drives
+	// two paths nothing had reached for a pg_proc dump:
+	//   (1) CREATE FUNCTION stores ReturnsSet=true (the parser strips SETOF and sets
+	//       the flag, function.go:97); validateSQLFunctionBody then SKIPS the
+	//       single-column scalar-return check (operators_ddl.go:5728), so a body
+	//       whose final statement yields a row set is accepted; and
+	//   (2) the runtime pg_proc view emits proretset='t' AND the SRF-default
+	//       prorows='1000' (pg_proc_view.go:330/351), with prorettype set to the
+	//       ELEMENT type (integer, OID 23) — NOT an array type.
+	// pg_dump's dumpFunc renders the return clause as `RETURNS SETOF <rettype>` when
+	// proretset[0]=='t' (pg_dump.c) and SUPPRESSES the ROWS clause when prorows is the
+	// 1000 default — so the dump carries no explicit `ROWS`. The `$`-free body keeps
+	// the plain `$$` delimiter. Clean positive: the proretset/prorows plumbing already
+	// exists; this is the first end-to-end pg_dump assertion that a SETOF return shape
+	// round-trips. A dropped SETOF (function restored as scalar-returning) or a stray
+	// `ROWS 1000` surfaces exactly in the assertion below.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.gen_one() RETURNS SETOF integer LANGUAGE sql AS $$ SELECT 1 $$"); err != nil {
+		t.Fatalf("create function gen_one: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2304,6 +2326,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "    LANGUAGE sql\n    AS $_$ SELECT $1 + $2 $_$;") {
 			t.Errorf("pg_dump dropped/mangled add_default's body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 161 (asserted):** the SET-RETURNING function (gen_one) must
+		// round-trip its `RETURNS SETOF integer` return clause. pg_dump reads
+		// proretset/prorettype directly from pg_proc; goopg's runtime pg_proc view
+		// emits proretset='t' with prorettype=integer (element type, OID 23) and the
+		// SRF-default prorows='1000', which dumpFunc SUPPRESSES (no explicit ROWS).
+		// A dropped SETOF (function restored as a plain scalar-returning function) or
+		// a stray `ROWS 1000` surfaces exactly here. The `$`-free body keeps the plain
+		// `$$` delimiter. Real pg_dump 18.3 renders:
+		//   CREATE FUNCTION public.gen_one() RETURNS SETOF integer
+		//       LANGUAGE sql
+		//       AS $$ SELECT 1 $$;
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.gen_one() RETURNS SETOF integer") {
+			t.Errorf("pg_dump dropped/mangled the gen_one SETOF return clause\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.gen_one() RETURNS SETOF integer\n    LANGUAGE sql\n    AS $$ SELECT 1 $$;") {
+			t.Errorf("pg_dump dropped/mangled gen_one's body or emitted a stray ROWS clause\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

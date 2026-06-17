@@ -3492,6 +3492,29 @@ object support.
         `TRANSFORM FOR TYPE` clause (`protrftypes`, likely a feature gap), a non-`sql`
         LANGUAGE (e.g. `plpgsql`) body, or a function returning a composite/`RECORD` type.
 
+      - **PROGRESS 2026-06-17 (loop #128):** **DU-002 slice 161 LANDED — clean
+        positive.** A SET-RETURNING function (`public.gen_one() RETURNS SETOF integer`)
+        now round-trips through pg_dump. Every prior function slice returned a single
+        scalar (`RETURNS integer`/`void`), so the `proretset='t'` return-clause shape was
+        never exercised end-to-end. pg_dump's `dumpFunc` reads `proretset`/`prorettype`
+        directly from `pg_proc` and renders `RETURNS SETOF <rettype>` when
+        `proretset[0]=='t'`. The plumbing already exists end-to-end: parser strips SETOF +
+        sets `ReturnsSet=true` (`function.go:97`); CREATE FUNCTION stores it on
+        `catalog.Routine.ReturnsSet` and `validateSQLFunctionBody` skips the scalar
+        single-column check when `ReturnsSet` (`operators_ddl.go:5728`); the runtime
+        `pg_proc` view emits `proretset='t'` + SRF-default `prorows='1000'`
+        (`pg_proc_view.go:330/351`) with `prorettype`=element type (`integer`, OID 23).
+        pg_dump suppresses the `ROWS` clause at the 1000 default, so the dump carries no
+        explicit ROWS; `$`-free body keeps the plain `$$` delimiter. No production change.
+        Files: `internal/testport/pgdump_connsetup_test.go` (fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 161 section). Gates: gofmt OK;
+        `go build ./internal/...` OK; `TestPort_PgDumpConnectionSetup` PASS (2.17s, not
+        skipped); pgbench pre-commit smoke on commit. **Next: slice 162** — a `TRANSFORM
+        FOR TYPE` clause (`protrftypes`, feature gap), a non-`sql` LANGUAGE (`plpgsql`)
+        body, a function returning a composite/`RECORD` type, or a STRICT / SECURITY
+        DEFINER / LEAKPROOF / COST attribute (each already wired through the pg_proc view,
+        so likely clean positives like this slice).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).
