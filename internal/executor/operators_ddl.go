@@ -4203,7 +4203,39 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 			}
 		case parser.AlterTableAlterColumnSet:
-			// SET (options) on a column of a heap table: no-op in goopg v0.
+			// SET (opt=value, …) — record the per-column attribute options on the
+			// catalog column AND rewrite the pg_attribute heap row so pg_dump
+			// observes the new attoptions. pg_dump emits `ALTER TABLE ONLY ...
+			// ALTER COLUMN ... SET (...)` whenever array_to_string(attoptions)
+			// is non-empty (pg_dump.c dumpTableSchema). Like SET STORAGE (slice
+			// 182) / SET COMPRESSION (183) / SET STATISTICS (184), the in-memory
+			// mutation alone is invisible because pg_attribute is a heap populated
+			// at CREATE TABLE; the override must be flushed through the same
+			// delete-old-rows + re-sync path or the stale heap row keeps reporting
+			// NULL and the SET (...) is silently dropped from the dump. goopg does
+			// not act on these planner-statistics hints (e.g. n_distinct) —
+			// dump-fidelity only. DU-002 slice 185.
+			if act.ColumnName != "" && len(act.SetOptions) > 0 {
+				changed := false
+				for i := range tbl.Columns {
+					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+						tbl.Columns[i].Options = append([]string(nil), act.SetOptions...)
+						changed = true
+						break
+					}
+				}
+				if changed && catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+			}
 		case parser.AlterTableAlterColumnType:
 			if err := o.execAlterColumnType(tbl, act); err != nil {
 				return err

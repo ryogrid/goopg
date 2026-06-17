@@ -155,6 +155,15 @@ type Column struct {
 	// this is recorded purely so the column round-trips through pg_dump.
 	// DU-002 slice 184.
 	StatTarget *int
+	// Options holds per-column attribute options set via `ALTER COLUMN ...
+	// SET (opt=value, …)` (e.g. "n_distinct=0.5"), each normalized to PG's
+	// stored `name=value` form. nil/empty means none — PG stores
+	// pg_attribute.attoptions=NULL and pg_dump emits no SET (...) clause. A
+	// non-empty list is rendered into the attoptions text-array literal so
+	// pg_dump re-emits `ALTER TABLE ONLY ... ALTER COLUMN ... SET (...)`. goopg
+	// does not act on these planner statistics hints; recorded purely so the
+	// column round-trips through pg_dump. DU-002 slice 185.
+	Options []string
 }
 
 // NamedCheckConstraint holds a CHECK constraint with an explicit name.

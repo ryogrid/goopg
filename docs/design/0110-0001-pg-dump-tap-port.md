@@ -5330,6 +5330,45 @@ adds a `statcol(a, b, d integer)` fixture — `a` `SET STATISTICS 100`, `b` `SET
 asserts the dump re-emits both statements while the untouched `d` produces none. Dump-fidelity only:
 goopg does not sample per-column statistics targets, so the value has no runtime effect.
 
+### Slice 185 — per-column attribute options (ALTER COLUMN ... SET (opt=value)) round-trip
+
+The fourth sibling in the slice 182/183/184 family, for `pg_attribute.attoptions`: per-column attribute
+options set via `ALTER TABLE ... ALTER COLUMN c SET (n_distinct=0.5, …)` were silently dropped from the
+dump. pg_dump's `dumpTableSchema` (pg_dump.c) renders the attribute query column
+`array_to_string(a.attoptions, ', ') AS attoptions` and emits
+
+```sql
+ALTER TABLE ONLY public.optcol ALTER COLUMN a SET (n_distinct=0.5);
+```
+
+whenever that string is non-empty. goopg's parser **already had** a `SET (` arm in the table
+ALTER-COLUMN path, but it consumed the parenthesized block with a brace-depth counter and **discarded
+the contents**, emitting a bare `AlterTableAlterColumnSet` action that the executor treated as a no-op;
+`buildUserPGAttributeRow` hardcoded `attoptions=NULL`. Three layers were wired, mirroring 182/183/184:
+
+1. **Parser** — `parseColumnSetOptions` replaces the discard loop: it walks the option list, capturing
+   each `name [=] value` pair and normalizing it to PG's stored `name=value` form (e.g. `n_distinct=0.5`).
+   A leading `-` (negative `n_distinct`) lexes as `TokenOperator`, so value tokens are concatenated
+   verbatim to reconstruct `-0.1`. The pairs ride on a new `AlterTableAction.SetOptions []string` plus
+   the (previously unset) `ColumnName`.
+
+2. **`buildUserPGAttributeRow`** — when `len(Column.Options) > 0` it emits the PG text-array literal
+   `{opt1,opt2,…}` in `attoptions`; otherwise NULL (the default). goopg's `array_to_string` builtin
+   (→ `parseTextArray`) consumes that `{…}` literal, so the dump query renders the joined options exactly
+   as PG would.
+
+3. **The `AlterTableAlterColumnSet` executor arm** (`operators_ddl.go`) — previously a no-op — now copies
+   `act.SetOptions` onto `catalog.Column.Options` **and** flushes through the same delete-old-rows +
+   `syncTableToCatalogHeap` re-sync path the sibling slices use (load-bearing: pg_dump scans the persisted
+   `pg_attribute` heap, not the live catalog object).
+
+`TestUserPGAttributeOptionsOverride` pins the datum mapping (none → NULL, one/multi options → the
+`{…}` literal). `TestParseAlterTableSetColumnOptions` pins the parse + normalization forms (spaced/unspaced
+`=`, negative values, multiple options). The TAP test adds an `optcol(a, b, d integer)` fixture — `a`
+`SET (n_distinct=0.5)`, `b` `SET (n_distinct=-0.1)` — and asserts the dump re-emits both `SET (...)`
+statements while the untouched `d` produces none. `RESET (...)` is left as the pre-existing no-op (pg_dump
+never emits it). Dump-fidelity only: goopg does not act on these planner-statistics hints.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

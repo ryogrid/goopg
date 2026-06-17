@@ -293,3 +293,45 @@ func TestParseAlterTableSetStatistics(t *testing.T) {
 		}
 	}
 }
+
+// TestParseAlterTableSetColumnOptions verifies the per-column attribute-option
+// list (`ALTER COLUMN c SET (opt=value, …)`) is captured and normalized to PG's
+// stored `name=value` form for pg_attribute.attoptions round-trip. DU-002 slice 185.
+func TestParseAlterTableSetColumnOptions(t *testing.T) {
+	for _, tc := range []struct {
+		sql     string
+		wantCol string
+		wantOpt []string
+	}{
+		{"ALTER TABLE t ALTER COLUMN c SET (n_distinct = 0.5)", "c", []string{"n_distinct=0.5"}},
+		{"ALTER TABLE t ALTER COLUMN c SET (n_distinct=0.5)", "c", []string{"n_distinct=0.5"}},
+		{"ALTER TABLE t ALTER COLUMN c SET (n_distinct = -0.5)", "c", []string{"n_distinct=-0.5"}},
+		{"ALTER TABLE t ALTER COLUMN c SET (n_distinct = 100)", "c", []string{"n_distinct=100"}},
+		{"ALTER TABLE t ALTER COLUMN c SET (n_distinct = 0.5, n_distinct_inherited = -0.1)", "c",
+			[]string{"n_distinct=0.5", "n_distinct_inherited=-0.1"}},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableAlterColumnSet {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		if at.Actions[0].ColumnName != tc.wantCol {
+			t.Errorf("Parse(%q): ColumnName=%q want %q", tc.sql, at.Actions[0].ColumnName, tc.wantCol)
+		}
+		got := at.Actions[0].SetOptions
+		if len(got) != len(tc.wantOpt) {
+			t.Fatalf("Parse(%q): SetOptions=%v want %v", tc.sql, got, tc.wantOpt)
+		}
+		for i := range got {
+			if got[i] != tc.wantOpt[i] {
+				t.Errorf("Parse(%q): SetOptions[%d]=%q want %q", tc.sql, i, got[i], tc.wantOpt[i])
+			}
+		}
+	}
+}

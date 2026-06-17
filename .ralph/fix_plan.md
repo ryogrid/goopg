@@ -4061,6 +4061,36 @@ object support.
         pgbench pre-commit smoke on commit. **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node slice
         (HIGHER RISK: partition routing); or close the `validateDefaultExpr` array/row/CASE/InExpr recursion gap;
         or other pg_dump per-column attribute gaps (attoptions / attfdwoptions are NULL today).
+      - **PROGRESS 2026-06-17 (loop #153):** **DU-002 slice 185 LANDED — per-column attribute options
+        (`ALTER COLUMN c SET (n_distinct=0.5, …)`) round-trip through pg_dump.** The fourth sibling of
+        slices 182/183/184, for `pg_attribute.attoptions`. pg_dump's `dumpTableSchema` renders the
+        attribute query column `array_to_string(a.attoptions, ', ')` and emits `ALTER TABLE ONLY ...
+        ALTER COLUMN ... SET (...);` whenever that is non-empty. goopg's parser **already had** a `SET (`
+        arm in the table ALTER-COLUMN path, but it consumed the parenthesized block with a brace-depth
+        counter and **discarded the contents**, emitting a bare `AlterTableAlterColumnSet` the executor
+        treated as a no-op; `buildUserPGAttributeRow` hardcoded `attoptions=NULL`. **Fix (3 layers,
+        mirroring 182/183/184):** (1) parser — `parseColumnSetOptions` replaces the discard loop, capturing
+        each `name [=] value` pair normalized to PG's stored `name=value` form (leading `-` for negative
+        n_distinct lexes as `TokenOperator`, concatenated verbatim) onto a new `AlterTableAction.SetOptions
+        []string` + `ColumnName`; (2) `buildUserPGAttributeRow` — emits the PG text-array literal
+        `{opt1,opt2}` in `attoptions` when `len(Column.Options) > 0`, else NULL (goopg's `array_to_string`
+        → `parseTextArray` consumes the `{…}` literal so the dump query renders identically to PG);
+        (3) `AlterTableAlterColumnSet` executor arm (was a no-op) copies `act.SetOptions` onto
+        `catalog.Column.Options` AND flushes through the same delete-old-rows + `syncTableToCatalogHeap`
+        re-sync path (load-bearing: pg_dump scans the persisted pg_attribute heap). `RESET (...)` left as
+        the pre-existing no-op (pg_dump never emits it). New field `catalog.Column.Options []string`.
+        Dump-fidelity only (goopg does not act on n_distinct planner hints). Files:
+        `internal/parser/ast.go`, `internal/parser/ddl.go`, `internal/catalog/catalog.go`,
+        `internal/executor/pg18_user_catalog_rows.go`, `internal/executor/operators_ddl.go`,
+        `internal/executor/pg18_user_catalog_rows_test.go` (`TestUserPGAttributeOptionsOverride`),
+        `internal/parser/alter_test.go` (`TestParseAlterTableSetColumnOptions`),
+        `internal/testport/pgdump_connsetup_test.go` (`optcol` fixture + 2 positive + 1 negative assert),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 185 section). Gates: gofmt OK; `go vet
+        ./internal/parser/ ./internal/catalog/ ./internal/executor/` clean; full `./internal/parser/`,
+        `./internal/catalog/`, `./internal/executor/` PASS; `TestPort_PgDumpConnectionSetup` PASS (3.23s);
+        pgbench pre-commit smoke on commit. **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node slice
+        (HIGHER RISK: partition routing); or close the `validateDefaultExpr` recursion gap; or
+        attfdwoptions (foreign-table only, NULL today).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

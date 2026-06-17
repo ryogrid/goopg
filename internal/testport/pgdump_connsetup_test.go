@@ -953,6 +953,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("alter statcol.b set statistics 0: %v", err)
 	}
 
+	// Slice 185: per-column attribute options must survive the dump. pg_dump
+	// renders `array_to_string(a.attoptions, ', ')` and emits `ALTER TABLE
+	// ONLY ... ALTER COLUMN ... SET (...)` whenever that is non-empty (pg_dump.c
+	// dumpTableSchema). goopg captured the options on catalog.Column.Options,
+	// but the synthesized pg_attribute row hardcoded attoptions=NULL (the
+	// default), so they were silently dropped from the dump. `optcol.a` gets a
+	// positive n_distinct, `b` a negative one; the untouched `d` must NOT re-emit.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optcol (a integer, b integer, d integer)"); err != nil {
+		t.Fatalf("create table optcol: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.optcol ALTER COLUMN a SET (n_distinct=0.5)"); err != nil {
+		t.Fatalf("alter optcol.a set (n_distinct=0.5): %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.optcol ALTER COLUMN b SET (n_distinct=-0.1)"); err != nil {
+		t.Fatalf("alter optcol.b set (n_distinct=-0.1): %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -2506,6 +2523,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if strings.Contains(res.Stdout, "ALTER COLUMN d SET STATISTICS") {
 			t.Errorf("pg_dump emitted a spurious SET STATISTICS for an untouched column (statcol.d)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 185 (asserted):** per-column attribute options. `optcol.a` got
+		// `SET (n_distinct=0.5)` and `optcol.b` `SET (n_distinct=-0.1)`; pg_dump
+		// renders `array_to_string(a.attoptions, ', ')` and re-emits each as a
+		// standalone `ALTER TABLE ONLY public.optcol ALTER COLUMN <c> SET (...);`
+		// (pg_dump.c dumpTableSchema). Before the fix attoptions was hardcoded
+		// NULL, so neither statement appeared. The untouched `d` (attoptions
+		// NULL) must NOT produce one.
+		for _, sub := range []string{
+			"ALTER TABLE ONLY public.optcol ALTER COLUMN a SET (n_distinct=0.5);",
+			"ALTER TABLE ONLY public.optcol ALTER COLUMN b SET (n_distinct=-0.1);",
+		} {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a per-column attribute option; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		if strings.Contains(res.Stdout, "ALTER COLUMN d SET (") {
+			t.Errorf("pg_dump emitted a spurious SET (...) for an untouched column (optcol.d)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

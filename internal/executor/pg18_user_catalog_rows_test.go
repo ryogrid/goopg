@@ -678,6 +678,36 @@ func TestUserPGAttributeStatTargetOverride(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeOptionsOverride pins the per-column attribute-options
+// override (ALTER COLUMN ... SET (opt=value, …), DU-002 slice 185). A column
+// with no options reports pg_attribute.attoptions=NULL (the PG18 default → no
+// SET (...) clause); a column with options reports a PG text-array literal that
+// goopg's array_to_string(attoptions, ', ') renders so pg_dump re-emits the
+// clause.
+func TestUserPGAttributeOptionsOverride(t *testing.T) {
+	const attoptionsIdx = 21 // attoptions position in the user pg_attribute row
+	tbl := &catalog.Table{Name: "t", OID: 99004}
+
+	// No options: attoptions is NULL.
+	base := buildUserPGAttributeRow(nil, tbl, catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0})
+	if !base[attoptionsIdx].IsNull() {
+		t.Fatalf("column without options: attoptions=%v want NULL", base[attoptionsIdx])
+	}
+
+	// A single option renders as a one-element text-array literal.
+	one := catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0, Options: []string{"n_distinct=0.5"}}
+	if got := buildUserPGAttributeRow(nil, tbl, one)[attoptionsIdx]; got.StringValue() != "{n_distinct=0.5}" {
+		t.Errorf("one option: attoptions=%q want %q", got.StringValue(), "{n_distinct=0.5}")
+	}
+
+	// Multiple options render as a comma-joined text-array literal.
+	multi := catalog.Column{Name: "c", Type: catalog.Type{Name: "int4"}, Ordinal: 0,
+		Options: []string{"n_distinct=0.5", "n_distinct_inherited=-0.1"}}
+	if got := buildUserPGAttributeRow(nil, tbl, multi)[attoptionsIdx]; got.StringValue() != "{n_distinct=0.5,n_distinct_inherited=-0.1}" {
+		t.Errorf("multi option: attoptions=%q want %q", got.StringValue(), "{n_distinct=0.5,n_distinct_inherited=-0.1}")
+	}
+}
+
 // TestUserPGAttributeEnumColumn pins the enum-column resolution (DU-002 slice
 // 88). A column whose declared type is a user-defined enum must report
 // pg_attribute.atttypid = the enum's dynamic pg_type OID (not the text

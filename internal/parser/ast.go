@@ -1773,6 +1773,12 @@ type AlterTableAction struct {
 	// CompressionType is the TOAST compression method for AlterTableSetCompression.
 	// Values: "pglz", "lz4". DU-002 slice 183.
 	CompressionType string
+	// SetOptions holds the per-column attribute options captured from
+	// `ALTER COLUMN name SET (opt=value, …)` for AlterTableAlterColumnSet, each
+	// entry normalized to PG's stored `name=value` form (e.g. "n_distinct=0.5").
+	// Recorded on catalog.Column.Options so pg_dump re-emits the clause via
+	// pg_attribute.attoptions. DU-002 slice 185.
+	SetOptions []string
 	// ChildIndexName is populated for AlterIndexAttachPartition and holds
 	// the name of the child index to attach. M0097-0023.
 	ChildIndexName string

@@ -4700,20 +4700,15 @@ func (p *parser) parseAlter() (Stmt, error) {
 		// Check for SET (options) or SET STORAGE pattern.
 		if p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet) {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				// Consume the options block.
-				depth := 1
-				p.advance() // consume '('
-				for depth > 0 && p.cur().Kind != TokenEOF {
-					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-						depth++
-					} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
-						depth--
-					}
-					p.advance()
-				}
-				// Emit AlterTableAlterColumnSet action.
+				// SET (opt=value, …) — per-column attribute options (e.g.
+				// n_distinct). Capture each pair, normalized to PG's stored
+				// `name=value` form, so pg_dump re-emits the clause via
+				// pg_attribute.attoptions. DU-002 slice 185.
+				opts := p.parseColumnSetOptions()
 				stmt.Actions = append(stmt.Actions, AlterTableAction{
-					Kind: AlterTableAlterColumnSet,
+					Kind:       AlterTableAlterColumnSet,
+					ColumnName: colName,
+					SetOptions: opts,
 				})
 				return stmt, nil
 			}
@@ -4809,6 +4804,61 @@ func (p *parser) parseAlter() (Stmt, error) {
 		stmt.Actions = append(stmt.Actions, next)
 	}
 	return stmt, nil
+}
+
+// parseColumnSetOptions parses a parenthesized per-column attribute option list
+// (`(opt=value, …)`) starting at the opening `(`, consuming through the matching
+// `)`. Each option is normalized to PG's stored `name=value` form so it can be
+// recorded on catalog.Column.Options and re-emitted by pg_dump via
+// pg_attribute.attoptions (the dump renders `array_to_string(attoptions, ', ')`).
+// A bare option name with no `=value` is captured verbatim. DU-002 slice 185.
+func (p *parser) parseColumnSetOptions() []string {
+	var opts []string
+	if !(p.cur().Kind == TokenSymbol && p.cur().Value == "(") {
+		return opts
+	}
+	p.advance() // consume '('
+	for p.cur().Kind != TokenEOF {
+		if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+			p.advance() // consume ')'
+			break
+		}
+		// Option name.
+		name := ""
+		if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent || p.cur().Kind == TokenKeyword {
+			name = p.cur().Value
+			p.advance()
+		}
+		// Optional '= value'.
+		val := ""
+		hasVal := false
+		if (p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=" {
+			hasVal = true
+			p.advance() // consume '='
+			// Collect value tokens up to ',' or ')'. A leading '-' lexes as an
+			// operator (negative n_distinct), so concatenate token values with
+			// no spaces to reconstruct e.g. "-0.5".
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && (p.cur().Value == "," || p.cur().Value == ")") {
+					break
+				}
+				val += p.cur().Value
+				p.advance()
+			}
+		}
+		if name != "" {
+			if hasVal {
+				opts = append(opts, name+"="+val)
+			} else {
+				opts = append(opts, name)
+			}
+		}
+		// Skip a trailing comma between options.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+			p.advance()
+		}
+	}
+	return opts
 }
 
 func (p *parser) parseAlterTableAction() (AlterTableAction, error) {

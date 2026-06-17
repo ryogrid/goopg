@@ -677,6 +677,17 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	if col.StatTarget != nil && *col.StatTarget >= 0 {
 		attStatTargetDatum = NewIntDatum(int64(*col.StatTarget))
 	}
+	// Per-column attribute options (ALTER COLUMN ... SET (opt=value, …)) are
+	// stored in pg_attribute.attoptions as a text[] array. pg_dump renders
+	// `array_to_string(a.attoptions, ', ')` and emits `ALTER TABLE ONLY ...
+	// ALTER COLUMN ... SET (...)` whenever the result is non-empty. goopg's
+	// executor (array_to_string → parseTextArray) consumes the PG text-array
+	// literal `{n_distinct=0.5,…}`; an empty list stays NULL so pg_dump skips.
+	// DU-002 slice 185.
+	attOptionsDatum := NullDatum
+	if len(col.Options) > 0 {
+		attOptionsDatum = NewStringDatum("{" + strings.Join(col.Options, ",") + "}")
+	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),            // attrelid
 		NewStringDatum(col.Name),               // attname (name)
@@ -709,7 +720,7 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		// its bit. attstattarget (last) is NULL by default but carries the
 		// per-column SET STATISTICS override when one is set (DU-002 slice 184).
 		NullDatum,          // attacl
-		NullDatum,          // attoptions
+		attOptionsDatum,    // attoptions (NULL default; text[] literal when set)
 		NullDatum,          // attfdwoptions
 		NullDatum,          // attmissingval
 		attStatTargetDatum, // attstattarget (NULL default; integer override)
