@@ -4368,6 +4368,41 @@ exact one-line `LANGUAGE sql STABLE PARALLEL RESTRICTED` / `AS $_$ … $_$;` fra
 (the `$1` in the body forces the `$_$` delimiter). A downgrade of either marker to its
 default, a dropped clause, or a reorder surfaces in the assertion.
 
+### Slice 158 — multi-statement SQL function body round-trip (coverage; clean positive)
+
+Every prior function/procedure slice (148–157) carried a **single-statement** body, so
+two paths were never exercised end-to-end:
+
+1. **Simple-query splitter.** The `CREATE FUNCTION … AS $$ SELECT 1; SELECT $1 + 7; $$`
+   statement is sent as a simple query. goopg's multi-statement batch splitter must treat
+   the inner `;` as part of the dollar-quoted body, not as a batch separator — otherwise
+   the CREATE FUNCTION is truncated at the first `;`, and the residual `SELECT $1 + 7; $$`
+   fails to parse. (The `runSQLSimple` fatal in the fixture catches a regression here
+   immediately, before pg_dump even runs.)
+2. **Verbatim `prosrc` round-trip.** The multi-statement body — inner `;` included — must
+   be stored as `prosrc` verbatim and re-emitted by `dumpFunc` within the dollar quote.
+
+`validateSQLFunctionBody` (`operators_ddl.go`) already supports this: it parses the whole
+body with `parser.Parse`, scans **every** statement for out-of-range `$N` refs, and
+requires only the **last** statement to be a scalar `SELECT` (or DML RETURNING). So
+`SELECT 1; SELECT $1 + 7` is accepted — the leading `SELECT 1` is a non-final statement,
+the final `SELECT $1 + 7` returns one `integer` column. The body is opaque text to
+pg_dump (`appendStringLiteralDQ` only scans for `$` to pick the delimiter), so **no new
+dump branch is driven** — the coverage is entirely on goopg's splitter + verbatim-prosrc
+round-trip. The `$1` forces the `$_$` delimiter (same escalation as `add_six`). Verified
+empirically — clean positive (no production change). Real pg_dump 18.3 renders:
+
+```
+CREATE FUNCTION public.add_seven(integer) RETURNS integer
+    LANGUAGE sql
+    AS $_$ SELECT 1; SELECT $1 + 7; $_$;
+```
+
+The TAP test creates `public.add_seven(integer) … AS $$ SELECT 1; SELECT $1 + 7; $$` and
+asserts the `RETURNS integer` signature plus the exact one-line `LANGUAGE sql` /
+`AS $_$ SELECT 1; SELECT $1 + 7; $_$;` fragment. A body truncated at the inner `;`, a
+collapsed/normalized body, or a dropped statement surfaces exactly in the assertion.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

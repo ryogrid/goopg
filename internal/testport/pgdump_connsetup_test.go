@@ -1616,6 +1616,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function add_six: %v", err)
 	}
 
+	// Slice 158: a function whose SQL body holds MORE THAN ONE statement,
+	// separated by an internal `;`. Every prior function/procedure slice carried
+	// a single-statement body, so two distinct paths were never exercised:
+	//   (1) goopg's simple-query statement splitter must treat the inner `;` as
+	//       part of the dollar-quoted body, NOT as a batch separator — otherwise
+	//       this CREATE FUNCTION would be truncated at the first `;` and fail to
+	//       parse (caught immediately by the runSQLSimple error below); and
+	//   (2) the multi-statement body must be stored as prosrc verbatim (including
+	//       the inner `;`) and re-emitted by dumpFunc within the dollar quote.
+	// validateSQLFunctionBody parses the whole body, scans every statement for
+	// param refs, and requires only the LAST statement to be a scalar SELECT
+	// (operators_ddl.go) — so `SELECT 1; SELECT $1 + 7` is accepted. The `$1` in
+	// the body forces pg_dump's appendStringLiteralDQ to escalate to the `$_$`
+	// delimiter (same as add_six). Clean positive: the body is opaque text to
+	// pg_dump, so no new dump branch is driven — the coverage is on goopg's
+	// splitter + verbatim-prosrc round-trip. Real pg_dump 18.3 renders the body
+	// exactly as stored, inner `;` and all.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.add_seven(integer) RETURNS integer LANGUAGE sql AS $$ SELECT 1; SELECT $1 + 7; $$"); err != nil {
+		t.Fatalf("create function add_seven: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2191,6 +2212,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "    LANGUAGE sql STABLE PARALLEL RESTRICTED\n    AS $_$ SELECT $1 + 6 $_$;") {
 			t.Errorf("pg_dump dropped/mangled add_six's STABLE/PARALLEL RESTRICTED clauses or body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 158 (asserted):** the multi-statement-body function (add_seven)
+		// must round-trip its body verbatim, inner `;` included. This pins two
+		// goopg behaviours: the simple-query splitter kept the dollar-quoted body
+		// intact at CREATE time (already enforced by the runSQLSimple fatal above),
+		// and dumpFunc emits prosrc verbatim. The `$1` forces the `$_$` delimiter.
+		// Real pg_dump 18.3 renders:
+		//   CREATE FUNCTION public.add_seven(integer) RETURNS integer
+		//       LANGUAGE sql
+		//       AS $_$ SELECT 1; SELECT $1 + 7; $_$;
+		// A body truncated at the inner `;`, a collapsed/normalized body, or a
+		// dropped statement surfaces exactly here.
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.add_seven(integer) RETURNS integer") {
+			t.Errorf("pg_dump dropped/mangled the add_seven signature\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "    LANGUAGE sql\n    AS $_$ SELECT 1; SELECT $1 + 7; $_$;") {
+			t.Errorf("pg_dump dropped/mangled add_seven's multi-statement body\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

@@ -3412,6 +3412,27 @@ object support.
         pgbench pre-commit smoke on commit. **Next: slice 158** — a multi-statement
         SQL-procedure/function body (exercise the body re-render path beyond a single
         statement), or a `TRANSFORM FOR TYPE` / `WINDOW` function clause.
+      - **PROGRESS 2026-06-17 (loop #125):** **DU-002 slice 158 LANDED** — a function
+        with a **multi-statement SQL body** (`SELECT 1; SELECT $1 + 7;`) round-trips
+        through pg_dump. Every prior function/procedure slice (148–157) carried a
+        single-statement body, so two paths were never exercised end-to-end: (1) goopg's
+        simple-query batch splitter must keep the inner `;` inside the dollar-quoted body
+        (else the CREATE is truncated at the first `;` and fails — caught by the
+        `runSQLSimple` fatal); and (2) the multi-statement body must be stored as `prosrc`
+        verbatim and re-emitted by `dumpFunc`. `validateSQLFunctionBody` already parses the
+        whole body, scans every statement for `$N` refs, and requires only the LAST stmt to
+        be a scalar SELECT, so the body is accepted. The body is opaque to pg_dump
+        (`appendStringLiteralDQ` only scans for `$` to pick the delimiter), so no new dump
+        branch is driven — the coverage is on goopg's splitter + verbatim-prosrc round-trip.
+        The `$1` forces the `$_$` delimiter. **Clean positive (no production change)**. Test
+        adds `public.add_seven(integer) … AS $$ SELECT 1; SELECT $1 + 7; $$` and asserts the
+        `RETURNS integer` signature + the `LANGUAGE sql` / `AS $_$ SELECT 1; SELECT $1 + 7;
+        $_$;` fragment. Files: `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK; `go build
+        ./internal/...` OK; `TestPort_PgDumpConnectionSetup` PASS (2.26s, not skipped);
+        pgbench pre-commit smoke on commit. **Next: slice 159** — a `TRANSFORM FOR TYPE`
+        clause (`protrftypes`, currently NULL — likely a feature gap), a non-`sql` LANGUAGE
+        (e.g. `plpgsql`) body, or a function returning a composite/`RECORD` type.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
