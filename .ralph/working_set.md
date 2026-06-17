@@ -1,40 +1,37 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 169 (loop #136) — RANGE partition bounds now
-round-trip through pg_dump. REAL DIVERGENCE FIXED (text quoting + MINVALUE
-semantic corruption).
+Last landed: DU-002 slice 170 (loop #137) — legacy table inheritance
+(`CREATE TABLE child (...) INHERITS (parent)`) now round-trips through pg_dump.
+REAL DIVERGENCE FIXED.
 
-Root cause: FormatPartitionBound's RANGE branch rendered the raw
-FromValues/ToValues (stored via exprToString, needed for routing), so a TEXT
-RANGE bound dumped restore-breaking `FROM (a) TO (m)` not `FROM ('a') TO ('m')`.
-Worse: the parser encodes MINVALUE/MAXVALUE as a sentinel
-StringConst{Value:"MINVALUE"|"MAXVALUE"}; the generic literal renderer quoted it
-('MINVALUE') → restores as a TEXT bound, not an unbounded edge (silent semantic
-corruption, not just invalid SQL).
+Root cause (two lost dump signals): (1) `pg_inherits` VirtualRows emitted rows
+ONLY for partition children (`PartitionParentOID != 0`), so a legacy inheritance
+edge produced no row → pg_dump dropped the `INHERITS (...)` clause. (2) The
+INHERITS branch of execCreateTable left inherited columns `attislocal=true`
+(`Column.Inherited` never set, unlike the PARTITION OF path) → pg_dump re-emitted
+the parent's columns inline. Net: child structurally different + columns doubly
+defined on restore.
 
-Fix (same shape as slice 168, zero routing risk): PartitionBound gains parallel
-From/ToValueLiterals []string captured at creation by rangeBoundLiterals. The
-per-element rangeBoundExprToSQLLiteral delegates to boundExprToSQLLiteral for
-constants (quotes strings, passes ints) but emits the BARE keyword for the
-MINVALUE/MAXVALUE sentinel StringConsts. Helper returns nil for the whole tuple
-if any element can't render, so FormatPartitionBound falls back to raw
-FromValues/ToValues. Both RANGE creation sites populate it (execCreatePartitionChild
-+ ATTACH path). Routing untouched (still compares raw FromValues/ToValues).
+Fix: `catalog.Table.InheritsParentOIDs []uint32` (ordered direct parents),
+populated in execCreateTable's INHERITS branch; that branch also marks each
+purely-inherited column (in a parent, not locally redeclared) `Inherited=true`.
+`pg_inherits.VirtualRows` emits one (child,parent) row per entry, inhseqno =
+declaration order, mutually exclusive with the partition-child branch. Routing +
+the existing inheritanceChildren map untouched.
 
-Files: internal/catalog/catalog.go (From/ToValueLiterals fields +
-FormatPartitionBound RANGE branch + RANGE test cases in catalog_test.go),
-internal/executor/operators_ddl_partition.go (rangeBoundExprToSQLLiteral +
-rangeBoundLiterals), internal/executor/operators_ddl.go (2 sites),
-internal/testport/pgdump_connsetup_test.go (prange/prange_am FROM (MINVALUE) TO
-('m') fixture + assertions), docs/design/0110-0001-pg-dump-tap-port.md (slice
-169), .ralph/fix_plan.md (#136), .ralph/deferral_ledger.md (keyword-node + INHERITS).
+Files: internal/catalog/catalog.go (field + pg_inherits VirtualRows),
+internal/executor/operators_ddl.go (populate + mark cols),
+internal/catalog/catalog_test.go (TestPgInheritsEmitsLegacyInheritanceRows),
+internal/testport/pgdump_connsetup_test.go (inh_parent/inh_child fixture +
+assertions), docs/design/0110-0001-pg-dump-tap-port.md (slice 170),
+.ralph/fix_plan.md (#137).
 Gates: gofmt OK; go build ./internal/... OK; go vet ./internal/testport/ clean;
-TestFormatPartitionBoundListLiterals PASS; TestPort_PgDumpConnectionSetup PASS
-(2.64s, not skipped); catalog + full executor suites PASS; pgbench pre-commit
-smoke on commit.
+TestPgInheritsEmitsLegacyInheritanceRows PASS; TestPort_PgDumpConnectionSetup
+PASS (2.81s, not skipped); catalog + full executor suites PASS; pgbench
+pre-commit smoke on commit.
 
-Next (slice 170 candidates): (1) dedicated MINVALUE/MAXVALUE keyword AST node —
-parser collapses keyword `MINVALUE` and literal `'MINVALUE'` to the same
-StringConst, affecting routing too (latent correctness, pathologically rare).
-(2) table inheritance (INHERITS) dump fidelity. (3) multi-level partition trees.
-(4) column-level STORAGE/COMPRESSION (needs parser keywords). See ledger.
+Next (slice 171 candidates): (1) dedicated MINVALUE/MAXVALUE keyword-AST-node
+(parser collapses keyword vs literal `'MINVALUE'`, affects routing — latent).
+(2) multi-level partition trees. (3) multi-parent inheritance + inherited-CHECK
+(conislocal=false) dump fidelity. (4) column-level STORAGE/COMPRESSION (needs
+parser keywords). See ledger.

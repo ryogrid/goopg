@@ -4819,6 +4819,53 @@ literal text bound is exactly `'MINVALUE'`/`'MAXVALUE'` would render as the keyw
 ambiguity also affects routing (both compare against the raw `"MINVALUE"`); a faithful fix needs a
 dedicated keyword AST node. Tracked in the deferral ledger.
 
+### Slice 170 — legacy table inheritance round-trip (real divergence fixed)
+
+The partition slices (167–169) handled *declarative* partitioning. **Legacy table inheritance**
+(`CREATE TABLE child (...) INHERITS (parent)`) is a distinct relationship that pg_dump renders with an
+`INHERITS (...)` clause and by *omitting* the inherited columns from the child's column list (they
+arrive from the parent). goopg merged the parent's columns into the child at DDL time but lost both
+signals on the dump path:
+
+1. **No `pg_inherits` row.** The `pg_inherits` virtual view emitted rows only for partition children
+   (those with `PartitionParentOID != 0`); a legacy inheritance edge produced no row, so pg_dump's
+   `getInherits`/`findParentsByOid` saw the child as a standalone table and dropped the `INHERITS` clause.
+2. **`attislocal = true` on inherited columns.** Unlike the PARTITION OF path (which sets
+   `Column.Inherited = true`), the INHERITS branch in `execCreateTable` appended the parent's columns
+   verbatim, leaving `Inherited = false`. pg_attribute therefore reported `attislocal = true` /
+   `attinhcount = 0`, so pg_dump re-emitted the parent's columns inside the child's `CREATE TABLE`.
+
+The net effect: the dumped child was structurally different from the original and, on restore, would
+carry the parent's columns *both* inline and via inheritance.
+
+```
+CREATE TABLE public.inh_child (              -- goopg (wrong: no INHERITS, columns inlined)
+    pid integer,
+    pname text,
+    extra integer
+);
+CREATE TABLE public.inh_child (              -- upstream (correct)
+    extra integer
+)
+INHERITS (public.inh_parent);
+```
+
+**Fix.** `catalog.Table` gains `InheritsParentOIDs []uint32`, recording the child's direct parents in
+declaration order. The INHERITS branch of `execCreateTable` (a) populates it from the resolved parent
+tables and (b) marks each purely-inherited column (present in an INHERITS parent and **not** locally
+redeclared in the child body) with `Inherited = true`, so `attislocal = false` / `attinhcount > 0`. A
+column the child re-declares stays local. The `pg_inherits` `VirtualRows` builder now emits one row per
+`(child, parent)` pair from `InheritsParentOIDs` (with `inhseqno` matching the declaration order),
+mutually exclusive with the partition-child branch. Routing and the existing `inheritanceChildren`
+parent→child map are untouched.
+
+The TAP test adds `CREATE TABLE public.inh_parent (pid integer, pname text)` and
+`CREATE TABLE public.inh_child (extra integer) INHERITS (public.inh_parent)`, then asserts the dump
+emits `INHERITS (public.inh_parent)`, keeps the child's local `extra integer`, and does **not** repeat
+the inherited `pid`/`pname` columns inside the child's `CREATE TABLE` block.
+`TestPgInheritsEmitsLegacyInheritanceRows` (catalog) pins the multi-parent `pg_inherits` row shape /
+`inhseqno` ordering directly.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

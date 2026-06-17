@@ -1005,3 +1005,60 @@ func TestFormatPartitionBoundListLiterals(t *testing.T) {
 		})
 	}
 }
+
+// TestPgInheritsEmitsLegacyInheritanceRows pins DU-002 slice 170: a table
+// created via CREATE TABLE child (...) INHERITS (parent) must surface a
+// pg_inherits row per (child, parent) pair in declaration order, so pg_dump
+// re-emits the INHERITS (...) clause. Previously pg_inherits only emitted rows
+// for partition children (PartitionParentOID set), silently dropping legacy
+// inheritance edges.
+func TestPgInheritsEmitsLegacyInheritanceRows(t *testing.T) {
+	c := NewInMemory()
+	p1, err := c.CreateTable(parser.ObjectName{Name: "p1"}, []Column{{Name: "a", Type: Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := c.CreateTable(parser.ObjectName{Name: "p2"}, []Column{{Name: "b", Type: Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := c.CreateTable(parser.ObjectName{Name: "ch"}, []Column{
+		{Name: "a", Type: Type{Name: "int4"}, Inherited: true},
+		{Name: "b", Type: Type{Name: "int4"}, Inherited: true},
+		{Name: "extra", Type: Type{Name: "int4"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Declaration order: INHERITS (p1, p2) → inhseqno 1, 2.
+	child.InheritsParentOIDs = []uint32{p1.OID, p2.OID}
+
+	pgInh, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_inherits"})
+	if !ok {
+		t.Fatal("pg_catalog.pg_inherits missing")
+	}
+	rows := pgInh.VirtualRows()
+	got := map[string][]string{} // parentOID -> {childOID, seqno}
+	for _, r := range rows {
+		if r[0] == strconv.FormatUint(uint64(child.OID), 10) {
+			got[r[1]] = []string{r[2], r[3]}
+		}
+	}
+	want := map[string][]string{
+		strconv.FormatUint(uint64(p1.OID), 10): {"1", "f"},
+		strconv.FormatUint(uint64(p2.OID), 10): {"2", "f"},
+	}
+	for poid, exp := range want {
+		g, ok := got[poid]
+		if !ok {
+			t.Errorf("pg_inherits missing row child=%d parent=%s", child.OID, poid)
+			continue
+		}
+		if g[0] != exp[0] {
+			t.Errorf("pg_inherits child=%d parent=%s inhseqno=%s want %s", child.OID, poid, g[0], exp[0])
+		}
+		if g[1] != exp[1] {
+			t.Errorf("pg_inherits child=%d parent=%s inhdetachpending=%s want %s", child.OID, poid, g[1], exp[1])
+		}
+	}
+}

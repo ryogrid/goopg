@@ -760,6 +760,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create RANGE partition prange_am: %v", err)
 	}
 
+	// Slice 170: legacy table inheritance (CREATE TABLE child (...) INHERITS
+	// (parent)) must round-trip. goopg merged the parent's columns into the child
+	// but (a) emitted no pg_inherits row for the inheritance edge (only partition
+	// children did) and (b) left the inherited columns marked attislocal=true, so
+	// pg_dump dropped the `INHERITS (...)` clause AND re-emitted the parent's
+	// columns inline — a structurally different (and on re-restore, doubly-defined)
+	// table. The fix records the ordered parent OIDs on the child
+	// (Table.InheritsParentOIDs → pg_inherits rows) and marks purely-inherited
+	// columns Inherited=true (attislocal=false), so pg_dump omits them and emits
+	// the clause. `inh_child` adds one local column over `inh_parent`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.inh_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create inheritance parent inh_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.inh_child (extra integer) INHERITS (public.inh_parent)"); err != nil {
+		t.Fatalf("create inheritance child inh_child: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -2064,6 +2081,36 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')") {
 			t.Errorf("pg_dump emitted an unquoted/invalid RANGE bound; want %q\n  full stdout=%q", "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')", res.Stdout)
+		}
+		// **Slice 170 closed (asserted):** legacy table inheritance. goopg emitted
+		// no pg_inherits row for the INHERITS edge and left the inherited columns
+		// attislocal=true, so pg_dump dropped the `INHERITS (...)` clause and
+		// re-emitted the parent's columns inline. The child now records its parent
+		// OIDs (pg_inherits rows) and marks inherited columns Inherited=true. Assert
+		// (1) the `INHERITS (public.inh_parent)` clause is emitted, (2) the child's
+		// local column survives, and (3) the inherited columns are NOT re-emitted in
+		// the child's CREATE TABLE column list.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.inh_child (") ||
+			!strings.Contains(res.Stdout, "INHERITS (public.inh_parent)") {
+			t.Errorf("pg_dump dropped the INHERITS clause; missing CREATE TABLE public.inh_child / INHERITS (public.inh_parent)\n  full stdout=%q", res.Stdout)
+		}
+		// The child's CREATE TABLE block runs from its header to the INHERITS clause;
+		// the inherited parent columns must not appear inside it.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.inh_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, "INHERITS (public.inh_parent)")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the child's local column; want %q in inh_child block\n  block=%q", "extra integer", block)
+			}
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in inh_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

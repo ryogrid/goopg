@@ -3755,6 +3755,30 @@ object support.
         dedicated MINVALUE keyword-AST-node slice (parser collapses keyword vs literal `'MINVALUE'`,
         affecting routing too — latent), or table inheritance (`INHERITS`) / multi-level partition
         tree dump fidelity.
+      - **PROGRESS 2026-06-17 (loop #137):** **DU-002 slice 170 LANDED — real
+        divergence fixed.** Legacy table inheritance (`CREATE TABLE child (...) INHERITS (parent)`)
+        now round-trips. goopg merged the parent's columns into the child at DDL time but lost both
+        dump signals: (1) the `pg_inherits` virtual view emitted rows ONLY for partition children
+        (`PartitionParentOID != 0`), so a legacy inheritance edge produced no row and pg_dump dropped
+        the `INHERITS (...)` clause; (2) unlike the PARTITION OF path, the INHERITS branch left the
+        inherited columns `attislocal=true` (`Column.Inherited` never set), so pg_dump re-emitted the
+        parent's columns inline. Net: the dumped child was structurally different and, on restore,
+        would carry the parent's columns *both* inline and via inheritance. **Fix:** `catalog.Table`
+        gains `InheritsParentOIDs []uint32` (ordered direct parents); the INHERITS branch of
+        `execCreateTable` populates it and marks each purely-inherited column (in a parent, not locally
+        redeclared) `Inherited=true`. `pg_inherits.VirtualRows` now emits one `(child, parent)` row per
+        entry with `inhseqno` = declaration order, mutually exclusive with the partition-child branch.
+        Routing + the existing `inheritanceChildren` map untouched. Files:
+        `internal/catalog/catalog.go` (field + pg_inherits VirtualRows),
+        `internal/executor/operators_ddl.go` (populate + mark inherited cols),
+        `internal/catalog/catalog_test.go` (`TestPgInheritsEmitsLegacyInheritanceRows`),
+        `internal/testport/pgdump_connsetup_test.go` (`inh_parent`/`inh_child` fixture + INHERITS/
+        no-inherited-column-reemit assertions), `docs/design/0110-0001-pg-dump-tap-port.md` (slice 170).
+        Gates: gofmt OK; `go build ./internal/...` OK; `go vet ./internal/testport/` clean;
+        `TestPgInheritsEmitsLegacyInheritanceRows` PASS; `TestPort_PgDumpConnectionSetup` PASS (2.81s,
+        not skipped); catalog + full executor suites PASS; pgbench pre-commit smoke on commit. **Next:**
+        a dedicated MINVALUE/MAXVALUE keyword-AST-node slice (latent routing ambiguity), multi-level
+        partition trees, or multi-parent / inherited-CHECK-constraint inheritance dump fidelity.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

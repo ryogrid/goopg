@@ -334,6 +334,13 @@ type Table struct {
 	// Empty string means default (not shown in pg_get_partkeydef). M0097-0023.
 	PartitionKeyCollations []string
 
+	// InheritsParentOIDs lists the OIDs of the direct parents this table was
+	// created from via `CREATE TABLE child (...) INHERITS (parent, ...)`, in
+	// declaration order. Distinct from PartitionParentOID (a partition child is
+	// not legacy-inheritance). Populates pg_inherits rows so pg_dump re-emits the
+	// `INHERITS (...)` clause and omits the parent's columns. DU-002 slice 170.
+	InheritsParentOIDs []uint32
+
 	// Unlogged / Temp track relpersistence. 'u' for UNLOGGED, 't' for TEMP, 'p' for permanent.
 	Unlogged bool
 	Temp     bool
@@ -3317,17 +3324,32 @@ func (c *InMemory) registerSystemTables() {
 		var out [][]string
 		parentSeq := make(map[uint32]int)
 		for _, tbl := range c.tables {
-			if tbl.Virtual || tbl.PartitionParentOID == 0 {
+			if tbl.Virtual {
 				continue
 			}
-			parentSeq[tbl.PartitionParentOID]++
-			seq := parentSeq[tbl.PartitionParentOID]
-			out = append(out, []string{
-				fmt.Sprintf("%d", tbl.OID),
-				fmt.Sprintf("%d", tbl.PartitionParentOID),
-				fmt.Sprintf("%d", seq),
-				"f",
-			})
+			// Partition children: one row per child → its partition parent.
+			if tbl.PartitionParentOID != 0 {
+				parentSeq[tbl.PartitionParentOID]++
+				seq := parentSeq[tbl.PartitionParentOID]
+				out = append(out, []string{
+					fmt.Sprintf("%d", tbl.OID),
+					fmt.Sprintf("%d", tbl.PartitionParentOID),
+					fmt.Sprintf("%d", seq),
+					"f",
+				})
+				continue
+			}
+			// Legacy inheritance children: one row per (child, parent) pair in
+			// declaration order, so inhseqno matches the INHERITS (...) list and
+			// pg_dump re-emits the clause. DU-002 slice 170.
+			for i, parentOID := range tbl.InheritsParentOIDs {
+				out = append(out, []string{
+					fmt.Sprintf("%d", tbl.OID),
+					fmt.Sprintf("%d", parentOID),
+					fmt.Sprintf("%d", i+1),
+					"f",
+				})
+			}
 		}
 		// Emit index partition rows: each index with PartitionParentOID set is a
 		// partition child of its parent index. These rows enable the join pattern:

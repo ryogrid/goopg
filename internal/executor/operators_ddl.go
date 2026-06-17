@@ -991,6 +991,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if err := validatePartitionKey(s, cols, o.ctx); err != nil {
 		return err
 	}
+	// Mark purely-inherited columns (copied from an INHERITS parent and not
+	// locally redefined in the child body) so pg_attribute reports
+	// attislocal=false / attinhcount>0. pg_dump then omits them from the child's
+	// CREATE TABLE column list — they arrive via the INHERITS (...) clause
+	// instead. A column the child also declares stays local (attislocal=true).
+	// DU-002 slice 170.
+	if len(inheritParents) > 0 {
+		localCols := make(map[string]bool, len(s.Columns))
+		for _, c := range s.Columns {
+			localCols[strings.ToLower(c.Name)] = true
+		}
+		for i := range cols {
+			lname := strings.ToLower(cols[i].Name)
+			if inheritedColNames[lname] && !localCols[lname] {
+				cols[i].Inherited = true
+			}
+		}
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
@@ -1005,6 +1023,13 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				im.RegisterInheritanceChild(parent.OID, tbl.OID)
 			}
 		}
+		// Record the ordered parent OIDs on the child so pg_inherits emits a
+		// row per (child, parent) pair and pg_dump re-emits the INHERITS clause.
+		parentOIDs := make([]uint32, 0, len(inheritParents))
+		for _, parent := range inheritParents {
+			parentOIDs = append(parentOIDs, parent.OID)
+		}
+		tbl.InheritsParentOIDs = parentOIDs
 	}
 	// Register FK constraints from inline REFERENCES clauses. M0096-0011.
 	for _, c := range s.Columns {
