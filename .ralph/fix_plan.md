@@ -3877,6 +3877,31 @@ object support.
         pgbench pre-commit smoke on commit. **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node
         slice (HIGHER RISK: partition routing); or column STORAGE/COMPRESSION dump fidelity (needs
         parser keywords).
+      - **PROGRESS 2026-06-17 (loop #143):** **DU-002 slice 176 LANDED — cast/unary/binary/typed-string
+        column DEFAULT round-trips; sibling-path divergence closed.** `validateDefaultExpr` accepts a
+        wider default grammar than the catalog renderer covered: it recurses into `*CastExpr`,
+        `*UnaryOp`, `*BinaryOp` (and `*TypedStringLit` passes through). CREATE TABLE stores the parsed
+        AST verbatim in `Column.DefaultExpr`, so e.g. `DEFAULT '{}'::jsonb`, `DEFAULT -1`,
+        `DEFAULT 1 + 1`, `DEFAULT DATE '2020-01-01'` all reach `pg_attrdef.adbin` — but
+        `catalog.formatExprForAttrdef` handled none of them and fell through to `fmt.Sprintf("%v", e)`
+        (a Go pointer string), corrupting the dumped DEFAULT. The executor twin
+        `executor.defaultExprToSQL` (proargdefaults renderer) ALREADY handled all four — a live
+        sibling-path divergence (same class as slice 173's FuncCall gap). **Fix:** `formatExprForAttrdef`
+        gains `*CastExpr` (`operand::type`), `*UnaryOp` (`-x`/`NOT x`), `*BinaryOp` (full operator set),
+        `*TypedStringLit` (`TYPE 'lit'`) cases mirroring `defaultExprToSQL` line-for-line (cannot share
+        code — catalog is below executor in the import graph). Display-only; routing + default eval
+        untouched. Typmods on a cast are dropped (`::numeric(10,2)`→`::numeric`), same as the executor
+        twin — validateDefaultExpr ignores them and PG re-applies the column typmod on restore. Verified
+        parser shapes empirically (CastExpr/UnaryOp/BinaryOp as expected). Files:
+        `internal/catalog/catalog.go` (4 new cases in formatExprForAttrdef),
+        `internal/catalog/catalog_test.go` (`TestFormatExprForAttrdefExpr` — 8 cases incl. nested
+        `now()::date`), `internal/testport/pgdump_connsetup_test.go` (`defcol` gains
+        `meta jsonb DEFAULT '{}'::jsonb` + assertion), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (slice 176). Gates: gofmt OK; `go vet ./internal/testport/ ./internal/catalog/` clean;
+        `go build ./internal/catalog/` OK; `TestFormatExprForAttrdefExpr` + full catalog suite PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (3.15s, not skipped); pgbench pre-commit smoke on commit.
+        **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition routing); or
+        column STORAGE/COMPRESSION dump fidelity (needs parser keywords).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

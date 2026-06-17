@@ -5035,6 +5035,34 @@ slice is pure coverage of the argument path that slice 173 introduced but left u
 test's `defcol` fixture gains a `label text DEFAULT lpad('x', 5)` column and asserts the dumped block
 contains `DEFAULT lpad('x', 5)` (arguments intact).
 
+### Slice 176 — cast / unary / binary / typed-string DEFAULT (sibling-path divergence closed)
+
+Slices 173–175 taught the catalog renderer `formatExprForAttrdef` to handle `*FuncCall` defaults, but
+`validateDefaultExpr` accepts a wider grammar — it recurses into `*CastExpr`, `*UnaryOp` and
+`*BinaryOp` (rejecting only column refs/subqueries/aggregates/SRFs). Those nodes, plus
+`*TypedStringLit`, all reach `pg_attrdef.adbin` unfolded (CREATE TABLE stores the parsed AST verbatim
+in `Column.DefaultExpr`), yet `formatExprForAttrdef` handled none of them and fell through to
+`fmt.Sprintf("%v", e)` — a Go pointer string that corrupts the dumped `DEFAULT`. The executor twin
+`executor.defaultExprToSQL` (the `proargdefaults` renderer) *already* handled all four; this was a live
+sibling-path divergence. Examples that were broken:
+
+```sql
+CREATE TABLE public.defcol (..., meta jsonb DEFAULT '{}'::jsonb);   -- *CastExpr
+-- also: DEFAULT -1 (*UnaryOp), DEFAULT 1 + 1 (*BinaryOp), DEFAULT DATE '2020-01-01' (*TypedStringLit)
+```
+
+Fix: `formatExprForAttrdef` gains `*CastExpr` (`operand::type`), `*UnaryOp` (`-x` / `NOT x`),
+`*BinaryOp` (the full arithmetic/comparison/logical operator set) and `*TypedStringLit`
+(`TYPE 'literal'`) cases, mirroring `defaultExprToSQL` line-for-line. The two renderers cannot share
+code (catalog sits below executor in the import graph), so they are kept in lockstep by convention.
+Display-only; default evaluation and routing are untouched. Typmods on a cast are dropped (e.g.
+`::numeric(10,2)` → `::numeric`), exactly as the executor twin does — `validateDefaultExpr` never
+inspects them and PG re-applies the column typmod on restore.
+
+`catalog.TestFormatExprForAttrdefExpr` unit-tests all four node kinds (incl. a nested
+`now()::date`). The TAP `defcol` fixture gains a `meta jsonb DEFAULT '{}'::jsonb` column and asserts
+the dumped block contains `DEFAULT '{}'::jsonb`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -1113,3 +1113,67 @@ func TestFormatExprForAttrdefFuncCall(t *testing.T) {
 		}
 	}
 }
+
+// TestFormatExprForAttrdefExpr guards the pg_attrdef.adbin renderer for the
+// non-literal, non-call default expression nodes (DU-002 slice 176). A CastExpr
+// (`DEFAULT '{}'::jsonb`), UnaryOp (`DEFAULT -1`), BinaryOp (`DEFAULT 1 + 1`)
+// and TypedStringLit (`DEFAULT DATE '2020-01-01'`) are all accepted by
+// validateDefaultExpr, so they reach pg_attrdef.adbin — but before this slice
+// the catalog renderer handled none of them and fell through to
+// fmt.Sprintf("%v", e), corrupting the DEFAULT clause pg_dump re-emits. These
+// mirror the executor twin executor.defaultExprToSQL; the two MUST stay in sync.
+func TestFormatExprForAttrdefExpr(t *testing.T) {
+	cases := []struct {
+		name string
+		expr parser.Expr
+		want string
+	}{
+		{
+			"cast string",
+			&parser.CastExpr{Operand: &parser.StringConst{Value: "{}"}, Type: parser.ObjectName{Name: "jsonb"}},
+			"'{}'::jsonb",
+		},
+		{
+			"cast int",
+			&parser.CastExpr{Operand: &parser.IntegerConst{Value: 0}, Type: parser.ObjectName{Name: "numeric"}},
+			"0::numeric",
+		},
+		{
+			"unary minus",
+			&parser.UnaryOp{Op: parser.OpSub, Operand: &parser.IntegerConst{Value: 1}},
+			"-1",
+		},
+		{
+			"unary not",
+			&parser.UnaryOp{Op: parser.OpNot, Operand: &parser.BooleanConst{Value: true}},
+			"NOT true",
+		},
+		{
+			"binary add",
+			&parser.BinaryOp{Op: parser.OpAdd, Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 1}},
+			"1 + 1",
+		},
+		{
+			"binary concat",
+			&parser.BinaryOp{Op: parser.OpConcat, Left: &parser.StringConst{Value: "a"}, Right: &parser.StringConst{Value: "b"}},
+			"'a' || 'b'",
+		},
+		{
+			"typed string lit",
+			&parser.TypedStringLit{Type: "DATE", Value: "2020-01-01"},
+			"DATE '2020-01-01'",
+		},
+		{
+			// Nested: cast of a function call (`DEFAULT now()::date`) — exercises the
+			// recursive operand render through the FuncCall arm.
+			"cast of funccall",
+			&parser.CastExpr{Operand: &parser.FuncCall{Name: parser.ObjectName{Name: "now"}}, Type: parser.ObjectName{Name: "date"}},
+			"now()::date",
+		},
+	}
+	for _, tc := range cases {
+		if got := formatExprForAttrdef(tc.expr); got != tc.want {
+			t.Errorf("%s: formatExprForAttrdef = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

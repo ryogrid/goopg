@@ -6970,6 +6970,64 @@ func formatExprForAttrdef(e parser.Expr) string {
 			name = v.Name.Schema + "." + name
 		}
 		return name + "(" + strings.Join(args, ", ") + ")"
+	case *parser.CastExpr:
+		// `DEFAULT '{}'::jsonb`, `DEFAULT 0::numeric`. validateDefaultExpr accepts a
+		// CastExpr (recursing into its operand), so the parsed node reaches
+		// pg_attrdef.adbin and pg_dump re-emits it via pg_get_expr (goopg pass-through).
+		// Render `operand::type` mirroring executor.defaultExprToSQL (the proargdefaults
+		// twin); keep the two in sync. Typmods are dropped — same as the executor twin —
+		// because validateDefaultExpr never inspects them and PG's coercion re-applies
+		// the column typmod on restore. DU-002 slice 176.
+		return formatExprForAttrdef(v.Operand) + "::" + v.Type.Name
+	case *parser.UnaryOp:
+		// `DEFAULT -1` parses to UnaryOp(OpSub, IntegerConst). Mirror the executor twin.
+		switch v.Op {
+		case parser.OpSub:
+			return "-" + formatExprForAttrdef(v.Operand)
+		case parser.OpNot:
+			return "NOT " + formatExprForAttrdef(v.Operand)
+		}
+	case *parser.BinaryOp:
+		// `DEFAULT 1 + 1`, `DEFAULT 'a' || 'b'`. Mirror the executor twin's operator set.
+		left := formatExprForAttrdef(v.Left)
+		right := formatExprForAttrdef(v.Right)
+		switch v.Op {
+		case parser.OpAdd:
+			return left + " + " + right
+		case parser.OpSub:
+			return left + " - " + right
+		case parser.OpMul:
+			return left + " * " + right
+		case parser.OpDiv:
+			return left + " / " + right
+		case parser.OpMod:
+			return left + " % " + right
+		case parser.OpConcat:
+			return left + " || " + right
+		case parser.OpEq:
+			return left + " = " + right
+		case parser.OpLt:
+			return left + " < " + right
+		case parser.OpGt:
+			return left + " > " + right
+		case parser.OpLe:
+			return left + " <= " + right
+		case parser.OpGe:
+			return left + " >= " + right
+		case parser.OpNe:
+			return left + " <> " + right
+		case parser.OpAnd:
+			return left + " AND " + right
+		case parser.OpOr:
+			return left + " OR " + right
+		case parser.OpLike:
+			return left + " LIKE " + right
+		case parser.OpNotLike:
+			return left + " NOT LIKE " + right
+		}
+	case *parser.TypedStringLit:
+		// e.g. `DEFAULT DATE '2020-01-01'`. Mirror the executor twin.
+		return v.Type + " '" + strings.ReplaceAll(v.Value, "'", "''") + "'"
 	}
 	return fmt.Sprintf("%v", e)
 }

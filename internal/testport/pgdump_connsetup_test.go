@@ -844,7 +844,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// accepts a non-aggregate, non-SRF *FuncCall regardless of arity, so the
 	// parsed call (with its two literal args) reaches pg_attrdef.adbin and
 	// pg_dump re-emits `DEFAULT lpad('x', 5)`. The `label` column guards that.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5))"); err != nil {
+	//
+	// Slice 176: a column DEFAULT that is a CAST expression (`DEFAULT '{}'::jsonb`)
+	// must round-trip. validateDefaultExpr accepts a *CastExpr (recursing into its
+	// operand), so the parsed cast reaches pg_attrdef.adbin. Before this slice the
+	// catalog renderer formatExprForAttrdef handled only literals, niladic
+	// functions and ordinary calls; a *CastExpr (along with *UnaryOp, *BinaryOp,
+	// *TypedStringLit) fell through to fmt.Sprintf("%v", e) — a Go pointer string —
+	// corrupting the dumped DEFAULT. formatExprForAttrdef now mirrors
+	// executor.defaultExprToSQL for those nodes, rendering `'{}'::jsonb`. The
+	// `meta` column guards the cast path end-to-end.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb)"); err != nil {
 		t.Fatalf("create table defcol with function-call default: %v", err)
 	}
 
@@ -2279,6 +2289,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// regression in argument rendering would drop the args or corrupt them.
 			if !strings.Contains(block, "DEFAULT lpad('x', 5)") {
 				t.Errorf("pg_dump dropped/corrupted the function-call default args; want %q in defcol block\n  block=%q", "DEFAULT lpad('x', 5)", block)
+			}
+			// **Slice 176 (asserted):** a CAST-expression default. The `meta`
+			// column carries `DEFAULT '{}'::jsonb`. validateDefaultExpr accepts a
+			// *CastExpr; formatExprForAttrdef now renders `operand::type` (mirroring
+			// executor.defaultExprToSQL). Before the fix a *CastExpr fell through to
+			// fmt.Sprintf("%v", e), so the dumped DEFAULT was a corrupt Go pointer
+			// string. Assert the cast survives intact.
+			if !strings.Contains(block, "DEFAULT '{}'::jsonb") {
+				t.Errorf("pg_dump dropped/corrupted the cast-expression default; want %q in defcol block\n  block=%q", "DEFAULT '{}'::jsonb", block)
 			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
