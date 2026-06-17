@@ -1187,6 +1187,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.IsConstraint = true
 			idx.IncludeColumns = nc.IncludeColumns
+			// NULLS NOT DISTINCT rides the backing index so pg_get_constraintdef /
+			// pg_dump re-emit `UNIQUE NULLS NOT DISTINCT (cols)`. DU-002 slice 138.
+			idx.NullsNotDistinct = nc.NullsNotDistinct
 		}
 		if primary {
 			namedPKCreated = true

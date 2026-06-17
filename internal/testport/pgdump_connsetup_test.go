@@ -515,6 +515,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table uniqcname: %v", err)
 	}
 
+	// Slice 138: the NAMED TABLE-LEVEL UNIQUE form —
+	// `CONSTRAINT tuniq UNIQUE NULLS NOT DISTINCT (a)` (an explicit CONSTRAINT
+	// name on a table-level UNIQUE with the PG15+ NULLS NOT DISTINCT clause).
+	// pg_dump emits `ADD CONSTRAINT tuniq UNIQUE NULLS NOT DISTINCT (a)` under
+	// the USER-GIVEN name. goopg's named table-level UNIQUE parser case
+	// (`CONSTRAINT name UNIQUE (cols)`) previously did NOT parse the optional
+	// NULLS [NOT] DISTINCT clause that precedes the column list, so the `(`
+	// lookahead failed and the WHOLE named constraint was SILENTLY DROPPED from
+	// the table (and dump). The parser now mirrors the anonymous table-level
+	// form (capturing TableConstraintDef.NullsNotDistinct), and the executor's
+	// NamedConstraints loop threads the flag to the backing index so
+	// buildConstraintDefString re-emits it. `uniqtname` carries it on its own
+	// table. (Enforcement at INSERT/UPDATE remains deferred — dump-fidelity only.)
+	if err := runSQLSimple(t, c, "CREATE TABLE public.uniqtname (a integer, b integer, CONSTRAINT tuniq UNIQUE NULLS NOT DISTINCT (a))"); err != nil {
+		t.Fatalf("create table uniqtname: %v", err)
+	}
+
 	// Slice 127: anonymous table-level CHECK constraints (written without an
 	// explicit CONSTRAINT name) must round-trip. PG's AddRelationNewConstraints
 	// auto-names each one at DDL time — "<table>_<col>_check" when the predicate
@@ -1532,6 +1549,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// new path makes `CONSTRAINT name UNIQUE` set col.Unique + carry the
 			// name to the backing index, where it previously created no index.
 			"ADD CONSTRAINT myuniq UNIQUE NULLS NOT DISTINCT (a)",
+			// **Slice 138:** the NAMED TABLE-LEVEL UNIQUE form. An explicit
+			// `CONSTRAINT tuniq UNIQUE NULLS NOT DISTINCT (a)` dumps under the
+			// USER-GIVEN name with the clause preserved; the named table-level
+			// UNIQUE parser case previously skipped the NULLS [NOT] DISTINCT clause
+			// and the `(` lookahead failed, silently dropping the whole constraint.
+			"ADD CONSTRAINT tuniq UNIQUE NULLS NOT DISTINCT (a)",
 			// **Slice 127:** anonymous table-level CHECK constraints round-trip
 			// inline with PG's auto-generated names. The multi-column predicate
 			// (`a < b`) gets the table-only name `chk_check`; the single-column
@@ -1654,15 +1677,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				t.Errorf("pg_dump dropped/mangled a secondary index; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
-		// Slice 134/135/136/137 (regression guard): a plain unique/secondary index
-		// or a default-distinct UNIQUE constraint must NOT gain a stray NULLS NOT
-		// DISTINCT — the flag is only set where explicitly declared. Exactly four
-		// clauses must appear: the slice-134 CREATE INDEX (foo_nnd_idx), the
+		// Slice 134/135/136/137/138 (regression guard): a plain unique/secondary
+		// index or a default-distinct UNIQUE constraint must NOT gain a stray NULLS
+		// NOT DISTINCT — the flag is only set where explicitly declared. Exactly
+		// five clauses must appear: the slice-134 CREATE INDEX (foo_nnd_idx), the
 		// slice-135 table-level ADD CONSTRAINT (uniqnnd_a_key), the slice-136
-		// inline-column ADD CONSTRAINT (uniqcnnd_a_key), and the slice-137 inline
-		// NAMED column ADD CONSTRAINT (myuniq).
-		if got := strings.Count(res.Stdout, "NULLS NOT DISTINCT"); got != 4 {
-			t.Errorf("expected exactly four NULLS NOT DISTINCT in dump, got %d\n  full stdout=%q", got, res.Stdout)
+		// inline-column ADD CONSTRAINT (uniqcnnd_a_key), the slice-137 inline
+		// NAMED column ADD CONSTRAINT (myuniq), and the slice-138 NAMED table-level
+		// ADD CONSTRAINT (tuniq).
+		if got := strings.Count(res.Stdout, "NULLS NOT DISTINCT"); got != 5 {
+			t.Errorf("expected exactly five NULLS NOT DISTINCT in dump, got %d\n  full stdout=%q", got, res.Stdout)
 		}
 		// Slice 135/136 negative guard: dropping the clause would render the bare
 		// `<name> UNIQUE (a)`, silently restoring with default NULLS DISTINCT
@@ -1682,6 +1706,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if strings.Contains(res.Stdout, "uniqcname_a_key") {
 			t.Errorf("named inline column UNIQUE used the auto-generated name instead of myuniq\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 138 negative guard: the named table-level UNIQUE must surface under
+		// the USER name (tuniq) WITH the clause; dropping it would render the bare
+		// `ADD CONSTRAINT tuniq UNIQUE (a)` (silent NULL-dedup loss), and the
+		// pre-slice parser bug dropped the whole constraint (no ADD CONSTRAINT line).
+		if strings.Contains(res.Stdout, "ADD CONSTRAINT tuniq UNIQUE (a)") {
+			t.Errorf("pg_dump dropped NULLS NOT DISTINCT from a named table-level UNIQUE constraint\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 57 (asserted):** a VIEW must round-trip. pg_dump aborts the
 		// whole dump when pg_get_viewdef returns empty; goopg now returns the

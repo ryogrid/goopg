@@ -3638,6 +3638,38 @@ both the auto-generated name (`uniqcname_a_key`) and the dropped-clause regressi
 **Deferred (DU-002 follow-up):** enforcement at INSERT/UPDATE time, as in slices
 134/135/136 — same `encodeIndexKeyFromCols` backing-index path. Dump-fidelity only.
 
+### Slice 138 — named *table-level* `UNIQUE NULLS NOT DISTINCT` round-trip
+
+The table-level sibling of slice 137. A table-level UNIQUE constraint may carry an
+explicit name and the PG15+ NULLS clause — `CREATE TABLE t (a integer, …,
+CONSTRAINT tuniq UNIQUE NULLS NOT DISTINCT (a))`. pg_dump emits it under the
+**user-given** name with the clause preserved: `ALTER TABLE … ADD CONSTRAINT tuniq
+UNIQUE NULLS NOT DISTINCT (a)`.
+
+goopg's **named** table-level UNIQUE parser case (`CONSTRAINT name UNIQUE (cols)`
+in the table-constraint switch) **did not parse the optional `NULLS [NOT]
+DISTINCT` clause** that precedes the column list — unlike the *anonymous*
+table-level form, which slice 135 had already taught. So the `(` lookahead landed
+on the `NULLS` token, `p.acceptSymbol("(")` returned false, and the **whole named
+constraint was silently dropped** from the table (and thus the dump). Even had the
+clause been parsed, the executor's `NamedConstraints` loop never threaded
+`TableConstraintDef.NullsNotDistinct` to the backing index.
+
+**Production change:** the named table-level UNIQUE parser case (`ddl.go`) now
+parses the optional `NULLS [NOT] DISTINCT` before the column list, mirroring the
+anonymous form, and records it on `TableConstraintDef.NullsNotDistinct` (field
+already present from slice 135). The executor's `NamedConstraints` loop
+(`operators_ddl.go`) sets `idx.NullsNotDistinct = nc.NullsNotDistinct` on the
+backing index so `buildConstraintDefString` re-emits the clause (deparse path
+unchanged — index-backed constraints share one render). The round-trip test adds
+`public.uniqtname (a integer, b integer, CONSTRAINT tuniq UNIQUE NULLS NOT
+DISTINCT (a))` and asserts the dump carries `ADD CONSTRAINT tuniq UNIQUE NULLS NOT
+DISTINCT (a)`, with the clause-count guard tightened to exactly five and a negative
+guard against the dropped-clause regression (`ADD CONSTRAINT tuniq UNIQUE (a)`).
+
+**Deferred (DU-002 follow-up):** enforcement at INSERT/UPDATE time, as in slices
+134/135/136/137 — same `encodeIndexKeyFromCols` backing-index path. Dump-fidelity only.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

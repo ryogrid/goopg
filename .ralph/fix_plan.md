@@ -2829,10 +2829,39 @@ object support.
         `.ralph/deferral_ledger.md`. Gates: gofmt OK; `go build ./...` OK;
         `go vet` OK; `TestParseColumnNamedUniqueNullsNotDistinct` PASS;
         `TestPort_PgDumpConnectionSetup` PASS (2.34s); parser/executor packages
-        PASS; pgbench pre-commit smoke on commit. **Next: slice 138** —
-        enforcement of the slice-134/135/136/137 NULLS-equal semantics at
-        INSERT/UPDATE, OR an exclusion-constraint (`EXCLUDE USING gist`) dump
-        surface, OR a named table-level `CONSTRAINT name UNIQUE` form check.
+        PASS; pgbench pre-commit smoke on commit.
+      - **PROGRESS 2026-06-17 (loop #103):** **DU-002 slice 138 LANDED** — the
+        NAMED *table-level* UNIQUE form: `CONSTRAINT tuniq UNIQUE NULLS NOT
+        DISTINCT (a)` (explicit constraint name on a table-level UNIQUE with the
+        PG15+ NULLS clause). pg_dump emits `ADD CONSTRAINT tuniq UNIQUE NULLS NOT
+        DISTINCT (a)` under the USER name. **Production change:** goopg's named
+        table-level UNIQUE parser case (`CONSTRAINT name UNIQUE (cols)`) did NOT
+        parse the optional `NULLS [NOT] DISTINCT` clause that precedes the column
+        list (unlike the anonymous table-level form, taught by slice 135), so the
+        `(` lookahead landed on `NULLS`, `acceptSymbol("(")` returned false, and
+        the WHOLE named constraint was SILENTLY DROPPED from the table (and dump).
+        The parser now parses the clause before the column list (mirroring the
+        anonymous form) and records `TableConstraintDef.NullsNotDistinct` (field
+        already present from slice 135); the executor `NamedConstraints` loop now
+        sets `idx.NullsNotDistinct = nc.NullsNotDistinct` on the backing index so
+        `buildConstraintDefString` re-emits the clause (deparse unchanged).
+        **Deferred (ledger):** INSERT/UPDATE enforcement — same
+        `encodeIndexKeyFromCols` path as slices 134–137; dump-fidelity only. Files:
+        `internal/parser/ddl.go` (named table-level UNIQUE parses NULLS NOT
+        DISTINCT), `internal/executor/operators_ddl.go` (NamedConstraints loop
+        threads NullsNotDistinct), `internal/parser/ddl_test.go`
+        (`TestParseTableNamedUniqueNullsNotDistinct`),
+        `internal/testport/pgdump_connsetup_test.go` (`uniqtname` fixture +
+        `ADD CONSTRAINT tuniq UNIQUE NULLS NOT DISTINCT (a)` assert +
+        count-guard 4→5 + negative guard), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 138), `.ralph/deferral_ledger.md`. Gates: gofmt OK; `go build ./...`
+        OK; `go vet` OK; `TestParseTableNamedUniqueNullsNotDistinct` PASS;
+        `TestBuildConstraintDefNullsNotDistinct` PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.43s); pgbench pre-commit smoke on
+        commit. **Next: slice 139** — INSERT/UPDATE enforcement of the
+        slice-134–138 NULLS-equal semantics, OR an exclusion-constraint
+        (`EXCLUDE USING gist`) dump surface, OR a named table-level CHECK with
+        INCLUDE/expression edge cases.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -1905,8 +1905,20 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					_ = p.acceptIdentKeyword("immediate")
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
-				// CONSTRAINT name UNIQUE (cols) [INCLUDE (cols)] M0097-0028.
+				// CONSTRAINT name UNIQUE [NULLS [NOT] DISTINCT] (cols) [INCLUDE (cols)]
+				// M0097-0028 / DU-002 slice 138.
 				p.advance()
+				// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) precedes the column
+				// list, mirroring the anonymous table-level UNIQUE form above. Without
+				// this the `(` lookahead failed and the whole named constraint was
+				// silently dropped from the table (and thus the dump).
+				namedNullsNotDistinct := false
+				if p.acceptIdentKeyword("nulls") {
+					namedNullsNotDistinct = p.acceptKeyword(KwNot)
+					if !p.acceptKeyword(KwDistinct) {
+						_ = p.acceptIdentKeyword("distinct")
+					}
+				}
 				if p.acceptSymbol("(") {
 					var cols []string
 					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
@@ -1916,7 +1928,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						p.advance()
 					}
 					if len(cols) > 0 {
-						cdef := TableConstraintDef{Name: constraintName, Columns: cols}
+						cdef := TableConstraintDef{Name: constraintName, Columns: cols, NullsNotDistinct: namedNullsNotDistinct}
 						// Optional INCLUDE (col, …).
 						if p.acceptIdentKeyword("include") {
 							if p.acceptSymbol("(") {

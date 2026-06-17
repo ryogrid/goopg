@@ -282,6 +282,49 @@ func TestParseColumnNamedUniqueNullsNotDistinct(t *testing.T) {
 	}
 }
 
+// TestParseTableNamedUniqueNullsNotDistinct pins the NAMED table-level UNIQUE
+// form (`CONSTRAINT name UNIQUE [NULLS NOT DISTINCT] (cols)`) — DU-002 slice
+// 138. Before this slice the named table-level UNIQUE case did NOT parse the
+// optional PG15+ NULLS [NOT] DISTINCT clause that precedes the column list, so
+// the `(` lookahead failed and the whole named constraint was silently dropped
+// from the table. Now the flag is captured on TableConstraintDef.NullsNotDistinct
+// (parallel to the anonymous form's TableUniqueNullsNotDistinct).
+func TestParseTableNamedUniqueNullsNotDistinct(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		wantNND  bool
+	}{
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a))", "u_a", false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE NULLS DISTINCT (a))", "u_a", false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE NULLS NOT DISTINCT (a))", "u_a", true},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE NULLS NOT DISTINCT (a) INCLUDE (b))", "u_a", true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.NamedConstraints) != 1 {
+			t.Fatalf("Parse(%q): expected 1 NamedConstraint, got %d", c.in, len(ct.NamedConstraints))
+		}
+		nc := ct.NamedConstraints[0]
+		if nc.Name != c.wantName {
+			t.Errorf("Parse(%q): Name=%q want %q", c.in, nc.Name, c.wantName)
+		}
+		if nc.IsPrimary || nc.IsExclusion {
+			t.Errorf("Parse(%q): expected plain UNIQUE, got IsPrimary=%v IsExclusion=%v", c.in, nc.IsPrimary, nc.IsExclusion)
+		}
+		if len(nc.Columns) != 1 || nc.Columns[0] != "a" {
+			t.Errorf("Parse(%q): Columns=%v want [a]", c.in, nc.Columns)
+		}
+		if nc.NullsNotDistinct != c.wantNND {
+			t.Errorf("Parse(%q): NullsNotDistinct=%v want %v", c.in, nc.NullsNotDistinct, c.wantNND)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {
