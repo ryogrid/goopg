@@ -3252,6 +3252,33 @@ real pg_dump 18.3 (reference `/tmp/du125_pgdata`). Asserts: the exact
 `(30, false)` form + the unchanged `START WITH 5`; negatives reject the pre-fix
 `(5, false)` and the wrong-flag/value forms.
 
+### Slice 126 — multi-column UNIQUE constraint with non-table key order
+
+The constraint-backed UNIQUE/PK path was previously covered only by a
+single-column UNIQUE (`foo_code_key UNIQUE (code)`, slice 51) and a
+declaration-order multi-column PRIMARY KEY (`bar_pkey PRIMARY KEY (a, b)`,
+slice 53). Neither exercises a *multi-column UNIQUE* whose key order differs
+from the table's column order — the case where the auto-generated name and the
+rendered column list must both follow **index-key order**, not table order.
+`CREATE TABLE public.uniqm (a integer, b integer, c text, UNIQUE (b, a))` dumps:
+
+```sql
+ALTER TABLE ONLY public.uniqm
+    ADD CONSTRAINT uniqm_b_a_key UNIQUE (b, a);
+```
+
+No production change was needed — goopg already stores the index key columns in
+declared order (`catalog.Index.Columns`), and both the deparse
+(`buildConstraintDefString`, `internal/executor/expr.go`) and the
+auto-name generator (`<table>_<col1>_<col2>_key`,
+`internal/executor/operators_ddl.go`) consume that slice, so the `(b, a)`
+order and the `uniqm_b_a_key` name fall out correctly. This slice is the
+regression guard locking that behavior: positive assert for the exact
+`uniqm_b_a_key UNIQUE (b, a)`, plus negative guards rejecting a key-order
+regression (`uniqm_a_b_key` / `UNIQUE (a, b)`) that would silently reorder the
+constraint columns on restore. Verified byte-identical vs real pg_dump 18.3
+(reference `/tmp/du126_pgdata`).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

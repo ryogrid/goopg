@@ -1,27 +1,26 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 125 (loop #89) — a REWOUND sequence
-(`setval(seq, N, false)` with `N != start`) dumps byte-identically. This is the
-FIRST production code change in the sequence-dump slice series (115–125); all
-prior slices were verification/regression guards.
+Last landed: DU-002 slice 126 (loop #90) — a multi-column UNIQUE constraint whose
+key order DIFFERS from the table's column order now dumps byte-identically.
+`CREATE TABLE public.uniqm (a integer, b integer, c text, UNIQUE (b, a))` →
+`ADD CONSTRAINT uniqm_b_a_key UNIQUE (b, a)`. **No production change** — a
+regression guard: goopg stores index key columns in declared order
+(catalog.Index.Columns), and both the deparse (buildConstraintDefString,
+internal/executor/expr.go) and the auto-name generator
+(internal/executor/operators_ddl.go:1294, `<table>_<col1>_<col2>_key`) consume
+that slice, so both the `(b, a)` order and the `uniqm_b_a_key` name fall out
+correctly. The constraint-backed UNIQUE/PK path was previously covered only by a
+single-column UNIQUE (foo_code_key) and a declaration-order multi-column PK
+(bar_pkey (a,b)) — neither tested the multi-column `_key` name join NOR a
+non-table-order key list. Verified byte-identical vs real pg_dump 18.3 (reference
+/tmp/du126_pgdata).
 
-Bug (discovered in slice 124): `SequenceRowData`'s not-called branch returned the
-bare `s.start`, so after `setval('rewound_seq', 30, false)` (which rewinds value
-to 30 WITHOUT marking called) goopg dumped `setval(.., 5, false)` while real PG
-dumps `setval(.., 30, false)` (PG stores last_value=30/is_called=false). Fix:
-not-called branch now returns `current + increment` — the registry stores
-`current = nextTarget - increment`, so this is the exact on-disk last_value
-(`start` for fresh, `N` after rewind/RESTART WITH N). `SequenceRowData` is the
-single shared function behind both `SELECT * FROM <seq>` and the
-`pg_get_sequence_data` SRF → both sibling paths fixed in one place. The
-`pg_sequences` view is unaffected (sources AllSequenceInfos, emits NULL
-last_value while not-called).
+Files: internal/testport/pgdump_connsetup_test.go (uniqm fixture + positive assert
++ 2 negative guards rejecting uniqm_a_b_key / `UNIQUE (a, b)`),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 126), .ralph/fix_plan.md.
+Committed + pushed.
 
-Files: internal/executor/operators_sequence.go (SequenceRowData not-called
-branch + doc comment), internal/testport/pgdump_connsetup_test.go (rewound_seq
-fixture + asserts), docs/design/0110-0001-pg-dump-tap-port.md (Slice 125),
-.ralph/fix_plan.md. Reference /tmp/du125_pgdata. Committed + pushed.
-
-Next direction (slice 126): a table+VIEW dependency-ordering case (view depends
-on a table; verify topological emission ORDER, not just presence), OR a CHECK
-constraint / multi-column UNIQUE constraint dump case.
+Next direction (slice 127): a table+VIEW dependency-ordering case (verify
+topological emission ORDER, not just presence), OR a multi-column CHECK constraint
+(`CHECK (a < b)` referencing two columns), OR a UNIQUE constraint with an INCLUDE
+column.

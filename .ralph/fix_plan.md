@@ -2477,6 +2477,34 @@ object support.
         **Next: slice 126** — a table+VIEW dependency-ordering case (view depends on a
         table; verify topological emission ORDER, not just presence), OR a CHECK
         constraint / multi-column UNIQUE dump case.
+      - **PROGRESS 2026-06-17 (loop #90):** **DU-002 slice 126 LANDED** — a
+        multi-column UNIQUE constraint whose key order DIFFERS from the table's
+        column order now dumps byte-identically. `CREATE TABLE public.uniqm (a
+        integer, b integer, c text, UNIQUE (b, a))` → `ADD CONSTRAINT
+        uniqm_b_a_key UNIQUE (b, a)` (verified vs real pg_dump 18.3, reference
+        `/tmp/du126_pgdata`). The constraint-backed UNIQUE/PK path was previously
+        covered only by a single-column UNIQUE (`foo_code_key`) and a
+        declaration-order multi-column PK (`bar_pkey (a, b)`); neither exercised
+        the multi-column `_key` name join (`<table>_<col1>_<col2>_key`) NOR a key
+        list whose order differs from the table's column order. **No production
+        change needed** — goopg stores the index key columns in declared order
+        (`catalog.Index.Columns`), and BOTH sibling consumers — the deparse
+        (`buildConstraintDefString`, `internal/executor/expr.go`) and the
+        auto-name generator (`internal/executor/operators_ddl.go:1294`) — read
+        that slice, so `(b, a)` and `uniqm_b_a_key` fall out correctly. This slice
+        is the regression guard locking that behavior: positive assert for the
+        exact `uniqm_b_a_key UNIQUE (b, a)` + 2 negative guards rejecting a
+        key-order regression (`uniqm_a_b_key` / `UNIQUE (a, b)`, which would
+        silently reorder the constraint columns on restore). Files:
+        `internal/testport/pgdump_connsetup_test.go` (uniqm fixture + asserts),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 126 section). Gates:
+        gofmt OK; `go build ./...` OK; `TestPort_PgDumpConnectionSetup` PASS
+        (2.06s); `go test ./internal/executor/ ./internal/catalog/` PASS
+        (sibling-path + index-order coverage); pgbench pre-commit smoke on commit.
+        **Next: slice 127** — a table+VIEW dependency-ordering case (verify
+        topological emission ORDER), OR a multi-column CHECK constraint
+        (`CHECK (a < b)` referencing two columns), OR a UNIQUE constraint with an
+        INCLUDE column.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

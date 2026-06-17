@@ -424,6 +424,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table baz: %v", err)
 	}
 
+	// Slice 126: a table-level multi-column UNIQUE constraint whose column order
+	// DIFFERS from the table's column order (`UNIQUE (b, a)` over `(a, b, c)`).
+	// pg_dump emits constraint-backed UNIQUE/PK constraints from its index scan
+	// (pg_get_indexdef-style deparse), rendering the column list and the
+	// auto-generated constraint name in INDEX-key order, not table order. Real
+	// pg_dump 18.3 emits `ADD CONSTRAINT uniqm_b_a_key UNIQUE (b, a)` — the name
+	// joins the key columns (`<table>_<col1>_<col2>_key`) and the list preserves
+	// the declared `(b, a)` order. The existing fixtures only cover a single-column
+	// UNIQUE (`foo_code_key`) and a declaration-order multi-column PRIMARY KEY
+	// (`bar_pkey (a, b)`), so neither exercises the multi-column `_key` name join
+	// (operators_ddl.go autoIndexName path) NOR a non-table-order key list. goopg
+	// stores the index key columns in declared order (catalog.Index.Columns), and
+	// both buildConstraintDefString and the auto-name generator consume that slice,
+	// so this round-trips byte-identically (verified vs real pg_dump 18.3,
+	// reference /tmp/du126_pgdata). `uniqm` carries it on its own table so foo's
+	// many asserts are untouched.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.uniqm (a integer, b integer, c text, UNIQUE (b, a))"); err != nil {
+		t.Fatalf("create table uniqm: %v", err)
+	}
+
 	// Slice 54: a non-empty reloptions (`WITH (fillfactor=70)`) must surface in
 	// the dump. Slice 47 made an EMPTY reloptions read as SQL NULL (no WITH
 	// clause); the complementary case — an actually-set storage parameter — was
@@ -1340,10 +1360,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE SCHEMA s;",
 			"CREATE TABLE s.widget (",
 			"ADD CONSTRAINT widget_pkey PRIMARY KEY (id)",
+			// **Slice 126:** a multi-column UNIQUE constraint with a key order
+			// (`b, a`) that differs from the table's column order (`a, b, c`).
+			// Both the auto-generated name and the column list must follow the
+			// INDEX-key order, not the table order: `uniqm_b_a_key UNIQUE (b, a)`.
+			"ADD CONSTRAINT uniqm_b_a_key UNIQUE (b, a)",
 		}
 		for _, sub := range check {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped a constraint; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// Slice 126 negative guards: a key-order or name regression (sorting the
+		// columns into table order) would render `uniqm_a_b_key`/`UNIQUE (a, b)`,
+		// silently changing the constraint's column ordering on restore.
+		for _, neg := range []string{
+			"ADD CONSTRAINT uniqm_a_b_key UNIQUE (a, b)",
+			"UNIQUE (a, b)\n",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump reordered a multi-column UNIQUE key into table order: %q\n  full stdout=%q", neg, res.Stdout)
 			}
 		}
 		// **Slice 55 closed (asserted):** COMMENT ON {TABLE,COLUMN} must survive
