@@ -1548,6 +1548,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function add_five: %v", err)
 	}
 
+	// Slice 154: a CREATE PROCEDURE (prokind='p'), so the dump exercises
+	// dumpFunc's PROCEDURE branch (pg_dump.c:13484) and the no-RETURNS path
+	// (pg_dump.c:13498) — distinct from every prior slice, which only ever
+	// dumped functions (prokind='f'). pg_dump renders procedures with the
+	// `PROCEDURE` keyword, NO `RETURNS` clause, and — because procedures always
+	// carry an argmode (buildFunctionArguments sets showMode for procedures,
+	// matching ruleutils) — the `IN ` mode prefix on the named parameter. The
+	// body has no `$`, so pg_dump's appendStringLiteralDQ picks the bare `$$`
+	// delimiter (every prior function body contained `$N`, forcing `$_$`). This
+	// is the first procedure ever sent through getFuncs/dumpFunc, so it proves
+	// prokind='p' rows are discovered and rendered without the RETURNS type.
+	if err := runSQLSimple(t, c, "CREATE PROCEDURE public.ins_foo(a integer) LANGUAGE sql AS $$ INSERT INTO public.foo (id) VALUES (a) $$"); err != nil {
+		t.Fatalf("create procedure ins_foo: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2056,6 +2071,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "    LANGUAGE sql SECURITY DEFINER LEAKPROOF\n    AS $_$ SELECT $1 + 5 $_$;") {
 			t.Errorf("pg_dump dropped/mangled add_five's SECURITY DEFINER/LEAKPROOF clauses or body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 154 (asserted):** the procedure (ins_foo) must round-trip via
+		// dumpFunc's PROCEDURE branch. pg_dump uses the `PROCEDURE` keyword,
+		// emits NO `RETURNS` clause (prokind='p' short-circuits the result-type
+		// output at pg_dump.c:13498), prefixes the parameter with `IN ` (procedures
+		// always carry an argmode), and — because the body contains no `$` — quotes
+		// it with the bare `$$` delimiter, so real pg_dump 18.3 renders:
+		//   CREATE PROCEDURE public.ins_foo(IN a integer)
+		//       LANGUAGE sql
+		//       AS $$ INSERT INTO public.foo (id) VALUES (a) $$;
+		// A function-only divergence (missing prokind='p' discovery, a stray
+		// RETURNS, a dropped IN, or wrong dollar-quoting) would surface exactly here.
+		if !strings.Contains(res.Stdout, "CREATE PROCEDURE public.ins_foo(IN a integer)") {
+			t.Errorf("pg_dump dropped/mangled the ins_foo procedure signature\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE PROCEDURE public.ins_foo(IN a integer)\n    LANGUAGE sql\n    AS $$ INSERT INTO public.foo (id) VALUES (a) $$;") {
+			t.Errorf("pg_dump dropped/mangled ins_foo's LANGUAGE/body or emitted a stray RETURNS\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

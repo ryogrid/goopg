@@ -1,29 +1,28 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 153 (loop #119) — SECURITY DEFINER + LEAKPROOF
-functions now have asserted pg_dump round-trip coverage. CLEAN POSITIVE
-(verified empirically), not a divergence: the parser→catalog.Routine→pg_proc_view
-chain for prosecdef/proleakproof was already fully wired (unlike slices 150/151's
-parsed-then-dropped clauses). Slices 148–152 only ever drove the hardcoded 'f'
-for both columns (which dumpFunc suppresses), so no pg_dump round-trip had
-asserted these columns reach dumpFunc. dumpFunc (pg_dump.c:13545/13548) appends
-` SECURITY DEFINER` then ` LEAKPROOF` inline after STRICT, before COST.
+Last landed: DU-002 slice 154 (loop #120) — first CREATE PROCEDURE (prokind='p')
+round-trip through pg_dump. CLEAN POSITIVE (verified empirically), not a divergence.
+Every prior slice dumped only functions; this exercises dumpFunc's PROCEDURE keyword
+branch (pg_dump.c:13484) and the no-RETURNS path (:13498). Two procedure-shape details:
+(1) procedures always carry an argmode → buildFunctionArguments (expr.go:11329-11340)
+emits `IN ` on the named param; (2) body has no `$` → pg_dump's appendStringLiteralDQ
+picks bare `$$` (prior bodies had `$N`, forcing `$_$`). Path already wired
+(execCreateProcedure sets IsProcedure; pg_proc_view emits prokind='p').
 
-Test fixture: public.add_five(integer) RETURNS integer LANGUAGE sql SECURITY
-DEFINER LEAKPROOF. Asserts signature + one-line `LANGUAGE sql SECURITY DEFINER
-LEAKPROOF` / `AS $_$ SELECT $1 + 5 $_$;`.
+Test fixture: public.ins_foo(a integer) LANGUAGE sql AS $$ INSERT INTO public.foo
+(id) VALUES (a) $$. Asserts `CREATE PROCEDURE public.ins_foo(IN a integer)` + the
+`LANGUAGE sql` / `AS $$ … $$;` fragment (no stray RETURNS).
 
-Files: internal/testport/pgdump_connsetup_test.go (fixture ~1537 + assertion
-~2030), docs/design/0110-0001-pg-dump-tap-port.md (slice 153 section),
-.ralph/fix_plan.md (loop #119 PROGRESS).
-Verified: gofmt OK; go build ./internal/... OK; TestPort_PgDumpConnectionSetup
-PASS (2.54s, not skipped); ralph-state-guard consistent (auto-repaired stale
-completed marker); pgbench smoke runs on commit.
+Files: internal/testport/pgdump_connsetup_test.go (fixture ~1551, assertion ~2060),
+docs/design/0110-0001-pg-dump-tap-port.md (slice 154 section), .ralph/fix_plan.md
+(loop #120 PROGRESS).
+Verified: gofmt OK; go build ./internal/... OK; TestPort_PgDumpConnectionSetup PASS
+(2.29s, not skipped); ralph-state-guard consistent (auto-repaired stale completed
+marker); pgbench smoke runs on commit.
 
-Next direction (slice 154): a fresh pg_dump catalog-surface gap. Best candidate:
-CREATE PROCEDURE (prokind='p') round-trip — exercises dumpFunc's keyword=
-"PROCEDURE" branch + the no-RETURNS path (pg_dump.c:13483/13497). goopg's
-pg_proc_view already emits prokind='p' (line 326-328) but NO procedure has ever
-been dumped, so this likely surfaces a REAL divergence (prorettype handling for
-procedures, or getFuncs discovery of prokind='p'). Alternative lower-risk:
-a STABLE or PARALLEL RESTRICTED volatility variant (clean-positive coverage).
+Next direction (slice 155): a procedure carrying an OUT or INOUT parameter — exercises
+buildFunctionArguments' `OUT `/`INOUT ` argmode render through dumpFunc (the `IN ` path
+is now covered). pg_dump renders `CREATE PROCEDURE name(IN a integer, OUT b integer)`.
+Verify execCreateProcedure stores argmode 'o'/'b' and pg_get_function_arguments emits
+it. Alternative lower-risk: a STABLE or PARALLEL RESTRICTED volatility-marker variant
+(clean-positive coverage of the remaining provolatile/proparallel cells).

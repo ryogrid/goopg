@@ -4263,6 +4263,37 @@ signature plus the one-line `LANGUAGE sql SECURITY DEFINER LEAKPROOF` /
 `AS $_$ SELECT $1 + 5 $_$;` fragment. (LEAKPROOF requires a superuser, which the
 test connection is.)
 
+### Slice 154 — `CREATE PROCEDURE` (prokind='p') round-trip (coverage; clean positive)
+
+Every prior slice dumped only **functions** (`prokind='f'`). This slice sends the
+first **procedure** through `getFuncs`/`dumpFunc`, exercising two branches no
+function ever reaches:
+
+- the `PROCEDURE` keyword (`prokind[0] == PROKIND_PROCEDURE`, `pg_dump.c:13484`); and
+- the **no-`RETURNS`** path (`pg_dump.c:13498` short-circuits the result-type output
+  before `funcresult` is consulted).
+
+Two further details fall out of the procedure shape. First, procedures always carry
+an argmode, so `buildFunctionArguments` (`expr.go`) sets `showMode` for `IsProcedure`
+(matching ruleutils' `print_function_arguments`) and emits the `IN ` prefix on the
+named parameter — functions with all-IN params omit it. Second, the body
+` INSERT INTO public.foo (id) VALUES (a) ` contains no `$`, so pg_dump's
+`appendStringLiteralDQ` picks the bare `$$` delimiter; every prior function body held
+a `$N` parameter ref, which forced `$_$`. The procedure path was **already correctly
+wired** (executor `execCreateProcedure` sets `IsProcedure`, `pg_proc_view.go` emits
+`prokind='p'`), so this is coverage of an untested path, not a divergence fix
+(verified empirically: clean positive). Real pg_dump 18.3 renders:
+
+```
+CREATE PROCEDURE public.ins_foo(IN a integer)
+    LANGUAGE sql
+    AS $$ INSERT INTO public.foo (id) VALUES (a) $$;
+```
+
+The TAP test creates `public.ins_foo(a integer) LANGUAGE sql AS $$ INSERT … $$` and
+asserts the `CREATE PROCEDURE … (IN a integer)` signature plus the exact
+`LANGUAGE sql` / `AS $$ … $$;` fragment (no stray `RETURNS`).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

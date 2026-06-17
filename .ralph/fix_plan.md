@@ -3325,6 +3325,29 @@ object support.
         skipped); pgbench pre-commit smoke on commit. **Next: slice 154** — a
         `CREATE PROCEDURE` (prokind='p') round-trip (no-RETURNS branch + PROCEDURE
         keyword), or a STABLE / PARALLEL RESTRICTED volatility-marker variant.
+      - **PROGRESS 2026-06-17 (loop #120):** **DU-002 slice 154 LANDED** — first
+        **procedure** (prokind='p') sent through pg_dump's `getFuncs`/`dumpFunc`;
+        **clean positive (verified empirically), not a divergence**. Every prior
+        slice dumped only functions (prokind='f'); this exercises two branches no
+        function reaches: the `PROCEDURE` keyword (`pg_dump.c:13484`) and the
+        no-`RETURNS` path (`:13498` short-circuits before `funcresult`). Two details
+        fall out of the procedure shape — (1) procedures always carry an argmode, so
+        `buildFunctionArguments` (`expr.go`) emits the `IN ` prefix on the named
+        param (functions with all-IN params omit it); (2) the body
+        ` INSERT INTO public.foo (id) VALUES (a) ` has no `$`, so pg_dump's
+        `appendStringLiteralDQ` picks the bare `$$` delimiter (every prior body had a
+        `$N`, forcing `$_$`). The procedure path was already wired
+        (`execCreateProcedure` sets `IsProcedure`; `pg_proc_view.go` emits
+        prokind='p'), so this locks coverage of an untested path. Test adds
+        `public.ins_foo(a integer) LANGUAGE sql AS $$ INSERT … $$` and asserts
+        `CREATE PROCEDURE public.ins_foo(IN a integer)` + the `LANGUAGE sql` /
+        `AS $$ … $$;` fragment (no stray RETURNS). Files:
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK; `go build
+        ./internal/...` OK; `TestPort_PgDumpConnectionSetup` PASS (2.29s, not
+        skipped); pgbench pre-commit smoke on commit. **Next: slice 155** — a
+        procedure carrying an OUT/INOUT param (exercises the `OUT `/`INOUT ` argmode
+        render), or a STABLE / PARALLEL RESTRICTED volatility-marker variant.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
