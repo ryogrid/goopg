@@ -355,9 +355,13 @@ func TestPgProcViewProparallel(t *testing.T) {
 	}
 }
 
-// TestPgProcViewProsupport pins the prosupport column (DU-002 slice 41):
-// always "0" — goopg has no planner support functions, mirroring PG's
-// CREATE FUNCTION default, so dumpFunc emits no `SUPPORT ...` clause.
+// TestPgProcViewProsupport pins the prosupport column (DU-002 slice 41, fixed in
+// slice 148): always "-" (regproc text for InvalidOid) — goopg has no planner
+// support functions. The column is typed regproc (as in PG's pg_proc), so
+// InvalidOid renders as the text "-", NOT "0". pg_dump's dumpFunc emits
+// `SUPPORT <val>` whenever `strcmp(prosupport, "-") != 0`; an `oid`-typed "0"
+// cell made pg_dump emit the invalid `SUPPORT 0` clause (a restore error —
+// SUPPORT wants a function name). "-" suppresses the clause, matching real PG.
 func TestPgProcViewProsupport(t *testing.T) {
 	cat := catalog.NewInMemory()
 	if err := registerPgProcView(cat); err != nil {
@@ -373,12 +377,23 @@ func TestPgProcViewProsupport(t *testing.T) {
 		t.Fatal(err)
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	// The prosupport column must be regproc-typed so InvalidOid renders as "-"
+	// (an oid-typed "0" makes pg_dump emit the invalid `SUPPORT 0` clause).
+	var prosupportCol catalog.Column
+	for _, c := range tbl.Columns {
+		if c.Name == "prosupport" {
+			prosupportCol = c
+		}
+	}
+	if prosupportCol.Type.Name != "regproc" {
+		t.Fatalf("prosupport column type = %q, want regproc (oid makes pg_dump emit `SUPPORT 0`)", prosupportCol.Type.Name)
+	}
 	rows := tbl.VirtualRows()
 	// prosupport is the last column (index 22), appended after proparallel (21).
 	const prosupport = 22
 	for i := range rows {
-		if rows[i][prosupport] != "0" {
-			t.Errorf("row %q prosupport = %q, want 0", rows[i][1], rows[i][prosupport])
+		if rows[i][prosupport] != "-" {
+			t.Errorf("row %q prosupport = %q, want - (regproc InvalidOid)", rows[i][1], rows[i][prosupport])
 		}
 	}
 }

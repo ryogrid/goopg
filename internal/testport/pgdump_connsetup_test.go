@@ -1879,6 +1879,40 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				t.Errorf("pg_dump dropped a COMMENT; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
+		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must
+		// round-trip. Slice 147 created public.add_one(integer) only as a COMMENT
+		// target and asserted the COMMENT line; the CREATE FUNCTION body that
+		// pg_dump's getFuncs/dumpFunc emit from the pg_proc virtual view (slice 7's
+		// getFuncs SELECT + slice 147's pg_proc.tableoid fix) was exercised but
+		// never asserted — and it carried a real defect. pg_dump renders an
+		// old-style SQL function (prosqlbody NULL, so the body comes from prosrc) as:
+		//   CREATE FUNCTION public.add_one(integer) RETURNS integer
+		//       LANGUAGE sql
+		//       AS $_$ SELECT $1 + 1 $_$;
+		// The signature args come from pg_get_function_arguments (integer), the
+		// return type from formatTypeOID(prorettype=23 → integer), LANGUAGE from
+		// the pg_language join (prolang=14 → sql), and the dollar-quoted body
+		// verbatim from prosrc. The body is quoted `$_$…$_$` (not `$$…$$`) because
+		// pg_dump's appendStringLiteralDQ escalates the dollar-tag when the body
+		// contains a bare `$` — here the `$1` parameter — so `$_$` is the CORRECT,
+		// PG-identical rendering. The defect: goopg's pg_proc.prosupport was typed
+		// `oid` and emitted the text `0`; pg_dump's dumpFunc emits `SUPPORT <val>`
+		// whenever `strcmp(prosupport, "-") != 0`, so the dump carried the invalid
+		// `LANGUAGE sql SUPPORT 0` (SUPPORT wants a function name — a restore error).
+		// Real PG types prosupport `regproc`, which renders InvalidOid as `-`;
+		// retyping the column + emitting `-` suppresses the bogus clause. Assert the
+		// exact two-line LANGUAGE/AS fragment (which only matches once the spurious
+		// SUPPORT clause is gone) and a negative guard on `SUPPORT 0`. Verified
+		// against real pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.add_one(integer) RETURNS integer") {
+			t.Errorf("pg_dump dropped/mangled the CREATE FUNCTION signature\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "    LANGUAGE sql\n    AS $_$ SELECT $1 + 1 $_$;") {
+			t.Errorf("pg_dump dropped/mangled the CREATE FUNCTION body or emitted a spurious clause\n  full stdout=%q", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "SUPPORT 0") {
+			t.Errorf("pg_dump emitted invalid `SUPPORT 0` (prosupport must render regproc InvalidOid as '-')\n  full stdout=%q", res.Stdout)
+		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the
 		// index-backed constraint path. PG renders it `CREATE INDEX <name> ON

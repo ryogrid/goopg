@@ -1,32 +1,35 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 147 (loop #112) — COMMENT ON FUNCTION now round-trips
-through pg_dump. TWO coupled bugs: (1) parseCommentOnTail had no FUNCTION branch
-(silently swallowed); (2) the load-bearing one — pg_proc is a virtual view whose
-Table struct never set OID, so its `tableoid` system column resolved to 0
-(resolveTableoidForBinding returns b.table.OID). pg_dump's collectComments matches
-a pg_description row to a dumpable object by {classoid, objoid} where the function's
-catId.tableoid comes from pg_proc.tableoid; 1255 ≠ 0 → comment discarded even though
-it was in pg_description. TYPE/DOMAIN worked (slice 146) only because pg_type is
-heap-backed with OID=1247.
-Fix: (1) parser KwFunction branch → parseObjectName + parseFunctionArgList into new
-CommentOnStmt.Args; (2) execCommentOn `function` case resolves routine via
-Routines().Lookup, keys row under pg_proc (1255); (3) registerPgProcView sets
-OID: catalog.ProcedureRelationId (new const 1255).
-Key symbols: parser.parseCommentOnTail, CommentOnStmt.Args, ddlOp.execCommentOn,
-catalog.Routines.Lookup, registerPgProcView, catalog.ProcedureRelationId,
-resolveTableoidForBinding.
-Files: internal/parser/ast.go, internal/parser/parser.go,
-internal/executor/operators_ddl.go, internal/executor/comment_on_function_test.go,
-internal/catalog/catalog.go, internal/initdb/pg_proc_view.go,
-internal/testport/pgdump_connsetup_test.go, docs/design/0110-0001-pg-dump-tap-port.md.
-Verified: gofmt/build OK; parser+catalog+initdb+executor suites PASS;
-TestCommentOnFunctionStoresPgProcDescription PASS;
-TestPort_PgDumpConnectionSetup PASS (2.49s). Committed + pushed.
+Last landed: DU-002 slice 148 (loop #113) — `CREATE FUNCTION` now round-trips
+through pg_dump byte-identically. Slice 147 created public.add_one(integer) only
+as a COMMENT target and asserted just the comment; the CREATE FUNCTION body was
+emitted but never asserted — and carried a real defect.
+THE BUG: goopg's *virtual* pg_proc view typed `prosupport` as `oid`, emitting
+text "0". pg_dump's dumpFunc (pg_dump.c:13575) emits `SUPPORT <val>` whenever
+`strcmp(prosupport,"-") != 0`, so the dump carried `LANGUAGE sql SUPPORT 0` —
+invalid DDL (SUPPORT wants a function name; restore would fail). Real PG types
+prosupport `regproc`, which renders InvalidOid as "-".
+FIX: pg_proc_view.go — retype prosupport column oid→regproc; emit cell "-"
+(not "0") in BOTH row builders. TypedVirtualCell parses "-" as non-int →
+StringConst("-") → wire text "-" → dumpFunc suppresses the clause.
+NOTE: `$_$ SELECT $1 + 1 $_$` quoting is CORRECT (pg_dump escalates the dollar
+tag when the body has a bare `$`, here `$1`), not a bug. The physical heap
+pg_proc bootstrap already typed prosupport regproc w/ binary 0 — only the
+virtual view diverged.
+Key symbols: registerPgProcView, TypedVirtualCell (planner.go:2296),
+dumpFunc (pg_dump.c), catalog.Type regproc.
+Files: internal/initdb/pg_proc_view.go (col type + 2 cells + doc),
+internal/initdb/pg_proc_view_test.go (TestPgProcViewProsupport: now pins
+type=regproc, value="-"), internal/testport/pgdump_connsetup_test.go (slice 148
+assertions: exact LANGUAGE/AS fragment + negative SUPPORT 0 guard),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 148 section).
+Verified: gofmt OK; go build ./internal/initdb OK; initdb suite PASS (116s);
+catalog/planner PASS; executor Proc/Func/Comment PASS;
+TestPort_PgDumpConnectionSetup PASS (2.98s). ralph-state-guard OK.
 
-Next direction (slice 148): a fresh pg_dump catalog-surface gap. Candidates:
-COMMENT ON {COLLATION, EXTENSION, AGGREGATE} round-trip (none handled by
-parseCommentOnTail; check each object is actually dumped by goopg pg_dump first —
-the slice-147 lesson: a virtual catalog view must set its Table.OID or tableoid
-resolves to 0 and pg_dump comment-matching silently drops the comment). Or the
-deferred-check EXECUTION spike (validate at COMMIT, not per-row).
+Next direction (slice 149): a fresh pg_dump catalog-surface gap. Candidates:
+assert ALTER FUNCTION ... OWNER TO round-trips; a 2nd function with different
+volatility/strict/SECURITY DEFINER to exercise those dumpFunc clauses; a
+set-returning function (ROWS clause); or a procedure (CREATE PROCEDURE / prokind
+'p'). Lesson from this slice: a virtual catalog column's *type* drives its wire
+text (regproc 0 → "0" vs "-"); pg_dump compares against PG's regproc sentinels.

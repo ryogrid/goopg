@@ -4058,6 +4058,49 @@ The round-trip test adds the function + comment and asserts
 Guards: `executor.TestCommentOnFunctionStoresPgProcDescription`. Pure
 dump-fidelity; no catalog-schema change.
 
+### Slice 148 — `CREATE FUNCTION` round-trip (`SUPPORT 0` fix)
+
+Slice 147 created `public.add_one(integer)` only as a `COMMENT ON FUNCTION`
+target and asserted the comment line. The `CREATE FUNCTION` body that pg_dump's
+`getFuncs`/`dumpFunc` emit from the `pg_proc` virtual view (slice 7's `getFuncs`
+SELECT + slice 147's `pg_proc.tableoid` fix) was exercised end-to-end but never
+asserted — and it carried a real defect.
+
+**The defect — spurious `SUPPORT 0`.** Real pg_dump 18.3 renders the function:
+
+```
+CREATE FUNCTION public.add_one(integer) RETURNS integer
+    LANGUAGE sql
+    AS $_$ SELECT $1 + 1 $_$;
+```
+
+goopg instead emitted `LANGUAGE sql SUPPORT 0`. `dumpFunc`
+(`pg_dump.c:13575`) emits a `SUPPORT <val>` clause whenever
+`strcmp(prosupport, "-") != 0`, reading `prosupport` raw from its `getFuncs`
+SELECT. PG's `pg_proc.prosupport` is typed **`regproc`**, so InvalidOid renders
+as the text `-`; goopg's *virtual* `pg_proc` view typed it **`oid`**, so it
+rendered `0`, and `strcmp("0","-") != 0` → `SUPPORT 0`. That clause is invalid
+DDL (SUPPORT wants a function name), so a restored dump would fail.
+
+**The fix:** retype the virtual `pg_proc.prosupport` column `oid → regproc` and
+emit the cell value `-` (regproc's text for InvalidOid) in both row builders
+(built-in stubs + user routines). `TypedVirtualCell` parses `-` as a non-integer
+and falls back to `StringConst("-")`, so the wire text is exactly `-` and
+`dumpFunc` suppresses the clause. The physical (heap-backed) `pg_proc` bootstrap
+catalog already typed `prosupport` `regproc` with binary `0` (correct on disk);
+only the virtual view diverged.
+
+**The `$_$` quoting is correct, not a bug.** pg_dump's `appendStringLiteralDQ`
+escalates the dollar-tag when the body contains a bare `$` (here the `$1`
+parameter), so `$_$…$_$` is the PG-identical rendering — the test asserts that
+exact form.
+
+The round-trip test asserts the two-line `LANGUAGE sql` / `AS $_$ SELECT $1 + 1
+$_$;` fragment (which only matches once the spurious clause is gone) plus a
+negative guard on `SUPPORT 0`. Unit guard: `initdb.TestPgProcViewProsupport`
+(now pins type=regproc and value=`-`). Pure dump-fidelity; no catalog-schema
+change.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
