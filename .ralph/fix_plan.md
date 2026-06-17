@@ -3796,6 +3796,26 @@ object support.
         pgbench pre-commit smoke on commit. **Next:** dedicated MINVALUE/MAXVALUE keyword-AST-node
         slice (latent routing ambiguity), or multi-parent inheritance (`INHERITS (a, b)` ordering +
         shared-column merge) dump fidelity.
+      - **PROGRESS 2026-06-17 (loop #139):** **DU-002 slice 172 LANDED — clean positive
+        (verified, no fix needed).** Multi-parent legacy inheritance (`INHERITS (a, b)`) now pinned
+        as a regression guard. Slice 170 covered a single parent; the multi-parent form additionally
+        relies on: (a) the INHERITS column-merge dedup (`shared` defined in both parents kept once
+        with the "merging multiple inherited definitions" notice; `M0097-0046`), (b) the slice-170
+        marker loop iterating the FULL merged column set so every inherited column — `shared`,
+        `a_only`, `b_only` — gets `Inherited=true` (`attislocal=false`), and (c) `pg_inherits`
+        `VirtualRows` emitting one row per parent with `inhseqno=i+1` from the ordered
+        `InheritsParentOIDs`, so pg_dump re-emits `INHERITS (public.minh_a, public.minh_b)` in the
+        SAME order. Fixture `minh_a(shared,a_only)` + `minh_b(shared,b_only)` →
+        `minh_child(own_col) INHERITS (minh_a, minh_b)`; assertions: (1) ordered INHERITS clause,
+        (2) local `own_col boolean` survives, (3) `shared`/`a_only`/`b_only` NOT re-emitted in the
+        child block. Files: `internal/testport/pgdump_connsetup_test.go` (fixture + assertions),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 172). Gates: gofmt OK; `go vet
+        ./internal/testport/` clean; `TestPort_PgDumpConnectionSetup` PASS (2.56s, not skipped);
+        pgbench pre-commit smoke on commit. **Next:** dedicated MINVALUE/MAXVALUE keyword-AST-node
+        slice (latent: a text-RANGE bound literal `'MINVALUE'` and the keyword `MINVALUE` collapse
+        to the SAME `StringConst{Value:"MINVALUE"}` in the parser, so the literal misrenders as the
+        unbounded sentinel — higher-risk, touches partition routing comparison), or column-level
+        STORAGE/COMPRESSION dump fidelity (needs parser keywords).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -794,6 +794,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create leaf partition psub_east_lo: %v", err)
 	}
 
+	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
+	// only exercised a single parent; multi-parent additionally relies on (a) the
+	// column-merge dedup (a column present in both parents — `shared` — is kept
+	// once, with a "merging multiple inherited definitions" notice; M0097-0046),
+	// (b) every merged/inherited column being marked Inherited=true so pg_dump
+	// omits it (the slice-170 loop iterates all cols, so shared/minh_a-only/
+	// minh_b-only all qualify), and (c) pg_inherits emitting one row per parent in
+	// declaration order (inhseqno 1,2 from the ordered InheritsParentOIDs) so
+	// pg_dump re-emits the parents in the SAME order as the original clause. The
+	// child adds one purely-local column (`own_col`) over the two parents.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.minh_a (shared integer, a_only integer)"); err != nil {
+		t.Fatalf("create inheritance parent minh_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.minh_b (shared integer, b_only text)"); err != nil {
+		t.Fatalf("create inheritance parent minh_b: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.minh_child (own_col boolean) INHERITS (public.minh_a, public.minh_b)"); err != nil {
+		t.Fatalf("create multi-parent inheritance child minh_child: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -2152,6 +2172,35 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.psub_east_lo FOR VALUES FROM (0) TO (100)") {
 			t.Errorf("pg_dump dropped the leaf's ATTACH-to-middle bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.psub_east_lo FOR VALUES FROM (0) TO (100)", res.Stdout)
+		}
+		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
+		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged
+		// once). The same machinery slice 170 added for a single parent must, for two
+		// parents, (1) re-emit `INHERITS (public.minh_a, public.minh_b)` in declaration
+		// order (driven by pg_inherits inhseqno from the ordered InheritsParentOIDs),
+		// (2) keep the child's purely-local `own_col`, and (3) omit ALL inherited
+		// columns — including the merged `shared` — from the child's column list, since
+		// they arrive via the parents. An ordering regression would flip the parents;
+		// a merge/Inherited regression would re-emit `shared`/`a_only`/`b_only`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.minh_child (") ||
+			!strings.Contains(res.Stdout, "INHERITS (public.minh_a, public.minh_b)") {
+			t.Errorf("pg_dump dropped/reordered the multi-parent INHERITS clause; missing CREATE TABLE public.minh_child / INHERITS (public.minh_a, public.minh_b)\n  full stdout=%q", res.Stdout)
+		}
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.minh_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, "INHERITS (public.minh_a, public.minh_b)")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "own_col boolean") {
+				t.Errorf("pg_dump dropped the child's local column; want %q in minh_child block\n  block=%q", "own_col boolean", block)
+			}
+			for _, inheritedCol := range []string{"shared integer", "a_only integer", "b_only text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in minh_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

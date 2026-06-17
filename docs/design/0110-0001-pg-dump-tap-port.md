@@ -4907,6 +4907,37 @@ top, and the leaf's `ATTACH … FOR VALUES FROM (0) TO (100)` to the middle node
 sub-partitioned shape as a regression guard for the dual-identity (`relispartition` ∧
 `relkind='p'`) pg_class row.
 
+### Slice 172 — multi-parent legacy inheritance round-trip (clean positive)
+
+Slice 170 closed *single-parent* `INHERITS (parent)`. Slice 172 closes the **multi-parent**
+form `INHERITS (a, b)`, where a child draws columns from two parents at once:
+
+```sql
+CREATE TABLE public.minh_a (shared integer, a_only integer);
+CREATE TABLE public.minh_b (shared integer, b_only text);
+CREATE TABLE public.minh_child (own_col boolean) INHERITS (public.minh_a, public.minh_b);
+```
+
+This stresses three behaviors that single-parent never exercises:
+
+- **Column merge.** `shared` is defined in *both* parents. PostgreSQL merges the two definitions
+  into one inherited column (emitting `NOTICE: merging multiple inherited definitions of column
+  "shared"`). goopg's `execCreateTable` INHERITS loop already deduplicates by name and validates
+  storage-parameter agreement (`M0097-0046`), so `shared` appears once.
+- **Inherited flag across all parents.** The slice-170 marker loop iterates over the *full*
+  merged column set and sets `Inherited = true` on every column that is not locally redeclared —
+  so `shared`, `a_only`, and `b_only` all become `attislocal=false`, and pg_dump omits them.
+- **Parent ordering.** `Table.InheritsParentOIDs` is recorded in declaration order, and the
+  `pg_inherits` `VirtualRows` path emits one row per parent with `inhseqno = i+1`. pg_dump reads
+  those rows ordered by `inhseqno` and re-emits `INHERITS (public.minh_a, public.minh_b)` in the
+  *same* order as the original statement.
+
+**No fix required — verified to round-trip on the slice-170 machinery.** The TAP test asserts
+(1) the ordered `INHERITS (public.minh_a, public.minh_b)` clause is re-emitted, (2) the child's
+purely-local `own_col boolean` survives in the child's column list, and (3) none of the inherited
+columns — including the merged `shared` — are re-emitted there. An ordering regression would flip
+the two parents; a merge/`Inherited` regression would re-emit `shared`/`a_only`/`b_only`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
