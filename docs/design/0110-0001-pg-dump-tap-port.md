@@ -5179,6 +5179,43 @@ the import graph, so they cannot share code). Display-only; default evaluation a
 `span interval DEFAULT INTERVAL '1' day` column and asserts the dumped block contains
 `DEFAULT INTERVAL '1' day`.
 
+### Slice 181 — boolean-test predicate column DEFAULTs (audit closed)
+
+The same audit's last realistic batch is the boolean-test predicate family — `*IsNullExpr`
+(`x IS [NOT] NULL`), `*IsBoolExpr` (`x IS [NOT] TRUE|FALSE|UNKNOWN`), and `*IsDistinctFromExpr`
+(`x IS [NOT] DISTINCT FROM y`). Each is a valid, column-ref-free boolean expression usable as a
+DEFAULT on a `boolean` column. `validateDefaultExpr` rejects only column refs / subqueries /
+aggregate-or-SRF calls (and recurses into operator/cast/funccall operands) — every other node
+falls through to `return nil` — so all three reach `pg_attrdef.adbin` (atthasdef=true). Neither
+`catalog.formatExprForAttrdef` nor the executor twin `executor.defaultExprToSQL` had an arm for
+them, so each fell through to `fmt.Sprintf("%v", e)` — a Go pointer string that corrupts the
+dumped `DEFAULT`. Examples that were broken:
+
+```sql
+CREATE TABLE public.defcol (...,
+  nflag boolean DEFAULT (1 IS NOT NULL),        -- *IsNullExpr
+  bflag boolean DEFAULT (true IS NOT TRUE),     -- *IsBoolExpr
+  dflag boolean DEFAULT (1 IS DISTINCT FROM 2)  -- *IsDistinctFromExpr
+);
+```
+
+Fix: both renderers gain `*IsNullExpr` / `*IsBoolExpr` / `*IsDistinctFromExpr` arms that emit the
+same `IS [NOT] NULL` / `IS [NOT] TRUE|FALSE|UNKNOWN` / `IS [NOT] DISTINCT FROM` text PG's
+`pg_get_expr` produces for a `NullTest` / `BooleanTest` / `DistinctExpr` — valid, re-parseable SQL
+that round-trips to the same node. The two twins are kept in lockstep (catalog sits below executor
+in the import graph, so they cannot share code). Display-only; default evaluation and routing are
+untouched.
+
+`catalog.TestFormatExprForAttrdefExpr` gains eight cases covering both polarities of each kind plus
+the `IS FALSE`/`IS UNKNOWN` targets. The TAP `defcol` fixture gains `nflag`/`bflag`/`dflag` columns
+and asserts the dumped block contains the predicate cores `1 IS NOT NULL`, `true IS NOT TRUE`, and
+`1 IS DISTINCT FROM 2` (paren-robust — pg_dump may or may not wrap the whole default in parens).
+
+This closes the column-DEFAULT fall-through-corruption audit for every realistic node kind.
+Remaining unhandled `parser.Expr` kinds are `*CollateExpr` (collation-name quoting nuance) and
+`*InExpr` (drags in the `validateDefaultExpr` non-recursion-into-`InExpr` validation gap and the
+subquery form) — both genuinely contrived as constant column defaults and deferred.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

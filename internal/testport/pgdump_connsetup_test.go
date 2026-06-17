@@ -895,7 +895,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// const-folded value as `'1 day'::interval`; both are valid, re-parseable SQL
 	// that round-trips). The `span interval` column guards the interval-literal
 	// path end-to-end.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3], grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END, pair integer DEFAULT (1, 2), span interval DEFAULT INTERVAL '1' day)"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3], grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END, pair integer DEFAULT (1, 2), span interval DEFAULT INTERVAL '1' day, nflag boolean DEFAULT (1 IS NOT NULL), bflag boolean DEFAULT (true IS NOT TRUE), dflag boolean DEFAULT (1 IS DISTINCT FROM 2))"); err != nil {
 		t.Fatalf("create table defcol with function-call default: %v", err)
 	}
 
@@ -2375,6 +2375,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// string. Assert the interval literal survives intact.
 			if !strings.Contains(block, "DEFAULT INTERVAL '1' day") {
 				t.Errorf("pg_dump dropped/corrupted the interval-literal default; want %q in defcol block\n  block=%q", "DEFAULT INTERVAL '1' day", block)
+			}
+			// **Slice 181 (asserted):** the boolean-test predicate family closes
+			// the last realistic fall-through-corruption gap in the column-DEFAULT
+			// renderer. `nflag` carries `DEFAULT (1 IS NOT NULL)` (*IsNullExpr),
+			// `bflag` carries `DEFAULT (true IS NOT TRUE)` (*IsBoolExpr), and `dflag`
+			// carries `DEFAULT (1 IS DISTINCT FROM 2)` (*IsDistinctFromExpr).
+			// validateDefaultExpr accepts all three (it rejects only column refs /
+			// subqueries / aggregate-or-SRF calls); both renderers now emit the
+			// `IS [NOT] NULL` / `IS [NOT] TRUE|FALSE|UNKNOWN` / `IS [NOT] DISTINCT
+			// FROM` deparse PG's pg_get_expr produces for NullTest/BooleanTest/
+			// DistinctExpr. Before the fix each node fell through to
+			// fmt.Sprintf("%v", e), so the dumped DEFAULT was a corrupt Go pointer
+			// string. The predicate core is asserted (paren-robust: pg_dump may or
+			// may not wrap the whole default in parens).
+			if !strings.Contains(block, "1 IS NOT NULL") {
+				t.Errorf("pg_dump dropped/corrupted the IS NOT NULL default; want %q in defcol block\n  block=%q", "1 IS NOT NULL", block)
+			}
+			if !strings.Contains(block, "true IS NOT TRUE") {
+				t.Errorf("pg_dump dropped/corrupted the IS NOT TRUE default; want %q in defcol block\n  block=%q", "true IS NOT TRUE", block)
+			}
+			if !strings.Contains(block, "1 IS DISTINCT FROM 2") {
+				t.Errorf("pg_dump dropped/corrupted the IS DISTINCT FROM default; want %q in defcol block\n  block=%q", "1 IS DISTINCT FROM 2", block)
 			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently

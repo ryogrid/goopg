@@ -3953,6 +3953,33 @@ object support.
         deferred MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition routing); or close the
         `validateDefaultExpr` array/row/CASE/interval-element recursion gap (executor semantic change —
         needs its own gates).
+      - **PROGRESS 2026-06-17 (loop #149):** **DU-002 slice 181 LANDED — boolean-test predicate column
+        DEFAULTs round-trip; fall-through-corruption audit CLOSED.** The audit's last realistic batch is the
+        boolean-test predicate family: `*IsNullExpr` (`x IS [NOT] NULL`), `*IsBoolExpr`
+        (`x IS [NOT] TRUE|FALSE|UNKNOWN`), `*IsDistinctFromExpr` (`x IS [NOT] DISTINCT FROM y`). Each is a
+        valid column-ref-free boolean expression usable as a `boolean`-column DEFAULT. `validateDefaultExpr`
+        accepts all three (it rejects only column refs / subqueries / aggregate-or-SRF calls; every other
+        node falls through to `return nil`), so they reach `pg_attrdef.adbin`, but neither
+        `catalog.formatExprForAttrdef` nor the executor twin `executor.defaultExprToSQL` had arms → all three
+        fell through to `fmt.Sprintf("%v", e)` (a Go pointer string), corrupting the dumped DEFAULT. **Fix:**
+        both twins gain `*IsNullExpr`/`*IsBoolExpr`/`*IsDistinctFromExpr` cases emitting the same
+        `IS [NOT] NULL` / `IS [NOT] TRUE|FALSE|UNKNOWN` / `IS [NOT] DISTINCT FROM` text PG's pg_get_expr
+        produces for NullTest/BooleanTest/DistinctExpr — valid, re-parseable, round-tripping SQL. Kept in
+        lockstep (catalog below executor in the import graph). Display-only; eval/routing untouched. Files:
+        `internal/catalog/catalog.go` (+3 cases), `internal/executor/operators_ddl.go` (+3 cases, twin),
+        `internal/catalog/catalog_test.go` (8 new `TestFormatExprForAttrdefExpr` cases — both polarities +
+        FALSE/UNKNOWN targets), `internal/testport/pgdump_connsetup_test.go` (`defcol` gains
+        `nflag`/`bflag`/`dflag` boolean columns + 3 paren-robust predicate-core assertions),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 181 section). Gates: gofmt OK; `go vet
+        ./internal/catalog/ ./internal/executor/ ./internal/testport/` clean; `go build ./internal/catalog/
+        ./internal/executor/` OK; `TestFormatExprForAttrdefExpr` + executor DDL/default tests PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (3.04s, not skipped); pgbench pre-commit smoke on commit.
+        **Next:** the column-DEFAULT fall-through audit is now CLOSED for every realistic node kind
+        (`*CollateExpr` collation-quoting + `*InExpr` subquery/validation-recursion remain, both genuinely
+        contrived). Higher-value next steps: column STORAGE/COMPRESSION dump fidelity (needs parser
+        keywords); deferred MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition routing); or
+        close the `validateDefaultExpr` array/row/CASE/InExpr recursion gap (executor semantic change —
+        needs its own gates).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

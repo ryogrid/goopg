@@ -2491,6 +2491,37 @@ func defaultExprToSQL(e parser.Expr) string {
 		// interval output function, so it re-emits the native `INTERVAL '<n>' <unit>`
 		// literal form (PG's pg_get_expr would print the equivalent `'<n> <unit>'::interval`).
 		return "INTERVAL '" + strings.ReplaceAll(v.Value, "'", "''") + "' " + v.Unit
+	case *parser.IsNullExpr:
+		// `DEFAULT (1 IS NULL)`. Mirror the catalog twin
+		// (catalog.formatExprForAttrdef, DU-002 slice 181); keep the two in sync so
+		// the dump path and the proargdefaults path render identically. PG's
+		// pg_get_expr deparses a NullTest as `<operand> IS [NOT] NULL`.
+		if v.Negated {
+			return defaultExprToSQL(v.Operand) + " IS NOT NULL"
+		}
+		return defaultExprToSQL(v.Operand) + " IS NULL"
+	case *parser.IsBoolExpr:
+		// `DEFAULT (true IS NOT TRUE)`. Mirror the catalog twin (DU-002 slice 181).
+		// PG's pg_get_expr deparses a BooleanTest as `<operand> IS [NOT] TRUE|FALSE|UNKNOWN`.
+		target := "UNKNOWN"
+		if v.TestTrue {
+			target = "TRUE"
+		} else if v.TestFalse {
+			target = "FALSE"
+		}
+		op := " IS "
+		if v.Negated {
+			op = " IS NOT "
+		}
+		return defaultExprToSQL(v.Operand) + op + target
+	case *parser.IsDistinctFromExpr:
+		// `DEFAULT (1 IS DISTINCT FROM 2)`. Mirror the catalog twin (DU-002 slice 181).
+		// PG's pg_get_expr deparses a DistinctExpr as `<left> IS [NOT] DISTINCT FROM <right>`.
+		op := " IS DISTINCT FROM "
+		if v.Negated {
+			op = " IS NOT DISTINCT FROM "
+		}
+		return defaultExprToSQL(v.Left) + op + defaultExprToSQL(v.Right)
 	}
 	return fmt.Sprintf("%v", e)
 }

@@ -1248,6 +1248,56 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 			&parser.IntervalLit{Value: "90", Unit: "day"},
 			"INTERVAL '90' day",
 		},
+		{
+			// `DEFAULT (1 IS NULL)` on a boolean column parses to a *IsNullExpr
+			// (DU-002 slice 181). PG's pg_get_expr deparses a NullTest as
+			// `<operand> IS NULL`.
+			"is null",
+			&parser.IsNullExpr{Operand: &parser.IntegerConst{Value: 1}},
+			"1 IS NULL",
+		},
+		{
+			// `DEFAULT (1 IS NOT NULL)` — Negated form.
+			"is not null",
+			&parser.IsNullExpr{Operand: &parser.IntegerConst{Value: 1}, Negated: true},
+			"1 IS NOT NULL",
+		},
+		{
+			// `DEFAULT (true IS TRUE)` parses to a *IsBoolExpr (BooleanTest).
+			"is true",
+			&parser.IsBoolExpr{Operand: &parser.BooleanConst{Value: true}, TestTrue: true},
+			"true IS TRUE",
+		},
+		{
+			// `DEFAULT (true IS NOT TRUE)` — Negated form.
+			"is not true",
+			&parser.IsBoolExpr{Operand: &parser.BooleanConst{Value: true}, TestTrue: true, Negated: true},
+			"true IS NOT TRUE",
+		},
+		{
+			// IS FALSE / IS UNKNOWN render the right target keyword.
+			"is false",
+			&parser.IsBoolExpr{Operand: &parser.BooleanConst{Value: false}, TestFalse: true},
+			"false IS FALSE",
+		},
+		{
+			// Neither TestTrue nor TestFalse → UNKNOWN.
+			"is unknown",
+			&parser.IsBoolExpr{Operand: &parser.NullConst{}},
+			"NULL IS UNKNOWN",
+		},
+		{
+			// `DEFAULT (1 IS DISTINCT FROM 2)` parses to a *IsDistinctFromExpr.
+			"is distinct from",
+			&parser.IsDistinctFromExpr{Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 2}},
+			"1 IS DISTINCT FROM 2",
+		},
+		{
+			// `DEFAULT (1 IS NOT DISTINCT FROM 2)` — Negated form.
+			"is not distinct from",
+			&parser.IsDistinctFromExpr{Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 2}, Negated: true},
+			"1 IS NOT DISTINCT FROM 2",
+		},
 	}
 	for _, tc := range cases {
 		if got := formatExprForAttrdef(tc.expr); got != tc.want {

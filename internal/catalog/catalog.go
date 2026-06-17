@@ -7105,6 +7105,43 @@ func formatExprForAttrdef(e parser.Expr) string {
 		// proargdefaults twin) so the dump path and the runtime path render
 		// identically.
 		return "INTERVAL '" + strings.ReplaceAll(v.Value, "'", "''") + "' " + v.Unit
+	case *parser.IsNullExpr:
+		// `DEFAULT (1 IS NULL)` on a boolean column. validateDefaultExpr rejects
+		// only column refs / subqueries / aggregate-or-SRF calls and accepts every
+		// other node, so the parsed *IsNullExpr reaches pg_attrdef.adbin
+		// (atthasdef=true). Without this case it fell through to fmt.Sprintf("%v", e)
+		// — a Go pointer string — corrupting the DEFAULT clause pg_dump re-emits
+		// (DU-002 slice 181). Render `<operand> IS [NOT] NULL`, matching PG's
+		// pg_get_expr deparse of a NullTest; mirror executor.defaultExprToSQL (the
+		// proargdefaults twin) so the dump path and the runtime path agree.
+		if v.Negated {
+			return formatExprForAttrdef(v.Operand) + " IS NOT NULL"
+		}
+		return formatExprForAttrdef(v.Operand) + " IS NULL"
+	case *parser.IsBoolExpr:
+		// `DEFAULT (true IS NOT TRUE)`. Render `<operand> IS [NOT] TRUE|FALSE|UNKNOWN`,
+		// matching PG's pg_get_expr deparse of a BooleanTest; mirror the executor twin
+		// (DU-002 slice 181).
+		target := "UNKNOWN"
+		if v.TestTrue {
+			target = "TRUE"
+		} else if v.TestFalse {
+			target = "FALSE"
+		}
+		op := " IS "
+		if v.Negated {
+			op = " IS NOT "
+		}
+		return formatExprForAttrdef(v.Operand) + op + target
+	case *parser.IsDistinctFromExpr:
+		// `DEFAULT (1 IS DISTINCT FROM 2)`. Render `<left> IS [NOT] DISTINCT FROM
+		// <right>`, matching PG's pg_get_expr deparse of a DistinctExpr; mirror the
+		// executor twin (DU-002 slice 181).
+		op := " IS DISTINCT FROM "
+		if v.Negated {
+			op = " IS NOT DISTINCT FROM "
+		}
+		return formatExprForAttrdef(v.Left) + op + formatExprForAttrdef(v.Right)
 	}
 	return fmt.Sprintf("%v", e)
 }
