@@ -7042,6 +7042,36 @@ func formatExprForAttrdef(e parser.Expr) string {
 			elems = append(elems, formatExprForAttrdef(el))
 		}
 		return "ARRAY[" + strings.Join(elems, ", ") + "]"
+	case *parser.CaseExpr:
+		// `DEFAULT CASE WHEN true THEN 1 ELSE 0 END` (searched form) and
+		// `DEFAULT CASE 1 WHEN 1 THEN 'x' ELSE 'y' END` (simple form).
+		// validateDefaultExpr rejects only column refs / subqueries /
+		// aggregate-or-SRF calls and accepts every other node, so the parsed
+		// *CaseExpr reaches pg_attrdef.adbin (atthasdef=true). Without this case
+		// it fell through to fmt.Sprintf("%v") — a Go pointer string — corrupting
+		// the DEFAULT clause pg_dump re-emits (DU-002 slice 178). PG's pg_get_expr
+		// pretty-prints CASE across multiple lines; a single-line render is valid,
+		// re-parseable SQL that round-trips to the same node. Mirror
+		// executor.defaultExprToSQL (the proargdefaults twin) so the dump path and
+		// the runtime path agree.
+		var b strings.Builder
+		b.WriteString("CASE")
+		if v.Operand != nil {
+			b.WriteString(" ")
+			b.WriteString(formatExprForAttrdef(v.Operand))
+		}
+		for _, w := range v.Whens {
+			b.WriteString(" WHEN ")
+			b.WriteString(formatExprForAttrdef(w.When))
+			b.WriteString(" THEN ")
+			b.WriteString(formatExprForAttrdef(w.Then))
+		}
+		if v.Else != nil {
+			b.WriteString(" ELSE ")
+			b.WriteString(formatExprForAttrdef(v.Else))
+		}
+		b.WriteString(" END")
+		return b.String()
 	}
 	return fmt.Sprintf("%v", e)
 }

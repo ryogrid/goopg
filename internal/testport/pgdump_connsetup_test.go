@@ -864,7 +864,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// pointer string — corrupting the dumped DEFAULT. Both twins now render
 	// `ARRAY[1, 2, 3]`. The `vals integer[]` column guards the array-constructor
 	// path end-to-end.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3])"); err != nil {
+	//
+	// Slice 178: a column DEFAULT that is a CASE expression (`DEFAULT CASE WHEN
+	// true THEN 1 ELSE 0 END`) must round-trip. validateDefaultExpr accepts a
+	// parsed *CaseExpr (it rejects only column refs, subqueries and aggregate/SRF
+	// calls), so the node reaches pg_attrdef.adbin. Before this slice neither
+	// renderer (catalog.formatExprForAttrdef nor executor.defaultExprToSQL) had a
+	// *CaseExpr arm, so it fell through to fmt.Sprintf("%v", e) — a Go pointer
+	// string — corrupting the dumped DEFAULT. Both twins now render the single-line
+	// `CASE WHEN true THEN 1 ELSE 0 END` form (valid, re-parseable SQL; PG's
+	// pg_get_expr pretty-prints across lines but the dump round-trips either way).
+	// The `grade integer` column guards the CASE-expression path end-to-end.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3], grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END)"); err != nil {
 		t.Fatalf("create table defcol with function-call default: %v", err)
 	}
 
@@ -2317,6 +2328,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// DEFAULT was a corrupt Go pointer string. Assert the array survives intact.
 			if !strings.Contains(block, "DEFAULT ARRAY[1, 2, 3]") {
 				t.Errorf("pg_dump dropped/corrupted the array-constructor default; want %q in defcol block\n  block=%q", "DEFAULT ARRAY[1, 2, 3]", block)
+			}
+			// **Slice 178 (asserted):** a CASE-expression default. The `grade`
+			// column carries `DEFAULT CASE WHEN true THEN 1 ELSE 0 END`.
+			// validateDefaultExpr accepts a *CaseExpr; both renderers now emit the
+			// single-line CASE form. Before the fix the node fell through to
+			// fmt.Sprintf("%v", e), so the dumped DEFAULT was a corrupt Go pointer
+			// string. Assert the CASE survives intact.
+			if !strings.Contains(block, "DEFAULT CASE WHEN true THEN 1 ELSE 0 END") {
+				t.Errorf("pg_dump dropped/corrupted the case-expression default; want %q in defcol block\n  block=%q", "DEFAULT CASE WHEN true THEN 1 ELSE 0 END", block)
 			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently

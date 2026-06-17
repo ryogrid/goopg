@@ -1184,6 +1184,37 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 			&parser.ArrayConstructorExpr{},
 			"ARRAY[]",
 		},
+		{
+			// `DEFAULT CASE WHEN true THEN 1 ELSE 0 END` searched form (DU-002 slice 178).
+			"case searched",
+			&parser.CaseExpr{
+				Whens: []parser.CaseWhen{{When: &parser.BooleanConst{Value: true}, Then: &parser.IntegerConst{Value: 1}}},
+				Else:  &parser.IntegerConst{Value: 0},
+			},
+			"CASE WHEN true THEN 1 ELSE 0 END",
+		},
+		{
+			// `DEFAULT CASE 1 WHEN 1 THEN 'x' ELSE 'y' END` simple form: the operand
+			// renders right after CASE, before the first WHEN.
+			"case simple",
+			&parser.CaseExpr{
+				Operand: &parser.IntegerConst{Value: 1},
+				Whens:   []parser.CaseWhen{{When: &parser.IntegerConst{Value: 1}, Then: &parser.StringConst{Value: "x"}}},
+				Else:    &parser.StringConst{Value: "y"},
+			},
+			"CASE 1 WHEN 1 THEN 'x' ELSE 'y' END",
+		},
+		{
+			// ELSE-less searched CASE renders no ELSE clause and multiple WHEN arms.
+			"case no else multi when",
+			&parser.CaseExpr{
+				Whens: []parser.CaseWhen{
+					{When: &parser.BooleanConst{Value: true}, Then: &parser.IntegerConst{Value: 1}},
+					{When: &parser.BooleanConst{Value: false}, Then: &parser.IntegerConst{Value: 2}},
+				},
+			},
+			"CASE WHEN true THEN 1 WHEN false THEN 2 END",
+		},
 	}
 	for _, tc := range cases {
 		if got := formatExprForAttrdef(tc.expr); got != tc.want {

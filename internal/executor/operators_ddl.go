@@ -2452,6 +2452,28 @@ func defaultExprToSQL(e parser.Expr) string {
 			elems = append(elems, defaultExprToSQL(el))
 		}
 		return "ARRAY[" + strings.Join(elems, ", ") + "]"
+	case *parser.CaseExpr:
+		// `DEFAULT CASE WHEN true THEN 1 ELSE 0 END`. Mirror the catalog twin
+		// (catalog.formatExprForAttrdef, DU-002 slice 178); keep the two in sync so
+		// the dump path and the proargdefaults path render identically.
+		var b strings.Builder
+		b.WriteString("CASE")
+		if v.Operand != nil {
+			b.WriteString(" ")
+			b.WriteString(defaultExprToSQL(v.Operand))
+		}
+		for _, w := range v.Whens {
+			b.WriteString(" WHEN ")
+			b.WriteString(defaultExprToSQL(w.When))
+			b.WriteString(" THEN ")
+			b.WriteString(defaultExprToSQL(w.Then))
+		}
+		if v.Else != nil {
+			b.WriteString(" ELSE ")
+			b.WriteString(defaultExprToSQL(v.Else))
+		}
+		b.WriteString(" END")
+		return b.String()
 	}
 	return fmt.Sprintf("%v", e)
 }

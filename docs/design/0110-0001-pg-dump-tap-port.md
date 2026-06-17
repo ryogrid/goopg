@@ -5090,6 +5090,36 @@ DEFAULT validator) — a pre-existing validation gap, out of scope for this disp
 `vals integer[] DEFAULT ARRAY[1, 2, 3]` column and asserts the dumped block contains
 `DEFAULT ARRAY[1, 2, 3]`.
 
+### Slice 178 — CASE-expression column DEFAULT (sibling-path divergence closed)
+
+Continuing the same audit (which node kinds does `validateDefaultExpr` accept yet neither renderer
+handles?), the next live gap is `*CaseExpr`. `validateDefaultExpr` accepts a CASE node (it falls
+through to `return nil`), so both the searched form `DEFAULT CASE WHEN true THEN 1 ELSE 0 END` and the
+simple form `DEFAULT CASE 1 WHEN 1 THEN 'x' ELSE 'y' END` reach `pg_attrdef.adbin`. Neither
+`catalog.formatExprForAttrdef` nor the executor twin `executor.defaultExprToSQL` had a `*CaseExpr` arm,
+so the node fell through to `fmt.Sprintf("%v", e)` — a Go pointer string that corrupts the dumped
+`DEFAULT`. Example that was broken:
+
+```sql
+CREATE TABLE public.defcol (..., grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END);  -- *CaseExpr
+```
+
+Fix: both renderers gain a `*CaseExpr` case that renders the single-line form
+`CASE [operand] WHEN c THEN r [WHEN …] [ELSE e] END`, recursively rendering the operand, each
+WHEN/THEN arm and the optional ELSE through the same switch. PG's `pg_get_expr` pretty-prints CASE
+across multiple indented lines, but a single-line render is valid, re-parseable SQL that round-trips to
+the same node — `pg_dump`'s restore re-parses it identically. The two twins are kept in lockstep
+(catalog sits below executor in the import graph, so they cannot share code). Display-only; default
+evaluation and routing are untouched. Note: `validateDefaultExpr` still does not *recurse* into the
+CASE arms (a column ref inside a WHEN/THEN would slip past the DEFAULT validator — PG itself rejects
+those at parse time) — the same pre-existing validation gap noted for array elements, out of scope for
+this display-path slice.
+
+`catalog.TestFormatExprForAttrdefExpr` gains `case searched` (`CASE WHEN true THEN 1 ELSE 0 END`),
+`case simple` (`CASE 1 WHEN 1 THEN 'x' ELSE 'y' END`) and `case no else multi when` cases. The TAP
+`defcol` fixture gains a `grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END` column and asserts
+the dumped block contains `DEFAULT CASE WHEN true THEN 1 ELSE 0 END`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
