@@ -8398,6 +8398,7 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 	const (
 		oidPgClass        = 1259 // pg_class: tables, indexes, views, sequences, matviews
 		oidPgType         = 1247 // pg_type: user types (enum) and domains
+		oidPgProc         = 1255 // pg_proc: functions and procedures
 		oidPgConstraint   = 2606 // pg_constraint
 		oidPgNamespace    = 2615 // pg_namespace: schemas
 		oidPgStatisticExt = 3381 // pg_statistic_ext
@@ -8501,6 +8502,25 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 			return nil
 		}
 		im.SetComment(oidPgStatisticExt, stat.OID, 0, s.Description)
+	case "function":
+		// Functions live in pg_proc (classoid 1255). Resolve the routine by
+		// name + argument signature (mirrors DROP FUNCTION's resolution) so the
+		// correct overload is keyed. Without this a COMMENT ON FUNCTION was
+		// silently swallowed and never reached pg_description, so pg_dump could
+		// not re-emit it. DU-002 slice 147.
+		rs := im.Routines()
+		if rs == nil {
+			return nil
+		}
+		argTypes := make([]catalog.Type, len(s.Args))
+		for i, a := range s.Args {
+			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+		}
+		r, ok := rs.Lookup(s.ObjName, argTypes)
+		if !ok || r == nil {
+			return nil
+		}
+		im.SetComment(oidPgProc, r.OID, 0, s.Description)
 	}
 	return nil
 }

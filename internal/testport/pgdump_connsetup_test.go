@@ -1481,6 +1481,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table dom: %v", err)
 	}
 
+	// Slice 147: a user function so COMMENT ON FUNCTION has a real pg_proc target
+	// the dump re-emits. pg_dump deparses the signature via
+	// pg_get_function_identity_arguments → `public.add_one(integer)`.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.add_one(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 + 1 $$"); err != nil {
+		t.Fatalf("create function add_one: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -1508,6 +1515,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"COMMENT ON MATERIALIZED VIEW public.foo_mv IS 'a matview comment'",
 		"COMMENT ON TYPE public.mood IS 'a type comment'",
 		"COMMENT ON DOMAIN public.zipcode IS 'a domain comment'",
+		// Slice 147: COMMENT ON FUNCTION must also survive the dump. Before this
+		// slice, parseCommentOnTail had no FUNCTION branch, so the server silently
+		// swallowed it and the comment never reached pg_description. The parser now
+		// recognises FUNCTION + its argument signature, and execCommentOn resolves
+		// the routine OID (Routines().Lookup) and keys it under pg_proc (1255).
+		"COMMENT ON FUNCTION public.add_one(integer) IS 'a function comment'",
 	}
 	for _, sql := range miscComments {
 		if err := runSQLSimple(t, c, sql); err != nil {
@@ -1855,6 +1868,11 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"COMMENT ON MATERIALIZED VIEW public.foo_mv IS 'a matview comment';",
 			"COMMENT ON TYPE public.mood IS 'a type comment';",
 			"COMMENT ON DOMAIN public.zipcode IS 'a domain comment';",
+			// **Slice 147 (asserted):** COMMENT ON FUNCTION must round-trip. It was
+			// silently swallowed (parser had no FUNCTION branch). pg_dump deparses
+			// the signature via pg_get_function_identity_arguments and emits the
+			// comment keyed off pg_description (classoid=pg_proc).
+			"COMMENT ON FUNCTION public.add_one(integer) IS 'a function comment';",
 		}
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {

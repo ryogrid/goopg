@@ -3152,6 +3152,44 @@ object support.
         a fresh pg_dump catalog-surface gap (e.g. `COMMENT ON {FUNCTION,
         COLLATION, EXTENSION}` round-trip), or the deferred-check execution
         spike.
+      - **PROGRESS 2026-06-17 (loop #112):** **DU-002 slice 147 LANDED** —
+        `COMMENT ON FUNCTION` now round-trips through pg_dump. **Two coupled
+        bugs:** (1) `parseCommentOnTail` (`internal/parser/parser.go`) had no
+        FUNCTION branch, so `COMMENT ON FUNCTION …` fell through to the
+        unsupported `default` branch and the server silently swallowed it; (2)
+        **the load-bearing one** — even after the comment was stored under
+        classoid=pg_proc (1255), pg_dump dropped it. `collectComments` matches a
+        `pg_description` row to a dumpable object via
+        `findObjectByCatalogId({classoid, objoid})`, and `getFuncs` records each
+        function's `catId.tableoid` from `pg_proc.tableoid`. goopg's `pg_proc` is
+        a **virtual** view whose `Table` struct never set `OID`, so its
+        `tableoid` resolved to 0 (`resolveTableoidForBinding` returns
+        `b.table.OID`); 1255 ≠ 0 → no match → comment discarded (TYPE/DOMAIN
+        worked in slice 146 only because `pg_type` is heap-backed with OID=1247).
+        **The fix:** (1) parser gains a `KwFunction` branch reading
+        `parseObjectName` + `parseFunctionArgList` into new `CommentOnStmt.Args`;
+        (2) `execCommentOn` (`internal/executor/operators_ddl.go`) gains a
+        `function` case resolving the routine via `Routines().Lookup` and keying
+        the row under classoid=pg_proc (1255); (3) `registerPgProcView`
+        (`internal/initdb/pg_proc_view.go`) sets `OID: catalog.ProcedureRelationId`
+        (new constant 1255) so `pg_proc.tableoid` resolves correctly — also a
+        latent fix for any tool joining/filtering pg_proc by tableoid. No
+        catalog-schema change. **Scope:** pure dump-fidelity. Tests:
+        `TestPort_PgDumpConnectionSetup` creates `public.add_one(integer)` +
+        comment and asserts `COMMENT ON FUNCTION public.add_one(integer) IS '…';`
+        reappears verbatim (real pg_dump 18.3); new unit guard
+        `executor.TestCommentOnFunctionStoresPgProcDescription`. Files:
+        `internal/parser/ast.go`, `internal/parser/parser.go`,
+        `internal/executor/operators_ddl.go`,
+        `internal/executor/comment_on_function_test.go`,
+        `internal/catalog/catalog.go`, `internal/initdb/pg_proc_view.go`,
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK;
+        `go build ./...` OK; parser/catalog/initdb/executor suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (2.49s); pgbench pre-commit smoke
+        on commit. **Next: slice 148** — a fresh pg_dump catalog-surface gap
+        (e.g. `COMMENT ON {COLLATION, EXTENSION, AGGREGATE}` round-trip), or the
+        deferred-check execution spike.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

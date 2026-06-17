@@ -4013,6 +4013,51 @@ pg_dump 18.3: `COMMENT ON MATERIALIZED VIEW public.foo_mv IS '…';`,
 `COMMENT ON TYPE public.mood IS '…';`, and
 `COMMENT ON DOMAIN public.zipcode IS '…';`. Pure dump-fidelity.
 
+### Slice 147 — `COMMENT ON FUNCTION` round-trip
+
+Slices 144–146 covered the relation/schema/type comment kinds. This slice closes
+the last common `COMMENT ON` kind pg_dump re-emits for a user object goopg both
+creates and dumps: a user function in `pg_proc`. The fixture now creates
+`public.add_one(integer)` (a `LANGUAGE sql` function) and comments it.
+
+**Two coupled bugs:**
+
+1. **Parser:** `parseCommentOnTail` had no `FUNCTION` branch, so
+   `COMMENT ON FUNCTION …` fell through to the unsupported `default` branch and
+   the server silently swallowed it — the description never reached
+   `pg_description`.
+2. **`tableoid` mismatch (the load-bearing one):** even after the parser stored
+   the comment under classoid=`pg_proc` (1255), pg_dump still dropped it.
+   `collectComments` matches each `pg_description` row to a dumpable object via
+   `findObjectByCatalogId({classoid, objoid})`, and `getFuncs` records a
+   function's `catId.tableoid` from `pg_proc.tableoid`. goopg's `pg_proc` is a
+   **virtual** view whose `Table` struct never set `OID`, so its `tableoid`
+   system column resolved to 0 (`resolveTableoidForBinding` returns
+   `b.table.OID`). The comment's classoid (1255) could never equal the function's
+   recorded tableoid (0), so the match failed and the comment was discarded —
+   even though it was present in `pg_description`. (The `TYPE`/`DOMAIN` comments
+   in slice 146 worked because `pg_type` is heap-backed with `OID=1247`.)
+
+**The fix:**
+
+1. `parseCommentOnTail` gains a `KwFunction` branch (FUNCTION *is* a lexer
+   keyword) that reads `parseObjectName` + `parseFunctionArgList` (the same helper
+   DROP FUNCTION uses) into a new `CommentOnStmt.Args []FunctionArg`. The argument
+   list is required to disambiguate overloads.
+2. `execCommentOn` gains a `function` case: it converts `s.Args` to
+   `[]catalog.Type`, resolves the routine via `Routines().Lookup` (mirrors DROP
+   FUNCTION's resolution), and keys the row under classoid=`pg_proc` (1255).
+3. `registerPgProcView` now sets `OID: catalog.ProcedureRelationId` (new constant,
+   1255) on the virtual `pg_proc` table so its `tableoid` resolves correctly —
+   the fix that actually makes the comment round-trip, and a latent correctness
+   fix for any tool that joins/filters `pg_proc` by `tableoid`.
+
+The round-trip test adds the function + comment and asserts
+`COMMENT ON FUNCTION public.add_one(integer) IS '…';` reappears verbatim
+(pg_dump deparses the signature via `pg_get_function_identity_arguments`).
+Guards: `executor.TestCommentOnFunctionStoresPgProcDescription`. Pure
+dump-fidelity; no catalog-schema change.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

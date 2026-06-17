@@ -1,31 +1,32 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 146 (loop #111) — COMMENT ON {MATERIALIZED VIEW,TYPE,
-DOMAIN} now round-trips through pg_dump. parseCommentOnTail had no branch for
-these kinds, so each fell through to the unsupported default branch and the
-server's COMMENT fallback silently swallowed them (nothing reached
-pg_description → pg_dump re-emitted nothing). Fix: (1) parser
-parseCommentOnTail (internal/parser/parser.go) gains three acceptIdentKeyword
-branches — `materialized` (+ optional VIEW), `type`, `domain` (none is a lexer
-keyword); (2) execCommentOn (internal/executor/operators_ddl.go ~L8404) folds
-`materialized view` into the table/view/sequence case (matview is a pg_class
-relation, classoid 1259, shared LookupTable path — pg_dump picks MATERIALIZED
-VIEW from relkind='m') and adds `type`/`domain` cases → im.LookupEnum /
-im.LookupDomain, keyed under classoid=pg_type (1247); pg_dump picks TYPE vs
-DOMAIN from typtype. No catalog-schema change.
-Key symbols: parser.parseCommentOnTail, ddlOp.execCommentOn,
-InMemory.LookupTable, InMemory.LookupEnum, InMemory.LookupDomain,
-InMemory.SetComment.
-Files: internal/parser/parser.go, internal/executor/operators_ddl.go,
-internal/testport/pgdump_connsetup_test.go,
-docs/design/0110-0001-pg-dump-tap-port.md, .ralph/fix_plan.md.
-Verified: gofmt/build/vet OK; parser+catalog+executor suites PASS;
-TestPort_PgDumpConnectionSetup PASS (2.84s, 3 new asserts: foo_mv MATERIALIZED
-VIEW, mood TYPE, zipcode DOMAIN — verified vs real pg_dump 18.3).
-Committed + pushed.
+Last landed: DU-002 slice 147 (loop #112) — COMMENT ON FUNCTION now round-trips
+through pg_dump. TWO coupled bugs: (1) parseCommentOnTail had no FUNCTION branch
+(silently swallowed); (2) the load-bearing one — pg_proc is a virtual view whose
+Table struct never set OID, so its `tableoid` system column resolved to 0
+(resolveTableoidForBinding returns b.table.OID). pg_dump's collectComments matches
+a pg_description row to a dumpable object by {classoid, objoid} where the function's
+catId.tableoid comes from pg_proc.tableoid; 1255 ≠ 0 → comment discarded even though
+it was in pg_description. TYPE/DOMAIN worked (slice 146) only because pg_type is
+heap-backed with OID=1247.
+Fix: (1) parser KwFunction branch → parseObjectName + parseFunctionArgList into new
+CommentOnStmt.Args; (2) execCommentOn `function` case resolves routine via
+Routines().Lookup, keys row under pg_proc (1255); (3) registerPgProcView sets
+OID: catalog.ProcedureRelationId (new const 1255).
+Key symbols: parser.parseCommentOnTail, CommentOnStmt.Args, ddlOp.execCommentOn,
+catalog.Routines.Lookup, registerPgProcView, catalog.ProcedureRelationId,
+resolveTableoidForBinding.
+Files: internal/parser/ast.go, internal/parser/parser.go,
+internal/executor/operators_ddl.go, internal/executor/comment_on_function_test.go,
+internal/catalog/catalog.go, internal/initdb/pg_proc_view.go,
+internal/testport/pgdump_connsetup_test.go, docs/design/0110-0001-pg-dump-tap-port.md.
+Verified: gofmt/build OK; parser+catalog+initdb+executor suites PASS;
+TestCommentOnFunctionStoresPgProcDescription PASS;
+TestPort_PgDumpConnectionSetup PASS (2.49s). Committed + pushed.
 
-Next direction (slice 147): a fresh pg_dump catalog-surface gap. Candidates:
-COMMENT ON {FUNCTION, COLLATION, EXTENSION} round-trip (none handled by
-parseCommentOnTail yet). Or the deferred-check EXECUTION spike (validate at
-COMMIT, not per-row) — a larger txn-machinery milestone, separate from
-dump-fidelity.
+Next direction (slice 148): a fresh pg_dump catalog-surface gap. Candidates:
+COMMENT ON {COLLATION, EXTENSION, AGGREGATE} round-trip (none handled by
+parseCommentOnTail; check each object is actually dumped by goopg pg_dump first —
+the slice-147 lesson: a virtual catalog view must set its Table.OID or tableoid
+resolves to 0 and pg_dump comment-matching silently drops the comment). Or the
+deferred-check EXECUTION spike (validate at COMMIT, not per-row).

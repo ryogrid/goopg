@@ -2073,6 +2073,23 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptKeyword(KwFunction):
+		// COMMENT ON FUNCTION [schema.]name([argtypes]) IS '...'. Functions live
+		// in pg_proc (classoid 1255); pg_dump re-emits `COMMENT ON FUNCTION …`
+		// with the full identity-argument signature. The argument list is
+		// required to disambiguate overloads — parse it with the same helper
+		// DROP FUNCTION uses. DU-002 slice 147.
+		cs.ObjKind = "function"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+		args, err := p.parseFunctionArgList()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.Args = args
 	default:
 		return nil, false, nil
 	}

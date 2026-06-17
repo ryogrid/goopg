@@ -242,6 +242,12 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "proparallel", Type: catalog.Type{Name: "char"}},
 			{Name: "prosupport", Type: catalog.Type{Name: "oid"}},
 		},
+		// The fixed pg_proc relation OID (1255). Without it the table's `tableoid`
+		// system column resolves to 0, so pg_dump's getFuncs records each
+		// function's catalogId.tableoid as 0 and cannot match the
+		// pg_description.classoid=1255 rows that COMMENT ON FUNCTION writes — the
+		// function comment is silently dropped from the dump. DU-002 slice 147.
+		OID:     catalog.ProcedureRelationId,
 		Virtual: true,
 	}
 	tbl.VirtualRows = func() [][]string {

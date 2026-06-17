@@ -1539,10 +1539,11 @@ func (s *CompatNoopStmt) stmtNode() {}
 // M0097-0023; VIEW/SEQUENCE/SCHEMA added in DU-002 slice 145.
 type CommentOnStmt struct {
 	pos         int
-	ObjKind     string     // "table", "index", "column", "constraint", "statistics", "view", "sequence", "schema"
-	ObjName     ObjectName // table/index name, or table for constraint/column
-	SubName     string     // column name (ObjKind=column) or constraint name (ObjKind=constraint)
-	Description string     // comment text; empty string = IS NULL (delete comment)
+	ObjKind     string        // "table", "index", "column", "constraint", "statistics", "view", "sequence", "schema", "function"
+	ObjName     ObjectName    // table/index name, or table for constraint/column, or routine name for function
+	SubName     string        // column name (ObjKind=column) or constraint name (ObjKind=constraint)
+	Args        []FunctionArg // routine argument signature (ObjKind=function); nil for all other kinds
+	Description string        // comment text; empty string = IS NULL (delete comment)
 }
 
 func (s *CommentOnStmt) Pos() int  { return s.pos }
