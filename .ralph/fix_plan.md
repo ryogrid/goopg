@@ -3730,6 +3730,31 @@ object support.
         **Next: slice 169** — RANGE-on-text bounds have the SAME raw-vs-literal bug (FromValues/
         ToValues stored unquoted); also table inheritance (`INHERITS`), multi-level partition
         trees, or column-level `STORAGE`/`COMPRESSION` (needs parser keywords).
+      - **PROGRESS 2026-06-17 (loop #136):** **DU-002 slice 169 LANDED — real
+        divergence fixed.** RANGE partition bounds now round-trip. `FormatPartitionBound`'s RANGE
+        branch reused the raw `FromValues`/`ToValues` (stored via `exprToString`), so a **text**
+        RANGE bound dumped the restore-breaking `FOR VALUES FROM (a) TO (m)` instead of
+        `FROM ('a') TO ('m')`. Worse, the parser encodes the MINVALUE/MAXVALUE keywords as a
+        sentinel `StringConst{Value:"MINVALUE"|"MAXVALUE"}`, so the generic literal renderer quoted
+        it (`'MINVALUE'`) — restoring as a *text bound*, not an unbounded edge (silent semantic
+        corruption). **Fix (same shape as slice 168):** `PartitionBound` gains parallel
+        `From/ToValueLiterals []string`, captured at creation by a new `rangeBoundLiterals` helper;
+        the per-element `rangeBoundExprToSQLLiteral` delegates to `boundExprToSQLLiteral` for
+        constants but emits the bare keyword for the MINVALUE/MAXVALUE sentinels. FormatPartitionBound
+        prefers the literals (falls back to raw `FromValues`/`ToValues` — integer bounds render the
+        same). Both RANGE creation sites populate them; routing untouched. Files:
+        `internal/catalog/catalog.go` (fields + FormatPartitionBound RANGE branch),
+        `internal/executor/operators_ddl_partition.go` (`rangeBoundExprToSQLLiteral` +
+        `rangeBoundLiterals`), `internal/executor/operators_ddl.go` (2 sites),
+        `internal/catalog/catalog_test.go` (RANGE cases), `internal/testport/pgdump_connsetup_test.go`
+        (`prange`/`prange_am FROM (MINVALUE) TO ('m')` fixture + assertions),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 169 section). Gates: gofmt OK;
+        `go build ./internal/...` OK; `go vet ./internal/testport/` clean;
+        `TestFormatPartitionBoundListLiterals` PASS; `TestPort_PgDumpConnectionSetup` PASS (2.64s);
+        catalog + full executor suites PASS; pgbench pre-commit smoke on commit. **Next:** a
+        dedicated MINVALUE keyword-AST-node slice (parser collapses keyword vs literal `'MINVALUE'`,
+        affecting routing too — latent), or table inheritance (`INHERITS`) / multi-level partition
+        tree dump fidelity.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

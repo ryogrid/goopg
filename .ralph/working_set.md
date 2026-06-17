@@ -1,41 +1,40 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 168 (loop #135) — LIST + HASH partition bounds now
-round-trip through pg_dump. REAL DIVERGENCE FIXED.
+Last landed: DU-002 slice 169 (loop #136) — RANGE partition bounds now
+round-trip through pg_dump. REAL DIVERGENCE FIXED (text quoting + MINVALUE
+semantic corruption).
 
-Root cause: a partition's bound values are stored via exprToString (the RAW
-unquoted form — 'a'→a), which is correct/required for value routing
-(FindPartitionForValue compares row keys against pb.InValues verbatim). But
-FormatPartitionBound reused those raw strings for relpartbound, so a TEXT LIST
-partition dumped the restore-breaking `FOR VALUES IN (a, b)` instead of
-`FOR VALUES IN ('a', 'b')`. The raw strings can't be re-quoted at format time
-(catalog no longer knows the column type: is "1" int 1 or text '1'?).
+Root cause: FormatPartitionBound's RANGE branch rendered the raw
+FromValues/ToValues (stored via exprToString, needed for routing), so a TEXT
+RANGE bound dumped restore-breaking `FROM (a) TO (m)` not `FROM ('a') TO ('m')`.
+Worse: the parser encodes MINVALUE/MAXVALUE as a sentinel
+StringConst{Value:"MINVALUE"|"MAXVALUE"}; the generic literal renderer quoted it
+('MINVALUE') → restores as a TEXT bound, not an unbounded edge (silent semantic
+corruption, not just invalid SQL).
 
-Fix (catalog-metadata + capture-at-creation, zero routing risk):
-PartitionBound gains a parallel InValueLiterals []string holding the SQL-literal
-rendering, captured at partition-creation time from the bound's parser.Expr via
-the existing boundExprToSQLLiteral (quotes/escapes strings, passes ints through).
-Both LIST creation sites populate it (execCreatePartitionChild + ATTACH PARTITION
-path). FormatPartitionBound prefers InValueLiterals, falls back to InValues when
-absent (int keys render the same) → fixes both sibling consumers
-(buildUserPGClassRow heap row + catalog.go VirtualRows) at once. HASH already
-correct; locked by fixture.
+Fix (same shape as slice 168, zero routing risk): PartitionBound gains parallel
+From/ToValueLiterals []string captured at creation by rangeBoundLiterals. The
+per-element rangeBoundExprToSQLLiteral delegates to boundExprToSQLLiteral for
+constants (quotes strings, passes ints) but emits the BARE keyword for the
+MINVALUE/MAXVALUE sentinel StringConsts. Helper returns nil for the whole tuple
+if any element can't render, so FormatPartitionBound falls back to raw
+FromValues/ToValues. Both RANGE creation sites populate it (execCreatePartitionChild
++ ATTACH path). Routing untouched (still compares raw FromValues/ToValues).
 
-Files: internal/catalog/catalog.go (InValueLiterals field + FormatPartitionBound
-+ TestFormatPartitionBoundListLiterals), internal/executor/operators_ddl.go
-(2 sites populate InValueLiterals), internal/testport/pgdump_connsetup_test.go
-(LIST plist/plist_ab + HASH phash/phash_0 fixtures + quoted-bound assertions),
-docs/design/0110-0001-pg-dump-tap-port.md (slice 168), .ralph/fix_plan.md (#135),
-.ralph/deferral_ledger.md (RANGE-on-text follow-up).
+Files: internal/catalog/catalog.go (From/ToValueLiterals fields +
+FormatPartitionBound RANGE branch + RANGE test cases in catalog_test.go),
+internal/executor/operators_ddl_partition.go (rangeBoundExprToSQLLiteral +
+rangeBoundLiterals), internal/executor/operators_ddl.go (2 sites),
+internal/testport/pgdump_connsetup_test.go (prange/prange_am FROM (MINVALUE) TO
+('m') fixture + assertions), docs/design/0110-0001-pg-dump-tap-port.md (slice
+169), .ralph/fix_plan.md (#136), .ralph/deferral_ledger.md (keyword-node + INHERITS).
 Gates: gofmt OK; go build ./internal/... OK; go vet ./internal/testport/ clean;
 TestFormatPartitionBoundListLiterals PASS; TestPort_PgDumpConnectionSetup PASS
-(2.78s, not skipped); catalog + full executor suites PASS; pgbench pre-commit
+(2.64s, not skipped); catalog + full executor suites PASS; pgbench pre-commit
 smoke on commit.
 
-Next (slice 169): RANGE-on-text bounds have the SAME raw-vs-literal bug
-(FromValues/ToValues stored unquoted via exprToString) — a FOR VALUES FROM ('a')
-TO ('m') partition dumps invalid FROM (a) TO (m). Add FromValueLiterals/
-ToValueLiterals captured from poc.FromValues/ToValues parser.Exprs, render in
-FormatPartitionBound's RANGE branch, add a text-keyed RANGE fixture. See ledger.
-Other directions: table inheritance (INHERITS), multi-level partition trees,
-column-level STORAGE/COMPRESSION (needs parser keywords).
+Next (slice 170 candidates): (1) dedicated MINVALUE/MAXVALUE keyword AST node —
+parser collapses keyword `MINVALUE` and literal `'MINVALUE'` to the same
+StringConst, affecting routing too (latent correctness, pathologically rare).
+(2) table inheritance (INHERITS) dump fidelity. (3) multi-level partition trees.
+(4) column-level STORAGE/COMPRESSION (needs parser keywords). See ledger.

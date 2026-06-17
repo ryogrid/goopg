@@ -419,13 +419,23 @@ type PartitionBound struct {
 	InValueLiterals []string
 	From            string   // RANGE: lower bound (single-column, kept for compat)
 	To              string   // RANGE: upper bound (single-column, kept for compat)
-	FromValues      []string // RANGE: lower bound tuple (multi-column; len==1 for single-col)
-	ToValues        []string // RANGE: upper bound tuple (multi-column; len==1 for single-col)
-	Modulus         int64    // HASH: modulus
-	Remainder       int64    // HASH: remainder (partition index)
-	IsHash          bool     // true for HASH partitions
-	IsDefault       bool     // true for DEFAULT partitions
-	ChildName       string   // name of the child partition that owns this bound
+	FromValues      []string // RANGE: lower bound tuple (raw routing form; multi-column, len==1 for single-col)
+	ToValues        []string // RANGE: upper bound tuple (raw routing form; multi-column, len==1 for single-col)
+	// FromValueLiterals / ToValueLiterals hold the SQL-literal rendering of each
+	// RANGE bound element (parallel to FromValues / ToValues): 'a' for a text
+	// value, 5 for an integer, and the bare keyword MINVALUE / MAXVALUE for an
+	// unbounded edge. Captured at partition-creation time for the same reason as
+	// InValueLiterals: FromValues / ToValues store the unquoted raw form needed
+	// for routing comparison and cannot be re-quoted later without the column
+	// type. FormatPartitionBound prefers these so a TEXT RANGE bound emits
+	// `FOR VALUES FROM ('a') TO ('m')` rather than the invalid `FROM (a) TO (m)`.
+	FromValueLiterals []string
+	ToValueLiterals   []string
+	Modulus           int64  // HASH: modulus
+	Remainder         int64  // HASH: remainder (partition index)
+	IsHash            bool   // true for HASH partitions
+	IsDefault         bool   // true for DEFAULT partitions
+	ChildName         string // name of the child partition that owns this bound
 }
 
 // FormatPartitionBound formats a PartitionBound as the "FOR VALUES ..." string
@@ -449,12 +459,21 @@ func FormatPartitionBound(pb PartitionBound) string {
 		}
 		return "FOR VALUES IN (" + strings.Join(vals, ", ") + ")"
 	}
-	// RANGE partition.
+	// RANGE partition. Prefer the SQL-literal tuples (FromValueLiterals /
+	// ToValueLiterals) when present and length-matched: they quote string bounds
+	// and uppercase MINVALUE/MAXVALUE so the relpartbound is valid SQL on restore.
+	// Fall back to the raw FromValues/ToValues (integer bounds render the same).
 	fromParts := pb.FromValues
+	if len(pb.FromValueLiterals) == len(pb.FromValues) && len(pb.FromValueLiterals) > 0 {
+		fromParts = pb.FromValueLiterals
+	}
 	if len(fromParts) == 0 && pb.From != "" {
 		fromParts = []string{pb.From}
 	}
 	toParts := pb.ToValues
+	if len(pb.ToValueLiterals) == len(pb.ToValues) && len(pb.ToValueLiterals) > 0 {
+		toParts = pb.ToValueLiterals
+	}
 	if len(toParts) == 0 && pb.To != "" {
 		toParts = []string{pb.To}
 	}

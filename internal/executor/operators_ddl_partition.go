@@ -1133,6 +1133,41 @@ func boundExprToSQLLiteral(e parser.Expr) string {
 	return ""
 }
 
+// rangeBoundExprToSQLLiteral renders a RANGE partition bound element as a SQL
+// literal for relpartbound/pg_dump output. The parser encodes the MINVALUE /
+// MAXVALUE keywords as a sentinel StringConst whose Value is exactly "MINVALUE"
+// or "MAXVALUE" (parse_partition_for_values in ddl.go); those must render as the
+// bare keyword, NOT a quoted string, or the relpartbound restores as a text bound
+// instead of an unbounded edge. Other constants delegate to boundExprToSQLLiteral
+// so text bounds are quoted ('a') and integers stay bare. Returns "" if the
+// element can't be rendered (the caller then falls back to the raw routing form).
+// DU-002 slice 169.
+func rangeBoundExprToSQLLiteral(e parser.Expr) string {
+	if sc, ok := e.(*parser.StringConst); ok && (sc.Value == "MINVALUE" || sc.Value == "MAXVALUE") {
+		return sc.Value
+	}
+	return boundExprToSQLLiteral(e)
+}
+
+// rangeBoundLiterals renders a RANGE bound tuple (FROM or TO) to SQL literals,
+// parallel to its raw routing form. Returns nil if any element can't be rendered
+// so FormatPartitionBound falls back to the raw values rather than emitting an
+// empty bound. DU-002 slice 169.
+func rangeBoundLiterals(exprs []parser.Expr) []string {
+	if len(exprs) == 0 {
+		return nil
+	}
+	lits := make([]string, 0, len(exprs))
+	for _, e := range exprs {
+		lit := rangeBoundExprToSQLLiteral(e)
+		if lit == "" {
+			return nil
+		}
+		lits = append(lits, lit)
+	}
+	return lits
+}
+
 // funcExprContainsName returns true if expr (a partition-key expression) contains
 // a FuncCall whose Name.Name matches funcName (case-insensitive). Used to detect
 // partition-key dependencies when dropping a function.

@@ -946,6 +946,56 @@ func TestFormatPartitionBoundListLiterals(t *testing.T) {
 			pb:   PartitionBound{IsHash: true, Modulus: 4, Remainder: 0},
 			want: "FOR VALUES WITH (modulus 4, remainder 0)",
 		},
+		{
+			// RANGE on text: raw bounds are unquoted (routing form); the literal
+			// tuples quote them so the bound restores. DU-002 slice 169.
+			name: "range text bounds are quoted",
+			pb: PartitionBound{
+				FromValues:        []string{"a"},
+				ToValues:          []string{"m"},
+				FromValueLiterals: []string{"'a'"},
+				ToValueLiterals:   []string{"'m'"},
+			},
+			want: "FOR VALUES FROM ('a') TO ('m')",
+		},
+		{
+			name: "range integer bounds are bare",
+			pb: PartitionBound{
+				FromValues:        []string{"1"},
+				ToValues:          []string{"100"},
+				FromValueLiterals: []string{"1"},
+				ToValueLiterals:   []string{"100"},
+			},
+			want: "FOR VALUES FROM (1) TO (100)",
+		},
+		{
+			name: "range minvalue/maxvalue keywords",
+			pb: PartitionBound{
+				FromValues:        []string{"minvalue"},
+				ToValues:          []string{"maxvalue"},
+				FromValueLiterals: []string{"MINVALUE"},
+				ToValueLiterals:   []string{"MAXVALUE"},
+			},
+			want: "FOR VALUES FROM (MINVALUE) TO (MAXVALUE)",
+		},
+		{
+			name: "range multi-column text tuple",
+			pb: PartitionBound{
+				FromValues:        []string{"a", "1"},
+				ToValues:          []string{"m", "10"},
+				FromValueLiterals: []string{"'a'", "1"},
+				ToValueLiterals:   []string{"'m'", "10"},
+			},
+			want: "FOR VALUES FROM ('a', 1) TO ('m', 10)",
+		},
+		{
+			name: "range missing literals falls back to raw values",
+			pb: PartitionBound{
+				FromValues: []string{"1"},
+				ToValues:   []string{"100"},
+			},
+			want: "FOR VALUES FROM (1) TO (100)",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

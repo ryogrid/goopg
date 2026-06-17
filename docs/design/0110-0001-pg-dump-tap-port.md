@@ -4781,6 +4781,44 @@ The TAP test adds `CREATE TABLE public.plist (grp text, val integer) PARTITION B
 bound both survive. A `catalog` unit test (`TestFormatPartitionBoundListLiterals`) pins the
 quote/escape/fallback rendering directly.
 
+### Slice 169 — RANGE partition bounds round-trip (real divergence fixed)
+
+Slice 168 closed the raw-vs-literal divergence for LIST bounds, but `FormatPartitionBound`'s **RANGE**
+branch still rendered the raw `FromValues`/`ToValues` (also stored via `exprToString`). A text RANGE
+bound therefore hit the identical bug: `FROM (a) TO (m)` instead of upstream's `FROM ('a') TO ('m')`.
+Two RANGE-specific wrinkles made it worse than LIST:
+
+1. **MINVALUE / MAXVALUE.** The parser encodes the unbounded-edge keywords as a *sentinel*
+   `StringConst{Value:"MINVALUE"|"MAXVALUE"}` (`parse_partition_for_values`, `ddl.go`). Passing that
+   through the generic literal renderer quoted it as `'MINVALUE'`, which restores as the *text value*
+   `'MINVALUE'` rather than an unbounded bound — a silent semantic corruption, not just invalid SQL.
+
+```
+... ATTACH PARTITION public.prange_am FOR VALUES FROM ('MINVALUE') TO ('m');   -- goopg (corrupt: text bound)
+... ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m');     -- upstream (unbounded edge)
+```
+
+**Fix (same shape as slice 168).** `PartitionBound` gains parallel `FromValueLiterals` /
+`ToValueLiterals []string`, captured at partition-creation time from the bound's `parser.Expr` by a
+new `rangeBoundLiterals` helper. The per-element renderer `rangeBoundExprToSQLLiteral` delegates to
+`boundExprToSQLLiteral` for ordinary constants (quoting strings, passing integers through) but
+recognizes the `MINVALUE`/`MAXVALUE` sentinel StringConsts and emits them as the **bare keyword**.
+The helper returns `nil` for the whole tuple if any element can't be rendered, so `FormatPartitionBound`
+falls back to the raw `FromValues`/`ToValues` (integer bounds render the same either way). Both RANGE
+creation sites (`execCreatePartitionChild` and the ATTACH path) populate the literals; routing is
+untouched — it still compares the raw `FromValues`/`ToValues`.
+
+The TAP test adds `CREATE TABLE public.prange (grp text, val integer) PARTITION BY RANGE (grp)` with
+`prange_am FOR VALUES FROM (MINVALUE) TO ('m')` and asserts the quoted-string upper bound and the
+bare MINVALUE keyword both survive the dump. `TestFormatPartitionBoundListLiterals` gains RANGE cases
+(text quoting, integer fallback, MINVALUE/MAXVALUE keywords, multi-column tuple).
+
+**Latent follow-up (not slice 169):** because the parser collapses the keyword `MINVALUE` and a
+quoted text literal `'MINVALUE'` to the same `StringConst{Value:"MINVALUE"}`, a partition whose
+literal text bound is exactly `'MINVALUE'`/`'MAXVALUE'` would render as the keyword. This pre-existing
+ambiguity also affects routing (both compare against the raw `"MINVALUE"`); a faithful fix needs a
+dedicated keyword AST node. Tracked in the deferral ledger.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

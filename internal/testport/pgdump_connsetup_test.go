@@ -744,6 +744,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create HASH partition phash_0: %v", err)
 	}
 
+	// Slice 169: RANGE bounds keyed on a text column have the SAME raw-vs-literal
+	// divergence as LIST (slice 168). The earlier RANGE fixture (`part`) used
+	// integer bounds, which render identically quoted or not. A text RANGE bound
+	// was stored via exprToString (the raw routing form), so FormatPartitionBound
+	// emitted the restore-breaking `FOR VALUES FROM (a) TO (m)` instead of PG's
+	// `FOR VALUES FROM ('a') TO ('m')`. The fix captures parallel SQL-literal
+	// tuples (PartitionBound.From/ToValueLiterals) — quoting strings and
+	// uppercasing MINVALUE/MAXVALUE — at partition-creation time. `prange` uses an
+	// open lower bound (MINVALUE) to also pin the keyword rendering.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.prange (grp text, val integer) PARTITION BY RANGE (grp)"); err != nil {
+		t.Fatalf("create RANGE-partitioned table prange: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.prange_am PARTITION OF public.prange FOR VALUES FROM (MINVALUE) TO ('m')"); err != nil {
+		t.Fatalf("create RANGE partition prange_am: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -2036,6 +2052,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.phash_0 FOR VALUES WITH (modulus 4, remainder 0)") {
 			t.Errorf("pg_dump dropped/mangled the HASH partition bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.phash_0 FOR VALUES WITH (modulus 4, remainder 0)", res.Stdout)
+		}
+		// **Slice 169 closed (asserted):** a text RANGE bound. Like the LIST case
+		// (slice 168), the bound was stored unquoted (routing form), so the dump
+		// emitted the restore-breaking `FOR VALUES FROM (a) TO (m)`. The literal
+		// tuples now quote the string edge and uppercase MINVALUE. Assert both the
+		// parent key clause and the quoted/keyword bound survive the round-trip.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.prange (") ||
+			!strings.Contains(res.Stdout, "PARTITION BY RANGE (grp)") {
+			t.Errorf("pg_dump dropped/mangled the RANGE-on-text parent table; missing CREATE TABLE public.prange / PARTITION BY RANGE (grp)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')") {
+			t.Errorf("pg_dump emitted an unquoted/invalid RANGE bound; want %q\n  full stdout=%q", "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')", res.Stdout)
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

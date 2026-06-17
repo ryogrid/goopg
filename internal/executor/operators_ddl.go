@@ -1946,17 +1946,22 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	} else if len(poc.FromValues) > 0 || len(poc.ToValues) > 0 {
 		// RANGE partition: store all key-column values for multi-column routing.
+		// FromValues/ToValues keep the raw unquoted routing form; the parallel
+		// *ValueLiterals keep the SQL-literal form ('a', 5, MINVALUE) so
+		// FormatPartitionBound emits a valid relpartbound for pg_dump.
 		if len(poc.FromValues) > 0 {
 			pb.From = exprToString(poc.FromValues[0]) // backward compat (single-col)
 			for _, v := range poc.FromValues {
 				pb.FromValues = append(pb.FromValues, exprToString(v))
 			}
+			pb.FromValueLiterals = rangeBoundLiterals(poc.FromValues)
 		}
 		if len(poc.ToValues) > 0 {
 			pb.To = exprToString(poc.ToValues[0]) // backward compat (single-col)
 			for _, v := range poc.ToValues {
 				pb.ToValues = append(pb.ToValues, exprToString(v))
 			}
+			pb.ToValueLiterals = rangeBoundLiterals(poc.ToValues)
 		}
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	}
@@ -3739,12 +3744,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					for _, v := range poc.FromValues {
 						pb.FromValues = append(pb.FromValues, exprToString(v))
 					}
+					pb.FromValueLiterals = rangeBoundLiterals(poc.FromValues)
 				}
 				if len(poc.ToValues) > 0 {
 					pb.To = exprToString(poc.ToValues[0]) // backward compat
 					for _, v := range poc.ToValues {
 						pb.ToValues = append(pb.ToValues, exprToString(v))
 					}
+					pb.ToValueLiterals = rangeBoundLiterals(poc.ToValues)
 				}
 				if len(pb.InValues) > 0 || pb.From != "" || pb.To != "" {
 					childTbl.PartitionBounds = []catalog.PartitionBound{pb}
