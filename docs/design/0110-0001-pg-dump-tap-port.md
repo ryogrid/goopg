@@ -4705,6 +4705,43 @@ The TAP test creates `CREATE UNLOGGED TABLE public.ulog (id integer PRIMARY KEY,
 public.ulog (` appears, plus a negative guard that the permanent `foo`/`opt` tables did **not**
 gain a spurious `UNLOGGED` keyword.
 
+### Slice 167 — partitioned table + partition round-trip (real divergence fixed)
+
+Slice 166 corrected one table-level catalog char (`relpersistence`); slice 167 corrects another
+table-level catalog field with a richer payload: `pg_class.relpartbound`. pg_dump reconstructs a
+partition hierarchy from three catalog facts — the parent's `relkind='p'` plus
+`pg_get_partkeydef(oid)` (→ `PARTITION BY RANGE (id)`), `pg_inherits` (parent↔child links), and
+each child's `relispartition` plus `pg_get_expr(c.relpartbound, c.oid)` (→ the `FOR VALUES …`
+bound). pg_dump emits the parent as `CREATE TABLE … PARTITION BY …`, each partition as a
+standalone `CREATE TABLE`, and a separate `ALTER TABLE ONLY parent ATTACH PARTITION child
+<bound>`.
+
+**Divergence.** goopg already had all the moving parts *except the bound*: `relkind='p'` and
+`relispartition` were emitted by `buildUserPGClassRow`, `pg_get_partkeydef` was implemented
+(internal/executor/expr.go, off `catalog.Table.PartitionMethod/PartitionKey`), `pg_inherits` was
+populated (catalog.go VirtualRows off `PartitionParentOID`), and `pg_get_expr` passed
+`relpartbound` through. But `buildUserPGClassRow` — the heap-backed `pg_class` row pg_dump
+actually reads — **hardcoded** `relpartbound` to `""`. So a partition child attached with an
+*empty* (invalid) bound, silently losing its value range on restore:
+
+```
+ALTER TABLE ONLY public.part ATTACH PARTITION public.part_p0 ;                          -- goopg (wrong/invalid)
+ALTER TABLE ONLY public.part ATTACH PARTITION public.part_p0 FOR VALUES FROM (0) TO (100); -- upstream
+```
+
+**Fix (catalog-metadata only, zero storage-path risk).** `buildUserPGClassRow` now derives
+`relpartbound` from `catalog.FormatPartitionBound(tbl.PartitionBounds[0])` for a partition child
+(`PartitionParentOID != 0`); a parent partitioned table keeps `""` (parents have no bound,
+matching PG). This brings the executor's heap-backed `pg_class` builder into line with catalog.go's
+VirtualRows sibling path, which already computed the same string — a sibling-paths-must-agree fix.
+`FormatPartitionBound` already handles RANGE / LIST / HASH / DEFAULT bounds, so all partition kinds
+are covered by the one change.
+
+The TAP test creates `CREATE TABLE public.part (id integer, val text) PARTITION BY RANGE (id)` and
+`CREATE TABLE public.part_p0 PARTITION OF public.part FOR VALUES FROM (0) TO (100)`, then asserts
+both the parent's `PARTITION BY RANGE (id)` clause and the child's
+`ATTACH PARTITION public.part_p0 FOR VALUES FROM (0) TO (100)` survive the dump.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -697,6 +697,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create unlogged table ulog: %v", err)
 	}
 
+	// Slice 167: a RANGE-partitioned table and one of its partitions must
+	// round-trip. pg_dump dumps the parent as
+	//   CREATE TABLE public.part (...) PARTITION BY RANGE (id);
+	// (the trailing clause comes from pg_get_partkeydef(oid), which goopg already
+	// implements off catalog.Table.PartitionMethod/PartitionKey), and each
+	// partition child as a standalone CREATE TABLE plus a separate
+	//   ALTER TABLE ONLY public.part ATTACH PARTITION public.part_p0
+	//       FOR VALUES FROM (0) TO (100);
+	// where the `FOR VALUES …` bound is read back via
+	// pg_get_expr(c.relpartbound, c.oid). The parent's relkind='p' and the
+	// child's relispartition were already emitted, BUT buildUserPGClassRow (the
+	// heap-backed pg_class row pg_dump actually reads) HARDCODED relpartbound to
+	// "", so the child attached with an empty (invalid) bound — a silent loss of
+	// the partition's value range on restore. The emitter now derives the bound
+	// from catalog.FormatPartitionBound(tbl.PartitionBounds[0]) for partition
+	// children (parents keep ""), mirroring catalog.go's VirtualRows sibling
+	// path. `part`/`part_p0` carry it on their own tables so foo's many asserts
+	// are untouched.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.part (id integer, val text) PARTITION BY RANGE (id)"); err != nil {
+		t.Fatalf("create partitioned table part: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.part_p0 PARTITION OF public.part FOR VALUES FROM (0) TO (100)"); err != nil {
+		t.Fatalf("create partition part_p0: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -1956,6 +1981,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "CREATE UNLOGGED TABLE public.foo (") ||
 			strings.Contains(res.Stdout, "CREATE UNLOGGED TABLE public.opt (") {
 			t.Errorf("pg_dump emitted a spurious UNLOGGED keyword on a permanent table\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 167 closed (asserted):** a RANGE-partitioned table and its
+		// partition must round-trip. The parent's PARTITION BY clause comes from
+		// pg_get_partkeydef; the child's FOR VALUES bound from
+		// pg_get_expr(relpartbound, oid). buildUserPGClassRow hardcoded
+		// relpartbound to "", so the ATTACH PARTITION lost its bound. The emitter
+		// now derives it from the catalog. Assert both the parent partition-key
+		// clause and the child's ATTACH-with-bound survive.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.part (") ||
+			!strings.Contains(res.Stdout, "PARTITION BY RANGE (id)") {
+			t.Errorf("pg_dump dropped/mangled the parent PARTITION BY clause; missing %q\n  full stdout=%q", "PARTITION BY RANGE (id)", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.part_p0 FOR VALUES FROM (0) TO (100)") {
+			t.Errorf("pg_dump dropped the partition bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.part_p0 FOR VALUES FROM (0) TO (100)", res.Stdout)
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

@@ -410,6 +410,16 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	if tbl.Unlogged {
 		relpersistence = "u"
 	}
+	// relpartbound: a partition child carries its `FOR VALUES …` bound, which
+	// pg_dump reads via pg_get_expr(relpartbound, oid) and re-emits as
+	// `ALTER TABLE ONLY parent ATTACH PARTITION child <bound>`. Hardcoding ""
+	// silently dropped the bound, so the restored child would attach with an
+	// empty (invalid) bound. A parent partitioned table has no bound (""),
+	// matching PG. Mirrors catalog.go's VirtualRows pg_class path (sibling).
+	relpartbound := ""
+	if isPartition && len(tbl.PartitionBounds) > 0 {
+		relpartbound = catalog.FormatPartitionBound(tbl.PartitionBounds[0])
+	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                // oid
 		NewStringDatum(tbl.Name),                                   // relname (name)
@@ -444,7 +454,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewIntDatum(minFrozenMXID),                                 // relminmxid
 		NewStringDatum("{}"),                                       // relacl (encoded as empty aclitem[] ArrayType)
 		NewStringDatum("{}"),                                       // reloptions (encoded as empty text[] ArrayType)
-		NewStringDatum(""),                                         // relpartbound (NULL-equivalent empty pg_node_tree)
+		NewStringDatum(relpartbound),                               // relpartbound (FOR VALUES … for partition children)
 	}
 }
 

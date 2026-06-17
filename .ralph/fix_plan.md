@@ -3670,6 +3670,37 @@ object support.
         pre-commit smoke on commit. **Next: slice 167** — remaining untested table-level
         attributes: table inheritance (`INHERITS`), partitioning (`PARTITION BY`/
         `PARTITION OF`), or column-level `STORAGE`/`COMPRESSION` (needs parser keywords).
+      - **PROGRESS 2026-06-17 (loop #134):** **DU-002 slice 167 LANDED — real
+        divergence fixed.** A RANGE-partitioned table and its partition now round-trip
+        through pg_dump. pg_dump reconstructs a partition hierarchy from the parent's
+        `relkind='p'` + `pg_get_partkeydef(oid)` (→ `PARTITION BY RANGE (id)`),
+        `pg_inherits` (parent↔child), and each child's `relispartition` +
+        `pg_get_expr(c.relpartbound, c.oid)` (→ the `FOR VALUES …` bound), emitting the
+        parent as `CREATE TABLE … PARTITION BY …`, the child as a standalone `CREATE TABLE`,
+        and a separate `ALTER TABLE ONLY parent ATTACH PARTITION child <bound>`. goopg
+        already had every moving part EXCEPT the bound: `relkind='p'`/`relispartition` were
+        emitted, `pg_get_partkeydef` was implemented, `pg_inherits` was populated, and
+        `pg_get_expr` passed `relpartbound` through — but `buildUserPGClassRow` (the
+        heap-backed pg_class row pg_dump reads) HARDCODED `relpartbound` to `""`, so a
+        partition child attached with an EMPTY (invalid) bound, silently losing its value
+        range on restore (real divergence). **Fix (catalog-metadata only, zero storage-path
+        risk):** `buildUserPGClassRow` derives `relpartbound` from
+        `catalog.FormatPartitionBound(tbl.PartitionBounds[0])` for a partition child
+        (`PartitionParentOID != 0`); a parent keeps `""` (no bound, matching PG). This is a
+        sibling-paths-must-agree fix — it brings the executor's heap-backed pg_class builder
+        into line with catalog.go's VirtualRows path, which already computed the same string.
+        `FormatPartitionBound` covers RANGE/LIST/HASH/DEFAULT, so all partition kinds are
+        handled by the one change. Files: `internal/executor/pg18_user_catalog_rows.go`
+        (relpartbound from catalog), `internal/testport/pgdump_connsetup_test.go` (fixture
+        `public.part` PARTITION BY RANGE + `public.part_p0` partition + positive assertions
+        on the parent key clause AND the child ATTACH-with-bound),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 167 section). Gates: gofmt OK;
+        `go build ./internal/...` OK; `go vet ./internal/testport/` clean;
+        `TestPort_PgDumpConnectionSetup` PASS (2.43s, not skipped); executor + catalog
+        suites PASS; pgbench pre-commit smoke on commit. **Next: slice 168** — remaining
+        untested table-level attributes: table inheritance (`INHERITS`), LIST/HASH partition
+        bounds, multi-level partition trees, or column-level `STORAGE`/`COMPRESSION` (needs
+        parser keywords).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
