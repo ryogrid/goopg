@@ -1534,6 +1534,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function gen_series_lite: %v", err)
 	}
 
+	// Slice 153: a sixth user function carrying SECURITY DEFINER and LEAKPROOF, so
+	// the dump exercises the pg_proc virtual view's `prosecdef` and `proleakproof`
+	// columns at their NON-default values ('t'). Slices 148–152 only ever drove the
+	// hardcoded 'f' for both, which dumpFunc suppresses. The parser+executor already
+	// thread SECURITY DEFINER/LEAKPROOF onto catalog.Routine (unlike the
+	// parsed-then-dropped clauses of slices 150/151), and pg_proc_view emits 't'/'t'
+	// — but NO pg_dump round-trip previously asserted these columns flow through
+	// dumpFunc, so this slice locks the coverage. dumpFunc (pg_dump.c:13545/13548)
+	// appends ` SECURITY DEFINER` then ` LEAKPROOF` inline after STRICT and before
+	// COST. (LEAKPROOF requires a superuser, which the test connection is.)
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.add_five(integer) RETURNS integer LANGUAGE sql SECURITY DEFINER LEAKPROOF AS $$ SELECT $1 + 5 $$"); err != nil {
+		t.Fatalf("create function add_five: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2026,6 +2040,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "    LANGUAGE sql ROWS 5\n    AS $_$ SELECT $1 $_$;") {
 			t.Errorf("pg_dump dropped/mangled gen_series_lite's ROWS clause or body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 153 (asserted):** the SECURITY DEFINER LEAKPROOF function
+		// (add_five) must round-trip both clauses. dumpFunc appends ` SECURITY
+		// DEFINER` (prosecdef[0]=='t') then ` LEAKPROOF` (proleakproof[0]=='t')
+		// inline after STRICT and before COST, so real pg_dump 18.3 renders:
+		//   CREATE FUNCTION public.add_five(integer) RETURNS integer
+		//       LANGUAGE sql SECURITY DEFINER LEAKPROOF
+		//       AS $_$ SELECT $1 + 5 $_$;
+		// The parser+executor already thread both flags onto catalog.Routine and
+		// pg_proc_view emits 't'/'t'; this is the first pg_dump round-trip to
+		// assert the prosecdef/proleakproof columns reach dumpFunc.
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.add_five(integer) RETURNS integer") {
+			t.Errorf("pg_dump dropped/mangled the add_five signature\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "    LANGUAGE sql SECURITY DEFINER LEAKPROOF\n    AS $_$ SELECT $1 + 5 $_$;") {
+			t.Errorf("pg_dump dropped/mangled add_five's SECURITY DEFINER/LEAKPROOF clauses or body\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

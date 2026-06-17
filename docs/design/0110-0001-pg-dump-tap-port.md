@@ -4238,6 +4238,31 @@ The TAP test creates `gen_series_lite … RETURNS SETOF integer … ROWS 5` and 
 both the `RETURNS SETOF integer` signature and the one-line `LANGUAGE sql ROWS 5` /
 `AS $_$ SELECT $1 $_$;` fragment.
 
+### Slice 153 — `SECURITY DEFINER`/`LEAKPROOF` round-trip (coverage; clean positive)
+
+`dumpFunc` appends ` SECURITY DEFINER` (`prosecdef[0]=='t'`, `pg_dump.c:13545`) then
+` LEAKPROOF` (`proleakproof[0]=='t'`, `pg_dump.c:13548`) inline after `STRICT` and
+before `COST`. Unlike the parsed-then-dropped clauses of slices 150/151, the
+`SECURITY DEFINER`/`LEAKPROOF` chain was **already fully wired**: the parser
+(`function.go`) captures both into `CreateFunctionStmt`, the executor
+(`operators_ddl.go`) threads them onto `catalog.Routine.SecurityDefiner`/`Leakproof`,
+and `pg_proc_view.go` emits `prosecdef`/`proleakproof` as `'t'`/`'t'`. But slices
+148–152 only ever drove the hardcoded `'f'` for both columns (which `dumpFunc`
+suppresses), so **no pg_dump round-trip had asserted these columns reach
+`dumpFunc`** — this slice locks that coverage rather than fixing a divergence
+(verified empirically: clean positive). Real pg_dump 18.3 renders:
+
+```
+CREATE FUNCTION public.add_five(integer) RETURNS integer
+    LANGUAGE sql SECURITY DEFINER LEAKPROOF
+    AS $_$ SELECT $1 + 5 $_$;
+```
+
+The TAP test creates `add_five … SECURITY DEFINER LEAKPROOF` and asserts the
+signature plus the one-line `LANGUAGE sql SECURITY DEFINER LEAKPROOF` /
+`AS $_$ SELECT $1 + 5 $_$;` fragment. (LEAKPROOF requires a superuser, which the
+test connection is.)
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

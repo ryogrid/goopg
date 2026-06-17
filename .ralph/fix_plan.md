@@ -3304,6 +3304,27 @@ object support.
         (2.44s, not skipped); pgbench pre-commit smoke on commit. **Next: slice
         153** — a fresh pg_dump catalog-surface gap (SECURITY DEFINER / LEAKPROOF
         clauses, or a `CREATE PROCEDURE` / prokind='p' dump).
+      - **PROGRESS 2026-06-17 (loop #119):** **DU-002 slice 153 LANDED** —
+        `SECURITY DEFINER` + `LEAKPROOF` functions now have asserted pg_dump
+        round-trip coverage; **clean positive (verified empirically), not a
+        divergence**. `dumpFunc` appends ` SECURITY DEFINER` (prosecdef[0]=='t',
+        `pg_dump.c:13545`) then ` LEAKPROOF` (proleakproof[0]=='t', `:13548`)
+        inline after STRICT and before COST. Unlike slices 150/151's
+        parsed-then-dropped clauses, this chain was already fully wired: parser
+        (`function.go`) → `catalog.Routine.SecurityDefiner`/`Leakproof`
+        (`operators_ddl.go`) → `pg_proc_view.go` emits 't'/'t'. But slices 148–152
+        only drove the hardcoded 'f' (which dumpFunc suppresses), so no round-trip
+        had asserted these columns reach dumpFunc — this slice locks that coverage.
+        Test adds `public.add_five(integer) … SECURITY DEFINER LEAKPROOF` and
+        asserts the signature plus the one-line `LANGUAGE sql SECURITY DEFINER
+        LEAKPROOF` / `AS $_$ SELECT $1 + 5 $_$;` fragment (LEAKPROOF needs a
+        superuser, which the test conn is). Files:
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK; `go build
+        ./internal/...` OK; `TestPort_PgDumpConnectionSetup` PASS (2.54s, not
+        skipped); pgbench pre-commit smoke on commit. **Next: slice 154** — a
+        `CREATE PROCEDURE` (prokind='p') round-trip (no-RETURNS branch + PROCEDURE
+        keyword), or a STABLE / PARALLEL RESTRICTED volatility-marker variant.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
