@@ -1496,6 +1496,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		"COMMENT ON SEQUENCE public.plain_seq IS 'a sequence comment'",
 		"COMMENT ON INDEX public.foo_name_idx IS 'an index comment'",
 		"COMMENT ON SCHEMA s IS 'a schema comment'",
+		// Slice 146: COMMENT ON {MATERIALIZED VIEW, TYPE, DOMAIN} must also
+		// survive the dump. Before this slice, parseCommentOnTail had no branch
+		// for these kinds, so the server silently swallowed them and the comment
+		// never reached pg_description. The parser now recognises MATERIALIZED
+		// VIEW / TYPE / DOMAIN, and execCommentOn keys the matview under pg_class
+		// (1259, shared LookupTable path; pg_dump picks MATERIALIZED VIEW from
+		// relkind='m') and the enum type + domain under pg_type (1247; pg_dump
+		// picks TYPE vs DOMAIN from typtype). foo_mv, public.mood, public.zipcode
+		// are created earlier in this fixture.
+		"COMMENT ON MATERIALIZED VIEW public.foo_mv IS 'a matview comment'",
+		"COMMENT ON TYPE public.mood IS 'a type comment'",
+		"COMMENT ON DOMAIN public.zipcode IS 'a domain comment'",
 	}
 	for _, sql := range miscComments {
 		if err := runSQLSimple(t, c, sql); err != nil {
@@ -1836,6 +1848,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"COMMENT ON SEQUENCE public.plain_seq IS 'a sequence comment';",
 			"COMMENT ON INDEX public.foo_name_idx IS 'an index comment';",
 			"COMMENT ON SCHEMA s IS 'a schema comment';",
+			// **Slice 146 (asserted):** COMMENT ON {MATERIALIZED VIEW,TYPE,DOMAIN}
+			// must round-trip. All three were silently swallowed (parser had no
+			// branch). pg_dump picks the keyword from relkind='m' (matview) and
+			// typtype ('e' enum → TYPE, 'd' → DOMAIN).
+			"COMMENT ON MATERIALIZED VIEW public.foo_mv IS 'a matview comment';",
+			"COMMENT ON TYPE public.mood IS 'a type comment';",
+			"COMMENT ON DOMAIN public.zipcode IS 'a domain comment';",
 		}
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {

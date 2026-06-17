@@ -3980,6 +3980,39 @@ emits exactly `COMMENT ON VIEW public.foo_view IS '…';`,
 `COMMENT ON INDEX public.foo_name_idx IS '…';`, and
 `COMMENT ON SCHEMA s IS '…';`. Pure dump-fidelity.
 
+### Slice 146 — `COMMENT ON {MATERIALIZED VIEW,TYPE,DOMAIN}` round-trip
+
+Slice 145 closed the relation/schema kinds; this slice extends the comment
+round-trip to the remaining `COMMENT ON` object kinds the existing fixture
+already creates: a materialized view (`public.foo_mv`), a user enum type
+(`public.mood`), and a domain (`public.zipcode`).
+
+**The bug:** `parseCommentOnTail` had no branch for `MATERIALIZED VIEW`, `TYPE`,
+or `DOMAIN`, so all three fell through to the unsupported `default` branch
+(`return nil, false, nil`); the server's COMMENT fallback silently swallowed the
+statement, the description never reached `pg_description`, and pg_dump re-emitted
+nothing.
+
+**The fix:**
+
+1. `parseCommentOnTail` gains three branches, all via `acceptIdentKeyword`
+   (`materialized`, `type`, `domain` are not lexer keywords): `MATERIALIZED
+   [VIEW]` → `ObjKind = "materialized view"`, `TYPE` → `type`, `DOMAIN` →
+   `domain`. Each reads a `parseObjectName`.
+2. `execCommentOn` folds `materialized view` into the existing
+   `table`/`view`/`sequence` case: matviews are `pg_class` relations in the same
+   table registry (`LookupTable`), so they share classoid 1259 — pg_dump picks
+   the `MATERIALIZED VIEW` keyword from `relkind='m'`. New `type` and `domain`
+   cases resolve the OID via `im.LookupEnum` / `im.LookupDomain` and key the row
+   under classoid=`pg_type` (1247) — pg_dump picks `TYPE` vs `DOMAIN` from
+   `typtype` (`'e'` vs `'d'`).
+
+No catalog-schema change. The round-trip test adds three comments and asserts
+each `COMMENT ON <kind> …` line reappears verbatim. Verified against real
+pg_dump 18.3: `COMMENT ON MATERIALIZED VIEW public.foo_mv IS '…';`,
+`COMMENT ON TYPE public.mood IS '…';`, and
+`COMMENT ON DOMAIN public.zipcode IS '…';`. Pure dump-fidelity.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

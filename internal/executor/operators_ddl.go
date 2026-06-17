@@ -8396,22 +8396,43 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 	}
 	// classOID constants match PostgreSQL system catalog OIDs.
 	const (
-		oidPgClass        = 1259 // pg_class: tables, indexes, views, sequences
+		oidPgClass        = 1259 // pg_class: tables, indexes, views, sequences, matviews
+		oidPgType         = 1247 // pg_type: user types (enum) and domains
 		oidPgConstraint   = 2606 // pg_constraint
 		oidPgNamespace    = 2615 // pg_namespace: schemas
 		oidPgStatisticExt = 3381 // pg_statistic_ext
 	)
 	switch s.ObjKind {
-	case "table", "view", "sequence":
-		// Views and sequences are pg_class relations stored in the same table
-		// registry as ordinary tables, so they share the classoid (1259) and
-		// LookupTable path. pg_dump chooses the COMMENT ON keyword from relkind;
-		// the stored pg_description row is keyword-agnostic. DU-002 slice 145.
+	case "table", "view", "sequence", "materialized view":
+		// Views, sequences, and materialized views are pg_class relations stored
+		// in the same table registry as ordinary tables, so they share the
+		// classoid (1259) and LookupTable path. pg_dump chooses the COMMENT ON
+		// keyword from relkind (relkind='m' → MATERIALIZED VIEW); the stored
+		// pg_description row is keyword-agnostic. DU-002 slices 145, 146.
 		tbl, ok := im.LookupTable(s.ObjName)
 		if !ok {
 			return nil
 		}
 		im.SetComment(oidPgClass, tbl.OID, 0, s.Description)
+	case "type":
+		// User-defined types live in pg_type (classoid 1247). goopg's only
+		// user types are enums; resolve the enum OID. Without this a COMMENT ON
+		// TYPE was silently swallowed and never reached pg_description, so
+		// pg_dump could not re-emit it. DU-002 slice 146.
+		et, ok := im.LookupEnum(s.ObjName.Name)
+		if !ok {
+			return nil
+		}
+		im.SetComment(oidPgType, et.OID, 0, s.Description)
+	case "domain":
+		// Domains live in pg_type (typtype='d', classoid 1247). pg_dump picks the
+		// DOMAIN keyword from typtype; the stored pg_description row is
+		// keyword-agnostic. DU-002 slice 146.
+		dom, ok := im.LookupDomain(s.ObjName.Name)
+		if !ok {
+			return nil
+		}
+		im.SetComment(oidPgType, dom.OID, 0, s.Description)
 	case "schema":
 		// Schemas live in pg_namespace (classoid 2615). Without this, a COMMENT
 		// ON SCHEMA was silently swallowed and never reached pg_description, so

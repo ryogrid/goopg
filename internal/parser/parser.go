@@ -2043,6 +2043,36 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptIdentKeyword("materialized"):
+		// COMMENT ON MATERIALIZED VIEW [schema.]name IS '...'. Materialized views
+		// are pg_class relations (relkind='m'); pg_dump re-emits
+		// `COMMENT ON MATERIALIZED VIEW …`. "materialized"/"view" are not lexer
+		// keywords, so accept either spelling for VIEW. DU-002 slice 146.
+		_ = p.acceptKeyword(KwView) || p.acceptIdentKeyword("view")
+		cs.ObjKind = "materialized view"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("type"):
+		// COMMENT ON TYPE [schema.]name IS '...'. User-defined types live in
+		// pg_type; pg_dump re-emits `COMMENT ON TYPE …`. DU-002 slice 146.
+		cs.ObjKind = "type"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("domain"):
+		// COMMENT ON DOMAIN [schema.]name IS '...'. Domains live in pg_type
+		// (typtype='d'); pg_dump re-emits `COMMENT ON DOMAIN …`. DU-002 slice 146.
+		cs.ObjKind = "domain"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
 	default:
 		return nil, false, nil
 	}

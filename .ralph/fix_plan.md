@@ -3121,6 +3121,37 @@ object support.
         (2.88s); pgbench pre-commit smoke on commit. **Next: slice 146** — a fresh
         pg_dump catalog-surface gap (e.g. `COMMENT ON {MATERIALIZED VIEW,TYPE,
         DOMAIN,FUNCTION}` round-trip), or the deferred-check execution spike.
+      - **PROGRESS 2026-06-17 (loop #111):** **DU-002 slice 146 LANDED** —
+        `COMMENT ON {MATERIALIZED VIEW,TYPE,DOMAIN}` now round-trips through
+        pg_dump. **The bug:** `parseCommentOnTail`
+        (`internal/parser/parser.go`) had no branch for MATERIALIZED VIEW / TYPE
+        / DOMAIN, so each fell through to the unsupported `default` branch
+        (`return nil, false, nil`); the server's COMMENT fallback silently
+        swallowed them, nothing reached `pg_description`, and pg_dump re-emitted
+        nothing. **The fix:** (1) parser gains three `acceptIdentKeyword`
+        branches (`materialized` [+ optional VIEW], `type`, `domain` — none is a
+        lexer keyword); (2) `execCommentOn`
+        (`internal/executor/operators_ddl.go`) folds `materialized view` into the
+        existing `table`/`view`/`sequence` case (matviews are pg_class relations
+        in the same table registry, classoid 1259, shared `LookupTable` path —
+        pg_dump picks MATERIALIZED VIEW from relkind='m'), and new `type` /
+        `domain` cases resolve the OID via `im.LookupEnum` / `im.LookupDomain`
+        and key the row under classoid=pg_type (1247) — pg_dump picks TYPE vs
+        DOMAIN from typtype. No catalog-schema change. **Scope:** pure
+        dump-fidelity. Test: `TestPort_PgDumpConnectionSetup` adds three comments
+        (`public.foo_mv` MATERIALIZED VIEW, `public.mood` TYPE, `public.zipcode`
+        DOMAIN — all already created in the fixture) and asserts each
+        `COMMENT ON <kind> …` line reappears verbatim — verified against real
+        pg_dump 18.3 (the test drives the real binary). Files:
+        `internal/parser/parser.go`, `internal/executor/operators_ddl.go`,
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK;
+        `go build ./internal/parser ./internal/executor` OK; `go vet` OK;
+        parser/catalog/executor suites PASS; `TestPort_PgDumpConnectionSetup`
+        PASS (2.84s); pgbench pre-commit smoke on commit. **Next: slice 147** —
+        a fresh pg_dump catalog-surface gap (e.g. `COMMENT ON {FUNCTION,
+        COLLATION, EXTENSION}` round-trip), or the deferred-check execution
+        spike.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
