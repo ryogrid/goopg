@@ -2933,6 +2933,43 @@ object support.
         DEFERRABLE on the inline-column UNIQUE form (`a int UNIQUE DEFERRABLE …`)
         and/or the PRIMARY KEY forms (which still discard the flag), OR an
         exclusion-constraint (`EXCLUDE USING gist`) dump surface.
+      - **PROGRESS 2026-06-17 (loop #106):** **DU-002 slice 141 LANDED** — the
+        INLINE-COLUMN sibling of slices 139/140: a DEFERRABLE trailer on a
+        column-level UNIQUE, both anonymous (`a integer UNIQUE DEFERRABLE INITIALLY
+        DEFERRED`) and named (`a integer CONSTRAINT cudef UNIQUE DEFERRABLE
+        INITIALLY DEFERRED`), now round-trips. pg_dump emits `ADD CONSTRAINT
+        uniqcdef_a_key UNIQUE (a) DEFERRABLE INITIALLY DEFERRED` (anonymous → auto
+        name) and `ADD CONSTRAINT cudef UNIQUE (a) DEFERRABLE INITIALLY DEFERRED`
+        (named → user name). **Production change:** the inline column UNIQUE parser
+        case parsed only the optional NULLS [NOT] DISTINCT clause and had NO slot
+        for a trailing DEFERRABLE, so the keyword fell through to the
+        column-constraint loop's default arm (returns) and was left unconsumed → a
+        HARD PARSE ERROR that failed the whole CREATE TABLE. 3 sites: (1) parser
+        (`internal/parser/ddl.go`) — both inline UNIQUE cases (anonymous + named)
+        now call a new shared `parseUniqueDeferrable` helper after the NULLS clause,
+        consuming `[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]` (and bare
+        INITIALLY DEFERRED) into 2 new `ColumnDef.UniqueDeferrable` /
+        `UniqueInitiallyDeferred` fields (`internal/parser/ast.go`); (2) executor
+        per-column UNIQUE loop (`internal/executor/operators_ddl.go`) threads both
+        onto the backing index beside the slice-136 `NullsNotDistinct` assignment;
+        (3) deparse + pg_constraint UNCHANGED from slice 139 (shared
+        `buildConstraintDefString` appends the clause from the index;
+        condeferrable/condeferred already read from the index). **Scope:** pure
+        dump-fidelity — deferred CHECKING still not implemented (enforced per-row);
+        PRIMARY KEY DEFERRABLE forms (anonymous + named + inline) still discard the
+        flag. Tests: `TestParseColumnUniqueDeferrable` (parser, 11 forms incl.
+        named + NULLS-compose + trailing-NOT-NULL), `TestPort_PgDumpConnectionSetup`
+        (`uniqcdef`/`uniqcndef` fixtures + 2 asserts + 4 negative guards). Files:
+        `internal/parser/ddl.go`, `internal/parser/ast.go`,
+        `internal/parser/ddl_test.go`, `internal/executor/operators_ddl.go`,
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK;
+        `go build ./...` OK; `go vet` OK; parser/catalog/executor suites PASS;
+        `TestParseColumnUniqueDeferrable` PASS; `TestPort_PgDumpConnectionSetup`
+        PASS (2.43s); pgbench pre-commit smoke on commit. **Next: slice 142** —
+        DEFERRABLE on the PRIMARY KEY forms (anonymous table-level / named
+        table-level / inline column — all still discard the flag), OR an
+        exclusion-constraint (`EXCLUDE USING gist`) dump surface.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

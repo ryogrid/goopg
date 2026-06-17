@@ -1327,6 +1327,39 @@ func (p *parser) parseRefreshMatView(pos int) (Stmt, error) {
 	return stmt, nil
 }
 
+// parseUniqueDeferrable consumes an optional `[NOT] DEFERRABLE [INITIALLY
+// DEFERRED | INITIALLY IMMEDIATE]` trailer (and the bare `INITIALLY DEFERRED`
+// shorthand, which implies DEFERRABLE) following an inline column UNIQUE
+// constraint, recording the result into the supplied flags. NOT DEFERRABLE and
+// INITIALLY IMMEDIATE both leave the flags false (the SQL defaults). This is the
+// inline-column sibling of the trailer parsing used by the table-level UNIQUE
+// forms. DU-002 slice 141.
+func (p *parser) parseUniqueDeferrable(deferrable, initiallyDeferred *bool) {
+	if p.acceptKeyword(KwNot) {
+		_ = p.acceptKeyword(KwDeferrable)
+		return
+	}
+	if p.acceptKeyword(KwDeferrable) {
+		*deferrable = true
+		if p.acceptIdentKeyword("initially") {
+			if p.acceptIdentKeyword("deferred") {
+				*initiallyDeferred = true
+			} else {
+				_ = p.acceptIdentKeyword("immediate")
+			}
+		}
+		return
+	}
+	if p.acceptIdentKeyword("initially") {
+		if p.acceptIdentKeyword("deferred") {
+			*deferrable = true
+			*initiallyDeferred = true
+		} else {
+			_ = p.acceptIdentKeyword("immediate")
+		}
+	}
+}
+
 // parseCreateTableTail picks up after CREATE [UNLOGGED] TABLE.
 func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 	stmt := &CreateTableStmt{pos: pos, Unlogged: unlogged}
@@ -2553,6 +2586,11 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 					_ = p.acceptIdentKeyword("distinct")
 				}
 			}
+			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]
+			// trailer on the inline column UNIQUE. Without this, a trailing
+			// DEFERRABLE fell through to the default arm and became a HARD PARSE
+			// ERROR for the whole CREATE TABLE. DU-002 slice 141.
+			p.parseUniqueDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
 		// CHECK (expr) inline column constraint. M0097-0014.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 			p.advance()
@@ -2617,6 +2655,9 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 						_ = p.acceptIdentKeyword("distinct")
 					}
 				}
+				// Optional DEFERRABLE trailer (named inline column UNIQUE).
+				// DU-002 slice 141.
+				p.parseUniqueDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
 				// CONSTRAINT name REFERENCES table (cols) — FK; parsed below.
 				// Fall through to FK parsing path by continuing the outer loop.

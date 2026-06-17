@@ -897,6 +897,16 @@ type ColumnDef struct {
 	// form, in which case the backing index name is auto-generated
 	// (`tbl_col_key`). Only meaningful when Unique is true. DU-002 slice 137.
 	UniqueConstraintName string
+	// UniqueDeferrable / UniqueInitiallyDeferred capture a `[NOT] DEFERRABLE
+	// [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` trailer on an inline column
+	// UNIQUE constraint (`a int UNIQUE DEFERRABLE INITIALLY DEFERRED`). They
+	// thread onto the backing catalog.Index so pg_get_constraintdef / pg_dump
+	// re-emit the clause and pg_constraint emits condeferrable/condeferred.
+	// INITIALLY DEFERRED implies DEFERRABLE; IMMEDIATE is the default (both
+	// false). Only meaningful when Unique is true. Dump-fidelity only — deferred
+	// CHECKING is not implemented (constraints enforced per-row). DU-002 slice 141.
+	UniqueDeferrable        bool
+	UniqueInitiallyDeferred bool
 	// GeneratedAlways is true for `GENERATED ALWAYS AS (expr) STORED` columns.
 	// M0096-0008.
 	GeneratedAlways bool

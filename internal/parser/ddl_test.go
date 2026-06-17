@@ -417,6 +417,60 @@ func TestParseTableNamedUniqueDeferrable(t *testing.T) {
 	}
 }
 
+// TestParseColumnUniqueDeferrable pins the DEFERRABLE [INITIALLY DEFERRED |
+// INITIALLY IMMEDIATE] capture on an INLINE column UNIQUE constraint
+// (`a int UNIQUE DEFERRABLE …`, plus the named `CONSTRAINT n UNIQUE DEFERRABLE`
+// form) — DU-002 slice 141. Before this slice the inline column UNIQUE case
+// parsed only the optional NULLS [NOT] DISTINCT clause; a trailing DEFERRABLE
+// fell through to the default arm of the column-constraint loop and became a
+// HARD PARSE ERROR for the whole CREATE TABLE. The two flags ride on
+// ColumnDef.UniqueDeferrable / UniqueInitiallyDeferred so the backing index
+// records them and pg_get_constraintdef / pg_constraint re-emit the clause.
+// INITIALLY DEFERRED implies DEFERRABLE; INITIALLY IMMEDIATE is the default.
+func TestParseColumnUniqueDeferrable(t *testing.T) {
+	cases := []struct {
+		in           string
+		wantName     string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int UNIQUE)", "", false, false},
+		{"CREATE TABLE t (a int UNIQUE NOT DEFERRABLE)", "", false, false},
+		{"CREATE TABLE t (a int UNIQUE DEFERRABLE)", "", true, false},
+		{"CREATE TABLE t (a int UNIQUE DEFERRABLE INITIALLY IMMEDIATE)", "", true, false},
+		{"CREATE TABLE t (a int UNIQUE DEFERRABLE INITIALLY DEFERRED)", "", true, true},
+		{"CREATE TABLE t (a int UNIQUE INITIALLY DEFERRED)", "", true, true},
+		// Composes with NULLS NOT DISTINCT and with a following column.
+		{"CREATE TABLE t (a int UNIQUE NULLS NOT DISTINCT DEFERRABLE INITIALLY DEFERRED, b text)", "", true, true},
+		// Named inline column UNIQUE.
+		{"CREATE TABLE t (a int CONSTRAINT u_a UNIQUE DEFERRABLE INITIALLY DEFERRED)", "u_a", true, true},
+		{"CREATE TABLE t (a int CONSTRAINT u_a UNIQUE DEFERRABLE)", "u_a", true, false},
+		{"CREATE TABLE t (a int CONSTRAINT u_a UNIQUE NOT DEFERRABLE)", "u_a", false, false},
+		// DEFERRABLE composes with a following NOT NULL constraint on the column.
+		{"CREATE TABLE t (a int UNIQUE DEFERRABLE NOT NULL)", "", true, false},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		col := ct.Columns[0]
+		if !col.Unique {
+			t.Fatalf("Parse(%q): column a Unique=false, want true", c.in)
+		}
+		if col.UniqueConstraintName != c.wantName {
+			t.Errorf("Parse(%q): UniqueConstraintName=%q want %q", c.in, col.UniqueConstraintName, c.wantName)
+		}
+		if col.UniqueDeferrable != c.wantDefer {
+			t.Errorf("Parse(%q): UniqueDeferrable=%v want %v", c.in, col.UniqueDeferrable, c.wantDefer)
+		}
+		if col.UniqueInitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): UniqueInitiallyDeferred=%v want %v", c.in, col.UniqueInitiallyDeferred, c.wantDeferred)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {

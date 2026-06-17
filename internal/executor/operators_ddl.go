@@ -1264,6 +1264,10 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				// NULLS NOT DISTINCT (PG 15+) — record so pg_get_constraintdef
 				// re-emits `UNIQUE NULLS NOT DISTINCT (col)`. DU-002 slice 136.
 				idx.NullsNotDistinct = c.UniqueNullsNotDistinct
+				// DEFERRABLE [INITIALLY DEFERRED] — record so pg_get_constraintdef /
+				// pg_constraint re-emit the clause on dump. DU-002 slice 141.
+				idx.Deferrable = c.UniqueDeferrable
+				idx.InitiallyDeferred = c.UniqueInitiallyDeferred
 			}
 		}
 	}

@@ -3758,6 +3758,49 @@ Same dump-fidelity scope caveat as slice 139 (no deferred *checking*). The
 inline-column and PRIMARY KEY DEFERRABLE forms (still discard the flag) remain
 for later slices.
 
+### Slice 141 — `DEFERRABLE` on an INLINE-column `UNIQUE`
+
+The inline-column sibling of slices 139/140: a `DEFERRABLE` trailer on a
+column-level `UNIQUE`, both anonymous (`a integer UNIQUE DEFERRABLE INITIALLY
+DEFERRED`) and named (`a integer CONSTRAINT cudef UNIQUE DEFERRABLE INITIALLY
+DEFERRED`). pg_dump must re-emit the same index-backed constraint forms as the
+table-level case: `ADD CONSTRAINT uniqcdef_a_key UNIQUE (a) DEFERRABLE INITIALLY
+DEFERRED` (anonymous → auto name `<tbl>_<col>_key`) and `ADD CONSTRAINT cudef
+UNIQUE (a) DEFERRABLE INITIALLY DEFERRED` (named → user name).
+
+The inline column UNIQUE parser case (`a int UNIQUE [NULLS …]` and `CONSTRAINT
+name UNIQUE [NULLS …]`) parsed only the optional `NULLS [NOT] DISTINCT` clause
+and had **no slot** for a trailing `DEFERRABLE`. The keyword therefore fell
+through to the column-constraint loop's `default` arm, which returns — leaving
+`DEFERRABLE` unconsumed as an unexpected token, a **hard parse error** that
+failed the whole `CREATE TABLE` (the same failure shape as the anonymous
+table-level form before slice 139). The fix:
+
+1. **Parser** (`internal/parser/ddl.go`) — both inline UNIQUE cases now call a
+   shared `parseUniqueDeferrable` helper after the `NULLS` clause, consuming a
+   `[NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` trailer (and a
+   bare `INITIALLY DEFERRED`, which implies `DEFERRABLE`) into two new
+   `ColumnDef.UniqueDeferrable` / `UniqueInitiallyDeferred` fields
+   (`internal/parser/ast.go`). The helper factors out the identical trailer
+   grammar used by the table-level forms.
+2. **Executor** (`internal/executor/operators_ddl.go`) — the per-column UNIQUE
+   loop threads both flags onto the backing `catalog.Index` (right beside the
+   `NullsNotDistinct` assignment from slice 136).
+3. **Deparse + `pg_constraint`** — unchanged from slice 139: the shared
+   `buildConstraintDefString` appends the clause from the index, and
+   `pg_constraint` emits `condeferrable`/`condeferred` from the index.
+
+The round-trip test adds `public.uniqcdef (a integer UNIQUE DEFERRABLE INITIALLY
+DEFERRED, …)` and `public.uniqcndef (a integer CONSTRAINT cudef UNIQUE DEFERRABLE
+INITIALLY DEFERRED, …)` and asserts both `ADD CONSTRAINT … DEFERRABLE INITIALLY
+DEFERRED` lines, with negative guards against the dropped-flag (`… UNIQUE (a);`)
+and partial-render (`… UNIQUE (a) DEFERRABLE;`) regressions for both names. Unit
+test: `TestParseColumnUniqueDeferrable` (parser capture across the
+NOT/IMMEDIATE/DEFERRED/bare-INITIALLY/named/NULLS-compose/trailing-NOT-NULL
+forms). Same dump-fidelity scope caveat (no deferred *checking*). The PRIMARY KEY
+DEFERRABLE forms (anonymous + named + inline, all still discard the flag) remain
+for later slices.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
