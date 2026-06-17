@@ -1,26 +1,32 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 126 (loop #90) — a multi-column UNIQUE constraint whose
-key order DIFFERS from the table's column order now dumps byte-identically.
-`CREATE TABLE public.uniqm (a integer, b integer, c text, UNIQUE (b, a))` →
-`ADD CONSTRAINT uniqm_b_a_key UNIQUE (b, a)`. **No production change** — a
-regression guard: goopg stores index key columns in declared order
-(catalog.Index.Columns), and both the deparse (buildConstraintDefString,
-internal/executor/expr.go) and the auto-name generator
-(internal/executor/operators_ddl.go:1294, `<table>_<col1>_<col2>_key`) consume
-that slice, so both the `(b, a)` order and the `uniqm_b_a_key` name fall out
-correctly. The constraint-backed UNIQUE/PK path was previously covered only by a
-single-column UNIQUE (foo_code_key) and a declaration-order multi-column PK
-(bar_pkey (a,b)) — neither tested the multi-column `_key` name join NOR a
-non-table-order key list. Verified byte-identical vs real pg_dump 18.3 (reference
-/tmp/du126_pgdata).
+Last landed: DU-002 slice 128 (loop #92) — anonymous table-level CHECK with
+NO INHERIT (`CREATE TABLE t (..., CHECK (expr) NO INHERIT)`) now re-emits the
+` NO INHERIT` suffix on dump. **Real production fix:** slice 127's auto-naming
+kept only the aggregate `CreateTableStmt.TableHasNoInheritCheck` bool and
+DISCARDED the per-check flag, so the constraint stored NoInherit=false and the
+dump produced a plain *inheritable* CHECK (pg_get_constraintdef dropped
+` NO INHERIT`; pg_constraint.connoinherit reported 'f') — a re-loaded dump would
+wrongly propagate the constraint to children. The deparse path already appended
+the suffix when the flag was set (slice 127); gap was purely the lost flag.
+Fix threads it end-to-end:
+  - parser/ast.go: TableCheckNoInherit []bool parallel to TableChecks
+  - parser/ddl.go: both anonymous-CHECK parse sites append one flag each
+  - catalog/catalog.go: AddCheckWithNoInherit (AddCheck delegates false);
+    pg_constraint CHECK VirtualRow connoinherit from nc.NoInherit (was 'f')
+  - executor/operators_ddl.go: TableChecks loop passes TableCheckNoInherit[i]
+  chk2 (y integer, CHECK (y > 0) NO INHERIT) → CONSTRAINT chk2_y_check
+  CHECK ((y > 0)) NO INHERIT. Verified byte-identical vs real pg_dump 18.3
+  (reference /tmp/du128_pgdata).
+Committed + pushed (see git log).
 
-Files: internal/testport/pgdump_connsetup_test.go (uniqm fixture + positive assert
-+ 2 negative guards rejecting uniqm_a_b_key / `UNIQUE (a, b)`),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 126), .ralph/fix_plan.md.
-Committed + pushed.
+Files: internal/parser/ast.go, internal/parser/ddl.go,
+internal/catalog/catalog.go, internal/executor/operators_ddl.go,
+internal/testport/pgdump_connsetup_test.go,
+docs/design/0110-0001-pg-dump-tap-port.md, .ralph/fix_plan.md.
 
-Next direction (slice 127): a table+VIEW dependency-ordering case (verify
-topological emission ORDER, not just presence), OR a multi-column CHECK constraint
-(`CHECK (a < b)` referencing two columns), OR a UNIQUE constraint with an INCLUDE
-column.
+Next direction (slice 129): a NAMED table-level NO-INHERIT check
+(`CONSTRAINT c CHECK (...) NO INHERIT`) — the analog gap: PartitionCheckConstraint
+(TableNamedChecks) lacks a NoInherit field, so named NO-INHERIT checks still drop
+the suffix. OR a UNIQUE constraint with an INCLUDE column, OR a table+VIEW
+dependency-ordering case (verify topological emission ORDER).

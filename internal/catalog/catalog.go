@@ -179,9 +179,17 @@ func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool, isL
 // constraints (pg_constraint's VirtualRows skips empty-name / zero-OID rows so
 // the common unnamed case stays invisible in the catalog). M0097-0023.
 func (t *Table) AddCheck(name, expr string, oid uint32) {
+	t.AddCheckWithNoInherit(name, expr, oid, false)
+}
+
+// AddCheckWithNoInherit is AddCheck for a CHECK that may carry NO INHERIT
+// (PG18 connoinherit='t'). An anonymous table-level `CHECK (...) NO INHERIT`
+// must record the flag so pg_get_constraintdef re-emits the ` NO INHERIT`
+// suffix on dump and pg_constraint reports connoinherit. DU-002 slice 128.
+func (t *Table) AddCheckWithNoInherit(name, expr string, oid uint32, noInherit bool) {
 	t.CheckConstraints = append(t.CheckConstraints, expr)
 	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{
-		Name: name, Expr: expr, OID: oid, IsLocal: true,
+		Name: name, Expr: expr, OID: oid, IsLocal: true, NoInherit: noInherit,
 	})
 }
 
@@ -3016,9 +3024,13 @@ func (c *InMemory) registerSystemTables() {
 					row[15] = "f"
 				}
 				row[16] = fmt.Sprintf("%d", nc.InhCount) // coninhcount
-				row[17] = "f"                            // connoinherit
-				row[18] = "f"                            // conperiod
-				row[24] = nc.Expr                        // conbin
+				if nc.NoInherit {
+					row[17] = "t" // connoinherit (CHECK ... NO INHERIT). DU-002 slice 128.
+				} else {
+					row[17] = "f"
+				}
+				row[18] = "f"     // conperiod
+				row[24] = nc.Expr // conbin
 				row[25] = "t"                            // conenforced: always true in v0
 				out = append(out, row)
 			}

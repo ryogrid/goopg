@@ -1823,11 +1823,15 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
-			// Accept optional NO INHERIT.
+			// Accept optional NO INHERIT, recording it per-check so the suffix
+			// round-trips through the dump. DU-002 slice 128.
+			noInherit := false
 			if p.acceptIdentKeyword("no") {
 				_ = p.acceptIdentKeyword("inherit")
 				stmt.TableHasNoInheritCheck = true
+				noInherit = true
 			}
+			stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
 		} else if p.acceptIdentKeyword("exclude") {
 			// Anonymous EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
 			cdef := p.parseExcludeConstraint()
@@ -1925,7 +1929,8 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				if err != nil {
 					return nil, err
 				}
-				if constraintName != "" {
+				anonCheck := constraintName == ""
+				if !anonCheck {
 					// Named CHECK constraint: store with its name for pg_constraint.
 					stmt.TableNamedChecks = append(stmt.TableNamedChecks, PartitionCheckConstraint{
 						Name: constraintName, Expr: expr,
@@ -1939,9 +1944,16 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					_ = p.acceptIdentKeyword("enforced")
 				}
 				// Accept optional NO INHERIT (CONSTRAINT name CHECK NO INHERIT).
+				noInherit := false
 				if p.acceptIdentKeyword("no") {
 					_ = p.acceptIdentKeyword("inherit")
 					stmt.TableHasNoInheritCheck = true
+					noInherit = true
+				}
+				// Keep TableCheckNoInherit parallel to TableChecks: only the
+				// anonymous branch appended an expr. DU-002 slice 128.
+				if anonCheck {
+					stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
 				// CONSTRAINT name FOREIGN KEY (cols) REFERENCES t (cols) … —

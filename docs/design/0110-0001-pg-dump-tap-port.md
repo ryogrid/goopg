@@ -3316,6 +3316,37 @@ Positive asserts pin both names + inline rendering; negative guards reject a
 single-vs-multi flip (`chk_a_check` / `chk1_check`). Verified byte-identical to
 real pg_dump 18.3 (reference `/tmp/du127_pgdata`).
 
+### Slice 128 — anonymous table-level CHECK with NO INHERIT
+
+Slice 127 made anonymous table-level CHECKs round-trip, but only the *aggregate*
+`CreateTableStmt.TableHasNoInheritCheck` bool survived parsing — the **per-check**
+NO INHERIT flag was discarded. So `CREATE TABLE t (..., CHECK (expr) NO INHERIT)`
+stored `NamedCheckConstraint.NoInherit=false`, and the dump emitted a plain
+*inheritable* CHECK: `pg_get_constraintdef` dropped the ` NO INHERIT` suffix and
+`pg_constraint.connoinherit` reported `'f'`. On a re-loaded dump the constraint
+would wrongly propagate to child tables — a silent semantic divergence.
+
+The deparse path already appended ` NO INHERIT` when the flag was set (added in
+slice 127's `pg_get_constraintdef` CHECK branch); the gap was purely the lost
+flag. The fix threads it end-to-end:
+
+- `parser`: `CreateTableStmt.TableCheckNoInherit []bool` is kept parallel to
+  `TableChecks`; both anonymous-CHECK parse sites (bare and `CONSTRAINT`-with-
+  empty-name) append one entry each, recording the per-check NO INHERIT.
+- `catalog`: new `Table.AddCheckWithNoInherit(name, expr, oid, noInherit)`
+  (`AddCheck` now delegates with `false`); the `pg_constraint` `VirtualRows`
+  CHECK row sets `connoinherit` from `nc.NoInherit` (was hard-coded `'f'`).
+- `executor`: the `s.TableChecks` loop passes `TableCheckNoInherit[i]` through.
+
+```sql
+CREATE TABLE public.chk2 (y integer, CHECK (y > 0) NO INHERIT);
+-- → CONSTRAINT chk2_y_check CHECK ((y > 0)) NO INHERIT
+```
+
+Positive assert pins the suffix; negative guard rejects a plain
+`CONSTRAINT chk2_y_check CHECK ((y > 0))\n` (flag dropped). Verified
+byte-identical to real pg_dump 18.3 (reference `/tmp/du128_pgdata`).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

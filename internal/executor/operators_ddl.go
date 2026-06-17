@@ -1344,9 +1344,13 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Giving them name+OID here makes them surface in pg_constraint (contype='c')
 	// and therefore in pg_dump — previously they were stored with an empty name
 	// and OID 0, so the dumped CREATE TABLE silently dropped them. DU-002 slice 127.
-	for _, chk := range s.TableChecks {
+	for i, chk := range s.TableChecks {
 		autoName := o.autoCheckName(tbl, chk)
-		tbl.AddCheck(autoName, chk, o.allocConstraintOID(autoName))
+		// TableCheckNoInherit is parallel to TableChecks; an anonymous
+		// `CHECK (...) NO INHERIT` must keep its flag so the dumped
+		// constraintdef re-emits the suffix. DU-002 slice 128.
+		noInherit := i < len(s.TableCheckNoInherit) && s.TableCheckNoInherit[i]
+		tbl.AddCheckWithNoInherit(autoName, chk, o.allocConstraintOID(autoName), noInherit)
 	}
 	// Named table-level CHECK constraints from CONSTRAINT name CHECK (expr). M0097-0023.
 	for _, nc := range s.TableNamedChecks {

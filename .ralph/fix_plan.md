@@ -2530,6 +2530,41 @@ object support.
         dependency-ordering case (verify topological emission ORDER), OR a UNIQUE
         constraint with an INCLUDE column, OR a NO-INHERIT table-level CHECK
         (`CHECK (...) NO INHERIT`, exercises the ` NO INHERIT` deparse suffix).
+      - **PROGRESS 2026-06-17 (loop #92):** **DU-002 slice 128 LANDED** — an
+        anonymous table-level CHECK with NO INHERIT (`CREATE TABLE t (..., CHECK
+        (expr) NO INHERIT)`) now re-emits the ` NO INHERIT` suffix on dump.
+        **Real production fix:** slice 127's auto-naming kept only the aggregate
+        `CreateTableStmt.TableHasNoInheritCheck` bool, DISCARDING the per-check
+        flag, so the constraint stored `NamedCheckConstraint.NoInherit=false`;
+        the dump then produced a plain *inheritable* CHECK
+        (`pg_get_constraintdef` dropped ` NO INHERIT`, `pg_constraint.connoinherit`
+        reported `'f'`) — on a re-loaded dump the constraint would wrongly
+        propagate to child tables, a silent semantic divergence. The deparse path
+        already appended ` NO INHERIT` when the flag was set (slice 127); the gap
+        was purely the lost flag. Fix threads it end-to-end: parser adds
+        `TableCheckNoInherit []bool` parallel to `TableChecks` (both anonymous
+        parse sites append one entry each); catalog adds
+        `Table.AddCheckWithNoInherit` (`AddCheck` delegates with `false`) and the
+        `pg_constraint` CHECK VirtualRow sets `connoinherit` from `nc.NoInherit`
+        (was hard-coded `'f'`); executor's `TableChecks` loop passes the flag
+        through. `CREATE TABLE public.chk2 (y integer, CHECK (y > 0) NO INHERIT)`
+        → `CONSTRAINT chk2_y_check CHECK ((y > 0)) NO INHERIT`. Verified
+        byte-identical vs real pg_dump 18.3 (reference `/tmp/du128_pgdata`). Files:
+        `internal/parser/ast.go` (TableCheckNoInherit field),
+        `internal/parser/ddl.go` (both anonymous-CHECK parse sites append the
+        flag), `internal/catalog/catalog.go` (AddCheckWithNoInherit + connoinherit
+        from nc.NoInherit), `internal/executor/operators_ddl.go` (loop passes
+        flag), `internal/testport/pgdump_connsetup_test.go` (chk2 fixture +
+        positive assert + negative NO-INHERIT-dropped guard),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 128). Gates: `go build
+        ./internal/parser/ ./internal/catalog/ ./internal/executor/` OK;
+        `TestPort_PgDumpConnectionSetup` PASS (2.8s); `go test
+        ./internal/parser/ ./internal/catalog/ ./internal/executor/` PASS; pgbench
+        pre-commit smoke on commit. **Next: slice 129** — a table+VIEW
+        dependency-ordering case (verify topological emission ORDER), OR a UNIQUE
+        constraint with an INCLUDE column, OR a named (CONSTRAINT name CHECK ...
+        NO INHERIT) check (`PartitionCheckConstraint` lacks a NoInherit field, so
+        named NO-INHERIT checks still drop the suffix — the analog gap to this slice).
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

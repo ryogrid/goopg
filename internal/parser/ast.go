@@ -1005,6 +1005,12 @@ type CreateTableStmt struct {
 	// TableChecks holds raw SQL expressions from table-level CHECK constraints.
 	// M0097-0014.
 	TableChecks []string
+	// TableCheckNoInherit is parallel to TableChecks: entry i is true when the
+	// anonymous table-level CHECK at TableChecks[i] carries NO INHERIT. Tracked
+	// per-check (not just the aggregate TableHasNoInheritCheck) so an anonymous
+	// `CHECK (...) NO INHERIT` re-emits its suffix through pg_get_constraintdef
+	// on dump. DU-002 slice 128.
+	TableCheckNoInherit []bool
 	// TableNamedChecks holds explicitly named table-level CHECK constraints,
 	// e.g. `CONSTRAINT check_a CHECK (a > 0)`. M0097-0023.
 	TableNamedChecks []PartitionCheckConstraint
