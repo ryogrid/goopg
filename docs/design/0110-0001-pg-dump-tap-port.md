@@ -4294,6 +4294,30 @@ The TAP test creates `public.ins_foo(a integer) LANGUAGE sql AS $$ INSERT … $$
 asserts the `CREATE PROCEDURE … (IN a integer)` signature plus the exact
 `LANGUAGE sql` / `AS $$ … $$;` fragment (no stray `RETURNS`).
 
+### Slice 155 — OUT-parameter procedure round-trip (coverage; clean positive)
+
+Slice 154 drove the first procedure but its single parameter was `IN`-only, so it
+covered only `buildFunctionArguments`' `IN ` argmode branch. This slice adds a
+procedure with a **mixed `IN`/`OUT` signature**, forcing `pg_get_function_arguments`
+to emit the `OUT ` prefix — the first non-`IN` argmode any slice has driven through
+`dumpFunc`. The parser maps `OUT` to `proargmodes` element `'o'` (`FuncArgOut`,
+`operators_ddl.go:5522`), `buildFunctionArguments` (`expr.go`) renders it as `OUT `,
+and pg_dump re-emits the full mode-qualified list verbatim in the CREATE PROCEDURE
+signature. The `OUT` parameter is pure catalog metadata; the `INSERT` body is always
+accepted by `validateSQLFunctionBody` (the `InsertStmt` case is unconditionally OK),
+keeping the fixture focused on the argmode render rather than SQL-procedure body
+semantics. Verified empirically — clean positive. Real pg_dump 18.3 renders:
+
+```
+CREATE PROCEDURE public.proc_out(IN a integer, OUT b integer)
+    LANGUAGE sql
+    AS $$ INSERT INTO public.foo (id) VALUES (a) $$;
+```
+
+The TAP test creates `public.proc_out(a integer, OUT b integer) LANGUAGE sql AS $$
+INSERT … $$` and asserts the `(IN a integer, OUT b integer)` signature plus the exact
+`LANGUAGE sql` / `AS $$ … $$;` fragment.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

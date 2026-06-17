@@ -3348,6 +3348,26 @@ object support.
         skipped); pgbench pre-commit smoke on commit. **Next: slice 155** — a
         procedure carrying an OUT/INOUT param (exercises the `OUT `/`INOUT ` argmode
         render), or a STABLE / PARALLEL RESTRICTED volatility-marker variant.
+      - **PROGRESS 2026-06-17 (loop #121):** **DU-002 slice 155 LANDED** — a
+        procedure with a mixed `IN`/`OUT` signature, so the dump exercises
+        `buildFunctionArguments`' `OUT ` argmode branch (`expr.go`) through `dumpFunc`
+        — a path NO prior slice reached (slice 154's ins_foo was `IN`-only; functions
+        with all-IN params suppress the mode prefix entirely). The parser maps `OUT`
+        to `proargmodes` element `'o'` (`FuncArgOut`, `operators_ddl.go:5522`),
+        `buildFunctionArguments` renders `OUT `, and pg_dump re-emits the full
+        mode-qualified list verbatim. The `OUT` param is pure catalog metadata; the
+        `INSERT` body is always accepted by `validateSQLFunctionBody` (the
+        `InsertStmt` case is unconditionally OK), keeping the fixture on the argmode
+        render. **Clean positive (verified empirically), not a divergence** — the path
+        was already wired. Test adds `public.proc_out(a integer, OUT b integer)
+        LANGUAGE sql AS $$ INSERT … $$` and asserts `CREATE PROCEDURE
+        public.proc_out(IN a integer, OUT b integer)` + the `LANGUAGE sql` / `AS $$ …
+        $$;` fragment. Files: `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK; `go build
+        ./internal/...` OK; `TestPort_PgDumpConnectionSetup` PASS (2.11s, not
+        skipped); pgbench pre-commit smoke on commit. **Next: slice 156** — a
+        procedure carrying an INOUT param (the `'b'` → `INOUT ` branch, the last
+        unrendered argmode), or a STABLE / PARALLEL RESTRICTED volatility variant.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

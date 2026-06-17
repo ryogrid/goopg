@@ -1563,6 +1563,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create procedure ins_foo: %v", err)
 	}
 
+	// Slice 155: a procedure carrying an OUT parameter, so the dump exercises
+	// buildFunctionArguments' `OUT ` argmode branch (expr.go) through dumpFunc —
+	// a path NO prior slice reached. Every function/procedure dumped so far had
+	// only IN parameters (slice 154's ins_foo rendered `IN a integer`; functions
+	// with all-IN params suppress the mode prefix entirely). A procedure with a
+	// mixed IN/OUT signature forces pg_get_function_arguments to emit BOTH the
+	// `IN ` and the `OUT ` prefix, and pg_dump renders the full mode-qualified
+	// list verbatim in the CREATE PROCEDURE signature. The OUT parameter is pure
+	// catalog metadata (proargmodes='b'/'o' element); the INSERT body is always
+	// accepted by validateSQLFunctionBody regardless of return shape, keeping the
+	// fixture focused on the argmode render rather than SQL-procedure body rules.
+	// A dropped or mis-rendered OUT prefix (e.g. emitting it as a plain `IN`, or
+	// omitting the OUT param from the signature) would surface exactly here.
+	if err := runSQLSimple(t, c, "CREATE PROCEDURE public.proc_out(a integer, OUT b integer) LANGUAGE sql AS $$ INSERT INTO public.foo (id) VALUES (a) $$"); err != nil {
+		t.Fatalf("create procedure proc_out: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2088,6 +2105,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "CREATE PROCEDURE public.ins_foo(IN a integer)\n    LANGUAGE sql\n    AS $$ INSERT INTO public.foo (id) VALUES (a) $$;") {
 			t.Errorf("pg_dump dropped/mangled ins_foo's LANGUAGE/body or emitted a stray RETURNS\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 155 (asserted):** the OUT-parameter procedure (proc_out) must
+		// round-trip with BOTH the `IN ` and `OUT ` mode prefixes. pg_dump rebuilds
+		// the signature from pg_get_function_arguments(oid), which renders each
+		// parameter mode-qualified; the OUT param (proargmodes element 'b'/'o') is
+		// the first non-IN argmode any slice has driven through dumpFunc. Real
+		// pg_dump 18.3 renders:
+		//   CREATE PROCEDURE public.proc_out(IN a integer, OUT b integer)
+		//       LANGUAGE sql
+		//       AS $$ INSERT INTO public.foo (id) VALUES (a) $$;
+		// A divergence (OUT dropped, rendered as IN, or the param omitted) surfaces
+		// exactly here.
+		if !strings.Contains(res.Stdout, "CREATE PROCEDURE public.proc_out(IN a integer, OUT b integer)") {
+			t.Errorf("pg_dump dropped/mangled the proc_out OUT-parameter signature\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE PROCEDURE public.proc_out(IN a integer, OUT b integer)\n    LANGUAGE sql\n    AS $$ INSERT INTO public.foo (id) VALUES (a) $$;") {
+			t.Errorf("pg_dump dropped/mangled proc_out's LANGUAGE/body\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the
