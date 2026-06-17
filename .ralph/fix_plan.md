@@ -3776,9 +3776,26 @@ object support.
         no-inherited-column-reemit assertions), `docs/design/0110-0001-pg-dump-tap-port.md` (slice 170).
         Gates: gofmt OK; `go build ./internal/...` OK; `go vet ./internal/testport/` clean;
         `TestPgInheritsEmitsLegacyInheritanceRows` PASS; `TestPort_PgDumpConnectionSetup` PASS (2.81s,
-        not skipped); catalog + full executor suites PASS; pgbench pre-commit smoke on commit. **Next:**
-        a dedicated MINVALUE/MAXVALUE keyword-AST-node slice (latent routing ambiguity), multi-level
-        partition trees, or multi-parent / inherited-CHECK-constraint inheritance dump fidelity.
+        not skipped); catalog + full executor suites PASS; pgbench pre-commit smoke on commit.
+      - **PROGRESS 2026-06-17 (loop #138):** **DU-002 slice 171 LANDED — clean positive
+        (verified, no fix needed).** Multi-level (sub-partitioned) partition tree now pinned as a
+        regression guard. The middle node of a sub-partitioned tree (`CREATE TABLE mid PARTITION OF
+        top ... PARTITION BY ...`) is the only relation that is simultaneously `relispartition=true`
+        AND `relkind='p'`: pg_dump must emit BOTH its own `PARTITION BY` clause (it has children) AND
+        an ATTACH to its own parent (it is a child). Verified to round-trip on the existing machinery:
+        `buildUserPGClassRow`/`catalog.go` VirtualRows derive `relkind='p'` from `PartitionMethod`
+        regardless of `isPartition` and set `relpartbound` whenever `isPartition && PartitionBounds`,
+        so the middle node carries `relkind='p'`+`relispartition=true`+non-empty `relpartbound`
+        together; `execCreatePartitionChild` sets the sub-partition key (so `pg_get_partkeydef`
+        renders it); `pg_inherits` emits one edge per `PartitionParentOID` (so the two-level tree
+        walks). Fixture `psub`→`psub_east`(LIST partition, sub-partitioned BY RANGE)→`psub_east_lo`;
+        4 assertions (top key clause, middle node's own key clause, middle ATTACH-to-top,
+        leaf ATTACH-to-middle). Files: `internal/testport/pgdump_connsetup_test.go` (fixture +
+        assertions), `docs/design/0110-0001-pg-dump-tap-port.md` (slice 171). Gates: gofmt OK;
+        `go build ./internal/...` OK; `TestPort_PgDumpConnectionSetup` PASS (2.45s, not skipped);
+        pgbench pre-commit smoke on commit. **Next:** dedicated MINVALUE/MAXVALUE keyword-AST-node
+        slice (latent routing ambiguity), or multi-parent inheritance (`INHERITS (a, b)` ordering +
+        shared-column merge) dump fidelity.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

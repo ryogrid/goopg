@@ -4866,6 +4866,47 @@ the inherited `pid`/`pname` columns inside the child's `CREATE TABLE` block.
 `TestPgInheritsEmitsLegacyInheritanceRows` (catalog) pins the multi-parent `pg_inherits` row shape /
 `inhseqno` ordering directly.
 
+### Slice 171 — multi-level (sub-partitioned) partition tree round-trip (clean positive)
+
+Slices 167–170 exercised only *single-level* relationships: one partitioned parent with
+direct leaf partitions, or one inheritance parent with a direct child. Slice 171 closes the
+last structural partition gap — a **sub-partitioned** tree, where a partition is *itself*
+partitioned:
+
+```sql
+CREATE TABLE public.psub (id integer, region text) PARTITION BY LIST (region);
+CREATE TABLE public.psub_east PARTITION OF public.psub FOR VALUES IN ('east') PARTITION BY RANGE (id);
+CREATE TABLE public.psub_east_lo PARTITION OF public.psub_east FOR VALUES FROM (0) TO (100);
+```
+
+The middle node `psub_east` is the interesting case: it is the *only* relation that is
+simultaneously `relispartition = true` (a LIST partition of `psub`) **and** `relkind = 'p'`
+(a RANGE-partitioned table with its own children). pg_dump must therefore emit, for that one
+node, **both** its own `PARTITION BY RANGE (id)` clause (because it has children, read via
+`pg_get_partkeydef`) **and** an `ALTER TABLE ONLY public.psub ATTACH PARTITION public.psub_east
+FOR VALUES IN ('east')` (because it is itself a child, read via `pg_get_expr(relpartbound)`).
+
+**No fix required — verified to round-trip on the existing machinery.** Two earlier slices
+already cover the combination without special-casing the middle node:
+
+- `buildUserPGClassRow` (and the sibling `catalog.go` `VirtualRows` path) derives
+  `relkind = 'p'` from `tbl.PartitionMethod != ""` **regardless of** `isPartition`, and sets
+  `relpartbound` whenever `isPartition && len(PartitionBounds) > 0`. So `psub_east` gets
+  `relkind='p'`, `relispartition=true`, `relfilenode=0`, *and* a non-empty `relpartbound`
+  simultaneously — exactly the dual identity pg_dump needs.
+- `execCreatePartitionChild` already sets `PartitionMethod`/`PartitionKey` on a partition that
+  carries its own `PARTITION BY` clause (the `s.PartitionBy != nil` branch), so
+  `pg_get_partkeydef(psub_east)` renders `RANGE (id)`.
+- `pg_inherits` `VirtualRows` emits one partition-edge row per `PartitionParentOID`, so both
+  `(psub_east → psub)` and `(psub_east_lo → psub_east)` edges are present and pg_dump walks the
+  two-level tree.
+
+The TAP test asserts all four signals survive the dump: the top `PARTITION BY LIST (region)`,
+the middle node's own `PARTITION BY RANGE (id)`, its `ATTACH … FOR VALUES IN ('east')` to the
+top, and the leaf's `ATTACH … FOR VALUES FROM (0) TO (100)` to the middle node. This pins the
+sub-partitioned shape as a regression guard for the dual-identity (`relispartition` ∧
+`relkind='p'`) pg_class row.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

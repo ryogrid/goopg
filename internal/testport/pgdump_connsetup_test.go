@@ -777,6 +777,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create inheritance child inh_child: %v", err)
 	}
 
+	// Slice 171: multi-level (sub-partitioned) partition tree. A partition that is
+	// ITSELF partitioned (`CREATE TABLE mid PARTITION OF top ... PARTITION BY ...`)
+	// is the one node that is simultaneously relispartition=true AND relkind='p':
+	// pg_dump must emit its `PARTITION BY` clause (it has children) *and* an ATTACH
+	// to its own parent (it is a child). The slices through 170 only exercised
+	// single-level partition trees. `psub_east` is the middle node: a LIST partition
+	// of `psub` that is sub-partitioned BY RANGE, with one leaf `psub_east_lo`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.psub (id integer, region text) PARTITION BY LIST (region)"); err != nil {
+		t.Fatalf("create top-level partitioned table psub: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.psub_east PARTITION OF public.psub FOR VALUES IN ('east') PARTITION BY RANGE (id)"); err != nil {
+		t.Fatalf("create sub-partitioned partition psub_east: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.psub_east_lo PARTITION OF public.psub_east FOR VALUES FROM (0) TO (100)"); err != nil {
+		t.Fatalf("create leaf partition psub_east_lo: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -2111,6 +2128,30 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 					t.Errorf("pg_dump re-emitted inherited column %q in inh_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
 				}
 			}
+		}
+		// **Slice 171 (asserted):** multi-level partition tree. The middle node
+		// psub_east is both a partition of psub (relispartition=true → ATTACH with a
+		// LIST bound) AND a partitioned table itself (relkind='p' → its own
+		// PARTITION BY RANGE clause + a leaf attached to it). buildUserPGClassRow
+		// already derives relkind='p' from PartitionMethod regardless of being a
+		// partition, and execCreatePartitionChild sets the sub-partition key, so this
+		// round-trips; assert it to guard the sub-partitioned shape. Verify (1) the
+		// top key clause, (2) the middle node's OWN partition-key clause, (3) its
+		// ATTACH-with-LIST-bound to the top, and (4) the leaf's ATTACH-with-RANGE
+		// bound to the middle node.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.psub (") ||
+			!strings.Contains(res.Stdout, "PARTITION BY LIST (region)") {
+			t.Errorf("pg_dump dropped/mangled the top-level partition-key clause; missing %q\n  full stdout=%q", "PARTITION BY LIST (region)", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.psub_east (") ||
+			!strings.Contains(res.Stdout, "PARTITION BY RANGE (id)") {
+			t.Errorf("pg_dump dropped the sub-partitioned partition's own PARTITION BY clause; missing CREATE TABLE public.psub_east / PARTITION BY RANGE (id)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.psub_east FOR VALUES IN ('east')") {
+			t.Errorf("pg_dump dropped the middle node's ATTACH-to-top bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.psub_east FOR VALUES IN ('east')", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.psub_east_lo FOR VALUES FROM (0) TO (100)") {
+			t.Errorf("pg_dump dropped the leaf's ATTACH-to-middle bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.psub_east_lo FOR VALUES FROM (0) TO (100)", res.Stdout)
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on
