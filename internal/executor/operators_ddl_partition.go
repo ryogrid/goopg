@@ -52,7 +52,8 @@ func validateDefaultExpr(e parser.Expr, pos int, ctx *Context) error {
 				}
 			}
 		}
-	case *parser.SubqueryExpr:
+	case *parser.SubqueryExpr, *parser.ExistsExpr, *parser.ArraySubqueryExpr:
+		// All three carry a nested SELECT in expression position.
 		return &ExecError{Code: "42P17", Pos: pos,
 			Message: "cannot use subquery in DEFAULT expression"}
 	case *parser.BinaryOp:
@@ -64,6 +65,67 @@ func validateDefaultExpr(e parser.Expr, pos int, ctx *Context) error {
 		return validateDefaultExpr(v.Operand, pos, ctx)
 	case *parser.CastExpr:
 		return validateDefaultExpr(v.Operand, pos, ctx)
+	case *parser.CollateExpr:
+		return validateDefaultExpr(v.Operand, pos, ctx)
+	case *parser.ArrayConstructorExpr:
+		// ARRAY[e1, e2, …]
+		for _, el := range v.Elements {
+			if err := validateDefaultExpr(el, pos, ctx); err != nil {
+				return err
+			}
+		}
+	case *parser.RowExpr:
+		// (e1, e2, …) row/tuple constructor
+		for _, el := range v.Elems {
+			if err := validateDefaultExpr(el, pos, ctx); err != nil {
+				return err
+			}
+		}
+	case *parser.CaseExpr:
+		// CASE [operand] WHEN cond THEN result … [ELSE result] END
+		if err := validateDefaultExpr(v.Operand, pos, ctx); err != nil {
+			return err
+		}
+		for _, w := range v.Whens {
+			if err := validateDefaultExpr(w.When, pos, ctx); err != nil {
+				return err
+			}
+			if err := validateDefaultExpr(w.Then, pos, ctx); err != nil {
+				return err
+			}
+		}
+		return validateDefaultExpr(v.Else, pos, ctx)
+	case *parser.InExpr:
+		// `x IN (subquery)` is a subquery; `x IN (val_list)` recurses into
+		// the operand and each list element.
+		if v.Subquery != nil {
+			return &ExecError{Code: "42P17", Pos: pos,
+				Message: "cannot use subquery in DEFAULT expression"}
+		}
+		if err := validateDefaultExpr(v.Operand, pos, ctx); err != nil {
+			return err
+		}
+		for _, el := range v.List {
+			if err := validateDefaultExpr(el, pos, ctx); err != nil {
+				return err
+			}
+		}
+	case *parser.IsNullExpr:
+		return validateDefaultExpr(v.Operand, pos, ctx)
+	case *parser.IsBoolExpr:
+		return validateDefaultExpr(v.Operand, pos, ctx)
+	case *parser.IsDistinctFromExpr:
+		if err := validateDefaultExpr(v.Left, pos, ctx); err != nil {
+			return err
+		}
+		return validateDefaultExpr(v.Right, pos, ctx)
+	case *parser.ArraySubscriptExpr:
+		if err := validateDefaultExpr(v.Base, pos, ctx); err != nil {
+			return err
+		}
+		return validateDefaultExpr(v.Index, pos, ctx)
+	case *parser.ExtractExpr:
+		return validateDefaultExpr(v.Source, pos, ctx)
 	}
 	return nil
 }

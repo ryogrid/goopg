@@ -5369,6 +5369,30 @@ the contents**, emitting a bare `AlterTableAlterColumnSet` action that the execu
 statements while the untouched `d` produces none. `RESET (...)` is left as the pre-existing no-op (pg_dump
 never emits it). Dump-fidelity only: goopg does not act on these planner-statistics hints.
 
+### Slice 186 — close the `validateDefaultExpr` compound-expression recursion gap
+
+The `defcol` fixture (slice 181) round-trips column DEFAULTs that wrap their value in compound
+expressions — `ARRAY[1,2,3]`, `CASE WHEN … THEN … ELSE … END`, a row constructor `(1, 2)`, an
+`IN`-list, `IS [NOT] NULL`, `IS DISTINCT FROM`, etc. Adding those shapes surfaced a latent
+correctness gap in the DEFAULT validator: `validateDefaultExpr`
+(`internal/executor/operators_ddl_partition.go`) rejects column references, aggregates, subqueries,
+and SRFs in a DEFAULT, but it only recursed into `FuncCall` args, `BinaryOp`, `UnaryOp`, and
+`CastExpr`. A column ref / aggregate / subquery hidden **inside** one of the compound nodes slipped
+through entirely, so goopg accepted DEFAULTs that PostgreSQL rejects with `42P17` / `42803` / `0A000`
+— e.g. `b integer[] DEFAULT ARRAY[a]` or `b boolean DEFAULT (a IS NULL)` referencing a sibling column.
+
+The fix adds recursion arms for every compound `parser.Expr` node that carries sub-expressions:
+`ArrayConstructorExpr` (Elements), `RowExpr` (Elems), `CaseExpr` (Operand + each WHEN/THEN + ELSE),
+`InExpr` (Operand + List; a populated `Subquery` is rejected as a subquery), `IsNullExpr`,
+`IsBoolExpr`, `IsDistinctFromExpr`, `CollateExpr`, `ArraySubscriptExpr`, and `ExtractExpr`. The
+subquery rejection now also covers `ExistsExpr` and `ArraySubqueryExpr` (both carry a nested SELECT in
+expression position), folded into the existing `SubqueryExpr` arm.
+
+`TestDefaultExprRejectsNestedColumnRefs` pins rejection of a column ref / aggregate / subquery nested
+inside each compound form (12 cases); `TestDefaultExprAcceptsConstantCompounds` guards against
+over-rejection by re-accepting the constant-only compound DEFAULTs the `defcol` fixture relies on.
+Validation-only: no change to how a valid DEFAULT is stored or evaluated.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
