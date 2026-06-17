@@ -1597,6 +1597,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create procedure proc_inout: %v", err)
 	}
 
+	// Slice 157: a function carrying STABLE + PARALLEL RESTRICTED, driving the
+	// two volatility/parallel cells that no prior slice reached. Slice 149 hit the
+	// IMMUTABLE cell (provolatile='i') and slice 150 the PARALLEL SAFE cell
+	// (proparallel='s'); the STABLE cell (provolatile='s') and the PARALLEL
+	// RESTRICTED cell (proparallel='r') were the last non-default volatility /
+	// parallel-safety values pg_dump could emit that nothing had exercised
+	// end-to-end. The parser already maps STABLE -> 's' (function.go:184) and
+	// RESTRICTED -> 'r' (function.go:253); the executor stores both onto
+	// catalog.Routine and pg_proc_view emits r.Volatile / r.Parallel verbatim, so
+	// this is a clean positive (no production change) closing the matrix. dumpFunc
+	// appends ` STABLE` (provolatile[0]=='s', pg_dump.c:13533) then
+	// ` PARALLEL RESTRICTED` (proparallel[0]=='r', pg_dump.c:13583) — volatility
+	// before parallel — yielding the one-line `LANGUAGE sql STABLE PARALLEL
+	// RESTRICTED`. A dropped or reordered clause (or a downgrade of either marker
+	// to its default) surfaces in the assertion below.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.add_six(integer) RETURNS integer LANGUAGE sql STABLE PARALLEL RESTRICTED AS $$ SELECT $1 + 6 $$"); err != nil {
+		t.Fatalf("create function add_six: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2155,6 +2174,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "CREATE PROCEDURE public.proc_inout(INOUT x integer)\n    LANGUAGE sql\n    AS $$ INSERT INTO public.foo (id) VALUES (x) $$;") {
 			t.Errorf("pg_dump dropped/mangled proc_inout's LANGUAGE/body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 157 (asserted):** the STABLE + PARALLEL RESTRICTED function
+		// (add_six) must round-trip both markers. Slice 149 covered IMMUTABLE
+		// (provolatile='i') and slice 150 PARALLEL SAFE (proparallel='s'); STABLE
+		// (provolatile='s') and PARALLEL RESTRICTED (proparallel='r') are the last
+		// non-default volatility/parallel cells dumpFunc can emit. dumpFunc appends
+		// volatility before parallel, so real pg_dump 18.3 renders:
+		//   CREATE FUNCTION public.add_six(integer) RETURNS integer
+		//       LANGUAGE sql STABLE PARALLEL RESTRICTED
+		//       AS $_$ SELECT $1 + 6 $_$;
+		// A divergence (either marker downgraded to its default, dropped, or the
+		// two clauses reordered) surfaces exactly here.
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.add_six(integer) RETURNS integer") {
+			t.Errorf("pg_dump dropped/mangled the add_six signature\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "    LANGUAGE sql STABLE PARALLEL RESTRICTED\n    AS $_$ SELECT $1 + 6 $_$;") {
+			t.Errorf("pg_dump dropped/mangled add_six's STABLE/PARALLEL RESTRICTED clauses or body\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

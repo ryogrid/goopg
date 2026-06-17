@@ -3390,6 +3390,28 @@ object support.
         RESTRICTED volatility variant (`provolatile='s'` / `proparallel='r'` cells not
         yet hit through pg_dump; same plumbing as slices 149/150), or a multi-statement
         SQL-procedure body.
+      - **PROGRESS 2026-06-17 (loop #124):** **DU-002 slice 157 LANDED** — a
+        function carrying `STABLE PARALLEL RESTRICTED` round-trips through pg_dump,
+        closing the volatility/parallel cell matrix. Slice 149 drove the `IMMUTABLE`
+        cell (`provolatile='i'`) and slice 150 the `PARALLEL SAFE` cell
+        (`proparallel='s'`); `STABLE` (`provolatile='s'`) and `PARALLEL RESTRICTED`
+        (`proparallel='r'`) were the last non-default volatility / parallel-safety
+        values `dumpFunc` can emit that no slice had exercised end-to-end. The parser
+        already maps `STABLE → 's'` (`function.go:184`) and `RESTRICTED → 'r'`
+        (`function.go:253`); the executor stores both onto `catalog.Routine` and
+        `pg_proc_view` emits `r.Volatile` / `r.Parallel` verbatim, so this is a
+        **clean positive (no production change)**, not a divergence. `dumpFunc`
+        appends volatility before parallel (`pg_dump.c:13535` then `:13583`), yielding
+        the one-line `LANGUAGE sql STABLE PARALLEL RESTRICTED`. Test adds
+        `public.add_six(integer) … STABLE PARALLEL RESTRICTED` and asserts the exact
+        `RETURNS integer` signature + the `LANGUAGE sql STABLE PARALLEL RESTRICTED` /
+        `AS $_$ SELECT $1 + 6 $_$;` fragment. Files:
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK; `go build
+        ./internal/...` OK; `TestPort_PgDumpConnectionSetup` PASS (2.16s, not skipped);
+        pgbench pre-commit smoke on commit. **Next: slice 158** — a multi-statement
+        SQL-procedure/function body (exercise the body re-render path beyond a single
+        statement), or a `TRANSFORM FOR TYPE` / `WINDOW` function clause.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

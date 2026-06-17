@@ -4342,6 +4342,32 @@ The TAP test creates `public.proc_inout(INOUT x integer) LANGUAGE sql AS $$ INSE
 and asserts the `(INOUT x integer)` signature plus the exact `LANGUAGE sql` / `AS $$ …
 $$;` fragment.
 
+### Slice 157 — STABLE + PARALLEL RESTRICTED round-trip (coverage; clean positive)
+
+Closes the volatility/parallel cell matrix through pg_dump. Slice 149 drove the
+`IMMUTABLE` cell (`provolatile='i'`) and slice 150 the `PARALLEL SAFE` cell
+(`proparallel='s'`); the two values neither slice reached are `STABLE`
+(`provolatile='s'`) and `PARALLEL RESTRICTED` (`proparallel='r'`) — the last
+non-default volatility / parallel-safety values `dumpFunc` can emit. This slice adds
+one function carrying **both** markers. The parser already maps `STABLE → 's'`
+(`function.go:184`) and `RESTRICTED → 'r'` (`function.go:253`); the executor stores
+both onto `catalog.Routine` and `pg_proc_view` emits `r.Volatile` / `r.Parallel`
+verbatim, so this is a clean positive (no production change). `dumpFunc` appends
+volatility **before** parallel (`pg_dump.c:13535` then `:13583`), so real pg_dump 18.3
+renders:
+
+```
+CREATE FUNCTION public.add_six(integer) RETURNS integer
+    LANGUAGE sql STABLE PARALLEL RESTRICTED
+    AS $_$ SELECT $1 + 6 $_$;
+```
+
+The TAP test creates `public.add_six(integer) … LANGUAGE sql STABLE PARALLEL
+RESTRICTED AS $$ SELECT $1 + 6 $$` and asserts the `RETURNS integer` signature plus the
+exact one-line `LANGUAGE sql STABLE PARALLEL RESTRICTED` / `AS $_$ … $_$;` fragment
+(the `$1` in the body forces the `$_$` delimiter). A downgrade of either marker to its
+default, a dropped clause, or a reorder surfaces in the assertion.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
