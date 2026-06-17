@@ -3449,6 +3449,34 @@ negative guards reject a dropped INCLUDE (`uniqi_a_key UNIQUE (a)`, covering col
 lost) and a key/cover confusion (`uniqi_a_b_key UNIQUE (a, b)`, a different
 uniqueness semantic). Verified byte-identical to real pg_dump 18.3.
 
+### Slice 132 — view→table dependency ordering (topological emission)
+
+A `pg_dump` archive is replayed top-to-bottom by `pg_restore`/`psql` with no
+forward references: every object must appear *after* the objects it depends on.
+A view that selects from `public.foo` therefore must have its `CREATE VIEW`
+emitted **after** the `CREATE TABLE public.foo` that backs it; otherwise restore
+fails with `relation "public.foo" does not exist`.
+
+Slices 57/58/60 added view, renamed-column-view and materialized-view coverage,
+but each only asserted the statement *text is present* — none pinned its
+*position* relative to the base table. This slice locks the ORDER.
+
+pg_dump derives the order by topologically sorting the dump's `TocEntry` DAG,
+which it builds from the dependency edges goopg surfaces (`pg_depend` rows plus
+the rewrite/relation edges `getDependencies` reads). A regression that dropped or
+inverted goopg's view→table dependency edge would let a view sort ahead of its
+table and silently produce an **unrestorable** dump that still passes every
+presence check.
+
+**No production change needed** — goopg already emits the table before all three
+dependents. Empirically verified against goopg's own pg_dump output (byte
+offsets): `CREATE TABLE public.foo (` at 21374 precedes `CREATE MATERIALIZED VIEW
+public.foo_mv` (22004), `CREATE VIEW public.foo_rview` (22497) and `CREATE VIEW
+public.foo_view` (22700). The new positional assert computes
+`strings.Index(...)` for the base table and each dependent view and fails if any
+view's offset is below the table's — guarding the topological order that restore
+correctness depends on, complementing the presence checks of the earlier slices.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

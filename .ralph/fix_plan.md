@@ -2631,6 +2631,32 @@ object support.
         (verify topological emission ORDER), OR a partial-index predicate
         round-trip (`CREATE INDEX ... WHERE`), OR a UNIQUE NULLS NOT DISTINCT
         constraint.
+      - **PROGRESS 2026-06-17 (loop #97):** **DU-002 slice 132 LANDED** — a
+        table→VIEW dependency-ordering (topological emission) regression guard.
+        **No production change needed** (empirically verified vs goopg's own
+        pg_dump output): a `pg_dump` archive replays top-to-bottom with no
+        forward references, so every view that selects from `public.foo` must be
+        emitted AFTER `CREATE TABLE public.foo` or `pg_restore` fails with
+        `relation "public.foo" does not exist`. Slices 57/58/60 added view /
+        renamed-column-view / matview coverage but each only asserted the
+        statement TEXT is PRESENT — none pinned its POSITION relative to the
+        base table. pg_dump derives the order by topologically sorting the
+        dump's TocEntry DAG from the dependency edges goopg surfaces (`pg_depend`
+        + the rewrite/relation edges `getDependencies` reads); a regression that
+        dropped/inverted goopg's view→table edge would let a view sort ahead of
+        its table and silently produce an unrestorable dump that still passes
+        every presence check. Verified offsets: `CREATE TABLE public.foo (`
+        @21374 precedes `foo_mv` @22004, `foo_rview` @22497, `foo_view` @22700.
+        New positional assert computes `strings.Index` for the base table and
+        each of the 3 dependent views and fails if any view offset < table
+        offset. Files: `internal/testport/pgdump_connsetup_test.go` (slice-132
+        positional assert), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice
+        132). Gates: gofmt OK; `go build ./internal/...` OK;
+        `TestPort_PgDumpConnectionSetup` PASS (2.07s); pgbench pre-commit smoke
+        on commit. **Next: slice 133** — a partial-index predicate round-trip
+        on a constraint-backed path, OR a UNIQUE NULLS NOT DISTINCT constraint,
+        OR a multi-table FK dependency-ordering case (referenced table before
+        referencing).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

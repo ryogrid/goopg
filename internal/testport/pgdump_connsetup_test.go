@@ -1627,6 +1627,44 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				t.Errorf("pg_dump dropped a MATERIALIZED VIEW; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
+		// **Slice 132 (asserted):** DEPENDENCY-ORDERING — every view that selects
+		// from `public.foo` must be emitted AFTER the `CREATE TABLE public.foo`
+		// that backs it. pg_restore replays the dump top-to-bottom with no
+		// forward references, so a view whose CREATE precedes its base table
+		// would fail restore with `relation "public.foo" does not exist`. The
+		// preceding slices (57/58/60) only asserted each view's TEXT is PRESENT;
+		// none pinned its POSITION relative to the base table. pg_dump derives
+		// this order by topologically sorting the dump's TocEntry DAG, which it
+		// builds from the dependency rows goopg surfaces (pg_depend + the
+		// rewrite/relation edges getDependencies reads) — so a regression that
+		// dropped or inverted goopg's view→table dependency edge would let the
+		// view sort ahead of the table and silently produce an unrestorable dump.
+		// Empirically verified vs goopg's own pg_dump output: foo precedes
+		// foo_view, foo_rview and foo_mv. This guards the ORDER, complementing the
+		// presence checks above. (strings.Index returns the first occurrence; all
+		// four markers are unique CREATE headers, so a non-negative index is the
+		// statement's emission offset.)
+		tableOff := strings.Index(res.Stdout, "CREATE TABLE public.foo (")
+		if tableOff < 0 {
+			t.Errorf("pg_dump missing CREATE TABLE public.foo for dependency-order check\n  full stdout=%q", res.Stdout)
+		} else {
+			dependents := []string{
+				"CREATE VIEW public.foo_view AS",
+				"CREATE VIEW public.foo_rview AS",
+				"CREATE MATERIALIZED VIEW public.foo_mv AS",
+			}
+			for _, dep := range dependents {
+				depOff := strings.Index(res.Stdout, dep)
+				if depOff < 0 {
+					t.Errorf("pg_dump missing %q for dependency-order check\n  full stdout=%q", dep, res.Stdout)
+					continue
+				}
+				if depOff < tableOff {
+					t.Errorf("pg_dump emitted a dependent view BEFORE its base table — unrestorable dump: %q at %d precedes CREATE TABLE public.foo at %d\n  full stdout=%q",
+						dep, depOff, tableOff, res.Stdout)
+				}
+			}
+		}
 		// **Slice 116 (asserted):** a standalone SEQUENCE must round-trip. pg_dump's
 		// getTables now discovers the relkind='S' relation (pg_class surfaces each
 		// IsSequence table) and dumpSequence regenerates the DDL from pg_sequence
