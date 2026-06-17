@@ -4584,6 +4584,41 @@ RETURN $1 + 1; END; $$` and asserts both the signature and the exact `LANGUAGE p
 surfaces in the first assertion. Unit coverage: `TestPgLanguageBuiltinRows` now asserts the
 4-row view, and `TestPgProcViewRendersRoutine` asserts `prolang=13627` for a plpgsql routine.
 
+### Slice 164 — `RETURNS record` pseudo-type round-trip (real divergence fixed)
+
+Slices 161/162 covered SETOF and array return types; every prior function slice returned a
+concrete scalar/array type whose OID `typeNameToOIDStr` already knew. `RETURNS record` (the
+pseudo-type representing any composite) was a separate, untested sibling — and it was broken.
+The parser stores the bare name `record` on `ReturnType`, but `typeNameToOIDStr` had no `record`
+case, so the runtime `pg_proc` view resolved `prorettype` to `"0"` (InvalidOid). pg_dump's
+`dumpFunc` builds the RETURNS clause from `format_type(p.prorettype, NULL)`; `format_type(0)`
+yields the placeholder `-`, so the dump rendered `RETURNS -` — broken SQL that no longer
+round-trips.
+
+**Oracle probe (PG 18.3).** `record` is `pg_type` OID **2249** (`typtype='p'`), its array
+`_record` is **2287**. A SQL function declared `RETURNS record` whose final SELECT yields a
+composite value (e.g. `SELECT (1, 2)`) is accepted, and pg_dump renders `RETURNS record`.
+
+**Production fix.** One-line-per-OID additions to `internal/initdb/pg_proc_view.go`'s
+`typeNameToOIDStr`: `record`→`2249` and `record[]`→`2287`. The **sibling** path —
+goopg's `format_type` (`internal/executor/expr.go`) — already maps 2249→`record`, so once the
+view emits `prorettype=2249` the two agree and pg_dump's `format_type(2249)` produces `record`.
+No executor change was needed: the body `SELECT (1, 2)` parses as a single row-constructor
+column, so `validateSQLFunctionBody`'s one-column check accepts it.
+
+Real pg_dump 18.3 renders:
+
+```
+CREATE FUNCTION public.ret_rec() RETURNS record
+    LANGUAGE sql
+    AS $$ SELECT (1, 2) $$;
+```
+
+The TAP test creates `public.ret_rec() RETURNS record LANGUAGE sql AS $$ SELECT (1, 2) $$` and
+asserts both the signature and the exact `RETURNS record` / `AS $$ … $$;` fragment. Unit
+coverage: `TestPgProcViewRecordReturnType` pins `prorettype=2249` (record) and `2287`
+(record[]).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

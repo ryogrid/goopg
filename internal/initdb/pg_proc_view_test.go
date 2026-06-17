@@ -100,6 +100,46 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 	}
 }
 
+// TestPgProcViewRecordReturnType pins prorettype for a function declared
+// `RETURNS record` (DU-002 slice 164): the pseudo-type record resolves to OID
+// 2249 (and record[] to 2287). Before this slice typeNameToOIDStr had no record
+// case, so prorettype was 0 and pg_dump's format_type(0) rendered `RETURNS -`.
+func TestPgProcViewRecordReturnType(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "ret_rec",
+		ReturnType: catalog.Type{Name: "record"},
+		Language:   "sql",
+		Body:       "SELECT (1, 2)",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "ret_rec_arr",
+		ReturnType: catalog.Type{Name: "record[]"},
+		Language:   "sql",
+		Body:       "SELECT ARRAY[(1, 2)]",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	// prorettype is column index 4.
+	const prorettype = 4
+	userRows := rows[len(builtinProcs):]
+	if userRows[0][1] != "ret_rec" || userRows[0][prorettype] != "2249" {
+		t.Errorf("ret_rec prorettype = %q, want 2249 (record OID)", userRows[0][prorettype])
+	}
+	if userRows[1][1] != "ret_rec_arr" || userRows[1][prorettype] != "2287" {
+		t.Errorf("ret_rec_arr prorettype = %q, want 2287 (_record OID)", userRows[1][prorettype])
+	}
+}
+
 // TestPgProcViewProretset pins the proretset column (DU-002 slice 34):
 // built-in stubs are never SRFs ('f'); a user routine reflects
 // catalog.Routine.ReturnsSet. dumpFunc reads this to decide RETURNS SETOF.

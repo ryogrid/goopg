@@ -1742,6 +1742,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function plpg_inc: %v", err)
 	}
 
+	// Slice 164: a function whose RESULT type is the pseudo-type `record`
+	// (`RETURNS record`). Every prior function slice returned a concrete scalar
+	// or array type whose OID typeNameToOIDStr already knew; `record` was a
+	// separate, untested sibling and it was BROKEN. The parser stores the bare
+	// type name "record" on ReturnType, but typeNameToOIDStr had no case for it,
+	// so prorettype resolved to "0" (InvalidOid). pg_dump's dumpFunc builds the
+	// RETURNS clause from `format_type(p.prorettype, NULL)`; format_type(0)
+	// yields the placeholder `-`, so the dump rendered `RETURNS -` — broken SQL
+	// that no longer round-trips. This slice adds the missing `record`→2249 (and
+	// array `record[]`→2287) mappings to typeNameToOIDStr; goopg's format_type
+	// already renders 2249 as `record` (expr.go), so the two sibling paths now
+	// agree and pg_dump emits `RETURNS record`. The body `SELECT (1, 2)` is a
+	// single row-constructor column (a record value), so validateSQLFunctionBody
+	// sees exactly one target and accepts it; PG likewise accepts a SQL function
+	// declared `RETURNS record` whose final SELECT yields a composite value.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.ret_rec() RETURNS record LANGUAGE sql AS $$ SELECT (1, 2) $$"); err != nil {
+		t.Fatalf("create function ret_rec: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2419,6 +2438,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.plpg_inc(integer) RETURNS integer\n    LANGUAGE plpgsql\n    AS $_$ BEGIN RETURN $1 + 1; END; $_$;") {
 			t.Errorf("pg_dump dropped/mangled plpg_inc's plpgsql language or body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 164 (asserted):** a function returning the pseudo-type `record`
+		// (ret_rec) must round-trip. dumpFunc builds the RETURNS clause from
+		// `format_type(p.prorettype, NULL)`. Before this slice typeNameToOIDStr
+		// had no `record` case, so prorettype was 0 and format_type(0) yielded the
+		// placeholder `-` — the dump rendered `RETURNS -`, broken SQL. record now
+		// maps to OID 2249, and goopg's format_type(2249) is `record`, so the two
+		// sibling paths agree. Real pg_dump 18.3 emits:
+		//   CREATE FUNCTION public.ret_rec() RETURNS record
+		//       LANGUAGE sql
+		//       AS $$ SELECT (1, 2) $$;
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.ret_rec() RETURNS record") {
+			t.Errorf("pg_dump dropped/mangled the ret_rec record return type (prorettype likely 0)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.ret_rec() RETURNS record\n    LANGUAGE sql\n    AS $$ SELECT (1, 2) $$;") {
+			t.Errorf("pg_dump dropped/mangled ret_rec's body or return clause\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

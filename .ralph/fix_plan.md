@@ -3573,6 +3573,32 @@ object support.
         function-attribute gaps are genuine features: composite/`RECORD` return type,
         `TRANSFORM FOR TYPE` (`protrftypes` always NULL), or `RETURNS TABLE` (maps to OUT
         params in goopg's parser — a known divergence).
+      - **PROGRESS 2026-06-17 (loop #131):** **DU-002 slice 164 LANDED — real
+        divergence fixed.** A function returning the pseudo-type `record`
+        (`public.ret_rec() RETURNS record LANGUAGE sql AS $$ SELECT (1, 2) $$`) now
+        round-trips through pg_dump. Every prior function slice returned a concrete
+        scalar/array type whose OID `typeNameToOIDStr` already knew; `RETURNS record`
+        was a separate, untested sibling and was broken. The parser stores the bare name
+        `record` on `ReturnType`, but `typeNameToOIDStr` had no `record` case, so the
+        `pg_proc` view resolved `prorettype` to `"0"` (InvalidOid). pg_dump's `dumpFunc`
+        builds the RETURNS clause from `format_type(p.prorettype, NULL)`; `format_type(0)`
+        yields the placeholder `-` → the dump rendered `RETURNS -`, broken SQL. Oracle
+        probe (PG 18.3): `record` is `pg_type` OID 2249, `_record` is 2287. **Fix (one
+        sibling path):** `internal/initdb/pg_proc_view.go` `typeNameToOIDStr` adds
+        `record`→`2249` and `record[]`→`2287`. The OTHER sibling — goopg's `format_type`
+        (`internal/executor/expr.go`) — already maps 2249→`record`, so the two now agree
+        and pg_dump emits `RETURNS record`. No executor change needed: the body
+        `SELECT (1, 2)` parses as a single row-constructor column, so
+        `validateSQLFunctionBody`'s one-column check accepts it. Files:
+        `internal/initdb/pg_proc_view.go` (2 typeNameToOIDStr cases),
+        `internal/initdb/pg_proc_view_test.go` (new TestPgProcViewRecordReturnType →
+        2249/2287), `internal/testport/pgdump_connsetup_test.go` (fixture + 2 assertions),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 164 section). Gates: gofmt OK;
+        `go build ./internal/...` OK; `go vet` clean; `TestPort_PgDumpConnectionSetup`
+        PASS (2.19s, not skipped); `internal/initdb` suite PASS; pgbench pre-commit smoke
+        on commit. **Next: slice 165** — remaining function-attribute gaps:
+        `TRANSFORM FOR TYPE` (`protrftypes` always NULL) or `RETURNS TABLE` (maps to OUT
+        params in goopg's parser — a known divergence).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

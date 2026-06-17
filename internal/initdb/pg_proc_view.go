@@ -64,6 +64,12 @@ func typeNameToOIDStr(typName string) string {
 		return "2279"
 	case "internal":
 		return "2281"
+	case "record":
+		// Pseudo-type representing any composite type. A SQL/plpgsql function
+		// declared `RETURNS record` stores this name on prorettype; pg_dump's
+		// dumpFunc renders it via format_type(2249) → "record". Without this
+		// case prorettype resolved to 0 and the dump emitted `RETURNS -`.
+		return "2249"
 	case "pg_lsn":
 		return "3220"
 	// Array types (common ones)
@@ -103,6 +109,11 @@ func typeNameToOIDStr(typName string) string {
 		return "1231"
 	case "uuid[]":
 		return "2951"
+	case "record[]":
+		// _record (array of records). Same pseudo-type family as record (2249);
+		// included for symmetry with the array branches above so a function
+		// declared `RETURNS record[]` resolves to the array OID rather than 0.
+		return "2287"
 	default:
 		return "0"
 	}
