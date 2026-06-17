@@ -957,6 +957,12 @@ type ColumnDef struct {
 	// CheckNoInherit is true when the inline CHECK constraint carries NO INHERIT.
 	// Stored so LIKE INCLUDING ALL can error on partitioned tables. M0097-0023.
 	CheckNoInherit bool
+	// Compression is the per-column TOAST compression method from an inline
+	// `COMPRESSION <method>` clause (`col text COMPRESSION lz4`) — "pglz" or
+	// "lz4". Empty when no method was written. Threaded onto catalog.Column.
+	// Compression purely so the column round-trips through pg_dump (goopg does
+	// not actually TOAST/compress). DU-002 slice 183.
+	Compression string
 }
 
 func (c ColumnDef) Pos() int { return c.pos }
@@ -1703,6 +1709,11 @@ const (
 	// Records the storage type (plain/main/external/extended) on the catalog column.
 	// StorageType holds the storage name; ColumnName holds the column. M0097-0023.
 	AlterTableSetStorage
+	// AlterTableSetCompression — `ALTER COLUMN name SET COMPRESSION method`.
+	// Records the per-column TOAST compression method (pglz/lz4) on the catalog
+	// column purely for pg_dump round-trip fidelity (goopg does not TOAST).
+	// CompressionType holds the method; ColumnName holds the column. DU-002 slice 183.
+	AlterTableSetCompression
 	// AlterIndexAttachPartition — `ALTER INDEX parent ATTACH PARTITION child`.
 	// Registers child as a partition of parent in the index partition tree.
 	// ConstraintName holds the parent index name; ChildIndexName holds the child. M0097-0023.
@@ -1759,6 +1770,9 @@ type AlterTableAction struct {
 	// StorageType is the storage strategy for AlterTableSetStorage.
 	// Values: "plain", "main", "external", "extended". M0097-0023.
 	StorageType string
+	// CompressionType is the TOAST compression method for AlterTableSetCompression.
+	// Values: "pglz", "lz4". DU-002 slice 183.
+	CompressionType string
 	// ChildIndexName is populated for AlterIndexAttachPartition and holds
 	// the name of the child index to attach. M0097-0023.
 	ChildIndexName string

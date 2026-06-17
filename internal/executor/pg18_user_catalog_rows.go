@@ -531,6 +531,24 @@ func storageNameToAttCode(name string) byte {
 	}
 }
 
+// compressionNameToAttCode maps a column's per-column compression-method name (as
+// recorded by `COMPRESSION <method>` / `ALTER COLUMN ... SET COMPRESSION`:
+// "pglz"/"lz4") to the single-char pg_attribute.attcompression code PG uses
+// ('p'/'l', matching TOAST_PGLZ_COMPRESSION / TOAST_LZ4_COMPRESSION in
+// postgres/src/include/access/toast_compression.h). Returns 0 for an empty or
+// unrecognized name, signalling "no explicit method" — encoded as '\0'
+// (InvalidCompressionMethod), for which pg_dump emits no SET COMPRESSION clause.
+func compressionNameToAttCode(name string) byte {
+	switch strings.ToLower(name) {
+	case "pglz":
+		return 'p'
+	case "lz4":
+		return 'l'
+	default:
+		return 0
+	}
+}
+
 // buildUserPGAttributeRow constructs a 25-column pg_attribute row for a
 // user-defined column (attstattarget appended last as NULL).
 func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalog.Column) Row {
@@ -639,6 +657,16 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	if c := storageNameToAttCode(col.Storage); c != 0 {
 		attStorageChar = c
 	}
+	// A per-column compression override (COMPRESSION <method> / ALTER COLUMN ...
+	// SET COMPRESSION) sets pg_attribute.attcompression to 'p' (pglz) or 'l'
+	// (lz4). pg_dump re-emits a `SET COMPRESSION <method>` for either; the PG18
+	// default is '\0' (encoded as "") meaning "use default_toast_compression",
+	// for which pg_dump emits nothing. attcompression was hardcoded to "" so a
+	// declared method was silently dropped from the dump. DU-002 slice 183.
+	attCompressionStr := ""
+	if c := compressionNameToAttCode(col.Compression); c != 0 {
+		attCompressionStr = string(c)
+	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),            // attrelid
 		NewStringDatum(col.Name),               // attname (name)
@@ -650,7 +678,7 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		NewBoolDatum(attrs.TypByVal),           // attbyval
 		NewStringDatum(string(attrs.TypAlign)), // attalign
 		NewStringDatum(string(attStorageChar)), // attstorage
-		NewStringDatum(""),                     // attcompression (PG18 default: '\0' meaning "default")
+		NewStringDatum(attCompressionStr),      // attcompression ('\0' default; 'p'/'l' override)
 		NewBoolDatum(col.NotNull),              // attnotnull
 		NewBoolDatum(col.DefaultExpr != nil || col.GeneratedExpr != "" || catalog.IsSerialTypeName(col.Type.Name)), // atthasdef (generated cols + SERIAL nextval defaults carry their expr in pg_attrdef too)
 		NewBoolDatum(false),                  // atthasmissing

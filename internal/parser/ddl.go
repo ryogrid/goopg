@@ -2385,6 +2385,24 @@ func (p *parser) parsePartitionBoundValues() ([]Expr, error) {
 	return vals, nil
 }
 
+// normalizeCompressionMethod canonicalizes a `COMPRESSION <method>` argument for
+// storage on the catalog column. PG accepts "pglz", "lz4", and "default"
+// (case-insensitive); "default" resets attcompression to '\0' (the
+// default_toast_compression GUC applies) and is recorded as the empty string, so
+// no SET COMPRESSION clause is dumped. Any other / empty token also normalizes to
+// "" — goopg does not enforce the method, this is dump-fidelity only.
+// DU-002 slice 183.
+func normalizeCompressionMethod(method string) string {
+	switch strings.ToLower(method) {
+	case "pglz":
+		return "pglz"
+	case "lz4":
+		return "lz4"
+	default:
+		return ""
+	}
+}
+
 // parseColumnDef parses `name TYPE [NOT NULL | PRIMARY KEY]`.
 func (p *parser) parseColumnDef() (ColumnDef, error) {
 	pos := p.cur().Pos
@@ -2428,9 +2446,13 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		// COLLATE collation_name — ignore collation; goopg v0 doesn't track collations. M0097-0071.
 		case p.acceptIdentKeyword("collate"):
 			_, _ = p.parseIdent() // consume collation name (may be quoted)
-		// COMPRESSION method — column-level compression method (PG 14+); goopg v0 ignores it.
+		// COMPRESSION method — column-level compression method (PG 14+). goopg does
+		// not actually TOAST/compress, but records the method so the column
+		// round-trips through pg_dump (which re-emits a SET COMPRESSION clause for
+		// pglz/lz4). DU-002 slice 183.
 		case p.acceptIdentKeyword("compression"):
-			_, _ = p.parseIdent() // consume method name (pglz, lz4, default, etc.)
+			method, _ := p.parseIdent() // consume method name (pglz, lz4, default, etc.)
+			col.Compression = normalizeCompressionMethod(method.Value)
 		// GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY or GENERATED ALWAYS AS (expr) STORED (M0096-0008)
 		case p.acceptIdentKeyword("generated"):
 			isAlways := p.acceptIdentKeyword("always")
@@ -4706,6 +4728,22 @@ func (p *parser) parseAlter() (Stmt, error) {
 					Kind:        AlterTableSetStorage,
 					ColumnName:  colName,
 					StorageType: storageType,
+				})
+				return stmt, nil
+			}
+			// SET COMPRESSION method — record TOAST compression on the catalog
+			// column for pg_dump round-trip fidelity (goopg does not TOAST).
+			// DU-002 slice 183.
+			if p.acceptIdentKeyword("compression") {
+				method := ""
+				if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+					method = p.cur().Value
+					p.advance()
+				}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:            AlterTableSetCompression,
+					ColumnName:      colName,
+					CompressionType: normalizeCompressionMethod(method),
 				})
 				return stmt, nil
 			}

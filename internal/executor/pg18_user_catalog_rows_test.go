@@ -598,6 +598,47 @@ func TestUserPGAttributeStorageOverride(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeCompressionOverride pins the per-column compression override
+// (DU-002 slice 183). A column carrying a `COMPRESSION <method>` /
+// `ALTER COLUMN ... SET COMPRESSION` result (catalog.Column.Compression) must
+// report that method in pg_attribute.attcompression ('p' for pglz, 'l' for lz4).
+// pg_dump re-emits `ALTER TABLE ... SET COMPRESSION <method>` whenever
+// attcompression is 'p' or 'l'; the PG18 default is '\0' (encoded as ""), for
+// which pg_dump emits nothing. attcompression was hardcoded to "" so a declared
+// method was silently dropped from the dump.
+func TestUserPGAttributeCompressionOverride(t *testing.T) {
+	const attcompressionIdx = 10 // attcompression position in the user pg_attribute row
+	tbl := &catalog.Table{Name: "t", OID: 99002}
+
+	// No method: a text column reports the default '\0' (encoded as "").
+	base := buildUserPGAttributeRow(nil, tbl, catalog.Column{Name: "c", Type: catalog.Type{Name: "text"}, Ordinal: 0})
+	if got := base[attcompressionIdx].StringValue(); got != "" {
+		t.Fatalf("text column without method: attcompression=%q want \"\" (default)", got)
+	}
+
+	// Each compression method maps to its single-char attcompression code.
+	for _, tc := range []struct {
+		method string
+		want   string
+	}{
+		{"pglz", "p"},
+		{"lz4", "l"},
+		{"LZ4", "l"}, // case-insensitive (parser normalizes, but be robust)
+	} {
+		col := catalog.Column{Name: "c", Type: catalog.Type{Name: "text"}, Ordinal: 0, Compression: tc.method}
+		row := buildUserPGAttributeRow(nil, tbl, col)
+		if got := row[attcompressionIdx].StringValue(); got != tc.want {
+			t.Errorf("COMPRESSION %s: attcompression=%q want %q", tc.method, got, tc.want)
+		}
+	}
+
+	// An unrecognized method leaves the default intact (no corruption).
+	bogus := catalog.Column{Name: "c", Type: catalog.Type{Name: "text"}, Ordinal: 0, Compression: "bogus"}
+	if got := buildUserPGAttributeRow(nil, tbl, bogus)[attcompressionIdx].StringValue(); got != "" {
+		t.Errorf("unrecognized method: attcompression=%q want \"\" (default unchanged)", got)
+	}
+}
+
 // TestUserPGAttributeEnumColumn pins the enum-column resolution (DU-002 slice
 // 88). A column whose declared type is a user-defined enum must report
 // pg_attribute.atttypid = the enum's dynamic pg_type OID (not the text

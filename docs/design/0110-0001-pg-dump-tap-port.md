@@ -5256,6 +5256,45 @@ statements while the untouched `d` column produces none (its `attstorage == typs
 This slice is dump-fidelity only: goopg does not TOAST, so the storage strategy has no runtime
 effect; it is recorded and round-tripped so a restored schema preserves the declared strategy.
 
+### Slice 183 — per-column compression method (COMPRESSION / SET COMPRESSION) round-trip
+
+The exact analogue of slice 182 for the sibling `pg_attribute` column `attcompression`: a per-column
+TOAST compression method — written inline (`a text COMPRESSION lz4`) or via
+`ALTER TABLE ... ALTER COLUMN c SET COMPRESSION {pglz|lz4}` — was silently dropped from the dump.
+pg_dump's `dumpTableSchema` (pg_dump.c) reads `a.attcompression` and emits
+
+```sql
+ALTER TABLE ONLY public.cmprcol ALTER COLUMN a SET COMPRESSION pglz;
+```
+
+whenever the char is `'p'` (pglz) or `'l'` (lz4); the PG18 default `'\0'` (the
+`default_toast_compression` GUC applies) emits nothing. goopg's parser previously **discarded** the
+`COMPRESSION` keyword entirely (ddl.go column-constraint loop), and `buildUserPGAttributeRow`
+hardcoded `attcompression=""`, so the method never reached the dump. Three layers were wired,
+mirroring slice 182:
+
+1. **Parser** — a new `normalizeCompressionMethod` helper canonicalizes the argument to `"pglz"`/
+   `"lz4"` (`default`/unknown → `""`). The inline `COMPRESSION` arm now stores it on
+   `ColumnDef.Compression`; a new `SET COMPRESSION` arm in the ALTER-COLUMN path emits an
+   `AlterTableSetCompression` action carrying `CompressionType` + `ColumnName`.
+
+2. **`buildUserPGAttributeRow`** — a new `compressionNameToAttCode` helper maps `"pglz"/"lz4"` to
+   PG's `'p'/'l'` (`TOAST_PGLZ_COMPRESSION`/`TOAST_LZ4_COMPRESSION`); when `Column.Compression` is set
+   it overrides the hardcoded `'\0'` default. CREATE TABLE threads `ColumnDef.Compression` →
+   `catalog.Column.Compression` in both column-builder paths.
+
+3. **The `AlterTableSetCompression` executor arm** (`operators_ddl.go`) records the method on the
+   in-memory column **and** flushes it through the same delete-old-rows + `syncTableToCatalogHeap`
+   re-sync path slice 182 uses — the load-bearing step, since pg_dump scans the persisted
+   `pg_attribute` heap, not the live catalog object.
+
+`TestUserPGAttributeCompressionOverride` pins the char mapping (pglz→p, lz4→l, plus no-method and
+unrecognized-name fall-throughs to the `'\0'` default). Parser tests `TestParseAlterTableSetCompression`
+and `TestParseCreateTableColumnCompression` pin both input forms. The TAP test adds a
+`cmprcol(a, b, d text)` fixture — `a` inline `COMPRESSION pglz`, `b` `SET COMPRESSION lz4` — and
+asserts the dump re-emits both `SET COMPRESSION` statements while the untouched `d` produces none.
+Dump-fidelity only: goopg does not TOAST/compress, so the method has no runtime effect.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

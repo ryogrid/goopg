@@ -920,6 +920,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("alter storcol.b set storage main: %v", err)
 	}
 
+	// Slice 183: a per-column TOAST compression method must survive the dump.
+	// pg_dump emits `ALTER TABLE ONLY ... ALTER COLUMN ... SET COMPRESSION
+	// <method>` whenever pg_attribute.attcompression is 'p' (pglz) or 'l' (lz4)
+	// (pg_dump.c dumpTableSchema). goopg recorded the method on
+	// catalog.Column.Compression, but the synthesized pg_attribute row hardcoded
+	// attcompression="" (the '\0' default), so the method was silently dropped
+	// from the dump. `cmprcol.a` uses the inline `COMPRESSION pglz` form; `b` the
+	// `ALTER ... SET COMPRESSION lz4` form; the untouched `d` must NOT re-emit.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.cmprcol (a text COMPRESSION pglz, b text, d text)"); err != nil {
+		t.Fatalf("create table cmprcol: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.cmprcol ALTER COLUMN b SET COMPRESSION lz4"); err != nil {
+		t.Fatalf("alter cmprcol.b set compression lz4: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -2437,6 +2452,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if strings.Contains(res.Stdout, "ALTER COLUMN d SET STORAGE") {
 			t.Errorf("pg_dump emitted a spurious SET STORAGE for an untouched column (storcol.d)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 183 (asserted):** per-column compression methods. `cmprcol.a`
+		// was declared `COMPRESSION pglz` and `cmprcol.b` `SET COMPRESSION lz4`;
+		// both are non-default, so pg_dump must re-emit each as a standalone
+		// `ALTER TABLE ONLY public.cmprcol ALTER COLUMN <c> SET COMPRESSION
+		// <method>;` (pg_dump.c dumpTableSchema). Before the fix attcompression
+		// echoed the '\0' default, so neither statement appeared. The untouched
+		// `d` column must NOT produce a SET COMPRESSION.
+		for _, sub := range []string{
+			"ALTER TABLE ONLY public.cmprcol ALTER COLUMN a SET COMPRESSION pglz;",
+			"ALTER TABLE ONLY public.cmprcol ALTER COLUMN b SET COMPRESSION lz4;",
+		} {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a column compression method; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		if strings.Contains(res.Stdout, "ALTER COLUMN d SET COMPRESSION") {
+			t.Errorf("pg_dump emitted a spurious SET COMPRESSION for an untouched column (cmprcol.d)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

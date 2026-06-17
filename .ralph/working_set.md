@@ -1,32 +1,33 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 182 (loop #150) — per-column storage override
-(`ALTER COLUMN ... SET STORAGE {PLAIN|MAIN|EXTERNAL|EXTENDED}`) now round-trips through pg_dump.
-Pivoted OFF the (closed) column-DEFAULT fall-through audit to a real pg_dump feature gap.
+Last landed: DU-002 slice 183 (loop #151) — per-column COMPRESSION method
+(`COMPRESSION <m>` inline / `ALTER COLUMN ... SET COMPRESSION <m>`) now round-trips through pg_dump.
+Exact analogue of slice 182 (SET STORAGE) for the sibling pg_attribute.attcompression column.
 
-pg_dump's dumpTableSchema emits `ALTER TABLE ONLY <t> ALTER COLUMN <c> SET STORAGE <mode>;` only
-when `a.attstorage != t.typstorage`. Parser accepted the clause + executor recorded
-`catalog.Column.Storage`, but TWO layers dropped it:
-  1. buildUserPGAttributeRow populated attstorage from the TYPE default unconditionally → always
-     == typstorage → pg_dump never emitted. Fixed via new storageNameToAttCode helper
-     (plain/main/external/extended → 'p'/'m'/'e'/'x') that shadows the type default when set.
-  2. LOAD-BEARING: pg_attribute is a HEAP populated by syncTableToCatalogHeap at CREATE TABLE; the
-     AlterTableSetStorage executor arm only mutated in-memory Column.Storage, never the heap row.
-     Fixed by flushing through the same delete-old-rows + syncTableToCatalogHeap re-sync path
-     DROP COLUMN / SET NOT NULL use (gated on catalogHeapSyncAvailable).
-Dump-fidelity only (goopg doesn't TOAST). Verified: TestPort_PgDumpConnectionSetup PASS (3.02s).
+pg_dump's dumpTableSchema emits `ALTER TABLE ONLY <t> ALTER COLUMN <c> SET COMPRESSION <method>;`
+when attcompression is 'p' (pglz) or 'l' (lz4); default '\0' emits nothing. Parser previously
+DISCARDED the COMPRESSION keyword and buildUserPGAttributeRow hardcoded attcompression="". Fixed in
+3 layers (mirroring 182):
+  1. Parser: new normalizeCompressionMethod helper (pglz/lz4; default/unknown→""); inline COMPRESSION
+     arm stores ColumnDef.Compression; new SET COMPRESSION ALTER arm → AlterTableSetCompression action.
+  2. buildUserPGAttributeRow: new compressionNameToAttCode (pglz→'p', lz4→'l'); overrides hardcoded
+     default when Column.Compression set. CREATE TABLE threads ColumnDef.Compression→catalog.Column
+     .Compression in BOTH column-builder paths (operators_ddl.go ~712 and ~899).
+  3. LOAD-BEARING: AlterTableSetCompression executor arm flushes via delete-old-rows +
+     syncTableToCatalogHeap re-sync (pg_dump scans the persisted heap, not the live catalog object).
+New fields: catalog.Column.Compression, parser.ColumnDef.Compression, AlterTableAction.CompressionType,
+AST kind AlterTableSetCompression. Dump-fidelity only (goopg doesn't TOAST/compress).
 
-Files: internal/executor/pg18_user_catalog_rows.go (+storageNameToAttCode, attstorage override),
-internal/executor/operators_ddl.go (AlterTableSetStorage arm: heap re-sync),
-internal/executor/pg18_user_catalog_rows_test.go (TestUserPGAttributeStorageOverride),
-internal/testport/pgdump_connsetup_test.go (storcol fixture, 2 positive + 1 negative assert),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 182), .ralph/fix_plan.md (loop-150 PROGRESS).
-Gates: gofmt OK; go vet executor+testport clean; full ./internal/executor/ PASS;
-TestPort_PgDumpConnectionSetup PASS; pgbench pre-commit smoke on commit.
+Files: internal/catalog/catalog.go, internal/parser/ast.go, internal/parser/ddl.go,
+internal/executor/pg18_user_catalog_rows.go, internal/executor/operators_ddl.go,
+internal/executor/pg18_user_catalog_rows_test.go (TestUserPGAttributeCompressionOverride),
+internal/parser/alter_test.go (TestParseAlterTableSetCompression + TestParseCreateTableColumnCompression),
+internal/testport/pgdump_connsetup_test.go (cmprcol fixture, 2 positive + 1 negative assert),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 183), .ralph/fix_plan.md (loop-151 PROGRESS).
+Gates: gofmt OK; go vet parser+catalog+executor clean; full parser/catalog/executor PASS;
+TestPort_PgDumpConnectionSetup PASS (3.21s); pgbench pre-commit smoke on commit.
 
-Next (slice 183 candidates): (1) column COMPRESSION dump fidelity — attcompression is the exact
-analogous gap (pg_dump emits SET COMPRESSION when attcompression differs); parser currently
-IGNORES the COMPRESSION keyword (ddl.go:2431) so it'd need a Column.Compression field + the same
-heap-resync wiring. SAME shape as this slice, clean follow-up. (2) deferred MINVALUE/MAXVALUE
-keyword-AST-node slice (HIGHER RISK: partition routing). (3) close validateDefaultExpr
-array/row/CASE/InExpr recursion gap (executor semantic change — own gates).
+Next (slice 184 candidates): (1) deferred MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK:
+partition routing). (2) close validateDefaultExpr array/row/CASE/InExpr recursion gap (executor
+semantic change — own gates). (3) other pg_dump per-column attribute gaps (attoptions / attfdwoptions
+are NULL today; attstattarget dump fidelity).

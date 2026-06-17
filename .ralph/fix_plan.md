@@ -4008,6 +4008,32 @@ object support.
         COMPRESSION` when attcompression differs; needs the same heap-resync wiring + the parser already
         ignores the keyword so it'd need to record it); deferred MINVALUE/MAXVALUE keyword-AST-node slice
         (HIGHER RISK: partition routing); or close the `validateDefaultExpr` recursion gap.
+      - **PROGRESS 2026-06-17 (loop #151):** **DU-002 slice 183 LANDED — per-column COMPRESSION method
+        (`COMPRESSION <m>` / `ALTER COLUMN ... SET COMPRESSION <m>`) round-trips through pg_dump.** The exact
+        analogue of slice 182 for the sibling `pg_attribute.attcompression` column. pg_dump's
+        `dumpTableSchema` reads `a.attcompression` and emits `ALTER TABLE ONLY <t> ALTER COLUMN <c> SET
+        COMPRESSION <method>;` when the char is `'p'` (pglz) or `'l'` (lz4); the PG18 default `'\0'` emits
+        nothing. The parser previously **discarded** the COMPRESSION keyword and `buildUserPGAttributeRow`
+        hardcoded `attcompression=""`, so a declared method never reached the dump. **Fix (3 layers,
+        mirroring 182):** (1) parser — new `normalizeCompressionMethod` helper (pglz/lz4; default/unknown →
+        ""); inline `COMPRESSION` arm stores `ColumnDef.Compression`; new `SET COMPRESSION` ALTER arm emits
+        `AlterTableSetCompression{CompressionType, ColumnName}`; (2) `buildUserPGAttributeRow` — new
+        `compressionNameToAttCode` (pglz→'p', lz4→'l', `TOAST_*_COMPRESSION`) overrides the hardcoded default
+        when `Column.Compression` set; CREATE TABLE threads `ColumnDef.Compression` → `catalog.Column.Compression`
+        in both column-builder paths; (3) `AlterTableSetCompression` executor arm records the method AND flushes
+        through the same delete-old-rows + `syncTableToCatalogHeap` re-sync path (load-bearing: pg_dump scans
+        the persisted heap). Dump-fidelity only (no TOAST/compress at runtime). New field `catalog.Column.Compression`
+        + `ColumnDef.Compression`. Files: `internal/catalog/catalog.go`, `internal/parser/ast.go`,
+        `internal/parser/ddl.go`, `internal/executor/pg18_user_catalog_rows.go`,
+        `internal/executor/operators_ddl.go`, `internal/executor/pg18_user_catalog_rows_test.go`
+        (`TestUserPGAttributeCompressionOverride`), `internal/parser/alter_test.go`
+        (`TestParseAlterTableSetCompression` + `TestParseCreateTableColumnCompression`),
+        `internal/testport/pgdump_connsetup_test.go` (`cmprcol` fixture + 2 positive + 1 negative assert),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 183 section). Gates: gofmt OK; `go vet
+        ./internal/parser/ ./internal/catalog/ ./internal/executor/` clean; full `./internal/parser/`,
+        `./internal/catalog/`, `./internal/executor/` PASS; `TestPort_PgDumpConnectionSetup` PASS (3.21s);
+        pgbench pre-commit smoke on commit. **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node slice
+        (HIGHER RISK: partition routing); or close the `validateDefaultExpr` array/row/CASE/InExpr recursion gap.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

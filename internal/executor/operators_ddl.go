@@ -709,6 +709,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				IdentityColumn:   c.IdentityColumn,
 				IdentityAlways:   c.IdentityAlways,
 				IdentityStart:    c.IdentityStart,
+				Compression:      c.Compression,
 			})
 		}
 		for _, item := range s.BodyOrder {
@@ -895,6 +896,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				GeneratedExpr:   c.GeneratedExpr,
 				GeneratedAlways: c.GeneratedAlways,
 				DefaultExpr:     c.DefaultExpr,
+				Compression:     c.Compression,
 			})
 		}
 	}
@@ -4106,6 +4108,39 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				for i := range tbl.Columns {
 					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
 						tbl.Columns[i].Storage = act.StorageType
+						changed = true
+						break
+					}
+				}
+				if changed && catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+			}
+		case parser.AlterTableSetCompression:
+			// SET COMPRESSION method — record the per-column TOAST compression on the
+			// catalog column AND rewrite the pg_attribute heap row so pg_dump observes
+			// the new attcompression. pg_dump emits `ALTER TABLE ONLY ... SET
+			// COMPRESSION <method>` whenever attcompression is 'p' (pglz) or 'l' (lz4)
+			// (pg_dump.c dumpTableSchema). Like SET STORAGE (slice 182), the in-memory
+			// mutation alone is invisible because pg_attribute is a heap populated at
+			// CREATE TABLE; the override must be flushed through the same delete-old-
+			// rows + re-sync path or the stale heap row keeps reporting the default
+			// and the SET COMPRESSION is silently dropped from the dump. An empty
+			// CompressionType (`SET COMPRESSION default`) clears the override.
+			// goopg does not TOAST/compress — dump-fidelity only. DU-002 slice 183.
+			if act.ColumnName != "" {
+				changed := false
+				for i := range tbl.Columns {
+					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+						tbl.Columns[i].Compression = act.CompressionType
 						changed = true
 						break
 					}

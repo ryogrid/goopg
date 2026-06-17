@@ -139,6 +139,14 @@ type Column struct {
 	// Storage is the column storage type: "plain", "main", "external", "extended".
 	// Empty means the default for the column's type.
 	Storage string
+	// Compression is the column's per-column TOAST compression method as written
+	// in `COMPRESSION <method>` (CREATE TABLE) or `ALTER COLUMN ... SET COMPRESSION
+	// <method>` — "pglz" or "lz4". Empty means no explicit method (PG stores
+	// attcompression='\0', meaning the default_toast_compression GUC applies, and
+	// pg_dump emits no SET COMPRESSION clause). goopg does not actually TOAST or
+	// compress; this is recorded purely so the column round-trips through pg_dump.
+	// DU-002 slice 183.
+	Compression string
 }
 
 // NamedCheckConstraint holds a CHECK constraint with an explicit name.
