@@ -722,6 +722,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition part_p0: %v", err)
 	}
 
+	// Slice 168: non-RANGE partition bounds must round-trip too. RANGE bounds
+	// (slice 167) happened to be integer literals, which render identically
+	// quoted or not. A LIST partition keyed on a text column exposed a real
+	// divergence: the bound value was stored via exprToString (the raw, unquoted
+	// routing form), so FormatPartitionBound emitted the invalid
+	// `FOR VALUES IN (a, b)` instead of PG's `FOR VALUES IN ('a', 'b')` — a
+	// restore-breaking loss. The fix captures a parallel SQL-literal form
+	// (PartitionBound.InValueLiterals) at partition-creation time and renders it.
+	// `plist`/`phash` carry their own tables so the many `foo` asserts are untouched.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.plist (grp text, val integer) PARTITION BY LIST (grp)"); err != nil {
+		t.Fatalf("create LIST-partitioned table plist: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.plist_ab PARTITION OF public.plist FOR VALUES IN ('a', 'b')"); err != nil {
+		t.Fatalf("create LIST partition plist_ab: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.phash (id integer, val text) PARTITION BY HASH (id)"); err != nil {
+		t.Fatalf("create HASH-partitioned table phash: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.phash_0 PARTITION OF public.phash FOR VALUES WITH (MODULUS 4, REMAINDER 0)"); err != nil {
+		t.Fatalf("create HASH partition phash_0: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -1995,6 +2017,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.part_p0 FOR VALUES FROM (0) TO (100)") {
 			t.Errorf("pg_dump dropped the partition bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.part_p0 FOR VALUES FROM (0) TO (100)", res.Stdout)
+		}
+		// **Slice 168 closed (asserted):** non-RANGE partition bounds. A text LIST
+		// bound exposed a real divergence — the value was stored unquoted (the raw
+		// routing form), so the dump emitted the restore-breaking `FOR VALUES IN
+		// (a, b)`. The fix renders the captured SQL-literal form. Assert (1) the
+		// parent LIST/HASH key clauses survive, (2) the text LIST bound is quoted,
+		// and (3) the HASH modulus/remainder bound survives.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.plist (") ||
+			!strings.Contains(res.Stdout, "PARTITION BY LIST (grp)") {
+			t.Errorf("pg_dump dropped/mangled the LIST partition-key clause; missing %q\n  full stdout=%q", "PARTITION BY LIST (grp)", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.plist_ab FOR VALUES IN ('a', 'b')") {
+			t.Errorf("pg_dump emitted an unquoted/invalid LIST bound; want %q\n  full stdout=%q", "ATTACH PARTITION public.plist_ab FOR VALUES IN ('a', 'b')", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "PARTITION BY HASH (id)") {
+			t.Errorf("pg_dump dropped/mangled the HASH partition-key clause; missing %q\n  full stdout=%q", "PARTITION BY HASH (id)", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.phash_0 FOR VALUES WITH (modulus 4, remainder 0)") {
+			t.Errorf("pg_dump dropped/mangled the HASH partition bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.phash_0 FOR VALUES WITH (modulus 4, remainder 0)", res.Stdout)
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

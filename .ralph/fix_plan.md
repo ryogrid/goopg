@@ -3701,6 +3701,35 @@ object support.
         untested table-level attributes: table inheritance (`INHERITS`), LIST/HASH partition
         bounds, multi-level partition trees, or column-level `STORAGE`/`COMPRESSION` (needs
         parser keywords).
+      - **PROGRESS 2026-06-17 (loop #135):** **DU-002 slice 168 LANDED — real
+        divergence fixed.** Non-RANGE partition bounds now round-trip. Slice 167's RANGE
+        fixture used integer literals, which render identically quoted or not; a **text LIST**
+        bound exposed a value-level divergence behind the same path. A partition's bound
+        values are stored via `exprToString` (the RAW unquoted form — `'a'`→`a`), which is
+        correct/required for value routing (`FindPartitionForValue` compares row keys against
+        `pb.InValues` verbatim). But `FormatPartitionBound` reused those raw strings for
+        `relpartbound`, so a text LIST partition dumped as the restore-breaking
+        `FOR VALUES IN (a, b)` instead of `FOR VALUES IN ('a', 'b')` — and the raw strings
+        can't be re-quoted at format time (catalog no longer knows the column type).
+        **Fix (catalog-metadata + capture-at-creation, zero routing risk):** `PartitionBound`
+        gains a parallel `InValueLiterals []string` holding the SQL-literal rendering, captured
+        at partition-creation time from the bound's `parser.Expr` via the existing
+        `boundExprToSQLLiteral`; both LIST creation sites (`execCreatePartitionChild` +
+        ATTACH PARTITION path) populate it. `FormatPartitionBound` prefers it (falls back to
+        `InValues` when absent — integer keys render the same), fixing both sibling consumers
+        (`buildUserPGClassRow` + catalog.go `VirtualRows`) at once. Routing untouched. HASH
+        bounds were already correct; locked by a new fixture. Files:
+        `internal/catalog/catalog.go` (field + FormatPartitionBound + unit test),
+        `internal/executor/operators_ddl.go` (2 sites populate InValueLiterals),
+        `internal/testport/pgdump_connsetup_test.go` (LIST `plist`/`plist_ab` + HASH
+        `phash`/`phash_0` fixtures + quoted-bound assertions),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 168 section). Gates: gofmt OK;
+        `go build ./internal/...` OK; `go vet ./internal/testport/` clean;
+        `TestFormatPartitionBoundListLiterals` PASS; `TestPort_PgDumpConnectionSetup` PASS
+        (2.78s); catalog + full executor suites PASS; pgbench pre-commit smoke on commit.
+        **Next: slice 169** — RANGE-on-text bounds have the SAME raw-vs-literal bug (FromValues/
+        ToValues stored unquoted); also table inheritance (`INHERITS`), multi-level partition
+        trees, or column-level `STORAGE`/`COMPRESSION` (needs parser keywords).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

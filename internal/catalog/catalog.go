@@ -408,16 +408,24 @@ func fkActionChar(a parser.FKAction) byte {
 // For RANGE partitioning, From and To contain the bound strings ("MINVALUE", "MAXVALUE", or a literal).
 // For HASH partitioning, Modulus and Remainder specify the hash bucket. M0096-0007; HASH M0097-0015.
 type PartitionBound struct {
-	InValues   []string // LIST: values in this partition
-	From       string   // RANGE: lower bound (single-column, kept for compat)
-	To         string   // RANGE: upper bound (single-column, kept for compat)
-	FromValues []string // RANGE: lower bound tuple (multi-column; len==1 for single-col)
-	ToValues   []string // RANGE: upper bound tuple (multi-column; len==1 for single-col)
-	Modulus    int64    // HASH: modulus
-	Remainder  int64    // HASH: remainder (partition index)
-	IsHash     bool     // true for HASH partitions
-	IsDefault  bool     // true for DEFAULT partitions
-	ChildName  string   // name of the child partition that owns this bound
+	InValues []string // LIST: values in this partition (raw, used for value routing)
+	// InValueLiterals holds the SQL-literal rendering of each LIST value
+	// (e.g. 'a' for a text value, 1 for an integer). Parallel to InValues.
+	// Populated at partition-creation time from the bound's parser.Expr, since
+	// InValues stores the unquoted raw value (needed for routing comparison) and
+	// cannot be re-quoted later without the column type. FormatPartitionBound
+	// prefers this for relpartbound/pg_dump output so string LIST bounds emit
+	// `FOR VALUES IN ('a', 'b')` rather than the invalid `FOR VALUES IN (a, b)`.
+	InValueLiterals []string
+	From            string   // RANGE: lower bound (single-column, kept for compat)
+	To              string   // RANGE: upper bound (single-column, kept for compat)
+	FromValues      []string // RANGE: lower bound tuple (multi-column; len==1 for single-col)
+	ToValues        []string // RANGE: upper bound tuple (multi-column; len==1 for single-col)
+	Modulus         int64    // HASH: modulus
+	Remainder       int64    // HASH: remainder (partition index)
+	IsHash          bool     // true for HASH partitions
+	IsDefault       bool     // true for DEFAULT partitions
+	ChildName       string   // name of the child partition that owns this bound
 }
 
 // FormatPartitionBound formats a PartitionBound as the "FOR VALUES ..." string
@@ -430,11 +438,16 @@ func FormatPartitionBound(pb PartitionBound) string {
 		return fmt.Sprintf("FOR VALUES WITH (modulus %d, remainder %d)", pb.Modulus, pb.Remainder)
 	}
 	if len(pb.InValues) > 0 {
-		quoted := make([]string, len(pb.InValues))
-		for i, v := range pb.InValues {
-			quoted[i] = v
+		// Prefer the SQL-literal rendering (InValueLiterals) when available: it
+		// quotes string values so the bound is valid SQL on restore. InValues
+		// holds the raw unquoted form used for routing and cannot be re-quoted
+		// here without the column type. Fall back to InValues for bounds created
+		// before literals were captured (e.g. integer LIST keys render the same).
+		vals := pb.InValueLiterals
+		if len(vals) != len(pb.InValues) {
+			vals = pb.InValues
 		}
-		return "FOR VALUES IN (" + strings.Join(quoted, ", ") + ")"
+		return "FOR VALUES IN (" + strings.Join(vals, ", ") + ")"
 	}
 	// RANGE partition.
 	fromParts := pb.FromValues

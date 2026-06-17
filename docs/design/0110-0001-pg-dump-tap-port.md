@@ -4742,6 +4742,45 @@ The TAP test creates `CREATE TABLE public.part (id integer, val text) PARTITION 
 both the parent's `PARTITION BY RANGE (id)` clause and the child's
 `ATTACH PARTITION public.part_p0 FOR VALUES FROM (0) TO (100)` survive the dump.
 
+### Slice 168 — LIST/HASH partition bounds round-trip (real divergence fixed)
+
+Slice 167 wired `relpartbound` into the heap-backed `pg_class` row, but its fixture's RANGE bound
+happened to be *integer* literals (`FROM (0) TO (100)`) — which render identically whether quoted
+or not. A **text** LIST bound exposed a second, value-level divergence hiding behind the same code
+path.
+
+**Divergence.** A partition's bound values are stored at DDL time via `exprToString` (the *raw*,
+unquoted form — `'a'` becomes `a`). That raw form is correct and necessary for *value routing*
+(`InMemory.FindPartitionForValue` compares an inserted row's key string against `pb.InValues`
+verbatim). But `FormatPartitionBound` reused those same raw strings for `relpartbound`, so a text
+LIST partition dumped as the **restore-breaking** `FOR VALUES IN (a, b)` (bare `a`/`b` are not
+valid bound literals) instead of upstream's `FOR VALUES IN ('a', 'b')`. The raw strings cannot be
+re-quoted at format time because the catalog no longer knows the column type (is `"1"` the integer
+`1` or the text `'1'`?).
+
+```
+... ATTACH PARTITION public.plist_ab FOR VALUES IN (a, b);       -- goopg (invalid SQL on restore)
+... ATTACH PARTITION public.plist_ab FOR VALUES IN ('a', 'b');   -- upstream
+```
+
+**Fix (catalog-metadata + capture-at-creation, zero routing risk).** `PartitionBound` gains a
+parallel `InValueLiterals []string` field holding the SQL-literal rendering of each LIST value,
+captured at partition-creation time from the bound's `parser.Expr` via the existing
+`boundExprToSQLLiteral` (which quotes/escapes strings and passes integers through). Both LIST
+creation sites — `execCreatePartitionChild` (CREATE TABLE … PARTITION OF) and the ATTACH PARTITION
+path in `operators_ddl.go` — populate it alongside the raw `InValues`. `FormatPartitionBound`
+prefers `InValueLiterals` (falling back to `InValues` when absent, e.g. integer keys render the
+same), so the divergence is corrected once for *both* sibling consumers (`buildUserPGClassRow`'s
+heap row and catalog.go's `VirtualRows`). Routing is untouched — it still reads the raw `InValues`.
+HASH bounds (`FOR VALUES WITH (modulus n, remainder r)`) were already correct (numbers only) and are
+locked by a new fixture.
+
+The TAP test adds `CREATE TABLE public.plist (grp text, val integer) PARTITION BY LIST (grp)` with
+`plist_ab FOR VALUES IN ('a', 'b')`, plus `public.phash PARTITION BY HASH (id)` with
+`phash_0 FOR VALUES WITH (MODULUS 4, REMAINDER 0)`, and asserts the quoted LIST bound and the HASH
+bound both survive. A `catalog` unit test (`TestFormatPartitionBoundListLiterals`) pins the
+quote/escape/fallback rendering directly.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

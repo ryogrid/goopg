@@ -1,30 +1,41 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 167 (loop #134) — a RANGE-partitioned table + its partition
-now round-trip through pg_dump. REAL DIVERGENCE FIXED.
+Last landed: DU-002 slice 168 (loop #135) — LIST + HASH partition bounds now
+round-trip through pg_dump. REAL DIVERGENCE FIXED.
 
-Root cause: every partition moving part already existed (relkind='p', relispartition,
-pg_get_partkeydef, pg_inherits, pg_get_expr pass-through) EXCEPT the bound:
-buildUserPGClassRow (the heap-backed pg_class row pg_dump reads) HARDCODED relpartbound
-to "". So a partition child attached with an empty (invalid) FOR VALUES bound — silent
-loss of the value range on restore.
+Root cause: a partition's bound values are stored via exprToString (the RAW
+unquoted form — 'a'→a), which is correct/required for value routing
+(FindPartitionForValue compares row keys against pb.InValues verbatim). But
+FormatPartitionBound reused those raw strings for relpartbound, so a TEXT LIST
+partition dumped the restore-breaking `FOR VALUES IN (a, b)` instead of
+`FOR VALUES IN ('a', 'b')`. The raw strings can't be re-quoted at format time
+(catalog no longer knows the column type: is "1" int 1 or text '1'?).
 
-Fix (catalog-metadata only, zero storage-path risk): buildUserPGClassRow derives
-relpartbound from catalog.FormatPartitionBound(tbl.PartitionBounds[0]) for a partition
-child (PartitionParentOID != 0); a parent keeps "" (no bound, matching PG). This is a
-sibling-paths-must-agree fix — catalog.go VirtualRows already computed the same string.
-FormatPartitionBound covers RANGE/LIST/HASH/DEFAULT, so all kinds are handled.
+Fix (catalog-metadata + capture-at-creation, zero routing risk):
+PartitionBound gains a parallel InValueLiterals []string holding the SQL-literal
+rendering, captured at partition-creation time from the bound's parser.Expr via
+the existing boundExprToSQLLiteral (quotes/escapes strings, passes ints through).
+Both LIST creation sites populate it (execCreatePartitionChild + ATTACH PARTITION
+path). FormatPartitionBound prefers InValueLiterals, falls back to InValues when
+absent (int keys render the same) → fixes both sibling consumers
+(buildUserPGClassRow heap row + catalog.go VirtualRows) at once. HASH already
+correct; locked by fixture.
 
-Files: internal/executor/pg18_user_catalog_rows.go (relpartbound derive),
-internal/testport/pgdump_connsetup_test.go (fixture public.part PARTITION BY RANGE +
-public.part_p0 partition, asserts parent PARTITION BY clause + child ATTACH-with-bound),
-docs/design/0110-0001-pg-dump-tap-port.md (slice 167 section), .ralph/fix_plan.md (#134).
-Verified: gofmt OK; go build ./internal/... OK; go vet ./internal/testport/ clean;
-TestPort_PgDumpConnectionSetup PASS (2.43s, not skipped); executor+catalog PASS;
-pgbench pre-commit smoke on commit.
+Files: internal/catalog/catalog.go (InValueLiterals field + FormatPartitionBound
++ TestFormatPartitionBoundListLiterals), internal/executor/operators_ddl.go
+(2 sites populate InValueLiterals), internal/testport/pgdump_connsetup_test.go
+(LIST plist/plist_ab + HASH phash/phash_0 fixtures + quoted-bound assertions),
+docs/design/0110-0001-pg-dump-tap-port.md (slice 168), .ralph/fix_plan.md (#135),
+.ralph/deferral_ledger.md (RANGE-on-text follow-up).
+Gates: gofmt OK; go build ./internal/... OK; go vet ./internal/testport/ clean;
+TestFormatPartitionBoundListLiterals PASS; TestPort_PgDumpConnectionSetup PASS
+(2.78s, not skipped); catalog + full executor suites PASS; pgbench pre-commit
+smoke on commit.
 
-Next direction (slice 168): table inheritance (INHERITS — check pg_inherits + INHERITS
-clause emit), LIST/HASH partition bounds (FormatPartitionBound already covers them —
-just add fixtures to lock them), multi-level partition trees, or column-level
-STORAGE/COMPRESSION (needs new parser keywords KwStorage/KwCompress). Probe goopg
-support before picking.
+Next (slice 169): RANGE-on-text bounds have the SAME raw-vs-literal bug
+(FromValues/ToValues stored unquoted via exprToString) — a FOR VALUES FROM ('a')
+TO ('m') partition dumps invalid FROM (a) TO (m). Add FromValueLiterals/
+ToValueLiterals captured from poc.FromValues/ToValues parser.Exprs, render in
+FormatPartitionBound's RANGE branch, add a text-keyed RANGE fixture. See ledger.
+Other directions: table inheritance (INHERITS), multi-level partition trees,
+column-level STORAGE/COMPRESSION (needs parser keywords).

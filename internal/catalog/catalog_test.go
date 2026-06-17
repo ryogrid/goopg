@@ -897,3 +897,61 @@ func TestPgLanguageBuiltinRows(t *testing.T) {
 		t.Errorf("pg_language missing expected rows: %v", want)
 	}
 }
+
+// TestFormatPartitionBoundListLiterals pins the LIST-partition relpartbound
+// rendering. InValues holds the raw, unquoted routing form; InValueLiterals
+// holds the SQL-literal form. FormatPartitionBound must emit the literal form
+// so a text LIST bound round-trips through pg_dump as
+// `FOR VALUES IN ('a', 'b')` rather than the invalid `FOR VALUES IN (a, b)`.
+// Slice 168 (DU-002).
+func TestFormatPartitionBoundListLiterals(t *testing.T) {
+	cases := []struct {
+		name string
+		pb   PartitionBound
+		want string
+	}{
+		{
+			name: "text values are quoted",
+			pb: PartitionBound{
+				InValues:        []string{"a", "b"},
+				InValueLiterals: []string{"'a'", "'b'"},
+			},
+			want: "FOR VALUES IN ('a', 'b')",
+		},
+		{
+			name: "integer values are bare",
+			pb: PartitionBound{
+				InValues:        []string{"1", "2"},
+				InValueLiterals: []string{"1", "2"},
+			},
+			want: "FOR VALUES IN (1, 2)",
+		},
+		{
+			name: "missing literals falls back to raw values",
+			pb: PartitionBound{
+				InValues: []string{"1", "2"},
+			},
+			want: "FOR VALUES IN (1, 2)",
+		},
+		{
+			name: "embedded quote is escaped",
+			pb: PartitionBound{
+				InValues:        []string{"a'b"},
+				InValueLiterals: []string{"'a''b'"},
+			},
+			want: "FOR VALUES IN ('a''b')",
+		},
+		{
+			name: "hash bound unaffected",
+			pb:   PartitionBound{IsHash: true, Modulus: 4, Remainder: 0},
+			want: "FOR VALUES WITH (modulus 4, remainder 0)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := FormatPartitionBound(tc.pb); got != tc.want {
+				t.Errorf("FormatPartitionBound = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}

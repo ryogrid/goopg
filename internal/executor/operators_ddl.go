@@ -1935,9 +1935,13 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 				}
 			}
 		}
-		// LIST partition: evaluate each IN value as a string.
+		// LIST partition: evaluate each IN value as a string. InValues keeps the
+		// raw unquoted form (routing compares against it); InValueLiterals keeps
+		// the SQL-literal form ('a', 1, …) so FormatPartitionBound emits a valid
+		// relpartbound for pg_dump.
 		for _, e := range poc.InValues {
 			pb.InValues = append(pb.InValues, exprToString(e))
+			pb.InValueLiterals = append(pb.InValueLiterals, boundExprToSQLLiteral(e))
 		}
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	} else if len(poc.FromValues) > 0 || len(poc.ToValues) > 0 {
@@ -3728,6 +3732,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			} else {
 				for _, e := range poc.InValues {
 					pb.InValues = append(pb.InValues, exprToString(e))
+					pb.InValueLiterals = append(pb.InValueLiterals, boundExprToSQLLiteral(e))
 				}
 				if len(poc.FromValues) > 0 {
 					pb.From = exprToString(poc.FromValues[0]) // backward compat
