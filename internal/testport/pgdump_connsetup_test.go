@@ -634,6 +634,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("setval bumped_seq: %v", err)
 	}
 
+	// Slice 125: a REWOUND sequence — `setval(seq, N, false)` with N != start.
+	// Slices 115–124 only ever exercised the never-called default (last_value =
+	// start) or the called branch (slice 124). The not-yet-called branch with a
+	// NON-default last_value was the silent gap: after `setval('rewound_seq', 30,
+	// false)` real PG stores last_value=30 / is_called=false (verified: `SELECT *
+	// FROM rewound_seq` → 30/0/f), so pg_dump's data section emits
+	// `SELECT pg_catalog.setval('public.rewound_seq', 30, false)` while the schema
+	// CREATE SEQUENCE still carries the original `START WITH 5`. goopg's
+	// SequenceRowData previously returned the bare `start` (5) for any not-called
+	// sequence, so it would have dumped `setval(..., 5, false)` — losing the rewind
+	// and corrupting restored continuity (next nextval would yield 5, not 30). The
+	// fix returns `current + increment` (the on-disk last_value: start for a fresh
+	// seq, N after setval(N,false)). Regression guard for the not-called /
+	// non-default last_value dump path. Verified byte-identical vs real pg_dump
+	// 18.3 (reference /tmp/du125_pgdata).
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.rewound_seq START WITH 5"); err != nil {
+		t.Fatalf("create sequence rewound_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "SELECT setval('public.rewound_seq', 30, false)"); err != nil {
+		t.Fatalf("setval rewound_seq: %v", err)
+	}
+
 	// Slice 120: an IDENTITY column's backing sequence is the first MULTI-statement
 	// pg_dump object beyond a standalone sequence. PG records the column→sequence
 	// link as a pg_depend INTERNAL ('i') row (vs the AUTO 'a' of an OWNED BY
@@ -1554,6 +1576,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		} {
 			if strings.Contains(res.Stdout, neg) {
 				t.Errorf("pg_dump emitted the wrong setval form for an advanced sequence: %q\n  full stdout=%q", neg, res.Stdout)
+			}
+		}
+		// **Slice 125 (asserted):** a REWOUND sequence — `setval(seq, N, false)` with
+		// N != start — must keep the original `START WITH 5` in the CREATE SEQUENCE
+		// while the data section emits the rewound `setval(..., 30, false)`. The
+		// not-called branch now reports the on-disk last_value (current+increment=30),
+		// not the bare start (5). A regression that reverted to returning `start`
+		// would dump `setval(..., 5, false)` and silently lose the rewind.
+		rewoundSeqDefs := []string{
+			"CREATE SEQUENCE public.rewound_seq\n    START WITH 5\n    INCREMENT BY 1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 1;\n",
+			"SELECT pg_catalog.setval('public.rewound_seq', 30, false);",
+		}
+		for _, sub := range rewoundSeqDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/mangled the rewound-sequence dump; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// The rewound sequence must NOT dump its setval with the original start (the
+		// pre-fix bug), nor flip is_called, nor mangle the value.
+		for _, neg := range []string{
+			"SELECT pg_catalog.setval('public.rewound_seq', 5, false);",
+			"SELECT pg_catalog.setval('public.rewound_seq', 30, true);",
+			"SELECT pg_catalog.setval('public.rewound_seq', 5, true);",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump emitted the wrong setval form for a rewound sequence: %q\n  full stdout=%q", neg, res.Stdout)
 			}
 		}
 		// **Slice 120 (asserted):** an IDENTITY column's backing sequence must dump

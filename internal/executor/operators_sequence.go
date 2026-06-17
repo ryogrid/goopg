@@ -195,7 +195,10 @@ func RenameSequence(oldName, newName string) bool {
 }
 
 // SequenceRowData returns (lastValue, logCnt, isCalled) for SELECT * FROM seq.
-// lastValue is the last returned value (or start value if not yet called).
+// lastValue is the last returned value when called; when not yet called it is
+// the value the next nextval will return (start for a fresh sequence, or N
+// after setval(N,false) / RESTART WITH N) — i.e. the on-disk last_value pg_dump
+// reads from the sequence relation.
 // logCnt is 32 when called (mirrors PG's write-ahead log cache size), 0 otherwise.
 // Returns ok=false if the sequence does not exist. M0097-0024.
 func SequenceRowData(name string) (lastValue int64, logCnt int64, isCalled bool, ok bool) {
@@ -210,7 +213,16 @@ func SequenceRowData(name string) (lastValue int64, logCnt int64, isCalled bool,
 		lastValue = s.current.Load()
 		logCnt = 32
 	} else {
-		lastValue = s.start
+		// Not-yet-called: last_value is the value the next nextval will
+		// return. The registry stores `current = nextTarget - increment`
+		// (RegisterSequence seeds start-increment; setval(N,false) /
+		// RESTART WITH N seed N-increment), so the on-disk last_value is
+		// `current + increment`. For a fresh sequence this equals start;
+		// after setval('seq', N, false) it equals N — matching what real
+		// pg_dump reads from the sequence relation (`SELECT last_value`).
+		// Returning the bare `start` here silently dropped any non-default
+		// setval(N,false) / RESTART WITH N, corrupting the dumped setval.
+		lastValue = s.current.Load() + s.increment
 		logCnt = 0
 	}
 	s.mu.Unlock()

@@ -3208,15 +3208,49 @@ the exact `(42, true)` form is present; negatives reject the three wrong forms
 (`(1, false)` never-called, `(42, false)` ignored-called-flag, `(1, true)`
 ignored-value).
 
-**Discovered (deferred → slice 125 candidate):** `SequenceRowData`'s `called=false`
-branch returns `s.start` rather than the actual `current + increment`. For a
-sequence whose value was set with `setval(seq, N, false)` where `N != start`
-(e.g. `START WITH 5` then `setval(.., 30, false)`), real pg_dump 18.3 emits
-`setval('..', 30, false)` but goopg would emit `setval('..', 5, false)`. This
-slice deliberately avoids that case to stay byte-identical; the fix (return
-`current + increment` when not called, which equals `start` for a fresh sequence
-and `N` after `setval(.., N, false)`) touches the shared `pg_sequences` view and
-`SELECT * FROM <seq>` sibling paths and is therefore its own task.
+**Discovered (deferred → slice 125):** `SequenceRowData`'s `called=false`
+branch returned `s.start` rather than the actual on-disk `last_value`. For a
+sequence whose value was set with `setval(seq, N, false)` where `N != start`,
+real pg_dump 18.3 emits `setval('..', N, false)` but goopg would emit
+`setval('..', start, false)`. Fixed in slice 125 (below).
+
+### Slice 125 — rewound sequence (`setval(seq, N, false)`, `N != start`)
+
+The not-yet-called branch with a **non-default** last_value was the last
+sequence gap. Slices 115–123 only dumped the never-called default (`last_value
+= start`), and slice 124 covered the called branch — but a `setval(seq, N,
+false)` rewinds a sequence to N *without* marking it called. Real PG stores
+`last_value=N / is_called=false` (verified: `SELECT * FROM rewound_seq` →
+`30/0/f`), so pg_dump keeps the original `START WITH 5` in the schema
+`CREATE SEQUENCE` while the data section emits the rewound value:
+
+```sql
+CREATE SEQUENCE public.rewound_seq
+    START WITH 5
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+-- data section:
+SELECT pg_catalog.setval('public.rewound_seq', 30, false);
+```
+
+**Production fix** (`internal/executor/operators_sequence.go`,
+`SequenceRowData`): the not-called branch now returns `current + increment`
+instead of the bare `start`. The registry stores `current = nextTarget -
+increment` (`RegisterSequence` seeds `start-increment`; `setval(N,false)` and
+`RESTART WITH N` seed `N-increment`), so `current + increment` is exactly the
+on-disk `last_value` pg_dump reads — `start` for a fresh sequence, `N` after a
+rewind. The pre-fix code dropped any rewind, so a restore's next `nextval`
+would yield `start` instead of `N`, silently corrupting continuity. This is the
+single shared function behind both `SELECT * FROM <seq>` (the
+`createSeqCatalogTable` VirtualRows closure) and the `pg_get_sequence_data` SRF
+that pg_dump reads, so both sibling paths are fixed in one place; the
+`pg_sequences` *view* is unaffected (it sources `AllSequenceInfos` and emits
+NULL `last_value` while not called, matching PG). Verified byte-identical vs
+real pg_dump 18.3 (reference `/tmp/du125_pgdata`). Asserts: the exact
+`(30, false)` form + the unchanged `START WITH 5`; negatives reject the pre-fix
+`(5, false)` and the wrong-flag/value forms.
 
 ## Deferred (002–010) — catalog surface estimate
 

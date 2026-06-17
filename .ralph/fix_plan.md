@@ -2445,6 +2445,38 @@ object support.
         **Next: slice 125** — fix the called=false non-default-value divergence
         above, OR a table+VIEW dependency-ordering case (verify topological emission
         ORDER).
+      - **PROGRESS 2026-06-17 (loop #89):** **DU-002 slice 125 LANDED** — a REWOUND
+        sequence (`setval(seq, N, false)` with `N != start`) now dumps byte-identically.
+        This closes the called=FALSE non-default-value gap discovered in slice 124 and
+        is the **first production code change** in the sequence-dump slice series.
+        `setval('public.rewound_seq', 30, false)` rewinds the value to 30 *without*
+        marking the sequence called; real PG stores `last_value=30 / is_called=false`
+        (verified `SELECT * FROM rewound_seq` → `30/0/f`), so pg_dump keeps the schema
+        `CREATE SEQUENCE ... START WITH 5` and emits the data-section
+        `SELECT pg_catalog.setval('public.rewound_seq', 30, false)`. **Fix:**
+        `SequenceRowData`'s not-called branch (`internal/executor/operators_sequence.go`)
+        now returns `current + increment` instead of the bare `s.start`. The registry
+        stores `current = nextTarget - increment` (`RegisterSequence` → `start-increment`;
+        `setval(N,false)`/`RESTART WITH N` → `N-increment`), so `current+increment` is
+        the exact on-disk `last_value` — `start` for a fresh seq, `N` after a rewind. The
+        pre-fix code returned `start`, silently dropping the rewind (a restore's next
+        nextval would yield 5 not 30, corrupting continuity). `SequenceRowData` is the
+        single shared function behind BOTH sibling paths — `SELECT * FROM <seq>`
+        (createSeqCatalogTable VirtualRows) and the `pg_get_sequence_data` SRF pg_dump
+        reads — so both fixed in one place; the `pg_sequences` *view* is unaffected (it
+        sources `AllSequenceInfos` and emits NULL last_value while not-called, matching
+        PG). Verified byte-identical vs real pg_dump 18.3 (reference `/tmp/du125_pgdata`),
+        with exact `(30, false)` + unchanged `START WITH 5` positive asserts + 3 negative
+        guards (rejects pre-fix `(5, false)`, `(30, true)`, `(5, true)`). Files:
+        `internal/executor/operators_sequence.go` (SequenceRowData not-called branch +
+        doc comment), `internal/testport/pgdump_connsetup_test.go` (rewound_seq fixture +
+        setval + asserts), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 125
+        section). Gates: gofmt OK; `go build ./...` OK;
+        `TestPort_PgDumpConnectionSetup` PASS (2.25s); `go test ./internal/executor/`
+        PASS (1.35s, sibling-path coverage); pgbench pre-commit smoke on commit.
+        **Next: slice 126** — a table+VIEW dependency-ordering case (view depends on a
+        table; verify topological emission ORDER, not just presence), OR a CHECK
+        constraint / multi-column UNIQUE dump case.
       - **NOTE (orthogonal, pre-existing — do NOT conflate with slice 18):**
         reading a `text[]` column back from the heap yields the binary array
         encoding (Datum KindString carrying raw bytes) rather than the text

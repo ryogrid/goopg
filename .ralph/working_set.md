@@ -1,27 +1,27 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 124 (loop #88) — an ADVANCED sequence (`is_called=true`)
-dumps `SELECT pg_catalog.setval('public.bumped_seq', 42, true)` byte-identically vs
-real pg_dump 18.3. First slice over the called branch; every prior sequence slice
-(115–123) dumps `(name, start, false)` (never-called). After `setval(bumped_seq, 42,
-true)` the process-global `seqRegistry` state is current=42/called=true, so
-`SequenceRowData` → (42, true), the `pg_get_sequence_data` SRF projects it, pg_dump
-emits the called form. NO production code change — `SequenceRowData`'s called=true
-branch already returns `current` as last_value. Regression guard with exact `(42,
-true)` positive assert + 3 negative guards (rejects `(1,false)`, `(42,false)`,
-`(1,true)`). Reference `/tmp/du124_pgdata`.
-Files: internal/testport/pgdump_connsetup_test.go (bumped_seq fixture+setval+asserts),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 124 section), .ralph/fix_plan.md.
+Last landed: DU-002 slice 125 (loop #89) — a REWOUND sequence
+(`setval(seq, N, false)` with `N != start`) dumps byte-identically. This is the
+FIRST production code change in the sequence-dump slice series (115–125); all
+prior slices were verification/regression guards.
 
-DISCOVERED BUG (→ slice 125 candidate): `SequenceRowData` (internal/executor/
-operators_sequence.go ~line 201) called=FALSE branch returns `s.start`, NOT
-`current+increment`. So `setval(seq, N, false)` with N != start (e.g. `START WITH 5;
-setval(.., 30, false)`) diverges — goopg dumps `setval(.., 5, false)`, real PG dumps
-`setval(.., 30, false)`. Fix = return `current + increment` when !called (equals
-start for a fresh seq, N after setval(N,false)). Touches the SHARED pg_sequences
-view + `SELECT * FROM <seq>` sibling paths → needs full sequence-path testing, own
-task. Slice 124 deliberately avoided this case.
+Bug (discovered in slice 124): `SequenceRowData`'s not-called branch returned the
+bare `s.start`, so after `setval('rewound_seq', 30, false)` (which rewinds value
+to 30 WITHOUT marking called) goopg dumped `setval(.., 5, false)` while real PG
+dumps `setval(.., 30, false)` (PG stores last_value=30/is_called=false). Fix:
+not-called branch now returns `current + increment` — the registry stores
+`current = nextTarget - increment`, so this is the exact on-disk last_value
+(`start` for fresh, `N` after rewind/RESTART WITH N). `SequenceRowData` is the
+single shared function behind both `SELECT * FROM <seq>` and the
+`pg_get_sequence_data` SRF → both sibling paths fixed in one place. The
+`pg_sequences` view is unaffected (sources AllSequenceInfos, emits NULL
+last_value while not-called).
 
-Next direction (slice 125): either fix the called=false non-default-value divergence
-above (production change, sibling-path care), OR a table+VIEW dependency-ordering
-case (view depends on table; verify topological emission ORDER, not just presence).
+Files: internal/executor/operators_sequence.go (SequenceRowData not-called
+branch + doc comment), internal/testport/pgdump_connsetup_test.go (rewound_seq
+fixture + asserts), docs/design/0110-0001-pg-dump-tap-port.md (Slice 125),
+.ralph/fix_plan.md. Reference /tmp/du125_pgdata. Committed + pushed.
+
+Next direction (slice 126): a table+VIEW dependency-ordering case (view depends
+on a table; verify topological emission ORDER, not just presence), OR a CHECK
+constraint / multi-column UNIQUE constraint dump case.
