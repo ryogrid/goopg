@@ -2443,6 +2443,15 @@ func defaultExprToSQL(e parser.Expr) string {
 		}
 	case *parser.TypedStringLit:
 		return v.Type + " '" + strings.ReplaceAll(v.Value, "'", "''") + "'"
+	case *parser.ArrayConstructorExpr:
+		// `DEFAULT ARRAY[1, 2, 3]`. Mirror the catalog twin
+		// (catalog.formatExprForAttrdef, DU-002 slice 177); keep the two in sync so
+		// the dump path and the proargdefaults path render identically.
+		var elems []string
+		for _, el := range v.Elements {
+			elems = append(elems, defaultExprToSQL(el))
+		}
+		return "ARRAY[" + strings.Join(elems, ", ") + "]"
 	}
 	return fmt.Sprintf("%v", e)
 }

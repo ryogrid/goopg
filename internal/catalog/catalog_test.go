@@ -1170,6 +1170,20 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 			&parser.CastExpr{Operand: &parser.FuncCall{Name: parser.ObjectName{Name: "now"}}, Type: parser.ObjectName{Name: "date"}},
 			"now()::date",
 		},
+		{
+			// `DEFAULT ARRAY[1, 2, 3]` on an array column (DU-002 slice 177).
+			"array constructor",
+			&parser.ArrayConstructorExpr{Elements: []parser.Expr{
+				&parser.IntegerConst{Value: 1}, &parser.IntegerConst{Value: 2}, &parser.IntegerConst{Value: 3},
+			}},
+			"ARRAY[1, 2, 3]",
+		},
+		{
+			// Empty array constructor renders `ARRAY[]` (no trailing separator).
+			"array constructor empty",
+			&parser.ArrayConstructorExpr{},
+			"ARRAY[]",
+		},
 	}
 	for _, tc := range cases {
 		if got := formatExprForAttrdef(tc.expr); got != tc.want {

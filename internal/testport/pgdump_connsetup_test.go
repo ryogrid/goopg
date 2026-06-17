@@ -854,7 +854,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// corrupting the dumped DEFAULT. formatExprForAttrdef now mirrors
 	// executor.defaultExprToSQL for those nodes, rendering `'{}'::jsonb`. The
 	// `meta` column guards the cast path end-to-end.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb)"); err != nil {
+	//
+	// Slice 177: a column DEFAULT that is an ARRAY constructor (`DEFAULT ARRAY[1,
+	// 2, 3]`) must round-trip. validateDefaultExpr rejects only column refs,
+	// subqueries and aggregate/SRF calls, so a parsed *ArrayConstructorExpr is
+	// accepted and reaches pg_attrdef.adbin. Before this slice neither renderer
+	// (catalog.formatExprForAttrdef nor executor.defaultExprToSQL) had an
+	// *ArrayConstructorExpr arm, so it fell through to fmt.Sprintf("%v", e) — a Go
+	// pointer string — corrupting the dumped DEFAULT. Both twins now render
+	// `ARRAY[1, 2, 3]`. The `vals integer[]` column guards the array-constructor
+	// path end-to-end.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3])"); err != nil {
 		t.Fatalf("create table defcol with function-call default: %v", err)
 	}
 
@@ -2298,6 +2308,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// string. Assert the cast survives intact.
 			if !strings.Contains(block, "DEFAULT '{}'::jsonb") {
 				t.Errorf("pg_dump dropped/corrupted the cast-expression default; want %q in defcol block\n  block=%q", "DEFAULT '{}'::jsonb", block)
+			}
+			// **Slice 177 (asserted):** an ARRAY-constructor default. The `vals`
+			// column carries `DEFAULT ARRAY[1, 2, 3]`. validateDefaultExpr accepts a
+			// *ArrayConstructorExpr (it rejects only column refs / subqueries /
+			// aggregate-or-SRF calls); both renderers now emit `ARRAY[e1, …]`. Before
+			// the fix the node fell through to fmt.Sprintf("%v", e), so the dumped
+			// DEFAULT was a corrupt Go pointer string. Assert the array survives intact.
+			if !strings.Contains(block, "DEFAULT ARRAY[1, 2, 3]") {
+				t.Errorf("pg_dump dropped/corrupted the array-constructor default; want %q in defcol block\n  block=%q", "DEFAULT ARRAY[1, 2, 3]", block)
 			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently

@@ -5063,6 +5063,33 @@ inspects them and PG re-applies the column typmod on restore.
 `now()::date`). The TAP `defcol` fixture gains a `meta jsonb DEFAULT '{}'::jsonb` column and asserts
 the dumped block contains `DEFAULT '{}'::jsonb`.
 
+### Slice 177 — ARRAY-constructor column DEFAULT (sibling-path divergence closed)
+
+Slice 176 closed the cast/unary/binary/typed-string arms, but the same audit (which node kinds does
+`validateDefaultExpr` accept yet neither renderer handles?) surfaced one more live gap:
+`*ArrayConstructorExpr`. `validateDefaultExpr` rejects only column refs, subqueries and
+aggregate/SRF calls — every other node returns `nil` (accepted) — so `DEFAULT ARRAY[1, 2, 3]` on an
+array column reaches `pg_attrdef.adbin` verbatim. Neither `catalog.formatExprForAttrdef` nor the
+executor twin `executor.defaultExprToSQL` had an `*ArrayConstructorExpr` arm, so the node fell through
+to `fmt.Sprintf("%v", e)` — a Go pointer string that corrupts the dumped `DEFAULT`. Example that was
+broken:
+
+```sql
+CREATE TABLE public.defcol (..., vals integer[] DEFAULT ARRAY[1, 2, 3]);   -- *ArrayConstructorExpr
+```
+
+Fix: both renderers gain an `*ArrayConstructorExpr` case that renders `ARRAY[e1, e2, …]`, recursively
+rendering each element through the same switch and joining with `, ` — matching PG's `pg_get_expr`
+deparse. The two twins are kept in lockstep (catalog sits below executor in the import graph, so they
+cannot share code). Display-only; default evaluation and routing are untouched. Note: `validateDefaultExpr`
+still does not *recurse* into array elements (a column ref inside `ARRAY[...]` would slip past the
+DEFAULT validator) — a pre-existing validation gap, out of scope for this display-path slice.
+
+`catalog.TestFormatExprForAttrdefExpr` gains `array constructor` (`ARRAY[1, 2, 3]`) and
+`array constructor empty` (`ARRAY[]`) cases. The TAP `defcol` fixture gains a
+`vals integer[] DEFAULT ARRAY[1, 2, 3]` column and asserts the dumped block contains
+`DEFAULT ARRAY[1, 2, 3]`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

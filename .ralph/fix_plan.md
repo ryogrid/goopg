@@ -3902,6 +3902,28 @@ object support.
         `TestPort_PgDumpConnectionSetup` PASS (3.15s, not skipped); pgbench pre-commit smoke on commit.
         **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition routing); or
         column STORAGE/COMPRESSION dump fidelity (needs parser keywords).
+      - **PROGRESS 2026-06-17 (loop #145):** **DU-002 slice 177 LANDED — ARRAY-constructor column
+        DEFAULT round-trips; sibling-path divergence closed.** Same audit as slice 176 (which node kinds
+        does `validateDefaultExpr` accept yet neither renderer handles?) surfaced `*ArrayConstructorExpr`.
+        `validateDefaultExpr` rejects only column refs/subqueries/aggregate-or-SRF calls — every other
+        node returns nil (accepted) — so `DEFAULT ARRAY[1, 2, 3]` on an array column reaches
+        `pg_attrdef.adbin` verbatim, but neither `catalog.formatExprForAttrdef` nor the executor twin
+        `executor.defaultExprToSQL` had an `*ArrayConstructorExpr` arm → fell through to
+        `fmt.Sprintf("%v", e)` (Go pointer string), corrupting the dumped DEFAULT. **Fix:** both twins
+        gain an `*ArrayConstructorExpr` case rendering `ARRAY[e1, …]` (elements rendered recursively
+        through the same switch, joined `, `), matching PG's pg_get_expr deparse; kept in lockstep
+        (catalog below executor in import graph). Display-only; eval/routing untouched.
+        `validateDefaultExpr` still does not recurse into array elements (pre-existing gap, out of scope).
+        Files: `internal/catalog/catalog.go` (+1 case), `internal/executor/operators_ddl.go` (+1 case,
+        twin), `internal/catalog/catalog_test.go` (`array constructor` + `array constructor empty`
+        cases), `internal/testport/pgdump_connsetup_test.go` (`defcol` gains
+        `vals integer[] DEFAULT ARRAY[1, 2, 3]` + assertion), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (slice 177). Gates: gofmt OK; `go vet ./internal/catalog/ ./internal/executor/` clean;
+        `go build ./internal/executor/` OK; `TestFormatExprForAttrdefExpr` + executor default tests PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (3.10s, not skipped); pgbench pre-commit smoke on commit.
+        **Next:** deferred MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition routing); or
+        column STORAGE/COMPRESSION dump fidelity (needs parser keywords); or `*CaseExpr` column DEFAULT
+        (`DEFAULT CASE WHEN true THEN 1 ELSE 0 END`) if still falling through both renderers.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

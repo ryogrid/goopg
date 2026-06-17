@@ -7028,6 +7028,20 @@ func formatExprForAttrdef(e parser.Expr) string {
 	case *parser.TypedStringLit:
 		// e.g. `DEFAULT DATE '2020-01-01'`. Mirror the executor twin.
 		return v.Type + " '" + strings.ReplaceAll(v.Value, "'", "''") + "'"
+	case *parser.ArrayConstructorExpr:
+		// `DEFAULT ARRAY[1, 2, 3]` on an array column. validateDefaultExpr rejects
+		// only column refs / subqueries / aggregate-or-SRF calls and accepts every
+		// other node, so the parsed *ArrayConstructorExpr reaches pg_attrdef.adbin
+		// (atthasdef=true). Without this case it fell through to fmt.Sprintf("%v") —
+		// a Go pointer string — corrupting the DEFAULT clause pg_dump re-emits
+		// (DU-002 slice 177). Render `ARRAY[e1, e2, …]` with each element recursively
+		// rendered, matching PG's pg_get_expr deparse; mirror executor.defaultExprToSQL
+		// (the proargdefaults twin) so the dump path and the runtime path agree.
+		elems := make([]string, 0, len(v.Elements))
+		for _, el := range v.Elements {
+			elems = append(elems, formatExprForAttrdef(el))
+		}
+		return "ARRAY[" + strings.Join(elems, ", ") + "]"
 	}
 	return fmt.Sprintf("%v", e)
 }
