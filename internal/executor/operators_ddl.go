@@ -1216,12 +1216,33 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Both need a B-tree index with unique=true, primary=true so that
 	// ON CONFLICT (col) can match the constraint via resolveArbiterIndex.
 	var pkCols []string
+	// DEFERRABLE [INITIALLY DEFERRED] for the anonymous table-level
+	// (`PRIMARY KEY (a) DEFERRABLE`) and inline-column (`a int PRIMARY KEY
+	// DEFERRABLE`) forms rides the backing tbl_pkey index so pg_get_constraintdef
+	// / pg_constraint re-emit the clause on dump. The named table-level form is
+	// handled by the NamedConstraints loop above. DU-002 slice 142.
+	var pkDeferrable, pkInitiallyDeferred bool
 	if len(s.PrimaryKey) > 0 {
 		pkCols = s.PrimaryKey
+		pkDeferrable = s.PrimaryKeyDeferrable
+		pkInitiallyDeferred = s.PrimaryKeyInitiallyDeferred
 	} else {
 		for _, c := range s.Columns {
 			if c.Primary {
 				pkCols = append(pkCols, c.Name)
+			}
+		}
+	}
+	// An inline-column PRIMARY KEY (`a int PRIMARY KEY DEFERRABLE`) also
+	// populates s.PrimaryKey (the parser appends the column name), so the
+	// table-level flags above stay false for that form; adopt the inline PK
+	// column's deferrable flags here. The inline-column and table-level PK forms
+	// are mutually exclusive, so this never double-counts. DU-002 slice 142.
+	if !pkDeferrable {
+		for _, c := range s.Columns {
+			if c.Primary && c.PrimaryDeferrable {
+				pkDeferrable = true
+				pkInitiallyDeferred = c.PrimaryInitiallyDeferred
 			}
 		}
 	}
@@ -1236,6 +1257,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.IsConstraint = true
 			idx.IncludeColumns = s.PrimaryKeyInclude
+			idx.Deferrable = pkDeferrable
+			idx.InitiallyDeferred = pkInitiallyDeferred
 		}
 		// PRIMARY KEY implies NOT NULL on all key columns (SQL standard).
 		for _, pkCol := range pkCols {

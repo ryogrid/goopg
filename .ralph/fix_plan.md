@@ -2970,6 +2970,51 @@ object support.
         DEFERRABLE on the PRIMARY KEY forms (anonymous table-level / named
         table-level / inline column — all still discard the flag), OR an
         exclusion-constraint (`EXCLUDE USING gist`) dump surface.
+      - **PROGRESS 2026-06-17 (loop #107):** **DU-002 slice 142 LANDED** — the
+        PRIMARY KEY siblings of slices 139–141: a `[NOT] DEFERRABLE [INITIALLY
+        DEFERRED|IMMEDIATE]` trailer on all three PK forms — anonymous table-level
+        (`PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED`), named table-level
+        (`CONSTRAINT pkdef PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED`), and
+        inline column (`a integer PRIMARY KEY DEFERRABLE INITIALLY DEFERRED`) —
+        now round-trips. pg_dump emits `ADD CONSTRAINT pktdef_pkey/pkcdef_pkey
+        PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED` (auto name) and
+        `ADD CONSTRAINT pkdef PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED`
+        (named). **Production change:** all three PK parser cases DISCARDED the
+        trailer — the two table-level cases accepted-and-dropped it; the inline
+        column case had NO slot, so a trailing DEFERRABLE was a HARD PARSE ERROR
+        that failed the whole CREATE TABLE. 3 sites: (1) parser
+        (`internal/parser/ddl.go`) — the slice-141 `parseUniqueDeferrable` helper
+        is renamed `parseConstraintDeferrable` (generic) and now captures the
+        trailer for all 3 PK cases: anonymous table-level → 2 new
+        `CreateTableStmt.PrimaryKeyDeferrable`/`PrimaryKeyInitiallyDeferred`;
+        named table-level → existing `TableConstraintDef.Deferrable`/
+        `InitiallyDeferred` (parsed BEFORE the NamedConstraints append); both
+        inline cases → 2 new `ColumnDef.PrimaryDeferrable`/`PrimaryInitiallyDeferred`
+        (`internal/parser/ast.go`); (2) executor (`operators_ddl.go`) — named form
+        already threads onto the index via the shared NamedConstraints loop (slice
+        140); the tbl_pkey index build now copies the flags for the anonymous +
+        inline forms. SUBTLETY: an inline column PK ALSO populates `s.PrimaryKey`
+        (parser appends the col name), so the table-level branch reads the false
+        flag → a follow-up column scan adopts the inline PK column's flags (forms
+        are mutually exclusive, no double-count); (3) deparse + pg_constraint
+        UNCHANGED — `buildConstraintDefString` already appends the clause from the
+        index for BOTH PRIMARY KEY/UNIQUE, and pg_constraint already emits
+        condeferrable/condeferred from idx.Deferrable for contype='p'. **Scope:**
+        pure dump-fidelity — deferred CHECKING still not implemented (enforced
+        per-row). With slice 142 the full UNIQUE+PK DEFERRABLE surface round-trips;
+        EXCLUDE-constraint DEFERRABLE remains. Tests: `TestParsePrimaryKeyDeferrable`
+        (parser, all 3 forms × NOT/IMMEDIATE/DEFERRED/bare-INITIALLY/named),
+        `TestPort_PgDumpConnectionSetup` (`pktdef`/`pkndef`/`pkcdef` fixtures + 3
+        asserts + 6 negative guards). Files: `internal/parser/ddl.go`,
+        `internal/parser/ast.go`, `internal/parser/ddl_test.go`,
+        `internal/executor/operators_ddl.go`,
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK;
+        `go build ./...` OK; `go vet` OK; parser/catalog/executor suites PASS;
+        `TestParsePrimaryKeyDeferrable` PASS; `TestPort_PgDumpConnectionSetup` PASS
+        (2.43s); pgbench pre-commit smoke on commit. **Next: slice 143** —
+        DEFERRABLE on an EXCLUDE constraint (`EXCLUDE USING gist … DEFERRABLE`)
+        dump surface, OR a fresh pg_dump catalog-surface gap.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

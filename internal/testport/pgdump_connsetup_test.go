@@ -587,6 +587,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table uniqcndef: %v", err)
 	}
 
+	// Slice 142: the PRIMARY KEY siblings of slices 139–141. All three PK forms
+	// previously DISCARDED the DEFERRABLE flag (the anonymous + named table-level
+	// parser cases accepted-and-dropped it; the inline column case had no slot at
+	// all, so a trailing DEFERRABLE was a hard parse error). Now the parser
+	// captures the [NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE] trailer onto the
+	// backing tbl_pkey index (anonymous/inline via CreateTableStmt /
+	// ColumnDef fields; named via the NamedConstraints loop), and the shared
+	// buildConstraintDefString + condeferrable/condeferred emission re-emit the
+	// clause. pg_dump emits `ADD CONSTRAINT <t>_pkey PRIMARY KEY (a) DEFERRABLE
+	// INITIALLY DEFERRED` (auto name) and `ADD CONSTRAINT pkdef PRIMARY KEY (a)
+	// DEFERRABLE INITIALLY DEFERRED` (named). Each on its own table.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pktdef (a integer, b integer, PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED)"); err != nil {
+		t.Fatalf("create table pktdef: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pkndef (a integer, b integer, CONSTRAINT pkdef PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED)"); err != nil {
+		t.Fatalf("create table pkndef: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pkcdef (a integer PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, b integer)"); err != nil {
+		t.Fatalf("create table pkcdef: %v", err)
+	}
+
 	// Slice 127: anonymous table-level CHECK constraints (written without an
 	// explicit CONSTRAINT name) must round-trip. PG's AddRelationNewConstraints
 	// auto-names each one at DDL time — "<table>_<col>_check" when the predicate
@@ -1629,6 +1650,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// DEFERRABLE was a hard parse error; now both round-trip with the trailer.
 			"ADD CONSTRAINT uniqcdef_a_key UNIQUE (a) DEFERRABLE INITIALLY DEFERRED",
 			"ADD CONSTRAINT cudef UNIQUE (a) DEFERRABLE INITIALLY DEFERRED",
+			// **Slice 142:** the PRIMARY KEY siblings — a DEFERRABLE trailer on all
+			// three PK forms round-trips: anonymous table-level (auto name
+			// `pktdef_pkey`), named table-level (user name `pkdef`), and inline column
+			// (auto name `pkcdef_pkey`). All three previously dropped the flag (the
+			// inline form was a hard parse error). pg_dump now re-emits the clause via
+			// the shared buildConstraintDefString (Primary branch) + condeferrable.
+			"ADD CONSTRAINT pktdef_pkey PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED",
+			"ADD CONSTRAINT pkdef PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED",
+			"ADD CONSTRAINT pkcdef_pkey PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED",
 			// **Slice 127:** anonymous table-level CHECK constraints round-trip
 			// inline with PG's auto-generated names. The multi-column predicate
 			// (`a < b`) gets the table-only name `chk_check`; the single-column
@@ -1809,6 +1839,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		} {
 			if strings.Contains(res.Stdout, neg) {
 				t.Errorf("pg_dump mangled a DEFERRABLE UNIQUE constraint: %q", neg)
+			}
+		}
+		// Slice 142 negative guard: the PRIMARY KEY deferrable forms must not lose
+		// their trailer either — neither the bare constraint nor the half-clause
+		// `… DEFERRABLE` (missing INITIALLY DEFERRED) may appear for the anonymous
+		// (`pktdef_pkey`), named (`pkdef`), or inline-column (`pkcdef_pkey`) forms.
+		for _, neg := range []string{
+			"ADD CONSTRAINT pktdef_pkey PRIMARY KEY (a);",
+			"ADD CONSTRAINT pktdef_pkey PRIMARY KEY (a) DEFERRABLE;",
+			"ADD CONSTRAINT pkdef PRIMARY KEY (a);",
+			"ADD CONSTRAINT pkdef PRIMARY KEY (a) DEFERRABLE;",
+			"ADD CONSTRAINT pkcdef_pkey PRIMARY KEY (a);",
+			"ADD CONSTRAINT pkcdef_pkey PRIMARY KEY (a) DEFERRABLE;",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump mangled a DEFERRABLE PRIMARY KEY constraint: %q", neg)
 			}
 		}
 		if strings.Contains(res.Stdout, "ADD CONSTRAINT tuniq UNIQUE (a)") {

@@ -471,6 +471,110 @@ func TestParseColumnUniqueDeferrable(t *testing.T) {
 	}
 }
 
+// TestParsePrimaryKeyDeferrable pins DU-002 slice 142: a `[NOT] DEFERRABLE
+// [INITIALLY DEFERRED|IMMEDIATE]` trailer on all three PRIMARY KEY forms
+// (anonymous table-level, named table-level, inline column — both anonymous and
+// named) is captured rather than discarded so pg_dump round-trips the clause.
+func TestParsePrimaryKeyDeferrable(t *testing.T) {
+	// Inline-column forms — flags land on ColumnDef.PrimaryDeferrable.
+	inlineCases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int PRIMARY KEY)", false, false},
+		{"CREATE TABLE t (a int PRIMARY KEY NOT DEFERRABLE)", false, false},
+		{"CREATE TABLE t (a int PRIMARY KEY DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int PRIMARY KEY DEFERRABLE INITIALLY IMMEDIATE)", true, false},
+		{"CREATE TABLE t (a int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int PRIMARY KEY INITIALLY DEFERRED)", true, true},
+		// Composes with a following column.
+		{"CREATE TABLE t (a int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, b text)", true, true},
+		// Named inline column PRIMARY KEY.
+		{"CREATE TABLE t (a int CONSTRAINT pk_a PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int CONSTRAINT pk_a PRIMARY KEY NOT DEFERRABLE)", false, false},
+	}
+	for _, c := range inlineCases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		col := stmts[0].(*CreateTableStmt).Columns[0]
+		if !col.Primary {
+			t.Fatalf("Parse(%q): column a Primary=false, want true", c.in)
+		}
+		if col.PrimaryDeferrable != c.wantDefer {
+			t.Errorf("Parse(%q): PrimaryDeferrable=%v want %v", c.in, col.PrimaryDeferrable, c.wantDefer)
+		}
+		if col.PrimaryInitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): PrimaryInitiallyDeferred=%v want %v", c.in, col.PrimaryInitiallyDeferred, c.wantDeferred)
+		}
+	}
+
+	// Anonymous table-level — flags land on CreateTableStmt.PrimaryKeyDeferrable.
+	tableCases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, PRIMARY KEY (a))", false, false},
+		{"CREATE TABLE t (a int, PRIMARY KEY (a) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, PRIMARY KEY (a) INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, PRIMARY KEY (a) NOT DEFERRABLE)", false, false},
+	}
+	for _, c := range tableCases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.PrimaryKey) != 1 {
+			t.Fatalf("Parse(%q): PrimaryKey=%v, want 1 column", c.in, ct.PrimaryKey)
+		}
+		if ct.PrimaryKeyDeferrable != c.wantDefer {
+			t.Errorf("Parse(%q): PrimaryKeyDeferrable=%v want %v", c.in, ct.PrimaryKeyDeferrable, c.wantDefer)
+		}
+		if ct.PrimaryKeyInitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): PrimaryKeyInitiallyDeferred=%v want %v", c.in, ct.PrimaryKeyInitiallyDeferred, c.wantDeferred)
+		}
+	}
+
+	// Named table-level — flags land on the matching NamedConstraints entry.
+	namedCases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, CONSTRAINT pk PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, CONSTRAINT pk PRIMARY KEY (a) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, CONSTRAINT pk PRIMARY KEY (a) NOT DEFERRABLE)", false, false},
+	}
+	for _, c := range namedCases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		var found *TableConstraintDef
+		for i := range ct.NamedConstraints {
+			if ct.NamedConstraints[i].IsPrimary {
+				found = &ct.NamedConstraints[i]
+				break
+			}
+		}
+		if found == nil {
+			t.Fatalf("Parse(%q): no primary-key NamedConstraint", c.in)
+		}
+		if found.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, found.Deferrable, c.wantDefer)
+		}
+		if found.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, found.InitiallyDeferred, c.wantDeferred)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {

@@ -907,6 +907,16 @@ type ColumnDef struct {
 	// CHECKING is not implemented (constraints enforced per-row). DU-002 slice 141.
 	UniqueDeferrable        bool
 	UniqueInitiallyDeferred bool
+	// PrimaryDeferrable / PrimaryInitiallyDeferred capture a `[NOT] DEFERRABLE
+	// [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` trailer on an inline column
+	// PRIMARY KEY constraint (`a int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED`).
+	// They thread onto the backing catalog.Index so pg_get_constraintdef / pg_dump
+	// re-emit the clause and pg_constraint emits condeferrable/condeferred.
+	// INITIALLY DEFERRED implies DEFERRABLE; IMMEDIATE is the default (both
+	// false). Only meaningful when Primary is true. Dump-fidelity only — deferred
+	// CHECKING is not implemented (constraints enforced per-row). DU-002 slice 142.
+	PrimaryDeferrable        bool
+	PrimaryInitiallyDeferred bool
 	// GeneratedAlways is true for `GENERATED ALWAYS AS (expr) STORED` columns.
 	// M0096-0008.
 	GeneratedAlways bool
@@ -1074,6 +1084,15 @@ type CreateTableStmt struct {
 	// PrimaryKeyInclude holds the INCLUDE covering columns for an anonymous
 	// table-level PRIMARY KEY constraint. M0097-0023.
 	PrimaryKeyInclude []string
+	// PrimaryKeyDeferrable / PrimaryKeyInitiallyDeferred capture a `[NOT]
+	// DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` trailer on an
+	// anonymous table-level PRIMARY KEY constraint (`PRIMARY KEY (a) DEFERRABLE
+	// INITIALLY DEFERRED`). They thread onto the backing catalog.Index so
+	// pg_get_constraintdef / pg_dump re-emit the clause and pg_constraint emits
+	// condeferrable/condeferred. INITIALLY DEFERRED implies DEFERRABLE; IMMEDIATE
+	// is the default (both false). Dump-fidelity only. DU-002 slice 142.
+	PrimaryKeyDeferrable        bool
+	PrimaryKeyInitiallyDeferred bool
 	// NamedConstraints holds explicitly named UNIQUE/PRIMARY KEY/EXCLUDE constraints,
 	// which may carry INCLUDE covering columns. The parser places named constraints
 	// here so the executor can use the constraint name as the index name. M0097-0023.

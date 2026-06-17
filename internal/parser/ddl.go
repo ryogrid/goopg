@@ -1327,14 +1327,15 @@ func (p *parser) parseRefreshMatView(pos int) (Stmt, error) {
 	return stmt, nil
 }
 
-// parseUniqueDeferrable consumes an optional `[NOT] DEFERRABLE [INITIALLY
+// parseConstraintDeferrable consumes an optional `[NOT] DEFERRABLE [INITIALLY
 // DEFERRED | INITIALLY IMMEDIATE]` trailer (and the bare `INITIALLY DEFERRED`
-// shorthand, which implies DEFERRABLE) following an inline column UNIQUE
-// constraint, recording the result into the supplied flags. NOT DEFERRABLE and
-// INITIALLY IMMEDIATE both leave the flags false (the SQL defaults). This is the
-// inline-column sibling of the trailer parsing used by the table-level UNIQUE
-// forms. DU-002 slice 141.
-func (p *parser) parseUniqueDeferrable(deferrable, initiallyDeferred *bool) {
+// shorthand, which implies DEFERRABLE) following an inline column UNIQUE or
+// PRIMARY KEY constraint, recording the result into the supplied flags. NOT
+// DEFERRABLE and INITIALLY IMMEDIATE both leave the flags false (the SQL
+// defaults). This is the inline-column sibling of the trailer parsing used by
+// the table-level UNIQUE / PRIMARY KEY forms. DU-002 slices 141 (UNIQUE) / 142
+// (PRIMARY KEY).
+func (p *parser) parseConstraintDeferrable(deferrable, initiallyDeferred *bool) {
 	if p.acceptKeyword(KwNot) {
 		_ = p.acceptKeyword(KwDeferrable)
 		return
@@ -1804,16 +1805,11 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 				}
 			}
-			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE] — accept and discard.
-			if p.acceptKeyword(KwNot) {
-				_ = p.acceptKeyword(KwDeferrable)
-			} else {
-				p.acceptKeyword(KwDeferrable)
-			}
-			if p.acceptIdentKeyword("initially") {
-				_ = p.acceptIdentKeyword("deferred")
-				_ = p.acceptIdentKeyword("immediate")
-			}
+			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
+			// Captured (not discarded) so pg_get_constraintdef re-emits the clause
+			// and pg_constraint emits condeferrable/condeferred on dump. The flags
+			// ride the backing tbl_pkey index built in the executor. DU-002 slice 142.
+			p.parseConstraintDeferrable(&stmt.PrimaryKeyDeferrable, &stmt.PrimaryKeyInitiallyDeferred)
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
 			// Table-level UNIQUE [NULLS NOT DISTINCT] (cols) [INCLUDE (incl)] —
 			// create btree index. M0097-0028 / DU-002 slice 135.
@@ -1945,18 +1941,14 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						}
 					}
 				}
+				// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
+				// Captured (not discarded) onto the constraint def so the executor
+				// threads it onto the backing index (shared NamedConstraints loop) and
+				// pg_get_constraintdef / pg_constraint re-emit the clause on dump.
+				// Parsed before the append so cdef carries the flags. DU-002 slice 142.
+				p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
 				if constraintName != "" {
 					stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
-				}
-				// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE] — accept and discard.
-				if p.acceptKeyword(KwNot) {
-					_ = p.acceptKeyword(KwDeferrable)
-				} else {
-					p.acceptKeyword(KwDeferrable)
-				}
-				if p.acceptIdentKeyword("initially") {
-					_ = p.acceptIdentKeyword("deferred")
-					_ = p.acceptIdentKeyword("immediate")
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 				// CONSTRAINT name UNIQUE [NULLS [NOT] DISTINCT] (cols) [INCLUDE (cols)]
@@ -2415,6 +2407,12 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			}
 			col.Primary = true
 			col.NotNull = true
+			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]
+			// trailer — captured so pg_get_constraintdef / pg_dump re-emit the clause
+			// (rides the backing tbl_pkey index built in the executor). Without this
+			// the keyword fell through to the column-constraint loop's default arm and
+			// failed the whole CREATE TABLE. DU-002 slice 142.
+			p.parseConstraintDeferrable(&col.PrimaryDeferrable, &col.PrimaryInitiallyDeferred)
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull:
 			p.advance() // NULL is the default; absorb it
 		// COLLATE collation_name — ignore collation; goopg v0 doesn't track collations. M0097-0071.
@@ -2590,7 +2588,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			// trailer on the inline column UNIQUE. Without this, a trailing
 			// DEFERRABLE fell through to the default arm and became a HARD PARSE
 			// ERROR for the whole CREATE TABLE. DU-002 slice 141.
-			p.parseUniqueDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
+			p.parseConstraintDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
 		// CHECK (expr) inline column constraint. M0097-0014.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 			p.advance()
@@ -2640,6 +2638,9 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				}
 				col.Primary = true
 				col.NotNull = true
+				// Optional DEFERRABLE trailer (named inline column PRIMARY KEY).
+				// DU-002 slice 142.
+				p.parseConstraintDeferrable(&col.PrimaryDeferrable, &col.PrimaryInitiallyDeferred)
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 				// CONSTRAINT name UNIQUE [NULLS [NOT] DISTINCT] — named inline
 				// column UNIQUE. Set col.Unique so the executor creates the
@@ -2657,7 +2658,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				}
 				// Optional DEFERRABLE trailer (named inline column UNIQUE).
 				// DU-002 slice 141.
-				p.parseUniqueDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
+				p.parseConstraintDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
 				// CONSTRAINT name REFERENCES table (cols) — FK; parsed below.
 				// Fall through to FK parsing path by continuing the outer loop.

@@ -3801,6 +3801,58 @@ forms). Same dump-fidelity scope caveat (no deferred *checking*). The PRIMARY KE
 DEFERRABLE forms (anonymous + named + inline, all still discard the flag) remain
 for later slices.
 
+### Slice 142 — `DEFERRABLE` on all three `PRIMARY KEY` forms
+
+The PRIMARY KEY siblings of slices 139–141: a `[NOT] DEFERRABLE [INITIALLY
+DEFERRED | INITIALLY IMMEDIATE]` trailer on the anonymous table-level
+(`PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED`), named table-level
+(`CONSTRAINT pkdef PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED`), and inline
+column (`a integer PRIMARY KEY DEFERRABLE INITIALLY DEFERRED`) forms now
+round-trips. pg_dump emits `ADD CONSTRAINT <t>_pkey PRIMARY KEY (a) DEFERRABLE
+INITIALLY DEFERRED` (auto name) and `ADD CONSTRAINT pkdef PRIMARY KEY (a)
+DEFERRABLE INITIALLY DEFERRED` (named).
+
+**The bug:** all three PK parser cases *discarded* the trailer. The two
+table-level cases accepted-and-dropped it (`_ = p.acceptKeyword(KwDeferrable)`);
+the inline column case had **no slot** at all, so a trailing `DEFERRABLE` fell
+through to the column-constraint loop's default arm and was a hard parse error
+that failed the whole `CREATE TABLE`. The fix:
+
+1. **Parser** (`internal/parser/ddl.go`) — the generic `parseUniqueDeferrable`
+   helper from slice 141 is renamed `parseConstraintDeferrable` (it parses a
+   constraint deferrable trailer, not a UNIQUE-specific one) and now captures the
+   trailer for all three PK cases: the anonymous table-level case into two new
+   `CreateTableStmt.PrimaryKeyDeferrable` / `PrimaryKeyInitiallyDeferred` fields,
+   the named table-level case into the existing `TableConstraintDef.Deferrable` /
+   `InitiallyDeferred` fields (parsed *before* the `NamedConstraints` append), and
+   both inline column cases (anonymous + named) into two new
+   `ColumnDef.PrimaryDeferrable` / `PrimaryInitiallyDeferred` fields
+   (`internal/parser/ast.go`).
+2. **Executor** (`internal/executor/operators_ddl.go`) — the named table-level
+   form already threads `nc.Deferrable` onto the backing index via the shared
+   `NamedConstraints` loop (slice 140). For the anonymous table-level and inline
+   column forms, the `tbl_pkey` index build now copies the deferrable flags onto
+   `idx.Deferrable` / `idx.InitiallyDeferred`. Subtlety: an inline column PK
+   *also* populates `s.PrimaryKey` (the parser appends the column name), so the
+   table-level branch reads the false `PrimaryKeyDeferrable`; a follow-up scan of
+   the columns adopts an inline PK column's flags. The two forms are mutually
+   exclusive, so no double-count.
+3. **Deparse + `pg_constraint`** — unchanged. `buildConstraintDefString`
+   (`internal/executor/expr.go`) already appends ` DEFERRABLE [INITIALLY
+   DEFERRED]` from the index regardless of the PRIMARY KEY / UNIQUE keyword, and
+   pg_constraint already emits `condeferrable` / `condeferred` from `idx.Deferrable`
+   for `contype='p'`.
+
+The round-trip test adds `public.pktdef`, `public.pkndef`, and `public.pkcdef`
+and asserts all three `ADD CONSTRAINT … PRIMARY KEY (a) DEFERRABLE INITIALLY
+DEFERRED` lines, with negative guards against the dropped-flag
+(`… PRIMARY KEY (a);`) and partial-render (`… PRIMARY KEY (a) DEFERRABLE;`)
+regressions for each name. Unit test: `TestParsePrimaryKeyDeferrable` (parser
+capture across all three forms). Same dump-fidelity scope caveat (no deferred
+*checking* — constraints are enforced per-row, not at COMMIT). With slice 142 the
+full DEFERRABLE surface for UNIQUE and PRIMARY KEY constraints round-trips;
+exclusion-constraint (`EXCLUDE USING`) DEFERRABLE remains for a later slice.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
