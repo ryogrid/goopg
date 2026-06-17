@@ -55,6 +55,31 @@ func TestParseCreateFunctionOrReplace(t *testing.T) {
 	}
 }
 
+// TestParseCreateFunctionParallel pins the proparallel marker captured from
+// the PARALLEL SAFE/RESTRICTED/UNSAFE clause. The default (no clause) is "u"
+// (unsafe), matching PG's CREATE FUNCTION default. DU-002 slice 150.
+func TestParseCreateFunctionParallel(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{`CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "u"},
+		{`CREATE FUNCTION f() RETURNS int LANGUAGE sql PARALLEL SAFE AS $$ SELECT 1 $$`, "s"},
+		{`CREATE FUNCTION f() RETURNS int LANGUAGE sql PARALLEL RESTRICTED AS $$ SELECT 1 $$`, "r"},
+		{`CREATE FUNCTION f() RETURNS int LANGUAGE sql PARALLEL UNSAFE AS $$ SELECT 1 $$`, "u"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.src, err)
+		}
+		cf := stmts[0].(*CreateFunctionStmt)
+		if cf.Parallel != tc.want {
+			t.Errorf("Parallel = %q, want %q (src=%q)", cf.Parallel, tc.want, tc.src)
+		}
+	}
+}
+
 // TestParseCreateFunctionWithArgs pins the named-arg surface and the
 // implicit-IN mode. Two args with explicit names + one anonymous
 // positional arg.

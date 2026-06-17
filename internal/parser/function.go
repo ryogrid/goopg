@@ -96,6 +96,7 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 		ReturnType: retType,
 		ReturnsSet: returnsSet,
 		Volatile:   "v", // default: volatile
+		Parallel:   "u", // default: parallel unsafe (PG CREATE FUNCTION default)
 	}
 	// The LANGUAGE / AS clauses can appear in either order (mirrors
 	// upstream). Loop until both have been seen or we hit an
@@ -227,7 +228,14 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 				continue
 			} else if cur.Kind == TokenKeyword && cur.Keyword == KwParallel {
 				p.advance()
-				p.acceptIdentKeyword("safe", "unsafe", "restricted")
+				switch {
+				case p.acceptIdentKeyword("safe"):
+					stmt.Parallel = "s"
+				case p.acceptIdentKeyword("restricted"):
+					stmt.Parallel = "r"
+				case p.acceptIdentKeyword("unsafe"):
+					stmt.Parallel = "u"
+				}
 				continue
 			}
 			p.consumeFunctionAttribute()
@@ -450,9 +458,11 @@ func (p *parser) parseFunctionArg() (FunctionArg, error) {
 }
 
 // parseProcedureArg parses a single procedure argument in any of the PG forms:
-//   [mode] [name] type      — mode-first
-//   [name] [mode] type      — name-first (PG also accepts this)
-//   [DEFAULT expr]
+//
+//	[mode] [name] type      — mode-first
+//	[name] [mode] type      — name-first (PG also accepts this)
+//	[DEFAULT expr]
+//
 // Stage B allows OUT, INOUT, and VARIADIC modes.
 func (p *parser) parseProcedureArg() (FunctionArg, error) {
 	pos := p.cur().Pos

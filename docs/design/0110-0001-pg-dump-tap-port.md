@@ -4129,6 +4129,47 @@ production change. The test asserts the exact one-line
 `LANGUAGE sql IMMUTABLE STRICT` / `AS $_$ SELECT $1 + 2 $_$;` fragment. Pure
 dump-fidelity; no catalog-schema change.
 
+### Slice 150 — `PARALLEL SAFE` round-trip (real divergence fixed)
+
+Slices 148/149 exercised the `pg_proc` virtual view's `provolatile`/`proisstrict`
+cells, but `proparallel` was still **hardcoded** to `'u'` (unsafe) in both row
+builders — the comment even said "goopg tracks no parallel-safety". `dumpFunc`
+suppresses the clause for `'u'` (the default), so the hardcode happened to be a
+no-op for the only cell ever tested. But goopg's CREATE FUNCTION parser *parsed*
+the `PARALLEL safe|restricted|unsafe` clause and then **threw it away** — so a
+`CREATE FUNCTION … PARALLEL SAFE` was silently downgraded to unsafe on dump. A
+real round-trip divergence, not a fidelity gap.
+
+This slice threads the marker end-to-end:
+
+- **Parser** (`function.go`): `CreateFunctionStmt.Parallel` (new field) defaults
+  to `'u'` and captures `'s'`/`'r'`/`'u'` from `PARALLEL safe|restricted|unsafe`
+  (previously `acceptIdentKeyword(...)` consumed-and-discarded).
+- **Catalog** (`routines.go`): new `Routine.Parallel` field.
+- **Executor** (`operators_ddl.go`): `execCreateFunction` stores `s.Parallel`.
+- **Virtual view** (`pg_proc_view.go`): the user-routine row builder emits
+  `r.Parallel` (defaulting `''`→`'u'`) instead of the literal `"u"`.
+- **Sibling deparse** (`expr.go`): `pg_get_functiondef` emits ` PARALLEL SAFE`/
+  ` PARALLEL RESTRICTED` when `proparallel != 'u'` (kept in sync with the dump
+  path per the sibling-paths rule).
+
+`dumpFunc` (`pg_dump.c:13581`) appends ` PARALLEL SAFE` inline after the
+`LANGUAGE` line (it is the last of the volatility/strict/secdef/leakproof/cost/
+rows/support/parallel clause chain) when `proparallel[0] != 'u'`, so real pg_dump
+18.3 renders:
+
+```
+CREATE FUNCTION public.add_three(integer) RETURNS integer
+    LANGUAGE sql PARALLEL SAFE
+    AS $_$ SELECT $1 + 3 $_$;
+```
+
+The TAP test creates `add_three … PARALLEL SAFE` and asserts the exact one-line
+`LANGUAGE sql PARALLEL SAFE` / `AS $_$ SELECT $1 + 3 $_$;` fragment. A parser
+unit test (`TestParseCreateFunctionParallel`) pins the four marker mappings.
+Procedures keep `'u'` (PG rejects PARALLEL on CREATE PROCEDURE), so the procedure
+path is unchanged.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

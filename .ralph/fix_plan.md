@@ -3223,6 +3223,36 @@ object support.
         set-returning function's `ROWS` clause, or a `CREATE PROCEDURE` /
         prokind='p' round-trip).
 
+      - **PROGRESS 2026-06-17 (loop #115):** **DU-002 slice 150 LANDED** —
+        `PARALLEL SAFE` now round-trips; **a real divergence fixed**, not just a
+        fidelity test. The `pg_proc` virtual view hardcoded `proparallel`='u'
+        (unsafe) in both row builders, and the CREATE FUNCTION parser *parsed*
+        the `PARALLEL safe|restricted|unsafe` clause then **discarded** it — so a
+        `CREATE FUNCTION … PARALLEL SAFE` was silently downgraded to unsafe on
+        dump. Threaded the marker end-to-end: `CreateFunctionStmt.Parallel` (new,
+        default 'u'; captures 's'/'r'/'u'), `Routine.Parallel` (new),
+        `execCreateFunction` stores it, the view emits `r.Parallel` instead of the
+        literal "u", and the sibling `pg_get_functiondef` deparser emits
+        ` PARALLEL SAFE`/` PARALLEL RESTRICTED` when != 'u'. `dumpFunc`
+        (`pg_dump.c:13581`) appends ` PARALLEL SAFE` inline after the `LANGUAGE`
+        line when `proparallel[0] != 'u'`. Test adds
+        `public.add_three(integer) … PARALLEL SAFE` and asserts the exact one-line
+        `LANGUAGE sql PARALLEL SAFE` / `AS $_$ SELECT $1 + 3 $_$;` fragment;
+        `TestParseCreateFunctionParallel` pins the 4 marker mappings. Procedures
+        keep 'u' (PG rejects PARALLEL on CREATE PROCEDURE). Files:
+        `internal/parser/{ast,function,function_test}.go`,
+        `internal/catalog/routines.go`,
+        `internal/executor/{operators_ddl,expr}.go`,
+        `internal/initdb/pg_proc_view.go`,
+        `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md`. Gates: gofmt OK; `go build
+        ./internal/...` OK; `go vet ./internal/executor/` clean; parser +
+        catalog + initdb tests PASS; `TestPort_PgDumpConnectionSetup` PASS
+        (2.87s, not skipped); pgbench pre-commit smoke on commit. **Next: slice
+        151** — a fresh pg_dump catalog-surface gap (e.g. SECURITY DEFINER /
+        LEAKPROOF function clauses, a set-returning function's `ROWS` clause, or a
+        `CREATE PROCEDURE` / prokind='p' round-trip).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

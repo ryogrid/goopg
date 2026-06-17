@@ -5573,6 +5573,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		IsWindow:        s.Window,
 		Strict:          s.Strict,
 		Volatile:        volatile,
+		Parallel:        s.Parallel,
 		SecurityDefiner: s.SecurityDefiner,
 		Leakproof:       s.Leakproof,
 	}

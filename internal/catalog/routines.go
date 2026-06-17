@@ -44,6 +44,7 @@ type Routine struct {
 	Body            string // raw routine source between the dollar-quote delimiters
 	Strict          bool   // STRICT / CALLED ON NULL INPUT
 	Volatile        string // "v"=volatile (default), "s"=stable, "i"=immutable
+	Parallel        string // proparallel: "u"=unsafe (default), "s"=safe, "r"=restricted
 	SecurityDefiner bool   // SECURITY DEFINER
 	Leakproof       bool   // LEAKPROOF
 	IsProcedure     bool   // true when created via CREATE PROCEDURE

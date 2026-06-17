@@ -1,33 +1,36 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 149 (loop #114) — non-default volatility/strict now
-round-trips through pg_dump. Slice 148 asserted only `add_one` (all-default
-attrs), so the `pg_proc` virtual view's `provolatile`/`proisstrict` cells were
-only ever exercised at default 'v'/'f'. This slice adds
-`public.add_two(integer) … IMMUTABLE STRICT` and asserts pg_dump emits the exact
-one-line `LANGUAGE sql IMMUTABLE STRICT` / `AS $_$ SELECT $1 + 2 $_$;` fragment.
-dumpFunc (pg_dump.c:13531 / :13542) appends ` IMMUTABLE` when provolatile[0] !=
-'v' and ` STRICT` when proisstrict[0] == 't', both inline after `LANGUAGE sql`.
-goopg's CREATE FUNCTION executor already stores r.Volatile='i' / r.Strict=true
-(parser defaults Volatile to 'v', overrides to 'i' for IMMUTABLE) and the view
-emits provolatile='i' (text) + proisstrict='t' (bool) verbatim → dump matched on
-the FIRST run. Clean positive test, NO production change (test + design-doc only).
+Last landed: DU-002 slice 150 (loop #115) — `PARALLEL SAFE` now round-trips
+through pg_dump. This was a REAL divergence, not a fidelity-only test: the
+pg_proc virtual view hardcoded proparallel='u' AND the CREATE FUNCTION parser
+parsed `PARALLEL safe|restricted|unsafe` then discarded it, so a
+`CREATE FUNCTION … PARALLEL SAFE` was silently downgraded to unsafe on dump.
+Threaded the marker end-to-end:
+  - parser: CreateFunctionStmt.Parallel (new, default 'u'; captures 's'/'r'/'u')
+  - catalog: Routine.Parallel (new field)
+  - executor: execCreateFunction stores s.Parallel (operators_ddl.go ~5577)
+  - view: pg_proc_view.go user-routine builder emits r.Parallel (''→'u')
+  - sibling deparse: pg_get_functiondef (expr.go) emits PARALLEL SAFE/RESTRICTED
+dumpFunc (pg_dump.c:13581) appends ` PARALLEL SAFE` inline after the LANGUAGE
+line when proparallel[0] != 'u' (it's the LAST of the volatility/strict/secdef/
+leakproof/cost/rows/support/parallel clause chain). Procedures keep 'u' (PG
+rejects PARALLEL on CREATE PROCEDURE), so the procedure executor path
+(operators_ddl.go ~6240) is intentionally unchanged.
 
-NOTE (dead-code finding, not fixed): inferSQLFunctionVolatility
-(operators_ddl.go:9938) is effectively unreachable — the parser defaults
-stmt.Volatile to "v" (function.go:98), so `volatile := s.Volatile` is never "",
-and the inference branch (`if volatile == ""`) never runs. Harmless; left as-is.
+Key symbols: registerPgProcView (pg_proc_view.go), dumpFunc (pg_dump.c:13581),
+catalog.Routine.Parallel, CreateFunctionStmt.Parallel, getFunctionDef deparse
+in expr.go.
+Files: internal/parser/{ast,function,function_test}.go,
+internal/catalog/routines.go, internal/executor/{operators_ddl,expr}.go,
+internal/initdb/pg_proc_view.go,
+internal/testport/pgdump_connsetup_test.go,
+docs/design/0110-0001-pg-dump-tap-port.md, .ralph/fix_plan.md.
+Verified: gofmt OK; go build ./internal/... OK; go vet ./internal/executor/
+clean; parser+catalog+initdb tests PASS; TestPort_PgDumpConnectionSetup PASS
+(2.87s, not skipped). ralph-state-guard + pgbench smoke (on commit) pending.
 
-Key symbols: registerPgProcView (pg_proc_view.go), dumpFunc (pg_dump.c),
-catalog.Routine.Volatile/Strict, parser CREATE FUNCTION attr clause.
-Files: internal/testport/pgdump_connsetup_test.go (slice 149: create add_two +
-2 assertions), docs/design/0110-0001-pg-dump-tap-port.md (Slice 149 section),
-.ralph/fix_plan.md (loop #113/#114 PROGRESS).
-Verified: gofmt OK; go build ./internal/... OK; TestPort_PgDumpConnectionSetup
-PASS (2.16s, not skipped). ralph-state-guard pending.
-
-Next direction (slice 150): a fresh pg_dump catalog-surface gap. Candidates:
-a SECURITY DEFINER / LEAKPROOF / PARALLEL SAFE function (exercise the remaining
-dumpFunc clauses — note proparallel column is always 'u' in the view, so PARALLEL
-SAFE would NOT round-trip yet → a real divergence to fix); a set-returning
-function's ROWS clause; or a CREATE PROCEDURE (prokind='p') round-trip.
+Next direction (slice 151): a fresh pg_dump catalog-surface gap. Candidates:
+a SECURITY DEFINER / LEAKPROOF function (exercise those dumpFunc clauses —
+goopg already stores r.SecurityDefiner/r.Leakproof and the view emits them, so
+likely a clean positive test); a set-returning function's ROWS clause (prorows
+non-default); or a CREATE PROCEDURE (prokind='p') round-trip.

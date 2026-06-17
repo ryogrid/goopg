@@ -204,9 +204,10 @@ var builtinProcs = []builtinProcRow{
 //     the function uses; always NULL — goopg supports no transforms, so
 //     dumpFunc emits no `TRANSFORM FOR TYPE ...` clause.
 //   - proparallel: parallel-safety marker (char) — 's' safe / 'r' restricted /
-//     'u' unsafe. Mirrors PG's CREATE FUNCTION default of 'u' (unsafe) for
-//     every routine; goopg tracks no parallel-safety, so dumpFunc emits
-//     `PARALLEL UNSAFE` (the default, so effectively nothing) for all.
+//     'u' unsafe. Defaults to 'u' (unsafe), matching PG's CREATE FUNCTION
+//     default; a CREATE FUNCTION … PARALLEL SAFE/RESTRICTED records 's'/'r'.
+//     dumpFunc emits `PARALLEL SAFE`/`PARALLEL RESTRICTED` whenever the marker
+//     != 'u' (the default, which it suppresses). DU-002 slice 150.
 //   - prosupport: the function's planner support function. Typed regproc (as in
 //     PG's pg_proc), so InvalidOid renders as the text '-', NOT '0'. pg_dump's
 //     getFuncs selects `prosupport` raw and dumpFunc emits `SUPPORT <val>`
@@ -343,6 +344,13 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			if r.ReturnsSet {
 				prorows = "1000"
 			}
+			// proparallel: PG's CREATE FUNCTION default is 'u' (unsafe);
+			// PARALLEL SAFE/RESTRICTED record 's'/'r'. dumpFunc emits
+			// `PARALLEL SAFE`/`PARALLEL RESTRICTED` when the marker != 'u'.
+			parallel := r.Parallel
+			if parallel == "" {
+				parallel = "u"
+			}
 			rows = append(rows, []string{
 				fmt.Sprintf("%d", r.OID),
 				r.Name,
@@ -360,13 +368,13 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				strict,
 				prokind,
 				retset,
-				"",      // probin: NULL (goopg has no C-language functions)
-				"",      // proconfig: NULL (goopg tracks no per-function GUC SET)
-				procost, // procost: language-derived (1 internal/C, else 100)
-				prorows, // prorows: 1000 for SRFs, 0 otherwise
-				"",      // protrftypes: NULL (goopg supports no transforms)
-				"u",     // proparallel: unsafe (PG CREATE FUNCTION default)
-				"-",     // prosupport: regproc InvalidOid renders '-' (no support function)
+				"",       // probin: NULL (goopg has no C-language functions)
+				"",       // proconfig: NULL (goopg tracks no per-function GUC SET)
+				procost,  // procost: language-derived (1 internal/C, else 100)
+				prorows,  // prorows: 1000 for SRFs, 0 otherwise
+				"",       // protrftypes: NULL (goopg supports no transforms)
+				parallel, // proparallel: 'u' unsafe (default), 's' safe, 'r' restricted
+				"-",      // prosupport: regproc InvalidOid renders '-' (no support function)
 			})
 		}
 		return rows

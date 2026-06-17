@@ -11437,6 +11437,14 @@ func buildFunctionDef(r *catalog.Routine) string {
 		sb.WriteString(" SECURITY DEFINER\n")
 	}
 
+	// PARALLEL SAFE / RESTRICTED (UNSAFE is the default, omitted — matches PG's deparser)
+	switch r.Parallel {
+	case "s":
+		sb.WriteString(" PARALLEL SAFE\n")
+	case "r":
+		sb.WriteString(" PARALLEL RESTRICTED\n")
+	}
+
 	// Body
 	body := r.Body
 	if r.BeginAtomic {

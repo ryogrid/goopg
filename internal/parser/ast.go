@@ -1930,6 +1930,7 @@ type CreateFunctionStmt struct {
 	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
 	IsReturnForm    bool   // PG14 RETURN expr body (no AS keyword, body stored as "SELECT expr")
 	Window          bool   // WINDOW attribute — marks function as a window function
+	Parallel        string // proparallel: "u"=unsafe (default), "s"=safe, "r"=restricted
 }
 
 // AlterFunctionStmt — `ALTER FUNCTION name([argtypes]) attribute ...`

@@ -1498,6 +1498,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function add_two: %v", err)
 	}
 
+	// Slice 150: a third user function carrying an explicit PARALLEL SAFE marker,
+	// so the dump exercises the pg_proc virtual view's `proparallel` column at a
+	// NON-default value ('s'). Slices 148/149 only ever drove the hardcoded 'u'
+	// (unsafe) cell, which dumpFunc suppresses — so the round-trip was a no-op.
+	// goopg previously discarded the PARALLEL clause entirely (the parser parsed
+	// then dropped it; the view hardcoded 'u'), so PARALLEL SAFE was silently lost
+	// on dump — a real divergence. pg_dump's dumpFunc (pg_dump.c:13581) appends
+	// ` PARALLEL SAFE` inline after `LANGUAGE sql` when proparallel[0] != 'u'.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.add_three(integer) RETURNS integer LANGUAGE sql PARALLEL SAFE AS $$ SELECT $1 + 3 $$"); err != nil {
+		t.Fatalf("create function add_three: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -1940,6 +1952,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "    LANGUAGE sql IMMUTABLE STRICT\n    AS $_$ SELECT $1 + 2 $_$;") {
 			t.Errorf("pg_dump dropped/mangled add_two's IMMUTABLE STRICT clauses or body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 150 (asserted):** the PARALLEL SAFE function (add_three) must
+		// round-trip. proparallel is the LAST inline clause dumpFunc appends to
+		// the LANGUAGE line (after volatility/strict/secdef/leakproof/cost/rows/
+		// support), so for a function carrying ONLY `PARALLEL SAFE` real pg_dump
+		// 18.3 renders:
+		//   CREATE FUNCTION public.add_three(integer) RETURNS integer
+		//       LANGUAGE sql PARALLEL SAFE
+		//       AS $_$ SELECT $1 + 3 $_$;
+		// Before this slice the view hardcoded proparallel='u', so dumpFunc emitted
+		// nothing and the marker was silently lost. Assert the exact one-line
+		// LANGUAGE/PARALLEL fragment.
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.add_three(integer) RETURNS integer") {
+			t.Errorf("pg_dump dropped/mangled the add_three signature\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "    LANGUAGE sql PARALLEL SAFE\n    AS $_$ SELECT $1 + 3 $_$;") {
+			t.Errorf("pg_dump dropped/mangled add_three's PARALLEL SAFE clause or body\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the
