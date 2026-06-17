@@ -1095,6 +1095,17 @@ func TestFormatExprForAttrdefFuncCall(t *testing.T) {
 		{"int literal", &parser.IntegerConst{Value: 42}, "42"},
 		{"string literal", &parser.StringConst{Value: "pending"}, "'pending'"},
 		{"bool literal", &parser.BooleanConst{Value: true}, "true"},
+		// Parenless SQL niladic value functions deparse as the bare uppercase
+		// keyword (matching PG's get_sql_value_function), NOT `name()` — PG would
+		// re-emit `current_timestamp()` as invalid SQL on restore. The "literal
+		// args" / "now()" cases above guard that ordinary calls keep their parens.
+		// DU-002 slice 174.
+		{"CURRENT_TIMESTAMP", &parser.FuncCall{Name: parser.ObjectName{Name: "current_timestamp"}}, "CURRENT_TIMESTAMP"},
+		{"CURRENT_DATE", &parser.FuncCall{Name: parser.ObjectName{Name: "current_date"}}, "CURRENT_DATE"},
+		{"CURRENT_USER", &parser.FuncCall{Name: parser.ObjectName{Name: "current_user"}}, "CURRENT_USER"},
+		{"CURRENT_SCHEMA", &parser.FuncCall{Name: parser.ObjectName{Name: "current_schema"}}, "CURRENT_SCHEMA"},
+		{"SESSION_USER", &parser.FuncCall{Name: parser.ObjectName{Name: "session_user"}}, "SESSION_USER"},
+		{"LOCALTIMESTAMP", &parser.FuncCall{Name: parser.ObjectName{Name: "localtimestamp"}}, "LOCALTIMESTAMP"},
 	}
 	for _, tc := range cases {
 		if got := formatExprForAttrdef(tc.expr); got != tc.want {

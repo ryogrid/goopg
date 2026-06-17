@@ -3143,7 +3143,7 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 	// niladic FuncCall not a ColumnRef. pgbench's TPC-B emits
 	// `... VALUES (..., CURRENT_TIMESTAMP)` and relies on this
 	// shape.
-	if len(parts) == 1 && isNoParenFuncName(parts[0]) {
+	if len(parts) == 1 && IsNoParenFuncName(parts[0]) {
 		return &FuncCall{pos: startPos, Name: ObjectName{pos: startPos, Name: parts[0]}}, nil
 	}
 	// Column reference.
@@ -3158,12 +3158,16 @@ func (p *parser) parseColumnOrCall() (Expr, error) {
 	return nil, &SyntaxError{Pos: startPos, Message: "column reference has too many name parts"}
 }
 
-// isNoParenFuncName reports whether name (already lower-cased by the
+// IsNoParenFuncName reports whether name (already lower-cased by the
 // lexer) is one of the SQL standard niladic functions that don't
 // require parentheses on the call side. Mirrors upstream's
 // SystemFuncName classification — we cover the ones the executor
-// already knows how to evaluate.
-func isNoParenFuncName(name string) bool {
+// already knows how to evaluate. Exported so default-expression
+// renderers (catalog.formatExprForAttrdef, executor.defaultExprToSQL)
+// can detect a parenless niladic FuncCall and deparse it the way
+// PostgreSQL's get_sql_value_function does — as the bare uppercase
+// keyword, NOT `name()` (DU-002 slice 174).
+func IsNoParenFuncName(name string) bool {
 	switch name {
 	case "current_timestamp", "current_date", "current_time",
 		"localtime", "localtimestamp",

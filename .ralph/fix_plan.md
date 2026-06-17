@@ -3837,6 +3837,28 @@ object support.
         PASS (2.72s, not skipped); pgbench pre-commit smoke on commit. **Next:** function-call defaults
         with literal args / `CURRENT_TIMESTAMP` keyword form (stored without parens in PG); or the
         deferred MINVALUE/MAXVALUE keyword-AST-node slice; or column STORAGE/COMPRESSION dump fidelity.
+      - **PROGRESS 2026-06-17 (loop #141):** **DU-002 slice 174 LANDED — slice-173 regression closed.**
+        Slice 173's generic `*FuncCall` renderer deparsed a parenless SQL niladic value function
+        (`DEFAULT CURRENT_TIMESTAMP`) as `current_timestamp()` — parens that are INVALID SQL on restore.
+        goopg parses `CURRENT_TIMESTAMP`/`CURRENT_DATE`/`CURRENT_USER`/`CURRENT_SCHEMA`/`SESSION_USER`/
+        `LOCALTIMESTAMP`/… (`parser.IsNoParenFuncName` set) as a **zero-arg** `*FuncCall`. **Oracle (PG
+        18.3, verified):** PG stores these as `SQLValueFunction` and `pg_get_expr` deparses the bare
+        UPPERCASE keyword (`CURRENT_TIMESTAMP`), never with parens; `now()` (a real FuncExpr) keeps its
+        parens. **Fix:** both default renderers gain a guard before the generic call arm — zero args +
+        no schema + name in `parser.IsNoParenFuncName` → `strings.ToUpper(name)`. The niladic set is now
+        **exported** from the parser so the parse classifier + both render twins
+        (`catalog.formatExprForAttrdef`, `executor.defaultExprToSQL`) share one source of truth.
+        Display-only. *Known limit:* AST has no "with-parens" flag, so a genuine `current_schema()` call
+        renders as the keyword `CURRENT_SCHEMA` (benign — CURRENT_TIMESTAMP/DATE can't be paren-called at
+        all). Files: `internal/parser/select.go` (export `IsNoParenFuncName`),
+        `internal/catalog/catalog.go` + `internal/executor/operators_ddl.go` (niladic guard, sibling
+        twins), `internal/catalog/catalog_test.go` (niladic cases), `internal/testport/pgdump_connsetup_test.go`
+        (`touched timestamptz DEFAULT CURRENT_TIMESTAMP` + asserts `DEFAULT CURRENT_TIMESTAMP`, not
+        `current_timestamp()`), `docs/design/0110-0001-pg-dump-tap-port.md` (slice 174). Gates: gofmt OK;
+        `go vet ./internal/testport/` clean; `go build ./internal/...` OK; catalog+executor+parser suites
+        PASS; `TestPort_PgDumpConnectionSetup` PASS (2.85s, not skipped); pgbench pre-commit smoke on
+        commit. **Next:** function-call default with literal args e2e (`DEFAULT lpad('x',5)`); deferred
+        MINVALUE/MAXVALUE keyword-AST-node slice; or column STORAGE/COMPRESSION dump fidelity.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

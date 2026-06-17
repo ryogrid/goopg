@@ -6941,6 +6941,18 @@ func formatExprForAttrdef(e parser.Expr) string {
 		}
 		return "false"
 	case *parser.FuncCall:
+		// SQL niladic value functions written without parens (`DEFAULT
+		// CURRENT_TIMESTAMP`, `DEFAULT CURRENT_DATE`, `DEFAULT CURRENT_USER`,
+		// …) parse to a parenless *FuncCall (parser.IsNoParenFuncName). PG
+		// stores these as a SQLValueFunction node, and pg_get_expr deparses
+		// them as the bare UPPERCASE keyword — `CURRENT_TIMESTAMP`, never
+		// `current_timestamp()`. Rendering them like an ordinary call (the
+		// generic branch below) added spurious parens that break the DEFAULT
+		// clause pg_dump re-emits — `current_timestamp()` is not even valid
+		// SQL on restore. Verified against PG 18.3. DU-002 slice 174.
+		if len(v.Args) == 0 && v.Name.Schema == "" && parser.IsNoParenFuncName(strings.ToLower(v.Name.Name)) {
+			return strings.ToUpper(v.Name.Name)
+		}
 		// Function-call defaults (`DEFAULT now()`, `DEFAULT gen_random_uuid()`)
 		// are accepted by validateDefaultExpr, so the parsed *FuncCall reaches
 		// pg_attrdef.adbin. Without this case it fell through to fmt.Sprintf("%v")

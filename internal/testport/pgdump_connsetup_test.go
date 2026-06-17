@@ -826,7 +826,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// executor.defaultExprToSQL, the sibling proargdefaults renderer). A plain
 	// literal default (`status integer DEFAULT 0`) on the same table guards the
 	// pre-existing literal branch through the same dump path.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now())"); err != nil {
+	//
+	// Slice 174: a parenless SQL niladic value function (`DEFAULT
+	// CURRENT_TIMESTAMP`) must NOT acquire the parens slice 173's call renderer
+	// would add. goopg parses CURRENT_TIMESTAMP as a zero-arg *FuncCall
+	// (parser.IsNoParenFuncName); PG stores it as a SQLValueFunction and
+	// pg_get_expr deparses the bare uppercase keyword. formatExprForAttrdef now
+	// special-cases the niladic form to emit `CURRENT_TIMESTAMP` (not
+	// `current_timestamp()`, which is invalid SQL on restore). The `touched`
+	// column guards that path.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP)"); err != nil {
 		t.Fatalf("create table defcol with function-call default: %v", err)
 	}
 
@@ -2242,6 +2251,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			}
 			if !strings.Contains(block, "DEFAULT 0") {
 				t.Errorf("pg_dump dropped the literal default; want %q in defcol block\n  block=%q", "DEFAULT 0", block)
+			}
+			// **Slice 174 (asserted):** parenless SQL niladic default. The
+			// `touched` column carries `DEFAULT CURRENT_TIMESTAMP`. PG deparses the
+			// SQLValueFunction as the bare uppercase keyword; goopg must match —
+			// emitting `current_timestamp()` (the call-form renderer from slice 173)
+			// would be a restore-breaking regression.
+			if !strings.Contains(block, "DEFAULT CURRENT_TIMESTAMP") {
+				t.Errorf("pg_dump dropped/altered the niladic default; want %q in defcol block\n  block=%q", "DEFAULT CURRENT_TIMESTAMP", block)
+			}
+			if strings.Contains(strings.ToLower(block), "current_timestamp()") {
+				t.Errorf("pg_dump added spurious parens to CURRENT_TIMESTAMP (slice 174 regression)\n  block=%q", block)
 			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently

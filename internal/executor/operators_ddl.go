@@ -2378,6 +2378,14 @@ func defaultExprToSQL(e parser.Expr) string {
 		}
 		return v.Column
 	case *parser.FuncCall:
+		// SQL niladic value functions (CURRENT_TIMESTAMP, CURRENT_USER, …)
+		// parse to a parenless *FuncCall. Deparse them as the bare uppercase
+		// keyword the way PG's get_sql_value_function does — `current_timestamp()`
+		// is not valid SQL on re-evaluation. Mirrors the catalog twin in
+		// catalog.formatExprForAttrdef (DU-002 slice 174); keep the two in sync.
+		if len(v.Args) == 0 && v.Name.Schema == "" && parser.IsNoParenFuncName(strings.ToLower(v.Name.Name)) {
+			return strings.ToUpper(v.Name.Name)
+		}
 		var args []string
 		for _, a := range v.Args {
 			args = append(args, defaultExprToSQL(a))

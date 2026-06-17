@@ -4973,6 +4973,46 @@ TAP test adds the `defcol` fixture and asserts both `DEFAULT now()` (the fix) an
 literal branch through the same dump path) survive inside the dumped `defcol` block. A render
 regression on the FuncCall would surface as a `0x…`/`&{…}` token instead of `now()`.
 
+### Slice 174 — parenless SQL niladic value-function DEFAULT (regression from 173 closed)
+
+Slice 173's `*FuncCall` renderer introduced a *new* divergence for one shape: a column default that
+is an SQL niladic value function written without parens, e.g.
+
+```sql
+CREATE TABLE public.defcol (..., touched timestamptz DEFAULT CURRENT_TIMESTAMP);
+```
+
+goopg's parser turns `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_USER`, `CURRENT_SCHEMA`,
+`SESSION_USER`, `LOCALTIMESTAMP`, … (the `parser.IsNoParenFuncName` set) into a **zero-argument**
+`*FuncCall` — the SQL standard niladic functions that may appear without a call list. Slice 173's
+generic call renderer would deparse such a node as `current_timestamp()`, adding parens that are
+**invalid SQL on restore** (`DEFAULT current_timestamp()` does not parse).
+
+**Oracle.** Verified against PG 18.3: PG stores these as a `SQLValueFunction` node (not a `FuncExpr`),
+and `pg_get_expr(adbin)` deparses each as the **bare uppercase keyword** — `CURRENT_TIMESTAMP`,
+`CURRENT_DATE`, `CURRENT_USER`, `CURRENT_SCHEMA`, `SESSION_USER`, `LOCALTIME`, … — never with parens.
+By contrast `now()` is a genuine `FuncExpr` and keeps its parens. The mapping from goopg's lowercase
+parse name to PG's spelling is a plain `strings.ToUpper`.
+
+**Fix.** Both default renderers gain a guard *before* the generic call arm: when a `*FuncCall` has
+zero args, no schema qualifier, and a name in `parser.IsNoParenFuncName`, render `strings.ToUpper(name)`
+(the bare keyword). The niladic-name set is now **exported** from the parser
+(`parser.IsNoParenFuncName`) so the parse-side classifier and both render-side twins
+(`catalog.formatExprForAttrdef` on the pg_dump path, `executor.defaultExprToSQL` on the
+`proargdefaults` path) share one source of truth and cannot drift. Display-only; routing and default
+evaluation are untouched.
+
+*Known limitation.* goopg's AST carries no "written with parens" flag, so a default written as the
+genuine function call `current_schema()` is indistinguishable from the keyword `current_schema` and
+will render as the keyword. This is benign for the dominant cases (`CURRENT_TIMESTAMP`/`CURRENT_DATE`
+etc. cannot be paren-called in PG at all) and matches the far more common keyword spelling in column
+defaults.
+
+`catalog.TestFormatExprForAttrdefFuncCall` adds the niladic cases (keyword forms render bare; `now()`
+and `lpad('x', 5)` guard that ordinary calls keep their parens). The TAP test's `defcol` fixture gains
+a `touched timestamptz DEFAULT CURRENT_TIMESTAMP` column and asserts the dumped block contains
+`DEFAULT CURRENT_TIMESTAMP` and **not** `current_timestamp()`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
