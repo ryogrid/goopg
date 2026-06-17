@@ -7105,6 +7105,9 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	}
 	cycle := s.Cycle
 	RegisterSequence(name, start, increment, minV, maxV, cycle)
+	if s.Cache != nil {
+		SetSequenceCache(name, *s.Cache)
+	}
 	if s.Temporary {
 		SetSequenceTemporary(name, true)
 	}
@@ -7315,7 +7318,7 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	}
 
 	if err := UpdateSequenceParams(name, s.Increment, minV, maxV, s.StartWith, s.RestartWith,
-		s.Restart, s.Cycle, s.NoCycle); err != nil {
+		s.Cache, s.Restart, s.Cycle, s.NoCycle); err != nil {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 	}
 	if s.DataType != "" {

@@ -28,6 +28,7 @@ type seqState struct {
 	increment int64
 	min       int64
 	max       int64
+	cache     int64 // CACHE n (preallocation size); PG default 1
 	cycle     bool
 	called    atomic.Bool // true after first nextval or setval
 	ownedBy   string      // "table.column" set by ALTER SEQUENCE ... OWNED BY
@@ -87,6 +88,7 @@ func RegisterSequence(name string, start, increment, min, max int64, cycle bool)
 		increment: increment,
 		min:       min,
 		max:       max,
+		cache:     1, // PG default; overridden by SetSequenceCache for CACHE n
 		cycle:     cycle,
 		schema:    schema,
 		seqName:   bare,
@@ -107,6 +109,23 @@ func SetSequenceDataType(name, dataType string) {
 	s := v.(*seqState)
 	s.mu.Lock()
 	s.dataType = strings.ToLower(dataType)
+	s.mu.Unlock()
+}
+
+// SetSequenceCache records the declared CACHE size of a sequence (e.g. from
+// CREATE/ALTER SEQUENCE ... CACHE n). Values < 1 are clamped to 1, matching PG's
+// minimum. DU-002 slice 130.
+func SetSequenceCache(name string, cache int64) {
+	v, ok := seqRegistry.Load(seqKey(name))
+	if !ok {
+		return
+	}
+	if cache < 1 {
+		cache = 1
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	s.cache = cache
 	s.mu.Unlock()
 }
 
@@ -470,7 +489,7 @@ func evalLastval(ctx *Context) (Datum, error) {
 // All pointer fields: nil means "leave unchanged". restart=true resets current
 // to start-increment (honoring newStart if also supplied). restartWith, if not
 // nil, overrides the restart target. M0097-0068.
-func UpdateSequenceParams(name string, increment, minVal, maxVal, startWith, restartWith *int64,
+func UpdateSequenceParams(name string, increment, minVal, maxVal, startWith, restartWith, cache *int64,
 	restart, cycle, noCycle bool) error {
 	s := LookupSequence(name)
 	if s == nil {
@@ -480,6 +499,13 @@ func UpdateSequenceParams(name string, increment, minVal, maxVal, startWith, res
 	defer s.mu.Unlock()
 	if increment != nil {
 		s.increment = *increment
+	}
+	if cache != nil {
+		c := *cache
+		if c < 1 {
+			c = 1
+		}
+		s.cache = c
 	}
 	if minVal != nil {
 		s.min = *minVal
@@ -572,13 +598,17 @@ func sequenceParamsForCatalog(qualifiedName string) (catalog.SeqParams, bool) {
 	if dt == "" {
 		dt = "bigint"
 	}
+	cache := s.cache
+	if cache < 1 {
+		cache = 1 // PG default; guards sequences registered before cache tracking
+	}
 	return catalog.SeqParams{
 		TypeOID:   seqTypeOID(dt),
 		Start:     s.start,
 		Increment: s.increment,
 		Max:       s.max,
 		Min:       s.min,
-		Cache:     1, // goopg does not track per-sequence CACHE; PG default is 1
+		Cache:     cache,
 		Cycle:     s.cycle,
 		OwnedBy:   s.ownedBy, // "table.column" for OWNED BY sequences; "" otherwise
 	}, true

@@ -3377,6 +3377,42 @@ CREATE TABLE public.chk3 (z integer, CONSTRAINT chk3_pos CHECK (z > 0) NO INHERI
 Positive assert pins the named suffix; negative guard rejects a plain
 `CONSTRAINT chk3_pos CHECK ((z > 0))\n` (flag dropped).
 
+### Slice 130 — per-sequence CACHE size
+
+`CREATE SEQUENCE … CACHE n` (and `ALTER SEQUENCE … CACHE n`) sets the sequence's
+preallocation size. goopg parsed the clause but **discarded the value**: the
+in-memory `seqState` carried no cache field, and `sequenceParamsForCatalog`
+hard-wired `Cache: 1` into the `pg_sequence.seqcache` row pg_dump reads. So every
+dumped `CREATE SEQUENCE` emitted `CACHE 1` regardless of the declared cache — a
+silent loss of the parameter (a restored dump would change the sequence's caching
+behaviour). The `ALTER SEQUENCE … CACHE n` path was the same: the parser parsed
+the value into a throwaway local.
+
+The fix tracks the cache on the registry-side sequence state and threads it into
+the catalog row:
+
+- `executor` (`operators_sequence.go`): `seqState.cache int64` (default 1 in
+  `RegisterSequence`); new `SetSequenceCache(name, cache)` setter (clamps `< 1` to
+  1, matching PG's minimum); `UpdateSequenceParams` gains a `cache *int64` param;
+  `sequenceParamsForCatalog` returns the tracked value (default 1 for sequences
+  registered before cache tracking).
+- `executor` (`operators_ddl.go`): `execCreateSequence` calls `SetSequenceCache`
+  when `CACHE n` was given; the ALTER path passes `s.Cache` into
+  `UpdateSequenceParams`.
+- `parser`: `AlterSequenceStmt.Cache *int64`; the ALTER `cache` case now stores
+  the parsed value instead of discarding it (`CreateSequenceStmt.Cache` already
+  existed and reached the catalog only after this slice).
+
+```sql
+CREATE SEQUENCE public.cache_seq CACHE 5;          -- → … CACHE 5;
+CREATE SEQUENCE public.altcache_seq;
+ALTER SEQUENCE public.altcache_seq CACHE 42;        -- → … CACHE 42;
+```
+
+Positive asserts pin the full 4-space CREATE blocks (CACHE is the last clause for
+a non-cycling sequence); negative guard rejects `cache_seq` falling back to
+`CACHE 1`. Verified byte-identical to real pg_dump 18.3.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

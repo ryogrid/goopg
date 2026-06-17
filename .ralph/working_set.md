@@ -1,26 +1,26 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 129 (loop #93) — a NAMED table-level CHECK with
-NO INHERIT (`CONSTRAINT c CHECK (expr) NO INHERIT`) now re-emits the
-` NO INHERIT` suffix on dump. The named analog of slice 128's anonymous fix:
-`PartitionCheckConstraint` (CreateTableStmt.TableNamedChecks) had NO NoInherit
-field, and the executor stored named checks via AddCheck (NoInherit=false), so
-the named NO-INHERIT check dumped as a plain *inheritable* CHECK
-(pg_get_constraintdef dropped the suffix; pg_constraint.connoinherit='f') — the
-identical silent inheritance divergence as slice 128, for the named form.
-The deparse path needed no change (both pg_get_constraintdef's CHECK branch and
-the pg_constraint VirtualRow already key off NamedCheckConstraint.NoInherit,
-shared by anon-auto-named and named checks). Fix:
-  - parser/ast.go: PartitionCheckConstraint.NoInherit bool
-  - parser/ddl.go: named-CHECK parse back-fills the flag on the just-appended
-    TableNamedChecks entry once ` NO INHERIT` is consumed (append precedes the
-    suffix parse, so back-fill the last element)
-  - executor/operators_ddl.go: TableNamedChecks loop calls
-    AddCheckWithNoInherit(nc.Name, nc.Expr, oid, nc.NoInherit) (was AddCheck)
-  CREATE TABLE chk3 (z integer, CONSTRAINT chk3_pos CHECK (z > 0) NO INHERIT)
-  → CONSTRAINT chk3_pos CHECK ((z > 0)) NO INHERIT.
-Committed + pushed (see git log).
+Last landed: DU-002 slice 130 (loop #95) — per-sequence CACHE size now
+round-trips through pg_dump. goopg parsed `CACHE n` on CREATE/ALTER SEQUENCE
+but DISCARDED the value: in-memory `seqState` had no cache field and
+`sequenceParamsForCatalog` hard-wired `Cache: 1` into pg_sequence.seqcache, so
+every dumped CREATE SEQUENCE emitted `CACHE 1` regardless of the declared cache.
+The ALTER path was the sibling: parser parsed `CACHE n` into a throwaway local.
+Fix (work was completed by a usage-limit-cut-off prior loop; this loop verified
++ committed it):
+  - executor/operators_sequence.go: seqState.cache int64 (default 1 in
+    RegisterSequence); new SetSequenceCache(name, cache) (clamps <1 to 1);
+    UpdateSequenceParams gains cache *int64; sequenceParamsForCatalog returns
+    tracked value (default-1 guard for pre-tracking sequences).
+  - executor/operators_ddl.go: execCreateSequence calls SetSequenceCache when
+    CACHE n given; ALTER path threads s.Cache into UpdateSequenceParams.
+  - parser/ast.go: AlterSequenceStmt.Cache *int64
+  - parser/ddl.go: ALTER `cache` case stores parsed value (was discarded)
+  CREATE SEQUENCE public.cache_seq CACHE 5;  → … CACHE 5;
+  ALTER SEQUENCE public.altcache_seq CACHE 42; → … CACHE 42;
+Verified byte-identical to pg_dump 18.3; TestPort_PgDumpConnectionSetup PASS.
+Committed + pushed.
 
-Next direction (slice 130): a table+VIEW dependency-ordering case (verify
+Next direction (slice 131): a table+VIEW dependency-ordering case (verify
 topological emission ORDER — view depends on a table, must be dumped after), OR
 a UNIQUE constraint with an INCLUDE column.

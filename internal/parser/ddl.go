@@ -4039,7 +4039,11 @@ func (p *parser) parseAlter() (Stmt, error) {
 			case p.acceptIdentKeyword("cycle"):
 				stmt.Cycle = true
 			case p.acceptIdentKeyword("cache"):
-				_, _ = p.parseInt64()
+				val, err := p.parseInt64()
+				if err != nil {
+					return stmt, err
+				}
+				stmt.Cache = &val
 			case p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet):
 				// SET LOGGED / SET UNLOGGED — no-op.
 				_ = p.acceptIdentKeyword("logged") || p.acceptIdentKeyword("unlogged") || p.acceptKeyword(KwUnlogged)

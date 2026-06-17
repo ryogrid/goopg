@@ -639,6 +639,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.cyc_seq CYCLE"); err != nil {
 		t.Fatalf("create sequence cyc_seq: %v", err)
 	}
+	// Slice 130: a per-sequence CACHE size must round-trip. goopg parsed `CACHE n`
+	// on CREATE but DISCARDED the value (sequenceParamsForCatalog hard-wired
+	// seqcache=1), so every dumped CREATE SEQUENCE emitted `CACHE 1` regardless of
+	// the declared cache — a silent loss of the preallocation parameter (a restored
+	// dump would change the sequence's caching behaviour). The executor now tracks
+	// the cache on the in-memory seqState (SetSequenceCache) and pg_sequence.seqcache
+	// reports it, so pg_dump re-emits the declared `CACHE n`. ALTER SEQUENCE ...
+	// CACHE n (the sibling path — the parser previously parsed-and-threw-away the
+	// value too) is wired through the same field via UpdateSequenceParams. Verified
+	// byte-identical to real pg_dump 18.3 (CREATE: CACHE 5; ALTER: CACHE 42).
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.cache_seq CACHE 5"); err != nil {
+		t.Fatalf("create sequence cache_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.altcache_seq"); err != nil {
+		t.Fatalf("create sequence altcache_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER SEQUENCE public.altcache_seq CACHE 42"); err != nil {
+		t.Fatalf("alter sequence altcache_seq cache: %v", err)
+	}
 	// Slice 118: a sequence with `OWNED BY table.column` is the last single-
 	// sequence pg_dump surface. PG records the link as a pg_depend AUTO ('a') row
 	// (classid/refclassid=pg_class, objid=seq oid, refobjid=table oid,
@@ -1666,6 +1685,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// guarded above) and the plain descending seq must NOT emit MINVALUE/MAXVALUE.
 		if strings.Contains(res.Stdout, "CREATE SEQUENCE public.desc_seq\n    START WITH -1\n    INCREMENT BY -1\n    MINVALUE") {
 			t.Errorf("pg_dump emitted a spurious MINVALUE for a plain descending sequence\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 130 (asserted):** a per-sequence CACHE size must round-trip. The
+		// CREATE path (`CACHE 5`) and the ALTER path (`ALTER SEQUENCE ... CACHE 42`
+		// over a default-cache sequence) both surface in pg_sequence.seqcache, which
+		// pg_dump renders as the 4-space `CACHE n` clause. The full blocks pin the
+		// exact byte order (CACHE is the last clause for a non-cycling sequence). A
+		// regression that re-hard-wired seqcache=1 — the behaviour every other
+		// sequence slice tolerates, since they all use the default — would silently
+		// emit `CACHE 1` here instead.
+		cacheSeqDefs := []string{
+			"CREATE SEQUENCE public.cache_seq\n    START WITH 1\n    INCREMENT BY 1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 5;\n",
+			"CREATE SEQUENCE public.altcache_seq\n    START WITH 1\n    INCREMENT BY 1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 42;\n",
+		}
+		for _, sub := range cacheSeqDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a per-sequence CACHE size; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// Negative guard: the explicit-cache sequences must NOT fall back to CACHE 1
+		// (the old hard-wired seqcache=1 behaviour).
+		if strings.Contains(res.Stdout, "CREATE SEQUENCE public.cache_seq\n    START WITH 1\n    INCREMENT BY 1\n    NO MINVALUE\n    NO MAXVALUE\n    CACHE 1;\n") {
+			t.Errorf("pg_dump emitted CACHE 1 for a CACHE 5 sequence (seqcache hard-wired)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 124 (asserted):** an ADVANCED sequence dumps its setval with
 		// is_called=TRUE and the bumped last_value. After `setval(bumped_seq, 42,

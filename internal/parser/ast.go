@@ -1268,6 +1268,7 @@ type AlterSequenceStmt struct {
 	StartWith    *int64 // START [WITH] n — updates stored start_value only
 	Restart      bool   // RESTART (no value) — reset current to start_value
 	RestartWith  *int64 // RESTART [WITH] n — reset current and update start_value
+	Cache        *int64 // CACHE n (nil = unchanged)
 	Cycle        bool   // CYCLE
 	NoCycle      bool   // NO CYCLE
 	OwnedBy      string // "table.column" or "" from OWNED BY clause
