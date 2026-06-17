@@ -1721,6 +1721,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function make_arr: %v", err)
 	}
 
+	// Slice 163: a function written in `LANGUAGE plpgsql` (the most common
+	// real-world PL). Every prior function slice used LANGUAGE sql. The plpgsql
+	// path was a separate, untested sibling: the parser/executor accept plpgsql
+	// bodies (operators_ddl.go's CREATE FUNCTION pins LANGUAGE to plpgsql|sql|c),
+	// but pg_proc's prolang is resolved by name via langNameToOIDStr, which
+	// previously returned "0" for plpgsql. pg_dump's dumpFunc joins pg_proc to
+	// pg_language on `l.oid = p.prolang` (no lanispl filter) purely to fetch
+	// lanname; prolang=0 matches no pg_language row, so the join returns "0 rows
+	// instead of one" and ABORTS the whole dump. This slice gives plpgsql a
+	// pg_language row (OID 13627, matching a stock PG 18.3 initdb) and maps the
+	// name in langNameToOIDStr, so prolang=13627 resolves to lanname='plpgsql'.
+	// The new row keeps lanispl=f (like internal/c/sql) so getProcLangs's
+	// `WHERE lanispl` still emits no CREATE LANGUAGE — real PG suppresses it via a
+	// pg_depend pin instead, but the net dump output is identical. The body
+	// contains `$1`, so pg_dump dollar-quotes with the `$_$` tag (the body is
+	// stored verbatim as prosrc and rendered untouched — plpgsql bodies are NOT
+	// deparsed, unlike `LANGUAGE sql ... BEGIN ATOMIC`).
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.plpg_inc(integer) RETURNS integer LANGUAGE plpgsql AS $$ BEGIN RETURN $1 + 1; END; $$"); err != nil {
+		t.Fatalf("create function plpg_inc: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2381,6 +2402,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.make_arr() RETURNS integer[]\n    LANGUAGE sql\n    AS $$ SELECT ARRAY[1, 2, 3] $$;") {
 			t.Errorf("pg_dump dropped/mangled make_arr's body or return clause\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 163 (asserted):** a `LANGUAGE plpgsql` function (plpg_inc) must
+		// round-trip. dumpFunc resolves the language name by joining pg_proc.prolang
+		// to pg_language.oid; plpgsql now has OID 13627 in both the pg_language view
+		// and langNameToOIDStr, so the join finds lanname='plpgsql'. Before this
+		// slice prolang was 0, the join returned 0 rows, and pg_dump aborted the
+		// ENTIRE dump. The body contains `$1`, so pg_dump dollar-quotes it with the
+		// `$_$` tag (the verbatim prosrc is rendered untouched — plpgsql is not
+		// deparsed). Real pg_dump 18.3 emits:
+		//   CREATE FUNCTION public.plpg_inc(integer) RETURNS integer
+		//       LANGUAGE plpgsql
+		//       AS $_$ BEGIN RETURN $1 + 1; END; $_$;
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.plpg_inc(integer) RETURNS integer") {
+			t.Errorf("pg_dump dropped/mangled the plpg_inc signature (prolang join likely failed)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.plpg_inc(integer) RETURNS integer\n    LANGUAGE plpgsql\n    AS $_$ BEGIN RETURN $1 + 1; END; $_$;") {
+			t.Errorf("pg_dump dropped/mangled plpg_inc's plpgsql language or body\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

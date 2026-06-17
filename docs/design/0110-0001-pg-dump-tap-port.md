@@ -4542,6 +4542,48 @@ and asserts the `RETURNS integer[]` signature plus the exact one-line `LANGUAGE 
 `AS $$ SELECT ARRAY[1, 2, 3] $$;` fragment. A scalarized return type (the pre-fix bug) or a
 mangled body surfaces exactly in the two assertions.
 
+### Slice 163 — `LANGUAGE plpgsql` function round-trip (real divergence fixed)
+
+Every prior function slice (149–162) used `LANGUAGE sql`. The plpgsql path is a separate,
+untested sibling, and it was broken end-to-end. The parser/executor already accept plpgsql
+bodies (CREATE FUNCTION pins the language to `plpgsql`/`sql`/`c`), but the runtime `pg_proc`
+view resolves `prolang` **by name** via `langNameToOIDStr`, which previously returned `"0"`
+for plpgsql. pg_dump's `dumpFunc` joins `pg_proc` to `pg_language` on `l.oid = p.prolang`
+(no `lanispl` filter) purely to fetch `lanname`; `prolang=0` matches no `pg_language` row, so
+the join returns **"0 rows instead of one"** and aborts the **entire** dump — not just the one
+function.
+
+**Oracle probe (PG 18.3).** A stock initdb installs plpgsql as the 4th `pg_language` row at
+**OID 13627** with `lanispl=t`, `lanpltrusted=t`. Real pg_dump does **not** emit a
+`CREATE LANGUAGE`/`CREATE EXTENSION plpgsql` even though `lanispl=t`, because plpgsql is pinned
+via `pg_depend`/extension membership and `getProcLangs` skips pinned languages.
+
+**Production fix.** Two coordinated sibling edits:
+- `internal/catalog/catalog.go` — append a 4th `pg_language` row
+  `{13627, plpgsql, owner 10, lanispl=f, lanpltrusted=t, handler OIDs 0}`. goopg has neither a
+  `pg_depend` pin nor extension machinery, so it sets `lanispl=f` (like the existing
+  internal/c/sql rows): `getProcLangs`'s `WHERE lanispl` then selects nothing and no spurious
+  `CREATE LANGUAGE` is dumped — reproducing real PG's net output by a different mechanism. The
+  unfiltered `dumpFunc` join still resolves `lanname='plpgsql'`.
+- `internal/initdb/pg_proc_view.go` — `langNameToOIDStr("plpgsql")` returns `"13627"`, so a
+  plpgsql routine's `prolang` matches the new row.
+
+The body is stored verbatim as `prosrc` and rendered untouched (plpgsql is **not** deparsed,
+unlike `LANGUAGE sql … BEGIN ATOMIC`). Because the body contains `$1`, pg_dump dollar-quotes
+with the `$_$` tag. Real pg_dump 18.3 renders:
+
+```
+CREATE FUNCTION public.plpg_inc(integer) RETURNS integer
+    LANGUAGE plpgsql
+    AS $_$ BEGIN RETURN $1 + 1; END; $_$;
+```
+
+The TAP test creates `public.plpg_inc(integer) RETURNS integer LANGUAGE plpgsql AS $$ BEGIN
+RETURN $1 + 1; END; $$` and asserts both the signature and the exact `LANGUAGE plpgsql` /
+`AS $_$ … $_$;` fragment. A failed prolang join (the pre-fix bug) aborts the whole dump and
+surfaces in the first assertion. Unit coverage: `TestPgLanguageBuiltinRows` now asserts the
+4-row view, and `TestPgProcViewRendersRoutine` asserts `prolang=13627` for a plpgsql routine.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

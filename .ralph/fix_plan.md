@@ -3542,6 +3542,38 @@ object support.
         body, a composite/`RECORD` return type, or `RETURNS TABLE` (maps to OUT params in
         goopg's parser — a known divergence).
 
+      - **PROGRESS 2026-06-17 (loop #130):** **DU-002 slice 163 LANDED — real
+        divergence fixed.** A `LANGUAGE plpgsql` function
+        (`public.plpg_inc(integer) RETURNS integer … AS $$ BEGIN RETURN $1 + 1; END; $$`)
+        now round-trips through pg_dump. Every prior function slice (149–162) used
+        `LANGUAGE sql`; the plpgsql path was a separate, untested sibling and was broken
+        end-to-end. The parser/executor accept plpgsql bodies, but the `pg_proc` view
+        resolves `prolang` by NAME via `langNameToOIDStr`, which returned `"0"` for
+        plpgsql. pg_dump's `dumpFunc` joins `pg_proc`→`pg_language` on `l.oid=p.prolang`
+        (no `lanispl` filter) just to fetch `lanname`; `prolang=0` matched no row → join
+        returned "0 rows instead of one" → **the ENTIRE dump aborted**. Oracle probe
+        (PG 18.3): plpgsql is the 4th `pg_language` row at OID 13627 (`lanispl=t`,
+        `lanpltrusted=t`), and real pg_dump emits NO `CREATE LANGUAGE` for it (pinned via
+        `pg_depend`). **Fix (2 sibling edits):** (a) `internal/catalog/catalog.go` appends
+        a plpgsql row `{13627, plpgsql, owner 10, lanispl=f, lanpltrusted=t, handlers 0}`
+        — `lanispl=f` (matching the existing internal/c/sql rows) keeps `getProcLangs`
+        from dumping a spurious `CREATE LANGUAGE` while the unfiltered `dumpFunc` join
+        still resolves `lanname`; (b) `internal/initdb/pg_proc_view.go`
+        `langNameToOIDStr("plpgsql")` returns `"13627"`. The body is rendered verbatim as
+        `prosrc` (plpgsql is NOT deparsed); the `$1` forces the `$_$` dollar-quote tag.
+        Files: `internal/catalog/catalog.go` (+plpgsql row + comment),
+        `internal/initdb/pg_proc_view.go` (langNameToOIDStr case),
+        `internal/catalog/catalog_test.go` (TestPgLanguageBuiltinRows → 4 rows),
+        `internal/initdb/pg_proc_view_test.go` (TestPgProcViewRendersRoutine prolang →
+        13627), `internal/testport/pgdump_connsetup_test.go` (fixture + 2 assertions),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 163 section). Gates: gofmt OK;
+        `go build ./internal/...` OK; `go vet` clean; `TestPort_PgDumpConnectionSetup`
+        PASS (2.69s, not skipped); `internal/catalog` + `internal/initdb` suites PASS;
+        pgbench pre-commit smoke on commit. **Next: slice 164** — remaining
+        function-attribute gaps are genuine features: composite/`RECORD` return type,
+        `TRANSFORM FOR TYPE` (`protrftypes` always NULL), or `RETURNS TABLE` (maps to OUT
+        params in goopg's parser — a known divergence).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

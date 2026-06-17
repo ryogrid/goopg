@@ -837,12 +837,12 @@ func pgPathElem(arr string, n int) string {
 }
 
 // TestPgLanguageBuiltinRows verifies the pg_language virtual view exposes the 3
-// built-in BKI languages (internal/c/sql, OIDs 12/13/14). pg_dump's dumpFunc
-// joins pg_proc to pg_language WITHOUT a lanispl filter purely to fetch lanname
-// for the function's prolang; an empty view returns "0 rows instead of one" and
-// aborts the dump. All three rows MUST have lanispl=f so getProcLangs's
-// `WHERE lanispl` predicate still selects nothing (no user PLs to dump).
-// M0110-0001 (DU-002 slice 42).
+// built-in BKI languages (internal/c/sql, OIDs 12/13/14) plus plpgsql (OID 13627).
+// pg_dump's dumpFunc joins pg_proc to pg_language WITHOUT a lanispl filter purely
+// to fetch lanname for the function's prolang; an empty view returns "0 rows
+// instead of one" and aborts the dump. All four rows MUST have lanispl=f so
+// getProcLangs's `WHERE lanispl` predicate still selects nothing (no user PLs to
+// dump). M0110-0001 (DU-002 slices 42, 163).
 func TestPgLanguageBuiltinRows(t *testing.T) {
 	c := NewInMemory()
 	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_language"})
@@ -854,8 +854,8 @@ func TestPgLanguageBuiltinRows(t *testing.T) {
 		colIdx[col.Name] = i
 	}
 	rows := tbl.VirtualRows()
-	if len(rows) != 3 {
-		t.Fatalf("pg_language returned %d rows; want exactly 3 (internal/c/sql)", len(rows))
+	if len(rows) != 4 {
+		t.Fatalf("pg_language returned %d rows; want exactly 4 (internal/c/sql/plpgsql)", len(rows))
 	}
 	// oid -> expected (lanname, lanpltrusted, laninline)
 	want := map[string]struct {
@@ -863,9 +863,10 @@ func TestPgLanguageBuiltinRows(t *testing.T) {
 		pltrusted string
 		inline    string
 	}{
-		"12": {"internal", "f", "0"},
-		"13": {"c", "f", "0"},
-		"14": {"sql", "t", "2511"},
+		"12":    {"internal", "f", "0"},
+		"13":    {"c", "f", "0"},
+		"14":    {"sql", "t", "2511"},
+		"13627": {"plpgsql", "t", "0"},
 	}
 	for _, row := range rows {
 		oid := row[colIdx["oid"]]

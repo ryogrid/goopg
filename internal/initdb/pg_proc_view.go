@@ -126,6 +126,11 @@ func langNameToOIDStr(lang string) string {
 		return "13"
 	case "sql":
 		return "14"
+	case "plpgsql":
+		// OID 13627 — matches a stock PG 18.3 initdb and the plpgsql row added to
+		// the pg_language virtual view (catalog.go). Lets dumpFunc's join resolve
+		// lanname='plpgsql' so a LANGUAGE plpgsql function round-trips. DU-002 slice 163.
+		return "13627"
 	default:
 		return "0"
 	}

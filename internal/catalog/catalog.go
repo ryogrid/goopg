@@ -3907,8 +3907,14 @@ func (c *InMemory) registerSystemTables() {
 	// fetch lanname for the function's prolang; with 0 rows that join returns
 	// "0 rows instead of one" and aborts the dump. So this view is populated with
 	// the 3 built-in BKI rows (internal/c/sql, OIDs 12/13/14) matching initdb's
-	// pgLanguageInitialEntries(); all three have lanispl=false so getProcLangs's
-	// `WHERE lanispl` still returns 0. Schema matches PG's pg_language (oid,
+	// pgLanguageInitialEntries() PLUS a plpgsql row (OID 13627, DU-002 slice 163)
+	// so a `LANGUAGE plpgsql` function's prolang resolves to lanname='plpgsql'.
+	// All four rows have lanispl=false so getProcLangs's `WHERE lanispl` returns 0:
+	// real PG marks plpgsql lanispl=true but skips dumping CREATE LANGUAGE for it
+	// because it is pinned via pg_depend/extension membership; goopg has neither
+	// pin nor extension machinery, so setting lanispl=false reproduces the same
+	// net dump output (no spurious CREATE LANGUAGE) while still letting dumpFunc's
+	// unfiltered join resolve the language name. Schema matches PG's pg_language (oid,
 	// lanname name, lanowner oid, lanispl bool, lanpltrusted bool, lanplcallfoid oid,
 	// laninline oid, lanvalidator oid, lanacl aclitem[]); lanowner is typed oid so
 	// `acldefault('l', lanowner)` resolves. lanvalidator=0 (no validators) and
@@ -3931,11 +3937,16 @@ func (c *InMemory) registerSystemTables() {
 	// 3 built-in languages from postgres/src/include/catalog/pg_language.dat
 	// (oid, lanname, lanowner=10, lanispl=f, lanpltrusted, lanplcallfoid=0,
 	// laninline, lanvalidator=0, lanacl=NULL). sql is trusted with laninline=2511.
+	// plpgsql (OID 13627, matching a stock PG 18.3 initdb) is appended so
+	// `LANGUAGE plpgsql` functions round-trip through pg_dump; it is trusted and,
+	// per the comment above, kept lanispl=f / handler-OIDs=0 (dumpFunc only reads
+	// lanname). DU-002 slice 163.
 	pgLanguage.VirtualRows = func() [][]string {
 		return [][]string{
 			{"12", "internal", "10", "f", "f", "0", "0", "0", ""},
 			{"13", "c", "10", "f", "f", "0", "0", "0", ""},
 			{"14", "sql", "10", "f", "t", "0", "2511", "0", ""},
+			{"13627", "plpgsql", "10", "f", "t", "0", "0", "0", ""},
 		}
 	}
 	c.tables["pg_catalog.pg_language"] = pgLanguage

@@ -66,10 +66,11 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 		t.Errorf("pronamespace = %q, want 2200 (public OID)", row[2])
 	}
 	// prolang is now the oid string (matches PG's pg_proc.prolang). plpgsql is
-	// not installed in goopg's pg_language, so it maps to "0" (InvalidOid); the
-	// 3 built-in langs (internal/c/sql) map to 12/13/14. DU-002 slice 42.
-	if row[3] != "0" {
-		t.Errorf("prolang = %q, want 0 (plpgsql not in pg_language)", row[3])
+	// installed in goopg's pg_language at OID 13627, so a plpgsql routine maps to
+	// 13627 (DU-002 slice 163); the 3 built-in langs (internal/c/sql) map to
+	// 12/13/14. DU-002 slice 42.
+	if row[3] != "13627" {
+		t.Errorf("prolang = %q, want 13627 (plpgsql pg_language OID)", row[3])
 	}
 	// prorettype is now the OID string for "int" (int4 = 23).
 	if row[4] != "23" {
