@@ -369,6 +369,54 @@ func TestParseTableNamedUniqueNullsNotDistinct(t *testing.T) {
 	}
 }
 
+// TestParseTableNamedUniqueDeferrable pins the DEFERRABLE [INITIALLY DEFERRED |
+// INITIALLY IMMEDIATE] capture on a NAMED table-level UNIQUE constraint
+// (`CONSTRAINT name UNIQUE (cols) DEFERRABLE …`) — DU-002 slice 140. The clause
+// trails the column list (and any INCLUDE list); before this slice the named
+// UNIQUE case parsed NO trailing DEFERRABLE, so the keyword was a HARD PARSE
+// ERROR (trailing tokens after the column list). The two flags ride on
+// TableConstraintDef.Deferrable / InitiallyDeferred so the backing index records
+// them and pg_get_constraintdef / pg_constraint re-emit the clause. INITIALLY
+// DEFERRED implies DEFERRABLE; INITIALLY IMMEDIATE is the default (both false).
+func TestParseTableNamedUniqueDeferrable(t *testing.T) {
+	cases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a))", false, false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) NOT DEFERRABLE)", false, false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) DEFERRABLE INITIALLY IMMEDIATE)", true, false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) INCLUDE (b) DEFERRABLE INITIALLY DEFERRED)", true, true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.NamedConstraints) != 1 {
+			t.Fatalf("Parse(%q): expected 1 NamedConstraint, got %d", c.in, len(ct.NamedConstraints))
+		}
+		nc := ct.NamedConstraints[0]
+		if nc.Name != "u_a" {
+			t.Errorf("Parse(%q): Name=%q want u_a", c.in, nc.Name)
+		}
+		if nc.IsPrimary || nc.IsExclusion {
+			t.Errorf("Parse(%q): expected plain UNIQUE, got IsPrimary=%v IsExclusion=%v", c.in, nc.IsPrimary, nc.IsExclusion)
+		}
+		if nc.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, nc.Deferrable, c.wantDefer)
+		}
+		if nc.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, nc.InitiallyDeferred, c.wantDeferred)
+		}
+	}
+}
+
 // TestParseDropTablePgbench: pgbench's exact "drop table if exists
 // a, b, c, d" string.
 func TestParseDropTablePgbench(t *testing.T) {

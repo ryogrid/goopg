@@ -1190,6 +1190,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			// NULLS NOT DISTINCT rides the backing index so pg_get_constraintdef /
 			// pg_dump re-emit `UNIQUE NULLS NOT DISTINCT (cols)`. DU-002 slice 138.
 			idx.NullsNotDistinct = nc.NullsNotDistinct
+			// DEFERRABLE [INITIALLY DEFERRED] likewise rides the backing index so
+			// the deparse appends the clause and pg_constraint emits
+			// condeferrable/condeferred. Dump-fidelity only. DU-002 slice 140.
+			idx.Deferrable = nc.Deferrable
+			idx.InitiallyDeferred = nc.InitiallyDeferred
 		}
 		if primary {
 			namedPKCreated = true

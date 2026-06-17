@@ -3722,6 +3722,42 @@ Limited to the anonymous table-level UNIQUE form; the named table-level / inline
 column / PRIMARY KEY DEFERRABLE forms (which still discard the flag) are the next
 slices in this family.
 
+### Slice 140 — `DEFERRABLE INITIALLY DEFERRED` on a NAMED table-level `UNIQUE`
+
+The named sibling of slice 139: `CREATE TABLE t (a integer, …, CONSTRAINT tudef
+UNIQUE (a) DEFERRABLE INITIALLY DEFERRED)`. pg_dump must emit the constraint
+under the **user-supplied** name with the trailer preserved — `ADD CONSTRAINT
+tudef UNIQUE (a) DEFERRABLE INITIALLY DEFERRED`.
+
+Like the anonymous form before slice 139, the **named** table-level UNIQUE parser
+case (`CONSTRAINT name UNIQUE [NULLS …] (cols) [INCLUDE …]`) parsed **no trailing
+`DEFERRABLE`** at all. A trailing `DEFERRABLE` keyword was therefore a **hard
+parse error** (unexpected tokens after the column/INCLUDE list) — the whole
+`CREATE TABLE` failed. The fix mirrors slice 139, threading through the named
+plumbing instead of the anonymous `TableUnique*` arrays:
+
+1. **Parser** (`internal/parser/ddl.go`) — the named UNIQUE case now consumes a
+   `[NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` trailer (and a
+   bare `INITIALLY DEFERRED`, which implies `DEFERRABLE`) after the column/INCLUDE
+   list, into two new `TableConstraintDef.Deferrable` / `InitiallyDeferred` fields
+   (`internal/parser/ast.go`).
+2. **Executor** (`internal/executor/operators_ddl.go`) — the `NamedConstraints`
+   loop threads both flags onto the backing `catalog.Index` (right beside the
+   `NullsNotDistinct` assignment from slice 138).
+3. **Deparse + `pg_constraint`** — unchanged from slice 139: the shared
+   `buildConstraintDefString` already appends the clause from the index, and
+   `pg_constraint` already emits `condeferrable`/`condeferred` from the index.
+
+The round-trip test adds `public.uniqtdef (… CONSTRAINT tudef UNIQUE (a)
+DEFERRABLE INITIALLY DEFERRED)` and asserts the dump carries `ADD CONSTRAINT
+tudef UNIQUE (a) DEFERRABLE INITIALLY DEFERRED`, with negative guards against the
+dropped-flag (`… tudef UNIQUE (a);`) and partial-render (`… tudef UNIQUE (a)
+DEFERRABLE;`) regressions. Unit test: `TestParseTableNamedUniqueDeferrable`
+(parser capture across the NOT/IMMEDIATE/DEFERRED/bare-INITIALLY/INCLUDE forms).
+Same dump-fidelity scope caveat as slice 139 (no deferred *checking*). The
+inline-column and PRIMARY KEY DEFERRABLE forms (still discard the flag) remain
+for later slices.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

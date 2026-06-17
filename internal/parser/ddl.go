@@ -1961,6 +1961,32 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 								}
 							}
 						}
+						// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
+						// IMMEDIATE] trailer. Mirrors the anonymous table-level UNIQUE
+						// form (slice 139); without this branch a named
+						// `UNIQUE (a) DEFERRABLE …` was a HARD PARSE ERROR (trailing
+						// tokens after the column list). DU-002 slice 140.
+						if p.acceptKeyword(KwNot) {
+							_ = p.acceptKeyword(KwDeferrable)
+							// NOT DEFERRABLE → both flags stay false (default).
+						} else if p.acceptKeyword(KwDeferrable) {
+							cdef.Deferrable = true
+							if p.acceptIdentKeyword("initially") {
+								if p.acceptIdentKeyword("deferred") {
+									cdef.InitiallyDeferred = true
+								} else {
+									_ = p.acceptIdentKeyword("immediate")
+								}
+							}
+						} else if p.acceptIdentKeyword("initially") {
+							// Bare INITIALLY DEFERRED implies DEFERRABLE.
+							if p.acceptIdentKeyword("deferred") {
+								cdef.Deferrable = true
+								cdef.InitiallyDeferred = true
+							} else {
+								_ = p.acceptIdentKeyword("immediate")
+							}
+						}
 						if constraintName != "" {
 							stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
 						} else {

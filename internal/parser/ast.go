@@ -957,6 +957,15 @@ type TableConstraintDef struct {
 	// catalog.Index.NullsNotDistinct so pg_get_constraintdef re-emits it.
 	// DU-002 slice 135.
 	NullsNotDistinct bool
+	// Deferrable / InitiallyDeferred capture a `[NOT] DEFERRABLE [INITIALLY
+	// DEFERRED | INITIALLY IMMEDIATE]` trailer on a named table-level UNIQUE
+	// constraint. They thread onto the backing catalog.Index so
+	// pg_get_constraintdef / pg_dump re-emit the clause and pg_constraint emits
+	// condeferrable/condeferred. INITIALLY DEFERRED implies DEFERRABLE; IMMEDIATE
+	// is the default (both false). Dump-fidelity only — deferred CHECKING is not
+	// implemented (constraints are enforced per-row). DU-002 slice 140.
+	Deferrable        bool
+	InitiallyDeferred bool
 }
 
 // TableForeignKeyDef describes a table-level FOREIGN KEY constraint, e.g.
