@@ -4619,6 +4619,60 @@ asserts both the signature and the exact `RETURNS record` / `AS $$ … $$;` frag
 coverage: `TestPgProcViewRecordReturnType` pins `prorettype=2249` (record) and `2287`
 (record[]).
 
+### Slice 165 — `RETURNS TABLE(...)` round-trip (real divergence fixed)
+
+Slice 164 closed the last *return-type-OID* gap; slice 165 closes the last *function-signature
+shape* gap among the supported attributes. goopg's parser desugars `RETURNS TABLE(col type, …)`
+into trailing **OUT** args (mode `'o'`) plus `RETURNS SETOF record` (parser/function.go). That is
+semantically equivalent to upstream, but pg_dump renders it from the **server-side** deparsers,
+not the raw catalog: `dumpFunc` builds the signature from `pg_get_function_arguments(p.oid)` and
+the RETURNS clause from `pg_get_function_result(p.oid)`, concatenating both **verbatim**
+(`appendPQExpBuffer(q, " RETURNS %s", funcresult)`). Because goopg stored the table columns as
+plain OUT args, the deparsers leaked them into the argument list and rendered the result as
+`SETOF record`, so the dump was:
+
+```
+CREATE FUNCTION public.ret_tab(OUT id integer, OUT label text) RETURNS SETOF record …
+```
+
+valid but divergent from upstream's:
+
+```
+CREATE FUNCTION public.ret_tab() RETURNS TABLE(id integer, label text)
+    LANGUAGE sql
+    AS $$ SELECT 1, 'x' $$;
+```
+
+**Oracle behaviour (PG 18.3).** RETURNS TABLE columns are stored with `proargmode='t'`
+(PROARGMODE_TABLE); `print_function_arguments` (ruleutils.c) **excludes** them from
+`pg_get_function_arguments` / `pg_get_function_identity_arguments`, and
+`pg_get_function_result` renders them as `TABLE(name type, …)`.
+
+**Production fix (contained, zero execution-path risk).** Rather than introduce a new `'t'`
+argmode — which would force every `mode == "o"` consumer (the planner's OUT-column expansion at
+`planner.go:3139/3336`, CALL execution, etc.) to learn the new mode and risk a silent
+result-column regression — a `ReturnsTable bool` marker is threaded from the parser
+(`CreateFunctionStmt.ReturnsTable`) through the executor into `catalog.Routine.ReturnsTable`. The
+table columns stay stored as OUT args, so the planner's OUT-column expansion is **unchanged**.
+Only the three catalog deparsers in `internal/executor/expr.go` change, all gated on
+`r.ReturnsTable`:
+
+- `buildFunctionArguments` (feeds `pg_get_function_arguments` *and*
+  `pg_get_function_identity_arguments`) skips the OUT-stored table columns and no longer flips the
+  `showMode` IN/OUT prefix on for them.
+- `pg_get_function_result` calls the new `buildTableResult` helper, which renders
+  `TABLE(name type, …)` from the OUT args.
+- `buildFunctionDef` (`pg_get_functiondef`, a sibling deparser) mirrors both: skips the table
+  columns in its arg loop and emits the `RETURNS TABLE(...)` clause.
+
+The body returns two columns (`SELECT 1, 'x'`); `validateSQLFunctionBody`'s single-column check is
+bypassed because `ReturnsSet` is true, matching how PG accepts the form.
+
+The TAP test creates `public.ret_tab() RETURNS TABLE(id integer, label text)` and asserts the
+exact signature + `RETURNS TABLE(...)` + body fragment. Unit coverage:
+`TestPgGetFunctionResultReturnsTable` (input arg kept, table cols excluded, result = `TABLE(...)`)
+and `TestPgGetFunctionResultReturnsTableNoArgs` (empty arg list, full TABLE result).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

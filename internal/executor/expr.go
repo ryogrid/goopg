@@ -7285,6 +7285,14 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if rs := ctx.Catalog.Routines(); rs != nil {
 					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil && !r.IsProcedure {
+						// RETURNS TABLE: PG's pg_get_function_result renders the
+						// table columns (stored here as trailing OUT args) as
+						// `TABLE(name type, ...)` rather than the equivalent
+						// `SETOF record`. pg_dump uses this verbatim, so emitting
+						// the TABLE form keeps the dump identical to upstream.
+						if r.ReturnsTable {
+							return NewStringDatum(buildTableResult(r)), nil
+						}
 						// Set-returning functions carry a SETOF prefix on their
 						// result type, matching PG's pg_get_function_result
 						// (ruleutils.c). pg_dump uses this verbatim for the
@@ -11337,14 +11345,26 @@ func buildFunctionArguments(r *catalog.Routine, printDefaults bool) string {
 	showMode := r.IsProcedure
 	if !showMode {
 		for _, m := range r.ArgModes {
+			// For RETURNS TABLE the OUT-mode args are table columns; they belong to
+			// the result (rendered by pg_get_function_result), not the arg list, so
+			// they must not flip showMode on. PG's print_function_arguments excludes
+			// PROARGMODE_TABLE args entirely.
+			if r.ReturnsTable && m == "o" {
+				continue
+			}
 			if m == "o" || m == "b" {
 				showMode = true
 				break
 			}
 		}
 	}
-	parts := make([]string, len(r.ArgTypes))
+	parts := make([]string, 0, len(r.ArgTypes))
 	for i, argType := range r.ArgTypes {
+		// Skip RETURNS TABLE columns: they are stored as trailing OUT args but
+		// surface only in the RETURNS TABLE(...) result clause, never the arg list.
+		if r.ReturnsTable && i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+			continue
+		}
 		var part strings.Builder
 		// Mode prefix. OUT/INOUT/VARIADIC always carry their prefix (matching
 		// print_function_arguments, which prints every non-default mode regardless
@@ -11380,9 +11400,39 @@ func buildFunctionArguments(r *catalog.Routine, printDefaults bool) string {
 			part.WriteString(" DEFAULT ")
 			part.WriteString(r.ArgDefaults[i])
 		}
-		parts[i] = part.String()
+		parts = append(parts, part.String())
 	}
 	return strings.Join(parts, ", ")
+}
+
+// buildTableResult renders the `TABLE(name type, ...)` result clause for a
+// RETURNS TABLE function, matching PG's pg_get_function_result (ruleutils.c,
+// PROARGMODE_TABLE branch). The table columns are stored as the routine's
+// trailing OUT args (mode "o"); pg_dump consumes this string verbatim for the
+// RETURNS clause.
+func buildTableResult(r *catalog.Routine) string {
+	var cols []string
+	for i := range r.ArgTypes {
+		if i >= len(r.ArgModes) || r.ArgModes[i] != "o" {
+			continue
+		}
+		name := ""
+		if i < len(r.ArgNames) {
+			name = r.ArgNames[i]
+		}
+		part := name
+		if part != "" {
+			part += " "
+		}
+		part += canonicalTypeName(r.ArgTypes[i].Name)
+		cols = append(cols, part)
+	}
+	if len(cols) == 0 {
+		// Defensive: a RETURNS TABLE with no recoverable columns falls back to the
+		// SETOF record form rather than emitting an empty, unparsable TABLE().
+		return "SETOF record"
+	}
+	return "TABLE(" + strings.Join(cols, ", ") + ")"
 }
 
 // argIsInput reports whether the argument at index i is an input argument
@@ -11419,10 +11469,17 @@ func buildFunctionDef(r *catalog.Routine) string {
 	}
 	sb.WriteString(r.Name)
 	sb.WriteByte('(')
+	wroteArg := false
 	for i, argType := range r.ArgTypes {
-		if i > 0 {
+		// RETURNS TABLE columns are stored as trailing OUT args but render in the
+		// RETURNS TABLE(...) clause, not the arg list (sibling of buildFunctionArguments).
+		if r.ReturnsTable && i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+			continue
+		}
+		if wroteArg {
 			sb.WriteString(", ")
 		}
+		wroteArg = true
 		// Mode prefix: OUT/INOUT/VARIADIC are emitted for both functions and
 		// procedures; the bare IN prefix is procedure-only (sibling of
 		// buildFunctionArguments).
@@ -11458,10 +11515,15 @@ func buildFunctionDef(r *catalog.Routine) string {
 	// RETURNS clause (functions only) — 1-space indent like PG's deparser
 	if !r.IsProcedure {
 		sb.WriteString(" RETURNS ")
-		if r.ReturnsSet {
-			sb.WriteString("SETOF ")
+		if r.ReturnsTable {
+			// RETURNS TABLE(col type, ...) — rendered from the trailing OUT args.
+			sb.WriteString(buildTableResult(r))
+		} else {
+			if r.ReturnsSet {
+				sb.WriteString("SETOF ")
+			}
+			sb.WriteString(canonicalTypeName(r.ReturnType.Name))
 		}
-		sb.WriteString(canonicalTypeName(r.ReturnType.Name))
 		sb.WriteByte('\n')
 	}
 

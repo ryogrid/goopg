@@ -3599,6 +3599,45 @@ object support.
         on commit. **Next: slice 165** — remaining function-attribute gaps:
         `TRANSFORM FOR TYPE` (`protrftypes` always NULL) or `RETURNS TABLE` (maps to OUT
         params in goopg's parser — a known divergence).
+      - **PROGRESS 2026-06-17 (loop #132):** **DU-002 slice 165 LANDED — real
+        divergence fixed.** A function declared `RETURNS TABLE(id integer, label text)`
+        now round-trips through pg_dump in the upstream form rather than the divergent
+        OUT-args desugaring. goopg's parser desugars `RETURNS TABLE(...)` into trailing
+        OUT args (mode `'o'`) + `RETURNS SETOF record` — semantically equivalent but
+        pg_dump renders from the SERVER-SIDE deparsers: `dumpFunc` builds the signature
+        from `pg_get_function_arguments(p.oid)` and the RETURNS clause from
+        `pg_get_function_result(p.oid)`, both used verbatim. Because the table columns
+        were stored as plain OUT args, they leaked into the arg list and the result
+        rendered as `SETOF record`, so the dump was
+        `ret_tab(OUT id integer, OUT label text) RETURNS SETOF record` instead of
+        `ret_tab() RETURNS TABLE(id integer, label text)`. Oracle (PG 18.3): TABLE cols
+        carry `proargmode='t'`; `print_function_arguments` EXCLUDES them from the arg
+        list and `pg_get_function_result` renders `TABLE(name type, …)`. **Fix
+        (contained, zero execution-path risk):** a `ReturnsTable bool` marker threaded
+        parser→executor→`catalog.Routine` (NOT a new `'t'` argmode, which would force
+        every `mode=="o"` consumer — the planner's OUT-column expansion at
+        `planner.go:3139/3336`, CALL exec, etc. — to learn it and risk a silent
+        result-column regression). Table cols stay stored as OUT args, so the planner's
+        OUT-column expansion is UNCHANGED; only the three deparsers in
+        `internal/executor/expr.go` change, all gated on `r.ReturnsTable`:
+        `buildFunctionArguments` (skips table cols + no IN/OUT prefix flip; feeds both
+        `pg_get_function_arguments` and `_identity_arguments`), `pg_get_function_result`
+        (new `buildTableResult` helper → `TABLE(...)`), and `buildFunctionDef`
+        (`pg_get_functiondef` sibling). Body `SELECT 1, 'x'` returns 2 cols;
+        `validateSQLFunctionBody`'s single-column check is bypassed since `ReturnsSet`
+        is true. Files: `internal/parser/ast.go` (+ReturnsTable on CreateFunctionStmt),
+        `internal/parser/function.go` (set marker), `internal/catalog/routines.go`
+        (+ReturnsTable on Routine), `internal/executor/operators_ddl.go` (propagate),
+        `internal/executor/expr.go` (3 deparsers + buildTableResult),
+        `internal/executor/pg_get_function_identity_arguments_test.go` (2 new unit
+        tests), `internal/testport/pgdump_connsetup_test.go` (fixture + 2 assertions),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (slice 165 section). Gates: gofmt
+        OK; `go build ./internal/...` OK; `go vet` clean;
+        `TestPort_PgDumpConnectionSetup` PASS (2.73s, not skipped); executor + parser
+        suites PASS; pgbench pre-commit smoke on commit. **Next: slice 166** — the only
+        remaining function-attribute gap is `TRANSFORM FOR TYPE` (`protrftypes` always
+        NULL), a genuine feature gap; consider pivoting to a new object class (column
+        `COLLATE`, table `STORAGE`/`COMPRESSION`, triggers, or ACL/GRANT dumping).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

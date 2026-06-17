@@ -40,6 +40,7 @@ type Routine struct {
 	ArgDefaults     []string // parallel to ArgTypes; raw SQL expression for DEFAULT, "" = no default
 	ReturnType      Type
 	ReturnsSet      bool   // RETURNS SETOF ... M0097-0020
+	ReturnsTable    bool   // RETURNS TABLE (...) — table cols stored as trailing OUT args
 	Language        string // lower-cased
 	Body            string // raw routine source between the dollar-quote delimiters
 	Strict          bool   // STRICT / CALLED ON NULL INPUT

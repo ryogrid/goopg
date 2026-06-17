@@ -5582,6 +5582,7 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			Args: append([]int64(nil), s.ReturnType.Args...),
 		},
 		ReturnsSet:      s.ReturnsSet,
+		ReturnsTable:    s.ReturnsTable,
 		Language:        lang,
 		Body:            s.Body,
 		BeginAtomic:     s.BeginAtomic,

@@ -1761,6 +1761,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function ret_rec: %v", err)
 	}
 
+	// Slice 165: a function declared `RETURNS TABLE(col type, ...)`. goopg's parser
+	// desugars RETURNS TABLE into trailing OUT args (mode 'o') + RETURNS SETOF record,
+	// which is semantically equivalent but DIVERGES from upstream pg_dump: without
+	// this slice the table columns leaked into the argument list and the result
+	// rendered as `SETOF record`, so pg_dump emitted
+	// `ret_tab(OUT id integer, OUT label text) RETURNS SETOF record` instead of
+	// `ret_tab() RETURNS TABLE(id integer, label text)`. pg_dump's dumpFunc builds
+	// the signature from pg_get_function_arguments(p.oid) and the RETURNS clause from
+	// pg_get_function_result(p.oid), using both verbatim. This slice teaches both
+	// deparsers about the RETURNS TABLE marker: pg_get_function_arguments now EXCLUDES
+	// the table columns (PG's print_function_arguments skips PROARGMODE_TABLE args) and
+	// pg_get_function_result renders them as `TABLE(...)`. The body returns two columns
+	// (ReturnsSet=true bypasses the single-column check), matching the two table cols.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.ret_tab() RETURNS TABLE(id integer, label text) LANGUAGE sql AS $$ SELECT 1, 'x' $$"); err != nil {
+		t.Fatalf("create function ret_tab: %v", err)
+	}
+
 	// Slice 145: COMMENT ON {VIEW,SEQUENCE,INDEX,SCHEMA} must survive the dump.
 	// Before this slice, parseCommentOnTail handled only TABLE/INDEX/COLUMN/
 	// CONSTRAINT/STATISTICS; VIEW/SEQUENCE/SCHEMA fell through to the unsupported
@@ -2454,6 +2471,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.ret_rec() RETURNS record\n    LANGUAGE sql\n    AS $$ SELECT (1, 2) $$;") {
 			t.Errorf("pg_dump dropped/mangled ret_rec's body or return clause\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 165 (asserted):** a `RETURNS TABLE(...)` function must round-trip in
+		// the upstream form, not the divergent OUT-args desugaring. dumpFunc builds the
+		// signature from pg_get_function_arguments (which must EXCLUDE the table cols,
+		// leaving `ret_tab()`) and the RETURNS clause from pg_get_function_result (which
+		// must render `TABLE(id integer, label text)`). Before this slice the table
+		// columns leaked into the arg list and the result was `SETOF record`. Real
+		// pg_dump 18.3 emits:
+		//   CREATE FUNCTION public.ret_tab() RETURNS TABLE(id integer, label text)
+		//       LANGUAGE sql
+		//       AS $$ SELECT 1, 'x' $$;
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.ret_tab() RETURNS TABLE(id integer, label text)") {
+			t.Errorf("pg_dump dropped/mangled ret_tab's RETURNS TABLE clause (table cols leaked to args or result was SETOF record)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.ret_tab() RETURNS TABLE(id integer, label text)\n    LANGUAGE sql\n    AS $$ SELECT 1, 'x' $$;") {
+			t.Errorf("pg_dump dropped/mangled ret_tab's body or RETURNS TABLE clause\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 56 (asserted):** a plain (non-constraint) secondary index must
 		// survive the dump via getIndexes -> pg_get_indexdef, distinct from the

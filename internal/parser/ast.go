@@ -1921,6 +1921,7 @@ type CreateFunctionStmt struct {
 	Args            []FunctionArg
 	ReturnType      ColumnType
 	ReturnsSet      bool   // RETURNS SETOF ... M0097-0020
+	ReturnsTable    bool   // RETURNS TABLE (...) — table columns stored as trailing OUT args
 	Language        string // lower-cased, e.g. "plpgsql"
 	Body            string // raw source between the dollar-quote delimiters
 	Strict          bool   // STRICT / RETURNS NULL ON NULL INPUT M0097-0035

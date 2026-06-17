@@ -1,31 +1,36 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 164 (loop #131) — a function returning the pseudo-type
-`record` (`public.ret_rec() RETURNS record LANGUAGE sql AS $$ SELECT (1, 2) $$`)
-now round-trips through pg_dump. REAL DIVERGENCE FIXED (sibling-path bug).
+Last landed: DU-002 slice 165 (loop #132) — `RETURNS TABLE(...)` functions now
+round-trip through pg_dump in the upstream form. REAL DIVERGENCE FIXED.
 
-Root cause: typeNameToOIDStr (pg_proc_view.go) had no `record` case, so the
-runtime pg_proc view resolved prorettype to "0" (InvalidOid). pg_dump's dumpFunc
-builds the RETURNS clause from format_type(prorettype, NULL); format_type(0)
-yields the placeholder "-", so the dump rendered `RETURNS -` (broken SQL).
-Fix (one sibling path): typeNameToOIDStr adds record→2249 and record[]→2287.
-The OTHER sibling — goopg's format_type (executor/expr.go) — already maps
-2249→"record", so the two now agree. No executor change: body `SELECT (1, 2)`
-parses as a single row-constructor column, so validateSQLFunctionBody's
-one-column check accepts it. Oracle (PG 18.3): record=2249, _record=2287.
+Root cause: goopg's parser desugars `RETURNS TABLE(col type, ...)` into trailing OUT
+args (mode 'o') + `RETURNS SETOF record`. pg_dump renders from the server-side deparsers
+(pg_get_function_arguments + pg_get_function_result, both verbatim), so the table cols
+leaked into the arg list and the result was `SETOF record` → dump emitted
+`ret_tab(OUT id integer, OUT label text) RETURNS SETOF record` instead of
+`ret_tab() RETURNS TABLE(id integer, label text)`. PG stores TABLE cols as proargmode='t';
+print_function_arguments excludes them, pg_get_function_result renders `TABLE(...)`.
 
-Files: internal/initdb/pg_proc_view.go (2 typeNameToOIDStr cases),
-internal/initdb/pg_proc_view_test.go (TestPgProcViewRecordReturnType → 2249/2287),
-internal/testport/pgdump_connsetup_test.go (fixture ~1760, assertions ~2442),
-docs/design/0110-0001-pg-dump-tap-port.md (slice 164), .ralph/fix_plan.md (loop #131).
+Fix (contained, zero execution-path risk): a `ReturnsTable bool` marker threaded
+parser→executor→catalog.Routine. NOT a new 't' argmode (would force every mode=="o"
+consumer — planner OUT-column expansion at planner.go:3139/3336, CALL exec — to learn it,
+risking a silent result-column regression). Table cols stay OUT args (planner expansion
+unchanged); only 3 deparsers in expr.go change, gated on r.ReturnsTable:
+buildFunctionArguments (skip table cols + no IN/OUT prefix flip), pg_get_function_result
+(new buildTableResult → TABLE(...)), buildFunctionDef (pg_get_functiondef sibling).
+
+Files: internal/parser/ast.go, internal/parser/function.go, internal/catalog/routines.go,
+internal/executor/operators_ddl.go (propagate at the 5566 Routine literal),
+internal/executor/expr.go (3 deparsers + buildTableResult helper),
+internal/executor/pg_get_function_identity_arguments_test.go (2 unit tests),
+internal/testport/pgdump_connsetup_test.go (fixture ~1764, assertions ~2475),
+docs/design/0110-0001-pg-dump-tap-port.md (slice 165), .ralph/fix_plan.md (loop #132).
 Verified: gofmt OK; go build ./internal/... OK; go vet clean;
-TestPort_PgDumpConnectionSetup PASS (2.19s, not skipped); internal/initdb suite PASS;
+TestPort_PgDumpConnectionSetup PASS (2.73s, not skipped); executor+parser suites PASS;
 pgbench pre-commit smoke on commit.
 
-Next direction (slice 165): remaining function-attribute cells are GENUINE feature gaps:
-- TRANSFORM FOR TYPE (protrftypes always NULL — feature gap)
-- RETURNS TABLE (goopg parser maps to OUT params, argmode 'o' not 't'; known divergence —
-  pg_dump would render OUT params + RETURNS record instead of RETURNS TABLE).
-Covered (slices 149-164): STRICT / SECURITY DEFINER / LEAKPROOF / COST / IMMUTABLE / STABLE /
-VOLATILE / PARALLEL SAFE|RESTRICTED / VARIADIC / DEFAULT / multi-statement / SETOF / ROWS /
-array return / plpgsql language / record return / procedures + OUT/INOUT.
+Next direction (slice 166): the only remaining function-attribute gap is TRANSFORM FOR
+TYPE (protrftypes always NULL — genuine feature gap). Better to pivot to a NEW object
+class for pg_dump round-trip: column COLLATE, table STORAGE/COMPRESSION (ALTER COLUMN SET
+STORAGE), triggers, or ACL/GRANT dumping — all currently untested (0 occurrences in
+pgdump_connsetup_test.go). Probe goopg support before picking.
