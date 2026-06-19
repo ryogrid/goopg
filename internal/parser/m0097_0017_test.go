@@ -95,6 +95,42 @@ func TestCompositeFieldTypmodParsing(t *testing.T) {
 	}
 }
 
+// TestAlterTypeAddAttributeParsing covers DU-002 slice 253: ALTER TYPE … ADD
+// ATTRIBUTE col type parses into AlterTypeStmt.AddAttrName / AddAttrType with
+// the same space-joined type-token form as a composite field (typmod parens and
+// the `[]` array suffix survive intact). A bare `ADD ATTRIBUTE` must not be
+// misread as the enum `ADD VALUE` branch.
+func TestAlterTypeAddAttributeParsing(t *testing.T) {
+	tests := []struct {
+		sql      string
+		wantName string
+		wantType string
+	}{
+		{`ALTER TYPE addr ADD ATTRIBUTE zip text`, "zip", "text"},
+		{`ALTER TYPE addr ADD ATTRIBUTE amount numeric(10,2)`, "amount", "numeric ( 10 , 2 )"},
+		{`ALTER TYPE addr ADD ATTRIBUTE tags text[]`, "tags", "text [ ]"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.sql[:min(60, len(tc.sql))], func(t *testing.T) {
+			stmts, err := parser.Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+			}
+			at, ok := stmts[0].(*parser.AlterTypeStmt)
+			if !ok {
+				t.Fatalf("expected *AlterTypeStmt, got %T", stmts[0])
+			}
+			if at.AddValue != "" {
+				t.Errorf("AddValue = %q, want empty (must not take the ADD VALUE branch)", at.AddValue)
+			}
+			if at.AddAttrName != tc.wantName || at.AddAttrType != tc.wantType {
+				t.Errorf("ADD ATTRIBUTE = {%q, %q}, want {%q, %q}",
+					at.AddAttrName, at.AddAttrType, tc.wantName, tc.wantType)
+			}
+		})
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

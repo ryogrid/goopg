@@ -7337,6 +7337,42 @@ byte-matching real pg_dump 18.3.
 > **Next (slice 253+):** `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE` (the composite-field type matrix —
 > built-in / enum / domain / composite, scalar and array — is now complete for `CREATE TYPE`).
 
+### Slice 253 — `ALTER TYPE … ADD ATTRIBUTE col type` appends a composite field
+
+Through slice 252 the composite-field type matrix was complete for `CREATE TYPE`, but a field added later via
+`ALTER TYPE … ADD ATTRIBUTE` was silently dropped: the parser's `ADD` branch only recognised the enum
+`ADD VALUE` form and stub-consumed everything else to `;`, so the statement was a no-op and the new attribute
+never reached `pg_dump`. This slice wires the `ADD ATTRIBUTE` form end-to-end.
+
+- **Parser (`parseAlterType`)** — after `ADD`, a new `attribute` sub-branch parses the attribute name then
+  collects the type as a space-joined token run, tracking paren depth so a typmod (`numeric(10,2)`) or `[]`
+  suffix survives intact (identical to the composite-field collection in `parseCreateType`, slice 247). It
+  stops at a top-level `,` (a further subcommand) or `;`/EOF and stub-consumes any trailer
+  (CASCADE/RESTRICT/extra subcommands). Recorded on `AlterTypeStmt.AddAttrName` / `AddAttrType`.
+- **Executor (`execAlterType`)** — when `AddAttrName != ""`, look up the composite type
+  (`cat.LookupCompositeType`; `42704` if absent, `42701` on a duplicate attribute, `42P16` on pseudo-type
+  `unknown`, matching `execCreateType`), append the field, and **re-sync** the heap. Because a composite
+  type's three OIDs (the type, its `_name` array, the implicit `pg_class` relation) are stable across
+  `RegisterCompositeTypeWithFields` re-registration, the re-sync stamps `xmax` on the existing `pg_type` ×2 +
+  `pg_class`/`pg_attribute` rows (mirroring `execDropType`'s composite branch) and re-runs
+  `syncCompositeTypeToCatalogHeap` with the appended field list. There is no in-place `pg_attribute` insert /
+  `relnatts` bump path — full re-sync is the established pattern (cf. ALTER TABLE re-sync).
+- **No `pg_dump`-side change** — `dumpCompositeType` walks `pg_type.typrelid → pg_class → pg_attribute` ordered
+  by `attnum`, so the re-synced rows (carrying the new attnum) re-emit the full field list automatically.
+- **Scope**: `ADD ATTRIBUTE` only (the common, clearly-broken case). `DROP ATTRIBUTE`, `ALTER ATTRIBUTE … TYPE`,
+  `RENAME ATTRIBUTE`, multiple comma-separated subcommands in one statement, and mid-transaction ROLLBACK of the
+  in-memory field-add (the re-synced heap rows already carry the txn XID, so they vanish on abort; only the
+  in-memory `ct.Fields` append would persist) remain future work — deferred to keep one task per loop.
+
+Guarded at two levels: `parser.TestAlterTypeAddAttributeParsing` pins the `ADD ATTRIBUTE` parse (name + the
+space-joined type form for scalar / typmod / array, and that it does NOT take the `ADD VALUE` branch); the
+pg_dump TAP port creates `public.alt_comp AS (a integer)`, runs two `ALTER TYPE … ADD ATTRIBUTE` (a `text`, a
+`numeric(10,2)`), and asserts `pg_dump --schema-only` re-emits all three fields
+(`a integer, b text, c numeric(10,2)`), byte-matching real pg_dump 18.3.
+
+> **Next (slice 254+):** `ALTER TYPE … DROP ATTRIBUTE` / `RENAME ATTRIBUTE` / `ALTER ATTRIBUTE … TYPE`
+> (the remaining `ALTER TYPE` attribute subcommands).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

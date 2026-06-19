@@ -5439,6 +5439,28 @@ object support.
         PASS, 3.5s). Design: `0110-0001` Slice 252. pgbench pre-commit smoke on commit. **Next (slice 253+):**
         `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE` (the composite-field type matrix is now complete for CREATE TYPE).
 
+      - **PROGRESS 2026-06-20 (loop #19):** **DU-002 slice 253 LANDED — `ALTER TYPE … ADD ATTRIBUTE col type`
+        appends a field to an existing composite type, and the new attribute round-trips through pg_dump.**
+        Real divergence fixed: the parser's `ADD` branch only recognised the enum `ADD VALUE` form and
+        stub-consumed everything else to `;`, so `ALTER TYPE … ADD ATTRIBUTE` was a silent no-op and the new
+        field never reached the catalog/dump. Parser (`parseAlterType`): new `attribute` sub-branch parses the
+        name + a space-joined type token run (paren-depth tracked so `numeric(10,2)` / `[]` survive, like the
+        composite-field collection slice 247), recorded on `AlterTypeStmt.AddAttrName`/`AddAttrType`. Executor
+        (`execAlterType`): `AddAttrName != ""` → `cat.LookupCompositeType` (42704 if absent, 42701 duplicate
+        attr, 42P16 pseudo-type unknown), append the field, then **re-sync** the heap — the composite's three
+        OIDs (type / `_name` array / implicit pg_class relation) are stable across
+        `RegisterCompositeTypeWithFields`, so we stamp `xmax` on the existing pg_type×2 + pg_class/pg_attribute
+        rows (mirrors `execDropType`'s composite branch) and re-run `syncCompositeTypeToCatalogHeap` with the
+        appended list. No pg_dump-side change — `dumpCompositeType` walks `typrelid→pg_class→pg_attribute` by
+        attnum. Scope: `ADD ATTRIBUTE` only (the common, clearly-broken case); `DROP/RENAME/ALTER ATTRIBUTE`,
+        multi-subcommand statements, and mid-txn ROLLBACK of the in-memory field-append deferred (one task per
+        loop). Guards: `parser.TestAlterTypeAddAttributeParsing` (scalar/typmod/array parse, NOT the ADD VALUE
+        branch) + pg_dump TAP port creates `public.alt_comp AS (a integer)`, runs two `ALTER TYPE … ADD
+        ATTRIBUTE` (b text, c numeric(10,2)), asserts the dump re-emits all three fields
+        (`a integer, b text, c numeric(10,2)`) byte-matching real pg_dump 18.3 (`TestPort_PgDumpConnectionSetup`
+        PASS, 3.5s). Executor+parser+catalog unit suites PASS. Design: `0110-0001` Slice 253. pgbench
+        pre-commit smoke on commit. **Next (slice 254+):** `ALTER TYPE … DROP/RENAME/ALTER ATTRIBUTE`.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

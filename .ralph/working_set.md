@@ -1,28 +1,31 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 252 (loop #18) — composite FIELD whose type is an ARRAY
-of a user-defined DOMAIN. `CREATE TYPE rec AS (zips zipcode[])` now dumps the field
-as `public.zipcode[]`, not the base type's array (`text[]`). Closes the
-composite-field type matrix (built-in / enum / domain / composite × scalar / array)
-for CREATE TYPE.
+Last landed: DU-002 slice 253 (loop #19) — `ALTER TYPE … ADD ATTRIBUTE col type`
+appends a field to an existing composite type; the new attribute round-trips
+through pg_dump. Previously the parser's `ADD` branch only knew the enum
+`ADD VALUE` form and stub-consumed `ADD ATTRIBUTE` to `;` (silent no-op).
 
-Mechanism (mirrors composite-array field slice 250 + domain-array column slice 251):
-- buildUserPGAttributeRowForCompositeField: the domain re-resolve (was gated
-  `!isArray`) now also handles isArray → domainArrayOID = d.ArrayOID; element layout
-  from domain base (d.BaseOID else TypeNameToOID(d.Base.Name)); domain-over-enum
-  forces int align. New domainArrayOID cases in array-OID switch (atttypid→ArrayOID,
-  attndims=1) + attrs switch (typlen=-1, storage 'x', base align/collation).
-- NO expr.go change: format_type LookupDomainByArrayOID branch (251) + synced
-  domain-array pg_type row (syncDomainTypeToCatalogHeap, 251) already exist.
+Mechanism:
+- Parser (parseAlterType, ddl.go): new `attribute` sub-branch after `ADD` parses
+  name + space-joined type tokens (paren-depth tracked for typmod/`[]`, like the
+  composite-field collection slice 247) → AlterTypeStmt.AddAttrName/AddAttrType.
+- Executor (execAlterType, operators_ddl.go): AddAttrName != "" → LookupCompositeType
+  (42704 absent / 42701 dup attr / 42P16 unknown), append field, RE-SYNC heap. The
+  composite's 3 OIDs (type/_name array/pg_class relation) are stable across
+  RegisterCompositeTypeWithFields, so stamp xmax on existing pg_type×2 + pg_class/
+  pg_attribute rows (mirrors execDropType composite branch) + re-run
+  syncCompositeTypeToCatalogHeap with the new field list. No pg_dump-side change.
 
-Files: internal/executor/pg18_user_catalog_rows.go,
-internal/executor/pg18_user_catalog_rows_test.go (+TestUserPGAttributeCompositeFieldDomainArray),
-internal/testport/pgdump_connsetup_test.go (CREATE TYPE public.dom_arr_comp + asserts),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 252), .ralph/fix_plan.md.
+Files: internal/parser/ast.go (AddAttrName/AddAttrType), internal/parser/ddl.go,
+internal/parser/m0097_0017_test.go (+TestAlterTypeAddAttributeParsing),
+internal/executor/operators_ddl.go (execAlterType ADD ATTRIBUTE block),
+internal/testport/pgdump_connsetup_test.go (alt_comp fixture + 3-field asserts),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 253), .ralph/fix_plan.md.
 
-Gates: gofmt clean; go build ./... clean; executor+catalog unit suites PASS;
-TestPort_PgDumpConnectionSetup PASS (3.5s, real pg_dump round-trips `zips public.zipcode[]`);
-pgbench pre-commit smoke on commit (.githooks/pre-commit).
+Gates: gofmt clean; go build ./... clean; executor+parser+catalog unit suites PASS;
+TestPort_PgDumpConnectionSetup PASS (3.45s, real pg_dump round-trips
+`a integer, b text, c numeric(10,2)`); pgbench pre-commit smoke on commit.
 
-Next (slice 253+): ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE (composite-field type
-matrix complete for CREATE TYPE).
+Next (slice 254+): ALTER TYPE … DROP/RENAME/ALTER ATTRIBUTE (remaining attribute
+subcommands). DROP needs attisdropped handling; RENAME is a pg_attribute attname
+re-sync; ALTER … TYPE is a re-resolve of one field's type.

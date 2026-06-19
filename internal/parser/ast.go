@@ -2126,6 +2126,10 @@ type AlterTypeStmt struct {
 	RenameOldValue string // RENAME VALUE: existing label (empty when ADD VALUE)
 	RenameNewValue string // RENAME VALUE: replacement label
 	RenameTo       string // RENAME TO: new type name (M0097-enum-rename)
+	// ADD ATTRIBUTE col_name type — appends a field to a composite type.
+	// DU-002 slice 253.
+	AddAttrName string // new composite-type attribute name (empty when not ADD ATTRIBUTE)
+	AddAttrType string // its type string (space-joined, e.g. "numeric ( 10 , 2 )")
 }
 
 func (s *AlterTypeStmt) Pos() int  { return s.pos }

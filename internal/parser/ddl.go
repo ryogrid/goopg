@@ -5520,6 +5520,44 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 	// ADD VALUE [IF NOT EXISTS] 'val' [BEFORE|AFTER 'ref']
 	// NOTE: ADD is a reserved keyword (KwAdd), not an ident keyword — use acceptKeyword.
 	if p.acceptKeyword(KwAdd) {
+		// ADD ATTRIBUTE col_name type — append a field to a composite type.
+		// DU-002 slice 253. Mirrors the composite-field type-token collection in
+		// parseCreateType (typmod parens tracked so `numeric(10,2)` / `zip[]`
+		// survive intact); stops at a top-level ',' (a further subcommand, which
+		// we then stub-consume) or ';'/EOF.
+		if p.acceptIdentKeyword("attribute") {
+			if p.cur().Kind != TokenIdent {
+				return nil, p.errAtCur("expected attribute name after ADD ATTRIBUTE")
+			}
+			stmt.AddAttrName = strings.ToLower(p.advance().Value)
+			var typeParts []string
+			parenDepth := 0
+			for p.cur().Kind != TokenEOF {
+				tok := p.cur()
+				if tok.Kind == TokenSymbol && tok.Value == ";" {
+					break
+				}
+				if tok.Kind == TokenSymbol && parenDepth == 0 && tok.Value == "," {
+					break
+				}
+				if tok.Kind == TokenSymbol && tok.Value == "(" {
+					parenDepth++
+				} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+					parenDepth--
+				}
+				typeParts = append(typeParts, tok.Value)
+				p.advance()
+			}
+			stmt.AddAttrType = strings.Join(typeParts, " ")
+			// Consume any trailing subcommands / CASCADE|RESTRICT as a stub.
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return stmt, nil
+		}
 		if !p.acceptIdentKeyword("value") {
 			// consume until ';' or EOF
 			for p.cur().Kind != TokenEOF {

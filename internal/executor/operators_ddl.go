@@ -10299,6 +10299,46 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	if !ok {
 		return nil
 	}
+	// ADD ATTRIBUTE col_name type — append a field to a composite type so the
+	// new attribute round-trips through pg_dump's dumpCompositeType. DU-002
+	// slice 253. The composite type's OIDs (type / `_name` array / implicit
+	// pg_class relation) are stable across re-registration, so we stamp xmax on
+	// the existing heap rows and re-sync the full row set with the appended
+	// field — there is no in-place pg_attribute update / relnatts bump path.
+	if s.AddAttrName != "" {
+		ct := cat.LookupCompositeType(s.Name)
+		if ct == nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		for _, f := range ct.Fields {
+			if strings.EqualFold(f.Name, s.AddAttrName) {
+				return &ExecError{Code: "42701", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q already exists", s.AddAttrName, s.Name)}
+			}
+		}
+		if strings.EqualFold(s.AddAttrType, "unknown") {
+			return &ExecError{Code: "42P16", Pos: s.Pos(),
+				Message: fmt.Sprintf("column %q has pseudo-type unknown", s.AddAttrName)}
+		}
+		newFields := make([]catalog.CompositeField, len(ct.Fields)+1)
+		copy(newFields, ct.Fields)
+		newFields[len(ct.Fields)] = catalog.CompositeField{Name: s.AddAttrName, ColType: s.AddAttrType}
+		// Stamp xmax on the existing composite heap rows (pg_type ×2, the
+		// implicit pg_class relation + its pg_attribute field rows) before the
+		// re-sync re-writes them, mirroring execDropType's composite branch.
+		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
+		}
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
+		return nil
+	}
 	// RENAME VALUE 'old' TO 'new' — M0097-0022.
 	if s.RenameOldValue != "" {
 		err := cat.RenameEnumValue(s.Name, s.RenameOldValue, s.RenameNewValue)
