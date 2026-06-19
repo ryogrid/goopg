@@ -634,10 +634,19 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	// base — because a domain stores values exactly as its base. Scalar only in
 	// this slice. DU-002 slice 90.
 	domainBaseOID := uint32(0)
-	if cat != nil && col.DeclaredTypeName != "" && !col.Type.IsArray {
+	domainArrayOID := uint32(0)
+	if cat != nil && col.DeclaredTypeName != "" {
 		if d, ok := cat.LookupDomain(col.DeclaredTypeName); ok {
-			domainBaseOID = typOID
-			typOID = d.OID
+			if col.Type.IsArray {
+				// A `d[]` column resolves to the domain's auto-generated array
+				// type OID; the array element layout still follows the base type
+				// (a domain stores values exactly as its base). DU-002 slice 251.
+				domainBaseOID = typOID
+				domainArrayOID = d.ArrayOID
+			} else {
+				domainBaseOID = typOID
+				typOID = d.OID
+			}
 		}
 	}
 	// atttypmod carries the ELEMENT typmod even for array columns; compute it
@@ -649,6 +658,10 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		case enumArrayOID != 0:
 			// Enum array OIDs are dynamic, so ArrayOIDForBase can't case on them.
 			typOID = enumArrayOID
+			attndims = 1
+		case domainArrayOID != 0:
+			// Domain array OIDs are dynamic too. DU-002 slice 251.
+			typOID = domainArrayOID
 			attndims = 1
 		default:
 			if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
@@ -668,6 +681,13 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 		// An enum's array type is a standard varlena array: -1 length,
 		// int-aligned (matching the 4-byte enum element), extended storage.
 		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case domainArrayOID != 0:
+		// A domain's array type is a standard varlena array: -1 length, extended
+		// storage, alignment matching the base element (a domain inherits the
+		// base's layout, and an array's alignment equals its element's). DU-002
+		// slice 251.
+		base := userTypeAttrsForOID(domainBaseOID)
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: base.TypAlign, TypStorage: 'x', TypCollation: base.TypCollation}
 	case domainBaseOID != 0:
 		// A domain inherits its base type's physical layout. DU-002 slice 90.
 		attrs = userTypeAttrsForOID(domainBaseOID)
@@ -1670,7 +1690,7 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		NewIntDatum(0),                                 // typrelid
 		NewIntDatum(0),                                 // typsubscript
 		NewIntDatum(0),                                 // typelem
-		NewIntDatum(0),                                 // typarray (no domain array type in this slice)
+		NewIntDatum(int64(d.ArrayOID)),                 // typarray (auto-generated `_name` array type, slice 251)
 		NewIntDatum(0),                                 // typinput
 		NewIntDatum(0),                                 // typoutput
 		NewIntDatum(0),                                 // typreceive
@@ -1687,6 +1707,61 @@ func buildUserPGTypeRowForDomain(d *catalog.Domain) Row {
 		NewIntDatum(int64(attrs.TypCollation)),         // typcollation (inherit base)
 		typdefaultbin,                                  // typdefaultbin (rendered DEFAULT expr, NULL if none)
 		NullDatum,                                      // typdefault (NULL; pg_dump prefers typdefaultbin)
+		NullDatum,                                      // typacl (NULL)
+	}
+}
+
+// buildUserPGTypeRowForDomainArray builds the pg_type row for a domain's
+// auto-generated array type (`_name`): a varlena array (typtype='b',
+// typcategory='A') whose typelem points back at the domain. typalign matches the
+// base type's alignment (an array's element alignment equals its element type's,
+// and a domain inherits the base's), typstorage is always 'x' (extended).
+// Mirrors buildUserPGTypeRowForEnumArray / buildUserPGTypeRowForCompositeArray.
+// DU-002 slice 251.
+func buildUserPGTypeRowForDomainArray(d *catalog.Domain) Row {
+	baseOID := d.BaseOID
+	if baseOID == 0 {
+		baseOID = catalog.TypeNameToOID(d.Base.Name)
+	}
+	attrs := userTypeAttrsForOID(baseOID)
+	typalign := attrs.TypAlign
+	if d.BaseIsEnum {
+		// A domain over an enum inherits the enum's 4-byte int alignment, which
+		// userTypeAttrsForOID can't derive from the dynamic enum OID (slice 109).
+		typalign = 'i'
+	}
+	return Row{
+		NewIntDatum(int64(d.ArrayOID)),                 // oid
+		NewStringDatum("_" + d.Name),                   // typname (array type name)
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
+		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(-1),                                // typlen (varlena array)
+		NewBoolDatum(false),                            // typbyval
+		NewStringDatum("b"),                            // typtype = 'b' (base)
+		NewStringDatum("A"),                            // typcategory = TYPCATEGORY_ARRAY
+		NewBoolDatum(false),                            // typispreferred
+		NewBoolDatum(true),                             // typisdefined
+		NewStringDatum(","),                            // typdelim
+		NewIntDatum(0),                                 // typrelid
+		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(int64(d.OID)),                      // typelem = the domain element type
+		NewIntDatum(0),                                 // typarray
+		NewIntDatum(0),                                 // typinput
+		NewIntDatum(0),                                 // typoutput
+		NewIntDatum(0),                                 // typreceive
+		NewIntDatum(0),                                 // typsend
+		NewIntDatum(0),                                 // typmodin
+		NewIntDatum(0),                                 // typmodout
+		NewIntDatum(0),                                 // typanalyze
+		NewStringDatum(string(typalign)),               // typalign (matches base element alignment)
+		NewStringDatum("x"),                            // typstorage = 'x' (extended)
+		NewBoolDatum(false),                            // typnotnull
+		NewIntDatum(0),                                 // typbasetype
+		NewIntDatum(-1),                                // typtypmod
+		NewIntDatum(0),                                 // typndims
+		NewIntDatum(int64(attrs.TypCollation)),         // typcollation (inherit base)
+		NullDatum,                                      // typdefaultbin (NULL)
+		NullDatum,                                      // typdefault (NULL)
 		NullDatum,                                      // typacl (NULL)
 	}
 }

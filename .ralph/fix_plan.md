@@ -5395,6 +5395,28 @@ object support.
         smoke on commit. **Next (slice 251+):** domain array types as their own feature (allocate `_name`
         array OID at `CREATE DOMAIN`, sync `pg_type` row, render domain-array columns/fields), then `ALTER
         TYPE … ADD/DROP/ALTER ATTRIBUTE`.
+      - **PROGRESS 2026-06-20 (loop #17):** **DU-002 slice 251 LANDED — domain ARRAY types as their own
+        feature; a `d[]` column (array of a user-defined DOMAIN) round-trips through `pg_dump` as
+        `public.d[]`.** Domains were the last user-defined type with no auto-generated array type:
+        `RegisterDomain` allocated one OID, the domain's `pg_type.typarray` was hardcoded 0, and a `d[]` column
+        folded through `ArrayOIDForBase(baseOID)` to the BASE type's built-in array (`text[]`), so pg_dump
+        emitted `zips text[]` not `zips public.zipcode[]`. Fix mirrors the enum (89) / composite (242/250)
+        array paths: `catalog.Domain` gains an `ArrayOID` field; `RegisterDomain` now allocates TWO OIDs
+        (domain then `_name` array, `nextOID`/`nextOID+1`); new `catalog.LookupDomainByArrayOID` (on the
+        `Catalog` iface). `buildUserPGTypeRowForDomain.typarray` now emits `d.ArrayOID` (so pg_dump's isarray
+        subquery suppresses `_zipcode`); new `buildUserPGTypeRowForDomainArray` (typtype='b', typcategory='A',
+        typelem=d.OID, varlena layout, typalign matching base element). `buildUserPGAttributeRow`'s domain
+        re-resolve now handles `IsArray` → `domainArrayOID` (atttypid=ArrayOID, attndims=1, varlena-array attrs
+        with base alignment). `syncDomainTypeToCatalogHeap` writes the array row; `execDropDomain` stamps both.
+        `expr.go` format_type adds an `else if LookupDomainByArrayOID` branch → `public.<domain>[]`. Scope:
+        table columns only (composite FIELD of domain-array is slice 252). Guards:
+        `executor.TestUserPGAttributeDomainArrayColumn` (atttypid→ArrayOID, attndims=1, varlena layout, array
+        pg_type shape, scalar typarray link, `LookupDomainByArrayOID` inverse + scalar-OID non-resolution,
+        nil-cat `text[]` fallback) + pg_dump TAP port adds `zips zipcode[]` to `public.dom` and asserts
+        round-trip of `zips public.zipcode[]` (never `text[]`, no separate `CREATE TYPE public._zipcode`)
+        (`TestPort_PgDumpConnectionSetup` PASS, 3.6s). Design: `0110-0001` Slice 251. pgbench pre-commit smoke
+        on commit. **Next (slice 252+):** composite FIELD whose type is a domain array (`f zipcode[]`,
+        `buildUserPGAttributeRowForCompositeField` analog), then `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE`.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

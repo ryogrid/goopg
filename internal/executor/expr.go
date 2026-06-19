@@ -8831,6 +8831,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					// (NOT the base type) so the dump round-trips as
 					// `public.zipcode`. DU-002 slice 90.
 					name = "public." + dom.Name
+				} else if dom, ok := ctx.Catalog.LookupDomainByArrayOID(uint32(typeOID)); ok {
+					// A `d[]` column carries the domain's auto-generated array OID;
+					// render it as the schema-qualified array name so the dump
+					// round-trips as `public.d[]`, not the base type's array.
+					// DU-002 slice 251.
+					name = "public." + dom.Name + "[]"
 				} else if ct, ok := ctx.Catalog.LookupCompositeTypeByOID(uint32(typeOID)); ok {
 					// A nested-composite field carries the inner composite type's
 					// dynamically-allocated pg_type OID; render it as the

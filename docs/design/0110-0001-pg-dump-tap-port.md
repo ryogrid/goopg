@@ -7265,6 +7265,46 @@ text[]`), byte-matching real pg_dump 18.3.
 > DOMAIN`, sync its `pg_type` row, render domain-array columns/fields), then `ALTER TYPE …
 > ADD/DROP/ALTER ATTRIBUTE`.
 
+### Slice 251 — domain array type (`d[]` column → `public.d[]`)
+
+Domains were the last user-defined type with no auto-generated array type: `RegisterDomain` allocated a single
+OID, the domain's `pg_type.typarray` was hardcoded `0`, and a `d[]` column folded through
+`ArrayOIDForBase(baseOID)` to the *base type's* built-in array (e.g. `text[]`), so pg_dump rendered `zips
+text[]` instead of `zips public.zipcode[]`. This slice gives a domain its own `_name` array type, mirroring
+the enum (slice 89) and composite (slice 242/250) array paths.
+
+- **`catalog`** — `Domain` gains an `ArrayOID` field; `RegisterDomain` now allocates **two** OIDs (the domain
+  then its `_name` array, `nextOID` then `nextOID+1`), matching `RegisterEnum` / `RegisterCompositeType`. New
+  `LookupDomainByArrayOID(oid)` (promoted onto the `Catalog` interface, mirrors `LookupEnumByArrayOID` /
+  `LookupCompositeTypeByArrayOID`) so `format_type`'s fallback can render the array OID.
+- **`buildUserPGTypeRowForDomain`** — `typarray` now emits `d.ArrayOID` (was `0`), so pg_dump's `getTypes`
+  isarray subquery recognizes `_zipcode` as the domain's auto-generated array and suppresses it from the dump.
+- **`buildUserPGTypeRowForDomainArray`** (new) — the array `pg_type` row: `typtype='b'`, `typcategory='A'`,
+  `typelem=d.OID`, varlena layout (`typlen=-1`, `typbyval=false`, `typstorage='x'`), `typalign` matching the
+  base element's alignment (an array's alignment equals its element type's, and a domain inherits the base's).
+- **`buildUserPGAttributeRow`** — the domain re-resolve now handles `col.Type.IsArray`: a `d[]` column resolves
+  `atttypid` to `d.ArrayOID` (`domainArrayOID`), sets `attndims=1`, and reports the varlena-array layout with
+  the base element's alignment (the `domainArrayOID` cases in the array-OID switch and the attrs switch,
+  ordered before the scalar `domainBaseOID` case).
+- **`syncDomainTypeToCatalogHeap`** — writes the second `pg_type` row (the array) at `CREATE DOMAIN`, like
+  `syncEnumTypeToCatalogHeap`. `execDropDomain` stamps both rows' xmax on `DROP DOMAIN`.
+- **`expr.go` `format_type`** — a new `else if LookupDomainByArrayOID` branch renders the array OID as
+  `public.<domain>[]` (after the scalar `LookupDomainByOID` branch).
+- **Scope**: table columns only. A composite FIELD declared as a domain array (`f d[]`) is the natural next
+  slice (the `buildUserPGAttributeRowForCompositeField` analog), now unblocked since domain array types exist.
+
+Guarded at two levels: `executor.TestUserPGAttributeDomainArrayColumn` pins `atttypid` → domain `ArrayOID`,
+`attndims=1`, the varlena-array layout, the array `pg_type` row shape (`typtype='b'`, `typcategory='A'`,
+`typelem=d.OID`), the scalar row's `typarray` link, the `LookupDomainByArrayOID` inverse (and that the scalar
+OID does NOT resolve via the array path), and the nil-catalog `text[]` fallback; the pg_dump TAP port adds a
+`zips zipcode[]` column to `public.dom` and asserts `pg_dump --schema-only` renders it as `zips
+public.zipcode[]` (never `zips text[]`) with no separate `CREATE TYPE public._zipcode`, byte-matching real
+pg_dump 18.3.
+
+> **Next (slice 252+):** composite FIELD whose type is a domain array (`f zipcode[]`, the
+> `buildUserPGAttributeRowForCompositeField` analog of this slice), then `ALTER TYPE … ADD/DROP/ALTER
+> ATTRIBUTE`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

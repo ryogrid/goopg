@@ -8164,6 +8164,13 @@ func syncDomainTypeToCatalogHeap(ctx *Context, d *catalog.Domain) {
 	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForDomain(d)); err != nil {
 		return
 	}
+	// Also write the auto-generated array type (`_name`) so a `d[]` column's
+	// atttypid joins to a real pg_type row and pg_dump's format_type renders it
+	// as `public.d[]` rather than the base type's built-in array. DU-002 slice 251
+	// (mirrors syncEnumTypeToCatalogHeap's array-row write).
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForDomainArray(d)); err != nil {
+		return
+	}
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
 }
 
@@ -10808,6 +10815,10 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 		if d, ok := cat.LookupDomain(name.Name); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.OID, o.ctx.Tx.XID)
+				// Also stamp the auto-generated array type row. DU-002 slice 251.
+				if d.ArrayOID != 0 {
+					deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.ArrayOID, o.ctx.Tx.XID)
+				}
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			}
 		}

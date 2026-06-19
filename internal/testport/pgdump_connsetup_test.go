@@ -2407,7 +2407,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TYPE public.route AS (name text, stops addr[])"); err != nil {
 		t.Fatalf("create type route: %v", err)
 	}
-	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in)"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in, zips zipcode[])"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
 
@@ -5416,11 +5416,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.tsq_in AS tsquery",
 			"CONSTRAINT tsq_in_check CHECK ((VALUE = ANY (ARRAY['''a'' & ''b'''::tsquery, '''cat'' | ''dog'''::tsquery])))",
 			"tsqi public.tsq_in",
+			// Slice 251: a column declared `zipcode[]` (an ARRAY of a user-defined
+			// DOMAIN) must render as the schema-qualified domain array name, not the
+			// base type's array. The domain's auto-generated `_zipcode` array type
+			// (allocated at CREATE DOMAIN) gives the column a real array pg_type OID
+			// that format_type resolves to `public.zipcode[]`.
+			"zips public.zipcode[]",
 		}
 		for _, sub := range domainDefs {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped the DOMAIN round-trip; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// Slice 251: the domain-array column must NOT degrade to the base type's
+		// array, and the auto-generated `_zipcode` array type must NOT dump as its
+		// own CREATE TYPE (the domain's typarray points back at it, so pg_dump's
+		// isarray subquery suppresses it).
+		if strings.Contains(res.Stdout, "zips text[]") {
+			t.Errorf("pg_dump rendered the domain-array column as text[] (slice-251 array OID resolution regressed)\n  full stdout=%q", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "CREATE TYPE public._zipcode") {
+			t.Errorf("pg_dump emitted the auto-generated domain array type as a separate CREATE TYPE (slice-251 isarray suppression regressed)\n  full stdout=%q", res.Stdout)
 		}
 		// The domain column must NOT fold back to its base type, and the domain
 		// definition must NOT carry an empty DEFAULT clause.

@@ -1201,6 +1201,11 @@ type Catalog interface {
 	// LookupDomainByOID finds a user-defined domain type by its pg_type OID, used
 	// by format_type to render a domain column's declared type. DU-002 slice 90.
 	LookupDomainByOID(oid uint32) (*Domain, bool)
+	// LookupDomainByArrayOID finds a user-defined domain type by the pg_type OID
+	// of its auto-generated array type (`_name`), used by format_type to render a
+	// domain-array column (`d[]`) as the schema-qualified array name. DU-002
+	// slice 251.
+	LookupDomainByArrayOID(oid uint32) (*Domain, bool)
 	// LookupCompositeType returns the OID-bearing metadata for a composite type
 	// by name (case-insensitive), or nil. Exposed on the interface so the
 	// catalog-row builders can re-resolve a composite field whose declared type
@@ -1423,7 +1428,14 @@ type EnumType struct {
 type Domain struct {
 	Name string
 	OID  uint32
-	Base Type // resolved base type
+	// ArrayOID is the pg_type OID of the domain's auto-generated array type
+	// (`_name`), allocated immediately after OID at CREATE DOMAIN (same running
+	// counter, OID then ArrayOID) so a `d[]` column resolves to a real array
+	// pg_type row and pg_dump renders it as `public.d[]` rather than the base
+	// type's built-in array. Mirrors EnumType.ArrayOID / CompositeType.ArrayOID.
+	// DU-002 slice 251.
+	ArrayOID uint32
+	Base     Type // resolved base type
 	// BaseOID is the pg_type OID of the resolved base type, recorded at CREATE
 	// DOMAIN time. Zero means "derive from Base.Name via TypeNameToOID" (the
 	// built-in-base default). It is set explicitly for a user-defined enum base,
@@ -7575,14 +7587,19 @@ func (c *InMemory) RegisterDomain(name string, base Type, notNull bool, checkInV
 	if _, exists := c.domains[k]; exists {
 		return nil, fmt.Errorf("type %q already exists", name)
 	}
+	// PostgreSQL allocates two OIDs per domain: the domain type itself, then its
+	// auto-generated array type (`_name`). Mirror that ordering (OID, then
+	// ArrayOID) so a `d[]` column joins to a real array pg_type row. DU-002
+	// slice 251 (matches RegisterEnum / RegisterCompositeType).
 	d := &Domain{
 		Name:          k,
 		OID:           c.nextOID,
+		ArrayOID:      c.nextOID + 1,
 		Base:          base,
 		NotNull:       notNull,
 		CheckInValues: checkInValues,
 	}
-	c.nextOID++
+	c.nextOID += 2
 	c.domains[k] = d
 	return d, nil
 }
@@ -7636,6 +7653,21 @@ func (c *InMemory) LookupDomainByOID(oid uint32) (*Domain, bool) {
 	defer c.mu.RUnlock()
 	for _, d := range c.domains {
 		if d.OID == oid {
+			return d, true
+		}
+	}
+	return nil, false
+}
+
+// LookupDomainByArrayOID finds a user-defined domain type by the pg_type OID of
+// its auto-generated array type (`_name`). Used by format_type to render a
+// domain-array column (`d[]`) as the schema-qualified array name. Mirrors
+// LookupEnumByArrayOID / LookupCompositeTypeByArrayOID. DU-002 slice 251.
+func (c *InMemory) LookupDomainByArrayOID(oid uint32) (*Domain, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, d := range c.domains {
+		if d.ArrayOID == oid {
 			return d, true
 		}
 	}

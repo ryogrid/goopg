@@ -1428,6 +1428,108 @@ func TestUserPGAttributeDomainColumn(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeDomainArrayColumn pins the DOMAIN-ARRAY column resolution
+// (DU-002 slice 251). A column declared `d[]` (d a user-defined domain) is
+// stored with Type.Name resolved to the base and Type.IsArray=true, the domain
+// name in DeclaredTypeName. buildUserPGAttributeRow must resolve atttypid to the
+// domain's auto-generated array OID (d.ArrayOID, allocated right after d.OID),
+// set attndims=1, and report the varlena-array layout with the base element's
+// alignment — so pg_dump renders `public.d[]`, not the base type's array.
+func TestUserPGAttributeDomainArrayColumn(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		attndimsIdx   = 6
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	d, err := cat.RegisterDomain("zipcode", catalog.Type{Name: "text"}, false)
+	if err != nil {
+		t.Fatalf("RegisterDomain: %v", err)
+	}
+	if d.ArrayOID != d.OID+1 {
+		t.Fatalf("domain ArrayOID=%d want OID+1=%d", d.ArrayOID, d.OID+1)
+	}
+	tbl := &catalog.Table{Schema: "public", Name: "dom", OID: 16500}
+	// CREATE TABLE stores the base type name + IsArray, domain in DeclaredTypeName.
+	col := catalog.Column{Name: "zips", Type: catalog.Type{Name: "text", IsArray: true}, DeclaredTypeName: "zipcode", Ordinal: 1}
+	row := buildUserPGAttributeRow(cat, tbl, col)
+
+	if got := uint32(row[atttypidIdx].Int); got != d.ArrayOID {
+		t.Errorf("domain-array column: atttypid=%d want %d (domain ArrayOID)", got, d.ArrayOID)
+	}
+	if got := row[attndimsIdx].Int; got != 1 {
+		t.Errorf("domain-array column: attndims=%d want 1", got)
+	}
+	// Varlena-array layout: -1 length, not by-value, int-aligned (matching the
+	// text base element), extended storage.
+	if got := row[attlenIdx].Int; got != -1 {
+		t.Errorf("domain-array column: attlen=%d want -1", got)
+	}
+	if got := row[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("domain-array column: attbyval=%v want false", got)
+	}
+	if got := row[attalignIdx].StringValue(); got != "i" {
+		t.Errorf("domain-array column: attalign=%q want \"i\" (text base element)", got)
+	}
+	if got := row[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("domain-array column: attstorage=%q want \"x\"", got)
+	}
+
+	// The auto-generated array pg_type row: typtype='b', typcategory='A',
+	// typelem=d.OID, varlena layout.
+	const (
+		typtypeIdx     = 6
+		typcategoryIdx = 7
+		typelemIdx     = 13
+		typlenIdx      = 4
+	)
+	arr := buildUserPGTypeRowForDomainArray(d)
+	if got := uint32(arr[0].Int); got != d.ArrayOID {
+		t.Errorf("domain-array pg_type: oid=%d want %d", got, d.ArrayOID)
+	}
+	if got := arr[1].StringValue(); got != "_zipcode" {
+		t.Errorf("domain-array pg_type: typname=%q want \"_zipcode\"", got)
+	}
+	if got := arr[typtypeIdx].StringValue(); got != "b" {
+		t.Errorf("domain-array pg_type: typtype=%q want \"b\"", got)
+	}
+	if got := arr[typcategoryIdx].StringValue(); got != "A" {
+		t.Errorf("domain-array pg_type: typcategory=%q want \"A\"", got)
+	}
+	if got := uint32(arr[typelemIdx].Int); got != d.OID {
+		t.Errorf("domain-array pg_type: typelem=%d want %d (domain OID)", got, d.OID)
+	}
+	if got := arr[typlenIdx].Int; got != -1 {
+		t.Errorf("domain-array pg_type: typlen=%d want -1", got)
+	}
+
+	// The scalar domain row's typarray now points at the array OID so pg_dump can
+	// follow the link.
+	const typarrayIdx = 14
+	srow := buildUserPGTypeRowForDomain(d)
+	if got := uint32(srow[typarrayIdx].Int); got != d.ArrayOID {
+		t.Errorf("domain pg_type: typarray=%d want %d", got, d.ArrayOID)
+	}
+
+	// LookupDomainByArrayOID is the inverse used by format_type: the array OID
+	// resolves to the domain; the scalar OID must NOT resolve via the array path.
+	if got, ok := cat.LookupDomainByArrayOID(d.ArrayOID); !ok || got.Name != "zipcode" {
+		t.Errorf("LookupDomainByArrayOID(%d)=%v,%v want zipcode,true", d.ArrayOID, got, ok)
+	}
+	if _, ok := cat.LookupDomainByArrayOID(d.OID); ok {
+		t.Errorf("LookupDomainByArrayOID(scalar OID) unexpectedly resolved")
+	}
+
+	// nil catalog: no re-resolution, column folds to the built-in text[] array.
+	nilRow := buildUserPGAttributeRow(nil, tbl, col)
+	if got := uint32(nilRow[atttypidIdx].Int); got != catalog.ArrayOIDForBase(catalog.OIDText) {
+		t.Errorf("nil-catalog domain-array column: atttypid=%d want %d (text[])", got, catalog.ArrayOIDForBase(catalog.OIDText))
+	}
+}
+
 // TestUserPGAttributeTypmod pins the atttypmod computation for typmod-bearing
 // columns and the matching format_type round-trip (DU-002 slice 48). Before
 // this, buildUserPGAttributeRow hardcoded atttypmod=-1, so pg_dump rendered
