@@ -1270,6 +1270,12 @@ type CreateIndexStmt struct {
 	// declared limit so pg_get_indexdef can re-emit
 	// `WITH (gin_pending_list_limit='N')`. Valid range 64–2097151. DU-002 slice 221.
 	GinPendingListLimit int
+	// PagesPerRange captures the BRIN `WITH (pages_per_range=N)` integer storage
+	// parameter (number of heap pages per summarized range). 0 means unset (PG
+	// default 128); a non-zero value records the explicitly-declared value so
+	// pg_get_indexdef can re-emit `WITH (pages_per_range='N')`. Valid range
+	// 1–131072. DU-002 slice 222.
+	PagesPerRange int
 }
 
 // IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key

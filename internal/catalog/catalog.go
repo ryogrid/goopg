@@ -1002,6 +1002,14 @@ type Index struct {
 	// goopg has no GIN pending list, so this is advisory catalog/dump-only.
 	// DU-002 slice 221.
 	GinPendingListLimit int
+	// PagesPerRange stores the BRIN `WITH (pages_per_range=N)` integer storage
+	// parameter (number of heap pages per summarized range). Zero means unset
+	// (PG default 128) — no reloption is emitted, so a plain BRIN index dumps
+	// byte-identically. When set, the index's pg_class.reloptions virtual row
+	// renders `pages_per_range=N`, which pg_dump re-emits as `CREATE INDEX …
+	// WITH (pages_per_range='N')`. goopg has no BRIN summarization, so this is
+	// advisory catalog/dump-only. DU-002 slice 222.
+	PagesPerRange int
 }
 
 // reloptionList returns the index's storage parameters as ordered key=value
@@ -1031,6 +1039,9 @@ func (idx *Index) reloptionList() [][2]string {
 	}
 	if idx.GinPendingListLimit != 0 {
 		opts = append(opts, [2]string{"gin_pending_list_limit", strconv.Itoa(idx.GinPendingListLimit)})
+	}
+	if idx.PagesPerRange != 0 {
+		opts = append(opts, [2]string{"pages_per_range", strconv.Itoa(idx.PagesPerRange)})
 	}
 	return opts
 }

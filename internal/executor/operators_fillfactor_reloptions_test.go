@@ -2472,3 +2472,88 @@ func TestIndexGinPendingListLimitOutOfBoundsRejected(t *testing.T) {
 		t.Fatalf("error = %v (%T), want ExecError with code 22023", err, err)
 	}
 }
+
+// TestIndexPagesPerRangeSurfacesInPgClassReloptions verifies that a BRIN
+// `WITH (pages_per_range=N)` integer storage parameter declared on CREATE INDEX
+// USING brin is persisted on the catalog Index and surfaced through the index's
+// own pg_class virtual-view row (relkind 'i'), reloptions cell. BRIN registers
+// catalog-only, which is what lets the reloption round-trip: pg_dump reads
+// reloptions via `t.reloptions AS indreloptions` and re-emits `CREATE INDEX …
+// USING brin … WITH (pages_per_range='64')`. Cases pin: a non-default integer
+// value and a plain BRIN index (reloptions NULL). goopg has no BRIN
+// summarization, so the value is catalog/dump-only. DU-002 slice 222.
+func TestIndexPagesPerRangeSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE bp (id integer, v integer)`); err != nil {
+		t.Fatalf("CREATE TABLE bp: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX bpr ON bp USING brin (id) WITH (pages_per_range=64)`); err != nil {
+		t.Fatalf("CREATE INDEX bpr: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX bpplain ON bp USING brin (v)`); err != nil {
+		t.Fatalf("CREATE INDEX bpplain: %v", err)
+	}
+
+	prIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "bpr"})
+	if !ok {
+		t.Fatal("bpr index not found")
+	}
+	if prIdx.PagesPerRange != 64 {
+		t.Errorf("bpr.PagesPerRange = %d, want 64", prIdx.PagesPerRange)
+	}
+	plainIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "bpplain"})
+	if !ok {
+		t.Fatal("bpplain index not found")
+	}
+	if plainIdx.PagesPerRange != 0 {
+		t.Errorf("bpplain.PagesPerRange = %d, want 0 (unset)", plainIdx.PagesPerRange)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && r[17] == "i" && (r[1] == "bpr" || r[1] == "bpplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["bpr"] != "{pages_per_range=64}" {
+		t.Errorf("pg_class.reloptions for bpr = %q, want %q", got["bpr"], "{pages_per_range=64}")
+	}
+	if got["bpplain"] != "" {
+		t.Errorf("pg_class.reloptions for bpplain = %q, want \"\" (NULL)", got["bpplain"])
+	}
+
+	// BuildIndexDef (the pg_get_indexdef path pg_dump emits verbatim) single-quotes
+	// the reloption value and renders USING brin.
+	if def := catalog.BuildIndexDef(prIdx); !strings.Contains(def, "USING brin") || !strings.Contains(def, "WITH (pages_per_range='64')") {
+		t.Errorf("BuildIndexDef(bpr) = %q, want USING brin and WITH (pages_per_range='64')", def)
+	}
+	if def := catalog.BuildIndexDef(plainIdx); strings.Contains(def, "WITH (") {
+		t.Errorf("BuildIndexDef(bpplain) = %q, want no WITH clause", def)
+	}
+}
+
+// TestIndexPagesPerRangeOutOfBoundsRejected verifies a value outside the
+// PG-accepted range (1–131072) is rejected with SQLSTATE 22023, mirroring
+// PostgreSQL's reloption bounds check. DU-002 slice 222.
+func TestIndexPagesPerRangeOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE bpb (id integer)`); err != nil {
+		t.Fatalf("CREATE TABLE bpb: %v", err)
+	}
+	err := runDDL(t, ctx, `CREATE INDEX bpbad ON bpb USING brin (id) WITH (pages_per_range=200000)`)
+	if err == nil {
+		t.Fatal("CREATE INDEX with pages_per_range=200000 should be rejected")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "22023" {
+		t.Fatalf("error = %v (%T), want ExecError with code 22023", err, err)
+	}
+}

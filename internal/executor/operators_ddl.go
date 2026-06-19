@@ -4093,6 +4093,13 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			Message: fmt.Sprintf("value %d out of bounds for option \"gin_pending_list_limit\"", s.GinPendingListLimit),
 			Detail:  "Valid values are between \"64\" and \"2097151\"."}
 	}
+	// pages_per_range (BRIN integer storage parameter) range-validated like PG:
+	// min 1, max BRIN_MAX_PAGES_PER_RANGE (131072). DU-002 slice 222.
+	if s.PagesPerRange != 0 && (s.PagesPerRange < 1 || s.PagesPerRange > 131072) {
+		return &ExecError{Code: "22023", Pos: s.Pos(),
+			Message: fmt.Sprintf("value %d out of bounds for option \"pages_per_range\"", s.PagesPerRange),
+			Detail:  "Valid values are between \"1\" and \"131072\"."}
+	}
 	method := strings.ToLower(strings.TrimSpace(s.Method))
 	if method == "rtree" {
 		o.ctx.AddNotice("substituting access method \"gist\" for obsolete method \"rtree\"")
@@ -4113,11 +4120,13 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method == "hash" {
 		method = "btree"
 	}
-	// gist, spgist and gin: register catalog metadata only (no physical
+	// gist, spgist, gin and brin: register catalog metadata only (no physical
 	// storage). pg_index / pg_class / pg_get_indexdef queries work correctly; no
 	// actual index acceleration or constraint enforcement. GIN is catalog-only
-	// so its `fastupdate` reloption can round-trip through pg_dump. DU-002 slice 220.
-	if method == "gist" || method == "spgist" || method == "gin" {
+	// so its `fastupdate` reloption can round-trip through pg_dump (slice 220);
+	// BRIN is catalog-only so its `pages_per_range` reloption likewise round-trips
+	// (DU-002 slice 222).
+	if method == "gist" || method == "spgist" || method == "gin" || method == "brin" {
 		idx, createErr := o.ctx.Catalog.CreateIndex(idxName, tbl, s.Columns, s.Unique, method, false)
 		if createErr != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: createErr.Error()}
@@ -4133,6 +4142,8 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		idx.FastUpdate = s.FastUpdate
 		// Persist `WITH (gin_pending_list_limit=N)` (GIN, range-validated above). DU-002 slice 221.
 		idx.GinPendingListLimit = s.GinPendingListLimit
+		// Persist `WITH (pages_per_range=N)` (BRIN, range-validated above). DU-002 slice 222.
+		idx.PagesPerRange = s.PagesPerRange
 		if catalogHeapSyncAvailable(o.ctx) {
 			if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
 				return fmt.Errorf("DDL catalog sync: %w", syncErr)

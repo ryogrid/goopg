@@ -4876,6 +4876,30 @@ object support.
         pgbench pre-commit smoke on commit. **Next:** brin `autosummarize` bool / `pages_per_range` int (brin
         still needs the catalog-only branch widened to `gist||spgist||gin||brin` — one-line change); or the
         BIGGER `toast.*` namespace / composite types.
+      - **PROGRESS 2026-06-19 (loop #37):** **DU-002 slice 222 LANDED — BRIN catalog-only index +
+        `pages_per_range` integer storage parameter round-trips through pg_dump.** Unlike GIN, BRIN was
+        previously *rejected* by `CREATE INDEX` (`index method "brin" is not supported in v0`), so this slice
+        first widens the catalog-only branch guard to `gist || spgist || gin || brin` (BRIN now registers
+        catalog metadata only — no physical storage / no summarization, like gist/spgist/gin). Then mirrors
+        slice 221's int plumbing on the BRIN key: parser (`ddl.go`) recognizes `pages_per_range` and reads
+        the int via `parseIntLit` into `CreateIndexStmt.PagesPerRange` (`int`, 0=unset); executor
+        (`operators_ddl.go`) range-validates like PG (`< 1 || > 131072` → SQLSTATE `22023`, mirroring
+        `reloptions.c` min 1 / max `BRIN_MAX_PAGES_PER_RANGE`=131072) next to the gin_pending_list_limit check,
+        then persists `idx.PagesPerRange` in the catalog-only branch. `Index.PagesPerRange` (`strconv.Itoa`)
+        appended to `reloptionList()` after gin_pending_list_limit; `BuildIndexDef` dumps `USING brin … WITH
+        (pages_per_range='64')`. JSON-persisted; advisory catalog/dump-only. 0 sentinel keeps a plain BRIN
+        index byte-identical. Files: `internal/parser/ast.go` (`CreateIndexStmt.PagesPerRange`),
+        `internal/parser/ddl.go` (WITH-loop capture), `internal/catalog/catalog.go` (`Index.PagesPerRange` +
+        `reloptionList()`), `internal/executor/operators_ddl.go` (branch widen + range-validate + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestIndexPagesPerRangeSurfacesInPgClassReloptions` + `TestIndexPagesPerRangeOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `foo_brinrange_idx` fixture + indexDefs assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 222). Gates: gofmt OK; `go build ./internal/...`
+        clean; catalog/parser/full-executor reloption suites PASS; `TestPort_PgDumpConnectionSetup` PASS
+        (round-trips `CREATE INDEX foo_brinrange_idx ON public.foo USING brin (qty) WITH
+        (pages_per_range='64');`); pgbench pre-commit smoke on commit. **Next:** brin `autosummarize` bool
+        (the remaining BRIN reloption; same bool plumbing as fastupdate/deduplicate_items); or the BIGGER
+        `toast.*` namespace / composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -6403,6 +6403,39 @@ The pg_dump fixture adds `foo_ginlimit_idx ON public.foo USING gin (qty) WITH (g
 the assertion confirms the dump carries `CREATE INDEX foo_ginlimit_idx ON public.foo USING gin (qty) WITH
 (gin_pending_list_limit='128');`.
 
+### Slice 222 — BRIN catalog-only index + `pages_per_range` reloption round-trip
+
+Adds the BRIN `pages_per_range` **integer** storage parameter on **`CREATE INDEX … USING brin`**.
+PG's BRIN access method exposes it (`reloptions.c`: default `128`, min `1`, max `BRIN_MAX_PAGES_PER_RANGE`
+= `131072`) to set how many heap pages each summarized range covers; `WITH (pages_per_range=64)` must
+survive a dump/restore. Unlike GIN, BRIN was previously **rejected** by `CREATE INDEX` (`index method
+"brin" is not supported in v0`), so this slice first widens the catalog-only branch to include it.
+
+This slice mirrors `gin_pending_list_limit`'s **integer** plumbing (slice 221) on a BRIN-specific key:
+
+- **Executor** (`operators_ddl.go`): the catalog-only branch guard becomes
+  `gist || spgist || gin || brin`, so BRIN now registers catalog metadata only (no physical storage,
+  no summarization) — exactly like gist/spgist/gin. This is what lets the reloption round-trip.
+- **Parser** (`ddl.go`): the WITH loop recognizes `pages_per_range` and reads its integer via the existing
+  `parseIntLit` into `CreateIndexStmt.PagesPerRange` (`int`, `0` = unset).
+- **Executor** (`operators_ddl.go`): range-validates like PG (`< 1 || > 131072` → SQLSTATE `22023`,
+  `value %d out of bounds for option "pages_per_range"`, detail `Valid values are between "1" and
+  "131072".`) next to the gin_pending_list_limit check, then persists `idx.PagesPerRange = s.PagesPerRange`
+  in the catalog-only branch.
+- **catalog** (`catalog.go`): `Index.PagesPerRange` (`int`, `strconv.Itoa`) is appended to `reloptionList()`
+  after gin_pending_list_limit. `BuildIndexDef` dumps `USING brin … WITH (pages_per_range='64')`.
+
+`catalog.Index.PagesPerRange` is JSON-persisted. goopg has no BRIN summarization, so the value is advisory
+catalog/dump-only — like the BRIN index itself. `0` is the unset sentinel (PG default `128` emits no
+reloption), so a plain BRIN index still dumps byte-identically.
+
+Engine guards: `TestIndexPagesPerRangeSurfacesInPgClassReloptions` (a non-default `64` →
+`{pages_per_range=64}` with `BuildIndexDef` rendering `USING brin … WITH (pages_per_range='64')`; a plain
+BRIN index keeps reloptions NULL) and `TestIndexPagesPerRangeOutOfBoundsRejected` (`=200000` → SQLSTATE
+`22023`). The pg_dump fixture adds `foo_brinrange_idx ON public.foo USING brin (qty) WITH
+(pages_per_range=64)`; the assertion confirms the dump carries `CREATE INDEX foo_brinrange_idx ON
+public.foo USING brin (qty) WITH (pages_per_range='64');`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -3102,6 +3102,19 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 							continue
 						}
 					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "pages_per_range" {
+					// BRIN integer storage parameter (heap pages per summarized
+					// range). Record the value so pg_dump can re-emit it. DU-002 slice 222.
+					p.advance() // consume "pages_per_range"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if p.cur().Kind == TokenIntLit {
+							if v, err := p.parseIntLit(); err == nil {
+								stmt.PagesPerRange = int(v)
+							}
+							continue
+						}
+					}
 				}
 				p.advance()
 			}
