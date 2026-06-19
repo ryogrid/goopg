@@ -1780,6 +1780,15 @@ const (
 	// Clears the catalog column's NOT NULL and drops its contype='n'
 	// constraint. ColumnName holds the column. DU-002 slice 270.
 	AlterTableDropNotNull
+	// AlterTableAddNotNull — `ADD [CONSTRAINT name] NOT NULL col [NO INHERIT]`.
+	// The named (PG18) counterpart of AlterTableSetNotNull: marks the column
+	// NOT NULL and records a contype='n' constraint carrying the EXPLICIT name
+	// from ConstraintName (auto-named `<table>_<col>_not_null` when omitted).
+	// When the name differs from that default, pg_dump prints the
+	// `CONSTRAINT <name> NOT NULL <col>` form (pg_dump.c:17228). ColumnName
+	// holds the column; ConstraintName holds the optional name; NoInherit is
+	// set for the `NO INHERIT` trailer. DU-002 slice 271.
+	AlterTableAddNotNull
 	// AlterIndexAttachPartition — `ALTER INDEX parent ATTACH PARTITION child`.
 	// Registers child as a partition of parent in the index partition tree.
 	// ConstraintName holds the parent index name; ChildIndexName holds the child. M0097-0023.
@@ -1849,6 +1858,9 @@ type AlterTableAction struct {
 	// Recorded on catalog.Column.Options so pg_dump re-emits the clause via
 	// pg_attribute.attoptions. DU-002 slice 185.
 	SetOptions []string
+	// NoInherit is set for AlterTableAddNotNull when the constraint carries a
+	// `NO INHERIT` trailer (contype='n', connoinherit='t'). DU-002 slice 271.
+	NoInherit bool
 	// ChildIndexName is populated for AlterIndexAttachPartition and holds
 	// the name of the child index to attach. M0097-0023.
 	ChildIndexName string

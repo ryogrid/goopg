@@ -313,6 +313,46 @@ func TestParseAlterTableSetDropNotNull(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableAddNotNull covers the PG18 named NOT NULL constraint form
+// `ALTER TABLE ... ADD [CONSTRAINT name] NOT NULL col [NO INHERIT]` (DU-002
+// slice 271). It records AlterTableAddNotNull with the column, optional explicit
+// name, and the NO INHERIT flag so the executor records a contype='n' row whose
+// conname round-trips through pg_dump as `CONSTRAINT <name> NOT NULL <col>`.
+func TestParseAlterTableAddNotNull(t *testing.T) {
+	for _, tc := range []struct {
+		sql           string
+		wantCol       string
+		wantName      string
+		wantNoInherit bool
+	}{
+		{"ALTER TABLE t ADD CONSTRAINT my_nn NOT NULL c", "c", "my_nn", false},
+		{"ALTER TABLE t ADD NOT NULL c", "c", "", false},
+		{"ALTER TABLE t ADD CONSTRAINT my_nn NOT NULL c NO INHERIT", "c", "my_nn", true},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableAddNotNull {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		a := at.Actions[0]
+		if a.ColumnName != tc.wantCol {
+			t.Errorf("Parse(%q): ColumnName=%q want %q", tc.sql, a.ColumnName, tc.wantCol)
+		}
+		if a.ConstraintName != tc.wantName {
+			t.Errorf("Parse(%q): ConstraintName=%q want %q", tc.sql, a.ConstraintName, tc.wantName)
+		}
+		if a.NoInherit != tc.wantNoInherit {
+			t.Errorf("Parse(%q): NoInherit=%v want %v", tc.sql, a.NoInherit, tc.wantNoInherit)
+		}
+	}
+}
+
 // TestParseCreateTableColumnCompression covers the inline `COMPRESSION <method>`
 // clause in a CREATE TABLE column definition (`a text COMPRESSION lz4`), which
 // threads the method onto ColumnDef.Compression. DU-002 slice 183.

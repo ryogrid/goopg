@@ -1490,6 +1490,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("set NOT NULL on inherited column idfn_child.pid: %v", err)
 	}
 
+	// Slice 271: a *named* NOT NULL on an inherited column via PG18's
+	// `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>`. This is the named
+	// counterpart of slice 270's unnamed `""` path. pg_dump reads the
+	// constraint's conname (notnull_name) and compares it against the computed
+	// default `<table>_<col>_not_null`; because `idfnn_nn` differs, notnull_constrs
+	// carries the real name and pg_dump prints `CONSTRAINT idfnn_nn NOT NULL pid`
+	// — the named body form (pg_dump.c:17228) — rather than the unnamed
+	// `NOT NULL pid`. New production support: the ADD CONSTRAINT NOT NULL parser
+	// branch (previously the column-level `NOT NULL` was only parsed inline) plus
+	// the AlterTableAddNotNull executor action, which records a contype='n'
+	// constraint with the EXPLICIT name (conislocal=true, coninhcount=0) and
+	// flushes pg_attribute.attnotnull via the same delete-old-rows +
+	// syncTableToCatalogHeap path as SET NOT NULL. idfnn_child keeps a local
+	// `extra` column so its body is non-empty; the inherited `pid`/`pname` arrive
+	// via INHERITS, with `CONSTRAINT idfnn_nn NOT NULL pid` emitted in the body.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfnn_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create legacy inheritance parent idfnn_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfnn_child (extra integer) INHERITS (public.idfnn_parent)"); err != nil {
+		t.Fatalf("create legacy inheritance child idfnn_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.idfnn_child ADD CONSTRAINT idfnn_nn NOT NULL pid"); err != nil {
+		t.Fatalf("add named NOT NULL on inherited column idfnn_child.pid: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -3988,6 +4013,42 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "INHERITS (public.idfn_parent)") {
 			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfn_parent)", res.Stdout)
+		}
+		// **Slice 271 (asserted):** a *named* NOT NULL on an inherited column,
+		// emitted as the `CONSTRAINT idfnn_nn NOT NULL pid` body form — the named
+		// counterpart of slice 270's unnamed `NOT NULL pid`. pg_dump prints the
+		// CONSTRAINT prefix only when the conname differs from the computed default
+		// `<table>_<col>_not_null` (pg_dump.c:17228), so the explicit `idfnn_nn`
+		// name must survive into pg_constraint.conname. idfnn_child's body must
+		// print its local `extra` column AND `CONSTRAINT idfnn_nn NOT NULL pid`;
+		// the inherited `pid`/`pname` are suppressed and arrive via INHERITS. A
+		// regression that dropped the explicit name would fall back to the unnamed
+		// form (no `CONSTRAINT idfnn_nn` prefix); one that lost AlterTableAddNotNull
+		// would emit nothing for the NOT NULL.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.idfnn_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the legacy child's local column; want %q in idfnn_child block\n  block=%q", "extra integer", block)
+			}
+			if !strings.Contains(block, "CONSTRAINT idfnn_nn NOT NULL pid") {
+				t.Errorf("pg_dump dropped the named child-level NOT NULL; want %q in idfnn_child block\n  block=%q", "CONSTRAINT idfnn_nn NOT NULL pid", block)
+			}
+			// The inherited columns must NOT be re-emitted as full columns.
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in idfnn_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.idfnn_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.idfnn_parent)") {
+			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfnn_parent)", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged

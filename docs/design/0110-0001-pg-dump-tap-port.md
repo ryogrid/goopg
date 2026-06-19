@@ -7892,9 +7892,47 @@ contype='n' rows with `conislocal`/`coninhcount`/`connoinherit`/`conkey` from `N
 Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `TestParseAlterTableSetDropNotNull`
 (parser AST) + `TestAlterTableSetDropNotNull` (executor catalog state, incl. idempotence + DROP).
 
-> **Next (slice 271+):** a *named* NOT NULL constraint added via `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>`
-> on an inherited column, which exercises the `CONSTRAINT <name> NOT NULL <col>` form (`notnull_constrs` carrying the
-> non-default name) — the named counterpart of this slice's unnamed `""` path.
+### Slice 271 — *named* NOT NULL on an inherited column (`CONSTRAINT <name> NOT NULL <col>` body form)
+
+The named counterpart of slice 270. PG 18's `ALTER TABLE ... ADD [CONSTRAINT <name>] NOT NULL <col>` records a
+`pg_constraint` contype='n' row carrying the **explicit** name. pg_dump's `getTableAttrs` reads that `conname` as
+`notnull_name` and, for a PG18 server, compares it against the computed default `<table>_<col>_not_null`
+(`pg_dump.c:9926`). When they **match**, `notnull_constrs[j]` becomes the unnamed `""` (slice 270's path). When they
+**differ**, `notnull_constrs[j]` keeps the real name, and the standalone body emitter prints
+`CONSTRAINT <name> NOT NULL <col>` instead of the bare `NOT NULL <col>` (`pg_dump.c:17228`). Verified against real
+pg_dump 18.3 — `idfnn_nn` differs from `idfnn_child_pid_not_null`, so:
+
+```
+CREATE TABLE public.idfnn_child (
+    CONSTRAINT idfnn_nn NOT NULL pid,
+    extra integer
+)
+INHERITS (public.idfnn_parent);
+```
+
+New production support — the `ADD CONSTRAINT ... NOT NULL <col>` shape was previously unparseable (the column-level
+`NOT NULL` was only recognized inline in a CREATE TABLE / ADD COLUMN coldef):
+
+- **Parser** (`internal/parser/ddl.go`): a `NOT NULL` case in the `ALTER TABLE ... ADD [CONSTRAINT name]` switch that
+  consumes `NOT NULL <col>` plus an optional `NO INHERIT` trailer. New AST kind `AlterTableAddNotNull` carrying
+  `ColumnName`, the optional `ConstraintName`, and a new `NoInherit` flag (`internal/parser/ast.go`).
+- **Executor** (`internal/executor/operators_ddl.go`): `AlterTableAddNotNull` marks `Column.NotNull` and records a
+  contype='n' constraint via `catalog.Table.AddNotNull(name, col, oid, NoInherit, isLocal=true, inhCount=0)` — using
+  the **explicit** name when given, else the auto-name `<table>_<col>_not_null`. Idempotent (no duplicate row for a
+  column that already has a NOT NULL), and a missing column raises `42703`. The `pg_attribute.attnotnull` flush rides
+  the same delete-old-rows + `syncTableToCatalogHeap` path as SET NOT NULL.
+
+The constraint surfaces through the existing `pg_constraint` virtual builder (`catalog.go:3954`), which already renders
+`conname` from `NamedNotNullConstraint.Name` — so no builder change was needed; the explicit name flows straight
+through to pg_dump's `notnull_name`.
+
+Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `TestParseAlterTableAddNotNull`
+(parser AST: named, unnamed, and `NO INHERIT` forms) + `TestAlterTableAddNotNullNamed` (executor catalog state:
+explicit name retained, unnamed fallback to auto-name, idempotence, 42703 on missing column).
+
+> **Next (slice 272+):** a `NO INHERIT` NOT NULL on a standalone (non-inherited) table dumped inline as
+> `<col> <type> NOT NULL NO INHERIT` — exercises the `connoinherit='t'` rendering that `AddNotNull`'s `noInherit`
+> argument now threads but no dump path has yet asserted.
 
 ## Deferred (002–010) — catalog surface estimate
 

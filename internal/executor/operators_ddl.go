@@ -5446,6 +5446,56 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return fmt.Errorf("DDL catalog sync: %w", syncErr)
 				}
 			}
+		case parser.AlterTableAddNotNull:
+			// ADD [CONSTRAINT name] NOT NULL col — the named (PG18) counterpart
+			// of SET NOT NULL. Marks the column NOT NULL AND records a contype='n'
+			// constraint with the EXPLICIT name (auto-named when omitted). When
+			// the name differs from PG's default `<table>_<col>_not_null`,
+			// pg_dump prints the `CONSTRAINT <name> NOT NULL <col>` form
+			// (pg_dump.c:17228) instead of the unnamed `NOT NULL <col>` form. The
+			// pg_attribute.attnotnull flush goes through the same delete-old-rows
+			// + syncTableToCatalogHeap path as SET NOT NULL. DU-002 slice 271.
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					tbl.Columns[i].NotNull = true
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			// Idempotent: a column already carrying a NOT NULL constraint is left
+			// as-is (PG raises no error and adds no duplicate row).
+			hasNN := false
+			for _, nc := range tbl.NotNullConstraints {
+				if strings.EqualFold(nc.ColName, act.ColumnName) {
+					hasNN = true
+					break
+				}
+			}
+			if !hasNN {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					name := act.ConstraintName
+					if name == "" {
+						name = strings.ToLower(tbl.Name) + "_" + strings.ToLower(act.ColumnName) + "_not_null"
+					}
+					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), act.NoInherit, true, 0)
+				}
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
 		case parser.AlterTableAlterColumnType:
 			if err := o.execAlterColumnType(tbl, act); err != nil {
 				return err

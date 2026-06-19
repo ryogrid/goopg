@@ -5827,6 +5827,28 @@ object support.
         `0110-0001` Slice 270. **Next (slice 271+):** a *named* NOT NULL via `ADD CONSTRAINT <name> NOT NULL <col>` on an
         inherited column — the `CONSTRAINT <name> NOT NULL <col>` form (`notnull_constrs` carrying a non-default name).
 
+      - **PROGRESS 2026-06-20 (loop #38):** **DU-002 slice 271 LANDED — a *named* NOT NULL on an INHERITED column via
+        PG18's `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` round-trips through pg_dump as the
+        `CONSTRAINT <name> NOT NULL <col>` body form (new production support).** The named counterpart of slice 270's
+        unnamed `""` path. pg_dump reads the constraint's `conname` as `notnull_name` and, for a PG18 server, compares it
+        against the computed default `<tbl>_<col>_not_null` (`pg_dump.c:9926`); when they DIFFER, `notnull_constrs[j]`
+        keeps the real name and the standalone body emitter prints `CONSTRAINT <name> NOT NULL <col>` rather than the bare
+        `NOT NULL <col>` (`pg_dump.c:17228`). Verified vs real pg_dump 18.3: `idfnn_nn` differs from
+        `idfnn_child_pid_not_null` → `CONSTRAINT idfnn_nn NOT NULL pid` in the body, preceding `extra integer`. **Required
+        NEW production code:** the `ADD CONSTRAINT ... NOT NULL <col>` shape was previously unparseable (column-level NOT
+        NULL was only recognized inline). Added AST kind `AlterTableAddNotNull` + `NoInherit` field (`ast.go`), a `NOT NULL`
+        case in the ALTER TABLE ADD switch consuming `NOT NULL <col> [NO INHERIT]` (`ddl.go`), and an executor arm
+        (`operators_ddl.go`) that sets `Column.NotNull`, records a contype='n' constraint via `catalog.Table.AddNotNull`
+        with the EXPLICIT name (auto-name fallback when omitted; idempotent; 42703 on missing column), and flushes
+        `pg_attribute.attnotnull` via the delete-old-rows + `syncTableToCatalogHeap` path. The existing `pg_constraint`
+        virtual builder (`catalog.go:3954`) already renders `conname` from `NamedNotNullConstraint.Name` — no builder change
+        needed. **Guards:** `TestPort_PgDumpConnectionSetup` PASS (3.80s, byte-matches real pg_dump 18.3) +
+        `TestParseAlterTableAddNotNull` (parser AST: named/unnamed/NO INHERIT) + `TestAlterTableAddNotNullNamed` (executor
+        catalog state: explicit name retained, unnamed auto-name fallback, idempotence, 42703) + `go test ./internal/parser/
+        ./internal/executor/ ./internal/catalog/` PASS. gofmt + `go build ./...` clean; pgbench pre-commit smoke on commit.
+        Design: `0110-0001` Slice 271. **Next (slice 272+):** a `NO INHERIT` NOT NULL on a standalone table dumped inline as
+        `<col> <type> NOT NULL NO INHERIT` — exercises the `connoinherit='t'` rendering the new `noInherit` arg threads.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

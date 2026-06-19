@@ -5445,6 +5445,27 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		act.Kind = AlterTableAddUnique
 		return act, nil
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
+		// ADD [CONSTRAINT name] NOT NULL col [NO INHERIT] — PG18 named NOT NULL
+		// constraint. The named counterpart of `ALTER COLUMN col SET NOT NULL`:
+		// when ConstraintName differs from PG's auto-name (<table>_<col>_not_null)
+		// pg_dump prints `CONSTRAINT <name> NOT NULL <col>`. DU-002 slice 271.
+		p.advance() // consume NOT
+		if _, err := p.expectKeyword(KwNull); err != nil {
+			return AlterTableAction{}, err
+		}
+		colTok, err := p.parseIdent()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		act.ColumnName = identText(colTok)
+		// Optional `NO INHERIT` trailer (connoinherit='t').
+		if p.acceptIdentKeyword("no") {
+			_ = p.acceptIdentKeyword("inherit")
+			act.NoInherit = true
+		}
+		act.Kind = AlterTableAddNotNull
+		return act, nil
 	default:
 		// ADD [COLUMN] column_def — bare ident or COLUMN keyword.
 		if act.ConstraintName != "" {
