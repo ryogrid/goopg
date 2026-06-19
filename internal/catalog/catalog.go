@@ -649,6 +649,24 @@ type Table struct {
 	// (DU-002 slice 212).
 	AutovacuumMultixactFreezeTableAge    int
 	AutovacuumMultixactFreezeTableAgeSet bool
+
+	// AutovacuumVacuumCostLimit stores the table's
+	// `WITH (autovacuum_vacuum_cost_limit=N)` storage parameter — the eleventh
+	// INT-typed autovacuum-namespace reloption goopg round-trips, reusing the
+	// slice-198 integer path. PG's reloption type is RELOPT_TYPE_INT,
+	// RELOPT_KIND_HEAP | RELOPT_KIND_TOAST, with range 1–10000 and a default
+	// of -1 (= unset / use the GUC) (reloptions.c:1883/268). Unlike the freeze-age
+	// options the lower bound is 1, so 0 is below range and rejected; the WITH-clause
+	// parser already refuses negative values, leaving 0, above-range (10001) and
+	// non-integer as the reachable invalid cases. AutovacuumVacuumCostLimitSet — not a
+	// zero check — guards whether the option was specified (the parallel_workers
+	// pattern). When set, pg_class.reloptions gains the text[] element
+	// `autovacuum_vacuum_cost_limit=N`, which pg_dump renders back as
+	// `WITH (autovacuum_vacuum_cost_limit='N')`. goopg has no autovacuum, so
+	// the value is catalog/dump-only (advisory; runtime unaffected). M0110-0001
+	// (DU-002 slice 213).
+	AutovacuumVacuumCostLimit    int
+	AutovacuumVacuumCostLimitSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2425,6 +2443,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.AutovacuumMultixactFreezeTableAgeSet {
 				relopts = append(relopts, "autovacuum_multixact_freeze_table_age="+strconv.Itoa(t.AutovacuumMultixactFreezeTableAge))
+			}
+			if t.AutovacuumVacuumCostLimitSet {
+				relopts = append(relopts, "autovacuum_vacuum_cost_limit="+strconv.Itoa(t.AutovacuumVacuumCostLimit))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

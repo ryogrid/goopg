@@ -4678,6 +4678,25 @@ object support.
         `go build ./internal/...` clean; catalog/executor reloption tests PASS; `TestPort_PgDumpConnectionSetup`
         PASS; pgbench pre-commit smoke on commit. **Next:** `autovacuum_vacuum_cost_limit` 1–10000, or
         `user_catalog_table` bool; then `toast.*` namespace; or composite types (`CREATE TYPE AS`).
+      - **PROGRESS 2026-06-19 (loop #27):** **DU-002 slice 213 LANDED — eleventh INTEGER autovacuum-namespace
+        storage parameter (`autovacuum_vacuum_cost_limit`) round-trips through pg_dump.** Reuses the slice-198
+        integer path. `autovacuum_vacuum_cost_limit` is `RELOPT_TYPE_INT`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`,
+        default -1 (= unset / use the GUC), range 1–10000 (`reloptions.c:1883/268`). An
+        `AutovacuumVacuumCostLimitSet` flag records presence (parallel_workers pattern). Executor parses via
+        `strconv.Atoi`, rejecting non-integer / out-of-range (`< 1 || > 10000`) → `22023`; unlike the freeze-age
+        options the lower bound is 1, so `0` is below range and rejected — `0`, overflow (`10001`) and non-integer
+        are the reachable invalid cases. Persist `catalog.Table.AutovacuumVacuumCostLimit` (int); pg_class virtual
+        view appends `autovacuum_vacuum_cost_limit=N` after `autovacuum_multixact_freeze_table_age`; pg_dump
+        renders `WITH (autovacuum_vacuum_cost_limit='N')`. Advisory catalog/dump-only; base-table-only. Files:
+        `internal/catalog/catalog.go` (`Table.AutovacuumVacuumCostLimit`/`…Set` + render),
+        `internal/executor/operators_ddl.go` (extract/parse + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestAutovacuumVacuumCostLimitSurfacesInPgClassReloptions` + `TestAutovacuumVacuumCostLimitOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optavcl` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 213). No parser change needed. Gates: gofmt OK;
+        `go build ./internal/...` clean; catalog/executor reloption tests PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** `user_catalog_table` bool; then `toast.*` namespace;
+        or composite types (`CREATE TYPE AS`).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

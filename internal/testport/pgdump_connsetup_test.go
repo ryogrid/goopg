@@ -933,6 +933,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optamftaa: %v", err)
 	}
 
+	// Slice 213: the integer autovacuum_vacuum_cost_limit storage parameter
+	// (RELOPT_TYPE_INT, valid 1–10000, default -1 = unset), the eleventh INT-typed
+	// autovacuum-namespace reloption, reusing the slice-198 integer path (a separate
+	// set flag records presence). Unlike the freeze-age options the lower bound is 1,
+	// so 0 is below range and rejected. goopg stores
+	// catalog.Table.AutovacuumVacuumCostLimit; the pg_class virtual view renders
+	// `{autovacuum_vacuum_cost_limit=2500}`, which pg_dump emits as
+	// `WITH (autovacuum_vacuum_cost_limit='2500')`. goopg has no autovacuum, so the
+	// value is catalog/dump-only (advisory). `optavcl` carries it on its own table to
+	// keep the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optavcl (id integer PRIMARY KEY) WITH (autovacuum_vacuum_cost_limit=2500)"); err != nil {
+		t.Fatalf("create table optavcl: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2829,6 +2843,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (autovacuum_multixact_freeze_table_age='900000000')") {
 			t.Errorf("pg_dump dropped the autovacuum_multixact_freeze_table_age reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_multixact_freeze_table_age='900000000')", res.Stdout)
+		}
+		// **Slice 213 closed (asserted):** the integer autovacuum_vacuum_cost_limit
+		// storage parameter (RELOPT_TYPE_INT, valid 1–10000, default -1 = unset) — the
+		// eleventh INT-typed autovacuum-namespace reloption — must round-trip via the
+		// slice-198 integer path (a separate set flag records presence; unlike the
+		// freeze-age options the lower bound is 1, so 0 is below range and rejected).
+		// catalog.Table.AutovacuumVacuumCostLimit persists it and the pg_class virtual
+		// view renders `{autovacuum_vacuum_cost_limit=2500}`, which pg_dump emits as
+		// `WITH (autovacuum_vacuum_cost_limit='2500')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optavcl (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optavcl\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (autovacuum_vacuum_cost_limit='2500')") {
+			t.Errorf("pg_dump dropped the autovacuum_vacuum_cost_limit reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_vacuum_cost_limit='2500')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

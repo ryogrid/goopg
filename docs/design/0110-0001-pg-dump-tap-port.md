@@ -6143,6 +6143,27 @@ pg_dump fixture adds `optamftaa (… WITH (autovacuum_multixact_freeze_table_age
 own table; the assertion confirms the dump carries
 `WITH (autovacuum_multixact_freeze_table_age='900000000')`.
 
+### Slice 213 — eleventh INTEGER autovacuum reloption (`autovacuum_vacuum_cost_limit`) round-trip
+
+Adds the eleventh INT-typed autovacuum-namespace reloption, reusing the slice-198 integer path.
+`autovacuum_vacuum_cost_limit` is `RELOPT_TYPE_INT` with `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`
+and a default of **-1** (= unset / use the GUC), range `1`–`10000` (`reloptions.c:268/1883`;
+"Vacuum cost amount available before napping, for autovacuum"). An
+`AutovacuumVacuumCostLimitSet` flag records presence (the `parallel_workers` pattern). The
+executor parses with `strconv.Atoi`, rejecting non-integers and out-of-range values
+(`< 1 || > 10000`) with `22023`; unlike the freeze-age options the lower bound is **1**, so `0`
+is below range and rejected — `0`, overflow (`10001`) and non-integer are the reachable invalid
+cases. It persists `catalog.Table.AutovacuumVacuumCostLimit` (an `int`); the pg_class virtual
+view appends `autovacuum_vacuum_cost_limit=N` after `autovacuum_multixact_freeze_table_age`;
+pg_dump renders `WITH (autovacuum_vacuum_cost_limit='N')`. goopg has no autovacuum, so the value
+is advisory catalog/dump-only, base-table-only — same as the sibling reloption slices.
+
+Engine guards: `TestAutovacuumVacuumCostLimitSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,autovacuum_vacuum_cost_limit=2500}`; plain table → no reloptions) and
+`TestAutovacuumVacuumCostLimitOutOfBoundsRejected` (`0`/`10001`/`nope` → 22023). The pg_dump
+fixture adds `optavcl (… WITH (autovacuum_vacuum_cost_limit=2500))` on its own table; the
+assertion confirms the dump carries `WITH (autovacuum_vacuum_cost_limit='2500')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

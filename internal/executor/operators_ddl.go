@@ -1388,6 +1388,28 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		autovacuumMultixactFreezeTableAge = amfta
 		autovacuumMultixactFreezeTableAgeSet = true
 	}
+	// autovacuum_vacuum_cost_limit (RELOPT_TYPE_INT, range 1–10000,
+	// default -1 = unset; reloptions.c:1883/268). The lower bound is 1, so 0 is below
+	// range and rejected; a separate `set` flag records whether the option was present
+	// (the parallel_workers pattern). goopg has no autovacuum, so the value is purely
+	// catalog/dump state that round-trips through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_vacuum_cost_limit='N')`. M0110-0001 (DU-002 slice 213).
+	autovacuumVacuumCostLimit := 0
+	autovacuumVacuumCostLimitSet := false
+	if v, ok := s.With["autovacuum_vacuum_cost_limit"]; ok {
+		avcl, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_cost_limit\": %s", v)}
+		}
+		if avcl < 1 || avcl > 10000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_cost_limit\"", avcl),
+				Detail:  "Valid values are between \"1\" and \"10000\"."}
+		}
+		autovacuumVacuumCostLimit = avcl
+		autovacuumVacuumCostLimitSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1475,6 +1497,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.AutovacuumMultixactFreezeMaxAgeSet = autovacuumMultixactFreezeMaxAgeSet
 	tbl.AutovacuumMultixactFreezeTableAge = autovacuumMultixactFreezeTableAge
 	tbl.AutovacuumMultixactFreezeTableAgeSet = autovacuumMultixactFreezeTableAgeSet
+	tbl.AutovacuumVacuumCostLimit = autovacuumVacuumCostLimit
+	tbl.AutovacuumVacuumCostLimitSet = autovacuumVacuumCostLimitSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

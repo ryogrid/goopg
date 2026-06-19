@@ -1636,6 +1636,80 @@ func TestAutovacuumMultixactFreezeTableAgeOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+// TestAutovacuumVacuumCostLimitSurfacesInPgClassReloptions verifies that an
+// integer autovacuum_vacuum_cost_limit storage parameter is persisted on the
+// table, surfaces in pg_class.reloptions as `autovacuum_vacuum_cost_limit=N`,
+// and that an unset table reports no reloption. The valid range minimum is 1, so
+// presence is tracked by a flag rather than a zero check. DU-002 slice 213.
+func TestAutovacuumVacuumCostLimitSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE avcl (id integer PRIMARY KEY) WITH (fillfactor=70, autovacuum_vacuum_cost_limit=2500)`); err != nil {
+		t.Fatalf("CREATE TABLE avcl: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE avclplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE avclplain: %v", err)
+	}
+
+	avclTbl, ok := cat.LookupTable(parser.ObjectName{Name: "avcl"})
+	if !ok {
+		t.Fatal("avcl table not found")
+	}
+	if avclTbl.AutovacuumVacuumCostLimit != 2500 || !avclTbl.AutovacuumVacuumCostLimitSet {
+		t.Errorf("avcl limit = %d set=%v, want 2500 set=true", avclTbl.AutovacuumVacuumCostLimit, avclTbl.AutovacuumVacuumCostLimitSet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "avclplain"})
+	if !ok {
+		t.Fatal("avclplain table not found")
+	}
+	if plainTbl.AutovacuumVacuumCostLimitSet {
+		t.Errorf("avclplain set=%v, want false (unset)", plainTbl.AutovacuumVacuumCostLimitSet)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "avcl" || r[1] == "avclplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["avcl"] != "{fillfactor=70,autovacuum_vacuum_cost_limit=2500}" {
+		t.Errorf("pg_class.reloptions for avcl = %q, want %q", got["avcl"], "{fillfactor=70,autovacuum_vacuum_cost_limit=2500}")
+	}
+	if got["avclplain"] != "" {
+		t.Errorf("pg_class.reloptions for avclplain = %q, want \"\" (NULL)", got["avclplain"])
+	}
+}
+
+// TestAutovacuumVacuumCostLimitOutOfBoundsRejected verifies CREATE TABLE rejects a
+// below-min (< 1, e.g. 0), above-max (> 10000) or non-integer
+// autovacuum_vacuum_cost_limit with PG's 22023 error. Unlike the freeze-age options
+// the lower bound is 1, so 0 is a reachable invalid case. DU-002 slice 213.
+func TestAutovacuumVacuumCostLimitOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, v := range []string{"0", "10001", "nope"} {
+		err := runDDL(t, ctx, `CREATE TABLE avclbad`+strconv.Itoa(i)+` (id integer) WITH (autovacuum_vacuum_cost_limit=`+v+`)`)
+		if err == nil {
+			t.Errorf("autovacuum_vacuum_cost_limit=%s: expected an error, got nil", v)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("autovacuum_vacuum_cost_limit=%s: error type = %T, want *ExecError", v, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("autovacuum_vacuum_cost_limit=%s: error code = %q, want 22023", v, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.
