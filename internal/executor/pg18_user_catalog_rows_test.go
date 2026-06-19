@@ -1003,6 +1003,85 @@ func TestUserPGAttributeCompositeFieldEnum(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeCompositeFieldArray pins the ARRAY-field resolution for a
+// composite type (DU-002 slice 246). A composite field declared as an array
+// (`tags text[]`, `feelings mood[]`) must remap its element OID to the array
+// type's OID and stamp attndims=1, so pg_dump's dumpCompositeType renders the
+// field as `text[]` / `public.mood[]` rather than the scalar element type. A
+// built-in element folds through catalog.ArrayOIDForBase; an enum element folds
+// to its auto-generated array OID (et.ArrayOID). atttypmod must carry the
+// ELEMENT typmod so `amount numeric(10,2)[]` keeps its precision.
+func TestUserPGAttributeCompositeFieldArray(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		atttypmodIdx  = 5
+		attndimsIdx   = 6
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	et, err := cat.RegisterEnum("mood", []string{"sad", "ok", "happy"})
+	if err != nil {
+		t.Fatalf("RegisterEnum: %v", err)
+	}
+	// CREATE TYPE rec AS (tags text[], amount numeric(10,2)[], feelings mood[]):
+	// the parser records the array suffix as the three tokens "text [ ]" etc.
+	ct := cat.RegisterCompositeTypeWithFields("rec", []catalog.CompositeField{
+		{Name: "tags", ColType: "text [ ]"},
+		{Name: "amount", ColType: "numeric ( 10 , 2 ) [ ]"},
+		{Name: "feelings", ColType: "mood [ ]"},
+	})
+
+	// Built-in array element → _text (1009), varlena array shape, attndims=1.
+	a0 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[0], 1)
+	if got := uint32(a0[atttypidIdx].Int); got != catalog.OIDArrayText {
+		t.Errorf("text[] field: atttypid=%d want %d (_text)", got, catalog.OIDArrayText)
+	}
+	if got := a0[attndimsIdx].Int; got != 1 {
+		t.Errorf("text[] field: attndims=%d want 1", got)
+	}
+	if got := a0[attlenIdx].Int; got != -1 {
+		t.Errorf("text[] field: attlen=%d want -1 (varlena)", got)
+	}
+
+	// numeric(10,2)[] → _numeric, attndims=1, atttypmod carries the ELEMENT
+	// precision/scale (the same encoding numeric(10,2) yields for a scalar).
+	a1 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[1], 2)
+	if got := uint32(a1[atttypidIdx].Int); got != catalog.OIDArrayNumeric {
+		t.Errorf("numeric(10,2)[] field: atttypid=%d want %d (_numeric)", got, catalog.OIDArrayNumeric)
+	}
+	if got := a1[attndimsIdx].Int; got != 1 {
+		t.Errorf("numeric(10,2)[] field: attndims=%d want 1", got)
+	}
+	wantTypmod := pgAttTypmod(catalog.OIDNumeric, []int64{10, 2})
+	if got := a1[atttypmodIdx].Int; got != wantTypmod {
+		t.Errorf("numeric(10,2)[] field: atttypmod=%d want %d (element typmod)", got, wantTypmod)
+	}
+
+	// Enum array element → et.ArrayOID, attndims=1, varlena-array shape.
+	a2 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[2], 3)
+	if got := uint32(a2[atttypidIdx].Int); got != et.ArrayOID {
+		t.Errorf("mood[] field: atttypid=%d want %d (enum array OID)", got, et.ArrayOID)
+	}
+	if got := a2[attndimsIdx].Int; got != 1 {
+		t.Errorf("mood[] field: attndims=%d want 1", got)
+	}
+	if got := a2[attlenIdx].Int; got != -1 {
+		t.Errorf("mood[] field: attlen=%d want -1 (varlena)", got)
+	}
+	if got := a2[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("mood[] field: attbyval=%v want false", got)
+	}
+	if got := a2[attalignIdx].StringValue(); got != "i" {
+		t.Errorf("mood[] field: attalign=%q want \"i\"", got)
+	}
+	if got := a2[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("mood[] field: attstorage=%q want \"x\" (extended)", got)
+	}
+}
+
 // TestUserPGAttributeEnumArrayColumn pins the enum-ARRAY resolution (DU-002
 // slice 89). A `mood[]` column must report pg_attribute.atttypid = the enum's
 // auto-generated array OID (et.ArrayOID = et.OID+1), attndims=1, and carry a

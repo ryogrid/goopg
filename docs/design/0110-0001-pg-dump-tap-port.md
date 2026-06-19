@@ -7115,6 +7115,45 @@ age int);` then `pg_dump --schema-only` emits `feeling public.mood` (was `feelin
 > limitation). The clean first dump is correct; the duplication only appears after restoring twice into the
 > shared heap. Independent of enum-field resolution — this slice adds no rows and does not allocate OIDs.
 
+### Slice 246 — composite field whose type is an array (built-in or enum)
+
+Slices 243–245 resolved scalar composite field types (built-in, then user-defined enum). An **array**
+field (`tags text[]`, `amount numeric(10,2)[]`, `feelings mood[]`) was still broken in both directions:
+`parseCompositeFieldType` never looked for the `[]` suffix, so it folded the whole token string
+(`"text [ ]"`, as the parser tokenizes the brackets) through `TypeNameToOID` to the `text` fallback and
+dumped the field as the scalar element type. This slice mirrors the table-column array path (slices 62–83
+for built-ins, slice 89 for enums) for composite fields.
+
+- **`parseCompositeFieldType`** now detects and strips an array suffix (the first `[` after the optional
+  type modifier), returning a fourth `bool` reporting array-ness; the OID/typmod/base it returns describe
+  the **element** type. atttypmod is the element typmod, so `numeric(10,2)[]` round-trips its precision.
+- **`buildUserPGAttributeRowForCompositeField`** remaps the element OID to the array type's OID and stamps
+  `attndims=1`: a built-in element via `catalog.ArrayOIDForBase` (e.g. `text` → `_text` 1009), an enum
+  element via `et.ArrayOID` (the auto-generated `_mood`, already written to `pg_type` by
+  `syncEnumTypeToCatalogHeap` at enum-create time, slice 89). The array's physical layout comes from
+  `userTypeAttrsForOID(arrayOID)` for built-ins; an enum array gets the standard varlena-array shape
+  (`attlen=-1`, int-aligned, extended storage). `format_type` renders the array OID as `text[]` /
+  `public.mood[]` (enum arrays via `LookupEnumByArrayOID`, slice 89), so `dumpCompositeType` emits the
+  array spelling.
+- **Scope**: one-dimensional arrays of built-in or enum elements. Domain-typed fields, multi-dimensional
+  arrays, and nested-composite fields remain on their fallbacks — later slices.
+
+Guarded by `executor.TestUserPGAttributeCompositeFieldArray` (`pg18_user_catalog_rows_test.go`): a
+`text[]` field → `_text` + `attndims=1` + varlena shape, a `numeric(10,2)[]` field carrying the element
+typmod, and a `mood[]` field → `et.ArrayOID` + `attndims=1` + varlena-array shape. No new `pg_type` rows
+or OID allocations — the array element types (built-in `_text`/`_numeric`, enum `_mood`) already exist.
+Verified live (port 5546): `CREATE TYPE rec2 AS (tags text[], scores int[], feelings mood[], note text)`
+then `pg_dump --schema-only` emits `tags text[]`, `scores integer[]`, `feelings public.mood[]` (each was
+the scalar element type before this slice).
+
+> **Observed (out of scope, pre-existing parser gap):** the composite-type field-list grammar
+> (`parser.parseCreateType`) collects each field's type tokens until the first `,` or `)`, so a field
+> whose type carries a **typmod** (`amount numeric(10,2)[]`, `code varchar(8)`) fails to parse — the
+> `(10,2)` commas/parens terminate the field early. The catalog-row builder *does* handle typmod composite
+> fields (the unit test constructs the `"numeric ( 10 , 2 ) [ ]"` ColType directly), but they cannot reach
+> it through SQL until the parser balances parentheses inside a composite field's type. Tracked for a
+> future slice; independent of array resolution.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

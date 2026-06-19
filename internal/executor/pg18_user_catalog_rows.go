@@ -1348,8 +1348,22 @@ func buildUserPGTypeRowForCompositeArray(ct *catalog.CompositeType) Row {
 // The collapsed base type name is returned as the third value so callers can
 // re-resolve a user-defined field type (enum/domain) that TypeNameToOID folded
 // to the text fallback. DU-002 slice 245.
-func parseCompositeFieldType(colType string) (uint32, int64, string) {
-	base := strings.TrimSpace(colType)
+// An array suffix (`text[]`, tokenized by the parser as the three tokens
+// `text [ ]`) is detected and stripped; the fourth return value reports whether
+// the field is an array, and the returned OID/typmod/base describe the ELEMENT
+// type so the caller can remap to the array OID (built-in via ArrayOIDForBase,
+// enum via et.ArrayOID) and stamp attndims=1. DU-002 slice 246.
+func parseCompositeFieldType(colType string) (uint32, int64, string, bool) {
+	s := strings.TrimSpace(colType)
+	// Strip any array suffix before parsing the element type. The suffix appears
+	// after the optional type modifier, e.g. "numeric ( 10 , 2 ) [ ]", so the
+	// first '[' marks the start of the array brackets regardless of typmod.
+	isArray := false
+	if i := strings.IndexByte(s, '['); i >= 0 {
+		isArray = true
+		s = strings.TrimSpace(s[:i])
+	}
+	base := s
 	var args []int64
 	if i := strings.IndexByte(base, '('); i >= 0 {
 		inner := base[i+1:]
@@ -1372,7 +1386,7 @@ func parseCompositeFieldType(colType string) (uint32, int64, string) {
 	// TypeNameToOID recognises.
 	base = strings.Join(strings.Fields(base), " ")
 	typOID := catalog.TypeNameToOID(base)
-	return typOID, pgAttTypmod(typOID, args), base
+	return typOID, pgAttTypmod(typOID, args), base, isArray
 }
 
 // buildUserPGClassRowForComposite builds the 34-column PG18-canonical pg_class
@@ -1438,18 +1452,52 @@ func buildUserPGClassRowForComposite(cat catalog.Catalog, ct *catalog.CompositeT
 // dumpCompositeType renders the field as the enum type rather than `text`. The
 // physical attrs match buildUserPGTypeRowForEnum's shape (4-byte, int-aligned,
 // plain-storage, non-collatable, like oid). DU-002 slice 245.
+//
+// An ARRAY field (`tags text[]`, `feelings mood[]`) remaps the element OID to
+// the array type's OID and stamps attndims=1, mirroring the table-column array
+// path: a built-in element folds through catalog.ArrayOIDForBase (e.g. text →
+// _text 1009), an enum element folds to its auto-generated array OID
+// (et.ArrayOID). atttypmod carries the ELEMENT typmod (computed from the base
+// OID before the remap), so `amount numeric(10,2)[]` round-trips its precision.
+// The array's physical layout comes from userTypeAttrsForOID(arrayOID) for
+// built-ins; an enum array gets the standard varlena-array shape (-1 length,
+// int-aligned, extended storage). DU-002 slice 246.
 func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.CompositeType, field catalog.CompositeField, attnum int) Row {
-	typOID, typmod, base := parseCompositeFieldType(field.ColType)
+	typOID, typmod, base, isArray := parseCompositeFieldType(field.ColType)
 	enumOID := uint32(0)
+	enumArrayOID := uint32(0)
 	if cat != nil && typOID == catalog.OIDText {
 		if et, ok := cat.LookupEnum(base); ok {
-			typOID = et.OID
-			enumOID = et.OID
+			if isArray {
+				enumArrayOID = et.ArrayOID
+			} else {
+				typOID = et.OID
+				enumOID = et.OID
+			}
+		}
+	}
+	attndims := int64(0)
+	if isArray {
+		switch {
+		case enumArrayOID != 0:
+			// Enum array OIDs are dynamic, so ArrayOIDForBase can't case on them.
+			typOID = enumArrayOID
+			attndims = 1
+		default:
+			if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
+				typOID = aoid
+				attndims = 1
+			}
 		}
 	}
 	attrs := userTypeAttrsForOID(typOID)
-	if enumOID != 0 {
+	switch {
+	case enumOID != 0:
 		attrs = userTypeAttrs{TypLen: 4, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
+	case enumArrayOID != 0:
+		// An enum's array type is a standard varlena array: -1 length,
+		// int-aligned (matching the 4-byte enum element), extended storage.
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
 	}
 	return Row{
 		NewIntDatum(int64(ct.RelOID)),            // attrelid
@@ -1458,7 +1506,7 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		NewIntDatum(int64(attrs.TypLen)),         // attlen
 		NewIntDatum(int64(attnum)),               // attnum (1-based)
 		NewIntDatum(typmod),                      // atttypmod
-		NewIntDatum(0),                           // attndims
+		NewIntDatum(attndims),                    // attndims
 		NewBoolDatum(attrs.TypByVal),             // attbyval
 		NewStringDatum(string(attrs.TypAlign)),   // attalign
 		NewStringDatum(string(attrs.TypStorage)), // attstorage

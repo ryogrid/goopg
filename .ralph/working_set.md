@@ -1,29 +1,31 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 245 (loop #11) — composite field whose type is a USER-DEFINED
-ENUM now renders as the enum type in pg_dump (was `text`). Mirrors table-column slice 88.
+Last landed: DU-002 slice 246 (loop #12) — composite field whose type is an ARRAY
+(built-in or enum) now round-trips through pg_dump. Mirrors table-column array path
+(slices 62–83 built-ins, slice 89 enum).
 
 Mechanism:
-- parseCompositeFieldType (pg18_user_catalog_rows.go) now also returns the collapsed base
-  type name (3rd return value).
-- buildUserPGAttributeRowForCompositeField gained a `cat catalog.Catalog` first param; when
-  the field folds to OIDText, cat.LookupEnum(base) re-resolves atttypid to the enum scalar OID
-  and overrides physical attrs to enum shape {TypLen:4, ByVal:false, Align:'i', Storage:'p'}.
-  nil catalog → text fallback preserved.
-- Call site operators_ddl.go syncCompositeTypeToCatalogHeap passes ctx.Catalog.
+- parseCompositeFieldType (pg18_user_catalog_rows.go) now detects+strips the `[]` suffix
+  (first '[' after the optional typmod), returns a 4th bool isArray; OID/typmod/base
+  describe the ELEMENT type.
+- buildUserPGAttributeRowForCompositeField: when isArray, remaps to the array OID
+  (built-in via catalog.ArrayOIDForBase, enum via et.ArrayOID) and stamps attndims=1.
+  Built-in array attrs from userTypeAttrsForOID(arrayOID); enum array gets varlena-array
+  shape {TypLen:-1, ByVal:false, Align:'i', Storage:'x'}.
 
-Files: internal/executor/pg18_user_catalog_rows.go, operators_ddl.go (1 call site),
-pg18_user_catalog_rows_test.go (+TestUserPGAttributeCompositeFieldEnum, 3 call-site fixups);
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 245).
+Files: internal/executor/pg18_user_catalog_rows.go, pg18_user_catalog_rows_test.go
+(+TestUserPGAttributeCompositeFieldArray); docs/design/0110-0001-pg-dump-tap-port.md (Slice 246).
 
-Gates: gofmt clean; go build ./internal/... clean; executor package tests PASS (full);
-live-verified port 5544 (pg_dump emits `feeling public.mood`, was `feeling text`); pgbench
-pre-commit smoke on commit.
+Gates: gofmt clean; go build ./internal/... clean; executor pkg tests PASS (full);
+live-verified port 5546 (pg_dump emits `tags text[]`, `scores integer[]`,
+`feelings public.mood[]`); pgbench pre-commit smoke on commit.
 
-OBSERVED pre-existing (out of slice scope): pg_dump goopg→restore into a SECOND goopg db
-duplicates composite pg_attribute/pg_type rows — shared catalog heap, no per-db isolation for
-CREATE TYPE writes. Clean first dump is correct; duplication only after a 2nd restore.
+OBSERVED pre-existing PARSER gap (out of slice scope): parser.parseCreateType collects a
+composite field's type tokens until the first ','/')' , so a typmod field
+(`amount numeric(10,2)[]`, `code varchar(8)`) FAILS TO PARSE via SQL. The catalog-row
+builder handles it (unit test builds the ColType directly), but it's unreachable until the
+parser balances parens inside a composite field type. → candidate next slice.
 
-Next (slice 246+): enum-ARRAY composite field (mirror slice 89: et.ArrayOID, attndims=1,
-varlena-array attrs), then DOMAIN field (slice 90: DeclaredTypeName→cat.LookupDomain, base
-physical layout), then nested-composite field. Then ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE.
+Next (slice 247+): fix composite-field typmod parsing (parser parens-balance), then DOMAIN
+composite field (slice 90 analog: DeclaredTypeName→cat.LookupDomain), then nested-composite
+field. Then ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE.
