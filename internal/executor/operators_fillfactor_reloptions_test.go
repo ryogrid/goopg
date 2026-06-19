@@ -1987,6 +1987,102 @@ func TestVacuumMaxEagerFreezeFailureRateOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+// TestVacuumIndexCleanupSurfacesInPgClassReloptions verifies that a
+// `WITH (vacuum_index_cleanup=V)` storage parameter — a PG18 heap reloption and
+// goopg's first ENUM reloption (RELOPT_TYPE_ENUM; auto/on/off/true/false/yes/no/1/0
+// accepted case-insensitively) — declared on CREATE TABLE is persisted on the
+// catalog table and surfaced through the pg_class virtual view's reloptions cell.
+// Unlike the bool/int/float reloptions, the value is stored VERBATIM (trimmed), so
+// `=on` round-trips as `=on` (not normalized to `=true`), matching PG's
+// pg_class.reloptions which preserves the literal input text. Cases pin: an enum
+// value alongside fillfactor (combined `{fillfactor=70,vacuum_index_cleanup=on}`),
+// an alias spelling that is NOT normalized to its canonical member (`yes` stays
+// `yes`, unlike the bool reloptions which canonicalize to true/false), and a plain
+// table (no reloptions). pg_dump renders the array back as
+// `WITH (vacuum_index_cleanup='on')`. goopg has no autovacuum, so the value is
+// catalog/dump-only. DU-002 slice 217.
+func TestVacuumIndexCleanupSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE vic (id integer PRIMARY KEY) WITH (fillfactor=70, vacuum_index_cleanup=on)`); err != nil {
+		t.Fatalf("CREATE TABLE vic: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE vicyes (id integer PRIMARY KEY) WITH (vacuum_index_cleanup=yes)`); err != nil {
+		t.Fatalf("CREATE TABLE vicyes: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE vicplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE vicplain: %v", err)
+	}
+
+	vicTbl, ok := cat.LookupTable(parser.ObjectName{Name: "vic"})
+	if !ok {
+		t.Fatal("vic table not found")
+	}
+	if vicTbl.VacuumIndexCleanup != "on" || !vicTbl.VacuumIndexCleanupSet {
+		t.Errorf("vic cleanup = %q set=%v, want \"on\" set=true", vicTbl.VacuumIndexCleanup, vicTbl.VacuumIndexCleanupSet)
+	}
+	yesTbl, ok := cat.LookupTable(parser.ObjectName{Name: "vicyes"})
+	if !ok {
+		t.Fatal("vicyes table not found")
+	}
+	if yesTbl.VacuumIndexCleanup != "yes" || !yesTbl.VacuumIndexCleanupSet {
+		t.Errorf("vicyes cleanup = %q set=%v, want \"yes\" set=true (alias not normalized)", yesTbl.VacuumIndexCleanup, yesTbl.VacuumIndexCleanupSet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "vicplain"})
+	if !ok {
+		t.Fatal("vicplain table not found")
+	}
+	if plainTbl.VacuumIndexCleanupSet {
+		t.Errorf("vicplain set=%v, want false (unset)", plainTbl.VacuumIndexCleanupSet)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "vic" || r[1] == "vicyes" || r[1] == "vicplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["vic"] != "{fillfactor=70,vacuum_index_cleanup=on}" {
+		t.Errorf("pg_class.reloptions for vic = %q, want %q", got["vic"], "{fillfactor=70,vacuum_index_cleanup=on}")
+	}
+	if got["vicyes"] != "{vacuum_index_cleanup=yes}" {
+		t.Errorf("pg_class.reloptions for vicyes = %q, want %q", got["vicyes"], "{vacuum_index_cleanup=yes}")
+	}
+	if got["vicplain"] != "" {
+		t.Errorf("pg_class.reloptions for vicplain = %q, want \"\" (NULL)", got["vicplain"])
+	}
+}
+
+// TestVacuumIndexCleanupInvalidRejected verifies CREATE TABLE rejects an
+// unrecognized vacuum_index_cleanup enum value with PG's 22023 error. The valid
+// spellings are auto/on/off/true/false/yes/no/1/0 (case-insensitive); anything else
+// is invalid. DU-002 slice 217.
+func TestVacuumIndexCleanupInvalidRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, av := range []string{"maybe", "2", "auot"} {
+		err := runDDL(t, ctx, `CREATE TABLE vicbad`+strconv.Itoa(i)+` (id integer) WITH (vacuum_index_cleanup=`+av+`)`)
+		if err == nil {
+			t.Errorf("vacuum_index_cleanup=%s: expected an error, got nil", av)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("vacuum_index_cleanup=%s: error type = %T, want *ExecError", av, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("vacuum_index_cleanup=%s: error code = %q, want 22023", av, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.

@@ -4755,6 +4755,29 @@ object support.
         PASS; pgbench pre-commit smoke on commit. **Next:** remaining heap reloption `vacuum_index_cleanup`
         (enum auto/on/off; NEW `RELOPT_TYPE_ENUM` path); then `toast.*` namespace (needs toast-table pg_class
         modeling — `reltoastrelid` hardcoded 0); or composite types (`CREATE TYPE AS`; pg_class.reltype hardcoded 0).
+      - **PROGRESS 2026-06-19 (loop #32):** **DU-002 slice 217 LANDED — ENUM `vacuum_index_cleanup`
+        storage parameter round-trips through pg_dump (goopg's FIRST enum reloption).** It is a PG18 heap
+        reloption (`RELOPT_TYPE_ENUM`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`, `reloptions.c:519`) with members
+        `auto`/`on`/`off`/`true`/`false`/`yes`/`no`/`1`/`0` (case-insensitive; `StdRdOptIndexCleanupValues`,
+        `reloptions.c:487`), default `auto`. Executor validates the lowercased value against that set, rejects
+        anything else → `22023` (message lists `on`/`off`/`auto`). Unlike the bool/int/float reloptions, the value
+        is stored **verbatim** (trimmed) on `catalog.Table.VacuumIndexCleanup` (string) with NO re-canonicalization,
+        so alias `yes` round-trips as `=yes` (not normalized to `=true`/`=on`), mirroring PG's
+        `pg_class.reloptions` which preserves the literal text. A `VacuumIndexCleanupSet` flag records presence
+        (`auto` is a legal explicit value, no reserved sentinel). pg_class virtual view appends
+        `vacuum_index_cleanup=V` after `vacuum_max_eager_freeze_failure_rate`; pg_dump renders
+        `WITH (vacuum_index_cleanup='V')`. goopg has no autovacuum, so advisory catalog/dump-only; base-table-only.
+        (goopg's parser already lowercases bareword option values, so `OFF`→`off`; the meaningful guard is
+        absence-of-alias-normalization, not case.) Files: `internal/catalog/catalog.go`
+        (`Table.VacuumIndexCleanup`/`…Set` + render), `internal/executor/operators_ddl.go` (extract/validate +
+        persist), `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestVacuumIndexCleanupSurfacesInPgClassReloptions` + `TestVacuumIndexCleanupInvalidRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optvic` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 217). No parser change needed. Gates: gofmt OK;
+        `go build ./internal/...` clean; catalog/executor reloption tests PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** `toast.*` namespace (BIGGER: real pg_dump reads
+        `tc.reloptions` from the toast table's pg_class row, but goopg hardcodes `reltoastrelid=0` → needs
+        toast-table pg_class modeling); or composite types (`CREATE TYPE AS`; pg_class.reltype hardcoded 0).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

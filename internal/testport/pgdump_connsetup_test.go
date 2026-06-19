@@ -986,6 +986,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optvefr: %v", err)
 	}
 
+	// Slice 217: the ENUM vacuum_index_cleanup storage parameter — a PG18 heap
+	// reloption (RELOPT_TYPE_ENUM, members auto/on/off/true/false/yes/no/1/0,
+	// default auto), goopg's first enum reloption. The value is stored verbatim
+	// (no alias normalization) on catalog.Table.VacuumIndexCleanup; the pg_class
+	// virtual view renders `{vacuum_index_cleanup=on}`, which pg_dump emits as
+	// `WITH (vacuum_index_cleanup='on')`. goopg has no autovacuum, so the value is
+	// catalog/dump-only (advisory). `optvic` carries it on its own table to keep
+	// the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optvic (id integer PRIMARY KEY) WITH (vacuum_index_cleanup=on)"); err != nil {
+		t.Fatalf("create table optvic: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2935,6 +2947,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (vacuum_max_eager_freeze_failure_rate='0.1')") {
 			t.Errorf("pg_dump dropped the vacuum_max_eager_freeze_failure_rate reloption; missing %q\n  full stdout=%q", "WITH (vacuum_max_eager_freeze_failure_rate='0.1')", res.Stdout)
+		}
+		// **Slice 217 closed (asserted):** the ENUM vacuum_index_cleanup storage
+		// parameter (RELOPT_TYPE_ENUM, members auto/on/off/true/false/yes/no/1/0,
+		// default auto; a PG18 heap reloption — goopg's first enum reloption) must
+		// round-trip with no alias normalization. catalog.Table.VacuumIndexCleanup
+		// persists the verbatim value and the pg_class virtual view renders
+		// `{vacuum_index_cleanup=on}`, which pg_dump emits as
+		// `WITH (vacuum_index_cleanup='on')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optvic (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optvic\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (vacuum_index_cleanup='on')") {
+			t.Errorf("pg_dump dropped the vacuum_index_cleanup reloption; missing %q\n  full stdout=%q", "WITH (vacuum_index_cleanup='on')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

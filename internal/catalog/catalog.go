@@ -715,6 +715,25 @@ type Table struct {
 	// M0110-0001 (DU-002 slice 216).
 	VacuumMaxEagerFreezeFailureRate    float64
 	VacuumMaxEagerFreezeFailureRateSet bool
+
+	// VacuumIndexCleanup stores the table's `WITH (vacuum_index_cleanup=V)`
+	// storage parameter — a PG18 heap reloption (RELOPT_TYPE_ENUM,
+	// RELOPT_KIND_HEAP | RELOPT_KIND_TOAST, reloptions.c:519) controlling whether
+	// VACUUM performs index vacuuming and cleanup. This is goopg's first ENUM
+	// reloption: PG accepts the spellings auto/on/off/true/false/yes/no/1/0
+	// (StdRdOptIndexCleanupValues, reloptions.c:487) case-insensitively, with a
+	// default of "auto". Unlike the bool/int/float reloptions, goopg stores the
+	// value verbatim (trimmed) rather than re-rendering a canonical form, matching
+	// PG's pg_class.reloptions which preserves the literal input text — so
+	// `WITH (vacuum_index_cleanup=on)` round-trips as `=on`, not `=true`.
+	// VacuumIndexCleanupSet guards presence (there is no reserved sentinel string,
+	// and "auto" is itself a legal explicit value). When set, pg_class.reloptions
+	// gains the text[] element `vacuum_index_cleanup=V`, which pg_dump renders back
+	// as `WITH (vacuum_index_cleanup='V')`. goopg has no autovacuum, so the value
+	// is catalog/dump-only (advisory; runtime unaffected). M0110-0001
+	// (DU-002 slice 217).
+	VacuumIndexCleanup    string
+	VacuumIndexCleanupSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2503,6 +2522,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.VacuumMaxEagerFreezeFailureRateSet {
 				relopts = append(relopts, "vacuum_max_eager_freeze_failure_rate="+strconv.FormatFloat(t.VacuumMaxEagerFreezeFailureRate, 'g', -1, 64))
+			}
+			if t.VacuumIndexCleanupSet {
+				relopts = append(relopts, "vacuum_index_cleanup="+t.VacuumIndexCleanup)
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

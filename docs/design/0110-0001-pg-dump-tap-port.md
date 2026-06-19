@@ -6231,6 +6231,33 @@ Engine guards: `TestVacuumMaxEagerFreezeFailureRateSurfacesInPgClassReloptions` 
 fixture adds `optvefr (… WITH (vacuum_max_eager_freeze_failure_rate=0.1))` on its own table; the
 assertion confirms the dump carries `WITH (vacuum_max_eager_freeze_failure_rate='0.1')`.
 
+### Slice 217 — ENUM `vacuum_index_cleanup` reloption round-trip
+
+Adds the `vacuum_index_cleanup` storage parameter — goopg's **first ENUM reloption**. It is a
+**PG18** heap reloption (`RELOPT_TYPE_ENUM`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`,
+`reloptions.c:519`; "Controls index vacuuming and index cleanup") whose accepted spellings are
+`auto`/`on`/`off`/`true`/`false`/`yes`/`no`/`1`/`0` (case-insensitive; `StdRdOptIndexCleanupValues`,
+`reloptions.c:487`) with a default of `auto`. The executor validates the lowercased value against
+that member set and rejects anything else with `22023` (message lists the canonical `on`/`off`/`auto`
+members, matching PG's enum-error text). Unlike the bool/int/float reloptions, the value is stored
+**verbatim** (trimmed) on `catalog.Table.VacuumIndexCleanup` (a `string`) — there is no
+re-canonicalization, so an alias like `yes` round-trips as `=yes`, not normalized to `=true`/`=on`,
+mirroring PG's `pg_class.reloptions` which preserves the literal input text. A
+`VacuumIndexCleanupSet` flag records presence (`auto` is itself a legal explicit value, so there is
+no reserved sentinel string). The pg_class virtual view appends `vacuum_index_cleanup=V` after
+`vacuum_max_eager_freeze_failure_rate`; pg_dump renders `WITH (vacuum_index_cleanup='V')`. goopg has
+no autovacuum, so the value is advisory catalog/dump-only, base-table-only — same as the sibling
+reloption slices. (Note: goopg's parser already lowercases bareword option values, so a bareword
+`OFF` arrives as `off`; case is only preserved when relevant. The meaningful distinction this slice
+guards is the *absence of alias normalization*, not case.)
+
+Engine guards: `TestVacuumIndexCleanupSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,vacuum_index_cleanup=on}`; alias `yes` → `{vacuum_index_cleanup=yes}` not normalized;
+plain table → no reloptions) and `TestVacuumIndexCleanupInvalidRejected`
+(`maybe`/`2`/`auot` → 22023). The pg_dump fixture adds
+`optvic (… WITH (vacuum_index_cleanup=on))` on its own table; the assertion confirms the dump carries
+`WITH (vacuum_index_cleanup='on')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

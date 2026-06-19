@@ -1483,6 +1483,36 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		vacuumMaxEagerFreezeFailureRate = vmefr
 		vacuumMaxEagerFreezeFailureRateSet = true
 	}
+	// Extract and validate the vacuum_index_cleanup storage parameter — a PG18
+	// heap reloption (RELOPT_TYPE_ENUM, RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+	// reloptions.c:519) controlling whether VACUUM performs index vacuuming and
+	// cleanup. This is goopg's first ENUM reloption. PG accepts the spellings
+	// auto/on/off/true/false/yes/no/1/0 case-insensitively
+	// (StdRdOptIndexCleanupValues, reloptions.c:487); an unrecognized value is a
+	// 22023 error whose message lists the canonical members. Unlike the
+	// bool/int/float reloptions, the value is stored VERBATIM (trimmed) rather
+	// than re-rendered to a canonical form, mirroring PG's pg_class.reloptions
+	// which preserves the literal input text (so `=on` round-trips as `=on`, not
+	// `=true`). A separate `set` flag records presence ("auto" is a legal
+	// explicit value with no reserved sentinel). goopg has no autovacuum, so the
+	// value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (vacuum_index_cleanup='V')`.
+	// M0110-0001 (DU-002 slice 217).
+	vacuumIndexCleanup := ""
+	vacuumIndexCleanupSet := false
+	if v, ok := s.With["vacuum_index_cleanup"]; ok {
+		trimmed := strings.TrimSpace(v)
+		switch strings.ToLower(trimmed) {
+		case "auto", "on", "off", "true", "false", "yes", "no", "1", "0":
+			// accepted enum spelling
+		default:
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for enum option \"vacuum_index_cleanup\": %s", trimmed),
+				Detail:  "Valid values are \"on\", \"off\", and \"auto\"."}
+		}
+		vacuumIndexCleanup = trimmed
+		vacuumIndexCleanupSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1578,6 +1608,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.AutovacuumVacuumMaxThresholdSet = autovacuumVacuumMaxThresholdSet
 	tbl.VacuumMaxEagerFreezeFailureRate = vacuumMaxEagerFreezeFailureRate
 	tbl.VacuumMaxEagerFreezeFailureRateSet = vacuumMaxEagerFreezeFailureRateSet
+	tbl.VacuumIndexCleanup = vacuumIndexCleanup
+	tbl.VacuumIndexCleanupSet = vacuumIndexCleanupSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
