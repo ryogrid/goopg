@@ -7232,9 +7232,38 @@ fallback; the pg_dump TAP port seeds `CREATE TYPE public.nested_comp AS (label t
 the existing `addr` composite) and asserts `pg_dump --schema-only` renders the field as `location
 public.addr`, byte-matching real pg_dump 18.3.
 
-> **Next (slice 250+):** a composite-typed ARRAY field (`addr[]`), then domain array types as their own
-> feature (allocate the `_name` array OID at `CREATE DOMAIN`, sync its `pg_type` row, render domain-array
-> columns/fields), then `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE`.
+### Slice 250 — composite field whose type is an ARRAY of another composite (`addr[]`)
+
+Slice 249 resolved a scalar nested-composite field. A field declared as an **array of** another
+user-defined composite (`stops addr[]`) folds to the `text` fallback in `parseCompositeFieldType` *with the
+array suffix detected* (`isArray=true`), so without re-resolution the array switch degraded it to the
+built-in `text[]` (`ArrayOIDForBase(OIDText)` → 1009) and `dumpCompositeType` emitted `stops text[]`. The
+inner composite's auto-generated `_name` array `pg_type` row already exists (synced at `CREATE TYPE`, slice
+242), so this mirrors the enum-array field path (slice 246/89).
+
+- **`buildUserPGAttributeRowForCompositeField`** — the nested-composite re-resolve now also handles the
+  array case: a still-`text` field that `cat.LookupCompositeType(base)` matches resolves to the inner
+  composite's `ArrayOID` (recorded as `compositeArrayOID`) when `isArray`, else to its scalar `OID` (slice
+  249). The array switch gains a `case compositeArrayOID != 0` (dynamic OID, like the enum-array case) that
+  sets `atttypid = compositeArrayOID`, `attndims=1`; the attrs switch gains a matching case with the
+  varlena-array layout (`attlen=-1`, `attbyval=false`, `attalign='d'` — double-aligned to match the
+  composite element — `attstorage='x'`).
+- **`catalog`** — new `LookupCompositeTypeByArrayOID(oid)` (promoted onto the `Catalog` interface, mirroring
+  `LookupEnumByArrayOID`) so `format_type`'s fallback in `expr.go` renders the composite array OID as
+  `public.<inner>[]` (the `else if` after the `LookupCompositeTypeByOID` scalar branch).
+- **Scope**: still excludes a DOMAIN-ARRAY field, which blocks on domain array types goopg does not
+  synthesize anywhere yet (a separate feature, not a single dump slice).
+
+Guarded at two levels: `executor.TestUserPGAttributeCompositeFieldCompositeArray` pins atttypid → inner
+composite array OID, `attndims=1`, the varlena-array layout, the `LookupCompositeTypeByArrayOID` inverse
+(and that the scalar OID does NOT resolve via the array path), and the nil-catalog `text[]` fallback; the
+pg_dump TAP port seeds `CREATE TYPE public.route AS (name text, stops addr[])` (over the existing `addr`
+composite) and asserts `pg_dump --schema-only` renders the field as `stops public.addr[]` (and never `stops
+text[]`), byte-matching real pg_dump 18.3.
+
+> **Next (slice 251+):** domain array types as their own feature (allocate the `_name` array OID at `CREATE
+> DOMAIN`, sync its `pg_type` row, render domain-array columns/fields), then `ALTER TYPE …
+> ADD/DROP/ALTER ATTRIBUTE`.
 
 ## Deferred (002–010) — catalog surface estimate
 

@@ -1210,6 +1210,11 @@ type Catalog interface {
 	// OID, used by format_type to render a nested-composite column's declared
 	// type as its schema-qualified name. DU-002 slice 249.
 	LookupCompositeTypeByOID(oid uint32) (*CompositeType, bool)
+	// LookupCompositeTypeByArrayOID finds a user-defined composite type by the
+	// pg_type OID of its auto-generated array type (`_name`), used by format_type
+	// to render a composite-array field (`addr[]`) as the schema-qualified array
+	// name. DU-002 slice 250.
+	LookupCompositeTypeByArrayOID(oid uint32) (*CompositeType, bool)
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -7506,6 +7511,21 @@ func (c *InMemory) LookupCompositeTypeByOID(oid uint32) (*CompositeType, bool) {
 	defer c.mu.RUnlock()
 	for _, ct := range c.compositeTypes {
 		if ct.OID == oid {
+			return ct, true
+		}
+	}
+	return nil, false
+}
+
+// LookupCompositeTypeByArrayOID finds a composite type by the pg_type OID of its
+// auto-generated array type (`_name`). Used by format_type to render a
+// composite-array field (`addr[]`) as the schema-qualified array name. DU-002
+// slice 250.
+func (c *InMemory) LookupCompositeTypeByArrayOID(oid uint32) (*CompositeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, ct := range c.compositeTypes {
+		if ct.ArrayOID == oid {
 			return ct, true
 		}
 	}

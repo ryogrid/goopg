@@ -2396,6 +2396,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TYPE public.nested_comp AS (label text, location addr)"); err != nil {
 		t.Fatalf("create type nested_comp: %v", err)
 	}
+	// Slice 250: a composite field whose declared type is an ARRAY of another
+	// user-defined composite (`stops addr[]`). Like the scalar nested-composite
+	// case it folds to the text fallback in parseCompositeFieldType, but with the
+	// array suffix detected. The pg_attribute builder re-resolves it to the inner
+	// composite's auto-generated array OID (cat.LookupCompositeType().ArrayOID),
+	// attndims=1, varlena-array layout, so dumpCompositeType renders the field via
+	// format_type as `public.addr[]` rather than `text[]`. public.addr was created
+	// above, so this composite follows it (lower OID dumps first).
+	if err := runSQLSimple(t, c, "CREATE TYPE public.route AS (name text, stops addr[])"); err != nil {
+		t.Fatalf("create type route: %v", err)
+	}
 	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in)"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
@@ -5178,6 +5189,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE TYPE public.nested_comp AS (",
 			"\tlabel text,",
 			"\tlocation public.addr",
+			// Slice 250: a composite field whose type is an ARRAY of another
+			// composite renders as the schema-qualified composite array name,
+			// not `text[]`.
+			"CREATE TYPE public.route AS (",
+			"\tname text,",
+			"\tstops public.addr[]",
 		}
 		for _, sub := range compositeDefs {
 			if !strings.Contains(res.Stdout, sub) {
@@ -5188,6 +5205,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// TYPE (the isarray subquery suppresses it, like `_mood`).
 		if strings.Contains(res.Stdout, "CREATE TYPE public._addr") {
 			t.Errorf("pg_dump emitted the auto-generated composite array type as a separate CREATE TYPE\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 250: the composite-array field must not degrade to text[].
+		if strings.Contains(res.Stdout, "stops text[]") {
+			t.Errorf("pg_dump rendered the composite-array field as text[] (slice-250 array OID resolution regressed)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 90 (asserted):** a DOMAIN and a column using it must round-trip.
 		// The CREATE DOMAIN statement must carry NO spurious `DEFAULT ` clause

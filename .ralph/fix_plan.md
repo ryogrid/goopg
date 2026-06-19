@@ -5375,6 +5375,26 @@ object support.
         synthesize anywhere yet (a separate feature, not a single dump slice). **Next (slice 250+):**
         composite-typed ARRAY field (`addr[]`), then domain array types as their own feature, then `ALTER
         TYPE … ADD/DROP/ALTER ATTRIBUTE`.
+      - **PROGRESS 2026-06-20 (loop #16):** **DU-002 slice 250 LANDED — composite field whose type is an
+        ARRAY of another COMPOSITE type (`stops addr[]`) round-trips through `pg_dump`.** Slice 249 resolved
+        the scalar nested-composite field; an array of a composite folded to the `text` fallback with
+        `isArray=true`, so the array switch degraded it to the built-in `text[]` (`ArrayOIDForBase(OIDText)`
+        → 1009) and `dumpCompositeType` emitted `stops text[]`. Fix mirrors the enum-array field path
+        (slice 246/89): `buildUserPGAttributeRowForCompositeField` re-resolve now handles the array case —
+        `cat.LookupCompositeType(base)` → inner composite's `ArrayOID` (`compositeArrayOID`) when `isArray`,
+        scalar `OID` otherwise; the array switch gains `case compositeArrayOID != 0` (`atttypid=ArrayOID`,
+        `attndims=1`) and the attrs switch a matching varlena-array layout (`attlen=-1`, `attbyval=false`,
+        `attalign='d'`, `attstorage='x'`). New `catalog.LookupCompositeTypeByArrayOID` (on the `Catalog`
+        interface, mirrors `LookupEnumByArrayOID`) lets `format_type`'s fallback render the array OID as
+        `public.<inner>[]`. Inner composite's `_name` array `pg_type` row already exists (slice 242) → no new
+        OID alloc. Guards: `executor.TestUserPGAttributeCompositeFieldCompositeArray` (atttypid→inner array
+        OID, `attndims=1`, varlena-array layout, `LookupCompositeTypeByArrayOID` inverse + scalar-OID
+        non-resolution, nil-cat `text[]` fallback) + pg_dump TAP port seeds `CREATE TYPE public.route AS
+        (name text, stops addr[])` and asserts round-trip of `stops public.addr[]` (never `text[]`)
+        (`TestPort_PgDumpConnectionSetup` PASS, 3.6s). Design: `0110-0001` Slice 250. pgbench pre-commit
+        smoke on commit. **Next (slice 251+):** domain array types as their own feature (allocate `_name`
+        array OID at `CREATE DOMAIN`, sync `pg_type` row, render domain-array columns/fields), then `ALTER
+        TYPE … ADD/DROP/ALTER ATTRIBUTE`.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

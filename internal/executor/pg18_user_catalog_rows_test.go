@@ -1227,6 +1227,77 @@ func TestUserPGAttributeCompositeFieldNestedComposite(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeCompositeFieldCompositeArray pins the COMPOSITE-ARRAY-FIELD
+// resolution (DU-002 slice 250). A composite field whose declared type is an
+// array of another user-defined composite type (`addr[]`) folds to the text
+// fallback inside parseCompositeFieldType (the parser records the raw composite
+// name + `[ ]` suffix in ColType). The builder must re-resolve it to the inner
+// composite's auto-generated array pg_type OID (ct.ArrayOID), report attndims=1
+// and the varlena-array layout (-1 length, double-aligned, extended storage), so
+// pg_dump renders the field as `public.addr[]` rather than `text[]`.
+// LookupCompositeTypeByArrayOID is the inverse used by format_type. Without the
+// catalog (cat==nil) it must keep the text fallback.
+func TestUserPGAttributeCompositeFieldCompositeArray(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		attndimsIdx   = 6
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	inner := cat.RegisterCompositeTypeWithFields("addr", []catalog.CompositeField{
+		{Name: "street", ColType: "text"},
+		{Name: "zip", ColType: "text"},
+	})
+	// Outer composite: CREATE TYPE route AS (name text, stops addr[]). The parser
+	// records the array suffix space-joined, matching slice 246/247.
+	outer := cat.RegisterCompositeTypeWithFields("route", []catalog.CompositeField{
+		{Name: "name", ColType: "text"},
+		{Name: "stops", ColType: "addr [ ]"},
+	})
+
+	// Composite-array field → inner composite ARRAY OID + varlena-array layout.
+	a1 := buildUserPGAttributeRowForCompositeField(cat, outer, outer.Fields[1], 2)
+	if got := uint32(a1[atttypidIdx].Int); got != inner.ArrayOID {
+		t.Errorf("stops field: atttypid=%d want %d (inner composite array OID)", got, inner.ArrayOID)
+	}
+	if got := a1[attndimsIdx].Int; got != 1 {
+		t.Errorf("stops field: attndims=%d want 1", got)
+	}
+	if got := a1[attlenIdx].Int; got != -1 {
+		t.Errorf("stops field: attlen=%d want -1 (varlena array)", got)
+	}
+	if got := a1[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("stops field: attbyval=%v want false", got)
+	}
+	if got := a1[attalignIdx].StringValue(); got != "d" {
+		t.Errorf("stops field: attalign=%q want \"d\" (double-aligned)", got)
+	}
+	if got := a1[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("stops field: attstorage=%q want \"x\" (extended)", got)
+	}
+
+	// LookupCompositeTypeByArrayOID is the inverse used by format_type. The array
+	// OID resolves to the composite; the SCALAR OID must NOT resolve via the array
+	// path (it is reached through LookupCompositeTypeByOID instead).
+	if got, ok := cat.LookupCompositeTypeByArrayOID(inner.ArrayOID); !ok || got.Name != "addr" {
+		t.Errorf("LookupCompositeTypeByArrayOID(%d)=%v,%v want addr,true", inner.ArrayOID, got, ok)
+	}
+	if _, ok := cat.LookupCompositeTypeByArrayOID(inner.OID); ok {
+		t.Errorf("LookupCompositeTypeByArrayOID(scalar composite OID) unexpectedly resolved")
+	}
+
+	// Without a catalog the inner composite cannot be resolved, so the array
+	// suffix degrades to the built-in text array (`text[]`, OID 1009), the same
+	// fallback an unknown scalar element would take through ArrayOIDForBase.
+	aNil := buildUserPGAttributeRowForCompositeField(nil, outer, outer.Fields[1], 2)
+	if got := uint32(aNil[atttypidIdx].Int); got != catalog.OIDArrayText {
+		t.Errorf("stops field (nil cat): atttypid=%d want %d (text[] fallback)", got, catalog.OIDArrayText)
+	}
+}
+
 // TestUserPGAttributeEnumArrayColumn pins the enum-ARRAY resolution (DU-002
 // slice 89). A `mood[]` column must report pg_attribute.atttypid = the enum's
 // auto-generated array OID (et.ArrayOID = et.OID+1), attndims=1, and carry a

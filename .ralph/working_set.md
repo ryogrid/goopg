@@ -1,36 +1,32 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 249 (loop #15) — composite type FIELD whose type is
-itself another user-defined COMPOSITE type (nested composite) now dumps as the
-schema-qualified composite name (public.addr), not text. Mirrors enum/domain
-field paths (slices 245/248).
+Last landed: DU-002 slice 250 (loop #16) — composite type FIELD whose type is an
+ARRAY of another user-defined COMPOSITE type (`stops addr[]`) now dumps as the
+schema-qualified composite array name (`public.addr[]`), not `text[]`. Mirrors the
+enum-array field path (slice 246/89).
 
 Mechanism:
 - buildUserPGAttributeRowForCompositeField (internal/executor/pg18_user_catalog_rows.go):
-  after the domain re-resolve, a still-text scalar field calls cat.LookupCompositeType(base)
-  → inner composite OID (atttypid). attrs = pass-by-ref varlena (-1, byval=false,
-  align 'd', storage 'x', matching buildUserPGTypeRowForComposite); atttypmod -1.
-- catalog: LookupCompositeType promoted onto the Catalog interface (row builder
-  takes the interface) + new LookupCompositeTypeByOID so format_type's fallback
-  (expr.go ~L8828) renders the OID as public.<inner> (mirrors enum/domain branches).
-- Inner composite's pg_type rows already exist (slice 242) → no new OID alloc.
+  the nested-composite re-resolve now handles isArray — cat.LookupCompositeType(base)
+  → inner composite ArrayOID (compositeArrayOID) when isArray, scalar OID otherwise.
+  Array switch: `case compositeArrayOID != 0` (atttypid=ArrayOID, attndims=1).
+  Attrs switch: matching varlena-array layout (-1, byval=false, align 'd', storage 'x').
+- catalog: new LookupCompositeTypeByArrayOID (Catalog iface + InMemory), mirrors
+  LookupEnumByArrayOID. expr.go format_type fallback adds an else-if branch rendering
+  the array OID as public.<inner>[].
+- Inner composite's _name array pg_type row already exists (slice 242) → no OID alloc.
 
-Files: internal/catalog/catalog.go (interface + LookupCompositeTypeByOID),
-internal/executor/expr.go (format_type composite branch),
-internal/executor/pg18_user_catalog_rows.go (re-resolve + attrs case),
-internal/executor/pg18_user_catalog_rows_test.go (+TestUserPGAttributeCompositeFieldNestedComposite),
-internal/testport/pgdump_connsetup_test.go (nested_comp fixture + compositeDefs assertion),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 249).
+Files: internal/catalog/catalog.go (iface + LookupCompositeTypeByArrayOID),
+internal/executor/expr.go (format_type composite-array branch),
+internal/executor/pg18_user_catalog_rows.go (re-resolve + array switch + attrs case),
+internal/executor/pg18_user_catalog_rows_test.go (+TestUserPGAttributeCompositeFieldCompositeArray),
+internal/testport/pgdump_connsetup_test.go (route fixture + compositeDefs + text[] negative assert),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 250), .ralph/fix_plan.md (progress note).
 
-Gates: gofmt clean; go build ./... clean; catalog+executor unit tests PASS;
-TestPort_PgDumpConnectionSetup PASS (3.8s, real pg_dump round-trips
-`location public.addr`); pgbench pre-commit smoke on commit.
+Gates: gofmt clean; go build ./... clean; catalog+executor unit suites PASS;
+TestPort_PgDumpConnectionSetup PASS (3.6s, real pg_dump round-trips `stops public.addr[]`);
+pgbench pre-commit smoke on commit.
 
-REORDER NOTE: domain-array field (previously listed as slice 249) deferred — it
-blocks on domain array types, which goopg does not synthesize anywhere yet (a
-separate feature, not a dump slice).
-
-Next (slice 250+): composite-typed ARRAY field (addr[]) — element OID via
-ct.ArrayOID (already synced, slice 242), attndims=1, format_type via a new
-LookupCompositeTypeByArrayOID branch. Then domain array types as their own
-feature. Then ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE.
+Next (slice 251+): domain ARRAY types as their own feature — allocate the `_name`
+array OID at CREATE DOMAIN, sync its pg_type row, render domain-array columns/fields.
+Then ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE.

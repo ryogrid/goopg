@@ -1510,11 +1510,21 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 	// is a pass-by-ref varlena (typlen=-1, byval=false, double-aligned, extended
 	// storage), matching buildUserPGTypeRowForComposite. Scalar only, mirroring
 	// the enum/domain paths. DU-002 slice 249.
+	// An array of a user-defined composite type (`addr[]`) also folds to the
+	// text fallback. Resolve to the inner composite's auto-generated array
+	// pg_type OID (ArrayOID, synced at CREATE TYPE) so format_type renders the
+	// field as `public.<inner>[]`; the physical attrs are a standard varlena
+	// array over the double-aligned composite element. DU-002 slice 250.
 	nestedComposite := false
-	if cat != nil && typOID == catalog.OIDText && !isArray {
+	compositeArrayOID := uint32(0)
+	if cat != nil && typOID == catalog.OIDText {
 		if ict := cat.LookupCompositeType(base); ict != nil {
-			nestedComposite = true
-			typOID = ict.OID
+			if isArray {
+				compositeArrayOID = ict.ArrayOID
+			} else {
+				nestedComposite = true
+				typOID = ict.OID
+			}
 		}
 	}
 	attndims := int64(0)
@@ -1523,6 +1533,10 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		case enumArrayOID != 0:
 			// Enum array OIDs are dynamic, so ArrayOIDForBase can't case on them.
 			typOID = enumArrayOID
+			attndims = 1
+		case compositeArrayOID != 0:
+			// Composite array OIDs are dynamic too. DU-002 slice 250.
+			typOID = compositeArrayOID
 			attndims = 1
 		default:
 			if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
@@ -1539,6 +1553,11 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		// An enum's array type is a standard varlena array: -1 length,
 		// int-aligned (matching the 4-byte enum element), extended storage.
 		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case compositeArrayOID != 0:
+		// An array of a composite type is a standard varlena array: -1 length,
+		// double-aligned (matching the double-aligned composite element),
+		// extended storage. DU-002 slice 250.
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	case domain != nil:
 		// A domain inherits its base type's physical layout, resolved exactly as
 		// buildUserPGTypeRowForDomain does (BaseOID, else TypeNameToOID(Base.Name);

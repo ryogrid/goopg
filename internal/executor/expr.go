@@ -8838,6 +8838,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					// `<field> public.<inner>` rather than the text fallback.
 					// DU-002 slice 249.
 					name = "public." + ct.Name
+				} else if ct, ok := ctx.Catalog.LookupCompositeTypeByArrayOID(uint32(typeOID)); ok {
+					// A composite-array field (`addr[]`) carries the composite's
+					// auto-generated array OID; render it as the schema-qualified
+					// array name so the dump round-trips as `public.addr[]`, not
+					// `text[]`. DU-002 slice 250.
+					name = "public." + ct.Name + "[]"
 				}
 			}
 			return NewStringDatum(name), nil
