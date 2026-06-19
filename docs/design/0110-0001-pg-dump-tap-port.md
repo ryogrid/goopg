@@ -6836,8 +6836,35 @@ Engine guard: the `optoast` fixture now carries all thirteen options (including 
 confirms the combined thirteen-element `WITH` clause and that no `pg_toast_*` relation leaks.
 `TestPort_PgDumpConnectionSetup` PASS.
 
-**Next:** the `toast.` autovacuum reloption surface is now complete (`autovacuum_analyze_*` are
-`RELOPT_KIND_HEAP`-only, so PG rejects the `toast.` prefix — do not add). After: composite types.
+**Next:** three `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` insert-vacuum options remain
+(`autovacuum_vacuum_insert_threshold`, `autovacuum_vacuum_max_threshold`,
+`autovacuum_vacuum_insert_scale_factor` — see slice 237); the `analyze_*` options are
+`RELOPT_KIND_HEAP`-only (PG rejects the `toast.` prefix — do not add).
+
+### Slice 237 — `RELOPT_KIND_TOAST` insert-vacuum *integer* reloption (`toast.autovacuum_vacuum_insert_threshold`)
+
+Adds `toast.autovacuum_vacuum_insert_threshold`, extending the TOAST reloptions array to fourteen elements.
+`autovacuum_vacuum_insert_threshold` is `RELOPT_TYPE_INT` and shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`
+(`reloptions.c:245/1879`, range `-1–INT_MAX`, default `-2` = unset; `-1` disables insert vacuums), so PG
+accepts the `toast.` prefix and stores it (without prefix) on the TOAST relation's `pg_class.reloptions`.
+Like `log_autovacuum_min_duration`, both `-1` and `0` are valid explicit values (floor `-1` not `0`),
+mirroring the parent-table arm (slice 204).
+
+- **Executor** (`operators_ddl.go`): one extra gather block after the slice-236
+  `toast.log_autovacuum_min_duration` arm: `strconv.Atoi` + `-1 ≤ N ≤ 2147483647` bounds check
+  (non-int or out-of-range → 22023), appended to `toastReloptions` as
+  `autovacuum_vacuum_insert_threshold=<N>` (no prefix) via `strconv.Itoa`.
+- **catalog** (`catalog.go`): no change — the existing `strings.Join` over `t.ToastReloptions` renders the
+  fourteen-element array ending in `…,log_autovacuum_min_duration=-1,autovacuum_vacuum_insert_threshold=1000}`.
+
+On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) order:
+`WITH (..., toast.log_autovacuum_min_duration='-1', toast.autovacuum_vacuum_insert_threshold='1000')`.
+
+Engine guard: the `optoast` fixture now carries all fourteen options; the assertion confirms the combined
+fourteen-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
+
+**Next:** the two remaining HEAP|TOAST insert-vacuum options (`toast.autovacuum_vacuum_max_threshold` int,
+`toast.autovacuum_vacuum_insert_scale_factor` real) on the same pattern; then composite types.
 
 ## Deferred (002–010) — catalog surface estimate
 

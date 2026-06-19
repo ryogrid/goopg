@@ -5177,6 +5177,23 @@ object support.
         PASS; pgbench pre-commit smoke on commit. **Next:** `toast.` autovacuum reloption surface COMPLETE
         (`autovacuum_analyze_*` are `RELOPT_KIND_HEAP`-only → PG rejects `toast.` prefix; do NOT add). After:
         composite types.
+      - **PROGRESS 2026-06-19 (loop #3):** **DU-002 slice 237 LANDED — `RELOPT_KIND_TOAST` insert-vacuum
+        *integer* reloption (`toast.autovacuum_vacuum_insert_threshold`) round-trips; fourteen-element TOAST
+        reloptions array.** Corrects the slice-236 "surface complete" note: three HEAP|TOAST insert-vacuum
+        options were missed (only the `analyze_*` pair is HEAP-only). `autovacuum_vacuum_insert_threshold` is
+        `RELOPT_TYPE_INT`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:245/1879`, range `-1–INT_MAX`,
+        default `-2`); both `-1` and `0` valid (floor `-1`, mirrors parent-table arm slice 204). **Executor**
+        (`operators_ddl.go`): one gather block after the slice-236 `toast.log_autovacuum_min_duration` arm —
+        `strconv.Atoi` + `-1 ≤ N ≤ 2147483647` (non-int/out-of-range → 22023), appended as
+        `autovacuum_vacuum_insert_threshold=<N>`. **catalog**: NO change. On dump-out →
+        `WITH (..., toast.autovacuum_vacuum_insert_threshold='1000')`. Files:
+        `internal/executor/operators_ddl.go` (toast int gather block),
+        `internal/testport/pgdump_connsetup_test.go` (`optoast` fixture = 14 options + updated combined-WITH
+        assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 237). Gates: gofmt OK;
+        `go build ./internal/...` clean; executor reloption + `TestPort_PgDumpConnectionSetup` PASS; pgbench
+        pre-commit smoke on commit. **Next:** the two remaining HEAP|TOAST insert-vacuum options
+        (`toast.autovacuum_vacuum_max_threshold` int, `toast.autovacuum_vacuum_insert_scale_factor` real);
+        then composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
