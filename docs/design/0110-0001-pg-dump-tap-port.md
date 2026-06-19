@@ -6072,6 +6072,29 @@ Engine guards: `TestAutovacuumFreezeTableAgeSurfacesInPgClassReloptions` (combin
 fixture adds `optafta (… WITH (autovacuum_freeze_table_age=150000000))` on its own table; the
 assertion confirms the dump carries `WITH (autovacuum_freeze_table_age='150000000')`.
 
+### Slice 210 — eighth INTEGER autovacuum reloption (`autovacuum_multixact_freeze_min_age`) round-trip
+
+Opens the multixact freeze-age subfamily for the eighth INT-typed autovacuum-namespace
+reloption, reusing the slice-198 integer path. `autovacuum_multixact_freeze_min_age` is
+`RELOPT_TYPE_INT` with `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` and a default of **-1**
+(= unset / use the GUC), range `0`–`1000000000` (`reloptions.c:281/1891`; "Minimum multixact
+age at which VACUUM should freeze a row multixact's, for autovacuum"). Because `0` is a valid
+explicit value, an `AutovacuumMultixactFreezeMinAgeSet` flag — not a zero check — records
+presence (the `parallel_workers` pattern). The executor parses with `strconv.Atoi`, rejecting
+non-integers and out-of-range values (`< 0 || > 1000000000`) with `22023`; negatives are
+rejected even earlier by the parser as a syntax error. It persists
+`catalog.Table.AutovacuumMultixactFreezeMinAge` (an `int`); the pg_class virtual view appends
+`autovacuum_multixact_freeze_min_age=N` after `autovacuum_freeze_table_age`; pg_dump renders
+`WITH (autovacuum_multixact_freeze_min_age='N')`. goopg has no autovacuum, so the value is
+advisory catalog/dump-only, base-table-only — same as the sibling reloption slices.
+
+Engine guards: `TestAutovacuumMultixactFreezeMinAgeSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,autovacuum_multixact_freeze_min_age=5000000}`; plain table → no reloptions) and
+`TestAutovacuumMultixactFreezeMinAgeOutOfBoundsRejected` (`1000000001`/`nope` → 22023). The
+pg_dump fixture adds `optamfma (… WITH (autovacuum_multixact_freeze_min_age=5000000))` on its
+own table; the assertion confirms the dump carries
+`WITH (autovacuum_multixact_freeze_min_age='5000000')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

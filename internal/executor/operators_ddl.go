@@ -1319,6 +1319,29 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		autovacuumFreezeTableAge = afta
 		autovacuumFreezeTableAgeSet = true
 	}
+	// autovacuum_multixact_freeze_min_age (RELOPT_TYPE_INT, range 0–1000000000,
+	// default -1 = unset; reloptions.c:1891/281). 0 is a valid explicit value, so a
+	// separate `set` flag records whether the option was present (the
+	// parallel_workers pattern) rather than a zero check. goopg has no autovacuum,
+	// so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_multixact_freeze_min_age='N')`.
+	// M0110-0001 (DU-002 slice 210).
+	autovacuumMultixactFreezeMinAge := 0
+	autovacuumMultixactFreezeMinAgeSet := false
+	if v, ok := s.With["autovacuum_multixact_freeze_min_age"]; ok {
+		amfma, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_multixact_freeze_min_age\": %s", v)}
+		}
+		if amfma < 0 || amfma > 1000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_multixact_freeze_min_age\"", amfma),
+				Detail:  "Valid values are between \"0\" and \"1000000000\"."}
+		}
+		autovacuumMultixactFreezeMinAge = amfma
+		autovacuumMultixactFreezeMinAgeSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1400,6 +1423,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.AutovacuumFreezeMaxAgeSet = autovacuumFreezeMaxAgeSet
 	tbl.AutovacuumFreezeTableAge = autovacuumFreezeTableAge
 	tbl.AutovacuumFreezeTableAgeSet = autovacuumFreezeTableAgeSet
+	tbl.AutovacuumMultixactFreezeMinAge = autovacuumMultixactFreezeMinAge
+	tbl.AutovacuumMultixactFreezeMinAgeSet = autovacuumMultixactFreezeMinAgeSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
