@@ -5581,6 +5581,30 @@ object support.
         **Next (slice 259+):** multi-subcommand `ALTER TYPE` (`ADD …, DROP …`) / per-attribute COLLATE via
         `ALTER TYPE … ALTER ATTRIBUTE … COLLATE`.
 
+      - **PROGRESS 2026-06-20 (loop #25):** **DU-002 slice 259 LANDED — a per-attribute `COLLATE` on
+        `ALTER TYPE … ALTER ATTRIBUTE attname TYPE newtype COLLATE "POSIX"` now round-trips through pg_dump.** Slice 256
+        re-typed a composite field in place but **stub-consumed** the trailing `COLLATE`/`USING`/`CASCADE`/`RESTRICT`,
+        silently dropping a re-typed attribute's collation from the dump. Fix reuses slices 256 + 257 — the only gap
+        was the parser discarding the already-recognized `COLLATE` keyword. **Parser** (`parseAlterType` ALTER
+        ATTRIBUTE branch, `ddl.go`) — the type-token loop already stops at a top-level `COLLATE` ident keyword (slice
+        256); instead of stub-consuming it, the branch now parses the optional `COLLATE <name>` via the shared
+        `parseCollationName` (bare `"C"` / schema-qualified `pg_catalog."C"` → bare last component) into the new
+        `AlterTypeStmt.AlterAttrCollation`; remaining `USING`/`CASCADE`/`RESTRICT` stay stub-consumed. **Executor**
+        (`execAlterType` ALTER ATTRIBUTE, `operators_ddl.go`) — alongside `newFields[idx].ColType = s.AlterAttrType`,
+        the branch now sets `newFields[idx].Collation = s.AlterAttrCollation`, matching PG semantics (re-typing
+        replaces the type so the prior collation no longer applies: explicit `COLLATE` sets the new one, absence resets
+        to the new type's default/empty). The OID-stable re-sync (`RegisterCompositeTypeWithFields` +
+        `syncCompositeTypeToCatalogHeap`) stamps `attcollation` from `field.Collation` (C→950/POSIX→951, non-collatable
+        suppressed) exactly as the ADD/CREATE paths. **No pg_dump-side change** — `dumpCompositeType` re-emits
+        `COLLATE pg_catalog."<name>"` inline when `attcollation <> typcollation`. Guards:
+        `parser.TestAlterTypeAlterAttributeParsing` extended with `AlterAttrCollation` assertions (bare `COLLATE "C"`,
+        `SET DATA TYPE varchar(8) COLLATE "POSIX"`, schema-qualified `pg_catalog."C"`, `CASCADE`-only → empty) +
+        pg_dump TAP port re-types the slice-258 `cc` field via `ALTER TYPE public.alt_comp ALTER ATTRIBUTE cc TYPE text
+        COLLATE "POSIX"`, flipping its dumped clause `COLLATE pg_catalog."C"` → `COLLATE pg_catalog."POSIX"`
+        (`TestPort_PgDumpConnectionSetup` PASS, 3.7s). Parser+executor unit suites PASS. Design: `0110-0001` Slice 259.
+        pgbench pre-commit smoke on commit. **Next (slice 260+):** multi-subcommand `ALTER TYPE` (`ADD …, DROP …` in
+        one command).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

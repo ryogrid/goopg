@@ -2143,6 +2143,8 @@ type AlterTypeStmt struct {
 	// type field in place. DU-002 slice 256.
 	AlterAttrName string // attribute whose type changes (empty when not ALTER ATTRIBUTE)
 	AlterAttrType string // its new type string (space-joined, e.g. "numeric ( 12 , 3 )")
+	// Optional per-attribute COLLATE on ALTER ATTRIBUTE … TYPE (empty when none). DU-002 slice 259.
+	AlterAttrCollation string
 }
 
 func (s *AlterTypeStmt) Pos() int  { return s.pos }

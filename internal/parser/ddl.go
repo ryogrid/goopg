@@ -5713,7 +5713,13 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 				p.advance()
 			}
 			stmt.AlterAttrType = strings.Join(typeParts, " ")
-			// Consume any trailing COLLATE / USING / CASCADE|RESTRICT / further
+			// Optional COLLATE <name> on the new type — captured so the re-typed
+			// attribute's collation round-trips through pg_dump. DU-002 slice 259.
+			if p.acceptIdentKeyword("collate") {
+				collName, _ := p.parseCollationName()
+				stmt.AlterAttrCollation = collName
+			}
+			// Consume any trailing USING / CASCADE|RESTRICT / further
 			// subcommands as a stub.
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {

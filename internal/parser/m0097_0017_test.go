@@ -299,19 +299,23 @@ func TestAlterTypeDropAttributeParsing(t *testing.T) {
 
 // TestAlterTypeAlterAttributeParsing covers DU-002 slice 256: ALTER TYPE …
 // ALTER ATTRIBUTE attname [SET DATA] TYPE newtype [COLLATE/USING/CASCADE/RESTRICT].
-// The type tokens are paren-tracked (so numeric(12,3) survives) and the trailing
-// COLLATE/USING/behavior clause is stub-consumed (not folded into the type).
+// The type tokens are paren-tracked (so numeric(12,3) survives). A trailing
+// COLLATE clause is captured into AlterAttrCollation (DU-002 slice 259), keeping
+// the type clean; USING/CASCADE/RESTRICT remain stub-consumed.
 func TestAlterTypeAlterAttributeParsing(t *testing.T) {
 	tests := []struct {
 		sql      string
 		wantName string
 		wantType string
+		wantColl string
 	}{
-		{`ALTER TYPE alt_comp ALTER ATTRIBUTE a TYPE bigint`, "a", "bigint"},
-		{`ALTER TYPE alt_comp ALTER ATTRIBUTE a SET DATA TYPE bigint`, "a", "bigint"},
-		{`ALTER TYPE alt_comp ALTER ATTRIBUTE b TYPE numeric(12,3)`, "b", "numeric ( 12 , 3 )"},
-		{`ALTER TYPE alt_comp ALTER ATTRIBUTE b TYPE text COLLATE "C"`, "b", "text"},
-		{`ALTER TYPE alt_comp ALTER ATTRIBUTE b TYPE varchar(64) CASCADE`, "b", "varchar ( 64 )"},
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE a TYPE bigint`, "a", "bigint", ""},
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE a SET DATA TYPE bigint`, "a", "bigint", ""},
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE b TYPE numeric(12,3)`, "b", "numeric ( 12 , 3 )", ""},
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE b TYPE text COLLATE "C"`, "b", "text", "C"},
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE b SET DATA TYPE varchar(8) COLLATE "POSIX"`, "b", "varchar ( 8 )", "POSIX"},
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE b TYPE text COLLATE pg_catalog."C"`, "b", "text", "C"},
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE b TYPE varchar(64) CASCADE`, "b", "varchar ( 64 )", ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.sql[:min(60, len(tc.sql))], func(t *testing.T) {
@@ -330,6 +334,9 @@ func TestAlterTypeAlterAttributeParsing(t *testing.T) {
 			if at.AlterAttrName != tc.wantName || at.AlterAttrType != tc.wantType {
 				t.Errorf("ALTER ATTRIBUTE = {%q, %q}, want {%q, %q}",
 					at.AlterAttrName, at.AlterAttrType, tc.wantName, tc.wantType)
+			}
+			if at.AlterAttrCollation != tc.wantColl {
+				t.Errorf("AlterAttrCollation = %q, want %q", at.AlterAttrCollation, tc.wantColl)
 			}
 		})
 	}

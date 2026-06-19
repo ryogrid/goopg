@@ -10453,6 +10453,10 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		newFields := make([]catalog.CompositeField, len(ct.Fields))
 		copy(newFields, ct.Fields)
 		newFields[idx].ColType = s.AlterAttrType
+		// ALTER ATTRIBUTE … TYPE replaces the attribute's type, so the prior
+		// collation no longer applies: set it from an explicit COLLATE clause if
+		// present (DU-002 slice 259), else reset to the new type's default (empty).
+		newFields[idx].Collation = s.AlterAttrCollation
 		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
 			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
 			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)

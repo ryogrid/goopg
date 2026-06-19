@@ -2476,6 +2476,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, `ALTER TYPE public.alt_comp ADD ATTRIBUTE cc text COLLATE "C"`); err != nil {
 		t.Fatalf("alter type alt_comp add attribute cc collate C: %v", err)
 	}
+	// Slice 259: ALTER ATTRIBUTE … TYPE with a per-attribute COLLATE. Re-typing
+	// `cc` (currently text COLLATE "C") to text COLLATE "POSIX" replaces the
+	// attribute's type AND collation in place, so the re-synced heap row stamps
+	// attcollation=951 (POSIX); dumpCompositeType must now re-emit
+	// `COLLATE pg_catalog."POSIX"` for cc. This exercises capturing the COLLATE
+	// clause on the ALTER ATTRIBUTE path (slice 256 stub-consumed it).
+	if err := runSQLSimple(t, c, `ALTER TYPE public.alt_comp ALTER ATTRIBUTE cc TYPE text COLLATE "POSIX"`); err != nil {
+		t.Fatalf("alter type alt_comp alter attribute cc type text collate POSIX: %v", err)
+	}
 	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in, zips zipcode[])"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
@@ -5280,10 +5289,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// via the re-sync path; its attcollation (950) shadows text's default
 			// (100), so dumpCompositeType re-emits the COLLATE clause inline, and
 			// `cc` is now the final (comma-less) field.
+			// Slice 259: ALTER ATTRIBUTE cc TYPE text COLLATE "POSIX" re-typed cc in
+			// place, replacing its collation C→POSIX (attcollation 950→951), so the
+			// final dump emits COLLATE pg_catalog."POSIX" for cc.
 			"CREATE TYPE public.alt_comp AS (",
 			"\ta bigint,",
 			"\tb_renamed numeric(12,3),",
-			"\tcc text COLLATE pg_catalog.\"C\"\n",
+			"\tcc text COLLATE pg_catalog.\"POSIX\"\n",
 			// Slice 257: a per-field COLLATE round-trips inline. The field's
 			// attcollation (C=950 / POSIX=951) differs from text's typcollation
 			// (100), so dumpCompositeType re-emits `COLLATE pg_catalog."<name>"`.

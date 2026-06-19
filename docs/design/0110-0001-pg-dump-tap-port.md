@@ -7534,6 +7534,38 @@ builder the re-sync reuses.
 > **Next (slice 259+):** multi-subcommand `ALTER TYPE` statements (`ADD …, DROP …` in one command) and
 > per-attribute `COLLATE` via `ALTER TYPE … ALTER ATTRIBUTE … COLLATE`.
 
+### Slice 259 — per-attribute `COLLATE` via `ALTER TYPE … ALTER ATTRIBUTE … TYPE … COLLATE`
+
+Slice 256 re-typed a composite field in place (`ALTER TYPE … ALTER ATTRIBUTE attname [SET DATA] TYPE newtype`),
+collecting the new type's tokens and **stub-consuming** any trailing `COLLATE`/`USING`/`CASCADE`/`RESTRICT`. So
+`ALTER TYPE … ALTER ATTRIBUTE attname TYPE text COLLATE "POSIX"` re-typed the field but silently dropped the new
+collation from the dump. This slice captures that `COLLATE` clause, reusing slices 256 + 257 wholesale — the only
+gap was the parser discarding the already-recognized keyword.
+
+- **Parser (`parseAlterType` ALTER ATTRIBUTE branch, `ddl.go`)** — the type-token loop already stops at a top-level
+  `COLLATE` ident keyword (slice 256). Instead of stub-consuming it, the branch now parses the optional trailing
+  `COLLATE <name>` via the shared `parseCollationName` (bare `"C"` / schema-qualified `pg_catalog."C"` → bare last
+  component) into the new `AlterTypeStmt.AlterAttrCollation`; remaining `USING`/`CASCADE`/`RESTRICT` stay
+  stub-consumed. No `COLLATE` → empty.
+- **Executor (`execAlterType` ALTER ATTRIBUTE, `operators_ddl.go`)** — alongside `newFields[idx].ColType =
+  s.AlterAttrType`, the branch now sets `newFields[idx].Collation = s.AlterAttrCollation`. This matches PostgreSQL
+  semantics: re-typing an attribute replaces its type, so the prior collation no longer applies — an explicit
+  `COLLATE` sets the new one, and its absence resets to the new type's default (empty). The OID-stable re-sync
+  (`RegisterCompositeTypeWithFields` + `syncCompositeTypeToCatalogHeap`) then stamps `attcollation` from
+  `field.Collation` exactly as the ADD/CREATE paths do (slice 257; C→950, POSIX→951, non-collatable suppressed).
+- **No `pg_dump`-side change** — `dumpCompositeType` re-emits `COLLATE pg_catalog."<name>"` inline when
+  `attcollation <> typcollation`; the re-synced heap row carries the changed override.
+
+Guarded at two levels: `parser.TestAlterTypeAlterAttributeParsing` now asserts `AlterAttrCollation` across the
+existing cases plus bare `COLLATE "C"`, `SET DATA TYPE varchar(8) COLLATE "POSIX"`, schema-qualified
+`pg_catalog."C"`, and a `CASCADE`-only case (empty collation). The pg_dump TAP port re-types the slice-258 `cc`
+field via `ALTER TYPE public.alt_comp ALTER ATTRIBUTE cc TYPE text COLLATE "POSIX"`, flipping its dumped clause
+`COLLATE pg_catalog."C"` → `COLLATE pg_catalog."POSIX"` (`TestPort_PgDumpConnectionSetup`, byte-matching real
+pg_dump 18.3). The slice-257 heap-row test (`executor.TestUserPGAttributeCompositeFieldCollation`) covers the
+reused `field.Collation`→`attcollation` builder.
+
+> **Next (slice 260+):** multi-subcommand `ALTER TYPE` statements (`ADD …, DROP …` in one command).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
