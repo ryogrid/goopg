@@ -5246,6 +5246,24 @@ object support.
         PASS (cgroup wrapper, -count=1, 3.46s); pgbench pre-commit smoke on commit. **Next:** the 18th and
         last `RELOPT_KIND_TOAST` option `toast.vacuum_index_cleanup` (enum, reuses slice-217 heap enum path) →
         then `toast.*` is genuinely complete → composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0).
+      - **PROGRESS 2026-06-19 (loop #7):** **DU-002 slice 241 LANDED — `RELOPT_KIND_TOAST` *enum* reloption
+        (`toast.vacuum_index_cleanup`) round-trips; eighteen-element TOAST reloptions array. The `toast.*`
+        reloption surface is now GENUINELY COMPLETE (all 18 `RELOPT_KIND_TOAST` options round-trip).**
+        `vacuum_index_cleanup` is `RELOPT_TYPE_ENUM`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:519`),
+        accepting `auto/on/off/true/false/yes/no/1/0` case-insensitively (`StdRdOptIndexCleanupValues`,
+        `reloptions.c:487`). **Executor** (`operators_ddl.go`): one gather block after the slice-240
+        `toast.vacuum_max_eager_freeze_failure_rate` arm — a `switch strings.ToLower(trimmed)` over the nine
+        spellings (unrecognized → 22023), appended **VERBATIM** (trimmed) as `vacuum_index_cleanup=<V>` so
+        `=on` stays `=on` (not `=true`), mirroring the parent heap arm slice 217. **catalog**: NO change.
+        On dump-out → `WITH (..., toast.vacuum_index_cleanup='on')`. Files:
+        `internal/executor/operators_ddl.go` (toast enum gather block),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (2 new unit tests:
+        `TestToastVacuumIndexCleanup{SurfacesInToastReloptions,InvalidRejected}`),
+        `internal/testport/pgdump_connsetup_test.go` (`optoast` fixture = 18 options + updated combined-WITH
+        assertion x2), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 241). Gates: gofmt OK;
+        `go build ./internal/...` clean; executor reloption unit tests + `TestPort_PgDumpConnectionSetup`
+        PASS (cgroup wrapper, -count=1, 3.43s); pgbench pre-commit smoke on commit. **Next:** `toast.*`
+        complete → composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger structural task).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

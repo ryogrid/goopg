@@ -6948,6 +6948,36 @@ ToastReloptions storage and the `0.0–1.0` bounds (incl. the 1.5 / NaN / Inf re
 slice-217 heap enum path) → then the `toast.*` surface is genuinely complete → composite types
 (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — a larger structural task).
 
+### Slice 241 — `RELOPT_KIND_TOAST` *enum* reloption (`toast.vacuum_index_cleanup`) — toast.* surface complete
+
+Adds `toast.vacuum_index_cleanup`, the **18th and final** `RELOPT_KIND_TOAST` option and the only enum
+one, extending the TOAST reloptions array to eighteen elements. `vacuum_index_cleanup` is
+`RELOPT_TYPE_ENUM`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:519`), accepting
+`auto/on/off/true/false/yes/no/1/0` case-insensitively (`StdRdOptIndexCleanupValues`, `reloptions.c:487`),
+so PG accepts the `toast.` prefix and stores it (without prefix) on the TOAST relation's
+`pg_class.reloptions`. Reuses the parent heap enum arm (slice 217).
+
+- **Executor** (`operators_ddl.go`): one extra gather block after the slice-240
+  `toast.vacuum_max_eager_freeze_failure_rate` arm: a `switch strings.ToLower(trimmed)` over the nine
+  accepted spellings (unrecognized → 22023, message lists `"on"`, `"off"`, `"auto"`), appended to
+  `toastReloptions` as `vacuum_index_cleanup=<V>` (no prefix) **VERBATIM** (trimmed) — like the parent
+  heap arm, the literal input text is preserved so `=on` round-trips as `=on`, not `=true`, mirroring
+  PG's `pg_class.reloptions`.
+- **catalog** (`catalog.go`): no change — the existing `strings.Join` over `t.ToastReloptions` renders the
+  eighteen-element array ending in `…,vacuum_max_eager_freeze_failure_rate=0.5,vacuum_index_cleanup=on}`.
+
+On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) order:
+`WITH (..., toast.vacuum_max_eager_freeze_failure_rate='0.5', toast.vacuum_index_cleanup='on')`.
+
+Engine guards: the `optoast` fixture now carries all eighteen options and the assertion confirms the combined
+eighteen-element `WITH` clause (`TestPort_PgDumpConnectionSetup` PASS); two focused executor unit tests
+(`TestToastVacuumIndexCleanup{SurfacesInToastReloptions,InvalidRejected}`) pin the verbatim ToastReloptions
+storage (incl. `=auto` non-canonicalization and case-insensitive `OFF`) and the unrecognized-spelling 22023.
+
+**Next:** the `toast.*` reloption surface is now **complete** (all 18 `RELOPT_KIND_TOAST` options round-trip).
+The remaining DU-002 catalog surface moves to composite types (`CREATE TYPE AS`; `pg_class.reltype`
+hardcoded 0 — a larger structural task).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

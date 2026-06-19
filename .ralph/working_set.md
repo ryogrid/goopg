@@ -1,26 +1,27 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 240 (loop #6) — `toast.vacuum_max_eager_freeze_failure_rate`
-(RELOPT_KIND_HEAP|TOAST, REAL range **0.0–1.0** — page fraction, NOT 0.0–100.0; default -1),
-seventeen-element TOAST reloptions array. Mirrors parent heap arm slice 216.
+Last landed: DU-002 slice 241 (loop #7) — `toast.vacuum_index_cleanup`
+(RELOPT_KIND_HEAP|TOAST, the ONLY enum RELOPT_KIND_TOAST option; spellings
+auto/on/off/true/false/yes/no/1/0 case-insensitive; stored VERBATIM trimmed so
+`=on` round-trips as `=on`). Eighteen-element TOAST reloptions array. Mirrors
+parent heap enum arm slice 217 (operators_ddl.go:1486-1515).
 
-IMPORTANT CORRECTION: the slice-239 working-set claim that the `toast.*` surface was
-COMPLETE was WRONG. PG has **18** `RELOPT_KIND_TOAST` options (`grep -c RELOPT_KIND_TOAST
-postgres/.../reloptions.c`), goopg covered 16. Slice 240 added the 17th (this real one).
-The 18th and last is `toast.vacuum_index_cleanup` (ENUM auto/on/off; heap arm = slice 217,
-operators_ddl.go:1486-1515) — that is the NEXT slice (241). After that the toast.* surface
-is genuinely complete → composite types (`CREATE TYPE AS`; pg_class.reltype hardcoded 0).
+MILESTONE: with slice 241 the `toast.*` reloption surface is GENUINELY COMPLETE —
+all 18 RELOPT_KIND_TOAST options (`grep -c RELOPT_KIND_TOAST reloptions.c` = 18)
+now round-trip through pg_dump.
 
-Files: internal/executor/operators_ddl.go (toast real gather block after the slice-239
-toast.autovacuum_vacuum_insert_scale_factor arm; ParseFloat + !(f>=0 && f<=1) → 22023),
+Files touched: internal/executor/operators_ddl.go (toast enum gather block after the
+slice-240 toast.vacuum_max_eager_freeze_failure_rate arm, ~line 1872: switch over
+nine spellings → 22023, store trimmed verbatim in toastReloptions),
 internal/executor/operators_fillfactor_reloptions_test.go (2 new unit tests),
-internal/testport/pgdump_connsetup_test.go (optoast fixture = 17 options incl.
-vacuum_max_eager_freeze_failure_rate=0.5 + combined-WITH assertion x2),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 240 + correction note), .ralph/fix_plan.md.
+internal/testport/pgdump_connsetup_test.go (optoast fixture = 18 options incl.
+vacuum_index_cleanup=on + combined-WITH assertion x2 + array-literal comment),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 241 section), .ralph/fix_plan.md.
 
 Gates: gofmt OK; go build ./internal/... clean; executor reloption unit tests PASS;
-TestPort_PgDumpConnectionSetup PASS (cgroup wrapper, -count=1, 3.46s); pgbench pre-commit smoke on commit.
+TestPort_PgDumpConnectionSetup PASS (cgroup wrapper, -count=1, 3.43s); pgbench
+pre-commit smoke on commit.
 
-Next: slice 241 = `toast.vacuum_index_cleanup` (enum) — copy slice-217 heap enum validation
-(switch over auto/on/off/true/false/yes/no/1/0), store VERBATIM trimmed in toastReloptions,
-extend optoast fixture to 18 options. Then composite types.
+Next: toast.* surface is DONE. Next DU-002 frontier = composite types
+(`CREATE TYPE AS`; pg_class.reltype currently hardcoded 0) — a larger structural
+task, not a one-arm slice. Scope it before coding.

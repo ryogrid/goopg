@@ -1869,6 +1869,32 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		toastReloptions = append(toastReloptions, "vacuum_max_eager_freeze_failure_rate="+strconv.FormatFloat(vmefr, 'g', -1, 64))
 	}
+	// `toast.vacuum_index_cleanup` — the only RELOPT_KIND_TOAST *enum* option,
+	// reusing the parent-table enum reloption path (slice 217). PG's reloption type
+	// is RELOPT_TYPE_ENUM accepting auto/on/off/true/false/yes/no/1/0
+	// case-insensitively (StdRdOptIndexCleanupValues, reloptions.c:487);
+	// vacuum_index_cleanup shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:519), so PG accepts the `toast.` prefix and stores it (no prefix)
+	// on the TOAST relation's reloptions. Like the parent-table arm the value is
+	// stored VERBATIM (trimmed) rather than re-rendered to a canonical form,
+	// mirroring PG's pg_class.reloptions which preserves the literal input text (so
+	// `=on` round-trips as `=on`, not `=true`); an unrecognized value is a 22023
+	// error. goopg has no autovacuum, so the value is purely catalog/dump state that
+	// round-trips through pg_dump's `WITH (toast.vacuum_index_cleanup='V')`. This is
+	// the 18th and final RELOPT_KIND_TOAST option, so the toast.* reloption surface
+	// is now genuinely complete. M0110-0001 (DU-002 slice 241).
+	if v, ok := s.With["toast.vacuum_index_cleanup"]; ok {
+		trimmed := strings.TrimSpace(v)
+		switch strings.ToLower(trimmed) {
+		case "auto", "on", "off", "true", "false", "yes", "no", "1", "0":
+			// accepted enum spelling
+		default:
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for enum option \"vacuum_index_cleanup\": %s", trimmed),
+				Detail:  "Valid values are \"on\", \"off\", and \"auto\"."}
+		}
+		toastReloptions = append(toastReloptions, "vacuum_index_cleanup="+trimmed)
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}

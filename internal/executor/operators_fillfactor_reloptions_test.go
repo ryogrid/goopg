@@ -2835,3 +2835,62 @@ func TestToastVacuumMaxEagerFreezeFailureRateOutOfBoundsRejected(t *testing.T) {
 		}
 	}
 }
+
+// TestToastVacuumIndexCleanupSurfacesInToastReloptions verifies that a
+// `WITH (toast.vacuum_index_cleanup=V)` storage parameter — the 18th and final
+// RELOPT_KIND_TOAST option, and the only enum one (RELOPT_TYPE_ENUM,
+// reloptions.c:519) — is stored on the table's ToastReloptions VERBATIM (trimmed,
+// without the `toast.` prefix). Like the parent-table enum arm (slice 217), the
+// literal spelling is preserved (so `=on` stays `=on`, not `=true`), mirroring PG's
+// pg_class.reloptions. DU-002 slice 241.
+func TestToastVacuumIndexCleanupSurfacesInToastReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE toastvic (id integer PRIMARY KEY) WITH (toast.vacuum_index_cleanup=on)`); err != nil {
+		t.Fatalf("CREATE TABLE toastvic: %v", err)
+	}
+	vicTbl, ok := cat.LookupTable(parser.ObjectName{Name: "toastvic"})
+	if !ok {
+		t.Fatal("toastvic table not found")
+	}
+	if len(vicTbl.ToastReloptions) != 1 || vicTbl.ToastReloptions[0] != "vacuum_index_cleanup=on" {
+		t.Errorf("toastvic.ToastReloptions = %v, want [vacuum_index_cleanup=on]", vicTbl.ToastReloptions)
+	}
+	// The value is preserved verbatim, not canonicalized: `=auto` round-trips as `=auto`.
+	if err := runDDL(t, ctx, `CREATE TABLE toastvic2 (id integer PRIMARY KEY) WITH (toast.vacuum_index_cleanup=auto)`); err != nil {
+		t.Fatalf("CREATE TABLE toastvic2: %v", err)
+	}
+	vic2Tbl, ok := cat.LookupTable(parser.ObjectName{Name: "toastvic2"})
+	if !ok {
+		t.Fatal("toastvic2 table not found")
+	}
+	if len(vic2Tbl.ToastReloptions) != 1 || vic2Tbl.ToastReloptions[0] != "vacuum_index_cleanup=auto" {
+		t.Errorf("toastvic2.ToastReloptions = %v, want [vacuum_index_cleanup=auto]", vic2Tbl.ToastReloptions)
+	}
+}
+
+// TestToastVacuumIndexCleanupInvalidRejected verifies CREATE TABLE rejects an
+// unrecognized toast.vacuum_index_cleanup enum spelling with PG's 22023 error,
+// while accepting the documented spellings (auto/on/off/true/false/yes/no/1/0)
+// case-insensitively. DU-002 slice 241.
+func TestToastVacuumIndexCleanupInvalidRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, v := range []string{"maybe", "2", "onn", "disabled"} {
+		stmt := "CREATE TABLE tvicbad" + strconv.Itoa(i) + " (id integer) WITH (toast.vacuum_index_cleanup=" + v + ")"
+		err := runDDL(t, ctx, stmt)
+		if err == nil {
+			t.Errorf("toast.vacuum_index_cleanup=%q: expected an error, got nil", v)
+			continue
+		}
+		if ee, ok := err.(*ExecError); !ok || ee.Code != "22023" {
+			t.Errorf("toast.vacuum_index_cleanup=%q: want 22023 ExecError, got %v", v, err)
+		}
+	}
+	// Case-insensitive acceptance of a non-default spelling.
+	if err := runDDL(t, ctx, `CREATE TABLE tvicok (id integer) WITH (toast.vacuum_index_cleanup=OFF)`); err != nil {
+		t.Errorf("toast.vacuum_index_cleanup=OFF: unexpected error %v", err)
+	}
+}
