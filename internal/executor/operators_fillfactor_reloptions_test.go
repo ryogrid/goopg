@@ -2369,3 +2369,106 @@ func TestIndexFastUpdateSurfacesInPgClassReloptions(t *testing.T) {
 		t.Errorf("BuildIndexDef(gplain) = %q, want no WITH clause", def)
 	}
 }
+
+// TestIndexGinPendingListLimitSurfacesInPgClassReloptions verifies that a GIN
+// `WITH (gin_pending_list_limit=N)` integer storage parameter declared on CREATE
+// INDEX USING gin is persisted on the catalog Index and surfaced through the
+// index's own pg_class virtual-view row (relkind 'i'), reloptions cell. GIN
+// registers catalog-only, which is what lets the reloption round-trip: pg_dump
+// reads reloptions via `t.reloptions AS indreloptions` and re-emits `CREATE INDEX
+// … USING gin … WITH (gin_pending_list_limit='128')`. Cases pin: a lone integer
+// value, the combined `{fastupdate=off,gin_pending_list_limit=128}` ordering
+// (fastupdate before gin_pending_list_limit, matching reloptionList), and a plain
+// GIN index (reloptions NULL). goopg has no GIN pending-list, so the value is
+// catalog/dump-only. DU-002 slice 221.
+func TestIndexGinPendingListLimitSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE gp (id integer, v integer, w integer)`); err != nil {
+		t.Fatalf("CREATE TABLE gp: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX gpl ON gp USING gin (id) WITH (gin_pending_list_limit=128)`); err != nil {
+		t.Fatalf("CREATE INDEX gpl: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX gpboth ON gp USING gin (v) WITH (fastupdate=off, gin_pending_list_limit=2048)`); err != nil {
+		t.Fatalf("CREATE INDEX gpboth: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX gpplain ON gp USING gin (w)`); err != nil {
+		t.Fatalf("CREATE INDEX gpplain: %v", err)
+	}
+
+	plIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "gpl"})
+	if !ok {
+		t.Fatal("gpl index not found")
+	}
+	if plIdx.GinPendingListLimit != 128 {
+		t.Errorf("gpl.GinPendingListLimit = %d, want 128", plIdx.GinPendingListLimit)
+	}
+	bothIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "gpboth"})
+	if !ok {
+		t.Fatal("gpboth index not found")
+	}
+	if bothIdx.GinPendingListLimit != 2048 || bothIdx.FastUpdate == nil || *bothIdx.FastUpdate {
+		t.Errorf("gpboth = {limit:%d fastupdate:%v}, want {2048 false}", bothIdx.GinPendingListLimit, bothIdx.FastUpdate)
+	}
+	plainIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "gpplain"})
+	if !ok {
+		t.Fatal("gpplain index not found")
+	}
+	if plainIdx.GinPendingListLimit != 0 {
+		t.Errorf("gpplain.GinPendingListLimit = %d, want 0 (unset)", plainIdx.GinPendingListLimit)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && r[17] == "i" && (r[1] == "gpl" || r[1] == "gpboth" || r[1] == "gpplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["gpl"] != "{gin_pending_list_limit=128}" {
+		t.Errorf("pg_class.reloptions for gpl = %q, want %q", got["gpl"], "{gin_pending_list_limit=128}")
+	}
+	if got["gpboth"] != "{fastupdate=off,gin_pending_list_limit=2048}" {
+		t.Errorf("pg_class.reloptions for gpboth = %q, want %q", got["gpboth"], "{fastupdate=off,gin_pending_list_limit=2048}")
+	}
+	if got["gpplain"] != "" {
+		t.Errorf("pg_class.reloptions for gpplain = %q, want \"\" (NULL)", got["gpplain"])
+	}
+
+	// BuildIndexDef (the pg_get_indexdef path pg_dump emits verbatim) single-quotes
+	// each reloption value and preserves declaration order.
+	if def := catalog.BuildIndexDef(plIdx); !strings.Contains(def, "USING gin") || !strings.Contains(def, "WITH (gin_pending_list_limit='128')") {
+		t.Errorf("BuildIndexDef(gpl) = %q, want USING gin and WITH (gin_pending_list_limit='128')", def)
+	}
+	if def := catalog.BuildIndexDef(bothIdx); !strings.Contains(def, "WITH (fastupdate='off', gin_pending_list_limit='2048')") {
+		t.Errorf("BuildIndexDef(gpboth) = %q, want WITH (fastupdate='off', gin_pending_list_limit='2048')", def)
+	}
+	if def := catalog.BuildIndexDef(plainIdx); strings.Contains(def, "WITH (") {
+		t.Errorf("BuildIndexDef(gpplain) = %q, want no WITH clause", def)
+	}
+}
+
+// TestIndexGinPendingListLimitOutOfBoundsRejected verifies a value outside the
+// PG-accepted range (64–2097151) is rejected with SQLSTATE 22023, mirroring
+// PostgreSQL's reloption bounds check. DU-002 slice 221.
+func TestIndexGinPendingListLimitOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE gpb (id integer)`); err != nil {
+		t.Fatalf("CREATE TABLE gpb: %v", err)
+	}
+	err := runDDL(t, ctx, `CREATE INDEX gpbad ON gpb USING gin (id) WITH (gin_pending_list_limit=10)`)
+	if err == nil {
+		t.Fatal("CREATE INDEX with gin_pending_list_limit=10 should be rejected")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok || ee.Code != "22023" {
+		t.Fatalf("error = %v (%T), want ExecError with code 22023", err, err)
+	}
+}

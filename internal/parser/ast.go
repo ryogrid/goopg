@@ -1264,6 +1264,12 @@ type CreateIndexStmt struct {
 	// explicitly-declared value so pg_get_indexdef can re-emit
 	// `WITH (fastupdate='on'|'off')`. DU-002 slice 220.
 	FastUpdate *bool
+	// GinPendingListLimit captures the GIN `WITH (gin_pending_list_limit=N)`
+	// integer storage parameter (max pending-list size in kB). 0 means unset
+	// (PG default -1 = use the GUC); a non-zero value records the explicitly-
+	// declared limit so pg_get_indexdef can re-emit
+	// `WITH (gin_pending_list_limit='N')`. Valid range 64–2097151. DU-002 slice 221.
+	GinPendingListLimit int
 }
 
 // IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key

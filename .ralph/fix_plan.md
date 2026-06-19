@@ -4852,6 +4852,31 @@ object support.
         reloptions (`gin_pending_list_limit`, brin `autosummarize`/`pages_per_range` — brin still needs the
         catalog-only branch widened too); or the BIGGER `toast.*` namespace / composite types.
 
+      - **PROGRESS 2026-06-19 (loop #36):** **DU-002 slice 221 LANDED — GIN index `gin_pending_list_limit`
+        integer storage parameter round-trips through pg_dump.** First INDEX-level *integer* reloption beyond
+        fillfactor. GIN already registered catalog-only (slice 220); only gap was the WITH parser discarding
+        every key except fillfactor/deduplicate_items/fastupdate. Reused fillfactor's exact int plumbing
+        (slice 218): parser (`ddl.go`) recognizes `gin_pending_list_limit` and reads the int via the existing
+        `parseIntLit` into `CreateIndexStmt.GinPendingListLimit` (`int`, 0=unset); executor (`operators_ddl.go`)
+        range-validates like PG (`< 64 || > 2097151` → SQLSTATE `22023`, mirroring `reloptions.c` min 64 / max
+        `MAX_KILOBYTES`) next to the fillfactor check, then persists `idx.GinPendingListLimit` in the catalog-only
+        GIN branch. `Index.GinPendingListLimit` (`strconv.Itoa`) appended to `reloptionList()` after fastupdate →
+        combining renders the stable `{fastupdate=off,gin_pending_list_limit=2048}` order; `BuildIndexDef` dumps
+        `USING gin … WITH (gin_pending_list_limit='128')`. JSON-persisted; advisory catalog/dump-only (no GIN
+        pending list). 0 sentinel keeps a plain GIN index byte-identical. Files: `internal/parser/ast.go`
+        (`CreateIndexStmt.GinPendingListLimit`), `internal/parser/ddl.go` (WITH-loop capture),
+        `internal/catalog/catalog.go` (`Index.GinPendingListLimit` + `reloptionList()`),
+        `internal/executor/operators_ddl.go` (range-validate + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestIndexGinPendingListLimitSurfacesInPgClassReloptions` + `TestIndexGinPendingListLimitOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `foo_ginlimit_idx` fixture + indexDefs assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 221). Gates: gofmt OK; `go build ./internal/...` clean;
+        catalog/parser/full-executor reloption suites PASS; `TestPort_PgDumpConnectionSetup` PASS (round-trips
+        `CREATE INDEX foo_ginlimit_idx ON public.foo USING gin (qty) WITH (gin_pending_list_limit='128');`);
+        pgbench pre-commit smoke on commit. **Next:** brin `autosummarize` bool / `pages_per_range` int (brin
+        still needs the catalog-only branch widened to `gist||spgist||gin||brin` — one-line change); or the
+        BIGGER `toast.*` namespace / composite types.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

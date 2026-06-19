@@ -4086,6 +4086,13 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", s.Fillfactor),
 			Detail:  "Valid values are between \"10\" and \"100\"."}
 	}
+	// gin_pending_list_limit (GIN integer storage parameter, kB) range-validated
+	// like PG: min 64, max MAX_KILOBYTES (INT_MAX/1024). DU-002 slice 221.
+	if s.GinPendingListLimit != 0 && (s.GinPendingListLimit < 64 || s.GinPendingListLimit > 2097151) {
+		return &ExecError{Code: "22023", Pos: s.Pos(),
+			Message: fmt.Sprintf("value %d out of bounds for option \"gin_pending_list_limit\"", s.GinPendingListLimit),
+			Detail:  "Valid values are between \"64\" and \"2097151\"."}
+	}
 	method := strings.ToLower(strings.TrimSpace(s.Method))
 	if method == "rtree" {
 		o.ctx.AddNotice("substituting access method \"gist\" for obsolete method \"rtree\"")
@@ -4124,6 +4131,8 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		idx.DeduplicateItems = s.DeduplicateItems
 		// Persist `WITH (fastupdate=on|off)` (GIN). DU-002 slice 220.
 		idx.FastUpdate = s.FastUpdate
+		// Persist `WITH (gin_pending_list_limit=N)` (GIN, range-validated above). DU-002 slice 221.
+		idx.GinPendingListLimit = s.GinPendingListLimit
 		if catalogHeapSyncAvailable(o.ctx) {
 			if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
 				return fmt.Errorf("DDL catalog sync: %w", syncErr)

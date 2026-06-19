@@ -6370,6 +6370,39 @@ a plain GIN index keeps reloptions NULL and no WITH clause). The pg_dump fixture
 dump carries `CREATE INDEX foo_fastupdate_idx ON public.foo USING gin (qty) WITH (fastupdate='off');`
 (the `USING gin` access method is preserved, not silently upgraded to btree).
 
+### Slice 221 — GIN index `gin_pending_list_limit` reloption round-trip (first INDEX-level INTEGER reloption beyond fillfactor)
+
+Adds the GIN `gin_pending_list_limit` **integer** storage parameter on **`CREATE INDEX … USING gin`**.
+PG's GIN access method exposes it (`reloptions.c`: default `-1`, min `64`, max `MAX_KILOBYTES` = `INT_MAX/1024`
+= `2097151`) to cap the pending list's size in kB; `WITH (gin_pending_list_limit=128)` must survive a
+dump/restore. GIN already registers catalog-only (slice 220), so the only gap was the WITH parser
+discarding every key except fillfactor/deduplicate_items/fastupdate.
+
+This slice reuses fillfactor's exact **integer** plumbing (slice 218), now on a GIN-specific key:
+
+- **Parser** (`ddl.go`): the WITH loop recognizes `gin_pending_list_limit` and reads its integer via the
+  existing `parseIntLit` into `CreateIndexStmt.GinPendingListLimit` (`int`, `0` = unset).
+- **Executor** (`operators_ddl.go`): range-validates like PG (`< 64 || > 2097151` → SQLSTATE `22023`,
+  `value %d out of bounds for option "gin_pending_list_limit"`, detail `Valid values are between "64" and
+  "2097151".`) next to the fillfactor check, then persists `idx.GinPendingListLimit = s.GinPendingListLimit`
+  in the catalog-only GIN branch.
+- **catalog** (`catalog.go`): `Index.GinPendingListLimit` (`int`, `strconv.Itoa`) is appended to
+  `reloptionList()` after fastupdate, so combining it with `fastupdate` renders the stable
+  `{fastupdate=off,gin_pending_list_limit=2048}` order. `BuildIndexDef` dumps `USING gin … WITH
+  (gin_pending_list_limit='128')`.
+
+`catalog.Index.GinPendingListLimit` is JSON-persisted. goopg has no GIN pending list, so the value is
+advisory catalog/dump-only — like the GIN index itself. `0` is the unset sentinel (PG default `-1` emits
+no reloption), so a plain GIN index still dumps byte-identically.
+
+Engine guards: `TestIndexGinPendingListLimitSurfacesInPgClassReloptions` (a lone `128` → `{gin_pending_list_limit=128}`;
+the combined `fastupdate=off, gin_pending_list_limit=2048` → `{fastupdate=off,gin_pending_list_limit=2048}`
+with `BuildIndexDef` rendering `WITH (fastupdate='off', gin_pending_list_limit='2048')`; a plain GIN index
+keeps reloptions NULL) and `TestIndexGinPendingListLimitOutOfBoundsRejected` (`=10` → SQLSTATE `22023`).
+The pg_dump fixture adds `foo_ginlimit_idx ON public.foo USING gin (qty) WITH (gin_pending_list_limit=128)`;
+the assertion confirms the dump carries `CREATE INDEX foo_ginlimit_idx ON public.foo USING gin (qty) WITH
+(gin_pending_list_limit='128');`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

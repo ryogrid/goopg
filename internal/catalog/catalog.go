@@ -993,6 +993,15 @@ type Index struct {
 	// pg_dump re-emits as `CREATE INDEX … WITH (fastupdate='on')`. goopg has no
 	// GIN pending-list, so this is advisory catalog/dump-only. DU-002 slice 220.
 	FastUpdate *bool
+	// GinPendingListLimit stores the GIN `WITH (gin_pending_list_limit=N)`
+	// integer storage parameter (max pending-list size in kB). Zero means unset
+	// (PG default -1 = use the gin_pending_list_limit GUC) — no reloption is
+	// emitted, so a plain index dumps byte-identically. When set, the index's
+	// pg_class.reloptions virtual row renders `gin_pending_list_limit=N`, which
+	// pg_dump re-emits as `CREATE INDEX … WITH (gin_pending_list_limit='N')`.
+	// goopg has no GIN pending list, so this is advisory catalog/dump-only.
+	// DU-002 slice 221.
+	GinPendingListLimit int
 }
 
 // reloptionList returns the index's storage parameters as ordered key=value
@@ -1019,6 +1028,9 @@ func (idx *Index) reloptionList() [][2]string {
 			v = "on"
 		}
 		opts = append(opts, [2]string{"fastupdate", v})
+	}
+	if idx.GinPendingListLimit != 0 {
+		opts = append(opts, [2]string{"gin_pending_list_limit", strconv.Itoa(idx.GinPendingListLimit)})
 	}
 	return opts
 }

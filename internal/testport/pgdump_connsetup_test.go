@@ -1487,6 +1487,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_fastupdate_idx ON public.foo USING gin (qty) WITH (fastupdate=off)"); err != nil {
 		t.Fatalf("create fastupdate gin index: %v", err)
 	}
+	// Slice 221: a GIN index declared `WITH (gin_pending_list_limit=128)` must
+	// round-trip. goopg's parser previously extracted only fillfactor/deduplicate_
+	// items/fastupdate from the WITH clause, discarding gin_pending_list_limit; it
+	// now range-validates (64–2097151) and persists it on catalog.Index.
+	// GinPendingListLimit (int), so BuildIndexDef emits `USING gin … WITH
+	// (gin_pending_list_limit='128')` and the index pg_class.reloptions cell carries
+	// it. goopg has no GIN pending-list, so the value is advisory catalog/dump-only.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_ginlimit_idx ON public.foo USING gin (qty) WITH (gin_pending_list_limit=128)"); err != nil {
+		t.Fatalf("create gin_pending_list_limit gin index: %v", err)
+	}
 	// Slice 134: a UNIQUE index declared `NULLS NOT DISTINCT` (PostgreSQL 15+)
 	// must round-trip. goopg's parser accepted the clause but DISCARDED it, and
 	// pg_index.indnullsnotdistinct was hard-wired false, so pg_get_indexdef
@@ -4060,6 +4070,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// boolean reloption. Exercises the `USING gin` access-method rendering
 			// (not silently upgraded to btree) plus flatten_reloptions single-quoting.
 			"CREATE INDEX foo_fastupdate_idx ON public.foo USING gin (qty) WITH (fastupdate='off');",
+			// Slice 221: GIN catalog-only index with a `WITH (gin_pending_list_limit=
+			// '128')` integer reloption. Exercises the `USING gin` rendering plus the
+			// integer reloption path through flatten_reloptions (single-quoted value).
+			"CREATE INDEX foo_ginlimit_idx ON public.foo USING gin (qty) WITH (gin_pending_list_limit='128');",
 		}
 		for _, sub := range indexDefs {
 			if !strings.Contains(res.Stdout, sub) {

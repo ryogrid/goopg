@@ -3089,6 +3089,19 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 							continue
 						}
 					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "gin_pending_list_limit" {
+					// GIN integer storage parameter (max pending-list size in kB).
+					// Record the value so pg_dump can re-emit it. DU-002 slice 221.
+					p.advance() // consume "gin_pending_list_limit"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if p.cur().Kind == TokenIntLit {
+							if v, err := p.parseIntLit(); err == nil {
+								stmt.GinPendingListLimit = int(v)
+							}
+							continue
+						}
+					}
 				}
 				p.advance()
 			}
