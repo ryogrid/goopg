@@ -1609,6 +1609,26 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		toastReloptions = append(toastReloptions, "autovacuum_vacuum_cost_delay="+strconv.FormatFloat(avcd, 'g', -1, 64))
 	}
+	// `toast.autovacuum_vacuum_cost_limit` — the second RELOPT_KIND_TOAST *integer*
+	// option, reusing the parent-table integer reloption path. PG's reloption range
+	// is 1–10000 with a default of -1 (= unset / use the GUC);
+	// autovacuum_vacuum_cost_limit shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:265), so PG accepts the `toast.` prefix and stores it on the
+	// TOAST relation's reloptions. goopg has no autovacuum, so the value is purely
+	// catalog/dump state. M0110-0001 (DU-002 slice 229).
+	if v, ok := s.With["toast.autovacuum_vacuum_cost_limit"]; ok {
+		avcl, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_cost_limit\": %s", v)}
+		}
+		if avcl < 1 || avcl > 10000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_cost_limit\"", avcl),
+				Detail:  "Valid values are between \"1\" and \"10000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_vacuum_cost_limit="+strconv.Itoa(avcl))
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}

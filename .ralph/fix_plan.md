@@ -5022,6 +5022,23 @@ object support.
         PASS; pgbench pre-commit smoke on commit. **Next:** `toast.autovacuum_vacuum_cost_limit` (INT),
         `toast.autovacuum_freeze_min_age/max_age/table_age` (INT),
         `toast.log_autovacuum_min_duration` (INT, allows -1) — each a one-line gather. After: composite types.
+      - **PROGRESS 2026-06-19 (loop #44):** **DU-002 slice 229 LANDED — second `RELOPT_KIND_TOAST` *integer*
+        reloption (`toast.autovacuum_vacuum_cost_limit`) round-trips; six-element TOAST reloptions array.**
+        `autovacuum_vacuum_cost_limit` is `RELOPT_TYPE_INT` and shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`
+        (`reloptions.c:265`, range `1–10000`, default `-1`), so PG accepts the `toast.` prefix and stores it
+        (no prefix) on the TOAST relation's reloptions. **Executor** (`operators_ddl.go`): one extra gather
+        block after the slice-228 `toast.autovacuum_vacuum_cost_delay` arm, reusing the parent-table integer
+        path (slice 198): `strconv.Atoi` + `1 ≤ N ≤ 10000` bounds check (non-int/out-of-range → 22023),
+        appended as `autovacuum_vacuum_cost_limit=<N>` via `strconv.Itoa`. **catalog**: NO change —
+        `strings.Join` over `ToastReloptions` renders
+        `{...,autovacuum_vacuum_cost_delay=10.5,autovacuum_vacuum_cost_limit=500}`. On dump-out pg_dump re-adds
+        the prefix per element in array order → `WITH (..., toast.autovacuum_vacuum_cost_limit='500')`.
+        Files: `internal/executor/operators_ddl.go` (int gather block),
+        `internal/testport/pgdump_connsetup_test.go` (`optoast` fixture carries all six options + updated
+        combined-WITH assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 229). Gates: gofmt OK;
+        `go build ./internal/...` clean; executor+parser+catalog suites PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** `toast.autovacuum_freeze_min_age/max_age/table_age`
+        (INT), `toast.log_autovacuum_min_duration` (INT, allows -1) — each a one-line gather. After: composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

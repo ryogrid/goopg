@@ -6619,8 +6619,33 @@ On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) o
 Engine guard: the `optoast` fixture now carries all five options; the assertion confirms the combined
 five-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
 
-**Next:** the remaining `RELOPT_KIND_TOAST` int options (`cost_limit` (INT),
-`toast.autovacuum_freeze_min_age/max_age/table_age` (INT),
+**Next:** the remaining `RELOPT_KIND_TOAST` int options
+(`toast.autovacuum_freeze_min_age/max_age/table_age` (INT),
+`toast.log_autovacuum_min_duration` (INT, allows `-1`)) — each a one-line gather reusing the int path.
+After: composite types.
+
+### Slice 229 — second `RELOPT_KIND_TOAST` *integer* reloption (`toast.autovacuum_vacuum_cost_limit`)
+
+Adds `toast.autovacuum_vacuum_cost_limit`, the second `RELOPT_KIND_TOAST` **integer** option, extending the
+TOAST reloptions array to six elements. `autovacuum_vacuum_cost_limit` is `RELOPT_TYPE_INT` and shares
+`RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:265`, range `1–10000`, default `-1`), so PG accepts
+the `toast.` prefix and stores it (without prefix) on the TOAST relation's `pg_class.reloptions`.
+
+- **Executor** (`operators_ddl.go`): one extra gather block after the slice-228 `toast.autovacuum_vacuum_cost_delay`
+  arm, reusing the parent-table integer reloption path (slice 198): `strconv.Atoi` + `1 ≤ N ≤ 10000` bounds
+  check (non-int or out-of-range → 22023), appended to `toastReloptions` as `autovacuum_vacuum_cost_limit=<N>`
+  (no prefix) via `strconv.Itoa`.
+- **catalog** (`catalog.go`): no change — the existing `strings.Join` over `t.ToastReloptions` renders the
+  six-element array `{autovacuum_enabled=false,vacuum_truncate=false,autovacuum_vacuum_threshold=100,autovacuum_vacuum_scale_factor=2.5,autovacuum_vacuum_cost_delay=10.5,autovacuum_vacuum_cost_limit=500}`.
+
+On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) order:
+`WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false', toast.autovacuum_vacuum_threshold='100', toast.autovacuum_vacuum_scale_factor='2.5', toast.autovacuum_vacuum_cost_delay='10.5', toast.autovacuum_vacuum_cost_limit='500')`.
+
+Engine guard: the `optoast` fixture now carries all six options; the assertion confirms the combined
+six-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
+
+**Next:** the remaining `RELOPT_KIND_TOAST` int options
+(`toast.autovacuum_freeze_min_age/max_age/table_age` (INT),
 `toast.log_autovacuum_min_duration` (INT, allows `-1`)) — each a one-line gather reusing the int path.
 After: composite types.
 
