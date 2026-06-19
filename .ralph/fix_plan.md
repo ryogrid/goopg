@@ -6056,8 +6056,26 @@ object support.
         pg_dump 18.3 — asserts the `pdfa_1` block prints `ka integer` + inline `kb integer DEFAULT 7`, NO standalone
         `ALTER COLUMN kb SET DEFAULT 7` anywhere, `ATTACH PARTITION public.pdfa_1 FOR VALUES IN (1)` survives). gofmt +
         `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 282.
-        **Next (slice 283+):** a generated-column (`GENERATED ALWAYS AS … STORED`) inherited/partition body form, or a
-        multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+      - **PROGRESS 2026-06-20 (loop #50):** **DU-002 slice 283 LANDED — a STORED GENERATED column inherited onto a partition
+        leaf prints its generation clause INLINE in the leaf body, not as a (illegal) standalone SET DEFAULT (no production
+        change; different discriminator branch than 281/282).** The generated-column counterpart of slices 281/282. Where
+        281/282 held `attrdefs[].separate=false` via `shouldPrintColumn` (every partition column prints because
+        `ispartition`), slice 283 holds `separate=false` via **`attgenerated`**: pg_dump.c:9507 sets
+        `attrdefs[adnum-1].separate = false` UNCONDITIONALLY whenever `tbinfo->attgenerated[adnum-1]` is non-empty — a
+        generation expression can never be split into a standalone `ALTER ... SET DEFAULT`. Fixture: `CREATE TABLE public.pgna
+        (ga integer, gb integer GENERATED ALWAYS AS (ga * 2) STORED) PARTITION BY LIST (ga)` + `CREATE TABLE public.pgna_1
+        PARTITION OF public.pgna FOR VALUES IN (1)` → leaf prints `gb integer GENERATED ALWAYS AS (ga * 2) STORED` inline;
+        partition key `ga` stays plain `ga integer`. NO production change — goopg already round-trips STORED generated columns
+        on standalone tables (slice 59: attgenerated='s' + pg_attrdef deparse) and inherits parent columns onto partition
+        leaves (slices 281/282); the two facts compose. A regression dropping the generation expression on the inherited
+        column would print bare `gb integer`; one mis-setting `separate` would try the illegal standalone SET DEFAULT.
+        **Guards:** `TestPort_PgDumpConnectionSetup` PASS (3.68s; byte-identical vs real pg_dump 18.3 — asserts the `pgna_1`
+        block prints `ga integer` + inline `gb integer GENERATED ALWAYS AS (ga * 2) STORED`, NO standalone `ALTER COLUMN gb
+        SET DEFAULT` anywhere, `ATTACH PARTITION public.pgna_1 FOR VALUES IN (1)` survives). gofmt + `go build ./...` clean;
+        pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 283.
+        **Next (slice 284+):** a VIRTUAL generated column (`GENERATED ALWAYS AS … VIRTUAL`, slice 194's attgenerated='v' form)
+        inherited onto a partition leaf — same `separate=false`-via-`attgenerated` branch but rendered WITHOUT trailing
+        `STORED`; or a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

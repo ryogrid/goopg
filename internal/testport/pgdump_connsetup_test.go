@@ -1455,6 +1455,33 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("set DEFAULT on partition leaf inherited column pdfa_1.kb: %v", err)
 	}
 
+	// Slice 283: a STORED GENERATED column inherited onto a partition leaf. The
+	// parent pgna declares `gb` as `GENERATED ALWAYS AS (ga * 2) STORED`; the
+	// partition leaf pgna_1 INHERITS the generated column (attislocal=false). This
+	// exercises a DIFFERENT discriminator branch than slices 281/282: there the
+	// default/NOT-NULL rode inline because shouldPrintColumn forced every partition
+	// column to print; here the dominant force is attgenerated. pg_dump.c:9507
+	// sets `attrdefs[].separate = false` UNCONDITIONALLY whenever
+	// `tbinfo->attgenerated[adnum-1]` is non-empty — a generation expression can
+	// NEVER be split into a standalone `ALTER TABLE ... ALTER COLUMN ... SET
+	// DEFAULT` (that syntax cannot express a generated column). So even before
+	// ispartition enters the picture, `separate` is false and the generation clause
+	// must ride INLINE on the column. Layered on the partition leaf's ispartition=true
+	// (shouldPrintColumn true for every column, slices 281/282), the leaf body prints
+	// `gb integer GENERATED ALWAYS AS (ga * 2) STORED` inline. NO production change —
+	// goopg already round-trips STORED generated columns on standalone tables (slice
+	// 59: attgenerated='s' + a pg_attrdef row carrying the deparse) and inherits
+	// parent columns onto partition leaves (slices 281/282). Verified byte-identical
+	// vs PG 18.3. A regression that dropped the generation expression on the inherited
+	// column would print a bare `gb integer`; one that mis-set `separate` would try to
+	// emit an (illegal) standalone SET DEFAULT for a generated column.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgna (ga integer, gb integer GENERATED ALWAYS AS (ga * 2) STORED) PARTITION BY LIST (ga)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgna with generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgna_1 PARTITION OF public.pgna FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pgna_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4240,6 +4267,38 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pdfa_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pdfa_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 283 (asserted):** a STORED generated column inherited onto a
+		// partition leaf prints its generation clause INLINE in the leaf body
+		// (`gb integer GENERATED ALWAYS AS (ga * 2) STORED`). attgenerated forces
+		// attrdefs[].separate=false UNCONDITIONALLY (pg_dump.c:9507) — a generation
+		// expression can never be split into a standalone ALTER ... SET DEFAULT — and
+		// ispartition makes every column print (slices 281/282). The partition key
+		// `ga` stays a plain `ga integer`. Discriminator-distinct from slices 281/282:
+		// here separate is held false by attgenerated, not (only) by ispartition.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgna_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "ga integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited partition-key column; want %q in pgna_1 block\n  block=%q", "ga integer", block)
+			}
+			if !strings.Contains(block, "gb integer GENERATED ALWAYS AS (ga * 2) STORED") {
+				t.Errorf("pg_dump dropped/corrupted the inline generated column on a partition leaf; want %q in pgna_1 block\n  block=%q", "gb integer GENERATED ALWAYS AS (ga * 2) STORED", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgna_1\n  full stdout=%q", res.Stdout)
+		}
+		// A generation expression can never be a standalone SET DEFAULT; assert the
+		// illegal standalone form is absent for the leaf's generated column.
+		if strings.Contains(res.Stdout, "ALTER COLUMN gb SET DEFAULT") {
+			t.Errorf("pg_dump emitted an (illegal) standalone SET DEFAULT for a generated partition-leaf column (separate set despite attgenerated); unexpected %q\n  full stdout=%q", "ALTER COLUMN gb SET DEFAULT", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgna_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgna_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every
