@@ -6038,6 +6038,26 @@ object support.
         survives). gofmt + `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 281.
         **Next (slice 282+):** a generated-column (`GENERATED ALWAYS AS … STORED`) inherited/partition body form, or a
         child-level DEFAULT added via `ALTER TABLE … ALTER COLUMN … SET DEFAULT` on an inherited column.
+      - **PROGRESS 2026-06-20 (loop #49):** **DU-002 slice 282 LANDED — a DEFAULT added to a partition leaf's INHERITED
+        column via `ALTER TABLE … ALTER COLUMN … SET DEFAULT` rides INLINE on the printed column, not as a standalone ALTER
+        (no production change; sibling-paths regression guard).** The DEFAULT analog of slice 281 and the partition-INLINE
+        twin of slice 269. The SAME `ALTER TABLE <leaf> ALTER COLUMN <inherited-col> SET DEFAULT <expr>` shape that yields a
+        STANDALONE `ALTER TABLE ONLY ... ALTER COLUMN ... SET DEFAULT` on a legacy-inheritance child (slice 269, `idfa_child`)
+        instead rides INLINE on a partition leaf. Discriminator: the `attrdefs[].separate` flag (pg_dump.c:9507-9535) — pg_dump
+        marks a default `separate` (→ standalone ALTER) only on the `!shouldPrintColumn` branch; `shouldPrintColumn` returns
+        `attislocal[j] || ispartition` (pg_dump.c:9964) → every partition column prints inline, `separate` stays false, the
+        DEFAULT joins the CREATE TABLE body. Fixture: `CREATE TABLE public.pdfa (ka integer, kb integer) PARTITION BY LIST
+        (ka)` + `CREATE TABLE public.pdfa_1 PARTITION OF public.pdfa FOR VALUES IN (1)` + `ALTER TABLE public.pdfa_1 ALTER
+        COLUMN kb SET DEFAULT 7` → inline `kb integer DEFAULT 7`; partition key `ka` stays plain `ka integer`. NO production
+        change — goopg already records the ALTER-path DEFAULT (`AlterTableSetDefault`, added for slice 269: Column.DefaultExpr
+        → pg_attrdef + atthasdef) and reports the leaf as a partition (slices 266/281). A regression ignoring ispartition in
+        shouldPrintColumn would suppress `kb` and emit the standalone ALTER; one losing AlterTableSetDefault would drop the
+        `DEFAULT 7` decoration. **Guards:** `TestPort_PgDumpConnectionSetup` PASS (3.59s; verified byte-identical vs real
+        pg_dump 18.3 — asserts the `pdfa_1` block prints `ka integer` + inline `kb integer DEFAULT 7`, NO standalone
+        `ALTER COLUMN kb SET DEFAULT 7` anywhere, `ATTACH PARTITION public.pdfa_1 FOR VALUES IN (1)` survives). gofmt +
+        `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 282.
+        **Next (slice 283+):** a generated-column (`GENERATED ALWAYS AS … STORED`) inherited/partition body form, or a
+        multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -1425,6 +1425,36 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("add default-named NOT NULL on partition leaf inherited column pnna_1.qc: %v", err)
 	}
 
+	// Slice 282: a DEFAULT applied to a partition leaf's INHERITED column via
+	// `ALTER TABLE <leaf> ALTER COLUMN <inherited-col> SET DEFAULT <expr>`. This is
+	// the DEFAULT analog of slice 281 (which proved the NOT NULL ALTER path rides
+	// INLINE on a partition leaf) and the partition-INLINE twin of slice 269 (which
+	// proved the SAME ALTER shape on a LEGACY-inheritance child emits a STANDALONE
+	// `ALTER TABLE ONLY ... ALTER COLUMN ... SET DEFAULT`). The discriminator is the
+	// `attrdefs[].separate` flag (pg_dump.c:9507-9535): pg_dump marks a default
+	// `separate` (→ standalone ALTER) only on the `!shouldPrintColumn` branch; for a
+	// partition leaf shouldPrintColumn returns `attislocal[j] || ispartition`
+	// (pg_dump.c:9964) → true for EVERY column, so `separate` stays false and the
+	// DEFAULT rides INLINE on the already-printed column (`kb integer DEFAULT 7`).
+	// The standalone `ALTER TABLE ONLY public.pdfa_1 ALTER COLUMN kb SET DEFAULT 7;`
+	// form (slice 269's legacy shape) must therefore NEVER appear. The partition key
+	// column `ka` stays a plain `ka integer`. NO production change — goopg already
+	// records the ALTER-path DEFAULT on the child column (AlterTableSetDefault, added
+	// for slice 269: Column.DefaultExpr → pg_attrdef + atthasdef) and reports the leaf
+	// as a partition (proven by pnnl/pnna), so real pg_dump 18.3 renders the inline
+	// form. Verified byte-identical vs PG 18.3 this loop. A regression that ignored
+	// ispartition in shouldPrintColumn would suppress `kb` and emit the standalone
+	// ALTER; one that lost AlterTableSetDefault would drop the `DEFAULT 7` decoration.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pdfa (ka integer, kb integer) PARTITION BY LIST (ka)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pdfa: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pdfa_1 PARTITION OF public.pdfa FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pdfa_1: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.pdfa_1 ALTER COLUMN kb SET DEFAULT 7"); err != nil {
+		t.Fatalf("set DEFAULT on partition leaf inherited column pdfa_1.kb: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4178,6 +4208,38 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pnna_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pnna_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 282 (asserted):** a DEFAULT added to a partition leaf's INHERITED
+		// column via ALTER TABLE ALTER COLUMN SET DEFAULT rides INLINE on the printed
+		// column (`kb integer DEFAULT 7`), not as a standalone ALTER. shouldPrintColumn
+		// is true for every partition column (ispartition), so attrdefs[].separate stays
+		// false (pg_dump.c:9527-9535) and the default joins the CREATE TABLE body. The
+		// partition key `ka` stays a plain `ka integer`. The legacy-inheritance standalone
+		// form (slice 269) must NOT appear. DEFAULT analog of slice 281; partition-inline
+		// twin of slice 269.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pdfa_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "ka integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited partition-key column; want %q in pdfa_1 block\n  block=%q", "ka integer", block)
+			}
+			if !strings.Contains(block, "kb integer DEFAULT 7") {
+				t.Errorf("pg_dump dropped/corrupted the inline DEFAULT on a partition leaf; want %q in pdfa_1 block\n  block=%q", "kb integer DEFAULT 7", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pdfa_1\n  full stdout=%q", res.Stdout)
+		}
+		// The standalone SET DEFAULT form is the legacy-inheritance shape (slice 269);
+		// it must never appear for a partition leaf whose column already prints inline.
+		if strings.Contains(res.Stdout, "ALTER COLUMN kb SET DEFAULT 7") {
+			t.Errorf("pg_dump emitted the standalone SET DEFAULT form for a partition leaf (separate flag set despite ispartition); unexpected %q\n  full stdout=%q", "ALTER COLUMN kb SET DEFAULT 7", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pdfa_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pdfa_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every

@@ -8190,9 +8190,34 @@ Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts th
 `CONSTRAINT pnna_named NOT NULL qb` body item appears anywhere, that `CONSTRAINT pnna_1_qc_not_null` never leaks, and that
 `ATTACH PARTITION public.pnna_1 FOR VALUES IN (1)` survives).
 
-> **Next (slice 282+):** a generated-column (`GENERATED ALWAYS AS … STORED`) inherited/partition body form, or a
-> child-level DEFAULT added via `ALTER TABLE … ALTER COLUMN … SET DEFAULT` on an inherited column (the DEFAULT analog of
-> the NOT NULL ALTER-path slices).
+### Slice 282 — partition-leaf `SET DEFAULT` on an *inherited* column rides INLINE (separate-flag discriminator)
+
+The DEFAULT analog of slice 281, and the partition-INLINE twin of slice 269. The SAME
+`ALTER TABLE <leaf> ALTER COLUMN <inherited-col> SET DEFAULT <expr>` shape that produces a STANDALONE
+`ALTER TABLE ONLY ... ALTER COLUMN ... SET DEFAULT` on a legacy-inheritance child (slice 269, `idfa_child`) instead rides
+INLINE on the printed column for a partition leaf —
+`CREATE TABLE pdfa (ka integer, kb integer) PARTITION BY LIST (ka); CREATE TABLE pdfa_1 PARTITION OF pdfa FOR VALUES IN (1);
+ALTER TABLE pdfa_1 ALTER COLUMN kb SET DEFAULT 7`.
+
+**No production change required.** The discriminator is the `attrdefs[].separate` flag (pg_dump.c:9507-9535): pg_dump marks
+a default `separate` (→ standalone ALTER) only on the `!shouldPrintColumn` branch. Because `shouldPrintColumn`
+(pg_dump.c:9964) returns `attislocal[j] || tbinfo->ispartition`, every column of a partition leaf prints inline, so
+`separate` stays false and the default joins the CREATE TABLE body (`kb integer DEFAULT 7`). This is the exact mirror of
+slice 269, where the legacy-inheritance child's inherited column is suppressed (`attislocal=false`, `ispartition=false`) →
+`separate=true` → standalone `ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;`. goopg already records the
+ALTER-path DEFAULT on the child column (`AlterTableSetDefault`, added for slice 269: `Column.DefaultExpr` → `pg_attrdef` +
+`atthasdef`) and reports the leaf as a partition (slices 266/281), so real pg_dump 18.3 renders the inline form unaided.
+Verified byte-identical vs PG 18.3 (`ka integer`, `kb integer DEFAULT 7`, no standalone SET DEFAULT). A regression that
+ignored `ispartition` in `shouldPrintColumn` would suppress `kb` and emit the standalone ALTER; one that lost
+`AlterTableSetDefault` would drop the `DEFAULT 7` decoration.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pdfa_1` block prints `ka integer` and the
+inline `kb integer DEFAULT 7`, that NO standalone `ALTER COLUMN kb SET DEFAULT 7` appears anywhere, and that
+`ATTACH PARTITION public.pdfa_1 FOR VALUES IN (1)` survives).
+
+> **Next (slice 283+):** a generated-column (`GENERATED ALWAYS AS … STORED`) inherited/partition body form (the generation
+> expression is inherited and `attgenerated` forces `separate=false`, pg_dump.c:9507), or a multi-column / NULL-typed
+> DEFAULT variant on the partition-leaf ALTER path.
 
 ## Deferred (002–010) — catalog surface estimate
 
