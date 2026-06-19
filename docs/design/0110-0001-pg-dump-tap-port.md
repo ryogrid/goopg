@@ -5783,6 +5783,49 @@ The pg_dump fixture adds `optavt (… WITH (autovacuum_vacuum_threshold=100))` o
 its own table; the assertion confirms the dump carries
 `WITH (autovacuum_vacuum_threshold='100')`.
 
+### Slice 199 — first REAL-typed storage parameter (`autovacuum_vacuum_scale_factor`) round-trip
+
+Every reloption slice so far (54/195/196/197/198) was integer- or boolean-typed.
+`autovacuum_vacuum_scale_factor` is the first **REAL-typed** reloption goopg
+round-trips. Its PG reloption type is `RELOPT_TYPE_REAL` with range **0.0–100.0
+and a default of -1** (`reloptions.c`:
+`{"autovacuum_vacuum_scale_factor", … -1, 0.0, 100.0}`), so — like
+`parallel_workers`/`autovacuum_vacuum_threshold` — `0.0` is a valid explicit
+value and a separate `AutovacuumVacuumScaleFactorSet` flag (not a zero check)
+records presence.
+
+The real-typed value surfaced a **parser gap**: a fractional literal such as
+`0.2` lexes as `TokenNumericLit`, which `parseWithOptions` did not accept (its
+value switch handled only `TokenIntLit`/`TokenStringLit`/identifier keywords),
+so `CREATE TABLE … WITH (autovacuum_vacuum_scale_factor=0.2)` failed with
+"expected option value" before reaching the executor. The fix adds
+`TokenNumericLit` to that switch (preserving the raw literal text), then the
+executor parses it with `strconv.ParseFloat` and bounds-checks `0.0 ≤ f ≤ 100.0`
+via the `!(f >= 0 && f <= 100)` form — which also rejects `NaN`/`±Inf` that
+`ParseFloat` would otherwise accept (above-range / non-numeric → PG's `22023`;
+negatives are rejected earlier by the parser as a syntax error). It persists
+`catalog.Table.AutovacuumVacuumScaleFactor` (a `float64`). The pg_class virtual
+view appends `autovacuum_vacuum_scale_factor=F` after `autovacuum_vacuum_threshold`,
+rendering `F` as its shortest exact decimal via
+`strconv.FormatFloat(f, 'g', -1, 64)` (so `0.2`→`0.2`, `0`→`0`); pg_dump's
+`appendReloptionsArray` renders `WITH (autovacuum_vacuum_scale_factor='0.2')`.
+
+goopg has no autovacuum, so the value is advisory catalog/dump-only state —
+runtime unaffected; only the schema round-trips. Base-table-only, same as the
+sibling reloption slices.
+
+Engine guards: `TestAutovacuumVacuumScaleFactorSurfacesInPgClassReloptions`
+(combined `{fillfactor=70,autovacuum_vacuum_scale_factor=0.2}`; explicit-zero
+`{autovacuum_vacuum_scale_factor=0}` proving the Set flag, not a zero check,
+guards presence; plain table → no reloptions) and
+`TestAutovacuumVacuumScaleFactorOutOfBoundsRejected` (`100.5`/`1000`/`notafloat`
+→ 22023). The pg_dump fixture adds `optavsf (… WITH
+(autovacuum_vacuum_scale_factor=0.2))` on its own table; the assertion confirms
+the dump carries `WITH (autovacuum_vacuum_scale_factor='0.2')`. This unblocks the
+remaining REAL-typed table reloptions (`autovacuum_analyze_scale_factor`,
+`autovacuum_vacuum_insert_scale_factor`, `autovacuum_vacuum_cost_delay`, …),
+which now reuse the same float parse/format path.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

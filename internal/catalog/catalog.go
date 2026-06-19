@@ -438,6 +438,22 @@ type Table struct {
 	// (DU-002 slice 198).
 	AutovacuumVacuumThreshold    int
 	AutovacuumVacuumThresholdSet bool
+
+	// AutovacuumVacuumScaleFactor stores the table's
+	// `WITH (autovacuum_vacuum_scale_factor=F)` storage parameter — the first
+	// REAL-typed reloption goopg round-trips. PG's reloption type is
+	// RELOPT_TYPE_REAL with range 0.0–100.0 and a default of -1 (= unset / use
+	// the GUC); because 0.0 is a valid explicit value, AutovacuumVacuumScaleFactorSet
+	// — not a zero check — guards whether the option was specified (the
+	// parallel_workers pattern, generalized to a float). When set,
+	// pg_class.reloptions gains the text[] element
+	// `autovacuum_vacuum_scale_factor=F` (F rendered as its shortest exact
+	// decimal), which pg_dump renders back as
+	// `WITH (autovacuum_vacuum_scale_factor='F')`. goopg has no autovacuum, so the
+	// value is catalog/dump-only (advisory; runtime unaffected). M0110-0001
+	// (DU-002 slice 199).
+	AutovacuumVacuumScaleFactor    float64
+	AutovacuumVacuumScaleFactorSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2151,7 +2167,8 @@ func (c *InMemory) registerSystemTables() {
 			// order as `{fillfactor=70,parallel_workers=4}`; autovacuum_enabled
 			// (slice 196) follows as a boolean element, then toast_tuple_target
 			// (slice 197) and autovacuum_vacuum_threshold (slice 198) as trailing
-			// integer elements.
+			// integer elements, then autovacuum_vacuum_scale_factor (slice 199) as
+			// the first REAL-typed element.
 			var relopts []string
 			if t.Fillfactor != 0 {
 				relopts = append(relopts, "fillfactor="+strconv.Itoa(t.Fillfactor))
@@ -2167,6 +2184,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.AutovacuumVacuumThresholdSet {
 				relopts = append(relopts, "autovacuum_vacuum_threshold="+strconv.Itoa(t.AutovacuumVacuumThreshold))
+			}
+			if t.AutovacuumVacuumScaleFactorSet {
+				relopts = append(relopts, "autovacuum_vacuum_scale_factor="+strconv.FormatFloat(t.AutovacuumVacuumScaleFactor, 'g', -1, 64))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

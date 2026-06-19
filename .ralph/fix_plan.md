@@ -4377,6 +4377,33 @@ object support.
         needs float parse + 0-as-valid) or another int autovacuum knob
         (`autovacuum_analyze_threshold`/`autovacuum_vacuum_insert_threshold`); or composite types
         (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger).
+      - **PROGRESS 2026-06-19 (loop #12):** **DU-002 slice 199 LANDED — first REAL-typed storage
+        parameter (`autovacuum_vacuum_scale_factor`) round-trips through pg_dump.** Every reloption slice
+        so far (54/195/196/197/198) was int/bool-typed; this is the first `RELOPT_TYPE_REAL` knob. PG's
+        range is 0.0–100.0 with default -1 (`reloptions.c`), so 0.0 is a valid explicit value guarded by a
+        separate `AutovacuumVacuumScaleFactorSet` flag. The real value surfaced a **parser gap**: a
+        fractional literal (`0.2`) lexes as `TokenNumericLit`, which `parseWithOptions` rejected with
+        "expected option value", so the option never reached the executor. Fix: accept `TokenNumericLit`
+        in `parseWithOptions` (raw text preserved), then `strconv.ParseFloat` + bounds-check
+        `!(f>=0 && f<=100)` (also rejects NaN/±Inf; above-range/non-numeric → `22023`; negatives are a
+        parser syntax error) on the base-table CREATE path; persist
+        `catalog.Table.AutovacuumVacuumScaleFactor` (float64); pg_class virtual view appends
+        `autovacuum_vacuum_scale_factor=F` after `autovacuum_vacuum_threshold`, F rendered via
+        `FormatFloat(f,'g',-1,64)` (0.2→"0.2", 0→"0"); pg_dump renders
+        `WITH (autovacuum_vacuum_scale_factor='0.2')`. goopg has no autovacuum → advisory
+        catalog/dump-only; base-table-only. Files: `internal/parser/ddl.go` (`parseWithOptions` accepts
+        `TokenNumericLit`), `internal/catalog/catalog.go` (`Table.AutovacuumVacuumScaleFactor`/`…Set` +
+        render), `internal/executor/operators_ddl.go` (extract/parse/bounds + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestAutovacuumVacuumScaleFactorSurfacesInPgClassReloptions` +
+        `TestAutovacuumVacuumScaleFactorOutOfBoundsRejected`), `internal/testport/pgdump_connsetup_test.go`
+        (NEW `optavsf` fixture + assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 199).
+        Gates: gofmt OK; `go build ./internal/...` clean; `go vet parser/catalog/testport` clean;
+        catalog/executor reloption tests PASS; `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit
+        smoke on commit. **Next:** the now-unblocked REAL-typed reloptions reuse this float path
+        (`autovacuum_analyze_scale_factor`, `autovacuum_vacuum_insert_scale_factor`,
+        `autovacuum_vacuum_cost_delay`); or another int autovacuum knob (`autovacuum_analyze_threshold`); or
+        composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

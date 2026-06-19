@@ -739,6 +739,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optavt: %v", err)
 	}
 
+	// Slice 199: the first REAL-typed storage parameter
+	// (`autovacuum_vacuum_scale_factor`, valid 0.0–100.0). Prior reloption slices
+	// were all int/bool; a fractional value (`0.2`) lexes as TokenNumericLit,
+	// which the WITH-options parser previously rejected with "expected option
+	// value", so the option never reached the executor. The fix accepts
+	// TokenNumericLit in parseWithOptions and parses/bounds-checks the float
+	// (0.0 is a valid explicit value — separate set flag, the parallel_workers
+	// pattern). catalog.Table.AutovacuumVacuumScaleFactor persists it; the
+	// pg_class virtual view renders `{autovacuum_vacuum_scale_factor=0.2}`
+	// (shortest exact decimal), which pg_dump emits as
+	// `WITH (autovacuum_vacuum_scale_factor='0.2')`. goopg has no autovacuum, so
+	// the value is catalog/dump-only (advisory). `optavsf` carries it on its own
+	// table to keep the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optavsf (id integer PRIMARY KEY) WITH (autovacuum_vacuum_scale_factor=0.2)"); err != nil {
+		t.Fatalf("create table optavsf: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2443,6 +2460,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (autovacuum_vacuum_threshold='100')") {
 			t.Errorf("pg_dump dropped the autovacuum_vacuum_threshold reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_vacuum_threshold='100')", res.Stdout)
+		}
+		// **Slice 199 closed (asserted):** the first REAL-typed storage parameter
+		// (autovacuum_vacuum_scale_factor) must round-trip. A fractional value
+		// (`0.2`) lexes as TokenNumericLit, which parseWithOptions previously
+		// rejected with "expected option value", so the option never reached the
+		// executor. parseWithOptions now accepts TokenNumericLit and the executor
+		// parses/bounds-checks the float (0.0 valid via a separate set flag).
+		// catalog.Table.AutovacuumVacuumScaleFactor persists it and the pg_class
+		// virtual view renders `{autovacuum_vacuum_scale_factor=0.2}`, which pg_dump
+		// emits as `WITH (autovacuum_vacuum_scale_factor='0.2')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optavsf (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optavsf\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (autovacuum_vacuum_scale_factor='0.2')") {
+			t.Errorf("pg_dump dropped the autovacuum_vacuum_scale_factor reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_vacuum_scale_factor='0.2')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

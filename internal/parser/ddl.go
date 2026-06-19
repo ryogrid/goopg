@@ -2934,7 +2934,11 @@ func (p *parser) parseWithOptions() (map[string]string, error) {
 			p.advance() // consume '='
 			t := p.cur()
 			switch t.Kind {
-			case TokenIntLit, TokenStringLit:
+			case TokenIntLit, TokenStringLit, TokenNumericLit:
+				// TokenNumericLit (e.g. `0.2`) is accepted so REAL-typed storage
+				// parameters such as autovacuum_vacuum_scale_factor round-trip;
+				// the raw text is preserved for the executor to parse/bounds-check.
+				// M0110-0001 (DU-002 slice 199).
 				val = t.Value
 			case TokenIdent, TokenQuotedIdent, TokenKeyword:
 				val = identText(t)
