@@ -5553,6 +5553,32 @@ adds a `pfo` LIST parent with an option-bearing leaf (`pfo_1 … WITH
 substring match would also catch slice 54's `opt` table) and verifies `pfo_2`
 carries no `WITH` clause.
 
+### Slice 192 — per-leaf-partition `TABLESPACE` clause (parser sibling-path gap)
+
+PG's `CREATE TABLE … PARTITION OF …` grammar admits `OptTableSpace` (after
+`OptWith` / `OnCommitOption`), so a leaf partition may carry a trailing
+`TABLESPACE name`. The non-partition `CREATE TABLE` path already accepts and
+discards this clause (`ddl.go` ~2248 — goopg's storage manager does not honour
+tablespaces), but the partition-child arm stopped after `WITH` / `ON COMMIT` and
+returned. The unconsumed `TABLESPACE` token then made the whole statement fail
+with a syntax error — a divergence from the main path and from PG.
+
+The fix mirrors the main path in the partition-child arm: after the `WITH` and
+`ON COMMIT` trailers, `acceptKeyword(KwTablespace)` and `parseIdent()` the name,
+discarding it. Because `reltablespace` stays 0 (the default-tablespace sentinel,
+hardcoded in `pg18_user_catalog_rows.go`), pg_dump emits **no** `TABLESPACE`
+clause and the child round-trips exactly like an option-less leaf. (Storing a
+non-default `reltablespace` and re-emitting the clause is a separate, larger
+multi-catalog feature — `pg_class.reltablespace` + `pg_tablespace` name
+resolution — and is out of scope here.)
+
+Parser unit guards: `TestPartitionChildTablespaceClause` (bare trailing
+`TABLESPACE`) and `TestPartitionChildTablespaceAfterWith` (grammar order
+`WITH (...) TABLESPACE ...`). The pg_dump fixture adds a `ptbs` LIST parent with a
+leaf `ptbs_1 … TABLESPACE pg_default`; the assertion confirms the leaf's
+`CREATE TABLE` carries no spurious `TABLESPACE`/`WITH` clause and its
+`ATTACH PARTITION … FOR VALUES IN (1)` bound round-trips.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

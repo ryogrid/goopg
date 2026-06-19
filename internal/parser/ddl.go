@@ -1744,6 +1744,21 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				_ = p.acceptIdentKeyword("rows") || p.acceptKeyword(KwDrop)
 			}
 		}
+		// Optional TABLESPACE clause on a partition child, e.g.
+		// `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) TABLESPACE pg_default`.
+		// PG's CREATE TABLE ... PARTITION OF grammar admits OptTableSpace (after
+		// OptWith / OnCommitOption); the partition-child arm previously omitted it,
+		// so a trailing TABLESPACE left unconsumed tokens and the whole statement
+		// failed with a syntax error. Mirror the non-partition path (line ~2248):
+		// accept and discard the name — goopg's storage manager does not honour
+		// tablespaces, so reltablespace stays 0 and pg_dump emits no TABLESPACE
+		// clause for the default tablespace, round-tripping the child unchanged.
+		// M0110-0001 (DU-002 slice 192).
+		if p.acceptKeyword(KwTablespace) {
+			if _, err := p.parseIdent(); err != nil {
+				return nil, err
+			}
+		}
 		return stmt, nil
 	}
 

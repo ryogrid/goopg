@@ -68,3 +68,39 @@ func TestPartitionChildWithStorageParamsAfterSubPartitionBy(t *testing.T) {
 		t.Errorf("expected With[fillfactor]=70, got %q (With=%v)", got, ct.With)
 	}
 }
+
+// TestPartitionChildTablespaceClause covers DU-002 slice 192: a leaf partition
+// child may carry a trailing TABLESPACE clause (after FOR VALUES, any WITH, and
+// ON COMMIT), exactly like the non-partition CREATE TABLE path. The parser
+// previously stopped before TABLESPACE, leaving it unconsumed so the statement
+// failed with a syntax error. The name is accepted and discarded (goopg's
+// storage manager does not honour tablespaces), so the parse must simply succeed.
+func TestPartitionChildTablespaceClause(t *testing.T) {
+	sql := `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) TABLESPACE pg_default`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if ct.PartitionOf == nil {
+		t.Fatal("no PartitionOf")
+	}
+}
+
+// TestPartitionChildTablespaceAfterWith ensures the TABLESPACE clause is parsed
+// when it follows a WITH (storage params) clause — the PG grammar order is
+// OptWith → OnCommitOption → OptTableSpace, so both trailers must be consumed.
+func TestPartitionChildTablespaceAfterWith(t *testing.T) {
+	sql := `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) WITH (fillfactor=70) TABLESPACE pg_default`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if ct.PartitionOf == nil {
+		t.Fatal("no PartitionOf")
+	}
+	if got := ct.With["fillfactor"]; got != "70" {
+		t.Errorf("expected With[fillfactor]=70, got %q (With=%v)", got, ct.With)
+	}
+}

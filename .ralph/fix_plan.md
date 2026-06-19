@@ -4217,6 +4217,26 @@ object support.
         clean; parser + executor + `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on
         commit. **Next:** composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger);
         or partition-child `TABLESPACE` clause round-trip.
+      - **PROGRESS 2026-06-19 (loop #5):** **DU-002 slice 192 LANDED — per-leaf-partition
+        `TABLESPACE` clause (parser sibling-path gap).** PG's `CREATE TABLE … PARTITION OF …`
+        grammar admits `OptTableSpace` (after `OptWith`/`OnCommitOption`); the non-partition CREATE
+        TABLE path already accepts-and-discards it (`ddl.go` ~2248, storage manager does not honour
+        tablespaces) but the partition-child arm returned after `WITH`/`ON COMMIT`, so a trailing
+        `TABLESPACE name` left the token unconsumed and the whole statement failed with a syntax
+        error — a divergence from both the main path and PG. Fix: mirror the main path in the
+        partition-child arm (`acceptKeyword(KwTablespace)` + `parseIdent()`, discard the name).
+        `reltablespace` stays 0 (default sentinel), so pg_dump emits no TABLESPACE clause and the
+        child round-trips exactly like an option-less leaf. (Storing a non-default `reltablespace`
+        + re-emitting the clause is a separate larger multi-catalog feature — out of scope.) Files:
+        `internal/parser/ddl.go`, `internal/parser/gen_override_test.go` (2 new unit tests:
+        `TestPartitionChildTablespaceClause`, `TestPartitionChildTablespaceAfterWith`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `ptbs`/`ptbs_1 … TABLESPACE pg_default`
+        fixture + no-spurious-TABLESPACE/WITH + ATTACH-bound assertions),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 192). Gates: gofmt OK; `go build ./...`
+        clean; `go vet ./internal/testport/` clean; parser + `TestPort_PgDumpConnectionSetup` PASS;
+        pgbench pre-commit smoke on commit. **Next:** composite types (`CREATE TYPE AS`;
+        `pg_class.reltype` hardcoded 0 — larger); or PG18 virtual generated columns
+        (`GENERATED ALWAYS AS (expr) VIRTUAL`; attgenerated='v' not yet surfaced — runtime-heavy).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

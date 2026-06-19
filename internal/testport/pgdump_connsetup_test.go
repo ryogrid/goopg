@@ -798,6 +798,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create LIST leaf partition pfo_2: %v", err)
 	}
 
+	// Slice 192: a leaf partition child may carry a trailing TABLESPACE clause
+	// (PG's CREATE TABLE ... PARTITION OF grammar admits OptTableSpace after
+	// OptWith / OnCommitOption). The partition-child parser arm previously stopped
+	// before TABLESPACE, leaving the token unconsumed so the whole statement
+	// failed with a syntax error — a divergence from the non-partition CREATE
+	// TABLE path, which already accepts and discards it. goopg's storage manager
+	// does not honour tablespaces, so reltablespace stays 0 (the default-tablespace
+	// sentinel) and pg_dump emits no TABLESPACE clause; the child round-trips
+	// exactly like an option-less leaf. `ptbs_1` exercises the parse-and-discard
+	// of `TABLESPACE pg_default` on a LIST leaf of `ptbs`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ptbs (k integer, v text) PARTITION BY LIST (k)"); err != nil {
+		t.Fatalf("create LIST-partitioned table ptbs: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ptbs_1 PARTITION OF public.ptbs FOR VALUES IN (1) TABLESPACE pg_default"); err != nil {
+		t.Fatalf("create LIST leaf partition ptbs_1 with TABLESPACE: %v", err)
+	}
+
 	// Slice 170: legacy table inheritance (CREATE TABLE child (...) INHERITS
 	// (parent)) must round-trip. goopg merged the parent's columns into the child
 	// but (a) emitted no pg_inherits row for the inheritance edge (only partition
@@ -2392,6 +2409,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pfo_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped/mangled the fillfactor leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pfo_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 192 closed (asserted):** a TABLESPACE clause on a leaf partition.
+		// The partition-child parser arm previously omitted OptTableSpace, so the
+		// trailing `TABLESPACE pg_default` left unconsumed tokens and the whole
+		// CREATE TABLE failed with a syntax error (the runSQLSimple above would have
+		// fatal'd at fixture setup). The parser now accepts and discards the name,
+		// mirroring the non-partition path. reltablespace stays 0 (default), so
+		// pg_dump emits NO TABLESPACE clause and the child round-trips exactly like
+		// an option-less leaf: a plain CREATE TABLE plus its ATTACH bound, with no
+		// spurious WITH or TABLESPACE.
+		if ptbsStart := strings.Index(res.Stdout, "CREATE TABLE public.ptbs_1 ("); ptbsStart >= 0 {
+			rest := res.Stdout[ptbsStart:]
+			stmtEnd := strings.Index(rest, ";")
+			if stmtEnd < 0 {
+				stmtEnd = len(rest)
+			}
+			ptbsStmt := rest[:stmtEnd]
+			if strings.Contains(ptbsStmt, "TABLESPACE") {
+				t.Errorf("pg_dump emitted a spurious TABLESPACE clause on the default-tablespace leaf ptbs_1\n  ptbs_1 stmt=%q\n  full stdout=%q", ptbsStmt, res.Stdout)
+			}
+			if strings.Contains(ptbsStmt, "WITH (") {
+				t.Errorf("pg_dump emitted a spurious WITH clause on the option-less leaf ptbs_1\n  full stdout=%q", res.Stdout)
+			}
+		} else {
+			t.Errorf("pg_dump did not emit CREATE TABLE for leaf partition ptbs_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.ptbs_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped/mangled the TABLESPACE leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.ptbs_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 170 closed (asserted):** legacy table inheritance. goopg emitted
 		// no pg_inherits row for the INHERITS edge and left the inherited columns
