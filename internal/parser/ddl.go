@@ -3076,6 +3076,19 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 							continue
 						}
 					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "fastupdate" {
+					// GIN boolean storage parameter. PG accepts on/off/true/
+					// false/yes/no/1/0 (parse_bool); record the value so pg_dump
+					// can re-emit it. DU-002 slice 220.
+					p.advance() // consume "fastupdate"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if b, ok := parseReloptionBool(p.cur().Value); ok {
+							stmt.FastUpdate = &b
+							p.advance()
+							continue
+						}
+					}
 				}
 				p.advance()
 			}

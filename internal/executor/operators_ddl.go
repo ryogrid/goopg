@@ -4106,10 +4106,11 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method == "hash" {
 		method = "btree"
 	}
-	// gist and spgist: register catalog metadata only (no physical storage).
-	// pg_index / pg_class / pg_get_indexdef queries work correctly; no actual
-	// index acceleration or constraint enforcement.
-	if method == "gist" || method == "spgist" {
+	// gist, spgist and gin: register catalog metadata only (no physical
+	// storage). pg_index / pg_class / pg_get_indexdef queries work correctly; no
+	// actual index acceleration or constraint enforcement. GIN is catalog-only
+	// so its `fastupdate` reloption can round-trip through pg_dump. DU-002 slice 220.
+	if method == "gist" || method == "spgist" || method == "gin" {
 		idx, createErr := o.ctx.Catalog.CreateIndex(idxName, tbl, s.Columns, s.Unique, method, false)
 		if createErr != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: createErr.Error()}
@@ -4121,6 +4122,8 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		idx.Fillfactor = s.Fillfactor
 		// Persist `WITH (deduplicate_items=on|off)` likewise. DU-002 slice 219.
 		idx.DeduplicateItems = s.DeduplicateItems
+		// Persist `WITH (fastupdate=on|off)` (GIN). DU-002 slice 220.
+		idx.FastUpdate = s.FastUpdate
 		if catalogHeapSyncAvailable(o.ctx) {
 			if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
 				return fmt.Errorf("DDL catalog sync: %w", syncErr)

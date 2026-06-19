@@ -1259,6 +1259,11 @@ type CreateIndexStmt struct {
 	// pointer records the explicitly-declared value so pg_get_indexdef can
 	// re-emit `WITH (deduplicate_items='on'|'off')`. DU-002 slice 219.
 	DeduplicateItems *bool
+	// FastUpdate captures the GIN `WITH (fastupdate=on|off)` boolean storage
+	// parameter. nil means unset (PG default ON); a non-nil pointer records the
+	// explicitly-declared value so pg_get_indexdef can re-emit
+	// `WITH (fastupdate='on'|'off')`. DU-002 slice 220.
+	FastUpdate *bool
 }
 
 // IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key

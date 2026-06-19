@@ -4828,6 +4828,30 @@ object support.
         reloptions (`fastupdate` for gin); or the BIGGER `toast.*` namespace (toast-table pg_class modeling) /
         composite types.
 
+      - **PROGRESS 2026-06-19 (loop #35):** **DU-002 slice 220 LANDED — GIN catalog-only index + `fastupdate`
+        boolean storage parameter round-trips through pg_dump.** Two gaps: (1) GIN was not creatable —
+        `execCreateIndex` routed only `gist`/`spgist` to the catalog-only registration branch, every other
+        non-btree method fell through to `index method %q is not supported in v0`; (2) the WITH parser discarded
+        `fastupdate`. Reused slice 219's exact bool plumbing: the catalog-only branch guard widened to
+        `gist||spgist||gin` (GIN now registers metadata-only — pg_class/pg_index/pg_get_indexdef populated, no
+        physical build, no acceleration/opclass enforcement, exactly like the pre-existing gist path), and it
+        persists `idx.FastUpdate = s.FastUpdate`. Parser (`ddl.go`) recognizes `fastupdate` via the existing
+        `parseReloptionBool` into `CreateIndexStmt.FastUpdate` (`*bool` tri-state). `Index.FastUpdate` appended to
+        `reloptionList()` after fillfactor/deduplicate_items; `BuildIndexDef` already renders `USING <idx.Method>`
+        so a GIN index dumps `USING gin … WITH (fastupdate='off')` and the pg_class.reloptions cell renders
+        `{fastupdate=off}`. JSON-persisted; advisory catalog/dump-only (no GIN pending-list). Same normalization
+        limitation as slice 219. Files: `internal/parser/ast.go` (`CreateIndexStmt.FastUpdate`),
+        `internal/parser/ddl.go` (WITH-loop `fastupdate` capture), `internal/catalog/catalog.go` (`Index.FastUpdate`
+        + `reloptionList()`), `internal/executor/operators_ddl.go` (gin in catalog-only branch + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW `TestIndexFastUpdateSurfacesInPgClassReloptions`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `foo_fastupdate_idx` fixture + indexDefs assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 220). Gates: gofmt OK; `go build ./internal/...` clean;
+        catalog/parser/full-executor suites PASS; `TestPort_PgDumpConnectionSetup` PASS (round-trips `CREATE INDEX
+        foo_fastupdate_idx ON public.foo USING gin (qty) WITH (fastupdate='off');` — `USING gin` preserved, not
+        upgraded to btree); pgbench pre-commit smoke on commit. **Next:** GIN/brin gain more catalog-only
+        reloptions (`gin_pending_list_limit`, brin `autosummarize`/`pages_per_range` — brin still needs the
+        catalog-only branch widened too); or the BIGGER `toast.*` namespace / composite types.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

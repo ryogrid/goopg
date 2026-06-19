@@ -6333,6 +6333,43 @@ NULL and no WITH clause). The pg_dump fixture adds `foo_dedup_idx ON public.foo 
 (deduplicate_items=off)`; the assertion confirms the dump carries
 `CREATE INDEX foo_dedup_idx ON public.foo USING btree (qty) WITH (deduplicate_items='off');`.
 
+### Slice 220 — GIN catalog-only index + `fastupdate` reloption round-trip
+
+Adds the GIN `fastupdate` boolean storage parameter on **`CREATE INDEX … USING gin`**. PG's GIN
+access method exposes `fastupdate` (default ON) to control the pending-list insertion fast-path;
+`WITH (fastupdate=off)` must survive a dump/restore. Two gaps blocked this:
+
+1. **GIN was not creatable.** `execCreateIndex` routed only `gist`/`spgist` to the catalog-only
+   registration branch (no physical storage; pg_class/pg_index/pg_get_indexdef populated, no build);
+   every other non-btree method fell through to `index method %q is not supported in v0`. So a GIN
+   index could not exist, let alone carry a reloption.
+2. **The WITH parser discarded `fastupdate`** (like every key other than fillfactor/deduplicate_items).
+
+This slice threads it through, reusing slice 219's exact boolean plumbing:
+
+- **Executor** (`operators_ddl.go`): the catalog-only branch guard widens to `method == "gist" ||
+  method == "spgist" || method == "gin"`, so GIN registers metadata-only like gist (`Catalog.CreateIndex`
+  already stores any method string verbatim). The branch now persists `idx.FastUpdate = s.FastUpdate`
+  alongside fillfactor/deduplicate_items. GIN never reaches the btree branch, so no change there.
+- **Parser** (`ddl.go`): the WITH loop recognizes `fastupdate` and parses its boolean via the existing
+  `parseReloptionBool` helper into `CreateIndexStmt.FastUpdate` (`*bool` tri-state).
+- **catalog** (`catalog.go`): `Index.FastUpdate` (`*bool`) is appended to `reloptionList()` after
+  fillfactor and deduplicate_items. `BuildIndexDef` already renders `USING <idx.Method>`, so a GIN
+  index dumps `USING gin … WITH (fastupdate='off')`; the index's `pg_class.reloptions` cell renders
+  `{fastupdate=off}`.
+
+`catalog.Index.FastUpdate` is JSON-persisted. goopg has no GIN pending-list, so the value is advisory
+catalog/dump-only — as is the GIN index itself (no acceleration, no opclass enforcement, exactly like
+the pre-existing gist/spgist catalog-only path). Same normalization limitation as slice 219 (token
+normalized to on/off; unrecognized token silently ignored).
+
+Engine guard: `TestIndexFastUpdateSurfacesInPgClassReloptions` (an `off` value → `{fastupdate=off}`
+and `BuildIndexDef` containing `USING gin` + `WITH (fastupdate='off')`; a `yes` value → `{fastupdate=on}`;
+a plain GIN index keeps reloptions NULL and no WITH clause). The pg_dump fixture adds
+`foo_fastupdate_idx ON public.foo USING gin (qty) WITH (fastupdate=off)`; the assertion confirms the
+dump carries `CREATE INDEX foo_fastupdate_idx ON public.foo USING gin (qty) WITH (fastupdate='off');`
+(the `USING gin` access method is preserved, not silently upgraded to btree).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -986,6 +986,13 @@ type Index struct {
 	// (deduplicate_items='on')`. goopg does not perform btree posting-list
 	// deduplication, so this is advisory catalog/dump-only. DU-002 slice 219.
 	DeduplicateItems *bool
+	// FastUpdate stores the GIN `WITH (fastupdate=on|off)` boolean storage
+	// parameter. nil means unset (PG default ON) — no reloption is emitted, so a
+	// plain index dumps byte-identically. When set, the index's
+	// pg_class.reloptions virtual row renders `fastupdate=on` (or `off`), which
+	// pg_dump re-emits as `CREATE INDEX … WITH (fastupdate='on')`. goopg has no
+	// GIN pending-list, so this is advisory catalog/dump-only. DU-002 slice 220.
+	FastUpdate *bool
 }
 
 // reloptionList returns the index's storage parameters as ordered key=value
@@ -1005,6 +1012,13 @@ func (idx *Index) reloptionList() [][2]string {
 			v = "on"
 		}
 		opts = append(opts, [2]string{"deduplicate_items", v})
+	}
+	if idx.FastUpdate != nil {
+		v := "off"
+		if *idx.FastUpdate {
+			v = "on"
+		}
+		opts = append(opts, [2]string{"fastupdate", v})
 	}
 	return opts
 }

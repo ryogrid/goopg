@@ -1,35 +1,35 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 219 (loop #34) — index `deduplicate_items` btree BOOLEAN
-storage parameter round-trips through pg_dump. goopg's FIRST index-level boolean
-reloption (slice 218's fillfactor was an int).
+Last landed: DU-002 slice 220 (loop #35) — GIN catalog-only index + `fastupdate`
+boolean storage parameter round-trips through pg_dump.
 
-What happened: goopg's CREATE INDEX `WITH (…)` parser only extracted `fillfactor`,
-discarding every other key — so `deduplicate_items=off` was silently lost (index
-restored with btree dedup implicitly ON). Threaded through: parser (ddl.go) recognizes
-`deduplicate_items`, parses bool via NEW `parseReloptionBool` (PG parse_bool token set
-on/off/true/false/yes/no/1/0); value → `CreateIndexStmt.DeduplicateItems` (*bool
-tri-state, nil=unset). execCreateIndex persists `idx.DeduplicateItems = s.DeduplicateItems`
-in BOTH branches (btree guard now includes `s.DeduplicateItems != nil`). KEY refactor
-(sibling-path law): both render surfaces now share a NEW `Index.reloptionList()` helper
-returning ordered key=value pairs (fillfactor first) — (1) BuildIndexDef emits multi-option
-` WITH (fillfactor='70', deduplicate_items='off')` (single-quoted, joined ", "); (2) index
-pg_class.reloptions cell renders `{fillfactor=70,deduplicate_items=off}`. JSON-persisted.
-Limitation: bool normalized to on/off (false/no/0 → off); unrecognized token silently
-ignored (matches fillfactor leniency).
+What happened: TWO gaps. (1) GIN was not creatable — execCreateIndex routed only
+gist/spgist to the catalog-only registration branch; every other non-btree method
+fell through to "index method %q is not supported in v0". (2) the CREATE INDEX
+WITH(…) parser discarded `fastupdate`. Reused slice 219's EXACT bool plumbing:
+widened the catalog-only branch guard to `gist||spgist||gin` (GIN now registers
+metadata-only — pg_class/pg_index/pg_get_indexdef populated, no physical build, no
+acceleration/opclass enforcement, identical to the pre-existing gist path) and it
+persists `idx.FastUpdate = s.FastUpdate`. Parser recognizes `fastupdate` via the
+existing parseReloptionBool into CreateIndexStmt.FastUpdate (*bool tri-state).
+Index.FastUpdate appended to reloptionList() after fillfactor/deduplicate_items;
+BuildIndexDef already renders `USING <idx.Method>` so a GIN index dumps
+`USING gin … WITH (fastupdate='off')`; pg_class.reloptions cell → `{fastupdate=off}`.
+JSON-persisted; advisory catalog/dump-only (no GIN pending-list). Same normalization
+limit as slice 219 (token → on/off; unrecognized silently ignored).
 
-Files: internal/parser/ast.go (CreateIndexStmt.DeduplicateItems), internal/parser/ddl.go
-(WITH capture + parseReloptionBool helper), internal/catalog/catalog.go
-(Index.DeduplicateItems + reloptionList() + both render surfaces),
-internal/executor/operators_ddl.go (persist both branches),
-internal/executor/operators_fillfactor_reloptions_test.go (NEW
-TestIndexDeduplicateItemsSurfacesInPgClassReloptions), internal/testport/pgdump_connsetup_test.go
-(foo_dedup_idx fixture + indexDefs assertion), docs/design/0110-0001-pg-dump-tap-port.md
-(Slice 219), fix_plan.md.
+Files: internal/parser/ast.go (CreateIndexStmt.FastUpdate), internal/parser/ddl.go
+(WITH-loop fastupdate capture), internal/catalog/catalog.go (Index.FastUpdate +
+reloptionList()), internal/executor/operators_ddl.go (gin in catalog-only branch +
+persist), internal/executor/operators_fillfactor_reloptions_test.go (NEW
+TestIndexFastUpdateSurfacesInPgClassReloptions), internal/testport/pgdump_connsetup_test.go
+(foo_fastupdate_idx fixture + indexDefs assertion), docs/design/0110-0001-pg-dump-tap-port.md
+(Slice 220), fix_plan.md.
 
-Gates: gofmt OK; go build ./internal/... clean; parser+catalog+executor suites PASS;
-TestPort_PgDumpConnectionSetup PASS; pgbench pre-commit smoke on commit.
+Gates: gofmt OK; go build ./internal/... clean; catalog+parser+FULL executor suites
+PASS; TestPort_PgDumpConnectionSetup PASS; pgbench pre-commit smoke on commit.
 
-Next: more btree boolean reloptions reuse this exact plumbing (gin `fastupdate`,
-`buffering` for gist). Or the BIGGER `toast.*` namespace (needs toast-table pg_class
-modeling — reltoastrelid hardcoded 0) or composite types (CREATE TYPE AS; reltype 0).
+Next: GIN/brin gain more catalog-only reloptions (gin `gin_pending_list_limit` int;
+brin `autosummarize` bool / `pages_per_range` int — brin still needs the catalog-only
+branch widened, same one-line change as gin here). Or the BIGGER `toast.*` namespace
+(toast-table pg_class modeling; reltoastrelid hardcoded 0) / composite types.

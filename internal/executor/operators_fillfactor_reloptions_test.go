@@ -2284,3 +2284,88 @@ func TestIndexDeduplicateItemsSurfacesInPgClassReloptions(t *testing.T) {
 		t.Errorf("BuildIndexDef(iplain) = %q, want no WITH clause", def)
 	}
 }
+
+// TestIndexFastUpdateSurfacesInPgClassReloptions verifies that a GIN
+// `WITH (fastupdate=on|off)` boolean storage parameter declared on CREATE INDEX
+// USING gin is persisted on the catalog Index and surfaced through the index's
+// own pg_class virtual-view row (relkind 'i'), reloptions cell. GIN registers
+// catalog-only (no physical storage, like gist/spgist), which is what lets the
+// fastupdate reloption round-trip: pg_dump reads reloptions via `t.reloptions AS
+// indreloptions` and re-emits `CREATE INDEX … USING gin … WITH (fastupdate='off')`.
+// Cases pin: an off value (`{fastupdate=off}`), an on value spelled with a
+// non-canonical accepted token ("yes" → `fastupdate=on`), and a plain GIN index
+// (reloptions NULL). goopg has no GIN pending-list, so the value is
+// catalog/dump-only. DU-002 slice 220.
+func TestIndexFastUpdateSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE g (id integer, v integer, w integer)`); err != nil {
+		t.Fatalf("CREATE TABLE g: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX goff ON g USING gin (id) WITH (fastupdate=off)`); err != nil {
+		t.Fatalf("CREATE INDEX goff: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX gon ON g USING gin (v) WITH (fastupdate=yes)`); err != nil {
+		t.Fatalf("CREATE INDEX gon: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX gplain ON g USING gin (w)`); err != nil {
+		t.Fatalf("CREATE INDEX gplain: %v", err)
+	}
+
+	offIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "goff"})
+	if !ok {
+		t.Fatal("goff index not found")
+	}
+	if offIdx.FastUpdate == nil || *offIdx.FastUpdate {
+		t.Errorf("goff.FastUpdate = %v, want non-nil false", offIdx.FastUpdate)
+	}
+	onIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "gon"})
+	if !ok {
+		t.Fatal("gon index not found")
+	}
+	if onIdx.FastUpdate == nil || !*onIdx.FastUpdate {
+		t.Errorf("gon.FastUpdate = %v, want non-nil true", onIdx.FastUpdate)
+	}
+	plainIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "gplain"})
+	if !ok {
+		t.Fatal("gplain index not found")
+	}
+	if plainIdx.FastUpdate != nil {
+		t.Errorf("gplain.FastUpdate = %v, want nil (unset)", plainIdx.FastUpdate)
+	}
+
+	// pg_class.reloptions (column index 32) on the index pg_class rows (relkind
+	// 'i', column index 17).
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && r[17] == "i" && (r[1] == "goff" || r[1] == "gon" || r[1] == "gplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["goff"] != "{fastupdate=off}" {
+		t.Errorf("pg_class.reloptions for goff = %q, want %q", got["goff"], "{fastupdate=off}")
+	}
+	if got["gon"] != "{fastupdate=on}" {
+		t.Errorf("pg_class.reloptions for gon = %q, want %q", got["gon"], "{fastupdate=on}")
+	}
+	if got["gplain"] != "" {
+		t.Errorf("pg_class.reloptions for gplain = %q, want \"\" (NULL)", got["gplain"])
+	}
+
+	// BuildIndexDef (the pg_get_indexdef path pg_dump emits verbatim) must render
+	// `USING gin` and single-quote the reloption value.
+	if def := catalog.BuildIndexDef(offIdx); !strings.Contains(def, "USING gin") || !strings.Contains(def, "WITH (fastupdate='off')") {
+		t.Errorf("BuildIndexDef(goff) = %q, want USING gin and WITH (fastupdate='off')", def)
+	}
+	if def := catalog.BuildIndexDef(onIdx); !strings.Contains(def, "WITH (fastupdate='on')") {
+		t.Errorf("BuildIndexDef(gon) = %q, want it to contain %q", def, "WITH (fastupdate='on')")
+	}
+	if def := catalog.BuildIndexDef(plainIdx); strings.Contains(def, "WITH (") {
+		t.Errorf("BuildIndexDef(gplain) = %q, want no WITH clause", def)
+	}
+}

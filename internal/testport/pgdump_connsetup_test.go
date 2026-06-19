@@ -1477,6 +1477,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_dedup_idx ON public.foo (qty) WITH (deduplicate_items=off)"); err != nil {
 		t.Fatalf("create deduplicate_items index: %v", err)
 	}
+	// Slice 220: a GIN index declared `WITH (fastupdate=off)` must round-trip.
+	// GIN previously fell through to "index method gin is not supported in v0";
+	// it now registers catalog-only (like gist/spgist — no physical storage),
+	// which lets its fastupdate boolean reloption thread parser →
+	// catalog.Index.FastUpdate (*bool tri-state) → BuildIndexDef's `USING gin …
+	// WITH (fastupdate='off')` and the index pg_class.reloptions cell. goopg has
+	// no GIN pending-list, so the value is advisory catalog/dump-only.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_fastupdate_idx ON public.foo USING gin (qty) WITH (fastupdate=off)"); err != nil {
+		t.Fatalf("create fastupdate gin index: %v", err)
+	}
 	// Slice 134: a UNIQUE index declared `NULLS NOT DISTINCT` (PostgreSQL 15+)
 	// must round-trip. goopg's parser accepted the clause but DISCARDED it, and
 	// pg_index.indnullsnotdistinct was hard-wired false, so pg_get_indexdef
@@ -4046,6 +4056,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// re-emitted via flatten_reloptions (single-quoted value), in the same
 			// WITH clause position as fillfactor.
 			"CREATE INDEX foo_dedup_idx ON public.foo USING btree (qty) WITH (deduplicate_items='off');",
+			// Slice 220: GIN catalog-only index with a `WITH (fastupdate='off')`
+			// boolean reloption. Exercises the `USING gin` access-method rendering
+			// (not silently upgraded to btree) plus flatten_reloptions single-quoting.
+			"CREATE INDEX foo_fastupdate_idx ON public.foo USING gin (qty) WITH (fastupdate='off');",
 		}
 		for _, sub := range indexDefs {
 			if !strings.Contains(res.Stdout, sub) {
