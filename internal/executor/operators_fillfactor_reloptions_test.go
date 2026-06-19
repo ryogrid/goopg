@@ -707,6 +707,101 @@ func TestAutovacuumVacuumInsertScaleFactorOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+// TestAutovacuumVacuumCostDelaySurfacesInPgClassReloptions verifies that a
+// `WITH (autovacuum_vacuum_cost_delay=F)` storage parameter — the fourth (and
+// final) REAL-typed reloption goopg round-trips, reusing the slice-199 float path —
+// declared on CREATE TABLE is persisted on the catalog table and surfaced through
+// the pg_class virtual view's reloptions cell. Like autovacuum_vacuum_scale_factor
+// (slice 199), 0.0 is a valid explicit value (PG's reloption default is -1 =
+// unset), so the Set flag — not a zero check — guards presence. Cases pin: a
+// fractional value alongside fillfactor (combined
+// `{fillfactor=70,autovacuum_vacuum_cost_delay=2.5}`), the boundary value 0
+// (explicitly set, rendered `=0`), and a plain table (no reloptions). pg_dump
+// renders the array back as `WITH (autovacuum_vacuum_cost_delay='2.5')`. goopg has
+// no autovacuum, so the value is catalog/dump-only. DU-002 slice 202.
+func TestAutovacuumVacuumCostDelaySurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE av (id integer PRIMARY KEY) WITH (fillfactor=70, autovacuum_vacuum_cost_delay=2.5)`); err != nil {
+		t.Fatalf("CREATE TABLE av: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE avzero (id integer PRIMARY KEY) WITH (autovacuum_vacuum_cost_delay=0)`); err != nil {
+		t.Fatalf("CREATE TABLE avzero: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE avplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE avplain: %v", err)
+	}
+
+	avTbl, ok := cat.LookupTable(parser.ObjectName{Name: "av"})
+	if !ok {
+		t.Fatal("av table not found")
+	}
+	if avTbl.AutovacuumVacuumCostDelay != 2.5 || !avTbl.AutovacuumVacuumCostDelaySet {
+		t.Errorf("av cost_delay = %v set=%v, want 2.5 set=true", avTbl.AutovacuumVacuumCostDelay, avTbl.AutovacuumVacuumCostDelaySet)
+	}
+	zeroTbl, ok := cat.LookupTable(parser.ObjectName{Name: "avzero"})
+	if !ok {
+		t.Fatal("avzero table not found")
+	}
+	if zeroTbl.AutovacuumVacuumCostDelay != 0 || !zeroTbl.AutovacuumVacuumCostDelaySet {
+		t.Errorf("avzero cost_delay = %v set=%v, want 0 set=true", zeroTbl.AutovacuumVacuumCostDelay, zeroTbl.AutovacuumVacuumCostDelaySet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "avplain"})
+	if !ok {
+		t.Fatal("avplain table not found")
+	}
+	if plainTbl.AutovacuumVacuumCostDelaySet {
+		t.Errorf("avplain set=%v, want false (unset)", plainTbl.AutovacuumVacuumCostDelaySet)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "av" || r[1] == "avzero" || r[1] == "avplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["av"] != "{fillfactor=70,autovacuum_vacuum_cost_delay=2.5}" {
+		t.Errorf("pg_class.reloptions for av = %q, want %q", got["av"], "{fillfactor=70,autovacuum_vacuum_cost_delay=2.5}")
+	}
+	if got["avzero"] != "{autovacuum_vacuum_cost_delay=0}" {
+		t.Errorf("pg_class.reloptions for avzero = %q, want %q", got["avzero"], "{autovacuum_vacuum_cost_delay=0}")
+	}
+	if got["avplain"] != "" {
+		t.Errorf("pg_class.reloptions for avplain = %q, want \"\" (NULL)", got["avplain"])
+	}
+}
+
+// TestAutovacuumVacuumCostDelayOutOfBoundsRejected verifies CREATE TABLE rejects
+// an above-100.0 or non-numeric autovacuum_vacuum_cost_delay with PG's 22023 error.
+// The valid range is 0.0–100.0 (negatives are rejected earlier by the parser as a
+// syntax error, so the reachable invalid cases are above-range and non-numeric).
+// DU-002 slice 202.
+func TestAutovacuumVacuumCostDelayOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, av := range []string{"100.5", "1000", "notafloat"} {
+		err := runDDL(t, ctx, `CREATE TABLE avcdbad`+strconv.Itoa(i)+` (id integer) WITH (autovacuum_vacuum_cost_delay=`+av+`)`)
+		if err == nil {
+			t.Errorf("autovacuum_vacuum_cost_delay=%s: expected an error, got nil", av)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("autovacuum_vacuum_cost_delay=%s: error type = %T, want *ExecError", av, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("autovacuum_vacuum_cost_delay=%s: error code = %q, want 22023", av, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.

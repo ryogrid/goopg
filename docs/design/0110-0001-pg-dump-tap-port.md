@@ -5880,6 +5880,34 @@ confirms the dump carries `WITH (autovacuum_vacuum_insert_scale_factor='0.2')`. 
 remaining REAL-typed table reloption (`autovacuum_vacuum_cost_delay`, also
 0.0–100.0) continues to reuse this path.
 
+### Slice 202 — fourth (final) REAL-typed storage parameter (`autovacuum_vacuum_cost_delay`) round-trip
+
+The last REAL-typed table reloption, closing the slice-199 float family.
+`autovacuum_vacuum_cost_delay` is `RELOPT_TYPE_REAL` with range **0.0–100.0 and a
+default of -1** (`reloptions.c`: `{"autovacuum_vacuum_cost_delay", … -1, 0.0,
+100.0}`), so it reuses the slice-199 mechanism verbatim: the parser already accepts
+`TokenNumericLit`, the executor parses via `strconv.ParseFloat` + the
+`!(f >= 0 && f <= 100)` bounds-check (rejecting `NaN`/`±Inf`; above-range /
+non-numeric → `22023`), and a separate `AutovacuumVacuumCostDelaySet` flag (not a
+zero check) records presence so explicit `0.0` round-trips. It persists
+`catalog.Table.AutovacuumVacuumCostDelay` (a `float64`); the pg_class virtual view
+appends `autovacuum_vacuum_cost_delay=F` after `autovacuum_vacuum_insert_scale_factor`,
+rendering `F` via `strconv.FormatFloat(f, 'g', -1, 64)`; pg_dump renders
+`WITH (autovacuum_vacuum_cost_delay='2.5')`. Advisory catalog/dump-only,
+base-table-only — same as the sibling reloption slices.
+
+Engine guards: `TestAutovacuumVacuumCostDelaySurfacesInPgClassReloptions` (combined
+`{fillfactor=70,autovacuum_vacuum_cost_delay=2.5}`; explicit-zero
+`{autovacuum_vacuum_cost_delay=0}`; plain table → no reloptions) and
+`TestAutovacuumVacuumCostDelayOutOfBoundsRejected` (`100.5`/`1000`/`notafloat` →
+22023). The pg_dump fixture adds `optavcd (… WITH (autovacuum_vacuum_cost_delay=2.5))`
+on its own table; the assertion confirms the dump carries
+`WITH (autovacuum_vacuum_cost_delay='2.5')`. With this slice all four REAL-typed
+table reloptions (`autovacuum_vacuum_scale_factor`, `autovacuum_analyze_scale_factor`,
+`autovacuum_vacuum_insert_scale_factor`, `autovacuum_vacuum_cost_delay`) round-trip;
+the next reloption candidates are int autovacuum knobs (`autovacuum_analyze_threshold`,
+`autovacuum_vacuum_insert_threshold`) on the slice-198 Set-flag int path.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

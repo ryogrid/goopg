@@ -4447,6 +4447,27 @@ object support.
         reloption tests PASS; `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit.
         **Next:** last REAL-typed reloption `autovacuum_vacuum_cost_delay` (0.0–100.0) reuses this path;
         or an int autovacuum knob (`autovacuum_analyze_threshold`); or composite types (`CREATE TYPE AS`).
+      - **PROGRESS 2026-06-19 (loop #15):** **DU-002 slice 202 LANDED — fourth (final) REAL-typed storage
+        parameter (`autovacuum_vacuum_cost_delay`) round-trips through pg_dump.** Closes the slice-199
+        float family: `autovacuum_vacuum_cost_delay` is `RELOPT_TYPE_REAL`, range 0.0–100.0, default -1
+        (`reloptions.c:393/1901`), so it reuses the mechanism verbatim — parser already accepts
+        `TokenNumericLit`, executor does `strconv.ParseFloat` + `!(f>=0 && f<=100)` bounds-check (rejects
+        NaN/±Inf; above-range/non-numeric → `22023`), separate `AutovacuumVacuumCostDelaySet` flag so
+        explicit `0.0` round-trips. Persist `catalog.Table.AutovacuumVacuumCostDelay` (float64); pg_class
+        virtual view appends `autovacuum_vacuum_cost_delay=F` after `autovacuum_vacuum_insert_scale_factor`,
+        F via `FormatFloat(f,'g',-1,64)`; pg_dump renders `WITH (autovacuum_vacuum_cost_delay='2.5')`.
+        Advisory catalog/dump-only; base-table-only. Files: `internal/catalog/catalog.go`
+        (`Table.AutovacuumVacuumCostDelay`/`…Set` + render), `internal/executor/operators_ddl.go`
+        (extract/parse/bounds + persist), `internal/executor/operators_fillfactor_reloptions_test.go`
+        (NEW `TestAutovacuumVacuumCostDelaySurfacesInPgClassReloptions` +
+        `TestAutovacuumVacuumCostDelayOutOfBoundsRejected`), `internal/testport/pgdump_connsetup_test.go`
+        (NEW `optavcd` fixture + assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 202).
+        No parser change needed. Gates: gofmt OK; `go build ./internal/...` clean; `go vet
+        catalog/executor/testport` clean; catalog/executor reloption tests PASS;
+        `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** all four
+        REAL reloptions now round-trip; remaining candidates are int autovacuum knobs
+        (`autovacuum_analyze_threshold`/`autovacuum_vacuum_insert_threshold`, slice-198 int path); or
+        composite types (`CREATE TYPE AS`; larger).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
