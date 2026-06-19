@@ -92,6 +92,10 @@ type connTxState struct {
 	// PendingCreatedEnums tracks CREATE TYPE … AS ENUM within the current tx.
 	// On ROLLBACK, created types are dropped.  map[name(lowercase)]=true.  M0097-0022.
 	PendingCreatedEnums map[string]bool
+	// PendingCreatedComposites tracks CREATE TYPE … AS (...) within the current
+	// tx.  On ROLLBACK, created composite types are dropped.
+	// map[name(lowercase)]=true.  DU-002 slice 244.
+	PendingCreatedComposites map[string]bool
 	// NonSuperuserRole is set when SET SESSION AUTHORIZATION is called with a
 	// non-default role name. While non-empty, privilege checks that require
 	// superuser (e.g. LEAKPROOF function attribute) are rejected. Cleared by
@@ -186,6 +190,7 @@ func (c *connTxState) End() {
 	c.PendingEnumValues = nil
 	c.PendingEnumRenames = nil
 	c.PendingCreatedEnums = nil
+	c.PendingCreatedComposites = nil
 	c.mu.Unlock()
 }
 

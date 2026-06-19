@@ -2324,6 +2324,22 @@ func TypedVirtualCell(pos int, value, colType string) Expr {
 		if value != "" {
 			return &NumericConst{pos: pos, Value: value}
 		}
+	case "text[]", "_text", "aclitem[]", "_aclitem", "oid[]", "_oid",
+		"int2[]", "_int2", "int4[]", "_int4", "char[]", "_char",
+		"name[]", "_name", "float4[]", "_float4", "anyarray":
+		// Array-typed virtual-catalog columns. An empty cell denotes SQL NULL
+		// (the PostgreSQL convention for an absent reloptions / relacl /
+		// proconfig / … value), NOT an empty string. Routed through the
+		// default StringConst branch a bare "" is parsed by the array
+		// machinery as a single empty-string element ({""}), which made
+		// pg_dump emit a spurious `WITH (""='')` clause for a table with no
+		// reloptions (DU-002 slice 47: nonemptyReloptions saw strlen>2). A
+		// non-empty value is the array text literal ("{a,b}") and passes
+		// through verbatim.
+		if value == "" {
+			return &NullConst{pos: pos}
+		}
+		return &StringConst{pos: pos, Value: value}
 	}
 	return &StringConst{pos: pos, Value: value}
 }
@@ -9520,13 +9536,18 @@ func bindingMatchesRelation(b rangeBinding, table, schema string) bool {
 	if table == "" {
 		return schema != ""
 	}
-	if strings.EqualFold(table, b.table.Name) {
-		return true
+	// A relation with an explicit alias is referenceable ONLY by that alias —
+	// PostgreSQL hides the original table name once a FROM entry is aliased
+	// (`SELECT t.x FROM tbl t` is fine, `SELECT tbl.x FROM tbl t` is a 42712
+	// error). Matching the original name of an aliased binding is what made a
+	// correlated reference to an unaliased OUTER table (e.g. pg_dump's
+	// `… WHERE oid = pg_type.typelem` over `FROM pg_type`) wrongly bind to an
+	// inner same-named relation aliased as `te`, breaking the correlation.
+	// DU-002 slice 89.
+	if b.alias != "" {
+		return strings.EqualFold(table, b.alias)
 	}
-	if b.alias != "" && strings.EqualFold(table, b.alias) {
-		return true
-	}
-	return false
+	return strings.EqualFold(table, b.table.Name)
 }
 
 // tryPromoteIndexOnlyScan examines a freshly-built Project node and promotes

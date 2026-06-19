@@ -154,7 +154,6 @@ func TestParseAlterTableSyntaxErrors(t *testing.T) {
 	}
 }
 
-
 // TestParseAlterTableDropConstraint verifies that DROP CONSTRAINT name [RESTRICT|CASCADE]
 // is parsed into an AlterTableDropConstraint action. M0097-0036 / functional_deps.
 func TestParseAlterTableDropConstraint(t *testing.T) {
@@ -195,6 +194,144 @@ func TestParseAlterTableDropConstraint(t *testing.T) {
 		}
 		if act.Restrict != tc.wantRestrict {
 			t.Errorf("Parse(%q): Restrict=%v, want %v", tc.sql, act.Restrict, tc.wantRestrict)
+		}
+	}
+}
+
+// TestParseAlterTableSetCompression covers `ALTER TABLE ... ALTER COLUMN c SET
+// COMPRESSION <method>` (DU-002 slice 183). The method normalizes to pglz/lz4;
+// `default` (and any unknown token) normalizes to "" so no SET COMPRESSION is
+// dumped. The action records CompressionType + ColumnName for the executor.
+func TestParseAlterTableSetCompression(t *testing.T) {
+	for _, tc := range []struct {
+		sql      string
+		wantCol  string
+		wantMeth string
+	}{
+		{"ALTER TABLE t ALTER COLUMN c SET COMPRESSION pglz", "c", "pglz"},
+		{"ALTER TABLE t ALTER COLUMN c SET COMPRESSION lz4", "c", "lz4"},
+		{"ALTER TABLE t ALTER COLUMN c SET COMPRESSION LZ4", "c", "lz4"},  // case-insensitive
+		{"ALTER TABLE t ALTER COLUMN c SET COMPRESSION default", "c", ""}, // reset to default
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetCompression {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		if at.Actions[0].ColumnName != tc.wantCol {
+			t.Errorf("Parse(%q): ColumnName=%q want %q", tc.sql, at.Actions[0].ColumnName, tc.wantCol)
+		}
+		if at.Actions[0].CompressionType != tc.wantMeth {
+			t.Errorf("Parse(%q): CompressionType=%q want %q", tc.sql, at.Actions[0].CompressionType, tc.wantMeth)
+		}
+	}
+}
+
+// TestParseCreateTableColumnCompression covers the inline `COMPRESSION <method>`
+// clause in a CREATE TABLE column definition (`a text COMPRESSION lz4`), which
+// threads the method onto ColumnDef.Compression. DU-002 slice 183.
+func TestParseCreateTableColumnCompression(t *testing.T) {
+	stmts, err := Parse("CREATE TABLE t (a text COMPRESSION lz4, b text COMPRESSION pglz, d text)")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(ct.Columns) != 3 {
+		t.Fatalf("columns=%d want 3", len(ct.Columns))
+	}
+	if ct.Columns[0].Compression != "lz4" {
+		t.Errorf("a.Compression=%q want lz4", ct.Columns[0].Compression)
+	}
+	if ct.Columns[1].Compression != "pglz" {
+		t.Errorf("b.Compression=%q want pglz", ct.Columns[1].Compression)
+	}
+	if ct.Columns[2].Compression != "" {
+		t.Errorf("d.Compression=%q want \"\"", ct.Columns[2].Compression)
+	}
+}
+
+// TestParseAlterTableSetStatistics covers `ALTER TABLE ... ALTER COLUMN c SET
+// STATISTICS <n>` (DU-002 slice 184). The integer value (including a negative
+// reset value like -1) is recorded in CheckExpr + ColumnName for the executor,
+// which threads it onto pg_attribute.attstattarget for pg_dump round-trip.
+func TestParseAlterTableSetStatistics(t *testing.T) {
+	for _, tc := range []struct {
+		sql     string
+		wantCol string
+		wantVal string
+	}{
+		{"ALTER TABLE t ALTER COLUMN c SET STATISTICS 100", "c", "100"},
+		{"ALTER TABLE t ALTER COLUMN c SET STATISTICS 0", "c", "0"},
+		{"ALTER TABLE t ALTER COLUMN c SET STATISTICS -1", "c", "-1"}, // reset to default
+		{"ALTER TABLE t ALTER COLUMN c SET STATISTICS 10000", "c", "10000"},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetStatistics {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		if at.Actions[0].ColumnName != tc.wantCol {
+			t.Errorf("Parse(%q): ColumnName=%q want %q", tc.sql, at.Actions[0].ColumnName, tc.wantCol)
+		}
+		if at.Actions[0].CheckExpr != tc.wantVal {
+			t.Errorf("Parse(%q): CheckExpr=%q want %q", tc.sql, at.Actions[0].CheckExpr, tc.wantVal)
+		}
+	}
+}
+
+// TestParseAlterTableSetColumnOptions verifies the per-column attribute-option
+// list (`ALTER COLUMN c SET (opt=value, …)`) is captured and normalized to PG's
+// stored `name=value` form for pg_attribute.attoptions round-trip. DU-002 slice 185.
+func TestParseAlterTableSetColumnOptions(t *testing.T) {
+	for _, tc := range []struct {
+		sql     string
+		wantCol string
+		wantOpt []string
+	}{
+		{"ALTER TABLE t ALTER COLUMN c SET (n_distinct = 0.5)", "c", []string{"n_distinct=0.5"}},
+		{"ALTER TABLE t ALTER COLUMN c SET (n_distinct=0.5)", "c", []string{"n_distinct=0.5"}},
+		{"ALTER TABLE t ALTER COLUMN c SET (n_distinct = -0.5)", "c", []string{"n_distinct=-0.5"}},
+		{"ALTER TABLE t ALTER COLUMN c SET (n_distinct = 100)", "c", []string{"n_distinct=100"}},
+		{"ALTER TABLE t ALTER COLUMN c SET (n_distinct = 0.5, n_distinct_inherited = -0.1)", "c",
+			[]string{"n_distinct=0.5", "n_distinct_inherited=-0.1"}},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableAlterColumnSet {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		if at.Actions[0].ColumnName != tc.wantCol {
+			t.Errorf("Parse(%q): ColumnName=%q want %q", tc.sql, at.Actions[0].ColumnName, tc.wantCol)
+		}
+		got := at.Actions[0].SetOptions
+		if len(got) != len(tc.wantOpt) {
+			t.Fatalf("Parse(%q): SetOptions=%v want %v", tc.sql, got, tc.wantOpt)
+		}
+		for i := range got {
+			if got[i] != tc.wantOpt[i] {
+				t.Errorf("Parse(%q): SetOptions[%d]=%q want %q", tc.sql, i, got[i], tc.wantOpt[i])
+			}
 		}
 	}
 }

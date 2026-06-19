@@ -85,6 +85,14 @@ func TestTypedVirtualCell(t *testing.T) {
 		{"text stays string", "TopMemoryContext", "text", &StringConst{Value: "TopMemoryContext"}},
 		{"non-numeric int falls back", "", "int8", &StringConst{Value: ""}},
 		{"non-bool bool falls back", "maybe", "bool", &StringConst{Value: "maybe"}},
+		// Array-typed empty cells denote SQL NULL, not a 1-element empty-string
+		// array — see DU-002 slice 47 (the spurious pg_dump `WITH (""='')`).
+		{"empty text[] is NULL", "", "text[]", &NullConst{}},
+		{"empty aclitem[] is NULL", "", "aclitem[]", &NullConst{}},
+		{"empty oid[] is NULL", "", "oid[]", &NullConst{}},
+		{"empty _text is NULL", "", "_text", &NullConst{}},
+		// A non-empty array cell passes through as the array text literal.
+		{"non-empty text[] passes through", "{a,b}", "text[]", &StringConst{Value: "{a,b}"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -99,6 +107,10 @@ func TestTypedVirtualCell(t *testing.T) {
 				g, ok := got.(*BooleanConst)
 				if !ok || g.Value != want.Value {
 					t.Fatalf("got %#v, want BooleanConst{%v}", got, want.Value)
+				}
+			case *NullConst:
+				if _, ok := got.(*NullConst); !ok {
+					t.Fatalf("got %#v, want NullConst", got)
 				}
 			case *StringConst:
 				g, ok := got.(*StringConst)

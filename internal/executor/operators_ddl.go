@@ -700,14 +700,18 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				serialTyp == "smallserial" || serialTyp == "serial2"
 			cols = append(cols, catalog.Column{
 				Name:             c.Name,
-				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
+				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...), IsArray: c.Type.IsArray},
 				DeclaredTypeName: declaredTypeName,
 				NotNull:          c.NotNull || c.IdentityColumn || isSerialCol,
 				GeneratedExpr:    c.GeneratedExpr,
 				GeneratedAlways:  c.GeneratedAlways,
+				GeneratedVirtual: c.GeneratedVirtual,
 				DefaultExpr:      c.DefaultExpr,
 				IdentityColumn:   c.IdentityColumn,
+				IdentityAlways:   c.IdentityAlways,
 				IdentityStart:    c.IdentityStart,
+				Compression:      c.Compression,
+				Collation:        c.Collation,
 			})
 		}
 		for _, item := range s.BodyOrder {
@@ -796,6 +800,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					if !includeGenerated {
 						c.GeneratedAlways = false
 						c.GeneratedExpr = ""
+						c.GeneratedVirtual = false
 					}
 					// Clear DefaultExpr unless INCLUDING DEFAULTS or INCLUDING ALL was specified.
 					if !includeDefaults {
@@ -888,12 +893,15 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				}
 			}
 			cols = append(cols, catalog.Column{
-				Name:            c.Name,
-				Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
-				NotNull:         c.NotNull,
-				GeneratedExpr:   c.GeneratedExpr,
-				GeneratedAlways: c.GeneratedAlways,
-				DefaultExpr:     c.DefaultExpr,
+				Name:             c.Name,
+				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
+				NotNull:          c.NotNull,
+				GeneratedExpr:    c.GeneratedExpr,
+				GeneratedAlways:  c.GeneratedAlways,
+				GeneratedVirtual: c.GeneratedVirtual,
+				DefaultExpr:      c.DefaultExpr,
+				Compression:      c.Compression,
+				Collation:        c.Collation,
 			})
 		}
 	}
@@ -946,6 +954,947 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Message: fmt.Sprintf("unrecognized parameter %q", k)}
 		}
 	}
+	// Extract and bounds-check the fillfactor storage parameter so it can be
+	// persisted on the catalog table (and surfaced through pg_class.reloptions
+	// for pg_dump). PG rejects values outside 10–100. M0110-0001 (DU-002 slice 54).
+	fillfactor := 0
+	if v, ok := s.With["fillfactor"]; ok {
+		ff, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"fillfactor\": %s", v)}
+		}
+		if ff < 10 || ff > 100 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", ff),
+				Detail:  "Valid values are between \"10\" and \"100\"."}
+		}
+		fillfactor = ff
+	}
+	// Extract and bounds-check the parallel_workers storage parameter. Unlike
+	// fillfactor, 0 is a valid explicit value (PG's reloption default is -1 =
+	// unset; valid range 0–1024), so a separate `set` flag records whether the
+	// option was present. goopg has no parallel query, so the value is purely
+	// catalog/dump state that round-trips through pg_class.reloptions /
+	// pg_dump's `WITH (parallel_workers='N')`. M0110-0001 (DU-002 slice 195).
+	parallelWorkers := 0
+	parallelWorkersSet := false
+	if v, ok := s.With["parallel_workers"]; ok {
+		pw, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"parallel_workers\": %s", v)}
+		}
+		if pw < 0 || pw > 1024 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"parallel_workers\"", pw),
+				Detail:  "Valid values are between \"0\" and \"1024\"."}
+		}
+		parallelWorkers = pw
+		parallelWorkersSet = true
+	}
+	// Extract and parse the autovacuum_enabled storage parameter. PG accepts
+	// the usual boolean spellings (true/false, on/off, yes/no, 1/0, t/f,
+	// y/n; case-insensitive) via parse_bool. goopg has no autovacuum, so the
+	// value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_enabled='true')`.
+	// M0110-0001 (DU-002 slice 196).
+	autovacuumEnabled := false
+	autovacuumEnabledSet := false
+	if v, ok := s.With["autovacuum_enabled"]; ok {
+		b, parsed := parseReloptionBool(strings.TrimSpace(v))
+		if !parsed {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for boolean option \"autovacuum_enabled\": %s", v)}
+		}
+		autovacuumEnabled = b
+		autovacuumEnabledSet = true
+	}
+	// Extract and bounds-check the toast_tuple_target storage parameter. PG's
+	// valid range is 128–TOAST_TUPLE_TARGET_MAIN (8160 on the default 8 KB
+	// page); since the minimum is 128, zero unambiguously means "unset" (the
+	// fillfactor pattern — no separate flag needed). goopg's TOAST thresholds
+	// are fixed, so the value is purely catalog/dump state that round-trips
+	// through pg_class.reloptions / pg_dump's `WITH (toast_tuple_target='N')`.
+	// M0110-0001 (DU-002 slice 197).
+	toastTupleTarget := 0
+	if v, ok := s.With["toast_tuple_target"]; ok {
+		tt, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"toast_tuple_target\": %s", v)}
+		}
+		if tt < 128 || tt > 8160 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"toast_tuple_target\"", tt),
+				Detail:  "Valid values are between \"128\" and \"8160\"."}
+		}
+		toastTupleTarget = tt
+	}
+	// Extract and bounds-check the autovacuum_vacuum_threshold storage
+	// parameter. PG's reloption range is 0–INT_MAX with a default of -1 (=
+	// unset / use the GUC); since 0 is a valid explicit value, a separate `set`
+	// flag records whether the option was present (the parallel_workers
+	// pattern). goopg has no autovacuum, so the value is purely catalog/dump
+	// state that round-trips through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_vacuum_threshold='N')`. M0110-0001 (DU-002 slice 198).
+	autovacuumVacuumThreshold := 0
+	autovacuumVacuumThresholdSet := false
+	if v, ok := s.With["autovacuum_vacuum_threshold"]; ok {
+		avt, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_threshold\": %s", v)}
+		}
+		if avt < 0 || avt > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_threshold\"", avt),
+				Detail:  "Valid values are between \"0\" and \"2147483647\"."}
+		}
+		autovacuumVacuumThreshold = avt
+		autovacuumVacuumThresholdSet = true
+	}
+	// Extract and bounds-check the autovacuum_vacuum_scale_factor storage
+	// parameter — the first REAL-typed reloption goopg round-trips. PG's
+	// reloption type is RELOPT_TYPE_REAL with range 0.0–100.0 and a default of
+	// -1 (= unset / use the GUC); since 0.0 is a valid explicit value, a separate
+	// `set` flag records whether the option was present (the parallel_workers
+	// pattern, generalized to a float). The `!(f >= 0 && f <= 100)` form also
+	// rejects NaN/±Inf, which ParseFloat would otherwise accept. goopg has no
+	// autovacuum, so the value is purely catalog/dump state that round-trips
+	// through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_vacuum_scale_factor='F')`. M0110-0001 (DU-002 slice 199).
+	autovacuumVacuumScaleFactor := 0.0
+	autovacuumVacuumScaleFactorSet := false
+	if v, ok := s.With["autovacuum_vacuum_scale_factor"]; ok {
+		avsf, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"autovacuum_vacuum_scale_factor\": %s", v)}
+		}
+		if !(avsf >= 0.0 && avsf <= 100.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"autovacuum_vacuum_scale_factor\"", strconv.FormatFloat(avsf, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"100.000000\"."}
+		}
+		autovacuumVacuumScaleFactor = avsf
+		autovacuumVacuumScaleFactorSet = true
+	}
+	// Extract and bounds-check the autovacuum_analyze_scale_factor storage
+	// parameter — the second REAL-typed reloption goopg round-trips, reusing the
+	// slice-199 float path. PG's reloption type is RELOPT_TYPE_REAL with range
+	// 0.0–100.0 and a default of -1 (= unset / use the GUC); since 0.0 is a valid
+	// explicit value, a separate `set` flag records whether the option was present.
+	// The `!(f >= 0 && f <= 100)` form also rejects NaN/±Inf, which ParseFloat
+	// would otherwise accept. goopg has no autovacuum, so the value is purely
+	// catalog/dump state that round-trips through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_analyze_scale_factor='F')`. M0110-0001 (DU-002 slice 200).
+	autovacuumAnalyzeScaleFactor := 0.0
+	autovacuumAnalyzeScaleFactorSet := false
+	if v, ok := s.With["autovacuum_analyze_scale_factor"]; ok {
+		aasf, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"autovacuum_analyze_scale_factor\": %s", v)}
+		}
+		if !(aasf >= 0.0 && aasf <= 100.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"autovacuum_analyze_scale_factor\"", strconv.FormatFloat(aasf, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"100.000000\"."}
+		}
+		autovacuumAnalyzeScaleFactor = aasf
+		autovacuumAnalyzeScaleFactorSet = true
+	}
+	// Extract and bounds-check the autovacuum_vacuum_insert_scale_factor storage
+	// parameter — the third REAL-typed reloption goopg round-trips, reusing the
+	// slice-199 float path. PG's reloption type is RELOPT_TYPE_REAL with range
+	// 0.0–100.0 and a default of -1 (= unset / use the GUC); since 0.0 is a valid
+	// explicit value, a separate `set` flag records whether the option was present.
+	// The `!(f >= 0 && f <= 100)` form also rejects NaN/±Inf, which ParseFloat
+	// would otherwise accept. goopg has no autovacuum, so the value is purely
+	// catalog/dump state that round-trips through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_vacuum_insert_scale_factor='F')`. M0110-0001 (DU-002 slice 201).
+	autovacuumVacuumInsertScaleFactor := 0.0
+	autovacuumVacuumInsertScaleFactorSet := false
+	if v, ok := s.With["autovacuum_vacuum_insert_scale_factor"]; ok {
+		avisf, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"autovacuum_vacuum_insert_scale_factor\": %s", v)}
+		}
+		if !(avisf >= 0.0 && avisf <= 100.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"autovacuum_vacuum_insert_scale_factor\"", strconv.FormatFloat(avisf, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"100.000000\"."}
+		}
+		autovacuumVacuumInsertScaleFactor = avisf
+		autovacuumVacuumInsertScaleFactorSet = true
+	}
+	// Extract and bounds-check the autovacuum_vacuum_cost_delay storage parameter —
+	// the fourth (and final) REAL-typed reloption goopg round-trips, reusing the
+	// slice-199 float path. PG's reloption type is RELOPT_TYPE_REAL with range
+	// 0.0–100.0 and a default of -1 (= unset / use the GUC); since 0.0 is a valid
+	// explicit value, a separate `set` flag records whether the option was present.
+	// The `!(f >= 0 && f <= 100)` form also rejects NaN/±Inf, which ParseFloat
+	// would otherwise accept. goopg has no autovacuum, so the value is purely
+	// catalog/dump state that round-trips through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_vacuum_cost_delay='F')`. M0110-0001 (DU-002 slice 202).
+	autovacuumVacuumCostDelay := 0.0
+	autovacuumVacuumCostDelaySet := false
+	if v, ok := s.With["autovacuum_vacuum_cost_delay"]; ok {
+		avcd, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"autovacuum_vacuum_cost_delay\": %s", v)}
+		}
+		if !(avcd >= 0.0 && avcd <= 100.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"autovacuum_vacuum_cost_delay\"", strconv.FormatFloat(avcd, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"100.000000\"."}
+		}
+		autovacuumVacuumCostDelay = avcd
+		autovacuumVacuumCostDelaySet = true
+	}
+	// Extract and bounds-check the autovacuum_analyze_threshold storage parameter —
+	// the second INT-typed autovacuum reloption goopg round-trips, reusing the
+	// slice-198 integer path. PG's reloption type is RELOPT_TYPE_INT with range
+	// 0–INT_MAX and a default of -1 (= unset / use the GUC); since 0 is a valid
+	// explicit value, a separate `set` flag records whether the option was present
+	// (the parallel_workers pattern). goopg has no autovacuum, so the value is
+	// purely catalog/dump state that round-trips through pg_class.reloptions /
+	// pg_dump's `WITH (autovacuum_analyze_threshold='N')`. M0110-0001 (DU-002 slice 203).
+	autovacuumAnalyzeThreshold := 0
+	autovacuumAnalyzeThresholdSet := false
+	if v, ok := s.With["autovacuum_analyze_threshold"]; ok {
+		aat, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_analyze_threshold\": %s", v)}
+		}
+		if aat < 0 || aat > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_analyze_threshold\"", aat),
+				Detail:  "Valid values are between \"0\" and \"2147483647\"."}
+		}
+		autovacuumAnalyzeThreshold = aat
+		autovacuumAnalyzeThresholdSet = true
+	}
+	// Extract and bounds-check the autovacuum_vacuum_insert_threshold storage
+	// parameter — the third INT-typed autovacuum reloption goopg round-trips,
+	// reusing the slice-198 integer path. PG's reloption type is RELOPT_TYPE_INT
+	// with range -1–INT_MAX and a default of -2 (= unset / use the GUC); -1
+	// disables insert vacuums. Since -1 and 0 are valid explicit values, a separate
+	// `set` flag records whether the option was present (the parallel_workers
+	// pattern). goopg has no autovacuum, so the value is purely catalog/dump state
+	// that round-trips through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_vacuum_insert_threshold='N')`. M0110-0001 (DU-002 slice 204).
+	autovacuumVacuumInsertThreshold := 0
+	autovacuumVacuumInsertThresholdSet := false
+	if v, ok := s.With["autovacuum_vacuum_insert_threshold"]; ok {
+		avit, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_insert_threshold\": %s", v)}
+		}
+		if avit < -1 || avit > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_insert_threshold\"", avit),
+				Detail:  "Valid values are between \"-1\" and \"2147483647\"."}
+		}
+		autovacuumVacuumInsertThreshold = avit
+		autovacuumVacuumInsertThresholdSet = true
+	}
+	// Extract and parse the vacuum_truncate storage parameter — a boolean
+	// reloption (RELOPT_TYPE_BOOL, reloptions.c:1915; RELOPT_KIND_HEAP|TOAST,
+	// default true) that reuses the slice-196 autovacuum_enabled boolean path.
+	// PG accepts the usual boolean spellings (true/false, on/off, yes/no, 1/0,
+	// t/f, y/n; case-insensitive) via parse_bool. goopg has no VACUUM truncation,
+	// so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (vacuum_truncate='true')`.
+	// M0110-0001 (DU-002 slice 205).
+	vacuumTruncate := false
+	vacuumTruncateSet := false
+	if v, ok := s.With["vacuum_truncate"]; ok {
+		b, parsed := parseReloptionBool(strings.TrimSpace(v))
+		if !parsed {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for boolean option \"vacuum_truncate\": %s", v)}
+		}
+		vacuumTruncate = b
+		vacuumTruncateSet = true
+	}
+	// Extract and bounds-check the log_autovacuum_min_duration storage parameter —
+	// the fourth INT-typed autovacuum-namespace reloption goopg round-trips,
+	// reusing the slice-198 integer path. PG's reloption type is RELOPT_TYPE_INT
+	// with range -1–INT_MAX and a default of -1 (= unset / use the GUC); 0 logs
+	// every autovacuum action (reloptions.c:1897/329). Since -1 and 0 are valid
+	// explicit values, a separate `set` flag records whether the option was present
+	// (the parallel_workers pattern). goopg has no autovacuum, so the value is
+	// purely catalog/dump state that round-trips through pg_class.reloptions /
+	// pg_dump's `WITH (log_autovacuum_min_duration='N')`. M0110-0001 (DU-002 slice 206).
+	logAutovacuumMinDuration := 0
+	logAutovacuumMinDurationSet := false
+	if v, ok := s.With["log_autovacuum_min_duration"]; ok {
+		lamd, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"log_autovacuum_min_duration\": %s", v)}
+		}
+		if lamd < -1 || lamd > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"log_autovacuum_min_duration\"", lamd),
+				Detail:  "Valid values are between \"-1\" and \"2147483647\"."}
+		}
+		logAutovacuumMinDuration = lamd
+		logAutovacuumMinDurationSet = true
+	}
+	// Extract and bounds-check the autovacuum_freeze_min_age storage parameter —
+	// the fifth INT-typed autovacuum-namespace reloption goopg round-trips, reusing
+	// the slice-198 integer path. PG's reloption type is RELOPT_TYPE_INT with range
+	// 0–1000000000 and a default of -1 (= unset / use the GUC) (reloptions.c:1885/272).
+	// Since 0 is a valid explicit value, a separate `set` flag records whether the
+	// option was present (the parallel_workers pattern). goopg has no autovacuum, so
+	// the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_freeze_min_age='N')`.
+	// M0110-0001 (DU-002 slice 207).
+	autovacuumFreezeMinAge := 0
+	autovacuumFreezeMinAgeSet := false
+	if v, ok := s.With["autovacuum_freeze_min_age"]; ok {
+		afma, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_freeze_min_age\": %s", v)}
+		}
+		if afma < 0 || afma > 1000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_freeze_min_age\"", afma),
+				Detail:  "Valid values are between \"0\" and \"1000000000\"."}
+		}
+		autovacuumFreezeMinAge = afma
+		autovacuumFreezeMinAgeSet = true
+	}
+	// autovacuum_freeze_max_age (RELOPT_TYPE_INT, range 100000–2000000000, default
+	// -1 = unset; reloptions.c:1887/290). The minimum valid value is 100000, so an
+	// explicit -1 is rejected as out-of-range; a separate `set` flag records whether
+	// the option was present (the parallel_workers pattern). goopg has no autovacuum,
+	// so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_freeze_max_age='N')`.
+	// M0110-0001 (DU-002 slice 208).
+	autovacuumFreezeMaxAge := 0
+	autovacuumFreezeMaxAgeSet := false
+	if v, ok := s.With["autovacuum_freeze_max_age"]; ok {
+		afma, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_freeze_max_age\": %s", v)}
+		}
+		if afma < 100000 || afma > 2000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_freeze_max_age\"", afma),
+				Detail:  "Valid values are between \"100000\" and \"2000000000\"."}
+		}
+		autovacuumFreezeMaxAge = afma
+		autovacuumFreezeMaxAgeSet = true
+	}
+	// autovacuum_freeze_table_age (RELOPT_TYPE_INT, range 0–2000000000, default
+	// -1 = unset; reloptions.c:1889/312). 0 is a valid explicit value, so a
+	// separate `set` flag records whether the option was present (the
+	// parallel_workers pattern) rather than a zero check. goopg has no autovacuum,
+	// so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_freeze_table_age='N')`.
+	// M0110-0001 (DU-002 slice 209).
+	autovacuumFreezeTableAge := 0
+	autovacuumFreezeTableAgeSet := false
+	if v, ok := s.With["autovacuum_freeze_table_age"]; ok {
+		afta, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_freeze_table_age\": %s", v)}
+		}
+		if afta < 0 || afta > 2000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_freeze_table_age\"", afta),
+				Detail:  "Valid values are between \"0\" and \"2000000000\"."}
+		}
+		autovacuumFreezeTableAge = afta
+		autovacuumFreezeTableAgeSet = true
+	}
+	// autovacuum_multixact_freeze_min_age (RELOPT_TYPE_INT, range 0–1000000000,
+	// default -1 = unset; reloptions.c:1891/281). 0 is a valid explicit value, so a
+	// separate `set` flag records whether the option was present (the
+	// parallel_workers pattern) rather than a zero check. goopg has no autovacuum,
+	// so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_multixact_freeze_min_age='N')`.
+	// M0110-0001 (DU-002 slice 210).
+	autovacuumMultixactFreezeMinAge := 0
+	autovacuumMultixactFreezeMinAgeSet := false
+	if v, ok := s.With["autovacuum_multixact_freeze_min_age"]; ok {
+		amfma, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_multixact_freeze_min_age\": %s", v)}
+		}
+		if amfma < 0 || amfma > 1000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_multixact_freeze_min_age\"", amfma),
+				Detail:  "Valid values are between \"0\" and \"1000000000\"."}
+		}
+		autovacuumMultixactFreezeMinAge = amfma
+		autovacuumMultixactFreezeMinAgeSet = true
+	}
+	// autovacuum_multixact_freeze_max_age (RELOPT_TYPE_INT, range 10000–2000000000,
+	// default -1 = unset; reloptions.c:1893/299). Unlike the min/table-age options
+	// the lower bound is 10000 (not 0), but a separate `set` flag still records
+	// whether the option was present (the parallel_workers pattern). goopg has no
+	// autovacuum, so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_multixact_freeze_max_age='N')`.
+	// M0110-0001 (DU-002 slice 211).
+	autovacuumMultixactFreezeMaxAge := 0
+	autovacuumMultixactFreezeMaxAgeSet := false
+	if v, ok := s.With["autovacuum_multixact_freeze_max_age"]; ok {
+		amfmaxa, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_multixact_freeze_max_age\": %s", v)}
+		}
+		if amfmaxa < 10000 || amfmaxa > 2000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_multixact_freeze_max_age\"", amfmaxa),
+				Detail:  "Valid values are between \"10000\" and \"2000000000\"."}
+		}
+		autovacuumMultixactFreezeMaxAge = amfmaxa
+		autovacuumMultixactFreezeMaxAgeSet = true
+	}
+	// autovacuum_multixact_freeze_table_age (RELOPT_TYPE_INT, range 0–2000000000,
+	// default -1 = unset; reloptions.c:1895/316). 0 is a valid explicit value, so a
+	// separate `set` flag records whether the option was present (the
+	// parallel_workers pattern) rather than a zero check. goopg has no autovacuum,
+	// so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_multixact_freeze_table_age='N')`.
+	// M0110-0001 (DU-002 slice 212).
+	autovacuumMultixactFreezeTableAge := 0
+	autovacuumMultixactFreezeTableAgeSet := false
+	if v, ok := s.With["autovacuum_multixact_freeze_table_age"]; ok {
+		amfta, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_multixact_freeze_table_age\": %s", v)}
+		}
+		if amfta < 0 || amfta > 2000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_multixact_freeze_table_age\"", amfta),
+				Detail:  "Valid values are between \"0\" and \"2000000000\"."}
+		}
+		autovacuumMultixactFreezeTableAge = amfta
+		autovacuumMultixactFreezeTableAgeSet = true
+	}
+	// autovacuum_vacuum_cost_limit (RELOPT_TYPE_INT, range 1–10000,
+	// default -1 = unset; reloptions.c:1883/268). The lower bound is 1, so 0 is below
+	// range and rejected; a separate `set` flag records whether the option was present
+	// (the parallel_workers pattern). goopg has no autovacuum, so the value is purely
+	// catalog/dump state that round-trips through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_vacuum_cost_limit='N')`. M0110-0001 (DU-002 slice 213).
+	autovacuumVacuumCostLimit := 0
+	autovacuumVacuumCostLimitSet := false
+	if v, ok := s.With["autovacuum_vacuum_cost_limit"]; ok {
+		avcl, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_cost_limit\": %s", v)}
+		}
+		if avcl < 1 || avcl > 10000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_cost_limit\"", avcl),
+				Detail:  "Valid values are between \"1\" and \"10000\"."}
+		}
+		autovacuumVacuumCostLimit = avcl
+		autovacuumVacuumCostLimitSet = true
+	}
+	// Extract and parse the user_catalog_table storage parameter
+	// (RELOPT_TYPE_BOOL, RELOPT_KIND_HEAP, default false; reloptions.c:1909).
+	// PG accepts the usual boolean spellings via parse_bool; a separate `set`
+	// flag records whether the option was present (the slice-196 autovacuum_enabled
+	// boolean path). The option marks a heap as a catalog table for
+	// logical-decoding purposes; goopg has no logical decoding, so the value is
+	// purely catalog/dump state that round-trips through pg_class.reloptions /
+	// pg_dump's `WITH (user_catalog_table='true')`. M0110-0001 (DU-002 slice 214).
+	userCatalogTable := false
+	userCatalogTableSet := false
+	if v, ok := s.With["user_catalog_table"]; ok {
+		b, parsed := parseReloptionBool(strings.TrimSpace(v))
+		if !parsed {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for boolean option \"user_catalog_table\": %s", v)}
+		}
+		userCatalogTable = b
+		userCatalogTableSet = true
+	}
+	// Extract and bounds-check the autovacuum_vacuum_max_threshold storage
+	// parameter — a PG18 heap reloption (RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+	// reloptions.c:236) capping the dead-tuple count at which autovacuum fires.
+	// Reuses the slice-204 integer path: PG's reloption type is RELOPT_TYPE_INT
+	// with range -1–INT_MAX and a default of -2 (= unset / use the GUC); -1
+	// disables the cap. Since -1 and 0 are valid explicit values, a separate `set`
+	// flag records whether the option was present (the parallel_workers pattern).
+	// goopg has no autovacuum, so the value is purely catalog/dump state that
+	// round-trips through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_vacuum_max_threshold='N')`. M0110-0001 (DU-002 slice 215).
+	autovacuumVacuumMaxThreshold := 0
+	autovacuumVacuumMaxThresholdSet := false
+	if v, ok := s.With["autovacuum_vacuum_max_threshold"]; ok {
+		avmt, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_max_threshold\": %s", v)}
+		}
+		if avmt < -1 || avmt > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_max_threshold\"", avmt),
+				Detail:  "Valid values are between \"-1\" and \"2147483647\"."}
+		}
+		autovacuumVacuumMaxThreshold = avmt
+		autovacuumVacuumMaxThresholdSet = true
+	}
+	// Extract and bounds-check the vacuum_max_eager_freeze_failure_rate storage
+	// parameter — a PG18 heap reloption (RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+	// reloptions.c:431) giving the fraction of pages vacuum may scan and fail to
+	// freeze before disabling eager scanning. Reuses the slice-199 REAL path, but
+	// PG's range here is 0.0–1.0 (not 0.0–100.0) with a default of -1 (= unset /
+	// use the GUC); since 0.0 is a valid explicit value, a separate `set` flag
+	// records whether the option was present (the parallel_workers pattern,
+	// generalized to a float). The `!(f >= 0 && f <= 1)` form also rejects
+	// NaN/±Inf, which ParseFloat would otherwise accept. goopg has no eager
+	// freezing, so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's
+	// `WITH (vacuum_max_eager_freeze_failure_rate='F')`. M0110-0001 (DU-002 slice 216).
+	vacuumMaxEagerFreezeFailureRate := 0.0
+	vacuumMaxEagerFreezeFailureRateSet := false
+	if v, ok := s.With["vacuum_max_eager_freeze_failure_rate"]; ok {
+		vmefr, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"vacuum_max_eager_freeze_failure_rate\": %s", v)}
+		}
+		if !(vmefr >= 0.0 && vmefr <= 1.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"vacuum_max_eager_freeze_failure_rate\"", strconv.FormatFloat(vmefr, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"1.000000\"."}
+		}
+		vacuumMaxEagerFreezeFailureRate = vmefr
+		vacuumMaxEagerFreezeFailureRateSet = true
+	}
+	// Extract and validate the vacuum_index_cleanup storage parameter — a PG18
+	// heap reloption (RELOPT_TYPE_ENUM, RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+	// reloptions.c:519) controlling whether VACUUM performs index vacuuming and
+	// cleanup. This is goopg's first ENUM reloption. PG accepts the spellings
+	// auto/on/off/true/false/yes/no/1/0 case-insensitively
+	// (StdRdOptIndexCleanupValues, reloptions.c:487); an unrecognized value is a
+	// 22023 error whose message lists the canonical members. Unlike the
+	// bool/int/float reloptions, the value is stored VERBATIM (trimmed) rather
+	// than re-rendered to a canonical form, mirroring PG's pg_class.reloptions
+	// which preserves the literal input text (so `=on` round-trips as `=on`, not
+	// `=true`). A separate `set` flag records presence ("auto" is a legal
+	// explicit value with no reserved sentinel). goopg has no autovacuum, so the
+	// value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (vacuum_index_cleanup='V')`.
+	// M0110-0001 (DU-002 slice 217).
+	vacuumIndexCleanup := ""
+	vacuumIndexCleanupSet := false
+	if v, ok := s.With["vacuum_index_cleanup"]; ok {
+		trimmed := strings.TrimSpace(v)
+		switch strings.ToLower(trimmed) {
+		case "auto", "on", "off", "true", "false", "yes", "no", "1", "0":
+			// accepted enum spelling
+		default:
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for enum option \"vacuum_index_cleanup\": %s", trimmed),
+				Detail:  "Valid values are \"on\", \"off\", and \"auto\"."}
+		}
+		vacuumIndexCleanup = trimmed
+		vacuumIndexCleanupSet = true
+	}
+	// Extract `toast.*` storage parameters. PostgreSQL stores reloptions whose
+	// names carry the `toast.` namespace on the table's TOAST relation's
+	// pg_class.reloptions (without the `toast.` prefix); pg_dump joins to the
+	// TOAST relation, reads `tc.reloptions AS toast_reloptions`, and re-emits
+	// them WITH the `toast.` prefix (appendReloptionsArrayAH, "toast.").
+	// goopg has no TOAST, so these are catalog/dump-only (advisory). Each option
+	// is gathered in a fixed code order; the synthesized TOAST relation's
+	// reloptions array stores them as `name=value` WITHOUT the `toast.` prefix.
+	// Supported so far: the booleans `toast.autovacuum_enabled` (slice 224) and
+	// `toast.vacuum_truncate` (slice 225). Both share RELOPT_KIND_TOAST in
+	// PostgreSQL (reloptions.c:107/152, RELOPT_KIND_HEAP | RELOPT_KIND_TOAST).
+	// Additional toast.* options extend this gather in later slices.
+	// M0110-0001 (DU-002 slice 224/225).
+	var toastReloptions []string
+	if v, ok := s.With["toast.autovacuum_enabled"]; ok {
+		b, parsed := parseReloptionBool(strings.TrimSpace(v))
+		if !parsed {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for boolean option \"autovacuum_enabled\": %s", v)}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_enabled="+strconv.FormatBool(b))
+	}
+	// `toast.vacuum_truncate` — the second RELOPT_KIND_TOAST boolean, mirroring
+	// the parent-table `vacuum_truncate` path (slice 205) on the TOAST relation.
+	// PG accepts the usual boolean spellings via parse_bool; non-bool → 22023.
+	// M0110-0001 (DU-002 slice 225).
+	if v, ok := s.With["toast.vacuum_truncate"]; ok {
+		b, parsed := parseReloptionBool(strings.TrimSpace(v))
+		if !parsed {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for boolean option \"vacuum_truncate\": %s", v)}
+		}
+		toastReloptions = append(toastReloptions, "vacuum_truncate="+strconv.FormatBool(b))
+	}
+	// `toast.autovacuum_vacuum_threshold` — the first RELOPT_KIND_TOAST *integer*
+	// option, reusing the parent-table integer reloption path (slice 198). PG's
+	// reloption range is 0–INT_MAX with a default of -1 (= unset / use the GUC);
+	// autovacuum_vacuum_threshold shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:229), so PG accepts the `toast.` prefix and stores it on the
+	// TOAST relation's reloptions. goopg has no autovacuum, so the value is purely
+	// catalog/dump state. M0110-0001 (DU-002 slice 226).
+	if v, ok := s.With["toast.autovacuum_vacuum_threshold"]; ok {
+		avt, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_threshold\": %s", v)}
+		}
+		if avt < 0 || avt > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_threshold\"", avt),
+				Detail:  "Valid values are between \"0\" and \"2147483647\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_vacuum_threshold="+strconv.Itoa(avt))
+	}
+	// `toast.autovacuum_vacuum_scale_factor` — the first RELOPT_KIND_TOAST *real*
+	// option, reusing the parent-table float reloption path (slice 199). PG's
+	// reloption type is RELOPT_TYPE_REAL with range 0.0–100.0 and a default of -1
+	// (= unset / use the GUC); autovacuum_vacuum_scale_factor shares
+	// RELOPT_KIND_HEAP | RELOPT_KIND_TOAST (reloptions.c:404), so PG accepts the
+	// `toast.` prefix and stores it on the TOAST relation's reloptions. The
+	// `!(f >= 0 && f <= 100)` form also rejects NaN/±Inf. goopg has no autovacuum,
+	// so the value is purely catalog/dump state. M0110-0001 (DU-002 slice 227).
+	if v, ok := s.With["toast.autovacuum_vacuum_scale_factor"]; ok {
+		avsf, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"autovacuum_vacuum_scale_factor\": %s", v)}
+		}
+		if !(avsf >= 0.0 && avsf <= 100.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"autovacuum_vacuum_scale_factor\"", strconv.FormatFloat(avsf, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"100.000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_vacuum_scale_factor="+strconv.FormatFloat(avsf, 'g', -1, 64))
+	}
+	// `toast.autovacuum_vacuum_cost_delay` — the second RELOPT_KIND_TOAST *real*
+	// option, reusing the parent-table float reloption path (slice 202). PG's
+	// reloption type is RELOPT_TYPE_REAL with range 0.0–100.0 and a default of -1
+	// (= unset / use the GUC); autovacuum_vacuum_cost_delay shares
+	// RELOPT_KIND_HEAP | RELOPT_KIND_TOAST (reloptions.c:393), so PG accepts the
+	// `toast.` prefix and stores it on the TOAST relation's reloptions. The
+	// `!(f >= 0 && f <= 100)` form also rejects NaN/±Inf. goopg has no autovacuum,
+	// so the value is purely catalog/dump state. M0110-0001 (DU-002 slice 228).
+	if v, ok := s.With["toast.autovacuum_vacuum_cost_delay"]; ok {
+		avcd, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"autovacuum_vacuum_cost_delay\": %s", v)}
+		}
+		if !(avcd >= 0.0 && avcd <= 100.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"autovacuum_vacuum_cost_delay\"", strconv.FormatFloat(avcd, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"100.000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_vacuum_cost_delay="+strconv.FormatFloat(avcd, 'g', -1, 64))
+	}
+	// `toast.autovacuum_vacuum_cost_limit` — the second RELOPT_KIND_TOAST *integer*
+	// option, reusing the parent-table integer reloption path. PG's reloption range
+	// is 1–10000 with a default of -1 (= unset / use the GUC);
+	// autovacuum_vacuum_cost_limit shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:265), so PG accepts the `toast.` prefix and stores it on the
+	// TOAST relation's reloptions. goopg has no autovacuum, so the value is purely
+	// catalog/dump state. M0110-0001 (DU-002 slice 229).
+	if v, ok := s.With["toast.autovacuum_vacuum_cost_limit"]; ok {
+		avcl, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_cost_limit\": %s", v)}
+		}
+		if avcl < 1 || avcl > 10000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_cost_limit\"", avcl),
+				Detail:  "Valid values are between \"1\" and \"10000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_vacuum_cost_limit="+strconv.Itoa(avcl))
+	}
+	// `toast.autovacuum_freeze_min_age` — the first RELOPT_KIND_TOAST autovacuum-age
+	// *integer* option, reusing the parent-table integer reloption path (slice 207).
+	// PG's reloption type is RELOPT_TYPE_INT with range 0–1000000000 and a default of
+	// -1 (= unset / use the GUC); autovacuum_freeze_min_age shares
+	// RELOPT_KIND_HEAP | RELOPT_KIND_TOAST (reloptions.c:1885/274), so PG accepts the
+	// `toast.` prefix and stores it (no prefix) on the TOAST relation's reloptions.
+	// goopg has no autovacuum, so the value is purely catalog/dump state. Since 0 is a
+	// valid explicit value the bounds check rejects only <0 or >1e9. M0110-0001
+	// (DU-002 slice 230).
+	if v, ok := s.With["toast.autovacuum_freeze_min_age"]; ok {
+		afma, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_freeze_min_age\": %s", v)}
+		}
+		if afma < 0 || afma > 1000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_freeze_min_age\"", afma),
+				Detail:  "Valid values are between \"0\" and \"1000000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_freeze_min_age="+strconv.Itoa(afma))
+	}
+	// `toast.autovacuum_freeze_max_age` — RELOPT_TYPE_INT, range 100000–2000000000,
+	// default -1 (= unset). Shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:1887/290), so PG accepts the `toast.` prefix and stores it (no
+	// prefix) on the TOAST relation's reloptions. The minimum valid value is 100000,
+	// so an explicit -1 is rejected as out-of-range (mirrors the parent-table arm,
+	// slice 208). goopg has no autovacuum, so the value is purely catalog/dump state.
+	// M0110-0001 (DU-002 slice 231).
+	if v, ok := s.With["toast.autovacuum_freeze_max_age"]; ok {
+		afma, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_freeze_max_age\": %s", v)}
+		}
+		if afma < 100000 || afma > 2000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_freeze_max_age\"", afma),
+				Detail:  "Valid values are between \"100000\" and \"2000000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_freeze_max_age="+strconv.Itoa(afma))
+	}
+	// `toast.autovacuum_freeze_table_age` — RELOPT_TYPE_INT, range 0–2000000000,
+	// default -1 (= unset). Shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:1889/308), so PG accepts the `toast.` prefix and stores it (no
+	// prefix) on the TOAST relation's reloptions. 0 is a valid explicit value
+	// (mirrors the parent-table arm, slice 209); an explicit -1 is rejected as
+	// out-of-range. goopg has no autovacuum, so the value is purely catalog/dump
+	// state that round-trips through pg_dump's
+	// `WITH (toast.autovacuum_freeze_table_age='N')`. M0110-0001 (DU-002 slice 232).
+	if v, ok := s.With["toast.autovacuum_freeze_table_age"]; ok {
+		afta, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_freeze_table_age\": %s", v)}
+		}
+		if afta < 0 || afta > 2000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_freeze_table_age\"", afta),
+				Detail:  "Valid values are between \"0\" and \"2000000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_freeze_table_age="+strconv.Itoa(afta))
+	}
+	// `toast.autovacuum_multixact_freeze_min_age` — RELOPT_TYPE_INT, range
+	// 0–1000000000, default -1 (= unset). Shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:1891/286), so PG accepts the `toast.` prefix and stores it (no
+	// prefix) on the TOAST relation's reloptions. 0 is a valid explicit value
+	// (mirrors the parent-table arm, slice 210); an explicit -1 is rejected as
+	// out-of-range. goopg has no autovacuum, so the value is purely catalog/dump
+	// state that round-trips through pg_dump's
+	// `WITH (toast.autovacuum_multixact_freeze_min_age='N')`. M0110-0001 (DU-002 slice 233).
+	if v, ok := s.With["toast.autovacuum_multixact_freeze_min_age"]; ok {
+		amfma, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_multixact_freeze_min_age\": %s", v)}
+		}
+		if amfma < 0 || amfma > 1000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_multixact_freeze_min_age\"", amfma),
+				Detail:  "Valid values are between \"0\" and \"1000000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_multixact_freeze_min_age="+strconv.Itoa(amfma))
+	}
+	// `toast.autovacuum_multixact_freeze_max_age` — RELOPT_TYPE_INT, range
+	// 10000–2000000000, default -1 (= unset). Shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:1893/304), so PG accepts the `toast.` prefix and stores it (no
+	// prefix) on the TOAST relation's reloptions. Unlike the min/table-age options
+	// the lower bound is 10000 (not 0); an explicit -1 is rejected as out-of-range.
+	// goopg has no autovacuum, so the value is purely catalog/dump state that
+	// round-trips through pg_dump's
+	// `WITH (toast.autovacuum_multixact_freeze_max_age='N')`. M0110-0001 (DU-002 slice 234).
+	if v, ok := s.With["toast.autovacuum_multixact_freeze_max_age"]; ok {
+		amfmaxa, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_multixact_freeze_max_age\": %s", v)}
+		}
+		if amfmaxa < 10000 || amfmaxa > 2000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_multixact_freeze_max_age\"", amfmaxa),
+				Detail:  "Valid values are between \"10000\" and \"2000000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_multixact_freeze_max_age="+strconv.Itoa(amfmaxa))
+	}
+	// `toast.autovacuum_multixact_freeze_table_age` — RELOPT_TYPE_INT, range
+	// 0–2000000000, default -1 (= unset). Shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:1895/316), so PG accepts the `toast.` prefix and stores it (no
+	// prefix) on the TOAST relation's reloptions. 0 is a valid explicit value
+	// (mirrors the parent-table arm, slice 211 sibling); an explicit -1 is rejected
+	// as out-of-range. goopg has no autovacuum, so the value is purely catalog/dump
+	// state that round-trips through pg_dump's
+	// `WITH (toast.autovacuum_multixact_freeze_table_age='N')`. M0110-0001 (DU-002 slice 235).
+	if v, ok := s.With["toast.autovacuum_multixact_freeze_table_age"]; ok {
+		amfta, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_multixact_freeze_table_age\": %s", v)}
+		}
+		if amfta < 0 || amfta > 2000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_multixact_freeze_table_age\"", amfta),
+				Detail:  "Valid values are between \"0\" and \"2000000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_multixact_freeze_table_age="+strconv.Itoa(amfta))
+	}
+	// `toast.log_autovacuum_min_duration` — RELOPT_TYPE_INT, range -1–INT_MAX,
+	// default -1 (= unset / use the GUC). Shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:1897/324), so PG accepts the `toast.` prefix and stores it (no
+	// prefix) on the TOAST relation's reloptions. Unlike the autovacuum-age options,
+	// -1 IS a valid explicit value here (0 logs every action; -1 disables logging),
+	// so the floor is -1 not 0 (mirrors the parent-table arm, slice 206 sibling).
+	// goopg has no autovacuum, so the value is purely catalog/dump state that
+	// round-trips through pg_dump's `WITH (toast.log_autovacuum_min_duration='N')`.
+	// M0110-0001 (DU-002 slice 236).
+	if v, ok := s.With["toast.log_autovacuum_min_duration"]; ok {
+		lamd, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"log_autovacuum_min_duration\": %s", v)}
+		}
+		if lamd < -1 || lamd > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"log_autovacuum_min_duration\"", lamd),
+				Detail:  "Valid values are between \"-1\" and \"2147483647\"."}
+		}
+		toastReloptions = append(toastReloptions, "log_autovacuum_min_duration="+strconv.Itoa(lamd))
+	}
+	// `toast.autovacuum_vacuum_insert_threshold` — RELOPT_TYPE_INT, range
+	// -1–INT_MAX, default -2 (= unset / use the GUC); -1 disables insert vacuums.
+	// Shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST (reloptions.c:245/1879), so PG
+	// accepts the `toast.` prefix and stores it (no prefix) on the TOAST relation's
+	// reloptions. Both -1 and 0 are valid explicit values; the value is gathered
+	// whenever the key is present (mirrors the parent-table arm, slice 204 sibling).
+	// goopg has no autovacuum, so the value is purely catalog/dump state that
+	// round-trips through pg_dump's `WITH (toast.autovacuum_vacuum_insert_threshold='N')`.
+	// M0110-0001 (DU-002 slice 237).
+	if v, ok := s.With["toast.autovacuum_vacuum_insert_threshold"]; ok {
+		avit, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_insert_threshold\": %s", v)}
+		}
+		if avit < -1 || avit > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_insert_threshold\"", avit),
+				Detail:  "Valid values are between \"-1\" and \"2147483647\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_vacuum_insert_threshold="+strconv.Itoa(avit))
+	}
+	// `toast.autovacuum_vacuum_max_threshold` — RELOPT_TYPE_INT, range
+	// -1–INT_MAX, default -2 (= unset / use the GUC); -1 disables the cap.
+	// Shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST (reloptions.c:236/1877), so PG
+	// accepts the `toast.` prefix and stores it (no prefix) on the TOAST relation's
+	// reloptions. Both -1 and 0 are valid explicit values; the value is gathered
+	// whenever the key is present (mirrors the toast.autovacuum_vacuum_insert_threshold
+	// arm, slice 237 sibling). goopg has no autovacuum, so the value is purely
+	// catalog/dump state that round-trips through pg_dump's
+	// `WITH (toast.autovacuum_vacuum_max_threshold='N')`. M0110-0001 (DU-002 slice 238).
+	if v, ok := s.With["toast.autovacuum_vacuum_max_threshold"]; ok {
+		avmt, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_max_threshold\": %s", v)}
+		}
+		if avmt < -1 || avmt > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_max_threshold\"", avmt),
+				Detail:  "Valid values are between \"-1\" and \"2147483647\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_vacuum_max_threshold="+strconv.Itoa(avmt))
+	}
+	// `toast.autovacuum_vacuum_insert_scale_factor` — the last RELOPT_KIND_TOAST
+	// *real* option, reusing the parent-table float reloption path (slice 201). PG's
+	// reloption type is RELOPT_TYPE_REAL with range 0.0–100.0 and a default of -1
+	// (= unset / use the GUC); autovacuum_vacuum_insert_scale_factor shares
+	// RELOPT_KIND_HEAP | RELOPT_KIND_TOAST (reloptions.c:411/1905), so PG accepts the
+	// `toast.` prefix and stores it (no prefix) on the TOAST relation's reloptions.
+	// The `!(f >= 0 && f <= 100)` form also rejects NaN/±Inf. goopg has no autovacuum,
+	// so the value is purely catalog/dump state that round-trips through pg_dump's
+	// `WITH (toast.autovacuum_vacuum_insert_scale_factor='F')`. With this arm the
+	// toast.* reloption surface is complete. M0110-0001 (DU-002 slice 239).
+	if v, ok := s.With["toast.autovacuum_vacuum_insert_scale_factor"]; ok {
+		avisf, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"autovacuum_vacuum_insert_scale_factor\": %s", v)}
+		}
+		if !(avisf >= 0.0 && avisf <= 100.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"autovacuum_vacuum_insert_scale_factor\"", strconv.FormatFloat(avisf, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"100.000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_vacuum_insert_scale_factor="+strconv.FormatFloat(avisf, 'g', -1, 64))
+	}
+	// `toast.vacuum_max_eager_freeze_failure_rate` — a RELOPT_KIND_TOAST *real*
+	// option, reusing the parent-table float reloption path (slice 216). PG's
+	// reloption type is RELOPT_TYPE_REAL with range 0.0–1.0 (NOT 0.0–100.0 — it is a
+	// fraction of pages) and a default of -1 (= unset / use the GUC);
+	// vacuum_max_eager_freeze_failure_rate shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:431), so PG accepts the `toast.` prefix and stores it (no prefix)
+	// on the TOAST relation's reloptions. The `!(f >= 0 && f <= 1)` form also rejects
+	// NaN/±Inf. goopg has no eager freezing, so the value is purely catalog/dump state
+	// that round-trips through pg_dump's
+	// `WITH (toast.vacuum_max_eager_freeze_failure_rate='F')`. The earlier working-set
+	// note that the toast.* surface was "complete" at slice 239 was wrong: PG has 18
+	// RELOPT_KIND_TOAST options, and this is the 17th. M0110-0001 (DU-002 slice 240).
+	if v, ok := s.With["toast.vacuum_max_eager_freeze_failure_rate"]; ok {
+		vmefr, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"vacuum_max_eager_freeze_failure_rate\": %s", v)}
+		}
+		if !(vmefr >= 0.0 && vmefr <= 1.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"vacuum_max_eager_freeze_failure_rate\"", strconv.FormatFloat(vmefr, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"1.000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "vacuum_max_eager_freeze_failure_rate="+strconv.FormatFloat(vmefr, 'g', -1, 64))
+	}
+	// `toast.vacuum_index_cleanup` — the only RELOPT_KIND_TOAST *enum* option,
+	// reusing the parent-table enum reloption path (slice 217). PG's reloption type
+	// is RELOPT_TYPE_ENUM accepting auto/on/off/true/false/yes/no/1/0
+	// case-insensitively (StdRdOptIndexCleanupValues, reloptions.c:487);
+	// vacuum_index_cleanup shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:519), so PG accepts the `toast.` prefix and stores it (no prefix)
+	// on the TOAST relation's reloptions. Like the parent-table arm the value is
+	// stored VERBATIM (trimmed) rather than re-rendered to a canonical form,
+	// mirroring PG's pg_class.reloptions which preserves the literal input text (so
+	// `=on` round-trips as `=on`, not `=true`); an unrecognized value is a 22023
+	// error. goopg has no autovacuum, so the value is purely catalog/dump state that
+	// round-trips through pg_dump's `WITH (toast.vacuum_index_cleanup='V')`. This is
+	// the 18th and final RELOPT_KIND_TOAST option, so the toast.* reloption surface
+	// is now genuinely complete. M0110-0001 (DU-002 slice 241).
+	if v, ok := s.With["toast.vacuum_index_cleanup"]; ok {
+		trimmed := strings.TrimSpace(v)
+		switch strings.ToLower(trimmed) {
+		case "auto", "on", "off", "true", "false", "yes", "no", "1", "0":
+			// accepted enum spelling
+		default:
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for enum option \"vacuum_index_cleanup\": %s", trimmed),
+				Detail:  "Valid values are \"on\", \"off\", and \"auto\"."}
+		}
+		toastReloptions = append(toastReloptions, "vacuum_index_cleanup="+trimmed)
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -973,12 +1922,77 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	if err := validatePartitionKey(s, cols, o.ctx); err != nil {
 		return err
 	}
+	// Mark purely-inherited columns (copied from an INHERITS parent and not
+	// locally redefined in the child body) so pg_attribute reports
+	// attislocal=false / attinhcount>0. pg_dump then omits them from the child's
+	// CREATE TABLE column list — they arrive via the INHERITS (...) clause
+	// instead. A column the child also declares stays local (attislocal=true).
+	// DU-002 slice 170.
+	if len(inheritParents) > 0 {
+		localCols := make(map[string]bool, len(s.Columns))
+		for _, c := range s.Columns {
+			localCols[strings.ToLower(c.Name)] = true
+		}
+		for i := range cols {
+			lname := strings.ToLower(cols[i].Name)
+			if inheritedColNames[lname] && !localCols[lname] {
+				cols[i].Inherited = true
+			}
+		}
+	}
 	tbl, err := o.ctx.Catalog.CreateTable(s.Name, cols)
 	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
 	}
 	tbl.Unlogged = s.Unlogged
 	tbl.Temp = s.Temporary
+	tbl.Fillfactor = fillfactor
+	tbl.ParallelWorkers = parallelWorkers
+	tbl.ParallelWorkersSet = parallelWorkersSet
+	tbl.AutovacuumEnabled = autovacuumEnabled
+	tbl.AutovacuumEnabledSet = autovacuumEnabledSet
+	tbl.ToastTupleTarget = toastTupleTarget
+	tbl.AutovacuumVacuumThreshold = autovacuumVacuumThreshold
+	tbl.AutovacuumVacuumThresholdSet = autovacuumVacuumThresholdSet
+	tbl.AutovacuumVacuumScaleFactor = autovacuumVacuumScaleFactor
+	tbl.AutovacuumVacuumScaleFactorSet = autovacuumVacuumScaleFactorSet
+	tbl.AutovacuumAnalyzeScaleFactor = autovacuumAnalyzeScaleFactor
+	tbl.AutovacuumAnalyzeScaleFactorSet = autovacuumAnalyzeScaleFactorSet
+	tbl.AutovacuumVacuumInsertScaleFactor = autovacuumVacuumInsertScaleFactor
+	tbl.AutovacuumVacuumInsertScaleFactorSet = autovacuumVacuumInsertScaleFactorSet
+	tbl.AutovacuumVacuumCostDelay = autovacuumVacuumCostDelay
+	tbl.AutovacuumVacuumCostDelaySet = autovacuumVacuumCostDelaySet
+	tbl.AutovacuumAnalyzeThreshold = autovacuumAnalyzeThreshold
+	tbl.AutovacuumAnalyzeThresholdSet = autovacuumAnalyzeThresholdSet
+	tbl.AutovacuumVacuumInsertThreshold = autovacuumVacuumInsertThreshold
+	tbl.AutovacuumVacuumInsertThresholdSet = autovacuumVacuumInsertThresholdSet
+	tbl.VacuumTruncate = vacuumTruncate
+	tbl.VacuumTruncateSet = vacuumTruncateSet
+	tbl.LogAutovacuumMinDuration = logAutovacuumMinDuration
+	tbl.LogAutovacuumMinDurationSet = logAutovacuumMinDurationSet
+	tbl.AutovacuumFreezeMinAge = autovacuumFreezeMinAge
+	tbl.AutovacuumFreezeMinAgeSet = autovacuumFreezeMinAgeSet
+	tbl.AutovacuumFreezeMaxAge = autovacuumFreezeMaxAge
+	tbl.AutovacuumFreezeMaxAgeSet = autovacuumFreezeMaxAgeSet
+	tbl.AutovacuumFreezeTableAge = autovacuumFreezeTableAge
+	tbl.AutovacuumFreezeTableAgeSet = autovacuumFreezeTableAgeSet
+	tbl.AutovacuumMultixactFreezeMinAge = autovacuumMultixactFreezeMinAge
+	tbl.AutovacuumMultixactFreezeMinAgeSet = autovacuumMultixactFreezeMinAgeSet
+	tbl.AutovacuumMultixactFreezeMaxAge = autovacuumMultixactFreezeMaxAge
+	tbl.AutovacuumMultixactFreezeMaxAgeSet = autovacuumMultixactFreezeMaxAgeSet
+	tbl.AutovacuumMultixactFreezeTableAge = autovacuumMultixactFreezeTableAge
+	tbl.AutovacuumMultixactFreezeTableAgeSet = autovacuumMultixactFreezeTableAgeSet
+	tbl.AutovacuumVacuumCostLimit = autovacuumVacuumCostLimit
+	tbl.AutovacuumVacuumCostLimitSet = autovacuumVacuumCostLimitSet
+	tbl.UserCatalogTable = userCatalogTable
+	tbl.UserCatalogTableSet = userCatalogTableSet
+	tbl.AutovacuumVacuumMaxThreshold = autovacuumVacuumMaxThreshold
+	tbl.AutovacuumVacuumMaxThresholdSet = autovacuumVacuumMaxThresholdSet
+	tbl.VacuumMaxEagerFreezeFailureRate = vacuumMaxEagerFreezeFailureRate
+	tbl.VacuumMaxEagerFreezeFailureRateSet = vacuumMaxEagerFreezeFailureRateSet
+	tbl.VacuumIndexCleanup = vacuumIndexCleanup
+	tbl.VacuumIndexCleanupSet = vacuumIndexCleanupSet
+	tbl.ToastReloptions = toastReloptions
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -986,11 +2000,25 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				im.RegisterInheritanceChild(parent.OID, tbl.OID)
 			}
 		}
+		// Record the ordered parent OIDs on the child so pg_inherits emits a
+		// row per (child, parent) pair and pg_dump re-emits the INHERITS clause.
+		parentOIDs := make([]uint32, 0, len(inheritParents))
+		for _, parent := range inheritParents {
+			parentOIDs = append(parentOIDs, parent.OID)
+		}
+		tbl.InheritsParentOIDs = parentOIDs
 	}
 	// Register FK constraints from inline REFERENCES clauses. M0096-0011.
 	for _, c := range s.Columns {
 		if c.RefTable.Name != "" {
+			// PG auto-names a single-column inline FK <table>_<col>_fkey and
+			// records it in pg_constraint (contype='f'); pg_dump's getConstraints
+			// reads that row and renders the ALTER TABLE ADD CONSTRAINT via
+			// pg_get_constraintdef. DU-002 slice 51.
+			fkName := tbl.Name + "_" + c.Name + "_fkey"
 			fk := catalog.ForeignKey{
+				Name:              fkName,
+				OID:               o.allocConstraintOID(fkName),
 				Columns:           []string{c.Name},
 				RefTable:          c.RefTable.Name,
 				RefColumns:        c.RefColumns,
@@ -1005,6 +2033,34 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		}
+	}
+	// Register table-level FOREIGN KEY constraints — the multi-column sibling of
+	// the inline REFERENCES loop above (`FOREIGN KEY (a, b) REFERENCES t (x, y)`).
+	// PG auto-names an unnamed table-level FK <table>_<firstcol>_fkey and records
+	// it in pg_constraint (contype='f'), where pg_dump's getConstraints renders it
+	// via pg_get_constraintdef (conkey/confkey ordinals are already multi-column
+	// aware). DU-002 slice 53.
+	for _, tfk := range s.TableForeignKeys {
+		fkName := tfk.Name
+		if fkName == "" {
+			firstCol := ""
+			if len(tfk.Columns) > 0 {
+				firstCol = tfk.Columns[0]
+			}
+			fkName = tbl.Name + "_" + firstCol + "_fkey"
+		}
+		fk := catalog.ForeignKey{
+			Name:              fkName,
+			OID:               o.allocConstraintOID(fkName),
+			Columns:           append([]string(nil), tfk.Columns...),
+			RefTable:          tfk.RefTable.Name,
+			RefColumns:        append([]string(nil), tfk.RefColumns...),
+			OnDelete:          tfk.OnDelete,
+			OnUpdate:          tfk.OnUpdate,
+			Deferrable:        tfk.Deferrable,
+			InitiallyDeferred: tfk.InitiallyDeferred,
+		}
+		tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 	}
 	// Register implicit sequences for SERIAL / BIGSERIAL / SMALLSERIAL columns
 	// and GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY columns.
@@ -1039,12 +2095,18 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			seqStart = c.IdentityStart
 		}
 		RegisterSequence(seqName, seqStart, 1, seqMin, seqMax, false)
-		// Set the data type so information_schema.sequences shows the correct type.
+		// Set the data type so information_schema.sequences shows the correct type
+		// AND pg_dump computes the right default min/max. The base-integer aliases
+		// (int2/smallint, int8/bigint) only reach here for IDENTITY columns (serial
+		// columns use the serialN spellings); without them a `bigint GENERATED AS
+		// IDENTITY` sequence got seqtypid=int4, so pg_dump's default_maxv was
+		// INT32_MAX and it emitted a spurious `MAXVALUE 9223372036854775807` instead
+		// of `NO MAXVALUE`. Mirrors the seqMin/seqMax switch above. DU-002 slice 120.
 		var seqDataType string
 		switch colTypeLow {
-		case "smallserial", "serial2":
+		case "smallserial", "serial2", "int2", "smallint":
 			seqDataType = "smallint"
-		case "bigserial", "serial8":
+		case "bigserial", "serial8", "int8", "bigint":
 			seqDataType = "bigint"
 		default:
 			seqDataType = "integer"
@@ -1052,6 +2114,16 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		SetSequenceDataType(seqName, seqDataType)
 		// Record implicit ownership so DROP TABLE cascades to this sequence.
 		SetSequenceOwnedBy(seqName, strings.ToLower(s.Name.Name)+"."+strings.ToLower(c.Name))
+		// A SERIAL or IDENTITY column's backing sequence must be discoverable by
+		// pg_dump (relkind='S' in pg_class + its pg_depend row), so give it a catalog
+		// IsSequence relation just like an explicit CREATE SEQUENCE. A serial
+		// sequence's OWNED-BY link is AUTO ('a'), so pg_dump dumps it as a standalone
+		// CREATE SEQUENCE + ALTER SEQUENCE OWNED BY + a column SET DEFAULT
+		// nextval(...) (vs an identity column's INTERNAL 'i' ADD GENERATED form).
+		// M0110-0001 (slice 120 identity, slice 121 serial).
+		if c.IdentityColumn || isSerial {
+			o.createSeqCatalogTable(parser.ObjectName{Schema: s.Name.Schema, Name: seqName}, seqName)
+		}
 	}
 
 	// If PARTITION BY, annotate the table with partition metadata
@@ -1101,6 +2173,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					idx.ExclusionOp = "="
 					idx.IncludeColumns = nc.IncludeColumns
 					idx.IsConstraint = true
+					// DEFERRABLE [INITIALLY DEFERRED] rides the backing index so the
+					// deparse appends the clause and pg_constraint emits
+					// condeferrable/condeferred. Dump-fidelity only. DU-002 slice 143.
+					idx.Deferrable = nc.Deferrable
+					idx.InitiallyDeferred = nc.InitiallyDeferred
 				}
 			} else {
 				// Other exclusion operators: stub catalog entry; no enforcement in v0.
@@ -1117,6 +2194,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.IsConstraint = true
 			idx.IncludeColumns = nc.IncludeColumns
+			// NULLS NOT DISTINCT rides the backing index so pg_get_constraintdef /
+			// pg_dump re-emit `UNIQUE NULLS NOT DISTINCT (cols)`. DU-002 slice 138.
+			idx.NullsNotDistinct = nc.NullsNotDistinct
+			// DEFERRABLE [INITIALLY DEFERRED] likewise rides the backing index so
+			// the deparse appends the clause and pg_constraint emits
+			// condeferrable/condeferred. Dump-fidelity only. DU-002 slice 140.
+			idx.Deferrable = nc.Deferrable
+			idx.InitiallyDeferred = nc.InitiallyDeferred
 		}
 		if primary {
 			namedPKCreated = true
@@ -1138,12 +2223,33 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Both need a B-tree index with unique=true, primary=true so that
 	// ON CONFLICT (col) can match the constraint via resolveArbiterIndex.
 	var pkCols []string
+	// DEFERRABLE [INITIALLY DEFERRED] for the anonymous table-level
+	// (`PRIMARY KEY (a) DEFERRABLE`) and inline-column (`a int PRIMARY KEY
+	// DEFERRABLE`) forms rides the backing tbl_pkey index so pg_get_constraintdef
+	// / pg_constraint re-emit the clause on dump. The named table-level form is
+	// handled by the NamedConstraints loop above. DU-002 slice 142.
+	var pkDeferrable, pkInitiallyDeferred bool
 	if len(s.PrimaryKey) > 0 {
 		pkCols = s.PrimaryKey
+		pkDeferrable = s.PrimaryKeyDeferrable
+		pkInitiallyDeferred = s.PrimaryKeyInitiallyDeferred
 	} else {
 		for _, c := range s.Columns {
 			if c.Primary {
 				pkCols = append(pkCols, c.Name)
+			}
+		}
+	}
+	// An inline-column PRIMARY KEY (`a int PRIMARY KEY DEFERRABLE`) also
+	// populates s.PrimaryKey (the parser appends the column name), so the
+	// table-level flags above stay false for that form; adopt the inline PK
+	// column's deferrable flags here. The inline-column and table-level PK forms
+	// are mutually exclusive, so this never double-counts. DU-002 slice 142.
+	if !pkDeferrable {
+		for _, c := range s.Columns {
+			if c.Primary && c.PrimaryDeferrable {
+				pkDeferrable = true
+				pkInitiallyDeferred = c.PrimaryInitiallyDeferred
 			}
 		}
 	}
@@ -1158,6 +2264,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.IsConstraint = true
 			idx.IncludeColumns = s.PrimaryKeyInclude
+			idx.Deferrable = pkDeferrable
+			idx.InitiallyDeferred = pkInitiallyDeferred
 		}
 		// PRIMARY KEY implies NOT NULL on all key columns (SQL standard).
 		for _, pkCol := range pkCols {
@@ -1170,12 +2278,26 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// e.g. `CREATE TABLE t (a int UNIQUE, b text)` — M0097-0028.
 	for _, c := range s.Columns {
 		if c.Unique {
-			idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + c.Name + "_key"}
+			// Named inline column UNIQUE (`CONSTRAINT myname UNIQUE`) uses the
+			// user-given name for the backing index/constraint; the anonymous
+			// form auto-generates `tbl_col_key`. DU-002 slice 137.
+			idxBaseName := tbl.Name + "_" + c.Name + "_key"
+			if c.UniqueConstraintName != "" {
+				idxBaseName = c.UniqueConstraintName
+			}
+			idxName := parser.ObjectName{Schema: s.Name.Schema, Name: idxBaseName}
 			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false); err != nil {
 				return err
 			}
 			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 				idx.IsConstraint = true
+				// NULLS NOT DISTINCT (PG 15+) — record so pg_get_constraintdef
+				// re-emits `UNIQUE NULLS NOT DISTINCT (col)`. DU-002 slice 136.
+				idx.NullsNotDistinct = c.UniqueNullsNotDistinct
+				// DEFERRABLE [INITIALLY DEFERRED] — record so pg_get_constraintdef /
+				// pg_constraint re-emit the clause on dump. DU-002 slice 141.
+				idx.Deferrable = c.UniqueDeferrable
+				idx.InitiallyDeferred = c.UniqueInitiallyDeferred
 			}
 		}
 	}
@@ -1193,6 +2315,19 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.IsConstraint = true
 			idx.IncludeColumns = inclCols
+			// NULLS NOT DISTINCT (PG 15+) — record so pg_get_constraintdef
+			// re-emits `UNIQUE NULLS NOT DISTINCT (…)`. DU-002 slice 135.
+			if i < len(s.TableUniqueNullsNotDistinct) {
+				idx.NullsNotDistinct = s.TableUniqueNullsNotDistinct[i]
+			}
+			// DEFERRABLE [INITIALLY DEFERRED] — record so pg_get_constraintdef /
+			// pg_constraint re-emit the clause on dump. DU-002 slice 139.
+			if i < len(s.TableUniqueDeferrable) {
+				idx.Deferrable = s.TableUniqueDeferrable[i]
+			}
+			if i < len(s.TableUniqueInitiallyDeferred) {
+				idx.InitiallyDeferred = s.TableUniqueInitiallyDeferred[i]
+			}
 		}
 	}
 	// Create indexes for anonymous EXCLUDE USING constraints. M0097-0023.
@@ -1212,6 +2347,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				idx.ExclusionOp = "="
 				idx.IncludeColumns = ec.IncludeColumns
 				idx.IsConstraint = true
+				// DEFERRABLE [INITIALLY DEFERRED] rides the backing index so the
+				// deparse appends the clause and pg_constraint emits
+				// condeferrable/condeferred. Dump-fidelity only. DU-002 slice 143.
+				idx.Deferrable = ec.Deferrable
+				idx.InitiallyDeferred = ec.InitiallyDeferred
 			}
 		} else {
 			if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, ec); err != nil {
@@ -1266,12 +2406,27 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			tbl.AddCheck(autoName, c.CheckExpr, o.allocConstraintOID(autoName))
 		}
 	}
-	for _, chk := range s.TableChecks {
-		tbl.AddCheck("", chk, 0)
+	// Table-level CHECK constraints written without an explicit CONSTRAINT name
+	// (`CREATE TABLE t (..., CHECK (a < b))`) are anonymous in the parser, but
+	// PostgreSQL still assigns each one a catalog-visible auto-name at DDL time
+	// (AddRelationNewConstraints): a CHECK that references exactly one column
+	// becomes "<table>_<col>_check", any other case becomes "<table>_check".
+	// Giving them name+OID here makes them surface in pg_constraint (contype='c')
+	// and therefore in pg_dump — previously they were stored with an empty name
+	// and OID 0, so the dumped CREATE TABLE silently dropped them. DU-002 slice 127.
+	for i, chk := range s.TableChecks {
+		autoName := o.autoCheckName(tbl, chk)
+		// TableCheckNoInherit is parallel to TableChecks; an anonymous
+		// `CHECK (...) NO INHERIT` must keep its flag so the dumped
+		// constraintdef re-emits the suffix. DU-002 slice 128.
+		noInherit := i < len(s.TableCheckNoInherit) && s.TableCheckNoInherit[i]
+		tbl.AddCheckWithNoInherit(autoName, chk, o.allocConstraintOID(autoName), noInherit)
 	}
 	// Named table-level CHECK constraints from CONSTRAINT name CHECK (expr). M0097-0023.
+	// A named `CONSTRAINT c CHECK (...) NO INHERIT` must keep its per-constraint
+	// flag so the dumped constraintdef re-emits the suffix. DU-002 slice 129.
 	for _, nc := range s.TableNamedChecks {
-		tbl.AddCheck(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name))
+		tbl.AddCheckWithNoInherit(nc.Name, nc.Expr, o.allocConstraintOID(nc.Name), nc.NoInherit)
 	}
 	// Copy statistics from LIKE INCLUDING STATISTICS (or INCLUDING ALL) sources. M0097-0023.
 	if len(likeStatisticsSources) > 0 {
@@ -1305,17 +2460,6 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// explicit or inherited columns get auto-name <tablename>_<colname>_not_null.
 	// M0097-0023.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		pkColSet := make(map[string]bool, len(pkCols))
-		for _, pk := range pkCols {
-			pkColSet[strings.ToLower(pk)] = true
-		}
-		for _, nc := range s.NamedConstraints {
-			if nc.IsPrimary {
-				for _, pc := range nc.Columns {
-					pkColSet[strings.ToLower(pc)] = true
-				}
-			}
-		}
 		// Build set of explicit column defs that carry NOT NULL NO INHERIT.
 		explicitNoInherit := make(map[string]bool)
 		for _, origCol := range s.Columns {
@@ -1323,8 +2467,15 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				explicitNoInherit[strings.ToLower(origCol.Name)] = true
 			}
 		}
+		// PG18 records a contype='n' NOT NULL constraint for EVERY not-null
+		// column, INCLUDING primary-key columns (the PK implies NOT NULL, and
+		// PG materialises that as a separate `<table>_<col>_not_null` row in
+		// pg_constraint). pg_dump's getTableAttrs LEFT-JOINs pg_constraint on
+		// contype='n' to decide whether to print the inline NOT NULL clause, so
+		// PK columns must NOT be skipped here or their NOT NULL is lost from the
+		// dump (`id integer` instead of `id integer NOT NULL`). DU-002 slice 50.
 		for _, col := range tbl.Columns {
-			if !col.NotNull || pkColSet[strings.ToLower(col.Name)] {
+			if !col.NotNull {
 				continue
 			}
 			colKey := strings.ToLower(col.Name)
@@ -1456,6 +2607,110 @@ func (o *ddlOp) allocConstraintOID(name string) uint32 {
 		return 0
 	}
 	return o.ctx.Catalog.AllocOID()
+}
+
+// autoCheckName derives PostgreSQL's auto-generated name for an anonymous
+// table-level CHECK constraint. PG's AddRelationNewConstraints names a CHECK
+// that references exactly one column "<table>_<col>_check" and any other CHECK
+// (multiple columns, or none) "<table>_check"; the single-vs-multi decision is
+// made by counting the distinct columns the expression references (PG uses
+// pull_var_clause, which does not descend into sublinks). On a collision with an
+// existing constraint name on the table, ChooseConstraintName appends an
+// incrementing numeric suffix to the "check" label ("<base>1", "<base>2", …).
+// DU-002 slice 127.
+func (o *ddlOp) autoCheckName(tbl *catalog.Table, expr string) string {
+	base := tbl.Name + "_check"
+	if parsed, err := parser.ParseExpr(expr); err == nil {
+		var cols []string
+		collectCheckExprColumns(parsed, &cols)
+		seen := make(map[string]bool, len(cols))
+		var distinct []string
+		for _, c := range cols {
+			if !seen[c] {
+				seen[c] = true
+				distinct = append(distinct, c)
+			}
+		}
+		if len(distinct) == 1 {
+			base = tbl.Name + "_" + distinct[0] + "_check"
+		}
+	}
+	name := base
+	for i := 1; checkNameTaken(tbl, name); i++ {
+		name = base + strconv.Itoa(i)
+	}
+	return name
+}
+
+// checkNameTaken reports whether the table already carries a CHECK constraint
+// with the given name (used for ChooseConstraintName-style collision avoidance).
+func checkNameTaken(tbl *catalog.Table, name string) bool {
+	for _, nc := range tbl.NamedChecks {
+		if nc.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// collectCheckExprColumns walks a parsed CHECK expression and appends the
+// lowercased names of every bare column reference it finds to *out. Mirrors
+// PostgreSQL's pull_var_clause: subqueries (sublinks) are not descended into,
+// which is fine for the approximate single-vs-multi-column name decision.
+func collectCheckExprColumns(e parser.Expr, out *[]string) {
+	if e == nil {
+		return
+	}
+	switch n := e.(type) {
+	case *parser.ColumnRef:
+		if n.Column != "" {
+			*out = append(*out, strings.ToLower(n.Column))
+		}
+	case *parser.BinaryOp:
+		collectCheckExprColumns(n.Left, out)
+		collectCheckExprColumns(n.Right, out)
+	case *parser.UnaryOp:
+		collectCheckExprColumns(n.Operand, out)
+	case *parser.CastExpr:
+		collectCheckExprColumns(n.Operand, out)
+	case *parser.CollateExpr:
+		collectCheckExprColumns(n.Operand, out)
+	case *parser.IsNullExpr:
+		collectCheckExprColumns(n.Operand, out)
+	case *parser.IsBoolExpr:
+		collectCheckExprColumns(n.Operand, out)
+	case *parser.IsDistinctFromExpr:
+		collectCheckExprColumns(n.Left, out)
+		collectCheckExprColumns(n.Right, out)
+	case *parser.FuncCall:
+		for _, a := range n.Args {
+			collectCheckExprColumns(a, out)
+		}
+		collectCheckExprColumns(n.Filter, out)
+	case *parser.InExpr:
+		collectCheckExprColumns(n.Operand, out)
+		for _, v := range n.List {
+			collectCheckExprColumns(v, out)
+		}
+	case *parser.CaseExpr:
+		collectCheckExprColumns(n.Operand, out)
+		for _, w := range n.Whens {
+			collectCheckExprColumns(w.When, out)
+			collectCheckExprColumns(w.Then, out)
+		}
+		collectCheckExprColumns(n.Else, out)
+	case *parser.RowExpr:
+		for _, el := range n.Elems {
+			collectCheckExprColumns(el, out)
+		}
+	case *parser.ArrayConstructorExpr:
+		for _, el := range n.Elements {
+			collectCheckExprColumns(el, out)
+		}
+	case *parser.ArraySubscriptExpr:
+		collectCheckExprColumns(n.Base, out)
+		collectCheckExprColumns(n.Index, out)
+	}
 }
 
 // appendLikeChecks copies src's CHECK constraints (name + expression) into
@@ -1606,6 +2861,38 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	if err := validatePartitionChild(s, parent, o.ctx); err != nil {
 		return err
 	}
+	// Storage parameters (WITH clause) on a partition child. PG allows them on a
+	// leaf partition (it is a concrete heap), but rejects them when the child is
+	// itself a partitioned table (PARTITION BY ...). Validate names/value here so
+	// the leaf's fillfactor persists on pg_class.reloptions and round-trips
+	// through pg_dump, mirroring the non-partition CREATE TABLE path above.
+	// M0110-0001 (DU-002 slice 191).
+	for k := range s.With {
+		if k != strings.ToLower(k) {
+			return &ExecError{Code: "42000", Pos: s.Pos(),
+				Message: fmt.Sprintf("unrecognized parameter %q", k)}
+		}
+	}
+	if s.PartitionBy != nil && len(s.With) > 0 {
+		return &ExecError{Code: "0A000", Pos: s.Pos(),
+			Message: "cannot specify storage parameters for a partitioned table",
+			Detail:  "This operation is not supported for partitioned tables.",
+			Hint:    "Specify storage parameters for its leaf partitions instead."}
+	}
+	childFillfactor := 0
+	if v, ok := s.With["fillfactor"]; ok {
+		ff, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"fillfactor\": %s", v)}
+		}
+		if ff < 10 || ff > 100 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", ff),
+				Detail:  "Valid values are between \"10\" and \"100\"."}
+		}
+		childFillfactor = ff
+	}
 	// Inherit columns from parent (partition children use parent's schema).
 	cols := make([]catalog.Column, len(parent.Columns))
 	copy(cols, parent.Columns)
@@ -1633,6 +2920,9 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// Set persistence flags on the child.
 	tbl.Unlogged = s.Unlogged
 	tbl.Temp = s.Temporary
+	// Persist the leaf partition's fillfactor so pg_class.reloptions surfaces it
+	// and pg_dump re-emits `WITH (fillfactor='N')`. DU-002 slice 191.
+	tbl.Fillfactor = childFillfactor
 	// Set partition metadata on the child.
 	tbl.PartitionParentOID = parent.OID
 	// Use the child's own PARTITION BY clause when present (e.g. nested
@@ -1682,24 +2972,35 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 				}
 			}
 		}
-		// LIST partition: evaluate each IN value as a string.
+		// LIST partition: evaluate each IN value as a string. InValues keeps the
+		// raw unquoted form (routing compares against it); InValueLiterals keeps
+		// the SQL-literal form ('a', 1, …) so FormatPartitionBound emits a valid
+		// relpartbound for pg_dump.
 		for _, e := range poc.InValues {
 			pb.InValues = append(pb.InValues, exprToString(e))
+			pb.InValueLiterals = append(pb.InValueLiterals, boundExprToSQLLiteral(e))
 		}
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	} else if len(poc.FromValues) > 0 || len(poc.ToValues) > 0 {
 		// RANGE partition: store all key-column values for multi-column routing.
+		// FromValues/ToValues keep the raw unquoted routing form; the parallel
+		// *ValueLiterals keep the SQL-literal form ('a', 5, MINVALUE) so
+		// FormatPartitionBound emits a valid relpartbound for pg_dump.
 		if len(poc.FromValues) > 0 {
 			pb.From = exprToString(poc.FromValues[0]) // backward compat (single-col)
 			for _, v := range poc.FromValues {
 				pb.FromValues = append(pb.FromValues, exprToString(v))
 			}
+			pb.FromValueLiterals = rangeBoundLiterals(poc.FromValues)
+			pb.FromUnbounded, pb.FromUnboundMax = rangeBoundUnboundedFlags(poc.FromValues)
 		}
 		if len(poc.ToValues) > 0 {
 			pb.To = exprToString(poc.ToValues[0]) // backward compat (single-col)
 			for _, v := range poc.ToValues {
 				pb.ToValues = append(pb.ToValues, exprToString(v))
 			}
+			pb.ToValueLiterals = rangeBoundLiterals(poc.ToValues)
+			pb.ToUnbounded, pb.ToUnboundMax = rangeBoundUnboundedFlags(poc.ToValues)
 		}
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	}
@@ -2052,8 +3353,14 @@ func exprToString(e parser.Expr) string {
 		return v.Value
 	case *parser.NullConst:
 		return "null"
+	case *parser.PartitionRangeBoundKeyword:
+		// Unbounded RANGE edge. The raw routing form keeps the uppercase keyword
+		// as a sentinel string; the parallel FromUnbounded/ToUnbounded flags carry
+		// the unambiguous signal so a real text value 'MINVALUE' is not mistaken
+		// for an unbounded edge. DU-002 slice 261.
+		return v.Keyword()
 	case *parser.ColumnRef:
-		// MINVALUE / MAXVALUE in partition bounds are parsed as ColumnRef.
+		// Legacy: some MINVALUE / MAXVALUE forms were once parsed as ColumnRef.
 		return strings.ToLower(v.Column)
 	case *parser.UnaryOp:
 		if v.Op == parser.OpUnaryNeg {
@@ -2091,6 +3398,14 @@ func defaultExprToSQL(e parser.Expr) string {
 		}
 		return v.Column
 	case *parser.FuncCall:
+		// SQL niladic value functions (CURRENT_TIMESTAMP, CURRENT_USER, …)
+		// parse to a parenless *FuncCall. Deparse them as the bare uppercase
+		// keyword the way PG's get_sql_value_function does — `current_timestamp()`
+		// is not valid SQL on re-evaluation. Mirrors the catalog twin in
+		// catalog.formatExprForAttrdef (DU-002 slice 174); keep the two in sync.
+		if len(v.Args) == 0 && v.Name.Schema == "" && parser.IsNoParenFuncName(strings.ToLower(v.Name.Name)) {
+			return strings.ToUpper(v.Name.Name)
+		}
 		var args []string
 		for _, a := range v.Args {
 			args = append(args, defaultExprToSQL(a))
@@ -2148,6 +3463,85 @@ func defaultExprToSQL(e parser.Expr) string {
 		}
 	case *parser.TypedStringLit:
 		return v.Type + " '" + strings.ReplaceAll(v.Value, "'", "''") + "'"
+	case *parser.ArrayConstructorExpr:
+		// `DEFAULT ARRAY[1, 2, 3]`. Mirror the catalog twin
+		// (catalog.formatExprForAttrdef, DU-002 slice 177); keep the two in sync so
+		// the dump path and the proargdefaults path render identically.
+		var elems []string
+		for _, el := range v.Elements {
+			elems = append(elems, defaultExprToSQL(el))
+		}
+		return "ARRAY[" + strings.Join(elems, ", ") + "]"
+	case *parser.CaseExpr:
+		// `DEFAULT CASE WHEN true THEN 1 ELSE 0 END`. Mirror the catalog twin
+		// (catalog.formatExprForAttrdef, DU-002 slice 178); keep the two in sync so
+		// the dump path and the proargdefaults path render identically.
+		var b strings.Builder
+		b.WriteString("CASE")
+		if v.Operand != nil {
+			b.WriteString(" ")
+			b.WriteString(defaultExprToSQL(v.Operand))
+		}
+		for _, w := range v.Whens {
+			b.WriteString(" WHEN ")
+			b.WriteString(defaultExprToSQL(w.When))
+			b.WriteString(" THEN ")
+			b.WriteString(defaultExprToSQL(w.Then))
+		}
+		if v.Else != nil {
+			b.WriteString(" ELSE ")
+			b.WriteString(defaultExprToSQL(v.Else))
+		}
+		b.WriteString(" END")
+		return b.String()
+	case *parser.RowExpr:
+		// `DEFAULT (1, 2)` — the parenthesised row-constructor shorthand. Mirror the
+		// catalog twin (catalog.formatExprForAttrdef, DU-002 slice 179); keep the two in
+		// sync so the dump path and the proargdefaults path render identically. PG's
+		// ruleutils always prints the ROW keyword (get_rule_expr T_RowExpr).
+		var elems []string
+		for _, el := range v.Elems {
+			elems = append(elems, defaultExprToSQL(el))
+		}
+		return "ROW(" + strings.Join(elems, ", ") + ")"
+	case *parser.IntervalLit:
+		// `DEFAULT INTERVAL '1' day`. Mirror the catalog twin
+		// (catalog.formatExprForAttrdef, DU-002 slice 180); keep the two in sync so
+		// the dump path and the proargdefaults path render identically. goopg has no
+		// interval output function, so it re-emits the native `INTERVAL '<n>' <unit>`
+		// literal form (PG's pg_get_expr would print the equivalent `'<n> <unit>'::interval`).
+		return "INTERVAL '" + strings.ReplaceAll(v.Value, "'", "''") + "' " + v.Unit
+	case *parser.IsNullExpr:
+		// `DEFAULT (1 IS NULL)`. Mirror the catalog twin
+		// (catalog.formatExprForAttrdef, DU-002 slice 181); keep the two in sync so
+		// the dump path and the proargdefaults path render identically. PG's
+		// pg_get_expr deparses a NullTest as `<operand> IS [NOT] NULL`.
+		if v.Negated {
+			return defaultExprToSQL(v.Operand) + " IS NOT NULL"
+		}
+		return defaultExprToSQL(v.Operand) + " IS NULL"
+	case *parser.IsBoolExpr:
+		// `DEFAULT (true IS NOT TRUE)`. Mirror the catalog twin (DU-002 slice 181).
+		// PG's pg_get_expr deparses a BooleanTest as `<operand> IS [NOT] TRUE|FALSE|UNKNOWN`.
+		target := "UNKNOWN"
+		if v.TestTrue {
+			target = "TRUE"
+		} else if v.TestFalse {
+			target = "FALSE"
+		}
+		op := " IS "
+		if v.Negated {
+			op = " IS NOT "
+		}
+		return defaultExprToSQL(v.Operand) + op + target
+	case *parser.IsDistinctFromExpr:
+		// `DEFAULT (1 IS DISTINCT FROM 2)`. Mirror the catalog twin (DU-002 slice 181).
+		// PG's pg_get_expr deparses a DistinctExpr as `<left> IS [NOT] DISTINCT FROM <right>`.
+		op := " IS DISTINCT FROM "
+		if v.Negated {
+			op = " IS NOT DISTINCT FROM "
+		}
+		return defaultExprToSQL(v.Left) + op + defaultExprToSQL(v.Right)
 	}
 	return fmt.Sprintf("%v", e)
 }
@@ -2271,8 +3665,13 @@ func (o *ddlOp) execCreateView(s *parser.CreateViewStmt) error {
 			}
 		}
 	}
-	if _, err := o.ctx.Catalog.CreateView(s.Name, cols, s.Columns, s.Query, s.OrReplace); err != nil {
+	vt, err := o.ctx.Catalog.CreateView(s.Name, cols, s.Columns, s.Query, s.OrReplace)
+	if err != nil {
 		return &ExecError{Code: "42P07", Pos: s.Pos(), Message: err.Error()}
+	}
+	// Preserve the raw view body so pg_get_viewdef can echo it for pg_dump.
+	if vt != nil {
+		vt.ViewDef = s.RawDef
 	}
 	// Register view→PK-constraint dependencies so DROP CONSTRAINT RESTRICT
 	// can detect that this view relies on the constraint. M0097-0036.
@@ -3078,6 +4477,20 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", s.Fillfactor),
 			Detail:  "Valid values are between \"10\" and \"100\"."}
 	}
+	// gin_pending_list_limit (GIN integer storage parameter, kB) range-validated
+	// like PG: min 64, max MAX_KILOBYTES (INT_MAX/1024). DU-002 slice 221.
+	if s.GinPendingListLimit != 0 && (s.GinPendingListLimit < 64 || s.GinPendingListLimit > 2097151) {
+		return &ExecError{Code: "22023", Pos: s.Pos(),
+			Message: fmt.Sprintf("value %d out of bounds for option \"gin_pending_list_limit\"", s.GinPendingListLimit),
+			Detail:  "Valid values are between \"64\" and \"2097151\"."}
+	}
+	// pages_per_range (BRIN integer storage parameter) range-validated like PG:
+	// min 1, max BRIN_MAX_PAGES_PER_RANGE (131072). DU-002 slice 222.
+	if s.PagesPerRange != 0 && (s.PagesPerRange < 1 || s.PagesPerRange > 131072) {
+		return &ExecError{Code: "22023", Pos: s.Pos(),
+			Message: fmt.Sprintf("value %d out of bounds for option \"pages_per_range\"", s.PagesPerRange),
+			Detail:  "Valid values are between \"1\" and \"131072\"."}
+	}
 	method := strings.ToLower(strings.TrimSpace(s.Method))
 	if method == "rtree" {
 		o.ctx.AddNotice("substituting access method \"gist\" for obsolete method \"rtree\"")
@@ -3098,16 +4511,32 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method == "hash" {
 		method = "btree"
 	}
-	// gist and spgist: register catalog metadata only (no physical storage).
-	// pg_index / pg_class / pg_get_indexdef queries work correctly; no actual
-	// index acceleration or constraint enforcement.
-	if method == "gist" || method == "spgist" {
+	// gist, spgist, gin and brin: register catalog metadata only (no physical
+	// storage). pg_index / pg_class / pg_get_indexdef queries work correctly; no
+	// actual index acceleration or constraint enforcement. GIN is catalog-only
+	// so its `fastupdate` reloption can round-trip through pg_dump (slice 220);
+	// BRIN is catalog-only so its `pages_per_range` reloption likewise round-trips
+	// (DU-002 slice 222).
+	if method == "gist" || method == "spgist" || method == "gin" || method == "brin" {
 		idx, createErr := o.ctx.Catalog.CreateIndex(idxName, tbl, s.Columns, s.Unique, method, false)
 		if createErr != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: createErr.Error()}
 		}
 		idx.HasPredicate = s.HasPredicate
 		idx.IncludeColumns = s.IncludeColumns
+		// Persist `WITH (fillfactor=N)` so pg_class.reloptions / pg_dump round-trip
+		// it (already range-validated above). DU-002 slice 218.
+		idx.Fillfactor = s.Fillfactor
+		// Persist `WITH (deduplicate_items=on|off)` likewise. DU-002 slice 219.
+		idx.DeduplicateItems = s.DeduplicateItems
+		// Persist `WITH (fastupdate=on|off)` (GIN). DU-002 slice 220.
+		idx.FastUpdate = s.FastUpdate
+		// Persist `WITH (gin_pending_list_limit=N)` (GIN, range-validated above). DU-002 slice 221.
+		idx.GinPendingListLimit = s.GinPendingListLimit
+		// Persist `WITH (pages_per_range=N)` (BRIN, range-validated above). DU-002 slice 222.
+		idx.PagesPerRange = s.PagesPerRange
+		// Persist `WITH (autosummarize=on|off)` (BRIN). DU-002 slice 223.
+		idx.AutoSummarize = s.AutoSummarize
 		if catalogHeapSyncAvailable(o.ctx) {
 			if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
 				return fmt.Errorf("DDL catalog sync: %w", syncErr)
@@ -3126,18 +4555,52 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, resolvedPred); err != nil {
 		return err
 	}
-	// Store INCLUDE columns, partial index flag, and predicate expression.
-	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil {
+	// Store INCLUDE columns, partial index flag, predicate expression, and the
+	// per-column ASC/DESC + NULLS ordering. The ordering is recorded only when
+	// at least one column is non-default so a plain index keeps empty slices and
+	// dumps byte-identically. DU-002 slice 56.
+	nonDefaultOrder := indexHasNonDefaultOrder(s.ColOrders)
+	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.HasPredicate = s.HasPredicate
 			idx.Predicate = s.Predicate
+			// Persist `WITH (fillfactor=N)` so pg_class.reloptions / pg_dump
+			// round-trip it (already range-validated above). DU-002 slice 218.
+			idx.Fillfactor = s.Fillfactor
+			// Persist `WITH (deduplicate_items=on|off)` likewise. DU-002 slice 219.
+			idx.DeduplicateItems = s.DeduplicateItems
 			if s.Predicate != nil {
 				idx.PredicateString = defaultExprToSQL(s.Predicate)
 			}
 			idx.IncludeColumns = s.IncludeColumns
+			// NULLS NOT DISTINCT (PG 15+) — record so pg_index.indnullsnotdistinct
+			// and pg_get_indexdef reproduce it for pg_dump. DU-002 slice 134.
+			idx.NullsNotDistinct = s.NullsNotDistinct
+			if nonDefaultOrder {
+				desc := make([]bool, len(s.ColOrders))
+				nullsFirst := make([]bool, len(s.ColOrders))
+				for i, ord := range s.ColOrders {
+					desc[i] = ord.Descending
+					nullsFirst[i] = ord.NullsFirst
+				}
+				idx.ColDescending = desc
+				idx.ColNullsFirst = nullsFirst
+			}
 		}
 	}
 	return nil
+}
+
+// indexHasNonDefaultOrder reports whether any key column carries a non-default
+// ASC/DESC + NULLS ordering (the btree default is ASC NULLS LAST, i.e.
+// Descending=false, NullsFirst=false). DU-002 slice 56.
+func indexHasNonDefaultOrder(orders []parser.IndexColOrder) bool {
+	for _, o := range orders {
+		if o.Descending || o.NullsFirst {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
@@ -3343,10 +4806,25 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable); !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
 			}
+			// Surface the FK in pg_constraint (contype='f') so pg_dump can
+			// re-emit it: honour an explicit CONSTRAINT name, else PG's
+			// <table>_<firstcol>_fkey auto-name. DU-002 slice 51.
+			fkName := act.ConstraintName
+			if fkName == "" {
+				firstCol := ""
+				if len(act.Columns) > 0 {
+					firstCol = act.Columns[0]
+				}
+				fkName = tbl.Name + "_" + firstCol + "_fkey"
+			}
 			fk := catalog.ForeignKey{
+				Name:       fkName,
+				OID:        o.allocConstraintOID(fkName),
 				Columns:    append([]string(nil), act.Columns...),
 				RefTable:   act.RefTable.Name,
 				RefColumns: append([]string(nil), act.RefColumns...),
+				OnDelete:   act.OnDelete,
+				OnUpdate:   act.OnUpdate,
 				Deferrable: act.Deferrable,
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
@@ -3426,18 +4904,23 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			} else {
 				for _, e := range poc.InValues {
 					pb.InValues = append(pb.InValues, exprToString(e))
+					pb.InValueLiterals = append(pb.InValueLiterals, boundExprToSQLLiteral(e))
 				}
 				if len(poc.FromValues) > 0 {
 					pb.From = exprToString(poc.FromValues[0]) // backward compat
 					for _, v := range poc.FromValues {
 						pb.FromValues = append(pb.FromValues, exprToString(v))
 					}
+					pb.FromValueLiterals = rangeBoundLiterals(poc.FromValues)
+					pb.FromUnbounded, pb.FromUnboundMax = rangeBoundUnboundedFlags(poc.FromValues)
 				}
 				if len(poc.ToValues) > 0 {
 					pb.To = exprToString(poc.ToValues[0]) // backward compat
 					for _, v := range poc.ToValues {
 						pb.ToValues = append(pb.ToValues, exprToString(v))
 					}
+					pb.ToValueLiterals = rangeBoundLiterals(poc.ToValues)
+					pb.ToUnbounded, pb.ToUnboundMax = rangeBoundUnboundedFlags(poc.ToValues)
 				}
 				if len(pb.InValues) > 0 || pb.From != "" || pb.To != "" {
 					childTbl.PartitionBounds = []catalog.PartitionBound{pb}
@@ -3665,17 +5148,149 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				im.UnregisterInheritanceChild(parentTbl.OID, tbl.OID)
 			}
 		case parser.AlterTableSetStorage:
-			// SET STORAGE type — record on the catalog column for conflict detection.
+			// SET STORAGE type — record on the catalog column AND rewrite the
+			// pg_attribute heap row so pg_dump observes the new attstorage.
+			// pg_dump compares attstorage against the column type's typstorage and
+			// emits `ALTER TABLE ONLY ... SET STORAGE <mode>` only when they differ
+			// (pg_dump.c dumpTableSchema). The in-memory catalog mutation alone is
+			// invisible to pg_dump because pg_attribute is a heap populated at
+			// CREATE TABLE time; the override must be flushed through the same
+			// delete-old-rows + re-sync path DROP COLUMN / SET NOT NULL use, or the
+			// stale heap row keeps reporting the type default and the SET STORAGE
+			// is silently dropped from the dump. DU-002 slice 182.
 			if act.ColumnName != "" && act.StorageType != "" {
+				changed := false
 				for i := range tbl.Columns {
 					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
 						tbl.Columns[i].Storage = act.StorageType
+						changed = true
 						break
+					}
+				}
+				if changed && catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+			}
+		case parser.AlterTableSetCompression:
+			// SET COMPRESSION method — record the per-column TOAST compression on the
+			// catalog column AND rewrite the pg_attribute heap row so pg_dump observes
+			// the new attcompression. pg_dump emits `ALTER TABLE ONLY ... SET
+			// COMPRESSION <method>` whenever attcompression is 'p' (pglz) or 'l' (lz4)
+			// (pg_dump.c dumpTableSchema). Like SET STORAGE (slice 182), the in-memory
+			// mutation alone is invisible because pg_attribute is a heap populated at
+			// CREATE TABLE; the override must be flushed through the same delete-old-
+			// rows + re-sync path or the stale heap row keeps reporting the default
+			// and the SET COMPRESSION is silently dropped from the dump. An empty
+			// CompressionType (`SET COMPRESSION default`) clears the override.
+			// goopg does not TOAST/compress — dump-fidelity only. DU-002 slice 183.
+			if act.ColumnName != "" {
+				changed := false
+				for i := range tbl.Columns {
+					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+						tbl.Columns[i].Compression = act.CompressionType
+						changed = true
+						break
+					}
+				}
+				if changed && catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+			}
+		case parser.AlterTableSetStatistics:
+			// SET STATISTICS <n> — record the per-column statistics target on the
+			// catalog column AND rewrite the pg_attribute heap row so pg_dump
+			// observes the new attstattarget. pg_dump emits `ALTER TABLE ONLY ...
+			// ALTER COLUMN ... SET STATISTICS <n>` whenever attstattarget >= 0
+			// (pg_dump.c dumpTableSchema); the default (NULL/-1) emits nothing.
+			// Like SET STORAGE (slice 182) / SET COMPRESSION (slice 183), the
+			// in-memory mutation alone is invisible because pg_attribute is a heap
+			// populated at CREATE TABLE; the override must be flushed through the
+			// same delete-old-rows + re-sync path or the stale heap row keeps
+			// reporting NULL and the SET STATISTICS is silently dropped from the
+			// dump. `SET STATISTICS -1` (or a negative value) resets to the default
+			// and clears the override. goopg does not sample per-column statistics
+			// targets — dump-fidelity only. DU-002 slice 184.
+			if act.ColumnName != "" {
+				target, parseErr := strconv.Atoi(act.CheckExpr)
+				if parseErr != nil {
+					// No (or malformed) value: treat as reset to default.
+					target = -1
+				}
+				changed := false
+				for i := range tbl.Columns {
+					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+						if target < 0 {
+							tbl.Columns[i].StatTarget = nil
+						} else {
+							v := target
+							tbl.Columns[i].StatTarget = &v
+						}
+						changed = true
+						break
+					}
+				}
+				if changed && catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
 					}
 				}
 			}
 		case parser.AlterTableAlterColumnSet:
-			// SET (options) on a column of a heap table: no-op in goopg v0.
+			// SET (opt=value, …) — record the per-column attribute options on the
+			// catalog column AND rewrite the pg_attribute heap row so pg_dump
+			// observes the new attoptions. pg_dump emits `ALTER TABLE ONLY ...
+			// ALTER COLUMN ... SET (...)` whenever array_to_string(attoptions)
+			// is non-empty (pg_dump.c dumpTableSchema). Like SET STORAGE (slice
+			// 182) / SET COMPRESSION (183) / SET STATISTICS (184), the in-memory
+			// mutation alone is invisible because pg_attribute is a heap populated
+			// at CREATE TABLE; the override must be flushed through the same
+			// delete-old-rows + re-sync path or the stale heap row keeps reporting
+			// NULL and the SET (...) is silently dropped from the dump. goopg does
+			// not act on these planner-statistics hints (e.g. n_distinct) —
+			// dump-fidelity only. DU-002 slice 185.
+			if act.ColumnName != "" && len(act.SetOptions) > 0 {
+				changed := false
+				for i := range tbl.Columns {
+					if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+						tbl.Columns[i].Options = append([]string(nil), act.SetOptions...)
+						changed = true
+						break
+					}
+				}
+				if changed && catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+			}
 		case parser.AlterTableAlterColumnType:
 			if err := o.execAlterColumnType(tbl, act); err != nil {
 				return err
@@ -3939,10 +5554,33 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		idx.IsConstraint = true
 		idx.IncludeColumns = act.IncludeColumns
 	}
-	// PRIMARY KEY implies NOT NULL on all key columns (SQL standard).
+	// PRIMARY KEY implies NOT NULL on all key columns (SQL standard). PG18 also
+	// materialises that implication as a contype='n' `<table>_<col>_not_null`
+	// row in pg_constraint, which pg_dump LEFT-JOINs to decide whether to print
+	// the inline NOT NULL clause. Register one for any PK column that does not
+	// already carry a NOT NULL constraint, so an ALTER-added PK survives a dump
+	// round-trip identically to an inline CREATE TABLE PK. DU-002 slice 50.
+	im, _ := o.ctx.Catalog.(*catalog.InMemory)
 	for _, pkCol := range act.Columns {
-		if col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol); ok {
-			col.NotNull = true
+		col, ok := o.ctx.Catalog.LookupColumn(tbl, pkCol)
+		if !ok {
+			continue
+		}
+		alreadyHadNotNull := col.NotNull
+		col.NotNull = true
+		if im == nil || alreadyHadNotNull {
+			continue
+		}
+		hasConstraint := false
+		for _, nc := range tbl.NotNullConstraints {
+			if strings.EqualFold(nc.ColName, col.Name) {
+				hasConstraint = true
+				break
+			}
+		}
+		if !hasConstraint {
+			nnName := strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_not_null"
+			tbl.AddNotNull(nnName, col.Name, im.AllocOID(), false, true, 0)
 		}
 	}
 	return nil
@@ -4174,6 +5812,10 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	idx.IsExclusion = true
 	idx.ExclusionOp = ec.ExclusionOp
 	idx.IncludeColumns = ec.IncludeColumns
+	// DEFERRABLE [INITIALLY DEFERRED] rides the stub index so pg_get_constraintdef
+	// / pg_constraint re-emit the clause on dump (no enforcement in v0). DU-002 slice 143.
+	idx.Deferrable = ec.Deferrable
+	idx.InitiallyDeferred = ec.InitiallyDeferred
 	if sess, ok2 := o.ctx.Session.(*BasicSession); ok2 {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
 	}
@@ -4533,6 +6175,56 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 		o.ctx.Pool.Unpin(slot)
 	}
 	return nil
+}
+
+// parseReloptionBool mirrors PostgreSQL's parse_bool (parse_bool_with_len in
+// bool.c), which validates boolean reloption values such as
+// `autovacuum_enabled`. Like PG it accepts case-insensitive *prefixes* of the
+// canonical spellings: any non-empty prefix of true/false/yes/no (e.g. "t",
+// "tr", "tru", "true"), plus "on", "of"/"off", and single-character "1"/"0".
+// The second return value reports whether the input was a recognized boolean —
+// callers raise an "invalid value for boolean option" error when it is false.
+// M0110-0001 (DU-002 slice 196).
+func parseReloptionBool(s string) (bool, bool) {
+	if s == "" {
+		return false, false
+	}
+	lower := strings.ToLower(s)
+	switch lower[0] {
+	case 't':
+		if strings.HasPrefix("true", lower) {
+			return true, true
+		}
+	case 'f':
+		if strings.HasPrefix("false", lower) {
+			return false, true
+		}
+	case 'y':
+		if strings.HasPrefix("yes", lower) {
+			return true, true
+		}
+	case 'n':
+		if strings.HasPrefix("no", lower) {
+			return false, true
+		}
+	case 'o':
+		// "on" needs ≥2 chars; "of"/"off" both map to false.
+		if lower == "on" {
+			return true, true
+		}
+		if lower == "of" || lower == "off" {
+			return false, true
+		}
+	case '1':
+		if lower == "1" {
+			return true, true
+		}
+	case '0':
+		if lower == "0" {
+			return false, true
+		}
+	}
+	return false, false
 }
 
 // encodeCompositeBTreeKey builds a composite btree key by concatenating
@@ -5225,6 +6917,15 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 			return err
 		}
 	}
+	// Re-append the "[]" suffix for an array return type, mirroring the
+	// argument-type construction above (operators_ddl.go:5510). The parser
+	// stores arrays as a base name plus IsArray; the pg_proc view keys the
+	// prorettype OID off the bracketed name, so dropping the suffix here makes
+	// pg_dump emit the scalar element type instead of the array.
+	retTypeName := strings.ToLower(s.ReturnType.Name)
+	if s.ReturnType.IsArray {
+		retTypeName += "[]"
+	}
 	r := &catalog.Routine{
 		Schema:      schema,
 		Name:        s.Name.Name,
@@ -5233,10 +6934,18 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		ArgModes:    argModes,
 		ArgDefaults: argDefaults,
 		ReturnType: catalog.Type{
-			Name: strings.ToLower(s.ReturnType.Name),
+			// Mirror the argument-type path above: the parser stores an array
+			// return type as the base name (e.g. "integer") with IsArray set,
+			// NOT as "integer[]". Without re-appending the "[]" suffix the
+			// pg_proc view's typeNameToOIDStr resolves prorettype to the SCALAR
+			// element OID (23) instead of the array OID (1007), so pg_dump emits
+			// `RETURNS integer` and silently drops the array — a sibling-path
+			// divergence from how ArgTypes are built (operators_ddl.go:5510).
+			Name: retTypeName,
 			Args: append([]int64(nil), s.ReturnType.Args...),
 		},
 		ReturnsSet:      s.ReturnsSet,
+		ReturnsTable:    s.ReturnsTable,
 		Language:        lang,
 		Body:            s.Body,
 		BeginAtomic:     s.BeginAtomic,
@@ -5244,6 +6953,9 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 		IsWindow:        s.Window,
 		Strict:          s.Strict,
 		Volatile:        volatile,
+		Parallel:        s.Parallel,
+		Cost:            s.Cost,
+		Rows:            s.Rows,
 		SecurityDefiner: s.SecurityDefiner,
 		Leakproof:       s.Leakproof,
 	}
@@ -6361,9 +8073,114 @@ func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForEnum(et)); err != nil {
 		return
 	}
+	// Also write the auto-generated array type (`_name`) so a `mood[]` column's
+	// atttypid joins to a real pg_type row — pg_dump's getTableAttrs passes the
+	// joined t.oid to format_type, and a missing row renders the column type
+	// blank. DU-002 slice 89.
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForEnumArray(et)); err != nil {
+		return
+	}
 	// Mirror pg_type to the postgres database (DBOid=5) so sessions using
 	// the postgres db can find the new type row via SeqScan. This mirrors
 	// the pattern used by syncTableToCatalogHeap. M0097-0022.
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+}
+
+// syncCompositeTypeToCatalogHeap writes the catalog rows for a composite type
+// (`CREATE TYPE x AS (...)`): the two pg_type rows (the type itself, typtype='c',
+// and its auto-generated `_name` array type, typtype='b'/typcategory='A'), the
+// implicit pg_class relation (relkind='c', oid=ct.RelOID, reltype=ct.OID), and
+// one pg_attribute row per field keyed by attrelid=ct.RelOID. pg_type.typrelid
+// points at the relation so pg_dump's dumpCompositeType walks
+// typrelid → pg_class → pg_attribute to re-emit the field list. Mirrors
+// syncEnumTypeToCatalogHeap (pg_type) and syncTableToCatalogHeap (pg_class /
+// pg_attribute + index entries). DU-002 slice 242 (pg_type), slice 243 (relation).
+func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
+	if ct == nil || !catalogHeapSyncAvailable(ctx) {
+		return
+	}
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForComposite(ct)); err != nil {
+		return
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForCompositeArray(ct)); err != nil {
+		return
+	}
+
+	// Seed the implicit pg_class relation (relkind='c') and one pg_attribute row
+	// per field so pg_dump's dumpCompositeType can walk
+	// pg_type.typrelid → pg_class → pg_attribute to recover the field list and
+	// re-emit `CREATE TYPE x AS (...)`. Index entries mirror syncTableToCatalogHeap
+	// so the rows are reachable by OID / relname-nsp lookups too. DU-002 slice 243.
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForComposite(ctx.Catalog, ct))
+	if err != nil {
+		return
+	}
+	if err := insertPgClassOidIndexEntry(ctx, ct.RelOID, classTID); err != nil {
+		return
+	}
+	if err := insertPgClassRelnameNspIndexEntry(ctx, ct.Name, catalog.PublicNamespaceOID, classTID); err != nil {
+		return
+	}
+
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	for i, field := range ct.Fields {
+		attnum := i + 1 // 1-based
+		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRowForCompositeField(ctx.Catalog, ct, field, attnum))
+		if err != nil {
+			return
+		}
+		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, ct.RelOID, int16(attnum), attrTID); err != nil {
+			return
+		}
+	}
+
+	// pg_class / pg_attribute are nailed catalogs; flag the txn so the commit
+	// hook refreshes pg_internal.init on an attaching PG18 standby.
+	if ctx.TxnMgr != nil {
+		ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.RelationRelationId)
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.AttributeRelationId)
+}
+
+// syncDomainTypeToCatalogHeap writes a single pg_type row (typtype='d') for a
+// user-defined DOMAIN into the pg_type heap (OID 1247), mirroring
+// syncEnumTypeToCatalogHeap. pg_dump's getTypes reads pg_type to discover the
+// domain and dumpDomain re-renders it via typbasetype/typtypmod. DU-002 slice 90.
+func syncDomainTypeToCatalogHeap(ctx *Context, d *catalog.Domain) {
+	if !catalogHeapSyncAvailable(ctx) {
+		return
+	}
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForDomain(d)); err != nil {
+		return
+	}
+	// Also write the auto-generated array type (`_name`) so a `d[]` column's
+	// atttypid joins to a real pg_type row and pg_dump's format_type renders it
+	// as `public.d[]` rather than the base type's built-in array. DU-002 slice 251
+	// (mirrors syncEnumTypeToCatalogHeap's array-row write).
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForDomainArray(d)); err != nil {
+		return
+	}
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
 }
 
@@ -6470,7 +8287,7 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		Fork:   storage.MainFork,
 	}
 	for _, col := range tbl.Columns {
-		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRow(tbl, col))
+		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRow(ctx.Catalog, tbl, col))
 		if err != nil {
 			return fmt.Errorf("pg_attribute col %q: %w", col.Name, err)
 		}
@@ -6825,6 +8642,9 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	}
 	cycle := s.Cycle
 	RegisterSequence(name, start, increment, minV, maxV, cycle)
+	if s.Cache != nil {
+		SetSequenceCache(name, *s.Cache)
+	}
 	if s.Temporary {
 		SetSequenceTemporary(name, true)
 	}
@@ -6836,37 +8656,52 @@ func (o *ddlOp) execCreateSequence(s *parser.CreateSequenceStmt) error {
 	if s.OwnedBy != "" {
 		SetSequenceOwnedBy(name, s.OwnedBy)
 	}
-	// Create a virtual catalog table for SELECT * FROM seq_name.
-	// Columns: last_value int8, log_cnt int8, is_called bool. M0097-0024.
-	if _, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		seqCols := []catalog.Column{
-			{Name: "last_value", Type: catalog.Type{Name: "int8"}, Ordinal: 0},
-			{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
-			{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
-		}
-		seqTbl, err2 := o.ctx.Catalog.CreateTable(s.Name, seqCols)
-		if err2 == nil {
-			seqTbl.Virtual = true
-			seqTbl.IsSequence = true
-			seqName := name // capture for closure
-			seqTbl.VirtualRows = func() [][]string {
-				lv, lc, called, ok2 := SequenceRowData(seqName)
-				if !ok2 {
-					return nil
-				}
-				calledStr := "f"
-				if called {
-					calledStr = "t"
-				}
-				return [][]string{{
-					fmt.Sprintf("%d", lv),
-					fmt.Sprintf("%d", lc),
-					calledStr,
-				}}
-			}
-		}
-	}
+	// Create a virtual catalog table for SELECT * FROM seq_name. This also
+	// surfaces the sequence in pg_class (relkind='S') / pg_depend / pg_sequence
+	// so pg_dump can discover and dump it. M0097-0024.
+	o.createSeqCatalogTable(s.Name, name)
 	return nil
+}
+
+// createSeqCatalogTable registers the virtual catalog relation that backs
+// `SELECT * FROM <seq>` (last_value / log_cnt / is_called) and marks it
+// IsSequence so it surfaces in pg_class (relkind='S'), pg_depend, and
+// pg_sequence — the rows pg_dump's getTables reads to discover and dump the
+// sequence. `name` is the registry key passed to RegisterSequence (bare or
+// schema-qualified; SequenceRowData resolves both). Shared by the explicit
+// CREATE SEQUENCE path and the implicit IDENTITY-column registration so an
+// identity sequence is discoverable by pg_dump. M0110-0001 (DU-002 slice 120).
+func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string) {
+	if _, ok := o.ctx.Catalog.(*catalog.InMemory); !ok {
+		return
+	}
+	seqCols := []catalog.Column{
+		{Name: "last_value", Type: catalog.Type{Name: "int8"}, Ordinal: 0},
+		{Name: "log_cnt", Type: catalog.Type{Name: "int8"}, Ordinal: 1},
+		{Name: "is_called", Type: catalog.Type{Name: "bool"}, Ordinal: 2},
+	}
+	seqTbl, err2 := o.ctx.Catalog.CreateTable(seqObjName, seqCols)
+	if err2 != nil {
+		return
+	}
+	seqTbl.Virtual = true
+	seqTbl.IsSequence = true
+	seqName := name // capture for closure
+	seqTbl.VirtualRows = func() [][]string {
+		lv, lc, called, ok2 := SequenceRowData(seqName)
+		if !ok2 {
+			return nil
+		}
+		calledStr := "f"
+		if called {
+			calledStr = "t"
+		}
+		return [][]string{{
+			fmt.Sprintf("%d", lv),
+			fmt.Sprintf("%d", lc),
+			calledStr,
+		}}
+	}
 }
 
 // validateSeqOwnedBy checks OWNED BY table.column before the sequence is
@@ -7020,7 +8855,7 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 	}
 
 	if err := UpdateSequenceParams(name, s.Increment, minV, maxV, s.StartWith, s.RestartWith,
-		s.Restart, s.Cycle, s.NoCycle); err != nil {
+		s.Cache, s.Restart, s.Cycle, s.NoCycle); err != nil {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: err.Error()}
 	}
 	if s.DataType != "" {
@@ -7146,6 +8981,11 @@ func (o *ddlOp) execCreateMatView(s *parser.CreateMatViewStmt) error {
 	}
 	// Store the SELECT AST as the view query (for REFRESH).
 	tbl.View = s.Query
+	// Store the raw body text so pg_get_viewdef can echo it for pg_dump, which
+	// dumps a matview's `AS` clause exactly like a plain view (createViewAsClause
+	// → pg_get_viewdef) and aborts the whole dump if it returns empty. Mirrors
+	// the plain-view path (vt.ViewDef = s.RawDef). M0110-0001 (DU-002 slice 60).
+	tbl.ViewDef = s.RawDef
 	if sess, ok := o.ctx.Session.(*BasicSession); ok {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: s.Name, RelOID: tbl.OID, IsIndex: false})
 	}
@@ -8018,17 +9858,53 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 	}
 	// classOID constants match PostgreSQL system catalog OIDs.
 	const (
-		oidPgClass        = 1259 // pg_class: tables, indexes, views
+		oidPgClass        = 1259 // pg_class: tables, indexes, views, sequences, matviews
+		oidPgType         = 1247 // pg_type: user types (enum) and domains
+		oidPgProc         = 1255 // pg_proc: functions and procedures
 		oidPgConstraint   = 2606 // pg_constraint
+		oidPgNamespace    = 2615 // pg_namespace: schemas
 		oidPgStatisticExt = 3381 // pg_statistic_ext
 	)
 	switch s.ObjKind {
-	case "table":
+	case "table", "view", "sequence", "materialized view":
+		// Views, sequences, and materialized views are pg_class relations stored
+		// in the same table registry as ordinary tables, so they share the
+		// classoid (1259) and LookupTable path. pg_dump chooses the COMMENT ON
+		// keyword from relkind (relkind='m' → MATERIALIZED VIEW); the stored
+		// pg_description row is keyword-agnostic. DU-002 slices 145, 146.
 		tbl, ok := im.LookupTable(s.ObjName)
 		if !ok {
 			return nil
 		}
 		im.SetComment(oidPgClass, tbl.OID, 0, s.Description)
+	case "type":
+		// User-defined types live in pg_type (classoid 1247). goopg's only
+		// user types are enums; resolve the enum OID. Without this a COMMENT ON
+		// TYPE was silently swallowed and never reached pg_description, so
+		// pg_dump could not re-emit it. DU-002 slice 146.
+		et, ok := im.LookupEnum(s.ObjName.Name)
+		if !ok {
+			return nil
+		}
+		im.SetComment(oidPgType, et.OID, 0, s.Description)
+	case "domain":
+		// Domains live in pg_type (typtype='d', classoid 1247). pg_dump picks the
+		// DOMAIN keyword from typtype; the stored pg_description row is
+		// keyword-agnostic. DU-002 slice 146.
+		dom, ok := im.LookupDomain(s.ObjName.Name)
+		if !ok {
+			return nil
+		}
+		im.SetComment(oidPgType, dom.OID, 0, s.Description)
+	case "schema":
+		// Schemas live in pg_namespace (classoid 2615). Without this, a COMMENT
+		// ON SCHEMA was silently swallowed and never reached pg_description, so
+		// pg_dump could not re-emit it. DU-002 slice 145.
+		oid := im.SchemaOID(s.ObjName.Name)
+		if oid == 0 {
+			return nil
+		}
+		im.SetComment(oidPgNamespace, oid, 0, s.Description)
 	case "index":
 		idx, ok := im.LookupIndex(s.ObjName)
 		if !ok {
@@ -8064,12 +9940,49 @@ func (o *ddlOp) execCommentOn(s *parser.CommentOnStmt) error {
 				return nil
 			}
 		}
+		// UNIQUE / PRIMARY KEY / EXCLUDE constraints are backed by indexes whose
+		// Name equals the constraint name; the index OID is the pg_constraint OID
+		// emitted by pg_constraint's VirtualRows. Without this, a COMMENT ON these
+		// constraint kinds was silently dropped and never reached pg_description,
+		// so pg_dump could not re-emit it. DU-002 slice 144.
+		for _, idx := range im.IndexesOnTable(tbl) {
+			if (idx.IsConstraint || idx.IsExclusion) && idx.OID != 0 && strings.EqualFold(idx.Name, s.SubName) {
+				im.SetComment(oidPgConstraint, idx.OID, 0, s.Description)
+				return nil
+			}
+		}
+		// FOREIGN KEY constraints (contype='f') are stored on the child table.
+		for _, fk := range tbl.ForeignKeys {
+			if strings.EqualFold(fk.Name, s.SubName) && fk.OID != 0 {
+				im.SetComment(oidPgConstraint, fk.OID, 0, s.Description)
+				return nil
+			}
+		}
 	case "statistics":
 		stat, ok := im.LookupStatistics(s.ObjName.Name)
 		if !ok {
 			return nil
 		}
 		im.SetComment(oidPgStatisticExt, stat.OID, 0, s.Description)
+	case "function":
+		// Functions live in pg_proc (classoid 1255). Resolve the routine by
+		// name + argument signature (mirrors DROP FUNCTION's resolution) so the
+		// correct overload is keyed. Without this a COMMENT ON FUNCTION was
+		// silently swallowed and never reached pg_description, so pg_dump could
+		// not re-emit it. DU-002 slice 147.
+		rs := im.Routines()
+		if rs == nil {
+			return nil
+		}
+		argTypes := make([]catalog.Type, len(s.Args))
+		for i, a := range s.Args {
+			argTypes[i] = catalog.Type{Name: strings.ToLower(a.Type.Name)}
+		}
+		r, ok := rs.Lookup(s.ObjName, argTypes)
+		if !ok || r == nil {
+			return nil
+		}
+		im.SetComment(oidPgProc, r.OID, 0, s.Description)
 	}
 	return nil
 }
@@ -8351,9 +10264,24 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			}
 			fields := make([]catalog.CompositeField, len(s.CompositeFields))
 			for i, f := range s.CompositeFields {
-				fields[i] = catalog.CompositeField{Name: f.Name, ColType: f.ColType}
+				fields[i] = catalog.CompositeField{Name: f.Name, ColType: f.ColType, Collation: f.Collation}
 			}
-			cat.RegisterCompositeTypeWithFields(s.Name, fields)
+			ct := cat.RegisterCompositeTypeWithFields(s.Name, fields)
+			// Write pg_type heap rows (typtype='c' + its `_name` array) so the
+			// composite type is visible to pg_dump's getTypes and catalog
+			// queries. DU-002 slice 242.
+			syncCompositeTypeToCatalogHeap(o.ctx, ct)
+			// Track composite type creation so ROLLBACK can drop it (mirrors the
+			// enum branch below).  The heap rows written above carry the aborting
+			// transaction's XID, so they become MVCC-invisible after rollback;
+			// the in-memory catalog registration is the part ROLLBACK must undo.
+			// DU-002 slice 244.
+			if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+				if o.ctx.PendingCreatedComposites == nil {
+					o.ctx.PendingCreatedComposites = make(map[string]bool)
+				}
+				o.ctx.PendingCreatedComposites[strings.ToLower(s.Name)] = true
+			}
 		} else {
 			cat.RegisterCompositeType(s.Name)
 		}
@@ -8379,6 +10307,185 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
+		return nil
+	}
+	// Multi-subcommand ALTER TYPE — a comma-combined list of ADD/DROP/ALTER
+	// ATTRIBUTE actions (DU-002 slice 260). The single-subcommand forms keep
+	// their proven dedicated branches below (the parser mirrors AttrCmds[0] into
+	// the legacy scalar fields), so this only fires when more than one action was
+	// combined. execAlterTypeAttrCmds folds every action into one field slice and
+	// re-syncs the composite heap once.
+	if len(s.AttrCmds) > 1 {
+		return o.execAlterTypeAttrCmds(cat, s)
+	}
+	// ADD ATTRIBUTE col_name type — append a field to a composite type so the
+	// new attribute round-trips through pg_dump's dumpCompositeType. DU-002
+	// slice 253. The composite type's OIDs (type / `_name` array / implicit
+	// pg_class relation) are stable across re-registration, so we stamp xmax on
+	// the existing heap rows and re-sync the full row set with the appended
+	// field — there is no in-place pg_attribute update / relnatts bump path.
+	if s.AddAttrName != "" {
+		ct := cat.LookupCompositeType(s.Name)
+		if ct == nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		for _, f := range ct.Fields {
+			if strings.EqualFold(f.Name, s.AddAttrName) {
+				return &ExecError{Code: "42701", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q already exists", s.AddAttrName, s.Name)}
+			}
+		}
+		if strings.EqualFold(s.AddAttrType, "unknown") {
+			return &ExecError{Code: "42P16", Pos: s.Pos(),
+				Message: fmt.Sprintf("column %q has pseudo-type unknown", s.AddAttrName)}
+		}
+		newFields := make([]catalog.CompositeField, len(ct.Fields)+1)
+		copy(newFields, ct.Fields)
+		newFields[len(ct.Fields)] = catalog.CompositeField{Name: s.AddAttrName, ColType: s.AddAttrType, Collation: s.AddAttrCollation}
+		// Stamp xmax on the existing composite heap rows (pg_type ×2, the
+		// implicit pg_class relation + its pg_attribute field rows) before the
+		// re-sync re-writes them, mirroring execDropType's composite branch.
+		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
+		}
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
+		return nil
+	}
+	// RENAME ATTRIBUTE old TO new — rename a composite type field so the new
+	// name round-trips through pg_dump's dumpCompositeType. DU-002 slice 254.
+	// Same re-sync mechanism as ADD ATTRIBUTE: the composite's OIDs are stable
+	// across re-registration, so stamp xmax on the existing heap rows and
+	// re-sync the field set with the renamed attribute.
+	if s.RenameAttrOld != "" {
+		ct := cat.LookupCompositeType(s.Name)
+		if ct == nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		idx := -1
+		for i, f := range ct.Fields {
+			if strings.EqualFold(f.Name, s.RenameAttrOld) {
+				idx = i
+			}
+			if strings.EqualFold(f.Name, s.RenameAttrNew) {
+				return &ExecError{Code: "42701", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q already exists", s.RenameAttrNew, s.Name)}
+			}
+		}
+		if idx < 0 {
+			return &ExecError{Code: "42703", Pos: s.Pos(),
+				Message: fmt.Sprintf("column %q does not exist", s.RenameAttrOld)}
+		}
+		newFields := make([]catalog.CompositeField, len(ct.Fields))
+		copy(newFields, ct.Fields)
+		newFields[idx].Name = s.RenameAttrNew
+		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
+		}
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
+		return nil
+	}
+	// DROP ATTRIBUTE [IF EXISTS] attname — remove a composite type field so it no
+	// longer round-trips through pg_dump's dumpCompositeType. DU-002 slice 255.
+	// Same re-sync mechanism as ADD/RENAME ATTRIBUTE: the composite's OIDs are
+	// stable across re-registration, so stamp xmax on the existing heap rows and
+	// re-sync the field set without the dropped attribute.
+	if s.DropAttrName != "" {
+		ct := cat.LookupCompositeType(s.Name)
+		if ct == nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		idx := -1
+		for i, f := range ct.Fields {
+			if strings.EqualFold(f.Name, s.DropAttrName) {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			// Match PG renameatt/dropatt: "column %q of relation %q does not
+			// exist"; IF EXISTS downgrades the error to a skipping NOTICE.
+			if s.DropAttrIfExists {
+				o.ctx.AddNotice(fmt.Sprintf("column %q of relation %q does not exist, skipping", s.DropAttrName, s.Name))
+				return nil
+			}
+			return &ExecError{Code: "42703", Pos: s.Pos(),
+				Message: fmt.Sprintf("column %q of relation %q does not exist", s.DropAttrName, s.Name)}
+		}
+		newFields := make([]catalog.CompositeField, 0, len(ct.Fields)-1)
+		newFields = append(newFields, ct.Fields[:idx]...)
+		newFields = append(newFields, ct.Fields[idx+1:]...)
+		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
+		}
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
+		return nil
+	}
+	// ALTER ATTRIBUTE attname [SET DATA] TYPE newtype — re-type a composite type
+	// field in place so the new type round-trips through pg_dump's
+	// dumpCompositeType. DU-002 slice 256. Same re-sync mechanism as ADD/RENAME/
+	// DROP ATTRIBUTE: the composite's OIDs are stable across re-registration, so
+	// stamp xmax on the existing heap rows and re-sync the field set with the
+	// re-typed attribute (syncCompositeTypeToCatalogHeap re-resolves ColType to
+	// atttypid/atttypmod, so a typmod like numeric(12,3) survives intact).
+	if s.AlterAttrName != "" {
+		ct := cat.LookupCompositeType(s.Name)
+		if ct == nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		idx := -1
+		for i, f := range ct.Fields {
+			if strings.EqualFold(f.Name, s.AlterAttrName) {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return &ExecError{Code: "42703", Pos: s.Pos(),
+				Message: fmt.Sprintf("column %q of relation %q does not exist", s.AlterAttrName, s.Name)}
+		}
+		if strings.EqualFold(s.AlterAttrType, "unknown") {
+			return &ExecError{Code: "42P16", Pos: s.Pos(),
+				Message: fmt.Sprintf("column %q has pseudo-type unknown", s.AlterAttrName)}
+		}
+		newFields := make([]catalog.CompositeField, len(ct.Fields))
+		copy(newFields, ct.Fields)
+		newFields[idx].ColType = s.AlterAttrType
+		// ALTER ATTRIBUTE … TYPE replaces the attribute's type, so the prior
+		// collation no longer applies: set it from an explicit COLLATE clause if
+		// present (DU-002 slice 259), else reset to the new type's default (empty).
+		newFields[idx].Collation = s.AlterAttrCollation
+		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
+		}
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 		return nil
 	}
 	// RENAME VALUE 'old' TO 'new' — M0097-0022.
@@ -8459,6 +10566,95 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	}
 }
 
+// execAlterTypeAttrCmds applies a comma-combined list of ALTER TYPE attribute
+// subcommands (ADD/DROP/ALTER ATTRIBUTE) to a composite type in one shot. It
+// folds every subcommand into a working field slice — reusing the same
+// per-subcommand validation and SQLSTATEs as the single-subcommand branches in
+// execAlterType — then stamps xmax on the existing composite heap rows once and
+// re-syncs the final field set. The composite's OIDs (type / `_name` array /
+// implicit pg_class relation) are stable across re-registration, so a single
+// re-sync suffices and every changed attribute round-trips through pg_dump's
+// dumpCompositeType. Subcommands are processed left to right, so each one sees
+// the result of its predecessors (e.g. ADD a, then ALTER a TYPE …). DU-002
+// slice 260 (multi-subcommand ALTER TYPE).
+func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterTypeStmt) error {
+	ct := cat.LookupCompositeType(s.Name)
+	if ct == nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("type %q does not exist", s.Name)}
+	}
+	fields := make([]catalog.CompositeField, len(ct.Fields))
+	copy(fields, ct.Fields)
+	for _, cmd := range s.AttrCmds {
+		switch cmd.Kind {
+		case "add":
+			for _, f := range fields {
+				if strings.EqualFold(f.Name, cmd.Name) {
+					return &ExecError{Code: "42701", Pos: s.Pos(),
+						Message: fmt.Sprintf("column %q of relation %q already exists", cmd.Name, s.Name)}
+				}
+			}
+			if strings.EqualFold(cmd.Type, "unknown") {
+				return &ExecError{Code: "42P16", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q has pseudo-type unknown", cmd.Name)}
+			}
+			fields = append(fields, catalog.CompositeField{Name: cmd.Name, ColType: cmd.Type, Collation: cmd.Collation})
+		case "drop":
+			idx := -1
+			for i, f := range fields {
+				if strings.EqualFold(f.Name, cmd.Name) {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				// IF EXISTS downgrades the missing-attribute error to a skipping NOTICE.
+				if cmd.IfExists {
+					o.ctx.AddNotice(fmt.Sprintf("column %q of relation %q does not exist, skipping", cmd.Name, s.Name))
+					continue
+				}
+				return &ExecError{Code: "42703", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", cmd.Name, s.Name)}
+			}
+			fields = append(fields[:idx], fields[idx+1:]...)
+		case "alter":
+			idx := -1
+			for i, f := range fields {
+				if strings.EqualFold(f.Name, cmd.Name) {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				return &ExecError{Code: "42703", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", cmd.Name, s.Name)}
+			}
+			if strings.EqualFold(cmd.Type, "unknown") {
+				return &ExecError{Code: "42P16", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q has pseudo-type unknown", cmd.Name)}
+			}
+			// ALTER ATTRIBUTE … TYPE replaces the type, so the prior collation no
+			// longer applies: set it from an explicit COLLATE clause if present,
+			// else reset to the new type's default (empty). Mirrors slice 256/259.
+			fields[idx].ColType = cmd.Type
+			fields[idx].Collation = cmd.Collation
+		}
+	}
+	// One xmax-stamp + re-sync for the whole combined statement (see execAlterType's
+	// single-subcommand branches for the per-relation rationale).
+	if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+		deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
+		deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+		deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
+		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
+	}
+	ct2 := cat.RegisterCompositeTypeWithFields(s.Name, fields)
+	syncCompositeTypeToCatalogHeap(o.ctx, ct2)
+	return nil
+}
+
 func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 	cat, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -8477,6 +10673,8 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		if et, ok := cat.LookupEnum(n); ok && catalogHeapSyncAvailable(o.ctx) {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.OID, o.ctx.Tx.XID)
+				// Also stamp the auto-generated array type row (`_name`). DU-002 slice 89.
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, et.ArrayOID, o.ctx.Tx.XID)
 				// Mirror pg_type to postgres db so the xmax stamp is visible via SeqScan.
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
 			}
@@ -8484,6 +10682,22 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		enumErr := cat.DropEnum(n, s.Cascade)
 		if enumErr == nil {
 			continue // successfully dropped as enum
+		}
+		// Stamp the composite type's pg_type rows (the type + its `_name` array)
+		// before the in-memory delete, so the OID is still resolvable. DU-002
+		// slice 242 — mirrors the enum branch above.
+		if ct := cat.LookupCompositeType(n); ct != nil && catalogHeapSyncAvailable(o.ctx) {
+			if o.ctx.MaterializeWriterXID() == nil {
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+				// Stamp xmax on the implicit pg_class relation + its pg_attribute
+				// field rows so the dropped composite type leaves no orphan rows
+				// for pg_dump's getTypes/dumpCompositeType. DU-002 slice 243.
+				deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
+			}
 		}
 		compErr := cat.DropCompositeType(n)
 		if compErr == nil {
@@ -8504,12 +10718,365 @@ func (o *ddlOp) execCreateDomain(s *parser.CreateDomainStmt) error {
 	if !ok {
 		return nil
 	}
-	baseType := catalog.Type{Name: s.BaseType}
-	_, err := cat.RegisterDomain(s.Name, baseType, s.NotNull, s.CheckInValues...)
+	baseType := catalog.Type{Name: s.BaseType, Args: s.BaseTypeArgs}
+	d, err := cat.RegisterDomain(s.Name, baseType, s.NotNull, s.CheckInValues...)
 	if err != nil {
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+	// Resolve a user-defined enum base type's dynamically-allocated OID and
+	// record it on the domain. TypeNameToOID falls back to text for enum names,
+	// so without this the pg_type row would carry typbasetype=text and pg_dump
+	// would render `AS text` instead of `AS public.<enum>`. DU-002 slice 109.
+	if et, ok := enumForDomainBaseType(cat, s.BaseType); ok {
+		d.BaseOID = et.OID
+		d.BaseIsEnum = true
+	}
+	// Record the DEFAULT expression so buildUserPGTypeRowForDomain can emit
+	// typdefaultbin and pg_dump re-renders `DEFAULT <expr>`. DU-002 slice 92.
+	d.Default = s.Default
+	// Record a generic CHECK predicate (e.g. `VALUE > 0`) so pg_dump's
+	// getDomainConstraints surfaces it and dumpDomain re-emits the inline
+	// `CONSTRAINT <name> CHECK ((<expr>))` clause. DU-002 slice 96.
+	//
+	// A `CHECK (VALUE IN (...))` form is captured separately as CheckInValues
+	// (used at runtime for membership validation). PG deparses it to a
+	// ScalarArrayOpExpr — `VALUE = ANY (ARRAY['a'::text, ...])` — so we synthesize
+	// the same text here and store it as the constraint's conbin, making it
+	// round-trip through pg_dump too. DU-002 slice 97.
+	checkExpr := s.CheckExpr
+	if checkExpr == "" && len(s.CheckInValues) > 0 {
+		checkExpr = domainInValuesCheckExpr(s.BaseType, s.CheckInValues, cat)
+	}
+	cat.SetDomainCheck(d, s.CheckName, checkExpr)
+	// Write a pg_type heap row (typtype='d') so pg_dump's getTypes discovers the
+	// domain and a column of the domain type round-trips as its declared type.
+	// DU-002 slice 90.
+	syncDomainTypeToCatalogHeap(o.ctx, d)
 	return nil
+}
+
+// domainInValuesCheckExpr renders a `CHECK (VALUE IN (...))` domain constraint as
+// PG's deparsed ScalarArrayOpExpr text, so it round-trips through pg_dump via
+// pg_get_constraintdef. The exact deparse depends on the string base type's
+// equality operator (verified against real pg_dump 18.3):
+//
+//	text       VALUE = ANY (ARRAY['red'::text, 'green'::text])
+//	char(n)    VALUE = ANY (ARRAY['a'::bpchar, 'b'::bpchar])
+//	varchar    (VALUE)::text = ANY ((ARRAY['a'::character varying, ...])::text[])
+//	smallint   VALUE = ANY (ARRAY[10, 20, 30])
+//	integer    VALUE = ANY (ARRAY[1, 2, 3])
+//	numeric    VALUE = ANY (ARRAY[1.5, 2.5])
+//	bigint     VALUE = ANY (ARRAY[(100)::bigint, (200)::bigint])
+//	bytea      VALUE = ANY (ARRAY['\xdeadbeef'::bytea, '\xcafe'::bytea])
+//	inet       VALUE = ANY (ARRAY['192.168.0.1'::inet, '10.0.0.0/8'::inet])
+//	real       VALUE = ANY (ARRAY[(1.5)::real, (2.5)::real])
+//	float8     VALUE = ANY (ARRAY[(1.5)::double precision, (3.0)::double precision])
+//	boolean    VALUE = ANY (ARRAY[true, false])
+//	date       VALUE = ANY (ARRAY['2020-01-01'::date, '2021-06-15'::date])
+//	timestamp  VALUE = ANY (ARRAY['2020-01-01 00:00:00'::timestamp without time zone, ...])
+//	time       VALUE = ANY (ARRAY['12:00:00'::time without time zone, ...])
+//	uuid       VALUE = ANY (ARRAY['a0ee…'::uuid, 'b0ee…'::uuid])
+//	name       VALUE = ANY (ARRAY['alice'::name, 'bob'::name])
+//	jsonb      VALUE = ANY (ARRAY['1'::jsonb, '"hello"'::jsonb])
+//	json       (VALUE)::text = ANY (ARRAY['1'::text, '{"a": 1}'::text])
+//	xml        (VALUE)::text = ANY (ARRAY['<a/>'::text, '<b>1</b>'::text])
+//	oid        VALUE = ANY (ARRAY[(1)::oid, (2)::oid, (3)::oid])
+//	bit(n)     VALUE = ANY (ARRAY['1010'::"bit", '0101'::"bit"])
+//	varbit     VALUE = ANY (ARRAY['101'::bit varying, '110'::bit varying])
+//	pg_lsn     VALUE = ANY (ARRAY['16/B374D848'::pg_lsn, '0/0'::pg_lsn])
+//	tid        VALUE = ANY (ARRAY['(0,1)'::tid, '(1,2)'::tid])
+//	xid        VALUE = ANY (ARRAY['100'::xid, '200'::xid])
+//	cid        VALUE = ANY (ARRAY['5'::cid, '10'::cid])
+//	interval   VALUE = ANY (ARRAY['1 day'::interval, '02:00:00'::interval])
+//	money      VALUE = ANY (ARRAY['$1.00'::money, '$2.50'::money])
+//
+// text and bpchar have native equality operators, so PG emits a bare per-element
+// cast with no coercion wrapper. character varying has no varchar-eq operator and
+// reuses text's, so PG coerces both sides to text — hence the `(VALUE)::text` /
+// `(...)::text[]` envelope. The per-element cast always uses the base type's bare
+// name (no typmod, even for varchar(20)/char(4)).
+//
+// integer and numeric domains store integer/numeric literals whose own type
+// already matches the base type, so PG emits the literal verbatim — no quotes
+// and no per-element cast (verified against real pg_dump 18.3). boolean is the
+// same verbatim shape (the IN-list keyword literals already have type bool).
+// bigint/real/float8 differ: the IN-list literals parse as int4/numeric constants
+// and PG coerces each to the base type, so every element is wrapped
+// `(N)::<basetype>`. date/timestamp/time/uuid mirror the string-with-cast shape
+// (`'…'::<basetype>`). bytea/inet also use the string-with-cast shape; their
+// canonical input forms (bytea `\x` hex, inet dotted-quad/CIDR) round-trip
+// verbatim. smallint joins the verbatim integer branch — small integer literals
+// const-fold to int2 with no cast wrapper. macaddr/macaddr8 use the bare
+// string-with-cast shape (their canonical colon-form round-trips). cidr is special:
+// it has no cidr-eq operator and reuses inet's, so PG coerces both sides to inet —
+// the element cast stays `::cidr` but the envelope is `(VALUE)::inet = ANY
+// ((ARRAY[...])::inet[])` (same envelope mechanism as varchar→text). name and
+// jsonb both have native equality operators, so they use the bare string-with-cast
+// shape (`'alice'::name`, `'1'::jsonb`); name is a plain string and jsonb scalars
+// (numbers, quoted strings) round-trip verbatim through jsonb's output function.
+// json and xml have no equality operator (their CHECK must be `VALUE::text IN
+// (...)`, the cast-on-VALUE parse shape) so they use the `(VALUE)::text` lhsCast
+// form; both round-trip verbatim through `::text`. oid joins the per-element
+// coercion shape (`(N)::oid`). bit/varbit use the bare string-with-cast shape;
+// bit's cast type is quoted (`::"bit"`) by the deparser. pg_lsn/tid/xid/cid all
+// have native equality operators and canonical input forms that round-trip
+// verbatim through the bare string-with-cast shape (`'16/B374D848'::pg_lsn`,
+// `'(0,1)'::tid`, `'100'::xid`, `'5'::cid`). interval and money also have native
+// equality operators and use the bare string-with-cast shape, but only their
+// canonical-output forms round-trip byte-identically: interval's output function
+// normalizes ('2 hours'→'02:00:00') and money's output depends on lc_monetary
+// (the default C/POSIX locale yields '$1.00'), so the fixtures use already-canonical
+// values ('1 day'/'02:00:00'/'1 year 2 mons', '$1.00'/'$2.50') — the same
+// canonical-only contract as jsonb scalars. timestamptz, tsvector and tsquery
+// remain deliberately excluded — timestamptz re-renders the stored constant in the
+// session timezone, and tsvector/tsquery re-render their lexemes with single quotes
+// ('a b'→”'a” ”b”'; bareword 'cat'→”'cat”'). The internal "char" type
+// (OID 18) is also excluded: TypeNameToOID maps "char" to bpchar (OID 1042), so
+// the quoted-vs-unquoted distinction needed to emit `::"char"` is not tracked. Note jsonb byte-identity holds
+// only for already-canonical values — non-scalar jsonb (e.g. objects) is
+// re-rendered with key reordering / whitespace normalization, so the fixtures use
+// canonical scalars.
+// Other non-string base types return "".
+// DU-002 slices 97 (text), 98 (char/varchar), 99 (integer/numeric),
+// 100 (bigint/boolean/date), 101 (real/float8/timestamp/time/uuid),
+// 102 (smallint/bytea/inet), 103 (macaddr/macaddr8/cidr), 104 (name/jsonb),
+// 105 (json), 106 (xml/oid/bit/varbit), 107 (pg_lsn/tid/xid/cid),
+// 108 (interval/money), 109 (user-defined enum base type).
+func domainInValuesCheckExpr(baseType string, vals []string, cat *catalog.InMemory) string {
+	if len(vals) == 0 {
+		return ""
+	}
+	var castType string
+	// coerceTo holds the target type of PG's coercion envelope for base types
+	// that lack a direct equality operator: PG rewrites `VALUE IN (...)` as
+	// `(VALUE)::T = ANY ((ARRAY[...])::T[])`. Empty means no envelope (the base
+	// type's own eq operator is used directly).
+	var coerceTo string
+	// lhsCast handles the `VALUE::text IN (...)` source form (base types with no
+	// equality operator AND whose IN-list literals are already untyped string
+	// constants typed as the cast target). PG deparses `(VALUE)::T = ANY
+	// (ARRAY['...'::T, ...])` — the LHS is cast but the array is NOT re-cast,
+	// since each element literal already has type T. Empty means not used.
+	var lhsCast string
+	// A user-defined enum base type must be detected before the switch:
+	// TypeNameToOID falls back to OIDText for an enum name, which would
+	// mis-render the cast as `::text`. Enums have a native equality operator, so
+	// PG emits the bare string-with-cast shape with the schema-qualified enum
+	// type name, e.g. `VALUE = ANY (ARRAY['red'::public.rgb, ...])`. pg_dump sets
+	// an empty search_path so the type is qualified; all goopg enums live in the
+	// public schema (see expr.go format_type). Each label round-trips verbatim
+	// (no normalization). DU-002 slice 109.
+	if et, ok := enumForDomainBaseType(cat, baseType); ok {
+		parts := make([]string, len(vals))
+		for i, v := range vals {
+			parts[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::public." + et.Name
+		}
+		return "VALUE = ANY (ARRAY[" + strings.Join(parts, ", ") + "])"
+	}
+	switch catalog.TypeNameToOID(baseType) {
+	case catalog.OIDText:
+		castType = "text"
+	case catalog.OIDBpChar:
+		castType = "bpchar"
+	case catalog.OIDDate:
+		castType = "date"
+	case catalog.OIDTimestamp:
+		castType = "timestamp without time zone"
+	case catalog.OIDTimestampTZ:
+		// timestamp with time zone has a native equality operator, so PG emits
+		// the bare string-with-cast shape. The output function renders the value
+		// in the session TimeZone, so byte-identity holds only for inputs already
+		// in the session-TZ canonical form; the fixtures pin UTC (`+00` offset)
+		// against a UTC-session pg_dump so the literals round-trip verbatim
+		// through `::timestamp with time zone`. goopg stores the IN-list literals
+		// verbatim (no re-render), so its deparse is TZ-independent. DU-002 slice 110.
+		castType = "timestamp with time zone"
+	case catalog.OIDTime:
+		castType = "time without time zone"
+	case catalog.OIDTimeTZ:
+		// time with time zone has a native equality operator, so PG emits the
+		// bare string-with-cast shape. Unlike timestamptz, timetz's output
+		// function preserves the stored zone offset verbatim (it does NOT
+		// re-render in the session TimeZone), so the canonical
+		// 'HH:MM:SS±HH[:MM]' form round-trips byte-identically through `::time
+		// with time zone` regardless of session TZ. DU-002 slice 111.
+		castType = "time with time zone"
+	case catalog.OIDUUID:
+		castType = "uuid"
+	case catalog.OIDBytea:
+		castType = "bytea"
+	case catalog.OIDInet:
+		castType = "inet"
+	case catalog.OIDMacaddr:
+		castType = "macaddr"
+	case catalog.OIDMacaddr8:
+		castType = "macaddr8"
+	case catalog.OIDName:
+		castType = "name"
+	case catalog.OIDJsonb:
+		castType = "jsonb"
+	case catalog.OIDJSON:
+		// json has no equality operator, so the CHECK casts VALUE to text
+		// (`CHECK (VALUE::text IN (...))`). PG deparses `(VALUE)::text = ANY
+		// (ARRAY['...'::text, ...])`: the LHS is cast but the array is not
+		// re-cast, because each IN-list literal is an untyped string constant
+		// already typed as text. Unlike jsonb, json preserves the input text
+		// verbatim (no key reordering / whitespace normalization), so even
+		// object/array values round-trip byte-identically through `::text`.
+		castType = "text"
+		lhsCast = "text"
+	case catalog.OIDXML:
+		// xml has no equality operator either, so the CHECK casts VALUE to text
+		// (`CHECK (VALUE::text IN (...))`) — identical deparse shape to json:
+		// `(VALUE)::text = ANY (ARRAY['...'::text, ...])`. xml is stored and
+		// re-emitted verbatim, so the text round-trips byte-identically.
+		castType = "text"
+		lhsCast = "text"
+	case catalog.OIDBit:
+		// bit(n) has a native equality operator, so PG emits the bare
+		// string-with-cast shape. The cast type name is quoted (`::"bit"`)
+		// because `bit` is a non-standard type-name token in the deparser.
+		castType = `"bit"`
+	case catalog.OIDVarbit:
+		// bit varying has a native equality operator; the canonical bit-string
+		// form round-trips verbatim through `::bit varying`.
+		castType = "bit varying"
+	case catalog.OIDPgLsn:
+		// pg_lsn has a native equality operator; the canonical uppercase-hex
+		// form ('16/B374D848') round-trips verbatim through `::pg_lsn`.
+		castType = "pg_lsn"
+	case catalog.OIDTid:
+		// tid has a native equality operator; the canonical '(block,offset)'
+		// form round-trips verbatim through `::tid`.
+		castType = "tid"
+	case catalog.OIDXid:
+		// xid has a native equality operator; the decimal txid form round-trips
+		// verbatim through `::xid`.
+		castType = "xid"
+	case catalog.OIDCid:
+		// cid has a native equality operator; the decimal command-id form
+		// round-trips verbatim through `::cid`.
+		castType = "cid"
+	case catalog.OIDXid8:
+		// xid8 (full 64-bit transaction id) has a native equality operator; the
+		// decimal form round-trips verbatim through `::xid8`. Same simplest render
+		// mode as xid/cid (slice 107). DU-002 slice 112.
+		castType = "xid8"
+	case catalog.OIDInt2vector:
+		// int2vector (the legacy space-separated int2 list, e.g. pg_index.indkey)
+		// has a native equality operator (int2vectoreq), so PG emits the bare
+		// string-with-cast shape. The output function renders the canonical
+		// space-separated form, so an already-canonical input ('1 2') round-trips
+		// verbatim through `::int2vector`. DU-002 slice 113.
+		castType = "int2vector"
+	case catalog.OIDOidvector:
+		// oidvector (the legacy space-separated oid list, e.g. pg_proc.proargtypes)
+		// likewise has a native equality operator (oidvectoreq) and renders the
+		// canonical space-separated form, round-tripping verbatim through
+		// `::oidvector`. DU-002 slice 113.
+		castType = "oidvector"
+	case catalog.OIDTsvector:
+		// tsvector has a native equality operator (tsvector_eq), so PG emits the
+		// bare string-with-cast shape. Its output function renders lexemes in the
+		// canonical form (single-quoted, sorted, deduplicated, positions stripped
+		// when absent), so byte-identity holds only for already-canonical inputs
+		// (e.g. the lexeme set `'a' 'b'`), which round-trip verbatim through
+		// `::tsvector` — the same canonical-only contract as jsonb scalars /
+		// interval. DU-002 slice 114.
+		castType = "tsvector"
+	case catalog.OIDTsquery:
+		// tsquery has a native equality operator (tsquery_eq); the bare
+		// string-with-cast shape applies. Its output normalizes operator spacing
+		// and single-quotes lexemes, so the fixtures pin already-canonical forms
+		// (`'a' & 'b'`) that round-trip verbatim through `::tsquery`. DU-002 slice 114.
+		castType = "tsquery"
+	case catalog.OIDInterval:
+		// interval has a native equality operator. Its output function
+		// normalizes the stored value (e.g. '2 hours'→'02:00:00'), so byte
+		// identity holds only for already-canonical inputs ('1 day',
+		// '02:00:00', '1 year 2 mons'), which round-trip verbatim through
+		// `::interval` — the same canonical-only contract as jsonb scalars.
+		castType = "interval"
+	case catalog.OIDMoney:
+		// money has a native equality operator. Its output depends on
+		// lc_monetary; under the default C/POSIX locale the canonical form is
+		// '$1.00', which round-trips verbatim through `::money`. Non-canonical
+		// inputs or a non-C lc_monetary would re-render, so the fixtures use
+		// the canonical C-locale form.
+		castType = "money"
+	case catalog.OIDCidr:
+		// cidr has no cidr-eq operator, so PG coerces both sides to inet
+		// (the element cast stays ::cidr, the envelope is ::inet / ::inet[]).
+		castType = "cidr"
+		coerceTo = "inet"
+	case catalog.OIDVarChar:
+		castType = "character varying"
+		coerceTo = "text"
+	case catalog.OIDInt2, catalog.OIDInt4, catalog.OIDNumeric, catalog.OIDBool:
+		// smallint/integer/numeric literals and boolean keyword literals already
+		// carry (or const-fold to) the base type, so PG renders them verbatim (no
+		// quotes, no cast).
+		arr := "ARRAY[" + strings.Join(vals, ", ") + "]"
+		return "VALUE = ANY (" + arr + ")"
+	case catalog.OIDInt8:
+		// bigint: the IN-list int4 literals are coerced per element to bigint.
+		return domainInValuesCoerced(vals, "bigint")
+	case catalog.OIDOID:
+		// oid: the IN-list int4 literals are coerced per element to oid
+		// (`(1)::oid`), the same per-element coercion shape bigint/real use.
+		return domainInValuesCoerced(vals, "oid")
+	case catalog.OIDFloat4:
+		// real: the IN-list numeric literals are coerced per element to real.
+		return domainInValuesCoerced(vals, "real")
+	case catalog.OIDFloat8:
+		// double precision: numeric literals coerced per element.
+		return domainInValuesCoerced(vals, "double precision")
+	default:
+		return ""
+	}
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		// PG quotes string literals with single quotes and doubles any embedded
+		// quote; mirror that so the deparse is byte-identical.
+		parts[i] = "'" + strings.ReplaceAll(v, "'", "''") + "'::" + castType
+	}
+	arr := "ARRAY[" + strings.Join(parts, ", ") + "]"
+	if lhsCast != "" {
+		return "(VALUE)::" + lhsCast + " = ANY (" + arr + ")"
+	}
+	if coerceTo != "" {
+		return "(VALUE)::" + coerceTo + " = ANY ((" + arr + ")::" + coerceTo + "[])"
+	}
+	return "VALUE = ANY (" + arr + ")"
+}
+
+// enumForDomainBaseType resolves a domain's base-type name to a user-defined
+// enum, if one exists. The parser stores the base type as either a bare name
+// (`rgb`) or schema-qualified (`public.rgb`); enums are keyed by bare name in
+// the catalog, so we strip any leading schema component before the lookup.
+// Returns nil,false for built-in base types or when no enum matches.
+func enumForDomainBaseType(cat *catalog.InMemory, baseType string) (*catalog.EnumType, bool) {
+	if cat == nil {
+		return nil, false
+	}
+	name := baseType
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		name = name[i+1:]
+	}
+	return cat.LookupEnum(name)
+}
+
+// domainInValuesCoerced renders the per-element coercion shape used by base types
+// whose IN-list literals parse as a different (narrower) numeric type than the
+// base, so PG wraps each literal `(N)::<castType>`: bigint (int4 → bigint), real
+// and double precision (numeric → float). DU-002 slices 100, 101.
+func domainInValuesCoerced(vals []string, castType string) string {
+	parts := make([]string, len(vals))
+	for i, v := range vals {
+		parts[i] = "(" + v + ")::" + castType
+	}
+	arr := "ARRAY[" + strings.Join(parts, ", ") + "]"
+	return "VALUE = ANY (" + arr + ")"
 }
 
 func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
@@ -8520,6 +11087,18 @@ func (o *ddlOp) execDropDomain(s *parser.DropDomainStmt) error {
 	for _, name := range s.Names {
 		if s.IfExists && o.dropSchemaQualifiedNotice(name) {
 			continue
+		}
+		// Stamp the pg_type heap row's xmax before the in-memory delete (need the
+		// OID while the domain still exists), mirroring execDropType. DU-002 slice 90.
+		if d, ok := cat.LookupDomain(name.Name); ok && catalogHeapSyncAvailable(o.ctx) {
+			if o.ctx.MaterializeWriterXID() == nil {
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.OID, o.ctx.Tx.XID)
+				// Also stamp the auto-generated array type row. DU-002 slice 251.
+				if d.ArrayOID != 0 {
+					deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, d.ArrayOID, o.ctx.Tx.XID)
+				}
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			}
 		}
 		// names = dropped tables (CASCADE) or blocking tables (RESTRICT).
 		names, err := cat.DropDomain(name.Name, false, s.Cascade)

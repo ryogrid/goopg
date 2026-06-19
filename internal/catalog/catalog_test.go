@@ -837,12 +837,12 @@ func pgPathElem(arr string, n int) string {
 }
 
 // TestPgLanguageBuiltinRows verifies the pg_language virtual view exposes the 3
-// built-in BKI languages (internal/c/sql, OIDs 12/13/14). pg_dump's dumpFunc
-// joins pg_proc to pg_language WITHOUT a lanispl filter purely to fetch lanname
-// for the function's prolang; an empty view returns "0 rows instead of one" and
-// aborts the dump. All three rows MUST have lanispl=f so getProcLangs's
-// `WHERE lanispl` predicate still selects nothing (no user PLs to dump).
-// M0110-0001 (DU-002 slice 42).
+// built-in BKI languages (internal/c/sql, OIDs 12/13/14) plus plpgsql (OID 13627).
+// pg_dump's dumpFunc joins pg_proc to pg_language WITHOUT a lanispl filter purely
+// to fetch lanname for the function's prolang; an empty view returns "0 rows
+// instead of one" and aborts the dump. All four rows MUST have lanispl=f so
+// getProcLangs's `WHERE lanispl` predicate still selects nothing (no user PLs to
+// dump). M0110-0001 (DU-002 slices 42, 163).
 func TestPgLanguageBuiltinRows(t *testing.T) {
 	c := NewInMemory()
 	tbl, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_language"})
@@ -854,8 +854,8 @@ func TestPgLanguageBuiltinRows(t *testing.T) {
 		colIdx[col.Name] = i
 	}
 	rows := tbl.VirtualRows()
-	if len(rows) != 3 {
-		t.Fatalf("pg_language returned %d rows; want exactly 3 (internal/c/sql)", len(rows))
+	if len(rows) != 4 {
+		t.Fatalf("pg_language returned %d rows; want exactly 4 (internal/c/sql/plpgsql)", len(rows))
 	}
 	// oid -> expected (lanname, lanpltrusted, laninline)
 	want := map[string]struct {
@@ -863,9 +863,10 @@ func TestPgLanguageBuiltinRows(t *testing.T) {
 		pltrusted string
 		inline    string
 	}{
-		"12": {"internal", "f", "0"},
-		"13": {"c", "f", "0"},
-		"14": {"sql", "t", "2511"},
+		"12":    {"internal", "f", "0"},
+		"13":    {"c", "f", "0"},
+		"14":    {"sql", "t", "2511"},
+		"13627": {"plpgsql", "t", "0"},
 	}
 	for _, row := range rows {
 		oid := row[colIdx["oid"]]
@@ -894,5 +895,470 @@ func TestPgLanguageBuiltinRows(t *testing.T) {
 	}
 	if len(want) != 0 {
 		t.Errorf("pg_language missing expected rows: %v", want)
+	}
+}
+
+// TestFormatPartitionBoundListLiterals pins the LIST-partition relpartbound
+// rendering. InValues holds the raw, unquoted routing form; InValueLiterals
+// holds the SQL-literal form. FormatPartitionBound must emit the literal form
+// so a text LIST bound round-trips through pg_dump as
+// `FOR VALUES IN ('a', 'b')` rather than the invalid `FOR VALUES IN (a, b)`.
+// Slice 168 (DU-002).
+func TestFormatPartitionBoundListLiterals(t *testing.T) {
+	cases := []struct {
+		name string
+		pb   PartitionBound
+		want string
+	}{
+		{
+			name: "text values are quoted",
+			pb: PartitionBound{
+				InValues:        []string{"a", "b"},
+				InValueLiterals: []string{"'a'", "'b'"},
+			},
+			want: "FOR VALUES IN ('a', 'b')",
+		},
+		{
+			name: "integer values are bare",
+			pb: PartitionBound{
+				InValues:        []string{"1", "2"},
+				InValueLiterals: []string{"1", "2"},
+			},
+			want: "FOR VALUES IN (1, 2)",
+		},
+		{
+			name: "missing literals falls back to raw values",
+			pb: PartitionBound{
+				InValues: []string{"1", "2"},
+			},
+			want: "FOR VALUES IN (1, 2)",
+		},
+		{
+			name: "embedded quote is escaped",
+			pb: PartitionBound{
+				InValues:        []string{"a'b"},
+				InValueLiterals: []string{"'a''b'"},
+			},
+			want: "FOR VALUES IN ('a''b')",
+		},
+		{
+			name: "hash bound unaffected",
+			pb:   PartitionBound{IsHash: true, Modulus: 4, Remainder: 0},
+			want: "FOR VALUES WITH (modulus 4, remainder 0)",
+		},
+		{
+			// RANGE on text: raw bounds are unquoted (routing form); the literal
+			// tuples quote them so the bound restores. DU-002 slice 169.
+			name: "range text bounds are quoted",
+			pb: PartitionBound{
+				FromValues:        []string{"a"},
+				ToValues:          []string{"m"},
+				FromValueLiterals: []string{"'a'"},
+				ToValueLiterals:   []string{"'m'"},
+			},
+			want: "FOR VALUES FROM ('a') TO ('m')",
+		},
+		{
+			name: "range integer bounds are bare",
+			pb: PartitionBound{
+				FromValues:        []string{"1"},
+				ToValues:          []string{"100"},
+				FromValueLiterals: []string{"1"},
+				ToValueLiterals:   []string{"100"},
+			},
+			want: "FOR VALUES FROM (1) TO (100)",
+		},
+		{
+			name: "range minvalue/maxvalue keywords",
+			pb: PartitionBound{
+				FromValues:        []string{"minvalue"},
+				ToValues:          []string{"maxvalue"},
+				FromValueLiterals: []string{"MINVALUE"},
+				ToValueLiterals:   []string{"MAXVALUE"},
+			},
+			want: "FOR VALUES FROM (MINVALUE) TO (MAXVALUE)",
+		},
+		{
+			name: "range multi-column text tuple",
+			pb: PartitionBound{
+				FromValues:        []string{"a", "1"},
+				ToValues:          []string{"m", "10"},
+				FromValueLiterals: []string{"'a'", "1"},
+				ToValueLiterals:   []string{"'m'", "10"},
+			},
+			want: "FOR VALUES FROM ('a', 1) TO ('m', 10)",
+		},
+		{
+			name: "range missing literals falls back to raw values",
+			pb: PartitionBound{
+				FromValues: []string{"1"},
+				ToValues:   []string{"100"},
+			},
+			want: "FOR VALUES FROM (1) TO (100)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := FormatPartitionBound(tc.pb); got != tc.want {
+				t.Errorf("FormatPartitionBound = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCompareKeyToRangeBoundDisambiguation pins DU-002 slice 261: the routing
+// comparison must treat the partition KEY as a concrete value always, and use
+// the explicit per-element unbounded flags (not a string sentinel) to recognize
+// an unbounded bound edge. The pre-slice-261 helper inspected the key string for
+// "MINVALUE"/"MAXVALUE" and treated it as ±∞, so a real text key value
+// "MINVALUE" was mis-routed.
+func TestCompareKeyToRangeBoundDisambiguation(t *testing.T) {
+	t.Run("unbounded edge via flag ignores bound string", func(t *testing.T) {
+		// -∞: any key (even "MINVALUE") is greater.
+		if got := compareKeyToRangeBound("MINVALUE", "", true, false); got != 1 {
+			t.Errorf("key > -∞: got %d; want 1", got)
+		}
+		// +∞: any key (even "MAXVALUE") is less.
+		if got := compareKeyToRangeBound("MAXVALUE", "", true, true); got != -1 {
+			t.Errorf("key < +∞: got %d; want -1", got)
+		}
+	})
+
+	t.Run("real text key 'MINVALUE' is concrete, not -∞", func(t *testing.T) {
+		// Bound is a concrete text value "m"; key "MINVALUE" must compare as the
+		// string it is ("MINVALUE" < "m" lexicographically), NOT as -∞.
+		if got := compareKeyToRangeBound("MINVALUE", "m", false, false); got >= 0 {
+			t.Errorf("text key \"MINVALUE\" vs \"m\": got %d; want <0 (concrete string compare)", got)
+		}
+		// And against "AAA": "MINVALUE" > "AAA".
+		if got := compareKeyToRangeBound("MAXVALUE", "AAA", false, false); got <= 0 {
+			t.Errorf("text key \"MAXVALUE\" vs \"AAA\": got %d; want >0 (concrete string compare)", got)
+		}
+	})
+
+	t.Run("tuple routing: unbounded FROM edge admits any key", func(t *testing.T) {
+		// FROM (MINVALUE) TO (10): keyStrs={"5"} must satisfy >= FROM and < TO.
+		from := []string{"minvalue"}
+		fromUnb, fromMax := []bool{true}, []bool{false}
+		to := []string{"10"}
+		if !rangeStrTupleGE([]string{"5"}, from, fromUnb, fromMax) {
+			t.Errorf("5 >= (MINVALUE) should be true")
+		}
+		if !rangeStrTupleLT([]string{"5"}, to, nil, nil) {
+			t.Errorf("5 < (10) should be true")
+		}
+	})
+
+	t.Run("legacy fallback: nil flags fall back to bound string sentinel", func(t *testing.T) {
+		// Pre-slice-261 bounds have no flags; a bound element "MINVALUE" must
+		// still be recognized as -∞ via boundElemUnbounded's string fallback.
+		bound := []string{"MINVALUE"}
+		if !boundElemUnbounded(bound, nil, 0) {
+			t.Errorf("legacy bound \"MINVALUE\" with nil flags should be unbounded")
+		}
+		if got := compareKeyToRangeBound("anything", bound[0],
+			boundElemUnbounded(bound, nil, 0), boundElemUnboundMax(bound, nil, 0)); got != 1 {
+			t.Errorf("legacy -∞ fallback: got %d; want 1", got)
+		}
+	})
+}
+
+// TestPgInheritsEmitsLegacyInheritanceRows pins DU-002 slice 170: a table
+// created via CREATE TABLE child (...) INHERITS (parent) must surface a
+// pg_inherits row per (child, parent) pair in declaration order, so pg_dump
+// re-emits the INHERITS (...) clause. Previously pg_inherits only emitted rows
+// for partition children (PartitionParentOID set), silently dropping legacy
+// inheritance edges.
+func TestPgInheritsEmitsLegacyInheritanceRows(t *testing.T) {
+	c := NewInMemory()
+	p1, err := c.CreateTable(parser.ObjectName{Name: "p1"}, []Column{{Name: "a", Type: Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := c.CreateTable(parser.ObjectName{Name: "p2"}, []Column{{Name: "b", Type: Type{Name: "int4"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := c.CreateTable(parser.ObjectName{Name: "ch"}, []Column{
+		{Name: "a", Type: Type{Name: "int4"}, Inherited: true},
+		{Name: "b", Type: Type{Name: "int4"}, Inherited: true},
+		{Name: "extra", Type: Type{Name: "int4"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Declaration order: INHERITS (p1, p2) → inhseqno 1, 2.
+	child.InheritsParentOIDs = []uint32{p1.OID, p2.OID}
+
+	pgInh, ok := c.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_inherits"})
+	if !ok {
+		t.Fatal("pg_catalog.pg_inherits missing")
+	}
+	rows := pgInh.VirtualRows()
+	got := map[string][]string{} // parentOID -> {childOID, seqno}
+	for _, r := range rows {
+		if r[0] == strconv.FormatUint(uint64(child.OID), 10) {
+			got[r[1]] = []string{r[2], r[3]}
+		}
+	}
+	want := map[string][]string{
+		strconv.FormatUint(uint64(p1.OID), 10): {"1", "f"},
+		strconv.FormatUint(uint64(p2.OID), 10): {"2", "f"},
+	}
+	for poid, exp := range want {
+		g, ok := got[poid]
+		if !ok {
+			t.Errorf("pg_inherits missing row child=%d parent=%s", child.OID, poid)
+			continue
+		}
+		if g[0] != exp[0] {
+			t.Errorf("pg_inherits child=%d parent=%s inhseqno=%s want %s", child.OID, poid, g[0], exp[0])
+		}
+		if g[1] != exp[1] {
+			t.Errorf("pg_inherits child=%d parent=%s inhdetachpending=%s want %s", child.OID, poid, g[1], exp[1])
+		}
+	}
+}
+
+// TestFormatExprForAttrdefFuncCall guards the pg_attrdef.adbin renderer for
+// function-call column defaults (DU-002 slice 173). Before the fix a *FuncCall
+// fell through to fmt.Sprintf("%v", e) — a Go pointer string — so a
+// `DEFAULT now()` column dumped a corrupt DEFAULT clause. The renderer must emit
+// the call form (recursively rendering literal arguments) so pg_dump round-trips
+// it. Literal cases are included as regression guards on the existing branches.
+func TestFormatExprForAttrdefFuncCall(t *testing.T) {
+	cases := []struct {
+		name string
+		expr parser.Expr
+		want string
+	}{
+		{"now()", &parser.FuncCall{Name: parser.ObjectName{Name: "now"}}, "now()"},
+		{
+			"schema-qualified",
+			&parser.FuncCall{Name: parser.ObjectName{Schema: "pg_catalog", Name: "now"}},
+			"pg_catalog.now()",
+		},
+		{
+			"literal args",
+			&parser.FuncCall{
+				Name: parser.ObjectName{Name: "lpad"},
+				Args: []parser.Expr{
+					&parser.StringConst{Value: "x"},
+					&parser.IntegerConst{Value: 5},
+				},
+			},
+			"lpad('x', 5)",
+		},
+		{"int literal", &parser.IntegerConst{Value: 42}, "42"},
+		{"string literal", &parser.StringConst{Value: "pending"}, "'pending'"},
+		{"bool literal", &parser.BooleanConst{Value: true}, "true"},
+		// Parenless SQL niladic value functions deparse as the bare uppercase
+		// keyword (matching PG's get_sql_value_function), NOT `name()` — PG would
+		// re-emit `current_timestamp()` as invalid SQL on restore. The "literal
+		// args" / "now()" cases above guard that ordinary calls keep their parens.
+		// DU-002 slice 174.
+		{"CURRENT_TIMESTAMP", &parser.FuncCall{Name: parser.ObjectName{Name: "current_timestamp"}}, "CURRENT_TIMESTAMP"},
+		{"CURRENT_DATE", &parser.FuncCall{Name: parser.ObjectName{Name: "current_date"}}, "CURRENT_DATE"},
+		{"CURRENT_USER", &parser.FuncCall{Name: parser.ObjectName{Name: "current_user"}}, "CURRENT_USER"},
+		{"CURRENT_SCHEMA", &parser.FuncCall{Name: parser.ObjectName{Name: "current_schema"}}, "CURRENT_SCHEMA"},
+		{"SESSION_USER", &parser.FuncCall{Name: parser.ObjectName{Name: "session_user"}}, "SESSION_USER"},
+		{"LOCALTIMESTAMP", &parser.FuncCall{Name: parser.ObjectName{Name: "localtimestamp"}}, "LOCALTIMESTAMP"},
+	}
+	for _, tc := range cases {
+		if got := formatExprForAttrdef(tc.expr); got != tc.want {
+			t.Errorf("%s: formatExprForAttrdef = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestFormatExprForAttrdefExpr guards the pg_attrdef.adbin renderer for the
+// non-literal, non-call default expression nodes (DU-002 slice 176). A CastExpr
+// (`DEFAULT '{}'::jsonb`), UnaryOp (`DEFAULT -1`), BinaryOp (`DEFAULT 1 + 1`)
+// and TypedStringLit (`DEFAULT DATE '2020-01-01'`) are all accepted by
+// validateDefaultExpr, so they reach pg_attrdef.adbin — but before this slice
+// the catalog renderer handled none of them and fell through to
+// fmt.Sprintf("%v", e), corrupting the DEFAULT clause pg_dump re-emits. These
+// mirror the executor twin executor.defaultExprToSQL; the two MUST stay in sync.
+func TestFormatExprForAttrdefExpr(t *testing.T) {
+	cases := []struct {
+		name string
+		expr parser.Expr
+		want string
+	}{
+		{
+			"cast string",
+			&parser.CastExpr{Operand: &parser.StringConst{Value: "{}"}, Type: parser.ObjectName{Name: "jsonb"}},
+			"'{}'::jsonb",
+		},
+		{
+			"cast int",
+			&parser.CastExpr{Operand: &parser.IntegerConst{Value: 0}, Type: parser.ObjectName{Name: "numeric"}},
+			"0::numeric",
+		},
+		{
+			"unary minus",
+			&parser.UnaryOp{Op: parser.OpSub, Operand: &parser.IntegerConst{Value: 1}},
+			"-1",
+		},
+		{
+			"unary not",
+			&parser.UnaryOp{Op: parser.OpNot, Operand: &parser.BooleanConst{Value: true}},
+			"NOT true",
+		},
+		{
+			"binary add",
+			&parser.BinaryOp{Op: parser.OpAdd, Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 1}},
+			"1 + 1",
+		},
+		{
+			"binary concat",
+			&parser.BinaryOp{Op: parser.OpConcat, Left: &parser.StringConst{Value: "a"}, Right: &parser.StringConst{Value: "b"}},
+			"'a' || 'b'",
+		},
+		{
+			"typed string lit",
+			&parser.TypedStringLit{Type: "DATE", Value: "2020-01-01"},
+			"DATE '2020-01-01'",
+		},
+		{
+			// Nested: cast of a function call (`DEFAULT now()::date`) — exercises the
+			// recursive operand render through the FuncCall arm.
+			"cast of funccall",
+			&parser.CastExpr{Operand: &parser.FuncCall{Name: parser.ObjectName{Name: "now"}}, Type: parser.ObjectName{Name: "date"}},
+			"now()::date",
+		},
+		{
+			// `DEFAULT ARRAY[1, 2, 3]` on an array column (DU-002 slice 177).
+			"array constructor",
+			&parser.ArrayConstructorExpr{Elements: []parser.Expr{
+				&parser.IntegerConst{Value: 1}, &parser.IntegerConst{Value: 2}, &parser.IntegerConst{Value: 3},
+			}},
+			"ARRAY[1, 2, 3]",
+		},
+		{
+			// Empty array constructor renders `ARRAY[]` (no trailing separator).
+			"array constructor empty",
+			&parser.ArrayConstructorExpr{},
+			"ARRAY[]",
+		},
+		{
+			// `DEFAULT CASE WHEN true THEN 1 ELSE 0 END` searched form (DU-002 slice 178).
+			"case searched",
+			&parser.CaseExpr{
+				Whens: []parser.CaseWhen{{When: &parser.BooleanConst{Value: true}, Then: &parser.IntegerConst{Value: 1}}},
+				Else:  &parser.IntegerConst{Value: 0},
+			},
+			"CASE WHEN true THEN 1 ELSE 0 END",
+		},
+		{
+			// `DEFAULT CASE 1 WHEN 1 THEN 'x' ELSE 'y' END` simple form: the operand
+			// renders right after CASE, before the first WHEN.
+			"case simple",
+			&parser.CaseExpr{
+				Operand: &parser.IntegerConst{Value: 1},
+				Whens:   []parser.CaseWhen{{When: &parser.IntegerConst{Value: 1}, Then: &parser.StringConst{Value: "x"}}},
+				Else:    &parser.StringConst{Value: "y"},
+			},
+			"CASE 1 WHEN 1 THEN 'x' ELSE 'y' END",
+		},
+		{
+			// ELSE-less searched CASE renders no ELSE clause and multiple WHEN arms.
+			"case no else multi when",
+			&parser.CaseExpr{
+				Whens: []parser.CaseWhen{
+					{When: &parser.BooleanConst{Value: true}, Then: &parser.IntegerConst{Value: 1}},
+					{When: &parser.BooleanConst{Value: false}, Then: &parser.IntegerConst{Value: 2}},
+				},
+			},
+			"CASE WHEN true THEN 1 WHEN false THEN 2 END",
+		},
+		{
+			// `DEFAULT (1, 2)` — the parenthesised row-constructor shorthand parses to a
+			// *RowExpr. PG's ruleutils always prints the ROW keyword (DU-002 slice 179).
+			"row constructor",
+			&parser.RowExpr{Elems: []parser.Expr{
+				&parser.IntegerConst{Value: 1}, &parser.IntegerConst{Value: 2},
+			}},
+			"ROW(1, 2)",
+		},
+		{
+			// Nested element render: `DEFAULT (1, 'a' || 'b')` exercises recursion through
+			// the BinaryOp arm from inside a RowExpr.
+			"row constructor nested",
+			&parser.RowExpr{Elems: []parser.Expr{
+				&parser.IntegerConst{Value: 1},
+				&parser.BinaryOp{Op: parser.OpConcat, Left: &parser.StringConst{Value: "a"}, Right: &parser.StringConst{Value: "b"}},
+			}},
+			"ROW(1, 'a' || 'b')",
+		},
+		{
+			// `DEFAULT INTERVAL '1' day` on an interval column parses to a
+			// *IntervalLit. goopg re-emits its native INTERVAL literal form
+			// (PG would print `'1 day'::interval`); both round-trip (DU-002 slice 180).
+			"interval lit",
+			&parser.IntervalLit{Value: "1", Unit: "day"},
+			"INTERVAL '1' day",
+		},
+		{
+			// Multi-count interval (`INTERVAL '90' day`) — the value body renders verbatim.
+			"interval lit multi",
+			&parser.IntervalLit{Value: "90", Unit: "day"},
+			"INTERVAL '90' day",
+		},
+		{
+			// `DEFAULT (1 IS NULL)` on a boolean column parses to a *IsNullExpr
+			// (DU-002 slice 181). PG's pg_get_expr deparses a NullTest as
+			// `<operand> IS NULL`.
+			"is null",
+			&parser.IsNullExpr{Operand: &parser.IntegerConst{Value: 1}},
+			"1 IS NULL",
+		},
+		{
+			// `DEFAULT (1 IS NOT NULL)` — Negated form.
+			"is not null",
+			&parser.IsNullExpr{Operand: &parser.IntegerConst{Value: 1}, Negated: true},
+			"1 IS NOT NULL",
+		},
+		{
+			// `DEFAULT (true IS TRUE)` parses to a *IsBoolExpr (BooleanTest).
+			"is true",
+			&parser.IsBoolExpr{Operand: &parser.BooleanConst{Value: true}, TestTrue: true},
+			"true IS TRUE",
+		},
+		{
+			// `DEFAULT (true IS NOT TRUE)` — Negated form.
+			"is not true",
+			&parser.IsBoolExpr{Operand: &parser.BooleanConst{Value: true}, TestTrue: true, Negated: true},
+			"true IS NOT TRUE",
+		},
+		{
+			// IS FALSE / IS UNKNOWN render the right target keyword.
+			"is false",
+			&parser.IsBoolExpr{Operand: &parser.BooleanConst{Value: false}, TestFalse: true},
+			"false IS FALSE",
+		},
+		{
+			// Neither TestTrue nor TestFalse → UNKNOWN.
+			"is unknown",
+			&parser.IsBoolExpr{Operand: &parser.NullConst{}},
+			"NULL IS UNKNOWN",
+		},
+		{
+			// `DEFAULT (1 IS DISTINCT FROM 2)` parses to a *IsDistinctFromExpr.
+			"is distinct from",
+			&parser.IsDistinctFromExpr{Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 2}},
+			"1 IS DISTINCT FROM 2",
+		},
+		{
+			// `DEFAULT (1 IS NOT DISTINCT FROM 2)` — Negated form.
+			"is not distinct from",
+			&parser.IsDistinctFromExpr{Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 2}, Negated: true},
+			"1 IS NOT DISTINCT FROM 2",
+		},
+	}
+	for _, tc := range cases {
+		if got := formatExprForAttrdef(tc.expr); got != tc.want {
+			t.Errorf("%s: formatExprForAttrdef = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }

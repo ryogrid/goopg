@@ -52,7 +52,8 @@ func validateDefaultExpr(e parser.Expr, pos int, ctx *Context) error {
 				}
 			}
 		}
-	case *parser.SubqueryExpr:
+	case *parser.SubqueryExpr, *parser.ExistsExpr, *parser.ArraySubqueryExpr:
+		// All three carry a nested SELECT in expression position.
 		return &ExecError{Code: "42P17", Pos: pos,
 			Message: "cannot use subquery in DEFAULT expression"}
 	case *parser.BinaryOp:
@@ -64,6 +65,67 @@ func validateDefaultExpr(e parser.Expr, pos int, ctx *Context) error {
 		return validateDefaultExpr(v.Operand, pos, ctx)
 	case *parser.CastExpr:
 		return validateDefaultExpr(v.Operand, pos, ctx)
+	case *parser.CollateExpr:
+		return validateDefaultExpr(v.Operand, pos, ctx)
+	case *parser.ArrayConstructorExpr:
+		// ARRAY[e1, e2, …]
+		for _, el := range v.Elements {
+			if err := validateDefaultExpr(el, pos, ctx); err != nil {
+				return err
+			}
+		}
+	case *parser.RowExpr:
+		// (e1, e2, …) row/tuple constructor
+		for _, el := range v.Elems {
+			if err := validateDefaultExpr(el, pos, ctx); err != nil {
+				return err
+			}
+		}
+	case *parser.CaseExpr:
+		// CASE [operand] WHEN cond THEN result … [ELSE result] END
+		if err := validateDefaultExpr(v.Operand, pos, ctx); err != nil {
+			return err
+		}
+		for _, w := range v.Whens {
+			if err := validateDefaultExpr(w.When, pos, ctx); err != nil {
+				return err
+			}
+			if err := validateDefaultExpr(w.Then, pos, ctx); err != nil {
+				return err
+			}
+		}
+		return validateDefaultExpr(v.Else, pos, ctx)
+	case *parser.InExpr:
+		// `x IN (subquery)` is a subquery; `x IN (val_list)` recurses into
+		// the operand and each list element.
+		if v.Subquery != nil {
+			return &ExecError{Code: "42P17", Pos: pos,
+				Message: "cannot use subquery in DEFAULT expression"}
+		}
+		if err := validateDefaultExpr(v.Operand, pos, ctx); err != nil {
+			return err
+		}
+		for _, el := range v.List {
+			if err := validateDefaultExpr(el, pos, ctx); err != nil {
+				return err
+			}
+		}
+	case *parser.IsNullExpr:
+		return validateDefaultExpr(v.Operand, pos, ctx)
+	case *parser.IsBoolExpr:
+		return validateDefaultExpr(v.Operand, pos, ctx)
+	case *parser.IsDistinctFromExpr:
+		if err := validateDefaultExpr(v.Left, pos, ctx); err != nil {
+			return err
+		}
+		return validateDefaultExpr(v.Right, pos, ctx)
+	case *parser.ArraySubscriptExpr:
+		if err := validateDefaultExpr(v.Base, pos, ctx); err != nil {
+			return err
+		}
+		return validateDefaultExpr(v.Index, pos, ctx)
+	case *parser.ExtractExpr:
+		return validateDefaultExpr(v.Source, pos, ctx)
 	}
 	return nil
 }
@@ -1126,11 +1188,70 @@ func boundExprToSQLLiteral(e parser.Expr) string {
 		}
 	case *parser.StringConst:
 		return "'" + strings.ReplaceAll(v.Value, "'", "''") + "'"
+	case *parser.PartitionRangeBoundKeyword:
+		// Unbounded edge: cannot be expressed as a comparable SQL literal.
+		return ""
 	case *parser.ColumnRef:
-		// MINVALUE / MAXVALUE stored as ColumnRef; can't express as literal.
+		// Legacy MINVALUE / MAXVALUE once stored as ColumnRef; can't express.
 		return ""
 	}
 	return ""
+}
+
+// rangeBoundExprToSQLLiteral renders a RANGE partition bound element as a SQL
+// literal for relpartbound/pg_dump output. The parser encodes the MINVALUE /
+// MAXVALUE keywords as a sentinel StringConst whose Value is exactly "MINVALUE"
+// or "MAXVALUE" (parse_partition_for_values in ddl.go); those must render as the
+// bare keyword, NOT a quoted string, or the relpartbound restores as a text bound
+// instead of an unbounded edge. Other constants delegate to boundExprToSQLLiteral
+// so text bounds are quoted ('a') and integers stay bare. Returns "" if the
+// element can't be rendered (the caller then falls back to the raw routing form).
+// DU-002 slice 169.
+func rangeBoundExprToSQLLiteral(e parser.Expr) string {
+	if kw, ok := e.(*parser.PartitionRangeBoundKeyword); ok {
+		return kw.Keyword()
+	}
+	return boundExprToSQLLiteral(e)
+}
+
+// rangeBoundLiterals renders a RANGE bound tuple (FROM or TO) to SQL literals,
+// parallel to its raw routing form. Returns nil if any element can't be rendered
+// so FormatPartitionBound falls back to the raw values rather than emitting an
+// empty bound. DU-002 slice 169.
+func rangeBoundLiterals(exprs []parser.Expr) []string {
+	if len(exprs) == 0 {
+		return nil
+	}
+	lits := make([]string, 0, len(exprs))
+	for _, e := range exprs {
+		lit := rangeBoundExprToSQLLiteral(e)
+		if lit == "" {
+			return nil
+		}
+		lits = append(lits, lit)
+	}
+	return lits
+}
+
+// rangeBoundUnboundedFlags returns two parallel slices over a RANGE bound tuple:
+// unbounded[i] is true when element i is a MINVALUE/MAXVALUE keyword (an
+// unbounded edge), and isMax[i] is true when that edge is MAXVALUE (+∞). They
+// disambiguate the unbounded keyword from a quoted text value 'MINVALUE' at the
+// routing layer, where both otherwise serialize to the bare string "MINVALUE".
+// DU-002 slice 261.
+func rangeBoundUnboundedFlags(exprs []parser.Expr) (unbounded, isMax []bool) {
+	if len(exprs) == 0 {
+		return nil, nil
+	}
+	unbounded = make([]bool, len(exprs))
+	isMax = make([]bool, len(exprs))
+	for i, e := range exprs {
+		if kw, ok := e.(*parser.PartitionRangeBoundKeyword); ok {
+			unbounded[i] = true
+			isMax[i] = kw.IsMax
+		}
+	}
+	return unbounded, isMax
 }
 
 // funcExprContainsName returns true if expr (a partition-key expression) contains

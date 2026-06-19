@@ -35,9 +35,30 @@ set -euo pipefail
 # `go list ./...` covers the whole module and relative paths resolve.
 cd "$(dirname "$0")/.."
 
+# Scope selector — three values, chosen to avoid running the same work twice
+# across the manual pre-commit step and the commit hook:
+#
+#   full  (default) Part 1 (unit/component suite) AND Part 2 (pgbench smoke).
+#   units           Part 1 only — the agent's mandatory manual pre-commit run.
+#   smoke           Part 2 only — what .githooks/pre-commit runs on EVERY commit.
+#
+# Division of labour (no duplication): the agent runs `units` by hand to clear
+# the ~10 min unit suite once per change; the commit hook runs `smoke` (~2-3 min
+# pgbench) on every commit. Together that is full CI parity with each part run
+# once. `full` remains for one-shot local runs (e.g. exercising pgbench yourself
+# before committing a concurrency/executor change) — using it means the hook's
+# `smoke` re-runs pgbench, which is harmless defense-in-depth, not required.
+# The pgbench smoke is the CI-parity workload the Ralph loop was otherwise blind
+# to (it only ran targeted `go test`, so the TPC-B concurrency regression class
+# slipped straight through to CI). Override: RALPH_PRECOMMIT_SCOPE=units|smoke|full.
+SCOPE="${RALPH_PRECOMMIT_SCOPE:-full}"
+
 # --------------------------------------------------------------------------- #
-# Part 1 — unit/component Go suite
+# Part 1 — unit/component Go suite (full scope only)
 # --------------------------------------------------------------------------- #
+if [ "$SCOPE" = "smoke" ]; then
+  echo "ralph-precommit-test.sh: SCOPE=smoke — skipping Part 1 (unit/component suite); running pgbench smoke only"
+else
 
 # Keep this pattern in sync with the EXCLUDE list in
 # .github/workflows/test.yml ("Run unit and component tests").
@@ -69,17 +90,66 @@ if [ "${RALPH_PRECOMMIT_RACE:-0}" = "1" ]; then
   echo "ralph-precommit-test.sh: race pass PASS"
 fi
 
+fi  # end Part 1 (skipped when SCOPE=smoke)
+
 # --------------------------------------------------------------------------- #
 # Part 2 — pgbench smoke against a live goopg server
 #
 # Mirrors the test.yml steps: build goopg, init a data dir, start the server,
 # `pgbench -i` (load), then the standard / -N / -S workloads.
 # --------------------------------------------------------------------------- #
+if [ "$SCOPE" = "units" ]; then
+  echo "ralph-precommit-test.sh: SCOPE=units — skipping Part 2 (pgbench smoke); the commit hook runs it"
+else
 
-PORT="${RALPH_PRECOMMIT_PGPORT:-5535}"
-DATADIR="tmp/ralph-precommit-goopg-data"
-LOGFILE="tmp/ralph-precommit-goopg.log"
-CG_UNIT="ralph-precommit-goopg"
+# Pick a listen port that is actually free. A fixed port is unsafe here: a
+# stray goopg/PostgreSQL left over from a crashed run (or a concurrent loop) may
+# already hold it, in which case our `pg_isready` wait would connect to the
+# WRONG server and the gate would falsely pass (pgbench against the stray) or
+# fail confusingly ("could not read postmaster.pid"). So probe from the
+# requested port upward and use the first free one.
+port_in_use() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    # Compare the port field (last colon-separated token) of each LISTEN
+    # socket's local address, so 127.0.0.1:P / *:P / [::]:P all match P.
+    ss -ltn 2>/dev/null | awk -v port="$p" \
+      'NR>1 { n=split($4,a,":"); if (a[n]==port) found=1 } END { exit(found?0:1) }' \
+      && return 0
+    return 1
+  fi
+  # Fallback when ss is unavailable: a successful TCP connect => in use.
+  if (exec 3<>"/dev/tcp/127.0.0.1/$p") >/dev/null 2>&1; then
+    exec 3>&- 3<&- 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
+REQ_PORT="${RALPH_PRECOMMIT_PGPORT:-5535}"
+PORT=""
+for cand in $(seq "$REQ_PORT" $((REQ_PORT + 50))); do
+  if ! port_in_use "$cand"; then PORT="$cand"; break; fi
+done
+if [ -z "$PORT" ]; then
+  echo "ralph-precommit-test.sh: no free port in [$REQ_PORT, $((REQ_PORT + 50))]" >&2
+  exit 1
+fi
+if [ "$PORT" != "$REQ_PORT" ]; then
+  echo "ralph-precommit-test.sh: port $REQ_PORT busy; using free port $PORT instead"
+fi
+
+# Per-run-unique data dir / log / systemd scope. Two gate runs can overlap (e.g.
+# a respawned Ralph loop committing — and thus firing its own pre-commit gate —
+# while you commit). Fixed names would then collide: a shared data dir corrupts,
+# and systemd refuses a second scope of the same name ("Unit
+# ralph-precommit-goopg.scope was already loaded"), failing the gate spuriously.
+# Suffixing with the PID keeps concurrent runs independent (the free-port probe
+# above handles the listen-port half of the same hazard).
+RUN_ID="$$"
+DATADIR="tmp/ralph-precommit-goopg-data-$RUN_ID"
+LOGFILE="tmp/ralph-precommit-goopg-$RUN_ID.log"
+CG_UNIT="ralph-precommit-goopg-$RUN_ID"
 
 # Prefer the project's pinned PG 18.3 client tools (pgbench / pg_isready) under
 # postgres/local_install/bin when present — that is the compatibility oracle
@@ -163,6 +233,8 @@ pgbench -i              -h 127.0.0.1 -p "$PORT" -U postgres postgres
 pgbench -T 30 -c 2 -j 2 -P 5    -h 127.0.0.1 -p "$PORT" -U postgres postgres
 pgbench -T 30 -c 2 -j 2 -P 5 -N -h 127.0.0.1 -p "$PORT" -U postgres postgres
 pgbench -T 30 -c 2 -j 2 -P 5 -S -h 127.0.0.1 -p "$PORT" -U postgres postgres
+
+fi  # end Part 2 (skipped when SCOPE=units)
 
 # --------------------------------------------------------------------------- #
 # Part 3 — optional plan-diff gate (RALPH_PRECOMMIT_PLAN_DIFF=1 to enable)

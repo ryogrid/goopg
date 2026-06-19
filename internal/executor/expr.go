@@ -83,6 +83,8 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "text"
 	case 26:
 		return "oid"
+	case 22:
+		return "int2vector"
 	case 30:
 		return "oidvector"
 	case 700:
@@ -99,6 +101,40 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "timestamp without time zone"
 	case 1184:
 		return "timestamp with time zone"
+	case 650:
+		return "cidr"
+	case 774:
+		return "macaddr8"
+	case 829:
+		return "macaddr"
+	case 869:
+		return "inet"
+	case 600:
+		return "point"
+	case 601:
+		return "lseg"
+	case 602:
+		return "path"
+	case 603:
+		return "box"
+	case 604:
+		return "polygon"
+	case 628:
+		return "line"
+	case 718:
+		return "circle"
+	case 3614:
+		return "tsvector"
+	case 3615:
+		return "tsquery"
+	case 142:
+		return "xml"
+	case 790:
+		return "money"
+	case 1560:
+		return "bit"
+	case 1562:
+		return "bit varying"
 	case 1186:
 		return "interval"
 	case 1266:
@@ -115,6 +151,53 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "uuid"
 	case 3220:
 		return "pg_lsn"
+	case 2970:
+		return "txid_snapshot"
+	case 5038:
+		return "pg_snapshot"
+	case 5069:
+		return "xid8"
+	case 27:
+		// tid: tuple identifier, bare name. DU-002 slice 79.
+		return "tid"
+	case 28:
+		// xid: 32-bit transaction id, bare name. Slice 79.
+		return "xid"
+	case 29:
+		// cid: 32-bit command id, bare name. Slice 79.
+		return "cid"
+	// DU-002 slice 80: the OID-reference ("reg*") family, bare names.
+	case 24:
+		return "regproc"
+	case 2202:
+		return "regprocedure"
+	case 2203:
+		return "regoper"
+	case 2204:
+		return "regoperator"
+	case 2205:
+		return "regclass"
+	case 2206:
+		return "regtype"
+	case 3734:
+		return "regconfig"
+	case 3769:
+		return "regdictionary"
+	case 4089:
+		return "regnamespace"
+	case 4096:
+		return "regrole"
+	case 4191:
+		return "regcollation"
+	case 4072:
+		// jsonpath: SQL/JSON path, varlena, bare name. DU-002 slice 84.
+		return "jsonpath"
+	case 1790:
+		// refcursor: cursor-name reference, varlena, bare name. DU-002 slice 85.
+		return "refcursor"
+	case 1033:
+		// aclitem: access-control-list item, fixed-length, bare name. DU-002 slice 86.
+		return "aclitem"
 	// Array types
 	case 1000:
 		return "boolean[]"
@@ -144,14 +227,98 @@ func oidToBuiltinTypeName(oid uint32) string {
 		return "timestamp without time zone[]"
 	case 1182:
 		return "date[]"
+	case 1183:
+		return "time without time zone[]"
+	case 1270:
+		return "time with time zone[]"
 	case 1185:
 		return "timestamp with time zone[]"
+	case 651:
+		return "cidr[]"
+	case 775:
+		return "macaddr8[]"
+	case 1040:
+		return "macaddr[]"
+	case 1041:
+		return "inet[]"
+	case 1017:
+		return "point[]"
+	case 1018:
+		return "lseg[]"
+	case 1019:
+		return "path[]"
+	case 1020:
+		return "box[]"
+	case 1027:
+		return "polygon[]"
+	case 629:
+		return "line[]"
+	case 719:
+		return "circle[]"
+	case 3643:
+		return "tsvector[]"
+	case 3645:
+		return "tsquery[]"
+	case 143:
+		return "xml[]"
+	case 791:
+		return "money[]"
+	case 1561:
+		return "bit[]"
+	case 1563:
+		return "bit varying[]"
 	case 1187:
 		return "interval[]"
+	case 3221:
+		return "pg_lsn[]"
+	case 2949:
+		return "txid_snapshot[]"
+	case 5039:
+		return "pg_snapshot[]"
+	case 271:
+		return "xid8[]"
+	case 1010:
+		return "tid[]"
+	case 1011:
+		return "xid[]"
+	case 1012:
+		return "cid[]"
+	// DU-002 slice 80: the OID-reference ("reg*") array types, bare names + [].
+	case 1008:
+		return "regproc[]"
+	case 2207:
+		return "regprocedure[]"
+	case 2208:
+		return "regoper[]"
+	case 2209:
+		return "regoperator[]"
+	case 2210:
+		return "regclass[]"
+	case 2211:
+		return "regtype[]"
+	case 3735:
+		return "regconfig[]"
+	case 3770:
+		return "regdictionary[]"
+	case 4090:
+		return "regnamespace[]"
+	case 4097:
+		return "regrole[]"
+	case 4192:
+		return "regcollation[]"
 	case 1231:
 		return "numeric[]"
 	case 2951:
 		return "uuid[]"
+	case 4073:
+		// _jsonpath: jsonpath has no typmod, bare element name + []. Slice 84.
+		return "jsonpath[]"
+	case 2201:
+		// _refcursor: refcursor has no typmod, bare element name + []. Slice 85.
+		return "refcursor[]"
+	case 1034:
+		// _aclitem: aclitem has no typmod, bare element name + []. Slice 86.
+		return "aclitem[]"
 	default:
 		return ""
 	}
@@ -4170,6 +4337,16 @@ func buildConstraintDefString(idx *catalog.Index) string {
 		if len(idx.IncludeColumns) > 0 {
 			def += " INCLUDE (" + strings.Join(idx.IncludeColumns, ", ") + ")"
 		}
+		// DEFERRABLE [INITIALLY DEFERRED] — ruleutils.c appends ` DEFERRABLE` for a
+		// deferrable EXCLUDE constraint (after the WHERE predicate, which goopg does
+		// not yet emit) and ` INITIALLY DEFERRED` when initially deferred (INITIALLY
+		// IMMEDIATE is the default, omitted like PG). DU-002 slice 143.
+		if idx.Deferrable {
+			def += " DEFERRABLE"
+			if idx.InitiallyDeferred {
+				def += " INITIALLY DEFERRED"
+			}
+		}
 		return def
 	}
 	keyCols := "(" + strings.Join(idx.Columns, ", ") + ")"
@@ -4179,11 +4356,98 @@ func buildConstraintDefString(idx *catalog.Index) string {
 	} else {
 		keyword = "UNIQUE"
 	}
-	def := keyword + " " + keyCols
+	def := keyword
+	// NULLS NOT DISTINCT (PG 15+) precedes the column list for a UNIQUE
+	// constraint — ruleutils.c pg_get_constraintdef_worker emits
+	// `UNIQUE NULLS NOT DISTINCT (cols)` (only for CONSTRAINT_UNIQUE, never a
+	// PRIMARY KEY whose columns are already NOT NULL). DU-002 slice 135.
+	if !idx.Primary && idx.NullsNotDistinct {
+		def += " NULLS NOT DISTINCT"
+	}
+	def += " " + keyCols
 	if len(idx.IncludeColumns) > 0 {
 		def += " INCLUDE (" + strings.Join(idx.IncludeColumns, ", ") + ")"
 	}
+	// DEFERRABLE [INITIALLY DEFERRED] — ruleutils.c appends ` DEFERRABLE` for a
+	// deferrable constraint and additionally ` INITIALLY DEFERRED` when the
+	// constraint is initially deferred (INITIALLY IMMEDIATE is the default and is
+	// omitted, like PG). DU-002 slice 139.
+	if idx.Deferrable {
+		def += " DEFERRABLE"
+		if idx.InitiallyDeferred {
+			def += " INITIALLY DEFERRED"
+		}
+	}
 	return def
+}
+
+// buildForeignKeyDefString builds the pg_get_constraintdef text for a FOREIGN
+// KEY constraint, mirroring ruleutils.c pg_get_constraintdef_worker. pg_dump
+// runs with search_path=” so the referenced relation is fully schema-qualified
+// (`REFERENCES public.foo(id)`). Referential actions other than NO ACTION and a
+// DEFERRABLE clause are appended; MATCH SIMPLE (the default) is omitted, as PG
+// does. DU-002 slice 51.
+func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) string {
+	var refTbl *catalog.Table
+	for _, t := range im.AllTables() {
+		if t.Virtual || t.OID == 0 {
+			continue
+		}
+		if strings.EqualFold(t.Name, fk.RefTable) {
+			refTbl = t
+			break
+		}
+	}
+	refSchema := "public"
+	refName := fk.RefTable
+	refCols := fk.RefColumns
+	if refTbl != nil {
+		if refTbl.Schema != "" {
+			refSchema = refTbl.Schema
+		}
+		refName = refTbl.Name
+		if len(refCols) == 0 {
+			// Default to the referenced table's primary-key columns.
+			for _, idx := range im.IndexesOnTable(refTbl) {
+				if idx.Primary {
+					refCols = idx.Columns
+					break
+				}
+			}
+		}
+	}
+	def := "FOREIGN KEY (" + strings.Join(fk.Columns, ", ") + ") REFERENCES " +
+		refSchema + "." + refName + "(" + strings.Join(refCols, ", ") + ")"
+	if act := fkActionClause(fk.OnUpdate); act != "" {
+		def += " ON UPDATE " + act
+	}
+	if act := fkActionClause(fk.OnDelete); act != "" {
+		def += " ON DELETE " + act
+	}
+	if fk.Deferrable {
+		def += " DEFERRABLE"
+		if fk.InitiallyDeferred {
+			def += " INITIALLY DEFERRED"
+		}
+	}
+	return def
+}
+
+// fkActionClause renders the SQL keyword for a non-default FK referential
+// action; NO ACTION (the default) returns "" so the clause is omitted. DU-002 slice 51.
+func fkActionClause(a parser.FKAction) string {
+	switch a {
+	case parser.FKActionRestrict:
+		return "RESTRICT"
+	case parser.FKActionCascade:
+		return "CASCADE"
+	case parser.FKActionSetNull:
+		return "SET NULL"
+	case parser.FKActionSetDefault:
+		return "SET DEFAULT"
+	default:
+		return ""
+	}
 }
 
 // evalMakeDate implements make_date(year, month, day) → date. M0097-0004.
@@ -5429,9 +5693,56 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		result.Scale = int16(newOffsetSecs / 60)
 		return result, nil
 	case "pg_get_viewdef":
-		// Stub: return NULL so the normalizer can strip the result block.
-		// Full SQL deparsing would require a complete SQL pretty-printer. M0097-0004.
-		return NullDatum, nil
+		// pg_get_viewdef(view [, …]) → text: the view's defining SELECT.
+		// goopg stores the raw view body (catalog.Table.ViewDef) captured at
+		// parse time and echoes it here, terminated with ';' — pg_dump's
+		// createViewAsClause strips the trailing ';' and wraps it in
+		// `CREATE VIEW … AS <body>`. The first argument is an OID (pg_dump) or a
+		// view name (psql). NULL for an unknown/non-view object, so callers that
+		// pretty-print over an empty set are unaffected. M0110-0001 (DU-002).
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		im, ok := ctx.Catalog.(*catalog.InMemory)
+		if !ok {
+			return NullDatum, nil
+		}
+		var view *catalog.Table
+		if arg.Kind == KindInt {
+			if t, found := im.LookupTableByOID(uint32(arg.Int)); found {
+				view = t
+			}
+		} else if v, perr := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32); perr == nil {
+			if t, found := im.LookupTableByOID(uint32(v)); found {
+				view = t
+			}
+		} else if name := strings.TrimSpace(arg.StringValue()); name != "" {
+			if parsed, perr := parser.Parse("SELECT 1 FROM " + name); perr == nil && len(parsed) == 1 {
+				if sel, ok := parsed[0].(*parser.SelectStmt); ok && len(sel.From) == 1 {
+					rv := sel.From[0]
+					if t, found := im.LookupTable(parser.ObjectName{Schema: rv.Schema, Name: rv.Name}); found {
+						view = t
+					}
+				}
+			}
+		}
+		if view == nil || view.View == nil || view.ViewDef == "" {
+			return NullDatum, nil
+		}
+		def := view.ViewDef
+		// A `CREATE VIEW v (c1, c2, …) AS …` explicit column list renames the
+		// view's output columns. PG's pg_get_viewdef bakes those names into the
+		// SELECT as `expr AS cN`; goopg captures the body verbatim (no deparser),
+		// so splice the aliases into the raw select-list text. Skipped (raw text
+		// returned) when the view has no explicit column list. M0110-0001 (DU-002).
+		if len(view.ViewColumnAliases) > 0 {
+			def = applyViewColumnAliases(def, view.ViewColumnAliases)
+		}
+		return NewStringDatum(def + ";"), nil
 	case "pg_collation_for":
 		// Return "POSIX" to match the C/POSIX locale used in regression tests.
 		// PG regression databases are created with --locale=C, so text values
@@ -5736,7 +6047,22 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				return NullDatum, nil
 			}
 			n := idxDatum.Int
-			elems := parseTextArray(arr.StringValue())
+			sv := arr.StringValue()
+			if len(sv) < 2 || sv[0] != '{' {
+				// Not an array literal: a fixed-length pseudo-array type — most
+				// importantly `name` — is being subscripted. PostgreSQL indexes
+				// these 0-based and returns the Nth character (as "char").
+				// pg_dump's getTypes detects an auto-generated array type with
+				// `typname[0] = '_'`; without 0-based name subscripting that
+				// test is NULL and the array type wrongly dumps as a base type.
+				// DU-002 slice 89.
+				runes := []rune(sv)
+				if n < 0 || int(n) >= len(runes) {
+					return NullDatum, nil
+				}
+				return NewStringDatum(string(runes[n])), nil
+			}
+			elems := parseTextArray(sv)
 			if n < 1 || int(n) > len(elems) {
 				return NullDatum, nil
 			}
@@ -6385,6 +6711,50 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			return NewStringDatum(buildConstraintDefString(idx)), nil
 		}
+		// CHECK constraints are not index-backed; they live in the owning
+		// table's NamedChecks. pg_dump's getTableConstraints query selects
+		// `pg_get_constraintdef(c.oid)` for every contype='c' row, so without
+		// this branch the CHECK def comes back NULL and the constraint is
+		// silently dropped from the dumped CREATE TABLE. PG's deparser wraps the
+		// predicate in an extra paren layer (CHECK ((expr))), and appends
+		// NO INHERIT for a NO-INHERIT check; mirror that here. M0110-0001.
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			for _, tbl := range im.AllTables() {
+				for _, nc := range tbl.NamedChecks {
+					if nc.OID == 0 || nc.OID != targetOID {
+						continue
+					}
+					def := "CHECK ((" + nc.Expr + "))"
+					if nc.NoInherit {
+						def += " NO INHERIT"
+					}
+					return NewStringDatum(def), nil
+				}
+			}
+			// FOREIGN KEY constraints (contype='f'). pg_dump's getConstraints
+			// renders each FK via pg_get_constraintdef; with search_path='' the
+			// deparser fully schema-qualifies the referenced relation
+			// (`REFERENCES public.foo(id)`). DU-002 slice 51.
+			for _, tbl := range im.AllTables() {
+				for _, fk := range tbl.ForeignKeys {
+					if fk.OID == 0 || fk.OID != targetOID {
+						continue
+					}
+					return NewStringDatum(buildForeignKeyDefString(im, fk)), nil
+				}
+			}
+			// Domain CHECK constraints (contype='c', keyed on contypid). pg_dump's
+			// getDomainConstraints renders each via pg_get_constraintdef and
+			// dumpDomain emits `CONSTRAINT <name> <def>`; the deparser wraps the
+			// predicate in an extra paren layer (CHECK ((expr))), mirroring the
+			// table-CHECK path above. DU-002 slice 96.
+			for _, d := range im.AllDomains() {
+				if d.CheckOID == 0 || d.CheckOID != targetOID {
+					continue
+				}
+				return NewStringDatum("CHECK ((" + d.CheckExpr + "))"), nil
+			}
+		}
 		return NullDatum, nil
 
 	case "array_to_string":
@@ -6492,7 +6862,15 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil {
 				return Datum{}, err
 			}
-			if !treeArg.IsNull() && treeArg.StringValue() != "" {
+			// pg_get_expr(NULL, ...) → NULL (mirrors PG). A NULL node tree means
+			// the object has no such expression (e.g. a domain or column with no
+			// default); pg_dump distinguishes NULL from '' to decide whether to
+			// emit a DEFAULT clause, so collapsing NULL to '' produced a spurious
+			// empty `DEFAULT `. DU-002 slice 90.
+			if treeArg.IsNull() {
+				return NullDatum, nil
+			}
+			if treeArg.StringValue() != "" {
 				return NewStringDatum(treeArg.StringValue()), nil
 			}
 		}
@@ -6867,7 +7245,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if rs := ctx.Catalog.Routines(); rs != nil {
 					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
-						return NewStringDatum(buildFunctionArguments(r)), nil
+						return NewStringDatum(buildFunctionArguments(r, true)), nil
 					}
 				}
 			}
@@ -6878,14 +7256,14 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		// needed to identify the function for ALTER/DROP FUNCTION. Upstream
 		// (ruleutils.c print_function_arguments) differs from
 		// pg_get_function_arguments only by print_defaults=false — it omits
-		// DEFAULT clauses. goopg's buildFunctionArguments never emits defaults,
-		// so the identity form is identical to the full argument list here.
+		// DEFAULT clauses. buildFunctionArguments takes printDefaults=false here,
+		// so the identity form drops any ` DEFAULT <expr>` carried by the full form.
 		if len(x.Args) == 1 && ctx != nil && ctx.Catalog != nil {
 			oidArg, err := evalExpr(x.Args[0], row, ctx)
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if rs := ctx.Catalog.Routines(); rs != nil {
 					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil {
-						return NewStringDatum(buildFunctionArguments(r)), nil
+						return NewStringDatum(buildFunctionArguments(r, false)), nil
 					}
 				}
 			}
@@ -6907,7 +7285,24 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err == nil && !oidArg.IsNull() && oidArg.Kind == KindInt {
 				if rs := ctx.Catalog.Routines(); rs != nil {
 					if r := rs.LookupByOID(uint32(oidArg.Int)); r != nil && !r.IsProcedure {
-						return NewStringDatum(canonicalTypeName(r.ReturnType.Name)), nil
+						// RETURNS TABLE: PG's pg_get_function_result renders the
+						// table columns (stored here as trailing OUT args) as
+						// `TABLE(name type, ...)` rather than the equivalent
+						// `SETOF record`. pg_dump uses this verbatim, so emitting
+						// the TABLE form keeps the dump identical to upstream.
+						if r.ReturnsTable {
+							return NewStringDatum(buildTableResult(r)), nil
+						}
+						// Set-returning functions carry a SETOF prefix on their
+						// result type, matching PG's pg_get_function_result
+						// (ruleutils.c). pg_dump uses this verbatim for the
+						// RETURNS clause, so dropping SETOF would silently
+						// downgrade an SRF to a scalar function on dump.
+						ret := canonicalTypeName(r.ReturnType.Name)
+						if r.ReturnsSet {
+							ret = "SETOF " + ret
+						}
+						return NewStringDatum(ret), nil
 					}
 				}
 			}
@@ -8415,6 +8810,48 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 				}
 			}
 			name := formatTypeOID(typeOID, typmod)
+			if name == "???" && ctx != nil && ctx.Catalog != nil {
+				// A user-defined enum's pg_type OID is dynamically allocated,
+				// so formatTypeOID (built-ins only) returns the unknown
+				// sentinel. Resolve it to the enum's schema-qualified name.
+				// pg_dump runs with search_path='', under which format_type
+				// qualifies a non-visible type with its namespace; goopg enums
+				// live in public, hence the public. prefix. DU-002 slice 88.
+				if et, ok := ctx.Catalog.LookupEnumByOID(uint32(typeOID)); ok {
+					name = "public." + et.Name
+				} else if et, ok := ctx.Catalog.LookupEnumByArrayOID(uint32(typeOID)); ok {
+					// A `mood[]` column carries the enum's auto-generated array
+					// OID; render it as the schema-qualified array name so the
+					// dump round-trips as `public.mood[]`, not `text[]`. DU-002
+					// slice 89.
+					name = "public." + et.Name + "[]"
+				} else if dom, ok := ctx.Catalog.LookupDomainByOID(uint32(typeOID)); ok {
+					// A domain column carries the domain's dynamically-allocated
+					// pg_type OID; render it as the schema-qualified domain name
+					// (NOT the base type) so the dump round-trips as
+					// `public.zipcode`. DU-002 slice 90.
+					name = "public." + dom.Name
+				} else if dom, ok := ctx.Catalog.LookupDomainByArrayOID(uint32(typeOID)); ok {
+					// A `d[]` column carries the domain's auto-generated array OID;
+					// render it as the schema-qualified array name so the dump
+					// round-trips as `public.d[]`, not the base type's array.
+					// DU-002 slice 251.
+					name = "public." + dom.Name + "[]"
+				} else if ct, ok := ctx.Catalog.LookupCompositeTypeByOID(uint32(typeOID)); ok {
+					// A nested-composite field carries the inner composite type's
+					// dynamically-allocated pg_type OID; render it as the
+					// schema-qualified composite name so dumpCompositeType emits
+					// `<field> public.<inner>` rather than the text fallback.
+					// DU-002 slice 249.
+					name = "public." + ct.Name
+				} else if ct, ok := ctx.Catalog.LookupCompositeTypeByArrayOID(uint32(typeOID)); ok {
+					// A composite-array field (`addr[]`) carries the composite's
+					// auto-generated array OID; render it as the schema-qualified
+					// array name so the dump round-trips as `public.addr[]`, not
+					// `text[]`. DU-002 slice 250.
+					name = "public." + ct.Name + "[]"
+				}
+			}
 			return NewStringDatum(name), nil
 		}
 	case "pg_column_size":
@@ -9471,6 +9908,198 @@ func formatTextArrayWithNulls(elems []string, nulls []bool) string {
 	return sb.String()
 }
 
+// applyViewColumnAliases rewrites the top-level select-list of a view's raw
+// definition so each output column carries the explicit name from a
+// `CREATE VIEW v (c1, c2, …)` column list, mirroring how PostgreSQL's
+// pg_get_viewdef bakes the view column names into the SELECT as `expr AS cN`.
+// goopg captures the view body verbatim (no deparser), so the aliases are
+// spliced into the raw text.
+//
+// The rewrite is applied ONLY when it can be done unambiguously: the body must
+// begin with the SELECT keyword, the top-level select list must split into
+// exactly len(aliases) items, and no item may be a `*`/`x.*` star or already
+// carry a top-level `AS` alias. Otherwise the raw text is returned unchanged
+// (the renamed column names are then lost — a documented fidelity gap for these
+// uncommon shapes). Quoting/paren/bracket nesting and string/identifier
+// literals are respected when locating the FROM boundary and item commas.
+func applyViewColumnAliases(rawDef string, aliases []string) string {
+	if len(aliases) == 0 {
+		return rawDef
+	}
+	trimmed := strings.TrimLeft(rawDef, " \t\n\r")
+	const kw = "select"
+	if len(trimmed) < len(kw) || !strings.EqualFold(trimmed[:len(kw)], kw) {
+		return rawDef
+	}
+	rest := trimmed[len(kw):]
+	// Guard against matching e.g. "selected" — the SELECT keyword must be
+	// followed by a non-identifier byte (whitespace/paren).
+	if rest == "" || isViewIdentByte(rest[0]) {
+		return rawDef
+	}
+	// The select list ends at the first top-level FROM, or end-of-string when
+	// the view body has no FROM clause (e.g. `SELECT 1 AS x`).
+	selectList := rest
+	tail := ""
+	if from := findTopLevelFromKeyword(rest); from >= 0 {
+		selectList = rest[:from]
+		tail = rest[from:]
+	}
+	items := splitTopLevelCommas(selectList)
+	if len(items) != len(aliases) {
+		return rawDef
+	}
+	var sb strings.Builder
+	sb.WriteString(trimmed[:len(kw)]) // preserve the original SELECT casing
+	for i, item := range items {
+		expr := strings.TrimSpace(item)
+		if expr == "" || expr == "*" || strings.HasSuffix(expr, ".*") || hasTopLevelAsAlias(expr) {
+			return rawDef
+		}
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte(' ')
+		sb.WriteString(expr)
+		sb.WriteString(" AS ")
+		sb.WriteString(quoteViewIdent(aliases[i]))
+	}
+	if tail != "" {
+		sb.WriteByte(' ')
+		sb.WriteString(tail)
+	}
+	return sb.String()
+}
+
+// isViewIdentByte reports whether b can appear in an unquoted SQL identifier.
+func isViewIdentByte(b byte) bool {
+	return b == '_' || b == '$' ||
+		(b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// findTopLevelFromKeyword returns the byte index of the first `FROM` keyword in
+// s that appears at paren/bracket depth 0 and outside string/identifier
+// literals, with identifier word boundaries on both sides; -1 if none.
+func findTopLevelFromKeyword(s string) int {
+	depth := 0
+	inSingle, inDouble := false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case inSingle:
+			if c == '\'' {
+				if i+1 < len(s) && s[i+1] == '\'' {
+					i++
+				} else {
+					inSingle = false
+				}
+			}
+		case inDouble:
+			if c == '"' {
+				if i+1 < len(s) && s[i+1] == '"' {
+					i++
+				} else {
+					inDouble = false
+				}
+			}
+		case c == '\'':
+			inSingle = true
+		case c == '"':
+			inDouble = true
+		case c == '(' || c == '[':
+			depth++
+		case c == ')' || c == ']':
+			if depth > 0 {
+				depth--
+			}
+		case depth == 0 && (c == 'f' || c == 'F'):
+			if i+4 <= len(s) && strings.EqualFold(s[i:i+4], "from") {
+				prevOK := i == 0 || !isViewIdentByte(s[i-1])
+				nextOK := i+4 == len(s) || !isViewIdentByte(s[i+4])
+				if prevOK && nextOK {
+					return i
+				}
+			}
+		}
+	}
+	return -1
+}
+
+// hasTopLevelAsAlias reports whether expr contains an `AS` keyword at
+// paren/bracket depth 0 and outside literals — i.e. it already names its output
+// column. Such items are left untouched (the whole rewrite bails) to avoid
+// generating `expr AS old AS new`. A bare trailing alias without AS is not
+// detected (atypical alongside an explicit view column list).
+func hasTopLevelAsAlias(expr string) bool {
+	depth := 0
+	inSingle, inDouble := false, false
+	for i := 0; i < len(expr); i++ {
+		c := expr[i]
+		switch {
+		case inSingle:
+			if c == '\'' {
+				if i+1 < len(expr) && expr[i+1] == '\'' {
+					i++
+				} else {
+					inSingle = false
+				}
+			}
+		case inDouble:
+			if c == '"' {
+				if i+1 < len(expr) && expr[i+1] == '"' {
+					i++
+				} else {
+					inDouble = false
+				}
+			}
+		case c == '\'':
+			inSingle = true
+		case c == '"':
+			inDouble = true
+		case c == '(' || c == '[':
+			depth++
+		case c == ')' || c == ']':
+			if depth > 0 {
+				depth--
+			}
+		case depth == 0 && (c == 'a' || c == 'A'):
+			if i+2 <= len(expr) && strings.EqualFold(expr[i:i+2], "as") {
+				prevOK := i == 0 || !isViewIdentByte(expr[i-1])
+				nextOK := i+2 == len(expr) || !isViewIdentByte(expr[i+2])
+				if prevOK && nextOK {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// quoteViewIdent renders an alias as a SQL identifier, double-quoting it only
+// when it is not a simple lowercase identifier (mirrors PG's quote_identifier).
+func quoteViewIdent(s string) string {
+	simple := len(s) > 0
+	if simple {
+		c := s[0]
+		if !(c == '_' || (c >= 'a' && c <= 'z')) {
+			simple = false
+		}
+	}
+	if simple {
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if !(c == '_' || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+				simple = false
+				break
+			}
+		}
+	}
+	if simple {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
 // applyPgFormat implements PostgreSQL's format() function for common specifiers:
 // %s (value as text), %I (quote_ident), %L (quote_literal), %% (literal %). M0097-0003.
 // applyPgFormat is kept as a simple no-error wrapper for callers that don't
@@ -10013,7 +10642,10 @@ func formatTypeOID(typeOID, typmod int64) string {
 	case 21:
 		return "smallint"
 	case 22:
-		return "smallint[]"
+		// int2vector: a space-separated list of int2 (pg_index.indkey). NOT
+		// smallint[] — that is the genuine _int2 array type (OID 1005). DU-002
+		// slice 81.
+		return "int2vector"
 	case 23:
 		return "integer"
 	case 25:
@@ -10026,18 +10658,152 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "xid"
 	case 29:
 		return "cid"
+	// DU-002 slice 80: the OID-reference ("reg*") family. No typmod, bare names.
+	case 24:
+		return "regproc"
+	case 2202:
+		return "regprocedure"
+	case 2203:
+		return "regoper"
+	case 2204:
+		return "regoperator"
+	case 2205:
+		return "regclass"
+	case 2206:
+		return "regtype"
+	case 3734:
+		return "regconfig"
+	case 3769:
+		return "regdictionary"
+	case 4089:
+		return "regnamespace"
+	case 4096:
+		return "regrole"
+	case 4191:
+		return "regcollation"
+	// DU-002 slice 80: the reg* array types. No typmod, bare element name + [].
+	case 1008:
+		return "regproc[]"
+	case 2207:
+		return "regprocedure[]"
+	case 2208:
+		return "regoper[]"
+	case 2209:
+		return "regoperator[]"
+	case 2210:
+		return "regclass[]"
+	case 2211:
+		return "regtype[]"
+	case 3735:
+		return "regconfig[]"
+	case 3770:
+		return "regdictionary[]"
+	case 4090:
+		return "regnamespace[]"
+	case 4097:
+		return "regrole[]"
+	case 4192:
+		return "regcollation[]"
 	case 30:
-		return "oid[]"
+		// oidvector: a space-separated list of oid (pg_proc.proargtypes). NOT
+		// oid[] — that is the genuine _oid array type (OID 1028). DU-002 slice 81.
+		return "oidvector"
+	case 1006:
+		// _int2vector: int2vector has no typmod, so the array is the bare name + [].
+		return "int2vector[]"
+	case 1013:
+		// _oidvector: oidvector has no typmod, so the array is the bare name + [].
+		return "oidvector[]"
+	case 1003:
+		// _name: name has no typmod, so the array is the bare name + []. Slice 82.
+		return "name[]"
 	case 114:
 		return "json"
 	case 142:
 		return "xml"
+	case 199:
+		// _json: json has no typmod, so the array is the bare name. Slice 69.
+		return "json[]"
+	case 3807:
+		// _jsonb: jsonb has no typmod, so the array is the bare name. Slice 69.
+		return "jsonb[]"
 	case 600:
 		return "point"
+	case 601:
+		// lseg: no typmod, bare name. DU-002 slice 72.
+		return "lseg"
+	case 602:
+		// path: no typmod, bare name. Slice 72.
+		return "path"
+	case 603:
+		// box: no typmod, bare name. Slice 72.
+		return "box"
+	case 604:
+		// polygon: no typmod, bare name. Slice 72.
+		return "polygon"
+	case 628:
+		// line: no typmod, bare name. Slice 72.
+		return "line"
+	case 718:
+		// circle: no typmod, bare name. Slice 72.
+		return "circle"
+	case 1017:
+		// _point: no typmod, bare element name + []. Slice 72.
+		return "point[]"
+	case 1018:
+		// _lseg: no typmod, bare element name + []. Slice 72.
+		return "lseg[]"
+	case 1019:
+		// _path: no typmod, bare element name + []. Slice 72.
+		return "path[]"
+	case 1020:
+		// _box: no typmod, bare element name + []. Slice 72.
+		return "box[]"
+	case 1027:
+		// _polygon: no typmod, bare element name + []. Slice 72.
+		return "polygon[]"
+	case 629:
+		// _line: no typmod, bare element name + []. Slice 72.
+		return "line[]"
+	case 719:
+		// _circle: no typmod, bare element name + []. Slice 72.
+		return "circle[]"
+	case 650:
+		// cidr: no typmod, bare name. DU-002 slice 71.
+		return "cidr"
+	case 651:
+		// _cidr: no typmod, bare element name + []. Slice 71.
+		return "cidr[]"
+	case 774:
+		// macaddr8: no typmod, bare name. Slice 71.
+		return "macaddr8"
+	case 775:
+		// _macaddr8: no typmod, bare element name + []. Slice 71.
+		return "macaddr8[]"
+	case 829:
+		// macaddr: no typmod, bare name. Slice 71.
+		return "macaddr"
+	case 869:
+		// inet: no typmod, bare name. Slice 71.
+		return "inet"
+	case 1040:
+		// _macaddr: no typmod, bare element name + []. Slice 71.
+		return "macaddr[]"
+	case 1041:
+		// _inet: no typmod, bare element name + []. Slice 71.
+		return "inet[]"
 	case 700:
 		return "real"
 	case 701:
 		return "double precision"
+	case 1000:
+		return "boolean[]"
+	case 1001:
+		// _bytea: bytea has no typmod, so the array is the bare name. Slice 67.
+		return "bytea[]"
+	case 1002:
+		// _char: array of the single-byte "char" type (18). Slice 87.
+		return "\"char\"[]"
 	case 1005:
 		return "smallint[]"
 	case 1007:
@@ -10046,6 +10812,39 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "text[]"
 	case 1016:
 		return "bigint[]"
+	case 1021:
+		return "real[]"
+	case 1022:
+		return "double precision[]"
+	case 1115:
+		// _timestamp: element typmod (timestamp(p)) is carried onto the array;
+		// formatTypeOID(1114) has no typmod decode, so this is the bare name.
+		return "timestamp without time zone[]"
+	case 1182:
+		return "date[]"
+	case 1183:
+		// _time: bare name, mirroring scalar 1083 (no typmod decode). Slice 65.
+		return "time without time zone[]"
+	case 1270:
+		// _timetz: bare name, mirroring scalar 1266 (no typmod decode). Slice 83.
+		return "time with time zone[]"
+	case 1185:
+		// _timestamptz: bare name, mirroring scalar 1184. Slice 65.
+		return "timestamp with time zone[]"
+	case 1231:
+		// _numeric: format_type strips the array, formats the element with
+		// the carried typmod, then re-appends []. DU-002 slice 63.
+		return formatTypeOID(1700, typmod) + "[]"
+	case 1015:
+		// _varchar: element typmod (varchar(n)) is carried onto the array;
+		// format the element then re-append []. DU-002 slice 68.
+		return formatTypeOID(1043, typmod) + "[]"
+	case 1014:
+		// _bpchar: element typmod (char(n)) carried onto the array. Slice 68.
+		return formatTypeOID(1042, typmod) + "[]"
+	case 1028:
+		// _oid: oid has no typmod, so the array is the bare name. Slice 68.
+		return "oid[]"
 	case 1042:
 		if typmod > 4 {
 			return fmt.Sprintf("character(%d)", typmod-4)
@@ -10060,26 +10859,126 @@ func formatTypeOID(typeOID, typmod int64) string {
 		return "date"
 	case 1083:
 		return "time without time zone"
+	case 1266:
+		return "time with time zone"
 	case 1114:
 		return "timestamp without time zone"
 	case 1184:
 		return "timestamp with time zone"
 	case 1186:
 		return "interval"
+	case 1187:
+		// _interval: a bare interval[] column has typmod -1, so this is the
+		// bare element name with the [] suffix. DU-002 slice 70.
+		return "interval[]"
 	case 1700:
+		// numeric(precision,scale): atttypmod = ((p<<16)|s)+VARHDRSZ.
+		// Mirrors numerictypmodout. typmod<VARHDRSZ means no modifier.
+		if typmod >= 4 {
+			m := typmod - 4
+			precision := (m >> 16) & 0xffff
+			scale := m & 0xffff
+			return fmt.Sprintf("numeric(%d,%d)", precision, scale)
+		}
 		return "numeric"
 	case 2249:
 		return "record"
 	case 2950:
 		return "uuid"
+	case 2951:
+		// _uuid: uuid has no typmod, so the array is the bare name. Slice 66.
+		return "uuid[]"
 	case 3614:
 		return "tsvector"
 	case 3615:
 		return "tsquery"
+	case 3643:
+		// _tsvector: tsvector has no typmod, so the array is the bare name. Slice 73.
+		return "tsvector[]"
+	case 3645:
+		// _tsquery: tsquery has no typmod, so the array is the bare name. Slice 73.
+		return "tsquery[]"
+	case 790:
+		return "money"
+	case 143:
+		// _xml: xml has no typmod, so the array is the bare name. Slice 74.
+		return "xml[]"
+	case 791:
+		// _money: money has no typmod, so the array is the bare name. Slice 74.
+		return "money[]"
+	case 1560:
+		// bit(n): atttypmod is the bit length stored raw (no VARHDRSZ), mirroring
+		// anybit_typmodout. A column always carries typmod (bare `bit` => bit(1)).
+		// DU-002 slice 75.
+		if typmod >= 0 {
+			return fmt.Sprintf("bit(%d)", typmod)
+		}
+		return "bit"
+	case 1562:
+		// bit varying(n): like bit, typmod is the raw bit length. A bare `varbit`
+		// column has typmod -1 (unlimited) => the bare name. DU-002 slice 75.
+		if typmod >= 0 {
+			return fmt.Sprintf("bit varying(%d)", typmod)
+		}
+		return "bit varying"
+	case 1561:
+		// _bit: element typmod (bit(n)) is carried onto the array; format the
+		// element then re-append []. DU-002 slice 75.
+		return formatTypeOID(1560, typmod) + "[]"
+	case 1563:
+		// _varbit: element typmod (bit varying(n)) carried onto the array. Slice 75.
+		return formatTypeOID(1562, typmod) + "[]"
+	case 3220:
+		// pg_lsn: no typmod, bare name. DU-002 slice 76.
+		return "pg_lsn"
+	case 3221:
+		// _pg_lsn: pg_lsn has no typmod, so the array is the bare name. Slice 76.
+		return "pg_lsn[]"
+	case 2970:
+		// txid_snapshot: no typmod, bare name. DU-002 slice 77.
+		return "txid_snapshot"
+	case 2949:
+		// _txid_snapshot: no typmod, so the array is the bare name. Slice 77.
+		return "txid_snapshot[]"
+	case 5038:
+		// pg_snapshot: no typmod, bare name. DU-002 slice 77.
+		return "pg_snapshot"
+	case 5039:
+		// _pg_snapshot: no typmod, so the array is the bare name. Slice 77.
+		return "pg_snapshot[]"
+	case 5069:
+		// xid8: no typmod, bare name. DU-002 slice 78.
+		return "xid8"
+	case 271:
+		// _xid8: xid8 has no typmod, so the array is the bare name. Slice 78.
+		return "xid8[]"
+	case 1010:
+		// _tid: tid has no typmod, so the array is the bare name. Slice 79.
+		return "tid[]"
+	case 1011:
+		// _xid: xid has no typmod, so the array is the bare name. Slice 79.
+		return "xid[]"
+	case 1012:
+		// _cid: cid has no typmod, so the array is the bare name. Slice 79.
+		return "cid[]"
 	case 3802:
 		return "jsonb"
 	case 4072:
 		return "jsonpath"
+	case 4073:
+		// _jsonpath: jsonpath has no typmod, so the array is the bare name. Slice 84.
+		return "jsonpath[]"
+	case 1790:
+		return "refcursor"
+	case 2201:
+		// _refcursor: refcursor has no typmod, so the array is the bare name. Slice 85.
+		return "refcursor[]"
+	case 1033:
+		// aclitem: access-control-list item, no typmod, bare name. Slice 86.
+		return "aclitem"
+	case 1034:
+		// _aclitem: aclitem has no typmod, so the array is the bare name. Slice 86.
+		return "aclitem[]"
 	default:
 		return "???"
 	}
@@ -10448,9 +11347,14 @@ func parseTZHourMin(s string) (h, m int, ok bool) {
 	return n, 0, true
 }
 
-// buildFunctionArguments returns the argument list string for pg_get_function_arguments().
-// Format: "IN name type, OUT name type, ..." matching PG's pg_get_function_arguments.
-func buildFunctionArguments(r *catalog.Routine) string {
+// buildFunctionArguments returns the argument list string for
+// pg_get_function_arguments() / pg_get_function_identity_arguments(). Format:
+// "IN name type, OUT name type, ..." matching PG's print_function_arguments.
+// printDefaults mirrors PG's print_defaults flag: pg_get_function_arguments
+// passes true (so trailing input args carry their ` DEFAULT <expr>` clause),
+// while pg_get_function_identity_arguments passes false (defaults omitted, since
+// they are not part of the function's ALTER/DROP identity).
+func buildFunctionArguments(r *catalog.Routine, printDefaults bool) string {
 	if len(r.ArgTypes) == 0 {
 		return ""
 	}
@@ -10460,26 +11364,43 @@ func buildFunctionArguments(r *catalog.Routine) string {
 	showMode := r.IsProcedure
 	if !showMode {
 		for _, m := range r.ArgModes {
+			// For RETURNS TABLE the OUT-mode args are table columns; they belong to
+			// the result (rendered by pg_get_function_result), not the arg list, so
+			// they must not flip showMode on. PG's print_function_arguments excludes
+			// PROARGMODE_TABLE args entirely.
+			if r.ReturnsTable && m == "o" {
+				continue
+			}
 			if m == "o" || m == "b" {
 				showMode = true
 				break
 			}
 		}
 	}
-	parts := make([]string, len(r.ArgTypes))
+	parts := make([]string, 0, len(r.ArgTypes))
 	for i, argType := range r.ArgTypes {
+		// Skip RETURNS TABLE columns: they are stored as trailing OUT args but
+		// surface only in the RETURNS TABLE(...) result clause, never the arg list.
+		if r.ReturnsTable && i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+			continue
+		}
 		var part strings.Builder
-		// Mode prefix
-		if showMode && r.ArgModes != nil && i < len(r.ArgModes) {
+		// Mode prefix. OUT/INOUT/VARIADIC always carry their prefix (matching
+		// print_function_arguments, which prints every non-default mode regardless
+		// of routine kind); the bare IN prefix is only emitted when showMode is set
+		// (procedures, or functions that carry an OUT/INOUT arg).
+		if r.ArgModes != nil && i < len(r.ArgModes) {
 			switch r.ArgModes[i] {
-			case "i", "":
-				part.WriteString("IN ")
 			case "o":
 				part.WriteString("OUT ")
 			case "b":
 				part.WriteString("INOUT ")
 			case "v":
 				part.WriteString("VARIADIC ")
+			default: // "i" or ""
+				if showMode {
+					part.WriteString("IN ")
+				}
 			}
 		} else if showMode {
 			part.WriteString("IN ")
@@ -10490,9 +11411,62 @@ func buildFunctionArguments(r *catalog.Routine) string {
 			part.WriteByte(' ')
 		}
 		part.WriteString(canonicalTypeName(argType.Name))
-		parts[i] = part.String()
+		// DEFAULT clause. PG's print_function_arguments appends ` DEFAULT <expr>`
+		// only when print_defaults is set AND the argument is an input arg
+		// (IN/INOUT/VARIADIC) — output args never carry a default. goopg stores the
+		// deparse-canonical default expression positionally in ArgDefaults.
+		if printDefaults && i < len(r.ArgDefaults) && r.ArgDefaults[i] != "" && argIsInput(r.ArgModes, i) {
+			part.WriteString(" DEFAULT ")
+			part.WriteString(r.ArgDefaults[i])
+		}
+		parts = append(parts, part.String())
 	}
 	return strings.Join(parts, ", ")
+}
+
+// buildTableResult renders the `TABLE(name type, ...)` result clause for a
+// RETURNS TABLE function, matching PG's pg_get_function_result (ruleutils.c,
+// PROARGMODE_TABLE branch). The table columns are stored as the routine's
+// trailing OUT args (mode "o"); pg_dump consumes this string verbatim for the
+// RETURNS clause.
+func buildTableResult(r *catalog.Routine) string {
+	var cols []string
+	for i := range r.ArgTypes {
+		if i >= len(r.ArgModes) || r.ArgModes[i] != "o" {
+			continue
+		}
+		name := ""
+		if i < len(r.ArgNames) {
+			name = r.ArgNames[i]
+		}
+		part := name
+		if part != "" {
+			part += " "
+		}
+		part += canonicalTypeName(r.ArgTypes[i].Name)
+		cols = append(cols, part)
+	}
+	if len(cols) == 0 {
+		// Defensive: a RETURNS TABLE with no recoverable columns falls back to the
+		// SETOF record form rather than emitting an empty, unparsable TABLE().
+		return "SETOF record"
+	}
+	return "TABLE(" + strings.Join(cols, ", ") + ")"
+}
+
+// argIsInput reports whether the argument at index i is an input argument
+// (IN/INOUT/VARIADIC) — the only modes that can carry a DEFAULT. A nil/short
+// ArgModes slice means all-IN (per catalog.Routine.ArgModes convention).
+func argIsInput(modes []string, i int) bool {
+	if modes == nil || i >= len(modes) {
+		return true // all-IN
+	}
+	switch modes[i] {
+	case "o": // OUT
+		return false
+	default: // "i" (IN), "b" (INOUT), "v" (VARIADIC), "" (defaults to IN)
+		return true
+	}
 }
 
 // buildFunctionDef reconstructs the CREATE FUNCTION / CREATE PROCEDURE DDL
@@ -10514,21 +11488,32 @@ func buildFunctionDef(r *catalog.Routine) string {
 	}
 	sb.WriteString(r.Name)
 	sb.WriteByte('(')
+	wroteArg := false
 	for i, argType := range r.ArgTypes {
-		if i > 0 {
+		// RETURNS TABLE columns are stored as trailing OUT args but render in the
+		// RETURNS TABLE(...) clause, not the arg list (sibling of buildFunctionArguments).
+		if r.ReturnsTable && i < len(r.ArgModes) && r.ArgModes[i] == "o" {
+			continue
+		}
+		if wroteArg {
 			sb.WriteString(", ")
 		}
-		// Procedure args include mode prefix
-		if r.IsProcedure && r.ArgModes != nil && i < len(r.ArgModes) {
+		wroteArg = true
+		// Mode prefix: OUT/INOUT/VARIADIC are emitted for both functions and
+		// procedures; the bare IN prefix is procedure-only (sibling of
+		// buildFunctionArguments).
+		if r.ArgModes != nil && i < len(r.ArgModes) {
 			switch r.ArgModes[i] {
-			case "i":
-				sb.WriteString("IN ")
 			case "o":
 				sb.WriteString("OUT ")
 			case "b":
 				sb.WriteString("INOUT ")
 			case "v":
 				sb.WriteString("VARIADIC ")
+			case "i", "":
+				if r.IsProcedure {
+					sb.WriteString("IN ")
+				}
 			}
 		}
 		if i < len(r.ArgNames) && r.ArgNames[i] != "" {
@@ -10536,13 +11521,28 @@ func buildFunctionDef(r *catalog.Routine) string {
 			sb.WriteByte(' ')
 		}
 		sb.WriteString(canonicalTypeName(argType.Name))
+		// DEFAULT clause: pg_get_functiondef calls print_function_arguments with
+		// print_defaults=true, so input args carry their ` DEFAULT <expr>` (sibling
+		// of buildFunctionArguments; output args never have a default).
+		if i < len(r.ArgDefaults) && r.ArgDefaults[i] != "" && argIsInput(r.ArgModes, i) {
+			sb.WriteString(" DEFAULT ")
+			sb.WriteString(r.ArgDefaults[i])
+		}
 	}
 	sb.WriteString(")\n")
 
 	// RETURNS clause (functions only) — 1-space indent like PG's deparser
 	if !r.IsProcedure {
 		sb.WriteString(" RETURNS ")
-		sb.WriteString(canonicalTypeName(r.ReturnType.Name))
+		if r.ReturnsTable {
+			// RETURNS TABLE(col type, ...) — rendered from the trailing OUT args.
+			sb.WriteString(buildTableResult(r))
+		} else {
+			if r.ReturnsSet {
+				sb.WriteString("SETOF ")
+			}
+			sb.WriteString(canonicalTypeName(r.ReturnType.Name))
+		}
 		sb.WriteByte('\n')
 	}
 
@@ -10572,6 +11572,36 @@ func buildFunctionDef(r *catalog.Routine) string {
 	// SECURITY DEFINER
 	if r.SecurityDefiner {
 		sb.WriteString(" SECURITY DEFINER\n")
+	}
+
+	// PARALLEL SAFE / RESTRICTED (UNSAFE is the default, omitted — matches PG's deparser)
+	switch r.Parallel {
+	case "s":
+		sb.WriteString(" PARALLEL SAFE\n")
+	case "r":
+		sb.WriteString(" PARALLEL RESTRICTED\n")
+	}
+
+	// COST — emitted only when non-default, matching pg_get_functiondef
+	// (ruleutils.c): default is 1 for internal/C, 100 otherwise.
+	if r.Cost != "" {
+		defaultCost := "100"
+		switch strings.ToLower(r.Language) {
+		case "internal", "c":
+			defaultCost = "1"
+		}
+		if r.Cost != defaultCost {
+			sb.WriteString(" COST ")
+			sb.WriteString(r.Cost)
+			sb.WriteByte('\n')
+		}
+	}
+
+	// ROWS — set-returning functions only; omitted at the 1000 default.
+	if r.ReturnsSet && r.Rows != "" && r.Rows != "0" && r.Rows != "1000" {
+		sb.WriteString(" ROWS ")
+		sb.WriteString(r.Rows)
+		sb.WriteByte('\n')
 	}
 
 	// Body

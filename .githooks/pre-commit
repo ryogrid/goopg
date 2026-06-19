@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#
+# pre-commit — machine-enforced CI-parity gate for the goopg repo.
+#
+# WHY THIS EXISTS
+#   The Ralph autonomous loop committed once per slice after running only
+#   targeted `go test` for the files it touched. It NEVER ran the pgbench
+#   workload, so the pgbench TPC-B concurrency regression class (spurious
+#   SQLSTATE 40001 / "current transaction is aborted" under contention) sailed
+#   straight past the loop and only surfaced in GitHub-Actions CI. The fix for
+#   that bug landed via a separate manual session, not the loop's own gate —
+#   proof the loop is structurally blind to the pgbench/CI-parity workload.
+#
+#   This hook closes that blind spot: every commit must clear the pgbench smoke
+#   (build → init → the three CI workloads: standard / -N / -S) before it can
+#   land. It runs in "smoke" scope so the cost is ~2-3 min, not the ~10 min full
+#   unit suite (which CI and explicit agent runs still cover).
+#
+# INSTALL: `make install-hooks` (sets core.hooksPath=.githooks). Run once per
+#          clone. The hook is committed so it is reproducible for every checkout.
+#
+# DO NOT bypass with `git commit --no-verify`: that re-opens the exact blind
+# spot this gate exists to close.
+#
+# Escape hatch for environments without the pinned pgbench client (the script
+# errors loudly if pgbench/pg_isready are absent): set GOOPG_SKIP_PRECOMMIT=1
+# to skip — intended only for hosts that genuinely cannot run the smoke (e.g. a
+# docs-only machine), never for the development loop.
+set -euo pipefail
+
+if [ "${GOOPG_SKIP_PRECOMMIT:-0}" = "1" ]; then
+  echo "pre-commit: GOOPG_SKIP_PRECOMMIT=1 — skipping pgbench smoke gate" >&2
+  exit 0
+fi
+
+# Resolve the repo root from the hook location so the gate runs regardless of
+# the subdirectory git invoked the hook from.
+ROOT="$(git rev-parse --show-toplevel)"
+
+echo "pre-commit: running CI-parity pgbench smoke (RALPH_PRECOMMIT_SCOPE=smoke)..."
+RALPH_PRECOMMIT_SCOPE=smoke "$ROOT/scripts/ralph-precommit-test.sh"
+echo "pre-commit: pgbench smoke PASS — commit allowed"

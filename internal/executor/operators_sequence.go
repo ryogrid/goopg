@@ -28,6 +28,7 @@ type seqState struct {
 	increment int64
 	min       int64
 	max       int64
+	cache     int64 // CACHE n (preallocation size); PG default 1
 	cycle     bool
 	called    atomic.Bool // true after first nextval or setval
 	ownedBy   string      // "table.column" set by ALTER SEQUENCE ... OWNED BY
@@ -87,6 +88,7 @@ func RegisterSequence(name string, start, increment, min, max int64, cycle bool)
 		increment: increment,
 		min:       min,
 		max:       max,
+		cache:     1, // PG default; overridden by SetSequenceCache for CACHE n
 		cycle:     cycle,
 		schema:    schema,
 		seqName:   bare,
@@ -107,6 +109,23 @@ func SetSequenceDataType(name, dataType string) {
 	s := v.(*seqState)
 	s.mu.Lock()
 	s.dataType = strings.ToLower(dataType)
+	s.mu.Unlock()
+}
+
+// SetSequenceCache records the declared CACHE size of a sequence (e.g. from
+// CREATE/ALTER SEQUENCE ... CACHE n). Values < 1 are clamped to 1, matching PG's
+// minimum. DU-002 slice 130.
+func SetSequenceCache(name string, cache int64) {
+	v, ok := seqRegistry.Load(seqKey(name))
+	if !ok {
+		return
+	}
+	if cache < 1 {
+		cache = 1
+	}
+	s := v.(*seqState)
+	s.mu.Lock()
+	s.cache = cache
 	s.mu.Unlock()
 }
 
@@ -195,7 +214,10 @@ func RenameSequence(oldName, newName string) bool {
 }
 
 // SequenceRowData returns (lastValue, logCnt, isCalled) for SELECT * FROM seq.
-// lastValue is the last returned value (or start value if not yet called).
+// lastValue is the last returned value when called; when not yet called it is
+// the value the next nextval will return (start for a fresh sequence, or N
+// after setval(N,false) / RESTART WITH N) — i.e. the on-disk last_value pg_dump
+// reads from the sequence relation.
 // logCnt is 32 when called (mirrors PG's write-ahead log cache size), 0 otherwise.
 // Returns ok=false if the sequence does not exist. M0097-0024.
 func SequenceRowData(name string) (lastValue int64, logCnt int64, isCalled bool, ok bool) {
@@ -210,7 +232,16 @@ func SequenceRowData(name string) (lastValue int64, logCnt int64, isCalled bool,
 		lastValue = s.current.Load()
 		logCnt = 32
 	} else {
-		lastValue = s.start
+		// Not-yet-called: last_value is the value the next nextval will
+		// return. The registry stores `current = nextTarget - increment`
+		// (RegisterSequence seeds start-increment; setval(N,false) /
+		// RESTART WITH N seed N-increment), so the on-disk last_value is
+		// `current + increment`. For a fresh sequence this equals start;
+		// after setval('seq', N, false) it equals N — matching what real
+		// pg_dump reads from the sequence relation (`SELECT last_value`).
+		// Returning the bare `start` here silently dropped any non-default
+		// setval(N,false) / RESTART WITH N, corrupting the dumped setval.
+		lastValue = s.current.Load() + s.increment
 		logCnt = 0
 	}
 	s.mu.Unlock()
@@ -311,7 +342,6 @@ func SetSequenceCurrentValue(name string, val int64) bool {
 	v.(*seqState).current.Store(val)
 	return true
 }
-
 
 // evalNextval implements nextval(sequence_name text) → int8.
 // Advances the sequence and returns the new value. Also stores the
@@ -459,7 +489,7 @@ func evalLastval(ctx *Context) (Datum, error) {
 // All pointer fields: nil means "leave unchanged". restart=true resets current
 // to start-increment (honoring newStart if also supplied). restartWith, if not
 // nil, overrides the restart target. M0097-0068.
-func UpdateSequenceParams(name string, increment, minVal, maxVal, startWith, restartWith *int64,
+func UpdateSequenceParams(name string, increment, minVal, maxVal, startWith, restartWith, cache *int64,
 	restart, cycle, noCycle bool) error {
 	s := LookupSequence(name)
 	if s == nil {
@@ -469,6 +499,13 @@ func UpdateSequenceParams(name string, increment, minVal, maxVal, startWith, res
 	defer s.mu.Unlock()
 	if increment != nil {
 		s.increment = *increment
+	}
+	if cache != nil {
+		c := *cache
+		if c < 1 {
+			c = 1
+		}
+		s.cache = c
 	}
 	if minVal != nil {
 		s.min = *minVal
@@ -538,4 +575,54 @@ func AllSequenceInfos() []SeqInfo {
 		return true
 	})
 	return out
+}
+
+// init wires the catalog's pg_sequence (singular) row builder to the executor's
+// sequence registry. The catalog owns OID resolution (seqrelid); the executor
+// owns the per-sequence parameters. M0110-0001 (DU-002 slice 115).
+func init() {
+	catalog.SequenceParamsFunc = sequenceParamsForCatalog
+}
+
+// sequenceParamsForCatalog returns the pg_sequence parameter row for the named
+// sequence, or ok=false if no such sequence is registered. Called by the
+// catalog's pg_sequence VirtualRows for each IsSequence relation.
+func sequenceParamsForCatalog(qualifiedName string) (catalog.SeqParams, bool) {
+	s := LookupSequence(qualifiedName)
+	if s == nil {
+		return catalog.SeqParams{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dt := s.dataType
+	if dt == "" {
+		dt = "bigint"
+	}
+	cache := s.cache
+	if cache < 1 {
+		cache = 1 // PG default; guards sequences registered before cache tracking
+	}
+	return catalog.SeqParams{
+		TypeOID:   seqTypeOID(dt),
+		Start:     s.start,
+		Increment: s.increment,
+		Max:       s.max,
+		Min:       s.min,
+		Cache:     cache,
+		Cycle:     s.cycle,
+		OwnedBy:   s.ownedBy, // "table.column" for OWNED BY sequences; "" otherwise
+	}, true
+}
+
+// seqTypeOID maps a sequence's declared data type to its pg_type OID, which
+// pg_dump renders via format_type(seqtypid, NULL). bigint is the default.
+func seqTypeOID(dataType string) uint32 {
+	switch dataType {
+	case "smallint", "int2":
+		return 21
+	case "integer", "int", "int4":
+		return 23
+	default: // "bigint", "int8"
+		return 20
+	}
 }

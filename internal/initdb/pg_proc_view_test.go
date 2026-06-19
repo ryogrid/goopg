@@ -66,10 +66,11 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 		t.Errorf("pronamespace = %q, want 2200 (public OID)", row[2])
 	}
 	// prolang is now the oid string (matches PG's pg_proc.prolang). plpgsql is
-	// not installed in goopg's pg_language, so it maps to "0" (InvalidOid); the
-	// 3 built-in langs (internal/c/sql) map to 12/13/14. DU-002 slice 42.
-	if row[3] != "0" {
-		t.Errorf("prolang = %q, want 0 (plpgsql not in pg_language)", row[3])
+	// installed in goopg's pg_language at OID 13627, so a plpgsql routine maps to
+	// 13627 (DU-002 slice 163); the 3 built-in langs (internal/c/sql) map to
+	// 12/13/14. DU-002 slice 42.
+	if row[3] != "13627" {
+		t.Errorf("prolang = %q, want 13627 (plpgsql pg_language OID)", row[3])
 	}
 	// prorettype is now the OID string for "int" (int4 = 23).
 	if row[4] != "23" {
@@ -96,6 +97,46 @@ func TestPgProcViewRendersRoutine(t *testing.T) {
 	}
 	if row[0] == "" || row[0] == "0" {
 		t.Errorf("oid = %q, want non-zero text", row[0])
+	}
+}
+
+// TestPgProcViewRecordReturnType pins prorettype for a function declared
+// `RETURNS record` (DU-002 slice 164): the pseudo-type record resolves to OID
+// 2249 (and record[] to 2287). Before this slice typeNameToOIDStr had no record
+// case, so prorettype was 0 and pg_dump's format_type(0) rendered `RETURNS -`.
+func TestPgProcViewRecordReturnType(t *testing.T) {
+	cat := catalog.NewInMemory()
+	if err := registerPgProcView(cat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "ret_rec",
+		ReturnType: catalog.Type{Name: "record"},
+		Language:   "sql",
+		Body:       "SELECT (1, 2)",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cat.Routines().Create(&catalog.Routine{
+		Schema:     "public",
+		Name:       "ret_rec_arr",
+		ReturnType: catalog.Type{Name: "record[]"},
+		Language:   "sql",
+		Body:       "SELECT ARRAY[(1, 2)]",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	rows := tbl.VirtualRows()
+	// prorettype is column index 4.
+	const prorettype = 4
+	userRows := rows[len(builtinProcs):]
+	if userRows[0][1] != "ret_rec" || userRows[0][prorettype] != "2249" {
+		t.Errorf("ret_rec prorettype = %q, want 2249 (record OID)", userRows[0][prorettype])
+	}
+	if userRows[1][1] != "ret_rec_arr" || userRows[1][prorettype] != "2287" {
+		t.Errorf("ret_rec_arr prorettype = %q, want 2287 (_record OID)", userRows[1][prorettype])
 	}
 }
 
@@ -355,9 +396,13 @@ func TestPgProcViewProparallel(t *testing.T) {
 	}
 }
 
-// TestPgProcViewProsupport pins the prosupport column (DU-002 slice 41):
-// always "0" — goopg has no planner support functions, mirroring PG's
-// CREATE FUNCTION default, so dumpFunc emits no `SUPPORT ...` clause.
+// TestPgProcViewProsupport pins the prosupport column (DU-002 slice 41, fixed in
+// slice 148): always "-" (regproc text for InvalidOid) — goopg has no planner
+// support functions. The column is typed regproc (as in PG's pg_proc), so
+// InvalidOid renders as the text "-", NOT "0". pg_dump's dumpFunc emits
+// `SUPPORT <val>` whenever `strcmp(prosupport, "-") != 0`; an `oid`-typed "0"
+// cell made pg_dump emit the invalid `SUPPORT 0` clause (a restore error —
+// SUPPORT wants a function name). "-" suppresses the clause, matching real PG.
 func TestPgProcViewProsupport(t *testing.T) {
 	cat := catalog.NewInMemory()
 	if err := registerPgProcView(cat); err != nil {
@@ -373,12 +418,23 @@ func TestPgProcViewProsupport(t *testing.T) {
 		t.Fatal(err)
 	}
 	tbl, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_proc"})
+	// The prosupport column must be regproc-typed so InvalidOid renders as "-"
+	// (an oid-typed "0" makes pg_dump emit the invalid `SUPPORT 0` clause).
+	var prosupportCol catalog.Column
+	for _, c := range tbl.Columns {
+		if c.Name == "prosupport" {
+			prosupportCol = c
+		}
+	}
+	if prosupportCol.Type.Name != "regproc" {
+		t.Fatalf("prosupport column type = %q, want regproc (oid makes pg_dump emit `SUPPORT 0`)", prosupportCol.Type.Name)
+	}
 	rows := tbl.VirtualRows()
 	// prosupport is the last column (index 22), appended after proparallel (21).
 	const prosupport = 22
 	for i := range rows {
-		if rows[i][prosupport] != "0" {
-			t.Errorf("row %q prosupport = %q, want 0", rows[i][1], rows[i][prosupport])
+		if rows[i][prosupport] != "-" {
+			t.Errorf("row %q prosupport = %q, want - (regproc InvalidOid)", rows[i][1], rows[i][prosupport])
 		}
 	}
 }

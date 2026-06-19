@@ -152,7 +152,13 @@ The target inventory (test counts per suite) is in
 
 ## Execution Guidelines
 - Before making changes: search codebase using subagents
-- After implementation: run ESSENTIAL tests for the modified code only
+- After implementation: run ESSENTIAL tests for the modified code only —
+  **but this never excuses skipping the CI-parity pgbench smoke.** Concurrency /
+  CI-parity bugs are cross-cutting and unrelated to whichever slice you touched
+  (a pg_dump catalog change cannot "obviously not" break pgbench TPC-B). The
+  pgbench smoke is therefore mandatory on **every commit regardless of which
+  files changed**, and is now machine-enforced by `.githooks/pre-commit`
+  (run `make install-hooks` once). Never `git commit --no-verify`.
 - If tests fail: fix them as part of your current work
 - Keep .ralph/AGENT.md updated with build/run instructions
 - Document the WHY behind tests and implementations

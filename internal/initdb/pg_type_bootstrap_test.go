@@ -82,6 +82,89 @@ func TestPgTypeRowCanonicalTypalignByte(t *testing.T) {
 	}
 }
 
+// TestPgTypeRowCanonicalTypcollation pins pg_type.typcollation (FormData
+// offset 144) for every bootstrapped row. The value MUST agree with the
+// attcollation that the runtime virtual pg_attribute path reports for the same
+// type (executor.userTypeAttrsForOID): pg_dump's getTableAttrs emits a column
+// COLLATE clause precisely when `a.attcollation <> t.typcollation`. When the
+// heap hardcoded typcollation=0 while pg_attribute reported 100, pg_dump — once
+// pg_collation was populated (DU-002 slice 187) — spuriously emitted
+// `COLLATE pg_catalog."default"` on every collatable column. This pins the
+// PG-canonical values that close that divergence. DU-002 slice 188.
+func TestPgTypeRowCanonicalTypcollation(t *testing.T) {
+	cols := pgTypeColDefs()
+	// want[oid] = canonical typcollation; absent OIDs must be 0 (non-collatable).
+	want := map[uint32]uint32{
+		19:   950, // name    -> C
+		25:   100, // text    -> default
+		1042: 100, // bpchar  -> default
+		1043: 100, // varchar -> default
+		1009: 100, // _text   -> default (array inherits element collation)
+	}
+	for _, e := range pgTypeInitialEntries() {
+		row := pgTypeRow(e)
+		payload, err := executor.EncodeRowPG(cols, row)
+		if err != nil {
+			t.Fatalf("oid=%d (%s): encode: %v", e.OID, e.Name, err)
+		}
+		if len(payload) < 148 {
+			t.Errorf("oid=%d (%s): fixed part %d bytes < 148", e.OID, e.Name, len(payload))
+			continue
+		}
+		got := uint32(payload[144]) | uint32(payload[145])<<8 |
+			uint32(payload[146])<<16 | uint32(payload[147])<<24
+		if got != want[e.OID] { // want[oid] is 0 for any OID not in the map
+			t.Errorf("oid=%d (%s): typcollation at offset 144: want %d, got %d",
+				e.OID, e.Name, want[e.OID], got)
+		}
+	}
+}
+
+// TestPgTypeArrayCollationMatchesElement pins pg_type.typcollation for the
+// ARRAY types of the collatable scalars. A PG array inherits its element's
+// typcollation, and the runtime virtual pg_attribute path (executor.
+// userTypeAttrsForOID) already reports the inherited collation for an array
+// column — so the bootstrapped heap MUST report the same value or pg_dump's
+// getTableAttrs (`a.attcollation <> t.typcollation`) emits a spurious COLLATE
+// clause on every `varchar[]`/`bpchar[]`/`name[]` column. This is the array
+// analog of the slice-188 scalar fix; the three array OIDs were left at 0 and
+// only surfaced once a column of the array type was dumped. DU-002 slice 189.
+func TestPgTypeArrayCollationMatchesElement(t *testing.T) {
+	cols := pgTypeColDefs()
+	// want[oid] = canonical typcollation (inherited from the element type).
+	want := map[uint32]uint32{
+		1003: 950, // _name    -> element name is 'C'
+		1014: 100, // _bpchar  -> element bpchar is 'default'
+		1015: 100, // _varchar -> element varchar is 'default'
+	}
+	seen := map[uint32]bool{}
+	for _, e := range pgTypeAllEntries() {
+		exp, ok := want[e.OID]
+		if !ok {
+			continue
+		}
+		seen[e.OID] = true
+		row := pgTypeRow(e)
+		payload, err := executor.EncodeRowPG(cols, row)
+		if err != nil {
+			t.Fatalf("oid=%d (%s): encode: %v", e.OID, e.Name, err)
+		}
+		if len(payload) < 148 {
+			t.Fatalf("oid=%d (%s): fixed part %d bytes < 148", e.OID, e.Name, len(payload))
+		}
+		got := uint32(payload[144]) | uint32(payload[145])<<8 |
+			uint32(payload[146])<<16 | uint32(payload[147])<<24
+		if got != exp {
+			t.Errorf("oid=%d (%s): typcollation: want %d, got %d", e.OID, e.Name, exp, got)
+		}
+	}
+	for oid := range want {
+		if !seen[oid] {
+			t.Errorf("array type oid=%d not present in pgTypeAllEntries(); test cannot guard it", oid)
+		}
+	}
+}
+
 // TestPgTypeRowEmbedsCanonicalIORegprocOIDs pins the I/O regproc OIDs
 // emitted in every bootstrapped pg_type row. The int4 case in
 // particular is load-bearing: an int4 row with typoutput=0 makes PG18's
@@ -92,14 +175,14 @@ func TestPgTypeRowCanonicalTypalignByte(t *testing.T) {
 func TestPgTypeRowEmbedsCanonicalIORegprocOIDs(t *testing.T) {
 	cols := pgTypeColDefs()
 	cases := []struct {
-		oid                                      uint32
-		wantIn, wantOut, wantRecv, wantSend      uint32
+		oid                                 uint32
+		wantIn, wantOut, wantRecv, wantSend uint32
 	}{
-		{23, 42, 43, 2406, 2407},   // int4
+		{23, 42, 43, 2406, 2407},     // int4
 		{16, 1242, 1243, 2436, 2437}, // bool
-		{25, 46, 47, 2414, 2415},   // text
+		{25, 46, 47, 2414, 2415},     // text
 		{26, 1798, 1799, 2418, 2419}, // oid
-		{19, 34, 35, 2422, 2423},   // name
+		{19, 34, 35, 2422, 2423},     // name
 	}
 	for _, tc := range cases {
 		e, ok := pgTypeCanonical(tc.oid)

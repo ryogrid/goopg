@@ -54,6 +54,49 @@ func TestParseCreateTableConstraints(t *testing.T) {
 	}
 }
 
+// TestParseCreateTableToastNamespacedReloption covers the namespace-qualified
+// storage parameter form `toast.<option>` (PG's reloption_elem: ColLabel '.'
+// ColLabel '=' def_arg). parseWithOptions must combine the two dotted labels
+// into one map key so the executor can route the option to the TOAST relation.
+// A plain (unqualified) option in the same list keeps its bare key. DU-002 slice 224.
+func TestParseCreateTableToastNamespacedReloption(t *testing.T) {
+	stmts, err := Parse("CREATE TABLE t (id int) WITH (fillfactor = 70, toast.autovacuum_enabled = false)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if ct.With["toast.autovacuum_enabled"] != "false" {
+		t.Errorf("toast.autovacuum_enabled = %q, want %q (with=%+v)", ct.With["toast.autovacuum_enabled"], "false", ct.With)
+	}
+	if ct.With["fillfactor"] != "70" {
+		t.Errorf("fillfactor = %q, want %q (with=%+v)", ct.With["fillfactor"], "70", ct.With)
+	}
+	// The bare second label must NOT also leak in as its own key.
+	if _, ok := ct.With["autovacuum_enabled"]; ok {
+		t.Errorf("unexpected bare key autovacuum_enabled in with=%+v", ct.With)
+	}
+}
+
+// TestParseCreateTableSignedReloption covers signed-integer storage parameter
+// values (PG's def_arg = NumericOnly permits an optional leading '+'/'-'), e.g.
+// `toast.log_autovacuum_min_duration=-1` whose valid floor is -1. The leading
+// sign must be preserved in the stored raw value text so the executor can
+// bounds-check it. A '+' sign is accepted but normalized away (kept as the bare
+// number). DU-002 slice 236.
+func TestParseCreateTableSignedReloption(t *testing.T) {
+	stmts, err := Parse("CREATE TABLE t (id int) WITH (toast.log_autovacuum_min_duration = -1, autovacuum_vacuum_cost_delay = +5)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if ct.With["toast.log_autovacuum_min_duration"] != "-1" {
+		t.Errorf("toast.log_autovacuum_min_duration = %q, want %q (with=%+v)", ct.With["toast.log_autovacuum_min_duration"], "-1", ct.With)
+	}
+	if ct.With["autovacuum_vacuum_cost_delay"] != "5" {
+		t.Errorf("autovacuum_vacuum_cost_delay = %q, want %q (with=%+v)", ct.With["autovacuum_vacuum_cost_delay"], "5", ct.With)
+	}
+}
+
 func TestParseCreateTableBareCharDefaultsToCharacterOne(t *testing.T) {
 	stmts, err := Parse(`CREATE TABLE t (a char, b "char")`)
 	if err != nil {
@@ -110,6 +153,543 @@ func TestParseCreateIndex(t *testing.T) {
 		}
 		if len(ci.Columns) != len(c.cols) {
 			t.Errorf("Parse(%q): cols=%v want %v", c.in, ci.Columns, c.cols)
+		}
+	}
+}
+
+// TestParseCreateIndexColOrders pins the per-column ASC/DESC + NULLS FIRST/LAST
+// capture (DU-002 slice 56). goopg previously parsed and discarded these
+// modifiers, so a DESC index lost its ordering on dump. NullsFirst defaults to
+// the descending flag (NULLS FIRST is the btree default for DESC) unless an
+// explicit NULLS clause overrides it. Also guards that `NULLS` is not mis-read
+// as an opclass name in `(col NULLS FIRST)`.
+func TestParseCreateIndexColOrders(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []IndexColOrder
+	}{
+		{"CREATE INDEX i ON t (a)", []IndexColOrder{{false, false}}},
+		{"CREATE INDEX i ON t (a DESC)", []IndexColOrder{{true, true}}},
+		{"CREATE INDEX i ON t (a ASC)", []IndexColOrder{{false, false}}},
+		{"CREATE INDEX i ON t (a DESC NULLS LAST)", []IndexColOrder{{true, false}}},
+		{"CREATE INDEX i ON t (a NULLS FIRST)", []IndexColOrder{{false, true}}},
+		{"CREATE INDEX i ON t (a DESC, b NULLS FIRST)", []IndexColOrder{{true, true}, {false, true}}},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ci := stmts[0].(*CreateIndexStmt)
+		if len(ci.ColOrders) != len(c.want) {
+			t.Fatalf("Parse(%q): ColOrders=%+v want %+v", c.in, ci.ColOrders, c.want)
+		}
+		for i, w := range c.want {
+			if ci.ColOrders[i] != w {
+				t.Errorf("Parse(%q): ColOrders[%d]=%+v want %+v", c.in, i, ci.ColOrders[i], w)
+			}
+		}
+	}
+}
+
+// TestParseCreateIndexNullsNotDistinct pins the PostgreSQL 15+ NULLS [NOT]
+// DISTINCT capture (DU-002 slice 134). goopg previously parsed and discarded the
+// clause, so a NULLS NOT DISTINCT unique index dumped as a plain one — a silent
+// loss of the NULL-deduplication semantics. The bare/default `NULLS DISTINCT`
+// (and an omitted clause) must leave the flag false; only `NULLS NOT DISTINCT`
+// sets it. The clause may appear before or after WHERE/WITH in practice; here we
+// pin the canonical position (after the column list) plus the WHERE combination.
+func TestParseCreateIndexNullsNotDistinct(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"CREATE UNIQUE INDEX i ON t (a)", false},
+		{"CREATE UNIQUE INDEX i ON t (a) NULLS DISTINCT", false},
+		{"CREATE UNIQUE INDEX i ON t (a) NULLS NOT DISTINCT", true},
+		{"CREATE UNIQUE INDEX i ON t (a) NULLS NOT DISTINCT WHERE a > 0", true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ci := stmts[0].(*CreateIndexStmt)
+		if ci.NullsNotDistinct != c.want {
+			t.Errorf("Parse(%q): NullsNotDistinct=%v want %v", c.in, ci.NullsNotDistinct, c.want)
+		}
+	}
+}
+
+// TestParseTableUniqueNullsNotDistinct pins the PostgreSQL 15+ NULLS [NOT]
+// DISTINCT capture on a TABLE-level UNIQUE constraint (DU-002 slice 135). For a
+// constraint the clause precedes the column list (`UNIQUE NULLS NOT DISTINCT
+// (cols)`, ruleutils.c pg_get_constraintdef order), unlike CREATE INDEX where it
+// trails. The flag rides parallel to TableUniques so the backing index records
+// it and pg_get_constraintdef re-emits it. Only `NULLS NOT DISTINCT` sets it;
+// the bare/default `NULLS DISTINCT` and an omitted clause leave it false.
+func TestParseTableUniqueNullsNotDistinct(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"CREATE TABLE t (a int, b int, UNIQUE (a))", false},
+		{"CREATE TABLE t (a int, b int, UNIQUE NULLS DISTINCT (a))", false},
+		{"CREATE TABLE t (a int, b int, UNIQUE NULLS NOT DISTINCT (a))", true},
+		{"CREATE TABLE t (a int, b int, UNIQUE NULLS NOT DISTINCT (a) INCLUDE (b))", true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.TableUniques) != 1 {
+			t.Fatalf("Parse(%q): expected 1 table UNIQUE, got %d", c.in, len(ct.TableUniques))
+		}
+		if len(ct.TableUniqueNullsNotDistinct) != 1 {
+			t.Fatalf("Parse(%q): TableUniqueNullsNotDistinct len=%d want 1", c.in, len(ct.TableUniqueNullsNotDistinct))
+		}
+		if ct.TableUniqueNullsNotDistinct[0] != c.want {
+			t.Errorf("Parse(%q): NullsNotDistinct=%v want %v", c.in, ct.TableUniqueNullsNotDistinct[0], c.want)
+		}
+	}
+}
+
+// TestParseTableUniqueDeferrable pins the DEFERRABLE [INITIALLY DEFERRED |
+// INITIALLY IMMEDIATE] capture on a TABLE-level UNIQUE constraint (DU-002
+// slice 139). The clause trails the column list (and any INCLUDE list); it was
+// previously a hard parse error for the anonymous UNIQUE form (no DEFERRABLE
+// branch existed, unlike PRIMARY KEY which silently discarded it). The two flags
+// ride parallel to TableUniques so the backing index records them and
+// pg_get_constraintdef / pg_constraint re-emit the clause. INITIALLY DEFERRED
+// implies DEFERRABLE; INITIALLY IMMEDIATE is the default and leaves both false.
+func TestParseTableUniqueDeferrable(t *testing.T) {
+	cases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, UNIQUE (a))", false, false},
+		{"CREATE TABLE t (a int, UNIQUE (a) NOT DEFERRABLE)", false, false},
+		{"CREATE TABLE t (a int, UNIQUE (a) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, UNIQUE (a) DEFERRABLE INITIALLY IMMEDIATE)", true, false},
+		{"CREATE TABLE t (a int, UNIQUE (a) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, UNIQUE (a) INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, b int, UNIQUE (a) INCLUDE (b) DEFERRABLE INITIALLY DEFERRED)", true, true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.TableUniques) != 1 {
+			t.Fatalf("Parse(%q): expected 1 table UNIQUE, got %d", c.in, len(ct.TableUniques))
+		}
+		if len(ct.TableUniqueDeferrable) != 1 || len(ct.TableUniqueInitiallyDeferred) != 1 {
+			t.Fatalf("Parse(%q): deferrable flag arrays len=%d/%d want 1/1", c.in,
+				len(ct.TableUniqueDeferrable), len(ct.TableUniqueInitiallyDeferred))
+		}
+		if ct.TableUniqueDeferrable[0] != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, ct.TableUniqueDeferrable[0], c.wantDefer)
+		}
+		if ct.TableUniqueInitiallyDeferred[0] != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, ct.TableUniqueInitiallyDeferred[0], c.wantDeferred)
+		}
+	}
+}
+
+// TestParseColumnUniqueNullsNotDistinct pins the PostgreSQL 15+ NULLS [NOT]
+// DISTINCT capture on an INLINE column UNIQUE constraint (DU-002 slice 136).
+// `a int UNIQUE NULLS NOT DISTINCT` rides on ColumnDef.UniqueNullsNotDistinct so
+// the backing index records it and pg_get_constraintdef re-emits
+// `UNIQUE NULLS NOT DISTINCT (a)`. Only `NULLS NOT DISTINCT` sets it; the
+// bare/default `NULLS DISTINCT` and an omitted clause leave it false.
+func TestParseColumnUniqueNullsNotDistinct(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"CREATE TABLE t (a int UNIQUE)", false},
+		{"CREATE TABLE t (a int UNIQUE NULLS DISTINCT)", false},
+		{"CREATE TABLE t (a int UNIQUE NULLS NOT DISTINCT)", true},
+		{"CREATE TABLE t (a int UNIQUE NULLS NOT DISTINCT, b text)", true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		col := ct.Columns[0]
+		if !col.Unique {
+			t.Fatalf("Parse(%q): column a Unique=false, want true", c.in)
+		}
+		if col.UniqueNullsNotDistinct != c.want {
+			t.Errorf("Parse(%q): UniqueNullsNotDistinct=%v want %v", c.in, col.UniqueNullsNotDistinct, c.want)
+		}
+	}
+}
+
+// TestParseColumnNamedUniqueNullsNotDistinct pins the inline NAMED column UNIQUE
+// form (`a int CONSTRAINT myname UNIQUE [NULLS NOT DISTINCT]`) — DU-002 slice
+// 137. Before this slice the `CONSTRAINT name UNIQUE` column case absorbed the
+// keyword WITHOUT setting col.Unique, so no backing index was created (silent
+// loss). Now col.Unique is set, the explicit name rides on
+// ColumnDef.UniqueConstraintName, and the optional PG15+ NULLS NOT DISTINCT
+// clause is captured.
+func TestParseColumnNamedUniqueNullsNotDistinct(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		wantNND  bool
+	}{
+		{"CREATE TABLE t (a int CONSTRAINT myname UNIQUE)", "myname", false},
+		{"CREATE TABLE t (a int CONSTRAINT myname UNIQUE NULLS DISTINCT)", "myname", false},
+		{"CREATE TABLE t (a int CONSTRAINT myname UNIQUE NULLS NOT DISTINCT)", "myname", true},
+		{"CREATE TABLE t (a int CONSTRAINT u_a UNIQUE NULLS NOT DISTINCT, b text)", "u_a", true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		col := ct.Columns[0]
+		if !col.Unique {
+			t.Fatalf("Parse(%q): column a Unique=false, want true", c.in)
+		}
+		if col.UniqueConstraintName != c.wantName {
+			t.Errorf("Parse(%q): UniqueConstraintName=%q want %q", c.in, col.UniqueConstraintName, c.wantName)
+		}
+		if col.UniqueNullsNotDistinct != c.wantNND {
+			t.Errorf("Parse(%q): UniqueNullsNotDistinct=%v want %v", c.in, col.UniqueNullsNotDistinct, c.wantNND)
+		}
+	}
+}
+
+// TestParseTableNamedUniqueNullsNotDistinct pins the NAMED table-level UNIQUE
+// form (`CONSTRAINT name UNIQUE [NULLS NOT DISTINCT] (cols)`) — DU-002 slice
+// 138. Before this slice the named table-level UNIQUE case did NOT parse the
+// optional PG15+ NULLS [NOT] DISTINCT clause that precedes the column list, so
+// the `(` lookahead failed and the whole named constraint was silently dropped
+// from the table. Now the flag is captured on TableConstraintDef.NullsNotDistinct
+// (parallel to the anonymous form's TableUniqueNullsNotDistinct).
+func TestParseTableNamedUniqueNullsNotDistinct(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		wantNND  bool
+	}{
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a))", "u_a", false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE NULLS DISTINCT (a))", "u_a", false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE NULLS NOT DISTINCT (a))", "u_a", true},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE NULLS NOT DISTINCT (a) INCLUDE (b))", "u_a", true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.NamedConstraints) != 1 {
+			t.Fatalf("Parse(%q): expected 1 NamedConstraint, got %d", c.in, len(ct.NamedConstraints))
+		}
+		nc := ct.NamedConstraints[0]
+		if nc.Name != c.wantName {
+			t.Errorf("Parse(%q): Name=%q want %q", c.in, nc.Name, c.wantName)
+		}
+		if nc.IsPrimary || nc.IsExclusion {
+			t.Errorf("Parse(%q): expected plain UNIQUE, got IsPrimary=%v IsExclusion=%v", c.in, nc.IsPrimary, nc.IsExclusion)
+		}
+		if len(nc.Columns) != 1 || nc.Columns[0] != "a" {
+			t.Errorf("Parse(%q): Columns=%v want [a]", c.in, nc.Columns)
+		}
+		if nc.NullsNotDistinct != c.wantNND {
+			t.Errorf("Parse(%q): NullsNotDistinct=%v want %v", c.in, nc.NullsNotDistinct, c.wantNND)
+		}
+	}
+}
+
+// TestParseTableNamedUniqueDeferrable pins the DEFERRABLE [INITIALLY DEFERRED |
+// INITIALLY IMMEDIATE] capture on a NAMED table-level UNIQUE constraint
+// (`CONSTRAINT name UNIQUE (cols) DEFERRABLE …`) — DU-002 slice 140. The clause
+// trails the column list (and any INCLUDE list); before this slice the named
+// UNIQUE case parsed NO trailing DEFERRABLE, so the keyword was a HARD PARSE
+// ERROR (trailing tokens after the column list). The two flags ride on
+// TableConstraintDef.Deferrable / InitiallyDeferred so the backing index records
+// them and pg_get_constraintdef / pg_constraint re-emit the clause. INITIALLY
+// DEFERRED implies DEFERRABLE; INITIALLY IMMEDIATE is the default (both false).
+func TestParseTableNamedUniqueDeferrable(t *testing.T) {
+	cases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a))", false, false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) NOT DEFERRABLE)", false, false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) DEFERRABLE INITIALLY IMMEDIATE)", true, false},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, b int, CONSTRAINT u_a UNIQUE (a) INCLUDE (b) DEFERRABLE INITIALLY DEFERRED)", true, true},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.NamedConstraints) != 1 {
+			t.Fatalf("Parse(%q): expected 1 NamedConstraint, got %d", c.in, len(ct.NamedConstraints))
+		}
+		nc := ct.NamedConstraints[0]
+		if nc.Name != "u_a" {
+			t.Errorf("Parse(%q): Name=%q want u_a", c.in, nc.Name)
+		}
+		if nc.IsPrimary || nc.IsExclusion {
+			t.Errorf("Parse(%q): expected plain UNIQUE, got IsPrimary=%v IsExclusion=%v", c.in, nc.IsPrimary, nc.IsExclusion)
+		}
+		if nc.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, nc.Deferrable, c.wantDefer)
+		}
+		if nc.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, nc.InitiallyDeferred, c.wantDeferred)
+		}
+	}
+}
+
+// TestParseColumnUniqueDeferrable pins the DEFERRABLE [INITIALLY DEFERRED |
+// INITIALLY IMMEDIATE] capture on an INLINE column UNIQUE constraint
+// (`a int UNIQUE DEFERRABLE …`, plus the named `CONSTRAINT n UNIQUE DEFERRABLE`
+// form) — DU-002 slice 141. Before this slice the inline column UNIQUE case
+// parsed only the optional NULLS [NOT] DISTINCT clause; a trailing DEFERRABLE
+// fell through to the default arm of the column-constraint loop and became a
+// HARD PARSE ERROR for the whole CREATE TABLE. The two flags ride on
+// ColumnDef.UniqueDeferrable / UniqueInitiallyDeferred so the backing index
+// records them and pg_get_constraintdef / pg_constraint re-emit the clause.
+// INITIALLY DEFERRED implies DEFERRABLE; INITIALLY IMMEDIATE is the default.
+func TestParseColumnUniqueDeferrable(t *testing.T) {
+	cases := []struct {
+		in           string
+		wantName     string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int UNIQUE)", "", false, false},
+		{"CREATE TABLE t (a int UNIQUE NOT DEFERRABLE)", "", false, false},
+		{"CREATE TABLE t (a int UNIQUE DEFERRABLE)", "", true, false},
+		{"CREATE TABLE t (a int UNIQUE DEFERRABLE INITIALLY IMMEDIATE)", "", true, false},
+		{"CREATE TABLE t (a int UNIQUE DEFERRABLE INITIALLY DEFERRED)", "", true, true},
+		{"CREATE TABLE t (a int UNIQUE INITIALLY DEFERRED)", "", true, true},
+		// Composes with NULLS NOT DISTINCT and with a following column.
+		{"CREATE TABLE t (a int UNIQUE NULLS NOT DISTINCT DEFERRABLE INITIALLY DEFERRED, b text)", "", true, true},
+		// Named inline column UNIQUE.
+		{"CREATE TABLE t (a int CONSTRAINT u_a UNIQUE DEFERRABLE INITIALLY DEFERRED)", "u_a", true, true},
+		{"CREATE TABLE t (a int CONSTRAINT u_a UNIQUE DEFERRABLE)", "u_a", true, false},
+		{"CREATE TABLE t (a int CONSTRAINT u_a UNIQUE NOT DEFERRABLE)", "u_a", false, false},
+		// DEFERRABLE composes with a following NOT NULL constraint on the column.
+		{"CREATE TABLE t (a int UNIQUE DEFERRABLE NOT NULL)", "", true, false},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		col := ct.Columns[0]
+		if !col.Unique {
+			t.Fatalf("Parse(%q): column a Unique=false, want true", c.in)
+		}
+		if col.UniqueConstraintName != c.wantName {
+			t.Errorf("Parse(%q): UniqueConstraintName=%q want %q", c.in, col.UniqueConstraintName, c.wantName)
+		}
+		if col.UniqueDeferrable != c.wantDefer {
+			t.Errorf("Parse(%q): UniqueDeferrable=%v want %v", c.in, col.UniqueDeferrable, c.wantDefer)
+		}
+		if col.UniqueInitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): UniqueInitiallyDeferred=%v want %v", c.in, col.UniqueInitiallyDeferred, c.wantDeferred)
+		}
+	}
+}
+
+// TestParsePrimaryKeyDeferrable pins DU-002 slice 142: a `[NOT] DEFERRABLE
+// [INITIALLY DEFERRED|IMMEDIATE]` trailer on all three PRIMARY KEY forms
+// (anonymous table-level, named table-level, inline column — both anonymous and
+// named) is captured rather than discarded so pg_dump round-trips the clause.
+func TestParsePrimaryKeyDeferrable(t *testing.T) {
+	// Inline-column forms — flags land on ColumnDef.PrimaryDeferrable.
+	inlineCases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int PRIMARY KEY)", false, false},
+		{"CREATE TABLE t (a int PRIMARY KEY NOT DEFERRABLE)", false, false},
+		{"CREATE TABLE t (a int PRIMARY KEY DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int PRIMARY KEY DEFERRABLE INITIALLY IMMEDIATE)", true, false},
+		{"CREATE TABLE t (a int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int PRIMARY KEY INITIALLY DEFERRED)", true, true},
+		// Composes with a following column.
+		{"CREATE TABLE t (a int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED, b text)", true, true},
+		// Named inline column PRIMARY KEY.
+		{"CREATE TABLE t (a int CONSTRAINT pk_a PRIMARY KEY DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int CONSTRAINT pk_a PRIMARY KEY NOT DEFERRABLE)", false, false},
+	}
+	for _, c := range inlineCases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		col := stmts[0].(*CreateTableStmt).Columns[0]
+		if !col.Primary {
+			t.Fatalf("Parse(%q): column a Primary=false, want true", c.in)
+		}
+		if col.PrimaryDeferrable != c.wantDefer {
+			t.Errorf("Parse(%q): PrimaryDeferrable=%v want %v", c.in, col.PrimaryDeferrable, c.wantDefer)
+		}
+		if col.PrimaryInitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): PrimaryInitiallyDeferred=%v want %v", c.in, col.PrimaryInitiallyDeferred, c.wantDeferred)
+		}
+	}
+
+	// Anonymous table-level — flags land on CreateTableStmt.PrimaryKeyDeferrable.
+	tableCases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, PRIMARY KEY (a))", false, false},
+		{"CREATE TABLE t (a int, PRIMARY KEY (a) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, PRIMARY KEY (a) INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, PRIMARY KEY (a) NOT DEFERRABLE)", false, false},
+	}
+	for _, c := range tableCases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.PrimaryKey) != 1 {
+			t.Fatalf("Parse(%q): PrimaryKey=%v, want 1 column", c.in, ct.PrimaryKey)
+		}
+		if ct.PrimaryKeyDeferrable != c.wantDefer {
+			t.Errorf("Parse(%q): PrimaryKeyDeferrable=%v want %v", c.in, ct.PrimaryKeyDeferrable, c.wantDefer)
+		}
+		if ct.PrimaryKeyInitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): PrimaryKeyInitiallyDeferred=%v want %v", c.in, ct.PrimaryKeyInitiallyDeferred, c.wantDeferred)
+		}
+	}
+
+	// Named table-level — flags land on the matching NamedConstraints entry.
+	namedCases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, CONSTRAINT pk PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, CONSTRAINT pk PRIMARY KEY (a) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, CONSTRAINT pk PRIMARY KEY (a) NOT DEFERRABLE)", false, false},
+	}
+	for _, c := range namedCases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		var found *TableConstraintDef
+		for i := range ct.NamedConstraints {
+			if ct.NamedConstraints[i].IsPrimary {
+				found = &ct.NamedConstraints[i]
+				break
+			}
+		}
+		if found == nil {
+			t.Fatalf("Parse(%q): no primary-key NamedConstraint", c.in)
+		}
+		if found.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, found.Deferrable, c.wantDefer)
+		}
+		if found.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, found.InitiallyDeferred, c.wantDeferred)
+		}
+	}
+}
+
+// TestParseExcludeDeferrable: the EXCLUDE-constraint sibling of the
+// UNIQUE/PRIMARY KEY DEFERRABLE slices. A `[NOT] DEFERRABLE [INITIALLY
+// DEFERRED|IMMEDIATE]` trailer after an EXCLUDE constraint body must be captured
+// (it was previously discarded — the parser stopped at the close-paren). Flags
+// land on TableExclusions[0] (anonymous) or the matching NamedConstraints entry
+// (named). DU-002 slice 143.
+func TestParseExcludeDeferrable(t *testing.T) {
+	// Anonymous table-level — flags land on TableExclusions[0].
+	anonCases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =))", false, false},
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =) INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =) NOT DEFERRABLE)", false, false},
+		{"CREATE TABLE t (a int, EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY IMMEDIATE)", true, false},
+	}
+	for _, c := range anonCases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		if len(ct.TableExclusions) != 1 {
+			t.Fatalf("Parse(%q): TableExclusions=%d, want 1", c.in, len(ct.TableExclusions))
+		}
+		ex := ct.TableExclusions[0]
+		if ex.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, ex.Deferrable, c.wantDefer)
+		}
+		if ex.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, ex.InitiallyDeferred, c.wantDeferred)
+		}
+	}
+
+	// Named — flags land on the matching exclusion NamedConstraints entry.
+	namedCases := []struct {
+		in           string
+		wantDefer    bool
+		wantDeferred bool
+	}{
+		{"CREATE TABLE t (a int, CONSTRAINT ex EXCLUDE USING btree (a WITH =) DEFERRABLE INITIALLY DEFERRED)", true, true},
+		{"CREATE TABLE t (a int, CONSTRAINT ex EXCLUDE USING btree (a WITH =) DEFERRABLE)", true, false},
+		{"CREATE TABLE t (a int, CONSTRAINT ex EXCLUDE USING btree (a WITH =) NOT DEFERRABLE)", false, false},
+	}
+	for _, c := range namedCases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ct := stmts[0].(*CreateTableStmt)
+		var found *TableConstraintDef
+		for i := range ct.NamedConstraints {
+			if ct.NamedConstraints[i].IsExclusion {
+				found = &ct.NamedConstraints[i]
+				break
+			}
+		}
+		if found == nil {
+			t.Fatalf("Parse(%q): no exclusion NamedConstraint", c.in)
+		}
+		if found.Name != "ex" {
+			t.Errorf("Parse(%q): Name=%q want %q", c.in, found.Name, "ex")
+		}
+		if found.Deferrable != c.wantDefer {
+			t.Errorf("Parse(%q): Deferrable=%v want %v", c.in, found.Deferrable, c.wantDefer)
+		}
+		if found.InitiallyDeferred != c.wantDeferred {
+			t.Errorf("Parse(%q): InitiallyDeferred=%v want %v", c.in, found.InitiallyDeferred, c.wantDeferred)
 		}
 	}
 }
@@ -295,5 +875,36 @@ func TestParseColumnDefCompression(t *testing.T) {
 	}
 	if !ct.Columns[1].NotNull {
 		t.Errorf("col[1].NotNull=false, want true")
+	}
+}
+
+// TestParseColumnDefCollation verifies that an inline `COLLATE <name>` clause is
+// captured onto ColumnDef.Collation (bare trailing component, unquoted) so the
+// column round-trips through pg_dump. Covers the quoted form (`"C"`), the
+// schema-qualified form (`pg_catalog."POSIX"` → "POSIX"), an unquoted name, a
+// COLLATE that precedes another column constraint (NOT NULL), and confirms a
+// column with no COLLATE leaves the field empty. DU-002 slice 188.
+func TestParseColumnDefCollation(t *testing.T) {
+	sql := `CREATE TABLE t (a text COLLATE "C", b text COLLATE pg_catalog."POSIX" NOT NULL, c text COLLATE ucs_basic, d text)`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected *CreateTableStmt, got %T", stmts[0])
+	}
+	if len(ct.Columns) != 4 {
+		t.Fatalf("expected 4 columns, got %d", len(ct.Columns))
+	}
+	want := []string{"C", "POSIX", "ucs_basic", ""}
+	for i, w := range want {
+		if got := ct.Columns[i].Collation; got != w {
+			t.Errorf("col[%d] (%s) Collation=%q, want %q", i, ct.Columns[i].Name, got, w)
+		}
+	}
+	// The COLLATE before NOT NULL must not swallow the constraint.
+	if !ct.Columns[1].NotNull {
+		t.Errorf("col[1].NotNull=false, want true (COLLATE consumed the NOT NULL)")
 	}
 }

@@ -43,7 +43,7 @@ PSQL_USER     ?= postgres
 # Wrap shell invocations with the in-tree PostgreSQL paths.
 ENV_PREFIX = PATH="$(PG_BIN_DIR):$$PATH" LD_LIBRARY_PATH="$(PG_LIB_DIR):$$LD_LIBRARY_PATH"
 
-.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard
+.PHONY: help build init start goopg-test-server stop restart psql status clean clean-data print-env install-hooks ralph-state-check ralph-state-repair ralph-state-guard ralph-metrics bench-build bench-build-optimized pgo-profile pgbench-compare pgbench-compare-matrix pgbench-compare-report plan-snapshot-build plan-snapshot-capture plan-diff plan-gate runtimeshim-matrix race-gate parity-dashboard
 
 help:
 	@echo "goopg lifecycle targets:"
@@ -58,6 +58,7 @@ help:
 	@echo "  make clean-data      Remove DATA_DIR (after stopping)."
 	@echo "  make clean           Remove DATA_DIR and the goopg binary."
 	@echo "  make print-env       Print the PATH/LD_LIBRARY_PATH this Makefile uses."
+	@echo "  make install-hooks   Enable the committed git hooks (.githooks): pgbench CI-parity pre-commit gate."
 	@echo "  make ralph-state-check  Validate .ralph/status.json and .ralph/progress.json consistency."
 	@echo "  make ralph-state-repair Attempt safe auto-repair for .ralph/status.json and .ralph/progress.json."
 	@echo "  make ralph-state-guard  Check Ralph state, auto-repair if needed, then verify again."
@@ -161,6 +162,16 @@ clean: clean-data
 print-env:
 	@echo "PATH=$(PG_BIN_DIR):\$$PATH"
 	@echo "LD_LIBRARY_PATH=$(PG_LIB_DIR):\$$LD_LIBRARY_PATH"
+
+# install-hooks: point git at the committed .githooks directory so the
+# pre-commit gate (CI-parity pgbench smoke) runs on every commit. Run once per
+# clone — core.hooksPath is local git config, not tracked, so the committed
+# hook + this target make enforcement reproducible without per-dev setup drift.
+# Idempotent.
+install-hooks:
+	git config core.hooksPath .githooks
+	chmod +x .githooks/pre-commit
+	@echo "install-hooks: core.hooksPath -> $$(git config --get core.hooksPath); pre-commit gate active"
 
 ralph-state-check:
 	go run ./cmd/validate-ralph-state -status .ralph/status.json -progress .ralph/progress.json

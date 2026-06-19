@@ -44,6 +44,7 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 	}
 	// Accept optional SETOF modifier (set-returning functions). M0096-0007.
 	returnsSet := p.acceptIdentKeyword("setof")
+	returnsTable := false
 	var retType ColumnType
 	// RETURNS TABLE (col type, ...) — syntactic sugar for RETURNS SETOF RECORD
 	// with named OUT parameters. Append OUT params to args list. M0097-0028.
@@ -81,6 +82,11 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 		}
 		returnsSet = true
 		retType = ColumnType{Name: "record"}
+		// Mark the RETURNS TABLE form so catalog deparsers (pg_get_function_result /
+		// pg_get_function_arguments) can re-render `RETURNS TABLE(...)` rather than the
+		// equivalent-but-divergent `OUT col ... RETURNS SETOF record`. The columns stay
+		// stored as trailing OUT args so the planner's OUT-column expansion is unchanged.
+		returnsTable = true
 	} else {
 		var err error
 		retType, err = p.parseColumnType()
@@ -89,13 +95,15 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 		}
 	}
 	stmt := &CreateFunctionStmt{
-		pos:        pos,
-		OrReplace:  orReplace,
-		Name:       name,
-		Args:       args,
-		ReturnType: retType,
-		ReturnsSet: returnsSet,
-		Volatile:   "v", // default: volatile
+		pos:          pos,
+		OrReplace:    orReplace,
+		Name:         name,
+		Args:         args,
+		ReturnType:   retType,
+		ReturnsSet:   returnsSet,
+		ReturnsTable: returnsTable,
+		Volatile:     "v", // default: volatile
+		Parallel:     "u", // default: parallel unsafe (PG CREATE FUNCTION default)
 	}
 	// The LANGUAGE / AS clauses can appear in either order (mirrors
 	// upstream). Loop until both have been seen or we hit an
@@ -209,6 +217,24 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 				case "called":
 					// CALLED ON NULL INPUT — explicit not-strict
 					stmt.Strict = false
+				case "cost":
+					// COST <n> — planner per-row cost. Capture the numeric
+					// literal verbatim so the pg_proc view / dump can re-emit
+					// the non-default value (previously parsed-then-discarded).
+					p.advance()
+					if p.cur().Kind == TokenIntLit || p.cur().Kind == TokenNumericLit {
+						stmt.Cost = p.cur().Value
+						p.advance()
+					}
+					continue
+				case "rows":
+					// ROWS <n> — set-returning-function result-row estimate.
+					p.advance()
+					if p.cur().Kind == TokenIntLit || p.cur().Kind == TokenNumericLit {
+						stmt.Rows = p.cur().Value
+						p.advance()
+					}
+					continue
 				}
 			} else if cur.Kind == TokenKeyword && cur.Keyword == KwNot {
 				// NOT LEAKPROOF
@@ -227,7 +253,14 @@ func (p *parser) parseCreateFunctionTail(pos int, orReplace bool) (Stmt, error) 
 				continue
 			} else if cur.Kind == TokenKeyword && cur.Keyword == KwParallel {
 				p.advance()
-				p.acceptIdentKeyword("safe", "unsafe", "restricted")
+				switch {
+				case p.acceptIdentKeyword("safe"):
+					stmt.Parallel = "s"
+				case p.acceptIdentKeyword("restricted"):
+					stmt.Parallel = "r"
+				case p.acceptIdentKeyword("unsafe"):
+					stmt.Parallel = "u"
+				}
 				continue
 			}
 			p.consumeFunctionAttribute()
@@ -450,9 +483,11 @@ func (p *parser) parseFunctionArg() (FunctionArg, error) {
 }
 
 // parseProcedureArg parses a single procedure argument in any of the PG forms:
-//   [mode] [name] type      — mode-first
-//   [name] [mode] type      — name-first (PG also accepts this)
-//   [DEFAULT expr]
+//
+//	[mode] [name] type      — mode-first
+//	[name] [mode] type      — name-first (PG also accepts this)
+//	[DEFAULT expr]
+//
 // Stage B allows OUT, INOUT, and VARIADIC modes.
 func (p *parser) parseProcedureArg() (FunctionArg, error) {
 	pos := p.cur().Pos

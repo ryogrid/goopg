@@ -887,12 +887,47 @@ type ColumnDef struct {
 	NotNull bool
 	Primary bool // inline `PRIMARY KEY` constraint
 	Unique  bool // inline `UNIQUE` constraint
+	// UniqueNullsNotDistinct is true when an inline column UNIQUE was declared
+	// `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15+). It is threaded into
+	// catalog.Index.NullsNotDistinct so pg_get_constraintdef re-emits the
+	// clause. Only meaningful when Unique is true. DU-002 slice 136.
+	UniqueNullsNotDistinct bool
+	// UniqueConstraintName is the explicit constraint name from an inline named
+	// column UNIQUE (`a int CONSTRAINT myname UNIQUE`). Empty for the anonymous
+	// form, in which case the backing index name is auto-generated
+	// (`tbl_col_key`). Only meaningful when Unique is true. DU-002 slice 137.
+	UniqueConstraintName string
+	// UniqueDeferrable / UniqueInitiallyDeferred capture a `[NOT] DEFERRABLE
+	// [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` trailer on an inline column
+	// UNIQUE constraint (`a int UNIQUE DEFERRABLE INITIALLY DEFERRED`). They
+	// thread onto the backing catalog.Index so pg_get_constraintdef / pg_dump
+	// re-emit the clause and pg_constraint emits condeferrable/condeferred.
+	// INITIALLY DEFERRED implies DEFERRABLE; IMMEDIATE is the default (both
+	// false). Only meaningful when Unique is true. Dump-fidelity only — deferred
+	// CHECKING is not implemented (constraints enforced per-row). DU-002 slice 141.
+	UniqueDeferrable        bool
+	UniqueInitiallyDeferred bool
+	// PrimaryDeferrable / PrimaryInitiallyDeferred capture a `[NOT] DEFERRABLE
+	// [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` trailer on an inline column
+	// PRIMARY KEY constraint (`a int PRIMARY KEY DEFERRABLE INITIALLY DEFERRED`).
+	// They thread onto the backing catalog.Index so pg_get_constraintdef / pg_dump
+	// re-emit the clause and pg_constraint emits condeferrable/condeferred.
+	// INITIALLY DEFERRED implies DEFERRABLE; IMMEDIATE is the default (both
+	// false). Only meaningful when Primary is true. Dump-fidelity only — deferred
+	// CHECKING is not implemented (constraints enforced per-row). DU-002 slice 142.
+	PrimaryDeferrable        bool
+	PrimaryInitiallyDeferred bool
 	// GeneratedAlways is true for `GENERATED ALWAYS AS (expr) STORED` columns.
 	// M0096-0008.
 	GeneratedAlways bool
 	// GeneratedExpr holds the raw SQL expression text (without surrounding parens)
-	// for a stored generated column. Empty for ordinary columns.
+	// for a generated column. Empty for ordinary columns.
 	GeneratedExpr string
+	// GeneratedVirtual is true when the generated column is declared VIRTUAL
+	// (explicitly, or implicitly via the bare `GENERATED ALWAYS AS (expr)` form,
+	// whose PG18 default is VIRTUAL); false for an explicit STORED. M0110-0001
+	// (DU-002 slice 194).
+	GeneratedVirtual bool
 	// IdentityColumn is true for `GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY` columns.
 	// The sequence is registered during CREATE TABLE; INSERT uses nextval() as default.
 	IdentityColumn bool
@@ -927,6 +962,20 @@ type ColumnDef struct {
 	// CheckNoInherit is true when the inline CHECK constraint carries NO INHERIT.
 	// Stored so LIKE INCLUDING ALL can error on partitioned tables. M0097-0023.
 	CheckNoInherit bool
+	// Compression is the per-column TOAST compression method from an inline
+	// `COMPRESSION <method>` clause (`col text COMPRESSION lz4`) — "pglz" or
+	// "lz4". Empty when no method was written. Threaded onto catalog.Column.
+	// Compression purely so the column round-trips through pg_dump (goopg does
+	// not actually TOAST/compress). DU-002 slice 183.
+	Compression string
+	// Collation is the collation name from an inline `COLLATE <name>` clause
+	// (`col text COLLATE "C"`). Empty when none was written. Stored as the bare
+	// (last-component, unquoted) collation name — e.g. "C", "POSIX", "ucs_basic".
+	// Threaded onto catalog.Column.Collation so the synthesized pg_attribute
+	// row reports the chosen attcollation and pg_dump re-emits the COLLATE
+	// clause. goopg does not actually collate; this is recorded purely for
+	// pg_dump round-trip fidelity. DU-002 slice 188.
+	Collation string
 }
 
 func (c ColumnDef) Pos() int { return c.pos }
@@ -941,6 +990,36 @@ type TableConstraintDef struct {
 	IsExclusion    bool     // true for EXCLUDE USING constraints
 	ExclusionOp    string   // per-column operator (e.g. "=") for single-column EXCLUDE
 	Method         string   // index method for EXCLUDE (e.g. "btree")
+	// NullsNotDistinct is true when a UNIQUE constraint was declared
+	// `UNIQUE NULLS NOT DISTINCT (…)` (PostgreSQL 15+): NULL key values are
+	// treated as equal for uniqueness. Threads to the backing index's
+	// catalog.Index.NullsNotDistinct so pg_get_constraintdef re-emits it.
+	// DU-002 slice 135.
+	NullsNotDistinct bool
+	// Deferrable / InitiallyDeferred capture a `[NOT] DEFERRABLE [INITIALLY
+	// DEFERRED | INITIALLY IMMEDIATE]` trailer on a named table-level UNIQUE
+	// constraint. They thread onto the backing catalog.Index so
+	// pg_get_constraintdef / pg_dump re-emit the clause and pg_constraint emits
+	// condeferrable/condeferred. INITIALLY DEFERRED implies DEFERRABLE; IMMEDIATE
+	// is the default (both false). Dump-fidelity only — deferred CHECKING is not
+	// implemented (constraints are enforced per-row). DU-002 slice 140.
+	Deferrable        bool
+	InitiallyDeferred bool
+}
+
+// TableForeignKeyDef describes a table-level FOREIGN KEY constraint, e.g.
+// `FOREIGN KEY (a, b) REFERENCES t (x, y) ON DELETE CASCADE`. This is the
+// multi-column sibling of the inline-on-column REFERENCES clause (whose fields
+// live on ColumnDef). Used in CreateTableStmt.TableForeignKeys. DU-002 slice 53.
+type TableForeignKeyDef struct {
+	Name              string     // explicit CONSTRAINT name; "" when anonymous
+	Columns           []string   // referencing (local) columns
+	RefTable          ObjectName // referenced table
+	RefColumns        []string   // referenced columns; empty = referenced table's PK
+	OnDelete          FKAction   // referential action for ON DELETE (default NO ACTION)
+	OnUpdate          FKAction   // referential action for ON UPDATE (default NO ACTION)
+	Deferrable        bool
+	InitiallyDeferred bool
 }
 
 // CreateTableStmt — `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name
@@ -990,6 +1069,12 @@ type CreateTableStmt struct {
 	// TableChecks holds raw SQL expressions from table-level CHECK constraints.
 	// M0097-0014.
 	TableChecks []string
+	// TableCheckNoInherit is parallel to TableChecks: entry i is true when the
+	// anonymous table-level CHECK at TableChecks[i] carries NO INHERIT. Tracked
+	// per-check (not just the aggregate TableHasNoInheritCheck) so an anonymous
+	// `CHECK (...) NO INHERIT` re-emits its suffix through pg_get_constraintdef
+	// on dump. DU-002 slice 128.
+	TableCheckNoInherit []bool
 	// TableNamedChecks holds explicitly named table-level CHECK constraints,
 	// e.g. `CONSTRAINT check_a CHECK (a > 0)`. M0097-0023.
 	TableNamedChecks []PartitionCheckConstraint
@@ -1001,9 +1086,32 @@ type CreateTableStmt struct {
 	// TableUniques: TableUniqueIncludes[i] is the include list for TableUniques[i].
 	// May be shorter than TableUniques if trailing entries have no INCLUDE. M0097-0023.
 	TableUniqueIncludes [][]string
+	// TableUniqueNullsNotDistinct is parallel to TableUniques:
+	// TableUniqueNullsNotDistinct[i] is true when TableUniques[i] was declared
+	// `UNIQUE NULLS NOT DISTINCT (…)` (PostgreSQL 15+). May be shorter than
+	// TableUniques if trailing entries use the default NULLS DISTINCT.
+	// DU-002 slice 135.
+	TableUniqueNullsNotDistinct []bool
+	// TableUniqueDeferrable / TableUniqueInitiallyDeferred are parallel to
+	// TableUniques: entry [i] is true when TableUniques[i] was declared
+	// `DEFERRABLE` / `DEFERRABLE INITIALLY DEFERRED`. May be shorter than
+	// TableUniques when trailing entries use the NOT DEFERRABLE default.
+	// pg_get_constraintdef re-emits the clause so pg_dump round-trips it.
+	// DU-002 slice 139.
+	TableUniqueDeferrable        []bool
+	TableUniqueInitiallyDeferred []bool
 	// PrimaryKeyInclude holds the INCLUDE covering columns for an anonymous
 	// table-level PRIMARY KEY constraint. M0097-0023.
 	PrimaryKeyInclude []string
+	// PrimaryKeyDeferrable / PrimaryKeyInitiallyDeferred capture a `[NOT]
+	// DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]` trailer on an
+	// anonymous table-level PRIMARY KEY constraint (`PRIMARY KEY (a) DEFERRABLE
+	// INITIALLY DEFERRED`). They thread onto the backing catalog.Index so
+	// pg_get_constraintdef / pg_dump re-emit the clause and pg_constraint emits
+	// condeferrable/condeferred. INITIALLY DEFERRED implies DEFERRABLE; IMMEDIATE
+	// is the default (both false). Dump-fidelity only. DU-002 slice 142.
+	PrimaryKeyDeferrable        bool
+	PrimaryKeyInitiallyDeferred bool
 	// NamedConstraints holds explicitly named UNIQUE/PRIMARY KEY/EXCLUDE constraints,
 	// which may carry INCLUDE covering columns. The parser places named constraints
 	// here so the executor can use the constraint name as the index name. M0097-0023.
@@ -1011,6 +1119,10 @@ type CreateTableStmt struct {
 	// TableExclusions holds anonymous EXCLUDE USING constraints (no CONSTRAINT name).
 	// Named ones are folded into NamedConstraints. M0097-0023.
 	TableExclusions []TableConstraintDef
+	// TableForeignKeys holds table-level FOREIGN KEY constraints (both anonymous
+	// and CONSTRAINT-named), e.g. `FOREIGN KEY (a, b) REFERENCES t (x, y)`. The
+	// inline-on-column REFERENCES sibling lives on ColumnDef instead. DU-002 slice 53.
+	TableForeignKeys []TableForeignKeyDef
 	// TableHasNoInheritCheck is true when any table-level CHECK constraint carries
 	// NO INHERIT. Partitioned tables reject such constraints. M0097-0023.
 	TableHasNoInheritCheck bool
@@ -1098,6 +1210,10 @@ type PartitionColGenerated struct {
 type PartitionCheckConstraint struct {
 	Name string // constraint name (from CONSTRAINT name CHECK (...))
 	Expr string // raw SQL expression text
+	// NoInherit is true for `CONSTRAINT c CHECK (...) NO INHERIT` (PG18
+	// connoinherit='t'); the dumped constraintdef must re-emit the ` NO INHERIT`
+	// suffix and pg_constraint must report connoinherit. DU-002 slice 129.
+	NoInherit bool
 }
 
 // CreateIndexStmt — `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name]
@@ -1129,6 +1245,53 @@ type CreateIndexStmt struct {
 	Predicate          Expr     // WHERE predicate expression (nil if no WHERE clause)
 	IncludeColumns     []string // non-key covering columns from INCLUDE (…)
 	OnOnly             bool     // ON ONLY — create on parent table without propagating to children
+	// ColOrders captures the per-key-column ASC/DESC + NULLS FIRST/LAST ordering,
+	// parallel to Columns (ColOrders[i] applies to Columns[i]). Mirrors PG's
+	// pg_index.indoption so pg_get_indexdef can reproduce a non-default ordering.
+	ColOrders []IndexColOrder
+	// NullsNotDistinct is true when the index was declared with the PostgreSQL 15+
+	// `NULLS NOT DISTINCT` option (treat NULL key values as equal for uniqueness).
+	// Mirrors pg_index.indnullsnotdistinct so pg_get_indexdef can reproduce it.
+	// The default (omitted, or explicit `NULLS DISTINCT`) leaves this false.
+	NullsNotDistinct bool
+	// DeduplicateItems captures the btree `WITH (deduplicate_items=on|off)`
+	// boolean storage parameter. nil means unset (PG default ON); a non-nil
+	// pointer records the explicitly-declared value so pg_get_indexdef can
+	// re-emit `WITH (deduplicate_items='on'|'off')`. DU-002 slice 219.
+	DeduplicateItems *bool
+	// FastUpdate captures the GIN `WITH (fastupdate=on|off)` boolean storage
+	// parameter. nil means unset (PG default ON); a non-nil pointer records the
+	// explicitly-declared value so pg_get_indexdef can re-emit
+	// `WITH (fastupdate='on'|'off')`. DU-002 slice 220.
+	FastUpdate *bool
+	// GinPendingListLimit captures the GIN `WITH (gin_pending_list_limit=N)`
+	// integer storage parameter (max pending-list size in kB). 0 means unset
+	// (PG default -1 = use the GUC); a non-zero value records the explicitly-
+	// declared limit so pg_get_indexdef can re-emit
+	// `WITH (gin_pending_list_limit='N')`. Valid range 64–2097151. DU-002 slice 221.
+	GinPendingListLimit int
+	// PagesPerRange captures the BRIN `WITH (pages_per_range=N)` integer storage
+	// parameter (number of heap pages per summarized range). 0 means unset (PG
+	// default 128); a non-zero value records the explicitly-declared value so
+	// pg_get_indexdef can re-emit `WITH (pages_per_range='N')`. Valid range
+	// 1–131072. DU-002 slice 222.
+	PagesPerRange int
+	// AutoSummarize captures the BRIN `WITH (autosummarize=on|off)` boolean
+	// storage parameter (summarize the previous range when a new page range is
+	// created). nil means unset (PG default OFF); a non-nil pointer records the
+	// explicitly-declared value so pg_get_indexdef can re-emit
+	// `WITH (autosummarize='on'|'off')`. DU-002 slice 223.
+	AutoSummarize *bool
+}
+
+// IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key
+// column. Descending mirrors PG's INDOPTION_DESC; NullsFirst mirrors
+// INDOPTION_NULLS_FIRST. When the NULLS clause is omitted PG defaults NullsFirst
+// to Descending (NULLS FIRST is the default for DESC, NULLS LAST for ASC), so the
+// parser pre-resolves NullsFirst to that effective value.
+type IndexColOrder struct {
+	Descending bool
+	NullsFirst bool
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }
@@ -1225,6 +1388,7 @@ type AlterSequenceStmt struct {
 	StartWith    *int64 // START [WITH] n — updates stored start_value only
 	Restart      bool   // RESTART (no value) — reset current to start_value
 	RestartWith  *int64 // RESTART [WITH] n — reset current and update start_value
+	Cache        *int64 // CACHE n (nil = unchanged)
 	Cycle        bool   // CYCLE
 	NoCycle      bool   // NO CYCLE
 	OwnedBy      string // "table.column" or "" from OWNED BY clause
@@ -1271,6 +1435,11 @@ type CreateViewStmt struct {
 	Name      ObjectName
 	Columns   []string // optional explicit column-name list
 	Query     *SelectStmt
+	// RawDef is the raw SQL text of the view body (everything after `AS`,
+	// trimmed of trailing whitespace/semicolons). Captured verbatim so
+	// pg_get_viewdef can echo it for pg_dump. Empty if the source text was
+	// unavailable to the parser.
+	RawDef string
 }
 
 func (s *CreateViewStmt) Pos() int  { return s.pos }
@@ -1296,6 +1465,11 @@ type CreateMatViewStmt struct {
 	WithNoData    bool
 	IfNotExists   bool
 	ColumnAliases []string // optional (col1, col2, ...) after the name
+	// RawDef is the raw SQL text of the matview body (everything after `AS`,
+	// before any `WITH [NO] DATA`), captured verbatim so pg_get_viewdef can
+	// echo it for pg_dump (which dumps a matview's body via createViewAsClause,
+	// exactly like a plain view). Empty when the source text was unavailable.
+	RawDef string
 }
 
 func (s *CreateMatViewStmt) Pos() int  { return s.pos }
@@ -1407,14 +1581,16 @@ func (s *CompatNoopStmt) Pos() int  { return s.pos }
 func (s *CompatNoopStmt) stmtNode() {}
 
 // CommentOnStmt represents a COMMENT ON statement for objects goopg tracks
-// (TABLE, INDEX, COLUMN, CONSTRAINT). The executor stores the description in
-// pg_description via catalog.SetComment. M0097-0023.
+// (TABLE, INDEX, COLUMN, CONSTRAINT, STATISTICS, VIEW, SEQUENCE, SCHEMA). The
+// executor stores the description in pg_description via catalog.SetComment.
+// M0097-0023; VIEW/SEQUENCE/SCHEMA added in DU-002 slice 145.
 type CommentOnStmt struct {
 	pos         int
-	ObjKind     string     // "table", "index", "column", "constraint", "statistics"
-	ObjName     ObjectName // table/index name, or table for constraint/column
-	SubName     string     // column name (ObjKind=column) or constraint name (ObjKind=constraint)
-	Description string     // comment text; empty string = IS NULL (delete comment)
+	ObjKind     string        // "table", "index", "column", "constraint", "statistics", "view", "sequence", "schema", "function"
+	ObjName     ObjectName    // table/index name, or table for constraint/column, or routine name for function
+	SubName     string        // column name (ObjKind=column) or constraint name (ObjKind=constraint)
+	Args        []FunctionArg // routine argument signature (ObjKind=function); nil for all other kinds
+	Description string        // comment text; empty string = IS NULL (delete comment)
 }
 
 func (s *CommentOnStmt) Pos() int  { return s.pos }
@@ -1574,6 +1750,11 @@ const (
 	// Records the storage type (plain/main/external/extended) on the catalog column.
 	// StorageType holds the storage name; ColumnName holds the column. M0097-0023.
 	AlterTableSetStorage
+	// AlterTableSetCompression — `ALTER COLUMN name SET COMPRESSION method`.
+	// Records the per-column TOAST compression method (pglz/lz4) on the catalog
+	// column purely for pg_dump round-trip fidelity (goopg does not TOAST).
+	// CompressionType holds the method; ColumnName holds the column. DU-002 slice 183.
+	AlterTableSetCompression
 	// AlterIndexAttachPartition — `ALTER INDEX parent ATTACH PARTITION child`.
 	// Registers child as a partition of parent in the index partition tree.
 	// ConstraintName holds the parent index name; ChildIndexName holds the child. M0097-0023.
@@ -1596,7 +1777,9 @@ type AlterTableAction struct {
 	// Foreign-key extras (only populated for AddForeignKey).
 	RefTable   ObjectName
 	RefColumns []string
-	Deferrable bool // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
+	Deferrable bool     // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
+	OnDelete   FKAction // referential action for ON DELETE (default NO ACTION)
+	OnUpdate   FKAction // referential action for ON UPDATE (default NO ACTION)
 
 	// AttachPartitionOf is populated for AlterTableAttachPartition.
 	// It holds the child table name and partition bounds. M0096-0007.
@@ -1628,6 +1811,15 @@ type AlterTableAction struct {
 	// StorageType is the storage strategy for AlterTableSetStorage.
 	// Values: "plain", "main", "external", "extended". M0097-0023.
 	StorageType string
+	// CompressionType is the TOAST compression method for AlterTableSetCompression.
+	// Values: "pglz", "lz4". DU-002 slice 183.
+	CompressionType string
+	// SetOptions holds the per-column attribute options captured from
+	// `ALTER COLUMN name SET (opt=value, …)` for AlterTableAlterColumnSet, each
+	// entry normalized to PG's stored `name=value` form (e.g. "n_distinct=0.5").
+	// Recorded on catalog.Column.Options so pg_dump re-emits the clause via
+	// pg_attribute.attoptions. DU-002 slice 185.
+	SetOptions []string
 	// ChildIndexName is populated for AlterIndexAttachPartition and holds
 	// the name of the child index to attach. M0097-0023.
 	ChildIndexName string
@@ -1790,6 +1982,7 @@ type CreateFunctionStmt struct {
 	Args            []FunctionArg
 	ReturnType      ColumnType
 	ReturnsSet      bool   // RETURNS SETOF ... M0097-0020
+	ReturnsTable    bool   // RETURNS TABLE (...) — table columns stored as trailing OUT args
 	Language        string // lower-cased, e.g. "plpgsql"
 	Body            string // raw source between the dollar-quote delimiters
 	Strict          bool   // STRICT / RETURNS NULL ON NULL INPUT M0097-0035
@@ -1799,6 +1992,9 @@ type CreateFunctionStmt struct {
 	BeginAtomic     bool   // PG14 BEGIN ATOMIC ... END body (no AS keyword)
 	IsReturnForm    bool   // PG14 RETURN expr body (no AS keyword, body stored as "SELECT expr")
 	Window          bool   // WINDOW attribute — marks function as a window function
+	Parallel        string // proparallel: "u"=unsafe (default), "s"=safe, "r"=restricted
+	Cost            string // procost: planner per-row cost override (COST n); "" = language default
+	Rows            string // prorows: SRF result-row estimate override (ROWS n); "" = default
 }
 
 // AlterFunctionStmt — `ALTER FUNCTION name([argtypes]) attribute ...`
@@ -1898,8 +2094,9 @@ func (s *DropProcedureStmt) stmtNode() {}
 // TypeField describes one field in a composite type definition.
 // M0097-composite.
 type TypeField struct {
-	Name    string // lower-case field name
-	ColType string // column type string (e.g. "bigint", "text")
+	Name      string // lower-case field name
+	ColType   string // column type string (e.g. "bigint", "text")
+	Collation string // per-field COLLATE name (e.g. "C"); empty = type default
 }
 
 // CreateTypeStmt — CREATE TYPE name AS ENUM (val1, val2, …) or
@@ -1930,6 +2127,43 @@ type AlterTypeStmt struct {
 	RenameOldValue string // RENAME VALUE: existing label (empty when ADD VALUE)
 	RenameNewValue string // RENAME VALUE: replacement label
 	RenameTo       string // RENAME TO: new type name (M0097-enum-rename)
+	// ADD ATTRIBUTE col_name type — appends a field to a composite type.
+	// DU-002 slice 253.
+	AddAttrName string // new composite-type attribute name (empty when not ADD ATTRIBUTE)
+	AddAttrType string // its type string (space-joined, e.g. "numeric ( 10 , 2 )")
+	// Optional per-attribute COLLATE on ADD ATTRIBUTE (empty when none). DU-002 slice 258.
+	AddAttrCollation string
+	// RENAME ATTRIBUTE old TO new — renames a composite type field. DU-002 slice 254.
+	RenameAttrOld string // existing attribute name (empty when not RENAME ATTRIBUTE)
+	RenameAttrNew string // replacement attribute name
+	// DROP ATTRIBUTE [IF EXISTS] attname — removes a composite type field. DU-002 slice 255.
+	DropAttrName     string // attribute to drop (empty when not DROP ATTRIBUTE)
+	DropAttrIfExists bool   // DROP ATTRIBUTE IF EXISTS — missing attr → NOTICE, not error
+	// ALTER ATTRIBUTE attname [SET DATA] TYPE newtype — re-types a composite
+	// type field in place. DU-002 slice 256.
+	AlterAttrName string // attribute whose type changes (empty when not ALTER ATTRIBUTE)
+	AlterAttrType string // its new type string (space-joined, e.g. "numeric ( 12 , 3 )")
+	// Optional per-attribute COLLATE on ALTER ATTRIBUTE … TYPE (empty when none). DU-002 slice 259.
+	AlterAttrCollation string
+	// AttrCmds is the comma-combined attribute-subcommand list for
+	// ALTER TYPE … (ADD|DROP|ALTER ATTRIBUTE …, …). PG only allows these three
+	// actions to be combined in one statement (ADD VALUE / RENAME / OWNER are
+	// singular). The parser populates one element per subcommand and mirrors
+	// AttrCmds[0] into the legacy scalar fields above so the single-subcommand
+	// executor branches + parser tests are unchanged; the executor routes the
+	// multi-subcommand case (len > 1) through execAlterTypeAttrCmds. DU-002
+	// slice 260.
+	AttrCmds []AlterTypeAttrCmd
+}
+
+// AlterTypeAttrCmd is one attribute subcommand of an ALTER TYPE statement.
+// DU-002 slice 260 (multi-subcommand ALTER TYPE).
+type AlterTypeAttrCmd struct {
+	Kind      string // "add" | "drop" | "alter"
+	Name      string // target attribute name (lowercased)
+	Type      string // ADD/ALTER: the (space-joined) new type string
+	Collation string // ADD/ALTER: optional COLLATE name (empty when none)
+	IfExists  bool   // DROP: IF EXISTS → a missing attribute is a NOTICE, not an error
 }
 
 func (s *AlterTypeStmt) Pos() int  { return s.pos }
@@ -1951,9 +2185,18 @@ type CreateDomainStmt struct {
 	pos           int
 	Name          string
 	Schema        string
-	BaseType      string // base type name
+	BaseType      string  // base type name
+	BaseTypeArgs  []int64 // base-type modifier args: varchar(20)→[20], numeric(10,2)→[10,2]. DU-002 slice 95.
 	NotNull       bool
 	CheckInValues []string // allowed values from CHECK (VALUE IN ('a','b','c')), M0097-domain-check
+	Default       Expr     // DEFAULT expression AST, nil when no DEFAULT clause. DU-002 slice 92.
+	// CheckExpr holds the raw SQL text of a generic (non-IN) domain CHECK
+	// expression, e.g. `VALUE > 0`. CheckName is the explicit CONSTRAINT name
+	// when one is given, "" for the auto-generated `<domain>_check`. The
+	// `CHECK (VALUE IN (...))` form is kept separately in CheckInValues (its
+	// ANY/ARRAY deparse is not yet rendered). DU-002 slice 96.
+	CheckExpr string
+	CheckName string
 }
 
 func (s *CreateDomainStmt) Pos() int  { return s.pos }

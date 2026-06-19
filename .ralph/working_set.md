@@ -1,42 +1,33 @@
-Task: M0110-0001 / DU-002 — pg_dump catalog-view parity. Slice 44 COMPLETE
-and (to be) pushed. NOTHING in flight; next loop starts on slice 45 (populate
-pg_attribute columns in pg_dump's getTableAttrs path).
+(idle — nothing in flight)
 
-=== DONE (loop #67) — DU-002 slice 44 ===
-Added the `pg_get_function_sqlbody(oid)` executor dispatch case.
-Root cause: seed pg_proc already registered it (OID 6197,
-internal/initdb/pg_proc_seed_data.go) but the big func switch in
-internal/executor/expr.go had NO case → dumpFunc's EXECUTE raised 42883.
-Fix: added a case (right before pg_get_function_result) returning NullDatum
-unconditionally — sqlbody only deparses LANGUAGE sql ... BEGIN ATOMIC bodies
-(PG14+), which goopg never parses, so NULL for every routine is correct and
-matches what pg_dump expects for quoted-body SQL functions.
-**pg_dump now runs to completion (exit 0)** end-to-end.
-Files: internal/executor/expr.go (new case),
-internal/executor/pg_get_function_sqlbody_test.go (NEW: TestPgGetFunctionSqlbody
-+ ...UnknownOID), internal/testport/pgdump_connsetup_test.go (header slice 44 +
-promoted exit-0 branch asserts CREATE TABLE/ALTER OWNER/COPY + logs slice-45
-target), docs/design/0110-0001-pg-dump-tap-port.md (slice 44 entry + guard note).
-Gates: gofmt/build clean; executor pkg PASS (1.4s);
-TestPort_PgDumpConnectionSetup PASS (exit 0, asserts archive entry).
-tpch-spotcheck N/A (catalog builtin addition; no executor row-path/codec change).
+Last landed: DU-002 slice 261 (loop #28) — a dedicated MINVALUE/MAXVALUE keyword
+AST node (`PartitionRangeBoundKeyword`) disambiguates an unbounded RANGE-partition
+edge from a quoted text literal `'MINVALUE'`. Picked up the previous loop's
+usage-limit-interrupted WIP (was uncommitted in catalog.go/operators_ddl*.go/
+ddl.go/expr.go), gofmt-cleaned it, added the missing tests, doc, fix_plan, landed.
 
-=== NEXT STEP — DU-002 slice 45 (pg_attribute columns in dump) ===
-pg_dump exits 0 but the dump is CONTENT-incomplete: emitted
-`CREATE TABLE public.foo (\n)` has an EMPTY column list (no `id integer,
-name text`) plus a malformed `WITH (""='')` reloptions clause. Two gaps:
- 1. getTableAttrs' per-table pg_attribute query (attname/atttypid/attnotnull/
-    atttypmod/attstattarget/...) returns NO rows for user tables → no columns.
- 2. reloptions ARRAY subquery yields one empty element → `WITH (""='')`.
-Find getTableAttrs' SQL in postgres/src/bin/pg_dump/pg_dump.c (pg_search_symbols
-'getTableAttrs') and run it against goopg to see which column/predicate yields
-0 rows. Likely pg_attribute virtual view lacks user-table rows, or a join/WHERE
-(attnum>0, NOT attisdropped, atttypid resolution) filters them out. Then RUN
-`go test -count=1 -v -run TestPort_PgDumpConnectionSetup ./internal/testport/`
-— once columns appear, tighten the test to assert `id integer`/`name text`.
+Mechanism:
+- AST (expr.go): PartitionRangeBoundKeyword{pos, IsMax} + Keyword(); distinct from
+  StringConst so bare MINVALUE/MAXVALUE ≠ quoted 'MINVALUE'.
+- Parser (parsePartitionBoundValues, ddl.go): bare keyword → new node; quoted → StringConst.
+- Catalog (catalog.go): parallel []bool flags From/ToUnbounded[Max] on PartitionBound;
+  compareKeyToRangeBound (replaces compareRangeBoundStr) treats KEY as concrete always,
+  reads flags for the bound edge; boundElemUnbounded[Max] fall back to legacy string
+  sentinel for pre-slice-261 bounds. rangeStrTupleGE/LT take the flag slices.
+- Executor (operators_ddl.go / operators_ddl_partition.go): exprToString /
+  boundExprToSQLLiteral / rangeBoundExprToSQLLiteral handle the new node;
+  rangeBoundUnboundedFlags populates flags in execCreatePartitionChild + execAlterTable.
+- No pg_dump-side change (FromValueLiterals still uppercase keyword → same dump).
 
-ORTHOGONAL PRE-EXISTING (track separately): plpgsql user functions can't be
-dumped (plpgsql not in pg_language → prolang=0 → dumpFunc join still 0 rows).
+Files: internal/parser/expr.go, internal/parser/ddl.go, internal/catalog/catalog.go,
+internal/executor/operators_ddl.go, internal/executor/operators_ddl_partition.go,
+internal/parser/partition_range_bound_keyword_test.go (new),
+internal/catalog/catalog_test.go (TestCompareKeyToRangeBoundDisambiguation),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 261), .ralph/fix_plan.md.
 
-Other open (larger, untouched): M0110-0003 AC-003 003_check feature tiers;
-M0110-0002 002_save_fullpage; M0095-0003 recvlogical; M0117-0006/7/8 (CLOG).
+Gates: gofmt clean; go build ./... clean; parser+catalog+executor suites PASS;
+TestPort_PgDumpConnectionSetup PASS (3.7s, prange_am MINVALUE fixture still byte-matches);
+pgbench pre-commit smoke runs on commit.
+
+Next (slice 262+): multi-level / INHERITS partition-tree dump fidelity, or per-element
+open-edge multi-column RANGE bound routing (FROM (a, MINVALUE) TO (b, MAXVALUE)).

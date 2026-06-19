@@ -1952,9 +1952,18 @@ func loadUserTablesFromHeap(mgr *storage.Manager, cat *catalog.InMemory, clog *m
 
 		cols := make([]catalog.Column, len(attrRows))
 		for i, ar := range attrRows {
+			// An array column persists its array (_typename) OID in atttypid;
+			// reverse-map it to the element type and re-flag IsArray so the
+			// reloaded catalog matches the CREATE-time shape. DU-002 slice 62.
+			typOID := ar.AttTypID
+			isArray := false
+			if base, ok := catalog.BaseOIDForArray(typOID); ok {
+				typOID = base
+				isArray = true
+			}
 			cols[i] = catalog.Column{
 				Name:    ar.AttName,
-				Type:    catalog.Type{Name: catalog.OIDToTypeName(ar.AttTypID)},
+				Type:    catalog.Type{Name: catalog.OIDToTypeName(typOID), IsArray: isArray},
 				NotNull: ar.AttNotNull,
 				Ordinal: i,
 			}

@@ -149,6 +149,7 @@ func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
 	var p parser
 	p.tokens = toks
 	p.idx = 0
+	p.src = input
 
 	var out []Stmt
 	for p.cur().Kind != TokenEOF {
@@ -188,6 +189,10 @@ func Parse(input string, mc ...*mctx.Context) ([]Stmt, error) {
 type parser struct {
 	tokens []Token
 	idx    int
+	// src holds the original input string, used to capture raw source spans
+	// (e.g. the verbatim view body for pg_get_viewdef). Token.Pos values are
+	// byte offsets into this string.
+	src string
 	// selectIntoErrMsg is non-empty when SELECT … INTO is forbidden in the
 	// current parse context (cursor, subquery, view body, INSERT SELECT).
 	// parseSelect emits a SyntaxError with this message when INTO is seen.
@@ -201,6 +206,29 @@ type parser struct {
 	// planCopy can emit the PG-compatible "COPY (SELECT INTO) is not
 	// supported" error. M0097-0024.
 	selectIntoCopyStop bool
+}
+
+// captureSrcSpan returns the raw source text from byte offset startPos up to
+// the start of endTok (its Pos), trimmed of surrounding whitespace and any
+// trailing ';'. When endTok is EOF (Pos not meaningful) the span runs to the
+// end of the source. Returns "" when the source is unavailable or the offsets
+// are out of range. Used to preserve verbatim sub-statement text (e.g. the
+// view body for pg_get_viewdef).
+func (p *parser) captureSrcSpan(startPos int, endTok Token) string {
+	if p.src == "" || startPos < 0 || startPos > len(p.src) {
+		return ""
+	}
+	end := endTok.Pos
+	if endTok.Kind == TokenEOF || end <= 0 || end > len(p.src) {
+		end = len(p.src)
+	}
+	if end < startPos {
+		return ""
+	}
+	span := p.src[startPos:end]
+	span = strings.TrimSpace(span)
+	span = strings.TrimRight(span, "; \t\n\r")
+	return span
 }
 
 func (p *parser) cur() Token {
@@ -1938,15 +1966,29 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 		}
 		cs.ObjName = name
 	case p.acceptKeyword(KwColumn):
-		// COLUMN table.col — parseObjectName reads "table.col" as Schema=table, Name=col.
+		// COLUMN [schema.]table.col. parseObjectName consumes up to two dotted
+		// parts; a trailing ".col" distinguishes the schema-qualified 3-part form
+		// (schema.table.col — the canonical form pg_dump itself emits) from the
+		// bare 2-part form (table.col). Both must round-trip dump→restore.
 		cs.ObjKind = "column"
 		name, err := p.parseObjectName()
 		if err != nil {
 			return nil, true, err
 		}
-		// Schema field holds table name; Name field holds column name.
-		cs.ObjName = ObjectName{Name: name.Schema}
-		cs.SubName = name.Name
+		if p.acceptSymbol(".") {
+			// 3-part schema.table.col: parseObjectName read schema.table; the
+			// remaining identifier is the column.
+			col, err := p.parseIdent()
+			if err != nil {
+				return nil, true, err
+			}
+			cs.ObjName = ObjectName{Schema: name.Schema, Name: name.Name}
+			cs.SubName = identText(col)
+		} else {
+			// 2-part table.col: parseObjectName read it as Schema=table, Name=col.
+			cs.ObjName = ObjectName{Name: name.Schema}
+			cs.SubName = name.Name
+		}
 	case p.acceptKeyword(KwConstraint):
 		cs.ObjKind = "constraint"
 		// constraint name
@@ -1973,6 +2015,81 @@ func (p *parser) parseCommentOnTail(pos int) (Stmt, bool, error) {
 			return nil, true, err
 		}
 		cs.ObjName = name
+	case p.acceptKeyword(KwView):
+		// COMMENT ON VIEW [schema.]name IS '...'. Views are pg_class relations;
+		// pg_dump re-emits `COMMENT ON VIEW …`. DU-002 slice 145.
+		cs.ObjKind = "view"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("sequence"):
+		// COMMENT ON SEQUENCE [schema.]name IS '...'. Sequences are pg_class
+		// relations (relkind='S'); pg_dump re-emits `COMMENT ON SEQUENCE …`.
+		// DU-002 slice 145.
+		cs.ObjKind = "sequence"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("schema"):
+		// COMMENT ON SCHEMA name IS '...'. Schemas live in pg_namespace; pg_dump
+		// re-emits `COMMENT ON SCHEMA …`. DU-002 slice 145.
+		cs.ObjKind = "schema"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("materialized"):
+		// COMMENT ON MATERIALIZED VIEW [schema.]name IS '...'. Materialized views
+		// are pg_class relations (relkind='m'); pg_dump re-emits
+		// `COMMENT ON MATERIALIZED VIEW …`. "materialized"/"view" are not lexer
+		// keywords, so accept either spelling for VIEW. DU-002 slice 146.
+		_ = p.acceptKeyword(KwView) || p.acceptIdentKeyword("view")
+		cs.ObjKind = "materialized view"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("type"):
+		// COMMENT ON TYPE [schema.]name IS '...'. User-defined types live in
+		// pg_type; pg_dump re-emits `COMMENT ON TYPE …`. DU-002 slice 146.
+		cs.ObjKind = "type"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptIdentKeyword("domain"):
+		// COMMENT ON DOMAIN [schema.]name IS '...'. Domains live in pg_type
+		// (typtype='d'); pg_dump re-emits `COMMENT ON DOMAIN …`. DU-002 slice 146.
+		cs.ObjKind = "domain"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+	case p.acceptKeyword(KwFunction):
+		// COMMENT ON FUNCTION [schema.]name([argtypes]) IS '...'. Functions live
+		// in pg_proc (classoid 1255); pg_dump re-emits `COMMENT ON FUNCTION …`
+		// with the full identity-argument signature. The argument list is
+		// required to disambiguate overloads — parse it with the same helper
+		// DROP FUNCTION uses. DU-002 slice 147.
+		cs.ObjKind = "function"
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.ObjName = name
+		args, err := p.parseFunctionArgList()
+		if err != nil {
+			return nil, true, err
+		}
+		cs.Args = args
 	default:
 		return nil, false, nil
 	}

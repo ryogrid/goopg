@@ -1123,6 +1123,10 @@ func (p *parser) parseCreateViewTail(pos int, orReplace bool) (Stmt, error) {
 		return nil, &SyntaxError{Pos: pos, Message: "view body did not produce SELECT"}
 	}
 	stmt.Query = sel
+	// Capture the raw source span of the view body (from the SELECT/VALUES/WITH
+	// keyword up to the next unconsumed token) so pg_get_viewdef can echo it
+	// verbatim for pg_dump. p.cur() now points just past the body.
+	stmt.RawDef = p.captureSrcSpan(cur.Pos, p.cur())
 	// Optional trailing WITH [CASCADED|LOCAL] CHECK OPTION clause.
 	// goopg accepts and ignores the clause (check enforcement not yet implemented).
 	if p.acceptKeyword(KwWith) {
@@ -1164,7 +1168,9 @@ func (p *parser) parseCreateRecursiveViewTail(pos int, orReplace bool) (Stmt, er
 	if _, err = p.expectKeyword(KwAs); err != nil {
 		return nil, err
 	}
-	// Parse the view body.
+	// Parse the view body. Remember its starting token so the raw source span
+	// can be captured verbatim for pg_get_viewdef. M0110-0001 (DU-002 slice 61).
+	bodyStart := p.cur()
 	old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 	p.selectIntoErrMsg = "views must not contain SELECT INTO"
 	p.selectIntoNoPos = true
@@ -1177,6 +1183,7 @@ func (p *parser) parseCreateRecursiveViewTail(pos int, orReplace bool) (Stmt, er
 	if !ok {
 		return nil, &SyntaxError{Pos: pos, Message: "recursive view body did not produce SELECT"}
 	}
+	rawBody := p.captureSrcSpan(bodyStart.Pos, p.cur())
 	// Wrap: WITH RECURSIVE name(cols) AS (body) SELECT * FROM name.
 	cte := &CommonTableExpr{
 		Name:    name.Name,
@@ -1193,6 +1200,22 @@ func (p *parser) parseCreateRecursiveViewTail(pos int, orReplace bool) (Stmt, er
 		From:    []RangeVar{{pos: pos, Name: name.Name}},
 	}
 	stmt.Query = outer
+	// Synthesize the wrapped-CTE form as the view's stored definition so
+	// pg_get_viewdef returns a non-empty body (a recursive view with no RawDef
+	// makes pg_dump abort the whole dump — the slice-57 blocker). PostgreSQL
+	// stores a recursive view as a regular view over a WITH RECURSIVE CTE and
+	// pg_dump re-emits it as a plain CREATE VIEW; goopg mirrors that by echoing
+	// `WITH RECURSIVE name(cols) AS (<body>) SELECT cols FROM name`. The outer
+	// projection lists the declared columns explicitly (PG expands the canonical
+	// list; goopg has no deparser, so it spells them out — a documented fidelity
+	// gap, like the verbatim plain-view body). The "WITH" prefix means
+	// applyViewColumnAliases bails (it only rewrites bodies starting with SELECT),
+	// so the column names come solely from this projection. M0110-0001 slice 61.
+	if rawBody != "" && len(cols) > 0 {
+		colList := strings.Join(cols, ", ")
+		stmt.RawDef = "WITH RECURSIVE " + name.Name + "(" + colList + ") AS (" +
+			rawBody + ") SELECT " + colList + " FROM " + name.Name
+	}
 	return stmt, nil
 }
 
@@ -1253,6 +1276,9 @@ func (p *parser) parseCreateMatViewTail(pos int) (Stmt, error) {
 	if _, err := p.expectKeyword(KwAs); err != nil {
 		return nil, err
 	}
+	// Remember the body's starting token so the raw source span can be captured
+	// verbatim for pg_get_viewdef (mirrors parseCreateViewTail). M0110-0001 (DU-002).
+	bodyStart := p.cur()
 	inner, err := p.parseSelect()
 	if err != nil {
 		return nil, err
@@ -1262,6 +1288,9 @@ func (p *parser) parseCreateMatViewTail(pos int) (Stmt, error) {
 		return nil, &SyntaxError{Pos: pos, Message: "materialized view body did not produce SELECT"}
 	}
 	stmt.Query = sel
+	// p.cur() now points just past the body (at WITH [NO] DATA or EOF), so the
+	// span runs from the SELECT/WITH keyword up to the optional data clause.
+	stmt.RawDef = p.captureSrcSpan(bodyStart.Pos, p.cur())
 	// Optional WITH [NO] DATA clause. "NO" is a plain identifier, not a keyword.
 	if p.acceptKeyword(KwWith) {
 		if p.acceptIdentKeyword("no") {
@@ -1296,6 +1325,40 @@ func (p *parser) parseRefreshMatView(pos int) (Stmt, error) {
 		}
 	}
 	return stmt, nil
+}
+
+// parseConstraintDeferrable consumes an optional `[NOT] DEFERRABLE [INITIALLY
+// DEFERRED | INITIALLY IMMEDIATE]` trailer (and the bare `INITIALLY DEFERRED`
+// shorthand, which implies DEFERRABLE) following an inline column UNIQUE or
+// PRIMARY KEY constraint, recording the result into the supplied flags. NOT
+// DEFERRABLE and INITIALLY IMMEDIATE both leave the flags false (the SQL
+// defaults). This is the inline-column sibling of the trailer parsing used by
+// the table-level UNIQUE / PRIMARY KEY forms. DU-002 slices 141 (UNIQUE) / 142
+// (PRIMARY KEY).
+func (p *parser) parseConstraintDeferrable(deferrable, initiallyDeferred *bool) {
+	if p.acceptKeyword(KwNot) {
+		_ = p.acceptKeyword(KwDeferrable)
+		return
+	}
+	if p.acceptKeyword(KwDeferrable) {
+		*deferrable = true
+		if p.acceptIdentKeyword("initially") {
+			if p.acceptIdentKeyword("deferred") {
+				*initiallyDeferred = true
+			} else {
+				_ = p.acceptIdentKeyword("immediate")
+			}
+		}
+		return
+	}
+	if p.acceptIdentKeyword("initially") {
+		if p.acceptIdentKeyword("deferred") {
+			*deferrable = true
+			*initiallyDeferred = true
+		} else {
+			_ = p.acceptIdentKeyword("immediate")
+		}
+	}
 }
 
 // parseCreateTableTail picks up after CREATE [UNLOGGED] TABLE.
@@ -1657,12 +1720,57 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
 			}
 		}
+		// Optional USING <access_method> on a partition child, e.g.
+		// `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) USING heap`.
+		// PG's grammar is OptPartitionSpec table_access_method_clause OptWith
+		// OnCommitOption OptTableSpace, so USING precedes WITH. The partition-child
+		// arm previously omitted it, leaving the USING token unconsumed → syntax
+		// error. goopg has a single (heap) access method, so the name is accepted
+		// and discarded; relam stays at its default and pg_dump emits no USING
+		// clause, round-tripping the child like an access-method-less leaf.
+		// M0110-0001 (DU-002 slice 193).
+		if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
+			if _, err := p.parseIdent(); err != nil {
+				return nil, err
+			}
+		}
+		// Optional WITH (storage params) on a partition child, e.g.
+		// `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) WITH (fillfactor=70)`.
+		// PG allows storage parameters on a leaf partition; the executor persists
+		// them (pg_class.reloptions) so pg_dump round-trips the option. The clause
+		// follows FOR VALUES (and any PARTITION BY). M0110-0001 (DU-002 slice 191).
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith {
+			p.advance() // WITH
+			opts, werr := p.parseWithOptions()
+			if werr != nil {
+				return nil, werr
+			}
+			stmt.With = opts
+			if v, ok := opts["oids"]; ok {
+				stmt.WithOIDS = !strings.EqualFold(v, "false") && v != "0"
+			}
+		}
 		// ON COMMIT clause may follow FOR VALUES ... in partition tables.
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
 			p.advance()
 			if p.acceptKeyword(KwCommit) {
 				_ = p.acceptIdentKeyword("preserve") || p.acceptKeyword(KwDelete)
 				_ = p.acceptIdentKeyword("rows") || p.acceptKeyword(KwDrop)
+			}
+		}
+		// Optional TABLESPACE clause on a partition child, e.g.
+		// `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) TABLESPACE pg_default`.
+		// PG's CREATE TABLE ... PARTITION OF grammar admits OptTableSpace (after
+		// OptWith / OnCommitOption); the partition-child arm previously omitted it,
+		// so a trailing TABLESPACE left unconsumed tokens and the whole statement
+		// failed with a syntax error. Mirror the non-partition path (line ~2248):
+		// accept and discard the name — goopg's storage manager does not honour
+		// tablespaces, so reltablespace stays 0 and pg_dump emits no TABLESPACE
+		// clause for the default tablespace, round-tripping the child unchanged.
+		// M0110-0001 (DU-002 slice 192).
+		if p.acceptKeyword(KwTablespace) {
+			if _, err := p.parseIdent(); err != nil {
+				return nil, err
 			}
 		}
 		return stmt, nil
@@ -1742,19 +1850,25 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					}
 				}
 			}
-			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE] — accept and discard.
-			if p.acceptKeyword(KwNot) {
-				_ = p.acceptKeyword(KwDeferrable)
-			} else {
-				p.acceptKeyword(KwDeferrable)
-			}
-			if p.acceptIdentKeyword("initially") {
-				_ = p.acceptIdentKeyword("deferred")
-				_ = p.acceptIdentKeyword("immediate")
-			}
+			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
+			// Captured (not discarded) so pg_get_constraintdef re-emits the clause
+			// and pg_constraint emits condeferrable/condeferred on dump. The flags
+			// ride the backing tbl_pkey index built in the executor. DU-002 slice 142.
+			p.parseConstraintDeferrable(&stmt.PrimaryKeyDeferrable, &stmt.PrimaryKeyInitiallyDeferred)
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique {
-			// Table-level UNIQUE (cols) [INCLUDE (incl)] — create btree index. M0097-0028.
+			// Table-level UNIQUE [NULLS NOT DISTINCT] (cols) [INCLUDE (incl)] —
+			// create btree index. M0097-0028 / DU-002 slice 135.
 			p.advance()
+			// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) precedes the column
+			// list for a constraint (ruleutils.c emits `UNIQUE NULLS NOT DISTINCT
+			// (cols)`), unlike CREATE INDEX where the clause trails the columns.
+			nullsNotDistinct := false
+			if p.acceptIdentKeyword("nulls") {
+				nullsNotDistinct = p.acceptKeyword(KwNot)
+				if !p.acceptKeyword(KwDistinct) {
+					_ = p.acceptIdentKeyword("distinct")
+				}
+			}
 			if p.acceptSymbol("(") {
 				var cols []string
 				for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
@@ -1765,6 +1879,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				}
 				if len(cols) > 0 {
 					stmt.TableUniques = append(stmt.TableUniques, cols)
+					stmt.TableUniqueNullsNotDistinct = append(stmt.TableUniqueNullsNotDistinct, nullsNotDistinct)
 					// Optional INCLUDE (col, …). M0097-0023.
 					var incl []string
 					if p.acceptIdentKeyword("include") {
@@ -1778,6 +1893,27 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						}
 					}
 					stmt.TableUniqueIncludes = append(stmt.TableUniqueIncludes, incl)
+					// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
+					// IMMEDIATE]. Captured (not discarded) so pg_get_constraintdef
+					// re-emits the clause on dump. DU-002 slice 139.
+					deferrable := false
+					initiallyDeferred := false
+					if p.acceptKeyword(KwNot) {
+						_ = p.acceptKeyword(KwDeferrable)
+					} else if p.acceptKeyword(KwDeferrable) {
+						deferrable = true
+					}
+					if p.acceptIdentKeyword("initially") {
+						if p.acceptIdentKeyword("deferred") {
+							// INITIALLY DEFERRED implies DEFERRABLE.
+							deferrable = true
+							initiallyDeferred = true
+						} else {
+							_ = p.acceptIdentKeyword("immediate")
+						}
+					}
+					stmt.TableUniqueDeferrable = append(stmt.TableUniqueDeferrable, deferrable)
+					stmt.TableUniqueInitiallyDeferred = append(stmt.TableUniqueInitiallyDeferred, initiallyDeferred)
 				}
 			}
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
@@ -1794,15 +1930,33 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 			} else {
 				_ = p.acceptIdentKeyword("enforced")
 			}
-			// Accept optional NO INHERIT.
+			// Accept optional NO INHERIT, recording it per-check so the suffix
+			// round-trips through the dump. DU-002 slice 128.
+			noInherit := false
 			if p.acceptIdentKeyword("no") {
 				_ = p.acceptIdentKeyword("inherit")
 				stmt.TableHasNoInheritCheck = true
+				noInherit = true
 			}
+			stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
 		} else if p.acceptIdentKeyword("exclude") {
 			// Anonymous EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
 			cdef := p.parseExcludeConstraint()
+			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
+			// Captured onto the constraint def so the executor threads it onto the
+			// backing exclusion index and pg_get_constraintdef / pg_constraint
+			// re-emit the clause on dump. DU-002 slice 143.
+			p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
 			stmt.TableExclusions = append(stmt.TableExclusions, cdef)
+		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign {
+			// Anonymous table-level FOREIGN KEY (cols) REFERENCES t (cols) … —
+			// the multi-column sibling of the inline column REFERENCES clause.
+			// PG auto-names it <table>_<firstcol>_fkey at execution. DU-002 slice 53.
+			fk, err := p.parseTableForeignKey("")
+			if err != nil {
+				return nil, err
+			}
+			stmt.TableForeignKeys = append(stmt.TableForeignKeys, fk)
 		} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint {
 			// Table-level CONSTRAINT name (PRIMARY KEY | UNIQUE | CHECK | FOREIGN KEY).
 			p.advance() // CONSTRAINT
@@ -1837,22 +1991,30 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						}
 					}
 				}
+				// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE].
+				// Captured (not discarded) onto the constraint def so the executor
+				// threads it onto the backing index (shared NamedConstraints loop) and
+				// pg_get_constraintdef / pg_constraint re-emit the clause on dump.
+				// Parsed before the append so cdef carries the flags. DU-002 slice 142.
+				p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
 				if constraintName != "" {
 					stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
 				}
-				// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE] — accept and discard.
-				if p.acceptKeyword(KwNot) {
-					_ = p.acceptKeyword(KwDeferrable)
-				} else {
-					p.acceptKeyword(KwDeferrable)
-				}
-				if p.acceptIdentKeyword("initially") {
-					_ = p.acceptIdentKeyword("deferred")
-					_ = p.acceptIdentKeyword("immediate")
-				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
-				// CONSTRAINT name UNIQUE (cols) [INCLUDE (cols)] M0097-0028.
+				// CONSTRAINT name UNIQUE [NULLS [NOT] DISTINCT] (cols) [INCLUDE (cols)]
+				// M0097-0028 / DU-002 slice 138.
 				p.advance()
+				// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) precedes the column
+				// list, mirroring the anonymous table-level UNIQUE form above. Without
+				// this the `(` lookahead failed and the whole named constraint was
+				// silently dropped from the table (and thus the dump).
+				namedNullsNotDistinct := false
+				if p.acceptIdentKeyword("nulls") {
+					namedNullsNotDistinct = p.acceptKeyword(KwNot)
+					if !p.acceptKeyword(KwDistinct) {
+						_ = p.acceptIdentKeyword("distinct")
+					}
+				}
 				if p.acceptSymbol("(") {
 					var cols []string
 					for !p.acceptSymbol(")") && p.cur().Kind != TokenEOF {
@@ -1862,7 +2024,7 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 						p.advance()
 					}
 					if len(cols) > 0 {
-						cdef := TableConstraintDef{Name: constraintName, Columns: cols}
+						cdef := TableConstraintDef{Name: constraintName, Columns: cols, NullsNotDistinct: namedNullsNotDistinct}
 						// Optional INCLUDE (col, …).
 						if p.acceptIdentKeyword("include") {
 							if p.acceptSymbol("(") {
@@ -1872,6 +2034,32 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 									}
 									p.advance()
 								}
+							}
+						}
+						// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
+						// IMMEDIATE] trailer. Mirrors the anonymous table-level UNIQUE
+						// form (slice 139); without this branch a named
+						// `UNIQUE (a) DEFERRABLE …` was a HARD PARSE ERROR (trailing
+						// tokens after the column list). DU-002 slice 140.
+						if p.acceptKeyword(KwNot) {
+							_ = p.acceptKeyword(KwDeferrable)
+							// NOT DEFERRABLE → both flags stay false (default).
+						} else if p.acceptKeyword(KwDeferrable) {
+							cdef.Deferrable = true
+							if p.acceptIdentKeyword("initially") {
+								if p.acceptIdentKeyword("deferred") {
+									cdef.InitiallyDeferred = true
+								} else {
+									_ = p.acceptIdentKeyword("immediate")
+								}
+							}
+						} else if p.acceptIdentKeyword("initially") {
+							// Bare INITIALLY DEFERRED implies DEFERRABLE.
+							if p.acceptIdentKeyword("deferred") {
+								cdef.Deferrable = true
+								cdef.InitiallyDeferred = true
+							} else {
+								_ = p.acceptIdentKeyword("immediate")
 							}
 						}
 						if constraintName != "" {
@@ -1887,7 +2075,8 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				if err != nil {
 					return nil, err
 				}
-				if constraintName != "" {
+				anonCheck := constraintName == ""
+				if !anonCheck {
 					// Named CHECK constraint: store with its name for pg_constraint.
 					stmt.TableNamedChecks = append(stmt.TableNamedChecks, PartitionCheckConstraint{
 						Name: constraintName, Expr: expr,
@@ -1901,27 +2090,39 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 					_ = p.acceptIdentKeyword("enforced")
 				}
 				// Accept optional NO INHERIT (CONSTRAINT name CHECK NO INHERIT).
+				noInherit := false
 				if p.acceptIdentKeyword("no") {
 					_ = p.acceptIdentKeyword("inherit")
 					stmt.TableHasNoInheritCheck = true
+					noInherit = true
+				}
+				// Keep TableCheckNoInherit parallel to TableChecks: only the
+				// anonymous branch appended an expr. DU-002 slice 128.
+				if anonCheck {
+					stmt.TableCheckNoInherit = append(stmt.TableCheckNoInherit, noInherit)
+				} else if noInherit && len(stmt.TableNamedChecks) > 0 {
+					// Named branch appended before NO INHERIT was parsed; carry the
+					// per-constraint flag so the named NO-INHERIT check re-emits the
+					// suffix on dump. DU-002 slice 129.
+					stmt.TableNamedChecks[len(stmt.TableNamedChecks)-1].NoInherit = true
 				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwForeign:
-				// Already handled by FK parsing in parseColumnDef / REFERENCES
-				// at the column level. Table-level FOREIGN KEY is a no-op here.
-				for p.cur().Kind != TokenEOF {
-					t := p.cur()
-					if t.Kind == TokenSymbol && t.Value == ")" {
-						break
-					}
-					if t.Kind == TokenSymbol && t.Value == "," {
-						break
-					}
-					p.advance()
+				// CONSTRAINT name FOREIGN KEY (cols) REFERENCES t (cols) … —
+				// table-level (possibly composite) FK. DU-002 slice 53.
+				fk, err := p.parseTableForeignKey(constraintName)
+				if err != nil {
+					return nil, err
 				}
+				stmt.TableForeignKeys = append(stmt.TableForeignKeys, fk)
 			case p.acceptIdentKeyword("exclude"):
 				// CONSTRAINT name EXCLUDE USING method (col WITH op) [INCLUDE (cols)]. M0097-0023.
 				cdef := p.parseExcludeConstraint()
 				cdef.Name = constraintName
+				// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY
+				// IMMEDIATE] — captured (not discarded) so the executor threads it
+				// onto the backing exclusion index via the shared NamedConstraints
+				// loop and the dump re-emits the clause. DU-002 slice 143.
+				p.parseConstraintDeferrable(&cdef.Deferrable, &cdef.InitiallyDeferred)
 				stmt.NamedConstraints = append(stmt.NamedConstraints, cdef)
 			default:
 				// Unknown constraint type: skip to next comma/close-paren.
@@ -2211,10 +2412,15 @@ func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opC
 func (p *parser) parsePartitionBoundValues() ([]Expr, error) {
 	var vals []Expr
 	for {
+		// MINVALUE / MAXVALUE are the unbounded-edge keywords, encoded as a
+		// dedicated PartitionRangeBoundKeyword node so they never collide with the
+		// quoted text literals 'MINVALUE' / 'MAXVALUE' (which parse as StringConst
+		// via parseExpr below). DU-002 slice 261.
+		kwPos := p.cur().Pos
 		if p.acceptIdentKeyword("minvalue") {
-			vals = append(vals, &StringConst{Value: "MINVALUE"})
+			vals = append(vals, &PartitionRangeBoundKeyword{pos: kwPos, IsMax: false})
 		} else if p.acceptIdentKeyword("maxvalue") {
-			vals = append(vals, &StringConst{Value: "MAXVALUE"})
+			vals = append(vals, &PartitionRangeBoundKeyword{pos: kwPos, IsMax: true})
 		} else {
 			e, err := p.parseExpr()
 			if err != nil {
@@ -2227,6 +2433,24 @@ func (p *parser) parsePartitionBoundValues() ([]Expr, error) {
 		}
 	}
 	return vals, nil
+}
+
+// normalizeCompressionMethod canonicalizes a `COMPRESSION <method>` argument for
+// storage on the catalog column. PG accepts "pglz", "lz4", and "default"
+// (case-insensitive); "default" resets attcompression to '\0' (the
+// default_toast_compression GUC applies) and is recorded as the empty string, so
+// no SET COMPRESSION clause is dumped. Any other / empty token also normalizes to
+// "" — goopg does not enforce the method, this is dump-fidelity only.
+// DU-002 slice 183.
+func normalizeCompressionMethod(method string) string {
+	switch strings.ToLower(method) {
+	case "pglz":
+		return "pglz"
+	case "lz4":
+		return "lz4"
+	default:
+		return ""
+	}
 }
 
 // parseColumnDef parses `name TYPE [NOT NULL | PRIMARY KEY]`.
@@ -2261,14 +2485,32 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			}
 			col.Primary = true
 			col.NotNull = true
+			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]
+			// trailer — captured so pg_get_constraintdef / pg_dump re-emit the clause
+			// (rides the backing tbl_pkey index built in the executor). Without this
+			// the keyword fell through to the column-constraint loop's default arm and
+			// failed the whole CREATE TABLE. DU-002 slice 142.
+			p.parseConstraintDeferrable(&col.PrimaryDeferrable, &col.PrimaryInitiallyDeferred)
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull:
 			p.advance() // NULL is the default; absorb it
-		// COLLATE collation_name — ignore collation; goopg v0 doesn't track collations. M0097-0071.
+		// COLLATE collation_name — capture the collation so the column round-trips
+		// through pg_dump (attcollation in pg_attribute → re-emitted COLLATE clause).
+		// goopg v0 does not actually collate; the name is recorded for dump fidelity
+		// only. Accepts an optional schema qualifier (`pg_catalog."C"`); we keep the
+		// bare last component, matching pg_collation.collname. DU-002 slice 188
+		// (was M0097-0071: previously discarded).
 		case p.acceptIdentKeyword("collate"):
-			_, _ = p.parseIdent() // consume collation name (may be quoted)
-		// COMPRESSION method — column-level compression method (PG 14+); goopg v0 ignores it.
+			// parseCollationName accepts an optional schema qualifier
+			// (`pg_catalog."C"`) and returns the trailing component unquoted.
+			collName, _ := p.parseCollationName()
+			col.Collation = collName
+		// COMPRESSION method — column-level compression method (PG 14+). goopg does
+		// not actually TOAST/compress, but records the method so the column
+		// round-trips through pg_dump (which re-emits a SET COMPRESSION clause for
+		// pglz/lz4). DU-002 slice 183.
 		case p.acceptIdentKeyword("compression"):
-			_, _ = p.parseIdent() // consume method name (pglz, lz4, default, etc.)
+			method, _ := p.parseIdent() // consume method name (pglz, lz4, default, etc.)
+			col.Compression = normalizeCompressionMethod(method.Value)
 		// GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY or GENERATED ALWAYS AS (expr) STORED (M0096-0008)
 		case p.acceptIdentKeyword("generated"):
 			isAlways := p.acceptIdentKeyword("always")
@@ -2349,9 +2591,18 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			if !p.acceptSymbol(")") {
 				return ColumnDef{}, p.errAtCur("expected ')' to close generated expression")
 			}
-			// Accept optional STORED keyword (virtual columns not yet supported).
-			_ = p.acceptIdentKeyword("stored")
-			_ = p.acceptIdentKeyword("virtual")
+			// Storage strategy: `STORED` or `VIRTUAL`. PG18's default (when neither
+			// keyword is given) is VIRTUAL. goopg materializes every generated
+			// column on write regardless, but records the declared strategy so
+			// pg_attribute.attgenerated reports the PG-faithful 'v'/'s' code and
+			// pg_dump re-emits the original form. DU-002 slice 194.
+			if p.acceptIdentKeyword("stored") {
+				col.GeneratedVirtual = false
+			} else {
+				// `VIRTUAL` keyword (consumed) or omitted — both mean VIRTUAL.
+				_ = p.acceptIdentKeyword("virtual")
+				col.GeneratedVirtual = true
+			}
 			col.GeneratedAlways = true
 			col.GeneratedExpr = strings.Join(exprToks, " ")
 		// WITH OPTIONS modifier in PARTITION OF column override (M0096-0007)
@@ -2422,6 +2673,21 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 			p.advance()
 			col.Unique = true
+			// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+) follows the keyword
+			// for an inline column UNIQUE. Threaded into catalog.Index so
+			// pg_get_constraintdef re-emits `UNIQUE NULLS NOT DISTINCT (col)`.
+			// DU-002 slice 136.
+			if p.acceptIdentKeyword("nulls") {
+				col.UniqueNullsNotDistinct = p.acceptKeyword(KwNot)
+				if !p.acceptKeyword(KwDistinct) {
+					_ = p.acceptIdentKeyword("distinct")
+				}
+			}
+			// Optional [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]
+			// trailer on the inline column UNIQUE. Without this, a trailing
+			// DEFERRABLE fell through to the default arm and became a HARD PARSE
+			// ERROR for the whole CREATE TABLE. DU-002 slice 141.
+			p.parseConstraintDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
 		// CHECK (expr) inline column constraint. M0097-0014.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 			p.advance()
@@ -2443,8 +2709,8 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			}
 		// CONSTRAINT name CHECK/PRIMARY KEY/UNIQUE/... column constraint.
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint:
-			p.advance()           // CONSTRAINT
-			_, _ = p.parseIdent() // constraint name
+			p.advance()                   // CONSTRAINT
+			cnameTok, _ := p.parseIdent() // constraint name
 			switch {
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 				p.advance()
@@ -2471,9 +2737,27 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				}
 				col.Primary = true
 				col.NotNull = true
+				// Optional DEFERRABLE trailer (named inline column PRIMARY KEY).
+				// DU-002 slice 142.
+				p.parseConstraintDeferrable(&col.PrimaryDeferrable, &col.PrimaryInitiallyDeferred)
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
-				// CONSTRAINT name UNIQUE — absorb keyword (no Unique field on ColumnDef)
+				// CONSTRAINT name UNIQUE [NULLS [NOT] DISTINCT] — named inline
+				// column UNIQUE. Set col.Unique so the executor creates the
+				// backing index, and carry the explicit constraint name so
+				// pg_dump round-trips `ADD CONSTRAINT name UNIQUE (col)`.
+				// DU-002 slice 137.
 				p.advance()
+				col.Unique = true
+				col.UniqueConstraintName = identText(cnameTok)
+				if p.acceptIdentKeyword("nulls") {
+					col.UniqueNullsNotDistinct = p.acceptKeyword(KwNot)
+					if !p.acceptKeyword(KwDistinct) {
+						_ = p.acceptIdentKeyword("distinct")
+					}
+				}
+				// Optional DEFERRABLE trailer (named inline column UNIQUE).
+				// DU-002 slice 141.
+				p.parseConstraintDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
 				// CONSTRAINT name REFERENCES table (cols) — FK; parsed below.
 				// Fall through to FK parsing path by continuing the outer loop.
@@ -2650,15 +2934,48 @@ func (p *parser) parseWithOptions() (map[string]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		keyName := identText(key)
+		// Namespace-qualified storage parameter, e.g. `toast.autovacuum_enabled`.
+		// PostgreSQL's grammar permits a single optional namespace prefix
+		// (reloption_elem: ColLabel '.' ColLabel '=' def_arg in gram.y); the
+		// `toast.` namespace routes the option to the table's TOAST relation.
+		// Combine the two labels into one dotted key so the executor can route
+		// it. A bare `.` lexes as TokenSymbol. M0110-0001 (DU-002 slice 224).
+		if cur := p.cur(); cur.Kind == TokenSymbol && cur.Value == "." {
+			p.advance() // consume '.'
+			sub, serr := p.parseIdent()
+			if serr != nil {
+				return nil, serr
+			}
+			keyName = keyName + "." + identText(sub)
+		}
 		var val string
 		if cur := p.cur(); cur.Kind == TokenOperator && cur.Value == "=" {
 			p.advance() // consume '='
 			t := p.cur()
+			// Optional leading sign: PG's reloption grammar accepts def_arg =
+			// NumericOnly, which permits an optional '+'/'-' before the number
+			// (gram.y), so signed-integer storage parameters such as
+			// `WITH (toast.log_autovacuum_min_duration=-1)` (valid floor -1)
+			// round-trip. Preserve the sign in the raw text for the executor to
+			// parse/bounds-check. M0110-0001 (DU-002 slice 236).
+			sign := ""
+			if t.Kind == TokenOperator && (t.Value == "-" || t.Value == "+") {
+				if t.Value == "-" {
+					sign = "-"
+				}
+				p.advance()
+				t = p.cur()
+			}
 			switch t.Kind {
-			case TokenIntLit, TokenStringLit:
-				val = t.Value
+			case TokenIntLit, TokenStringLit, TokenNumericLit:
+				// TokenNumericLit (e.g. `0.2`) is accepted so REAL-typed storage
+				// parameters such as autovacuum_vacuum_scale_factor round-trip;
+				// the raw text is preserved for the executor to parse/bounds-check.
+				// M0110-0001 (DU-002 slice 199).
+				val = sign + t.Value
 			case TokenIdent, TokenQuotedIdent, TokenKeyword:
-				val = identText(t)
+				val = sign + identText(t)
 			default:
 				return nil, p.errAtCur("expected option value")
 			}
@@ -2667,7 +2984,7 @@ func (p *parser) parseWithOptions() (map[string]string, error) {
 			// Boolean flag without '= value' (e.g. 'oids' in WITH (oids)).
 			val = "true"
 		}
-		out[identText(key)] = val
+		out[keyName] = val
 		if p.acceptSymbol(",") {
 			continue
 		}
@@ -2722,12 +3039,13 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 	if !p.acceptSymbol("(") {
 		return nil, p.errAtCur("expected '('")
 	}
-	cols, colExprs, opClassWithOptions, err := p.parseIndexColumnList()
+	cols, colExprs, colOrders, opClassWithOptions, err := p.parseIndexColumnList()
 	if err != nil {
 		return nil, err
 	}
 	stmt.Columns = cols
 	stmt.ColExprs = colExprs
+	stmt.ColOrders = colOrders
 	stmt.OpClassWithOptions = opClassWithOptions
 	if !p.acceptSymbol(")") {
 		return nil, p.errAtCur("expected ')'")
@@ -2779,15 +3097,82 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 							continue
 						}
 					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "deduplicate_items" {
+					// btree boolean storage parameter. PG accepts on/off/true/
+					// false/yes/no/1/0 (parse_bool); record the value so pg_dump
+					// can re-emit it. DU-002 slice 219.
+					p.advance() // consume "deduplicate_items"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if b, ok := parseReloptionBool(p.cur().Value); ok {
+							stmt.DeduplicateItems = &b
+							p.advance()
+							continue
+						}
+					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "fastupdate" {
+					// GIN boolean storage parameter. PG accepts on/off/true/
+					// false/yes/no/1/0 (parse_bool); record the value so pg_dump
+					// can re-emit it. DU-002 slice 220.
+					p.advance() // consume "fastupdate"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if b, ok := parseReloptionBool(p.cur().Value); ok {
+							stmt.FastUpdate = &b
+							p.advance()
+							continue
+						}
+					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "gin_pending_list_limit" {
+					// GIN integer storage parameter (max pending-list size in kB).
+					// Record the value so pg_dump can re-emit it. DU-002 slice 221.
+					p.advance() // consume "gin_pending_list_limit"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if p.cur().Kind == TokenIntLit {
+							if v, err := p.parseIntLit(); err == nil {
+								stmt.GinPendingListLimit = int(v)
+							}
+							continue
+						}
+					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "pages_per_range" {
+					// BRIN integer storage parameter (heap pages per summarized
+					// range). Record the value so pg_dump can re-emit it. DU-002 slice 222.
+					p.advance() // consume "pages_per_range"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if p.cur().Kind == TokenIntLit {
+							if v, err := p.parseIntLit(); err == nil {
+								stmt.PagesPerRange = int(v)
+							}
+							continue
+						}
+					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "autosummarize" {
+					// BRIN boolean storage parameter. PG accepts on/off/true/
+					// false/yes/no/1/0 (parse_bool); record the value so pg_dump
+					// can re-emit it. DU-002 slice 223.
+					p.advance() // consume "autosummarize"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if b, ok := parseReloptionBool(p.cur().Value); ok {
+							stmt.AutoSummarize = &b
+							p.advance()
+							continue
+						}
+					}
 				}
 				p.advance()
 			}
 		}
 	}
-	// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+ unique index option) — accept and discard.
+	// Optional NULLS [NOT] DISTINCT (PostgreSQL 15+ unique index option).
 	// DISTINCT may be a reserved keyword token (KwDistinct), not just an identifier.
+	// `NULLS NOT DISTINCT` records the flag (treat NULLs as equal for uniqueness);
+	// the bare/default `NULLS DISTINCT` leaves it false. DU-002 slice 134.
 	if p.acceptIdentKeyword("nulls") {
-		_ = p.acceptKeyword(KwNot)
+		stmt.NullsNotDistinct = p.acceptKeyword(KwNot)
 		if !p.acceptKeyword(KwDistinct) {
 			_ = p.acceptIdentKeyword("distinct")
 		}
@@ -2805,6 +3190,20 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 	return stmt, nil
 }
 
+// parseReloptionBool maps a storage-parameter boolean token to its value,
+// mirroring PostgreSQL's parse_bool (on/off/true/false/yes/no/1/0,
+// case-insensitive). The second return is false for an unrecognized token.
+func parseReloptionBool(v string) (bool, bool) {
+	switch strings.ToLower(v) {
+	case "on", "true", "yes", "1", "t", "y":
+		return true, true
+	case "off", "false", "no", "0", "f", "n":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 // parseIndexColumnList parses the column list inside CREATE INDEX (…).
 // Unlike parseColumnNameList it handles:
 //   - simple column names
@@ -2816,9 +3215,10 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 // For expression entries the column name is stored as "" and the parsed
 // expression is returned in the parallel exprs slice. Simple column names
 // are stored verbatim with nil in exprs.
-func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
+func (p *parser) parseIndexColumnList() ([]string, []Expr, []IndexColOrder, string, error) {
 	var cols []string
 	var exprs []Expr
+	var orders []IndexColOrder
 	var opClassWithOptions string
 	for {
 		var colName string
@@ -2829,7 +3229,7 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
 			// Parse and capture the expression.
 			e, err := p.parseExpr()
 			if err != nil {
-				return nil, nil, "", err
+				return nil, nil, nil, "", err
 			}
 			colName = "" // expression — no simple column name
 			colExpr = e
@@ -2837,14 +3237,14 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
 			// Parenthesised expression: (expr)
 			e, err := p.parseExpr()
 			if err != nil {
-				return nil, nil, "", err
+				return nil, nil, nil, "", err
 			}
 			colName = ""
 			colExpr = e
 		} else {
 			tok, err := p.parseIdent()
 			if err != nil {
-				return nil, nil, "", err
+				return nil, nil, nil, "", err
 			}
 			colName = identText(tok)
 		}
@@ -2856,8 +3256,10 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
 		}
 
 		// Optional opclass name (bare ident that is not a known keyword
-		// and not ',' or ')')
-		if p.cur().Kind == TokenIdent {
+		// and not ',' or ')'). `NULLS` lexes as a bare TokenIdent, so guard
+		// against it here — otherwise `(col NULLS FIRST)` mis-reads NULLS as an
+		// opclass name and the trailing FIRST/LAST then fails to parse.
+		if p.cur().Kind == TokenIdent && !strings.EqualFold(p.cur().Value, "nulls") {
 			// This is the opclass name — capture it.
 			opClassName := p.cur().Value
 			p.advance()
@@ -2881,22 +3283,37 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
 			}
 		}
 
-		// Optional ASC/DESC
-		_ = p.acceptKeyword(KwAsc) || p.acceptKeyword(KwDesc)
+		// Optional ASC/DESC. NULLS FIRST is the btree default for DESC, NULLS
+		// LAST for ASC, so pre-resolve NullsFirst to the descending flag and let
+		// an explicit NULLS clause below override it (mirrors PG's indoption).
+		var order IndexColOrder
+		if p.acceptKeyword(KwDesc) {
+			order.Descending = true
+		} else {
+			_ = p.acceptKeyword(KwAsc)
+		}
+		order.NullsFirst = order.Descending
 
 		// Optional NULLS FIRST/LAST
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull {
 			p.advance() // NULLS
-			p.acceptIdentKeyword("first")
-			p.acceptIdentKeyword("last")
+			if p.acceptIdentKeyword("first") {
+				order.NullsFirst = true
+			} else if p.acceptIdentKeyword("last") {
+				order.NullsFirst = false
+			}
 		}
 		if p.acceptIdentKeyword("nulls") {
-			p.acceptIdentKeyword("first")
-			p.acceptIdentKeyword("last")
+			if p.acceptIdentKeyword("first") {
+				order.NullsFirst = true
+			} else if p.acceptIdentKeyword("last") {
+				order.NullsFirst = false
+			}
 		}
 
 		cols = append(cols, colName)
 		exprs = append(exprs, colExpr)
+		orders = append(orders, order)
 		if !p.acceptSymbol(",") {
 			break
 		}
@@ -2906,7 +3323,7 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, string, error) {
 			break
 		}
 	}
-	return cols, exprs, opClassWithOptions, nil
+	return cols, exprs, orders, opClassWithOptions, nil
 }
 
 // parseDrop dispatches on the next keyword after DROP.
@@ -3360,6 +3777,84 @@ func (p *parser) parseDrop() (Stmt, error) {
 	return nil, p.errAtCur("expected TABLE, INDEX, VIEW, SEQUENCE, SCHEMA, TYPE, PUBLICATION, SUBSCRIPTION, FUNCTION, PROCEDURE, or TRIGGER after DROP")
 }
 
+// parseTableForeignKey parses a table-level FOREIGN KEY constraint, positioned
+// on the FOREIGN keyword:
+//
+//	FOREIGN KEY (cols) REFERENCES table [(refcols)]
+//	  [ON DELETE action] [ON UPDATE action]
+//	  [[NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]]
+//
+// The constraint name (or "" for an anonymous constraint) is supplied by the
+// caller. This is the multi-column sibling of the inline column REFERENCES path
+// in parseColumnDef; the action/deferrable grammar is kept in lockstep with it
+// so both round-trip identically through pg_constraint and pg_dump. DU-002 slice 53.
+func (p *parser) parseTableForeignKey(name string) (TableForeignKeyDef, error) {
+	fk := TableForeignKeyDef{Name: name}
+	p.advance() // FOREIGN
+	if _, err := p.expectKeyword(KwKey); err != nil {
+		return TableForeignKeyDef{}, err
+	}
+	if !p.acceptSymbol("(") {
+		return TableForeignKeyDef{}, p.errAtCur("expected '(' after FOREIGN KEY")
+	}
+	cols, err := p.parseColumnNameList()
+	if err != nil {
+		return TableForeignKeyDef{}, err
+	}
+	if !p.acceptSymbol(")") {
+		return TableForeignKeyDef{}, p.errAtCur("expected ')'")
+	}
+	fk.Columns = cols
+	if _, err := p.expectKeyword(KwReferences); err != nil {
+		return TableForeignKeyDef{}, err
+	}
+	refTable, err := p.parseObjectName()
+	if err != nil {
+		return TableForeignKeyDef{}, err
+	}
+	fk.RefTable = refTable
+	if p.acceptSymbol("(") {
+		refCols, err := p.parseColumnNameList()
+		if err != nil {
+			return TableForeignKeyDef{}, err
+		}
+		if !p.acceptSymbol(")") {
+			return TableForeignKeyDef{}, p.errAtCur("expected ')'")
+		}
+		fk.RefColumns = refCols
+	}
+	// ON DELETE / ON UPDATE referential-action clauses. ON is KwOn (reserved).
+	for p.acceptKeyword(KwOn) {
+		isDelete := p.acceptKeyword(KwDelete)
+		if !isDelete {
+			_ = p.acceptKeyword(KwUpdate)
+		}
+		action := parseFKAction(p)
+		if isDelete {
+			fk.OnDelete = action
+		} else {
+			fk.OnUpdate = action
+		}
+	}
+	// [NOT] DEFERRABLE [INITIALLY DEFERRED | INITIALLY IMMEDIATE]; also accept a
+	// bare INITIALLY DEFERRED (implies DEFERRABLE), mirroring the inline path.
+	if p.acceptKeyword(KwNot) {
+		_, _ = p.expectKeyword(KwDeferrable)
+		fk.Deferrable = false
+	} else if p.acceptKeyword(KwDeferrable) {
+		fk.Deferrable = true
+		if p.acceptIdentKeyword("initially") {
+			fk.InitiallyDeferred = p.acceptIdentKeyword("deferred")
+			_ = p.acceptIdentKeyword("immediate")
+		}
+	} else if p.acceptIdentKeyword("initially") {
+		fk.Deferrable = true
+		fk.InitiallyDeferred = p.acceptIdentKeyword("deferred")
+		_ = p.acceptIdentKeyword("immediate")
+	}
+	return fk, nil
+}
+
 // parseExcludeConstraint parses the body of EXCLUDE USING method (col WITH op) [INCLUDE (cols)]
 // after the EXCLUDE keyword has already been consumed. Returns a TableConstraintDef. M0097-0023.
 func (p *parser) parseExcludeConstraint() TableConstraintDef {
@@ -3407,6 +3902,43 @@ func (p *parser) parseExcludeConstraint() TableConstraintDef {
 		}
 	}
 	return cdef
+}
+
+// parseDomainCheckExpr is parseCheckExpr's domain twin: it reconstructs the raw
+// CHECK predicate but renders the domain value placeholder as uppercase `VALUE`,
+// matching PG's ruleutils deparse (pg_get_constraintdef). The shared
+// parseCheckExpr must NOT do this — in a TABLE check `value` may be a real column
+// name. String literals are left untouched (a literal `'value'` stays lowercase).
+// DU-002 slice 96.
+func (p *parser) parseDomainCheckExpr() (string, error) {
+	if !p.acceptSymbol("(") {
+		return "", p.errAtCur("expected '(' after CHECK")
+	}
+	depth := 1
+	var parts []string
+	for depth > 0 && p.cur().Kind != TokenEOF {
+		t := p.cur()
+		switch {
+		case t.Kind == TokenSymbol && t.Value == "(":
+			depth++
+			parts = append(parts, "(")
+		case t.Kind == TokenSymbol && t.Value == ")":
+			depth--
+			if depth == 0 {
+				p.advance()
+				return strings.Join(parts, " "), nil
+			}
+			parts = append(parts, ")")
+		case t.Kind == TokenStringLit:
+			parts = append(parts, "'"+strings.ReplaceAll(t.Value, "'", "''")+"'")
+		case (t.Kind == TokenIdent || t.Kind == TokenKeyword) && strings.EqualFold(t.Value, "value"):
+			parts = append(parts, "VALUE")
+		default:
+			parts = append(parts, t.Value)
+		}
+		p.advance()
+	}
+	return "", p.errAtCur("unterminated CHECK expression")
 }
 
 // parseCheckExpr parses `( expr )` after CHECK and returns the raw SQL expression
@@ -3855,7 +4387,11 @@ func (p *parser) parseAlter() (Stmt, error) {
 			case p.acceptIdentKeyword("cycle"):
 				stmt.Cycle = true
 			case p.acceptIdentKeyword("cache"):
-				_, _ = p.parseInt64()
+				val, err := p.parseInt64()
+				if err != nil {
+					return stmt, err
+				}
+				stmt.Cache = &val
 			case p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet):
 				// SET LOGGED / SET UNLOGGED — no-op.
 				_ = p.acceptIdentKeyword("logged") || p.acceptIdentKeyword("unlogged") || p.acceptKeyword(KwUnlogged)
@@ -4343,20 +4879,15 @@ func (p *parser) parseAlter() (Stmt, error) {
 		// Check for SET (options) or SET STORAGE pattern.
 		if p.acceptIdentKeyword("set") || p.acceptKeyword(KwSet) {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-				// Consume the options block.
-				depth := 1
-				p.advance() // consume '('
-				for depth > 0 && p.cur().Kind != TokenEOF {
-					if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-						depth++
-					} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
-						depth--
-					}
-					p.advance()
-				}
-				// Emit AlterTableAlterColumnSet action.
+				// SET (opt=value, …) — per-column attribute options (e.g.
+				// n_distinct). Capture each pair, normalized to PG's stored
+				// `name=value` form, so pg_dump re-emits the clause via
+				// pg_attribute.attoptions. DU-002 slice 185.
+				opts := p.parseColumnSetOptions()
 				stmt.Actions = append(stmt.Actions, AlterTableAction{
-					Kind: AlterTableAlterColumnSet,
+					Kind:       AlterTableAlterColumnSet,
+					ColumnName: colName,
+					SetOptions: opts,
 				})
 				return stmt, nil
 			}
@@ -4371,6 +4902,46 @@ func (p *parser) parseAlter() (Stmt, error) {
 					Kind:        AlterTableSetStorage,
 					ColumnName:  colName,
 					StorageType: storageType,
+				})
+				return stmt, nil
+			}
+			// SET COMPRESSION method — record TOAST compression on the catalog
+			// column for pg_dump round-trip fidelity (goopg does not TOAST).
+			// DU-002 slice 183.
+			if p.acceptIdentKeyword("compression") {
+				method := ""
+				if p.cur().Kind == TokenIdent || p.cur().Kind == TokenKeyword {
+					method = p.cur().Value
+					p.advance()
+				}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:            AlterTableSetCompression,
+					ColumnName:      colName,
+					CompressionType: normalizeCompressionMethod(method),
+				})
+				return stmt, nil
+			}
+			// SET STATISTICS value — record the per-column statistics target on the
+			// catalog column for pg_dump round-trip fidelity. pg_dump emits an
+			// `ALTER TABLE ONLY ... ALTER COLUMN ... SET STATISTICS <n>` whenever
+			// attstattarget >= 0 (pg_dump.c dumpTableSchema); the default (-1) emits
+			// nothing. goopg does not sample statistics targets at this granularity;
+			// the value is recorded purely so the column round-trips. DU-002 slice 184.
+			if p.acceptIdentKeyword("statistics") {
+				statsVal := ""
+				if (p.cur().Kind == TokenOperator || p.cur().Kind == TokenSymbol) && p.cur().Value == "-" {
+					// SET STATISTICS -1 resets to the default.
+					statsVal = "-"
+					p.advance()
+				}
+				if p.cur().Kind == TokenIntLit {
+					statsVal += p.cur().Value
+					p.advance()
+				}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:       AlterTableSetStatistics,
+					ColumnName: colName,
+					CheckExpr:  statsVal,
 				})
 				return stmt, nil
 			}
@@ -4412,6 +4983,61 @@ func (p *parser) parseAlter() (Stmt, error) {
 		stmt.Actions = append(stmt.Actions, next)
 	}
 	return stmt, nil
+}
+
+// parseColumnSetOptions parses a parenthesized per-column attribute option list
+// (`(opt=value, …)`) starting at the opening `(`, consuming through the matching
+// `)`. Each option is normalized to PG's stored `name=value` form so it can be
+// recorded on catalog.Column.Options and re-emitted by pg_dump via
+// pg_attribute.attoptions (the dump renders `array_to_string(attoptions, ', ')`).
+// A bare option name with no `=value` is captured verbatim. DU-002 slice 185.
+func (p *parser) parseColumnSetOptions() []string {
+	var opts []string
+	if !(p.cur().Kind == TokenSymbol && p.cur().Value == "(") {
+		return opts
+	}
+	p.advance() // consume '('
+	for p.cur().Kind != TokenEOF {
+		if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
+			p.advance() // consume ')'
+			break
+		}
+		// Option name.
+		name := ""
+		if p.cur().Kind == TokenIdent || p.cur().Kind == TokenQuotedIdent || p.cur().Kind == TokenKeyword {
+			name = p.cur().Value
+			p.advance()
+		}
+		// Optional '= value'.
+		val := ""
+		hasVal := false
+		if (p.cur().Kind == TokenSymbol || p.cur().Kind == TokenOperator) && p.cur().Value == "=" {
+			hasVal = true
+			p.advance() // consume '='
+			// Collect value tokens up to ',' or ')'. A leading '-' lexes as an
+			// operator (negative n_distinct), so concatenate token values with
+			// no spaces to reconstruct e.g. "-0.5".
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && (p.cur().Value == "," || p.cur().Value == ")") {
+					break
+				}
+				val += p.cur().Value
+				p.advance()
+			}
+		}
+		if name != "" {
+			if hasVal {
+				opts = append(opts, name+"="+val)
+			} else {
+				opts = append(opts, name)
+			}
+		}
+		// Skip a trailing comma between options.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+			p.advance()
+		}
+	}
+	return opts
 }
 
 func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
@@ -4665,6 +5291,22 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				return AlterTableAction{}, p.errAtCur("expected ')'")
 			}
 		}
+		// Optional ON DELETE / ON UPDATE referential-action clauses, mirroring
+		// the inline column-FK path so actions survive into pg_constraint and
+		// pg_dump (DU-002 slice 52). ON is KwOn (reserved).
+		var onDelete, onUpdate FKAction
+		for p.acceptKeyword(KwOn) {
+			isDelete := p.acceptKeyword(KwDelete)
+			if !isDelete {
+				_ = p.acceptKeyword(KwUpdate)
+			}
+			action := parseFKAction(p)
+			if isDelete {
+				onDelete = action
+			} else {
+				onUpdate = action
+			}
+		}
 		// Optional [NOT] DEFERRABLE trailer.
 		deferrable := false
 		if p.acceptKeyword(KwNot) {
@@ -4680,6 +5322,8 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act.RefTable = refTable
 		act.RefColumns = refCols
 		act.Deferrable = deferrable
+		act.OnDelete = onDelete
+		act.OnUpdate = onUpdate
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 		// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
@@ -4802,17 +5446,49 @@ func (p *parser) parseCreateType(pos int) (Stmt, error) {
 					break
 				}
 				fname := strings.ToLower(p.advance().Value)
-				// Collect type tokens until ',' or ')'
+				// Collect type tokens until a TOP-LEVEL ',' (next field) or ')'
+				// (end of field list). Track paren depth so a typmod like
+				// numeric(10,2) or varchar(8) — whose inner ',' / ')' would
+				// otherwise prematurely terminate the field — is captured intact.
+				// parseCompositeFieldType (executor) reads the space-joined form.
+				// DU-002 slice 247.
 				var typeParts []string
-				for p.cur().Kind != TokenEOF &&
-					!(p.cur().Kind == TokenSymbol && (p.cur().Value == "," || p.cur().Value == ")")) {
-					typeParts = append(typeParts, p.cur().Value)
+				parenDepth := 0
+				for p.cur().Kind != TokenEOF {
+					tok := p.cur()
+					if tok.Kind == TokenSymbol && parenDepth == 0 &&
+						(tok.Value == "," || tok.Value == ")") {
+						break
+					}
+					// A top-level COLLATE clause is not part of the type — stop
+					// here and capture it separately so the field's atttypid stays
+					// clean and its attcollation round-trips. DU-002 slice 257.
+					if parenDepth == 0 && tok.Kind != TokenSymbol &&
+						strings.EqualFold(tok.Value, "collate") {
+						break
+					}
+					if tok.Kind == TokenSymbol && tok.Value == "(" {
+						parenDepth++
+					} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+						parenDepth--
+					}
+					typeParts = append(typeParts, tok.Value)
 					p.advance()
 				}
-				stmt.CompositeFields = append(stmt.CompositeFields, TypeField{
+				field := TypeField{
 					Name:    fname,
 					ColType: strings.Join(typeParts, " "),
-				})
+				}
+				// Optional per-field COLLATE "<name>" — record the collation so the
+				// field's pg_attribute.attcollation shadows the type default and
+				// pg_dump's dumpCompositeType re-emits a `COLLATE` clause, mirroring
+				// the table-column path (slice 188). goopg v0 does not actually
+				// collate; the name is kept for dump fidelity. DU-002 slice 257.
+				if p.acceptIdentKeyword("collate") {
+					collName, _ := p.parseCollationName()
+					field.Collation = collName
+				}
+				stmt.CompositeFields = append(stmt.CompositeFields, field)
 				if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
 					p.advance() // consume ','
 				} else {
@@ -4863,8 +5539,47 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		return nil, err
 	}
 	stmt := &AlterTypeStmt{pos: pos, Name: name.Name, Schema: name.Schema}
+
+	// Attribute subcommand list: ADD/DROP/ALTER ATTRIBUTE …, optionally
+	// comma-combined. PG's ALTER TYPE grammar only allows these three actions to
+	// be combined in one statement (ADD VALUE / RENAME / OWNER TO are singular and
+	// handled by the dedicated branches below). DU-002 slices 253/255/256/258/259
+	// for the single forms; slice 260 adds the comma-combined case.
+	// parseOneAttrCmd backtracks and reports ok=false for the non-attribute forms,
+	// so this is tried first without disturbing them.
+	if cmd, ok, acErr := p.parseOneAttrCmd(); acErr != nil {
+		return nil, acErr
+	} else if ok {
+		stmt.AttrCmds = append(stmt.AttrCmds, cmd)
+		for p.acceptSymbol(",") {
+			cmd2, ok2, acErr2 := p.parseOneAttrCmd()
+			if acErr2 != nil {
+				return nil, acErr2
+			}
+			if !ok2 {
+				// A trailing non-attribute subcommand (e.g. OWNER TO) — stub-consume
+				// to ';'/EOF, matching the legacy single-subcommand trailers.
+				for p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+						break
+					}
+					p.advance()
+				}
+				break
+			}
+			stmt.AttrCmds = append(stmt.AttrCmds, cmd2)
+		}
+		// Mirror the first subcommand into the legacy scalar fields so the
+		// single-subcommand executor branches and the existing parser unit tests
+		// observe identical AST; the executor routes len(AttrCmds) > 1 through
+		// execAlterTypeAttrCmds. DU-002 slice 260.
+		p.mirrorFirstAttrCmd(stmt)
+		return stmt, nil
+	}
+
 	// ADD VALUE [IF NOT EXISTS] 'val' [BEFORE|AFTER 'ref']
 	// NOTE: ADD is a reserved keyword (KwAdd), not an ident keyword — use acceptKeyword.
+	// (ADD ATTRIBUTE is handled above by parseOneAttrCmd.)
 	if p.acceptKeyword(KwAdd) {
 		if !p.acceptIdentKeyword("value") {
 			// consume until ';' or EOF
@@ -4907,6 +5622,28 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		}
 		return stmt, nil
 	}
+	// (DROP ATTRIBUTE is handled above by parseOneAttrCmd.) Any other DROP
+	// variant — consume as a stub. DROP is a reserved keyword (KwDrop).
+	if p.acceptKeyword(KwDrop) {
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return stmt, nil
+	}
+	// (ALTER ATTRIBUTE is handled above by parseOneAttrCmd.) Any other ALTER
+	// variant — consume as a stub. ALTER is a reserved keyword (KwAlter).
+	if p.acceptKeyword(KwAlter) {
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return stmt, nil
+	}
 	// RENAME VALUE 'old' TO 'new' (enum label rename). M0097-0022.
 	if p.acceptIdentKeyword("rename") {
 		if p.acceptIdentKeyword("value") {
@@ -4936,7 +5673,32 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 			stmt.RenameTo = newName.Name
 			return stmt, nil
 		}
-		// Other RENAME variants (e.g. RENAME ATTRIBUTE) — consume as stub.
+		// RENAME ATTRIBUTE old TO new [CASCADE|RESTRICT] — rename a composite
+		// type field so the new name round-trips through pg_dump. DU-002 slice 254.
+		// RENAME ATTRIBUTE is singular (PG forbids combining it), so it keeps its
+		// own legacy path rather than joining AttrCmds.
+		if p.acceptIdentKeyword("attribute") {
+			if p.cur().Kind != TokenIdent {
+				return nil, p.errAtCur("expected attribute name after RENAME ATTRIBUTE")
+			}
+			stmt.RenameAttrOld = strings.ToLower(p.advance().Value)
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			if p.cur().Kind != TokenIdent {
+				return nil, p.errAtCur("expected new attribute name after TO")
+			}
+			stmt.RenameAttrNew = strings.ToLower(p.advance().Value)
+			// Consume trailing CASCADE|RESTRICT to ';'/EOF as a stub.
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return stmt, nil
+		}
+		// Other RENAME variants — consume as stub.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break
@@ -4953,6 +5715,162 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		p.advance()
 	}
 	return stmt, nil
+}
+
+// parseOneAttrCmd parses a single ALTER TYPE attribute subcommand
+// (ADD|DROP|ALTER ATTRIBUTE …) starting at its leading keyword. It returns
+// ok=true with the parsed command when the current position begins an attribute
+// subcommand, and ok=false WITHOUT consuming anything when it does not (e.g.
+// ADD VALUE, RENAME VALUE/TO/ATTRIBUTE, OWNER TO) so the caller can fall through
+// to those dedicated branches. The cursor (p.idx) is restored on a non-match.
+// DU-002 slice 260.
+func (p *parser) parseOneAttrCmd() (AlterTypeAttrCmd, bool, error) {
+	save := p.idx
+	// ADD ATTRIBUTE name type [COLLATE name] [CASCADE|RESTRICT]. DU-002 slice 253/258.
+	if p.acceptKeyword(KwAdd) {
+		if p.acceptIdentKeyword("attribute") {
+			if p.cur().Kind != TokenIdent {
+				return AlterTypeAttrCmd{}, false, p.errAtCur("expected attribute name after ADD ATTRIBUTE")
+			}
+			cmd := AlterTypeAttrCmd{Kind: "add", Name: strings.ToLower(p.advance().Value)}
+			cmd.Type = p.parseAttrTypeTokens()
+			if p.acceptIdentKeyword("collate") {
+				cmd.Collation, _ = p.parseCollationName()
+			}
+			p.consumeAttrCmdTrailer()
+			return cmd, true, nil
+		}
+		p.idx = save
+		return AlterTypeAttrCmd{}, false, nil
+	}
+	// DROP ATTRIBUTE [IF EXISTS] name [CASCADE|RESTRICT]. DU-002 slice 255.
+	if p.acceptKeyword(KwDrop) {
+		if p.acceptIdentKeyword("attribute") {
+			cmd := AlterTypeAttrCmd{Kind: "drop"}
+			if p.acceptKeyword(KwIf) {
+				if _, err := p.expectKeyword(KwExists); err != nil {
+					return AlterTypeAttrCmd{}, false, err
+				}
+				cmd.IfExists = true
+			}
+			if p.cur().Kind != TokenIdent {
+				return AlterTypeAttrCmd{}, false, p.errAtCur("expected attribute name after DROP ATTRIBUTE")
+			}
+			cmd.Name = strings.ToLower(p.advance().Value)
+			p.consumeAttrCmdTrailer()
+			return cmd, true, nil
+		}
+		p.idx = save
+		return AlterTypeAttrCmd{}, false, nil
+	}
+	// ALTER ATTRIBUTE name [SET DATA] TYPE newtype [COLLATE name] [CASCADE|RESTRICT].
+	// DU-002 slice 256/259.
+	if p.acceptKeyword(KwAlter) {
+		if p.acceptIdentKeyword("attribute") {
+			if p.cur().Kind != TokenIdent {
+				return AlterTypeAttrCmd{}, false, p.errAtCur("expected attribute name after ALTER ATTRIBUTE")
+			}
+			cmd := AlterTypeAttrCmd{Kind: "alter", Name: strings.ToLower(p.advance().Value)}
+			if p.acceptKeyword(KwSet) {
+				if !p.acceptIdentKeyword("data") {
+					return AlterTypeAttrCmd{}, false, p.errAtCur("expected DATA after SET in ALTER ATTRIBUTE")
+				}
+			}
+			if !p.acceptIdentKeyword("type") {
+				return AlterTypeAttrCmd{}, false, p.errAtCur("expected TYPE in ALTER ATTRIBUTE")
+			}
+			cmd.Type = p.parseAttrTypeTokens()
+			if p.acceptIdentKeyword("collate") {
+				cmd.Collation, _ = p.parseCollationName()
+			}
+			p.consumeAttrCmdTrailer()
+			return cmd, true, nil
+		}
+		p.idx = save
+		return AlterTypeAttrCmd{}, false, nil
+	}
+	return AlterTypeAttrCmd{}, false, nil
+}
+
+// parseAttrTypeTokens collects the type-token string of an ADD/ALTER ATTRIBUTE
+// subcommand, paren-tracking typmods so `numeric(12,3)` / `zip[]` survive intact.
+// It stops at a top-level ',' (the next subcommand), ';'/EOF, or a top-level
+// COLLATE/USING/CASCADE/RESTRICT keyword (which are not part of the type and are
+// parsed/consumed by the caller). DU-002 slice 260 — shared by the ADD and ALTER
+// branches of parseOneAttrCmd, mirroring the inline loops of slices 256/258.
+func (p *parser) parseAttrTypeTokens() string {
+	var typeParts []string
+	parenDepth := 0
+	for p.cur().Kind != TokenEOF {
+		tok := p.cur()
+		if tok.Kind == TokenSymbol && tok.Value == ";" {
+			break
+		}
+		if tok.Kind == TokenSymbol && parenDepth == 0 && tok.Value == "," {
+			break
+		}
+		if parenDepth == 0 && tok.Kind != TokenSymbol &&
+			(strings.EqualFold(tok.Value, "collate") || strings.EqualFold(tok.Value, "using") ||
+				strings.EqualFold(tok.Value, "cascade") || strings.EqualFold(tok.Value, "restrict")) {
+			break
+		}
+		if tok.Kind == TokenSymbol && tok.Value == "(" {
+			parenDepth++
+		} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+			parenDepth--
+		}
+		typeParts = append(typeParts, tok.Value)
+		p.advance()
+	}
+	return strings.Join(typeParts, " ")
+}
+
+// consumeAttrCmdTrailer stub-consumes the optional per-subcommand
+// USING/CASCADE/RESTRICT trailer of an attribute subcommand (goopg honours none
+// of them). It paren-tracks so a comma inside parens is not mistaken for the
+// next subcommand, and stops at a top-level ',' or ';'/EOF. DU-002 slice 260.
+func (p *parser) consumeAttrCmdTrailer() {
+	parenDepth := 0
+	for p.cur().Kind != TokenEOF {
+		tok := p.cur()
+		if tok.Kind == TokenSymbol && tok.Value == ";" {
+			break
+		}
+		if tok.Kind == TokenSymbol && parenDepth == 0 && tok.Value == "," {
+			break
+		}
+		if tok.Kind == TokenSymbol && tok.Value == "(" {
+			parenDepth++
+		} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+			parenDepth--
+		}
+		p.advance()
+	}
+}
+
+// mirrorFirstAttrCmd copies AttrCmds[0] into the legacy scalar fields of the
+// statement so single-subcommand ALTER TYPE behaves identically to slices
+// 253/255/256/258/259 (executor branches + parser unit tests read the scalar
+// fields). The executor only consults the scalar fields when len(AttrCmds) <= 1.
+// DU-002 slice 260.
+func (p *parser) mirrorFirstAttrCmd(stmt *AlterTypeStmt) {
+	if len(stmt.AttrCmds) == 0 {
+		return
+	}
+	c := stmt.AttrCmds[0]
+	switch c.Kind {
+	case "add":
+		stmt.AddAttrName = c.Name
+		stmt.AddAttrType = c.Type
+		stmt.AddAttrCollation = c.Collation
+	case "drop":
+		stmt.DropAttrName = c.Name
+		stmt.DropAttrIfExists = c.IfExists
+	case "alter":
+		stmt.AlterAttrName = c.Name
+		stmt.AlterAttrType = c.Type
+		stmt.AlterAttrCollation = c.Collation
+	}
 }
 
 // parseDropType picks up after DROP TYPE has been detected.
@@ -4990,21 +5908,31 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 	if baseTypeName.Schema != "" {
 		stmt.BaseType = baseTypeName.Schema + "." + baseTypeName.Name
 	}
-	// Skip optional type arguments like (5) or (8,2).
+	// Capture optional type-modifier arguments like (20) or (10,2) so the
+	// domain's base type round-trips through pg_dump with its declared length/
+	// precision: dumpDomain renders format_type(typbasetype, typtypmod), and a
+	// discarded typmod dumped varchar(20) as bare `character varying`. The cast
+	// PG appends to a string DEFAULT stays typmod-less (format_type(consttype,
+	// -1)), so only the base render needs these. DU-002 slice 95.
 	if p.acceptSymbol("(") {
-		depth := 1
-		for depth > 0 && p.cur().Kind != TokenEOF {
+		for {
 			t := p.cur()
-			if t.Kind == TokenSymbol && t.Value == "(" {
-				depth++
-			} else if t.Kind == TokenSymbol && t.Value == ")" {
-				depth--
-				if depth == 0 {
-					p.advance()
-					break
-				}
+			if t.Kind != TokenIntLit {
+				return nil, p.errAtCur("expected integer in type modifier")
 			}
 			p.advance()
+			n, err := strconv.ParseInt(t.Value, 10, 64)
+			if err != nil {
+				return nil, &SyntaxError{Pos: t.Pos, Message: "invalid integer: " + t.Value}
+			}
+			stmt.BaseTypeArgs = append(stmt.BaseTypeArgs, n)
+			if p.acceptSymbol(",") {
+				continue
+			}
+			if !p.acceptSymbol(")") {
+				return nil, p.errAtCur("expected ',' or ')'")
+			}
+			break
 		}
 	}
 	// Accept array notation: int[], text[], etc. Append [] to the base type
@@ -5048,40 +5976,45 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 				stmt.NotNull = false
 				continue
 			case KwDefault:
-				// Skip DEFAULT expression (consume until NOT/NULL/CHECK/CONSTRAINT/COLLATE/';')
+				// DEFAULT expr — parse the expression so it round-trips through
+				// pg_dump (typdefaultbin → pg_get_expr). parseExpr stops at the
+				// next NOT/NULL/CHECK/CONSTRAINT/COLLATE keyword or ';'. DU-002 slice 92.
 				p.advance()
-				for p.cur().Kind != TokenEOF {
-					if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
-						break
-					}
-					if p.cur().Kind == TokenKeyword {
-						kw := p.cur().Keyword
-						if kw == KwNot || kw == KwNull || kw == KwCheck || kw == KwConstraint {
-							break
-						}
-					}
-					if p.cur().Kind == TokenIdent {
-						v := strings.ToLower(p.cur().Value)
-						if v == "collate" {
-							break
-						}
-					}
-					p.advance()
+				expr, err := p.parseExpr()
+				if err != nil {
+					return nil, err
 				}
+				stmt.Default = expr
 				continue
 			case KwConstraint:
-				// CONSTRAINT name CHECK (…) — skip constraint name.
+				// CONSTRAINT name CHECK (…) — capture the explicit constraint name.
 				p.advance()
-				_, _ = p.parseIdent() // constraint name
+				cname, _ := p.parseIdent() // constraint name
 				// Fall through to CHECK handling below.
 				if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck {
 					p.advance()
 					if vals := p.tryParseCheckInValues(); vals != nil {
 						if stmt.CheckInValues == nil {
 							stmt.CheckInValues = vals
+							// Preserve the explicit CONSTRAINT name so the
+							// deparsed `= ANY (ARRAY[...])` round-trips with the
+							// right conname through pg_dump. DU-002 slice 97.
+							if stmt.CheckName == "" {
+								stmt.CheckName = cname.Value
+							}
 						}
-					} else if err := p.skipParenExpr(); err != nil {
-						return nil, err
+					} else {
+						// Generic CHECK expression: capture the raw predicate text
+						// (e.g. `VALUE > 0`) so it round-trips through pg_dump via
+						// pg_get_constraintdef. DU-002 slice 96.
+						expr, err := p.parseDomainCheckExpr()
+						if err != nil {
+							return nil, err
+						}
+						if stmt.CheckExpr == "" {
+							stmt.CheckExpr = expr
+							stmt.CheckName = cname.Value
+						}
 					}
 				}
 				continue
@@ -5091,8 +6024,15 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 					if stmt.CheckInValues == nil {
 						stmt.CheckInValues = vals
 					}
-				} else if err := p.skipParenExpr(); err != nil {
-					return nil, err
+				} else {
+					// Generic CHECK expression (auto-named <domain>_check). DU-002 slice 96.
+					expr, err := p.parseDomainCheckExpr()
+					if err != nil {
+						return nil, err
+					}
+					if stmt.CheckExpr == "" {
+						stmt.CheckExpr = expr
+					}
 				}
 				continue
 			}
@@ -5107,28 +6047,6 @@ func (p *parser) parseCreateDomain(pos int) (Stmt, error) {
 		break
 	}
 	return stmt, nil
-}
-
-// skipParenExpr skips a balanced parenthesised expression.
-func (p *parser) skipParenExpr() error {
-	if !p.acceptSymbol("(") {
-		return p.errAtCur("expected '('")
-	}
-	depth := 1
-	for depth > 0 && p.cur().Kind != TokenEOF {
-		t := p.cur()
-		if t.Kind == TokenSymbol && t.Value == "(" {
-			depth++
-		} else if t.Kind == TokenSymbol && t.Value == ")" {
-			depth--
-			if depth == 0 {
-				p.advance()
-				break
-			}
-		}
-		p.advance()
-	}
-	return nil
 }
 
 // tryParseCheckInValues tries to parse a CHECK (VALUE IN ('a','b','c')) pattern.
@@ -5147,6 +6065,19 @@ func (p *parser) tryParseCheckInValues() []string {
 		return nil
 	}
 	p.advance() // consume VALUE
+	// Optionally accept a cast on the VALUE left-hand side, e.g.
+	// `CHECK (VALUE::text IN (...))`. Types without an equality operator (json)
+	// cannot use the bare `VALUE IN (...)` form, so the domain definition casts
+	// VALUE to a comparable type (text). The cast type itself is not retained —
+	// the deparse shape is decided from the domain's base type — but it must be
+	// consumed here so the pattern still matches. DU-002 slice 105 (json).
+	if p.cur().Kind == TokenOperator && p.cur().Value == "::" {
+		p.advance() // consume "::"
+		if _, err := p.parseTypeNameAfterCast(); err != nil {
+			p.idx = start
+			return nil
+		}
+	}
 	// Expect IN keyword.
 	if !p.acceptKeyword(KwIn) {
 		p.idx = start
@@ -5157,14 +6088,24 @@ func (p *parser) tryParseCheckInValues() []string {
 		p.idx = start
 		return nil
 	}
-	// Parse string literals.
+	// Parse the membership list. Accept string literals (text/varchar/bpchar/date
+	// domains), integer and numeric literals (integer/numeric/bigint domains), and
+	// the boolean keyword literals true/false (boolean domains). The raw token
+	// value is stored verbatim; whether to quote/cast it on deparse is decided
+	// later from the domain's base type. DU-002 slices 99, 100.
 	var vals []string
 	for {
-		if p.cur().Kind != TokenStringLit {
+		switch {
+		case p.cur().Kind == TokenStringLit, p.cur().Kind == TokenIntLit, p.cur().Kind == TokenNumericLit:
+			vals = append(vals, p.cur().Value)
+		case p.cur().Kind == TokenKeyword && (p.cur().Keyword == KwTrue || p.cur().Keyword == KwFalse):
+			// Boolean domain: CHECK (VALUE IN (true, false)). Store the canonical
+			// lowercase literal; deparse renders it verbatim (no quotes/cast).
+			vals = append(vals, string(p.cur().Keyword))
+		default:
 			p.idx = start
 			return nil
 		}
-		vals = append(vals, p.cur().Value)
 		p.advance()
 		if p.acceptSymbol(",") {
 			continue

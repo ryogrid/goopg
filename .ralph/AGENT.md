@@ -165,14 +165,38 @@ gofmt -l .          # must produce empty output
 go vet ./...
 ```
 
-## Pre-commit test gate — MANDATORY
+## Pre-commit test gate — MANDATORY (now machine-enforced)
 
-Before you create **any** commit, you MUST run the project's unit/component
-test suite, and it MUST pass cleanly:
+**This gate is now enforced by a git hook, not just by discipline.** Run once
+per clone to activate it:
 
 ```bash
-scripts/ralph-precommit-test.sh
+make install-hooks      # sets core.hooksPath=.githooks
 ```
+
+After that, **every `git commit` automatically runs the CI-parity pgbench smoke**
+(`.githooks/pre-commit` → `RALPH_PRECOMMIT_SCOPE=smoke scripts/ralph-precommit-test.sh`:
+build → init → pgbench standard / `-N` / `-S`, ~2-3 min) and the commit is
+**rejected** if it fails. This closes the historical blind spot where the loop
+ran only targeted `go test` and never the pgbench workload, so the pgbench TPC-B
+concurrency-regression class reached CI undetected. **Do NOT bypass with
+`git commit --no-verify`** — that re-opens exactly that blind spot.
+
+The hook runs the **pgbench smoke only**. So you do NOT run pgbench by hand —
+that would run it twice (once manually, once in the hook). Your manual,
+mandatory pre-commit job is the **unit/component suite**, which the hook does
+not run; it MUST pass cleanly before you commit:
+
+```bash
+RALPH_PRECOMMIT_SCOPE=units scripts/ralph-precommit-test.sh   # unit/component suite only
+```
+
+Division of labour: `units` (you, once per change) + the hook's `smoke` (every
+commit) = full CI parity, each part run once. Run the `full` scope
+(`scripts/ralph-precommit-test.sh`, unit suite + pgbench) only when you want to
+exercise pgbench locally before committing — e.g. a concurrency / executor /
+storage change; the hook's `smoke` then re-runs pgbench as harmless
+defense-in-depth.
 
 For executor/planner/codec changes, additionally run the TPC-H silent-regression
 spot-check (fresh capped server + Q12/Q13 canonical row counts, ~1 min; skips

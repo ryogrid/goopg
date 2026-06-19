@@ -192,6 +192,40 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 		{"bpchar", OIDBpChar},
 		{"varchar", OIDVarChar},
 		{"numeric", OIDNumeric},
+		{"uuid", OIDUUID},
+		// DU-002 slice 80: the OID-reference ("reg*") family round-trips its
+		// canonical name. Also guards against name collisions with the existing
+		// scalar names above (e.g. "regproc" must not resolve to text).
+		{"regproc", OIDRegproc},
+		{"regprocedure", OIDRegprocedure},
+		{"regoper", OIDRegoper},
+		{"regoperator", OIDRegoperator},
+		{"regclass", OIDRegclass},
+		{"regtype", OIDRegtype},
+		{"regconfig", OIDRegconfig},
+		{"regdictionary", OIDRegdictionary},
+		{"regnamespace", OIDRegnamespace},
+		{"regrole", OIDRegrole},
+		{"regcollation", OIDRegcollation},
+		// DU-002 slice 81: int2vector/oidvector round-trip their canonical names
+		// (NOT smallint[]/oid[], which are the genuine _int2/_oid array types).
+		{"int2vector", OIDInt2vector},
+		{"oidvector", OIDOidvector},
+		// DU-002 slice 82: name (the 64-byte identifier type) round-trips its
+		// canonical name instead of falling back to text.
+		{"name", OIDName},
+		// DU-002 slice 83: timetz (time with time zone) round-trips its canonical
+		// name instead of falling back to text (the codec had no timetz→OID entry).
+		{"timetz", OIDTimeTZ},
+		// DU-002 slice 84: jsonpath (SQL/JSON path) round-trips its canonical
+		// name instead of falling back to text (the codec had no jsonpath→OID entry).
+		{"jsonpath", OIDJsonpath},
+		// DU-002 slice 85: refcursor (cursor-name reference) round-trips its
+		// canonical name instead of falling back to text.
+		{"refcursor", OIDRefcursor},
+		// DU-002 slice 86: aclitem (access-control-list item) round-trips its
+		// canonical name instead of falling back to text.
+		{"aclitem", OIDAclitem},
 	}
 	for _, p := range pairs {
 		gotOID := TypeNameToOID(p.name)
@@ -202,6 +236,89 @@ func TestTypeNameToOIDRoundTrip(t *testing.T) {
 		if gotName != p.name {
 			t.Errorf("OIDToTypeName(%d) = %q, want %q", p.oid, gotName, p.name)
 		}
+	}
+
+	// DU-002 slice 82: name ↔ _name array OID mapping round-trips, so a
+	// `name[]` column resolves to _name (1003) and reconstructs from it.
+	if got := ArrayOIDForBase(OIDName); got != OIDArrayName {
+		t.Errorf("ArrayOIDForBase(OIDName) = %d, want %d (_name)", got, OIDArrayName)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayName); !ok || got != OIDName {
+		t.Errorf("BaseOIDForArray(OIDArrayName) = (%d,%v), want (%d,true)", got, ok, OIDName)
+	}
+	if OIDName != 19 || OIDArrayName != 1003 {
+		t.Errorf("name OIDs drifted: OIDName=%d (want 19), OIDArrayName=%d (want 1003)", OIDName, OIDArrayName)
+	}
+
+	// DU-002 slice 83: timetz ↔ _timetz array OID mapping round-trips, so a
+	// `timetz[]` column resolves to _timetz (1270) and reconstructs from it.
+	if got := ArrayOIDForBase(OIDTimeTZ); got != OIDArrayTimeTZ {
+		t.Errorf("ArrayOIDForBase(OIDTimeTZ) = %d, want %d (_timetz)", got, OIDArrayTimeTZ)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayTimeTZ); !ok || got != OIDTimeTZ {
+		t.Errorf("BaseOIDForArray(OIDArrayTimeTZ) = (%d,%v), want (%d,true)", got, ok, OIDTimeTZ)
+	}
+	if OIDTimeTZ != 1266 || OIDArrayTimeTZ != 1270 {
+		t.Errorf("timetz OIDs drifted: OIDTimeTZ=%d (want 1266), OIDArrayTimeTZ=%d (want 1270)", OIDTimeTZ, OIDArrayTimeTZ)
+	}
+
+	// DU-002 slice 84: jsonpath ↔ _jsonpath array OID mapping round-trips, so a
+	// `jsonpath[]` column resolves to _jsonpath (4073) and reconstructs from it.
+	if got := ArrayOIDForBase(OIDJsonpath); got != OIDArrayJsonpath {
+		t.Errorf("ArrayOIDForBase(OIDJsonpath) = %d, want %d (_jsonpath)", got, OIDArrayJsonpath)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayJsonpath); !ok || got != OIDJsonpath {
+		t.Errorf("BaseOIDForArray(OIDArrayJsonpath) = (%d,%v), want (%d,true)", got, ok, OIDJsonpath)
+	}
+	if OIDJsonpath != 4072 || OIDArrayJsonpath != 4073 {
+		t.Errorf("jsonpath OIDs drifted: OIDJsonpath=%d (want 4072), OIDArrayJsonpath=%d (want 4073)", OIDJsonpath, OIDArrayJsonpath)
+	}
+
+	// DU-002 slice 85: refcursor ↔ _refcursor array OID mapping round-trips, so a
+	// `refcursor[]` column resolves to _refcursor (2201) and reconstructs from it.
+	if got := ArrayOIDForBase(OIDRefcursor); got != OIDArrayRefcursor {
+		t.Errorf("ArrayOIDForBase(OIDRefcursor) = %d, want %d (_refcursor)", got, OIDArrayRefcursor)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayRefcursor); !ok || got != OIDRefcursor {
+		t.Errorf("BaseOIDForArray(OIDArrayRefcursor) = (%d,%v), want (%d,true)", got, ok, OIDRefcursor)
+	}
+	if OIDRefcursor != 1790 || OIDArrayRefcursor != 2201 {
+		t.Errorf("refcursor OIDs drifted: OIDRefcursor=%d (want 1790), OIDArrayRefcursor=%d (want 2201)", OIDRefcursor, OIDArrayRefcursor)
+	}
+
+	// DU-002 slice 86: aclitem ↔ _aclitem array OID mapping round-trips, so an
+	// `aclitem[]` column resolves to _aclitem (1034) and reconstructs from it.
+	if got := ArrayOIDForBase(OIDAclitem); got != OIDArrayAclitem {
+		t.Errorf("ArrayOIDForBase(OIDAclitem) = %d, want %d (_aclitem)", got, OIDArrayAclitem)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayAclitem); !ok || got != OIDAclitem {
+		t.Errorf("BaseOIDForArray(OIDArrayAclitem) = (%d,%v), want (%d,true)", got, ok, OIDAclitem)
+	}
+	if OIDAclitem != 1033 || OIDArrayAclitem != 1034 {
+		t.Errorf("aclitem OIDs drifted: OIDAclitem=%d (want 1033), OIDArrayAclitem=%d (want 1034)", OIDAclitem, OIDArrayAclitem)
+	}
+
+	// DU-002 slice 87: the single-byte "char" type (18). Unlike the other
+	// slices its name→OID lookup is intentionally NOT inverse: TypeNameToOID
+	// folds the spelling "char" to bpchar because the catalog "char" vs
+	// bpchar(1) distinction is args-based and cannot be made from a name alone
+	// (buildUserPGAttributeRow does the args-aware remap). But OIDToTypeName(18)
+	// must reconstruct "char", and the char ↔ _char array mapping must hold so
+	// a `"char"[]` column resolves to _char (1002) and reconstructs from it.
+	if got := OIDToTypeName(OIDChar); got != "char" {
+		t.Errorf("OIDToTypeName(OIDChar) = %q, want %q", got, "char")
+	}
+	if got := TypeNameToOID("char"); got != OIDBpChar {
+		t.Errorf("TypeNameToOID(%q) = %d, want %d (bpchar — char/bpchar disambiguation is args-based)", "char", got, OIDBpChar)
+	}
+	if got := ArrayOIDForBase(OIDChar); got != OIDArrayChar {
+		t.Errorf("ArrayOIDForBase(OIDChar) = %d, want %d (_char)", got, OIDArrayChar)
+	}
+	if got, ok := BaseOIDForArray(OIDArrayChar); !ok || got != OIDChar {
+		t.Errorf("BaseOIDForArray(OIDArrayChar) = (%d,%v), want (%d,true)", got, ok, OIDChar)
+	}
+	if OIDChar != 18 || OIDArrayChar != 1002 {
+		t.Errorf("char OIDs drifted: OIDChar=%d (want 18), OIDArrayChar=%d (want 1002)", OIDChar, OIDArrayChar)
 	}
 }
 

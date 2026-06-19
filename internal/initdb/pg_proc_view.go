@@ -64,6 +64,12 @@ func typeNameToOIDStr(typName string) string {
 		return "2279"
 	case "internal":
 		return "2281"
+	case "record":
+		// Pseudo-type representing any composite type. A SQL/plpgsql function
+		// declared `RETURNS record` stores this name on prorettype; pg_dump's
+		// dumpFunc renders it via format_type(2249) → "record". Without this
+		// case prorettype resolved to 0 and the dump emitted `RETURNS -`.
+		return "2249"
 	case "pg_lsn":
 		return "3220"
 	// Array types (common ones)
@@ -103,6 +109,11 @@ func typeNameToOIDStr(typName string) string {
 		return "1231"
 	case "uuid[]":
 		return "2951"
+	case "record[]":
+		// _record (array of records). Same pseudo-type family as record (2249);
+		// included for symmetry with the array branches above so a function
+		// declared `RETURNS record[]` resolves to the array OID rather than 0.
+		return "2287"
 	default:
 		return "0"
 	}
@@ -126,6 +137,11 @@ func langNameToOIDStr(lang string) string {
 		return "13"
 	case "sql":
 		return "14"
+	case "plpgsql":
+		// OID 13627 — matches a stock PG 18.3 initdb and the plpgsql row added to
+		// the pg_language virtual view (catalog.go). Lets dumpFunc's join resolve
+		// lanname='plpgsql' so a LANGUAGE plpgsql function round-trips. DU-002 slice 163.
+		return "13627"
 	default:
 		return "0"
 	}
@@ -204,12 +220,17 @@ var builtinProcs = []builtinProcRow{
 //     the function uses; always NULL — goopg supports no transforms, so
 //     dumpFunc emits no `TRANSFORM FOR TYPE ...` clause.
 //   - proparallel: parallel-safety marker (char) — 's' safe / 'r' restricted /
-//     'u' unsafe. Mirrors PG's CREATE FUNCTION default of 'u' (unsafe) for
-//     every routine; goopg tracks no parallel-safety, so dumpFunc emits
-//     `PARALLEL UNSAFE` (the default, so effectively nothing) for all.
-//   - prosupport: OID of the function's planner support function (regproc/oid).
-//     Always 0 — goopg has no planner support functions; PG's CREATE FUNCTION
-//     default is likewise 0, so dumpFunc emits no `SUPPORT ...` clause.
+//     'u' unsafe. Defaults to 'u' (unsafe), matching PG's CREATE FUNCTION
+//     default; a CREATE FUNCTION … PARALLEL SAFE/RESTRICTED records 's'/'r'.
+//     dumpFunc emits `PARALLEL SAFE`/`PARALLEL RESTRICTED` whenever the marker
+//     != 'u' (the default, which it suppresses). DU-002 slice 150.
+//   - prosupport: the function's planner support function. Typed regproc (as in
+//     PG's pg_proc), so InvalidOid renders as the text '-', NOT '0'. pg_dump's
+//     getFuncs selects `prosupport` raw and dumpFunc emits `SUPPORT <val>`
+//     whenever `strcmp(prosupport, "-") != 0` — an `oid`-typed '0' cell made it
+//     emit the invalid `SUPPORT 0` clause (a restore error: SUPPORT wants a
+//     function name). Always '-' — goopg has no planner support functions, so
+//     dumpFunc emits no `SUPPORT ...` clause. DU-002 slice 148.
 //
 // pronargs/proacl/proowner were added for pg_dump's getFuncs SELECT (M0110-0001
 // DU-002 slice 7), which projects `p.pronargs, …, p.proacl, …, p.proowner`.
@@ -240,8 +261,14 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			{Name: "prorows", Type: catalog.Type{Name: "float4"}},
 			{Name: "protrftypes", Type: catalog.Type{Name: "oidvector"}},
 			{Name: "proparallel", Type: catalog.Type{Name: "char"}},
-			{Name: "prosupport", Type: catalog.Type{Name: "oid"}},
+			{Name: "prosupport", Type: catalog.Type{Name: "regproc"}},
 		},
+		// The fixed pg_proc relation OID (1255). Without it the table's `tableoid`
+		// system column resolves to 0, so pg_dump's getFuncs records each
+		// function's catalogId.tableoid as 0 and cannot match the
+		// pg_description.classoid=1255 rows that COMMENT ON FUNCTION writes — the
+		// function comment is silently dropped from the dump. DU-002 slice 147.
+		OID:     catalog.ProcedureRelationId,
 		Virtual: true,
 	}
 	tbl.VirtualRows = func() [][]string {
@@ -271,7 +298,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				"0", // prorows: built-in stubs (abs/RI_FKey) are not SRFs
 				"",  // protrftypes: NULL (goopg supports no transforms)
 				"u", // proparallel: unsafe (PG CREATE FUNCTION default)
-				"0", // prosupport: 0 (no planner support function)
+				"-", // prosupport: regproc InvalidOid renders '-' (no support function)
 			})
 		}
 		// Append user-defined routines.
@@ -327,11 +354,28 @@ func registerPgProcView(cat *catalog.InMemory) error {
 			case "internal", "c":
 				procost = "1"
 			}
+			// An explicit COST n on CREATE FUNCTION overrides the
+			// language-derived default; previously the parser discarded it, so
+			// dumpFunc never saw the non-default cost (silent divergence).
+			if r.Cost != "" {
+				procost = r.Cost
+			}
 			// prorows: PG's CREATE FUNCTION default — 1000 estimated result
-			// rows for set-returning functions, 0 for everything else.
+			// rows for set-returning functions, 0 for everything else. An
+			// explicit ROWS n (set-returning functions only) overrides it.
 			prorows := "0"
 			if r.ReturnsSet {
 				prorows = "1000"
+			}
+			if r.Rows != "" {
+				prorows = r.Rows
+			}
+			// proparallel: PG's CREATE FUNCTION default is 'u' (unsafe);
+			// PARALLEL SAFE/RESTRICTED record 's'/'r'. dumpFunc emits
+			// `PARALLEL SAFE`/`PARALLEL RESTRICTED` when the marker != 'u'.
+			parallel := r.Parallel
+			if parallel == "" {
+				parallel = "u"
 			}
 			rows = append(rows, []string{
 				fmt.Sprintf("%d", r.OID),
@@ -350,13 +394,13 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				strict,
 				prokind,
 				retset,
-				"",      // probin: NULL (goopg has no C-language functions)
-				"",      // proconfig: NULL (goopg tracks no per-function GUC SET)
-				procost, // procost: language-derived (1 internal/C, else 100)
-				prorows, // prorows: 1000 for SRFs, 0 otherwise
-				"",      // protrftypes: NULL (goopg supports no transforms)
-				"u",     // proparallel: unsafe (PG CREATE FUNCTION default)
-				"0",     // prosupport: 0 (no planner support function)
+				"",       // probin: NULL (goopg has no C-language functions)
+				"",       // proconfig: NULL (goopg tracks no per-function GUC SET)
+				procost,  // procost: language-derived (1 internal/C, else 100)
+				prorows,  // prorows: 1000 for SRFs, 0 otherwise
+				"",       // protrftypes: NULL (goopg supports no transforms)
+				parallel, // proparallel: 'u' unsafe (default), 's' safe, 'r' restricted
+				"-",      // prosupport: regproc InvalidOid renders '-' (no support function)
 			})
 		}
 		return rows

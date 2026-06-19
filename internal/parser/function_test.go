@@ -55,6 +55,61 @@ func TestParseCreateFunctionOrReplace(t *testing.T) {
 	}
 }
 
+// TestParseCreateFunctionParallel pins the proparallel marker captured from
+// the PARALLEL SAFE/RESTRICTED/UNSAFE clause. The default (no clause) is "u"
+// (unsafe), matching PG's CREATE FUNCTION default. DU-002 slice 150.
+func TestParseCreateFunctionParallel(t *testing.T) {
+	cases := []struct {
+		src  string
+		want string
+	}{
+		{`CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "u"},
+		{`CREATE FUNCTION f() RETURNS int LANGUAGE sql PARALLEL SAFE AS $$ SELECT 1 $$`, "s"},
+		{`CREATE FUNCTION f() RETURNS int LANGUAGE sql PARALLEL RESTRICTED AS $$ SELECT 1 $$`, "r"},
+		{`CREATE FUNCTION f() RETURNS int LANGUAGE sql PARALLEL UNSAFE AS $$ SELECT 1 $$`, "u"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.src, err)
+		}
+		cf := stmts[0].(*CreateFunctionStmt)
+		if cf.Parallel != tc.want {
+			t.Errorf("Parallel = %q, want %q (src=%q)", cf.Parallel, tc.want, tc.src)
+		}
+	}
+}
+
+// TestParseCreateFunctionCostRows pins the procost/prorows numeric values
+// captured from the COST/ROWS clauses. Both were previously parsed and then
+// discarded, so an explicit COST/ROWS was silently reset to the language /
+// SRF default on dump. Empty = no clause given (use the default). DU-002 slice 151.
+func TestParseCreateFunctionCostRows(t *testing.T) {
+	cases := []struct {
+		src      string
+		wantCost string
+		wantRows string
+	}{
+		{`CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$`, "", ""},
+		{`CREATE FUNCTION f() RETURNS int LANGUAGE sql COST 50 AS $$ SELECT 1 $$`, "50", ""},
+		{`CREATE FUNCTION f() RETURNS SETOF int LANGUAGE sql ROWS 5 AS $$ SELECT 1 $$`, "", "5"},
+		{`CREATE FUNCTION f() RETURNS SETOF int LANGUAGE sql COST 0.5 ROWS 200 AS $$ SELECT 1 $$`, "0.5", "200"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.src, err)
+		}
+		cf := stmts[0].(*CreateFunctionStmt)
+		if cf.Cost != tc.wantCost {
+			t.Errorf("Cost = %q, want %q (src=%q)", cf.Cost, tc.wantCost, tc.src)
+		}
+		if cf.Rows != tc.wantRows {
+			t.Errorf("Rows = %q, want %q (src=%q)", cf.Rows, tc.wantRows, tc.src)
+		}
+	}
+}
+
 // TestParseCreateFunctionWithArgs pins the named-arg surface and the
 // implicit-IN mode. Two args with explicit names + one anonymous
 // positional arg.

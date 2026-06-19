@@ -65,12 +65,512 @@ const (
 	OIDFloat8      uint32 = 701
 	OIDDate        uint32 = 1082
 	OIDTime        uint32 = 1083
+	OIDTimeTZ      uint32 = 1266
 	OIDTimestamp   uint32 = 1114
 	OIDTimestampTZ uint32 = 1184
 	OIDBpChar      uint32 = 1042
-	OIDVarChar     uint32 = 1043
-	OIDNumeric     uint32 = 1700
+	// OIDChar is the single-byte internal "char" type (typname "char", OID 18),
+	// distinct from bpchar (1042). It shares the spelling "char" in declared
+	// column types; the parser only forces a length arg ([1], i.e. bpchar(1))
+	// on the unquoted `char` form — a quoted `"char"` arrives as name "char"
+	// with no args, which buildUserPGAttributeRow remaps to this OID so the
+	// column round-trips through pg_dump as "char". DU-002 slice 87.
+	OIDChar     uint32 = 18
+	OIDVarChar  uint32 = 1043
+	OIDNumeric  uint32 = 1700
+	OIDUUID     uint32 = 2950
+	OIDJSON     uint32 = 114
+	OIDJsonb    uint32 = 3802
+	OIDJsonpath uint32 = 4072
+	// DU-002 slice 85: refcursor is a varlena cursor-name reference (typstorage
+	// 'x', no typmod), so format_type renders the bare `refcursor`.
+	OIDRefcursor uint32 = 1790
+	OIDInterval  uint32 = 1186
+	// DU-002 slice 71: the network-address family. All are seeded in pg_type
+	// (see initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs.
+	// None carry a typmod, so format_type renders the bare type name.
+	OIDInet     uint32 = 869
+	OIDCidr     uint32 = 650
+	OIDMacaddr  uint32 = 829
+	OIDMacaddr8 uint32 = 774
+	// DU-002 slice 72: the geometric family. All are seeded in pg_type (see
+	// initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs. None
+	// carry a typmod, so format_type renders the bare type name.
+	OIDPoint   uint32 = 600
+	OIDLseg    uint32 = 601
+	OIDPath    uint32 = 602
+	OIDBox     uint32 = 603
+	OIDPolygon uint32 = 604
+	OIDLine    uint32 = 628
+	OIDCircle  uint32 = 718
+	// DU-002 slice 73: the full-text-search family. Both are seeded in pg_type
+	// (see initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs.
+	// Neither carries a typmod, so format_type renders the bare type name.
+	OIDTsvector uint32 = 3614
+	OIDTsquery  uint32 = 3615
+	// DU-002 slice 74: xml and money. Both are seeded in pg_type (see
+	// initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs. Neither
+	// carries a typmod, so format_type renders the bare type name.
+	OIDXML   uint32 = 142
+	OIDMoney uint32 = 790
+	// DU-002 slice 75: bit and varbit (bit varying). Both are seeded in pg_type
+	// (see initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs.
+	// Both carry a typmod (the bit length, stored raw with no VARHDRSZ), so
+	// format_type renders `bit(n)` / `bit varying(n)`.
+	OIDBit    uint32 = 1560
+	OIDVarbit uint32 = 1562
+	// DU-002 slice 76: pg_lsn (the WAL log-sequence-number type). Seeded in
+	// pg_type (see initdb/pg_type_seed_data.go) so a PG standby can resolve the
+	// OID. It is an 8-byte by-value type with no typmod, so format_type renders
+	// the bare type name.
+	OIDPgLsn uint32 = 3220
+	// DU-002 slice 77: the snapshot types. txid_snapshot is the legacy
+	// (pre-PG13) txid-based snapshot type; pg_snapshot is its xid8-based
+	// successor. Both are seeded in pg_type (see initdb/pg_type_seed_data.go)
+	// so a PG standby can resolve the OIDs. Both are varlena with no typmod, so
+	// format_type renders the bare type name.
+	OIDTxidSnapshot uint32 = 2970
+	OIDPgSnapshot   uint32 = 5038
+	// DU-002 slice 78: xid8 (the 64-bit full transaction-id type, the element
+	// of pg_snapshot). Seeded in pg_type (see initdb/pg_type_seed_data.go) so a
+	// PG standby can resolve the OID. It is an 8-byte by-value type with no
+	// typmod, so format_type renders the bare type name.
+	OIDXid8 uint32 = 5069
+	// DU-002 slice 79: the transaction/tuple identifier types. tid is the 6-byte
+	// tuple identifier (block,offset); xid is the 32-bit transaction id; cid is
+	// the 32-bit command id. All three are seeded in pg_type (see
+	// initdb/pg_type_seed_data.go) so a PG standby can resolve the OIDs. None
+	// carry a typmod, so format_type renders the bare type name.
+	OIDTid uint32 = 27
+	OIDXid uint32 = 28
+	OIDCid uint32 = 29
+	// DU-002 slice 80: the OID-reference ("reg*") family. Each is a 4-byte
+	// by-value alias for oid whose I/O function resolves the referenced object's
+	// name; declared as a column type they round-trip like oid. All are seeded in
+	// pg_type (see initdb/pg_type_seed_data.go) so a PG standby can resolve the
+	// OIDs. None carry a typmod, so format_type renders the bare type name.
+	OIDRegproc       uint32 = 24
+	OIDRegprocedure  uint32 = 2202
+	OIDRegoper       uint32 = 2203
+	OIDRegoperator   uint32 = 2204
+	OIDRegclass      uint32 = 2205
+	OIDRegtype       uint32 = 2206
+	OIDRegconfig     uint32 = 3734
+	OIDRegdictionary uint32 = 3769
+	OIDRegnamespace  uint32 = 4089
+	OIDRegrole       uint32 = 4096
+	OIDRegcollation  uint32 = 4191
+	// DU-002 slice 81: the legacy OID/int2 vector types. int2vector is a
+	// space-separated list of int2 (used internally for pg_index.indkey);
+	// oidvector a space-separated list of oid (pg_proc.proargtypes). Both are
+	// declarable column types — format_type renders the bare names "int2vector"/
+	// "oidvector" (NOT "smallint[]"/"oid[]"; those are the genuine _int2/_oid
+	// array types 1005/1028). Seeded in pg_type (initdb/pg_type_seed_data.go) so a
+	// PG standby can resolve the OIDs; neither carries a typmod.
+	OIDInt2vector uint32 = 22
+	OIDOidvector  uint32 = 30
+	// DU-002 slice 82: name (the 64-byte fixed-length identifier type, used
+	// internally for catalog name columns relname/attname/typname). Declarable
+	// as a column type; format_type renders the bare name "name". Seeded in
+	// pg_type (initdb/pg_type_seed_data.go) so a PG standby can resolve the OID.
+	// It carries no typmod. ("char" — OID 18, the 1-byte internal char distinct
+	// from char/bpchar — is deferred: the parser folds both quoted "char" and
+	// bare char to ct.Name="char", so disambiguating the two needs a parser
+	// change, not just a codec entry.)
+	OIDName uint32 = 19
+	// DU-002 slice 86: aclitem (the access-control-list item type, used
+	// internally for catalog *acl columns like pg_class.relacl). Declarable as a
+	// column type; format_type renders the bare name "aclitem". Seeded in pg_type
+	// (initdb/pg_type_seed_data.go) so a PG standby can resolve the OID. It carries
+	// no typmod (typlen 16, typbyval f, typalign 'd', typstorage 'p').
+	OIDAclitem uint32 = 1033
+
+	// Array (_typename) OIDs for the element types goopg currently supports as
+	// array columns. These mirror pg_type.typarray for int2/int4/int8/text/
+	// bool/numeric/float8/date/timestamp and are the OIDs format_type renders as
+	// `smallint[]`/`integer[]`/`bigint[]`/`text[]`/`boolean[]`/`numeric[]`/
+	// `double precision[]`/`date[]`/`timestamp without time zone[]`. DU-002 slice
+	// 62 (int2/int4/int8/text); slice 63 added bool/numeric; slice 64 added
+	// float8/date/timestamp; slice 65 added float4/time/timestamptz.
+	OIDArrayBool        uint32 = 1000
+	OIDArrayBytea       uint32 = 1001
+	OIDArrayInt2        uint32 = 1005
+	OIDArrayInt4        uint32 = 1007
+	OIDArrayText        uint32 = 1009
+	OIDArrayInt8        uint32 = 1016
+	OIDArrayNumeric     uint32 = 1231
+	OIDArrayFloat8      uint32 = 1022
+	OIDArrayDate        uint32 = 1182
+	OIDArrayTimestamp   uint32 = 1115
+	OIDArrayFloat4      uint32 = 1021
+	OIDArrayTime        uint32 = 1183
+	OIDArrayTimeTZ      uint32 = 1270
+	OIDArrayTimestampTZ uint32 = 1185
+	OIDArrayUUID        uint32 = 2951
+	// DU-002 slice 68: the remaining simple scalar-backed array types.
+	// _varchar/_bpchar carry the element typmod onto the array (like _numeric);
+	// _oid has no typmod. format_type renders these as `character varying[]`,
+	// `character[]`, and `oid[]`.
+	OIDArrayVarChar uint32 = 1015
+	OIDArrayBpChar  uint32 = 1014
+	// OIDArrayChar is _char (1002), the array peer of the single-byte "char"
+	// type (18). format_type renders it `"char"[]`. DU-002 slice 87.
+	OIDArrayChar uint32 = 1002
+	OIDArrayOID  uint32 = 1028
+	// DU-002 slice 69: the JSON family. json/jsonb are varlena with no typmod,
+	// so format_type renders these arrays as the bare `json[]` / `jsonb[]`.
+	OIDArrayJSON  uint32 = 199
+	OIDArrayJsonb uint32 = 3807
+	// DU-002 slice 84: jsonpath. _jsonpath is varlena with no typmod, so
+	// format_type renders the array as the bare `jsonpath[]`.
+	OIDArrayJsonpath uint32 = 4073
+	// DU-002 slice 85: refcursor. _refcursor is varlena with no typmod, so
+	// format_type renders the array as the bare `refcursor[]`.
+	OIDArrayRefcursor uint32 = 2201
+	// DU-002 slice 70: interval. _interval carries the element typmod onto the
+	// array (interval fields/precision), but a bare `interval[]` column has
+	// typmod -1, so format_type renders it as the bare `interval[]`.
+	OIDArrayInterval uint32 = 1187
+	// DU-002 slice 71: the network-address array types. None carry a typmod, so
+	// format_type renders the bare element name with a [] suffix.
+	OIDArrayInet     uint32 = 1041
+	OIDArrayCidr     uint32 = 651
+	OIDArrayMacaddr  uint32 = 1040
+	OIDArrayMacaddr8 uint32 = 775
+	// DU-002 slice 72: the geometric array types. None carry a typmod, so
+	// format_type renders the bare element name with a [] suffix.
+	OIDArrayPoint   uint32 = 1017
+	OIDArrayLseg    uint32 = 1018
+	OIDArrayPath    uint32 = 1019
+	OIDArrayBox     uint32 = 1020
+	OIDArrayPolygon uint32 = 1027
+	OIDArrayLine    uint32 = 629
+	OIDArrayCircle  uint32 = 719
+	// DU-002 slice 73: the full-text-search array types. Neither carries a
+	// typmod, so format_type renders the bare element name with a [] suffix.
+	OIDArrayTsvector uint32 = 3643
+	OIDArrayTsquery  uint32 = 3645
+	// DU-002 slice 74: the xml and money array types. Neither carries a typmod,
+	// so format_type renders the bare element name with a [] suffix.
+	OIDArrayXML   uint32 = 143
+	OIDArrayMoney uint32 = 791
+	// DU-002 slice 75: the bit and varbit array types. Both carry the element
+	// typmod (bit length) onto the array, so format_type renders the element with
+	// its typmod and re-appends [] (e.g. `bit(8)[]`, `bit varying(8)[]`).
+	OIDArrayBit    uint32 = 1561
+	OIDArrayVarbit uint32 = 1563
+	// DU-002 slice 76: the pg_lsn array type. pg_lsn has no typmod, so
+	// format_type renders the bare element name with a [] suffix.
+	OIDArrayPgLsn uint32 = 3221
+	// DU-002 slice 77: the snapshot array types. Neither carries a typmod, so
+	// format_type renders the bare element name with a [] suffix.
+	OIDArrayTxidSnapshot uint32 = 2949
+	OIDArrayPgSnapshot   uint32 = 5039
+	// DU-002 slice 78: the xid8 array type. xid8 has no typmod, so format_type
+	// renders the bare element name with a [] suffix.
+	OIDArrayXid8 uint32 = 271
+	// DU-002 slice 79: the tid/xid/cid array types. None carry a typmod, so
+	// format_type renders the bare element name with a [] suffix.
+	OIDArrayTid uint32 = 1010
+	OIDArrayXid uint32 = 1011
+	OIDArrayCid uint32 = 1012
+	// DU-002 slice 80: the OID-reference ("reg*") array types. None carry a
+	// typmod, so format_type renders the bare element name with a [] suffix.
+	OIDArrayRegproc       uint32 = 1008
+	OIDArrayRegprocedure  uint32 = 2207
+	OIDArrayRegoper       uint32 = 2208
+	OIDArrayRegoperator   uint32 = 2209
+	OIDArrayRegclass      uint32 = 2210
+	OIDArrayRegtype       uint32 = 2211
+	OIDArrayRegconfig     uint32 = 3735
+	OIDArrayRegdictionary uint32 = 3770
+	OIDArrayRegnamespace  uint32 = 4090
+	OIDArrayRegrole       uint32 = 4097
+	OIDArrayRegcollation  uint32 = 4192
+	// DU-002 slice 81: the int2vector/oidvector array types (_int2vector 1006 /
+	// _oidvector 1013). Neither carries a typmod, so format_type renders the bare
+	// element name with a [] suffix ("int2vector[]"/"oidvector[]").
+	OIDArrayInt2vector uint32 = 1006
+	OIDArrayOidvector  uint32 = 1013
+	// DU-002 slice 82: the name array type (_name 1003). No typmod, so
+	// format_type renders the bare element name with a [] suffix ("name[]").
+	OIDArrayName uint32 = 1003
+	// DU-002 slice 86: the aclitem array type (_aclitem 1034). No typmod, so
+	// format_type renders the bare element name with a [] suffix ("aclitem[]").
+	OIDArrayAclitem uint32 = 1034
 )
+
+// ArrayOIDForBase returns the canonical array (_typename) OID for a base scalar
+// OID, or 0 when goopg has no array OID mapped for that base type. Mirrors the
+// pg_type.typarray column for the four element types goopg currently supports as
+// array columns (int2/int4/int8/text). DU-002 slice 62.
+func ArrayOIDForBase(baseOID uint32) uint32 {
+	switch baseOID {
+	case OIDBool:
+		return OIDArrayBool
+	case OIDBytea:
+		return OIDArrayBytea
+	case OIDInt2:
+		return OIDArrayInt2
+	case OIDInt4:
+		return OIDArrayInt4
+	case OIDInt8:
+		return OIDArrayInt8
+	case OIDText:
+		return OIDArrayText
+	case OIDNumeric:
+		return OIDArrayNumeric
+	case OIDFloat8:
+		return OIDArrayFloat8
+	case OIDDate:
+		return OIDArrayDate
+	case OIDTimestamp:
+		return OIDArrayTimestamp
+	case OIDFloat4:
+		return OIDArrayFloat4
+	case OIDTime:
+		return OIDArrayTime
+	case OIDTimeTZ:
+		return OIDArrayTimeTZ
+	case OIDTimestampTZ:
+		return OIDArrayTimestampTZ
+	case OIDUUID:
+		return OIDArrayUUID
+	case OIDVarChar:
+		return OIDArrayVarChar
+	case OIDBpChar:
+		return OIDArrayBpChar
+	case OIDOID:
+		return OIDArrayOID
+	case OIDName:
+		return OIDArrayName
+	case OIDJSON:
+		return OIDArrayJSON
+	case OIDJsonb:
+		return OIDArrayJsonb
+	case OIDJsonpath:
+		return OIDArrayJsonpath
+	case OIDRefcursor:
+		return OIDArrayRefcursor
+	case OIDInterval:
+		return OIDArrayInterval
+	case OIDInet:
+		return OIDArrayInet
+	case OIDCidr:
+		return OIDArrayCidr
+	case OIDMacaddr:
+		return OIDArrayMacaddr
+	case OIDMacaddr8:
+		return OIDArrayMacaddr8
+	case OIDPoint:
+		return OIDArrayPoint
+	case OIDLseg:
+		return OIDArrayLseg
+	case OIDPath:
+		return OIDArrayPath
+	case OIDBox:
+		return OIDArrayBox
+	case OIDPolygon:
+		return OIDArrayPolygon
+	case OIDLine:
+		return OIDArrayLine
+	case OIDCircle:
+		return OIDArrayCircle
+	case OIDTsvector:
+		return OIDArrayTsvector
+	case OIDTsquery:
+		return OIDArrayTsquery
+	case OIDXML:
+		return OIDArrayXML
+	case OIDMoney:
+		return OIDArrayMoney
+	case OIDBit:
+		return OIDArrayBit
+	case OIDVarbit:
+		return OIDArrayVarbit
+	case OIDPgLsn:
+		return OIDArrayPgLsn
+	case OIDTxidSnapshot:
+		return OIDArrayTxidSnapshot
+	case OIDPgSnapshot:
+		return OIDArrayPgSnapshot
+	case OIDXid8:
+		return OIDArrayXid8
+	case OIDTid:
+		return OIDArrayTid
+	case OIDXid:
+		return OIDArrayXid
+	case OIDCid:
+		return OIDArrayCid
+	case OIDRegproc:
+		return OIDArrayRegproc
+	case OIDRegprocedure:
+		return OIDArrayRegprocedure
+	case OIDRegoper:
+		return OIDArrayRegoper
+	case OIDRegoperator:
+		return OIDArrayRegoperator
+	case OIDRegclass:
+		return OIDArrayRegclass
+	case OIDRegtype:
+		return OIDArrayRegtype
+	case OIDRegconfig:
+		return OIDArrayRegconfig
+	case OIDRegdictionary:
+		return OIDArrayRegdictionary
+	case OIDRegnamespace:
+		return OIDArrayRegnamespace
+	case OIDRegrole:
+		return OIDArrayRegrole
+	case OIDRegcollation:
+		return OIDArrayRegcollation
+	case OIDInt2vector:
+		return OIDArrayInt2vector
+	case OIDOidvector:
+		return OIDArrayOidvector
+	case OIDAclitem:
+		return OIDArrayAclitem
+	case OIDChar:
+		return OIDArrayChar
+	}
+	return 0
+}
+
+// BaseOIDForArray is the inverse of ArrayOIDForBase: it maps a known array OID
+// back to its element scalar OID, returning ok=false for non-array OIDs. Used by
+// the heap loader to reconstruct an array column's catalog.Type on restart.
+// DU-002 slice 62.
+func BaseOIDForArray(oid uint32) (uint32, bool) {
+	switch oid {
+	case OIDArrayBool:
+		return OIDBool, true
+	case OIDArrayBytea:
+		return OIDBytea, true
+	case OIDArrayInt2:
+		return OIDInt2, true
+	case OIDArrayInt4:
+		return OIDInt4, true
+	case OIDArrayInt8:
+		return OIDInt8, true
+	case OIDArrayText:
+		return OIDText, true
+	case OIDArrayNumeric:
+		return OIDNumeric, true
+	case OIDArrayFloat8:
+		return OIDFloat8, true
+	case OIDArrayDate:
+		return OIDDate, true
+	case OIDArrayTimestamp:
+		return OIDTimestamp, true
+	case OIDArrayFloat4:
+		return OIDFloat4, true
+	case OIDArrayTime:
+		return OIDTime, true
+	case OIDArrayTimeTZ:
+		return OIDTimeTZ, true
+	case OIDArrayTimestampTZ:
+		return OIDTimestampTZ, true
+	case OIDArrayUUID:
+		return OIDUUID, true
+	case OIDArrayVarChar:
+		return OIDVarChar, true
+	case OIDArrayBpChar:
+		return OIDBpChar, true
+	case OIDArrayOID:
+		return OIDOID, true
+	case OIDArrayName:
+		return OIDName, true
+	case OIDArrayJSON:
+		return OIDJSON, true
+	case OIDArrayJsonb:
+		return OIDJsonb, true
+	case OIDArrayJsonpath:
+		return OIDJsonpath, true
+	case OIDArrayRefcursor:
+		return OIDRefcursor, true
+	case OIDArrayInterval:
+		return OIDInterval, true
+	case OIDArrayInet:
+		return OIDInet, true
+	case OIDArrayCidr:
+		return OIDCidr, true
+	case OIDArrayMacaddr:
+		return OIDMacaddr, true
+	case OIDArrayMacaddr8:
+		return OIDMacaddr8, true
+	case OIDArrayPoint:
+		return OIDPoint, true
+	case OIDArrayLseg:
+		return OIDLseg, true
+	case OIDArrayPath:
+		return OIDPath, true
+	case OIDArrayBox:
+		return OIDBox, true
+	case OIDArrayPolygon:
+		return OIDPolygon, true
+	case OIDArrayLine:
+		return OIDLine, true
+	case OIDArrayCircle:
+		return OIDCircle, true
+	case OIDArrayTsvector:
+		return OIDTsvector, true
+	case OIDArrayTsquery:
+		return OIDTsquery, true
+	case OIDArrayXML:
+		return OIDXML, true
+	case OIDArrayMoney:
+		return OIDMoney, true
+	case OIDArrayBit:
+		return OIDBit, true
+	case OIDArrayVarbit:
+		return OIDVarbit, true
+	case OIDArrayPgLsn:
+		return OIDPgLsn, true
+	case OIDArrayTxidSnapshot:
+		return OIDTxidSnapshot, true
+	case OIDArrayPgSnapshot:
+		return OIDPgSnapshot, true
+	case OIDArrayXid8:
+		return OIDXid8, true
+	case OIDArrayTid:
+		return OIDTid, true
+	case OIDArrayXid:
+		return OIDXid, true
+	case OIDArrayCid:
+		return OIDCid, true
+	case OIDArrayRegproc:
+		return OIDRegproc, true
+	case OIDArrayRegprocedure:
+		return OIDRegprocedure, true
+	case OIDArrayRegoper:
+		return OIDRegoper, true
+	case OIDArrayRegoperator:
+		return OIDRegoperator, true
+	case OIDArrayRegclass:
+		return OIDRegclass, true
+	case OIDArrayRegtype:
+		return OIDRegtype, true
+	case OIDArrayRegconfig:
+		return OIDRegconfig, true
+	case OIDArrayRegdictionary:
+		return OIDRegdictionary, true
+	case OIDArrayRegnamespace:
+		return OIDRegnamespace, true
+	case OIDArrayRegrole:
+		return OIDRegrole, true
+	case OIDArrayRegcollation:
+		return OIDRegcollation, true
+	case OIDArrayInt2vector:
+		return OIDInt2vector, true
+	case OIDArrayOidvector:
+		return OIDOidvector, true
+	case OIDArrayAclitem:
+		return OIDAclitem, true
+	case OIDArrayChar:
+		return OIDChar, true
+	}
+	return 0, false
+}
 
 // PGClassRow is the v0 on-disk shape of one pg_class tuple.
 // Only the subset of columns needed to reconstruct the in-memory
@@ -868,14 +1368,106 @@ func TypeNameToOID(typName string) uint32 {
 		return OIDDate
 	case "time", "time without time zone":
 		return OIDTime
+	case "timetz", "time with time zone":
+		return OIDTimeTZ
 	case "timestamp", "timestamp without time zone":
 		return OIDTimestamp
 	case "timestamptz", "timestamp with time zone":
 		return OIDTimestampTZ
 	case "numeric", "decimal":
 		return OIDNumeric
+	case "uuid":
+		return OIDUUID
 	case "oid":
 		return OIDOID
+	case "json":
+		return OIDJSON
+	case "jsonb":
+		return OIDJsonb
+	case "jsonpath":
+		return OIDJsonpath
+	case "refcursor":
+		return OIDRefcursor
+	case "interval":
+		return OIDInterval
+	case "inet":
+		return OIDInet
+	case "cidr":
+		return OIDCidr
+	case "macaddr":
+		return OIDMacaddr
+	case "macaddr8":
+		return OIDMacaddr8
+	case "point":
+		return OIDPoint
+	case "lseg":
+		return OIDLseg
+	case "path":
+		return OIDPath
+	case "box":
+		return OIDBox
+	case "polygon":
+		return OIDPolygon
+	case "line":
+		return OIDLine
+	case "circle":
+		return OIDCircle
+	case "tsvector":
+		return OIDTsvector
+	case "tsquery":
+		return OIDTsquery
+	case "xml":
+		return OIDXML
+	case "money":
+		return OIDMoney
+	case "bit":
+		return OIDBit
+	case "varbit", "bit varying":
+		return OIDVarbit
+	case "pg_lsn":
+		return OIDPgLsn
+	case "txid_snapshot":
+		return OIDTxidSnapshot
+	case "pg_snapshot":
+		return OIDPgSnapshot
+	case "xid8":
+		return OIDXid8
+	case "tid":
+		return OIDTid
+	case "xid":
+		return OIDXid
+	case "cid":
+		return OIDCid
+	case "regproc":
+		return OIDRegproc
+	case "regprocedure":
+		return OIDRegprocedure
+	case "regoper":
+		return OIDRegoper
+	case "regoperator":
+		return OIDRegoperator
+	case "regclass":
+		return OIDRegclass
+	case "regtype":
+		return OIDRegtype
+	case "regconfig":
+		return OIDRegconfig
+	case "regdictionary":
+		return OIDRegdictionary
+	case "regnamespace":
+		return OIDRegnamespace
+	case "regrole":
+		return OIDRegrole
+	case "regcollation":
+		return OIDRegcollation
+	case "int2vector":
+		return OIDInt2vector
+	case "oidvector":
+		return OIDOidvector
+	case "name":
+		return OIDName
+	case "aclitem":
+		return OIDAclitem
 	default:
 		return OIDText // safe fallback
 	}
@@ -900,6 +1492,12 @@ func OIDToTypeName(oid uint32) string {
 		return "varchar"
 	case OIDBpChar:
 		return "bpchar"
+	case OIDChar:
+		// Single-byte "char" (18): the heap loader reconstructs the column as
+		// catalog.Type{Name:"char"} with no args, which buildUserPGAttributeRow
+		// re-resolves back to OID 18 (not bpchar) on the next catalog read.
+		// DU-002 slice 87.
+		return "char"
 	case OIDBool:
 		return "bool"
 	case OIDBytea:
@@ -912,14 +1510,106 @@ func OIDToTypeName(oid uint32) string {
 		return "date"
 	case OIDTime:
 		return "time"
+	case OIDTimeTZ:
+		return "timetz"
 	case OIDTimestamp:
 		return "timestamp"
 	case OIDTimestampTZ:
 		return "timestamptz"
 	case OIDNumeric:
 		return "numeric"
+	case OIDUUID:
+		return "uuid"
 	case OIDOID:
 		return "oid"
+	case OIDJSON:
+		return "json"
+	case OIDJsonb:
+		return "jsonb"
+	case OIDJsonpath:
+		return "jsonpath"
+	case OIDRefcursor:
+		return "refcursor"
+	case OIDInterval:
+		return "interval"
+	case OIDInet:
+		return "inet"
+	case OIDCidr:
+		return "cidr"
+	case OIDMacaddr:
+		return "macaddr"
+	case OIDMacaddr8:
+		return "macaddr8"
+	case OIDPoint:
+		return "point"
+	case OIDLseg:
+		return "lseg"
+	case OIDPath:
+		return "path"
+	case OIDBox:
+		return "box"
+	case OIDPolygon:
+		return "polygon"
+	case OIDLine:
+		return "line"
+	case OIDCircle:
+		return "circle"
+	case OIDTsvector:
+		return "tsvector"
+	case OIDTsquery:
+		return "tsquery"
+	case OIDXML:
+		return "xml"
+	case OIDMoney:
+		return "money"
+	case OIDBit:
+		return "bit"
+	case OIDVarbit:
+		return "varbit"
+	case OIDPgLsn:
+		return "pg_lsn"
+	case OIDTxidSnapshot:
+		return "txid_snapshot"
+	case OIDPgSnapshot:
+		return "pg_snapshot"
+	case OIDXid8:
+		return "xid8"
+	case OIDTid:
+		return "tid"
+	case OIDXid:
+		return "xid"
+	case OIDCid:
+		return "cid"
+	case OIDRegproc:
+		return "regproc"
+	case OIDRegprocedure:
+		return "regprocedure"
+	case OIDRegoper:
+		return "regoper"
+	case OIDRegoperator:
+		return "regoperator"
+	case OIDRegclass:
+		return "regclass"
+	case OIDRegtype:
+		return "regtype"
+	case OIDRegconfig:
+		return "regconfig"
+	case OIDRegdictionary:
+		return "regdictionary"
+	case OIDRegnamespace:
+		return "regnamespace"
+	case OIDRegrole:
+		return "regrole"
+	case OIDRegcollation:
+		return "regcollation"
+	case OIDInt2vector:
+		return "int2vector"
+	case OIDOidvector:
+		return "oidvector"
+	case OIDName:
+		return "name"
+	case OIDAclitem:
+		return "aclitem"
 	default:
 		return "text"
 	}

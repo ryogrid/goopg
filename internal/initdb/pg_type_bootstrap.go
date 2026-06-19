@@ -19,38 +19,38 @@ import (
 // bitmap path (Step 3i); none of the three are read on early-boot paths.
 func pgTypeColDefs() []catalog.Column {
 	return []catalog.Column{
-		{Name: "oid", Type: catalog.Type{Name: "oid"}},                   // 1  off 0   sz 4
-		{Name: "typname", Type: catalog.Type{Name: "name"}},              // 2  off 4   sz 64
-		{Name: "typnamespace", Type: catalog.Type{Name: "oid"}},          // 3  off 68  sz 4
-		{Name: "typowner", Type: catalog.Type{Name: "oid"}},              // 4  off 72  sz 4
-		{Name: "typlen", Type: catalog.Type{Name: "int2"}},               // 5  off 76  sz 2
-		{Name: "typbyval", Type: catalog.Type{Name: "bool"}},             // 6  off 78  sz 1
-		{Name: "typtype", Type: catalog.Type{Name: "char"}},              // 7  off 79  sz 1
-		{Name: "typcategory", Type: catalog.Type{Name: "char"}},          // 8  off 80  sz 1
-		{Name: "typispreferred", Type: catalog.Type{Name: "bool"}},       // 9  off 81  sz 1
-		{Name: "typisdefined", Type: catalog.Type{Name: "bool"}},         // 10 off 82  sz 1
-		{Name: "typdelim", Type: catalog.Type{Name: "char"}},             // 11 off 83  sz 1
-		{Name: "typrelid", Type: catalog.Type{Name: "oid"}},              // 12 off 84  sz 4
-		{Name: "typsubscript", Type: catalog.Type{Name: "regproc"}},      // 13 off 88  sz 4
-		{Name: "typelem", Type: catalog.Type{Name: "oid"}},               // 14 off 92  sz 4
-		{Name: "typarray", Type: catalog.Type{Name: "oid"}},              // 15 off 96  sz 4
-		{Name: "typinput", Type: catalog.Type{Name: "regproc"}},          // 16 off 100 sz 4
-		{Name: "typoutput", Type: catalog.Type{Name: "regproc"}},         // 17 off 104 sz 4
-		{Name: "typreceive", Type: catalog.Type{Name: "regproc"}},        // 18 off 108 sz 4
-		{Name: "typsend", Type: catalog.Type{Name: "regproc"}},           // 19 off 112 sz 4
-		{Name: "typmodin", Type: catalog.Type{Name: "regproc"}},          // 20 off 116 sz 4
-		{Name: "typmodout", Type: catalog.Type{Name: "regproc"}},         // 21 off 120 sz 4
-		{Name: "typanalyze", Type: catalog.Type{Name: "regproc"}},        // 22 off 124 sz 4
-		{Name: "typalign", Type: catalog.Type{Name: "char"}},             // 23 off 128 sz 1  ← target
-		{Name: "typstorage", Type: catalog.Type{Name: "char"}},           // 24 off 129 sz 1
-		{Name: "typnotnull", Type: catalog.Type{Name: "bool"}},           // 25 off 130 sz 1
-		{Name: "typbasetype", Type: catalog.Type{Name: "oid"}},           // 26 off 132 sz 4
-		{Name: "typtypmod", Type: catalog.Type{Name: "int4"}},            // 27 off 136 sz 4
-		{Name: "typndims", Type: catalog.Type{Name: "int4"}},             // 28 off 140 sz 4
-		{Name: "typcollation", Type: catalog.Type{Name: "oid"}},          // 29 off 144 sz 4
+		{Name: "oid", Type: catalog.Type{Name: "oid"}},                    // 1  off 0   sz 4
+		{Name: "typname", Type: catalog.Type{Name: "name"}},               // 2  off 4   sz 64
+		{Name: "typnamespace", Type: catalog.Type{Name: "oid"}},           // 3  off 68  sz 4
+		{Name: "typowner", Type: catalog.Type{Name: "oid"}},               // 4  off 72  sz 4
+		{Name: "typlen", Type: catalog.Type{Name: "int2"}},                // 5  off 76  sz 2
+		{Name: "typbyval", Type: catalog.Type{Name: "bool"}},              // 6  off 78  sz 1
+		{Name: "typtype", Type: catalog.Type{Name: "char"}},               // 7  off 79  sz 1
+		{Name: "typcategory", Type: catalog.Type{Name: "char"}},           // 8  off 80  sz 1
+		{Name: "typispreferred", Type: catalog.Type{Name: "bool"}},        // 9  off 81  sz 1
+		{Name: "typisdefined", Type: catalog.Type{Name: "bool"}},          // 10 off 82  sz 1
+		{Name: "typdelim", Type: catalog.Type{Name: "char"}},              // 11 off 83  sz 1
+		{Name: "typrelid", Type: catalog.Type{Name: "oid"}},               // 12 off 84  sz 4
+		{Name: "typsubscript", Type: catalog.Type{Name: "regproc"}},       // 13 off 88  sz 4
+		{Name: "typelem", Type: catalog.Type{Name: "oid"}},                // 14 off 92  sz 4
+		{Name: "typarray", Type: catalog.Type{Name: "oid"}},               // 15 off 96  sz 4
+		{Name: "typinput", Type: catalog.Type{Name: "regproc"}},           // 16 off 100 sz 4
+		{Name: "typoutput", Type: catalog.Type{Name: "regproc"}},          // 17 off 104 sz 4
+		{Name: "typreceive", Type: catalog.Type{Name: "regproc"}},         // 18 off 108 sz 4
+		{Name: "typsend", Type: catalog.Type{Name: "regproc"}},            // 19 off 112 sz 4
+		{Name: "typmodin", Type: catalog.Type{Name: "regproc"}},           // 20 off 116 sz 4
+		{Name: "typmodout", Type: catalog.Type{Name: "regproc"}},          // 21 off 120 sz 4
+		{Name: "typanalyze", Type: catalog.Type{Name: "regproc"}},         // 22 off 124 sz 4
+		{Name: "typalign", Type: catalog.Type{Name: "char"}},              // 23 off 128 sz 1  ← target
+		{Name: "typstorage", Type: catalog.Type{Name: "char"}},            // 24 off 129 sz 1
+		{Name: "typnotnull", Type: catalog.Type{Name: "bool"}},            // 25 off 130 sz 1
+		{Name: "typbasetype", Type: catalog.Type{Name: "oid"}},            // 26 off 132 sz 4
+		{Name: "typtypmod", Type: catalog.Type{Name: "int4"}},             // 27 off 136 sz 4
+		{Name: "typndims", Type: catalog.Type{Name: "int4"}},              // 28 off 140 sz 4
+		{Name: "typcollation", Type: catalog.Type{Name: "oid"}},           // 29 off 144 sz 4
 		{Name: "typdefaultbin", Type: catalog.Type{Name: "pg_node_tree"}}, // 30 NULL (varlen)
-		{Name: "typdefault", Type: catalog.Type{Name: "text"}},           // 31 NULL (varlen)
-		{Name: "typacl", Type: catalog.Type{Name: "aclitem[]"}},          // 32 NULL (varlen)
+		{Name: "typdefault", Type: catalog.Type{Name: "text"}},            // 31 NULL (varlen)
+		{Name: "typacl", Type: catalog.Type{Name: "aclitem[]"}},           // 32 NULL (varlen)
 	}
 }
 
@@ -227,44 +227,89 @@ func pgTypeInitialEntries() []pgTypeEntry {
 	return entries
 }
 
+// pgTypeCollationForOID returns the PG18-canonical pg_type.typcollation for a
+// built-in type OID, sourced from `src/include/catalog/pg_type.dat`. It MUST
+// agree with the attcollation that the runtime virtual pg_attribute path reports
+// for the same type (executor.userTypeAttrsForOID.TypCollation): pg_dump's
+// getTableAttrs emits a column COLLATE clause precisely when
+// `a.attcollation <> t.typcollation`, so any divergence makes pg_dump spuriously
+// emit (or drop) `COLLATE pg_catalog."default"` on every collatable column. The
+// heap previously hardcoded 0 here while pg_attribute reported 100, which —
+// once pg_collation was populated so findCollationByOid(100) resolved (DU-002
+// slice 187) — surfaced as a spurious `COLLATE pg_catalog."default"` on every
+// text/varchar/bpchar column in pg_dump output. DU-002 slice 188.
+//
+// DU-002 slice 189 extends the same fix to the ARRAY types of the collatable
+// scalars: a PG array inherits its element's typcollation, so _name (1003) is
+// 'C' (950) and _bpchar (1014) / _varchar (1015) are 'default' (100), exactly as
+// userTypeAttrsForOID reports for those array OIDs. Without these rows the heap
+// reported 0 while pg_attribute reported 100/950, so a `varchar[]`/`bpchar[]`/
+// `name[]` column round-tripped through pg_dump with a spurious COLLATE clause.
+//
+// Only collatable built-in types present in the nailed pg_type heap are listed;
+// every other type is non-collatable (InvalidOid/0). default=100, C=950 match
+// pg_collation_d.h DEFAULT_COLLATION_OID / C_COLLATION_OID.
+func pgTypeCollationForOID(oid uint32) int64 {
+	switch oid {
+	case 19: // name      -- typcollation => 'C'
+		return 950
+	case 25: // text      -- typcollation => 'default'
+		return 100
+	case 1042: // bpchar  -- typcollation => 'default'
+		return 100
+	case 1043: // varchar -- typcollation => 'default'
+		return 100
+	case 1009: // _text   -- text array inherits the element's 'default' collation
+		return 100
+	case 1003: // _name   -- name array inherits the element's 'C' collation
+		return 950
+	case 1014: // _bpchar -- bpchar array inherits the element's 'default' collation
+		return 100
+	case 1015: // _varchar -- varchar array inherits the element's 'default' collation
+		return 100
+	default:
+		return 0
+	}
+}
+
 // pgTypeRow encodes one pgTypeEntry into a 32-column executor.Row matching
 // pgTypeColDefs(). All optional regproc fields and the three CATALOG_VARLEN
 // columns are zero/NULL — only the fixed fields PG18 actually reads on the
 // early-boot TupleDescInitEntry path are populated.
 func pgTypeRow(e pgTypeEntry) executor.Row {
 	return executor.Row{
-		executor.NewIntDatum(int64(e.OID)),         // 1 oid
-		executor.NewStringDatum(e.Name),            // 2 typname
-		executor.NewIntDatum(11),                   // 3 typnamespace = pg_catalog
-		executor.NewIntDatum(10),                   // 4 typowner = BOOTSTRAP_SUPERUSERID
-		executor.NewIntDatum(int64(e.Len)),         // 5 typlen
-		executor.NewBoolDatum(e.ByVal),             // 6 typbyval
-		executor.NewStringDatum(string(e.Type)),    // 7 typtype
-		executor.NewStringDatum(string(e.Category)), // 8 typcategory
-		executor.NewBoolDatum(false),               // 9 typispreferred
-		executor.NewBoolDatum(true),                // 10 typisdefined
-		executor.NewStringDatum(","),               // 11 typdelim
-		executor.NewIntDatum(0),                    // 12 typrelid
-		executor.NewIntDatum(0),                    // 13 typsubscript
-		executor.NewIntDatum(0),                    // 14 typelem
-		executor.NewIntDatum(0),                    // 15 typarray
-		executor.NewIntDatum(int64(e.Input)),       // 16 typinput
-		executor.NewIntDatum(int64(e.Output)),      // 17 typoutput
-		executor.NewIntDatum(int64(e.Receive)),     // 18 typreceive
-		executor.NewIntDatum(int64(e.Send)),        // 19 typsend
-		executor.NewIntDatum(0),                    // 20 typmodin
-		executor.NewIntDatum(0),                    // 21 typmodout
-		executor.NewIntDatum(0),                    // 22 typanalyze
-		executor.NewStringDatum(string(e.Align)),   // 23 typalign  ← load-bearing
-		executor.NewStringDatum(string(e.Storage)), // 24 typstorage
-		executor.NewBoolDatum(false),               // 25 typnotnull
-		executor.NewIntDatum(0),                    // 26 typbasetype
-		executor.NewIntDatum(-1),                   // 27 typtypmod
-		executor.NewIntDatum(0),                    // 28 typndims
-		executor.NewIntDatum(0),                    // 29 typcollation
-		executor.NullDatum,                         // 30 typdefaultbin
-		executor.NullDatum,                         // 31 typdefault
-		executor.NullDatum,                         // 32 typacl
+		executor.NewIntDatum(int64(e.OID)),                 // 1 oid
+		executor.NewStringDatum(e.Name),                    // 2 typname
+		executor.NewIntDatum(11),                           // 3 typnamespace = pg_catalog
+		executor.NewIntDatum(10),                           // 4 typowner = BOOTSTRAP_SUPERUSERID
+		executor.NewIntDatum(int64(e.Len)),                 // 5 typlen
+		executor.NewBoolDatum(e.ByVal),                     // 6 typbyval
+		executor.NewStringDatum(string(e.Type)),            // 7 typtype
+		executor.NewStringDatum(string(e.Category)),        // 8 typcategory
+		executor.NewBoolDatum(false),                       // 9 typispreferred
+		executor.NewBoolDatum(true),                        // 10 typisdefined
+		executor.NewStringDatum(","),                       // 11 typdelim
+		executor.NewIntDatum(0),                            // 12 typrelid
+		executor.NewIntDatum(0),                            // 13 typsubscript
+		executor.NewIntDatum(0),                            // 14 typelem
+		executor.NewIntDatum(0),                            // 15 typarray
+		executor.NewIntDatum(int64(e.Input)),               // 16 typinput
+		executor.NewIntDatum(int64(e.Output)),              // 17 typoutput
+		executor.NewIntDatum(int64(e.Receive)),             // 18 typreceive
+		executor.NewIntDatum(int64(e.Send)),                // 19 typsend
+		executor.NewIntDatum(0),                            // 20 typmodin
+		executor.NewIntDatum(0),                            // 21 typmodout
+		executor.NewIntDatum(0),                            // 22 typanalyze
+		executor.NewStringDatum(string(e.Align)),           // 23 typalign  ← load-bearing
+		executor.NewStringDatum(string(e.Storage)),         // 24 typstorage
+		executor.NewBoolDatum(false),                       // 25 typnotnull
+		executor.NewIntDatum(0),                            // 26 typbasetype
+		executor.NewIntDatum(-1),                           // 27 typtypmod
+		executor.NewIntDatum(0),                            // 28 typndims
+		executor.NewIntDatum(pgTypeCollationForOID(e.OID)), // 29 typcollation (PG-canonical; must match attcollation, slice 188)
+		executor.NullDatum,                                 // 30 typdefaultbin
+		executor.NullDatum,                                 // 31 typdefault
+		executor.NullDatum,                                 // 32 typacl
 	}
 }
 
