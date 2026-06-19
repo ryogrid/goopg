@@ -1410,6 +1410,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create legacy inheritance child ichk_child with local CHECK: %v", err)
 	}
 
+	// Slice 268: a LOCAL column DEFAULT on a LEGACY (non-partition) INHERITS child
+	// must round-trip. This is the pg_attrdef sibling of slice 267's table-level
+	// CHECK: instead of a conislocal CHECK, the child's own local column carries an
+	// attrdef (`extra integer DEFAULT 42`). The same column-omission regime applies
+	// — `idfl_child`'s inherited `pid`/`pname` (attislocal=false) are dropped while
+	// its local `extra` (attislocal=true) prints — but the new wrinkle is that the
+	// DEFAULT must ride INLINE on that local column. Slice 265 proved a child-only
+	// DEFAULT on a PARTITION leaf (ispartition forces every column to print, so the
+	// DEFAULT rode an already-printed column); this slice proves the DEFAULT still
+	// rides correctly when the column is printed BECAUSE OF attislocal, not despite
+	// it — the legacy-inheritance code path that slices 170/267 exercise. Real
+	// pg_dump 18.3 emits the body `extra integer DEFAULT 42` followed by
+	// `INHERITS (public.idfl_parent)` (verified byte-identical this loop). No
+	// production change — the local-column attrdef path (operators_ddl.go column
+	// DEFAULT → pg_attrdef) and the legacy-inheritance column omission
+	// (Table.InheritsParentOIDs + Column.Inherited) already exist.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfl_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create legacy inheritance parent idfl_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfl_child (extra integer DEFAULT 42) INHERITS (public.idfl_parent)"); err != nil {
+		t.Fatalf("create legacy inheritance child idfl_child with local DEFAULT: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -3807,6 +3830,35 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "INHERITS (public.ichk_parent)") {
 			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.ichk_parent)", res.Stdout)
+		}
+		// **Slice 268 (asserted):** local column DEFAULT on a legacy (non-partition)
+		// INHERITS child. Like ichk_child above, idfl_child must (1) print ONLY its
+		// local column `extra` — the inherited `pid`/`pname` are omitted because
+		// shouldPrintColumn gates on attislocal alone — but now (2) that local column
+		// must carry its attrdef inline as `extra integer DEFAULT 42`, and (3) the
+		// block must close with the `INHERITS (public.idfl_parent)` clause. A
+		// regression that re-emitted the inherited columns, dropped the DEFAULT, or
+		// lost the INHERITS clause would restore a structurally different table.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.idfl_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer DEFAULT 42") {
+				t.Errorf("pg_dump dropped the legacy child's local DEFAULT; want %q in idfl_child block\n  block=%q", "extra integer DEFAULT 42", block)
+			}
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in idfl_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.idfl_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.idfl_parent)") {
+			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfl_parent)", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged

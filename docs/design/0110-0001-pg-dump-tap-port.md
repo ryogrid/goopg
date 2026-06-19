@@ -7785,8 +7785,34 @@ and the legacy-inheritance column omission (`Table.InheritsParentOIDs` + `Column
 
 Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
 
-> **Next (slice 268+):** a local column **DEFAULT** on a legacy INHERITS child (the `pg_attrdef` sibling of this slice's
-> table-level CHECK), and a child-level DEFAULT/NOT NULL applied to an *inherited* column (`ALTER TABLE child ALTER
+### Slice 268 — local column `DEFAULT` on a legacy (non-partition) `INHERITS` child
+
+The `pg_attrdef` sibling of slice 267's table-level CHECK. Instead of a `conislocal` CHECK, the child's own local column
+carries an attrdef. The same column-omission regime applies — `idfl_child`'s inherited `pid`/`pname` (`attislocal=false`)
+are dropped while its local `extra` (`attislocal=true`) prints — but the new wrinkle is that the DEFAULT must ride
+**inline** on that local column. Slice 265 proved a child-only DEFAULT on a **partition leaf** (`ispartition` forces every
+column to print, so the DEFAULT rode an already-printed column); this slice proves the DEFAULT still rides correctly when
+the column prints *because of* `attislocal`, not despite it — the legacy-inheritance path that slices 170/267 exercise.
+
+`idfl_child (extra integer DEFAULT 42) INHERITS (idfl_parent (pid integer, pname text))`. Real pg_dump 18.3 emits:
+
+```
+CREATE TABLE public.idfl_child (
+    extra integer DEFAULT 42
+)
+INHERITS (public.idfl_parent);
+```
+
+i.e. (1) only the local `extra integer` prints — `pid`/`pname` are omitted (they arrive via `INHERITS`), (2) the DEFAULT
+rides inline as `extra integer DEFAULT 42`, and (3) the `INHERITS (public.idfl_parent)` clause closes it. Verified
+byte-identical vs PG 18.3 and a fresh goopg server this loop.
+
+No production code changed — the local-column attrdef path (`operators_ddl.go` column DEFAULT → pg_attrdef) and the
+legacy-inheritance column omission (`Table.InheritsParentOIDs` + `Column.Inherited`) already existed.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+> **Next (slice 269+):** a child-level DEFAULT/NOT NULL applied to an *inherited* column (`ALTER TABLE child ALTER
 > COLUMN ... SET DEFAULT/SET NOT NULL`), which pg_dump emits as a separate `ALTER TABLE ... ALTER COLUMN` statement rather
 > than inline.
 

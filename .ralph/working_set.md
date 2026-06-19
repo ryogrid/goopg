@@ -1,29 +1,26 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 267 (loop #34) — a LOCAL CHECK constraint on a LEGACY
-(non-partition) INHERITS child round-trips through pg_dump. First slice to leave
-the partition-leaf regime (slices 264–266) for legacy inheritance, where
-`ispartition` is false so `shouldPrintColumn` (pg_dump.c:9970) gates on
-`attislocal` ALONE: inherited cols are OMITTED, local col prints. Fixture:
-`ichk_child (extra integer, CONSTRAINT ichk_child_pos CHECK (extra > 0)) INHERITS
-(ichk_parent (pid integer, pname text))`. Real pg_dump 18.3 emits the body
-`extra integer, CONSTRAINT ichk_child_pos CHECK ((extra > 0))` + `INHERITS
-(public.ichk_parent)` (NOT an ATTACH). Verified byte-identical vs PG 18.3 (probed)
-AND fresh goopg server (test runs pg_dump against goopg). NO production change —
-the conislocal CHECK path + legacy-inheritance column omission already existed.
+Last landed: DU-002 slice 268 (loop #35) — a LOCAL column DEFAULT on a LEGACY
+(non-partition) INHERITS child round-trips through pg_dump. The pg_attrdef sibling
+of slice 267's table-level CHECK: same column-omission regime (inherited
+`pid`/`pname` dropped via attislocal=false; local `extra` printed) but the DEFAULT
+must ride INLINE on the local column. Fixture: `idfl_child (extra integer DEFAULT
+42) INHERITS (idfl_parent (pid integer, pname text))`. Real pg_dump 18.3 emits body
+`extra integer DEFAULT 42` + `INHERITS (public.idfl_parent)` — verified byte-exact
+vs PG 18.3 (probed) AND fresh goopg server. NO production change — local-column
+attrdef path + legacy-inheritance column omission already exist.
 
 Files (test/docs only):
-- internal/testport/pgdump_connsetup_test.go — ichk_parent/ichk_child fixture
-  (after pnnl_1 block, ~line 1385) + block-scoped assert (local `extra integer`,
-  the `CONSTRAINT ... CHECK`, inherited `pid`/`pname` ABSENT) + INHERITS clause
-  assert (after slice 266's pnnl assert, ~line 3750).
-- docs/design/0110-0001-pg-dump-tap-port.md — Slice 267 section + Next note.
-- .ralph/fix_plan.md — slice 267 progress entry (loop #34).
+- internal/testport/pgdump_connsetup_test.go — idfl_parent/idfl_child fixture
+  (after ichk_child block, ~line 1413) + block-scoped assert (local
+  `extra integer DEFAULT 42`, inherited `pid`/`pname` ABSENT) + INHERITS assert
+  (after slice 267's ichk INHERITS assert, ~line 3811).
+- docs/design/0110-0001-pg-dump-tap-port.md — Slice 268 section + Next note.
+- .ralph/fix_plan.md — slice 268 progress entry (loop #35).
 
 Gates: gofmt clean; go build ./... clean; TestPort_PgDumpConnectionSetup PASS
-(3.39s); pgbench pre-commit smoke (enforced by .githooks/pre-commit on commit).
+(3.26s); pgbench pre-commit smoke (enforced by .githooks/pre-commit on commit).
 
-Next (slice 268+): a local column DEFAULT on a legacy INHERITS child (pg_attrdef
-sibling of this slice's table-level CHECK); then a child-level DEFAULT/NOT NULL on
-an INHERITED column (`ALTER TABLE child ALTER COLUMN ... SET DEFAULT/SET NOT NULL`),
-which pg_dump emits as a separate `ALTER TABLE ... ALTER COLUMN` statement, NOT inline.
+Next (slice 269+): a child-level DEFAULT/NOT NULL on an INHERITED column
+(`ALTER TABLE child ALTER COLUMN ... SET DEFAULT/SET NOT NULL`), which pg_dump
+emits as a separate `ALTER TABLE ... ALTER COLUMN` statement, NOT inline.

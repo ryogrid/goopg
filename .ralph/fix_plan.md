@@ -5769,6 +5769,25 @@ object support.
         (the `pg_attrdef` sibling of this slice's table-level CHECK), and a child-level DEFAULT/NOT NULL on an INHERITED
         column (`ALTER TABLE child ALTER COLUMN ... SET DEFAULT/SET NOT NULL`), which pg_dump emits as a separate
         `ALTER TABLE ... ALTER COLUMN` statement rather than inline.
+      - **PROGRESS 2026-06-20 (loop #35):** **DU-002 slice 268 LANDED — a LOCAL column `DEFAULT` on a LEGACY
+        (non-partition) `INHERITS` child round-trips through pg_dump.** The `pg_attrdef` sibling of slice 267's table-level
+        CHECK: instead of a `conislocal` CHECK, the child's own local column carries an attrdef. The same column-omission
+        regime applies — `idfl_child`'s inherited `pid`/`pname` (attislocal=false) are dropped while its local `extra`
+        (attislocal=true) prints — but the new wrinkle is the DEFAULT must ride INLINE on that local column. Slice 265
+        proved a child-only DEFAULT on a PARTITION leaf (`ispartition` forces every column to print, so the DEFAULT rode an
+        already-printed column); this slice proves the DEFAULT still rides correctly when the column prints BECAUSE OF
+        `attislocal`, not despite it — the legacy-inheritance path slices 170/267 exercise:
+        `idfl_child (extra integer DEFAULT 42) INHERITS (idfl_parent (pid integer, pname text))`. Real pg_dump 18.3 emits
+        the body `extra integer DEFAULT 42` followed by `INHERITS (public.idfl_parent)` — verified byte-identical vs PG
+        18.3 (probed this loop) AND a fresh goopg server (the test runs pg_dump against goopg). **No production change** —
+        the local-column attrdef path (`operators_ddl.go` column DEFAULT → pg_attrdef) and the legacy-inheritance column
+        omission (`Table.InheritsParentOIDs` + `Column.Inherited`) already exist. **pg_dump fixture**
+        (`pgdump_connsetup_test.go`): `idfl_parent`/`idfl_child` + a block-scoped assert on the child body (local
+        `extra integer DEFAULT 42`, the inherited `pid`/`pname` ABSENT) plus the `INHERITS` clause. Guard:
+        `TestPort_PgDumpConnectionSetup` PASS (3.26s). gofmt + `go build ./...` clean; pgbench pre-commit smoke on commit.
+        Design: `0110-0001` Slice 268. **Next (slice 269+):** a child-level DEFAULT/NOT NULL on an INHERITED column
+        (`ALTER TABLE child ALTER COLUMN ... SET DEFAULT/SET NOT NULL`), which pg_dump emits as a separate
+        `ALTER TABLE ... ALTER COLUMN` statement rather than inline.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
