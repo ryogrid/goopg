@@ -1158,6 +1158,75 @@ func TestUserPGAttributeCompositeFieldDomain(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeCompositeFieldNestedComposite pins the NESTED-COMPOSITE-FIELD
+// resolution (DU-002 slice 249). A composite field whose declared type is itself
+// another user-defined composite type folds to the text fallback inside
+// parseCompositeFieldType (the parser records the raw composite name in ColType).
+// The builder must re-resolve it to the inner composite's pg_type OID and report
+// the pass-by-ref varlena layout (-1 length, double-aligned, extended storage),
+// so pg_dump's dumpCompositeType renders the field as `public.<inner>` rather
+// than `text`. LookupCompositeTypeByOID is the inverse used by format_type.
+// Without the catalog (cat==nil) it must keep the text fallback.
+func TestUserPGAttributeCompositeFieldNestedComposite(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		atttypmodIdx  = 5
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	// Inner composite first (lower OID → dumped before the outer in pg_dump).
+	inner := cat.RegisterCompositeTypeWithFields("addr", []catalog.CompositeField{
+		{Name: "street", ColType: "text"},
+		{Name: "zip", ColType: "text"},
+	})
+	// Outer composite references the inner: CREATE TYPE person AS (name text, home addr).
+	outer := cat.RegisterCompositeTypeWithFields("person", []catalog.CompositeField{
+		{Name: "name", ColType: "text"},
+		{Name: "home", ColType: "addr"},
+	})
+
+	// Built-in field is untouched: name → text.
+	a0 := buildUserPGAttributeRowForCompositeField(cat, outer, outer.Fields[0], 1)
+	if got := uint32(a0[atttypidIdx].Int); got != catalog.OIDText {
+		t.Errorf("text field: atttypid=%d want %d (text)", got, catalog.OIDText)
+	}
+
+	// Nested-composite field → inner composite OID + pass-by-ref varlena layout.
+	a1 := buildUserPGAttributeRowForCompositeField(cat, outer, outer.Fields[1], 2)
+	if got := uint32(a1[atttypidIdx].Int); got != inner.OID {
+		t.Errorf("home field: atttypid=%d want %d (inner composite OID)", got, inner.OID)
+	}
+	if got := a1[attlenIdx].Int; got != -1 {
+		t.Errorf("home field: attlen=%d want -1 (varlena composite)", got)
+	}
+	if got := a1[atttypmodIdx].Int; got != -1 {
+		t.Errorf("home field: atttypmod=%d want -1", got)
+	}
+	if got := a1[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("home field: attbyval=%v want false (composite)", got)
+	}
+	if got := a1[attalignIdx].StringValue(); got != "d" {
+		t.Errorf("home field: attalign=%q want \"d\" (double-aligned)", got)
+	}
+	if got := a1[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("home field: attstorage=%q want \"x\" (extended)", got)
+	}
+
+	// LookupCompositeTypeByOID is the inverse used by format_type.
+	if got, ok := cat.LookupCompositeTypeByOID(inner.OID); !ok || got.Name != "addr" {
+		t.Errorf("LookupCompositeTypeByOID(%d)=%v,%v want addr,true", inner.OID, got, ok)
+	}
+
+	// Without a catalog the inner composite cannot be resolved → text fallback.
+	aNil := buildUserPGAttributeRowForCompositeField(nil, outer, outer.Fields[1], 2)
+	if got := uint32(aNil[atttypidIdx].Int); got != catalog.OIDText {
+		t.Errorf("home field (nil cat): atttypid=%d want %d (text fallback)", got, catalog.OIDText)
+	}
+}
+
 // TestUserPGAttributeEnumArrayColumn pins the enum-ARRAY resolution (DU-002
 // slice 89). A `mood[]` column must report pg_attribute.atttypid = the enum's
 // auto-generated array OID (et.ArrayOID = et.OID+1), attndims=1, and carry a

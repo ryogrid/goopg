@@ -7203,9 +7203,38 @@ pg_dump TAP port seeds `CREATE TYPE public.dom_comp AS (z zipcode, n numd)` (ove
 text-domain and `numd` numeric(10,2)-domain) and asserts `pg_dump --schema-only` renders the fields as
 `z public.zipcode` / `n public.numd`, byte-matching real pg_dump 18.3.
 
-> **Next (slice 249+):** a composite field whose type is a DOMAIN ARRAY, then a nested-composite field
-> (a composite type whose field is itself a composite type), then `ALTER TYPE … ADD/DROP/ALTER
-> ATTRIBUTE`.
+### Slice 249 — composite field whose type is itself another composite type (nested composite)
+
+Slices 245–248 resolved composite scalar fields whose declared type is a built-in, enum, or domain. A
+field whose type is **itself another user-defined composite type** (`location addr`, where `addr` is a
+composite) was still broken: `parseCompositeFieldType` folded the raw composite name through
+`TypeNameToOID` to the `text` fallback, so `dumpCompositeType` emitted the field as `text`. Unlike the
+domain-array path (which would need a domain array type goopg does not yet synthesize), the inner
+composite's `pg_type` rows — the type and its `_name` array — already exist in the heap (slice 242), so
+this is a clean re-resolve mirroring the enum/domain field paths.
+
+- **`buildUserPGAttributeRowForCompositeField`** — after the domain re-resolve, when the field still folds
+  to the `text` fallback and is scalar, `cat.LookupCompositeType(base)` re-resolves it to the inner
+  composite's `pg_type` OID (`atttypid`). The physical attrs are the pass-by-ref varlena layout
+  (`attlen=-1`, `attbyval=false`, `attalign='d'`, `attstorage='x'`), matching `buildUserPGTypeRowForComposite`.
+  `atttypmod` stays `-1`.
+- **`catalog`** — `LookupCompositeType(name)` is promoted onto the `Catalog` interface (the row builder
+  takes the interface, not `*InMemory`), and a new `LookupCompositeTypeByOID(oid)` is added so
+  `format_type`'s fallback can render the inner composite's dynamically-allocated OID as `public.<inner>`
+  (mirroring the enum/domain `LookupXByOID` branches in `expr.go`).
+- **Scope**: scalar only. A composite-typed ARRAY field and a DOMAIN-ARRAY field remain deferred — the
+  latter blocks on domain array types, which goopg does not synthesize anywhere yet (a separate feature,
+  not a single dump slice).
+
+Guarded at two levels: `executor.TestUserPGAttributeCompositeFieldNestedComposite` pins atttypid → inner
+composite OID, the varlena layout, the `LookupCompositeTypeByOID` inverse, and the nil-catalog text
+fallback; the pg_dump TAP port seeds `CREATE TYPE public.nested_comp AS (label text, location addr)` (over
+the existing `addr` composite) and asserts `pg_dump --schema-only` renders the field as `location
+public.addr`, byte-matching real pg_dump 18.3.
+
+> **Next (slice 250+):** a composite-typed ARRAY field (`addr[]`), then domain array types as their own
+> feature (allocate the `_name` array OID at `CREATE DOMAIN`, sync its `pg_type` row, render domain-array
+> columns/fields), then `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE`.
 
 ## Deferred (002–010) — catalog surface estimate
 

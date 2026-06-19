@@ -8831,6 +8831,13 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					// (NOT the base type) so the dump round-trips as
 					// `public.zipcode`. DU-002 slice 90.
 					name = "public." + dom.Name
+				} else if ct, ok := ctx.Catalog.LookupCompositeTypeByOID(uint32(typeOID)); ok {
+					// A nested-composite field carries the inner composite type's
+					// dynamically-allocated pg_type OID; render it as the
+					// schema-qualified composite name so dumpCompositeType emits
+					// `<field> public.<inner>` rather than the text fallback.
+					// DU-002 slice 249.
+					name = "public." + ct.Name
 				}
 			}
 			return NewStringDatum(name), nil

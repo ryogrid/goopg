@@ -5355,6 +5355,26 @@ object support.
         smoke on commit. **Next (slice 248+):** composite field whose type is a DOMAIN (slice 90 analog,
         `DeclaredTypeName`→`cat.LookupDomain`), then nested-composite field, then `ALTER TYPE …
         ADD/DROP/ALTER ATTRIBUTE`.
+      - **PROGRESS 2026-06-20 (loop #15):** **DU-002 slice 249 LANDED — composite field whose type is
+        itself another COMPOSITE type (nested composite) round-trips through `pg_dump`.** Slices 245–248
+        resolved composite scalar fields of built-in/enum/domain type; a field declared as another
+        user-defined composite (`location addr`) still folded to the `text` fallback and dumped as `text`.
+        Re-resolve mirrors the enum/domain field paths: `buildUserPGAttributeRowForCompositeField` now, after
+        the domain re-resolve, calls `cat.LookupCompositeType(base)` for a still-text scalar field → inner
+        composite's `pg_type` OID with the pass-by-ref varlena layout (`attlen=-1`, `attbyval=false`,
+        `attalign='d'`, `attstorage='x'`, matching `buildUserPGTypeRowForComposite`); `atttypmod=-1`.
+        `LookupCompositeType` is promoted onto the `Catalog` interface and a new `LookupCompositeTypeByOID`
+        added so `format_type`'s fallback (expr.go) renders the OID as `public.<inner>` (mirrors the
+        enum/domain `LookupXByOID` branches). The inner composite's `pg_type` rows already exist (slice 242),
+        so no new OID allocation. Guards: `executor.TestUserPGAttributeCompositeFieldNestedComposite`
+        (atttypid→inner OID, varlena layout, `LookupCompositeTypeByOID` inverse, nil-cat text fallback) +
+        pg_dump TAP port seeds `CREATE TYPE public.nested_comp AS (label text, location addr)` and asserts
+        round-trip of `location public.addr` (`TestPort_PgDumpConnectionSetup` PASS, 3.8s). Design:
+        `0110-0001` Slice 249. pgbench pre-commit smoke on commit. **Reordered ahead of the previously-listed
+        domain-array field:** a DOMAIN-ARRAY field blocks on domain array types, which goopg does not
+        synthesize anywhere yet (a separate feature, not a single dump slice). **Next (slice 250+):**
+        composite-typed ARRAY field (`addr[]`), then domain array types as their own feature, then `ALTER
+        TYPE … ADD/DROP/ALTER ATTRIBUTE`.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

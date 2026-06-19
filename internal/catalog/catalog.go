@@ -1201,6 +1201,15 @@ type Catalog interface {
 	// LookupDomainByOID finds a user-defined domain type by its pg_type OID, used
 	// by format_type to render a domain column's declared type. DU-002 slice 90.
 	LookupDomainByOID(oid uint32) (*Domain, bool)
+	// LookupCompositeType returns the OID-bearing metadata for a composite type
+	// by name (case-insensitive), or nil. Exposed on the interface so the
+	// catalog-row builders can re-resolve a composite field whose declared type
+	// is itself a user-defined composite type. DU-002 slice 249.
+	LookupCompositeType(name string) *CompositeType
+	// LookupCompositeTypeByOID finds a user-defined composite type by its pg_type
+	// OID, used by format_type to render a nested-composite column's declared
+	// type as its schema-qualified name. DU-002 slice 249.
+	LookupCompositeTypeByOID(oid uint32) (*CompositeType, bool)
 }
 
 // InMemory is the v0 implementation: a sync.RWMutex-guarded map.
@@ -7486,6 +7495,21 @@ func (c *InMemory) LookupCompositeType(name string) *CompositeType {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.compositeTypes[k]
+}
+
+// LookupCompositeTypeByOID finds a composite type by its pg_type OID. Used by
+// format_type to render a nested-composite column's declared type as its
+// schema-qualified composite name (not `record` or the text fallback). DU-002
+// slice 249.
+func (c *InMemory) LookupCompositeTypeByOID(oid uint32) (*CompositeType, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, ct := range c.compositeTypes {
+		if ct.OID == oid {
+			return ct, true
+		}
+	}
+	return nil, false
 }
 
 // LookupCompositeTypeFields returns the ordered field list for a composite type,

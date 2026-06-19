@@ -1467,6 +1467,12 @@ func buildUserPGClassRowForComposite(cat catalog.Catalog, ct *catalog.CompositeT
 // domain's pg_type OID (cat.LookupDomain on the raw field-type name) with
 // physical attrs from the domain's base, so pg_dump renders the field as the
 // domain name rather than `text`. Scalar only. DU-002 slice 248.
+//
+// A field whose declared type is itself another user-defined COMPOSITE type (a
+// nested composite) re-resolves to the inner composite's pg_type OID
+// (cat.LookupCompositeType) with the pass-by-ref varlena layout (-1 length,
+// double-aligned, extended storage), so pg_dump renders the field as
+// `public.<inner>`. Scalar only. DU-002 slice 249.
 func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.CompositeType, field catalog.CompositeField, attnum int) Row {
 	typOID, typmod, base, isArray := parseCompositeFieldType(field.ColType)
 	enumOID := uint32(0)
@@ -1495,6 +1501,20 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		if d, ok := cat.LookupDomain(base); ok {
 			domain = d
 			typOID = d.OID
+		}
+	}
+	// A field whose declared type is itself another user-defined COMPOSITE type
+	// (a nested composite) also folds to the text fallback. Re-resolve to the
+	// inner composite's pg_type OID so pg_dump's format_type renders the field as
+	// the composite name (`public.<inner>`) rather than `text`. A composite type
+	// is a pass-by-ref varlena (typlen=-1, byval=false, double-aligned, extended
+	// storage), matching buildUserPGTypeRowForComposite. Scalar only, mirroring
+	// the enum/domain paths. DU-002 slice 249.
+	nestedComposite := false
+	if cat != nil && typOID == catalog.OIDText && !isArray {
+		if ict := cat.LookupCompositeType(base); ict != nil {
+			nestedComposite = true
+			typOID = ict.OID
 		}
 	}
 	attndims := int64(0)
@@ -1533,6 +1553,11 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 			}
 			attrs = userTypeAttrsForOID(baseOID)
 		}
+	case nestedComposite:
+		// A composite type is a pass-by-ref varlena: typlen=-1, not by-value,
+		// double-aligned (like RECORD), extended storage. Mirrors
+		// buildUserPGTypeRowForComposite. DU-002 slice 249.
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	}
 	return Row{
 		NewIntDatum(int64(ct.RelOID)),            // attrelid
