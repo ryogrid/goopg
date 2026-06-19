@@ -5320,6 +5320,26 @@ object support.
         pgbench pre-commit smoke on commit. **Next (slice 244+):** composite fields of user-defined type
         (enum/domain/nested composite) — `parseCompositeFieldType` resolves only built-ins; ROLLBACK-undo
         (`PendingCreatedComposites`); `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE`.
+      - **PROGRESS 2026-06-19 (loop #10):** **DU-002 slice 244 LANDED — `ROLLBACK` drops a composite type
+        created in the aborted transaction.** Slice 243 registered the composite unconditionally, so
+        `BEGIN; CREATE TYPE x AS (...); ROLLBACK;` left `x` alive (visible in `pg_type`/virtual `pg_class`/
+        `\dT`; a re-`CREATE TYPE x` failed "already exists"). Fix mirrors the enum `PendingCreatedEnums`
+        mechanism: (1) `execCreateType` records the lowercased name in `PendingCreatedComposites` when in an
+        explicit tx; (2) both rollback paths — executor `undoEnumDDLFromContext` + dispatch
+        `undoEnumDDLForRollback` — gain a step 4 that calls `InMemory.DropCompositeType`; (3) the field is
+        threaded `connTx↔ectx` and cleared at every COMMIT/ROLLBACK exit (executor `clearCtxTransaction`,
+        five dispatch transaction-verb exits, `connTxState.reset`). Heap `pg_type`/`pg_class`/`pg_attribute`
+        rows carry the aborting XID → MVCC-invisible post-rollback (no xmax stamp needed, same as enums).
+        Files: `internal/executor/context.go`, `internal/executor/operators_ddl.go`,
+        `internal/executor/operators_tx.go`, `internal/server/conn_tx.go`, `internal/server/dispatch.go`,
+        `internal/executor/operators_tx_composite_test.go` (+`TestUndoCompositeDDLOnRollback`,
+        `TestUndoCompositeDDLCaseInsensitive`), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 244).
+        Gates: gofmt + `go build ./internal/...` clean; executor composite/enum/tx suites PASS; verified live
+        (port 5544, cgroup wrapper): `BEGIN; CREATE TYPE rb AS (a int,b text);` → in-tx `pg_type` count 1,
+        `ROLLBACK` → count 0 + `\dT` empty, re-`CREATE TYPE rb` OK, sibling `COMMIT` persists + round-trips
+        through `pg_dump`; pgbench pre-commit smoke on commit. **Next (slice 245+):** composite fields of a
+        user-defined type (`parseCompositeFieldType` folds non-built-ins to `text`); `ALTER TYPE …
+        ADD/DROP/ALTER ATTRIBUTE`.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

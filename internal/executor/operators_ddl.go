@@ -10254,6 +10254,17 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			// composite type is visible to pg_dump's getTypes and catalog
 			// queries. DU-002 slice 242.
 			syncCompositeTypeToCatalogHeap(o.ctx, ct)
+			// Track composite type creation so ROLLBACK can drop it (mirrors the
+			// enum branch below).  The heap rows written above carry the aborting
+			// transaction's XID, so they become MVCC-invisible after rollback;
+			// the in-memory catalog registration is the part ROLLBACK must undo.
+			// DU-002 slice 244.
+			if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+				if o.ctx.PendingCreatedComposites == nil {
+					o.ctx.PendingCreatedComposites = make(map[string]bool)
+				}
+				o.ctx.PendingCreatedComposites[strings.ToLower(s.Name)] = true
+			}
 		} else {
 			cat.RegisterCompositeType(s.Name)
 		}

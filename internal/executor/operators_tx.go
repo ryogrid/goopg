@@ -283,6 +283,7 @@ func (o *transactionOp) clearCtxTransaction() {
 	o.ctx.PendingEnumValues = nil
 	o.ctx.PendingEnumRenames = nil
 	o.ctx.PendingCreatedEnums = nil
+	o.ctx.PendingCreatedComposites = nil
 }
 
 // undoEnumDDLFromContext reverses enum DDL (ADD VALUE, RENAME TO, CREATE TYPE AS ENUM)
@@ -317,6 +318,14 @@ func undoEnumDDLFromContext(ctx *Context) {
 	// Step 3: Drop types created in this transaction (now at original names).
 	for name := range created {
 		_ = inm.DropEnum(name, false)
+	}
+	// Step 4: Drop composite types created via CREATE TYPE … AS (...) in this
+	// transaction.  Their pg_type/pg_attribute heap rows carry the aborting
+	// XID (MVCC-invisible post-rollback) and the virtual pg_class builder
+	// iterates the in-memory registry, so removing the registration below is
+	// what makes the aborted composite disappear.  DU-002 slice 244.
+	for name := range ctx.PendingCreatedComposites {
+		_ = inm.DropCompositeType(name)
 	}
 }
 
@@ -425,7 +434,7 @@ func newSetTransactionOp(s *parser.SetTransactionStmt) *setTransactionOp {
 	return &setTransactionOp{stmt: s}
 }
 
-func (o *setTransactionOp) Schema() planner.Schema { return nil }
+func (o *setTransactionOp) Schema() planner.Schema  { return nil }
 func (o *setTransactionOp) Open(ctx *Context) error { o.ctx = ctx; return nil }
 func (o *setTransactionOp) Close() error            { return nil }
 

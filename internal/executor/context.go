@@ -264,6 +264,13 @@ type Context struct {
 	// within the current explicit transaction.  On ROLLBACK, created types are
 	// dropped from the catalog.  map[enumTypeName(lowercase)]=true.  M0097-0022.
 	PendingCreatedEnums map[string]bool
+	// PendingCreatedComposites tracks composite types created via
+	// CREATE TYPE … AS (...) within the current explicit transaction.  On
+	// ROLLBACK, created types are dropped from the catalog so they do not
+	// outlive the aborted transaction (the enum analogue is
+	// PendingCreatedEnums).  map[compositeTypeName(lowercase)]=true.
+	// DU-002 slice 244.
+	PendingCreatedComposites map[string]bool
 
 	// WAL exposes the cluster's WAL writer so execCommit can read the
 	// WrittenLSN after a local flush to bound the SyncRep wait. nil

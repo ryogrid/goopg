@@ -249,6 +249,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.PendingEnumValues = connTx.PendingEnumValues
 		ectx.PendingEnumRenames = connTx.PendingEnumRenames
 		ectx.PendingCreatedEnums = connTx.PendingCreatedEnums
+		ectx.PendingCreatedComposites = connTx.PendingCreatedComposites
 		// Wire session-authorization role tracking so LEAKPROOF privilege checks
 		// work after SET SESSION AUTHORIZATION regress_unpriv_user.
 		ectx.NonSuperuserRole = connTx.NonSuperuserRole
@@ -700,6 +701,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			connTx.PendingEnumValues = ectx.PendingEnumValues
 			connTx.PendingEnumRenames = ectx.PendingEnumRenames
 			connTx.PendingCreatedEnums = ectx.PendingCreatedEnums
+			connTx.PendingCreatedComposites = ectx.PendingCreatedComposites
 		}
 	}
 	// Update pg_stat_activity to idle after successful execution.
@@ -1370,6 +1372,11 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
 	for name := range created {
 		_ = inm.DropEnum(name, false)
 	}
+	// Step 4: Drop composite types created via CREATE TYPE … AS (...) in this
+	// transaction.  Mirrors undoEnumDDLFromContext step 4.  DU-002 slice 244.
+	for name := range connTx.PendingCreatedComposites {
+		_ = inm.DropCompositeType(name)
+	}
 }
 
 // autoCommitPtr, if non-nil, is set to false when a BEGIN starts an
@@ -1470,6 +1477,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					ctx.PendingEnumValues = nil
 					ctx.PendingEnumRenames = nil
 					ctx.PendingCreatedEnums = nil
+					ctx.PendingCreatedComposites = nil
 					return w.WriteCommandComplete("ROLLBACK")
 				}
 				explicitTx := connTx.Tx()
@@ -1500,6 +1508,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						ctx.PendingEnumValues = nil
 						ctx.PendingEnumRenames = nil
 						ctx.PendingCreatedEnums = nil
+						ctx.PendingCreatedComposites = nil
 						return s.writeQueryError(w, "40001",
 							"could not serialize access due to read/write dependencies among transactions: "+ssiErr.Error())
 					}
@@ -1513,6 +1522,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					ctx.PendingEnumValues = nil
 					ctx.PendingEnumRenames = nil
 					ctx.PendingCreatedEnums = nil
+					ctx.PendingCreatedComposites = nil
 					return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 				}
 				// Clear pending routine drops — committed, no restoration needed.
@@ -1526,6 +1536,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				ctx.PendingEnumValues = nil
 				ctx.PendingEnumRenames = nil
 				ctx.PendingCreatedEnums = nil
+				ctx.PendingCreatedComposites = nil
 				maybeForceGCAfterCommit()
 				// Leave *autoCommitPtr = false so the caller does NOT attempt
 				// a second TxnMgr.Commit on the already-committed transaction.
@@ -1561,6 +1572,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				ctx.PendingEnumValues = nil
 				ctx.PendingEnumRenames = nil
 				ctx.PendingCreatedEnums = nil
+				ctx.PendingCreatedComposites = nil
 				// Leave *autoCommitPtr = false to avoid a second rollback attempt.
 			} else {
 				// ROLLBACK outside an explicit transaction: emit warning.

@@ -7052,8 +7052,40 @@ suppressed by `getTypes`' isarray subquery, like `_mood`.
 
 **Still deferred:** composite fields whose type is itself a user-defined type (enum/domain/composite) —
 `parseCompositeFieldType` resolves only built-ins via `TypeNameToOID` (a non-built-in field folds to
-`text`); ROLLBACK-undo of composite catalog rows (no `PendingCreatedComposites`, matching the unchanged
-in-memory registration); `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE`.
+`text`); `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE`.
+
+### Slice 244 — ROLLBACK drops a composite type created in the aborted transaction
+
+Slice 243 left a transactional-correctness gap: `CREATE TYPE x AS (...)` registered the composite in the
+in-memory catalog unconditionally, so `BEGIN; CREATE TYPE x AS (...); ROLLBACK;` left `x` alive — it
+stayed visible in `pg_type`/the virtual `pg_class`/`\dT` and a subsequent `CREATE TYPE x` failed with a
+spurious "already exists". The enum path already solved the analogous problem (`PendingCreatedEnums` +
+`undoEnumDDLFromContext` / `undoEnumDDLForRollback`); this slice mirrors it for composites.
+
+- **Tracking**: `CREATE TYPE … AS (...)` now records the (lowercased) name in
+  `Context.PendingCreatedComposites` / `connTxState.PendingCreatedComposites` when issued inside an explicit
+  transaction (`operators_ddl.go` `execCreateType`).
+- **Undo**: both rollback paths — the executor's `undoEnumDDLFromContext` (extended-query / failure-path
+  COMMIT) and dispatch's `undoEnumDDLForRollback` (simple-query `ROLLBACK`/failed-`COMMIT`) — gain a
+  step 4 that calls `InMemory.DropCompositeType(name)` for every tracked composite.
+- **Heap rows**: the `pg_type`/`pg_class`/`pg_attribute` heap rows written by `syncCompositeTypeToCatalogHeap`
+  carry the aborting transaction's XID, so they become MVCC-invisible on rollback automatically — no
+  explicit xmax stamping is needed (the same is true of the enum path). Only the in-memory registration,
+  which the virtual `pg_class` builder iterates and which `LookupCompositeType` consults, must be undone.
+- **Wiring**: `PendingCreatedComposites` is threaded `connTx → ectx` before dispatch and `ectx → connTx`
+  after (alongside `PendingCreatedEnums`), and cleared at every COMMIT/ROLLBACK exit (executor
+  `clearCtxTransaction`, the five dispatch transaction-verb exits, and `connTxState.reset`).
+
+Verified live: `BEGIN; CREATE TYPE rb AS (a int, b text);` shows `pg_type` count 1 in-tx, then `ROLLBACK`
+drops it (`pg_type`/`pg_class` count 0, `\dT` empty), re-`CREATE TYPE rb` succeeds, and `COMMIT` of a
+sibling type persists + round-trips through `pg_dump`. Unit tests `TestUndoCompositeDDLOnRollback`
+(drops in-tx composite, keeps pre-existing one) and `TestUndoCompositeDDLCaseInsensitive`
+(`operators_tx_composite_test.go`) pin the undo step.
+
+**Still deferred** (unchanged): composite fields of a user-defined type; `ALTER TYPE … ADD/DROP/ALTER
+ATTRIBUTE`. Crash-recovery of a rolled-back composite's catalog heap rows shares the enum path's reliance
+on MVCC xmin-abort visibility (no xmax stamp on rollback) — out of scope here, tracked with the enum
+behavior.
 
 ## Deferred (002–010) — catalog surface estimate
 
