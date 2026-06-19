@@ -3115,6 +3115,19 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 							continue
 						}
 					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "autosummarize" {
+					// BRIN boolean storage parameter. PG accepts on/off/true/
+					// false/yes/no/1/0 (parse_bool); record the value so pg_dump
+					// can re-emit it. DU-002 slice 223.
+					p.advance() // consume "autosummarize"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if b, ok := parseReloptionBool(p.cur().Value); ok {
+							stmt.AutoSummarize = &b
+							p.advance()
+							continue
+						}
+					}
 				}
 				p.advance()
 			}

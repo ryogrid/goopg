@@ -6436,6 +6436,35 @@ BRIN index keeps reloptions NULL) and `TestIndexPagesPerRangeOutOfBoundsRejected
 (pages_per_range=64)`; the assertion confirms the dump carries `CREATE INDEX foo_brinrange_idx ON
 public.foo USING brin (qty) WITH (pages_per_range='64');`.
 
+### Slice 223 — BRIN index `autosummarize` boolean reloption round-trip
+
+Adds the BRIN `autosummarize` **boolean** storage parameter on **`CREATE INDEX … USING brin`**, the
+remaining BRIN reloption after `pages_per_range` (slice 222). PG's BRIN access method exposes it
+(`reloptions.c`: default `false`) to summarize the previous page range when a new range is created;
+`WITH (autosummarize=on)` must survive a dump/restore.
+
+This slice mirrors `fastupdate`'s **boolean** tri-state plumbing (slice 220) on a BRIN-specific key:
+
+- **Parser** (`ddl.go`): the WITH loop recognizes `autosummarize` and reads its boolean via the existing
+  `parseReloptionBool` (PG `parse_bool`: on/off/true/false/yes/no/1/0) into `CreateIndexStmt.AutoSummarize`
+  (`*bool`, `nil` = unset).
+- **Executor** (`operators_ddl.go`): persists `idx.AutoSummarize = s.AutoSummarize` in the catalog-only
+  branch (no range check — the value is already validated by the parser's `parseReloptionBool`).
+- **catalog** (`catalog.go`): `Index.AutoSummarize` (`*bool`, rendered `on`/`off`) is appended to
+  `reloptionList()` after `pages_per_range`. `BuildIndexDef` dumps `USING brin … WITH (autosummarize='on')`.
+
+`catalog.Index.AutoSummarize` is JSON-persisted. goopg has no BRIN summarization, so the value is advisory
+catalog/dump-only — like the BRIN index itself. `nil` is the unset sentinel (PG default `off` emits no
+reloption), so a plain BRIN index still dumps byte-identically.
+
+Engine guards: `TestIndexAutoSummarizeSurfacesInPgClassReloptions` (an `on` value → `{autosummarize=on}`,
+an off value spelled `no` → `{autosummarize=off}`, and a plain BRIN index keeping reloptions NULL, with
+`BuildIndexDef` rendering `USING brin … WITH (autosummarize='on')`) and
+`TestIndexPagesPerRangeAndAutoSummarizeCombined` (both reloptions together →
+`{pages_per_range=32,autosummarize=on}` in the stable `reloptionList` order). The pg_dump fixture adds
+`foo_brinauto_idx ON public.foo USING brin (qty) WITH (autosummarize=on)`; the assertion confirms the dump
+carries `CREATE INDEX foo_brinauto_idx ON public.foo USING brin (qty) WITH (autosummarize='on');`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

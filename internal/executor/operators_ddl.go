@@ -4144,6 +4144,8 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		idx.GinPendingListLimit = s.GinPendingListLimit
 		// Persist `WITH (pages_per_range=N)` (BRIN, range-validated above). DU-002 slice 222.
 		idx.PagesPerRange = s.PagesPerRange
+		// Persist `WITH (autosummarize=on|off)` (BRIN). DU-002 slice 223.
+		idx.AutoSummarize = s.AutoSummarize
 		if catalogHeapSyncAvailable(o.ctx) {
 			if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
 				return fmt.Errorf("DDL catalog sync: %w", syncErr)

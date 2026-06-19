@@ -4900,6 +4900,26 @@ object support.
         (pages_per_range='64');`); pgbench pre-commit smoke on commit. **Next:** brin `autosummarize` bool
         (the remaining BRIN reloption; same bool plumbing as fastupdate/deduplicate_items); or the BIGGER
         `toast.*` namespace / composite types.
+      - **PROGRESS 2026-06-19 (loop #38):** **DU-002 slice 223 LANDED — BRIN index `autosummarize` boolean
+        storage parameter round-trips through pg_dump.** The remaining BRIN reloption after `pages_per_range`.
+        Mirrors slice 220's (fastupdate) `*bool` tri-state plumbing on a BRIN key: parser (`ddl.go`) recognizes
+        `autosummarize` and reads the bool via `parseReloptionBool` into `CreateIndexStmt.AutoSummarize`
+        (`*bool`, nil=unset); executor (`operators_ddl.go`) persists `idx.AutoSummarize = s.AutoSummarize` in
+        the catalog-only branch (no range check — parser already validated the bool token). `Index.AutoSummarize`
+        (rendered on/off) appended to `reloptionList()` after `pages_per_range`; `BuildIndexDef` dumps `USING
+        brin … WITH (autosummarize='on')`. JSON-persisted; advisory catalog/dump-only. nil sentinel (PG default
+        off) keeps a plain BRIN index byte-identical. Files: `internal/parser/ast.go`
+        (`CreateIndexStmt.AutoSummarize`), `internal/parser/ddl.go` (WITH-loop bool capture),
+        `internal/catalog/catalog.go` (`Index.AutoSummarize` + `reloptionList()`),
+        `internal/executor/operators_ddl.go` (persist in catalog-only branch),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestIndexAutoSummarizeSurfacesInPgClassReloptions` + `TestIndexPagesPerRangeAndAutoSummarizeCombined`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `foo_brinauto_idx` fixture + indexDefs assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 223). Gates: gofmt OK; `go build ./internal/...`
+        clean; catalog/parser/full-executor reloption suites PASS; `TestPort_PgDumpConnectionSetup` PASS
+        (round-trips `CREATE INDEX foo_brinauto_idx ON public.foo USING brin (qty) WITH (autosummarize='on');`);
+        pgbench pre-commit smoke on commit. **Next:** the BIGGER `toast.*` namespace (toast-table pg_class
+        modeling; `reltoastrelid` hardcoded 0) / composite types — all simple index/table reloptions now land.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

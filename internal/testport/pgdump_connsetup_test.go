@@ -1507,6 +1507,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_brinrange_idx ON public.foo USING brin (qty) WITH (pages_per_range=64)"); err != nil {
 		t.Fatalf("create pages_per_range brin index: %v", err)
 	}
+	// Slice 223: a BRIN index declared `WITH (autosummarize=on)` must round-trip.
+	// goopg's parser previously extracted only pages_per_range from the BRIN WITH
+	// clause, discarding autosummarize; it now threads the boolean through parser →
+	// catalog.Index.AutoSummarize (*bool tri-state), so BuildIndexDef emits `USING
+	// brin … WITH (autosummarize='on')` and the index pg_class.reloptions cell
+	// carries it. goopg has no BRIN summarization, so the value is advisory
+	// catalog/dump-only.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_brinauto_idx ON public.foo USING brin (qty) WITH (autosummarize=on)"); err != nil {
+		t.Fatalf("create autosummarize brin index: %v", err)
+	}
 	// Slice 134: a UNIQUE index declared `NULLS NOT DISTINCT` (PostgreSQL 15+)
 	// must round-trip. goopg's parser accepted the clause but DISCARDED it, and
 	// pg_index.indnullsnotdistinct was hard-wired false, so pg_get_indexdef
@@ -4089,6 +4099,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// (previously rejected as an unsupported method) plus flatten_reloptions
 			// single-quoting of the integer value.
 			"CREATE INDEX foo_brinrange_idx ON public.foo USING brin (qty) WITH (pages_per_range='64');",
+			// Slice 223: BRIN catalog-only index with a `WITH (autosummarize='on')`
+			// boolean reloption. Exercises the `USING brin` rendering plus the boolean
+			// reloption path through flatten_reloptions (single-quoted value).
+			"CREATE INDEX foo_brinauto_idx ON public.foo USING brin (qty) WITH (autosummarize='on');",
 		}
 		for _, sub := range indexDefs {
 			if !strings.Contains(res.Stdout, sub) {

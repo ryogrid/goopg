@@ -1276,6 +1276,12 @@ type CreateIndexStmt struct {
 	// pg_get_indexdef can re-emit `WITH (pages_per_range='N')`. Valid range
 	// 1–131072. DU-002 slice 222.
 	PagesPerRange int
+	// AutoSummarize captures the BRIN `WITH (autosummarize=on|off)` boolean
+	// storage parameter (summarize the previous range when a new page range is
+	// created). nil means unset (PG default OFF); a non-nil pointer records the
+	// explicitly-declared value so pg_get_indexdef can re-emit
+	// `WITH (autosummarize='on'|'off')`. DU-002 slice 223.
+	AutoSummarize *bool
 }
 
 // IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key

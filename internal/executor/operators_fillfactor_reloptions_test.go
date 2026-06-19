@@ -2557,3 +2557,127 @@ func TestIndexPagesPerRangeOutOfBoundsRejected(t *testing.T) {
 		t.Fatalf("error = %v (%T), want ExecError with code 22023", err, err)
 	}
 }
+
+// TestIndexAutoSummarizeSurfacesInPgClassReloptions verifies that a BRIN
+// `WITH (autosummarize=on|off)` boolean storage parameter declared on CREATE
+// INDEX USING brin is persisted on the catalog Index (as a *bool tri-state) and
+// surfaced through the index's own pg_class virtual-view reloptions cell. BRIN
+// registers catalog-only, which lets the autosummarize reloption round-trip:
+// pg_dump reads reloptions via `t.reloptions AS indreloptions` and re-emits
+// `CREATE INDEX … USING brin … WITH (autosummarize='on')`. Cases pin: an on
+// value (`{autosummarize=on}`), an off value spelled with a non-canonical
+// accepted token ("no" → `autosummarize=off`), and a plain BRIN index
+// (reloptions NULL). goopg has no BRIN summarization, so this is advisory
+// catalog/dump-only. DU-002 slice 223.
+func TestIndexAutoSummarizeSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE ba (id integer, v integer, w integer)`); err != nil {
+		t.Fatalf("CREATE TABLE ba: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX baon ON ba USING brin (id) WITH (autosummarize=on)`); err != nil {
+		t.Fatalf("CREATE INDEX baon: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX baoff ON ba USING brin (v) WITH (autosummarize=no)`); err != nil {
+		t.Fatalf("CREATE INDEX baoff: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX baplain ON ba USING brin (w)`); err != nil {
+		t.Fatalf("CREATE INDEX baplain: %v", err)
+	}
+
+	onIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "baon"})
+	if !ok {
+		t.Fatal("baon index not found")
+	}
+	if onIdx.AutoSummarize == nil || !*onIdx.AutoSummarize {
+		t.Errorf("baon.AutoSummarize = %v, want non-nil true", onIdx.AutoSummarize)
+	}
+	offIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "baoff"})
+	if !ok {
+		t.Fatal("baoff index not found")
+	}
+	if offIdx.AutoSummarize == nil || *offIdx.AutoSummarize {
+		t.Errorf("baoff.AutoSummarize = %v, want non-nil false", offIdx.AutoSummarize)
+	}
+	plainIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "baplain"})
+	if !ok {
+		t.Fatal("baplain index not found")
+	}
+	if plainIdx.AutoSummarize != nil {
+		t.Errorf("baplain.AutoSummarize = %v, want nil (unset)", plainIdx.AutoSummarize)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && r[17] == "i" && (r[1] == "baon" || r[1] == "baoff" || r[1] == "baplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["baon"] != "{autosummarize=on}" {
+		t.Errorf("pg_class.reloptions for baon = %q, want %q", got["baon"], "{autosummarize=on}")
+	}
+	if got["baoff"] != "{autosummarize=off}" {
+		t.Errorf("pg_class.reloptions for baoff = %q, want %q", got["baoff"], "{autosummarize=off}")
+	}
+	if got["baplain"] != "" {
+		t.Errorf("pg_class.reloptions for baplain = %q, want \"\" (NULL)", got["baplain"])
+	}
+
+	// BuildIndexDef (the pg_get_indexdef path pg_dump emits verbatim) single-quotes
+	// the reloption value and renders USING brin.
+	if def := catalog.BuildIndexDef(onIdx); !strings.Contains(def, "USING brin") || !strings.Contains(def, "WITH (autosummarize='on')") {
+		t.Errorf("BuildIndexDef(baon) = %q, want USING brin and WITH (autosummarize='on')", def)
+	}
+	if def := catalog.BuildIndexDef(offIdx); !strings.Contains(def, "WITH (autosummarize='off')") {
+		t.Errorf("BuildIndexDef(baoff) = %q, want WITH (autosummarize='off')", def)
+	}
+	if def := catalog.BuildIndexDef(plainIdx); strings.Contains(def, "WITH (") {
+		t.Errorf("BuildIndexDef(baplain) = %q, want no WITH clause", def)
+	}
+}
+
+// TestIndexPagesPerRangeAndAutoSummarizeCombined verifies that a BRIN index
+// declared with both `pages_per_range` and `autosummarize` renders them in the
+// stable pg_class.reloptions order (pages_per_range before autosummarize,
+// matching reloptionList) and that BuildIndexDef re-emits both. DU-002 slice 223.
+func TestIndexPagesPerRangeAndAutoSummarizeCombined(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE bc (id integer)`); err != nil {
+		t.Fatalf("CREATE TABLE bc: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX bcboth ON bc USING brin (id) WITH (pages_per_range=32, autosummarize=on)`); err != nil {
+		t.Fatalf("CREATE INDEX bcboth: %v", err)
+	}
+
+	bothIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "bcboth"})
+	if !ok {
+		t.Fatal("bcboth index not found")
+	}
+	if bothIdx.PagesPerRange != 32 || bothIdx.AutoSummarize == nil || !*bothIdx.AutoSummarize {
+		t.Errorf("bcboth = {ppr:%d autosummarize:%v}, want {32 true}", bothIdx.PagesPerRange, bothIdx.AutoSummarize)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && r[17] == "i" && r[1] == "bcboth" {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["bcboth"] != "{pages_per_range=32,autosummarize=on}" {
+		t.Errorf("pg_class.reloptions for bcboth = %q, want %q", got["bcboth"], "{pages_per_range=32,autosummarize=on}")
+	}
+	if def := catalog.BuildIndexDef(bothIdx); !strings.Contains(def, "WITH (pages_per_range='32', autosummarize='on')") {
+		t.Errorf("BuildIndexDef(bcboth) = %q, want WITH (pages_per_range='32', autosummarize='on')", def)
+	}
+}

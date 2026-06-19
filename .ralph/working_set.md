@@ -1,37 +1,32 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 222 (loop #37) — BRIN catalog-only index +
-`pages_per_range` integer storage parameter round-trips through pg_dump.
+Last landed: DU-002 slice 223 (loop #38) — BRIN index `autosummarize` boolean
+storage parameter round-trips through pg_dump. The remaining BRIN reloption.
 
-What happened: Unlike GIN, BRIN was previously *rejected* by CREATE INDEX
-(`index method "brin" is not supported in v0`), so this slice first widened the
-catalog-only branch guard from `gist||spgist||gin` to `gist||spgist||gin||brin`
-(BRIN now registers catalog metadata only — no physical storage/summarization).
-Then mirrored slice 221's int plumbing on the BRIN key: parser reads the int via
-parseIntLit into CreateIndexStmt.PagesPerRange (int, 0=unset); executor
-range-validates like PG (<1 || >131072 → SQLSTATE 22023, reloptions.c min 1 / max
-BRIN_MAX_PAGES_PER_RANGE=131072) next to the gin_pending_list_limit check;
-persists idx.PagesPerRange in the catalog-only branch. Index.PagesPerRange
-(strconv.Itoa) appended to reloptionList() after gin_pending_list_limit;
-BuildIndexDef dumps `USING brin … WITH (pages_per_range='64')`. JSON-persisted;
-advisory catalog/dump-only (no BRIN summarization). 0 sentinel keeps a plain BRIN
-index byte-identical.
+What happened: Mirrored slice 220's (fastupdate) `*bool` tri-state plumbing on a
+BRIN key. Parser (ddl.go WITH-loop) recognizes `autosummarize`, reads the bool via
+parseReloptionBool into CreateIndexStmt.AutoSummarize (*bool, nil=unset). Executor
+persists idx.AutoSummarize in the catalog-only branch (no range check — bool token
+already validated by parser). Index.AutoSummarize (rendered on/off) appended to
+reloptionList() AFTER pages_per_range (PG relopt order); BuildIndexDef dumps
+`USING brin … WITH (autosummarize='on')`. JSON-persisted; advisory catalog/dump-only.
+nil sentinel (PG default off) keeps a plain BRIN index byte-identical.
 
-Files: internal/parser/ast.go (CreateIndexStmt.PagesPerRange),
-internal/parser/ddl.go (WITH-loop capture), internal/catalog/catalog.go
-(Index.PagesPerRange + reloptionList()), internal/executor/operators_ddl.go
-(branch widen + range-validate + persist),
+Files: internal/parser/ast.go (CreateIndexStmt.AutoSummarize), internal/parser/ddl.go
+(WITH-loop bool capture), internal/catalog/catalog.go (Index.AutoSummarize +
+reloptionList()), internal/executor/operators_ddl.go (persist in catalog-only branch),
 internal/executor/operators_fillfactor_reloptions_test.go (NEW
-TestIndexPagesPerRangeSurfacesInPgClassReloptions +
-TestIndexPagesPerRangeOutOfBoundsRejected),
-internal/testport/pgdump_connsetup_test.go (foo_brinrange_idx fixture + indexDefs
-assertion), docs/design/0110-0001-pg-dump-tap-port.md (Slice 222), fix_plan.md.
+TestIndexAutoSummarizeSurfacesInPgClassReloptions +
+TestIndexPagesPerRangeAndAutoSummarizeCombined),
+internal/testport/pgdump_connsetup_test.go (foo_brinauto_idx fixture + indexDefs
+assertion), docs/design/0110-0001-pg-dump-tap-port.md (Slice 223), fix_plan.md.
 
-Gates: gofmt OK; go build ./internal/... clean; FULL executor suite PASS;
-parser+catalog PASS; TestPort_PgDumpConnectionSetup PASS; pgbench pre-commit
-smoke on commit.
+Gates: gofmt OK; go build ./internal/... clean; parser+catalog PASS; executor
+reloption suite PASS; TestPort_PgDumpConnectionSetup PASS; pgbench pre-commit smoke
+on commit.
 
-Next: brin `autosummarize` bool — the remaining BRIN reloption; same bool
-plumbing as fastupdate/deduplicate_items (parseReloptionBool → *bool tri-state,
-reloptionList renders on/off). Or the BIGGER toast.* namespace (toast-table
-pg_class modeling; reltoastrelid hardcoded 0) / composite types.
+Next: All simple index/table reloptions now land (fillfactor, deduplicate_items,
+fastupdate, gin_pending_list_limit, pages_per_range, autosummarize). The remaining
+pg_dump-fidelity work is BIGGER: toast.* reloption namespace (needs toast-table
+pg_class modeling; reltoastrelid hardcoded 0) or composite types. Pick one as a
+multi-slice effort, not a one-line mirror.

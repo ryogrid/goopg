@@ -1010,6 +1010,14 @@ type Index struct {
 	// WITH (pages_per_range='N')`. goopg has no BRIN summarization, so this is
 	// advisory catalog/dump-only. DU-002 slice 222.
 	PagesPerRange int
+	// AutoSummarize stores the BRIN `WITH (autosummarize=on|off)` boolean storage
+	// parameter (summarize the previous range when a new page range is created).
+	// nil means unset (PG default OFF) — no reloption is emitted, so a plain BRIN
+	// index dumps byte-identically. When set, the index's pg_class.reloptions
+	// virtual row renders `autosummarize=on` (or `off`), which pg_dump re-emits as
+	// `CREATE INDEX … WITH (autosummarize='on')`. goopg has no BRIN
+	// summarization, so this is advisory catalog/dump-only. DU-002 slice 223.
+	AutoSummarize *bool
 }
 
 // reloptionList returns the index's storage parameters as ordered key=value
@@ -1042,6 +1050,13 @@ func (idx *Index) reloptionList() [][2]string {
 	}
 	if idx.PagesPerRange != 0 {
 		opts = append(opts, [2]string{"pages_per_range", strconv.Itoa(idx.PagesPerRange)})
+	}
+	if idx.AutoSummarize != nil {
+		v := "off"
+		if *idx.AutoSummarize {
+			v = "on"
+		}
+		opts = append(opts, [2]string{"autosummarize", v})
 	}
 	return opts
 }
