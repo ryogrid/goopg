@@ -4593,6 +4593,27 @@ object support.
         (`autovacuum_freeze_table_age` 0–2000000000, the multixact_freeze trio: `autovacuum_multixact_freeze_min_age`
         0–1000000000 / `…max_age` 10000–2000000000 / `…table_age` 0–2000000000, `autovacuum_vacuum_cost_limit`
         1–10000) or `user_catalog_table` bool; then `toast.*` namespace; or composite types (`CREATE TYPE AS`).
+      - **PROGRESS 2026-06-19 (loop #23):** **DU-002 slice 209 LANDED — seventh INTEGER autovacuum-namespace
+        storage parameter (`autovacuum_freeze_table_age`) round-trips through pg_dump.** Continues the
+        freeze-age subfamily, reusing the slice-198 integer path. `autovacuum_freeze_table_age` is
+        `RELOPT_TYPE_INT`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`, default -1 (= unset / use the GUC), range
+        0–2000000000 (`reloptions.c:1889/312`). `0` is a valid explicit value, so `AutovacuumFreezeTableAgeSet`
+        flag — not a zero check — records presence (parallel_workers pattern). Executor parses via `strconv.Atoi`,
+        rejecting non-integer / out-of-range (`< 0 || > 2000000000`) → `22023` (negatives rejected earlier by the
+        parser as a syntax error). Persist `catalog.Table.AutovacuumFreezeTableAge` (int); pg_class virtual view
+        appends `autovacuum_freeze_table_age=N` after `autovacuum_freeze_max_age`; pg_dump renders
+        `WITH (autovacuum_freeze_table_age='N')`. Advisory catalog/dump-only; base-table-only. Files:
+        `internal/catalog/catalog.go` (`Table.AutovacuumFreezeTableAge`/`…Set` + render),
+        `internal/executor/operators_ddl.go` (extract/parse + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestAutovacuumFreezeTableAgeSurfacesInPgClassReloptions` + `TestAutovacuumFreezeTableAgeOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optafta` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 209). No parser change needed. Gates: gofmt OK;
+        `go build ./internal/...` clean; catalog/executor reloption tests PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** remaining freeze-age INT reloptions (multixact_freeze
+        trio: `autovacuum_multixact_freeze_min_age` 0–1000000000 / `…max_age` 10000–2000000000 / `…table_age`
+        0–2000000000, `autovacuum_vacuum_cost_limit` 1–10000) or `user_catalog_table` bool; then `toast.*`
+        namespace; or composite types (`CREATE TYPE AS`).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

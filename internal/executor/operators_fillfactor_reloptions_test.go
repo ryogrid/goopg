@@ -1332,6 +1332,82 @@ func TestAutovacuumFreezeMaxAgeOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+// TestAutovacuumFreezeTableAgeSurfacesInPgClassReloptions verifies that an integer
+// autovacuum_freeze_table_age storage parameter is persisted on the table, surfaces
+// in pg_class.reloptions as `autovacuum_freeze_table_age=N`, and that an unset table
+// reports no reloption. The valid range minimum is 0 (distinct from the -1 unset
+// sentinel), so presence is tracked by a flag rather than a zero check.
+// DU-002 slice 209.
+func TestAutovacuumFreezeTableAgeSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE afta (id integer PRIMARY KEY) WITH (fillfactor=70, autovacuum_freeze_table_age=150000000)`); err != nil {
+		t.Fatalf("CREATE TABLE afta: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE aftaplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE aftaplain: %v", err)
+	}
+
+	aftaTbl, ok := cat.LookupTable(parser.ObjectName{Name: "afta"})
+	if !ok {
+		t.Fatal("afta table not found")
+	}
+	if aftaTbl.AutovacuumFreezeTableAge != 150000000 || !aftaTbl.AutovacuumFreezeTableAgeSet {
+		t.Errorf("afta age = %d set=%v, want 150000000 set=true", aftaTbl.AutovacuumFreezeTableAge, aftaTbl.AutovacuumFreezeTableAgeSet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "aftaplain"})
+	if !ok {
+		t.Fatal("aftaplain table not found")
+	}
+	if plainTbl.AutovacuumFreezeTableAgeSet {
+		t.Errorf("aftaplain set=%v, want false (unset)", plainTbl.AutovacuumFreezeTableAgeSet)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "afta" || r[1] == "aftaplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["afta"] != "{fillfactor=70,autovacuum_freeze_table_age=150000000}" {
+		t.Errorf("pg_class.reloptions for afta = %q, want %q", got["afta"], "{fillfactor=70,autovacuum_freeze_table_age=150000000}")
+	}
+	if got["aftaplain"] != "" {
+		t.Errorf("pg_class.reloptions for aftaplain = %q, want \"\" (NULL)", got["aftaplain"])
+	}
+}
+
+// TestAutovacuumFreezeTableAgeOutOfBoundsRejected verifies CREATE TABLE rejects an
+// above-max (> 2000000000) or non-integer autovacuum_freeze_table_age with PG's
+// 22023 error. The valid range is 0–2000000000; negatives (below min 0) are
+// rejected earlier by the parser as a syntax error, so the reachable invalid cases
+// are overflow and non-integer. DU-002 slice 209.
+func TestAutovacuumFreezeTableAgeOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, v := range []string{"2000000001", "nope"} {
+		err := runDDL(t, ctx, `CREATE TABLE aftabad`+strconv.Itoa(i)+` (id integer) WITH (autovacuum_freeze_table_age=`+v+`)`)
+		if err == nil {
+			t.Errorf("autovacuum_freeze_table_age=%s: expected an error, got nil", v)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("autovacuum_freeze_table_age=%s: error type = %T, want *ExecError", v, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("autovacuum_freeze_table_age=%s: error code = %q, want 22023", v, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.
