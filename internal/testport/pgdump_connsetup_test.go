@@ -983,6 +983,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table collcol: %v", err)
 	}
 
+	// Slice 189: the ARRAY types of the collatable scalars must NOT emit a
+	// spurious COLLATE. A PG array inherits its element's typcollation, so
+	// varchar[]/bpchar[]/name[] columns carry attcollation 100/100/950 — and the
+	// bootstrapped pg_type heap must report the SAME typcollation for the array
+	// OID, or getTableAttrs's `a.attcollation <> t.typcollation` fires and
+	// dumpTableSchema emits `COLLATE pg_catalog."default"` on a column the user
+	// never collated. The heap left _name/_bpchar/_varchar typcollation at 0
+	// (slice 188 fixed only the scalars), so this was the slice-187 regression
+	// still latent for array columns. No COLLATE clause must appear for collarr.
+	if err := runSQLSimple(t, c, `CREATE TABLE public.collarr (a character varying[], b character(4)[], cc name[], d text[])`); err != nil {
+		t.Fatalf("create table collarr: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -2572,6 +2585,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if strings.Contains(res.Stdout, "d text COLLATE") {
 			t.Errorf("pg_dump emitted a spurious COLLATE for an untouched column (collcol.d)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 189 (asserted):** array-of-collatable columns must NOT carry a
+		// spurious COLLATE. _name/_bpchar/_varchar inherit their element collation
+		// (950/100/100); once the heap typcollation for these array OIDs matches the
+		// virtual pg_attribute.attcollation, getTableAttrs reports no difference and
+		// dumpTableSchema omits the clause. Any COLLATE on a collarr column means the
+		// heap/attribute sibling paths diverged again (the slice-187 regression).
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.collarr") {
+			t.Errorf("pg_dump dropped the collarr table entirely\n  full stdout=%q", res.Stdout)
+		} else {
+			// Any COLLATE on one of collarr's four default-collation array columns is
+			// spurious (format_type renders varchar[]/bpchar(4)[]/name[]/text[]).
+			for _, sub := range []string{
+				`character varying[] COLLATE`,
+				`character(4)[] COLLATE`,
+				`name[] COLLATE`,
+				`text[] COLLATE`,
+			} {
+				if strings.Contains(res.Stdout, sub) {
+					t.Errorf("pg_dump emitted a spurious COLLATE on a default-collation array column (collarr): %q\n  full stdout=%q", sub, res.Stdout)
+				}
+			}
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

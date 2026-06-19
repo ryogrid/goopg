@@ -4158,6 +4158,26 @@ object support.
         clean; parser/catalog/initdb/executor PASS; `TestPort_PgDumpConnectionSetup` PASS (was FAILING
         at HEAD); pgbench pre-commit smoke on commit. **Next:** MINVALUE/MAXVALUE keyword-AST-node
         slice (HIGHER RISK: partition routing); or attfdwoptions (foreign-table only, NULL today).
+      - **PROGRESS 2026-06-19 (loop #157):** **DU-002 slice 189 LANDED — extended the slice-188
+        `attcollation`/`typcollation` fix to the ARRAY types, closing the slice-187 regression that
+        was STILL LATENT for array columns.** Slice 188 set the heap `pg_type.typcollation` for the
+        collatable scalars (name/text/bpchar/varchar) + `_text`, but left `_name` (1003), `_bpchar`
+        (1014), `_varchar` (1015) at 0 — while `executor.userTypeAttrsForOID` already reports the
+        element-inherited collation for those array OIDs (`_name`→950, `_bpchar`/`_varchar`→100, since
+        a PG array inherits its element's typcollation). So a `varchar[]`/`bpchar[]`/`name[]` column
+        had `attcollation`=100/100/950 but heap `typcollation`=0 → pg_dump's getTableAttrs
+        (`a.attcollation <> t.typcollation`) fired → spurious `COLLATE pg_catalog."default"` on a
+        column the user never collated (invisible until a column of one of those array types was
+        dumped — no prior fixture used one). Fix: added the three array OIDs to `pgTypeCollationForOID`
+        (`internal/initdb/pg_type_bootstrap.go`). Audit complete: no other built-in heap type is
+        collatable. Files: `internal/initdb/pg_type_bootstrap.go`,
+        `internal/initdb/pg_type_bootstrap_test.go` (NEW `TestPgTypeArrayCollationMatchesElement`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `collarr` 4-array-column fixture +
+        no-spurious-COLLATE assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 189).
+        Gates: gofmt OK; `go build ./...` clean; initdb + executor PASS;
+        `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:**
+        MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition routing); or attfdwoptions
+        (foreign-table only, NULL today).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

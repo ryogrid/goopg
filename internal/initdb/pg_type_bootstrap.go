@@ -239,6 +239,13 @@ func pgTypeInitialEntries() []pgTypeEntry {
 // slice 187) — surfaced as a spurious `COLLATE pg_catalog."default"` on every
 // text/varchar/bpchar column in pg_dump output. DU-002 slice 188.
 //
+// DU-002 slice 189 extends the same fix to the ARRAY types of the collatable
+// scalars: a PG array inherits its element's typcollation, so _name (1003) is
+// 'C' (950) and _bpchar (1014) / _varchar (1015) are 'default' (100), exactly as
+// userTypeAttrsForOID reports for those array OIDs. Without these rows the heap
+// reported 0 while pg_attribute reported 100/950, so a `varchar[]`/`bpchar[]`/
+// `name[]` column round-tripped through pg_dump with a spurious COLLATE clause.
+//
 // Only collatable built-in types present in the nailed pg_type heap are listed;
 // every other type is non-collatable (InvalidOid/0). default=100, C=950 match
 // pg_collation_d.h DEFAULT_COLLATION_OID / C_COLLATION_OID.
@@ -253,6 +260,12 @@ func pgTypeCollationForOID(oid uint32) int64 {
 	case 1043: // varchar -- typcollation => 'default'
 		return 100
 	case 1009: // _text   -- text array inherits the element's 'default' collation
+		return 100
+	case 1003: // _name   -- name array inherits the element's 'C' collation
+		return 950
+	case 1014: // _bpchar -- bpchar array inherits the element's 'default' collation
+		return 100
+	case 1015: // _varchar -- varchar array inherits the element's 'default' collation
 		return 100
 	default:
 		return 0

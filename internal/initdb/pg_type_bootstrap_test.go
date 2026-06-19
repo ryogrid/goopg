@@ -120,6 +120,51 @@ func TestPgTypeRowCanonicalTypcollation(t *testing.T) {
 	}
 }
 
+// TestPgTypeArrayCollationMatchesElement pins pg_type.typcollation for the
+// ARRAY types of the collatable scalars. A PG array inherits its element's
+// typcollation, and the runtime virtual pg_attribute path (executor.
+// userTypeAttrsForOID) already reports the inherited collation for an array
+// column — so the bootstrapped heap MUST report the same value or pg_dump's
+// getTableAttrs (`a.attcollation <> t.typcollation`) emits a spurious COLLATE
+// clause on every `varchar[]`/`bpchar[]`/`name[]` column. This is the array
+// analog of the slice-188 scalar fix; the three array OIDs were left at 0 and
+// only surfaced once a column of the array type was dumped. DU-002 slice 189.
+func TestPgTypeArrayCollationMatchesElement(t *testing.T) {
+	cols := pgTypeColDefs()
+	// want[oid] = canonical typcollation (inherited from the element type).
+	want := map[uint32]uint32{
+		1003: 950, // _name    -> element name is 'C'
+		1014: 100, // _bpchar  -> element bpchar is 'default'
+		1015: 100, // _varchar -> element varchar is 'default'
+	}
+	seen := map[uint32]bool{}
+	for _, e := range pgTypeAllEntries() {
+		exp, ok := want[e.OID]
+		if !ok {
+			continue
+		}
+		seen[e.OID] = true
+		row := pgTypeRow(e)
+		payload, err := executor.EncodeRowPG(cols, row)
+		if err != nil {
+			t.Fatalf("oid=%d (%s): encode: %v", e.OID, e.Name, err)
+		}
+		if len(payload) < 148 {
+			t.Fatalf("oid=%d (%s): fixed part %d bytes < 148", e.OID, e.Name, len(payload))
+		}
+		got := uint32(payload[144]) | uint32(payload[145])<<8 |
+			uint32(payload[146])<<16 | uint32(payload[147])<<24
+		if got != exp {
+			t.Errorf("oid=%d (%s): typcollation: want %d, got %d", e.OID, e.Name, exp, got)
+		}
+	}
+	for oid := range want {
+		if !seen[oid] {
+			t.Errorf("array type oid=%d not present in pgTypeAllEntries(); test cannot guard it", oid)
+		}
+	}
+}
+
 // TestPgTypeRowEmbedsCanonicalIORegprocOIDs pins the I/O regproc OIDs
 // emitted in every bootstrapped pg_type row. The int4 case in
 // particular is load-bearing: an int4 row with typoutput=0 makes PG18's
@@ -130,14 +175,14 @@ func TestPgTypeRowCanonicalTypcollation(t *testing.T) {
 func TestPgTypeRowEmbedsCanonicalIORegprocOIDs(t *testing.T) {
 	cols := pgTypeColDefs()
 	cases := []struct {
-		oid                                      uint32
-		wantIn, wantOut, wantRecv, wantSend      uint32
+		oid                                 uint32
+		wantIn, wantOut, wantRecv, wantSend uint32
 	}{
-		{23, 42, 43, 2406, 2407},   // int4
+		{23, 42, 43, 2406, 2407},     // int4
 		{16, 1242, 1243, 2436, 2437}, // bool
-		{25, 46, 47, 2414, 2415},   // text
+		{25, 46, 47, 2414, 2415},     // text
 		{26, 1798, 1799, 2418, 2419}, // oid
-		{19, 34, 35, 2422, 2423},   // name
+		{19, 34, 35, 2422, 2423},     // name
 	}
 	for _, tc := range cases {
 		e, ok := pgTypeCanonical(tc.oid)

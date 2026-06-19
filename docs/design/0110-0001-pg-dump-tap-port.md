@@ -5466,6 +5466,37 @@ offset 144 for every bootstrapped OID); and the `collcol` table added to
 `TestPort_PgDumpConnectionSetup` asserts `a text COLLATE pg_catalog."C"` /
 `b text COLLATE pg_catalog."POSIX"` survive and the untouched `d` carries no `COLLATE`.
 
+### Slice 189 — extend the `attcollation`/`typcollation` fix to ARRAY types (latent slice-187 regression for array columns)
+
+Slice 188 fixed the heap `typcollation` for the collatable *scalars* (`name`, `text`,
+`bpchar`, `varchar`) and one array (`_text`), but left the other arrays of collatable
+scalars — `_name` (1003), `_bpchar` (1014), `_varchar` (1015) — at `typcollation = 0`.
+Meanwhile `executor.userTypeAttrsForOID` already reports the *inherited* element
+collation for those array OIDs (`_name` → 950, `_bpchar`/`_varchar` → 100), because a
+PostgreSQL array inherits its element type's `typcollation` (the array entries in
+`pg_type.dat` are generated from the element's `array_type_oid` and copy the element's
+collation).
+
+So the exact slice-187 sibling-path divergence was **still latent for array columns**: a
+`varchar[]` / `bpchar[]` / `name[]` column had `pg_attribute.attcollation = 100/100/950`
+but the heap `pg_type.typcollation = 0`, so pg_dump's `getTableAttrs`
+(`a.attcollation <> t.typcollation`) fired and `dumpTableSchema` spuriously emitted
+`COLLATE pg_catalog."default"` on a column the user never collated. It only surfaced once
+a column of one of those array types was actually dumped (no prior fixture used one), so
+slice 188's gates did not catch it.
+
+The fix adds the three array OIDs to `pgTypeCollationForOID` (`_name` → 950,
+`_bpchar`/`_varchar` → 100), restoring the `typcollation == attcollation` invariant for
+the full collatable family (scalars + arrays). No other built-in type in the bootstrapped
+heap is collatable, so the audit is complete.
+
+Tests: `TestPgTypeArrayCollationMatchesElement`
+(`internal/initdb/pg_type_bootstrap_test.go`) emits the actual heap rows for the three
+array OIDs from `pgTypeAllEntries()` and pins their `typcollation` at FormData offset 144
+(950/100/100); and the `collarr` table added to `TestPort_PgDumpConnectionSetup`
+(`character varying[]`, `character(4)[]`, `name[]`, `text[]` — all default collation)
+asserts pg_dump emits **no** `COLLATE` clause on any of them.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -1,34 +1,33 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 188 (loop #156) — per-column COLLATE round-trip AND
-closed a silent slice-187 regression of TestPort_PgDumpConnectionSetup.
+Last landed: DU-002 slice 189 (loop #157) — extended the slice-188
+attcollation/typcollation fix to ARRAY types, closing the slice-187 regression
+that was STILL LATENT for array-of-collatable columns.
 
-What happened: slice 187 (populating pg_collation) silently regressed the pg_dump
-TAP test. goopg's virtual pg_attribute reported attcollation=100 for
-text/varchar/bpchar, but the bootstrapped pg_type heap hardcoded typcollation=0.
-Once pg_collation had OID 100, findCollationByOid(100) resolved and pg_dump
-spuriously emitted `COLLATE pg_catalog."default"` on EVERY collatable column.
-Discovered while adding slice 188's explicit-COLLATE test (the d-column check fired);
-confirmed pre-existing by `git stash` + re-run at HEAD.
+What happened: slice 188 fixed heap pg_type.typcollation for the collatable
+scalars (name/text/bpchar/varchar) + _text, but left _name(1003), _bpchar(1014),
+_varchar(1015) at 0. Meanwhile executor.userTypeAttrsForOID already reports the
+element-inherited collation for those array OIDs (_name→950, _bpchar/_varchar→100,
+since a PG array inherits its element's typcollation). So a varchar[]/bpchar[]/
+name[] column had attcollation=100/100/950 vs heap typcollation=0 → pg_dump's
+getTableAttrs (a.attcollation <> t.typcollation) fired → spurious
+`COLLATE pg_catalog."default"` on a column the user never collated. Invisible
+until a column of one of those array types was dumped (no prior fixture used one).
 
-Fix (two coupled parts):
- (a) Parser now captures `COLLATE <name>` (was discard) via parseCollationName →
-     ColumnDef.Collation → both CREATE TABLE paths in operators_ddl.go →
-     catalog.Column.Collation → buildUserPGAttributeRow resolves name→OID
-     (collationNameToOID) and reports attcollation (collatable types only).
- (b) pg_type heap typcollation set to PG-canonical via pgTypeCollationForOID
-     (name→950, text/bpchar/varchar/_text→100, else 0) — matches pg_type.dat AND
-     executor.userTypeAttrsForOID's attcollation (sibling-path invariant).
+Fix: added 1003→950, 1014→100, 1015→100 to pgTypeCollationForOID in
+internal/initdb/pg_type_bootstrap.go. Audit complete — no other built-in heap
+type is collatable.
 
-Files: internal/parser/{ast.go,ddl.go,ddl_test.go}, internal/catalog/catalog.go,
-internal/executor/{operators_ddl.go,pg18_user_catalog_rows.go},
-internal/initdb/{pg_type_bootstrap.go,pg_type_bootstrap_test.go},
-internal/testport/pgdump_connsetup_test.go, docs/design/0110-0001-pg-dump-tap-port.md.
-Gates: gofmt OK; build clean; parser/catalog/initdb/executor PASS;
-TestPort_PgDumpConnectionSetup PASS (was FAILING at HEAD); pgbench smoke on commit.
+Files: internal/initdb/{pg_type_bootstrap.go,pg_type_bootstrap_test.go}
+(NEW TestPgTypeArrayCollationMatchesElement),
+internal/testport/pgdump_connsetup_test.go (NEW collarr 4-array-column fixture +
+no-spurious-COLLATE assertion), docs/design/0110-0001-pg-dump-tap-port.md (Slice 189).
+Gates: gofmt OK; build clean; initdb + executor PASS;
+TestPort_PgDumpConnectionSetup PASS; pgbench smoke on commit.
 
-Next (slice 189 candidates): (1) MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER
-RISK: partition routing). (2) attfdwoptions (foreign-table only, NULL today).
-(3) audit other built-in pg_type.typcollation vs userTypeAttrsForOID for any
-remaining mismatches (e.g. pg_node_tree=100 in PG but 0 in goopg — currently
-harmless since pg_dump never sees system-catalog columns).
+Next (slice 190 candidates): (1) MINVALUE/MAXVALUE keyword-AST-node slice — but
+note partition RANGE bounds ALREADY round-trip via the StringConst sentinel
+(slice 169); a proper AST node would be a refactor of working code (avoid).
+(2) attfdwoptions (foreign-table column OPTIONS, NULL today). (3) composite types
+(CREATE TYPE AS) — pg_class.reltype is hardcoded 0 ("no composite type seeded
+yet", pg18_user_catalog_rows.go:453); larger feature.
