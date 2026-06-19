@@ -978,6 +978,35 @@ type Index struct {
 	// fill factor for page packing, so this is advisory catalog/dump-only.
 	// DU-002 slice 218.
 	Fillfactor int
+	// DeduplicateItems stores the btree `WITH (deduplicate_items=on|off)`
+	// boolean storage parameter. nil means unset (PG default ON) — no
+	// reloption is emitted, so a plain index dumps byte-identically. When set,
+	// the index's pg_class.reloptions virtual row renders `deduplicate_items=on`
+	// (or `off`), which pg_dump re-emits as `CREATE INDEX … WITH
+	// (deduplicate_items='on')`. goopg does not perform btree posting-list
+	// deduplication, so this is advisory catalog/dump-only. DU-002 slice 219.
+	DeduplicateItems *bool
+}
+
+// reloptionList returns the index's storage parameters as ordered key=value
+// pairs (value unquoted), in the stable declaration order PG stores them in
+// pg_class.reloptions (fillfactor first). Callers format them: the pg_class
+// virtual row joins them bare (`{fillfactor=70,deduplicate_items=off}`) while
+// pg_get_indexdef single-quotes each value via flatten_reloptions
+// (`WITH (fillfactor='70', deduplicate_items='off')`). DU-002 slices 218/219.
+func (idx *Index) reloptionList() [][2]string {
+	var opts [][2]string
+	if idx.Fillfactor != 0 {
+		opts = append(opts, [2]string{"fillfactor", strconv.Itoa(idx.Fillfactor)})
+	}
+	if idx.DeduplicateItems != nil {
+		v := "off"
+		if *idx.DeduplicateItems {
+			v = "on"
+		}
+		opts = append(opts, [2]string{"deduplicate_items", v})
+	}
+	return opts
 }
 
 // QualifiedName renders the table's name in the canonical
@@ -2623,13 +2652,19 @@ func (c *InMemory) registerSystemTables() {
 			if hasIdxChildren {
 				idxHasSubclass = "t"
 			}
-			// Index reloptions: `WITH (fillfactor=N)`. pg_dump reads this via
-			// `t.reloptions AS indreloptions` (the index's own pg_class row) and
-			// re-emits `CREATE INDEX … WITH (fillfactor='N')`. Empty (NULL) when
-			// unset so a plain index dumps byte-identically. DU-002 slice 218.
+			// Index reloptions: `WITH (fillfactor=N[, deduplicate_items=on|off])`.
+			// pg_dump reads this via `t.reloptions AS indreloptions` (the index's
+			// own pg_class row) and re-emits `CREATE INDEX … WITH (…)`. Empty
+			// (NULL) when unset so a plain index dumps byte-identically. Options
+			// are joined in declaration-stable order (fillfactor first), mirroring
+			// the array order PG stores. DU-002 slices 218/219.
 			idxReloptions := ""
-			if idx.Fillfactor != 0 {
-				idxReloptions = "{fillfactor=" + strconv.Itoa(idx.Fillfactor) + "}"
+			if opts := idx.reloptionList(); len(opts) > 0 {
+				parts := make([]string, len(opts))
+				for i, kv := range opts {
+					parts[i] = kv[0] + "=" + kv[1]
+				}
+				idxReloptions = "{" + strings.Join(parts, ",") + "}"
 			}
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),  // 0:  oid
@@ -6574,16 +6609,24 @@ func BuildIndexDef(idx *Index) string {
 	if idx.NullsNotDistinct {
 		sb.WriteString(" NULLS NOT DISTINCT")
 	}
-	// Storage parameters: `WITH (fillfactor='N')`. ruleutils.c
-	// pg_get_indexdef_worker emits reloptions (via flatten_reloptions, which
-	// single-quotes each value) after NULLS NOT DISTINCT and before WHERE. This
-	// is the dump path for a plain CREATE INDEX (pg_dump emits indexdef verbatim);
-	// the index's pg_class.reloptions virtual cell is the sibling surface used by
-	// the constraint-backed index path. DU-002 slice 218.
-	if idx.Fillfactor != 0 {
-		sb.WriteString(" WITH (fillfactor='")
-		sb.WriteString(strconv.Itoa(idx.Fillfactor))
-		sb.WriteString("')")
+	// Storage parameters: `WITH (fillfactor='N'[, deduplicate_items='on'|'off'])`.
+	// ruleutils.c pg_get_indexdef_worker emits reloptions (via flatten_reloptions,
+	// which single-quotes each value) after NULLS NOT DISTINCT and before WHERE.
+	// This is the dump path for a plain CREATE INDEX (pg_dump emits indexdef
+	// verbatim); the index's pg_class.reloptions virtual cell is the sibling
+	// surface used by the constraint-backed index path. DU-002 slices 218/219.
+	if opts := idx.reloptionList(); len(opts) > 0 {
+		sb.WriteString(" WITH (")
+		for i, kv := range opts {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(kv[0])
+			sb.WriteString("='")
+			sb.WriteString(kv[1])
+			sb.WriteString("'")
+		}
+		sb.WriteString(")")
 	}
 	if idx.PredicateString != "" {
 		sb.WriteString(" WHERE ")

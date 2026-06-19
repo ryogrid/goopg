@@ -3063,6 +3063,19 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 							continue
 						}
 					}
+				} else if p.cur().Kind == TokenIdent && strings.ToLower(p.cur().Value) == "deduplicate_items" {
+					// btree boolean storage parameter. PG accepts on/off/true/
+					// false/yes/no/1/0 (parse_bool); record the value so pg_dump
+					// can re-emit it. DU-002 slice 219.
+					p.advance() // consume "deduplicate_items"
+					if p.cur().Kind == TokenOperator && p.cur().Value == "=" {
+						p.advance()
+						if b, ok := parseReloptionBool(p.cur().Value); ok {
+							stmt.DeduplicateItems = &b
+							p.advance()
+							continue
+						}
+					}
 				}
 				p.advance()
 			}
@@ -3089,6 +3102,20 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 		stmt.Predicate = pred
 	}
 	return stmt, nil
+}
+
+// parseReloptionBool maps a storage-parameter boolean token to its value,
+// mirroring PostgreSQL's parse_bool (on/off/true/false/yes/no/1/0,
+// case-insensitive). The second return is false for an unrecognized token.
+func parseReloptionBool(v string) (bool, bool) {
+	switch strings.ToLower(v) {
+	case "on", "true", "yes", "1", "t", "y":
+		return true, true
+	case "off", "false", "no", "0", "f", "n":
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 // parseIndexColumnList parses the column list inside CREATE INDEX (…).

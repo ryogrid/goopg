@@ -1466,6 +1466,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_ff_idx ON public.foo (qty) WITH (fillfactor=70)"); err != nil {
 		t.Fatalf("create fillfactor index: %v", err)
 	}
+	// Slice 219: goopg's first index-level BOOLEAN reloption. A btree index
+	// declared `WITH (deduplicate_items=off)` must round-trip. goopg's parser
+	// accepted the WITH clause but only extracted fillfactor, discarding every
+	// other key — so deduplicate_items was silently lost and the index restored
+	// with btree posting-list deduplication implicitly ON. The value now threads
+	// parser → catalog.Index.DeduplicateItems (*bool tri-state) → BuildIndexDef's
+	// `WITH (deduplicate_items='off')` and the index pg_class.reloptions cell.
+	// goopg performs no deduplication, so it is advisory catalog/dump-only.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_dedup_idx ON public.foo (qty) WITH (deduplicate_items=off)"); err != nil {
+		t.Fatalf("create deduplicate_items index: %v", err)
+	}
 	// Slice 134: a UNIQUE index declared `NULLS NOT DISTINCT` (PostgreSQL 15+)
 	// must round-trip. goopg's parser accepted the clause but DISCARDED it, and
 	// pg_index.indnullsnotdistinct was hard-wired false, so pg_get_indexdef
@@ -4031,6 +4042,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// the column list (ruleutils.c order: (cols) [INCLUDE] [NULLS NOT
 			// DISTINCT] WITH [WHERE]); flatten_reloptions single-quotes the value.
 			"CREATE INDEX foo_ff_idx ON public.foo USING btree (qty) WITH (fillfactor='70');",
+			// Slice 219: btree boolean reloption `WITH (deduplicate_items='off')`
+			// re-emitted via flatten_reloptions (single-quoted value), in the same
+			// WITH clause position as fillfactor.
+			"CREATE INDEX foo_dedup_idx ON public.foo USING btree (qty) WITH (deduplicate_items='off');",
 		}
 		for _, sub := range indexDefs {
 			if !strings.Contains(res.Stdout, sub) {

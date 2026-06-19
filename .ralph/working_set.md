@@ -1,33 +1,35 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 218 (loop #33) — index `fillfactor` storage parameter
-round-trips through pg_dump. goopg's FIRST index-level reloption (slices 54–217 were
-all table/heap reloptions).
+Last landed: DU-002 slice 219 (loop #34) — index `deduplicate_items` btree BOOLEAN
+storage parameter round-trips through pg_dump. goopg's FIRST index-level boolean
+reloption (slice 218's fillfactor was an int).
 
-What happened: parser already captured `CreateIndexStmt.Fillfactor` and `execCreateIndex`
-already range-validated (10–100 → 22023), but it was NEVER persisted to catalog.Index, so
-the dump silently dropped it. Persisted via `idx.Fillfactor = s.Fillfactor` in BOTH
-execCreateIndex branches (btree post-create block — guard now includes `s.Fillfactor != 0`;
-and gist/spgist branch). KEY insight (sibling-path law): a plain CREATE INDEX dumps via
-`pg_get_indexdef`/`BuildIndexDef` (pg_dump emits indexdef verbatim, pg_dump.c:18133), NOT
-via the pg_class.reloptions/indreloptions column — that column (pg_dump.c:7775) is only used
-by the CONSTRAINT-backed index path (pg_dump.c:18459). So I updated BOTH: BuildIndexDef
-emits ` WITH (fillfactor='N')` after NULLS NOT DISTINCT, before WHERE (ruleutils.c order;
-flatten_reloptions single-quotes); AND the index pg_class row (relkind 'i', col 32) renders
-`{fillfactor=N}`. catalog.Index.Fillfactor is JSON-persisted (survives reload).
-Limitation: parser uses 0 as "unset" sentinel → `fillfactor=0` reads as unspecified (PG min 10).
+What happened: goopg's CREATE INDEX `WITH (…)` parser only extracted `fillfactor`,
+discarding every other key — so `deduplicate_items=off` was silently lost (index
+restored with btree dedup implicitly ON). Threaded through: parser (ddl.go) recognizes
+`deduplicate_items`, parses bool via NEW `parseReloptionBool` (PG parse_bool token set
+on/off/true/false/yes/no/1/0); value → `CreateIndexStmt.DeduplicateItems` (*bool
+tri-state, nil=unset). execCreateIndex persists `idx.DeduplicateItems = s.DeduplicateItems`
+in BOTH branches (btree guard now includes `s.DeduplicateItems != nil`). KEY refactor
+(sibling-path law): both render surfaces now share a NEW `Index.reloptionList()` helper
+returning ordered key=value pairs (fillfactor first) — (1) BuildIndexDef emits multi-option
+` WITH (fillfactor='70', deduplicate_items='off')` (single-quoted, joined ", "); (2) index
+pg_class.reloptions cell renders `{fillfactor=70,deduplicate_items=off}`. JSON-persisted.
+Limitation: bool normalized to on/off (false/no/0 → off); unrecognized token silently
+ignored (matches fillfactor leniency).
 
-Files: internal/catalog/catalog.go (Index.Fillfactor field + index pg_class reloptions render
-+ BuildIndexDef WITH clause), internal/executor/operators_ddl.go (persist in both branches),
+Files: internal/parser/ast.go (CreateIndexStmt.DeduplicateItems), internal/parser/ddl.go
+(WITH capture + parseReloptionBool helper), internal/catalog/catalog.go
+(Index.DeduplicateItems + reloptionList() + both render surfaces),
+internal/executor/operators_ddl.go (persist both branches),
 internal/executor/operators_fillfactor_reloptions_test.go (NEW
-TestIndexFillfactorSurfacesInPgClassReloptions + …OutOfBoundsRejected),
-internal/testport/pgdump_connsetup_test.go (foo_ff_idx fixture + indexDefs assertion),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 218), fix_plan.md.
+TestIndexDeduplicateItemsSurfacesInPgClassReloptions), internal/testport/pgdump_connsetup_test.go
+(foo_dedup_idx fixture + indexDefs assertion), docs/design/0110-0001-pg-dump-tap-port.md
+(Slice 219), fix_plan.md.
 
-Gates: gofmt OK; go build ./internal/... clean; catalog+executor+parser suites PASS;
+Gates: gofmt OK; go build ./internal/... clean; parser+catalog+executor suites PASS;
 TestPort_PgDumpConnectionSetup PASS; pgbench pre-commit smoke on commit.
 
-Next: index `deduplicate_items` (btree boolean reloption — another clean index-level slice,
-same plumbing as fillfactor but boolean + BuildIndexDef multi-option WITH handling). Or the
-BIGGER `toast.*` namespace (needs toast-table pg_class modeling — reltoastrelid hardcoded 0)
-or composite types (CREATE TYPE AS; pg_class.reltype hardcoded 0).
+Next: more btree boolean reloptions reuse this exact plumbing (gin `fastupdate`,
+`buffering` for gist). Or the BIGGER `toast.*` namespace (needs toast-table pg_class
+modeling — reltoastrelid hardcoded 0) or composite types (CREATE TYPE AS; reltype 0).

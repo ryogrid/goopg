@@ -1254,6 +1254,11 @@ type CreateIndexStmt struct {
 	// Mirrors pg_index.indnullsnotdistinct so pg_get_indexdef can reproduce it.
 	// The default (omitted, or explicit `NULLS DISTINCT`) leaves this false.
 	NullsNotDistinct bool
+	// DeduplicateItems captures the btree `WITH (deduplicate_items=on|off)`
+	// boolean storage parameter. nil means unset (PG default ON); a non-nil
+	// pointer records the explicitly-declared value so pg_get_indexdef can
+	// re-emit `WITH (deduplicate_items='on'|'off')`. DU-002 slice 219.
+	DeduplicateItems *bool
 }
 
 // IndexColOrder captures the ASC/DESC + NULLS ordering of one CREATE INDEX key

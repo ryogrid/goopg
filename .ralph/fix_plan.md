@@ -4802,6 +4802,31 @@ object support.
         `CREATE INDEX foo_ff_idx ON public.foo USING btree (qty) WITH (fillfactor='70');`); pgbench pre-commit
         smoke on commit. **Next:** index `deduplicate_items` (btree boolean reloption, another index-level
         slice); or the BIGGER `toast.*` namespace (needs toast-table pg_class modeling) / composite types.
+      - **PROGRESS 2026-06-19 (loop #34):** **DU-002 slice 219 LANDED — index `deduplicate_items` boolean
+        storage parameter round-trips through pg_dump (goopg's FIRST index-level BOOLEAN reloption; slice 218's
+        fillfactor was an integer).** goopg's CREATE INDEX `WITH (…)` parser only extracted `fillfactor`,
+        discarding every other key, so `deduplicate_items=off` was silently lost (index restored with btree
+        dedup implicitly ON). Threaded it through: parser (`ddl.go`) recognizes `deduplicate_items` and parses
+        the boolean via a NEW `parseReloptionBool` helper (PG `parse_bool` token set: on/off/true/false/yes/no/
+        1/0); value lands in `CreateIndexStmt.DeduplicateItems` (`*bool` tri-state, nil=unset→PG default ON).
+        `execCreateIndex` persists `idx.DeduplicateItems = s.DeduplicateItems` in both branches (btree guard now
+        includes `s.DeduplicateItems != nil`). **Two sibling surfaces** (sibling-path law) refactored onto a NEW
+        `Index.reloptionList()` helper returning ordered `key=value` pairs (fillfactor first): (1) `BuildIndexDef`
+        now emits multi-option ` WITH (fillfactor='70', deduplicate_items='off')` (each value single-quoted,
+        joined `, `); (2) index `pg_class.reloptions` cell renders `{fillfactor=70,deduplicate_items=off}`.
+        `catalog.Index.DeduplicateItems` JSON-persisted (survives reload). Limitations: bool stored as normalized
+        tri-state so `false`/`no`/`0` round-trip as `off` (semantically identical); unrecognized bool token
+        silently ignored (matches fillfactor parser leniency). Files: `internal/parser/ast.go`
+        (`CreateIndexStmt.DeduplicateItems`), `internal/parser/ddl.go` (WITH-loop capture + `parseReloptionBool`),
+        `internal/catalog/catalog.go` (`Index.DeduplicateItems` + `reloptionList()` + both render surfaces),
+        `internal/executor/operators_ddl.go` (persist both branches), `internal/executor/operators_fillfactor_reloptions_test.go`
+        (NEW `TestIndexDeduplicateItemsSurfacesInPgClassReloptions`), `internal/testport/pgdump_connsetup_test.go`
+        (NEW `foo_dedup_idx` fixture + indexDefs assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 219).
+        Gates: gofmt OK; `go build ./internal/...` clean; catalog/executor/parser suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (round-trips `CREATE INDEX foo_dedup_idx ON public.foo USING btree
+        (qty) WITH (deduplicate_items='off');`); pgbench pre-commit smoke on commit. **Next:** more btree boolean
+        reloptions (`fastupdate` for gin); or the BIGGER `toast.*` namespace (toast-table pg_class modeling) /
+        composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

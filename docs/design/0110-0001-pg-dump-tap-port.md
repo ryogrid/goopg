@@ -6293,6 +6293,46 @@ limitation). The pg_dump fixture adds `foo_ff_idx ON public.foo (qty) WITH (fill
 assertion confirms the dump carries
 `CREATE INDEX foo_ff_idx ON public.foo USING btree (qty) WITH (fillfactor='70');`.
 
+### Slice 219 — index `deduplicate_items` reloption round-trip (first INDEX-level BOOLEAN reloption)
+
+Adds the btree `deduplicate_items` boolean storage parameter on **`CREATE INDEX`** — goopg's first
+*index*-level **boolean** reloption (slice 218's fillfactor was an integer). PG's btree access method
+exposes `deduplicate_items` (default ON) to control posting-list deduplication; `WITH
+(deduplicate_items=off)` must survive a dump/restore. goopg's CREATE INDEX `WITH (…)` parser only
+extracted `fillfactor`, discarding every other key — so the option was silently lost and the index
+restored with deduplication implicitly ON.
+
+This slice threads it through:
+
+- **Parser** (`ddl.go`): the WITH loop now recognizes `deduplicate_items` and parses its boolean value
+  via the new `parseReloptionBool` helper (PG's `parse_bool` token set: `on`/`off`/`true`/`false`/
+  `yes`/`no`/`1`/`0`, case-insensitive). The value lands in `CreateIndexStmt.DeduplicateItems`, a
+  `*bool` tri-state (nil = unset → PG default ON; non-nil = explicitly declared).
+- **Executor** (`operators_ddl.go`): `execCreateIndex` persists `idx.DeduplicateItems =
+  s.DeduplicateItems` in both the btree branch (whose field-setting guard now includes
+  `s.DeduplicateItems != nil`) and the gist/spgist branch (harmless there — only btree honors it).
+- **catalog** (`catalog.go`): a new `Index.reloptionList()` helper returns the index's storage
+  parameters as ordered `key=value` pairs (fillfactor first, then deduplicate_items — the stable
+  array order PG stores). Both render surfaces consume it:
+  1. **`BuildIndexDef`** emits ` WITH (fillfactor='70', deduplicate_items='off')` — multi-option,
+     each value single-quoted by the `flatten_reloptions` analog, joined with `, `.
+  2. **The index's `pg_class.reloptions` virtual cell** renders the bare array
+     `{fillfactor=70,deduplicate_items=off}`.
+
+`catalog.Index.DeduplicateItems` is JSON-persisted (survives a catalog reload). goopg performs no
+btree posting-list deduplication, so the value is advisory catalog/dump-only. **Limitation:** the bool
+is stored as a normalized tri-state, so a value spelled `false`/`no`/`0` round-trips as `off` (and
+`true`/`yes`/`1` as `on`) rather than verbatim — PG stores the user's literal token, but the canonical
+on/off form is semantically identical. An unrecognized boolean token is silently ignored (field left
+unset) rather than raising `22023` — matching the existing fillfactor parser's lenient handling.
+
+Engine guard: `TestIndexDeduplicateItemsSurfacesInPgClassReloptions` (an `off` value alongside
+fillfactor → `{fillfactor=70,deduplicate_items=off}` and `BuildIndexDef` `WITH (fillfactor='70',
+deduplicate_items='off')`; a `true` value → `{deduplicate_items=on}`; a plain index keeps reloptions
+NULL and no WITH clause). The pg_dump fixture adds `foo_dedup_idx ON public.foo (qty) WITH
+(deduplicate_items=off)`; the assertion confirms the dump carries
+`CREATE INDEX foo_dedup_idx ON public.foo USING btree (qty) WITH (deduplicate_items='off');`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

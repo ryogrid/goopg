@@ -2,8 +2,10 @@ package executor
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -2194,5 +2196,91 @@ func TestIndexFillfactorOutOfBoundsRejected(t *testing.T) {
 		if ee.Code != "22023" {
 			t.Errorf("fillfactor=%s: error code = %q, want 22023", ff, ee.Code)
 		}
+	}
+}
+
+// TestIndexDeduplicateItemsSurfacesInPgClassReloptions verifies that a btree
+// `WITH (deduplicate_items=on|off)` boolean storage parameter declared on CREATE
+// INDEX is persisted on the catalog Index and surfaced through the index's own
+// pg_class virtual-view row (relkind 'i'), reloptions cell. pg_dump reads that
+// via `t.reloptions AS indreloptions` and re-emits `CREATE INDEX … WITH
+// (deduplicate_items='off')`, so this is the engine-side half of the round-trip
+// TestPort_PgDumpConnectionSetup asserts end-to-end. Cases pin: an off value
+// alongside fillfactor (combined `{fillfactor=70,deduplicate_items=off}`), an on
+// value spelled with a non-canonical accepted token ("true" → `deduplicate_items=on`),
+// and a plain index (reloptions NULL). goopg performs no btree posting-list
+// deduplication, so the value is catalog/dump-only. DU-002 slice 219.
+func TestIndexDeduplicateItemsSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE t (id integer, v integer, w integer)`); err != nil {
+		t.Fatalf("CREATE TABLE t: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX ioff ON t (id) WITH (fillfactor=70, deduplicate_items=off)`); err != nil {
+		t.Fatalf("CREATE INDEX ioff: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX ion ON t (v) WITH (deduplicate_items=true)`); err != nil {
+		t.Fatalf("CREATE INDEX ion: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX iplain ON t (w)`); err != nil {
+		t.Fatalf("CREATE INDEX iplain: %v", err)
+	}
+
+	offIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "ioff"})
+	if !ok {
+		t.Fatal("ioff index not found")
+	}
+	if offIdx.DeduplicateItems == nil || *offIdx.DeduplicateItems {
+		t.Errorf("ioff.DeduplicateItems = %v, want non-nil false", offIdx.DeduplicateItems)
+	}
+	onIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "ion"})
+	if !ok {
+		t.Fatal("ion index not found")
+	}
+	if onIdx.DeduplicateItems == nil || !*onIdx.DeduplicateItems {
+		t.Errorf("ion.DeduplicateItems = %v, want non-nil true", onIdx.DeduplicateItems)
+	}
+	plainIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "iplain"})
+	if !ok {
+		t.Fatal("iplain index not found")
+	}
+	if plainIdx.DeduplicateItems != nil {
+		t.Errorf("iplain.DeduplicateItems = %v, want nil (unset)", plainIdx.DeduplicateItems)
+	}
+
+	// pg_class.reloptions (column index 32) on the index pg_class rows (relkind
+	// 'i', column index 17). The combined option must keep declaration order
+	// (fillfactor first).
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && r[17] == "i" && (r[1] == "ioff" || r[1] == "ion" || r[1] == "iplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["ioff"] != "{fillfactor=70,deduplicate_items=off}" {
+		t.Errorf("pg_class.reloptions for ioff = %q, want %q", got["ioff"], "{fillfactor=70,deduplicate_items=off}")
+	}
+	if got["ion"] != "{deduplicate_items=on}" {
+		t.Errorf("pg_class.reloptions for ion = %q, want %q", got["ion"], "{deduplicate_items=on}")
+	}
+	if got["iplain"] != "" {
+		t.Errorf("pg_class.reloptions for iplain = %q, want \"\" (NULL)", got["iplain"])
+	}
+
+	// BuildIndexDef (the pg_get_indexdef path pg_dump emits verbatim for plain
+	// indexes) must single-quote each value and join with ", ".
+	if def := catalog.BuildIndexDef(offIdx); !strings.Contains(def, "WITH (fillfactor='70', deduplicate_items='off')") {
+		t.Errorf("BuildIndexDef(ioff) = %q, want it to contain %q", def, "WITH (fillfactor='70', deduplicate_items='off')")
+	}
+	if def := catalog.BuildIndexDef(onIdx); !strings.Contains(def, "WITH (deduplicate_items='on')") {
+		t.Errorf("BuildIndexDef(ion) = %q, want it to contain %q", def, "WITH (deduplicate_items='on')")
+	}
+	if def := catalog.BuildIndexDef(plainIdx); strings.Contains(def, "WITH (") {
+		t.Errorf("BuildIndexDef(iplain) = %q, want no WITH clause", def)
 	}
 }
