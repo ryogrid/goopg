@@ -6095,6 +6095,30 @@ pg_dump fixture adds `optamfma (… WITH (autovacuum_multixact_freeze_min_age=50
 own table; the assertion confirms the dump carries
 `WITH (autovacuum_multixact_freeze_min_age='5000000')`.
 
+### Slice 211 — ninth INTEGER autovacuum reloption (`autovacuum_multixact_freeze_max_age`) round-trip
+
+Continues the multixact freeze-age subfamily for the ninth INT-typed autovacuum-namespace
+reloption, reusing the slice-198 integer path. `autovacuum_multixact_freeze_max_age` is
+`RELOPT_TYPE_INT` with `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` and a default of **-1**
+(= unset / use the GUC), range `10000`–`2000000000` (`reloptions.c:299/1893`; "Multixact age
+at which to autovacuum a table to prevent multixact wraparound"). Unlike the min/table-age
+options the lower bound is **10000** (not 0), but an `AutovacuumMultixactFreezeMaxAgeSet` flag —
+not a zero check — still records presence (the `parallel_workers` pattern). The executor parses
+with `strconv.Atoi`, rejecting non-integers and out-of-range values (`< 10000 || > 2000000000`)
+with `22023`; because the lower bound is 10000, a below-min positive value (`9999`) is now a
+reachable invalid case alongside overflow and non-integer. It persists
+`catalog.Table.AutovacuumMultixactFreezeMaxAge` (an `int`); the pg_class virtual view appends
+`autovacuum_multixact_freeze_max_age=N` after `autovacuum_multixact_freeze_min_age`; pg_dump
+renders `WITH (autovacuum_multixact_freeze_max_age='N')`. goopg has no autovacuum, so the value
+is advisory catalog/dump-only, base-table-only — same as the sibling reloption slices.
+
+Engine guards: `TestAutovacuumMultixactFreezeMaxAgeSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,autovacuum_multixact_freeze_max_age=500000000}`; plain table → no reloptions) and
+`TestAutovacuumMultixactFreezeMaxAgeOutOfBoundsRejected` (`9999`/`2000000001`/`nope` → 22023). The
+pg_dump fixture adds `optamfmaxa (… WITH (autovacuum_multixact_freeze_max_age=500000000))` on its
+own table; the assertion confirms the dump carries
+`WITH (autovacuum_multixact_freeze_max_age='500000000')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

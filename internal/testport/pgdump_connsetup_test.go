@@ -905,6 +905,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optamfma: %v", err)
 	}
 
+	// Slice 211: the integer autovacuum_multixact_freeze_max_age storage parameter
+	// (RELOPT_TYPE_INT, valid 10000–2000000000, default -1 = unset), the ninth
+	// INT-typed autovacuum-namespace reloption, reusing the slice-198 integer path
+	// (a separate set flag records presence; unlike the min/table-age options the
+	// lower bound is 10000, but the flag — not a zero check — still guards presence).
+	// goopg stores catalog.Table.AutovacuumMultixactFreezeMaxAge; the pg_class virtual
+	// view renders `{autovacuum_multixact_freeze_max_age=500000000}`, which pg_dump
+	// emits as `WITH (autovacuum_multixact_freeze_max_age='500000000')`. goopg has no
+	// autovacuum, so the value is catalog/dump-only (advisory). `optamfmaxa` carries
+	// it on its own table to keep the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optamfmaxa (id integer PRIMARY KEY) WITH (autovacuum_multixact_freeze_max_age=500000000)"); err != nil {
+		t.Fatalf("create table optamfmaxa: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2771,6 +2785,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (autovacuum_multixact_freeze_min_age='5000000')") {
 			t.Errorf("pg_dump dropped the autovacuum_multixact_freeze_min_age reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_multixact_freeze_min_age='5000000')", res.Stdout)
+		}
+		// **Slice 211 closed (asserted):** the integer
+		// autovacuum_multixact_freeze_max_age storage parameter (RELOPT_TYPE_INT,
+		// valid 10000–2000000000, default -1 = unset) — the ninth INT-typed
+		// autovacuum-namespace reloption — must round-trip via the slice-198 integer
+		// path (a separate set flag records presence; unlike the min/table-age options
+		// the lower bound is 10000, but the flag still guards presence).
+		// catalog.Table.AutovacuumMultixactFreezeMaxAge persists it and the pg_class
+		// virtual view renders `{autovacuum_multixact_freeze_max_age=500000000}`, which
+		// pg_dump emits as `WITH (autovacuum_multixact_freeze_max_age='500000000')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optamfmaxa (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optamfmaxa\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (autovacuum_multixact_freeze_max_age='500000000')") {
+			t.Errorf("pg_dump dropped the autovacuum_multixact_freeze_max_age reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_multixact_freeze_max_age='500000000')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to
