@@ -2460,11 +2460,19 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// explicit or inherited columns get auto-name <tablename>_<colname>_not_null.
 	// M0097-0023.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		// Build set of explicit column defs that carry NOT NULL NO INHERIT.
+		// Build set of explicit column defs that carry NOT NULL NO INHERIT, plus
+		// any user-given inline constraint name (`CONSTRAINT <name> NOT NULL`).
+		// A non-default name makes pg_dump re-emit the inline
+		// `CONSTRAINT <name> NOT NULL` form rather than a bare `NOT NULL`.
+		// DU-002 slice 273.
 		explicitNoInherit := make(map[string]bool)
+		explicitNotNullName := make(map[string]string)
 		for _, origCol := range s.Columns {
 			if origCol.NotNullNoInherit {
 				explicitNoInherit[strings.ToLower(origCol.Name)] = true
+			}
+			if origCol.NotNullConstraintName != "" {
+				explicitNotNullName[strings.ToLower(origCol.Name)] = origCol.NotNullConstraintName
 			}
 		}
 		// PG18 records a contype='n' NOT NULL constraint for EVERY not-null
@@ -2481,6 +2489,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			colKey := strings.ToLower(col.Name)
 			noInherit := explicitNoInherit[colKey]
 			name := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+			if custom, ok2 := explicitNotNullName[colKey]; ok2 {
+				// Explicit inline `CONSTRAINT <name> NOT NULL` overrides the
+				// auto-name. DU-002 slice 273.
+				name = custom
+			}
 			if entry, ok2 := likeNotNullByCol[colKey]; ok2 {
 				// LIKE INCLUDING preserves the source NOT NULL constraint name.
 				if entry.name != "" {

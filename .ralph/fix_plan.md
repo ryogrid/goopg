@@ -5870,6 +5870,27 @@ object support.
         path exercised with the `NO INHERIT` trailer end-to-end through a dump), or the named-differs inline variant
         `c integer CONSTRAINT <name> NOT NULL NO INHERIT`.
 
+      - **PROGRESS 2026-06-20 (loop #40):** **DU-002 slice 273 LANDED — a NAMED inline NOT NULL whose name differs from
+        PG's auto-name round-trips through pg_dump as the inline `<col> <type> CONSTRAINT <name> NOT NULL [NO INHERIT]`
+        form (new production support).** Slice 272 dumped the UNNAMED inline form (name == `<table>_<col>_not_null` → bare
+        `NOT NULL`); slice 273 covers the case where an explicit `CONSTRAINT <name>` differs from the auto-name, forcing
+        pg_dump to re-emit the `CONSTRAINT <name>` prefix (`pg_dump.c:17184`), followed by ` NO INHERIT` when
+        connoinherit='t'. **Production fix required:** goopg's inline-`CONSTRAINT` parser switch had no `NOT NULL` arm, so
+        `CONSTRAINT c_nn NOT NULL` fell through the default skip and the constraint was silently DROPPED (column dumped as a
+        plain `c integer`). Fix: new `ColumnDef.NotNullConstraintName` AST field (`ast.go`); a `KwNot` case in the inline
+        CONSTRAINT switch captures the name + optional NO INHERIT (`ddl.go:2761`); the CREATE TABLE NOT-NULL loop builds an
+        `explicitNotNullName[col]` map and uses the custom name in `AddNotNull(...)` (`operators_ddl.go:2464`) so the
+        pg_constraint virtual row carries the user-given conname. The unnamed path (slice 272) is unaffected (empty map →
+        auto-name still wins). Verified byte-for-byte against real pg_dump 18.3: `c integer CONSTRAINT c_nn NOT NULL NO
+        INHERIT,\n    e integer CONSTRAINT e_nn NOT NULL`. **Guards:** `TestPort_PgDumpConnectionSetup` PASS (3.90s; +
+        negative check that the plain named NOT NULL on `e` does NOT gain a spurious ` NO INHERIT`) + new
+        `TestParseCreateTableColumnNamedNotNull` (parser: inline `CONSTRAINT <name>` arm sets `NotNullConstraintName` +
+        `NotNullNoInherit`; an unnamed `NOT NULL` leaves the name empty) + `go test ./internal/parser/ ./internal/executor/
+        ./internal/catalog/` PASS. gofmt + `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001`
+        Slice 273. **Next (slice 274+):** the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` end-to-end
+        dump on a STANDALONE table (rendered inline because the column is local), or a named inline NOT NULL whose name
+        EQUALS the auto-name (must collapse back to the bare `NOT NULL` form, not the `CONSTRAINT <name>` form).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

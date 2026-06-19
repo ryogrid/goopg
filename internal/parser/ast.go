@@ -959,6 +959,13 @@ type ColumnDef struct {
 	// (PG18: `c int NOT NULL NO INHERIT`). goopg v0 tracks the flag to emit
 	// the partitioned-table error for LIKE INCLUDING ALL. M0097-0023.
 	NotNullNoInherit bool
+	// NotNullConstraintName holds the user-given name when the inline NOT NULL is
+	// written with an explicit `CONSTRAINT <name>` prefix
+	// (`c int CONSTRAINT myname NOT NULL [NO INHERIT]`). When this differs from
+	// PG's auto-name (<table>_<col>_not_null), pg_dump re-emits the inline
+	// `CONSTRAINT <name> NOT NULL` form rather than a bare `NOT NULL`. Empty for
+	// the common unnamed case. DU-002 slice 273.
+	NotNullConstraintName string
 	// CheckNoInherit is true when the inline CHECK constraint carries NO INHERIT.
 	// Stored so LIKE INCLUDING ALL can error on partitioned tables. M0097-0023.
 	CheckNoInherit bool

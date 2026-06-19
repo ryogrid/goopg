@@ -2758,6 +2758,24 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				// Optional DEFERRABLE trailer (named inline column UNIQUE).
 				// DU-002 slice 141.
 				p.parseConstraintDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
+			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
+				// CONSTRAINT name NOT NULL [NO INHERIT] — named inline NOT NULL.
+				// PG18 lets a column carry an explicitly named NOT NULL; when the
+				// name differs from the auto-name (<table>_<col>_not_null) pg_dump
+				// re-emits `<col> <type> CONSTRAINT <name> NOT NULL`. Capture the
+				// name + optional NO INHERIT so the constraint round-trips with its
+				// user-given name instead of being dropped by the default skip arm.
+				// DU-002 slice 273.
+				p.advance() // NOT
+				if _, err := p.expectKeyword(KwNull); err != nil {
+					return ColumnDef{}, err
+				}
+				col.NotNull = true
+				col.NotNullConstraintName = identText(cnameTok)
+				if p.acceptIdentKeyword("no") {
+					_ = p.acceptIdentKeyword("inherit")
+					col.NotNullNoInherit = true
+				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
 				// CONSTRAINT name REFERENCES table (cols) — FK; parsed below.
 				// Fall through to FK parsing path by continuing the outer loop.

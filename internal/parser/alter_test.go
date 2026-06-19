@@ -408,6 +408,43 @@ func TestParseCreateTableColumnNotNullNoInherit(t *testing.T) {
 	}
 }
 
+// TestParseCreateTableColumnNamedNotNull covers the inline column-level
+// `CONSTRAINT <name> NOT NULL [NO INHERIT]` form in CREATE TABLE (DU-002 slice
+// 273). PG18 lets a column carry an explicitly named NOT NULL; the parser must
+// capture the user-given name into ColumnDef.NotNullConstraintName (and the
+// optional ` NO INHERIT` trailer into NotNullNoInherit) so the executor threads
+// the name onto the constraint and pg_dump re-emits the inline `CONSTRAINT
+// <name> NOT NULL` form. Before this slice the inline CONSTRAINT switch had no
+// NOT NULL arm, so the constraint was silently dropped by the default skip.
+func TestParseCreateTableColumnNamedNotNull(t *testing.T) {
+	stmts, err := Parse("CREATE TABLE t (c integer CONSTRAINT c_nn NOT NULL NO INHERIT, d integer CONSTRAINT d_nn NOT NULL, e integer NOT NULL)")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(ct.Columns) != 3 {
+		t.Fatalf("columns=%d want 3", len(ct.Columns))
+	}
+	// c: named NOT NULL with NO INHERIT.
+	if !ct.Columns[0].NotNull || ct.Columns[0].NotNullConstraintName != "c_nn" || !ct.Columns[0].NotNullNoInherit {
+		t.Errorf("c: NotNull=%v name=%q NoInherit=%v want true/\"c_nn\"/true",
+			ct.Columns[0].NotNull, ct.Columns[0].NotNullConstraintName, ct.Columns[0].NotNullNoInherit)
+	}
+	// d: named NOT NULL, no NO INHERIT.
+	if !ct.Columns[1].NotNull || ct.Columns[1].NotNullConstraintName != "d_nn" || ct.Columns[1].NotNullNoInherit {
+		t.Errorf("d: NotNull=%v name=%q NoInherit=%v want true/\"d_nn\"/false",
+			ct.Columns[1].NotNull, ct.Columns[1].NotNullConstraintName, ct.Columns[1].NotNullNoInherit)
+	}
+	// e: unnamed NOT NULL — NotNullConstraintName must stay empty.
+	if !ct.Columns[2].NotNull || ct.Columns[2].NotNullConstraintName != "" {
+		t.Errorf("e: NotNull=%v name=%q want true/\"\"",
+			ct.Columns[2].NotNull, ct.Columns[2].NotNullConstraintName)
+	}
+}
+
 // TestParseAlterTableSetStatistics covers `ALTER TABLE ... ALTER COLUMN c SET
 // STATISTICS <n>` (DU-002 slice 184). The integer value (including a negative
 // reset value like -1) is recorded in CheckExpr + ColumnName for the executor,

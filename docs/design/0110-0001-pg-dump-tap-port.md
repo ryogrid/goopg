@@ -7966,6 +7966,47 @@ Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3 — `c 
 > <name> NOT NULL <col> NO INHERIT` (slice 271's ADD-CONSTRAINT path now exercised with the `NO INHERIT` trailer end-to-end
 > through a dump) — or the *named*-differs variant rendered inline as `c integer CONSTRAINT <name> NOT NULL NO INHERIT`.
 
+### Slice 273 — *named* inline NOT NULL on a *standalone* table (`CONSTRAINT <name> NOT NULL [NO INHERIT]`)
+
+Slice 272 dumped the **unnamed** inline NOT NULL (name == auto-name → bare `NOT NULL`). Slice 273 covers the *named*
+inline form: when a column's NOT NULL constraint name **differs** from PG's auto-name `<table>_<col>_not_null`, pg_dump
+re-emits the explicit `CONSTRAINT <name>` prefix on the inline column definition (`pg_dump.c:17184`), followed by
+` NO INHERIT` when `connoinherit='t'`. Verified byte-for-byte against real pg_dump 18.3:
+
+```
+CREATE TABLE public.nninh2 (
+    c integer CONSTRAINT c_nn NOT NULL NO INHERIT,
+    e integer CONSTRAINT e_nn NOT NULL
+);
+```
+
+This slice **did** require a production fix — goopg's inline-`CONSTRAINT` parser switch had no `NOT NULL` arm, so
+`CONSTRAINT c_nn NOT NULL` fell through to the default skip and the constraint was silently dropped (column dumped as a
+plain `c integer`):
+
+- **AST** (`internal/parser/ast.go`): new `ColumnDef.NotNullConstraintName` holds the user-given name from an inline
+  `CONSTRAINT <name> NOT NULL`.
+- **Parser** (`internal/parser/ddl.go:2761`): a new `KwNot` case inside the inline-`CONSTRAINT` switch consumes
+  `NOT NULL`, records `NotNullConstraintName = <name>`, and accepts the optional ` NO INHERIT` trailer
+  (`NotNullNoInherit = true`).
+- **Executor** (`internal/executor/operators_ddl.go:2464`): the CREATE TABLE NOT-NULL loop builds an
+  `explicitNotNullName[col]` map from the parsed defs and uses the custom name (instead of the computed auto-name) in the
+  `AddNotNull(name, col, oid, noInherit, isLocal=true, 0)` call, so the pg_constraint virtual row carries the user-given
+  conname. pg_dump's `getTableAttrs` query then reports a non-default notnull name and emits the `CONSTRAINT <name>` prefix.
+
+The unnamed path (slice 272) is unaffected: `explicitNotNullName` is empty for a bare `NOT NULL`, so the auto-name still
+wins and pg_dump emits the bare inline form.
+
+Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3 — `c integer CONSTRAINT c_nn NOT NULL NO
+INHERIT` and `e integer CONSTRAINT e_nn NOT NULL`, with a negative check that the plain named NOT NULL on `e` does NOT
+gain a spurious ` NO INHERIT`) + `TestParseCreateTableColumnNamedNotNull` (parser: the inline `CONSTRAINT <name>` arm sets
+`NotNullConstraintName` + `NotNullNoInherit`; an unnamed `NOT NULL` leaves `NotNullConstraintName` empty).
+
+> **Next (slice 274+):** the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` end-to-end dump on a
+> *standalone* table (slice 271's ADD-CONSTRAINT path, but rendered inline because the column is local), or a *named*
+> inline NOT NULL whose name **equals** the auto-name (must collapse back to the bare `NOT NULL` form, not the
+> `CONSTRAINT <name>` form).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

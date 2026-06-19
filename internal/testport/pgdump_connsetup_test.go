@@ -1536,6 +1536,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create standalone table nninh with NOT NULL NO INHERIT column: %v", err)
 	}
 
+	// Slice 273: a NAMED inline NOT NULL whose name differs from PG's auto-name,
+	// dumped INLINE as `<col> <type> CONSTRAINT <name> NOT NULL [NO INHERIT]`.
+	// Slice 272 covered the UNNAMED inline form (name == default → bare `NOT
+	// NULL`); here the explicit `CONSTRAINT c_nn` name (≠ `nninh2_c_not_null`)
+	// forces pg_dump to re-emit the `CONSTRAINT <name>` prefix (pg_dump.c:17184),
+	// followed by ` NO INHERIT` (connoinherit='t'). Before this slice goopg's
+	// inline-CONSTRAINT parser arm had no NOT NULL case, so `CONSTRAINT c_nn NOT
+	// NULL` was silently dropped (column dumped as a plain `c integer`). The fix
+	// captures the name into ColumnDef.NotNullConstraintName (ddl.go) and the
+	// executor threads it onto AddNotNull (operators_ddl.go) so the pg_constraint
+	// virtual row carries the user-given conname; pg_dump's getTableAttrs query
+	// then reports a non-default notnull name. Second column `e` carries a named
+	// NOT NULL WITHOUT NO INHERIT (`CONSTRAINT e_nn`) to assert the suffix is not
+	// spuriously added. Verified against real pg_dump 18.3:
+	// `c integer CONSTRAINT c_nn NOT NULL NO INHERIT,\n    e integer CONSTRAINT e_nn NOT NULL`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh2 (c integer CONSTRAINT c_nn NOT NULL NO INHERIT, e integer CONSTRAINT e_nn NOT NULL)"); err != nil {
+		t.Fatalf("create standalone table nninh2 with named NOT NULL columns: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -4093,6 +4112,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			}
 		} else {
 			t.Errorf("pg_dump missing CREATE TABLE public.nninh\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 273 (asserted):** a NAMED inline NOT NULL whose name differs from
+		// the auto-name forces pg_dump to re-emit the `CONSTRAINT <name>` prefix
+		// (pg_dump.c:17184). `c` carries NO INHERIT, `e` does not. A regression that
+		// dropped the inline named NOT NULL (the pre-slice-273 parser had no NOT
+		// NULL arm in the inline-CONSTRAINT switch) would dump a plain `c integer` /
+		// `e integer` with no NOT NULL at all.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh2 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer CONSTRAINT c_nn NOT NULL NO INHERIT") {
+				t.Errorf("pg_dump dropped the named NOT NULL NO INHERIT; want %q in nninh2 block\n  block=%q", "c integer CONSTRAINT c_nn NOT NULL NO INHERIT", block)
+			}
+			if !strings.Contains(block, "e integer CONSTRAINT e_nn NOT NULL") {
+				t.Errorf("pg_dump dropped the named NOT NULL; want %q in nninh2 block\n  block=%q", "e integer CONSTRAINT e_nn NOT NULL", block)
+			}
+			// The plain named NOT NULL on `e` must NOT spuriously gain NO INHERIT.
+			if strings.Contains(block, "e integer CONSTRAINT e_nn NOT NULL NO INHERIT") {
+				t.Errorf("pg_dump added a spurious NO INHERIT to a plain named NOT NULL\n  block=%q", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh2\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged
