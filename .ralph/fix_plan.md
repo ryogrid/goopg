@@ -5943,6 +5943,22 @@ object support.
         `0110-0001` Slice 276. **Next (slice 277+):** an `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` on a
         LOCAL column where the name EQUALS the auto-name `<table>_<col>_not_null` — the ALTER-path counterpart of slice
         274, asserting the named constraint collapses to a bare `<col> <type> NOT NULL` (no `CONSTRAINT` prefix).
+      - **PROGRESS 2026-06-20 (loop #44):** **DU-002 slice 277 LANDED — the ALTER-path counterpart of slice 274's
+        CREATE-inline `nninh3`: a NAMED NOT NULL added to a LOCAL column via `ALTER TABLE ... ADD CONSTRAINT
+        nninh6_c_not_null NOT NULL c` whose explicit name EQUALS the auto-name `nninh6_c_not_null` must COLLAPSE to the
+        bare `c integer NOT NULL` form — pg_dump must NOT leak the `CONSTRAINT nninh6_c_not_null` prefix (no production
+        change; sibling-paths regression guard).** Slice 274 proved this collapse at table-creation time; this twin proves
+        the ALTER path stores the same `conname` so pg_dump's auto-name suppression (pg_dump.c:17184, fires when conname
+        == computed default `<table>_<col>_not_null`) also applies. A regression storing a non-default conname on the
+        ALTER arm — or skipping the auto-name comparison — would emit `c integer CONSTRAINT nninh6_c_not_null NOT NULL`;
+        the assertion explicitly rejects that leaked prefix. Fixture: `CREATE TABLE public.nninh6 (c integer, d integer)`
+        + `ALTER TABLE public.nninh6 ADD CONSTRAINT nninh6_c_not_null NOT NULL c`. **Guards:**
+        `TestPort_PgDumpConnectionSetup` PASS (3.40s; asserts bare `c integer NOT NULL`, negative check that
+        `CONSTRAINT nninh6_c_not_null` does NOT leak, and plain `d integer` survives). gofmt + `go build ./...` clean;
+        pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 277. **Next (slice 278+):** the
+        `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` counterpart where the name EQUALS the auto-name
+        — the collapse should drop the `CONSTRAINT` prefix while the `NO INHERIT` suffix survives (`<col> <type> NOT NULL
+        NO INHERIT`), combining slice 274's collapse with slice 275's suffix threading.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

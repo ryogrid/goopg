@@ -1624,6 +1624,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("add named NOT NULL on local column nninh5.c: %v", err)
 	}
 
+	// Slice 277 (ALTER-path counterpart of slice 274's CREATE-inline nninh3):
+	// a NAMED NOT NULL added to a LOCAL column via `ALTER TABLE ... ADD CONSTRAINT
+	// <name> NOT NULL <col>` whose explicit name EQUALS the auto-name
+	// `<table>_<col>_not_null` must COLLAPSE to the bare `<col> <type> NOT NULL`
+	// form — pg_dump must NOT leak the `CONSTRAINT nninh6_c_not_null` prefix even
+	// though the constraint was created with an explicit name. Slice 274 proved
+	// this collapse for the inline-at-creation path; this twin proves the ALTER
+	// path stores the same `conname` (so pg_dump's auto-name suppression at
+	// pg_dump.c:17184 — which fires when conname == the computed default — also
+	// applies). A regression that stored a different conname, or that skipped the
+	// auto-name comparison on the ALTER path, would leak `c integer CONSTRAINT
+	// nninh6_c_not_null NOT NULL` into the dump.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh6 (c integer, d integer)"); err != nil {
+		t.Fatalf("create standalone table nninh6: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nninh6 ADD CONSTRAINT nninh6_c_not_null NOT NULL c"); err != nil {
+		t.Fatalf("add default-named NOT NULL on local column nninh6.c: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -4288,6 +4307,33 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			}
 		} else {
 			t.Errorf("pg_dump missing CREATE TABLE public.nninh5\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 277 (asserted, ALTER-path counterpart of slice 274):** a NAMED
+		// NOT NULL added to a LOCAL column via `ALTER TABLE ... ADD CONSTRAINT
+		// nninh6_c_not_null NOT NULL c`, whose explicit name EQUALS the auto-name
+		// `nninh6_c_not_null`, must COLLAPSE to the bare `c integer NOT NULL` form.
+		// pg_dump suppresses a NOT NULL constraint name when it matches the computed
+		// default (pg_dump.c:17184), so the explicit name must NOT leak into the
+		// dump. A regression storing a non-default conname on the ALTER path would
+		// emit `c integer CONSTRAINT nninh6_c_not_null NOT NULL`.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh6 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer NOT NULL") {
+				t.Errorf("pg_dump dropped the default-named NOT NULL added via ALTER; want %q in nninh6 block\n  block=%q", "c integer NOT NULL", block)
+			}
+			if strings.Contains(block, "CONSTRAINT nninh6_c_not_null") {
+				t.Errorf("pg_dump leaked the default constraint name from the ALTER path; want bare %q, not %q in nninh6 block\n  block=%q", "c integer NOT NULL", "CONSTRAINT nninh6_c_not_null", block)
+			}
+			if !strings.Contains(block, "d integer") {
+				t.Errorf("pg_dump dropped the standalone table's plain column; want %q in nninh6 block\n  block=%q", "d integer", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh6\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged

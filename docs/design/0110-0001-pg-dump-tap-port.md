@@ -8068,9 +8068,27 @@ Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live
 block contains `c integer CONSTRAINT nn5 NOT NULL`, does NOT contain `CONSTRAINT nn5 NOT NULL NO INHERIT`, and the plain
 `d integer` survives).
 
-> **Next (slice 277+):** an `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` on a *local* column where the name
-> EQUALS the auto-name `<table>_<col>_not_null` — the ALTER-path counterpart of slice 274, asserting the named
-> constraint collapses to a bare `<col> <type> NOT NULL` (no `CONSTRAINT` prefix) through pg_dump.
+### Slice 277 — *default-named* NOT NULL added to a *local* column via `ALTER TABLE ADD CONSTRAINT` collapses to bare form
+
+The ALTER-path counterpart of slice 274's CREATE-inline `nninh3`. Slice 274 proved that a named NOT NULL whose explicit
+name equals the auto-name `<table>_<col>_not_null` collapses to the bare `<col> <type> NOT NULL` form at table-creation
+time; this twin proves the same collapse when the constraint is added later via ALTER —
+`CREATE TABLE nninh6 (c integer, d integer); ALTER TABLE nninh6 ADD CONSTRAINT nninh6_c_not_null NOT NULL c` →
+`c integer NOT NULL` (no `CONSTRAINT nninh6_c_not_null` prefix).
+
+**No production change required.** The AlterTableAddNotNull executor stores the user-supplied `conname`
+(`nninh6_c_not_null`) on a contype='n' pg_constraint row, identical to the value real PostgreSQL computes as the default.
+pg_dump suppresses the constraint name when it matches the computed default (`<table>_<col>_not_null`, pg_dump.c:17184),
+so the explicit name does NOT leak into the dump. A regression that stored a non-default conname on the ALTER path — or
+skipped the auto-name comparison — would emit `c integer CONSTRAINT nninh6_c_not_null NOT NULL`; the assertion explicitly
+rejects that leaked prefix in addition to requiring the bare named form.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `nninh6`
+block contains `c integer NOT NULL`, does NOT contain `CONSTRAINT nninh6_c_not_null`, and the plain `d integer` survives).
+
+> **Next (slice 278+):** the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` counterpart where the name
+> EQUALS the auto-name — the auto-name collapse should still drop the `CONSTRAINT` prefix while the `NO INHERIT` suffix
+> survives (`<col> <type> NOT NULL NO INHERIT`), combining slice 274's collapse with slice 275's suffix threading.
 
 ## Deferred (002–010) — catalog surface estimate
 
