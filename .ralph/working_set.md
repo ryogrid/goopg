@@ -1,20 +1,20 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 235 (loop #51) — sixth `RELOPT_KIND_TOAST` autovacuum-age
-*integer* reloption (`toast.autovacuum_multixact_freeze_table_age`, INT 0–2000000000);
-twelve-element TOAST reloptions array. Committing+pushing now.
+Last landed: DU-002 slice 236 (loop #52) — `toast.log_autovacuum_min_duration`
+(RELOPT_KIND_HEAP|TOAST, INT range -1–INT_MAX, floor -1 not 0), thirteen-element
+TOAST reloptions array. First SIGNED reloption value → also fixed a parser gap
+(storage-param list now accepts an optional leading '+'/'-', mirroring PG's
+def_arg=NumericOnly). Committing+pushing now.
 
-Files: internal/executor/operators_ddl.go (int gather arm after slice-234 max_age, ~line 1737),
-internal/testport/pgdump_connsetup_test.go (optoast fixture = 12 options + updated combined-WITH
-assertion + comment blocks), docs/design/0110-0001-pg-dump-tap-port.md (Slice 235), .ralph/fix_plan.md.
+Files: internal/parser/ddl.go (optional-sign block before value-token switch in the
+storage-param list parser), internal/parser/ddl_test.go (TestParseCreateTableSignedReloption),
+internal/executor/operators_ddl.go (int gather arm after slice-235, floor -1),
+internal/testport/pgdump_connsetup_test.go (optoast fixture = 13 options incl. signed -1
++ combined-WITH assertion), docs/design/0110-0001-pg-dump-tap-port.md (Slice 236), .ralph/fix_plan.md.
 
-Gates: gofmt OK; go build ./internal/... clean; executor+parser+catalog PASS;
+Gates: gofmt OK; go build ./internal/... clean; parser+executor+catalog PASS;
 TestPort_PgDumpConnectionSetup PASS (cgroup wrapper, -count=1, 3.5s); pgbench pre-commit smoke on commit.
 
-PG oracle (reloptions.c, verified): autovacuum_multixact_freeze_table_age
-RELOPT_KIND_HEAP|TOAST, default -1, range 0–2000000000 (line 316/1895). 0 valid; explicit -1 rejected.
-
-Next (last TOAST int option, then composites):
-  slice 236: toast.log_autovacuum_min_duration (INT, range -1–INT_MAX; -1 IS valid → floor is -1 not 0).
-    One-line gather appended after the slice-235 arm; fixture extended by one option; assertion extended.
-toast.autovacuum_analyze_* is RELOPT_KIND_HEAP ONLY → PG rejects toast. prefix; do NOT add. After: composite types.
+Next: the toast.* autovacuum reloption surface is COMPLETE. autovacuum_analyze_threshold /
+autovacuum_analyze_scale_factor are RELOPT_KIND_HEAP-ONLY → PG rejects the toast. prefix; do NOT add them.
+Next DU-002 work item: composite types (CREATE TYPE ... AS (...)) in pg_dump.

@@ -5157,6 +5157,26 @@ object support.
         `go build ./internal/...` clean; executor+parser+catalog suites PASS; `TestPort_PgDumpConnectionSetup`
         PASS; pgbench pre-commit smoke on commit. **Next:** `toast.log_autovacuum_min_duration` (INT, range
         `-1–INT_MAX`; -1 IS valid → floor is -1 not 0) — one-line gather. After: composite types.
+      - **PROGRESS 2026-06-19 (loop #52):** **DU-002 slice 236 LANDED — `RELOPT_KIND_TOAST` logging *integer*
+        reloption (`toast.log_autovacuum_min_duration`) round-trips; thirteen-element TOAST reloptions array.**
+        `log_autovacuum_min_duration` is `RELOPT_TYPE_INT` and shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`
+        (`reloptions.c:1897/324`, range `-1–INT_MAX`, default `-1`), so PG accepts the `toast.` prefix. Unlike
+        the autovacuum-**age** options, the floor is `-1` not `0` (`-1` disables logging; `0` logs every action).
+        First **signed** reloption value to round-trip → surfaced a parser gap: the storage-param list parser
+        (`parser/ddl.go`) only accepted bare int/numeric/string/ident tokens, so `-1` failed with `expected
+        option value`. Fix mirrors PG's `def_arg = NumericOnly` grammar: an optional leading `TokenOperator`
+        `-`/`+` is now consumed and its sign prepended to the raw value text. **Executor** (`operators_ddl.go`):
+        one extra gather block after the slice-235 arm: `strconv.Atoi` + `-1 ≤ N ≤ 2147483647` bounds check
+        (non-int/out-of-range → 22023; `-1` valid), appended as `log_autovacuum_min_duration=<N>` via
+        `strconv.Itoa`. **catalog**: NO change. On dump-out pg_dump re-adds the prefix per element →
+        `WITH (..., toast.log_autovacuum_min_duration='-1')`. Files: `internal/parser/ddl.go` (optional-sign
+        block), `internal/executor/operators_ddl.go` (int gather block),
+        `internal/testport/pgdump_connsetup_test.go` (`optoast` fixture = 13 options incl. signed `-1` + updated
+        combined-WITH assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 236). Gates: gofmt OK;
+        `go build ./internal/...` clean; parser+executor+catalog suites PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** `toast.` autovacuum reloption surface COMPLETE
+        (`autovacuum_analyze_*` are `RELOPT_KIND_HEAP`-only → PG rejects `toast.` prefix; do NOT add). After:
+        composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

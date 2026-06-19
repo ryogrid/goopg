@@ -780,8 +780,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// sixth RELOPT_KIND_TOAST autovacuum-age *integer* option
 	// (`toast.autovacuum_multixact_freeze_table_age`, valid 0–2000000000), extending
 	// the array to twelve elements; pg_dump re-emits the integer element
-	// `toast.autovacuum_multixact_freeze_table_age='250000000'`.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.optoast (id integer PRIMARY KEY) WITH (toast.autovacuum_enabled=false, toast.vacuum_truncate=false, toast.autovacuum_vacuum_threshold=100, toast.autovacuum_vacuum_scale_factor=2.5, toast.autovacuum_vacuum_cost_delay=10.5, toast.autovacuum_vacuum_cost_limit=500, toast.autovacuum_freeze_min_age=200000000, toast.autovacuum_freeze_max_age=500000000, toast.autovacuum_freeze_table_age=0, toast.autovacuum_multixact_freeze_min_age=150000000, toast.autovacuum_multixact_freeze_max_age=500000000, toast.autovacuum_multixact_freeze_table_age=250000000)"); err != nil {
+	// `toast.autovacuum_multixact_freeze_table_age='250000000'`. Slice 236 adds the
+	// integer `toast.log_autovacuum_min_duration` option (valid -1–INT_MAX; unlike the
+	// autovacuum-age options, -1 is a valid explicit value so the floor is -1 not 0),
+	// extending the array to thirteen elements; pg_dump re-emits the integer element
+	// `toast.log_autovacuum_min_duration='-1'`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optoast (id integer PRIMARY KEY) WITH (toast.autovacuum_enabled=false, toast.vacuum_truncate=false, toast.autovacuum_vacuum_threshold=100, toast.autovacuum_vacuum_scale_factor=2.5, toast.autovacuum_vacuum_cost_delay=10.5, toast.autovacuum_vacuum_cost_limit=500, toast.autovacuum_freeze_min_age=200000000, toast.autovacuum_freeze_max_age=500000000, toast.autovacuum_freeze_table_age=0, toast.autovacuum_multixact_freeze_min_age=150000000, toast.autovacuum_multixact_freeze_max_age=500000000, toast.autovacuum_multixact_freeze_table_age=250000000, toast.log_autovacuum_min_duration=-1)"); err != nil {
 		t.Fatalf("create table optoast: %v", err)
 	}
 
@@ -2826,23 +2830,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if !strings.Contains(res.Stdout, "CREATE TABLE public.optoast (") {
 			t.Errorf("pg_dump missing CREATE TABLE public.optoast\n  full stdout=%q", res.Stdout)
 		}
-		// **Slice 225 + 226 + 227 + 228 + 229 + 230 + 231 + 232 + 233 + 234 closed (asserted):**
+		// **Slice 225 + 226 + 227 + 228 + 229 + 230 + 231 + 232 + 233 + 234 + 235 + 236 closed (asserted):**
 		// a second RELOPT_KIND_TOAST boolean (toast.vacuum_truncate), the first
 		// RELOPT_KIND_TOAST integer (toast.autovacuum_vacuum_threshold), two
 		// RELOPT_KIND_TOAST reals (toast.autovacuum_vacuum_scale_factor,
 		// toast.autovacuum_vacuum_cost_delay), a second RELOPT_KIND_TOAST integer
-		// (toast.autovacuum_vacuum_cost_limit), and six RELOPT_KIND_TOAST
+		// (toast.autovacuum_vacuum_cost_limit), six RELOPT_KIND_TOAST
 		// autovacuum-age integers (toast.autovacuum_freeze_min_age,
 		// toast.autovacuum_freeze_max_age, toast.autovacuum_freeze_table_age,
 		// toast.autovacuum_multixact_freeze_min_age,
 		// toast.autovacuum_multixact_freeze_max_age,
-		// toast.autovacuum_multixact_freeze_table_age) on the
+		// toast.autovacuum_multixact_freeze_table_age), and the
+		// RELOPT_KIND_TOAST logging integer (toast.log_autovacuum_min_duration,
+		// floor -1 not 0) on the
 		// same table exercise the multi-element toast reloptions array. The
 		// synthesized TOAST relation's reloptions are
-		// `{autovacuum_enabled=false,vacuum_truncate=false,autovacuum_vacuum_threshold=100,autovacuum_vacuum_scale_factor=2.5,autovacuum_vacuum_cost_delay=10.5,autovacuum_vacuum_cost_limit=500,autovacuum_freeze_min_age=200000000,autovacuum_freeze_max_age=500000000,autovacuum_freeze_table_age=0,autovacuum_multixact_freeze_min_age=150000000,autovacuum_multixact_freeze_max_age=500000000,autovacuum_multixact_freeze_table_age=250000000}`
-		// (code order), so pg_dump emits all twelve prefixed options in one WITH clause.
-		if !strings.Contains(res.Stdout, "WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false', toast.autovacuum_vacuum_threshold='100', toast.autovacuum_vacuum_scale_factor='2.5', toast.autovacuum_vacuum_cost_delay='10.5', toast.autovacuum_vacuum_cost_limit='500', toast.autovacuum_freeze_min_age='200000000', toast.autovacuum_freeze_max_age='500000000', toast.autovacuum_freeze_table_age='0', toast.autovacuum_multixact_freeze_min_age='150000000', toast.autovacuum_multixact_freeze_max_age='500000000', toast.autovacuum_multixact_freeze_table_age='250000000')") {
-			t.Errorf("pg_dump dropped a toast.* reloption; missing %q\n  full stdout=%q", "WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false', toast.autovacuum_vacuum_threshold='100', toast.autovacuum_vacuum_scale_factor='2.5', toast.autovacuum_vacuum_cost_delay='10.5', toast.autovacuum_vacuum_cost_limit='500', toast.autovacuum_freeze_min_age='200000000', toast.autovacuum_freeze_max_age='500000000', toast.autovacuum_freeze_table_age='0', toast.autovacuum_multixact_freeze_min_age='150000000', toast.autovacuum_multixact_freeze_max_age='500000000', toast.autovacuum_multixact_freeze_table_age='250000000')", res.Stdout)
+		// `{autovacuum_enabled=false,vacuum_truncate=false,autovacuum_vacuum_threshold=100,autovacuum_vacuum_scale_factor=2.5,autovacuum_vacuum_cost_delay=10.5,autovacuum_vacuum_cost_limit=500,autovacuum_freeze_min_age=200000000,autovacuum_freeze_max_age=500000000,autovacuum_freeze_table_age=0,autovacuum_multixact_freeze_min_age=150000000,autovacuum_multixact_freeze_max_age=500000000,autovacuum_multixact_freeze_table_age=250000000,log_autovacuum_min_duration=-1}`
+		// (code order), so pg_dump emits all thirteen prefixed options in one WITH clause.
+		if !strings.Contains(res.Stdout, "WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false', toast.autovacuum_vacuum_threshold='100', toast.autovacuum_vacuum_scale_factor='2.5', toast.autovacuum_vacuum_cost_delay='10.5', toast.autovacuum_vacuum_cost_limit='500', toast.autovacuum_freeze_min_age='200000000', toast.autovacuum_freeze_max_age='500000000', toast.autovacuum_freeze_table_age='0', toast.autovacuum_multixact_freeze_min_age='150000000', toast.autovacuum_multixact_freeze_max_age='500000000', toast.autovacuum_multixact_freeze_table_age='250000000', toast.log_autovacuum_min_duration='-1')") {
+			t.Errorf("pg_dump dropped a toast.* reloption; missing %q\n  full stdout=%q", "WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false', toast.autovacuum_vacuum_threshold='100', toast.autovacuum_vacuum_scale_factor='2.5', toast.autovacuum_vacuum_cost_delay='10.5', toast.autovacuum_vacuum_cost_limit='500', toast.autovacuum_freeze_min_age='200000000', toast.autovacuum_freeze_max_age='500000000', toast.autovacuum_freeze_table_age='0', toast.autovacuum_multixact_freeze_min_age='150000000', toast.autovacuum_multixact_freeze_max_age='500000000', toast.autovacuum_multixact_freeze_table_age='250000000', toast.log_autovacuum_min_duration='-1')", res.Stdout)
 		}
 		// The synthesized TOAST relation must never be dumped as its own object.
 		if strings.Contains(res.Stdout, "pg_toast_") {

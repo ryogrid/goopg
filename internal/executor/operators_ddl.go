@@ -1755,6 +1755,28 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		toastReloptions = append(toastReloptions, "autovacuum_multixact_freeze_table_age="+strconv.Itoa(amfta))
 	}
+	// `toast.log_autovacuum_min_duration` — RELOPT_TYPE_INT, range -1–INT_MAX,
+	// default -1 (= unset / use the GUC). Shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:1897/324), so PG accepts the `toast.` prefix and stores it (no
+	// prefix) on the TOAST relation's reloptions. Unlike the autovacuum-age options,
+	// -1 IS a valid explicit value here (0 logs every action; -1 disables logging),
+	// so the floor is -1 not 0 (mirrors the parent-table arm, slice 206 sibling).
+	// goopg has no autovacuum, so the value is purely catalog/dump state that
+	// round-trips through pg_dump's `WITH (toast.log_autovacuum_min_duration='N')`.
+	// M0110-0001 (DU-002 slice 236).
+	if v, ok := s.With["toast.log_autovacuum_min_duration"]; ok {
+		lamd, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"log_autovacuum_min_duration\": %s", v)}
+		}
+		if lamd < -1 || lamd > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"log_autovacuum_min_duration\"", lamd),
+				Detail:  "Valid values are between \"-1\" and \"2147483647\"."}
+		}
+		toastReloptions = append(toastReloptions, "log_autovacuum_min_duration="+strconv.Itoa(lamd))
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}

@@ -77,6 +77,26 @@ func TestParseCreateTableToastNamespacedReloption(t *testing.T) {
 	}
 }
 
+// TestParseCreateTableSignedReloption covers signed-integer storage parameter
+// values (PG's def_arg = NumericOnly permits an optional leading '+'/'-'), e.g.
+// `toast.log_autovacuum_min_duration=-1` whose valid floor is -1. The leading
+// sign must be preserved in the stored raw value text so the executor can
+// bounds-check it. A '+' sign is accepted but normalized away (kept as the bare
+// number). DU-002 slice 236.
+func TestParseCreateTableSignedReloption(t *testing.T) {
+	stmts, err := Parse("CREATE TABLE t (id int) WITH (toast.log_autovacuum_min_duration = -1, autovacuum_vacuum_cost_delay = +5)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if ct.With["toast.log_autovacuum_min_duration"] != "-1" {
+		t.Errorf("toast.log_autovacuum_min_duration = %q, want %q (with=%+v)", ct.With["toast.log_autovacuum_min_duration"], "-1", ct.With)
+	}
+	if ct.With["autovacuum_vacuum_cost_delay"] != "5" {
+		t.Errorf("autovacuum_vacuum_cost_delay = %q, want %q (with=%+v)", ct.With["autovacuum_vacuum_cost_delay"], "5", ct.With)
+	}
+}
+
 func TestParseCreateTableBareCharDefaultsToCharacterOne(t *testing.T) {
 	stmts, err := Parse(`CREATE TABLE t (a char, b "char")`)
 	if err != nil {

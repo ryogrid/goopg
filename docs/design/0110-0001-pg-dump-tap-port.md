@@ -6805,6 +6805,40 @@ twelve-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_
 `toast.log_autovacuum_min_duration` (INT, range `-1–INT_MAX`; `-1` IS valid → floor is `-1` not `0`), a one-line
 gather reusing the int path. After: composite types.
 
+### Slice 236 — `RELOPT_KIND_TOAST` logging *integer* reloption (`toast.log_autovacuum_min_duration`)
+
+Adds `toast.log_autovacuum_min_duration`, the last `RELOPT_KIND_TOAST` integer option in the autovacuum
+namespace, extending the TOAST reloptions array to thirteen elements. `log_autovacuum_min_duration` is
+`RELOPT_TYPE_INT` and shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:1897/324`, range
+`-1–INT_MAX`, default `-1`), so PG accepts the `toast.` prefix and stores it (without prefix) on the TOAST
+relation's `pg_class.reloptions`. Unlike the autovacuum-**age** options, the lower bound here is `-1` (which
+disables logging; `0` logs every action), so `-1` is a valid explicit value — the floor is `-1` not `0`
+(mirroring the parent-table arm, slice 206).
+
+This was the first signed reloption value to round-trip, which surfaced a parser gap: the storage-parameter
+parser (`parseWithStorageParams` in `parser/ddl.go`) only accepted bare int/numeric/string/ident tokens, so
+`-1` failed with `expected option value`. PG's `def_arg` grammar permits `NumericOnly` (an optionally-signed
+number), so a leading `+`/`-` is now consumed and prepended to the raw option text before the executor parses it.
+
+- **parser** (`ddl.go`): one optional-sign block before the value-token switch in the storage-param list — a
+  leading `TokenOperator` `-`/`+` is consumed and its sign prepended to the resulting `val`.
+- **Executor** (`operators_ddl.go`): one extra gather block after the slice-235
+  `toast.autovacuum_multixact_freeze_table_age` arm: `strconv.Atoi` + `-1 ≤ N ≤ 2147483647` bounds check
+  (non-int or out-of-range → 22023), appended to `toastReloptions` as `log_autovacuum_min_duration=<N>`
+  (no prefix) via `strconv.Itoa`.
+- **catalog** (`catalog.go`): no change — the existing `strings.Join` over `t.ToastReloptions` renders the
+  thirteen-element array ending in `…,autovacuum_multixact_freeze_table_age=250000000,log_autovacuum_min_duration=-1}`.
+
+On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) order:
+`WITH (..., toast.autovacuum_multixact_freeze_table_age='250000000', toast.log_autovacuum_min_duration='-1')`.
+
+Engine guard: the `optoast` fixture now carries all thirteen options (including the signed `-1`); the assertion
+confirms the combined thirteen-element `WITH` clause and that no `pg_toast_*` relation leaks.
+`TestPort_PgDumpConnectionSetup` PASS.
+
+**Next:** the `toast.` autovacuum reloption surface is now complete (`autovacuum_analyze_*` are
+`RELOPT_KIND_HEAP`-only, so PG rejects the `toast.` prefix — do not add). After: composite types.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

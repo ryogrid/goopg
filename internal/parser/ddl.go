@@ -2948,15 +2948,29 @@ func (p *parser) parseWithOptions() (map[string]string, error) {
 		if cur := p.cur(); cur.Kind == TokenOperator && cur.Value == "=" {
 			p.advance() // consume '='
 			t := p.cur()
+			// Optional leading sign: PG's reloption grammar accepts def_arg =
+			// NumericOnly, which permits an optional '+'/'-' before the number
+			// (gram.y), so signed-integer storage parameters such as
+			// `WITH (toast.log_autovacuum_min_duration=-1)` (valid floor -1)
+			// round-trip. Preserve the sign in the raw text for the executor to
+			// parse/bounds-check. M0110-0001 (DU-002 slice 236).
+			sign := ""
+			if t.Kind == TokenOperator && (t.Value == "-" || t.Value == "+") {
+				if t.Value == "-" {
+					sign = "-"
+				}
+				p.advance()
+				t = p.cur()
+			}
 			switch t.Kind {
 			case TokenIntLit, TokenStringLit, TokenNumericLit:
 				// TokenNumericLit (e.g. `0.2`) is accepted so REAL-typed storage
 				// parameters such as autovacuum_vacuum_scale_factor round-trip;
 				// the raw text is preserved for the executor to parse/bounds-check.
 				// M0110-0001 (DU-002 slice 199).
-				val = t.Value
+				val = sign + t.Value
 			case TokenIdent, TokenQuotedIdent, TokenKeyword:
-				val = identText(t)
+				val = sign + identText(t)
 			default:
 				return nil, p.errAtCur("expected option value")
 			}
