@@ -10323,7 +10323,7 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		}
 		newFields := make([]catalog.CompositeField, len(ct.Fields)+1)
 		copy(newFields, ct.Fields)
-		newFields[len(ct.Fields)] = catalog.CompositeField{Name: s.AddAttrName, ColType: s.AddAttrType}
+		newFields[len(ct.Fields)] = catalog.CompositeField{Name: s.AddAttrName, ColType: s.AddAttrType, Collation: s.AddAttrCollation}
 		// Stamp xmax on the existing composite heap rows (pg_type ×2, the
 		// implicit pg_class relation + its pg_attribute field rows) before the
 		// re-sync re-writes them, mirroring execDropType's composite branch.

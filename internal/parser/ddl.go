@@ -5557,6 +5557,14 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 				if tok.Kind == TokenSymbol && parenDepth == 0 && tok.Value == "," {
 					break
 				}
+				// A top-level COLLATE clause is not part of the type — stop here and
+				// capture it separately so the attribute's atttypid stays clean and its
+				// attcollation round-trips through pg_dump. DU-002 slice 258, mirroring
+				// the CREATE TYPE composite-field path (slice 257).
+				if parenDepth == 0 && tok.Kind != TokenSymbol &&
+					strings.EqualFold(tok.Value, "collate") {
+					break
+				}
 				if tok.Kind == TokenSymbol && tok.Value == "(" {
 					parenDepth++
 				} else if tok.Kind == TokenSymbol && tok.Value == ")" {
@@ -5566,6 +5574,14 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 				p.advance()
 			}
 			stmt.AddAttrType = strings.Join(typeParts, " ")
+			// Optional per-attribute COLLATE "<name>" — record the collation so the
+			// new field's pg_attribute.attcollation shadows the type default and
+			// pg_dump re-emits a COLLATE clause. goopg v0 does not actually collate;
+			// the name is kept for dump fidelity. DU-002 slice 258.
+			if p.acceptIdentKeyword("collate") {
+				collName, _ := p.parseCollationName()
+				stmt.AddAttrCollation = collName
+			}
 			// Consume any trailing subcommands / CASCADE|RESTRICT as a stub.
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {

@@ -7500,8 +7500,39 @@ override, text default 100 untouched, non-collatable int suppressed to 0); the p
 `a text COLLATE pg_catalog."C", b text, p text COLLATE pg_catalog."POSIX"` (the bare `\tb text,` form proving the
 middle field is clause-free), byte-matching real pg_dump 18.3.
 
-> **Next (slice 258+):** multi-subcommand `ALTER TYPE` statements (`ADD …, DROP …` in one command) and
-> per-attribute `COLLATE` via `ALTER TYPE … ADD ATTRIBUTE`.
+### Slice 258 — per-attribute `COLLATE` via `ALTER TYPE … ADD ATTRIBUTE`
+
+Slice 253 wired `ALTER TYPE … ADD ATTRIBUTE col type` (append a composite field via the heap re-sync); slice 257
+taught the *`CREATE TYPE`* path to capture a per-field `COLLATE` and round-trip it through `attcollation`. But
+`ALTER TYPE … ADD ATTRIBUTE col type COLLATE "C"` still stub-consumed the trailing `COLLATE` clause, so the new
+attribute's collation was silently dropped from the dump. This slice closes that gap, reusing the same machinery
+both prior slices already built.
+
+- **Parser (`parseAlterType` ADD ATTRIBUTE branch, `ddl.go`)** — the type-token collection now stops at a
+  top-level `COLLATE` ident keyword (Kind-agnostic break, identical to the `CREATE TYPE` composite-field loop in
+  slice 257), keeping the type clean (`text`, not `text COLLATE "C"`). The optional trailing `COLLATE <name>` is
+  then parsed via the shared `parseCollationName` (bare `"C"` and schema-qualified `pg_catalog."C"` → bare last
+  component) into the new `AlterTypeStmt.AddAttrCollation`. No `COLLATE` → empty.
+- **Executor (`execAlterType` ADD ATTRIBUTE, `operators_ddl.go`)** — the appended `catalog.CompositeField` now
+  carries `Collation: s.AddAttrCollation`. Everything downstream is unchanged: the OID-stable re-sync
+  (`RegisterCompositeTypeWithFields` + `syncCompositeTypeToCatalogHeap`) runs `buildUserPGAttributeRowForCompositeField`,
+  which already (slice 257) stamps `attcollation` from `field.Collation` for a collatable type via
+  `collationNameToOID` (C→950, POSIX→951; a `COLLATE` on a non-collatable type is suppressed).
+- **No `pg_dump`-side change** — `dumpCompositeType` already re-emits `COLLATE pg_catalog."<name>"` inline when
+  `attcollation <> typcollation` (slice 257); the re-synced heap row now carries the override, so the added field
+  dumps with its clause.
+
+Guarded at two levels: `parser.TestAlterTypeAddAttributeCollateParsing` pins the parse (bare `COLLATE "C"`, a
+typmod-then-COLLATE attribute keeps the type clean, schema-qualified `pg_catalog."C"` keeps the bare name, and an
+attribute without `COLLATE` leaves `AddAttrCollation` empty); the pg_dump TAP port appends
+`ALTER TYPE public.alt_comp ADD ATTRIBUTE cc text COLLATE "C"` to the existing `alt_comp` ALTER-chain and asserts
+the dump renders `cc text COLLATE pg_catalog."C"` as the final field (with `b_renamed numeric(12,3),` now
+comma-suffixed), byte-matching real pg_dump 18.3. The slice-257 heap-row test
+(`executor.TestUserPGAttributeCompositeFieldCollation`) already covers the `field.Collation`→`attcollation`
+builder the re-sync reuses.
+
+> **Next (slice 259+):** multi-subcommand `ALTER TYPE` statements (`ADD …, DROP …` in one command) and
+> per-attribute `COLLATE` via `ALTER TYPE … ALTER ATTRIBUTE … COLLATE`.
 
 ## Deferred (002–010) — catalog surface estimate
 

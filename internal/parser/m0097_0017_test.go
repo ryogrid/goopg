@@ -192,6 +192,45 @@ func TestAlterTypeAddAttributeParsing(t *testing.T) {
 	}
 }
 
+// TestAlterTypeAddAttributeCollateParsing covers DU-002 slice 258: a per-attribute
+// COLLATE on ALTER TYPE … ADD ATTRIBUTE is captured separately into
+// AddAttrCollation, leaving the type clean (no `COLLATE "C"` folded into AddAttrType).
+// Handles bare `COLLATE "C"`, a typmod-then-COLLATE attribute, schema-qualified
+// `pg_catalog."C"` (bare last component kept), and that an attribute without COLLATE
+// leaves AddAttrCollation empty.
+func TestAlterTypeAddAttributeCollateParsing(t *testing.T) {
+	tests := []struct {
+		sql      string
+		wantName string
+		wantType string
+		wantColl string
+	}{
+		{`ALTER TYPE addr ADD ATTRIBUTE city text COLLATE "C"`, "city", "text", "C"},
+		{`ALTER TYPE addr ADD ATTRIBUTE code varchar(8) COLLATE "POSIX"`, "code", "varchar ( 8 )", "POSIX"},
+		{`ALTER TYPE addr ADD ATTRIBUTE z text COLLATE pg_catalog."C"`, "z", "text", "C"},
+		{`ALTER TYPE addr ADD ATTRIBUTE plain text`, "plain", "text", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.sql[:min(60, len(tc.sql))], func(t *testing.T) {
+			stmts, err := parser.Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+			}
+			at, ok := stmts[0].(*parser.AlterTypeStmt)
+			if !ok {
+				t.Fatalf("expected *AlterTypeStmt, got %T", stmts[0])
+			}
+			if at.AddAttrName != tc.wantName || at.AddAttrType != tc.wantType {
+				t.Errorf("ADD ATTRIBUTE = {%q, %q}, want {%q, %q}",
+					at.AddAttrName, at.AddAttrType, tc.wantName, tc.wantType)
+			}
+			if at.AddAttrCollation != tc.wantColl {
+				t.Errorf("AddAttrCollation = %q, want %q", at.AddAttrCollation, tc.wantColl)
+			}
+		})
+	}
+}
+
 // TestAlterTypeRenameAttributeParsing covers the RENAME ATTRIBUTE old TO new
 // sub-branch (DU-002 slice 254). It must NOT take the RENAME VALUE / RENAME TO
 // paths — those carry RenameOldValue / RenameTo, not RenameAttrOld/New.
