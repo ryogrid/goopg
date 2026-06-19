@@ -5138,6 +5138,25 @@ object support.
         PASS; pgbench pre-commit smoke on commit. **Next:** `toast.autovacuum_multixact_freeze_table_age` (INT
         `0–2000000000`), `toast.log_autovacuum_min_duration` (INT, allows -1 — floor is -1 not 0) — each a
         one-line gather. After: composite types.
+      - **PROGRESS 2026-06-19 (loop #51):** **DU-002 slice 235 LANDED — sixth `RELOPT_KIND_TOAST`
+        autovacuum-age *integer* reloption (`toast.autovacuum_multixact_freeze_table_age`) round-trips;
+        twelve-element TOAST reloptions array.** `autovacuum_multixact_freeze_table_age` is `RELOPT_TYPE_INT`
+        and shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:1895/316`, range `0–2000000000`,
+        default `-1`), so PG accepts the `toast.` prefix and stores it (no prefix) on the TOAST relation's
+        reloptions. **Executor** (`operators_ddl.go`): one extra gather block after the slice-234
+        `toast.autovacuum_multixact_freeze_max_age` arm, mirroring the parent-table integer arm (slice 212):
+        `strconv.Atoi` + `0 ≤ N ≤ 2000000000` bounds check (non-int/out-of-range → 22023; `0` valid, explicit
+        `-1` rejected), appended as `autovacuum_multixact_freeze_table_age=<N>` via `strconv.Itoa`. **catalog**:
+        NO change — `strings.Join` over `ToastReloptions` renders
+        `{...,autovacuum_multixact_freeze_max_age=500000000,autovacuum_multixact_freeze_table_age=250000000}`. On
+        dump-out pg_dump re-adds the prefix per element in array order →
+        `WITH (..., toast.autovacuum_multixact_freeze_table_age='250000000')`. Files:
+        `internal/executor/operators_ddl.go` (int gather block),
+        `internal/testport/pgdump_connsetup_test.go` (`optoast` fixture carries all twelve options + updated
+        combined-WITH assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 235). Gates: gofmt OK;
+        `go build ./internal/...` clean; executor+parser+catalog suites PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** `toast.log_autovacuum_min_duration` (INT, range
+        `-1–INT_MAX`; -1 IS valid → floor is -1 not 0) — one-line gather. After: composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
