@@ -5997,6 +5997,26 @@ object support.
         on commit. Design: `0110-0001` Slice 279. **Next (slice 280+):** the partition-leaf counterpart (a conislocal NOT
         NULL on a partition leaf where `tbinfo->ispartition` changes the column-omission decision), or a multi-column
         inherited NOT NULL body form proving attnum ordering of multiple standalone `NOT NULL <col>` items.
+      - **PROGRESS 2026-06-20 (loop #47):** **DU-002 slice 280 LANDED — multi-column inherited NOT NULL body form proving
+        ATTNUM ordering + PER-COLUMN collapse (no production change; sibling-paths regression guard).** Two conislocal NOT
+        NULL constraints on DISTINCT inherited columns of the same child, added in REVERSE attnum order, must emit their
+        STANDALONE body items in attnum order (not constraint-creation order) AND apply the auto-name collapse per-column.
+        The pg_dump body loop iterates `j` over columns (pg_dump.c:17175-17233), so the two `NOT NULL <col>` items sort by
+        attnum regardless of creation order; the collapse test `notnull_constrs[j][0]=='\0'` (pg_dump.c:17226) is evaluated
+        independently per column. Fixture: `CREATE TABLE public.mninh_parent (ma integer, mb integer, mname text)` +
+        `CREATE TABLE public.mninh_child (extra integer) INHERITS (public.mninh_parent)` + `ALTER TABLE public.mninh_child
+        ADD CONSTRAINT mninh_named NOT NULL mb` (attnum 2, NON-default name → keeps `CONSTRAINT mninh_named NOT NULL mb`) +
+        `ALTER TABLE public.mninh_child ADD CONSTRAINT mninh_child_ma_not_null NOT NULL ma` (attnum 1, default name →
+        collapses to bare `NOT NULL ma`). Slices 271/277/279 proved per-constraint name handling + collapse; this twin
+        proves they compose across multiple columns of one table. A regression sorting body items by constraint OID/creation
+        order would flip `ma`/`mb`; one applying the default-name collapse globally would drop the `CONSTRAINT mninh_named`
+        prefix; one losing either AlterTableAddNotNull would drop a body item. **Guards:** `TestPort_PgDumpConnectionSetup`
+        PASS (3.58s; byte-matches real pg_dump 18.3 — asserts `extra integer`, bare `NOT NULL ma`, no `CONSTRAINT
+        mninh_child_ma_not_null`, `CONSTRAINT mninh_named NOT NULL mb`, `NOT NULL ma` precedes `NOT NULL mb`, inherited
+        `ma integer`/`mb integer`/`mname text` not re-emitted, `INHERITS (public.mninh_parent)` survives). gofmt +
+        `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 280. **Next (slice 281+):** the
+        partition-leaf counterpart (a conislocal NOT NULL on a partition leaf where `tbinfo->ispartition` changes the
+        column-omission decision), or a generated-column / default-value inherited body form.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

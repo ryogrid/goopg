@@ -1695,6 +1695,41 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("add default-named NOT NULL on inherited column idfnd_child.pid: %v", err)
 	}
 
+	// Slice 280 (multi-column inherited NOT NULL body form — attnum ordering +
+	// per-column collapse): two conislocal NOT NULL constraints on DISTINCT
+	// inherited columns of the same child, added in REVERSE attnum order, must
+	// emit their STANDALONE body items in ATTNUM order (not constraint-creation
+	// order) because the pg_dump body loop iterates `j` over columns
+	// (pg_dump.c:17175-17233). Slices 271/279 proved the named/default body form
+	// for a SINGLE inherited column; this twin proves (a) the body emits multiple
+	// `NOT NULL <col>` items sorted by attnum and (b) the COLLAPSE decision is
+	// PER-COLUMN: `mb`'s constraint carries a NON-default name (`mninh_named` !=
+	// `mninh_child_mb_not_null`) so its body item keeps the `CONSTRAINT mninh_named`
+	// prefix, while `ma`'s name EQUALS its auto-name (`mninh_child_ma_not_null`) so
+	// its body item collapses to the bare `NOT NULL ma`. The ALTERs run mb-first
+	// (attnum 2) then ma-second (attnum 1) so a regression that emitted in
+	// creation order would print `mb` before `ma`. No production change — the body
+	// loop already walks columns in attnum order and reuses the same per-column
+	// notnull_constrs[] entries proven by slices 271/277/279. A regression that
+	// sorted by constraint OID/creation order would flip the two items; one that
+	// applied the default-name collapse globally would drop the `CONSTRAINT
+	// mninh_named` prefix; one that lost either AlterTableAddNotNull would drop a
+	// body item.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.mninh_parent (ma integer, mb integer, mname text)"); err != nil {
+		t.Fatalf("create multi-col inheritance parent mninh_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.mninh_child (extra integer) INHERITS (public.mninh_parent)"); err != nil {
+		t.Fatalf("create multi-col inheritance child mninh_child: %v", err)
+	}
+	// mb FIRST (attnum 2, non-default name → keeps CONSTRAINT prefix)...
+	if err := runSQLSimple(t, c, "ALTER TABLE public.mninh_child ADD CONSTRAINT mninh_named NOT NULL mb"); err != nil {
+		t.Fatalf("add named NOT NULL on inherited column mninh_child.mb: %v", err)
+	}
+	// ...then ma SECOND (attnum 1, default name → collapses to bare NOT NULL).
+	if err := runSQLSimple(t, c, "ALTER TABLE public.mninh_child ADD CONSTRAINT mninh_child_ma_not_null NOT NULL ma"); err != nil {
+		t.Fatalf("add default-named NOT NULL on inherited column mninh_child.ma: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -4452,6 +4487,53 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "INHERITS (public.idfnd_parent)") {
 			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfnd_parent)", res.Stdout)
+		}
+		// Slice 280 (multi-column inherited NOT NULL body form — attnum ordering +
+		// per-column collapse): mninh_child carries two conislocal NOT NULL
+		// constraints on distinct inherited columns, added in reverse attnum order.
+		// The body must (1) print the local `extra` column, (2) collapse `ma`'s
+		// default-named constraint to the bare `NOT NULL ma`, (3) keep `mb`'s
+		// non-default name as `CONSTRAINT mninh_named NOT NULL mb`, (4) emit `ma`
+		// BEFORE `mb` (attnum order despite mb being ALTERed first), and (5) suppress
+		// the inherited columns (they arrive via INHERITS).
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.mninh_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the child's local column; want %q in mninh_child block\n  block=%q", "extra integer", block)
+			}
+			maIdx := strings.Index(block, "NOT NULL ma")
+			mbIdx := strings.Index(block, "NOT NULL mb")
+			if maIdx < 0 {
+				t.Errorf("pg_dump dropped the default-named NOT NULL on inherited column ma; want %q in mninh_child block\n  block=%q", "NOT NULL ma", block)
+			}
+			if mbIdx < 0 {
+				t.Errorf("pg_dump dropped the named NOT NULL on inherited column mb; want %q in mninh_child block\n  block=%q", "NOT NULL mb", block)
+			}
+			if strings.Contains(block, "CONSTRAINT mninh_child_ma_not_null") {
+				t.Errorf("pg_dump leaked the default constraint name from the ALTER path; want bare %q, not %q in mninh_child block\n  block=%q", "NOT NULL ma", "CONSTRAINT mninh_child_ma_not_null NOT NULL ma", block)
+			}
+			if !strings.Contains(block, "CONSTRAINT mninh_named NOT NULL mb") {
+				t.Errorf("pg_dump dropped the non-default constraint name on mb; want %q in mninh_child block\n  block=%q", "CONSTRAINT mninh_named NOT NULL mb", block)
+			}
+			if maIdx >= 0 && mbIdx >= 0 && maIdx >= mbIdx {
+				t.Errorf("pg_dump emitted the standalone NOT NULL body items out of attnum order; want %q (attnum 1) before %q (attnum 2) despite mb being ALTERed first\n  block=%q", "NOT NULL ma", "NOT NULL mb", block)
+			}
+			// The inherited columns must NOT be re-emitted as full columns.
+			for _, inheritedCol := range []string{"ma integer", "mb integer", "mname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in mninh_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.mninh_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.mninh_parent)") {
+			t.Errorf("pg_dump dropped the multi-col child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.mninh_parent)", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged

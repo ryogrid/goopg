@@ -8133,6 +8133,34 @@ does NOT re-emit the inherited `pid integer`/`pname text` columns, and that `INH
 > `tbinfo->ispartition` changes the column-omission decision), or a multi-column inherited NOT NULL body form proving the
 > attnum ordering of multiple standalone `NOT NULL <col>` body items.
 
+### Slice 280 — multi-column inherited NOT NULL body form: attnum ordering + per-column collapse
+
+The multi-column generalization of slices 271/279. Two conislocal NOT NULL constraints on DISTINCT inherited columns of
+the same child, added in REVERSE attnum order —
+`CREATE TABLE mninh_parent (ma integer, mb integer, mname text); CREATE TABLE mninh_child (extra integer) INHERITS (mninh_parent);
+ALTER TABLE mninh_child ADD CONSTRAINT mninh_named NOT NULL mb; ALTER TABLE mninh_child ADD CONSTRAINT mninh_child_ma_not_null NOT NULL ma`
+— must emit their STANDALONE body items in ATTNUM order (`NOT NULL ma` before `… mb`), not constraint-creation order, AND
+apply the auto-name COLLAPSE decision PER-COLUMN.
+
+**No production change required.** The pg_dump body loop iterates `j` over columns (pg_dump.c:17175-17233), so the two
+standalone `NOT NULL <col>` items are naturally sorted by attnum regardless of when each constraint was created — `mb` is
+ALTERed first (attnum 2) but `ma` (attnum 1) still prints first. The collapse test (`notnull_constrs[j][0]=='\0'`,
+pg_dump.c:17226) is evaluated independently per column: `ma`'s explicit name EQUALS its auto-name
+`mninh_child_ma_not_null` so it collapses to the bare `NOT NULL ma`, while `mb`'s name (`mninh_named`) DIFFERS from
+`mninh_child_mb_not_null` so it keeps `CONSTRAINT mninh_named NOT NULL mb`. Slices 271/277/279 already proved the
+per-constraint name handling and collapse; this twin proves they compose correctly across multiple columns of one table.
+A regression that sorted body items by constraint OID/creation order would flip `ma`/`mb`; one that applied the
+default-name collapse globally would drop the `CONSTRAINT mninh_named` prefix; one that lost either AlterTableAddNotNull
+would drop a body item.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `mninh_child` block prints `extra integer`,
+the bare `NOT NULL ma` (no `CONSTRAINT mninh_child_ma_not_null`), `CONSTRAINT mninh_named NOT NULL mb`, that `NOT NULL ma`
+precedes `NOT NULL mb` (attnum order despite mb-first ALTER), does NOT re-emit the inherited `ma integer`/`mb integer`/
+`mname text` columns, and that `INHERITS (public.mninh_parent)` survives).
+
+> **Next (slice 281+):** the partition-leaf counterpart — a conislocal NOT NULL on a partition leaf column (where
+> `tbinfo->ispartition` changes the column-omission decision), or a generated-column / default-value inherited body form.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
