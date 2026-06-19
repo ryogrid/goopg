@@ -1888,6 +1888,38 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	if err := validatePartitionChild(s, parent, o.ctx); err != nil {
 		return err
 	}
+	// Storage parameters (WITH clause) on a partition child. PG allows them on a
+	// leaf partition (it is a concrete heap), but rejects them when the child is
+	// itself a partitioned table (PARTITION BY ...). Validate names/value here so
+	// the leaf's fillfactor persists on pg_class.reloptions and round-trips
+	// through pg_dump, mirroring the non-partition CREATE TABLE path above.
+	// M0110-0001 (DU-002 slice 191).
+	for k := range s.With {
+		if k != strings.ToLower(k) {
+			return &ExecError{Code: "42000", Pos: s.Pos(),
+				Message: fmt.Sprintf("unrecognized parameter %q", k)}
+		}
+	}
+	if s.PartitionBy != nil && len(s.With) > 0 {
+		return &ExecError{Code: "0A000", Pos: s.Pos(),
+			Message: "cannot specify storage parameters for a partitioned table",
+			Detail:  "This operation is not supported for partitioned tables.",
+			Hint:    "Specify storage parameters for its leaf partitions instead."}
+	}
+	childFillfactor := 0
+	if v, ok := s.With["fillfactor"]; ok {
+		ff, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"fillfactor\": %s", v)}
+		}
+		if ff < 10 || ff > 100 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", ff),
+				Detail:  "Valid values are between \"10\" and \"100\"."}
+		}
+		childFillfactor = ff
+	}
 	// Inherit columns from parent (partition children use parent's schema).
 	cols := make([]catalog.Column, len(parent.Columns))
 	copy(cols, parent.Columns)
@@ -1915,6 +1947,9 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// Set persistence flags on the child.
 	tbl.Unlogged = s.Unlogged
 	tbl.Temp = s.Temporary
+	// Persist the leaf partition's fillfactor so pg_class.reloptions surfaces it
+	// and pg_dump re-emits `WITH (fillfactor='N')`. DU-002 slice 191.
+	tbl.Fillfactor = childFillfactor
 	// Set partition metadata on the child.
 	tbl.PartitionParentOID = parent.OID
 	// Use the child's own PARTITION BY clause when present (e.g. nested

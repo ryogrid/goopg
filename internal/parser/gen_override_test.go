@@ -31,3 +31,40 @@ func TestPartitionColGeneratedExprParsed(t *testing.T) {
 		t.Errorf("expected Expr='a + b + 1000', got %q", cg.Expr)
 	}
 }
+
+// TestPartitionChildWithStorageParams covers DU-002 slice 191: a leaf partition
+// child may carry a WITH (storage params) clause after FOR VALUES. The parser
+// previously stopped at FOR VALUES and rejected the trailing WITH.
+func TestPartitionChildWithStorageParams(t *testing.T) {
+	sql := `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) WITH (fillfactor=70)`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if ct.PartitionOf == nil {
+		t.Fatal("no PartitionOf")
+	}
+	if got := ct.With["fillfactor"]; got != "70" {
+		t.Errorf("expected With[fillfactor]=70, got %q (With=%v)", got, ct.With)
+	}
+}
+
+// TestPartitionChildWithStorageParamsAfterSubPartitionBy ensures the WITH clause
+// is parsed even when the child is itself sub-partitioned (the executor rejects
+// storage params on a partitioned child, but the parse must succeed so the
+// executor can emit the proper error).
+func TestPartitionChildWithStorageParamsAfterSubPartitionBy(t *testing.T) {
+	sql := `CREATE TABLE mid PARTITION OF top FOR VALUES IN (1) PARTITION BY RANGE (id) WITH (fillfactor=70)`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if ct.PartitionBy == nil {
+		t.Fatal("expected PartitionBy on sub-partitioned child")
+	}
+	if got := ct.With["fillfactor"]; got != "70" {
+		t.Errorf("expected With[fillfactor]=70, got %q (With=%v)", got, ct.With)
+	}
+}

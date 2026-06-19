@@ -5523,6 +5523,36 @@ scrubs that exact partition-attach line before scanning, keeping the domain-only
 intent precise (sibling-paths: the new fixture and the old assertion were updated
 together).
 
+### Slice 191 — per-leaf-partition storage parameters (`WITH (fillfactor=N)`)
+
+PG permits storage parameters on a leaf partition (it is a concrete heap) and
+pg_dump re-emits them on the leaf's own `CREATE TABLE` as `WITH (fillfactor='N')`.
+goopg persisted the `WITH (fillfactor=N)` option only on the **non-partition**
+`CREATE TABLE` path (slice 54: validate → bounds-check → `tbl.Fillfactor`, surfaced
+through `pg_class.reloptions` by `catalog.go`'s `{fillfactor=N}` cell). The
+partition-child path took an early return — both in the parser and the executor:
+
+- **Parser** (`internal/parser/ddl.go`): after `FOR VALUES …` (and any nested
+  `PARTITION BY …`) the partition-child arm returned without scanning a trailing
+  `WITH` clause, so `CREATE TABLE leaf PARTITION OF p FOR VALUES IN (1) WITH
+  (fillfactor=70)` failed with a syntax error at `WITH`. Added a `WITH`-clause
+  parse (reusing `parseWithOptions`) between the `PARTITION BY` and `ON COMMIT`
+  handling, populating `stmt.With`.
+- **Executor** (`internal/executor/operators_ddl.go`): `execCreatePartitionChild`
+  never read `s.With`, so even a parsed option was dropped. Mirrored the main
+  path's validation: reject mixed-case (quoted) parameter names (42000); reject
+  any storage params when the child is **itself** partitioned (`PARTITION BY …`)
+  with the same 0A000 "cannot specify storage parameters for a partitioned table"
+  error PG raises; bounds-check `fillfactor` to 10–100 (22023); and persist it via
+  `tbl.Fillfactor`, which the shared `pg_class.reloptions` cell then surfaces.
+
+Both twins were updated in one slice (parser↔executor sibling paths). The fixture
+adds a `pfo` LIST parent with an option-bearing leaf (`pfo_1 … WITH
+(fillfactor=70)`) and an option-less sibling (`pfo_2`); the assertion scopes the
+`WITH (fillfactor='70')` match to the `pfo_1` `CREATE TABLE` statement (a bare
+substring match would also catch slice 54's `opt` table) and verifies `pfo_2`
+carries no `WITH` clause.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

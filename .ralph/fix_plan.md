@@ -4196,6 +4196,27 @@ object support.
         clean; `go vet ./internal/testport/` clean; `TestPort_PgDumpConnectionSetup` PASS; pgbench
         pre-commit smoke on commit. **Next:** composite types (`CREATE TYPE AS`; `pg_class.reltype`
         hardcoded 0 — larger); or partition `WITH (...)`-on-child / `TABLESPACE` clauses.
+      - **PROGRESS 2026-06-19 (loop #4):** **DU-002 slice 191 LANDED — per-leaf-partition storage
+        parameters (`WITH (fillfactor=N)`).** PG allows storage params on a leaf partition and pg_dump
+        re-emits them on the leaf's own `CREATE TABLE` as `WITH (fillfactor='N')`. goopg persisted the
+        option only on the non-partition `CREATE TABLE` path (slice 54); the partition-child path
+        early-returned in BOTH twins, so the option was silently dropped. (a) Parser
+        (`internal/parser/ddl.go`): the partition-child arm returned after `FOR VALUES …`/`PARTITION
+        BY …` without scanning a trailing `WITH`, so the statement failed with a syntax error at
+        `WITH`; added a `WITH`-clause parse (`parseWithOptions`) populating `stmt.With`. (b) Executor
+        (`execCreatePartitionChild`): never read `s.With`; mirrored the main path — reject mixed-case
+        param names (42000), reject storage params on a sub-partitioned child (0A000, same msg PG
+        raises), bounds-check fillfactor 10–100 (22023), persist via `tbl.Fillfactor` (surfaced by the
+        shared `pg_class.reloptions` cell). Fixture: `pfo` LIST parent + option-bearing leaf
+        `pfo_1 … WITH (fillfactor=70)` + option-less sibling `pfo_2`; assertion scopes the
+        `WITH (fillfactor='70')` match to the `pfo_1` statement (bare match would also catch slice 54's
+        `opt` table) and checks `pfo_2` has no `WITH`. Sibling paths (parser↔executor) updated in one
+        slice. Files: `internal/parser/ddl.go`, `internal/parser/gen_override_test.go` (2 unit tests),
+        `internal/executor/operators_ddl.go`, `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 191). Gates: gofmt OK; `go build ./...`
+        clean; parser + executor + `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on
+        commit. **Next:** composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger);
+        or partition-child `TABLESPACE` clause round-trip.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

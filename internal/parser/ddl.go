@@ -1720,6 +1720,22 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
 			}
 		}
+		// Optional WITH (storage params) on a partition child, e.g.
+		// `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) WITH (fillfactor=70)`.
+		// PG allows storage parameters on a leaf partition; the executor persists
+		// them (pg_class.reloptions) so pg_dump round-trips the option. The clause
+		// follows FOR VALUES (and any PARTITION BY). M0110-0001 (DU-002 slice 191).
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWith {
+			p.advance() // WITH
+			opts, werr := p.parseWithOptions()
+			if werr != nil {
+				return nil, werr
+			}
+			stmt.With = opts
+			if v, ok := opts["oids"]; ok {
+				stmt.WithOIDS = !strings.EqualFold(v, "false") && v != "0"
+			}
+		}
 		// ON COMMIT clause may follow FOR VALUES ... in partition tables.
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn {
 			p.advance()

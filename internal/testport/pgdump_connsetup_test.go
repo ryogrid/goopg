@@ -779,6 +779,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create DEFAULT partition pdef_def: %v", err)
 	}
 
+	// Slice 191: per-leaf-partition storage parameters. PG allows `WITH
+	// (fillfactor=N)` on a leaf partition (it is a concrete heap), and pg_dump
+	// re-emits it on the leaf's own CREATE TABLE as `WITH (fillfactor='N')`.
+	// goopg persisted fillfactor only on the non-partition CREATE TABLE path
+	// (slice 54); execCreatePartitionChild took an early-return branch that never
+	// extracted/persisted it, so pg_class.reloptions read NULL for the leaf and
+	// the option was silently dropped from the dump. `pfo_1` is a LIST leaf of
+	// `pfo` carrying fillfactor=70; the sibling `pfo_2` is left at default to keep
+	// the assertion specific to the option-bearing leaf.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pfo (k integer, v text) PARTITION BY LIST (k)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pfo: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pfo_1 PARTITION OF public.pfo FOR VALUES IN (1) WITH (fillfactor=70)"); err != nil {
+		t.Fatalf("create LIST leaf partition pfo_1 with fillfactor: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pfo_2 PARTITION OF public.pfo FOR VALUES IN (2)"); err != nil {
+		t.Fatalf("create LIST leaf partition pfo_2: %v", err)
+	}
+
 	// Slice 170: legacy table inheritance (CREATE TABLE child (...) INHERITS
 	// (parent)) must round-trip. goopg merged the parent's columns into the child
 	// but (a) emitted no pg_inherits row for the inheritance edge (only partition
@@ -2338,6 +2357,41 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if strings.Contains(res.Stdout, "ATTACH PARTITION public.pdef_def FOR VALUES") {
 			t.Errorf("pg_dump emitted a spurious FOR VALUES on the DEFAULT partition\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 191 closed (asserted):** per-leaf-partition storage parameters.
+		// goopg persisted `WITH (fillfactor=N)` only on the non-partition CREATE
+		// TABLE path; execCreatePartitionChild never extracted it, so the leaf's
+		// pg_class.reloptions read NULL and the option vanished from the dump. The
+		// fix extracts/validates/persists the fillfactor on the leaf. pg_dump emits
+		// the reloptions on the leaf's own CREATE TABLE as `WITH (fillfactor='70')`
+		// (a plain string match would also catch slice 54's `opt` table, so scope
+		// the check to the pfo_1 statement) and the option-less sibling pfo_2 must
+		// carry no WITH clause.
+		if pfoStart := strings.Index(res.Stdout, "CREATE TABLE public.pfo_1 ("); pfoStart >= 0 {
+			rest := res.Stdout[pfoStart:]
+			stmtEnd := strings.Index(rest, ";")
+			if stmtEnd < 0 {
+				stmtEnd = len(rest)
+			}
+			pfoStmt := rest[:stmtEnd]
+			if !strings.Contains(pfoStmt, "WITH (fillfactor='70')") {
+				t.Errorf("pg_dump dropped the leaf partition's fillfactor; missing %q in pfo_1 CREATE TABLE\n  pfo_1 stmt=%q\n  full stdout=%q", "WITH (fillfactor='70')", pfoStmt, res.Stdout)
+			}
+		} else {
+			t.Errorf("pg_dump did not emit CREATE TABLE for leaf partition pfo_1\n  full stdout=%q", res.Stdout)
+		}
+		if pfo2Start := strings.Index(res.Stdout, "CREATE TABLE public.pfo_2 ("); pfo2Start >= 0 {
+			rest := res.Stdout[pfo2Start:]
+			stmtEnd := strings.Index(rest, ";")
+			if stmtEnd < 0 {
+				stmtEnd = len(rest)
+			}
+			if strings.Contains(rest[:stmtEnd], "WITH (") {
+				t.Errorf("pg_dump emitted a spurious WITH clause on the option-less leaf partition pfo_2\n  full stdout=%q", res.Stdout)
+			}
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pfo_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped/mangled the fillfactor leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pfo_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 170 closed (asserted):** legacy table inheritance. goopg emitted
 		// no pg_inherits row for the INHERITS edge and left the inherited columns
