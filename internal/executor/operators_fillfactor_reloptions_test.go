@@ -1710,6 +1710,92 @@ func TestAutovacuumVacuumCostLimitOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+// TestUserCatalogTableSurfacesInPgClassReloptions verifies that a `WITH
+// (user_catalog_table=BOOL)` storage parameter is persisted on the table,
+// surfaces in pg_class.reloptions as `user_catalog_table=true|false`, and that
+// an unset table reports no reloption. The boolean value carries no
+// zero-detectable default, so presence is tracked by a flag. pg_dump renders
+// the array back as `WITH (user_catalog_table='true')`. DU-002 slice 214.
+func TestUserCatalogTableSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE uct (id integer PRIMARY KEY) WITH (fillfactor=70, user_catalog_table=true)`); err != nil {
+		t.Fatalf("CREATE TABLE uct: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE uctf (id integer PRIMARY KEY) WITH (user_catalog_table=off)`); err != nil {
+		t.Fatalf("CREATE TABLE uctf: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE uctplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE uctplain: %v", err)
+	}
+
+	uctTbl, ok := cat.LookupTable(parser.ObjectName{Name: "uct"})
+	if !ok {
+		t.Fatal("uct table not found")
+	}
+	if !uctTbl.UserCatalogTable || !uctTbl.UserCatalogTableSet {
+		t.Errorf("uct value=%v set=%v, want true set=true", uctTbl.UserCatalogTable, uctTbl.UserCatalogTableSet)
+	}
+	uctfTbl, ok := cat.LookupTable(parser.ObjectName{Name: "uctf"})
+	if !ok {
+		t.Fatal("uctf table not found")
+	}
+	if uctfTbl.UserCatalogTable || !uctfTbl.UserCatalogTableSet {
+		t.Errorf("uctf value=%v set=%v, want false set=true", uctfTbl.UserCatalogTable, uctfTbl.UserCatalogTableSet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "uctplain"})
+	if !ok {
+		t.Fatal("uctplain table not found")
+	}
+	if plainTbl.UserCatalogTableSet {
+		t.Errorf("uctplain set=%v, want false (unset)", plainTbl.UserCatalogTableSet)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "uct" || r[1] == "uctf" || r[1] == "uctplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["uct"] != "{fillfactor=70,user_catalog_table=true}" {
+		t.Errorf("pg_class.reloptions for uct = %q, want %q", got["uct"], "{fillfactor=70,user_catalog_table=true}")
+	}
+	if got["uctf"] != "{user_catalog_table=false}" {
+		t.Errorf("pg_class.reloptions for uctf = %q, want %q", got["uctf"], "{user_catalog_table=false}")
+	}
+	if got["uctplain"] != "" {
+		t.Errorf("pg_class.reloptions for uctplain = %q, want \"\" (NULL)", got["uctplain"])
+	}
+}
+
+// TestUserCatalogTableInvalidValueRejected verifies CREATE TABLE rejects a
+// non-boolean user_catalog_table value with PG's 22023 error. DU-002 slice 214.
+func TestUserCatalogTableInvalidValueRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, v := range []string{"maybe", "2", "tru3"} {
+		err := runDDL(t, ctx, `CREATE TABLE uctbad`+strconv.Itoa(i)+` (id integer) WITH (user_catalog_table=`+v+`)`)
+		if err == nil {
+			t.Errorf("user_catalog_table=%s: expected an invalid-value error, got nil", v)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("user_catalog_table=%s: error type = %T, want *ExecError", v, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("user_catalog_table=%s: error code = %q, want 22023", v, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.

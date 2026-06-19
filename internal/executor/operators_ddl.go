@@ -1410,6 +1410,25 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		autovacuumVacuumCostLimit = avcl
 		autovacuumVacuumCostLimitSet = true
 	}
+	// Extract and parse the user_catalog_table storage parameter
+	// (RELOPT_TYPE_BOOL, RELOPT_KIND_HEAP, default false; reloptions.c:1909).
+	// PG accepts the usual boolean spellings via parse_bool; a separate `set`
+	// flag records whether the option was present (the slice-196 autovacuum_enabled
+	// boolean path). The option marks a heap as a catalog table for
+	// logical-decoding purposes; goopg has no logical decoding, so the value is
+	// purely catalog/dump state that round-trips through pg_class.reloptions /
+	// pg_dump's `WITH (user_catalog_table='true')`. M0110-0001 (DU-002 slice 214).
+	userCatalogTable := false
+	userCatalogTableSet := false
+	if v, ok := s.With["user_catalog_table"]; ok {
+		b, parsed := parseReloptionBool(strings.TrimSpace(v))
+		if !parsed {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for boolean option \"user_catalog_table\": %s", v)}
+		}
+		userCatalogTable = b
+		userCatalogTableSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1499,6 +1518,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.AutovacuumMultixactFreezeTableAgeSet = autovacuumMultixactFreezeTableAgeSet
 	tbl.AutovacuumVacuumCostLimit = autovacuumVacuumCostLimit
 	tbl.AutovacuumVacuumCostLimitSet = autovacuumVacuumCostLimitSet
+	tbl.UserCatalogTable = userCatalogTable
+	tbl.UserCatalogTableSet = userCatalogTableSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

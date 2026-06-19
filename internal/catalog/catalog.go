@@ -667,6 +667,20 @@ type Table struct {
 	// (DU-002 slice 213).
 	AutovacuumVacuumCostLimit    int
 	AutovacuumVacuumCostLimitSet bool
+
+	// UserCatalogTable stores the table's `WITH (user_catalog_table=BOOL)`
+	// storage parameter. PG's reloption type is RELOPT_TYPE_BOOL,
+	// RELOPT_KIND_HEAP, default false (reloptions.c:1909). Like
+	// autovacuum_enabled the boolean value carries no default that a zero check
+	// could detect, so UserCatalogTableSet guards whether the option was
+	// specified (the slice-196 boolean path). When set, pg_class.reloptions
+	// gains the text[] element `user_catalog_table=true|false`, which pg_dump
+	// renders back as `WITH (user_catalog_table='true'|'false')`. The option
+	// marks a heap as a catalog table for logical-decoding tuple-visibility
+	// purposes; goopg has no logical decoding, so the value is catalog/dump-only
+	// (advisory; runtime unaffected). M0110-0001 (DU-002 slice 214).
+	UserCatalogTable    bool
+	UserCatalogTableSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2446,6 +2460,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.AutovacuumVacuumCostLimitSet {
 				relopts = append(relopts, "autovacuum_vacuum_cost_limit="+strconv.Itoa(t.AutovacuumVacuumCostLimit))
+			}
+			if t.UserCatalogTableSet {
+				relopts = append(relopts, "user_catalog_table="+strconv.FormatBool(t.UserCatalogTable))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

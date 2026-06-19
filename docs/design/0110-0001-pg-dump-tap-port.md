@@ -6164,6 +6164,27 @@ Engine guards: `TestAutovacuumVacuumCostLimitSurfacesInPgClassReloptions` (combi
 fixture adds `optavcl (… WITH (autovacuum_vacuum_cost_limit=2500))` on its own table; the
 assertion confirms the dump carries `WITH (autovacuum_vacuum_cost_limit='2500')`.
 
+### Slice 214 — boolean `user_catalog_table` reloption round-trip
+
+Adds the `user_catalog_table` storage parameter, reusing the slice-196 `autovacuum_enabled`
+boolean path. `user_catalog_table` is `RELOPT_TYPE_BOOL` with `RELOPT_KIND_HEAP` and a default of
+**false** (`reloptions.c:1909`; "Declare a table as an additional catalog table for the purpose of
+logical replication"). Because the boolean value carries no zero-detectable default, a
+`UserCatalogTableSet` flag records presence. The executor parses with `parseReloptionBool`
+(PG's `parse_bool` spellings: true/false, on/off, yes/no, 1/0, t/f, y/n, case-insensitive
+prefixes), rejecting non-boolean values with `22023`. It persists
+`catalog.Table.UserCatalogTable` (a `bool`); the pg_class virtual view appends
+`user_catalog_table=true|false` after `autovacuum_vacuum_cost_limit`; pg_dump renders
+`WITH (user_catalog_table='true'|'false')`. The option marks a heap as an additional catalog
+table for logical-decoding tuple visibility; goopg has no logical decoding, so the value is
+advisory catalog/dump-only, base-table-only — same as the sibling reloption slices.
+
+Engine guards: `TestUserCatalogTableSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,user_catalog_table=true}`; `off` → `{user_catalog_table=false}`; plain table →
+no reloptions) and `TestUserCatalogTableInvalidValueRejected` (`maybe`/`2`/`tru3` → 22023). The
+pg_dump fixture adds `optuct (… WITH (user_catalog_table=true))` on its own table; the assertion
+confirms the dump carries `WITH (user_catalog_table='true')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -4698,6 +4698,24 @@ object support.
         PASS; pgbench pre-commit smoke on commit. **Next:** `user_catalog_table` bool; then `toast.*` namespace;
         or composite types (`CREATE TYPE AS`).
 
+      - **PROGRESS 2026-06-19 (loop #29):** **DU-002 slice 214 LANDED — boolean `user_catalog_table` storage
+        parameter round-trips through pg_dump.** Reuses the slice-196 `autovacuum_enabled` boolean path.
+        `user_catalog_table` is `RELOPT_TYPE_BOOL`, `RELOPT_KIND_HEAP`, default false (`reloptions.c:1909`). A
+        `UserCatalogTableSet` flag records presence (boolean carries no zero-detectable default). Executor parses
+        via `parseReloptionBool` (PG `parse_bool` spellings), rejecting non-boolean → `22023`. Persist
+        `catalog.Table.UserCatalogTable` (bool); pg_class virtual view appends `user_catalog_table=true|false`
+        after `autovacuum_vacuum_cost_limit`; pg_dump renders `WITH (user_catalog_table='true'|'false')`. Marks a
+        heap as an additional catalog table for logical decoding; goopg has none, so advisory catalog/dump-only;
+        base-table-only. Files: `internal/catalog/catalog.go` (`Table.UserCatalogTable`/`…Set` + render),
+        `internal/executor/operators_ddl.go` (extract/parse + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestUserCatalogTableSurfacesInPgClassReloptions` + `TestUserCatalogTableInvalidValueRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optuct` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 214). No parser change needed. Gates: gofmt OK;
+        `go build ./internal/...` clean; catalog/executor reloption tests PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** `toast.*` namespace reloptions; or composite types
+        (`CREATE TYPE AS`; larger, pg_class.reltype hardcoded 0).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).
