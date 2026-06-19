@@ -5730,6 +5730,25 @@ object support.
         last column-override form; confirmed working on goopg as `b integer NOT NULL`), or a local constraint on a legacy
         `INHERITS` child.
 
+      - **PROGRESS 2026-06-20 (loop #33):** **DU-002 slice 266 LANDED — a CHILD-ONLY `NOT NULL` override on a partition
+        leaf round-trips through pg_dump** (the LAST of the three per-column override forms, after slice 264's CHECK and
+        slice 265's DEFAULT). `pnnl_1` is a `LIST` leaf of `pnnl (a integer, b integer)` carrying `(b NOT NULL)` in its
+        `PARTITION OF` column-override list. Like the DEFAULT, a per-column `NOT NULL` re-attaches inside the leaf's
+        printed column list as the inline decoration `b integer NOT NULL` — NOT a separate `CONSTRAINT` clause. (In PG18 a
+        `NOT NULL` is also a named `pg_constraint` row `contype='n'`, but pg_dump still emits the inline decoration for a
+        partition leaf.) The `NOT NULL` is local to the leaf: `execCreatePartitionChild` records it on
+        `catalog.Column.NotNull` and pg_dump's per-column renderer appends ` NOT NULL` inline. Real pg_dump 18.3 emits the
+        leaf body `a integer, b integer NOT NULL` + `ATTACH PARTITION public.pnnl_1 FOR VALUES IN (1)` — verified
+        byte-identical vs PG 18.3 (probed this loop) AND a fresh goopg server (the test runs pg_dump against goopg).
+        **No production code changed** — the column-override `NOT NULL` handling + inline pg_dump column decoration
+        already existed; this slice proves and guards that inline-NOT-NULL leaf path. **pg_dump fixture**
+        (`pgdump_connsetup_test.go`): `pnnl`/`pnnl_1` + a block-scoped assert on the leaf body (`a integer`,
+        `b integer NOT NULL`) and the ATTACH bound. Guard: `TestPort_PgDumpConnectionSetup` PASS (3.41s). gofmt +
+        `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 266. **Next (slice 267+):**
+        all three per-column override forms now covered for a partition leaf — move to `INHERITS`-tree dump fidelity
+        beyond the single child (local constraint/DEFAULT on a legacy non-partition inheritance child, where
+        `attislocal`/`conislocal` interplay differs since `ispartition` no longer forces every column to print).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

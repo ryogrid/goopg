@@ -1360,6 +1360,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pdfl_1 with child-only DEFAULT: %v", err)
 	}
 
+	// Slice 266: child-only NOT NULL override on a partition leaf — the LAST
+	// per-column override form (after CHECK in slice 264 and DEFAULT in slice
+	// 265). The leaf `pnnl_1` of `pnnl (a integer, b integer)` carries `(b NOT
+	// NULL)` in its PARTITION OF column-override list. As with the DEFAULT case,
+	// shouldPrintColumn (pg_dump.c:9970) returns true for every partition column
+	// (`tbinfo->ispartition`), so the leaf body is NOT column-less: real pg_dump
+	// 18.3 emits the full body `a integer, b integer NOT NULL` followed by the
+	// LIST-bound ATTACH (verified byte-identical vs PG 18.3 this loop). The NOT
+	// NULL is LOCAL to the leaf: execCreatePartitionChild records it on the
+	// leaf's catalog.Column.NotNull, and pg_dump's per-column attribute renderer
+	// appends ` NOT NULL` inline. In PG18 a NOT NULL is also a named pg_constraint
+	// (contype='n'), but for a partition leaf pg_dump still emits the inline
+	// `NOT NULL` decoration on the column (not a separate CONSTRAINT clause), so
+	// this guards the inline-NOT-NULL leaf path. No production change —
+	// execCreatePartitionChild's column-override NOT NULL handling and the inline
+	// pg_dump column decoration already exist.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pnnl (a integer, b integer) PARTITION BY LIST (a)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pnnl: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pnnl_1 PARTITION OF public.pnnl (b NOT NULL) FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pnnl_1 with child-only NOT NULL: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -3695,6 +3718,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pdfl_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pdfl_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 266 (asserted):** child-only NOT NULL override on a partition
+		// leaf — the LAST per-column override form. The leaf pnnl_1 prints its full
+		// inherited column list (shouldPrintColumn is true for every partition
+		// column); the per-column override NOT NULL must re-attach inside that list
+		// as the inline decoration `b integer NOT NULL`, with the inherited
+		// `a integer` kept and no spurious NOT NULL on it. A regression dropping the
+		// leaf's local NOT NULL (or rendering it as a separate CONSTRAINT clause
+		// instead of the inline column decoration) would diverge from PG 18.3 and
+		// could lose the constraint on restore.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pnnl_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "a integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited column; want %q in pnnl_1 block\n  block=%q", "a integer", block)
+			}
+			if !strings.Contains(block, "b integer NOT NULL") {
+				t.Errorf("pg_dump dropped/corrupted the child-only NOT NULL; want %q in pnnl_1 block\n  block=%q", "b integer NOT NULL", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pnnl_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pnnl_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pnnl_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged

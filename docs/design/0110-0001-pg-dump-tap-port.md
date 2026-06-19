@@ -7735,9 +7735,29 @@ No production code changed — `execCreatePartitionChild`'s column-override `DEF
 
 Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
 
-> **Next (slice 266+):** a child-only `NOT NULL` override on a partition leaf (the last column-override form; real
-> pg_dump 18.3 also prints it inline as `b integer NOT NULL` — confirmed working on goopg), or `INHERITS`-tree dump
-> fidelity beyond the single child (local constraint on a legacy inheritance child).
+### Slice 266 — child-only `NOT NULL` override on a partition leaf
+
+The last of the three per-column override forms (after slice 264's table-level CHECK and slice 265's column DEFAULT):
+`pnnl_1` is a `LIST` leaf of `pnnl (a integer, b integer)` carrying `(b NOT NULL)` in its `PARTITION OF`
+column-override list. Like the DEFAULT, a per-column `NOT NULL` re-attaches to its column **inside** the leaf's printed
+column list — as the inline decoration `b integer NOT NULL`, not a separate `CONSTRAINT` clause.
+
+The `NOT NULL` is local to the leaf: `execCreatePartitionChild` records it on the leaf's `catalog.Column.NotNull`, and
+pg_dump's per-column attribute renderer appends ` NOT NULL` inline. In PG18 a `NOT NULL` is *also* a named
+`pg_constraint` row (`contype='n'`), but for a partition leaf pg_dump still emits the inline `NOT NULL` decoration on the
+column rather than a separate constraint item — real pg_dump 18.3 emits the leaf body `a integer, b integer NOT NULL`
+followed by `ATTACH PARTITION public.pnnl_1 FOR VALUES IN (1)` (verified byte-identical vs PG 18.3 and a fresh goopg
+server this loop). This slice proves and guards that inline-NOT-NULL leaf path.
+
+No production code changed — `execCreatePartitionChild`'s column-override `NOT NULL` handling and the inline pg_dump
+column decoration already existed.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+> **Next (slice 267+):** the three per-column override forms (CHECK, DEFAULT, NOT NULL) are now all covered for a
+> partition leaf. Move to `INHERITS`-tree dump fidelity beyond the single child — e.g. a local constraint or DEFAULT on a
+> legacy (non-partition) inheritance child, where `attislocal`/`conislocal` interplay differs from a partition leaf
+> (`ispartition` no longer forces every column to print).
 
 ## Deferred (002–010) — catalog surface estimate
 
