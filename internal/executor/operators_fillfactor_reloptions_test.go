@@ -2785,3 +2785,53 @@ func TestToastAutovacuumEnabledInvalidValueRejected(t *testing.T) {
 		}
 	}
 }
+
+// TestToastVacuumMaxEagerFreezeFailureRateSurfacesInToastReloptions verifies that a
+// `WITH (toast.vacuum_max_eager_freeze_failure_rate=F)` storage parameter — the 17th
+// RELOPT_KIND_TOAST option (RELOPT_TYPE_REAL, reloptions.c:431) — is stored on the
+// table's ToastReloptions (without the `toast.` prefix). Its valid range is 0.0–1.0
+// (a page fraction), NOT the 0.0–100.0 used by the autovacuum-scale reals, so the
+// bounds check is distinct and worth guarding. DU-002 slice 240.
+func TestToastVacuumMaxEagerFreezeFailureRateSurfacesInToastReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE toastve (id integer PRIMARY KEY) WITH (toast.vacuum_max_eager_freeze_failure_rate=0.5)`); err != nil {
+		t.Fatalf("CREATE TABLE toastve: %v", err)
+	}
+	veTbl, ok := cat.LookupTable(parser.ObjectName{Name: "toastve"})
+	if !ok {
+		t.Fatal("toastve table not found")
+	}
+	if len(veTbl.ToastReloptions) != 1 || veTbl.ToastReloptions[0] != "vacuum_max_eager_freeze_failure_rate=0.5" {
+		t.Errorf("toastve.ToastReloptions = %v, want [vacuum_max_eager_freeze_failure_rate=0.5]", veTbl.ToastReloptions)
+	}
+	// The toast.* option must not leak onto the parent table's own fillfactor-style
+	// reloption fields (it lives on the synthesized TOAST relation, asserted end-to-end
+	// by TestToastAutovacuumEnabledSurfacesInPgClassToastRow / the testport fixture).
+	if veTbl.Fillfactor != 0 {
+		t.Errorf("toastve.Fillfactor = %d, want 0 (no parent reloption set)", veTbl.Fillfactor)
+	}
+}
+
+// TestToastVacuumMaxEagerFreezeFailureRateOutOfBoundsRejected verifies CREATE TABLE
+// rejects an above-1.0, NaN/±Inf, or non-numeric toast.vacuum_max_eager_freeze_failure_rate
+// with PG's 22023 error. The 1.5 case confirms the 0.0–1.0 (not 0.0–100.0) range; NaN/Inf
+// confirm the `!(f>=0 && f<=1)` form rejects what ParseFloat would otherwise accept.
+// (Negatives are a parser-level syntax error, not a reachable 22023 case.) DU-002 slice 240.
+func TestToastVacuumMaxEagerFreezeFailureRateOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, v := range []string{"1.5", "2", "NaN", "Inf", "abc"} {
+		stmt := "CREATE TABLE tvebad" + strconv.Itoa(i) + " (id integer) WITH (toast.vacuum_max_eager_freeze_failure_rate=" + v + ")"
+		err := runDDL(t, ctx, stmt)
+		if err == nil {
+			t.Errorf("toast.vacuum_max_eager_freeze_failure_rate=%s: expected an error, got nil", v)
+			continue
+		}
+		if ee, ok := err.(*ExecError); !ok || ee.Code != "22023" {
+			t.Errorf("toast.vacuum_max_eager_freeze_failure_rate=%s: want 22023 ExecError, got %v", v, err)
+		}
+	}
+}

@@ -1844,6 +1844,31 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		toastReloptions = append(toastReloptions, "autovacuum_vacuum_insert_scale_factor="+strconv.FormatFloat(avisf, 'g', -1, 64))
 	}
+	// `toast.vacuum_max_eager_freeze_failure_rate` — a RELOPT_KIND_TOAST *real*
+	// option, reusing the parent-table float reloption path (slice 216). PG's
+	// reloption type is RELOPT_TYPE_REAL with range 0.0–1.0 (NOT 0.0–100.0 — it is a
+	// fraction of pages) and a default of -1 (= unset / use the GUC);
+	// vacuum_max_eager_freeze_failure_rate shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST
+	// (reloptions.c:431), so PG accepts the `toast.` prefix and stores it (no prefix)
+	// on the TOAST relation's reloptions. The `!(f >= 0 && f <= 1)` form also rejects
+	// NaN/±Inf. goopg has no eager freezing, so the value is purely catalog/dump state
+	// that round-trips through pg_dump's
+	// `WITH (toast.vacuum_max_eager_freeze_failure_rate='F')`. The earlier working-set
+	// note that the toast.* surface was "complete" at slice 239 was wrong: PG has 18
+	// RELOPT_KIND_TOAST options, and this is the 17th. M0110-0001 (DU-002 slice 240).
+	if v, ok := s.With["toast.vacuum_max_eager_freeze_failure_rate"]; ok {
+		vmefr, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"vacuum_max_eager_freeze_failure_rate\": %s", v)}
+		}
+		if !(vmefr >= 0.0 && vmefr <= 1.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"vacuum_max_eager_freeze_failure_rate\"", strconv.FormatFloat(vmefr, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"1.000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "vacuum_max_eager_freeze_failure_rate="+strconv.FormatFloat(vmefr, 'g', -1, 64))
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}

@@ -6914,7 +6914,38 @@ On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) o
 Engine guard: the `optoast` fixture now carries all sixteen options; the assertion confirms the combined
 sixteen-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
 
-**Next:** the `toast.*` reloption surface is complete. Remaining pg_dump work moves to composite types
+**Correction (slice 240):** the claim that the `toast.*` surface was complete here was **wrong** —
+PG has **18** `RELOPT_KIND_TOAST` options, not 16. `grep -n RELOPT_KIND_TOAST reloptions.c` lists 18
+option entries; the two missed were `vacuum_max_eager_freeze_failure_rate` (real, `reloptions.c:431`)
+and `vacuum_index_cleanup` (enum, `reloptions.c:525`), both `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`.
+Slice 240 lands the first; slice 241 will land the enum.
+
+### Slice 240 — `RELOPT_KIND_TOAST` eager-freeze *real* reloption (`toast.vacuum_max_eager_freeze_failure_rate`)
+
+Adds `toast.vacuum_max_eager_freeze_failure_rate`, the **17th** of PG's 18 `RELOPT_KIND_TOAST` options,
+extending the TOAST reloptions array to seventeen elements. `vacuum_max_eager_freeze_failure_rate` is
+`RELOPT_TYPE_REAL`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:431`), with range **`0.0–1.0`**
+(a fraction of pages — NOT the `0.0–100.0` range the autovacuum-scale reals use) and default `-1`
+(= unset / use the GUC), so PG accepts the `toast.` prefix and stores it (without prefix) on the TOAST
+relation's `pg_class.reloptions`. Reuses the parent heap arm (slice 216).
+
+- **Executor** (`operators_ddl.go`): one extra gather block after the slice-239
+  `toast.autovacuum_vacuum_insert_scale_factor` arm: `strconv.ParseFloat` + the `!(f >= 0 && f <= 1)`
+  bounds check (also rejects NaN/±Inf; non-float or out-of-range → 22023), appended to `toastReloptions`
+  as `vacuum_max_eager_freeze_failure_rate=<F>` (no prefix) via `strconv.FormatFloat(f, 'g', -1, 64)`.
+- **catalog** (`catalog.go`): no change — the existing `strings.Join` over `t.ToastReloptions` renders the
+  seventeen-element array ending in `…,autovacuum_vacuum_insert_scale_factor=1.5,vacuum_max_eager_freeze_failure_rate=0.5}`.
+
+On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) order:
+`WITH (..., toast.autovacuum_vacuum_insert_scale_factor='1.5', toast.vacuum_max_eager_freeze_failure_rate='0.5')`.
+
+Engine guards: the `optoast` fixture now carries all seventeen options and the assertion confirms the combined
+seventeen-element `WITH` clause (`TestPort_PgDumpConnectionSetup` PASS); two focused executor unit tests
+(`TestToastVacuumMaxEagerFreezeFailureRate{SurfacesInToastReloptions,OutOfBoundsRejected}`) pin the
+ToastReloptions storage and the `0.0–1.0` bounds (incl. the 1.5 / NaN / Inf rejections).
+
+**Next:** `toast.vacuum_index_cleanup` (enum, the 18th and last `RELOPT_KIND_TOAST` option, reusing the
+slice-217 heap enum path) → then the `toast.*` surface is genuinely complete → composite types
 (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — a larger structural task).
 
 ## Deferred (002–010) — catalog surface estimate

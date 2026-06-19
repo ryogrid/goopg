@@ -5226,6 +5226,26 @@ object support.
         `go build ./internal/...` clean; executor reloption + `TestPort_PgDumpConnectionSetup` PASS; pgbench
         pre-commit smoke on commit. **Next:** the `toast.*` surface is complete → composite types
         (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger structural task).
+      - **PROGRESS 2026-06-19 (loop #6):** **DU-002 slice 240 LANDED — `RELOPT_KIND_TOAST` eager-freeze
+        *real* reloption (`toast.vacuum_max_eager_freeze_failure_rate`) round-trips; seventeen-element TOAST
+        reloptions array. CORRECTS the slice-239 claim that the `toast.*` surface was complete — PG actually
+        has 18 `RELOPT_KIND_TOAST` options (`grep -c RELOPT_KIND_TOAST reloptions.c`), not 16.**
+        `vacuum_max_eager_freeze_failure_rate` is `RELOPT_TYPE_REAL`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`
+        (`reloptions.c:431`, range **`0.0–1.0`** — a page fraction, NOT the `0.0–100.0` autovacuum-scale range,
+        default `-1`). **Executor** (`operators_ddl.go`): one gather block after the slice-239
+        `toast.autovacuum_vacuum_insert_scale_factor` arm — `strconv.ParseFloat` + `!(f >= 0 && f <= 1)`
+        (rejects NaN/±Inf; non-float/out-of-range → 22023), appended as
+        `vacuum_max_eager_freeze_failure_rate=<F>` via `FormatFloat(f,'g',-1,64)`. **catalog**: NO change.
+        On dump-out → `WITH (..., toast.vacuum_max_eager_freeze_failure_rate='0.5')`. Files:
+        `internal/executor/operators_ddl.go` (toast real gather block),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (2 new unit tests:
+        `TestToastVacuumMaxEagerFreezeFailureRate{SurfacesInToastReloptions,OutOfBoundsRejected}`),
+        `internal/testport/pgdump_connsetup_test.go` (`optoast` fixture = 17 options + updated combined-WITH
+        assertion x2), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 240). Gates: gofmt OK;
+        `go build ./internal/...` clean; executor reloption unit tests + `TestPort_PgDumpConnectionSetup`
+        PASS (cgroup wrapper, -count=1, 3.46s); pgbench pre-commit smoke on commit. **Next:** the 18th and
+        last `RELOPT_KIND_TOAST` option `toast.vacuum_index_cleanup` (enum, reuses slice-217 heap enum path) →
+        then `toast.*` is genuinely complete → composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
