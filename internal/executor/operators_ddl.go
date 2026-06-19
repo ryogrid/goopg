@@ -8076,6 +8076,31 @@ func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
 }
 
+// syncCompositeTypeToCatalogHeap writes the pg_type rows for a composite type
+// (`CREATE TYPE x AS (...)`): the composite type itself (typtype='c') and its
+// auto-generated `_name` array type (typtype='b', typcategory='A'). Mirrors
+// syncEnumTypeToCatalogHeap so pg_dump's getTypes and catalog queries discover
+// the type. The implicit pg_class relation (relkind='c') that carries the field
+// columns in pg_attribute is a follow-up slice; typrelid is therefore left 0
+// for now. DU-002 slice 242.
+func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
+	if ct == nil || !catalogHeapSyncAvailable(ctx) {
+		return
+	}
+	typeRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.TypeRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForComposite(ct)); err != nil {
+		return
+	}
+	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForCompositeArray(ct)); err != nil {
+		return
+	}
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+}
+
 // syncDomainTypeToCatalogHeap writes a single pg_type row (typtype='d') for a
 // user-defined DOMAIN into the pg_type heap (OID 1247), mirroring
 // syncEnumTypeToCatalogHeap. pg_dump's getTypes reads pg_type to discover the
@@ -10177,7 +10202,11 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			for i, f := range s.CompositeFields {
 				fields[i] = catalog.CompositeField{Name: f.Name, ColType: f.ColType}
 			}
-			cat.RegisterCompositeTypeWithFields(s.Name, fields)
+			ct := cat.RegisterCompositeTypeWithFields(s.Name, fields)
+			// Write pg_type heap rows (typtype='c' + its `_name` array) so the
+			// composite type is visible to pg_dump's getTypes and catalog
+			// queries. DU-002 slice 242.
+			syncCompositeTypeToCatalogHeap(o.ctx, ct)
 		} else {
 			cat.RegisterCompositeType(s.Name)
 		}
@@ -10310,6 +10339,16 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 		enumErr := cat.DropEnum(n, s.Cascade)
 		if enumErr == nil {
 			continue // successfully dropped as enum
+		}
+		// Stamp the composite type's pg_type rows (the type + its `_name` array)
+		// before the in-memory delete, so the OID is still resolvable. DU-002
+		// slice 242 — mirrors the enum branch above.
+		if ct := cat.LookupCompositeType(n); ct != nil && catalogHeapSyncAvailable(o.ctx) {
+			if o.ctx.MaterializeWriterXID() == nil {
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
+				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			}
 		}
 		compErr := cat.DropCompositeType(n)
 		if compErr == nil {

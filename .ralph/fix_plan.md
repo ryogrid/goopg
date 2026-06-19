@@ -5264,6 +5264,36 @@ object support.
         `go build ./internal/...` clean; executor reloption unit tests + `TestPort_PgDumpConnectionSetup`
         PASS (cgroup wrapper, -count=1, 3.43s); pgbench pre-commit smoke on commit. **Next:** `toast.*`
         complete → composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger structural task).
+      - **PROGRESS 2026-06-19 (loop #8):** **DU-002 slice 242 LANDED — composite type `pg_type` heap row
+        (`CREATE TYPE x AS (...)`, typtype='c') — composite-type frontier opened.** `CREATE TYPE x AS
+        (a int, b text)` was already parsed (`parser.CreateTypeStmt.IsComposite`/`CompositeFields`) and
+        registered in-memory, but the type was INVISIBLE to `pg_type` (no heap row) — `pg_dump`'s getTypes
+        and any `pg_type` query could not see it. This slice synthesizes the two `pg_type` heap rows PG
+        allocates per composite type, mirroring the enum precedent (slices 89/90). **catalog**
+        (`catalog.go`): new `CompositeType{Name,OID,ArrayOID,Fields}` struct + `compositeTypes` map;
+        `RegisterCompositeTypeWithFields` now allocates TWO OIDs (type + auto `_name` array) from `nextOID`
+        once per type (re-registration stable, like `RegisterEnum`) and returns `*CompositeType`; new
+        `LookupCompositeType`; `DropCompositeType` clears the new + field maps. The implicit `pg_class`
+        relation (relkind='c') is NOT seeded yet → `typrelid` left 0. **Executor** (`operators_ddl.go`):
+        `execCreateType` composite branch calls new `syncCompositeTypeToCatalogHeap` (mirrors
+        `syncEnumTypeToCatalogHeap`) writing `buildUserPGTypeRowForComposite` (typtype='c', typcategory='C',
+        typlen=-1, typbyval=false, typalign='d', typstorage='x', typarray=ArrayOID) +
+        `buildUserPGTypeRowForCompositeArray` (typtype='b', typcategory='A', typelem=composite OID);
+        `execDropType` stamps xmax on both rows before in-memory delete (parallel to enum branch). Builders
+        in `pg18_user_catalog_rows.go` use the 32-col `pgTypeColumnsPG18` layout. Files:
+        `internal/catalog/catalog.go` (struct/map/Register/Lookup/Drop),
+        `internal/executor/operators_ddl.go` (sync + create/drop wiring),
+        `internal/executor/pg18_user_catalog_rows.go` (2 row builders),
+        `internal/executor/pg18_user_catalog_rows_test.go` (`TestUserPGTypeRowForComposite`),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 242). Gates: gofmt OK; `go build ./internal/...`
+        clean; full executor + catalog suites PASS; `TestPort_PgDumpConnectionSetup` PASS (cgroup wrapper,
+        -count=1, 3.65s — no composite fixture added yet, so emitting the rows cannot regress the
+        round-trip); pgbench pre-commit smoke on commit. **Next (slice 243+):** synthesize the implicit
+        `pg_class` relation (relkind='c', reltype=type OID) + one `pg_attribute` row per field (atttypid
+        resolved from field type name) + OID/relname-nsp index entries, set `typrelid` to the relation OID,
+        THEN add `CREATE TYPE … AS (…)` to the pg_dump fixture and assert the round-tripped
+        `CREATE TYPE public.x AS (a integer, b text);`. Also deferred: ROLLBACK-undo for composite heap rows
+        (consistent with existing un-rolled-back in-memory composite registration).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -1253,6 +1253,90 @@ func buildUserPGTypeRowForEnumArray(et *catalog.EnumType) Row {
 	}
 }
 
+// buildUserPGTypeRowForComposite builds the pg_type row for a user-defined
+// composite type (`CREATE TYPE x AS (...)`), typtype='c'/typcategory='C'.
+// typrelid points at the implicit pg_class relation in PostgreSQL; goopg does
+// not synthesize that relation yet, so it is left 0 (a follow-up slice fills it
+// in along with the pg_attribute field rows). Composite types are pass-by-ref
+// varlena (typlen=-1, typbyval=false, typalign='d', typstorage='x'), mirroring
+// PG's record/composite layout. DU-002 slice 242.
+func buildUserPGTypeRowForComposite(ct *catalog.CompositeType) Row {
+	return Row{
+		NewIntDatum(int64(ct.OID)),                     // oid
+		NewStringDatum(ct.Name),                        // typname (name type)
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
+		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(-1),                                // typlen (varlena composite)
+		NewBoolDatum(false),                            // typbyval
+		NewStringDatum("c"),                            // typtype = 'c' (composite)
+		NewStringDatum("C"),                            // typcategory = TYPCATEGORY_COMPOSITE
+		NewBoolDatum(false),                            // typispreferred
+		NewBoolDatum(true),                             // typisdefined
+		NewStringDatum(","),                            // typdelim
+		NewIntDatum(0),                                 // typrelid (implicit pg_class relation — not seeded yet)
+		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(0),                                 // typelem
+		NewIntDatum(int64(ct.ArrayOID)),                // typarray (auto-generated `_name` array type)
+		NewIntDatum(0),                                 // typinput
+		NewIntDatum(0),                                 // typoutput
+		NewIntDatum(0),                                 // typreceive
+		NewIntDatum(0),                                 // typsend
+		NewIntDatum(0),                                 // typmodin
+		NewIntDatum(0),                                 // typmodout
+		NewIntDatum(0),                                 // typanalyze
+		NewStringDatum("d"),                            // typalign = 'd' (double-aligned, like RECORD)
+		NewStringDatum("x"),                            // typstorage = 'x' (extended)
+		NewBoolDatum(false),                            // typnotnull
+		NewIntDatum(0),                                 // typbasetype
+		NewIntDatum(-1),                                // typtypmod
+		NewIntDatum(0),                                 // typndims
+		NewIntDatum(0),                                 // typcollation
+		NullDatum,                                      // typdefaultbin (NULL)
+		NullDatum,                                      // typdefault (NULL)
+		NullDatum,                                      // typacl (NULL)
+	}
+}
+
+// buildUserPGTypeRowForCompositeArray builds the pg_type row for the
+// auto-generated `_name` array type of a composite type (typtype='b',
+// typcategory='A'), mirroring buildUserPGTypeRowForEnumArray. DU-002 slice 242.
+func buildUserPGTypeRowForCompositeArray(ct *catalog.CompositeType) Row {
+	return Row{
+		NewIntDatum(int64(ct.ArrayOID)),                // oid
+		NewStringDatum("_" + ct.Name),                  // typname (array type name)
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // typnamespace = public
+		NewIntDatum(bootstrapSuperuserOID),             // typowner
+		NewIntDatum(-1),                                // typlen (varlena array)
+		NewBoolDatum(false),                            // typbyval
+		NewStringDatum("b"),                            // typtype = 'b' (base)
+		NewStringDatum("A"),                            // typcategory = TYPCATEGORY_ARRAY
+		NewBoolDatum(false),                            // typispreferred
+		NewBoolDatum(true),                             // typisdefined
+		NewStringDatum(","),                            // typdelim
+		NewIntDatum(0),                                 // typrelid
+		NewIntDatum(0),                                 // typsubscript
+		NewIntDatum(int64(ct.OID)),                     // typelem = the composite element type
+		NewIntDatum(0),                                 // typarray
+		NewIntDatum(0),                                 // typinput
+		NewIntDatum(0),                                 // typoutput
+		NewIntDatum(0),                                 // typreceive
+		NewIntDatum(0),                                 // typsend
+		NewIntDatum(0),                                 // typmodin
+		NewIntDatum(0),                                 // typmodout
+		NewIntDatum(0),                                 // typanalyze
+		NewStringDatum("d"),                            // typalign = 'd' (matches composite element)
+		NewStringDatum("x"),                            // typstorage = 'x' (extended)
+		NewBoolDatum(false),                            // typnotnull
+		NewIntDatum(0),                                 // typbasetype
+		NewIntDatum(-1),                                // typtypmod
+		NewIntDatum(0),                                 // typndims
+		NewIntDatum(0),                                 // typcollation
+		NullDatum,                                      // typdefaultbin (NULL)
+		NullDatum,                                      // typdefault (NULL)
+		NullDatum,                                      // typacl (NULL)
+	}
+}
+
 // pgTypeCategoryForOID returns the PG18 pg_type.typcategory single-byte code for
 // a built-in base type OID, used when a domain inherits its base type's category.
 // It mirrors the typcategory values in postgres/src/include/catalog/pg_type.dat.

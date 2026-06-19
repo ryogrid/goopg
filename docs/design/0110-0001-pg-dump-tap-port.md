@@ -6978,6 +6978,44 @@ storage (incl. `=auto` non-canonicalization and case-insensitive `OFF`) and the 
 The remaining DU-002 catalog surface moves to composite types (`CREATE TYPE AS`; `pg_class.reltype`
 hardcoded 0 — a larger structural task).
 
+### Slice 242 — composite type `pg_type` heap row (`CREATE TYPE x AS (...)`, typtype='c') — foundation
+
+Opens the composite-type frontier. `CREATE TYPE x AS (a int, b text)` was already parsed
+(`parser.CreateTypeStmt.IsComposite`/`CompositeFields`) and registered in-memory
+(`RegisterCompositeTypeWithFields`), but the type was **invisible to `pg_type`** — no heap row — so
+`pg_dump`'s `getTypes` (and any `pg_type` query) could not discover it. This slice synthesizes the two
+`pg_type` heap rows PostgreSQL allocates for a composite type, mirroring the enum precedent (slices 89/90):
+
+- **catalog** (`catalog.go`): new `CompositeType{Name, OID, ArrayOID, Fields}` struct + `compositeTypes`
+  map. `RegisterCompositeTypeWithFields` now allocates **two OIDs** (the type, then its auto-generated
+  `_name` array) from `nextOID` once per type — re-registration keeps them stable, exactly like
+  `RegisterEnum`. `LookupCompositeType` exposes the OIDs; `DropCompositeType` clears the new map (and the
+  field map). The implicit `pg_class` relation (relkind='c') that PG creates is **not** seeded yet, so
+  `typrelid` is left 0 (a follow-up slice fills it in along with the `pg_attribute` field rows).
+- **Executor** (`operators_ddl.go`): `execCreateType` composite branch captures the returned
+  `*CompositeType` and calls new `syncCompositeTypeToCatalogHeap` (mirrors `syncEnumTypeToCatalogHeap`):
+  writes `buildUserPGTypeRowForComposite` (typtype='c', typcategory='C', typlen=-1 varlena, typbyval=false,
+  typalign='d', typstorage='x', typarray=ArrayOID, typrelid=0) and
+  `buildUserPGTypeRowForCompositeArray` (typtype='b', typcategory='A', typelem=composite OID), then mirrors
+  pg_type to the postgres DB. `execDropType` stamps xmax on both rows before the in-memory delete (parallel
+  to the enum branch).
+
+`buildUserPGTypeRowFor{Composite,CompositeArray}` live in `pg18_user_catalog_rows.go` alongside the
+enum/domain builders and use the same 32-column `pgTypeColumnsPG18` layout.
+
+Engine guards: unit test `TestUserPGTypeRowForComposite` pins stable two-OID allocation,
+case-insensitive `LookupCompositeType`, and the full canonical shape of both rows; the existing
+`TestPort_PgDumpConnectionSetup` still passes (no composite fixture added yet — emitting the rows cannot
+regress the round-trip). Composite types are **not** added to the pg_dump fixture this slice because the
+`typrelid → pg_class → pg_attribute` chain `dumpCompositeType` walks is not synthesized yet.
+
+**Deferred to slice 243+:** the implicit `pg_class` relation (relkind='c', reltype=type OID) + one
+`pg_attribute` row per field (with `atttypid` resolved from each field's type name) + OID/relname-nsp index
+entries, then add `CREATE TYPE … AS (…)` to the pg_dump fixture and assert the round-tripped
+`CREATE TYPE public.x AS (a integer, b text);`. ROLLBACK-undo for composite-type heap rows (the enum path
+has `PendingCreatedEnums`) is also deferred — current composite-type in-memory registration is likewise not
+rolled back, so the heap rows stay consistent with existing semantics.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -763,6 +763,94 @@ func TestUserPGAttributeEnumColumn(t *testing.T) {
 	}
 }
 
+// TestUserPGTypeRowForComposite verifies that CREATE TYPE x AS (...) allocates a
+// stable pair of OIDs (the composite type + its `_name` array) and that the
+// synthesized pg_type rows carry the PG18-canonical composite shape
+// (typtype='c'/typcategory='C', varlena, double-aligned) and the array
+// companion (typtype='b'/typcategory='A', typelem=composite OID). DU-002 slice 242.
+func TestUserPGTypeRowForComposite(t *testing.T) {
+	const (
+		oidIdx         = 0
+		typnameIdx     = 1
+		typlenIdx      = 4
+		typbyvalIdx    = 5
+		typtypeIdx     = 6
+		typcategoryIdx = 7
+		typrelidIdx    = 11
+		typelemIdx     = 13
+		typarrayIdx    = 14
+		typalignIdx    = 22
+		typstorageIdx  = 23
+	)
+	cat := catalog.NewInMemory()
+	ct := cat.RegisterCompositeTypeWithFields("addr", []catalog.CompositeField{
+		{Name: "street", ColType: "text"},
+		{Name: "zip", ColType: "int"},
+	})
+	if ct == nil || ct.OID == 0 || ct.ArrayOID != ct.OID+1 {
+		t.Fatalf("RegisterCompositeTypeWithFields OID alloc: %+v", ct)
+	}
+	// Re-registration (e.g. CREATE OR REPLACE-style re-run) keeps OIDs stable.
+	ct2 := cat.RegisterCompositeTypeWithFields("addr", ct.Fields)
+	if ct2.OID != ct.OID || ct2.ArrayOID != ct.ArrayOID {
+		t.Fatalf("re-register changed OIDs: %+v vs %+v", ct2, ct)
+	}
+	// LookupCompositeType is case-insensitive.
+	if got := cat.LookupCompositeType("ADDR"); got == nil || got.OID != ct.OID {
+		t.Fatalf("LookupCompositeType(ADDR)=%+v want OID %d", got, ct.OID)
+	}
+
+	row := buildUserPGTypeRowForComposite(ct)
+	if got := uint32(row[oidIdx].Int); got != ct.OID {
+		t.Errorf("oid=%d want %d", got, ct.OID)
+	}
+	if got := row[typnameIdx].StringValue(); got != "addr" {
+		t.Errorf("typname=%q want addr", got)
+	}
+	if got := row[typtypeIdx].StringValue(); got != "c" {
+		t.Errorf("typtype=%q want c (composite)", got)
+	}
+	if got := row[typcategoryIdx].StringValue(); got != "C" {
+		t.Errorf("typcategory=%q want C", got)
+	}
+	if got := row[typlenIdx].Int; got != -1 {
+		t.Errorf("typlen=%d want -1 (varlena)", got)
+	}
+	if got := row[typbyvalIdx].BoolValue(); got != false {
+		t.Errorf("typbyval=%v want false", got)
+	}
+	if got := uint32(row[typarrayIdx].Int); got != ct.ArrayOID {
+		t.Errorf("typarray=%d want %d", got, ct.ArrayOID)
+	}
+	if got := row[typrelidIdx].Int; got != 0 {
+		t.Errorf("typrelid=%d want 0 (implicit relation not seeded yet)", got)
+	}
+	if got := row[typalignIdx].StringValue(); got != "d" {
+		t.Errorf("typalign=%q want d", got)
+	}
+	if got := row[typstorageIdx].StringValue(); got != "x" {
+		t.Errorf("typstorage=%q want x", got)
+	}
+
+	// Array companion row (`_addr`).
+	arr := buildUserPGTypeRowForCompositeArray(ct)
+	if got := uint32(arr[oidIdx].Int); got != ct.ArrayOID {
+		t.Errorf("array oid=%d want %d", got, ct.ArrayOID)
+	}
+	if got := arr[typnameIdx].StringValue(); got != "_addr" {
+		t.Errorf("array typname=%q want _addr", got)
+	}
+	if got := arr[typtypeIdx].StringValue(); got != "b" {
+		t.Errorf("array typtype=%q want b (base)", got)
+	}
+	if got := arr[typcategoryIdx].StringValue(); got != "A" {
+		t.Errorf("array typcategory=%q want A", got)
+	}
+	if got := uint32(arr[typelemIdx].Int); got != ct.OID {
+		t.Errorf("array typelem=%d want %d (composite element)", got, ct.OID)
+	}
+}
+
 // TestUserPGAttributeEnumArrayColumn pins the enum-ARRAY resolution (DU-002
 // slice 89). A `mood[]` column must report pg_attribute.atttypid = the enum's
 // auto-generated array OID (et.ArrayOID = et.OID+1), attndims=1, and carry a

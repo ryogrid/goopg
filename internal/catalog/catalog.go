@@ -1257,6 +1257,10 @@ type InMemory struct {
 	// compositeTypeFields stores the ordered field list for composite types so
 	// that PL/pgSQL can perform field access and assignment. M0097-composite.
 	compositeTypeFields map[string][]CompositeField
+	// compositeTypes holds OID-bearing metadata for composite types created via
+	// CREATE TYPE ... AS (...), so a pg_type heap row (typtype='c') can be
+	// synthesized for pg_dump / catalog parity. DU-002 slice 242.
+	compositeTypes map[string]*CompositeType
 
 	// constraintViewDeps maps "tableOID:constraintName" → []viewName for
 	// views that rely on the constraint for GROUP BY functional dependency.
@@ -1480,6 +1484,20 @@ type CompositeField struct {
 	ColType string // column type string (e.g. "bigint", "text")
 }
 
+// CompositeType describes a user-defined composite type created via
+// `CREATE TYPE x AS (a int, b text)`. PostgreSQL allocates a pg_type row
+// (typtype='c'), an auto-generated array type (`_x`), and an implicit
+// pg_class relation (relkind='c') that holds the field columns in
+// pg_attribute. goopg currently synthesizes the two pg_type rows (the type
+// and its array); the implicit relation + pg_attribute rows are a follow-up
+// (see fix_plan DU-002). DU-002 slice 242.
+type CompositeType struct {
+	Name     string           // lower-case type name
+	OID      uint32           // pg_type.oid of the composite type
+	ArrayOID uint32           // OID of the auto-generated `_name` array type
+	Fields   []CompositeField // ordered field list
+}
+
 // UserAggregate holds metadata for a CREATE AGGREGATE user-defined aggregate.
 // It is stored in InMemory.userAggregates and looked up by lower-case name.
 type UserAggregate struct {
@@ -1553,6 +1571,7 @@ func NewInMemory() *InMemory {
 		domains:                make(map[string]*Domain),
 		compositeTypeNames:     make(map[string]bool),
 		compositeTypeFields:    make(map[string][]CompositeField),
+		compositeTypes:         make(map[string]*CompositeType),
 		constraintViewDeps:     make(map[string][]string),
 		opClassHashFuncs:       make(map[string]string),
 		opClassSchemas:         make(map[string]string),
@@ -7383,12 +7402,32 @@ func (c *InMemory) RegisterCompositeType(name string) {
 
 // RegisterCompositeTypeWithFields records a composite type together with its
 // ordered field list, enabling PL/pgSQL field access/assignment. M0097-composite.
-func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []CompositeField) {
+func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []CompositeField) *CompositeType {
 	k := strings.ToLower(name)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.compositeTypeNames[k] = true
 	c.compositeTypeFields[k] = fields
+	// Allocate two OIDs (the type itself, then its auto-generated `_name` array
+	// type) once per type, mirroring RegisterEnum so re-registration keeps the
+	// OIDs stable. DU-002 slice 242.
+	ct, ok := c.compositeTypes[k]
+	if !ok {
+		ct = &CompositeType{Name: k, OID: c.nextOID, ArrayOID: c.nextOID + 1}
+		c.nextOID += 2
+		c.compositeTypes[k] = ct
+	}
+	ct.Fields = fields
+	return ct
+}
+
+// LookupCompositeType returns the OID-bearing metadata for a composite type, or
+// nil if no such type exists. DU-002 slice 242.
+func (c *InMemory) LookupCompositeType(name string) *CompositeType {
+	k := strings.ToLower(name)
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.compositeTypes[k]
 }
 
 // LookupCompositeTypeFields returns the ordered field list for a composite type,
@@ -7418,6 +7457,8 @@ func (c *InMemory) DropCompositeType(name string) error {
 		return fmt.Errorf("type %q does not exist", name)
 	}
 	delete(c.compositeTypeNames, k)
+	delete(c.compositeTypeFields, k)
+	delete(c.compositeTypes, k)
 	return nil
 }
 
