@@ -5039,6 +5039,25 @@ object support.
         `go build ./internal/...` clean; executor+parser+catalog suites PASS; `TestPort_PgDumpConnectionSetup`
         PASS; pgbench pre-commit smoke on commit. **Next:** `toast.autovacuum_freeze_min_age/max_age/table_age`
         (INT), `toast.log_autovacuum_min_duration` (INT, allows -1) — each a one-line gather. After: composite types.
+      - **PROGRESS 2026-06-19 (loop #45):** **DU-002 slice 230 LANDED — first `RELOPT_KIND_TOAST`
+        autovacuum-age *integer* reloption (`toast.autovacuum_freeze_min_age`) round-trips; seven-element
+        TOAST reloptions array.** `autovacuum_freeze_min_age` is `RELOPT_TYPE_INT` and shares
+        `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:1885/274`, range `0–1000000000`, default `-1`),
+        so PG accepts the `toast.` prefix and stores it (no prefix) on the TOAST relation's reloptions.
+        **Executor** (`operators_ddl.go`): one extra gather block after the slice-229
+        `toast.autovacuum_vacuum_cost_limit` arm, reusing the parent-table integer path (slice 207):
+        `strconv.Atoi` + `0 ≤ N ≤ 1000000000` bounds check (non-int/out-of-range → 22023; `0` valid),
+        appended as `autovacuum_freeze_min_age=<N>` via `strconv.Itoa`. **catalog**: NO change —
+        `strings.Join` over `ToastReloptions` renders `{...,autovacuum_freeze_min_age=200000000}`. On
+        dump-out pg_dump re-adds the prefix per element in array order →
+        `WITH (..., toast.autovacuum_freeze_min_age='200000000')`. Files:
+        `internal/executor/operators_ddl.go` (int gather block),
+        `internal/testport/pgdump_connsetup_test.go` (`optoast` fixture carries all seven options + updated
+        combined-WITH assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 230). Gates: gofmt OK;
+        `go build ./internal/...` clean; executor+parser+catalog suites PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** `toast.autovacuum_freeze_max_age` (INT,
+        `100000–2000000000`), `toast.autovacuum_freeze_table_age` (INT, `0–2000000000`), multixact variants,
+        `toast.log_autovacuum_min_duration` (INT, allows -1) — each a one-line gather. After: composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

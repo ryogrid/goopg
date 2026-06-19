@@ -1629,6 +1629,28 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		toastReloptions = append(toastReloptions, "autovacuum_vacuum_cost_limit="+strconv.Itoa(avcl))
 	}
+	// `toast.autovacuum_freeze_min_age` — the first RELOPT_KIND_TOAST autovacuum-age
+	// *integer* option, reusing the parent-table integer reloption path (slice 207).
+	// PG's reloption type is RELOPT_TYPE_INT with range 0–1000000000 and a default of
+	// -1 (= unset / use the GUC); autovacuum_freeze_min_age shares
+	// RELOPT_KIND_HEAP | RELOPT_KIND_TOAST (reloptions.c:1885/274), so PG accepts the
+	// `toast.` prefix and stores it (no prefix) on the TOAST relation's reloptions.
+	// goopg has no autovacuum, so the value is purely catalog/dump state. Since 0 is a
+	// valid explicit value the bounds check rejects only <0 or >1e9. M0110-0001
+	// (DU-002 slice 230).
+	if v, ok := s.With["toast.autovacuum_freeze_min_age"]; ok {
+		afma, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_freeze_min_age\": %s", v)}
+		}
+		if afma < 0 || afma > 1000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_freeze_min_age\"", afma),
+				Detail:  "Valid values are between \"0\" and \"1000000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_freeze_min_age="+strconv.Itoa(afma))
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
