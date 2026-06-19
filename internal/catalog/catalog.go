@@ -1506,8 +1506,9 @@ func domainConstCastTypeName(baseName string) string {
 // CompositeField describes one field in a user-defined composite type.
 // M0097-composite.
 type CompositeField struct {
-	Name    string // lower-case field name
-	ColType string // column type string (e.g. "bigint", "text")
+	Name      string // lower-case field name
+	ColType   string // column type string (e.g. "bigint", "text")
+	Collation string // per-field COLLATE name (e.g. "C"); empty = type default
 }
 
 // CompositeType describes a user-defined composite type created via

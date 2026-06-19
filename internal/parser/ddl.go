@@ -5455,6 +5455,13 @@ func (p *parser) parseCreateType(pos int) (Stmt, error) {
 						(tok.Value == "," || tok.Value == ")") {
 						break
 					}
+					// A top-level COLLATE clause is not part of the type — stop
+					// here and capture it separately so the field's atttypid stays
+					// clean and its attcollation round-trips. DU-002 slice 257.
+					if parenDepth == 0 && tok.Kind != TokenSymbol &&
+						strings.EqualFold(tok.Value, "collate") {
+						break
+					}
 					if tok.Kind == TokenSymbol && tok.Value == "(" {
 						parenDepth++
 					} else if tok.Kind == TokenSymbol && tok.Value == ")" {
@@ -5463,10 +5470,20 @@ func (p *parser) parseCreateType(pos int) (Stmt, error) {
 					typeParts = append(typeParts, tok.Value)
 					p.advance()
 				}
-				stmt.CompositeFields = append(stmt.CompositeFields, TypeField{
+				field := TypeField{
 					Name:    fname,
 					ColType: strings.Join(typeParts, " "),
-				})
+				}
+				// Optional per-field COLLATE "<name>" — record the collation so the
+				// field's pg_attribute.attcollation shadows the type default and
+				// pg_dump's dumpCompositeType re-emits a `COLLATE` clause, mirroring
+				// the table-column path (slice 188). goopg v0 does not actually
+				// collate; the name is kept for dump fidelity. DU-002 slice 257.
+				if p.acceptIdentKeyword("collate") {
+					collName, _ := p.parseCollationName()
+					field.Collation = collName
+				}
+				stmt.CompositeFields = append(stmt.CompositeFields, field)
 				if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
 					p.advance() // consume ','
 				} else {

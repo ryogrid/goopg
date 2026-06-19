@@ -10254,7 +10254,7 @@ func (o *ddlOp) execCreateType(s *parser.CreateTypeStmt) error {
 			}
 			fields := make([]catalog.CompositeField, len(s.CompositeFields))
 			for i, f := range s.CompositeFields {
-				fields[i] = catalog.CompositeField{Name: f.Name, ColType: f.ColType}
+				fields[i] = catalog.CompositeField{Name: f.Name, ColType: f.ColType, Collation: f.Collation}
 			}
 			ct := cat.RegisterCompositeTypeWithFields(s.Name, fields)
 			// Write pg_type heap rows (typtype='c' + its `_name` array) so the

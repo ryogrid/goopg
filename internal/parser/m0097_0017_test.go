@@ -95,6 +95,67 @@ func TestCompositeFieldTypmodParsing(t *testing.T) {
 	}
 }
 
+// TestCompositeFieldCollateParsing covers DU-002 slice 257: a per-field
+// `COLLATE "<name>"` clause in a composite type definition is captured in
+// TypeField.Collation, separate from ColType (so the field's atttypid stays
+// clean and its attcollation can shadow the type default). A field without a
+// COLLATE clause leaves Collation empty. The collation name is unquoted by the
+// lexer ("C" → C), matching collationNameToOID's keys.
+func TestCompositeFieldCollateParsing(t *testing.T) {
+	tests := []struct {
+		sql        string
+		wantFields []struct{ name, colType, collation string }
+	}{
+		{
+			sql: `CREATE TYPE coll_comp AS (a text COLLATE "C", b text)`,
+			wantFields: []struct{ name, colType, collation string }{
+				{"a", "text", "C"},
+				{"b", "text", ""},
+			},
+		},
+		{
+			// COLLATE after a typmod type: the parens must be consumed by the
+			// type-token loop before the COLLATE clause is reached.
+			sql: `CREATE TYPE coll_vc AS (v varchar(8) COLLATE "POSIX", n int)`,
+			wantFields: []struct{ name, colType, collation string }{
+				{"v", "varchar ( 8 )", "POSIX"},
+				{"n", "int", ""},
+			},
+		},
+		{
+			// Schema-qualified collation name — parseCollationName keeps the last
+			// component (the bare name), as the table-column path does.
+			sql: `CREATE TYPE coll_q AS (a text COLLATE pg_catalog."C")`,
+			wantFields: []struct{ name, colType, collation string }{
+				{"a", "text", "C"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.sql[:min(60, len(tc.sql))], func(t *testing.T) {
+			stmts, err := parser.Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+			}
+			ct, ok := stmts[0].(*parser.CreateTypeStmt)
+			if !ok {
+				t.Fatalf("expected *CreateTypeStmt, got %T", stmts[0])
+			}
+			if len(ct.CompositeFields) != len(tc.wantFields) {
+				t.Fatalf("got %d fields, want %d: %+v",
+					len(ct.CompositeFields), len(tc.wantFields), ct.CompositeFields)
+			}
+			for i, want := range tc.wantFields {
+				got := ct.CompositeFields[i]
+				if got.Name != want.name || got.ColType != want.colType || got.Collation != want.collation {
+					t.Errorf("field[%d] = {%q, %q, coll=%q}, want {%q, %q, coll=%q}",
+						i, got.Name, got.ColType, got.Collation, want.name, want.colType, want.collation)
+				}
+			}
+		})
+	}
+}
+
 // TestAlterTypeAddAttributeParsing covers DU-002 slice 253: ALTER TYPE … ADD
 // ATTRIBUTE col type parses into AlterTypeStmt.AddAttrName / AddAttrType with
 // the same space-joined type-token form as a composite field (typmod parens and

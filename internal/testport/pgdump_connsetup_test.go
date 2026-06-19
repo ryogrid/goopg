@@ -2418,6 +2418,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TYPE public.dom_arr_comp AS (label text, zips zipcode[])"); err != nil {
 		t.Fatalf("create type dom_arr_comp: %v", err)
 	}
+	// Slice 257: a composite field with an explicit per-field COLLATE must round
+	// through pg_dump. The field's pg_attribute.attcollation shadows the type
+	// default (text typcollation=100 → C=950 / POSIX=951), so pg_dump's
+	// dumpCompositeType reports `attcollation <> typcollation` and re-emits a
+	// `COLLATE pg_catalog."<name>"` clause inline; the uncollated field `b` must
+	// stay clause-free.
+	if err := runSQLSimple(t, c, `CREATE TYPE public.coll_comp AS (a text COLLATE "C", b text, p text COLLATE "POSIX")`); err != nil {
+		t.Fatalf("create type coll_comp: %v", err)
+	}
 	// Slice 253: ALTER TYPE … ADD ATTRIBUTE appends a field to an existing
 	// composite type. The new attribute must round-trip through pg_dump's
 	// dumpCompositeType, which walks pg_type.typrelid → pg_class → pg_attribute;
@@ -5262,6 +5271,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE TYPE public.alt_comp AS (",
 			"\ta bigint,",
 			"\tb_renamed numeric(12,3)\n",
+			// Slice 257: a per-field COLLATE round-trips inline. The field's
+			// attcollation (C=950 / POSIX=951) differs from text's typcollation
+			// (100), so dumpCompositeType re-emits `COLLATE pg_catalog."<name>"`.
+			// The uncollated middle field `b` (default 100) carries no clause.
+			"CREATE TYPE public.coll_comp AS (",
+			"\ta text COLLATE pg_catalog.\"C\",",
+			"\tb text,",
+			"\tp text COLLATE pg_catalog.\"POSIX\"\n",
 		}
 		for _, sub := range compositeDefs {
 			if !strings.Contains(res.Stdout, sub) {
@@ -5286,6 +5303,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "zips text[]") {
 			t.Errorf("pg_dump rendered the domain-array composite field as text[] (slice-252 array OID resolution regressed)\n  full stdout=%q", res.Stdout)
 		}
+		// Slice 257: the uncollated middle field of coll_comp must NOT carry a
+		// spurious COLLATE clause. The positive assertion above pins the exact
+		// `\tb text,` form (tab-prefixed, comma-suffixed) — a leaked override would
+		// render `\tb text COLLATE …,` instead, so that substring would be absent.
+		// (A broad `b text COLLATE` check would false-positive on the collcol TABLE,
+		// whose column b is legitimately `COLLATE "POSIX"`.)
 		// **Slice 90 (asserted):** a DOMAIN and a column using it must round-trip.
 		// The CREATE DOMAIN statement must carry NO spurious `DEFAULT ` clause
 		// (the pg_get_expr(NULL) fix), and the column must render as the

@@ -2094,8 +2094,9 @@ func (s *DropProcedureStmt) stmtNode() {}
 // TypeField describes one field in a composite type definition.
 // M0097-composite.
 type TypeField struct {
-	Name    string // lower-case field name
-	ColType string // column type string (e.g. "bigint", "text")
+	Name      string // lower-case field name
+	ColType   string // column type string (e.g. "bigint", "text")
+	Collation string // per-field COLLATE name (e.g. "C"); empty = type default
 }
 
 // CreateTypeStmt — CREATE TYPE name AS ENUM (val1, val2, …) or

@@ -1633,6 +1633,20 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		// buildUserPGTypeRowForComposite. DU-002 slice 249.
 		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
 	}
+	// A per-field explicit collation (`a text COLLATE "C"`) shadows the field
+	// type's typcollation in pg_attribute.attcollation, exactly as the
+	// table-column path does (slice 188). pg_dump's dumpCompositeType reports the
+	// collation only when `attcollation <> typcollation`, then re-emits a
+	// `COLLATE <schema>.<name>` clause inline; echoing the type default
+	// unconditionally silently dropped a declared composite-field COLLATE. Only
+	// override for a collatable type (typcollation != 0) and a name that resolves
+	// to a known collation OID. DU-002 slice 257.
+	attCollationOID := attrs.TypCollation
+	if field.Collation != "" && attrs.TypCollation != 0 {
+		if oid := collationNameToOID(field.Collation); oid != 0 {
+			attCollationOID = oid
+		}
+	}
 	return Row{
 		NewIntDatum(int64(ct.RelOID)),            // attrelid
 		NewStringDatum(field.Name),               // attname (name)
@@ -1653,7 +1667,7 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		NewBoolDatum(false),                      // attisdropped
 		NewBoolDatum(true),                       // attislocal
 		NewIntDatum(0),                           // attinhcount
-		NewIntDatum(int64(attrs.TypCollation)),   // attcollation (type default)
+		NewIntDatum(int64(attCollationOID)),      // attcollation (type default; per-field COLLATE override, slice 257)
 		NullDatum,                                // attacl
 		NullDatum,                                // attoptions
 		NullDatum,                                // attfdwoptions

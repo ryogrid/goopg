@@ -943,6 +943,45 @@ func TestUserPGClassAndAttributeForComposite(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeCompositeFieldCollation pins the per-field COLLATE override
+// for a composite type (DU-002 slice 257). A field declared `a text COLLATE "C"`
+// must stamp pg_attribute.attcollation with the C collation OID (950) instead of
+// the text type's default (100), mirroring the table-column path (slice 188), so
+// pg_dump's dumpCompositeType reports `attcollation <> typcollation` and re-emits
+// the COLLATE clause. A field with no COLLATE keeps the type default; a COLLATE
+// on a non-collatable type (int) must be ignored (no bogus OID persisted).
+func TestUserPGAttributeCompositeFieldCollation(t *testing.T) {
+	const attcollationIdx = 19
+	cat := catalog.NewInMemory()
+	ct := cat.RegisterCompositeTypeWithFields("coll_comp", []catalog.CompositeField{
+		{Name: "a", ColType: "text", Collation: "C"},
+		{Name: "b", ColType: "text"},
+		{Name: "p", ColType: "text", Collation: "POSIX"},
+		{Name: "n", ColType: "int", Collation: "C"}, // non-collatable: ignore
+	})
+	// Field a: COLLATE "C" → attcollation 950 (C_COLLATION_OID).
+	a := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[0], 1)
+	if got := uint32(a[attcollationIdx].Int); got != 950 {
+		t.Errorf("field a attcollation=%d want 950 (COLLATE \"C\")", got)
+	}
+	// Field b: no COLLATE → text default 100 (DEFAULT_COLLATION_OID).
+	b := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[1], 2)
+	if got := uint32(b[attcollationIdx].Int); got != 100 {
+		t.Errorf("field b attcollation=%d want 100 (text default)", got)
+	}
+	// Field p: COLLATE "POSIX" → attcollation 951.
+	p := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[2], 3)
+	if got := uint32(p[attcollationIdx].Int); got != 951 {
+		t.Errorf("field p attcollation=%d want 951 (COLLATE \"POSIX\")", got)
+	}
+	// Field n: COLLATE on a non-collatable type (int4, typcollation 0) → 0, the
+	// override is suppressed exactly as the table-column path does.
+	n := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[3], 4)
+	if got := uint32(n[attcollationIdx].Int); got != 0 {
+		t.Errorf("field n attcollation=%d want 0 (COLLATE on non-collatable int ignored)", got)
+	}
+}
+
 // TestUserPGAttributeCompositeFieldEnum pins the enum-FIELD resolution for a
 // composite type (DU-002 slice 245). A composite field whose declared type is a
 // user-defined enum folds to the text fallback inside parseCompositeFieldType

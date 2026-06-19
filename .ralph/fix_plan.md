@@ -5527,6 +5527,36 @@ object support.
         unit suites PASS. Design: `0110-0001` Slice 256. pgbench pre-commit smoke on commit. **Next (slice
         257+):** multi-subcommand `ALTER TYPE` (`ADD …, DROP …`) / per-attribute `COLLATE` round-trip.
 
+      - **PROGRESS 2026-06-20 (loop #23):** **DU-002 slice 257 LANDED — a composite-type field with an explicit
+        per-field `COLLATE` (`CREATE TYPE x AS (a text COLLATE "C", …)`) now round-trips through pg_dump.**
+        `CREATE TYPE`'s composite-field parser collected the *whole* field tail (incl. `COLLATE "C"`) into
+        `ColType`, so `parseCompositeFieldType` mis-resolved the type and the collation was silently dropped —
+        `dumpCompositeType` re-emitted the field with no `COLLATE` clause. Fix mirrors the table-column path
+        (slice 188): **Parser** (`parseCreateType` composite loop, `ddl.go`) — the type-token loop now also
+        stops at a top-level `COLLATE` ident keyword (Kind-agnostic break, like `ALTER ATTRIBUTE`), so the type
+        stays clean (`text`, not `text COLLATE "C"`); the optional trailing `COLLATE <name>` is parsed via the
+        existing `parseCollationName` (bare `"C"` + schema-qualified `pg_catalog."C"`, keeping the bare last
+        component) into the new `TypeField.Collation`. **AST/catalog** — `parser.TypeField` +
+        `catalog.CompositeField` each gain `Collation string`; the executor `CREATE TYPE` path
+        (`operators_ddl.go` ~10257) propagates `f.Collation`. **Heap row**
+        (`buildUserPGAttributeRowForCompositeField`, `pg18_user_catalog_rows.go`) — `attcollation` now applies the
+        per-field override exactly as the table-column builder (slice 188): for a collatable type
+        (`typcollation != 0`) and a name resolving via `collationNameToOID` (C→950, POSIX→951), stamp the
+        override; a COLLATE on a non-collatable type (int, typcollation 0) is suppressed (no bogus OID). Flows
+        through `syncCompositeTypeToCatalogHeap` (same builder) → the heap `pg_attribute` row pg_dump scans.
+        No pg_dump-side change: `dumpCompositeType` reports `attcollation <> typcollation` and re-emits
+        `COLLATE pg_catalog."<name>"` inline; uncollated fields stay clause-free. Scope: `CREATE TYPE` composite
+        fields only (ALTER-TYPE ADD/ALTER ATTRIBUTE COLLATE still stub-consumes the trailing COLLATE). Guards:
+        `parser.TestCompositeFieldCollateParsing` (bare / typmod-then-COLLATE / schema-qualified / uncollated) +
+        `executor.TestUserPGAttributeCompositeFieldCollation` (C→950/POSIX→951 override, text default 100
+        untouched, non-collatable int→0) + pg_dump TAP port creates
+        `public.coll_comp AS (a text COLLATE "C", b text, p text COLLATE "POSIX")` and asserts the dump re-emits
+        `a text COLLATE pg_catalog."C", b text, p text COLLATE pg_catalog."POSIX"` (bare `\tb text,` proves the
+        middle field clause-free), byte-matching real pg_dump 18.3 (`TestPort_PgDumpConnectionSetup` PASS, 3.3s).
+        Parser+catalog+executor unit suites PASS. Design: `0110-0001` Slice 257. pgbench pre-commit smoke on
+        commit. **Next (slice 258+):** multi-subcommand `ALTER TYPE` (`ADD …, DROP …`) / per-attribute COLLATE
+        via `ALTER TYPE … ADD ATTRIBUTE`.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).
