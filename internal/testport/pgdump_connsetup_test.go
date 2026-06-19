@@ -973,6 +973,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optavmt: %v", err)
 	}
 
+	// Slice 216: the REAL vacuum_max_eager_freeze_failure_rate storage parameter — a
+	// PG18 heap reloption (RELOPT_TYPE_REAL, range 0.0–1.0, default -1 = unset),
+	// reusing the slice-199 float path but with PG's narrower 0.0–1.0 range (a
+	// separate set flag records presence since 0.0 is a valid explicit value). goopg
+	// stores catalog.Table.VacuumMaxEagerFreezeFailureRate; the pg_class virtual view
+	// renders `{vacuum_max_eager_freeze_failure_rate=0.1}`, which pg_dump emits as
+	// `WITH (vacuum_max_eager_freeze_failure_rate='0.1')`. goopg has no eager
+	// freezing, so the value is catalog/dump-only (advisory). `optvefr` carries it on
+	// its own table to keep the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optvefr (id integer PRIMARY KEY) WITH (vacuum_max_eager_freeze_failure_rate=0.1)"); err != nil {
+		t.Fatalf("create table optvefr: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2908,6 +2921,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (autovacuum_vacuum_max_threshold='5000')") {
 			t.Errorf("pg_dump dropped the autovacuum_vacuum_max_threshold reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_vacuum_max_threshold='5000')", res.Stdout)
+		}
+		// **Slice 216 closed (asserted):** the REAL vacuum_max_eager_freeze_failure_rate
+		// storage parameter (RELOPT_TYPE_REAL, range 0.0–1.0, default -1 = unset; a PG18
+		// heap reloption) must round-trip via the slice-199 float path with PG's
+		// narrower 0.0–1.0 range (a separate set flag records presence since 0.0 is a
+		// valid explicit value). catalog.Table.VacuumMaxEagerFreezeFailureRate persists
+		// it and the pg_class virtual view renders
+		// `{vacuum_max_eager_freeze_failure_rate=0.1}`, which pg_dump emits as
+		// `WITH (vacuum_max_eager_freeze_failure_rate='0.1')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optvefr (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optvefr\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (vacuum_max_eager_freeze_failure_rate='0.1')") {
+			t.Errorf("pg_dump dropped the vacuum_max_eager_freeze_failure_rate reloption; missing %q\n  full stdout=%q", "WITH (vacuum_max_eager_freeze_failure_rate='0.1')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

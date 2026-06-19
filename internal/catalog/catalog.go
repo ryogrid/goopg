@@ -697,6 +697,24 @@ type Table struct {
 	// (DU-002 slice 215).
 	AutovacuumVacuumMaxThreshold    int
 	AutovacuumVacuumMaxThresholdSet bool
+
+	// VacuumMaxEagerFreezeFailureRate stores the table's
+	// `WITH (vacuum_max_eager_freeze_failure_rate=F)` storage parameter — a PG18
+	// heap reloption (RELOPT_KIND_HEAP | RELOPT_KIND_TOAST, reloptions.c:431)
+	// giving the fraction of pages vacuum may scan and fail to freeze before
+	// disabling eager scanning. Reuses the slice-199 REAL path: PG's reloption
+	// type is RELOPT_TYPE_REAL but with range 0.0–1.0 (not 0.0–100.0) and a
+	// default of -1 (= unset / use the GUC) (reloptions.c:434). Because 0.0 is a
+	// valid explicit value, VacuumMaxEagerFreezeFailureRateSet — not a zero check
+	// — guards whether the option was specified (the parallel_workers pattern,
+	// generalized to a float). When set, pg_class.reloptions gains the text[]
+	// element `vacuum_max_eager_freeze_failure_rate=F` (F rendered as its shortest
+	// exact decimal), which pg_dump renders back as
+	// `WITH (vacuum_max_eager_freeze_failure_rate='F')`. goopg has no eager
+	// freezing, so the value is catalog/dump-only (advisory; runtime unaffected).
+	// M0110-0001 (DU-002 slice 216).
+	VacuumMaxEagerFreezeFailureRate    float64
+	VacuumMaxEagerFreezeFailureRateSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2482,6 +2500,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.AutovacuumVacuumMaxThresholdSet {
 				relopts = append(relopts, "autovacuum_vacuum_max_threshold="+strconv.Itoa(t.AutovacuumVacuumMaxThreshold))
+			}
+			if t.VacuumMaxEagerFreezeFailureRateSet {
+				relopts = append(relopts, "vacuum_max_eager_freeze_failure_rate="+strconv.FormatFloat(t.VacuumMaxEagerFreezeFailureRate, 'g', -1, 64))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

@@ -6206,6 +6206,31 @@ plain table → no reloptions) and `TestAutovacuumVacuumMaxThresholdOutOfBoundsR
 (`9999999999`/`nope` → 22023). The pg_dump fixture adds `optavmt (… WITH (autovacuum_vacuum_max_threshold=5000))`
 on its own table; the assertion confirms the dump carries `WITH (autovacuum_vacuum_max_threshold='5000')`.
 
+### Slice 216 — REAL `vacuum_max_eager_freeze_failure_rate` reloption round-trip
+
+Adds the `vacuum_max_eager_freeze_failure_rate` storage parameter, reusing the slice-199
+`autovacuum_vacuum_scale_factor` REAL path. It is a **PG18** heap reloption
+(`RELOPT_TYPE_REAL`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`, `reloptions.c:431`; "Fraction of pages
+in a relation vacuum can scan and fail to freeze before disabling eager scanning") but with PG's
+**narrower range 0.0–1.0** (not the 0.0–100.0 of the scale-factor reloptions) and a default of
+**-1** (= unset / use the GUC). Because 0.0 is a valid explicit value, a
+`VacuumMaxEagerFreezeFailureRateSet` flag records presence (the parser rejects a bare negative as a
+syntax error, so 0.0 is the reachable boundary). The executor parses with `strconv.ParseFloat`,
+bounds-checks `0.0 ≤ F ≤ 1.0` via the `!(F >= 0 && F <= 1)` form (which also rejects NaN/±Inf), and
+rejects non-numeric/out-of-range values with `22023`. It persists
+`catalog.Table.VacuumMaxEagerFreezeFailureRate` (a `float64`); the pg_class virtual view appends
+`vacuum_max_eager_freeze_failure_rate=F` (F rendered as its shortest exact decimal) after
+`autovacuum_vacuum_max_threshold`; pg_dump renders `WITH (vacuum_max_eager_freeze_failure_rate='F')`.
+goopg has no eager freezing, so the value is advisory catalog/dump-only, base-table-only — same as
+the sibling reloption slices.
+
+Engine guards: `TestVacuumMaxEagerFreezeFailureRateSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,vacuum_max_eager_freeze_failure_rate=0.1}`; boundary `0` →
+`{vacuum_max_eager_freeze_failure_rate=0}`; plain table → no reloptions) and
+`TestVacuumMaxEagerFreezeFailureRateOutOfBoundsRejected` (`1.5`/`2`/`notafloat` → 22023). The pg_dump
+fixture adds `optvefr (… WITH (vacuum_max_eager_freeze_failure_rate=0.1))` on its own table; the
+assertion confirms the dump carries `WITH (vacuum_max_eager_freeze_failure_rate='0.1')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

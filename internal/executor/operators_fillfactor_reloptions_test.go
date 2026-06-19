@@ -1891,6 +1891,102 @@ func TestAutovacuumVacuumMaxThresholdOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+// TestVacuumMaxEagerFreezeFailureRateSurfacesInPgClassReloptions verifies that a
+// `WITH (vacuum_max_eager_freeze_failure_rate=F)` storage parameter — a PG18 heap
+// reloption reusing the slice-199 REAL path but with PG's narrower range 0.0–1.0 —
+// declared on CREATE TABLE is persisted on the catalog table and surfaced through
+// the pg_class virtual view's reloptions cell. Like the other REAL reloptions
+// (slices 199/200), 0.0 is a valid explicit value (PG's reloption default is -1 =
+// unset; a bare negative is a parser syntax error, so 0.0 is the reachable
+// boundary), so the Set flag — not a zero check — guards presence. Cases pin: a
+// fractional value alongside fillfactor (combined
+// `{fillfactor=70,vacuum_max_eager_freeze_failure_rate=0.1}`), the boundary value
+// 0 (explicitly set, rendered `=0`), and a plain table (no reloptions). pg_dump
+// renders the array back as `WITH (vacuum_max_eager_freeze_failure_rate='0.1')`.
+// goopg has no eager freezing, so the value is catalog/dump-only. DU-002 slice 216.
+func TestVacuumMaxEagerFreezeFailureRateSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE ve (id integer PRIMARY KEY) WITH (fillfactor=70, vacuum_max_eager_freeze_failure_rate=0.1)`); err != nil {
+		t.Fatalf("CREATE TABLE ve: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE vezero (id integer PRIMARY KEY) WITH (vacuum_max_eager_freeze_failure_rate=0)`); err != nil {
+		t.Fatalf("CREATE TABLE vezero: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE veplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE veplain: %v", err)
+	}
+
+	veTbl, ok := cat.LookupTable(parser.ObjectName{Name: "ve"})
+	if !ok {
+		t.Fatal("ve table not found")
+	}
+	if veTbl.VacuumMaxEagerFreezeFailureRate != 0.1 || !veTbl.VacuumMaxEagerFreezeFailureRateSet {
+		t.Errorf("ve rate = %v set=%v, want 0.1 set=true", veTbl.VacuumMaxEagerFreezeFailureRate, veTbl.VacuumMaxEagerFreezeFailureRateSet)
+	}
+	zeroTbl, ok := cat.LookupTable(parser.ObjectName{Name: "vezero"})
+	if !ok {
+		t.Fatal("vezero table not found")
+	}
+	if zeroTbl.VacuumMaxEagerFreezeFailureRate != 0 || !zeroTbl.VacuumMaxEagerFreezeFailureRateSet {
+		t.Errorf("vezero rate = %v set=%v, want 0 set=true", zeroTbl.VacuumMaxEagerFreezeFailureRate, zeroTbl.VacuumMaxEagerFreezeFailureRateSet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "veplain"})
+	if !ok {
+		t.Fatal("veplain table not found")
+	}
+	if plainTbl.VacuumMaxEagerFreezeFailureRateSet {
+		t.Errorf("veplain set=%v, want false (unset)", plainTbl.VacuumMaxEagerFreezeFailureRateSet)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "ve" || r[1] == "vezero" || r[1] == "veplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["ve"] != "{fillfactor=70,vacuum_max_eager_freeze_failure_rate=0.1}" {
+		t.Errorf("pg_class.reloptions for ve = %q, want %q", got["ve"], "{fillfactor=70,vacuum_max_eager_freeze_failure_rate=0.1}")
+	}
+	if got["vezero"] != "{vacuum_max_eager_freeze_failure_rate=0}" {
+		t.Errorf("pg_class.reloptions for vezero = %q, want %q", got["vezero"], "{vacuum_max_eager_freeze_failure_rate=0}")
+	}
+	if got["veplain"] != "" {
+		t.Errorf("pg_class.reloptions for veplain = %q, want \"\" (NULL)", got["veplain"])
+	}
+}
+
+// TestVacuumMaxEagerFreezeFailureRateOutOfBoundsRejected verifies CREATE TABLE
+// rejects an above-1.0 or non-numeric vacuum_max_eager_freeze_failure_rate with
+// PG's 22023 error. The valid range is 0.0–1.0 (negatives are rejected earlier by
+// the parser as a syntax error, so the reachable invalid cases are above-range and
+// non-numeric). DU-002 slice 216.
+func TestVacuumMaxEagerFreezeFailureRateOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, av := range []string{"1.5", "2", "notafloat"} {
+		err := runDDL(t, ctx, `CREATE TABLE vefrbad`+strconv.Itoa(i)+` (id integer) WITH (vacuum_max_eager_freeze_failure_rate=`+av+`)`)
+		if err == nil {
+			t.Errorf("vacuum_max_eager_freeze_failure_rate=%s: expected an error, got nil", av)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("vacuum_max_eager_freeze_failure_rate=%s: error type = %T, want *ExecError", av, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("vacuum_max_eager_freeze_failure_rate=%s: error code = %q, want 22023", av, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.

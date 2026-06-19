@@ -1455,6 +1455,34 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		autovacuumVacuumMaxThreshold = avmt
 		autovacuumVacuumMaxThresholdSet = true
 	}
+	// Extract and bounds-check the vacuum_max_eager_freeze_failure_rate storage
+	// parameter — a PG18 heap reloption (RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+	// reloptions.c:431) giving the fraction of pages vacuum may scan and fail to
+	// freeze before disabling eager scanning. Reuses the slice-199 REAL path, but
+	// PG's range here is 0.0–1.0 (not 0.0–100.0) with a default of -1 (= unset /
+	// use the GUC); since 0.0 is a valid explicit value, a separate `set` flag
+	// records whether the option was present (the parallel_workers pattern,
+	// generalized to a float). The `!(f >= 0 && f <= 1)` form also rejects
+	// NaN/±Inf, which ParseFloat would otherwise accept. goopg has no eager
+	// freezing, so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's
+	// `WITH (vacuum_max_eager_freeze_failure_rate='F')`. M0110-0001 (DU-002 slice 216).
+	vacuumMaxEagerFreezeFailureRate := 0.0
+	vacuumMaxEagerFreezeFailureRateSet := false
+	if v, ok := s.With["vacuum_max_eager_freeze_failure_rate"]; ok {
+		vmefr, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"vacuum_max_eager_freeze_failure_rate\": %s", v)}
+		}
+		if !(vmefr >= 0.0 && vmefr <= 1.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"vacuum_max_eager_freeze_failure_rate\"", strconv.FormatFloat(vmefr, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"1.000000\"."}
+		}
+		vacuumMaxEagerFreezeFailureRate = vmefr
+		vacuumMaxEagerFreezeFailureRateSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1548,6 +1576,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.UserCatalogTableSet = userCatalogTableSet
 	tbl.AutovacuumVacuumMaxThreshold = autovacuumVacuumMaxThreshold
 	tbl.AutovacuumVacuumMaxThresholdSet = autovacuumVacuumMaxThresholdSet
+	tbl.VacuumMaxEagerFreezeFailureRate = vacuumMaxEagerFreezeFailureRate
+	tbl.VacuumMaxEagerFreezeFailureRateSet = vacuumMaxEagerFreezeFailureRateSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

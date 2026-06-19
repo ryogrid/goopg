@@ -4735,6 +4735,26 @@ object support.
         (enum auto/on/off) and `vacuum_max_eager_freeze_failure_rate` (REAL, PG18); then `toast.*` namespace (needs
         toast-table pg_class modeling — `reltoastrelid` hardcoded 0, so real pg_dump's `tc.reloptions` join is NULL);
         or composite types (`CREATE TYPE AS`; larger, pg_class.reltype hardcoded 0).
+      - **PROGRESS 2026-06-19 (loop #31):** **DU-002 slice 216 LANDED — REAL `vacuum_max_eager_freeze_failure_rate`
+        storage parameter round-trips through pg_dump.** Reuses the slice-199 `autovacuum_vacuum_scale_factor` REAL
+        path but with PG's narrower range 0.0–1.0 (not 0.0–100.0). It is a PG18 heap reloption (`RELOPT_TYPE_REAL`,
+        `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`, `reloptions.c:431`), default -1 (= unset). A
+        `VacuumMaxEagerFreezeFailureRateSet` flag records presence (0.0 is a valid explicit value; the parser rejects a
+        bare negative as a syntax error, so 0.0 is the reachable boundary). Executor parses via `strconv.ParseFloat`,
+        bounds-checks `0.0 ≤ F ≤ 1.0` (the `!(F>=0 && F<=1)` form also rejects NaN/±Inf), rejects non-numeric/out-of-range
+        → `22023`. Persist `catalog.Table.VacuumMaxEagerFreezeFailureRate` (float64); pg_class virtual view appends
+        `vacuum_max_eager_freeze_failure_rate=F` after `autovacuum_vacuum_max_threshold`; pg_dump renders
+        `WITH (vacuum_max_eager_freeze_failure_rate='F')`. goopg has no eager freezing, so advisory catalog/dump-only;
+        base-table-only. Files: `internal/catalog/catalog.go` (`Table.VacuumMaxEagerFreezeFailureRate`/`…Set` + render),
+        `internal/executor/operators_ddl.go` (extract/bounds-check + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestVacuumMaxEagerFreezeFailureRateSurfacesInPgClassReloptions` + `TestVacuumMaxEagerFreezeFailureRateOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optvefr` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 216). No parser change needed. Gates: gofmt OK;
+        `go build ./internal/...` clean; catalog/executor reloption tests PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** remaining heap reloption `vacuum_index_cleanup`
+        (enum auto/on/off; NEW `RELOPT_TYPE_ENUM` path); then `toast.*` namespace (needs toast-table pg_class
+        modeling — `reltoastrelid` hardcoded 0); or composite types (`CREATE TYPE AS`; pg_class.reltype hardcoded 0).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
