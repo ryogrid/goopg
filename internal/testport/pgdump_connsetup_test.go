@@ -1601,6 +1601,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("add named NO INHERIT NOT NULL on local column nninh4.c: %v", err)
 	}
 
+	// Slice 276 (negative twin of slice 275): a NAMED NOT NULL added to a LOCAL
+	// column via `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` — WITHOUT
+	// the `NO INHERIT` trailer — must dump INLINE as `<col> <type> CONSTRAINT
+	// <name> NOT NULL` and must NOT grow a spurious ` NO INHERIT` suffix. Slice
+	// 275 proved the ALTER path THREADS act.NoInherit when present; this twin
+	// proves it does not FABRICATE it when absent. The parser leaves
+	// AlterTableAction.NoInherit=false (no `NO INHERIT` trailer at ddl.go:5483),
+	// the executor records a contype='n' row with connoinherit='f' via
+	// tbl.AddNotNull(name, col, oid, false, isLocal=true, 0) (operators_ddl.go:5498),
+	// and pg_dump (pg_dump.c:17184/17188) emits the `CONSTRAINT nn5` prefix
+	// (LOCAL + name `nn5` ≠ auto-name `nninh5_c_not_null`) but NO suffix. A
+	// regression that defaulted connoinherit to 't' on the ALTER path, or that
+	// echoed a stray NO INHERIT, would emit `c integer CONSTRAINT nn5 NOT NULL NO
+	// INHERIT` — the exact byte form slice 275 wants but which is WRONG here. This
+	// is the inline-rendered ALTER-path counterpart of slice 273's `nninh2.e`
+	// (`e integer CONSTRAINT e_nn NOT NULL`), which arrived at table-creation time.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh5 (c integer, d integer)"); err != nil {
+		t.Fatalf("create standalone table nninh5: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nninh5 ADD CONSTRAINT nn5 NOT NULL c"); err != nil {
+		t.Fatalf("add named NOT NULL on local column nninh5.c: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -4238,6 +4261,33 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			}
 		} else {
 			t.Errorf("pg_dump missing CREATE TABLE public.nninh4\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 276 (asserted, negative twin of slice 275):** a NAMED NOT NULL
+		// added to a LOCAL column via `ALTER TABLE ... ADD CONSTRAINT nn5 NOT NULL
+		// c` (no `NO INHERIT`) must dump INLINE as `c integer CONSTRAINT nn5 NOT
+		// NULL` and must NOT acquire a spurious ` NO INHERIT` suffix. This proves
+		// the AlterTableAddNotNull executor records connoinherit='f' when the
+		// trailer is absent — it does not fabricate NO INHERIT. A regression that
+		// defaulted connoinherit to 't' on the ALTER path would emit `c integer
+		// CONSTRAINT nn5 NOT NULL NO INHERIT` (the slice-275 byte form, wrong here).
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh5 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer CONSTRAINT nn5 NOT NULL") {
+				t.Errorf("pg_dump dropped the named NOT NULL added via ALTER; want %q in nninh5 block\n  block=%q", "c integer CONSTRAINT nn5 NOT NULL", block)
+			}
+			if strings.Contains(block, "CONSTRAINT nn5 NOT NULL NO INHERIT") {
+				t.Errorf("pg_dump fabricated a NO INHERIT suffix on the named NOT NULL; want bare %q, not %q in nninh5 block\n  block=%q", "c integer CONSTRAINT nn5 NOT NULL", "CONSTRAINT nn5 NOT NULL NO INHERIT", block)
+			}
+			if !strings.Contains(block, "d integer") {
+				t.Errorf("pg_dump dropped the standalone table's plain column; want %q in nninh5 block\n  block=%q", "d integer", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh5\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged

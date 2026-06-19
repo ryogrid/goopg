@@ -8047,9 +8047,30 @@ silent twin failure a green CREATE-inline test would not catch.
 Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `nninh4`
 block contains `c integer CONSTRAINT nn4 NOT NULL NO INHERIT` and the plain `d integer` survives).
 
-> **Next (slice 276+):** an `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` (named, NO `NO INHERIT`) on a
-> *local* column — the bare-named ALTER variant, asserting the inline `CONSTRAINT <name> NOT NULL` form WITHOUT a
-> spurious ` NO INHERIT` suffix (the negative twin of slice 275).
+### Slice 276 — *named* NOT NULL (no `NO INHERIT`) added to a *local* column via `ALTER TABLE ADD CONSTRAINT` (inline, negative twin)
+
+The negative twin of slice 275. Slice 275 proved the ALTER path **threads** `act.NoInherit` when the `NO INHERIT`
+trailer is present; this slice proves it does not **fabricate** it when the trailer is absent —
+`CREATE TABLE nninh5 (c integer, d integer); ALTER TABLE nninh5 ADD CONSTRAINT nn5 NOT NULL c` →
+`c integer CONSTRAINT nn5 NOT NULL` (no ` NO INHERIT` suffix). It is the inline-rendered ALTER-path counterpart of
+slice 273's `nninh2.e` (`e integer CONSTRAINT e_nn NOT NULL`), which arrived at table-creation time.
+
+**No production change required.** The parser leaves `AlterTableAction.NoInherit=false` (no `NO INHERIT` trailer at
+`ddl.go:5483`); the executor records a contype='n' pg_constraint row with connoinherit='f' via
+`tbl.AddNotNull(name, col, oid, false, isLocal=true, 0)` (`operators_ddl.go:5498`). Because the column is LOCAL and
+`nn5` differs from the auto-name `nninh5_c_not_null`, real pg_dump emits the `CONSTRAINT nn5` prefix
+(pg_dump.c:17184) but NO suffix (pg_dump.c:17188 is gated on connoinherit). A regression that defaulted connoinherit to
+'t' on the ALTER arm — or echoed a stray NO INHERIT — would emit `c integer CONSTRAINT nn5 NOT NULL NO INHERIT` (the
+exact slice-275 byte form, but wrong here); the assertion explicitly rejects that suffix in addition to requiring the
+bare named form.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `nninh5`
+block contains `c integer CONSTRAINT nn5 NOT NULL`, does NOT contain `CONSTRAINT nn5 NOT NULL NO INHERIT`, and the plain
+`d integer` survives).
+
+> **Next (slice 277+):** an `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` on a *local* column where the name
+> EQUALS the auto-name `<table>_<col>_not_null` — the ALTER-path counterpart of slice 274, asserting the named
+> constraint collapses to a bare `<col> <type> NOT NULL` (no `CONSTRAINT` prefix) through pg_dump.
 
 ## Deferred (002–010) — catalog surface estimate
 

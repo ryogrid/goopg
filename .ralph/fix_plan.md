@@ -5925,6 +5925,24 @@ object support.
         Design: `0110-0001` Slice 275. **Next (slice 276+):** an `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>`
         (named, NO `NO INHERIT`) on a LOCAL column — the negative twin asserting the inline `CONSTRAINT <name> NOT NULL`
         form WITHOUT a spurious ` NO INHERIT` suffix.
+      - **PROGRESS 2026-06-20 (loop #43):** **DU-002 slice 276 LANDED — the negative twin of slice 275: a NAMED NOT NULL
+        (no `NO INHERIT`) added to a LOCAL column via `ALTER TABLE ... ADD CONSTRAINT nn5 NOT NULL c` dumps INLINE as
+        `c integer CONSTRAINT nn5 NOT NULL` and must NOT acquire a spurious ` NO INHERIT` suffix (no production change;
+        sibling-paths regression guard).** Slice 275 proved the ALTER path THREADS `act.NoInherit` when the trailer is
+        present; this twin proves it does NOT FABRICATE it when absent. The parser leaves `AlterTableAction.NoInherit=false`
+        (`ddl.go:5483`); executor records a contype='n' pg_constraint row with connoinherit='f' via
+        `tbl.AddNotNull(name, col, oid, false, isLocal=true, 0)` (`operators_ddl.go:5498`). Because the column is LOCAL and
+        `nn5` ≠ auto-name `nninh5_c_not_null`, real pg_dump emits the `CONSTRAINT nn5` prefix (pg_dump.c:17184) but NO
+        suffix (pg_dump.c:17188 is gated on connoinherit). Inline-rendered ALTER-path counterpart of slice 273's
+        `nninh2.e` (`e integer CONSTRAINT e_nn NOT NULL`). A regression defaulting connoinherit to 't' on the ALTER arm
+        would emit `c integer CONSTRAINT nn5 NOT NULL NO INHERIT` (the slice-275 byte form, wrong here); the assertion
+        explicitly rejects that suffix. Fixture: `CREATE TABLE public.nninh5 (c integer, d integer)` +
+        `ALTER TABLE public.nninh5 ADD CONSTRAINT nn5 NOT NULL c`. **Guards:** `TestPort_PgDumpConnectionSetup` PASS
+        (3.36s; asserts inline `c integer CONSTRAINT nn5 NOT NULL`, negative check that ` NO INHERIT` is NOT appended, and
+        plain `d integer` survives). gofmt + `go build ./...` clean; pgbench pre-commit smoke on commit. Design:
+        `0110-0001` Slice 276. **Next (slice 277+):** an `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` on a
+        LOCAL column where the name EQUALS the auto-name `<table>_<col>_not_null` — the ALTER-path counterpart of slice
+        274, asserting the named constraint collapses to a bare `<col> <type> NOT NULL` (no `CONSTRAINT` prefix).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

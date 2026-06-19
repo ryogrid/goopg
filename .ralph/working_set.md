@@ -1,31 +1,31 @@
-Task: DU-002 slice 275 (loop #42) — COMPLETE, ready to commit/push.
+Task: DU-002 slice 276 (loop #43) — COMPLETE, ready to commit/push.
 
-Last landed: a NAMED `NO INHERIT` NOT NULL added to a LOCAL column via
-`ALTER TABLE ... ADD CONSTRAINT nn4 NOT NULL c NO INHERIT` dumps INLINE as
-`c integer CONSTRAINT nn4 NOT NULL NO INHERIT`. NO production change — the path
-already exists end-to-end: parser captures `NO INHERIT` into
-AlterTableAction.NoInherit (ddl.go:5483); executor records contype='n' with
-connoinherit='t' via tbl.AddNotNull(name, col, oid, act.NoInherit=true,
-isLocal=true, 0) (operators_ddl.go:5498) + delete-old-rows/syncTableToCatalogHeap.
-Sibling-paths regression guard: ALTER path must thread NoInherit + conname
-identically to the CREATE-inline path (nninh2, slice 273). Because column is
-LOCAL and nn4 ≠ auto-name nninh4_c_not_null, real pg_dump re-emits CONSTRAINT
-prefix + NO INHERIT suffix.
+Last landed: the NEGATIVE TWIN of slice 275. A NAMED NOT NULL (no `NO INHERIT`)
+added to a LOCAL column via `ALTER TABLE public.nninh5 ADD CONSTRAINT nn5 NOT NULL c`
+dumps INLINE as `c integer CONSTRAINT nn5 NOT NULL` and must NOT grow a spurious
+` NO INHERIT` suffix. NO production change. Slice 275 proved the ALTER path THREADS
+act.NoInherit when present; this proves it does NOT FABRICATE it when absent. Parser
+leaves AlterTableAction.NoInherit=false (ddl.go:5483); executor records contype='n'
+connoinherit='f' via tbl.AddNotNull(name, col, oid, false, isLocal=true, 0)
+(operators_ddl.go:5498). LOCAL + nn5 ≠ auto-name nninh5_c_not_null → pg_dump emits
+CONSTRAINT nn5 prefix (pg_dump.c:17184) but NO suffix (17188 gated on connoinherit).
 
-Fixture: `CREATE TABLE public.nninh4 (c integer, d integer)` then
-`ALTER TABLE public.nninh4 ADD CONSTRAINT nn4 NOT NULL c NO INHERIT`. Asserted:
-nninh4 block has `c integer CONSTRAINT nn4 NOT NULL NO INHERIT`; `d integer` survives.
+Fixture: `CREATE TABLE public.nninh5 (c integer, d integer)` then
+`ALTER TABLE public.nninh5 ADD CONSTRAINT nn5 NOT NULL c`. Asserted: nninh5 block has
+`c integer CONSTRAINT nn5 NOT NULL`; does NOT contain `CONSTRAINT nn5 NOT NULL NO
+INHERIT`; `d integer` survives.
 
 Files:
-- internal/testport/pgdump_connsetup_test.go — nninh4 fixture (after nninh3) +
-  assertion block (after nninh3 assert).
-- docs/design/0110-0001-pg-dump-tap-port.md — Slice 275 section + Next (276) note.
-- .ralph/fix_plan.md — slice 275 progress (loop #42).
+- internal/testport/pgdump_connsetup_test.go — nninh5 fixture (after nninh4) +
+  assertion block (after nninh4 assert).
+- docs/design/0110-0001-pg-dump-tap-port.md — Slice 276 section + Next (277) note.
+- .ralph/fix_plan.md — slice 276 progress (loop #43).
 
 Gates: gofmt clean; go build ./... clean; TestPort_PgDumpConnectionSetup PASS
-(3.56s, byte-matches real pg_dump 18.3); pgbench pre-commit smoke (enforced by
+(3.36s, byte-matches real pg_dump 18.3); pgbench pre-commit smoke (enforced by
 .githooks/pre-commit on commit).
 
-Next (slice 276+): an `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>`
-(named, NO `NO INHERIT`) on a LOCAL column — the negative twin asserting the
-inline `CONSTRAINT <name> NOT NULL` form WITHOUT a spurious ` NO INHERIT` suffix.
+Next (slice 277+): an `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` on a
+LOCAL column where the name EQUALS the auto-name `<table>_<col>_not_null` — the
+ALTER-path counterpart of slice 274, asserting the named constraint collapses to a
+bare `<col> <type> NOT NULL` (no `CONSTRAINT` prefix) through pg_dump.
