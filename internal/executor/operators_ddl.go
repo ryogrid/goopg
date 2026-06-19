@@ -1799,6 +1799,28 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		toastReloptions = append(toastReloptions, "autovacuum_vacuum_insert_threshold="+strconv.Itoa(avit))
 	}
+	// `toast.autovacuum_vacuum_max_threshold` — RELOPT_TYPE_INT, range
+	// -1–INT_MAX, default -2 (= unset / use the GUC); -1 disables the cap.
+	// Shares RELOPT_KIND_HEAP | RELOPT_KIND_TOAST (reloptions.c:236/1877), so PG
+	// accepts the `toast.` prefix and stores it (no prefix) on the TOAST relation's
+	// reloptions. Both -1 and 0 are valid explicit values; the value is gathered
+	// whenever the key is present (mirrors the toast.autovacuum_vacuum_insert_threshold
+	// arm, slice 237 sibling). goopg has no autovacuum, so the value is purely
+	// catalog/dump state that round-trips through pg_dump's
+	// `WITH (toast.autovacuum_vacuum_max_threshold='N')`. M0110-0001 (DU-002 slice 238).
+	if v, ok := s.With["toast.autovacuum_vacuum_max_threshold"]; ok {
+		avmt, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_max_threshold\": %s", v)}
+		}
+		if avmt < -1 || avmt > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_max_threshold\"", avmt),
+				Detail:  "Valid values are between \"-1\" and \"2147483647\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_vacuum_max_threshold="+strconv.Itoa(avmt))
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}

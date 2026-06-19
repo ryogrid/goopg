@@ -5194,6 +5194,22 @@ object support.
         pre-commit smoke on commit. **Next:** the two remaining HEAP|TOAST insert-vacuum options
         (`toast.autovacuum_vacuum_max_threshold` int, `toast.autovacuum_vacuum_insert_scale_factor` real);
         then composite types.
+      - **PROGRESS 2026-06-19 (loop #4):** **DU-002 slice 238 LANDED — `RELOPT_KIND_TOAST` max-vacuum
+        *integer* reloption (`toast.autovacuum_vacuum_max_threshold`) round-trips; fifteen-element TOAST
+        reloptions array.** `autovacuum_vacuum_max_threshold` is `RELOPT_TYPE_INT`,
+        `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:236/1877`, range `-1–INT_MAX`, default `-2`;
+        `-1` disables the cap); both `-1` and `0` valid (floor `-1`, mirrors parent-table arm slice 215).
+        **Executor** (`operators_ddl.go`): one gather block after the slice-237
+        `toast.autovacuum_vacuum_insert_threshold` arm — `strconv.Atoi` + `-1 ≤ N ≤ 2147483647`
+        (non-int/out-of-range → 22023), appended as `autovacuum_vacuum_max_threshold=<N>`. **catalog**: NO
+        change. On dump-out → `WITH (..., toast.autovacuum_vacuum_max_threshold='2000')`. Files:
+        `internal/executor/operators_ddl.go` (toast int gather block),
+        `internal/testport/pgdump_connsetup_test.go` (`optoast` fixture = 15 options + updated combined-WITH
+        assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 238). Gates: gofmt OK;
+        `go build ./internal/...` clean; executor reloption + `TestPort_PgDumpConnectionSetup` PASS; pgbench
+        pre-commit smoke on commit. **Next:** the LAST HEAP|TOAST insert-vacuum option
+        (`toast.autovacuum_vacuum_insert_scale_factor` real, range `0.0–100.0`, default `-1`, slice-227
+        toast-real pattern) completes the `toast.*` surface; then composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

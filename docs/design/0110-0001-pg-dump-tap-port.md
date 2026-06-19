@@ -6866,6 +6866,32 @@ fourteen-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPor
 **Next:** the two remaining HEAP|TOAST insert-vacuum options (`toast.autovacuum_vacuum_max_threshold` int,
 `toast.autovacuum_vacuum_insert_scale_factor` real) on the same pattern; then composite types.
 
+### Slice 238 — `RELOPT_KIND_TOAST` max-vacuum *integer* reloption (`toast.autovacuum_vacuum_max_threshold`)
+
+Adds `toast.autovacuum_vacuum_max_threshold`, extending the TOAST reloptions array to fifteen elements.
+`autovacuum_vacuum_max_threshold` is `RELOPT_TYPE_INT` and shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`
+(`reloptions.c:236/1877`, range `-1–INT_MAX`, default `-2` = unset; `-1` disables the cap), so PG
+accepts the `toast.` prefix and stores it (without prefix) on the TOAST relation's `pg_class.reloptions`.
+Like `autovacuum_vacuum_insert_threshold`, both `-1` and `0` are valid explicit values (floor `-1` not `0`),
+mirroring the parent-table arm (slice 215).
+
+- **Executor** (`operators_ddl.go`): one extra gather block after the slice-237
+  `toast.autovacuum_vacuum_insert_threshold` arm: `strconv.Atoi` + `-1 ≤ N ≤ 2147483647` bounds check
+  (non-int or out-of-range → 22023), appended to `toastReloptions` as
+  `autovacuum_vacuum_max_threshold=<N>` (no prefix) via `strconv.Itoa`.
+- **catalog** (`catalog.go`): no change — the existing `strings.Join` over `t.ToastReloptions` renders the
+  fifteen-element array ending in `…,autovacuum_vacuum_insert_threshold=1000,autovacuum_vacuum_max_threshold=2000}`.
+
+On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) order:
+`WITH (..., toast.autovacuum_vacuum_insert_threshold='1000', toast.autovacuum_vacuum_max_threshold='2000')`.
+
+Engine guard: the `optoast` fixture now carries all fifteen options; the assertion confirms the combined
+fifteen-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
+
+**Next:** the last HEAP|TOAST insert-vacuum option (`toast.autovacuum_vacuum_insert_scale_factor` real,
+range `0.0–100.0`, default `-1`, the slice-227 toast-real pattern) completes the `toast.*` surface; then
+composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — a larger structural task).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
