@@ -4332,6 +4332,29 @@ object support.
         `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** more
         reloptions on the same pattern (`toast_tuple_target` int 128–8160, `autovacuum_vacuum_scale_factor`
         real 0–100); or composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger).
+      - **PROGRESS 2026-06-19 (loop #10):** **DU-002 slice 197 LANDED — integer storage parameter with a
+        non-zero minimum (`toast_tuple_target`) round-trips through pg_dump.** Next-most-common heap
+        reloption after fillfactor/autovacuum; exercises the integer variant whose valid range starts at
+        128 (PG's `128, TOAST_TUPLE_TARGET_MAIN`=8160 on the default 8 KB page). Because the minimum is
+        128, zero unambiguously means "unset", so it reuses fillfactor's plain zero-check pattern
+        (`ToastTupleTarget int`, NO separate `Set` flag) — unlike parallel_workers whose 0 is real. goopg
+        validated the lowercase WITH key but never extracted it, so `CREATE TABLE … WITH
+        (toast_tuple_target=256)` silently dropped it. The fix extracts/bounds-checks (128–8160;
+        out-of-range/non-int → `22023`) on the base-table CREATE path and persists
+        `catalog.Table.ToastTupleTarget`; the pg_class virtual view appends `toast_tuple_target=N` as a
+        trailing integer element after `autovacuum_enabled`; pg_dump renders `WITH
+        (toast_tuple_target='256')`. goopg's TOAST thresholds are fixed → advisory catalog/dump-only;
+        base-table-only. Files: `internal/catalog/catalog.go` (`Table.ToastTupleTarget` + render),
+        `internal/executor/operators_ddl.go` (extract/parse/bounds + persist on `execCreateTable`),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestToastTupleTargetSurfacesInPgClassReloptions` + `TestToastTupleTargetOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optt` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 197). Gates: gofmt OK; `go build ./internal/...`
+        clean; `go vet ./internal/testport/` clean; catalog/executor reloption tests PASS;
+        `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** real-typed
+        reloption (`autovacuum_vacuum_scale_factor` real 0–100, needs float parse + 0-as-valid) or
+        `autovacuum_vacuum_threshold` (int); or composite types (`CREATE TYPE AS`; `pg_class.reltype`
+        hardcoded 0 — larger).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

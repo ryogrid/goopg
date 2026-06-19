@@ -709,6 +709,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optav: %v", err)
 	}
 
+	// Slice 197: an INTEGER table-level storage parameter with a non-zero
+	// minimum (`toast_tuple_target`, valid 128–8160). It is the next-most-common
+	// heap reloption after fillfactor/autovacuum and exercises the
+	// minimum-is-128 "0-means-unset" variant of the integer code path (no
+	// separate set flag, unlike parallel_workers whose 0 is a real value). goopg
+	// validated the lowercase WITH key but never extracted/persisted it, so it
+	// vanished from the dump. The fix stores catalog.Table.ToastTupleTarget; the
+	// pg_class virtual view renders `{toast_tuple_target=256}`, which pg_dump
+	// emits as `WITH (toast_tuple_target='256')`. goopg's TOAST thresholds are
+	// fixed, so the value is catalog/dump-only (advisory). `optt` carries it on
+	// its own table to keep the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optt (id integer PRIMARY KEY) WITH (toast_tuple_target=256)"); err != nil {
+		t.Fatalf("create table optt: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2386,6 +2401,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (autovacuum_enabled='false')") {
 			t.Errorf("pg_dump dropped the autovacuum_enabled reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_enabled='false')", res.Stdout)
+		}
+		// **Slice 197 closed (asserted):** an INTEGER storage parameter whose
+		// minimum is 128 (toast_tuple_target) must round-trip via the
+		// "0-means-unset" integer path (no set flag). goopg validated the
+		// lowercase WITH key but never extracted/persisted it, so it vanished from
+		// the dump. catalog.Table.ToastTupleTarget now persists it and the pg_class
+		// virtual view renders `{toast_tuple_target=256}`, which pg_dump emits as
+		// `WITH (toast_tuple_target='256')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optt (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optt\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (toast_tuple_target='256')") {
+			t.Errorf("pg_dump dropped the toast_tuple_target reloption; missing %q\n  full stdout=%q", "WITH (toast_tuple_target='256')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

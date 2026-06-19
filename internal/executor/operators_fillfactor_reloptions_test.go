@@ -239,6 +239,95 @@ func TestAutovacuumEnabledInvalidValueRejected(t *testing.T) {
 	}
 }
 
+// TestToastTupleTargetSurfacesInPgClassReloptions verifies that a `WITH
+// (toast_tuple_target=N)` storage parameter declared on CREATE TABLE is
+// persisted on the catalog table and surfaced through the pg_class virtual
+// view's reloptions cell. Cases pin: a value alongside fillfactor (combined
+// `{fillfactor=70,toast_tuple_target=256}`), a boundary value at the minimum
+// (128), and a plain table (no reloptions). pg_dump renders the array back as
+// `WITH (toast_tuple_target='256')`. goopg's TOAST thresholds are fixed, so the
+// value is catalog/dump-only. DU-002 slice 197.
+func TestToastTupleTargetSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE tt (id integer PRIMARY KEY) WITH (fillfactor=70, toast_tuple_target=256)`); err != nil {
+		t.Fatalf("CREATE TABLE tt: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE ttmin (id integer PRIMARY KEY) WITH (toast_tuple_target=128)`); err != nil {
+		t.Fatalf("CREATE TABLE ttmin: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE ttplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE ttplain: %v", err)
+	}
+
+	ttTbl, ok := cat.LookupTable(parser.ObjectName{Name: "tt"})
+	if !ok {
+		t.Fatal("tt table not found")
+	}
+	if ttTbl.ToastTupleTarget != 256 {
+		t.Errorf("tt.ToastTupleTarget = %d, want 256", ttTbl.ToastTupleTarget)
+	}
+	minTbl, ok := cat.LookupTable(parser.ObjectName{Name: "ttmin"})
+	if !ok {
+		t.Fatal("ttmin table not found")
+	}
+	if minTbl.ToastTupleTarget != 128 {
+		t.Errorf("ttmin.ToastTupleTarget = %d, want 128", minTbl.ToastTupleTarget)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "ttplain"})
+	if !ok {
+		t.Fatal("ttplain table not found")
+	}
+	if plainTbl.ToastTupleTarget != 0 {
+		t.Errorf("ttplain.ToastTupleTarget = %d, want 0 (unset)", plainTbl.ToastTupleTarget)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "tt" || r[1] == "ttmin" || r[1] == "ttplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["tt"] != "{fillfactor=70,toast_tuple_target=256}" {
+		t.Errorf("pg_class.reloptions for tt = %q, want %q", got["tt"], "{fillfactor=70,toast_tuple_target=256}")
+	}
+	if got["ttmin"] != "{toast_tuple_target=128}" {
+		t.Errorf("pg_class.reloptions for ttmin = %q, want %q", got["ttmin"], "{toast_tuple_target=128}")
+	}
+	if got["ttplain"] != "" {
+		t.Errorf("pg_class.reloptions for ttplain = %q, want \"\" (NULL)", got["ttplain"])
+	}
+}
+
+// TestToastTupleTargetOutOfBoundsRejected verifies CREATE TABLE rejects a
+// toast_tuple_target value outside the valid 128–8160 range (or a non-integer)
+// with PG's 22023 error. DU-002 slice 197.
+func TestToastTupleTargetOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, tt := range []string{"127", "8161", "0", "huge"} {
+		err := runDDL(t, ctx, `CREATE TABLE ttbad`+strconv.Itoa(i)+` (id integer) WITH (toast_tuple_target=`+tt+`)`)
+		if err == nil {
+			t.Errorf("toast_tuple_target=%s: expected an out-of-bounds error, got nil", tt)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("toast_tuple_target=%s: error type = %T, want *ExecError", tt, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("toast_tuple_target=%s: error code = %q, want 22023", tt, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.

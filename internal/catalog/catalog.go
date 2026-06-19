@@ -415,6 +415,16 @@ type Table struct {
 	// unaffected). M0110-0001 (DU-002 slice 196).
 	AutovacuumEnabled    bool
 	AutovacuumEnabledSet bool
+
+	// ToastTupleTarget stores the table's `WITH (toast_tuple_target=N)` storage
+	// parameter (128–8160). Zero means unset (PG's default; valid values start
+	// at 128, so — like fillfactor — a plain zero check unambiguously detects
+	// "not specified" without a separate flag). When non-zero, pg_class's
+	// reloptions cell gains the text[] element `toast_tuple_target=N`, which
+	// pg_dump renders back as `WITH (toast_tuple_target='N')`. goopg's TOAST
+	// thresholds are fixed, so the value is catalog/dump-only (advisory; runtime
+	// unaffected). M0110-0001 (DU-002 slice 197).
+	ToastTupleTarget int
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2126,7 +2136,8 @@ func (c *InMemory) registerSystemTables() {
 			// (fillfactor='70')`. M0110-0001 (DU-002 slice 54). Multiple options
 			// (e.g. fillfactor + parallel_workers, slice 195) join in a fixed
 			// order as `{fillfactor=70,parallel_workers=4}`; autovacuum_enabled
-			// (slice 196) follows as a boolean element.
+			// (slice 196) follows as a boolean element, then toast_tuple_target
+			// (slice 197) as a trailing integer element.
 			var relopts []string
 			if t.Fillfactor != 0 {
 				relopts = append(relopts, "fillfactor="+strconv.Itoa(t.Fillfactor))
@@ -2136,6 +2147,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.AutovacuumEnabledSet {
 				relopts = append(relopts, "autovacuum_enabled="+strconv.FormatBool(t.AutovacuumEnabled))
+			}
+			if t.ToastTupleTarget != 0 {
+				relopts = append(relopts, "toast_tuple_target="+strconv.Itoa(t.ToastTupleTarget))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

@@ -1010,6 +1010,27 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		autovacuumEnabled = b
 		autovacuumEnabledSet = true
 	}
+	// Extract and bounds-check the toast_tuple_target storage parameter. PG's
+	// valid range is 128–TOAST_TUPLE_TARGET_MAIN (8160 on the default 8 KB
+	// page); since the minimum is 128, zero unambiguously means "unset" (the
+	// fillfactor pattern — no separate flag needed). goopg's TOAST thresholds
+	// are fixed, so the value is purely catalog/dump state that round-trips
+	// through pg_class.reloptions / pg_dump's `WITH (toast_tuple_target='N')`.
+	// M0110-0001 (DU-002 slice 197).
+	toastTupleTarget := 0
+	if v, ok := s.With["toast_tuple_target"]; ok {
+		tt, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"toast_tuple_target\": %s", v)}
+		}
+		if tt < 128 || tt > 8160 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"toast_tuple_target\"", tt),
+				Detail:  "Valid values are between \"128\" and \"8160\"."}
+		}
+		toastTupleTarget = tt
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1066,6 +1087,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.ParallelWorkersSet = parallelWorkersSet
 	tbl.AutovacuumEnabled = autovacuumEnabled
 	tbl.AutovacuumEnabledSet = autovacuumEnabledSet
+	tbl.ToastTupleTarget = toastTupleTarget
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

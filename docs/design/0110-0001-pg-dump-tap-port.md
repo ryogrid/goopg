@@ -5717,6 +5717,37 @@ no reloptions) and `TestAutovacuumEnabledInvalidValueRejected`
 `optav (… WITH (autovacuum_enabled=false))` on its own table; the assertion
 confirms the dump carries `WITH (autovacuum_enabled='false')`.
 
+### Slice 197 — integer storage parameter with a non-zero minimum (`toast_tuple_target`) round-trip
+
+Slices 54/195/196 made `fillfactor`, `parallel_workers` and `autovacuum_enabled`
+round-trip. `toast_tuple_target` is the next-most-common heap reloption and
+exercises an integer variant the prior slices did not: its valid range starts at
+**128** (PG's `128, TOAST_TUPLE_TARGET_MAIN`, where `TOAST_TUPLE_TARGET_MAIN =
+MaximumBytesPerTuple(1) = 8160` on the default 8 KB page). Because the minimum is
+128, zero unambiguously means "unset" — so it reuses `fillfactor`'s plain
+zero-check pattern (`ToastTupleTarget int`, no separate `Set` flag), unlike
+`parallel_workers` whose `0` is a real value requiring `ParallelWorkersSet`.
+
+Before this slice goopg validated the lowercase WITH key but never extracted it,
+so `CREATE TABLE … WITH (toast_tuple_target=256)` succeeded and silently lost the
+option. The fix extracts and bounds-checks it (128–8160; out-of-range or
+non-integer → PG's `22023`) on the base-table CREATE path and persists
+`catalog.Table.ToastTupleTarget`. The pg_class virtual view appends
+`toast_tuple_target=N` as a trailing integer element after `autovacuum_enabled`
+in the ordered reloptions list; pg_dump's `appendReloptionsArray` renders
+`WITH (toast_tuple_target='256')`.
+
+goopg's TOAST thresholds are fixed, so the value is advisory catalog/dump-only
+state — runtime unaffected; only the schema round-trips. Base-table-only, same as
+the sibling reloption slices.
+
+Engine guards: `TestToastTupleTargetSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,toast_tuple_target=256}`; boundary `{toast_tuple_target=128}`;
+plain table → no reloptions) and `TestToastTupleTargetOutOfBoundsRejected`
+(`127`/`8161`/`0`/`huge` → 22023). The pg_dump fixture adds
+`optt (… WITH (toast_tuple_target=256))` on its own table; the assertion confirms
+the dump carries `WITH (toast_tuple_target='256')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
