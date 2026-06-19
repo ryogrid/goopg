@@ -5481,6 +5481,28 @@ object support.
         Executor+parser+catalog unit suites PASS. Design: `0110-0001` Slice 254. pgbench pre-commit smoke on
         commit. **Next (slice 255+):** `ALTER TYPE … DROP ATTRIBUTE` / `ALTER ATTRIBUTE … TYPE`.
 
+      - **PROGRESS 2026-06-20 (loop #21):** **DU-002 slice 255 LANDED — `ALTER TYPE … DROP ATTRIBUTE [IF EXISTS]
+        attname` removes a composite type field; the dropped attribute disappears from pg_dump.** Slices 253/254
+        wired `ADD`/`RENAME ATTRIBUTE`; `DROP ATTRIBUTE` had no parser branch and fell through to the generic
+        ALTER-TYPE stub (consumed to `;` as a no-op), so the field still dumped. Parser (`parseAlterType`): new
+        `DROP` branch (`DROP` is the reserved `KwDrop`) with an `attribute` sub-branch parsing optional
+        `IF EXISTS` + the name (lower-cased) + stub-consumed `CASCADE`/`RESTRICT` trailer →
+        `AlterTypeStmt.DropAttrName`/`DropAttrIfExists`. Executor (`execAlterType`): `DropAttrName != ""` →
+        `cat.LookupCompositeType` (42704 absent); scan `ct.Fields` — missing field with `IF EXISTS` emits PG
+        `column "%s" of relation "%s" does not exist, skipping` NOTICE and returns, else `42703`
+        `column "%s" of relation "%s" does not exist`. On a hit, splice the field out and **re-sync** the heap
+        exactly as slices 253/254 (composite OIDs stable across `RegisterCompositeTypeWithFields`; stamp `xmax` on
+        existing pg_type×2 + pg_class/pg_attribute, re-run `syncCompositeTypeToCatalogHeap` — the dropped field's
+        pg_attribute row just doesn't reappear). No pg_dump-side change. Scope: single-attribute `DROP ATTRIBUTE`
+        only; `ALTER ATTRIBUTE … TYPE`/multi-subcommand/zero-column-drop/`attisdropped`-placeholder/ROLLBACK
+        deferred (one task per loop). Guards: `parser.TestAlterTypeDropAttributeParsing` (bare/CASCADE/IF EXISTS,
+        NOT the ADD/RENAME attribute fields) + pg_dump TAP port runs `DROP ATTRIBUTE c` (+ no-op `DROP ATTRIBUTE
+        IF EXISTS nonexistent`) after the RENAME, asserts the dump re-emits `a integer, b_renamed text`
+        (comma-less final field) and that `c numeric(10,2)` is gone, byte-matching real pg_dump 18.3
+        (`TestPort_PgDumpConnectionSetup` PASS, 3.6s). Executor+parser+catalog unit suites PASS. Design:
+        `0110-0001` Slice 255. pgbench pre-commit smoke on commit. **Next (slice 256+):** `ALTER TYPE … ALTER
+        ATTRIBUTE … TYPE` / multi-subcommand `ALTER TYPE`.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

@@ -7399,8 +7399,38 @@ Guarded at two levels: `parser.TestAlterTypeRenameAttributeParsing` pins the par
 `ALTER TYPE public.alt_comp RENAME ATTRIBUTE b TO b_renamed` after the two `ADD ATTRIBUTE`s and asserts the dump
 re-emits `a integer, b_renamed text, c numeric(10,2)`, byte-matching real pg_dump 18.3.
 
-> **Next (slice 255+):** `ALTER TYPE … DROP ATTRIBUTE` / `ALTER ATTRIBUTE … TYPE`
-> (the remaining `ALTER TYPE` attribute subcommands).
+### Slice 255 — `ALTER TYPE … DROP ATTRIBUTE [IF EXISTS] attname` removes a composite field
+
+Slices 253/254 wired `ADD`/`RENAME ATTRIBUTE`; `DROP ATTRIBUTE` had no parser branch at all, so it fell through
+to the generic ALTER-TYPE stub (consumed to `;` as a no-op) and the field still dumped. This slice wires the
+`DROP ATTRIBUTE` form end-to-end, reusing the same re-sync mechanism.
+
+- **Parser (`parseAlterType`)** — a new `DROP` branch (`DROP` is the reserved `KwDrop`, not an ident keyword)
+  with an `attribute` sub-branch parses an optional `IF EXISTS`, the attribute name (lower-cased), and
+  stub-consumes any `CASCADE`/`RESTRICT` trailer to `;`/EOF. Recorded on `AlterTypeStmt.DropAttrName` /
+  `DropAttrIfExists`.
+- **Executor (`execAlterType`)** — when `DropAttrName != ""`, look up the composite type (`42704` if absent),
+  scan `ct.Fields` for the name. If missing: `DROP ATTRIBUTE IF EXISTS` emits the PG
+  `column "%s" of relation "%s" does not exist, skipping` NOTICE and returns; otherwise `42703`
+  `column "%s" of relation "%s" does not exist` (matching PG's drop-attribute error). On a hit, splice the
+  field out of the slice, then re-sync the heap exactly as slices 253/254 (OIDs stable across
+  `RegisterCompositeTypeWithFields`; stamp `xmax` on the existing `pg_type` ×2 + `pg_class`/`pg_attribute` rows
+  and re-run `syncCompositeTypeToCatalogHeap` — the dropped field's `pg_attribute` row simply doesn't reappear).
+- **No `pg_dump`-side change** — `dumpCompositeType` walks the re-synced `pg_attribute` rows.
+- **Scope**: single-attribute `DROP ATTRIBUTE` only. `ALTER ATTRIBUTE … TYPE`, multi-subcommand statements
+  (`DROP …, ADD …`), dropping the last attribute to a zero-column composite, PG's `attisdropped` placeholder
+  semantics, and mid-txn ROLLBACK of the in-memory drop remain future work (one task per loop). The re-sync
+  fully removes the field rather than tombstoning it, which is equivalent for pg_dump round-trip purposes
+  (pg_dump skips `attisdropped` columns anyway).
+
+Guarded at two levels: `parser.TestAlterTypeDropAttributeParsing` pins the parse (bare / `CASCADE` / `IF EXISTS`
+forms, and that it does NOT touch the ADD/RENAME attribute fields); the pg_dump TAP port now runs
+`ALTER TYPE public.alt_comp DROP ATTRIBUTE c` (plus a no-op `DROP ATTRIBUTE IF EXISTS nonexistent`) after the
+RENAME, asserts the dump re-emits `a integer, b_renamed text` (comma-less final field) and that
+`c numeric(10,2)` is gone, byte-matching real pg_dump 18.3.
+
+> **Next (slice 256+):** `ALTER TYPE … ALTER ATTRIBUTE … TYPE` (re-resolve one field's
+> type) and multi-subcommand `ALTER TYPE` statements.
 
 ## Deferred (002–010) — catalog surface estimate
 

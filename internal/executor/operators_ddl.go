@@ -10379,6 +10379,49 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 		return nil
 	}
+	// DROP ATTRIBUTE [IF EXISTS] attname — remove a composite type field so it no
+	// longer round-trips through pg_dump's dumpCompositeType. DU-002 slice 255.
+	// Same re-sync mechanism as ADD/RENAME ATTRIBUTE: the composite's OIDs are
+	// stable across re-registration, so stamp xmax on the existing heap rows and
+	// re-sync the field set without the dropped attribute.
+	if s.DropAttrName != "" {
+		ct := cat.LookupCompositeType(s.Name)
+		if ct == nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		idx := -1
+		for i, f := range ct.Fields {
+			if strings.EqualFold(f.Name, s.DropAttrName) {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			// Match PG renameatt/dropatt: "column %q of relation %q does not
+			// exist"; IF EXISTS downgrades the error to a skipping NOTICE.
+			if s.DropAttrIfExists {
+				o.ctx.AddNotice(fmt.Sprintf("column %q of relation %q does not exist, skipping", s.DropAttrName, s.Name))
+				return nil
+			}
+			return &ExecError{Code: "42703", Pos: s.Pos(),
+				Message: fmt.Sprintf("column %q of relation %q does not exist", s.DropAttrName, s.Name)}
+		}
+		newFields := make([]catalog.CompositeField, 0, len(ct.Fields)-1)
+		newFields = append(newFields, ct.Fields[:idx]...)
+		newFields = append(newFields, ct.Fields[idx+1:]...)
+		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
+		}
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
+		return nil
+	}
 	// RENAME VALUE 'old' TO 'new' — M0097-0022.
 	if s.RenameOldValue != "" {
 		err := cat.RenameEnumValue(s.Name, s.RenameOldValue, s.RenameNewValue)

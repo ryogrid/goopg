@@ -5599,6 +5599,39 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		}
 		return stmt, nil
 	}
+	// DROP ATTRIBUTE [IF EXISTS] attname [CASCADE|RESTRICT] — remove a composite
+	// type field so it no longer round-trips through pg_dump. DU-002 slice 255.
+	// DROP is a reserved keyword (KwDrop), not an ident keyword.
+	if p.acceptKeyword(KwDrop) {
+		if p.acceptIdentKeyword("attribute") {
+			if p.acceptKeyword(KwIf) {
+				if _, err := p.expectKeyword(KwExists); err != nil {
+					return nil, err
+				}
+				stmt.DropAttrIfExists = true
+			}
+			if p.cur().Kind != TokenIdent {
+				return nil, p.errAtCur("expected attribute name after DROP ATTRIBUTE")
+			}
+			stmt.DropAttrName = strings.ToLower(p.advance().Value)
+			// Consume trailing CASCADE|RESTRICT / further subcommands to ';'/EOF.
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return stmt, nil
+		}
+		// Other DROP variants — consume as stub.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return stmt, nil
+	}
 	// RENAME VALUE 'old' TO 'new' (enum label rename). M0097-0022.
 	if p.acceptIdentKeyword("rename") {
 		if p.acceptIdentKeyword("value") {

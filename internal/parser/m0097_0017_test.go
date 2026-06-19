@@ -164,6 +164,39 @@ func TestAlterTypeRenameAttributeParsing(t *testing.T) {
 	}
 }
 
+// TestAlterTypeDropAttributeParsing covers the DROP ATTRIBUTE [IF EXISTS] attname
+// sub-branch (DU-002 slice 255). It must NOT touch the ADD/RENAME attribute fields.
+func TestAlterTypeDropAttributeParsing(t *testing.T) {
+	tests := []struct {
+		sql          string
+		wantName     string
+		wantIfExists bool
+	}{
+		{`ALTER TYPE addr DROP ATTRIBUTE zip`, "zip", false},
+		{`ALTER TYPE addr DROP ATTRIBUTE zip CASCADE`, "zip", false},
+		{`ALTER TYPE addr DROP ATTRIBUTE IF EXISTS zip`, "zip", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.sql[:min(60, len(tc.sql))], func(t *testing.T) {
+			stmts, err := parser.Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+			}
+			at, ok := stmts[0].(*parser.AlterTypeStmt)
+			if !ok {
+				t.Fatalf("expected *AlterTypeStmt, got %T", stmts[0])
+			}
+			if at.AddAttrName != "" || at.RenameAttrOld != "" {
+				t.Errorf("took an ADD/RENAME attribute branch: AddAttrName=%q RenameAttrOld=%q", at.AddAttrName, at.RenameAttrOld)
+			}
+			if at.DropAttrName != tc.wantName || at.DropAttrIfExists != tc.wantIfExists {
+				t.Errorf("DROP ATTRIBUTE = {%q, %v}, want {%q, %v}",
+					at.DropAttrName, at.DropAttrIfExists, tc.wantName, tc.wantIfExists)
+			}
+		})
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

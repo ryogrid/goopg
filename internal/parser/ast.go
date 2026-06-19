@@ -2133,6 +2133,9 @@ type AlterTypeStmt struct {
 	// RENAME ATTRIBUTE old TO new — renames a composite type field. DU-002 slice 254.
 	RenameAttrOld string // existing attribute name (empty when not RENAME ATTRIBUTE)
 	RenameAttrNew string // replacement attribute name
+	// DROP ATTRIBUTE [IF EXISTS] attname — removes a composite type field. DU-002 slice 255.
+	DropAttrName     string // attribute to drop (empty when not DROP ATTRIBUTE)
+	DropAttrIfExists bool   // DROP ATTRIBUTE IF EXISTS — missing attr → NOTICE, not error
 }
 
 func (s *AlterTypeStmt) Pos() int  { return s.pos }

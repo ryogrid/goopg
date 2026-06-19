@@ -1,30 +1,31 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 254 (loop #20) — `ALTER TYPE … RENAME ATTRIBUTE old TO new`
-renames a composite type field in place; the renamed attribute round-trips through
-pg_dump. Previously the parser's `RENAME` branch knew only `RENAME VALUE`/`RENAME TO`
-and stub-consumed `RENAME ATTRIBUTE …` to `;` (silent no-op).
+Last landed: DU-002 slice 255 (loop #21) — `ALTER TYPE … DROP ATTRIBUTE [IF EXISTS]
+attname` removes a composite type field in place; the dropped attribute disappears
+from pg_dump. Previously `DROP ATTRIBUTE` had no parser branch and fell through to the
+generic ALTER-TYPE stub (consumed to `;` as a silent no-op), so the field still dumped.
 
 Mechanism:
-- Parser (parseAlterType, ddl.go): inside the `RENAME` branch, new `attribute`
-  sub-branch parses `old TO new` (two bare idents, lower-cased), stub-consumes a
-  CASCADE/RESTRICT trailer → AlterTypeStmt.RenameAttrOld/RenameAttrNew.
-- Executor (execAlterType, operators_ddl.go): RenameAttrOld != "" → LookupCompositeType
-  (42704 absent; 42703 `column … does not exist` if old name missing; 42701 collision
-  with new name), copy field slice, rewrite the one field's Name, RE-SYNC heap (same as
-  slice 253 ADD ATTRIBUTE: composite OIDs stable across RegisterCompositeTypeWithFields,
-  stamp xmax on pg_type×2 + pg_class/pg_attribute, re-run syncCompositeTypeToCatalogHeap).
-  No pg_dump-side change.
+- Parser (parseAlterType, ddl.go): new `DROP` branch (`DROP` is reserved `KwDrop`) with
+  an `attribute` sub-branch parsing optional `IF EXISTS` + name (lower-cased) +
+  stub-consumed CASCADE/RESTRICT trailer → AlterTypeStmt.DropAttrName/DropAttrIfExists.
+- Executor (execAlterType, operators_ddl.go): DropAttrName != "" → LookupCompositeType
+  (42704 absent); scan ct.Fields — missing field + IF EXISTS → PG NOTICE
+  `column "%s" of relation "%s" does not exist, skipping` + return; else 42703
+  `column "%s" of relation "%s" does not exist`. On hit, splice the field out and
+  RE-SYNC heap (same as slices 253/254: composite OIDs stable, stamp xmax on
+  pg_type×2 + pg_class/pg_attribute, re-run syncCompositeTypeToCatalogHeap — dropped
+  pg_attribute row just doesn't reappear). No pg_dump-side change.
 
-Files: internal/parser/ast.go (RenameAttrOld/RenameAttrNew), internal/parser/ddl.go,
-internal/parser/m0097_0017_test.go (+TestAlterTypeRenameAttributeParsing),
-internal/executor/operators_ddl.go (execAlterType RENAME ATTRIBUTE block),
-internal/testport/pgdump_connsetup_test.go (RENAME b→b_renamed + dump assert),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 254), .ralph/fix_plan.md.
+Files: internal/parser/ast.go (DropAttrName/DropAttrIfExists), internal/parser/ddl.go,
+internal/parser/m0097_0017_test.go (+TestAlterTypeDropAttributeParsing),
+internal/executor/operators_ddl.go (execAlterType DROP ATTRIBUTE block),
+internal/testport/pgdump_connsetup_test.go (DROP c + IF EXISTS no-op + neg assert),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 255), .ralph/fix_plan.md.
 
 Gates: gofmt clean; go build ./... clean; executor+parser+catalog unit suites PASS;
-TestPort_PgDumpConnectionSetup PASS (3.5s, real pg_dump round-trips
-`a integer, b_renamed text, c numeric(10,2)`); pgbench pre-commit smoke on commit.
+TestPort_PgDumpConnectionSetup PASS (3.6s, real pg_dump round-trips
+`a integer, b_renamed text`, c numeric(10,2) gone); pgbench pre-commit smoke on commit.
 
-Next (slice 255+): ALTER TYPE … DROP ATTRIBUTE (needs attisdropped handling) and
-ALTER ATTRIBUTE … TYPE (re-resolve one field's type) — remaining attribute subcommands.
+Next (slice 256+): ALTER TYPE … ALTER ATTRIBUTE … TYPE (re-resolve one field's type)
+and multi-subcommand ALTER TYPE statements — remaining attribute subcommands.
