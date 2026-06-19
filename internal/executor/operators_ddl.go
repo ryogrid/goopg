@@ -993,6 +993,23 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		parallelWorkers = pw
 		parallelWorkersSet = true
 	}
+	// Extract and parse the autovacuum_enabled storage parameter. PG accepts
+	// the usual boolean spellings (true/false, on/off, yes/no, 1/0, t/f,
+	// y/n; case-insensitive) via parse_bool. goopg has no autovacuum, so the
+	// value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_enabled='true')`.
+	// M0110-0001 (DU-002 slice 196).
+	autovacuumEnabled := false
+	autovacuumEnabledSet := false
+	if v, ok := s.With["autovacuum_enabled"]; ok {
+		b, parsed := parseReloptionBool(strings.TrimSpace(v))
+		if !parsed {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for boolean option \"autovacuum_enabled\": %s", v)}
+		}
+		autovacuumEnabled = b
+		autovacuumEnabledSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1047,6 +1064,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.Fillfactor = fillfactor
 	tbl.ParallelWorkers = parallelWorkers
 	tbl.ParallelWorkersSet = parallelWorkersSet
+	tbl.AutovacuumEnabled = autovacuumEnabled
+	tbl.AutovacuumEnabledSet = autovacuumEnabledSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
@@ -5184,6 +5203,56 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 		o.ctx.Pool.Unpin(slot)
 	}
 	return nil
+}
+
+// parseReloptionBool mirrors PostgreSQL's parse_bool (parse_bool_with_len in
+// bool.c), which validates boolean reloption values such as
+// `autovacuum_enabled`. Like PG it accepts case-insensitive *prefixes* of the
+// canonical spellings: any non-empty prefix of true/false/yes/no (e.g. "t",
+// "tr", "tru", "true"), plus "on", "of"/"off", and single-character "1"/"0".
+// The second return value reports whether the input was a recognized boolean —
+// callers raise an "invalid value for boolean option" error when it is false.
+// M0110-0001 (DU-002 slice 196).
+func parseReloptionBool(s string) (bool, bool) {
+	if s == "" {
+		return false, false
+	}
+	lower := strings.ToLower(s)
+	switch lower[0] {
+	case 't':
+		if strings.HasPrefix("true", lower) {
+			return true, true
+		}
+	case 'f':
+		if strings.HasPrefix("false", lower) {
+			return false, true
+		}
+	case 'y':
+		if strings.HasPrefix("yes", lower) {
+			return true, true
+		}
+	case 'n':
+		if strings.HasPrefix("no", lower) {
+			return false, true
+		}
+	case 'o':
+		// "on" needs ≥2 chars; "of"/"off" both map to false.
+		if lower == "on" {
+			return true, true
+		}
+		if lower == "of" || lower == "off" {
+			return false, true
+		}
+	case '1':
+		if lower == "1" {
+			return true, true
+		}
+	case '0':
+		if lower == "0" {
+			return false, true
+		}
+	}
+	return false, false
 }
 
 // encodeCompositeBTreeKey builds a composite btree key by concatenating

@@ -695,6 +695,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optpw: %v", err)
 	}
 
+	// Slice 196: a BOOLEAN table-level storage parameter (`autovacuum_enabled`)
+	// must round-trip too. It is the most common non-fillfactor reloption in real
+	// dumps and exercises the boolean reloption code path (parseReloptionBool
+	// mirrors PG's parse_bool). goopg validated the WITH key as lowercase but
+	// never extracted/persisted it, so it vanished from the dump. The fix stores
+	// catalog.Table.AutovacuumEnabled{,Set}; the pg_class virtual view renders
+	// `{autovacuum_enabled=false}`, which pg_dump emits as `WITH
+	// (autovacuum_enabled='false')`. goopg has no autovacuum, so the value is
+	// catalog/dump-only (advisory). `optav` carries it on its own table to keep
+	// the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optav (id integer PRIMARY KEY) WITH (autovacuum_enabled=false)"); err != nil {
+		t.Fatalf("create table optav: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2358,6 +2372,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (fillfactor='70', parallel_workers='4')") {
 			t.Errorf("pg_dump dropped the parallel_workers reloption; missing %q\n  full stdout=%q", "WITH (fillfactor='70', parallel_workers='4')", res.Stdout)
+		}
+		// **Slice 196 closed (asserted):** a BOOLEAN storage parameter
+		// (autovacuum_enabled) must round-trip — the most common non-fillfactor
+		// reloption in real dumps. goopg validated the lowercase WITH key but never
+		// extracted/persisted it, so it vanished from the dump.
+		// catalog.Table.AutovacuumEnabled{,Set} now persists it (parseReloptionBool
+		// mirrors PG's parse_bool); the pg_class virtual view renders
+		// `{autovacuum_enabled=false}`, which pg_dump emits as `WITH
+		// (autovacuum_enabled='false')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optav (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optav\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (autovacuum_enabled='false')") {
+			t.Errorf("pg_dump dropped the autovacuum_enabled reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_enabled='false')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

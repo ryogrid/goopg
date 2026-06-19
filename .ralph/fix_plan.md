@@ -4308,6 +4308,30 @@ object support.
         `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** composite
         types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger); or further reloptions
         (`autovacuum_*`, `toast_tuple_target`) on the same passthrough pattern.
+      - **PROGRESS 2026-06-19 (loop #9):** **DU-002 slice 196 LANDED — boolean table-level storage
+        parameter (`autovacuum_enabled`) round-trips through pg_dump.** Slices 54/195 made two *integer*
+        reloptions round-trip; `autovacuum_enabled` is the most common non-fillfactor reloption in real
+        dumps and the first **boolean** one, so it exercises a new code path (value parsing, not
+        bounds-checking). goopg validated the lowercase WITH key but never extracted it, so
+        `CREATE TABLE … WITH (autovacuum_enabled=false)` succeeded and silently lost the option. The fix
+        adds a `parseReloptionBool` helper mirroring PG's `parse_bool` (`parse_bool_with_len`): accepts
+        case-insensitive **prefixes** of `true`/`false`/`yes`/`no` plus `on`/`of`/`off`/`1`/`0`;
+        unrecognized → `22023 invalid value for boolean option`. Like parallel_workers the boolean has no
+        zero-detectable default, so `catalog.Table` carries `AutovacuumEnabled bool` +
+        `AutovacuumEnabledSet bool` and only the flag surfaces it. The pg_class virtual view appends
+        `autovacuum_enabled=true|false` (via `strconv.FormatBool`) after the two integer options;
+        pg_dump's `appendReloptionsArray` renders `WITH (autovacuum_enabled='false')`. goopg has no
+        autovacuum, so the value is advisory catalog/dump-only (runtime unchanged); base-table-only.
+        Files: `internal/catalog/catalog.go` (`Table.AutovacuumEnabled`/`AutovacuumEnabledSet` + render),
+        `internal/executor/operators_ddl.go` (`parseReloptionBool` helper + extract/parse + persist on
+        `execCreateTable`), `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestAutovacuumEnabledSurfacesInPgClassReloptions` + `TestAutovacuumEnabledInvalidValueRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optav` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 196). Gates: gofmt OK; `go build ./...` clean;
+        `go vet ./internal/testport/` clean; catalog/executor reloption tests PASS;
+        `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** more
+        reloptions on the same pattern (`toast_tuple_target` int 128–8160, `autovacuum_vacuum_scale_factor`
+        real 0–100); or composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

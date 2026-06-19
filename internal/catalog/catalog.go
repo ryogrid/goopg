@@ -404,6 +404,17 @@ type Table struct {
 	// is catalog/dump-only (advisory; runtime unaffected). M0110-0001 (DU-002 slice 195).
 	ParallelWorkers    int
 	ParallelWorkersSet bool
+
+	// AutovacuumEnabled stores the table's `WITH (autovacuum_enabled=BOOL)`
+	// storage parameter. Like parallel_workers, the value itself (true/false)
+	// carries no default that a zero check could detect, so AutovacuumEnabledSet
+	// guards whether the option was specified. When set, pg_class.reloptions
+	// gains the text[] element `autovacuum_enabled=true|false`, which pg_dump
+	// renders back as `WITH (autovacuum_enabled='true'|'false')`. goopg has no
+	// autovacuum, so the value is catalog/dump-only (advisory; runtime
+	// unaffected). M0110-0001 (DU-002 slice 196).
+	AutovacuumEnabled    bool
+	AutovacuumEnabledSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2114,13 +2125,17 @@ func (c *InMemory) registerSystemTables() {
 			// a non-empty one round-trips through pg_dump as `WITH
 			// (fillfactor='70')`. M0110-0001 (DU-002 slice 54). Multiple options
 			// (e.g. fillfactor + parallel_workers, slice 195) join in a fixed
-			// order as `{fillfactor=70,parallel_workers=4}`.
+			// order as `{fillfactor=70,parallel_workers=4}`; autovacuum_enabled
+			// (slice 196) follows as a boolean element.
 			var relopts []string
 			if t.Fillfactor != 0 {
 				relopts = append(relopts, "fillfactor="+strconv.Itoa(t.Fillfactor))
 			}
 			if t.ParallelWorkersSet {
 				relopts = append(relopts, "parallel_workers="+strconv.Itoa(t.ParallelWorkers))
+			}
+			if t.AutovacuumEnabledSet {
+				relopts = append(relopts, "autovacuum_enabled="+strconv.FormatBool(t.AutovacuumEnabled))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

@@ -150,6 +150,95 @@ func TestParallelWorkersOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+// TestAutovacuumEnabledSurfacesInPgClassReloptions verifies that a `WITH
+// (autovacuum_enabled=BOOL)` storage parameter declared on CREATE TABLE is
+// persisted on the catalog table and surfaced through the pg_class virtual
+// view's reloptions cell. Cases pin: a false value alongside fillfactor
+// (combined `{fillfactor=70,autovacuum_enabled=false}`), a true value spelled
+// with a non-canonical accepted token ("on" → `autovacuum_enabled=true`), and a
+// plain table (no reloptions). pg_dump renders the array back as `WITH
+// (autovacuum_enabled='false')`. goopg has no autovacuum, so the value is
+// catalog/dump-only. DU-002 slice 196.
+func TestAutovacuumEnabledSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE av (id integer PRIMARY KEY) WITH (fillfactor=70, autovacuum_enabled=false)`); err != nil {
+		t.Fatalf("CREATE TABLE av: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE avon (id integer PRIMARY KEY) WITH (autovacuum_enabled=on)`); err != nil {
+		t.Fatalf("CREATE TABLE avon: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE avplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE avplain: %v", err)
+	}
+
+	avTbl, ok := cat.LookupTable(parser.ObjectName{Name: "av"})
+	if !ok {
+		t.Fatal("av table not found")
+	}
+	if !avTbl.AutovacuumEnabledSet || avTbl.AutovacuumEnabled {
+		t.Errorf("av.AutovacuumEnabled = %v (set=%v), want false (set=true)", avTbl.AutovacuumEnabled, avTbl.AutovacuumEnabledSet)
+	}
+	onTbl, ok := cat.LookupTable(parser.ObjectName{Name: "avon"})
+	if !ok {
+		t.Fatal("avon table not found")
+	}
+	if !onTbl.AutovacuumEnabledSet || !onTbl.AutovacuumEnabled {
+		t.Errorf("avon.AutovacuumEnabled = %v (set=%v), want true (set=true)", onTbl.AutovacuumEnabled, onTbl.AutovacuumEnabledSet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "avplain"})
+	if !ok {
+		t.Fatal("avplain table not found")
+	}
+	if plainTbl.AutovacuumEnabledSet {
+		t.Errorf("avplain.AutovacuumEnabledSet = true, want false (unset)")
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "av" || r[1] == "avon" || r[1] == "avplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["av"] != "{fillfactor=70,autovacuum_enabled=false}" {
+		t.Errorf("pg_class.reloptions for av = %q, want %q", got["av"], "{fillfactor=70,autovacuum_enabled=false}")
+	}
+	if got["avon"] != "{autovacuum_enabled=true}" {
+		t.Errorf("pg_class.reloptions for avon = %q, want %q", got["avon"], "{autovacuum_enabled=true}")
+	}
+	if got["avplain"] != "" {
+		t.Errorf("pg_class.reloptions for avplain = %q, want \"\" (NULL)", got["avplain"])
+	}
+}
+
+// TestAutovacuumEnabledInvalidValueRejected verifies CREATE TABLE rejects a
+// non-boolean autovacuum_enabled value with PG's 22023 error. DU-002 slice 196.
+func TestAutovacuumEnabledInvalidValueRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, v := range []string{"maybe", "2", "tru3"} {
+		err := runDDL(t, ctx, `CREATE TABLE avbad`+strconv.Itoa(i)+` (id integer) WITH (autovacuum_enabled=`+v+`)`)
+		if err == nil {
+			t.Errorf("autovacuum_enabled=%s: expected an invalid-value error, got nil", v)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("autovacuum_enabled=%s: error type = %T, want *ExecError", v, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("autovacuum_enabled=%s: error code = %q, want 22023", v, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.

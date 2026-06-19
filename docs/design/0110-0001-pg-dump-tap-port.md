@@ -5680,6 +5680,43 @@ plain table → no reloptions) and `TestParallelWorkersOutOfBoundsRejected`
 54's single-option `opt` assertion stays intact); the assertion confirms the dump
 carries `WITH (fillfactor='70', parallel_workers='4')`.
 
+### Slice 196 — boolean table-level storage parameter (`autovacuum_enabled`) round-trip
+
+Slices 54/195 made two *integer* reloptions (`fillfactor`, `parallel_workers`)
+round-trip. `autovacuum_enabled` is the most common non-fillfactor reloption in
+real-world dumps and the first **boolean** one, so it exercises a genuinely new
+code path: value parsing rather than bounds-checking. Before this slice goopg
+validated the lowercase WITH key but never extracted it, so
+`CREATE TABLE … WITH (autovacuum_enabled=false)` succeeded and silently lost the
+option — `reloptions` never carried it and pg_dump never re-emitted it.
+
+The fix adds a `parseReloptionBool` helper that mirrors PG's `parse_bool`
+(`parse_bool_with_len` in `bool.c`): it accepts case-insensitive **prefixes** of
+the canonical spellings — any non-empty prefix of `true`/`false`/`yes`/`no`
+(`t`, `tr`, `tru`, `true`, …), plus `on`, `of`/`off`, and single-character
+`1`/`0`. An unrecognized token raises PG's `22023`
+`invalid value for boolean option "autovacuum_enabled"`. Like `parallel_workers`,
+the boolean carries no default a zero-value check could detect, so `catalog.Table`
+holds both `AutovacuumEnabled bool` and an `AutovacuumEnabledSet bool` guard; only
+the flag decides whether the option surfaces.
+
+The pg_class virtual view appends `autovacuum_enabled=true|false`
+(`strconv.FormatBool`) after the two integer options in the ordered reloptions
+list. pg_dump's `appendReloptionsArray` splits each `name=value` element and quotes
+the value, rendering `WITH (autovacuum_enabled='false')`.
+
+goopg has no autovacuum, so the value is advisory catalog/dump-only state (like
+`parallel_workers` in slice 195) — the runtime is unaffected; only the schema
+round-trips. Base-table-only, same as the sibling reloption slices.
+
+Engine guards: `TestAutovacuumEnabledSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,autovacuum_enabled=false}`; the non-canonical token `on` →
+`{autovacuum_enabled=true}`, proving the prefix-accepting parser; plain table →
+no reloptions) and `TestAutovacuumEnabledInvalidValueRejected`
+(`maybe`/`2`/`tru3` → 22023). The pg_dump fixture adds
+`optav (… WITH (autovacuum_enabled=false))` on its own table; the assertion
+confirms the dump carries `WITH (autovacuum_enabled='false')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
