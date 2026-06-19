@@ -8129,7 +8129,7 @@ func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	}
 	for i, field := range ct.Fields {
 		attnum := i + 1 // 1-based
-		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRowForCompositeField(ct, field, attnum))
+		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRowForCompositeField(ctx.Catalog, ct, field, attnum))
 		if err != nil {
 			return
 		}

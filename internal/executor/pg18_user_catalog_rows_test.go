@@ -906,7 +906,7 @@ func TestUserPGClassAndAttributeForComposite(t *testing.T) {
 	}
 
 	// Field 1: street text → atttypid=text, atttypmod=-1, attnum=1.
-	a0 := buildUserPGAttributeRowForCompositeField(ct, ct.Fields[0], 1)
+	a0 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[0], 1)
 	if got := uint32(a0[attrelidIdx].Int); got != ct.RelOID {
 		t.Errorf("field0 attrelid=%d want %d", got, ct.RelOID)
 	}
@@ -920,7 +920,7 @@ func TestUserPGClassAndAttributeForComposite(t *testing.T) {
 		t.Errorf("field0 attnum=%d want 1", got)
 	}
 	// Field 2: zip int → atttypid=int4, attnum=2.
-	a1 := buildUserPGAttributeRowForCompositeField(ct, ct.Fields[1], 2)
+	a1 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[1], 2)
 	if got := uint32(a1[atttypidIdx].Int); got != catalog.OIDInt4 {
 		t.Errorf("field1 atttypid=%d want %d (int4)", got, catalog.OIDInt4)
 	}
@@ -933,13 +933,73 @@ func TestUserPGClassAndAttributeForComposite(t *testing.T) {
 	ctn := cat.RegisterCompositeTypeWithFields("money_row", []catalog.CompositeField{
 		{Name: "amt", ColType: "numeric ( 10 , 2 )"},
 	})
-	an := buildUserPGAttributeRowForCompositeField(ctn, ctn.Fields[0], 1)
+	an := buildUserPGAttributeRowForCompositeField(cat, ctn, ctn.Fields[0], 1)
 	if got := uint32(an[atttypidIdx].Int); got != catalog.OIDNumeric {
 		t.Errorf("numeric field atttypid=%d want %d", got, catalog.OIDNumeric)
 	}
 	wantMod := int64((10<<16|2)&0xffffffff) + 4
 	if got := an[atttypmodIdx].Int; got != wantMod {
 		t.Errorf("numeric(10,2) atttypmod=%d want %d", got, wantMod)
+	}
+}
+
+// TestUserPGAttributeCompositeFieldEnum pins the enum-FIELD resolution for a
+// composite type (DU-002 slice 245). A composite field whose declared type is a
+// user-defined enum folds to the text fallback inside parseCompositeFieldType
+// (TypeNameToOID knows only built-ins); buildUserPGAttributeRowForCompositeField
+// must re-resolve it to the enum's dynamically-allocated pg_type OID and report
+// the enum's physical layout (4-byte, int-aligned, plain storage, not byval), so
+// pg_dump's dumpCompositeType renders the field as the enum type rather than
+// `text`. Without the catalog (cat==nil) it must keep the text fallback.
+func TestUserPGAttributeCompositeFieldEnum(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	et, err := cat.RegisterEnum("mood", []string{"sad", "ok", "happy"})
+	if err != nil {
+		t.Fatalf("RegisterEnum: %v", err)
+	}
+	// CREATE TYPE person AS (name text, feeling mood): the parser records the
+	// field's ColType verbatim as the (built-in-unknown) enum name.
+	ct := cat.RegisterCompositeTypeWithFields("person", []catalog.CompositeField{
+		{Name: "name", ColType: "text"},
+		{Name: "feeling", ColType: "mood"},
+	})
+
+	// Built-in field is untouched: name → text.
+	a0 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[0], 1)
+	if got := uint32(a0[atttypidIdx].Int); got != catalog.OIDText {
+		t.Errorf("text field: atttypid=%d want %d (text)", got, catalog.OIDText)
+	}
+
+	// Enum field resolves to the enum's scalar pg_type OID, not text.
+	a1 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[1], 2)
+	if got := uint32(a1[atttypidIdx].Int); got != et.OID {
+		t.Errorf("enum field: atttypid=%d want %d (enum OID)", got, et.OID)
+	}
+	if got := a1[attlenIdx].Int; got != 4 {
+		t.Errorf("enum field: attlen=%d want 4", got)
+	}
+	if got := a1[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("enum field: attbyval=%v want false", got)
+	}
+	if got := a1[attalignIdx].StringValue(); got != "i" {
+		t.Errorf("enum field: attalign=%q want \"i\"", got)
+	}
+	if got := a1[attstorageIdx].StringValue(); got != "p" {
+		t.Errorf("enum field: attstorage=%q want \"p\" (plain)", got)
+	}
+
+	// Without a catalog the enum cannot be resolved → text fallback preserved
+	// (the row must still build for nil-catalog callers).
+	aNil := buildUserPGAttributeRowForCompositeField(nil, ct, ct.Fields[1], 2)
+	if got := uint32(aNil[atttypidIdx].Int); got != catalog.OIDText {
+		t.Errorf("enum field (nil cat): atttypid=%d want %d (text fallback)", got, catalog.OIDText)
 	}
 }
 

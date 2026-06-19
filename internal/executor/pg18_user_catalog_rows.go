@@ -1345,7 +1345,10 @@ func buildUserPGTypeRowForCompositeArray(ct *catalog.CompositeType) Row {
 // carry the encoded typmod to round-trip as `numeric(10,2)` rather than bare
 // `numeric`. Unknown / arg-less names yield typmod -1, matching pgAttTypmod.
 // DU-002 slice 243.
-func parseCompositeFieldType(colType string) (uint32, int64) {
+// The collapsed base type name is returned as the third value so callers can
+// re-resolve a user-defined field type (enum/domain) that TypeNameToOID folded
+// to the text fallback. DU-002 slice 245.
+func parseCompositeFieldType(colType string) (uint32, int64, string) {
 	base := strings.TrimSpace(colType)
 	var args []int64
 	if i := strings.IndexByte(base, '('); i >= 0 {
@@ -1369,7 +1372,7 @@ func parseCompositeFieldType(colType string) (uint32, int64) {
 	// TypeNameToOID recognises.
 	base = strings.Join(strings.Fields(base), " ")
 	typOID := catalog.TypeNameToOID(base)
-	return typOID, pgAttTypmod(typOID, args)
+	return typOID, pgAttTypmod(typOID, args), base
 }
 
 // buildUserPGClassRowForComposite builds the 34-column PG18-canonical pg_class
@@ -1427,9 +1430,27 @@ func buildUserPGClassRowForComposite(cat catalog.Catalog, ct *catalog.CompositeT
 // physical attrs (attlen/attbyval/attalign/attstorage/attcollation) follow the
 // resolved type. Composite fields carry no per-column overrides, so the
 // override-bearing columns are their defaults. attnum is 1-based. DU-002 slice 243.
-func buildUserPGAttributeRowForCompositeField(ct *catalog.CompositeType, field catalog.CompositeField, attnum int) Row {
-	typOID, typmod := parseCompositeFieldType(field.ColType)
+//
+// A field whose declared type is a user-defined enum resolves to the text
+// fallback inside parseCompositeFieldType (TypeNameToOID knows only built-ins).
+// Re-resolve it to the enum's dynamically-allocated pg_type OID — mirroring the
+// table-column path in buildUserPGAttributeRow — so pg_dump's
+// dumpCompositeType renders the field as the enum type rather than `text`. The
+// physical attrs match buildUserPGTypeRowForEnum's shape (4-byte, int-aligned,
+// plain-storage, non-collatable, like oid). DU-002 slice 245.
+func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.CompositeType, field catalog.CompositeField, attnum int) Row {
+	typOID, typmod, base := parseCompositeFieldType(field.ColType)
+	enumOID := uint32(0)
+	if cat != nil && typOID == catalog.OIDText {
+		if et, ok := cat.LookupEnum(base); ok {
+			typOID = et.OID
+			enumOID = et.OID
+		}
+	}
 	attrs := userTypeAttrsForOID(typOID)
+	if enumOID != 0 {
+		attrs = userTypeAttrs{TypLen: 4, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
+	}
 	return Row{
 		NewIntDatum(int64(ct.RelOID)),            // attrelid
 		NewStringDatum(field.Name),               // attname (name)

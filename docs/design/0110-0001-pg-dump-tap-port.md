@@ -7087,6 +7087,34 @@ ATTRIBUTE`. Crash-recovery of a rolled-back composite's catalog heap rows shares
 on MVCC xmin-abort visibility (no xmax stamp on rollback) — out of scope here, tracked with the enum
 behavior.
 
+### Slice 245 — composite field whose type is a user-defined enum
+
+Slice 243 resolved composite field types via `parseCompositeFieldType` → `catalog.TypeNameToOID`, which
+knows only built-ins, so a field declared with a user-defined enum folded to the `text` fallback:
+`CREATE TYPE person AS (feeling mood)` dumped as `feeling text` instead of `feeling public.mood`. This
+mirrors the table-column enum path (`buildUserPGAttributeRow`, slice 88) for composite fields.
+
+- **Re-resolve**: `parseCompositeFieldType` now also returns the collapsed base type name.
+  `buildUserPGAttributeRowForCompositeField` takes the catalog and, when the field resolved to the text
+  fallback (`typOID == OIDText`), calls `cat.LookupEnum(base)`; on a hit it sets `atttypid` to the enum's
+  dynamically-allocated scalar OID and overrides the physical attrs to the enum's shape (4-byte,
+  int-aligned, plain storage, non-byval — matching `buildUserPGTypeRowForEnum`/the table-column path).
+- **Call site**: `operators_ddl.go` `syncCompositeTypeToCatalogHeap` passes `ctx.Catalog`. A nil catalog
+  keeps the text fallback so non-catalog callers (and the existing built-in-only tests) still build a row.
+- **Scope**: scalar enum fields only this slice (mirrors slice 88). Enum-ARRAY fields, domain fields, and
+  nested-composite fields remain folded to their fallbacks — next slices, mirroring slices 89/90.
+
+Verified live (port 5544): `CREATE TYPE mood AS ENUM(...); CREATE TYPE person AS (name text, feeling mood,
+age int);` then `pg_dump --schema-only` emits `feeling public.mood` (was `feeling text`). Unit test
+`TestUserPGAttributeCompositeFieldEnum` (`pg18_user_catalog_rows_test.go`) pins enum-field re-resolution
+(OID + physical attrs), the untouched built-in field, and the nil-catalog text fallback.
+
+> **Observed (out of scope, pre-existing):** `pg_dump` from goopg → restore into a *second* goopg database
+> duplicates composite `pg_attribute`/`pg_type` rows, because those catalogs are a single shared heap with
+> no per-database isolation for `CREATE TYPE` writes (see the per-connection-virtual-catalog-scoping
+> limitation). The clean first dump is correct; the duplication only appears after restoring twice into the
+> shared heap. Independent of enum-field resolution — this slice adds no rows and does not allocate OIDs.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
