@@ -8022,8 +8022,34 @@ Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3 — asse
 regression that unconditionally emitted the `CONSTRAINT` prefix for any explicitly-named NOT NULL would fail the
 negative check.
 
-> **Next (slice 275+):** the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` end-to-end dump on a
-> *standalone* table (slice 271's ADD-CONSTRAINT path, but rendered inline because the column is local).
+### Slice 275 — *named* `NO INHERIT` NOT NULL added to a *local* column via `ALTER TABLE ADD CONSTRAINT` (inline)
+
+The ALTER-path counterpart of slice 273's CREATE-TABLE-inline case. Slice 271 exercised `ALTER TABLE ... ADD
+CONSTRAINT <name> NOT NULL <col>` on an *inherited* column (rendered as a standalone `CONSTRAINT <name> NOT NULL <col>`
+body item); slice 272 exercised `NO INHERIT` on a *standalone* table but via the CREATE-TABLE-inline parser; nninh2
+(slice 273) proved the inline `c integer CONSTRAINT c_nn NOT NULL NO INHERIT` form when the constraint is spelled at
+table-creation time. This slice closes the matrix: the SAME inline rendering must result when a named `NO INHERIT`
+NOT NULL arrives AFTER the fact on a LOCAL column —
+`CREATE TABLE nninh4 (c integer, d integer); ALTER TABLE nninh4 ADD CONSTRAINT nn4 NOT NULL c NO INHERIT` →
+`c integer CONSTRAINT nn4 NOT NULL NO INHERIT`.
+
+**No production change required.** The path already exists end-to-end: the parser captures the `NO INHERIT` trailer into
+`AlterTableAction.NoInherit` (`ddl.go:5483`) and the executor records a contype='n' pg_constraint row with
+connoinherit='t' via `tbl.AddNotNull(name, col, oid, act.NoInherit=true, isLocal=true, 0)` (`operators_ddl.go:5498`),
+then flushes attnotnull through the delete-old-rows + `syncTableToCatalogHeap` path (same as SET NOT NULL). Because the
+column is LOCAL (notnull_islocal='t') and `nn4` differs from the auto-name `nninh4_c_not_null`, real pg_dump re-emits
+the `CONSTRAINT nn4` prefix (pg_dump.c:17184) and the ` NO INHERIT` suffix (pg_dump.c:17188) on the inline column —
+exactly as for nninh2's inline-created `c`. The slice is a "sibling paths must agree" regression guard: it locks in that
+the **ALTER** path threads `act.NoInherit` and the conname identically to the **CREATE-inline** path. A regression that
+dropped `act.NoInherit` only on the ALTER arm would emit `c integer CONSTRAINT nn4 NOT NULL` (connoinherit='f') — a
+silent twin failure a green CREATE-inline test would not catch.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `nninh4`
+block contains `c integer CONSTRAINT nn4 NOT NULL NO INHERIT` and the plain `d integer` survives).
+
+> **Next (slice 276+):** an `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` (named, NO `NO INHERIT`) on a
+> *local* column — the bare-named ALTER variant, asserting the inline `CONSTRAINT <name> NOT NULL` form WITHOUT a
+> spurious ` NO INHERIT` suffix (the negative twin of slice 275).
 
 ## Deferred (002–010) — catalog surface estimate
 

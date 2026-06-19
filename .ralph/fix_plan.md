@@ -5905,6 +5905,26 @@ object support.
         `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 274. **Next (slice 275+):**
         the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` end-to-end dump on a STANDALONE table
         (slice 271's ADD-CONSTRAINT path, rendered inline because the column is local).
+      - **PROGRESS 2026-06-20 (loop #42):** **DU-002 slice 275 LANDED — a NAMED `NO INHERIT` NOT NULL added to a LOCAL
+        column via `ALTER TABLE ... ADD CONSTRAINT nn4 NOT NULL c NO INHERIT` dumps INLINE as
+        `c integer CONSTRAINT nn4 NOT NULL NO INHERIT` (no production change; sibling-paths regression guard).** The
+        ALTER-path counterpart of slice 273's CREATE-inline case: nninh2 (slice 273) proved the inline form when the
+        named NO INHERIT constraint is spelled at table-creation time; this slice proves the SAME inline rendering when
+        it arrives AFTER the fact through the `AlterTableAddNotNull` executor. Combines slice 271's ADD CONSTRAINT NOT
+        NULL parser/executor branch with slice 272's NO INHERIT thread on a STANDALONE table. The path already exists:
+        parser captures the `NO INHERIT` trailer into `AlterTableAction.NoInherit` (`ddl.go:5483`); executor records a
+        contype='n' pg_constraint row with connoinherit='t' via `tbl.AddNotNull(name, col, oid, act.NoInherit=true,
+        isLocal=true, 0)` (`operators_ddl.go:5498`) then flushes attnotnull via delete-old-rows + syncTableToCatalogHeap.
+        Because the column is LOCAL and `nn4` differs from auto-name `nninh4_c_not_null`, real pg_dump re-emits the
+        `CONSTRAINT nn4` prefix (pg_dump.c:17184) and ` NO INHERIT` suffix (pg_dump.c:17188). A regression dropping
+        `act.NoInherit` only on the ALTER arm would emit `c integer CONSTRAINT nn4 NOT NULL` — a silent twin a green
+        CREATE-inline test would miss. Fixture: `CREATE TABLE public.nninh4 (c integer, d integer)` +
+        `ALTER TABLE public.nninh4 ADD CONSTRAINT nn4 NOT NULL c NO INHERIT`. **Guards:**
+        `TestPort_PgDumpConnectionSetup` PASS (3.56s; asserts the inline `c integer CONSTRAINT nn4 NOT NULL NO INHERIT`
+        and that plain `d integer` survives). gofmt + `go build ./...` clean; pgbench pre-commit smoke on commit.
+        Design: `0110-0001` Slice 275. **Next (slice 276+):** an `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>`
+        (named, NO `NO INHERIT`) on a LOCAL column — the negative twin asserting the inline `CONSTRAINT <name> NOT NULL`
+        form WITHOUT a spurious ` NO INHERIT` suffix.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -1571,6 +1571,36 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create standalone table nninh3 with default-named NOT NULL column: %v", err)
 	}
 
+	// Slice 275: a NAMED `NO INHERIT` NOT NULL added to a LOCAL column via
+	// `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT`, dumped
+	// INLINE as `<col> <type> CONSTRAINT <name> NOT NULL NO INHERIT`. This is the
+	// ALTER-path counterpart of slice 273/274's CREATE-TABLE-inline cases: nninh2
+	// proved the inline form when the constraint is spelled at table-creation
+	// time; here the SAME inline rendering must result when the named NO INHERIT
+	// constraint arrives AFTER the fact through the AlterTableAddNotNull executor.
+	// It combines slice 271's ADD CONSTRAINT NOT NULL parser/executor branch with
+	// slice 272's NO INHERIT thread on a STANDALONE (non-inherited) table: the
+	// parser captures the `NO INHERIT` trailer into AlterTableAction.NoInherit
+	// (ddl.go:5483) and the executor records a contype='n' pg_constraint row with
+	// connoinherit='t' via tbl.AddNotNull(name, col, oid, act.NoInherit=true,
+	// isLocal=true, 0) (operators_ddl.go:5498), then flushes attnotnull through
+	// the delete-old-rows + syncTableToCatalogHeap path. Because the column is
+	// LOCAL (notnull_islocal='t') and the name `nn4` differs from the auto-name
+	// `nninh4_c_not_null`, pg_dump re-emits the `CONSTRAINT nn4` prefix and the
+	// ` NO INHERIT` suffix on the INLINE column (pg_dump.c:17184/17188), exactly
+	// like nninh2's `c`. A regression that dropped act.NoInherit on the ALTER path
+	// (while the CREATE-inline path kept it) would dump a plain
+	// `c integer CONSTRAINT nn4 NOT NULL` here — the silent-twin failure mode the
+	// "sibling paths must agree" rule guards against. Verified to match real
+	// pg_dump 18.3's rendering of pg_constraint (which is creation-method-agnostic;
+	// nninh2 anchors the byte form).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh4 (c integer, d integer)"); err != nil {
+		t.Fatalf("create standalone table nninh4: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nninh4 ADD CONSTRAINT nn4 NOT NULL c NO INHERIT"); err != nil {
+		t.Fatalf("add named NO INHERIT NOT NULL on local column nninh4.c: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -4183,6 +4213,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			}
 		} else {
 			t.Errorf("pg_dump missing CREATE TABLE public.nninh3\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 275 (asserted):** a NAMED `NO INHERIT` NOT NULL added to a LOCAL
+		// column via `ALTER TABLE ... ADD CONSTRAINT nn4 NOT NULL c NO INHERIT`
+		// must dump INLINE as `c integer CONSTRAINT nn4 NOT NULL NO INHERIT` —
+		// identical to nninh2's inline-created `c`, proving the AlterTableAddNotNull
+		// executor threads act.NoInherit (operators_ddl.go:5498) and the conname
+		// just as the CREATE-TABLE-inline path does. A regression that dropped the
+		// NO INHERIT on the ALTER path would emit `c integer CONSTRAINT nn4 NOT
+		// NULL` (connoinherit='f'); one that dropped the name would emit a bare
+		// `c integer NOT NULL NO INHERIT`.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh4 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer CONSTRAINT nn4 NOT NULL NO INHERIT") {
+				t.Errorf("pg_dump dropped the named NO INHERIT NOT NULL added via ALTER; want %q in nninh4 block\n  block=%q", "c integer CONSTRAINT nn4 NOT NULL NO INHERIT", block)
+			}
+			if !strings.Contains(block, "d integer") {
+				t.Errorf("pg_dump dropped the standalone table's plain column; want %q in nninh4 block\n  block=%q", "d integer", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh4\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged
