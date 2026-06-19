@@ -1082,6 +1082,82 @@ func TestUserPGAttributeCompositeFieldArray(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeCompositeFieldDomain pins the DOMAIN-FIELD resolution for a
+// composite type (DU-002 slice 248). A composite field whose declared type is a
+// user-defined domain folds to the text fallback inside parseCompositeFieldType
+// (the parser records the raw domain name in ColType; composite fields are NOT
+// resolved to the base type at CREATE TYPE, unlike table columns). The builder
+// must re-resolve it to the domain's pg_type OID and report the domain's BASE
+// physical layout, so pg_dump's dumpCompositeType renders the field as the domain
+// name rather than `text`. An integer-based domain proves the base-attr
+// inheritance (4-byte, byval, plain) distinctly from text's varlena shape.
+// Without the catalog (cat==nil) it must keep the text fallback.
+func TestUserPGAttributeCompositeFieldDomain(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		atttypmodIdx  = 5
+		attbyvalIdx   = 7
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	dz, err := cat.RegisterDomain("zipcode", catalog.Type{Name: "text"}, false)
+	if err != nil {
+		t.Fatalf("RegisterDomain zipcode: %v", err)
+	}
+	ds, err := cat.RegisterDomain("score", catalog.Type{Name: "int4"}, false)
+	if err != nil {
+		t.Fatalf("RegisterDomain score: %v", err)
+	}
+	// CREATE TYPE rec AS (name text, zip zipcode, sc score): the parser records
+	// each field's ColType verbatim as the (built-in-unknown) domain name.
+	ct := cat.RegisterCompositeTypeWithFields("rec", []catalog.CompositeField{
+		{Name: "name", ColType: "text"},
+		{Name: "zip", ColType: "zipcode"},
+		{Name: "sc", ColType: "score"},
+	})
+
+	// Built-in field is untouched: name → text.
+	a0 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[0], 1)
+	if got := uint32(a0[atttypidIdx].Int); got != catalog.OIDText {
+		t.Errorf("text field: atttypid=%d want %d (text)", got, catalog.OIDText)
+	}
+
+	// text-based domain field → domain OID, base (text) varlena layout, typmod -1.
+	a1 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[1], 2)
+	if got := uint32(a1[atttypidIdx].Int); got != dz.OID {
+		t.Errorf("zipcode field: atttypid=%d want %d (domain OID)", got, dz.OID)
+	}
+	if got := a1[attlenIdx].Int; got != -1 {
+		t.Errorf("zipcode field: attlen=%d want -1 (text base)", got)
+	}
+	if got := a1[atttypmodIdx].Int; got != -1 {
+		t.Errorf("zipcode field: atttypmod=%d want -1", got)
+	}
+
+	// int-based domain field → domain OID, base (int4) fixed layout: 4-byte,
+	// byval, plain storage. This distinctly proves base-attr inheritance.
+	a2 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[2], 3)
+	if got := uint32(a2[atttypidIdx].Int); got != ds.OID {
+		t.Errorf("score field: atttypid=%d want %d (domain OID)", got, ds.OID)
+	}
+	if got := a2[attlenIdx].Int; got != 4 {
+		t.Errorf("score field: attlen=%d want 4 (int4 base)", got)
+	}
+	if got := a2[attbyvalIdx].BoolValue(); got != true {
+		t.Errorf("score field: attbyval=%v want true (int4 base)", got)
+	}
+	if got := a2[attstorageIdx].StringValue(); got != "p" {
+		t.Errorf("score field: attstorage=%q want \"p\" (int4 base, plain)", got)
+	}
+
+	// Without a catalog the domain cannot be resolved → text fallback preserved.
+	aNil := buildUserPGAttributeRowForCompositeField(nil, ct, ct.Fields[1], 2)
+	if got := uint32(aNil[atttypidIdx].Int); got != catalog.OIDText {
+		t.Errorf("zipcode field (nil cat): atttypid=%d want %d (text fallback)", got, catalog.OIDText)
+	}
+}
+
 // TestUserPGAttributeEnumArrayColumn pins the enum-ARRAY resolution (DU-002
 // slice 89). A `mood[]` column must report pg_attribute.atttypid = the enum's
 // auto-generated array OID (et.ArrayOID = et.OID+1), attndims=1, and carry a

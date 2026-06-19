@@ -7178,9 +7178,34 @@ space-joined ColType for `numeric(10,2)` / `varchar(8)` scalar and array fields;
 varchar(8))` and asserts `pg_dump --schema-only` round-trips `amount numeric(10,2)` and `code character
 varying(8)` (the canonical spelling of `varchar`), byte-matching real pg_dump 18.3.
 
-> **Next (slice 248+):** a composite field whose type is a DOMAIN (slice 90 analog —
-> `DeclaredTypeName` → `cat.LookupDomain`), then a nested-composite field, then
-> `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE`.
+### Slice 248 — composite field whose type is a user-defined DOMAIN
+
+The table-column analog landed in slice 90: a column declared with a domain type re-resolves to the
+domain's `pg_type` OID so `format_type` renders the domain name, not the base. The composite-field path
+needed the same treatment, with one structural difference. A table column's `Type.Name` is rewritten to
+the **base** type at `CREATE TABLE` (the original domain name kept in `DeclaredTypeName`); a composite
+field is **not** — `parser.parseCreateType` records the raw domain name verbatim in
+`CompositeField.ColType`. So the composite re-resolve keys on the raw field-type name itself, and the
+domain's base physical layout must be looked up from the catalog rather than read off the (already-base)
+`typOID`.
+
+- **`buildUserPGAttributeRowForCompositeField`** — after the enum re-resolve, when the field still folds
+  to the `text` fallback and is scalar, `cat.LookupDomain(base)` re-resolves it to the domain's pg_type
+  OID (`atttypid`). The physical attrs (`attlen/attbyval/attalign/attstorage`) follow the domain's BASE,
+  resolved exactly as `buildUserPGTypeRowForDomain` does — `d.BaseOID`, else
+  `TypeNameToOID(d.Base.Name)`; a `BaseIsEnum` domain uses the enum's fixed 4-byte/int-aligned/plain
+  shape. `atttypmod` stays `-1` (the typmod belongs to the domain definition, not the use site).
+- **Scalar only**, matching slice 90; a domain-array composite field is deferred.
+
+Guarded at two levels: `executor.TestUserPGAttributeCompositeFieldDomain` pins atttypid → domain OID and
+the base-attr inheritance (text→varlena, int4→4-byte/byval/plain) plus the nil-catalog text fallback; the
+pg_dump TAP port seeds `CREATE TYPE public.dom_comp AS (z zipcode, n numd)` (over the existing `zipcode`
+text-domain and `numd` numeric(10,2)-domain) and asserts `pg_dump --schema-only` renders the fields as
+`z public.zipcode` / `n public.numd`, byte-matching real pg_dump 18.3.
+
+> **Next (slice 249+):** a composite field whose type is a DOMAIN ARRAY, then a nested-composite field
+> (a composite type whose field is itself a composite type), then `ALTER TYPE … ADD/DROP/ALTER
+> ATTRIBUTE`.
 
 ## Deferred (002–010) — catalog surface estimate
 

@@ -1462,6 +1462,11 @@ func buildUserPGClassRowForComposite(cat catalog.Catalog, ct *catalog.CompositeT
 // The array's physical layout comes from userTypeAttrsForOID(arrayOID) for
 // built-ins; an enum array gets the standard varlena-array shape (-1 length,
 // int-aligned, extended storage). DU-002 slice 246.
+//
+// A field whose declared type is a user-defined DOMAIN re-resolves to the
+// domain's pg_type OID (cat.LookupDomain on the raw field-type name) with
+// physical attrs from the domain's base, so pg_dump renders the field as the
+// domain name rather than `text`. Scalar only. DU-002 slice 248.
 func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.CompositeType, field catalog.CompositeField, attnum int) Row {
 	typOID, typmod, base, isArray := parseCompositeFieldType(field.ColType)
 	enumOID := uint32(0)
@@ -1474,6 +1479,22 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 				typOID = et.OID
 				enumOID = et.OID
 			}
+		}
+	}
+	// A field whose declared type is a user-defined DOMAIN also folds to the text
+	// fallback (TypeNameToOID knows only built-ins, and the parser records the raw
+	// domain name in ColType — unlike table columns, composite fields are NOT
+	// resolved to the base type at CREATE TYPE). Re-resolve to the domain's
+	// pg_type OID so pg_dump's format_type(atttypid, atttypmod) renders the field
+	// as the domain name rather than `text`; the physical attrs follow the domain's
+	// BASE type (resolved the same way as buildUserPGTypeRowForDomain), since a
+	// domain stores values exactly as its base. Scalar only, mirroring the
+	// table-column path. DU-002 slice 248 (cf. slice 90).
+	var domain *catalog.Domain
+	if cat != nil && typOID == catalog.OIDText && !isArray {
+		if d, ok := cat.LookupDomain(base); ok {
+			domain = d
+			typOID = d.OID
 		}
 	}
 	attndims := int64(0)
@@ -1498,6 +1519,20 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		// An enum's array type is a standard varlena array: -1 length,
 		// int-aligned (matching the 4-byte enum element), extended storage.
 		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'i', TypStorage: 'x'}
+	case domain != nil:
+		// A domain inherits its base type's physical layout, resolved exactly as
+		// buildUserPGTypeRowForDomain does (BaseOID, else TypeNameToOID(Base.Name);
+		// an enum base uses the enum's fixed 4-byte/int-aligned/plain shape).
+		// DU-002 slice 248.
+		if domain.BaseIsEnum {
+			attrs = userTypeAttrs{TypLen: 4, TypByVal: false, TypAlign: 'i', TypStorage: 'p'}
+		} else {
+			baseOID := domain.BaseOID
+			if baseOID == 0 {
+				baseOID = catalog.TypeNameToOID(domain.Base.Name)
+			}
+			attrs = userTypeAttrsForOID(baseOID)
+		}
 	}
 	return Row{
 		NewIntDatum(int64(ct.RelOID)),            // attrelid
