@@ -8002,10 +8002,28 @@ INHERIT` and `e integer CONSTRAINT e_nn NOT NULL`, with a negative check that th
 gain a spurious ` NO INHERIT`) + `TestParseCreateTableColumnNamedNotNull` (parser: the inline `CONSTRAINT <name>` arm sets
 `NotNullConstraintName` + `NotNullNoInherit`; an unnamed `NOT NULL` leaves `NotNullConstraintName` empty).
 
-> **Next (slice 274+):** the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` end-to-end dump on a
-> *standalone* table (slice 271's ADD-CONSTRAINT path, but rendered inline because the column is local), or a *named*
-> inline NOT NULL whose name **equals** the auto-name (must collapse back to the bare `NOT NULL` form, not the
-> `CONSTRAINT <name>` form).
+### Slice 274 — *named* inline NOT NULL whose name EQUALS the auto-name (collapses to bare `NOT NULL`)
+
+Slice 273's boundary twin. Slice 273 asserted that a named inline NOT NULL whose conname *differs* from PG's computed
+default `<table>_<col>_not_null` forces pg_dump to re-emit the `CONSTRAINT <name>` prefix. This slice covers the *equal*
+case: a user who spells out the exact default name (`CREATE TABLE nninh3 (c integer CONSTRAINT nninh3_c_not_null NOT
+NULL, d integer)`) must see the constraint COLLAPSE back to the bare `c integer NOT NULL` form — pg_dump only emits the
+`CONSTRAINT <name>` prefix when the name differs from the default it would itself choose (pg_dump.c:17184,
+`ChooseConstraintName` match).
+
+**No production change required.** Slice 273's code records the user-given name on `AddNotNull(...)` so the pg_constraint
+virtual row carries conname `nninh3_c_not_null`; the *real* pg_dump 18.3 binary then compares that against its own
+computed default, finds them equal, and drops the prefix on its own. The slice is a verification/regression guard that
+locks in the correct boundary behavior: goopg must record the explicit name faithfully (so the comparison is against the
+true conname, not a synthesized one) and must NOT itself force the prefix whenever an explicit name is present.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3 — asserts the `nninh3` block contains the bare
+`c integer NOT NULL` and does NOT contain `CONSTRAINT nninh3_c_not_null`, plus the plain `d integer` survives). A
+regression that unconditionally emitted the `CONSTRAINT` prefix for any explicitly-named NOT NULL would fail the
+negative check.
+
+> **Next (slice 275+):** the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` end-to-end dump on a
+> *standalone* table (slice 271's ADD-CONSTRAINT path, but rendered inline because the column is local).
 
 ## Deferred (002–010) — catalog surface estimate
 

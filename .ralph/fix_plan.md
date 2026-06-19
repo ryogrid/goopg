@@ -5890,6 +5890,21 @@ object support.
         Slice 273. **Next (slice 274+):** the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` end-to-end
         dump on a STANDALONE table (rendered inline because the column is local), or a named inline NOT NULL whose name
         EQUALS the auto-name (must collapse back to the bare `NOT NULL` form, not the `CONSTRAINT <name>` form).
+      - **PROGRESS 2026-06-20 (loop #41):** **DU-002 slice 274 LANDED — slice 273's boundary twin: a NAMED inline NOT
+        NULL whose name EQUALS the computed default `<table>_<col>_not_null` COLLAPSES to the bare `NOT NULL` form (no
+        production change; verification/regression guard).** Slice 273 asserted the `CONSTRAINT <name>` prefix is
+        RE-EMITTED when the conname differs from the default; this slice asserts it is SUPPRESSED when the name matches.
+        Fixture: `CREATE TABLE public.nninh3 (c integer CONSTRAINT nninh3_c_not_null NOT NULL, d integer)` — the user
+        spells out the exact auto-name. Slice 273's code records that explicit name on `AddNotNull(...)` so the
+        pg_constraint conname is `nninh3_c_not_null`; the *real* pg_dump 18.3 binary then compares it against its own
+        computed default, finds them equal, and drops the prefix (`pg_dump.c:17184` ChooseConstraintName match). This
+        confirms goopg records the explicit name faithfully and does NOT itself force the prefix whenever an explicit
+        name is present. Verified byte-for-byte: the `nninh3` block contains bare `c integer NOT NULL` (no `CONSTRAINT
+        nninh3_c_not_null`) and the plain `d integer` survives. **Guards:** `TestPort_PgDumpConnectionSetup` PASS
+        (3.56s; + negative check that the default name does NOT leak a `CONSTRAINT` prefix). gofmt +
+        `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 274. **Next (slice 275+):**
+        the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` end-to-end dump on a STANDALONE table
+        (slice 271's ADD-CONSTRAINT path, rendered inline because the column is local).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -1555,6 +1555,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create standalone table nninh2 with named NOT NULL columns: %v", err)
 	}
 
+	// Slice 274: a NAMED inline NOT NULL whose name EQUALS PG's computed default
+	// `<table>_<col>_not_null` must COLLAPSE back to the bare `NOT NULL` form —
+	// pg_dump only emits the `CONSTRAINT <name>` prefix when the conname differs
+	// from the default (pg_dump.c:17184 ChooseConstraintName match). Slice 273
+	// covered the DIFFERING-name case (prefix re-emitted); this is the boundary
+	// twin: the user spells out the exact auto-name `nninh3_c_not_null`, so even
+	// though goopg records it as an EXPLICIT name on AddNotNull, pg_dump's
+	// default-name comparison finds them equal and drops the prefix. A regression
+	// that unconditionally emitted the `CONSTRAINT` prefix whenever an explicit
+	// name was given (instead of letting pg_dump's default match decide) would
+	// leak `CONSTRAINT nninh3_c_not_null` into the dump. Verified against real
+	// pg_dump 18.3: `c integer NOT NULL` (bare, no CONSTRAINT prefix).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh3 (c integer CONSTRAINT nninh3_c_not_null NOT NULL, d integer)"); err != nil {
+		t.Fatalf("create standalone table nninh3 with default-named NOT NULL column: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -4138,6 +4154,35 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			}
 		} else {
 			t.Errorf("pg_dump missing CREATE TABLE public.nninh2\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 274 (asserted):** a NAMED inline NOT NULL whose name EQUALS the
+		// computed default `<table>_<col>_not_null` must COLLAPSE to the bare
+		// `NOT NULL` form. The user spelled out `CONSTRAINT nninh3_c_not_null`,
+		// but because it matches pg_dump's default name the `CONSTRAINT <name>`
+		// prefix is dropped (pg_dump.c:17184). This is slice 273's boundary twin:
+		// 273 asserted the prefix is re-emitted when the name DIFFERS; here it is
+		// suppressed when the name MATCHES. A regression that always emitted the
+		// prefix for an explicitly-named NOT NULL would leak `CONSTRAINT
+		// nninh3_c_not_null` into the column definition.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh3 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer NOT NULL") {
+				t.Errorf("pg_dump dropped the NOT NULL on the default-named column; want %q in nninh3 block\n  block=%q", "c integer NOT NULL", block)
+			}
+			// The default-named NOT NULL must NOT carry a CONSTRAINT prefix.
+			if strings.Contains(block, "CONSTRAINT nninh3_c_not_null") {
+				t.Errorf("pg_dump leaked the default constraint name; want bare %q, not %q in nninh3 block\n  block=%q", "c integer NOT NULL", "CONSTRAINT nninh3_c_not_null", block)
+			}
+			if !strings.Contains(block, "d integer") {
+				t.Errorf("pg_dump dropped the standalone table's plain column; want %q in nninh3 block\n  block=%q", "d integer", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh3\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged
