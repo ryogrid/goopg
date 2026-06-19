@@ -960,6 +960,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optuct: %v", err)
 	}
 
+	// Slice 215: the integer autovacuum_vacuum_max_threshold storage parameter — a
+	// PG18 heap reloption (RELOPT_TYPE_INT, range -1–INT_MAX, default -2 = unset),
+	// reusing the slice-204 integer path (a separate set flag records presence
+	// since -1/0 are valid explicit values). goopg stores
+	// catalog.Table.AutovacuumVacuumMaxThreshold; the pg_class virtual view renders
+	// `{autovacuum_vacuum_max_threshold=5000}`, which pg_dump emits as
+	// `WITH (autovacuum_vacuum_max_threshold='5000')`. goopg has no autovacuum, so
+	// the value is catalog/dump-only (advisory). `optavmt` carries it on its own
+	// table to keep the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optavmt (id integer PRIMARY KEY) WITH (autovacuum_vacuum_max_threshold=5000)"); err != nil {
+		t.Fatalf("create table optavmt: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2882,6 +2895,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (user_catalog_table='true')") {
 			t.Errorf("pg_dump dropped the user_catalog_table reloption; missing %q\n  full stdout=%q", "WITH (user_catalog_table='true')", res.Stdout)
+		}
+		// **Slice 215 closed (asserted):** the integer autovacuum_vacuum_max_threshold
+		// storage parameter (RELOPT_TYPE_INT, range -1–INT_MAX, default -2 = unset; a
+		// PG18 heap reloption) must round-trip via the slice-204 integer path (a
+		// separate set flag records presence since -1/0 are valid explicit values).
+		// catalog.Table.AutovacuumVacuumMaxThreshold persists it and the pg_class
+		// virtual view renders `{autovacuum_vacuum_max_threshold=5000}`, which pg_dump
+		// emits as `WITH (autovacuum_vacuum_max_threshold='5000')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optavmt (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optavmt\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (autovacuum_vacuum_max_threshold='5000')") {
+			t.Errorf("pg_dump dropped the autovacuum_vacuum_max_threshold reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_vacuum_max_threshold='5000')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

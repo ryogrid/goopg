@@ -4715,6 +4715,26 @@ object support.
         `go build ./internal/...` clean; catalog/executor reloption tests PASS; `TestPort_PgDumpConnectionSetup`
         PASS; pgbench pre-commit smoke on commit. **Next:** `toast.*` namespace reloptions; or composite types
         (`CREATE TYPE AS`; larger, pg_class.reltype hardcoded 0).
+      - **PROGRESS 2026-06-19 (loop #30):** **DU-002 slice 215 LANDED — integer `autovacuum_vacuum_max_threshold`
+        storage parameter round-trips through pg_dump.** Reuses the slice-204 `autovacuum_vacuum_insert_threshold`
+        integer path. It is a PG18 heap reloption (`RELOPT_TYPE_INT`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`,
+        `reloptions.c:236`) with range -1–INT_MAX, default -2 (= unset). An `AutovacuumVacuumMaxThresholdSet` flag
+        records presence (-1/0 are valid explicit values; the parser rejects a bare negative as a syntax error, so 0
+        is the reachable boundary). Executor parses via `strconv.Atoi`, bounds-checks `-1 ≤ N ≤ INT_MAX`, rejects
+        non-integer/overflow → `22023`. Persist `catalog.Table.AutovacuumVacuumMaxThreshold` (int); pg_class virtual
+        view appends `autovacuum_vacuum_max_threshold=N` after `user_catalog_table`; pg_dump renders
+        `WITH (autovacuum_vacuum_max_threshold='N')`. goopg has no autovacuum, so advisory catalog/dump-only;
+        base-table-only. Files: `internal/catalog/catalog.go` (`Table.AutovacuumVacuumMaxThreshold`/`…Set` + render),
+        `internal/executor/operators_ddl.go` (extract/bounds-check + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestAutovacuumVacuumMaxThresholdSurfacesInPgClassReloptions` + `TestAutovacuumVacuumMaxThresholdOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optavmt` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 215). No parser change needed. Gates: gofmt OK;
+        `go build ./internal/...` clean; catalog/executor reloption tests PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** remaining heap reloptions are `vacuum_index_cleanup`
+        (enum auto/on/off) and `vacuum_max_eager_freeze_failure_rate` (REAL, PG18); then `toast.*` namespace (needs
+        toast-table pg_class modeling — `reltoastrelid` hardcoded 0, so real pg_dump's `tc.reloptions` join is NULL);
+        or composite types (`CREATE TYPE AS`; larger, pg_class.reltype hardcoded 0).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

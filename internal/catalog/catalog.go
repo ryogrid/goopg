@@ -681,6 +681,22 @@ type Table struct {
 	// (advisory; runtime unaffected). M0110-0001 (DU-002 slice 214).
 	UserCatalogTable    bool
 	UserCatalogTableSet bool
+
+	// AutovacuumVacuumMaxThreshold stores the table's
+	// `WITH (autovacuum_vacuum_max_threshold=N)` storage parameter — a PG18 heap
+	// reloption (RELOPT_KIND_HEAP | RELOPT_KIND_TOAST, reloptions.c:236) that caps
+	// the dead-tuple count at which autovacuum triggers. PG's reloption type is
+	// RELOPT_TYPE_INT with range -1–INT_MAX and a default of -2 (= unset / use the
+	// GUC); -1 disables the cap. Because -1 and 0 are valid explicit values,
+	// AutovacuumVacuumMaxThresholdSet — not a zero check — guards whether the
+	// option was specified (the autovacuum_vacuum_insert_threshold pattern, slice
+	// 204). When set, pg_class.reloptions gains the text[] element
+	// `autovacuum_vacuum_max_threshold=N`, which pg_dump renders back as
+	// `WITH (autovacuum_vacuum_max_threshold='N')`. goopg has no autovacuum, so the
+	// value is catalog/dump-only (advisory; runtime unaffected). M0110-0001
+	// (DU-002 slice 215).
+	AutovacuumVacuumMaxThreshold    int
+	AutovacuumVacuumMaxThresholdSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2463,6 +2479,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.UserCatalogTableSet {
 				relopts = append(relopts, "user_catalog_table="+strconv.FormatBool(t.UserCatalogTable))
+			}
+			if t.AutovacuumVacuumMaxThresholdSet {
+				relopts = append(relopts, "autovacuum_vacuum_max_threshold="+strconv.Itoa(t.AutovacuumVacuumMaxThreshold))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

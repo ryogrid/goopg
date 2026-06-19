@@ -6185,6 +6185,27 @@ no reloptions) and `TestUserCatalogTableInvalidValueRejected` (`maybe`/`2`/`tru3
 pg_dump fixture adds `optuct (… WITH (user_catalog_table=true))` on its own table; the assertion
 confirms the dump carries `WITH (user_catalog_table='true')`.
 
+### Slice 215 — integer `autovacuum_vacuum_max_threshold` reloption round-trip
+
+Adds the `autovacuum_vacuum_max_threshold` storage parameter, reusing the slice-204
+`autovacuum_vacuum_insert_threshold` integer path. It is a **PG18** heap reloption
+(`RELOPT_TYPE_INT`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`, `reloptions.c:236`; "Maximum number of
+tuple updates or deletes prior to vacuum") with range **-1–INT_MAX** and a default of **-2**
+(= unset / use the GUC); -1 disables the cap. Because -1 and 0 are valid explicit values, an
+`AutovacuumVacuumMaxThresholdSet` flag records presence (the parser rejects a bare negative as a
+syntax error, so 0 is the reachable boundary). The executor parses with `strconv.Atoi`, bounds-checks
+`-1 ≤ N ≤ INT_MAX`, and rejects non-integer/overflow values with `22023`. It persists
+`catalog.Table.AutovacuumVacuumMaxThreshold` (an `int`); the pg_class virtual view appends
+`autovacuum_vacuum_max_threshold=N` after `user_catalog_table`; pg_dump renders
+`WITH (autovacuum_vacuum_max_threshold='N')`. goopg has no autovacuum, so the value is advisory
+catalog/dump-only, base-table-only — same as the sibling reloption slices.
+
+Engine guards: `TestAutovacuumVacuumMaxThresholdSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,autovacuum_vacuum_max_threshold=5000}`; boundary `0` → `{autovacuum_vacuum_max_threshold=0}`;
+plain table → no reloptions) and `TestAutovacuumVacuumMaxThresholdOutOfBoundsRejected`
+(`9999999999`/`nope` → 22023). The pg_dump fixture adds `optavmt (… WITH (autovacuum_vacuum_max_threshold=5000))`
+on its own table; the assertion confirms the dump carries `WITH (autovacuum_vacuum_max_threshold='5000')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

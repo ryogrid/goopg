@@ -1429,6 +1429,32 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		userCatalogTable = b
 		userCatalogTableSet = true
 	}
+	// Extract and bounds-check the autovacuum_vacuum_max_threshold storage
+	// parameter — a PG18 heap reloption (RELOPT_KIND_HEAP | RELOPT_KIND_TOAST,
+	// reloptions.c:236) capping the dead-tuple count at which autovacuum fires.
+	// Reuses the slice-204 integer path: PG's reloption type is RELOPT_TYPE_INT
+	// with range -1–INT_MAX and a default of -2 (= unset / use the GUC); -1
+	// disables the cap. Since -1 and 0 are valid explicit values, a separate `set`
+	// flag records whether the option was present (the parallel_workers pattern).
+	// goopg has no autovacuum, so the value is purely catalog/dump state that
+	// round-trips through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_vacuum_max_threshold='N')`. M0110-0001 (DU-002 slice 215).
+	autovacuumVacuumMaxThreshold := 0
+	autovacuumVacuumMaxThresholdSet := false
+	if v, ok := s.With["autovacuum_vacuum_max_threshold"]; ok {
+		avmt, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_max_threshold\": %s", v)}
+		}
+		if avmt < -1 || avmt > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_max_threshold\"", avmt),
+				Detail:  "Valid values are between \"-1\" and \"2147483647\"."}
+		}
+		autovacuumVacuumMaxThreshold = avmt
+		autovacuumVacuumMaxThresholdSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1520,6 +1546,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.AutovacuumVacuumCostLimitSet = autovacuumVacuumCostLimitSet
 	tbl.UserCatalogTable = userCatalogTable
 	tbl.UserCatalogTableSet = userCatalogTableSet
+	tbl.AutovacuumVacuumMaxThreshold = autovacuumVacuumMaxThreshold
+	tbl.AutovacuumVacuumMaxThresholdSet = autovacuumVacuumMaxThresholdSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

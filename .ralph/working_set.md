@@ -1,25 +1,29 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 214 (loop #29) — boolean `user_catalog_table` storage
-parameter round-trips through pg_dump.
+Last landed: DU-002 slice 215 (loop #30) — integer `autovacuum_vacuum_max_threshold`
+storage parameter round-trips through pg_dump.
 
-What happened: user_catalog_table is RELOPT_TYPE_BOOL, RELOPT_KIND_HEAP, default false
-(reloptions.c:1909). Boolean carries no zero-detectable default, so UserCatalogTableSet
-guards presence (slice-196 autovacuum_enabled pattern). Executor parses via
-parseReloptionBool; non-boolean → 22023. Persist catalog.Table.UserCatalogTable (bool);
-pg_class virtual view appends `user_catalog_table=true|false` after
-autovacuum_vacuum_cost_limit; pg_dump renders `WITH (user_catalog_table='true'|'false')`.
-Advisory catalog/dump-only (no logical decoding in goopg); base-table-only.
+What happened: PG18 heap reloption (RELOPT_TYPE_INT, RELOPT_KIND_HEAP|TOAST,
+reloptions.c:236), range -1–INT_MAX, default -2 (=unset). Reuses slice-204
+autovacuum_vacuum_insert_threshold integer path. Set flag guards presence (-1/0
+valid; parser rejects bare negative as syntax error so 0 is reachable boundary).
+Executor strconv.Atoi + bounds-check -1≤N≤INT_MAX → 22023 on bad. Persist
+catalog.Table.AutovacuumVacuumMaxThreshold; pg_class virtual view appends
+`autovacuum_vacuum_max_threshold=N` after user_catalog_table; pg_dump renders
+`WITH (autovacuum_vacuum_max_threshold='N')`. Advisory catalog/dump-only.
 
-Files: internal/catalog/catalog.go (Table.UserCatalogTable/…Set + render),
-internal/executor/operators_ddl.go (extract/parse + persist),
+Files: internal/catalog/catalog.go (Table field + render),
+internal/executor/operators_ddl.go (extract/bounds-check + persist),
 internal/executor/operators_fillfactor_reloptions_test.go (NEW
-TestUserCatalogTableSurfacesInPgClassReloptions + …InvalidValueRejected),
-internal/testport/pgdump_connsetup_test.go (optuct fixture + assertion),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 214), fix_plan.md.
+TestAutovacuumVacuumMaxThresholdSurfacesInPgClassReloptions + …OutOfBoundsRejected),
+internal/testport/pgdump_connsetup_test.go (optavmt fixture + assertion),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 215), fix_plan.md.
 
 Gates: gofmt OK; go build ./internal/... clean; catalog+executor reloption tests PASS;
 TestPort_PgDumpConnectionSetup PASS; pgbench pre-commit smoke on commit.
 
-Next: toast.* namespace reloptions; or composite types (CREATE TYPE AS; larger,
-pg_class.reltype hardcoded 0).
+Next: remaining heap reloptions — `vacuum_index_cleanup` (enum auto/on/off; NEW path,
+RELOPT_TYPE_ENUM) and `vacuum_max_eager_freeze_failure_rate` (REAL, PG18). Then
+`toast.*` namespace (BIGGER: real pg_dump reads tc.reloptions from the toast table's
+pg_class row, but goopg hardcodes reltoastrelid=0 → needs toast-table pg_class
+modeling). Or composite types (CREATE TYPE AS; pg_class.reltype hardcoded 0).
