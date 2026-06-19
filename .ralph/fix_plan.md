@@ -4404,6 +4404,28 @@ object support.
         (`autovacuum_analyze_scale_factor`, `autovacuum_vacuum_insert_scale_factor`,
         `autovacuum_vacuum_cost_delay`); or another int autovacuum knob (`autovacuum_analyze_threshold`); or
         composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger).
+      - **PROGRESS 2026-06-19 (loop #13):** **DU-002 slice 200 LANDED — second REAL-typed storage
+        parameter (`autovacuum_analyze_scale_factor`) round-trips through pg_dump.** The first follow-on
+        to slice 199's float path: `autovacuum_analyze_scale_factor` is also `RELOPT_TYPE_REAL`, range
+        0.0–100.0, default -1 (`reloptions.c`), so it reuses the mechanism verbatim — parser already
+        accepts `TokenNumericLit`, executor does `strconv.ParseFloat` + `!(f>=0 && f<=100)` bounds-check
+        (rejects NaN/±Inf; above-range/non-numeric → `22023`), separate
+        `AutovacuumAnalyzeScaleFactorSet` flag so explicit `0.0` round-trips. Persist
+        `catalog.Table.AutovacuumAnalyzeScaleFactor` (float64); pg_class virtual view appends
+        `autovacuum_analyze_scale_factor=F` after `autovacuum_vacuum_scale_factor`, F via
+        `FormatFloat(f,'g',-1,64)`; pg_dump renders `WITH (autovacuum_analyze_scale_factor='0.05')`.
+        Advisory catalog/dump-only; base-table-only. Files: `internal/catalog/catalog.go`
+        (`Table.AutovacuumAnalyzeScaleFactor`/`…Set` + render), `internal/executor/operators_ddl.go`
+        (extract/parse/bounds + persist), `internal/executor/operators_fillfactor_reloptions_test.go`
+        (NEW `TestAutovacuumAnalyzeScaleFactorSurfacesInPgClassReloptions` +
+        `TestAutovacuumAnalyzeScaleFactorOutOfBoundsRejected`), `internal/testport/pgdump_connsetup_test.go`
+        (NEW `optaasf` fixture + assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 200).
+        No parser change needed (slice 199 already opened `TokenNumericLit`). Gates: gofmt OK;
+        `go build ./internal/...` clean; `go vet catalog/executor/testport` clean; catalog/executor
+        reloption tests PASS; `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit.
+        **Next:** remaining REAL-typed reloptions reuse this path
+        (`autovacuum_vacuum_insert_scale_factor`, `autovacuum_vacuum_cost_delay`); or an int autovacuum
+        knob (`autovacuum_analyze_threshold`); or composite types (`CREATE TYPE AS`; larger).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

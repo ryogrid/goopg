@@ -516,6 +516,102 @@ func TestAutovacuumVacuumScaleFactorOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+// TestAutovacuumAnalyzeScaleFactorSurfacesInPgClassReloptions verifies that a
+// `WITH (autovacuum_analyze_scale_factor=F)` storage parameter — the second
+// REAL-typed reloption goopg round-trips, reusing the slice-199 float path —
+// declared on CREATE TABLE is persisted on the catalog table and surfaced
+// through the pg_class virtual view's reloptions cell. Like
+// autovacuum_vacuum_scale_factor (slice 199), 0.0 is a valid explicit value
+// (PG's reloption default is -1 = unset), so the Set flag — not a zero check —
+// guards presence. Cases pin: a fractional value alongside fillfactor
+// (combined `{fillfactor=70,autovacuum_analyze_scale_factor=0.05}`), the
+// boundary value 0 (explicitly set, rendered `=0`), and a plain table (no
+// reloptions). pg_dump renders the array back as
+// `WITH (autovacuum_analyze_scale_factor='0.05')`. goopg has no autovacuum, so
+// the value is catalog/dump-only. DU-002 slice 200.
+func TestAutovacuumAnalyzeScaleFactorSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE aa (id integer PRIMARY KEY) WITH (fillfactor=70, autovacuum_analyze_scale_factor=0.05)`); err != nil {
+		t.Fatalf("CREATE TABLE aa: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE aazero (id integer PRIMARY KEY) WITH (autovacuum_analyze_scale_factor=0)`); err != nil {
+		t.Fatalf("CREATE TABLE aazero: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE aaplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE aaplain: %v", err)
+	}
+
+	aaTbl, ok := cat.LookupTable(parser.ObjectName{Name: "aa"})
+	if !ok {
+		t.Fatal("aa table not found")
+	}
+	if aaTbl.AutovacuumAnalyzeScaleFactor != 0.05 || !aaTbl.AutovacuumAnalyzeScaleFactorSet {
+		t.Errorf("aa analyze_scale_factor = %v set=%v, want 0.05 set=true", aaTbl.AutovacuumAnalyzeScaleFactor, aaTbl.AutovacuumAnalyzeScaleFactorSet)
+	}
+	zeroTbl, ok := cat.LookupTable(parser.ObjectName{Name: "aazero"})
+	if !ok {
+		t.Fatal("aazero table not found")
+	}
+	if zeroTbl.AutovacuumAnalyzeScaleFactor != 0 || !zeroTbl.AutovacuumAnalyzeScaleFactorSet {
+		t.Errorf("aazero analyze_scale_factor = %v set=%v, want 0 set=true", zeroTbl.AutovacuumAnalyzeScaleFactor, zeroTbl.AutovacuumAnalyzeScaleFactorSet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "aaplain"})
+	if !ok {
+		t.Fatal("aaplain table not found")
+	}
+	if plainTbl.AutovacuumAnalyzeScaleFactorSet {
+		t.Errorf("aaplain set=%v, want false (unset)", plainTbl.AutovacuumAnalyzeScaleFactorSet)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "aa" || r[1] == "aazero" || r[1] == "aaplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["aa"] != "{fillfactor=70,autovacuum_analyze_scale_factor=0.05}" {
+		t.Errorf("pg_class.reloptions for aa = %q, want %q", got["aa"], "{fillfactor=70,autovacuum_analyze_scale_factor=0.05}")
+	}
+	if got["aazero"] != "{autovacuum_analyze_scale_factor=0}" {
+		t.Errorf("pg_class.reloptions for aazero = %q, want %q", got["aazero"], "{autovacuum_analyze_scale_factor=0}")
+	}
+	if got["aaplain"] != "" {
+		t.Errorf("pg_class.reloptions for aaplain = %q, want \"\" (NULL)", got["aaplain"])
+	}
+}
+
+// TestAutovacuumAnalyzeScaleFactorOutOfBoundsRejected verifies CREATE TABLE
+// rejects an above-100.0 or non-numeric autovacuum_analyze_scale_factor with
+// PG's 22023 error. The valid range is 0.0–100.0 (negatives are rejected earlier
+// by the parser as a syntax error, so the reachable invalid cases are above-range
+// and non-numeric). DU-002 slice 200.
+func TestAutovacuumAnalyzeScaleFactorOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, aa := range []string{"100.5", "1000", "notafloat"} {
+		err := runDDL(t, ctx, `CREATE TABLE aasfbad`+strconv.Itoa(i)+` (id integer) WITH (autovacuum_analyze_scale_factor=`+aa+`)`)
+		if err == nil {
+			t.Errorf("autovacuum_analyze_scale_factor=%s: expected an error, got nil", aa)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("autovacuum_analyze_scale_factor=%s: error type = %T, want *ExecError", aa, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("autovacuum_analyze_scale_factor=%s: error code = %q, want 22023", aa, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.

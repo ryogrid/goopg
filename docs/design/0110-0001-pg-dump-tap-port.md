@@ -5826,6 +5826,33 @@ remaining REAL-typed table reloptions (`autovacuum_analyze_scale_factor`,
 `autovacuum_vacuum_insert_scale_factor`, `autovacuum_vacuum_cost_delay`, …),
 which now reuse the same float parse/format path.
 
+### Slice 200 — second REAL-typed storage parameter (`autovacuum_analyze_scale_factor`) round-trip
+
+The first follow-on to slice 199's float path. `autovacuum_analyze_scale_factor`
+is also `RELOPT_TYPE_REAL` with range **0.0–100.0 and a default of -1**
+(`reloptions.c`: `{"autovacuum_analyze_scale_factor", … -1, 0.0, 100.0}`), so it
+reuses the slice-199 mechanism verbatim: the parser already accepts
+`TokenNumericLit`, the executor parses via `strconv.ParseFloat` + the
+`!(f >= 0 && f <= 100)` bounds-check (rejecting `NaN`/`±Inf`; above-range /
+non-numeric → `22023`), and a separate `AutovacuumAnalyzeScaleFactorSet` flag
+(not a zero check) records presence so explicit `0.0` round-trips. It persists
+`catalog.Table.AutovacuumAnalyzeScaleFactor` (a `float64`); the pg_class virtual
+view appends `autovacuum_analyze_scale_factor=F` after
+`autovacuum_vacuum_scale_factor`, rendering `F` via
+`strconv.FormatFloat(f, 'g', -1, 64)`; pg_dump renders
+`WITH (autovacuum_analyze_scale_factor='0.05')`. Advisory catalog/dump-only,
+base-table-only — same as the sibling reloption slices.
+
+Engine guards: `TestAutovacuumAnalyzeScaleFactorSurfacesInPgClassReloptions`
+(combined `{fillfactor=70,autovacuum_analyze_scale_factor=0.05}`; explicit-zero
+`{autovacuum_analyze_scale_factor=0}`; plain table → no reloptions) and
+`TestAutovacuumAnalyzeScaleFactorOutOfBoundsRejected`
+(`100.5`/`1000`/`notafloat` → 22023). The pg_dump fixture adds `optaasf (… WITH
+(autovacuum_analyze_scale_factor=0.05))` on its own table; the assertion confirms
+the dump carries `WITH (autovacuum_analyze_scale_factor='0.05')`. The remaining
+REAL-typed table reloptions (`autovacuum_vacuum_insert_scale_factor`,
+`autovacuum_vacuum_cost_delay`, …) continue to reuse this path.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
