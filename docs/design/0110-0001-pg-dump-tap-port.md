@@ -6546,6 +6546,32 @@ that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
 `toast.log_autovacuum_min_duration`, `toast.autovacuum_freeze_*_age`, … — each a one-line gather addition
 reusing the established int/float reloption paths), then composite types.
 
+### Slice 226 — first `RELOPT_KIND_TOAST` *integer* reloption (`toast.autovacuum_vacuum_threshold`)
+
+Adds `toast.autovacuum_vacuum_threshold`, the first `RELOPT_KIND_TOAST` **integer** option, extending the
+TOAST reloptions array to three elements. `autovacuum_vacuum_threshold` shares
+`RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:229`, range `0–INT_MAX`, default `-1`), so PG accepts
+the `toast.` prefix and stores it (without prefix) on the TOAST relation's `pg_class.reloptions`.
+
+- **Executor** (`operators_ddl.go`): one extra gather block after the slice-225 `toast.vacuum_truncate`
+  arm, reusing the parent-table integer reloption path (slice 198): `strconv.Atoi` + `0 ≤ N ≤ 2147483647`
+  bounds check (non-integer or out-of-range → 22023), appended to `toastReloptions` as
+  `autovacuum_vacuum_threshold=<N>` (no prefix).
+- **catalog** (`catalog.go`): no change — the existing `strings.Join` over `t.ToastReloptions` renders the
+  three-element array `{autovacuum_enabled=false,vacuum_truncate=false,autovacuum_vacuum_threshold=100}`.
+
+On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) order:
+`WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false', toast.autovacuum_vacuum_threshold='100')`.
+
+Engine guard: the `optoast` fixture now carries all three options; the assertion confirms the combined
+three-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
+
+**Next:** the remaining `RELOPT_KIND_TOAST` float/int options (`toast.autovacuum_vacuum_scale_factor` via
+the slice-199 float path, `toast.autovacuum_vacuum_cost_delay/limit`, `toast.autovacuum_freeze_*_age`,
+`toast.log_autovacuum_min_duration`) — each a one-line gather reusing the int/float paths. NOTE:
+`toast.autovacuum_analyze_*` is `RELOPT_KIND_HEAP`-only (TOAST tables aren't analyzed); PG rejects it, so do
+not add those. After: composite types.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
