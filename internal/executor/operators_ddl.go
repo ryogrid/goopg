@@ -10339,6 +10339,46 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
 		return nil
 	}
+	// RENAME ATTRIBUTE old TO new — rename a composite type field so the new
+	// name round-trips through pg_dump's dumpCompositeType. DU-002 slice 254.
+	// Same re-sync mechanism as ADD ATTRIBUTE: the composite's OIDs are stable
+	// across re-registration, so stamp xmax on the existing heap rows and
+	// re-sync the field set with the renamed attribute.
+	if s.RenameAttrOld != "" {
+		ct := cat.LookupCompositeType(s.Name)
+		if ct == nil {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("type %q does not exist", s.Name)}
+		}
+		idx := -1
+		for i, f := range ct.Fields {
+			if strings.EqualFold(f.Name, s.RenameAttrOld) {
+				idx = i
+			}
+			if strings.EqualFold(f.Name, s.RenameAttrNew) {
+				return &ExecError{Code: "42701", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q already exists", s.RenameAttrNew, s.Name)}
+			}
+		}
+		if idx < 0 {
+			return &ExecError{Code: "42703", Pos: s.Pos(),
+				Message: fmt.Sprintf("column %q does not exist", s.RenameAttrOld)}
+		}
+		newFields := make([]catalog.CompositeField, len(ct.Fields))
+		copy(newFields, ct.Fields)
+		newFields[idx].Name = s.RenameAttrNew
+		if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
+			deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+			deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
+			_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
+		}
+		ct2 := cat.RegisterCompositeTypeWithFields(s.Name, newFields)
+		syncCompositeTypeToCatalogHeap(o.ctx, ct2)
+		return nil
+	}
 	// RENAME VALUE 'old' TO 'new' — M0097-0022.
 	if s.RenameOldValue != "" {
 		err := cat.RenameEnumValue(s.Name, s.RenameOldValue, s.RenameNewValue)

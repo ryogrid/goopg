@@ -131,6 +131,39 @@ func TestAlterTypeAddAttributeParsing(t *testing.T) {
 	}
 }
 
+// TestAlterTypeRenameAttributeParsing covers the RENAME ATTRIBUTE old TO new
+// sub-branch (DU-002 slice 254). It must NOT take the RENAME VALUE / RENAME TO
+// paths — those carry RenameOldValue / RenameTo, not RenameAttrOld/New.
+func TestAlterTypeRenameAttributeParsing(t *testing.T) {
+	tests := []struct {
+		sql     string
+		wantOld string
+		wantNew string
+	}{
+		{`ALTER TYPE addr RENAME ATTRIBUTE zip TO postal`, "zip", "postal"},
+		{`ALTER TYPE addr RENAME ATTRIBUTE a TO b CASCADE`, "a", "b"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.sql[:min(60, len(tc.sql))], func(t *testing.T) {
+			stmts, err := parser.Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+			}
+			at, ok := stmts[0].(*parser.AlterTypeStmt)
+			if !ok {
+				t.Fatalf("expected *AlterTypeStmt, got %T", stmts[0])
+			}
+			if at.RenameOldValue != "" || at.RenameTo != "" {
+				t.Errorf("took a RENAME VALUE/TO branch: RenameOldValue=%q RenameTo=%q", at.RenameOldValue, at.RenameTo)
+			}
+			if at.RenameAttrOld != tc.wantOld || at.RenameAttrNew != tc.wantNew {
+				t.Errorf("RENAME ATTRIBUTE = {%q, %q}, want {%q, %q}",
+					at.RenameAttrOld, at.RenameAttrNew, tc.wantOld, tc.wantNew)
+			}
+		})
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

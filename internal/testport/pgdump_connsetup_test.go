@@ -2433,6 +2433,11 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "ALTER TYPE public.alt_comp ADD ATTRIBUTE c numeric(10,2)"); err != nil {
 		t.Fatalf("alter type alt_comp add attribute c: %v", err)
 	}
+	// Slice 254: RENAME ATTRIBUTE renames an existing field in place; the renamed
+	// attribute (b -> b_renamed) must dump under its new name.
+	if err := runSQLSimple(t, c, "ALTER TYPE public.alt_comp RENAME ATTRIBUTE b TO b_renamed"); err != nil {
+		t.Fatalf("alter type alt_comp rename attribute b: %v", err)
+	}
 	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in, zips zipcode[])"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
@@ -5229,9 +5234,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// Slice 253: ALTER TYPE … ADD ATTRIBUTE appends fields that must dump
 			// alongside the original one — the type re-synced its heap rows with
 			// the new attributes (typmod preserved on the numeric one).
+			// Slice 254: RENAME ATTRIBUTE renamed b -> b_renamed in place.
 			"CREATE TYPE public.alt_comp AS (",
 			"\ta integer,",
-			"\tb text,",
+			"\tb_renamed text,",
 			"\tc numeric(10,2)",
 		}
 		for _, sub := range compositeDefs {

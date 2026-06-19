@@ -2130,6 +2130,9 @@ type AlterTypeStmt struct {
 	// DU-002 slice 253.
 	AddAttrName string // new composite-type attribute name (empty when not ADD ATTRIBUTE)
 	AddAttrType string // its type string (space-joined, e.g. "numeric ( 10 , 2 )")
+	// RENAME ATTRIBUTE old TO new — renames a composite type field. DU-002 slice 254.
+	RenameAttrOld string // existing attribute name (empty when not RENAME ATTRIBUTE)
+	RenameAttrNew string // replacement attribute name
 }
 
 func (s *AlterTypeStmt) Pos() int  { return s.pos }

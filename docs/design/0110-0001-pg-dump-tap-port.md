@@ -7373,6 +7373,35 @@ pg_dump TAP port creates `public.alt_comp AS (a integer)`, runs two `ALTER TYPE 
 > **Next (slice 254+):** `ALTER TYPE … DROP ATTRIBUTE` / `RENAME ATTRIBUTE` / `ALTER ATTRIBUTE … TYPE`
 > (the remaining `ALTER TYPE` attribute subcommands).
 
+### Slice 254 — `ALTER TYPE … RENAME ATTRIBUTE old TO new` renames a composite field
+
+Slice 253 wired `ADD ATTRIBUTE`; `RENAME ATTRIBUTE` was still a parser stub (the `RENAME` branch only knew
+`RENAME VALUE` and `RENAME TO`, consuming `RENAME ATTRIBUTE …` to `;` as a no-op), so a renamed field still
+dumped under its old name. This slice wires the `RENAME ATTRIBUTE` form end-to-end, reusing slice 253's re-sync
+mechanism verbatim.
+
+- **Parser (`parseAlterType`)** — inside the `RENAME` branch, a new `attribute` sub-branch parses
+  `old TO new` (two bare identifiers, lower-cased) and stub-consumes any `CASCADE`/`RESTRICT` trailer to
+  `;`/EOF. Recorded on `AlterTypeStmt.RenameAttrOld` / `RenameAttrNew`. It must not fall through to the
+  `RENAME VALUE`/`RENAME TO` paths.
+- **Executor (`execAlterType`)** — when `RenameAttrOld != ""`, look up the composite type (`42704` if absent),
+  scan `ct.Fields` for the old name (`42703` `column "%s" does not exist` if missing, matching PG
+  `renameatt_internal`) and reject a collision with the new name (`42701`
+  `column "%s" of relation "%s" already exists`). Copy the field slice, rewrite the one field's `Name`, then
+  re-sync the heap exactly as slice 253 (OIDs stable across `RegisterCompositeTypeWithFields`; stamp `xmax` on
+  the existing `pg_type` ×2 + `pg_class`/`pg_attribute` rows and re-run `syncCompositeTypeToCatalogHeap`).
+- **No `pg_dump`-side change** — `dumpCompositeType` reads `attname` from the re-synced `pg_attribute` rows.
+- **Scope**: `RENAME ATTRIBUTE` only. `DROP ATTRIBUTE`, `ALTER ATTRIBUTE … TYPE`, multi-subcommand statements,
+  and mid-txn ROLLBACK of the in-memory rename remain future work (one task per loop).
+
+Guarded at two levels: `parser.TestAlterTypeRenameAttributeParsing` pins the parse (`old`/`new`, with/without a
+`CASCADE` trailer, and that it does NOT take a `RENAME VALUE`/`RENAME TO` branch); the pg_dump TAP port now runs
+`ALTER TYPE public.alt_comp RENAME ATTRIBUTE b TO b_renamed` after the two `ADD ATTRIBUTE`s and asserts the dump
+re-emits `a integer, b_renamed text, c numeric(10,2)`, byte-matching real pg_dump 18.3.
+
+> **Next (slice 255+):** `ALTER TYPE … DROP ATTRIBUTE` / `ALTER ATTRIBUTE … TYPE`
+> (the remaining `ALTER TYPE` attribute subcommands).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

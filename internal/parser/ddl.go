@@ -5628,7 +5628,30 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 			stmt.RenameTo = newName.Name
 			return stmt, nil
 		}
-		// Other RENAME variants (e.g. RENAME ATTRIBUTE) — consume as stub.
+		// RENAME ATTRIBUTE old TO new [CASCADE|RESTRICT] — rename a composite
+		// type field so the new name round-trips through pg_dump. DU-002 slice 254.
+		if p.acceptIdentKeyword("attribute") {
+			if p.cur().Kind != TokenIdent {
+				return nil, p.errAtCur("expected attribute name after RENAME ATTRIBUTE")
+			}
+			stmt.RenameAttrOld = strings.ToLower(p.advance().Value)
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			if p.cur().Kind != TokenIdent {
+				return nil, p.errAtCur("expected new attribute name after TO")
+			}
+			stmt.RenameAttrNew = strings.ToLower(p.advance().Value)
+			// Consume trailing CASCADE|RESTRICT to ';'/EOF as a stub.
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return stmt, nil
+		}
+		// Other RENAME variants — consume as stub.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break

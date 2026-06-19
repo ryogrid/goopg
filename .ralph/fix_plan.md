@@ -5461,6 +5461,26 @@ object support.
         PASS, 3.5s). Executor+parser+catalog unit suites PASS. Design: `0110-0001` Slice 253. pgbench
         pre-commit smoke on commit. **Next (slice 254+):** `ALTER TYPE … DROP/RENAME/ALTER ATTRIBUTE`.
 
+      - **PROGRESS 2026-06-20 (loop #20):** **DU-002 slice 254 LANDED — `ALTER TYPE … RENAME ATTRIBUTE old TO
+        new` renames a composite type field in place; the renamed attribute round-trips through pg_dump.**
+        Slice 253 wired `ADD ATTRIBUTE`; `RENAME ATTRIBUTE` was still a parser stub (the `RENAME` branch knew
+        only `RENAME VALUE`/`RENAME TO`, consuming `RENAME ATTRIBUTE …` to `;` as a no-op), so a renamed field
+        still dumped under its old name. Parser (`parseAlterType`): new `attribute` sub-branch inside `RENAME`
+        parses `old TO new` (two bare idents, lower-cased), stub-consumes a `CASCADE`/`RESTRICT` trailer →
+        `AlterTypeStmt.RenameAttrOld`/`RenameAttrNew`. Executor (`execAlterType`): `RenameAttrOld != ""` →
+        `cat.LookupCompositeType` (42704 absent; 42703 `column … does not exist` if old name missing, matching
+        PG `renameatt_internal`; 42701 collision with new name), copy the field slice, rewrite the one field's
+        `Name`, then **re-sync** the heap exactly as slice 253 (composite OIDs stable across
+        `RegisterCompositeTypeWithFields`, so stamp `xmax` on existing pg_type×2 + pg_class/pg_attribute and
+        re-run `syncCompositeTypeToCatalogHeap`). No pg_dump-side change — `dumpCompositeType` reads `attname`
+        from the re-synced rows. Scope: `RENAME ATTRIBUTE` only; `DROP ATTRIBUTE`/`ALTER ATTRIBUTE … TYPE`/
+        multi-subcommand/ROLLBACK deferred (one task per loop). Guards: `parser.TestAlterTypeRenameAttributeParsing`
+        (old/new, CASCADE trailer, NOT the RENAME VALUE/TO branch) + pg_dump TAP port runs `RENAME ATTRIBUTE
+        b TO b_renamed` after the two ADDs, asserts the dump re-emits `a integer, b_renamed text,
+        c numeric(10,2)` byte-matching real pg_dump 18.3 (`TestPort_PgDumpConnectionSetup` PASS, 3.5s).
+        Executor+parser+catalog unit suites PASS. Design: `0110-0001` Slice 254. pgbench pre-commit smoke on
+        commit. **Next (slice 255+):** `ALTER TYPE … DROP ATTRIBUTE` / `ALTER ATTRIBUTE … TYPE`.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).
