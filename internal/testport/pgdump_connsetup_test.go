@@ -849,6 +849,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optlamd: %v", err)
 	}
 
+	// Slice 207: the integer autovacuum_freeze_min_age storage parameter
+	// (RELOPT_TYPE_INT, valid 0–1000000000, default -1 = unset), the fifth
+	// INT-typed autovacuum-namespace reloption, reusing the slice-198 integer path
+	// (a separate set flag records presence — 0 is a valid explicit value distinct
+	// from the -1 unset sentinel). goopg stores
+	// catalog.Table.AutovacuumFreezeMinAge; the pg_class virtual view renders
+	// `{autovacuum_freeze_min_age=5000}`, which pg_dump emits as
+	// `WITH (autovacuum_freeze_min_age='5000')`. goopg has no autovacuum, so the
+	// value is catalog/dump-only (advisory). `optafma` carries it on its own table
+	// to keep the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optafma (id integer PRIMARY KEY) WITH (autovacuum_freeze_min_age=5000)"); err != nil {
+		t.Fatalf("create table optafma: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2658,6 +2672,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (log_autovacuum_min_duration='250')") {
 			t.Errorf("pg_dump dropped the log_autovacuum_min_duration reloption; missing %q\n  full stdout=%q", "WITH (log_autovacuum_min_duration='250')", res.Stdout)
+		}
+		// **Slice 207 closed (asserted):** the integer autovacuum_freeze_min_age
+		// storage parameter (RELOPT_TYPE_INT, valid 0–1000000000, default -1 =
+		// unset) — the fifth INT-typed autovacuum-namespace reloption — must
+		// round-trip via the slice-198 integer path (a separate set flag records
+		// presence since 0 is a valid explicit value distinct from the -1 unset
+		// sentinel). catalog.Table.AutovacuumFreezeMinAge persists it and the
+		// pg_class virtual view renders `{autovacuum_freeze_min_age=5000}`, which
+		// pg_dump emits as `WITH (autovacuum_freeze_min_age='5000')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optafma (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optafma\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (autovacuum_freeze_min_age='5000')") {
+			t.Errorf("pg_dump dropped the autovacuum_freeze_min_age reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_freeze_min_age='5000')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

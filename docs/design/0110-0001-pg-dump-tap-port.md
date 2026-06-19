@@ -6004,6 +6004,30 @@ reloptions) and `TestLogAutovacuumMinDurationOutOfBoundsRejected` (`9999999999`/
 on its own table; the assertion confirms the dump carries
 `WITH (log_autovacuum_min_duration='250')`.
 
+### Slice 207 — fifth INTEGER autovacuum reloption (`autovacuum_freeze_min_age`) round-trip
+
+Steps onto the freeze-age subfamily for the fifth INT-typed autovacuum-namespace
+reloption, reusing the slice-198 integer path. `autovacuum_freeze_min_age` is
+`RELOPT_TYPE_INT` with `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` and a default of **-1**
+(= unset / use the GUC), range `0`–`1000000000` (`reloptions.c:272/1885`; "Minimum age
+at which VACUUM should freeze a table row, for autovacuum"). Unlike the prior INT
+slices the range *minimum* is `0` (the `-1` default is an out-of-range unset sentinel,
+so a user cannot supply `-1` explicitly), but `0` is itself a valid explicit value, so a
+separate `AutovacuumFreezeMinAgeSet` flag still records presence (the `parallel_workers`
+pattern) rather than a zero check. The executor parses with `strconv.Atoi`, rejecting
+non-integers and out-of-range values (`< 0 || > 1000000000`) with `22023`. It persists
+`catalog.Table.AutovacuumFreezeMinAge` (an `int`); the pg_class virtual view appends
+`autovacuum_freeze_min_age=N` after `log_autovacuum_min_duration`; pg_dump renders
+`WITH (autovacuum_freeze_min_age='N')`. goopg has no autovacuum, so the value is advisory
+catalog/dump-only, base-table-only — same as the sibling reloption slices.
+
+Engine guards: `TestAutovacuumFreezeMinAgeSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,autovacuum_freeze_min_age=5000}`; boundary `0`; plain table → no
+reloptions) and `TestAutovacuumFreezeMinAgeOutOfBoundsRejected` (`1000000001`/`nope`
+→ 22023). The pg_dump fixture adds `optafma (… WITH (autovacuum_freeze_min_age=5000))`
+on its own table; the assertion confirms the dump carries
+`WITH (autovacuum_freeze_min_age='5000')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

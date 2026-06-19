@@ -1248,6 +1248,31 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		logAutovacuumMinDuration = lamd
 		logAutovacuumMinDurationSet = true
 	}
+	// Extract and bounds-check the autovacuum_freeze_min_age storage parameter —
+	// the fifth INT-typed autovacuum-namespace reloption goopg round-trips, reusing
+	// the slice-198 integer path. PG's reloption type is RELOPT_TYPE_INT with range
+	// 0–1000000000 and a default of -1 (= unset / use the GUC) (reloptions.c:1885/272).
+	// Since 0 is a valid explicit value, a separate `set` flag records whether the
+	// option was present (the parallel_workers pattern). goopg has no autovacuum, so
+	// the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_freeze_min_age='N')`.
+	// M0110-0001 (DU-002 slice 207).
+	autovacuumFreezeMinAge := 0
+	autovacuumFreezeMinAgeSet := false
+	if v, ok := s.With["autovacuum_freeze_min_age"]; ok {
+		afma, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_freeze_min_age\": %s", v)}
+		}
+		if afma < 0 || afma > 1000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_freeze_min_age\"", afma),
+				Detail:  "Valid values are between \"0\" and \"1000000000\"."}
+		}
+		autovacuumFreezeMinAge = afma
+		autovacuumFreezeMinAgeSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1323,6 +1348,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.VacuumTruncateSet = vacuumTruncateSet
 	tbl.LogAutovacuumMinDuration = logAutovacuumMinDuration
 	tbl.LogAutovacuumMinDurationSet = logAutovacuumMinDurationSet
+	tbl.AutovacuumFreezeMinAge = autovacuumFreezeMinAge
+	tbl.AutovacuumFreezeMinAgeSet = autovacuumFreezeMinAgeSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

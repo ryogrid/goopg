@@ -1169,6 +1169,94 @@ func TestLogAutovacuumMinDurationOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+// TestAutovacuumFreezeMinAgeSurfacesInPgClassReloptions verifies that an integer
+// autovacuum_freeze_min_age storage parameter is persisted on the table, surfaces
+// in pg_class.reloptions as `autovacuum_freeze_min_age=N`, and that an explicit 0
+// (the range minimum, distinct from the -1 unset sentinel) round-trips via the
+// presence flag rather than a zero check. DU-002 slice 207.
+func TestAutovacuumFreezeMinAgeSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE afma (id integer PRIMARY KEY) WITH (fillfactor=70, autovacuum_freeze_min_age=5000)`); err != nil {
+		t.Fatalf("CREATE TABLE afma: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE afmazero (id integer PRIMARY KEY) WITH (autovacuum_freeze_min_age=0)`); err != nil {
+		t.Fatalf("CREATE TABLE afmazero: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE afmaplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE afmaplain: %v", err)
+	}
+
+	afmaTbl, ok := cat.LookupTable(parser.ObjectName{Name: "afma"})
+	if !ok {
+		t.Fatal("afma table not found")
+	}
+	if afmaTbl.AutovacuumFreezeMinAge != 5000 || !afmaTbl.AutovacuumFreezeMinAgeSet {
+		t.Errorf("afma age = %d set=%v, want 5000 set=true", afmaTbl.AutovacuumFreezeMinAge, afmaTbl.AutovacuumFreezeMinAgeSet)
+	}
+	zeroTbl, ok := cat.LookupTable(parser.ObjectName{Name: "afmazero"})
+	if !ok {
+		t.Fatal("afmazero table not found")
+	}
+	if zeroTbl.AutovacuumFreezeMinAge != 0 || !zeroTbl.AutovacuumFreezeMinAgeSet {
+		t.Errorf("afmazero age = %d set=%v, want 0 set=true", zeroTbl.AutovacuumFreezeMinAge, zeroTbl.AutovacuumFreezeMinAgeSet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "afmaplain"})
+	if !ok {
+		t.Fatal("afmaplain table not found")
+	}
+	if plainTbl.AutovacuumFreezeMinAgeSet {
+		t.Errorf("afmaplain set=%v, want false (unset)", plainTbl.AutovacuumFreezeMinAgeSet)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "afma" || r[1] == "afmazero" || r[1] == "afmaplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["afma"] != "{fillfactor=70,autovacuum_freeze_min_age=5000}" {
+		t.Errorf("pg_class.reloptions for afma = %q, want %q", got["afma"], "{fillfactor=70,autovacuum_freeze_min_age=5000}")
+	}
+	if got["afmazero"] != "{autovacuum_freeze_min_age=0}" {
+		t.Errorf("pg_class.reloptions for afmazero = %q, want %q", got["afmazero"], "{autovacuum_freeze_min_age=0}")
+	}
+	if got["afmaplain"] != "" {
+		t.Errorf("pg_class.reloptions for afmaplain = %q, want \"\" (NULL)", got["afmaplain"])
+	}
+}
+
+// TestAutovacuumFreezeMinAgeOutOfBoundsRejected verifies CREATE TABLE rejects an
+// above-range (> 1000000000) or non-integer autovacuum_freeze_min_age with PG's
+// 22023 error. The valid range is 0–1000000000 (a bare negative is rejected
+// earlier by the parser as a syntax error, so the reachable invalid cases are
+// over-max and non-integer). DU-002 slice 207.
+func TestAutovacuumFreezeMinAgeOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, v := range []string{"1000000001", "nope"} {
+		err := runDDL(t, ctx, `CREATE TABLE afmabad`+strconv.Itoa(i)+` (id integer) WITH (autovacuum_freeze_min_age=`+v+`)`)
+		if err == nil {
+			t.Errorf("autovacuum_freeze_min_age=%s: expected an error, got nil", v)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("autovacuum_freeze_min_age=%s: error type = %T, want *ExecError", v, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("autovacuum_freeze_min_age=%s: error code = %q, want 22023", v, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.
