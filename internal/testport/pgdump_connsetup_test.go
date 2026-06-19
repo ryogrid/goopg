@@ -1383,6 +1383,33 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pnnl_1 with child-only NOT NULL: %v", err)
 	}
 
+	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
+	// child must round-trip. Slices 264–266 covered the per-child override forms
+	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
+	// (pg_dump.c:9970) to print EVERY column. A legacy INHERITS child is the
+	// opposite regime: ispartition is false, so shouldPrintColumn gates on
+	// attislocal ALONE — the inherited columns (`pid`, `pname`, attislocal=false)
+	// are OMITTED while the child's own local column (`extra`, attislocal=true)
+	// prints. Layered on top, a CHECK declared in the child's CREATE TABLE
+	// (`CONSTRAINT ichk_child_pos CHECK (extra > 0)`) is conislocal='t': pg_dump
+	// emits it INSIDE the child's body alongside the local column, then the
+	// `INHERITS (public.ichk_parent)` clause (NOT an ATTACH — legacy inheritance,
+	// not a partition). Slice 170 proved column-omission + the INHERITS clause for
+	// a plain child; slice 264 proved a conislocal CHECK on a partition leaf; this
+	// slice proves their INTERSECTION — a conislocal CHECK on a column-omitting
+	// legacy child — which neither prior fixture exercised. Real pg_dump 18.3 emits
+	// the body `extra integer, CONSTRAINT ichk_child_pos CHECK ((extra > 0))`
+	// followed by `INHERITS (public.ichk_parent)` (verified byte-identical this
+	// loop). No production change — the conislocal CHECK path (operators_ddl.go
+	// AddCheck → pg_constraint VirtualRows) and the legacy-inheritance column
+	// omission (Table.InheritsParentOIDs + Column.Inherited) already exist.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ichk_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create legacy inheritance parent ichk_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ichk_child (extra integer, CONSTRAINT ichk_child_pos CHECK (extra > 0)) INHERITS (public.ichk_parent)"); err != nil {
+		t.Fatalf("create legacy inheritance child ichk_child with local CHECK: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -3746,6 +3773,40 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pnnl_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pnnl_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
+		// child. Unlike the partition leaves above (whose ispartition forces every
+		// column to print), ichk_child must (1) print ONLY its local column `extra`
+		// — the inherited `pid`/`pname` are omitted because shouldPrintColumn gates
+		// on attislocal alone here — (2) emit its conislocal CHECK
+		// `CONSTRAINT ichk_child_pos CHECK ((extra > 0))` inside that body, and
+		// (3) close with the `INHERITS (public.ichk_parent)` clause (legacy
+		// inheritance, NOT an ATTACH). A regression that re-emitted the inherited
+		// columns, dropped the conislocal CHECK, or lost the INHERITS clause would
+		// produce a structurally different table on restore.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.ichk_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the legacy child's local column; want %q in ichk_child block\n  block=%q", "extra integer", block)
+			}
+			if !strings.Contains(block, "CONSTRAINT ichk_child_pos CHECK ((extra > 0))") {
+				t.Errorf("pg_dump dropped the legacy child's local CHECK; want %q in ichk_child block\n  block=%q", "CONSTRAINT ichk_child_pos CHECK ((extra > 0))", block)
+			}
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in ichk_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.ichk_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.ichk_parent)") {
+			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.ichk_parent)", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged

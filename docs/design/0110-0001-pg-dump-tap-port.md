@@ -7754,10 +7754,41 @@ column decoration already existed.
 
 Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
 
-> **Next (slice 267+):** the three per-column override forms (CHECK, DEFAULT, NOT NULL) are now all covered for a
-> partition leaf. Move to `INHERITS`-tree dump fidelity beyond the single child — e.g. a local constraint or DEFAULT on a
-> legacy (non-partition) inheritance child, where `attislocal`/`conislocal` interplay differs from a partition leaf
-> (`ispartition` no longer forces every column to print).
+> **Next (slice 267):** see slice 267 below — a local CHECK on a legacy (non-partition) INHERITS child.
+
+### Slice 267 — local `CHECK` constraint on a legacy (non-partition) `INHERITS` child
+
+Slices 264–266 covered the per-child override forms on a **partition leaf**, where `tbinfo->ispartition` forces
+`shouldPrintColumn` (pg_dump.c:9970) to print *every* column. A legacy `INHERITS` child is the opposite regime:
+`ispartition` is false, so `shouldPrintColumn` gates on `attislocal` **alone** — the inherited columns are omitted while
+the child's own local column prints. This slice proves the **intersection** of slice 170 (column omission + the
+`INHERITS` clause for a plain child) and slice 264 (a `conislocal` CHECK), which neither prior fixture exercised on its
+own: a `conislocal` CHECK on a *column-omitting* legacy child.
+
+`ichk_child (extra integer, CONSTRAINT ichk_child_pos CHECK (extra > 0)) INHERITS (ichk_parent (pid integer, pname text))`.
+Real pg_dump 18.3 emits:
+
+```
+CREATE TABLE public.ichk_child (
+    extra integer,
+    CONSTRAINT ichk_child_pos CHECK ((extra > 0))
+)
+INHERITS (public.ichk_parent);
+```
+
+i.e. (1) only the local `extra integer` prints — `pid`/`pname` are omitted (they arrive via `INHERITS`), (2) the
+`conislocal='t'` CHECK prints inside the body, and (3) the `INHERITS (public.ichk_parent)` clause closes it (legacy
+inheritance, **not** an `ATTACH`). Verified byte-identical vs PG 18.3 and a fresh goopg server this loop.
+
+No production code changed — the `conislocal` CHECK path (`operators_ddl.go` `AddCheck` → pg_constraint `VirtualRows`)
+and the legacy-inheritance column omission (`Table.InheritsParentOIDs` + `Column.Inherited`) already existed.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+> **Next (slice 268+):** a local column **DEFAULT** on a legacy INHERITS child (the `pg_attrdef` sibling of this slice's
+> table-level CHECK), and a child-level DEFAULT/NOT NULL applied to an *inherited* column (`ALTER TABLE child ALTER
+> COLUMN ... SET DEFAULT/SET NOT NULL`), which pg_dump emits as a separate `ALTER TABLE ... ALTER COLUMN` statement rather
+> than inline.
 
 ## Deferred (002–010) — catalog surface estimate
 

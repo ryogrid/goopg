@@ -5749,6 +5749,27 @@ object support.
         beyond the single child (local constraint/DEFAULT on a legacy non-partition inheritance child, where
         `attislocal`/`conislocal` interplay differs since `ispartition` no longer forces every column to print).
 
+      - **PROGRESS 2026-06-20 (loop #34):** **DU-002 slice 267 LANDED — a LOCAL `CHECK` constraint on a LEGACY
+        (non-partition) `INHERITS` child round-trips through pg_dump.** Slices 264–266 covered per-child override forms on
+        a PARTITION leaf, where `tbinfo->ispartition` forces `shouldPrintColumn` (pg_dump.c:9970) to print EVERY column. A
+        legacy `INHERITS` child is the opposite regime: `ispartition` is false, so `shouldPrintColumn` gates on
+        `attislocal` ALONE — the inherited columns (`pid`/`pname`, attislocal=false) are OMITTED while the child's own
+        local column (`extra`, attislocal=true) prints. This slice proves the INTERSECTION of slice 170 (column omission +
+        the `INHERITS` clause) and slice 264 (a `conislocal` CHECK), which neither prior fixture exercised together:
+        `ichk_child (extra integer, CONSTRAINT ichk_child_pos CHECK (extra > 0)) INHERITS (ichk_parent (pid integer,
+        pname text))`. Real pg_dump 18.3 emits the body `extra integer, CONSTRAINT ichk_child_pos CHECK ((extra > 0))`
+        followed by `INHERITS (public.ichk_parent)` (legacy inheritance, NOT an ATTACH) — verified byte-identical vs PG
+        18.3 (probed this loop) AND a fresh goopg server (the test runs pg_dump against goopg). **No production change** —
+        the `conislocal` CHECK path (`operators_ddl.go` AddCheck → pg_constraint VirtualRows) and the legacy-inheritance
+        column omission (`Table.InheritsParentOIDs` + `Column.Inherited`) already exist. **pg_dump fixture**
+        (`pgdump_connsetup_test.go`): `ichk_parent`/`ichk_child` + a block-scoped assert on the child body (local
+        `extra integer`, the `CONSTRAINT ... CHECK`, and the inherited `pid`/`pname` ABSENT) plus the `INHERITS` clause.
+        Guard: `TestPort_PgDumpConnectionSetup` PASS (3.39s). gofmt + `go build ./...` clean; pgbench pre-commit smoke on
+        commit. Design: `0110-0001` Slice 267. **Next (slice 268+):** a local column `DEFAULT` on a legacy INHERITS child
+        (the `pg_attrdef` sibling of this slice's table-level CHECK), and a child-level DEFAULT/NOT NULL on an INHERITED
+        column (`ALTER TABLE child ALTER COLUMN ... SET DEFAULT/SET NOT NULL`), which pg_dump emits as a separate
+        `ALTER TABLE ... ALTER COLUMN` statement rather than inline.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).
