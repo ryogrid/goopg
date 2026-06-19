@@ -6702,6 +6702,33 @@ eight-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_P
 `toast.log_autovacuum_min_duration` (INT, allows `-1`)) — each a one-line gather reusing the int path.
 After: composite types.
 
+### Slice 232 — third `RELOPT_KIND_TOAST` autovacuum-age *integer* reloption (`toast.autovacuum_freeze_table_age`)
+
+Adds `toast.autovacuum_freeze_table_age`, the third `RELOPT_KIND_TOAST` autovacuum-**age** integer option,
+extending the TOAST reloptions array to nine elements. `autovacuum_freeze_table_age` is `RELOPT_TYPE_INT`
+and shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:1889/308`, range `0–2000000000`,
+default `-1`), so PG accepts the `toast.` prefix and stores it (without prefix) on the TOAST relation's
+`pg_class.reloptions`. Unlike the freeze_min/max_age arms, `0` is a valid explicit value (its lower bound
+is `0`), so the fixture uses `0` to exercise that boundary.
+
+- **Executor** (`operators_ddl.go`): one extra gather block after the slice-231 `toast.autovacuum_freeze_max_age`
+  arm, mirroring the parent-table integer reloption arm (slice 209): `strconv.Atoi` + `0 ≤ N ≤ 2000000000`
+  bounds check (non-int or out-of-range → 22023; the `0` floor means an explicit `-1` is rejected),
+  appended to `toastReloptions` as `autovacuum_freeze_table_age=<N>` (no prefix) via `strconv.Itoa`.
+- **catalog** (`catalog.go`): no change — the existing `strings.Join` over `t.ToastReloptions` renders the
+  nine-element array ending in `…,autovacuum_freeze_max_age=500000000,autovacuum_freeze_table_age=0}`.
+
+On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) order:
+`WITH (..., toast.autovacuum_freeze_max_age='500000000', toast.autovacuum_freeze_table_age='0')`.
+
+Engine guard: the `optoast` fixture now carries all nine options; the assertion confirms the combined
+nine-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
+
+**Next:** the remaining `RELOPT_KIND_TOAST` int options (the multixact variants
+(`toast.autovacuum_multixact_freeze_min/max_age`, `toast.autovacuum_multixact_freeze_table_age`),
+`toast.log_autovacuum_min_duration` (INT, allows `-1`)) — each a one-line gather reusing the int path.
+After: composite types.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
