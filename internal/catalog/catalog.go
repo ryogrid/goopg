@@ -164,6 +164,17 @@ type Column struct {
 	// does not act on these planner statistics hints; recorded purely so the
 	// column round-trips through pg_dump. DU-002 slice 185.
 	Options []string
+	// Collation is the explicit collation name from a column-level `COLLATE
+	// <name>` clause — e.g. "C", "POSIX", "ucs_basic" (bare collname, matching
+	// pg_collation.collname). Empty means none, in which case pg_attribute.
+	// attcollation echoes the column type's typcollation and pg_dump emits no
+	// COLLATE clause. When set (and the type is collatable), the synthesized
+	// pg_attribute row reports the resolved collation OID so pg_dump's
+	// `CASE WHEN a.attcollation <> t.typcollation` test fires and it re-emits
+	// `COLLATE <schema>.<name>` inline in the CREATE TABLE column list. goopg
+	// does not actually collate; recorded purely for pg_dump round-trip
+	// fidelity. DU-002 slice 188.
+	Collation string
 }
 
 // NamedCheckConstraint holds a CHECK constraint with an explicit name.

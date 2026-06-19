@@ -82,6 +82,44 @@ func TestPgTypeRowCanonicalTypalignByte(t *testing.T) {
 	}
 }
 
+// TestPgTypeRowCanonicalTypcollation pins pg_type.typcollation (FormData
+// offset 144) for every bootstrapped row. The value MUST agree with the
+// attcollation that the runtime virtual pg_attribute path reports for the same
+// type (executor.userTypeAttrsForOID): pg_dump's getTableAttrs emits a column
+// COLLATE clause precisely when `a.attcollation <> t.typcollation`. When the
+// heap hardcoded typcollation=0 while pg_attribute reported 100, pg_dump — once
+// pg_collation was populated (DU-002 slice 187) — spuriously emitted
+// `COLLATE pg_catalog."default"` on every collatable column. This pins the
+// PG-canonical values that close that divergence. DU-002 slice 188.
+func TestPgTypeRowCanonicalTypcollation(t *testing.T) {
+	cols := pgTypeColDefs()
+	// want[oid] = canonical typcollation; absent OIDs must be 0 (non-collatable).
+	want := map[uint32]uint32{
+		19:   950, // name    -> C
+		25:   100, // text    -> default
+		1042: 100, // bpchar  -> default
+		1043: 100, // varchar -> default
+		1009: 100, // _text   -> default (array inherits element collation)
+	}
+	for _, e := range pgTypeInitialEntries() {
+		row := pgTypeRow(e)
+		payload, err := executor.EncodeRowPG(cols, row)
+		if err != nil {
+			t.Fatalf("oid=%d (%s): encode: %v", e.OID, e.Name, err)
+		}
+		if len(payload) < 148 {
+			t.Errorf("oid=%d (%s): fixed part %d bytes < 148", e.OID, e.Name, len(payload))
+			continue
+		}
+		got := uint32(payload[144]) | uint32(payload[145])<<8 |
+			uint32(payload[146])<<16 | uint32(payload[147])<<24
+		if got != want[e.OID] { // want[oid] is 0 for any OID not in the map
+			t.Errorf("oid=%d (%s): typcollation at offset 144: want %d, got %d",
+				e.OID, e.Name, want[e.OID], got)
+		}
+	}
+}
+
 // TestPgTypeRowEmbedsCanonicalIORegprocOIDs pins the I/O regproc OIDs
 // emitted in every bootstrapped pg_type row. The int4 case in
 // particular is load-bearing: an int4 row with typoutput=0 makes PG18's

@@ -970,6 +970,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("alter optcol.b set (n_distinct=-0.1): %v", err)
 	}
 
+	// Slice 188: a per-column explicit collation (`COLLATE <name>`) must survive
+	// the dump. pg_dump's getTableAttrs reports attcollation only when it differs
+	// from the column type's typcollation (`CASE WHEN a.attcollation <>
+	// t.typcollation …`), then dumpTableSchema re-emits `COLLATE <schema>.<name>`
+	// inline in the CREATE TABLE column list. goopg recorded the name on
+	// catalog.Column.Collation, but the synthesized pg_attribute row echoed the
+	// type's typcollation unconditionally, so the COLLATE was silently dropped.
+	// text's typcollation is the default (100), so C (950) and POSIX (951) both
+	// differ and must re-emit; the untouched `d` (default collation) must NOT.
+	if err := runSQLSimple(t, c, `CREATE TABLE public.collcol (a text COLLATE "C", b text COLLATE "POSIX", d text)`); err != nil {
+		t.Fatalf("create table collcol: %v", err)
+	}
+
 	// Slice 54 (cross-namespace guard): a user-defined schema (other than public)
 	// and a table inside it round-trip. pg_dump emits `CREATE SCHEMA s;` for every
 	// dumpable non-public namespace and qualifies the contained objects; this
@@ -2541,6 +2554,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if strings.Contains(res.Stdout, "ALTER COLUMN d SET (") {
 			t.Errorf("pg_dump emitted a spurious SET (...) for an untouched column (optcol.d)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 188 (asserted):** per-column explicit collation. `collcol.a` got
+		// COLLATE "C" and `collcol.b` COLLATE "POSIX"; pg_dump's getTableAttrs
+		// reports attcollation when it differs from the type's typcollation, and
+		// dumpTableSchema re-emits `COLLATE pg_catalog."<name>"` inline in the
+		// column list (text's typcollation is the default=100, so C=950/POSIX=951
+		// both differ). Before the fix attcollation echoed the type default, so
+		// neither appeared. The untouched `d` (default collation) must NOT carry one.
+		for _, sub := range []string{
+			`a text COLLATE pg_catalog."C"`,
+			`b text COLLATE pg_catalog."POSIX"`,
+		} {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a per-column collation; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		if strings.Contains(res.Stdout, "d text COLLATE") {
+			t.Errorf("pg_dump emitted a spurious COLLATE for an untouched column (collcol.d)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 49 closed (asserted):** a column-level CHECK was silently
 		// dropped from the dump. pg_dump gates its per-table CHECK query on

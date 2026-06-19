@@ -2443,9 +2443,17 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			p.parseConstraintDeferrable(&col.PrimaryDeferrable, &col.PrimaryInitiallyDeferred)
 		case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNull:
 			p.advance() // NULL is the default; absorb it
-		// COLLATE collation_name — ignore collation; goopg v0 doesn't track collations. M0097-0071.
+		// COLLATE collation_name — capture the collation so the column round-trips
+		// through pg_dump (attcollation in pg_attribute → re-emitted COLLATE clause).
+		// goopg v0 does not actually collate; the name is recorded for dump fidelity
+		// only. Accepts an optional schema qualifier (`pg_catalog."C"`); we keep the
+		// bare last component, matching pg_collation.collname. DU-002 slice 188
+		// (was M0097-0071: previously discarded).
 		case p.acceptIdentKeyword("collate"):
-			_, _ = p.parseIdent() // consume collation name (may be quoted)
+			// parseCollationName accepts an optional schema qualifier
+			// (`pg_catalog."C"`) and returns the trailing component unquoted.
+			collName, _ := p.parseCollationName()
+			col.Collation = collName
 		// COMPRESSION method — column-level compression method (PG 14+). goopg does
 		// not actually TOAST/compress, but records the method so the column
 		// round-trips through pg_dump (which re-emits a SET COMPRESSION clause for

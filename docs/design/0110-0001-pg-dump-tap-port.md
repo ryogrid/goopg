@@ -5423,6 +5423,49 @@ string (a pre-existing, system-wide limitation of the `[][]string` virtual-row l
 `TestPgCollationVirtualRows` (`internal/catalog/pg_collation_virtual_test.go`) pins the row
 count (7), the 12-column width, and the full per-OID value vector against `pg_collation.dat`.
 
+### Slice 188 — per-column `COLLATE` round-trip + close the slice-187 `attcollation`/`typcollation` regression
+
+Two coupled fixes that together make column collations round-trip through pg_dump.
+
+**(a) Capture the explicit `COLLATE`.** A column-level `COLLATE <name>` clause was
+parsed-and-discarded (`internal/parser/ddl.go`, the old M0097-0071 no-op). It is now
+captured via the existing `parseCollationName` helper (handles `pg_catalog."C"`
+qualification, returns the unquoted trailing component) onto `ColumnDef.Collation`,
+threaded through both CREATE TABLE column-build paths in `operators_ddl.go` onto
+`catalog.Column.Collation`. The synthesized virtual `pg_attribute` row
+(`buildUserPGAttributeRow`) resolves the name to its BKI-pinned collation OID
+(`collationNameToOID`, mirroring the slice-187 `pg_collation` rows) and reports it as
+`attcollation` — but only for a collatable type (`typcollation != 0`) and a name that
+resolves, since `COLLATE` on a non-collatable type is a CREATE-time error in PG.
+
+**(b) Fix the `typcollation` side so the comparison is correct.** pg_dump's
+`getTableAttrs` emits a column `COLLATE` clause precisely when
+`a.attcollation <> t.typcollation`. goopg's virtual `pg_attribute` already reported
+`attcollation = 100` (default) for text/varchar/bpchar (deliberately, so a PG standby can
+resolve the default collation when planning), but the bootstrapped `pg_type` heap
+(`internal/initdb/pg_type_bootstrap.go`) hardcoded `typcollation = 0` for **every** type.
+While `pg_collation` was an empty stub this was invisible — `findCollationByOid(100)`
+returned nothing so pg_dump emitted no clause. Slice 187 populated `pg_collation`, so
+`findCollationByOid(100)` began resolving and pg_dump started spuriously emitting
+`COLLATE pg_catalog."default"` on **every** collatable column (a silent regression of
+`TestPort_PgDumpConnectionSetup`, which slice 187's gates did not run). The fix sets the
+heap `typcollation` to the PG-canonical value via `pgTypeCollationForOID` —
+`name` → 950 (C), `text`/`bpchar`/`varchar`/`_text` → 100 (default), all others 0 —
+which both matches `pg_type.dat` and agrees with the `attcollation` that
+`executor.userTypeAttrsForOID` reports for the same OID. Default columns now satisfy
+`100 == 100` (no clause); an explicit `COLLATE "C"` column satisfies `950 <> 100`
+(emit `COLLATE pg_catalog."C"`).
+
+This is a textbook sibling-path divergence (`attcollation`↔`typcollation`): the two must
+carry the same value for the same type or pg_dump mis-fires.
+
+Tests: `TestParseColumnDefCollation` (parser capture incl. qualified/quoted forms and the
+COLLATE-before-NOT-NULL ordering); `TestPgTypeRowCanonicalTypcollation`
+(`internal/initdb/pg_type_bootstrap_test.go`, pins the heap `typcollation` at FormData
+offset 144 for every bootstrapped OID); and the `collcol` table added to
+`TestPort_PgDumpConnectionSetup` asserts `a text COLLATE pg_catalog."C"` /
+`b text COLLATE pg_catalog."POSIX"` survive and the untouched `d` carries no `COLLATE`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

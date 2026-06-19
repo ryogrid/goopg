@@ -4133,6 +4133,32 @@ object support.
         column COLLATE in parser → store attcollation in pg_attribute heap → pg_dump emits clause when
         attcollation ≠ typcollation); or MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK).
 
+      - **PROGRESS 2026-06-19 (loop #156):** **DU-002 slice 188 LANDED — per-column `COLLATE`
+        round-trip AND closed a silent slice-187 regression of `TestPort_PgDumpConnectionSetup`.**
+        Two coupled fixes: **(a)** the parser now captures a column `COLLATE <name>` (was a
+        parse-and-discard no-op) via `parseCollationName` onto `ColumnDef.Collation` → both CREATE
+        TABLE column paths in `operators_ddl.go` → `catalog.Column.Collation`; the virtual
+        `pg_attribute` row resolves the name to its collation OID (`collationNameToOID`) and reports
+        it as `attcollation` (only for collatable types). **(b)** ROOT CAUSE of the regression:
+        goopg's virtual `pg_attribute` reported `attcollation=100` for text/varchar/bpchar, but the
+        bootstrapped `pg_type` heap hardcoded `typcollation=0`. While `pg_collation` was an empty
+        stub this was invisible; slice 187 populated it, so `findCollationByOid(100)` began resolving
+        and pg_dump spuriously emitted `COLLATE pg_catalog."default"` on EVERY collatable column
+        (slice 187's gates never ran the pg_dump TAP test). Fixed by setting the heap `typcollation`
+        to PG-canonical values (`pgTypeCollationForOID`: name→950, text/bpchar/varchar/_text→100,
+        else 0) — matches `pg_type.dat` AND agrees with `executor.userTypeAttrsForOID`'s
+        `attcollation` (sibling-path invariant). Default columns now `100==100` (no clause); explicit
+        `COLLATE "C"` → `950<>100` → `COLLATE pg_catalog."C"`. Files: `internal/parser/ast.go`,
+        `internal/parser/ddl.go`, `internal/parser/ddl_test.go` (NEW `TestParseColumnDefCollation`),
+        `internal/catalog/catalog.go`, `internal/executor/operators_ddl.go`,
+        `internal/executor/pg18_user_catalog_rows.go`, `internal/initdb/pg_type_bootstrap.go`,
+        `internal/initdb/pg_type_bootstrap_test.go` (NEW `TestPgTypeRowCanonicalTypcollation`),
+        `internal/testport/pgdump_connsetup_test.go` (collcol round-trip),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 188). Gates: gofmt OK; `go build ./...`
+        clean; parser/catalog/initdb/executor PASS; `TestPort_PgDumpConnectionSetup` PASS (was FAILING
+        at HEAD); pgbench pre-commit smoke on commit. **Next:** MINVALUE/MAXVALUE keyword-AST-node
+        slice (HIGHER RISK: partition routing); or attfdwoptions (foreign-table only, NULL today).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

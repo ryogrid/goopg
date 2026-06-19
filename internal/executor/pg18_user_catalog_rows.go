@@ -388,6 +388,32 @@ const (
 	cCollationOID uint32 = 950
 )
 
+// collationNameToOID resolves a bare pg_collation.collname (as captured from a
+// column's `COLLATE <name>` clause) to its BKI-pinned OID. The mapping mirrors
+// the seven built-in collations populated in catalog.pgCollation.VirtualRows
+// (DU-002 slice 187) and PG18's pg_collation.dat. Returns 0 for an unknown name
+// so callers leave attcollation at the type default. DU-002 slice 188.
+func collationNameToOID(name string) uint32 {
+	switch name {
+	case "default":
+		return 100
+	case "C":
+		return 950
+	case "POSIX":
+		return 951
+	case "pg_c_utf8":
+		return 811
+	case "ucs_basic":
+		return 962
+	case "unicode":
+		return 963
+	case "pg_unicode_fast":
+		return 6411
+	default:
+		return 0
+	}
+}
+
 // buildUserPGClassRow constructs a 34-column PG18-canonical pg_class row for
 // a user-defined table. Mirrors initdb.pgClassRow's per-column ordering and
 // default values.
@@ -688,6 +714,21 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 	if len(col.Options) > 0 {
 		attOptionsDatum = NewStringDatum("{" + strings.Join(col.Options, ",") + "}")
 	}
+	// A per-column explicit collation (`COLLATE <name>`) shadows the type's
+	// typcollation in pg_attribute.attcollation. pg_dump's getTableAttrs query
+	// reports attcollation only when `a.attcollation <> t.typcollation`, and
+	// dumpTableSchema then re-emits a `COLLATE <schema>.<name>` clause inline.
+	// attcollation echoed the type collation unconditionally, so a declared
+	// COLLATE was silently dropped from the dump. Only override for a collatable
+	// type (typcollation != 0) and a name that resolves to a known collation OID
+	// — a COLLATE on a non-collatable type is a CREATE-time error in PG, so we
+	// never persist a bogus OID. DU-002 slice 188.
+	attCollationOID := attrs.TypCollation
+	if col.Collation != "" && attrs.TypCollation != 0 {
+		if oid := collationNameToOID(col.Collation); oid != 0 {
+			attCollationOID = oid
+		}
+	}
 	return Row{
 		NewIntDatum(int64(tbl.OID)),            // attrelid
 		NewStringDatum(col.Name),               // attname (name)
@@ -713,7 +754,7 @@ func buildUserPGAttributeRow(cat catalog.Catalog, tbl *catalog.Table, col catalo
 			}
 			return NewIntDatum(0)
 		}(), // attinhcount
-		NewIntDatum(int64(attrs.TypCollation)), // attcollation
+		NewIntDatum(int64(attCollationOID)), // attcollation (type default; per-column COLLATE override, slice 188)
 		// attacl / attoptions / attfdwoptions / attmissingval are nullable
 		// varlena columns; PG18 stores NULL when unset. NullDatum signals
 		// EncodeRowPG to skip the column and the bitmap helper to clear

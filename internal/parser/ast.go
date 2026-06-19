@@ -963,6 +963,14 @@ type ColumnDef struct {
 	// Compression purely so the column round-trips through pg_dump (goopg does
 	// not actually TOAST/compress). DU-002 slice 183.
 	Compression string
+	// Collation is the collation name from an inline `COLLATE <name>` clause
+	// (`col text COLLATE "C"`). Empty when none was written. Stored as the bare
+	// (last-component, unquoted) collation name — e.g. "C", "POSIX", "ucs_basic".
+	// Threaded onto catalog.Column.Collation so the synthesized pg_attribute
+	// row reports the chosen attcollation and pg_dump re-emits the COLLATE
+	// clause. goopg does not actually collate; this is recorded purely for
+	// pg_dump round-trip fidelity. DU-002 slice 188.
+	Collation string
 }
 
 func (c ColumnDef) Pos() int { return c.pos }

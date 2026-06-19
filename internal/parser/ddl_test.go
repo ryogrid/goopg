@@ -834,3 +834,34 @@ func TestParseColumnDefCompression(t *testing.T) {
 		t.Errorf("col[1].NotNull=false, want true")
 	}
 }
+
+// TestParseColumnDefCollation verifies that an inline `COLLATE <name>` clause is
+// captured onto ColumnDef.Collation (bare trailing component, unquoted) so the
+// column round-trips through pg_dump. Covers the quoted form (`"C"`), the
+// schema-qualified form (`pg_catalog."POSIX"` → "POSIX"), an unquoted name, a
+// COLLATE that precedes another column constraint (NOT NULL), and confirms a
+// column with no COLLATE leaves the field empty. DU-002 slice 188.
+func TestParseColumnDefCollation(t *testing.T) {
+	sql := `CREATE TABLE t (a text COLLATE "C", b text COLLATE pg_catalog."POSIX" NOT NULL, c text COLLATE ucs_basic, d text)`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("expected *CreateTableStmt, got %T", stmts[0])
+	}
+	if len(ct.Columns) != 4 {
+		t.Fatalf("expected 4 columns, got %d", len(ct.Columns))
+	}
+	want := []string{"C", "POSIX", "ucs_basic", ""}
+	for i, w := range want {
+		if got := ct.Columns[i].Collation; got != w {
+			t.Errorf("col[%d] (%s) Collation=%q, want %q", i, ct.Columns[i].Name, got, w)
+		}
+	}
+	// The COLLATE before NOT NULL must not swallow the constraint.
+	if !ct.Columns[1].NotNull {
+		t.Errorf("col[1].NotNull=false, want true (COLLATE consumed the NOT NULL)")
+	}
+}
