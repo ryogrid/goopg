@@ -1755,6 +1755,18 @@ const (
 	// column purely for pg_dump round-trip fidelity (goopg does not TOAST).
 	// CompressionType holds the method; ColumnName holds the column. DU-002 slice 183.
 	AlterTableSetCompression
+	// AlterTableSetDefault — `ALTER COLUMN name SET DEFAULT expr`.
+	// Records the parsed DEFAULT expression on the catalog column
+	// (Column.DefaultExpr) so it surfaces in pg_attrdef and round-trips
+	// through pg_dump — inline on a printed local column, or as a separate
+	// `ALTER TABLE ONLY ... ALTER COLUMN ... SET DEFAULT` when the column is a
+	// suppressed inherited column. DefaultExpr holds the expression;
+	// ColumnName holds the column. DU-002 slice 269.
+	AlterTableSetDefault
+	// AlterTableDropDefault — `ALTER COLUMN name DROP DEFAULT`.
+	// Clears the catalog column's DEFAULT expression. ColumnName holds the
+	// column. DU-002 slice 269.
+	AlterTableDropDefault
 	// AlterIndexAttachPartition — `ALTER INDEX parent ATTACH PARTITION child`.
 	// Registers child as a partition of parent in the index partition tree.
 	// ConstraintName holds the parent index name; ChildIndexName holds the child. M0097-0023.
@@ -1814,6 +1826,10 @@ type AlterTableAction struct {
 	// CompressionType is the TOAST compression method for AlterTableSetCompression.
 	// Values: "pglz", "lz4". DU-002 slice 183.
 	CompressionType string
+	// DefaultExpr is the parsed DEFAULT expression for AlterTableSetDefault
+	// (`ALTER COLUMN name SET DEFAULT expr`). Nil for AlterTableDropDefault.
+	// DU-002 slice 269.
+	DefaultExpr Expr
 	// SetOptions holds the per-column attribute options captured from
 	// `ALTER COLUMN name SET (opt=value, …)` for AlterTableAlterColumnSet, each
 	// entry normalized to PG's stored `name=value` form (e.g. "n_distinct=0.5").

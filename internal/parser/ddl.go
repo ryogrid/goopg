@@ -4945,6 +4945,38 @@ func (p *parser) parseAlter() (Stmt, error) {
 				})
 				return stmt, nil
 			}
+			// SET DEFAULT expr — record the parsed DEFAULT expression on the
+			// catalog column. pg_dump re-emits it inline on a printed local
+			// column, or as a separate `ALTER TABLE ONLY ... ALTER COLUMN ...
+			// SET DEFAULT` when the column is a suppressed inherited column.
+			// DU-002 slice 269.
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+				p.advance() // consume DEFAULT
+				expr, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:        AlterTableSetDefault,
+					ColumnName:  colName,
+					DefaultExpr: expr,
+				})
+				return stmt, nil
+			}
+		}
+		// DROP DEFAULT — clear the column's DEFAULT expression. Other DROP
+		// forms (DROP NOT NULL, DROP IDENTITY, …) fall through to the no-op
+		// consume below for now. DU-002 slice 269.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDrop {
+			p.advance() // consume DROP
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+				p.advance() // consume DEFAULT
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:       AlterTableDropDefault,
+					ColumnName: colName,
+				})
+				return stmt, nil
+			}
 		}
 		// Check for TYPE newtype pattern.
 		// "type" is not in goopg's keyword map — arrives as TokenIdent.

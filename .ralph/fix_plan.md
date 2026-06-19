@@ -5789,6 +5789,24 @@ object support.
         (`ALTER TABLE child ALTER COLUMN ... SET DEFAULT/SET NOT NULL`), which pg_dump emits as a separate
         `ALTER TABLE ... ALTER COLUMN` statement rather than inline.
 
+      - **PROGRESS 2026-06-20 (loop #36):** **DU-002 slice 269 LANDED — a child-level `SET DEFAULT` on an INHERITED
+        column round-trips through pg_dump as a SEPARATE ALTER (new production support).** Slices 265/268 rode a DEFAULT
+        INLINE on a printed column; this slice is the opposite — a DEFAULT on an *inherited* column pg_dump SUPPRESSES
+        from the child column list (`attislocal=false`). Because the column is not printed, pg_dump.c marks
+        `attrdefs[].separate` (the `!shouldPrintColumn` branch, `pg_dump.c:9527`) and emits a standalone
+        `ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;` (`dumpAttrDef`, `pg_dump.c:18028`).
+        **Required NEW production code:** `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT`/`DROP DEFAULT` were previously a
+        parser no-op. Added AST kinds `AlterTableSetDefault`/`AlterTableDropDefault` + `AlterTableAction.DefaultExpr`
+        (`ast.go`), parser branches in the ALTER COLUMN `SET`/`DROP` blocks (`ddl.go`, expr via `parseExpr`), and executor
+        arms (`operators_ddl.go`) that validate via `validateDefaultExpr`, set `Column.DefaultExpr`, and flush the
+        `pg_attribute` heap `atthasdef` via the delete-old-rows + `syncTableToCatalogHeap` path (same as SET STORAGE/
+        COMPRESSION — pg_attribute is a heap, so in-memory mutation alone is invisible to pg_dump). The DEFAULT surfaces in
+        `pg_attrdef` (`attrDefRowsLocked` → `formatExprForAttrdef`) and the re-synced heap. **Guards:**
+        `TestPort_PgDumpConnectionSetup` PASS (3.78s, byte-matches real pg_dump 18.3) + `TestParseAlterTableSetDropDefault`
+        (parser AST) + `go test ./internal/executor/` PASS. gofmt + `go build ./...` clean; pgbench pre-commit smoke on
+        commit. Design: `0110-0001` Slice 269. **Next (slice 270+):** a child-level `SET NOT NULL` on an INHERITED column
+        (PG 18 NOT NULL is a `pg_constraint` contype='n' — a distinct catalog path from this attrdef slice).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

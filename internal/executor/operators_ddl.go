@@ -5291,6 +5291,75 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+		case parser.AlterTableSetDefault:
+			// SET DEFAULT expr — record the parsed DEFAULT on the catalog column
+			// AND rewrite the pg_attribute heap row so pg_dump observes
+			// atthasdef. The default surfaces in pg_attrdef (catalog
+			// attrDefRowsLocked reads Column.DefaultExpr) and round-trips through
+			// pg_dump: inline on a printed local column, or as a separate
+			// `ALTER TABLE ONLY ... ALTER COLUMN ... SET DEFAULT` when the column
+			// is a suppressed inherited column (pg_dump.c marks
+			// attrdefs[].separate when !shouldPrintColumn). Like the SET STORAGE/
+			// COMPRESSION/STATISTICS arms, the in-memory mutation alone is
+			// invisible because pg_attribute is a heap populated at CREATE TABLE;
+			// the change must be flushed via delete-old-rows + re-sync. The same
+			// validation CREATE TABLE applies (no column refs, aggregates,
+			// subqueries, SRFs) runs here. DU-002 slice 269.
+			if act.DefaultExpr != nil {
+				if err := validateDefaultExpr(act.DefaultExpr, act.Pos(), o.ctx); err != nil {
+					return err
+				}
+			}
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					tbl.Columns[i].DefaultExpr = act.DefaultExpr
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
+		case parser.AlterTableDropDefault:
+			// DROP DEFAULT — clear the column's DEFAULT (same heap re-sync as
+			// SET DEFAULT). DROP DEFAULT on a column with no default is a no-op
+			// in PG; we mirror that (no error). DU-002 slice 269.
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					tbl.Columns[i].DefaultExpr = nil
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
 		case parser.AlterTableAlterColumnType:
 			if err := o.execAlterColumnType(tbl, act); err != nil {
 				return err

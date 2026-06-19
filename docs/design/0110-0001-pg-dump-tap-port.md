@@ -7816,6 +7816,50 @@ Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
 > COLUMN ... SET DEFAULT/SET NOT NULL`), which pg_dump emits as a separate `ALTER TABLE ... ALTER COLUMN` statement rather
 > than inline.
 
+### Slice 269 — child-level `SET DEFAULT` on an *inherited* column (separate ALTER)
+
+Slices 265/268 rode a column DEFAULT **inline** on a column pg_dump prints. This slice is the opposite: a DEFAULT on an
+*inherited* column that pg_dump **suppresses** from the child's column list (`attislocal=false`). Because the column is
+not printed, the DEFAULT cannot ride inline — pg_dump.c marks `attrdefs[].separate` in the `!shouldPrintColumn` branch
+(`pg_dump.c:9527`) and emits it as a STANDALONE statement via `dumpAttrDef` (`pg_dump.c:18028`):
+
+```
+CREATE TABLE public.idfa_child (
+    extra integer
+)
+INHERITS (public.idfa_parent);
+...
+ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;
+```
+
+This required **new production support**: `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT` (and `DROP DEFAULT`) were
+previously swallowed as a no-op by the parser (`ddl.go` ALTER COLUMN block fell through to the "consume rest" loop). The
+change adds:
+
+- **Parser** (`internal/parser/ddl.go`): a `SET DEFAULT <expr>` branch (parses the expression via `parseExpr`) inside the
+  ALTER COLUMN `SET` block, plus a `DROP DEFAULT` branch. New AST kinds `AlterTableSetDefault` / `AlterTableDropDefault`
+  and an `AlterTableAction.DefaultExpr` field (`internal/parser/ast.go`).
+- **Executor** (`internal/executor/operators_ddl.go`): `AlterTableSetDefault` validates the expression with the same
+  `validateDefaultExpr` CREATE TABLE uses (no column refs, aggregates, subqueries, SRFs), sets `Column.DefaultExpr` on the
+  target column, and flushes the `pg_attribute` heap (`atthasdef`) via the established delete-old-rows +
+  `syncTableToCatalogHeap` path (the same one SET STORAGE/COMPRESSION/STATISTICS use, because `pg_attribute` is a heap
+  populated at CREATE TABLE — an in-memory mutation alone is invisible to pg_dump). `AlterTableDropDefault` clears it.
+  A missing column raises `42703 column "…" of relation "…" does not exist`.
+
+The DEFAULT then surfaces in two places pg_dump reads: `pg_attrdef` (catalog `attrDefRowsLocked` renders
+`Column.DefaultExpr` via `formatExprForAttrdef`) and `pg_attribute.atthasdef` (the re-synced heap row). The fixture keeps
+a purely-local column (`extra`) on the child so the CREATE TABLE body is non-empty and the inherited `pid`/`pname` are
+still omitted (arriving via INHERITS). Verified end-to-end: real pg_dump 18.3 against goopg emits the separate
+`ALTER TABLE ONLY ... SET DEFAULT 7;`.
+
+Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `TestParseAlterTableSetDropDefault`
+(parser AST).
+
+> **Next (slice 270+):** a child-level `SET NOT NULL` on an *inherited* column. In PG 18 NOT NULL is a `pg_constraint`
+> (contype='n'); pg_dump emits an invalid/child-only NOT NULL as a separate `ALTER TABLE ... ALTER COLUMN ... SET NOT
+> NULL` or a `CONSTRAINT ... NOT NULL` clause depending on validity/inheritance — a distinct catalog path from this
+> attrdef slice.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

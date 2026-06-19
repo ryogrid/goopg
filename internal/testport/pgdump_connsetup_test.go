@@ -1433,6 +1433,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create legacy inheritance child idfl_child with local DEFAULT: %v", err)
 	}
 
+	// Slice 269: a child-level DEFAULT applied to an INHERITED column via
+	// `ALTER TABLE child ALTER COLUMN <inherited-col> SET DEFAULT <expr>`.
+	// Slices 265/268 rode the DEFAULT INLINE on a column that pg_dump prints;
+	// this slice exercises the OPPOSITE — a DEFAULT on an inherited column that
+	// pg_dump SUPPRESSES from the child's column list (attislocal=false). Because
+	// the column is not printed, pg_dump cannot ride the DEFAULT inline; instead
+	// pg_dump.c marks `attrdefs[].separate` (the `!shouldPrintColumn` branch,
+	// pg_dump.c:9527) and emits it as a STANDALONE
+	// `ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;`
+	// (dumpAttrDef, pg_dump.c:18028). This required NEW production support:
+	// `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT` was previously swallowed as
+	// a no-op by the parser. The new AlterTableSetDefault action records the
+	// parsed expr on the child's catalog column (Column.DefaultExpr), which feeds
+	// both pg_attrdef (catalog attrDefRowsLocked) and the pg_attribute heap
+	// atthasdef flag (flushed via the same delete-old-rows + syncTableToCatalogHeap
+	// path SET STORAGE/COMPRESSION use). idfa_child keeps a purely-local column
+	// (`extra`) so its CREATE TABLE body is non-empty and the inherited
+	// `pid`/`pname` are still omitted (arriving via INHERITS).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfa_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create legacy inheritance parent idfa_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfa_child (extra integer) INHERITS (public.idfa_parent)"); err != nil {
+		t.Fatalf("create legacy inheritance child idfa_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.idfa_child ALTER COLUMN pid SET DEFAULT 7"); err != nil {
+		t.Fatalf("set DEFAULT on inherited column idfa_child.pid: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -3859,6 +3887,42 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "INHERITS (public.idfl_parent)") {
 			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfl_parent)", res.Stdout)
+		}
+		// **Slice 269 (asserted):** child-level DEFAULT on an INHERITED column,
+		// emitted as a SEPARATE ALTER (not inline). idfa_child's CREATE TABLE
+		// body must print ONLY its local `extra` column — the inherited
+		// `pid`/`pname` are suppressed (attislocal=false) and arrive via the
+		// INHERITS clause — and the DEFAULT set on the suppressed `pid` must
+		// surface as the standalone statement
+		// `ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;`
+		// (pg_dump.c marks attrdefs[].separate for non-printed columns). A
+		// regression that lost the new AlterTableSetDefault support would drop
+		// the ALTER entirely (atthasdef=false → pg_dump emits nothing); a
+		// regression that re-emitted the inherited columns or rode the DEFAULT
+		// inline would diverge from PG 18.3.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.idfa_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the legacy child's local column; want %q in idfa_child block\n  block=%q", "extra integer", block)
+			}
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in idfa_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.idfa_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.idfa_parent)") {
+			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfa_parent)", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;") {
+			t.Errorf("pg_dump dropped the child-level DEFAULT on the inherited column; missing %q\n  full stdout=%q", "ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged

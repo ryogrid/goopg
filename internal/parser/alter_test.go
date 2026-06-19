@@ -233,6 +233,50 @@ func TestParseAlterTableSetCompression(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableSetDropDefault covers `ALTER TABLE ... ALTER COLUMN c SET
+// DEFAULT <expr>` and `... DROP DEFAULT` (DU-002 slice 269). SET DEFAULT records
+// the parsed expression on DefaultExpr; DROP DEFAULT records the column with a
+// nil DefaultExpr. Both previously fell through to the no-op consume.
+func TestParseAlterTableSetDropDefault(t *testing.T) {
+	// SET DEFAULT — expression must be captured.
+	stmts, err := Parse("ALTER TABLE t ALTER COLUMN c SET DEFAULT 7")
+	if err != nil {
+		t.Fatalf("Parse SET DEFAULT: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetDefault {
+		t.Fatalf("SET DEFAULT: actions=%+v", at.Actions)
+	}
+	if at.Actions[0].ColumnName != "c" {
+		t.Errorf("SET DEFAULT: ColumnName=%q want %q", at.Actions[0].ColumnName, "c")
+	}
+	if at.Actions[0].DefaultExpr == nil {
+		t.Errorf("SET DEFAULT: DefaultExpr is nil, want the parsed expression")
+	}
+
+	// DROP DEFAULT — no expression, action recorded with nil DefaultExpr.
+	stmts, err = Parse("ALTER TABLE t ALTER COLUMN c DROP DEFAULT")
+	if err != nil {
+		t.Fatalf("Parse DROP DEFAULT: %v", err)
+	}
+	at, ok = stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableDropDefault {
+		t.Fatalf("DROP DEFAULT: actions=%+v", at.Actions)
+	}
+	if at.Actions[0].ColumnName != "c" {
+		t.Errorf("DROP DEFAULT: ColumnName=%q want %q", at.Actions[0].ColumnName, "c")
+	}
+	if at.Actions[0].DefaultExpr != nil {
+		t.Errorf("DROP DEFAULT: DefaultExpr=%v want nil", at.Actions[0].DefaultExpr)
+	}
+}
+
 // TestParseCreateTableColumnCompression covers the inline `COMPRESSION <method>`
 // clause in a CREATE TABLE column definition (`a text COMPRESSION lz4`), which
 // threads the method onto ColumnDef.Compression. DU-002 slice 183.
