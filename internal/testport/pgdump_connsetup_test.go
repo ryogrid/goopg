@@ -750,8 +750,11 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// `toast.autovacuum_vacuum_threshold='100'`. Slice 227 adds the first
 	// RELOPT_KIND_TOAST *real* option (`toast.autovacuum_vacuum_scale_factor`),
 	// extending the array to four elements; pg_dump re-emits the float element
-	// `toast.autovacuum_vacuum_scale_factor='2.5'`.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.optoast (id integer PRIMARY KEY) WITH (toast.autovacuum_enabled=false, toast.vacuum_truncate=false, toast.autovacuum_vacuum_threshold=100, toast.autovacuum_vacuum_scale_factor=2.5)"); err != nil {
+	// `toast.autovacuum_vacuum_scale_factor='2.5'`. Slice 228 adds the second
+	// RELOPT_KIND_TOAST *real* option (`toast.autovacuum_vacuum_cost_delay`),
+	// extending the array to five elements; pg_dump re-emits the float element
+	// `toast.autovacuum_vacuum_cost_delay='10.5'`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optoast (id integer PRIMARY KEY) WITH (toast.autovacuum_enabled=false, toast.vacuum_truncate=false, toast.autovacuum_vacuum_threshold=100, toast.autovacuum_vacuum_scale_factor=2.5, toast.autovacuum_vacuum_cost_delay=10.5)"); err != nil {
 		t.Fatalf("create table optoast: %v", err)
 	}
 
@@ -2796,16 +2799,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if !strings.Contains(res.Stdout, "CREATE TABLE public.optoast (") {
 			t.Errorf("pg_dump missing CREATE TABLE public.optoast\n  full stdout=%q", res.Stdout)
 		}
-		// **Slice 225 + 226 + 227 closed (asserted):** a second RELOPT_KIND_TOAST
-		// boolean (toast.vacuum_truncate), the first RELOPT_KIND_TOAST integer
-		// (toast.autovacuum_vacuum_threshold), and the first RELOPT_KIND_TOAST real
-		// (toast.autovacuum_vacuum_scale_factor) on the same table exercise the
+		// **Slice 225 + 226 + 227 + 228 closed (asserted):** a second
+		// RELOPT_KIND_TOAST boolean (toast.vacuum_truncate), the first
+		// RELOPT_KIND_TOAST integer (toast.autovacuum_vacuum_threshold), and two
+		// RELOPT_KIND_TOAST reals (toast.autovacuum_vacuum_scale_factor,
+		// toast.autovacuum_vacuum_cost_delay) on the same table exercise the
 		// multi-element toast reloptions array. The synthesized TOAST relation's
 		// reloptions are
-		// `{autovacuum_enabled=false,vacuum_truncate=false,autovacuum_vacuum_threshold=100,autovacuum_vacuum_scale_factor=2.5}`
-		// (code order), so pg_dump emits all four prefixed options in one WITH clause.
-		if !strings.Contains(res.Stdout, "WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false', toast.autovacuum_vacuum_threshold='100', toast.autovacuum_vacuum_scale_factor='2.5')") {
-			t.Errorf("pg_dump dropped a toast.* reloption; missing %q\n  full stdout=%q", "WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false', toast.autovacuum_vacuum_threshold='100', toast.autovacuum_vacuum_scale_factor='2.5')", res.Stdout)
+		// `{autovacuum_enabled=false,vacuum_truncate=false,autovacuum_vacuum_threshold=100,autovacuum_vacuum_scale_factor=2.5,autovacuum_vacuum_cost_delay=10.5}`
+		// (code order), so pg_dump emits all five prefixed options in one WITH clause.
+		if !strings.Contains(res.Stdout, "WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false', toast.autovacuum_vacuum_threshold='100', toast.autovacuum_vacuum_scale_factor='2.5', toast.autovacuum_vacuum_cost_delay='10.5')") {
+			t.Errorf("pg_dump dropped a toast.* reloption; missing %q\n  full stdout=%q", "WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false', toast.autovacuum_vacuum_threshold='100', toast.autovacuum_vacuum_scale_factor='2.5', toast.autovacuum_vacuum_cost_delay='10.5')", res.Stdout)
 		}
 		// The synthesized TOAST relation must never be dumped as its own object.
 		if strings.Contains(res.Stdout, "pg_toast_") {

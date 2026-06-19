@@ -1588,6 +1588,27 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		toastReloptions = append(toastReloptions, "autovacuum_vacuum_scale_factor="+strconv.FormatFloat(avsf, 'g', -1, 64))
 	}
+	// `toast.autovacuum_vacuum_cost_delay` — the second RELOPT_KIND_TOAST *real*
+	// option, reusing the parent-table float reloption path (slice 202). PG's
+	// reloption type is RELOPT_TYPE_REAL with range 0.0–100.0 and a default of -1
+	// (= unset / use the GUC); autovacuum_vacuum_cost_delay shares
+	// RELOPT_KIND_HEAP | RELOPT_KIND_TOAST (reloptions.c:393), so PG accepts the
+	// `toast.` prefix and stores it on the TOAST relation's reloptions. The
+	// `!(f >= 0 && f <= 100)` form also rejects NaN/±Inf. goopg has no autovacuum,
+	// so the value is purely catalog/dump state. M0110-0001 (DU-002 slice 228).
+	if v, ok := s.With["toast.autovacuum_vacuum_cost_delay"]; ok {
+		avcd, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"autovacuum_vacuum_cost_delay\": %s", v)}
+		}
+		if !(avcd >= 0.0 && avcd <= 100.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"autovacuum_vacuum_cost_delay\"", strconv.FormatFloat(avcd, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"100.000000\"."}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_vacuum_cost_delay="+strconv.FormatFloat(avcd, 'g', -1, 64))
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
