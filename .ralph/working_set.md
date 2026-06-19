@@ -1,32 +1,32 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 223 (loop #38) — BRIN index `autosummarize` boolean
-storage parameter round-trips through pg_dump. The remaining BRIN reloption.
+Last landed: DU-002 slice 224 (loop #39) — first `toast.*` namespace reloption
+(`toast.autovacuum_enabled`) round-trips through pg_dump; first synthesized TOAST
+pg_class row. Opens the `toast.*` namespace flagged by slice 223 as bigger work.
 
-What happened: Mirrored slice 220's (fastupdate) `*bool` tri-state plumbing on a
-BRIN key. Parser (ddl.go WITH-loop) recognizes `autosummarize`, reads the bool via
-parseReloptionBool into CreateIndexStmt.AutoSummarize (*bool, nil=unset). Executor
-persists idx.AutoSummarize in the catalog-only branch (no range check — bool token
-already validated by parser). Index.AutoSummarize (rendered on/off) appended to
-reloptionList() AFTER pages_per_range (PG relopt order); BuildIndexDef dumps
-`USING brin … WITH (autosummarize='on')`. JSON-persisted; advisory catalog/dump-only.
-nil sentinel (PG default off) keeps a plain BRIN index byte-identical.
+What happened: PG keeps `toast.`-prefixed reloptions on the table's TOAST relation's
+pg_class.reloptions (WITHOUT the prefix); pg_dump re-adds the prefix via the
+reltoastrelid join (LEFT JOIN pg_class tc ON c.reltoastrelid=tc.oid AND tc.relkind='t').
+Closed two gaps: (a) parser combines the dotted WITH key, (b) goopg models a synthetic
+TOAST relation. Parser (parseWithOptions): a bare `.` after the key label triggers
+consuming a second label → one dotted map key. Executor: gathers toast.* keys into
+catalog.Table.ToastReloptions (normalized `autovacuum_enabled=false`, no prefix);
+validates the bool (non-bool→22023). catalog: new Table.ToastReloptions []string;
+when non-empty the pg_class view sets parent reltoastrelid=OID+100_000_000 AND emits
+an extra relkind='t' row `pg_toast_<oid>` (ns 99) carrying the reloptions. getTables
+WHERE excludes 't', so the TOAST row is join-target-only — never dumped.
 
-Files: internal/parser/ast.go (CreateIndexStmt.AutoSummarize), internal/parser/ddl.go
-(WITH-loop bool capture), internal/catalog/catalog.go (Index.AutoSummarize +
-reloptionList()), internal/executor/operators_ddl.go (persist in catalog-only branch),
-internal/executor/operators_fillfactor_reloptions_test.go (NEW
-TestIndexAutoSummarizeSurfacesInPgClassReloptions +
-TestIndexPagesPerRangeAndAutoSummarizeCombined),
-internal/testport/pgdump_connsetup_test.go (foo_brinauto_idx fixture + indexDefs
-assertion), docs/design/0110-0001-pg-dump-tap-port.md (Slice 223), fix_plan.md.
+Files: internal/parser/ddl.go (+ddl_test.go), internal/executor/operators_ddl.go
+(+operators_fillfactor_reloptions_test.go), internal/catalog/catalog.go,
+internal/testport/pgdump_connsetup_test.go (NEW optoast fixture+assertion),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 224), fix_plan.md.
 
-Gates: gofmt OK; go build ./internal/... clean; parser+catalog PASS; executor
-reloption suite PASS; TestPort_PgDumpConnectionSetup PASS; pgbench pre-commit smoke
-on commit.
+Gates: gofmt OK; go build ./internal/... clean; parser+catalog+full-executor PASS;
+TestPort_PgDumpConnectionSetup PASS; pgbench pre-commit smoke on commit.
 
-Next: All simple index/table reloptions now land (fillfactor, deduplicate_items,
-fastupdate, gin_pending_list_limit, pages_per_range, autosummarize). The remaining
-pg_dump-fidelity work is BIGGER: toast.* reloption namespace (needs toast-table
-pg_class modeling; reltoastrelid hardcoded 0) or composite types. Pick one as a
-multi-slice effort, not a one-line mirror.
+Next: the TOAST-row machinery now exists, so the rest of the RELOPT_KIND_TOAST-capable
+options become one-line gather additions: toast.autovacuum_vacuum_threshold,
+toast.autovacuum_vacuum_scale_factor, toast.autovacuum_vacuum_cost_delay,
+toast.autovacuum_vacuum_cost_limit, toast.autovacuum_freeze_*_age, toast.log_autovacuum_min_duration,
+toast.vacuum_truncate, toast.autovacuum_enabled (done). Mirror slice 224's gather +
+add a fixture/assertion each. After that: composite types.

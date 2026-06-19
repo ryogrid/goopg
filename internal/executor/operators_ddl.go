@@ -1513,6 +1513,25 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		vacuumIndexCleanup = trimmed
 		vacuumIndexCleanupSet = true
 	}
+	// Extract `toast.*` storage parameters. PostgreSQL stores reloptions whose
+	// names carry the `toast.` namespace on the table's TOAST relation's
+	// pg_class.reloptions (without the `toast.` prefix); pg_dump joins to the
+	// TOAST relation, reads `tc.reloptions AS toast_reloptions`, and re-emits
+	// them WITH the `toast.` prefix (appendReloptionsArrayAH, "toast.").
+	// goopg has no TOAST, so these are catalog/dump-only (advisory). This slice
+	// supports the boolean `toast.autovacuum_enabled`; the synthesized TOAST
+	// relation's reloptions array stores it as `autovacuum_enabled=BOOL`.
+	// Additional toast.* options extend this gather in later slices.
+	// M0110-0001 (DU-002 slice 224).
+	var toastReloptions []string
+	if v, ok := s.With["toast.autovacuum_enabled"]; ok {
+		b, parsed := parseReloptionBool(strings.TrimSpace(v))
+		if !parsed {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for boolean option \"autovacuum_enabled\": %s", v)}
+		}
+		toastReloptions = append(toastReloptions, "autovacuum_enabled="+strconv.FormatBool(b))
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1610,6 +1629,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.VacuumMaxEagerFreezeFailureRateSet = vacuumMaxEagerFreezeFailureRateSet
 	tbl.VacuumIndexCleanup = vacuumIndexCleanup
 	tbl.VacuumIndexCleanupSet = vacuumIndexCleanupSet
+	tbl.ToastReloptions = toastReloptions
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

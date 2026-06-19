@@ -2681,3 +2681,107 @@ func TestIndexPagesPerRangeAndAutoSummarizeCombined(t *testing.T) {
 		t.Errorf("BuildIndexDef(bcboth) = %q, want WITH (pages_per_range='32', autosummarize='on')", def)
 	}
 }
+
+// TestToastAutovacuumEnabledSurfacesInPgClassToastRow verifies that a
+// `WITH (toast.autovacuum_enabled=BOOL)` storage parameter is persisted as a
+// `toast.*` reloption on the catalog table (without the `toast.` prefix) and
+// surfaced through the pg_class virtual view as a synthesized relkind='t' TOAST
+// row whose reloptions cell carries the option — while the parent table's
+// reltoastrelid (column 13) points at that TOAST row's OID. pg_dump joins to the
+// TOAST row via reltoastrelid and re-emits `WITH (toast.autovacuum_enabled='false')`.
+// This is the engine-side half of the round-trip TestPort_PgDumpConnectionSetup
+// (slice 224) asserts end-to-end — goopg's first `toast.*` reloption and first
+// synthesized TOAST pg_class row. DU-002 slice 224.
+func TestToastAutovacuumEnabledSurfacesInPgClassToastRow(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE toastav (id integer PRIMARY KEY) WITH (toast.autovacuum_enabled=false)`); err != nil {
+		t.Fatalf("CREATE TABLE toastav: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE toastplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE toastplain: %v", err)
+	}
+
+	avTbl, ok := cat.LookupTable(parser.ObjectName{Name: "toastav"})
+	if !ok {
+		t.Fatal("toastav table not found")
+	}
+	if len(avTbl.ToastReloptions) != 1 || avTbl.ToastReloptions[0] != "autovacuum_enabled=false" {
+		t.Errorf("toastav.ToastReloptions = %v, want [autovacuum_enabled=false]", avTbl.ToastReloptions)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "toastplain"})
+	if !ok {
+		t.Fatal("toastplain table not found")
+	}
+	if len(plainTbl.ToastReloptions) != 0 {
+		t.Errorf("toastplain.ToastReloptions = %v, want empty", plainTbl.ToastReloptions)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	// Locate the parent table row and the synthesized TOAST row.
+	wantToastOID := strconv.Itoa(int(avTbl.OID) + 100_000_000)
+	var parentReltoastrelid, parentReloptions string
+	var toastRowReloptions, toastRowRelkind, toastRowName string
+	plainReltoastrelid := "MISSING"
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) <= 32 {
+			continue
+		}
+		switch r[1] {
+		case "toastav":
+			parentReltoastrelid = r[13]
+			parentReloptions = r[32]
+		case "toastplain":
+			plainReltoastrelid = r[13]
+		case "pg_toast_" + strconv.Itoa(int(avTbl.OID)):
+			toastRowName = r[1]
+			toastRowRelkind = r[17]
+			toastRowReloptions = r[32]
+		}
+	}
+	// Parent table: reltoastrelid points at the synthesized TOAST OID; its own
+	// reloptions stay NULL (toast.* lives on the TOAST relation, not the table).
+	if parentReltoastrelid != wantToastOID {
+		t.Errorf("toastav.reltoastrelid = %q, want %q", parentReltoastrelid, wantToastOID)
+	}
+	if parentReloptions != "" {
+		t.Errorf("toastav.reloptions = %q, want \"\" (toast.* must not appear on the table row)", parentReloptions)
+	}
+	// Synthesized TOAST row: relkind='t', reloptions carry the option (no prefix).
+	if toastRowName == "" {
+		t.Fatalf("synthesized TOAST row pg_toast_%d not found in pg_class", avTbl.OID)
+	}
+	if toastRowRelkind != "t" {
+		t.Errorf("TOAST row relkind = %q, want \"t\"", toastRowRelkind)
+	}
+	if toastRowReloptions != "{autovacuum_enabled=false}" {
+		t.Errorf("TOAST row reloptions = %q, want %q", toastRowReloptions, "{autovacuum_enabled=false}")
+	}
+	// A plain table gets neither a reltoastrelid nor a TOAST row.
+	if plainReltoastrelid != "0" {
+		t.Errorf("toastplain.reltoastrelid = %q, want \"0\"", plainReltoastrelid)
+	}
+}
+
+// TestToastAutovacuumEnabledInvalidValueRejected verifies CREATE TABLE rejects a
+// non-boolean toast.autovacuum_enabled value with PG's 22023 error. DU-002 slice 224.
+func TestToastAutovacuumEnabledInvalidValueRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, v := range []string{"maybe", "2", "tru3"} {
+		stmt := "CREATE TABLE bad" + strconv.Itoa(i) + " (id integer) WITH (toast.autovacuum_enabled=" + v + ")"
+		err := runDDL(t, ctx, stmt)
+		if err == nil {
+			t.Errorf("CREATE TABLE with toast.autovacuum_enabled=%s: want error, got nil", v)
+			continue
+		}
+		if ee, ok := err.(*ExecError); !ok || ee.Code != "22023" {
+			t.Errorf("toast.autovacuum_enabled=%s: want 22023 ExecError, got %v", v, err)
+		}
+	}
+}

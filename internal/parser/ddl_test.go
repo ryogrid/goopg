@@ -54,6 +54,29 @@ func TestParseCreateTableConstraints(t *testing.T) {
 	}
 }
 
+// TestParseCreateTableToastNamespacedReloption covers the namespace-qualified
+// storage parameter form `toast.<option>` (PG's reloption_elem: ColLabel '.'
+// ColLabel '=' def_arg). parseWithOptions must combine the two dotted labels
+// into one map key so the executor can route the option to the TOAST relation.
+// A plain (unqualified) option in the same list keeps its bare key. DU-002 slice 224.
+func TestParseCreateTableToastNamespacedReloption(t *testing.T) {
+	stmts, err := Parse("CREATE TABLE t (id int) WITH (fillfactor = 70, toast.autovacuum_enabled = false)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if ct.With["toast.autovacuum_enabled"] != "false" {
+		t.Errorf("toast.autovacuum_enabled = %q, want %q (with=%+v)", ct.With["toast.autovacuum_enabled"], "false", ct.With)
+	}
+	if ct.With["fillfactor"] != "70" {
+		t.Errorf("fillfactor = %q, want %q (with=%+v)", ct.With["fillfactor"], "70", ct.With)
+	}
+	// The bare second label must NOT also leak in as its own key.
+	if _, ok := ct.With["autovacuum_enabled"]; ok {
+		t.Errorf("unexpected bare key autovacuum_enabled in with=%+v", ct.With)
+	}
+}
+
 func TestParseCreateTableBareCharDefaultsToCharacterOne(t *testing.T) {
 	stmts, err := Parse(`CREATE TABLE t (a char, b "char")`)
 	if err != nil {

@@ -4920,6 +4920,32 @@ object support.
         (round-trips `CREATE INDEX foo_brinauto_idx ON public.foo USING brin (qty) WITH (autosummarize='on');`);
         pgbench pre-commit smoke on commit. **Next:** the BIGGER `toast.*` namespace (toast-table pg_class
         modeling; `reltoastrelid` hardcoded 0) / composite types — all simple index/table reloptions now land.
+      - **PROGRESS 2026-06-19 (loop #39):** **DU-002 slice 224 LANDED — first `toast.*` namespace reloption
+        (`toast.autovacuum_enabled`) round-trips through pg_dump; first synthesized TOAST pg_class row.**
+        Opens the `toast.*` namespace the previous loop flagged as bigger work. PG keeps `toast.`-prefixed
+        reloptions on the table's TOAST relation's `pg_class.reloptions` (without the prefix) and pg_dump
+        re-adds the prefix via the `reltoastrelid` join (`appendReloptionsArrayAH(…, "toast.", …)`). Two gaps
+        closed: (a) parser combines the dotted name and (b) goopg now models a synthetic TOAST relation.
+        **Parser** (`ddl.go` `parseWithOptions`): after the key label, a bare `.` (TokenSymbol) triggers
+        consuming a second label, combining into one dotted map key (`toast.autovacuum_enabled`); mirrors PG
+        grammar `reloption_elem: ColLabel '.' ColLabel`. **Executor** (`operators_ddl.go`): gathers `toast.*`
+        keys into `catalog.Table.ToastReloptions` as normalized `name=value` (no prefix); validates the
+        boolean `toast.autovacuum_enabled` via `parseReloptionBool` (non-bool → 22023). **catalog**
+        (`catalog.go`): new `Table.ToastReloptions []string` (JSON-persisted); when non-empty the `pg_class`
+        view sets the parent's `reltoastrelid` (col 13) to `OID+toastRelidOffset` (100_000_000) AND emits an
+        extra `relkind='t'` row `pg_toast_<oid>` (namespace 99) carrying the reloptions. pg_dump's getTables
+        WHERE excludes relkind `'t'`, so the TOAST row is a join target only — never dumped. Files:
+        `internal/parser/ddl.go` (dotted-key combine), `internal/parser/ddl_test.go`
+        (`TestParseCreateTableToastNamespacedReloption`), `internal/executor/operators_ddl.go` (toast.* gather +
+        `tbl.ToastReloptions`), `internal/executor/operators_fillfactor_reloptions_test.go`
+        (`TestToastAutovacuumEnabledSurfacesInPgClassToastRow` + `…InvalidValueRejected`),
+        `internal/catalog/catalog.go` (`Table.ToastReloptions` + `toastRelidOffset` + pg_class TOAST-row
+        synthesis), `internal/testport/pgdump_connsetup_test.go` (NEW `optoast` fixture + assertion for
+        `WITH (toast.autovacuum_enabled='false')` and no `pg_toast_*` leak), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 224). Gates: gofmt OK; `go build ./internal/...` clean; parser+catalog+full-executor suites PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (round-trips `WITH (toast.autovacuum_enabled='false')`); pgbench
+        pre-commit smoke on commit. **Next:** widen the toast.* gather to the rest of the RELOPT_KIND_TOAST
+        options (each one line now), then composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

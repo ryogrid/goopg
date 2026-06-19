@@ -734,7 +734,27 @@ type Table struct {
 	// (DU-002 slice 217).
 	VacuumIndexCleanup    string
 	VacuumIndexCleanupSet bool
+
+	// ToastReloptions holds the table's `toast.*` storage parameters, stored as
+	// PG-normalized `name=value` strings WITHOUT the `toast.` namespace prefix
+	// (e.g. `autovacuum_enabled=false`), mirroring how PostgreSQL keeps them on
+	// the TOAST relation's own pg_class.reloptions. When non-empty, the pg_class
+	// virtual view synthesizes a relkind='t' TOAST row (OID = table OID +
+	// toastRelidOffset) carrying these as its reloptions and points the main
+	// table's reltoastrelid at it, so pg_dump's `LEFT JOIN pg_class tc ON
+	// (c.reltoastrelid = tc.oid AND tc.relkind='t')` reads them via
+	// `tc.reloptions AS toast_reloptions` and re-emits `WITH (toast.<opt>='…')`.
+	// goopg has no TOAST, so these are catalog/dump-only (advisory). M0110-0001
+	// (DU-002 slice 224).
+	ToastReloptions []string
 }
+
+// toastRelidOffset derives a synthetic TOAST relation OID from its parent
+// table's OID for the pg_class virtual view. The offset keeps the synthetic
+// OID clear of the small sequentially-allocated user-relation OID space; it
+// matches the convention used by the executor's TOAST-relation helper
+// (internal/executor/toast.go: RelOid + 100_000_000).
+const toastRelidOffset = 100_000_000
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
 // parser package in contexts that only need the catalog. M0096-0012.
@@ -2620,6 +2640,14 @@ func (c *InMemory) registerSystemTables() {
 			if len(relopts) > 0 {
 				reloptions = "{" + strings.Join(relopts, ",") + "}"
 			}
+			// reltoastrelid: when the table carries any `toast.*` storage
+			// parameters, point it at a synthesized TOAST relation (emitted
+			// below) so pg_dump's toast LEFT JOIN resolves and re-emits the
+			// `toast.*` reloptions. Otherwise 0 (no TOAST relation). DU-002 slice 224.
+			reltoastrelid := "0"
+			if len(t.ToastReloptions) > 0 {
+				reltoastrelid = strconv.Itoa(int(t.OID) + toastRelidOffset)
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // 0:  oid
 				t.Name,                       // 1:  relname
@@ -2634,7 +2662,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",                          // 10: reltuples
 				"0",                          // 11: relallvisible
 				"0",                          // 12: relallfrozen
-				"0",                          // 13: reltoastrelid
+				reltoastrelid,                // 13: reltoastrelid
 				hasIdx,                       // 14: relhasindex
 				"f",                          // 15: relisshared
 				relpers,                      // 16: relpersistence
@@ -2661,6 +2689,54 @@ func (c *InMemory) registerSystemTables() {
 				reloptions,  // 32: reloptions ({fillfactor=N} or NULL)
 				partBound,   // 33: relpartbound
 			})
+			// Synthesize the TOAST relation (relkind='t') when the table carries
+			// `toast.*` storage parameters. pg_dump joins to it via
+			// reltoastrelid and reads its reloptions (stored WITHOUT the
+			// `toast.` prefix), re-emitting them as `WITH (toast.<opt>='…')`.
+			// The TOAST row is filtered out of pg_dump's getTables WHERE
+			// (relkind IN r/S/v/c/m/f/p — not 't') so it is never dumped as an
+			// object; it exists only as a join target. Named pg_toast_<oid> in
+			// the pg_toast namespace (OID 99), mirroring PG. DU-002 slice 224.
+			if len(t.ToastReloptions) > 0 {
+				toastOID := int(t.OID) + toastRelidOffset
+				toastReloptions := "{" + strings.Join(t.ToastReloptions, ",") + "}"
+				out = append(out, []string{
+					strconv.Itoa(toastOID),                 // 0:  oid
+					"pg_toast_" + strconv.Itoa(int(t.OID)), // 1:  relname
+					"99",                                   // 2:  relnamespace (pg_toast)
+					"0",                                    // 3:  reltype
+					"0",                                    // 4:  reloftype
+					"10",                                   // 5:  relowner
+					"0",                                    // 6:  relam
+					strconv.Itoa(toastOID),                 // 7:  relfilenode
+					"0",                                    // 8:  reltablespace
+					"0",                                    // 9:  relpages
+					"0",                                    // 10: reltuples
+					"0",                                    // 11: relallvisible
+					"0",                                    // 12: relallfrozen
+					"0",                                    // 13: reltoastrelid
+					"f",                                    // 14: relhasindex
+					"f",                                    // 15: relisshared
+					relpers,                                // 16: relpersistence (inherits the table's)
+					"t",                                    // 17: relkind (TOAST)
+					"3",                                    // 18: relnatts (chunk_id, chunk_seq, chunk_data)
+					"0",                                    // 19: relchecks
+					"f",                                    // 20: relhasrules
+					"f",                                    // 21: relhastriggers
+					"f",                                    // 22: relhassubclass
+					"f",                                    // 23: relrowsecurity
+					"f",                                    // 24: relforcerowsecurity
+					"t",                                    // 25: relispopulated
+					"n",                                    // 26: relreplident
+					"f",                                    // 27: relispartition
+					"0",                                    // 28: relrewrite
+					"0",                                    // 29: relfrozenxid
+					"1",                                    // 30: relminmxid
+					"",                                     // 31: relacl (NULL)
+					toastReloptions,                        // 32: reloptions ({autovacuum_enabled=false})
+					"",                                     // 33: relpartbound
+				})
+			}
 		}
 		// Emit index rows (relkind='i'/'I') so pg_class can be used to count indexes.
 		idxKeys := make([]string, 0, len(c.indexes))

@@ -6465,6 +6465,56 @@ an off value spelled `no` → `{autosummarize=off}`, and a plain BRIN index keep
 `foo_brinauto_idx ON public.foo USING brin (qty) WITH (autosummarize=on)`; the assertion confirms the dump
 carries `CREATE INDEX foo_brinauto_idx ON public.foo USING brin (qty) WITH (autosummarize='on');`.
 
+### Slice 224 — `toast.*` namespace reloption round-trip (first synthesized TOAST pg_class row)
+
+Adds the first **`toast.`-namespace-qualified** table storage parameter, `toast.autovacuum_enabled`, and
+the machinery that lets any `toast.*` reloption round-trip through pg_dump. PostgreSQL keeps reloptions
+whose names carry the `toast.` namespace on the table's **TOAST relation's** `pg_class.reloptions`
+(*without* the `toast.` prefix); pg_dump joins to that relation and re-adds the prefix on dump-out
+(`pg_dump.c`: `LEFT JOIN pg_class tc ON (c.reltoastrelid = tc.oid AND tc.relkind='t' …)`, then
+`appendReloptionsArrayAH(q, tbinfo->toast_reloptions, "toast.", …)`). goopg previously (a) parsed
+`toast.autovacuum_enabled` as a bare `toast` key — the dotted name was never combined — and (b) modeled
+no TOAST relation (`reltoastrelid` hardcoded `0`), so any `toast.*` option silently vanished from the dump.
+
+This slice closes both gaps and establishes the synthesized-TOAST-row pattern that future `toast.*`
+options extend cheaply:
+
+- **Parser** (`ddl.go` `parseWithOptions`): handle the namespace-qualified form. After the key label,
+  if the next token is a bare `.` (lexed as `TokenSymbol`), consume it and the second label and combine
+  them into one dotted map key (`toast.autovacuum_enabled`). Mirrors PG's grammar
+  `reloption_elem: ColLabel '.' ColLabel '=' def_arg`. A single namespace prefix is supported; the bare
+  second label does not leak in as its own key. This applies to *every* `WITH (…)` list (CREATE TABLE,
+  CTAS), but a dotted key only ever appears for namespaced reloptions, so existing options are unaffected.
+- **Executor** (`operators_ddl.go`): gather `toast.*` keys from `s.With` into
+  `catalog.Table.ToastReloptions` as PG-normalized `name=value` strings **without** the prefix
+  (`toast.autovacuum_enabled=false` → `autovacuum_enabled=false`). This slice validates the boolean
+  `toast.autovacuum_enabled` via `parseReloptionBool` (rejecting non-booleans with PG's 22023); later
+  slices append more recognized `toast.*` options to the same gather.
+- **catalog** (`catalog.go`): a new `Table.ToastReloptions []string` field (JSON-persisted). When it is
+  non-empty, the `pg_class` virtual view (1) sets the parent table's `reltoastrelid` (column 13) to a
+  synthetic TOAST OID (`table OID + toastRelidOffset`, `100_000_000` — the convention already used by
+  `internal/executor/toast.go`), and (2) emits an extra `relkind='t'` row named `pg_toast_<tableOID>` in
+  the `pg_toast` namespace (OID 99) whose `reloptions` cell carries the `{name=value,…}` array. The parent
+  table's own `reloptions` stay NULL — `toast.*` lives only on the TOAST relation, matching PG.
+
+Because pg_dump's `getTables` WHERE clause restricts `c.relkind` to `r/S/v/c/m/f/p` (never `'t'`), the
+synthesized TOAST row is **never dumped as its own object** — it exists only as a join target. goopg has
+no TOAST storage, so the value is catalog/dump-only (advisory). A plain table gets neither a
+`reltoastrelid` nor a TOAST row, so it still dumps byte-identically.
+
+Engine guards: `executor.TestToastAutovacuumEnabledSurfacesInPgClassToastRow` (parent
+`reltoastrelid` → the synthetic OID, parent `reloptions` NULL, the synthesized `pg_toast_*` row with
+`relkind='t'` and `reloptions={autovacuum_enabled=false}`, and a plain table with `reltoastrelid=0` and no
+TOAST row), `executor.TestToastAutovacuumEnabledInvalidValueRejected` (non-boolean → 22023), and
+`parser.TestParseCreateTableToastNamespacedReloption` (the dotted key combines; the bare label does not
+leak). The pg_dump fixture adds `optoast (id integer PRIMARY KEY) WITH (toast.autovacuum_enabled=false)`;
+the assertion confirms the dump carries `WITH (toast.autovacuum_enabled='false')` and that no `pg_toast_*`
+relation leaks into the dump.
+
+**Next:** widen the executor's `toast.*` gather to the rest of the `RELOPT_KIND_TOAST`-capable options
+(`toast.autovacuum_vacuum_threshold`, `toast.autovacuum_vacuum_scale_factor`, … — each a one-line
+addition now that the TOAST-row machinery exists), then `toast_tuple_target`/composite types.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

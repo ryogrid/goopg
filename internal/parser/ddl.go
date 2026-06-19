@@ -2929,6 +2929,21 @@ func (p *parser) parseWithOptions() (map[string]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		keyName := identText(key)
+		// Namespace-qualified storage parameter, e.g. `toast.autovacuum_enabled`.
+		// PostgreSQL's grammar permits a single optional namespace prefix
+		// (reloption_elem: ColLabel '.' ColLabel '=' def_arg in gram.y); the
+		// `toast.` namespace routes the option to the table's TOAST relation.
+		// Combine the two labels into one dotted key so the executor can route
+		// it. A bare `.` lexes as TokenSymbol. M0110-0001 (DU-002 slice 224).
+		if cur := p.cur(); cur.Kind == TokenSymbol && cur.Value == "." {
+			p.advance() // consume '.'
+			sub, serr := p.parseIdent()
+			if serr != nil {
+				return nil, serr
+			}
+			keyName = keyName + "." + identText(sub)
+		}
 		var val string
 		if cur := p.cur(); cur.Kind == TokenOperator && cur.Value == "=" {
 			p.advance() // consume '='
@@ -2950,7 +2965,7 @@ func (p *parser) parseWithOptions() (map[string]string, error) {
 			// Boolean flag without '= value' (e.g. 'oids' in WITH (oids)).
 			val = "true"
 		}
-		out[identText(key)] = val
+		out[keyName] = val
 		if p.acceptSymbol(",") {
 			continue
 		}

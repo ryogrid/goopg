@@ -724,6 +724,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optt: %v", err)
 	}
 
+	// Slice 224: the first `toast.*` namespace-qualified storage parameter
+	// (`toast.autovacuum_enabled`). PostgreSQL keeps reloptions whose names carry
+	// the `toast.` namespace on the table's TOAST relation's pg_class.reloptions
+	// (without the prefix); pg_dump joins to that relation via reltoastrelid,
+	// reads `tc.reloptions AS toast_reloptions`, and re-emits them WITH the
+	// `toast.` prefix. goopg previously parsed `toast.autovacuum_enabled` as a
+	// bare `toast` key (the dotted name was not combined) and modeled no TOAST
+	// relation, so the option vanished from the dump. The fix: parseWithOptions
+	// combines the dotted labels; the executor records catalog.Table.ToastReloptions
+	// (normalized `autovacuum_enabled=false`); the pg_class virtual view synthesizes
+	// a relkind='t' TOAST row carrying those reloptions and points the table's
+	// reltoastrelid at it, so pg_dump emits `WITH (toast.autovacuum_enabled='false')`.
+	// goopg has no TOAST, so the value is catalog/dump-only (advisory). `optoast`
+	// carries it on its own table to keep the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optoast (id integer PRIMARY KEY) WITH (toast.autovacuum_enabled=false)"); err != nil {
+		t.Fatalf("create table optoast: %v", err)
+	}
+
 	// Slice 198: an INTEGER autovacuum-namespace storage parameter
 	// (`autovacuum_vacuum_threshold`, valid 0–INT_MAX). It exercises the
 	// "0-is-a-real-value" integer variant (PG's reloption default is -1 = unset,
@@ -2751,6 +2769,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (toast_tuple_target='256')") {
 			t.Errorf("pg_dump dropped the toast_tuple_target reloption; missing %q\n  full stdout=%q", "WITH (toast_tuple_target='256')", res.Stdout)
+		}
+		// **Slice 224 closed (asserted):** the first `toast.*` namespace-qualified
+		// storage parameter (toast.autovacuum_enabled) must round-trip. PG stores
+		// it on the TOAST relation's reloptions (no prefix) and pg_dump re-emits it
+		// WITH the `toast.` prefix via the reltoastrelid join. goopg combines the
+		// dotted WITH key, records catalog.Table.ToastReloptions, and the pg_class
+		// virtual view synthesizes a relkind='t' TOAST row (reloptions
+		// `{autovacuum_enabled=false}`) that the parent table's reltoastrelid points
+		// at — so pg_dump emits `WITH (toast.autovacuum_enabled='false')`. The TOAST
+		// row is filtered out of getTables' relkind WHERE, so it is never dumped as
+		// an object. This is goopg's first synthesized TOAST pg_class row.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optoast (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optoast\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (toast.autovacuum_enabled='false')") {
+			t.Errorf("pg_dump dropped the toast.autovacuum_enabled reloption; missing %q\n  full stdout=%q", "WITH (toast.autovacuum_enabled='false')", res.Stdout)
+		}
+		// The synthesized TOAST relation must never be dumped as its own object.
+		if strings.Contains(res.Stdout, "pg_toast_") {
+			t.Errorf("pg_dump leaked a TOAST relation into the dump (pg_toast_*)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 198 closed (asserted):** an INTEGER autovacuum-namespace storage
 		// parameter (autovacuum_vacuum_threshold) must round-trip via the
