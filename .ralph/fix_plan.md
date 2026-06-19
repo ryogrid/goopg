@@ -5849,6 +5849,27 @@ object support.
         Design: `0110-0001` Slice 271. **Next (slice 272+):** a `NO INHERIT` NOT NULL on a standalone table dumped inline as
         `<col> <type> NOT NULL NO INHERIT` — exercises the `connoinherit='t'` rendering the new `noInherit` arg threads.
 
+      - **PROGRESS 2026-06-20 (loop #39):** **DU-002 slice 272 LANDED — a `NO INHERIT` NOT NULL on a STANDALONE
+        (non-inherited) table round-trips through pg_dump as the INLINE `<col> <type> NOT NULL NO INHERIT` form.**
+        Slices 270/271 covered NOT NULL on *inherited* columns (standalone body items); slice 272 exercises the same
+        `connoinherit='t'` bit on an ordinary LOCAL column, where pg_dump renders it inline. PG18 records a contype='n'
+        pg_constraint row with `connoinherit='t'`; pg_dump reads it as `notnull_noinh[j]` and appends ` NO INHERIT` after
+        the inline `NOT NULL` (`pg_dump.c:17188`). Because the column is local (`notnull_islocal='t'`) and the constraint
+        name equals the computed default `nninh_c_not_null`, the UNNAMED inline form is emitted. Verified byte-for-byte
+        against real pg_dump 18.3: `c integer NOT NULL NO INHERIT,\n    d integer`. **No production change required** — the
+        whole path already existed but had never been asserted by a dump: the inline parser consumes the ` NO INHERIT`
+        trailer into `ColumnDef.NotNullNoInherit` (`ddl.go:2475`), the CREATE TABLE executor threads it through
+        `AddNotNull(..., noInherit, isLocal=true, 0)` (`operators_ddl.go:2493`; the partition-only NO-INHERIT reject at
+        `:913` does not fire for a plain table), and the pg_constraint virtual builder renders `connoinherit` from
+        `NamedNotNullConstraint.NoInherit` (`catalog.go:3992`). **Guards:** `TestPort_PgDumpConnectionSetup` PASS (3.47s,
+        byte-matches real pg_dump 18.3) + new `TestParseCreateTableColumnNotNullNoInherit` (parser: the inline ` NO INHERIT`
+        trailer sets `NotNullNoInherit`; a plain `NOT NULL` leaves it false; a bare column leaves both false) + `go test
+        ./internal/parser/ ./internal/executor/ ./internal/catalog/` PASS. gofmt + `go build ./...` clean; pgbench
+        pre-commit smoke on commit. Design: `0110-0001` Slice 272. **Next (slice 273+):** a `NO INHERIT` NOT NULL added to
+        a standalone table via `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` (slice 271's ADD-CONSTRAINT
+        path exercised with the `NO INHERIT` trailer end-to-end through a dump), or the named-differs inline variant
+        `c integer CONSTRAINT <name> NOT NULL NO INHERIT`.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

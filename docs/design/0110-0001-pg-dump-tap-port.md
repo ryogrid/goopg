@@ -7930,9 +7930,41 @@ Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `Tes
 (parser AST: named, unnamed, and `NO INHERIT` forms) + `TestAlterTableAddNotNullNamed` (executor catalog state:
 explicit name retained, unnamed fallback to auto-name, idempotence, 42703 on missing column).
 
-> **Next (slice 272+):** a `NO INHERIT` NOT NULL on a standalone (non-inherited) table dumped inline as
-> `<col> <type> NOT NULL NO INHERIT` — exercises the `connoinherit='t'` rendering that `AddNotNull`'s `noInherit`
-> argument now threads but no dump path has yet asserted.
+### Slice 272 — `NO INHERIT` NOT NULL on a *standalone* table (inline `NOT NULL NO INHERIT`)
+
+Slices 270/271 covered NOT NULL on *inherited* columns (emitted as standalone body items because the column is
+suppressed). Slice 272 exercises the same `connoinherit='t'` bit on an ordinary **local** column of a non-inherited
+table, where pg_dump renders it INLINE. PG18 records a contype='n' pg_constraint row with `connoinherit='t'`; pg_dump
+reads it as `notnull_noinh[j]` and appends ` NO INHERIT` after the inline `NOT NULL` (`pg_dump.c:17188`). Because the
+column is local (`notnull_islocal='t'`) and the constraint name equals the computed default `<table>_<col>_not_null`,
+pg_dump emits the **unnamed** inline form. Verified byte-for-byte against real pg_dump 18.3:
+
+```
+CREATE TABLE public.nninh (
+    c integer NOT NULL NO INHERIT,
+    d integer
+);
+```
+
+No production change was required — the whole path already existed but had never been asserted by a dump:
+
+- **Parser** (`internal/parser/ddl.go:2475`): `parseColumnDef` already consumes the optional ` NO INHERIT` trailer
+  after a column-level `NOT NULL` into `ColumnDef.NotNullNoInherit`.
+- **Executor** (`internal/executor/operators_ddl.go:2493`): the CREATE TABLE NOT-NULL loop threads
+  `explicitNoInherit[col]` (from `ColumnDef.NotNullNoInherit`) into `AddNotNull(name, col, oid, noInherit, isLocal=true, 0)`.
+  The PG18 guard that rejects `NO INHERIT` (`operators_ddl.go:913`) fires only for *partitioned* tables, so a plain
+  standalone table is allowed.
+- **Catalog** (`internal/catalog/catalog.go:3992`): the pg_constraint virtual builder already renders `connoinherit`
+  from `NamedNotNullConstraint.NoInherit`, so `connoinherit='t'` flows straight to pg_dump.
+
+Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3 — `c integer NOT NULL NO INHERIT`) +
+`TestParseCreateTableColumnNotNullNoInherit` (parser: the inline ` NO INHERIT` trailer sets `NotNullNoInherit`, a plain
+`NOT NULL` leaves it false). A regression that dropped the NoInherit thread anywhere in the chain would dump a plain
+`c integer NOT NULL` (connoinherit='f').
+
+> **Next (slice 273+):** a `NO INHERIT` NOT NULL added to a standalone table via `ALTER TABLE ... ADD CONSTRAINT
+> <name> NOT NULL <col> NO INHERIT` (slice 271's ADD-CONSTRAINT path now exercised with the `NO INHERIT` trailer end-to-end
+> through a dump) — or the *named*-differs variant rendered inline as `c integer CONSTRAINT <name> NOT NULL NO INHERIT`.
 
 ## Deferred (002–010) — catalog surface estimate
 

@@ -1515,6 +1515,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("add named NOT NULL on inherited column idfnn_child.pid: %v", err)
 	}
 
+	// Slice 272: a `NO INHERIT` NOT NULL on a STANDALONE (non-inherited) table,
+	// dumped INLINE as `<col> <type> NOT NULL NO INHERIT`. Slices 270/271 covered
+	// NOT NULL on *inherited* columns (standalone body items); this exercises the
+	// `connoinherit='t'` rendering on a plain local column. PG18 records the NOT
+	// NULL as a contype='n' pg_constraint row with connoinherit='t'; pg_dump reads
+	// it as notnull_noinh[j] and appends ` NO INHERIT` after the inline `NOT NULL`
+	// (pg_dump.c:17188). Because the column is local (notnull_islocal='t') and the
+	// constraint name equals the computed default `nninh_c_not_null`, pg_dump emits
+	// the UNNAMED inline form `c integer NOT NULL NO INHERIT` (no CONSTRAINT prefix).
+	// The whole production path already existed — the inline parser consumes the
+	// `NO INHERIT` trailer into ColumnDef.NotNullNoInherit (ddl.go), the CREATE
+	// TABLE executor threads it through `AddNotNull(..., noInherit, isLocal=true)`
+	// (operators_ddl.go), and the pg_constraint virtual builder renders
+	// connoinherit from NamedNotNullConstraint.NoInherit (catalog.go) — but no dump
+	// path had asserted it. Verified byte-for-byte against real pg_dump 18.3:
+	// `c integer NOT NULL NO INHERIT,\n    d integer`. A regression that dropped the
+	// NoInherit thread would emit a plain `c integer NOT NULL` (connoinherit='f').
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh (c integer NOT NULL NO INHERIT, d integer)"); err != nil {
+		t.Fatalf("create standalone table nninh with NOT NULL NO INHERIT column: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -4049,6 +4070,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "INHERITS (public.idfnn_parent)") {
 			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfnn_parent)", res.Stdout)
+		}
+		// **Slice 272 (asserted):** a `NO INHERIT` NOT NULL on a STANDALONE table,
+		// dumped inline as `c integer NOT NULL NO INHERIT`. pg_dump appends ` NO
+		// INHERIT` after the inline `NOT NULL` only when pg_constraint reports
+		// connoinherit='t' (notnull_noinh[j]; pg_dump.c:17188); the column is local
+		// and the constraint name matches the default, so the UNNAMED inline form is
+		// emitted. A regression that lost the NoInherit thread (parser → executor →
+		// pg_constraint builder) would dump a plain `c integer NOT NULL` here.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer NOT NULL NO INHERIT") {
+				t.Errorf("pg_dump dropped the NO INHERIT on a standalone NOT NULL column; want %q in nninh block\n  block=%q", "c integer NOT NULL NO INHERIT", block)
+			}
+			if !strings.Contains(block, "d integer") {
+				t.Errorf("pg_dump dropped the standalone table's plain column; want %q in nninh block\n  block=%q", "d integer", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged

@@ -379,6 +379,35 @@ func TestParseCreateTableColumnCompression(t *testing.T) {
 	}
 }
 
+// TestParseCreateTableColumnNotNullNoInherit covers the inline column-level
+// `NOT NULL NO INHERIT` form in CREATE TABLE (DU-002 slice 272). PG18 records the
+// NOT NULL as a contype='n' pg_constraint row with connoinherit='t'; the parser
+// must consume the optional ` NO INHERIT` trailer into ColumnDef.NotNullNoInherit
+// so the executor can thread it onto the constraint. A plain `NOT NULL` (no
+// trailer) must leave NotNullNoInherit false.
+func TestParseCreateTableColumnNotNullNoInherit(t *testing.T) {
+	stmts, err := Parse("CREATE TABLE t (c integer NOT NULL NO INHERIT, d integer NOT NULL, e integer)")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(ct.Columns) != 3 {
+		t.Fatalf("columns=%d want 3", len(ct.Columns))
+	}
+	if !ct.Columns[0].NotNull || !ct.Columns[0].NotNullNoInherit {
+		t.Errorf("c: NotNull=%v NotNullNoInherit=%v want both true", ct.Columns[0].NotNull, ct.Columns[0].NotNullNoInherit)
+	}
+	if !ct.Columns[1].NotNull || ct.Columns[1].NotNullNoInherit {
+		t.Errorf("d: NotNull=%v NotNullNoInherit=%v want true/false", ct.Columns[1].NotNull, ct.Columns[1].NotNullNoInherit)
+	}
+	if ct.Columns[2].NotNull || ct.Columns[2].NotNullNoInherit {
+		t.Errorf("e: NotNull=%v NotNullNoInherit=%v want false/false", ct.Columns[2].NotNull, ct.Columns[2].NotNullNoInherit)
+	}
+}
+
 // TestParseAlterTableSetStatistics covers `ALTER TABLE ... ALTER COLUMN c SET
 // STATISTICS <n>` (DU-002 slice 184). The integer value (including a negative
 // reset value like -1) is recorded in CheckExpr + ColumnName for the executor,
