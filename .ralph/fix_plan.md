@@ -4351,10 +4351,32 @@ object support.
         `internal/testport/pgdump_connsetup_test.go` (NEW `optt` fixture + assertion),
         `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 197). Gates: gofmt OK; `go build ./internal/...`
         clean; `go vet ./internal/testport/` clean; catalog/executor reloption tests PASS;
-        `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** real-typed
-        reloption (`autovacuum_vacuum_scale_factor` real 0–100, needs float parse + 0-as-valid) or
-        `autovacuum_vacuum_threshold` (int); or composite types (`CREATE TYPE AS`; `pg_class.reltype`
-        hardcoded 0 — larger).
+        `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit.
+
+      - **PROGRESS 2026-06-19 (loop #11):** **DU-002 slice 198 LANDED — integer autovacuum-namespace
+        storage parameter (`autovacuum_vacuum_threshold`) round-trips through pg_dump.** Most common
+        per-table autovacuum tuning knob; extends reloption coverage to the autovacuum namespace. PG's
+        reloption range is 0–INT_MAX with a default of -1 (`reloptions.c`), so — like parallel_workers —
+        0 is a valid explicit value and a separate `AutovacuumVacuumThresholdSet` flag (NOT a zero check)
+        records presence. goopg validated the lowercase WITH key but never extracted it, so `CREATE TABLE
+        … WITH (autovacuum_vacuum_threshold=100)` silently dropped it. The fix extracts/bounds-checks
+        (0–2147483647; overflow/non-int → `22023`; negatives rejected earlier by the parser) on the
+        base-table CREATE path and persists `catalog.Table.AutovacuumVacuumThreshold`; the pg_class
+        virtual view appends `autovacuum_vacuum_threshold=N` as a trailing integer element after
+        `toast_tuple_target`; pg_dump renders `WITH (autovacuum_vacuum_threshold='100')`. goopg has no
+        autovacuum → advisory catalog/dump-only; base-table-only. Files: `internal/catalog/catalog.go`
+        (`Table.AutovacuumVacuumThreshold`/`…Set` + render), `internal/executor/operators_ddl.go`
+        (extract/parse/bounds + persist on `execCreateTable`),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestAutovacuumVacuumThresholdSurfacesInPgClassReloptions` +
+        `TestAutovacuumVacuumThresholdOutOfBoundsRejected`), `internal/testport/pgdump_connsetup_test.go`
+        (NEW `optavt` fixture + assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 198).
+        Gates: gofmt OK; `go build ./internal/...` clean; `go vet ./internal/testport/` clean;
+        catalog/executor reloption tests PASS; `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit
+        smoke on commit. **Next:** real-typed reloption (`autovacuum_vacuum_scale_factor` real 0–100,
+        needs float parse + 0-as-valid) or another int autovacuum knob
+        (`autovacuum_analyze_threshold`/`autovacuum_vacuum_insert_threshold`); or composite types
+        (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

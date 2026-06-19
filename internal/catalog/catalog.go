@@ -425,6 +425,19 @@ type Table struct {
 	// thresholds are fixed, so the value is catalog/dump-only (advisory; runtime
 	// unaffected). M0110-0001 (DU-002 slice 197).
 	ToastTupleTarget int
+
+	// AutovacuumVacuumThreshold stores the table's
+	// `WITH (autovacuum_vacuum_threshold=N)` storage parameter. PG's reloption
+	// range is 0–INT_MAX with a default of -1 (= unset / use the GUC); because 0
+	// is a valid explicit value, AutovacuumVacuumThresholdSet — not a zero check
+	// — guards whether the option was specified (the parallel_workers pattern).
+	// When set, pg_class.reloptions gains the text[] element
+	// `autovacuum_vacuum_threshold=N`, which pg_dump renders back as
+	// `WITH (autovacuum_vacuum_threshold='N')`. goopg has no autovacuum, so the
+	// value is catalog/dump-only (advisory; runtime unaffected). M0110-0001
+	// (DU-002 slice 198).
+	AutovacuumVacuumThreshold    int
+	AutovacuumVacuumThresholdSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2137,7 +2150,8 @@ func (c *InMemory) registerSystemTables() {
 			// (e.g. fillfactor + parallel_workers, slice 195) join in a fixed
 			// order as `{fillfactor=70,parallel_workers=4}`; autovacuum_enabled
 			// (slice 196) follows as a boolean element, then toast_tuple_target
-			// (slice 197) as a trailing integer element.
+			// (slice 197) and autovacuum_vacuum_threshold (slice 198) as trailing
+			// integer elements.
 			var relopts []string
 			if t.Fillfactor != 0 {
 				relopts = append(relopts, "fillfactor="+strconv.Itoa(t.Fillfactor))
@@ -2150,6 +2164,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.ToastTupleTarget != 0 {
 				relopts = append(relopts, "toast_tuple_target="+strconv.Itoa(t.ToastTupleTarget))
+			}
+			if t.AutovacuumVacuumThresholdSet {
+				relopts = append(relopts, "autovacuum_vacuum_threshold="+strconv.Itoa(t.AutovacuumVacuumThreshold))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

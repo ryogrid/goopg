@@ -5748,6 +5748,41 @@ plain table → no reloptions) and `TestToastTupleTargetOutOfBoundsRejected`
 `optt (… WITH (toast_tuple_target=256))` on its own table; the assertion confirms
 the dump carries `WITH (toast_tuple_target='256')`.
 
+### Slice 198 — integer autovacuum-namespace storage parameter (`autovacuum_vacuum_threshold`) round-trip
+
+Slices 54/195/196/197 made `fillfactor`, `parallel_workers`,
+`autovacuum_enabled` and `toast_tuple_target` round-trip.
+`autovacuum_vacuum_threshold` is the most common per-table autovacuum tuning
+knob and extends coverage to the autovacuum reloption namespace. Its PG
+reloption range is **0–INT_MAX with a default of -1** (`reloptions.c`:
+`{"autovacuum_vacuum_threshold", … -1, 0, INT_MAX}`), so — like
+`parallel_workers` — `0` is a valid explicit value and a separate
+`AutovacuumVacuumThresholdSet` flag (not a zero check) records whether the
+option was present.
+
+Before this slice goopg validated the lowercase WITH key but never extracted it,
+so `CREATE TABLE … WITH (autovacuum_vacuum_threshold=100)` succeeded and silently
+lost the option. The fix extracts and bounds-checks it (0–2147483647;
+above-range overflow or non-integer → PG's `22023`; negatives are rejected
+earlier by the parser as a syntax error) on the base-table CREATE path and
+persists `catalog.Table.AutovacuumVacuumThreshold`. The pg_class virtual view
+appends `autovacuum_vacuum_threshold=N` as a trailing integer element after
+`toast_tuple_target` in the ordered reloptions list; pg_dump's
+`appendReloptionsArray` renders `WITH (autovacuum_vacuum_threshold='100')`.
+
+goopg has no autovacuum, so the value is advisory catalog/dump-only state —
+runtime unaffected; only the schema round-trips. Base-table-only, same as the
+sibling reloption slices.
+
+Engine guards: `TestAutovacuumVacuumThresholdSurfacesInPgClassReloptions`
+(combined `{fillfactor=70,autovacuum_vacuum_threshold=100}`; explicit-zero
+`{autovacuum_vacuum_threshold=0}` proving the Set flag, not a zero check, guards
+presence; plain table → no reloptions) and
+`TestAutovacuumVacuumThresholdOutOfBoundsRejected` (`9999999999`/`nope` → 22023).
+The pg_dump fixture adds `optavt (… WITH (autovacuum_vacuum_threshold=100))` on
+its own table; the assertion confirms the dump carries
+`WITH (autovacuum_vacuum_threshold='100')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

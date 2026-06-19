@@ -1031,6 +1031,29 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		toastTupleTarget = tt
 	}
+	// Extract and bounds-check the autovacuum_vacuum_threshold storage
+	// parameter. PG's reloption range is 0–INT_MAX with a default of -1 (=
+	// unset / use the GUC); since 0 is a valid explicit value, a separate `set`
+	// flag records whether the option was present (the parallel_workers
+	// pattern). goopg has no autovacuum, so the value is purely catalog/dump
+	// state that round-trips through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_vacuum_threshold='N')`. M0110-0001 (DU-002 slice 198).
+	autovacuumVacuumThreshold := 0
+	autovacuumVacuumThresholdSet := false
+	if v, ok := s.With["autovacuum_vacuum_threshold"]; ok {
+		avt, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_vacuum_threshold\": %s", v)}
+		}
+		if avt < 0 || avt > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_vacuum_threshold\"", avt),
+				Detail:  "Valid values are between \"0\" and \"2147483647\"."}
+		}
+		autovacuumVacuumThreshold = avt
+		autovacuumVacuumThresholdSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1088,6 +1111,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.AutovacuumEnabled = autovacuumEnabled
 	tbl.AutovacuumEnabledSet = autovacuumEnabledSet
 	tbl.ToastTupleTarget = toastTupleTarget
+	tbl.AutovacuumVacuumThreshold = autovacuumVacuumThreshold
+	tbl.AutovacuumVacuumThresholdSet = autovacuumVacuumThresholdSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
