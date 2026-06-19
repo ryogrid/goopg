@@ -1365,6 +1365,29 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		autovacuumMultixactFreezeMaxAge = amfmaxa
 		autovacuumMultixactFreezeMaxAgeSet = true
 	}
+	// autovacuum_multixact_freeze_table_age (RELOPT_TYPE_INT, range 0–2000000000,
+	// default -1 = unset; reloptions.c:1895/316). 0 is a valid explicit value, so a
+	// separate `set` flag records whether the option was present (the
+	// parallel_workers pattern) rather than a zero check. goopg has no autovacuum,
+	// so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_multixact_freeze_table_age='N')`.
+	// M0110-0001 (DU-002 slice 212).
+	autovacuumMultixactFreezeTableAge := 0
+	autovacuumMultixactFreezeTableAgeSet := false
+	if v, ok := s.With["autovacuum_multixact_freeze_table_age"]; ok {
+		amfta, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_multixact_freeze_table_age\": %s", v)}
+		}
+		if amfta < 0 || amfta > 2000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_multixact_freeze_table_age\"", amfta),
+				Detail:  "Valid values are between \"0\" and \"2000000000\"."}
+		}
+		autovacuumMultixactFreezeTableAge = amfta
+		autovacuumMultixactFreezeTableAgeSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1450,6 +1473,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.AutovacuumMultixactFreezeMinAgeSet = autovacuumMultixactFreezeMinAgeSet
 	tbl.AutovacuumMultixactFreezeMaxAge = autovacuumMultixactFreezeMaxAge
 	tbl.AutovacuumMultixactFreezeMaxAgeSet = autovacuumMultixactFreezeMaxAgeSet
+	tbl.AutovacuumMultixactFreezeTableAge = autovacuumMultixactFreezeTableAge
+	tbl.AutovacuumMultixactFreezeTableAgeSet = autovacuumMultixactFreezeTableAgeSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

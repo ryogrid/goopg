@@ -4657,6 +4657,27 @@ object support.
         PASS; pgbench pre-commit smoke on commit. **Next:** remaining multixact `…table_age` 0–2000000000,
         `autovacuum_vacuum_cost_limit` 1–10000, or `user_catalog_table` bool; then `toast.*` namespace; or
         composite types (`CREATE TYPE AS`).
+      - **PROGRESS 2026-06-19 (loop #26):** **DU-002 slice 212 LANDED — tenth INTEGER autovacuum-namespace
+        storage parameter (`autovacuum_multixact_freeze_table_age`) round-trips through pg_dump.** Completes the
+        multixact freeze-age subfamily (min/max/table-age), reusing the slice-198 integer path.
+        `autovacuum_multixact_freeze_table_age` is `RELOPT_TYPE_INT`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`,
+        default -1 (= unset / use the GUC), range 0–2000000000 (`reloptions.c:1895/316`). As with the min-age
+        option 0 is a valid explicit value, so `AutovacuumMultixactFreezeTableAgeSet` flag — not a zero check —
+        records presence. Executor parses via `strconv.Atoi`, rejecting non-integer / out-of-range
+        (`< 0 || > 2000000000`) → `22023`; since the WITH-clause parser refuses negative option values, overflow
+        (`2000000001`) and non-integer are the reachable invalid cases. Persist
+        `catalog.Table.AutovacuumMultixactFreezeTableAge` (int); pg_class virtual view appends
+        `autovacuum_multixact_freeze_table_age=N` after `autovacuum_multixact_freeze_max_age`; pg_dump renders
+        `WITH (autovacuum_multixact_freeze_table_age='N')`. Advisory catalog/dump-only; base-table-only. Files:
+        `internal/catalog/catalog.go` (`Table.AutovacuumMultixactFreezeTableAge`/`…Set` + render),
+        `internal/executor/operators_ddl.go` (extract/parse + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestAutovacuumMultixactFreezeTableAgeSurfacesInPgClassReloptions` + `TestAutovacuumMultixactFreezeTableAgeOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optamftaa` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 212). No parser change needed. Gates: gofmt OK;
+        `go build ./internal/...` clean; catalog/executor reloption tests PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** `autovacuum_vacuum_cost_limit` 1–10000, or
+        `user_catalog_table` bool; then `toast.*` namespace; or composite types (`CREATE TYPE AS`).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
