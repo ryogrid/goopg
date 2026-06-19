@@ -6017,6 +6017,27 @@ object support.
         `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 280. **Next (slice 281+):** the
         partition-leaf counterpart (a conislocal NOT NULL on a partition leaf where `tbinfo->ispartition` changes the
         column-omission decision), or a generated-column / default-value inherited body form.
+      - **PROGRESS 2026-06-20 (loop #48):** **DU-002 slice 281 LANDED — partition-leaf NOT NULL added via `ALTER TABLE ADD
+        CONSTRAINT` routes to the INLINE column form, with ispartition as the sole discriminator (no production change;
+        sibling-paths regression guard).** The SAME `ALTER TABLE leaf ADD CONSTRAINT <name> NOT NULL <inherited-col>` shape
+        that yields the STANDALONE body item on a legacy-inheritance child (mninh/idfnd, slices 271/277/279/280) instead
+        yields the INLINE decoration on a partition leaf, because `shouldPrintColumn` returns `attislocal[j] || ispartition`
+        (pg_dump.c:9970) → every partition column prints inline and the standalone-body branch (pg_dump.c:17213) is never
+        reached; `print_notnull` (true via ispartition) renders `CONSTRAINT <name> NOT NULL` inline (pg_dump.c:17178-17183).
+        Fixture: `CREATE TABLE public.pnna (qa integer, qb integer, qc text) PARTITION BY LIST (qa)` + `CREATE TABLE
+        public.pnna_1 PARTITION OF public.pnna FOR VALUES IN (1)` + `ALTER TABLE public.pnna_1 ADD CONSTRAINT pnna_named NOT
+        NULL qb` (non-default name → inline `qb integer CONSTRAINT pnna_named NOT NULL`) + `ALTER TABLE public.pnna_1 ADD
+        CONSTRAINT pnna_1_qc_not_null NOT NULL qc` (default name → collapses to bare inline `qc text NOT NULL`). Partition
+        twin of slice 280: that proved per-column collapse on the legacy-inheritance STANDALONE path; this proves the SAME
+        per-column collapse on the partition INLINE path. A regression ignoring ispartition in shouldPrintColumn would emit
+        the standalone body form (`CONSTRAINT pnna_named NOT NULL qb`); one collapsing globally would drop the `CONSTRAINT
+        pnna_named` prefix; one losing either AlterTableAddNotNull would drop an inline decoration. **Guards:**
+        `TestPort_PgDumpConnectionSetup` PASS (3.55s; verified byte-identical vs real pg_dump 18.3 — asserts `qa integer`,
+        `qb integer CONSTRAINT pnna_named NOT NULL`, collapsed `qc text NOT NULL`, NO standalone `CONSTRAINT pnna_named NOT
+        NULL qb` anywhere, no `CONSTRAINT pnna_1_qc_not_null` leak, `ATTACH PARTITION public.pnna_1 FOR VALUES IN (1)`
+        survives). gofmt + `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 281.
+        **Next (slice 282+):** a generated-column (`GENERATED ALWAYS AS … STORED`) inherited/partition body form, or a
+        child-level DEFAULT added via `ALTER TABLE … ALTER COLUMN … SET DEFAULT` on an inherited column.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -1,35 +1,35 @@
-Task: DU-002 slice 280 (loop #47) — COMPLETE, ready to commit + push.
+Task: DU-002 slice 281 (loop #48) — COMPLETE, committed + pushed.
 
-Last landed: multi-column inherited NOT NULL body form proving ATTNUM ordering +
-PER-COLUMN collapse. Two conislocal NOT NULL constraints on DISTINCT inherited
-columns of mninh_child, added in REVERSE attnum order. pg_dump body loop iterates
-`j` over columns (pg_dump.c:17175-17233) → standalone `NOT NULL <col>` items sort
-by attnum, not creation order. Collapse test `notnull_constrs[j][0]=='\0'`
-(pg_dump.c:17226) is per-column. NO production change — composes slices 271/277/279
-across multiple columns of one table.
+Last landed: partition-leaf NOT NULL added via `ALTER TABLE ADD CONSTRAINT` routes
+to the INLINE column form (ispartition discriminator). Twin of slice 280 but on the
+partition INLINE path instead of the legacy-inheritance STANDALONE body path.
+`shouldPrintColumn` = `attislocal[j] || ispartition` (pg_dump.c:9970) → partition
+columns always print inline, so the standalone-body branch (pg_dump.c:17213) is
+never reached; print_notnull renders `CONSTRAINT <name> NOT NULL` inline
+(pg_dump.c:17178-17183). NO production change — goopg already exposes conislocal
+NOT NULL pg_constraint rows + attnotnull (mninh/idfnd) and reports the leaf as a
+partition (pnnl). Verified byte-identical vs real PG 18.3.
 
-Fixture: `CREATE TABLE public.mninh_parent (ma integer, mb integer, mname text)` +
-`CREATE TABLE public.mninh_child (extra integer) INHERITS (public.mninh_parent)` +
-`ALTER TABLE public.mninh_child ADD CONSTRAINT mninh_named NOT NULL mb` (attnum 2,
-non-default name → keeps `CONSTRAINT mninh_named NOT NULL mb`) +
-`ALTER TABLE public.mninh_child ADD CONSTRAINT mninh_child_ma_not_null NOT NULL ma`
-(attnum 1, default name → collapses to bare `NOT NULL ma`).
-Asserted: block has `extra integer`, bare `NOT NULL ma`, no `CONSTRAINT
-mninh_child_ma_not_null`, `CONSTRAINT mninh_named NOT NULL mb`, `NOT NULL ma`
-precedes `NOT NULL mb` (attnum order despite mb-first ALTER); inherited `ma
-integer`/`mb integer`/`mname text` not re-emitted; `INHERITS (public.mninh_parent)`
-survives.
+Fixture: `CREATE TABLE public.pnna (qa integer, qb integer, qc text) PARTITION BY
+LIST (qa)` + `CREATE TABLE public.pnna_1 PARTITION OF public.pnna FOR VALUES IN (1)`
++ `ALTER TABLE pnna_1 ADD CONSTRAINT pnna_named NOT NULL qb` (non-default → inline
+`qb integer CONSTRAINT pnna_named NOT NULL`) + `ALTER TABLE pnna_1 ADD CONSTRAINT
+pnna_1_qc_not_null NOT NULL qc` (default → collapses to bare `qc text NOT NULL`).
+Asserted: pnna_1 block has `qa integer`, `qb integer CONSTRAINT pnna_named NOT
+NULL`, `qc text NOT NULL`; NO standalone `CONSTRAINT pnna_named NOT NULL qb`
+anywhere; no `CONSTRAINT pnna_1_qc_not_null` leak; ATTACH bound survives.
 
 Files:
-- internal/testport/pgdump_connsetup_test.go — mninh fixture (after idfnd ALTER) +
-  assertion block (after idfnd INHERITS check).
-- docs/design/0110-0001-pg-dump-tap-port.md — Slice 280 section + Next (281) note.
-- .ralph/fix_plan.md — slice 280 progress (loop #47).
+- internal/testport/pgdump_connsetup_test.go — pnna fixture (after pnnl_1 ALTER) +
+  assertion block (after pnnl_1 ATTACH assertion).
+- docs/design/0110-0001-pg-dump-tap-port.md — Slice 281 section + Next (282) note.
+- .ralph/fix_plan.md — slice 281 progress (loop #48).
 
 Gates: gofmt clean; go build ./... clean; TestPort_PgDumpConnectionSetup PASS
-(3.58s, byte-matches real pg_dump 18.3); pgbench pre-commit smoke (enforced by
+(3.55s, byte-matches real pg_dump 18.3); pgbench pre-commit smoke (enforced by
 .githooks/pre-commit on commit).
 
-Next (slice 281+): the partition-leaf counterpart — a conislocal NOT NULL on a
-partition leaf column (where tbinfo->ispartition changes the column-omission
-decision), OR a generated-column / default-value inherited body form.
+Next (slice 282+): a generated-column (`GENERATED ALWAYS AS … STORED`)
+inherited/partition body form, OR a child-level DEFAULT added via `ALTER TABLE …
+ALTER COLUMN … SET DEFAULT` on an inherited column (the DEFAULT analog of the
+NOT NULL ALTER-path slices).

@@ -8158,8 +8158,41 @@ the bare `NOT NULL ma` (no `CONSTRAINT mninh_child_ma_not_null`), `CONSTRAINT mn
 precedes `NOT NULL mb` (attnum order despite mb-first ALTER), does NOT re-emit the inherited `ma integer`/`mb integer`/
 `mname text` columns, and that `INHERITS (public.mninh_parent)` survives).
 
-> **Next (slice 281+):** the partition-leaf counterpart — a conislocal NOT NULL on a partition leaf column (where
-> `tbinfo->ispartition` changes the column-omission decision), or a generated-column / default-value inherited body form.
+> **Next (slice 281+):** ~~the partition-leaf counterpart — a conislocal NOT NULL on a partition leaf column (where
+> `tbinfo->ispartition` changes the column-omission decision)~~ — done in slice 281 below.
+
+### Slice 281 — partition-leaf NOT NULL added via `ALTER TABLE ADD CONSTRAINT` routes to the INLINE form (ispartition discriminator)
+
+The partition-leaf counterpart of the legacy-inheritance inherited-NOT-NULL body forms (271/277/279/280). The SAME
+`ALTER TABLE leaf ADD CONSTRAINT <name> NOT NULL <inherited-col>` shape that produces the STANDALONE body item
+(`CONSTRAINT <name> NOT NULL <col>`) on a legacy-inheritance child (`mninh`/`idfnd`) instead produces the INLINE column
+decoration (`<col> <type> CONSTRAINT <name> NOT NULL`) on a partition leaf —
+`CREATE TABLE pnna (qa integer, qb integer, qc text) PARTITION BY LIST (qa); CREATE TABLE pnna_1 PARTITION OF pnna FOR VALUES IN (1);
+ALTER TABLE pnna_1 ADD CONSTRAINT pnna_named NOT NULL qb; ALTER TABLE pnna_1 ADD CONSTRAINT pnna_1_qc_not_null NOT NULL qc`.
+
+**No production change required.** `shouldPrintColumn` (pg_dump.c:9970) returns `attislocal[j] || tbinfo->ispartition`, so for
+a partition leaf EVERY column prints inline and the standalone-body branch (`!shouldPrintColumn && notnull_islocal[j]`,
+pg_dump.c:17213) is never reached. `print_notnull` (pg_dump.c:17116) is true because `ispartition`, so the constraint
+renders as the inline decoration at pg_dump.c:17178-17183 — `CONSTRAINT <name> NOT NULL` for the non-default name (`qb` →
+`pnna_named` ≠ auto-name `pnna_1_qb_not_null`) and the bare ` NOT NULL` for the collapsing default name (`qc` →
+`pnna_1_qc_not_null` matches its auto-name). This is the partition twin of slice 280: that slice proved the per-column
+collapse on the legacy-inheritance STANDALONE path; this one proves the SAME per-column collapse on the partition INLINE
+path, with `ispartition` as the sole discriminator routing the identical ALTER shape to a different output form. goopg
+already exposes the conislocal NOT NULL `pg_constraint` rows + `attnotnull` for the ALTER path (slices 277/280) and reports
+the leaf as a partition (slice 266), so real pg_dump 18.3 renders the inline form unaided. Verified byte-identical vs PG
+18.3 (`qa integer`, `qb integer CONSTRAINT pnna_named NOT NULL`, `qc text NOT NULL`). A regression that ignored
+`ispartition` in `shouldPrintColumn` would emit the standalone body form (`CONSTRAINT pnna_named NOT NULL qb`) after the
+column list; one that collapsed the name globally would drop the `CONSTRAINT pnna_named` prefix on `qb`; one that lost
+either AlterTableAddNotNull would drop an inline decoration.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pnna_1` block prints `qa integer`,
+`qb integer CONSTRAINT pnna_named NOT NULL` and the collapsed `qc text NOT NULL`, that NO standalone
+`CONSTRAINT pnna_named NOT NULL qb` body item appears anywhere, that `CONSTRAINT pnna_1_qc_not_null` never leaks, and that
+`ATTACH PARTITION public.pnna_1 FOR VALUES IN (1)` survives).
+
+> **Next (slice 282+):** a generated-column (`GENERATED ALWAYS AS … STORED`) inherited/partition body form, or a
+> child-level DEFAULT added via `ALTER TABLE … ALTER COLUMN … SET DEFAULT` on an inherited column (the DEFAULT analog of
+> the NOT NULL ALTER-path slices).
 
 ## Deferred (002–010) — catalog surface estimate
 

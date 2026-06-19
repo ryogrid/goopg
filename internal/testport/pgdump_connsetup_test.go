@@ -1383,6 +1383,48 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pnnl_1 with child-only NOT NULL: %v", err)
 	}
 
+	// Slice 281 (partition-leaf counterpart of the inherited NOT NULL body forms,
+	// 271/277/279/280): a NOT NULL added to a partition leaf's INHERITED column via
+	// `ALTER TABLE ADD CONSTRAINT` is routed to the INLINE column form, NOT the
+	// standalone body form the legacy-inheritance `mninh`/`idfnd` siblings produce.
+	// shouldPrintColumn (pg_dump.c:9970) returns `attislocal[j] || ispartition`, so
+	// for a partition leaf EVERY column prints inline; the standalone-body branch
+	// (`!shouldPrintColumn && notnull_islocal`, pg_dump.c:17213) is therefore NEVER
+	// reached. Instead print_notnull (pg_dump.c:17116, true because `ispartition`)
+	// renders the constraint as the inline decoration at pg_dump.c:17178-17183 —
+	// `CONSTRAINT <name> NOT NULL` when the name is non-default, bare ` NOT NULL`
+	// when it collapses. `pnna_1` adds TWO conislocal NOT NULLs on distinct inherited
+	// columns: `qb` keeps a NON-default name (`pnna_named` != auto-name
+	// `pnna_1_qb_not_null`) so its inline decoration is `qb integer CONSTRAINT
+	// pnna_named NOT NULL`, while `qc`'s name EQUALS its auto-name
+	// (`pnna_1_qc_not_null`) so it collapses to the bare `qc text NOT NULL`. This is
+	// the partition twin of slice 280 (which proved the same per-column collapse on
+	// the legacy-inheritance STANDALONE body path): here the SAME ALTER shape routes
+	// INLINE because ispartition flips shouldPrintColumn. The partition key column
+	// `qa` stays a plain `qa integer` (no NOT NULL). No production change — goopg
+	// already exposes the conislocal NOT NULL pg_constraint rows + attnotnull for the
+	// ALTER path (proven by mninh/idfnd) and reports the leaf as a partition (proven
+	// by pnnl), so real pg_dump 18.3 renders the inline form. Verified byte-identical
+	// vs PG 18.3 this loop. A regression that emitted the standalone body form for a
+	// partition leaf (ignoring ispartition in shouldPrintColumn) would print
+	// `CONSTRAINT pnna_named NOT NULL qb` after the column list; one that collapsed
+	// globally would drop the `CONSTRAINT pnna_named` prefix on qb; one that lost
+	// either AlterTableAddNotNull would drop an inline decoration.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pnna (qa integer, qb integer, qc text) PARTITION BY LIST (qa)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pnna: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pnna_1 PARTITION OF public.pnna FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pnna_1: %v", err)
+	}
+	// qb FIRST (non-default name → keeps inline CONSTRAINT prefix)...
+	if err := runSQLSimple(t, c, "ALTER TABLE public.pnna_1 ADD CONSTRAINT pnna_named NOT NULL qb"); err != nil {
+		t.Fatalf("add named NOT NULL on partition leaf inherited column pnna_1.qb: %v", err)
+	}
+	// ...then qc (default name → collapses to bare inline NOT NULL).
+	if err := runSQLSimple(t, c, "ALTER TABLE public.pnna_1 ADD CONSTRAINT pnna_1_qc_not_null NOT NULL qc"); err != nil {
+		t.Fatalf("add default-named NOT NULL on partition leaf inherited column pnna_1.qc: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4093,6 +4135,49 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pnnl_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pnnl_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 281 (asserted):** NOT NULL added to a partition leaf's INHERITED
+		// column via ALTER TABLE ADD CONSTRAINT routes to the INLINE column form (not
+		// the standalone body form the legacy-inheritance mninh/idfnd siblings use),
+		// because shouldPrintColumn returns true for every partition column
+		// (ispartition). The leaf pnna_1 prints its full inherited column list with
+		// the two ALTER-added NOT NULLs as INLINE decorations: `qb` keeps its
+		// non-default name (`qb integer CONSTRAINT pnna_named NOT NULL`) while `qc`'s
+		// default name collapses to the bare `qc text NOT NULL`; the partition key
+		// `qa` stays a plain `qa integer`. The standalone body form
+		// (`CONSTRAINT pnna_named NOT NULL qb` with a trailing column name) must NOT
+		// appear — its presence would mean ispartition was ignored in
+		// shouldPrintColumn. Twin of slice 280 (same per-column collapse on the
+		// legacy-inheritance standalone path).
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pnna_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "qa integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited partition-key column; want %q in pnna_1 block\n  block=%q", "qa integer", block)
+			}
+			if !strings.Contains(block, "qb integer CONSTRAINT pnna_named NOT NULL") {
+				t.Errorf("pg_dump dropped/corrupted the non-default inline NOT NULL on a partition leaf; want %q in pnna_1 block\n  block=%q", "qb integer CONSTRAINT pnna_named NOT NULL", block)
+			}
+			if !strings.Contains(block, "qc text NOT NULL") {
+				t.Errorf("pg_dump dropped/corrupted the collapsed default-named inline NOT NULL on a partition leaf; want %q in pnna_1 block\n  block=%q", "qc text NOT NULL", block)
+			}
+			if strings.Contains(block, "CONSTRAINT pnna_1_qc_not_null") {
+				t.Errorf("pg_dump leaked the default constraint name on a partition leaf; want bare %q, not %q in pnna_1 block\n  block=%q", "qc text NOT NULL", "CONSTRAINT pnna_1_qc_not_null NOT NULL qc", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pnna_1\n  full stdout=%q", res.Stdout)
+		}
+		// The standalone inherited-NOT-NULL body form (column name AFTER the keyword)
+		// is the legacy-inheritance shape; it must never appear for a partition leaf.
+		if strings.Contains(res.Stdout, "CONSTRAINT pnna_named NOT NULL qb") {
+			t.Errorf("pg_dump emitted the standalone body NOT NULL form for a partition leaf (ispartition ignored in shouldPrintColumn); unexpected %q\n  full stdout=%q", "CONSTRAINT pnna_named NOT NULL qb", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pnna_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pnna_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every
