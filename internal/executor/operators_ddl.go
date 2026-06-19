@@ -1105,6 +1105,31 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		autovacuumAnalyzeScaleFactor = aasf
 		autovacuumAnalyzeScaleFactorSet = true
 	}
+	// Extract and bounds-check the autovacuum_vacuum_insert_scale_factor storage
+	// parameter — the third REAL-typed reloption goopg round-trips, reusing the
+	// slice-199 float path. PG's reloption type is RELOPT_TYPE_REAL with range
+	// 0.0–100.0 and a default of -1 (= unset / use the GUC); since 0.0 is a valid
+	// explicit value, a separate `set` flag records whether the option was present.
+	// The `!(f >= 0 && f <= 100)` form also rejects NaN/±Inf, which ParseFloat
+	// would otherwise accept. goopg has no autovacuum, so the value is purely
+	// catalog/dump state that round-trips through pg_class.reloptions / pg_dump's
+	// `WITH (autovacuum_vacuum_insert_scale_factor='F')`. M0110-0001 (DU-002 slice 201).
+	autovacuumVacuumInsertScaleFactor := 0.0
+	autovacuumVacuumInsertScaleFactorSet := false
+	if v, ok := s.With["autovacuum_vacuum_insert_scale_factor"]; ok {
+		avisf, convErr := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for floating point option \"autovacuum_vacuum_insert_scale_factor\": %s", v)}
+		}
+		if !(avisf >= 0.0 && avisf <= 100.0) {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %s out of bounds for option \"autovacuum_vacuum_insert_scale_factor\"", strconv.FormatFloat(avisf, 'g', -1, 64)),
+				Detail:  "Valid values are between \"0.000000\" and \"100.000000\"."}
+		}
+		autovacuumVacuumInsertScaleFactor = avisf
+		autovacuumVacuumInsertScaleFactorSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1168,6 +1193,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.AutovacuumVacuumScaleFactorSet = autovacuumVacuumScaleFactorSet
 	tbl.AutovacuumAnalyzeScaleFactor = autovacuumAnalyzeScaleFactor
 	tbl.AutovacuumAnalyzeScaleFactorSet = autovacuumAnalyzeScaleFactorSet
+	tbl.AutovacuumVacuumInsertScaleFactor = autovacuumVacuumInsertScaleFactor
+	tbl.AutovacuumVacuumInsertScaleFactorSet = autovacuumVacuumInsertScaleFactorSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

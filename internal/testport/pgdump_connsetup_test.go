@@ -768,6 +768,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optaasf: %v", err)
 	}
 
+	// Slice 201: the third REAL-typed storage parameter
+	// (`autovacuum_vacuum_insert_scale_factor`, valid 0.0–100.0), reusing the
+	// slice-199 float path. catalog.Table.AutovacuumVacuumInsertScaleFactor
+	// persists it; the pg_class virtual view renders
+	// `{autovacuum_vacuum_insert_scale_factor=0.2}` (shortest exact decimal),
+	// which pg_dump emits as `WITH (autovacuum_vacuum_insert_scale_factor='0.2')`.
+	// goopg has no autovacuum, so the value is catalog/dump-only (advisory).
+	// `optavisf` carries it on its own table to keep the other reloption
+	// assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optavisf (id integer PRIMARY KEY) WITH (autovacuum_vacuum_insert_scale_factor=0.2)"); err != nil {
+		t.Fatalf("create table optavisf: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2498,6 +2511,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (autovacuum_analyze_scale_factor='0.05')") {
 			t.Errorf("pg_dump dropped the autovacuum_analyze_scale_factor reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_analyze_scale_factor='0.05')", res.Stdout)
+		}
+		// **Slice 201 closed (asserted):** the third REAL-typed storage parameter
+		// (autovacuum_vacuum_insert_scale_factor) must round-trip, reusing the
+		// slice-199 float path. catalog.Table.AutovacuumVacuumInsertScaleFactor
+		// persists it and the pg_class virtual view renders
+		// `{autovacuum_vacuum_insert_scale_factor=0.2}`, which pg_dump emits as
+		// `WITH (autovacuum_vacuum_insert_scale_factor='0.2')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optavisf (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optavisf\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (autovacuum_vacuum_insert_scale_factor='0.2')") {
+			t.Errorf("pg_dump dropped the autovacuum_vacuum_insert_scale_factor reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_vacuum_insert_scale_factor='0.2')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to
