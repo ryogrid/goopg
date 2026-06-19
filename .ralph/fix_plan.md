@@ -4281,6 +4281,33 @@ object support.
         parser/catalog/executor PASS; `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke
         on commit. **Next:** composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 —
         larger); or remaining partition-child trailers (none obvious after USING/WITH/ON COMMIT/TABLESPACE).
+      - **PROGRESS 2026-06-19 (loop #8):** **DU-002 slice 195 LANDED — second table-level storage
+        parameter (`parallel_workers`) round-trips through pg_dump.** A `WITH (...)` clause can carry
+        more than one storage parameter, but goopg only ever extracted `fillfactor` (slice 54):
+        `execCreateTable` validated every WITH name as lowercase, then read `fillfactor` alone and
+        dropped any other recognized reloption, so `CREATE TABLE … WITH (parallel_workers=4)` succeeded
+        but silently lost the option (pg_class.reloptions stayed fillfactor-only/NULL; pg_dump never
+        re-emitted it). The fix adds `parallel_workers` as a second persisted reloption, mirroring the
+        fillfactor extraction (parse + bounds-check `0–1024` per PG's `reloptions.c` heap entry) with one
+        key difference: **0 is a valid explicit value** (PG's reloption default is `-1`=unset), so a
+        zero-check can't tell "set to 0" from "unset" — `catalog.Table` now carries both
+        `ParallelWorkers int` and a `ParallelWorkersSet bool` guard, and only the flag decides whether
+        the option surfaces. The pg_class virtual view builds an **ordered** reloptions list (fillfactor
+        first, then parallel_workers) → `{fillfactor=70,parallel_workers=4}`, which pg_dump's
+        `appendReloptionsArray` renders back as `WITH (fillfactor='70', parallel_workers='4')`. goopg has
+        no parallel query, so the value is advisory catalog/dump-only state (runtime unchanged, like
+        slice 194's `GeneratedVirtual`); base-table-only (partitioned tables still reject WITH; the
+        leaf-partition WITH path keeps fillfactor-only). Files: `internal/catalog/catalog.go`
+        (`Table.ParallelWorkers`/`ParallelWorkersSet` + ordered reloptions render),
+        `internal/executor/operators_ddl.go` (extract/bounds-check + persist on `execCreateTable`),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestParallelWorkersSurfacesInPgClassReloptions` + `TestParallelWorkersOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optpw` fixture + combined-clause assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 195). Gates: gofmt OK; `go build ./...` clean;
+        `go vet ./internal/testport/` clean; catalog/parser/executor PASS;
+        `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** composite
+        types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger); or further reloptions
+        (`autovacuum_*`, `toast_tuple_target`) on the same passthrough pattern.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -5641,6 +5641,45 @@ The pg_dump fixture adds `genv (… varea integer GENERATED ALWAYS AS (w + h)
 VIRTUAL)`; the assertion confirms the dump carries the bare `GENERATED ALWAYS
 AS (w + h)` clause with NO `STORED` keyword.
 
+### Slice 195 — second table-level storage parameter (`parallel_workers`) round-trip
+
+A table's `WITH (...)` clause can carry more than one storage parameter. Slice 54
+made `fillfactor` round-trip, but goopg only ever extracted that single key:
+`execCreateTable` validated every WITH name as lowercase and then read `fillfactor`
+alone, dropping any other recognized reloption on the floor. So
+`CREATE TABLE … WITH (parallel_workers=4)` succeeded but lost the option — pg_class
+`reloptions` stayed `{fillfactor=…}`-only (or NULL), and pg_dump never re-emitted it.
+
+The fix adds `parallel_workers` as a second persisted reloption. It mirrors the
+fillfactor extraction (parse, bounds-check `0–1024` per PG's `reloptions.c` heap
+entry, store on the catalog table) with one important difference: **0 is a valid
+explicit value** (PG's reloption default is `-1` = unset), so a zero-check cannot
+distinguish "set to 0" from "unset". `catalog.Table` therefore carries both
+`ParallelWorkers int` and a `ParallelWorkersSet bool` guard; only the latter
+decides whether the option appears in `reloptions`.
+
+The pg_class virtual view's `reloptions` cell now builds an **ordered list** of
+present options — `fillfactor` first, then `parallel_workers` — joined as
+`{fillfactor=70,parallel_workers=4}`. pg_dump's `appendReloptionsArray`
+(`fe_utils/string_utils.c`) renders that array back as
+`WITH (fillfactor='70', parallel_workers='4')` (`, ` separator, numeric values
+quoted because a digit-leading token is not a bare identifier).
+
+goopg has no parallel query, so `parallel_workers` is advisory catalog/dump-only
+state (like `GeneratedVirtual` in slice 194) — the runtime is unaffected; only the
+schema round-trips. The slice is base-table-only: partitioned tables still reject
+WITH (the option belongs on leaf partitions), and the leaf-partition WITH path
+(slices 191) continues to handle fillfactor only.
+
+Engine guards: `TestParallelWorkersSurfacesInPgClassReloptions` (combined
+fillfactor+parallel_workers → `{fillfactor=70,parallel_workers=4}`; the edge value
+`0` → `{parallel_workers=0}`, proving the set-flag is consulted not a zero check;
+plain table → no reloptions) and `TestParallelWorkersOutOfBoundsRejected`
+(`1025`/`99999` → 22023). The pg_dump fixture adds
+`optpw (… WITH (fillfactor=70, parallel_workers=4))` on its own table (so slice
+54's single-option `opt` assertion stays intact); the assertion confirms the dump
+carries `WITH (fillfactor='70', parallel_workers='4')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

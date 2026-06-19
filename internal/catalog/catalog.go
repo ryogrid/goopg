@@ -394,6 +394,16 @@ type Table struct {
 	// reloptions cell surfaces this as the text[] element `fillfactor=N`, which
 	// pg_dump renders back as `WITH (fillfactor='N')`. M0110-0001 (DU-002 slice 54).
 	Fillfactor int
+
+	// ParallelWorkers stores the table's `WITH (parallel_workers=N)` storage
+	// parameter (0–1024). Unlike fillfactor, 0 is a valid explicit value (PG's
+	// reloption default is -1 = unset), so ParallelWorkersSet — not a zero check
+	// — guards whether the option was specified. When set, pg_class.reloptions
+	// gains the text[] element `parallel_workers=N`, which pg_dump renders back
+	// as `WITH (parallel_workers='N')`. goopg has no parallel query, so the value
+	// is catalog/dump-only (advisory; runtime unaffected). M0110-0001 (DU-002 slice 195).
+	ParallelWorkers    int
+	ParallelWorkersSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2102,10 +2112,19 @@ func (c *InMemory) registerSystemTables() {
 			// array literal (`{fillfactor=70}`). Empty → "" → planner maps it to
 			// SQL NULL (DU-002 slice 47), so a plain table emits no WITH clause;
 			// a non-empty one round-trips through pg_dump as `WITH
-			// (fillfactor='70')`. M0110-0001 (DU-002 slice 54).
-			reloptions := ""
+			// (fillfactor='70')`. M0110-0001 (DU-002 slice 54). Multiple options
+			// (e.g. fillfactor + parallel_workers, slice 195) join in a fixed
+			// order as `{fillfactor=70,parallel_workers=4}`.
+			var relopts []string
 			if t.Fillfactor != 0 {
-				reloptions = "{fillfactor=" + strconv.Itoa(t.Fillfactor) + "}"
+				relopts = append(relopts, "fillfactor="+strconv.Itoa(t.Fillfactor))
+			}
+			if t.ParallelWorkersSet {
+				relopts = append(relopts, "parallel_workers="+strconv.Itoa(t.ParallelWorkers))
+			}
+			reloptions := ""
+			if len(relopts) > 0 {
+				reloptions = "{" + strings.Join(relopts, ",") + "}"
 			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // 0:  oid

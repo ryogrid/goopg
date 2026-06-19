@@ -682,6 +682,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table opt: %v", err)
 	}
 
+	// Slice 195: a SECOND table-level storage parameter (`parallel_workers`) must
+	// also round-trip — and coexist with fillfactor in the same reloptions array.
+	// goopg parsed every lowercase WITH key but only extracted+persisted
+	// fillfactor (slice 54); any other recognized reloption (here
+	// parallel_workers) was silently dropped, so pg_dump lost it. The fix
+	// extracts/bounds-checks parallel_workers (0–1024) and joins it with
+	// fillfactor in pg_class.reloptions. goopg has no parallel query, so the value
+	// is catalog/dump-only (advisory). `optpw` carries it on its own table to keep
+	// slice 54's single-option `opt` assertion (`WITH (fillfactor='70')`) intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optpw (id integer PRIMARY KEY) WITH (fillfactor=70, parallel_workers=4)"); err != nil {
+		t.Fatalf("create table optpw: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2332,6 +2345,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (fillfactor='70')") {
 			t.Errorf("pg_dump dropped a non-empty reloptions; missing %q\n  full stdout=%q", "WITH (fillfactor='70')", res.Stdout)
+		}
+		// **Slice 195 closed (asserted):** a second recognized storage parameter
+		// (parallel_workers) must also round-trip and coexist with fillfactor in one
+		// reloptions array. goopg parsed the WITH key but only persisted fillfactor,
+		// so parallel_workers vanished from the dump. catalog.Table.ParallelWorkers
+		// (+ ParallelWorkersSet, since 0 is a valid value) now persists it and the
+		// pg_class virtual view joins both options into `{fillfactor=70,parallel_workers=4}`,
+		// which pg_dump renders as `WITH (fillfactor='70', parallel_workers='4')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optpw (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optpw\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (fillfactor='70', parallel_workers='4')") {
+			t.Errorf("pg_dump dropped the parallel_workers reloption; missing %q\n  full stdout=%q", "WITH (fillfactor='70', parallel_workers='4')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

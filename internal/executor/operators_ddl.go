@@ -971,6 +971,28 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		}
 		fillfactor = ff
 	}
+	// Extract and bounds-check the parallel_workers storage parameter. Unlike
+	// fillfactor, 0 is a valid explicit value (PG's reloption default is -1 =
+	// unset; valid range 0–1024), so a separate `set` flag records whether the
+	// option was present. goopg has no parallel query, so the value is purely
+	// catalog/dump state that round-trips through pg_class.reloptions /
+	// pg_dump's `WITH (parallel_workers='N')`. M0110-0001 (DU-002 slice 195).
+	parallelWorkers := 0
+	parallelWorkersSet := false
+	if v, ok := s.With["parallel_workers"]; ok {
+		pw, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"parallel_workers\": %s", v)}
+		}
+		if pw < 0 || pw > 1024 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"parallel_workers\"", pw),
+				Detail:  "Valid values are between \"0\" and \"1024\"."}
+		}
+		parallelWorkers = pw
+		parallelWorkersSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1023,6 +1045,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.Unlogged = s.Unlogged
 	tbl.Temp = s.Temporary
 	tbl.Fillfactor = fillfactor
+	tbl.ParallelWorkers = parallelWorkers
+	tbl.ParallelWorkersSet = parallelWorkersSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
