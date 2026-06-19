@@ -842,11 +842,22 @@ type PartitionBound struct {
 	// `FOR VALUES FROM ('a') TO ('m')` rather than the invalid `FROM (a) TO (m)`.
 	FromValueLiterals []string
 	ToValueLiterals   []string
-	Modulus           int64  // HASH: modulus
-	Remainder         int64  // HASH: remainder (partition index)
-	IsHash            bool   // true for HASH partitions
-	IsDefault         bool   // true for DEFAULT partitions
-	ChildName         string // name of the child partition that owns this bound
+	// FromUnbounded / ToUnbounded flag each RANGE bound element as an unbounded
+	// edge (MINVALUE/-∞ when the matching IsMax is false, MAXVALUE/+∞ when true).
+	// Parallel to FromValues / ToValues. Without these, an unbounded edge is only
+	// distinguishable by the sentinel string "MINVALUE"/"MAXVALUE" in FromValues,
+	// which a real text bound value 'MINVALUE' collides with — so routing would
+	// treat that text value as ±∞. When absent (len 0, pre-slice-261 bounds),
+	// routing falls back to the legacy string-sentinel check. DU-002 slice 261.
+	FromUnbounded  []bool
+	FromUnboundMax []bool
+	ToUnbounded    []bool
+	ToUnboundMax   []bool
+	Modulus        int64  // HASH: modulus
+	Remainder      int64  // HASH: remainder (partition index)
+	IsHash         bool   // true for HASH partitions
+	IsDefault      bool   // true for DEFAULT partitions
+	ChildName      string // name of the child partition that owns this bound
 }
 
 // FormatPartitionBound formats a PartitionBound as the "FOR VALUES ..." string
@@ -1996,7 +2007,8 @@ func (c *InMemory) FindRangePartitionForDatums(parentOID uint32, keyStrs []strin
 				if len(pb.FromValues) == 0 && len(pb.ToValues) == 0 {
 					continue
 				}
-				if rangeStrTupleGE(keyStrs, pb.FromValues) && rangeStrTupleLT(keyStrs, pb.ToValues) {
+				if rangeStrTupleGE(keyStrs, pb.FromValues, pb.FromUnbounded, pb.FromUnboundMax) &&
+					rangeStrTupleLT(keyStrs, pb.ToValues, pb.ToUnbounded, pb.ToUnboundMax) {
 					return t
 				}
 			}
@@ -2006,12 +2018,15 @@ func (c *InMemory) FindRangePartitionForDatums(parentOID uint32, keyStrs []strin
 }
 
 // rangeStrTupleGE returns true if key >= bound (lexicographic tuple comparison).
-func rangeStrTupleGE(key, bound []string) bool {
+// unb/max are the per-element unbounded-edge flags parallel to bound (may be
+// shorter/nil for pre-slice-261 bounds, in which case the legacy string sentinel
+// is used). DU-002 slice 261.
+func rangeStrTupleGE(key, bound []string, unb, max []bool) bool {
 	for i := range key {
 		if i >= len(bound) {
 			break
 		}
-		cmp := compareRangeBoundStr(key[i], bound[i])
+		cmp := compareKeyToRangeBound(key[i], bound[i], boundElemUnbounded(bound, unb, i), boundElemUnboundMax(bound, max, i))
 		if cmp > 0 {
 			return true
 		}
@@ -2023,12 +2038,12 @@ func rangeStrTupleGE(key, bound []string) bool {
 }
 
 // rangeStrTupleLT returns true if key < bound (lexicographic tuple comparison).
-func rangeStrTupleLT(key, bound []string) bool {
+func rangeStrTupleLT(key, bound []string, unb, max []bool) bool {
 	for i := range key {
 		if i >= len(bound) {
 			break
 		}
-		cmp := compareRangeBoundStr(key[i], bound[i])
+		cmp := compareKeyToRangeBound(key[i], bound[i], boundElemUnbounded(bound, unb, i), boundElemUnboundMax(bound, max, i))
 		if cmp < 0 {
 			return true
 		}
@@ -2039,21 +2054,37 @@ func rangeStrTupleLT(key, bound []string) bool {
 	return false // equal on all compared positions: does NOT satisfy < (exclusive upper bound)
 }
 
-// compareRangeBoundStr compares a string-formatted key value against a
-// partition bound string. Returns -1, 0, +1.
-// "MINVALUE" is -∞ (key > MINVALUE → +1); "MAXVALUE" is +∞ (key < MAXVALUE → -1).
-func compareRangeBoundStr(keyStr, boundStr string) int {
-	switch boundStr {
-	case "MINVALUE":
-		return 1 // anything > -∞
-	case "MAXVALUE":
-		return -1 // anything < +∞
+// boundElemUnbounded reports whether bound element i is an unbounded edge,
+// preferring the explicit flag and falling back to the legacy string sentinel
+// for bounds created before slice 261 (no flags captured). DU-002 slice 261.
+func boundElemUnbounded(bound []string, unb []bool, i int) bool {
+	if i < len(unb) {
+		return unb[i]
 	}
-	switch keyStr {
-	case "MINVALUE":
-		return -1
-	case "MAXVALUE":
-		return 1
+	return bound[i] == "MINVALUE" || bound[i] == "MAXVALUE"
+}
+
+// boundElemUnboundMax reports whether unbounded element i is +∞ (MAXVALUE) vs
+// -∞ (MINVALUE). Meaningful only when boundElemUnbounded is true.
+func boundElemUnboundMax(bound []string, max []bool, i int) bool {
+	if i < len(max) {
+		return max[i]
+	}
+	return bound[i] == "MAXVALUE"
+}
+
+// compareKeyToRangeBound compares a string-formatted key value against a
+// partition bound element. Returns -1, 0, +1 (sign of key − bound).
+// When the bound element is an unbounded edge, isMax distinguishes +∞ (key < it
+// → -1) from -∞ (key > it → +1); the bound string is then ignored. Unlike the
+// pre-slice-261 helper, the KEY is always treated as a concrete value — a real
+// text key "MINVALUE"/"MAXVALUE" is no longer mistaken for ±∞. DU-002 slice 261.
+func compareKeyToRangeBound(keyStr, boundStr string, unbounded, isMax bool) int {
+	if unbounded {
+		if isMax {
+			return -1 // anything < +∞
+		}
+		return 1 // anything > -∞
 	}
 	// Try integer comparison first (covers int, bigint, etc.).
 	var ki, bi int64

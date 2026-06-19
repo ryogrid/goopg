@@ -7602,7 +7602,42 @@ then byte-matches the whole contiguous dumped block `(a integer, c numeric(12,3)
 pg_catalog."C")` against real pg_dump 18.3 (`TestPort_PgDumpConnectionSetup`) — the contiguous match proves both
 the field order and that the dropped `b` is gone.
 
-> **Next (slice 261+):** multi-level / `INHERITS` partition-tree dump fidelity, or a dedicated `MINVALUE`/`MAXVALUE` keyword AST node (see slice 169 deferral).
+### Slice 261 — dedicated `MINVALUE`/`MAXVALUE` keyword AST node (range-bound disambiguation)
+
+Slice 169 captured the open-edge RANGE keywords by collapsing the bare `MINVALUE`/`MAXVALUE` token into
+`StringConst{Value:"MINVALUE"}` — **byte-identical** to the quoted text literal `'MINVALUE'`. That collision was
+latent but real on two paths: (1) at the routing layer `compareRangeBoundStr` inspected *both* the key and the
+bound string for the `"MINVALUE"`/`"MAXVALUE"` sentinel, so a row whose real text partition key was literally
+`"MINVALUE"` was treated as −∞ and mis-routed; (2) a real text *bound* value `'MINVALUE'` was indistinguishable from
+the unbounded edge. This slice gives the unbounded edge its own node so the two are never confused.
+
+- **AST (`expr.go`)** — new `PartitionRangeBoundKeyword{pos, IsMax}` (`IsMax=false` → `MINVALUE`/−∞,
+  `true` → `MAXVALUE`/+∞), with `Keyword()` rendering the canonical uppercase token. Distinct from `StringConst`.
+- **Parser (`parsePartitionBoundValues`, `ddl.go`)** — the bare `minvalue`/`maxvalue` keywords now emit
+  `PartitionRangeBoundKeyword` instead of `StringConst`; a *quoted* `'MINVALUE'` still flows through `parseExpr` to
+  `StringConst`, so the two are finally separable.
+- **Catalog (`PartitionBound`, `catalog.go`)** — new parallel `[]bool` flags `FromUnbounded`/`FromUnboundMax`/
+  `ToUnbounded`/`ToUnboundMax` over the bound tuples. Routing (`FindRangePartitionForDatums` →
+  `rangeStrTupleGE`/`rangeStrTupleLT`) now calls the rewritten `compareKeyToRangeBound`, which treats the **key as a
+  concrete value always** and consults the explicit flags for the bound edge. `boundElemUnbounded`/
+  `boundElemUnboundMax` prefer the flags and fall back to the legacy bound-string sentinel for pre-slice-261 bounds
+  (so older in-memory bounds keep routing correctly).
+- **Executor (`operators_ddl.go` / `operators_ddl_partition.go`)** — `exprToString`, `boundExprToSQLLiteral`, and
+  `rangeBoundExprToSQLLiteral` now handle `PartitionRangeBoundKeyword` (the keyword path replaces the old
+  `StringConst.Value == "MINVALUE"` checks). New `rangeBoundUnboundedFlags` derives the `[]bool` flag tuples at
+  partition-creation time; `execCreatePartitionChild` and `execAlterTable` populate `pb.From/ToUnbounded[Max]`.
+- **No `pg_dump`-side change** — `FromValueLiterals` still receives the uppercase `MINVALUE`/`MAXVALUE` so
+  `FormatPartitionBound` emits the same `FOR VALUES FROM (MINVALUE) TO …` as before.
+
+Guarded at three levels: `parser.TestPartitionRangeBoundKeywordDistinctFromStringConst` asserts the bare keywords
+parse to `PartitionRangeBoundKeyword` (with the right `IsMax`) while a quoted `'MINVALUE'` stays a `StringConst`;
+`catalog.TestCompareKeyToRangeBoundDisambiguation` asserts a real text key `"MINVALUE"` compares as a concrete
+string (not ±∞), that the flag-driven edges behave as ±∞, and that nil flags fall back to the legacy sentinel; and
+the existing `prange_am` fixture (`FOR VALUES FROM (MINVALUE) TO ('m')`) in `TestPort_PgDumpConnectionSetup`
+continues to byte-match real pg_dump 18.3, proving the keyword-node rewrite preserves the dump round-trip.
+
+> **Next (slice 262+):** multi-level / `INHERITS` partition-tree dump fidelity, or per-element open-edge multi-column
+> RANGE bounds (`FROM (a, MINVALUE) TO (b, MAXVALUE)`) routing coverage.
 
 ## Deferred (002–010) — catalog surface estimate
 

@@ -1188,8 +1188,11 @@ func boundExprToSQLLiteral(e parser.Expr) string {
 		}
 	case *parser.StringConst:
 		return "'" + strings.ReplaceAll(v.Value, "'", "''") + "'"
+	case *parser.PartitionRangeBoundKeyword:
+		// Unbounded edge: cannot be expressed as a comparable SQL literal.
+		return ""
 	case *parser.ColumnRef:
-		// MINVALUE / MAXVALUE stored as ColumnRef; can't express as literal.
+		// Legacy MINVALUE / MAXVALUE once stored as ColumnRef; can't express.
 		return ""
 	}
 	return ""
@@ -1205,8 +1208,8 @@ func boundExprToSQLLiteral(e parser.Expr) string {
 // element can't be rendered (the caller then falls back to the raw routing form).
 // DU-002 slice 169.
 func rangeBoundExprToSQLLiteral(e parser.Expr) string {
-	if sc, ok := e.(*parser.StringConst); ok && (sc.Value == "MINVALUE" || sc.Value == "MAXVALUE") {
-		return sc.Value
+	if kw, ok := e.(*parser.PartitionRangeBoundKeyword); ok {
+		return kw.Keyword()
 	}
 	return boundExprToSQLLiteral(e)
 }
@@ -1228,6 +1231,27 @@ func rangeBoundLiterals(exprs []parser.Expr) []string {
 		lits = append(lits, lit)
 	}
 	return lits
+}
+
+// rangeBoundUnboundedFlags returns two parallel slices over a RANGE bound tuple:
+// unbounded[i] is true when element i is a MINVALUE/MAXVALUE keyword (an
+// unbounded edge), and isMax[i] is true when that edge is MAXVALUE (+∞). They
+// disambiguate the unbounded keyword from a quoted text value 'MINVALUE' at the
+// routing layer, where both otherwise serialize to the bare string "MINVALUE".
+// DU-002 slice 261.
+func rangeBoundUnboundedFlags(exprs []parser.Expr) (unbounded, isMax []bool) {
+	if len(exprs) == 0 {
+		return nil, nil
+	}
+	unbounded = make([]bool, len(exprs))
+	isMax = make([]bool, len(exprs))
+	for i, e := range exprs {
+		if kw, ok := e.(*parser.PartitionRangeBoundKeyword); ok {
+			unbounded[i] = true
+			isMax[i] = kw.IsMax
+		}
+	}
+	return unbounded, isMax
 }
 
 // funcExprContainsName returns true if expr (a partition-key expression) contains

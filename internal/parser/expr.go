@@ -25,6 +25,30 @@ type StringConst struct {
 func (e *StringConst) Pos() int { return e.pos }
 func (*StringConst) exprNode()  {}
 
+// PartitionRangeBoundKeyword is the MINVALUE / MAXVALUE keyword in a RANGE
+// partition bound (an unbounded edge: -∞ / +∞). It is intentionally a distinct
+// node from StringConst: without it the parser collapsed the bare keyword into
+// StringConst{Value:"MINVALUE"}, which is byte-identical to the *quoted text
+// literal* 'MINVALUE'. That collision silently corrupted both the dumped
+// relpartbound (a real text bound 'MINVALUE' dumped as the bare unbounded
+// keyword) and value routing (a real text key/bound "MINVALUE" treated as ±∞).
+// DU-002 slice 261.
+type PartitionRangeBoundKeyword struct {
+	pos   int
+	IsMax bool // false = MINVALUE (-∞), true = MAXVALUE (+∞)
+}
+
+func (e *PartitionRangeBoundKeyword) Pos() int { return e.pos }
+func (*PartitionRangeBoundKeyword) exprNode()  {}
+
+// Keyword renders the node as its canonical uppercase SQL keyword.
+func (e *PartitionRangeBoundKeyword) Keyword() string {
+	if e.IsMax {
+		return "MAXVALUE"
+	}
+	return "MINVALUE"
+}
+
 // NumericConst carries the verbatim text of a decimal / scientific
 // literal so we don't lose precision before the executor's NUMERIC
 // codec encodes it as varlen text. v0 doesn't compute on NUMERIC —
@@ -98,8 +122,8 @@ func (*IntervalLit) exprNode()  {}
 type InExpr struct {
 	pos         int
 	Operand     Expr
-	Negated     bool        // NOT IN
-	NotEqualAny bool        // != ANY semantics (OR of != comparisons). M0097-0067.
+	Negated     bool // NOT IN
+	NotEqualAny bool // != ANY semantics (OR of != comparisons). M0097-0067.
 	// AnyOp, when non-zero, indicates `left op ANY(array)` with the given operator.
 	// Used for non-equality ANY predicates such as `col ~ ANY(ARRAY[...])`.
 	AnyOp    OpCode
@@ -117,7 +141,7 @@ func (*InExpr) exprNode()  {}
 // — output columns are discarded; upstream-aligned semantics.
 type ExistsExpr struct {
 	pos      int
-	Negated  bool        // NOT EXISTS
+	Negated  bool // NOT EXISTS
 	Subquery *SelectStmt
 }
 

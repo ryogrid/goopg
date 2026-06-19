@@ -5628,6 +5628,28 @@ object support.
         pgbench pre-commit smoke on commit. **Next (slice 261+):** multi-level / `INHERITS` partition-tree dump fidelity,
         or a dedicated `MINVALUE`/`MAXVALUE` keyword AST node (slice 169 deferral).
 
+      - **PROGRESS 2026-06-20 (loop #28):** **DU-002 slice 261 LANDED — a dedicated `MINVALUE`/`MAXVALUE` keyword AST
+        node disambiguates an unbounded RANGE-partition edge from a quoted text literal `'MINVALUE'`.** Slice 169 collapsed
+        the bare `MINVALUE`/`MAXVALUE` token into `StringConst{Value:"MINVALUE"}` — byte-identical to the quoted text
+        literal — so (1) a row whose real text partition key was literally `"MINVALUE"` was treated as −∞ and mis-routed,
+        and (2) a real text *bound* value `'MINVALUE'` was indistinguishable from the unbounded edge. **AST** (`expr.go`) —
+        new `PartitionRangeBoundKeyword{pos,IsMax}` (false→`MINVALUE`/−∞, true→`MAXVALUE`/+∞) with `Keyword()`. **Parser**
+        (`parsePartitionBoundValues`, `ddl.go`) — bare keywords now emit the new node; a quoted `'MINVALUE'` still parses to
+        `StringConst`. **Catalog** (`catalog.go`) — new parallel `[]bool` flags `From/ToUnbounded[Max]` on `PartitionBound`;
+        routing (`FindRangePartitionForDatums`→`rangeStrTupleGE`/`LT`) now calls the rewritten `compareKeyToRangeBound`,
+        which treats the **key as a concrete value always** and reads the explicit flags for the bound edge;
+        `boundElemUnbounded`/`boundElemUnboundMax` fall back to the legacy bound-string sentinel for pre-slice-261 bounds.
+        **Executor** (`operators_ddl.go`/`operators_ddl_partition.go`) — `exprToString`/`boundExprToSQLLiteral`/
+        `rangeBoundExprToSQLLiteral` handle the new node; new `rangeBoundUnboundedFlags` populates the flag tuples in
+        `execCreatePartitionChild` + `execAlterTable`. **No pg_dump-side change** (`FromValueLiterals` still gets the
+        uppercase keyword → same dump). Guards (3 levels): `parser.TestPartitionRangeBoundKeywordDistinctFromStringConst`
+        (bare→keyword node w/ IsMax, quoted→StringConst), `catalog.TestCompareKeyToRangeBoundDisambiguation` (text key
+        `"MINVALUE"` compares concrete, flag-driven ±∞, nil-flag legacy fallback), and existing `prange_am`
+        (`FROM (MINVALUE) TO ('m')`) in `TestPort_PgDumpConnectionSetup` still byte-matches real pg_dump 18.3 (PASS, 3.7s).
+        parser+catalog+executor suites PASS. Design: `0110-0001` Slice 261. pgbench pre-commit smoke on commit.
+        **Next (slice 262+):** multi-level / `INHERITS` partition-tree dump fidelity, or per-element open-edge multi-column
+        RANGE bound routing (`FROM (a, MINVALUE) TO (b, MAXVALUE)`).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

@@ -2412,10 +2412,15 @@ func (p *parser) parsePartitionKeyCols() (keyCols []string, keyExprs []Expr, opC
 func (p *parser) parsePartitionBoundValues() ([]Expr, error) {
 	var vals []Expr
 	for {
+		// MINVALUE / MAXVALUE are the unbounded-edge keywords, encoded as a
+		// dedicated PartitionRangeBoundKeyword node so they never collide with the
+		// quoted text literals 'MINVALUE' / 'MAXVALUE' (which parse as StringConst
+		// via parseExpr below). DU-002 slice 261.
+		kwPos := p.cur().Pos
 		if p.acceptIdentKeyword("minvalue") {
-			vals = append(vals, &StringConst{Value: "MINVALUE"})
+			vals = append(vals, &PartitionRangeBoundKeyword{pos: kwPos, IsMax: false})
 		} else if p.acceptIdentKeyword("maxvalue") {
-			vals = append(vals, &StringConst{Value: "MAXVALUE"})
+			vals = append(vals, &PartitionRangeBoundKeyword{pos: kwPos, IsMax: true})
 		} else {
 			e, err := p.parseExpr()
 			if err != nil {

@@ -2992,6 +2992,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 				pb.FromValues = append(pb.FromValues, exprToString(v))
 			}
 			pb.FromValueLiterals = rangeBoundLiterals(poc.FromValues)
+			pb.FromUnbounded, pb.FromUnboundMax = rangeBoundUnboundedFlags(poc.FromValues)
 		}
 		if len(poc.ToValues) > 0 {
 			pb.To = exprToString(poc.ToValues[0]) // backward compat (single-col)
@@ -2999,6 +3000,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 				pb.ToValues = append(pb.ToValues, exprToString(v))
 			}
 			pb.ToValueLiterals = rangeBoundLiterals(poc.ToValues)
+			pb.ToUnbounded, pb.ToUnboundMax = rangeBoundUnboundedFlags(poc.ToValues)
 		}
 		tbl.PartitionBounds = []catalog.PartitionBound{pb}
 	}
@@ -3351,8 +3353,14 @@ func exprToString(e parser.Expr) string {
 		return v.Value
 	case *parser.NullConst:
 		return "null"
+	case *parser.PartitionRangeBoundKeyword:
+		// Unbounded RANGE edge. The raw routing form keeps the uppercase keyword
+		// as a sentinel string; the parallel FromUnbounded/ToUnbounded flags carry
+		// the unambiguous signal so a real text value 'MINVALUE' is not mistaken
+		// for an unbounded edge. DU-002 slice 261.
+		return v.Keyword()
 	case *parser.ColumnRef:
-		// MINVALUE / MAXVALUE in partition bounds are parsed as ColumnRef.
+		// Legacy: some MINVALUE / MAXVALUE forms were once parsed as ColumnRef.
 		return strings.ToLower(v.Column)
 	case *parser.UnaryOp:
 		if v.Op == parser.OpUnaryNeg {
@@ -4904,6 +4912,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						pb.FromValues = append(pb.FromValues, exprToString(v))
 					}
 					pb.FromValueLiterals = rangeBoundLiterals(poc.FromValues)
+					pb.FromUnbounded, pb.FromUnboundMax = rangeBoundUnboundedFlags(poc.FromValues)
 				}
 				if len(poc.ToValues) > 0 {
 					pb.To = exprToString(poc.ToValues[0]) // backward compat
@@ -4911,6 +4920,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						pb.ToValues = append(pb.ToValues, exprToString(v))
 					}
 					pb.ToValueLiterals = rangeBoundLiterals(poc.ToValues)
+					pb.ToUnbounded, pb.ToUnboundMax = rangeBoundUnboundedFlags(poc.ToValues)
 				}
 				if len(pb.InValues) > 0 || pb.From != "" || pb.To != "" {
 					childTbl.PartitionBounds = []catalog.PartitionBound{pb}

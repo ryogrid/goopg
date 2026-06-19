@@ -1006,6 +1006,63 @@ func TestFormatPartitionBoundListLiterals(t *testing.T) {
 	}
 }
 
+// TestCompareKeyToRangeBoundDisambiguation pins DU-002 slice 261: the routing
+// comparison must treat the partition KEY as a concrete value always, and use
+// the explicit per-element unbounded flags (not a string sentinel) to recognize
+// an unbounded bound edge. The pre-slice-261 helper inspected the key string for
+// "MINVALUE"/"MAXVALUE" and treated it as ±∞, so a real text key value
+// "MINVALUE" was mis-routed.
+func TestCompareKeyToRangeBoundDisambiguation(t *testing.T) {
+	t.Run("unbounded edge via flag ignores bound string", func(t *testing.T) {
+		// -∞: any key (even "MINVALUE") is greater.
+		if got := compareKeyToRangeBound("MINVALUE", "", true, false); got != 1 {
+			t.Errorf("key > -∞: got %d; want 1", got)
+		}
+		// +∞: any key (even "MAXVALUE") is less.
+		if got := compareKeyToRangeBound("MAXVALUE", "", true, true); got != -1 {
+			t.Errorf("key < +∞: got %d; want -1", got)
+		}
+	})
+
+	t.Run("real text key 'MINVALUE' is concrete, not -∞", func(t *testing.T) {
+		// Bound is a concrete text value "m"; key "MINVALUE" must compare as the
+		// string it is ("MINVALUE" < "m" lexicographically), NOT as -∞.
+		if got := compareKeyToRangeBound("MINVALUE", "m", false, false); got >= 0 {
+			t.Errorf("text key \"MINVALUE\" vs \"m\": got %d; want <0 (concrete string compare)", got)
+		}
+		// And against "AAA": "MINVALUE" > "AAA".
+		if got := compareKeyToRangeBound("MAXVALUE", "AAA", false, false); got <= 0 {
+			t.Errorf("text key \"MAXVALUE\" vs \"AAA\": got %d; want >0 (concrete string compare)", got)
+		}
+	})
+
+	t.Run("tuple routing: unbounded FROM edge admits any key", func(t *testing.T) {
+		// FROM (MINVALUE) TO (10): keyStrs={"5"} must satisfy >= FROM and < TO.
+		from := []string{"minvalue"}
+		fromUnb, fromMax := []bool{true}, []bool{false}
+		to := []string{"10"}
+		if !rangeStrTupleGE([]string{"5"}, from, fromUnb, fromMax) {
+			t.Errorf("5 >= (MINVALUE) should be true")
+		}
+		if !rangeStrTupleLT([]string{"5"}, to, nil, nil) {
+			t.Errorf("5 < (10) should be true")
+		}
+	})
+
+	t.Run("legacy fallback: nil flags fall back to bound string sentinel", func(t *testing.T) {
+		// Pre-slice-261 bounds have no flags; a bound element "MINVALUE" must
+		// still be recognized as -∞ via boundElemUnbounded's string fallback.
+		bound := []string{"MINVALUE"}
+		if !boundElemUnbounded(bound, nil, 0) {
+			t.Errorf("legacy bound \"MINVALUE\" with nil flags should be unbounded")
+		}
+		if got := compareKeyToRangeBound("anything", bound[0],
+			boundElemUnbounded(bound, nil, 0), boundElemUnboundMax(bound, nil, 0)); got != 1 {
+			t.Errorf("legacy -∞ fallback: got %d; want 1", got)
+		}
+	})
+}
+
 // TestPgInheritsEmitsLegacyInheritanceRows pins DU-002 slice 170: a table
 // created via CREATE TABLE child (...) INHERITS (parent) must surface a
 // pg_inherits row per (child, parent) pair in declaration order, so pg_dump
