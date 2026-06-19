@@ -5981,6 +5981,29 @@ Engine guards: `TestVacuumTruncateSurfacesInPgClassReloptions` (combined
 fixture adds `optvt (… WITH (vacuum_truncate=false))` on its own table; the assertion
 confirms the dump carries `WITH (vacuum_truncate='false')`.
 
+### Slice 206 — fourth INTEGER autovacuum reloption (`log_autovacuum_min_duration`) round-trip
+
+Returns to the autovacuum namespace for the fourth INT-typed reloption, reusing the
+slice-198 integer path. `log_autovacuum_min_duration` is `RELOPT_TYPE_INT` with
+`RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` and a default of **-1** (= unset / use the GUC),
+range `-1`–`INT_MAX` (`reloptions.c:324/1897`; "Sets the minimum execution time above
+which autovacuum actions will be logged"; `0` logs every autovacuum action). Because
+`-1` and `0` are both valid explicit values, a separate `LogAutovacuumMinDurationSet`
+flag records presence (the `parallel_workers` pattern) rather than a zero check. The
+executor parses with `strconv.Atoi`, rejecting non-integers and out-of-range values
+(`< -1 || > 2147483647`) with `22023`. It persists `catalog.Table.LogAutovacuumMinDuration`
+(an `int`); the pg_class virtual view appends `log_autovacuum_min_duration=N` after
+`vacuum_truncate`; pg_dump renders `WITH (log_autovacuum_min_duration='N')`. goopg has
+no autovacuum, so the value is advisory catalog/dump-only, base-table-only — same as the
+sibling reloption slices.
+
+Engine guards: `TestLogAutovacuumMinDurationSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,log_autovacuum_min_duration=250}`; boundary `0`; plain table → no
+reloptions) and `TestLogAutovacuumMinDurationOutOfBoundsRejected` (`9999999999`/`nope`
+→ 22023). The pg_dump fixture adds `optlamd (… WITH (log_autovacuum_min_duration=250))`
+on its own table; the assertion confirms the dump carries
+`WITH (log_autovacuum_min_duration='250')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -1223,6 +1223,31 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		vacuumTruncate = b
 		vacuumTruncateSet = true
 	}
+	// Extract and bounds-check the log_autovacuum_min_duration storage parameter —
+	// the fourth INT-typed autovacuum-namespace reloption goopg round-trips,
+	// reusing the slice-198 integer path. PG's reloption type is RELOPT_TYPE_INT
+	// with range -1–INT_MAX and a default of -1 (= unset / use the GUC); 0 logs
+	// every autovacuum action (reloptions.c:1897/329). Since -1 and 0 are valid
+	// explicit values, a separate `set` flag records whether the option was present
+	// (the parallel_workers pattern). goopg has no autovacuum, so the value is
+	// purely catalog/dump state that round-trips through pg_class.reloptions /
+	// pg_dump's `WITH (log_autovacuum_min_duration='N')`. M0110-0001 (DU-002 slice 206).
+	logAutovacuumMinDuration := 0
+	logAutovacuumMinDurationSet := false
+	if v, ok := s.With["log_autovacuum_min_duration"]; ok {
+		lamd, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"log_autovacuum_min_duration\": %s", v)}
+		}
+		if lamd < -1 || lamd > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"log_autovacuum_min_duration\"", lamd),
+				Detail:  "Valid values are between \"-1\" and \"2147483647\"."}
+		}
+		logAutovacuumMinDuration = lamd
+		logAutovacuumMinDurationSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1296,6 +1321,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.AutovacuumVacuumInsertThresholdSet = autovacuumVacuumInsertThresholdSet
 	tbl.VacuumTruncate = vacuumTruncate
 	tbl.VacuumTruncateSet = vacuumTruncateSet
+	tbl.LogAutovacuumMinDuration = logAutovacuumMinDuration
+	tbl.LogAutovacuumMinDurationSet = logAutovacuumMinDurationSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

@@ -1078,6 +1078,97 @@ func TestVacuumTruncateInvalidValueRejected(t *testing.T) {
 	}
 }
 
+// TestLogAutovacuumMinDurationSurfacesInPgClassReloptions verifies that a `WITH
+// (log_autovacuum_min_duration=N)` storage parameter declared on CREATE TABLE is
+// persisted on the catalog table and surfaced through the pg_class virtual
+// reloptions text[] column. Covers a value combined with fillfactor (rendered as
+// `{fillfactor=70,log_autovacuum_min_duration=250}`), the boundary value 0
+// (explicitly set, logs every action), and a plain table (no reloptions).
+// pg_dump renders the array back as `WITH (log_autovacuum_min_duration='250')`.
+// goopg has no autovacuum, so the value is catalog/dump-only. DU-002 slice 206.
+func TestLogAutovacuumMinDurationSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE lamd (id integer PRIMARY KEY) WITH (fillfactor=70, log_autovacuum_min_duration=250)`); err != nil {
+		t.Fatalf("CREATE TABLE lamd: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE lamdzero (id integer PRIMARY KEY) WITH (log_autovacuum_min_duration=0)`); err != nil {
+		t.Fatalf("CREATE TABLE lamdzero: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE lamdplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE lamdplain: %v", err)
+	}
+
+	lamdTbl, ok := cat.LookupTable(parser.ObjectName{Name: "lamd"})
+	if !ok {
+		t.Fatal("lamd table not found")
+	}
+	if lamdTbl.LogAutovacuumMinDuration != 250 || !lamdTbl.LogAutovacuumMinDurationSet {
+		t.Errorf("lamd duration = %d set=%v, want 250 set=true", lamdTbl.LogAutovacuumMinDuration, lamdTbl.LogAutovacuumMinDurationSet)
+	}
+	zeroTbl, ok := cat.LookupTable(parser.ObjectName{Name: "lamdzero"})
+	if !ok {
+		t.Fatal("lamdzero table not found")
+	}
+	if zeroTbl.LogAutovacuumMinDuration != 0 || !zeroTbl.LogAutovacuumMinDurationSet {
+		t.Errorf("lamdzero duration = %d set=%v, want 0 set=true", zeroTbl.LogAutovacuumMinDuration, zeroTbl.LogAutovacuumMinDurationSet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "lamdplain"})
+	if !ok {
+		t.Fatal("lamdplain table not found")
+	}
+	if plainTbl.LogAutovacuumMinDurationSet {
+		t.Errorf("lamdplain set=%v, want false (unset)", plainTbl.LogAutovacuumMinDurationSet)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "lamd" || r[1] == "lamdzero" || r[1] == "lamdplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["lamd"] != "{fillfactor=70,log_autovacuum_min_duration=250}" {
+		t.Errorf("pg_class.reloptions for lamd = %q, want %q", got["lamd"], "{fillfactor=70,log_autovacuum_min_duration=250}")
+	}
+	if got["lamdzero"] != "{log_autovacuum_min_duration=0}" {
+		t.Errorf("pg_class.reloptions for lamdzero = %q, want %q", got["lamdzero"], "{log_autovacuum_min_duration=0}")
+	}
+	if got["lamdplain"] != "" {
+		t.Errorf("pg_class.reloptions for lamdplain = %q, want \"\" (NULL)", got["lamdplain"])
+	}
+}
+
+// TestLogAutovacuumMinDurationOutOfBoundsRejected verifies CREATE TABLE rejects
+// an above-INT_MAX or non-integer log_autovacuum_min_duration with PG's 22023
+// error. The valid range is -1–INT_MAX (a bare negative is rejected earlier by
+// the parser as a syntax error, so the reachable invalid cases are overflow and
+// non-integer). DU-002 slice 206.
+func TestLogAutovacuumMinDurationOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, v := range []string{"9999999999", "nope"} {
+		err := runDDL(t, ctx, `CREATE TABLE lamdbad`+strconv.Itoa(i)+` (id integer) WITH (log_autovacuum_min_duration=`+v+`)`)
+		if err == nil {
+			t.Errorf("log_autovacuum_min_duration=%s: expected an error, got nil", v)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("log_autovacuum_min_duration=%s: error type = %T, want *ExecError", v, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("log_autovacuum_min_duration=%s: error code = %q, want 22023", v, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.

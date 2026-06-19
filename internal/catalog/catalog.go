@@ -540,6 +540,21 @@ type Table struct {
 	// (DU-002 slice 205).
 	VacuumTruncate    bool
 	VacuumTruncateSet bool
+
+	// LogAutovacuumMinDuration stores the table's
+	// `WITH (log_autovacuum_min_duration=N)` storage parameter — the fourth
+	// INT-typed autovacuum-namespace reloption goopg round-trips, reusing the
+	// slice-198 integer path. PG's reloption type is RELOPT_TYPE_INT with range
+	// -1–INT_MAX and a default of -1 (= unset / use the GUC); 0 logs every
+	// autovacuum action (reloptions.c:1897/329). Because -1 and 0 are valid
+	// explicit values, LogAutovacuumMinDurationSet — not a zero check — guards
+	// whether the option was specified (the parallel_workers pattern). When set,
+	// pg_class.reloptions gains the text[] element `log_autovacuum_min_duration=N`,
+	// which pg_dump renders back as `WITH (log_autovacuum_min_duration='N')`.
+	// goopg has no autovacuum, so the value is catalog/dump-only (advisory;
+	// runtime unaffected). M0110-0001 (DU-002 slice 206).
+	LogAutovacuumMinDuration    int
+	LogAutovacuumMinDurationSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2295,6 +2310,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.VacuumTruncateSet {
 				relopts = append(relopts, "vacuum_truncate="+strconv.FormatBool(t.VacuumTruncate))
+			}
+			if t.LogAutovacuumMinDurationSet {
+				relopts = append(relopts, "log_autovacuum_min_duration="+strconv.Itoa(t.LogAutovacuumMinDuration))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

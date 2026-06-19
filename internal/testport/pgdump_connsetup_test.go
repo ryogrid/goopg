@@ -835,6 +835,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optvt: %v", err)
 	}
 
+	// Slice 206: the integer log_autovacuum_min_duration storage parameter
+	// (RELOPT_TYPE_INT, valid -1–INT_MAX, default -1; 0 logs every autovacuum
+	// action), the fourth INT-typed autovacuum-namespace reloption, reusing the
+	// slice-198 integer path (a separate set flag records presence — -1 and 0 are
+	// both valid explicit values). goopg stores
+	// catalog.Table.LogAutovacuumMinDuration; the pg_class virtual view renders
+	// `{log_autovacuum_min_duration=250}`, which pg_dump emits as
+	// `WITH (log_autovacuum_min_duration='250')`. goopg has no autovacuum, so the
+	// value is catalog/dump-only (advisory). `optlamd` carries it on its own table
+	// to keep the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optlamd (id integer PRIMARY KEY) WITH (log_autovacuum_min_duration=250)"); err != nil {
+		t.Fatalf("create table optlamd: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2630,6 +2644,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (vacuum_truncate='false')") {
 			t.Errorf("pg_dump dropped the vacuum_truncate reloption; missing %q\n  full stdout=%q", "WITH (vacuum_truncate='false')", res.Stdout)
+		}
+		// **Slice 206 closed (asserted):** the integer log_autovacuum_min_duration
+		// storage parameter (RELOPT_TYPE_INT, valid -1–INT_MAX, default -1; 0 logs
+		// every autovacuum action) — the fourth INT-typed autovacuum-namespace
+		// reloption — must round-trip via the slice-198 integer path (a separate
+		// set flag records presence since -1 and 0 are both valid explicit values).
+		// catalog.Table.LogAutovacuumMinDuration persists it and the pg_class
+		// virtual view renders `{log_autovacuum_min_duration=250}`, which pg_dump
+		// emits as `WITH (log_autovacuum_min_duration='250')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optlamd (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optlamd\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (log_autovacuum_min_duration='250')") {
+			t.Errorf("pg_dump dropped the log_autovacuum_min_duration reloption; missing %q\n  full stdout=%q", "WITH (log_autovacuum_min_duration='250')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

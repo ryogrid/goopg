@@ -4529,6 +4529,26 @@ object support.
         tests PASS; `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** more
         non-autovacuum reloption families (`log_autovacuum_min_duration` int, `toast.*` namespace); or
         composite types (`CREATE TYPE AS`; larger, `pg_class.reltype` hardcoded 0).
+      - **PROGRESS 2026-06-19 (loop #20):** **DU-002 slice 206 LANDED — integer `log_autovacuum_min_duration`
+        storage parameter round-trips through pg_dump.** The fourth INT-typed autovacuum-namespace reloption,
+        reusing the slice-198 integer path. `log_autovacuum_min_duration` is `RELOPT_TYPE_INT`,
+        `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`, default -1 (= unset/use GUC), range -1–INT_MAX
+        (`reloptions.c:324/1897`; 0 logs every autovacuum action). Executor parses via `strconv.Atoi`,
+        rejecting non-integer / out-of-range (`< -1 || > 2147483647`) → `22023`; separate
+        `LogAutovacuumMinDurationSet` flag records presence since -1 and 0 are valid explicit values. Persist
+        `catalog.Table.LogAutovacuumMinDuration` (int); pg_class virtual view appends
+        `log_autovacuum_min_duration=N` after `vacuum_truncate`; pg_dump renders
+        `WITH (log_autovacuum_min_duration='N')`. Advisory catalog/dump-only; base-table-only. Files:
+        `internal/catalog/catalog.go` (`Table.LogAutovacuumMinDuration`/`…Set` + render),
+        `internal/executor/operators_ddl.go` (extract/parse + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestLogAutovacuumMinDurationSurfacesInPgClassReloptions` + `TestLogAutovacuumMinDurationOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optlamd` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 206). No parser change needed. Gates: gofmt OK;
+        `go build ./internal/...` clean; `go vet catalog/executor` clean; catalog/executor reloption tests
+        PASS; `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** more
+        non-autovacuum reloption families (`toast.*` namespace); or composite types (`CREATE TYPE AS`;
+        larger, `pg_class.reltype` hardcoded 0).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

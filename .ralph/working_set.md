@@ -1,28 +1,30 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 205 (loop #18) — boolean `vacuum_truncate` storage
-parameter round-trips through pg_dump.
+Last landed: DU-002 slice 206 (loop #20) — integer `log_autovacuum_min_duration`
+storage parameter round-trips through pg_dump.
 
-What happened: pure reuse of slice 196's (autovacuum_enabled) boolean path.
-RELOPT_TYPE_BOOL, RELOPT_KIND_HEAP|TOAST, default true (reloptions.c:152/1915).
-Executor parses via parseReloptionBool (PG parse_bool prefix-matching; non-bool →
-22023); separate VacuumTruncateSet flag so explicit `vacuum_truncate=false` round-
-trips; persist catalog.Table.VacuumTruncate (bool); pg_class virtual view appends
-`vacuum_truncate=true|false` after autovacuum_vacuum_insert_threshold; pg_dump
-renders WITH (vacuum_truncate='false'). Advisory catalog/dump-only; base-table-only.
+What happened: found WIP for slice 206 in the tree (working_set said idle) that was
+complete EXCEPT the pg_dump dump-output assertion for optlamd. Added that assertion,
+verified the whole slice, then committed. Pure reuse of slice-198 int path.
+RELOPT_TYPE_INT, RELOPT_KIND_HEAP|TOAST, default -1, range -1–INT_MAX
+(reloptions.c:324/1897); 0 logs every autovacuum action. Executor parses via
+strconv.Atoi (reject non-int/out-of-range → 22023); separate
+LogAutovacuumMinDurationSet flag (−1 and 0 both valid explicit values). Persist
+catalog.Table.LogAutovacuumMinDuration (int); pg_class virtual view appends
+`log_autovacuum_min_duration=N` after vacuum_truncate; pg_dump renders
+`WITH (log_autovacuum_min_duration='N')`. Advisory catalog/dump-only; base-table-only.
 
-Files: internal/catalog/catalog.go (Table.VacuumTruncate/…Set ~L531 + render ~L2284),
-internal/executor/operators_ddl.go (extract/parse ~L1207 + persist ~L1279),
+Files: internal/catalog/catalog.go (Table.LogAutovacuumMinDuration/…Set + render),
+internal/executor/operators_ddl.go (extract/parse + persist),
 operators_fillfactor_reloptions_test.go (NEW
-TestVacuumTruncateSurfacesInPgClassReloptions + …InvalidValueRejected),
-internal/testport/pgdump_connsetup_test.go (optvt fixture ~L823 + assertion ~L2620),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 205), fix_plan.md.
+TestLogAutovacuumMinDurationSurfacesInPgClassReloptions + …OutOfBoundsRejected),
+internal/testport/pgdump_connsetup_test.go (optlamd fixture + assertion),
+docs/design/0110-0001-pg-dump-tap-port.md (Slice 206), fix_plan.md.
 
-Gates: gofmt OK; go build ./internal/... clean; go vet catalog/executor/testport
-clean; catalog+executor reloption tests PASS; TestPort_PgDumpConnectionSetup PASS;
+Gates: gofmt OK; go build ./internal/... clean; go vet catalog/executor clean;
+catalog+executor reloption tests PASS; TestPort_PgDumpConnectionSetup PASS;
 pgbench pre-commit smoke on commit.
 
-Next: more reloption families remain. Candidates: (1) int `log_autovacuum_min_duration`
-(RELOPT_TYPE_INT, range -1–INT_MAX; reuse slice-198 int path). (2) the `toast.*`
-namespace reloptions. (3) composite types (CREATE TYPE AS) — larger,
+Next: more reloption families remain. Candidates: (1) the `toast.*` namespace
+reloptions (toast_tuple_target etc.). (2) composite types (CREATE TYPE AS) — larger,
 pg_class.reltype hardcoded 0 (pg18_user_catalog_rows.go:453).
