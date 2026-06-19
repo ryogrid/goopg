@@ -1273,7 +1273,7 @@ func buildUserPGTypeRowForComposite(ct *catalog.CompositeType) Row {
 		NewBoolDatum(false),                            // typispreferred
 		NewBoolDatum(true),                             // typisdefined
 		NewStringDatum(","),                            // typdelim
-		NewIntDatum(0),                                 // typrelid (implicit pg_class relation — not seeded yet)
+		NewIntDatum(int64(ct.RelOID)),                  // typrelid (implicit pg_class relation, relkind='c')
 		NewIntDatum(0),                                 // typsubscript
 		NewIntDatum(0),                                 // typelem
 		NewIntDatum(int64(ct.ArrayOID)),                // typarray (auto-generated `_name` array type)
@@ -1334,6 +1334,128 @@ func buildUserPGTypeRowForCompositeArray(ct *catalog.CompositeType) Row {
 		NullDatum,                                      // typdefaultbin (NULL)
 		NullDatum,                                      // typdefault (NULL)
 		NullDatum,                                      // typacl (NULL)
+	}
+}
+
+// parseCompositeFieldType splits a composite type field's column-type string (as
+// recorded by the parser in catalog.CompositeField.ColType — tokens joined by a
+// space, e.g. "int", "text", "numeric ( 10 , 2 )") into its base type OID and
+// the PG-canonical pg_attribute.atttypmod. pg_dump's dumpCompositeType renders
+// each field via format_type(atttypid, atttypmod), so a numeric(10,2) field must
+// carry the encoded typmod to round-trip as `numeric(10,2)` rather than bare
+// `numeric`. Unknown / arg-less names yield typmod -1, matching pgAttTypmod.
+// DU-002 slice 243.
+func parseCompositeFieldType(colType string) (uint32, int64) {
+	base := strings.TrimSpace(colType)
+	var args []int64
+	if i := strings.IndexByte(base, '('); i >= 0 {
+		inner := base[i+1:]
+		base = strings.TrimSpace(base[:i])
+		if j := strings.IndexByte(inner, ')'); j >= 0 {
+			inner = inner[:j]
+		}
+		for _, part := range strings.Split(inner, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if n, err := strconv.ParseInt(part, 10, 64); err == nil {
+				args = append(args, n)
+			}
+		}
+	}
+	// Collapse the parser's space-joined multi-word names ("double precision",
+	// "character varying", "timestamp with time zone") to a single-spaced form
+	// TypeNameToOID recognises.
+	base = strings.Join(strings.Fields(base), " ")
+	typOID := catalog.TypeNameToOID(base)
+	return typOID, pgAttTypmod(typOID, args)
+}
+
+// buildUserPGClassRowForComposite builds the 34-column PG18-canonical pg_class
+// row for the implicit relation (relkind='c') backing a composite type. PG
+// creates this relation so the field columns live in pg_attribute keyed by
+// attrelid; pg_dump's getTypes subquery reads its relkind (must be 'c') to route
+// the type to dumpCompositeType, and getTables includes relkind='c' rows but
+// marks them DUMP_COMPONENT_NONE (never emitted as a table). A composite-type
+// relation has no physical storage and no access method, so relam/relfilenode are
+// 0 and relfrozenxid/relminmxid are 0 (InvalidTransactionId — PG only freezes
+// relkinds with storage). DU-002 slice 243.
+func buildUserPGClassRowForComposite(cat catalog.Catalog, ct *catalog.CompositeType) Row {
+	return Row{
+		NewIntDatum(int64(ct.RelOID)),                  // oid
+		NewStringDatum(ct.Name),                        // relname (name)
+		NewIntDatum(int64(catalog.PublicNamespaceOID)), // relnamespace = public
+		NewIntDatum(int64(ct.OID)),                     // reltype = the composite pg_type OID
+		NewIntDatum(0),                                 // reloftype
+		NewIntDatum(bootstrapSuperuserOID),             // relowner
+		NewIntDatum(0),                                 // relam (composite types have no access method)
+		NewIntDatum(0),                                 // relfilenode (no physical storage)
+		NewIntDatum(0),                                 // reltablespace
+		NewIntDatum(0),                                 // relpages
+		NewIntDatum(0),                                 // reltuples
+		NewIntDatum(0),                                 // relallvisible
+		NewIntDatum(0),                                 // relallfrozen
+		NewIntDatum(0),                                 // reltoastrelid
+		NewBoolDatum(false),                            // relhasindex
+		NewBoolDatum(false),                            // relisshared
+		NewStringDatum("p"),                            // relpersistence
+		NewStringDatum("c"),                            // relkind = 'c' (composite type)
+		NewIntDatum(int64(len(ct.Fields))),             // relnatts
+		NewIntDatum(0),                                 // relchecks
+		NewBoolDatum(false),                            // relhasrules
+		NewBoolDatum(false),                            // relhastriggers
+		NewBoolDatum(false),                            // relhassubclass
+		NewBoolDatum(false),                            // relrowsecurity
+		NewBoolDatum(false),                            // relforcerowsecurity
+		NewBoolDatum(true),                             // relispopulated
+		NewStringDatum("n"),                            // relreplident (no storage → REPLICA_IDENTITY_NOTHING)
+		NewBoolDatum(false),                            // relispartition
+		NewIntDatum(0),                                 // relrewrite
+		NewIntDatum(0),                                 // relfrozenxid (InvalidTransactionId — no storage)
+		NewIntDatum(0),                                 // relminmxid
+		NewStringDatum("{}"),                           // relacl
+		NewStringDatum("{}"),                           // reloptions
+		NewStringDatum(""),                             // relpartbound
+	}
+}
+
+// buildUserPGAttributeRowForCompositeField builds a 25-column PG18 pg_attribute
+// row for one field of a composite type's implicit relation (attrelid =
+// ct.RelOID). atttypid/atttypmod come from the field's declared type so pg_dump's
+// dumpCompositeType renders `<field> <format_type(atttypid, atttypmod)>`; the
+// physical attrs (attlen/attbyval/attalign/attstorage/attcollation) follow the
+// resolved type. Composite fields carry no per-column overrides, so the
+// override-bearing columns are their defaults. attnum is 1-based. DU-002 slice 243.
+func buildUserPGAttributeRowForCompositeField(ct *catalog.CompositeType, field catalog.CompositeField, attnum int) Row {
+	typOID, typmod := parseCompositeFieldType(field.ColType)
+	attrs := userTypeAttrsForOID(typOID)
+	return Row{
+		NewIntDatum(int64(ct.RelOID)),            // attrelid
+		NewStringDatum(field.Name),               // attname (name)
+		NewIntDatum(int64(typOID)),               // atttypid
+		NewIntDatum(int64(attrs.TypLen)),         // attlen
+		NewIntDatum(int64(attnum)),               // attnum (1-based)
+		NewIntDatum(typmod),                      // atttypmod
+		NewIntDatum(0),                           // attndims
+		NewBoolDatum(attrs.TypByVal),             // attbyval
+		NewStringDatum(string(attrs.TypAlign)),   // attalign
+		NewStringDatum(string(attrs.TypStorage)), // attstorage
+		NewStringDatum(""),                       // attcompression (default)
+		NewBoolDatum(false),                      // attnotnull
+		NewBoolDatum(false),                      // atthasdef
+		NewBoolDatum(false),                      // atthasmissing
+		NewStringDatum(""),                       // attidentity
+		NewStringDatum(""),                       // attgenerated
+		NewBoolDatum(false),                      // attisdropped
+		NewBoolDatum(true),                       // attislocal
+		NewIntDatum(0),                           // attinhcount
+		NewIntDatum(int64(attrs.TypCollation)),   // attcollation (type default)
+		NullDatum,                                // attacl
+		NullDatum,                                // attoptions
+		NullDatum,                                // attfdwoptions
+		NullDatum,                                // attmissingval
+		NullDatum,                                // attstattarget
 	}
 }
 

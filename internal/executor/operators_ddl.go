@@ -8076,13 +8076,15 @@ func syncEnumTypeToCatalogHeap(ctx *Context, et *catalog.EnumType) {
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
 }
 
-// syncCompositeTypeToCatalogHeap writes the pg_type rows for a composite type
-// (`CREATE TYPE x AS (...)`): the composite type itself (typtype='c') and its
-// auto-generated `_name` array type (typtype='b', typcategory='A'). Mirrors
-// syncEnumTypeToCatalogHeap so pg_dump's getTypes and catalog queries discover
-// the type. The implicit pg_class relation (relkind='c') that carries the field
-// columns in pg_attribute is a follow-up slice; typrelid is therefore left 0
-// for now. DU-002 slice 242.
+// syncCompositeTypeToCatalogHeap writes the catalog rows for a composite type
+// (`CREATE TYPE x AS (...)`): the two pg_type rows (the type itself, typtype='c',
+// and its auto-generated `_name` array type, typtype='b'/typcategory='A'), the
+// implicit pg_class relation (relkind='c', oid=ct.RelOID, reltype=ct.OID), and
+// one pg_attribute row per field keyed by attrelid=ct.RelOID. pg_type.typrelid
+// points at the relation so pg_dump's dumpCompositeType walks
+// typrelid → pg_class → pg_attribute to re-emit the field list. Mirrors
+// syncEnumTypeToCatalogHeap (pg_type) and syncTableToCatalogHeap (pg_class /
+// pg_attribute + index entries). DU-002 slice 242 (pg_type), slice 243 (relation).
 func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	if ct == nil || !catalogHeapSyncAvailable(ctx) {
 		return
@@ -8098,7 +8100,52 @@ func syncCompositeTypeToCatalogHeap(ctx *Context, ct *catalog.CompositeType) {
 	if _, err := writeHeapRowCanonical(ctx, typeRel, pgTypeColumnsPG18(), buildUserPGTypeRowForCompositeArray(ct)); err != nil {
 		return
 	}
+
+	// Seed the implicit pg_class relation (relkind='c') and one pg_attribute row
+	// per field so pg_dump's dumpCompositeType can walk
+	// pg_type.typrelid → pg_class → pg_attribute to recover the field list and
+	// re-emit `CREATE TYPE x AS (...)`. Index entries mirror syncTableToCatalogHeap
+	// so the rows are reachable by OID / relname-nsp lookups too. DU-002 slice 243.
+	classRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.RelationRelationId,
+		Fork:   storage.MainFork,
+	}
+	classTID, err := writeHeapRowCanonical(ctx, classRel, pgClassColumnsPG18(), buildUserPGClassRowForComposite(ctx.Catalog, ct))
+	if err != nil {
+		return
+	}
+	if err := insertPgClassOidIndexEntry(ctx, ct.RelOID, classTID); err != nil {
+		return
+	}
+	if err := insertPgClassRelnameNspIndexEntry(ctx, ct.Name, catalog.PublicNamespaceOID, classTID); err != nil {
+		return
+	}
+
+	attrRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.AttributeRelationId,
+		Fork:   storage.MainFork,
+	}
+	for i, field := range ct.Fields {
+		attnum := i + 1 // 1-based
+		attrTID, err := writeHeapRowCanonical(ctx, attrRel, pgAttributeColumnsPG18(), buildUserPGAttributeRowForCompositeField(ct, field, attnum))
+		if err != nil {
+			return
+		}
+		if err := insertPgAttributeRelidAttnumIndexEntry(ctx, ct.RelOID, int16(attnum), attrTID); err != nil {
+			return
+		}
+	}
+
+	// pg_class / pg_attribute are nailed catalogs; flag the txn so the commit
+	// hook refreshes pg_internal.init on an attaching PG18 standby.
+	if ctx.TxnMgr != nil {
+		ctx.TxnMgr.SetRelcacheInvalPending()
+	}
 	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.TypeRelationId)
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.RelationRelationId)
+	_ = mirrorCatalogRelToPostgresDB(ctx, catalog.AttributeRelationId)
 }
 
 // syncDomainTypeToCatalogHeap writes a single pg_type row (typtype='d') for a
@@ -10347,7 +10394,13 @@ func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {
 			if o.ctx.MaterializeWriterXID() == nil {
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
 				deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+				// Stamp xmax on the implicit pg_class relation + its pg_attribute
+				// field rows so the dropped composite type leaves no orphan rows
+				// for pg_dump's getTypes/dumpCompositeType. DU-002 slice 243.
+				deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
 				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
+				_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
 			}
 		}
 		compErr := cat.DropCompositeType(n)

@@ -7016,6 +7016,45 @@ entries, then add `CREATE TYPE … AS (…)` to the pg_dump fixture and assert t
 has `PendingCreatedEnums`) is also deferred — current composite-type in-memory registration is likewise not
 rolled back, so the heap rows stay consistent with existing semantics.
 
+### Slice 243 — composite type round-trip (`CREATE TYPE x AS (...)`, the `typrelid → pg_class → pg_attribute` chain)
+
+Closes the composite-type frontier opened by slice 242. `pg_dump`'s `dumpCompositeType` recovers a
+composite type's field list by walking `pg_type.typrelid → pg_class (relkind='c') → pg_attribute`
+(query `SELECT a.attname, format_type(a.atttypid, a.atttypmod), … FROM pg_type ct JOIN pg_attribute a ON
+a.attrelid = ct.typrelid WHERE ct.oid = $1 ORDER BY a.attnum`). Crucially, `getTypes` first runs
+`(SELECT relkind FROM pg_class WHERE oid = typrelid)` and `selectDumpableType` **drops** the type unless
+that relkind is `'c'` (`RELKIND_COMPOSITE_TYPE`) — a non-`'c'` relkind is interpreted as a table rowtype
+and skipped. Slice 242 left `typrelid=0`, so the chain was unwalkable. This slice synthesizes it:
+
+- **catalog** (`catalog.go`): `CompositeType` gains `RelOID`; `RegisterCompositeTypeWithFields` now
+  allocates **three** OIDs (type, `_name` array, relation) once per type. The relation surfaces as a
+  `relkind='c'` row in the **virtual** `pg_class` builder (one per `compositeTypes` entry,
+  `reltype`=type OID, `relnatts`=#fields, `relam=0`/`relfilenode=0` — no storage). This is the load-bearing
+  fix: goopg serves its own `pg_class` queries from the virtual catalog, not the heap, so the heap row
+  written below is invisible to goopg's own `pg_dump` connection.
+- **Executor** (`pg18_user_catalog_rows.go`): `buildUserPGTypeRowForComposite` sets `typrelid=ct.RelOID`;
+  new `buildUserPGClassRowForComposite` (34-col, relkind='c') and
+  `buildUserPGAttributeRowForCompositeField` (25-col, `atttypid`/`atttypmod` from
+  `parseCompositeFieldType`, which splits the field's `ColType` into base name + typmod args). The
+  `pg_attribute` rows ARE heap-backed and are what the `dumpCompositeType` join reads.
+- **Executor** (`operators_ddl.go`): `syncCompositeTypeToCatalogHeap` additionally writes the `pg_class`
+  row + `pg_attribute` field rows (+ OID/relname-nsp/relid-attnum index entries), mirrors `pg_class` /
+  `pg_attribute` to the `postgres` DB, and flags `SetRelcacheInvalPending` — mirroring
+  `syncTableToCatalogHeap` (for PG-standby parity; goopg's own reads use the virtual `pg_class`).
+  `execDropType` stamps xmax on the `pg_class` + `pg_attribute` rows via `deleteCatalogRowsForOID`.
+
+Verified end-to-end against a live goopg server: `CREATE TYPE public.addr AS (street text, zip int)`
+dumps as `CREATE TYPE public.addr AS (\n\tstreet text,\n\tzip integer\n);`, and `DROP TYPE` removes the
+virtual `pg_class` row + `pg_type` rows cleanly. The pg_dump fixture (`pgdump_connsetup_test.go`) now
+carries `addr` and asserts the round-trip; unit test `TestUserPGClassAndAttributeForComposite` pins the
+relation/attribute row shapes (incl. a `numeric(10,2)` field's typmod). The `_addr` array type is
+suppressed by `getTypes`' isarray subquery, like `_mood`.
+
+**Still deferred:** composite fields whose type is itself a user-defined type (enum/domain/composite) —
+`parseCompositeFieldType` resolves only built-ins via `TypeNameToOID` (a non-built-in field folds to
+`text`); ROLLBACK-undo of composite catalog rows (no `PendingCreatedComposites`, matching the unchanged
+in-memory registration); `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

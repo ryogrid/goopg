@@ -787,12 +787,12 @@ func TestUserPGTypeRowForComposite(t *testing.T) {
 		{Name: "street", ColType: "text"},
 		{Name: "zip", ColType: "int"},
 	})
-	if ct == nil || ct.OID == 0 || ct.ArrayOID != ct.OID+1 {
+	if ct == nil || ct.OID == 0 || ct.ArrayOID != ct.OID+1 || ct.RelOID != ct.OID+2 {
 		t.Fatalf("RegisterCompositeTypeWithFields OID alloc: %+v", ct)
 	}
 	// Re-registration (e.g. CREATE OR REPLACE-style re-run) keeps OIDs stable.
 	ct2 := cat.RegisterCompositeTypeWithFields("addr", ct.Fields)
-	if ct2.OID != ct.OID || ct2.ArrayOID != ct.ArrayOID {
+	if ct2.OID != ct.OID || ct2.ArrayOID != ct.ArrayOID || ct2.RelOID != ct.RelOID {
 		t.Fatalf("re-register changed OIDs: %+v vs %+v", ct2, ct)
 	}
 	// LookupCompositeType is case-insensitive.
@@ -822,8 +822,8 @@ func TestUserPGTypeRowForComposite(t *testing.T) {
 	if got := uint32(row[typarrayIdx].Int); got != ct.ArrayOID {
 		t.Errorf("typarray=%d want %d", got, ct.ArrayOID)
 	}
-	if got := row[typrelidIdx].Int; got != 0 {
-		t.Errorf("typrelid=%d want 0 (implicit relation not seeded yet)", got)
+	if got := uint32(row[typrelidIdx].Int); got != ct.RelOID {
+		t.Errorf("typrelid=%d want %d (implicit pg_class relation)", got, ct.RelOID)
 	}
 	if got := row[typalignIdx].StringValue(); got != "d" {
 		t.Errorf("typalign=%q want d", got)
@@ -848,6 +848,98 @@ func TestUserPGTypeRowForComposite(t *testing.T) {
 	}
 	if got := uint32(arr[typelemIdx].Int); got != ct.OID {
 		t.Errorf("array typelem=%d want %d (composite element)", got, ct.OID)
+	}
+}
+
+// TestUserPGClassAndAttributeForComposite pins the implicit pg_class relation
+// (relkind='c', reltype=composite OID, oid=ct.RelOID, relnatts=#fields) and the
+// per-field pg_attribute rows that pg_dump's dumpCompositeType walks via
+// pg_type.typrelid → pg_class → pg_attribute. DU-002 slice 243.
+func TestUserPGClassAndAttributeForComposite(t *testing.T) {
+	const (
+		// pg_class column indices (pgClassColumnsPG18 layout).
+		relOidIdx       = 0
+		relnameIdx      = 1
+		reltypeIdx      = 3
+		relamIdx        = 6
+		relfilenodeIdx  = 7
+		relkindIdx      = 17
+		relnattsIdx     = 18
+		relfrozenxidIdx = 29
+		// pg_attribute column indices (pgAttributeColumnsPG18 layout).
+		attrelidIdx  = 0
+		attnameIdx   = 1
+		atttypidIdx  = 2
+		attnumIdx    = 4
+		atttypmodIdx = 5
+	)
+	cat := catalog.NewInMemory()
+	ct := cat.RegisterCompositeTypeWithFields("addr", []catalog.CompositeField{
+		{Name: "street", ColType: "text"},
+		{Name: "zip", ColType: "int"},
+	})
+
+	cls := buildUserPGClassRowForComposite(cat, ct)
+	if got := uint32(cls[relOidIdx].Int); got != ct.RelOID {
+		t.Errorf("relation oid=%d want %d", got, ct.RelOID)
+	}
+	if got := cls[relnameIdx].StringValue(); got != "addr" {
+		t.Errorf("relname=%q want addr", got)
+	}
+	if got := uint32(cls[reltypeIdx].Int); got != ct.OID {
+		t.Errorf("reltype=%d want %d (composite type OID)", got, ct.OID)
+	}
+	if got := cls[relkindIdx].StringValue(); got != "c" {
+		t.Errorf("relkind=%q want c (composite)", got)
+	}
+	if got := cls[relnattsIdx].Int; got != 2 {
+		t.Errorf("relnatts=%d want 2", got)
+	}
+	if got := cls[relamIdx].Int; got != 0 {
+		t.Errorf("relam=%d want 0 (no access method)", got)
+	}
+	if got := cls[relfilenodeIdx].Int; got != 0 {
+		t.Errorf("relfilenode=%d want 0 (no storage)", got)
+	}
+	if got := cls[relfrozenxidIdx].Int; got != 0 {
+		t.Errorf("relfrozenxid=%d want 0 (no storage)", got)
+	}
+
+	// Field 1: street text → atttypid=text, atttypmod=-1, attnum=1.
+	a0 := buildUserPGAttributeRowForCompositeField(ct, ct.Fields[0], 1)
+	if got := uint32(a0[attrelidIdx].Int); got != ct.RelOID {
+		t.Errorf("field0 attrelid=%d want %d", got, ct.RelOID)
+	}
+	if got := a0[attnameIdx].StringValue(); got != "street" {
+		t.Errorf("field0 attname=%q want street", got)
+	}
+	if got := uint32(a0[atttypidIdx].Int); got != catalog.OIDText {
+		t.Errorf("field0 atttypid=%d want %d (text)", got, catalog.OIDText)
+	}
+	if got := a0[attnumIdx].Int; got != 1 {
+		t.Errorf("field0 attnum=%d want 1", got)
+	}
+	// Field 2: zip int → atttypid=int4, attnum=2.
+	a1 := buildUserPGAttributeRowForCompositeField(ct, ct.Fields[1], 2)
+	if got := uint32(a1[atttypidIdx].Int); got != catalog.OIDInt4 {
+		t.Errorf("field1 atttypid=%d want %d (int4)", got, catalog.OIDInt4)
+	}
+	if got := a1[attnumIdx].Int; got != 2 {
+		t.Errorf("field1 attnum=%d want 2", got)
+	}
+
+	// A typmod-bearing field round-trips its modifier: numeric(10,2) →
+	// atttypmod = ((10<<16)|2)+VARHDRSZ.
+	ctn := cat.RegisterCompositeTypeWithFields("money_row", []catalog.CompositeField{
+		{Name: "amt", ColType: "numeric ( 10 , 2 )"},
+	})
+	an := buildUserPGAttributeRowForCompositeField(ctn, ctn.Fields[0], 1)
+	if got := uint32(an[atttypidIdx].Int); got != catalog.OIDNumeric {
+		t.Errorf("numeric field atttypid=%d want %d", got, catalog.OIDNumeric)
+	}
+	wantMod := int64((10<<16|2)&0xffffffff) + 4
+	if got := an[atttypmodIdx].Int; got != wantMod {
+		t.Errorf("numeric(10,2) atttypmod=%d want %d", got, wantMod)
 	}
 }
 

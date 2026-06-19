@@ -1495,6 +1495,7 @@ type CompositeType struct {
 	Name     string           // lower-case type name
 	OID      uint32           // pg_type.oid of the composite type
 	ArrayOID uint32           // OID of the auto-generated `_name` array type
+	RelOID   uint32           // pg_class.oid of the implicit relation (relkind='c')
 	Fields   []CompositeField // ordered field list
 }
 
@@ -2848,6 +2849,60 @@ func (c *InMemory) registerSystemTables() {
 				"",                          // 31: relacl (NULL)
 				idxReloptions,               // 32: reloptions ({fillfactor=N} or NULL)
 				"",                          // 33: relpartbound
+			})
+		}
+		// Emit the implicit relation (relkind='c') backing each composite type
+		// (`CREATE TYPE x AS (...)`). pg_dump's getTypes reads
+		// `(SELECT relkind FROM pg_class WHERE oid = typrelid)`, and
+		// selectDumpableType keeps the type only when that relkind is 'c'
+		// (RELKIND_COMPOSITE_TYPE) — otherwise the type is treated as a table
+		// rowtype and skipped. The companion pg_attribute field rows are
+		// heap-backed (written by syncCompositeTypeToCatalogHeap); pg_class is
+		// virtual, so the relation must be surfaced here too. A composite-type
+		// relation has no storage and no access method (relam=0, relfilenode=0).
+		// DU-002 slice 243.
+		ctKeys := make([]string, 0, len(c.compositeTypes))
+		for k := range c.compositeTypes {
+			ctKeys = append(ctKeys, k)
+		}
+		sort.Strings(ctKeys)
+		for _, k := range ctKeys {
+			ct := c.compositeTypes[k]
+			out = append(out, []string{
+				strconv.Itoa(int(ct.RelOID)), // 0:  oid
+				ct.Name,                      // 1:  relname
+				"2200",                       // 2:  relnamespace (public)
+				strconv.Itoa(int(ct.OID)),    // 3:  reltype (the composite pg_type OID)
+				"0",                          // 4:  reloftype
+				"10",                         // 5:  relowner
+				"0",                          // 6:  relam (no access method)
+				"0",                          // 7:  relfilenode (no storage)
+				"0",                          // 8:  reltablespace
+				"0",                          // 9:  relpages
+				"0",                          // 10: reltuples
+				"0",                          // 11: relallvisible
+				"0",                          // 12: relallfrozen
+				"0",                          // 13: reltoastrelid
+				"f",                          // 14: relhasindex
+				"f",                          // 15: relisshared
+				"p",                          // 16: relpersistence
+				"c",                          // 17: relkind (composite type)
+				strconv.Itoa(len(ct.Fields)), // 18: relnatts
+				"0",                          // 19: relchecks
+				"f",                          // 20: relhasrules
+				"f",                          // 21: relhastriggers
+				"f",                          // 22: relhassubclass
+				"f",                          // 23: relrowsecurity
+				"f",                          // 24: relforcerowsecurity
+				"t",                          // 25: relispopulated
+				"n",                          // 26: relreplident (no storage)
+				"f",                          // 27: relispartition
+				"0",                          // 28: relrewrite
+				"0",                          // 29: relfrozenxid (InvalidTransactionId)
+				"0",                          // 30: relminmxid
+				"",                           // 31: relacl (NULL)
+				"",                           // 32: reloptions (NULL)
+				"",                           // 33: relpartbound
 			})
 		}
 		// Include pg_class itself (OID 1259, relkind='r', pg_catalog namespace OID 11).
@@ -7408,13 +7463,16 @@ func (c *InMemory) RegisterCompositeTypeWithFields(name string, fields []Composi
 	defer c.mu.Unlock()
 	c.compositeTypeNames[k] = true
 	c.compositeTypeFields[k] = fields
-	// Allocate two OIDs (the type itself, then its auto-generated `_name` array
-	// type) once per type, mirroring RegisterEnum so re-registration keeps the
-	// OIDs stable. DU-002 slice 242.
+	// Allocate three OIDs (the type itself, its auto-generated `_name` array
+	// type, then the implicit pg_class relation of relkind='c' that carries the
+	// field columns) once per type, mirroring RegisterEnum so re-registration
+	// keeps the OIDs stable. The relation OID is what pg_type.typrelid points at
+	// and what pg_dump's dumpCompositeType walks to find the field list via
+	// pg_attribute. DU-002 slice 242 (type+array), slice 243 (relation).
 	ct, ok := c.compositeTypes[k]
 	if !ok {
-		ct = &CompositeType{Name: k, OID: c.nextOID, ArrayOID: c.nextOID + 1}
-		c.nextOID += 2
+		ct = &CompositeType{Name: k, OID: c.nextOID, ArrayOID: c.nextOID + 1, RelOID: c.nextOID + 2}
+		c.nextOID += 3
 		c.compositeTypes[k] = ct
 	}
 	ct.Fields = fields

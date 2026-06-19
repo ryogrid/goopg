@@ -5294,6 +5294,32 @@ object support.
         THEN add `CREATE TYPE … AS (…)` to the pg_dump fixture and assert the round-tripped
         `CREATE TYPE public.x AS (a integer, b text);`. Also deferred: ROLLBACK-undo for composite heap rows
         (consistent with existing un-rolled-back in-memory composite registration).
+      - **PROGRESS 2026-06-19 (loop #9):** **DU-002 slice 243 LANDED — composite type round-trips through
+        `pg_dump` (`CREATE TYPE x AS (...)`, the `typrelid → pg_class → pg_attribute` chain).** Slice 242
+        made the type visible in `pg_type` but left `typrelid=0`, so `dumpCompositeType` found no fields AND
+        `getTypes`/`selectDumpableType` SKIPPED the type (a `typrelid!=0` type is dropped unless
+        `(SELECT relkind FROM pg_class WHERE oid=typrelid)`=='c'). **Root cause discovered via live server:**
+        goopg serves its OWN `pg_class` queries from the VIRTUAL catalog builder, not the heap — so a heap
+        `pg_class` write is invisible to goopg's own pg_dump connection (whereas `pg_attribute` IS
+        heap-backed, so its field rows show up). Fix: (1) `catalog.go` — `CompositeType` gains `RelOID`,
+        `RegisterCompositeTypeWithFields` allocates THREE OIDs (type/array/relation), and the virtual
+        `pg_class` builder emits a `relkind='c'` row per `compositeTypes` entry (reltype=type OID,
+        relnatts=#fields, relam=0/relfilenode=0); (2) `pg18_user_catalog_rows.go` —
+        `buildUserPGTypeRowForComposite` sets `typrelid=ct.RelOID`, new `buildUserPGClassRowForComposite` +
+        `buildUserPGAttributeRowForCompositeField` (+ `parseCompositeFieldType` for atttypid/atttypmod);
+        (3) `operators_ddl.go` — `syncCompositeTypeToCatalogHeap` also writes the heap `pg_class`/`pg_attribute`
+        rows + index entries + mirrors (PG-standby parity), `execDropType` stamps them via
+        `deleteCatalogRowsForOID`. Files: `internal/catalog/catalog.go`, `internal/executor/operators_ddl.go`,
+        `internal/executor/pg18_user_catalog_rows.go`,
+        `internal/executor/pg18_user_catalog_rows_test.go` (+`TestUserPGClassAndAttributeForComposite`),
+        `internal/testport/pgdump_connsetup_test.go` (addr fixture + round-trip assert),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 243). Gates: gofmt + `go build ./internal/...`
+        clean; catalog + executor suites PASS; `TestPort_PgDumpConnectionSetup` + `TestPort_PgDump001Basic`
+        PASS (cgroup wrapper, -count=1); verified live: `CREATE TYPE public.addr AS (street text, zip int)`
+        dumps as `CREATE TYPE public.addr AS (\n\tstreet text,\n\tzip integer\n);`, DROP TYPE cleans up;
+        pgbench pre-commit smoke on commit. **Next (slice 244+):** composite fields of user-defined type
+        (enum/domain/nested composite) — `parseCompositeFieldType` resolves only built-ins; ROLLBACK-undo
+        (`PendingCreatedComposites`); `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE`.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

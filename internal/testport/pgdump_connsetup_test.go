@@ -2022,6 +2022,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table moody: %v", err)
 	}
 
+	// Slice 243: a stand-alone composite type (`CREATE TYPE x AS (...)`) must
+	// round-trip. Slice 242 made the type visible to pg_dump's getTypes via the
+	// pg_type row (typtype='c'), but left typrelid=0 so dumpCompositeType found no
+	// fields. This slice seeds the implicit pg_class relation (relkind='c') +
+	// one pg_attribute row per field, sets typrelid → that relation, so
+	// dumpCompositeType walks typrelid → pg_class → pg_attribute and re-emits the
+	// field list via format_type(atttypid, atttypmod). `addr` carries scalar
+	// fields whose declared spellings (`int`, `text`) round-trip to their
+	// canonical names (`integer`, `text`).
+	if err := runSQLSimple(t, c, "CREATE TYPE public.addr AS (street text, zip int)"); err != nil {
+		t.Fatalf("create type addr: %v", err)
+	}
+
 	// Slice 90: a user-defined DOMAIN over a base type and a column that uses it
 	// must survive the dump. This is the second OBJECT type (after the enum in
 	// slices 88-89). pg_dump's getTypes collects the domain from pg_type
@@ -5102,6 +5115,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// typarray points back at it) and suppresses it. Slice 89.
 		if strings.Contains(res.Stdout, "CREATE TYPE public._mood") {
 			t.Errorf("pg_dump emitted the auto-generated enum array type as a separate CREATE TYPE (slice-89 isarray suppression regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 243 (asserted):** a stand-alone composite type round-trips. PG's
+		// dumpCompositeType walks pg_type.typrelid → pg_class (relkind='c') →
+		// pg_attribute, rendering each field as `\n\t<name> <format_type>`. The
+		// declared `int`/`text` field types resolve to their canonical
+		// `integer`/`text` spellings via format_type(atttypid, atttypmod).
+		compositeDefs := []string{
+			"CREATE TYPE public.addr AS (",
+			"\tstreet text,",
+			"\tzip integer",
+		}
+		for _, sub := range compositeDefs {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/mangled the composite TYPE round-trip; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// The auto-generated `_addr` array type must NOT dump as its own CREATE
+		// TYPE (the isarray subquery suppresses it, like `_mood`).
+		if strings.Contains(res.Stdout, "CREATE TYPE public._addr") {
+			t.Errorf("pg_dump emitted the auto-generated composite array type as a separate CREATE TYPE\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 90 (asserted):** a DOMAIN and a column using it must round-trip.
 		// The CREATE DOMAIN statement must carry NO spurious `DEFAULT ` clause
