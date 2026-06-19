@@ -5908,6 +5908,30 @@ table reloptions (`autovacuum_vacuum_scale_factor`, `autovacuum_analyze_scale_fa
 the next reloption candidates are int autovacuum knobs (`autovacuum_analyze_threshold`,
 `autovacuum_vacuum_insert_threshold`) on the slice-198 Set-flag int path.
 
+### Slice 203 — second INTEGER autovacuum reloption (`autovacuum_analyze_threshold`) round-trip
+
+Resumes the slice-198 integer family on the autovacuum namespace.
+`autovacuum_analyze_threshold` is `RELOPT_TYPE_INT` with range **0–INT_MAX and a
+default of -1** (`reloptions.c`: `{"autovacuum_analyze_threshold", … -1, 0,
+INT_MAX}`), identical in shape to `autovacuum_vacuum_threshold` (slice 198), so it
+reuses that path verbatim: the executor parses via `strconv.Atoi` with a
+`0 ≤ N ≤ 2147483647` bounds-check (overflow / non-integer → `22023`; negatives are
+a parser syntax error), and a separate `AutovacuumAnalyzeThresholdSet` flag (not a
+zero check) records presence so explicit `0` round-trips. It persists
+`catalog.Table.AutovacuumAnalyzeThreshold` (an `int`); the pg_class virtual view
+appends `autovacuum_analyze_threshold=N` after `autovacuum_vacuum_cost_delay`;
+pg_dump renders `WITH (autovacuum_analyze_threshold='50')`. Advisory
+catalog/dump-only, base-table-only — same as the sibling reloption slices.
+
+Engine guards: `TestAutovacuumAnalyzeThresholdSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,autovacuum_analyze_threshold=50}`; explicit-zero
+`{autovacuum_analyze_threshold=0}`; plain table → no reloptions) and
+`TestAutovacuumAnalyzeThresholdOutOfBoundsRejected` (`9999999999`/`nope` → 22023).
+The pg_dump fixture adds `optaat (… WITH (autovacuum_analyze_threshold=50))` on its
+own table; the assertion confirms the dump carries
+`WITH (autovacuum_analyze_threshold='50')`. The remaining int autovacuum candidate
+is `autovacuum_vacuum_insert_threshold` on the same Set-flag int path.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

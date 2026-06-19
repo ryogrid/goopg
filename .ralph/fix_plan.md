@@ -4468,6 +4468,27 @@ object support.
         REAL reloptions now round-trip; remaining candidates are int autovacuum knobs
         (`autovacuum_analyze_threshold`/`autovacuum_vacuum_insert_threshold`, slice-198 int path); or
         composite types (`CREATE TYPE AS`; larger).
+      - **PROGRESS 2026-06-19 (loop #16):** **DU-002 slice 203 LANDED — second INTEGER autovacuum
+        storage parameter (`autovacuum_analyze_threshold`) round-trips through pg_dump.** Resumes the
+        slice-198 integer family: `autovacuum_analyze_threshold` is `RELOPT_TYPE_INT`, range 0–INT_MAX,
+        default -1 (`reloptions.c:254/1881`), identical in shape to `autovacuum_vacuum_threshold`, so it
+        reuses that path verbatim — executor does `strconv.Atoi` + `0 ≤ N ≤ 2147483647` bounds-check
+        (overflow/non-integer → `22023`; negatives are a parser syntax error), separate
+        `AutovacuumAnalyzeThresholdSet` flag so explicit `0` round-trips. Persist
+        `catalog.Table.AutovacuumAnalyzeThreshold` (int); pg_class virtual view appends
+        `autovacuum_analyze_threshold=N` after `autovacuum_vacuum_cost_delay`; pg_dump renders
+        `WITH (autovacuum_analyze_threshold='50')`. Advisory catalog/dump-only; base-table-only. Files:
+        `internal/catalog/catalog.go` (`Table.AutovacuumAnalyzeThreshold`/`…Set` + render),
+        `internal/executor/operators_ddl.go` (extract/parse/bounds + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestAutovacuumAnalyzeThresholdSurfacesInPgClassReloptions` +
+        `TestAutovacuumAnalyzeThresholdOutOfBoundsRejected`), `internal/testport/pgdump_connsetup_test.go`
+        (NEW `optaat` fixture + assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 203). No
+        parser change needed. Gates: gofmt OK; `go build ./internal/...` clean; `go vet
+        catalog/executor/testport` clean; catalog/executor reloption tests PASS;
+        `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** remaining int
+        autovacuum candidate is `autovacuum_vacuum_insert_threshold` (same Set-flag int path); or composite
+        types (`CREATE TYPE AS`; larger).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

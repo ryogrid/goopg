@@ -793,6 +793,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optavcd: %v", err)
 	}
 
+	// Slice 203: the second INTEGER autovacuum-namespace storage parameter
+	// (`autovacuum_analyze_threshold`, valid 0–INT_MAX), reusing the slice-198
+	// integer path (separate set flag — not a zero check — records presence, the
+	// parallel_workers pattern). goopg validated the lowercase WITH key but never
+	// extracted/persisted it, so it vanished from the dump. The fix stores
+	// catalog.Table.AutovacuumAnalyzeThreshold; the pg_class virtual view renders
+	// `{autovacuum_analyze_threshold=50}`, which pg_dump emits as
+	// `WITH (autovacuum_analyze_threshold='50')`. goopg has no autovacuum, so the
+	// value is catalog/dump-only (advisory). `optaat` carries it on its own table
+	// to keep the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optaat (id integer PRIMARY KEY) WITH (autovacuum_analyze_threshold=50)"); err != nil {
+		t.Fatalf("create table optaat: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2546,6 +2560,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (autovacuum_vacuum_cost_delay='2.5')") {
 			t.Errorf("pg_dump dropped the autovacuum_vacuum_cost_delay reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_vacuum_cost_delay='2.5')", res.Stdout)
+		}
+		// **Slice 203 closed (asserted):** the second INTEGER autovacuum-namespace
+		// storage parameter (autovacuum_analyze_threshold) must round-trip via the
+		// "0-is-a-real-value" integer path (separate set flag, the parallel_workers
+		// pattern). goopg validated the lowercase WITH key but never
+		// extracted/persisted it, so it vanished from the dump.
+		// catalog.Table.AutovacuumAnalyzeThreshold now persists it and the pg_class
+		// virtual view renders `{autovacuum_analyze_threshold=50}`, which pg_dump
+		// emits as `WITH (autovacuum_analyze_threshold='50')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optaat (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optaat\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (autovacuum_analyze_threshold='50')") {
+			t.Errorf("pg_dump dropped the autovacuum_analyze_threshold reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_analyze_threshold='50')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

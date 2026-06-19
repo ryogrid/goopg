@@ -1155,6 +1155,30 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		autovacuumVacuumCostDelay = avcd
 		autovacuumVacuumCostDelaySet = true
 	}
+	// Extract and bounds-check the autovacuum_analyze_threshold storage parameter —
+	// the second INT-typed autovacuum reloption goopg round-trips, reusing the
+	// slice-198 integer path. PG's reloption type is RELOPT_TYPE_INT with range
+	// 0–INT_MAX and a default of -1 (= unset / use the GUC); since 0 is a valid
+	// explicit value, a separate `set` flag records whether the option was present
+	// (the parallel_workers pattern). goopg has no autovacuum, so the value is
+	// purely catalog/dump state that round-trips through pg_class.reloptions /
+	// pg_dump's `WITH (autovacuum_analyze_threshold='N')`. M0110-0001 (DU-002 slice 203).
+	autovacuumAnalyzeThreshold := 0
+	autovacuumAnalyzeThresholdSet := false
+	if v, ok := s.With["autovacuum_analyze_threshold"]; ok {
+		aat, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_analyze_threshold\": %s", v)}
+		}
+		if aat < 0 || aat > 2147483647 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_analyze_threshold\"", aat),
+				Detail:  "Valid values are between \"0\" and \"2147483647\"."}
+		}
+		autovacuumAnalyzeThreshold = aat
+		autovacuumAnalyzeThresholdSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1222,6 +1246,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.AutovacuumVacuumInsertScaleFactorSet = autovacuumVacuumInsertScaleFactorSet
 	tbl.AutovacuumVacuumCostDelay = autovacuumVacuumCostDelay
 	tbl.AutovacuumVacuumCostDelaySet = autovacuumVacuumCostDelaySet
+	tbl.AutovacuumAnalyzeThreshold = autovacuumAnalyzeThreshold
+	tbl.AutovacuumAnalyzeThresholdSet = autovacuumAnalyzeThresholdSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

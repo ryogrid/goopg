@@ -498,6 +498,21 @@ type Table struct {
 	// runtime unaffected). M0110-0001 (DU-002 slice 202).
 	AutovacuumVacuumCostDelay    float64
 	AutovacuumVacuumCostDelaySet bool
+
+	// AutovacuumAnalyzeThreshold stores the table's
+	// `WITH (autovacuum_analyze_threshold=N)` storage parameter — the second
+	// INT-typed autovacuum reloption goopg round-trips, reusing the slice-198
+	// integer path. PG's reloption type is RELOPT_TYPE_INT with range 0–INT_MAX
+	// and a default of -1 (= unset / use the GUC); because 0 is a valid explicit
+	// value, AutovacuumAnalyzeThresholdSet — not a zero check — guards whether the
+	// option was specified (the parallel_workers pattern). When set,
+	// pg_class.reloptions gains the text[] element
+	// `autovacuum_analyze_threshold=N`, which pg_dump renders back as
+	// `WITH (autovacuum_analyze_threshold='N')`. goopg has no autovacuum, so the
+	// value is catalog/dump-only (advisory; runtime unaffected). M0110-0001
+	// (DU-002 slice 203).
+	AutovacuumAnalyzeThreshold    int
+	AutovacuumAnalyzeThresholdSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2214,7 +2229,9 @@ func (c *InMemory) registerSystemTables() {
 			// integer elements, then autovacuum_vacuum_scale_factor (slice 199),
 			// autovacuum_analyze_scale_factor (slice 200),
 			// autovacuum_vacuum_insert_scale_factor (slice 201) and
-			// autovacuum_vacuum_cost_delay (slice 202) as REAL-typed elements.
+			// autovacuum_vacuum_cost_delay (slice 202) as REAL-typed elements,
+			// then autovacuum_analyze_threshold (slice 203) as a trailing integer
+			// element.
 			var relopts []string
 			if t.Fillfactor != 0 {
 				relopts = append(relopts, "fillfactor="+strconv.Itoa(t.Fillfactor))
@@ -2242,6 +2259,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.AutovacuumVacuumCostDelaySet {
 				relopts = append(relopts, "autovacuum_vacuum_cost_delay="+strconv.FormatFloat(t.AutovacuumVacuumCostDelay, 'g', -1, 64))
+			}
+			if t.AutovacuumAnalyzeThresholdSet {
+				relopts = append(relopts, "autovacuum_analyze_threshold="+strconv.Itoa(t.AutovacuumAnalyzeThreshold))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {
