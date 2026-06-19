@@ -4489,6 +4489,27 @@ object support.
         `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** remaining int
         autovacuum candidate is `autovacuum_vacuum_insert_threshold` (same Set-flag int path); or composite
         types (`CREATE TYPE AS`; larger).
+      - **PROGRESS 2026-06-19 (loop #17):** **DU-002 slice 204 LANDED — third INTEGER autovacuum
+        storage parameter (`autovacuum_vacuum_insert_threshold`) round-trips through pg_dump.** Continues the
+        slice-198 integer family: `autovacuum_vacuum_insert_threshold` is `RELOPT_TYPE_INT`, range -1–INT_MAX,
+        default -2 (`reloptions.c:245/1879`; -1 disables insert vacuums), so it reuses that path verbatim —
+        executor does `strconv.Atoi` + `-1 ≤ N ≤ 2147483647` bounds-check (overflow/non-integer → `22023`; a
+        bare negative is a parser syntax error so the -1 floor is reachable only via a quoted `'-1'` reload),
+        separate `AutovacuumVacuumInsertThresholdSet` flag so explicit `0` round-trips. Persist
+        `catalog.Table.AutovacuumVacuumInsertThreshold` (int); pg_class virtual view appends
+        `autovacuum_vacuum_insert_threshold=N` after `autovacuum_analyze_threshold`; pg_dump renders
+        `WITH (autovacuum_vacuum_insert_threshold='1000')`. Advisory catalog/dump-only; base-table-only. Files:
+        `internal/catalog/catalog.go` (`Table.AutovacuumVacuumInsertThreshold`/`…Set` + render),
+        `internal/executor/operators_ddl.go` (extract/parse/bounds + persist),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestAutovacuumVacuumInsertThresholdSurfacesInPgClassReloptions` +
+        `TestAutovacuumVacuumInsertThresholdOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optavit` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 204). No parser change needed. Gates: gofmt OK;
+        `go build ./internal/...` clean; `go vet catalog/executor/testport` clean; catalog/executor reloption
+        tests PASS; `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** the
+        INT autovacuum-namespace reloptions are now exhausted; remaining storage params are non-autovacuum
+        families (`vacuum_truncate` bool, `log_autovacuum_*`); or composite types (`CREATE TYPE AS`; larger).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

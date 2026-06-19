@@ -5932,6 +5932,32 @@ own table; the assertion confirms the dump carries
 `WITH (autovacuum_analyze_threshold='50')`. The remaining int autovacuum candidate
 is `autovacuum_vacuum_insert_threshold` on the same Set-flag int path.
 
+### Slice 204 — third INTEGER autovacuum reloption (`autovacuum_vacuum_insert_threshold`) round-trip
+
+Continues the slice-198 integer family on the autovacuum namespace.
+`autovacuum_vacuum_insert_threshold` is `RELOPT_TYPE_INT` with range **-1–INT_MAX
+and a default of -2** (`reloptions.c`: `{"autovacuum_vacuum_insert_threshold", …
+-2, -1, INT_MAX}`; `-1` disables insert vacuums). It reuses the slice-198 path: the
+executor parses via `strconv.Atoi` with a `-1 ≤ N ≤ 2147483647` bounds-check
+(overflow / non-integer → `22023`; a bare negative is a parser syntax error, so the
+`-1` floor is only reachable via a quoted `'-1'` reload), and a separate
+`AutovacuumVacuumInsertThresholdSet` flag (not a zero check) records presence so
+explicit `0` round-trips. It persists `catalog.Table.AutovacuumVacuumInsertThreshold`
+(an `int`); the pg_class virtual view appends `autovacuum_vacuum_insert_threshold=N`
+after `autovacuum_analyze_threshold`; pg_dump renders
+`WITH (autovacuum_vacuum_insert_threshold='1000')`. Advisory catalog/dump-only,
+base-table-only — same as the sibling reloption slices.
+
+Engine guards: `TestAutovacuumVacuumInsertThresholdSurfacesInPgClassReloptions`
+(combined `{fillfactor=70,autovacuum_vacuum_insert_threshold=1000}`; explicit-zero
+`{autovacuum_vacuum_insert_threshold=0}`; plain table → no reloptions) and
+`TestAutovacuumVacuumInsertThresholdOutOfBoundsRejected` (`9999999999`/`nope` →
+22023). The pg_dump fixture adds `optavit (… WITH
+(autovacuum_vacuum_insert_threshold=1000))` on its own table; the assertion
+confirms the dump carries `WITH (autovacuum_vacuum_insert_threshold='1000')`. This
+exhausts the INT autovacuum-namespace reloptions; the remaining storage parameters
+are the non-autovacuum families (e.g. `vacuum_truncate` bool, `log_autovacuum_*`).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -895,6 +895,100 @@ func TestAutovacuumAnalyzeThresholdOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+// TestAutovacuumVacuumInsertThresholdSurfacesInPgClassReloptions verifies that a
+// `WITH (autovacuum_vacuum_insert_threshold=N)` storage parameter declared on
+// CREATE TABLE is persisted on the catalog table and surfaced through the
+// pg_class virtual view's reloptions cell. Like the other INT autovacuum
+// reloptions (slices 198/203), 0 is a valid explicit value (PG's reloption
+// default is -2 = unset), so the Set flag — not a zero check — guards presence.
+// Cases pin: a value alongside fillfactor (combined
+// `{fillfactor=70,autovacuum_vacuum_insert_threshold=1000}`), the boundary value
+// 0 (explicitly set), and a plain table (no reloptions). pg_dump renders the
+// array back as `WITH (autovacuum_vacuum_insert_threshold='1000')`. goopg has no
+// autovacuum, so the value is catalog/dump-only. DU-002 slice 204.
+func TestAutovacuumVacuumInsertThresholdSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE av (id integer PRIMARY KEY) WITH (fillfactor=70, autovacuum_vacuum_insert_threshold=1000)`); err != nil {
+		t.Fatalf("CREATE TABLE av: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE avzero (id integer PRIMARY KEY) WITH (autovacuum_vacuum_insert_threshold=0)`); err != nil {
+		t.Fatalf("CREATE TABLE avzero: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE avplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE avplain: %v", err)
+	}
+
+	avTbl, ok := cat.LookupTable(parser.ObjectName{Name: "av"})
+	if !ok {
+		t.Fatal("av table not found")
+	}
+	if avTbl.AutovacuumVacuumInsertThreshold != 1000 || !avTbl.AutovacuumVacuumInsertThresholdSet {
+		t.Errorf("av threshold = %d set=%v, want 1000 set=true", avTbl.AutovacuumVacuumInsertThreshold, avTbl.AutovacuumVacuumInsertThresholdSet)
+	}
+	zeroTbl, ok := cat.LookupTable(parser.ObjectName{Name: "avzero"})
+	if !ok {
+		t.Fatal("avzero table not found")
+	}
+	if zeroTbl.AutovacuumVacuumInsertThreshold != 0 || !zeroTbl.AutovacuumVacuumInsertThresholdSet {
+		t.Errorf("avzero threshold = %d set=%v, want 0 set=true", zeroTbl.AutovacuumVacuumInsertThreshold, zeroTbl.AutovacuumVacuumInsertThresholdSet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "avplain"})
+	if !ok {
+		t.Fatal("avplain table not found")
+	}
+	if plainTbl.AutovacuumVacuumInsertThresholdSet {
+		t.Errorf("avplain set=%v, want false (unset)", plainTbl.AutovacuumVacuumInsertThresholdSet)
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "av" || r[1] == "avzero" || r[1] == "avplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["av"] != "{fillfactor=70,autovacuum_vacuum_insert_threshold=1000}" {
+		t.Errorf("pg_class.reloptions for av = %q, want %q", got["av"], "{fillfactor=70,autovacuum_vacuum_insert_threshold=1000}")
+	}
+	if got["avzero"] != "{autovacuum_vacuum_insert_threshold=0}" {
+		t.Errorf("pg_class.reloptions for avzero = %q, want %q", got["avzero"], "{autovacuum_vacuum_insert_threshold=0}")
+	}
+	if got["avplain"] != "" {
+		t.Errorf("pg_class.reloptions for avplain = %q, want \"\" (NULL)", got["avplain"])
+	}
+}
+
+// TestAutovacuumVacuumInsertThresholdOutOfBoundsRejected verifies CREATE TABLE
+// rejects an above-INT_MAX or non-integer autovacuum_vacuum_insert_threshold with
+// PG's 22023 error. The valid range is -1–INT_MAX (a bare negative is rejected
+// earlier by the parser as a syntax error, so the reachable invalid cases are
+// overflow and non-integer). DU-002 slice 204.
+func TestAutovacuumVacuumInsertThresholdOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, av := range []string{"9999999999", "nope"} {
+		err := runDDL(t, ctx, `CREATE TABLE avitbad`+strconv.Itoa(i)+` (id integer) WITH (autovacuum_vacuum_insert_threshold=`+av+`)`)
+		if err == nil {
+			t.Errorf("autovacuum_vacuum_insert_threshold=%s: expected an error, got nil", av)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("autovacuum_vacuum_insert_threshold=%s: error type = %T, want *ExecError", av, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("autovacuum_vacuum_insert_threshold=%s: error code = %q, want 22023", av, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.

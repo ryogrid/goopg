@@ -513,6 +513,21 @@ type Table struct {
 	// (DU-002 slice 203).
 	AutovacuumAnalyzeThreshold    int
 	AutovacuumAnalyzeThresholdSet bool
+
+	// AutovacuumVacuumInsertThreshold stores the table's
+	// `WITH (autovacuum_vacuum_insert_threshold=N)` storage parameter — the third
+	// INT-typed autovacuum reloption goopg round-trips, reusing the slice-198
+	// integer path. PG's reloption type is RELOPT_TYPE_INT with range -1–INT_MAX
+	// and a default of -2 (= unset / use the GUC); -1 disables insert vacuums.
+	// Because -1 and 0 are valid explicit values, AutovacuumVacuumInsertThresholdSet
+	// — not a zero check — guards whether the option was specified (the
+	// parallel_workers pattern). When set, pg_class.reloptions gains the text[]
+	// element `autovacuum_vacuum_insert_threshold=N`, which pg_dump renders back as
+	// `WITH (autovacuum_vacuum_insert_threshold='N')`. goopg has no autovacuum, so
+	// the value is catalog/dump-only (advisory; runtime unaffected). M0110-0001
+	// (DU-002 slice 204).
+	AutovacuumVacuumInsertThreshold    int
+	AutovacuumVacuumInsertThresholdSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2262,6 +2277,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.AutovacuumAnalyzeThresholdSet {
 				relopts = append(relopts, "autovacuum_analyze_threshold="+strconv.Itoa(t.AutovacuumAnalyzeThreshold))
+			}
+			if t.AutovacuumVacuumInsertThresholdSet {
+				relopts = append(relopts, "autovacuum_vacuum_insert_threshold="+strconv.Itoa(t.AutovacuumVacuumInsertThreshold))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {
