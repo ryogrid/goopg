@@ -1454,6 +1454,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_ord_idx ON public.foo (name DESC, qty NULLS FIRST)"); err != nil {
 		t.Fatalf("create ordered composite index: %v", err)
 	}
+	// Slice 218: a plain CREATE INDEX with a `WITH (fillfactor=N)` storage
+	// parameter must round-trip. goopg parsed and range-validated the fillfactor
+	// but never STORED it on catalog.Index, so pg_get_indexdef (BuildIndexDef)
+	// dropped the WITH clause and the index restored without its fill factor — a
+	// silent loss. The value now threads parser → catalog.Index.Fillfactor →
+	// BuildIndexDef's `WITH (fillfactor='N')` (the dump path for a plain index)
+	// and the index's pg_class.reloptions virtual cell (the constraint-backed
+	// sibling surface). goopg does not honor fill factor for page packing, so it
+	// is advisory catalog/dump-only.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_ff_idx ON public.foo (qty) WITH (fillfactor=70)"); err != nil {
+		t.Fatalf("create fillfactor index: %v", err)
+	}
 	// Slice 134: a UNIQUE index declared `NULLS NOT DISTINCT` (PostgreSQL 15+)
 	// must round-trip. goopg's parser accepted the clause but DISCARDED it, and
 	// pg_index.indnullsnotdistinct was hard-wired false, so pg_get_indexdef
@@ -4015,6 +4027,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// Slice 134: NULLS NOT DISTINCT clause re-emitted after the column list
 			// (ruleutils.c order: (cols) [INCLUDE] NULLS NOT DISTINCT [WHERE]).
 			"CREATE UNIQUE INDEX foo_nnd_idx ON public.foo USING btree (name) NULLS NOT DISTINCT;",
+			// Slice 218: `WITH (fillfactor='N')` storage parameter re-emitted after
+			// the column list (ruleutils.c order: (cols) [INCLUDE] [NULLS NOT
+			// DISTINCT] WITH [WHERE]); flatten_reloptions single-quotes the value.
+			"CREATE INDEX foo_ff_idx ON public.foo USING btree (qty) WITH (fillfactor='70');",
 		}
 		for _, sub := range indexDefs {
 			if !strings.Contains(res.Stdout, sub) {

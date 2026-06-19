@@ -4116,6 +4116,9 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 		}
 		idx.HasPredicate = s.HasPredicate
 		idx.IncludeColumns = s.IncludeColumns
+		// Persist `WITH (fillfactor=N)` so pg_class.reloptions / pg_dump round-trip
+		// it (already range-validated above). DU-002 slice 218.
+		idx.Fillfactor = s.Fillfactor
 		if catalogHeapSyncAvailable(o.ctx) {
 			if syncErr := syncIndexToCatalogHeap(o.ctx, idx); syncErr != nil {
 				return fmt.Errorf("DDL catalog sync: %w", syncErr)
@@ -4139,10 +4142,13 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// at least one column is non-default so a plain index keeps empty slices and
 	// dumps byte-identically. DU-002 slice 56.
 	nonDefaultOrder := indexHasNonDefaultOrder(s.ColOrders)
-	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || s.NullsNotDistinct {
+	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || s.NullsNotDistinct || s.Fillfactor != 0 {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.HasPredicate = s.HasPredicate
 			idx.Predicate = s.Predicate
+			// Persist `WITH (fillfactor=N)` so pg_class.reloptions / pg_dump
+			// round-trip it (already range-validated above). DU-002 slice 218.
+			idx.Fillfactor = s.Fillfactor
 			if s.Predicate != nil {
 				idx.PredicateString = defaultExprToSQL(s.Predicate)
 			}

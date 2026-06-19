@@ -2106,3 +2106,93 @@ func TestFillfactorOutOfBoundsRejected(t *testing.T) {
 		}
 	}
 }
+
+// TestIndexFillfactorSurfacesInPgClassReloptions verifies that a `WITH
+// (fillfactor=N)` storage parameter declared on CREATE INDEX is persisted on the
+// catalog Index and surfaced through the *index's own* pg_class virtual-view row
+// (relkind 'i'), reloptions cell, as the text[] literal `{fillfactor=N}`.
+// pg_dump reads that via `t.reloptions AS indreloptions` (the index pg_class row)
+// and re-emits `CREATE INDEX … WITH (fillfactor='N')`, so this is the engine-side
+// half of the round-trip TestPort_PgDumpConnectionSetup asserts end-to-end. A
+// plain index must keep reloptions NULL so it dumps byte-identically. DU-002
+// slice 218.
+func TestIndexFillfactorSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE t (id integer, v integer)`); err != nil {
+		t.Fatalf("CREATE TABLE t: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX iopt ON t (id) WITH (fillfactor=70)`); err != nil {
+		t.Fatalf("CREATE INDEX iopt: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE INDEX iplain ON t (v)`); err != nil {
+		t.Fatalf("CREATE INDEX iplain: %v", err)
+	}
+
+	optIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "iopt"})
+	if !ok {
+		t.Fatal("iopt index not found")
+	}
+	if optIdx.Fillfactor != 70 {
+		t.Errorf("iopt.Fillfactor = %d, want 70", optIdx.Fillfactor)
+	}
+	plainIdx, ok := cat.LookupIndex(parser.ObjectName{Name: "iplain"})
+	if !ok {
+		t.Fatal("iplain index not found")
+	}
+	if plainIdx.Fillfactor != 0 {
+		t.Errorf("iplain.Fillfactor = %d, want 0 (unset)", plainIdx.Fillfactor)
+	}
+
+	// pg_class.reloptions (column index 32) must read `{fillfactor=70}` for the
+	// option-bearing index and "" (→ SQL NULL) for the plain one. Match on the
+	// index pg_class rows (relkind 'i', column index 17).
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && r[17] == "i" && (r[1] == "iopt" || r[1] == "iplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["iopt"] != "{fillfactor=70}" {
+		t.Errorf("pg_class.reloptions for iopt = %q, want %q", got["iopt"], "{fillfactor=70}")
+	}
+	if got["iplain"] != "" {
+		t.Errorf("pg_class.reloptions for iplain = %q, want \"\" (NULL)", got["iplain"])
+	}
+}
+
+// TestIndexFillfactorOutOfBoundsRejected verifies CREATE INDEX rejects a
+// fillfactor outside the valid 10–100 range with PG's 22023 error. DU-002 slice
+// 218 (the bounds check predates this slice; this pins it now that the value is
+// persisted). NB: the CREATE INDEX parser uses 0 as the "unset" sentinel for
+// stmt.Fillfactor, so `fillfactor=0` reads as unspecified rather than an
+// out-of-bounds error (a pre-existing int-sentinel limitation; PG's minimum is
+// 10, so 0 is never a meaningful user value). Hence 0 is not exercised here.
+func TestIndexFillfactorOutOfBoundsRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE t (id integer)`); err != nil {
+		t.Fatalf("CREATE TABLE t: %v", err)
+	}
+	for _, ff := range []string{"5", "101"} {
+		err := runDDL(t, ctx, `CREATE INDEX bad`+ff+` ON t (id) WITH (fillfactor=`+ff+`)`)
+		if err == nil {
+			t.Errorf("fillfactor=%s: expected an out-of-bounds error, got nil", ff)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("fillfactor=%s: error type = %T, want *ExecError", ff, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("fillfactor=%s: error code = %q, want 22023", ff, ee.Code)
+		}
+	}
+}

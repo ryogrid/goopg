@@ -969,6 +969,15 @@ type Index struct {
 	// trees (ALTER INDEX parent ATTACH PARTITION child). Zero if not a partition
 	// index child. M0097-0023.
 	PartitionParentOID uint32
+	// Fillfactor stores the index's `WITH (fillfactor=N)` storage parameter
+	// (btree/hash/gist accept it; range 10–100). Zero means unset — no
+	// reloptions are emitted, so a plain index dumps byte-identically. The
+	// index's pg_class.reloptions virtual row renders `fillfactor=N`, which
+	// pg_dump reads via `t.reloptions AS indreloptions` (pg_dump.c:7775) and
+	// re-emits as `CREATE INDEX … WITH (fillfactor='N')`. goopg does not honor
+	// fill factor for page packing, so this is advisory catalog/dump-only.
+	// DU-002 slice 218.
+	Fillfactor int
 }
 
 // QualifiedName renders the table's name in the canonical
@@ -2614,6 +2623,14 @@ func (c *InMemory) registerSystemTables() {
 			if hasIdxChildren {
 				idxHasSubclass = "t"
 			}
+			// Index reloptions: `WITH (fillfactor=N)`. pg_dump reads this via
+			// `t.reloptions AS indreloptions` (the index's own pg_class row) and
+			// re-emits `CREATE INDEX … WITH (fillfactor='N')`. Empty (NULL) when
+			// unset so a plain index dumps byte-identically. DU-002 slice 218.
+			idxReloptions := ""
+			if idx.Fillfactor != 0 {
+				idxReloptions = "{fillfactor=" + strconv.Itoa(idx.Fillfactor) + "}"
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(idx.OID)),  // 0:  oid
 				idx.Name,                    // 1:  relname
@@ -2647,7 +2664,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",                         // 29: relfrozenxid
 				"1",                         // 30: relminmxid
 				"",                          // 31: relacl (NULL)
-				"",                          // 32: reloptions (NULL)
+				idxReloptions,               // 32: reloptions ({fillfactor=N} or NULL)
 				"",                          // 33: relpartbound
 			})
 		}
@@ -6556,6 +6573,17 @@ func BuildIndexDef(idx *Index) string {
 	// unique index. DU-002 slice 134.
 	if idx.NullsNotDistinct {
 		sb.WriteString(" NULLS NOT DISTINCT")
+	}
+	// Storage parameters: `WITH (fillfactor='N')`. ruleutils.c
+	// pg_get_indexdef_worker emits reloptions (via flatten_reloptions, which
+	// single-quotes each value) after NULLS NOT DISTINCT and before WHERE. This
+	// is the dump path for a plain CREATE INDEX (pg_dump emits indexdef verbatim);
+	// the index's pg_class.reloptions virtual cell is the sibling surface used by
+	// the constraint-backed index path. DU-002 slice 218.
+	if idx.Fillfactor != 0 {
+		sb.WriteString(" WITH (fillfactor='")
+		sb.WriteString(strconv.Itoa(idx.Fillfactor))
+		sb.WriteString("')")
 	}
 	if idx.PredicateString != "" {
 		sb.WriteString(" WHERE ")

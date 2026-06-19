@@ -6258,6 +6258,41 @@ plain table → no reloptions) and `TestVacuumIndexCleanupInvalidRejected`
 `optvic (… WITH (vacuum_index_cleanup=on))` on its own table; the assertion confirms the dump carries
 `WITH (vacuum_index_cleanup='on')`.
 
+### Slice 218 — index `fillfactor` reloption round-trip (first INDEX-level reloption)
+
+Adds the `fillfactor` storage parameter on **`CREATE INDEX`** — the first *index*-level reloption
+(slices 54–217 all targeted table/heap reloptions). The parser already captured
+`CreateIndexStmt.Fillfactor` and `execCreateIndex` already range-validated it (10–100 → else `22023`),
+but the value was **never persisted** to `catalog.Index`, so it was silently dropped from the dump.
+This slice threads it through: `execCreateIndex` now sets `idx.Fillfactor = s.Fillfactor` in both the
+btree branch (the post-create field-setting block, whose guard now includes `s.Fillfactor != 0`) and
+the gist/spgist metadata-only branch.
+
+The round-trip has **two sibling surfaces** that must agree:
+
+1. **`BuildIndexDef`** (goopg's `pg_get_indexdef` analog) — the dump path for a *plain* `CREATE INDEX`.
+   pg_dump emits `indxinfo->indexdef` verbatim (`pg_dump.c:18133`), and ruleutils.c
+   `pg_get_indexdef_worker` includes the reloptions as ` WITH (fillfactor='N')` **after** any
+   `NULLS NOT DISTINCT` and **before** `WHERE` (via `flatten_reloptions`, which single-quotes each
+   value). `BuildIndexDef` now emits that clause in the same position.
+2. **The index's `pg_class.reloptions` virtual cell** (relkind `'i'`, column 32) — rendered as the
+   text[] literal `{fillfactor=N}`. This is read by pg_dump's getIndexes as
+   `t.reloptions AS indreloptions` (`pg_dump.c:7775`) and used by the *constraint-backed* index path
+   (`pg_dump.c:18459`, which builds the index DDL manually rather than from `indexdef`).
+
+goopg does not honor fill factor for page packing, so the value is advisory catalog/dump-only.
+`catalog.Index.Fillfactor` is JSON-persisted, so it survives a catalog reload. **Limitation:** the
+CREATE INDEX parser uses `0` as the "unset" sentinel for `stmt.Fillfactor`, so `WITH (fillfactor=0)`
+reads as unspecified rather than an out-of-bounds error (PG's minimum is 10, so 0 is never a
+meaningful user value).
+
+Engine guards: `TestIndexFillfactorSurfacesInPgClassReloptions` (an index `WITH (fillfactor=70)` sets
+`idx.Fillfactor=70` and its pg_class row reads `{fillfactor=70}`; a plain index keeps reloptions NULL)
+and `TestIndexFillfactorOutOfBoundsRejected` (`5`/`101` → 22023; 0 excluded per the sentinel
+limitation). The pg_dump fixture adds `foo_ff_idx ON public.foo (qty) WITH (fillfactor=70)`; the
+assertion confirms the dump carries
+`CREATE INDEX foo_ff_idx ON public.foo USING btree (qty) WITH (fillfactor='70');`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

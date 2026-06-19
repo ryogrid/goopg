@@ -4778,6 +4778,30 @@ object support.
         PASS; pgbench pre-commit smoke on commit. **Next:** `toast.*` namespace (BIGGER: real pg_dump reads
         `tc.reloptions` from the toast table's pg_class row, but goopg hardcodes `reltoastrelid=0` → needs
         toast-table pg_class modeling); or composite types (`CREATE TYPE AS`; pg_class.reltype hardcoded 0).
+      - **PROGRESS 2026-06-19 (loop #33):** **DU-002 slice 218 LANDED — index `fillfactor` storage
+        parameter round-trips through pg_dump (goopg's FIRST index-level reloption; slices 54–217 were all
+        table/heap reloptions).** The parser already captured `CreateIndexStmt.Fillfactor` and
+        `execCreateIndex` already range-validated it (10–100 → `22023`), but it was NEVER persisted to
+        `catalog.Index`, so the dump silently dropped it. Threaded it through: `execCreateIndex` sets
+        `idx.Fillfactor = s.Fillfactor` in both the btree branch (post-create block, guard now includes
+        `s.Fillfactor != 0`) and the gist/spgist branch. **Two sibling surfaces** updated together (sibling-path
+        law): (1) `BuildIndexDef` (goopg's `pg_get_indexdef`) — the dump path for a *plain* CREATE INDEX, since
+        pg_dump emits `indexdef` verbatim (`pg_dump.c:18133`) — now emits ` WITH (fillfactor='N')` after NULLS
+        NOT DISTINCT, before WHERE (ruleutils.c order; `flatten_reloptions` single-quotes); (2) the index's
+        `pg_class.reloptions` virtual cell (relkind 'i', col 32) renders `{fillfactor=N}`, read as
+        `indreloptions` (`pg_dump.c:7775`) by the constraint-backed index path (`pg_dump.c:18459`).
+        `catalog.Index.Fillfactor` is JSON-persisted (survives catalog reload). Limitation: parser uses 0 as the
+        "unset" sentinel, so `fillfactor=0` reads as unspecified (PG min is 10). Files:
+        `internal/catalog/catalog.go` (`Index.Fillfactor` field + index pg_class reloptions render + BuildIndexDef
+        WITH clause), `internal/executor/operators_ddl.go` (persist in both CREATE INDEX branches),
+        `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestIndexFillfactorSurfacesInPgClassReloptions` + `TestIndexFillfactorOutOfBoundsRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `foo_ff_idx` fixture + indexDefs assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 218). Gates: gofmt OK; `go build ./internal/...` clean;
+        catalog/executor/parser suites PASS; `TestPort_PgDumpConnectionSetup` PASS (round-trips
+        `CREATE INDEX foo_ff_idx ON public.foo USING btree (qty) WITH (fillfactor='70');`); pgbench pre-commit
+        smoke on commit. **Next:** index `deduplicate_items` (btree boolean reloption, another index-level
+        slice); or the BIGGER `toast.*` namespace (needs toast-table pg_class modeling) / composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
