@@ -5977,6 +5977,26 @@ object support.
         `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` counterpart on an *inherited* (child) column — pg_dump
         attaches the NOT NULL to the child only when it is locally declared (conislocal), exercising the inheritance
         interaction the prior local-only slices avoided.
+      - **PROGRESS 2026-06-20 (loop #46):** **DU-002 slice 279 LANDED — the inherited-child counterpart of slice 277:
+        a DEFAULT-named NOT NULL added to an INHERITED column via `ALTER TABLE idfnd_child ADD CONSTRAINT
+        idfnd_child_pid_not_null NOT NULL pid` whose name EQUALS the auto-name must COLLAPSE the `CONSTRAINT` prefix in the
+        STANDALONE body form — the bare `NOT NULL pid` (no production change; sibling-paths regression guard).** pg_dump
+        renders a conislocal NOT NULL on a non-printed (inherited) column through the body branch (pg_dump.c:17225-17232):
+        `NOT NULL <col>` when `notnull_constrs[j][0]=='\0'` (conname == computed default), else `CONSTRAINT <name> NOT NULL
+        <col>`. That branch reuses the SAME `notnull_constrs[]` array as the inline path, so once the ALTER path stores the
+        collapsible default conname (slice 277) and getTableAttrs suppresses it, the inherited body form collapses
+        identically. Slice 271 proved the NAMED (non-default) body form (`CONSTRAINT idfnn_nn NOT NULL pid`); this twin
+        proves the auto-name collapse for the same branch. The body branch never appends ` NO INHERIT` (inline-only,
+        pg_dump.c:17187), so the slice omits that dimension. A regression storing a non-default conname would leak
+        `CONSTRAINT idfnd_child_pid_not_null NOT NULL pid`; one losing AlterTableAddNotNull would drop the NOT NULL.
+        Fixture: `CREATE TABLE public.idfnd_parent (pid integer, pname text)` + `CREATE TABLE public.idfnd_child (extra
+        integer) INHERITS (public.idfnd_parent)` + `ALTER TABLE public.idfnd_child ADD CONSTRAINT idfnd_child_pid_not_null
+        NOT NULL pid`. **Guards:** `TestPort_PgDumpConnectionSetup` PASS (3.49s; asserts `extra integer` + bare `NOT NULL
+        pid`, negative check that `CONSTRAINT idfnd_child_pid_not_null` does NOT leak, inherited `pid integer`/`pname text`
+        not re-emitted, `INHERITS (public.idfnd_parent)` survives). gofmt + `go build ./...` clean; pgbench pre-commit smoke
+        on commit. Design: `0110-0001` Slice 279. **Next (slice 280+):** the partition-leaf counterpart (a conislocal NOT
+        NULL on a partition leaf where `tbinfo->ispartition` changes the column-omission decision), or a multi-column
+        inherited NOT NULL body form proving attnum ordering of multiple standalone `NOT NULL <col>` items.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

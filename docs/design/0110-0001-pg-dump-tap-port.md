@@ -8106,9 +8106,32 @@ Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live
 block contains `c integer NOT NULL NO INHERIT`, does NOT contain `CONSTRAINT nninh7_c_not_null`, and the plain
 `d integer` survives).
 
-> **Next (slice 279+):** the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` counterpart on an *inherited* (child)
-> column — pg_dump should attach the NOT NULL to the child only when it is locally declared (conislocal), exercising the
-> inheritance interaction the prior local-only slices deliberately avoided.
+### Slice 279 — *default-named* NOT NULL added to an *inherited* column via `ALTER TABLE ADD CONSTRAINT` collapses to the bare body form
+
+The inherited-child counterpart of slice 277. A DEFAULT-named NOT NULL added to an INHERITED column —
+`CREATE TABLE idfnd_parent (pid integer, pname text); CREATE TABLE idfnd_child (extra integer) INHERITS (idfnd_parent);
+ALTER TABLE idfnd_child ADD CONSTRAINT idfnd_child_pid_not_null NOT NULL pid` — whose explicit name EQUALS the auto-name
+`idfnd_child_pid_not_null` must COLLAPSE the `CONSTRAINT` prefix in the STANDALONE body form: pg_dump emits the bare
+`NOT NULL pid`, not `CONSTRAINT idfnd_child_pid_not_null NOT NULL pid`.
+
+**No production change required.** pg_dump renders a conislocal NOT NULL on a non-printed (inherited) column through the
+standalone body branch (pg_dump.c:17225-17232): `NOT NULL <col>` when `notnull_constrs[j][0]=='\0'` (conname == the
+computed default `<table>_<col>_not_null`) and `CONSTRAINT <name> NOT NULL <col>` otherwise. This branch reuses the SAME
+`notnull_constrs[]` array as the inline-column branch, so once goopg's ALTER path stores the collapsible default conname
+(proven by slice 277 for a local column) and getTableAttrs suppresses it, the inherited body form collapses identically.
+Slice 271 already proved the NAMED (non-default) body form (`CONSTRAINT idfnn_nn NOT NULL pid`); this twin proves the
+auto-name collapse for the same body branch. Note the body branch never appends ` NO INHERIT` (inline-only,
+pg_dump.c:17187), so this slice deliberately omits the NO INHERIT dimension. A regression storing a non-default conname
+(or skipping the default-name comparison on the ALTER path) would leak `CONSTRAINT idfnd_child_pid_not_null NOT NULL pid`;
+one that lost AlterTableAddNotNull would drop the NOT NULL entirely.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `idfnd_child`
+block prints its local `extra integer` and the bare `NOT NULL pid`, does NOT contain `CONSTRAINT idfnd_child_pid_not_null`,
+does NOT re-emit the inherited `pid integer`/`pname text` columns, and that `INHERITS (public.idfnd_parent)` survives).
+
+> **Next (slice 280+):** the partition-leaf counterpart — a conislocal NOT NULL on a partition leaf column (where
+> `tbinfo->ispartition` changes the column-omission decision), or a multi-column inherited NOT NULL body form proving the
+> attnum ordering of multiple standalone `NOT NULL <col>` body items.
 
 ## Deferred (002–010) — catalog surface estimate
 

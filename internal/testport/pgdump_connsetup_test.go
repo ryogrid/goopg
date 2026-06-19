@@ -1664,6 +1664,37 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("add default-named NO INHERIT NOT NULL on local column nninh7.c: %v", err)
 	}
 
+	// Slice 279 (inherited-child counterpart of slice 277): a DEFAULT-named NOT
+	// NULL added to an INHERITED column via `ALTER TABLE ... ADD CONSTRAINT
+	// <child>_<col>_not_null NOT NULL <inherited_col>` whose explicit name EQUALS
+	// the auto-name must COLLAPSE the `CONSTRAINT` prefix in the STANDALONE body
+	// form — pg_dump emits the bare `NOT NULL pid` (no `CONSTRAINT` prefix) rather
+	// than `CONSTRAINT idfnd_child_pid_not_null NOT NULL pid`. Slice 271 proved the
+	// NAMED (non-default) body form for a conislocal NOT NULL on an inherited
+	// column (`CONSTRAINT idfnn_nn NOT NULL pid`); slice 277 proved the auto-name
+	// COLLAPSE for a LOCAL inline column on the ALTER path. This twin proves their
+	// INTERSECTION: the collapse also fires in the inherited-column body branch
+	// (pg_dump.c:17225-17232), which emits `NOT NULL <col>` when notnull_constrs[j]
+	// is empty (conname == computed default) and `CONSTRAINT <name> NOT NULL <col>`
+	// otherwise. No production change required — the standalone body form reuses the
+	// SAME notnull_constrs[] array as the inline path, so once goopg's ALTER path
+	// stores the collapsible default conname (slice 277) and getTableAttrs suppresses
+	// it, the inherited body form collapses identically. Note the body branch never
+	// appends ` NO INHERIT` (that is inline-only, pg_dump.c:17187), so this slice
+	// deliberately omits the NO INHERIT dimension. A regression storing a non-default
+	// conname (or skipping the default-name comparison) would leak
+	// `CONSTRAINT idfnd_child_pid_not_null NOT NULL pid`; one that lost
+	// AlterTableAddNotNull would drop the NOT NULL entirely.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfnd_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create legacy inheritance parent idfnd_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfnd_child (extra integer) INHERITS (public.idfnd_parent)"); err != nil {
+		t.Fatalf("create legacy inheritance child idfnd_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.idfnd_child ADD CONSTRAINT idfnd_child_pid_not_null NOT NULL pid"); err != nil {
+		t.Fatalf("add default-named NOT NULL on inherited column idfnd_child.pid: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -4383,6 +4414,44 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			}
 		} else {
 			t.Errorf("pg_dump missing CREATE TABLE public.nninh7\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 279 (inherited-child counterpart of slice 277):
+		// `ALTER TABLE public.idfnd_child ADD CONSTRAINT idfnd_child_pid_not_null
+		// NOT NULL pid`, whose explicit name EQUALS the auto-name
+		// `idfnd_child_pid_not_null`, must COLLAPSE the `CONSTRAINT` prefix in the
+		// STANDALONE body form — the bare `NOT NULL pid` (pg_dump.c:17225-17232
+		// emits `NOT NULL <col>` when notnull_constrs[j] is empty). idfnd_child's
+		// body must print its local `extra` column AND `NOT NULL pid`; the inherited
+		// `pid`/`pname` are suppressed and arrive via INHERITS. A regression storing
+		// a non-default conname would leak `CONSTRAINT idfnd_child_pid_not_null`;
+		// one that lost AlterTableAddNotNull would emit nothing for the NOT NULL.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.idfnd_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the legacy child's local column; want %q in idfnd_child block\n  block=%q", "extra integer", block)
+			}
+			if !strings.Contains(block, "NOT NULL pid") {
+				t.Errorf("pg_dump dropped the default-named NOT NULL on the inherited column; want %q in idfnd_child block\n  block=%q", "NOT NULL pid", block)
+			}
+			if strings.Contains(block, "CONSTRAINT idfnd_child_pid_not_null") {
+				t.Errorf("pg_dump leaked the default constraint name from the ALTER path; want bare %q, not %q in idfnd_child block\n  block=%q", "NOT NULL pid", "CONSTRAINT idfnd_child_pid_not_null NOT NULL pid", block)
+			}
+			// The inherited columns must NOT be re-emitted as full columns.
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in idfnd_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.idfnd_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.idfnd_parent)") {
+			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfnd_parent)", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged
