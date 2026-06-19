@@ -1767,6 +1767,19 @@ const (
 	// Clears the catalog column's DEFAULT expression. ColumnName holds the
 	// column. DU-002 slice 269.
 	AlterTableDropDefault
+	// AlterTableSetNotNull — `ALTER COLUMN name SET NOT NULL`.
+	// Marks the catalog column NOT NULL (Column.NotNull) and records a named
+	// NOT NULL constraint (pg_constraint contype='n', conislocal='t') so it
+	// surfaces in pg_attribute.attnotnull and round-trips through pg_dump —
+	// inline on a printed local column, or as a standalone `NOT NULL <col>`
+	// constraint item in the child CREATE TABLE body when the column is a
+	// suppressed inherited column (pg_dump.c:17213). ColumnName holds the
+	// column. DU-002 slice 270.
+	AlterTableSetNotNull
+	// AlterTableDropNotNull — `ALTER COLUMN name DROP NOT NULL`.
+	// Clears the catalog column's NOT NULL and drops its contype='n'
+	// constraint. ColumnName holds the column. DU-002 slice 270.
+	AlterTableDropNotNull
 	// AlterIndexAttachPartition — `ALTER INDEX parent ATTACH PARTITION child`.
 	// Registers child as a partition of parent in the index partition tree.
 	// ConstraintName holds the parent index name; ChildIndexName holds the child. M0097-0023.

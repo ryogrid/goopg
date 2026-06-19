@@ -7855,10 +7855,46 @@ still omitted (arriving via INHERITS). Verified end-to-end: real pg_dump 18.3 ag
 Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `TestParseAlterTableSetDropDefault`
 (parser AST).
 
-> **Next (slice 270+):** a child-level `SET NOT NULL` on an *inherited* column. In PG 18 NOT NULL is a `pg_constraint`
-> (contype='n'); pg_dump emits an invalid/child-only NOT NULL as a separate `ALTER TABLE ... ALTER COLUMN ... SET NOT
-> NULL` or a `CONSTRAINT ... NOT NULL` clause depending on validity/inheritance — a distinct catalog path from this
-> attrdef slice.
+### Slice 270 — child-level `SET NOT NULL` on an *inherited* column (standalone body item)
+
+The NOT NULL twin of slice 269, but a **different catalog path**. In PG 18 a NOT NULL is a `pg_constraint` row
+(contype='n'), and pg_dump's `getTableAttrs` LEFT-JOINs `pg_constraint` (`contype='n' AND conkey=array[attnum]`) to
+populate `notnull_constrs`/`notnull_islocal` (`pg_dump.c:9260`). When the column is **suppressed** from the child's
+column list (`!shouldPrintColumn`, `attislocal=false`) but carries a **local** NOT NULL constraint
+(`conislocal='t'`), pg_dump emits the constraint as a STANDALONE item INSIDE the CREATE TABLE body
+(`pg_dump.c:17213-17232`) — *not* as a separate ALTER (the way DEFAULT is dumped). Because the constraint's name
+matches PG's auto-generated `<table>_<col>_not_null`, `notnull_constrs` is the unnamed `""` form, so the printed text
+is `NOT NULL <col>`. Verified against real pg_dump 18.3 — `NOT NULL pid` precedes `extra integer` in attnum order:
+
+```
+CREATE TABLE public.idfn_child (
+    NOT NULL pid,
+    extra integer
+)
+INHERITS (public.idfn_parent);
+```
+
+This required **new production support**: `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` (and `DROP NOT NULL`) were
+previously swallowed as a no-op by the parser. The change adds:
+
+- **Parser** (`internal/parser/ddl.go`): a `SET NOT NULL` branch inside the ALTER COLUMN `SET` block, plus a
+  `DROP NOT NULL` branch in the DROP block. New AST kinds `AlterTableSetNotNull` / `AlterTableDropNotNull`
+  (`internal/parser/ast.go`).
+- **Executor** (`internal/executor/operators_ddl.go`): `AlterTableSetNotNull` sets `Column.NotNull` AND records a
+  contype='n' constraint via `catalog.Table.AddNotNull(name, col, oid, noInherit=false, isLocal=true, inhCount=0)`
+  — auto-named `<table>_<col>_not_null` — unless one already exists (idempotent, matching PG). It then flushes
+  `pg_attribute.attnotnull` via the established delete-old-rows + `syncTableToCatalogHeap` path. `AlterTableDropNotNull`
+  clears the flag and removes the constraint. A missing column raises `42703`.
+
+The constraint surfaces through the existing `pg_constraint` virtual builder (`catalog.go:3954`), which already renders
+contype='n' rows with `conislocal`/`coninhcount`/`connoinherit`/`conkey` from `NamedNotNullConstraint`.
+
+Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `TestParseAlterTableSetDropNotNull`
+(parser AST) + `TestAlterTableSetDropNotNull` (executor catalog state, incl. idempotence + DROP).
+
+> **Next (slice 271+):** a *named* NOT NULL constraint added via `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>`
+> on an inherited column, which exercises the `CONSTRAINT <name> NOT NULL <col>` form (`notnull_constrs` carrying the
+> non-default name) — the named counterpart of this slice's unnamed `""` path.
 
 ## Deferred (002–010) — catalog surface estimate
 

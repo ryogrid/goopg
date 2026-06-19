@@ -5806,6 +5806,26 @@ object support.
         (parser AST) + `go test ./internal/executor/` PASS. gofmt + `go build ./...` clean; pgbench pre-commit smoke on
         commit. Design: `0110-0001` Slice 269. **Next (slice 270+):** a child-level `SET NOT NULL` on an INHERITED column
         (PG 18 NOT NULL is a `pg_constraint` contype='n' — a distinct catalog path from this attrdef slice).
+      - **PROGRESS 2026-06-20 (loop #37):** **DU-002 slice 270 LANDED — a child-level `SET NOT NULL` on an INHERITED
+        column round-trips through pg_dump as a standalone `NOT NULL <col>` body item (new production support).** The
+        NOT NULL twin of slice 269's DEFAULT, but a DIFFERENT catalog path: PG18 records NOT NULL as a `pg_constraint`
+        contype='n' row, and pg_dump's `getTableAttrs` LEFT-JOINs `pg_constraint` (`contype='n' AND conkey=array[attnum]`,
+        `pg_dump.c:9260`) to populate `notnull_constrs`/`notnull_islocal`. A LOCAL NOT NULL (`conislocal='t'`) on a
+        SUPPRESSED inherited column (`!shouldPrintColumn`) is emitted as a standalone constraint item INSIDE the CREATE
+        TABLE body (`pg_dump.c:17213-17232`) — NOT as a separate ALTER. The auto-name `<tbl>_<col>_not_null` matches PG's
+        default, so `notnull_constrs` is the unnamed `""` form → printed `NOT NULL pid` (verified vs real pg_dump 18.3,
+        precedes `extra integer` in attnum order). **Required NEW production code:** `ALTER TABLE ... ALTER COLUMN ...
+        SET NOT NULL`/`DROP NOT NULL` were previously a parser no-op. Added AST kinds `AlterTableSetNotNull`/
+        `AlterTableDropNotNull` (`ast.go`), parser branches in the ALTER COLUMN `SET`/`DROP` blocks (`ddl.go`), and
+        executor arms (`operators_ddl.go`) that set `Column.NotNull`, record a contype='n' constraint via
+        `catalog.Table.AddNotNull(..., isLocal=true, inhCount=0)` (idempotent), and flush `pg_attribute.attnotnull` via the
+        delete-old-rows + `syncTableToCatalogHeap` path. The existing `pg_constraint` virtual builder (`catalog.go:3954`)
+        already renders the contype='n' row with `conislocal`/`coninhcount`/`conkey`. **Guards:**
+        `TestPort_PgDumpConnectionSetup` PASS (3.63s, byte-matches real pg_dump 18.3) + `TestParseAlterTableSetDropNotNull`
+        (parser AST) + `TestAlterTableSetDropNotNull` (executor catalog state, incl. idempotence + DROP) +
+        `go test ./internal/executor/` PASS. gofmt + `go build ./...` clean; pgbench pre-commit smoke on commit. Design:
+        `0110-0001` Slice 270. **Next (slice 271+):** a *named* NOT NULL via `ADD CONSTRAINT <name> NOT NULL <col>` on an
+        inherited column — the `CONSTRAINT <name> NOT NULL <col>` form (`notnull_constrs` carrying a non-default name).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

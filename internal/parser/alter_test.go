@@ -277,6 +277,42 @@ func TestParseAlterTableSetDropDefault(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableSetDropNotNull covers `ALTER TABLE ... ALTER COLUMN c SET
+// NOT NULL` and `... DROP NOT NULL` (DU-002 slice 270). Both previously fell
+// through to the no-op consume; now they record a dedicated action kind so the
+// executor can mutate pg_attribute.attnotnull and the contype='n' constraint.
+func TestParseAlterTableSetDropNotNull(t *testing.T) {
+	stmts, err := Parse("ALTER TABLE t ALTER COLUMN c SET NOT NULL")
+	if err != nil {
+		t.Fatalf("Parse SET NOT NULL: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetNotNull {
+		t.Fatalf("SET NOT NULL: actions=%+v", at.Actions)
+	}
+	if at.Actions[0].ColumnName != "c" {
+		t.Errorf("SET NOT NULL: ColumnName=%q want %q", at.Actions[0].ColumnName, "c")
+	}
+
+	stmts, err = Parse("ALTER TABLE t ALTER COLUMN c DROP NOT NULL")
+	if err != nil {
+		t.Fatalf("Parse DROP NOT NULL: %v", err)
+	}
+	at, ok = stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableDropNotNull {
+		t.Fatalf("DROP NOT NULL: actions=%+v", at.Actions)
+	}
+	if at.Actions[0].ColumnName != "c" {
+		t.Errorf("DROP NOT NULL: ColumnName=%q want %q", at.Actions[0].ColumnName, "c")
+	}
+}
+
 // TestParseCreateTableColumnCompression covers the inline `COMPRESSION <method>`
 // clause in a CREATE TABLE column definition (`a text COMPRESSION lz4`), which
 // threads the method onto ColumnDef.Compression. DU-002 slice 183.

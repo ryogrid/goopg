@@ -5360,6 +5360,92 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return fmt.Errorf("DDL catalog sync: %w", syncErr)
 				}
 			}
+		case parser.AlterTableSetNotNull:
+			// SET NOT NULL — mark the column NOT NULL (pg_attribute.attnotnull)
+			// AND record a contype='n' constraint (pg_constraint) so pg_dump's
+			// getTableAttrs LEFT JOIN sees it. pg_dump re-emits the NOT NULL
+			// inline on a printed local column, or as a standalone `NOT NULL
+			// <col>` constraint item in the child CREATE TABLE body when the
+			// column is a suppressed inherited column (pg_dump.c:17213,
+			// !shouldPrintColumn && notnull_islocal). The auto-name matches PG's
+			// `<table>_<col>_not_null`, conislocal='t', coninhcount=0 — so
+			// pg_dump prints the unnamed `NOT NULL <col>` form. Like SET DEFAULT,
+			// the in-memory mutation alone is invisible: pg_attribute is a heap
+			// populated at CREATE TABLE, so the change is flushed via
+			// delete-old-rows + re-sync. DU-002 slice 270.
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					tbl.Columns[i].NotNull = true
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			// Add a named NOT NULL constraint unless one already exists for the
+			// column (SET NOT NULL is idempotent in PG — no duplicate row).
+			hasNN := false
+			for _, nc := range tbl.NotNullConstraints {
+				if strings.EqualFold(nc.ColName, act.ColumnName) {
+					hasNN = true
+					break
+				}
+			}
+			if !hasNN {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					name := strings.ToLower(tbl.Name) + "_" + strings.ToLower(act.ColumnName) + "_not_null"
+					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), false, true, 0)
+				}
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
+		case parser.AlterTableDropNotNull:
+			// DROP NOT NULL — clear the column's NOT NULL flag and drop its
+			// contype='n' constraint (same heap re-sync as SET NOT NULL). DROP
+			// NOT NULL on a column with no NOT NULL is a no-op in PG; we mirror
+			// that (no error). DU-002 slice 270.
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					tbl.Columns[i].NotNull = false
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			kept := tbl.NotNullConstraints[:0]
+			for _, nc := range tbl.NotNullConstraints {
+				if !strings.EqualFold(nc.ColName, act.ColumnName) {
+					kept = append(kept, nc)
+				}
+			}
+			tbl.NotNullConstraints = kept
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
 		case parser.AlterTableAlterColumnType:
 			if err := o.execAlterColumnType(tbl, act); err != nil {
 				return err

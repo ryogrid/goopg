@@ -4963,16 +4963,43 @@ func (p *parser) parseAlter() (Stmt, error) {
 				})
 				return stmt, nil
 			}
+			// SET NOT NULL — mark the column NOT NULL. The executor records a
+			// contype='n' constraint so pg_dump re-emits the NOT NULL: inline on
+			// a printed local column, or as a standalone `NOT NULL <col>` item in
+			// the child CREATE TABLE body when the column is a suppressed
+			// inherited column. DU-002 slice 270.
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
+				p.advance() // consume NOT
+				if _, err := p.expectKeyword(KwNull); err != nil {
+					return nil, err
+				}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:       AlterTableSetNotNull,
+					ColumnName: colName,
+				})
+				return stmt, nil
+			}
 		}
-		// DROP DEFAULT — clear the column's DEFAULT expression. Other DROP
-		// forms (DROP NOT NULL, DROP IDENTITY, …) fall through to the no-op
-		// consume below for now. DU-002 slice 269.
+		// DROP DEFAULT / DROP NOT NULL — clear the column's DEFAULT expression or
+		// NOT NULL flag. Other DROP forms (DROP IDENTITY, …) fall through to the
+		// no-op consume below for now. DU-002 slices 269, 270.
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDrop {
 			p.advance() // consume DROP
 			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
 				p.advance() // consume DEFAULT
 				stmt.Actions = append(stmt.Actions, AlterTableAction{
 					Kind:       AlterTableDropDefault,
+					ColumnName: colName,
+				})
+				return stmt, nil
+			}
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
+				p.advance() // consume NOT
+				if _, err := p.expectKeyword(KwNull); err != nil {
+					return nil, err
+				}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:       AlterTableDropNotNull,
 					ColumnName: colName,
 				})
 				return stmt, nil
