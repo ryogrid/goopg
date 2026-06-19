@@ -964,3 +964,26 @@ func TestUserPGAttributeTypmod(t *testing.T) {
 		}
 	}
 }
+
+// TestAttGeneratedForStorageStrategy covers DU-002 slice 194: attgenerated must
+// report 'v' for a VIRTUAL generated column, 's' for an explicit STORED one, and
+// "" (the empty/zero discriminator) for an ordinary column. pg_dump reads this
+// to choose between `GENERATED ALWAYS AS (expr)` (virtual) and `… STORED`.
+func TestAttGeneratedForStorageStrategy(t *testing.T) {
+	cases := []struct {
+		name string
+		col  catalog.Column
+		want string
+	}{
+		{"ordinary", catalog.Column{Name: "a"}, ""},
+		{"stored", catalog.Column{Name: "g", GeneratedExpr: "a + 1", GeneratedAlways: true, GeneratedVirtual: false}, "s"},
+		{"virtual", catalog.Column{Name: "g", GeneratedExpr: "a + 1", GeneratedAlways: true, GeneratedVirtual: true}, "v"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := attGeneratedFor(tc.col); got != tc.want {
+				t.Errorf("attGeneratedFor(%s) = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}

@@ -4258,6 +4258,29 @@ object support.
         composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger); or PG18 virtual
         generated columns (`GENERATED ALWAYS AS (expr) VIRTUAL`; attgenerated='v' not yet surfaced —
         runtime-heavy).
+      - **PROGRESS 2026-06-19 (loop #7):** **DU-002 slice 194 LANDED — VIRTUAL vs STORED
+        generated-column strategy round-trips through pg_dump.** PG18 admits
+        `GENERATED ALWAYS AS (expr) [STORED|VIRTUAL]` (default VIRTUAL); pg_dump keys on
+        `pg_attribute.attgenerated` (`'s'` → `… STORED`, `'v'` → bare `GENERATED ALWAYS AS (expr)`).
+        goopg parsed both keywords but discarded the choice — `attGeneratedFor` was hardcoded `"s"`,
+        so a VIRTUAL column always dumped as STORED (strategy divergence on restore). Fix records the
+        declared strategy on `catalog.Column.GeneratedVirtual` (parser: `STORED`→false,
+        `VIRTUAL`/bare→true per PG18 default), threads it through both CREATE TABLE column paths in
+        `operators_ddl.go` (+ clears under `INCLUDING GENERATED`), and maps it in `attGeneratedFor`
+        → `'v'`/`'s'`. The shared `atthasdef`/`pg_attrdef` expr wiring (slice 59) feeds both
+        strategies. goopg still MATERIALIZES every generated column on write (STORED storage
+        semantics); `GeneratedVirtual` is consumed only by the catalog/dump path, so the schema
+        round-trips faithfully while true compute-on-read VIRTUAL semantics remain a separate larger
+        feature (runtime unchanged). Files: `internal/catalog/catalog.go`, `internal/parser/ast.go`,
+        `internal/parser/ddl.go`, `internal/parser/gen_override_test.go` (NEW
+        `TestGeneratedColumnStorageStrategy`), `internal/executor/operators_ddl.go`,
+        `internal/executor/pg18_user_catalog_rows.go`, `internal/executor/pg18_user_catalog_rows_test.go`
+        (NEW `TestAttGeneratedForStorageStrategy`), `internal/testport/pgdump_connsetup_test.go` (NEW
+        `genv` VIRTUAL fixture + no-STORED assertion), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 194). Gates: gofmt OK; `go build ./...` clean; `go vet ./internal/testport/` clean;
+        parser/catalog/executor PASS; `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke
+        on commit. **Next:** composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 —
+        larger); or remaining partition-child trailers (none obvious after USING/WITH/ON COMMIT/TABLESPACE).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -98,6 +98,14 @@ type Column struct {
 	GeneratedExpr string
 	// GeneratedAlways is true when the column uses GENERATED ALWAYS AS semantics.
 	GeneratedAlways bool
+	// GeneratedVirtual records the declared storage strategy of a generated
+	// column: true for `GENERATED ALWAYS AS (expr) VIRTUAL` (and the bare
+	// `GENERATED ALWAYS AS (expr)` form, whose PG18 default is VIRTUAL), false
+	// for an explicit STORED. goopg materializes every generated column on write
+	// (STORED storage semantics) regardless of this flag — it exists only so
+	// pg_attribute.attgenerated reports the PG-faithful discriminator ('v' vs
+	// 's') and pg_dump re-emits the original keyword. DU-002 slice 194.
+	GeneratedVirtual bool
 	// DefaultExpr holds the parsed AST of the column's DEFAULT clause when
 	// CREATE TABLE provided one. nil for columns without a DEFAULT. The
 	// apply worker evaluates this when filling subscriber-extra columns at

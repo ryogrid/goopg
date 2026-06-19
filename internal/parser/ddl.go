@@ -2586,9 +2586,18 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			if !p.acceptSymbol(")") {
 				return ColumnDef{}, p.errAtCur("expected ')' to close generated expression")
 			}
-			// Accept optional STORED keyword (virtual columns not yet supported).
-			_ = p.acceptIdentKeyword("stored")
-			_ = p.acceptIdentKeyword("virtual")
+			// Storage strategy: `STORED` or `VIRTUAL`. PG18's default (when neither
+			// keyword is given) is VIRTUAL. goopg materializes every generated
+			// column on write regardless, but records the declared strategy so
+			// pg_attribute.attgenerated reports the PG-faithful 'v'/'s' code and
+			// pg_dump re-emits the original form. DU-002 slice 194.
+			if p.acceptIdentKeyword("stored") {
+				col.GeneratedVirtual = false
+			} else {
+				// `VIRTUAL` keyword (consumed) or omitted — both mean VIRTUAL.
+				_ = p.acceptIdentKeyword("virtual")
+				col.GeneratedVirtual = true
+			}
 			col.GeneratedAlways = true
 			col.GeneratedExpr = strings.Join(exprToks, " ")
 		// WITH OPTIONS modifier in PARTITION OF column override (M0096-0007)

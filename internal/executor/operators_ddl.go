@@ -705,6 +705,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				NotNull:          c.NotNull || c.IdentityColumn || isSerialCol,
 				GeneratedExpr:    c.GeneratedExpr,
 				GeneratedAlways:  c.GeneratedAlways,
+				GeneratedVirtual: c.GeneratedVirtual,
 				DefaultExpr:      c.DefaultExpr,
 				IdentityColumn:   c.IdentityColumn,
 				IdentityAlways:   c.IdentityAlways,
@@ -799,6 +800,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					if !includeGenerated {
 						c.GeneratedAlways = false
 						c.GeneratedExpr = ""
+						c.GeneratedVirtual = false
 					}
 					// Clear DefaultExpr unless INCLUDING DEFAULTS or INCLUDING ALL was specified.
 					if !includeDefaults {
@@ -891,14 +893,15 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				}
 			}
 			cols = append(cols, catalog.Column{
-				Name:            c.Name,
-				Type:            catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
-				NotNull:         c.NotNull,
-				GeneratedExpr:   c.GeneratedExpr,
-				GeneratedAlways: c.GeneratedAlways,
-				DefaultExpr:     c.DefaultExpr,
-				Compression:     c.Compression,
-				Collation:       c.Collation,
+				Name:             c.Name,
+				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...)},
+				NotNull:          c.NotNull,
+				GeneratedExpr:    c.GeneratedExpr,
+				GeneratedAlways:  c.GeneratedAlways,
+				GeneratedVirtual: c.GeneratedVirtual,
+				DefaultExpr:      c.DefaultExpr,
+				Compression:      c.Compression,
+				Collation:        c.Collation,
 			})
 		}
 	}

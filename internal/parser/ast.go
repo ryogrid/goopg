@@ -921,8 +921,13 @@ type ColumnDef struct {
 	// M0096-0008.
 	GeneratedAlways bool
 	// GeneratedExpr holds the raw SQL expression text (without surrounding parens)
-	// for a stored generated column. Empty for ordinary columns.
+	// for a generated column. Empty for ordinary columns.
 	GeneratedExpr string
+	// GeneratedVirtual is true when the generated column is declared VIRTUAL
+	// (explicitly, or implicitly via the bare `GENERATED ALWAYS AS (expr)` form,
+	// whose PG18 default is VIRTUAL); false for an explicit STORED. M0110-0001
+	// (DU-002 slice 194).
+	GeneratedVirtual bool
 	// IdentityColumn is true for `GENERATED [ALWAYS|BY DEFAULT] AS IDENTITY` columns.
 	// The sequence is registered during CREATE TABLE; INSERT uses nextval() as default.
 	IdentityColumn bool

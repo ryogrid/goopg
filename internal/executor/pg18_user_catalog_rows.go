@@ -802,15 +802,23 @@ func pgAttTypmod(typOID uint32, args []int64) int64 {
 	return -1
 }
 
-// attGeneratedFor returns the attgenerated discriminator: 's' for GENERATED
-// ALWAYS AS … STORED columns, '\0' (empty string, encoded by EncodeRowPG as
-// a single zero byte) for ordinary columns. PG18 also supports 'v' (virtual)
-// but goopg's catalog model does not surface that yet.
+// attGeneratedFor returns the attgenerated discriminator: 'v' for a VIRTUAL
+// generated column (`GENERATED ALWAYS AS (expr) VIRTUAL`, and the bare
+// `GENERATED ALWAYS AS (expr)` form, whose PG18 default is VIRTUAL), 's' for an
+// explicit STORED generated column, and '\0' (empty string, encoded by
+// EncodeRowPG as a single zero byte) for an ordinary column. pg_dump reads this
+// to choose between `GENERATED ALWAYS AS (expr)` (virtual) and `… STORED`.
+// goopg materializes every generated column on write regardless of the declared
+// strategy; the discriminator exists for catalog/dump fidelity only (DU-002
+// slice 194).
 func attGeneratedFor(col catalog.Column) string {
-	if col.GeneratedExpr != "" {
-		return "s"
+	if col.GeneratedExpr == "" {
+		return ""
 	}
-	return ""
+	if col.GeneratedVirtual {
+		return "v"
+	}
+	return "s"
 }
 
 // attIdentityFor returns the attidentity discriminator: 'a' for GENERATED ALWAYS

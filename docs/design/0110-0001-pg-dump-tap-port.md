@@ -5606,6 +5606,41 @@ parent with a leaf `puse_1 … USING heap`; the assertion confirms the leaf's
 `CREATE TABLE` carries no spurious `USING`/`WITH` clause and its
 `ATTACH PARTITION … FOR VALUES IN (1)` bound round-trips.
 
+### Slice 194 — VIRTUAL vs STORED generated-column strategy round-trip
+
+PG18 lets a generated column choose its storage strategy:
+`GENERATED ALWAYS AS (expr) [ STORED | VIRTUAL ]`, with `VIRTUAL` (compute on
+read, no storage) as the default when neither keyword is given. pg_dump keys on
+`pg_attribute.attgenerated` — `'s'` → `GENERATED ALWAYS AS (expr) STORED`,
+`'v'` → `GENERATED ALWAYS AS (expr)` (no keyword) — so the discriminator alone
+decides the emitted clause (`pg_dump.c` `dumpTableSchema`).
+
+goopg parsed both keywords but discarded the choice (`attGeneratedFor` was
+hardcoded to `"s"`), so a VIRTUAL column always dumped as STORED — a strategy
+divergence that, on restore, materializes a column PG would compute on read.
+
+The fix records the declared strategy on `catalog.Column.GeneratedVirtual`
+(parser `ddl.go`: `STORED` → false, `VIRTUAL` or bare → true, matching PG18's
+default), threads it through both `CREATE TABLE` column paths in
+`operators_ddl.go` (and clears it under `INCLUDING GENERATED`), and maps it in
+`attGeneratedFor` → `'v'`/`'s'`. The shared `atthasdef`/`pg_attrdef` wiring
+(slice 59) already supplies the expression for both strategies, so pg_dump emits
+the correct clause for each.
+
+Note: goopg materializes **every** generated column on write (STORED storage
+semantics); `GeneratedVirtual` is consumed only by the catalog/dump path. So the
+schema round-trips faithfully (VIRTUAL stays VIRTUAL, round-trip stable), while
+goopg's internal storage strategy is STORED for both — a documented v0
+limitation (true compute-on-read VIRTUAL semantics are a separate, larger
+feature). The runtime is unchanged by this slice.
+
+Parser unit guard: `TestGeneratedColumnStorageStrategy` (STORED → not virtual,
+VIRTUAL → virtual, bare → virtual). Catalog-row guard:
+`TestAttGeneratedForStorageStrategy` (ordinary→"", stored→'s', virtual→'v').
+The pg_dump fixture adds `genv (… varea integer GENERATED ALWAYS AS (w + h)
+VIRTUAL)`; the assertion confirms the dump carries the bare `GENERATED ALWAYS
+AS (w + h)` clause with NO `STORED` keyword.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -1193,6 +1193,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table gen: %v", err)
 	}
 
+	// Slice 194: a VIRTUAL generated column (`GENERATED ALWAYS AS (expr) VIRTUAL`,
+	// PG18) must round-trip preserving its strategy. pg_dump emits
+	// `GENERATED ALWAYS AS (%s)` WITHOUT the `STORED` keyword when
+	// pg_attribute.attgenerated='v' (pg_dump.c dumpTableSchema), and
+	// `… STORED` when 's'. goopg previously reported 's' for every generated
+	// column (attGeneratedFor hardcoded "s"), so a VIRTUAL column dumped as
+	// STORED — a strategy divergence on restore. The parser now records the
+	// declared strategy on catalog.Column.GeneratedVirtual (PG18's default, with
+	// no keyword, is VIRTUAL), and attGeneratedFor maps it to 'v'/'s'. goopg
+	// still materializes every generated column on write; the discriminator is
+	// for catalog/dump fidelity only. `genv` carries a virtual column on its own
+	// table so the assertion is isolated from the slice-59 stored fixture.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.genv (w integer, h integer, "+
+		"varea integer GENERATED ALWAYS AS (w + h) VIRTUAL)"); err != nil {
+		t.Fatalf("create table genv: %v", err)
+	}
+
 	// Slice 60: a MATERIALIZED VIEW must survive the dump. pg_dump dumps a
 	// matview's `AS` clause via the SAME createViewAsClause -> pg_get_viewdef
 	// path as a plain view (pg_dump.c dumpTableSchema, RELKIND_MATVIEW branch:
@@ -3510,6 +3527,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "area integer GENERATED ALWAYS AS (w * h) STORED") {
 			t.Errorf("pg_dump dropped the GENERATED clause on a stored generated column\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 194 (asserted):** a VIRTUAL generated column round-trips with its
+		// generation clause AND its virtual strategy — pg_dump emits
+		// `GENERATED ALWAYS AS (w + h)` with NO trailing `STORED` (attgenerated='v').
+		// Guards that attGeneratedFor reports 'v' for a VIRTUAL column and that the
+		// pg_attrdef expr wiring is shared with the stored path.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.genv (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.genv\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "varea integer GENERATED ALWAYS AS (w + h)") {
+			t.Errorf("pg_dump dropped the GENERATED clause on a virtual generated column\n  full stdout=%q", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "varea integer GENERATED ALWAYS AS (w + h) STORED") {
+			t.Errorf("pg_dump emitted STORED for a VIRTUAL generated column (attgenerated should be 'v')\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 60 (asserted):** a MATERIALIZED VIEW must round-trip. pg_dump
 		// dumps the matview body via the same pg_get_viewdef path as a plain view

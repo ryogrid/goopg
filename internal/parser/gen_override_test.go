@@ -142,3 +142,47 @@ func TestPartitionChildTablespaceAfterWith(t *testing.T) {
 		t.Errorf("expected With[fillfactor]=70, got %q (With=%v)", got, ct.With)
 	}
 }
+
+// TestGeneratedColumnStorageStrategy covers DU-002 slice 194: a generated
+// column records its declared storage strategy (STORED vs VIRTUAL) so
+// pg_attribute.attgenerated can report the PG-faithful 'v'/'s' code and pg_dump
+// re-emits the original keyword. PG18's default (no keyword) is VIRTUAL.
+func TestGeneratedColumnStorageStrategy(t *testing.T) {
+	cases := []struct {
+		name        string
+		decl        string
+		wantVirtual bool
+	}{
+		{"stored", "GENERATED ALWAYS AS (a + 1) STORED", false},
+		{"virtual", "GENERATED ALWAYS AS (a + 1) VIRTUAL", true},
+		{"bare_defaults_virtual", "GENERATED ALWAYS AS (a + 1)", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sql := "CREATE TABLE g (a integer, b integer " + tc.decl + ")"
+			stmts, err := Parse(sql)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			ct := stmts[0].(*CreateTableStmt)
+			var bcol *ColumnDef
+			for i := range ct.Columns {
+				if ct.Columns[i].Name == "b" {
+					bcol = &ct.Columns[i]
+				}
+			}
+			if bcol == nil {
+				t.Fatal("column b not found")
+			}
+			if !bcol.GeneratedAlways {
+				t.Errorf("expected GeneratedAlways=true")
+			}
+			if bcol.GeneratedExpr != "a + 1" {
+				t.Errorf("expected GeneratedExpr='a + 1', got %q", bcol.GeneratedExpr)
+			}
+			if bcol.GeneratedVirtual != tc.wantVirtual {
+				t.Errorf("GeneratedVirtual=%v, want %v", bcol.GeneratedVirtual, tc.wantVirtual)
+			}
+		})
+	}
+}
