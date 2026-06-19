@@ -4984,6 +4984,25 @@ object support.
         float path), `toast.autovacuum_vacuum_cost_delay/limit`, `toast.autovacuum_freeze_*_age`,
         `toast.log_autovacuum_min_duration` — each a one-line gather. NOTE: `toast.autovacuum_analyze_*` is
         HEAP-only (TOAST tables aren't analyzed), PG rejects it — do NOT add. After: composite types.
+      - **PROGRESS 2026-06-19 (loop #42):** **DU-002 slice 227 LANDED — first `RELOPT_KIND_TOAST` *real*
+        reloption (`toast.autovacuum_vacuum_scale_factor`) round-trips; four-element TOAST reloptions array.**
+        `autovacuum_vacuum_scale_factor` is `RELOPT_TYPE_REAL` and shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`
+        (`reloptions.c:404`, range `0.0–100.0`, default `-1`), so PG accepts the `toast.` prefix and stores it
+        (no prefix) on the TOAST relation's reloptions. **Executor** (`operators_ddl.go`): one extra gather
+        block after the slice-226 `toast.autovacuum_vacuum_threshold` arm, reusing the parent-table float path
+        (slice 199): `strconv.ParseFloat` + `!(f >= 0 && f <= 100)` bounds check (also rejects NaN/±Inf;
+        non-float/out-of-range → 22023), appended as `autovacuum_vacuum_scale_factor=<F>` via
+        `FormatFloat(f,'g',-1,64)`. **catalog**: NO change — `strings.Join` over `ToastReloptions` renders
+        `{autovacuum_enabled=false,vacuum_truncate=false,autovacuum_vacuum_threshold=100,autovacuum_vacuum_scale_factor=2.5}`.
+        On dump-out pg_dump re-adds the prefix per element in array order →
+        `WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false', toast.autovacuum_vacuum_threshold='100', toast.autovacuum_vacuum_scale_factor='2.5')`.
+        Files: `internal/executor/operators_ddl.go` (float gather block),
+        `internal/testport/pgdump_connsetup_test.go` (`optoast` fixture carries all four options + updated
+        combined-WITH assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 227). Gates: gofmt OK;
+        `go build ./internal/...` clean; executor+parser+catalog suites PASS; `TestPort_PgDumpConnectionSetup`
+        PASS; pgbench pre-commit smoke on commit. **Next:** `toast.autovacuum_vacuum_cost_delay` (REAL) /
+        `cost_limit` (INT), `toast.autovacuum_freeze_min_age/max_age/table_age` (INT),
+        `toast.log_autovacuum_min_duration` (INT, allows -1) — each a one-line gather. After: composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
