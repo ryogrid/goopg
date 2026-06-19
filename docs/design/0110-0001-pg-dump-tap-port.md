@@ -7305,6 +7305,38 @@ pg_dump 18.3.
 > `buildUserPGAttributeRowForCompositeField` analog of this slice), then `ALTER TYPE … ADD/DROP/ALTER
 > ATTRIBUTE`.
 
+### Slice 252 — composite field whose type is an ARRAY of a user-defined DOMAIN (`f zipcode[]`)
+
+Slice 251 gave a domain its own auto-generated `_name` array type and resolved a domain-array **table
+column**. This slice resolves the matching **composite FIELD** case: `CREATE TYPE rec AS (zips zipcode[])`.
+Like every user-defined field type, `parseCompositeFieldType` records the raw name (`zipcode`) + `[ ]` suffix
+in `CompositeField.ColType` and `TypeNameToOID` folds the unknown name to the `text` fallback, so without a
+re-resolve the field dumped as `zips text[]` instead of `zips public.zipcode[]`. Mirrors the composite-array
+field path (slice 250) but folds to the **domain's** array OID rather than a composite's.
+
+- **`buildUserPGAttributeRowForCompositeField`** — the domain re-resolve (previously gated `!isArray`, scalar
+  only) now also handles the array case: when `cat.LookupDomain(base)` hits and `isArray`, resolve
+  `domainArrayOID = d.ArrayOID` and compute the element layout from the domain's base (`d.BaseOID`, else
+  `TypeNameToOID(d.Base.Name)`) via `userTypeAttrsForOID`; a domain-over-enum base forces int alignment
+  (slice 109/251). New `domainArrayOID` cases in the array-OID switch (`atttypid → domainArrayOID`,
+  `attndims=1`) and the attrs switch (`typlen=-1`, `typstorage='x'`, alignment/collation from the base element).
+- **No `expr.go` change** — `format_type`'s `LookupDomainByArrayOID` branch (slice 251) already renders the
+  array OID as `public.<domain>[]`, and the domain's array `pg_type` row is already synced at `CREATE DOMAIN`
+  (`syncDomainTypeToCatalogHeap`, slice 251), independent of composite types.
+- **Scope**: composite fields one array level deep, matching the table-column and composite-array paths. Nested
+  multi-dimensional domain arrays and `ALTER TYPE` remain future work.
+
+Guarded at two levels: `executor.TestUserPGAttributeCompositeFieldDomainArray` pins `atttypid` → domain
+`ArrayOID`, `attndims=1`, the varlena-array layout, and base-element alignment inheritance (a text-domain field
+→ `'i'`, an int8-domain field → `'d'`, distinctly proving the base element drives alignment), plus the
+`LookupDomainByArrayOID` inverse (scalar OID does NOT resolve via the array path) and the nil-catalog `text[]`
+fallback; the pg_dump TAP port adds `CREATE TYPE public.dom_arr_comp AS (label text, zips zipcode[])` and
+asserts `pg_dump --schema-only` renders the field as `zips public.zipcode[]` (never `zips text[]`),
+byte-matching real pg_dump 18.3.
+
+> **Next (slice 253+):** `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE` (the composite-field type matrix —
+> built-in / enum / domain / composite, scalar and array — is now complete for `CREATE TYPE`).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

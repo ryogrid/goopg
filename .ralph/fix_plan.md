@@ -5418,6 +5418,27 @@ object support.
         on commit. **Next (slice 252+):** composite FIELD whose type is a domain array (`f zipcode[]`,
         `buildUserPGAttributeRowForCompositeField` analog), then `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE`.
 
+      - **PROGRESS 2026-06-20 (loop #18):** **DU-002 slice 252 LANDED — composite FIELD whose type is an
+        ARRAY of a user-defined DOMAIN (`zips zipcode[]`) dumps as the schema-qualified domain array name
+        (`public.zipcode[]`), not the base type's array (`text[]`).** Closes the composite-field type matrix
+        for `CREATE TYPE`. Slice 251 gave a domain its own `_name` array type + resolved a domain-array table
+        COLUMN; this slice is the FIELD analog. `parseCompositeFieldType` folds the unknown domain name to the
+        `text` fallback (composite fields are never base-resolved at parse, unlike table columns), so without a
+        re-resolve the field dumped `zips text[]`. Fix: `buildUserPGAttributeRowForCompositeField`'s domain
+        re-resolve (previously gated `!isArray`) now also handles `isArray` → resolve `domainArrayOID =
+        d.ArrayOID`, compute element layout from the domain's base (`d.BaseOID`, else `TypeNameToOID(d.Base.Name)`;
+        a domain-over-enum forces int alignment); new `domainArrayOID` cases in the array-OID switch
+        (atttypid→ArrayOID, attndims=1) + attrs switch (typlen=-1, typstorage='x', base-element align/collation).
+        No `expr.go` change — `format_type`'s `LookupDomainByArrayOID` branch (251) and the synced domain-array
+        `pg_type` row (`syncDomainTypeToCatalogHeap`, 251) already exist. Guards:
+        `executor.TestUserPGAttributeCompositeFieldDomainArray` (atttypid→ArrayOID, attndims=1, varlena layout,
+        base-element alignment inheritance — text-domain field→'i', int8-domain field→'d', distinctly proving
+        the base drives alignment; `LookupDomainByArrayOID` inverse + scalar-OID non-resolution; nil-cat `text[]`
+        fallback) + pg_dump TAP port adds `CREATE TYPE public.dom_arr_comp AS (label text, zips zipcode[])` and
+        asserts round-trip of `zips public.zipcode[]` (never `zips text[]`) (`TestPort_PgDumpConnectionSetup`
+        PASS, 3.5s). Design: `0110-0001` Slice 252. pgbench pre-commit smoke on commit. **Next (slice 253+):**
+        `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE` (the composite-field type matrix is now complete for CREATE TYPE).
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

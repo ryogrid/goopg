@@ -1516,11 +1516,36 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 	// BASE type (resolved the same way as buildUserPGTypeRowForDomain), since a
 	// domain stores values exactly as its base. Scalar only, mirroring the
 	// table-column path. DU-002 slice 248 (cf. slice 90).
+	// An ARRAY field whose element type is a user-defined DOMAIN (`f zipcode[]`)
+	// also folds to the text fallback. Resolve to the domain's auto-generated
+	// array pg_type OID (d.ArrayOID, synced at CREATE DOMAIN) so format_type
+	// renders the field as `public.<domain>[]` rather than `text[]`; the element
+	// layout follows the domain's BASE type (a domain stores values exactly as
+	// its base). Mirrors the table-column domain-array path. DU-002 slice 252
+	// (cf. scalar slice 248, table-column array slice 251).
 	var domain *catalog.Domain
-	if cat != nil && typOID == catalog.OIDText && !isArray {
+	domainArrayOID := uint32(0)
+	domainArrayAttrs := userTypeAttrs{}
+	if cat != nil && typOID == catalog.OIDText {
 		if d, ok := cat.LookupDomain(base); ok {
-			domain = d
-			typOID = d.OID
+			if isArray {
+				domainArrayOID = d.ArrayOID
+				baseOID := d.BaseOID
+				if baseOID == 0 {
+					baseOID = catalog.TypeNameToOID(d.Base.Name)
+				}
+				domainArrayAttrs = userTypeAttrsForOID(baseOID)
+				if d.BaseIsEnum {
+					// A domain over an enum inherits the enum's int alignment,
+					// which userTypeAttrsForOID can't derive from the dynamic
+					// enum OID (slice 109/251).
+					domainArrayAttrs.TypAlign = 'i'
+					domainArrayAttrs.TypCollation = 0
+				}
+			} else {
+				domain = d
+				typOID = d.OID
+			}
 		}
 	}
 	// A field whose declared type is itself another user-defined COMPOSITE type
@@ -1558,6 +1583,10 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 			// Composite array OIDs are dynamic too. DU-002 slice 250.
 			typOID = compositeArrayOID
 			attndims = 1
+		case domainArrayOID != 0:
+			// Domain array OIDs are dynamic too. DU-002 slice 252.
+			typOID = domainArrayOID
+			attndims = 1
 		default:
 			if aoid := catalog.ArrayOIDForBase(typOID); aoid != 0 {
 				typOID = aoid
@@ -1578,6 +1607,12 @@ func buildUserPGAttributeRowForCompositeField(cat catalog.Catalog, ct *catalog.C
 		// double-aligned (matching the double-aligned composite element),
 		// extended storage. DU-002 slice 250.
 		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: 'd', TypStorage: 'x'}
+	case domainArrayOID != 0:
+		// A domain's array type is a standard varlena array: -1 length, extended
+		// storage, alignment/collation matching the base element (a domain
+		// inherits the base's layout, and an array's alignment equals its
+		// element's). DU-002 slice 252 (cf. slice 251).
+		attrs = userTypeAttrs{TypLen: -1, TypByVal: false, TypAlign: domainArrayAttrs.TypAlign, TypStorage: 'x', TypCollation: domainArrayAttrs.TypCollation}
 	case domain != nil:
 		// A domain inherits its base type's physical layout, resolved exactly as
 		// buildUserPGTypeRowForDomain does (BaseOID, else TypeNameToOID(Base.Name);

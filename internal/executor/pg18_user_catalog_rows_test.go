@@ -1298,6 +1298,99 @@ func TestUserPGAttributeCompositeFieldCompositeArray(t *testing.T) {
 	}
 }
 
+// TestUserPGAttributeCompositeFieldDomainArray pins the DOMAIN-ARRAY-FIELD
+// resolution (DU-002 slice 252). A composite field whose declared type is an
+// array of a user-defined DOMAIN (`zips zipcode[]`) folds to the text fallback
+// inside parseCompositeFieldType (the parser records the raw domain name + `[ ]`
+// suffix in ColType). The builder must re-resolve it to the domain's
+// auto-generated array pg_type OID (d.ArrayOID), report attndims=1 and the
+// varlena-array layout (-1 length, extended storage, alignment inherited from
+// the domain's BASE element), so pg_dump renders the field as `public.<domain>[]`
+// rather than `text[]`. LookupDomainByArrayOID is the inverse used by
+// format_type. Without the catalog (cat==nil) it must degrade to `text[]`.
+func TestUserPGAttributeCompositeFieldDomainArray(t *testing.T) {
+	const (
+		atttypidIdx   = 2
+		attlenIdx     = 3
+		attndimsIdx   = 6
+		attbyvalIdx   = 7
+		attalignIdx   = 8
+		attstorageIdx = 9
+	)
+	cat := catalog.NewInMemory()
+	// text-based domain: array element inherits text's int alignment ('i').
+	dz, err := cat.RegisterDomain("zipcode", catalog.Type{Name: "text"}, false)
+	if err != nil {
+		t.Fatalf("RegisterDomain zipcode: %v", err)
+	}
+	// int8-based domain: array element inherits int8's double alignment ('d'),
+	// distinctly proving base-element-alignment inheritance (text would be 'i').
+	dq, err := cat.RegisterDomain("bigq", catalog.Type{Name: "int8"}, false)
+	if err != nil {
+		t.Fatalf("RegisterDomain bigq: %v", err)
+	}
+	// CREATE TYPE rec AS (name text, zips zipcode[], qs bigq[]): the parser
+	// records the array suffix space-joined, matching slice 246/247/250.
+	ct := cat.RegisterCompositeTypeWithFields("rec", []catalog.CompositeField{
+		{Name: "name", ColType: "text"},
+		{Name: "zips", ColType: "zipcode [ ]"},
+		{Name: "qs", ColType: "bigq [ ]"},
+	})
+
+	// text-based domain array field → domain array OID + varlena-array layout,
+	// int-aligned (text base).
+	a1 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[1], 2)
+	if got := uint32(a1[atttypidIdx].Int); got != dz.ArrayOID {
+		t.Errorf("zips field: atttypid=%d want %d (domain array OID)", got, dz.ArrayOID)
+	}
+	if got := a1[attndimsIdx].Int; got != 1 {
+		t.Errorf("zips field: attndims=%d want 1", got)
+	}
+	if got := a1[attlenIdx].Int; got != -1 {
+		t.Errorf("zips field: attlen=%d want -1 (varlena array)", got)
+	}
+	if got := a1[attbyvalIdx].BoolValue(); got != false {
+		t.Errorf("zips field: attbyval=%v want false", got)
+	}
+	if got := a1[attalignIdx].StringValue(); got != "i" {
+		t.Errorf("zips field: attalign=%q want \"i\" (text base)", got)
+	}
+	if got := a1[attstorageIdx].StringValue(); got != "x" {
+		t.Errorf("zips field: attstorage=%q want \"x\" (extended)", got)
+	}
+
+	// int8-based domain array field → domain array OID, double-aligned (int8 base):
+	// distinctly proves base-element alignment inheritance.
+	a2 := buildUserPGAttributeRowForCompositeField(cat, ct, ct.Fields[2], 3)
+	if got := uint32(a2[atttypidIdx].Int); got != dq.ArrayOID {
+		t.Errorf("qs field: atttypid=%d want %d (domain array OID)", got, dq.ArrayOID)
+	}
+	if got := a2[attndimsIdx].Int; got != 1 {
+		t.Errorf("qs field: attndims=%d want 1", got)
+	}
+	if got := a2[attalignIdx].StringValue(); got != "d" {
+		t.Errorf("qs field: attalign=%q want \"d\" (int8 base)", got)
+	}
+
+	// LookupDomainByArrayOID is the inverse used by format_type. The array OID
+	// resolves to the domain; the SCALAR OID must NOT resolve via the array path
+	// (it is reached through LookupDomainByOID/LookupDomain instead).
+	if got, ok := cat.LookupDomainByArrayOID(dz.ArrayOID); !ok || got.Name != "zipcode" {
+		t.Errorf("LookupDomainByArrayOID(%d)=%v,%v want zipcode,true", dz.ArrayOID, got, ok)
+	}
+	if _, ok := cat.LookupDomainByArrayOID(dz.OID); ok {
+		t.Errorf("LookupDomainByArrayOID(scalar domain OID) unexpectedly resolved")
+	}
+
+	// Without a catalog the domain cannot be resolved, so the array suffix degrades
+	// to the built-in text array (`text[]`, OID 1009) — the same fallback an
+	// unknown scalar element takes through ArrayOIDForBase.
+	aNil := buildUserPGAttributeRowForCompositeField(nil, ct, ct.Fields[1], 2)
+	if got := uint32(aNil[atttypidIdx].Int); got != catalog.OIDArrayText {
+		t.Errorf("zips field (nil cat): atttypid=%d want %d (text[] fallback)", got, catalog.OIDArrayText)
+	}
+}
+
 // TestUserPGAttributeEnumArrayColumn pins the enum-ARRAY resolution (DU-002
 // slice 89). A `mood[]` column must report pg_attribute.atttypid = the enum's
 // auto-generated array OID (et.ArrayOID = et.OID+1), attndims=1, and carry a
