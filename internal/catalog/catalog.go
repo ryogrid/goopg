@@ -528,6 +528,18 @@ type Table struct {
 	// (DU-002 slice 204).
 	AutovacuumVacuumInsertThreshold    int
 	AutovacuumVacuumInsertThresholdSet bool
+
+	// VacuumTruncate stores the table's `WITH (vacuum_truncate=BOOL)` storage
+	// parameter (RELOPT_TYPE_BOOL, reloptions.c:1915; default true). Like
+	// autovacuum_enabled the value itself carries no default that a zero check
+	// could detect, so VacuumTruncateSet — not a zero check — guards whether the
+	// option was specified. When set, pg_class.reloptions gains the text[]
+	// element `vacuum_truncate=true|false`, which pg_dump renders back as
+	// `WITH (vacuum_truncate='true'|'false')`. goopg has no VACUUM truncation, so
+	// the value is catalog/dump-only (advisory; runtime unaffected). M0110-0001
+	// (DU-002 slice 205).
+	VacuumTruncate    bool
+	VacuumTruncateSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2280,6 +2292,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.AutovacuumVacuumInsertThresholdSet {
 				relopts = append(relopts, "autovacuum_vacuum_insert_threshold="+strconv.Itoa(t.AutovacuumVacuumInsertThreshold))
+			}
+			if t.VacuumTruncateSet {
+				relopts = append(relopts, "vacuum_truncate="+strconv.FormatBool(t.VacuumTruncate))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

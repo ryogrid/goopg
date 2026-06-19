@@ -5958,6 +5958,29 @@ confirms the dump carries `WITH (autovacuum_vacuum_insert_threshold='1000')`. Th
 exhausts the INT autovacuum-namespace reloptions; the remaining storage parameters
 are the non-autovacuum families (e.g. `vacuum_truncate` bool, `log_autovacuum_*`).
 
+### Slice 205 — boolean `vacuum_truncate` reloption round-trip
+
+Steps off the autovacuum namespace onto the VACUUM-truncation family, reusing the
+slice-196 `autovacuum_enabled` boolean path. `vacuum_truncate` is `RELOPT_TYPE_BOOL`
+with `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` and a default of **true**
+(`reloptions.c:152/1915`; "Enables vacuum to truncate empty pages at the end of this
+table"). Because the value itself (true/false) carries no zero-detectable default, a
+separate `VacuumTruncateSet` flag records presence so an explicit `vacuum_truncate=false`
+round-trips. The executor parses via `parseReloptionBool` (PG's `parse_bool`
+prefix-matching: true/false, on/off, yes/no, 1/0, t/f, y/n — a non-boolean → `22023`).
+It persists `catalog.Table.VacuumTruncate` (a `bool`); the pg_class virtual view
+appends `vacuum_truncate=true|false` after `autovacuum_vacuum_insert_threshold`;
+pg_dump renders `WITH (vacuum_truncate='false')`. goopg has no VACUUM truncation, so
+the value is advisory catalog/dump-only, base-table-only — same as the sibling
+reloption slices.
+
+Engine guards: `TestVacuumTruncateSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,vacuum_truncate=false}`; `on`-spelling normalizing to
+`{vacuum_truncate=true}`; plain table → no reloptions) and
+`TestVacuumTruncateInvalidValueRejected` (`maybe`/`2`/`tru3` → 22023). The pg_dump
+fixture adds `optvt (… WITH (vacuum_truncate=false))` on its own table; the assertion
+confirms the dump carries `WITH (vacuum_truncate='false')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

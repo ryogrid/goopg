@@ -989,6 +989,95 @@ func TestAutovacuumVacuumInsertThresholdOutOfBoundsRejected(t *testing.T) {
 	}
 }
 
+// TestVacuumTruncateSurfacesInPgClassReloptions verifies that a `WITH
+// (vacuum_truncate=BOOL)` storage parameter declared on CREATE TABLE is
+// persisted on the catalog table and surfaced through the pg_class virtual
+// view's reloptions cell. vacuum_truncate is a boolean reloption
+// (RELOPT_TYPE_BOOL); cases pin: false alongside fillfactor (combined
+// `{fillfactor=70,vacuum_truncate=false}`), the `on` spelling normalizing to
+// `true`, and a plain table (no reloptions). pg_dump renders the array back as
+// `WITH (vacuum_truncate='false')`. goopg has no VACUUM truncation, so the
+// value is catalog/dump-only. DU-002 slice 205.
+func TestVacuumTruncateSurfacesInPgClassReloptions(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE vt (id integer PRIMARY KEY) WITH (fillfactor=70, vacuum_truncate=false)`); err != nil {
+		t.Fatalf("CREATE TABLE vt: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE vton (id integer PRIMARY KEY) WITH (vacuum_truncate=on)`); err != nil {
+		t.Fatalf("CREATE TABLE vton: %v", err)
+	}
+	if err := runDDL(t, ctx, `CREATE TABLE vtplain (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE vtplain: %v", err)
+	}
+
+	vtTbl, ok := cat.LookupTable(parser.ObjectName{Name: "vt"})
+	if !ok {
+		t.Fatal("vt table not found")
+	}
+	if !vtTbl.VacuumTruncateSet || vtTbl.VacuumTruncate {
+		t.Errorf("vt.VacuumTruncate = %v (set=%v), want false (set=true)", vtTbl.VacuumTruncate, vtTbl.VacuumTruncateSet)
+	}
+	onTbl, ok := cat.LookupTable(parser.ObjectName{Name: "vton"})
+	if !ok {
+		t.Fatal("vton table not found")
+	}
+	if !onTbl.VacuumTruncateSet || !onTbl.VacuumTruncate {
+		t.Errorf("vton.VacuumTruncate = %v (set=%v), want true (set=true)", onTbl.VacuumTruncate, onTbl.VacuumTruncateSet)
+	}
+	plainTbl, ok := cat.LookupTable(parser.ObjectName{Name: "vtplain"})
+	if !ok {
+		t.Fatal("vtplain table not found")
+	}
+	if plainTbl.VacuumTruncateSet {
+		t.Errorf("vtplain.VacuumTruncateSet = true, want false (unset)")
+	}
+
+	pgClass, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_class"})
+	if !ok || pgClass.VirtualRows == nil {
+		t.Fatal("pg_class virtual table not found")
+	}
+	got := map[string]string{}
+	for _, r := range pgClass.VirtualRows() {
+		if len(r) > 32 && (r[1] == "vt" || r[1] == "vton" || r[1] == "vtplain") {
+			got[r[1]] = r[32]
+		}
+	}
+	if got["vt"] != "{fillfactor=70,vacuum_truncate=false}" {
+		t.Errorf("pg_class.reloptions for vt = %q, want %q", got["vt"], "{fillfactor=70,vacuum_truncate=false}")
+	}
+	if got["vton"] != "{vacuum_truncate=true}" {
+		t.Errorf("pg_class.reloptions for vton = %q, want %q", got["vton"], "{vacuum_truncate=true}")
+	}
+	if got["vtplain"] != "" {
+		t.Errorf("pg_class.reloptions for vtplain = %q, want \"\" (NULL)", got["vtplain"])
+	}
+}
+
+// TestVacuumTruncateInvalidValueRejected verifies CREATE TABLE rejects a
+// non-boolean vacuum_truncate value with PG's 22023 error. DU-002 slice 205.
+func TestVacuumTruncateInvalidValueRejected(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	for i, v := range []string{"maybe", "2", "tru3"} {
+		err := runDDL(t, ctx, `CREATE TABLE vtbad`+strconv.Itoa(i)+` (id integer) WITH (vacuum_truncate=`+v+`)`)
+		if err == nil {
+			t.Errorf("vacuum_truncate=%s: expected an invalid-value error, got nil", v)
+			continue
+		}
+		ee, ok := err.(*ExecError)
+		if !ok {
+			t.Errorf("vacuum_truncate=%s: error type = %T, want *ExecError", v, err)
+			continue
+		}
+		if ee.Code != "22023" {
+			t.Errorf("vacuum_truncate=%s: error code = %q, want 22023", v, ee.Code)
+		}
+	}
+}
+
 // TestFillfactorOutOfBoundsRejected verifies CREATE TABLE rejects a fillfactor
 // outside the valid 10–100 range with PG's 22023 error, mirroring the existing
 // CREATE INDEX bounds check. DU-002 slice 54.

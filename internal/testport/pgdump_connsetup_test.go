@@ -821,6 +821,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table optavit: %v", err)
 	}
 
+	// Slice 205: the boolean vacuum_truncate storage parameter
+	// (RELOPT_TYPE_BOOL, default true), reusing the slice-196 autovacuum_enabled
+	// boolean path (a separate set flag records presence — the value carries no
+	// zero-detectable default). goopg validated the lowercase WITH key but never
+	// extracted/persisted it, so it vanished from the dump. The fix stores
+	// catalog.Table.VacuumTruncate; the pg_class virtual view renders
+	// `{vacuum_truncate=false}`, which pg_dump emits as
+	// `WITH (vacuum_truncate='false')`. goopg has no VACUUM truncation, so the
+	// value is catalog/dump-only (advisory). `optvt` carries it on its own table
+	// to keep the other reloption assertions intact.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optvt (id integer PRIMARY KEY) WITH (vacuum_truncate=false)"); err != nil {
+		t.Fatalf("create table optvt: %v", err)
+	}
+
 	// Slice 166: an UNLOGGED table must round-trip as `CREATE UNLOGGED TABLE`.
 	// pg_dump keys the UNLOGGED keyword off pg_class.relpersistence ==
 	// RELPERSISTENCE_UNLOGGED ('u') (pg_dump.c dumpTableSchema). The parser
@@ -2602,6 +2616,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "WITH (autovacuum_vacuum_insert_threshold='1000')") {
 			t.Errorf("pg_dump dropped the autovacuum_vacuum_insert_threshold reloption; missing %q\n  full stdout=%q", "WITH (autovacuum_vacuum_insert_threshold='1000')", res.Stdout)
+		}
+		// **Slice 205 closed (asserted):** the boolean vacuum_truncate storage
+		// parameter (RELOPT_TYPE_BOOL, default true) must round-trip via the
+		// slice-196 autovacuum_enabled boolean path (a separate set flag records
+		// presence). goopg validated the lowercase WITH key but never
+		// extracted/persisted it, so it vanished from the dump.
+		// catalog.Table.VacuumTruncate now persists it and the pg_class virtual
+		// view renders `{vacuum_truncate=false}`, which pg_dump emits as
+		// `WITH (vacuum_truncate='false')`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.optvt (") {
+			t.Errorf("pg_dump missing CREATE TABLE public.optvt\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "WITH (vacuum_truncate='false')") {
+			t.Errorf("pg_dump dropped the vacuum_truncate reloption; missing %q\n  full stdout=%q", "WITH (vacuum_truncate='false')", res.Stdout)
 		}
 		// **Slice 166 closed (asserted):** an UNLOGGED table was silently demoted
 		// to a logged one because buildUserPGClassRow hardcoded relpersistence to

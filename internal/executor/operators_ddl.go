@@ -1204,6 +1204,25 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		autovacuumVacuumInsertThreshold = avit
 		autovacuumVacuumInsertThresholdSet = true
 	}
+	// Extract and parse the vacuum_truncate storage parameter — a boolean
+	// reloption (RELOPT_TYPE_BOOL, reloptions.c:1915; RELOPT_KIND_HEAP|TOAST,
+	// default true) that reuses the slice-196 autovacuum_enabled boolean path.
+	// PG accepts the usual boolean spellings (true/false, on/off, yes/no, 1/0,
+	// t/f, y/n; case-insensitive) via parse_bool. goopg has no VACUUM truncation,
+	// so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (vacuum_truncate='true')`.
+	// M0110-0001 (DU-002 slice 205).
+	vacuumTruncate := false
+	vacuumTruncateSet := false
+	if v, ok := s.With["vacuum_truncate"]; ok {
+		b, parsed := parseReloptionBool(strings.TrimSpace(v))
+		if !parsed {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for boolean option \"vacuum_truncate\": %s", v)}
+		}
+		vacuumTruncate = b
+		vacuumTruncateSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1275,6 +1294,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.AutovacuumAnalyzeThresholdSet = autovacuumAnalyzeThresholdSet
 	tbl.AutovacuumVacuumInsertThreshold = autovacuumVacuumInsertThreshold
 	tbl.AutovacuumVacuumInsertThresholdSet = autovacuumVacuumInsertThresholdSet
+	tbl.VacuumTruncate = vacuumTruncate
+	tbl.VacuumTruncateSet = vacuumTruncateSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

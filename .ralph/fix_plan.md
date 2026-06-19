@@ -4510,6 +4510,25 @@ object support.
         tests PASS; `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** the
         INT autovacuum-namespace reloptions are now exhausted; remaining storage params are non-autovacuum
         families (`vacuum_truncate` bool, `log_autovacuum_*`); or composite types (`CREATE TYPE AS`; larger).
+      - **PROGRESS 2026-06-19 (loop #18):** **DU-002 slice 205 LANDED — boolean `vacuum_truncate`
+        storage parameter round-trips through pg_dump.** Steps off the autovacuum namespace onto the
+        VACUUM-truncation family, reusing the slice-196 `autovacuum_enabled` boolean path verbatim.
+        `vacuum_truncate` is `RELOPT_TYPE_BOOL`, `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST`, default true
+        (`reloptions.c:152/1915`). Executor parses via `parseReloptionBool` (PG `parse_bool`: true/false,
+        on/off, yes/no, 1/0, t/f, y/n; non-boolean → `22023`), separate `VacuumTruncateSet` flag records
+        presence so explicit `vacuum_truncate=false` round-trips. Persist `catalog.Table.VacuumTruncate`
+        (bool); pg_class virtual view appends `vacuum_truncate=true|false` after
+        `autovacuum_vacuum_insert_threshold`; pg_dump renders `WITH (vacuum_truncate='false')`. Advisory
+        catalog/dump-only; base-table-only. Files: `internal/catalog/catalog.go`
+        (`Table.VacuumTruncate`/`…Set` + render), `internal/executor/operators_ddl.go` (extract/parse +
+        persist), `internal/executor/operators_fillfactor_reloptions_test.go` (NEW
+        `TestVacuumTruncateSurfacesInPgClassReloptions` + `TestVacuumTruncateInvalidValueRejected`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `optvt` fixture + assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 205). No parser change needed. Gates: gofmt OK;
+        `go build ./internal/...` clean; `go vet catalog/executor/testport` clean; catalog/executor reloption
+        tests PASS; `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:** more
+        non-autovacuum reloption families (`log_autovacuum_min_duration` int, `toast.*` namespace); or
+        composite types (`CREATE TYPE AS`; larger, `pg_class.reltype` hardcoded 0).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
