@@ -5692,6 +5692,25 @@ object support.
         pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 263. **Next (slice 264+):** per-partition
         column-level options on a partition child, or `INHERITS`-tree dump fidelity beyond the single child.
 
+      - **PROGRESS 2026-06-20 (loop #31):** **DU-002 slice 264 LANDED — a CHILD-ONLY CHECK constraint on a partition
+        leaf round-trips through pg_dump.** Every prior partition fixture (`psub*`/`part`/`prange*`/`pmc`/`pdef`/`pfo`/
+        `ptbs`/`puse`) exercised the leaf's *bound* and storage/access-method clauses but never a **local constraint**.
+        A partition child prints NO columns in its dumped `CREATE TABLE` body (all inherited from the parent → pg_dump's
+        `shouldPrintColumn` is false), but a named CHECK declared in the `PARTITION OF` column-override list
+        (`CREATE TABLE public.pchk_1 PARTITION OF public.pchk (CONSTRAINT pchk_1_pos CHECK (a > 0)) FOR VALUES IN (1)`) is
+        **local** to the leaf: the parser collects it into `PartitionOfClause.CheckConstraints` (`ddl.go` ~1516),
+        `execCreatePartitionChild` routes it through `tbl.AddCheck` (`IsLocal=true`/`InhCount=0`, `catalog.go`), the
+        `pg_constraint` `VirtualRows` emits the row with `conislocal='t'`/`conrelid`=leaf OID, and `pg_get_constraintdef`
+        renders `CHECK ((a > 0))` (`expr.go` ~6727). The real pg_dump 18.3 therefore emits `CONSTRAINT pchk_1_pos CHECK
+        ((a > 0))` inside the leaf's column-less `CREATE TABLE` body + `ATTACH PARTITION public.pchk_1 FOR VALUES IN (1)`.
+        **No production code changed** — the column-override-list CHECK path (M0097-0023) and the
+        `pg_constraint`/`pg_get_constraintdef` CHECK branches (slice 49) already existed; this slice proves the
+        partition-leaf local-constraint dump path end to end and guards a silent `conislocal`/constraint-row regression.
+        **pg_dump fixture** (`pgdump_connsetup_test.go`): `pchk`/`pchk_1` + asserts `CONSTRAINT pchk_1_pos CHECK ((a > 0))`
+        and the ATTACH bound. Guard: `TestPort_PgDumpConnectionSetup` PASS (3.35s, byte-matches real pg_dump 18.3). gofmt
+        + `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 264. **Next (slice 265+):**
+        a child-only `DEFAULT`/`NOT NULL` override on a partition leaf, or a local constraint on a legacy `INHERITS` child.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

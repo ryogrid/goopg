@@ -1,25 +1,27 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 263 (loop #30) — a WIDE multi-level partition tree now
-round-trips through pg_dump. Slice 171 proved a single-chain sub-partitioned tree
-(`psub_east` middle node + one leaf `psub_east_lo`); this slice widens it to the two
-real fan-out shapes: (a) a second leaf `psub_east_hi` under the SAME middle node (two
-pg_inherits rows → same parent; per-parent inhseqno increments per leaf), and (b) a
-SIBLING sub-partitioned middle node `psub_west` + leaf `psub_west_lo` whose bound text
-is IDENTICAL to psub_east_lo's, so the leaf→parent link is proven from PartitionParentOID
-not the bound. NO production code changed — pg_inherits already keys each parent row off
-the child's own PartitionParentOID (catalog.go ~4110).
+Last landed: DU-002 slice 264 (loop #31) — a CHILD-ONLY CHECK constraint on a
+partition leaf now round-trips through pg_dump. Prior partition fixtures only
+exercised bounds + storage/access-method clauses, never a local constraint on a
+leaf. `pchk_1` is a LIST leaf of `pchk` carrying `(CONSTRAINT pchk_1_pos CHECK
+(a > 0))` in its PARTITION OF column-override list. A partition child prints NO
+columns (all inherited), but the named CHECK is LOCAL (IsLocal=true via
+tbl.AddCheck), so pg_constraint emits conislocal='t' and pg_get_constraintdef
+renders `CHECK ((a > 0))`; real pg_dump 18.3 emits `CONSTRAINT pchk_1_pos CHECK
+((a > 0))` inside the column-less CREATE TABLE + the ATTACH. NO production code
+changed — column-override CHECK path (M0097-0023) + pg_constraint/
+pg_get_constraintdef CHECK branches (slice 49) already existed; proven+guarded.
 
 Files (test/docs only):
-- internal/testport/pgdump_connsetup_test.go — three new children on the psub tree +
-  assertions (psub_east_hi ATTACH; psub_west CREATE TABLE + ATTACH-to-top LIST bound;
-  full single-line ALTER TABLE ONLY public.psub_west ATTACH ... psub_west_lo for the
-  immediate-parent link).
-- docs/design/0110-0001-pg-dump-tap-port.md — Slice 263 section + Next note.
-- .ralph/fix_plan.md — slice 263 progress entry.
+- internal/testport/pgdump_connsetup_test.go — pchk/pchk_1 fixture (after the
+  psub block) + two assertions (CONSTRAINT pchk_1_pos CHECK ((a > 0)); ATTACH
+  PARTITION public.pchk_1 FOR VALUES IN (1)).
+- docs/design/0110-0001-pg-dump-tap-port.md — Slice 264 section + Next note.
+- .ralph/fix_plan.md — slice 264 progress entry.
 
-Gates: gofmt clean; go build ./... clean; TestPort_PgDumpConnectionSetup PASS (3.33s,
-byte-matches real pg_dump 18.3); pgbench pre-commit smoke runs on commit.
+Gates: gofmt clean; go build ./... clean; TestPort_PgDumpConnectionSetup PASS
+(3.35s, byte-matches real pg_dump 18.3); pgbench pre-commit smoke runs on commit.
 
-Next (slice 264+): per-partition column-level options on a partition child (child-only
-NOT NULL / DEFAULT / CHECK), or INHERITS-tree dump fidelity beyond the single child.
+Next (slice 265+): a child-only DEFAULT or NOT NULL override on a partition leaf
+(the other two column-override forms), or a local constraint on a legacy
+INHERITS child (inheritance-tree dump fidelity beyond the single child).

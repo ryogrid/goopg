@@ -1311,6 +1311,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create leaf partition psub_west_lo: %v", err)
 	}
 
+	// Slice 264: a CHILD-ONLY CHECK constraint on a LIST partition leaf must
+	// round-trip through pg_dump. A partition child inherits every column from
+	// the partitioned parent, so pg_dump prints NONE of them (shouldPrintColumn
+	// is false for an inherited attribute) — the leaf's CREATE TABLE body is
+	// otherwise empty. But a named CHECK declared in the PARTITION OF
+	// column-override list (`(CONSTRAINT pchk_1_pos CHECK (a > 0))`) is LOCAL to
+	// the leaf: execCreatePartitionChild routes it through tbl.AddCheck, which
+	// records IsLocal=true / InhCount=0 (operators_ddl.go ~3178). goopg's
+	// pg_constraint VirtualRows then emits that row with conislocal='t',
+	// conrelid=leaf OID, and pg_get_constraintdef renders `CHECK ((a > 0))`
+	// (expr.go ~6727), so the real pg_dump 18.3 emits `CONSTRAINT pchk_1_pos
+	// CHECK ((a > 0))` INSIDE the leaf's column-less CREATE TABLE body, then the
+	// ATTACH. Every prior partition fixture (psub*/part/prange*/pmc/pdef/pfo/
+	// ptbs/puse) left the partition-leaf local-constraint dump path untested; this
+	// slice proves and guards it. No production change.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pchk (a integer) PARTITION BY LIST (a)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pchk: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pchk_1 PARTITION OF public.pchk (CONSTRAINT pchk_1_pos CHECK (a > 0)) FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pchk_1 with child-only CHECK: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -3607,6 +3629,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ALTER TABLE ONLY public.psub_west ATTACH PARTITION public.psub_west_lo FOR VALUES FROM (0) TO (100)") {
 			t.Errorf("pg_dump linked the leaf psub_west_lo to the wrong parent; missing immediate-parent ATTACH %q\n  full stdout=%q", "ALTER TABLE ONLY public.psub_west ATTACH PARTITION public.psub_west_lo FOR VALUES FROM (0) TO (100)", res.Stdout)
+		}
+		// **Slice 264 (asserted):** child-only CHECK on a partition leaf. The leaf
+		// pchk_1 inherits column `a` from pchk (pg_dump prints no columns for it),
+		// but its locally-declared CHECK (conislocal='t') must survive: pg_dump
+		// emits `CONSTRAINT pchk_1_pos CHECK ((a > 0))` inside the otherwise
+		// column-less CREATE TABLE body, then the LIST-bound ATTACH. A regression
+		// that dropped conislocal, the pg_constraint row, or the
+		// pg_get_constraintdef CHECK branch would lose the constraint silently.
+		if !strings.Contains(res.Stdout, "CONSTRAINT pchk_1_pos CHECK ((a > 0))") {
+			t.Errorf("pg_dump dropped the partition leaf's child-only CHECK; missing %q\n  full stdout=%q", "CONSTRAINT pchk_1_pos CHECK ((a > 0))", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pchk_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pchk_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged

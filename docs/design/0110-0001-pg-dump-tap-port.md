@@ -7686,8 +7686,31 @@ No production code changed — `pg_inherits` already keys each parent row off th
 
 Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
 
-> **Next (slice 264+):** per-partition column-level options on a partition child (e.g. a child-only `NOT NULL` /
-> `DEFAULT` / `CHECK`), or `INHERITS`-tree dump fidelity beyond the single child.
+### Slice 264 — child-only `CHECK` constraint on a partition leaf
+
+The whole partition-fixture family so far (`psub*`, `part`, `prange*`, `pmc`, `pdef`, `pfo`, `ptbs`, `puse`) exercised
+the *bound* (the `ATTACH … FOR VALUES …`) and the leaf's storage/access-method clauses, but never a **local
+constraint** on a partition child. This slice adds one: `pchk_1` is a `LIST` leaf of `pchk` carrying
+`(CONSTRAINT pchk_1_pos CHECK (a > 0))` in its `PARTITION OF` column-override list.
+
+The interesting property is that a partition child prints **no columns** in its dumped `CREATE TABLE` body — every
+attribute is inherited from the partitioned parent, so pg_dump's `shouldPrintColumn` is false for all of them. The CHECK,
+by contrast, is *local* to the leaf: the parser collects it into `PartitionOfClause.CheckConstraints` (`ddl.go` ~1516)
+and `execCreatePartitionChild` routes it through `tbl.AddCheck`, which stamps `IsLocal=true` / `InhCount=0`
+(`catalog.go::AddCheck`). goopg's `pg_constraint` `VirtualRows` then emits that row with `conislocal='t'`,
+`conrelid`=leaf OID, and `pg_get_constraintdef` renders `CHECK ((a > 0))` (the double-paren deparser form, `expr.go`
+~6727). The real pg_dump 18.3 therefore emits `CONSTRAINT pchk_1_pos CHECK ((a > 0))` inside the leaf's otherwise
+column-less `CREATE TABLE` body, followed by the `ATTACH PARTITION public.pchk_1 FOR VALUES IN (1)`.
+
+No production code changed — the column-override-list CHECK path (M0097-0023) and the `pg_constraint`/`pg_get_constraintdef`
+CHECK branches (slice 49) already existed; this slice proves the partition-leaf local-constraint dump path end to end and
+guards it against a silent `conislocal`/constraint-row regression.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+> **Next (slice 265+):** a child-only `DEFAULT` or `NOT NULL` override on a partition leaf (the other two
+> column-override forms), or `INHERITS`-tree dump fidelity beyond the single child (local constraint on a legacy
+> inheritance child).
 
 ## Deferred (002–010) — catalog surface estimate
 
