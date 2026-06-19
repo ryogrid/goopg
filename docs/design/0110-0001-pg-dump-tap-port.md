@@ -6515,6 +6515,37 @@ relation leaks into the dump.
 (`toast.autovacuum_vacuum_threshold`, `toast.autovacuum_vacuum_scale_factor`, … — each a one-line
 addition now that the TOAST-row machinery exists), then `toast_tuple_target`/composite types.
 
+### Slice 225 — second `toast.*` reloption (`toast.vacuum_truncate`); multi-element TOAST reloptions array
+
+Adds `toast.vacuum_truncate`, the second `RELOPT_KIND_TOAST` boolean, and exercises the **multi-element**
+TOAST reloptions array that slice 224's machinery already supported but never tested. `vacuum_truncate`
+shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` with `autovacuum_enabled` (`reloptions.c:152`/`107`), so PG
+accepts `toast.vacuum_truncate` and keeps it (without the prefix) on the TOAST relation's
+`pg_class.reloptions` alongside `autovacuum_enabled`.
+
+- **Executor** (`operators_ddl.go`): one extra gather block after the slice-224 `toast.autovacuum_enabled`
+  arm, in fixed code order. `toast.vacuum_truncate` is validated via `parseReloptionBool` (non-boolean →
+  22023) and appended to the same `toastReloptions` slice as `vacuum_truncate=<bool>` (no prefix), mirroring
+  the parent-table `vacuum_truncate` path (slice 205) onto the TOAST relation.
+- **catalog** (`catalog.go`): no change. The `pg_class` view already `strings.Join`s `t.ToastReloptions`
+  with commas, so the synthesized `pg_toast_<oid>` row's `reloptions` cell becomes
+  `{autovacuum_enabled=false,vacuum_truncate=false}` for a table carrying both — the array-element path was
+  built in slice 224 and is first exercised here.
+
+On dump-out, pg_dump reads the TOAST relation's `reloptions` array via the `reltoastrelid` join and emits
+each element (array order = goopg's code order) with the `toast.` prefix re-added:
+`WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false')`.
+
+Engine guard: the pg_dump fixture's `optoast` table now carries both options
+(`WITH (toast.autovacuum_enabled=false, toast.vacuum_truncate=false)`); the assertion confirms the dump
+carries the combined `WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false')` clause and
+that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
+
+**Next:** the remaining `RELOPT_KIND_TOAST` integer/float autovacuum options
+(`toast.autovacuum_vacuum_threshold`, `toast.autovacuum_vacuum_scale_factor`,
+`toast.log_autovacuum_min_duration`, `toast.autovacuum_freeze_*_age`, … — each a one-line gather addition
+reusing the established int/float reloption paths), then composite types.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

@@ -738,7 +738,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// reltoastrelid at it, so pg_dump emits `WITH (toast.autovacuum_enabled='false')`.
 	// goopg has no TOAST, so the value is catalog/dump-only (advisory). `optoast`
 	// carries it on its own table to keep the other reloption assertions intact.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.optoast (id integer PRIMARY KEY) WITH (toast.autovacuum_enabled=false)"); err != nil {
+	// Slice 225 adds a second RELOPT_KIND_TOAST boolean (`toast.vacuum_truncate`)
+	// to the same table, exercising the multi-element toast reloptions array: the
+	// synthesized TOAST relation's pg_class.reloptions becomes
+	// `{autovacuum_enabled=false,vacuum_truncate=false}` and pg_dump re-emits both
+	// in code order — `WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false')`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.optoast (id integer PRIMARY KEY) WITH (toast.autovacuum_enabled=false, toast.vacuum_truncate=false)"); err != nil {
 		t.Fatalf("create table optoast: %v", err)
 	}
 
@@ -2783,8 +2788,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if !strings.Contains(res.Stdout, "CREATE TABLE public.optoast (") {
 			t.Errorf("pg_dump missing CREATE TABLE public.optoast\n  full stdout=%q", res.Stdout)
 		}
-		if !strings.Contains(res.Stdout, "WITH (toast.autovacuum_enabled='false')") {
-			t.Errorf("pg_dump dropped the toast.autovacuum_enabled reloption; missing %q\n  full stdout=%q", "WITH (toast.autovacuum_enabled='false')", res.Stdout)
+		// **Slice 225 closed (asserted):** a second RELOPT_KIND_TOAST boolean
+		// (toast.vacuum_truncate) on the same table exercises the multi-element
+		// toast reloptions array. The synthesized TOAST relation's reloptions are
+		// `{autovacuum_enabled=false,vacuum_truncate=false}` (code order), so
+		// pg_dump emits both prefixed options in one WITH clause.
+		if !strings.Contains(res.Stdout, "WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false')") {
+			t.Errorf("pg_dump dropped a toast.* reloption; missing %q\n  full stdout=%q", "WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false')", res.Stdout)
 		}
 		// The synthesized TOAST relation must never be dumped as its own object.
 		if strings.Contains(res.Stdout, "pg_toast_") {

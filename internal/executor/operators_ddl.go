@@ -1518,11 +1518,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// pg_class.reloptions (without the `toast.` prefix); pg_dump joins to the
 	// TOAST relation, reads `tc.reloptions AS toast_reloptions`, and re-emits
 	// them WITH the `toast.` prefix (appendReloptionsArrayAH, "toast.").
-	// goopg has no TOAST, so these are catalog/dump-only (advisory). This slice
-	// supports the boolean `toast.autovacuum_enabled`; the synthesized TOAST
-	// relation's reloptions array stores it as `autovacuum_enabled=BOOL`.
+	// goopg has no TOAST, so these are catalog/dump-only (advisory). Each option
+	// is gathered in a fixed code order; the synthesized TOAST relation's
+	// reloptions array stores them as `name=value` WITHOUT the `toast.` prefix.
+	// Supported so far: the booleans `toast.autovacuum_enabled` (slice 224) and
+	// `toast.vacuum_truncate` (slice 225). Both share RELOPT_KIND_TOAST in
+	// PostgreSQL (reloptions.c:107/152, RELOPT_KIND_HEAP | RELOPT_KIND_TOAST).
 	// Additional toast.* options extend this gather in later slices.
-	// M0110-0001 (DU-002 slice 224).
+	// M0110-0001 (DU-002 slice 224/225).
 	var toastReloptions []string
 	if v, ok := s.With["toast.autovacuum_enabled"]; ok {
 		b, parsed := parseReloptionBool(strings.TrimSpace(v))
@@ -1531,6 +1534,18 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				Message: fmt.Sprintf("invalid value for boolean option \"autovacuum_enabled\": %s", v)}
 		}
 		toastReloptions = append(toastReloptions, "autovacuum_enabled="+strconv.FormatBool(b))
+	}
+	// `toast.vacuum_truncate` — the second RELOPT_KIND_TOAST boolean, mirroring
+	// the parent-table `vacuum_truncate` path (slice 205) on the TOAST relation.
+	// PG accepts the usual boolean spellings via parse_bool; non-bool → 22023.
+	// M0110-0001 (DU-002 slice 225).
+	if v, ok := s.With["toast.vacuum_truncate"]; ok {
+		b, parsed := parseReloptionBool(strings.TrimSpace(v))
+		if !parsed {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for boolean option \"vacuum_truncate\": %s", v)}
+		}
+		toastReloptions = append(toastReloptions, "vacuum_truncate="+strconv.FormatBool(b))
 	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {

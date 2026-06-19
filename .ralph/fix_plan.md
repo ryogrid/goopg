@@ -4946,6 +4946,25 @@ object support.
         `TestPort_PgDumpConnectionSetup` PASS (round-trips `WITH (toast.autovacuum_enabled='false')`); pgbench
         pre-commit smoke on commit. **Next:** widen the toast.* gather to the rest of the RELOPT_KIND_TOAST
         options (each one line now), then composite types.
+      - **PROGRESS 2026-06-19 (loop #40):** **DU-002 slice 225 LANDED — second `toast.*` reloption
+        (`toast.vacuum_truncate`) round-trips; first multi-element TOAST reloptions array.** `vacuum_truncate`
+        shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` with `autovacuum_enabled` (`reloptions.c:152`/`107`), so
+        PG keeps `toast.vacuum_truncate` (no prefix) on the TOAST relation's reloptions alongside
+        `autovacuum_enabled`. **Executor** (`operators_ddl.go`): one extra gather block after the slice-224
+        arm (fixed code order), validated via `parseReloptionBool` (non-bool → 22023), appended as
+        `vacuum_truncate=<bool>`. **catalog**: NO change — the `pg_class` view already `strings.Join`s
+        `ToastReloptions`, so the synthesized `pg_toast_<oid>` row's reloptions cell becomes
+        `{autovacuum_enabled=false,vacuum_truncate=false}` (the array-element path built in slice 224, first
+        exercised here). On dump-out pg_dump re-adds the prefix per element in array order →
+        `WITH (toast.autovacuum_enabled='false', toast.vacuum_truncate='false')`. Files:
+        `internal/executor/operators_ddl.go` (vacuum_truncate gather), `internal/testport/pgdump_connsetup_test.go`
+        (`optoast` fixture now carries both options + combined-WITH assertion),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 225). Gates: gofmt OK; `go build ./internal/...`
+        clean; executor+parser+catalog suites PASS; `TestPort_PgDumpConnectionSetup` PASS (round-trips both
+        toast.* options); pgbench pre-commit smoke on commit. **Next:** the remaining RELOPT_KIND_TOAST
+        integer/float autovacuum options (`toast.autovacuum_vacuum_threshold`,
+        `toast.autovacuum_vacuum_scale_factor`, `toast.log_autovacuum_min_duration`, … — each a one-line
+        gather reusing the int/float paths), then composite types.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
