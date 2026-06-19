@@ -7660,9 +7660,34 @@ production code changed — the existing machinery already round-trips the shape
 
 Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `catalog.TestRangeTupleMultiColumnOpenEdge`.
 
-> **Next (slice 263+):** multi-level / `INHERITS` partition-tree dump fidelity beyond the existing single-leaf `psub`
-> tree (e.g. a sub-partitioned middle node with multiple leaves), or per-partition column-level options on a partition
-> child.
+> **Next (slice 263+):** ~~multi-level partition-tree dump fidelity beyond the single-leaf `psub` tree~~ — done in
+> slice 263. Remaining: per-partition column-level options on a partition child, or `INHERITS`-tree dump fidelity.
+
+### Slice 263 — wide multi-level partition tree (multiple leaves + sibling sub-partitioned middle node)
+
+Slice 171 first exercised a *sub-partitioned* partition (`psub_east`: a `LIST` child of `psub` that is itself
+partitioned `BY RANGE`, with one leaf `psub_east_lo`). That proved the single node that is simultaneously
+`relispartition=true` AND `relkind='p'` round-trips. But the tree was a single chain — one middle node, one leaf. This
+slice widens it to the two fan-out shapes a real tree has, neither previously exercised end to end:
+
+- **One middle node, multiple leaves** — `psub_east` gains a second leaf `psub_east_hi FOR VALUES FROM (100) TO (200)`
+  alongside `psub_east_lo`. pg_inherits must emit **two** child rows that both point at the same `psub_east` parent; the
+  per-parent `inhseqno` counter (`parentSeq` map in `catalog.go::pg_inherits.VirtualRows`) must increment independently
+  per leaf, and pg_dump must emit a separate `ATTACH` for each.
+- **Sibling sub-partitioned middle node** — `psub_west` is a *second* `LIST` partition of `psub`, itself partitioned
+  `BY RANGE`, with its own leaf `psub_west_lo FOR VALUES FROM (0) TO (100)`. Crucially `psub_west_lo`'s bound text is
+  **identical** to `psub_east_lo`'s, so the leaf-to-parent linkage cannot be inferred from the bound — it must come from
+  each child's own `PartitionParentOID`. The test verifies the immediate parent via the full single-line form
+  `ALTER TABLE ONLY public.psub_west ATTACH PARTITION public.psub_west_lo FOR VALUES FROM (0) TO (100)`, which a
+  wrong-parent regression (attaching to the sibling `psub_east` or the grandparent `psub`) would break.
+
+No production code changed — `pg_inherits` already keys each parent row off the child's own `PartitionParentOID`
+(`catalog.go` ~4110), so width and a second middle node fall out for free; this slice proves and guards the wide tree.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+> **Next (slice 264+):** per-partition column-level options on a partition child (e.g. a child-only `NOT NULL` /
+> `DEFAULT` / `CHECK`), or `INHERITS`-tree dump fidelity beyond the single child.
 
 ## Deferred (002–010) — catalog surface estimate
 

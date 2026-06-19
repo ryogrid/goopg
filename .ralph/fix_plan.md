@@ -5671,6 +5671,27 @@ object support.
         ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 262. **Next (slice 263+):**
         multi-level partition-tree fidelity beyond the single-leaf `psub` tree, or per-partition column-level options.
 
+      - **PROGRESS 2026-06-20 (loop #30):** **DU-002 slice 263 LANDED — a WIDE multi-level partition tree
+        (multiple leaves under one middle node + a sibling sub-partitioned middle node) round-trips through pg_dump.**
+        Slice 171 first proved a sub-partitioned partition (`psub_east`, a LIST child of `psub` partitioned BY RANGE
+        with one leaf `psub_east_lo`), but the tree was a single chain — one middle node, one leaf. This slice widens it
+        to the two fan-out shapes a real tree has: **(a)** `psub_east` gains a second leaf `psub_east_hi FOR VALUES FROM
+        (100) TO (200)` so pg_inherits emits TWO child rows both pointing at `psub_east` (the per-parent `inhseqno`
+        counter `parentSeq` in `catalog.go::pg_inherits.VirtualRows` increments independently per leaf) and pg_dump
+        emits a separate ATTACH for each; **(b)** a sibling `psub_west` (a second LIST partition of `psub`, itself
+        partitioned BY RANGE) with leaf `psub_west_lo FOR VALUES FROM (0) TO (100)` whose bound text is **identical** to
+        `psub_east_lo`'s — so the leaf-to-parent link cannot be inferred from the bound, only from each child's own
+        `PartitionParentOID`. **No production code changed** — `pg_inherits` already keys each parent row off the
+        child's own `PartitionParentOID` (`catalog.go` ~4110), so width + a second middle node fall out for free; this
+        slice proves and guards it. **pg_dump fixture** (`pgdump_connsetup_test.go`): the three new children attached to
+        the existing `psub` tree; asserts `ATTACH PARTITION public.psub_east_hi FOR VALUES FROM (100) TO (200)`, the
+        sibling middle node `CREATE TABLE public.psub_west (` + `ATTACH PARTITION public.psub_west FOR VALUES IN
+        ('west')`, and — to verify the immediate parent despite the duplicate bound text — the full single-line `ALTER
+        TABLE ONLY public.psub_west ATTACH PARTITION public.psub_west_lo FOR VALUES FROM (0) TO (100)`. Guard:
+        `TestPort_PgDumpConnectionSetup` PASS (3.33s, byte-matches real pg_dump 18.3). gofmt + `go build ./...` clean;
+        pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 263. **Next (slice 264+):** per-partition
+        column-level options on a partition child, or `INHERITS`-tree dump fidelity beyond the single child.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

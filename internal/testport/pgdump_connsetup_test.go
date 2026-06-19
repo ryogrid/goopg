@@ -1287,6 +1287,30 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create leaf partition psub_east_lo: %v", err)
 	}
 
+	// Slice 263: a WIDE multi-level partition tree — beyond slice 171's single-leaf
+	// `psub_east` chain. Two distinct fan-out shapes that slice 171 never exercised:
+	//   (a) one middle node with MULTIPLE leaves: `psub_east` gains a second leaf
+	//       `psub_east_hi` alongside `psub_east_lo`, so pg_inherits must emit TWO
+	//       child rows that both point at the same `psub_east` parent (the per-parent
+	//       inhseqno counter in catalog.go must increment independently per leaf), and
+	//       pg_dump must emit a separate ATTACH for each.
+	//   (b) a SIBLING sub-partitioned middle node: `psub_west` is a second LIST
+	//       partition of `psub` that is itself partitioned BY RANGE, with its own leaf
+	//       `psub_west_lo`. This proves a leaf resolves its IMMEDIATE parent (the leaf
+	//       under `psub_west` must ATTACH to `psub_west`, NOT to the sibling
+	//       `psub_east` nor the grandparent `psub`) when several middle nodes coexist.
+	// No production change — pg_inherits already keys parent rows by each child's own
+	// PartitionParentOID (catalog.go ~4110); this slice proves + guards the wide tree.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.psub_east_hi PARTITION OF public.psub_east FOR VALUES FROM (100) TO (200)"); err != nil {
+		t.Fatalf("create second leaf partition psub_east_hi: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.psub_west PARTITION OF public.psub FOR VALUES IN ('west') PARTITION BY RANGE (id)"); err != nil {
+		t.Fatalf("create sibling sub-partitioned partition psub_west: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.psub_west_lo PARTITION OF public.psub_west FOR VALUES FROM (0) TO (100)"); err != nil {
+		t.Fatalf("create leaf partition psub_west_lo: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -3562,6 +3586,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.psub_east_lo FOR VALUES FROM (0) TO (100)") {
 			t.Errorf("pg_dump dropped the leaf's ATTACH-to-middle bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.psub_east_lo FOR VALUES FROM (0) TO (100)", res.Stdout)
+		}
+		// **Slice 263 (asserted):** WIDE multi-level partition tree. Two fan-out
+		// shapes beyond slice 171's single leaf: (a) `psub_east` now has TWO leaves —
+		// the second leaf `psub_east_hi` must get its own ATTACH with the (100,200)
+		// bound, proving the per-parent inhseqno counter increments independently per
+		// child; (b) the sibling sub-partitioned middle node `psub_west` must emit its
+		// OWN PARTITION BY clause, its ATTACH-to-top with the LIST bound, and its leaf
+		// `psub_west_lo` must ATTACH to `psub_west` (NOT the sibling `psub_east` nor the
+		// grandparent `psub`) even though its (0,100) bound text is identical to
+		// `psub_east_lo`'s. The immediate-parent link is verified via the full
+		// `ALTER TABLE ONLY public.psub_west ATTACH PARTITION public.psub_west_lo`
+		// single-line form, which a wrong-parent regression would break.
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.psub_east_hi FOR VALUES FROM (100) TO (200)") {
+			t.Errorf("pg_dump dropped the second leaf's ATTACH-to-middle bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.psub_east_hi FOR VALUES FROM (100) TO (200)", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.psub_west (") ||
+			!strings.Contains(res.Stdout, "ATTACH PARTITION public.psub_west FOR VALUES IN ('west')") {
+			t.Errorf("pg_dump dropped the sibling sub-partitioned middle node psub_west (CREATE TABLE / ATTACH-to-top with LIST bound)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER TABLE ONLY public.psub_west ATTACH PARTITION public.psub_west_lo FOR VALUES FROM (0) TO (100)") {
+			t.Errorf("pg_dump linked the leaf psub_west_lo to the wrong parent; missing immediate-parent ATTACH %q\n  full stdout=%q", "ALTER TABLE ONLY public.psub_west ATTACH PARTITION public.psub_west_lo FOR VALUES FROM (0) TO (100)", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged
