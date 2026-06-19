@@ -4178,6 +4178,24 @@ object support.
         `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:**
         MINVALUE/MAXVALUE keyword-AST-node slice (HIGHER RISK: partition routing); or attfdwoptions
         (foreign-table only, NULL today).
+      - **PROGRESS 2026-06-19 (loop #3):** **DU-002 slice 190 LANDED — DEFAULT (catch-all)
+        partition round-trip.** pg_dump emits each partition child as a standalone `CREATE TABLE`
+        plus `ALTER TABLE ONLY parent ATTACH PARTITION child <bound>`, where `<bound>` =
+        `pg_get_expr(c.relpartbound, …)`; for a DEFAULT partition that decompiles to the bare
+        keyword `DEFAULT` (no `FOR VALUES`). goopg already supported DEFAULT partitions end-to-end
+        (parser `PartitionOfClause.Default` → executor `PartitionBound.IsDefault` →
+        `catalog.FormatPartitionBound` returns `"DEFAULT"` → stored in `relpartbound`), so the bound
+        already round-tripped — but no fixture pinned it. Added a `pdef` LIST-partitioned parent with
+        a concrete child (`pdef_1 FOR VALUES IN (1)`) and a catch-all child (`pdef_def DEFAULT`) to
+        `TestPort_PgDumpConnectionSetup`, asserting `ATTACH PARTITION public.pdef_def DEFAULT` with no
+        spurious trailing `FOR VALUES`. Also tightened slice 90's empty-DEFAULT domain check: it
+        scans for `DEFAULT;\n`, which the legitimate `ATTACH PARTITION public.pdef_def DEFAULT;\n`
+        line now also matches — scrub that exact line before scanning (sibling-paths: new fixture +
+        old assertion updated together). Files: `internal/testport/pgdump_connsetup_test.go`,
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 190). Gates: gofmt OK; `go build ./...`
+        clean; `go vet ./internal/testport/` clean; `TestPort_PgDumpConnectionSetup` PASS; pgbench
+        pre-commit smoke on commit. **Next:** composite types (`CREATE TYPE AS`; `pg_class.reltype`
+        hardcoded 0 — larger); or partition `WITH (...)`-on-child / `TABLESPACE` clauses.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -760,6 +760,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create RANGE partition prange_am: %v", err)
 	}
 
+	// Slice 190: a DEFAULT partition (`CREATE TABLE child PARTITION OF parent
+	// DEFAULT`) must round-trip. pg_dump reads the catch-all child's bound via
+	// pg_get_expr(c.relpartbound, …), which returns the bare keyword `DEFAULT`,
+	// and emits `ALTER TABLE ONLY public.parent ATTACH PARTITION public.child
+	// DEFAULT;` (no FOR VALUES). The executor already records pb.IsDefault and
+	// FormatPartitionBound returns "DEFAULT", so the relpartbound carries the
+	// keyword; this fixture pins that the catch-all partition survives the dump
+	// alongside a concrete sibling. `pdef` carries its own tables so the many
+	// `foo` asserts are untouched.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pdef (k integer, v text) PARTITION BY LIST (k)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pdef: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pdef_1 PARTITION OF public.pdef FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create LIST partition pdef_1: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pdef_def PARTITION OF public.pdef DEFAULT"); err != nil {
+		t.Fatalf("create DEFAULT partition pdef_def: %v", err)
+	}
+
 	// Slice 170: legacy table inheritance (CREATE TABLE child (...) INHERITS
 	// (parent)) must round-trip. goopg merged the parent's columns into the child
 	// but (a) emitted no pg_inherits row for the inheritance edge (only partition
@@ -2300,6 +2319,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')") {
 			t.Errorf("pg_dump emitted an unquoted/invalid RANGE bound; want %q\n  full stdout=%q", "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')", res.Stdout)
+		}
+		// **Slice 190 (asserted):** a DEFAULT (catch-all) partition. pg_dump reads
+		// the bound via pg_get_expr(relpartbound), which yields the bare keyword
+		// `DEFAULT`, and emits `ATTACH PARTITION public.<child> DEFAULT` (no FOR
+		// VALUES). Assert (1) the parent's LIST key clause, (2) the concrete
+		// sibling's IN bound, and (3) the DEFAULT child's keyword bound — with no
+		// spurious `FOR VALUES` trailing the DEFAULT child.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.pdef (") ||
+			!strings.Contains(res.Stdout, "PARTITION BY LIST (k)") {
+			t.Errorf("pg_dump dropped/mangled the DEFAULT-partition parent table; missing CREATE TABLE public.pdef / PARTITION BY LIST (k)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pdef_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped/mangled the concrete sibling bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pdef_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pdef_def DEFAULT") {
+			t.Errorf("pg_dump dropped/mangled the DEFAULT partition bound; want %q\n  full stdout=%q", "ATTACH PARTITION public.pdef_def DEFAULT", res.Stdout)
+		}
+		if strings.Contains(res.Stdout, "ATTACH PARTITION public.pdef_def FOR VALUES") {
+			t.Errorf("pg_dump emitted a spurious FOR VALUES on the DEFAULT partition\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 170 closed (asserted):** legacy table inheritance. goopg emitted
 		// no pg_inherits row for the INHERITS edge and left the inherited columns
@@ -4269,7 +4307,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// slice-93 text-default domain present. The checks are newline-anchored so
 		// they do NOT match pg_dump's `-- ... Type: DEFAULT; Schema: ...` section
 		// comment, which slice 121's separate SERIAL column defaults introduce.
-		if strings.Contains(res.Stdout, "DEFAULT;\n") || strings.Contains(res.Stdout, "DEFAULT \n") {
+		// Slice 190's DEFAULT (catch-all) partition emits a legitimate
+		// `ATTACH PARTITION public.pdef_def DEFAULT;\n` whose tail also matches
+		// `DEFAULT;\n`; scrub that exact line first so this domain-only check stays
+		// precise.
+		dfltScrub := strings.ReplaceAll(res.Stdout, "ATTACH PARTITION public.pdef_def DEFAULT;\n", "")
+		if strings.Contains(dfltScrub, "DEFAULT;\n") || strings.Contains(dfltScrub, "DEFAULT \n") {
 			t.Errorf("pg_dump emitted a spurious empty DEFAULT on the domain (slice-90 pg_get_expr(NULL) regressed)\n  full stdout=%q", res.Stdout)
 		}
 		return

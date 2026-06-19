@@ -5497,6 +5497,32 @@ array OIDs from `pgTypeAllEntries()` and pins their `typcollation` at FormData o
 (`character varying[]`, `character(4)[]`, `name[]`, `text[]` — all default collation)
 asserts pg_dump emits **no** `COLLATE` clause on any of them.
 
+### Slice 190 — DEFAULT (catch-all) partition round-trip
+
+pg_dump dumps each partition child as a standalone `CREATE TABLE` followed by
+`ALTER TABLE ONLY public.<parent> ATTACH PARTITION public.<child> <bound>;`,
+where `<bound>` is `pg_get_expr(c.relpartbound, c.oid)`. For a DEFAULT (catch-all)
+partition that expression decompiles to the bare keyword `DEFAULT` (no
+`FOR VALUES`). goopg already supports DEFAULT partitions end-to-end — the parser
+sets `PartitionOfClause.Default`, `execCreatePartitionChild` records
+`PartitionBound.IsDefault`, and `catalog.FormatPartitionBound` returns the literal
+`"DEFAULT"`, which `buildUserPGClassRow` stores in `relpartbound` — so the bound
+already round-trips; no prior fixture had pinned it.
+
+This slice adds a `pdef (k integer, v text) PARTITION BY LIST (k)` parent with a
+concrete child (`pdef_1 FOR VALUES IN (1)`) and a catch-all child
+(`pdef_def ... DEFAULT`) to `TestPort_PgDumpConnectionSetup`, and asserts the dump
+emits `ATTACH PARTITION public.pdef_def DEFAULT` with **no** spurious `FOR VALUES`
+trailing it (alongside the parent `PARTITION BY LIST (k)` clause and the sibling's
+`FOR VALUES IN (1)` bound).
+
+It also tightens slice 90's empty-DEFAULT domain regression check: that assertion
+scans for the substring `DEFAULT;\n`, which the legitimate
+`ATTACH PARTITION public.pdef_def DEFAULT;\n` line now also matches. The check now
+scrubs that exact partition-attach line before scanning, keeping the domain-only
+intent precise (sibling-paths: the new fixture and the old assertion were updated
+together).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
