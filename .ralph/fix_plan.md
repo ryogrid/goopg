@@ -5210,6 +5210,22 @@ object support.
         pre-commit smoke on commit. **Next:** the LAST HEAP|TOAST insert-vacuum option
         (`toast.autovacuum_vacuum_insert_scale_factor` real, range `0.0–100.0`, default `-1`, slice-227
         toast-real pattern) completes the `toast.*` surface; then composite types.
+      - **PROGRESS 2026-06-19 (loop #5):** **DU-002 slice 239 LANDED — `RELOPT_KIND_TOAST` insert-vacuum
+        *real* reloption (`toast.autovacuum_vacuum_insert_scale_factor`) round-trips; sixteen-element TOAST
+        reloptions array. The `toast.*` reloption surface is now COMPLETE.**
+        `autovacuum_vacuum_insert_scale_factor` is `RELOPT_TYPE_REAL`,
+        `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:411/1905`, range `0.0–100.0`, default `-1`).
+        **Executor** (`operators_ddl.go`): one gather block after the slice-238
+        `toast.autovacuum_vacuum_max_threshold` arm — `strconv.ParseFloat` + `!(f >= 0 && f <= 100)`
+        (rejects NaN/±Inf; non-float/out-of-range → 22023), appended as
+        `autovacuum_vacuum_insert_scale_factor=<F>` via `FormatFloat(f,'g',-1,64)`. **catalog**: NO change.
+        On dump-out → `WITH (..., toast.autovacuum_vacuum_insert_scale_factor='1.5')`. Files:
+        `internal/executor/operators_ddl.go` (toast real gather block),
+        `internal/testport/pgdump_connsetup_test.go` (`optoast` fixture = 16 options + updated combined-WITH
+        assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 239). Gates: gofmt OK;
+        `go build ./internal/...` clean; executor reloption + `TestPort_PgDumpConnectionSetup` PASS; pgbench
+        pre-commit smoke on commit. **Next:** the `toast.*` surface is complete → composite types
+        (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger structural task).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

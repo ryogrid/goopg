@@ -6892,6 +6892,31 @@ fifteen-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort
 range `0.0–100.0`, default `-1`, the slice-227 toast-real pattern) completes the `toast.*` surface; then
 composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — a larger structural task).
 
+### Slice 239 — `RELOPT_KIND_TOAST` insert-vacuum *real* reloption (`toast.autovacuum_vacuum_insert_scale_factor`)
+
+Adds `toast.autovacuum_vacuum_insert_scale_factor`, extending the TOAST reloptions array to sixteen elements
+and **completing the `toast.*` reloption surface**. `autovacuum_vacuum_insert_scale_factor` is
+`RELOPT_TYPE_REAL` and shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:411/1905`, range
+`0.0–100.0`, default `-1` = unset), so PG accepts the `toast.` prefix and stores it (without prefix) on the
+TOAST relation's `pg_class.reloptions`. Reuses the slice-227 toast-real pattern (and the parent-table arm,
+slice 201).
+
+- **Executor** (`operators_ddl.go`): one extra gather block after the slice-238
+  `toast.autovacuum_vacuum_max_threshold` arm: `strconv.ParseFloat` + the `!(f >= 0 && f <= 100)`
+  bounds check (also rejects NaN/±Inf; non-float or out-of-range → 22023), appended to `toastReloptions`
+  as `autovacuum_vacuum_insert_scale_factor=<F>` (no prefix) via `strconv.FormatFloat(f, 'g', -1, 64)`.
+- **catalog** (`catalog.go`): no change — the existing `strings.Join` over `t.ToastReloptions` renders the
+  sixteen-element array ending in `…,autovacuum_vacuum_max_threshold=2000,autovacuum_vacuum_insert_scale_factor=1.5}`.
+
+On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) order:
+`WITH (..., toast.autovacuum_vacuum_max_threshold='2000', toast.autovacuum_vacuum_insert_scale_factor='1.5')`.
+
+Engine guard: the `optoast` fixture now carries all sixteen options; the assertion confirms the combined
+sixteen-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
+
+**Next:** the `toast.*` reloption surface is complete. Remaining pg_dump work moves to composite types
+(`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — a larger structural task).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
