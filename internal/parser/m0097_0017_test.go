@@ -197,6 +197,44 @@ func TestAlterTypeDropAttributeParsing(t *testing.T) {
 	}
 }
 
+// TestAlterTypeAlterAttributeParsing covers DU-002 slice 256: ALTER TYPE …
+// ALTER ATTRIBUTE attname [SET DATA] TYPE newtype [COLLATE/USING/CASCADE/RESTRICT].
+// The type tokens are paren-tracked (so numeric(12,3) survives) and the trailing
+// COLLATE/USING/behavior clause is stub-consumed (not folded into the type).
+func TestAlterTypeAlterAttributeParsing(t *testing.T) {
+	tests := []struct {
+		sql      string
+		wantName string
+		wantType string
+	}{
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE a TYPE bigint`, "a", "bigint"},
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE a SET DATA TYPE bigint`, "a", "bigint"},
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE b TYPE numeric(12,3)`, "b", "numeric ( 12 , 3 )"},
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE b TYPE text COLLATE "C"`, "b", "text"},
+		{`ALTER TYPE alt_comp ALTER ATTRIBUTE b TYPE varchar(64) CASCADE`, "b", "varchar ( 64 )"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.sql[:min(60, len(tc.sql))], func(t *testing.T) {
+			stmts, err := parser.Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+			}
+			at, ok := stmts[0].(*parser.AlterTypeStmt)
+			if !ok {
+				t.Fatalf("expected *AlterTypeStmt, got %T", stmts[0])
+			}
+			if at.AddAttrName != "" || at.RenameAttrOld != "" || at.DropAttrName != "" {
+				t.Errorf("took an ADD/RENAME/DROP attribute branch: AddAttrName=%q RenameAttrOld=%q DropAttrName=%q",
+					at.AddAttrName, at.RenameAttrOld, at.DropAttrName)
+			}
+			if at.AlterAttrName != tc.wantName || at.AlterAttrType != tc.wantType {
+				t.Errorf("ALTER ATTRIBUTE = {%q, %q}, want {%q, %q}",
+					at.AlterAttrName, at.AlterAttrType, tc.wantName, tc.wantType)
+			}
+		})
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

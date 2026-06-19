@@ -2447,6 +2447,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "ALTER TYPE public.alt_comp DROP ATTRIBUTE IF EXISTS nonexistent"); err != nil {
 		t.Fatalf("alter type alt_comp drop attribute if exists nonexistent: %v", err)
 	}
+	// Slice 256: ALTER ATTRIBUTE … TYPE re-types a field in place. After this
+	// alt_comp is (a bigint, b_renamed numeric(12,3)): `a` widens integer→bigint
+	// (SET DATA TYPE spelling), `b_renamed` becomes numeric with a typmod to prove
+	// the paren-tracked type-token collection survives the inner `(`,`)` and that
+	// the re-synced heap re-resolves atttypid/atttypmod.
+	if err := runSQLSimple(t, c, "ALTER TYPE public.alt_comp ALTER ATTRIBUTE a SET DATA TYPE bigint"); err != nil {
+		t.Fatalf("alter type alt_comp alter attribute a type bigint: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TYPE public.alt_comp ALTER ATTRIBUTE b_renamed TYPE numeric(12,3)"); err != nil {
+		t.Fatalf("alter type alt_comp alter attribute b_renamed type numeric: %v", err)
+	}
 	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in, zips zipcode[])"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
@@ -5244,11 +5255,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// alongside the original one — the type re-synced its heap rows with
 			// the new attributes (typmod preserved on the numeric one).
 			// Slice 254: RENAME ATTRIBUTE renamed b -> b_renamed in place.
-			// Slice 255: DROP ATTRIBUTE removed c, so it must NOT appear and
-			// b_renamed becomes the final (comma-less) field.
+			// Slice 255: DROP ATTRIBUTE removed c.
+			// Slice 256: ALTER ATTRIBUTE … TYPE re-typed a→bigint and
+			// b_renamed→numeric(12,3) (typmod preserved); b_renamed is the final
+			// (comma-less) field.
 			"CREATE TYPE public.alt_comp AS (",
-			"\ta integer,",
-			"\tb_renamed text\n",
+			"\ta bigint,",
+			"\tb_renamed numeric(12,3)\n",
 		}
 		for _, sub := range compositeDefs {
 			if !strings.Contains(res.Stdout, sub) {

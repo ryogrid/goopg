@@ -7429,8 +7429,39 @@ forms, and that it does NOT touch the ADD/RENAME attribute fields); the pg_dump 
 RENAME, asserts the dump re-emits `a integer, b_renamed text` (comma-less final field) and that
 `c numeric(10,2)` is gone, byte-matching real pg_dump 18.3.
 
-> **Next (slice 256+):** `ALTER TYPE … ALTER ATTRIBUTE … TYPE` (re-resolve one field's
-> type) and multi-subcommand `ALTER TYPE` statements.
+### Slice 256 — `ALTER TYPE … ALTER ATTRIBUTE attname [SET DATA] TYPE newtype` re-types a composite field
+
+Slices 253/254/255 wired `ADD`/`RENAME`/`DROP ATTRIBUTE`; `ALTER ATTRIBUTE … TYPE` still fell through to the
+generic ALTER-TYPE stub (consumed to `;` as a no-op), so a re-typed field still dumped under its old type. This
+slice wires the `ALTER ATTRIBUTE … TYPE` form end-to-end, reusing the same heap re-sync mechanism.
+
+- **Parser (`parseAlterType`)** — a new `ALTER` branch (`ALTER` is the reserved `KwAlter`) with an `attribute`
+  sub-branch parses the attribute name (lower-cased), an optional `SET DATA` (both `data` and `type` are
+  idents, not keyword tokens — like `CREATE TYPE`), the mandatory `TYPE`, then the new type's tokens collected
+  exactly like `ADD ATTRIBUTE` (paren-tracked typmods so `numeric(12,3)` survives, stopping at a top-level `,`,
+  `;`/EOF, or a `COLLATE`/`USING`/`CASCADE`/`RESTRICT` token — the break is Kind-agnostic because `CASCADE`/
+  `RESTRICT` tokenize as keywords while `COLLATE`/`USING` are idents). Trailing `COLLATE`/`USING`/behavior
+  clauses are stub-consumed. Recorded on `AlterTypeStmt.AlterAttrName` / `AlterAttrType`.
+- **Executor (`execAlterType`)** — when `AlterAttrName != ""`, look up the composite type (`42704` if absent),
+  find the field (`42703` `column "%s" of relation "%s" does not exist` if missing), reject pseudo-type
+  `unknown` (`42P16`). On a hit, copy the field set, rewrite the one field's `ColType`, and re-sync the heap
+  exactly as slices 253–255 (OIDs stable across `RegisterCompositeTypeWithFields`; stamp `xmax` on the existing
+  `pg_type` ×2 + `pg_class`/`pg_attribute` rows and re-run `syncCompositeTypeToCatalogHeap`, which re-resolves
+  `ColType` → `atttypid`/`atttypmod`, so the typmod survives).
+- **No `pg_dump`-side change** — `dumpCompositeType` walks the re-synced `pg_attribute` rows.
+- **Scope**: single `ALTER ATTRIBUTE … TYPE` only. `COLLATE`/`USING` clauses are accepted but ignored
+  (goopg has no per-attribute collation in composite heap rows yet), and multi-subcommand statements
+  (`ALTER …, ALTER …`), data-rewrite of existing composite values, and mid-txn ROLLBACK of the in-memory
+  re-type remain future work (one task per loop).
+
+Guarded at two levels: `parser.TestAlterTypeAlterAttributeParsing` pins the parse (bare / `SET DATA TYPE` /
+typmod / trailing `COLLATE` / trailing `CASCADE` forms, and that it does NOT touch the ADD/RENAME/DROP
+attribute fields); the pg_dump TAP port now runs `ALTER TYPE public.alt_comp ALTER ATTRIBUTE a SET DATA TYPE
+bigint` + `ALTER ATTRIBUTE b_renamed TYPE numeric(12,3)` after the DROP, asserts the dump re-emits
+`a bigint, b_renamed numeric(12,3)` (typmod preserved, comma-less final field), byte-matching real pg_dump 18.3.
+
+> **Next (slice 257+):** multi-subcommand `ALTER TYPE` statements (`ADD …, DROP …` in one command) and
+> per-attribute `COLLATE` round-trip.
 
 ## Deferred (002–010) — catalog surface estimate
 

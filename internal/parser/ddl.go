@@ -5632,6 +5632,73 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		}
 		return stmt, nil
 	}
+	// ALTER ATTRIBUTE attname [SET DATA] TYPE newtype [COLLATE ...] [CASCADE|RESTRICT]
+	// — re-type a composite type field in place so the new type round-trips
+	// through pg_dump. DU-002 slice 256. ALTER is a reserved keyword (KwAlter).
+	if p.acceptKeyword(KwAlter) {
+		if p.acceptIdentKeyword("attribute") {
+			if p.cur().Kind != TokenIdent {
+				return nil, p.errAtCur("expected attribute name after ALTER ATTRIBUTE")
+			}
+			stmt.AlterAttrName = strings.ToLower(p.advance().Value)
+			// Optional SET DATA (DATA is an ident) before the mandatory TYPE
+			// keyword (also an ident, like CREATE TYPE).
+			if p.acceptKeyword(KwSet) {
+				if !p.acceptIdentKeyword("data") {
+					return nil, p.errAtCur("expected DATA after SET in ALTER ATTRIBUTE")
+				}
+			}
+			if !p.acceptIdentKeyword("type") {
+				return nil, p.errAtCur("expected TYPE in ALTER ATTRIBUTE")
+			}
+			// Collect the new type's tokens the same way ADD ATTRIBUTE does:
+			// paren-track typmods so `numeric(12,3)` survives, stop at a top-level
+			// ',' (a COLLATE/USING/further subcommand we then stub-consume) or
+			// ';'/EOF. COLLATE / USING / CASCADE / RESTRICT are not part of the
+			// type, so also stop at those ident keywords.
+			var typeParts []string
+			parenDepth := 0
+			for p.cur().Kind != TokenEOF {
+				tok := p.cur()
+				if tok.Kind == TokenSymbol && tok.Value == ";" {
+					break
+				}
+				if tok.Kind == TokenSymbol && parenDepth == 0 && tok.Value == "," {
+					break
+				}
+				if parenDepth == 0 && tok.Kind != TokenSymbol &&
+					(strings.EqualFold(tok.Value, "collate") || strings.EqualFold(tok.Value, "using") ||
+						strings.EqualFold(tok.Value, "cascade") || strings.EqualFold(tok.Value, "restrict")) {
+					break
+				}
+				if tok.Kind == TokenSymbol && tok.Value == "(" {
+					parenDepth++
+				} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+					parenDepth--
+				}
+				typeParts = append(typeParts, tok.Value)
+				p.advance()
+			}
+			stmt.AlterAttrType = strings.Join(typeParts, " ")
+			// Consume any trailing COLLATE / USING / CASCADE|RESTRICT / further
+			// subcommands as a stub.
+			for p.cur().Kind != TokenEOF {
+				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+					break
+				}
+				p.advance()
+			}
+			return stmt, nil
+		}
+		// Other ALTER variants (e.g. OWNER) — consume as stub.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return stmt, nil
+	}
 	// RENAME VALUE 'old' TO 'new' (enum label rename). M0097-0022.
 	if p.acceptIdentKeyword("rename") {
 		if p.acceptIdentKeyword("value") {

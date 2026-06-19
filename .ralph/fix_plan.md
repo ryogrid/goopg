@@ -5502,6 +5502,30 @@ object support.
         (`TestPort_PgDumpConnectionSetup` PASS, 3.6s). Executor+parser+catalog unit suites PASS. Design:
         `0110-0001` Slice 255. pgbench pre-commit smoke on commit. **Next (slice 256+):** `ALTER TYPE … ALTER
         ATTRIBUTE … TYPE` / multi-subcommand `ALTER TYPE`.
+      - **PROGRESS 2026-06-20 (loop #22):** **DU-002 slice 256 LANDED — `ALTER TYPE … ALTER ATTRIBUTE attname
+        [SET DATA] TYPE newtype` re-types a composite type field in place; the new type round-trips through
+        pg_dump.** Slices 253–255 wired `ADD`/`RENAME`/`DROP ATTRIBUTE`; `ALTER ATTRIBUTE … TYPE` still fell
+        through to the generic ALTER-TYPE stub (consumed to `;` as a no-op), so a re-typed field dumped under its
+        old type. Parser (`parseAlterType`): new `ALTER` branch (`ALTER` is the reserved `KwAlter`) with an
+        `attribute` sub-branch parsing the name (lower-cased), optional `SET DATA` (both `data` and `type` are
+        idents, not keyword tokens — like `CREATE TYPE`), mandatory `TYPE`, then the type tokens collected like
+        `ADD ATTRIBUTE` (paren-tracked typmods so `numeric(12,3)` survives, stopping at top-level `,`/`;`/EOF or a
+        `COLLATE`/`USING`/`CASCADE`/`RESTRICT` token — break is Kind-agnostic since CASCADE/RESTRICT tokenize as
+        keywords while COLLATE/USING are idents); trailing clauses stub-consumed →
+        `AlterTypeStmt.AlterAttrName`/`AlterAttrType`. Executor (`execAlterType`): `AlterAttrName != ""` →
+        `cat.LookupCompositeType` (42704 absent), find field (42703 if missing), reject pseudo-type `unknown`
+        (42P16). On a hit, copy the field set, rewrite the one field's `ColType`, **re-sync** the heap exactly as
+        slices 253–255 (composite OIDs stable across `RegisterCompositeTypeWithFields`; stamp `xmax` on existing
+        pg_type×2 + pg_class/pg_attribute, re-run `syncCompositeTypeToCatalogHeap`, which re-resolves `ColType` →
+        `atttypid`/`atttypmod` so the typmod survives). No pg_dump-side change. Scope: single `ALTER ATTRIBUTE …
+        TYPE` only; `COLLATE`/`USING` accepted but ignored, multi-subcommand/data-rewrite/ROLLBACK deferred (one
+        task per loop). Guards: `parser.TestAlterTypeAlterAttributeParsing` (bare/SET DATA TYPE/typmod/trailing
+        COLLATE/trailing CASCADE, NOT the ADD/RENAME/DROP attribute fields) + pg_dump TAP port runs `ALTER
+        ATTRIBUTE a SET DATA TYPE bigint` + `ALTER ATTRIBUTE b_renamed TYPE numeric(12,3)` after the DROP, asserts
+        the dump re-emits `a bigint, b_renamed numeric(12,3)` (typmod preserved, comma-less final field),
+        byte-matching real pg_dump 18.3 (`TestPort_PgDumpConnectionSetup` PASS, 3.9s). Executor+parser+catalog
+        unit suites PASS. Design: `0110-0001` Slice 256. pgbench pre-commit smoke on commit. **Next (slice
+        257+):** multi-subcommand `ALTER TYPE` (`ADD …, DROP …`) / per-attribute `COLLATE` round-trip.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
