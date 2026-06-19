@@ -6724,8 +6724,31 @@ On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) o
 Engine guard: the `optoast` fixture now carries all nine options; the assertion confirms the combined
 nine-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
 
-**Next:** the remaining `RELOPT_KIND_TOAST` int options (the multixact variants
-(`toast.autovacuum_multixact_freeze_min/max_age`, `toast.autovacuum_multixact_freeze_table_age`),
+### Slice 233 — fourth `RELOPT_KIND_TOAST` autovacuum-age *integer* reloption (`toast.autovacuum_multixact_freeze_min_age`)
+
+Adds `toast.autovacuum_multixact_freeze_min_age`, the first of the multixact `RELOPT_KIND_TOAST` autovacuum-**age**
+integer options, extending the TOAST reloptions array to ten elements. `autovacuum_multixact_freeze_min_age` is
+`RELOPT_TYPE_INT` and shares `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` (`reloptions.c:1891/286`, range
+`0–1000000000`, default `-1`), so PG accepts the `toast.` prefix and stores it (without prefix) on the TOAST
+relation's `pg_class.reloptions`. As with `freeze_min_age` / `freeze_table_age`, `0` is a valid explicit value
+(its lower bound is `0`), so an explicit `-1` is rejected as out-of-range.
+
+- **Executor** (`operators_ddl.go`): one extra gather block after the slice-232 `toast.autovacuum_freeze_table_age`
+  arm, mirroring the parent-table integer reloption arm (slice 210): `strconv.Atoi` + `0 ≤ N ≤ 1000000000`
+  bounds check (non-int or out-of-range → 22023; the `0` floor means an explicit `-1` is rejected),
+  appended to `toastReloptions` as `autovacuum_multixact_freeze_min_age=<N>` (no prefix) via `strconv.Itoa`.
+- **catalog** (`catalog.go`): no change — the existing `strings.Join` over `t.ToastReloptions` renders the
+  ten-element array ending in `…,autovacuum_freeze_table_age=0,autovacuum_multixact_freeze_min_age=150000000}`.
+
+On dump-out, pg_dump re-adds the `toast.` prefix per element in array (= code) order:
+`WITH (..., toast.autovacuum_freeze_table_age='0', toast.autovacuum_multixact_freeze_min_age='150000000')`.
+
+Engine guard: the `optoast` fixture now carries all ten options; the assertion confirms the combined
+ten-element `WITH` clause and that no `pg_toast_*` relation leaks. `TestPort_PgDumpConnectionSetup` PASS.
+
+**Next:** the remaining `RELOPT_KIND_TOAST` int options (the other multixact variants
+(`toast.autovacuum_multixact_freeze_max_age` (INT, `10000–2000000000`),
+`toast.autovacuum_multixact_freeze_table_age` (INT, `0–2000000000`)),
 `toast.log_autovacuum_min_duration` (INT, allows `-1`)) — each a one-line gather reusing the int path.
 After: composite types.
 
