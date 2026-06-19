@@ -1273,6 +1273,29 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		autovacuumFreezeMinAge = afma
 		autovacuumFreezeMinAgeSet = true
 	}
+	// autovacuum_freeze_max_age (RELOPT_TYPE_INT, range 100000–2000000000, default
+	// -1 = unset; reloptions.c:1887/290). The minimum valid value is 100000, so an
+	// explicit -1 is rejected as out-of-range; a separate `set` flag records whether
+	// the option was present (the parallel_workers pattern). goopg has no autovacuum,
+	// so the value is purely catalog/dump state that round-trips through
+	// pg_class.reloptions / pg_dump's `WITH (autovacuum_freeze_max_age='N')`.
+	// M0110-0001 (DU-002 slice 208).
+	autovacuumFreezeMaxAge := 0
+	autovacuumFreezeMaxAgeSet := false
+	if v, ok := s.With["autovacuum_freeze_max_age"]; ok {
+		afma, convErr := strconv.Atoi(strings.TrimSpace(v))
+		if convErr != nil {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("invalid value for integer option \"autovacuum_freeze_max_age\": %s", v)}
+		}
+		if afma < 100000 || afma > 2000000000 {
+			return &ExecError{Code: "22023", Pos: s.Pos(),
+				Message: fmt.Sprintf("value %d out of bounds for option \"autovacuum_freeze_max_age\"", afma),
+				Detail:  "Valid values are between \"100000\" and \"2000000000\"."}
+		}
+		autovacuumFreezeMaxAge = afma
+		autovacuumFreezeMaxAgeSet = true
+	}
 	// UNLOGGED partitioned tables are not supported in PostgreSQL.
 	if s.Unlogged && s.PartitionBy != nil {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: "partitioned tables cannot be unlogged"}
@@ -1350,6 +1373,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.LogAutovacuumMinDurationSet = logAutovacuumMinDurationSet
 	tbl.AutovacuumFreezeMinAge = autovacuumFreezeMinAge
 	tbl.AutovacuumFreezeMinAgeSet = autovacuumFreezeMinAgeSet
+	tbl.AutovacuumFreezeMaxAge = autovacuumFreezeMaxAge
+	tbl.AutovacuumFreezeMaxAgeSet = autovacuumFreezeMaxAgeSet
 	// Register inheritance relationships now that the child OID is known.
 	if len(inheritParents) > 0 {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {

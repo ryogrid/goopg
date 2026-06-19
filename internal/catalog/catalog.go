@@ -570,6 +570,22 @@ type Table struct {
 	// unaffected). M0110-0001 (DU-002 slice 207).
 	AutovacuumFreezeMinAge    int
 	AutovacuumFreezeMinAgeSet bool
+
+	// AutovacuumFreezeMaxAge stores the table's
+	// `WITH (autovacuum_freeze_max_age=N)` storage parameter — the sixth INT-typed
+	// autovacuum-namespace reloption goopg round-trips, reusing the slice-198
+	// integer path. PG's reloption type is RELOPT_TYPE_INT,
+	// RELOPT_KIND_HEAP | RELOPT_KIND_TOAST, with range 100000–2000000000 and a
+	// default of -1 (= unset / use the GUC) (reloptions.c:1887/290). Because the
+	// minimum valid value is 100000, an explicit -1 is rejected as out-of-range;
+	// AutovacuumFreezeMaxAgeSet records whether the option was specified (the
+	// parallel_workers pattern). When set, pg_class.reloptions gains the text[]
+	// element `autovacuum_freeze_max_age=N`, which pg_dump renders back as
+	// `WITH (autovacuum_freeze_max_age='N')`. goopg has no autovacuum, so the value
+	// is catalog/dump-only (advisory; runtime unaffected). M0110-0001
+	// (DU-002 slice 208).
+	AutovacuumFreezeMaxAge    int
+	AutovacuumFreezeMaxAgeSet bool
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -2331,6 +2347,9 @@ func (c *InMemory) registerSystemTables() {
 			}
 			if t.AutovacuumFreezeMinAgeSet {
 				relopts = append(relopts, "autovacuum_freeze_min_age="+strconv.Itoa(t.AutovacuumFreezeMinAge))
+			}
+			if t.AutovacuumFreezeMaxAgeSet {
+				relopts = append(relopts, "autovacuum_freeze_max_age="+strconv.Itoa(t.AutovacuumFreezeMaxAge))
 			}
 			reloptions := ""
 			if len(relopts) > 0 {

@@ -6028,6 +6028,28 @@ reloptions) and `TestAutovacuumFreezeMinAgeOutOfBoundsRejected` (`1000000001`/`n
 on its own table; the assertion confirms the dump carries
 `WITH (autovacuum_freeze_min_age='5000')`.
 
+### Slice 208 — sixth INTEGER autovacuum reloption (`autovacuum_freeze_max_age`) round-trip
+
+Continues the freeze-age subfamily for the sixth INT-typed autovacuum-namespace
+reloption, reusing the slice-198 integer path. `autovacuum_freeze_max_age` is
+`RELOPT_TYPE_INT` with `RELOPT_KIND_HEAP | RELOPT_KIND_TOAST` and a default of **-1**
+(= unset / use the GUC), range `100000`–`2000000000` (`reloptions.c:290/1887`; "Age at
+which to autovacuum a table to prevent transaction ID wraparound"). The range *minimum*
+is `100000`, so an explicit `-1` is rejected as out-of-range; an `AutovacuumFreezeMaxAgeSet`
+flag still records presence (the `parallel_workers` pattern) rather than a value check.
+The executor parses with `strconv.Atoi`, rejecting non-integers and out-of-range values
+(`< 100000 || > 2000000000`) with `22023`. It persists
+`catalog.Table.AutovacuumFreezeMaxAge` (an `int`); the pg_class virtual view appends
+`autovacuum_freeze_max_age=N` after `autovacuum_freeze_min_age`; pg_dump renders
+`WITH (autovacuum_freeze_max_age='N')`. goopg has no autovacuum, so the value is advisory
+catalog/dump-only, base-table-only — same as the sibling reloption slices.
+
+Engine guards: `TestAutovacuumFreezeMaxAgeSurfacesInPgClassReloptions` (combined
+`{fillfactor=70,autovacuum_freeze_max_age=500000}`; plain table → no reloptions) and
+`TestAutovacuumFreezeMaxAgeOutOfBoundsRejected` (`99999`/`2000000001`/`nope` → 22023).
+The pg_dump fixture adds `optafmx (… WITH (autovacuum_freeze_max_age=500000))` on its own
+table; the assertion confirms the dump carries `WITH (autovacuum_freeze_max_age='500000')`.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
