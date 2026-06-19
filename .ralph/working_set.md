@@ -1,33 +1,25 @@
 (idle — nothing in flight)
 
-Last landed: DU-002 slice 261 (loop #28) — a dedicated MINVALUE/MAXVALUE keyword
-AST node (`PartitionRangeBoundKeyword`) disambiguates an unbounded RANGE-partition
-edge from a quoted text literal `'MINVALUE'`. Picked up the previous loop's
-usage-limit-interrupted WIP (was uncommitted in catalog.go/operators_ddl*.go/
-ddl.go/expr.go), gofmt-cleaned it, added the missing tests, doc, fix_plan, landed.
+Last landed: DU-002 slice 262 (loop #29) — a multi-column RANGE partition with a
+MINVALUE/MAXVALUE open edge on a NON-leading column (`FROM (MINVALUE, MINVALUE) TO
+(10, MAXVALUE)`) now round-trips through pg_dump and routes correctly. Coverage slice:
+NO production code changed — the per-element bound machinery from slices 169/261 already
+handled the shape; this slice proves + guards the first end-to-end multi-column exercise
+(all prior fixtures were single-column).
 
-Mechanism:
-- AST (expr.go): PartitionRangeBoundKeyword{pos, IsMax} + Keyword(); distinct from
-  StringConst so bare MINVALUE/MAXVALUE ≠ quoted 'MINVALUE'.
-- Parser (parsePartitionBoundValues, ddl.go): bare keyword → new node; quoted → StringConst.
-- Catalog (catalog.go): parallel []bool flags From/ToUnbounded[Max] on PartitionBound;
-  compareKeyToRangeBound (replaces compareRangeBoundStr) treats KEY as concrete always,
-  reads flags for the bound edge; boundElemUnbounded[Max] fall back to legacy string
-  sentinel for pre-slice-261 bounds. rangeStrTupleGE/LT take the flag slices.
-- Executor (operators_ddl.go / operators_ddl_partition.go): exprToString /
-  boundExprToSQLLiteral / rangeBoundExprToSQLLiteral handle the new node;
-  rangeBoundUnboundedFlags populates flags in execCreatePartitionChild + execAlterTable.
-- No pg_dump-side change (FromValueLiterals still uppercase keyword → same dump).
+Files (test/docs only):
+- internal/testport/pgdump_connsetup_test.go — new `public.pmc (a,b,val) PARTITION BY
+  RANGE (a, b)` + child `pmc_lo FOR VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)`;
+  Contains-asserts the parent key clause + verbatim ATTACH bound (bare keywords).
+- internal/catalog/catalog_test.go — new TestRangeTupleMultiColumnOpenEdge drives
+  rangeStrTupleGE/LT directly across concrete-prefix + open-suffix flag tuples.
+- docs/design/0110-0001-pg-dump-tap-port.md — Slice 262 section + Next note.
+- .ralph/fix_plan.md — slice 262 progress entry.
 
-Files: internal/parser/expr.go, internal/parser/ddl.go, internal/catalog/catalog.go,
-internal/executor/operators_ddl.go, internal/executor/operators_ddl_partition.go,
-internal/parser/partition_range_bound_keyword_test.go (new),
-internal/catalog/catalog_test.go (TestCompareKeyToRangeBoundDisambiguation),
-docs/design/0110-0001-pg-dump-tap-port.md (Slice 261), .ralph/fix_plan.md.
-
-Gates: gofmt clean; go build ./... clean; parser+catalog+executor suites PASS;
-TestPort_PgDumpConnectionSetup PASS (3.7s, prange_am MINVALUE fixture still byte-matches);
+Gates: gofmt clean; go build ./... clean; catalog suite PASS;
+TestPort_PgDumpConnectionSetup PASS (3.16s, byte-matches real pg_dump 18.3);
 pgbench pre-commit smoke runs on commit.
 
-Next (slice 262+): multi-level / INHERITS partition-tree dump fidelity, or per-element
-open-edge multi-column RANGE bound routing (FROM (a, MINVALUE) TO (b, MAXVALUE)).
+Next (slice 263+): multi-level partition-tree fidelity beyond the single-leaf `psub`
+tree (a sub-partitioned middle node with MULTIPLE leaves), or per-partition
+column-level options on a partition child.

@@ -1063,6 +1063,75 @@ func TestCompareKeyToRangeBoundDisambiguation(t *testing.T) {
 	})
 }
 
+// TestRangeTupleMultiColumnOpenEdge exercises the multi-column RANGE routing path
+// where an unbounded MINVALUE/MAXVALUE edge sits on a NON-leading column, with a
+// concrete leading column — the exact bound shape pg_dump slice 262 round-trips
+// (FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)). Every prior routing test is
+// single-column, so the per-element flag tuples driving rangeStrTupleGE/LT across
+// a concrete prefix + open suffix were never directly exercised. DU-002 slice 262.
+func TestRangeTupleMultiColumnOpenEdge(t *testing.T) {
+	// pmc_lo: FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE).
+	from := []string{"MINVALUE", "MINVALUE"}
+	fromUnb, fromMax := []bool{true, true}, []bool{false, false}
+	to := []string{"10", "MAXVALUE"}
+	toUnb, toMax := []bool{false, true}, []bool{false, true}
+
+	inLo := func(key []string) bool {
+		return rangeStrTupleGE(key, from, fromUnb, fromMax) &&
+			rangeStrTupleLT(key, to, toUnb, toMax)
+	}
+
+	t.Run("fully-open lower bound admits any key", func(t *testing.T) {
+		// (MINVALUE, MINVALUE) is −∞ on both columns: every key is >= it.
+		if !rangeStrTupleGE([]string{"5", "99"}, from, fromUnb, fromMax) {
+			t.Errorf("(5, 99) >= (MINVALUE, MINVALUE) should be true")
+		}
+		if !rangeStrTupleGE([]string{"-100", "-100"}, from, fromUnb, fromMax) {
+			t.Errorf("(-100, -100) >= (MINVALUE, MINVALUE) should be true")
+		}
+	})
+
+	t.Run("concrete prefix below upper bound is in-partition", func(t *testing.T) {
+		// Leading column 5 < 10, so the suffix never matters: in pmc_lo.
+		if !inLo([]string{"5", "99999"}) {
+			t.Errorf("(5, 99999) should route to pmc_lo")
+		}
+	})
+
+	t.Run("MAXVALUE suffix opens the whole second column at the boundary prefix", func(t *testing.T) {
+		// Upper bound (10, MAXVALUE): with leading column == 10, the trailing
+		// MAXVALUE (+∞) means EVERY (10, x) is strictly below the upper edge, so
+		// it stays in pmc_lo (PG treats the suffix edge as +∞).
+		if !inLo([]string{"10", "0"}) {
+			t.Errorf("(10, 0) should route to pmc_lo (10 == prefix, suffix < +∞)")
+		}
+		if !inLo([]string{"10", "999999"}) {
+			t.Errorf("(10, 999999) should route to pmc_lo (suffix still < +∞)")
+		}
+	})
+
+	t.Run("concrete prefix above upper bound is out-of-partition", func(t *testing.T) {
+		// Leading column 11 > 10: above the upper edge regardless of suffix.
+		if rangeStrTupleLT([]string{"11", "0"}, to, toUnb, toMax) {
+			t.Errorf("(11, 0) < (10, MAXVALUE) should be false")
+		}
+	})
+
+	t.Run("concrete prefix + MAXVALUE lower edge excludes equal-prefix keys", func(t *testing.T) {
+		// A sibling pmc_hi would start FROM (10, MAXVALUE): a key (10, x) is NOT
+		// >= (10, +∞) for any finite x — it belongs to pmc_lo, not pmc_hi. This
+		// is the mirror invariant that keeps the two partitions non-overlapping.
+		hiFrom := []string{"10", "MAXVALUE"}
+		hiUnb, hiMax := []bool{false, true}, []bool{false, true}
+		if rangeStrTupleGE([]string{"10", "5"}, hiFrom, hiUnb, hiMax) {
+			t.Errorf("(10, 5) >= (10, MAXVALUE) should be false (suffix +∞ excludes equal prefix)")
+		}
+		if !rangeStrTupleGE([]string{"11", "0"}, hiFrom, hiUnb, hiMax) {
+			t.Errorf("(11, 0) >= (10, MAXVALUE) should be true (leading column exceeds)")
+		}
+	})
+}
+
 // TestPgInheritsEmitsLegacyInheritanceRows pins DU-002 slice 170: a table
 // created via CREATE TABLE child (...) INHERITS (parent) must surface a
 // pg_inherits row per (child, parent) pair in declaration order, so pg_dump

@@ -1161,6 +1161,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create RANGE partition prange_am: %v", err)
 	}
 
+	// Slice 262: a MULTI-COLUMN RANGE partition with a MINVALUE/MAXVALUE open edge
+	// on a NON-leading column. Every prior partition fixture (part/prange_am) is
+	// single-column, so the per-element bound machinery added in slices 169/261 —
+	// FormatPartitionBound's `, `-joined multi-element tuple, the parallel
+	// From/ToValueLiterals capture, and the parallel From/ToUnbounded[Max] flag
+	// tuples that route a concrete prefix column against an unbounded suffix edge —
+	// had never been exercised end to end through pg_dump. `pmc` is partitioned BY
+	// RANGE (a, b); `pmc_lo` keeps a fully-open lower bound `(MINVALUE, MINVALUE)`
+	// and a mixed upper bound `(10, MAXVALUE)` (concrete leading + open trailing),
+	// the exact shape PG requires (once an element is MINVALUE/MAXVALUE, every
+	// trailing element must match). pg_dump must re-emit the two-element tuples
+	// verbatim with bare keywords (not quoted literals) so the relpartbound restores
+	// as the same unbounded edges.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pmc (a integer, b integer, val text) PARTITION BY RANGE (a, b)"); err != nil {
+		t.Fatalf("create multi-column RANGE-partitioned table pmc: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pmc_lo PARTITION OF public.pmc FOR VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)"); err != nil {
+		t.Fatalf("create multi-column RANGE partition pmc_lo: %v", err)
+	}
+
 	// Slice 190: a DEFAULT partition (`CREATE TABLE child PARTITION OF parent
 	// DEFAULT`) must round-trip. pg_dump reads the catch-all child's bound via
 	// pg_get_expr(c.relpartbound, …), which returns the bare keyword `DEFAULT`,
@@ -3364,6 +3384,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')") {
 			t.Errorf("pg_dump emitted an unquoted/invalid RANGE bound; want %q\n  full stdout=%q", "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')", res.Stdout)
+		}
+		// **Slice 262 closed (asserted):** a MULTI-COLUMN RANGE bound with a
+		// MINVALUE/MAXVALUE open edge on a non-leading column. FormatPartitionBound
+		// joins the parallel From/ToValueLiterals tuples with `, `, so the two-element
+		// bounds must re-emit verbatim with bare keywords (slices 169/261). Assert (1)
+		// the parent's multi-column key clause `PARTITION BY RANGE (a, b)`, and (2) the
+		// child's mixed open/concrete two-element bound, proving the suffix MINVALUE/
+		// MAXVALUE survive un-quoted alongside the concrete leading `10`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.pmc (") ||
+			!strings.Contains(res.Stdout, "PARTITION BY RANGE (a, b)") {
+			t.Errorf("pg_dump dropped/mangled the multi-column RANGE parent; missing CREATE TABLE public.pmc / PARTITION BY RANGE (a, b)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pmc_lo FOR VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)") {
+			t.Errorf("pg_dump dropped/mangled the multi-column RANGE bound; want %q\n  full stdout=%q", "ATTACH PARTITION public.pmc_lo FOR VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)", res.Stdout)
 		}
 		// **Slice 190 (asserted):** a DEFAULT (catch-all) partition. pg_dump reads
 		// the bound via pg_get_expr(relpartbound), which yields the bare keyword

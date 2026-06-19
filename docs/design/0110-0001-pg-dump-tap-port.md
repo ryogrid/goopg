@@ -7636,8 +7636,33 @@ string (not ±∞), that the flag-driven edges behave as ±∞, and that nil fla
 the existing `prange_am` fixture (`FOR VALUES FROM (MINVALUE) TO ('m')`) in `TestPort_PgDumpConnectionSetup`
 continues to byte-match real pg_dump 18.3, proving the keyword-node rewrite preserves the dump round-trip.
 
-> **Next (slice 262+):** multi-level / `INHERITS` partition-tree dump fidelity, or per-element open-edge multi-column
-> RANGE bounds (`FROM (a, MINVALUE) TO (b, MAXVALUE)`) routing coverage.
+### Slice 262 — multi-column RANGE partition with a non-leading open edge (`FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)`)
+
+Every partition fixture through slice 261 was **single-column** (`part`, `prange_am`, `pdef`, …). The per-element
+RANGE-bound machinery built up over slices 169 (parallel `From/ToValueLiterals` tuples + `, `-joined
+`FormatPartitionBound`) and 261 (parallel `From/ToUnbounded[Max]` flag tuples + `compareKeyToRangeBound`) was written
+for multi-column tuples but had never been exercised end to end through pg_dump, nor had the routing been directly
+unit-tested across a **concrete prefix column + an unbounded suffix edge**. This slice closes that coverage gap; no
+production code changed — the existing machinery already round-trips the shape, and this slice proves (and guards) it.
+
+- **pg_dump fixture (`pgdump_connsetup_test.go`)** — `public.pmc (a integer, b integer, val text) PARTITION BY RANGE
+  (a, b)` with one child `pmc_lo FOR VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)`. The bound is the canonical
+  PG shape: once an element is `MINVALUE`/`MAXVALUE`, every trailing element must match, so `(MINVALUE, MINVALUE)`
+  (fully open) and `(10, MAXVALUE)` (concrete leading + open trailing) are both legal. Assertions: the parent's
+  two-column key clause `PARTITION BY RANGE (a, b)` and the verbatim child bound `ATTACH PARTITION public.pmc_lo FOR
+  VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)` — the contiguous `, `-joined tuples with **bare keywords** (not
+  quoted `'MINVALUE'`) prove the multi-element `FormatPartitionBound` join + the keyword renderer both hold.
+- **Routing unit test (`catalog_test.go::TestRangeTupleMultiColumnOpenEdge`)** — drives `rangeStrTupleGE`/
+  `rangeStrTupleLT` directly with the `pmc_lo` flag tuples: a fully-open lower bound admits any key; a concrete prefix
+  below `10` is in-partition regardless of suffix; at the boundary prefix `10` the trailing `MAXVALUE` (+∞) keeps
+  every `(10, x)` strictly below the upper edge (so it stays in `pmc_lo`); a prefix `11 > 10` is out; and the mirror
+  invariant `(10, x) NOT >= (10, MAXVALUE)` keeps a hypothetical `pmc_hi FROM (10, MAXVALUE)` non-overlapping.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `catalog.TestRangeTupleMultiColumnOpenEdge`.
+
+> **Next (slice 263+):** multi-level / `INHERITS` partition-tree dump fidelity beyond the existing single-leaf `psub`
+> tree (e.g. a sub-partitioned middle node with multiple leaves), or per-partition column-level options on a partition
+> child.
 
 ## Deferred (002–010) — catalog surface estimate
 

@@ -5650,6 +5650,27 @@ object support.
         **Next (slice 262+):** multi-level / `INHERITS` partition-tree dump fidelity, or per-element open-edge multi-column
         RANGE bound routing (`FROM (a, MINVALUE) TO (b, MAXVALUE)`).
 
+      - **PROGRESS 2026-06-20 (loop #29):** **DU-002 slice 262 LANDED — a multi-column RANGE partition with a
+        MINVALUE/MAXVALUE open edge on a NON-leading column (`FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)`) now
+        round-trips through pg_dump and routes correctly.** Every partition fixture through slice 261 was single-column
+        (`part`, `prange_am`, …), so the per-element RANGE-bound machinery built over slices 169 (parallel
+        `From/ToValueLiterals` + `, `-joined `FormatPartitionBound`) and 261 (parallel `From/ToUnbounded[Max]` flags +
+        `compareKeyToRangeBound`) — written for multi-column tuples — had never been exercised end to end through
+        pg_dump nor unit-tested across a **concrete prefix column + an unbounded suffix edge**. **No production code
+        changed** — the existing machinery already handles the shape; this slice proves and guards it. **pg_dump
+        fixture** (`pgdump_connsetup_test.go`): `public.pmc (a integer, b integer, val text) PARTITION BY RANGE (a, b)`
+        + child `pmc_lo FOR VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)` (the canonical PG shape — once an
+        element is MIN/MAXVALUE every trailing element must match); asserts the parent `PARTITION BY RANGE (a, b)` and
+        the verbatim `ATTACH PARTITION public.pmc_lo FOR VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)` with bare
+        keywords (not quoted `'MINVALUE'`). **Routing unit test** (`catalog.TestRangeTupleMultiColumnOpenEdge`): drives
+        `rangeStrTupleGE`/`rangeStrTupleLT` with the `pmc_lo` flag tuples — fully-open lower bound admits any key;
+        concrete prefix `<10` in-partition regardless of suffix; at boundary prefix `10` the trailing `MAXVALUE` (+∞)
+        keeps every `(10, x)` below the upper edge; prefix `11>10` out; and `(10, x) NOT >= (10, MAXVALUE)` keeps a
+        hypothetical `pmc_hi` non-overlapping. Guards: `TestPort_PgDumpConnectionSetup` PASS (3.16s, byte-matches real
+        pg_dump 18.3) + `catalog.TestRangeTupleMultiColumnOpenEdge` PASS. Full catalog suite PASS; gofmt + `go build
+        ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 262. **Next (slice 263+):**
+        multi-level partition-tree fidelity beyond the single-leaf `psub` tree, or per-partition column-level options.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).
