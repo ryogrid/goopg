@@ -1,8 +1,8 @@
 package parser_test
 
 import (
-	"testing"
 	"github.com/goopg/goopg/internal/parser"
+	"testing"
 )
 
 func TestM0097_0017_EnumDomainParsing(t *testing.T) {
@@ -26,7 +26,7 @@ func TestM0097_0017_EnumDomainParsing(t *testing.T) {
 		`DROP DOMAIN domaindroptest RESTRICT`,
 	}
 	for _, sql := range tests {
-		t.Run(sql[:min(60,len(sql))], func(t *testing.T) {
+		t.Run(sql[:min(60, len(sql))], func(t *testing.T) {
 			_, err := parser.Parse(sql)
 			if err != nil {
 				t.Errorf("Parse(%q) error: %v", sql, err)
@@ -35,4 +35,69 @@ func TestM0097_0017_EnumDomainParsing(t *testing.T) {
 	}
 }
 
-func min(a, b int) int { if a < b { return a }; return b }
+// TestCompositeFieldTypmodParsing covers DU-002 slice 247: a composite-type
+// field whose type carries a typmod (numeric(10,2), varchar(8)) must parse —
+// the inner ',' / ')' of the typmod must NOT prematurely terminate the field.
+// The collected ColType is the parser's space-joined token form, which
+// executor.parseCompositeFieldType decodes back into base type + atttypmod.
+func TestCompositeFieldTypmodParsing(t *testing.T) {
+	tests := []struct {
+		sql        string
+		wantFields []struct{ name, colType string }
+	}{
+		{
+			sql: `CREATE TYPE money_amt AS (amount numeric(10,2), code varchar(8))`,
+			wantFields: []struct{ name, colType string }{
+				{"amount", "numeric ( 10 , 2 )"},
+				{"code", "varchar ( 8 )"},
+			},
+		},
+		{
+			sql: `CREATE TYPE mixed_t AS (id int, amount numeric(10,2), label text)`,
+			wantFields: []struct{ name, colType string }{
+				{"id", "int"},
+				{"amount", "numeric ( 10 , 2 )"},
+				{"label", "text"},
+			},
+		},
+		{
+			sql: `CREATE TYPE arr_typmod AS (amounts numeric(10,2)[])`,
+			wantFields: []struct{ name, colType string }{
+				{"amounts", "numeric ( 10 , 2 ) [ ]"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.sql[:min(60, len(tc.sql))], func(t *testing.T) {
+			stmts, err := parser.Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+			}
+			ct, ok := stmts[0].(*parser.CreateTypeStmt)
+			if !ok {
+				t.Fatalf("expected *CreateTypeStmt, got %T", stmts[0])
+			}
+			if !ct.IsComposite {
+				t.Fatalf("expected IsComposite=true")
+			}
+			if len(ct.CompositeFields) != len(tc.wantFields) {
+				t.Fatalf("got %d fields, want %d: %+v",
+					len(ct.CompositeFields), len(tc.wantFields), ct.CompositeFields)
+			}
+			for i, want := range tc.wantFields {
+				got := ct.CompositeFields[i]
+				if got.Name != want.name || got.ColType != want.colType {
+					t.Errorf("field[%d] = {%q, %q}, want {%q, %q}",
+						i, got.Name, got.ColType, want.name, want.colType)
+				}
+			}
+		})
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

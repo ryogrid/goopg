@@ -2035,6 +2035,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create type addr: %v", err)
 	}
 
+	// Slice 247: a composite type whose FIELD carries a TYPMOD (numeric(10,2),
+	// varchar(8)) must round-trip the declared precision/length. dumpCompositeType
+	// renders each field via format_type(atttypid, atttypmod), so the encoded
+	// typmod must survive. goopg's CREATE TYPE parser previously broke a composite
+	// field's type collection on the FIRST ','/')' — which is *inside* the typmod
+	// for numeric(10,2)/varchar(8) — so the field list mis-parsed and the type
+	// never reached the catalog intact. The parser now balances parens, capturing
+	// the full `numeric ( 10 , 2 )` token run; executor.parseCompositeFieldType
+	// already decoded that space-joined form into base + atttypmod (it had been
+	// unreachable via SQL). Real pg_dump 18.3 renders numeric(10,2) and
+	// `character varying(8)` (the canonical spelling of varchar).
+	if err := runSQLSimple(t, c, "CREATE TYPE public.money_amt AS (amount numeric(10,2), code varchar(8))"); err != nil {
+		t.Fatalf("create type money_amt: %v", err)
+	}
+
 	// Slice 90: a user-defined DOMAIN over a base type and a column that uses it
 	// must survive the dump. This is the second OBJECT type (after the enum in
 	// slices 88-89). pg_dump's getTypes collects the domain from pg_type
@@ -5125,6 +5140,10 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE TYPE public.addr AS (",
 			"\tstreet text,",
 			"\tzip integer",
+			// Slice 247: typmod composite fields round-trip precision/length.
+			"CREATE TYPE public.money_amt AS (",
+			"\tamount numeric(10,2),",
+			"\tcode character varying(8)",
 		}
 		for _, sub := range compositeDefs {
 			if !strings.Contains(res.Stdout, sub) {

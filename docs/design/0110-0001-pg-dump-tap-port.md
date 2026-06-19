@@ -7152,7 +7152,35 @@ the scalar element type before this slice).
 > `(10,2)` commas/parens terminate the field early. The catalog-row builder *does* handle typmod composite
 > fields (the unit test constructs the `"numeric ( 10 , 2 ) [ ]"` ColType directly), but they cannot reach
 > it through SQL until the parser balances parentheses inside a composite field's type. Tracked for a
-> future slice; independent of array resolution.
+> future slice; independent of array resolution. **Resolved in slice 247.**
+
+### Slice 247 — composite field whose type carries a typmod (numeric(10,2), varchar(8))
+
+This closes the parser gap flagged at the end of slice 246. `parser.parseCreateType` collected each
+composite field's type tokens until the **first** `,` or `)` — but those characters appear *inside* a
+typmod (`numeric(10,2)`, `varchar(8)`), so a typmod field mis-parsed: `numeric(10,2)` split into a field
+`amount` of type `numeric ( 10` followed by a bogus field `2 )`. The executor side was already complete —
+`parseCompositeFieldType` decodes the space-joined `"numeric ( 10 , 2 )"` form into base type + encoded
+atttypmod (slice 243) — it was simply unreachable through SQL.
+
+- **`parser.parseCreateType`** now tracks paren depth while collecting a composite field's type tokens,
+  breaking only on a **top-level** `,` (next field) or `)` (end of field list). An inner `(` increments
+  the depth and an inner `)` decrements it, so the full `numeric ( 10 , 2 )` token run (and an array
+  suffix like `numeric ( 10 , 2 ) [ ]`, slice 246) is captured intact and handed to the executor's
+  already-working decoder.
+- **No executor change** — `parseCompositeFieldType` / `buildUserPGAttributeRowForCompositeField` already
+  rendered the typmod via `format_type(atttypid, atttypmod)`. The fix is purely making the catalog row
+  reachable from SQL.
+
+Guarded at two levels: `parser.TestCompositeFieldTypmodParsing` asserts the parser captures the
+space-joined ColType for `numeric(10,2)` / `varchar(8)` scalar and array fields; the pg_dump TAP port
+(`TestPort_PgDumpConnectionSetup`) seeds `CREATE TYPE public.money_amt AS (amount numeric(10,2), code
+varchar(8))` and asserts `pg_dump --schema-only` round-trips `amount numeric(10,2)` and `code character
+varying(8)` (the canonical spelling of `varchar`), byte-matching real pg_dump 18.3.
+
+> **Next (slice 248+):** a composite field whose type is a DOMAIN (slice 90 analog —
+> `DeclaredTypeName` → `cat.LookupDomain`), then a nested-composite field, then
+> `ALTER TYPE … ADD/DROP/ALTER ATTRIBUTE`.
 
 ## Deferred (002–010) — catalog surface estimate
 

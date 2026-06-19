@@ -5441,11 +5441,26 @@ func (p *parser) parseCreateType(pos int) (Stmt, error) {
 					break
 				}
 				fname := strings.ToLower(p.advance().Value)
-				// Collect type tokens until ',' or ')'
+				// Collect type tokens until a TOP-LEVEL ',' (next field) or ')'
+				// (end of field list). Track paren depth so a typmod like
+				// numeric(10,2) or varchar(8) — whose inner ',' / ')' would
+				// otherwise prematurely terminate the field — is captured intact.
+				// parseCompositeFieldType (executor) reads the space-joined form.
+				// DU-002 slice 247.
 				var typeParts []string
-				for p.cur().Kind != TokenEOF &&
-					!(p.cur().Kind == TokenSymbol && (p.cur().Value == "," || p.cur().Value == ")")) {
-					typeParts = append(typeParts, p.cur().Value)
+				parenDepth := 0
+				for p.cur().Kind != TokenEOF {
+					tok := p.cur()
+					if tok.Kind == TokenSymbol && parenDepth == 0 &&
+						(tok.Value == "," || tok.Value == ")") {
+						break
+					}
+					if tok.Kind == TokenSymbol && tok.Value == "(" {
+						parenDepth++
+					} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+						parenDepth--
+					}
+					typeParts = append(typeParts, tok.Value)
 					p.advance()
 				}
 				stmt.CompositeFields = append(stmt.CompositeFields, TypeField{

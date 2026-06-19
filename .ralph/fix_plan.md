@@ -5340,6 +5340,21 @@ object support.
         through `pg_dump`; pgbench pre-commit smoke on commit. **Next (slice 245+):** composite fields of a
         user-defined type (`parseCompositeFieldType` folds non-built-ins to `text`); `ALTER TYPE …
         ADD/DROP/ALTER ATTRIBUTE`.
+      - **PROGRESS 2026-06-20 (loop #13):** **DU-002 slice 247 LANDED — composite field whose type
+        carries a TYPMOD (`numeric(10,2)`, `varchar(8)`) now parses + round-trips through `pg_dump`.**
+        Closes the parser gap flagged at the end of slices 245/246: `parser.parseCreateType` collected a
+        composite field's type tokens until the FIRST `,`/`)`, but those appear *inside* a typmod, so
+        `numeric(10,2)` mis-parsed into `amount numeric ( 10` + a bogus `2 )` field. Fix is parser-only —
+        `parseCreateType` now tracks paren depth and breaks only on a TOP-LEVEL `,`/`)`, capturing the full
+        `numeric ( 10 , 2 )` token run (and `… [ ]` array suffix, slice 246). The executor side was already
+        complete (`parseCompositeFieldType` decodes the space-joined form into base + atttypmod, slice 243);
+        it was simply unreachable via SQL. Guards: `parser.TestCompositeFieldTypmodParsing` (scalar + array
+        typmod fields) + pg_dump TAP port seeds `CREATE TYPE public.money_amt AS (amount numeric(10,2), code
+        varchar(8))` and asserts round-trip of `amount numeric(10,2)` / `code character varying(8)`
+        (`TestPort_PgDumpConnectionSetup` PASS, 3.4s). Design: `0110-0001` Slice 247. pgbench pre-commit
+        smoke on commit. **Next (slice 248+):** composite field whose type is a DOMAIN (slice 90 analog,
+        `DeclaredTypeName`→`cat.LookupDomain`), then nested-composite field, then `ALTER TYPE …
+        ADD/DROP/ALTER ATTRIBUTE`.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
