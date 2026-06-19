@@ -5579,6 +5579,33 @@ leaf `ptbs_1 … TABLESPACE pg_default`; the assertion confirms the leaf's
 `CREATE TABLE` carries no spurious `TABLESPACE`/`WITH` clause and its
 `ATTACH PARTITION … FOR VALUES IN (1)` bound round-trips.
 
+### Slice 193 — per-leaf-partition `USING <access_method>` clause (parser sibling-path gap)
+
+PG's `CREATE TABLE … PARTITION OF …` grammar is `OptPartitionSpec
+table_access_method_clause OptWith OnCommitOption OptTableSpace`, so a leaf
+partition may carry a `USING method` clause **between** `PARTITION BY` and
+`WITH`. The non-partition `CREATE TABLE` path handles `table_access_method_clause`,
+but the partition-child arm went straight from the optional `PARTITION BY` block
+to `WITH`, so a `USING heap` left the token unconsumed and the whole statement
+failed with a syntax error — the same sibling-path divergence pattern as slices
+191 (`WITH`) and 192 (`TABLESPACE`).
+
+The fix inserts a `USING` trailer in the partition-child arm at the grammar
+position (after `PARTITION BY`, before `WITH`): `acceptKeyword(KwUsing)` /
+`acceptIdentKeyword("using")` then `parseIdent()` the method name, discarding it.
+goopg has a single (heap) access method, so `relam` stays at its default and
+pg_dump emits **no** `USING` clause; the child round-trips exactly like an
+access-method-less leaf. (Storing a non-default `relam` and re-emitting the clause
+would require `pg_class.relam` + `pg_am` name resolution — a separate, larger
+feature, out of scope here.)
+
+Parser unit guards: `TestPartitionChildUsingClause` (bare `USING heap`) and
+`TestPartitionChildUsingBeforeWith` (full grammar order
+`USING heap WITH (...) TABLESPACE ...`). The pg_dump fixture adds a `puse` LIST
+parent with a leaf `puse_1 … USING heap`; the assertion confirms the leaf's
+`CREATE TABLE` carries no spurious `USING`/`WITH` clause and its
+`ATTACH PARTITION … FOR VALUES IN (1)` bound round-trips.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

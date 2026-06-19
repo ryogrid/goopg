@@ -1720,6 +1720,20 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 				stmt.PartitionBy = &PartitionByClause{pos: pos2, Method: method, KeyCols: keyCols, KeyExprs: keyExprs, OpClasses: opClasses, Collations: colls}
 			}
 		}
+		// Optional USING <access_method> on a partition child, e.g.
+		// `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) USING heap`.
+		// PG's grammar is OptPartitionSpec table_access_method_clause OptWith
+		// OnCommitOption OptTableSpace, so USING precedes WITH. The partition-child
+		// arm previously omitted it, leaving the USING token unconsumed → syntax
+		// error. goopg has a single (heap) access method, so the name is accepted
+		// and discarded; relam stays at its default and pg_dump emits no USING
+		// clause, round-tripping the child like an access-method-less leaf.
+		// M0110-0001 (DU-002 slice 193).
+		if p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using") {
+			if _, err := p.parseIdent(); err != nil {
+				return nil, err
+			}
+		}
 		// Optional WITH (storage params) on a partition child, e.g.
 		// `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) WITH (fillfactor=70)`.
 		// PG allows storage parameters on a leaf partition; the executor persists

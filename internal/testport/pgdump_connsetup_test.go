@@ -815,6 +815,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create LIST leaf partition ptbs_1 with TABLESPACE: %v", err)
 	}
 
+	// Slice 193: a leaf partition child may carry a USING <access_method> clause.
+	// PG's CREATE TABLE ... PARTITION OF grammar is OptPartitionSpec
+	// table_access_method_clause OptWith OnCommitOption OptTableSpace, so USING
+	// precedes WITH. The partition-child parser arm previously omitted it, leaving
+	// the USING token unconsumed so the whole statement failed with a syntax error
+	// — a divergence from the non-partition CREATE TABLE path. goopg has a single
+	// (heap) access method, so the name is accepted and discarded; relam stays at
+	// its default and pg_dump emits no USING clause, round-tripping the child like
+	// an access-method-less leaf. `puse_1` exercises `USING heap` on a LIST leaf of
+	// `puse`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.puse (k integer, v text) PARTITION BY LIST (k)"); err != nil {
+		t.Fatalf("create LIST-partitioned table puse: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.puse_1 PARTITION OF public.puse FOR VALUES IN (1) USING heap"); err != nil {
+		t.Fatalf("create LIST leaf partition puse_1 with USING: %v", err)
+	}
+
 	// Slice 170: legacy table inheritance (CREATE TABLE child (...) INHERITS
 	// (parent)) must round-trip. goopg merged the parent's columns into the child
 	// but (a) emitted no pg_inherits row for the inheritance edge (only partition
@@ -2437,6 +2454,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.ptbs_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped/mangled the TABLESPACE leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.ptbs_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 193 closed (asserted):** a USING <access_method> clause on a leaf
+		// partition. The partition-child parser arm previously omitted
+		// table_access_method_clause, so the `USING heap` token left unconsumed and
+		// the whole CREATE TABLE failed with a syntax error (the runSQLSimple above
+		// would have fatal'd at fixture setup). The parser now accepts and discards
+		// the name, mirroring the non-partition path. relam stays at its default, so
+		// pg_dump emits NO USING clause and the child round-trips exactly like an
+		// access-method-less leaf: a plain CREATE TABLE plus its ATTACH bound, with
+		// no spurious USING/WITH/TABLESPACE.
+		if puseStart := strings.Index(res.Stdout, "CREATE TABLE public.puse_1 ("); puseStart >= 0 {
+			rest := res.Stdout[puseStart:]
+			stmtEnd := strings.Index(rest, ";")
+			if stmtEnd < 0 {
+				stmtEnd = len(rest)
+			}
+			puseStmt := rest[:stmtEnd]
+			if strings.Contains(puseStmt, "USING") {
+				t.Errorf("pg_dump emitted a spurious USING clause on the default-access-method leaf puse_1\n  puse_1 stmt=%q\n  full stdout=%q", puseStmt, res.Stdout)
+			}
+			if strings.Contains(puseStmt, "WITH (") {
+				t.Errorf("pg_dump emitted a spurious WITH clause on the option-less leaf puse_1\n  full stdout=%q", res.Stdout)
+			}
+		} else {
+			t.Errorf("pg_dump did not emit CREATE TABLE for leaf partition puse_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.puse_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped/mangled the USING leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.puse_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 170 closed (asserted):** legacy table inheritance. goopg emitted
 		// no pg_inherits row for the INHERITS edge and left the inherited columns

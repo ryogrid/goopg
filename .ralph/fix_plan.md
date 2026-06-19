@@ -4237,6 +4237,27 @@ object support.
         pgbench pre-commit smoke on commit. **Next:** composite types (`CREATE TYPE AS`;
         `pg_class.reltype` hardcoded 0 — larger); or PG18 virtual generated columns
         (`GENERATED ALWAYS AS (expr) VIRTUAL`; attgenerated='v' not yet surfaced — runtime-heavy).
+      - **PROGRESS 2026-06-19 (loop #6):** **DU-002 slice 193 LANDED — per-leaf-partition
+        `USING <access_method>` clause (parser sibling-path gap).** PG's `CREATE TABLE … PARTITION
+        OF …` grammar is `OptPartitionSpec table_access_method_clause OptWith OnCommitOption
+        OptTableSpace`, so `USING method` sits between `PARTITION BY` and `WITH`. The non-partition
+        path handles `table_access_method_clause`, but the partition-child arm jumped from the
+        optional `PARTITION BY` block straight to `WITH`, so `USING heap` left the token unconsumed
+        and the statement failed with a syntax error — the same sibling-path gap as slices 191/192.
+        Fix: insert a `USING` trailer at the grammar position (after `PARTITION BY`, before `WITH`):
+        `acceptKeyword(KwUsing)`/`acceptIdentKeyword("using")` + `parseIdent()`, discard the name.
+        goopg has a single heap access method, so `relam` stays default and pg_dump emits no `USING`
+        clause; the child round-trips like an access-method-less leaf. (Non-default `relam` +
+        re-emit needs `pg_class.relam` + `pg_am` resolution — separate larger feature, out of
+        scope.) Files: `internal/parser/ddl.go`, `internal/parser/gen_override_test.go` (2 new unit
+        tests: `TestPartitionChildUsingClause`, `TestPartitionChildUsingBeforeWith`),
+        `internal/testport/pgdump_connsetup_test.go` (NEW `puse`/`puse_1 … USING heap` fixture +
+        no-spurious-USING/WITH + ATTACH-bound assertions), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 193). Gates: gofmt OK; `go build ./...` clean; `go vet ./internal/testport/` clean;
+        parser + `TestPort_PgDumpConnectionSetup` PASS; pgbench pre-commit smoke on commit. **Next:**
+        composite types (`CREATE TYPE AS`; `pg_class.reltype` hardcoded 0 — larger); or PG18 virtual
+        generated columns (`GENERATED ALWAYS AS (expr) VIRTUAL`; attgenerated='v' not yet surfaced —
+        runtime-heavy).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

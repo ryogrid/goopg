@@ -69,6 +69,44 @@ func TestPartitionChildWithStorageParamsAfterSubPartitionBy(t *testing.T) {
 	}
 }
 
+// TestPartitionChildUsingClause covers DU-002 slice 193: a leaf partition child
+// may carry a USING <access_method> clause (after FOR VALUES / PARTITION BY,
+// before WITH), exactly like the non-partition CREATE TABLE path. The PG grammar
+// is OptPartitionSpec table_access_method_clause OptWith OnCommitOption
+// OptTableSpace, so USING precedes WITH. The parser previously stopped before
+// USING, leaving it unconsumed so the statement failed with a syntax error.
+// goopg has a single heap access method, so the name is accepted and discarded;
+// the parse must simply succeed.
+func TestPartitionChildUsingClause(t *testing.T) {
+	sql := `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) USING heap`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if ct.PartitionOf == nil {
+		t.Fatal("no PartitionOf")
+	}
+}
+
+// TestPartitionChildUsingBeforeWith ensures USING is consumed when it precedes a
+// WITH (storage params) clause — the PG grammar order is table_access_method_clause
+// → OptWith, so both trailers must be parsed and WITH must still be captured.
+func TestPartitionChildUsingBeforeWith(t *testing.T) {
+	sql := `CREATE TABLE leaf PARTITION OF parent FOR VALUES IN (1) USING heap WITH (fillfactor=70) TABLESPACE pg_default`
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	ct := stmts[0].(*CreateTableStmt)
+	if ct.PartitionOf == nil {
+		t.Fatal("no PartitionOf")
+	}
+	if got := ct.With["fillfactor"]; got != "70" {
+		t.Errorf("expected With[fillfactor]=70, got %q (With=%v)", got, ct.With)
+	}
+}
+
 // TestPartitionChildTablespaceClause covers DU-002 slice 192: a leaf partition
 // child may carry a trailing TABLESPACE clause (after FOR VALUES, any WITH, and
 // ON COMMIT), exactly like the non-partition CREATE TABLE path. The parser
