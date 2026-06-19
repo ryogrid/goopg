@@ -1333,6 +1333,33 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pchk_1 with child-only CHECK: %v", err)
 	}
 
+	// Slice 265: a CHILD-ONLY column DEFAULT on a LIST partition leaf must
+	// round-trip through pg_dump. This is the column-ATTRIBUTE sibling of slice
+	// 264's table-level CHECK: where the CHECK appears as a separate constraint
+	// item, a per-column DEFAULT must be re-attached to its column INSIDE the
+	// leaf's column list. Critically, pg_dump prints the leaf's FULL inherited
+	// column list either way — shouldPrintColumn (pg_dump.c:9970) returns true
+	// for every column of a partition (`tbinfo->ispartition`), so the body is
+	// NOT column-less (slice 264's comment that a leaf "prints no columns" is
+	// inaccurate; real pg_dump 18.3 emits `a integer` for pchk_1 too). The
+	// DEFAULT declared in the PARTITION OF column-override list (`(b DEFAULT
+	// 42)`) is LOCAL to the leaf: execCreatePartitionChild records it on the
+	// leaf's catalog.Column.DefaultExpr, so goopg's pg_attrdef emits the leaf's
+	// adbin (atthasdef=true) and pg_get_expr renders `42`. Real pg_dump 18.3
+	// then emits the leaf body `a integer, b integer DEFAULT 42` followed by the
+	// LIST-bound ATTACH (verified byte-identical vs PG 18.3 and a fresh goopg
+	// server). Every prior partition fixture exercised bounds, storage/AM
+	// clauses, or a table-level CHECK, never a per-column override DEFAULT on a
+	// leaf; this slice proves and guards that pg_attrdef path. No production
+	// change — execCreatePartitionChild's column-override DEFAULT handling and
+	// the pg_attrdef/pg_get_expr leaf path already exist.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pdfl (a integer, b integer) PARTITION BY LIST (a)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pdfl: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pdfl_1 PARTITION OF public.pdfl (b DEFAULT 42) FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pdfl_1 with child-only DEFAULT: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -3642,6 +3669,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pchk_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pchk_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 265 (asserted):** child-only column DEFAULT on a partition leaf.
+		// The leaf pdfl_1 prints its full inherited column list (shouldPrintColumn
+		// is true for every partition column); the per-column override DEFAULT must
+		// re-attach inside that list as `b integer DEFAULT 42`, with the inherited
+		// `a integer` kept and no spurious default on it. A regression dropping the
+		// leaf's pg_attrdef row (or mis-rendering adbin) would lose `DEFAULT 42`
+		// silently and break restore (the leaf would no longer default b to 42).
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pdfl_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "a integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited column; want %q in pdfl_1 block\n  block=%q", "a integer", block)
+			}
+			if !strings.Contains(block, "b integer DEFAULT 42") {
+				t.Errorf("pg_dump dropped/corrupted the child-only DEFAULT; want %q in pdfl_1 block\n  block=%q", "b integer DEFAULT 42", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pdfl_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pdfl_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pdfl_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged

@@ -5711,6 +5711,25 @@ object support.
         + `go build ./...` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 264. **Next (slice 265+):**
         a child-only `DEFAULT`/`NOT NULL` override on a partition leaf, or a local constraint on a legacy `INHERITS` child.
 
+      - **PROGRESS 2026-06-20 (loop #32):** **DU-002 slice 265 LANDED — a CHILD-ONLY column `DEFAULT` on a partition
+        leaf round-trips through pg_dump.** The column-attribute sibling of slice 264's table-level CHECK: `pdfl_1` is a
+        `LIST` leaf of `pdfl (a integer, b integer)` carrying `(b DEFAULT 42)` in its `PARTITION OF` column-override list.
+        **Correction to slice 264's note:** a partition leaf does NOT print "no columns" — `shouldPrintColumn`
+        (`pg_dump.c:9970`) returns `attislocal || ispartition`, so every leaf column prints; real pg_dump 18.3 emits
+        `a integer` for `pchk_1` too, with the CHECK as an extra constraint item. The `DEFAULT 42` is local to the leaf:
+        `execCreatePartitionChild` records it on `catalog.Column.DefaultExpr`, so goopg's `pg_attrdef` emits the leaf's
+        `adbin` (`atthasdef=true`) and `pg_get_expr` renders `42`. Real pg_dump 18.3 emits the leaf body
+        `a integer, b integer DEFAULT 42` + `ATTACH PARTITION public.pdfl_1 FOR VALUES IN (1)` — verified byte-identical
+        vs PG 18.3 AND a fresh goopg server (both probed this loop). **No production code changed** — the column-override
+        `DEFAULT` handling + `pg_attrdef`/`pg_get_expr` leaf path already existed; this slice proves and guards that
+        `pg_attrdef` path (a regression dropping the leaf `pg_attrdef` row would lose `DEFAULT 42` silently and break
+        restore). **pg_dump fixture** (`pgdump_connsetup_test.go`): `pdfl`/`pdfl_1` + a block-scoped assert on the leaf
+        body (`a integer`, `b integer DEFAULT 42`) and the ATTACH bound. Guard: `TestPort_PgDumpConnectionSetup` PASS
+        (3.37s, byte-matches real pg_dump 18.3). gofmt + `go build ./...` clean; pgbench pre-commit smoke on commit.
+        Design: `0110-0001` Slice 265. **Next (slice 266+):** a child-only `NOT NULL` override on a partition leaf (the
+        last column-override form; confirmed working on goopg as `b integer NOT NULL`), or a local constraint on a legacy
+        `INHERITS` child.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

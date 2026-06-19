@@ -7712,6 +7712,33 @@ Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
 > column-override forms), or `INHERITS`-tree dump fidelity beyond the single child (local constraint on a legacy
 > inheritance child).
 
+### Slice 265 — child-only column `DEFAULT` on a partition leaf
+
+The column-attribute sibling of slice 264's table-level CHECK: `pdfl_1` is a `LIST` leaf of `pdfl (a integer, b integer)`
+carrying `(b DEFAULT 42)` in its `PARTITION OF` column-override list. Where the CHECK surfaces as a separate constraint
+item, a per-column `DEFAULT` must re-attach to its column **inside** the leaf's printed column list.
+
+**Correction to slice 264:** that section claimed a partition child "prints **no columns**." That is inaccurate.
+`shouldPrintColumn` (`pg_dump.c:9970`) returns `tbinfo->attislocal[colno] || tbinfo->ispartition`, so **every** column of a
+partition leaf is printed — real pg_dump 18.3 emits `a integer` for `pchk_1` too, with the CHECK as an additional
+constraint item. The leaf body is *not* column-less.
+
+The `DEFAULT 42` is local to the leaf: `execCreatePartitionChild` records it on the leaf's `catalog.Column.DefaultExpr`,
+so goopg's `pg_attrdef` emits the leaf's `adbin` (`atthasdef=true`) and `pg_get_expr` renders `42`. Real pg_dump 18.3
+emits the leaf body `a integer, b integer DEFAULT 42` followed by `ATTACH PARTITION public.pdfl_1 FOR VALUES IN (1)`
+(verified byte-identical vs PG 18.3 and a fresh goopg server). Every prior partition fixture exercised bounds,
+storage/AM clauses, or a table-level CHECK, never a per-column override `DEFAULT` on a leaf; this slice proves and guards
+that `pg_attrdef` path.
+
+No production code changed — `execCreatePartitionChild`'s column-override `DEFAULT` handling and the
+`pg_attrdef`/`pg_get_expr` leaf path already existed.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+> **Next (slice 266+):** a child-only `NOT NULL` override on a partition leaf (the last column-override form; real
+> pg_dump 18.3 also prints it inline as `b integer NOT NULL` — confirmed working on goopg), or `INHERITS`-tree dump
+> fidelity beyond the single child (local constraint on a legacy inheritance child).
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
