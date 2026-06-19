@@ -5959,6 +5959,24 @@ object support.
         `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` counterpart where the name EQUALS the auto-name
         — the collapse should drop the `CONSTRAINT` prefix while the `NO INHERIT` suffix survives (`<col> <type> NOT NULL
         NO INHERIT`), combining slice 274's collapse with slice 275's suffix threading.
+      - **PROGRESS 2026-06-20 (loop #45):** **DU-002 slice 278 LANDED — combines slice 277's auto-name collapse with
+        slice 275's `NO INHERIT` suffix on the ALTER path: a NAMED `NO INHERIT` NOT NULL added to a LOCAL column via
+        `ALTER TABLE ... ADD CONSTRAINT nninh7_c_not_null NOT NULL c NO INHERIT` whose name EQUALS the auto-name must
+        COLLAPSE the `CONSTRAINT` prefix while the `NO INHERIT` suffix SURVIVES — the bare `c integer NOT NULL NO INHERIT`
+        form (no production change; sibling-paths regression guard).** pg_dump renders the column NOT NULL clause in two
+        independent steps (pg_dump.c:17179-17188): the name-vs-default decision picks bare ` NOT NULL` (conname matches
+        computed default, suppressed at pg_dump.c:17184), then `notnull_noinh[j]` appends ` NO INHERIT` (pg_dump.c:17187).
+        Slice 275 proved the ALTER executor threads the NO INHERIT bit; slice 277 proved it stores the collapsible default
+        conname; this twin proves BOTH travel together. A regression dropping the noinh bit would emit `c integer NOT
+        NULL`; one storing a non-default conname would leak `c integer CONSTRAINT nninh7_c_not_null NOT NULL NO INHERIT`;
+        the assertion rejects both. Fixture: `CREATE TABLE public.nninh7 (c integer, d integer)` + `ALTER TABLE
+        public.nninh7 ADD CONSTRAINT nninh7_c_not_null NOT NULL c NO INHERIT`. **Guards:**
+        `TestPort_PgDumpConnectionSetup` PASS (3.55s; asserts bare `c integer NOT NULL NO INHERIT`, negative check that
+        `CONSTRAINT nninh7_c_not_null` does NOT leak, and plain `d integer` survives). gofmt + `go build ./...` clean;
+        pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 278. **Next (slice 279+):** the
+        `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` counterpart on an *inherited* (child) column — pg_dump
+        attaches the NOT NULL to the child only when it is locally declared (conislocal), exercising the inheritance
+        interaction the prior local-only slices avoided.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

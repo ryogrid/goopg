@@ -8086,9 +8086,29 @@ rejects that leaked prefix in addition to requiring the bare named form.
 Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `nninh6`
 block contains `c integer NOT NULL`, does NOT contain `CONSTRAINT nninh6_c_not_null`, and the plain `d integer` survives).
 
-> **Next (slice 278+):** the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` counterpart where the name
-> EQUALS the auto-name — the auto-name collapse should still drop the `CONSTRAINT` prefix while the `NO INHERIT` suffix
-> survives (`<col> <type> NOT NULL NO INHERIT`), combining slice 274's collapse with slice 275's suffix threading.
+### Slice 278 — *default-named* `NO INHERIT` NOT NULL added to a *local* column via `ALTER TABLE ADD CONSTRAINT` collapses the prefix but keeps the suffix
+
+Combines slice 277's auto-name collapse with slice 275's `NO INHERIT` suffix threading on the ALTER path —
+`CREATE TABLE nninh7 (c integer, d integer); ALTER TABLE nninh7 ADD CONSTRAINT nninh7_c_not_null NOT NULL c NO INHERIT` →
+`c integer NOT NULL NO INHERIT` (the `CONSTRAINT nninh7_c_not_null` prefix collapses because the explicit name equals the
+auto-name, but the `NO INHERIT` suffix survives).
+
+**No production change required.** pg_dump renders the column NOT NULL clause in two independent steps
+(pg_dump.c:17179-17188): the name-vs-default decision picks bare ` NOT NULL` (the conname matches the computed default
+`<table>_<col>_not_null`, suppressed at pg_dump.c:17184), then `notnull_noinh[j]` appends ` NO INHERIT`
+(pg_dump.c:17187). Slice 275 already proved the AlterTableAddNotNull executor threads the NO INHERIT bit onto the
+contype='n' pg_constraint row; slice 277 proved it stores the collapsible default conname. This twin proves BOTH travel
+together on the ALTER path. A regression dropping the noinh bit would emit `c integer NOT NULL` (missing suffix); one
+storing a non-default conname would leak `c integer CONSTRAINT nninh7_c_not_null NOT NULL NO INHERIT`; the assertion
+rejects both.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `nninh7`
+block contains `c integer NOT NULL NO INHERIT`, does NOT contain `CONSTRAINT nninh7_c_not_null`, and the plain
+`d integer` survives).
+
+> **Next (slice 279+):** the `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` counterpart on an *inherited* (child)
+> column — pg_dump should attach the NOT NULL to the child only when it is locally declared (conislocal), exercising the
+> inheritance interaction the prior local-only slices deliberately avoided.
 
 ## Deferred (002–010) — catalog surface estimate
 
