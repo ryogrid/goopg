@@ -342,6 +342,64 @@ func TestAlterTypeAlterAttributeParsing(t *testing.T) {
 	}
 }
 
+// TestAlterTypeMultiSubcommandParsing covers DU-002 slice 260: a comma-combined
+// ALTER TYPE … (ADD|DROP|ALTER ATTRIBUTE …, …) parses into one AttrCmds element
+// per subcommand, in order, with per-subcommand COLLATE/IF EXISTS/typmods intact.
+// AttrCmds[0] is also mirrored into the legacy scalar fields so the single
+// command keeps working unchanged. A single-subcommand statement yields exactly
+// one AttrCmds entry; RENAME ATTRIBUTE / ADD VALUE do NOT populate AttrCmds.
+func TestAlterTypeMultiSubcommandParsing(t *testing.T) {
+	sql := `ALTER TYPE public.mc ADD ATTRIBUTE d text, DROP ATTRIBUTE b, ALTER ATTRIBUTE c TYPE numeric(12,3), ADD ATTRIBUTE e text COLLATE "C", DROP ATTRIBUTE IF EXISTS gone`
+	stmts, err := parser.Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse(%q) error: %v", sql, err)
+	}
+	at, ok := stmts[0].(*parser.AlterTypeStmt)
+	if !ok {
+		t.Fatalf("expected *AlterTypeStmt, got %T", stmts[0])
+	}
+	want := []parser.AlterTypeAttrCmd{
+		{Kind: "add", Name: "d", Type: "text"},
+		{Kind: "drop", Name: "b"},
+		{Kind: "alter", Name: "c", Type: "numeric ( 12 , 3 )"},
+		{Kind: "add", Name: "e", Type: "text", Collation: "C"},
+		{Kind: "drop", Name: "gone", IfExists: true},
+	}
+	if len(at.AttrCmds) != len(want) {
+		t.Fatalf("AttrCmds len = %d, want %d (%+v)", len(at.AttrCmds), len(want), at.AttrCmds)
+	}
+	for i, w := range want {
+		if at.AttrCmds[i] != w {
+			t.Errorf("AttrCmds[%d] = %+v, want %+v", i, at.AttrCmds[i], w)
+		}
+	}
+	// AttrCmds[0] mirrored into the legacy ADD scalar fields.
+	if at.AddAttrName != "d" || at.AddAttrType != "text" {
+		t.Errorf("legacy mirror = {%q, %q}, want {d, text}", at.AddAttrName, at.AddAttrType)
+	}
+
+	// A single ADD ATTRIBUTE still yields exactly one AttrCmds entry (+ mirror).
+	single, err := parser.Parse(`ALTER TYPE public.mc ADD ATTRIBUTE only int`)
+	if err != nil {
+		t.Fatalf("Parse single: %v", err)
+	}
+	sat := single[0].(*parser.AlterTypeStmt)
+	if len(sat.AttrCmds) != 1 || sat.AttrCmds[0].Kind != "add" || sat.AddAttrName != "only" {
+		t.Errorf("single ADD ATTRIBUTE: AttrCmds=%+v AddAttrName=%q", sat.AttrCmds, sat.AddAttrName)
+	}
+
+	// RENAME ATTRIBUTE and ADD VALUE must NOT populate AttrCmds.
+	for _, s := range []string{`ALTER TYPE public.mc RENAME ATTRIBUTE a TO b`, `ALTER TYPE mood ADD VALUE 'x'`} {
+		ps, err := parser.Parse(s)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", s, err)
+		}
+		if pat := ps[0].(*parser.AlterTypeStmt); len(pat.AttrCmds) != 0 {
+			t.Errorf("%q populated AttrCmds=%+v, want empty", s, pat.AttrCmds)
+		}
+	}
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a

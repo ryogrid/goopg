@@ -2485,6 +2485,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, `ALTER TYPE public.alt_comp ALTER ATTRIBUTE cc TYPE text COLLATE "POSIX"`); err != nil {
 		t.Fatalf("alter type alt_comp alter attribute cc type text collate POSIX: %v", err)
 	}
+	// Slice 260: multi-subcommand ALTER TYPE — a single statement comma-combining
+	// ADD/DROP/ALTER ATTRIBUTE actions (PG's alter_type_cmds list). goopg folds
+	// every action into one field slice (left to right) and re-syncs the
+	// composite heap once, so all of them must round-trip together. Starting from
+	// (a integer, b text, c numeric(10,2)) the combined statement adds d, drops b,
+	// re-types c→numeric(12,3), and adds a collated e, leaving the final shape
+	// (a integer, c numeric(12,3), d text, e text COLLATE "C"). A fresh type keeps
+	// this fixture independent of the alt_comp chain above.
+	if err := runSQLSimple(t, c, "CREATE TYPE public.multi_comp AS (a integer, b text, c numeric(10,2))"); err != nil {
+		t.Fatalf("create type multi_comp: %v", err)
+	}
+	if err := runSQLSimple(t, c, `ALTER TYPE public.multi_comp ADD ATTRIBUTE d text, DROP ATTRIBUTE b, ALTER ATTRIBUTE c TYPE numeric(12,3), ADD ATTRIBUTE e text COLLATE "C"`); err != nil {
+		t.Fatalf("alter type multi_comp multi-subcommand: %v", err)
+	}
 	if err := runSQLSimple(t, c, "CREATE TABLE public.dom (id integer PRIMARY KEY, zip zipcode, zip_nn zipcode_nn, q qty, lbl label, vc vcdef, v20 vc20, c4 ch4, nd numd, pq posqty, nc named_chk, co colr, ni named_in, vci vc_in, vc20i vc20_in, chi ch_in, ii i_in, iin i_in_n, ni2 n_in, bi b_in, boi bo_in, di d_in, ri r_in, f8i f8_in, tsi ts_in, tmi tm_in, ui u_in, sii si_in, byi by_in, ineti inet_in, maci mac_in, mac8i mac8_in, cidri cidr_in, nmi nm_in, jbi jb_in, jsi js_in, xmli xml_in, oidi oid_in, biti bit_in, vbiti vbit_in, lsni lsn_in, tidi tid_in, xidi xid_in, cidi cid_in, ivi iv_in, mnyi mny_in, eni enum_in, tstzi tstz_in, ttzi ttz_in, x8i x8_in, i2vi i2v_in, oveci ovec_in, tsvi tsv_in, tsqi tsq_in, zips zipcode[])"); err != nil {
 		t.Fatalf("create table dom: %v", err)
 	}
@@ -5296,6 +5310,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"\ta bigint,",
 			"\tb_renamed numeric(12,3),",
 			"\tcc text COLLATE pg_catalog.\"POSIX\"\n",
+			// Slice 260: multi-subcommand ALTER TYPE folded ADD d / DROP b /
+			// ALTER c TYPE numeric(12,3) / ADD e COLLATE "C" into one re-sync, so
+			// all four changes round-trip together: b is gone, c carries its new
+			// typmod, d appended, e is the final collated field (comma-less).
+			"CREATE TYPE public.multi_comp AS (",
+			"\ta integer,",
+			"\tc numeric(12,3),",
+			"\td text,",
+			"\te text COLLATE pg_catalog.\"C\"\n",
 			// Slice 257: a per-field COLLATE round-trips inline. The field's
 			// attcollation (C=950 / POSIX=951) differs from text's typcollation
 			// (100), so dumpCompositeType re-emits `COLLATE pg_catalog."<name>"`.
@@ -5314,6 +5337,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// from alt_comp — the re-synced heap dropped its pg_attribute row.
 		if strings.Contains(res.Stdout, "c numeric(10,2)") {
 			t.Errorf("pg_dump still emitted the DROP ATTRIBUTE'd composite field c (slice-255 drop regressed)\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 260: the multi-subcommand fold must emit multi_comp's fields in
+		// exactly (a, c, d, e) order with the DROP'd `b` gone — assert the whole
+		// contiguous block so an out-of-order field or a surviving `b text` (which
+		// would appear between a and c) fails the test.
+		multiCompBlock := "CREATE TYPE public.multi_comp AS (\n\ta integer,\n\tc numeric(12,3),\n\td text,\n\te text COLLATE pg_catalog.\"C\"\n);"
+		if !strings.Contains(res.Stdout, multiCompBlock) {
+			t.Errorf("pg_dump mangled the multi-subcommand ALTER TYPE round-trip (slice-260); missing contiguous block %q\n  full stdout=%q", multiCompBlock, res.Stdout)
 		}
 		// The auto-generated `_addr` array type must NOT dump as its own CREATE
 		// TYPE (the isarray subquery suppresses it, like `_mood`).

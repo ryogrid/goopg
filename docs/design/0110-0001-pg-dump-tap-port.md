@@ -7564,7 +7564,45 @@ field via `ALTER TYPE public.alt_comp ALTER ATTRIBUTE cc TYPE text COLLATE "POSI
 pg_dump 18.3). The slice-257 heap-row test (`executor.TestUserPGAttributeCompositeFieldCollation`) covers the
 reused `field.Collation`→`attcollation` builder.
 
-> **Next (slice 260+):** multi-subcommand `ALTER TYPE` statements (`ADD …, DROP …` in one command).
+### Slice 260 — multi-subcommand `ALTER TYPE` (`ADD …, DROP …, ALTER …` in one statement)
+
+Slices 253/255/256 each handled exactly **one** attribute action per `ALTER TYPE`; the parser branch parsed its
+single subcommand and **stub-consumed** any trailing `, <subcommand>`, so a comma-combined statement like
+`ALTER TYPE x ADD ATTRIBUTE d text, DROP ATTRIBUTE b, ALTER ATTRIBUTE c TYPE numeric(12,3)` silently applied only
+the first action and dropped the rest from the catalog (and thus the dump). PostgreSQL's `ALTER TYPE` grammar
+allows `ADD/DROP/ALTER ATTRIBUTE` (only these three — `ADD VALUE`/`RENAME`/`OWNER` are singular) to be combined in
+one `alter_type_cmds` list. This slice lands the comma-combined form end to end.
+
+- **AST (`ast.go`)** — new `AlterTypeAttrCmd{Kind, Name, Type, Collation, IfExists}` plus
+  `AlterTypeStmt.AttrCmds []AlterTypeAttrCmd`, one element per subcommand.
+- **Parser (`parseAlterType`, `ddl.go`)** — restructured so the attribute-subcommand list is tried first via the
+  new backtracking `parseOneAttrCmd` (returns `ok=false` and restores `p.idx` for the non-attribute forms — `ADD
+  VALUE`, `RENAME …`, `OWNER TO` — which keep their dedicated branches). A `,` loop collects each further
+  subcommand; a trailing non-attribute action is stub-consumed. Shared helpers `parseAttrTypeTokens` (paren-tracked
+  typmods, stops at top-level `,`/`;`/`COLLATE`/`USING`/`CASCADE`/`RESTRICT`) and `consumeAttrCmdTrailer`
+  (paren-aware stub of the per-action `USING`/`CASCADE`/`RESTRICT`) replace the old inline loops. `mirrorFirstAttrCmd`
+  copies `AttrCmds[0]` back into the legacy scalar fields (`AddAttrName`/`DropAttrName`/`AlterAttr*`/…) so the
+  single-subcommand executor branches **and** all existing parser unit tests are byte-for-byte unchanged.
+- **Executor (`execAlterType` → `execAlterTypeAttrCmds`, `operators_ddl.go`)** — when `len(AttrCmds) > 1` the new
+  `execAlterTypeAttrCmds` looks up the composite once, folds every action into a working `[]CompositeField` **left
+  to right** (so each action sees its predecessors' result — e.g. `ADD a` then `ALTER a TYPE …`), reusing the exact
+  per-action validation + SQLSTATEs of the single branches (`42701` duplicate, `42703` missing, `42P16` pseudo-type
+  `unknown`, `IF EXISTS` → skipping NOTICE), then stamps xmax on the composite heap rows **once** and re-syncs the
+  final field set (`RegisterCompositeTypeWithFields` + `syncCompositeTypeToCatalogHeap`; OIDs stable). The proven
+  single-subcommand branches (len ≤ 1) are untouched.
+- **No `pg_dump`-side change** — `dumpCompositeType` re-emits the final field set; every changed/added attribute
+  (and the dropped one's absence) round-trips.
+
+Guarded at two levels: `parser.TestAlterTypeMultiSubcommandParsing` asserts the full `AttrCmds` list (order,
+per-subcommand `COLLATE`/`IF EXISTS`/typmod), the `AttrCmds[0]` legacy mirror, that a single `ADD ATTRIBUTE` yields
+exactly one entry, and that `RENAME ATTRIBUTE`/`ADD VALUE` populate no `AttrCmds`. The pg_dump TAP port creates a
+fresh `public.multi_comp (a integer, b text, c numeric(10,2))` and runs one combined
+`ADD ATTRIBUTE d text, DROP ATTRIBUTE b, ALTER ATTRIBUTE c TYPE numeric(12,3), ADD ATTRIBUTE e text COLLATE "C"`,
+then byte-matches the whole contiguous dumped block `(a integer, c numeric(12,3), d text, e text COLLATE
+pg_catalog."C")` against real pg_dump 18.3 (`TestPort_PgDumpConnectionSetup`) — the contiguous match proves both
+the field order and that the dropped `b` is gone.
+
+> **Next (slice 261+):** multi-level / `INHERITS` partition-tree dump fidelity, or a dedicated `MINVALUE`/`MAXVALUE` keyword AST node (see slice 169 deferral).
 
 ## Deferred (002–010) — catalog surface estimate
 

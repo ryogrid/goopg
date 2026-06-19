@@ -5534,63 +5534,48 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		return nil, err
 	}
 	stmt := &AlterTypeStmt{pos: pos, Name: name.Name, Schema: name.Schema}
+
+	// Attribute subcommand list: ADD/DROP/ALTER ATTRIBUTE …, optionally
+	// comma-combined. PG's ALTER TYPE grammar only allows these three actions to
+	// be combined in one statement (ADD VALUE / RENAME / OWNER TO are singular and
+	// handled by the dedicated branches below). DU-002 slices 253/255/256/258/259
+	// for the single forms; slice 260 adds the comma-combined case.
+	// parseOneAttrCmd backtracks and reports ok=false for the non-attribute forms,
+	// so this is tried first without disturbing them.
+	if cmd, ok, acErr := p.parseOneAttrCmd(); acErr != nil {
+		return nil, acErr
+	} else if ok {
+		stmt.AttrCmds = append(stmt.AttrCmds, cmd)
+		for p.acceptSymbol(",") {
+			cmd2, ok2, acErr2 := p.parseOneAttrCmd()
+			if acErr2 != nil {
+				return nil, acErr2
+			}
+			if !ok2 {
+				// A trailing non-attribute subcommand (e.g. OWNER TO) — stub-consume
+				// to ';'/EOF, matching the legacy single-subcommand trailers.
+				for p.cur().Kind != TokenEOF {
+					if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+						break
+					}
+					p.advance()
+				}
+				break
+			}
+			stmt.AttrCmds = append(stmt.AttrCmds, cmd2)
+		}
+		// Mirror the first subcommand into the legacy scalar fields so the
+		// single-subcommand executor branches and the existing parser unit tests
+		// observe identical AST; the executor routes len(AttrCmds) > 1 through
+		// execAlterTypeAttrCmds. DU-002 slice 260.
+		p.mirrorFirstAttrCmd(stmt)
+		return stmt, nil
+	}
+
 	// ADD VALUE [IF NOT EXISTS] 'val' [BEFORE|AFTER 'ref']
 	// NOTE: ADD is a reserved keyword (KwAdd), not an ident keyword — use acceptKeyword.
+	// (ADD ATTRIBUTE is handled above by parseOneAttrCmd.)
 	if p.acceptKeyword(KwAdd) {
-		// ADD ATTRIBUTE col_name type — append a field to a composite type.
-		// DU-002 slice 253. Mirrors the composite-field type-token collection in
-		// parseCreateType (typmod parens tracked so `numeric(10,2)` / `zip[]`
-		// survive intact); stops at a top-level ',' (a further subcommand, which
-		// we then stub-consume) or ';'/EOF.
-		if p.acceptIdentKeyword("attribute") {
-			if p.cur().Kind != TokenIdent {
-				return nil, p.errAtCur("expected attribute name after ADD ATTRIBUTE")
-			}
-			stmt.AddAttrName = strings.ToLower(p.advance().Value)
-			var typeParts []string
-			parenDepth := 0
-			for p.cur().Kind != TokenEOF {
-				tok := p.cur()
-				if tok.Kind == TokenSymbol && tok.Value == ";" {
-					break
-				}
-				if tok.Kind == TokenSymbol && parenDepth == 0 && tok.Value == "," {
-					break
-				}
-				// A top-level COLLATE clause is not part of the type — stop here and
-				// capture it separately so the attribute's atttypid stays clean and its
-				// attcollation round-trips through pg_dump. DU-002 slice 258, mirroring
-				// the CREATE TYPE composite-field path (slice 257).
-				if parenDepth == 0 && tok.Kind != TokenSymbol &&
-					strings.EqualFold(tok.Value, "collate") {
-					break
-				}
-				if tok.Kind == TokenSymbol && tok.Value == "(" {
-					parenDepth++
-				} else if tok.Kind == TokenSymbol && tok.Value == ")" {
-					parenDepth--
-				}
-				typeParts = append(typeParts, tok.Value)
-				p.advance()
-			}
-			stmt.AddAttrType = strings.Join(typeParts, " ")
-			// Optional per-attribute COLLATE "<name>" — record the collation so the
-			// new field's pg_attribute.attcollation shadows the type default and
-			// pg_dump re-emits a COLLATE clause. goopg v0 does not actually collate;
-			// the name is kept for dump fidelity. DU-002 slice 258.
-			if p.acceptIdentKeyword("collate") {
-				collName, _ := p.parseCollationName()
-				stmt.AddAttrCollation = collName
-			}
-			// Consume any trailing subcommands / CASCADE|RESTRICT as a stub.
-			for p.cur().Kind != TokenEOF {
-				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
-					break
-				}
-				p.advance()
-			}
-			return stmt, nil
-		}
 		if !p.acceptIdentKeyword("value") {
 			// consume until ';' or EOF
 			for p.cur().Kind != TokenEOF {
@@ -5632,31 +5617,9 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// DROP ATTRIBUTE [IF EXISTS] attname [CASCADE|RESTRICT] — remove a composite
-	// type field so it no longer round-trips through pg_dump. DU-002 slice 255.
-	// DROP is a reserved keyword (KwDrop), not an ident keyword.
+	// (DROP ATTRIBUTE is handled above by parseOneAttrCmd.) Any other DROP
+	// variant — consume as a stub. DROP is a reserved keyword (KwDrop).
 	if p.acceptKeyword(KwDrop) {
-		if p.acceptIdentKeyword("attribute") {
-			if p.acceptKeyword(KwIf) {
-				if _, err := p.expectKeyword(KwExists); err != nil {
-					return nil, err
-				}
-				stmt.DropAttrIfExists = true
-			}
-			if p.cur().Kind != TokenIdent {
-				return nil, p.errAtCur("expected attribute name after DROP ATTRIBUTE")
-			}
-			stmt.DropAttrName = strings.ToLower(p.advance().Value)
-			// Consume trailing CASCADE|RESTRICT / further subcommands to ';'/EOF.
-			for p.cur().Kind != TokenEOF {
-				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
-					break
-				}
-				p.advance()
-			}
-			return stmt, nil
-		}
-		// Other DROP variants — consume as stub.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break
@@ -5665,71 +5628,9 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		}
 		return stmt, nil
 	}
-	// ALTER ATTRIBUTE attname [SET DATA] TYPE newtype [COLLATE ...] [CASCADE|RESTRICT]
-	// — re-type a composite type field in place so the new type round-trips
-	// through pg_dump. DU-002 slice 256. ALTER is a reserved keyword (KwAlter).
+	// (ALTER ATTRIBUTE is handled above by parseOneAttrCmd.) Any other ALTER
+	// variant — consume as a stub. ALTER is a reserved keyword (KwAlter).
 	if p.acceptKeyword(KwAlter) {
-		if p.acceptIdentKeyword("attribute") {
-			if p.cur().Kind != TokenIdent {
-				return nil, p.errAtCur("expected attribute name after ALTER ATTRIBUTE")
-			}
-			stmt.AlterAttrName = strings.ToLower(p.advance().Value)
-			// Optional SET DATA (DATA is an ident) before the mandatory TYPE
-			// keyword (also an ident, like CREATE TYPE).
-			if p.acceptKeyword(KwSet) {
-				if !p.acceptIdentKeyword("data") {
-					return nil, p.errAtCur("expected DATA after SET in ALTER ATTRIBUTE")
-				}
-			}
-			if !p.acceptIdentKeyword("type") {
-				return nil, p.errAtCur("expected TYPE in ALTER ATTRIBUTE")
-			}
-			// Collect the new type's tokens the same way ADD ATTRIBUTE does:
-			// paren-track typmods so `numeric(12,3)` survives, stop at a top-level
-			// ',' (a COLLATE/USING/further subcommand we then stub-consume) or
-			// ';'/EOF. COLLATE / USING / CASCADE / RESTRICT are not part of the
-			// type, so also stop at those ident keywords.
-			var typeParts []string
-			parenDepth := 0
-			for p.cur().Kind != TokenEOF {
-				tok := p.cur()
-				if tok.Kind == TokenSymbol && tok.Value == ";" {
-					break
-				}
-				if tok.Kind == TokenSymbol && parenDepth == 0 && tok.Value == "," {
-					break
-				}
-				if parenDepth == 0 && tok.Kind != TokenSymbol &&
-					(strings.EqualFold(tok.Value, "collate") || strings.EqualFold(tok.Value, "using") ||
-						strings.EqualFold(tok.Value, "cascade") || strings.EqualFold(tok.Value, "restrict")) {
-					break
-				}
-				if tok.Kind == TokenSymbol && tok.Value == "(" {
-					parenDepth++
-				} else if tok.Kind == TokenSymbol && tok.Value == ")" {
-					parenDepth--
-				}
-				typeParts = append(typeParts, tok.Value)
-				p.advance()
-			}
-			stmt.AlterAttrType = strings.Join(typeParts, " ")
-			// Optional COLLATE <name> on the new type — captured so the re-typed
-			// attribute's collation round-trips through pg_dump. DU-002 slice 259.
-			if p.acceptIdentKeyword("collate") {
-				collName, _ := p.parseCollationName()
-				stmt.AlterAttrCollation = collName
-			}
-			// Consume any trailing USING / CASCADE|RESTRICT / further
-			// subcommands as a stub.
-			for p.cur().Kind != TokenEOF {
-				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
-					break
-				}
-				p.advance()
-			}
-			return stmt, nil
-		}
-		// Other ALTER variants (e.g. OWNER) — consume as stub.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break
@@ -5769,6 +5670,8 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		}
 		// RENAME ATTRIBUTE old TO new [CASCADE|RESTRICT] — rename a composite
 		// type field so the new name round-trips through pg_dump. DU-002 slice 254.
+		// RENAME ATTRIBUTE is singular (PG forbids combining it), so it keeps its
+		// own legacy path rather than joining AttrCmds.
 		if p.acceptIdentKeyword("attribute") {
 			if p.cur().Kind != TokenIdent {
 				return nil, p.errAtCur("expected attribute name after RENAME ATTRIBUTE")
@@ -5807,6 +5710,162 @@ func (p *parser) parseAlterType(pos int) (Stmt, error) {
 		p.advance()
 	}
 	return stmt, nil
+}
+
+// parseOneAttrCmd parses a single ALTER TYPE attribute subcommand
+// (ADD|DROP|ALTER ATTRIBUTE …) starting at its leading keyword. It returns
+// ok=true with the parsed command when the current position begins an attribute
+// subcommand, and ok=false WITHOUT consuming anything when it does not (e.g.
+// ADD VALUE, RENAME VALUE/TO/ATTRIBUTE, OWNER TO) so the caller can fall through
+// to those dedicated branches. The cursor (p.idx) is restored on a non-match.
+// DU-002 slice 260.
+func (p *parser) parseOneAttrCmd() (AlterTypeAttrCmd, bool, error) {
+	save := p.idx
+	// ADD ATTRIBUTE name type [COLLATE name] [CASCADE|RESTRICT]. DU-002 slice 253/258.
+	if p.acceptKeyword(KwAdd) {
+		if p.acceptIdentKeyword("attribute") {
+			if p.cur().Kind != TokenIdent {
+				return AlterTypeAttrCmd{}, false, p.errAtCur("expected attribute name after ADD ATTRIBUTE")
+			}
+			cmd := AlterTypeAttrCmd{Kind: "add", Name: strings.ToLower(p.advance().Value)}
+			cmd.Type = p.parseAttrTypeTokens()
+			if p.acceptIdentKeyword("collate") {
+				cmd.Collation, _ = p.parseCollationName()
+			}
+			p.consumeAttrCmdTrailer()
+			return cmd, true, nil
+		}
+		p.idx = save
+		return AlterTypeAttrCmd{}, false, nil
+	}
+	// DROP ATTRIBUTE [IF EXISTS] name [CASCADE|RESTRICT]. DU-002 slice 255.
+	if p.acceptKeyword(KwDrop) {
+		if p.acceptIdentKeyword("attribute") {
+			cmd := AlterTypeAttrCmd{Kind: "drop"}
+			if p.acceptKeyword(KwIf) {
+				if _, err := p.expectKeyword(KwExists); err != nil {
+					return AlterTypeAttrCmd{}, false, err
+				}
+				cmd.IfExists = true
+			}
+			if p.cur().Kind != TokenIdent {
+				return AlterTypeAttrCmd{}, false, p.errAtCur("expected attribute name after DROP ATTRIBUTE")
+			}
+			cmd.Name = strings.ToLower(p.advance().Value)
+			p.consumeAttrCmdTrailer()
+			return cmd, true, nil
+		}
+		p.idx = save
+		return AlterTypeAttrCmd{}, false, nil
+	}
+	// ALTER ATTRIBUTE name [SET DATA] TYPE newtype [COLLATE name] [CASCADE|RESTRICT].
+	// DU-002 slice 256/259.
+	if p.acceptKeyword(KwAlter) {
+		if p.acceptIdentKeyword("attribute") {
+			if p.cur().Kind != TokenIdent {
+				return AlterTypeAttrCmd{}, false, p.errAtCur("expected attribute name after ALTER ATTRIBUTE")
+			}
+			cmd := AlterTypeAttrCmd{Kind: "alter", Name: strings.ToLower(p.advance().Value)}
+			if p.acceptKeyword(KwSet) {
+				if !p.acceptIdentKeyword("data") {
+					return AlterTypeAttrCmd{}, false, p.errAtCur("expected DATA after SET in ALTER ATTRIBUTE")
+				}
+			}
+			if !p.acceptIdentKeyword("type") {
+				return AlterTypeAttrCmd{}, false, p.errAtCur("expected TYPE in ALTER ATTRIBUTE")
+			}
+			cmd.Type = p.parseAttrTypeTokens()
+			if p.acceptIdentKeyword("collate") {
+				cmd.Collation, _ = p.parseCollationName()
+			}
+			p.consumeAttrCmdTrailer()
+			return cmd, true, nil
+		}
+		p.idx = save
+		return AlterTypeAttrCmd{}, false, nil
+	}
+	return AlterTypeAttrCmd{}, false, nil
+}
+
+// parseAttrTypeTokens collects the type-token string of an ADD/ALTER ATTRIBUTE
+// subcommand, paren-tracking typmods so `numeric(12,3)` / `zip[]` survive intact.
+// It stops at a top-level ',' (the next subcommand), ';'/EOF, or a top-level
+// COLLATE/USING/CASCADE/RESTRICT keyword (which are not part of the type and are
+// parsed/consumed by the caller). DU-002 slice 260 — shared by the ADD and ALTER
+// branches of parseOneAttrCmd, mirroring the inline loops of slices 256/258.
+func (p *parser) parseAttrTypeTokens() string {
+	var typeParts []string
+	parenDepth := 0
+	for p.cur().Kind != TokenEOF {
+		tok := p.cur()
+		if tok.Kind == TokenSymbol && tok.Value == ";" {
+			break
+		}
+		if tok.Kind == TokenSymbol && parenDepth == 0 && tok.Value == "," {
+			break
+		}
+		if parenDepth == 0 && tok.Kind != TokenSymbol &&
+			(strings.EqualFold(tok.Value, "collate") || strings.EqualFold(tok.Value, "using") ||
+				strings.EqualFold(tok.Value, "cascade") || strings.EqualFold(tok.Value, "restrict")) {
+			break
+		}
+		if tok.Kind == TokenSymbol && tok.Value == "(" {
+			parenDepth++
+		} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+			parenDepth--
+		}
+		typeParts = append(typeParts, tok.Value)
+		p.advance()
+	}
+	return strings.Join(typeParts, " ")
+}
+
+// consumeAttrCmdTrailer stub-consumes the optional per-subcommand
+// USING/CASCADE/RESTRICT trailer of an attribute subcommand (goopg honours none
+// of them). It paren-tracks so a comma inside parens is not mistaken for the
+// next subcommand, and stops at a top-level ',' or ';'/EOF. DU-002 slice 260.
+func (p *parser) consumeAttrCmdTrailer() {
+	parenDepth := 0
+	for p.cur().Kind != TokenEOF {
+		tok := p.cur()
+		if tok.Kind == TokenSymbol && tok.Value == ";" {
+			break
+		}
+		if tok.Kind == TokenSymbol && parenDepth == 0 && tok.Value == "," {
+			break
+		}
+		if tok.Kind == TokenSymbol && tok.Value == "(" {
+			parenDepth++
+		} else if tok.Kind == TokenSymbol && tok.Value == ")" {
+			parenDepth--
+		}
+		p.advance()
+	}
+}
+
+// mirrorFirstAttrCmd copies AttrCmds[0] into the legacy scalar fields of the
+// statement so single-subcommand ALTER TYPE behaves identically to slices
+// 253/255/256/258/259 (executor branches + parser unit tests read the scalar
+// fields). The executor only consults the scalar fields when len(AttrCmds) <= 1.
+// DU-002 slice 260.
+func (p *parser) mirrorFirstAttrCmd(stmt *AlterTypeStmt) {
+	if len(stmt.AttrCmds) == 0 {
+		return
+	}
+	c := stmt.AttrCmds[0]
+	switch c.Kind {
+	case "add":
+		stmt.AddAttrName = c.Name
+		stmt.AddAttrType = c.Type
+		stmt.AddAttrCollation = c.Collation
+	case "drop":
+		stmt.DropAttrName = c.Name
+		stmt.DropAttrIfExists = c.IfExists
+	case "alter":
+		stmt.AlterAttrName = c.Name
+		stmt.AlterAttrType = c.Type
+		stmt.AlterAttrCollation = c.Collation
+	}
 }
 
 // parseDropType picks up after DROP TYPE has been detected.

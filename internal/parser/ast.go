@@ -2145,6 +2145,25 @@ type AlterTypeStmt struct {
 	AlterAttrType string // its new type string (space-joined, e.g. "numeric ( 12 , 3 )")
 	// Optional per-attribute COLLATE on ALTER ATTRIBUTE … TYPE (empty when none). DU-002 slice 259.
 	AlterAttrCollation string
+	// AttrCmds is the comma-combined attribute-subcommand list for
+	// ALTER TYPE … (ADD|DROP|ALTER ATTRIBUTE …, …). PG only allows these three
+	// actions to be combined in one statement (ADD VALUE / RENAME / OWNER are
+	// singular). The parser populates one element per subcommand and mirrors
+	// AttrCmds[0] into the legacy scalar fields above so the single-subcommand
+	// executor branches + parser tests are unchanged; the executor routes the
+	// multi-subcommand case (len > 1) through execAlterTypeAttrCmds. DU-002
+	// slice 260.
+	AttrCmds []AlterTypeAttrCmd
+}
+
+// AlterTypeAttrCmd is one attribute subcommand of an ALTER TYPE statement.
+// DU-002 slice 260 (multi-subcommand ALTER TYPE).
+type AlterTypeAttrCmd struct {
+	Kind      string // "add" | "drop" | "alter"
+	Name      string // target attribute name (lowercased)
+	Type      string // ADD/ALTER: the (space-joined) new type string
+	Collation string // ADD/ALTER: optional COLLATE name (empty when none)
+	IfExists  bool   // DROP: IF EXISTS → a missing attribute is a NOTICE, not an error
 }
 
 func (s *AlterTypeStmt) Pos() int  { return s.pos }

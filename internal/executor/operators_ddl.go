@@ -10299,6 +10299,15 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	if !ok {
 		return nil
 	}
+	// Multi-subcommand ALTER TYPE — a comma-combined list of ADD/DROP/ALTER
+	// ATTRIBUTE actions (DU-002 slice 260). The single-subcommand forms keep
+	// their proven dedicated branches below (the parser mirrors AttrCmds[0] into
+	// the legacy scalar fields), so this only fires when more than one action was
+	// combined. execAlterTypeAttrCmds folds every action into one field slice and
+	// re-syncs the composite heap once.
+	if len(s.AttrCmds) > 1 {
+		return o.execAlterTypeAttrCmds(cat, s)
+	}
 	// ADD ATTRIBUTE col_name type — append a field to a composite type so the
 	// new attribute round-trips through pg_dump's dumpCompositeType. DU-002
 	// slice 253. The composite type's OIDs (type / `_name` array / implicit
@@ -10545,6 +10554,95 @@ func (o *ddlOp) execAlterType(s *parser.AlterTypeStmt) error {
 	default:
 		return &ExecError{Code: "42710", Pos: s.Pos(), Message: err.Error()}
 	}
+}
+
+// execAlterTypeAttrCmds applies a comma-combined list of ALTER TYPE attribute
+// subcommands (ADD/DROP/ALTER ATTRIBUTE) to a composite type in one shot. It
+// folds every subcommand into a working field slice — reusing the same
+// per-subcommand validation and SQLSTATEs as the single-subcommand branches in
+// execAlterType — then stamps xmax on the existing composite heap rows once and
+// re-syncs the final field set. The composite's OIDs (type / `_name` array /
+// implicit pg_class relation) are stable across re-registration, so a single
+// re-sync suffices and every changed attribute round-trips through pg_dump's
+// dumpCompositeType. Subcommands are processed left to right, so each one sees
+// the result of its predecessors (e.g. ADD a, then ALTER a TYPE …). DU-002
+// slice 260 (multi-subcommand ALTER TYPE).
+func (o *ddlOp) execAlterTypeAttrCmds(cat *catalog.InMemory, s *parser.AlterTypeStmt) error {
+	ct := cat.LookupCompositeType(s.Name)
+	if ct == nil {
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("type %q does not exist", s.Name)}
+	}
+	fields := make([]catalog.CompositeField, len(ct.Fields))
+	copy(fields, ct.Fields)
+	for _, cmd := range s.AttrCmds {
+		switch cmd.Kind {
+		case "add":
+			for _, f := range fields {
+				if strings.EqualFold(f.Name, cmd.Name) {
+					return &ExecError{Code: "42701", Pos: s.Pos(),
+						Message: fmt.Sprintf("column %q of relation %q already exists", cmd.Name, s.Name)}
+				}
+			}
+			if strings.EqualFold(cmd.Type, "unknown") {
+				return &ExecError{Code: "42P16", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q has pseudo-type unknown", cmd.Name)}
+			}
+			fields = append(fields, catalog.CompositeField{Name: cmd.Name, ColType: cmd.Type, Collation: cmd.Collation})
+		case "drop":
+			idx := -1
+			for i, f := range fields {
+				if strings.EqualFold(f.Name, cmd.Name) {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				// IF EXISTS downgrades the missing-attribute error to a skipping NOTICE.
+				if cmd.IfExists {
+					o.ctx.AddNotice(fmt.Sprintf("column %q of relation %q does not exist, skipping", cmd.Name, s.Name))
+					continue
+				}
+				return &ExecError{Code: "42703", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", cmd.Name, s.Name)}
+			}
+			fields = append(fields[:idx], fields[idx+1:]...)
+		case "alter":
+			idx := -1
+			for i, f := range fields {
+				if strings.EqualFold(f.Name, cmd.Name) {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				return &ExecError{Code: "42703", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", cmd.Name, s.Name)}
+			}
+			if strings.EqualFold(cmd.Type, "unknown") {
+				return &ExecError{Code: "42P16", Pos: s.Pos(),
+					Message: fmt.Sprintf("column %q has pseudo-type unknown", cmd.Name)}
+			}
+			// ALTER ATTRIBUTE … TYPE replaces the type, so the prior collation no
+			// longer applies: set it from an explicit COLLATE clause if present,
+			// else reset to the new type's default (empty). Mirrors slice 256/259.
+			fields[idx].ColType = cmd.Type
+			fields[idx].Collation = cmd.Collation
+		}
+	}
+	// One xmax-stamp + re-sync for the whole combined statement (see execAlterType's
+	// single-subcommand branches for the per-relation rationale).
+	if catalogHeapSyncAvailable(o.ctx) && o.ctx.MaterializeWriterXID() == nil {
+		deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.OID, o.ctx.Tx.XID)
+		deleteTypeFromCatalogHeap(o.ctx, catalog.DefaultDBOid, ct.ArrayOID, o.ctx.Tx.XID)
+		deleteCatalogRowsForOID(o.ctx, catalog.DefaultDBOid, ct.RelOID, o.ctx.Tx.XID)
+		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.TypeRelationId)
+		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.RelationRelationId)
+		_ = mirrorCatalogRelToPostgresDB(o.ctx, catalog.AttributeRelationId)
+	}
+	ct2 := cat.RegisterCompositeTypeWithFields(s.Name, fields)
+	syncCompositeTypeToCatalogHeap(o.ctx, ct2)
+	return nil
 }
 
 func (o *ddlOp) execDropType(s *parser.DropTypeStmt) error {

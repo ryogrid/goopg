@@ -5604,6 +5604,29 @@ object support.
         (`TestPort_PgDumpConnectionSetup` PASS, 3.7s). Parser+executor unit suites PASS. Design: `0110-0001` Slice 259.
         pgbench pre-commit smoke on commit. **Next (slice 260+):** multi-subcommand `ALTER TYPE` (`ADD …, DROP …` in
         one command).
+      - **PROGRESS 2026-06-20 (loop #26):** **DU-002 slice 260 LANDED — a multi-subcommand `ALTER TYPE`
+        (`ADD ATTRIBUTE d text, DROP ATTRIBUTE b, ALTER ATTRIBUTE c TYPE numeric(12,3), ADD ATTRIBUTE e text COLLATE "C"`
+        in one statement) now applies every action and round-trips through pg_dump.** Slices 253/255/256 each handled
+        one attribute action and **stub-consumed** any trailing `, <subcommand>`, so a comma-combined statement silently
+        applied only the first and dropped the rest from the catalog + dump. PG's `ALTER TYPE` grammar allows only
+        `ADD/DROP/ALTER ATTRIBUTE` to be combined (`ADD VALUE`/`RENAME`/`OWNER` are singular). **AST** (`ast.go`) — new
+        `AlterTypeAttrCmd{Kind,Name,Type,Collation,IfExists}` + `AlterTypeStmt.AttrCmds []AlterTypeAttrCmd`. **Parser**
+        (`parseAlterType`, `ddl.go`) — restructured to try the attribute list first via the new backtracking
+        `parseOneAttrCmd` (`ok=false` + `p.idx` restore for `ADD VALUE`/`RENAME`/`OWNER`, which keep their branches), a
+        `,` loop collects each further subcommand, shared helpers `parseAttrTypeTokens`/`consumeAttrCmdTrailer` replace
+        the inline loops, and `mirrorFirstAttrCmd` copies `AttrCmds[0]` into the legacy scalar fields so the
+        single-subcommand executor branches + all existing parser tests are unchanged. **Executor**
+        (`execAlterType` → new `execAlterTypeAttrCmds`, `operators_ddl.go`) — gated on `len(AttrCmds) > 1`: looks up the
+        composite once, folds every action left-to-right into a working `[]CompositeField` reusing the single branches'
+        validation/SQLSTATEs (`42701`/`42703`/`42P16`, `IF EXISTS`→NOTICE), then one xmax-stamp + re-sync
+        (`RegisterCompositeTypeWithFields` + `syncCompositeTypeToCatalogHeap`, OIDs stable); proven single-cmd branches
+        (len ≤ 1) untouched. **No pg_dump-side change.** Guards: `parser.TestAlterTypeMultiSubcommandParsing` (full
+        `AttrCmds` list + order + COLLATE/IF EXISTS/typmod, legacy mirror, single→1 entry, RENAME/ADD VALUE→0) + pg_dump
+        TAP port creates `public.multi_comp` and byte-matches the whole contiguous dumped block
+        `(a integer, c numeric(12,3), d text, e text COLLATE pg_catalog."C")` vs real pg_dump 18.3
+        (`TestPort_PgDumpConnectionSetup` PASS, 3.7s). Parser+executor unit suites PASS. Design: `0110-0001` Slice 260.
+        pgbench pre-commit smoke on commit. **Next (slice 261+):** multi-level / `INHERITS` partition-tree dump fidelity,
+        or a dedicated `MINVALUE`/`MAXVALUE` keyword AST node (slice 169 deferral).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
