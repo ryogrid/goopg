@@ -242,21 +242,62 @@ All four changes are `ssiActive`-gated, so RC/RR and non-SERIALIZABLE workloads
 (pgbench, TPC-H) are byte-for-byte unchanged; the full UPDATE/MERGE/insert-conflict
 isolation suite stays green.
 
+### 6. Comma-separated `BEGIN` modes + `read-write-unique` family (this slice)
+
+No SSI engine change this slice — the machinery from sections 2–5 already produces
+the upstream results for the unique-constraint write-skew family. Two things landed:
+
+- **Parser: comma-separated transaction modes.** Upstream specs write
+  `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` (receipt-report, read-only-anomaly*)
+  but `parseBeginModes` stopped at the comma (`default → goto done`), leaving
+  `, READ ONLY` as a dangling token → *syntax error at the comma column*. The mode
+  loop now consumes an optional `,` between modes (`_ = p.acceptSymbol(",")`),
+  matching PG's `transaction_mode_list` grammar (`gram.y`) and the sibling fix
+  already present in `SET TRANSACTION`. Covered by
+  `TestParseBeginCommaSeparatedModes`. (A separate, pre-existing gap remains: a
+  bare `DEFERRABLE` keyword after `READ ONLY` is tokenized as a reserved keyword,
+  not an ident-keyword, so `parseBeginModes`' `acceptIdentKeyword("deferrable")`
+  misses it — needed only by `read-only-anomaly-3`, deferred.)
+- **`read-write-unique`, `-2`, `-3` promoted to `pass`.** All three now match
+  PG 18.3 byte-for-byte: the SIREAD predicate locks on the `i = 42` / key probe
+  plus the write-path conflict-in (sections 2–4) yield `40001` on the overlapping
+  interleavings and a plain `23505` unique violation on the serialized ones.
+  `-3` exercises the same shape through a `LANGUAGE SQL` insert-if-not-exists
+  function (bug 9301). Ported as `TestPort_IsolationReadWriteUnique{,2,3}`.
+
+`read-write-unique-4` still **defers**: two permutations (`r1 w1 w2 c1 c2`,
+`r2 w1 w2 c1 c2`) abort with `40001` where PG raises `23505`. goopg's write-path
+SSI conflict-in check fires *before* the btree unique-index insert detects the
+duplicate, so the serialization failure pre-empts the constraint violation. PG's
+ordering lets the heavyweight unique violation win when the conflicting key is
+already committed-visible. Closing this needs the write path to consult the unique
+index for an already-committed duplicate before raising the SSI failure — a
+sequencing change deferred within M0118-0001.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
   read-only anomaly, all 90 generated permutations byte-identical to PG 18.3),
   `total-cash` (mid-statement read-path abort, all 20 permutations — section 4),
-  and `project-manager` (phantom predicate locking, all 21 permutations
-  byte-identical to PG 18.3 — section 5).
+  `project-manager` (phantom predicate locking, all 21 permutations
+  byte-identical to PG 18.3 — section 5), and the `read-write-unique` family
+  `{base, -2, -3}` (unique-constraint write skew, section 6).
 - **Still deferred (same slice family):**
+  - `read-write-unique-4` — `40001`-vs-`23505` ordering (section 6).
   - `classroom-scheduling` — the SSI machinery is in place (section 5), but its
     primary key is `(room_id text, start_time timestamptz)` and goopg's btree
     rejects a `timestamptz` key (`btree v0 only supports int4 / numeric keys`,
     SQLSTATE 0A000) at the spec's `global setup`. Blocked on btree key-type
     support, NOT on SSI — a different subsystem.
-  - `receipt-report` — `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` is a
-    parser gap (syntax error today) *and* needs de-facto READ ONLY SSI modeling
-    to avoid the 42 false positives upstream notes for a READ WRITE `s3`.
+  - `receipt-report` — the `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` parser
+    gap is now **fixed** (section 6), so the spec runs end-to-end. Two issues
+    remain: (a) the spec's `date` columns read back through the isolation runner
+    as `2008-12-22T00:00:00Z` because lib/pq decodes the `date` OID into
+    `time.Time` and `database/sql`'s NullString scan re-renders it `RFC3339` — a
+    runner-fidelity gap, not a goopg wire bug; PG's regress harness also needs
+    `DateStyle='Postgres, MDY'` for the expected `12-22-2008`; and (b) de-facto
+    READ ONLY SSI modeling, without which goopg produces 48 serialization
+    failures where PG produces 6 (the 42 false positives upstream notes for a
+    READ WRITE `s3`, because goopg does not yet treat `s3` as read-only in SSI).
   Their dedicated `TestPort_Isolation*` functions auto-promote (run, then
   `t.Skip` only on `defer`), so the next slice sees green→pass instantly.

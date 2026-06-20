@@ -89,6 +89,38 @@ func TestPort_IsolationReadWriteUnique(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique.spec")
 }
 
+// TestPort_IsolationReadWriteUnique2 exercises read-write-unique-2: two SSI
+// transactions both probe for i=42 then INSERT; one must see a 40001 SSI
+// failure (overlapping) or a 23505 unique violation (serialized).
+func TestPort_IsolationReadWriteUnique2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_rw_unique2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-2.spec")
+}
+
+// TestPort_IsolationReadWriteUnique3 exercises read-write-unique-3 (bug 9301):
+// an insert-if-not-exists SQL function under SSI must abort with 40001.
+func TestPort_IsolationReadWriteUnique3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_rw_unique3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-3.spec")
+}
+
+// TestPort_IsolationReadWriteUnique4 exercises read-write-unique-4: a gapless
+// per-year invoice sequence; mixes 40001 SSI failures and 23505 unique
+// violations depending on read/write interleaving.
+func TestPort_IsolationReadWriteUnique4(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_rw_unique4")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-4.spec")
+}
+
 // TestPort_IsolationLockCommittedUpdate exercises a spec that produces <waiting ...>
 // output — verifying that blocking detection and drain work correctly.
 func TestPort_IsolationLockCommittedUpdate(t *testing.T) {

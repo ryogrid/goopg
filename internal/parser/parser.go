@@ -829,6 +829,9 @@ func (p *parser) parseBeginModes(s *BeginStmt) (Stmt, error) {
 		default:
 			goto done
 		}
+		// Transaction modes may be comma-separated, e.g.
+		// `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` (receipt-report.spec).
+		_ = p.acceptSymbol(",")
 	}
 done:
 	return s, nil
