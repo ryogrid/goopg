@@ -8451,9 +8451,32 @@ Guards:
   then the inline `jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED` with both call parens tight and only the
   inner comma spaced, in attnum order, and that `ATTACH PARTITION public.pgnc_1 FOR VALUES IN ('a')` survives).
 
-> **Next (slice 293+):** a THREE-argument function-call generation expression (`concat(a, b, c)`) to pin the
-> repeated-comma argument list end-to-end, OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER
-> path.
+### Slice 293 — three-argument function-call generation expression `concat(ka, la, ma)` (end-to-end on the pg_dump oracle)
+
+Slice 291 pinned the two-argument call-paren branch of `joinGeneratedExprTokens` (one comma in the argument list). This
+slice extends that to a **repeated-comma** argument list, proving the helper emits `, ` between **every** adjacent
+argument pair while keeping the single call paren tight.
+
+`CREATE TABLE pg3c (ka text, la text, ma text, na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED) PARTITION BY LIST (ka)`
+with leaf `pg3c_1 PARTITION OF pg3c FOR VALUES IN ('a')`. The argument count is the only thing that varies from slice
+291, so the comma-spacing rule fires **twice** inside a single call, yielding `concat(ka, la, ma)` — not
+`concat(ka, la,ma)` (one separator) or `concat(ka ,la ,ma)` (stray pre-comma spaces). A regression that hard-coded a
+two-token argument list would corrupt the third argument's separator. Because this test dumps a **live goopg server**,
+the source pg_dump reads back is goopg's stored form, so the lowercase function name is preserved verbatim (no real-PG
+`pg_get_expr` case normalization in this path). The render path is otherwise identical to slices 281–292: `attgenerated`
+('s') forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces `shouldPrintColumn` for every column,
+so the leaf inherits all four columns in attnum order (`ka`, `la`, `ma`, then the inline generated `na`). No rows are
+inserted, so this rides the dump-time deparse path only. Production already handled the N-argument list (the comma rule
+is count-agnostic); this slice is the oracle round-trip proof. Verified vs PG 18.3. TEST-ONLY — no production change.
+
+Guards:
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pg3c_1` block prints `ka text`, `la text`,
+  `ma text`, then the inline `na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED` with the call paren tight and both
+  argument commas spaced, in attnum order, and that `ATTACH PARTITION public.pg3c_1 FOR VALUES IN ('a')` survives).
+
+> **Next (slice 294+):** a function-call generation expression with a LITERAL argument (`concat(ka, '-', la)`) to pin
+> string-literal token rendering inside an argument list, OR a multi-column / NULL-typed DEFAULT variant on the
+> partition-leaf ALTER path.
 
 ## Deferred (002–010) — catalog surface estimate
 

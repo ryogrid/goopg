@@ -6254,6 +6254,27 @@ object support.
         `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 292).
         **Next (slice 293+):** a THREE-argument function-call generation expression (`concat(a, b, c)`) to pin the repeated-comma
         argument list end-to-end, OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+      - **PROGRESS 2026-06-20 (loop #61):** **DU-002 slice 293 LANDED — THREE-argument function-call generation expression
+        `concat(ka, la, ma)` end-to-end on the pg_dump oracle.** Slice 291 pinned the two-argument call-paren branch of
+        `joinGeneratedExprTokens` (ONE comma); this slice extends it to a REPEATED-comma argument list, proving the helper emits
+        `, ` between EVERY adjacent argument pair while keeping the single call paren tight (`concat(ka, la, ma)`, not
+        `concat(ka, la,ma)` one-separator or `concat(ka ,la ,ma)` stray-space). The comma-spacing rule fires TWICE inside one call;
+        a regression that hard-coded a two-token argument list would corrupt the third argument's separator. Argument count is
+        count-agnostic in production, so this is the oracle round-trip proof. Because the test dumps a LIVE goopg server, pg_dump
+        reads goopg's stored source verbatim — the lowercase function name preserved (no real-PG `pg_get_expr` case normalization).
+        Render path identical to 281–292 (attgenerated 's' → `attrdefs[].separate=false` pg_dump.c:9507; ispartition →
+        shouldPrintColumn every column); 4 columns in attnum order (`ka`, `la`, `ma`, generated `na`). No rows inserted → dump-time
+        deparse path only. (Table named `pg3c` because `pgcc` was already taken by slice 288's `||` concat fixture.) Fixture:
+        `CREATE TABLE public.pg3c (ka text, la text, ma text, na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED) PARTITION BY LIST (ka)` +
+        `CREATE TABLE public.pg3c_1 PARTITION OF public.pg3c FOR VALUES IN ('a')`. **Guards:** `TestPort_PgDumpConnectionSetup`
+        PASS (3.44s; vs real pg_dump 18.3 — asserts `pg3c_1` prints `ka text`, `la text`, `ma text`, then inline
+        `na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED` with the call paren tight and both argument commas spaced, attnum
+        order, ATTACH survives); gofmt + `go vet` clean; pgbench pre-commit smoke on commit. Files:
+        `internal/testport/pgdump_connsetup_test.go` (pg3c fixture + assertion — TEST-ONLY, no production change),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 293).
+        **Next (slice 294+):** a function-call generation expression with a LITERAL argument (`concat(ka, '-', la)`) to pin
+        string-literal token rendering inside an argument list, OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf
+        ALTER path.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

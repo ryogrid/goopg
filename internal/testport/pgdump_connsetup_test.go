@@ -1699,6 +1699,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pgnc_1: %v", err)
 	}
 
+	// Slice 293: a THREE-argument function-call generation expression
+	// (`concat(ka, la, ma)`) inherited onto a partition leaf. Slice 291 pinned
+	// the two-argument call-paren branch of joinGeneratedExprTokens (one comma in
+	// the argument list); this slice extends that to a REPEATED-comma argument
+	// list — `concat(ka, la, ma)` exercises the comma-spacing rule firing twice
+	// inside a single call, proving the helper emits `, ` between every adjacent
+	// argument pair (`concat(ka, la, ma)`, not `concat(ka, la,ma)` or
+	// `concat(ka ,la ,ma)`) while keeping the single call paren tight. The
+	// argument count is the only thing that varies from slice 291, so a
+	// regression that hard-coded the two-token argument list would corrupt the
+	// third argument's separator. goopg's stored source is what real pg_dump
+	// reads back (this test dumps a live goopg server), so the lowercase function
+	// name is preserved verbatim — no real-PG pg_get_expr case normalization in
+	// this path. The render path is otherwise identical to slices 281–292:
+	// attgenerated ('s') forces attrdefs[].separate=false (pg_dump.c:9507) and
+	// ispartition forces shouldPrintColumn for every column, so the leaf pg3c_1
+	// inherits all three plain columns and prints `ka text`, `la text`, `ma text`,
+	// then the inline generated `na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED`.
+	// No rows are inserted, so this rides the dump-time deparse path only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pg3c (ka text, la text, ma text, na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED) PARTITION BY LIST (ka)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pg3c with three-arg function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pg3c_1 PARTITION OF public.pg3c FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pg3c_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4862,6 +4888,54 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgnc_1 FOR VALUES IN ('a')") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgnc_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+
+		// **Slice 293 (asserted):** THREE-argument function-call generation
+		// expression on a partition leaf. The leaf pg3c_1 must print `ka text`,
+		// `la text`, `ma text`, then the inline generated
+		// `na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED` — with the
+		// single call paren tight and BOTH argument commas spaced (`, `), matching
+		// what pg_get_expr returns for goopg's stored source. A regression that
+		// emitted only one separator (`concat(ka, la,ma)`) or stray paren spaces
+		// would fail the exact-substring check below.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pg3c_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			kaIdx := strings.Index(block, "ka text")
+			if kaIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pg3c_1 block\n  block=%q", "ka text", block)
+			}
+			laIdx := strings.Index(block, "la text")
+			if laIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pg3c_1 block\n  block=%q", "la text", block)
+			}
+			maIdx := strings.Index(block, "ma text")
+			if maIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pg3c_1 block\n  block=%q", "ma text", block)
+			}
+			naIdx := strings.Index(block, "na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED")
+			if naIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the three-arg function-call generated column on a partition leaf; want %q in pg3c_1 block\n  block=%q", "na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED", block)
+			}
+			// Attnum order: ka (1) before la (2) before ma (3) before na (4).
+			if kaIdx >= 0 && laIdx >= 0 && kaIdx > laIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pg3c_1 block\n  block=%q", "ka", "la", block)
+			}
+			if laIdx >= 0 && maIdx >= 0 && laIdx > maIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pg3c_1 block\n  block=%q", "la", "ma", block)
+			}
+			if maIdx >= 0 && naIdx >= 0 && maIdx > naIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pg3c_1 block\n  block=%q", "ma", "na", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pg3c_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pg3c_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pg3c_1 FOR VALUES IN ('a')", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every
