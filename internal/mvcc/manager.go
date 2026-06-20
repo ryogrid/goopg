@@ -513,7 +513,7 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 	// RC/RR transactions skip this branch.
 	if tx.Isolation == IsolationSerializable {
 		m.ssiMu.Lock()
-		m.releaseSerializableLocked(tx.Handle)
+		m.releaseSerializableLocked(tx.Handle, kind == XactCommit)
 		m.ssiMu.Unlock()
 	}
 

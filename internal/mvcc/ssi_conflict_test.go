@@ -139,19 +139,33 @@ func TestCheckForSerializableConflictOut_NoOpForReservedXIDs(t *testing.T) {
 	}
 }
 
-func TestCheckForSerializableConflictOut_NoOpForFinishedWriter(t *testing.T) {
+// TestCheckForSerializableConflictOut_EdgeToRetainedCommittedWriter asserts the
+// M0118-0001 retention behaviour: a SERIALIZABLE writer that has COMMITTED while
+// a concurrent reader is still in-flight is retained (ssiState.finished), so a
+// reader that subsequently observes the committed writer's data still installs
+// the reader -> writer rw-edge. This is the inverse of the pre-M0118 contract,
+// where a finished writer's bookkeeping was dropped and the edge was silently
+// lost (defeating multi-xact dangerous-structure detection, e.g. two-ids).
+func TestCheckForSerializableConflictOut_EdgeToRetainedCommittedWriter(t *testing.T) {
 	m := NewManager()
 	reader := beginAndAssign(t, m)
 	writer := beginAndAssign(t, m)
 	writerXID := writer.XID
+	// Reader is still in-flight, so the committed writer overlaps it and is
+	// retained rather than purged.
 	if err := m.Commit(writer); err != nil {
 		t.Fatalf("Commit writer: %v", err)
 	}
-	if m.CheckForSerializableConflictOut(reader.Handle, writerXID) {
-		t.Fatal("finished writer registered an edge; expected no-op (retention is M0104-0006)")
+	if !m.CheckForSerializableConflictOut(reader.Handle, writerXID) {
+		t.Fatal("retained committed writer did not register an edge; want edge installed")
 	}
-	if got := m.OutConflictCount(reader.Handle); got != 0 {
-		t.Fatalf("reader.outConflicts = %d, want 0", got)
+	if got := m.OutConflictCount(reader.Handle); got != 1 {
+		t.Fatalf("reader.outConflicts = %d, want 1", got)
+	}
+	// No dangerous structure here (reader has no in-conflict, writer no
+	// out-conflict), so the reader must not have been doomed.
+	if m.IsDoomedForTest(reader.Handle) {
+		t.Fatal("reader doomed by a benign edge to a committed writer")
 	}
 }
 
@@ -168,7 +182,12 @@ func TestCheckForSerializableConflictOut_NoOpForUnknownReader(t *testing.T) {
 	}
 }
 
-func TestSerializableXact_PeerEdgesScrubbedOnCommit(t *testing.T) {
+// TestSerializableXact_PeerEdgesRetainedThenScrubbed asserts the M0118-0001
+// retention lifecycle: committing the writer while the reader is still in-flight
+// RETAINS the edge (the committed writer stays reachable for dangerous-structure
+// detection); the edge is only scrubbed once the overlapping reader also
+// finishes and the retained writer is purged.
+func TestSerializableXact_PeerEdgesRetainedThenScrubbed(t *testing.T) {
 	m := NewManager()
 	reader := beginAndAssign(t, m)
 	writer := beginAndAssign(t, m)
@@ -177,9 +196,9 @@ func TestSerializableXact_PeerEdgesScrubbedOnCommit(t *testing.T) {
 	}
 
 	// Capture the still-live reader pointer so we can inspect its
-	// outConflicts slice after the writer is released. Manager
-	// removes finished xacts from ssiState.xacts so we can't ask via
-	// the public API once the writer is gone.
+	// outConflicts slice after the writer is released. Manager removes
+	// finished xacts from ssiState.xacts so we can't ask via the public API
+	// once the writer is gone.
 	readerSX := m.SerializableXact(reader.Handle)
 	if readerSX == nil {
 		t.Fatal("reader SerializableXact = nil before commit")
@@ -188,15 +207,28 @@ func TestSerializableXact_PeerEdgesScrubbedOnCommit(t *testing.T) {
 		t.Fatalf("readerSX.outConflicts pre-commit = %d, want 1", len(readerSX.outConflicts))
 	}
 
+	// Commit the writer: reader is still in-flight, so the writer overlaps it
+	// and the edge is retained, NOT scrubbed.
 	if err := m.Commit(writer); err != nil {
 		t.Fatalf("Commit writer: %v", err)
 	}
-
 	m.ssiMu.Lock()
 	got := len(readerSX.outConflicts)
 	m.ssiMu.Unlock()
+	if got != 1 {
+		t.Fatalf("readerSX.outConflicts after writer Commit = %d, want 1 (retained while reader overlaps)", got)
+	}
+
+	// Finish the reader: no active xact remains, so the retained writer is
+	// purged and the edge is finally scrubbed.
+	if err := m.Commit(reader); err != nil {
+		t.Fatalf("Commit reader: %v", err)
+	}
+	m.ssiMu.Lock()
+	got = len(readerSX.outConflicts)
+	m.ssiMu.Unlock()
 	if got != 0 {
-		t.Fatalf("readerSX.outConflicts after writer Commit = %d, want 0 (peer scrub)", got)
+		t.Fatalf("readerSX.outConflicts after reader Commit = %d, want 0 (purged)", got)
 	}
 }
 
@@ -485,10 +517,12 @@ func TestCheckForSerializableConflictIn_MultipleReadersDistinctEdges(t *testing.
 	}
 }
 
-func TestCheckForSerializableConflictIn_PeerEdgesScrubbedOnReaderCommit(t *testing.T) {
-	// Symmetric counterpart of the read-path scrub test: after a
-	// reader installed via the write-path commits, the writer's
-	// inConflicts slice must no longer reference the dying reader.
+func TestCheckForSerializableConflictIn_PeerEdgesRetainedThenScrubbed(t *testing.T) {
+	// Symmetric counterpart of the read-path retention test: after a reader
+	// installed via the write-path commits while the writer is still
+	// in-flight, the edge is RETAINED (M0118-0001); it is scrubbed from the
+	// writer's inConflicts only once the writer also finishes and the retained
+	// reader is purged.
 	m := NewManager()
 	reader := beginAndAssign(t, m)
 	writer := beginAndAssign(t, m)
@@ -508,14 +542,27 @@ func TestCheckForSerializableConflictIn_PeerEdgesScrubbedOnReaderCommit(t *testi
 		t.Fatalf("writerSX.inConflicts pre-commit = %d, want 1", len(writerSX.inConflicts))
 	}
 
+	// Commit the reader: the writer is still in-flight, so the committed
+	// reader overlaps it and the edge is retained.
 	if err := m.Commit(reader); err != nil {
 		t.Fatalf("Commit reader: %v", err)
 	}
-
 	m.ssiMu.Lock()
 	got := len(writerSX.inConflicts)
 	m.ssiMu.Unlock()
+	if got != 1 {
+		t.Fatalf("writerSX.inConflicts after reader Commit = %d, want 1 (retained while writer overlaps)", got)
+	}
+
+	// Finish the writer: nothing active remains, the retained reader is
+	// purged, and the edge is scrubbed.
+	if err := m.Commit(writer); err != nil {
+		t.Fatalf("Commit writer: %v", err)
+	}
+	m.ssiMu.Lock()
+	got = len(writerSX.inConflicts)
+	m.ssiMu.Unlock()
 	if got != 0 {
-		t.Fatalf("writerSX.inConflicts after reader Commit = %d, want 0 (peer scrub)", got)
+		t.Fatalf("writerSX.inConflicts after writer Commit = %d, want 0 (purged)", got)
 	}
 }

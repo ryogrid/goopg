@@ -67,11 +67,11 @@ func (m *Manager) checkForSerializableConflictOutLocked(readerHandle TxnHandle, 
 	}
 	writer := m.serializableXactByXIDLocked(writerXID)
 	if writer == nil {
-		// Either non-SERIALIZABLE writer (RC/RR), or the writer has
-		// already finished and its bookkeeping has been released.
-		// M0104-0006 will revisit retention so finished writers
-		// remain conflict-relevant past their FinishedAt; for now
-		// drop the edge silently.
+		// Either a non-SERIALIZABLE writer (RC/RR), or a committed
+		// SERIALIZABLE writer whose retention window has already closed
+		// (purged from ssiState.finished). M0118-0001 retains committed
+		// writers, so an in-window committed writer IS found above and the
+		// edge installs; only genuinely unreachable writers fall here.
 		return false
 	}
 	if writer == reader {
@@ -82,7 +82,23 @@ func (m *Manager) checkForSerializableConflictOutLocked(readerHandle TxnHandle, 
 		// changes.
 		return false
 	}
-	return registerRWConflictLocked(reader, writer)
+	if !m.readerSnapshotSeesWriterAsConcurrentLocked(readerHandle, writerXID) {
+		// M0118-0001: the writer committed before the reader's snapshot, so
+		// the reader already sees its effects — this is an ordinary read
+		// (wr-dependency), not an rw anti-dependency. Mirrors upstream's
+		// `if (!XidIsConcurrent(xid)) return;` in CheckForSerializableConflictOut.
+		// Before retention this case was masked because committed writers were
+		// dropped from the registry; retaining them surfaces it, so the gate is
+		// now load-bearing (e.g. two-ids reading committed D1 without conflict).
+		return false
+	}
+	installed := registerRWConflictLocked(reader, writer)
+	if installed {
+		// M0118-0001: run the dangerous-structure check as the edge is
+		// recorded (current xact = reader on the read path).
+		m.onConflictCheckLocked(reader, writer, reader)
+	}
+	return installed
 }
 
 // serializableXactByXIDLocked returns the in-flight SerializableXact
@@ -102,7 +118,42 @@ func (m *Manager) serializableXactByXIDLocked(xid storage.TransactionID) *Serial
 			return sx
 		}
 	}
+	// M0118-0001: a reader may observe a tuple written by a SERIALIZABLE
+	// writer that has already COMMITTED. The committed writer is retained
+	// in ssiState.finished (not the active map) so its rw-edges remain
+	// reachable for the dangerous-structure check; scan it here so the
+	// read-path conflict-out edge to a committed writer still installs.
+	for _, sx := range m.ssiState.finished {
+		if sx != nil && sx.XID == xid {
+			return sx
+		}
+	}
 	return nil
+}
+
+// readerSnapshotSeesWriterAsConcurrentLocked reports whether writerXID ran
+// concurrently with the reader's pinned SERIALIZABLE snapshot — i.e. the
+// snapshot does not already see writerXID's commit. It is the goopg analogue of
+// the `XidIsConcurrent(xid)` gate in upstream CheckForSerializableConflictOut:
+// a writer the reader already sees as committed yields no rw-conflict.
+//
+// The reader's snapshot lives in its proc slot (firstSnap), pinned at the
+// reader's first statement; this hook runs on the reader's own goroutine, so
+// the field is stable. A nil snapshot (no statement has pinned one yet)
+// conservatively reports concurrent=true so the gate never introduces a false
+// negative.
+//
+// Caller must hold m.ssiMu.
+func (m *Manager) readerSnapshotSeesWriterAsConcurrentLocked(readerHandle TxnHandle, writerXID storage.TransactionID) bool {
+	procNum := int32(readerHandle) - 1
+	if procNum < 0 || int(procNum) >= len(m.procArray.slots) {
+		return true
+	}
+	snap := m.procArray.slots[procNum].firstSnap
+	if snap == nil {
+		return true
+	}
+	return snap.XidIsConcurrent(writerXID)
 }
 
 // registerRWConflictLocked installs an rw-conflict edge from → to in
@@ -121,6 +172,103 @@ func registerRWConflictLocked(from, to *SerializableXact) bool {
 	from.outConflicts = append(from.outConflicts, to)
 	to.inConflicts = append(to.inConflicts, from)
 	return true
+}
+
+// onConflictCheckLocked is goopg's analogue of PostgreSQL's
+// OnConflict_CheckForSerializationFailure (predicate.c). It runs the moment a
+// new rw-conflict edge reader -> writer is recorded and decides whether that
+// edge completes a dangerous structure that mandates an abort. `current` is the
+// xact executing the hook — the reader on the read path
+// (CheckForSerializableConflictOut), the writer on the write path
+// (CheckForSerializableConflictIn).
+//
+// Three structures are checked, mirroring the upstream cases:
+//
+//	Case 1  R -> W -> T2   W and T2 both committed (W carries ConflictOut):
+//	        the reader R closes the structure by reading W's data.
+//	Case 2  R -> W -> T2   W is the pivot with a committed out-conflict T2
+//	        that committed first.
+//	Case 3  T0 -> R -> W    R is the pivot and the writer W has committed.
+//
+// Simplifications vs upstream (documented, conservative — never a false
+// negative for the modeled cases): goopg does not yet model READ ONLY
+// transactions or two-phase PREPARE, so every xact is treated READ WRITE and a
+// finished (FinishedAt != Invalid) xact is treated as both prepared and
+// committed, with FinishedAt serving as both prepareSeqNo and commitSeqNo.
+//
+// goopg DEFERS the upstream mid-statement ereport: rather than aborting the
+// current read/write in place, it sets the SXACT_FLAG_DOOMED equivalent
+// (Doomed) on the transaction that upstream would cancel, which then fails at
+// its own PreCommit with SQLSTATE 40001. The aborted transaction is the same
+// one upstream chooses; only WHERE the error surfaces differs (at COMMIT rather
+// than mid-statement) for the read/write-cancel cases. Pivot-doom cases (the
+// common write-skew / read-only-anomaly shape) are deferred to commit upstream
+// too, so they match exactly.
+func (m *Manager) onConflictCheckLocked(reader, writer, current *SerializableXact) {
+	if reader == nil || writer == nil {
+		return
+	}
+
+	writerCommitted := writer.FinishedAt != InvalidCommitSeqNo
+	failure := false
+
+	// Case 1: committed writer already flagged with a conflict out. Since the
+	// writer has committed, the current xact must be the reader closing the
+	// R -> W -> T2 structure.
+	if writerCommitted && writer.ConflictOut {
+		failure = true
+	}
+
+	// Case 2: the writer has become a pivot with an out-conflict to a committed
+	// transaction T2 that committed first (no anomaly if the reader or writer
+	// committed before T2).
+	if !failure {
+		for _, t2 := range writer.outConflicts {
+			if t2 == nil || t2.FinishedAt == InvalidCommitSeqNo {
+				continue
+			}
+			if (reader.FinishedAt == InvalidCommitSeqNo || t2.FinishedAt <= reader.FinishedAt) &&
+				(writer.FinishedAt == InvalidCommitSeqNo || t2.FinishedAt <= writer.FinishedAt) {
+				failure = true
+				break
+			}
+		}
+	}
+
+	// Case 3: the reader has become a pivot with a committed writer (no anomaly
+	// if every in-conflict partner T0 committed before the writer).
+	if !failure && writerCommitted {
+		for _, t0 := range reader.inConflicts {
+			if t0 == nil || t0.Doomed {
+				continue
+			}
+			if t0.FinishedAt == InvalidCommitSeqNo || t0.FinishedAt >= writer.FinishedAt {
+				failure = true
+				break
+			}
+		}
+	}
+
+	if !failure {
+		return
+	}
+
+	// Pick the victim exactly as upstream does, then doom it (deferred abort).
+	switch {
+	case current == writer:
+		// We are the pivot writer: "Canceled on identification as a pivot,
+		// during write." Upstream aborts us in place; we doom ourselves.
+		writer.Doomed = true
+	case writerCommitted:
+		// The writer has already committed and cannot be aborted, so the
+		// reader (the current xact) must die: upstream's "Canceled on conflict
+		// out to pivot, during read."
+		reader.Doomed = true
+	default:
+		// Normal case: kill the in-flight pivot writer so a retry of the
+		// failing xact can make progress.
+		writer.Doomed = true
+	}
 }
 
 // removeSerializableXactFromPeersLocked scrubs every reference to
@@ -268,6 +416,10 @@ func (m *Manager) checkForSerializableConflictInLocked(writerHandle TxnHandle, t
 			}
 			if registerRWConflictLocked(reader, writer) {
 				installed = true
+				// M0118-0001: run the dangerous-structure check as the
+				// edge is recorded (current xact = writer on the write
+				// path).
+				m.onConflictCheckLocked(reader, writer, writer)
 			}
 		}
 	}

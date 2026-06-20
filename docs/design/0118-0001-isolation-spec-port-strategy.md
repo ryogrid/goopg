@@ -95,18 +95,77 @@ Go-side logging only). The focused `ssi_write_skew_test.go` assertions
 (`strings.Contains(... "could not serialize access due to read/write
 dependencies among transactions")`) still hold.
 
+### 3. Committed-xact retention + `OnConflict` at edge creation (lands `two-ids`)
+
+The 2-cycle write-skew that `simple-write-skew` exercises is fully caught by the
+commit-time `PreCommitCheckForSerializationFailure` walk. The **read-only
+anomaly** in `two-ids` is not: its dangerous structure `s3 →rw→ s2 →rw→ s1` has
+`s1` (the pivot's out-conflict partner) **already committed** by the time the
+closing `s3 →rw→ s2` edge is drawn. Before this slice goopg scrubbed a committed
+xact's edges and deleted it at `finish`, so the `s2 →rw→ s1` edge to committed
+`s1` was gone — a false negative.
+
+Three coordinated `mvcc` changes (no executor/hot-path change) close it,
+mirroring `predicate.c`:
+
+- **Retention.** `releaseSerializableLocked(handle, committed)` no longer scrubs
+  a *committed* xact. It stamps `FinishedAt`, sets the `ConflictOut` flag
+  (`SXACT_FLAG_CONFLICT_OUT`) if the xact holds an out-conflict to an
+  already-committed peer, and moves it to a new `ssiState.finished` pointer slice
+  with its rw-edges intact. Aborted xacts are scrubbed + dropped as before
+  (they cannot be part of a *committed* dangerous structure). `xacts` stays
+  active-only, so proc-slot handle reuse is safe; edges address peers by
+  `*SerializableXact`, so the retained slice has no handle-aliasing hazard.
+  `serializableXactByXIDLocked` scans `finished` too, so a read of a committed
+  writer's tuple still finds the writer.
+- **Overlap-scoped purge.** Each xact gets a `BeginAt` stamp from the same dense
+  counter as `FinishedAt`. `purgeFinishedSerializableLocked` (run at register and
+  at finish) drops a retained xact `C` once no active xact began before `C`
+  finished (`minActiveBegin ≥ C.FinishedAt`) — goopg's analogue of the
+  `SxactGlobalXmin`-driven cleanup. This bounds retention to the concurrency
+  window and clears prior-permutation state before handle reuse.
+- **`onConflictCheckLocked`** (port of `OnConflict_CheckForSerializationFailure`)
+  runs the moment a new edge `reader → writer` is recorded, on both the read and
+  write hooks. It checks the three upstream structures (Case 1 committed writer
+  with `ConflictOut`; Case 2 writer-pivot with a committed out-conflict `T2`;
+  Case 3 reader-pivot with a committed writer) and **dooms** the transaction
+  upstream would cancel. `two-ids` is entirely Case 2 (doom the in-flight pivot,
+  deferred to its own `PreCommit`), matching PG's all-at-COMMIT output exactly.
+
+**`XidIsConcurrent` gate (load-bearing once retention is on).** Retaining
+committed writers exposed a latent phantom: the read-path hook fires for the
+*creator* (`xmin`) of the version the reader sees, and a reader that already sees
+the writer's commit (writer committed before the reader's snapshot) must **not**
+form an anti-dependency — it is an ordinary read. `Snapshot.XidIsConcurrent`
+(mirroring `predicate.c`'s `XidIsConcurrent`) now gates
+`checkForSerializableConflictOutLocked` using the reader's pinned `firstSnap`;
+without it, `two-ids`' first permutation (`wx1 c1 rxwy2 …`, where `s2` reads
+committed `D1`) raised a spurious `40001`.
+
+**Deferral vs upstream (documented, conservative).** goopg does not yet model
+`READ ONLY` transactions or two-phase `PREPARE`; every xact is treated READ WRITE
+and a finished xact is treated as prepared+committed (`FinishedAt` doubles as
+`prepareSeqNo`/`commitSeqNo`). Where upstream would `ereport` **mid-statement**
+(Case 1 / Case 3 reader-kill), goopg instead dooms the same transaction, which
+fails at its **own COMMIT** — correct abort, later surfacing point. This is why
+`total-cash` (whose error lands on the read step `rxy2`) stays deferred this
+slice.
+
 ## Status / scope boundary
 
-- **Passing:** `simple-write-skew` — the 2-transaction, 2-cycle write-skew
-  dangerous structure. goopg's SSI detects it and aborts one committer with
-  `40001` in every overlapping interleaving.
-- **Still deferred (same slice family):** `two-ids`, `total-cash`,
-  `receipt-report`, `project-manager`, `classroom-scheduling`. These exercise
-  **3+ transaction** read-only / multi-version anomalies; goopg's SSI currently
-  yields a **false negative** (it fails to raise `40001` in some permutations
-  where PG does), e.g. `two-ids` is missing the expected serialization error in
-  the `wx1 rxwy2 ry3 …` ordering. Closing these is SSI dangerous-structure
-  *completeness* work (pivot detection across read-only and multi-version
-  pivots), tracked under M0118-0001 with a deferral-ledger entry — not an output
-  or error-format issue. Their dedicated `TestPort_Isolation*` functions are kept
-  as `t.Skip` promotion anchors so the next slice sees green→pass instantly.
+- **Passing:** `simple-write-skew` (2-cycle write skew) and `two-ids` (3-xact
+  read-only anomaly, all 90 generated permutations byte-identical to PG 18.3).
+- **Still deferred (same slice family):**
+  - `total-cash` — needs the **mid-statement** abort: PG cancels the reader
+    during `rxy2` (Case 3 reader-kill); goopg defers to COMMIT, so the read step
+    still prints its result. Requires threading a `40001` error up from the
+    read-path hook through the scan operators.
+  - `project-manager`, `classroom-scheduling` — 2-cycles whose second edge needs
+    **phantom / empty-range predicate locking** (a `SELECT … WHERE …` over a
+    range an INSERT later fills): goopg currently misses the rw-edge, a false
+    negative independent of the retention machinery.
+  - `receipt-report` — `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` is a
+    parser gap (syntax error today) *and* needs de-facto READ ONLY SSI modeling
+    to avoid the 42 false positives upstream notes for a READ WRITE `s3`.
+  Their dedicated `TestPort_Isolation*` functions auto-promote (run, then
+  `t.Skip` only on `defer`), so the next slice sees green→pass instantly.

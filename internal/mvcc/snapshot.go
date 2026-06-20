@@ -159,6 +159,31 @@ func (s Snapshot) HasAborted(xid storage.TransactionID) bool {
 	return idx < n && s.Aborted[idx] == xid
 }
 
+// XidIsConcurrent reports whether xid belongs to a transaction that ran
+// concurrently with this snapshot — i.e. the snapshot does NOT already see
+// xid's effects as committed. It mirrors PostgreSQL's XidIsConcurrent
+// (predicate.c): an xid strictly below Xmin committed before the snapshot was
+// taken (not concurrent); an xid at or above Xmax began after the snapshot (or
+// is still running — concurrent); an in-window xid is concurrent iff it is in
+// the in-progress set.
+//
+// SSI's CheckForSerializableConflictOut uses this to suppress a phantom
+// rw-conflict against a writer the reader already sees as committed: reading a
+// tuple version whose writer committed before our snapshot is an ordinary read
+// (wr-dependency), not an anti-dependency.
+func (s Snapshot) XidIsConcurrent(xid storage.TransactionID) bool {
+	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	if xid < s.Xmin {
+		return false
+	}
+	if xid >= s.Xmax {
+		return true
+	}
+	return s.HasInProgress(xid)
+}
+
 // SeesCommittedXID reports whether xid is visible as committed to this
 // snapshot under the v0 model.
 func (s Snapshot) SeesCommittedXID(xid storage.TransactionID) bool {
