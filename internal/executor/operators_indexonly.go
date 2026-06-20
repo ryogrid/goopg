@@ -254,6 +254,14 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 		v, err := btree.DecodeTimestamp(key[:8])
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
 		return NewTimeDatum(ts), 8, err
+	case isDateType(typeName):
+		// date is encoded as int4 days since the PG epoch. M0118-0001.
+		if len(key) < 4 {
+			return NullDatum, 0, fmt.Errorf("btree: date key truncated, got %d bytes", len(key))
+		}
+		v, err := btree.DecodeInt4(key[:4])
+		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
+		return NewTimeDatum(ts), 4, err
 	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName),
 		strings.ToLower(typeName) == "uuid":
 		raw, n, err := btree.DecodeVarcharLen(key)
@@ -347,6 +355,15 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 			return NullDatum, err
 		}
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
+		return NewTimeDatum(ts), nil
+
+	case isDateType(typeName):
+		// date is encoded as int4 days since the PG epoch. M0118-0001.
+		v, err := btree.DecodeInt4(key)
+		if err != nil {
+			return NullDatum, err
+		}
+		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
 		return NewTimeDatum(ts), nil
 
 	default:

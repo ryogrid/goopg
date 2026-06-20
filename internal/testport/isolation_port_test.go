@@ -512,6 +512,18 @@ func TestPort_IsolationPartialIndex(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/partial-index.spec")
 }
 
+// TestPort_IsolationTemporalRangeIntegrity exercises temporal-range-integrity: a
+// SERIALIZABLE write skew across two tables (statute / offense) where each
+// transaction reads one table with a range predicate and writes the other.
+// Any overlap must abort one transaction with 40001.
+func TestPort_IsolationTemporalRangeIntegrity(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_temporal_range")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/temporal-range-integrity.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

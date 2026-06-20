@@ -6571,6 +6571,16 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 		}
 		micros := v.TimeValue().Sub(pgEpoch).Microseconds()
 		return btree.EncodeTimestamp(micros), nil
+	case isDateType(col.Type.Name):
+		// date stored as int32 days since the PG epoch (2000-01-01); encode via
+		// the order-preserving int4 path. Mirrors the codec date encoding so a
+		// probe key built from a DATE literal matches the backfilled row. M0118-0001.
+		if v.Kind != KindTime {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a date at runtime", col.Name)}
+		}
+		micros := v.TimeValue().UnixMicro() - pgEpochUnixMicros
+		days := int32(micros / (24 * 3600 * 1000000))
+		return btree.EncodeInt4(days), nil
 	case strings.ToLower(col.Type.Name) == "uuid":
 		// uuid stored as canonical lowercase-dashes text; sort order matches byte order.
 		if v.Kind != KindString {
@@ -6736,6 +6746,13 @@ func isTimestampType(name string) bool {
 	}
 }
 
+// isDateType returns true for the date type accepted by B-tree key encoding.
+// A date is stored as int32 days since the PG epoch (2000-01-01), so the key
+// is encoded order-preservingly via the int4 path. M0118-0001.
+func isDateType(name string) bool {
+	return strings.ToLower(name) == "date"
+}
+
 // isFloat8Type returns true for float8 / float4 / real / double precision.
 func isFloat8Type(name string) bool {
 	switch strings.ToLower(name) {
@@ -6764,7 +6781,7 @@ func isSupportedBTreeKeyType(name string) bool {
 	}
 	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
 		isVarcharType(name) || isCharType(name) || isTimestampType(name) ||
-		isFloat8Type(name) || strings.ToLower(name) == "uuid"
+		isDateType(name) || isFloat8Type(name) || strings.ToLower(name) == "uuid"
 }
 
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {

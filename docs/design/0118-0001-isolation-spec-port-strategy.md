@@ -458,6 +458,48 @@ existing `INSERT` parse is altered (regression tests:
 `TestParseInsertColumnListThenParenthesisedSelect`,
 `TestParseInsertPlainSelectSourceUnchanged`).
 
+### 11. `date` B-tree key type (lands `temporal-range-integrity`)
+
+`temporal-range-integrity` is a SERIALIZABLE temporal write skew across two
+tables: `s1` reads `statute` with a date-range predicate
+(`eff_date <= DATE '…' AND (exp_date IS NULL OR exp_date > DATE '…')`) then
+`INSERT`s into `offense`; `s2` reads `offense` with a date-range predicate then
+`DELETE`s from `statute`. Any overlap must raise `40001`. The expected output is
+**not** uniform — permutations where `s1` fully commits before `s2`'s read see
+the inserted row and serialize cleanly, while permutations where `s2`'s read
+misses `s1`'s uncommitted insert close the two-rw-edge dangerous structure and
+abort.
+
+The SSI machinery needed **zero** change. The deleted `statute` row and the
+inserted `offense` row both fall *within* the concurrent readers' predicates, so
+even relation-grain SIREAD locks cross-cover exactly the rows PG's finer locks
+do — the dangerous-structure detection validated across the prior 23 specs
+reproduces the abort pattern (including the empty-relation predicate reads,
+which still take a relation-grain predicate lock that the later insert/delete
+conflicts with). All generated permutations match PG 18.3 byte-for-byte
+(`TestPort_IsolationTemporalRangeIntegrity`, stable 3/3 at ~2.5s).
+
+The **sole** blocker was B-tree key-type support. `statute`'s primary key is
+`(statute_cite text, eff_date date)`; `text` is an accepted B-tree key type but
+`date` was not, so the spec's `global setup` aborted with `0A000 btree v0 only
+supports int4 / numeric keys, got "date"` (`createBTreeIndex`,
+`internal/executor/operators_ddl.go`).
+
+Fix: `date` joins the accepted B-tree key types (`isDateType` →
+`isSupportedBTreeKeyType`). A PG `date` is `int32` days since the 2000-01-01
+epoch, so `encodeBTreeKeyForColumn` encodes it order-preservingly through the
+existing `int4` path (`btree.EncodeInt4(days)`) using the **same**
+days-since-epoch arithmetic the wire codec uses (`codec.go` `case "date"`), so a
+probe key built from a `DATE` literal is byte-identical to the key backfill
+produced for the stored row. Both index-only-scan key decoders
+(`internal/executor/operators_indexonly.go`) gained the symmetric `date` case
+(`DecodeInt4` → days → `time.Time`) so an index-only scan over a `date` key
+column round-trips rather than falling through to the float8 default — a latent
+sibling-path bug closed in the same change even though this spec does not drive
+an index-only scan. Regression tests: `TestDDLCreateDateBTreeIndexAcceptsType`,
+`TestDDLDateRangeScanParity` (mirroring the M0044 timestamp tests). This unblocks
+`date`-keyed indexes generally (e.g. TPC-H `date` columns), not only this spec.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
@@ -473,15 +515,18 @@ existing `INSERT` parse is altered (regression tests:
   `read-only-anomaly-2` (single-column full-key index-scan SIREAD granularity —
   section 9), `predicate-lock-hot-tuple` (`IN`-list point reads cross-covering
   each other's UPDATE target — write-skew 2-cycle, zero engine change via the
-  section-9 per-tuple SIREAD locks), and `partial-index` (SSI through a partial
+  section-9 per-tuple SIREAD locks), `partial-index` (SSI through a partial
   index; zero SSI change — only the parenthesised `INSERT … (SELECT …)` parser
-  source of section 10).
+  source of section 10), and `temporal-range-integrity` (cross-table temporal
+  write skew; zero SSI change — only the `date` B-tree key type of section 11).
 - **Still deferred (same slice family):**
   - `classroom-scheduling` — the SSI machinery is in place (section 5), but its
     primary key is `(room_id text, start_time timestamptz)` and goopg's btree
     rejects a `timestamptz` key (`btree v0 only supports int4 / numeric keys`,
-    SQLSTATE 0A000) at the spec's `global setup`. Blocked on btree key-type
-    support, NOT on SSI — a different subsystem.
+    SQLSTATE 0A000) at the spec's `global setup`. Section 11 added the `date` key
+    type via the int4-days path; `timestamptz` is a distinct (8-byte
+    microsecond-since-epoch, like `timestamp`) follow-on and is the remaining
+    blocker. Blocked on btree key-type support, NOT on SSI — a different subsystem.
   - `receipt-report` — the `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` parser
     gap is now **fixed** (section 6), so the spec runs end-to-end. Two issues
     remain: (a) the spec's `date` columns read back through the isolation runner
