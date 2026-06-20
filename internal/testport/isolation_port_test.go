@@ -667,6 +667,21 @@ func TestPort_IsolationNowait3(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-3.spec")
 }
 
+// TestPort_IsolationUpdateLockedTuple exercises the update-locked-tuple spec:
+// s1 (REPEATABLE READ) repeatedly UPDATEs orders (whose user_id FK references
+// users), which takes a KEY SHARE lock on the referenced users row; s2
+// (REPEATABLE READ) UPDATEs a non-key column of that same users row (a
+// FOR NO KEY UPDATE-equivalent change). Because KEY SHARE does not conflict
+// with a no-key update and the FK key is unchanged, no blocking nor
+// serializability failure should occur in any permutation.
+func TestPort_IsolationUpdateLockedTuple(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_update_locked_tuple")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/update-locked-tuple.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

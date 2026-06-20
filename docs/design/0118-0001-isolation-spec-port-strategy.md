@@ -1095,6 +1095,49 @@ the change widens the lock-only branch entry condition, so every NOWAIT / SKIP
 LOCKED / real-updater path it shares is regression-checked. Isolation pass count
 35 → 36.
 
+## Slice M0118-0003 — `update-locked-tuple` (FK KEY SHARE lock vs concurrent no-key parent update)
+
+`update-locked-tuple.spec` exercises the "update a locked tuple where the lock
+does not conflict" case. Two tables: `users (id PK, name, sometime)` and
+`orders (id PK, name, user_id REFERENCES users(id))`. Session `s1`
+(`REPEATABLE READ`) twice `UPDATE`s `orders SET … user_id = 1`; each such write
+re-checks the foreign key and takes a **`KEY SHARE`** row lock on the referenced
+`users` row. Session `s2` (`REPEATABLE READ`) `UPDATE`s `users.sometime` — a
+non-key column, i.e. a `FOR NO KEY UPDATE`-equivalent change that leaves the FK
+key (`id`) unchanged. The expected output across all six permutations is clean:
+no step blocks and no `40001` is raised, because:
+
+1. **`KEY SHARE` does not conflict with a no-key update.** s2's no-key update and
+   s1's FK-induced `KEY SHARE` lock are compatible per the tuple-lock conflict
+   table, so neither session waits on the other regardless of interleaving.
+2. **The FK key is unchanged, so the update-chain traversal succeeds without a
+   serialization failure.** In the permutations where s2 updates+commits the
+   `users` row *before* s1 takes its `KEY SHARE` lock, s1 (still in its original
+   `REPEATABLE READ` snapshot) must follow the update chain to the newer `users`
+   version and lock it. Because only a non-key column changed, that is allowed in
+   `REPEATABLE READ` without raising `40001` — the FK key the child depends on is
+   still valid on the successor tuple.
+
+**No engine change.** goopg already models both invariants: its FK enforcement
+takes the `KEY SHARE` row lock on the parent (the same path that lands
+`fk-snapshot` / `referential-integrity`), the tuple-lock conflict matrix treats
+`KEY SHARE` vs a no-key update as compatible, and the locking path traverses the
+committed update chain to the key-unchanged successor without a snapshot-too-old
+abort. The spec passes byte-for-byte with only a dedicated test added. This is
+the first row-locking slice that confirms the **non-conflicting** corner of the
+matrix (the `nowait` / `skip-locked` / `nowait-3` slices all exercised
+*conflicting* lock requests); together they bracket both outcomes of the
+cross-statement row-lock path.
+
+**Scope boundary (deferred siblings).** `tuplelock-conflict` still needs the full
+`{KEY SHARE, SHARE, NO KEY UPDATE, UPDATE}` conflict matrix plus multixact for its
+savepoint permutations; `tuplelock-update` needs cross-session advisory locks +
+`SERIAL`; `tuplelock-partition` needs `INSERT … ON CONFLICT` tuple locking on a
+partitioned parent. Tracked in the deferral ledger.
+
+Verified by `TestPort_IsolationUpdateLockedTuple` (all six permutations
+byte-for-byte vs PG 18.3). Isolation pass count 36 → 37.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
