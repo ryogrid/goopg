@@ -9,6 +9,15 @@ NOTE: past milestones are stored in `completed_milestones/` and should NOT be co
 
 Completed milestones are archived under `completed_milestones/` (latest: `completed_fix_plan_007.md`).
 
+## Notes
+
+- This file is the authoritative TODO list for Ralph. Update it after every
+  meaningful change.
+- Keep work to ONE item per loop. Decompose further if an item is larger
+  than what fits in a single agent invocation.
+- Every non-trivial subsystem must land alongside (or just before) a design
+  doc under `docs/design/`. The spec treats this as a hard requirement. 
+  
 ## Maintenance (small, do when convenient — does not preempt milestone order)
 
 - [x] **MAINT-STATEGUARD-RECONCILE** — Stop `make ralph-state-guard` failing at the
@@ -1024,6 +1033,14 @@ if 21-spec pass surfaces a real divergence:
         no-op under goopg's fixed C locale.
 
 ## M0110 — Additional TAP Test Porting (beyond M0094/M0095) (filed 2026-05-22)
+
+> **⚠️ PRIORITY DIRECTIVE (2026-06-20) — SUSPEND M0110 AFTER THE NEXT GREEN COMMIT.**
+>
+> As soon as the current in-progress M0110 fix reaches a state where the build
+> passes AND the pre-commit tests pass AND the change has been committed (one
+> clean, green commit), **STOP M0110**: do not start any further M0110 sub-task.
+> Immediately switch to **M0117** and then **M0118** below. M0110 is *paused, not
+> abandoned* — resume it only after M0117 and M0118 are complete.
 
 Operational note (2026-05-22):
 - This milestone covers TAP tests listed in
@@ -7629,6 +7646,16 @@ complete, these can be re-evaluated.
 
 ## M0117 — CLOG ↔ PostgreSQL subsystem alignment (filed 2026-06-14)
 
+> **⚠️ EXECUTION POLICY (2026-06-20) — FIX BLOCKERS IN PLACE; DO NOT DEFER.**
+>
+> When a sub-task here hits a blocker, the default is to **fix the blocker itself
+> as part of this task**, however deep it goes — do NOT work around it or defer
+> it. Still **commit and push at every clean, self-contained stopping point**
+> (build + pre-commit green) so progress lands incrementally. Deferring a blocker
+> is permitted ONLY for a genuinely compelling reason; in that case you MUST
+> record the reason in `.ralph/deferral_ledger.md` (one row: date, task-id,
+> landed, deferred, resume point, why) so it can be tracked and resumed later.
+
 Milestone doc: `docs/milestones/0117-clog-postgresql-subsystem-alignment.md`.
 
 Goal: finish bringing goopg's commit-log (`pg_xact`) and subtransaction
@@ -7813,20 +7840,19 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
         Full 5-step Part-B plan in the design doc. Defers to a dedicated full-gate
         session per `m0074_partial_scope_lessons`.
       - Gate (Part B): `go test ./internal/catalog/...`; re-init data dir + regress-port
-        re-run (catalog tuple-format change) + PG-standby-attach E2E. Effort: M (not S).
-
-
-## Notes
-
-- This file is the authoritative TODO list for Ralph. Update it after every
-  meaningful change.
-- Keep work to ONE item per loop. Decompose further if an item is larger
-  than what fits in a single agent invocation.
-- Every non-trivial subsystem must land alongside (or just before) a design
-  doc under `docs/design/`. The spec treats this as a hard requirement.    
-
+        re-run (catalog tuple-format change) + PG-standby-attach E2E. Effort: M (not S).   
 
 ## M0118 — Upstream Isolation Spec Suite Pass-Through (post REPEATABLE READ + SERIALIZABLE) (filed 2026-06-20)
+
+> **⚠️ EXECUTION POLICY (2026-06-20) — FIX BLOCKERS IN PLACE; DO NOT DEFER.**
+>
+> When a sub-task here hits a blocker, the default is to **fix the blocker itself
+> as part of this task**, however deep it goes — do NOT work around it or defer
+> it. Still **commit and push at every clean, self-contained stopping point**
+> (build + pre-commit green) so progress lands incrementally. Deferring a blocker
+> is permitted ONLY for a genuinely compelling reason; in that case you MUST
+> record the reason in `.ralph/deferral_ledger.md` (one row: date, task-id,
+> landed, deferred, resume point, why) so it can be tracked and resumed later.
 
 Goal: With REPEATABLE READ (transaction-level pinned snapshot) and SERIALIZABLE
 (RR snapshot + real SSI raising SQLSTATE 40001) now implemented (M0100/M0104), the
