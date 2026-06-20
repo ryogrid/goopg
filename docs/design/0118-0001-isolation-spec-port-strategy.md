@@ -1138,6 +1138,39 @@ partitioned parent. Tracked in the deferral ledger.
 Verified by `TestPort_IsolationUpdateLockedTuple` (all six permutations
 byte-for-byte vs PG 18.3). Isolation pass count 36 → 37.
 
+## Slice M0118-0003 — `lock-committed-keyupdate` (FOR KEY SHARE vs a committed key-update — promotion)
+
+`lock-committed-keyupdate.spec` is the **conflicting** mirror of the already-passing
+`lock-committed-update`. A single table `lcku_table (id, value, PRIMARY KEY (id) INCLUDE (value))`;
+`s1` `UPDATE`s the **key** (`SET id = 2 WHERE id = 3`) while holding an advisory
+lock, and `s2` then takes `SELECT … FOR KEY SHARE` (gated on the same advisory
+lock so the interleavings are deterministic). Because a *key*-update conflicts
+with `KEY SHARE` (unlike `lock-committed-update`'s no-key update, which is
+compatible), the spec exercises the conflicting corner across all three isolation
+levels and 24 active permutations:
+
+1. **READ COMMITTED** — `s2`'s `FOR KEY SHARE` waits behind `s1`'s in-progress key
+   `UPDATE`, then on `s1`'s commit follows the CTID chain to the live successor
+   (`id = 2`) and locks it.
+2. **REPEATABLE READ / SERIALIZABLE** — the frozen snapshot plus the committed
+   key-update means the locker cannot follow the chain without violating its
+   snapshot, so it raises `40001` (`could not serialize access due to concurrent update`).
+
+**No engine change — pure promotion.** This is a freebie unlocked by the
+cumulative M0118-0003 row-locking infrastructure: the lock-only-xmax
+cross-statement conflict detection (`nowait` slice), the blocking `WaitForXID`
+wait path in `stampLockInner` (`nowait-3` slice), and the real-updater CTID-chain
+traversal with the RR/SER `40001` raise (`lock-committed-update`'s
+`M0100-0005e/f`). The `nowait-3` slice already re-ran this spec green as a
+regression check (it shares the widened lock-only branch); this slice formally
+promotes it from `failed` to `pass` in the inventory. goopg already supports the
+advisory locks the spec uses for scheduling (`internal/executor/advisory.go`,
+the same path `lock-committed-update` relies on).
+
+Verified by `TestPort_IsolationLockCommittedKeyupdate` (all permutations
+byte-for-byte vs PG 18.3, deterministic 3/3 runs at ~12s). Isolation pass count
+37 → 38.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact

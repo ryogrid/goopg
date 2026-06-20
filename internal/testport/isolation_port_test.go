@@ -189,8 +189,15 @@ func TestPort_IsolationEvalPlanQualTrigger(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual-trigger.spec")
 }
 
-// TestPort_IsolationLockCommittedKeyupdate exercises the lock-committed-keyupdate spec.
-// Requires: BEGIN ISOLATION LEVEL, FOR KEY SHARE / FOR NO KEY UPDATE.
+// TestPort_IsolationLockCommittedKeyupdate exercises the lock-committed-keyupdate
+// spec: a FOR KEY SHARE lock on a tuple whose key was UPDATEd by a concurrent
+// committed transaction. Unlike lock-committed-update (a no-key update, which is
+// compatible with KEY SHARE), the key-update CONFLICTS with the locker, so under
+// READ COMMITTED the locker follows the CTID chain to the live successor while
+// under REPEATABLE READ / SERIALIZABLE it raises 40001. The locker also blocks
+// behind s1's still-in-progress key UPDATE until s1 commits. Passes on the
+// M0118-0003 row-locking infrastructure (lock-only-xmax cross-statement conflict
+// detection + the blocking WaitForXID path in stampLockInner) with no new code.
 func TestPort_IsolationLockCommittedKeyupdate(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_lock_keyupdate")
