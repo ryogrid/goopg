@@ -390,6 +390,19 @@ func TestPort_IsolationSimpleWriteSkew(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/simple-write-skew.spec")
 }
 
+// TestPort_IsolationMatviewWriteSkew exercises the matview-write-skew spec: a
+// SERIALIZABLE REFRESH MATERIALIZED VIEW CONCURRENTLY reads the parent relation
+// and writes the matview, while a concurrent SERIALIZABLE transaction reads the
+// matview and writes the parent relation. Every overlap forms a dangerous
+// structure, so the second committer must abort with 40001.
+func TestPort_IsolationMatviewWriteSkew(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_matview_ws")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/matview-write-skew.spec")
+}
+
 // TestPort_IsolationTwoIds exercises the two-ids spec: a SERIALIZABLE
 // read/write cycle over two id rows must abort with 40001.
 func TestPort_IsolationTwoIds(t *testing.T) {

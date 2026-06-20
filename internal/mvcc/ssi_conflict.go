@@ -471,6 +471,48 @@ func (m *Manager) CheckForSerializableConflictInReportingFailure(writerHandle Tx
 	return nil
 }
 
+// CheckTableForSerializableConflictIn is the relation-wide analogue of
+// CheckForSerializableConflictIn: the WRITER is performing a logical mass
+// delete/rewrite of the ENTIRE relation (TRUNCATE, DROP, or REFRESH
+// MATERIALIZED VIEW), which logically destroys every row any reader saw. It
+// mirrors upstream's CheckTableForSerializableConflictIn (predicate.c:4419):
+// every SERIALIZABLE reader holding a predicate lock of ANY granularity
+// (relation / page / tuple) on (db, rel) gets an rw-conflict R -> W installed.
+//
+// Unlike checkForSerializableConflictInLocked — which walks UPWARD from a
+// single tuple/page tag to its covering ancestors — this scans the global
+// target registry for every tag matching (db, rel) regardless of granularity,
+// because the writer is not touching one tuple but obliterating the whole
+// heap. It is the only conflict-in path that finds a reader holding only a
+// fine-grained (tuple/page) SIREAD when the writer never produced a matching
+// fine-grained write tag (the REFRESH MATERIALIZED VIEW case, whose
+// truncate+rematerialize writes the heap via the low-level writeHeapRow path
+// that bypasses ssiRecordTupleWrite).
+func (m *Manager) CheckTableForSerializableConflictIn(writerHandle TxnHandle, db, rel uint32) bool {
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
+	return m.checkTableForSerializableConflictInLocked(writerHandle, db, rel)
+}
+
+// CheckTableForSerializableConflictInReportingFailure is the
+// mid-statement-abort-reporting variant of CheckTableForSerializableConflictIn,
+// matching CheckForSerializableConflictInReportingFailure: it returns a non-nil
+// *SerializationFailureError only when this write newly dooms the WRITER as a
+// pivot with an out-conflict to an already-committed transaction. The common
+// deferred-pivot case (the conflicting partner is still in flight) returns nil
+// and surfaces at the partner's COMMIT.
+func (m *Manager) CheckTableForSerializableConflictInReportingFailure(writerHandle TxnHandle, db, rel uint32) error {
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
+	writer := m.ssiState.xacts[writerHandle]
+	wasDoomed := writer != nil && writer.Doomed
+	m.checkTableForSerializableConflictInLocked(writerHandle, db, rel)
+	if writer != nil && writer.Doomed && !wasDoomed {
+		return &SerializationFailureError{Reason: reasonPivotDuringWrite}
+	}
+	return nil
+}
+
 func (m *Manager) checkForSerializableConflictInLocked(writerHandle TxnHandle, tag PredicateLockTag) bool {
 	if tag.Granularity() == InvalidPredicateGranularity {
 		return false
@@ -545,6 +587,73 @@ func (m *Manager) checkForSerializableConflictInLocked(writerHandle TxnHandle, t
 			}
 		}
 		if !holdsCovering {
+			continue
+		}
+		if registerRWConflictLocked(reader, writer) {
+			installed = true
+			m.onConflictCheckLocked(reader, writer, writer)
+		}
+	}
+	return installed
+}
+
+// checkTableForSerializableConflictInLocked is the ssiMu-held body of
+// CheckTableForSerializableConflictIn. See that method's contract.
+func (m *Manager) checkTableForSerializableConflictInLocked(writerHandle TxnHandle, db, rel uint32) bool {
+	if m.ssiState.xacts == nil {
+		return false
+	}
+	writer, ok := m.ssiState.xacts[writerHandle]
+	if !ok || writer == nil {
+		return false
+	}
+	installed := false
+
+	// Live holders: any predicate-lock target on (db, rel) at ANY granularity.
+	if m.predicateLocks.targets != nil {
+		for tag, tgt := range m.predicateLocks.targets {
+			if tag.DB != db || tag.Rel != rel {
+				continue
+			}
+			for holder := range tgt.holders {
+				if holder == writerHandle {
+					// A writer that also read the relation does not
+					// conflict with itself.
+					continue
+				}
+				reader, ok := m.ssiState.xacts[holder]
+				if !ok || reader == nil {
+					continue
+				}
+				if registerRWConflictLocked(reader, writer) {
+					installed = true
+					m.onConflictCheckLocked(reader, writer, writer)
+				}
+			}
+		}
+	}
+
+	// Retained COMMITTED readers (see checkForSerializableConflictInLocked's
+	// second loop): a reader that predicate-locked the relation and then
+	// committed is kept in ssiState.finished with its owned-tag set intact.
+	// This relation-wide write must still form R -> W against such a reader
+	// when their lifetimes overlap (FinishedAt > writer.BeginAt). The reader
+	// is found by scanning its own predicateLocks for ANY tag on (db, rel).
+	for _, reader := range m.ssiState.finished {
+		if reader == nil || reader == writer || len(reader.predicateLocks) == 0 {
+			continue
+		}
+		if reader.FinishedAt <= writer.BeginAt {
+			continue
+		}
+		holds := false
+		for tag := range reader.predicateLocks {
+			if tag.DB == db && tag.Rel == rel {
+				holds = true
+				break
+			}
+		}
+		if !holds {
 			continue
 		}
 		if registerRWConflictLocked(reader, writer) {

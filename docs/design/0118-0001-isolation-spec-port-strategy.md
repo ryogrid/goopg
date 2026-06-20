@@ -759,6 +759,68 @@ suite (waits for a committing writer, an aborting writer, returns immediately
 with no writers / when not deferrable / when only read-only peers are active).
 Isolation pass count 29 → 30.
 
+### 18. Relation-wide conflict-in for `REFRESH MATERIALIZED VIEW` (lands `matview-write-skew`)
+
+`matview-write-skew` runs two SERIALIZABLE sessions: `s1` does
+`REFRESH MATERIALIZED VIEW CONCURRENTLY order_summary` (which reads the parent
+`orders` and rewrites the matview), and `s2` reads the matview
+(`SELECT max(date) FROM order_summary`) then writes the parent (`INSERT`/`UPDATE`
+on `orders`). Every overlap is a dangerous structure, so the second committer —
+always `s2`, since `s1_commit` precedes `s2_commit` in all eight permutations —
+must abort with `40001`.
+
+goopg already passed the **four** `refresh`-before-`read` permutations: there,
+`s1` rewrites the matview first, so `s2`'s later read sees the old row carrying
+`s1`'s concurrent `xmax` and forms the `s2 → rw s1` edge via the read-path
+conflict-out (`ssiRecordTupleRead`, section 13). It **failed** the four
+`read`-before-`refresh` permutations, where `s2` reads the matview before `s1`
+touches it. There the `s2 → rw s1` edge can only come from the *write* side:
+`s1`'s rewrite must conflict-in against `s2`'s existing SIREAD lock on the
+matview. But `execRefreshMatView` truncates and re-populates the matview heap
+through the low-level `writeHeapRow` path, which — unlike the INSERT operator —
+never calls `ssiRecordTupleWrite`. The refresh therefore produced **no** write
+tag at all, and even if it had, `ssiRecordTupleWrite`'s conflict-in walk is
+**upward-only** (`tuple → page → relation`) and could never reach `s2`'s
+fine-grained per-tuple SIREAD on the matview.
+
+The fix mirrors upstream's `CheckTableForSerializableConflictIn` (`predicate.c`),
+which TRUNCATE and DROP use for exactly this "logical mass delete of the whole
+relation" shape:
+
+- `Manager.CheckTableForSerializableConflictIn(writerHandle, db, rel)` (and its
+  `…ReportingFailure` variant) scans the global predicate-lock target registry
+  for **every** tag matching `(db, rel)` at **any** granularity — relation, page,
+  or tuple — and installs an `R → W` rw-edge from each holder, plus the retained
+  committed-reader walk (the same two-loop shape as
+  `checkForSerializableConflictInLocked`). It is the only conflict-in path that
+  finds a holder of a *finer* lock than the writer's target, which is precisely
+  what a whole-relation rewrite needs.
+- The executor hook `ssiRecordTableWrite` wraps it and is invoked from
+  `execRefreshMatView` just before the truncate (so a doomed-writer abort leaves
+  nothing half-written). It returns `40001` only if the refresh newly dooms
+  *itself* as a pivot to an already-committed partner; the spec's deferred-pivot
+  shape returns nil and surfaces at `s2`'s `COMMIT`.
+
+No read-side change was needed: the matview scan already acquires per-tuple
+SIREAD locks (`ssiRecordTupleRead` is not gated on `relkind`), and upstream's
+`PredicateLockingNeededForRelation` excludes only system catalogs and temp
+relations — **not** matviews. The misleading "matviews never participate in
+predicate locking" comment on `ssiRecordRelationRead` was corrected.
+
+Two runner-fidelity pieces (shared with the still-deferred `receipt-report`)
+also landed here: `date` columns now render `MM-DD-YYYY` (PG regress runs with
+`DateStyle='Postgres, MDY'`, so `2022-04-01` prints `04-01-2022`) by scanning
+such columns as `sql.NullTime` rather than letting lib/pq's `time.Time` decode
+re-render `RFC3339`; and `pqprintFormat` now replicates libpq `PQprint`'s
+**content-based** right-justification heuristic (`fe-print.c`) — a column
+right-justifies unless some value holds a character outside `[0-9.Ee -]` or does
+not end in a digit — which is why the all-digits-and-dashes `04-01-2022` aligns
+like an integer. Verified by `TestPort_IsolationMatviewWriteSkew` (byte-for-byte
+vs PG 18.3, all eight permutations) plus the `TestCheckTableForSerializableConflictIn`
+mvcc unit suite (tuple/page/relation holders, different-relation and self no-ops,
+multi-reader fan-out, deferred-pivot-returns-nil, retained committed reader).
+Isolation pass count 30 → 31.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
@@ -787,18 +849,22 @@ Isolation pass count 29 → 30.
   DDL of section 16), and `read-only-anomaly-3` (the O'Neil read-only anomaly with a
   `SERIALIZABLE READ ONLY DEFERRABLE` `s3` deferred to a safe snapshot — the
   `GetSafeSnapshot` drain-the-writers wait of section 17; `s3r` blocks then commits
-  with no abort).
+  with no abort), and `matview-write-skew` (write skew between a
+  `REFRESH MATERIALIZED VIEW CONCURRENTLY` and a reader/writer of the matview's
+  parent — the relation-wide `CheckTableForSerializableConflictIn` refresh hook of
+  section 18; all eight permutations abort the second committer with `40001`).
 - **Still deferred (same slice family):**
   - `receipt-report` — the `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` parser
     gap is now **fixed** (section 6), so the spec runs end-to-end. Two issues
-    remain: (a) the spec's `date` columns read back through the isolation runner
-    as `2008-12-22T00:00:00Z` because lib/pq decodes the `date` OID into
-    `time.Time` and `database/sql`'s NullString scan re-renders it `RFC3339` — a
-    runner-fidelity gap, not a goopg wire bug; PG's regress harness also needs
-    `DateStyle='Postgres, MDY'` for the expected `12-22-2008`; and (b) de-facto
-    READ ONLY SSI modeling, without which goopg produces 48 serialization
-    failures where PG produces 6 (the 42 false positives upstream notes for a
-    READ WRITE `s3`, because goopg does not yet treat `s3` as read-only in SSI).
+    remain: (a) the spec's `date` columns — the runner's `MM-DD-YYYY` render
+    landed with section 18 (`sql.NullTime` scan + `DateStyle='Postgres, MDY'`
+    semantics), so the `12-22-2008` rendering is now **fixed**; what is still
+    open is (b) de-facto READ ONLY SSI modeling, without which goopg produces 48
+    serialization failures where PG produces 6 (the 42 false positives upstream
+    notes for a READ WRITE `s3`, because goopg does not yet treat a never-writing
+    `s3` as read-only in SSI — the `SerializableXact.ReadOnly` flag from section
+    17 is the hook this needs: a declared/de-facto READ ONLY xact must be skipped
+    as a dangerous-structure pivot).
   - `multiple-row-versions` — **SSI-correct as of section 9** (output matches PG
     byte-for-byte) but not `pass_required`: its 1,000,000-row single-transaction
     setup INSERT intermittently trips the orthogonal WAL-buffer ring race

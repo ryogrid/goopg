@@ -23,12 +23,12 @@ func ssiActive(ctx *Context) bool {
 // a SERIALIZABLE reader observes a tuple at (rel, block, slot) produced by
 // `writerXmin`, it:
 //
-//   1. Acquires a tuple-grain SIREAD predicate lock on (rel, block, slot)
-//      via mvcc.Manager.AcquirePredicateLock so future SERIALIZABLE writers
-//      that touch this tuple — or a covering page / relation — see the read.
-//   2. Calls mvcc.Manager.CheckForSerializableConflictOut so any rw-edge
-//      from this reader to the writer (when the writer is a concurrent
-//      SERIALIZABLE xact) is installed in both peers' in/outConflict slices.
+//  1. Acquires a tuple-grain SIREAD predicate lock on (rel, block, slot)
+//     via mvcc.Manager.AcquirePredicateLock so future SERIALIZABLE writers
+//     that touch this tuple — or a covering page / relation — see the read.
+//  2. Calls mvcc.Manager.CheckForSerializableConflictOut so any rw-edge
+//     from this reader to the writer (when the writer is a concurrent
+//     SERIALIZABLE xact) is installed in both peers' in/outConflict slices.
 //
 // Both manager calls short-circuit again for invalid/bootstrap/frozen and
 // self xids and for RC/RR readers, so callers do not need to filter further.
@@ -95,10 +95,14 @@ func ssiRecordTupleRead(ctx *Context, rel storage.RelFileNode, block storage.Blo
 // coarser lock is held (AcquirePredicateLock prunes finer covered tags).
 //
 // Upstream gates this via SerializationNeededForRead /
-// PredicateLockingNeededForRelation: system catalogs (OID < FirstUserOID),
-// temp (local-buffer) relations and materialized views never participate in
-// predicate locking. The system-catalog gate lives here; the caller filters
-// temp / matview relations (it holds the catalog.Table) before calling.
+// PredicateLockingNeededForRelation, which excludes ONLY system catalogs
+// (OID < FirstUnpinnedObjectId) and temp (local-buffer) relations — NOT
+// materialized views, which are ordinary heaps for SSI purposes. The
+// system-catalog gate lives here; the caller elides this coarse relation-grain
+// lock for temp / matview relations (it holds the catalog.Table). A matview
+// scan still acquires per-tuple SIREAD locks via ssiRecordTupleRead, and a
+// concurrent REFRESH MATERIALIZED VIEW conflicts against those through the
+// relation-wide ssiRecordTableWrite hook (matview-write-skew spec).
 func ssiRecordRelationRead(ctx *Context, rel storage.RelFileNode) {
 	if !ssiActive(ctx) {
 		return
@@ -192,6 +196,40 @@ func ssiRecordTupleWrite(ctx *Context, rel storage.RelFileNode, block storage.Bl
 	}
 	tag := mvcc.TupleLockTag(rel.DBOid, rel.RelOid, block, slot)
 	if err := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); err != nil {
+		return ssiReadAbortError(err)
+	}
+	return nil
+}
+
+// ssiRecordTableWrite is the executor-side SSI hook for a relation-wide
+// logical mass delete/rewrite — TRUNCATE, DROP, or REFRESH MATERIALIZED VIEW.
+// Mirroring upstream CheckTableForSerializableConflictIn (predicate.c), it
+// installs an rw-conflict R -> W from EVERY SERIALIZABLE reader holding a
+// predicate lock of ANY granularity (relation / page / tuple) on the relation,
+// because the rewrite logically destroys every row those readers saw.
+//
+// Why REFRESH MATERIALIZED VIEW needs this and a per-tuple write hook would
+// not suffice: execRefreshMatView truncates the matview heap and re-populates
+// it through the low-level writeHeapRow path, which — unlike the INSERT
+// operator — never calls ssiRecordTupleWrite. So the refresh produces no
+// per-tuple write tag, and ssiRecordTupleWrite's UPWARD (tuple -> page ->
+// relation) conflict-in walk could never find a concurrent reader's
+// fine-grained SIREAD on the matview. The relation-wide scan here finds it
+// regardless of granularity, closing the s2_read -> s1_refresh dangerous
+// structure (matview-write-skew spec, M0118-0001).
+//
+// Returns 40001 only when this write newly dooms the WRITER itself as a pivot
+// with an out-conflict to an already-committed transaction (mirrors
+// ssiRecordTupleWrite); the common deferred-pivot case returns nil and surfaces
+// at the partner's COMMIT.
+func ssiRecordTableWrite(ctx *Context, rel storage.RelFileNode) error {
+	if !ssiActive(ctx) {
+		return nil
+	}
+	if catalog.IsSystemRelation(rel.RelOid) {
+		return nil
+	}
+	if err := ctx.TxnMgr.CheckTableForSerializableConflictInReportingFailure(ctx.Tx.Handle, rel.DBOid, rel.RelOid); err != nil {
 		return ssiReadAbortError(err)
 	}
 	return nil

@@ -9568,6 +9568,16 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	}
 	// Truncate existing data (stamp xmax on all rows).
 	rel := o.ctx.Catalog.RelFileNode(tbl)
+	// SSI: REFRESH logically mass-deletes and rewrites the entire matview heap,
+	// so under SERIALIZABLE it must record an rw-conflict in from every
+	// transaction holding a predicate lock on the matview — the writer-side edge
+	// the matview-write-skew spec needs (s2 reads the matview, s1 refreshes it).
+	// Mirrors upstream CheckTableForSerializableConflictIn for TRUNCATE/DROP.
+	// Run before the heap mutation so a doomed-writer abort leaves nothing
+	// half-written. M0118-0001.
+	if serr := ssiRecordTableWrite(o.ctx, rel); serr != nil {
+		return serr
+	}
 	if err := truncateRelation(o.ctx, rel); err != nil {
 		return err
 	}

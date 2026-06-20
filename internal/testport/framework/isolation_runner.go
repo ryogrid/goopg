@@ -615,7 +615,7 @@ func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session str
 }
 
 // splitSQLStatements splits a multi-statement SQL block into individual
-// statement strings. Handles single-quoted strings (with '' escapes) and
+// statement strings. Handles single-quoted strings (with ” escapes) and
 // single-line (--) comments. Sufficient for all isolation spec files.
 func splitSQLStatements(sql string) []string {
 	var stmts []string
@@ -691,6 +691,7 @@ func execOneStatement(ctx context.Context, conn *sql.Conn, sqlText string) (oneR
 	colTypes, _ := rows.ColumnTypes()
 	numericCols := make([]string, len(cols))
 	boolCols := make([]bool, len(cols))
+	dateCols := make([]bool, len(cols))
 	for i := range cols {
 		numericCols[i] = "text"
 		if i < len(colTypes) {
@@ -700,6 +701,15 @@ func execOneStatement(ctx context.Context, conn *sql.Conn, sqlText string) (oneR
 			}
 			if dbType == "BOOL" {
 				boolCols[i] = true
+			}
+			// DATE columns: lib/pq decodes the date OID (1082) into a time.Time,
+			// which a NullString scan would then re-render as RFC3339
+			// ("2022-04-01T00:00:00Z"). The PostgreSQL isolation expected files are
+			// produced by pg_regress, which sets DateStyle='Postgres, MDY' via
+			// PGDATESTYLE, so dates print as "MM-DD-YYYY". Scan such columns as a
+			// time and format to match the golden output. M0118-0001.
+			if dbType == "DATE" {
+				dateCols[i] = true
 			}
 		}
 	}
@@ -712,17 +722,28 @@ func execOneStatement(ctx context.Context, conn *sql.Conn, sqlText string) (oneR
 
 	for rows.Next() {
 		vals := make([]sql.NullString, len(cols))
+		dateVals := make([]sql.NullTime, len(cols))
 		ptrs := make([]interface{}, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
+		for i := range cols {
+			if dateCols[i] {
+				ptrs[i] = &dateVals[i]
+			} else {
+				ptrs[i] = &vals[i]
+			}
 		}
 		if err := rows.Scan(ptrs...); err != nil {
 			return oneResult{}, formatPQError(err)
 		}
 		row := make([]string, len(cols))
-		for i, v := range vals {
-			if v.Valid {
-				row[i] = v.String
+		for i := range cols {
+			if dateCols[i] {
+				if dateVals[i].Valid {
+					row[i] = dateVals[i].Time.Format("01-02-2006")
+				}
+				continue
+			}
+			if vals[i].Valid {
+				row[i] = vals[i].String
 				if boolCols[i] {
 					row[i] = normalizeBoolWireText(row[i])
 				}
@@ -821,6 +842,25 @@ func pqprintFormat(cols []string, data [][]string, colTypes []string) string {
 	var sb strings.Builder
 	n := len(cols)
 
+	// Replicate libpq PQprint's per-column right-justification heuristic
+	// (fe-print.c): a column is right-justified ("numeric") unless some value
+	// contains a character outside [0-9.Ee -] or does not end in a digit. This
+	// is content-based, not type-based — it is why date columns rendered as
+	// "MM-DD-YYYY" (all digits and dashes, ending in a digit) right-justify
+	// exactly like integers. colTypes is retained for the caller's signature but
+	// no longer drives alignment. M0118-0001.
+	notNum := make([]bool, n)
+	for _, row := range data {
+		for i := 0; i < n && i < len(row); i++ {
+			if notNum[i] {
+				continue
+			}
+			if pqValueNotNum(row[i]) {
+				notNum[i] = true
+			}
+		}
+	}
+
 	widths := make([]int, n)
 	for i, c := range cols {
 		widths[i] = len(c)
@@ -838,7 +878,7 @@ func pqprintFormat(cols []string, data [][]string, colTypes []string) string {
 			sb.WriteString("|")
 		}
 		w := widths[i]
-		if i < len(colTypes) && colTypes[i] == "numeric" {
+		if !notNum[i] {
 			sb.WriteString(padLeft(c, w))
 		} else {
 			sb.WriteString(padRight(c, w))
@@ -864,7 +904,7 @@ func pqprintFormat(cols []string, data [][]string, colTypes []string) string {
 				v = row[i]
 			}
 			w := widths[i]
-			if i < len(colTypes) && colTypes[i] == "numeric" {
+			if !notNum[i] {
 				sb.WriteString(padLeft(v, w))
 			} else {
 				sb.WriteString(padRight(v, w))
@@ -883,6 +923,28 @@ func pqprintFormat(cols []string, data [][]string, colTypes []string) string {
 	sb.WriteString("\n")
 
 	return sb.String()
+}
+
+// pqValueNotNum reports whether a single cell value forces its column to be
+// left-justified, mirroring the inner test of libpq PQprint (fe-print.c): the
+// value is "not numeric" if it contains any character outside [0-9.Ee -], if it
+// begins with 'E'/'e', or if it does not end in a digit. Empty values never
+// force left-justification (PQprint leaves fieldNotNum unset for them).
+func pqValueNotNum(v string) bool {
+	if v == "" {
+		return false
+	}
+	var ch byte = '0'
+	for i := 0; i < len(v); i++ {
+		ch = v[i]
+		if !((ch >= '0' && ch <= '9') || ch == '.' || ch == 'E' || ch == 'e' || ch == ' ' || ch == '-') {
+			return true
+		}
+	}
+	if v[0] == 'E' || v[0] == 'e' || !(ch >= '0' && ch <= '9') {
+		return true
+	}
+	return false
 }
 
 // execConn executes SQL on conn, discarding result rows.
