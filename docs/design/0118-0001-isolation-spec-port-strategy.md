@@ -421,6 +421,43 @@ and `serializable-parallel` over-aborts that section 8 attributed to the *same*
 relation-grain gap may now also improve, but they carry additional blockers
 (READ ONLY SSI modeling, `RO_SAFE`) and are not promoted here.
 
+### 10. Parenthesised query source for `INSERT` (lands `partial-index`)
+
+`partial-index` exercises SSI predicate locking through a *partial* index:
+`CREATE INDEX test_idx ON test_t(id) WHERE val2 = 1`, two SERIALIZABLE xacts
+each `SELECT * FROM test_t WHERE val2 = 1` and then `UPDATE … SET val2 = 2`
+(moving a row *out* of the partial index). Any overlap must raise `40001`.
+
+The SSI machinery needed **zero** change: the section-9 index-scan SIREAD
+granularity already records per-tuple read locks for the `WHERE val2 = 1`
+predicate read, and the concurrent `UPDATE`s that move rows out of the index
+install the cross-covering rw-edges that close the dangerous structure — exactly
+as for a full index. All generated permutations match PG 18.3 byte-for-byte
+(`TestPort_IsolationPartialIndex`, stable 3/3 at ~23s).
+
+The **sole** blocker was a parser gap. The spec's `global setup` seeds the table
+with `insert into test_t (select generate_series(0, 10000), 'a', 2);` — a fully
+**parenthesised query source**. PostgreSQL's `insert_rest` grammar permits a
+`SelectStmt` (which includes `select_with_parens`) as the source, so the leading
+`(` here opens a query, **not** a column list. goopg's `parseInsert`
+(`internal/parser/dml.go`) unconditionally consumed a `(` as the start of a
+column-name list and then failed at the `select` keyword (`42601`).
+
+Fix: a `nextIsParenQuerySource()` peek decides the `(`. It scans the run of
+leading `(` and reports whether the first non-`(` token is a query-starting
+**reserved** keyword (`SELECT` / `VALUES` / `WITH` / `TABLE`) — none of which can
+be a bare column name, which is what makes the lookahead unambiguous. When true,
+the source is parsed via the existing `parseParenthesisedSelectStmt` (reused from
+set-op RHS handling, so nested `((SELECT …))` works); otherwise the `(` is a
+column list as before. The check is applied both for a bare source
+(`INSERT INTO t (SELECT …)`) and after an explicit column list
+(`INSERT INTO t (a, b) (SELECT …)`, also valid upstream). The change is strictly
+additive — only input that previously raised a syntax error now parses — so no
+existing `INSERT` parse is altered (regression tests:
+`TestParseInsertParenthesisedSelectSource`,
+`TestParseInsertColumnListThenParenthesisedSelect`,
+`TestParseInsertPlainSelectSourceUnchanged`).
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
@@ -432,9 +469,13 @@ relation-grain gap may now also improve, but they carry additional blockers
   `40001` and `23505` across its three permutations via the conflict-in walk + the
   index-scan SSI completeness fixes), `read-only-anomaly` (REPEATABLE READ — anomaly
   allowed, no SSI), `update-conflict-out` (SSI conflict-out vs a concurrently
-  UPDATEd/DELETEd-then-aborted tuple; both section 8, zero engine change), and
+  UPDATEd/DELETEd-then-aborted tuple; both section 8, zero engine change),
   `read-only-anomaly-2` (single-column full-key index-scan SIREAD granularity —
-  section 9).
+  section 9), `predicate-lock-hot-tuple` (`IN`-list point reads cross-covering
+  each other's UPDATE target — write-skew 2-cycle, zero engine change via the
+  section-9 per-tuple SIREAD locks), and `partial-index` (SSI through a partial
+  index; zero SSI change — only the parenthesised `INSERT … (SELECT …)` parser
+  source of section 10).
 - **Still deferred (same slice family):**
   - `classroom-scheduling` — the SSI machinery is in place (section 5), but its
     primary key is `(room_id text, start_time timestamptz)` and goopg's btree

@@ -500,6 +500,18 @@ func TestPort_IsolationPredicateLockHotTuple(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/predicate-lock-hot-tuple.spec")
 }
 
+// TestPort_IsolationPartialIndex exercises partial-index: an UPDATE that moves a
+// row out of a partial index (CREATE INDEX ... WHERE val2 = 1) under SERIALIZABLE
+// must still create the read/write dependency a full-table read would, so any
+// overlap between the two transactions raises 40001.
+func TestPort_IsolationPartialIndex(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_partial_index")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/partial-index.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()
