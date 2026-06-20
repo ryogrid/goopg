@@ -6565,7 +6565,9 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
 		return btree.EncodeChar([]byte(v.StringValue())), nil
-	case isTimestampType(col.Type.Name):
+	case isTimestampType(col.Type.Name) || isTimestamptzType(col.Type.Name):
+		// timestamp and timestamptz share the int64-micros-since-epoch on-disk
+		// form, so both encode via EncodeTimestamp. M0118-0001.
 		if v.Kind != KindTime {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a timestamp at runtime", col.Name)}
 		}
@@ -6753,6 +6755,20 @@ func isDateType(name string) bool {
 	return strings.ToLower(name) == "date"
 }
 
+// isTimestamptzType returns true for the timestamp-with-time-zone type accepted
+// by B-tree key encoding. PG stores timestamptz as int64 microseconds since the
+// epoch (2000-01-01) normalized to UTC — byte-for-byte the same on-disk form as
+// timestamp without time zone — so it reuses the timestamp key path
+// (EncodeTimestamp). M0118-0001 (classroom-scheduling).
+func isTimestamptzType(name string) bool {
+	switch strings.ToLower(name) {
+	case "timestamptz", "timestamp with time zone":
+		return true
+	default:
+		return false
+	}
+}
+
 // isFloat8Type returns true for float8 / float4 / real / double precision.
 func isFloat8Type(name string) bool {
 	switch strings.ToLower(name) {
@@ -6781,7 +6797,8 @@ func isSupportedBTreeKeyType(name string) bool {
 	}
 	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
 		isVarcharType(name) || isCharType(name) || isTimestampType(name) ||
-		isDateType(name) || isFloat8Type(name) || strings.ToLower(name) == "uuid"
+		isTimestamptzType(name) || isDateType(name) || isFloat8Type(name) ||
+		strings.ToLower(name) == "uuid"
 }
 
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {

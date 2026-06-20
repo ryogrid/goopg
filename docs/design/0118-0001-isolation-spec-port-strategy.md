@@ -500,6 +500,49 @@ an index-only scan. Regression tests: `TestDDLCreateDateBTreeIndexAcceptsType`,
 `TestDDLDateRangeScanParity` (mirroring the M0044 timestamp tests). This unblocks
 `date`-keyed indexes generally (e.g. TPC-H `date` columns), not only this spec.
 
+### 12. `timestamptz` B-tree key type (lands `classroom-scheduling`)
+
+`classroom-scheduling` is the canonical SSI double-booking write skew: `s1` reads
+`room_reservation` with an overlap predicate
+(`start_time < … AND end_time > …`) then `INSERT`s an overlapping booking; `s2`
+reads with its own overlap predicate then `UPDATE`s the existing booking's
+`start_time` into the contested window. Any overlap between the two transactions
+must raise `40001`. Across the generated permutations only the two that fully
+serialize `s1` before `s2`'s read commit cleanly; every interleaving that closes
+the two-rw-edge dangerous structure aborts.
+
+The SSI machinery needed **zero** change. The inserted and updated rows both fall
+*within* the concurrent readers' overlap predicates, so the relation/tuple-grain
+SIREAD locks cross-cover exactly the rows PG's finer locks do — the
+dangerous-structure detection validated across the prior 24 specs reproduces the
+abort pattern. The spec emits only `count` values and `ERROR` lines, so
+`timestamptz` text rendering (timezone display) is never exercised by the
+comparison. All generated permutations match PG 18.3 byte-for-byte
+(`TestPort_IsolationClassroomScheduling`, stable 3/3).
+
+The **sole** blocker was B-tree key-type support. `room_reservation`'s primary
+key is `(room_id text, start_time timestamptz)`; `text` is an accepted B-tree key
+type but `timestamptz` was not, so the spec's `global setup` aborted with `0A000
+btree v0 only supports int4 / numeric keys` (`createBTreeIndex`,
+`internal/executor/operators_ddl.go`).
+
+Fix: `timestamptz` joins the accepted B-tree key types (`isTimestamptzType` →
+`isSupportedBTreeKeyType`). PG stores both `timestamp without time zone` and
+`timestamp with time zone` as `int64` microseconds since the 2000-01-01 epoch
+(timestamptz normalized to UTC) — byte-for-byte the **same** on-disk form — so
+`encodeBTreeKeyForColumn` routes `timestamptz` through the existing `timestamp`
+key path (`btree.EncodeTimestamp(micros)`). Because the same `KindTime` Datum
+representation feeds both backfill and probe, a probe key built from a
+`TIMESTAMP WITH TIME ZONE` literal is byte-identical to the key backfill produced
+for the stored row. Both index-only-scan key decoders
+(`internal/executor/operators_indexonly.go`) gained the symmetric `timestamptz`
+case alongside `timestamp` — a latent sibling-path bug closed in the same change
+even though this spec does not drive an index-only scan. Regression tests:
+`TestDDLCreateTimestamptzBTreeIndexAcceptsType`,
+`TestDDLTimestamptzRangeScanParity` (mirroring the M0044 timestamp / section-11
+date tests). This unblocks `timestamptz`-keyed indexes generally, not only this
+spec.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
@@ -517,16 +560,11 @@ an index-only scan. Regression tests: `TestDDLCreateDateBTreeIndexAcceptsType`,
   each other's UPDATE target — write-skew 2-cycle, zero engine change via the
   section-9 per-tuple SIREAD locks), `partial-index` (SSI through a partial
   index; zero SSI change — only the parenthesised `INSERT … (SELECT …)` parser
-  source of section 10), and `temporal-range-integrity` (cross-table temporal
-  write skew; zero SSI change — only the `date` B-tree key type of section 11).
+  source of section 10), `temporal-range-integrity` (cross-table temporal
+  write skew; zero SSI change — only the `date` B-tree key type of section 11),
+  and `classroom-scheduling` (double-booking write skew; zero SSI change — only
+  the `timestamptz` B-tree key type of section 12).
 - **Still deferred (same slice family):**
-  - `classroom-scheduling` — the SSI machinery is in place (section 5), but its
-    primary key is `(room_id text, start_time timestamptz)` and goopg's btree
-    rejects a `timestamptz` key (`btree v0 only supports int4 / numeric keys`,
-    SQLSTATE 0A000) at the spec's `global setup`. Section 11 added the `date` key
-    type via the int4-days path; `timestamptz` is a distinct (8-byte
-    microsecond-since-epoch, like `timestamp`) follow-on and is the remaining
-    blocker. Blocked on btree key-type support, NOT on SSI — a different subsystem.
   - `receipt-report` — the `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` parser
     gap is now **fixed** (section 6), so the spec runs end-to-end. Two issues
     remain: (a) the spec's `date` columns read back through the isolation runner

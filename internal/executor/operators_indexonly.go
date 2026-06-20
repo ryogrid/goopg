@@ -247,7 +247,8 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 		}
 		v, err := btree.DecodeFloat8(key[:8])
 		return NewStringDatum(strconv.FormatFloat(v, 'g', -1, 64)), 8, err
-	case isTimestampType(typeName):
+	case isTimestampType(typeName) || isTimestamptzType(typeName):
+		// timestamp and timestamptz share the int64-micros key form. M0118-0001.
 		if len(key) < 8 {
 			return NullDatum, 0, fmt.Errorf("btree: timestamp key truncated, got %d bytes", len(key))
 		}
@@ -349,7 +350,8 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 		}
 		return NewStringDatum(string(b)), nil
 
-	case isTimestampType(typeName):
+	case isTimestampType(typeName) || isTimestamptzType(typeName):
+		// timestamp and timestamptz share the int64-micros key form. M0118-0001.
 		v, err := btree.DecodeTimestamp(key)
 		if err != nil {
 			return NullDatum, err
