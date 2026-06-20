@@ -2189,8 +2189,26 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 	case "timestamp", "timestamptz":
 		// Try a few common upstream layouts in order. The
 		// `2006-01-02 15:04:05` form is what TPC-H and pgbench
-		// use; `2006-01-02T15:04:05Z` is RFC3339 fallback.
-		layouts := []string{"2006-01-02 15:04:05.999999", "2006-01-02 15:04:05", "2006-01-02"}
+		// use. PostgreSQL's timestamp(tz) input also accepts a
+		// seconds-less `HH:MM` time and an optional numeric
+		// timezone offset (e.g. `2010-04-01 10:00` and
+		// `2010-04-01 10:00:00-04`); the tz-suffixed and
+		// seconds-less variants below cover those. The tz-bearing
+		// layouts are tried first so an explicit offset is honoured
+		// before the zone-less fallbacks treat the wall clock as UTC.
+		// Without these the isolation classroom-scheduling /
+		// receipt-report specs (which book rooms on the half-hour with
+		// `TIMESTAMP WITH TIME ZONE '2010-04-01 10:00'`) fail their
+		// setup INSERT with `invalid timestamp` (22007).
+		layouts := []string{
+			"2006-01-02 15:04:05.999999-07",
+			"2006-01-02 15:04:05-07",
+			"2006-01-02 15:04-07",
+			"2006-01-02 15:04:05.999999",
+			"2006-01-02 15:04:05",
+			"2006-01-02 15:04",
+			"2006-01-02",
+		}
 		for _, layout := range layouts {
 			if t, err := time.Parse(layout, x.Value); err == nil {
 				x.CachedTime = t.UTC()

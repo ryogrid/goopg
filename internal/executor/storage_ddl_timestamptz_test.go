@@ -6,8 +6,65 @@ import (
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
+
+// TestEvalTypedStringLitTimestampForms pins the timestamp(tz) literal parse
+// surface of evalTypedStringLit. The classroom-scheduling / receipt-report
+// isolation specs book rooms on the half-hour with seconds-less literals such
+// as `TIMESTAMP WITH TIME ZONE '2010-04-01 10:00'`. Before this fix those
+// failed the global setup INSERT with `invalid timestamp "2010-04-01 10:00"`
+// (22007) because the layout list only accepted `HH:MM:SS`. PostgreSQL's
+// timestamptz_in accepts a seconds-less `HH:MM` time plus an optional numeric
+// timezone offset, so both must parse; an explicit offset must be honoured
+// (converted to UTC) before the zone-less fallbacks treat the wall clock as UTC.
+func TestEvalTypedStringLitTimestampForms(t *testing.T) {
+	utc := func(y int, mo time.Month, d, h, mi, s int) time.Time {
+		return time.Date(y, mo, d, h, mi, s, 0, time.UTC)
+	}
+	for _, typ := range []string{"timestamp", "timestamptz"} {
+		valid := []struct {
+			in   string
+			want time.Time
+		}{
+			{"2010-04-01 10:00", utc(2010, 4, 1, 10, 0, 0)},         // seconds-less (the spec's form)
+			{"2010-04-01 11:00", utc(2010, 4, 1, 11, 0, 0)},         // seconds-less
+			{"2010-04-01 10:00:00", utc(2010, 4, 1, 10, 0, 0)},      // explicit seconds (regression)
+			{"2010-04-01 10:00:00.5", utc(2010, 4, 1, 10, 0, 0)},    // fractional seconds (regression)
+			{"2010-04-01", utc(2010, 4, 1, 0, 0, 0)},                // date only (regression)
+			{"2010-04-01 10:00:00-04", utc(2010, 4, 1, 14, 0, 0)},   // explicit offset honoured
+			{"2010-04-01 10:00-04", utc(2010, 4, 1, 14, 0, 0)},      // seconds-less + offset
+			{"2010-04-01 10:00:00.5-04", utc(2010, 4, 1, 14, 0, 0)}, // fractional + offset
+		}
+		for _, tc := range valid {
+			x := &planner.TypedStringLit{Type: typ, Value: tc.in}
+			d, err := evalTypedStringLit(x)
+			if err != nil {
+				t.Errorf("%s '%s': unexpected error: %v", typ, tc.in, err)
+				continue
+			}
+			// Compare at second granularity: the fractional cases land on
+			// the same second, and sub-second precision is exercised by the
+			// pre-existing `.999999` layout, not this fix.
+			if got := d.TimeValue().UTC().Truncate(time.Second); !got.Equal(tc.want) {
+				t.Errorf("%s '%s': got %v want %v", typ, tc.in, got, tc.want)
+			}
+		}
+
+		invalid := []string{
+			"not-a-timestamp",
+			"2010-04-01 25:00", // hour out of range
+			"2010-13-01 10:00", // month out of range
+		}
+		for _, in := range invalid {
+			x := &planner.TypedStringLit{Type: typ, Value: in}
+			if _, err := evalTypedStringLit(x); err == nil {
+				t.Errorf("%s '%s': expected error, got none", typ, in)
+			}
+		}
+	}
+}
 
 // timestamptzBTreeKey mirrors the encodeBTreeKeyForColumn timestamptz path:
 // timestamptz shares the int64-micros-since-epoch on-disk form with timestamp

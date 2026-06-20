@@ -591,11 +591,40 @@ SERIALIZABLE specs (incl. `read-only-anomaly-2`, the `read-write-unique` family,
 precise per-tuple anti-dependency PG records, not a coarse lock, so it does not
 over-abort.
 
-> Note (unrelated pre-existing flake, recorded for follow-up): `classroom-scheduling`'s
-> `global setup` intermittently (~50%) fails with `invalid timestamp
-> "2010-04-01 10:00" (22007)` when inserting a seconds-less `timestamptz` literal.
-> Reproduced on a clean tree (without this slice), so it is a separate
-> `timestamptz` text-parse bug, not an SSI regression. See the deferral ledger.
+### 14. Seconds-less `timestamptz` literal parse (re-lands `classroom-scheduling`)
+
+Section 12 made the `timestamptz` *B-tree key* work, but the spec still failed its
+`global setup` INSERT with `invalid timestamp "2010-04-01 10:00" (22007)`. The
+follow-up note here originally framed this as a ~50% flake; running the dedicated
+test with the Go build cache disabled (`-count=1`) showed it was a **deterministic
+100% failure** — the earlier "pass" was a stale cached test result, and `ok` from a
+cached run masks a `--- SKIP` (see the test-harness memory note). So section 12's
+"sole blocker was the B-tree key type" was incomplete: there was a second,
+co-equal blocker in literal parsing.
+
+Root cause: `classroom-scheduling` (and `receipt-report`) book rooms on the
+half-hour with seconds-less literals like `TIMESTAMP WITH TIME ZONE
+'2010-04-01 10:00'`. `evalTypedStringLit` (`internal/executor/expr.go`, the
+`timestamp`/`timestamptz` case) only tried the layouts
+`2006-01-02 15:04:05.999999`, `2006-01-02 15:04:05`, and `2006-01-02` — none of
+which accept an `HH:MM` time with no seconds, so every overlap literal in the spec
+errored. PostgreSQL's `timestamptz_in` accepts a seconds-less time and an optional
+numeric timezone offset.
+
+Fix (executor-only, additive to the layout list): the case now also tries
+`2006-01-02 15:04` plus the timezone-suffixed variants
+(`…15:04:05.999999-07`, `…15:04:05-07`, `…15:04-07`). The tz-bearing layouts are
+listed first so an explicit offset is honoured (converted to UTC) before the
+zone-less fallbacks treat the wall clock as UTC; a zone-less layout rejects a
+tz-bearing input via Go's "extra text" error, so ordering never mis-parses. The
+full-second forms TPC-H / pgbench depend on stay in the list unchanged, and the
+per-node `CacheValid` memoization means the extra layouts cost only one first-eval
+pass. Regression: `TestEvalTypedStringLitTimestampForms`
+(`internal/executor/storage_ddl_timestamptz_test.go`) pins seconds-less, explicit
+seconds, fractional, date-only, and offset forms for both `timestamp` and
+`timestamptz`, plus rejection of out-of-range values.
+`TestPort_IsolationClassroomScheduling` now passes 5/5 (was 0/8 SKIP), and all 16
+SSI / timestamp specs re-verified green.
 
 ## Status / scope boundary
 
