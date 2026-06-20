@@ -475,6 +475,18 @@ func TestPort_IsolationUpdateConflictOut(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/update-conflict-out.spec")
 }
 
+// TestPort_IsolationMultipleRowVersions exercises the multiple-row-versions
+// spec: a four-transaction SERIALIZABLE dangerous structure that only triggers
+// with particular timings across many row versions. The single tested
+// permutation must abort s1's wz1 UPDATE with 40001.
+func TestPort_IsolationMultipleRowVersions(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_multi_row_ver")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/multiple-row-versions.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()
