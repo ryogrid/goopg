@@ -8308,8 +8308,32 @@ Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts th
 `gz integer GENERATED ALWAYS AS (ya + yc) STORED` **before** the two plain inherited columns `ya integer` and
 `yc integer`, and that `ATTACH PARTITION public.pgfr_1 FOR VALUES IN (1)` survives).
 
-> **Next (slice 287+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
-> column whose expression mixes a forward and a backward Var reference plus a literal (e.g. `gz = ya + 1 + yc`).
+### Slice 287 — mid-position generation expression mixing a backward Var, a literal, and a forward Var (both directions, one deparse)
+
+Slices 285/286 each exercised a single direction: 285's `gb` (attnum 3) referenced only columns declared **before** it,
+286's `gz` (attnum 1) referenced only columns declared **after** it. This slice places the generated column in the
+**middle** so a single expression resolves **both** directions at once. The parent
+`CREATE TABLE pgmx (ma integer, mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED, mc integer) PARTITION BY LIST (ma)`
+declares `mg` at attnum 2, referencing `ma` (attnum 1, **backward**), the literal `1`, and `mc` (attnum 3, **forward**).
+The leaf `CREATE TABLE pgmx_1 PARTITION OF pgmx FOR VALUES IN (1)` INHERITS all three (`attislocal=false`). The render
+path is identical to slices 283–286 — `attgenerated` forces `attrdefs[].separate=false` (pg_dump.c:9507) and
+`ispartition` forces `shouldPrintColumn` true for every column (slices 281/282) — so the leaf body prints in attnum
+order: `ma integer`, then the inline `mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED`, then `mc integer`. The
+**new** fact under test is that the generation deparse resolves both a backward and a forward Var by NAME within one
+expression; a forward-only positional scan would lose `ma`, a backward-only scan would lose `mc`.
+
+**No production change required.** goopg stores the generation expression as verbatim source text and renders it back
+through `pg_get_expr` (slices 283–286); pg_dump wraps it with one paren set (`GENERATED ALWAYS AS (%s) STORED`), so the
+three-operand `ma + 1 + mc` prints flat with no nested parens — matching goopg's existing flat-render convention
+(`GENERATED ALWAYS AS (a + b + 1000) STORED`). Verified byte-identical vs PG 18.3.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgmx_1` block prints `ma integer`
+**before** the inline `mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED`, which prints **before** `mc integer`, and
+that `ATTACH PARTITION public.pgmx_1 FOR VALUES IN (1)` survives).
+
+> **Next (slice 288+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
+> column whose expression applies a function call (e.g. `upper(name)`) rather than an arithmetic operator, exercising a
+> FuncExpr node in the inherited-leaf generation deparse.
 
 ## Deferred (002–010) — catalog surface estimate
 

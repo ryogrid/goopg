@@ -6129,8 +6129,26 @@ object support.
         — asserts the `pgfr_1` block prints the inline `gz integer GENERATED ALWAYS AS (ya + yc) STORED` BEFORE the plain
         inherited `ya integer`/`yc integer`, and `ATTACH PARTITION public.pgfr_1 FOR VALUES IN (1)` survives). gofmt + `go vet`
         clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 286.
-        **Next (slice 287+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
-        column whose expression mixes a forward and a backward Var reference plus a literal (e.g. `gz = ya + 1 + yc`).
+      - **PROGRESS 2026-06-20 (loop #55):** **DU-002 slice 287 LANDED — a MID-POSITION generation expression mixing a
+        BACKWARD Var, a literal, and a FORWARD Var inherited onto a partition leaf round-trips, proving the generation
+        deparse resolves BOTH reference directions by column NAME within a single expression (no production change).**
+        Slices 285/286 each exercised one direction (285's `gb` at attnum 3 referenced only columns BEFORE it; 286's `gz`
+        at attnum 1 referenced only columns AFTER it). Slice 287's `mg` is attnum 2 and references `ma` (attnum 1,
+        backward) + the literal `1` + `mc` (attnum 3, forward) — so one deparse must resolve a Var on each side plus a
+        Const. Same render path as 283–286 (attgenerated forces `attrdefs[].separate=false`, pg_dump.c:9507; `ispartition`
+        forces shouldPrintColumn true for every column, slices 281/282), so the leaf body prints in attnum order:
+        `ma integer`, then inline `mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED`, then `mc integer`. goopg stores the
+        generation expr as verbatim source text and renders it through `pg_get_expr`; pg_dump wraps it `(%s)`, so the
+        three-operand `ma + 1 + mc` prints FLAT (no nested parens), matching goopg's existing convention
+        (`GENERATED ALWAYS AS (a + b + 1000) STORED`). Fixture: `CREATE TABLE public.pgmx (ma integer, mg integer
+        GENERATED ALWAYS AS (ma + 1 + mc) STORED, mc integer) PARTITION BY LIST (ma)` + `CREATE TABLE public.pgmx_1
+        PARTITION OF public.pgmx FOR VALUES IN (1)`. A forward-only positional scan would lose `ma`; a backward-only scan
+        would lose `mc` — only name resolution renders both. **Guards:** `TestPort_PgDumpConnectionSetup` PASS (3.81s; vs
+        real pg_dump 18.3 — asserts the `pgmx_1` block prints `ma integer` BEFORE inline `mg integer GENERATED ALWAYS AS
+        (ma + 1 + mc) STORED` BEFORE `mc integer`, and `ATTACH PARTITION public.pgmx_1 FOR VALUES IN (1)` survives). gofmt
+        + `go vet` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 287.
+        **Next (slice 288+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
+        column whose expression applies a function call (e.g. `upper(name)`) — a FuncExpr node in the inherited-leaf deparse.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

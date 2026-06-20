@@ -1555,6 +1555,30 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pgfr_1: %v", err)
 	}
 
+	// Slice 287: a generated column placed in the MIDDLE (attnum 2) whose single
+	// expression resolves a BACKWARD Var (`ma`, attnum 1), a literal Const (`1`),
+	// and a FORWARD Var (`mc`, attnum 3) — all in one deparse. Slice 285 referenced
+	// only columns before the generated column; slice 286 referenced only columns
+	// after it. This slice exercises BOTH directions plus a literal simultaneously:
+	// `mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED` sits between `ma` and
+	// `mc`. The partition leaf pgmx_1 INHERITS all three (attislocal=false), and the
+	// same render path holds — attgenerated forces attrdefs[].separate=false
+	// (pg_dump.c:9507), ispartition forces shouldPrintColumn true for every column
+	// (slices 281/282) — so the leaf body prints in attnum order: `ma integer`,
+	// then the inline generated `mg`, then `mc integer`. NO production change —
+	// goopg stores the generation expression as verbatim source text and renders it
+	// back through pg_get_expr (slices 283–286); pg_dump wraps it `(%s)`, so the
+	// three-operand `ma + 1 + mc` prints flat with no nested parens. A regression
+	// that resolved Vars by a forward-only positional scan would lose `ma` (declared
+	// before `mg`); a backward-only scan would lose `mc` (declared after `mg`). Only
+	// NAME-based resolution renders both operands of this mid-position column.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgmx (ma integer, mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED, mc integer) PARTITION BY LIST (ma)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgmx with mid-position mixed-direction generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgmx_1 PARTITION OF public.pgmx FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pgmx_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4482,6 +4506,47 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgfr_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgfr_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 287 (asserted):** a mid-position generated column mixing a backward
+		// Var, a literal, and a forward Var in one expression. pgmx_1's inherited `mg`
+		// is attnum 2 and references `ma` (attnum 1, declared BEFORE) and `mc` (attnum
+		// 3, declared AFTER) plus the literal `1`. The leaf body must print in attnum
+		// order: `ma integer`, then the inline `mg integer GENERATED ALWAYS AS
+		// (ma + 1 + mc) STORED`, then `mc integer`. This asserts the generation deparse
+		// resolves BOTH directions by NAME in a single expression (slices 285/286 each
+		// exercised only one direction); the three-operand `ma + 1 + mc` prints flat.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgmx_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			maIdx := strings.Index(block, "ma integer")
+			if maIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgmx_1 block\n  block=%q", "ma integer", block)
+			}
+			mgIdx := strings.Index(block, "mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED")
+			if mgIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the mid-position mixed-direction generated column on a partition leaf; want %q in pgmx_1 block\n  block=%q", "mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED", block)
+			}
+			mcIdx := strings.Index(block, "mc integer")
+			if mcIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgmx_1 block\n  block=%q", "mc integer", block)
+			}
+			// Attnum order: ma (1) before mg (2) before mc (3) — the generated column
+			// prints between the two columns its expression references.
+			if maIdx >= 0 && mgIdx >= 0 && maIdx > mgIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgmx_1 block\n  block=%q", "ma", "mg", block)
+			}
+			if mgIdx >= 0 && mcIdx >= 0 && mgIdx > mcIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want generated %q before %q in pgmx_1 block\n  block=%q", "mg", "mc", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgmx_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgmx_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgmx_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every
