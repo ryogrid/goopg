@@ -132,7 +132,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 			return false, err
 		}
 		slot.RLock()
-		tuple, _, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID)
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID)
 		// M0118-0001: SSI phantom conflict-out for an index-only-scanned tuple
 		// present at this TID but invisible because a concurrent transaction
 		// inserted it — the IOS analog of the seq-scan invisible-tuple path. The
@@ -153,6 +153,21 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 				}
 			}
 			return true, nil
+		}
+		// M0118-0001: SSI read-path per-tuple conflict-out on the HOT-resolved
+		// live version. The ALL_VISIBLE fast path needs no heap tuple, but this
+		// non-ALL_VISIBLE fallback already fetched it, so record the rw-edge
+		// against the tuple's xmin (a concurrent inserter) AND xmax (a concurrent
+		// deleter/updater) — the latter is the referential-integrity write-skew
+		// edge where this reader sees a row an in-flight SERIALIZABLE peer has
+		// DELETEd. Mirrors the heap-fetching index-scan path
+		// (operators_index.go); the helper short-circuits for RC/RR and the
+		// tuple-grain predicate lock it would take is pruned by the relation-grain
+		// SIREAD already held (ssiRecordRelationRead above). The page RLock/pin is
+		// released above, so a non-nil error (reader closed a dangerous structure
+		// to an already-committed writer) propagates as a mid-statement 40001.
+		if serr := ssiRecordTupleRead(ctx, heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); serr != nil {
+			return false, serr
 		}
 		row, err := o.decodeRowFromHeap(tuple)
 		if err != nil {

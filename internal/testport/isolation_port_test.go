@@ -524,6 +524,21 @@ func TestPort_IsolationTemporalRangeIntegrity(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/temporal-range-integrity.spec")
 }
 
+// TestPort_IsolationReferentialIntegrity exercises referential-integrity: a
+// SERIALIZABLE write skew across two tables (a / b) standing in for an
+// application-enforced foreign key. s1 reads a(i=1) then INSERTs into b; s2
+// reads a(i=1) and b(a_id=1) then DELETEs a(i=1). Any overlap must abort one
+// transaction with 40001 — the empty read on b takes a relation-grain SIREAD
+// so s1's INSERT conflicts out, and s1's read of a conflicts in against s2's
+// DELETE, closing the dangerous structure.
+func TestPort_IsolationReferentialIntegrity(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_referential_integrity")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/referential-integrity.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

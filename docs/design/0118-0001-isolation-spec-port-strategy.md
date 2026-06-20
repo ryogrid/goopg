@@ -543,6 +543,60 @@ even though this spec does not drive an index-only scan. Regression tests:
 date tests). This unblocks `timestamptz`-keyed indexes generally, not only this
 spec.
 
+### 13. Index-only-scan per-tuple conflict-out against `xmax` (lands `referential-integrity`)
+
+`referential-integrity` is a two-table SSI write skew standing in for an
+application-enforced foreign key: `a (i int PRIMARY KEY)`, `b (a_id int)`,
+seeded with `a=(1)`. `s1` reads `a WHERE i=1` then `INSERT`s `b VALUES (1)`; `s2`
+reads `a WHERE i=1` and the (then-empty) `b WHERE a_id=1` then `DELETE`s
+`a WHERE i=1`. Any overlap must raise `40001`. The dangerous structure is the
+2-cycle `s1 --rw--> s2` (s1 reads the `a` row `s2` deletes) **and**
+`s2 --rw--> s1` (s2's empty read of `b` misses `s1`'s insert).
+
+Before this slice **35 of the 36** generated permutations matched PG 18.3; the
+single failure was `rx2 ry2 wx2 rx1 wy1 c1 c2` — the ordering where the pivot
+`s1` commits *first* and `s2` (committing last) must abort. Its sibling
+`…c2 c1` (commit order reversed) already aborted, which localized the gap: one of
+the two rw-edges was missing, and the pre-commit 2-cycle walk (which skips
+*already-committed* pivots) only fired when the still-in-flight partner committed
+first.
+
+Root cause: the **`s1 --rw--> s2`** edge never installed. `rx1` selects only the
+indexed primary-key column (`SELECT i FROM a WHERE i=1`), so the planner picks an
+**index-only scan**. `indexOnlyScanOp` (`internal/executor/operators_indexonly.go`)
+took the relation-grain SIREAD (phantom protection) and, in its non-`ALL_VISIBLE`
+heap-fetch fallback, the invisible-tuple phantom edge — but for a **visible**
+tuple it decoded and returned the row *without* the per-tuple conflict-out check
+that the heap-fetching index-scan (`operators_index.go`) and seq-scan
+(`operators_storage.go`) paths both run. So when `s1`'s index-only scan observed
+the `a(i=1)` row that in-flight `s2` had `DELETE`d (visible to `s1` because the
+delete is uncommitted; its header carries `Xmax = s2`), no reader→deleter edge
+formed. Mirrors upstream: an index-only scan that must fetch the heap (VM bit
+cleared by the concurrent delete) runs `HeapCheckForSerializableConflictOut`,
+which inspects `xmax`.
+
+Fix (executor-only, **zero** mvcc/SSI-engine change): the `found` (visible) branch
+of `indexOnlyScanOp`'s fallback now calls
+`ssiRecordTupleRead(ctx, heapRel, ptr.Block, actualSlot, tuple.Header.Xmin,
+tuple.Header.Xmax)` on the HOT-resolved live version, exactly like the index-scan
+path. The helper short-circuits for RC/RR; its tuple-grain SIREAD is pruned by the
+relation-grain lock already held, so only the conflict-out takes effect — against
+`xmin` (a concurrent inserter) and, when distinct, `xmax` (a concurrent
+deleter/updater). With both edges present the pre-commit 2-cycle walk dooms the
+in-flight partner regardless of commit order, so the second committer aborts where
+PG does. All 36 permutations now match PG 18.3 byte-for-byte
+(`TestPort_IsolationReferentialIntegrity`, stable runs); the 14 previously-passing
+SERIALIZABLE specs (incl. `read-only-anomaly-2`, the `read-write-unique` family,
+`project-manager`, `total-cash`, `two-ids`) remain green — the added edge is the
+precise per-tuple anti-dependency PG records, not a coarse lock, so it does not
+over-abort.
+
+> Note (unrelated pre-existing flake, recorded for follow-up): `classroom-scheduling`'s
+> `global setup` intermittently (~50%) fails with `invalid timestamp
+> "2010-04-01 10:00" (22007)` when inserting a seconds-less `timestamptz` literal.
+> Reproduced on a clean tree (without this slice), so it is a separate
+> `timestamptz` text-parse bug, not an SSI regression. See the deferral ledger.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
