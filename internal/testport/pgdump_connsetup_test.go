@@ -1579,6 +1579,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pgmx_1: %v", err)
 	}
 
+	// Slice 288: a generated column of TEXT type whose expression uses the string
+	// concatenation operator `||` instead of integer arithmetic. Every prior
+	// generation slice (283–287) used an integer column over `+`/`*` operators;
+	// this one proves the inherited-leaf generation render path is BOTH type-
+	// agnostic (the column is `text`, not `integer`) AND operator-agnostic (`||`,
+	// not `+`). The render path keys only off attgenerated ('s') and the verbatim
+	// pg_get_expr text — attGeneratedFor (pg18_user_catalog_rows.go:834) inspects
+	// no type, and goopg's pg_get_expr is a pass-through of the stored expression
+	// source, so `cc text GENERATED ALWAYS AS (ca || cb) STORED` round-trips by the
+	// SAME mechanism as the integer slices. The `||` token joins flat (no parens,
+	// no function call), so the deparse stays faithful: pg_dump wraps it `(%s)` →
+	// `(ca || cb)`. The partition leaf pgcc_1 INHERITS all three columns
+	// (attislocal=false); attgenerated forces attrdefs[].separate=false
+	// (pg_dump.c:9507) and ispartition forces shouldPrintColumn true for every
+	// column (slices 281/282), so the leaf body prints in attnum order: `ca text`,
+	// `cb text`, then the inline generated `cc`. A regression that special-cased
+	// integer generated columns, or one that lost a non-arithmetic operator in the
+	// deparse, would drop or corrupt `cc` here.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgcc (ca text, cb text, cc text GENERATED ALWAYS AS (ca || cb) STORED) PARTITION BY LIST (ca)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgcc with text concatenation generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgcc_1 PARTITION OF public.pgcc FOR VALUES IN ('x')"); err != nil {
+		t.Fatalf("create partition leaf pgcc_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4547,6 +4572,47 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgmx_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgmx_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 288 (asserted):** a TEXT generated column over the `||` string
+		// concatenation operator (every prior generation slice used integer `+`/`*`).
+		// pgcc_1's inherited `cc` is attnum 3 and references `ca`/`cb` (both text);
+		// the leaf body must print in attnum order `ca text`, `cb text`, then the
+		// inline `cc text GENERATED ALWAYS AS (ca || cb) STORED`. This asserts the
+		// inherited-leaf generation render path is type-agnostic (text, not integer)
+		// and operator-agnostic (`||`, not arithmetic): attGeneratedFor inspects no
+		// type and goopg's pg_get_expr passes the source through verbatim, so the
+		// `||` deparse stays flat with no nested parens.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgcc_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			caIdx := strings.Index(block, "ca text")
+			if caIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgcc_1 block\n  block=%q", "ca text", block)
+			}
+			cbIdx := strings.Index(block, "cb text")
+			if cbIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgcc_1 block\n  block=%q", "cb text", block)
+			}
+			ccIdx := strings.Index(block, "cc text GENERATED ALWAYS AS (ca || cb) STORED")
+			if ccIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the text-concatenation generated column on a partition leaf; want %q in pgcc_1 block\n  block=%q", "cc text GENERATED ALWAYS AS (ca || cb) STORED", block)
+			}
+			// Attnum order: ca (1) before cb (2) before cc (3).
+			if caIdx >= 0 && cbIdx >= 0 && caIdx > cbIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pgcc_1 block\n  block=%q", "ca", "cb", block)
+			}
+			if cbIdx >= 0 && ccIdx >= 0 && cbIdx > ccIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgcc_1 block\n  block=%q", "cb", "cc", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgcc_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgcc_1 FOR VALUES IN ('x')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgcc_1 FOR VALUES IN ('x')", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every

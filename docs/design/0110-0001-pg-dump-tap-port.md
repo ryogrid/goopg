@@ -8331,9 +8331,34 @@ Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts th
 **before** the inline `mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED`, which prints **before** `mc integer`, and
 that `ATTACH PARTITION public.pgmx_1 FOR VALUES IN (1)` survives).
 
-> **Next (slice 288+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
-> column whose expression applies a function call (e.g. `upper(name)`) rather than an arithmetic operator, exercising a
-> FuncExpr node in the inherited-leaf generation deparse.
+> **Next (slice 288):** see slice 288 below — a TEXT generated column over the `||` operator (type/operator-agnostic
+> render path). A FuncExpr generation expression (`upper(name)`) is **deferred**: goopg's parser stores `GeneratedExpr`
+> as space-joined tokens (`ddl.go:2607`), so `upper(fn)` becomes `upper ( fn )` and mismatches real pg_dump's `upper(fn)`
+> — that needs expression canonicalization (a production change), not a pure test slice.
+
+### Slice 288 — TEXT generated column over the `||` string-concatenation operator (type- and operator-agnostic render path)
+
+Every prior generation slice (283–287) used an **integer** column over the `+`/`*` arithmetic operators. This slice
+proves the inherited-leaf generation render path carries **neither** assumption: the parent
+`CREATE TABLE pgcc (ca text, cb text, cc text GENERATED ALWAYS AS (ca || cb) STORED) PARTITION BY LIST (ca)` declares a
+**text** generated column `cc` (attnum 3) over the **`||`** string-concatenation operator. The leaf
+`CREATE TABLE pgcc_1 PARTITION OF pgcc FOR VALUES IN ('x')` INHERITS all three columns (`attislocal=false`).
+
+**No production change required.** The render path keys only off `attgenerated` ('s', via `attGeneratedFor`,
+pg18_user_catalog_rows.go:834, which inspects no column type) and the verbatim `pg_get_expr` pass-through of the stored
+generation source. `attgenerated` forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces
+`shouldPrintColumn` true for every column (slices 281/282), so the leaf body prints in attnum order: `ca text`,
+`cb text`, then the inline `cc text GENERATED ALWAYS AS (ca || cb) STORED`. The `||` token joins flat (no parens, no
+function call), so the deparse stays faithful — pg_dump wraps it `(%s)` → `(ca || cb)`. Verified vs PG 18.3.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgcc_1` block prints `ca text` before
+`cb text` before the inline `cc text GENERATED ALWAYS AS (ca || cb) STORED`, and that
+`ATTACH PARTITION public.pgcc_1 FOR VALUES IN ('x')` survives).
+
+> **Next (slice 289+):** the FuncExpr generation deparse (`upper(name)`) now that it is the natural frontier — this is a
+> genuine production slice: canonicalize `GeneratedExpr` so a parsed-then-deparsed function call renders without the
+> token-join spaces (`upper(fn)`, not `upper ( fn )`). Alternatively, a multi-column / NULL-typed DEFAULT variant on the
+> partition-leaf ALTER path.
 
 ## Deferred (002–010) — catalog surface estimate
 

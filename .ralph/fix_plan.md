@@ -6149,6 +6149,26 @@ object support.
         + `go vet` clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 287.
         **Next (slice 288+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
         column whose expression applies a function call (e.g. `upper(name)`) — a FuncExpr node in the inherited-leaf deparse.
+      - **PROGRESS 2026-06-20 (loop #56):** **DU-002 slice 288 LANDED — a TEXT generated column over the `||` string-
+        concatenation operator inherited onto a partition leaf round-trips, proving the inherited-leaf generation render
+        path is BOTH type-agnostic and operator-agnostic (no production change).** Every prior generation slice (283–287)
+        used an `integer` column over `+`/`*` arithmetic; this one uses `text` over `||`. The render path keys ONLY off
+        `attgenerated` ('s', via `attGeneratedFor` at pg18_user_catalog_rows.go:834, which inspects no column type) and the
+        verbatim `pg_get_expr` pass-through of the stored generation source — so `cc text GENERATED ALWAYS AS (ca || cb)
+        STORED` round-trips by the SAME mechanism as the integer slices. `attgenerated` forces `attrdefs[].separate=false`
+        (pg_dump.c:9507) and `ispartition` forces shouldPrintColumn true for every column (slices 281/282), so the leaf
+        body prints in attnum order: `ca text`, `cb text`, then inline `cc text GENERATED ALWAYS AS (ca || cb) STORED`. The
+        `||` token joins flat (no parens, no function call), so the deparse stays faithful: pg_dump wraps it `(%s)` →
+        `(ca || cb)`. Fixture: `CREATE TABLE public.pgcc (ca text, cb text, cc text GENERATED ALWAYS AS (ca || cb) STORED)
+        PARTITION BY LIST (ca)` + `CREATE TABLE public.pgcc_1 PARTITION OF public.pgcc FOR VALUES IN ('x')`. **Guards:**
+        `TestPort_PgDumpConnectionSetup` PASS (3.84s; vs real pg_dump 18.3 — asserts the `pgcc_1` block prints `ca text`
+        BEFORE `cb text` BEFORE inline `cc text GENERATED ALWAYS AS (ca || cb) STORED`, and `ATTACH PARTITION
+        public.pgcc_1 FOR VALUES IN ('x')` survives). gofmt + `go vet` clean; pgbench pre-commit smoke on commit. Design:
+        `0110-0001` Slice 288. **Discovery:** a FuncExpr generation expr (`upper(name)`) is NOT a pure test slice — the
+        parser stores `GeneratedExpr` as space-joined tokens (ddl.go:2607) so `upper(fn)` → `upper ( fn )`, mismatching
+        real pg_dump's `upper(fn)`; it needs expression canonicalization (a production change), now the slice 289 frontier.
+        **Next (slice 289+):** the FuncExpr generation deparse production slice (canonicalize `GeneratedExpr`), OR a
+        multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
