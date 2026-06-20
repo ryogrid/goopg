@@ -322,6 +322,52 @@ blanket-`40001` heuristic removed. Ported as `TestPort_IsolationReadWriteUnique4
 > A read-then-write-skew driven purely through an index-only scan over existing rows
 > would miss its read edge. No current spec exercises that path.
 
+### 8. Zero-engine-change promotions + the predicate-lock-granularity boundary
+
+Two more specs were promoted this slice with **no engine change** — they already
+matched PG 18.3 against the machinery built in sections 3–7:
+
+- **`read-only-anomaly`** (`TestPort_IsolationReadOnlyAnomaly`). This is the O'Neil
+  read-only anomaly run under **REPEATABLE READ** (snapshot isolation), so the
+  anomaly is *allowed*: no serialization failure occurs and the read-only `s3`
+  observes the inconsistent `(X=0, Y=20)` state. No SSI is involved at all; goopg's
+  RR snapshot semantics reproduce the expected output byte-for-byte. (Contrast its
+  `-2` / `-3` siblings, which raise the level to SERIALIZABLE — see below.)
+- **`update-conflict-out`** (`TestPort_IsolationUpdateConflictOut`). Exercises SSI
+  conflict-out handling for heapam when a `trouble` session adds a second physical
+  version (UPDATE) or removes one (DELETE) and then aborts (bug `db7b729d`). Both
+  permutations abort session `bar` with `40001` at `bar_commit` where PG does. This
+  passes on the retained-committed-xact conflict graph (section 3) plus the
+  index-UPDATE write-path conflict-in edge (section 4) already in place.
+
+**Boundary surfaced — predicate-lock granularity (deferred to M0118-0002).**
+`read-only-anomaly-2` (the SERIALIZABLE sibling) is **blocked**, and the diagnosis
+draws the scope line for the rest of the M0118-0001 family. Its permutation 2
+(`… s3r s3c s2wx`) already matches: the read-only `s3` observes `s1`'s committed
+write, closing the real cycle, and `s2wx` aborts with `40001`. But permutation 1
+(`s2rx s2ry s1ry s1wy s1c s2wx s2c s3c`) **over-aborts** `s2wx` with a false-positive
+`40001` where PG commits both `s1` and `s2`. Root cause:
+
+- `s1`'s `SELECT … WHERE id = 'Y'` takes a **relation-grain SIREAD** on
+  `bank_account` (the coarse phantom lock from sections 5/7 — faithful but
+  over-approximate). That lock phantom-covers `X` even though `s1` only read `Y`.
+- When `s2` writes `X` (`s2wx`), `checkForSerializableConflictInLocked` finds `s1`
+  (retained committed) as a covering holder and installs a spurious `s1 → s2` rw-edge.
+- Combined with the *real* `s2 → s1` edge (`s2` read `Y` before `s1` wrote it), `s2`
+  now looks like a pivot in a 2-cycle, so `onConflictCheckLocked` Case 2 dooms it.
+
+PG avoids this because `s1`'s index-qualified read locks only the `Y` index
+leaf / tuple, not the whole relation, so no `s1 → X` edge ever forms. Closing this
+needs **finer predicate-lock granularity per access method** (tuple/page-grain SIREAD
+on index equality probes) — precisely the M0118-0002 charter. It is deliberately
+*not* attempted here: the relation-grain phantom is load-bearing for the specs that
+*do* pass (`read-write-unique-3`'s empty-probe phantom, `project-manager` /
+`classroom-scheduling`'s dangerous-structure closure), so narrowing it is a
+cross-cutting change that must land with its own regression budget. The same
+over-abort gap explains `receipt-report`'s 48-vs-6 serialization-failure surplus and
+the `serializable-parallel` family. `TestPort_IsolationReadOnlyAnomaly2` is kept as a
+skip-until-green baseline anchor so the fix flips it to PASS automatically.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
@@ -331,7 +377,9 @@ blanket-`40001` heuristic removed. Ported as `TestPort_IsolationReadWriteUnique4
   byte-identical to PG 18.3 — section 5), and the full `read-write-unique` family
   `{base, -2, -3, -4}` (unique-constraint write skew, sections 6–7; `-4` mixes
   `40001` and `23505` across its three permutations via the conflict-in walk + the
-  index-scan SSI completeness fixes).
+  index-scan SSI completeness fixes), `read-only-anomaly` (REPEATABLE READ — anomaly
+  allowed, no SSI), and `update-conflict-out` (SSI conflict-out vs a concurrently
+  UPDATEd/DELETEd-then-aborted tuple; both section 8, zero engine change).
 - **Still deferred (same slice family):**
   - `classroom-scheduling` — the SSI machinery is in place (section 5), but its
     primary key is `(room_id text, start_time timestamptz)` and goopg's btree
@@ -348,5 +396,13 @@ blanket-`40001` heuristic removed. Ported as `TestPort_IsolationReadWriteUnique4
     READ ONLY SSI modeling, without which goopg produces 48 serialization
     failures where PG produces 6 (the 42 false positives upstream notes for a
     READ WRITE `s3`, because goopg does not yet treat `s3` as read-only in SSI).
+  - `read-only-anomaly-2` / `read-only-anomaly-3` / the `serializable-parallel`
+    family — blocked on **predicate-lock granularity** (M0118-0002): the
+    relation-grain SIREAD over-approximates index-qualified reads and creates
+    phantom rw-edges that over-abort (section 8). `-3` additionally needs the
+    `DEFERRABLE` safe-snapshot deferral and the reserved-keyword parser fix
+    (section 6); the `serializable-parallel-2/-3` pair additionally needs the
+    `RO_SAFE` read-only-safe-snapshot optimisation. `read-only-anomaly-2` has a
+    skip baseline anchor (`TestPort_IsolationReadOnlyAnomaly2`).
   Their dedicated `TestPort_Isolation*` functions auto-promote (run, then
   `t.Skip` only on `defer`), so the next slice sees green→pass instantly.

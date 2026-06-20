@@ -440,6 +440,41 @@ func TestPort_IsolationClassroomScheduling(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/classroom-scheduling.spec")
 }
 
+// TestPort_IsolationReadOnlyAnomaly exercises the read-only-anomaly spec: the
+// classic O'Neil read-only transaction anomaly under REPEATABLE READ (snapshot
+// isolation). Because the level is RR (not SERIALIZABLE), the anomaly is
+// ALLOWED — no serialization failure occurs, s3 simply observes the
+// inconsistent (X=0, Y=20) state. No SSI machinery is involved.
+func TestPort_IsolationReadOnlyAnomaly(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_ro_anomaly")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly.spec")
+}
+
+// TestPort_IsolationReadOnlyAnomaly2 exercises read-only-anomaly-2: same O'Neil
+// example under SERIALIZABLE. The second permutation creates a cycle once the
+// read-only s3 observes s1's committed write, so s2wx must abort with 40001.
+func TestPort_IsolationReadOnlyAnomaly2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_ro_anomaly2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-2.spec")
+}
+
+// TestPort_IsolationUpdateConflictOut exercises update-conflict-out: SSI
+// "conflict out" handling for heapam interacting with a concurrently updated
+// (then aborted) tuple. "bar" must fail with 40001 at bar_commit at the latest.
+func TestPort_IsolationUpdateConflictOut(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_update_conflict_out")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/update-conflict-out.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()
