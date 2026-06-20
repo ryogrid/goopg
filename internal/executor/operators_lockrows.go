@@ -757,38 +757,55 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 
 	// Another transaction holds a row-level *lock* (lock-only xmax) on this
 	// tuple. Unlike a real updater (handled above) the row is not relocated,
-	// but a conflicting NOWAIT request must still fail fast rather than
-	// silently overwriting the holder's xmax. The lockmgr tuple lock is
-	// statement-scoped (released at each Query message's end in dispatch.go),
-	// so cross-statement conflict detection relies on this persisted lock-only
-	// xmax — the same durable signal the real-updater path reads above.
-	//
-	// Scope guard (M0118-0003): NOWAIT and SKIP LOCKED are intercepted here.
-	// The default blocking path keeps its existing behaviour untouched
-	// (blocking-FOR-UPDATE-on-a-row-lock and multixact shared locks are
-	// separate follow-ups). When the conflicting holder is still active,
-	// NOWAIT fails fast with 55P03 and SKIP LOCKED drops the row silently;
-	// when the holder has finished, both fall through and re-stamp our own
-	// lock-only xmax. No currently-passing spec changes.
+	// but a conflicting request must still honour the holder rather than
+	// silently overwriting its xmax. The lockmgr tuple lock is statement-scoped
+	// (released at each Query message's end in dispatch.go), so cross-statement
+	// conflict detection relies on this persisted lock-only xmax — the same
+	// durable signal the real-updater path reads above.
 	if gerr == nil &&
 		tup.Header.Xmax != storage.InvalidTransactionID &&
 		storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
 		tup.Header.Xmax != o.ctx.Tx.XID &&
-		(o.waitPolicy == planner.LockWaitNoWait || o.waitPolicy == planner.LockWaitSkipLocked) &&
 		tupleLockConflicts(o.lockStrength, tup.Header.Infomask) {
 
+		// Conflict resolution honours the wait policy (M0118-0003):
+		//   SKIP LOCKED -> drop the contended row silently.
+		//   NOWAIT      -> fail fast with 55P03 (relation-qualified).
+		//   blocking    -> wait for the holder to commit/abort, then retry
+		//     from the top. The holder may have committed its lock (released,
+		//     so we stamp our own), aborted (row live again), or upgraded to a
+		//     real update (the real-updater branch above takes over on retry).
+		//     Mirrors that branch's WaitForXID so the isolation scheduler sees
+		//     the step block (<waiting ...>) and resume on the holder's COMMIT.
+		// Multixact shared-lock combination (two non-conflicting FOR SHARE /
+		// FOR KEY SHARE holders) remains a separate follow-up; tupleLockConflicts
+		// only enters here on a genuine conflict.
 		xmax := tup.Header.Xmax
 		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
 			slot.Unlock()
 			o.ctx.Pool.Unpin(slot)
-			if o.waitPolicy == planner.LockWaitSkipLocked {
+			switch o.waitPolicy {
+			case planner.LockWaitSkipLocked:
 				// SKIP LOCKED: silently drop the contended row.
 				return storage.ItemPointer{}, false, true, nil // epqSkipped
-			}
-			return storage.ItemPointer{}, false, false, &ExecError{
-				Code:    "55P03",
-				Pos:     o.plan.Pos(),
-				Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
+			case planner.LockWaitNoWait:
+				return storage.ItemPointer{}, false, false, &ExecError{
+					Code:    "55P03",
+					Pos:     o.plan.Pos(),
+					Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
+				}
+			default:
+				// Blocking FOR UPDATE/FOR SHARE: wait for the row-lock holder
+				// to finish, then re-evaluate the tuple from scratch.
+				qctx := o.ctx.Ctx
+				if qctx == nil {
+					qctx = context.Background()
+				}
+				if werr := o.ctx.TxnMgr.WaitForXID(qctx, xmax); werr != nil {
+					// Context cancelled — skip this row silently.
+					return storage.ItemPointer{}, false, false, nil
+				}
+				return o.stampLockInner(rel, ptr, depth+1)
 			}
 		}
 		// Locker is no longer active (committed/aborted): its row lock is

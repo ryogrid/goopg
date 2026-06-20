@@ -653,6 +653,20 @@ func TestPort_IsolationNowait(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait.spec")
 }
 
+// TestPort_IsolationNowait3 exercises the nowait-3 spec: s1 holds a FOR UPDATE
+// row lock, s2 issues a *blocking* FOR UPDATE on the same row (must wait), and
+// while s2 is queued s3 issues FOR UPDATE NOWAIT (must fail fast with
+// "could not obtain lock on row in relation"). When s1 commits, s2 unblocks and
+// claims the row. Validates the blocking-on-a-row-lock wait path in
+// stampLockInner alongside the existing NOWAIT fail-fast path.
+func TestPort_IsolationNowait3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_nowait3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-3.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

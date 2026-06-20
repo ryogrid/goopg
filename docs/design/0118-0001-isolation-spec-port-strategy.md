@@ -970,7 +970,8 @@ holder.
 
 **Scope boundary (deferred siblings).** Only `nowait` lands this slice. `nowait-2`
 needs multixact (two `FOR SHARE` holders then an upgrade); `nowait-3` needs the
-blocking-`FOR UPDATE`-on-a-locked-row path (intentionally not implemented here);
+blocking-`FOR UPDATE`-on-a-locked-row path (landed later in slice M0118-0003 — see
+below);
 `nowait-4` / `nowait-5` need `EvalPlanQualFetch` NOWAIT over an updated CTID chain
 plus advisory locks / PREPARE; `lock-nowait` needs **cross-statement relation-lock
 persistence** (`LOCK TABLE … NOWAIT`), which goopg's statement-scoped lock manager
@@ -1046,6 +1047,53 @@ Verified by `TestPort_IsolationSkipLocked` (all 21 generated permutations vs PG
 `lock-committed-update`, `lock-committed-keyupdate`, and `eval-plan-qual` green to
 confirm the blocking / NOWAIT / EPQ paths and the `Sort` change are
 regression-free. Isolation pass count 34 → 35.
+
+## Slice M0118-0003 — `nowait-3` (blocking FOR UPDATE waits on a row-lock holder)
+
+`nowait-3.spec` is the one permutation `s1a s2a s3a s1b s2b s3b` over a single-row
+`foo`: `s1` takes `SELECT * FROM foo FOR UPDATE` (lock-only xmax), `s2` then issues
+a *blocking* `FOR UPDATE` on the same row and must **wait** (`<waiting ...>`), and
+while `s2` is queued `s3` issues `FOR UPDATE NOWAIT` and must fail fast
+(`could not obtain lock on row in relation "foo"`). When `s1` commits, `s2`
+unblocks and returns the row.
+
+This is the blocking-`FOR UPDATE`-on-a-row-lock path the `nowait` slice left open.
+The base `nowait` slice already detects a cross-statement conflict from the
+*persisted lock-only xmax* (goopg's lockmgr tuple lock is statement-scoped, so the
+heap xmax is the durable signal), but it only intercepted `NOWAIT` and
+`SKIP LOCKED`; the default blocking policy fell through and silently overwrote the
+holder's xmax. One change lands `nowait-3`:
+
+- **Executor — block on a conflicting lock-only xmax (`stampLockInner`).** The
+  lock-only branch no longer gates on `waitPolicy ∈ {NOWAIT, SKIP LOCKED}`; it now
+  enters on any genuine conflict (`tupleLockConflicts`) against an *active* holder
+  and dispatches on the wait policy: `SKIP LOCKED` drops the row (`epqSkipped`),
+  `NOWAIT` raises `55P03`, and the **default blocking** policy `WaitForXID(holder)`
+  then recurses `stampLockInner(rel, ptr, depth+1)` to re-evaluate from scratch —
+  mirroring the real-updater wait path directly above it. On retry the holder is
+  no longer active, so the row falls through and we stamp our own lock-only xmax.
+  Re-evaluating (rather than stamping blindly) also handles the holder *upgrading*
+  to a real update or *aborting* during the wait.
+
+The scheduler observes the block because `WaitForXID` parks the query goroutine —
+the same primitive `lock-committed-update` relies on for its `<waiting ...>`.
+`s3`'s NOWAIT still fails fast: while `s2` is parked it holds the *statement-scoped
+lockmgr* tuple lock, so `s3`'s `tryAcquireTupleLock` returns `55P03` directly (the
+same relation-qualified message), without reaching the heap-xmax check.
+
+**Scope boundary (deferred siblings).** Still deferred: `nowait-2` /
+`skip-locked-2` (multixact — two `FOR SHARE` holders combine then one upgrades);
+`skip-locked-3` / `lock-nowait` (cross-statement tuple/relation-lock persistence +
+a true wait queue, which goopg's statement-scoped lock manager does not model);
+`nowait-4` / `nowait-5` (`EvalPlanQualFetch` NOWAIT over an updated CTID chain plus
+advisory locks / PREPARE). Tracked in the deferral ledger.
+
+Verified by `TestPort_IsolationNowait3` (the permutation byte-for-byte vs PG 18.3)
+and by re-running `nowait`, `skip-locked`, `lock-committed-update`,
+`lock-committed-keyupdate`, `eval-plan-qual`, and `eval-plan-qual-trigger` green —
+the change widens the lock-only branch entry condition, so every NOWAIT / SKIP
+LOCKED / real-updater path it shares is regression-checked. Isolation pass count
+35 → 36.
 
 ## Status / scope boundary
 
