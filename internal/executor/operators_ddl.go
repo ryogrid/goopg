@@ -5314,6 +5314,22 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+		case parser.AlterTableSetReloptions:
+			// SET (param = value, …) — merge table-level storage parameters into the
+			// relation's reloptions. pg_class.reloptions is rendered from the live
+			// catalog.Table fields (the virtual pg_class builder), so updating the
+			// fields is immediately visible to pg_dump / pg_class — no heap re-sync
+			// is needed (unlike the pg_attribute-backed column options above). Only
+			// the storage parameters goopg models take effect; unrecognized (but
+			// lowercase) names are accepted and ignored, matching the CREATE TABLE
+			// WITH path. M0118-0001.
+			if err := o.execAlterTableSetReloptions(tbl, act, s.Pos()); err != nil {
+				return err
+			}
+		case parser.AlterTableResetReloptions:
+			// RESET (param, …) — clear the named storage parameters back to their
+			// defaults. Acts on the same live catalog.Table fields as SET. M0118-0001.
+			o.execAlterTableResetReloptions(tbl, act)
 		case parser.AlterTableAlterColumnSet:
 			// SET (opt=value, …) — record the per-column attribute options on the
 			// catalog column AND rewrite the pg_attribute heap row so pg_dump
@@ -5566,6 +5582,128 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		}
 	}
 	return nil
+}
+
+// execAlterTableSetReloptions applies an `ALTER TABLE … SET (param = value, …)`
+// clause, merging the named table-level storage parameters into the relation's
+// in-memory catalog fields. goopg surfaces pg_class.reloptions from those fields
+// (the virtual pg_class builder), so the mutation is immediately visible to
+// pg_dump and pg_class without a heap re-sync.
+//
+// Only the storage parameters goopg models are applied; any other lowercase name
+// is accepted and ignored, exactly as the CREATE TABLE WITH path does. The four
+// recognized options (parallel_workers, fillfactor, autovacuum_enabled,
+// toast_tuple_target) cover every reloption upstream's regress/isolation suites
+// ever set via ALTER TABLE; the autovacuum_* long tail is only ever declared at
+// CREATE time. Values are bounds-checked with the same ranges and SQLSTATEs as
+// CREATE so the two paths stay in lock-step. M0118-0001.
+//
+// PG validates the entire option list and only then applies it, so a
+// multi-option SET in which one value is out of range leaves the relation
+// untouched (statement atomicity). Mirror that: validate every option into a
+// pending set first, and commit the mutations only after the whole list passes.
+// Map iteration order is unspecified in Go, so applying field-by-field would
+// otherwise leave a nondeterministic partial state on a rejected statement.
+func (o *ddlOp) execAlterTableSetReloptions(tbl *catalog.Table, act parser.AlterTableAction, pos int) error {
+	var (
+		parallelWorkers  *int
+		fillfactor       *int
+		autovacEnabled   *bool
+		toastTupleTarget *int
+	)
+	for k, v := range act.With {
+		// Double-quoted mixed-case names are unrecognized (PG/CREATE reject them);
+		// all modeled option names are lowercase.
+		if k != strings.ToLower(k) {
+			return &ExecError{Code: "42000", Pos: pos,
+				Message: fmt.Sprintf("unrecognized parameter %q", k)}
+		}
+		switch k {
+		case "parallel_workers":
+			pw, convErr := strconv.Atoi(strings.TrimSpace(v))
+			if convErr != nil {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("invalid value for integer option \"parallel_workers\": %s", v)}
+			}
+			if pw < 0 || pw > 1024 {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("value %d out of bounds for option \"parallel_workers\"", pw),
+					Detail:  "Valid values are between \"0\" and \"1024\"."}
+			}
+			parallelWorkers = &pw
+		case "fillfactor":
+			ff, convErr := strconv.Atoi(strings.TrimSpace(v))
+			if convErr != nil {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("invalid value for integer option \"fillfactor\": %s", v)}
+			}
+			if ff < 10 || ff > 100 {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", ff),
+					Detail:  "Valid values are between \"10\" and \"100\"."}
+			}
+			fillfactor = &ff
+		case "autovacuum_enabled":
+			b, parsed := parseReloptionBool(strings.TrimSpace(v))
+			if !parsed {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("invalid value for boolean option \"autovacuum_enabled\": %s", v)}
+			}
+			autovacEnabled = &b
+		case "toast_tuple_target":
+			tt, convErr := strconv.Atoi(strings.TrimSpace(v))
+			if convErr != nil {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("invalid value for integer option \"toast_tuple_target\": %s", v)}
+			}
+			if tt < 128 || tt > 8160 {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("value %d out of bounds for option \"toast_tuple_target\"", tt),
+					Detail:  "Valid values are between \"128\" and \"8160\"."}
+			}
+			toastTupleTarget = &tt
+		default:
+			// Unrecognized but lowercase: accept and ignore (CREATE TABLE WITH
+			// behaves the same — it only stores the options it models).
+		}
+	}
+	// Every option validated — commit the changes (merge, not replace: only the
+	// named options are touched, preserving previously-set storage parameters).
+	if parallelWorkers != nil {
+		tbl.ParallelWorkers = *parallelWorkers
+		tbl.ParallelWorkersSet = true
+	}
+	if fillfactor != nil {
+		tbl.Fillfactor = *fillfactor
+	}
+	if autovacEnabled != nil {
+		tbl.AutovacuumEnabled = *autovacEnabled
+		tbl.AutovacuumEnabledSet = true
+	}
+	if toastTupleTarget != nil {
+		tbl.ToastTupleTarget = *toastTupleTarget
+	}
+	return nil
+}
+
+// execAlterTableResetReloptions applies an `ALTER TABLE … RESET (param, …)`
+// clause, clearing each named storage parameter back to its unset default on the
+// in-memory catalog table. Names goopg does not model are ignored. M0118-0001.
+func (o *ddlOp) execAlterTableResetReloptions(tbl *catalog.Table, act parser.AlterTableAction) {
+	for k := range act.With {
+		switch strings.ToLower(k) {
+		case "parallel_workers":
+			tbl.ParallelWorkers = 0
+			tbl.ParallelWorkersSet = false
+		case "fillfactor":
+			tbl.Fillfactor = 0
+		case "autovacuum_enabled":
+			tbl.AutovacuumEnabled = false
+			tbl.AutovacuumEnabledSet = false
+		case "toast_tuple_target":
+			tbl.ToastTupleTarget = 0
+		}
+	}
 }
 
 func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalog.Table, act parser.AlterTableAction) error {

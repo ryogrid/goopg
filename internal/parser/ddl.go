@@ -5191,6 +5191,20 @@ func (p *parser) parseColumnSetOptions() []string {
 	return opts
 }
 
+// isAlterReloptVerb reports whether tok begins a table-level reloptions action
+// (`SET (...)` or `RESET (...)`). SET/RESET are unreserved keywords, so they may
+// arrive as a keyword token or, in some lexing contexts, a bare identifier;
+// accept both spellings (mirroring the ALTER COLUMN ... SET dispatch). M0118-0001.
+func isAlterReloptVerb(tok Token) bool {
+	if tok.Kind == TokenKeyword && (tok.Keyword == KwSet || tok.Keyword == KwReset) {
+		return true
+	}
+	if tok.Kind == TokenIdent && (strings.EqualFold(tok.Value, "set") || strings.EqualFold(tok.Value, "reset")) {
+		return true
+	}
+	return false
+}
+
 func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 	// ATTACH PARTITION child FOR VALUES … (M0096-0007)
 	if p.acceptIdentKeyword("attach") {
@@ -5354,6 +5368,28 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			}, nil
 		}
 		return AlterTableAction{}, p.errAtCur("expected column or constraint name after DROP")
+	}
+	// SET (reloptions) / RESET (reloptions) — table-level storage parameters,
+	// e.g. `ALTER TABLE foo SET (parallel_workers = 2)` or
+	// `RESET (fillfactor)`. Only the parenthesized form is a reloptions update;
+	// the bare SET SCHEMA / SET TABLESPACE / SET LOGGED actions are distinct and
+	// fall through to the ADD/DROP dispatch below (unchanged). RESET shares the
+	// WITH-options parser — its option list carries bare names (empty values),
+	// and the executor clears the named storage parameters. M0118-0001.
+	if cur := p.cur(); isAlterReloptVerb(cur) && p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+		reset := cur.Kind == TokenKeyword && cur.Keyword == KwReset ||
+			cur.Kind == TokenIdent && strings.EqualFold(cur.Value, "reset")
+		pos := cur.Pos
+		p.advance() // SET or RESET
+		opts, err := p.parseWithOptions()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		kind := AlterTableSetReloptions
+		if reset {
+			kind = AlterTableResetReloptions
+		}
+		return AlterTableAction{pos: pos, Kind: kind, With: opts}, nil
 	}
 	if !p.acceptKeyword(KwAdd) {
 		return AlterTableAction{}, p.errAtCur("expected ADD or DROP")

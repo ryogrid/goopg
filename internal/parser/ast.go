@@ -1800,6 +1800,17 @@ const (
 	// Registers child as a partition of parent in the index partition tree.
 	// ConstraintName holds the parent index name; ChildIndexName holds the child. M0097-0023.
 	AlterIndexAttachPartition
+	// AlterTableSetReloptions — `ALTER TABLE name SET (param = value, …)`.
+	// Merges table-level storage parameters into the relation's reloptions
+	// (e.g. parallel_workers, fillfactor, autovacuum_enabled, toast_tuple_target).
+	// With holds the parsed name→value pairs. Only options goopg models as
+	// pg_class.reloptions take effect; others are accepted and ignored, matching
+	// the CREATE TABLE WITH path. M0118-0001.
+	AlterTableSetReloptions
+	// AlterTableResetReloptions — `ALTER TABLE name RESET (param, …)`.
+	// Clears the named table-level storage parameters back to their defaults.
+	// With holds the option names as keys (values empty). M0118-0001.
+	AlterTableResetReloptions
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1865,6 +1876,10 @@ type AlterTableAction struct {
 	// Recorded on catalog.Column.Options so pg_dump re-emits the clause via
 	// pg_attribute.attoptions. DU-002 slice 185.
 	SetOptions []string
+	// With holds the table-level storage parameters for AlterTableSetReloptions
+	// (name→value) and the option names for AlterTableResetReloptions (names as
+	// keys, empty values). Parsed by parseWithOptions. M0118-0001.
+	With map[string]string
 	// NoInherit is set for AlterTableAddNotNull when the constraint carries a
 	// `NO INHERIT` trailer (contype='n', connoinherit='t'). DU-002 slice 271.
 	NoInherit bool

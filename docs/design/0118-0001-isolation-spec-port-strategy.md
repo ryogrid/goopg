@@ -653,10 +653,52 @@ boot `off`, `PGC_USERSET`) mirroring `postgres/src/backend/utils/misc/guc_tables
 Regression: `TestDebugParallelQueryGUC` (`internal/config/debug_parallel_query_test.go`)
 pins the registration, enum membership, case-insensitivity, and rejection of an
 out-of-enum value; `TestPort_IsolationSerializableParallel` passes both
-permutations byte-for-byte vs PG 18.3. The `-2`/`-3` members remain deferred:
-they additionally exercise the `RO_SAFE` read-only-safe-snapshot optimisation and
-several parallel-cost GUCs (`min_parallel_index_scan_size`, `enable_seqscan`,
-`parallel_leader_participation`) plus `ALTER TABLE … SET (parallel_workers=…)`.
+permutations byte-for-byte vs PG 18.3. The `-2`/`-3` members land in section 16.
+
+### 16. `ALTER TABLE … SET (reloptions)` (lands `serializable-parallel-2` / `-3`)
+
+The `-2`/`-3` siblings exercise PG's `SXACT_FLAG_RO_SAFE` read-only-safe-snapshot
+optimisation *in a parallel worker*: a `SERIALIZABLE READ ONLY` transaction that
+PG proves cannot complete a dangerous structure is flagged `RO_SAFE` and released
+early, and the variant forces the read to run in a parallel index-only scan.
+Crucially, **neither spec writes anything** — `s1`/`s3` are `SERIALIZABLE` but
+issue only `SELECT`, and `s2`/`s4` are `SERIALIZABLE READ ONLY`. A workload with
+no writes has no rw-antidependency and therefore no dangerous structure, so the
+*observable* outcome is anomaly-free: every step commits and each read returns the
+same stable snapshot (`COUNT(*) = 100` for `-2`; the full 10-row table for `-3`).
+goopg has neither a parallel executor nor an explicit `RO_SAFE` early-release, but
+because the outcome is anomaly-free it matches PG 18.3 byte-for-byte regardless —
+the same reason the base member does (section 15).
+
+The lone blocker was the setup DDL `ALTER TABLE foo SET (parallel_workers = 2)`,
+which goopg's parser rejected (`expected ADD or DROP`) — the table-level
+`SET (reloptions)` / `RESET (reloptions)` form was unimplemented. The parallel
+cost GUCs the sessions set (`parallel_setup_cost`, `parallel_tuple_cost`,
+`min_parallel_index_scan_size`, `parallel_leader_participation`, `enable_seqscan`)
+were already registered.
+
+Fix (additive): the parser now recognises `ALTER TABLE name SET (param = value, …)`
+and `RESET (param, …)` (`AlterTableSetReloptions` / `AlterTableResetReloptions` in
+`internal/parser/ast.go`; dispatch in `parseAlterTableAction`, guarded so the
+distinct `SET SCHEMA` / `SET TABLESPACE` / `SET LOGGED` actions still fall through
+to the ADD/DROP path). The executor (`execAlterTableSetReloptions` in
+`internal/executor/operators_ddl.go`) **merges** the named storage parameters into
+the live `catalog.Table` fields that the virtual `pg_class` builder renders into
+`pg_class.reloptions`, so the change is immediately visible to `pg_dump` / `pg_class`
+with no heap re-sync (unlike the `pg_attribute`-backed per-column options). Values
+are bounds-checked with the exact ranges and SQLSTATEs of the `CREATE TABLE WITH`
+path, and — matching PG's statement atomicity — the whole option list is validated
+into a pending set *before* any field is committed, so a multi-option `SET` with
+one out-of-range value leaves the relation untouched (Go map order is unspecified,
+so a field-by-field apply would otherwise leave a nondeterministic partial state).
+`RESET` clears the named parameters back to their unset defaults; unmodelled but
+lowercase option names are accepted and ignored, exactly as `CREATE TABLE WITH`.
+
+Regression: `TestAlterTableSetReloptions{MatchesCreateWith,Merge,Bounds,Atomic}`
+(`internal/executor/operators_alter_set_reloptions_test.go`) pin the sibling-path
+lock-step with `CREATE TABLE WITH`, the merge/RESET semantics, the bounds SQLSTATEs,
+and the all-or-nothing atomicity; `TestPort_IsolationSerializableParallel2` and
+`…Parallel3` pass byte-for-byte vs PG 18.3. Isolation pass count 27 → 29.
 
 ## Status / scope boundary
 
@@ -680,7 +722,10 @@ several parallel-cost GUCs (`min_parallel_index_scan_size`, `enable_seqscan`,
   and `classroom-scheduling` (double-booking write skew; zero SSI change — only
   the `timestamptz` B-tree key type of section 12), and `serializable-parallel`
   (the `read-only-anomaly-2` cycle with a parallel-worker read-only `s3`; zero SSI
-  change — only the `debug_parallel_query` no-op GUC of section 15).
+  change — only the `debug_parallel_query` no-op GUC of section 15), and
+  `serializable-parallel-2` / `-3` (write-free `RO_SAFE` read-only workloads whose
+  outcome is anomaly-free; zero SSI change — only the `ALTER TABLE … SET (reloptions)`
+  DDL of section 16).
 - **Still deferred (same slice family):**
   - `receipt-report` — the `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` parser
     gap is now **fixed** (section 6), so the spec runs end-to-end. Two issues
@@ -698,12 +743,10 @@ several parallel-cost GUCs (`min_parallel_index_scan_size`, `enable_seqscan`,
     `errWALBufferReservedOutOfRange` (`internal/wal/wal_buffer.go`), ~50% of runs.
     Blocked on that WAL race (a different subsystem), NOT on SSI.
     `TestPort_IsolationMultipleRowVersions` is a skip-on-defer anchor.
-  - `read-only-anomaly-3` / the `serializable-parallel-2` / `-3` members — the
-    base `serializable-parallel` now **passes** (section 15: it reuses the
-    section-9 per-tuple SIREAD locks and needed only the `debug_parallel_query`
-    no-op GUC). `read-only-anomaly-3` still needs the `DEFERRABLE` safe-snapshot
-    deferral and the reserved-keyword parser fix (section 6); the
-    `serializable-parallel-2`/`-3` pair additionally needs the `RO_SAFE`
-    read-only-safe-snapshot optimisation and the remaining parallel-cost GUCs.
+  - `read-only-anomaly-3` — the base `serializable-parallel` (section 15) and the
+    `serializable-parallel-2`/`-3` pair (section 16) now **pass**. `read-only-anomaly-3`
+    still needs the `DEFERRABLE` safe-snapshot deferral and the reserved-keyword
+    parser fix (section 6); unlike the parallel pair its workload *does* write, so
+    a genuine `RO_SAFE` safe-snapshot deferral is required, not just the setup DDL.
   Their dedicated `TestPort_Isolation*` functions auto-promote (run, then
   `t.Skip` only on `defer`), so the next slice sees green→pass instantly.

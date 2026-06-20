@@ -479,6 +479,38 @@ func TestPort_IsolationSerializableParallel(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel.spec")
 }
 
+// TestPort_IsolationSerializableParallel2 exercises serializable-parallel-2:
+// a SERIALIZABLE READ ONLY transaction repeatedly counts a table while a
+// concurrent SERIALIZABLE writer commits. Upstream forces parallel index-only
+// scans (ALTER TABLE foo SET (parallel_workers = 2); SET enable_seqscan = off)
+// to drive SXACT_FLAG_RO_SAFE through a parallel worker. goopg has no parallel
+// executor, so the parallel GUCs and reloption are accepted but inert; the
+// read-only transaction never becomes a pivot, so every step commits and the
+// COUNT(*) is a stable 100 — identical to the upstream serial-equivalent output.
+func TestPort_IsolationSerializableParallel2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_serializable_parallel2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel-2.spec")
+}
+
+// TestPort_IsolationSerializableParallel3 exercises serializable-parallel-3:
+// like serializable-parallel-2 but two SERIALIZABLE READ ONLY transactions
+// (s2, s4) run concurrently with the same xmin alongside two read-write
+// SERIALIZABLE transactions (s1, s3), stressing the SXACT_FLAG_RO_SAFE
+// "oldest with this xmin" path in a parallel query. goopg has no parallel
+// executor, so the parallel reloption/GUCs are inert; no read-only
+// transaction becomes a pivot, so every step commits and each SELECT returns
+// the full 10-row table — matching the upstream serial-equivalent output.
+func TestPort_IsolationSerializableParallel3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_serializable_parallel3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel-3.spec")
+}
+
 // TestPort_IsolationUpdateConflictOut exercises update-conflict-out: SSI
 // "conflict out" handling for heapam interacting with a concurrently updated
 // (then aborted) tuple. "bar" must fail with 40001 at bar_commit at the latest.
