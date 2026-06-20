@@ -6318,6 +6318,24 @@ object support.
         **Next (slice 296+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path, OR a string-literal
         generation expression with an embedded backslash / unicode escape to exercise the literal re-quoting against
         `standard_conforming_strings` edge cases.
+      - **PROGRESS 2026-06-20 (loop #64):** **DU-002 slice 296 LANDED — embedded-quote-literal argument in a function-call
+        generation expression `concat(ka, '''', la)` round-trips end-to-end on the pg_dump oracle.** The ADVERSARIAL complement to
+        slices 294 (body `-`) and 295 (body `,`), and the ONLY fixture that exercises slice 294's quote-DOUBLING
+        (`strings.ReplaceAll(t.Value, "'", "''")` in `renderTok`) on the oracle path. The lexer stores a literal's UNQUOTED body, so
+        the SQL four-quote literal `''''` (= a literal containing one `'`) is stored as the single byte `'`. The pre-slice-294 raw
+        space-join emitted the malformed single-quote `concat(ka, ', la)` (lone `'` opening a phantom string); a fix that re-quoted
+        but FORGOT to double the embedded quote would emit the unbalanced three-quote `concat(ka, ''', la)`. With the doubling the
+        literal renders as the balanced four-quote `''''`. TEST-ONLY (no production change) — the unit `embedded_quote_literal` case
+        already exercised the helper directly; this pins it on the ORACLE path. Fixture:
+        `CREATE TABLE public.pgqc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED) PARTITION BY LIST (ka)` +
+        `pgqc_1 PARTITION OF`. Render path identical to slice 295: attgenerated (`'s'`) → `attrdefs[].separate=false`
+        (pg_dump.c:9507), ispartition → `shouldPrintColumn` every column. **Guards:** `TestGeneratedColumnExprCanonicalSpacing` PASS
+        (existing case `embedded_quote_literal` `concat(fa, '''', fb)`); `TestPort_PgDumpConnectionSetup` PASS (4.08s vs real pg_dump
+        18.3 — asserts `pgqc_1` prints the inline `na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED`, the forgot-to-double
+        `concat(ka, ''', la)` is ABSENT, attnum order, ATTACH survives); gofmt + `go vet` clean; pgbench pre-commit smoke on commit.
+        Files: `internal/testport/pgdump_connsetup_test.go` (pgqc fixture + assertion), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 296). **Next (slice 297+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path, OR a
+        string-literal generation expression with an embedded backslash / `E''` escape against `standard_conforming_strings`.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

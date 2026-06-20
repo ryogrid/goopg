@@ -1780,6 +1780,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pgkc_1: %v", err)
 	}
 
+	// Slice 296: a function-call generation expression whose string-literal
+	// argument's BODY IS A SINGLE QUOTE (`concat(ka, '''', la)`) inherited onto a
+	// partition leaf — the adversarial complement to slices 294 (body `-`) and 295
+	// (body `,`). This is the only fixture that exercises slice 294's quote-DOUBLING
+	// (`strings.ReplaceAll(t.Value, "'", "''")` in joinGeneratedExprTokens.renderTok)
+	// on the ORACLE path. The lexer stores a literal's UNQUOTED, un-escaped body, so
+	// the SQL literal `''''` (four quotes = a literal containing one `'`) is stored
+	// as the single byte `'`. The pre-slice-294 helper space-joined that raw byte
+	// into the malformed `concat(ka, ', la)` (the lone `'` opening a phantom string
+	// that swallows the rest of the expression); a fix that re-quoted but FORGOT to
+	// double the embedded quote would emit `concat(ka, ''', la)` (three quotes —
+	// unbalanced). The fix re-quotes AND doubles, so the literal renders as the
+	// balanced four-quote `''''`. Because this test dumps a LIVE goopg server, real
+	// pg_dump reads goopg's stored source verbatim, pinning goopg's own canonical
+	// rendering (no `::text` cast — that pg_get_expr divergence is out of scope, like
+	// slices 290–295). Render path is otherwise identical to slice 295: attgenerated
+	// ('s') forces attrdefs[].separate=false (pg_dump.c:9507) and ispartition forces
+	// shouldPrintColumn for every column, so the leaf pgqc_1 inherits both plain
+	// columns and prints `ka text`, `la text`, then the inline generated
+	// `na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED`. No rows are
+	// inserted, so this rides the dump-time deparse path only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgqc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED) PARTITION BY LIST (ka)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgqc with embedded-quote-literal-argument function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgqc_1 PARTITION OF public.pgqc FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pgqc_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -5086,6 +5114,57 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgkc_1 FOR VALUES IN ('a')") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgkc_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+
+		// **Slice 296 (asserted):** function-call generation expression whose
+		// string-literal argument's BODY IS A SINGLE QUOTE on a partition leaf — the
+		// adversarial complement to slices 294 (body `-`) and 295 (body `,`), and the
+		// only fixture that exercises slice 294's quote-DOUBLING on the oracle path.
+		// The leaf pgqc_1 must print `ka text`, `la text`, then the inline generated
+		// `na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED` — the embedded
+		// quote DOUBLED to the balanced four-quote literal. The regression guards
+		// below pin renderTok's quote-doubling: a fix that re-quoted but forgot to
+		// double the embedded `'` would emit the unbalanced three-quote
+		// `concat(ka, ''', la)`; the pre-slice-294 raw space-join would emit the
+		// single-quote `concat(ka, ', la)` (the lone `'` opening a phantom string).
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgqc_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			kaIdx := strings.Index(block, "ka text")
+			if kaIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgqc_1 block\n  block=%q", "ka text", block)
+			}
+			laIdx := strings.Index(block, "la text")
+			if laIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgqc_1 block\n  block=%q", "la text", block)
+			}
+			naIdx := strings.Index(block, "na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED")
+			if naIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the embedded-quote-literal-argument function-call generated column on a partition leaf; want %q in pgqc_1 block\n  block=%q", "na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED", block)
+			}
+			// Guard against the forgot-to-double regression: the unbalanced
+			// three-quote form must NOT appear (embedded quote re-quoted but not
+			// doubled). `''''` contains `'''` as a substring, so match the full
+			// generated column text minus the trailing quote to isolate the bug.
+			if strings.Contains(block, "concat(ka, ''', la)") {
+				t.Errorf("pg_dump emitted the forgot-to-double malformed generation expr (embedded quote not doubled); got %q in pgqc_1 block\n  block=%q", "concat(ka, ''', la)", block)
+			}
+			// Attnum order: ka (1) before la (2) before na (3).
+			if kaIdx >= 0 && laIdx >= 0 && kaIdx > laIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pgqc_1 block\n  block=%q", "ka", "la", block)
+			}
+			if laIdx >= 0 && naIdx >= 0 && laIdx > naIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgqc_1 block\n  block=%q", "la", "na", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgqc_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgqc_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgqc_1 FOR VALUES IN ('a')", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every

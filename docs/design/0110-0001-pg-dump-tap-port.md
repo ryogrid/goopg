@@ -8532,8 +8532,37 @@ Guards:
   `concat(ka,,,la)` is **absent**, columns are in attnum order, and `ATTACH PARTITION public.pgkc_1 FOR VALUES IN ('a')`
   survives).
 
-> **Next (slice 296+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path, OR a
-> string-literal generation expression with an embedded backslash / unicode escape to exercise the literal re-quoting
+### Slice 296 — embedded-quote-literal argument in a function-call generation expression `concat(ka, '''', la)` (end-to-end on the pg_dump oracle)
+
+The adversarial complement to slices 294 (body `-`) and 295 (body `,`), and the **only** fixture that exercises slice 294's
+quote-**DOUBLING** on the oracle path. Slice 294's `renderTok` re-quotes a `TokenStringLit` by doubling embedded quotes —
+`"'" + strings.ReplaceAll(t.Value, "'", "''") + "'"`. This slice makes the literal body **be a single quote**:
+`concat(ka, '''', la)`. The lexer stores a literal's **unquoted, un-escaped** body, so the SQL four-quote literal `''''`
+(= a literal containing one `'`) is stored as the single byte `'`. The pre-slice-294 raw space-join emitted the malformed
+single-quote `concat(ka, ', la)` (the lone `'` opening a phantom string that swallows the rest of the expression); a fix
+that re-quoted but **forgot to double** the embedded quote would emit the unbalanced three-quote `concat(ka, ''', la)`.
+With the doubling, the literal renders as the balanced four-quote `''''`. TEST-ONLY — no production change; pins slice
+294's quote-doubling on the **oracle** path (the unit `embedded_quote_literal` case already exercised the helper directly).
+
+`CREATE TABLE pgqc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED) PARTITION BY LIST (ka)`
+with leaf `pgqc_1 PARTITION OF pgqc FOR VALUES IN ('a')`. Dumping a **live goopg server**, real pg_dump reads goopg's
+stored generation source verbatim, so the assertion pins goopg's own canonical rendering `concat(ka, '''', la)` (no
+`::text` cast — that pg_get_expr divergence is out of scope, like slices 290–295). Render path is otherwise identical to
+slices 281–295: attgenerated (`'s'`) forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces
+`shouldPrintColumn` for every column, so the leaf `pgqc_1` inherits both plain columns and prints `ka text`, `la text`,
+then the inline `na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED`. No rows are inserted, so this rides the
+dump-time deparse path only. Verified vs PG 18.3.
+
+Guards:
+- `TestGeneratedColumnExprCanonicalSpacing` (parser unit, existing case `embedded_quote_literal`): `concat(fa, '''', fb)` →
+  `concat(fa, '''', fb)`.
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgqc_1` block prints `ka text`, `la text`,
+  then the inline `na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED`, that the forgot-to-double malformed
+  `concat(ka, ''', la)` is **absent**, columns are in attnum order, and `ATTACH PARTITION public.pgqc_1 FOR VALUES IN ('a')`
+  survives).
+
+> **Next (slice 297+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path, OR a
+> string-literal generation expression with an embedded backslash / E'' escape to exercise the literal re-quoting
 > against `standard_conforming_strings` edge cases.
 
 ## Deferred (002–010) — catalog surface estimate
