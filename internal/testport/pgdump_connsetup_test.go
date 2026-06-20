@@ -2278,6 +2278,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table defcol with function-call default: %v", err)
 	}
 
+	// Slice 302: a column DEFAULT containing a UNARY MINUS. The parser tags `-x`
+	// with OpUnaryNeg (NOT OpSub — that is binary subtraction `a - b`), but both
+	// deparse twins (catalog.formatExprForAttrdef / executor.defaultExprToSQL)
+	// only handled `case parser.OpSub`, so a unary-minus default NEVER matched and
+	// fell through to fmt.Sprintf("%v", e) — dumping a Go pointer string like
+	// `&{0 - 0xc0001a2f00}` and corrupting every `DEFAULT -…` clause pg_dump
+	// re-emits. Both twins now key on OpUnaryNeg. For a unary minus on a COMPOUND
+	// operand (an OpExpr PG does NOT constant-fold) PG's get_rule_expr deparses
+	// `(- (operand))`, byte-identical to real pg_dump 18.3 (verified):
+	//   nb integer DEFAULT (- (1 + 2))
+	//   nc integer DEFAULT ((- (1 + 2)) * 3)
+	// (A unary minus applied DIRECTLY to a numeric literal — `DEFAULT -5` — is
+	// folded by PG's parser into a negative typed Const and deparsed as
+	// `'-5'::integer`; goopg is type-blind in this renderer and emits the
+	// re-parseable `-5` instead. That bare-literal `'-N'::type` cast form is a
+	// separate, deferred slice, so this fixture exercises only the byte-identical
+	// COMPOUND cases.) The `nb`/`nc` columns guard the unary-minus path
+	// end-to-end through real pg_dump.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.negdef (id integer, nb integer DEFAULT -(1 + 2), nc integer DEFAULT -(1 + 2) * 3)"); err != nil {
+		t.Fatalf("create table negdef with unary-minus default: %v", err)
+	}
+
 	// Slice 182: a per-column storage override (`ALTER TABLE ... ALTER COLUMN
 	// ... SET STORAGE <mode>`) must survive the dump. pg_dump compares
 	// pg_attribute.attstorage against the column type's typstorage and emits the
@@ -3652,6 +3674,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// assertion below. The `$1` body forces the `$_$` delimiter (same as add_default).
 	if err := runSQLSimple(t, c, "CREATE FUNCTION public.add_calcdef(a integer DEFAULT (1 + 2) * 3) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
 		t.Fatalf("create function add_calcdef: %v", err)
+	}
+
+	// Slice 302 (executor twin): a FUNCTION-ARGUMENT default with a UNARY MINUS on
+	// a compound operand. pg_dump reconstructs the signature from
+	// pg_get_function_arguments(oid), which goopg answers from the deparse-canonical
+	// string stored in catalog.Routine.ArgDefaults (the parser's `a.Default` →
+	// executor.defaultExprToSQL at CREATE FUNCTION time). Before slice 302 the
+	// unary minus matched no arm (OpUnaryNeg vs the dead OpSub case) and stored a Go
+	// pointer string; it now renders `(- (1 + 2))`, byte-identical to real pg_dump
+	// 18.3 (verified):
+	//   CREATE FUNCTION public.fneg(x integer DEFAULT (- (1 + 2))) RETURNS integer
+	// The `$1` body forces the `$_$` delimiter (same as add_calcdef/add_default).
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.fneg(x integer DEFAULT -(1 + 2)) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function fneg: %v", err)
 	}
 
 	// Slice 161: a SET-RETURNING function (`RETURNS SETOF integer`). Every prior
@@ -5853,6 +5889,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 				t.Errorf("pg_dump emitted the precedence-corrupted (un-parenthesized) nested-arithmetic default `DEFAULT 1 + 2 * 3`\n  block=%q", block)
 			}
 		}
+		// **Slice 302 (asserted):** a UNARY-MINUS column DEFAULT on a compound
+		// operand. The parser tags unary minus with OpUnaryNeg (NOT OpSub), but
+		// both deparse twins only handled OpSub — so a `DEFAULT -…` fell through to
+		// fmt.Sprintf("%v", e) and dumped a Go pointer string. `negdef.nb` carries
+		// `DEFAULT -(1 + 2)` and `negdef.nc` carries `DEFAULT -(1 + 2) * 3`. PG's
+		// get_rule_expr deparses a unary minus on a non-folded OpExpr as
+		// `(- (operand))`, so real pg_dump 18.3 emits `DEFAULT (- (1 + 2))` and
+		// `DEFAULT ((- (1 + 2)) * 3)` (empirically verified). Assert the PG-faithful
+		// forms.
+		for _, sub := range []string{
+			"nb integer DEFAULT (- (1 + 2))",
+			"nc integer DEFAULT ((- (1 + 2)) * 3)",
+		} {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/corrupted a unary-minus default; want %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// Guard the pre-fix corruption shape: the OpUnaryNeg fall-through dumped a
+		// Go pointer string `&{… - 0x…}`. Its `DEFAULT &{` form must NOT appear.
+		if strings.Contains(res.Stdout, "DEFAULT &{") {
+			t.Errorf("pg_dump emitted the pre-fix Go-pointer-string corruption for a unary-minus default (`DEFAULT &{…}`)\n  full stdout=%q", res.Stdout)
+		}
 		// **Slice 182 (asserted):** per-column storage overrides. `storcol.a` was
 		// SET STORAGE EXTERNAL and `storcol.b` SET STORAGE MAIN; both differ from
 		// text's EXTENDED default, so pg_dump must re-emit each as a standalone
@@ -6458,6 +6516,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// Negative guard: the precedence-corrupted one-paren-short form must NOT appear.
 		if strings.Contains(res.Stdout, "add_calcdef(a integer DEFAULT (1 + 2) * 3)") {
 			t.Errorf("pg_dump emitted the one-paren-short add_calcdef default (re-parses with wrong precedence)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 302 (asserted, executor twin):** a UNARY-MINUS function-argument
+		// default. pg_dump rebuilds the signature from pg_get_function_arguments,
+		// which goopg answers from catalog.Routine.ArgDefaults (populated via
+		// executor.defaultExprToSQL). Before slice 302 the unary minus matched the
+		// dead OpSub arm and stored a Go pointer string; it now renders
+		// `(- (1 + 2))`, so real pg_dump 18.3 emits (empirically verified):
+		//   CREATE FUNCTION public.fneg(x integer DEFAULT (- (1 + 2))) RETURNS integer
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.fneg(x integer DEFAULT (- (1 + 2))) RETURNS integer") {
+			t.Errorf("pg_dump dropped/corrupted fneg's unary-minus parameter default; want %q\n  full stdout=%q", "DEFAULT (- (1 + 2))", res.Stdout)
 		}
 		// **Slice 161 (asserted):** the SET-RETURNING function (gen_one) must
 		// round-trip its `RETURNS SETOF integer` return clause. pg_dump reads

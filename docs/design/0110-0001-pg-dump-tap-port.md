@@ -8736,6 +8736,41 @@ plus a negative guard that the one-paren-short `DEFAULT (1 + 2) * 3` (re-parses 
 > a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path, or the keyword-vs-literal `MINVALUE`
 > partition-bound ambiguity noted in slice 169's deferral.
 
+### Slice 302 — **unary-minus DEFAULT** `-(1 + 2)` → `DEFAULT (- (1 + 2))` (PRODUCTION fix — both twins)
+
+A latent **opcode bug** in *both* default-deparse twins. The parser tags a unary minus `-x` with `OpUnaryNeg`
+(`select.go:2420`), but `catalog.formatExprForAttrdef` and `executor.defaultExprToSQL` both had only a
+`case parser.OpSub` arm — and `OpSub` is **binary** subtraction `a - b`, never emitted for a unary minus. So a real
+`DEFAULT -…` matched no arm and fell through to `fmt.Sprintf("%v", e)`, dumping a Go pointer string like
+`&{0 - 0xc0001a2f00}` and corrupting every unary-minus default pg_dump re-emits. (The pre-existing unit test
+`TestFormatExprForAttrdefExpr` masked this by manually constructing `UnaryOp{Op: OpSub}` — a node the parser never
+produces — so the test was green while the live path was broken: a sibling-path divergence.)
+
+Both twins now key on `parser.OpUnaryNeg`, mirroring PG's `get_rule_expr`:
+
+- **Bare numeric operand** (`DEFAULT -5`): PG's parser folds `- ICONST` into a negative typed `Const` at parse time
+  (`gram.y` `doNegate`), which `pg_get_expr` deparses as `'-5'::integer`. goopg is **type-blind** in this renderer, so it
+  emits the re-parseable `-5` (semantically identical; byte-differs from PG's `'-N'::type`). Matching the exact cast form
+  needs the column/argument type — **deferred** to a future slice.
+- **Compound operand** (`DEFAULT -(1 + 2)`, an `OpExpr` PG does **not** fold): `get_rule_expr` deparses `(- (operand))`.
+  goopg now emits `"(- " + operand + ")"`; the recursion parenthesizes the operand, byte-identical to real pg_dump 18.3.
+
+| input default | goopg (pre-302) | goopg (post-302) | real pg_dump 18.3 |
+|---|---|---|---|
+| `-5` | `&{0 - 0x…}` (garbage) | `-5` | `'-5'::integer` (deferred) |
+| `-(1 + 2)` | `&{0 - 0x…}` (garbage) | `(- (1 + 2))` | `(- (1 + 2))` ✓ |
+| `-(1 + 2) * 3` | `(&{…} * 3)` (garbage) | `((- (1 + 2)) * 3)` | `((- (1 + 2)) * 3)` ✓ |
+
+Guards: unit twins `TestFormatExprForAttrdefExpr` / `TestDefaultExprToSQLBinaryParen` (corrected to `OpUnaryNeg`; new
+"unary minus literal" + "unary minus compound" cases). End-to-end `TestPort_PgDumpConnectionSetup` (real pg_dump 18.3):
+table `public.negdef` pins `nb integer DEFAULT (- (1 + 2))` and `nc integer DEFAULT ((- (1 + 2)) * 3)`, function
+`public.fneg(x integer DEFAULT (- (1 + 2)))` pins the executor twin via `pg_get_function_arguments`, plus a negative
+guard that the pre-fix `DEFAULT &{` Go-pointer corruption does **not** appear.
+
+> **Next (slice 303+):** the bare-literal `'-N'::type` typed-Const form (needs column/argument type threaded into the
+> renderer); `OpUnaryPos` (`+x`) / `OpBitNot` (`~x`) unary-default arms (still fall through to `fmt.Sprintf` garbage); or
+> a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

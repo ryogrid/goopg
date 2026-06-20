@@ -3477,8 +3477,27 @@ func defaultExprToSQL(e parser.Expr) string {
 		return defaultExprToSQL(v.Operand) + "::" + v.Type.Name
 	case *parser.UnaryOp:
 		switch v.Op {
-		case parser.OpSub:
-			return "-" + defaultExprToSQL(v.Operand)
+		case parser.OpUnaryNeg:
+			// Unary minus. The parser tags `-x` with OpUnaryNeg (NOT OpSub —
+			// OpSub is binary subtraction); the previous `case parser.OpSub` arm
+			// never matched a real unary minus, so a `DEFAULT -…` fell through to
+			// fmt.Sprintf("%v") and dumped a Go pointer string (DU-002 slice 302).
+			// PG's parser folds a unary minus applied DIRECTLY to a numeric literal
+			// into a negative typed Const at parse time (gram.y doNegate), which
+			// pg_get_expr deparses as `'-N'::type`. goopg is type-blind in this
+			// renderer, so for a bare numeric operand it emits the re-parseable
+			// `-N` (semantically identical; byte-differs from PG's `'-N'::type` —
+			// matching that cast form needs column/argument type and is deferred).
+			// For a unary minus on a COMPOUND operand (an OpExpr PG does NOT fold),
+			// get_rule_expr deparses `(- (operand))`; the recursion parenthesizes
+			// the operand, so mirror that exact form. Keep in sync with the catalog
+			// twin catalog.formatExprForAttrdef.
+			switch v.Operand.(type) {
+			case *parser.IntegerConst, *parser.NumericConst:
+				return "-" + defaultExprToSQL(v.Operand)
+			default:
+				return "(- " + defaultExprToSQL(v.Operand) + ")"
+			}
 		case parser.OpNot:
 			return "NOT " + defaultExprToSQL(v.Operand)
 		}

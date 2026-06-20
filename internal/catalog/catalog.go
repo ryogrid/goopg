@@ -7918,10 +7918,25 @@ func formatExprForAttrdef(e parser.Expr) string {
 		// the column typmod on restore. DU-002 slice 176.
 		return formatExprForAttrdef(v.Operand) + "::" + v.Type.Name
 	case *parser.UnaryOp:
-		// `DEFAULT -1` parses to UnaryOp(OpSub, IntegerConst). Mirror the executor twin.
+		// `DEFAULT -1` parses to UnaryOp(OpUnaryNeg, IntegerConst) — the parser
+		// tags unary minus with OpUnaryNeg, NOT OpSub (OpSub is binary `a - b`).
+		// The previous `case parser.OpSub` arm never matched a real unary minus, so
+		// a `DEFAULT -…` fell through to fmt.Sprintf("%v") and corrupted the dump
+		// with a Go pointer string (DU-002 slice 302). PG's parser folds a unary
+		// minus applied DIRECTLY to a numeric literal into a negative typed Const
+		// (gram.y doNegate), deparsed by pg_get_expr as `'-N'::type`; goopg is
+		// type-blind here so it emits the re-parseable `-N` for that case (matching
+		// the `'-N'::type` cast needs the column type — deferred). For a unary minus
+		// on a COMPOUND operand (an OpExpr PG does NOT fold), get_rule_expr deparses
+		// `(- (operand))`. Mirror the executor twin executor.defaultExprToSQL.
 		switch v.Op {
-		case parser.OpSub:
-			return "-" + formatExprForAttrdef(v.Operand)
+		case parser.OpUnaryNeg:
+			switch v.Operand.(type) {
+			case *parser.IntegerConst, *parser.NumericConst:
+				return "-" + formatExprForAttrdef(v.Operand)
+			default:
+				return "(- " + formatExprForAttrdef(v.Operand) + ")"
+			}
 		case parser.OpNot:
 			return "NOT " + formatExprForAttrdef(v.Operand)
 		}

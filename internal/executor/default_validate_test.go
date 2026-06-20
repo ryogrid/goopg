@@ -163,6 +163,21 @@ func TestDefaultExprToSQLBinaryParen(t *testing.T) {
 				Right: &parser.IntegerConst{Value: 0}},
 			"(((qty + id) * mgr_id) > 0)",
 		},
+		{
+			// Unary minus is tagged OpUnaryNeg (NOT OpSub); a bare numeric operand
+			// renders `-N` (PG folds it to `'-N'::type`, deferred). DU-002 slice 302.
+			"unary minus literal",
+			&parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: &parser.IntegerConst{Value: 1}},
+			"-1",
+		},
+		{
+			// Unary minus on a COMPOUND operand deparses `(- (operand))`,
+			// byte-identical to real pg_dump 18.3. Twin of the catalog renderer's
+			// "unary minus compound" case; the two MUST stay in sync. DU-002 slice 302.
+			"unary minus compound",
+			&parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: &parser.BinaryOp{Op: parser.OpAdd, Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 2}}},
+			"(- (1 + 2))",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
