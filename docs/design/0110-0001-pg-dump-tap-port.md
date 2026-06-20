@@ -8355,10 +8355,41 @@ Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts th
 `cb text` before the inline `cc text GENERATED ALWAYS AS (ca || cb) STORED`, and that
 `ATTACH PARTITION public.pgcc_1 FOR VALUES IN ('x')` survives).
 
-> **Next (slice 289+):** the FuncExpr generation deparse (`upper(name)`) now that it is the natural frontier — this is a
-> genuine production slice: canonicalize `GeneratedExpr` so a parsed-then-deparsed function call renders without the
-> token-join spaces (`upper(fn)`, not `upper ( fn )`). Alternatively, a multi-column / NULL-typed DEFAULT variant on the
-> partition-leaf ALTER path.
+### Slice 289 — parenthesised generation expression `(fa + fb) * 2` (PRODUCTION: canonical `GeneratedExpr` deparse)
+
+Every prior generation slice (283–288) used a **flat** operator chain (`ga * 2`, `ga + gc`, `ma + 1 + mc`, `ca || cb`),
+whose captured tokens space-join faithfully. The **first** parenthesised / function-call generation expression exposed a
+deparse defect: goopg captured the `GENERATED ALWAYS AS (...)` body as raw lexer tokens and joined them with single
+spaces (`strings.Join(toks, " ")`), so `(fa + fb) * 2` became `( fa + fb ) * 2` and `upper(fn)` became `upper ( fn )`.
+pg_dump wraps the stored source `(%s)`, so goopg emitted `(( fa + fb ) * 2)` where real pg_dump's `pg_get_expr` renders
+the precedence paren **tight**: `((fa + fb) * 2)`. The two diverged, and any function-call or parenthesised generation
+column failed the round-trip.
+
+**Production fix (this slice):** `joinGeneratedExprTokens` (parser/ddl.go) reconstructs `pg_get_expr`'s spacing from the
+captured token stream — tight function calls (`upper(fn)`), `, `-separated argument lists (`coalesce(a, b)`), tight
+grouping/precedence parens (`(fa + fb) * 2`), tight qualified names (`schema.fn`), spaced binary operators. It keys off
+punctuation + the previous token's `Kind` (a `(` is tight when it follows an identifier or `)` — a call paren — and
+spaced otherwise — a grouping paren). Both `GeneratedExpr` capture sites (the column-def path and the
+`PARTITION OF (... WITH OPTIONS GENERATED ALWAYS AS ...)` override path) now route through this helper. The result
+re-parses to the same node, so `evalGeneratedExpr` (which re-parses the stored string for materialization) is
+unaffected, and every flat-chain slice (283–288) keeps its byte-identical stored source.
+
+The render path is otherwise identical to slices 283–288: `attgenerated` ('s') forces `attrdefs[].separate=false`
+(pg_dump.c:9507) and `ispartition` forces `shouldPrintColumn` for every column (slices 281/282), so the leaf
+`CREATE TABLE pgpp_1 PARTITION OF pgpp FOR VALUES IN (1)` inherits all three columns and prints `fa integer`,
+`fb integer`, then the inline `fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED`. Verified vs PG 18.3.
+
+Guards:
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgpp_1` block prints the inline
+  `fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED` with the inner precedence paren **tight**, in attnum order, and
+  that `ATTACH PARTITION public.pgpp_1 FOR VALUES IN (1)` survives).
+- `TestGeneratedColumnExprCanonicalSpacing` (parser, no server — pins the canonical spacing for function calls, two-arg
+  calls, grouping parens, a nested call inside arithmetic, plain operator chains, and `||`).
+
+> **Next (slice 290+):** the function-call generation deparse end-to-end (`upper(fn)`) — the parser-level canonicalization
+> is now in place and unit-tested; the remaining work is confirming goopg's CREATE-TABLE + materialization path accepts a
+> function-call generation expression so it can also ride the pg_dump oracle. Alternatively, a multi-column / NULL-typed
+> DEFAULT variant on the partition-leaf ALTER path.
 
 ## Deferred (002–010) — catalog surface estimate
 

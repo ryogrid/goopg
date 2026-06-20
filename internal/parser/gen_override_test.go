@@ -143,6 +143,51 @@ func TestPartitionChildTablespaceAfterWith(t *testing.T) {
 	}
 }
 
+// TestGeneratedColumnExprCanonicalSpacing covers DU-002 slice 289: the stored
+// GeneratedExpr text must reproduce pg_get_expr's spacing so pg_dump round-trips
+// function-call and parenthesised generation expressions. PG stores the
+// expression as a parsed node and pg_dump re-emits it via pg_get_expr, which
+// renders function calls tightly (`upper(fn)`), argument lists with `, `
+// (`coalesce(a, b)`), grouping/precedence parens tightly (`(a + b) * 2`), and
+// spaces binary operators. A naive space-join of the captured tokens produced
+// `upper ( fn )` / `( a + b ) * 2`, which diverged from pg_get_expr and broke the
+// pg_dump round-trip. joinGeneratedExprTokens fixes the spacing; the result must
+// also re-parse to the same node (evalGeneratedExpr re-parses the stored string),
+// which `SELECT <expr>` parsing here confirms implicitly.
+func TestGeneratedColumnExprCanonicalSpacing(t *testing.T) {
+	cases := []struct {
+		name string
+		expr string
+		want string
+	}{
+		{"func_call", "upper(fn)", "upper(fn)"},
+		{"func_two_args", "coalesce(fn, gn)", "coalesce(fn, gn)"},
+		{"grouping_parens", "(fa + fb) * 2", "(fa + fb) * 2"},
+		{"nested_call_in_arith", "upper(fn) || gn", "upper(fn) || gn"},
+		{"plain_operator_chain", "fa + fb + 1000", "fa + fb + 1000"},
+		{"concat", "fa || fb", "fa || fb"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sql := "CREATE TABLE g (fa text, fb text, fn text, gn text, b text GENERATED ALWAYS AS (" + tc.expr + ") STORED)"
+			stmts, err := Parse(sql)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			ct := stmts[0].(*CreateTableStmt)
+			var got string
+			for i := range ct.Columns {
+				if ct.Columns[i].Name == "b" {
+					got = ct.Columns[i].GeneratedExpr
+				}
+			}
+			if got != tc.want {
+				t.Errorf("GeneratedExpr = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestGeneratedColumnStorageStrategy covers DU-002 slice 194: a generated
 // column records its declared storage strategy (STORED vs VIRTUAL) so
 // pg_attribute.attgenerated can report the PG-faithful 'v'/'s' code and pg_dump

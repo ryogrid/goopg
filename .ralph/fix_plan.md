@@ -6169,6 +6169,33 @@ object support.
         real pg_dump's `upper(fn)`; it needs expression canonicalization (a production change), now the slice 289 frontier.
         **Next (slice 289+):** the FuncExpr generation deparse production slice (canonicalize `GeneratedExpr`), OR a
         multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+      - **PROGRESS 2026-06-20 (loop #57):** **DU-002 slice 289 LANDED — PRODUCTION fix: canonical `GeneratedExpr` deparse.**
+        The FIRST parenthesised generation expression (`(fa + fb) * 2`) inherited onto a partition leaf round-trips. Every
+        prior generation slice (283–288) used a FLAT operator chain whose captured lexer tokens space-join faithfully; a
+        parenthesised (or function-call) body exposed a deparse defect — goopg captured the `GENERATED ALWAYS AS (...)` body
+        as raw tokens and joined them with single spaces (`strings.Join(toks, " ")`), so `(fa + fb) * 2` became
+        `( fa + fb ) * 2` (and `upper(fn)` → `upper ( fn )`). pg_dump wraps the source `(%s)`, so goopg emitted
+        `(( fa + fb ) * 2)` where real pg_dump's `pg_get_expr` renders the precedence paren TIGHT: `((fa + fb) * 2)`. **Fix:**
+        new `joinGeneratedExprTokens` (parser/ddl.go) reconstructs `pg_get_expr`'s spacing from the captured token stream —
+        tight function calls (`upper(fn)`), `, `-separated args (`coalesce(a, b)`), tight grouping parens (`(fa + fb) * 2`),
+        tight qualified names, spaced binary operators — keying off punctuation + the previous token's `Kind` (a `(` is tight
+        after an identifier/`)` = call paren, spaced otherwise = grouping paren). BOTH `GeneratedExpr` capture sites (column-
+        def + `PARTITION OF (... WITH OPTIONS GENERATED ALWAYS AS ...)` override) now route through it. The result re-parses
+        to the same node, so `evalGeneratedExpr` (re-parses the stored string for materialization) is unaffected and every
+        flat-chain slice (283–288) keeps its byte-identical stored source. Render path otherwise identical to 283–288
+        (attgenerated 's' → `attrdefs[].separate=false` pg_dump.c:9507; ispartition → shouldPrintColumn every column).
+        Fixture: `CREATE TABLE public.pgpp (fa integer, fb integer, fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED)
+        PARTITION BY LIST (fa)` + `CREATE TABLE public.pgpp_1 PARTITION OF public.pgpp FOR VALUES IN (1)`. **Guards:**
+        `TestPort_PgDumpConnectionSetup` PASS (4.07s; vs real pg_dump 18.3 — asserts the `pgpp_1` block prints inline
+        `fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED` with the inner paren TIGHT, in attnum order, ATTACH survives);
+        `TestGeneratedColumnExprCanonicalSpacing` (parser, no server — pins canonical spacing for func calls, two-arg calls,
+        grouping parens, nested call in arithmetic, plain chains, `||`); `go test ./internal/{parser,executor,catalog}/`
+        PASS; gofmt + `go vet` clean; pgbench pre-commit smoke on commit. Files: `internal/parser/ddl.go` (helper + both
+        capture sites → `[]Token`), `internal/parser/gen_override_test.go` (new test), `internal/testport/
+        pgdump_connsetup_test.go` (pgpp fixture + assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 289).
+        **Next (slice 290+):** function-call generation deparse END-TO-END (`upper(fn)`) — parser canonicalization is in
+        place + unit-tested; remaining work is confirming CREATE-TABLE + materialization accepts a function-call generation
+        expr so it can ride the pg_dump oracle. OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

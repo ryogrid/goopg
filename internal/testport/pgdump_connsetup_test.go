@@ -1604,6 +1604,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pgcc_1: %v", err)
 	}
 
+	// Slice 289: a generation expression with PRECEDENCE-GROUPING PARENS
+	// (`(fa + fb) * 2`) inherited onto a partition leaf. Every prior generation
+	// slice (283–288) used a FLAT operator chain (`ga * 2`, `ga + gc`, `ca || cb`)
+	// whose captured tokens space-join faithfully. A parenthesised expression
+	// exposed a deparse defect: goopg captured the GENERATED expression as raw
+	// tokens and joined them with single spaces, so `(fa + fb) * 2` became
+	// `( fa + fb ) * 2` — and pg_dump wrapped that to `(( fa + fb ) * 2)`, which
+	// diverges from real pg_dump's `((fa + fb) * 2)` (pg_get_expr renders the
+	// precedence paren tightly). This slice carries the PRODUCTION fix:
+	// joinGeneratedExprTokens (parser/ddl.go) reconstructs pg_get_expr's spacing —
+	// tight grouping parens and tight function calls, spaced binary operators — so
+	// the stored generation source now matches pg_get_expr verbatim. The render
+	// path is otherwise identical to slices 283–288: attgenerated ('s') forces
+	// attrdefs[].separate=false (pg_dump.c:9507) and ispartition forces
+	// shouldPrintColumn for every column (slices 281/282), so the leaf pgpp_1
+	// inherits all three columns and prints `fa integer`, `fb integer`, then the
+	// inline `fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED`. Before the
+	// fix this slice failed against the real-pg_dump oracle with the spurious
+	// inner spaces.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgpp (fa integer, fb integer, fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED) PARTITION BY LIST (fa)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgpp with parenthesised generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgpp_1 PARTITION OF public.pgpp FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pgpp_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4613,6 +4639,47 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgcc_1 FOR VALUES IN ('x')") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgcc_1 FOR VALUES IN ('x')", res.Stdout)
+		}
+		// **Slice 289 (asserted):** a generation expression with precedence-grouping
+		// parens (`(fa + fb) * 2`). This is the FIRST generation slice with nested
+		// parens; it pins the production deparse fix (joinGeneratedExprTokens). The
+		// leaf pgpp_1 must print `fa integer`, `fb integer`, then the inline
+		// generated `fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED` — with
+		// the inner precedence paren rendered TIGHT (`(fa + fb)`, not `( fa + fb )`),
+		// matching real pg_dump's pg_get_expr. A regression to the naive space-join
+		// would reintroduce the spurious inner spaces and fail the exact-substring
+		// check below.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgpp_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			faIdx := strings.Index(block, "fa integer")
+			if faIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgpp_1 block\n  block=%q", "fa integer", block)
+			}
+			fbIdx := strings.Index(block, "fb integer")
+			if fbIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgpp_1 block\n  block=%q", "fb integer", block)
+			}
+			fcIdx := strings.Index(block, "fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED")
+			if fcIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the parenthesised generated column on a partition leaf; want %q in pgpp_1 block\n  block=%q", "fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED", block)
+			}
+			// Attnum order: fa (1) before fb (2) before fc (3).
+			if faIdx >= 0 && fbIdx >= 0 && faIdx > fbIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pgpp_1 block\n  block=%q", "fa", "fb", block)
+			}
+			if fbIdx >= 0 && fcIdx >= 0 && fbIdx > fcIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgpp_1 block\n  block=%q", "fb", "fc", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgpp_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgpp_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgpp_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every

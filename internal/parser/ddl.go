@@ -1563,27 +1563,27 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 								p.advance() // consume AS
 								if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 									p.advance() // consume (
-									var exprToks []string
+									var exprToks []Token
 									exprDepth := 1
 									for exprDepth > 0 && p.cur().Kind != TokenEOF {
 										tok := p.cur()
 										if tok.Kind == TokenSymbol && tok.Value == "(" {
 											exprDepth++
-											exprToks = append(exprToks, tok.Value)
+											exprToks = append(exprToks, tok)
 										} else if tok.Kind == TokenSymbol && tok.Value == ")" {
 											exprDepth--
 											if exprDepth > 0 {
-												exprToks = append(exprToks, tok.Value)
+												exprToks = append(exprToks, tok)
 											}
 										} else {
-											exprToks = append(exprToks, tok.Value)
+											exprToks = append(exprToks, tok)
 										}
 										p.advance()
 									}
 									_ = p.acceptIdentKeyword("stored")
 									poc.ColGeneratedExprs = append(poc.ColGeneratedExprs, PartitionColGenerated{
 										ColName: curColName,
-										Expr:    strings.Join(exprToks, " "),
+										Expr:    joinGeneratedExprTokens(exprToks),
 									})
 								}
 							}
@@ -2454,6 +2454,55 @@ func normalizeCompressionMethod(method string) string {
 }
 
 // parseColumnDef parses `name TYPE [NOT NULL | PRIMARY KEY]`.
+// joinGeneratedExprTokens reconstructs the canonical SQL text of a
+// `GENERATED ALWAYS AS (...)` expression from its captured token stream. PG
+// stores the generation expression as a parsed node and pg_dump re-emits it via
+// pg_get_expr, which renders function calls tightly (`upper(fn)`,
+// `coalesce(a, b)`) and precedence-grouping parens tightly (`(a + b) * 2`) while
+// spacing binary operators. A naive strings.Join(toks, " ") produced
+// `upper ( fn )` / `( a + b ) * 2`, diverging from pg_get_expr and breaking the
+// pg_dump round-trip for any function-call or parenthesised generation
+// expression. This join keys off punctuation to match pg_get_expr's spacing for
+// the operator / function-call / grouping-paren / qualified-name surface goopg
+// supports. The result re-parses to the same node, so evalGeneratedExpr (which
+// re-parses the stored string) is unaffected. DU-002 slice 289.
+func joinGeneratedExprTokens(toks []Token) string {
+	var b strings.Builder
+	for i, t := range toks {
+		if i == 0 {
+			b.WriteString(t.Value)
+			continue
+		}
+		prev := toks[i-1]
+		noSpace := false
+		switch t.Value {
+		case ")", ",":
+			// Never a space before a close-paren or an argument comma.
+			noSpace = true
+		case "(":
+			// Tight before a call paren (prev is a function name or a closing
+			// paren); spaced before a grouping paren (prev is an operator,
+			// keyword, or open paren).
+			if prev.Kind == TokenIdent || prev.Kind == TokenQuotedIdent || prev.Value == ")" {
+				noSpace = true
+			}
+		case ".":
+			// Qualified name (`schema.func`): no space around the dot.
+			noSpace = true
+		}
+		// Tight after an open paren or a dot; the comma's trailing space is
+		// supplied by the default branch (the token after a comma is spaced).
+		if prev.Value == "(" || prev.Value == "." {
+			noSpace = true
+		}
+		if !noSpace {
+			b.WriteByte(' ')
+		}
+		b.WriteString(t.Value)
+	}
+	return b.String()
+}
+
 func (p *parser) parseColumnDef() (ColumnDef, error) {
 	pos := p.cur().Pos
 	nameTok, err := p.parseIdent()
@@ -2570,10 +2619,13 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			if !p.acceptSymbol("(") {
 				return ColumnDef{}, p.errAtCur("expected '(' after GENERATED ALWAYS AS")
 			}
-			// Collect the raw expression text.
+			// Collect the raw expression tokens (kind + value) so the canonical
+			// join below can reproduce pg_get_expr's spacing — tight function
+			// calls (`upper(fn)`) and grouping parens (`(a + b) * 2`), spaced
+			// binary operators. DU-002 slice 289.
 			depth := 1
 			start := p.cur().Pos
-			var exprToks []string
+			var exprToks []Token
 			for depth > 0 && p.cur().Kind != TokenEOF {
 				t := p.cur()
 				if t.Kind == TokenSymbol && t.Value == "(" {
@@ -2584,7 +2636,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 						break
 					}
 				}
-				exprToks = append(exprToks, t.Value)
+				exprToks = append(exprToks, t)
 				p.advance()
 				_ = start
 			}
@@ -2604,7 +2656,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				col.GeneratedVirtual = true
 			}
 			col.GeneratedAlways = true
-			col.GeneratedExpr = strings.Join(exprToks, " ")
+			col.GeneratedExpr = joinGeneratedExprTokens(exprToks)
 		// WITH OPTIONS modifier in PARTITION OF column override (M0096-0007)
 		case p.acceptIdentKeyword("with"):
 			if p.acceptIdentKeyword("options") {
