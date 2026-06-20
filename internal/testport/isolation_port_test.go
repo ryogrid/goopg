@@ -487,6 +487,19 @@ func TestPort_IsolationMultipleRowVersions(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/multiple-row-versions.spec")
 }
 
+// TestPort_IsolationPredicateLockHotTuple exercises predicate-lock-hot-tuple:
+// two SERIALIZABLE transactions each SELECT i IN (5,7) then UPDATE one of the
+// two rows. The reads cross-cover the other writer's target row, forming a
+// write-skew dangerous structure, so the later committer (s2) must abort with
+// 40001.
+func TestPort_IsolationPredicateLockHotTuple(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_pred_lock_hot")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/predicate-lock-hot-tuple.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()
