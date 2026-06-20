@@ -1509,8 +1509,20 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						ctx.PendingEnumRenames = nil
 						ctx.PendingCreatedEnums = nil
 						ctx.PendingCreatedComposites = nil
+						// Primary message is the bare upstream errmsg; the reason
+						// code rides in DETAIL (predicate.c parity). isolationtester
+						// and psql print only the errmsg line.
+						var ssiFields []protocol.ErrorField
+						if sfe, ok := ssiErr.(*mvcc.SerializationFailureError); ok {
+							if d := sfe.Detail(); d != "" {
+								ssiFields = append(ssiFields,
+									protocol.ErrorField{Code: protocol.FieldDetail, Value: d},
+									protocol.ErrorField{Code: protocol.FieldHint, Value: "The transaction might succeed if retried."})
+							}
+						}
 						return s.writeQueryError(w, "40001",
-							"could not serialize access due to read/write dependencies among transactions: "+ssiErr.Error())
+							"could not serialize access due to read/write dependencies among transactions",
+							ssiFields...)
 					}
 				}
 				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {

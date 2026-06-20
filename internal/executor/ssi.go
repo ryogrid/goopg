@@ -95,9 +95,20 @@ func ssiPreCommitCheck(ctx *Context, tx mvcc.Transaction) error {
 		return nil
 	}
 	if err := ctx.TxnMgr.PreCommitCheckForSerializationFailure(tx.Handle); err != nil {
+		// Surface the bare upstream errmsg as the primary message and carry the
+		// reason code as DETAIL, exactly as predicate.c does. Inlining the
+		// reason into the primary message (as the prior code did) diverged from
+		// psql/isolationtester, which print only the errmsg line.
+		detail, hint := "", ""
+		if sfe, ok := err.(*mvcc.SerializationFailureError); ok {
+			detail = sfe.Detail()
+			hint = "The transaction might succeed if retried."
+		}
 		return &ExecError{
 			Code:    "40001",
-			Message: "could not serialize access due to read/write dependencies among transactions: " + err.Error(),
+			Message: "could not serialize access due to read/write dependencies among transactions",
+			Detail:  detail,
+			Hint:    hint,
 		}
 	}
 	return nil

@@ -337,6 +337,77 @@ func TestPort_IsolationMergeJoin(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-join.spec")
 }
 
+// ── M0118-0001 SSI / SERIALIZABLE anomaly specs ──────────────────────────────
+//
+// These specs declare NO explicit `permutation` lines, so the runner generates
+// ALL interleavings of the per-session step sequences (run_all_permutations
+// parity, isolation.go generateAllPermutations). They became in scope once
+// goopg implemented REPEATABLE READ + SERIALIZABLE with real SSI raising
+// SQLSTATE 40001 (M0100/M0104). One dedicated, sequential (non-parallel)
+// function per spec — own cluster — so a green port is visible without running
+// the full IsolationSuite (whose parallel subtests share one cluster).
+
+// TestPort_IsolationSimpleWriteSkew exercises the simple-write-skew spec: two
+// SERIALIZABLE transactions form a write-skew dangerous structure; every
+// overlapping interleaving must abort one with 40001.
+func TestPort_IsolationSimpleWriteSkew(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_simple_ws")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/simple-write-skew.spec")
+}
+
+// TestPort_IsolationTwoIds exercises the two-ids spec: a SERIALIZABLE
+// read/write cycle over two id rows must abort with 40001.
+func TestPort_IsolationTwoIds(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_two_ids")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/two-ids.spec")
+}
+
+// TestPort_IsolationTotalCash exercises the total-cash spec: a SERIALIZABLE
+// constraint over an aggregate (total cash invariant) under write skew.
+func TestPort_IsolationTotalCash(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_total_cash")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/total-cash.spec")
+}
+
+// TestPort_IsolationReceiptReport exercises the receipt-report spec: the
+// classic batch/receipt read-only anomaly under SERIALIZABLE.
+func TestPort_IsolationReceiptReport(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_receipt_report")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/receipt-report.spec")
+}
+
+// TestPort_IsolationProjectManager exercises the project-manager spec: a
+// SERIALIZABLE resource-assignment write skew must abort one transaction.
+func TestPort_IsolationProjectManager(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_project_manager")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/project-manager.spec")
+}
+
+// TestPort_IsolationClassroomScheduling exercises the classroom-scheduling
+// spec: overlapping SERIALIZABLE bookings form a dangerous structure.
+func TestPort_IsolationClassroomScheduling(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_classroom_sched")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/classroom-scheduling.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()
