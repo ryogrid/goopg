@@ -7825,3 +7825,71 @@ visibility/catalog tuple-format changes additionally carry the TPC-H spot-check
 - Every non-trivial subsystem must land alongside (or just before) a design
   doc under `docs/design/`. The spec treats this as a hard requirement.    
 
+
+## M0118 — Upstream Isolation Spec Suite Pass-Through (post REPEATABLE READ + SERIALIZABLE) (filed 2026-06-20)
+
+Goal: With REPEATABLE READ (transaction-level pinned snapshot) and SERIALIZABLE
+(RR snapshot + real SSI raising SQLSTATE 40001) now implemented (M0100/M0104), the
+full 121-spec upstream isolation suite is in scope. 99 specs previously parked as
+`not-tried` (RC-only era) were re-classified to `failed` in
+`docs/test-port/postgres-oracle-target-inventory.csv`; together with the 13
+already-`failed`, drive all **112 targeted specs** to `pass` vs PostgreSQL 18.3
+(`./postgres/local_install`) using `internal/testport/framework/isolation_runner.go`.
+Keep the 9 already-passing specs green. Milestone doc:
+`docs/milestones/0118-isolation-spec-suite-passthrough.md`.
+
+Per-spec promotion workflow (every slice): make the spec green via its
+`TestPort_Isolation*` test, set its CSV row to `status=pass` (rationale = the Go
+test func name), then regenerate `go run ./cmd/gen-isolation-coverage --repo-root .`
+and `go run ./cmd/gen-oracle-inventory --repo-root .`. Pick one coherent spec group
+per loop.
+
+### Sub-milestones
+
+- [ ] **M0118-0001**
+      - Summary: SERIALIZABLE / SSI anomaly specs — write-skew + dangerous-structure 40001.
+      - Specs: simple-write-skew, matview-write-skew, read-only-anomaly{,-2,-3},
+        read-write-unique{,-2,-3,-4}, two-ids, total-cash, receipt-report,
+        project-manager, classroom-scheduling, multiple-row-versions,
+        update-conflict-out, serializable-parallel{,-2,-3}.
+      - Verify: per-spec TestPort_Isolation*; regen coverage docs; 9 passing stay green.
+- [ ] **M0118-0002**
+      - Summary: Predicate-lock granularity per access method / scan type.
+      - Specs: predicate-gin, predicate-gist, predicate-hash, predicate-lock-hot-tuple,
+        index-only-scan, index-only-bitmapscan, partial-index.
+- [ ] **M0118-0003**
+      - Summary: Row locking — FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT.
+      - Specs: skip-locked{,-2,-3,-4}, nowait{,-2,-3,-4,-5}, lock-nowait,
+        tuplelock-{conflict,partition,update,upgrade-no-deadlock},
+        lock-update-{delete,traversal}, update-locked-tuple, propagate-lock-delete,
+        lock-committed-keyupdate.
+- [ ] **M0118-0004**
+      - Summary: Deadlock detection.
+      - Specs: deadlock-{hard,simple,soft,soft-2,parallel}, multixact-no-deadlock.
+- [ ] **M0118-0005**
+      - Summary: FK / referential-integrity concurrency.
+      - Specs: fk-contention, fk-deadlock{,2}, fk-partitioned-{1,2},
+        referential-integrity, ri-trigger, temporal-range-integrity.
+- [ ] **M0118-0006**
+      - Summary: MERGE & INSERT ON CONFLICT output parity.
+      - Specs: merge-{update,delete,insert-update,match-recheck,join},
+        insert-conflict-do-update-{2,3,4}, insert-conflict-specconflict,
+        insert-conflict-do-nothing-2.
+- [ ] **M0118-0007**
+      - Summary: Planner / output-format blockers (previously failed).
+      - Specs: eval-plan-qual (RETURNING support in planner), drop-index-concurrently-1
+        (EXPLAIN EXECUTE plan-format parity).
+- [ ] **M0118-0008**
+      - Summary: DDL / VACUUM / maintenance concurrency.
+      - Specs: alter-table-{1,2,3,4}, detach-partition-concurrently-{1,2,3,4},
+        partition-concurrent-attach, partition-drop-index-locking,
+        reindex-concurrently{,-toast}, reindex-schema, multiple-cic,
+        vacuum-{concurrent-drop,conflict,no-cleanup-lock,skip-locked},
+        truncate-conflict, sequence-ddl, cluster-conflict{,-partition},
+        create-trigger, inherit-temp, plpgsql-toast.
+- [ ] **M0118-0009**
+      - Summary: Misc / system-level specs.
+      - Specs: async-notify, timeouts, stats, horizons, freeze-the-dead, inplace-inval,
+        intra-grant-inplace{,-db}, subxid-overflow, prepared-transactions{,-cic},
+        temp-schema-cleanup, multixact-no-forget, aborted-keyrevoke,
+        delete-abort-savept{,-2}.
