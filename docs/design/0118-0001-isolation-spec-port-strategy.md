@@ -145,21 +145,54 @@ committed `D1`) raised a spurious `40001`.
 **Deferral vs upstream (documented, conservative).** goopg does not yet model
 `READ ONLY` transactions or two-phase `PREPARE`; every xact is treated READ WRITE
 and a finished xact is treated as prepared+committed (`FinishedAt` doubles as
-`prepareSeqNo`/`commitSeqNo`). Where upstream would `ereport` **mid-statement**
-(Case 1 / Case 3 reader-kill), goopg instead dooms the same transaction, which
-fails at its **own COMMIT** — correct abort, later surfacing point. This is why
-`total-cash` (whose error lands on the read step `rxy2`) stays deferred this
-slice.
+`prepareSeqNo`/`commitSeqNo`). The read-path reader-kill is now surfaced
+mid-statement (section 4); the write-path pivot-writer doom (`current == writer`)
+is deliberately kept deferred to the writer's own `PreCommit` — no spec needs the
+write-path mid-statement abort, and `read-write-unique`'s mid-statement `w2`
+`40001` comes from the unique-index conflict path, not this hook.
+
+### 4. Mid-statement read-path abort + index-UPDATE conflict-in (lands `total-cash`)
+
+`total-cash` is the read-only-anomaly variant whose abort PG raises **during a
+`SELECT`** (e.g. `rxy2`), not at COMMIT: when the in-flight reader closes a
+dangerous structure to an already-**committed** writer it cannot abort, upstream
+`ereport`s in place (`predicate.c`: the entry `SxactIsDoomed(MySerializableXact)`
+check, and `OnConflict`'s "Canceled on conflict out to pivot, during read"). Two
+coordinated changes land it:
+
+- **Surface the reader-kill mid-statement.** `reader.Doomed` is set *only* by the
+  read-path reader-kill arm of `onConflictCheckLocked` (the write path dooms the
+  *writer*; `PreCommit` dooms the pivot at commit), so it is an exact predicate
+  for "this read must abort now". New `mvcc.Manager.CheckForSerializableConflictOutReportingFailure`
+  wraps the conflict-out check and returns a `*SerializationFailureError` when the
+  reader is doomed at entry or becomes doomed across the call. The executor hook
+  `ssiRecordTupleRead` now returns that error, and the **three** SERIALIZABLE read
+  sites — `seqScanOp.Next`, `indexScanOp.Next`, and the UPDATE/DELETE
+  `scanMatching` loop — propagate it (releasing any held page RLock first). The
+  statement aborts in place, marking the transaction failed (25P02) so the
+  following `COMMIT` is a silent rollback, exactly as PG/isolationtester print.
+  Deferred dooms (the writer is the victim, the `two-ids` / `simple-write-skew`
+  shape) leave `reader.Doomed` clear → the hook returns `nil` and the reader keeps
+  running, surfacing at the writer's COMMIT as before.
+- **Sibling-path fix: index-based UPDATE conflict-in.** `total-cash`'s
+  `wy2`-before-`rxy1` permutations also exposed a pre-existing gap: the
+  index-driven UPDATE path (`updateViaIndex`, used for `WHERE accountid = …` on a
+  PRIMARY KEY) never called `ssiRecordTupleWrite`, so a SERIALIZABLE UPDATE found
+  via an index installed **no** write-path conflict-in edge from concurrent SIREAD
+  holders — the seqscan UPDATE path (`scanMatching` + `ssiRecordTupleWrite`) did.
+  Without the `s1 → s2` edge the reader-pivot 2-cycle was never formed and the
+  reader-kill could not fire. `updateViaIndex` now records the conflict-in on the
+  old tuple's `(rel, blk, slot)` after each write, mirroring the seqscan path. The
+  change is a no-op for RC/RR (the `ssiActive` guard), so only SERIALIZABLE UPDATEs
+  are affected; the full UPDATE/MERGE/conflict isolation suite stays green.
 
 ## Status / scope boundary
 
-- **Passing:** `simple-write-skew` (2-cycle write skew) and `two-ids` (3-xact
-  read-only anomaly, all 90 generated permutations byte-identical to PG 18.3).
+- **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
+  read-only anomaly, all 90 generated permutations byte-identical to PG 18.3), and
+  `total-cash` (mid-statement read-path abort, all 20 generated permutations
+  byte-identical to PG 18.3 — section 4).
 - **Still deferred (same slice family):**
-  - `total-cash` — needs the **mid-statement** abort: PG cancels the reader
-    during `rxy2` (Case 3 reader-kill); goopg defers to COMMIT, so the read step
-    still prints its result. Requires threading a `40001` error up from the
-    read-path hook through the scan operators.
   - `project-manager`, `classroom-scheduling` — 2-cycles whose second edge needs
     **phantom / empty-range predicate locking** (a `SELECT … WHERE …` over a
     range an INSERT later fills): goopg currently misses the rw-edge, a false

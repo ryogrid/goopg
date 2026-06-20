@@ -855,7 +855,16 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// rw-conflict edge to the producing writer (xmin). Helper
 			// short-circuits to a single inline check for RC/RR readers.
 			// curSlot was already advanced past the just-fetched slot.
-			ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin, tuple.Header.Xmax)
+			// M0118-0001: a non-nil error means this read closed a dangerous
+			// structure to an already-committed writer and the reader must
+			// abort mid-statement (40001). Release the per-tuple page RLock
+			// before returning; Close()/the pin handles buffer release.
+			if err := ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
+				if o.pinned != nil {
+					o.pinned.RUnlock()
+				}
+				return nil, err
+			}
 			// M0054-0005a: decode into the reusable o.scanRow
 			// buffer. M0073-0004: route varchar / char / text /
 			// bytea payload through the per-page arena so per-
@@ -2586,6 +2595,15 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 		}
 		if !epqSkip {
+			// M0118-0001: SSI write-path hook on the prior live slot, mirroring
+			// the seqscan-based updateOp path (operators_storage.go ~3210). The
+			// index-based UPDATE path previously skipped this, so a SERIALIZABLE
+			// UPDATE driven by a PRIMARY KEY / index lookup never installed the
+			// rw-conflict-in edge from concurrent SIREAD holders — a sibling-path
+			// gap that made total-cash's `wy2`-before-`rxy1` permutations miss the
+			// dangerous structure. The conflict target is the OLD tuple's
+			// (rel, blk, slot), the same slot a concurrent reader predicate-locks.
+			ssiRecordTupleWrite(o.ctx, rel, pu.blk, pu.slot)
 			// AFTER UPDATE triggers (M0097-0140).
 			if len(idxTbl.Triggers) > 0 {
 				fireTriggers(o.ctx, idxTbl, "after", "update", pu.oldRow, pu.newRow)
@@ -4366,7 +4384,15 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			// rw-conflict, and must check conflict-out against both
 			// xmin (visible writer) and xmax (concurrent overwriter
 			// hidden by snapshot).
-			ssiRecordTupleRead(ctx, rel, blk, slot, tuple.Header.Xmin, tuple.Header.Xmax)
+			// M0118-0001: a non-nil error means this read closed a dangerous
+			// structure to an already-committed writer and the reading
+			// UPDATE/DELETE must abort mid-statement (40001). Release the
+			// page RLock + pin before returning, like the decode-error path.
+			if err := ssiRecordTupleRead(ctx, rel, blk, slot, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				return err
+			}
 			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
 			if err := DecodeRowIntoMctxPGTuple(scanRow, cols, tuple.Data, tuple.Bitmap, storedNatts, nil); err != nil {
 				continue // skip undecodable tuples (e.g. schema mismatch)

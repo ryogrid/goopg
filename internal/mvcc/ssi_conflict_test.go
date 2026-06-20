@@ -169,6 +169,108 @@ func TestCheckForSerializableConflictOut_EdgeToRetainedCommittedWriter(t *testin
 	}
 }
 
+// TestCheckForSerializableConflictOutReportingFailure_ReaderKillMidRead asserts
+// the M0118-0001 mid-statement abort: when an in-flight reader closes a dangerous
+// structure R -> W -> T2 to an already-COMMITTED writer W that carries a
+// conflict-out (W committed after T2 committed first), the reader is the pivot's
+// victim and the read-path hook must surface SQLSTATE 40001 IN PLACE — upstream's
+// "Canceled on conflict out to pivot, during read" (predicate.c). This is the
+// total-cash spec's distinguishing behaviour vs the deferred pivot-writer doom.
+func TestCheckForSerializableConflictOutReportingFailure_ReaderKillMidRead(t *testing.T) {
+	m := NewManager()
+	// The eventual victim stays in-flight throughout so retention keeps the
+	// committed W and T2 reachable.
+	reader := beginAndAssign(t, m)
+	t2 := beginAndAssign(t, m)
+	w := beginAndAssign(t, m)
+	// W reads T2's data: W -> T2 edge.
+	if !m.CheckForSerializableConflictOut(w.Handle, t2.XID) {
+		t.Fatal("W->T2 edge not installed")
+	}
+	// T2 commits first, then W commits carrying the conflict-out flag.
+	if err := m.Commit(t2); err != nil {
+		t.Fatalf("commit t2: %v", err)
+	}
+	if err := m.Commit(w); err != nil {
+		t.Fatalf("commit w: %v", err)
+	}
+	// The in-flight reader now reads W's committed data, closing R -> W -> T2.
+	err := m.CheckForSerializableConflictOutReportingFailure(reader.Handle, w.XID)
+	if err == nil {
+		t.Fatal("expected a mid-statement serialization failure, got nil")
+	}
+	if !IsSerializationFailure(err) {
+		t.Fatalf("error is not a SerializationFailureError: %v", err)
+	}
+	if !m.IsDoomedForTest(reader.Handle) {
+		t.Fatal("reader was not doomed by the reader-kill")
+	}
+	// Entry-doom path: a subsequent read by the now-doomed reader must abort
+	// immediately, before any conflict logic — even against an unrelated xid.
+	if err := m.CheckForSerializableConflictOutReportingFailure(reader.Handle, t2.XID); err == nil {
+		t.Fatal("already-doomed reader's next read did not abort (entry-doom check)")
+	}
+}
+
+// TestCheckForSerializableConflictOutReportingFailure_DeferredPivotReturnsNil is
+// the safety counterpart: when the dangerous structure makes the IN-FLIGHT writer
+// the pivot (R -> W -> T2 with W not yet committed), upstream dooms the writer and
+// defers the abort to the writer's COMMIT. The read-path hook must therefore
+// return nil — the reader keeps running. This is the two-ids / simple-write-skew
+// shape, and surfacing it mid-read here would regress those passing specs.
+func TestCheckForSerializableConflictOutReportingFailure_DeferredPivotReturnsNil(t *testing.T) {
+	m := NewManager()
+	reader := beginAndAssign(t, m)
+	t2 := beginAndAssign(t, m)
+	w := beginAndAssign(t, m)
+	// W -> T2 edge, then T2 commits first; W stays in-flight (the pivot).
+	if !m.CheckForSerializableConflictOut(w.Handle, t2.XID) {
+		t.Fatal("W->T2 edge not installed")
+	}
+	if err := m.Commit(t2); err != nil {
+		t.Fatalf("commit t2: %v", err)
+	}
+	// Reader reads the in-flight W's data, closing R -> W -> T2 with W as the
+	// in-flight pivot.
+	if err := m.CheckForSerializableConflictOutReportingFailure(reader.Handle, w.XID); err != nil {
+		t.Fatalf("deferred pivot-writer doom must NOT surface mid-read: %v", err)
+	}
+	if !m.IsDoomedForTest(w.Handle) {
+		t.Fatal("in-flight pivot writer was not doomed")
+	}
+	if m.IsDoomedForTest(reader.Handle) {
+		t.Fatal("reader was wrongly doomed in the deferred case")
+	}
+}
+
+// TestCheckForSerializableConflictOutReportingFailure_ReaderKillTwoCycle
+// reproduces the total-cash spec's distinguishing structure at the Manager
+// level: a 2-cycle s1 -> s2 -> s1 where s1 has COMMITTED. When the in-flight s2
+// reads s1's data (closing s2 -> s1), s2 becomes the pivot of T0(s1) -> s2 ->
+// W(s1) with the writer committed, so Case 3 of onConflictCheckLocked must doom
+// the reader and the read-path hook must surface 40001 mid-statement.
+func TestCheckForSerializableConflictOutReportingFailure_ReaderKillTwoCycle(t *testing.T) {
+	m := NewManager()
+	s1 := beginAndAssign(t, m)
+	s2 := beginAndAssign(t, m)
+	// s1 -> s2 edge (s1 read s2's data, or s2 wrote what s1 read).
+	if !m.CheckForSerializableConflictOut(s1.Handle, s2.XID) {
+		t.Fatal("s1->s2 edge not installed")
+	}
+	// s1 commits while s2 is still in-flight: s1 is retained, edge intact.
+	if err := m.Commit(s1); err != nil {
+		t.Fatalf("commit s1: %v", err)
+	}
+	// s2 now reads s1's committed data, closing s2 -> s1 (the 2-cycle).
+	err := m.CheckForSerializableConflictOutReportingFailure(s2.Handle, s1.XID)
+	if err == nil {
+		t.Fatal("expected mid-statement serialization failure for the 2-cycle pivot reader, got nil")
+	}
+	if !m.IsDoomedForTest(s2.Handle) {
+		t.Fatal("pivot reader s2 was not doomed")
+	}
+}
+
 func TestCheckForSerializableConflictOut_NoOpForUnknownReader(t *testing.T) {
 	m := NewManager()
 	writer := beginAndAssign(t, m)

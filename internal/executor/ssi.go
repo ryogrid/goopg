@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"errors"
+
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -31,19 +33,30 @@ func ssiActive(ctx *Context) bool {
 // self xids and for RC/RR readers, so callers do not need to filter further.
 // Block/slot sanity gating mirrors mvcc.TupleLockTag's invariants — calling
 // it with InvalidBlockNumber or slot==0 panics, so we filter here.
-func ssiRecordTupleRead(ctx *Context, rel storage.RelFileNode, block storage.BlockNumber, slot uint16, writerXmin, writerXmax storage.TransactionID) {
+//
+// Returns a non-nil error (SQLSTATE 40001) when this read closes a dangerous
+// rw-conflict structure to an already-committed writer that goopg cannot abort,
+// so the READER itself must die mid-statement — upstream's "Canceled on conflict
+// out to pivot, during read" (predicate.c). The caller (the scan operator) must
+// release any page lock it holds and return the error so the SELECT/UPDATE/DELETE
+// statement aborts in place, marking the transaction failed (25P02). Deferred
+// pivot/write-skew dooms (the WRITER is the victim) return nil here and surface
+// at the writer's own COMMIT, exactly as before.
+func ssiRecordTupleRead(ctx *Context, rel storage.RelFileNode, block storage.BlockNumber, slot uint16, writerXmin, writerXmax storage.TransactionID) error {
 	if !ssiActive(ctx) {
-		return
+		return nil
 	}
 	if block == storage.InvalidBlockNumber || slot == 0 {
-		return
+		return nil
 	}
 	tag := mvcc.TupleLockTag(rel.DBOid, rel.RelOid, block, slot)
 	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
 	// Conflict-out against the inserter — handles the reader-after-write
 	// shape (reader observes a concurrent SERIALIZABLE writer's new
 	// tuple version directly).
-	ctx.TxnMgr.CheckForSerializableConflictOut(ctx.Tx.Handle, writerXmin)
+	if err := ctx.TxnMgr.CheckForSerializableConflictOutReportingFailure(ctx.Tx.Handle, writerXmin); err != nil {
+		return ssiReadAbortError(err)
+	}
 	// M0104-0008: conflict-out against the deleter/updater. When the
 	// reader's snapshot hides a concurrent SERIALIZABLE writer's NEWER
 	// version of this tuple, the visible OLD version still carries the
@@ -53,7 +66,30 @@ func ssiRecordTupleRead(ctx *Context, rel storage.RelFileNode, block storage.Blo
 	// InvalidXID / Bootstrap / Frozen and elides the self-modify case,
 	// so an unconditional second check is safe when xmax != xmin.
 	if writerXmax != writerXmin {
-		ctx.TxnMgr.CheckForSerializableConflictOut(ctx.Tx.Handle, writerXmax)
+		if err := ctx.TxnMgr.CheckForSerializableConflictOutReportingFailure(ctx.Tx.Handle, writerXmax); err != nil {
+			return ssiReadAbortError(err)
+		}
+	}
+	return nil
+}
+
+// ssiReadAbortError converts the mvcc read-path serialization failure into the
+// executor's wire-surfacing ExecError (SQLSTATE 40001). The primary message is
+// the bare upstream errmsg that psql/isolationtester print; the reason rides in
+// DETAIL (suppressed by isolationtester, surfaced by psql), mirroring
+// ssiPreCommitCheck so the mid-statement and at-commit forms are byte-identical
+// on the wire.
+func ssiReadAbortError(err error) error {
+	detail := ""
+	var sfe *mvcc.SerializationFailureError
+	if errors.As(err, &sfe) {
+		detail = sfe.Detail()
+	}
+	return &ExecError{
+		Code:    mvcc.SerializationFailureSQLState,
+		Message: "could not serialize access due to read/write dependencies among transactions",
+		Detail:  detail,
+		Hint:    "The transaction might succeed if retried.",
 	}
 }
 

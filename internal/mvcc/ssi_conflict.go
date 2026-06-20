@@ -47,6 +47,60 @@ func (m *Manager) CheckForSerializableConflictOut(readerHandle TxnHandle, writer
 	return m.checkForSerializableConflictOutLocked(readerHandle, writerXID)
 }
 
+// Reason strings for the two mid-statement read-path serialization-failure
+// sites, matching the errdetail_internal phrases in upstream
+// CheckForSerializableConflictOut (predicate.c). isolationtester suppresses
+// DETAIL, but psql/wire clients surface it, so keeping them verbatim preserves
+// parity.
+const (
+	// reasonConflictDuringCheck is the entry "already doomed" abort
+	// (predicate.c:4038) — a reader doomed by an earlier conflict-out check
+	// (an earlier tuple in the same scan, or a peer's commit dooming this
+	// reader as a pivot) must die before reading further.
+	reasonConflictDuringCheck = "Canceled on identification as a pivot, during conflict out checking"
+	// reasonConflictOutDuringRead is the OnConflict reader-kill abort
+	// (predicate.c:4679) — the reader closed a dangerous structure to an
+	// already-committed writer it cannot abort, so the reader must die now.
+	reasonConflictOutDuringRead = "Canceled on conflict out to pivot, during read"
+)
+
+// CheckForSerializableConflictOutReportingFailure performs the same read-path
+// conflict-out check as CheckForSerializableConflictOut, but additionally
+// reports — via a non-nil *SerializationFailureError — when the READER must
+// abort its current statement immediately. It is goopg's analogue of the two
+// mid-statement ereport(ERROR) sites in upstream CheckForSerializableConflictOut
+// (predicate.c): the entry "already doomed" check (line 4032) and the
+// OnConflict_CheckForSerializationFailure "Canceled on conflict out to pivot,
+// during read" case (line 4676).
+//
+// The detection key is the reader's Doomed flag: it is set ONLY by the read-path
+// reader-kill arm of onConflictCheckLocked (the write path dooms the WRITER, and
+// PreCommit dooms the pivot at commit). So a reader that is doomed at entry, or
+// becomes doomed across this call, is exactly the upstream mid-statement-abort
+// reader; a doomed WRITER (the common pivot/write-skew shape) leaves this nil and
+// surfaces at the writer's own PreCommit, exactly as before.
+//
+// Used by the executor read-path hook (ssiRecordTupleRead) to surface SQLSTATE
+// 40001 on the offending SELECT/UPDATE/DELETE scan step rather than deferring it
+// to the reader's COMMIT — the difference real PG 18.3 exhibits on, e.g., the
+// total-cash isolation spec.
+func (m *Manager) CheckForSerializableConflictOutReportingFailure(readerHandle TxnHandle, writerXID storage.TransactionID) error {
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
+	// Entry doom check (predicate.c:4032-4040): a reader already doomed by an
+	// earlier conflict-out check must die before reading anything further.
+	if reader := m.ssiState.xacts[readerHandle]; reader != nil && reader.Doomed {
+		return &SerializationFailureError{Reason: reasonConflictDuringCheck}
+	}
+	m.checkForSerializableConflictOutLocked(readerHandle, writerXID)
+	// onConflictCheckLocked's reader-kill arm (writer already committed, so the
+	// reader is the victim) just doomed the reader: surface it mid-read.
+	if reader := m.ssiState.xacts[readerHandle]; reader != nil && reader.Doomed {
+		return &SerializationFailureError{Reason: reasonConflictOutDuringRead}
+	}
+	return nil
+}
+
 func (m *Manager) checkForSerializableConflictOutLocked(readerHandle TxnHandle, writerXID storage.TransactionID) bool {
 	if writerXID == storage.InvalidTransactionID ||
 		writerXID == BootstrapTransactionID ||

@@ -387,7 +387,13 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// Helper short-circuits for RC/RR; for SERIALIZABLE this installs a
 		// tuple-grain predicate lock and an rw-conflict edge to the writer
 		// identified by the visible tuple's xmin.
-		ssiRecordTupleRead(o.ctx, o.heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax)
+		// M0118-0001: a non-nil error means the reader closed a dangerous
+		// structure to an already-committed writer and must abort the scan
+		// mid-statement (40001). The heap page RLock/pin was already released
+		// above (after the decode), so just propagate the error.
+		if err := ssiRecordTupleRead(o.ctx, o.heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
+			return nil, err
+		}
 		// M0092-0007: stack-aliased slot — reuse o.slot across
 		// every Next() call. Caller must consume / Materialize
 		// before the next Next() invocation.
