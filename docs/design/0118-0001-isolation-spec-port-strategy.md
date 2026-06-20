@@ -265,14 +265,62 @@ the upstream results for the unique-constraint write-skew family. Two things lan
   `-3` exercises the same shape through a `LANGUAGE SQL` insert-if-not-exists
   function (bug 9301). Ported as `TestPort_IsolationReadWriteUnique{,2,3}`.
 
-`read-write-unique-4` still **defers**: two permutations (`r1 w1 w2 c1 c2`,
-`r2 w1 w2 c1 c2`) abort with `40001` where PG raises `23505`. goopg's write-path
-SSI conflict-in check fires *before* the btree unique-index insert detects the
-duplicate, so the serialization failure pre-empts the constraint violation. PG's
-ordering lets the heavyweight unique violation win when the conflicting key is
-already committed-visible. Closing this needs the write path to consult the unique
-index for an already-committed duplicate before raising the SSI failure — a
-sequencing change deferred within M0118-0001.
+### 7. Index-scan SSI completeness + `40001`-vs-`23505` ordering (lands `read-write-unique-4`)
+
+`read-write-unique-4` implements a gapless per-year invoice sequence and mixes both
+outcomes in one spec:
+
+- `r1 r2 w1 w2 c1 c2` — **both** sessions probe `MAX(invoice_number) … WHERE year = 2016`
+  first, so the loser's INSERT closes a dangerous structure → `40001`.
+- `r1 w1 w2 c1 c2` and `r2 w1 w2 c1 c2` — only **one** session probes, so there is no
+  pivot and the duplicate is a plain `23505`.
+
+The earlier blanket rule in `uniqueCheckWithWait` raised `40001` for *every* post-wait
+unique conflict between two SERIALIZABLE writers. That happened to match the
+both-read specs (`read-write-unique{,-2,-3}`) but over-fired the single-reader
+permutations here. The real discriminator is whether the writer is an SSI pivot,
+which only the conflict graph knows. Two coupled fixes:
+
+- **Defer the `40001`-vs-`23505` decision to the SSI conflict-in walk.**
+  `uniqueCheckWithWait` no longer hard-codes `40001` for SERIALIZABLE. After the
+  in-flight inserter commits and the duplicate survives, it runs
+  `ssiRecordTupleWrite` against the **committed conflicting tuple's** location
+  (`tuple → page → relation` holders, including retained-committed readers). A
+  non-nil result means this writer is a pivot to an already-committed peer → `40001`;
+  otherwise the duplicate falls through to `23505`. This mirrors upstream's
+  `_bt_check_unique` / `CheckForSerializableConflictIn` ordering. (REPEATABLE READ
+  keeps its prior `40001`; the third-in-flight-xact corner with no committed
+  location to walk keeps the prior conservative `40001`.)
+
+- **Close the SERIALIZABLE index-scan / index-only-scan predicate-lock gaps.** The
+  conflict-in walk only finds a reader if the reader registered a phantom-covering
+  predicate lock — but `WHERE year = 2016` / `WHERE i = 42` / `WHERE key = k` are
+  served by `indexScanOp` / `indexOnlyScanOp`, neither of which took the
+  relation-grain SIREAD that `seqScanOp` does (section 5), nor the invisible-tuple
+  conflict-out (the INSERT-before-READ phantom). Both operators now:
+  1. acquire a **relation-grain SIREAD on the heap relation** at `Open` (held even
+     when the probe matches no key — that empty-result gap *is* the phantom), and
+  2. register the **invisible-tuple conflict-out** (`ssiRecordInvisibleTupleRead`)
+     when an index entry points at a tuple invisible because a concurrent xact
+     inserted it — the analog of `seqScanOp.Next`'s invisible branch. This is what
+     `read-write-unique-3` needs: each `LANGUAGE SQL` `insert_unique` call reads the
+     key (finding the peer's in-flight insert invisible) then inserts the duplicate
+     itself; without the conflict-out the loser's out-edge never forms and it is not
+     a pivot.
+
+These are general correctness fixes (goopg's index access paths were SSI-incomplete
+relative to seq scans), not spec-specific patches. Upstream locks index *leaf pages*
+(`PredicateLockPage`); goopg's write-path conflict-in walk is keyed on the heap
+relation, so the relation-grain SIREAD is the faithful walk-reachable analog —
+slightly coarser than PG (more conservative, never a false negative). All four
+`read-write-unique{,-2,-3,-4}` specs now pass via the real machinery, with the
+blanket-`40001` heuristic removed. Ported as `TestPort_IsolationReadWriteUnique4`.
+
+> Latent (not needed by any in-scope spec, noted for follow-up): `indexOnlyScanOp`
+> still does not register a per-tuple SIREAD + conflict-out for *visible* rows it
+> reads (only the relation-grain phantom lock and the invisible-tuple conflict-out).
+> A read-then-write-skew driven purely through an index-only scan over existing rows
+> would miss its read edge. No current spec exercises that path.
 
 ## Status / scope boundary
 
@@ -280,10 +328,11 @@ sequencing change deferred within M0118-0001.
   read-only anomaly, all 90 generated permutations byte-identical to PG 18.3),
   `total-cash` (mid-statement read-path abort, all 20 permutations — section 4),
   `project-manager` (phantom predicate locking, all 21 permutations
-  byte-identical to PG 18.3 — section 5), and the `read-write-unique` family
-  `{base, -2, -3}` (unique-constraint write skew, section 6).
+  byte-identical to PG 18.3 — section 5), and the full `read-write-unique` family
+  `{base, -2, -3, -4}` (unique-constraint write skew, sections 6–7; `-4` mixes
+  `40001` and `23505` across its three permutations via the conflict-in walk + the
+  index-scan SSI completeness fixes).
 - **Still deferred (same slice family):**
-  - `read-write-unique-4` — `40001`-vs-`23505` ordering (section 6).
   - `classroom-scheduling` — the SSI machinery is in place (section 5), but its
     primary key is `(room_id text, start_time timestamptz)` and goopg's btree
     rejects a `timestamptz` key (`btree v0 only supports int4 / numeric keys`,

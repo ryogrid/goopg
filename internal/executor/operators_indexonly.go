@@ -51,6 +51,18 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		return err
 	}
 
+	// M0118-0001: a SERIALIZABLE index-only scan takes a relation-level SIREAD
+	// predicate lock on the heap relation, exactly like the seq-scan and
+	// (heap-fetching) index-scan paths. Acquired BEFORE the probe-bound lookups
+	// below so it is held even when the scan matches no key — that empty-result
+	// case is precisely the phantom the lock must cover (read-write-unique-2/-3
+	// probe a non-existent key first, then both INSERT it). Gated to
+	// SERIALIZABLE inside ssiRecordRelationRead; temp / matview relations are
+	// excluded as PredicateLockingNeededForRelation requires.
+	if o.plan.Table == nil || (!o.plan.Table.Temp && !o.plan.Table.IsMatView) {
+		ssiRecordRelationRead(ctx, heapRel)
+	}
+
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
 	tree, err := btree.Open(ctx.Pool, idxRel)
 	if err != nil {
@@ -121,9 +133,25 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		}
 		slot.RLock()
 		tuple, _, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID)
+		// M0118-0001: SSI phantom conflict-out for an index-only-scanned tuple
+		// present at this TID but invisible because a concurrent transaction
+		// inserted it — the IOS analog of the seq-scan invisible-tuple path. The
+		// VM bit is cleared by a concurrent in-flight insert, so this fallback
+		// (non-ALL_VISIBLE) branch is exactly where that phantom surfaces.
+		var invisXmin storage.TransactionID
+		if !found && ssiActive(ctx) {
+			if raw, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset); terr == nil {
+				invisXmin = raw.Header.Xmin
+			}
+		}
 		slot.RUnlock()
 		ctx.Pool.Unpin(slot)
 		if !found {
+			if invisXmin != storage.InvalidTransactionID {
+				if serr := ssiRecordInvisibleTupleRead(ctx, heapRel, invisXmin); serr != nil {
+					return false, serr
+				}
+			}
 			return true, nil
 		}
 		row, err := o.decodeRowFromHeap(tuple)

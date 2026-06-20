@@ -209,6 +209,23 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 		}
 		return err
 	}
+	// M0118-0001: a SERIALIZABLE index scan takes a relation-level SIREAD
+	// predicate lock on the HEAP relation, exactly like the seq scan path
+	// (operators_storage.go). Per-tuple SIREAD locks (ssiRecordTupleRead in
+	// Next) only cover rows that already match the scan key; they leave the
+	// "gap" — the range a not-yet-existing key would occupy — unlocked, so a
+	// concurrent SERIALIZABLE writer that INSERTs a phantom into that gap would
+	// form no rw-edge. Upstream closes this with a btree PAGE-grain
+	// PredicateLockPage on the scanned leaf; goopg's write-path conflict-in walk
+	// is keyed on the heap relation (tuple → heap-page → heap-relation), so the
+	// faithful, walk-reachable analog is a relation-grain SIREAD on the heap.
+	// This is what makes read-write-unique{,-2,-3,-4} permutation 1 (both xacts
+	// probe the key first) close the dangerous structure at the loser's INSERT.
+	// Gated to SERIALIZABLE inside ssiRecordRelationRead; temp / matview
+	// relations are excluded as PredicateLockingNeededForRelation requires.
+	if o.plan.Table == nil || (!o.plan.Table.Temp && !o.plan.Table.IsMatView) {
+		ssiRecordRelationRead(ctx, o.heapRel)
+	}
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
 	tree, err := btree.Open(ctx.Pool, idxRel)
 	if err != nil {
@@ -338,10 +355,31 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		slot.RLock()
 		tuple, actualSlot, found := followHOTChainNoCopy(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
 		if !found {
+			// M0118-0001: SSI phantom conflict-out for an index-scanned tuple
+			// that is physically present at this TID but invisible to us because
+			// a concurrent transaction inserted it. Register the reader→inserter
+			// rw-edge — the index-scan analog of the seq-scan invisible-tuple
+			// path (operators_storage.go) — so an INSERT-before-READ ordering
+			// still closes the dangerous structure (read-write-unique-3: each
+			// session probes the key, finds the peer's in-flight insert
+			// invisible, then inserts the duplicate itself). ssiActive gates the
+			// extra page read to SERIALIZABLE; the Manager filters the aborted /
+			// committed-before-snapshot (wr-dependency) cases.
+			var invisXmin storage.TransactionID
+			if ssiActive(o.ctx) {
+				if raw, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset); terr == nil {
+					invisXmin = raw.Header.Xmin
+				}
+			}
 			slot.RUnlock()
 			o.ctx.Pool.Unpin(slot)
 			// Tuple invisible (deleted / not yet committed at snap);
-			// skip this TID and try the next.
+			// register the SSI conflict-out then skip this TID.
+			if invisXmin != storage.InvalidTransactionID {
+				if serr := ssiRecordInvisibleTupleRead(o.ctx, o.heapRel, invisXmin); serr != nil {
+					return nil, serr
+				}
+			}
 			continue
 		}
 		if o.scanRow == nil || len(o.scanRow) != len(o.plan.Table.Columns) {

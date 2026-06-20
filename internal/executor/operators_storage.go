@@ -4961,10 +4961,12 @@ func buildExclusionConstraintDetail(idx *catalog.Index, cols []catalog.Column, r
 func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTree, key []byte, idxName, detail string, pos int) error {
 	var inflightXmin storage.TransactionID
 	var liveConflict bool
+	var conflictPtr storage.ItemPointer
 
 	scanOnce := func() {
 		inflightXmin = storage.InvalidTransactionID
 		liveConflict = false
+		conflictPtr = storage.ItemPointer{}
 		_ = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 			slot, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 			if perr != nil {
@@ -4988,6 +4990,7 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTre
 			}
 			if isLiveForUniqueCheck(ctx, xmin, tuple.Header.Xmax) {
 				liveConflict = true
+				conflictPtr = ptr
 				return false, nil
 			}
 			return true, nil
@@ -5005,7 +5008,44 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTre
 			liveConflict = true
 		}
 		if liveConflict {
-			if ctx.Tx.Isolation == mvcc.IsolationSerializable || ctx.Tx.Isolation == mvcc.IsolationRepeatableRead {
+			if ctx.Tx.Isolation == mvcc.IsolationSerializable {
+				// M0118-0001: a post-wait unique conflict between two SERIALIZABLE
+				// writers is a serialization failure (40001) only when THIS writer
+				// is the pivot of a dangerous rw-structure — i.e. another
+				// SERIALIZABLE reader holds a predicate lock covering the
+				// conflicting key AND this writer has an out-conflict to an
+				// already-committed xact. We must NOT blanket-raise 40001: that
+				// over-fires for read-write-unique-4 permutations `r1 w1 w2 …`
+				// and `r2 w1 w2 …`, where only one xact read first so there is no
+				// pivot and upstream raises a plain 23505 duplicate-key error.
+				//
+				// Defer the decision to the SSI conflict-in walk against the
+				// committed conflicting tuple's location (tuple → page →
+				// relation holders, incl. retained-committed readers). It fires
+				// 40001 for read-write-unique{,-2,-4} permutation 1 (both xacts
+				// read first → the pivot closes to the just-committed peer) and
+				// stays silent when no dangerous structure exists, where the
+				// duplicate falls through to the 23505 below — mirroring
+				// upstream's _bt_check_unique / CheckForSerializableConflictIn
+				// ordering.
+				if conflictPtr.Offset != 0 {
+					if serr := ssiRecordTupleWrite(ctx, rel, conflictPtr.Block, conflictPtr.Offset); serr != nil {
+						return serr
+					}
+					// No dangerous structure → fall through to 23505 below.
+				} else {
+					// liveConflict was forced by a THIRD still-in-flight xact
+					// (no committed location to walk). Preserve the prior
+					// conservative serialization failure.
+					return &ExecError{
+						Code:    "40001",
+						Pos:     pos,
+						Message: "could not serialize access due to read/write dependencies among transactions",
+						Detail:  "Reason code: Canceled on identification as a pivot, during write.",
+						Hint:    "The transaction might succeed if retried.",
+					}
+				}
+			} else if ctx.Tx.Isolation == mvcc.IsolationRepeatableRead {
 				return &ExecError{
 					Code:    "40001",
 					Pos:     pos,
@@ -5014,7 +5054,6 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTre
 					Hint:    "The transaction might succeed if retried.",
 				}
 			}
-			// RC: fall through to 23505 below.
 		} else {
 			// Other xact rolled back — no conflict.
 			return nil
