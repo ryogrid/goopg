@@ -6215,6 +6215,25 @@ object support.
         **Next (slice 291+):** a two-argument function-call generation expression (`coalesce(a, b)` / `concat(a, b)`) to pin
         the `, `-separated argument-list branch end-to-end on the oracle, OR a multi-column / NULL-typed DEFAULT variant on
         the partition-leaf ALTER path.
+      - **PROGRESS 2026-06-20 (loop #59):** **DU-002 slice 291 LANDED — two-argument function-call generation expression
+        `coalesce(cn, dn)` end-to-end on the pg_dump oracle.** Slice 290 proved the single-arg call-paren branch end-to-end
+        (`upper(fn)`); this slice pins the `, `-separated ARGUMENT-LIST branch of `joinGeneratedExprTokens` against real
+        pg_dump 18.3 — the FIRST generation slice whose body is a multi-argument function call. The comma branch was already
+        unit-tested (`gen_override_test.go` `coalesce(fn, gn)`); this slice proves the oracle round-trip. `joinGeneratedExprTokens`
+        renders the comma TIGHT-left / SPACED-right (`coalesce(cn, dn)`, not `coalesce(cn ,dn)` or `coalesce(cn,dn)`). Because the
+        test dumps a LIVE goopg server, pg_dump reads goopg's stored source verbatim — lowercase `coalesce` is preserved (no
+        real-PG `pg_get_expr` case normalization). Render path identical to 281–290 (attgenerated 's' → `attrdefs[].separate=false`
+        pg_dump.c:9507; ispartition → shouldPrintColumn every column); 3 columns in attnum order (`cn`, `dn`, generated `en`). No
+        rows inserted → dump-time deparse path only. Fixture:
+        `CREATE TABLE public.pgcl (cn text, dn text, en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED) PARTITION BY LIST (cn)` +
+        `CREATE TABLE public.pgcl_1 PARTITION OF public.pgcl FOR VALUES IN ('a')`. **Guards:** `TestPort_PgDumpConnectionSetup`
+        PASS (3.83s; vs real pg_dump 18.3 — asserts `pgcl_1` prints `cn text`, `dn text`, then inline
+        `en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED` with arg list `cn, dn`, attnum order, ATTACH survives); gofmt +
+        `go vet` clean; pgbench pre-commit smoke on commit. Files: `internal/testport/pgdump_connsetup_test.go` (pgcl fixture +
+        assertion — TEST-ONLY, no production change), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 291).
+        **Next (slice 292+):** a THREE-argument or nested-call generation expression (`concat(a, b, c)` / `upper(coalesce(a, b))`)
+        to pin repeated-comma / nested call-paren composition end-to-end, OR a multi-column / NULL-typed DEFAULT variant on the
+        partition-leaf ALTER path.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

@@ -8406,9 +8406,31 @@ Guards:
   `fu text GENERATED ALWAYS AS (upper(fn)) STORED` with the call parens **tight**, in attnum order, and that
   `ATTACH PARTITION public.pgfx_1 FOR VALUES IN ('a')` survives).
 
-> **Next (slice 291+):** a two-argument function-call generation expression (`coalesce(a, b)` or `concat(a, b)`) to pin the
-> `, `-separated argument-list branch of `joinGeneratedExprTokens` end-to-end on the oracle, OR a multi-column / NULL-typed
-> DEFAULT variant on the partition-leaf ALTER path.
+### Slice 291 — two-argument function-call generation expression `coalesce(cn, dn)` (end-to-end on the pg_dump oracle)
+
+Slice 290 proved the single-argument call-paren branch of `joinGeneratedExprTokens` end-to-end (`upper(fn)`). This slice
+pins the **`, `-separated argument-list branch** on the oracle — the **first** generation slice whose body is a
+multi-argument function call. The comma branch is already unit-tested in `gen_override_test.go` (`coalesce(fn, gn)`); this
+slice proves it round-trips through real pg_dump 18.3.
+
+`CREATE TABLE pgcl (cn text, dn text, en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED) PARTITION BY LIST (cn)` with
+leaf `pgcl_1 PARTITION OF pgcl FOR VALUES IN ('a')`. `joinGeneratedExprTokens` renders the comma **tight to its left
+operand and spaced to its right** (`coalesce(cn, dn)`, not `coalesce(cn ,dn)` or `coalesce(cn,dn)`) so the stored source
+byte-matches `pg_get_expr`. Because this test dumps a **live goopg server**, the source pg_dump reads back is goopg's
+stored form — the lowercase `coalesce` is preserved verbatim (no real-PG `pg_get_expr` case normalization in this path).
+The render path is otherwise identical to slices 281–290: `attgenerated` ('s') forces `attrdefs[].separate=false`
+(pg_dump.c:9507) and `ispartition` forces `shouldPrintColumn` for every column, so the leaf inherits all three columns in
+attnum order (`cn`, `dn`, then the inline generated `en`). No rows are inserted, so this rides the dump-time deparse path
+only. Verified vs PG 18.3. TEST-ONLY — no production change.
+
+Guards:
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgcl_1` block prints `cn text`, `dn text`,
+  then the inline `en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED` with the argument list rendered `cn, dn`, in
+  attnum order, and that `ATTACH PARTITION public.pgcl_1 FOR VALUES IN ('a')` survives).
+
+> **Next (slice 292+):** a THREE-argument or nested-call generation expression (`concat(a, b, c)` / `upper(coalesce(a, b))`)
+> to pin the repeated-comma / nested call-paren composition end-to-end, OR a multi-column / NULL-typed DEFAULT variant on
+> the partition-leaf ALTER path.
 
 ## Deferred (002–010) — catalog surface estimate
 

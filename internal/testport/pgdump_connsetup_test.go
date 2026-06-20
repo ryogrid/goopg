@@ -1651,6 +1651,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pgfx_1: %v", err)
 	}
 
+	// Slice 291: a generation expression that is a TWO-ARGUMENT function call
+	// (`coalesce(cn, dn)`) inherited onto a partition leaf. Slice 290 proved the
+	// single-argument call-paren branch of joinGeneratedExprTokens end-to-end
+	// (`upper(fn)`); this slice pins the `, `-separated ARGUMENT-LIST branch on the
+	// oracle: the helper must render the comma TIGHT to its left operand and SPACED
+	// to its right (`coalesce(cn, dn)`, not `coalesce(cn ,dn)` or `coalesce(cn,dn)`)
+	// so the stored source byte-matches what pg_get_expr returns. goopg's source is
+	// what real pg_dump reads back (this test dumps a live goopg server), so the
+	// lowercase `coalesce` is preserved verbatim — there is no real-PG pg_get_expr
+	// case normalization in this path. The render path is otherwise identical to
+	// slices 281–290: attgenerated ('s') forces attrdefs[].separate=false
+	// (pg_dump.c:9507) and ispartition forces shouldPrintColumn for every column, so
+	// the leaf pgcl_1 inherits both columns and prints `cn text`, `dn text`, then the
+	// inline generated `en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED`. No
+	// rows are inserted, so this rides the dump-time deparse path only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgcl (cn text, dn text, en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED) PARTITION BY LIST (cn)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgcl with two-arg function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgcl_1 PARTITION OF public.pgcl FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pgcl_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4733,6 +4755,46 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgfx_1 FOR VALUES IN ('a')") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgfx_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+
+		// **Slice 291 (asserted):** TWO-ARGUMENT function-call generation expression
+		// on a partition leaf. The leaf pgcl_1 must print `cn text`, `dn text`, then
+		// the inline generated `en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED`
+		// — with the argument list rendered `cn, dn` (comma tight-left, spaced-right),
+		// matching what pg_get_expr returns for goopg's stored source. A regression to
+		// a naive space-join would emit `coalesce(cn , dn)` (or drop the comma's
+		// trailing space) and fail the exact-substring check below.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgcl_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			cnIdx := strings.Index(block, "cn text")
+			if cnIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgcl_1 block\n  block=%q", "cn text", block)
+			}
+			dnIdx := strings.Index(block, "dn text")
+			if dnIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgcl_1 block\n  block=%q", "dn text", block)
+			}
+			enIdx := strings.Index(block, "en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED")
+			if enIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the two-arg function-call generated column on a partition leaf; want %q in pgcl_1 block\n  block=%q", "en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED", block)
+			}
+			// Attnum order: cn (1) before dn (2) before en (3).
+			if cnIdx >= 0 && dnIdx >= 0 && cnIdx > dnIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pgcl_1 block\n  block=%q", "cn", "dn", block)
+			}
+			if dnIdx >= 0 && enIdx >= 0 && dnIdx > enIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgcl_1 block\n  block=%q", "dn", "en", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgcl_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgcl_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgcl_1 FOR VALUES IN ('a')", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every
