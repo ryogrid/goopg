@@ -926,6 +926,65 @@ by re-running `simple-write-skew`, `temporal-range-integrity`, and
 confirm the per-block submission change is regression-free. Isolation pass count
 32 → 33.
 
+## Slice M0118-0003 — `nowait` (FOR UPDATE NOWAIT, tuple-level fail-fast)
+
+`nowait.spec` locks the single row of `foo` with `SELECT * FROM foo FOR UPDATE
+NOWAIT` in two overlapping sessions. When `s1` already holds the row lock, `s2`'s
+`FOR UPDATE NOWAIT` must immediately raise `ERROR: could not obtain lock on row in
+relation "foo"` (`ERRCODE_LOCK_NOT_AVAILABLE` = SQLSTATE `55P03`, the message from
+`heapam.c`) rather than block. Two parser + executor blockers had to clear:
+
+- **Trailing `LIMIT` after the locking clause (parser).** PostgreSQL's `gram.y`
+  `select_no_parens` permits `select_limit` either *before* or *after* the
+  `for_locking_clause`: both `… LIMIT n FOR UPDATE` and `… FOR UPDATE [SKIP LOCKED
+  | NOWAIT] LIMIT n` are legal. goopg only handled the former, so the
+  `skip-locked` / `nowait` spec shape `… FOR UPDATE SKIP LOCKED LIMIT 1` failed with
+  a syntax error. The limit/offset/fetch parsing was factored into
+  `parser.parseSelectLimitClauses` and is now invoked at both sites: once before the
+  set-op/locking tail, and again after the locking loop when a locking clause was
+  parsed and no limit preceded it. (`nowait.spec` itself has no `LIMIT`, but the
+  fix is shared with the `skip-locked` family and is the precondition for them.)
+
+- **Cross-statement row-lock conflict detection (executor).** goopg's lock manager
+  is **statement-scoped**: `dispatch.go` assigns a fresh `BackendID` per Query
+  message and calls `LockMgr.ReleaseAll` at each statement's end, so a tuple lock
+  taken by `s1a` is already released by the time `s2a` runs. Cross-statement
+  locking therefore rides entirely on the **persisted lock-only xmax** stamped into
+  the heap page (`HeapXmaxLockOnly` + the strength bits), the same durable signal
+  `stampLockInner` already reads for real updaters. Previously `stampLockInner`
+  *ignored* lock-only xmax (`!IsHeapTupleLockOnly` guard) and silently overwrote it
+  — so a second `FOR UPDATE` clobbered the first session's lock instead of
+  conflicting. `stampLockInner` now detects a conflicting lock-only xmax held by a
+  still-active transaction (`tupleLockConflicts` + `TxnMgr.IsXIDActive`) and, **for
+  NOWAIT only**, returns the relation-qualified `55P03`. The default blocking path
+  and SKIP LOCKED are deliberately left untouched (see scope note), so no
+  currently-passing spec changes. `lockRowsOp` resolves `waitPolicy` and
+  `lockRelName` once at Open from `Locks[0]`; `stampLock`'s top-level acquisition
+  also switches to `tryAcquireTupleLock` under NOWAIT to fail fast on the rare
+  intra-statement race.
+
+`tupleLockConflicts` encodes the single-locker (non-multixact) row-lock conflict
+matrix over goopg's two effective strengths: FOR UPDATE (`HeapXmaxExclLock`)
+conflicts with any held lock; a shared request conflicts only with a pure-exclusive
+holder.
+
+**Scope boundary (deferred siblings).** Only `nowait` lands this slice. `nowait-2`
+needs multixact (two `FOR SHARE` holders then an upgrade); `nowait-3` needs the
+blocking-`FOR UPDATE`-on-a-locked-row path (intentionally not implemented here);
+`nowait-4` / `nowait-5` need `EvalPlanQualFetch` NOWAIT over an updated CTID chain
+plus advisory locks / PREPARE; `lock-nowait` needs **cross-statement relation-lock
+persistence** (`LOCK TABLE … NOWAIT`), which goopg's statement-scoped lock manager
+does not provide. The whole `skip-locked` family additionally needs the
+`Limit`-above-`LockRows` plan shape — goopg currently plans
+`LockRows(Project(Limit(Sort(Scan))))`, applying `LIMIT` *below* the lock, so a
+skipped row reduces the result count instead of pulling the next lockable row as PG
+does (`Limit → LockRows → Sort`). These are tracked in the deferral ledger.
+
+Verified by `TestPort_IsolationNowait` (all six permutations vs PG 18.3), the new
+`TestParseSelectForUpdateBeforeLimit` and `TestTupleLockConflicts` unit tests, and
+by re-running `lock-committed-update` (the other tuple-lock spec) green to confirm
+the blocking path is regression-free. Isolation pass count 33 → 34.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact

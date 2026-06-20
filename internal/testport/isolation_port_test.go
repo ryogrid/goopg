@@ -629,6 +629,30 @@ func TestPort_IsolationIndexOnlyScan(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/index-only-scan.spec")
 }
 
+// TestPort_IsolationSkipLocked exercises the skip-locked spec: two sessions
+// each repeatedly SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1 from a 2-row queue.
+// SKIP LOCKED must skip rows already row-locked by the other session, so the
+// two sessions claim disjoint rows (1 and 2) without ever blocking.
+func TestPort_IsolationSkipLocked(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_skip_locked")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/skip-locked.spec")
+}
+
+// TestPort_IsolationNowait exercises the nowait spec: when one session holds a
+// FOR UPDATE row lock, a second SELECT ... FOR UPDATE NOWAIT on the same row
+// must immediately raise "could not obtain lock on row in relation" rather than
+// block.
+func TestPort_IsolationNowait(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_nowait")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

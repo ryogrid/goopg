@@ -157,6 +157,41 @@ func TestLockRowsNoWaitFailsOnContention(t *testing.T) {
 	}
 }
 
+// TestTupleLockConflicts pins the row-lock conflict matrix used by NOWAIT's
+// cross-statement conflict detection (M0118-0003). FOR UPDATE
+// (HeapXmaxExclLock) conflicts with every held row lock; a shared request
+// (FOR SHARE / KEY SHARE) conflicts only with a pure-exclusive FOR UPDATE
+// holder; an unlocked (no-lock-bits) infomask never conflicts.
+func TestTupleLockConflicts(t *testing.T) {
+	const (
+		excl   = storage.HeapXmaxExclLock   // FOR UPDATE
+		shr    = storage.HeapXmaxShrLock    // FOR SHARE
+		keyshr = storage.HeapXmaxKeyShrLock // FOR KEY SHARE
+	)
+	cases := []struct {
+		name      string
+		requested uint16
+		held      uint16
+		want      bool
+	}{
+		{"update vs none", excl, 0, false},
+		{"update vs update", excl, excl, true},
+		{"update vs share", excl, shr, true},
+		{"update vs keyshare", excl, keyshr, true},
+		{"share vs update", shr, excl, true},
+		{"share vs share", shr, shr, false},
+		{"share vs keyshare", shr, keyshr, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tupleLockConflicts(tc.requested, tc.held); got != tc.want {
+				t.Errorf("tupleLockConflicts(%#x, %#x) = %v, want %v",
+					tc.requested, tc.held, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestLockRowsStampsTupleLockOnlyXmax — the headline tuple-
 // level locking step 2 contract. SELECT FOR UPDATE pulls each
 // scanned row through lockRowsOp's two-pass drain-then-stamp

@@ -99,6 +99,16 @@ type lockRowsOp struct {
 	// the new row — matching PostgreSQL's EvalPlanQualFetchRowMark behaviour.
 	filterPred planner.Expr
 	filterCols []catalog.Column
+
+	// waitPolicy is the effective NOWAIT / SKIP LOCKED / (default) blocking
+	// policy for the per-tuple lock acquisition in stampLock. Resolved once at
+	// Open from Locks[0].WaitPolicy (v0 assumes a single policy per LockRows;
+	// multi-clause merge is deferred, consistent with lockStrength). M0118-0003.
+	waitPolicy planner.LockWaitPolicy
+	// lockRelName is the name of the first locked relation, used to format the
+	// NOWAIT "could not obtain lock on row in relation \"%s\"" diagnostic with
+	// the upstream-canonical relation name. Resolved at Open from Locks[0].
+	lockRelName string
 }
 
 type pendingLockedRow struct {
@@ -337,6 +347,12 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 		default:
 			// FOR UPDATE (and FOR NO KEY UPDATE mapped to ForUpdate) use an exclusive lock.
 			o.lockStrength = storage.HeapXmaxExclLock
+		}
+		// Resolve the wait policy and relation name once for stampLock's
+		// per-tuple acquisition (NOWAIT / SKIP LOCKED). M0118-0003.
+		o.waitPolicy = o.plan.Locks[0].WaitPolicy
+		if o.plan.Locks[0].Table != nil {
+			o.lockRelName = o.plan.Locks[0].Table.Name
 		}
 	}
 	for i := range o.plan.Locks {
@@ -583,9 +599,29 @@ func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer)
 	}
 	// Acquire the tuple-level lock first so a concurrent UPDATE
 	// that races with us can't slip through between the xmax
-	// stamp and the lock registration.
-	if err := o.ctx.acquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
-		return storage.ItemPointer{}, false, false, err
+	// stamp and the lock registration. The wait policy decides how
+	// contention is handled: NOWAIT fails fast with 55P03, mirroring
+	// heapam.c's "could not obtain lock on row in relation \"%s\""
+	// (relation-qualified, ERRCODE_LOCK_NOT_AVAILABLE); the default
+	// blocks until the conflicting holder releases. The lockmgr tuple
+	// tag is the cross-session gate — a concurrent FOR UPDATE holder
+	// makes TryAcquire return ErrLockNotAvailable. M0118-0003.
+	switch o.waitPolicy {
+	case planner.LockWaitNoWait:
+		if err := o.ctx.tryAcquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Code == "55P03" {
+				return storage.ItemPointer{}, false, false, &ExecError{
+					Code:    "55P03",
+					Pos:     o.plan.Pos(),
+					Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
+				}
+			}
+			return storage.ItemPointer{}, false, false, err
+		}
+	default:
+		if err := o.ctx.acquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
+			return storage.ItemPointer{}, false, false, err
+		}
 	}
 	return o.stampLockInner(rel, ptr, 0)
 }
@@ -686,6 +722,40 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		}
 		// Indicate that the entry's row data should be refetched.
 		return succ, true, false, nil
+	}
+
+	// Another transaction holds a row-level *lock* (lock-only xmax) on this
+	// tuple. Unlike a real updater (handled above) the row is not relocated,
+	// but a conflicting NOWAIT request must still fail fast rather than
+	// silently overwriting the holder's xmax. The lockmgr tuple lock is
+	// statement-scoped (released at each Query message's end in dispatch.go),
+	// so cross-statement conflict detection relies on this persisted lock-only
+	// xmax — the same durable signal the real-updater path reads above.
+	//
+	// Scope guard (M0118-0003): only NOWAIT is intercepted here. The default
+	// blocking path and SKIP LOCKED keep their existing behaviour untouched
+	// (SKIP LOCKED is rejected earlier in Open pending the LIMIT-above-LockRows
+	// plan shape; blocking-FOR-UPDATE-on-a-row-lock and multixact shared locks
+	// are separate follow-ups), so no currently-passing spec changes.
+	if gerr == nil &&
+		tup.Header.Xmax != storage.InvalidTransactionID &&
+		storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
+		tup.Header.Xmax != o.ctx.Tx.XID &&
+		o.waitPolicy == planner.LockWaitNoWait &&
+		tupleLockConflicts(o.lockStrength, tup.Header.Infomask) {
+
+		xmax := tup.Header.Xmax
+		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
+			slot.Unlock()
+			o.ctx.Pool.Unpin(slot)
+			return storage.ItemPointer{}, false, false, &ExecError{
+				Code:    "55P03",
+				Pos:     o.plan.Pos(),
+				Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
+			}
+		}
+		// Locker is no longer active (committed/aborted): its row lock is
+		// released, so fall through and stamp our own lock-only xmax.
 	}
 
 	// Tuple is live (no real updater xmax from another xact). Stamp it.
@@ -813,6 +883,28 @@ func (o *lockRowsOp) tupleLockMode() lockmgr.Mode {
 		return lockmgr.RowShareLock
 	}
 	return lockmgr.ExclusiveLock
+}
+
+// tupleLockConflicts reports whether a newly requested row-lock strength
+// conflicts with the strength already recorded in a lock-only xmax infomask.
+// goopg distinguishes two effective strengths: FOR UPDATE → HeapXmaxExclLock
+// (pure exclusive bit) and FOR SHARE / KEY SHARE → HeapXmaxShrLock (both bits).
+// FOR UPDATE conflicts with any held row lock; a shared request conflicts only
+// with an exclusive (FOR UPDATE) holder. This mirrors the relevant rows of
+// PostgreSQL's row-lock conflict table for the single-locker (non-multixact)
+// case. M0118-0003.
+func tupleLockConflicts(requested, heldInfomask uint16) bool {
+	held := heldInfomask & storage.HeapXmaxLockMask
+	if held == 0 {
+		return false
+	}
+	// FOR UPDATE: exclusive bit set, key-share bit clear → conflicts with all.
+	if requested&storage.HeapXmaxExclLock != 0 && requested&storage.HeapXmaxKeyShrLock == 0 {
+		return true
+	}
+	// Shared request (FOR SHARE / KEY SHARE): conflicts only with a holder that
+	// took the pure-exclusive FOR UPDATE lock.
+	return held == storage.HeapXmaxExclLock
 }
 
 // markHeapLockDirty centralises the choice between
