@@ -8602,6 +8602,42 @@ Guards:
 > index-predicate / expression-index / function-arg-default / partition-key fixtures (the deferred twin), OR a
 > multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
+### Slice 298 — **PRODUCTION fix:** index-predicate BinaryOp full parenthesization `WHERE qty > 0` → `WHERE (qty > 0)`
+
+The deferred twin from slice 297. `executor.defaultExprToSQL` is the goopg-side deparse renderer feeding the
+**non-pretty** `pg_get_expr` contexts: index predicates (`idx.PredicateString`, rendered as `... WHERE <pred>`),
+expression-index columns (`idx.ColExprStrings[i]`, wrapped `(<expr>)` by `BuildIndexDef`), partition-key expressions
+(`expr.go` partition deparse), and function-argument defaults (`proargdefaults`). Like the pre-297 `formatExprForAttrdef`,
+it emitted each `BinaryOp` **without parentheses** — so a partial index `WHERE (qty + id) * mgr_id > 0` deparsed to the
+precedence-corrupt `WHERE qty + id * mgr_id > 0`, which **re-parses** as `qty + (id * mgr_id) > 0` on restore: a silent
+change to *which rows the partial index covers*.
+
+**Empirically the blast radius was small, contrary to the slice-297 deferral note.** A sweep of the round-trip fixtures
+found the *only* binary-op expression flowing through `defaultExprToSQL` was the slice-56 partial-index `WHERE qty > 0`
+(the function-arg-default and expression-index fixtures use a bare integer / a function call, no binary op). Crucially,
+that fixture's assertion was a **substring `Contains` on goopg's own dump output**, not a true diff vs real pg_dump — so
+it *masked* the divergence: real pg_dump 18.3 emits `WHERE (qty > 0)` (it fully parenthesizes even a single top-level
+comparison), but the fixture asserted the bare `WHERE qty > 0`.
+
+The fix mirrors slice 297: a `binaryOpSymbolForDefault(parser.OpCode) string` helper (the executor-package twin of
+`catalog.binaryOpSymbol`; duplicated because catalog ⇄ executor cannot import each other) maps the operator to its SQL
+text, and the `BinaryOp` arm now returns `"(" + left + " " + sym + " " + right + ")"`. The recursion parenthesizes
+operands, yielding byte-identical output across all four contexts. Verified vs real PG 18.3:
+`WHERE (qty > 0)`, `WHERE (((qty + id) * mgr_id) > 0)`, expr-index `(((qty + 1)))`, func default `((1 + 2) * 3)`,
+`PARTITION BY RANGE ((((a + b) * c)))`.
+
+Guards:
+- `TestDefaultExprToSQLBinaryParen` (executor unit, twin of `TestFormatExprForAttrdefExpr`): `(qty > 0)`, `(1 + 1)`,
+  nested `(((qty + id) * mgr_id) > 0)`.
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3): the existing `foo_qty_partial_idx` assertion is corrected
+  to `WHERE (qty > 0)`; a new `foo_calc_partial_idx` index pins `WHERE (((qty + id) * mgr_id) > 0)`, plus an absence
+  guard that the precedence-corrupt `WHERE qty + id * mgr_id` does not appear.
+
+> **Next (slice 299+):** the still-unfixtured `defaultExprToSQL` contexts now also benefit from the parenthesization
+> (expression-index columns with binary ops, partition-key expressions, function-arg defaults with binary ops) — add an
+> oracle-verified fixture for one of them to lock it in; OR a multi-column / NULL-typed DEFAULT variant on the
+> partition-leaf ALTER path.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

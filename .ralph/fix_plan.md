@@ -6356,6 +6356,29 @@ object support.
         (defcol calc column + assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 297), `.ralph/deferral_ledger.md`.
         **Next (slice 298+):** apply the same parenthesization to `executor.defaultExprToSQL` + update its 4 fixture families
         (the deferred twin), OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+      - **PROGRESS 2026-06-20 (loop #66):** **DU-002 slice 298 LANDED — PRODUCTION fix: index-predicate BinaryOp full
+        parenthesization (the slice-297 deferred twin).** `executor.defaultExprToSQL` is the deparse renderer feeding the
+        non-pretty `pg_get_expr` contexts — index predicates (`idx.PredicateString`), expression-index cols
+        (`idx.ColExprStrings`), partition-key exprs, function-arg defaults — and (like pre-297 `formatExprForAttrdef`) emitted
+        each `BinaryOp` WITHOUT parens. So a partial index `WHERE (qty + id) * mgr_id > 0` deparsed to the precedence-corrupt
+        `WHERE qty + id * mgr_id > 0`, re-parsing as `qty + (id * mgr_id) > 0` on restore — a SILENT change to which rows the
+        partial index covers. **The ledger overestimated the blast radius:** a fixture sweep found the ONLY binary op flowing
+        through `defaultExprToSQL` was the slice-56 `WHERE qty > 0`, and its substring-`Contains` assertion (goopg-vs-self, not a
+        true PG diff) MASKED the divergence — real pg_dump 18.3 emits `WHERE (qty > 0)` (full parens even for a single top-level
+        comparison). Fix: `binaryOpSymbolForDefault(parser.OpCode)` helper (executor twin of `catalog.binaryOpSymbol`; duplicated
+        — catalog⇄executor can't import each other) + `BinaryOp` arm returns `"(" + left + " " + sym + " " + right + ")"`.
+        Verified vs real PG 18.3: `WHERE (qty > 0)`, `WHERE (((qty + id) * mgr_id) > 0)`, expr-index `(((qty + 1)))`, func default
+        `((1 + 2) * 3)`, `PARTITION BY RANGE ((((a + b) * c)))`. Fixtures: corrected `foo_qty_partial_idx` → `WHERE (qty > 0)`;
+        NEW `foo_calc_partial_idx` pins `WHERE (((qty + id) * mgr_id) > 0)` + absence guard for the corrupt
+        `WHERE qty + id * mgr_id`. **Guards:** `TestDefaultExprToSQLBinaryParen` PASS (new executor unit, twin of
+        `TestFormatExprForAttrdefExpr`); full `./internal/executor/` suite PASS; `TestFormatExprForAttrdefExpr` PASS;
+        `TestPort_PgDumpConnectionSetup` PASS (4.73s vs real pg_dump 18.3); gofmt + `go vet` clean; pgbench pre-commit smoke on
+        commit. Files: `internal/executor/operators_ddl.go` (binaryOpSymbolForDefault + BinaryOp wrap), `internal/executor/
+        default_validate_test.go` (TestDefaultExprToSQLBinaryParen + parser import), `internal/testport/pgdump_connsetup_test.go`
+        (foo_calc_partial_idx + corrected/added assertions + absence guard), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 298), `.ralph/deferral_ledger.md`. **Next (slice 299+):** add an oracle-verified fixture for one still-unfixtured
+        `defaultExprToSQL` context (expr-index / partition-key / func-arg default with a binary op) — the renderer already
+        parenthesizes them, just no byte-verified fixture yet; OR a multi-column / NULL-typed partition-leaf DEFAULT variant.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

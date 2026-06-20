@@ -2418,6 +2418,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_qty_partial_idx ON public.foo (qty) WHERE qty > 0"); err != nil {
 		t.Fatalf("create partial index: %v", err)
 	}
+	// Slice 298: a partial-index predicate with NESTED arithmetic exercises the
+	// executor's defaultExprToSQL BinaryOp parenthesization (the index-predicate
+	// twin of slice 297's column-default fix). Without full parenthesization the
+	// predicate `(qty + id) * mgr_id > 0` deparses to the precedence-corrupted
+	// `qty + id * mgr_id > 0`, which restores as `qty + (id * mgr_id) > 0` — a
+	// silent semantic change. Real pg_dump 18.3 emits the fully-parenthesized form.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_calc_partial_idx ON public.foo (qty) WHERE (qty + id) * mgr_id > 0"); err != nil {
+		t.Fatalf("create nested-arithmetic partial index: %v", err)
+	}
 	// DESC NULLS LAST exercises the DESC branch with a non-default NULLS override.
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_name_desc_idx ON public.foo (name DESC NULLS LAST)"); err != nil {
 		t.Fatalf("create DESC index: %v", err)
@@ -6450,8 +6459,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		indexDefs := []string{
 			// plain (all-default ASC NULLS LAST) — no ordering clause
 			"CREATE INDEX foo_name_idx ON public.foo USING btree (name);",
-			// partial index predicate (slice-56 regression guard — already worked)
-			"CREATE INDEX foo_qty_partial_idx ON public.foo USING btree (qty) WHERE qty > 0;",
+			// partial index predicate. Slice 298 PRODUCTION fix: real pg_dump 18.3
+			// fully parenthesizes the predicate (pg_get_expr prettyFlags=0), so even a
+			// single top-level comparison dumps as `WHERE (qty > 0)`, not the bare
+			// `WHERE qty > 0` goopg previously emitted — a fidelity divergence the
+			// old self-substring assertion masked.
+			"CREATE INDEX foo_qty_partial_idx ON public.foo USING btree (qty) WHERE (qty > 0);",
+			// Slice 298: nested arithmetic in the predicate must be fully
+			// parenthesized to preserve precedence on restore (verified byte-identical
+			// vs real pg_dump 18.3).
+			"CREATE INDEX foo_calc_partial_idx ON public.foo USING btree (qty) WHERE (((qty + id) * mgr_id) > 0);",
 			// DESC with a non-default NULLS LAST override
 			"CREATE INDEX foo_name_desc_idx ON public.foo USING btree (name DESC NULLS LAST);",
 			// DESC (default NULLS FIRST suppressed) + ASC NULLS FIRST override
@@ -6489,6 +6506,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped/mangled a secondary index; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// Slice 298 negative guard: the precedence-corrupt under-parenthesized
+		// predicate must NOT appear — its presence would mean a restore re-parses
+		// `(qty + id) * mgr_id` as `qty + (id * mgr_id)`, silently changing which
+		// rows the partial index covers.
+		if strings.Contains(res.Stdout, "WHERE qty + id * mgr_id") {
+			t.Errorf("pg_dump emitted a precedence-corrupt (under-parenthesized) index predicate\n  full stdout=%q", res.Stdout)
 		}
 		// Slice 134/135/136/137/138 (regression guard): a plain unique/secondary
 		// index or a default-distinct UNIQUE constraint must NOT gain a stray NULLS

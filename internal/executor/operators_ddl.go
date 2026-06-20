@@ -3387,6 +3387,51 @@ func exprToString(e parser.Expr) string {
 // defaultExprToSQL converts a default-argument expression to a SQL string
 // that can be re-evaluated at call time. Handles literal constants; for
 // complex expressions it falls back to a best-effort fmt.Sprintf form.
+// binaryOpSymbolForDefault maps a parser.BinaryOp operator to the SQL operator
+// text PG's pg_get_expr emits between the operands. Returns "" for an operator
+// the renderer does not model (the caller then falls through, leaving the
+// expression un-rendered as before). This is the executor-package twin of
+// catalog.binaryOpSymbol (DU-002 slice 297) — the two MUST stay in sync; they
+// are deliberately duplicated because catalog and executor cannot import each
+// other (DU-002 slice 298).
+func binaryOpSymbolForDefault(op parser.OpCode) string {
+	switch op {
+	case parser.OpAdd:
+		return "+"
+	case parser.OpSub:
+		return "-"
+	case parser.OpMul:
+		return "*"
+	case parser.OpDiv:
+		return "/"
+	case parser.OpMod:
+		return "%"
+	case parser.OpConcat:
+		return "||"
+	case parser.OpEq:
+		return "="
+	case parser.OpLt:
+		return "<"
+	case parser.OpGt:
+		return ">"
+	case parser.OpLe:
+		return "<="
+	case parser.OpGe:
+		return ">="
+	case parser.OpNe:
+		return "<>"
+	case parser.OpAnd:
+		return "AND"
+	case parser.OpOr:
+		return "OR"
+	case parser.OpLike:
+		return "LIKE"
+	case parser.OpNotLike:
+		return "NOT LIKE"
+	}
+	return ""
+}
+
 func defaultExprToSQL(e parser.Expr) string {
 	if e == nil {
 		return ""
@@ -3438,41 +3483,21 @@ func defaultExprToSQL(e parser.Expr) string {
 			return "NOT " + defaultExprToSQL(v.Operand)
 		}
 	case *parser.BinaryOp:
+		// Fully parenthesize every binary OpExpr `(left op right)`, matching PG's
+		// pg_get_expr in the prettyFlags=0 mode it uses for the contexts this
+		// renderer feeds — index predicates (pg_get_indexdef WHERE), expression
+		// index columns, partition-key expressions, and function-argument defaults
+		// (pg_get_function_arguments). Empirically vs real pg_dump 18.3:
+		// `WHERE a > 0` dumps `WHERE (a > 0)`, `DEFAULT (1+2)*3` dumps
+		// `DEFAULT ((1 + 2) * 3)`. Without the parens a nested-arithmetic predicate/
+		// default round-trips with corrupted precedence on restore (e.g.
+		// `(1 + 2) * 3` deparsed as `1 + 2 * 3` evaluates to 7, not 9). This is the
+		// executor-twin of catalog.formatExprForAttrdef's parenthesization
+		// (DU-002 slice 297); keep the two in sync (DU-002 slice 298).
 		left := defaultExprToSQL(v.Left)
 		right := defaultExprToSQL(v.Right)
-		switch v.Op {
-		case parser.OpAdd:
-			return left + " + " + right
-		case parser.OpSub:
-			return left + " - " + right
-		case parser.OpMul:
-			return left + " * " + right
-		case parser.OpDiv:
-			return left + " / " + right
-		case parser.OpMod:
-			return left + " % " + right
-		case parser.OpConcat:
-			return left + " || " + right
-		case parser.OpEq:
-			return left + " = " + right
-		case parser.OpLt:
-			return left + " < " + right
-		case parser.OpGt:
-			return left + " > " + right
-		case parser.OpLe:
-			return left + " <= " + right
-		case parser.OpGe:
-			return left + " >= " + right
-		case parser.OpNe:
-			return left + " <> " + right
-		case parser.OpAnd:
-			return left + " AND " + right
-		case parser.OpOr:
-			return left + " OR " + right
-		case parser.OpLike:
-			return left + " LIKE " + right
-		case parser.OpNotLike:
-			return left + " NOT LIKE " + right
+		if sym := binaryOpSymbolForDefault(v.Op); sym != "" {
+			return "(" + left + " " + sym + " " + right + ")"
 		}
 	case *parser.TypedStringLit:
 		return v.Type + " '" + strings.ReplaceAll(v.Value, "'", "''") + "'"
