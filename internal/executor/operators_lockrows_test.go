@@ -691,11 +691,13 @@ func TestForShareCompatibleMultipleHolders(t *testing.T) {
 	}
 }
 
-// TestLockRowsRejectsSkipLocked — SKIP LOCKED stays deferred
-// pending tuple-level pessimistic locking (relation-coarse
-// locks have no per-row "skip" semantic). Pins the explicit
-// 0A000 reject so the diagnostic message stays stable.
-func TestLockRowsRejectsSkipLocked(t *testing.T) {
+// TestLockRowsSkipLockedNoContention — SKIP LOCKED is now honored
+// (M0118-0003). With no concurrent locker there is nothing to skip,
+// so `FOR UPDATE SKIP LOCKED` must succeed and return every row, just
+// like plain FOR UPDATE. The per-row skip semantics (dropping rows a
+// concurrent transaction holds) are exercised end-to-end by the
+// skip-locked isolation spec (TestPort_IsolationSkipLocked).
+func TestLockRowsSkipLockedNoContention(t *testing.T) {
 	ctx, cat, cleanup := newStorageFixture(t)
 	defer cleanup()
 	ctx.LockMgr = lockmgr.New()
@@ -704,16 +706,12 @@ func TestLockRowsRejectsSkipLocked(t *testing.T) {
 	seedItems(t, ctx, tbl)
 
 	_ = catalog.Catalog(cat)
-	_, err := runForUpdate(t, ctx, "SELECT id FROM items FOR UPDATE SKIP LOCKED")
-	if err == nil {
-		t.Fatal("expected SKIP LOCKED rejection, got nil")
+	rows, err := runForUpdate(t, ctx, "SELECT id FROM items FOR UPDATE SKIP LOCKED")
+	if err != nil {
+		t.Fatalf("SKIP LOCKED with no contention: %v", err)
 	}
-	ee, ok := err.(*ExecError)
-	if !ok {
-		t.Fatalf("err = %T, want *ExecError", err)
-	}
-	if ee.Code != "0A000" {
-		t.Errorf("code = %q, want 0A000", ee.Code)
+	if len(rows) != 3 {
+		t.Errorf("rows = %d, want 3 (nothing locked → nothing skipped)", len(rows))
 	}
 }
 

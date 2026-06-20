@@ -985,6 +985,68 @@ Verified by `TestPort_IsolationNowait` (all six permutations vs PG 18.3), the ne
 by re-running `lock-committed-update` (the other tuple-lock spec) green to confirm
 the blocking path is regression-free. Isolation pass count 33 → 34.
 
+## Slice M0118-0003 — `skip-locked` (FOR UPDATE SKIP LOCKED LIMIT n)
+
+`skip-locked.spec` runs two sessions, each repeatedly
+`SELECT * FROM queue ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1` over a two-row
+queue. Each session must claim the lowest-id row it can lock, *skipping* any row
+the other session holds, so the two sessions take disjoint rows (1 and 2) and
+never block. Three changes land it:
+
+- **Planner — lift the `LIMIT` above the `LockRows` (`liftLimitAboveLockRows`).**
+  goopg's default plan is `LockRows(Project(Limit(Sort(Scan))))`, applying the
+  `LIMIT` *below* the lock — so a skipped (contended) row shrinks the result
+  instead of pulling the next lockable row. PG plans `Limit → LockRows → Sort`.
+  When any lock clause uses `SKIP LOCKED` and the top `Project` directly wraps a
+  (non-`WITH TIES`) `Limit`, the planner detaches that `Limit`, re-parents it
+  *above* a new `LockRows`, and copies the `LIMIT`/`OFFSET` expressions onto the
+  `LockRows` (`LimitCount` / `OffsetCount`). The lift is scoped to `SKIP LOCKED`
+  so every existing `FOR UPDATE`/`FOR SHARE` plan (incl. TPC-H) is byte-for-byte
+  unchanged (`TestPlanForUpdateLimitNoSkipKeepsLimitBelow`).
+
+- **Executor — cap the drain at `LIMIT` *successfully-locked* rows.**
+  `lockRowsOp.Open` evaluates `LimitCount` (+`OffsetCount`) exactly like
+  `limitOp.Open` and sets `maxDrain`. `drainAndStamp` already stops once
+  `successCount` reaches `maxDrain`, and a skipped row takes the `epqSkipped`
+  `continue` path *without* incrementing `successCount` — so the lock claims
+  exactly `LIMIT` rows, pulling past skipped ones.
+
+- **Executor — silently drop contended rows.** The `SKIP LOCKED` reject in
+  `Open` is removed (the relation-level `RowShareLock` is still taken with the
+  normal blocking policy — `SKIP LOCKED` governs only per-row locks). `stampLock`
+  gains a `SKIP LOCKED` arm that `tryAcquireTupleLock`s and returns `epqSkipped`
+  on `55P03` (a concurrent in-statement holder); `stampLockInner`'s lock-only-xmax
+  branch — the same cross-statement signal `nowait` reads — now also fires under
+  `SKIP LOCKED`, returning `epqSkipped` when the conflicting locker is still
+  active (vs `nowait`'s fail-fast `55P03`).
+
+- **Executor — preserve the per-row TID through `Sort`.** The blocker the
+  nowait-slice notes left open: with a `Sort` between `LockRows` and the scan,
+  `findScanLeaf` cannot reach the leaf and the sort dropped the slot's
+  `hasCTID`/`ctid` side-channel, so *no* row was ever locked (the spec returned
+  row 1 everywhere instead of 1/2). `sortOp` now carries a compact `[]sortCTID`
+  in lockstep with its in-memory rows (sorted together via a permutation),
+  re-attaching it on `Next`; `projectOp` already propagates it up to
+  `lockRowsOp.drainAndStamp`'s `ms.hasCTID` fallback. Spilled sorts disable the
+  side-channel (the N-way merge can't carry it) — rare for row-locking queries
+  and no worse than before.
+
+**Scope boundary (deferred siblings).** Only base `skip-locked` lands.
+`skip-locked-2` needs multixact (two `FOR SHARE` holders form a multixact, then
+an upgrade skips); `skip-locked-3` needs the **cross-statement tuple-lock wait
+queue** (a waiter holding the tuple lock while next-in-line for the row lock),
+which goopg's statement-scoped lock manager does not model; `skip-locked-4` needs
+`EvalPlanQualFetch`'s SKIP-LOCKED skip over an advisory-lock-gated updated CTID
+chain. Tracked in the deferral ledger.
+
+Verified by `TestPort_IsolationSkipLocked` (all 21 generated permutations vs PG
+18.3, byte-for-byte), the new `TestPlanSkipLockedLiftsLimitAboveLockRows` /
+`TestPlanForUpdateLimitNoSkipKeepsLimitBelow` planner tests, the rewritten
+`TestLockRowsSkipLockedNoContention` executor test, and by re-running `nowait`,
+`lock-committed-update`, `lock-committed-keyupdate`, and `eval-plan-qual` green to
+confirm the blocking / NOWAIT / EPQ paths and the `Sort` change are
+regression-free. Isolation pass count 34 → 35.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact

@@ -98,6 +98,57 @@ func TestPlanSelectForShareStrength(t *testing.T) {
 	}
 }
 
+// TestPlanSkipLockedLiftsLimitAboveLockRows — SKIP LOCKED with a LIMIT must
+// plan `Limit → LockRows → ... ` so the row lock claims rows in the LIMIT's
+// order and stops after LIMIT successfully-locked rows (skipped rows pull the
+// next lockable row instead of shrinking the result). The default plan puts
+// the Limit below the LockRows; this guards the lift. M0118-0003.
+func TestPlanSkipLockedLiftsLimitAboveLockRows(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t, "SELECT aid FROM pgbench_accounts ORDER BY aid FOR UPDATE SKIP LOCKED LIMIT 1")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	lim, ok := node.(*Limit)
+	if !ok {
+		t.Fatalf("root node = %T, want *Limit (lifted above LockRows)", node)
+	}
+	lr, ok := lim.Child.(*LockRows)
+	if !ok {
+		t.Fatalf("Limit.Child = %T, want *LockRows", lim.Child)
+	}
+	if lr.LimitCount == nil {
+		t.Errorf("LockRows.LimitCount = nil, want the lifted LIMIT expression for drain capping")
+	}
+	if lr.Locks[0].WaitPolicy != LockWaitSkipLocked {
+		t.Errorf("WaitPolicy = %v, want LockWaitSkipLocked", lr.Locks[0].WaitPolicy)
+	}
+	// No nested Limit should remain below the LockRows.
+	if _, nested := lr.Child.(*Limit); nested {
+		t.Errorf("LockRows.Child is *Limit; the Limit must be lifted ABOVE, not duplicated below")
+	}
+}
+
+// TestPlanForUpdateLimitNoSkipKeepsLimitBelow — guardrail: a plain
+// FOR UPDATE ... LIMIT (no SKIP LOCKED) keeps the default plan shape
+// (LockRows at the top, Limit below it). The lift is scoped to SKIP LOCKED
+// so existing FOR UPDATE plans (incl. TPC-H) are byte-for-byte unchanged.
+func TestPlanForUpdateLimitNoSkipKeepsLimitBelow(t *testing.T) {
+	cat := pgbenchCatalog(t)
+	stmt := parseOne(t, "SELECT aid FROM pgbench_accounts ORDER BY aid FOR UPDATE LIMIT 1")
+	node, err := Plan(stmt, cat)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	if _, ok := node.(*Limit); ok {
+		t.Fatalf("root node = *Limit; plain FOR UPDATE LIMIT should keep LockRows on top (no lift)")
+	}
+	if _, ok := node.(*LockRows); !ok {
+		t.Fatalf("root node = %T, want *LockRows", node)
+	}
+}
+
 // TestPlanSelectWithoutLockingNoWrapper — rollout guardrail:
 // SELECTs without locking clauses produce the bare plan tree as
 // before, no LockRows wrapper.

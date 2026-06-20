@@ -368,7 +368,13 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 		rel := ctx.Catalog.RelFileNode(lk.Table)
 		var err error
 		switch lk.WaitPolicy {
-		case planner.LockWaitBlock:
+		case planner.LockWaitBlock, planner.LockWaitSkipLocked:
+			// SKIP LOCKED affects only per-row locks: the relation-level
+			// RowShareLock is always acquired with the normal blocking
+			// policy. Mirrors upstream — the LockWaitPolicy governs
+			// heap_lock_tuple, not the relation lock. The actual row
+			// skipping happens per-tuple in stampLock / stampLockInner.
+			// M0118-0003.
 			err = ctx.acquireRelLock(rel, lockmgr.RowShareLock)
 		case planner.LockWaitNoWait:
 			// NOWAIT: try once and bail with 55P03 if the
@@ -377,20 +383,6 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 			// row" diagnostic at the relation-coarse layer
 			// goopg has today.
 			err = ctx.tryAcquireRelLock(rel, lockmgr.RowShareLock)
-		case planner.LockWaitSkipLocked:
-			// SKIP LOCKED needs tuple-level lock probing to
-			// silently drop contended rows from the result.
-			// goopg's row-locking is relation-coarse — there
-			// are no individual rows to skip, only the whole
-			// relation. Reject here so users see the specific
-			// "tuple-level pessimistic locking is the
-			// follow-up" message rather than silently producing
-			// an empty result on contention.
-			return &ExecError{
-				Code:    "0A000",
-				Pos:     o.plan.Pos(),
-				Message: "SKIP LOCKED requires tuple-level pessimistic locking (deferred follow-up to M0021)",
-			}
 		default:
 			return &ExecError{
 				Code:    "XX000",
@@ -434,6 +426,31 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	// out-of-range error and incorrectly skip the row (M0100-0010).
 	if o.filterPred != nil && filterPredMaxColRef(o.filterPred) >= len(o.filterCols) {
 		o.filterPred = nil
+	}
+	// When the planner lifted a LIMIT above this LockRows (SKIP LOCKED), cap the
+	// drain at LIMIT (+OFFSET) successfully-locked rows so the row lock claims
+	// only as many rows as the LIMIT demands — skipped (contended) rows do not
+	// count toward the cap (see drainAndStamp). Evaluated here exactly like
+	// limitOp.Open. nil LimitCount → unbounded drain (existing behaviour, and
+	// the EXISTS maxDrain=1 set by existsImpl is preserved). M0118-0003.
+	if o.plan.LimitCount != nil {
+		v, err := evalExpr(o.plan.LimitCount, nil, ctx)
+		if err != nil {
+			return err
+		}
+		if !v.IsNull() && v.Kind == KindInt && v.Int >= 0 {
+			drain := v.Int
+			if o.plan.OffsetCount != nil {
+				ov, oerr := evalExpr(o.plan.OffsetCount, nil, ctx)
+				if oerr != nil {
+					return oerr
+				}
+				if !ov.IsNull() && ov.Kind == KindInt && ov.Int > 0 {
+					drain += ov.Int
+				}
+			}
+			o.maxDrain = int(drain)
+		}
 	}
 	return nil
 }
@@ -618,6 +635,20 @@ func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer)
 			}
 			return storage.ItemPointer{}, false, false, err
 		}
+	case planner.LockWaitSkipLocked:
+		// SKIP LOCKED: try the tuple lock once. If a concurrent session holds
+		// it (it is mid-statement on this row), skip the row silently rather
+		// than blocking — mirrors heap_lock_tuple returning HeapTupleWouldBlock
+		// under LockWaitSkip. Cross-statement conflicts are detected later from
+		// the persisted lock-only xmax in stampLockInner (goopg's lockmgr tuple
+		// lock is statement-scoped, so a committed-but-active holder's lock has
+		// already been released here but its heap xmax persists). M0118-0003.
+		if err := o.ctx.tryAcquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Code == "55P03" {
+				return storage.ItemPointer{}, false, true, nil // epqSkipped: drop contended row
+			}
+			return storage.ItemPointer{}, false, false, err
+		}
 	default:
 		if err := o.ctx.acquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
 			return storage.ItemPointer{}, false, false, err
@@ -732,22 +763,28 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 	// so cross-statement conflict detection relies on this persisted lock-only
 	// xmax — the same durable signal the real-updater path reads above.
 	//
-	// Scope guard (M0118-0003): only NOWAIT is intercepted here. The default
-	// blocking path and SKIP LOCKED keep their existing behaviour untouched
-	// (SKIP LOCKED is rejected earlier in Open pending the LIMIT-above-LockRows
-	// plan shape; blocking-FOR-UPDATE-on-a-row-lock and multixact shared locks
-	// are separate follow-ups), so no currently-passing spec changes.
+	// Scope guard (M0118-0003): NOWAIT and SKIP LOCKED are intercepted here.
+	// The default blocking path keeps its existing behaviour untouched
+	// (blocking-FOR-UPDATE-on-a-row-lock and multixact shared locks are
+	// separate follow-ups). When the conflicting holder is still active,
+	// NOWAIT fails fast with 55P03 and SKIP LOCKED drops the row silently;
+	// when the holder has finished, both fall through and re-stamp our own
+	// lock-only xmax. No currently-passing spec changes.
 	if gerr == nil &&
 		tup.Header.Xmax != storage.InvalidTransactionID &&
 		storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
 		tup.Header.Xmax != o.ctx.Tx.XID &&
-		o.waitPolicy == planner.LockWaitNoWait &&
+		(o.waitPolicy == planner.LockWaitNoWait || o.waitPolicy == planner.LockWaitSkipLocked) &&
 		tupleLockConflicts(o.lockStrength, tup.Header.Infomask) {
 
 		xmax := tup.Header.Xmax
 		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
 			slot.Unlock()
 			o.ctx.Pool.Unpin(slot)
+			if o.waitPolicy == planner.LockWaitSkipLocked {
+				// SKIP LOCKED: silently drop the contended row.
+				return storage.ItemPointer{}, false, true, nil // epqSkipped
+			}
 			return storage.ItemPointer{}, false, false, &ExecError{
 				Code:    "55P03",
 				Pos:     o.plan.Pos(),
