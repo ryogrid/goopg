@@ -1,31 +1,35 @@
-Task: DU-002 slice 285 (loop #53) — COMPLETE, ready to commit + push.
+Task: DU-002 slice 286 (loop #54) — COMPLETE, ready to commit + push.
 
-Last landed: a MULTI-ATTRIBUTE generation expression inherited onto a partition leaf
-round-trips. Where slices 283/284 referenced a SINGLE column in the generation clause
-(`ga * 2`), slice 285's `gb` is `GENERATED ALWAYS AS (ga + gc) STORED` — a binary
-expression over two plain columns. SAME render path as slice 283 (attgenerated forces
-attrdefs[].separate=false unconditionally, pg_dump.c:9507; ispartition forces
-shouldPrintColumn true for every column, slices 281/282) → leaf body prints
-`gb integer GENERATED ALWAYS AS (ga + gc) STORED` inline. NEW fact under test: each Var
-resolves to the correct inherited column NAME on the leaf (not attnum-shifted/dropped/
-swapped). NO production change — goopg already deparses multi-column generation
-expressions (slice 59) and inherits parent columns onto partition leaves (281–284).
+Last landed: a FORWARD-REFERENCE generation expression inherited onto a partition leaf
+round-trips. Where slices 283/285 referenced columns declared BEFORE the generated column
+(`gb` attnum 3 over `ga`/`gc` attnum 1/2), slice 286's `gz` is attnum 1 and references
+`ya` (attnum 2) + `yc` (attnum 3) — both declared AFTER it. PG puts every table column in
+scope for a generation expr regardless of declaration order, so `(ya + yc)` is a legal
+forward reference. SAME render path as slice 285 (attgenerated forces attrdefs[].separate=
+false unconditionally, pg_dump.c:9507; ispartition forces shouldPrintColumn true for every
+column, slices 281/282) → leaf body prints columns in attnum order: inline
+`gz integer GENERATED ALWAYS AS (ya + yc) STORED` FIRST, then `ya integer`, `yc integer`.
+NEW fact under test: generation deparse resolves each Var by column NAME, not via a
+forward-only positional scan (which would see neither operand). NO production change —
+goopg resolves generation cols by name (evalGeneratedExpr over catalog.Column) and inherits
+parent columns onto partition leaves (281–285); the two compose.
 
-Fixture: `CREATE TABLE public.pgmc (ga integer, gc integer, gb integer GENERATED ALWAYS
-AS (ga + gc) STORED) PARTITION BY LIST (ga)` + `CREATE TABLE public.pgmc_1 PARTITION OF
-public.pgmc FOR VALUES IN (1)`.
-Asserted: pgmc_1 block has `ga integer` + `gc integer` + inline `gb integer GENERATED
-ALWAYS AS (ga + gc) STORED`; `ATTACH PARTITION public.pgmc_1 FOR VALUES IN (1)` survives.
+Fixture: `CREATE TABLE public.pgfr (gz integer GENERATED ALWAYS AS (ya + yc) STORED,
+ya integer, yc integer) PARTITION BY LIST (ya)` + `CREATE TABLE public.pgfr_1 PARTITION OF
+public.pgfr FOR VALUES IN (1)`.
+Asserted: pgfr_1 block has inline `gz integer GENERATED ALWAYS AS (ya + yc) STORED` BEFORE
+`ya integer` + `yc integer` (ordering check via strings.Index); `ATTACH PARTITION
+public.pgfr_1 FOR VALUES IN (1)` survives.
 
 Files:
-- internal/testport/pgdump_connsetup_test.go — pgmc fixture (after pvna_1) + assertion
-  block (after pvna_1 ATTACH assertion).
-- docs/design/0110-0001-pg-dump-tap-port.md — Slice 285 section + Next (286) note.
-- .ralph/fix_plan.md — slice 285 progress (loop #53).
+- internal/testport/pgdump_connsetup_test.go — pgfr fixture (after pgmc_1) + assertion
+  block (after pgmc_1 ATTACH assertion).
+- docs/design/0110-0001-pg-dump-tap-port.md — Slice 286 section + Next (287) note.
+- .ralph/fix_plan.md — slice 286 progress (loop #54).
 
-Gates: gofmt clean; go build clean; TestPort_PgDumpConnectionSetup PASS (3.78s, vs real
+Gates: gofmt clean; go vet clean; TestPort_PgDumpConnectionSetup PASS (3.75s, vs real
 pg_dump 18.3); pgbench pre-commit smoke (enforced by .githooks/pre-commit on commit).
 
-Next (slice 286+): a multi-column / NULL-typed DEFAULT variant on the partition-leaf
-ALTER path; OR a generated column whose expression references the partition-key column
-itself (Var-to-key deparse through the leaf).
+Next (slice 287+): a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER
+path; OR a generated column whose expression mixes a forward + backward Var reference plus
+a literal (e.g. `gz = ya + 1 + yc`).

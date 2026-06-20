@@ -6111,8 +6111,26 @@ object support.
         plain inherited `ga integer`/`gc integer` + inline `gb integer GENERATED ALWAYS AS (ga + gc) STORED`, and `ATTACH
         PARTITION public.pgmc_1 FOR VALUES IN (1)` survives). gofmt + `go build` clean; pgbench pre-commit smoke on commit.
         Design: `0110-0001` Slice 285.
-        **Next (slice 286+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
-        column whose expression references the partition-key column itself (Var-to-key deparse through the leaf).
+      - **PROGRESS 2026-06-20 (loop #54):** **DU-002 slice 286 LANDED — a FORWARD-REFERENCE generation expression inherited
+        onto a partition leaf round-trips, proving the generation deparse resolves Vars by column NAME, not declaration order
+        (no production change; declaration-order extension of slice 285).** Where slices 283/285 referenced columns declared
+        BEFORE the generated column (`gb` at attnum 3 over `ga`/`gc` at attnum 1/2), slice 286's `gz` is attnum 1 and references
+        `ya` (attnum 2) and `yc` (attnum 3) — both declared AFTER it. PG places every table column in scope for a generation
+        expression regardless of declaration order, so `(ya + yc)` is a legal forward reference. The render path is identical to
+        slice 285 (attgenerated forces `attrdefs[].separate=false` unconditionally, pg_dump.c:9507; `ispartition` forces
+        shouldPrintColumn true for every column, slices 281/282) so the leaf body prints columns in attnum order: inline
+        `gz integer GENERATED ALWAYS AS (ya + yc) STORED` FIRST, then `ya integer`, `yc integer`; the NEW fact is that the
+        deparse resolves each Var by NAME, not via a forward-only positional scan (which would see neither operand). Fixture:
+        `CREATE TABLE public.pgfr (gz integer GENERATED ALWAYS AS (ya + yc) STORED, ya integer, yc integer) PARTITION BY LIST
+        (ya)` + `CREATE TABLE public.pgfr_1 PARTITION OF public.pgfr FOR VALUES IN (1)`. NO production change — goopg resolves
+        generation-expression columns by name (`evalGeneratedExpr` over `catalog.Column`) and inherits parent columns onto
+        partition leaves (slices 281–285); the two compose. A regression resolving Vars positionally relative to the generated
+        column's attnum would corrupt the clause. **Guards:** `TestPort_PgDumpConnectionSetup` PASS (3.75s; vs real pg_dump 18.3
+        — asserts the `pgfr_1` block prints the inline `gz integer GENERATED ALWAYS AS (ya + yc) STORED` BEFORE the plain
+        inherited `ya integer`/`yc integer`, and `ATTACH PARTITION public.pgfr_1 FOR VALUES IN (1)` survives). gofmt + `go vet`
+        clean; pgbench pre-commit smoke on commit. Design: `0110-0001` Slice 286.
+        **Next (slice 287+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
+        column whose expression mixes a forward and a backward Var reference plus a literal (e.g. `gz = ya + 1 + yc`).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

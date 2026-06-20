@@ -8284,8 +8284,32 @@ Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts th
 columns `ga integer` and `gc integer` plus the inline `gb integer GENERATED ALWAYS AS (ga + gc) STORED`, and that
 `ATTACH PARTITION public.pgmc_1 FOR VALUES IN (1)` survives).
 
-> **Next (slice 286+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
-> column whose expression references the partition-key column itself (Var-to-key deparse through the leaf).
+### Slice 286 — forward-reference generation expression inherited onto a partition leaf (name-based Var resolution, not declaration order)
+
+Slices 283/285 proved a generated column whose expression references columns declared **before** it (`gb` at attnum 3 over
+`ga`/`gc` at attnum 1/2). This slice flips the declaration order: the parent
+`CREATE TABLE pgfr (gz integer GENERATED ALWAYS AS (ya + yc) STORED, ya integer, yc integer) PARTITION BY LIST (ya)`
+declares the generated column `gz` **first** (attnum 1), referencing `ya` (attnum 2) and `yc` (attnum 3) — both declared
+*after* it. PG places every table column in scope for a generation expression regardless of declaration order, so
+`(ya + yc)` is legal as a forward reference. The leaf `CREATE TABLE pgfr_1 PARTITION OF pgfr FOR VALUES IN (1)` INHERITS
+all three (`attislocal=false`). The *render path* is identical to slice 285 — `attgenerated` forces
+`attrdefs[].separate=false` unconditionally (pg_dump.c:9507) and `ispartition` forces `shouldPrintColumn` true for every
+column (slices 281/282) — so the leaf body prints columns in attnum order: the inline
+`gz integer GENERATED ALWAYS AS (ya + yc) STORED` first, then `ya integer`, `yc integer`. The **new** fact under test is
+that the generation deparse resolves each Var by column NAME, not via a forward-only positional scan that would only see
+columns up to the generated column's own attnum (where it would find neither operand).
+
+**No production change required.** goopg resolves generation-expression columns by name (`evalGeneratedExpr` over
+`catalog.Column`) and inherits parent columns onto partition leaves (slices 281–285); the two compose. Verified
+byte-identical vs PG 18.3. A regression that resolved Vars positionally relative to the generated column's attnum would
+corrupt the `(ya + yc)` clause here, where neither operand precedes `gz`.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgfr_1` block prints the inline
+`gz integer GENERATED ALWAYS AS (ya + yc) STORED` **before** the two plain inherited columns `ya integer` and
+`yc integer`, and that `ATTACH PARTITION public.pgfr_1 FOR VALUES IN (1)` survives).
+
+> **Next (slice 287+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
+> column whose expression mixes a forward and a backward Var reference plus a literal (e.g. `gz = ya + 1 + yc`).
 
 ## Deferred (002–010) — catalog surface estimate
 

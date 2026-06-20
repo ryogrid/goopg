@@ -1529,6 +1529,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pgmc_1: %v", err)
 	}
 
+	// Slice 286: a FORWARD-REFERENCE generation expression inherited onto a partition
+	// leaf. Slice 285 proved a multi-attr generation expression where every referenced
+	// column was declared BEFORE the generated column (ga=attnum1, gc=attnum2 →
+	// gb=attnum3). This slice flips the declaration order: the generated column `gz` is
+	// attnum 1 and references `ya` (attnum 2) and `yc` (attnum 3), both declared AFTER
+	// it. The new fact under test is that the generation deparse resolves each Var by
+	// column NAME (not by a positional/forward-only scan that would only see columns up
+	// to the generated column's own attnum). PG places all table columns in scope for a
+	// generation expression regardless of declaration order, so `(ya + yc)` is legal even
+	// though both operands come later in the body. The render path is identical to slices
+	// 283/285 — attgenerated forces attrdefs[].separate=false unconditionally
+	// (pg_dump.c:9507), ispartition forces shouldPrintColumn true for every column (slices
+	// 281/282) — so the leaf body prints columns in attnum order: the inline
+	// `gz integer GENERATED ALWAYS AS (ya + yc) STORED` FIRST, then `ya integer`,
+	// `yc integer`. A regression that resolved Vars positionally relative to the generated
+	// column's attnum (a forward-only scan) would drop or corrupt the `(ya + yc)` clause
+	// here, where neither operand precedes `gz`. NO production change — goopg resolves
+	// generation-expression columns by name (evalGeneratedExpr over catalog.Column) and
+	// inherits parent columns onto partition leaves (slices 281–285); the two compose.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgfr (gz integer GENERATED ALWAYS AS (ya + yc) STORED, ya integer, yc integer) PARTITION BY LIST (ya)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgfr with forward-reference generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgfr_1 PARTITION OF public.pgfr FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pgfr_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4418,6 +4444,44 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgmc_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgmc_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 286 (asserted):** a FORWARD-REFERENCE generation expression inherited
+		// onto a partition leaf. Where slice 285's `gb` referenced only columns declared
+		// before it, pgfr_1's inherited `gz` is attnum 1 and references `ya` (attnum 2) and
+		// `yc` (attnum 3), both declared AFTER it. The leaf body must carry the inline
+		// generated `gz integer GENERATED ALWAYS AS (ya + yc) STORED` FIRST (attnum order),
+		// then the two plain columns `ya integer`, `yc integer`. This asserts the generation
+		// deparse resolves both Vars by NAME even though neither operand precedes the
+		// generated column — a forward-only positional scan would corrupt the `(ya + yc)`
+		// clause here.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgfr_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			gzIdx := strings.Index(block, "gz integer GENERATED ALWAYS AS (ya + yc) STORED")
+			if gzIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the forward-reference inline generated column on a partition leaf; want %q in pgfr_1 block\n  block=%q", "gz integer GENERATED ALWAYS AS (ya + yc) STORED", block)
+			}
+			yaIdx := strings.Index(block, "ya integer")
+			if yaIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgfr_1 block\n  block=%q", "ya integer", block)
+			}
+			if !strings.Contains(block, "yc integer") {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgfr_1 block\n  block=%q", "yc integer", block)
+			}
+			// Forward-reference ordering: the generated column (attnum 1) must print BEFORE
+			// the columns its expression references (attnum 2/3).
+			if gzIdx >= 0 && yaIdx >= 0 && gzIdx > yaIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want generated %q before %q in pgfr_1 block\n  block=%q", "gz", "ya", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgfr_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgfr_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgfr_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every
