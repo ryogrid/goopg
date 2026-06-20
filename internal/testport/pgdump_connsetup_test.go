@@ -3629,6 +3629,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function add_default: %v", err)
 	}
 
+	// Slice 301: a function whose parameter DEFAULT is a NESTED-ARITHMETIC binary
+	// op (`a integer DEFAULT (1 + 2) * 3`). This is the FOURTH (and last) deparse
+	// context fed by executor.defaultExprToSQL — after slice 298's index predicate,
+	// slice 299's expression-index column, and slice 300's partition key. The
+	// function-arg-default path differs from those three: pg_dump reconstructs the
+	// signature from pg_get_function_arguments(oid), and PG's print_function_arguments
+	// (ruleutils.c:3428) appends the default via `deparse_expression(expr, NIL, false,
+	// false)` — which, UNLIKE pg_get_partkeydef (slice 300), adds NO extra `(%s)`
+	// wrap. The full parenthesization comes entirely from goopg storing the
+	// deparse-canonical `((1 + 2) * 3)` in catalog.Routine.ArgDefaults (the parser's
+	// `a.Default` → defaultExprToSQL at CREATE FUNCTION time, operators_ddl.go:7138),
+	// matching get_oper_expr's non-pretty mode which wraps every OpExpr in parens.
+	// So this slice is FIXTURE-ONLY: defaultExprToSQL's slice-298 BinaryOp fix already
+	// produces the correct `((1 + 2) * 3)`, and buildFunctionArguments emits it
+	// verbatim after ` DEFAULT `. Verified byte-identical vs real pg_dump 18.3:
+	//   CREATE FUNCTION public.add_calcdef(a integer DEFAULT ((1 + 2) * 3)) RETURNS integer
+	//       LANGUAGE sql
+	//       AS $_$ SELECT $1 $_$;
+	// A precedence-corrupted render (`DEFAULT 1 + 2 * 3`, re-parsing as 1+(2*3)=7
+	// not (1+2)*3=9) or a one-paren-short `DEFAULT (1 + 2) * 3` would surface in the
+	// assertion below. The `$1` body forces the `$_$` delimiter (same as add_default).
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.add_calcdef(a integer DEFAULT (1 + 2) * 3) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function add_calcdef: %v", err)
+	}
+
 	// Slice 161: a SET-RETURNING function (`RETURNS SETOF integer`). Every prior
 	// function slice returned a single scalar (`RETURNS integer`/`void`), so the
 	// proretset='t' return-clause shape was never exercised end-to-end. This drives
@@ -6413,6 +6438,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "    LANGUAGE sql\n    AS $_$ SELECT $1 + $2 $_$;") {
 			t.Errorf("pg_dump dropped/mangled add_default's body\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 301 (asserted):** the function whose parameter DEFAULT is a
+		// nested-arithmetic binary op (add_calcdef) must round-trip the default as
+		// the FULLY parenthesized `((1 + 2) * 3)` — the function-arg-default deparse
+		// context of executor.defaultExprToSQL (the fourth, after slice 298 index
+		// predicate / 299 index column / 300 partition key). pg_dump reads the
+		// signature from pg_get_function_arguments(oid); goopg stores the canonical
+		// `((1 + 2) * 3)` in ArgDefaults and buildFunctionArguments emits it verbatim
+		// after ` DEFAULT `. A one-paren-short `(1 + 2) * 3` or a precedence-corrupted
+		// `1 + 2 * 3` (evaluates to 7 not 9 on restore) surfaces exactly here. Real
+		// pg_dump 18.3 renders (verified byte-identical):
+		//   CREATE FUNCTION public.add_calcdef(a integer DEFAULT ((1 + 2) * 3)) RETURNS integer
+		//       LANGUAGE sql
+		//       AS $_$ SELECT $1 $_$;
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.add_calcdef(a integer DEFAULT ((1 + 2) * 3)) RETURNS integer") {
+			t.Errorf("pg_dump dropped/corrupted add_calcdef's nested-arithmetic parameter default; want fully-parenthesized %q\n  full stdout=%q", "DEFAULT ((1 + 2) * 3)", res.Stdout)
+		}
+		// Negative guard: the precedence-corrupted one-paren-short form must NOT appear.
+		if strings.Contains(res.Stdout, "add_calcdef(a integer DEFAULT (1 + 2) * 3)") {
+			t.Errorf("pg_dump emitted the one-paren-short add_calcdef default (re-parses with wrong precedence)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 161 (asserted):** the SET-RETURNING function (gen_one) must
 		// round-trip its `RETURNS SETOF integer` return clause. pg_dump reads

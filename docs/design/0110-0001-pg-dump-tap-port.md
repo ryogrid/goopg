@@ -8705,9 +8705,36 @@ byte-identical against a live PG 18.3 instance: `PARTITION BY RANGE ((((a + b) *
 Guard (`TestPort_PgDumpConnectionSetup`, drives real pg_dump 18.3): the `pexpr` fixture pins the four-paren form, plus a
 negative guard that the inner-precedence-corrupt `RANGE ((a + b * c))` (the `+` un-parenthesized) does **not** appear.
 
-> **Next (slice 301+):** the last unfixtured `defaultExprToSQL` context — function-argument defaults with a binary op
-> (`((1 + 2) * 3)` via `pg_get_function_arguments`) — still has no byte-verified fixture though the renderer already
-> parenthesizes it; OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+### Slice 301 — nested-arithmetic **function-argument default** `(1 + 2) * 3` → `DEFAULT ((1 + 2) * 3)` (fixture-only)
+
+The **fourth and last** deparse context `executor.defaultExprToSQL` feeds, after slice 298's index *predicate*, slice
+299's index *column*, and slice 300's partition *key*: the parameter DEFAULT expression of a `CREATE FUNCTION`, reached
+via `pg_get_function_arguments(oid)`. Unlike slice 300 (a real one-paren-short divergence), this context is
+**fixture-only** — the parenthesization was already correct end-to-end:
+
+PG's `print_function_arguments` (`ruleutils.c:3428`) appends the default with `deparse_expression(expr, NIL, false,
+false)`. Critically — and **unlike** `pg_get_partkeydef` (slice 300) — it adds **no** extra `(%s)` wrap; the full
+parenthesization comes entirely from `deparse_expression`'s non-pretty mode, where `get_oper_expr` wraps every `OpExpr`
+in parens. goopg mirrors this exactly: at `CREATE FUNCTION` time the parser's `a.Default` is rendered by
+`defaultExprToSQL` (`operators_ddl.go:7138`) and stored verbatim in `catalog.Routine.ArgDefaults`; `buildFunctionArguments`
+emits it after ` DEFAULT `. Slice 298's `BinaryOp` arm already produces the canonical `((1 + 2) * 3)`, so no production
+change was needed.
+
+| layer | produced by | cumulative |
+|---|---|---|
+| inner `(1 + 2)` | `defaultExprToSQL` `BinaryOp` arm (the `+`) | `(1 + 2)` |
+| `* 3` wrap | `defaultExprToSQL` `BinaryOp` arm (the `*`) | `((1 + 2) * 3)` |
+| ` DEFAULT %s` | `buildFunctionArguments` (no extra wrap; matches `print_function_arguments`) | `DEFAULT ((1 + 2) * 3)` |
+
+Verified byte-identical against a live PG 18.3 instance:
+`CREATE FUNCTION public.add_calcdef(a integer DEFAULT ((1 + 2) * 3)) RETURNS integer`. Guard
+(`TestPort_PgDumpConnectionSetup`, drives real pg_dump 18.3): the `add_calcdef` fixture pins the fully-parenthesized form,
+plus a negative guard that the one-paren-short `DEFAULT (1 + 2) * 3` (re-parses with wrong precedence: 1+2*3=7 not
+(1+2)*3=9) does **not** appear. This closes all four `defaultExprToSQL` deparse contexts.
+
+> **Next (slice 302+):** all four `defaultExprToSQL` binary-op contexts are now byte-verified. Candidate next surfaces:
+> a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path, or the keyword-vs-literal `MINVALUE`
+> partition-bound ambiguity noted in slice 169's deferral.
 
 ## Deferred (002–010) — catalog surface estimate
 
