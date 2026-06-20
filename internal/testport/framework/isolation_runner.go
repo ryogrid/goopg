@@ -109,14 +109,27 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 
 	for i, perm := range spec.Permutations {
 		// Global setup runs before each permutation (mirrors isolationtester.c).
-		if spec.SetupSQL != "" {
+		// Each setup block is submitted separately on a single monitor
+		// connection, matching isolationtester.c running each setupsqls[]
+		// entry via its own PQexec; this lets a block containing a statement
+		// that must run outside a transaction (e.g. VACUUM) succeed.
+		setupBlocks := spec.SetupBlocks
+		if len(setupBlocks) == 0 && spec.SetupSQL != "" {
+			setupBlocks = []string{spec.SetupSQL}
+		}
+		if len(setupBlocks) > 0 {
 			monitor, err := db.Conn(ctx)
 			if err != nil {
 				return "", fmt.Errorf("open monitor conn for setup: %w", err)
 			}
-			if err := execConn(ctx, monitor, spec.SetupSQL); err != nil {
-				_ = monitor.Close()
-				return "", fmt.Errorf("global setup (permutation %d): %w", i, err)
+			for _, blk := range setupBlocks {
+				if strings.TrimSpace(blk) == "" {
+					continue
+				}
+				if err := execConn(ctx, monitor, blk); err != nil {
+					_ = monitor.Close()
+					return "", fmt.Errorf("global setup (permutation %d): %w", i, err)
+				}
 			}
 			_ = monitor.Close()
 		}

@@ -610,6 +610,28 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// Per-tuple / per-operator planner cost estimates (guc_tables.c). goopg's
+	// planner does not consume these yet, but they must be registered so
+	// upstream specs that tune them (e.g. the index-only-scan isolation spec)
+	// can SET them without an "unrecognized configuration parameter" error.
+	r.MustRegister(NewVariable(Variable{
+		Name: "cpu_tuple_cost", Type: TypeReal, BootVal: "0.01",
+		MinVal: 0, MaxVal: 1e9,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "cpu_index_tuple_cost", Type: TypeReal, BootVal: "0.005",
+		MinVal: 0, MaxVal: 1e9,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "cpu_operator_cost", Type: TypeReal, BootVal: "0.0025",
+		MinVal: 0, MaxVal: 1e9,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 
 	// Tuple-freeze age thresholds (M0046-0005). vacuum_freeze_min_age is
 	// the minimum XID age before VACUUM rewrites xmin → FrozenTransactionId.

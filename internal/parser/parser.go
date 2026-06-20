@@ -1791,7 +1791,10 @@ func (p *parser) parseSetValueAtoms() ([]string, error) {
 	for {
 		t := p.cur()
 		switch t.Kind {
-		case TokenIntLit:
+		case TokenIntLit, TokenNumericLit:
+			// Accept integer and floating-point GUC values, e.g.
+			// `SET seq_page_cost = 0.1`. Real-typed GUCs (cost params,
+			// cpu_*_cost) are set with fractional literals upstream.
 			out = append(out, t.Value)
 			p.advance()
 		case TokenStringLit:
@@ -1805,8 +1808,8 @@ func (p *parser) parseSetValueAtoms() ([]string, error) {
 				// Allow leading minus on a numeric value (rare).
 				p.advance()
 				n := p.cur()
-				if n.Kind != TokenIntLit {
-					return nil, p.errAtCur("expected integer after '-'")
+				if n.Kind != TokenIntLit && n.Kind != TokenNumericLit {
+					return nil, p.errAtCur("expected number after '-'")
 				}
 				out = append(out, "-"+n.Value)
 				p.advance()

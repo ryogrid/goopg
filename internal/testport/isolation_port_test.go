@@ -615,6 +615,20 @@ func TestPort_IsolationReferentialIntegrity(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/referential-integrity.spec")
 }
 
+// TestPort_IsolationIndexOnlyScan exercises the index-only-scan spec: a
+// SERIALIZABLE write skew across two all-visible tables (tabx / taby) where each
+// transaction reads one table via an index-only scan of SELECT min(id) and
+// DELETEs the matching row from the other table. Any overlap forms a
+// rw-dependency cycle so the second committer must abort with 40001; the two
+// serialized orderings (rxwy1 c1 rywx2 c2 / rywx2 c2 rxwy1 c1) commit cleanly.
+func TestPort_IsolationIndexOnlyScan(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_index_only_scan")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/index-only-scan.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

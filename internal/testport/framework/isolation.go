@@ -46,15 +46,16 @@ type StepBlocker struct {
 }
 
 type IsolationSpec struct {
-	Path             string
-	Sessions         []string
-	SetupSQL         string            // global setup run before each permutation
-	TeardownSQL      string            // global teardown run after each permutation
-	SessionSetup     map[string]string // per-session setup run before each permutation
-	SessionTeardown  map[string]string // per-session teardown run after each permutation
-	Steps            map[string]IsolationStep
-	StepOrder        []string          // step names in declaration order (for "unused step" warnings)
-	Permutations     [][]string
+	Path            string
+	Sessions        []string
+	SetupSQL        string            // global setup (all blocks joined; kept for debug)
+	SetupBlocks     []string          // global setup blocks, each run as a separate submission
+	TeardownSQL     string            // global teardown run after each permutation
+	SessionSetup    map[string]string // per-session setup run before each permutation
+	SessionTeardown map[string]string // per-session teardown run after each permutation
+	Steps           map[string]IsolationStep
+	StepOrder       []string // step names in declaration order (for "unused step" warnings)
+	Permutations    [][]string
 	// PermutationBlockers is parallel to Permutations: PermutationBlockers[p][i]
 	// holds the completion blockers attached to Permutations[p][i]. Steps with
 	// no markers have a nil slice. Always the same outer/inner length as
@@ -75,10 +76,10 @@ type IsolationExecutor interface {
 }
 
 var (
-	reSession      = regexp.MustCompile(`^session\s+("([^"]+)"|(\S+))\s*$`)
-	reStepStart    = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*\{(.*)$`)
-	reStepNoBlock  = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*$`)
-	rePermutation  = regexp.MustCompile(`^permutation(?:\s+(.+))?$`)
+	reSession     = regexp.MustCompile(`^session\s+("([^"]+)"|(\S+))\s*$`)
+	reStepStart   = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*\{(.*)$`)
+	reStepNoBlock = regexp.MustCompile(`^step\s+("([^"]+)"|(\S+))\s*$`)
+	rePermutation = regexp.MustCompile(`^permutation(?:\s+(.+))?$`)
 )
 
 // DiscoverIsolationSpecs returns all upstream isolation .spec files.
@@ -180,7 +181,18 @@ func ParseIsolationSpec(path string) (IsolationSpec, error) {
 				if ctx == ctxSession && currentSession != "" {
 					s.SessionSetup[currentSession] = body
 				} else {
-					s.SetupSQL = body
+					// Multiple global setup blocks are run as separate
+					// submissions (mirrors isolationtester.c running each
+					// setupsqls[] entry via its own PQexec) so a standalone
+					// statement that cannot run inside a transaction block —
+					// e.g. VACUUM FREEZE ANALYZE — succeeds instead of
+					// aborting an implicit multi-statement transaction.
+					s.SetupBlocks = append(s.SetupBlocks, body)
+					if s.SetupSQL == "" {
+						s.SetupSQL = body
+					} else {
+						s.SetupSQL = s.SetupSQL + "\n" + body
+					}
 				}
 			}
 			continue

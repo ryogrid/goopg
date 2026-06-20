@@ -874,6 +874,58 @@ and all three were re-verified byte-for-byte. Verified by
 mvcc unit tests. The runner date-render / `PQprint` alignment pieces this spec
 also needs landed earlier in section 18. Isolation pass count 31 → 32.
 
+### 20. Index-only-scan write skew + multi-block global setup (lands `index-only-scan`)
+
+`index-only-scan` is a SERIALIZABLE write skew across two all-visible tables.
+Both `tabx` and `taby` are populated with 10000 rows, given a `PRIMARY KEY`, and
+`VACUUM FREEZE ANALYZE`d so the whole heap is all-visible (the precondition for an
+index-only scan). `s1` (`rxwy1`) runs `DELETE FROM taby WHERE id = (SELECT min(id)
+FROM tabx)` and `s2` (`rywx2`) runs the mirror `DELETE FROM tabx WHERE id =
+(SELECT min(id) FROM taby)`. Each `SELECT min(id)` reads one table and the `DELETE`
+writes the other, so every overlap forms the `s1 →rw s2 →rw s1` cycle and the
+second committer must abort with `40001`; the two fully serialized orderings
+(`rxwy1 c1 rywx2 c2` and `rywx2 c2 rxwy1 c1`) commit cleanly. All six generated
+permutations match PG 18.3 byte-for-byte.
+
+This is a **zero-SSI-change** promotion: the existing single-column full-key
+index-scan / index-only-scan SIREAD granularity (sections 9 and the
+`referential-integrity` index-only fetch hook) already records the per-tuple reads
+that cross-cover the rows the partner `DELETE`s, so the dangerous structure closes
+with no engine change. Three harness blockers had to clear:
+
+- **Floating-point GUC values.** `parser.parseSetValueAtoms` accepted integer,
+  string, and identifier atoms but not a `TokenNumericLit`, so the session setup
+  `SET LOCAL seq_page_cost = 0.1` failed with a `42601` syntax error
+  (`expected value`). It now accepts `TokenNumericLit` (and a leading minus on
+  either an int or a numeric) — real-typed GUCs are set with fractional literals
+  upstream. Purely additive: it rejects nothing previously accepted.
+- **Per-setup-block submission (the load-bearing harness fix).** The isolation
+  spec parser stored the global `setup {}` body in a single `SetupSQL` string and
+  **overwrote** it on each block, so a spec with multiple global setup blocks kept
+  only the last. `index-only-scan` is the first such spec: its three blocks are the
+  table-creation block plus `VACUUM FREEZE ANALYZE tabx` and `… taby`, so only the
+  final VACUUM survived and the `DELETE` steps all failed with `relation "tabx"
+  does not exist`. Fixed by collecting blocks into `IsolationSpec.SetupBlocks` and
+  having `RunSpec` submit each block on its own `execConn` call — mirroring
+  isolationtester.c running each `setupsqls[]` entry via its own `PQexec`. This
+  also makes `VACUUM` correct: a standalone block is its own implicit transaction,
+  so `VACUUM` no longer aborts with "cannot run inside a transaction block" the way
+  it would if concatenated with the DDL/DML into one multi-statement submission.
+  `SetupSQL` is still populated (all blocks joined) for debug and as a fallback.
+- **`cpu_*_cost` real GUCs.** `cpu_tuple_cost`, `cpu_index_tuple_cost`, and
+  `cpu_operator_cost` were unregistered, so the session setup `SET LOCAL
+  cpu_tuple_cost = 0.03` would have raised `unrecognized configuration parameter`.
+  They are now registered as `TypeReal` (`ContextUserset`, boot values matching
+  guc_tables.c) and added to `postgresql.conf.sample`. goopg's planner does not
+  consume them yet — like the parallel cost GUCs they are inert no-ops whose only
+  job is to be SET-able for upstream specs that tune the planner.
+
+Verified by `TestPort_IsolationIndexOnlyScan` (all six permutations vs PG 18.3) and
+by re-running `simple-write-skew`, `temporal-range-integrity`, and
+`referential-integrity` (the structural twins / single-setup-block specs) green to
+confirm the per-block submission change is regression-free. Isolation pass count
+32 → 33.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
@@ -909,13 +961,14 @@ also needs landed earlier in section 18. Isolation pass count 31 → 32.
   `receipt-report` (the daily-receipts read-only anomaly with a declared
   `SERIALIZABLE READ ONLY` `s3` — the de-facto `READ ONLY` SSI modeling of
   section 19; all 210 permutations match PG with exactly 6 genuine serialization
-  failures, down from goopg's previous 48).
-- **Still deferred (same slice family):**
-  - `multiple-row-versions` — **SSI-correct as of section 9** (output matches PG
-    byte-for-byte) but not `pass_required`: its 1,000,000-row single-transaction
-    setup INSERT intermittently trips the orthogonal WAL-buffer ring race
-    `errWALBufferReservedOutOfRange` (`internal/wal/wal_buffer.go`), ~50% of runs.
-    Blocked on that WAL race (a different subsystem), NOT on SSI.
-    `TestPort_IsolationMultipleRowVersions` is a skip-on-defer anchor.
-  Their dedicated `TestPort_Isolation*` functions auto-promote (run, then
-  `t.Skip` only on `defer`), so the next slice sees green→pass instantly.
+  failures, down from goopg's previous 48), and `multiple-row-versions` (the
+  four-xact dangerous structure over many row versions — SSI-correct via the
+  section-9 index-scan SIREAD granularity; its 1,000,000-row single-transaction
+  setup INSERT no longer trips the WAL-buffer ring race after the section-0107-0007aj
+  `2*conservativeSize` segment-crossing pad reservation, verified 3/3 uncached
+  runs at ~65s), and `index-only-scan` (the two-table `SELECT min(id)` write skew
+  through index-only scans — zero SSI change; only the floating-point GUC parse,
+  the per-setup-block submission runner fix, and the `cpu_*_cost` GUCs of section 20).
+- **Still deferred (same slice family):** none — every spec in the M0118-0001
+  group now passes. The dedicated `TestPort_Isolation*` functions auto-promote
+  (run, then `t.Skip` only on `defer`), so the next slice sees green→pass instantly.

@@ -147,6 +147,29 @@ func TestParseShowSetReset(t *testing.T) {
 			t.Fatalf("unexpected: %+v", s)
 		}
 	})
+	t.Run("set float value", func(t *testing.T) {
+		// Real-typed GUCs (cost params) are SET with fractional literals,
+		// e.g. the index-only-scan isolation spec's `SET LOCAL seq_page_cost
+		// = 0.1`. parseSetValueAtoms must accept a TokenNumericLit.
+		stmts, err := Parse("SET LOCAL seq_page_cost = 0.1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if !s.Local || s.Name != "seq_page_cost" || s.Value != "0.1" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
+	t.Run("set negative float value", func(t *testing.T) {
+		stmts, err := Parse("SET geqo_seed = -0.5")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := stmts[0].(*SetStmt)
+		if s.Name != "geqo_seed" || s.Value != "-0.5" {
+			t.Fatalf("unexpected: %+v", s)
+		}
+	})
 	t.Run("set local to default", func(t *testing.T) {
 		stmts, err := Parse("SET LOCAL search_path TO DEFAULT")
 		if err != nil {

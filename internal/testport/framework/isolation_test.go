@@ -102,9 +102,9 @@ func TestNormalizeBoolWireText(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"true", "t"},
 		{"false", "f"},
-		{"t", "t"},   // already in wire form (defensive)
-		{"f", "f"},   // already in wire form (defensive)
-		{"", ""},     // NULL sentinel — caller already checked .Valid
+		{"t", "t"},       // already in wire form (defensive)
+		{"f", "f"},       // already in wire form (defensive)
+		{"", ""},         // NULL sentinel — caller already checked .Valid
 		{"True", "True"}, // pq always lowercases Go bool — anything else is opaque text
 	}
 	for _, c := range cases {
@@ -158,7 +158,6 @@ func TestDrainWithTimeout_EmitsPendingStepNotices(t *testing.T) {
 		t.Fatalf("notice queue not drained: %v", got)
 	}
 }
-
 
 // TestParseIsolationSpecPreservesContinuationIndent pins M0100-0005b:
 // upstream isolationtester echoes multi-line step SQL verbatim, with the
@@ -231,6 +230,51 @@ func TestParseIsolationSpecClosingBraceOnOwnLine(t *testing.T) {
 	}
 }
 
+// TestParseIsolationSpecMultipleGlobalSetupBlocks pins that a spec declaring
+// more than one global `setup {}` block collects them into SetupBlocks (each run
+// as its own submission by RunSpec) rather than overwriting one another. The
+// index-only-scan spec is the first such spec: its table-creation block is
+// followed by standalone `VACUUM FREEZE ANALYZE` blocks that must NOT be folded
+// into one multi-statement transaction. Before the fix SetupSQL kept only the
+// last block, so the created tables vanished and every step failed with
+// `relation "..." does not exist`.
+func TestParseIsolationSpecMultipleGlobalSetupBlocks(t *testing.T) {
+	spec := "setup {\n" +
+		"  CREATE TABLE tabx (id int NOT NULL);\n" +
+		"  CREATE TABLE taby (id int NOT NULL);\n" +
+		"}\n" +
+		"setup { VACUUM FREEZE ANALYZE tabx; }\n" +
+		"setup { VACUUM FREEZE ANALYZE taby; }\n" +
+		"session \"s1\"\n" +
+		"step \"q\" { SELECT 1; }\n" +
+		"permutation \"q\"\n"
+	path := filepath.Join(t.TempDir(), "multisetup.spec")
+	if err := os.WriteFile(path, []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseIsolationSpec(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.SetupBlocks) != 3 {
+		t.Fatalf("expected 3 global setup blocks, got %d: %#v", len(parsed.SetupBlocks), parsed.SetupBlocks)
+	}
+	if !strings.Contains(parsed.SetupBlocks[0], "CREATE TABLE tabx") ||
+		!strings.Contains(parsed.SetupBlocks[0], "CREATE TABLE taby") {
+		t.Fatalf("first setup block lost the table-creation statements: %q", parsed.SetupBlocks[0])
+	}
+	if !strings.Contains(parsed.SetupBlocks[1], "VACUUM FREEZE ANALYZE tabx") {
+		t.Fatalf("second setup block mismatch: %q", parsed.SetupBlocks[1])
+	}
+	if !strings.Contains(parsed.SetupBlocks[2], "VACUUM FREEZE ANALYZE taby") {
+		t.Fatalf("third setup block mismatch: %q", parsed.SetupBlocks[2])
+	}
+	// SetupSQL keeps the joined form (debug / fallback) and must retain the
+	// table-creation statements that the overwrite bug used to drop.
+	if !strings.Contains(parsed.SetupSQL, "CREATE TABLE tabx") {
+		t.Fatalf("joined SetupSQL lost table creation: %q", parsed.SetupSQL)
+	}
+}
 
 // TestFormatStepOutputMultiLineInlinesFirstLine pins upstream isolationtester's
 // verbatim echo: when SQL is multi-line and the spec used the inline-brace
@@ -356,7 +400,10 @@ func TestFormatPQErrorStripsSQLStateSuffix(t *testing.T) {
 // that surface harness-internal errors (Scan failures, context cancellation,
 // connection-pool errors) where there is no SQLSTATE to strip.
 func TestFormatPQErrorFallsBackOnNonPQ(t *testing.T) {
-	cases := []struct{ in error; want string }{
+	cases := []struct {
+		in   error
+		want string
+	}{
 		{errors.New("pq: connection closed"), "ERROR:  connection closed"},
 		{errors.New("driver: bad connection"), "ERROR:  driver: bad connection"},
 	}
