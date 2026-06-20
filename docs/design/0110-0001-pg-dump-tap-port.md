@@ -8666,10 +8666,48 @@ Guards (`TestPort_PgDumpConnectionSetup`, drives real pg_dump 18.3): the `foo_ca
 form, plus an absence guard that the precedence-corrupt under-parenthesized column `(qty + id * mgr_id)` (which would
 re-parse as `qty + (id * mgr_id)`, silently changing the indexed value) does **not** appear.
 
-> **Next (slice 300+):** the remaining unfixtured `defaultExprToSQL` contexts — partition-key expressions
-> (`PARTITION BY RANGE ((((a + b) * c)))`) and function-argument defaults with a binary op (`((1 + 2) * 3)`) — still have
-> no byte-verified fixture though the renderer already parenthesizes them; OR a multi-column / NULL-typed DEFAULT variant
-> on the partition-leaf ALTER path.
+### Slice 300 — nested-arithmetic **partition-key expression** `((a + b) * c)` → `RANGE ((((a + b) * c)))` (PRODUCTION fix)
+
+The **third** deparse context `executor.defaultExprToSQL` feeds (after slice 298's index *predicate* and slice 299's
+index *column*): the partition-key expression, reached via `pg_get_partkeydef(oid)` (`internal/executor/expr.go`). Unlike
+slices 298/299 — where slice 298's `BinaryOp` parenthesization already produced correct bytes and the fixtures only
+locked it in — this context had a **real divergence** that needed a production fix.
+
+Real PG's `pg_get_partkeydef_worker` (`ruleutils.c`) wraps each **expression** key in `(%s)` *unless* it
+`looks_like_function` — a bare function call (and the `func_expr_common_subexpr` family: `COALESCE`/`NULLIF`/`GREATEST`/
+`LEAST`, SQL value functions, XML/JSON) deparses **without** the extra parens, while operators, casts, `CASE`, … are
+wrapped. goopg's `pg_get_partkeydef` emitted `defaultExprToSQL(keyExpr)` with **no** wrap, so a binary-op key was one
+paren short:
+
+| key | goopg (before) | real pg_dump 18.3 |
+|-----|----------------|-------------------|
+| `((a + b) * c)` | `RANGE (((a + b) * c))` ❌ | `RANGE ((((a + b) * c)))` |
+| `abs(a)` | `RANGE (abs(a))` ✅ | `RANGE (abs(a))` |
+
+Both forms re-parse to the same expression (the extra paren is cosmetic), so this is a **byte-fidelity** fix rather than
+a correctness one — but byte-identical round-trip vs real pg_dump is the milestone's bar. The four-paren nesting for
+`((a + b) * c)`:
+
+| layer | source | contributes |
+|-------|--------|-------------|
+| inner `(a + b)` | `defaultExprToSQL` `BinaryOp` arm (the `+`) | `(a + b)` |
+| `* c` wrap | `defaultExprToSQL` `BinaryOp` arm (the `*`) | `((a + b) * c)` |
+| per-key `(%s)` | `pg_get_partkeydef` wrap (NEW; `looks_like_function` false) | `(((a + b) * c))` |
+| `RANGE (…)` | `pg_get_partkeydef` strategy-list parens | `((((a + b) * c)))` |
+
+**The fix** (`internal/executor/expr.go`, `pg_get_partkeydef` case): after `part = defaultExprToSQL(keyExpr)`, wrap
+`part = "(" + part + ")"` unless `keyExpr` is a `*parser.FuncCall`. goopg represents every callable form — including
+`COALESCE`/`GREATEST`/`NULLIF` (generic `FuncCall`, no special parser node) and the niladic value functions
+(`FuncCall` with 0 args, rendered as a bare uppercase keyword) — as `*parser.FuncCall`, so that single type check mirrors
+PG's node-tag switch. The opclass/collation suffixes are appended *after* the wrap, matching PG's append order. Verified
+byte-identical against a live PG 18.3 instance: `PARTITION BY RANGE ((((a + b) * c)))` and `PARTITION BY RANGE (abs(a))`.
+
+Guard (`TestPort_PgDumpConnectionSetup`, drives real pg_dump 18.3): the `pexpr` fixture pins the four-paren form, plus a
+negative guard that the inner-precedence-corrupt `RANGE ((a + b * c))` (the `+` un-parenthesized) does **not** appear.
+
+> **Next (slice 301+):** the last unfixtured `defaultExprToSQL` context — function-argument defaults with a binary op
+> (`((1 + 2) * 3)` via `pg_get_function_arguments`) — still has no byte-verified fixture though the renderer already
+> parenthesizes it; OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
 ## Deferred (002–010) — catalog surface estimate
 

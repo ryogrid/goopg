@@ -6837,6 +6837,23 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			if keyExpr != nil {
 				part = defaultExprToSQL(keyExpr)
+				// pg_get_partkeydef_worker (ruleutils.c) wraps each EXPRESSION key
+				// in `(%s)` unless it "looks like a function call"
+				// (looks_like_function): a bare function call — and the
+				// func_expr_common_subexpr family (COALESCE/NULLIF/GREATEST/LEAST,
+				// SQL value functions, XML/JSON) — deparses without the extra parens,
+				// while everything else (operators, casts, CASE, …) is wrapped. goopg
+				// represents every one of those callable forms as *parser.FuncCall
+				// (including the niladic value functions, which defaultExprToSQL emits
+				// as bare uppercase keywords), so that single type check mirrors PG's
+				// node-tag switch. Without this wrap a binary-op key
+				// `((a + b) * c)` dumped as `RANGE (((a + b) * c))` — one paren short
+				// of real pg_dump 18.3's `RANGE ((((a + b) * c)))` (verified
+				// byte-identical). The opclass/collation suffixes below are appended
+				// AFTER the wrap, matching PG's append order (DU-002 slice 300).
+				if _, isFunc := keyExpr.(*parser.FuncCall); !isFunc {
+					part = "(" + part + ")"
+				}
 			} else {
 				part = colName
 			}

@@ -1161,6 +1161,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create RANGE partition prange_am: %v", err)
 	}
 
+	// Slice 300: a nested-arithmetic EXPRESSION partition key — the third deparse
+	// context fed by executor.defaultExprToSQL (after slice 298's index PREDICATE
+	// and slice 299's index COLUMN), reached via pg_get_partkeydef(oid). Every
+	// prior partition fixture uses a bare COLUMN key, so this is the first to
+	// exercise the expression branch. It exposed (and now pins the fix for) a real
+	// divergence: pg_get_partkeydef_worker (ruleutils.c) wraps each non-function
+	// expression key in `(%s)` (the `looks_like_function` branch), but goopg's
+	// pg_get_partkeydef emitted defaultExprToSQL(keyExpr) with NO wrap — so
+	// `PARTITION BY RANGE (((a + b) * c))` dumped as `RANGE (((a + b) * c))`, one
+	// paren short of real pg_dump 18.3's `RANGE ((((a + b) * c)))` (verified
+	// byte-identical against a live PG 18.3 instance). The fix adds the `(%s)`
+	// wrap unless the key is a *parser.FuncCall (goopg's single representation for
+	// every callable form — `abs(a)` correctly stays unwrapped as `RANGE (abs(a))`).
+	// `pexpr` carries its own table so the many `foo` asserts are untouched.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pexpr (a integer, b integer, c integer) PARTITION BY RANGE (((a + b) * c))"); err != nil {
+		t.Fatalf("create expression-key partitioned table pexpr: %v", err)
+	}
+
 	// Slice 262: a MULTI-COLUMN RANGE partition with a MINVALUE/MAXVALUE open edge
 	// on a NON-leading column. Every prior partition fixture (part/prange_am) is
 	// single-column, so the per-element bound machinery added in slices 169/261 —
@@ -4274,6 +4292,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')") {
 			t.Errorf("pg_dump emitted an unquoted/invalid RANGE bound; want %q\n  full stdout=%q", "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')", res.Stdout)
+		}
+		// **Slice 300 closed (asserted):** a nested-arithmetic EXPRESSION partition
+		// key — the third deparse context fed by defaultExprToSQL (index predicate
+		// → slice 298, index column → slice 299, partition key → here), reached via
+		// pg_get_partkeydef. pg_get_partkeydef_worker wraps each non-function key in
+		// `(%s)`, so `RANGE (((a + b) * c))` dumps as the FOUR-paren form
+		// `RANGE ((((a + b) * c)))` (verified byte-identical vs real pg_dump 18.3).
+		// goopg previously emitted only THREE parens (no `(%s)` wrap). The exact
+		// four-paren clause is a tight guard: the three-paren bug form is NOT a
+		// superstring of it, so a missing wrap fails this assertion.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.pexpr (") ||
+			!strings.Contains(res.Stdout, "PARTITION BY RANGE ((((a + b) * c)))") {
+			t.Errorf("pg_dump dropped/mangled the expression partition key; want CREATE TABLE public.pexpr / PARTITION BY RANGE ((((a + b) * c)))\n  full stdout=%q", res.Stdout)
+		}
+		// Negative guard on the INNER BinaryOp parenthesization (slice 298): the
+		// precedence-corrupt `a + b * c` (the `+` left un-parenthesized) must NOT
+		// appear — the correct render is `((a + b) * c)`, where a `)` always
+		// separates `b` from ` *`, so this literal is absent unless the inner wrap
+		// regressed.
+		if strings.Contains(res.Stdout, "RANGE ((a + b * c))") {
+			t.Errorf("pg_dump emitted a precedence-corrupt expression partition key (inner BinaryOp parens dropped); found %q\n  full stdout=%q", "RANGE ((a + b * c))", res.Stdout)
 		}
 		// **Slice 262 closed (asserted):** a MULTI-COLUMN RANGE bound with a
 		// MINVALUE/MAXVALUE open edge on a non-leading column. FormatPartitionBound

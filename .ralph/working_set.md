@@ -1,34 +1,45 @@
-Task: DU-002 slice 299 — COMPLETE, committing + pushing.
+Task: DU-002 slice 300 — COMPLETE, committing + pushing.
 
-Last landed: oracle-verified fixture for the nested-arithmetic EXPRESSION-INDEX-COLUMN
-deparse context — the second context `executor.defaultExprToSQL` feeds (the index-key
-expression in `catalog.Index.ColExprStrings[i]`, vs slice 298's index PREDICATE in
-`PredicateString`). FIXTURE-ONLY: slice 298's BinaryOp parenthesization already produces
-correct bytes here, so this locks it in vs real pg_dump 18.3 (no production code change).
+Last landed: PRODUCTION fix for the nested-arithmetic PARTITION-KEY EXPRESSION deparse
+context — the THIRD context `executor.defaultExprToSQL` feeds, reached via
+`pg_get_partkeydef(oid)` (after slice 298 index-predicate / slice 299 index-column).
 
-`CREATE INDEX foo_calc_expr_idx ON public.foo (((qty + id) * mgr_id))` dumps as
-`USING btree ((((qty + id) * mgr_id)))` — FOUR nested parens:
-  inner `(qty+id)` + `*` wrap (both from defaultExprToSQL) + per-column `(%s)` +
-  `USING btree (…)` column-list parens (both from catalog.BuildIndexDef).
-Verified `pg_get_indexdef` uses prettyFlags=PRETTYFLAG_INDENT (no PAREN) and
-`pg_get_expr(indexprs)` == goopg's defaultExprToSQL output (`((qty + id) * mgr_id)`).
-(NOTE: easy to mis-count — I first predicted 3 parens by forgetting the column-list wrapper.)
+Unlike 298/299 (fixture-only), this had a REAL byte divergence: real PG's
+`pg_get_partkeydef_worker` (ruleutils.c) wraps each NON-FUNCTION expression key in `(%s)`
+(the `looks_like_function` branch); goopg's `pg_get_partkeydef` emitted
+`defaultExprToSQL(keyExpr)` with NO wrap → `RANGE (((a + b) * c))`, ONE PAREN SHORT of real
+pg_dump 18.3's `RANGE ((((a + b) * c)))`.
+
+FIX (internal/executor/expr.go, pg_get_partkeydef case, ~L6840): after
+`part = defaultExprToSQL(keyExpr)`, wrap `part = "(" + part + ")"` UNLESS keyExpr is a
+`*parser.FuncCall`. goopg represents EVERY callable form as *parser.FuncCall
+(COALESCE/GREATEST/NULLIF are generic FuncCall; niladic value funcs = 0-arg FuncCall →
+bare uppercase keyword), so that single type check mirrors PG's node-tag switch.
+Opclass/collation suffixes appended AFTER the wrap (PG's append order).
+
+EMPIRICALLY verified vs a live PG 18.3 instance (spun up on :5599, then torn down):
+`PARTITION BY RANGE (((a + b) * c))` → dumps `((((a + b) * c)))` (4 parens);
+`RANGE (abs(a))` → stays `abs(a)` (no wrap); cast `(a::bigint)` → `(((a)::bigint))`.
 
 Files:
-- internal/testport/pgdump_connsetup_test.go — NEW foo_calc_expr_idx index DDL (~L2430);
-  NEW assertion in indexDefs list (~L6478); NEW negative guard for corrupt `(qty + id * mgr_id)`
-  (after the slice-298 predicate guard, ~L6525).
-- docs/design/0110-0001-pg-dump-tap-port.md — Slice 299 section (paren-nesting table).
-- .ralph/fix_plan.md (loop #67 progress); .ralph/deferral_ledger.md (slice 299 landed, 300 deferred).
+- internal/executor/expr.go — the `(%s)` wrap in pg_get_partkeydef.
+- internal/testport/pgdump_connsetup_test.go — NEW `pexpr` table DDL (~L1164); NEW
+  assertion for the 4-paren clause + negative guard `RANGE ((a + b * c))` (~L4296).
+- docs/design/0110-0001-pg-dump-tap-port.md — Slice 300 section (paren-nesting table + fix).
+- .ralph/fix_plan.md (loop #68 progress); .ralph/deferral_ledger.md (slice 300 landed, 301 deferred).
 
-Key symbols: defaultExprToSQL + binaryOpSymbolForDefault (executor/operators_ddl.go),
-BuildIndexDef (catalog/catalog.go:6795, expression-column branch ~L6824-6836 wraps `(exprStr)`),
-idx.ColExprStrings populated at operators_ddl.go:6117.
+Key symbols: pg_get_partkeydef (executor/expr.go ~L6799), defaultExprToSQL +
+binaryOpSymbolForDefault (operators_ddl.go:3435/3397), looks_like_function +
+pg_get_partkeydef_worker (postgres ruleutils.c — the oracle).
 
-Gates: gofmt clean; go vet clean; TestPort_PgDumpConnectionSetup PASS (4.0s vs real pg_dump 18.3);
-make ralph-state-guard; pgbench pre-commit smoke (enforced by .githooks/pre-commit).
+Gates: gofmt clean; go vet clean; TestPort_PgDumpConnectionSetup PASS (4.6s vs real pg_dump
+18.3); executor/parser/catalog pkg tests PASS; make ralph-state-guard; pgbench pre-commit
+smoke (enforced by .githooks/pre-commit).
 
-Next (slice 300+): add an oracle-verified fixture for ONE remaining unfixtured defaultExprToSQL
-context — partition-key expr `PARTITION BY RANGE ((((a+b)*c)))` OR func-arg default `((1+2)*3)`
-with a binary op (renderer already parenthesizes; no byte-verified fixture yet); OR a multi-column
-/ NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+NOTE: main tree has foreign WIP (isolation-suite docs, cmd/gen-oracle-inventory) line-disjoint
+from this slice — stage ONLY my files when committing; do NOT git add -A. Single loop confirmed
+(PPID 604991←4451 is the portable_timeout subshell, not a peer).
+
+Next (slice 301+): func-arg-default binary-op fixture (`((1+2)*3)` via pg_get_function_arguments)
+— last unfixtured defaultExprToSQL context; renderer already parenthesizes (check if pg_get_function_arguments
+adds a wrap like partkeydef did → may be another production fix, not just a fixture).
