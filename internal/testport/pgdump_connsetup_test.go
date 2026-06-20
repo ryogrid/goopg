@@ -2427,6 +2427,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_calc_partial_idx ON public.foo (qty) WHERE (qty + id) * mgr_id > 0"); err != nil {
 		t.Fatalf("create nested-arithmetic partial index: %v", err)
 	}
+	// Slice 299: a nested-arithmetic *expression-index column* `((qty + id) * mgr_id)`
+	// exercises slice 298's executor.defaultExprToSQL BinaryOp parenthesization in the
+	// SECOND deparse context that renderer feeds — the index-key expression stored in
+	// catalog.Index.ColExprStrings (vs slice 298's index *predicate*). pg_get_indexdef
+	// wraps the deparsed key in `(%s)` inside the `USING btree (...)` column-list parens,
+	// so real pg_dump 18.3 emits FOUR nested parens `((((qty + id) * mgr_id)))` (verified
+	// byte-identical). Without the BinaryOp parens the key would deparse to the
+	// precedence-corrupt `(qty + id * mgr_id)`, restoring as `qty + (id * mgr_id)` — a
+	// silent change to the indexed value. This is the oracle-verified expression-column
+	// complement to slice 298's predicate fixture.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_calc_expr_idx ON public.foo (((qty + id) * mgr_id))"); err != nil {
+		t.Fatalf("create nested-arithmetic expression index: %v", err)
+	}
 	// DESC NULLS LAST exercises the DESC branch with a non-default NULLS override.
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_name_desc_idx ON public.foo (name DESC NULLS LAST)"); err != nil {
 		t.Fatalf("create DESC index: %v", err)
@@ -6469,6 +6482,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// parenthesized to preserve precedence on restore (verified byte-identical
 			// vs real pg_dump 18.3).
 			"CREATE INDEX foo_calc_partial_idx ON public.foo USING btree (qty) WHERE (((qty + id) * mgr_id) > 0);",
+			// Slice 299: a nested-arithmetic expression-index COLUMN. pg_get_indexdef
+			// wraps the deparsed key `((qty + id) * mgr_id)` in `(%s)` inside the
+			// `USING btree (...)` column-list parens → four nested parens, byte-identical
+			// to real pg_dump 18.3. Locks in slice 298's defaultExprToSQL BinaryOp
+			// parenthesization in the index-key-expression deparse context.
+			"CREATE INDEX foo_calc_expr_idx ON public.foo USING btree ((((qty + id) * mgr_id)));",
 			// DESC with a non-default NULLS LAST override
 			"CREATE INDEX foo_name_desc_idx ON public.foo USING btree (name DESC NULLS LAST);",
 			// DESC (default NULLS FIRST suppressed) + ASC NULLS FIRST override
@@ -6513,6 +6532,12 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// rows the partial index covers.
 		if strings.Contains(res.Stdout, "WHERE qty + id * mgr_id") {
 			t.Errorf("pg_dump emitted a precedence-corrupt (under-parenthesized) index predicate\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 299 negative guard: the precedence-corrupt under-parenthesized
+		// expression-INDEX-COLUMN form must NOT appear — `(qty + id * mgr_id)` would
+		// restore as `qty + (id * mgr_id)`, silently changing the indexed value.
+		if strings.Contains(res.Stdout, "(qty + id * mgr_id)") {
+			t.Errorf("pg_dump emitted a precedence-corrupt (under-parenthesized) expression-index column\n  full stdout=%q", res.Stdout)
 		}
 		// Slice 134/135/136/137/138 (regression guard): a plain unique/secondary
 		// index or a default-distinct UNIQUE constraint must NOT gain a stray NULLS

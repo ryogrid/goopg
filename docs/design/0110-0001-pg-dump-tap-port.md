@@ -8638,6 +8638,39 @@ Guards:
 > oracle-verified fixture for one of them to lock it in; OR a multi-column / NULL-typed DEFAULT variant on the
 > partition-leaf ALTER path.
 
+### Slice 299 — nested-arithmetic **expression-index column** `((qty + id) * mgr_id)` → `((((qty + id) * mgr_id)))` (oracle-verified fixture)
+
+The oracle-verified complement to slice 298, in the **second** deparse context `executor.defaultExprToSQL` feeds: the
+index-key expression stored in `catalog.Index.ColExprStrings[i]` (vs slice 298's index *predicate* in `PredicateString`).
+Both populate from the same `defaultExprToSQL(e)` call at index-creation time, so slice 298's `BinaryOp`
+parenthesization already produces the correct bytes here — this slice **locks it in** with a byte-verified fixture
+rather than fixing new code.
+
+The paren-nesting arithmetic is worth recording because it is easy to mis-count (it cost a wrong first prediction this
+loop). For `CREATE INDEX foo_calc_expr_idx ON public.foo (((qty + id) * mgr_id))` the dumped key nests **four** parens:
+
+| layer | source | contributes |
+|-------|--------|-------------|
+| inner `(qty + id)` | `defaultExprToSQL` `BinaryOp` arm (the `+`) | `(qty + id)` |
+| `* mgr_id` wrap | `defaultExprToSQL` `BinaryOp` arm (the `*`) | `((qty + id) * mgr_id)` |
+| per-column `(%s)` | `BuildIndexDef` expression-column branch (`sb.WriteByte('(')` … `')'`) | `(((qty + id) * mgr_id))` |
+| column-list `(…)` | `BuildIndexDef` `USING btree (` … `)` | `((((qty + id) * mgr_id)))` |
+
+This mirrors real pg_dump 18.3 exactly: `pg_get_indexdef` (prettyFlags = `PRETTYFLAG_INDENT`, **no** `PRETTYFLAG_PAREN`)
+deparses the key via `deparse_expression_pretty` to `((qty + id) * mgr_id)` — identical to `pg_get_expr(indexprs)`, which
+this loop verified returns the same string — then wraps it `(%s)` (`ruleutils.c` `pg_get_indexdef_worker`,
+`looks_like_function` false) inside the `USING btree (…)` column-list parens. Verified byte-identical:
+`CREATE INDEX foo_calc_expr_idx ON public.foo USING btree ((((qty + id) * mgr_id)));`.
+
+Guards (`TestPort_PgDumpConnectionSetup`, drives real pg_dump 18.3): the `foo_calc_expr_idx` fixture pins the four-paren
+form, plus an absence guard that the precedence-corrupt under-parenthesized column `(qty + id * mgr_id)` (which would
+re-parse as `qty + (id * mgr_id)`, silently changing the indexed value) does **not** appear.
+
+> **Next (slice 300+):** the remaining unfixtured `defaultExprToSQL` contexts — partition-key expressions
+> (`PARTITION BY RANGE ((((a + b) * c)))`) and function-argument defaults with a binary op (`((1 + 2) * 3)`) — still have
+> no byte-verified fixture though the renderer already parenthesizes them; OR a multi-column / NULL-typed DEFAULT variant
+> on the partition-leaf ALTER path.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

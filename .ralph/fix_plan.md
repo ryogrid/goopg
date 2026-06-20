@@ -6379,6 +6379,21 @@ object support.
         (Slice 298), `.ralph/deferral_ledger.md`. **Next (slice 299+):** add an oracle-verified fixture for one still-unfixtured
         `defaultExprToSQL` context (expr-index / partition-key / func-arg default with a binary op) — the renderer already
         parenthesizes them, just no byte-verified fixture yet; OR a multi-column / NULL-typed partition-leaf DEFAULT variant.
+      - **PROGRESS 2026-06-20 (loop #67):** **DU-002 slice 299 LANDED — nested-arithmetic EXPRESSION-INDEX-COLUMN
+        `((qty + id) * mgr_id)` round-trips byte-identical vs real pg_dump 18.3.** The oracle-verified complement to slice 298,
+        in the SECOND deparse context `executor.defaultExprToSQL` feeds: the index-key expression in
+        `catalog.Index.ColExprStrings[i]` (vs slice 298's index PREDICATE in `PredicateString`). Both populate from the same
+        `defaultExprToSQL(e)` at CREATE INDEX time, so slice 298's `BinaryOp` parenthesization ALREADY produces correct bytes
+        here — fixture-only, locks it in. `CREATE INDEX foo_calc_expr_idx ON public.foo (((qty + id) * mgr_id))` dumps as
+        `USING btree ((((qty + id) * mgr_id)))` — FOUR nested parens: inner `(qty+id)` + `*` wrap (defaultExprToSQL) +
+        per-column `(%s)` + `USING btree (…)` column-list parens (BuildIndexDef). Confirmed `pg_get_indexdef` uses
+        prettyFlags=`PRETTYFLAG_INDENT` (no PAREN) and `pg_get_expr(indexprs)` returns the same `((qty + id) * mgr_id)` goopg's
+        `defaultExprToSQL` produces. **Guards:** `TestPort_PgDumpConnectionSetup` PASS (4.0s vs real pg_dump 18.3) — pins the
+        four-paren form + absence guard for the precedence-corrupt column `(qty + id * mgr_id)`; gofmt + `go vet` clean; pgbench
+        pre-commit smoke on commit. Files: `internal/testport/pgdump_connsetup_test.go` (foo_calc_expr_idx DDL + assertion +
+        negative guard), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 299), `.ralph/deferral_ledger.md`. **Next (slice
+        300+):** partition-key (`RANGE ((((a+b)*c)))`) OR func-arg-default (`((1+2)*3)`) binary-op fixture — renderer already
+        parenthesizes, no byte-verified fixture yet.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
