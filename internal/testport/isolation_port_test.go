@@ -464,6 +464,22 @@ func TestPort_IsolationReadOnlyAnomaly2(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-2.spec")
 }
 
+// TestPort_IsolationReadOnlyAnomaly3 exercises read-only-anomaly-3: the same
+// O'Neil read-only anomaly, but s3 is declared SERIALIZABLE READ ONLY
+// DEFERRABLE. PostgreSQL avoids the anomaly without aborting anyone by
+// deferring s3's snapshot (GetSafeSnapshot) until a safe snapshot is available
+// — s3r blocks (<waiting ...>) while the concurrent read-write s2 is active,
+// then completes once s2 commits, observing the final committed state
+// (X=-11, Y=20). goopg's Manager.waitForSafeSnapshot implements the same
+// drain-the-writers deferral (M0118-0001), so no transaction is rolled back.
+func TestPort_IsolationReadOnlyAnomaly3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_ro_anomaly3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-3.spec")
+}
+
 // TestPort_IsolationSerializableParallel exercises serializable-parallel: the
 // same O'Neil read-only anomaly under SERIALIZABLE as read-only-anomaly-2, but
 // the read-only s3 declares "SET debug_parallel_query = on" so upstream runs it

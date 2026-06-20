@@ -104,6 +104,19 @@ type SerializableXact struct {
 	// non-SERIALIZABLE workloads pay no allocation; first acquire
 	// initialises it.
 	predicateLocks map[PredicateLockTag]struct{}
+
+	// ReadOnly / Deferrable record the declared transaction modes (BEGIN
+	// ... READ ONLY DEFERRABLE), set by Manager.MarkSerializableModes right
+	// after Begin. ReadOnly mirrors PostgreSQL's SXACT_FLAG_READ_ONLY: it marks
+	// the xact as a non-writer for SSI purposes regardless of whether it has
+	// assigned an XID yet, so a concurrent READ ONLY DEFERRABLE peer does not
+	// wait on it. Deferrable requests the GetSafeSnapshot deferral in
+	// SnapshotFor — the read-only xact blocks until every concurrent
+	// declared-read-write SERIALIZABLE xact has finished, then takes a safe
+	// snapshot that can never form a dangerous structure (so it is never
+	// aborted with 40001). M0118-0001 (read-only-anomaly-3).
+	ReadOnly   bool
+	Deferrable bool
 }
 
 // IsActive reports whether the SerializableXact is still in-flight.
@@ -221,6 +234,12 @@ func (m *Manager) releaseSerializableLocked(handle TxnHandle, committed bool) *S
 	m.ssiState.nextCommitSeqNo++
 	delete(m.ssiState.xacts, handle)
 
+	// Wake any READ ONLY DEFERRABLE xact blocked in waitForSafeSnapshot: this
+	// SERIALIZABLE xact just finished, which may have completed a waiter's
+	// drain set. Broadcasting under m.ssiMu is safe (the waiter re-checks its
+	// condition on wake). M0118-0001.
+	m.ssiCondLocked().Broadcast()
+
 	if committed {
 		// M0118-0001: retain committed xacts so a later concurrent xact
 		// can still discover the `R -> W -> T2` / `T0 -> R -> W` pivots in
@@ -325,4 +344,90 @@ func (m *Manager) SerializableXactCount() int {
 		return 0
 	}
 	return len(m.ssiState.xacts)
+}
+
+// ssiCondLocked returns the SSI finish-event condition variable, creating it on
+// first use. Caller must hold m.ssiMu. The lazy init lets a Manager built as a
+// bare struct literal (tests) participate in the safe-snapshot wait without
+// going through NewManager.
+func (m *Manager) ssiCondLocked() *sync.Cond {
+	if m.ssiCond == nil {
+		m.ssiCond = sync.NewCond(&m.ssiMu)
+	}
+	return m.ssiCond
+}
+
+// MarkSerializableModes records the declared READ ONLY / DEFERRABLE transaction
+// modes on the SERIALIZABLE xact registered for handle. Called by the executor
+// immediately after Begin when the BEGIN statement carried those modes. A no-op
+// for RC/RR transactions (no SerializableXact) and for unregistered handles.
+// Mirrors PostgreSQL setting SXACT_FLAG_READ_ONLY / SXACT_FLAG_DEFERRABLE in
+// RegisterSerializableTransactionInt. M0118-0001.
+func (m *Manager) MarkSerializableModes(handle TxnHandle, readOnly, deferrable bool) {
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
+	if m.ssiState.xacts == nil {
+		return
+	}
+	if sx, ok := m.ssiState.xacts[handle]; ok {
+		sx.ReadOnly = readOnly
+		sx.Deferrable = deferrable
+	}
+}
+
+// waitForSafeSnapshot implements PostgreSQL's GetSafeSnapshot (predicate.c) for
+// a SERIALIZABLE READ ONLY DEFERRABLE transaction: it blocks until every
+// concurrent declared-read-write SERIALIZABLE transaction that was active when
+// the wait began has finished (committed or aborted). Only then is it safe for
+// the read-only transaction to take its snapshot — a snapshot taken after all
+// concurrent writers have committed cannot place this transaction on the
+// rw-conflict "out" side of a dangerous structure, so it never has to be rolled
+// back with SQLSTATE 40001. This trades a one-time wait for the absence of
+// false-positive serialization failures (the read-only-anomaly-3 scenario from
+// the Fekete et al. paper).
+//
+// goopg only ever resolves the read-only xact to ROSafe (it drains the
+// concurrent writers and proceeds); it does not implement the ROUnsafe
+// early-abort/retry refinement, which no ported spec exercises (the sole
+// DEFERRABLE spec resolves to a safe snapshot). The divergence is documented in
+// docs/design/0118-0001.
+//
+// Caller must NOT hold m.ssiMu and must call this BEFORE capturing the
+// snapshot. Returns immediately unless the xact for handle is both ReadOnly and
+// Deferrable. Writers that start after the wait begins do not extend it —
+// matching upstream, which only enrolls writers live at registration time.
+func (m *Manager) waitForSafeSnapshot(handle TxnHandle) {
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
+	if m.ssiState.xacts == nil {
+		return
+	}
+	self, ok := m.ssiState.xacts[handle]
+	if !ok || !self.ReadOnly || !self.Deferrable {
+		return
+	}
+	// Enroll every concurrent declared-read-write SERIALIZABLE xact active now.
+	// FinishedAt is stamped (and never cleared) on commit or abort, so holding
+	// the pointers is safe even after the peer is deleted from the registry.
+	var waitOn []*SerializableXact
+	for h, sx := range m.ssiState.xacts {
+		if h == handle || sx == nil || sx.ReadOnly {
+			continue
+		}
+		waitOn = append(waitOn, sx)
+	}
+	cond := m.ssiCondLocked()
+	for {
+		pending := false
+		for _, sx := range waitOn {
+			if sx.FinishedAt == InvalidCommitSeqNo {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			return
+		}
+		cond.Wait()
+	}
 }

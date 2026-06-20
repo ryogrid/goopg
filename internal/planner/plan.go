@@ -1464,6 +1464,7 @@ type Transaction struct {
 	Name           string // savepoint name for TxSavepoint / TxRelease / TxRollbackTo
 	IsolationLevel string // for TxBegin: "read committed", "repeatable read", etc.; "" = session default
 	ReadOnly       bool   // for TxBegin: true when BEGIN/START TRANSACTION READ ONLY
+	Deferrable     bool   // for TxBegin: true when BEGIN/START TRANSACTION DEFERRABLE
 }
 
 func (n *Transaction) Pos() int       { return n.pos }

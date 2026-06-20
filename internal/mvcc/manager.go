@@ -96,6 +96,12 @@ type Manager struct {
 	ssiMu          sync.Mutex
 	ssiState       ssiState
 	predicateLocks predicateLocksRegistry
+	// ssiCond signals when a SERIALIZABLE xact finishes (commit or abort),
+	// so a READ ONLY DEFERRABLE xact blocked in waitForSafeSnapshot can re-check
+	// whether its safe-snapshot condition is now met. Bound to ssiMu; created
+	// lazily under ssiMu (ssiCondLocked) so Managers built as a bare struct
+	// literal in tests work without NewManager. M0118-0001.
+	ssiCond *sync.Cond
 
 	// subxact tracking (M0050-0002): maps subxact XIDs to their parent
 	// XIDs, and records individually-aborted subxact XIDs. Lazily
@@ -113,6 +119,7 @@ func NewManager() *Manager {
 	m.xidgen.next.Store(uint64(FirstNormalTransactionID))
 	m.procArray = newProcArray(defaultProcArraySize)
 	m.commitCond = sync.NewCond(&m.waitMu)
+	m.ssiCond = sync.NewCond(&m.ssiMu)
 	return m
 }
 
@@ -352,6 +359,13 @@ func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 		// predicate-lock substrate (M0104-0003); conflict detection
 		// will overlay on top of the pinned snapshot, not replace it.
 		if s.firstSnap == nil {
+			if tx.Isolation == IsolationSerializable {
+				// GetSafeSnapshot deferral: a READ ONLY DEFERRABLE xact blocks
+				// here until concurrent writers drain, so the snapshot it then
+				// captures is safe. No-op for every other SERIALIZABLE xact.
+				// M0118-0001 (read-only-anomaly-3).
+				m.waitForSafeSnapshot(tx.Handle)
+			}
 			snap := m.captureSnapshot()
 			s.firstSnap = &snap
 			s.xmin.Store(uint64(snap.Xmin))

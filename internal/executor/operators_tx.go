@@ -83,6 +83,14 @@ func (o *transactionOp) execBegin() error {
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
+	// Record the declared READ ONLY / DEFERRABLE modes on the SSI xact so the
+	// snapshot path can apply PostgreSQL's GetSafeSnapshot deferral for a
+	// SERIALIZABLE READ ONLY DEFERRABLE transaction (it waits for concurrent
+	// writers to drain instead of risking a 40001 abort). No-op for RC/RR.
+	// M0118-0001 (read-only-anomaly-3).
+	if level == mvcc.IsolationSerializable {
+		o.ctx.TxnMgr.MarkSerializableModes(tx.Handle, o.plan.ReadOnly, o.plan.Deferrable)
+	}
 	// PG-parity: for RR/SERIALIZABLE, the snapshot is captured at the first
 	// non-BEGIN statement, NOT at BEGIN time. We leave firstSnapshot unset
 	// here; dispatchSimpleQueryViaExecutor's SnapshotFor call at the start of

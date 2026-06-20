@@ -700,6 +700,65 @@ lock-step with `CREATE TABLE WITH`, the merge/RESET semantics, the bounds SQLSTA
 and the all-or-nothing atomicity; `TestPort_IsolationSerializableParallel2` and
 `…Parallel3` pass byte-for-byte vs PG 18.3. Isolation pass count 27 → 29.
 
+### 17. `READ ONLY DEFERRABLE` safe-snapshot deferral (lands `read-only-anomaly-3`)
+
+`read-only-anomaly-3` is the example from O'Neil's *"A read-only transaction
+anomaly under snapshot isolation"*. Its read-only session `s3` is declared
+`BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE`. Upstream
+avoids the anomaly **without aborting anyone** by deferring `s3`'s snapshot
+(`GetSafeSnapshot`, `predicate.c`) until a *safe* snapshot is available: `s3r`
+blocks (`<waiting ...>`) while the concurrent read-write `s2` is still active,
+then completes once `s2` commits, observing the final committed state
+(`X=-11`, `Y=20`). The single permutation must produce zero serialization
+failures.
+
+Two blockers were fixed:
+
+1. **`DEFERRABLE` was never parsed.** `DEFERRABLE` lexes as the unreserved
+   keyword token `KwDeferrable`, but `parseBeginModes` matched it with
+   `acceptIdentKeyword("deferrable")`, which only accepts a `TokenIdent`. The
+   word was therefore never consumed and `BEGIN … READ ONLY DEFERRABLE` failed
+   with `syntax error … got deferrable`. The fix matches it with
+   `acceptKeyword(KwDeferrable)` (and the `NOT DEFERRABLE` arm likewise), and
+   records the result in the new `BeginStmt.Deferrable` / `Transaction.Deferrable`
+   plan field. (The earlier "accepted, no-op for v0" comment was wrong — the
+   prior code silently rejected the clause; no spec had exercised it.)
+
+2. **The safe-snapshot deferral did not exist.** goopg now models the minimal
+   `GetSafeSnapshot`:
+   - `SerializableXact` gains `ReadOnly` / `Deferrable` flags (the
+     `SXACT_FLAG_READ_ONLY` / `SXACT_FLAG_DEFERRABLE` analogues), set right after
+     `Begin` by `Manager.MarkSerializableModes`, wired from both BEGIN paths (the
+     `transactionOp.execBegin` operator and the inline auto-commit→explicit
+     promotion in `server/dispatch.go` — sibling paths kept in sync).
+   - `Manager.SnapshotFor`, when a SERIALIZABLE xact takes its **first** snapshot
+     (`firstSnap == nil`), calls `Manager.waitForSafeSnapshot`. For a
+     `ReadOnly && Deferrable` xact this enrolls every concurrent *declared
+     read-write* SERIALIZABLE xact active at that instant and blocks on a
+     `sync.Cond` (`ssiCond`, bound to `ssiMu`) until each has `FinishedAt`
+     stamped (committed **or** aborted). `releaseSerializableLocked` broadcasts
+     `ssiCond` on every finish. A non-deferrable or write-side xact returns
+     immediately, so the only behavioural change for all other SERIALIZABLE
+     workloads is one extra uncontended `ssiMu` acquisition per transaction.
+
+   A snapshot taken after every concurrent writer has drained cannot place the
+   read-only xact on the rw-conflict *out* side of a dangerous structure, so it
+   is always **`RO_SAFE`** and never aborted. goopg deliberately does **not**
+   implement the `RO_UNSAFE` early-abort/retry refinement (where a committing
+   writer can mark the deferrable reader unsafe, forcing a fresh snapshot): no
+   ported spec exercises it — the sole `DEFERRABLE` spec resolves to a safe
+   snapshot. That divergence is acceptable because the deferral is purely a
+   *false-positive eliminator*: in the worst un-modelled case goopg would wait
+   slightly longer, never produce a wrong answer.
+
+The runner's existing 300 ms block-detection (`isolation_runner.go`) turns the
+server-side `ssiCond.Wait` into the `<waiting ...>` / `<... completed>` markers
+with no runner change. Verified by `TestPort_IsolationReadOnlyAnomaly3`
+(byte-for-byte vs PG 18.3) plus the deterministic `TestSafeSnapshot*` mvcc unit
+suite (waits for a committing writer, an aborting writer, returns immediately
+with no writers / when not deferrable / when only read-only peers are active).
+Isolation pass count 29 → 30.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
@@ -725,7 +784,10 @@ and the all-or-nothing atomicity; `TestPort_IsolationSerializableParallel2` and
   change — only the `debug_parallel_query` no-op GUC of section 15), and
   `serializable-parallel-2` / `-3` (write-free `RO_SAFE` read-only workloads whose
   outcome is anomaly-free; zero SSI change — only the `ALTER TABLE … SET (reloptions)`
-  DDL of section 16).
+  DDL of section 16), and `read-only-anomaly-3` (the O'Neil read-only anomaly with a
+  `SERIALIZABLE READ ONLY DEFERRABLE` `s3` deferred to a safe snapshot — the
+  `GetSafeSnapshot` drain-the-writers wait of section 17; `s3r` blocks then commits
+  with no abort).
 - **Still deferred (same slice family):**
   - `receipt-report` — the `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` parser
     gap is now **fixed** (section 6), so the spec runs end-to-end. Two issues
@@ -743,10 +805,5 @@ and the all-or-nothing atomicity; `TestPort_IsolationSerializableParallel2` and
     `errWALBufferReservedOutOfRange` (`internal/wal/wal_buffer.go`), ~50% of runs.
     Blocked on that WAL race (a different subsystem), NOT on SSI.
     `TestPort_IsolationMultipleRowVersions` is a skip-on-defer anchor.
-  - `read-only-anomaly-3` — the base `serializable-parallel` (section 15) and the
-    `serializable-parallel-2`/`-3` pair (section 16) now **pass**. `read-only-anomaly-3`
-    still needs the `DEFERRABLE` safe-snapshot deferral and the reserved-keyword
-    parser fix (section 6); unlike the parallel pair its workload *does* write, so
-    a genuine `RO_SAFE` safe-snapshot deferral is required, not just the setup DDL.
   Their dedicated `TestPort_Isolation*` functions auto-promote (run, then
   `t.Skip` only on `defer`), so the next slice sees green→pass instantly.

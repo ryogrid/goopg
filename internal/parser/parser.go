@@ -784,8 +784,10 @@ func (p *parser) parseDoBlock() (Stmt, error) {
 //
 //	ISOLATION LEVEL {READ COMMITTED | READ UNCOMMITTED |
 //	                 REPEATABLE READ | SERIALIZABLE}
-//	READ {ONLY | WRITE}          — accepted, no-op for v0
-//	[NOT] DEFERRABLE             — accepted, no-op for v0
+//	READ {ONLY | WRITE}          — recorded in BeginStmt.ReadOnly
+//	[NOT] DEFERRABLE             — recorded in BeginStmt.Deferrable; for a
+//	                               SERIALIZABLE READ ONLY xact it requests the
+//	                               GetSafeSnapshot deferral (M0118-0001)
 //
 // Modes may appear in any order and repeat (last ISOLATION LEVEL wins).
 func (p *parser) parseBegin() (Stmt, error) {
@@ -823,9 +825,16 @@ func (p *parser) parseBeginModes(s *BeginStmt) (Stmt, error) {
 				s.ReadOnly = false
 			}
 		case p.acceptKeyword(KwNot):
-			_ = p.acceptIdentKeyword("deferrable")
-		case p.acceptIdentKeyword("deferrable"):
-			// no-op
+			// DEFERRABLE is an unreserved keyword token (KwDeferrable), not an
+			// identifier, so it must be matched with acceptKeyword — using
+			// acceptIdentKeyword silently failed to consume it (the cause of the
+			// "syntax error ... got deferrable" on BEGIN ... READ ONLY
+			// DEFERRABLE). M0118-0001.
+			if p.acceptKeyword(KwDeferrable) {
+				s.Deferrable = false
+			}
+		case p.acceptKeyword(KwDeferrable):
+			s.Deferrable = true
 		default:
 			goto done
 		}

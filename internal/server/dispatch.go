@@ -1449,6 +1449,13 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				if connTx.Session() != nil {
 					connTx.Session().SetReadOnlyTxn(txNode.ReadOnly)
 				}
+				// Record the declared READ ONLY / DEFERRABLE modes on the SSI
+				// xact so the snapshot path applies PostgreSQL's GetSafeSnapshot
+				// deferral for a SERIALIZABLE READ ONLY DEFERRABLE transaction.
+				// No-op for RC/RR. M0118-0001 (read-only-anomaly-3).
+				if ctx.Tx.Isolation == mvcc.IsolationSerializable {
+					s.cfg.TxnMgr.MarkSerializableModes(ctx.Tx.Handle, txNode.ReadOnly, txNode.Deferrable)
+				}
 				if ctx.BeginLocalTransaction != nil {
 					ctx.BeginLocalTransaction()
 				}

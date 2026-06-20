@@ -39,6 +39,12 @@ type BeginStmt struct {
 	pos            int
 	IsolationLevel string // "" = use session default
 	ReadOnly       bool   // true when START TRANSACTION READ ONLY / BEGIN READ ONLY
+	// Deferrable is true when the DEFERRABLE transaction mode was supplied
+	// (and NOT cleared by a later NOT DEFERRABLE). For a SERIALIZABLE READ ONLY
+	// transaction it requests the GetSafeSnapshot deferral (predicate.c): the
+	// transaction waits for a safe snapshot instead of risking a 40001 abort.
+	// M0118-0001 (read-only-anomaly-3).
+	Deferrable bool
 }
 
 func (s *BeginStmt) Pos() int  { return s.pos }
