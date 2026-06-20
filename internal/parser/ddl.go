@@ -2466,39 +2466,61 @@ func normalizeCompressionMethod(method string) string {
 // the operator / function-call / grouping-paren / qualified-name surface goopg
 // supports. The result re-parses to the same node, so evalGeneratedExpr (which
 // re-parses the stored string) is unaffected. DU-002 slice 289.
+//
+// String-literal tokens get special handling (DU-002 slice 294): the lexer
+// stores a literal's UNQUOTED body (`'-'` → Value "-"), so they must be
+// re-quoted (with embedded single quotes doubled) to reproduce pg_get_expr's
+// rendering — otherwise `concat(ka, '-', la)` would round-trip as the malformed
+// `concat(ka, -, la)`. The punctuation spacing rules are also gated on
+// TokenSymbol so a literal whose body happens to be ")"/","/"("/"." can never be
+// mistaken for the matching punctuator; for the operator/call/grouping-paren
+// expressions of slices 283–293 (which contain no string literals) every
+// punctuator is already a TokenSymbol, so this gating is a no-op there.
 func joinGeneratedExprTokens(toks []Token) string {
+	// renderTok reproduces a token's canonical SQL text: string literals are
+	// re-quoted (their stored body is unquoted), everything else is verbatim.
+	renderTok := func(t Token) string {
+		if t.Kind == TokenStringLit {
+			return "'" + strings.ReplaceAll(t.Value, "'", "''") + "'"
+		}
+		return t.Value
+	}
 	var b strings.Builder
 	for i, t := range toks {
 		if i == 0 {
-			b.WriteString(t.Value)
+			b.WriteString(renderTok(t))
 			continue
 		}
 		prev := toks[i-1]
 		noSpace := false
-		switch t.Value {
-		case ")", ",":
-			// Never a space before a close-paren or an argument comma.
-			noSpace = true
-		case "(":
-			// Tight before a call paren (prev is a function name or a closing
-			// paren); spaced before a grouping paren (prev is an operator,
-			// keyword, or open paren).
-			if prev.Kind == TokenIdent || prev.Kind == TokenQuotedIdent || prev.Value == ")" {
+		// The punctuation spacing rules apply to SYMBOL tokens only — a string
+		// literal whose body is ")"/","/"("/"." must not trigger them.
+		if t.Kind == TokenSymbol {
+			switch t.Value {
+			case ")", ",":
+				// Never a space before a close-paren or an argument comma.
+				noSpace = true
+			case "(":
+				// Tight before a call paren (prev is a function name or a closing
+				// paren); spaced before a grouping paren (prev is an operator,
+				// keyword, or open paren).
+				if prev.Kind == TokenIdent || prev.Kind == TokenQuotedIdent || (prev.Kind == TokenSymbol && prev.Value == ")") {
+					noSpace = true
+				}
+			case ".":
+				// Qualified name (`schema.func`): no space around the dot.
 				noSpace = true
 			}
-		case ".":
-			// Qualified name (`schema.func`): no space around the dot.
-			noSpace = true
 		}
 		// Tight after an open paren or a dot; the comma's trailing space is
 		// supplied by the default branch (the token after a comma is spaced).
-		if prev.Value == "(" || prev.Value == "." {
+		if prev.Kind == TokenSymbol && (prev.Value == "(" || prev.Value == ".") {
 			noSpace = true
 		}
 		if !noSpace {
 			b.WriteByte(' ')
 		}
-		b.WriteString(t.Value)
+		b.WriteString(renderTok(t))
 	}
 	return b.String()
 }

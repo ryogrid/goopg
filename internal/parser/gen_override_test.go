@@ -166,6 +166,14 @@ func TestGeneratedColumnExprCanonicalSpacing(t *testing.T) {
 		{"nested_call_in_arith", "upper(fn) || gn", "upper(fn) || gn"},
 		{"plain_operator_chain", "fa + fb + 1000", "fa + fb + 1000"},
 		{"concat", "fa || fb", "fa || fb"},
+		// DU-002 slice 294: string-literal arguments must be RE-QUOTED. The lexer
+		// stores a literal's unquoted body (`'-'` → "-"), so the pre-fix helper
+		// space-joined it raw into the malformed `concat(fa, -, fb)`. The fix
+		// re-quotes TokenStringLit (doubling embedded quotes) and gates the
+		// punctuation spacing on TokenSymbol.
+		{"string_literal_arg", "concat(fa, '-', fb)", "concat(fa, '-', fb)"},
+		{"string_literal_operand", "fa || '-' || fb", "fa || '-' || fb"},
+		{"embedded_quote_literal", "concat(fa, '''', fb)", "concat(fa, '''', fb)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -6275,6 +6275,30 @@ object support.
         **Next (slice 294+):** a function-call generation expression with a LITERAL argument (`concat(ka, '-', la)`) to pin
         string-literal token rendering inside an argument list, OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf
         ALTER path.
+      - **PROGRESS 2026-06-20 (loop #62):** **DU-002 slice 294 LANDED — PRODUCTION fix: string-literal argument in a function-call
+        generation expression `concat(ka, '-', la)` round-trips end-to-end on the pg_dump oracle.** Slices 291–293 pinned the
+        call-paren / comma-spacing branches of `joinGeneratedExprTokens` for IDENTIFIER arguments only. A string-literal argument
+        exposed a latent production bug: the lexer stores a literal's UNQUOTED body (`'-'` → `Token.Value` `"-"`), and the helper
+        space-joined token values raw — so `concat(ka, '-', la)` would have round-tripped as the MALFORMED `concat(ka, -, la)`
+        (quotes dropped, the literal indistinguishable from a minus operator). **Fix (`internal/parser/ddl.go`):** new `renderTok`
+        closure re-quotes `TokenStringLit` (doubling embedded single quotes); the punctuation spacing rules are gated on
+        `TokenSymbol` so a literal body of `)`/`,`/`(`/`.` can't be mistaken for a punctuator. For the operator/call/grouping-paren
+        expressions of slices 283–293 (no string literals) every punctuator is already a `TokenSymbol`, so the gating is a NO-OP
+        there — byte-identical output, zero regression. Because the test dumps a LIVE goopg server, real pg_dump reads goopg's stored
+        source verbatim, so the assertion pins goopg's own canonical `concat(ka, '-', la)` (goopg does NOT add the `::text` cast
+        real PG's `pg_get_expr` injects; out-of-scope divergence, like the lowercase-name divergence of 290–293). Fixture:
+        `CREATE TABLE public.pglc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED) PARTITION BY LIST (ka)` +
+        `pglc_1 PARTITION OF`. **Guards:** `TestGeneratedColumnExprCanonicalSpacing` PASS (3 new cases: `concat(fa, '-', fb)`,
+        `fa || '-' || fb` literal operand, `concat(fa, '''', fb)` embedded-quote literal re-quoted as `''''`);
+        `TestPort_PgDumpConnectionSetup` PASS (3.63s vs real pg_dump 18.3 — asserts `pglc_1` prints the inline
+        `na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED`, the malformed `concat(ka, -, la)` is ABSENT, attnum order,
+        ATTACH survives); gofmt + `go vet` + `go build ./...` clean; pgbench pre-commit smoke on commit. Files:
+        `internal/parser/ddl.go` (PRODUCTION fix to `joinGeneratedExprTokens`), `internal/parser/gen_override_test.go` (3 unit
+        cases), `internal/testport/pgdump_connsetup_test.go` (pglc fixture + assertion), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 294).
+        **Next (slice 295+):** a string-literal generation expression whose body IS `pg_get_expr` punctuation
+        (e.g. `concat(ka, ',', la)` — literal body is a comma) to exercise the `TokenSymbol`-gated spacing on the oracle path, OR a
+        multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

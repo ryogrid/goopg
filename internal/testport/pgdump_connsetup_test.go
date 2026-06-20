@@ -1725,6 +1725,35 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pg3c_1: %v", err)
 	}
 
+	// Slice 294 (PRODUCTION fix): a function-call generation expression with a
+	// STRING-LITERAL argument (`concat(ka, '-', la)`) inherited onto a partition
+	// leaf. Slices 291–293 pinned the call-paren / comma-spacing branches of
+	// joinGeneratedExprTokens for IDENTIFIER arguments only. A string-literal
+	// argument exposed a latent bug: the lexer stores a literal's UNQUOTED body
+	// (`'-'` → Token.Value "-"), and the helper space-joined token values raw, so
+	// `concat(ka, '-', la)` would have round-tripped as the MALFORMED
+	// `concat(ka, -, la)` (the quotes dropped, the literal indistinguishable from
+	// a minus operator). The fix re-quotes TokenStringLit tokens (doubling any
+	// embedded single quote) and gates the punctuation spacing rules on
+	// TokenSymbol so a literal body of ")"/","/"("/"." can't be mistaken for a
+	// punctuator. Because this test dumps a LIVE goopg server, real pg_dump reads
+	// goopg's stored generation source verbatim — so the assertion pins goopg's
+	// own canonical rendering `concat(ka, '-', la)` (goopg does not add the
+	// `::text` cast that real PG's pg_get_expr would inject; that divergence is
+	// out of scope, like the lowercase-function-name divergence of slices 290–293).
+	// Render path is otherwise identical to slices 281–293: attgenerated ('s')
+	// forces attrdefs[].separate=false (pg_dump.c:9507) and ispartition forces
+	// shouldPrintColumn for every column, so the leaf pglc_1 inherits both plain
+	// columns and prints `ka text`, `la text`, then the inline generated
+	// `na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED`. No rows are
+	// inserted, so this rides the dump-time deparse path only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pglc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED) PARTITION BY LIST (ka)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pglc with string-literal-argument function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pglc_1 PARTITION OF public.pglc FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pglc_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4936,6 +4965,53 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pg3c_1 FOR VALUES IN ('a')") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pg3c_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+
+		// **Slice 294 (asserted):** function-call generation expression with a
+		// STRING-LITERAL argument on a partition leaf. The leaf pglc_1 must print
+		// `ka text`, `la text`, then the inline generated
+		// `na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED` — with the
+		// literal RE-QUOTED (`'-'`, not the bare `-` the pre-fix helper would have
+		// emitted) and the surrounding commas spaced. The substring check below is
+		// the production-fix regression guard: before slice 294 the helper dropped
+		// the literal's quotes, so this block would have contained the malformed
+		// `concat(ka, -, la)`.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pglc_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			kaIdx := strings.Index(block, "ka text")
+			if kaIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pglc_1 block\n  block=%q", "ka text", block)
+			}
+			laIdx := strings.Index(block, "la text")
+			if laIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pglc_1 block\n  block=%q", "la text", block)
+			}
+			naIdx := strings.Index(block, "na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED")
+			if naIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the string-literal-argument function-call generated column on a partition leaf; want %q in pglc_1 block\n  block=%q", "na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED", block)
+			}
+			// Guard against the pre-fix regression: the malformed bare-literal
+			// form must NOT appear (quotes were dropped → `concat(ka, -, la)`).
+			if strings.Contains(block, "concat(ka, -, la)") {
+				t.Errorf("pg_dump emitted the pre-slice-294 malformed generation expr with the string literal's quotes dropped; got %q in pglc_1 block\n  block=%q", "concat(ka, -, la)", block)
+			}
+			// Attnum order: ka (1) before la (2) before na (3).
+			if kaIdx >= 0 && laIdx >= 0 && kaIdx > laIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pglc_1 block\n  block=%q", "ka", "la", block)
+			}
+			if laIdx >= 0 && naIdx >= 0 && laIdx > naIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pglc_1 block\n  block=%q", "la", "na", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pglc_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pglc_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pglc_1 FOR VALUES IN ('a')", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every
