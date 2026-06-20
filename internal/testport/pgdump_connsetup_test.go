@@ -2256,7 +2256,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// const-folded value as `'1 day'::interval`; both are valid, re-parseable SQL
 	// that round-trips). The `span interval` column guards the interval-literal
 	// path end-to-end.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3], grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END, pair integer DEFAULT (1, 2), span interval DEFAULT INTERVAL '1' day, nflag boolean DEFAULT (1 IS NOT NULL), bflag boolean DEFAULT (true IS NOT TRUE), dflag boolean DEFAULT (1 IS DISTINCT FROM 2))"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3], grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END, pair integer DEFAULT (1, 2), span interval DEFAULT INTERVAL '1' day, nflag boolean DEFAULT (1 IS NOT NULL), bflag boolean DEFAULT (true IS NOT TRUE), dflag boolean DEFAULT (1 IS DISTINCT FROM 2), calc integer DEFAULT (1 + 2) * 3)"); err != nil {
 		t.Fatalf("create table defcol with function-call default: %v", err)
 	}
 
@@ -5746,6 +5746,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			}
 			if !strings.Contains(block, "1 IS DISTINCT FROM 2") {
 				t.Errorf("pg_dump dropped/corrupted the IS DISTINCT FROM default; want %q in defcol block\n  block=%q", "1 IS DISTINCT FROM 2", block)
+			}
+			// **Slice 297 (asserted):** a NESTED-arithmetic column DEFAULT must
+			// round-trip with PG-faithful FULL parenthesization. The `calc` column
+			// carries `DEFAULT (1 + 2) * 3`, parsed as Mul(Add(1,2), 3). PG's
+			// pg_get_expr (prettyFlags=0, the mode pg_dump uses for pg_attrdef.adbin)
+			// wraps every binary OpExpr node, so real PG 18.3 emits
+			// `DEFAULT ((1 + 2) * 3)` (empirically verified). Before slice 297
+			// formatExprForAttrdef rendered the operator WITHOUT parens, so the dump
+			// emitted `DEFAULT 1 + 2 * 3` — which re-parses to Mul(1, Mul(2,3)) and
+			// evaluates to 7, not 9, on restore: a SILENT precedence corruption.
+			// The fix wraps each BinaryOp `(left op right)`; the recursion
+			// parenthesizes the inner Add. Assert the fully-parenthesized form.
+			if !strings.Contains(block, "calc integer DEFAULT ((1 + 2) * 3)") {
+				t.Errorf("pg_dump dropped/corrupted the nested-arithmetic default; want %q in defcol block\n  block=%q", "calc integer DEFAULT ((1 + 2) * 3)", block)
+			}
+			// Guard the pre-fix corruption shape explicitly: the un-parenthesized
+			// `DEFAULT 1 + 2 * 3` (precedence-changed) must NOT appear.
+			if strings.Contains(block, "DEFAULT 1 + 2 * 3") {
+				t.Errorf("pg_dump emitted the precedence-corrupted (un-parenthesized) nested-arithmetic default `DEFAULT 1 + 2 * 3`\n  block=%q", block)
 			}
 		}
 		// **Slice 182 (asserted):** per-column storage overrides. `storcol.a` was

@@ -1275,14 +1275,31 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 			"NOT true",
 		},
 		{
+			// PG's pg_get_expr fully parenthesizes every binary OpExpr node, so a
+			// bare `1 + 1` default dumps as `(1 + 1)` (DU-002 slice 297).
 			"binary add",
 			&parser.BinaryOp{Op: parser.OpAdd, Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 1}},
-			"1 + 1",
+			"(1 + 1)",
 		},
 		{
+			// Parenthesized like every binary OpExpr (slice 297). (Real PG also
+			// decorates the literals with `::text`, but that type-inference layer is
+			// orthogonal to the renderer under test here.)
 			"binary concat",
 			&parser.BinaryOp{Op: parser.OpConcat, Left: &parser.StringConst{Value: "a"}, Right: &parser.StringConst{Value: "b"}},
-			"'a' || 'b'",
+			"('a' || 'b')",
+		},
+		{
+			// Nested arithmetic: `DEFAULT (1 + 2) * 3` parses to Mul(Add(1,2), 3).
+			// The recursion parenthesizes the inner Add as an operand of Mul, so the
+			// render is `((1 + 2) * 3)` — byte-identical to real PG 18.3's pg_get_expr.
+			// Pre-slice-297 this rendered `1 + 2 * 3` (a precedence change that
+			// evaluates to 7, not 9, on restore). DU-002 slice 297.
+			"binary nested precedence",
+			&parser.BinaryOp{Op: parser.OpMul,
+				Left:  &parser.BinaryOp{Op: parser.OpAdd, Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 2}},
+				Right: &parser.IntegerConst{Value: 3}},
+			"((1 + 2) * 3)",
 		},
 		{
 			"typed string lit",
@@ -1358,7 +1375,7 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 				&parser.IntegerConst{Value: 1},
 				&parser.BinaryOp{Op: parser.OpConcat, Left: &parser.StringConst{Value: "a"}, Right: &parser.StringConst{Value: "b"}},
 			}},
-			"ROW(1, 'a' || 'b')",
+			"ROW(1, ('a' || 'b'))",
 		},
 		{
 			// `DEFAULT INTERVAL '1' day` on an interval column parses to a

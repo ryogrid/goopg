@@ -6336,6 +6336,26 @@ object support.
         Files: `internal/testport/pgdump_connsetup_test.go` (pgqc fixture + assertion), `docs/design/0110-0001-pg-dump-tap-port.md`
         (Slice 296). **Next (slice 297+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path, OR a
         string-literal generation expression with an embedded backslash / `E''` escape against `standard_conforming_strings`.
+      - **PROGRESS 2026-06-20 (loop #65):** **DU-002 slice 297 LANDED — PRODUCTION fix: nested-arithmetic column DEFAULT full
+        parenthesization.** A real round-trip CORRECTNESS bug, distinct from the generation-expr saga (281–296): generation
+        expressions deparse token-by-token (`joinGeneratedExprTokens`, preserves user parens); column DEFAULTs deparse from a parsed
+        `Expr` AST via `catalog.formatExprForAttrdef` (goopg's `pg_get_expr` pass-through → `pg_attrdef.adbin`). That renderer emitted
+        each `BinaryOp` WITHOUT parens (`left op right`), so `DEFAULT (1 + 2) * 3` (AST `Mul(Add(1,2),3)`) dumped as `1 + 2 * 3` —
+        which re-parses to `Mul(1, Mul(2,3))` = 7, NOT 9, on restore: a SILENT precedence corruption. PG's `pg_get_expr`
+        (prettyFlags=0, the mode pg_dump uses for adbin) FULLY parenthesizes every binary OpExpr — empirically verified vs real PG
+        18.3: `1 + 1` → `(1 + 1)`, `(1 + 2) * 3` → `((1 + 2) * 3)`. Fix wraps each `BinaryOp` `(left op right)` via a new
+        `binaryOpSymbol(parser.OpCode) string` helper; recursion parenthesizes operands → byte-identical. SCOPE: confined to the
+        ISOLATED `formatExprForAttrdef` (pg_attrdef column-default path). Its twin `executor.defaultExprToSQL` is overloaded across
+        index predicates / expression-index cols / function-arg defaults / partition keys (each with own fixtures), so its identical
+        under-parenthesization is DEFERRED to slice 298 (deferral ledger 2026-06-20). Fixture: `public.defcol` gains
+        `calc integer DEFAULT (1 + 2) * 3`; asserts dump contains `calc integer DEFAULT ((1 + 2) * 3)` and that the corruption shape
+        `DEFAULT 1 + 2 * 3` is ABSENT. **Guards:** `TestFormatExprForAttrdefExpr` PASS (`(1 + 1)`, `('a' || 'b')`, `((1 + 2) * 3)`,
+        `ROW(1, ('a' || 'b'))`); full `./internal/catalog/` suite PASS; `TestPort_PgDumpConnectionSetup` PASS (4.59s vs real pg_dump
+        18.3); gofmt + `go vet` clean; pgbench pre-commit smoke on commit. Files: `internal/catalog/catalog.go` (binaryOpSymbol +
+        BinaryOp wrap), `internal/catalog/catalog_test.go` (3 expectations + nested case), `internal/testport/pgdump_connsetup_test.go`
+        (defcol calc column + assertion), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 297), `.ralph/deferral_ledger.md`.
+        **Next (slice 298+):** apply the same parenthesization to `executor.defaultExprToSQL` + update its 4 fixture families
+        (the deferred twin), OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

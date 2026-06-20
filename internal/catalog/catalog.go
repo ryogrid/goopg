@@ -7816,6 +7816,48 @@ func (c *InMemory) attrDefRowsLocked() []attrDefRow {
 	return rows
 }
 
+// binaryOpSymbol maps a parser.BinaryOp operator to the SQL operator text PG's
+// pg_get_expr emits between the operands. Returns "" for an operator the
+// renderer does not model (the caller then falls through). Shared by
+// formatExprForAttrdef's BinaryOp parenthesization (DU-002 slice 297).
+func binaryOpSymbol(op parser.OpCode) string {
+	switch op {
+	case parser.OpAdd:
+		return "+"
+	case parser.OpSub:
+		return "-"
+	case parser.OpMul:
+		return "*"
+	case parser.OpDiv:
+		return "/"
+	case parser.OpMod:
+		return "%"
+	case parser.OpConcat:
+		return "||"
+	case parser.OpEq:
+		return "="
+	case parser.OpLt:
+		return "<"
+	case parser.OpGt:
+		return ">"
+	case parser.OpLe:
+		return "<="
+	case parser.OpGe:
+		return ">="
+	case parser.OpNe:
+		return "<>"
+	case parser.OpAnd:
+		return "AND"
+	case parser.OpOr:
+		return "OR"
+	case parser.OpLike:
+		return "LIKE"
+	case parser.OpNotLike:
+		return "NOT LIKE"
+	}
+	return ""
+}
+
 // formatExprForAttrdef converts a parsed default expression to a display string
 // for pg_attrdef.adbin. Used by pg_get_expr to display column defaults in \d.
 func formatExprForAttrdef(e parser.Expr) string {
@@ -7884,42 +7926,25 @@ func formatExprForAttrdef(e parser.Expr) string {
 			return "NOT " + formatExprForAttrdef(v.Operand)
 		}
 	case *parser.BinaryOp:
-		// `DEFAULT 1 + 1`, `DEFAULT 'a' || 'b'`. Mirror the executor twin's operator set.
+		// `DEFAULT (1 + 2) * 3`, `DEFAULT 'a' || 'b'`. PG's pg_get_expr (with
+		// prettyFlags=0, the mode pg_dump uses for pg_attrdef.adbin) FULLY
+		// parenthesizes every binary OpExpr/BoolExpr node — `(1 + 2) * 3`
+		// deparses to `((1 + 2) * 3)`, NOT the precedence-minimized `(1 + 2) * 3`.
+		// Empirically verified vs real PG 18.3: a bare `1 + 1` dumps as `(1 + 1)`
+		// and a nested `(1 + 2) * 3` as `((1 + 2) * 3)`. Before this slice the
+		// renderer emitted the operator without parens, so a nested-arithmetic
+		// default round-tripped as `1 + 2 * 3` — a SILENT precedence change that
+		// evaluates to a different value on restore (DU-002 slice 297). Wrap each
+		// node `(left op right)`; the recursion naturally parenthesizes operands.
+		// Mirror the executor twin's operator set. NOTE: the executor twin
+		// (executor.defaultExprToSQL, reused for index predicates / expression-index
+		// columns / function-arg defaults / partition keys) is NOT yet wrapped — that
+		// is a separate blast radius deferred to a follow-up slice; this slice fixes
+		// only the isolated pg_attrdef column-default path.
 		left := formatExprForAttrdef(v.Left)
 		right := formatExprForAttrdef(v.Right)
-		switch v.Op {
-		case parser.OpAdd:
-			return left + " + " + right
-		case parser.OpSub:
-			return left + " - " + right
-		case parser.OpMul:
-			return left + " * " + right
-		case parser.OpDiv:
-			return left + " / " + right
-		case parser.OpMod:
-			return left + " % " + right
-		case parser.OpConcat:
-			return left + " || " + right
-		case parser.OpEq:
-			return left + " = " + right
-		case parser.OpLt:
-			return left + " < " + right
-		case parser.OpGt:
-			return left + " > " + right
-		case parser.OpLe:
-			return left + " <= " + right
-		case parser.OpGe:
-			return left + " >= " + right
-		case parser.OpNe:
-			return left + " <> " + right
-		case parser.OpAnd:
-			return left + " AND " + right
-		case parser.OpOr:
-			return left + " OR " + right
-		case parser.OpLike:
-			return left + " LIKE " + right
-		case parser.OpNotLike:
-			return left + " NOT LIKE " + right
+		if op := binaryOpSymbol(v.Op); op != "" {
+			return "(" + left + " " + op + " " + right + ")"
 		}
 	case *parser.TypedStringLit:
 		// e.g. `DEFAULT DATE '2020-01-01'`. Mirror the executor twin.

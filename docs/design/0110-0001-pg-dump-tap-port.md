@@ -8565,6 +8565,43 @@ Guards:
 > string-literal generation expression with an embedded backslash / E'' escape to exercise the literal re-quoting
 > against `standard_conforming_strings` edge cases.
 
+### Slice 297 — **PRODUCTION fix:** nested-arithmetic column DEFAULT full parenthesization `(1 + 2) * 3` → `((1 + 2) * 3)`
+
+A **correctness** fix, distinct from the generation-expression saga (281–296): generation expressions deparse
+token-by-token via `joinGeneratedExprTokens`, which preserves the user's literal parens; **column DEFAULTs** instead
+deparse from a parsed `Expr` AST via `catalog.formatExprForAttrdef` (the goopg-side `pg_get_expr` pass-through feeding
+`pg_attrdef.adbin`). That renderer emitted each `BinaryOp` **without parentheses** — `left op right`. For a nested
+expression like `DEFAULT (1 + 2) * 3` (AST `Mul(Add(1,2), 3)`) it produced `1 + 2 * 3`, which **re-parses** to
+`Mul(1, Mul(2,3))` and evaluates to **7, not 9** on restore: a silent precedence corruption of the dumped DDL.
+
+PG's `pg_get_expr` with `prettyFlags=0` (the mode `pg_dump` uses for `pg_attrdef.adbin`) **fully parenthesizes** every
+binary `OpExpr`/`BoolExpr` node — it does not minimize parens by precedence. Empirically verified vs real PG 18.3:
+a bare `1 + 1` default deparses to `(1 + 1)`, and `(1 + 2) * 3` to `((1 + 2) * 3)`. The fix wraps each `BinaryOp`
+`(left op right)`; the recursion naturally parenthesizes operands, yielding byte-identical output. A new helper
+`binaryOpSymbol(parser.OpCode) string` maps the operator to its SQL text so the wrap is uniform across all operators.
+
+**Scope / sibling-paths note.** The change is confined to `catalog.formatExprForAttrdef` — the **isolated**
+`pg_attrdef` column-default path. Its historical twin `executor.defaultExprToSQL` is overloaded for **index predicates**
+(`idx.PredicateString`), **expression-index columns**, **function-argument defaults**, and **partition keys**, each with
+its own round-trip fixtures (e.g. the slice-56 partial-index `WHERE qty > 0`). PG fully-parenthesizes those contexts too
+(`WHERE (qty > 0)`, `WHERE ((a + b) > 0)`), so the twin is *also* under-parenthesized — but wrapping it has a large blast
+radius and must update each affected fixture. That is deferred to a follow-up slice (see the deferral ledger); this slice
+deliberately fixes only the column-default path it has a fixture for.
+
+`public.defcol` gains a `calc integer DEFAULT (1 + 2) * 3` column. Dumping a **live goopg server**, real pg_dump
+transports goopg's `pg_get_expr` output, so the assertion pins goopg's own rendering `calc integer DEFAULT ((1 + 2) * 3)`
+and explicitly guards that the pre-fix corruption shape `DEFAULT 1 + 2 * 3` is **absent**. Verified vs PG 18.3.
+
+Guards:
+- `TestFormatExprForAttrdefExpr` (catalog unit): `binary add` → `(1 + 1)`, `binary concat` → `('a' || 'b')`,
+  `binary nested precedence` `Mul(Add(1,2),3)` → `((1 + 2) * 3)`, and the row-nested concat → `ROW(1, ('a' || 'b'))`.
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `defcol` block prints
+  `calc integer DEFAULT ((1 + 2) * 3)` and that `DEFAULT 1 + 2 * 3` does not appear).
+
+> **Next (slice 298+):** apply the same full-parenthesization to `executor.defaultExprToSQL` and update the
+> index-predicate / expression-index / function-arg-default / partition-key fixtures (the deferred twin), OR a
+> multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump
