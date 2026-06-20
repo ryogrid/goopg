@@ -1253,14 +1253,24 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 	// (40-byte long PHD at a segment boundary + 24-byte contrecord header).
 	_, paddedLen := predictXLogRecordLen(payload)
 	conservativeSize := paddedLen + 64
+	// Worst-case WAL-buffer footprint including a possible segment-boundary
+	// pad. A record whose stripe reservation straddles a segment boundary is
+	// re-landed at the boundary by reserveEmittedAndPublish, which first emits
+	// an XLOG_NOOP pad over the gap via emitSegmentPad → writeReserved; pad +
+	// record together occupy strictly less than 2*conservativeSize ring bytes
+	// (the gap is < the record's emitted size by the crossing predicate). The
+	// Path B buffered append below also goes through AppendXLogPayload, so it
+	// must keep that much headroom too — otherwise a crossing while the buffer
+	// is near-full returns errWALBufferReservedOutOfRange. See tryAppend.
+	reserveSize := 2 * conservativeSize
 
 	// Path A: walBuf disabled, record physically won't fit in ring, OR the
 	// buffer needs draining. The drain case falls here (rather than Path B)
 	// so that appendMu.Lock() is held across drain + write: concurrent
 	// tryAppend goroutines (RLock) are frozen and cannot consume the freed
 	// space between the drain and the write, avoiding errWALBufferReservedOutOfRange.
-	needsDrain := s.walBuf != nil && int64(conservativeSize) > s.walBuf.free()-s.walBuf.reservedBytes.Load()
-	if s.walBuf == nil || !s.walBuf.canHold(conservativeSize) || needsDrain {
+	needsDrain := s.walBuf != nil && int64(reserveSize) > s.walBuf.free()-s.walBuf.reservedBytes.Load()
+	if s.walBuf == nil || !s.walBuf.canHold(reserveSize) || needsDrain {
 		s.appendMu.Lock()
 		// Publish + drain any buffered bytes before the direct write.
 		if s.walBuf != nil && s.walBuf.resident() > 0 {
@@ -1326,8 +1336,10 @@ func (s *state) appendPGCompat(payload []byte) (uint64, uint64, error) {
 	// AppendXLogPayload acquires its own stripe lock internally (no outer lock).
 	// PublishUpTo is an atomic tail advance (no lock).
 
-	// Phase 1: drain if needed (lock-free).
-	need := int64(conservativeSize) - s.walBuf.free()
+	// Phase 1: drain if needed (lock-free). Drain to the worst-case footprint
+	// (reserveSize) so a segment-boundary crossing inside AppendXLogPayload has
+	// room for both the pad and the re-landed record.
+	need := int64(reserveSize) - s.walBuf.free()
 	if need > 0 {
 		// Publish pending bytes before draining so drain can read them.
 		curr, _ := s.core.Load()
@@ -1451,7 +1463,23 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		// stripe lock — avoids the lock round-trip when walBuf has no room.
 		_, paddedLen := predictXLogRecordLen(payload)
 		conservativeSize := paddedLen + 64 // max PHD + contrecord overhead
-		if s.walBuf == nil || !s.walBuf.canHold(conservativeSize) {
+		// Worst-case WAL-buffer footprint of this one append. When a
+		// reservation would straddle a segment boundary, reserveEmittedAndPublish
+		// re-lands the record at the boundary AFTER first emitting an XLOG_NOOP
+		// pad over the gap [curr, boundary) via emitSegmentPad → writeReserved.
+		// The pad and the re-landed record are TWO separate writeReserved calls
+		// into the ring, so the reservation must cover BOTH. The crossing
+		// predicate (curr+total > boundary) means the gap is strictly smaller
+		// than the record's emitted size, and the re-landed record's emitted
+		// size is ≤ conservativeSize, so pad+record together occupy strictly
+		// less than 2*conservativeSize ring bytes. Reserving that worst case
+		// unconditionally keeps writeReserved inside the ring window regardless
+		// of where the (concurrently-advancing) LSN cursor actually lands —
+		// without it, a crossing while the buffer is near-full returns
+		// errWALBufferReservedOutOfRange (M0118-0001: tripped ~50% of the
+		// multiple-row-versions 1,000,000-row bulk-insert setup).
+		reserveSize := 2 * conservativeSize
+		if s.walBuf == nil || !s.walBuf.canHold(reserveSize) {
 			return 0, 0, false, nil // Path A territory; let slow path handle I/O
 		}
 
@@ -1461,7 +1489,7 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		s.appendMu.RLock()
 		defer s.appendMu.RUnlock()
 
-		// Atomically claim conservativeSize bytes in the WAL buffer before
+		// Atomically claim reserveSize bytes in the WAL buffer before
 		// reserving LSN space. Multiple concurrent stripe writers under
 		// RLock could each see free() > 0 and all proceed to reserve LSN
 		// space, collectively overflowing the buffer and causing
@@ -1469,7 +1497,7 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		// tryReserve uses a CAS loop so that the check-and-claim is
 		// atomic: only writers whose combined reservations stay within cap
 		// proceed to AppendXLogPayload.
-		if rerr := s.walBuf.tryReserve(int64(conservativeSize)); rerr != nil {
+		if rerr := s.walBuf.tryReserve(int64(reserveSize)); rerr != nil {
 			return 0, 0, false, nil // overflow; slow path drains then appends
 		}
 
@@ -1480,7 +1508,7 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		if err != nil {
 			// LSN reservation failed or encoding error; release the buffer
 			// reservation so capacity is not permanently consumed.
-			s.walBuf.releaseReservation(int64(conservativeSize))
+			s.walBuf.releaseReservation(int64(reserveSize))
 			return 0, 0, false, err
 		}
 
@@ -1489,7 +1517,7 @@ func (s *state) tryAppend(payload []byte) (start, end uint64, ok bool, err error
 		s.core.PublishUpTo(int64(start0) + int64(total))
 		// Release the reservation now that tail has advanced: the bytes are
 		// now counted in resident() rather than reservedBytes.
-		s.walBuf.releaseReservation(int64(conservativeSize))
+		s.walBuf.releaseReservation(int64(reserveSize))
 
 		end = uint64(int64(start0) + int64(total))
 		// CAS-max: multiple concurrent RLock holders may call this
