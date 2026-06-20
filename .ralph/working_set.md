@@ -1,34 +1,27 @@
-Task: DU-002 slice 289 (loop #57) — COMPLETE, committing + pushing.
+Task: DU-002 slice 290 (loop #58) — COMPLETE, committing + pushing.
 
-Last landed: PRODUCTION fix — canonical `GeneratedExpr` deparse. The FIRST parenthesised
-generation expression (`(fa + fb) * 2`) inherited onto a partition leaf now round-trips vs
-real pg_dump 18.3. Defect: goopg captured the `GENERATED ALWAYS AS (...)` body as raw lexer
-tokens and joined with single spaces, so `(fa + fb) * 2` → `( fa + fb ) * 2` (and `upper(fn)`
-→ `upper ( fn )`); pg_dump wraps `(%s)` so goopg emitted `(( fa + fb ) * 2)` vs real
-pg_get_expr's tight `((fa + fb) * 2)`.
+Last landed: function-call generation expression `upper(fn)` round-trips end-to-end on the
+pg_dump oracle. The FIRST generation slice whose body is a function invocation (283–289 used
+`*`/`+`/`||` or parenthesised arithmetic). Slice 289 already landed the production deparse fix
+(`joinGeneratedExprTokens`, parser/ddl.go) and unit-tested its function-call branch; this slice
+exercises it END-TO-END vs real pg_dump 18.3. TEST-ONLY — no production change.
 
-Fix: new `joinGeneratedExprTokens` (parser/ddl.go, inserted before parseColumnDef at ~line
-2457) reconstructs pg_get_expr spacing from the captured `[]Token` stream — tight call parens
-(prev Kind is TokenIdent/TokenQuotedIdent or prev==`)`), spaced grouping parens, `, ` arg
-separators, tight `.` qualified names, spaced binary operators. BOTH capture sites now collect
-`[]Token` (was `[]string`) and route through the helper: the column-def path (~line 2576–2613)
-and the `PARTITION OF (... WITH OPTIONS GENERATED ALWAYS AS ...)` override path (~line 1566–1586).
-Re-parses to same node → evalGeneratedExpr unaffected; flat-chain slices 283–288 keep
-byte-identical stored source (verified).
+goopg stores the generation source via joinGeneratedExprTokens (call parens TIGHT: `upper(fn)`,
+not `upper ( fn )`); real pg_dump reads it back through pg_get_expr verbatim and emits inline
+`fu text GENERATED ALWAYS AS (upper(fn)) STORED`. No rows inserted → dump-time deparse path only
+(materialization of upper() not exercised). Render path identical to 283–289 (attgenerated 's' →
+attrdefs[].separate=false pg_dump.c:9507; ispartition → shouldPrintColumn every column).
 
 Files:
-- internal/parser/ddl.go — `joinGeneratedExprTokens` helper + both capture sites → []Token.
-- internal/parser/gen_override_test.go — `TestGeneratedColumnExprCanonicalSpacing` (no server).
-- internal/testport/pgdump_connsetup_test.go — pgpp fixture (after pgcc_1) + assertion (after
-  pgcc_1 ATTACH assertion).
-- docs/design/0110-0001-pg-dump-tap-port.md — Slice 289 section + Next (290) note.
-- .ralph/fix_plan.md — slice 289 progress (loop #57).
+- internal/testport/pgdump_connsetup_test.go — pgfx fixture (CREATE TABLE pgfx +
+  pgfx_1 PARTITION OF, after pgpp_1 fixture ~line 1632) + assertion (pgfx_1 block, after
+  pgpp_1 assertion ~line 4684). TEST-ONLY.
+- docs/design/0110-0001-pg-dump-tap-port.md — Slice 290 section + Next (291) note.
+- .ralph/fix_plan.md — slice 290 progress (loop #58).
 
-Gates: gofmt clean; go vet clean; go test ./internal/{parser,executor,catalog}/ PASS;
-TestPort_PgDumpConnectionSetup PASS (4.07s vs real pg_dump 18.3); pgbench pre-commit smoke
-(enforced by .githooks/pre-commit on commit).
+Gates: gofmt clean; go vet clean; TestPort_PgDumpConnectionSetup PASS (3.96s vs real pg_dump
+18.3); pgbench pre-commit smoke (enforced by .githooks/pre-commit on commit).
 
-Next (slice 290+): function-call generation deparse END-TO-END (`upper(fn)`) — parser
-canonicalization is done + unit-tested; remaining is confirming CREATE-TABLE + materialization
-accept a function-call generation expr so it can ride the pg_dump oracle. OR a multi-column /
-NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+Next (slice 291+): a two-argument function-call generation expr (`coalesce(a, b)` / `concat(a, b)`)
+to pin the `, `-separated argument-list branch of joinGeneratedExprTokens end-to-end on the oracle.
+OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.

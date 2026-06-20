@@ -6197,6 +6197,25 @@ object support.
         place + unit-tested; remaining work is confirming CREATE-TABLE + materialization accepts a function-call generation
         expr so it can ride the pg_dump oracle. OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
+      - **PROGRESS 2026-06-20 (loop #58):** **DU-002 slice 290 LANDED — function-call generation expression `upper(fn)`
+        end-to-end on the pg_dump oracle.** Slice 289 landed the production `joinGeneratedExprTokens` deparse fix and
+        unit-tested its function-call branch; this slice exercises that branch END-TO-END against real pg_dump 18.3 — the
+        FIRST generation slice whose body is a function invocation rather than pure operators (283–289 used `*`/`+`/`||` or
+        parenthesised arithmetic). goopg stores the source via `joinGeneratedExprTokens` (call parens TIGHT: `upper(fn)`,
+        not `upper ( fn )`); real pg_dump reads it back through `pg_get_expr` verbatim and emits the inline
+        `fu text GENERATED ALWAYS AS (upper(fn)) STORED`. Render path identical to 283–289 (attgenerated 's' →
+        `attrdefs[].separate=false` pg_dump.c:9507; ispartition → shouldPrintColumn every column). No rows inserted, so it
+        rides the dump-time deparse path only (materialization of `upper()` not exercised). Fixture:
+        `CREATE TABLE public.pgfx (fn text, fu text GENERATED ALWAYS AS (upper(fn)) STORED) PARTITION BY LIST (fn)` +
+        `CREATE TABLE public.pgfx_1 PARTITION OF public.pgfx FOR VALUES IN ('a')`. **Guards:** `TestPort_PgDumpConnectionSetup`
+        PASS (3.96s; vs real pg_dump 18.3 — asserts the `pgfx_1` block prints `fn text` then inline
+        `fu text GENERATED ALWAYS AS (upper(fn)) STORED` with the call parens TIGHT, attnum order, ATTACH survives); gofmt +
+        `go vet` clean; pgbench pre-commit smoke on commit. Files: `internal/testport/pgdump_connsetup_test.go` (pgfx fixture
+        + assertion — TEST-ONLY, no production change), `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 290).
+        **Next (slice 291+):** a two-argument function-call generation expression (`coalesce(a, b)` / `concat(a, b)`) to pin
+        the `, `-separated argument-list branch end-to-end on the oracle, OR a multi-column / NULL-typed DEFAULT variant on
+        the partition-leaf ALTER path.
+
 ### pg_waldump (2 tests — excluded → candidate)
 
 pg_waldump reads WAL segment files directly (no server connection).

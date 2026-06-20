@@ -1630,6 +1630,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pgpp_1: %v", err)
 	}
 
+	// Slice 290: a generation expression that is a FUNCTION CALL (`upper(fn)`)
+	// inherited onto a partition leaf. Every prior generation slice (283–289) used
+	// only operators — flat arithmetic (`ga * 2`, `ga + gc`), string concat
+	// (`ca || cb`), or precedence-grouped arithmetic (`(fa + fb) * 2`). This is the
+	// FIRST slice whose generation body is a function invocation, exercising the
+	// joinGeneratedExprTokens call-paren branch end-to-end: the helper renders the
+	// call parens TIGHT (`upper(fn)`, not `upper ( fn )`) so the stored source
+	// matches pg_get_expr. The render path is otherwise identical to slices 283–289
+	// — attgenerated ('s') forces attrdefs[].separate=false (pg_dump.c:9507) and
+	// ispartition forces shouldPrintColumn for every column (slices 281/282), so the
+	// leaf pgfx_1 inherits both columns and prints `fn text`, then the inline
+	// generated `fu text GENERATED ALWAYS AS (upper(fn)) STORED`. No rows are
+	// inserted, so this rides the dump-time deparse path only (materialization of
+	// upper() is not exercised here).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgfx (fn text, fu text GENERATED ALWAYS AS (upper(fn)) STORED) PARTITION BY LIST (fn)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgfx with function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgfx_1 PARTITION OF public.pgfx FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pgfx_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4680,6 +4701,38 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgpp_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgpp_1 FOR VALUES IN (1)", res.Stdout)
+		}
+
+		// **Slice 290 (asserted):** function-call generation expression on a
+		// partition leaf. The leaf pgfx_1 must print `fn text`, then the inline
+		// generated `fu text GENERATED ALWAYS AS (upper(fn)) STORED` — with the call
+		// parens rendered TIGHT (`upper(fn)`, not `upper ( fn )`), matching real
+		// pg_dump's pg_get_expr. A regression to the naive space-join would emit the
+		// spurious inner spaces and fail the exact-substring check below.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgfx_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			fnIdx := strings.Index(block, "fn text")
+			if fnIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgfx_1 block\n  block=%q", "fn text", block)
+			}
+			fuIdx := strings.Index(block, "fu text GENERATED ALWAYS AS (upper(fn)) STORED")
+			if fuIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the function-call generated column on a partition leaf; want %q in pgfx_1 block\n  block=%q", "fu text GENERATED ALWAYS AS (upper(fn)) STORED", block)
+			}
+			// Attnum order: fn (1) before fu (2).
+			if fnIdx >= 0 && fuIdx >= 0 && fnIdx > fuIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgfx_1 block\n  block=%q", "fn", "fu", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgfx_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgfx_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgfx_1 FOR VALUES IN ('a')", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every

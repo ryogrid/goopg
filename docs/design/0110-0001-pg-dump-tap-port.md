@@ -8386,9 +8386,28 @@ Guards:
 - `TestGeneratedColumnExprCanonicalSpacing` (parser, no server — pins the canonical spacing for function calls, two-arg
   calls, grouping parens, a nested call inside arithmetic, plain operator chains, and `||`).
 
-> **Next (slice 290+):** the function-call generation deparse end-to-end (`upper(fn)`) — the parser-level canonicalization
-> is now in place and unit-tested; the remaining work is confirming goopg's CREATE-TABLE + materialization path accepts a
-> function-call generation expression so it can also ride the pg_dump oracle. Alternatively, a multi-column / NULL-typed
+### Slice 290 — function-call generation expression `upper(fn)` (end-to-end on the pg_dump oracle)
+
+Slice 289 landed the production deparse fix (`joinGeneratedExprTokens`) and unit-tested its function-call branch. This
+slice exercises that branch **end-to-end** against the real pg_dump 18.3 oracle: the **first** generation slice whose body
+is a function invocation rather than pure operators. Every prior generation slice (283–289) used arithmetic (`ga * 2`,
+`ga + gc`, `(fa + fb) * 2`) or string concat (`ca || cb`); this one uses `upper(fn)`, a built-in `pg_catalog` function.
+
+`CREATE TABLE pgfx (fn text, fu text GENERATED ALWAYS AS (upper(fn)) STORED) PARTITION BY LIST (fn)` with leaf
+`pgfx_1 PARTITION OF pgfx FOR VALUES IN ('a')`. goopg stores the generation source via `joinGeneratedExprTokens`, which
+renders the call parens **tight** (`upper(fn)`, not `upper ( fn )`); real pg_dump reads that back through `pg_get_expr`
+verbatim and emits the inline `fu text GENERATED ALWAYS AS (upper(fn)) STORED`. The render path is otherwise identical to
+slices 283–289: `attgenerated` ('s') forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces
+`shouldPrintColumn` for every column, so the leaf inherits both columns in attnum order. No rows are inserted, so this
+rides the dump-time deparse path only (materialization of `upper()` is not exercised). Verified vs PG 18.3.
+
+Guards:
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgfx_1` block prints `fn text` then the inline
+  `fu text GENERATED ALWAYS AS (upper(fn)) STORED` with the call parens **tight**, in attnum order, and that
+  `ATTACH PARTITION public.pgfx_1 FOR VALUES IN ('a')` survives).
+
+> **Next (slice 291+):** a two-argument function-call generation expression (`coalesce(a, b)` or `concat(a, b)`) to pin the
+> `, `-separated argument-list branch of `joinGeneratedExprTokens` end-to-end on the oracle, OR a multi-column / NULL-typed
 > DEFAULT variant on the partition-leaf ALTER path.
 
 ## Deferred (002–010) — catalog surface estimate
