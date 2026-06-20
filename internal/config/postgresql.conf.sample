@@ -296,6 +296,10 @@
                                         # CREATE TABLESPACE ... LOCATION ''
                                         # to create a tablespace directly
                                         # inside pg_tblspc (for testing)
+#debug_parallel_query = off             # off, on, regress; no-op in goopg
+                                        # (no parallel executor) — accepted so
+                                        # test scripts that force parallel
+                                        # plans don't fail on SET
 
 
 #------------------------------------------------------------------------------

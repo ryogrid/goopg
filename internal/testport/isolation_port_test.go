@@ -464,6 +464,21 @@ func TestPort_IsolationReadOnlyAnomaly2(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-2.spec")
 }
 
+// TestPort_IsolationSerializableParallel exercises serializable-parallel: the
+// same O'Neil read-only anomaly under SERIALIZABLE as read-only-anomaly-2, but
+// the read-only s3 declares "SET debug_parallel_query = on" so upstream runs it
+// in a parallel worker. goopg has no parallel executor, so the GUC is a no-op
+// and the SSI outcome is identical: once s3 observes s1's committed write, the
+// cycle dooms s2wx with 40001. Requires only that the developer GUC be
+// accepted during session setup.
+func TestPort_IsolationSerializableParallel(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_serializable_parallel")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel.spec")
+}
+
 // TestPort_IsolationUpdateConflictOut exercises update-conflict-out: SSI
 // "conflict out" handling for heapam interacting with a concurrently updated
 // (then aborted) tuple. "bar" must fail with 40001 at bar_commit at the latest.

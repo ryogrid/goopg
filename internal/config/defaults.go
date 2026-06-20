@@ -536,6 +536,18 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// debug_parallel_query (renamed from force_parallel_mode) — a developer
+	// GUC that forces a parallel plan for testing. goopg has no parallel
+	// executor so it is a no-op, but SET must succeed so upstream isolation
+	// specs (serializable-parallel*) that flip it during session setup don't
+	// fail with "unrecognized configuration parameter". Enum off/on/regress
+	// mirrors postgres/src/backend/utils/misc/guc_tables.c.
+	r.MustRegister(NewVariable(Variable{
+		Name: "debug_parallel_query", Type: TypeEnum, BootVal: "off",
+		EnumOptions: []string{"off", "on", "regress"},
+		Context:     ContextUserset,
+		Scope:       ScopeSession | ScopeTransaction,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "search_path", Type: TypeString, BootVal: `"$user", public`,
 		Context: ContextUserset,

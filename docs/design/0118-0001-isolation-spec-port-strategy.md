@@ -626,6 +626,38 @@ seconds, fractional, date-only, and offset forms for both `timestamp` and
 `TestPort_IsolationClassroomScheduling` now passes 5/5 (was 0/8 SKIP), and all 16
 SSI / timestamp specs re-verified green.
 
+### 15. `debug_parallel_query` no-op GUC (lands `serializable-parallel`)
+
+`serializable-parallel` is the O'Neil read-only anomaly of `read-only-anomaly-2`
+verbatim — same `bank_account(X,Y)` table, same `s1ry s1wy / s2rx s2ry s2wx`
+write-skew core, same read-only `s3` whose `SELECT … WHERE id IN ('X','Y')`
+observation of `s1`'s committed write closes the dangerous cycle that dooms
+`s2wx` with `40001`. The only difference is that `s3`'s session setup runs
+`SET debug_parallel_query = on` so upstream executes `s3r` in a parallel worker.
+
+goopg has no parallel executor, so the GUC has no semantic effect; serial and
+parallel SSI outcomes are identical. The lone blocker was registration: section-9
+per-tuple SIREAD locks on a single-column full-key index already produce the
+correct conflict graph for `s3`'s two PK point reads (the same machinery that
+lands `predicate-lock-hot-tuple`'s `IN`-list reads), but `debug_parallel_query`
+(renamed from `force_parallel_mode`) was absent from the GUC registry, so the
+session-setup `SET` failed with `unrecognized configuration parameter` before any
+step ran. This corrects section 8's pessimistic claim that the whole
+`serializable-parallel` family needed finer per-access-method locking — the
+**base** member needed only the GUC.
+
+Fix (config-only, additive): `debug_parallel_query` is now registered in
+`internal/config/defaults.go` as a no-op developer enum (`off`/`on`/`regress`,
+boot `off`, `PGC_USERSET`) mirroring `postgres/src/backend/utils/misc/guc_tables.c`.
+`SET` succeeds and stores the value; nothing in the planner consults it.
+Regression: `TestDebugParallelQueryGUC` (`internal/config/debug_parallel_query_test.go`)
+pins the registration, enum membership, case-insensitivity, and rejection of an
+out-of-enum value; `TestPort_IsolationSerializableParallel` passes both
+permutations byte-for-byte vs PG 18.3. The `-2`/`-3` members remain deferred:
+they additionally exercise the `RO_SAFE` read-only-safe-snapshot optimisation and
+several parallel-cost GUCs (`min_parallel_index_scan_size`, `enable_seqscan`,
+`parallel_leader_participation`) plus `ALTER TABLE … SET (parallel_workers=…)`.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
@@ -646,7 +678,9 @@ SSI / timestamp specs re-verified green.
   source of section 10), `temporal-range-integrity` (cross-table temporal
   write skew; zero SSI change — only the `date` B-tree key type of section 11),
   and `classroom-scheduling` (double-booking write skew; zero SSI change — only
-  the `timestamptz` B-tree key type of section 12).
+  the `timestamptz` B-tree key type of section 12), and `serializable-parallel`
+  (the `read-only-anomaly-2` cycle with a parallel-worker read-only `s3`; zero SSI
+  change — only the `debug_parallel_query` no-op GUC of section 15).
 - **Still deferred (same slice family):**
   - `receipt-report` — the `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` parser
     gap is now **fixed** (section 6), so the spec runs end-to-end. Two issues
@@ -664,13 +698,12 @@ SSI / timestamp specs re-verified green.
     `errWALBufferReservedOutOfRange` (`internal/wal/wal_buffer.go`), ~50% of runs.
     Blocked on that WAL race (a different subsystem), NOT on SSI.
     `TestPort_IsolationMultipleRowVersions` is a skip-on-defer anchor.
-  - `read-only-anomaly-3` / the `serializable-parallel` family — still blocked on
-    **predicate-lock granularity** beyond the section-9 slice plus their own extra
-    blockers. The section-9 single-column full-key narrowing fixed
-    `read-only-anomaly-2`; the remaining members need finer per-access-method
-    locking (M0118-0002 proper) for their range/aggregate reads. `-3` additionally
-    needs the `DEFERRABLE` safe-snapshot deferral and the reserved-keyword parser
-    fix (section 6); the `serializable-parallel-2/-3` pair additionally needs the
-    `RO_SAFE` read-only-safe-snapshot optimisation.
+  - `read-only-anomaly-3` / the `serializable-parallel-2` / `-3` members — the
+    base `serializable-parallel` now **passes** (section 15: it reuses the
+    section-9 per-tuple SIREAD locks and needed only the `debug_parallel_query`
+    no-op GUC). `read-only-anomaly-3` still needs the `DEFERRABLE` safe-snapshot
+    deferral and the reserved-keyword parser fix (section 6); the
+    `serializable-parallel-2`/`-3` pair additionally needs the `RO_SAFE`
+    read-only-safe-snapshot optimisation and the remaining parallel-cost GUCs.
   Their dedicated `TestPort_Isolation*` functions auto-promote (run, then
   `t.Skip` only on `defer`), so the next slice sees green→pass instantly.
