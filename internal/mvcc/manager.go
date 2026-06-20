@@ -369,6 +369,11 @@ func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 			snap := m.captureSnapshot()
 			s.firstSnap = &snap
 			s.xmin.Store(uint64(snap.Xmin))
+			if tx.Isolation == IsolationSerializable {
+				// Capture lastCommitBeforeSnapshot for the de-facto READ ONLY
+				// SSI optimisation (predicate.c). M0118-0001 (receipt-report).
+				m.stampSerializableSnapshotSeqNo(tx.Handle)
+			}
 		}
 		return s.firstSnap.Clone(), nil
 

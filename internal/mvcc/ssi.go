@@ -72,6 +72,19 @@ type SerializableXact struct {
 	// comparable for the overlap test in purgeFinishedSerializableLocked.
 	BeginAt CommitSeqNo
 
+	// SnapshotSeqNo is the dense counter watermark captured when this
+	// SERIALIZABLE xact takes its FIRST statement snapshot (deferred to the
+	// first non-BEGIN statement, NOT at Begin — see manager.SnapshotFor). It
+	// mirrors PostgreSQL's SERIALIZABLEXACT.SeqNo.lastCommitBeforeSnapshot
+	// (predicate.c): a peer P committed strictly before this xact's snapshot
+	// iff P.FinishedAt < SnapshotSeqNo, because FinishedAt and SnapshotSeqNo
+	// draw from the same monotonic nextCommitSeqNo (see committedBeforeSnapshot).
+	// Used ONLY by the READ ONLY de-facto optimisation in onConflictCheckLocked
+	// (a declared READ ONLY reader cannot close a dangerous structure to a T2
+	// that committed after its snapshot). InvalidCommitSeqNo until the snapshot
+	// is taken. M0118-0001 (receipt-report).
+	SnapshotSeqNo CommitSeqNo
+
 	// ConflictOut mirrors PostgreSQL's SXACT_FLAG_CONFLICT_OUT
 	// (predicate.c). It is set at commit when this (now committed) xact
 	// holds an rw-conflict OUT to an already-committed peer — i.e. it is
@@ -372,6 +385,26 @@ func (m *Manager) MarkSerializableModes(handle TxnHandle, readOnly, deferrable b
 	if sx, ok := m.ssiState.xacts[handle]; ok {
 		sx.ReadOnly = readOnly
 		sx.Deferrable = deferrable
+	}
+}
+
+// stampSerializableSnapshotSeqNo records the current nextCommitSeqNo watermark
+// as the xact's SnapshotSeqNo the first time it takes a statement snapshot,
+// mirroring PostgreSQL capturing SeqNo.lastCommitBeforeSnapshot at snapshot
+// acquisition (predicate.c GetSerializableTransactionSnapshotInt). It does NOT
+// consume a counter value — the watermark is only a read so that a peer P that
+// committed before this snapshot satisfies P.FinishedAt < SnapshotSeqNo. Called
+// from SnapshotFor right after the first SERIALIZABLE snapshot is captured. A
+// no-op for unregistered handles and once already stamped (the snapshot is
+// pinned for the whole transaction). M0118-0001 (receipt-report).
+func (m *Manager) stampSerializableSnapshotSeqNo(handle TxnHandle) {
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
+	if m.ssiState.xacts == nil {
+		return
+	}
+	if sx, ok := m.ssiState.xacts[handle]; ok && sx.SnapshotSeqNo == InvalidCommitSeqNo {
+		sx.SnapshotSeqNo = m.ssiState.nextCommitSeqNo
 	}
 }
 

@@ -141,6 +141,32 @@ func (m *Manager) checkForSerializableConflictOutLocked(readerHandle TxnHandle, 
 		// changes.
 		return false
 	}
+	if reader.ReadOnly && writer.FinishedAt != InvalidCommitSeqNo {
+		// De-facto READ ONLY conflict-out skip (predicate.c
+		// CheckForSerializableConflictOut, lines 4123-4137): a declared READ
+		// ONLY reader that reads data written by an already-committed writer
+		// forms NO rw-conflict — it simply "appears to run first" — UNLESS the
+		// writer itself has an rw-conflict OUT to a transaction that committed
+		// before this reader's snapshot. Only then can the read-only reader
+		// close a dangerous structure (R -> W -> T2 with T2 committed first and
+		// in the reader's past). This is what reduces receipt-report from 48
+		// aborts to the 6 genuine ones, and it MUST run before the edge is
+		// recorded because Case 1 of onConflictCheckLocked would otherwise fire
+		// the moment a READ ONLY reader touches any committed writer that holds
+		// an out-conflict, regardless of snapshot ordering. The scan over live
+		// outConflicts is goopg's analogue of upstream's
+		// SXACT_FLAG_CONFLICT_OUT + earliestOutConflictCommit pair. M0118-0001.
+		sustains := false
+		for _, t2 := range writer.outConflicts {
+			if committedBeforeSnapshot(t2, reader) {
+				sustains = true
+				break
+			}
+		}
+		if !sustains {
+			return false
+		}
+	}
 	if !m.readerSnapshotSeesWriterAsConcurrentLocked(readerHandle, writerXID) {
 		// M0118-0001: the writer committed before the reader's snapshot, so
 		// the reader already sees its effects — this is an ordinary read
@@ -249,11 +275,13 @@ func registerRWConflictLocked(from, to *SerializableXact) bool {
 //	        that committed first.
 //	Case 3  T0 -> R -> W    R is the pivot and the writer W has committed.
 //
-// Simplifications vs upstream (documented, conservative — never a false
-// negative for the modeled cases): goopg does not yet model READ ONLY
-// transactions or two-phase PREPARE, so every xact is treated READ WRITE and a
-// finished (FinishedAt != Invalid) xact is treated as both prepared and
-// committed, with FinishedAt serving as both prepareSeqNo and commitSeqNo.
+// Declared READ ONLY transactions ARE modeled (M0118-0001, receipt-report):
+// Cases 2 and 3 apply upstream's de-facto READ ONLY refinement via
+// committedBeforeSnapshot so a READ ONLY participant only sustains a dangerous
+// structure when the relevant peer committed before its snapshot. Two-phase
+// PREPARE is still not modeled, so a finished (FinishedAt != Invalid) xact is
+// treated as both prepared and committed, with FinishedAt serving as both
+// prepareSeqNo and commitSeqNo.
 //
 // goopg DEFERS the upstream mid-statement ereport: rather than aborting the
 // current read/write in place, it sets the SXACT_FLAG_DOOMED equivalent
@@ -280,14 +308,19 @@ func (m *Manager) onConflictCheckLocked(reader, writer, current *SerializableXac
 
 	// Case 2: the writer has become a pivot with an out-conflict to a committed
 	// transaction T2 that committed first (no anomaly if the reader or writer
-	// committed before T2).
+	// committed before T2). The de-facto READ ONLY refinement (predicate.c):
+	// when the reader R is declared READ ONLY, R can only close a dangerous
+	// structure if T2 committed before R's snapshot — otherwise R's snapshot
+	// already excludes T2's effects and no anomaly is possible. This is the sole
+	// reason receipt-report has 6 true failures rather than 48.
 	if !failure {
 		for _, t2 := range writer.outConflicts {
 			if t2 == nil || t2.FinishedAt == InvalidCommitSeqNo {
 				continue
 			}
 			if (reader.FinishedAt == InvalidCommitSeqNo || t2.FinishedAt <= reader.FinishedAt) &&
-				(writer.FinishedAt == InvalidCommitSeqNo || t2.FinishedAt <= writer.FinishedAt) {
+				(writer.FinishedAt == InvalidCommitSeqNo || t2.FinishedAt <= writer.FinishedAt) &&
+				(!reader.ReadOnly || committedBeforeSnapshot(t2, reader)) {
 				failure = true
 				break
 			}
@@ -295,13 +328,19 @@ func (m *Manager) onConflictCheckLocked(reader, writer, current *SerializableXac
 	}
 
 	// Case 3: the reader has become a pivot with a committed writer (no anomaly
-	// if every in-conflict partner T0 committed before the writer).
-	if !failure && writerCommitted {
+	// if every in-conflict partner T0 committed before the writer). A declared
+	// READ ONLY reader can never be the pivot — it writes nothing, so no peer can
+	// rw-conflict INTO it — and upstream gates the whole block on
+	// !SxactIsReadOnly(reader). The READ ONLY refinement on T0 (predicate.c):
+	// a READ ONLY T0 only sustains the structure if the writer committed before
+	// T0's snapshot.
+	if !failure && writerCommitted && !reader.ReadOnly {
 		for _, t0 := range reader.inConflicts {
 			if t0 == nil || t0.Doomed {
 				continue
 			}
-			if t0.FinishedAt == InvalidCommitSeqNo || t0.FinishedAt >= writer.FinishedAt {
+			if (t0.FinishedAt == InvalidCommitSeqNo || t0.FinishedAt >= writer.FinishedAt) &&
+				(!t0.ReadOnly || committedBeforeSnapshot(writer, t0)) {
 				failure = true
 				break
 			}
@@ -328,6 +367,24 @@ func (m *Manager) onConflictCheckLocked(reader, writer, current *SerializableXac
 		// failing xact can make progress.
 		writer.Doomed = true
 	}
+}
+
+// committedBeforeSnapshot reports whether peer committed strictly before
+// observer took its first statement snapshot. It is goopg's analogue of the
+// upstream test `peer.commitSeqNo <= observer.SeqNo.lastCommitBeforeSnapshot`
+// (predicate.c): FinishedAt (the commit stamp) and SnapshotSeqNo (the snapshot
+// watermark) both draw from the single nextCommitSeqNo counter, so a commit
+// that happened before the snapshot was taken necessarily got a strictly
+// smaller stamp. Returns false if peer never committed or observer never took a
+// snapshot (InvalidCommitSeqNo), which is the conservative READ ONLY answer —
+// "the peer's effects are not in my snapshot". M0118-0001 (receipt-report).
+func committedBeforeSnapshot(peer, observer *SerializableXact) bool {
+	if peer == nil || observer == nil {
+		return false
+	}
+	return peer.FinishedAt != InvalidCommitSeqNo &&
+		observer.SnapshotSeqNo != InvalidCommitSeqNo &&
+		peer.FinishedAt < observer.SnapshotSeqNo
 }
 
 // removeSerializableXactFromPeersLocked scrubs every reference to

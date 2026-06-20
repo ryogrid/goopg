@@ -821,6 +821,59 @@ mvcc unit suite (tuple/page/relation holders, different-relation and self no-ops
 multi-reader fan-out, deferred-pivot-returns-nil, retained committed reader).
 Isolation pass count 30 → 31.
 
+### 19. De-facto `READ ONLY` SSI modeling (lands `receipt-report`)
+
+`receipt-report` is the daily-receipts read-only anomaly: `s1` (`rxwy1`) reads the
+control row's deposit date and `INSERT`s a receipt stamped with it, `s2` (`wx2`)
+advances the control date, and `s3` (`rx3`/`ry3`) — declared
+`SERIALIZABLE READ ONLY` — reads the control row then the day's receipts. Of the
+**210** generated permutations only **6** are genuine serialization failures: the
+ones where `s1` overlaps both `s2` and `s3` *and* `s2` commits before `s3`'s first
+`SELECT`. The spec's own header notes that as long as `s3` is `READ ONLY` there
+must be **no** false positives.
+
+goopg over-aborted **48 vs 6** because — as documented since section 8 — it modeled
+every SERIALIZABLE xact as read-write and so let the read-only `s3` close
+dangerous structures it can only *appear* to precede. The fix ports upstream's
+de-facto `READ ONLY` machinery (`predicate.c`):
+
+- **Snapshot watermark.** `SerializableXact.SnapshotSeqNo` is captured the first
+  time the xact takes a statement snapshot (deferred to the first non-`BEGIN`
+  statement in `Manager.SnapshotFor` — *not* at `Begin`, where `BeginAt` is
+  stamped). It is the analogue of `SeqNo.lastCommitBeforeSnapshot`: because
+  `FinishedAt` and `SnapshotSeqNo` draw from the one `nextCommitSeqNo` counter, a
+  peer committed strictly before this xact's snapshot iff
+  `peer.FinishedAt < SnapshotSeqNo` — the new `committedBeforeSnapshot` predicate.
+  `BeginAt` cannot be reused here: all three sessions `BEGIN` at permutation start,
+  but `s3`'s anomaly hinges on whether `s2` committed before `s3`'s *first SELECT*.
+- **Conflict-out skip (the load-bearing change).** In
+  `checkForSerializableConflictOutLocked`, a `READ ONLY` reader that reads an
+  already-committed writer records **no** rw-conflict unless the writer holds an
+  out-conflict to a transaction that committed before the reader's snapshot
+  (`∃ t2 ∈ writer.outConflicts: committedBeforeSnapshot(t2, reader)`). This mirrors
+  `CheckForSerializableConflictOut` lines 4123-4137 and must run *before* the edge
+  is recorded, because `Case 1` of `onConflictCheckLocked` (committed writer with
+  `ConflictOut`) would otherwise fire the instant a `READ ONLY` reader touched any
+  committed writer holding an out-conflict — regardless of snapshot order. The
+  live-`outConflicts` scan stands in for upstream's
+  `SXACT_FLAG_CONFLICT_OUT` + `earliestOutConflictCommit` pair.
+- **`OnConflict` / `PreCommit` refinements.** `onConflictCheckLocked` Case 2 now
+  carries the `(!reader.ReadOnly || committedBeforeSnapshot(t2, reader))` clause,
+  Case 3 is gated on `!reader.ReadOnly` (a read-only xact writes nothing so can
+  never be a pivot) with the symmetric `t0` clause, and the `PreCommit`
+  far-conflict scan skips a `READ ONLY` in-flight `Tin` — exactly upstream's
+  `!SxactIsReadOnly(...)` guards.
+
+The skip can only ever *suppress* an edge, never add one, so it can fix false
+positives without risking a false negative for the read-write specs; the changes
+are all gated on the declared `ReadOnly` flag, so only `serializable-parallel-2`/`-3`
+and `read-only-anomaly-3` (the other declared-`READ ONLY` specs) share the paths,
+and all three were re-verified byte-for-byte. Verified by
+`TestPort_IsolationReceiptReport` (all 210 permutations vs PG 18.3) plus the new
+`TestCommittedBeforeSnapshot` and `TestCheckForSerializableConflictOut_ReadOnly*`
+mvcc unit tests. The runner date-render / `PQprint` alignment pieces this spec
+also needs landed earlier in section 18. Isolation pass count 31 → 32.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
@@ -852,19 +905,12 @@ Isolation pass count 30 → 31.
   with no abort), and `matview-write-skew` (write skew between a
   `REFRESH MATERIALIZED VIEW CONCURRENTLY` and a reader/writer of the matview's
   parent — the relation-wide `CheckTableForSerializableConflictIn` refresh hook of
-  section 18; all eight permutations abort the second committer with `40001`).
+  section 18; all eight permutations abort the second committer with `40001`), and
+  `receipt-report` (the daily-receipts read-only anomaly with a declared
+  `SERIALIZABLE READ ONLY` `s3` — the de-facto `READ ONLY` SSI modeling of
+  section 19; all 210 permutations match PG with exactly 6 genuine serialization
+  failures, down from goopg's previous 48).
 - **Still deferred (same slice family):**
-  - `receipt-report` — the `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` parser
-    gap is now **fixed** (section 6), so the spec runs end-to-end. Two issues
-    remain: (a) the spec's `date` columns — the runner's `MM-DD-YYYY` render
-    landed with section 18 (`sql.NullTime` scan + `DateStyle='Postgres, MDY'`
-    semantics), so the `12-22-2008` rendering is now **fixed**; what is still
-    open is (b) de-facto READ ONLY SSI modeling, without which goopg produces 48
-    serialization failures where PG produces 6 (the 42 false positives upstream
-    notes for a READ WRITE `s3`, because goopg does not yet treat a never-writing
-    `s3` as read-only in SSI — the `SerializableXact.ReadOnly` flag from section
-    17 is the hook this needs: a declared/de-facto READ ONLY xact must be skipped
-    as a dangerous-structure pivot).
   - `multiple-row-versions` — **SSI-correct as of section 9** (output matches PG
     byte-for-byte) but not `pass_required`: its 1,000,000-row single-transaction
     setup INSERT intermittently trips the orthogonal WAL-buffer ring race

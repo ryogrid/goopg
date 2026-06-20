@@ -157,14 +157,15 @@ func (m *Manager) preCommitCheckForSerializationFailureLocked(handle TxnHandle) 
 				pivot.Doomed = true
 				break
 			}
-			if tin.FinishedAt == InvalidCommitSeqNo && !tin.Doomed {
-				// The 3-cycle case: Tin is still in-flight, not doomed.
-				// `!SxactIsCommitted(t0) && !SxactIsDoomed(t0)` upstream.
-				// goopg does not yet model READ ONLY transactions
-				// distinctly, so the upstream READ ONLY optimisation
-				// (skip Tin if read-only and overlaps writer) is
-				// conservatively absent — false positives, never
-				// false negatives.
+			if tin.FinishedAt == InvalidCommitSeqNo && !tin.Doomed && !tin.ReadOnly {
+				// The 3-cycle case: Tin is still in-flight, not doomed,
+				// and not declared READ ONLY.
+				// `!SxactIsCommitted(t0) && !SxactIsReadOnly(t0) &&
+				// !SxactIsDoomed(t0)` upstream (predicate.c). A declared
+				// READ ONLY Tin in-flight cannot complete the dangerous
+				// structure here — it writes nothing, so it can still
+				// resolve RO-safe — which is exactly the receipt-report
+				// de-facto READ ONLY false-positive avoidance. M0118-0001.
 				pivot.Doomed = true
 				break
 			}
