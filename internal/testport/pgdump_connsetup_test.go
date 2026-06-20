@@ -1482,6 +1482,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pgna_1: %v", err)
 	}
 
+	// Slice 284: the VIRTUAL counterpart of slice 283. The parent pvna declares
+	// `vb` as `GENERATED ALWAYS AS (va * 2) VIRTUAL` (attgenerated='v', slice 194);
+	// the partition leaf pvna_1 INHERITS the virtual generated column
+	// (attislocal=false). This rides the SAME separate=false-via-attgenerated branch
+	// as slice 283 — pg_dump.c:9507 sets `attrdefs[].separate = false` UNCONDITIONALLY
+	// whenever `tbinfo->attgenerated[adnum-1]` is non-empty, and ATTRIBUTE_GENERATED_VIRTUAL
+	// ('v') is non-empty exactly like ATTRIBUTE_GENERATED_STORED ('s') — but the
+	// RENDER differs: pg_dump.c:17171 emits `GENERATED ALWAYS AS (%s)` with NO trailing
+	// keyword for a virtual column (the STORED branch at 17168 is skipped). Layered on
+	// the leaf's ispartition=true (shouldPrintColumn true for every column, slices
+	// 281/282), the leaf body prints `vb integer GENERATED ALWAYS AS (va * 2)` inline,
+	// bare. NO production change — goopg already round-trips VIRTUAL generated columns on
+	// standalone tables (slice 194: attGeneratedFor reports 'v') and inherits parent
+	// columns onto partition leaves (slices 281/282/283); the two facts compose. A
+	// regression that mis-mapped attgenerated 'v'→'s' would print a spurious trailing
+	// STORED; one that dropped the generation expression would print a bare `vb integer`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pvna (va integer, vb integer GENERATED ALWAYS AS (va * 2) VIRTUAL) PARTITION BY LIST (va)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pvna with virtual generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pvna_1 PARTITION OF public.pvna FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pvna_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4299,6 +4322,46 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgna_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgna_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 284 (asserted):** the VIRTUAL counterpart of slice 283. A VIRTUAL
+		// generated column inherited onto a partition leaf prints its generation
+		// clause INLINE in the leaf body, but rendered WITHOUT a trailing keyword
+		// (`vb integer GENERATED ALWAYS AS (va * 2)`). attgenerated forces
+		// attrdefs[].separate=false UNCONDITIONALLY (pg_dump.c:9507) exactly as for
+		// STORED — ATTRIBUTE_GENERATED_VIRTUAL ('v') is non-empty like
+		// ATTRIBUTE_GENERATED_STORED ('s') — but the render branch differs:
+		// pg_dump.c:17171 emits `GENERATED ALWAYS AS (%s)` with NO trailing STORED for
+		// a virtual column (the STORED branch at 17168 is skipped). ispartition makes
+		// every column print (slices 281/282). Discriminator-distinct from slice 283:
+		// the render must NOT carry a trailing STORED.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pvna_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "va integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited partition-key column; want %q in pvna_1 block\n  block=%q", "va integer", block)
+			}
+			if !strings.Contains(block, "vb integer GENERATED ALWAYS AS (va * 2)") {
+				t.Errorf("pg_dump dropped/corrupted the inline virtual generated column on a partition leaf; want %q in pvna_1 block\n  block=%q", "vb integer GENERATED ALWAYS AS (va * 2)", block)
+			}
+			// A virtual generated column must NOT render a trailing STORED: a regression
+			// that mis-mapped attgenerated 'v'→'s' (pg_dump.c:17168) would surface here.
+			if strings.Contains(block, "vb integer GENERATED ALWAYS AS (va * 2) STORED") {
+				t.Errorf("pg_dump emitted a spurious trailing STORED on a VIRTUAL generated partition-leaf column\n  block=%q", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pvna_1\n  full stdout=%q", res.Stdout)
+		}
+		// A generation expression can never be a standalone SET DEFAULT; assert the
+		// illegal standalone form is absent for the leaf's virtual generated column.
+		if strings.Contains(res.Stdout, "ALTER COLUMN vb SET DEFAULT") {
+			t.Errorf("pg_dump emitted an (illegal) standalone SET DEFAULT for a virtual generated partition-leaf column (separate set despite attgenerated); unexpected %q\n  full stdout=%q", "ALTER COLUMN vb SET DEFAULT", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pvna_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pvna_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every

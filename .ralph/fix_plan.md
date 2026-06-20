@@ -6076,6 +6076,25 @@ object support.
         **Next (slice 284+):** a VIRTUAL generated column (`GENERATED ALWAYS AS … VIRTUAL`, slice 194's attgenerated='v' form)
         inherited onto a partition leaf — same `separate=false`-via-`attgenerated` branch but rendered WITHOUT trailing
         `STORED`; or a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+      - **PROGRESS 2026-06-20 (loop #52):** **DU-002 slice 284 LANDED — a VIRTUAL GENERATED column inherited onto a partition
+        leaf prints its generation clause INLINE in the leaf body, rendered BARE without a trailing `STORED` keyword (no
+        production change; same discriminator branch as 283, different render branch).** The VIRTUAL counterpart of slice 283.
+        Both ride the same `separate=false`-via-`attgenerated` branch — pg_dump.c:9507 sets `attrdefs[].separate=false`
+        UNCONDITIONALLY whenever `attgenerated` is non-empty, and `ATTRIBUTE_GENERATED_VIRTUAL` ('v') is non-empty exactly like
+        `ATTRIBUTE_GENERATED_STORED` ('s') — but the render differs: pg_dump.c:17171 emits `GENERATED ALWAYS AS (%s)` with NO
+        trailing keyword for a virtual column (the STORED branch at 17168 is skipped). Fixture: `CREATE TABLE public.pvna (va
+        integer, vb integer GENERATED ALWAYS AS (va * 2) VIRTUAL) PARTITION BY LIST (va)` + `CREATE TABLE public.pvna_1
+        PARTITION OF public.pvna FOR VALUES IN (1)` → leaf prints `vb integer GENERATED ALWAYS AS (va * 2)` inline, bare;
+        partition key `va` stays plain `va integer`. NO production change — goopg already round-trips VIRTUAL generated columns
+        on standalone tables (slice 194: attGeneratedFor reports 'v') and inherits parent columns onto partition leaves (slices
+        281/282/283); the two facts compose. A regression that mis-mapped attgenerated 'v'→'s' would print a spurious trailing
+        STORED; one that dropped the generation expression would print bare `vb integer`. **Guards:**
+        `TestPort_PgDumpConnectionSetup` PASS (3.89s; vs real pg_dump 18.3 — asserts the `pvna_1` block prints `va integer` +
+        inline `vb integer GENERATED ALWAYS AS (va * 2)`, NO trailing `STORED`, NO standalone `ALTER COLUMN vb SET DEFAULT`
+        anywhere, `ATTACH PARTITION public.pvna_1 FOR VALUES IN (1)` survives). gofmt + `go build` clean; pgbench pre-commit
+        smoke on commit. Design: `0110-0001` Slice 284.
+        **Next (slice 285+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or an inherited
+        generated column whose expression references a second inherited column (multi-attr generation deparse through the leaf).
 
 ### pg_waldump (2 tests — excluded → candidate)
 
