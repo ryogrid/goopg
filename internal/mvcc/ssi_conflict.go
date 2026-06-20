@@ -62,6 +62,11 @@ const (
 	// (predicate.c:4679) — the reader closed a dangerous structure to an
 	// already-committed writer it cannot abort, so the reader must die now.
 	reasonConflictOutDuringRead = "Canceled on conflict out to pivot, during read"
+	// reasonPivotDuringWrite is the write-path pivot-doom abort
+	// (predicate.c:4667) — a SERIALIZABLE writer's modification closed a
+	// dangerous structure in which the writer is the pivot with an out-conflict
+	// to an already-committed transaction, so the writer must die mid-statement.
+	reasonPivotDuringWrite = "Canceled on identification as a pivot, during write"
 )
 
 // CheckForSerializableConflictOutReportingFailure performs the same read-path
@@ -433,6 +438,39 @@ func (m *Manager) CheckForSerializableConflictIn(writerHandle TxnHandle, tag Pre
 	return m.checkForSerializableConflictInLocked(writerHandle, tag)
 }
 
+// CheckForSerializableConflictInReportingFailure performs the same write-path
+// conflict-in check as CheckForSerializableConflictIn, but additionally reports
+// — via a non-nil *SerializationFailureError — when the WRITER must abort its
+// current statement immediately. It is goopg's analogue of the mid-statement
+// ereport(ERROR) in upstream CheckForSerializableConflictIn (predicate.c:4667,
+// "Canceled on identification as a pivot, during write.").
+//
+// The detection key is the writer's Doomed flag becoming newly set across this
+// call: on the write path onConflictCheckLocked dooms the writer (current ==
+// writer) only via its Case 2 — the writer is a pivot with an out-conflict to an
+// already-committed transaction that committed first. That is exactly the
+// upstream mid-statement-abort writer. A writer that was already doomed on entry
+// would have failed at the earlier statement that doomed it, and a deferred pivot
+// doom (partner still in flight) never sets the flag here and still surfaces at
+// the writer's own PreCommit — so this stays nil for the common write-skew shape.
+//
+// Used by the executor write-path hook (ssiRecordTupleWrite) to surface SQLSTATE
+// 40001 on the offending INSERT/UPDATE/DELETE/MERGE step rather than deferring it
+// to the writer's COMMIT — the difference real PG 18.3 exhibits on, e.g., the
+// project-manager and classroom-scheduling isolation specs where one session has
+// already committed before the other's conflicting write.
+func (m *Manager) CheckForSerializableConflictInReportingFailure(writerHandle TxnHandle, tag PredicateLockTag) error {
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
+	writer := m.ssiState.xacts[writerHandle]
+	wasDoomed := writer != nil && writer.Doomed
+	m.checkForSerializableConflictInLocked(writerHandle, tag)
+	if writer != nil && writer.Doomed && !wasDoomed {
+		return &SerializationFailureError{Reason: reasonPivotDuringWrite}
+	}
+	return nil
+}
+
 func (m *Manager) checkForSerializableConflictInLocked(writerHandle TxnHandle, tag PredicateLockTag) bool {
 	if tag.Granularity() == InvalidPredicateGranularity {
 		return false
@@ -448,7 +486,8 @@ func (m *Manager) checkForSerializableConflictInLocked(writerHandle TxnHandle, t
 		return false
 	}
 	installed := false
-	for _, ancestor := range coveringPredicateLockTags(tag) {
+	covering := coveringPredicateLockTags(tag)
+	for _, ancestor := range covering {
 		tgt, ok := m.predicateLocks.targets[ancestor]
 		if !ok {
 			continue
@@ -475,6 +514,42 @@ func (m *Manager) checkForSerializableConflictInLocked(writerHandle TxnHandle, t
 				// path).
 				m.onConflictCheckLocked(reader, writer, writer)
 			}
+		}
+	}
+
+	// M0118-0001: also walk RETAINED COMMITTED readers. A reader that
+	// predicate-locked a target and then COMMITTED is kept in ssiState.finished
+	// with its owned-tag set intact (releaseSerializableLocked detaches a
+	// committed xact from the GLOBAL holder sets but does not null its
+	// predicateLocks). This write must still form the R -> W rw-edge against
+	// such a reader — the INSERT/UPDATE-after-the-partner-committed shape that
+	// closes the project-manager / classroom-scheduling dangerous structures,
+	// where the reader is gone from the global holder sets above. The committed
+	// reader is found here by scanning its own predicateLocks for a covering
+	// tag. Only a reader whose lifetime OVERLAPS this writer can still close a
+	// dangerous structure (reader.FinishedAt > writer.BeginAt); a reader that
+	// committed at or before this writer began is serialization-order-consistent
+	// and purgeFinishedSerializableLocked will drop it.
+	for _, reader := range m.ssiState.finished {
+		if reader == nil || reader == writer || len(reader.predicateLocks) == 0 {
+			continue
+		}
+		if reader.FinishedAt <= writer.BeginAt {
+			continue
+		}
+		holdsCovering := false
+		for _, ancestor := range covering {
+			if _, ok := reader.predicateLocks[ancestor]; ok {
+				holdsCovering = true
+				break
+			}
+		}
+		if !holdsCovering {
+			continue
+		}
+		if registerRWConflictLocked(reader, writer) {
+			installed = true
+			m.onConflictCheckLocked(reader, writer, writer)
 		}
 	}
 	return installed

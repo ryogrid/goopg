@@ -186,17 +186,75 @@ coordinated changes land it:
   change is a no-op for RC/RR (the `ssiActive` guard), so only SERIALIZABLE UPDATEs
   are affected; the full UPDATE/MERGE/conflict isolation suite stays green.
 
+### 5. Phantom predicate locking (lands `project-manager`)
+
+`project-manager` is a 2-cycle whose second edge is a **phantom**: `s2` runs
+`SELECT count(*) FROM project WHERE project_manager = 1` over an (initially empty)
+table and `s1` later `INSERT`s a row that *would have matched*. The per-tuple
+SIREAD locks goopg took only cover rows that already exist, so the insert formed
+no rw-conflict — a false negative. PG closes this with relation-grain predicate
+locking plus a conflict-out on the physical insert. Four coordinated changes land
+all 21 permutations byte-identical:
+
+- **Relation-level SIREAD on seq scans.** `seqScanOp.Open` now acquires a
+  relation-grain predicate lock on the scanned table — the analogue of
+  `PredicateLockRelation` in upstream `heap_beginscan` (`heapam.c:1162`): *"for
+  seqscan … acquire a predicate lock on the entire relation … to conflict with
+  new insertions into the table … in a heap scan there is nothing more
+  fine-grained to lock."* New executor hook `ssiRecordRelationRead`; gated to skip
+  system catalogs (`catalog.IsSystemRelation`), temp and matview relations exactly
+  as upstream `PredicateLockingNeededForRelation`. This handles the
+  READ-before-INSERT ordering: the later insert's conflict-in walk finds the
+  reader's relation lock.
+- **Conflict-out on physically-present invisible tuples.** For the
+  INSERT-before-READ ordering, `s1`'s uncommitted insert is physically on the page
+  but invisible to `s2`. Upstream `HeapCheckForSerializableConflictOut`
+  (`heapam.c:9254`) runs for *every* tuple a scan examines, visible or not, and on
+  the `!visible` paths registers `reader → inserter` from the tuple's xmin. The
+  `seqScanOp.Next` invisible branch now calls new hook
+  `ssiRecordInvisibleTupleRead(rel, xmin)`; the Manager filters
+  aborted/bootstrap/frozen/own-snapshot xids so only a genuine concurrent inserter
+  forms the edge.
+- **Retained committed readers' predicate locks.** The 6 permutations where one
+  session COMMITs before the other's conflicting write needed the *committed*
+  reader's SIREAD lock to remain discoverable by the later write's conflict-in.
+  `releaseSerializableLocked` now, on **commit**, detaches the xact only from the
+  GLOBAL (handle-keyed) holder sets — which a reused proc-slot handle could alias —
+  but **keeps** `sx.predicateLocks` (`detachPredicateLocksFromGlobalLocked`).
+  `checkForSerializableConflictInLocked` gains a second walk over
+  `ssiState.finished`, forming `R → W` against any retained committed reader that
+  (a) overlaps the writer (`reader.FinishedAt > writer.BeginAt`) and (b) owns a
+  covering tag. Mirrors PG keeping a committed `SERIALIZABLEXACT`'s predicate
+  locks alive until `purgeFinishedSerializableLocked` drops it.
+- **Write-path mid-statement abort.** When the write closes a dangerous structure
+  in which the writer is the pivot with an out-conflict to an already-committed
+  partner, PG `ereport`s *during the write* (`predicate.c:4667`, "Canceled on
+  identification as a pivot, during write."). New
+  `mvcc.Manager.CheckForSerializableConflictInReportingFailure` returns a
+  `*SerializationFailureError` when the writer becomes newly doomed across the
+  check; `ssiRecordTupleWrite` now returns that error and **all seven** write
+  sites (insert ×2, update-via-index, update-via-seqscan, delete, MERGE
+  update/delete) propagate it so the statement fails in place (25P02). Deferred
+  pivot dooms (partner still in flight) leave the flag clear and surface at the
+  writer's own COMMIT, exactly as before — the `simple-write-skew` shape.
+
+All four changes are `ssiActive`-gated, so RC/RR and non-SERIALIZABLE workloads
+(pgbench, TPC-H) are byte-for-byte unchanged; the full UPDATE/MERGE/insert-conflict
+isolation suite stays green.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
-  read-only anomaly, all 90 generated permutations byte-identical to PG 18.3), and
-  `total-cash` (mid-statement read-path abort, all 20 generated permutations
-  byte-identical to PG 18.3 — section 4).
+  read-only anomaly, all 90 generated permutations byte-identical to PG 18.3),
+  `total-cash` (mid-statement read-path abort, all 20 permutations — section 4),
+  and `project-manager` (phantom predicate locking, all 21 permutations
+  byte-identical to PG 18.3 — section 5).
 - **Still deferred (same slice family):**
-  - `project-manager`, `classroom-scheduling` — 2-cycles whose second edge needs
-    **phantom / empty-range predicate locking** (a `SELECT … WHERE …` over a
-    range an INSERT later fills): goopg currently misses the rw-edge, a false
-    negative independent of the retention machinery.
+  - `classroom-scheduling` — the SSI machinery is in place (section 5), but its
+    primary key is `(room_id text, start_time timestamptz)` and goopg's btree
+    rejects a `timestamptz` key (`btree v0 only supports int4 / numeric keys`,
+    SQLSTATE 0A000) at the spec's `global setup`. Blocked on btree key-type
+    support, NOT on SSI — a different subsystem.
   - `receipt-report` — `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY` is a
     parser gap (syntax error today) *and* needs de-facto READ ONLY SSI modeling
     to avoid the 42 false positives upstream notes for a READ WRITE `s3`.

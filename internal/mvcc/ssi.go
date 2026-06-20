@@ -195,17 +195,27 @@ func (m *Manager) releaseSerializableLocked(handle TxnHandle, committed bool) *S
 	if !ok {
 		return nil
 	}
-	// M0104-0003: release predicate locks before stamping FinishedAt so
-	// the global target map (m.predicateLocks.targets) is cleared of this
-	// xact's entries while the SerializableXact is still addressable
-	// through the registry. releasePredicateLocksLocked also nulls
-	// sx.predicateLocks once it's done so the released pointer no longer
-	// holds references to global state. M0118-0001 releases predicate
-	// locks on BOTH commit and abort so the SIREAD holder set (keyed by a
-	// proc-slot handle that a later Begin may reuse) never names a retained
-	// committed xact — the read-path XID lookup, not the holder set, is
-	// what reaches a retained committed writer.
-	m.releasePredicateLocksLocked(handle)
+	// M0104-0003 / M0118-0001: clear the GLOBAL predicate-lock holder sets of
+	// this xact's handle before stamping FinishedAt, while the SerializableXact
+	// is still addressable through the registry. The handle-keyed holder sets
+	// must never name a retained committed xact (a later Begin may reuse the
+	// proc-slot handle and alias the lock).
+	//
+	// The two finish kinds differ in what survives:
+	//   - COMMIT: detach from the global holders ONLY and KEEP sx.predicateLocks
+	//     so checkForSerializableConflictInLocked's retained-xact (finished) walk
+	//     can still discover this committed reader when a later writer touches a
+	//     target it predicate-locked — the `R -> W` edge in the project-manager /
+	//     classroom-scheduling phantom structures, where R commits before W
+	//     writes. Mirrors PostgreSQL retaining a committed SERIALIZABLEXACT's
+	//     predicate locks until cleanup.
+	//   - ABORT: fully release (detach + null sx.predicateLocks); an aborted
+	//     reader cannot participate in any committed dangerous structure.
+	if committed {
+		m.detachPredicateLocksFromGlobalLocked(handle, sx)
+	} else {
+		m.releasePredicateLocksLocked(handle)
+	}
 
 	sx.FinishedAt = m.ssiState.nextCommitSeqNo
 	m.ssiState.nextCommitSeqNo++

@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -73,6 +74,75 @@ func ssiRecordTupleRead(ctx *Context, rel storage.RelFileNode, block storage.Blo
 	return nil
 }
 
+// ssiRecordRelationRead is the executor-side hook for a SERIALIZABLE
+// *sequential* scan. Mirroring upstream heap_beginscan (heapam.c:1150-1171),
+// a seq scan in a serializable transaction acquires a relation-grain SIREAD
+// predicate lock on the whole table:
+//
+//	"For seqscan and sample scans in a serializable transaction, acquire a
+//	 predicate lock on the entire relation. This is required not only to lock
+//	 all the matching tuples, but also to conflict with new insertions into
+//	 the table. ... in a heap scan there is nothing more fine-grained to lock."
+//
+// This is the PHANTOM mechanism: per-tuple SIREAD locks (ssiRecordTupleRead)
+// only cover rows that already exist, so a concurrent SERIALIZABLE writer that
+// INSERTs a row matching the scan's qual would form no rw-edge — the
+// false-negative behind the project-manager and classroom-scheduling specs.
+// The coarse relation lock makes the later INSERT's conflict-in walk
+// (tuple → page → relation) find this reader, closing the dangerous structure.
+// Per-tuple conflict-out detection still runs from ssiRecordTupleRead during
+// the scan; the per-tuple AcquirePredicateLock there becomes a no-op once this
+// coarser lock is held (AcquirePredicateLock prunes finer covered tags).
+//
+// Upstream gates this via SerializationNeededForRead /
+// PredicateLockingNeededForRelation: system catalogs (OID < FirstUserOID),
+// temp (local-buffer) relations and materialized views never participate in
+// predicate locking. The system-catalog gate lives here; the caller filters
+// temp / matview relations (it holds the catalog.Table) before calling.
+func ssiRecordRelationRead(ctx *Context, rel storage.RelFileNode) {
+	if !ssiActive(ctx) {
+		return
+	}
+	if catalog.IsSystemRelation(rel.RelOid) {
+		return
+	}
+	tag := mvcc.RelationLockTag(rel.DBOid, rel.RelOid)
+	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
+}
+
+// ssiRecordInvisibleTupleRead is the executor-side SSI hook for a tuple that a
+// SERIALIZABLE scan physically encounters but that is NOT visible to the
+// reader's snapshot because a CONCURRENT transaction inserted it (its xmin is
+// still in flight, or committed after the reader's snapshot). Upstream's
+// HeapCheckForSerializableConflictOut (heapam.c:9254) runs for every tuple the
+// scan examines, visible or not: in the not-visible cases it forms the
+// rw-antidependency reader → inserter using the tuple's xmin. This is the
+// second half of the PHANTOM mechanism — it catches the INSERT-before-READ
+// ordering, where the inserting writer ran *before* the reader acquired its
+// relation predicate lock, so ssiRecordRelationRead's lock alone cannot see it
+// (the reader was not yet a predicate-lock holder when the INSERT's
+// conflict-in walk ran).
+//
+// No predicate lock is acquired: the relation-level SIREAD from
+// ssiRecordRelationRead already covers the whole table, and an invisible tuple
+// is not "read" by this transaction. The Manager filters aborted / bootstrap /
+// frozen xmins and the writer-committed-before-our-snapshot (wr-dependency)
+// case, so passing xmin unconditionally is safe. A non-nil error means the read
+// closed a dangerous structure to an already-committed writer and the reader
+// must abort mid-statement (40001), exactly like ssiRecordTupleRead.
+func ssiRecordInvisibleTupleRead(ctx *Context, rel storage.RelFileNode, xmin storage.TransactionID) error {
+	if !ssiActive(ctx) {
+		return nil
+	}
+	if catalog.IsSystemRelation(rel.RelOid) {
+		return nil
+	}
+	if err := ctx.TxnMgr.CheckForSerializableConflictOutReportingFailure(ctx.Tx.Handle, xmin); err != nil {
+		return ssiReadAbortError(err)
+	}
+	return nil
+}
+
 // ssiReadAbortError converts the mvcc read-path serialization failure into the
 // executor's wire-surfacing ExecError (SQLSTATE 40001). The primary message is
 // the bare upstream errmsg that psql/isolationtester print; the reason rides in
@@ -96,21 +166,35 @@ func ssiReadAbortError(err error) error {
 // ssiRecordTupleWrite is the executor-side hook for SERIALIZABLE writes.
 // When a SERIALIZABLE writer modifies the tuple at (rel, block, slot), the
 // hook walks the predicate-lock holder set on the exact tag plus every
-// covering ancestor (tuple → page → relation) and installs rw-conflict
-// edges R → W for every concurrent SERIALIZABLE reader covering the target.
+// covering ancestor (tuple → page → relation) — and the retained-committed
+// reader set — and installs rw-conflict edges R → W for every SERIALIZABLE
+// reader covering the target.
 //
 // For INSERTs the tuple was just allocated, so the per-tuple holder set is
-// guaranteed empty — but covering page/relation holders are still found.
-// For UPDATE/DELETE the old tuple's (block, slot) is the canonical target.
-func ssiRecordTupleWrite(ctx *Context, rel storage.RelFileNode, block storage.BlockNumber, slot uint16) {
+// guaranteed empty — but covering page/relation holders (and committed readers
+// holding a relation-level SIREAD from a seq scan) are still found. For
+// UPDATE/DELETE the old tuple's (block, slot) is the canonical target.
+//
+// M0118-0001: returns a non-nil error (SQLSTATE 40001) when this write closes a
+// dangerous structure in which the writer is the pivot with an out-conflict to
+// an ALREADY-COMMITTED transaction — the writer must abort mid-statement
+// (upstream's "Canceled on identification as a pivot, during write"). The caller
+// (the storage write operator) must propagate the error so the
+// INSERT/UPDATE/DELETE/MERGE step fails in place, marking the transaction failed
+// (25P02). Deferred pivot/write-skew dooms (partner still in flight) return nil
+// here and surface at the writer's own COMMIT, exactly as before.
+func ssiRecordTupleWrite(ctx *Context, rel storage.RelFileNode, block storage.BlockNumber, slot uint16) error {
 	if !ssiActive(ctx) {
-		return
+		return nil
 	}
 	if block == storage.InvalidBlockNumber || slot == 0 {
-		return
+		return nil
 	}
 	tag := mvcc.TupleLockTag(rel.DBOid, rel.RelOid, block, slot)
-	ctx.TxnMgr.CheckForSerializableConflictIn(ctx.Tx.Handle, tag)
+	if err := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); err != nil {
+		return ssiReadAbortError(err)
+	}
+	return nil
 }
 
 // ssiPreCommitCheck is the executor-side wrapper over

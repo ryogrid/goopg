@@ -423,6 +423,34 @@ func (m *Manager) releasePredicateLocksLocked(handle TxnHandle) {
 	sx.predicateLocks = nil
 }
 
+// detachPredicateLocksFromGlobalLocked removes a SERIALIZABLE xact (by handle)
+// from every GLOBAL predicate-lock holder set but LEAVES sx.predicateLocks
+// intact. M0118-0001 calls this when a committed reader is retained past commit:
+// the handle-keyed global holder sets must not keep naming the committed xact
+// (its proc-slot handle may be reused by a later Begin, which would alias the
+// retained lock onto the new xact), yet the committed xact's own owned-tag set
+// must survive so checkForSerializableConflictInLocked can still discover it via
+// the retained-xact (finished) walk. This mirrors PostgreSQL keeping a committed
+// SERIALIZABLEXACT's predicate locks alive until no concurrent transaction can
+// still form a dangerous rw-conflict against it (predicate.c
+// ClearOldPredicateLocks / SxactGlobalXmin); goopg's purgeFinishedSerializableLocked
+// is the analogous deferred cleanup that finally drops the retained xact.
+func (m *Manager) detachPredicateLocksFromGlobalLocked(handle TxnHandle, sx *SerializableXact) {
+	if sx == nil || len(sx.predicateLocks) == 0 || m.predicateLocks.targets == nil {
+		return
+	}
+	for tag := range sx.predicateLocks {
+		tgt, ok := m.predicateLocks.targets[tag]
+		if !ok {
+			continue
+		}
+		delete(tgt.holders, handle)
+		if len(tgt.holders) == 0 {
+			delete(m.predicateLocks.targets, tag)
+		}
+	}
+}
+
 // coarsenAfterAcquireLocked enforces the active coarsening policy
 // after a new lock has been installed. Three stages, finest first:
 //
