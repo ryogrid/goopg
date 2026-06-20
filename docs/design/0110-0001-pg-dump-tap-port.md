@@ -8428,9 +8428,32 @@ Guards:
   then the inline `en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED` with the argument list rendered `cn, dn`, in
   attnum order, and that `ATTACH PARTITION public.pgcl_1 FOR VALUES IN ('a')` survives).
 
-> **Next (slice 292+):** a THREE-argument or nested-call generation expression (`concat(a, b, c)` / `upper(coalesce(a, b))`)
-> to pin the repeated-comma / nested call-paren composition end-to-end, OR a multi-column / NULL-typed DEFAULT variant on
-> the partition-leaf ALTER path.
+### Slice 292 — nested function-call generation expression `upper(coalesce(gn, hn))` (end-to-end on the pg_dump oracle)
+
+Slices 290/291 pinned the single- and two-argument call-paren branches of `joinGeneratedExprTokens` at **one** nesting
+level. This slice pins their **composition** — a function call whose argument is itself a function call — proving the
+helper keeps **both** call parens tight while spacing only the inner argument comma.
+
+`CREATE TABLE pgnc (gn text, hn text, jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED) PARTITION BY LIST (gn)`
+with leaf `pgnc_1 PARTITION OF pgnc FOR VALUES IN ('a')`. The token walk relies on the `(`-after-ident rule firing
+**twice** (`upper(`, then the inner `coalesce(`) and the `)`-is-always-tight rule firing twice at the tail, yielding
+`upper(coalesce(gn, hn))` — not `upper ( coalesce ( gn ,hn ) )` or any single-depth variant. Because this test dumps a
+**live goopg server**, the source pg_dump reads back is goopg's stored form, so both lowercase function names are
+preserved verbatim (no real-PG `pg_get_expr` case normalization in this path). The render path is otherwise identical to
+slices 281–291: `attgenerated` ('s') forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces
+`shouldPrintColumn` for every column, so the leaf inherits all three columns in attnum order (`gn`, `hn`, then the inline
+generated `jn`). No rows are inserted, so this rides the dump-time deparse path only. Production already handled nested
+calls (the `joinGeneratedExprTokens` paren rules are depth-agnostic); this slice is the oracle round-trip proof. Verified
+vs PG 18.3. TEST-ONLY — no production change.
+
+Guards:
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgnc_1` block prints `gn text`, `hn text`,
+  then the inline `jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED` with both call parens tight and only the
+  inner comma spaced, in attnum order, and that `ATTACH PARTITION public.pgnc_1 FOR VALUES IN ('a')` survives).
+
+> **Next (slice 293+):** a THREE-argument function-call generation expression (`concat(a, b, c)`) to pin the
+> repeated-comma argument list end-to-end, OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER
+> path.
 
 ## Deferred (002–010) — catalog surface estimate
 

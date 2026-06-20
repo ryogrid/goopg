@@ -6234,6 +6234,26 @@ object support.
         **Next (slice 292+):** a THREE-argument or nested-call generation expression (`concat(a, b, c)` / `upper(coalesce(a, b))`)
         to pin repeated-comma / nested call-paren composition end-to-end, OR a multi-column / NULL-typed DEFAULT variant on the
         partition-leaf ALTER path.
+      - **PROGRESS 2026-06-20 (loop #60):** **DU-002 slice 292 LANDED — NESTED function-call generation expression
+        `upper(coalesce(gn, hn))` end-to-end on the pg_dump oracle.** Slices 290/291 pinned the single- and two-argument
+        call-paren branches of `joinGeneratedExprTokens` at ONE nesting level; this slice pins their COMPOSITION — a call whose
+        argument is itself a call — proving the helper keeps BOTH call parens tight while spacing only the inner argument comma
+        (`upper(coalesce(gn, hn))`, not `upper ( coalesce ( gn ,hn ) )`). The token walk relies on the `(`-after-ident rule firing
+        TWICE (`upper(`, inner `coalesce(`) and the `)`-always-tight rule firing twice at the tail — depth-agnostic, so production
+        already handled it; this slice is the oracle round-trip proof. Because the test dumps a LIVE goopg server, pg_dump reads
+        goopg's stored source verbatim — both lowercase function names preserved (no real-PG `pg_get_expr` case normalization).
+        Render path identical to 281–291 (attgenerated 's' → `attrdefs[].separate=false` pg_dump.c:9507; ispartition →
+        shouldPrintColumn every column); 3 columns in attnum order (`gn`, `hn`, generated `jn`). No rows inserted → dump-time
+        deparse path only. Fixture:
+        `CREATE TABLE public.pgnc (gn text, hn text, jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED) PARTITION BY LIST (gn)` +
+        `CREATE TABLE public.pgnc_1 PARTITION OF public.pgnc FOR VALUES IN ('a')`. **Guards:** `TestPort_PgDumpConnectionSetup`
+        PASS (3.90s; vs real pg_dump 18.3 — asserts `pgnc_1` prints `gn text`, `hn text`, then inline
+        `jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED` with both call parens tight and only the inner comma spaced,
+        attnum order, ATTACH survives); gofmt + `go vet` clean; pgbench pre-commit smoke on commit. Files:
+        `internal/testport/pgdump_connsetup_test.go` (pgnc fixture + assertion — TEST-ONLY, no production change),
+        `docs/design/0110-0001-pg-dump-tap-port.md` (Slice 292).
+        **Next (slice 293+):** a THREE-argument function-call generation expression (`concat(a, b, c)`) to pin the repeated-comma
+        argument list end-to-end, OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
 ### pg_waldump (2 tests — excluded → candidate)
 
