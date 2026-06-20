@@ -6299,6 +6299,25 @@ object support.
         **Next (slice 295+):** a string-literal generation expression whose body IS `pg_get_expr` punctuation
         (e.g. `concat(ka, ',', la)` — literal body is a comma) to exercise the `TokenSymbol`-gated spacing on the oracle path, OR a
         multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+      - **PROGRESS 2026-06-20 (loop #63):** **DU-002 slice 295 LANDED — comma-literal argument in a function-call generation
+        expression `concat(ka, ',', la)` round-trips end-to-end on the pg_dump oracle.** The ADVERSARIAL complement to slice 294:
+        slice 294 proved a string literal whose body is `-`; this slice makes the literal body BE A COMMA, directly colliding the
+        literal `','` with the argument-separator comma. The pre-slice-294 `Value`-based switch would have matched the literal
+        token's `,` value against the `,` separator case (`noSpace`) AND dropped its quotes, collapsing the three commas into the
+        malformed `concat(ka,,,la)`; slice 294's `TokenSymbol` gating + `renderTok` re-quoting render it distinctly as
+        `concat(ka, ',', la)`. TEST-ONLY (no production change) — pins slice 294's gating on the ORACLE path. Fixture:
+        `CREATE TABLE public.pgkc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED) PARTITION BY LIST (ka)` +
+        `pgkc_1 PARTITION OF` (`pgcc` was already taken at L1600 → renamed `pgkc`). Render path identical to slice 294: attgenerated
+        (`'s'`) → `attrdefs[].separate=false` (pg_dump.c:9507), ispartition → `shouldPrintColumn` every column. **Guards:**
+        `TestGeneratedColumnExprCanonicalSpacing` PASS (new case `comma_literal_arg` `concat(fa, ',', fb)`);
+        `TestPort_PgDumpConnectionSetup` PASS (3.89s vs real pg_dump 18.3 — asserts `pgkc_1` prints the inline
+        `na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED`, the malformed `concat(ka,,,la)` is ABSENT, attnum order, ATTACH
+        survives); gofmt + `go vet` clean; pgbench pre-commit smoke on commit. Files: `internal/parser/gen_override_test.go` (1 unit
+        case), `internal/testport/pgdump_connsetup_test.go` (pgkc fixture + assertion), `docs/design/0110-0001-pg-dump-tap-port.md`
+        (Slice 295).
+        **Next (slice 296+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path, OR a string-literal
+        generation expression with an embedded backslash / unicode escape to exercise the literal re-quoting against
+        `standard_conforming_strings` edge cases.
 
 ### pg_waldump (2 tests — excluded → candidate)
 

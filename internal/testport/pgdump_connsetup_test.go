@@ -1754,6 +1754,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pglc_1: %v", err)
 	}
 
+	// Slice 295: a function-call generation expression whose string-literal
+	// argument's BODY IS A COMMA (`concat(ka, ',', la)`) inherited onto a
+	// partition leaf — the adversarial complement to slice 294. Here the literal
+	// `','` directly COLLIDES with the argument-separator comma. Slice 294's fix
+	// gates the punctuation spacing rules on TokenSymbol; this fixture exercises
+	// that gating on the ORACLE path. The pre-slice-294 Value-based switch would
+	// have matched the literal token's `,` value against the separator `,` case
+	// (noSpace) AND dropped its quotes, collapsing the three commas into the
+	// malformed `concat(ka,,,la)`. With the fix, the TokenStringLit literal is
+	// skipped by the symbol-only switch and re-quoted, so it renders distinctly
+	// as `concat(ka, ',', la)`. Because this test dumps a LIVE goopg server, real
+	// pg_dump reads goopg's stored source verbatim, pinning goopg's own canonical
+	// rendering (no `::text` cast — that pg_get_expr divergence is out of scope,
+	// like slices 290–294). Render path is otherwise identical to slice 294:
+	// attgenerated ('s') forces attrdefs[].separate=false (pg_dump.c:9507) and
+	// ispartition forces shouldPrintColumn for every column, so the leaf pgkc_1
+	// inherits both plain columns and prints `ka text`, `la text`, then the
+	// inline generated `na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED`.
+	// No rows are inserted, so this rides the dump-time deparse path only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgkc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED) PARTITION BY LIST (ka)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgkc with comma-literal-argument function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgkc_1 PARTITION OF public.pgkc FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pgkc_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -5012,6 +5038,54 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pglc_1 FOR VALUES IN ('a')") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pglc_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+
+		// **Slice 295 (asserted):** function-call generation expression whose
+		// string-literal argument's BODY IS A COMMA on a partition leaf — the
+		// adversarial complement to slice 294. The leaf pgkc_1 must print `ka text`,
+		// `la text`, then the inline generated
+		// `na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED` — with the
+		// comma literal RE-QUOTED and distinct from the separator commas. The
+		// regression guard below pins slice 294's TokenSymbol gating on the oracle
+		// path: a Value-based switch would have matched the literal `,` against the
+		// separator case and dropped its quotes, collapsing the block into the
+		// malformed `concat(ka,,,la)`.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgkc_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			kaIdx := strings.Index(block, "ka text")
+			if kaIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgkc_1 block\n  block=%q", "ka text", block)
+			}
+			laIdx := strings.Index(block, "la text")
+			if laIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgkc_1 block\n  block=%q", "la text", block)
+			}
+			naIdx := strings.Index(block, "na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED")
+			if naIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the comma-literal-argument function-call generated column on a partition leaf; want %q in pgkc_1 block\n  block=%q", "na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED", block)
+			}
+			// Guard against the pre-fix regression: the malformed collapsed-comma
+			// form must NOT appear (quotes dropped, literal merged into separators).
+			if strings.Contains(block, "concat(ka,,,la)") {
+				t.Errorf("pg_dump emitted the pre-slice-294 malformed generation expr with the comma literal collapsed into the separators; got %q in pgkc_1 block\n  block=%q", "concat(ka,,,la)", block)
+			}
+			// Attnum order: ka (1) before la (2) before na (3).
+			if kaIdx >= 0 && laIdx >= 0 && kaIdx > laIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pgkc_1 block\n  block=%q", "ka", "la", block)
+			}
+			if laIdx >= 0 && naIdx >= 0 && laIdx > naIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgkc_1 block\n  block=%q", "la", "na", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgkc_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgkc_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgkc_1 FOR VALUES IN ('a')", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every

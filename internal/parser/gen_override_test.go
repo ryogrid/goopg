@@ -174,6 +174,12 @@ func TestGeneratedColumnExprCanonicalSpacing(t *testing.T) {
 		{"string_literal_arg", "concat(fa, '-', fb)", "concat(fa, '-', fb)"},
 		{"string_literal_operand", "fa || '-' || fb", "fa || '-' || fb"},
 		{"embedded_quote_literal", "concat(fa, '''', fb)", "concat(fa, '''', fb)"},
+		// DU-002 slice 295: a string literal whose BODY IS A COMMA directly
+		// collides with the argument-separator comma. The TokenSymbol gating
+		// (slice 294) must keep the literal `','` distinct from the separators;
+		// a Value-based switch would have matched the `,` case and produced the
+		// malformed `concat(fa,,,fb)` (literal collapsed into the separators).
+		{"comma_literal_arg", "concat(fa, ',', fb)", "concat(fa, ',', fb)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

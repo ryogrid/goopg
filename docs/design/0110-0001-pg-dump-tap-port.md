@@ -8504,9 +8504,37 @@ Guards:
   `concat(ka, -, la)` is **absent**, columns are in attnum order, and `ATTACH PARTITION public.pglc_1 FOR VALUES IN ('a')`
   survives).
 
-> **Next (slice 295+):** a string-literal generation expression with embedded `pg_get_expr` punctuation
-> (e.g. `concat(ka, ',', la)` — a literal whose body is a comma) to exercise the `TokenSymbol`-gated spacing on the
-> oracle path, OR a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+### Slice 295 — comma-literal argument in a function-call generation expression `concat(ka, ',', la)` (end-to-end on the pg_dump oracle)
+
+The adversarial complement to slice 294. Slice 294's fix gated the punctuation spacing rules on `TokenSymbol` so a
+string literal whose body happens to be a punctuator can't be mistaken for one. This slice makes the literal body **be a
+comma** — `concat(ka, ',', la)` — directly colliding the literal `','` with the argument-separator comma. The pre-slice-294
+`Value`-based switch would have matched the literal token's `,` value against the `,` case (`noSpace`) **and** dropped its
+quotes, collapsing the three commas into the malformed `concat(ka,,,la)`. With the fix, the `TokenStringLit` literal is
+skipped by the symbol-only switch and re-quoted, so it renders distinctly as `concat(ka, ',', la)`. This is a TEST-ONLY
+slice — no production change; it pins slice 294's `TokenSymbol` gating on the **oracle** path (slice 294 already proved a
+string literal whose body is `-`; this proves the harder case where the body equals the separator itself).
+
+`CREATE TABLE pgkc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED) PARTITION BY LIST (ka)`
+with leaf `pgkc_1 PARTITION OF pgkc FOR VALUES IN ('a')`. Dumping a **live goopg server**, real pg_dump reads goopg's
+stored generation source verbatim, so the assertion pins goopg's own canonical rendering `concat(ka, ',', la)` (no
+`::text` cast — that pg_get_expr divergence is out of scope, like slices 290–294). Render path is otherwise identical to
+slices 281–294: attgenerated (`'s'`) forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces
+`shouldPrintColumn` for every column, so the leaf `pgkc_1` inherits both plain columns and prints `ka text`, `la text`,
+then the inline `na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED`. No rows are inserted, so this rides the
+dump-time deparse path only. Verified vs PG 18.3.
+
+Guards:
+- `TestGeneratedColumnExprCanonicalSpacing` (parser unit, one new case `comma_literal_arg`): `concat(fa, ',', fb)` →
+  `concat(fa, ',', fb)`.
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgkc_1` block prints `ka text`, `la text`,
+  then the inline `na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED`, that the pre-fix malformed
+  `concat(ka,,,la)` is **absent**, columns are in attnum order, and `ATTACH PARTITION public.pgkc_1 FOR VALUES IN ('a')`
+  survives).
+
+> **Next (slice 296+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path, OR a
+> string-literal generation expression with an embedded backslash / unicode escape to exercise the literal re-quoting
+> against `standard_conforming_strings` edge cases.
 
 ## Deferred (002–010) — catalog surface estimate
 
