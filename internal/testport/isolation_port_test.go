@@ -256,6 +256,19 @@ func TestPort_IsolationInsertConflictDoNothing(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-nothing.spec")
 }
 
+// TestPort_IsolationInsertConflictDoNothing2 exercises the
+// insert-conflict-do-nothing-2 spec: INSERT ... ON CONFLICT DO NOTHING with
+// multiple rows under REPEATABLE READ and SERIALIZABLE. ON CONFLICT DO NOTHING
+// never raises a serialization failure even when a concurrent committed insert
+// created the conflicting key — the conflict arbiter simply skips the row.
+func TestPort_IsolationInsertConflictDoNothing2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_icd_nothing2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-nothing-2.spec")
+}
+
 // TestPort_IsolationInsertConflictSpecconflict exercises the insert-conflict-specconflict spec.
 // Requires: BEGIN ISOLATION LEVEL, pg_advisory_xact_lock, ON CONFLICT DO UPDATE.
 func TestPort_IsolationInsertConflictSpecconflict(t *testing.T) {

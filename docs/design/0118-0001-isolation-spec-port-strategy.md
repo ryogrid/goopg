@@ -1171,6 +1171,35 @@ Verified by `TestPort_IsolationLockCommittedKeyupdate` (all permutations
 byte-for-byte vs PG 18.3, deterministic 3/3 runs at ~12s). Isolation pass count
 37 → 38.
 
+## Slice M0118-0001 — `insert-conflict-do-nothing-2` (multi-row `ON CONFLICT DO NOTHING` under RR/SER — promotion)
+
+`insert-conflict-do-nothing-2.spec` is the higher-isolation sibling of the
+already-passing `insert-conflict-do-nothing`. A single table
+`ints (key int, val text, PRIMARY KEY (key) INCLUDE (val))`; two sessions each run
+`INSERT … ON CONFLICT DO NOTHING` (one a single row, the other a two-row batch that
+also self-conflicts) while both sit in `REPEATABLE READ` or `SERIALIZABLE`, across
+all eight commit/insert interleavings.
+
+The load-bearing semantic is that **`ON CONFLICT DO NOTHING` never raises a
+serialization failure**, even at `SERIALIZABLE`. When the conflicting key was
+created by a concurrent transaction that has already committed, the arbiter index
+probe finds the live duplicate and the row is simply skipped — unlike
+`ON CONFLICT DO UPDATE` (which writes, and so can take an SSI `40001`) or a bare
+unique violation (`23505`). Because every conflicting insert is a no-op, none of
+the eight permutations form a dangerous structure, so the final `SELECT * FROM ints`
+shows exactly the first committed value (`donothing1`) and no transaction aborts.
+
+**No engine change — pure promotion.** goopg's `ON CONFLICT DO NOTHING` arbiter
+path (M0100-0002 eager-XID materialisation + duplicate-skip) already produces this
+outcome, and the `REPEATABLE READ` / `SERIALIZABLE` levels (M0104) impose no extra
+abort because DO-NOTHING records no write to seed a conflict-in edge. The
+`INCLUDE`-column primary key was already supported (it backs
+`lock-committed-keyupdate`).
+
+Verified by `TestPort_IsolationInsertConflictDoNothing2` (all eight permutations
+byte-for-byte vs PG 18.3, deterministic 3/3 runs at ~2.8s). Isolation pass count
+38 → 39.
+
 ## Status / scope boundary
 
 - **Passing:** `simple-write-skew` (2-cycle write skew), `two-ids` (3-xact
@@ -1213,7 +1242,10 @@ byte-for-byte vs PG 18.3, deterministic 3/3 runs at ~12s). Isolation pass count
   `2*conservativeSize` segment-crossing pad reservation, verified 3/3 uncached
   runs at ~65s), and `index-only-scan` (the two-table `SELECT min(id)` write skew
   through index-only scans — zero SSI change; only the floating-point GUC parse,
-  the per-setup-block submission runner fix, and the `cpu_*_cost` GUCs of section 20).
+  the per-setup-block submission runner fix, and the `cpu_*_cost` GUCs of section 20),
+  and `insert-conflict-do-nothing-2` (multi-row `INSERT … ON CONFLICT DO NOTHING`
+  under REPEATABLE READ / SERIALIZABLE — zero engine change; DO-NOTHING skips the
+  duplicate without writing so it never raises `40001` and no permutation aborts).
 - **Still deferred (same slice family):** none — every spec in the M0118-0001
   group now passes. The dedicated `TestPort_Isolation*` functions auto-promote
   (run, then `t.Skip` only on `defer`), so the next slice sees green→pass instantly.
