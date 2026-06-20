@@ -6095,6 +6095,24 @@ object support.
         smoke on commit. Design: `0110-0001` Slice 284.
         **Next (slice 285+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or an inherited
         generated column whose expression references a second inherited column (multi-attr generation deparse through the leaf).
+      - **PROGRESS 2026-06-20 (loop #53):** **DU-002 slice 285 LANDED — a MULTI-ATTRIBUTE generation expression inherited onto
+        a partition leaf round-trips, proving the generation deparse resolves TWO distinct inherited Var references through the
+        leaf (no production change; multi-Var deparse extension of slice 283).** Where slices 283/284 referenced a SINGLE column
+        in the generation clause (`ga * 2`), slice 285's `gb` is `GENERATED ALWAYS AS (ga + gc) STORED` — a binary expression
+        over two plain columns. The render path is identical to slice 283 (attgenerated forces `attrdefs[].separate=false`
+        unconditionally, pg_dump.c:9507; `ispartition` forces shouldPrintColumn true for every column, slices 281/282) so the
+        leaf body prints `gb integer GENERATED ALWAYS AS (ga + gc) STORED` inline; the NEW fact under test is that EACH Var
+        resolves to the right inherited column NAME on the leaf (not attnum-shifted, dropped, or swapped). Fixture: `CREATE
+        TABLE public.pgmc (ga integer, gc integer, gb integer GENERATED ALWAYS AS (ga + gc) STORED) PARTITION BY LIST (ga)` +
+        `CREATE TABLE public.pgmc_1 PARTITION OF public.pgmc FOR VALUES IN (1)`. NO production change — goopg already deparses
+        multi-column generation expressions (slice 59) and inherits parent columns onto partition leaves (slices 281–284); the
+        two compose. A regression resolving only the first Var, or swapping ga↔gc by attnum, would corrupt the clause.
+        **Guards:** `TestPort_PgDumpConnectionSetup` PASS (3.78s; vs real pg_dump 18.3 — asserts the `pgmc_1` block prints both
+        plain inherited `ga integer`/`gc integer` + inline `gb integer GENERATED ALWAYS AS (ga + gc) STORED`, and `ATTACH
+        PARTITION public.pgmc_1 FOR VALUES IN (1)` survives). gofmt + `go build` clean; pgbench pre-commit smoke on commit.
+        Design: `0110-0001` Slice 285.
+        **Next (slice 286+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
+        column whose expression references the partition-key column itself (Var-to-key deparse through the leaf).
 
 ### pg_waldump (2 tests — excluded → candidate)
 

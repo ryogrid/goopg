@@ -1505,6 +1505,30 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create partition leaf pvna_1: %v", err)
 	}
 
+	// Slice 285: a MULTI-ATTRIBUTE generation expression inherited onto a partition
+	// leaf. Slices 283/284 proved a generated column whose expression references a
+	// SINGLE other column (`ga * 2`); this slice proves the generation deparse
+	// resolves TWO distinct inherited column references through the leaf. The parent
+	// pgmc declares `gb` as `GENERATED ALWAYS AS (ga + gc) STORED` over two plain
+	// columns `ga`, `gc`; the partition leaf pgmc_1 INHERITS all three (attislocal=false).
+	// The render path is identical to slice 283 — attgenerated forces
+	// attrdefs[].separate=false unconditionally (pg_dump.c:9507), ispartition forces
+	// shouldPrintColumn true for every column (slices 281/282), so the leaf body prints
+	// `gb integer GENERATED ALWAYS AS (ga + gc) STORED` inline — but the NEW fact under
+	// test is the deparse of a binary expression over two Vars: each Var must resolve to
+	// the correct inherited column NAME on the leaf (not an attnum-shifted or dropped
+	// reference). A regression in the multi-Var generation deparse (e.g. one that resolved
+	// only the first Var, or that swapped ga↔gc by attnum) would surface as a corrupted
+	// generation clause here. NO production change — goopg already deparses multi-column
+	// expressions for generated columns (slice 59 attgenerated='s' + pg_attrdef deparse)
+	// and inherits parent columns onto partition leaves (slices 281–284); the two compose.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgmc (ga integer, gc integer, gb integer GENERATED ALWAYS AS (ga + gc) STORED) PARTITION BY LIST (ga)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgmc with multi-attr generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgmc_1 PARTITION OF public.pgmc FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pgmc_1: %v", err)
+	}
+
 	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
 	// child must round-trip. Slices 264–266 covered the per-child override forms
 	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
@@ -4362,6 +4386,38 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pvna_1 FOR VALUES IN (1)") {
 			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pvna_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 285 (asserted):** a MULTI-ATTRIBUTE generation expression inherited
+		// onto a partition leaf. Where slices 283/284 referenced a single column in the
+		// generation clause (`ga * 2`), pgmc_1's inherited `gb` is
+		// `GENERATED ALWAYS AS (ga + gc) STORED` — a binary expression over two distinct
+		// inherited Vars. The render path is identical to slice 283 (attgenerated forces
+		// separate=false, ispartition forces every column to print) but this asserts the
+		// deparse resolves BOTH Vars to the right column names: the leaf body must carry
+		// all three plain columns (`ga integer`, `gc integer`) plus the inline generated
+		// `gb integer GENERATED ALWAYS AS (ga + gc) STORED`. A regression that resolved
+		// only the first Var or swapped ga↔gc by attnum would corrupt the clause here.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgmc_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "ga integer") {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgmc_1 block\n  block=%q", "ga integer", block)
+			}
+			if !strings.Contains(block, "gc integer") {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgmc_1 block\n  block=%q", "gc integer", block)
+			}
+			if !strings.Contains(block, "gb integer GENERATED ALWAYS AS (ga + gc) STORED") {
+				t.Errorf("pg_dump dropped/corrupted the multi-attr inline generated column on a partition leaf; want %q in pgmc_1 block\n  block=%q", "gb integer GENERATED ALWAYS AS (ga + gc) STORED", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgmc_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgmc_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgmc_1 FOR VALUES IN (1)", res.Stdout)
 		}
 		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
 		// child. Unlike the partition leaves above (whose ispartition forces every

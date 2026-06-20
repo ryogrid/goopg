@@ -8262,8 +8262,30 @@ Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts th
 inline `vb integer GENERATED ALWAYS AS (va * 2)`, that NO trailing `STORED` follows it, that NO standalone
 `ALTER COLUMN vb SET DEFAULT` appears, and that `ATTACH PARTITION public.pvna_1 FOR VALUES IN (1)` survives).
 
-> **Next (slice 285+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or an inherited
-> generated column whose expression references a second inherited column (multi-attr generation deparse through the leaf).
+### Slice 285 — multi-attribute generation expression inherited onto a partition leaf (multi-Var deparse through the leaf)
+
+Where slices 283/284 referenced a **single** column in the generation clause (`ga * 2`), this slice proves the generation
+deparse resolves **two** distinct inherited Var references through the leaf. The parent
+`CREATE TABLE pgmc (ga integer, gc integer, gb integer GENERATED ALWAYS AS (ga + gc) STORED) PARTITION BY LIST (ga)`
+declares a generated column over a binary expression of two plain columns; the leaf
+`CREATE TABLE pgmc_1 PARTITION OF pgmc FOR VALUES IN (1)` INHERITS all three (`attislocal=false`). The *render path* is
+identical to slice 283 — `attgenerated` forces `attrdefs[].separate=false` unconditionally (pg_dump.c:9507) and
+`ispartition` forces `shouldPrintColumn` true for every column (slices 281/282) — so the leaf body prints
+`gb integer GENERATED ALWAYS AS (ga + gc) STORED` inline. The **new** fact under test is the deparse of a binary
+expression over two Vars: each Var must resolve to the correct inherited column NAME on the leaf (not an attnum-shifted,
+dropped, or swapped reference).
+
+**No production change required.** goopg already deparses multi-column expressions for generated columns (slice 59:
+`attgenerated='s'` + pg_attrdef deparse) and inherits parent columns onto partition leaves (slices 281–284); the two
+compose. Verified byte-identical vs PG 18.3. A regression that resolved only the first Var, or that swapped `ga↔gc` by
+attnum, would surface as a corrupted generation clause.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgmc_1` block prints both plain inherited
+columns `ga integer` and `gc integer` plus the inline `gb integer GENERATED ALWAYS AS (ga + gc) STORED`, and that
+`ATTACH PARTITION public.pgmc_1 FOR VALUES IN (1)` survives).
+
+> **Next (slice 286+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path; or a generated
+> column whose expression references the partition-key column itself (Var-to-key deparse through the leaf).
 
 ## Deferred (002–010) — catalog surface estimate
 
