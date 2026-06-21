@@ -160,9 +160,14 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (SOFT-deadlock wait-queue reordering — `deadlock.c` findLockCycle soft edges +
       deadLockCheck/testConfiguration + expandConstraints/topoSort + applyWaitOrders;
       reorders the queue and wakes the newly grantable waiter instead of aborting;
-      design 0118-0006). **Remaining:** `deadlock-parallel` (lock groups / parallel
-      workers), `multixact-no-deadlock` (row-lock xmax/WaitForXID wait graph,
-      invisible to lockmgr). Resume at `deadlock-parallel`.
+      design 0118-0006) + `multixact-no-deadlock` (re-acquiring a self-held row
+      lock; NO new engine work — conflict-gate-before-wait in stampLockInner +
+      self-filtering in activeLockHolders/stampMultiLock/MembersConflict already
+      hold the invariant; design 0118-0007). **Remaining:** `deadlock-parallel`
+      (lock groups / parallel workers), `tuplelock-upgrade-no-deadlock` (row-lock
+      upgrade retry algorithm across many permutations). Resume at
+      `tuplelock-upgrade-no-deadlock` (likely also no-engine or small-engine;
+      `deadlock-parallel` needs a lock-group abstraction goopg lacks — defer).
 - [ ] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,
       temporal-range-integrity.

@@ -930,6 +930,22 @@ func TestPort_IsolationDeadlockSoft2(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/deadlock-soft-2.spec")
 }
 
+// TestPort_IsolationMultixactNoDeadlock exercises the multixact-no-deadlock
+// spec: s1 takes FOR SHARE on the row, then s2 also takes FOR SHARE (turning the
+// row's tuple lock into a multixact). s3 then requests FOR UPDATE, which
+// conflicts with the SHARE multixact and waits. While s3 waits, s1 re-requests
+// FOR SHARE (s1lock2) — a lock it already holds — and must NOT be forced to
+// queue behind the waiting s3 (which would deadlock); since s1 is already a
+// member of the SHARE multixact it proceeds immediately. Once s2 and s1 commit,
+// s3's FOR UPDATE is granted. M0118-0004.
+func TestPort_IsolationMultixactNoDeadlock(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_multixact_no_deadlock")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/multixact-no-deadlock.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()
