@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -136,7 +137,70 @@ func TestIsConcurrentlyUpdatedHelper(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := isConcurrentlyUpdated(c.h, myXID, nil); got != c.want {
+			if got := isConcurrentlyUpdated(c.h, myXID, nil, nil); got != c.want {
+				t.Errorf("isConcurrentlyUpdated = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestIsConcurrentlyUpdatedMultiXact pins the M0118-0003 visibility-consumer
+// slice: when a tuple's xmax is an updater-bearing MultiXactId (IS_MULTI set,
+// LOCK_ONLY clear), isConcurrentlyUpdated must resolve the real updater xid
+// from the member store rather than treating the raw MultiXactId as the
+// deleting transaction id. Lock-only and single-xid cases are covered by
+// TestIsConcurrentlyUpdatedHelper.
+func TestIsConcurrentlyUpdatedMultiXact(t *testing.T) {
+	const myXID storage.TransactionID = 100
+	store := multixact.NewStore()
+
+	// A multi whose updater is a DIFFERENT transaction (xid 60).
+	updByOther, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 50, Status: multixact.StatusForShare},    // locker
+		{Xid: 60, Status: multixact.StatusNoKeyUpdate}, // updater
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(other updater): %v", err)
+	}
+	// A multi whose updater is OUR OWN transaction.
+	updBySelf, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 50, Status: multixact.StatusForShare},
+		{Xid: myXID, Status: multixact.StatusUpdate},
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(self updater): %v", err)
+	}
+	// A multi with only lockers (no updater). Such a multi should normally
+	// carry LOCK_ONLY; we deliberately leave that bit clear to exercise the
+	// defensive "no resolvable updater" branch.
+	lockersOnly, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 50, Status: multixact.StatusForShare},
+		{Xid: 60, Status: multixact.StatusForKeyShare},
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(lockers only): %v", err)
+	}
+
+	mk := func(multi multixact.MultiXactId) storage.HeapTupleHeader {
+		// IS_MULTI set, LOCK_ONLY clear: an updater-bearing multixact xmax.
+		return storage.HeapTupleHeader{Xmax: storage.TransactionID(multi), Infomask: storage.HeapXmaxIsMulti}
+	}
+
+	cases := []struct {
+		name string
+		h    storage.HeapTupleHeader
+		mxs  *multixact.Store
+		want bool
+	}{
+		{"updater is another active xact", mk(updByOther), store, true},
+		{"updater is our own xact", mk(updBySelf), store, false},
+		{"multi has only lockers (no updater)", mk(lockersOnly), store, false},
+		{"updater-multi but store unavailable", mk(updByOther), nil, true},
+		{"updater-multi not present in store", mk(9999), store, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isConcurrentlyUpdated(c.h, myXID, nil, c.mxs); got != c.want {
 				t.Errorf("isConcurrentlyUpdated = %v, want %v", got, c.want)
 			}
 		})
