@@ -457,9 +457,15 @@ func TestUpdateBlocksOnForeignTupleLock(t *testing.T) {
 		t.Fatal("session 2 did not register as a tuple-tag waiter within 2s")
 	}
 
-	// Release session 1's transaction-scoped locks; session 2
-	// should now wake and complete.
+	// Release session 1's statement-scoped lockmgr lock AND end its
+	// transaction. Cross-statement row-lock blocking now rides the locker's
+	// transaction (M0118-0003 write-path half): the conflicting UPDATE waits on
+	// session 1's xact via WaitForXID, so a bare lockmgr release no longer
+	// unblocks it — the holder must commit or abort to release the row lock.
 	lm.ReleaseAll(1)
+	if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
+		t.Fatalf("rollback session 1: %v", err)
+	}
 	select {
 	case err := <-done:
 		if err != nil {
@@ -630,7 +636,13 @@ func TestUpdateViaIndexScanBlocksOnForeignTupleLock(t *testing.T) {
 		<-done
 		t.Fatal("session 2 did not register as a tuple-tag waiter via the IndexScan-driven UPDATE path")
 	}
+	// Release the lockmgr lock AND end session 1's transaction: the
+	// cross-statement write-path wait (M0118-0003) blocks on the locker's
+	// transaction, so the holder must commit/abort to release the row lock.
 	lm.ReleaseAll(1)
+	if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
+		t.Fatalf("rollback session 1: %v", err)
+	}
 	select {
 	case err := <-done:
 		if err != nil {
@@ -752,17 +764,26 @@ func TestForShareCompatibleMultipleHolders(t *testing.T) {
 		t.Fatal("session 3 UPDATE did not register as waiter")
 	}
 
-	// Release session 1; session 3 must still be blocked
-	// (session 2 still holds RowShareLock).
+	// End session 1's transaction (statement-scoped lockmgr release + abort);
+	// session 3 must still be blocked because session 2 still holds the FOR
+	// SHARE row lock. The write-path wait (M0118-0003) keys off active holders,
+	// so the holder's transaction — not a bare lockmgr release — is the gate.
 	lm.ReleaseAll(1)
+	if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
+		t.Fatalf("rollback session 1: %v", err)
+	}
 	select {
 	case err := <-done:
 		t.Fatalf("session 3 unblocked too early — session 2 still holds: %v", err)
 	case <-time.After(100 * time.Millisecond):
 		// expected — still blocked
 	}
-	// Release session 2; session 3 should now wake.
+	// End session 2's transaction; session 3 should now wake (no active holder
+	// remains, so neither acquireTupleLock nor the conflict wait blocks).
 	lm.ReleaseAll(2)
+	if err := ctx.TxnMgr.Rollback(s2tx); err != nil {
+		t.Fatalf("rollback session 2: %v", err)
+	}
 	select {
 	case err := <-done:
 		if err != nil {
@@ -1084,6 +1105,92 @@ func TestForKeySharePropagatesLockToUpdatedSuccessor(t *testing.T) {
 	}
 	if st := lockOnlyMemberStatus(hdr.Infomask, hdr.Infomask2); st != multixact.StatusForKeyShare {
 		t.Errorf("successor lock status = %v, want StatusForKeyShare", st)
+	}
+}
+
+// TestConflictingRowLockHoldersHonoursStrengthMatrix proves the write-path
+// decision half of M0118-0003: once a FOR KEY SHARE lock has been propagated
+// forward onto an updated tuple's successor version (the locker half, see
+// TestForKeySharePropagatesLockToUpdatedSuccessor), a plain UPDATE/DELETE must
+// classify the held lock against its own write strength before stamping xmax.
+// A DELETE or key-column UPDATE (StatusUpdate) conflicts with FOR KEY SHARE and
+// must wait on the holder; a no-key UPDATE (StatusNoKeyUpdate) does NOT conflict
+// and proceeds immediately. This is the exact discriminator that makes
+// lock-update-traversal's s2d1/s2d2 block while s2d3 runs through. We assert the
+// decision (conflictingRowLockHolders) directly — deterministic, no blocking;
+// the end-to-end <waiting ...> behaviour is pinned by the isolation spec test.
+func TestConflictingRowLockHoldersHonoursStrengthMatrix(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+	store := multixact.NewStore()
+	mkSession := func(b lockmgr.BackendID) *Context {
+		tx, _ := ctx.TxnMgr.Begin(0)
+		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
+		s := makeCtx(lm, b)
+		s.Pool = ctx.Pool
+		s.Catalog = ctx.Catalog
+		s.TxnMgr = ctx.TxnMgr
+		s.MultiXact = store
+		s.Tx = tx
+		s.Snap = snap
+		return s
+	}
+
+	// Session A: in-progress no-key UPDATE on id=1 (creates a successor version),
+	// then release its statement-scoped lockmgr locks like dispatch.go does.
+	sA := mkSession(1)
+	defer ctx.TxnMgr.Rollback(sA.Tx)
+	if _, err := runForUpdate(t, sA, "UPDATE items SET label = 'zzz' WHERE id = 1"); err != nil {
+		t.Fatalf("session-A no-key UPDATE: %v", err)
+	}
+	lm.ReleaseAll(1)
+
+	// Session B: FOR KEY SHARE on id=1 — propagates the lock forward to sA's
+	// successor version (the locker half).
+	sB := mkSession(2)
+	defer ctx.TxnMgr.Rollback(sB.Tx)
+	if _, err := runForUpdate(t, sB, "SELECT id FROM items WHERE id = 1 FOR KEY SHARE"); err != nil {
+		t.Fatalf("session-B FOR KEY SHARE: %v", err)
+	}
+
+	// Locate the successor version carrying sB's propagated FOR KEY SHARE lock.
+	slot, hdr := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return h.Xmin == sA.Tx.XID
+	})
+	if slot == 0 {
+		t.Fatal("no successor version (xmin = sA) found on block 0")
+	}
+	if !storage.IsHeapTupleLockOnly(hdr.Infomask) || hdr.Xmax != sB.Tx.XID {
+		t.Fatalf("precondition failed: successor must carry sB's lock-only xmax (xmax=%d, infomask=%#x)", hdr.Xmax, hdr.Infomask)
+	}
+
+	// Session C is the writer that evaluates the conflict against sB's lock.
+	sC := mkSession(3)
+	defer ctx.TxnMgr.Rollback(sC.Tx)
+
+	// DELETE / key-UPDATE (StatusUpdate) conflicts with FOR KEY SHARE: must
+	// surface the still-active holder sB so the write waits.
+	if got := conflictingRowLockHolders(sC, hdr, multixact.StatusUpdate); len(got) != 1 || got[0] != sB.Tx.XID {
+		t.Errorf("StatusUpdate (DELETE/key-UPDATE) holders = %v, want [%d] (must wait on sB)", got, sB.Tx.XID)
+	}
+
+	// No-key UPDATE (StatusNoKeyUpdate) does NOT conflict with FOR KEY SHARE:
+	// the write proceeds immediately, so no holder is returned.
+	if got := conflictingRowLockHolders(sC, hdr, multixact.StatusNoKeyUpdate); len(got) != 0 {
+		t.Errorf("StatusNoKeyUpdate (no-key UPDATE) holders = %v, want none (must NOT wait on FOR KEY SHARE)", got)
+	}
+
+	// A holder that is no longer active (rolled back) must not block any writer.
+	ctx.TxnMgr.Rollback(sB.Tx)
+	if got := conflictingRowLockHolders(sC, hdr, multixact.StatusUpdate); len(got) != 0 {
+		t.Errorf("after holder rollback, StatusUpdate holders = %v, want none", got)
 	}
 }
 

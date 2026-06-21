@@ -566,6 +566,71 @@ strength matrix — a no-key `UPDATE` proceeds against a `FOR KEY SHARE` holder,
 `DELETE`/key-`UPDATE` waits. That write-path lock-wait is the next slice; it
 promotes `lock-update-traversal` / `lock-update-delete` / `propagate-lock-delete`.
 
+### Hot-path wiring slice 6: update-chain forward lock propagation (write-path half)
+
+This slice lands the **write-path half** identified at the end of slice 5, completing
+update-chain lock propagation. Slice 5 propagated a `FOR KEY SHARE`/`FOR SHARE` lock
+forward onto the live successor version; this slice makes the plain `UPDATE`/`DELETE`
+write path **honour** that lock — it waits for the holder before stamping its own
+xmax, the goopg analog of `heap_update` / `heap_delete`'s `MultiXactIdWait` /
+`XactLockTableWait` step (`postgres/src/backend/access/heap/heapam.c`).
+
+Two helpers in `operators_storage.go`:
+
+- **`conflictingRowLockHolders(ctx, h, reqStatus)`** is the write-path analogue of
+  `lockRowsOp.activeLockHolders`: it returns the still-active foreign transactions
+  holding a *pure row lock* (`HEAP_XMAX_LOCK_ONLY`) on tuple `h` whose strength
+  conflicts with a write of `reqStatus`. A single-xid lock-only xmax is decoded via
+  `tupleLockConflicts` (the infomask carries the strength); a multi xmax is resolved
+  through the member store with a **per-member** `StatusesConflict` test (mirroring
+  `Do_MultiXactIdWait` — a `FOR KEY SHARE` member does not block a no-key `UPDATE`
+  even when a `FOR SHARE` member in the same multi does). A real updater (xmax not
+  lock-only) returns nil: that case stays with the `isConcurrentlyUpdated` / EPQ path.
+- **`waitForConflictingRowLock(ctx, rel, blk, slot, reqStatus, pos)`** loops:
+  re-read the header, compute conflicting holders, and `epqWait` on each until none
+  remain. A lock-only xmax never relocates the row, so `blk`/`slot` stay valid across
+  the wait; `epqWait` registers a wait-for-graph edge so a lock cycle surfaces as a
+  `40001` deadlock rather than hanging. Reusing `epqWait` (not a bare `WaitForXID`)
+  keeps the write path's existing deadlock detection.
+
+Why this is needed and why the old mechanism did not suffice: the write path already
+took a statement-scoped lockmgr `ExclusiveLock` (`acquireTupleLock`) on the tuple
+tag, but heavyweight lockmgr locks are released at each `Query` message's end
+([[lockmgr_locks_are_statement_scoped]]), so a **cross-statement** holder has already
+dropped it — the lock never blocks the later write. Cross-statement blocking instead
+rides the persisted lock-only xmax + the holder's transaction, exactly like
+`stampLockInner`'s lock-only wait branch. `acquireTupleLock` is retained (it still
+serialises overlapping in-statement writers and is a no-op cross-statement); the new
+wait is the real cross-statement gate.
+
+Request-status classification (`reqStatus`) is the same signal used to stamp
+`HEAP_KEYS_UPDATED`, so the write classifies itself exactly as the locker decoded it
+([[pattern_sibling_paths_must_agree]]):
+
+- `DELETE` → `StatusUpdate` (conflicts with every strength, incl. `FOR KEY SHARE`).
+- `UPDATE` → `StatusUpdate` when a key column changes (`hotUpdateEligible` is false —
+  `INCLUDE`/covering columns are excluded from a key index's column list, so a no-key
+  `UPDATE` stays no-key), else `StatusNoKeyUpdate` (does **not** conflict with
+  `FOR KEY SHARE`).
+
+Wired at the three live write sites that can encounter a propagated lock:
+`deleteOp.Next` (before the per-victim EPQ/stamp loop), `updateOp.updateViaIndex`
+(top of the per-pending loop), and the `updateOp.Next` seqscan Phase-2 loop. The
+helper short-circuits to a no-op when no foreign lock-only xmax is present, so the
+common no-contention path is unchanged.
+
+Pinned by `TestConflictingRowLockHoldersHonoursStrengthMatrix`
+(`internal/executor/operators_lockrows_test.go`): on a successor carrying a
+propagated `FOR KEY SHARE` lock, `StatusUpdate` (DELETE / key-UPDATE) surfaces the
+active holder (must wait) while `StatusNoKeyUpdate` (no-key UPDATE) surfaces none
+(proceeds), and a rolled-back holder surfaces none. The end-to-end blocking behaviour
+is pinned by `TestPort_IsolationLockUpdateTraversal`, which now **passes** all three
+permutations against PG 18.3 (`s2d1`/`s2d2` emit `<waiting ...>`; `s2d3` runs through).
+The three lockmgr-waiter unit tests (`TestUpdateBlocksOnForeignTupleLock`,
+`TestUpdateViaIndexScanBlocksOnForeignTupleLock`, `TestForShareCompatibleMultipleHolders`)
+were updated to end the holder's *transaction* as the unblock trigger — the faithful
+production gate — rather than a bare statement-scoped lockmgr release.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -675,30 +740,34 @@ verified primitive:
      locking the same tuple must appear as distinct multixact members (the
      `tuplelock-conflict` savepoint permutations); needs the subtransaction xid
      threaded into the producer.
-   - 🟡 **update-chain lock propagation** — split into two halves:
+   - ✅ **update-chain lock propagation** — both halves landed:
      - ✅ **locker half**: `SELECT ... FOR KEY SHARE`/`FOR SHARE` on an
        in-flight-updated row now propagates the lock forward to the successor
        version(s) via `propagateLockForward` / `lockSuccessorVersion`
        (`heap_lock_updated_tuple` analog) — see *Hot-path wiring slice 5* above.
        Pinned by `TestForKeySharePropagatesLockToUpdatedSuccessor`.
-     - ⛔ **write-path half**: the plain `UPDATE`/`DELETE` write path must *wait*
-       on a propagated lock-only holder (resolve active holders via the multixact
-       member store + `WaitForXID`, re-evaluate) respecting the strength matrix.
-       Measured as the **sole** remaining `lock-update-traversal` blocker after
-       slice 5 (s2d2 key-`UPDATE` completes without `<waiting>`); promotes
-       `lock-update-traversal`/`lock-update-delete`/`propagate-lock-delete`.
+     - ✅ **write-path half**: the plain `UPDATE`/`DELETE` write path now *waits*
+       on a propagated lock-only holder (`conflictingRowLockHolders` resolves
+       active holders via the multixact member store; `waitForConflictingRowLock`
+       `epqWait`s on each), respecting the strength matrix — a no-key `UPDATE`
+       proceeds against a `FOR KEY SHARE` holder, a `DELETE`/key-`UPDATE` waits.
+       See *Hot-path wiring slice 6* above. **`lock-update-traversal` now passes**
+       (`TestPort_IsolationLockUpdateTraversal`). `lock-update-delete` /
+       `propagate-lock-delete` remain deferred (they additionally need advisory
+       locks / FK-`INSERT` propagation).
 4. **WAL persistence of multixact members** — the lock-only producer marks the
    page dirty *without* a heap-lock WAL record (the record carries a single
    xid + strength and cannot describe a multi). Lock-only multixact state is
    transient, so losing it on crash recovery is correct; but the
    updater-bearing case and `pg_multixact` SLRU parity need a real record +
    `Store` seeding from `pg_control.nextMulti`.
-5. **Spec promotion** — once 2–4 land as needed, promote the MultiXact-cluster
-   isolation specs (`lock-update-traversal`, `multixact-no-forget`, `nowait-2`,
+5. **Spec promotion** — once 2–4 land as needed, promote the remaining
+   MultiXact-cluster isolation specs (`multixact-no-forget`, `nowait-2`,
    `skip-locked-2`, `propagate-lock-delete`, `tuplelock-conflict`,
    `aborted-keyrevoke`) per the [0118-0001](0118-0001-isolation-spec-port-strategy.md)
    promotion workflow. (`multixact-no-deadlock` / `tuplelock-upgrade-no-deadlock`
    additionally need deadlock detection across the row-lock wait graph.)
+   ✅ **`lock-update-traversal` promoted** (slice 6 write-path half).
 
 Sibling-path discipline applies throughout: the encode (stamp) and decode
 twins must change together — see [[pattern_sibling_paths_must_agree]].

@@ -2361,7 +2361,24 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	// Modification phase: HOT update when eligible, else delete+insert.
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
 	idxTbl := o.plan.Table
+	// M0118-0003 (write-path half): an UPDATE that changes an index *key*
+	// column (hotEligible is false — INCLUDE columns are excluded from a
+	// covering index's key list, so this matches the HEAP_KEYS_UPDATED stamp
+	// below) is a StatusUpdate that conflicts with every lock strength; a no-key
+	// UPDATE is a StatusNoKeyUpdate that does NOT conflict with FOR KEY SHARE.
+	// Classify once so the write-path wait matches how the locker decoded it.
+	updReqStatus := multixact.StatusNoKeyUpdate
+	if !hotEligible {
+		updReqStatus = multixact.StatusUpdate
+	}
 	for _, pu := range pending {
+		// Honour a row lock propagated forward onto this live version by
+		// heap_lock_updated_tuple before writing: wait for every still-active
+		// foreign holder whose strength conflicts with this UPDATE. A lock-only
+		// xmax does not relocate the row, so pu.blk/pu.slot stay valid.
+		if err := waitForConflictingRowLock(o.ctx, rel, pu.blk, pu.slot, updReqStatus, o.plan.Pos()); err != nil {
+			return nil, err
+		}
 		// Fire BEFORE UPDATE trigger if the row has no concurrent xmax (i.e. a
 		// HOT-eligible write or a plain non-concurrent update). When a concurrent
 		// xmax is present (concurrent DELETE / UPDATE in progress), defer the
@@ -3021,7 +3038,28 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		}
 	}
 	hotEligibleSeq := hotUpdateEligible(o.plan, o.ctx)
+	// M0118-0003 (write-path half): classify this UPDATE for the row-lock wait
+	// exactly as updateViaIndex does (key-column change → StatusUpdate, else
+	// StatusNoKeyUpdate), so a propagated FOR KEY SHARE lock blocks a key-UPDATE
+	// but not a no-key UPDATE — the same hotEligible signal that stamps
+	// HEAP_KEYS_UPDATED. INCLUDE columns are excluded from a covering index's
+	// key list, so a no-key UPDATE stays no-key here.
+	updReqStatusSeq := multixact.StatusNoKeyUpdate
+	if !hotEligibleSeq {
+		updReqStatusSeq = multixact.StatusUpdate
+	}
 	for _, pu := range pending {
+		// Honour a row lock propagated forward onto this live version by
+		// heap_lock_updated_tuple before writing: wait for every still-active
+		// conflicting foreign holder. A lock-only xmax does not relocate the
+		// row, so pu.blk/pu.slot stay valid.
+		puWaitRel := pu.rel
+		if puWaitRel == (storage.RelFileNode{}) {
+			puWaitRel = rel
+		}
+		if err := waitForConflictingRowLock(o.ctx, puWaitRel, pu.blk, pu.slot, updReqStatusSeq, o.plan.Pos()); err != nil {
+			return nil, err
+		}
 		// Fire BEFORE UPDATE triggers (e.g. RAISE NOTICE) before writing.
 		// M0100-0005o: when the row came from a partition/inheritance child,
 		// fire that child's triggers — partition-key-update-1.spec defines
@@ -3628,6 +3666,16 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		victimRel := v.rel
 		if victimRel == (storage.RelFileNode{}) {
 			victimRel = rel // fallback to parent rel
+		}
+		// M0118-0003 (write-path half): honour a row lock propagated forward
+		// onto this live version by heap_lock_updated_tuple. A DELETE conflicts
+		// with every lock strength incl. FOR KEY SHARE, so wait for every
+		// still-active foreign holder before stamping our xmax. The lock-only
+		// xmax does not relocate the row, so v.blk/v.slot stay valid; a genuine
+		// concurrent updater is handled by the isConcurrentlyUpdated EPQ loop
+		// below (this only covers pure row locks the lockmgr already released).
+		if err := waitForConflictingRowLock(o.ctx, victimRel, v.blk, v.slot, multixact.StatusUpdate, o.plan.Pos()); err != nil {
+			return nil, err
 		}
 		// EvalPlanQual retry loop (M0098-0004): on concurrent xmax conflict,
 		// wait for the conflicting transaction and re-check visibility.
@@ -4569,6 +4617,105 @@ func lockedByForeign(h storage.HeapTupleHeader, currentXID storage.TransactionID
 		return h.Xmax
 	}
 	return storage.InvalidTransactionID
+}
+
+// conflictingRowLockHolders returns the still-active foreign transactions that
+// hold a row-level *lock* on tuple h whose strength conflicts with a write of
+// the given request status. It is the write-path analogue of
+// lockRowsOp.activeLockHolders: heap_lock_updated_tuple propagates a row lock
+// forward onto the live version of an updated tuple (the locker half of
+// M0118-0003, propagateLockForward), so a plain UPDATE / DELETE must honour
+// that lock across statements. The lockmgr tuple tag is statement-scoped
+// (ReleaseAll at each Query message's end), so a cross-statement holder has
+// already dropped it — cross-statement blocking instead rides this persisted
+// lock-only xmax, the same durable signal stampLockInner's wait branch reads.
+//
+// reqStatus is StatusUpdate for a DELETE or a key-column UPDATE (conflicts with
+// every lock strength incl. FOR KEY SHARE) and StatusNoKeyUpdate for a no-key
+// UPDATE (does NOT conflict with FOR KEY SHARE). Returns nil when the tuple
+// carries no foreign lock-only xmax, when the held strength does not conflict,
+// or when no naming holder is still active (the lock was already released).
+//
+// GOTCHA: a MultiXactId and a TransactionID share the uint32 space and
+// HEAP_XMAX_IS_MULTI is the only disambiguator, so a multi xmax is resolved
+// through the member store and never handed to IsXIDActive directly. A real
+// updater/deleter (xmax not lock-only) is left to the isConcurrentlyUpdated /
+// EPQ path; this helper only covers pure row locks.
+func conflictingRowLockHolders(ctx *Context, h storage.HeapTupleHeader, reqStatus multixact.Status) []storage.TransactionID {
+	if ctx.TxnMgr == nil {
+		return nil
+	}
+	if h.Xmax == storage.InvalidTransactionID || h.Xmax == ctx.Tx.XID {
+		return nil
+	}
+	if !storage.IsHeapTupleLockOnly(h.Infomask) {
+		return nil
+	}
+	if storage.IsHeapTupleXmaxMulti(h.Infomask) {
+		if ctx.MultiXact == nil {
+			return nil
+		}
+		members, ok := ctx.MultiXact.Members(multixact.MultiXactId(h.Xmax))
+		if !ok {
+			return nil
+		}
+		var out []storage.TransactionID
+		for _, m := range members {
+			// Per-member conflict: a FOR KEY SHARE member does not block a
+			// no-key UPDATE even when a FOR SHARE member in the same multi
+			// does, so we wait only on the members we actually conflict with
+			// (mirrors Do_MultiXactIdWait's per-member DoLockModesConflict).
+			if m.Xid != ctx.Tx.XID && ctx.TxnMgr.IsXIDActive(m.Xid) &&
+				multixact.StatusesConflict(m.Status, reqStatus) {
+				out = append(out, m.Xid)
+			}
+		}
+		return out
+	}
+	// Single-holder lock-only xmax: the strength lives in the infomask bits.
+	if !tupleLockConflicts(reqStatus, h.Infomask, h.Infomask2) {
+		return nil
+	}
+	if ctx.TxnMgr.IsXIDActive(h.Xmax) {
+		return []storage.TransactionID{h.Xmax}
+	}
+	return nil
+}
+
+// waitForConflictingRowLock blocks the current write until no still-active
+// foreign transaction holds a conflicting row lock on (rel,blk,slot). It is the
+// write-path counterpart to the lock-only wait branch in stampLockInner: a row
+// lock propagated forward by heap_lock_updated_tuple onto a live version must
+// stall a conflicting UPDATE / DELETE until the holder commits or aborts (the
+// heap_update / heap_delete MultiXactIdWait / XactLockTableWait step). A
+// lock-only xmax never relocates the row, so blk/slot stay valid across the
+// wait; a genuine concurrent updater is still handled by the caller's EPQ loop.
+// Each holder is waited on via epqWait, which registers a wait-for-graph edge,
+// so a lock cycle surfaces as a 40001 deadlock rather than hanging.
+func waitForConflictingRowLock(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16, reqStatus multixact.Status, pos int) error {
+	for {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return err
+		}
+		s.RLock()
+		tup, gerr := storage.PageGetHeapTuple(s.Page(), slot)
+		var holders []storage.TransactionID
+		if gerr == nil {
+			holders = conflictingRowLockHolders(ctx, tup.Header, reqStatus)
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		if len(holders) == 0 {
+			return nil
+		}
+		for _, hx := range holders {
+			if epqWait(ctx, hx) {
+				return &ExecError{Code: "40001", Pos: pos,
+					Message: "could not serialize access due to concurrent update (deadlock)"}
+			}
+		}
+	}
 }
 
 // encodeIndexKeyFromCols builds a btree key for an index by looking up
