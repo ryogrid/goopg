@@ -93,12 +93,42 @@ func (lm *LockManager) ReleaseAll(b BackendID)
 
 1. Take `lm.mu`.
 2. If `t` has no `LockState`, install a fresh one, grant `m` to `b`, return.
-3. If `LockCheckConflicts(m, granted_minus_self)` is clear (no
-   conflict), grant `m` to `b`, update `granted`, return.
-4. Otherwise enqueue a `Waiter{b, m, signal}` at the tail.
-5. Drop `lm.mu`. Block on `<-signal` (cancellable via `ctx`).
-6. On wakeup, the waiter has been promoted to a holder by the releaser;
+3. If `b` already holds exactly `m`, it's a no-op — return.
+4. If `canGrantImmediately(b, m)` is true, grant `m` to `b`, update
+   `granted`, return. This covers two cases (see below): the plain
+   no-waiter immediate grant, and the early grant ahead of a waiter.
+5. Otherwise enqueue a `Waiter{b, m, signal}` at the tail.
+6. Drop `lm.mu`. Block on `<-signal` (cancellable via `ctx`).
+7. On wakeup, the waiter has been promoted to a holder by the releaser;
    return.
+
+`TryAcquire` (the NOWAIT variant) is steps 1–4 verbatim, returning
+`ErrLockNotAvailable` instead of enqueuing at step 5.
+
+### Immediate-grant policy (`canGrantImmediately`)
+
+A request for mode `m` by backend `b` is granted without blocking when
+either upstream case holds:
+
+1. **Plain immediate grant** — there are no queued waiters and `m` does
+   not conflict with `granted_minus_self(b)`. The no-waiter precondition
+   enforces strict head-of-line FIFO so a stream of
+   compatible-with-current-holders newcomers can't starve a strong
+   waiter (mirrors `LockAcquireExtended`'s grant in `lock.c`).
+2. **Early grant ahead of a waiter** — `b` *already holds* a lock on `t`
+   (`myHeldLocks != 0`) and would be inserted *ahead of* a waiter whose
+   requested mode conflicts with what `b` already holds; and `m`
+   conflicts with neither the modes of waiters ahead of that insertion
+   point nor any other backend's current holdings. This is the "special
+   case" early grant in `JoinWaitQueue` (`proc.c`): it lets a backend
+   that already holds, say, `AccessExclusiveLock` take a weaker
+   self-compatible mode immediately even while a conflicting
+   `ExclusiveLock` waiter is parked ahead of it (the upstream
+   `lock-nowait` isolation spec). The deadlock sub-case from upstream
+   (the ahead waiter *holds* a lock conflicting with `m`) is subsumed by
+   the `granted_minus_self` conflict check: that holder's mode is in the
+   "others" mask, so the request simply declines and falls through to
+   the normal wait path / deadlock detector. M0118-0003.
 
 **Release algorithm:**
 
@@ -181,3 +211,11 @@ Unit tests in this slice exercise the core surface only:
   waiters for the same conflicting mode)
 - `TestLockConflictMatrixMatchesUpstream` (exhaustive 8x8 check
   against the table from postgres/src/backend/storage/lmgr/lock.c)
+- `TestLockManagerEarlyGrantAheadOfWaiter` (M0118-0003 — backend
+  already holding `AccessExclusiveLock` takes `ShareRowExclusiveLock`
+  NOWAIT immediately while a conflicting `ExclusiveLock` waiter is
+  parked; a third backend holding nothing still fails fast — pins the
+  `JoinWaitQueue` early-grant special case)
+- `TestParseModeRoundTrip` (M0118-0003 — `ParseMode` is the inverse of
+  `Mode.String()` across all 8 modes and rejects unknown names; the SQL
+  `LOCK TABLE` parser emits exactly these canonical names)

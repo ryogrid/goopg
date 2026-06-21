@@ -11919,6 +11919,15 @@ func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
 // (a) for views: all tables/views referenced by the view's body;
 // (b) for tables: all inheritance children.
 // This mirrors PostgreSQL's behaviour for LOCK TABLE. M0097.
+//
+// NB: this records locks in the in-memory registry (pg_locks visibility)
+// only — it does NOT yet acquire real heavyweight locks via the lock
+// manager, so a conflicting LOCK TABLE in another session does not block.
+// Real transaction-scoped table locking is deferred (see the lock-nowait
+// resume point in .ralph/deferral_ledger.md): the lockmgr early-grant
+// primitive it needs has landed (M0118-0003), but lockmgr locks are
+// currently statement-scoped (released per Query message in dispatch.go)
+// whereas LOCK TABLE must hold until COMMIT.
 func lockRelationTransitively(sess Session, dbOID uint32, mode string, tbl *catalog.Table, cat catalog.Catalog, visited map[uint32]bool) {
 	if visited[tbl.OID] {
 		return
