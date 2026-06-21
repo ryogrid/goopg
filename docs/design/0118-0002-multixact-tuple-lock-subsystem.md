@@ -695,6 +695,46 @@ wakeup it locks the originally-visible version rather than EvalPlanQual-followin
 chain. `TestPort_IsolationLockUpdateDelete` is added as a deferred SKIP guard that
 will auto-promote once (A)+(B) land.
 
+### Hot-path wiring slice 8: isolation-runner session-setup result printing (`lock-update-delete` divergence (A))
+
+Divergence (A) above is a faithfulness gap in the **test harness**, not the
+engine. PostgreSQL's `isolationtester.c` (`run_permutation`, lines 534-569) runs
+the global `setup {}` block on the control connection and each session's `setup
+{}` block on its own connection at the **top of every permutation**, and prints a
+block's result set whenever its final command returns tuples
+(`PQresultStatus == PGRES_TUPLES_OK`); `COMMAND_OK` setups (`BEGIN`/`SET`/`INSERT`
+/DDL) print nothing. `libpq`'s `PQexec` yields only the *last* result of a
+multi-statement string, so `BEGIN; SELECT * FROM force_snapshot;` prints just the
+`SELECT`.
+
+goopg's `IsolationRunner.runPermutation` ran the per-session setup via the
+non-capturing `execConn` and wrote the `starting permutation:` header *after*
+the setup loop, so a tuple-returning setup like `s2`'s `SELECT pg_advisory_lock(0)`
+was executed (side effect taken — the advisory gate is held) but its one-row
+result was silently dropped. The fix (`internal/testport/framework/isolation_runner.go`):
+
+- emit the `starting permutation:` header **before** the per-session setup loop
+  (so any captured setup output lands directly beneath it, matching PG order);
+- keep the goopg-only `SET application_name` (PG never runs it) uncaptured via
+  `execConn`;
+- run the spec's setup block through a new `execConnSetupCapture`, which reuses
+  `execStep` (same statements, same side effects — just capturing rows) and
+  formats the **last** row-bearing result with `pqprintFormat`, returning empty
+  for `COMMAND_OK`-only blocks. Output is written in session order.
+
+This is faithful for every in-scope spec with a tuple-returning session setup —
+`lock-update-delete` (`SELECT pg_advisory_lock(0)`), `plpgsql-toast`
+(`SELECT pg_advisory_unlock_all()`), `prepared-transactions`
+(`BEGIN …; SELECT * FROM force_snapshot;` → prints the `SELECT`; the
+`INSERT`-only session prints nothing), `temp-schema-cleanup` (ends in `INSERT
+… SELECT` → prints nothing) — and a no-op for every currently-passing spec
+(none has a row-returning session setup, so output stays byte-identical;
+re-verified `lock-committed-keyupdate` / `insert-conflict-do-update` / `nowait` /
+`lock-update-traversal` still pass). The `pg_advisory_lock` block now appears
+atop all twelve `lock-update-delete` permutations; the residual diff is purely
+divergence (B). Global-setup result printing (PG control-connection, `setupsqls[]`)
+is left unchanged — no in-scope spec has a tuple-returning global setup.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -824,14 +864,15 @@ verified primitive:
        `TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary` /
        `TestSyntax_AdvisoryLock_ReleasedOnDisconnect`.
      - ⏳ **`lock-update-delete` output match (DEFERRED)**: with the hang gone the
-       spec runs all twelve permutations, but two divergences remain (ledger
-       2026-06-21): (A) the isolation runner omits the session-`setup`
-       `pg_advisory_lock(0)` result block; (B) on unblocking, `s1l` returns the
-       stale pre-update row immediately instead of re-traversing the chain and
+       spec runs all twelve permutations. Divergence (A) is now **fixed** — the
+       isolation runner prints the session-`setup` `pg_advisory_lock(0)` result
+       block atop each permutation (see *Hot-path wiring slice 8* above; ledger
+       2026-06-21). **Only divergence (B) remains**: on unblocking, `s1l` returns
+       the stale pre-update row immediately instead of re-traversing the chain and
        waiting on `s2`'s in-flight `DELETE`/key-`UPDATE` (READ COMMITTED
-       blocked-then-woken-locker re-evaluation gap). `TestPort_IsolationLockUpdateDelete`
-       is a deferred SKIP guard. `propagate-lock-delete` additionally needs
-       FK-`INSERT` propagation.
+       blocked-then-woken-locker re-evaluation gap — the `lockRowsOp` wakeup path).
+       `TestPort_IsolationLockUpdateDelete` is a deferred SKIP guard.
+       `propagate-lock-delete` additionally needs FK-`INSERT` propagation.
 4. **WAL persistence of multixact members** — the lock-only producer marks the
    page dirty *without* a heap-lock WAL record (the record carries a single
    xid + strength and cannot describe a multi). Lock-only multixact state is

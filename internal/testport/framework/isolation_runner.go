@@ -290,22 +290,34 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 	}
 	specBase = strings.TrimSuffix(specBase, ".spec")
 
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "starting permutation: %s\n", strings.Join(perm, " "))
+
 	// Per-session setup: set application_name first so pg_locks queries
 	// filtered by application_name can identify sessions. M0100-0006b.
+	//
+	// PostgreSQL isolationtester.c (run_permutation) prints a per-session
+	// setup block's result set at the top of every permutation — right after
+	// the "starting permutation:" line — when the block's final command returns
+	// tuples (PGRES_TUPLES_OK). e.g. lock-update-delete's s2 setup runs
+	// `SELECT pg_advisory_lock(0)` and PG emits its one-row result before any
+	// step. COMMAND_OK setups (BEGIN/SET/INSERT) print nothing. We mirror this:
+	// the SET application_name (a goopg-only addition PG never runs) is executed
+	// uncaptured, then the spec's setup block is run with output captured and
+	// emitted in session order. M0118-0003.
 	for _, sname := range sessionNames {
 		appName := "isolation/" + specBase + "/" + sname
 		if err := execConn(ctx, conns[sname], "SET application_name = '"+appName+"'"); err != nil {
 			return "", fmt.Errorf("session %q set application_name: %w", sname, err)
 		}
 		if setupSQL, ok := spec.SessionSetup[sname]; ok && setupSQL != "" {
-			if err := execConn(ctx, conns[sname], setupSQL); err != nil {
-				return "", fmt.Errorf("session %q setup: %w", sname, err)
+			out, errText := execConnSetupCapture(ctx, conns[sname], setupSQL)
+			if errText != "" {
+				return "", fmt.Errorf("session %q setup: %s", sname, errText)
 			}
+			sb.WriteString(out)
 		}
 	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "starting permutation: %s\n", strings.Join(perm, " "))
 
 	var pending []pendingStep
 
@@ -985,6 +997,31 @@ func execConnCapture(ctx context.Context, conn *sql.Conn, sqlText string) string
 		return ""
 	}
 	return pqprintFormat(rs.rows[0], rs.rows[1:], rs.colTypes)
+}
+
+// execConnSetupCapture runs a per-session (or global) setup block and returns
+// the result-set text PostgreSQL's isolationtester would print for it, plus any
+// error text. Mirrors isolationtester.c run_permutation: a setup is one PQexec
+// whose result is printed only when the final command returns tuples
+// (PGRES_TUPLES_OK); COMMAND_OK setups (BEGIN/SET/INSERT/DDL) print nothing.
+// libpq's PQexec yields only the final result of a multi-statement string, so
+// when a block runs several statements we format the LAST row-bearing result
+// (e.g. `BEGIN; SELECT * FROM force_snapshot;` prints the SELECT). Side effects
+// (advisory-lock acquisition, opened transaction) occur exactly as with the
+// uncaptured path — execStep runs the same statements, just capturing rows.
+func execConnSetupCapture(ctx context.Context, conn *sql.Conn, sqlText string) (string, string) {
+	outcome := execStep(ctx, conn, sqlText, "")
+	if outcome.errText != "" {
+		return "", outcome.errText
+	}
+	if len(outcome.results) == 0 {
+		return "", ""
+	}
+	rs := outcome.results[len(outcome.results)-1]
+	if len(rs.rows) == 0 || len(rs.rows[0]) == 0 {
+		return "", ""
+	}
+	return pqprintFormat(rs.rows[0], rs.rows[1:], rs.colTypes), ""
 }
 
 // formatPQError formats a database error as isolationtester would print it.

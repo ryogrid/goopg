@@ -1,55 +1,47 @@
-Task: M0118-0003 — LANDED the ADVISORY-LOCK OWNER-IDENTITY ENABLER (resume point
-#3, lock-update-delete). This loop (#54) validated + completed the prior loop's
-interrupted WIP (it died at api_limit 18:57 mid-task, uncommitted). The advisory-
-lock infinite hang in lock-update-delete is GONE; the spec now runs all 12 perms
-to completion. lock-update-delete is NOT yet promoted (output still diverges).
+Task: M0118-0003 — LANDED lock-update-delete divergence (A): isolation-runner
+session-setup result printing (slice 8). This loop closed the output-format half
+of the lock-update-delete promotion. Spec is NOT yet promoted — divergence (B)
+remains. (A)+(B) were both blockers; only (B) is left now.
 
-DONE this loop (#54):
-- advisory.go: advisorySessionIDFromContext now PREFERS the per-connection
-  AdvisorySessionIdentity (*config.SessionRegistry, stable whole-connection) over
-  ctx.Session (*BasicSession, nil before first BEGIN). + NEW ReleaseAllAdvisoryLocks
-  (releaseAll, both scopes) for backend teardown (PG frees all advisory at exit).
-- conn_tx.go: NEW connTxState.AdvisoryID field; End() releases xact advisory under
-  it (=sess) not c.sess. server.go: connTx.AdvisoryID=sess + defer ReleaseAllAdvisoryLocks(sess).
-  dispatch.go/dispatch_extended.go: release-target order inverted to prefer
-  AdvisorySessionIdentity (match acquire). 5 sibling sites all key on per-conn sess.
-- FIXED a WIP test bug: TestSyntax_AdvisoryLock_ReleasedOnDisconnect asserted on
-  pg_advisory_lock(7)'s return — but pg_advisory_lock() returns VOID (only
-  pg_try_advisory_lock returns bool) → changed to ExecContext.
-- Tests: TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary +
-  ...ReleasedOnDisconnect PASS; TestPort_IsolationLockUpdateDelete added as
-  deferred SKIP guard. Design 0118-0002 slice 7 + resume-#3 + README index. Ledger row.
+DONE this loop:
+- internal/testport/framework/isolation_runner.go: runPermutation now writes the
+  `starting permutation:` header BEFORE the per-session setup loop, and runs each
+  session's `setup` block via NEW `execConnSetupCapture` (reuses execStep — same
+  statements/side effects, captures rows — formats the LAST row-bearing result via
+  pqprintFormat; empty for COMMAND_OK-only blocks). Mirrors isolationtester.c
+  run_permutation (PGRES_TUPLES_OK → printResultSet, lines 534-569). SET
+  application_name stays uncaptured via execConn (goopg-only, PG never runs it).
+- Result: lock-update-delete's `pg_advisory_lock(0)` setup block now prints atop
+  all 12 perms; diff dropped from (A)+(B) to ONLY (B).
+- Design 0118-0002 slice 8 + resume-#3 status (A→fixed) + README index. Ledger row.
 
-GATES (all PASS): go build ./...; go vet executor/server; executor+server unit
-suites; -race server; all TestSyntax_Advisory* (pre-existing AutoCommit ownership
-tests included — NO regression); the 2 new syntax tests PASS. gofmt: fixed NEW
-issues in server.go (trailing-comment realign from my longer connTx line) + test
-file (blank line); advisory.go stays gofmt-dirty = PRE-EXISTING go1.25/1.26
-advisoryManager struct-comment artifact (do NOT gofmt -w it). NOTE: cleaned a STALE
-orphan goopg server in goopg-test.scope (tmp/lud-data, 18:53, from the interrupted
-loop) before tests — systemctl --user stop goopg-test.scope. tpch-spotcheck not
-triggered (advisory path never fires in pgbench/TPC-H). DO NOT stage: postgres,
-weekly_loc.*, requirements.txt, weekkly_loc_history.py.
+GATES (all PASS): go build ./internal/testport/...; go vet framework; gofmt clean;
+framework unit tests; TestPort_IsolationLockUpdateDelete (skips on B, setup block
+matches); regression batch TestPort_Isolation{LockCommittedKeyupdate,InsertConflict
+DoUpdate,Nowait,LockUpdateTraversal} all PASS (byte-identical — no passing spec has
+a row-returning session setup). tpch-spotcheck not triggered (test-only pkg, no
+executor/codec change; also INFRA-BLOCKED). DO NOT stage: postgres, weekly_loc.*,
+requirements.txt, weekkly_loc_history.py.
 
->>> NEXT STEP (resume point #3 — promote lock-update-delete to pass): fix the TWO
-    remaining output divergences (TestPort_IsolationLockUpdateDelete, deferred):
-    (A) [output-format] goopg's isolation_runner omits the session-`setup`
-        pg_advisory_lock(0) result block that PG prints atop each permutation.
-    (B) [LOAD-BEARING, deep] when s1l unblocks at s2_unlock it returns the STALE
-        pre-update (1,1) row immediately instead of re-traversing the update chain
-        s2 built while s1l was parked and WAITING on s2's in-flight DELETE/key-UPDATE
-        (PG keeps s1l <waiting ...> until s2c, then (0 rows)). This is the READ
-        COMMITTED blocked-then-woken FOR KEY SHARE locker re-evaluation gap: s1l
-        took its snapshot before s2u; on wakeup it must re-fetch the latest version
-        via t_ctid (EPQ) and waitForConflictingRowLock/EPQ-wait on the in-flight
-        deleter. This is the lockRowsOp WAKEUP path (slice 6 already did the write
-        side). Bound it — M0072-0002 hang precedent. Then savepoint/subxact members,
-        WAL/pg_multixact persistence, then remaining spec promotion.
+>>> NEXT STEP (resume point #3 — promote lock-update-delete): fix divergence (B),
+    the ONLY remaining blocker. It is the lockRowsOp BLOCKED-THEN-WOKEN-LOCKER
+    re-evaluation gap (executor, NOT the test harness). When s1l unblocks at
+    s2_unlock under READ COMMITTED it locks+returns the stale originally-visible
+    (1,1) row immediately, instead of EvalPlanQual-following t_ctid to the latest
+    version and — for blocker1 (DELETE) / blocker2 (key-UPDATE) — WAITING on s2's
+    in-flight deleter until s2c, then returning (0 rows). blocker3 (no-key UPDATE)
+    already matches PG: (1,1) immediately at s2_unlock (KEY SHARE compatible, no
+    wait). So the fix is ONLY the wait+re-traverse path for conflicting blockers,
+    in the lockRowsOp Next/stampLock WAKEUP (slice 6 did the write-path side; this
+    is the locker-side wakeup — operators_lockrows.go: Next/stampLock/stampLockInner
+    /epqRecheckFilter/refetchRow/propagateLockForward). BOUND the wait (M0072-0002
+    hang precedent). Then savepoint/subxact members, WAL/pg_multixact persistence,
+    remaining MultiXact-cluster spec promotion.
 
-GOTCHAS: pg_advisory_lock() returns VOID; pg_try_advisory_lock returns bool. The 5
-advisory identity sites must ALL key on the per-connection *config.SessionRegistry
-(sess) — acquire (advisorySessionIDFromContext→AdvisorySessionIdentity), 2 per-stmt
-xact releases (dispatch*), End() (AdvisoryID), teardown (ReleaseAllAdvisoryLocks),
-pg_advisory_unlock_all (advisorySessionIDFromContext). ctx.Session flips nil→non-nil
-at first BEGIN — never key advisory ownership on it. lockmgr locks statement-scoped
-([[lockmgr_locks_are_statement_scoped]]).
+GOTCHAS: only 4 specs have tuple-returning session setups (lock-update-delete +
+deferred plpgsql-toast/prepared-transactions/temp-schema-cleanup) — passing specs
+are byte-identical under the new capture. PQexec prints only the LAST result of a
+multi-statement setup → execConnSetupCapture takes results[last]. Global-setup
+result printing (RunSpec, control conn) left unchanged — no in-scope spec needs it.
+lockmgr locks statement-scoped ([[lockmgr_locks_are_statement_scoped]]); the
+cross-statement gate is WaitForXID / waitForConflictingRowLock, not lockmgr.
