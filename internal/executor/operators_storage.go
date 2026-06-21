@@ -397,6 +397,24 @@ type epqChainResult struct {
 	ok   bool
 }
 
+// isChainTailCTID reports whether ctid is a t_ctid chain-tail sentinel — i.e.
+// there is no live successor version to follow from (curBlk, curSlot). True
+// when ctid:
+//   - has an invalid block number (no successor was ever stamped), or
+//   - has a zero offset (goopg's initial CTID is {InvalidBlockNumber,0}; a
+//     DELETE leaves it untouched, so a deleted-but-never-updated row reports
+//     a tail here), or
+//   - points at (curBlk, curSlot) itself (the latest version self-CTID).
+//
+// Shared by epqFollowChainFull (EPQ chain walk) and lockRowsOp.stampLockInner
+// (FOR UPDATE/SHARE chain-follow after a committed updater) so both sibling
+// paths terminate identically; following a sentinel CTID would Pin a
+// non-existent block and surface storage.ErrShortRead.
+func isChainTailCTID(ctid storage.ItemPointer, curBlk storage.BlockNumber, curSlot uint16) bool {
+	return ctid.Block == storage.InvalidBlockNumber || ctid.Offset == 0 ||
+		(ctid.Block == curBlk && ctid.Offset == curSlot)
+}
+
 // epqFollowChainFull walks the t_ctid chain and returns the live successor row.
 // movedPart is true if the chain ended because of a moved-partition sentinel.
 // origSnap, if non-nil, is used temporarily for predicate evaluation so that
@@ -426,8 +444,7 @@ func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.Block
 		// Chain terminates when CTID is invalid (no successor stamped) or
 		// points at self (latest version sentinel). At the tail, evaluate
 		// visibility + predicate against this tuple.
-		atTail := ctid.Block == storage.InvalidBlockNumber || ctid.Offset == 0 ||
-			(ctid.Block == curBlk && ctid.Offset == curSlot)
+		atTail := isChainTailCTID(ctid, curBlk, curSlot)
 		if atTail {
 			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.MultiXact) {
 				return rel, epqChainResult{}, false

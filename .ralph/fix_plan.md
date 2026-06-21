@@ -163,11 +163,20 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       design 0118-0006) + `multixact-no-deadlock` (re-acquiring a self-held row
       lock; NO new engine work — conflict-gate-before-wait in stampLockInner +
       self-filtering in activeLockHolders/stampMultiLock/MembersConflict already
-      hold the invariant; design 0118-0007). **Remaining:** `deadlock-parallel`
-      (lock groups / parallel workers), `tuplelock-upgrade-no-deadlock` (row-lock
-      upgrade retry algorithm across many permutations). Resume at
-      `tuplelock-upgrade-no-deadlock` (likely also no-engine or small-engine;
-      `deadlock-parallel` needs a lock-group abstraction goopg lacks — defer).
+      hold the invariant; design 0118-0007) + `tuplelock-upgrade-no-deadlock`
+      **PARTIAL** (design 0118-0008): fixed an `ERROR: short read at block` crash
+      on a committed-DELETE re-fetch (`stampLockInner` followed a goopg DELETE's
+      `{InvalidBlockNumber,0}` initial CTID into a non-existent block; extracted
+      shared `isChainTailCTID` helper used by both `epqFollowChainFull` and the
+      row-lock path; deleted row now `epqSkipped` → `(0 rows)`). **Remaining
+      (deferred):** (a) `tuplelock-upgrade-no-deadlock` is NOT promoted — the
+      "likely no-engine" guess was WRONG. Two failures remain: wait-queue upgrade
+      priority (perms 2,3 — existing key-share holder `s3` upgrading must wake
+      before pure waiter `s2`; goopg wakes `s2` first; `stampLockInner` committed-
+      updater branch ~L719 ignores a multixact xmax that carries updater+lockers)
+      and a savepoint-driven lock-retry deadlock (perm 9 `s1_fornokeyupd` times
+      out). Both are deeper multixact-with-updater wait-ordering work.
+      (b) `deadlock-parallel` needs a lock-group abstraction goopg lacks — defer.
 - [ ] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,
       temporal-range-integrity.

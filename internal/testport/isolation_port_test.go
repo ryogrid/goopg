@@ -946,6 +946,25 @@ func TestPort_IsolationMultixactNoDeadlock(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/multixact-no-deadlock.spec")
 }
 
+// TestPort_IsolationTuplelockUpgradeNoDeadlock exercises the
+// tuplelock-upgrade-no-deadlock spec: multiple sessions take row-level locks of
+// varying strength (FOR KEY SHARE / FOR SHARE / FOR NO KEY UPDATE / FOR UPDATE /
+// UPDATE / DELETE) on a single row across 9 permutations. It verifies that a
+// session upgrading its already-held row lock while others wait does NOT
+// deadlock, that sessions which do not upgrade acquire the lock in arrival
+// order, and that the heap_lock_tuple algorithm correctly retries (re-evaluates
+// the tuple lock after initially avoiding a deadlock) when an intervening
+// rollback-to-savepoint changes the multixact membership. Rides the row-lock
+// xmax / WaitForXID path (stampLockInner / tupleLockConflicts / multixact
+// membership), not the heavyweight lockmgr. M0118-0004.
+func TestPort_IsolationTuplelockUpgradeNoDeadlock(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_tuplelock_upgrade_no_deadlock")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

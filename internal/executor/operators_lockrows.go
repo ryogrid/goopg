@@ -848,9 +848,20 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 			}
 		}
 		next := ctid
-		if next.Block == ptr.Block && next.Offset == ptr.Offset {
-			// CTID points to self — deleted row, no live successor.
-			return storage.ItemPointer{}, false, false, nil
+		// No live successor when CTID is a chain-tail sentinel: self-pointing
+		// (the latest version), an invalid block, or a zero offset. A goopg
+		// DELETE leaves the original {InvalidBlockNumber,0} initial CTID in
+		// place (only UPDATE rewrites it via stampOldCtid), so a committed
+		// DELETE of a never-updated row reaches here with next.Block ==
+		// InvalidBlockNumber — following it would Pin a non-existent block and
+		// surface ErrShortRead. isChainTailCTID is the same test used by
+		// epqFollowChainFull. The committed updater deleted the row, so signal
+		// epqSkipped=true: the caller (drainAndStamp) drops the row rather than
+		// yielding the stale pre-delete version, matching PG's EvalPlanQual
+		// returning no tuple.
+		if isChainTailCTID(next, ptr.Block, ptr.Offset) {
+			// Chain-tail sentinel — deleted row, no live successor.
+			return storage.ItemPointer{}, false, true, nil // epqSkipped
 		}
 		// Acquire lockmgr lock on the successor before reading it.
 		if err := o.ctx.acquireTupleLock(rel, next, o.tupleLockMode()); err != nil {
