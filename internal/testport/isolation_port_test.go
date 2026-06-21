@@ -898,6 +898,38 @@ func TestPort_IsolationDeadlockHard(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/deadlock-hard.spec")
 }
 
+// TestPort_IsolationDeadlockSoft exercises the deadlock-soft spec: four
+// sessions form a 4-cycle with two hard edges (e1→d1, e2→d2: an
+// ACCESS EXCLUSIVE waiter behind an ACCESS SHARE holder) and two soft edges
+// (d2→e1, d1→e2: an ACCESS SHARE waiter queued behind a conflicting
+// ACCESS EXCLUSIVE waiter). Because the cycle contains soft edges, the
+// detector resolves it by REORDERING a wait queue (moving d1 ahead of e2 on
+// a2) rather than aborting anyone — d1 is granted immediately and nobody
+// fails. Exercises soft-deadlock wait-queue rearrangement (deadlock.c
+// TopoSort / ExpandConstraints). M0118-0004.
+func TestPort_IsolationDeadlockSoft(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_deadlock_soft")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/deadlock-soft.spec")
+}
+
+// TestPort_IsolationDeadlockSoft2 exercises the deadlock-soft-2 spec: the
+// blocked session s1 must jump over BOTH s3 and s4 (which are hard-blocked on
+// a2's ACCESS EXCLUSIVE request behind s2's ACCESS SHARE) and acquire its
+// SHARE UPDATE EXCLUSIVE lock on a2 immediately, since s1's request does not
+// conflict with the holder. This requires the soft-deadlock resolver to
+// topologically reorder a multi-waiter queue (s1 ahead of s3, s4) instead of
+// aborting. M0118-0004.
+func TestPort_IsolationDeadlockSoft2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_deadlock_soft2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/deadlock-soft-2.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()
