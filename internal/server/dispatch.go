@@ -305,10 +305,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// use it when calling planner.Plan for internal validation. M0097-0022.
 		ectx.PlanCatalog = sessionPlanCatalog(sess, s.cfg.Catalog)
 	}
-	if ectx.Session != nil {
-		advisoryReleaseTarget = ectx.Session
-	} else if ectx.AdvisorySessionIdentity != nil {
+	// Match advisorySessionIDFromContext's preference order: the per-connection
+	// AdvisorySessionIdentity (SessionRegistry) is the stable advisory owner, so
+	// xact-scoped advisory locks must be released under THAT identity at txn end
+	// — not the BasicSession, which is nil before the first BEGIN. M0118-0003.
+	if ectx.AdvisorySessionIdentity != nil {
 		advisoryReleaseTarget = ectx.AdvisorySessionIdentity
+	} else if ectx.Session != nil {
+		advisoryReleaseTarget = ectx.Session
 	}
 	ectx.EnableOpportunisticPrune = sessionOpportunisticPrune(sess)
 	ectx.FSM = s.cfg.FSM

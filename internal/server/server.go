@@ -1086,9 +1086,18 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 	// reused across all transactions on this connection; Begin clears and
 	// re-initialises it on each new transaction.
 	procNum := int32((pid - 1) % uint32(mvcc.DefaultProcArraySize))
-	extended.ProcNum = procNum                                                 // thread through to executeExtendedQueryViaExecutor
-	extended.DBName = dbName                                                   // scopes pg_extension per database (M0110-0003 gap #7c)
-	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum, DBName: dbName} // per-connection explicit transaction state (M0096-0005); DBName scopes pg_extension (M0110-0003 gap #7c)
+	extended.ProcNum = procNum                                                                   // thread through to executeExtendedQueryViaExecutor
+	extended.DBName = dbName                                                                     // scopes pg_extension per database (M0110-0003 gap #7c)
+	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum, DBName: dbName, AdvisoryID: sess} // per-connection explicit transaction state (M0096-0005); DBName scopes pg_extension (M0110-0003 gap #7c); AdvisoryID = stable advisory-lock owner identity (M0118-0003)
+	// On connection teardown, release EVERY advisory lock this backend still
+	// holds — session-scoped as well as transaction-scoped. PostgreSQL frees all
+	// advisory locks at backend exit; without this a session-scoped
+	// pg_advisory_lock() the client never unlocked (or abandoned the connection
+	// while holding) would persist for the server-process lifetime and block
+	// every future acquirer of the same key. Runs before the open-txn rollback
+	// (defers run LIFO) so the xact-scoped release there is a harmless no-op.
+	// M0118-0003.
+	defer executor.ReleaseAllAdvisoryLocks(sess)
 	// On connection teardown (client disconnect, EOF, read error, admin
 	// shutdown — every `return` from the loop below), roll back any still-open
 	// explicit transaction so its XID is released from the ProcArray and any

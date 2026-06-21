@@ -101,6 +101,14 @@ type connTxState struct {
 	// superuser (e.g. LEAKPROOF function attribute) are rejected. Cleared by
 	// RESET SESSION AUTHORIZATION or SET SESSION AUTHORIZATION DEFAULT/postgres.
 	NonSuperuserRole string
+	// AdvisoryID is the stable per-connection advisory-lock owner identity (the
+	// SessionRegistry). It is assigned once at connection start in
+	// runPostStartupLoop and matches advisorySessionIDFromContext's preferred
+	// identity, so transaction-end and connection-teardown release the same
+	// advisory locks that pg_advisory_*lock() acquired — regardless of whether
+	// the lock was taken in autocommit or inside an explicit transaction.
+	// M0118-0003.
+	AdvisoryID any
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr
@@ -180,7 +188,16 @@ func (c *connTxState) Session() *executor.BasicSession {
 func (c *connTxState) End() {
 	c.mu.Lock()
 	if c.sess != nil {
-		executor.ReleaseAdvisoryTransactionLocks(c.sess)
+		// Release xact-scoped advisory locks under the stable per-connection
+		// identity (AdvisoryID = SessionRegistry), which is what acquired them —
+		// NOT c.sess (the BasicSession), which is no longer the advisory owner.
+		// Falls back to c.sess for callers that never set AdvisoryID (unit tests).
+		// M0118-0003.
+		advID := c.AdvisoryID
+		if advID == nil {
+			advID = c.sess
+		}
+		executor.ReleaseAdvisoryTransactionLocks(advID)
 		executor.ReleaseRelationLocks(c.sess)
 		c.sess.EndExplicitTransaction()
 	}

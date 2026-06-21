@@ -631,6 +631,70 @@ The three lockmgr-waiter unit tests (`TestUpdateBlocksOnForeignTupleLock`,
 were updated to end the holder's *transaction* as the unblock trigger — the faithful
 production gate — rather than a bare statement-scoped lockmgr release.
 
+### Hot-path wiring slice 7: advisory-lock owner identity stable across the BEGIN boundary (`lock-update-delete` enabler)
+
+The `lock-update-delete` / `propagate-lock-delete` specs do not synchronise their
+sessions with a row lock — they use a **session-level advisory lock** as the gate
+(`postgres/src/test/isolation/specs/lock-update-delete.spec`): `s2` takes
+`pg_advisory_lock(0)` in its session `setup` block (auto-commit, **before** any
+`BEGIN`), then `BEGIN`s and builds the update chain while `s1` blocks inside
+`SELECT ... WHERE pg_advisory_xact_lock(0) IS NOT NULL ... FOR KEY SHARE`. `s2` only
+releases the gate with `pg_advisory_unlock(0)` — issued **after** its `BEGIN`.
+
+That step order exposed an advisory-lock **owner-identity** bug that hangs the whole
+spec. `advisorySessionIDFromContext` (`internal/executor/advisory.go`) preferred
+`ctx.Session` (the `*BasicSession`, created lazily at the first `BEGIN` and `nil`
+before it) over the per-connection `ctx.AdvisorySessionIdentity` (the
+`*config.SessionRegistry`, allocated once in `runPostStartupLoop` for the whole
+connection lifetime). So the auto-commit `pg_advisory_lock(0)` was keyed on the
+`SessionRegistry` identity, but the post-`BEGIN` `pg_advisory_unlock(0)` was keyed on
+the now-non-`nil` `BasicSession` — a **different** owner id. The unlock matched no
+held lock ("you don't own a lock" / returns false), the session-scoped lock **leaked**
+for the server-process lifetime, and the next acquirer of key 0 (`s1`) blocked
+forever.
+
+The fix makes the per-connection `AdvisorySessionIdentity` the preferred identity at
+**every** advisory site, so acquire and release agree regardless of explicit-txn
+state ([[pattern_sibling_paths_must_agree]] — five sibling sites changed together):
+
+- `advisorySessionIDFromContext` now prefers `AdvisorySessionIdentity`, falling back
+  to `ctx.Session` then `BackendID` only for unit-test contexts that wire neither.
+- The two per-statement xact-release sites (`dispatchSimpleQueryViaExecutor`,
+  `executeExtendedQueryViaExecutor`) release under `ectx.AdvisorySessionIdentity`
+  first (the order was inverted to match the acquire identity).
+- `connTxState.End` releases xact-scoped advisory locks under a new
+  `connTxState.AdvisoryID` field (set to the connection's `sess` in
+  `runPostStartupLoop`), not the `BasicSession`.
+- `pg_advisory_unlock_all()` (`expr.go`) already routed through
+  `advisorySessionIDFromContext`, so it inherited the fix.
+
+Separately, PostgreSQL frees **all** advisory locks (session- *and* xact-scoped) when
+a backend exits; goopg only released xact-scoped locks at connection teardown. New
+`executor.ReleaseAllAdvisoryLocks(identity)` (calls `advisoryManager.releaseAll`) is
+`defer`-ed in `runPostStartupLoop` so a session-scoped `pg_advisory_lock()` the client
+never unlocked (or abandoned the connection while holding) cannot strand the key for
+the server-process lifetime.
+
+Pinned by two regression tests in `internal/testport/advisory_lock_test.go`:
+`TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary` (take in auto-commit,
+unlock after `BEGIN`, then a second connection must acquire the same key) and
+`TestSyntax_AdvisoryLock_ReleasedOnDisconnect` (abandon a holder connection without
+unlocking; a fresh connection must claim the key after the backend exits). Both pass.
+
+This removes the `lock-update-delete` infinite hang — the spec now runs all twelve
+permutations to completion. **Two output divergences remain before promotion**
+(deferred, see resume point #3 below): (A) goopg's isolation runner omits the
+session-`setup` `pg_advisory_lock(0)` result block that PG prints at the top of each
+permutation; and (B) the load-bearing one — when `s1l` unblocks at `s2_unlock`, it
+returns the **stale pre-update `(1,1)` row immediately** instead of re-traversing the
+update chain `s2` built while `s1l` was parked and **waiting** on `s2`'s in-flight
+`DELETE`/key-`UPDATE` (PG keeps `s1l` `<waiting ...>` until `s2c`, then returns
+`(0 rows)`). (B) is the READ COMMITTED *blocked-then-woken locker must re-evaluate
+against the latest tuple version* gap: `s1l` took its snapshot before `s2u`, and on
+wakeup it locks the originally-visible version rather than EvalPlanQual-following the
+chain. `TestPort_IsolationLockUpdateDelete` is added as a deferred SKIP guard that
+will auto-promote once (A)+(B) land.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -752,9 +816,22 @@ verified primitive:
        `epqWait`s on each), respecting the strength matrix — a no-key `UPDATE`
        proceeds against a `FOR KEY SHARE` holder, a `DELETE`/key-`UPDATE` waits.
        See *Hot-path wiring slice 6* above. **`lock-update-traversal` now passes**
-       (`TestPort_IsolationLockUpdateTraversal`). `lock-update-delete` /
-       `propagate-lock-delete` remain deferred (they additionally need advisory
-       locks / FK-`INSERT` propagation).
+       (`TestPort_IsolationLockUpdateTraversal`).
+     - ✅ **advisory-lock synchroniser (enabler)**: the advisory-lock owner identity
+       is now stable across the `BEGIN` boundary and session-scoped advisory locks
+       are released on backend teardown — see *Hot-path wiring slice 7* above. This
+       removes the `lock-update-delete` infinite hang. Pinned by
+       `TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary` /
+       `TestSyntax_AdvisoryLock_ReleasedOnDisconnect`.
+     - ⏳ **`lock-update-delete` output match (DEFERRED)**: with the hang gone the
+       spec runs all twelve permutations, but two divergences remain (ledger
+       2026-06-21): (A) the isolation runner omits the session-`setup`
+       `pg_advisory_lock(0)` result block; (B) on unblocking, `s1l` returns the
+       stale pre-update row immediately instead of re-traversing the chain and
+       waiting on `s2`'s in-flight `DELETE`/key-`UPDATE` (READ COMMITTED
+       blocked-then-woken-locker re-evaluation gap). `TestPort_IsolationLockUpdateDelete`
+       is a deferred SKIP guard. `propagate-lock-delete` additionally needs
+       FK-`INSERT` propagation.
 4. **WAL persistence of multixact members** — the lock-only producer marks the
    page dirty *without* a heap-lock WAL record (the record carries a single
    xid + strength and cannot describe a multi). Lock-only multixact state is

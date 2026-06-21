@@ -718,6 +718,24 @@ func TestPort_IsolationLockUpdateTraversal(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-update-traversal.spec")
 }
 
+// TestPort_IsolationLockUpdateDelete exercises the lock-update-delete spec: s2
+// holds a session-level advisory lock (lock 0) so that s1's
+// SELECT ... WHERE pg_advisory_xact_lock(0) IS NOT NULL ... FOR KEY SHARE blocks
+// at the advisory gate while s2 builds an update chain (UPDATE then DELETE /
+// key-UPDATE / no-key-UPDATE) on the same tuple. When s2 unlocks the advisory
+// lock, s1's locker must traverse the update chain: it proceeds immediately for
+// the no-key UPDATE blocker but waits on the in-flight DELETE / key-UPDATE until
+// s2 commits or aborts (committing DELETE/key-UPDATE leaves 0 rows; aborting
+// lets s1 lock the surviving row). Layers the advisory-lock synchroniser on top
+// of the M0118-0003 update-chain wait-on-deleter path. M0118-0003.
+func TestPort_IsolationLockUpdateDelete(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_lock_update_delete")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-update-delete.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

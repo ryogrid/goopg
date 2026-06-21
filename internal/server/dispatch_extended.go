@@ -140,10 +140,14 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		ectx.BeginLocalTransaction = sess.BeginTransaction
 		ectx.EndLocalTransaction = sess.EndTransaction
 	}
-	if ectx.Session != nil {
-		advisoryReleaseTarget = ectx.Session
-	} else if ectx.AdvisorySessionIdentity != nil {
+	// Match advisorySessionIDFromContext's preference: the per-connection
+	// AdvisorySessionIdentity (SessionRegistry) is the stable advisory owner, so
+	// xact-scoped advisory locks release under it at txn end (not the
+	// BasicSession, which is nil before the first BEGIN). M0118-0003.
+	if ectx.AdvisorySessionIdentity != nil {
 		advisoryReleaseTarget = ectx.AdvisorySessionIdentity
+	} else if ectx.Session != nil {
+		advisoryReleaseTarget = ectx.Session
 	}
 	ectx.PubSub = s.cfg.PubSub
 	ectx.WAL = s.cfg.WAL
