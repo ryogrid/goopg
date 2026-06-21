@@ -803,6 +803,61 @@ green. The remaining M0118-0003 row-lock work (savepoint/subxact members,
 `propagate-lock-delete`'s FK-`INSERT` propagation, WAL persistence of multixact
 members, deadlock detection) is unchanged.
 
+### Hot-path wiring slice 10: five multixact / tuple-lock specs promoted (no new engine code)
+
+Re-measuring the remaining M0118-0003 multixact-cluster specs after slice 9
+landed shows that **five** of them already pass byte-for-byte against PG 18.3 on
+the infrastructure built in slices 1–9 — **no new engine code was required**.
+They are promoted to `pass` this slice (CSV `failed`→`pass`; `gen-isolation-coverage`
++ `gen-oracle-inventory` regenerated; dedicated `TestPort_Isolation*` per spec):
+
+- **`skip-locked-2`** (`TestPort_IsolationSkipLocked2`) — SKIP LOCKED with
+  multixact locks. `s1` and `s2` both `FOR SHARE` the same row; the second
+  `FOR SHARE` combines both holders into a lock-only MultiXactId (slice 1
+  `stampMultiLock`) rather than clobbering the first. `s2`'s subsequent
+  `FOR UPDATE SKIP LOCKED` then conflicts with `s1`'s still-active SHARE member
+  (`activeLockHolders` enumerates members through the shared store;
+  `tupleLockConflicts` compares against the strongest member status from
+  `HintBits`) and the SKIP-LOCKED wait-policy branch in `stampLockInner` drops
+  the row. This is the spec the *"producer gate: SATISFIED"* note (above) was
+  built for.
+- **`nowait-2`** (`TestPort_IsolationNowait2`) — identical structure to
+  `skip-locked-2` but `s2` uses `FOR UPDATE NOWAIT`; the same conflicting SHARE
+  member drives the NOWAIT branch to fail fast with `55P03` (relation-qualified)
+  instead of skipping.
+- **`skip-locked-3`** (`TestPort_IsolationSkipLocked3`) — SKIP LOCKED with plain
+  (non-multi) tuple locks: `s1` holds the row lock on `id=1`, `s2` queues behind
+  it for the same tuple, and `s3`'s `FOR UPDATE SKIP LOCKED` skips the contended
+  `id=1` and claims `id=2` via the lock-only-xmax cross-statement conflict
+  detection + SKIP-LOCKED drop branch.
+- **`nowait-5`** (`TestPort_IsolationNowait5`) — NOWAIT on an *updated tuple
+  chain*: `sl1`'s prepared `FOR UPDATE NOWAIT` parks at a `pg_advisory_lock(0)`
+  gate while `upd` commits a no-key UPDATE of `id=2` and `lk1` takes `FOR SHARE`
+  on the live successor; on release `sl1` follows the `t_ctid` chain (RC
+  chain-follow path) to the updated version and fails fast with `55P03` because
+  `lk1` holds a conflicting `FOR SHARE` lock-only xmax there.
+- **`tuplelock-conflict`** (`TestPort_IsolationTuplelockConflict`) — verifies the
+  documented tuple-lock conflict table across all four strengths (KEY SHARE /
+  SHARE / NO KEY UPDATE / UPDATE) in both the single-locker permutations and the
+  **savepoint** permutations. The savepoint permutations re-lock the same tuple
+  under a `SAVEPOINT` at a stronger mode; because every consumer (`activeLockHolders`,
+  `tupleLockConflicts`) evaluates `s2`'s request against the **strongest lock
+  mode held on the tuple** (`HintBits` records the strongest member), the output
+  is byte-identical to PG whether or not the savepoint re-lock is recorded as a
+  distinct subxid member. This **supersedes** the earlier hypothesis (resume
+  point #3 / slices 4–6) that `tuplelock-conflict` was blocked on threading a
+  subtransaction xid into the producer: genuine distinct-subxid membership is not
+  observable in this spec's outputs, so the `⛔ savepoint/subxact members` blocker
+  below is downgraded to a *latent* item (kept for any future spec whose output
+  actually distinguishes subxid members).
+
+All five ride **in-memory** multixact membership only; none crash/restart mid-run,
+so the deferred WAL/`pg_multixact` persistence (item 4 below) is not on their
+path either. The earlier estimate that `skip-locked-2`/`nowait-2` needed member
+persistence (prior ledger rows) is corrected by this measurement. Regression
+batch re-verified: `TestPort_Isolation{LockUpdateDelete,LockUpdateTraversal,
+LockCommittedKeyupdate,UpdateLockedTuple,SkipLocked,Nowait,Nowait3}` all PASS.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -908,10 +963,14 @@ verified primitive:
      `FOR NO KEY UPDATE` / `FOR UPDATE` distinction is threaded from the parser
      through to the producer member status and the `tupleLockConflicts` matrix
      (now `multixact.StatusesConflict`) — see *Hot-path wiring slice 4* above.
-   - ⛔ **savepoint/subxact members** — a transaction's main xid plus a subxid
-     locking the same tuple must appear as distinct multixact members (the
-     `tuplelock-conflict` savepoint permutations); needs the subtransaction xid
-     threaded into the producer.
+   - 🟡 **savepoint/subxact members (latent)** — a transaction's main xid plus a
+     subxid locking the same tuple would appear as distinct multixact members.
+     **`tuplelock-conflict` was re-measured to pass without this** (*slice 10*):
+     every conflict consumer evaluates the request against the *strongest lock
+     mode held* (`HintBits`), which is identical whether or not the savepoint
+     re-lock is a distinct subxid member, so the spec's output does not observe
+     subxid membership. Downgraded from ⛔ to latent — kept only for a future spec
+     whose output actually distinguishes individual subxid members.
    - ✅ **update-chain lock propagation** — both halves landed:
      - ✅ **locker half**: `SELECT ... FOR KEY SHARE`/`FOR SHARE` on an
        in-flight-updated row now propagates the lock forward to the successor
@@ -946,14 +1005,24 @@ verified primitive:
    xid + strength and cannot describe a multi). Lock-only multixact state is
    transient, so losing it on crash recovery is correct; but the
    updater-bearing case and `pg_multixact` SLRU parity need a real record +
-   `Store` seeding from `pg_control.nextMulti`.
+   `Store` seeding from `pg_control.nextMulti`. (Note: the multixact-cluster
+   specs promoted in *slice 10* run single-process with no crash/restart, so
+   none depend on this; persistence is needed only by `multixact-no-forget` and
+   for standby/crash parity.)
 5. **Spec promotion** — once 2–4 land as needed, promote the remaining
-   MultiXact-cluster isolation specs (`multixact-no-forget`, `nowait-2`,
-   `skip-locked-2`, `propagate-lock-delete`, `tuplelock-conflict`,
-   `aborted-keyrevoke`) per the [0118-0001](0118-0001-isolation-spec-port-strategy.md)
-   promotion workflow. (`multixact-no-deadlock` / `tuplelock-upgrade-no-deadlock`
-   additionally need deadlock detection across the row-lock wait graph.)
+   MultiXact-cluster isolation specs per the
+   [0118-0001](0118-0001-isolation-spec-port-strategy.md) promotion workflow.
    ✅ **`lock-update-traversal` promoted** (slice 6 write-path half).
+   ✅ **`lock-update-delete` promoted** (slice 9).
+   ✅ **`skip-locked-2`, `nowait-2`, `skip-locked-3`, `nowait-5`,
+   `tuplelock-conflict` promoted** (*slice 10*; no new engine code).
+   Still deferred in this cluster: `multixact-no-forget` (needs WAL/`pg_multixact`
+   member persistence, item 4); `propagate-lock-delete` (FK-`INSERT` lock
+   propagation); `skip-locked-4` / `nowait-4` (SKIP LOCKED / NOWAIT on an updated
+   tuple chain — re-measured `defer`, output mismatch still under investigation);
+   `aborted-keyrevoke`; and `multixact-no-deadlock` /
+   `tuplelock-upgrade-no-deadlock` (additionally need deadlock detection across
+   the row-lock wait graph).
 
 Sibling-path discipline applies throughout: the encode (stamp) and decode
 twins must change together — see [[pattern_sibling_paths_must_agree]].

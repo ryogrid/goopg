@@ -1,54 +1,55 @@
-Task: M0118-0003 — COMPLETE this loop: lock-update-delete.spec PROMOTED to pass
-(divergence (B) fixed — the READ COMMITTED blocked-then-woken locker chain
-re-traversal). Both blockers of lock-update-delete are now closed; spec passes
-all 12 permutations byte-identical vs PG 18.3.
+Task: M0118-0003 — COMPLETE this loop: a measurement-driven BATCH PROMOTION of
+FIVE more row-locking specs that already pass byte-for-byte on the slices 1–9
+multixact/chain infra with ZERO new engine code. Promoted to pass:
+skip-locked-2, nowait-2, skip-locked-3, nowait-5, tuplelock-conflict.
 
 DONE this loop (committed):
-- internal/executor/operators_lockrows.go: propagateLockForward rewritten as a
-  faithful heap_lock_updated_tuple_rec — returns a chainLockOutcome
-  (chainLockOK/Deleted/Updated). New classifyChainConflict + chainMembers =
-  test_lockmode_for_conflict analog over each chain version's holder(s): WAIT
-  (WaitForXID, bounded by query ctx) on a conflicting in-flight DELETE/key-UPDATE
-  then re-read the SAME version; committed conflict -> chainLockDeleted (0 rows)
-  or chainLockUpdated (EPQ recheck the successor). Branch (a) of stampLockInner
-  maps the outcome (epqSkipped for deleted/recheck-fail; keep (1,1) for OK).
-- Two goopg seams: (a) goopg DELETE leaves t_ctid self-pointing WITHOUT
-  HEAP_KEYS_UPDATED (PG's heap_delete sets it) -> chainMembers classifies a
-  self-ctid real-updater as StatusUpdate so it conflicts with FOR KEY SHARE
-  (fixed blocker1); (b) foo.key is a PRIMARY KEY so key=1 is the index-scan cond
-  not a filterOp pred -> Open folds indexScanPredicate into the EPQ recheck pred
-  (fixed blocker2).
-- Promotion: target-inventory CSV row -> pass; regen coverage + inventory.
-  Design 0118-0002 slice 9 + resume-#3 entry + README index. Ledger row.
+- internal/testport/isolation_port_test.go: added dedicated TestPort_Isolation*
+  for the 5 specs (SkipLocked2/Nowait2/SkipLocked3/Nowait5/TuplelockConflict).
+- docs/test-port/postgres-oracle-target-inventory.csv: 5 rows failed→pass
+  (comma-free rationales = Go func names); regenerated
+  postgres-oracle-target-inventory.md + upstream-isolation-coverage.md via
+  gen-oracle-inventory + gen-isolation-coverage.
+- docs/design/0118-0002-*: added slice 10 (batch promotion); downgraded the
+  savepoint/subxact-members blocker ⛔→latent (KEY FINDING below); updated
+  Deferred items 4+5; README index status + slice-10 sentence. Ledger row.
 
-GATES (all PASS): go build ./...; go vet executor; gofmt clean;
-executor+multixact unit (incl -race); TestPort_IsolationLockUpdateDelete PASS;
-regression batch TestPort_Isolation{LockUpdateTraversal,LockCommittedKeyupdate,
-UpdateLockedTuple,SkipLocked,Nowait,InsertConflictDoUpdate} all PASS.
-make ralph-state-guard OK (self-repaired). pgbench smoke via pre-commit hook.
+KEY FINDING (supersedes prior ledger/design estimates):
+- tuplelock-conflict passes WITHOUT threading a subxid into the producer: every
+  conflict consumer evaluates against the STRONGEST lock mode held on the tuple
+  (multixact.HintBits), identical whether or not the SAVEPOINT re-lock is a
+  distinct subxid member — subxid membership is NOT observable in its output.
+- skip-locked-2/nowait-2 need only IN-MEMORY multixact membership (single-process,
+  no crash) — NOT the WAL/pg_multixact persistence prior rows estimated.
+
+GATES (all PASS): go build ./...; go vet executor+testport; gofmt clean;
+5 new TestPort_Isolation* PASS; regression batch LockUpdateDelete/
+LockUpdateTraversal/Nowait/Nowait3/SkipLocked/LockCommittedKeyupdate/
+UpdateLockedTuple PASS; multixact -race + executor lock-unit -race PASS;
+ralph-state-guard OK; pgbench smoke via pre-commit hook.
 DO NOT stage: postgres, weekly_loc.*, requirements.txt, weekkly_loc_history.py.
 
 >>> NEXT STEP (continue M0118-0003 row-locking group, one spec per loop):
-    Pick the next-cheapest remaining spec. Candidates in dependency order:
-    - tuplelock-conflict: needs savepoint/subxact members (main xid + a subxid
-      locking the same tuple = distinct multixact members; thread the subxid into
-      the producer stampMulti*/lockMemberStatus).
-    - propagate-lock-delete: needs FK-INSERT lock propagation (and the chain-wait
-      now landed). Re-measure its diff first — the locker-side wait may already
-      cover part of it.
-    - skip-locked-2 / nowait-2 / multixact-no-forget: need WAL/pg_multixact
-      persistence of multixact members (Store seeded from pg_control.nextMulti +
-      a real heap-lock-updated WAL record carrying member sets).
-    - multixact-no-deadlock / tuplelock-upgrade-no-deadlock: need deadlock
-      detection across the row-lock wait graph.
-    Run the spec's TestPort_Isolation<Name> first to see the live diff before
-    designing. Per-spec workflow: green -> CSV status=pass (rationale=Go func) ->
-    regen gen-isolation-coverage + gen-oracle-inventory -> design doc + README.
+    RESUME at skip-locked-4 / nowait-4 — both are SKIP LOCKED / NOWAIT on an
+    UPDATED tuple CHAIN (re-measured `defer` this loop, output mismatch). Add
+    TestPort_IsolationSkipLocked4 / TestPort_IsolationNowait4 (removed this loop
+    since they defer) to see the live diff; the wait-policy (skip/nowait) must be
+    honoured while FOLLOWING the chain, not only at the head version. Likely the
+    stampLockInner chain-follow recursion does not thread waitPolicy/lock-only
+    conflict into the successor read. Then propagate-lock-delete (FK-INSERT + RI
+    trigger enforcement — heavyweight), then lock-nowait (LOCK TABLE needs a
+    txn-scoped heavyweight lock lifecycle, [[lockmgr_locks_are_statement_scoped]]),
+    tuplelock-update/partition (advisory chains / partitioned tables),
+    multixact-no-forget (WAL/pg_multixact member persistence), and the
+    deadlock-detection specs (multixact-no-deadlock / tuplelock-upgrade-no-deadlock).
+    Per-spec workflow: run TestPort_Isolation<Name> for the live diff → fix →
+    green → CSV failed→pass (rationale=Go func) → regen gen-isolation-coverage +
+    gen-oracle-inventory → design doc slice + README + ledger.
 
-GOTCHAS: HeapKeysUpdated (0x2000, infomask2) is consumed ONLY by lock-conflict
-logic (not visibility/decode) — that's why the structural delete-detection is
-safe without touching the hot DELETE/WAL path. lockmgr locks are statement-scoped
-([[lockmgr_locks_are_statement_scoped]]); cross-statement gate is WaitForXID. The
-chain-wait WAIT is bounded by the 10-min query ctx + a hops<64 backstop
-(M0072-0002 hang precedent). epqRecheckFilter now also re-applies the index-scan
-key predicate (folded in Open) — keep that in mind for any future EPQ change.
+GOTCHAS: CSV rationale MUST be comma-free (unquoted comma-delimited rows) —
+[[serena_replace_content_dotall_eats_file]] / memory note. The multixact lock-only
+producer (stampMultiLock) + activeLockHolders + tupleLockConflicts (delegates to
+multixact.StatusesConflict against the strongest HintBits member) cover the
+multi-SHARE conflict path; the SKIP/NOWAIT/wait branch is in stampLockInner's
+lock-only conflict block. tpch-spotcheck INFRA-BLOCKED (SLRU backfill >60s);
+row-lock path never fires in pgbench TPC-B/TPC-H so TPS blast radius nil.

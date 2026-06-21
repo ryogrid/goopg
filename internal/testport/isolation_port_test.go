@@ -736,6 +736,62 @@ func TestPort_IsolationLockUpdateDelete(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-update-delete.spec")
 }
 
+// TestPort_IsolationSkipLocked2 exercises the skip-locked-2 spec: s1 and s2 both
+// take FOR SHARE on the same row (forming a multixact lock with two SHARE
+// members), then s2 tries FOR UPDATE SKIP LOCKED and must skip the row because
+// the FOR UPDATE conflicts with s1's still-held SHARE member of the multixact.
+// Validates the multixact-aware SKIP LOCKED conflict path. M0118-0003.
+func TestPort_IsolationSkipLocked2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_skip_locked2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/skip-locked-2.spec")
+}
+
+// TestPort_IsolationNowait2 exercises the nowait-2 spec: like skip-locked-2 but
+// s2 uses FOR UPDATE NOWAIT and must abort with 55P03 instead of skipping when
+// the multixact SHARE member held by s1 blocks the upgrade. M0118-0003.
+func TestPort_IsolationNowait2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_nowait2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-2.spec")
+}
+
+// TestPort_IsolationTuplelockConflict exercises the tuplelock-conflict spec:
+// verifies the tuple-lock conflict table across all 4 strengths, including the
+// multixact cases where a SAVEPOINT subxid locks the same tuple as the main
+// xid. M0118-0003.
+func TestPort_IsolationTuplelockConflict(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_tuplelock_conflict")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-conflict.spec")
+}
+
+// TestPort_IsolationSkipLocked3 exercises skip-locked-3 (SKIP LOCKED with tuple
+// locks). M0118-0003.
+func TestPort_IsolationSkipLocked3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_skip_locked3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/skip-locked-3.spec")
+}
+
+// TestPort_IsolationNowait5 exercises nowait-5 (NOWAIT on an updated tuple
+// chain). M0118-0003.
+func TestPort_IsolationNowait5(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_nowait5")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-5.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()
