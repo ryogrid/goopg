@@ -836,6 +836,22 @@ func TestPort_IsolationTuplelockPartition(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-partition.spec")
 }
 
+// TestPort_IsolationPropagateLockDelete exercises the propagate-lock-delete
+// spec: s1 and s2 each INSERT INTO child VALUES(1), which takes a FOR KEY SHARE
+// lock on the parent row i=1 (RI_FKey_check). s3 then UPDATEs parent (no-key or
+// key-update SET i=i, optionally with an aborted savepoint) — which must NOT
+// drop the propagated FK locks — and finally DELETEs parent. The DELETE must
+// wait on the still-in-flight child INSERTs (s1/s2 uncommitted) and, once they
+// commit, raise the FK violation 23503 because the now-visible child rows still
+// reference the parent. M0118-0003.
+func TestPort_IsolationPropagateLockDelete(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_propagate_lock_delete")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/propagate-lock-delete.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

@@ -1009,6 +1009,45 @@ green: `TestPort_IsolationInsertConflict*` / `Tuplelock*` / `LockCommitted*` /
 `UpdateLockedTuple` / `EvalPlanQual*` specs and the full `internal/executor`
 suite all PASS.
 
+### Hot-path wiring slice 14: FK-propagated lock on parent DELETE (`propagate-lock-delete` promoted — no new engine code)
+
+`propagate-lock-delete` checks that when an `UPDATE` propagates a *preexisting*
+lock onto the updated tuple, a later operation on the new version does not ignore
+that lock. The upstream scenario: `s1` and `s2` each `INSERT INTO child VALUES
+(1)`, which (via `RI_FKey_check`) takes a `FOR KEY SHARE` lock on `parent`'s row
+`i=1`. `s3` then `UPDATE`s `parent` — either a no-key update (`SET c=lower(c)`)
+or a key update whose value is unchanged (`SET i=i`), optionally with an aborted
+`SAVEPOINT` (the savepoint variant takes a slightly different code path
+upstream) — and finally `DELETE`s `parent`. In every one of the 8 permutations
+the `DELETE` must **wait** for the still-in-flight child `INSERT`s and, once
+`s1`/`s2` commit, raise `23503` because the now-visible child rows still
+reference the parent.
+
+**Why goopg already satisfies this with no new code.** goopg does not model the
+FK check as a heap row-lock that has to be *propagated* across the `UPDATE`'s
+version chain. Instead the parent-`DELETE` path detects the conflict directly on
+the child side: `enforceFKOnDelete` (`operators_fk.go`) calls
+`fkChildWaitForInFlightInsert` (M0100-0005w) → `detectInFlightChildInsert`, which
+scans the child relation for a referencing row whose `xmin` is an in-flight
+non-self transaction. `s1`/`s2`'s uncommitted `child` rows match, so the
+`DELETE` blocks on those inserters via `WaitForXID`. After they commit the
+snapshot is refreshed and the default (NO ACTION) arm's `assertNoChildRows`
+finds the now-visible rows and raises
+`update or delete on table "parent" violates foreign key constraint
+"child_i_fkey"`. Because the conflict is rediscovered on the child relation at
+`DELETE` time, the intervening `s3` `UPDATE` of the parent (which rewrites the
+parent tuple and would, in PG, have to carry the propagated `KEY SHARE` lock
+forward) is irrelevant to goopg's path — there is no parent-side lock to lose,
+and the aborted-savepoint variant changes nothing because the wait keys off the
+child inserters' top-level xids. The wait/refresh/error sequence reproduces PG's
+`<waiting ...>` → commit → `ERROR` ordering byte-for-byte.
+
+Promoted to `pass` (`TestPort_IsolationPropagateLockDelete`; CSV `failed`→`pass`;
+coverage/inventory regenerated, isolation pass 50→51). Regression re-verified
+green: `TestPort_IsolationLockUpdateTraversal` / `LockUpdateDelete` /
+`LockCommittedKeyupdate` / `Tuplelock*` and the full `internal/executor` suite
+all PASS.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -1178,9 +1217,12 @@ verified primitive:
    column — set-list based per `ExecUpdateLockMode`, not value-based — and
    `applyUpdate` now links old→new via `t_ctid` for the waiting locker's
    chain-follow).
+   ✅ **`propagate-lock-delete` promoted** (*slice 14*; the parent `DELETE`'s
+   `enforceFKOnDelete` → `fkChildWaitForInFlightInsert` already blocks on the
+   in-flight child `INSERT`s and re-raises `23503` after they commit — no
+   parent-side lock to propagate, so no new engine code).
    Still deferred in this cluster: `multixact-no-forget` (needs WAL/`pg_multixact`
-   member persistence, item 4); `propagate-lock-delete` (FK-`INSERT` lock
-   propagation); `aborted-keyrevoke`; and `multixact-no-deadlock` /
+   member persistence, item 4); `aborted-keyrevoke`; and `multixact-no-deadlock` /
    `tuplelock-upgrade-no-deadlock` (additionally need deadlock detection across
    the row-lock wait graph).
 
