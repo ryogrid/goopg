@@ -802,9 +802,27 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
 
-		// Wait for in-progress updater to commit or abort.
+		// Wait for in-progress updater to commit or abort. NOWAIT / SKIP LOCKED
+		// must not block here: when the chain-follow reaches a version whose xmax
+		// is an in-progress *real* update (the second, uncommitted UPDATE in
+		// skip-locked-4 / nowait-4), the wait policy has to be honoured exactly as
+		// it is for a lock-only conflict below — PostgreSQL's EvalPlanQualFetch
+		// skips (SKIP LOCKED) or ereports (NOWAIT) rather than waiting on the
+		// updater. The head version is reached the same way, so this also covers a
+		// plain FOR UPDATE NOWAIT/SKIP LOCKED on a directly in-progress update.
+		// M0118-0003.
 		isActive := o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax)
 		if isActive {
+			switch o.waitPolicy {
+			case planner.LockWaitSkipLocked:
+				return storage.ItemPointer{}, false, true, nil // epqSkipped
+			case planner.LockWaitNoWait:
+				return storage.ItemPointer{}, false, false, &ExecError{
+					Code:    "55P03",
+					Pos:     o.plan.Pos(),
+					Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
+				}
+			}
 			qctx := o.ctx.Ctx
 			if qctx == nil {
 				qctx = context.Background()

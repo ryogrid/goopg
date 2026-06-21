@@ -858,6 +858,47 @@ persistence (prior ledger rows) is corrected by this measurement. Regression
 batch re-verified: `TestPort_Isolation{LockUpdateDelete,LockUpdateTraversal,
 LockCommittedKeyupdate,UpdateLockedTuple,SkipLocked,Nowait,Nowait3}` all PASS.
 
+### Hot-path wiring slice 11: wait policy honoured on the real-updater chain-follow (`skip-locked-4` / `nowait-4` promoted)
+
+`skip-locked-4` and `nowait-4` are the chain-follow twins of `nowait-5` but with a
+crucial difference in **who** holds the conflicting lock at the chain tip. Both
+park `s1`'s `FOR UPDATE SKIP LOCKED` / `FOR UPDATE NOWAIT` at a `pg_advisory_lock(0)`
+gate while `s2` (the session that owns the advisory lock) first **commits** a
+no-key `UPDATE` of `id=1`, then opens a **second, still-in-progress** `UPDATE` of
+the same row before releasing the advisory lock. When `s1` wakes, its snapshot
+(taken at `BEGIN`, before either UPDATE) still sees the original version, so
+`stampLockInner` follows the `t_ctid` chain forward: the head version's xmax is
+`s2`'s *committed* first update (not active → no wait), and the successor
+version's xmax is `s2`'s *in-progress real update*.
+
+The bug: the **real-updater wait branch** of `stampLockInner` (the
+`keyConflict` path that handles a non-lock-only foreign xmax) called
+`WaitForXID` **unconditionally** once it saw the updater was active — it never
+consulted `o.waitPolicy`. Only the *lock-only* conflict branch below it honoured
+SKIP LOCKED / NOWAIT, which is why `nowait-5` (whose chain tip is a `lk1`
+`FOR SHARE` **lock-only** xmax) already passed while `nowait-4`/`skip-locked-4`
+(whose chain tip is a **real** in-progress update) hung — `s1` blocked on `s2`'s
+uncommitted update and the isolation runner reported `<... timed out waiting>`
+instead of `<... completed>`.
+
+Fix (`internal/executor/operators_lockrows.go`, `stampLockInner`): before
+`WaitForXID` in the real-updater branch, switch on `o.waitPolicy` exactly as the
+lock-only branch does — `LockWaitSkipLocked` returns the `epqSkipped` sentinel
+(so `lockRowsOp` drops the contended row and `LIMIT 1` drains on to `id=2`),
+`LockWaitNoWait` returns the relation-qualified `55P03`
+(`could not obtain lock on row in relation "foo"`), and the default (blocking)
+falls through to the original `WaitForXID`. Because the head version is reached
+through the same branch, this also covers a plain `FOR UPDATE NOWAIT/SKIP LOCKED`
+landing directly on a row with an in-progress real update — PostgreSQL's
+`EvalPlanQualFetch` skips/ereports rather than waiting in all of these cases.
+
+No other engine change. Promoted to `pass` (`TestPort_IsolationSkipLocked4`,
+`TestPort_IsolationNowait4`; CSV `failed`→`pass`; coverage/inventory regenerated).
+Regression batch re-verified green: `TestPort_Isolation{LockUpdateDelete,
+LockUpdateTraversal,LockCommittedKeyupdate,UpdateLockedTuple,SkipLocked,Nowait,
+Nowait2,Nowait3,Nowait5,SkipLocked2,SkipLocked3,TuplelockConflict}` all PASS;
+executor lock-unit + `internal/multixact` race suites PASS.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -1016,11 +1057,11 @@ verified primitive:
    ✅ **`lock-update-delete` promoted** (slice 9).
    ✅ **`skip-locked-2`, `nowait-2`, `skip-locked-3`, `nowait-5`,
    `tuplelock-conflict` promoted** (*slice 10*; no new engine code).
+   ✅ **`skip-locked-4`, `nowait-4` promoted** (*slice 11*; wait policy threaded
+   into the real-updater chain-follow branch of `stampLockInner`).
    Still deferred in this cluster: `multixact-no-forget` (needs WAL/`pg_multixact`
    member persistence, item 4); `propagate-lock-delete` (FK-`INSERT` lock
-   propagation); `skip-locked-4` / `nowait-4` (SKIP LOCKED / NOWAIT on an updated
-   tuple chain — re-measured `defer`, output mismatch still under investigation);
-   `aborted-keyrevoke`; and `multixact-no-deadlock` /
+   propagation); `aborted-keyrevoke`; and `multixact-no-deadlock` /
    `tuplelock-upgrade-no-deadlock` (additionally need deadlock detection across
    the row-lock wait graph).
 

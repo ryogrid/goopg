@@ -1,55 +1,52 @@
-Task: M0118-0003 — COMPLETE this loop: a measurement-driven BATCH PROMOTION of
-FIVE more row-locking specs that already pass byte-for-byte on the slices 1–9
-multixact/chain infra with ZERO new engine code. Promoted to pass:
-skip-locked-2, nowait-2, skip-locked-3, nowait-5, tuplelock-conflict.
+Task: M0118-0003 (row locking) — COMPLETE this loop: promoted skip-locked-4 +
+nowait-4 (SKIP LOCKED / NOWAIT on an UPDATED tuple chain) via a single-branch
+engine fix. The M0118-0003 spec group continues (more specs below).
 
 DONE this loop (committed):
-- internal/testport/isolation_port_test.go: added dedicated TestPort_Isolation*
-  for the 5 specs (SkipLocked2/Nowait2/SkipLocked3/Nowait5/TuplelockConflict).
-- docs/test-port/postgres-oracle-target-inventory.csv: 5 rows failed→pass
-  (comma-free rationales = Go func names); regenerated
-  postgres-oracle-target-inventory.md + upstream-isolation-coverage.md via
-  gen-oracle-inventory + gen-isolation-coverage.
-- docs/design/0118-0002-*: added slice 10 (batch promotion); downgraded the
-  savepoint/subxact-members blocker ⛔→latent (KEY FINDING below); updated
-  Deferred items 4+5; README index status + slice-10 sentence. Ledger row.
+- internal/executor/operators_lockrows.go: stampLockInner's real-updater wait
+  branch (keyConflict path, non-lock-only foreign xmax) now consults
+  o.waitPolicy BEFORE WaitForXID — LockWaitSkipLocked→return epqSkipped,
+  LockWaitNoWait→relation-qualified 55P03, default→original WaitForXID. Mirrors
+  the lock-only branch that already honoured the policy. ~13 new lines.
+- internal/testport/isolation_port_test.go: added TestPort_IsolationSkipLocked4
+  + TestPort_IsolationNowait4 (both PASS).
+- CSV target-inventory: 2 rows failed→pass (comma-free rationales = Go funcs);
+  fixed stale "remain deferred" note in skip-locked.spec row; regenerated
+  postgres-oracle-target-inventory.md + upstream-isolation-coverage.md.
+- docs/design/0118-0002-*: slice 11 section; status checklist (✅ skip-locked-4
+  /nowait-4); README index status + slice-11 sentence. Ledger row appended.
 
-KEY FINDING (supersedes prior ledger/design estimates):
-- tuplelock-conflict passes WITHOUT threading a subxid into the producer: every
-  conflict consumer evaluates against the STRONGEST lock mode held on the tuple
-  (multixact.HintBits), identical whether or not the SAVEPOINT re-lock is a
-  distinct subxid member — subxid membership is NOT observable in its output.
-- skip-locked-2/nowait-2 need only IN-MEMORY multixact membership (single-process,
-  no crash) — NOT the WAL/pg_multixact persistence prior rows estimated.
+ROOT CAUSE (why nowait-5 passed but nowait-4/skip-locked-4 hung): both follow
+the t_ctid chain after waking from a pg_advisory_lock(0) gate, but the chain
+TIP differs — nowait-5 reaches a FOR SHARE LOCK-ONLY xmax (handled by the
+already-correct lock-only branch); nowait-4/skip-locked-4 reach an IN-PROGRESS
+REAL UPDATE xmax (s2's uncommitted second UPDATE), which the real-updater branch
+waited on unconditionally → `<... timed out waiting>`. Fix = honour the wait
+policy in BOTH branches.
 
 GATES (all PASS): go build ./...; go vet executor+testport; gofmt clean;
-5 new TestPort_Isolation* PASS; regression batch LockUpdateDelete/
-LockUpdateTraversal/Nowait/Nowait3/SkipLocked/LockCommittedKeyupdate/
-UpdateLockedTuple PASS; multixact -race + executor lock-unit -race PASS;
-ralph-state-guard OK; pgbench smoke via pre-commit hook.
-DO NOT stage: postgres, weekly_loc.*, requirements.txt, weekkly_loc_history.py.
+TestPort_IsolationSkipLocked4/Nowait4 PASS; 12-spec regression batch
+(LockUpdateDelete/LockUpdateTraversal/Nowait/Nowait2/Nowait3/Nowait5/SkipLocked/
+SkipLocked2/SkipLocked3/LockCommittedKeyupdate/UpdateLockedTuple/
+TuplelockConflict) PASS; executor lock-unit -race + multixact -race PASS;
+ralph-state-guard OK (auto-repaired progress→in_progress); pgbench smoke via
+pre-commit hook. DO NOT stage: postgres, weekly_loc.*, requirements.txt,
+weekkly_loc_history.py.
 
 >>> NEXT STEP (continue M0118-0003 row-locking group, one spec per loop):
-    RESUME at skip-locked-4 / nowait-4 — both are SKIP LOCKED / NOWAIT on an
-    UPDATED tuple CHAIN (re-measured `defer` this loop, output mismatch). Add
-    TestPort_IsolationSkipLocked4 / TestPort_IsolationNowait4 (removed this loop
-    since they defer) to see the live diff; the wait-policy (skip/nowait) must be
-    honoured while FOLLOWING the chain, not only at the head version. Likely the
-    stampLockInner chain-follow recursion does not thread waitPolicy/lock-only
-    conflict into the successor read. Then propagate-lock-delete (FK-INSERT + RI
-    trigger enforcement — heavyweight), then lock-nowait (LOCK TABLE needs a
-    txn-scoped heavyweight lock lifecycle, [[lockmgr_locks_are_statement_scoped]]),
-    tuplelock-update/partition (advisory chains / partitioned tables),
-    multixact-no-forget (WAL/pg_multixact member persistence), and the
+    RESUME at `propagate-lock-delete` (FK-INSERT lock propagation + RI trigger
+    enforcement — heavyweight) OR `lock-nowait` (LOCK TABLE needs a txn-scoped
+    heavyweight lock lifecycle, [[lockmgr_locks_are_statement_scoped]]). Then
+    `tuplelock-update`/`tuplelock-partition` (advisory chains / partitioned
+    tables), `multixact-no-forget` (WAL/pg_multixact member persistence), and the
     deadlock-detection specs (multixact-no-deadlock / tuplelock-upgrade-no-deadlock).
-    Per-spec workflow: run TestPort_Isolation<Name> for the live diff → fix →
-    green → CSV failed→pass (rationale=Go func) → regen gen-isolation-coverage +
-    gen-oracle-inventory → design doc slice + README + ledger.
+    Per-spec workflow: add TestPort_Isolation<Name> for the live diff → fix →
+    green → CSV failed→pass (rationale=Go func, COMMA-FREE) → regen
+    gen-isolation-coverage + gen-oracle-inventory → design doc slice + README +
+    ledger.
 
 GOTCHAS: CSV rationale MUST be comma-free (unquoted comma-delimited rows) —
-[[serena_replace_content_dotall_eats_file]] / memory note. The multixact lock-only
-producer (stampMultiLock) + activeLockHolders + tupleLockConflicts (delegates to
-multixact.StatusesConflict against the strongest HintBits member) cover the
-multi-SHARE conflict path; the SKIP/NOWAIT/wait branch is in stampLockInner's
-lock-only conflict block. tpch-spotcheck INFRA-BLOCKED (SLRU backfill >60s);
-row-lock path never fires in pgbench TPC-B/TPC-H so TPS blast radius nil.
+[[serena_replace_content_dotall_eats_file]]; prefer built-in Edit for Go code.
+The row-lock chain-follow wait-policy path is now COMPLETE for both policies at
+both head and successor versions. tpch-spotcheck INFRA-BLOCKED (SLRU backfill
+>60s); row-lock path never fires in pgbench TPC-B/TPC-H so TPS blast radius nil.

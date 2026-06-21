@@ -792,6 +792,22 @@ func TestPort_IsolationNowait5(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-5.spec")
 }
 
+func TestPort_IsolationSkipLocked4(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_skiplocked4")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/skip-locked-4.spec")
+}
+
+func TestPort_IsolationNowait4(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_nowait4")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-4.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()
