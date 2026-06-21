@@ -133,7 +133,7 @@ func TestTupleVisibleSubxactDegrades(t *testing.T) {
 		Xmax:     storage.InvalidTransactionID,
 		Infomask: 0,
 	}
-	want := TupleVisible(h, snap, 999)
+	want := TupleVisible(h, snap, 999, nil)
 	got := TupleVisibleSubxact(h, snap, 999, nil)
 	if got != want {
 		t.Errorf("TupleVisibleSubxact degraded: got %v want %v", got, want)

@@ -254,7 +254,11 @@ func Analyze(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (An
 				pool.Unpin(slot)
 				return out, err
 			}
-			if !mvcc.TupleVisible(t.Header, snap, tx.XID) {
+			// nil MultiXact store: vacuum's live-row count has no store in
+			// scope (the public Vacuum/Analyze API takes pool/mgr/rel). No
+			// tuple carries a non-lock-only multi xmax until the producer
+			// slice lands, which will also thread the store through here.
+			if !mvcc.TupleVisible(t.Header, snap, tx.XID, nil) {
 				continue
 			}
 			out.Rows++

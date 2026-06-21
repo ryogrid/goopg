@@ -6,6 +6,7 @@ import (
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -22,7 +23,7 @@ import (
 // ItemIDRedirect line pointers (created by opportunistic pruning when a chain
 // root is freed) are followed transparently — the redirect leads to the live
 // chain tip, skipping the freed slots.
-func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID) (storage.HeapTuple, uint16, bool) {
+func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID, mxs *multixact.Store) (storage.HeapTuple, uint16, bool) {
 	const maxChain = 64
 	cur := startSlot
 	for i := 0; i < maxChain; i++ {
@@ -47,7 +48,7 @@ func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid
 		if err != nil {
 			return storage.HeapTuple{}, 0, false
 		}
-		if mvcc.TupleVisible(t.Header, snap, xid) {
+		if mvcc.TupleVisible(t.Header, snap, xid, mxs) {
 			return t, cur, true
 		}
 		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
@@ -67,7 +68,7 @@ func followHOTChain(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid
 // PageGetHeapTupleNoCopy variant. Caller MUST hold the page's
 // content RLock for the lifetime of the returned tuple — the
 // returned tuple.Data aliases the page bytes (M0092-0006).
-func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID) (storage.HeapTuple, uint16, bool) {
+func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapshot, xid storage.TransactionID, mxs *multixact.Store) (storage.HeapTuple, uint16, bool) {
 	const maxChain = 64
 	cur := startSlot
 	for i := 0; i < maxChain; i++ {
@@ -90,7 +91,7 @@ func followHOTChainNoCopy(page storage.Page, startSlot uint16, snap mvcc.Snapsho
 		if err != nil {
 			return storage.HeapTuple{}, 0, false
 		}
-		if mvcc.TupleVisible(t.Header, snap, xid) {
+		if mvcc.TupleVisible(t.Header, snap, xid, mxs) {
 			return t, cur, true
 		}
 		if t.Header.Infomask&storage.HeapHotUpdated == 0 {
@@ -390,7 +391,7 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// rows, ~µs for wide rows) — bounded write-starvation,
 		// acceptable per the M0091-0002 audit.
 		slot.RLock()
-		tuple, actualSlot, found := followHOTChainNoCopy(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
+		tuple, actualSlot, found := followHOTChainNoCopy(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
 		if !found {
 			// M0118-0001: SSI phantom conflict-out for an index-scanned tuple
 			// that is physically present at this TID but invisible to us because

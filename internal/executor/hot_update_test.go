@@ -288,7 +288,7 @@ func TestFollowHOTChainDirect(t *testing.T) {
 	}
 
 	// followHOTChain from slot 1 must return (newT, slot 2, true).
-	got, gotSlot, found := followHOTChain(page, 1, snap, xid)
+	got, gotSlot, found := followHOTChain(page, 1, snap, xid, nil)
 	if !found {
 		t.Fatal("followHOTChain: not found, expected the HOT-only successor")
 	}
@@ -300,7 +300,7 @@ func TestFollowHOTChainDirect(t *testing.T) {
 	}
 
 	// Starting from slot 2 directly should also return it (already visible).
-	got2, slot2, found2 := followHOTChain(page, 2, snap, xid)
+	got2, slot2, found2 := followHOTChain(page, 2, snap, xid, nil)
 	if !found2 {
 		t.Fatal("followHOTChain from slot 2: not found")
 	}

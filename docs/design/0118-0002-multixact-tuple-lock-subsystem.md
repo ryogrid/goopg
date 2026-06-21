@@ -252,13 +252,43 @@ updater = self → not updated; lockers-only → not updated; store unavailable 
 multi absent → conservatively updated). The single-xid / lock-only cases remain
 under `TestIsConcurrentlyUpdatedHelper`.
 
-**Still deferred on the read side** (tracked in resume point #2): the *snapshot*
-visibility consumer `mvcc.TupleVisible` (8 production call sites would need the
-`Store` threaded through their signatures) and `storage/freeze.go` (package
-`storage` cannot import `multixact` — that is an import cycle — so it needs a
-resolver callback injected at init). These plus the producer are gated together:
+### Hot-path wiring slice 2 (continued): snapshot visibility consumer (`mvcc.TupleVisible`)
+
+The second read consumer is the snapshot visibility check itself.
+`mvcc.TupleVisible` (`mvcc/visibility.go`) now takes the process-shared
+`*multixact.Store` and, when the xmax is `IsHeapTupleXmaxMulti` and *not* lock-only,
+resolves the updater xid via `Store.Members` + `multixact.GetUpdateXid` before the
+self-delete (`effXmax == currentXID`) and snapshot
+(`!snap.SeesCommittedXID(effXmax)`) checks — exactly mirroring
+`isConcurrentlyUpdated` and upstream `HeapTupleSatisfiesMVCC`'s `HEAP_XMAX_IS_MULTI`
+arm. The conservative directions follow the *visibility* contract (which differs
+from the write-conflict contract above): an all-locker multi (no updater) →
+**visible** (a lock is not a delete); an unresolvable multi (nil store / missing
+record, both unreachable while no producer emits non-lock-only multis) →
+**invisible** (never expose a version whose committed successor we cannot rule
+out). The single-holder and lock-only paths stay byte-identical (`effXmax ==
+h.Xmax`), so every existing tuple is judged exactly as before.
+
+`mvcc` may import `multixact` (no cycle: `multixact` imports only `storage`). The
+`Store` is threaded through all production call sites — the executor
+scan / index / index-only / upsert / toast paths and the two
+`followHOTChain` / `followHOTChainNoCopy` helpers pass `ctx.MultiXact`; the
+`vacuum` and `analyze` stats-sampling scans have no store in scope (their public
+APIs take `pool`/`mgr`/`rel`) and pass `nil` — safe because no non-lock-only multi
+exists until the producer lands, at which point the producer slice threads the real
+store through those two maintenance paths.
+
+Pinned by `TestTupleVisibleMultiXact` (committed updater → invisible; in-progress /
+future updater → visible; self updater → invisible; lockers-only → visible; store
+unavailable / multi absent → conservatively invisible). The single-xid, own-xid,
+and lock-only cases remain under `TestTupleVisibleBasicCases` / `…OwnXIDRules` /
+`…LockOnlyXmax` / `…NonLockXmaxRegression`.
+
+**Still deferred on the read side** (tracked in resume point #2): `storage/freeze.go`
+(package `storage` cannot import `multixact` — that is an import cycle — so it needs
+a resolver callback injected at init). That plus the producer are gated together:
 the updater-bearing producer (branch (a) of `stampLockInner`) **must not** land
-until `TupleVisible` and `freeze.go` are also multixact-aware.
+until `freeze.go` is also multixact-aware.
 
 ## Verification
 
@@ -329,19 +359,21 @@ verified primitive:
    ([[pattern_sibling_paths_must_agree]]); status:
    - ✅ `isConcurrentlyUpdated` (the executor write-conflict / EPQ consumer) is
      multixact-aware — see *Hot-path wiring slice 2* above.
-   - ⛔ `mvcc.TupleVisible` (the snapshot visibility consumer) — must resolve the
-     updater xid for a non-lock-only multi; needs the `Store` threaded through
-     its 8 production call sites (executor scans, vacuum, analyze, toast).
+   - ✅ `mvcc.TupleVisible` (the snapshot visibility consumer) is multixact-aware —
+     the `Store` is threaded through every production call site (executor
+     scans / index / index-only / upsert / toast + `followHOTChain` helpers pass
+     `ctx.MultiXact`; vacuum/analyze stats scans pass `nil` until the producer
+     slice threads them). See *Hot-path wiring slice 2 (continued)* above.
    - ⛔ `storage/freeze.go` — must resolve the updater before freezing; package
      `storage` cannot import `multixact` (cycle), so inject a resolver callback
      (set at init, like other storage hooks) rather than a direct import.
    - ⛔ **producer**: branch (a) of `stampLockInner` (`operators_lockrows.go`, the
      "non-key update + `FOR KEY SHARE`" path that currently skips) must *combine*
      a new locker with the in-progress updater into a multixact and stamp a
-     **non**-lock-only multi. **GATE: do not land the producer until both
-     remaining consumers above are multixact-aware** — unlike the lock-only case
-     this is **not** transparent to visibility, so producer + *all* visibility
-     consumers must agree ([[pattern_sibling_paths_must_agree]]).
+     **non**-lock-only multi. **GATE: do not land the producer until the one
+     remaining consumer above (`storage/freeze.go`) is multixact-aware** — unlike
+     the lock-only case this is **not** transparent to visibility, so producer +
+     *all* visibility consumers must agree ([[pattern_sibling_paths_must_agree]]).
 3. **4-way lock strength + savepoint/subxact members** — goopg's `lockStrength`
    collapses PG's four lock modes to two (`ShrLock`/`ExclLock`); faithful
    `tuplelock-conflict`/`tuplelock-upgrade-no-deadlock` parity needs the full

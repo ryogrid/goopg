@@ -157,7 +157,7 @@ func epqRecheckVisible(ctx *Context, rel storage.RelFileNode, blk storage.BlockN
 	if gerr != nil {
 		return false, nil // page read error → treat as not visible
 	}
-	return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID), nil
+	return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.MultiXact), nil
 }
 
 // epqFollowHOT follows the HOT chain from (rel, blk, slot) to find the
@@ -187,7 +187,7 @@ func epqFollowHOT(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber
 		return 0, nil, false, false
 	}
 	s.RLock()
-	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID)
+	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID, ctx.MultiXact)
 	s.RUnlock()
 	ctx.Pool.Unpin(s)
 	if !found {
@@ -429,7 +429,7 @@ func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.Block
 		atTail := ctid.Block == storage.InvalidBlockNumber || ctid.Offset == 0 ||
 			(ctid.Block == curBlk && ctid.Offset == curSlot)
 		if atTail {
-			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID) {
+			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.MultiXact) {
 				return rel, epqChainResult{}, false
 			}
 			row, decErr := DecodeHeapTupleRow(cols, tup, nil)
@@ -2245,7 +2245,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		slot.RLock()
 		// Follow the HOT chain: the index pointer may be stale (pointing
 		// to an earlier version whose CTID leads to the live version).
-		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
 		if !found {
@@ -2263,7 +2263,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				return false, err
 			}
 			slot2.RLock()
-			tuple, actualSlot, found = followHOTChain(slot2.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
+			tuple, actualSlot, found = followHOTChain(slot2.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
 			slot2.RUnlock()
 			o.ctx.Pool.Unpin(slot2)
 			if !found {

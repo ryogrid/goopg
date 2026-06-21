@@ -222,7 +222,12 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 				pool.Unpin(slot)
 				return nil, perr
 			}
-			if !mvcc.TupleVisible(t.Header, snap, tx.XID) {
+			// nil MultiXact store: this stats-sampling scan has no store in
+			// scope (analyzeRelationWith takes raw pool/mgr). Until the
+			// updater-bearing multixact producer lands no tuple carries a
+			// non-lock-only multi xmax, so the multi branch is unreachable;
+			// the producer slice will thread the real store here.
+			if !mvcc.TupleVisible(t.Header, snap, tx.XID, nil) {
 				continue
 			}
 			// Decode the PG-physical tuple body using the header (natts +
