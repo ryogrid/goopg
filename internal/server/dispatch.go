@@ -321,6 +321,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	ectx.PubSub = s.cfg.PubSub
 	ectx.LockMgr = s.cfg.LockMgr
 	ectx.BackendID = backendID
+	// Inside an explicit transaction block, expose the stable per-connection
+	// lock-manager identity so LOCK TABLE can hold a transaction-scoped
+	// heavyweight lock that survives this statement's ReleaseAll(backendID)
+	// and is released only at COMMIT/ROLLBACK (connTxState.End). Zero outside
+	// an explicit block keeps autocommit LOCK display-only. M0118-0003.
+	if connTx != nil && connTx.InExplicit() {
+		ectx.TxnLockBackendID = connTx.LockBackendID
+	}
 	ectx.Activity = s.cfg.Activity
 	if connTx != nil {
 		ectx.ProcNum = connTx.ProcNum

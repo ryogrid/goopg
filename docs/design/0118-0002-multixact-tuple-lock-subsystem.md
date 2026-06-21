@@ -1048,6 +1048,69 @@ green: `TestPort_IsolationLockUpdateTraversal` / `LockUpdateDelete` /
 `LockCommittedKeyupdate` / `Tuplelock*` and the full `internal/executor` suite
 all PASS.
 
+### Hot-path wiring slice 15: transaction-scoped `LOCK TABLE` heavyweight locks (`lock-nowait` promoted)
+
+`lock-nowait` is the first M0118-0003 spec that exercises *relation-level*
+heavyweight locking (`LOCK TABLE … IN <mode> MODE [NOWAIT]`) rather than tuple
+locking. The single permutation is: `s1` takes `ACCESS EXCLUSIVE` on `a1`; `s2`
+requests `EXCLUSIVE` and **blocks** behind it; while `s2` waits, `s1` requests
+`SHARE ROW EXCLUSIVE … NOWAIT`, which must be **granted immediately** — `s1`
+already holds a stronger self-compatible lock so it jumps *ahead* of the parked
+conflicting `s2` waiter (upstream `JoinWaitQueue`'s early-grant special case)
+rather than failing the `NOWAIT`; after `s1` commits, `s2` is woken and
+completes.
+
+**The gap.** The `lockmgr` package already implemented everything this needs —
+the conflict matrix, a FIFO blocking `Acquire`, the non-blocking `TryAcquire`
+(`NOWAIT`), and `canGrantImmediately`'s early-grant rule written *explicitly* for
+this spec. But two things kept `LOCK TABLE` from blocking:
+
+1. **`lockmgr` was never instantiated in the production server** —
+   `lockmgr.New()` had no non-test caller, so `server.Config.LockMgr` was always
+   `nil` and every `acquireRelLock` / `acquireTupleLock` was a no-op. Cross-
+   statement row blocking instead rides `xmax` / `WaitForXID`, which is why the
+   tuple-lock specs pass without a live `lockmgr`.
+2. **Lock lifecycle was statement-scoped.** `dispatch.go` mints a fresh
+   `BackendID` per `Query` message and calls `LockMgr.ReleaseAll(backendID)` at
+   the end of each statement. A `LOCK TABLE` must instead hold until
+   `COMMIT`/`ROLLBACK`.
+
+**The fix — a dedicated, always-on table-lock manager.** Rather than wiring the
+global `Context.LockMgr` (which would activate *every* `acquireRelLock` call —
+scans, DML, DDL — across the whole engine and risk new blocking on the
+pgbench/TPC-H hot paths), `LOCK TABLE` gets its own `lockmgr.LockManager`
+singleton, `executor.tableLockMgr`, touched by nothing but explicit `LOCK`
+statements. Blast radius is therefore confined to `LOCK TABLE`.
+
+Lifecycle is made transaction-scoped with a stable per-connection backend
+identity:
+
+- `connTxState.LockBackendID` is minted once per connection from the same
+  monotonic counter as per-statement `BackendID`s (so it never collides) and is
+  threaded onto every `Context` as `TxnLockBackendID` **only while an explicit
+  transaction block is active** (`connTx.InExplicit()`); it is `0` in autocommit,
+  which keeps autocommit `LOCK` display-only and leak-free.
+- `execLockTable` → `lockRelationTransitively` now calls `acquireRelLockTxn`,
+  which `Acquire`s (or `TryAcquire`s, for `NOWAIT`) on `tableLockMgr` under
+  `TxnLockBackendID`. Because that identity differs from the per-statement
+  `BackendID`, the per-statement `ReleaseAll` leaves the lock untouched.
+- `connTxState.End()` (COMMIT/ROLLBACK, and connection teardown via
+  `rollbackOpenTxnOnTeardown`) calls `executor.ReleaseTableLocks(LockBackendID)`
+  to drop them — exactly transaction lifetime.
+
+The parser already emits canonical mode names (`AccessExclusiveLock`, …) so
+`lockmgr.ParseMode` round-trips without a second translation table; the existing
+`globalRelLockMgr` display registry that powers `pg_locks` is left unchanged.
+`NOWAIT` contention surfaces SQLSTATE `55P03`; a lock-cycle surfaces `40P01` via
+the manager's deadlock detector. Full design: `docs/design/0118-0003-txn-scoped-lock-table.md`.
+
+Promoted to `pass` (`TestPort_IsolationLockNowait`; CSV `failed`→`pass`;
+coverage/inventory regenerated, isolation pass 51→52). Regression re-verified
+green under `-race`: `TestPort_IsolationLockNowait` /
+`LockCommittedUpdate` / `TuplelockPartition` / `PropagateLockDelete`, the
+`internal/lockmgr` and `internal/server` suites, and the full
+`internal/executor` suite all PASS.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -1221,6 +1284,11 @@ verified primitive:
    `enforceFKOnDelete` → `fkChildWaitForInFlightInsert` already blocks on the
    in-flight child `INSERT`s and re-raises `23503` after they commit — no
    parent-side lock to propagate, so no new engine code).
+   ✅ **`lock-nowait` promoted** (*slice 15*; transaction-scoped `LOCK TABLE`
+   heavyweight locks on a dedicated always-on `executor.tableLockMgr` keyed by a
+   stable per-connection `LockBackendID`, released in `connTxState.End()` — the
+   first relation-level (not tuple-level) heavyweight lock to actually block;
+   see `docs/design/0118-0003-txn-scoped-lock-table.md`).
    Still deferred in this cluster: `multixact-no-forget` (needs WAL/`pg_multixact`
    member persistence, item 4); `aborted-keyrevoke`; and `multixact-no-deadlock` /
    `tuplelock-upgrade-no-deadlock` (additionally need deadlock detection across

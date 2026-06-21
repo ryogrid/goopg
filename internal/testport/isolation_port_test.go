@@ -852,6 +852,22 @@ func TestPort_IsolationPropagateLockDelete(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/propagate-lock-delete.spec")
 }
 
+// TestPort_IsolationLockNowait exercises the lock-nowait spec: s1 takes ACCESS
+// EXCLUSIVE on a1, then s2 requests EXCLUSIVE (blocks behind s1). While s2 waits,
+// s1 requests SHARE ROW EXCLUSIVE NOWAIT — which must be granted IMMEDIATELY (s1
+// already holds a stronger self-compatible lock, so it jumps ahead of the parked
+// conflicting s2 waiter rather than failing on NOWAIT). After s1 commits, s2's
+// EXCLUSIVE is granted. Exercises transaction-scoped LOCK TABLE heavyweight locks
+// (held until COMMIT, not released per statement) plus lockmgr's JoinWaitQueue
+// early-grant special case. M0118-0003.
+func TestPort_IsolationLockNowait(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_lock_nowait")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-nowait.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

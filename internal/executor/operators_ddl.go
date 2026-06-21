@@ -17,6 +17,7 @@ import (
 	"github.com/goopg/goopg/internal/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -11910,7 +11911,16 @@ func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
 				Message: fmt.Sprintf("relation \"%s\" does not exist", rel.Name),
 			}
 		}
-		lockRelationTransitively(sess, dbOID, s.Mode, tbl, o.ctx.Catalog, visited)
+		// Parse the requested mode into the lock manager's vocabulary; the
+		// parser already emits the canonical internal spelling
+		// ("AccessExclusiveLock", …) so this round-trips without a second
+		// translation table. An unrecognised name leaves lmMode == NoLock and
+		// acquireRelLockTxn becomes a no-op (display-only), preserving the
+		// historical behaviour for any exotic mode.
+		lmMode, _ := lockmgr.ParseMode(s.Mode)
+		if err := lockRelationTransitively(o.ctx, sess, dbOID, s.Mode, lmMode, s.NoWait, tbl, o.ctx.Catalog, visited); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -11920,20 +11930,28 @@ func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
 // (b) for tables: all inheritance children.
 // This mirrors PostgreSQL's behaviour for LOCK TABLE. M0097.
 //
-// NB: this records locks in the in-memory registry (pg_locks visibility)
-// only — it does NOT yet acquire real heavyweight locks via the lock
-// manager, so a conflicting LOCK TABLE in another session does not block.
-// Real transaction-scoped table locking is deferred (see the lock-nowait
-// resume point in .ralph/deferral_ledger.md): the lockmgr early-grant
-// primitive it needs has landed (M0118-0003), but lockmgr locks are
-// currently statement-scoped (released per Query message in dispatch.go)
-// whereas LOCK TABLE must hold until COMMIT.
-func lockRelationTransitively(sess Session, dbOID uint32, mode string, tbl *catalog.Table, cat catalog.Catalog, visited map[uint32]bool) {
+// It records each relation in the in-memory registry for pg_locks
+// visibility AND acquires a real transaction-scoped heavyweight lock via
+// the lock manager (ctx.acquireRelLockTxn) so a conflicting LOCK TABLE in
+// another session actually blocks until this transaction commits. The
+// lockmgr lock is keyed by ctx.TxnLockBackendID (stable for the txn), so
+// it survives dispatch.go's per-statement ReleaseAll and is released only
+// at COMMIT/ROLLBACK. Outside an explicit transaction block
+// (TxnLockBackendID == 0) the acquire is a no-op and only the display
+// registration happens, matching historical autocommit behaviour.
+// M0118-0003 (lock-nowait).
+func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode string, lmMode lockmgr.Mode, nowait bool, tbl *catalog.Table, cat catalog.Catalog, visited map[uint32]bool) error {
 	if visited[tbl.OID] {
-		return
+		return nil
 	}
 	visited[tbl.OID] = true
 	globalRelLockMgr.AddRelationLock(sess, dbOID, tbl.OID, mode)
+	if lmMode != lockmgr.NoLock {
+		rel := storage.RelFileNode{DBOid: dbOID, RelOid: tbl.OID}
+		if err := ctx.acquireRelLockTxn(rel, lmMode, nowait); err != nil {
+			return err
+		}
+	}
 	if tbl.View != nil {
 		// Walk the view body to find referenced tables/views.
 		refs := collectSelectTableRefs(tbl.View)
@@ -11945,17 +11963,22 @@ func lockRelationTransitively(sess Session, dbOID uint32, mode string, tbl *cata
 			if !ok {
 				continue
 			}
-			lockRelationTransitively(sess, dbOID, mode, dep, cat, visited)
+			if err := lockRelationTransitively(ctx, sess, dbOID, mode, lmMode, nowait, dep, cat, visited); err != nil {
+				return err
+			}
 		}
 	} else {
 		// Lock inheritance children transitively (PostgreSQL also acquires
 		// locks on all children when a parent table is locked).
 		if im, ok := cat.(*catalog.InMemory); ok {
 			for _, child := range im.InheritanceChildren(tbl.OID) {
-				lockRelationTransitively(sess, dbOID, mode, child, cat, visited)
+				if err := lockRelationTransitively(ctx, sess, dbOID, mode, lmMode, nowait, child, cat, visited); err != nil {
+					return err
+				}
 			}
 		}
 	}
+	return nil
 }
 
 // collectSelectTableRefs walks a SelectStmt and collects all table/view

@@ -26,6 +26,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -109,6 +110,14 @@ type connTxState struct {
 	// the lock was taken in autocommit or inside an explicit transaction.
 	// M0118-0003.
 	AdvisoryID any
+	// LockBackendID is a stable lock-manager backend identity for the
+	// whole connection (distinct from the per-statement BackendID minted
+	// in dispatch.go) that backs transaction-scoped LOCK TABLE heavyweight
+	// locks. A LOCK acquired in one statement survives the per-statement
+	// ReleaseAll and is dropped only here in End() (via
+	// executor.ReleaseTableLocks) on COMMIT/ROLLBACK. Assigned once at
+	// connection start in runPostStartupLoop. M0118-0003 (lock-nowait).
+	LockBackendID lockmgr.BackendID
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr
@@ -199,6 +208,11 @@ func (c *connTxState) End() {
 		}
 		executor.ReleaseAdvisoryTransactionLocks(advID)
 		executor.ReleaseRelationLocks(c.sess)
+		// Drop transaction-scoped LOCK TABLE heavyweight locks held under the
+		// stable per-connection backend identity. Per-statement locks use a
+		// different (per-Query) BackendID and are released in dispatch.go;
+		// these survive until end-of-transaction. M0118-0003 (lock-nowait).
+		executor.ReleaseTableLocks(c.LockBackendID)
 		c.sess.EndExplicitTransaction()
 	}
 	c.active = false

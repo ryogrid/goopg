@@ -167,6 +167,17 @@ type Context struct {
 	// policy from M0012-0002 relies on the monotonic shape.
 	BackendID lockmgr.BackendID
 
+	// TxnLockBackendID identifies the *transaction* (rather than the
+	// single statement) to the lock manager. It is stable for the life
+	// of an explicit transaction block, so heavyweight locks acquired
+	// under it survive the per-statement ReleaseAll(BackendID) in
+	// dispatch.go and are only dropped at COMMIT/ROLLBACK. LOCK TABLE
+	// uses it to hold its relation lock until end-of-transaction, the
+	// way upstream's lockmgr does. Zero means "not inside an explicit
+	// transaction" — execLockTable then falls back to display-only
+	// registration (no real blocking lock). M0118-0003 (lock-nowait).
+	TxnLockBackendID lockmgr.BackendID
+
 	// ProcNum is the backend's slot index in the Manager's ProcArray.
 	// Set once per connection in serveConn and carried on every ectx so
 	// operators that call TxnMgr.Begin (e.g. execBegin) can supply it.
@@ -611,6 +622,86 @@ func (c *Context) tryAcquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) 
 	}
 	if err == lockmgr.ErrLockNotAvailable {
 		return &ExecError{Code: "55P03", Message: "could not obtain lock on relation"}
+	}
+	return &ExecError{Code: "XX000", Message: err.Error()}
+}
+
+// tableLockMgr is the dedicated, always-on heavyweight lock manager
+// that backs `LOCK TABLE` (M0118-0003 lock-nowait). It is deliberately
+// SEPARATE from Context.LockMgr (which is nil in the production server,
+// so the relation/tuple acquireRelLock helpers are no-ops there and
+// cross-statement row blocking instead rides xmax/WaitForXID). Keeping
+// LOCK TABLE on its own manager confines the blast radius of real
+// heavyweight locking to explicit LOCK statements: ordinary scans,
+// DML and DDL never touch it, so enabling it can't introduce new
+// blocking on the pgbench/TPC-H hot paths.
+var tableLockMgr = lockmgr.New()
+
+// ReleaseTableLocks drops every LOCK TABLE heavyweight lock held by the
+// given transaction backend identity. The wire layer calls it from
+// connTxState.End() at COMMIT/ROLLBACK (and on connection teardown), so
+// LOCK TABLE locks live exactly as long as the transaction that took
+// them. M0118-0003 (lock-nowait).
+func ReleaseTableLocks(b lockmgr.BackendID) {
+	if b == 0 {
+		return
+	}
+	tableLockMgr.ReleaseAll(b)
+}
+
+// acquireRelLockTxn acquires a LOCK TABLE relation lock on the dedicated
+// tableLockMgr under the *transaction* backend identity
+// (TxnLockBackendID) rather than the per-statement BackendID, so the
+// lock is held until COMMIT/ROLLBACK instead of being dropped by
+// dispatch.go's per-statement ReleaseAll. A LOCK acquired in one
+// statement therefore still blocks a conflicting session two statements
+// later, the way upstream's transaction-scoped lockmgr does.
+//
+// nowait selects the non-blocking path (LOCK … NOWAIT): on contention
+// it returns SQLSTATE 55P03 immediately instead of waiting. The
+// lockmgr early-grant rule lets a session that already holds a
+// self-compatible mode jump ahead of a conflicting parked waiter, so
+// NOWAIT can still succeed when the requester already holds a stronger
+// lock (the lock-nowait spec's s1b step).
+//
+// A zero TxnLockBackendID (statement run outside an explicit
+// transaction block) makes this a no-op so autocommit LOCK keeps its
+// historical display-only behaviour and never leaks a lock that nothing
+// would release.
+func (c *Context) acquireRelLockTxn(rel storage.RelFileNode, mode lockmgr.Mode, nowait bool) error {
+	if c.TxnLockBackendID == 0 {
+		return nil
+	}
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	if nowait {
+		err := tableLockMgr.TryAcquire(c.TxnLockBackendID, tag, mode)
+		if err == nil {
+			return nil
+		}
+		if err == lockmgr.ErrLockNotAvailable {
+			return &ExecError{Code: "55P03", Message: "could not obtain lock on relation"}
+		}
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	if c.Activity != nil {
+		c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitRelationLock)
+	}
+	lockCtx := context.Background()
+	if c.Ctx != nil {
+		lockCtx = c.Ctx
+	}
+	err := tableLockMgr.Acquire(lockCtx, c.TxnLockBackendID, tag, mode)
+	if c.Activity != nil {
+		c.Activity.WaitEventEnd(c.ProcNum)
+	}
+	if err == nil {
+		return nil
+	}
+	if err == lockmgr.ErrDeadlockDetected {
+		return &ExecError{Code: "40P01", Message: "deadlock detected"}
+	}
+	if err == context.Canceled || err == context.DeadlineExceeded {
+		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 	}
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }

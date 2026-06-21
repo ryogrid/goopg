@@ -1089,6 +1089,14 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 	extended.ProcNum = procNum                                                                   // thread through to executeExtendedQueryViaExecutor
 	extended.DBName = dbName                                                                     // scopes pg_extension per database (M0110-0003 gap #7c)
 	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum, DBName: dbName, AdvisoryID: sess} // per-connection explicit transaction state (M0096-0005); DBName scopes pg_extension (M0110-0003 gap #7c); AdvisoryID = stable advisory-lock owner identity (M0118-0003)
+	// Stable per-connection lock-manager identity for transaction-scoped LOCK
+	// TABLE heavyweight locks (M0118-0003 lock-nowait). Minted once from the
+	// same monotonic counter as per-statement BackendIDs so it never collides
+	// with one; locks taken under it (on the executor's dedicated tableLockMgr)
+	// survive dispatch.go's per-statement ReleaseAll and are dropped in
+	// connTxState.End() at COMMIT/ROLLBACK (and on teardown via
+	// rollbackOpenTxnOnTeardown).
+	connTx.LockBackendID = lockmgr.BackendID(s.nextBackendID.Add(1))
 	// On connection teardown, release EVERY advisory lock this backend still
 	// holds — session-scoped as well as transaction-scoped. PostgreSQL frees all
 	// advisory locks at backend exit; without this a session-scoped
