@@ -227,6 +227,49 @@ func TestPageSetHeapTupleLockOnlyInvalidSlot(t *testing.T) {
 	}
 }
 
+// TestPageSetHeapTupleLockKeysUpdated round-trips the HEAP_KEYS_UPDATED
+// infomask2 bit the row-lock producer sets for a FOR UPDATE lock (and clears
+// for the weaker strengths so a stale bit from a prior FOR UPDATE lock on the
+// same line pointer can't mis-decode a later FOR NO KEY UPDATE holder as FOR
+// UPDATE). M0118-0003.
+func TestPageSetHeapTupleLockKeysUpdated(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	tuple := NewHeapTuple(TransactionID(100), InvalidTransactionID, []byte("v"))
+	slot, err := PageAddHeapTuple(p, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// FOR UPDATE: lock-only ExclLock + KEYS_UPDATED.
+	if err := PageSetHeapTupleLockOnly(p, slot, TransactionID(7), HeapXmaxExclLock); err != nil {
+		t.Fatal(err)
+	}
+	if err := PageSetHeapTupleLockKeysUpdated(p, slot, true); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := PageGetHeapTuple(p, slot)
+	if got.Header.Infomask2&HeapKeysUpdated == 0 {
+		t.Errorf("Infomask2 = %#x, KEYS_UPDATED should be set for FOR UPDATE", got.Header.Infomask2)
+	}
+	// Re-lock FOR NO KEY UPDATE on the same line pointer: the stale bit must clear.
+	if err := PageSetHeapTupleLockOnly(p, slot, TransactionID(8), HeapXmaxExclLock); err != nil {
+		t.Fatal(err)
+	}
+	if err := PageSetHeapTupleLockKeysUpdated(p, slot, false); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = PageGetHeapTuple(p, slot)
+	if got.Header.Infomask2&HeapKeysUpdated != 0 {
+		t.Errorf("Infomask2 = %#x, KEYS_UPDATED should have cleared for FOR NO KEY UPDATE", got.Header.Infomask2)
+	}
+	// Invalid slots behave like the sibling helpers.
+	if err := PageSetHeapTupleLockKeysUpdated(p, 0, true); !errors.Is(err, ErrInvalidSlot) {
+		t.Errorf("slot 0 err = %v, want ErrInvalidSlot", err)
+	}
+}
+
 // TestPageSetHeapTupleMovedPartition pins the storage primitive added
 // for cross-partition UPDATE (M0100-0005n): stamping the
 // moved-to-another-partition sentinel sets xmax, writes

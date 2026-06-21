@@ -163,31 +163,112 @@ func TestLockRowsNoWaitFailsOnContention(t *testing.T) {
 // (HeapXmaxExclLock) conflicts with every held row lock; a shared request
 // (FOR SHARE / KEY SHARE) conflicts only with a pure-exclusive FOR UPDATE
 // holder; an unlocked (no-lock-bits) infomask never conflicts.
+// TestTupleLockConflicts pins the full four-way row-lock conflict matrix
+// (FOR KEY SHARE / FOR SHARE / FOR NO KEY UPDATE / FOR UPDATE) the lockRows
+// producer enforces against a persisted lock-only holder. The expected results
+// are the upstream tuple-lock compatibility table: a FOR KEY SHARE request does
+// NOT conflict with a held FOR NO KEY UPDATE (a FK key lock vs a no-key update),
+// while FOR SHARE does. Conflict is symmetric. M0118-0003.
 func TestTupleLockConflicts(t *testing.T) {
-	const (
-		excl   = storage.HeapXmaxExclLock   // FOR UPDATE
-		shr    = storage.HeapXmaxShrLock    // FOR SHARE
-		keyshr = storage.HeapXmaxKeyShrLock // FOR KEY SHARE
-	)
+	// held strength → (infomask, infomask2) as the single-holder stamp records it.
+	type held struct {
+		infomask, infomask2 uint16
+	}
+	keyShareHeld := held{storage.HeapXmaxKeyShrLock, 0}
+	shareHeld := held{storage.HeapXmaxShrLock, 0}
+	noKeyUpdateHeld := held{storage.HeapXmaxExclLock, 0}
+	updateHeld := held{storage.HeapXmaxExclLock, storage.HeapKeysUpdated}
+
+	ks := multixact.StatusForKeyShare
+	sh := multixact.StatusForShare
+	nku := multixact.StatusForNoKeyUpdate
+	up := multixact.StatusForUpdate
+
 	cases := []struct {
-		name      string
-		requested uint16
-		held      uint16
-		want      bool
+		name string
+		req  multixact.Status
+		held held
+		want bool
 	}{
-		{"update vs none", excl, 0, false},
-		{"update vs update", excl, excl, true},
-		{"update vs share", excl, shr, true},
-		{"update vs keyshare", excl, keyshr, true},
-		{"share vs update", shr, excl, true},
-		{"share vs share", shr, shr, false},
-		{"share vs keyshare", shr, keyshr, false},
+		// held FOR KEY SHARE — conflicts only with FOR UPDATE.
+		{"keyshare vs keyshare", ks, keyShareHeld, false},
+		{"share vs keyshare", sh, keyShareHeld, false},
+		{"nokeyupdate vs keyshare", nku, keyShareHeld, false},
+		{"update vs keyshare", up, keyShareHeld, true},
+		// held FOR SHARE — conflicts with NO KEY UPDATE and UPDATE.
+		{"keyshare vs share", ks, shareHeld, false},
+		{"share vs share", sh, shareHeld, false},
+		{"nokeyupdate vs share", nku, shareHeld, true},
+		{"update vs share", up, shareHeld, true},
+		// held FOR NO KEY UPDATE — conflicts with everything except FOR KEY SHARE.
+		{"keyshare vs nokeyupdate", ks, noKeyUpdateHeld, false},
+		{"share vs nokeyupdate", sh, noKeyUpdateHeld, true},
+		{"nokeyupdate vs nokeyupdate", nku, noKeyUpdateHeld, true},
+		{"update vs nokeyupdate", up, noKeyUpdateHeld, true},
+		// held FOR UPDATE — conflicts with everything.
+		{"keyshare vs update", ks, updateHeld, true},
+		{"share vs update", sh, updateHeld, true},
+		{"nokeyupdate vs update", nku, updateHeld, true},
+		{"update vs update", up, updateHeld, true},
+		// no holder — never conflicts.
+		{"update vs none", up, held{0, 0}, false},
+		{"keyshare vs none", ks, held{0, 0}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := tupleLockConflicts(tc.requested, tc.held); got != tc.want {
-				t.Errorf("tupleLockConflicts(%#x, %#x) = %v, want %v",
-					tc.requested, tc.held, got, tc.want)
+			if got := tupleLockConflicts(tc.req, tc.held.infomask, tc.held.infomask2); got != tc.want {
+				t.Errorf("tupleLockConflicts(%v, %#x, %#x) = %v, want %v",
+					tc.req, tc.held.infomask, tc.held.infomask2, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLockMemberStatusFourWay pins the encode side of the four-way row-lock
+// strength → MultiXact member Status mapping the producer records. M0118-0003.
+func TestLockMemberStatusFourWay(t *testing.T) {
+	cases := []struct {
+		name        string
+		strength    uint16
+		keysUpdated bool
+		want        multixact.Status
+	}{
+		{"key share", storage.HeapXmaxKeyShrLock, false, multixact.StatusForKeyShare},
+		{"share", storage.HeapXmaxShrLock, false, multixact.StatusForShare},
+		{"no key update", storage.HeapXmaxExclLock, false, multixact.StatusForNoKeyUpdate},
+		{"for update", storage.HeapXmaxExclLock, true, multixact.StatusForUpdate},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := &lockRowsOp{lockStrength: tc.strength, lockKeysUpdated: tc.keysUpdated}
+			if got := o.lockMemberStatus(); got != tc.want {
+				t.Errorf("lockMemberStatus() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLockOnlyMemberStatusFourWay pins the decode side — reading a holder's
+// recorded infomask/infomask2 lock bits back to its member Status. It is the
+// twin of lockMemberStatus (per [[pattern_sibling_paths_must_agree]]); a FOR
+// UPDATE lock is only distinguishable from FOR NO KEY UPDATE by HEAP_KEYS_UPDATED.
+func TestLockOnlyMemberStatusFourWay(t *testing.T) {
+	cases := []struct {
+		name      string
+		infomask  uint16
+		infomask2 uint16
+		want      multixact.Status
+	}{
+		{"key share", storage.HeapXmaxKeyShrLock, 0, multixact.StatusForKeyShare},
+		{"share", storage.HeapXmaxShrLock, 0, multixact.StatusForShare},
+		{"no key update", storage.HeapXmaxExclLock, 0, multixact.StatusForNoKeyUpdate},
+		{"for update", storage.HeapXmaxExclLock, storage.HeapKeysUpdated, multixact.StatusForUpdate},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lockOnlyMemberStatus(tc.infomask, tc.infomask2); got != tc.want {
+				t.Errorf("lockOnlyMemberStatus(%#x, %#x) = %v, want %v",
+					tc.infomask, tc.infomask2, got, tc.want)
 			}
 		})
 	}

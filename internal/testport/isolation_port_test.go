@@ -702,6 +702,22 @@ func TestPort_IsolationUpdateLockedTuple(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/update-locked-tuple.spec")
 }
 
+// TestPort_IsolationLockUpdateTraversal exercises the lock-update-traversal
+// spec: s1 takes a FOR KEY SHARE lock on a row that s2 has updated in-flight
+// (forming an updater-bearing multixact), then after s2 commits a third step
+// DELETEs (s2d1) / key-UPDATEs (s2d2) / no-key-UPDATEs (s2d3) the row. The
+// DELETE and key-UPDATE must wait for s1's KEY SHARE lock; the no-key-UPDATE
+// must proceed immediately (KEY SHARE does not conflict with a no-key update).
+// This is the cleanest proof of the 4-way row-lock-strength distinction
+// (FOR KEY SHARE must NOT be collapsed to FOR SHARE). M0118-0003.
+func TestPort_IsolationLockUpdateTraversal(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_lock_update_traversal")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-update-traversal.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

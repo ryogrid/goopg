@@ -66,13 +66,22 @@ type lockRowsOp struct {
 	// from Open applies. Both seqScanOp (M0021 step 2a) and
 	// indexScanOp (M0021 step 2c) implement currentTIDProvider.
 	scan currentTIDProvider
-	// lockStrength is the HeapXmax* infomask bit corresponding
-	// to the locks slice (FOR UPDATE → ExclLock, FOR SHARE →
-	// ShrLock). Resolved once at Open. Multiple LockedRels
-	// targeting the same scan would need merging under
+	// lockStrength is the HeapXmax* lock-mode infomask bit corresponding
+	// to the locks slice, resolved once at Open from the four-way row-lock
+	// strength (M0118-0003):
+	//   FOR KEY SHARE      → HeapXmaxKeyShrLock
+	//   FOR SHARE          → HeapXmaxShrLock
+	//   FOR NO KEY UPDATE  → HeapXmaxExclLock              (lockKeysUpdated=false)
+	//   FOR UPDATE         → HeapXmaxExclLock + KEYS_UPDATED (lockKeysUpdated=true)
+	// Multiple LockedRels targeting the same scan would need merging under
 	// strongest-wins; v0 keeps that deferred and uses the first
 	// LockedRel's strength.
 	lockStrength uint16
+	// lockKeysUpdated distinguishes FOR UPDATE (true) from FOR NO KEY UPDATE
+	// (false) — both stamp HeapXmaxExclLock, but FOR UPDATE additionally
+	// reserves the key via HEAP_KEYS_UPDATED so a concurrent FOR KEY SHARE
+	// correctly conflicts with it. Mirrors heap_lock_tuple's new_infomask2.
+	lockKeysUpdated bool
 
 	// Two-pass buffer. seqScanOp holds the page's RLock
 	// across multiple Next() calls (RUnlock fires only at
@@ -340,14 +349,23 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	// strongest-wins is deferred); use the first LockedRel's
 	// strength.
 	if len(o.plan.Locks) > 0 {
+		// Resolve the four-way row-lock strength to its tuple-lock infomask bits
+		// (M0118-0003). FOR KEY SHARE and FOR SHARE are distinct read-intent
+		// strengths — a no-key UPDATE conflicts with FOR SHARE but not FOR KEY
+		// SHARE — and FOR UPDATE additionally reserves the key (HEAP_KEYS_UPDATED)
+		// vs FOR NO KEY UPDATE. Mirrors heap_lock_tuple's per-mode new_infomask.
 		switch o.plan.Locks[0].Strength {
+		case planner.LockStrengthForKeyShare:
+			o.lockStrength = storage.HeapXmaxKeyShrLock
 		case planner.LockStrengthForShare:
-			// FOR SHARE uses a shared (read-intent) lock.
-			// FOR KEY SHARE is handled by lockStrengthFromParser and maps to ForShare.
 			o.lockStrength = storage.HeapXmaxShrLock
-		default:
-			// FOR UPDATE (and FOR NO KEY UPDATE mapped to ForUpdate) use an exclusive lock.
+		case planner.LockStrengthForNoKeyUpdate:
 			o.lockStrength = storage.HeapXmaxExclLock
+		default:
+			// FOR UPDATE — strongest; reserves the key just as a key-changing
+			// UPDATE writes it, so a concurrent FOR KEY SHARE conflicts.
+			o.lockStrength = storage.HeapXmaxExclLock
+			o.lockKeysUpdated = true
 		}
 		// Resolve the wait policy and relation name once for stampLock's
 		// per-tuple acquisition (NOWAIT / SKIP LOCKED). M0118-0003.
@@ -792,7 +810,7 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		tup.Header.Xmax != storage.InvalidTransactionID &&
 		storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
 		tup.Header.Xmax != o.ctx.Tx.XID &&
-		tupleLockConflicts(o.lockStrength, tup.Header.Infomask) {
+		tupleLockConflicts(o.lockMemberStatus(), tup.Header.Infomask, tup.Header.Infomask2) {
 
 		// Conflict resolution honours the wait policy (M0118-0003):
 		//   SKIP LOCKED -> drop the contended row silently.
@@ -879,6 +897,14 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		o.ctx.Pool.Unpin(slot)
 		return storage.ItemPointer{}, false, false, err
 	}
+	// FOR UPDATE reserves the key (HEAP_KEYS_UPDATED) so a later FOR KEY SHARE
+	// holder decodes it as StatusForUpdate and conflicts; the weaker strengths
+	// clear any stale bit from a prior FOR UPDATE lock on this line pointer.
+	if err := storage.PageSetHeapTupleLockKeysUpdated(slot.Page(), ptr.Offset, o.lockKeysUpdated); err != nil {
+		slot.Unlock()
+		o.ctx.Pool.Unpin(slot)
+		return storage.ItemPointer{}, false, false, err
+	}
 	derr := markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, o.lockStrength)
 	slot.Unlock()
 	o.ctx.Pool.Unpin(slot)
@@ -906,6 +932,11 @@ func (o *lockRowsOp) stampAtPtr(rel storage.RelFileNode, ptr storage.ItemPointer
 		return storage.ItemPointer{}, false, nil
 	}
 	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, o.ctx.Tx.XID, o.lockStrength); err != nil {
+		slot.Unlock()
+		o.ctx.Pool.Unpin(slot)
+		return storage.ItemPointer{}, false, err
+	}
+	if err := storage.PageSetHeapTupleLockKeysUpdated(slot.Page(), ptr.Offset, o.lockKeysUpdated); err != nil {
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
 		return storage.ItemPointer{}, false, err
@@ -1021,18 +1052,18 @@ func (o *lockRowsOp) tupleLockMode() lockmgr.Mode {
 // with an exclusive (FOR UPDATE) holder. This mirrors the relevant rows of
 // PostgreSQL's row-lock conflict table for the single-locker (non-multixact)
 // case. M0118-0003.
-func tupleLockConflicts(requested, heldInfomask uint16) bool {
-	held := heldInfomask & storage.HeapXmaxLockMask
-	if held == 0 {
+// tupleLockConflicts reports whether a new row-lock request of member status
+// `reqStatus` conflicts with the lock-only holder currently recorded in a
+// tuple's `heldInfomask` / `heldInfomask2`. It decodes the holder's strength
+// (lockOnlyMemberStatus) and defers to multixact.StatusesConflict — the
+// verbatim port of upstream's row-lock compatibility matrix — so the full
+// four-way semantics hold: e.g. a FOR KEY SHARE request does NOT conflict with
+// a held FOR NO KEY UPDATE lock, while FOR SHARE does. M0118-0003.
+func tupleLockConflicts(reqStatus multixact.Status, heldInfomask, heldInfomask2 uint16) bool {
+	if heldInfomask&storage.HeapXmaxLockMask == 0 {
 		return false
 	}
-	// FOR UPDATE: exclusive bit set, key-share bit clear → conflicts with all.
-	if requested&storage.HeapXmaxExclLock != 0 && requested&storage.HeapXmaxKeyShrLock == 0 {
-		return true
-	}
-	// Shared request (FOR SHARE / KEY SHARE): conflicts only with a holder that
-	// took the pure-exclusive FOR UPDATE lock.
-	return held == storage.HeapXmaxExclLock
+	return multixact.StatusesConflict(lockOnlyMemberStatus(heldInfomask, heldInfomask2), reqStatus)
 }
 
 // lockOnlyMemberStatus maps a lock-only holder's recorded infomask lock-mode
@@ -1046,11 +1077,25 @@ func tupleLockConflicts(requested, heldInfomask uint16) bool {
 //
 // The default falls back to ForKeyShare (the weakest), which can never
 // over-state a holder's strength. M0118-0003.
-func lockOnlyMemberStatus(infomask uint16) multixact.Status {
+// lockOnlyMemberStatus maps a lock-only holder's recorded infomask /
+// infomask2 lock-mode bits back to the four-way multixact member Status used
+// when combining holders into a MultiXactId or testing tuple-lock conflicts.
+// The reverse mapping is exact for every strength goopg stamps (M0118-0003):
+//   - HeapXmaxKeyShrLock              → ForKeyShare    (FOR KEY SHARE)
+//   - HeapXmaxShrLock                 → ForShare       (FOR SHARE)
+//   - HeapXmaxExclLock, KEYS_UPDATED  → ForUpdate      (FOR UPDATE)
+//   - HeapXmaxExclLock, no KEYS_UPDATED → ForNoKeyUpdate (FOR NO KEY UPDATE)
+//
+// The default falls back to ForKeyShare (the weakest), which can never
+// over-state a holder's strength.
+func lockOnlyMemberStatus(infomask, infomask2 uint16) multixact.Status {
 	switch infomask & storage.HeapXmaxLockMask {
 	case storage.HeapXmaxShrLock:
 		return multixact.StatusForShare
 	case storage.HeapXmaxExclLock:
+		if infomask2&storage.HeapKeysUpdated != 0 {
+			return multixact.StatusForUpdate
+		}
 		return multixact.StatusForNoKeyUpdate
 	case storage.HeapXmaxKeyShrLock:
 		return multixact.StatusForKeyShare
@@ -1074,11 +1119,23 @@ func updaterMemberStatus(keysUpdated bool) multixact.Status {
 // lockMemberStatus maps this lockRowsOp's requested strength to the multixact
 // member Status it records when it joins (or forms) a MultiXact on a tuple.
 // goopg's two effective strengths map to the corresponding pure-lock statuses.
+// lockMemberStatus maps this lockRowsOp's requested four-way strength to the
+// multixact member Status it records when it joins (or forms) a MultiXact on a
+// tuple. The decode twin is lockOnlyMemberStatus (the bits this writes are read
+// back there). M0118-0003.
 func (o *lockRowsOp) lockMemberStatus() multixact.Status {
-	if o.lockStrength == storage.HeapXmaxExclLock {
+	switch o.lockStrength & storage.HeapXmaxLockMask {
+	case storage.HeapXmaxKeyShrLock:
+		return multixact.StatusForKeyShare
+	case storage.HeapXmaxShrLock:
+		return multixact.StatusForShare
+	case storage.HeapXmaxExclLock:
+		if o.lockKeysUpdated {
+			return multixact.StatusForUpdate
+		}
 		return multixact.StatusForNoKeyUpdate
 	}
-	return multixact.StatusForShare
+	return multixact.StatusForKeyShare
 }
 
 // activeLockHolders returns the still-active transactions holding a row lock on
@@ -1138,7 +1195,7 @@ func (o *lockRowsOp) stampMultiLock(slot *storage.Slot, ptr storage.ItemPointer,
 		}
 		existing = members
 	} else {
-		existing = []multixact.Member{{Xid: hdr.Xmax, Status: lockOnlyMemberStatus(hdr.Infomask)}}
+		existing = []multixact.Member{{Xid: hdr.Xmax, Status: lockOnlyMemberStatus(hdr.Infomask, hdr.Infomask2)}}
 	}
 
 	// Keep only members whose transaction is still in progress — a dead

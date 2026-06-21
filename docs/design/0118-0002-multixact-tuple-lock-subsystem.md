@@ -2,7 +2,8 @@
 
 - Status: accepted (partial — engine core + member store + tuple-header
   hint-bit encoder + **cross-session lock-only AND updater-bearing multixact
-  producer/consumer wired into `stampLockInner`**; 4-way lock-strength members +
+  producer/consumer wired into `stampLockInner`** + **four-way lock-strength
+  member status**; savepoint/subxact members + update-chain lock propagation +
   WAL persistence + spec promotion deferred)
 - Date: 2026-06-21
 - Supersedes: none
@@ -455,6 +456,63 @@ it → no multi). The full row-lock isolation suite (9 dedicated specs) stays gr
 the producer is byte-identical to the prior skip for the rows that yield (it only
 *additionally* records the multixact), so query output is unchanged.
 
+### Hot-path wiring slice 4: four-way lock-strength member status
+
+Slices 1–3 recorded every locker's member status as one of two collapsed
+strengths (`ShrLock`/`ExclLock`), because goopg's planner mapped `FOR KEY SHARE →
+FOR SHARE` and `FOR NO KEY UPDATE → FOR UPDATE` (`lockStrengthFromParser`). That
+collapse is wrong for the MultiXact-cluster conflict matrix: a no-key UPDATE must
+**not** conflict with a `FOR KEY SHARE` lock (`AccessShareLock` vs `ExclusiveLock`),
+but it **does** conflict with `FOR SHARE` (`RowShareLock` vs `ExclusiveLock`). With
+the collapse, a `FOR KEY SHARE` locker is recorded as `StatusForShare` and would
+spuriously block a concurrent no-key update. This slice threads the full four-way
+distinction from the parser through to the member status and conflict check:
+
+- **Planner** (`lockStrengthFromParser`): maps each parser strength 1:1 to its
+  planner counterpart, preserving all four. The only consumer of
+  `LockedRel.Strength` is the `lockRowsOp` executor, so widening from two to four
+  strengths is local (no other planner/analyzer/server site branches on it).
+- **Executor `Open`** (`operators_lockrows.go`): the four-way switch resolves the
+  tuple-lock infomask bits and a new `lockKeysUpdated` flag, mirroring
+  `heap_lock_tuple`'s per-mode `new_infomask`/`new_infomask2`:
+  `FOR KEY SHARE → HeapXmaxKeyShrLock`, `FOR SHARE → HeapXmaxShrLock`,
+  `FOR NO KEY UPDATE → HeapXmaxExclLock`, `FOR UPDATE → HeapXmaxExclLock +
+  HEAP_KEYS_UPDATED`. The single-holder stamp now also calls
+  `storage.PageSetHeapTupleLockKeysUpdated` (new) to **set** the key-reserved bit
+  for `FOR UPDATE` and **clear** any stale bit on the weaker strengths — without
+  the clear, a `FOR UPDATE` lock followed by a `FOR NO KEY UPDATE` re-lock on the
+  same line pointer would mis-decode.
+- **Member status, both twins** (`lockMemberStatus` encode / `lockOnlyMemberStatus`
+  decode, per [[pattern_sibling_paths_must_agree]]): four-way maps using
+  `lockStrength`+`lockKeysUpdated` (encode) and `infomask`+`infomask2` (decode);
+  `FOR UPDATE` is distinguishable from `FOR NO KEY UPDATE` only by
+  `HEAP_KEYS_UPDATED`.
+- **Conflict check** (`tupleLockConflicts`): replaced the hand-rolled two-way test
+  with a call into `multixact.StatusesConflict` — the verbatim upstream row-lock
+  compatibility matrix — decoding the held strength via `lockOnlyMemberStatus`. The
+  full four-way semantics now hold (e.g. KEY SHARE vs NO KEY UPDATE = no conflict).
+
+Pinned by `TestLockMemberStatusFourWay` / `TestLockOnlyMemberStatusFourWay` (the
+encode/decode twins) and a rewritten `TestTupleLockConflicts` (the full 4×4 matrix
++ the no-holder case), plus storage's `TestPageSetHeapTupleLockKeysUpdated` (set +
+clear round-trip). The seven dedicated row-lock isolation specs (`nowait`,
+`nowait-3`, `skip-locked`, `update-locked-tuple`, `lock-committed-update`,
+`lock-committed-keyupdate`, and the multixact producer specs) stay green — those
+exercise `FOR UPDATE`/`FOR SHARE` whose conflict outcome is unchanged by the
+refinement; only the previously-impossible KEY SHARE-vs-no-key-update distinction
+is now correct.
+
+This is the member-status half of resume point #3. The remaining halves —
+**savepoint/subxact members** (a transaction's main xid + a subxid locking the
+same tuple form a multi) and the lockmgr advisory tuple-lock 4-way mode — are
+still deferred. Measuring `lock-update-traversal` after this slice confirmed its
+blocker is **not** the member status (now correct) but **update-chain lock
+propagation**: `SELECT ... FOR KEY SHARE` on a row updated in-flight forms the
+multi on the version the locker sees but does not propagate the lock forward to
+the successor version, so a later `DELETE`/key-`UPDATE` of the live version does
+not wait. That propagation (+ the plain-`UPDATE`/`DELETE` write-path lock-conflict
+wait) is the next slice toward spec promotion.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -555,12 +613,22 @@ verified primitive:
      `vacuum.Analyze` / `analyzeRelationWith` read consumers that previously passed
      `nil`. Re-ran executor/storage/mvcc/btree + the 9 dedicated isolation row-lock
      specs (all green) ([[pattern_sibling_paths_must_agree]]).
-3. **4-way lock strength + savepoint/subxact members** — goopg's `lockStrength`
-   collapses PG's four lock modes to two (`ShrLock`/`ExclLock`); faithful
-   `tuplelock-conflict`/`tuplelock-upgrade-no-deadlock` parity needs the full
-   `FOR KEY SHARE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR UPDATE`
-   distinction threaded into the member status, plus subtransaction xids as
-   distinct multixact members (the savepoint permutations).
+3. **4-way lock strength + savepoint/subxact members** — status:
+   - ✅ **member status**: the full `FOR KEY SHARE` / `FOR SHARE` /
+     `FOR NO KEY UPDATE` / `FOR UPDATE` distinction is threaded from the parser
+     through to the producer member status and the `tupleLockConflicts` matrix
+     (now `multixact.StatusesConflict`) — see *Hot-path wiring slice 4* above.
+   - ⛔ **savepoint/subxact members** — a transaction's main xid plus a subxid
+     locking the same tuple must appear as distinct multixact members (the
+     `tuplelock-conflict` savepoint permutations); needs the subtransaction xid
+     threaded into the producer.
+   - ⛔ **update-chain lock propagation** — `SELECT ... FOR KEY SHARE` on an
+     in-flight-updated row must propagate the lock forward to the successor
+     version so a later `DELETE`/key-`UPDATE` of the live version waits
+     (`lock-update-traversal`/`lock-update-delete`/`propagate-lock-delete`). This
+     also needs the plain-`UPDATE`/`DELETE` write path to honour a lock-only
+     holder. Measured as the sole remaining `lock-update-traversal` blocker after
+     slice 4.
 4. **WAL persistence of multixact members** — the lock-only producer marks the
    page dirty *without* a heap-lock WAL record (the record carries a single
    xid + strength and cannot describe a multi). Lock-only multixact state is

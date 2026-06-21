@@ -1564,12 +1564,24 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 	return out, nil
 }
 
+// lockStrengthFromParser maps a parser row-locking strength to its planner
+// counterpart 1:1, preserving the full four-way FOR UPDATE / FOR NO KEY UPDATE /
+// FOR SHARE / FOR KEY SHARE distinction. The executor needs the precise strength
+// to stamp the correct tuple-lock infomask bits and record the right MultiXact
+// member status — a no-key UPDATE must not conflict with a FOR KEY SHARE lock,
+// which collapsing KEY SHARE→SHARE / NO KEY UPDATE→UPDATE would break (M0118-0003,
+// docs/design/0118-0002). The only consumer of LockedRel.Strength is the
+// lockRowsOp executor, so widening from two strengths to four is local.
 func lockStrengthFromParser(s parser.LockStrength) LockStrength {
 	switch s {
-	case parser.LockStrengthForUpdate, parser.LockStrengthForNoKeyUpdate:
+	case parser.LockStrengthForUpdate:
 		return LockStrengthForUpdate
-	case parser.LockStrengthForShare, parser.LockStrengthForKeyShare:
+	case parser.LockStrengthForNoKeyUpdate:
+		return LockStrengthForNoKeyUpdate
+	case parser.LockStrengthForShare:
 		return LockStrengthForShare
+	case parser.LockStrengthForKeyShare:
+		return LockStrengthForKeyShare
 	}
 	return LockStrengthForUpdate
 }

@@ -969,6 +969,47 @@ func PageSetHeapTupleKeysUpdated(p Page, slot uint16) error {
 	return nil
 }
 
+// PageSetHeapTupleLockKeysUpdated sets or clears the HeapKeysUpdated bit in
+// t_infomask2 of the tuple at slot. The row-lock producer calls it right after
+// PageSetHeapTupleLockOnly when stamping a single-holder lock-only xmax: FOR
+// UPDATE reserves the key (bit set) exactly as a key-changing UPDATE writes it,
+// while FOR KEY SHARE / FOR SHARE / FOR NO KEY UPDATE leave it clear. Clearing
+// on the weaker strengths prevents a stale bit (from a prior FOR UPDATE lock on
+// the same line pointer) from mis-decoding a later FOR NO KEY UPDATE holder as
+// FOR UPDATE. Mirrors heap_lock_tuple's new_infomask2 handling. M0118-0003.
+func PageSetHeapTupleLockKeysUpdated(p Page, slot uint16, keysUpdated bool) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+20 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
+	if keysUpdated {
+		infomask2 |= HeapKeysUpdated
+	} else {
+		infomask2 &^= HeapKeysUpdated
+	}
+	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
+	return nil
+}
+
 // PageSetHeapTupleMovedPartition stamps xmax on the tuple at
 // `slot` and writes the upstream "moved to another partition"
 // sentinel (block=InvalidBlockNumber, offset=MovedPartitionsOffsetNumber)
