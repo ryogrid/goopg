@@ -1,43 +1,49 @@
-Task: M0118-0003 (row locking) — COMPLETE this loop: promoted `lock-nowait` (slice 15)
-via transaction-scoped LOCK TABLE heavyweight locks. The M0118-0003 group continues.
+Task: M0118-0003 (row locking) — COMPLETE this loop: promoted `deadlock-simple` (slice 16)
+via synchronous simple (lock-upgrade) deadlock detection in lockmgr. M0118-0003 continues.
 
 DONE this loop (committed):
-- NEW ENGINE WORK — txn-scoped LOCK TABLE. lockmgr had every primitive but (1)
-  lockmgr.New() had NO production caller (Context.LockMgr always nil — row blocking
-  rides xmax/WaitForXID) and (2) lifecycle was per-statement.
-- Dedicated always-on `executor.tableLockMgr` singleton (separate from the nil
-  Context.LockMgr → confines blast radius to LOCK TABLE; scans/DML/DDL untouched).
-- Stable per-connection `connTxState.LockBackendID` (minted once from nextBackendID),
-  threaded to `Context.TxnLockBackendID` only while `connTx.InExplicit()`.
-- execLockTable→lockRelationTransitively→acquireRelLockTxn Acquire/TryAcquire on
-  tableLockMgr under TxnLockBackendID; per-statement ReleaseAll leaves it; End()
-  releases via executor.ReleaseTableLocks at COMMIT/ROLLBACK + teardown. NOWAIT→55P03.
-- Files: executor/context.go, executor/operators_ddl.go, server/{conn_tx,server,dispatch}.go,
-  testport/isolation_port_test.go (+TestPort_IsolationLockNowait). CSV failed→pass,
-  inventory+coverage regen (isolation 51→52). Design NEW 0118-0003 + 0118-0002 slice 15
-  + README index. Ledger row appended.
+- NEW ENGINE WORK — lockmgr early/simple deadlock detection. lockmgr had ONLY the
+  timeout-driven detector (time.AfterFunc(deadlockTimeout)); PG's JoinWaitQueue (proc.c)
+  resolves a simple lock-upgrade deadlock SYNCHRONOUSLY when the 2nd upgrader joins the
+  queue (no deadlock_timeout wait) → victim errors immediately with NO `<waiting>` marker.
+- Added lockState.hasSimpleDeadlock(b,m): mirrors the JoinWaitQueue scan — b holds a lock
+  here AND would queue behind first conflicting waiter w (w.Mode conflicts w/ b's held →
+  w waits for b) AND b's mode conflicts w/ w's held (b waits for w) → deadlock, b is victim.
+- Acquire calls it after canGrantImmediately (mutually exclusive at the deciding waiter)
+  and before enqueue; on hit: unlock → ReleaseAll(b) (mirrors timeout victim path so the
+  survivor's wake-pass fires) → return ErrDeadlockDetected (→40P01 via acquireRelLockTxn).
+- Files: internal/lockmgr/lockmgr.go (+hasSimpleDeadlock +Acquire branch);
+  testport/isolation_port_test.go (+TestPort_IsolationDeadlockSimple). CSV failed→pass,
+  coverage+inventory regen (isolation pass 52→53). Design NEW 0118-0004 + README index.
+  Ledger row appended.
 
-GATES (all PASS): go build ./...; gofmt clean; TestPort_IsolationLockNowait PASS
-byte-for-byte; -race over lockmgr + LockNowait/LockCommittedUpdate/TuplelockPartition/
-PropagateLockDelete PASS; internal/executor + internal/server + internal/lockmgr PASS;
-ralph-state-guard OK (self-repaired progress marker); pgbench smoke via pre-commit hook.
+GATES (all PASS): go build ./...; gofmt+vet clean; TestPort_IsolationDeadlockSimple PASS
+byte-for-byte; -race ./internal/lockmgr/... PASS (incl. linear-chain false-positive guard);
+-race executor Lock|Deadlock PASS; LockNowait/TuplelockConflict/LockCommittedKeyupdate still
+PASS; ralph-state-guard OK (self-repaired progress marker); pgbench smoke via pre-commit hook.
 DO NOT stage: postgres, weekly_loc.*, requirements.txt, weekkly_loc_history.py.
 
 >>> NEXT STEP (continue M0118-0003 row-locking group, one spec per loop):
-    Remaining `failed` specs (hardest left): `tuplelock-upgrade-no-deadlock` /
-    `multixact-no-deadlock` — both need DEADLOCK DETECTION across the row-lock wait
-    graph. KEY INSIGHT: lockmgr already HAS a wait-for-graph deadlock detector (used for
-    relation locks) but the ROW-lock path waits via xmax/WaitForXID, NOT lockmgr, so the
-    detector cannot see row-lock waits. The new tableLockMgr added this loop is a possible
-    host. Also remaining: `multixact-no-forget` (WAL/pg_multixact member persistence);
-    `aborted-keyrevoke`/`delete-abort-savept` (subxact-lock-restore). Each is its own loop.
-    Per-spec: write TestPort_Isolation<Name> FIRST and run it to capture the live diff
-    BEFORE engine work (always measure first), then fix → green → CSV failed→pass
-    (rationale=Go func, COMMA-FREE) → regen gen-isolation-coverage + gen-oracle-inventory
-    → design doc slice + README + ledger.
+    Remaining deadlock specs split two ways:
+    (A) LOCK-TABLE multi-object: `deadlock-soft` / `deadlock-soft-2` / `deadlock-hard` —
+        ride the now-wired tableLockMgr but need the GENERAL timeout detector to (a) find
+        multi-object cycles and (b) do SOFT-deadlock queue reordering (rearrange wait queue
+        to avoid killing anyone). lockmgr.checkDeadlockLocked already walks a wait-for graph
+        + picks youngest victim, but verify it handles multi-tag cycles + add soft reorder.
+        CLOSEST to this loop's work — start here.
+    (B) ROW-LOCK wait graph: `tuplelock-upgrade-no-deadlock` / `multixact-no-deadlock` —
+        the row-lock path waits via xmax/WaitForXID NOT lockmgr, so lockmgr's detector
+        can't see those waits; needs a row-lock wait-for graph. Harder.
+    Also: `multixact-no-forget` (WAL/pg_multixact member persistence);
+    `aborted-keyrevoke`/`delete-abort-savept` (subxact-lock-restore). Each its own loop.
+    Per-spec: write TestPort_Isolation<Name> FIRST, run it to capture the live diff BEFORE
+    engine work (always measure first); then fix → green → CSV failed→pass (rationale=Go
+    func, COMMA-FREE) → regen gen-isolation-coverage + gen-oracle-inventory → design slice
+    + README + ledger.
 
 GOTCHAS: CSV rationale MUST be comma-free — [[serena_replace_content_dotall_eats_file]];
 prefer built-in Edit for Go code. tpch-spotcheck INFRA-BLOCKED (SLRU backfill >60s);
 LOCK TABLE / row-lock path never fires in pgbench TPC-B/TPC-H so TPS blast radius nil.
-lockmgr.New() is otherwise dead in prod — do NOT wire the GLOBAL Context.LockMgr (would
-activate every scan/DML/DDL acquire); use a dedicated manager like tableLockMgr.
+lockmgr early-deadlock check is mutually exclusive with the early-GRANT rule
+(canGrantImmediately) at the deciding waiter — lock-nowait still passes. The simple-deadlock
+case is single-object only; multi-object + soft reorder is the GENERAL detector's job.

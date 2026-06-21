@@ -868,6 +868,19 @@ func TestPort_IsolationLockNowait(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-nowait.spec")
 }
 
+// TestPort_IsolationDeadlockSimple exercises the deadlock-simple spec: two
+// sessions each take ACCESS SHARE on a1, then each attempts a lock upgrade to
+// ACCESS EXCLUSIVE. Neither upgrade can complete until the other releases its
+// ACCESS SHARE, so the deadlock detector must abort one session with 40P01.
+// M0118-0003.
+func TestPort_IsolationDeadlockSimple(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_deadlock_simple")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/deadlock-simple.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

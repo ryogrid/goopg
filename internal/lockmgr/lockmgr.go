@@ -269,6 +269,41 @@ func (s *lockState) canGrantImmediately(b BackendID, m Mode) bool {
 	return false
 }
 
+// hasSimpleDeadlock reports whether enqueueing a request for mode `m` by
+// backend `b` (which does not already hold `m`) would constitute an
+// immediate "simple" deadlock — the special case upstream's JoinWaitQueue
+// (proc.c) resolves synchronously instead of waiting for deadlock_timeout.
+//
+// The cycle: `b` already holds a lock here; an earlier waiter `w` is parked
+// whose requested mode conflicts with what `b` holds (so `w` must wait for
+// `b`); and `b`'s requested mode `m` conflicts with what `w` already holds
+// (so `b` must wait for `w`). Neither can complete its upgrade — a deadlock
+// that PostgreSQL detects the instant the second upgrader joins the queue
+// (the deadlock-simple isolation spec). The requester `b` is the victim.
+//
+// Mirrors the JoinWaitQueue scan exactly: only the first waiter that "must
+// wait for me" decides the outcome (deadlock / early-grant / ordinary wait),
+// so we return at that waiter. Caller must hold lm.mu.
+func (s *lockState) hasSimpleDeadlock(b BackendID, m Mode) bool {
+	myHeld := s.holders[b]
+	if myHeld == 0 || len(s.waiters) == 0 {
+		return false
+	}
+	for _, w := range s.waiters {
+		if w.Backend == b {
+			continue
+		}
+		// Must this waiter wait for me? (its requested mode conflicts with a
+		// lock I already hold). The first such waiter is my insertion point;
+		// it is a deadlock iff I must also wait for it — i.e. my requested
+		// mode conflicts with a lock it already holds.
+		if ConflictsWith(w.Mode, myHeld) {
+			return ConflictsWith(m, s.holders[w.Backend])
+		}
+	}
+	return false
+}
+
 // LockManager is the lock table. Use New to construct.
 type LockManager struct {
 	mu              sync.Mutex
@@ -371,6 +406,17 @@ func (lm *LockManager) Acquire(ctx context.Context, b BackendID, t LockTag, m Mo
 		st.granted |= bit(m)
 		lm.mu.Unlock()
 		return nil
+	}
+	// Simple deadlock: `b` already holds a lock here and would queue behind a
+	// conflicting waiter that itself conflicts with `b`'s held locks. Upstream
+	// (JoinWaitQueue) resolves this synchronously rather than parking and
+	// waiting for deadlock_timeout. `b` is the victim; release its other
+	// holdings so the surviving upgrader can proceed (mirrors the timeout
+	// victim path's ReleaseAll), then report the deadlock.
+	if st.hasSimpleDeadlock(b, m) {
+		lm.mu.Unlock()
+		lm.ReleaseAll(b)
+		return ErrDeadlockDetected
 	}
 	// Conflict: enqueue and block.
 	w := &Waiter{
