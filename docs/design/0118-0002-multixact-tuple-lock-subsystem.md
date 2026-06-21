@@ -899,6 +899,68 @@ LockUpdateTraversal,LockCommittedKeyupdate,UpdateLockedTuple,SkipLocked,Nowait,
 Nowait2,Nowait3,Nowait5,SkipLocked2,SkipLocked3,TuplelockConflict}` all PASS;
 executor lock-unit + `internal/multixact` race suites PASS.
 
+### Hot-path wiring slice 12: `SERIAL` `DEFAULT` resolution + step-completion blockers (`tuplelock-update` promoted)
+
+`tuplelock-update` exercises the FOR-KEY-SHARE-then-no-key-update direction of
+the chain-propagation machinery (slice 5/6 in reverse): `s1` first builds an
+update chain (`s1_chain` = `UPDATE pktab SET data = DEFAULT`), then takes
+`FOR KEY SHARE` on the live row (`s1_grablock`); three other sessions
+(`s2`/`s3`/`s4`) each hold a pending no-key `UPDATE` gated behind one of three
+advisory locks `s1` owns. Releasing each advisory lock in turn lets that updater
+follow the `t_ctid` chain and propagate the `KEY SHARE` lock forward onto the new
+version *without* conflicting — a no-key `UPDATE` does not conflict with
+`FOR KEY SHARE`, so each updater proceeds immediately. The row-lock engine
+handled this correctly already (slice 5/6); two **non-engine** divergences blocked
+the promotion:
+
+1. **`SERIAL`/identity `DEFAULT` collapsed to `NULL`** (planner). The spec's
+   `pktab.data` is a `SERIAL NOT NULL`, and both setup (`INSERT INTO pktab VALUES
+   (1, DEFAULT)`) and the chain step (`UPDATE pktab SET data = DEFAULT`) write an
+   explicit `DEFAULT` keyword. goopg leaves `catalog.Column.DefaultExpr` **nil**
+   for serial/identity columns — the executor's `nextval` auto-generation loop
+   (`operators_storage.go`) is authoritative, but it only fires for *omitted*
+   columns (`insertMissing[i]`). `rewriteInsertDefaultMarkers` /
+   `rewriteUpdateDefaultMarkers` substituted a `DefaultMarker` whose column had a
+   nil `DefaultExpr` with `*parser.NullConst`, so the column became
+   *explicitly-provided as NULL*, the auto-gen loop skipped it, and the
+   `NOT NULL` check raised `23502`. Fix: a shared
+   `defaultMarkerReplacement(tbl, ordinal)` helper now returns the column's
+   `DefaultExpr` when present, else a synthesized `nextval('<table>_<col>_seq')`
+   `*parser.FuncCall` for `catalog.IsSerialTypeName` / `IdentityColumn` columns,
+   else `*parser.NullConst`. This mirrors PostgreSQL, where `SERIAL`'s column
+   default literally *is* that `nextval` call; the standard
+   `<table>_<column>_seq` name matches the executor's `seqName` derivation. All
+   three substitution sites (INSERT row cell, UPDATE single-column, UPDATE
+   tuple-form) route through the helper.
+
+2. **Step-completion blocker annotations were a no-op** (isolation runner). The
+   permutation annotates `s1_advunlock1(s2_update)` etc.: the parenthesised
+   `s2_update` is a `BlockerStepComplete` marker telling isolationtester to
+   withhold the unlock step's completion report until the referenced (blocked)
+   step finishes, so the released updater surfaces in a stable order. The runner
+   parsed these markers but `blockersSatisfied` only enforced `BlockerNotices`;
+   `BlockerStepComplete` was treated as always-satisfied, so the instantly-
+   completing unlock printed its result first and the unblocked updater surfaced
+   *after* it — inverted vs upstream, and missing the `<waiting ...>` /
+   `<... completed>` framing. Fix (`isolation_runner.go`): when an
+   immediately-completing step has a `BlockerStepComplete` referencing a step
+   still in `pending`, `reportStepGatedOnBlockers` echoes the step with the
+   `<waiting ...>` marker, awaits the referenced pending blocker step(s) and
+   reports each `<... completed>`, then reports the gating step. Blast radius is
+   nil for already-green specs: of the entire upstream isolation corpus only six
+   specs use parenthesised step-name blockers (`deadlock-hard`,
+   `detach-partition-concurrently-3`/`4`, `intra-grant-inplace-db`,
+   `partition-drop-index-locking`, `tuplelock-update`) and all but this one are
+   still `failed`.
+
+Promoted to `pass` (`TestPort_IsolationTuplelockUpdate`; CSV `failed`→`pass`;
+coverage/inventory regenerated). New planner regression tests
+`TestPlanInsertValuesDefaultSerialSubstitutesNextval` /
+`TestPlanUpdateSetDefaultSerialSubstitutesNextval` pin the `nextval` rewrite.
+Regression batch re-verified green: the 16 `TestPort_Isolation*` lock specs
+(slice-11 batch + `LockCommittedUpdate` + `TuplelockUpdate`) all PASS; full
+`internal/planner` / `internal/parser` / `internal/executor` suites PASS.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -1059,6 +1121,10 @@ verified primitive:
    `tuplelock-conflict` promoted** (*slice 10*; no new engine code).
    ✅ **`skip-locked-4`, `nowait-4` promoted** (*slice 11*; wait policy threaded
    into the real-updater chain-follow branch of `stampLockInner`).
+   ✅ **`tuplelock-update` promoted** (*slice 12*; `SERIAL`/identity `DEFAULT`
+   keyword now rewrites to `nextval` in the planner, and the isolation runner
+   honours `BlockerStepComplete` step-name annotations — no row-lock engine
+   change).
    Still deferred in this cluster: `multixact-no-forget` (needs WAL/`pg_multixact`
    member persistence, item 4); `propagate-lock-delete` (FK-`INSERT` lock
    propagation); `aborted-keyrevoke`; and `multixact-no-deadlock` /

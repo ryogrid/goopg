@@ -6708,6 +6708,37 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 	return &Filter{pos: where.Pos(), Child: scan, Predicate: fullPred}, true, nil
 }
 
+// defaultMarkerReplacement returns the expression a `*parser.DefaultMarker`
+// cell targeting tbl.Columns[ordinal] should be rewritten to: the column's
+// catalog DefaultExpr when present, else a synthesized nextval('<tbl>_<col>_seq')
+// call for SERIAL / BIGSERIAL / SMALLSERIAL and GENERATED AS IDENTITY columns,
+// else a NULL literal. goopg leaves catalog.Column.DefaultExpr nil for serial/
+// identity columns — the executor's auto-generation loop is authoritative for
+// OMITTED columns — so an explicit DEFAULT keyword (e.g.
+// `INSERT INTO t VALUES (1, DEFAULT)` / `UPDATE t SET data = DEFAULT`) would
+// otherwise collapse to NULL and trip the NOT NULL constraint. Mirroring
+// PostgreSQL, where SERIAL's column default literally IS nextval(...), we emit
+// that call so the value path produces the next sequence value. The standard
+// "<table>_<column>_seq" name matches the executor's seqName derivation; a
+// renamed sequence (rare, and not survivable by name anywhere in goopg) is not
+// resolved here.
+func defaultMarkerReplacement(tbl *catalog.Table, ordinal int) parser.Expr {
+	if ordinal >= 0 && ordinal < len(tbl.Columns) {
+		col := tbl.Columns[ordinal]
+		if def := col.DefaultExpr; def != nil {
+			return def
+		}
+		if catalog.IsSerialTypeName(col.Type.Name) || col.IdentityColumn {
+			seqName := strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+			return &parser.FuncCall{
+				Name: parser.ObjectName{Name: "nextval"},
+				Args: []parser.Expr{&parser.StringConst{Value: seqName}},
+			}
+		}
+	}
+	return &parser.NullConst{}
+}
+
 // rewriteInsertDefaultMarkers substitutes `*parser.DefaultMarker` cells
 // in an INSERT's VALUES rows with the target column's catalog
 // `DefaultExpr` (or `*parser.NullConst` when the column has no
@@ -6785,15 +6816,7 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 				continue
 			}
 			tgt := colIndex[i]
-			if tgt < 0 || tgt >= len(tbl.Columns) {
-				r[i] = &parser.NullConst{}
-				continue
-			}
-			if def := tbl.Columns[tgt].DefaultExpr; def != nil {
-				r[i] = def
-			} else {
-				r[i] = &parser.NullConst{}
-			}
+			r[i] = defaultMarkerReplacement(tbl, tgt)
 		}
 	}
 	return nil
@@ -6835,11 +6858,7 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 				if !ok {
 					return nil
 				}
-				if def := tbl.Columns[col.Ordinal].DefaultExpr; def != nil {
-					row.Elems[j] = def
-				} else {
-					row.Elems[j] = &parser.NullConst{}
-				}
+				row.Elems[j] = defaultMarkerReplacement(tbl, col.Ordinal)
 			}
 			continue
 		}
@@ -6853,11 +6872,7 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 			// uniform.
 			return nil
 		}
-		if def := tbl.Columns[col.Ordinal].DefaultExpr; def != nil {
-			a.Expr = def
-		} else {
-			a.Expr = &parser.NullConst{}
-		}
+		a.Expr = defaultMarkerReplacement(tbl, col.Ordinal)
 	}
 	return nil
 }

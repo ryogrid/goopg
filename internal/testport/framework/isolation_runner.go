@@ -408,18 +408,31 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			// Step completed immediately — release its context.
 			stepCancel()
 			activeSteps[step.Session] = nil
-			// Honor completion blockers: delay reporting this step's
-			// completion until the markers are satisfied (e.g. "notices <n>").
-			waitForStepBlockers(spec, sessionQueues, stepBlockers, stepBaselines)
-			// Drain notices generated during this non-blocking step.
-			if q != nil {
-				outcome.notices = q.drain()
+			if hasPendingStepCompleteBlocker(stepBlockers, pending) {
+				// PostgreSQL isolationtester: a step annotated with a
+				// step-completion blocker that names a still-pending (blocked)
+				// step — e.g. s1_advunlock1(s2_update) — is rendered in the
+				// waiting/completed format, its own completion report withheld
+				// until the referenced blocker step finishes. The step's query
+				// has already run (here, releasing the advisory lock the blocker
+				// waits on), so awaiting the blocker now lets it surface in the
+				// stable upstream order.
+				pending = reportStepGatedOnBlockers(&sb, spec, sessionQueues,
+					step.Name, step.SQL, outcome, q, stepBlockers, pending)
+			} else {
+				// Honor completion blockers: delay reporting this step's
+				// completion until the markers are satisfied (e.g. "notices <n>").
+				waitForStepBlockers(spec, sessionQueues, stepBlockers, stepBaselines)
+				// Drain notices generated during this non-blocking step.
+				if q != nil {
+					outcome.notices = q.drain()
+				}
+				// Print the current step first, then give pending steps a brief
+				// window to complete (matching PostgreSQL isolationtester order:
+				// unblocked waiting steps appear before the next regular step).
+				sb.WriteString(formatStepOutput(step.Name, step.SQL, outcome, false))
+				pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait)
 			}
-			// Print the current step first, then give pending steps a brief
-			// window to complete (matching PostgreSQL isolationtester order:
-			// unblocked waiting steps appear before the next regular step).
-			sb.WriteString(formatStepOutput(step.Name, step.SQL, outcome, false))
-			pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait)
 
 		case <-time.After(blockDetectWait):
 			// Step appears blocked.  Drain notices that arrived before the
@@ -550,6 +563,76 @@ func waitForStepBlockers(spec IsolationSpec, queues map[string]*sessionNoticeQue
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+}
+
+// hasPendingStepCompleteBlocker reports whether any of the step's blockers is a
+// BlockerStepComplete that references a step currently in `pending` (launched
+// but not yet reported complete). Such a step must be rendered in PostgreSQL
+// isolationtester's waiting/completed format with its report gated behind the
+// referenced blocker step.
+func hasPendingStepCompleteBlocker(blockers []StepBlocker, pending []pendingStep) bool {
+	for _, b := range blockers {
+		if b.Kind != BlockerStepComplete {
+			continue
+		}
+		for _, p := range pending {
+			if p.name == b.StepName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// reportStepGatedOnBlockers renders a step that completed immediately but is
+// annotated with one or more BlockerStepComplete markers referencing pending
+// (still-blocked) steps. Mirrors PostgreSQL isolationtester: the step is echoed
+// with the "<waiting ...>" marker, then each referenced blocker step is awaited
+// and reported complete, and finally this step is reported complete. The step's
+// own query has already executed (its outcome is in `outcome`) — typically it
+// released the lock the blocker steps were waiting on. Returns the pending slice
+// with the completed blocker steps removed.
+func reportStepGatedOnBlockers(sb *strings.Builder, spec IsolationSpec, queues map[string]*sessionNoticeQueue,
+	name, sql string, outcome stepOutcome, queue *sessionNoticeQueue, blockers []StepBlocker, pending []pendingStep) []pendingStep {
+	sb.WriteString(formatWaitingStepHeader(name, sql))
+	for _, b := range blockers {
+		if b.Kind != BlockerStepComplete {
+			continue
+		}
+		for i := 0; i < len(pending); i++ {
+			p := pending[i]
+			if p.name != b.StepName {
+				continue
+			}
+			select {
+			case o := <-p.outCh:
+				if p.cancelFn != nil {
+					p.cancelFn()
+				}
+				waitForStepBlockers(spec, queues, p.blockers, p.baselines)
+				if p.queue != nil {
+					o.notices = p.queue.drain()
+				}
+				writeCompletedStep(sb, p.name, p.sql, o)
+			case <-time.After(drainWindow):
+				fmt.Fprintf(sb, "step %s: <... timed out waiting>\n", p.name)
+				if p.cancelFn != nil {
+					p.cancelFn()
+					select {
+					case <-p.outCh:
+					case <-time.After(2 * time.Second):
+					}
+				}
+			}
+			pending = append(pending[:i], pending[i+1:]...)
+			break
+		}
+	}
+	if queue != nil {
+		outcome.notices = queue.drain()
+	}
+	writeCompletedStep(sb, name, sql, outcome)
+	return pending
 }
 
 // writeCompletedStep writes a blocked step's completed output: NOTICEs first

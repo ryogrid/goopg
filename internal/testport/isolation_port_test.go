@@ -808,6 +808,22 @@ func TestPort_IsolationNowait4(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-4.spec")
 }
 
+// TestPort_IsolationTuplelockUpdate exercises the tuplelock-update spec: s1 first
+// builds an update chain via s1_chain (UPDATE pktab SET data = DEFAULT) then takes
+// FOR KEY SHARE on the live row (s1_grablock). Three other sessions (s2/s3/s4)
+// each have a pending no-key UPDATE gated behind one of three advisory locks s1
+// holds; releasing each advisory lock in turn lets that updater run. Each no-key
+// UPDATE does NOT conflict with FOR KEY SHARE, so the updater follows the ctid
+// chain, propagates the KEY SHARE lock forward onto the new version, and proceeds
+// immediately rather than blocking. M0118-0003.
+func TestPort_IsolationTuplelockUpdate(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_tuplelock_update")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-update.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()
