@@ -23,21 +23,36 @@ func (lm *LockManager) CheckDeadlocksNow() bool {
 	return lm.checkDeadlockLocked()
 }
 
-// runDeadlockCheck is the time.AfterFunc target. It can fire after
-// the parked backend has already woken (signal or context cancel)
-// and the lockState GC'd; the lock check is a no-op in those cases.
-func (lm *LockManager) runDeadlockCheck() {
+// runDeadlockCheckFor is the time.AfterFunc target scheduled by a
+// parked backend's Acquire. It can fire after the parked backend has
+// already woken (signal or context cancel) and the lockState GC'd; the
+// check is a no-op in those cases. `b` is the backend whose timer fired:
+// when it participates in the discovered cycle it is preferred as the
+// victim, mirroring PostgreSQL where the process that runs DeadLockCheck
+// (its deadlock_timeout having expired) is the one rolled back.
+func (lm *LockManager) runDeadlockCheckFor(b BackendID) {
 	lm.mu.Lock()
 	defer lm.mu.Unlock()
-	lm.checkDeadlockLocked()
+	lm.checkDeadlockLockedFor(b)
 }
 
-// checkDeadlockLocked is the detector entry point. Caller holds
-// lm.mu. Walks every waiter, builds outbound edges to conflicting
-// holders, runs DFS, cancels at most one victim per pass.
+// checkDeadlockLocked is the detector entry point used by
+// CheckDeadlocksNow (no preferred victim → youngest-in-cycle). Caller
+// holds lm.mu.
 //
 // Returns true if a victim was cancelled.
 func (lm *LockManager) checkDeadlockLocked() bool {
+	return lm.checkDeadlockLockedFor(0)
+}
+
+// checkDeadlockLockedFor walks every waiter, builds outbound edges to
+// conflicting holders, runs DFS, and cancels at most one victim per
+// pass. When `prefer` is non-zero and participates in the discovered
+// cycle it is chosen as the victim; otherwise the youngest backend
+// (highest BackendID) in the cycle is chosen. Caller holds lm.mu.
+//
+// Returns true if a victim was cancelled.
+func (lm *LockManager) checkDeadlockLockedFor(prefer BackendID) bool {
 	// Build adjacency: waiter -> set of holders it's blocked on.
 	// A waiter blocks on holder h iff h's mask conflicts with the
 	// waiter's mode AND h != waiter (no self-edges).
@@ -63,12 +78,22 @@ func (lm *LockManager) checkDeadlockLocked() bool {
 		return false
 	}
 
-	// Pick victim = youngest backend (highest BackendID).
+	// Pick victim = youngest backend (highest BackendID), unless the
+	// firing backend `prefer` is itself in the cycle, in which case it
+	// is the victim (PostgreSQL rolls back the session that discovers
+	// the deadlock).
 	victim := cycle[0]
-	for _, b := range cycle[1:] {
+	preferInCycle := false
+	for _, b := range cycle {
 		if b > victim {
 			victim = b
 		}
+		if prefer != 0 && b == prefer {
+			preferInCycle = true
+		}
+	}
+	if preferInCycle {
+		victim = prefer
 	}
 
 	lm.cancelVictimLocked(victim)

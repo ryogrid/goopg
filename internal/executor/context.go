@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/activity"
@@ -690,7 +692,7 @@ func (c *Context) acquireRelLockTxn(rel storage.RelFileNode, mode lockmgr.Mode, 
 	if c.Ctx != nil {
 		lockCtx = c.Ctx
 	}
-	err := tableLockMgr.Acquire(lockCtx, c.TxnLockBackendID, tag, mode)
+	err := tableLockMgr.AcquireWithTimeout(lockCtx, c.TxnLockBackendID, tag, mode, c.deadlockTimeout())
 	if c.Activity != nil {
 		c.Activity.WaitEventEnd(c.ProcNum)
 	}
@@ -704,6 +706,27 @@ func (c *Context) acquireRelLockTxn(rel storage.RelFileNode, mode lockmgr.Mode, 
 		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
 	}
 	return &ExecError{Code: "XX000", Message: err.Error()}
+}
+
+// deadlockTimeout returns the session-effective `deadlock_timeout` GUC as
+// a duration, governing how long a LOCK TABLE wait parks before the
+// deadlock detector runs. Falls back to lockmgr.DefaultDeadlockTimeout
+// when the GUC is unset or unparseable. The effective GUC value is a bare
+// integer in milliseconds (UnitMs canonicalises away the unit suffix).
+// M0118-0004.
+func (c *Context) deadlockTimeout() time.Duration {
+	if c.GetSetting == nil {
+		return lockmgr.DefaultDeadlockTimeout
+	}
+	v, ok := c.GetSetting("deadlock_timeout")
+	if !ok {
+		return lockmgr.DefaultDeadlockTimeout
+	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil || ms <= 0 {
+		return lockmgr.DefaultDeadlockTimeout
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // Checkpointer is the contract the SQL `CHECKPOINT` verb uses to

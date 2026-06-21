@@ -1,49 +1,52 @@
-Task: M0118-0003 (row locking) — COMPLETE this loop: promoted `deadlock-simple` (slice 16)
-via synchronous simple (lock-upgrade) deadlock detection in lockmgr. M0118-0003 continues.
+Task: M0118-0004 (deadlock detection) — COMPLETE this loop: promoted `deadlock-hard`
+(first general-detector slice; design 0118-0005). M0118-0004 continues.
 
 DONE this loop (committed):
-- NEW ENGINE WORK — lockmgr early/simple deadlock detection. lockmgr had ONLY the
-  timeout-driven detector (time.AfterFunc(deadlockTimeout)); PG's JoinWaitQueue (proc.c)
-  resolves a simple lock-upgrade deadlock SYNCHRONOUSLY when the 2nd upgrader joins the
-  queue (no deadlock_timeout wait) → victim errors immediately with NO `<waiting>` marker.
-- Added lockState.hasSimpleDeadlock(b,m): mirrors the JoinWaitQueue scan — b holds a lock
-  here AND would queue behind first conflicting waiter w (w.Mode conflicts w/ b's held →
-  w waits for b) AND b's mode conflicts w/ w's held (b waits for w) → deadlock, b is victim.
-- Acquire calls it after canGrantImmediately (mutually exclusive at the deciding waiter)
-  and before enqueue; on hit: unlock → ReleaseAll(b) (mirrors timeout victim path so the
-  survivor's wake-pass fires) → return ErrDeadlockDetected (→40P01 via acquireRelLockTxn).
-- Files: internal/lockmgr/lockmgr.go (+hasSimpleDeadlock +Acquire branch);
-  testport/isolation_port_test.go (+TestPort_IsolationDeadlockSimple). CSV failed→pass,
-  coverage+inventory regen (isolation pass 52→53). Design NEW 0118-0004 + README index.
-  Ledger row appended.
+- NEW ENGINE WORK — general timeout-driven multi-object LOCK TABLE deadlock detection.
+  Three gaps fixed: (1) `deadlock_timeout` was NOT a GUC → SET failed at session setup;
+  registered (config/defaults.go + postgresql.conf.sample, TypeInt UnitMs BootVal 1000
+  ContextSuset). (2) detector always picked YOUNGEST backend but PG rolls back the
+  backend that RUNS the check → new lockmgr.AcquireWithTimeout + Context.deadlockTimeout()
+  feed per-session timeout; timer fires runDeadlockCheckFor(b) → checkDeadlockLockedFor(prefer)
+  picks `prefer` when in cycle else youngest; CheckDeadlocksNow keeps prefer=0 (unit tests
+  unchanged). (3) runner ignored `(*)` BlockerStar marker → hasStarBlocker renders such a
+  step waiting/completed even when it completed immediately (victim's fast 40P01), then
+  drainWithTimeout so s7a8 (gated on s8a1) surfaces in order. No passing spec uses (*).
+- Files: internal/config/defaults.go + postgresql.conf.sample; internal/lockmgr/lockmgr.go
+  (+AcquireWithTimeout +acquire +useConfiguredTimeout) + deadlock.go (runDeadlockCheckFor
+  + checkDeadlockLockedFor prefer-victim); internal/executor/context.go (+deadlockTimeout()
+  + AcquireWithTimeout call); internal/testport/framework/isolation_runner.go (+hasStarBlocker
+  + (*) immediate-branch); testport/isolation_port_test.go (+TestPort_IsolationDeadlockHard).
+  CSV failed→pass; coverage+inventory regen (isolation pass 53→54). Design NEW 0118-0005 +
+  README index. Ledger row appended; fix_plan M0118-0004 annotated.
 
-GATES (all PASS): go build ./...; gofmt+vet clean; TestPort_IsolationDeadlockSimple PASS
-byte-for-byte; -race ./internal/lockmgr/... PASS (incl. linear-chain false-positive guard);
--race executor Lock|Deadlock PASS; LockNowait/TuplelockConflict/LockCommittedKeyupdate still
-PASS; ralph-state-guard OK (self-repaired progress marker); pgbench smoke via pre-commit hook.
+GATES (all PASS): go build ./...; gofmt+vet clean; TestPort_IsolationDeadlockHard PASS
+byte-for-byte; -race ./internal/lockmgr/... PASS; -race executor Lock|Deadlock PASS;
+config tests PASS (GUC + sample); DeadlockSimple/LockNowait/TuplelockUpdate still PASS;
+ralph-state-guard OK; pgbench smoke via pre-commit hook.
 DO NOT stage: postgres, weekly_loc.*, requirements.txt, weekkly_loc_history.py.
 
->>> NEXT STEP (continue M0118-0003 row-locking group, one spec per loop):
-    Remaining deadlock specs split two ways:
-    (A) LOCK-TABLE multi-object: `deadlock-soft` / `deadlock-soft-2` / `deadlock-hard` —
-        ride the now-wired tableLockMgr but need the GENERAL timeout detector to (a) find
-        multi-object cycles and (b) do SOFT-deadlock queue reordering (rearrange wait queue
-        to avoid killing anyone). lockmgr.checkDeadlockLocked already walks a wait-for graph
-        + picks youngest victim, but verify it handles multi-tag cycles + add soft reorder.
-        CLOSEST to this loop's work — start here.
-    (B) ROW-LOCK wait graph: `tuplelock-upgrade-no-deadlock` / `multixact-no-deadlock` —
-        the row-lock path waits via xmax/WaitForXID NOT lockmgr, so lockmgr's detector
-        can't see those waits; needs a row-lock wait-for graph. Harder.
-    Also: `multixact-no-forget` (WAL/pg_multixact member persistence);
-    `aborted-keyrevoke`/`delete-abort-savept` (subxact-lock-restore). Each its own loop.
-    Per-spec: write TestPort_Isolation<Name> FIRST, run it to capture the live diff BEFORE
-    engine work (always measure first); then fix → green → CSV failed→pass (rationale=Go
-    func, COMMA-FREE) → regen gen-isolation-coverage + gen-oracle-inventory → design slice
-    + README + ledger.
+>>> NEXT STEP (continue M0118-0004 deadlock group, one spec per loop):
+    RESUME at `deadlock-soft` (then `deadlock-soft-2`). These need SOFT-deadlock
+    wait-queue REORDERING: when a cycle has a soft edge (a waiter blocking another
+    waiter, not a holder), PG's deadlock.c FindLockCycle + ProcLockWakeup rearrange
+    the wait queue to break the cycle WITHOUT aborting anyone. goopg's detector
+    currently only KILLS a victim — it has no queue-reorder path. deadlock-soft:
+    4 procs, 2 hard + 2 soft edges; detector reverses the d1-e2 soft edge, unblocking
+    d1, nobody dies (expected output has NO error). deadlock-soft-2: s1 must jump over
+    BOTH s3 and s4 (hard-blocked on a1) and grab a2 immediately. Both ride tableLockMgr
+    + the per-session deadlock_timeout + (*) marker landed this loop. Implement soft-edge
+    detection in checkDeadlockLockedFor: distinguish waiter→holder (hard) from
+    waiter→waiter (soft) edges; on a cycle with a soft edge, reorder the wait queue
+    (move the blocked waiter ahead) and re-run wakePass instead of cancelling.
+    THEN: `deadlock-parallel`; `multixact-no-deadlock`/`tuplelock-upgrade-no-deadlock`
+    (row-lock xmax/WaitForXID wait graph — lockmgr can't see those waits; hardest).
+    Per-spec: write TestPort_Isolation<Name> FIRST, run to capture the live diff BEFORE
+    engine work; fix → green → CSV failed→pass (rationale=Go func COMMA-FREE) → regen
+    gen-isolation-coverage + gen-oracle-inventory → design slice + README + ledger.
 
 GOTCHAS: CSV rationale MUST be comma-free — [[serena_replace_content_dotall_eats_file]];
 prefer built-in Edit for Go code. tpch-spotcheck INFRA-BLOCKED (SLRU backfill >60s);
-LOCK TABLE / row-lock path never fires in pgbench TPC-B/TPC-H so TPS blast radius nil.
-lockmgr early-deadlock check is mutually exclusive with the early-GRANT rule
-(canGrantImmediately) at the deciding waiter — lock-nowait still passes. The simple-deadlock
-case is single-object only; multi-object + soft reorder is the GENERAL detector's job.
+LOCK TABLE never fires in pgbench TPC-B/TPC-H so TPS blast radius nil. The per-session
+deadlock_timeout + firing-backend victim + (*) runner marker are NOW landed — reuse them.
+deadlock_timeout sample entry MUST equal BootVal exactly (1000) or config test fails.

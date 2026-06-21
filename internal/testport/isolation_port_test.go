@@ -881,6 +881,23 @@ func TestPort_IsolationDeadlockSimple(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/deadlock-simple.spec")
 }
 
+// TestPort_IsolationDeadlockHard exercises the deadlock-hard spec: eight
+// sessions each LOCK TABLE their own relation then attempt to LOCK the next in a
+// ring (s1→a2, s2→a3, …, s8→a1), forming an 8-way cycle. Every session sets a
+// 100s deadlock_timeout except s8 (10ms), so s8's wait-timer fires first; the
+// main lock detector finds the multi-relation cycle and rolls back the session
+// that discovered it (s8) with 40P01. Exercises the general (timeout-driven)
+// wait-for-graph deadlock detector over the transaction-scoped LOCK TABLE
+// heavyweight locks, per-session deadlock_timeout, and triggering-backend
+// victim selection. M0118-0004.
+func TestPort_IsolationDeadlockHard(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_deadlock_hard")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/deadlock-hard.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

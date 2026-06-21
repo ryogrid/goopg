@@ -289,6 +289,8 @@
                                         # (SIGHUP to apply)
 #max_prepared_transactions = 0          # 0-262143; zero disables 2PC
                                         # (change requires restart)
+#deadlock_timeout = 1000                # 1-2147483647 ms; wait before
+                                        # running the deadlock detector
 
 
 #------------------------------------------------------------------------------

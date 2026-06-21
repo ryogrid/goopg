@@ -381,6 +381,24 @@ func (lm *LockManager) TryAcquire(b BackendID, t LockTag, m Mode) error {
 }
 
 func (lm *LockManager) Acquire(ctx context.Context, b BackendID, t LockTag, m Mode) error {
+	return lm.acquire(ctx, b, t, m, useConfiguredTimeout)
+}
+
+// AcquireWithTimeout is Acquire with a per-call deadlock timeout. LOCK
+// TABLE uses it so each session's `deadlock_timeout` GUC governs how
+// long that session waits before running the detector — the spec suite
+// relies on the session with the shortest timeout discovering (and being
+// rolled back for) the cycle. A timeout <= 0 disables the auto-fire timer
+// for this acquire. M0118-0004.
+func (lm *LockManager) AcquireWithTimeout(ctx context.Context, b BackendID, t LockTag, m Mode, timeout time.Duration) error {
+	return lm.acquire(ctx, b, t, m, timeout)
+}
+
+// useConfiguredTimeout is the sentinel passed to acquire to make it fall
+// back to the manager-wide deadlockTimeout field (read under lm.mu).
+const useConfiguredTimeout time.Duration = -1
+
+func (lm *LockManager) acquire(ctx context.Context, b BackendID, t LockTag, m Mode, timeout time.Duration) error {
 	if m <= NoLock || m > maxMode {
 		return fmt.Errorf("lockmgr: invalid mode %d", int(m))
 	}
@@ -427,14 +445,19 @@ func (lm *LockManager) Acquire(ctx context.Context, b BackendID, t LockTag, m Mo
 		victim:  make(chan struct{}, 1),
 	}
 	st.waiters = append(st.waiters, w)
-	timeout := lm.deadlockTimeout
+	if timeout == useConfiguredTimeout {
+		timeout = lm.deadlockTimeout
+	}
 	lm.mu.Unlock()
 
 	// Schedule a deadlock check after the configured timeout.
-	// Idempotent and cheap; concurrent fires serialise on lm.mu.
+	// Idempotent and cheap; concurrent fires serialise on lm.mu. The
+	// check prefers THIS backend as the victim when it is part of a
+	// cycle — mirroring PostgreSQL, where the backend whose
+	// deadlock_timeout expires runs DeadLockCheck and is rolled back.
 	var timer *time.Timer
 	if timeout > 0 {
-		timer = time.AfterFunc(timeout, lm.runDeadlockCheck)
+		timer = time.AfterFunc(timeout, func() { lm.runDeadlockCheckFor(b) })
 		defer timer.Stop()
 	}
 

@@ -153,7 +153,14 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       lock-update-{delete,traversal}, update-locked-tuple, propagate-lock-delete,
       lock-committed-keyupdate.
 - [ ] **M0118-0004** — Deadlock detection: deadlock-{hard,simple,soft,soft-2,parallel},
-      multixact-no-deadlock.
+      multixact-no-deadlock. **Done so far:** `deadlock-simple` (slice 16, design
+      0118-0004) + `deadlock-hard` (general timeout-driven multi-object detector,
+      `deadlock_timeout` GUC + per-session lockmgr timeout + firing-backend victim +
+      runner `(*)` marker; design 0118-0005). **Remaining:** `deadlock-soft`/`-soft-2`
+      (SOFT-deadlock wait-queue reordering — break a cycle by moving a waiter ahead
+      instead of aborting; not yet implemented), `deadlock-parallel`,
+      `multixact-no-deadlock` (row-lock xmax/WaitForXID wait graph, invisible to
+      lockmgr). Resume at `deadlock-soft`.
 - [ ] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,
       temporal-range-integrity.

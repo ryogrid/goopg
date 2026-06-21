@@ -715,6 +715,18 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// deadlock_timeout: how long a backend waits on a lock before running the
+	// deadlock detector. Superuser-set (PGC_SUSET), default 1s. goopg honours it
+	// for LOCK TABLE waits on the transaction-scoped heavyweight lock manager
+	// (executor.acquireRelLockTxn → lockmgr); the isolation deadlock specs set
+	// it per session so the session with the shortest timeout deterministically
+	// discovers the cycle. Mirrors guc_tables.c (M0118-0004).
+	r.MustRegister(NewVariable(Variable{
+		Name: "deadlock_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "1000",
+		MinVal: 1, MaxVal: 2147483647,
+		Context: ContextSuset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 	// transaction_timeout (PG 17+). pg_dump's setup_connection disables it
 	// (SET transaction_timeout = 0) alongside the other timeouts; goopg does
 	// not enforce it, but SET must succeed. Mirrors guc_tables.c.

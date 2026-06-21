@@ -419,6 +419,22 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 				// stable upstream order.
 				pending = reportStepGatedOnBlockers(&sb, spec, sessionQueues,
 					step.Name, step.SQL, outcome, q, stepBlockers, pending)
+			} else if hasStarBlocker(stepBlockers) {
+				// PostgreSQL isolationtester (*) marker: the step is expected
+				// to block, so it is ALWAYS reported in waiting/completed
+				// format even when goopg observed it complete immediately. The
+				// deadlock specs use it for the victim step whose
+				// deadlock_timeout fires too fast to reliably catch in a wait
+				// state (deadlock-hard's s8a1(*)). Mirror the immediate-else
+				// branch's notice drain + post-step drain so unblocked waiters
+				// (e.g. s7a8, gated on s8a1) still surface in upstream order.
+				waitForStepBlockers(spec, sessionQueues, stepBlockers, stepBaselines)
+				if q != nil {
+					outcome.notices = q.drain()
+				}
+				sb.WriteString(formatWaitingStepHeader(step.Name, step.SQL))
+				writeCompletedStep(&sb, step.Name, step.SQL, outcome)
+				pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait)
 			} else {
 				// Honor completion blockers: delay reporting this step's
 				// completion until the markers are satisfied (e.g. "notices <n>").
@@ -570,6 +586,18 @@ func waitForStepBlockers(spec IsolationSpec, queues map[string]*sessionNoticeQue
 // but not yet reported complete). Such a step must be rendered in PostgreSQL
 // isolationtester's waiting/completed format with its report gated behind the
 // referenced blocker step.
+// hasStarBlocker reports whether any of the step's blockers is the (*) marker
+// (BlockerStar), which in PostgreSQL isolationtester forces the step to be
+// reported in waiting/completed format regardless of observed timing.
+func hasStarBlocker(blockers []StepBlocker) bool {
+	for _, b := range blockers {
+		if b.Kind == BlockerStar {
+			return true
+		}
+	}
+	return false
+}
+
 func hasPendingStepCompleteBlocker(blockers []StepBlocker, pending []pendingStep) bool {
 	for _, b := range blockers {
 		if b.Kind != BlockerStepComplete {
