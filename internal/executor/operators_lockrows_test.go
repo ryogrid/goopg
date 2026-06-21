@@ -7,6 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -688,6 +689,159 @@ func TestForShareCompatibleMultipleHolders(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("session 3 did not unblock after both holders released")
+	}
+}
+
+// scanBlock0 walks block 0 of tbl and returns the (1-based) slot and header of
+// the first tuple matching pred, or slot==0 when none match. Used by the
+// MultiXact tests to inspect the post-stamp page state.
+func scanBlock0(t *testing.T, ctx *Context, tbl *catalog.Table, pred func(storage.HeapTupleHeader) bool) (uint16, storage.HeapTupleHeader) {
+	t.Helper()
+	rel := ctx.Catalog.RelFileNode(tbl)
+	pinned, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Pool.Unpin(pinned)
+	pinned.RLock()
+	defer pinned.RUnlock()
+	page := pinned.Page()
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(page, slot)
+		if err != nil {
+			continue
+		}
+		parsed, err := storage.ParseHeapTuple(raw)
+		if err != nil {
+			continue
+		}
+		if pred(parsed.Header) {
+			return slot, parsed.Header
+		}
+	}
+	return 0, storage.HeapTupleHeader{}
+}
+
+// TestForShareFormsLockOnlyMultiXact is the headline MultiXact producer +
+// consumer test (M0118-0003). It exercises the whole round-trip against the
+// real hint-bit encoder:
+//
+//   - PRODUCER: two concurrent FOR SHARE holders on the same row must combine
+//     into a single lock-only MultiXactId xmax naming both holders, rather than
+//     the second silently overwriting the first's xmax.
+//   - CONSUMER (live multi): a third FOR UPDATE NOWAIT must resolve the multi's
+//     members, see that they are still active, and fail fast with 55P03 —
+//     proving the raw MultiXactId is not mis-read as a single TransactionID.
+//   - CONSUMER (holders gone): once both holders' transactions end, a fresh FOR
+//     UPDATE finds no live member and re-stamps a plain single-holder xmax.
+func TestForShareFormsLockOnlyMultiXact(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+	store := multixact.NewStore()
+
+	mkSession := func(b lockmgr.BackendID) *Context {
+		tx, _ := ctx.TxnMgr.Begin(0)
+		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
+		s := makeCtx(lm, b)
+		s.Pool = ctx.Pool
+		s.Catalog = ctx.Catalog
+		s.TxnMgr = ctx.TxnMgr
+		s.MultiXact = store
+		s.Tx = tx
+		s.Snap = snap
+		return s
+	}
+
+	s1 := mkSession(1)
+	s2 := mkSession(2)
+	if _, err := runForUpdate(t, s1, "SELECT id FROM items WHERE id = 1 FOR SHARE"); err != nil {
+		t.Fatalf("session-1 FOR SHARE: %v", err)
+	}
+	if _, err := runForUpdate(t, s2, "SELECT id FROM items WHERE id = 1 FOR SHARE"); err != nil {
+		t.Fatalf("session-2 FOR SHARE: %v", err)
+	}
+
+	// PRODUCER: id=1's tuple now carries a lock-only MultiXactId xmax.
+	_, hdr := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return storage.IsHeapTupleXmaxMulti(h.Infomask)
+	})
+	if hdr.Xmax == storage.InvalidTransactionID {
+		t.Fatal("no tuple carries a MultiXactId xmax after two FOR SHARE holders")
+	}
+	if !storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		t.Errorf("multi xmax not lock-only (Infomask=%#x)", hdr.Infomask)
+	}
+	members, ok := store.Members(multixact.MultiXactId(hdr.Xmax))
+	if !ok {
+		t.Fatalf("store has no members for multi %d", hdr.Xmax)
+	}
+	if len(members) != 2 {
+		t.Fatalf("multi has %d members, want 2: %+v", len(members), members)
+	}
+	byXid := map[storage.TransactionID]multixact.Status{}
+	for _, m := range members {
+		byXid[m.Xid] = m.Status
+	}
+	if st, ok := byXid[s1.Tx.XID]; !ok || st != multixact.StatusForShare {
+		t.Errorf("s1 (xid=%d) member missing/wrong status=%v members=%+v", s1.Tx.XID, st, members)
+	}
+	if st, ok := byXid[s2.Tx.XID]; !ok || st != multixact.StatusForShare {
+		t.Errorf("s2 (xid=%d) member missing/wrong status=%v members=%+v", s2.Tx.XID, st, members)
+	}
+
+	// CONSUMER (live multi): drop both holders' statement-scoped lockmgr tuple
+	// locks (their transactions stay active) so a third session reaches the
+	// heap-xmax conflict detection instead of blocking at the lockmgr. FOR
+	// UPDATE NOWAIT must fail fast with 55P03 because the multi is still live.
+	lm.ReleaseAll(1)
+	lm.ReleaseAll(2)
+	s3 := mkSession(3)
+	defer ctx.TxnMgr.Rollback(s3.Tx)
+	if _, err := runForUpdate(t, s3, "SELECT id FROM items WHERE id = 1 FOR UPDATE NOWAIT"); err == nil {
+		t.Fatal("FOR UPDATE NOWAIT against a live lock-only multi did not fail")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "55P03" {
+		t.Fatalf("FOR UPDATE NOWAIT error = %v, want 55P03", err)
+	}
+	// NOWAIT grants the lockmgr tuple tag before the heap-level 55P03 fires; in
+	// production dispatch releases it at statement end. Mirror that so the next
+	// session does not block on s3's leftover ExclusiveLock.
+	lm.ReleaseAll(3)
+
+	// CONSUMER (holders gone): end both holders' transactions; a fresh FOR
+	// UPDATE finds no live member and re-stamps a plain single-holder xmax.
+	if err := ctx.TxnMgr.Rollback(s1.Tx); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.TxnMgr.Rollback(s2.Tx); err != nil {
+		t.Fatal(err)
+	}
+	s4 := mkSession(4)
+	defer ctx.TxnMgr.Rollback(s4.Tx)
+	if _, err := runForUpdate(t, s4, "SELECT id FROM items WHERE id = 1 FOR UPDATE"); err != nil {
+		t.Fatalf("session-4 FOR UPDATE after holders gone: %v", err)
+	}
+	_, hdr4 := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return h.Xmax == s4.Tx.XID && !storage.IsHeapTupleXmaxMulti(h.Infomask)
+	})
+	if hdr4.Xmax != s4.Tx.XID {
+		t.Fatalf("after holders gone, no single-holder xmax==%d found", s4.Tx.XID)
+	}
+	if storage.IsHeapTupleXmaxMulti(hdr4.Infomask) {
+		t.Errorf("s4 single FOR UPDATE left a multi xmax (Infomask=%#x)", hdr4.Infomask)
+	}
+	if !storage.IsHeapTupleLockOnly(hdr4.Infomask) || hdr4.Infomask&storage.HeapXmaxExclLock == 0 {
+		t.Errorf("s4 xmax not lock-only exclusive (Infomask=%#x)", hdr4.Infomask)
 	}
 }
 

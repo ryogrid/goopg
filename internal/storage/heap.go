@@ -900,7 +900,7 @@ func PageSetHeapTupleXmax(p Page, slot uint16, xmax TransactionID) error {
 	// for any tuple written via the canonical path, silently skipping the EPQ
 	// wait loop on concurrent DELETE/UPDATE. Mirrors PG's heap_update /
 	// heap_delete which clear HEAP_XMAX_INVALID before re-stamping xmax.
-	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid | HeapXmaxIsMulti
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	// Advance pd_prune_xid so opportunistic pruning knows when
 	// this page first became prunable (M0046-0002).
@@ -988,7 +988,7 @@ func PageSetHeapTupleMovedPartition(p Page, slot uint16, xmax TransactionID) err
 	// "xmax is not a deleter"; a moved-partition stamp IS a real xmax and
 	// must clear the flag so isConcurrentlyUpdated detects the concurrent
 	// update. Mirrors PageSetHeapTupleXmax and PG's heap_update behaviour.
-	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid | HeapXmaxIsMulti
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	if pruneXID := MustHeader(p).PruneXID(); xmax > TransactionID(pruneXID) {
 		MustHeader(p).SetPruneXID(uint32(xmax))
@@ -1090,8 +1090,64 @@ func PageSetHeapTupleLockOnly(p Page, slot uint16, xmax TransactionID, lockStren
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
 	infomask &^= HeapXmaxLockMask
 	infomask &^= HeapXmaxInvalid // xmax is now a real (lock-only) value
+	infomask &^= HeapXmaxIsMulti // single-holder xmax: clear any prior multi bit
 	infomask |= HeapXmaxLockOnly
 	infomask |= lockStrength & HeapXmaxLockMask
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	return nil
+}
+
+// PageSetHeapTupleXmaxMulti stamps the given heap tuple's xmax with a
+// MultiXactId and the caller-computed hint bits (see internal/multixact.HintBits).
+// It is the multixact sibling of PageSetHeapTupleLockOnly: where that helper
+// records a single-transaction row lock, this records a *set* of lock holders
+// (HEAP_XMAX_IS_MULTI). The xmax value is therefore a MultiXactId resolved
+// through the multixact member store, never a plain TransactionID — readers must
+// gate on IsHeapTupleXmaxMulti before interpreting it.
+//
+// infomaskBits / infomask2Bits are the values returned by multixact.HintBits:
+//   - infomaskBits carries HEAP_XMAX_IS_MULTI, the strongest holder's lock-mode
+//     bit(s), and HEAP_XMAX_LOCK_ONLY when the multi has no updater.
+//   - infomask2Bits carries HEAP_KEYS_UPDATED when a member reserves key columns.
+//
+// Pre-existing xmax-classification bits (lock mask, lock-only, invalid, committed,
+// is-multi) and the keys-updated bit are cleared before the new ones are OR-ed in,
+// so a tuple previously carrying a single-xid lock-only xmax is cleanly re-stamped
+// as a multi. Other infomask bits (xmin hints, HEAP_HASNULL, …) are preserved.
+func PageSetHeapTupleXmaxMulti(p Page, slot uint16, multi TransactionID, infomaskBits, infomask2Bits uint16) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, slot, off)
+	}
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(multi))
+	// t_infomask2 at [18:20], t_infomask at [20:22] (on-disk order Infomask2
+	// then Infomask, per ParseHeapTuple / MarshalBinary).
+	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
+	infomask2 &^= HeapKeysUpdated
+	infomask2 |= infomask2Bits & HeapKeysUpdated
+	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
+
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	infomask &^= HeapXmaxLockMask | HeapXmaxLockOnly | HeapXmaxInvalid | HeapXmaxCommitted | HeapXmaxIsMulti
+	infomask |= infomaskBits
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	return nil
 }
@@ -1136,7 +1192,7 @@ func PageStampHotOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockN
 	// Update infomask: clear lock-only bits (a delete supersedes any
 	// lingering row-lock), then set HeapHotUpdated.
 	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
-	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid
+	infomask &^= HeapXmaxLockOnly | HeapXmaxLockMask | HeapXmaxInvalid | HeapXmaxIsMulti
 	infomask |= HeapHotUpdated
 	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
 	// Advance pd_prune_xid (M0046-0002): the old HOT tuple is dead

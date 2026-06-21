@@ -6,6 +6,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -777,11 +778,12 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		//     real update (the real-updater branch above takes over on retry).
 		//     Mirrors that branch's WaitForXID so the isolation scheduler sees
 		//     the step block (<waiting ...>) and resume on the holder's COMMIT.
-		// Multixact shared-lock combination (two non-conflicting FOR SHARE /
-		// FOR KEY SHARE holders) remains a separate follow-up; tupleLockConflicts
-		// only enters here on a genuine conflict.
-		xmax := tup.Header.Xmax
-		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
+		// When the conflicting xmax is a MultiXactId (HEAP_XMAX_IS_MULTI), the
+		// holders are resolved through the shared member store — the raw value
+		// must NOT be passed to IsXIDActive / WaitForXID, which expect a single
+		// TransactionID from a different numbering space. M0118-0003.
+		active := o.activeLockHolders(tup.Header.Xmax, tup.Header.Infomask)
+		if len(active) > 0 {
 			slot.Unlock()
 			o.ctx.Pool.Unpin(slot)
 			switch o.waitPolicy {
@@ -795,20 +797,23 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 					Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
 				}
 			default:
-				// Blocking FOR UPDATE/FOR SHARE: wait for the row-lock holder
-				// to finish, then re-evaluate the tuple from scratch.
+				// Blocking FOR UPDATE/FOR SHARE: wait for every still-active
+				// holder to finish (a multi may name several), then re-evaluate
+				// the tuple from scratch.
 				qctx := o.ctx.Ctx
 				if qctx == nil {
 					qctx = context.Background()
 				}
-				if werr := o.ctx.TxnMgr.WaitForXID(qctx, xmax); werr != nil {
-					// Context cancelled — skip this row silently.
-					return storage.ItemPointer{}, false, false, nil
+				for _, hx := range active {
+					if werr := o.ctx.TxnMgr.WaitForXID(qctx, hx); werr != nil {
+						// Context cancelled — skip this row silently.
+						return storage.ItemPointer{}, false, false, nil
+					}
 				}
 				return o.stampLockInner(rel, ptr, depth+1)
 			}
 		}
-		// Locker is no longer active (committed/aborted): its row lock is
+		// No holder still active (committed/aborted): the row lock(s) are
 		// released, so fall through and stamp our own lock-only xmax.
 	}
 
@@ -817,6 +822,32 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
 		return storage.ItemPointer{}, false, false, nil
+	}
+	// MultiXact producer (M0118-0003): if the tuple already carries a lock-only
+	// xmax from another transaction that does NOT conflict with our request
+	// (e.g. a second FOR SHARE holder), combine the holders into a MultiXactId
+	// rather than overwriting the existing holder's xmax. Reaching here with a
+	// foreign lock-only xmax implies tupleLockConflicts was false (a conflicting
+	// holder is handled by the wait/skip/nowait branch above), so the combined
+	// member set is lock-only and stays transparent to visibility — HintBits
+	// sets HEAP_XMAX_LOCK_ONLY whenever there is no updater member.
+	if o.ctx.MultiXact != nil &&
+		tup.Header.Xmax != storage.InvalidTransactionID &&
+		storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
+		tup.Header.Xmax != o.ctx.Tx.XID {
+		multiPtr, combined, merr := o.stampMultiLock(slot, ptr, tup.Header)
+		if merr != nil {
+			slot.Unlock()
+			o.ctx.Pool.Unpin(slot)
+			return storage.ItemPointer{}, false, false, merr
+		}
+		if combined {
+			slot.Unlock()
+			o.ctx.Pool.Unpin(slot)
+			return multiPtr, false, false, nil
+		}
+		// No surviving active holder to combine with — fall through to the
+		// single-holder stamp below.
 	}
 	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, o.ctx.Tx.XID, o.lockStrength); err != nil {
 		slot.Unlock()
@@ -959,6 +990,136 @@ func tupleLockConflicts(requested, heldInfomask uint16) bool {
 	// Shared request (FOR SHARE / KEY SHARE): conflicts only with a holder that
 	// took the pure-exclusive FOR UPDATE lock.
 	return held == storage.HeapXmaxExclLock
+}
+
+// lockOnlyMemberStatus maps a lock-only holder's recorded infomask lock-mode
+// bits back to the multixact member Status used when combining holders into a
+// MultiXactId. goopg stamps only two effective strengths (FOR SHARE / KEY SHARE
+// → HeapXmaxShrLock; FOR UPDATE / NO KEY UPDATE → HeapXmaxExclLock), so the
+// reverse mapping is exact for the values goopg actually produces:
+//   - HeapXmaxShrLock    → ForShare       (a pure shared lock)
+//   - HeapXmaxKeyShrLock → ForKeyShare    (FK key-share lock)
+//   - HeapXmaxExclLock   → ForNoKeyUpdate (a lock-only exclusive row lock)
+//
+// The default falls back to ForKeyShare (the weakest), which can never
+// over-state a holder's strength. M0118-0003.
+func lockOnlyMemberStatus(infomask uint16) multixact.Status {
+	switch infomask & storage.HeapXmaxLockMask {
+	case storage.HeapXmaxShrLock:
+		return multixact.StatusForShare
+	case storage.HeapXmaxExclLock:
+		return multixact.StatusForNoKeyUpdate
+	case storage.HeapXmaxKeyShrLock:
+		return multixact.StatusForKeyShare
+	default:
+		return multixact.StatusForKeyShare
+	}
+}
+
+// lockMemberStatus maps this lockRowsOp's requested strength to the multixact
+// member Status it records when it joins (or forms) a MultiXact on a tuple.
+// goopg's two effective strengths map to the corresponding pure-lock statuses.
+func (o *lockRowsOp) lockMemberStatus() multixact.Status {
+	if o.lockStrength == storage.HeapXmaxExclLock {
+		return multixact.StatusForNoKeyUpdate
+	}
+	return multixact.StatusForShare
+}
+
+// activeLockHolders returns the still-active transactions holding a row lock on
+// a tuple whose xmax is `xmax` with hint bits `infomask`. For a single-xid
+// lock-only xmax it is at most the one holder; for a MultiXactId xmax
+// (HEAP_XMAX_IS_MULTI) it is the subset of members still in progress, resolved
+// through the shared member store. The current transaction is never included
+// (it never blocks on its own lock). A multi whose membership cannot be
+// resolved (no store wired, or members not found after a restart) is treated as
+// released rather than hanging the waiter. M0118-0003.
+func (o *lockRowsOp) activeLockHolders(xmax storage.TransactionID, infomask uint16) []storage.TransactionID {
+	if o.ctx.TxnMgr == nil {
+		return nil
+	}
+	if storage.IsHeapTupleXmaxMulti(infomask) {
+		if o.ctx.MultiXact == nil {
+			return nil
+		}
+		members, ok := o.ctx.MultiXact.Members(multixact.MultiXactId(xmax))
+		if !ok {
+			return nil
+		}
+		var out []storage.TransactionID
+		for _, m := range members {
+			if m.Xid != o.ctx.Tx.XID && o.ctx.TxnMgr.IsXIDActive(m.Xid) {
+				out = append(out, m.Xid)
+			}
+		}
+		return out
+	}
+	if xmax != o.ctx.Tx.XID && o.ctx.TxnMgr.IsXIDActive(xmax) {
+		return []storage.TransactionID{xmax}
+	}
+	return nil
+}
+
+// stampMultiLock combines this lock request with the existing active lock
+// holder(s) recorded in `hdr` into a MultiXactId stamped on the tuple. It is
+// the MultiXact producer half of the row-lock path (the consumer half is
+// activeLockHolders + the wait/skip/nowait branch). The caller holds slot.Lock
+// and retains ownership of unlock/unpin.
+//
+// Returns combined=true when it has stamped a multi xmax (the caller must not
+// also stamp a single xmax); combined=false when there is no surviving active
+// holder to combine with, in which case the caller falls back to the
+// single-holder stamp. M0118-0003.
+func (o *lockRowsOp) stampMultiLock(slot *storage.Slot, ptr storage.ItemPointer, hdr storage.HeapTupleHeader) (storage.ItemPointer, bool, error) {
+	// Enumerate the existing holders. The producer is gated on a lock-only
+	// foreign xmax, so every existing member is a pure lock holder.
+	var existing []multixact.Member
+	if storage.IsHeapTupleXmaxMulti(hdr.Infomask) {
+		members, ok := o.ctx.MultiXact.Members(multixact.MultiXactId(hdr.Xmax))
+		if !ok {
+			// Membership lost (e.g. stamped before a restart with no persisted
+			// store): nothing live to combine with; stamp a single xmax.
+			return storage.ItemPointer{}, false, nil
+		}
+		existing = members
+	} else {
+		existing = []multixact.Member{{Xid: hdr.Xmax, Status: lockOnlyMemberStatus(hdr.Infomask)}}
+	}
+
+	// Keep only members whose transaction is still in progress — a dead
+	// locker's lock is released and must not be carried forward. (Committed-
+	// updater retention is part of the deferred updater-bearing multi producer.)
+	survivors := make([]multixact.Member, 0, len(existing)+1)
+	for _, m := range existing {
+		if m.Xid == o.ctx.Tx.XID {
+			continue // re-added once below with our current strength
+		}
+		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(m.Xid) {
+			survivors = append(survivors, m)
+		}
+	}
+	if len(survivors) == 0 {
+		return storage.ItemPointer{}, false, nil
+	}
+	survivors = append(survivors, multixact.Member{Xid: o.ctx.Tx.XID, Status: o.lockMemberStatus()})
+
+	multi, err := o.ctx.MultiXact.CreateFromMembers(survivors)
+	if err != nil {
+		return storage.ItemPointer{}, false, err
+	}
+	infomask, infomask2 := multixact.HintBits(survivors)
+	if err := storage.PageSetHeapTupleXmaxMulti(slot.Page(), ptr.Offset, storage.TransactionID(multi), infomask, infomask2); err != nil {
+		return storage.ItemPointer{}, false, err
+	}
+	// MultiXact membership is process-shared in-memory state, not yet persisted
+	// through the heap-lock WAL record (which carries a single xid + strength, so
+	// logging one record for the strongest holder would mis-describe the multi on
+	// replay). Mark the page dirty without a logical lock record. Lock-only
+	// multixact state is transient — the holders' transactions do not survive a
+	// crash — so losing it on recovery is correct. WAL persistence of multixact
+	// members is deferred (see docs/design/0118-0002). M0118-0003.
+	o.ctx.Pool.MarkDirty(slot)
+	return ptr, true, nil
 }
 
 // markHeapLockDirty centralises the choice between

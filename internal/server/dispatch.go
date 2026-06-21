@@ -236,6 +236,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	ectx.Catalog = s.cfg.Catalog
 	// PlanCatalog will be set to a search-path-aware wrapper after sess is wired.
 	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.MultiXact = s.cfg.MultiXact
 	ectx.Tx = tx
 	// Wire the per-connection session into the executor so advisory locks
 	// and other session-scoped state are properly tracked.

@@ -171,6 +171,7 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 	ectx.Pool = s.cfg.Pool
 	ectx.Catalog = s.cfg.Catalog
 	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.MultiXact = s.cfg.MultiXact
 	ectx.Tx = tx
 	ectx.Snap = snap
 	ectx.LogCanonical = s.cfg.LogCanonical

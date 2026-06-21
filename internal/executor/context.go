@@ -8,6 +8,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -52,6 +53,16 @@ type Context struct {
 	TxnMgr      *mvcc.Manager
 	Tx          mvcc.Transaction
 	Snap        mvcc.Snapshot
+
+	// MultiXact is the process-shared MultiXact member store (the SLRU
+	// analog). It is consulted by the row-locking path (stampLockInner) to
+	// (a) combine a new lock holder with an existing active lock holder into a
+	// MultiXactId rather than overwriting it, and (b) resolve a tuple's
+	// MultiXactId xmax back to its member transactions when checking lock
+	// conflicts. nil disables the multixact path entirely — the single-holder
+	// xmax behaviour (one TransactionID per tuple) is preserved, so tests and
+	// deployments that don't wire a store keep working unchanged. M0118-0003.
+	MultiXact *multixact.Store
 
 	// Session, if set, is consulted by the Transaction operator to
 	// drive BEGIN/COMMIT/ROLLBACK. It also tracks whether the current

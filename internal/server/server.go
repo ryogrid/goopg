@@ -53,6 +53,7 @@ import (
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
@@ -110,6 +111,13 @@ type Config struct {
 	Catalog catalog.Catalog
 	Pool    *storage.Pool
 	TxnMgr  *mvcc.Manager
+
+	// MultiXact is the process-shared MultiXact member store (M0118-0003).
+	// The dispatch path plumbs it into every executor.Context so the
+	// row-locking path can combine concurrent lock holders into a MultiXactId
+	// and resolve a tuple's MultiXactId xmax back to its members. nil disables
+	// the multixact path — single-holder xmax behaviour is preserved.
+	MultiXact *multixact.Store
 
 	// FSM is the in-memory free-space map (M0046-0003). When non-nil,
 	// INSERT consults it to reuse pages freed by VACUUM instead of

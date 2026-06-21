@@ -111,6 +111,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.Catalog = s.cfg.Catalog
 	s.wireExtensionRows(ectx, dbName) // per-database pg_extension (M0110-0003 gap #7c)
 	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.MultiXact = s.cfg.MultiXact
 	ectx.Tx = tx
 	ectx.Snap = snap
 	ectx.Params = datums

@@ -1,7 +1,9 @@
 # MultiXact tuple-lock subsystem (engine-first slice) — M0118-0003/0004
 
 - Status: accepted (partial — engine core + member store + tuple-header
-  hint-bit encoder; hot-path wiring deferred)
+  hint-bit encoder + **cross-session lock-only multixact producer/consumer
+  wired into `stampLockInner`**; updater-bearing multixact + WAL persistence +
+  spec promotion deferred)
 - Date: 2026-06-21
 - Supersedes: none
 - Related: [0118-0001](0118-0001-isolation-spec-port-strategy.md) (isolation
@@ -173,6 +175,51 @@ representation tomorrow. The reverse — `FOR KEY SHARE` vs. a key-changing
 `UPDATE`/`DELETE` (→ `AccessExclusiveLock`) — *does* conflict. Both are pinned
 by `TestStatusesConflictKeyShareCompatibleWithNoKeyUpdate`.
 
+### Hot-path wiring slice 1: cross-session lock-only multixact
+
+The first hot-path slice wires the **lock-only** multixact case — two (or more)
+concurrent non-conflicting row-lock holders on the same tuple (e.g. two
+`FOR SHARE` sessions) — end to end through `stampLockInner`
+(`internal/executor/operators_lockrows.go`). This is the deliberately *narrow*
+producer/consumer pair that keeps blast radius minimal:
+
+- **Producer** (`stampMultiLock`): when the live-tuple stamp path finds the
+  tuple already carries a lock-only `xmax` from another **still-active**
+  transaction that does **not** conflict with our request (`tupleLockConflicts`
+  was false, so we fell through the wait/skip/nowait branch), it builds the
+  combined member set (`existing survivors` filtered to in-progress + our own
+  member at our strength), `Store.CreateFromMembers`, computes `HintBits`, and
+  stamps the `MultiXactId` + hint bits via the new
+  `storage.PageSetHeapTupleXmaxMulti`. Because the combined set is lock-only,
+  `HintBits` always sets `HEAP_XMAX_LOCK_ONLY`.
+- **Consumer** (`activeLockHolders`): the row-lock conflict branch resolves a
+  `HEAP_XMAX_IS_MULTI` `xmax` through `Store.Members` to the subset of members
+  still in progress **before** calling `IsXIDActive`/`WaitForXID` — the raw
+  `MultiXactId` lives in a different numbering space and must never be passed to
+  a single-`TransactionID` API. A `NOWAIT` request against a live multi fails
+  `55P03`; a blocking request waits for **every** active member.
+
+**Why this is safe for visibility.** A lock-only multi carries
+`HEAP_XMAX_LOCK_ONLY`, and every visibility consumer
+(`mvcc/visibility.go`, `mvcc/subxact_visibility.go`, `isConcurrentlyUpdated`,
+`storage/freeze.go`, `storage/prune.go`, `storage/vm.go`) short-circuits a
+lock-only `xmax` to "not a delete" *before* interpreting the value as a
+`TransactionID`. So a lock-only `MultiXactId` is fully transparent to MVCC
+visibility — the only consumer that must become multixact-aware is the row-lock
+path itself. This is what bounds the change to `stampLockInner` and keeps the
+single-holder fast path byte-identical.
+
+The `Store` is process-shared: instantiated once in `cmd/goopg/main.go`
+(`multixact.NewStore()`), carried on `server.Config.MultiXact`, and plumbed into
+every `executor.Context` by the dispatch paths. A nil store disables the
+multixact path entirely, preserving single-holder behaviour for tests and any
+runtime that does not wire it.
+
+The full producer/consumer round-trip is pinned by
+`TestForShareFormsLockOnlyMultiXact` (two `FOR SHARE` holders → assert a 2-member
+lock-only multi; `FOR UPDATE NOWAIT` against the live multi → `55P03`; holders
+gone → fresh `FOR UPDATE` re-stamps a single-holder xmax).
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -232,33 +279,40 @@ under `-race`):
 The risky hot-path integration lands in later loops, each on top of this
 verified primitive:
 
-1. **xmax encoding** — represent a MultiXactId in the tuple header
-   (`HEAP_XMAX_IS_MULTI`). The member store and the **tuple-header
-   representation** (the `HeapXmaxIsMulti` bit, the `IsHeapTupleXmaxMulti`
-   decode predicate, and the `HintBits` encoder — see *The tuple-header
-   representation* above) have **both landed**. What remains is the **hot-path
-   wiring** that makes them live: (a) call `HintBits` from `stampLockInner`
-   (`operators_lockrows.go`) to actually stamp a `MultiXactId` + its hint bits
-   into a tuple's `xmax`/`t_infomask`, and (b) make the freeze/visibility
-   readers (`internal/storage`, `isConcurrentlyUpdated`) branch on
-   `IsHeapTupleXmaxMulti` to resolve `xmax` via `Store.Members` +
-   `GetUpdateXid`. These are the sibling twins — the producer (a) and the
-   consumer (b) must go in together ([[pattern_sibling_paths_must_agree]]).
-   This is also where the `Store` gets threaded into the executor/storage hot
-   paths (seeded `NewStoreAt(pg_control.nextMulti)`), so it is the high-risk
-   step that touches MVCC visibility + row-lock paths together.
-2. **`stampLockInner` member combination** — teach branch (a)
-   (`operators_lockrows.go`) to *combine* a new locker with an in-progress
-   updater into a multixact instead of skipping.
-3. **`isConcurrentlyUpdated` multixact decode** — make it resolve a multixact
-   xmax to its update member via `GetUpdateXid` instead of returning `false`
-   for any lock-only xmax.
-4. **Spec promotion** — once 1–3 land, promote the MultiXact-cluster isolation
-   specs (`lock-update-traversal`, `multixact-no-forget`, `nowait-2`,
+1. **xmax encoding — lock-only case: ✅ LANDED** (see *Hot-path wiring slice 1*
+   above). The member store, tuple-header representation, **and** the
+   cross-session lock-only producer (`stampMultiLock`) + consumer
+   (`activeLockHolders`) in `stampLockInner` are all live, with the `Store`
+   threaded through `server.Config`/`executor.Context`.
+2. **updater-bearing multixact** — the case where a member is an *updater*
+   (`HEAP_XMAX_LOCK_ONLY` clear): teach branch (a) of `stampLockInner`
+   (`operators_lockrows.go`, the "non-key update + `FOR KEY SHARE`" path that
+   currently skips) to *combine* a new locker with the in-progress updater into
+   a multixact, and make the visibility readers (`isConcurrentlyUpdated`,
+   `mvcc/visibility.go`, `storage/freeze.go`) branch on `IsHeapTupleXmaxMulti`
+   to resolve the real updater via `GetUpdateXid` instead of treating the raw
+   `MultiXactId` as the deleting xid. This is the high-risk twin — unlike the
+   lock-only case it is **not** transparent to visibility, so producer +
+   *all* visibility consumers must land together
+   ([[pattern_sibling_paths_must_agree]]).
+3. **4-way lock strength + savepoint/subxact members** — goopg's `lockStrength`
+   collapses PG's four lock modes to two (`ShrLock`/`ExclLock`); faithful
+   `tuplelock-conflict`/`tuplelock-upgrade-no-deadlock` parity needs the full
+   `FOR KEY SHARE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR UPDATE`
+   distinction threaded into the member status, plus subtransaction xids as
+   distinct multixact members (the savepoint permutations).
+4. **WAL persistence of multixact members** — the lock-only producer marks the
+   page dirty *without* a heap-lock WAL record (the record carries a single
+   xid + strength and cannot describe a multi). Lock-only multixact state is
+   transient, so losing it on crash recovery is correct; but the
+   updater-bearing case and `pg_multixact` SLRU parity need a real record +
+   `Store` seeding from `pg_control.nextMulti`.
+5. **Spec promotion** — once 2–4 land as needed, promote the MultiXact-cluster
+   isolation specs (`lock-update-traversal`, `multixact-no-forget`, `nowait-2`,
    `skip-locked-2`, `propagate-lock-delete`, `tuplelock-conflict`,
    `aborted-keyrevoke`) per the [0118-0001](0118-0001-isolation-spec-port-strategy.md)
-   promotion workflow.
+   promotion workflow. (`multixact-no-deadlock` / `tuplelock-upgrade-no-deadlock`
+   additionally need deadlock detection across the row-lock wait graph.)
 
 Sibling-path discipline applies throughout: the encode (stamp) and decode
-(`isConcurrentlyUpdated`) twins must change together — see
-[[pattern_sibling_paths_must_agree]].
+twins must change together — see [[pattern_sibling_paths_must_agree]].

@@ -31,6 +31,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/control"
 	"github.com/goopg/goopg/internal/initdb"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/server"
 	"github.com/goopg/goopg/internal/storage"
@@ -508,6 +509,12 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		cfg.Catalog = rt.Catalog
 		cfg.Pool = rt.Pool
 		cfg.TxnMgr = rt.TxnMgr
+		// Process-shared MultiXact member store (M0118-0003). One per server
+		// process; the dispatch path plumbs it into every executor.Context so
+		// concurrent row-lock holders combine into a MultiXactId. Starts at
+		// FirstMultiXactId; persisting/seeding from pg_control.nextMulti is a
+		// deferred enhancement (membership is in-memory and transient in v0).
+		cfg.MultiXact = multixact.NewStore()
 		cfg.FSM = rt.FSM
 		cfg.VM = rt.VM
 		cfg.Checkpointer = rt.Checkpointer
