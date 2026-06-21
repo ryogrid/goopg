@@ -265,3 +265,101 @@ func HasLockers(members []Member) bool {
 	}
 	return false
 }
+
+// --- Tuple-header hint bits (encode) ---------------------------------------
+//
+// The conflict matrix above maps a MultiXactStatus to a *heavyweight* LOCKMODE
+// for conflict detection. Stamping a MultiXactId into a tuple header needs a
+// different mapping: each status's *tuple* lock strength (LockTupleMode), whose
+// weakest-to-strongest ordering picks the multixact's strongest holder for the
+// t_infomask lock-strength bits.
+
+// tupleLockMode mirrors upstream LockTupleMode (nodes/lockoptions.h): the
+// per-tuple lock strength, ordered weakest-to-strongest. Distinct from the
+// heavyweight lockMode used by the conflict matrix.
+type tupleLockMode int
+
+const (
+	tupleLockKeyShare       tupleLockMode = 0 // SELECT FOR KEY SHARE
+	tupleLockShare          tupleLockMode = 1 // SELECT FOR SHARE
+	tupleLockNoKeyExclusive tupleLockMode = 2 // FOR NO KEY UPDATE; no-key UPDATE
+	tupleLockExclusive      tupleLockMode = 3 // FOR UPDATE; key UPDATE; DELETE
+)
+
+// statusTupleLock ports heapam.c's MultiXactStatusLock[] (the
+// TUPLOCK_from_mxstatus mapping): each MultiXactStatus to its LockTupleMode.
+// Indexed by Status.
+//
+//	ForKeyShare    -> LockTupleKeyShare
+//	ForShare       -> LockTupleShare
+//	ForNoKeyUpdate -> LockTupleNoKeyExclusive
+//	ForUpdate      -> LockTupleExclusive
+//	NoKeyUpdate    -> LockTupleNoKeyExclusive
+//	Update         -> LockTupleExclusive
+var statusTupleLock = [MaxStatus + 1]tupleLockMode{
+	StatusForKeyShare:    tupleLockKeyShare,
+	StatusForShare:       tupleLockShare,
+	StatusForNoKeyUpdate: tupleLockNoKeyExclusive,
+	StatusForUpdate:      tupleLockExclusive,
+	StatusNoKeyUpdate:    tupleLockNoKeyExclusive,
+	StatusUpdate:         tupleLockExclusive,
+}
+
+// HintBits is the pure port of heapam.c's GetMultiXactIdHintBits
+// (src/backend/access/heap/heapam.c:7455): given the member set that composes a
+// MultiXactId, compute the t_infomask / t_infomask2 bits that accompany
+// HEAP_XMAX_IS_MULTI when that id is stamped into a tuple's xmax. It is the
+// ENCODE twin of the decode predicates (storage.IsHeapTupleXmaxMulti /
+// storage.IsHeapTupleLockOnly) and the member-selection reader GetUpdateXid;
+// per [[pattern_sibling_paths_must_agree]] the encode and decode sides must
+// change together.
+//
+// The returned infomask always has storage.HeapXmaxIsMulti set, plus:
+//   - the strongest member's lock-strength bits (KEYSHR / SHR / EXCL_LOCK), and
+//   - storage.HeapXmaxLockOnly iff no member is an actual update.
+//
+// The returned infomask2 has storage.HeapKeysUpdated iff any member touches key
+// columns — a FOR UPDATE lock or a key-changing Update — matching upstream,
+// where FOR UPDATE reserves the key just as a key UPDATE writes it (a no-key
+// UPDATE does NOT set it).
+//
+// Callers pass a non-empty, well-formed member set (the store guarantees at
+// most one updater); HintBits does not re-validate. An empty set yields the
+// upstream "no members" fallback (IS_MULTI | KEYSHR_LOCK | LOCK_ONLY), which is
+// never stamped in practice.
+func HintBits(members []Member) (infomask, infomask2 uint16) {
+	infomask = storage.HeapXmaxIsMulti
+	strongest := tupleLockKeyShare
+	hasUpdate := false
+
+	for _, m := range members {
+		if mode := statusTupleLock[m.Status]; mode > strongest {
+			strongest = mode
+		}
+		switch m.Status {
+		case StatusForKeyShare, StatusForShare, StatusForNoKeyUpdate:
+			// pure lock that does not reserve key columns; no extra bits
+		case StatusForUpdate:
+			infomask2 |= storage.HeapKeysUpdated
+		case StatusNoKeyUpdate:
+			hasUpdate = true
+		case StatusUpdate:
+			infomask2 |= storage.HeapKeysUpdated
+			hasUpdate = true
+		}
+	}
+
+	switch strongest {
+	case tupleLockExclusive, tupleLockNoKeyExclusive:
+		infomask |= storage.HeapXmaxExclLock
+	case tupleLockShare:
+		infomask |= storage.HeapXmaxShrLock
+	case tupleLockKeyShare:
+		infomask |= storage.HeapXmaxKeyShrLock
+	}
+
+	if !hasUpdate {
+		infomask |= storage.HeapXmaxLockOnly
+	}
+	return infomask, infomask2
+}

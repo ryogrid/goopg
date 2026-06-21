@@ -313,3 +313,111 @@ func TestConstantsMatchUpstream(t *testing.T) {
 		t.Errorf("FirstMultiXactId = %d, want 1", FirstMultiXactId)
 	}
 }
+
+// TestHintBits pins HintBits (the GetMultiXactIdHintBits port) against an
+// independently-derived expected table — NOT re-using the implementation's
+// statusTupleLock/storage bit-or expressions, so a transcription error in
+// either is caught. For each single-member multixact it asserts the exact
+// (infomask, infomask2) bits, then round-trips them through the decode
+// predicates to prove the sibling encode/decode pair agrees:
+// storage.IsHeapTupleXmaxMulti is always true, and storage.IsHeapTupleLockOnly
+// is true exactly when GetUpdateXid finds no updater.
+func TestHintBits(t *testing.T) {
+	const (
+		isMulti  = uint16(0x1000) // HEAP_XMAX_IS_MULTI
+		keyShr   = uint16(0x0010) // HEAP_XMAX_KEYSHR_LOCK
+		excl     = uint16(0x0040) // HEAP_XMAX_EXCL_LOCK
+		shr      = uint16(0x0050) // HEAP_XMAX_SHR_LOCK = EXCL|KEYSHR
+		lockOnly = uint16(0x0080) // HEAP_XMAX_LOCK_ONLY
+		keysUpd  = uint16(0x2000) // HEAP_KEYS_UPDATED (infomask2)
+	)
+	// Cross-check the literals against the storage package's own constants so
+	// the expected table cannot silently drift from the shipping bit values.
+	for name, got := range map[string]struct{ a, b uint16 }{
+		"isMulti":  {isMulti, storage.HeapXmaxIsMulti},
+		"keyShr":   {keyShr, storage.HeapXmaxKeyShrLock},
+		"excl":     {excl, storage.HeapXmaxExclLock},
+		"shr":      {shr, storage.HeapXmaxShrLock},
+		"lockOnly": {lockOnly, storage.HeapXmaxLockOnly},
+		"keysUpd":  {keysUpd, storage.HeapKeysUpdated},
+	} {
+		if got.a != got.b {
+			t.Fatalf("test literal %s=0x%04x disagrees with storage const 0x%04x", name, got.a, got.b)
+		}
+	}
+
+	type tc struct {
+		name      string
+		members   []Member
+		infomask  uint16
+		infomask2 uint16
+	}
+	const x = storage.TransactionID(100)
+	cases := []tc{
+		// Single-member: lock-strength comes from the member's status, LOCK_ONLY
+		// set for every pure lock (no updater). FOR UPDATE additionally reserves
+		// the key (KEYS_UPDATED) even though it is lock-only.
+		{"forKeyShare", []Member{{x, StatusForKeyShare}}, isMulti | keyShr | lockOnly, 0},
+		{"forShare", []Member{{x, StatusForShare}}, isMulti | shr | lockOnly, 0},
+		{"forNoKeyUpdate", []Member{{x, StatusForNoKeyUpdate}}, isMulti | excl | lockOnly, 0},
+		{"forUpdate", []Member{{x, StatusForUpdate}}, isMulti | excl | lockOnly, keysUpd},
+		// Single-member updaters: no LOCK_ONLY. Update changes keys, NoKeyUpdate
+		// does not.
+		{"noKeyUpdate", []Member{{x, StatusNoKeyUpdate}}, isMulti | excl, 0},
+		{"update", []Member{{x, StatusUpdate}}, isMulti | excl, keysUpd},
+		// The load-bearing case: a FK FOR KEY SHARE locker coexisting with a
+		// concurrent no-key updater. Strongest is the updater (EXCL), the multi
+		// is NOT lock-only, and no key columns change.
+		{"keyShareLockerPlusNoKeyUpdater",
+			[]Member{{x, StatusForKeyShare}, {storage.TransactionID(101), StatusNoKeyUpdate}},
+			isMulti | excl, 0},
+		// FOR KEY SHARE locker that survives a key-changing update by another xact.
+		{"keyShareLockerPlusKeyUpdater",
+			[]Member{{x, StatusForKeyShare}, {storage.TransactionID(101), StatusUpdate}},
+			isMulti | excl, keysUpd},
+		// Two pure lockers: strongest is FOR SHARE, lock-only, no key reservation.
+		{"shareAndKeyShareLockers",
+			[]Member{{x, StatusForShare}, {storage.TransactionID(101), StatusForKeyShare}},
+			isMulti | shr | lockOnly, 0},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotMask, gotMask2 := HintBits(c.members)
+			if gotMask != c.infomask {
+				t.Errorf("infomask = 0x%04x, want 0x%04x", gotMask, c.infomask)
+			}
+			if gotMask2 != c.infomask2 {
+				t.Errorf("infomask2 = 0x%04x, want 0x%04x", gotMask2, c.infomask2)
+			}
+			// IS_MULTI must always be set so a single-xid reader never misapplies
+			// itself to a multixact xmax.
+			if !storage.IsHeapTupleXmaxMulti(gotMask) {
+				t.Errorf("IsHeapTupleXmaxMulti = false, want true for any multixact")
+			}
+			// Sibling round-trip: the LOCK_ONLY decode predicate must agree with
+			// the member set's updater presence (GetUpdateXid).
+			_, hasUpdater := GetUpdateXid(c.members)
+			if got := storage.IsHeapTupleLockOnly(gotMask); got != !hasUpdater {
+				t.Errorf("IsHeapTupleLockOnly = %v, but GetUpdateXid hasUpdater = %v (must be opposites)", got, hasUpdater)
+			}
+		})
+	}
+}
+
+// TestHintBitsStrongestWins guards the "strongest lock mode" selection against
+// member ordering: the same set in any order must yield identical lock-strength
+// bits (the loop takes a max, not last-wins).
+func TestHintBitsStrongestWins(t *testing.T) {
+	a := []Member{{storage.TransactionID(1), StatusForKeyShare}, {storage.TransactionID(2), StatusForShare}}
+	b := []Member{{storage.TransactionID(2), StatusForShare}, {storage.TransactionID(1), StatusForKeyShare}}
+	maskA, mask2A := HintBits(a)
+	maskB, mask2B := HintBits(b)
+	if maskA != maskB || mask2A != mask2B {
+		t.Fatalf("order-dependent hint bits: %#x/%#x vs %#x/%#x", maskA, mask2A, maskB, mask2B)
+	}
+	// FOR SHARE is strongest -> SHR_LOCK, lock-only (no updater).
+	if want := storage.HeapXmaxIsMulti | storage.HeapXmaxShrLock | storage.HeapXmaxLockOnly; maskA != want {
+		t.Errorf("infomask = 0x%04x, want 0x%04x", maskA, want)
+	}
+}

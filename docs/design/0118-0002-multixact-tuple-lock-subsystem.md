@@ -1,6 +1,7 @@
 # MultiXact tuple-lock subsystem (engine-first slice) — M0118-0003/0004
 
-- Status: accepted (partial — engine core + member store; hot-path wiring deferred)
+- Status: accepted (partial — engine core + member store + tuple-header
+  hint-bit encoder; hot-path wiring deferred)
 - Date: 2026-06-21
 - Supersedes: none
 - Related: [0118-0001](0118-0001-isolation-spec-port-strategy.md) (isolation
@@ -122,6 +123,42 @@ semantics: the dedup cache is **global and unbounded** (upstream's
 at spec/test scale), and ids are **never truncated/vacuumed** (the MultiXactId
 wraparound/`SetOffsetVacuumLimit` machinery is a separate, deferred concern).
 
+### The tuple-header representation (`internal/storage` + `HintBits`)
+
+The store answers *"which transactions compose MultiXactId N"*; the **tuple
+header** is where that id is recorded so a heap reader knows to ask. This slice
+lands the representation — the bit and the *encoder* — with still **no hot-path
+wiring** (nothing yet stamps a multi xmax, so every existing tuple decodes
+exactly as before):
+
+- **`storage.HeapXmaxIsMulti`** (`0x1000`, ← `HEAP_XMAX_IS_MULTI`): the
+  `t_infomask` bit that flips `xmax`'s interpretation from a single
+  `TransactionID` to a `MultiXactId`.
+- **`storage.IsHeapTupleXmaxMulti(infomask)`**: the decode predicate a reader
+  consults *before* applying any single-xid logic (`WaitForXID`,
+  `TransactionIdIsCurrent`) to `xmax` — a multi xmax must instead be resolved
+  through `Store.Members`. Its sibling `IsHeapTupleLockOnly` (unchanged)
+  classifies a multi as locked-only vs. updated; goopg needs no upstream
+  pre-9.3 `EXCL_LOCK` fallback clause because the encoder below always sets
+  `HEAP_XMAX_LOCK_ONLY` for an updater-free multi (no pg_upgrade legacy tuples).
+- **`multixact.HintBits(members)`** ← `GetMultiXactIdHintBits`
+  (`heapam.c:7455`): the **encoder**. Given a member set it computes the
+  `(t_infomask, t_infomask2)` bits that accompany `HEAP_XMAX_IS_MULTI`: the
+  *strongest* member's lock-strength bits (`KEYSHR`/`SHR`/`EXCL_LOCK` via the
+  `MultiXactStatusLock`/`LockTupleMode` ordering, ported as `statusTupleLock`),
+  `HEAP_XMAX_LOCK_ONLY` iff no member is an actual update, and
+  `HEAP_KEYS_UPDATED` iff any member reserves the key (a `FOR UPDATE` lock *or*
+  a key-changing `Update` — note `FOR UPDATE` sets it even while lock-only, and
+  a no-key `UPDATE` does not). It lives in `multixact` (not `storage`) because
+  it reads member *statuses*; the existing `multixact`→`storage` import lets it
+  reference the bit constants, and the reverse import would be a cycle.
+
+`HintBits` is the **encode twin** of the decode predicates above and of
+`GetUpdateXid` (member-selection); per
+[[pattern_sibling_paths_must_agree]] they land together and are round-tripped
+in `TestHintBits` (encode a member set → assert exact bits → decode and assert
+`IsHeapTupleLockOnly` agrees with `GetUpdateXid`'s updater presence).
+
 ### The load-bearing compatibility fact
 
 The whole subsystem exists to model one case the single-holder xmax cannot:
@@ -178,19 +215,38 @@ under `-race`):
 - `TestStoreConcurrentCreate` fans 16×64 distinct creates and asserts the
   allocator advanced by exactly the unique-set count (no lost/duplicated ids).
 
+`internal/multixact/multixact_test.go` (tuple-header encoder):
+
+- `TestHintBits` pins `HintBits` for each single-member status and the
+  multi-member cases against an **independently-derived** expected
+  `(infomask, infomask2)` table (its bit literals cross-checked against the
+  `storage` constants, not re-using the implementation's bit-or expressions),
+  then round-trips every case through the decode predicates to prove the
+  sibling pair agrees — `IsHeapTupleXmaxMulti` always true,
+  `IsHeapTupleLockOnly` true exactly when `GetUpdateXid` finds no updater.
+- `TestHintBitsStrongestWins` proves the strongest-lock selection is
+  order-independent (a max, not last-wins).
+
 ## Deferred (resume points)
 
 The risky hot-path integration lands in later loops, each on top of this
 verified primitive:
 
 1. **xmax encoding** — represent a MultiXactId in the tuple header
-   (`HEAP_XMAX_IS_MULTI`). The member store (in-memory analog of the multixact
-   SLRU) **landed this loop** (`store.go`, see above); what remains of this
-   keystone is the tuple-header half: set `HEAP_XMAX_IS_MULTI` in `t_infomask`,
-   stamp the `MultiXactId` into the `xmax` field, and make the freeze/visibility
-   readers (`internal/storage`) decode it via `Store.Members`. This is the
-   sibling-path step — the stamp (encode) and the `isConcurrentlyUpdated`/freeze
-   (decode) twins must change together ([[pattern_sibling_paths_must_agree]]).
+   (`HEAP_XMAX_IS_MULTI`). The member store and the **tuple-header
+   representation** (the `HeapXmaxIsMulti` bit, the `IsHeapTupleXmaxMulti`
+   decode predicate, and the `HintBits` encoder — see *The tuple-header
+   representation* above) have **both landed**. What remains is the **hot-path
+   wiring** that makes them live: (a) call `HintBits` from `stampLockInner`
+   (`operators_lockrows.go`) to actually stamp a `MultiXactId` + its hint bits
+   into a tuple's `xmax`/`t_infomask`, and (b) make the freeze/visibility
+   readers (`internal/storage`, `isConcurrentlyUpdated`) branch on
+   `IsHeapTupleXmaxMulti` to resolve `xmax` via `Store.Members` +
+   `GetUpdateXid`. These are the sibling twins — the producer (a) and the
+   consumer (b) must go in together ([[pattern_sibling_paths_must_agree]]).
+   This is also where the `Store` gets threaded into the executor/storage hot
+   paths (seeded `NewStoreAt(pg_control.nextMulti)`), so it is the high-risk
+   step that touches MVCC visibility + row-lock paths together.
 2. **`stampLockInner` member combination** — teach branch (a)
    (`operators_lockrows.go`) to *combine* a new locker with an in-progress
    updater into a multixact instead of skipping.
