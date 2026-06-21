@@ -1,59 +1,59 @@
-Task: M0118-0003 multixact — LANDED the FOUR-WAY row-lock strength member
-status (resume point #3, member-status half). Producer now records the correct
-FOR KEY SHARE / FOR SHARE / FOR NO KEY UPDATE / FOR UPDATE distinction instead of
-collapsing to two strengths.
+Task: M0118-0003 multixact — LANDED the LOCKER HALF of update-chain lock
+propagation (resume point #3, locker half). A SELECT FOR KEY SHARE/SHARE on a
+version an in-flight no-key updater superseded now traverses t_ctid forward and
+locks the successor version(s) too (heap_lock_updated_tuple analog).
 
-DONE this loop (#51), committed:
-- planner `lockStrengthFromParser`: stop collapsing (KEY SHARE→SHARE /
-  NO KEY UPDATE→UPDATE); preserve all 4. Only consumer of LockedRel.Strength is
-  the lockRowsOp executor → widening is local.
-- executor `Open` (operators_lockrows.go): four-way switch → lockStrength infomask
-  bits + new `lockKeysUpdated` bool. FOR UPDATE = ExclLock + HEAP_KEYS_UPDATED.
-- new `storage.PageSetHeapTupleLockKeysUpdated(p,slot,on)`: set/clear the
-  infomask2 KEYS_UPDATED bit on a lock-only single-holder stamp (both stamp sites).
-- `lockMemberStatus` (encode) / `lockOnlyMemberStatus` (decode, now takes
-  infomask2) = four-way twins. `tupleLockConflicts(reqStatus, heldInfomask,
-  heldInfomask2)` now delegates to verbatim `multixact.StatusesConflict`.
-- Tests: TestLockMemberStatusFourWay, TestLockOnlyMemberStatusFourWay, rewritten
-  TestTupleLockConflicts (full 4×4 + no-holder), storage
-  TestPageSetHeapTupleLockKeysUpdated. Added deferred anchor
-  TestPort_IsolationLockUpdateTraversal (t.Skip until it matches).
-- Design 0118-0002 "slice 4" section + status line + resume #3 split into
-  ✅member-status / ⛔savepoint-subxact / ⛔update-chain-propagation. README index
-  status + body slice-4 paragraph. Ledger row appended.
+DONE this loop (#52), committed:
+- operators_lockrows.go: stampLockInner branch (a) `formed` block now captures
+  the successor ptr + updater xid (from the ORIGINAL header), then after forming
+  the multi on the seen version calls the new `propagateLockForward`.
+- NEW methods (after stampMultiUpdaterLock): `updaterXID(hdr)` (single/multi
+  update-xid resolver, HeapTupleHeaderGetUpdateXid analog); `propagateLockForward
+  (rel, start, priorXmax)` (walks t_ctid, one page-lock per hop, continuity =
+  successor.xmin==priorXmax, stops at aborted-xmin / xmax-invalid / only-locked /
+  self-ctid / pruned / 32-hop cap); `lockSuccessorVersion(slot,rel,ptr,hdr)`
+  (combine via stampMultiLock/stampMultiUpdaterLock, never clobber a real
+  updater, else stamp our lock-only).
+- Test: TestForKeySharePropagatesLockToUpdatedSuccessor (operators_lockrows_test
+  .go) — sA in-flight no-key UPDATE supersedes id=1, sB FOR KEY SHARE → successor
+  (xmin=sA) carries sB's FOR KEY SHARE lock-only xmax (lockOnlyMemberStatus).
+- Design 0118-0002 "slice 5" section + resume-#3 status (locker ✅ / write-path
+  ⛔) + README index status line + slice-5 summary. Ledger row appended.
 
-GATES this loop (all PASS): go build ./...; go vet ./internal/executor;
-unit tests executor+storage+planner+multixact+analyzer+parser; -race subset
-(lockrows/multixact/storage lock tests); 7 dedicated row-lock isolation specs
-(nowait, nowait-3, skip-locked, update-locked-tuple, lock-committed-update,
-lock-committed-keyupdate) all PASS — NO regression. gofmt: fixed my own 2
-double-blank-lines; rest is pre-existing go1.25/1.26 skew (do NOT gofmt -w).
-tpch-spotcheck INFRA-BLOCKED (SLRU backfill >60s); pgbench pre-commit hook is the
-live guard. Stage ONLY code/doc/.ralph; do NOT add stray `postgres`,
-weekly_loc.*, requirements.txt.
+GATES this loop (all PASS): go build ./...; go vet ./internal/executor; unit
+tests executor+multixact+storage+planner; -race subset (executor row-lock tests
++ multixact); 6 dedicated row-lock isolation specs (lock-committed-update,
+lock-committed-keyupdate, skip-locked, nowait, nowait-3, update-locked-tuple) —
+NO regression. pgbench pre-commit smoke via hook on commit. tpch-spotcheck
+INFRA-BLOCKED (SLRU backfill >60s). Stage ONLY code/doc/.ralph; do NOT add stray
+`postgres`, weekly_loc.*, requirements.txt.
 
->>> KEY MEASUREMENT: ran lock-update-traversal BEFORE+AFTER. The member status was
-    a real bug but NOT this spec's only blocker. After slice 4, the SOLE remaining
-    blocker is **update-chain lock propagation**: s1 `SELECT ... FOR KEY SHARE` on
-    a row updated in-flight by s2 forms the multi on the version s1 sees but does
-    NOT propagate the lock forward to the successor (1,2); so s2d1 DELETE / s2d2
-    key-UPDATE of the live version do not wait (expected: <waiting>). ALSO the
-    plain UPDATE/DELETE write path does not honour a lock-only holder at all.
+>>> KEY MEASUREMENT: ran lock-update-traversal AFTER this slice (still SKIPs as
+    deferred). s2d2 key-UPDATE now completes WITHOUT `<waiting>` — i.e. the
+    propagated lock now EXISTS on the successor (locker half done) but the plain
+    UPDATE/DELETE write path does not HONOUR it across statements. The SOLE
+    remaining blocker for lock-update-traversal is the **write-path lock-wait**.
 
->>> NEXT STEP: land **update-chain lock propagation** (the next resume-#3 half).
-    Two coupled pieces: (1) in stampLockInner/stampMultiUpdaterLock, after forming
-    the multi on the locked version, traverse t_ctid forward (heap_lock_updated_
-    tuple analog) and lock each successor version too; (2) make the plain
-    UPDATE/DELETE write path (operators_storage.go update/delete) wait on a
-    lock-only row-lock holder from another active txn (resolve via
-    activeLockHolders/multixact, WaitForXID, then re-evaluate) — currently absent.
-    Together they unblock lock-update-traversal / lock-update-delete; add
-    propagate-lock-delete after savepoint/subxact members. Use
-    TestPort_IsolationLockUpdateTraversal as the proof spec (3 perms, no savepoint).
+>>> NEXT STEP: land the **write-path lock-wait half** (the other resume-#3 half).
+    In the UPDATE/DELETE write paths (operators_storage.go: updateViaIndex's
+    foreignLockOnly branch @~2299, the seqscan updateOp.Next, deleteOp.Next),
+    when the live version carries a foreign lock-only xmax: resolve active
+    holders via the multixact member store (activeLockHolders-style /
+    multixactFirstActiveMember + IsXIDActive), and if the WRITE conflicts with a
+    held strength (DELETE & key-UPDATE = StatusUpdate conflicts with ALL incl
+    FOR KEY SHARE; no-key UPDATE = StatusNoKeyUpdate does NOT conflict with FOR
+    KEY SHARE) → WaitForXID then re-evaluate (EPQ). Currently the path only takes
+    a STATEMENT-SCOPED lockmgr ExclusiveLock (acquireTupleLock) which a
+    cross-statement holder has already released — so it never waits. Use
+    TestPort_IsolationLockUpdateTraversal (3 perms, no savepoint) as proof; it
+    promotes to pass when this lands (then also lock-update-delete /
+    propagate-lock-delete, which add advisory locks / FK-INSERT propagation).
 
-GOTCHAS: MultiXactId and TransactionID share uint32; HEAP_XMAX_IS_MULTI is the
-ONLY disambiguator. FOR UPDATE vs FOR NO KEY UPDATE as a *lock* differ ONLY by
-HEAP_KEYS_UPDATED (infomask2) — both stamp ExclLock. KEYS_UPDATED readers are
-confined to lock/multixact paths (NOT mvcc visibility), so the FOR UPDATE
-lock-only stamp is contained. Sibling-path rule: lockMemberStatus (encode) ↔
-lockOnlyMemberStatus (decode) must agree — both four-way now.
+GOTCHAS: MultiXactId & TransactionID share uint32; HEAP_XMAX_IS_MULTI is the ONLY
+disambiguator — never pass a raw multi xmax to IsXIDActive/WaitForXID. goopg
+fresh-tuple CTID = {InvalidBlockNumber,0} (NOT self) — so "is this the latest
+version" must gate on xmax-valid, not just ctid!=self (propagateLockForward's
+`wasUpdated` already does: xmax-valid && !lock-only && forwardPtr). Sibling-path
+rule: lockMemberStatus (encode) ↔ lockOnlyMemberStatus (decode), both four-way.
+The propagated lock-only stamp is NOT WAL-persisted (same deferral as the multi
+producer; transient lock-only state is correct to lose on crash).

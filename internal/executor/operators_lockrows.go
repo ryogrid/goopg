@@ -722,8 +722,24 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 					return storage.ItemPointer{}, false, false, merr
 				}
 				if formed {
+					// heap_lock_updated_tuple: having combined our lock into the
+					// version the updater superseded, traverse the update chain
+					// forward and lock the newer version(s) too, so a later DELETE
+					// or key-UPDATE on the live successor honours our row lock
+					// (lock-update-traversal). Capture the forward pointer + the
+					// updater's xid from the original header before releasing the
+					// page; the lock-only combine above did not change either.
+					succ := tup.Header.CTID
+					prior := o.updaterXID(tup.Header)
+					hasSucc := succ.Block != storage.InvalidBlockNumber &&
+						(succ.Block != ptr.Block || succ.Offset != ptr.Offset)
 					slot.Unlock()
 					o.ctx.Pool.Unpin(slot)
+					if hasSucc && prior != storage.InvalidTransactionID {
+						if perr := o.propagateLockForward(rel, succ, prior); perr != nil {
+							return storage.ItemPointer{}, false, false, perr
+						}
+					}
 					return multiPtr, false, false, nil
 				}
 				// No surviving holder to combine with (updater gone/aborted):
@@ -1314,6 +1330,121 @@ func (o *lockRowsOp) stampMultiUpdaterLock(slot *storage.Slot, ptr storage.ItemP
 	// persistence of multixact members is deferred (docs/design/0118-0002).
 	o.ctx.Pool.MarkDirty(slot)
 	return ptr, true, nil
+}
+
+// updaterXID returns the transaction id of the *updater* recorded in a tuple's
+// xmax, or InvalidTransactionID when the xmax is invalid, lock-only, or a
+// MultiXactId with no update member. goopg analog of HeapTupleHeaderGetUpdateXid.
+func (o *lockRowsOp) updaterXID(hdr storage.HeapTupleHeader) storage.TransactionID {
+	if hdr.Xmax == storage.InvalidTransactionID || storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		return storage.InvalidTransactionID
+	}
+	if storage.IsHeapTupleXmaxMulti(hdr.Infomask) {
+		return multixactUpdaterXID(o.ctx.MultiXact, hdr.Xmax)
+	}
+	return hdr.Xmax
+}
+
+// propagateLockForward walks the update chain forward from `start` (the t_ctid
+// of a just-locked version that an updater had superseded) and applies our row
+// lock to every newer version, so a later DELETE / key-UPDATE on the live
+// successor honours the lock. This is goopg's analog of heap_lock_updated_tuple /
+// heap_lock_updated_tuple_rec (postgres/src/backend/access/heap/heapam.c): it
+// does NOT touch the initial tuple (the caller already stamped it) and it does
+// not check visibility — it unconditionally marks each chain member as locked.
+//
+// `priorXmax` is the update xid of the version we came from; each successor's
+// xmin must equal it for the chain to be contiguous (a mismatch means the line
+// pointer was recycled for an unrelated tuple, so we stop). lock-update-traversal.
+func (o *lockRowsOp) propagateLockForward(rel storage.RelFileNode, start storage.ItemPointer, priorXmax storage.TransactionID) error {
+	cur := start
+	px := priorXmax
+	for hops := 0; hops < 32; hops++ { // chain-depth backstop, mirrors stampLockInner's intent
+		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: cur.Block})
+		if err != nil {
+			return err
+		}
+		slot.Lock()
+		tup, gerr := storage.PageGetHeapTuple(slot.Page(), cur.Offset)
+		if gerr != nil {
+			// Successor pruned/vacuumed (its creator aborted): end of chain.
+			slot.Unlock()
+			o.ctx.Pool.Unpin(slot)
+			return nil
+		}
+		// Chain continuity: the successor must descend from the version we just
+		// locked (its xmin == that version's update xid). Otherwise the line
+		// pointer was recycled for an unrelated tuple — stop (heapam.c l4 check).
+		if px != storage.InvalidTransactionID && tup.Header.Xmin != px {
+			slot.Unlock()
+			o.ctx.Pool.Unpin(slot)
+			return nil
+		}
+		// Created by an aborted (sub)xact: the prior version was the last live one
+		// in the chain, so we are done.
+		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(tup.Header.Xmin) {
+			slot.Unlock()
+			o.ctx.Pool.Unpin(slot)
+			return nil
+		}
+		// Decide whether the chain continues from the ORIGINAL header, before
+		// lockSuccessorVersion mutates this version's xmax.
+		nextPtr := tup.Header.CTID
+		forwardPtr := nextPtr.Block != storage.InvalidBlockNumber &&
+			(nextPtr.Block != cur.Block || nextPtr.Offset != cur.Offset)
+		wasUpdated := tup.Header.Xmax != storage.InvalidTransactionID &&
+			!storage.IsHeapTupleLockOnly(tup.Header.Infomask) && forwardPtr
+		nextPrior := o.updaterXID(tup.Header)
+		if lerr := o.lockSuccessorVersion(slot, rel, cur, tup.Header); lerr != nil {
+			slot.Unlock()
+			o.ctx.Pool.Unpin(slot)
+			return lerr
+		}
+		slot.Unlock()
+		o.ctx.Pool.Unpin(slot)
+		if !wasUpdated || nextPrior == storage.InvalidTransactionID {
+			return nil // reached the latest version
+		}
+		cur = nextPtr
+		px = nextPrior
+	}
+	return nil
+}
+
+// lockSuccessorVersion applies our row lock to one update-chain member whose page
+// is already pinned and exclusively locked by the caller. A foreign holder is
+// combined into a MultiXactId (lock-only via stampMultiLock, updater-bearing via
+// stampMultiUpdaterLock) rather than overwritten; when no live holder survives,
+// our lock-only xmax is stamped directly. A surviving foreign *updater* that
+// cannot be combined is left untouched so we never clobber a real updater's xmax.
+func (o *lockRowsOp) lockSuccessorVersion(slot *storage.Slot, rel storage.RelFileNode, ptr storage.ItemPointer, hdr storage.HeapTupleHeader) error {
+	if hdr.Xmax != storage.InvalidTransactionID && hdr.Xmax != o.ctx.Tx.XID && o.ctx.MultiXact != nil {
+		if storage.IsHeapTupleLockOnly(hdr.Infomask) {
+			if _, combined, err := o.stampMultiLock(slot, ptr, hdr); err != nil {
+				return err
+			} else if combined {
+				return nil
+			}
+			// No live lock-only holder survived: safe to stamp our own below.
+		} else {
+			keysUpdated := (hdr.Infomask2 & storage.HeapKeysUpdated) != 0
+			if _, formed, err := o.stampMultiUpdaterLock(slot, ptr, hdr, keysUpdated); err != nil {
+				return err
+			} else if formed {
+				return nil
+			}
+			// A real updater that could not be combined (e.g. aborted) must not
+			// be clobbered — leave its xmax intact.
+			return nil
+		}
+	}
+	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, o.ctx.Tx.XID, o.lockStrength); err != nil {
+		return err
+	}
+	if err := storage.PageSetHeapTupleLockKeysUpdated(slot.Page(), ptr.Offset, o.lockKeysUpdated); err != nil {
+		return err
+	}
+	return markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, o.lockStrength)
 }
 
 // markHeapLockDirty centralises the choice between

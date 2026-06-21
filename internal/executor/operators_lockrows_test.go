@@ -1013,6 +1013,80 @@ func TestForShareJoinsInProgressUpdaterFormsMultiXact(t *testing.T) {
 	}
 }
 
+// TestForKeySharePropagatesLockToUpdatedSuccessor pins the locker half of
+// update-chain lock propagation (lock-update-traversal): when SELECT ... FOR KEY
+// SHARE locks a version that an in-progress no-key UPDATE has already superseded,
+// the locker must traverse the update chain forward and lock the newer version
+// too — otherwise a later DELETE / key-UPDATE on the live successor would not see
+// the lock. goopg analog of heap_lock_updated_tuple. Companion to
+// TestForShareJoinsInProgressUpdaterFormsMultiXact (which checks only the old
+// version's combined multi); this asserts the successor carries our lock.
+func TestForKeySharePropagatesLockToUpdatedSuccessor(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+	store := multixact.NewStore()
+	mkSession := func(b lockmgr.BackendID) *Context {
+		tx, _ := ctx.TxnMgr.Begin(0)
+		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
+		s := makeCtx(lm, b)
+		s.Pool = ctx.Pool
+		s.Catalog = ctx.Catalog
+		s.TxnMgr = ctx.TxnMgr
+		s.MultiXact = store
+		s.Tx = tx
+		s.Snap = snap
+		return s
+	}
+
+	// Session A: in-progress no-key UPDATE on id=1 — creates a successor version
+	// (xmin = sA) and stamps the old version's xmax = sA (non-lock-only). Release
+	// sA's statement-scoped lockmgr locks like dispatch.go does at Query end so
+	// sB's FOR KEY SHARE reaches the heap-xmax combine branch.
+	sA := mkSession(1)
+	defer ctx.TxnMgr.Rollback(sA.Tx)
+	if _, err := runForUpdate(t, sA, "UPDATE items SET label = 'zzz' WHERE id = 1"); err != nil {
+		t.Fatalf("session-A no-key UPDATE: %v", err)
+	}
+	if sA.Tx.XID == storage.InvalidTransactionID {
+		t.Fatal("session-A UPDATE did not materialise a real XID")
+	}
+	lm.ReleaseAll(1)
+
+	// Session B: FOR KEY SHARE on id=1. Under READ COMMITTED sB still sees the old
+	// version (sA uncommitted) and locks it, then must propagate the lock forward
+	// to sA's successor version.
+	sB := mkSession(2)
+	defer ctx.TxnMgr.Rollback(sB.Tx)
+	if _, err := runForUpdate(t, sB, "SELECT id FROM items WHERE id = 1 FOR KEY SHARE"); err != nil {
+		t.Fatalf("session-B FOR KEY SHARE: %v", err)
+	}
+
+	// The successor version (the only tuple with xmin = sA) must now carry sB's
+	// FOR KEY SHARE lock-only xmax.
+	slot, hdr := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return h.Xmin == sA.Tx.XID
+	})
+	if slot == 0 {
+		t.Fatal("no successor version (xmin = sA) found on block 0 — update did not create a new version, or it landed off block 0")
+	}
+	if hdr.Xmax != sB.Tx.XID {
+		t.Fatalf("successor xmax = %d, want propagated sB locker xid %d (Infomask=%#x)", hdr.Xmax, sB.Tx.XID, hdr.Infomask)
+	}
+	if !storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		t.Errorf("propagated lock on successor must be lock-only (Infomask=%#x)", hdr.Infomask)
+	}
+	if st := lockOnlyMemberStatus(hdr.Infomask, hdr.Infomask2); st != multixact.StatusForKeyShare {
+		t.Errorf("successor lock status = %v, want StatusForKeyShare", st)
+	}
+}
+
 // TestForShareSkipsAbortedUpdaterNoMultiXact is the negative twin: when the
 // foreign updater has ABORTED, the producer's MultiXactIdExpand-style survivor
 // filter drops it (an aborted updater leaves no live holder), so no multi is

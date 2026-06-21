@@ -513,6 +513,59 @@ the successor version, so a later `DELETE`/key-`UPDATE` of the live version does
 not wait. That propagation (+ the plain-`UPDATE`/`DELETE` write-path lock-conflict
 wait) is the next slice toward spec promotion.
 
+### Hot-path wiring slice 5: update-chain forward lock propagation (locker half)
+
+This slice lands the **locker half** of update-chain lock propagation identified at
+the end of slice 4. When `SELECT ... FOR KEY SHARE`/`FOR SHARE` (any non-key
+strength) locks a version that an in-progress *no-key* updater has already
+superseded, `stampLockInner` combines our locker into the version the locker sees
+(the updater-bearing multi, slice 1–4) **and now also traverses the update chain
+forward** to lock the newer version(s). Without this, a later `DELETE`/key-`UPDATE`
+of the live successor sees no holder on that version and proceeds without waiting.
+
+goopg analog of `heap_lock_updated_tuple` / `heap_lock_updated_tuple_rec`
+(`postgres/src/backend/access/heap/heapam.c`):
+
+- **`propagateLockForward(rel, start, priorXmax)`** walks `t_ctid` from the
+  successor pointer (`start`), one page-lock at a time (pin → lock → stamp →
+  unlock → unpin, mirroring upstream's `UnlockReleaseBuffer` between hops). It does
+  **not** touch the initial tuple (the caller already stamped it) and does **not**
+  check visibility — each chain member is unconditionally marked locked. Continuity
+  is enforced like upstream's `l4` `priorXmax` test: each successor's `xmin` must
+  equal the prior version's update xid, else the line pointer was recycled and we
+  stop. A successor created by an aborted xact, a `HEAP_XMAX_INVALID` / only-locked
+  / self-`t_ctid` version, or a pruned slot ends the walk. A 32-hop backstop guards
+  against a cyclic chain.
+- **`lockSuccessorVersion`** stamps one chain member (page already held by the
+  caller): a foreign holder is *combined* via `stampMultiLock` (lock-only) or
+  `stampMultiUpdaterLock` (updater-bearing), never overwritten; a real updater that
+  cannot be combined (aborted) is left intact so we never clobber a live updater's
+  xmax; otherwise our lock-only xmax is stamped directly (`PageSetHeapTupleLockOnly`
+  + `PageSetHeapTupleLockKeysUpdated` + `markHeapLockDirty`).
+- **`updaterXID(hdr)`** resolves a header's update xid (single xid, or the update
+  member of a multi via `multixactUpdaterXID`), the goopg analog of
+  `HeapTupleHeaderGetUpdateXid`, used both at the call site and for chain
+  continuity.
+
+Like the multi producer, the propagated lock-only stamp marks the page dirty
+without a logical heap-lock WAL record (lock-only multixact state is transient and
+correct to lose on crash); WAL persistence stays deferred.
+
+Pinned by `TestForKeySharePropagatesLockToUpdatedSuccessor`
+(`internal/executor/operators_lockrows_test.go`): an in-progress no-key UPDATE
+supersedes a row, a `FOR KEY SHARE` locker then locks the old version, and the
+successor (the only tuple with `xmin = sA`) is asserted to carry the locker's
+`FOR KEY SHARE` lock-only xmax (decoded via `lockOnlyMemberStatus`). The six
+dedicated row-lock isolation specs stay green.
+
+Measuring `lock-update-traversal` after this slice confirms the **remaining**
+blocker is now purely the **write-path half**: the plain `UPDATE`/`DELETE` path
+must *wait* on the propagated lock-only holder (resolving active holders via the
+multixact member store + `WaitForXID`, then re-evaluate) and must respect the
+strength matrix — a no-key `UPDATE` proceeds against a `FOR KEY SHARE` holder, a
+`DELETE`/key-`UPDATE` waits. That write-path lock-wait is the next slice; it
+promotes `lock-update-traversal` / `lock-update-delete` / `propagate-lock-delete`.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -622,13 +675,18 @@ verified primitive:
      locking the same tuple must appear as distinct multixact members (the
      `tuplelock-conflict` savepoint permutations); needs the subtransaction xid
      threaded into the producer.
-   - ⛔ **update-chain lock propagation** — `SELECT ... FOR KEY SHARE` on an
-     in-flight-updated row must propagate the lock forward to the successor
-     version so a later `DELETE`/key-`UPDATE` of the live version waits
-     (`lock-update-traversal`/`lock-update-delete`/`propagate-lock-delete`). This
-     also needs the plain-`UPDATE`/`DELETE` write path to honour a lock-only
-     holder. Measured as the sole remaining `lock-update-traversal` blocker after
-     slice 4.
+   - 🟡 **update-chain lock propagation** — split into two halves:
+     - ✅ **locker half**: `SELECT ... FOR KEY SHARE`/`FOR SHARE` on an
+       in-flight-updated row now propagates the lock forward to the successor
+       version(s) via `propagateLockForward` / `lockSuccessorVersion`
+       (`heap_lock_updated_tuple` analog) — see *Hot-path wiring slice 5* above.
+       Pinned by `TestForKeySharePropagatesLockToUpdatedSuccessor`.
+     - ⛔ **write-path half**: the plain `UPDATE`/`DELETE` write path must *wait*
+       on a propagated lock-only holder (resolve active holders via the multixact
+       member store + `WaitForXID`, re-evaluate) respecting the strength matrix.
+       Measured as the **sole** remaining `lock-update-traversal` blocker after
+       slice 5 (s2d2 key-`UPDATE` completes without `<waiting>`); promotes
+       `lock-update-traversal`/`lock-update-delete`/`propagate-lock-delete`.
 4. **WAL persistence of multixact members** — the lock-only producer marks the
    page dirty *without* a heap-lock WAL record (the record carries a single
    xid + strength and cannot describe a multi). Lock-only multixact state is
