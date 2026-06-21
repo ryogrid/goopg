@@ -176,6 +176,18 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       updater branch ~L719 ignores a multixact xmax that carries updater+lockers)
       and a savepoint-driven lock-retry deadlock (perm 9 `s1_fornokeyupd` times
       out). Both are deeper multixact-with-updater wait-ordering work.
+      **2026-06-22 read-side half landed (design 0118-0009):** `stampLockInner`'s
+      real-updater branch is now multixact-aware (resolves the real updater via
+      `updaterXID`, waits first on every other still-active member, excludes a
+      self-upgrading holder) — fixes a latent raw-MultiXactId-fed-to-single-xid-API
+      bug; regression batch green. perms 2/3 STILL fail because the PRODUCER side
+      is unimplemented: goopg's UPDATE stamps the old tuple with a single updater
+      xid (`PageSetHeapTupleXmax` at `operators_storage.go:2638`/`:3279` + merge/
+      upsert twins) instead of preserving a non-conflicting locker into a
+      `{updater+survivors}` MultiXactId (upstream `heap_update`/`MultiXactIdCreate`).
+      NEXT: shared `stampUpdaterXmaxPreservingLockers` helper, gated on a
+      pre-existing foreign non-conflicting active lock-only xmax (bounded blast
+      radius), then make the UPDATE conflict-wait multixact-aware.
       (b) `deadlock-parallel` needs a lock-group abstraction goopg lacks — defer.
 - [ ] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,

@@ -799,8 +799,60 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 
 		xmax := tup.Header.Xmax
 		ctid := tup.Header.CTID
+		infomask := tup.Header.Infomask
+		// MultiXact-aware updater handling (heap_lock_tuple's MultiXactIdWait):
+		// when the xmax is a MultiXactId the raw value is NOT a TransactionID, so
+		// it must not be fed to IsXIDActive / WaitForXID / HasAbortedXID. Resolve
+		// the real row-updater member for the abort/commit/chain decision below,
+		// and collect every OTHER still-active member whose lock we must also wait
+		// on (e.g. a surviving FOR KEY SHARE holder recorded alongside the
+		// updater). Without this an upgrading FOR UPDATE waiter ignores the
+		// co-holder and proceeds out of order: in tuplelock-upgrade-no-deadlock
+		// perms 2/3 the existing key-share holder s3 upgrading its own lock must
+		// complete before the pure waiter s2, because s2's FOR UPDATE still
+		// conflicts with s3's key-share membership even after the updater aborts.
+		var multiHolders []storage.TransactionID
+		if storage.IsHeapTupleXmaxMulti(infomask) {
+			updater := o.updaterXID(tup.Header)
+			for _, hx := range o.activeLockHolders(xmax, infomask) {
+				if hx != updater {
+					multiHolders = append(multiHolders, hx)
+				}
+			}
+			xmax = updater
+		}
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
+
+		// Wait for any still-active non-updater MultiXact lock member before the
+		// updater itself. An existing holder upgrading its own lock is excluded
+		// here (activeLockHolders skips Tx.XID) and so proceeds ahead of a pure
+		// waiter, matching PostgreSQL's lock-release order. The wait policy is
+		// honoured exactly as for the updater wait below.
+		if len(multiHolders) > 0 {
+			switch o.waitPolicy {
+			case planner.LockWaitSkipLocked:
+				return storage.ItemPointer{}, false, true, nil // epqSkipped
+			case planner.LockWaitNoWait:
+				return storage.ItemPointer{}, false, false, &ExecError{
+					Code:    "55P03",
+					Pos:     o.plan.Pos(),
+					Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
+				}
+			}
+			qctx := o.ctx.Ctx
+			if qctx == nil {
+				qctx = context.Background()
+			}
+			for _, hx := range multiHolders {
+				if werr := o.ctx.TxnMgr.WaitForXID(qctx, hx); werr != nil {
+					// Context cancelled — skip this row silently.
+					return storage.ItemPointer{}, false, false, nil
+				}
+			}
+			// Membership changed while we waited — re-evaluate from scratch.
+			return o.stampLockInner(rel, ptr, depth+1)
+		}
 
 		// Wait for in-progress updater to commit or abort. NOWAIT / SKIP LOCKED
 		// must not block here: when the chain-follow reaches a version whose xmax

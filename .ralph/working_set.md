@@ -1,57 +1,57 @@
-Task: M0118-0004 (deadlock detection) — this loop made PARTIAL progress on
-`tuplelock-upgrade-no-deadlock` (crash fixed, spec NOT promoted). M0118-0004 continues.
+Task: M0118-0004 (deadlock detection) — `tuplelock-upgrade-no-deadlock` continues.
+This loop landed the READ-SIDE half of the perm 2/3 wait-ordering fix. Spec NOT
+promoted (perms 2,3,9 still fail). M0118-0004 continues.
 
 DONE this loop (committed):
-- BUG FIX (not a promotion): `tuplelock-upgrade-no-deadlock` perm 5
-  (s1_keyshare s2_for_update s3_keyshare s3_delete s1_rollback s3_commit
-  s2_rollback) crashed with `ERROR: short read at block`. ROOT CAUSE: s2's
-  waking FOR UPDATE followed the committed-DELETE's t_ctid chain; a goopg DELETE
-  leaves the initial CTID {InvalidBlockNumber,0} (PageSetHeapTupleXmax stamps
-  only xmax), which is NOT self-pointing, so stampLockInner's self-only "no
-  successor" guard fell through and Pinned block InvalidBlockNumber → ErrShortRead.
-  FIX: extracted isChainTailCTID(ctid,curBlk,curSlot) (InvalidBlockNumber ||
-  Offset==0 || self) — used in BOTH epqFollowChainFull AND stampLockInner
-  (sibling-paths); deleted-row return now epqSkipped=true so drainAndStamp drops
-  the row → s2 sees (0 rows). Perm 5 now correct.
-- Files: internal/executor/operators_storage.go (+isChainTailCTID, epqFollowChainFull
-  uses it), internal/executor/operators_lockrows.go (stampLockInner uses it +
-  epqSkipped=true), internal/executor/chain_tail_ctid_test.go (NEW unit test —
-  CI guard since spec stays t.Skip), internal/testport/isolation_port_test.go
-  (+TestPort_IsolationTuplelockUpgradeNoDeadlock skip-anchor), design NEW
-  0118-0008 + README index, fix_plan + deferral ledger annotated.
+- BUG FIX (read side, NOT a promotion): lockRowsOp.stampLockInner's real-updater
+  branch captured `xmax := tup.Header.Xmax` and fed that RAW value to
+  TxnMgr.IsXIDActive/WaitForXID/HasAbortedXID. When xmax is a MultiXactId
+  (HEAP_XMAX_IS_MULTI {updater, key-share holder}) the raw value is NOT a
+  TransactionID → a FOR UPDATE waiter ignored a surviving co-holder and proceeded
+  out of order. FIX: when IsHeapTupleXmaxMulti → resolve updater via updaterXID
+  (used for abort/commit/chain), wait FIRST on every OTHER active member
+  (activeLockHolders skips Tx.XID) honouring SKIP LOCKED/NOWAIT/blocking, then
+  retry stampLockInner from scratch. Mirrors heap_lock_tuple MultiXactIdWait.
+- Files: internal/executor/operators_lockrows.go (stampLockInner ~L800 +multiHolders
+  branch), docs/design/0118-0009-rowlock-multixact-updater-wait.md (NEW) + README
+  index, fix_plan + deferral ledger annotated.
 
 GATES (all PASS): go build ./...; go vet ./internal/executor; gofmt clean on
-changed lines (pre-existing go1.25/1.26 alignment noise elsewhere left untouched
-— do NOT gofmt -w); go test ./internal/executor incl TestIsChainTailCTID;
-regression batch LockUpdateDelete/LockUpdateTraversal/UpdateLockedTuple/
-TuplelockConflict/TuplelockUpdate/TuplelockPartition/PropagateLockDelete/
-MultixactNoDeadlock/SkipLocked{,2,3,4}/Nowait{,2,3,4,5}/LockCommitted{Update,
-Keyupdate}/Merge{Update,Delete,MatchRecheck}/EvalPlanQual{,Trigger} PASS; -race
-on LockUpdateDelete/MultixactNoDeadlock/TuplelockConflict PASS; ralph-state-guard
-OK. DO NOT stage: postgres, weekly_loc.*, requirements.txt, weekkly_loc_history.py.
+changed lines (pre-existing go1.25/1.26 alignment noise elsewhere untouched — do
+NOT gofmt -w); multixact/row-lock regression batch (LockUpdateDelete/
+LockUpdateTraversal/UpdateLockedTuple/TuplelockConflict/TuplelockUpdate/
+TuplelockPartition/PropagateLockDelete/MultixactNoDeadlock/SkipLocked*/Nowait*/
+LockCommitted{Update,Keyupdate}/Merge{Update,Delete,MatchRecheck}/EvalPlanQual*)
+exit 0 — NO regression. ralph-state-guard OK. DO NOT stage: postgres, weekly_loc.*,
+requirements.txt, weekkly_loc_history.py.
 
->>> NEXT STEP (continue M0118-0004, finish tuplelock-upgrade-no-deadlock):
-    Two failures remain (spec CSV still `failed`, test still t.Skip):
-    (1) WAIT-QUEUE UPGRADE PRIORITY (perms 2,3): after s1 rolls back, the existing
-        key-share holder s3 upgrading its OWN lock must wake BEFORE the pure
-        waiter s2 (PG: s3_update completes first, THEN s2_for_update). goopg wakes
-        s2 first. FIX target: stampLockInner committed-updater branch (~L719 in
-        operators_lockrows.go) does NOT special-case a multixact xmax carrying
-        updater+lockers — make it multixact-aware (when xmax IS_MULTI w/ updater,
-        resolve members via shared store, wait only on conflicting ACTIVE members,
-        let an existing holder's self-upgrade proceed). Mirror stampMultiUpdaterLock.
-    (2) SAVEPOINT lock-retry (perm 9): s1_fornokeyupd times out / bad connection
-        where PG re-runs the tuple-lock algorithm after `rollback to savepoint`
-        changes multixact membership (heap_lock_tuple HeapTupleUpdated retry).
+>>> NEXT STEP (continue M0118-0004 — PRODUCER side of perms 2/3):
+    Read side is done but observably a no-op until the producer preserves the
+    co-locker. goopg's UPDATE stamps the OLD tuple with a SINGLE updater xid via
+    `PageSetHeapTupleXmax(s.Page(), pu.slot, Tx.XID)` at operators_storage.go:2638
+    AND :3279 (plus operators_merge.go:886/976 + operators_upsert.go:932/1287
+    twins) — discarding any pre-existing non-conflicting lock-only locker (s3's
+    key-share). PG's heap_update -> compute_new_xmax_infomask/MultiXactIdCreate
+    forms {updater + surviving non-conflicting members}.
+    PLAN: add shared `stampUpdaterXmaxPreservingLockers(ctx,rel,blk,slot)` that —
+    ONLY when the old tuple already has a foreign non-conflicting ACTIVE lock-only
+    xmax (single or multi) — forms {Tx.XID updater + survivors} via
+    PageSetHeapTupleXmaxMulti instead of the plain stamp (common pgbench case = no
+    foreign locker → plain stamp → bounded blast radius). Wire at the 2 storage
+    sites + merge/upsert twins (sibling-paths). THEN make the UPDATE conflict-wait
+    multixact-aware (wait on a conflicting member; let an existing member upgrade)
+    so s3_update behaves. MANDATORY gates for this slice: pgbench smoke + FULL
+    regress-port (UPDATE hot path). THEN perm 9 (savepoint-driven lock retry,
+    heap_lock_tuple HeapTupleUpdated re-run after rollback-to-savepoint).
     Then `deadlock-parallel` — DEFER (needs parallel-query lock-group abstraction).
-    Per-spec workflow: capture live diff; fix → green → CSV failed→pass (rationale
-    COMMA-FREE) → regen gen-oracle-inventory + gen-isolation-coverage → design slice
-    + README + ledger.
+    Per-spec workflow on promotion: fix→green→CSV failed→pass (rationale COMMA-FREE)
+    → regen gen-oracle-inventory + gen-isolation-coverage → design slice + README
+    + ledger.
 
 GOTCHAS: CSV rationale MUST be comma-free [[serena_replace_content_dotall_eats_file]];
 prefer built-in Edit for Go code. gofmt version mismatch — never gofmt -w
-[[goopg_gofmt_version_mismatch_no_w]]. goopg DELETE omits HEAP_KEYS_UPDATED + keeps
-self... no, keeps {InvalidBlockNumber,0} CTID [[goopg_delete_no_heap_keys_updated]].
-tpch-spotcheck INFRA-BLOCKED (SLRU backfill >60s); row-lock path never fires in
-pgbench TPC-B/TPC-H so TPS blast radius nil. Pre-existing forvar lint nit at
+[[goopg_gofmt_version_mismatch_no_w]]. goopg DELETE keeps initial CTID
+{InvalidBlockNumber,0} [[goopg_delete_no_heap_keys_updated]]. tpch-spotcheck
+INFRA-BLOCKED (SLRU backfill >60s); row-lock path never fires in pgbench TPC-B/
+TPC-H so TPS blast radius nil. Pre-existing forvar lint nit at
 isolation_port_test.go:50 UNRELATED.
