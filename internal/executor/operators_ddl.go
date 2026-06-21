@@ -9341,7 +9341,7 @@ func truncateRelation(ctx *Context, rel storage.RelFileNode) error {
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				continue
 			}
 			_ = storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
@@ -11662,7 +11662,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 			if terr != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
 				continue
 			}
 			row := acquireRow(len(oldCols))
@@ -11825,7 +11825,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 			if terr != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
 				continue
 			}
 			row := acquireRow(len(oldCols))

@@ -1,22 +1,56 @@
-(idle — nothing in flight)
+Task: M0118-0003 multixact — LANDED the MISSED highest-blast-radius read consumer
+`mvcc.TupleVisibleSubxact` (the subtransaction-aware twin of `TupleVisible` used by
+the MAIN seqscan + FK + MERGE + DDL rewrites). A producer-gate audit proved the
+prior "gate satisfied" claim WRONG: the gate is still NOT satisfied — two more
+wait-on-deleter consumers remain before the producer.
 
-DU-002 slice 301 LANDED (fixture-only). Function-argument DEFAULT with a nested-arithmetic
-binary op `(1 + 2) * 3` round-trips byte-identical vs real pg_dump 18.3 as
-`add_calcdef(a integer DEFAULT ((1 + 2) * 3))`. This is the FOURTH/last deparse context
-`executor.defaultExprToSQL` feeds (after slice 298 index-predicate / 299 index-column /
-300 partition-key). Verified PG's print_function_arguments (ruleutils.c:3428) uses
-`deparse_expression(expr,NIL,false,false)` with NO extra `(%s)` wrap (unlike partkeydef
-slice 300) — full parens come from get_oper_expr non-pretty mode, which goopg already
-mirrors via defaultExprToSQL's slice-298 BinaryOp arm + ArgDefaults storage. No production
-change; fixture only. Files: testport/pgdump_connsetup_test.go (add_calcdef fixture +
-4-paren assertion + one-paren-short negative guard), docs/design/0110-0001 (slice 301
-section). Oracle-verified vs live PG 18.3.
+DONE this loop (#48), committed:
+- `mvcc.TupleVisibleSubxact` (internal/mvcc/subxact_visibility.go) now takes
+  `mxs *multixact.Store` (new last param) and resolves an updater-bearing
+  (`IsHeapTupleXmaxMulti && !IsHeapTupleLockOnly`) MultiXactId xmax to its updater
+  via `Store.Members`+`GetUpdateXid` (effXmax) before the self/hint-bit/snapshot
+  checks — structurally identical to `TupleVisible`'s multi arm (all-locker→visible,
+  unresolvable→invisible; single/lock-only byte-identical; self-xmin branch keeps
+  raw h.Xmax to match TupleVisible). Added `multixact` import.
+- Threaded `ctx.MultiXact`/`o.ctx.MultiXact` through ALL 13 call sites:
+  operators_fk.go ×5, operators_ddl.go ×3, operators_storage.go ×2 (incl.
+  seqScanOp.Next L837), operators_merge.go, applyworker.go ×2.
+- Test TestTupleVisibleSubxactMultiXact (mirrors TestTupleVisibleMultiXact) +
+  3 existing call sites in subxact_visibility_test.go updated (mxs arg).
+- Design 0118-0002 §"slice 2 continued, 3" + corrected producer-gate section;
+  README index status+summary corrected; ledger row appended.
 
-All four defaultExprToSQL binary-op deparse contexts are now byte-verified.
+GATES this loop: `go build ./...` OK; `go vet ./internal/mvcc ./internal/executor`
+OK (persistent LSP WrongArgCount diagnostics are STALE cross-pkg cache — real build
+& vet pass clean); `-race ./internal/mvcc ./internal/multixact ./internal/storage`
+PASS; executor Visib/Scan/FK/Merge/DropColumn/AlterColumn/Truncate/Lock/MultiXact/
+Subxact/Apply subset PASS; 9 dedicated row-lock isolation specs PASS
+(LockCommittedUpdate/Keyupdate, MergeUpdate, MergeInsertUpdate, PredicateLockHotTuple,
+SkipLocked, Nowait, Nowait3, UpdateLockedTuple). ralph-state-guard: run before status.
+Stage ONLY code/doc/.ralph files; do NOT git add stray `postgres`, weekly_loc.*,
+requirements.txt.
 
-Next loop (slice 302+): no remaining defaultExprToSQL context. Candidate surfaces —
-multi-column / NULL-typed DEFAULT on the partition-leaf ALTER path, OR the keyword-vs-literal
-MINVALUE partition-bound ambiguity (slice 169 deferral). Pick from fix_plan.
+>>> NEXT STEP (producer gate, step (i) — the two REMAINING wait-on-deleter consumers,
+    found by the audit; MUST precede the producer per [[pattern_sibling_paths_must_agree]]):
+  Make `scanRelForFKMatch` (operators_fk.go ~L712) and `findInProgressConflictKey`
+  (operators_upsert.go Case 2 ~L798) multixact-aware: when
+  `IsHeapTupleXmaxMulti && !IsHeapTupleLockOnly`, resolve `GetUpdateXid(Store.Members
+  (MultiXactId(xmax)))` (and/or the active-member subset like `activeLockHolders`)
+  BEFORE `IsXIDActive(xmax)`/`WaitForXID` — never pass the raw MultiXactId to a
+  single-TransactionID API. all-locker→clean match; unresolvable→conservative wait.
+  Both have `ctx`/`o.ctx` for the store. ALSO audit `stampAtPtr` (operators_lockrows.go
+  ~L872) "another real updater arrived" recheck.
+  THEN: the PRODUCER (stampLockInner branch (a), the non-key-update+FOR KEY SHARE skip
+  path) — build {updater@NoKeyUpdate, locker@ForShare}, CreateFromMembers (keep
+  in-progress holders + committed updater, drop dead lockers/aborted updater per
+  MultiXactIdExpand), HintBits (NOT lock-only), PageSetHeapTupleXmaxMulti; thread the
+  real Store through vacuum/analyze (currently nil). HOT-PATH WARNING: updater-bearing
+  multis are NOT visibility-transparent — re-run executor/storage/mvcc/btree + FULL
+  isolation row-lock suite after the producer.
 
-NOTE: a concurrent session commits on this branch (committed fe03ce91 in loop #68). Do NOT
-git add -A — stage only your own files. Do NOT Edit .ralph/fix_plan.md (driver churns it).
+GOTCHAS: audit lesson — enumerate xmax consumers by MECHANICALLY sweeping every
+`IsHeapTupleLockOnly` site (the hand list missed TupleVisibleSubxact + the 2 FK/upsert
+consumers). multixact path only fires with ≥2 concurrent row-lock holders (never
+pgbench/TPC-H), TPS blast radius nil. No producer emits non-lock-only multis yet, so
+ALL changes are behavior-identical for existing tuples. tpch-spotcheck INFRA-BLOCKED
+(startup SLRU backfill >60s); pgbench pre-commit smoke (hook) is the live commit guard.

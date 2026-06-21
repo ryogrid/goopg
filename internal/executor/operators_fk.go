@@ -176,7 +176,7 @@ func fullTableFKCheck(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignK
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -428,7 +428,7 @@ func fkCascadeDelete(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKe
 				if err != nil {
 					continue
 				}
-				if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+				if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 					continue
 				}
 				row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -506,7 +506,7 @@ func fkSetNull(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, val
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -620,7 +620,7 @@ func scanRelForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals [
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -698,7 +698,7 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)

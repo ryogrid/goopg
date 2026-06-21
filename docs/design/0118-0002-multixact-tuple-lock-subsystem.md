@@ -326,10 +326,57 @@ added. `amcheck/verify_heapam.go`'s `checkXmaxBounds` already returns early on
 `HEAP_XMAX_IS_MULTI` (it validates the multi separately — a deferred AC-003 path),
 so it never misreads the MultiXactId either.
 
-With all three storage consumers correct, **every** xmax read consumer
-(`isConcurrentlyUpdated`, `mvcc.TupleVisible`, `freeze`/`prune`) now agrees on the
-updater-bearing-multi interpretation — the producer gate
-([[pattern_sibling_paths_must_agree]]) is satisfied.
+### Hot-path wiring slice 2 (continued, 3): main-scan visibility twin (`mvcc.TupleVisibleSubxact`)
+
+A producer-gate audit (re-running the [[pattern_sibling_paths_must_agree]] sweep
+over **every** `IsHeapTupleLockOnly` consumer, not just the originally-enumerated
+set) found that the slice-2 read-consumer list above was **incomplete**.
+`mvcc.TupleVisible` has a subtransaction-aware twin, **`mvcc.TupleVisibleSubxact`**
+(`mvcc/subxact_visibility.go`), and it is the visibility check the *main sequential
+scan* uses (`operators_storage.go` `seqScanOp.Next`), along with FK enforcement
+(`operators_fk.go`), `MERGE` (`operators_merge.go`), CTE-modifying scans, and the
+DDL table rewrites (`TRUNCATE` / `DROP COLUMN` / `ALTER COLUMN TYPE`). It read
+`h.Xmax` as a raw `TransactionID` in its non-lock-only arm — so a producer-stamped
+`HEAP_XMAX_IS_MULTI && !LOCK_ONLY` xmax would have been silently misread as a
+deleter xid on *every plain `SELECT`*. This is the highest-blast-radius consumer of
+all, and it had been missed.
+
+This slice makes `TupleVisibleSubxact` resolve the updater member through the
+process-shared `*multixact.Store` (added as its last parameter, threaded from
+`ctx.MultiXact` at all ~13 call sites) before the self / hint-bit / snapshot xmax
+checks — structurally identical to `TupleVisible`'s multi arm, with the same
+conservative directions (all-locker multi → visible; unresolvable multi → invisible).
+The self-`xmin` short-circuit branch keeps the raw `h.Xmax` comparison, mirroring
+`TupleVisible` exactly (both share the same unreachable-until-producer self-update
+edge case, to be re-audited in both twins when the producer lands). The single-xid
+and lock-only paths stay byte-identical, so every existing tuple is judged exactly
+as before. Pinned by `TestTupleVisibleSubxactMultiXact` (mirrors
+`TestTupleVisibleMultiXact`) plus the existing `TestTupleVisibleSubxactDegrades`.
+
+### Producer gate: still NOT satisfied — remaining read consumers
+
+The same audit found **two more** consumers that interpret a non-lock-only xmax as
+a raw xid and pass it to a single-`TransactionID` API (`IsXIDActive` / `WaitForXID`)
+— a category error for a `MultiXactId` (different numbering space). They are **not**
+yet multixact-aware and must land before the producer:
+
+- **`scanRelForFKMatch`** (`operators_fk.go`) — the FK existence/`ri` check that
+  decides whether to wait on a concurrent deleter: `xmax := tuple.Header.Xmax; …
+  IsXIDActive(xmax)`. Must resolve the updater member and wait on the active
+  member(s), like `activeLockHolders`.
+- **`findInProgressConflictKey`** (`operators_upsert.go`, Case 2) — the
+  `INSERT … ON CONFLICT` arbiter that waits on an in-flight deleter of a candidate
+  conflict row: `IsHeapTupleLockOnly`-gated, then `IsXIDActive(xmax)`.
+- (Audit also: `stampAtPtr` in `operators_lockrows.go`'s "another real updater
+  arrived while we waited" recheck reads a non-lock-only xmax; confirm it cannot see
+  a producer-stamped multi, or make it resolve.)
+
+So with `isConcurrentlyUpdated`, `mvcc.TupleVisible`, `mvcc.TupleVisibleSubxact`,
+and `freeze`/`prune` correct, the **visibility** consumers now agree, but the FK /
+upsert **wait-on-deleter** consumers do not — the producer gate
+([[pattern_sibling_paths_must_agree]]) is **not** satisfied until those land. The
+lesson: enumerate consumers by *mechanically sweeping every `IsHeapTupleLockOnly`
+site*, not from a hand-maintained list.
 
 ## Verification
 
@@ -408,16 +455,27 @@ verified primitive:
    - ✅ `storage` vacuum read consumers (`freeze.go` / `prune.go`; `vm.go`
      conservative, no change) are multixact-aware via the `storage.ResolveMultiUpdater`
      hook wired from `cmd/goopg/main.go` — see *Hot-path wiring slice 2 (continued, 2)*
-     above. This was the **last** read consumer; the producer gate is now satisfied.
+     above.
+   - ✅ `mvcc.TupleVisibleSubxact` (the **main sequential-scan** / FK / `MERGE` / DDL
+     visibility twin of `TupleVisible`) is multixact-aware — see *Hot-path wiring
+     slice 2 (continued, 3)* above. A producer-gate audit found this had been missed
+     from the original read-consumer list; it is the highest-blast-radius consumer
+     (every plain `SELECT`).
+   - ⛔ `scanRelForFKMatch` (`operators_fk.go`) — FK wait-on-deleter still reads a
+     non-lock-only xmax as a raw xid (`IsXIDActive(xmax)`). Resolve the updater +
+     wait on the active member(s) before the producer.
+   - ⛔ `findInProgressConflictKey` (`operators_upsert.go`, Case 2) — `INSERT … ON
+     CONFLICT` arbiter wait-on-deleter, same raw-xid read. Resolve before the producer.
    - ⛔ **producer**: branch (a) of `stampLockInner` (`operators_lockrows.go`, the
      "non-key update + `FOR KEY SHARE`" path that currently skips) must *combine*
      a new locker with the in-progress updater into a multixact and stamp a
-     **non**-lock-only multi. All read consumers now agree, so the producer may
-     land next — unlike the lock-only case this is **not** transparent to
-     visibility, so re-run the executor/storage/mvcc/btree + full isolation
-     row-lock suite when it does ([[pattern_sibling_paths_must_agree]]). When the
-     producer lands, also thread the real `Store` through vacuum/analyze (the
-     stats scans currently pass `nil`).
+     **non**-lock-only multi. **Blocked** until the two ⛔ FK/upsert wait-on-deleter
+     consumers above are multixact-aware (the *visibility* consumers now agree, but
+     the *wait-on-deleter* consumers do not). Unlike the lock-only case this is
+     **not** transparent to visibility, so re-run the executor/storage/mvcc/btree +
+     full isolation row-lock suite when it lands
+     ([[pattern_sibling_paths_must_agree]]). When the producer lands, also thread the
+     real `Store` through vacuum/analyze (the stats scans currently pass `nil`).
 3. **4-way lock strength + savepoint/subxact members** — goopg's `lockStrength`
    collapses PG's four lock modes to two (`ShrLock`/`ExclLock`); faithful
    `tuplelock-conflict`/`tuplelock-upgrade-no-deadlock` parity needs the full

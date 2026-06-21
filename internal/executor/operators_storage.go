@@ -834,7 +834,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// partial page writes or WAL-replay debris.
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}
@@ -4421,7 +4421,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 				ctx.Pool.Unpin(s)
 				return err
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				// CTESelfModifiedErrors: if a sub-command during the CTE phase
 				// modified this invisible (own-xmax) tuple, the outer
 				// UPDATE/DELETE must raise ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION.

@@ -266,7 +266,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				}
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
 				continue
 			}
 			tgtRow, err := DecodeHeapTupleRow(scanTbl.Columns, tuple, nil)
