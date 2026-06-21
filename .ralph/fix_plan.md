@@ -201,6 +201,25 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       HOT-stamp storage primitive (CTID + `HEAP_HOT_UPDATED` + multi xmax) in
       addition to the plain delete+insert / merge / upsert wiring, plus full
       UPDATE-hot-path gates (pgbench + regress-port).
+      **2026-06-22 producer landed (design 0118-0011): 8/9 spec perms now match.**
+      New storage primitive `PageStampHotOldTupleMulti` + shared helper
+      `stampUpdaterXmaxPreservingLockers` (gated on a lock-only xmax; keeps only
+      still-active foreign lockers whose mode does NOT conflict via
+      `multixact.StatusesConflict`, appends our updater member, builds the multi)
+      + non-HOT wrapper `stampUpdaterXmaxNonHOT`, wired at ALL old-tuple xmax
+      stamp twins (HOT path = spec; index/seqscan UPDATE delete-half; index/
+      seqscan DELETE + DELETE…USING; UPDATE…FROM; merge update/delete; upsert
+      update + delete). A no-key UPDATE now preserves a non-conflicting FOR KEY
+      SHARE holder into `{updater + survivors}`; key-UPDATE/DELETE (StatusUpdate
+      conflicts with all modes) stays a plain stamp. Crash-safe: HOT/delete WAL
+      records still carry the single updater xid → replay degrades to single-xid
+      (transient lockers don't survive a crash; multixact WAL persistence deferred
+      0118-0002). Unit tests `TestPageStampHotOldTupleMulti`/
+      `TestStampUpdaterXmaxPreservingLockers`; `-race` batch + multixact/storage/
+      executor/wal/mvcc PASS; pgbench smoke 0-failed. **Spec STILL `defer`:**
+      perm 9 needs savepoint-scoped row-lock release on ROLLBACK TO SAVEPOINT
+      (tuple-lock retry) — NOT in goopg; + UPDATE/DELETE conflict-wait-on-a-
+      conflicting-locker still deferred. Both ledger'd.
       (b) `deadlock-parallel` needs a lock-group abstraction goopg lacks — defer.
 - [ ] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,

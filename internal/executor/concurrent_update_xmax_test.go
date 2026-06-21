@@ -302,6 +302,98 @@ func TestMultixactFirstActiveMemberHelper(t *testing.T) {
 	_ = ctx.TxnMgr.Rollback(t1)
 }
 
+// TestStampUpdaterXmaxPreservingLockers pins the M0118-0004 UPDATE/DELETE
+// producer: when the old tuple already carries a pre-existing non-conflicting
+// foreign lock-only xmax, the writer preserves it into a {updater + survivors}
+// MultiXactId rather than clobbering it with the plain single-xid stamp.
+func TestStampUpdaterXmaxPreservingLockers(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.MultiXact = multixact.NewStore()
+
+	// Materialise self's writer XID (the updater).
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		t.Fatalf("MaterializeWriterXID: %v", err)
+	}
+	self := ctx.Tx.XID
+
+	// A foreign, still-active FOR KEY SHARE locker.
+	locker := beginTxn(t, ctx)
+	defer func() { _ = ctx.TxnMgr.Rollback(locker) }()
+	lockerXID, err := ctx.TxnMgr.AssignXID(locker)
+	if err != nil {
+		t.Fatalf("AssignXID locker: %v", err)
+	}
+	keyShareHdr := storage.HeapTupleHeader{
+		Xmax:     lockerXID,
+		Infomask: storage.HeapXmaxLockOnly | storage.HeapXmaxKeyShrLock,
+	}
+
+	// Case 1: no-key UPDATE — FOR KEY SHARE does NOT conflict with a no-key
+	// update, so the locker is preserved into {locker keyshare, self nokeyupdate}.
+	multi, im, _, ok, err := stampUpdaterXmaxPreservingLockers(ctx, keyShareHdr, false)
+	if err != nil {
+		t.Fatalf("no-key update: %v", err)
+	}
+	if !ok {
+		t.Fatalf("no-key update: ok=false, want a preserving multi")
+	}
+	if im&storage.HeapXmaxIsMulti == 0 {
+		t.Errorf("no-key update: infomask %#x missing HEAP_XMAX_IS_MULTI", im)
+	}
+	if im&storage.HeapXmaxLockOnly != 0 {
+		t.Errorf("no-key update: infomask %#x still has HEAP_XMAX_LOCK_ONLY (updater-bearing multi)", im)
+	}
+	members, found := ctx.MultiXact.Members(multi)
+	if !found {
+		t.Fatalf("no-key update: multi %d has no members", multi)
+	}
+	haveLocker, haveSelf := false, false
+	for _, m := range members {
+		if m.Xid == lockerXID && m.Status == multixact.StatusForKeyShare {
+			haveLocker = true
+		}
+		if m.Xid == self && m.Status == multixact.StatusNoKeyUpdate {
+			haveSelf = true
+		}
+	}
+	if !haveLocker || !haveSelf {
+		t.Errorf("no-key update members = %+v, want {locker keyshare, self nokeyupdate}", members)
+	}
+
+	// Case 2: key UPDATE / DELETE — StatusUpdate conflicts with FOR KEY SHARE,
+	// so nothing is preserved (caller falls back to the plain single-xid stamp).
+	if _, _, _, ok, err := stampUpdaterXmaxPreservingLockers(ctx, keyShareHdr, true); err != nil || ok {
+		t.Errorf("key update/delete: ok=%v err=%v, want ok=false (conflict drops locker)", ok, err)
+	}
+
+	// Case 3: a non-lock-only (updater-bearing) xmax is out of scope -> ok=false.
+	updHdr := storage.HeapTupleHeader{Xmax: lockerXID} // no LOCK_ONLY bit
+	if _, _, _, ok, err := stampUpdaterXmaxPreservingLockers(ctx, updHdr, false); err != nil || ok {
+		t.Errorf("non-lock-only xmax: ok=%v err=%v, want ok=false", ok, err)
+	}
+
+	// Case 4: the only holder is self -> nothing foreign to preserve -> ok=false.
+	selfHdr := storage.HeapTupleHeader{Xmax: self, Infomask: storage.HeapXmaxLockOnly | storage.HeapXmaxKeyShrLock}
+	if _, _, _, ok, err := stampUpdaterXmaxPreservingLockers(ctx, selfHdr, false); err != nil || ok {
+		t.Errorf("self-only holder: ok=%v err=%v, want ok=false", ok, err)
+	}
+
+	// Case 5: a dead (committed) foreign locker -> lock released -> ok=false.
+	deadLocker := beginTxn(t, ctx)
+	deadXID, err := ctx.TxnMgr.AssignXID(deadLocker)
+	if err != nil {
+		t.Fatalf("AssignXID dead locker: %v", err)
+	}
+	if err := ctx.TxnMgr.Commit(deadLocker); err != nil {
+		t.Fatalf("commit dead locker: %v", err)
+	}
+	deadHdr := storage.HeapTupleHeader{Xmax: deadXID, Infomask: storage.HeapXmaxLockOnly | storage.HeapXmaxKeyShrLock}
+	if _, _, _, ok, err := stampUpdaterXmaxPreservingLockers(ctx, deadHdr, false); err != nil || ok {
+		t.Errorf("dead locker: ok=%v err=%v, want ok=false", ok, err)
+	}
+}
+
 // beginTxn opens a fresh READ_COMMITTED transaction on the same mvcc
 // manager as ctx. Used by the concurrent-update tests to simulate
 // two clients hitting the same row.

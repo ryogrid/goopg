@@ -929,7 +929,17 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 		return err
 	}
 	pinned.Lock()
-	if err := storage.PageSetHeapTupleXmax(pinned.Page(), oldPtr.Offset, o.ctx.Tx.XID); err != nil {
+	// Preserve a pre-existing non-conflicting foreign locker into a {updater +
+	// survivors} multi (M0118-0004 producer); plain single-xid stamp otherwise.
+	// keysUpdated tracks whether the ON CONFLICT DO UPDATE SET list assigns a key
+	// column (StatusUpdate vs StatusNoKeyUpdate).
+	var upErr error
+	if oldHdrTup, herr := storage.PageGetHeapTuple(pinned.Page(), oldPtr.Offset); herr == nil {
+		upErr = stampUpdaterXmaxNonHOT(o.ctx, pinned.Page(), oldPtr.Offset, oldHdrTup.Header, o.onConflictUpdateTouchesKeyColumn())
+	} else {
+		upErr = storage.PageSetHeapTupleXmax(pinned.Page(), oldPtr.Offset, o.ctx.Tx.XID)
+	}
+	if err := upErr; err != nil {
 		pinned.Unlock()
 		o.ctx.Pool.Unpin(pinned)
 		return err
@@ -1284,7 +1294,15 @@ func (o *upsertOp) cancelSpeculativeRow(rel storage.RelFileNode, ptr storage.Ite
 		return err
 	}
 	pinned.Lock()
-	serr := storage.PageSetHeapTupleXmax(pinned.Page(), ptr.Offset, o.ctx.Tx.XID)
+	// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
+	// producer). This is a DELETE (StatusUpdate, keysUpdated=true) → no-op unless
+	// a non-conflicting locker survives; wired for sibling-path parity.
+	var serr error
+	if oldHdrTup, herr := storage.PageGetHeapTuple(pinned.Page(), ptr.Offset); herr == nil {
+		serr = stampUpdaterXmaxNonHOT(o.ctx, pinned.Page(), ptr.Offset, oldHdrTup.Header, true)
+	} else {
+		serr = storage.PageSetHeapTupleXmax(pinned.Page(), ptr.Offset, o.ctx.Tx.XID)
+	}
 	var derr error
 	if serr == nil {
 		derr = markHeapDeleteDirty(o.ctx.Pool, pinned, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, nil)

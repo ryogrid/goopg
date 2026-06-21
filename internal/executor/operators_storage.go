@@ -2030,6 +2030,108 @@ func concurrentModifierXID(hdr storage.HeapTupleHeader, mxs *multixact.Store) st
 	return hdr.Xmax
 }
 
+// stampUpdaterXmaxPreservingLockers is the UPDATE/DELETE producer twin of the
+// row-lock path's stampMultiLock / stampMultiUpdaterLock (operators_lockrows.go):
+// when the old tuple already carries a pre-existing *lock-only* xmax naming one
+// or more still-active foreign lockers (e.g. a FOR KEY SHARE holder), the writer
+// must preserve those lockers into a {updater + survivors} MultiXactId instead of
+// clobbering them with a plain single-xid updater stamp. This mirrors upstream
+// heap_update / heap_delete, which call MultiXactIdCreate/Expand on the
+// HEAP_XMAX_IS_LOCKED_ONLY pre-existing-locker path so a concurrent non-
+// conflicting locker is not silently dropped.
+//
+// keysUpdated is whether the write changes a key column (DELETE and key-changing
+// UPDATE → StatusUpdate; no-key UPDATE → StatusNoKeyUpdate). It is recorded as
+// our updater member's status and drives the HEAP_KEYS_UPDATED hint bit.
+//
+// Returns ok=true with the MultiXactId and hint bits when a preserving multi
+// should be stamped (the caller must use the multi-aware stamp primitive);
+// ok=false when there is no surviving foreign locker to preserve — the common
+// case — so the caller keeps the plain single-xid stamp. The bounded gate (a
+// pre-existing active foreign lock-only holder) never arises on the pgbench
+// TPC-B / TPC-H hot path, so the plain stamp remains the fast path. M0118-0004.
+func stampUpdaterXmaxPreservingLockers(ctx *Context, hdr storage.HeapTupleHeader, keysUpdated bool) (multixact.MultiXactId, uint16, uint16, bool, error) {
+	if ctx.MultiXact == nil || ctx.TxnMgr == nil {
+		return 0, 0, 0, false, nil
+	}
+	// Only the lock-only case is preserved here. A non-lock-only (updater-bearing)
+	// xmax means a concurrent modify, which isConcurrentlyUpdated/EPQ handles
+	// upstream of the stamp; reaching the stamp with such an xmax is not this
+	// producer's concern.
+	if hdr.Xmax == storage.InvalidTransactionID || !storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		return 0, 0, 0, false, nil
+	}
+
+	// Enumerate the existing lock holders (single-xid or multi).
+	var existing []multixact.Member
+	if storage.IsHeapTupleXmaxMulti(hdr.Infomask) {
+		members, ok := ctx.MultiXact.Members(multixact.MultiXactId(hdr.Xmax))
+		if !ok {
+			// Membership lost (stamped before a restart with no persisted store):
+			// nothing resolvable to combine with; keep the plain stamp.
+			return 0, 0, 0, false, nil
+		}
+		existing = members
+	} else {
+		existing = []multixact.Member{{Xid: hdr.Xmax, Status: lockOnlyMemberStatus(hdr.Infomask, hdr.Infomask2)}}
+	}
+
+	// Keep only still-active foreign lockers whose lock mode does NOT conflict
+	// with our update. A dead locker's lock is released; a *conflicting* locker
+	// must be waited for, not carried into the multi — preserving it would let an
+	// update coexist with a lock it should block on. (The conflict-wait itself is
+	// handled upstream of the stamp; an unwaited conflicting locker is dropped by
+	// the plain single-xid stamp, the pre-existing behaviour, until that wait
+	// lands.) This makes a key-changing UPDATE / DELETE (StatusUpdate, which
+	// conflicts with every lock mode incl. FOR KEY SHARE) a no-op here, while a
+	// no-key UPDATE (StatusNoKeyUpdate) preserves a non-conflicting FOR KEY SHARE
+	// holder — the spec scenario. Self is dropped (re-added below as the updater).
+	ourStatus := updaterMemberStatus(keysUpdated)
+	survivors := make([]multixact.Member, 0, len(existing)+1)
+	for _, m := range existing {
+		if m.Xid == ctx.Tx.XID {
+			continue // re-added once below as our updater
+		}
+		if !ctx.TxnMgr.IsXIDActive(m.Xid) {
+			continue // dead locker: lock already released
+		}
+		if multixact.StatusesConflict(m.Status, ourStatus) {
+			continue // conflicting locker: must be waited for, not preserved
+		}
+		survivors = append(survivors, m)
+	}
+	if len(survivors) == 0 {
+		return 0, 0, 0, false, nil
+	}
+	survivors = append(survivors, multixact.Member{Xid: ctx.Tx.XID, Status: ourStatus})
+
+	multi, err := ctx.MultiXact.CreateFromMembers(survivors)
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	infomask, infomask2 := multixact.HintBits(survivors)
+	return multi, infomask, infomask2, true, nil
+}
+
+// stampUpdaterXmaxNonHOT is the non-HOT (delete-half / DELETE) convenience
+// wrapper around stampUpdaterXmaxPreservingLockers: it stamps the old tuple's
+// xmax at `slot` on `page` with a {updater + surviving lockers} MultiXactId when
+// a pre-existing foreign non-conflicting locker must be preserved, else falls
+// back to the plain single-xid updater stamp. Unlike the HOT path it writes no
+// CTID / HEAP_HOT_UPDATED (the new version lives in a different slot/page and the
+// chain link is written separately by the caller). The bounded gate means the
+// plain stamp remains the fast path for every hot-path write. M0118-0004.
+func stampUpdaterXmaxNonHOT(ctx *Context, page storage.Page, slot uint16, hdr storage.HeapTupleHeader, keysUpdated bool) error {
+	multi, im, im2, ok, err := stampUpdaterXmaxPreservingLockers(ctx, hdr, keysUpdated)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return storage.PageSetHeapTupleXmaxMulti(page, slot, storage.TransactionID(multi), im, im2)
+	}
+	return storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
+}
+
 // tryApplyHOTUpdate attempts a same-page HOT update of the tuple at
 // (blk, oldSlot). It:
 //  1. Encodes newRow with HeapOnlyTuple set in the tuple infomask.
@@ -2156,17 +2258,39 @@ func tryApplyHOTUpdate(
 		return false, addErr
 	}
 
-	if err := storage.PageStampHotOldTuple(s.Page(), oldSlot, ctx.Tx.XID, blk, newSlot); err != nil {
+	// Stamp the old tuple's xmax + HOT chain link. If the old tuple already
+	// carries a pre-existing non-conflicting foreign locker (a lock-only xmax,
+	// e.g. FOR KEY SHARE), preserve it into a {updater + survivors} MultiXactId
+	// instead of clobbering it with the plain single-xid stamp (M0118-0004
+	// producer). A HOT update never changes a key column, so the updater status
+	// is always no-key (keysUpdated=false). The HeapHotUpdate WAL record still
+	// carries the single updater xid (markHeapHotUpdateDirty below), so crash
+	// recovery degrades to the single-xid stamp — correct, since the transient
+	// lockers do not survive a crash (multixact WAL persistence deferred; see
+	// docs/design/0118-0002).
+	stampErr := func() error {
+		if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), oldSlot); herr == nil {
+			multi, im, im2, ok, perr := stampUpdaterXmaxPreservingLockers(ctx, oldHdrTup.Header, false)
+			if perr != nil {
+				return perr
+			}
+			if ok {
+				return storage.PageStampHotOldTupleMulti(s.Page(), oldSlot, storage.TransactionID(multi), im, im2, ctx.Tx.XID, blk, newSlot)
+			}
+		}
+		return storage.PageStampHotOldTuple(s.Page(), oldSlot, ctx.Tx.XID, blk, newSlot)
+	}()
+	if stampErr != nil {
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		if errors.Is(err, storage.ErrUnsupportedItem) || errors.Is(err, storage.ErrInvalidSlot) {
+		if errors.Is(stampErr, storage.ErrUnsupportedItem) || errors.Is(stampErr, storage.ErrInvalidSlot) {
 			// PagePruneOpt above (page-full fallback) can invalidate
 			// the old slot in a tight window between our pre-check
 			// and this stamp. Caller treats (false, nil) as "skip
 			// this row" — same fall-through as the page-full case.
 			return false, nil
 		}
-		return false, err
+		return false, stampErr
 	}
 
 	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, ctx.Tx.XID, tupleBytes)
@@ -2656,6 +2780,12 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				var stampIdxErr error
 				if isCrossPartitionMoveIdx {
 					stampIdxErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, o.ctx.Tx.XID)
+				} else if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), pu.slot); herr == nil {
+					// Preserve a pre-existing non-conflicting foreign locker into a
+					// {updater + survivors} multi (M0118-0004 producer). Non-HOT
+					// UPDATE is treated key-changing by goopg (KeysUpdated stamped
+					// below), so the updater status is StatusUpdate (keysUpdated=true).
+					stampIdxErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
 				} else {
 					stampIdxErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
 				}
@@ -3297,6 +3427,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				var stampErr error
 				if isCrossPartitionMove {
 					stampErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, o.ctx.Tx.XID)
+				} else if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), pu.slot); herr == nil {
+					// Preserve a pre-existing non-conflicting foreign locker into a
+					// {updater + survivors} multi (M0118-0004 producer). Non-HOT
+					// UPDATE is key-changing in goopg, so keysUpdated=true.
+					stampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
 				} else {
 					stampErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
 				}
@@ -3805,7 +3940,18 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if oldGerr == nil {
 				oldTupleBytes, _ = oldTup.MarshalBinary()
 			}
-			if err := storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID); err != nil {
+			var delStampErr error
+			if oldGerr == nil {
+				// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
+				// producer). A DELETE is StatusUpdate (keysUpdated=true), which
+				// conflicts with every lock mode, so this is a no-op unless a
+				// non-conflicting locker somehow survives; wired for sibling-path
+				// parity with the UPDATE delete-half.
+				delStampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), v.slot, oldTup.Header, true)
+			} else {
+				delStampErr = storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID)
+			}
+			if err := delStampErr; err != nil {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				if errors.Is(err, storage.ErrUnsupportedItem) {
@@ -4215,7 +4361,10 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				continue
 			}
 			oldTupleBytes, _ = oldTup.MarshalBinary()
-			stampErr := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
+			// Preserve a pre-existing non-conflicting foreign locker into a
+			// {updater + survivors} multi (M0118-0004 producer); plain single-xid
+			// stamp otherwise. keysUpdated=true (non-HOT write).
+			stampErr := stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldTup.Header, true)
 			if stampErr != nil {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
@@ -4453,7 +4602,10 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 			continue // skip concurrent-update EPQ for USING case
 		}
 		oldTupleBytes, _ := oldTup.MarshalBinary()
-		if stampErr := storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID); stampErr != nil {
+		// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
+		// producer). DELETE is StatusUpdate (keysUpdated=true) → no-op unless a
+		// non-conflicting locker survives; wired for sibling-path parity.
+		if stampErr := stampUpdaterXmaxNonHOT(o.ctx, s.Page(), v.slot, oldTup.Header, true); stampErr != nil {
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if errors.Is(stampErr, storage.ErrUnsupportedItem) {

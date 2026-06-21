@@ -883,7 +883,16 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}
 	} else {
-		if err := storage.PageSetHeapTupleXmax(s.Page(), slot, ctx.Tx.XID); err != nil {
+		// Preserve a pre-existing non-conflicting foreign locker into a {updater +
+		// survivors} multi (M0118-0004 producer); plain single-xid stamp otherwise.
+		// keysUpdated=true (non-HOT MERGE update).
+		var mErr error
+		if oldGerr == nil {
+			mErr = stampUpdaterXmaxNonHOT(ctx, s.Page(), slot, oldTup.Header, true)
+		} else {
+			mErr = storage.PageSetHeapTupleXmax(s.Page(), slot, ctx.Tx.XID)
+		}
+		if err := mErr; err != nil {
 			s.Unlock()
 			ctx.Pool.Unpin(s)
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
@@ -973,7 +982,16 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	if oldGerr == nil {
 		oldTupleBytes, _ = oldTup.MarshalBinary()
 	}
-	if err := storage.PageSetHeapTupleXmax(s.Page(), slot, ctx.Tx.XID); err != nil {
+	// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
+	// producer). MERGE DELETE is StatusUpdate (keysUpdated=true) → no-op unless a
+	// non-conflicting locker survives; wired for sibling-path parity.
+	var mErr error
+	if oldGerr == nil {
+		mErr = stampUpdaterXmaxNonHOT(ctx, s.Page(), slot, oldTup.Header, true)
+	} else {
+		mErr = storage.PageSetHeapTupleXmax(s.Page(), slot, ctx.Tx.XID)
+	}
+	if err := mErr; err != nil {
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		if errors.Is(err, storage.ErrUnsupportedItem) {

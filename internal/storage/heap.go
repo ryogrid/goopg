@@ -1271,6 +1271,77 @@ func PageStampHotOldTuple(p Page, oldSlot uint16, xmax TransactionID, blk BlockN
 	return nil
 }
 
+// PageStampHotOldTupleMulti is the MultiXact-bearing sibling of
+// PageStampHotOldTuple: it stamps a HOT-update on the old-image tuple at
+// oldSlot where the new xmax is a MultiXactId naming {updater + surviving
+// lockers} rather than the updater's single TransactionID. It is used by the
+// UPDATE producer when the old tuple already carried a non-conflicting
+// foreign lock-only xmax (e.g. a FOR KEY SHARE locker) that must be preserved
+// into the multi instead of being clobbered by the plain single-xid stamp
+// (mirrors upstream heap_update → MultiXactIdCreate/Expand on the
+// HEAP_XMAX_IS_LOCKED_ONLY pre-existing-locker path).
+//
+// multi is the MultiXactId; infomaskBits / infomask2Bits are the hint bits
+// computed by multixact.HintBits for the member set (they carry
+// HEAP_XMAX_IS_MULTI and the strongest holder's lock-mode bits, and — because
+// the set has an updater — clear HEAP_XMAX_LOCK_ONLY). updaterXID is the real
+// update member (the current writer's XID); it is used only to advance
+// pd_prune_xid, never written to xmax. blk/newSlot link the HOT chain to the
+// live successor, exactly as PageStampHotOldTuple does.
+//
+// The caller must hold the page's exclusive content lock across the entire
+// HOT-update sequence (new tuple insert + this stamp) so the chain is never
+// torn between two page modifications.
+func PageStampHotOldTupleMulti(p Page, oldSlot uint16, multi TransactionID, infomaskBits, infomask2Bits uint16, updaterXID TransactionID, blk BlockNumber, newSlot uint16) error {
+	if oldSlot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(oldSlot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, oldSlot, item.Flags)
+	}
+	off := int(item.Offset)
+	if off+22 > len(p) {
+		return fmt.Errorf("%w: slot=%d off=%d", ErrCorruptTuple, oldSlot, off)
+	}
+	// Set xmax to the MultiXactId.
+	binary.LittleEndian.PutUint32(p[off+4:off+8], uint32(multi))
+	// Set CTID to (blk, newSlot) — same-page HOT chain link.
+	binary.LittleEndian.PutUint32(p[off+12:off+16], uint32(blk))
+	binary.LittleEndian.PutUint16(p[off+16:off+18], newSlot)
+	// t_infomask2 at [18:20]: refresh HEAP_KEYS_UPDATED from the multi hint.
+	infomask2 := binary.LittleEndian.Uint16(p[off+18 : off+20])
+	infomask2 &^= HeapKeysUpdated
+	infomask2 |= infomask2Bits & HeapKeysUpdated
+	binary.LittleEndian.PutUint16(p[off+18:off+20], infomask2)
+	// t_infomask at [20:22]: clear xmax-classification bits, OR in the multi
+	// hint bits (which set HEAP_XMAX_IS_MULTI and clear HEAP_XMAX_LOCK_ONLY for
+	// an updater-bearing multi), then mark the HOT chain.
+	infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
+	infomask &^= HeapXmaxLockMask | HeapXmaxLockOnly | HeapXmaxInvalid | HeapXmaxCommitted | HeapXmaxIsMulti
+	infomask |= infomaskBits
+	infomask |= HeapHotUpdated
+	binary.LittleEndian.PutUint16(p[off+20:off+22], infomask)
+	// Advance pd_prune_xid (M0046-0002) using the real update member: the old
+	// HOT tuple is dead once the updater commits and is < OldestXmin. The multi
+	// id itself is not a TransactionID, so prune tracking uses updaterXID.
+	if pruneXID := MustHeader(p).PruneXID(); updaterXID > TransactionID(pruneXID) {
+		MustHeader(p).SetPruneXID(uint32(updaterXID))
+	}
+	return nil
+}
+
 // PageGetItemID returns the raw ItemID for a 1-based line pointer slot.
 // Used by opportunistic pruning and HOT chain following to inspect line
 // pointer flags without attempting to decode a full heap tuple.
