@@ -795,10 +795,18 @@ func (o *upsertOp) findInProgressConflictKey(rel storage.RelFileNode, key []byte
 		// middle of deleting (or cross-partition-moving) what would otherwise
 		// be a real arbiter conflict. Upstream `_bt_check_unique` waits on
 		// this xmax to determine whether the apparent conflict survives.
+		// For an updater-bearing multixact (IS_MULTI set, LOCK_ONLY clear)
+		// t_xmax is a MultiXactId — wait on its updater member, never on the
+		// raw MultiXactId.
 		if xmax != storage.InvalidTransactionID && xmax != selfXID && !storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
+			effXmax := xmax
+			if storage.IsHeapTupleXmaxMulti(tuple.Header.Infomask) {
+				effXmax = multixactUpdaterXID(o.ctx.MultiXact, xmax)
+			}
 			xminSettled := xmin == selfXID || (o.ctx.Snap.SeesCommittedXID(xmin))
-			if xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
-				foundXID = xmax
+			if effXmax != storage.InvalidTransactionID && effXmax != selfXID &&
+				xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(effXmax) {
+				foundXID = effXmax
 				case1 = false
 				return false, nil
 			}
@@ -809,13 +817,22 @@ func (o *upsertOp) findInProgressConflictKey(rel storage.RelFileNode, key []byte
 		// re-probes. The row is still live (xmin settled, xmax is only a
 		// lock stamp) — we must wait because the lock holder may
 		// subsequently UPDATE or DELETE the conflicting row before
-		// committing, changing the arbiter outcome.
+		// committing, changing the arbiter outcome. For a lock-only
+		// multixact t_xmax is a MultiXactId of lock holders — wait on one
+		// live holder (the re-probe loop drains the rest), never on the
+		// MultiXactId itself.
 		if xmax != storage.InvalidTransactionID && xmax != selfXID && storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
 			xminSettled := xmin == selfXID || o.ctx.Snap.SeesCommittedXID(xmin)
-			if xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
-				foundXID = xmax
-				case1 = false
-				return false, nil
+			if xminSettled && o.ctx.TxnMgr != nil {
+				waitXID := xmax
+				if storage.IsHeapTupleXmaxMulti(tuple.Header.Infomask) {
+					waitXID = multixactFirstActiveMember(o.ctx.MultiXact, o.ctx.TxnMgr, selfXID, xmax)
+				}
+				if waitXID != storage.InvalidTransactionID && o.ctx.TxnMgr.IsXIDActive(waitXID) {
+					foundXID = waitXID
+					case1 = false
+					return false, nil
+				}
 			}
 		}
 		return true, nil

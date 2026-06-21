@@ -869,10 +869,7 @@ func (o *lockRowsOp) stampAtPtr(rel storage.RelFileNode, ptr storage.ItemPointer
 	}
 	slot.Lock()
 	tup, gerr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
-	if gerr == nil &&
-		tup.Header.Xmax != storage.InvalidTransactionID &&
-		!storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
-		tup.Header.Xmax != o.ctx.Tx.XID {
+	if gerr == nil && o.anotherRealUpdaterArrived(tup.Header) {
 		// Another real updater arrived while we waited — skip.
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
@@ -892,6 +889,27 @@ func (o *lockRowsOp) stampAtPtr(rel storage.RelFileNode, ptr storage.ItemPointer
 	slot.Unlock()
 	o.ctx.Pool.Unpin(slot)
 	return ptr, false, derr
+}
+
+// anotherRealUpdaterArrived reports whether the tuple now carries a non-self
+// updater stamp that landed while we waited (used to skip re-stamping a row
+// another writer has since updated/deleted). A lock-only xmax — including a
+// lock-only multixact — is not an updater and is ignored. For an
+// updater-bearing multixact, t_xmax is a MultiXactId: resolve its updater
+// member rather than comparing the MultiXactId to our own XID.
+func (o *lockRowsOp) anotherRealUpdaterArrived(h storage.HeapTupleHeader) bool {
+	if h.Xmax == storage.InvalidTransactionID || storage.IsHeapTupleLockOnly(h.Infomask) {
+		return false
+	}
+	effXmax := h.Xmax
+	if storage.IsHeapTupleXmaxMulti(h.Infomask) {
+		effXmax = multixactUpdaterXID(o.ctx.MultiXact, h.Xmax)
+		if effXmax == storage.InvalidTransactionID {
+			// Unresolvable or locker-only multi — not a real updater.
+			return false
+		}
+	}
+	return effXmax != o.ctx.Tx.XID
 }
 
 // epqRecheckFilter reads the heap tuple at (rel, ptr), decodes it using

@@ -353,30 +353,63 @@ and lock-only paths stay byte-identical, so every existing tuple is judged exact
 as before. Pinned by `TestTupleVisibleSubxactMultiXact` (mirrors
 `TestTupleVisibleMultiXact`) plus the existing `TestTupleVisibleSubxactDegrades`.
 
-### Producer gate: still NOT satisfied — remaining read consumers
+### Hot-path wiring slice 2 (continued, 4): wait-on-deleter consumers (`scanRelForFKMatch` / `findInProgressConflictKey` / `stampAtPtr`)
 
-The same audit found **two more** consumers that interpret a non-lock-only xmax as
-a raw xid and pass it to a single-`TransactionID` API (`IsXIDActive` / `WaitForXID`)
-— a category error for a `MultiXactId` (different numbering space). They are **not**
-yet multixact-aware and must land before the producer:
+The audit's remaining **two** consumers interpreted a non-lock-only xmax as a raw
+xid and passed it to a single-`TransactionID` API (`IsXIDActive` / `WaitForXID`) —
+a category error for a `MultiXactId` (a disjoint use of the same `uint32` space,
+disambiguated only by the `HEAP_XMAX_IS_MULTI` infomask bit). Both, plus the
+`stampAtPtr` recheck flagged by the audit, are now multixact-aware, completing the
+gate. Two shared package-level resolvers were added in `operators_storage.go`
+(beside `isConcurrentlyUpdated`, which already imports `multixact`/`mvcc`), so the
+three call sites stay DRY and `operators_upsert.go` needs no new import:
 
-- **`scanRelForFKMatch`** (`operators_fk.go`) — the FK existence/`ri` check that
-  decides whether to wait on a concurrent deleter: `xmax := tuple.Header.Xmax; …
-  IsXIDActive(xmax)`. Must resolve the updater member and wait on the active
-  member(s), like `activeLockHolders`.
-- **`findInProgressConflictKey`** (`operators_upsert.go`, Case 2) — the
-  `INSERT … ON CONFLICT` arbiter that waits on an in-flight deleter of a candidate
-  conflict row: `IsHeapTupleLockOnly`-gated, then `IsXIDActive(xmax)`.
-- (Audit also: `stampAtPtr` in `operators_lockrows.go`'s "another real updater
-  arrived while we waited" recheck reads a non-lock-only xmax; confirm it cannot see
-  a producer-stamped multi, or make it resolve.)
+- **`multixactUpdaterXID(mxs, xmax)`** → the multi's update-member xid, or
+  `Invalid` when the store is nil / the multi is unknown / it carries only lockers.
+- **`multixactFirstActiveMember(mxs, txnMgr, self, xmax)`** → the first *active,
+  non-self* member of a (lock-only) multi, or `Invalid` — one live holder to wait
+  on; the caller's re-probe loop drains the rest as members settle out of
+  `IsXIDActive`.
 
-So with `isConcurrentlyUpdated`, `mvcc.TupleVisible`, `mvcc.TupleVisibleSubxact`,
-and `freeze`/`prune` correct, the **visibility** consumers now agree, but the FK /
-upsert **wait-on-deleter** consumers do not — the producer gate
-([[pattern_sibling_paths_must_agree]]) is **not** satisfied until those land. The
-lesson: enumerate consumers by *mechanically sweeping every `IsHeapTupleLockOnly`
-site*, not from a hand-maintained list.
+Wiring:
+
+- **`scanRelForFKMatch`** (`operators_fk.go`) — for an updater-bearing multi
+  (`IS_MULTI && !LOCK_ONLY`) it resolves `effXmax = multixactUpdaterXID(…)` before
+  the `IsXIDActive` / pending-record logic, and records `effXmax` (the updater xid,
+  never the `MultiXactId`) in `fkPendingRef` so the downstream `WaitForXID` /
+  `epqChainCheckMovedPartition` / `HasAborted` all see a real xid. An all-locker
+  (or unresolvable) multi degrades to "clean match" — lockers do not delete the
+  matched parent row, exactly like the lock-only-xmax fast path.
+- **`findInProgressConflictKey`** (`operators_upsert.go`) — **Case 2**
+  (visible-being-deleted) resolves the updater for a non-lock-only multi; **Case 3**
+  (lock-only xmax) now also handles a lock-only *multi* via
+  `multixactFirstActiveMember`, waiting on one live holder instead of feeding the
+  raw `MultiXactId` to `IsXIDActive`. Case 3's lock-only-multi arm is not just
+  future-proofing: the **cross-session lock-only producer already landed**
+  (slice 1), so a tuple locked `FOR SHARE` by ≥2 sessions carries a lock-only multi
+  that an `INSERT … ON CONFLICT` arbiter probe can observe today.
+- **`stampAtPtr`** (`operators_lockrows.go`) — the "another real updater arrived
+  while we waited" recheck is refactored into `anotherRealUpdaterArrived(h)`, which
+  resolves the updater member for an updater-bearing multi rather than comparing the
+  `MultiXactId` to our own XID. Behaviour is byte-identical for every
+  currently-producible state (single updater, lock-only single, lock-only multi);
+  only the updater-bearing-multi case (unreachable until the producer lands) changes.
+
+Pinned by `TestMultixactUpdaterXIDHelper` and `TestMultixactFirstActiveMemberHelper`
+(`concurrent_update_xmax_test.go`), plus the existing FK / upsert / lock-rows and
+row-lock isolation suites (behaviour-identical for existing tuples).
+
+### Producer gate: NOW SATISFIED
+
+With `isConcurrentlyUpdated`, `mvcc.TupleVisible`, `mvcc.TupleVisibleSubxact`,
+`freeze`/`prune` (visibility consumers) **and** `scanRelForFKMatch`,
+`findInProgressConflictKey`, `stampAtPtr` (wait-on-deleter consumers) all
+multixact-aware, every `IsHeapTupleLockOnly`/raw-xmax consumer agrees on how to read
+an updater-bearing multi. The producer-gate ([[pattern_sibling_paths_must_agree]]) is
+**satisfied** — the updater-bearing producer (resume point #2) can now land. The
+lesson stands: enumerate consumers by *mechanically sweeping every
+`IsHeapTupleLockOnly` site*, not from a hand-maintained list (that sweep found the
+`TupleVisibleSubxact` and these two wait-on-deleter consumers the hand list missed).
 
 ## Verification
 
@@ -461,19 +494,23 @@ verified primitive:
      slice 2 (continued, 3)* above. A producer-gate audit found this had been missed
      from the original read-consumer list; it is the highest-blast-radius consumer
      (every plain `SELECT`).
-   - ⛔ `scanRelForFKMatch` (`operators_fk.go`) — FK wait-on-deleter still reads a
-     non-lock-only xmax as a raw xid (`IsXIDActive(xmax)`). Resolve the updater +
-     wait on the active member(s) before the producer.
-   - ⛔ `findInProgressConflictKey` (`operators_upsert.go`, Case 2) — `INSERT … ON
-     CONFLICT` arbiter wait-on-deleter, same raw-xid read. Resolve before the producer.
+   - ✅ `scanRelForFKMatch` (`operators_fk.go`) — FK wait-on-deleter resolves the
+     updater member (`multixactUpdaterXID`) and records the real updater xid in
+     `fkPendingRef`; all-locker/unresolvable multis degrade to a clean match. See
+     *Hot-path wiring slice 2 (continued, 4)* above.
+   - ✅ `findInProgressConflictKey` (`operators_upsert.go`) — Case 2 resolves the
+     updater; Case 3 waits on one live holder of a lock-only multi
+     (`multixactFirstActiveMember`). See *slice 2 (continued, 4)* above.
+   - ✅ `stampAtPtr` (`operators_lockrows.go`) — the "another real updater arrived"
+     recheck (`anotherRealUpdaterArrived`) resolves the updater member for an
+     updater-bearing multi. See *slice 2 (continued, 4)* above.
    - ⛔ **producer**: branch (a) of `stampLockInner` (`operators_lockrows.go`, the
      "non-key update + `FOR KEY SHARE`" path that currently skips) must *combine*
      a new locker with the in-progress updater into a multixact and stamp a
-     **non**-lock-only multi. **Blocked** until the two ⛔ FK/upsert wait-on-deleter
-     consumers above are multixact-aware (the *visibility* consumers now agree, but
-     the *wait-on-deleter* consumers do not). Unlike the lock-only case this is
-     **not** transparent to visibility, so re-run the executor/storage/mvcc/btree +
-     full isolation row-lock suite when it lands
+     **non**-lock-only multi. **Now UNBLOCKED** — every read + wait-on-deleter
+     consumer is multixact-aware (producer gate satisfied). Unlike the lock-only case
+     this is **not** transparent to visibility, so re-run the
+     executor/storage/mvcc/btree + full isolation row-lock suite when it lands
      ([[pattern_sibling_paths_must_agree]]). When the producer lands, also thread the
      real `Store` through vacuum/analyze (the stats scans currently pass `nil`).
 3. **4-way lock strength + savepoint/subxact members** — goopg's `lockStrength`

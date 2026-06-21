@@ -207,6 +207,101 @@ func TestIsConcurrentlyUpdatedMultiXact(t *testing.T) {
 	}
 }
 
+// TestMultixactUpdaterXIDHelper pins multixactUpdaterXID, the shared resolver
+// the FK-wait, ON CONFLICT arbiter, and SELECT FOR UPDATE re-stamp consumers
+// use to turn an updater-bearing MultiXactId t_xmax into the real updater
+// transaction id before any single-transaction test. It must never hand back a
+// MultiXactId.
+func TestMultixactUpdaterXIDHelper(t *testing.T) {
+	store := multixact.NewStore()
+	updByOther, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 50, Status: multixact.StatusForShare},    // locker
+		{Xid: 60, Status: multixact.StatusNoKeyUpdate}, // updater
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(updater): %v", err)
+	}
+	lockersOnly, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 50, Status: multixact.StatusForShare},
+		{Xid: 60, Status: multixact.StatusForKeyShare},
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(lockers only): %v", err)
+	}
+
+	cases := []struct {
+		name string
+		mxs  *multixact.Store
+		xmax storage.TransactionID
+		want storage.TransactionID
+	}{
+		{"resolves updater member", store, storage.TransactionID(updByOther), 60},
+		{"lockers only -> invalid", store, storage.TransactionID(lockersOnly), storage.InvalidTransactionID},
+		{"nil store -> invalid", nil, storage.TransactionID(updByOther), storage.InvalidTransactionID},
+		{"unknown multi -> invalid", store, 9999, storage.InvalidTransactionID},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := multixactUpdaterXID(c.mxs, c.xmax); got != c.want {
+				t.Errorf("multixactUpdaterXID = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+// TestMultixactFirstActiveMemberHelper pins multixactFirstActiveMember, the
+// resolver the ON CONFLICT arbiter (Case 3) uses to pick ONE live holder of a
+// lock-only multixact to wait on (the re-probe loop drains the rest). It must
+// skip self and settled members and never return a MultiXactId.
+func TestMultixactFirstActiveMemberHelper(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	// Two concurrently-live lock holders. XIDs are lazily assigned, so
+	// materialise a concrete in-progress XID for each (mirrors a real row
+	// lock, which assigns the locker's XID before stamping t_xmax).
+	t1 := beginTxn(t, ctx)
+	t2 := beginTxn(t, ctx)
+	xid1, err := ctx.TxnMgr.AssignXID(t1)
+	if err != nil {
+		t.Fatalf("AssignXID t1: %v", err)
+	}
+	xid2, err := ctx.TxnMgr.AssignXID(t2)
+	if err != nil {
+		t.Fatalf("AssignXID t2: %v", err)
+	}
+	store := multixact.NewStore()
+	multi, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: xid1, Status: multixact.StatusForShare},
+		{Xid: xid2, Status: multixact.StatusForKeyShare},
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers: %v", err)
+	}
+	xmax := storage.TransactionID(multi)
+
+	// With self == xid1, the first active non-self holder is xid2.
+	if got := multixactFirstActiveMember(store, ctx.TxnMgr, xid1, xmax); got != xid2 {
+		t.Errorf("first active member (self=xid1) = %d, want %d", got, xid2)
+	}
+	// nil store / nil manager are defensive -> invalid.
+	if got := multixactFirstActiveMember(nil, ctx.TxnMgr, xid1, xmax); got != storage.InvalidTransactionID {
+		t.Errorf("nil store = %d, want invalid", got)
+	}
+	if got := multixactFirstActiveMember(store, nil, xid1, xmax); got != storage.InvalidTransactionID {
+		t.Errorf("nil manager = %d, want invalid", got)
+	}
+
+	// Settle t2; now no active non-self holder remains for self == xid1.
+	if err := ctx.TxnMgr.Commit(t2); err != nil {
+		t.Fatalf("commit t2: %v", err)
+	}
+	if got := multixactFirstActiveMember(store, ctx.TxnMgr, xid1, xmax); got != storage.InvalidTransactionID {
+		t.Errorf("after t2 settled = %d, want invalid", got)
+	}
+	_ = ctx.TxnMgr.Rollback(t1)
+}
+
 // beginTxn opens a fresh READ_COMMITTED transaction on the same mvcc
 // manager as ctx. Used by the concurrent-update tests to simulate
 // two clients hitting the same row.

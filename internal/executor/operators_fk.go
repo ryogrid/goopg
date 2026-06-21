@@ -708,11 +708,26 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 			if !fkRowMatches(cols, colNames, row, vals) {
 				continue
 			}
-			// Matched.  Decide whether to wait on the updater.
+			// Matched.  Decide whether to wait on the updater.  For an
+			// updater-bearing multixact xmax (IS_MULTI set, LOCK_ONLY clear)
+			// the raw t_xmax is a MultiXactId, not a transaction id — resolve
+			// the updater member before any single-transaction test, and never
+			// record a MultiXactId as the xid to wait on.
 			xmax := tuple.Header.Xmax
-			isLockOnly := storage.IsHeapTupleLockOnly(tuple.Header.Infomask)
-			if xmax == storage.InvalidTransactionID || isLockOnly ||
-				xmax == ctx.Tx.XID || ctx.TxnMgr == nil || !ctx.TxnMgr.IsXIDActive(xmax) {
+			infomask := tuple.Header.Infomask
+			effXmax := xmax
+			isLockOnly := storage.IsHeapTupleLockOnly(infomask)
+			if storage.IsHeapTupleXmaxMulti(infomask) && !isLockOnly {
+				effXmax = multixactUpdaterXID(ctx.MultiXact, xmax)
+				if effXmax == storage.InvalidTransactionID {
+					// Only lockers (or an unknown multi / no store): lock
+					// holders do not delete the matched row, so this is a
+					// clean FK match just like a lock-only xmax.
+					isLockOnly = true
+				}
+			}
+			if effXmax == storage.InvalidTransactionID || isLockOnly ||
+				effXmax == ctx.Tx.XID || ctx.TxnMgr == nil || !ctx.TxnMgr.IsXIDActive(effXmax) {
 				// Clean match: no in-flight non-self updater.
 				s.RUnlock()
 				ctx.Pool.Unpin(s)
@@ -720,7 +735,7 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 			}
 			// Pending: record only the first encountered.
 			if pending == nil {
-				pending = &fkPendingRef{xid: xmax, rel: rel, blk: blk, slot: slotIdx}
+				pending = &fkPendingRef{xid: effXmax, rel: rel, blk: blk, slot: slotIdx}
 			}
 		}
 		s.RUnlock()

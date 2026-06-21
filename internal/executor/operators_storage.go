@@ -1946,6 +1946,51 @@ func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionI
 	return true
 }
 
+// multixactUpdaterXID resolves the update-member transaction id of an
+// updater-bearing MultiXactId xmax (the value a tuple stores in t_xmax when
+// IS_MULTI is set and LOCK_ONLY is clear). It returns InvalidTransactionID
+// when the store is nil, the multixact is unknown, or the multixact carries
+// only lockers (no updater). Callers MUST have already checked
+// storage.IsHeapTupleXmaxMulti(infomask): feeding a raw MultiXactId to a
+// single-transaction API such as mvcc.Manager.IsXIDActive / WaitForXID reads
+// the multixact id as an unrelated transaction id and is a correctness bug.
+func multixactUpdaterXID(mxs *multixact.Store, xmax storage.TransactionID) storage.TransactionID {
+	if mxs == nil {
+		return storage.InvalidTransactionID
+	}
+	members, ok := mxs.Members(multixact.MultiXactId(xmax))
+	if !ok {
+		return storage.InvalidTransactionID
+	}
+	upd, has := multixact.GetUpdateXid(members)
+	if !has {
+		return storage.InvalidTransactionID
+	}
+	return upd
+}
+
+// multixactFirstActiveMember returns the first member of a (typically
+// lock-only) MultiXactId xmax that is still active and is not self, or
+// InvalidTransactionID when every member has settled or only self holds the
+// lock. A waiter blocks on the returned xid and re-probes; one wait per
+// remaining holder converges because settled members drop out of IsXIDActive.
+// Callers MUST have already checked storage.IsHeapTupleXmaxMulti(infomask).
+func multixactFirstActiveMember(mxs *multixact.Store, txnMgr *mvcc.Manager, self, xmax storage.TransactionID) storage.TransactionID {
+	if mxs == nil || txnMgr == nil {
+		return storage.InvalidTransactionID
+	}
+	members, ok := mxs.Members(multixact.MultiXactId(xmax))
+	if !ok {
+		return storage.InvalidTransactionID
+	}
+	for _, m := range members {
+		if m.Xid != self && txnMgr.IsXIDActive(m.Xid) {
+			return m.Xid
+		}
+	}
+	return storage.InvalidTransactionID
+}
+
 // tryApplyHOTUpdate attempts a same-page HOT update of the tuple at
 // (blk, oldSlot). It:
 //  1. Encodes newRow with HeapOnlyTuple set in the tuple infomask.
