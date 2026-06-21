@@ -8,6 +8,7 @@ import (
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
+	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -446,6 +447,26 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	if o.filterPred != nil && filterPredMaxColRef(o.filterPred) >= len(o.filterCols) {
 		o.filterPred = nil
 	}
+	// When the locked scan is an index scan, the index's key condition (e.g.
+	// `key = 1`) lives in the IndexScan node, NOT in a filterOp — so an EPQ
+	// recheck against only the filterOp predicate would miss a key-column change
+	// (lock-update-delete blocker2: a committed key-UPDATE relocates the row to
+	// key=2, which no longer satisfies the original `key = 1`). Fold the
+	// synthesised index predicate into the EPQ recheck predicate so
+	// epqRecheckFilter re-applies it to the latest version, matching PG's
+	// EvalPlanQual re-running the whole plan (index recheck included). The
+	// synthesised ref points at the indexed column's table ordinal, so it stays
+	// within filterCols; guard anyway for safety. M0118-0003.
+	if ix, ok := o.scan.(*indexScanOp); ok && ix.plan != nil && len(o.filterCols) > 0 {
+		if idxPred := indexScanPredicate(ix.plan); idxPred != nil &&
+			filterPredMaxColRef(idxPred) < len(o.filterCols) {
+			if o.filterPred == nil {
+				o.filterPred = idxPred
+			} else {
+				o.filterPred = &planner.BinaryOp{Op: parser.OpAnd, Left: o.filterPred, Right: idxPred}
+			}
+		}
+	}
 	// When the planner lifted a LIMIT above this LockRows (SKIP LOCKED), cap the
 	// drain at LIMIT (+OFFSET) successfully-locked rows so the row lock claims
 	// only as many rows as the LIMIT demands — skipped (contended) rows do not
@@ -736,8 +757,33 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 					slot.Unlock()
 					o.ctx.Pool.Unpin(slot)
 					if hasSucc && prior != storage.InvalidTransactionID {
-						if perr := o.propagateLockForward(rel, succ, prior); perr != nil {
+						// Walk the chain forward, WAITING on any conflicting
+						// in-flight updater (heap_lock_updated_tuple_rec). The
+						// blocked-then-woken locker (lock-update-delete s1l) must
+						// re-evaluate against the latest version: if the chain ends
+						// in a committed conflicting DELETE/key-UPDATE the row is
+						// gone for us (EvalPlanQual returns nothing), so we drop it
+						// instead of yielding the stale snapshot version.
+						outcome, latest, perr := o.propagateLockForward(rel, succ, prior)
+						if perr != nil {
 							return storage.ItemPointer{}, false, false, perr
+						}
+						switch outcome {
+						case chainLockDeleted:
+							// Latest version deleted by a committed conflicting
+							// txn — nothing to return.
+							return storage.ItemPointer{}, false, true, nil // epqSkipped
+						case chainLockUpdated:
+							// Latest version is `latest`; re-check the WHERE
+							// predicate against it (EvalPlanQualFetchRowMark). If
+							// it no longer qualifies, drop the row; otherwise yield
+							// the updated version.
+							if o.filterPred != nil && len(o.filterCols) > 0 {
+								if skip := o.epqRecheckFilter(rel, latest); skip {
+									return storage.ItemPointer{}, false, true, nil // epqSkipped
+								}
+							}
+							return latest, true, false, nil
 						}
 					}
 					return multiPtr, false, false, nil
@@ -1345,6 +1391,98 @@ func (o *lockRowsOp) updaterXID(hdr storage.HeapTupleHeader) storage.Transaction
 	return hdr.Xmax
 }
 
+// chainLockOutcome mirrors the relevant TM_Result outcomes of
+// heap_lock_updated_tuple_rec for the forward (locker-side) chain walk.
+type chainLockOutcome int
+
+const (
+	// chainLockOK: the whole chain was locked (or its end / a vacuumed gap was
+	// reached). The caller keeps the originally-locked snapshot version.
+	chainLockOK chainLockOutcome = iota
+	// chainLockDeleted (TM_Deleted): a committed conflicting DELETE ends the
+	// chain. EvalPlanQual has nothing to return — the caller drops the row.
+	chainLockDeleted
+	// chainLockUpdated (TM_Updated): a committed conflicting key-UPDATE relocated
+	// the row; the returned ItemPointer is the next (newer) version the caller
+	// must re-check the WHERE predicate against (EvalPlanQualFetchRowMark).
+	chainLockUpdated
+)
+
+// chainMembers returns the lock/update holder(s) recorded in a chain version's
+// xmax as multixact members: the members of a MultiXactId xmax, or the single
+// synthetic member of a non-multi xmax (a lock-only locker decoded via
+// lockOnlyMemberStatus, or a real updater via updaterMemberStatus). `self` is the
+// version's own ItemPointer, used to recognise a DELETE. Empty when the
+// membership cannot be resolved (no store, or lost across a restart) — the
+// caller then treats the version as having no live conflicting holder.
+func (o *lockRowsOp) chainMembers(hdr storage.HeapTupleHeader, self storage.ItemPointer) []multixact.Member {
+	if storage.IsHeapTupleXmaxMulti(hdr.Infomask) {
+		if o.ctx.MultiXact == nil {
+			return nil
+		}
+		members, ok := o.ctx.MultiXact.Members(multixact.MultiXactId(hdr.Xmax))
+		if !ok {
+			return nil
+		}
+		return members
+	}
+	if storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		return []multixact.Member{{Xid: hdr.Xmax, Status: lockOnlyMemberStatus(hdr.Infomask, hdr.Infomask2)}}
+	}
+	keysUpdated := (hdr.Infomask2 & storage.HeapKeysUpdated) != 0
+	// A DELETE leaves t_ctid pointing at the tuple itself (no successor version).
+	// goopg does not stamp HEAP_KEYS_UPDATED on delete the way PG's heap_delete
+	// does (compute_new_xmax_infomask with LockTupleExclusive), so recognise the
+	// delete structurally: it invalidates the key for every row lock and must be
+	// classified as StatusUpdate so it conflicts with FOR KEY SHARE — not the
+	// StatusNoKeyUpdate the cleared bit would otherwise imply (lock-update-delete
+	// blocker1). M0118-0003.
+	if !keysUpdated && (hdr.CTID.Block == storage.InvalidBlockNumber ||
+		(hdr.CTID.Block == self.Block && hdr.CTID.Offset == self.Offset)) {
+		keysUpdated = true
+	}
+	return []multixact.Member{{Xid: hdr.Xmax, Status: updaterMemberStatus(keysUpdated)}}
+}
+
+// classifyChainConflict is goopg's analog of test_lockmode_for_conflict applied
+// over every holder recorded in a chain version's xmax, in member order (matching
+// heap_lock_updated_tuple_rec's per-member short-circuit). For our requested
+// strength (o.lockMemberStatus) it returns:
+//   - needWait=true, waitXID: the first still-in-flight holder whose lock mode
+//     conflicts — the caller must wait on it and re-read the version.
+//   - committedConflict=true: the first committed *updater* whose lock mode
+//     conflicts — the caller ends the walk with TM_Updated / TM_Deleted.
+//   - both false: no conflicting holder — the caller may lock this version.
+//
+// A holder that is our own xact (already locked by us), aborted, or a committed
+// pure locker (lock gone) is skipped, exactly as upstream does. M0118-0003.
+func (o *lockRowsOp) classifyChainConflict(hdr storage.HeapTupleHeader, self storage.ItemPointer) (needWait bool, waitXID storage.TransactionID, committedConflict bool) {
+	if o.ctx.TxnMgr == nil {
+		return false, storage.InvalidTransactionID, false
+	}
+	reqStatus := o.lockMemberStatus()
+	for _, m := range o.chainMembers(hdr, self) {
+		if m.Xid == o.ctx.Tx.XID {
+			continue // already locked by us
+		}
+		switch {
+		case o.ctx.TxnMgr.IsXIDActive(m.Xid):
+			if multixact.StatusesConflict(m.Status, reqStatus) {
+				return true, m.Xid, false
+			}
+		case o.ctx.TxnMgr.HasAbortedXID(m.Xid):
+			// Aborted: its lock/update is gone — no conflict.
+		default:
+			// Committed: a pure locker's lock is gone, but a committed update
+			// persists and conflicts if the modes do.
+			if m.Status.IsUpdate() && multixact.StatusesConflict(m.Status, reqStatus) {
+				return false, storage.InvalidTransactionID, true
+			}
+		}
+	}
+	return false, storage.InvalidTransactionID, false
+}
+
 // propagateLockForward walks the update chain forward from `start` (the t_ctid
 // of a just-locked version that an updater had superseded) and applies our row
 // lock to every newer version, so a later DELETE / key-UPDATE on the live
@@ -1353,16 +1491,27 @@ func (o *lockRowsOp) updaterXID(hdr storage.HeapTupleHeader) storage.Transaction
 // does NOT touch the initial tuple (the caller already stamped it) and it does
 // not check visibility — it unconditionally marks each chain member as locked.
 //
+// Unlike a blind walk it honours the row-lock strength matrix per version: a
+// conflicting in-flight updater is WAITED on (then the version is re-read), and
+// a committed conflicting DELETE / key-UPDATE ends the walk with
+// chainLockDeleted / chainLockUpdated so the blocked-then-woken locker
+// (lock-update-delete s1l) re-evaluates against the latest version rather than
+// returning the stale snapshot tuple.
+//
 // `priorXmax` is the update xid of the version we came from; each successor's
 // xmin must equal it for the chain to be contiguous (a mismatch means the line
 // pointer was recycled for an unrelated tuple, so we stop). lock-update-traversal.
-func (o *lockRowsOp) propagateLockForward(rel storage.RelFileNode, start storage.ItemPointer, priorXmax storage.TransactionID) error {
+func (o *lockRowsOp) propagateLockForward(rel storage.RelFileNode, start storage.ItemPointer, priorXmax storage.TransactionID) (chainLockOutcome, storage.ItemPointer, error) {
 	cur := start
 	px := priorXmax
-	for hops := 0; hops < 32; hops++ { // chain-depth backstop, mirrors stampLockInner's intent
+	// The backstop bounds total iterations including wait-and-re-read retries
+	// (each wait re-reads the SAME version once the waited xact finishes), so it
+	// must exceed the pure chain-depth backstop in stampLockInner. Mirrors
+	// heap_lock_updated_tuple_rec's unbounded loop made finite for safety.
+	for hops := 0; hops < 64; hops++ {
 		slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: cur.Block})
 		if err != nil {
-			return err
+			return chainLockOK, storage.ItemPointer{}, err
 		}
 		slot.Lock()
 		tup, gerr := storage.PageGetHeapTuple(slot.Page(), cur.Offset)
@@ -1370,7 +1519,7 @@ func (o *lockRowsOp) propagateLockForward(rel storage.RelFileNode, start storage
 			// Successor pruned/vacuumed (its creator aborted): end of chain.
 			slot.Unlock()
 			o.ctx.Pool.Unpin(slot)
-			return nil
+			return chainLockOK, storage.ItemPointer{}, nil
 		}
 		// Chain continuity: the successor must descend from the version we just
 		// locked (its xmin == that version's update xid). Otherwise the line
@@ -1378,15 +1527,49 @@ func (o *lockRowsOp) propagateLockForward(rel storage.RelFileNode, start storage
 		if px != storage.InvalidTransactionID && tup.Header.Xmin != px {
 			slot.Unlock()
 			o.ctx.Pool.Unpin(slot)
-			return nil
+			return chainLockOK, storage.ItemPointer{}, nil
 		}
 		// Created by an aborted (sub)xact: the prior version was the last live one
 		// in the chain, so we are done.
 		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(tup.Header.Xmin) {
 			slot.Unlock()
 			o.ctx.Pool.Unpin(slot)
-			return nil
+			return chainLockOK, storage.ItemPointer{}, nil
 		}
+		// Conflict test on this version's xmax — the analog of
+		// test_lockmode_for_conflict inside heap_lock_updated_tuple_rec. A
+		// conflicting in-flight holder forces a WAIT (then a re-read of the SAME
+		// version, like its `goto l4`); a committed conflicting updater ends the
+		// walk with TM_Updated / TM_Deleted.
+		if tup.Header.Xmax != storage.InvalidTransactionID && tup.Header.Xmax != o.ctx.Tx.XID {
+			needWait, waitXID, committedConflict := o.classifyChainConflict(tup.Header, cur)
+			if needWait {
+				slot.Unlock()
+				o.ctx.Pool.Unpin(slot)
+				qctx := o.ctx.Ctx
+				if qctx == nil {
+					qctx = context.Background()
+				}
+				if werr := o.ctx.TxnMgr.WaitForXID(qctx, waitXID); werr != nil {
+					// Context cancelled — give up on the chain walk silently;
+					// the caller keeps the originally-locked version.
+					return chainLockOK, storage.ItemPointer{}, nil
+				}
+				continue // re-read the same version (cur/px unchanged) — goto l4
+			}
+			if committedConflict {
+				ctid := tup.Header.CTID
+				deleted := ctid.Block == storage.InvalidBlockNumber ||
+					(ctid.Block == cur.Block && ctid.Offset == cur.Offset)
+				slot.Unlock()
+				o.ctx.Pool.Unpin(slot)
+				if deleted {
+					return chainLockDeleted, storage.ItemPointer{}, nil
+				}
+				return chainLockUpdated, ctid, nil
+			}
+		}
+		// No conflict (TM_Ok): stamp our lock on this version and advance.
 		// Decide whether the chain continues from the ORIGINAL header, before
 		// lockSuccessorVersion mutates this version's xmax.
 		nextPtr := tup.Header.CTID
@@ -1398,17 +1581,17 @@ func (o *lockRowsOp) propagateLockForward(rel storage.RelFileNode, start storage
 		if lerr := o.lockSuccessorVersion(slot, rel, cur, tup.Header); lerr != nil {
 			slot.Unlock()
 			o.ctx.Pool.Unpin(slot)
-			return lerr
+			return chainLockOK, storage.ItemPointer{}, lerr
 		}
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
 		if !wasUpdated || nextPrior == storage.InvalidTransactionID {
-			return nil // reached the latest version
+			return chainLockOK, storage.ItemPointer{}, nil // reached the latest version
 		}
 		cur = nextPtr
 		px = nextPrior
 	}
-	return nil
+	return chainLockOK, storage.ItemPointer{}, nil
 }
 
 // lockSuccessorVersion applies our row lock to one update-chain member whose page

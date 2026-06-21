@@ -735,6 +735,74 @@ atop all twelve `lock-update-delete` permutations; the residual diff is purely
 divergence (B). Global-setup result printing (PG control-connection, `setupsqls[]`)
 is left unchanged — no in-scope spec has a tuple-returning global setup.
 
+### Hot-path wiring slice 9: blocked-then-woken locker re-evaluates the chain (`lock-update-delete` divergence (B) — spec **promoted**)
+
+Divergence (B) is the load-bearing one and lives in the **executor**, not the
+harness. Under READ COMMITTED `s1l` (`SELECT … FOR KEY SHARE`) takes its snapshot
+before `s2u`, parks at the advisory gate, and on wakeup sees the originally-visible
+`(1,1)`. The original tuple's xmax is `s2`'s *no-key* `UPDATE` (`s2u`), which does
+**not** conflict with `FOR KEY SHARE` — so it enters branch (a) of `stampLockInner`,
+combines into the updater-bearing multi, and then traverses the update chain
+forward via `propagateLockForward` (goopg's `heap_lock_updated_tuple_rec`). The
+gap: that walk merely *combined* its lock onto every successor, never **waiting**
+on a conflicting in-flight `DELETE`/key-`UPDATE` and never reporting that the
+chain ended in a committed delete/key-change — so `s1l` returned the stale
+`(1,1)` immediately instead of blocking on `s2` and (after `s2c`) returning
+`(0 rows)`.
+
+The fix (`internal/executor/operators_lockrows.go`) makes `propagateLockForward`
+honour the row-lock strength matrix per chain version, faithfully mirroring
+`heap_lock_updated_tuple_rec`:
+
+- **`classifyChainConflict`** (+ `chainMembers`) is the `test_lockmode_for_conflict`
+  analog over each holder of a version's xmax (single xid or every MultiXact
+  member, in member order). For our requested strength it returns *needWait* +
+  the xid of the first still-in-flight conflicting holder, or *committedConflict*
+  for the first committed conflicting **updater** (a committed pure locker's lock
+  is gone), else no-conflict.
+- `propagateLockForward` now returns a `chainLockOutcome`: on *needWait* it
+  `WaitForXID`s (bounded by the query context — M0072-0002 hang precedent) and
+  re-reads the **same** version (the `goto l4` analog); on *committedConflict* it
+  ends the walk with `chainLockDeleted` (t_ctid self-pointing → the row is gone)
+  or `chainLockUpdated` (relocated → returns the successor ptr); otherwise it
+  stamps the lock and advances (unchanged `lockSuccessorVersion`).
+- The branch-(a) caller maps the outcome: `chainLockDeleted` → drop the row
+  (`epqSkipped`, `(0 rows)`); `chainLockUpdated` → re-run the EPQ recheck against
+  the latest version and drop it if the predicate no longer holds, else yield the
+  updated version; `chainLockOK` → keep the originally-locked `(1,1)`
+  (`EvalPlanQualFetchRowMark`).
+
+Two goopg-specific seams the port had to bridge:
+
+- **DELETE key classification.** PG's `heap_delete` stamps `HEAP_KEYS_UPDATED`
+  (`compute_new_xmax_infomask(…, LockTupleExclusive, true, …)`) so a delete reads
+  back as `MultiXactStatusUpdate` and conflicts with `FOR KEY SHARE`. goopg's
+  delete path does **not** set that bit (and replicating it would also need the
+  bit threaded through the heap-delete WAL record for standby parity — out of
+  scope here), so a delete would otherwise look like a no-key update and *not*
+  conflict (blocker1 silently returned `(1,1)`). `chainMembers` therefore detects
+  a delete *structurally* — a real-updater xmax whose `t_ctid` points at the
+  tuple itself — and classifies it `StatusUpdate`. (The reverse, write-path,
+  direction already classifies an incoming DELETE correctly via its own status.)
+- **Index-key EPQ recheck.** `foo`'s `key` is a PRIMARY KEY, so `key = 1` is the
+  index-scan condition, **not** a `filterOp` predicate; `lockRowsOp`'s
+  `findFilterPred` would miss it and a committed key-`UPDATE` to `key = 2`
+  (blocker2) would survive the recheck. `Open` now folds the synthesised
+  `indexScanPredicate` of an `indexScanOp` leaf into the EPQ recheck predicate
+  (AND), matching PG's EvalPlanQual re-running the *whole* plan (index recheck
+  included). The synthesised ColumnRef targets the indexed column's table
+  ordinal so it stays within `filterCols`.
+
+Result: all twelve permutations match PG 18.3 byte-for-byte — committed
+DELETE/key-`UPDATE` → `(0 rows)` (blocked until `s2c`), abort or the no-key
+blocker3 → `(1,1)`. **`lock-update-delete` is promoted to `pass`**
+(`TestPort_IsolationLockUpdateDelete`); regression batch
+`TestPort_Isolation{LockUpdateTraversal,LockCommittedKeyupdate,UpdateLockedTuple,SkipLocked,Nowait,InsertConflictDoUpdate}`
+plus the `operators_lockrows` / `multixact` unit suites (incl. `-race`) stay
+green. The remaining M0118-0003 row-lock work (savepoint/subxact members,
+`propagate-lock-delete`'s FK-`INSERT` propagation, WAL persistence of multixact
+members, deadlock detection) is unchanged.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -863,16 +931,16 @@ verified primitive:
        removes the `lock-update-delete` infinite hang. Pinned by
        `TestSyntax_AdvisoryLock_SessionUnlockAcrossBeginBoundary` /
        `TestSyntax_AdvisoryLock_ReleasedOnDisconnect`.
-     - ⏳ **`lock-update-delete` output match (DEFERRED)**: with the hang gone the
-       spec runs all twelve permutations. Divergence (A) is now **fixed** — the
-       isolation runner prints the session-`setup` `pg_advisory_lock(0)` result
-       block atop each permutation (see *Hot-path wiring slice 8* above; ledger
-       2026-06-21). **Only divergence (B) remains**: on unblocking, `s1l` returns
-       the stale pre-update row immediately instead of re-traversing the chain and
-       waiting on `s2`'s in-flight `DELETE`/key-`UPDATE` (READ COMMITTED
-       blocked-then-woken-locker re-evaluation gap — the `lockRowsOp` wakeup path).
-       `TestPort_IsolationLockUpdateDelete` is a deferred SKIP guard.
-       `propagate-lock-delete` additionally needs FK-`INSERT` propagation.
+     - ✅ **`lock-update-delete` PROMOTED**: both divergences are fixed.
+       Divergence (A) — the runner now prints the session-`setup`
+       `pg_advisory_lock(0)` result block atop each permutation (*slice 8*).
+       Divergence (B) — the blocked-then-woken locker now re-evaluates the update
+       chain on wakeup: `propagateLockForward` waits on a conflicting in-flight
+       `DELETE`/key-`UPDATE` and reports `chainLockDeleted`/`chainLockUpdated` so
+       `s1l` returns `(0 rows)` (committed) or `(1,1)` (abort / no-key) matching PG
+       (*slice 9*; ledger 2026-06-21). All twelve permutations pass — pinned by
+       `TestPort_IsolationLockUpdateDelete`. `propagate-lock-delete` additionally
+       needs FK-`INSERT` propagation (still deferred).
 4. **WAL persistence of multixact members** — the lock-only producer marks the
    page dirty *without* a heap-lock WAL record (the record carries a single
    xid + strength and cannot describe a multi). Lock-only multixact state is
