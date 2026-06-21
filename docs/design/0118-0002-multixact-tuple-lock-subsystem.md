@@ -961,6 +961,54 @@ Regression batch re-verified green: the 16 `TestPort_Isolation*` lock specs
 (slice-11 batch + `LockCommittedUpdate` + `TuplelockUpdate`) all PASS; full
 `internal/planner` / `internal/parser` / `internal/executor` suites PASS.
 
+### Hot-path wiring slice 13: ON CONFLICT key-update lock mode + chain link (`tuplelock-partition` promoted)
+
+`tuplelock-partition` exercises tuple locking through the `INSERT … ON CONFLICT
+(key) DO UPDATE` path on a `PARTITION BY LIST (key)` table. Two permutations
+differ only in the `DO UPDATE SET` clause against a concurrent
+`SELECT … FOR KEY SHARE`:
+
+- **no-key arm** (`SET col1='x', col2='y'`): the conflicting tuple is locked
+  `LockTupleNoKeyExclusive`; a no-key update does **not** conflict with
+  `FOR KEY SHARE`, so `s2` proceeds immediately.
+- **key arm** (`SET key=1`): even though the key *value* is unchanged
+  (`1`→`1`), the `FOR KEY SHARE` must **wait** until `s1` commits.
+
+That divergence is the crux: PostgreSQL's `ExecOnConflictUpdate` locks the
+existing tuple with the mode from `ExecUpdateLockMode`, which keys off
+`ExecGetAllUpdatedCols` — the **set-list columns**, *not* a value comparison.
+Because `key` appears in the `SET` list, the lock is `LockTupleExclusive`
+(key-reserving, `HEAP_KEYS_UPDATED`), so a concurrent `FOR KEY SHARE` blocks.
+This contrasts with the *plain* `UPDATE` path (`operators_storage.go`), which is
+correctly value-based (`!hotEligible` via `indexKeyColumnsChanged`): a plain
+`UPDATE … SET key=1` that doesn't change the value is *not* a key update. The
+two paths legitimately differ — ON CONFLICT reserves the key off the target
+list; plain UPDATE off actual value change.
+
+Two fixes in the upsert `applyUpdate` path (`operators_upsert.go`):
+
+1. **Key-reserving lock on a set-list key column.** New helper
+   `onConflictUpdateTouchesKeyColumn` returns true when any `OnConflict.UpdateSet[i]`
+   is non-nil and `Table.Columns[i].Name` participates in a unique/primary
+   (`idx.Unique || idx.Primary`) index of the target — goopg's analog of
+   `INDEX_ATTR_BITMAP_KEY`. When true, `applyUpdate` stamps `HEAP_KEYS_UPDATED`
+   on the conflicting (old) tuple alongside its `xmax`, mirroring the plain-update
+   stamp at `operators_storage.go` so the row-lock conflict detector
+   (`operators_lockrows.go`) treats it as `StatusUpdate` and the `FOR KEY SHARE`
+   waits.
+2. **`t_ctid` chain link.** `applyUpdate` previously stamped `xmax` on the old
+   tuple but never linked it to the new version. With the lock now blocking,
+   `s2`'s post-commit EPQ chain-follow read a self-pointing `t_ctid` and tripped a
+   `short read at block`. `applyUpdate` now calls the same `stampOldCtid` the
+   plain-update path uses (ON CONFLICT never moves partitions, so old and new
+   share `rel`) so the waiting locker follows the chain to the live successor.
+
+Promoted to `pass` (`TestPort_IsolationTuplelockPartition`; CSV `failed`→`pass`;
+coverage/inventory regenerated, isolation pass 73→74). Regression re-verified
+green: `TestPort_IsolationInsertConflict*` / `Tuplelock*` / `LockCommitted*` /
+`UpdateLockedTuple` / `EvalPlanQual*` specs and the full `internal/executor`
+suite all PASS.
+
 ## Verification
 
 `internal/multixact/multixact_test.go` (9 test functions, all pure/deterministic):
@@ -1125,6 +1173,11 @@ verified primitive:
    keyword now rewrites to `nextval` in the planner, and the isolation runner
    honours `BlockerStepComplete` step-name annotations — no row-lock engine
    change).
+   ✅ **`tuplelock-partition` promoted** (*slice 13*; `ON CONFLICT DO UPDATE`
+   reserves the key (`HEAP_KEYS_UPDATED`) when the `SET` list assigns a key
+   column — set-list based per `ExecUpdateLockMode`, not value-based — and
+   `applyUpdate` now links old→new via `t_ctid` for the waiting locker's
+   chain-follow).
    Still deferred in this cluster: `multixact-no-forget` (needs WAL/`pg_multixact`
    member persistence, item 4); `propagate-lock-delete` (FK-`INSERT` lock
    propagation); `aborted-keyrevoke`; and `multixact-no-deadlock` /

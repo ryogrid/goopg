@@ -1,61 +1,54 @@
-Task: M0118-0003 (row locking) — COMPLETE this loop: promoted `tuplelock-update`
-(slice 12). The M0118-0003 spec group continues (more specs below).
+Task: M0118-0003 (row locking) — COMPLETE this loop: promoted `tuplelock-partition`
+(slice 13). The M0118-0003 spec group continues (more specs below).
 
 DONE this loop (committed):
-- internal/planner/planner.go: new shared helper `defaultMarkerReplacement(tbl,
-  ordinal)` — returns the column's catalog DefaultExpr if present, ELSE a
-  synthesized `nextval('<table>_<col>_seq')` *parser.FuncCall for
-  catalog.IsSerialTypeName / IdentityColumn columns, ELSE *parser.NullConst.
-  Wired into all 3 DEFAULT-marker substitution sites (rewriteInsertDefaultMarkers
-  row cell; rewriteUpdateDefaultMarkers single-column + tuple-form). Fixes
-  explicit `DEFAULT` on a SERIAL column collapsing to NULL (23502).
-- internal/testport/framework/isolation_runner.go: `hasPendingStepCompleteBlocker`
-  + `reportStepGatedOnBlockers` — the immediate-completion branch now honours
-  BlockerStepComplete step-name annotations (e.g. `s1_advunlock1(s2_update)`),
-  rendering the unlock step in <waiting ...>/<... completed> format gated behind
-  the referenced pending blocker step.
-- internal/planner/planner_test.go: +TestPlanInsert/UpdateValuesDefaultSerial
-  SubstitutesNextval (pin the nextval rewrite).
-- internal/testport/isolation_port_test.go: +TestPort_IsolationTuplelockUpdate.
-- CSV target-inventory: tuplelock-update failed→pass (comma-free rationale);
-  regenerated postgres-oracle-target-inventory.md + upstream-isolation-coverage.md
-  (isolation pass 72→73).
-- docs/design/0118-0002-*: slice 12 section + status checklist (✅ tuplelock-update)
-  + README index slice-12 sentence. Ledger row appended.
+- internal/executor/operators_upsert.go: two fixes in the ON CONFLICT DO UPDATE
+  `applyUpdate` path.
+  (1) new helper `onConflictUpdateTouchesKeyColumn` — true when any
+      `OnConflict.UpdateSet[i]` is non-nil AND `Table.Columns[i].Name` is a key
+      column of a unique/primary index (`idx.Unique || idx.Primary`, via
+      `Catalog.IndexesOnTable`). When true, applyUpdate stamps HEAP_KEYS_UPDATED
+      on the conflicting (old) tuple alongside xmax (PageSetHeapTupleKeysUpdated).
+      Mirrors PG ExecUpdateLockMode/ExecGetAllUpdatedCols (set-list based, NOT
+      value-based) so `SET key=1` (value unchanged) still makes a concurrent
+      FOR KEY SHARE wait; no-key `SET col1/col2` does not. The plain-UPDATE path
+      stays value-based (!hotEligible) — legitimately different.
+  (2) applyUpdate now links old->new via `stampOldCtid` (was missing) so a
+      waiting FOR KEY SHARE follows the t_ctid chain to the live successor
+      instead of `short read at block` on a self-pointing ctid. ON CONFLICT never
+      moves partitions so old/new share rel.
+- internal/testport/isolation_port_test.go: +TestPort_IsolationTuplelockPartition.
+- CSV target-inventory line 610: failed->pass (comma-free rationale); regenerated
+  postgres-oracle-target-inventory.md + upstream-isolation-coverage.md
+  (isolation pass 73->74).
+- docs/design/0118-0002-*: slice 13 section + status checklist (✅ tuplelock-partition)
+  + README index slice-13 sentence. Ledger row appended.
 
-ROOT CAUSE: tuplelock-update setup `INSERT INTO pktab VALUES (1, DEFAULT)` where
-`data` is `SERIAL NOT NULL`. goopg leaves catalog DefaultExpr nil for serial cols
-(the executor nextval auto-gen loop is authoritative only for OMITTED columns),
-so the DEFAULT marker → NullConst → column counted as explicitly-provided-NULL →
-auto-gen skipped → NOT NULL 23502. Second divergence: runner ignored
-BlockerStepComplete annotations. The ROW-LOCK ENGINE was already correct (slices
-5/6 forward lock propagation handle FOR KEY SHARE + chained no-key updaters).
+ROOT CAUSE: two perms differ only in DO UPDATE SET. PG's ON CONFLICT locks the
+conflicting tuple FOR UPDATE (key-reserving) when the SET list names a key column
+regardless of value; goopg's applyUpdate stamped xmax but never set
+HEAP_KEYS_UPDATED off the set list, and never linked old->new t_ctid.
 
-GATES (all PASS): go build ./...; go vet planner+testport; gofmt clean;
-full internal/planner + internal/parser + internal/executor suites PASS;
-16 TestPort_Isolation lock specs (LockUpdateDelete/Traversal, Nowait/2/3/4/5,
-SkipLocked/2/3/4, TuplelockConflict, LockCommitted{Update,Keyupdate},
-UpdateLockedTuple, TuplelockUpdate) all PASS no silent skips; ralph-state-guard
-OK (auto-repaired progress→in_progress); pgbench smoke via pre-commit hook.
-DO NOT stage: postgres, weekly_loc.*, requirements.txt, weekkly_loc_history.py.
+GATES (all PASS): go build ./...; go vet executor+testport; gofmt clean on my
+added lines (pre-existing go1.25/1.26 version-mismatch noise elsewhere — do NOT
+gofmt -w); full internal/executor suite PASS incl. -race; regression batch
+TestPort_IsolationInsertConflict*/Tuplelock*/LockCommitted*/UpdateLockedTuple/
+EvalPlanQual* all PASS no silent skips; ralph-state-guard OK; pgbench smoke via
+pre-commit hook. DO NOT stage: postgres, weekly_loc.*, requirements.txt,
+weekkly_loc_history.py.
 
 >>> NEXT STEP (continue M0118-0003 row-locking group, one spec per loop):
-    RESUME at `tuplelock-partition` (INSERT ON CONFLICT UPDATE routing on a
-    LIST-partitioned table — 2 perms: no-key UPDATE proceeds vs s2 FOR KEY SHARE;
-    key-UPDATE blocks s2 until s1c) OR `lock-nowait` (LOCK TABLE — needs a
-    txn-scoped heavyweight lock lifecycle, [[lockmgr_locks_are_statement_scoped]])
-    OR `propagate-lock-delete` (FK-INSERT lock propagation + RI trigger).
-    Per-spec workflow: add TestPort_Isolation<Name> for the live diff → fix →
-    green → CSV failed→pass (rationale=Go func, COMMA-FREE) → regen
-    gen-isolation-coverage + gen-oracle-inventory → design doc slice + README +
+    RESUME at `propagate-lock-delete` (FK-INSERT lock propagation onto the updated
+    tuple + RI trigger; 8 perms incl. SAVEPOINT-rollback variant — a preexisting
+    FK-induced lock on `parent` must NOT be ignored after an UPDATE propagates it)
+    OR `lock-nowait` (LOCK TABLE — needs a NEW txn-scoped heavyweight lock
+    lifecycle, [[lockmgr_locks_are_statement_scoped]]). Both distinct higher-blast
+    subsystems, each its own loop.
+    Per-spec workflow: add TestPort_Isolation<Name> for the live diff -> fix ->
+    green -> CSV failed->pass (rationale=Go func, COMMA-FREE) -> regen
+    gen-isolation-coverage + gen-oracle-inventory -> design doc slice + README +
     ledger.
 
-GOTCHAS: CSV rationale MUST be comma-free (unquoted comma-delimited rows) —
-[[serena_replace_content_dotall_eats_file]]; prefer built-in Edit for Go code.
-The BlockerStepComplete runner support added this loop also unblocks output
-ordering for deadlock-hard / detach-partition-concurrently-3/4 /
-intra-grant-inplace-db / partition-drop-index-locking when later ported (only 6
-upstream specs use parenthesised step blockers). tpch-spotcheck INFRA-BLOCKED
-(SLRU backfill >60s); row-lock path never fires in pgbench TPC-B/TPC-H so TPS
-blast radius nil; the planner DEFAULT-on-serial change is guarded by full
-planner/executor suites + pgbench pre-commit smoke.
+GOTCHAS: CSV rationale MUST be comma-free — [[serena_replace_content_dotall_eats_file]];
+prefer built-in Edit for Go code. tpch-spotcheck INFRA-BLOCKED (SLRU backfill >60s);
+ON CONFLICT/row-lock path never fires in pgbench TPC-B/TPC-H so TPS blast radius nil.

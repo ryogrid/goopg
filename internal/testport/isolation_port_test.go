@@ -824,6 +824,18 @@ func TestPort_IsolationTuplelockUpdate(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-update.spec")
 }
 
+// TestPort_IsolationTuplelockPartition exercises the tuplelock-partition spec:
+// INSERT ON CONFLICT UPDATE on a LIST-partitioned table. A no-key UPDATE arm
+// (col1/col2) does not conflict with a concurrent FOR KEY SHARE; a key UPDATE
+// arm (SET key=1) blocks the FOR KEY SHARE until s1 commits. M0118-0003.
+func TestPort_IsolationTuplelockPartition(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_tuplelock_partition")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-partition.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

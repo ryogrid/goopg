@@ -934,6 +934,16 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 		o.ctx.Pool.Unpin(pinned)
 		return err
 	}
+	if o.onConflictUpdateTouchesKeyColumn() {
+		// ON CONFLICT DO UPDATE whose SET list assigns a key column locks the
+		// conflicting tuple FOR UPDATE (LockTupleExclusive), reserving the key
+		// via HEAP_KEYS_UPDATED so a concurrent FOR KEY SHARE waits until this
+		// transaction commits — even when the key VALUE is unchanged (SET key=1).
+		// Mirrors PG's ExecUpdateLockMode, which keys off ExecGetAllUpdatedCols
+		// (the SET-list columns), not value comparison. M0118-0003
+		// (tuplelock-partition).
+		_ = storage.PageSetHeapTupleKeysUpdated(pinned.Page(), oldPtr.Offset)
+	}
 	derr := markHeapDeleteDirty(o.ctx.Pool, pinned, rel, oldPtr.Block, oldPtr.Offset, o.ctx.Tx.XID, nil)
 	pinned.Unlock()
 	o.ctx.Pool.Unpin(pinned)
@@ -946,6 +956,15 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 	}
 	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
 		o.ctx.CTEWriteFence[newPtr] = struct{}{}
+	}
+	// Link the old tuple to the new version via t_ctid so a concurrent locker
+	// (e.g. FOR KEY SHARE on a key-UPDATE conflict) that waits on the old
+	// tuple's xmax can follow the ctid chain to the live successor instead of
+	// reading a stale/self-pointing ctid. ON CONFLICT DO UPDATE never moves
+	// partitions, so old and new always share rel. Mirrors the regular UPDATE
+	// path's stampOldCtid. M0118-0003 (tuplelock-partition).
+	if cerr := stampOldCtid(o.ctx, rel, oldPtr.Block, oldPtr.Offset, newPtr); cerr != nil {
+		return cerr
 	}
 	o.trackWrittenPtr(newPtr)
 	// For expression-based arbiters, re-evaluate the arbiter expression for the
@@ -965,6 +984,49 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 		o.maintainNonArbiterIndexesForUpdate(tbl, cols, updatedLeaf, newPtr, 0)
 	}
 	return nil
+}
+
+// onConflictUpdateTouchesKeyColumn reports whether the ON CONFLICT DO UPDATE
+// SET list assigns any column that participates in a unique/primary-key index
+// of the target table. PG's ExecUpdateLockMode locks the conflicting tuple
+// with LockTupleExclusive (key-reserving, HEAP_KEYS_UPDATED) whenever the set
+// of updated columns overlaps INDEX_ATTR_BITMAP_KEY — regardless of whether the
+// new key value differs from the old. A no-key UPDATE (SET on non-key columns)
+// stays LockTupleNoKeyExclusive and does NOT conflict with a concurrent
+// FOR KEY SHARE. M0118-0003 (tuplelock-partition).
+func (o *upsertOp) onConflictUpdateTouchesKeyColumn() bool {
+	oc := o.plan.OnConflict
+	if oc == nil || oc.Action != planner.OnConflictActionUpdate || len(oc.UpdateSet) == 0 {
+		return false
+	}
+	tbl := o.plan.Table
+	if tbl == nil || o.ctx.Catalog == nil {
+		return false
+	}
+	setCols := make(map[string]struct{})
+	for i, expr := range oc.UpdateSet {
+		if expr == nil || i >= len(tbl.Columns) {
+			continue
+		}
+		setCols[tbl.Columns[i].Name] = struct{}{}
+	}
+	if len(setCols) == 0 {
+		return false
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		if idx == nil || (!idx.Unique && !idx.Primary) {
+			continue
+		}
+		for _, col := range idx.Columns {
+			if col == "" { // expression index column — no plain name to match
+				continue
+			}
+			if _, ok := setCols[col]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // maintainArbiter inserts a precomputed (conflict-key → ptr) entry into the
