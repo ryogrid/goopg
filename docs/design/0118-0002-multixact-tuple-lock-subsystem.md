@@ -1,6 +1,6 @@
 # MultiXact tuple-lock subsystem (engine-first slice) — M0118-0003/0004
 
-- Status: accepted (partial — engine core only; hot-path wiring deferred)
+- Status: accepted (partial — engine core + member store; hot-path wiring deferred)
 - Date: 2026-06-21
 - Supersedes: none
 - Related: [0118-0001](0118-0001-isolation-spec-port-strategy.md) (isolation
@@ -80,6 +80,48 @@ and must land incrementally on top of a verified primitive.
 - **`HasLockers`** — whether a member set retains a pure-lock holder after its
   updater finishes (the `multixact-no-forget` invariant).
 
+### The member store (`internal/multixact/store.go`)
+
+The conflict matrix above answers *"do these statuses conflict"*; the **member
+store** answers *"which transactions compose MultiXactId N"* — the in-memory
+analog of PostgreSQL's multixact SLRU (`pg_multixact/offsets` +
+`pg_multixact/members`). It is still a pure data structure with no hot-path
+wiring; the eventual `stampLockInner` integration consumes it.
+
+- **`Store`** hands out monotonically increasing `MultiXactId`s
+  (`NewStore`/`NewStoreAt(next)` to seed from `pg_control`'s `nextMulti`,
+  `Next()` to read the allocator) and resolves each back to its immutable
+  member set (`Members(multi) ([]Member, bool)`, returning a defensive copy).
+  It is mutex-guarded (the future hot path is concurrent;
+  `TestStoreConcurrentCreate` runs under `-race`).
+- **`Create(m1, m2)`** ← `MultiXactIdCreate` (`multixact.c:430`): the
+  two-member constructor (the members must differ in xid or status).
+- **`CreateFromMembers(members)`** ← `MultiXactIdCreateFromMembers`
+  (`multixact.c:811`): validates at most one *updater*
+  (`ErrMultipleUpdaters`, mirroring the upstream `elog(ERROR)`) and that every
+  xid is valid, then sorts the set canonically (`sortedMembers` ←
+  `mxactMemberComparator`, `multixact.c:1652`: ascending `(xid, status)`, **not**
+  wraparound order) and **re-uses an existing id for an identical set**
+  (`setKey` ← the `mXactCacheGetBySet` sorted-array `memcmp`,
+  `multixact.c:1704`).
+- **`Expand(multi, add, live)`** ← `MultiXactIdExpand` (`multixact.c:483`):
+  immutability by construction — adding a member never mutates an existing id,
+  it mints a new one. Returns `multi` unchanged if `add` is already a member
+  with the same status; creates a singleton if `multi` is obsolete (no
+  resolvable members); otherwise keeps the members *still of interest* (running,
+  or a **committed** updater — an aborted update is dropped so the result keeps
+  the single-updater invariant) plus `add`.
+- **`Liveness`** injects transaction state (`IsInProgress`/`DidCommit`) into the
+  otherwise-pure `Expand` filter, the same way `MembersConflict` injects
+  `isCurrent`; the leaf package does not own liveness. A zero `Liveness{}` is
+  conservative (keep every member).
+
+Two deliberate divergences from the SLRU, neither affecting member-set
+semantics: the dedup cache is **global and unbounded** (upstream's
+`mXactCacheGetBySet` is per-backend, LRU-capped at 256 — deterministic and fine
+at spec/test scale), and ids are **never truncated/vacuumed** (the MultiXactId
+wraparound/`SetOffsetVacuumLimit` machinery is a separate, deferred concern).
+
 ### The load-bearing compatibility fact
 
 The whole subsystem exists to model one case the single-holder xmax cannot:
@@ -115,14 +157,40 @@ The port was cross-checked verbatim against the live upstream tree this loop:
 (`src/backend/access/heap/heapam.c:205` and `:132`) and `LockConflicts[]`
 (`src/backend/storage/lmgr/lock.c:65`).
 
+`internal/multixact/store_test.go` (member store, all pure/deterministic, runs
+under `-race`):
+
+- allocator starts at `FirstMultiXactId` and never hands out
+  `InvalidMultiXactId` (`NewStoreAt(0)` clamps up);
+- `Members` round-trips a set canonically sorted and returns an independent
+  copy (mutating it cannot corrupt the store), and reports `ok=false` for an
+  unknown id;
+- identical sets (in any argument order) re-use one id without advancing the
+  allocator; sets differing in a single member's status get distinct ids;
+- `Create` rejects an identical member pair; `CreateFromMembers` rejects
+  >1 updater (`ErrMultipleUpdaters`), an empty set, an invalid xid, an invalid
+  status, and does not mutate the caller's slice;
+- `Expand` mints a new id leaving the original immutable, returns the original
+  unchanged when re-adding an existing member, drops a finished pure locker but
+  keeps a committed updater, drops an aborted updater, creates a singleton for
+  an obsolete id, keeps every member under a zero `Liveness{}`, and rejects
+  `InvalidMultiXactId`/invalid-xid input;
+- `TestStoreConcurrentCreate` fans 16×64 distinct creates and asserts the
+  allocator advanced by exactly the unique-set count (no lost/duplicated ids).
+
 ## Deferred (resume points)
 
 The risky hot-path integration lands in later loops, each on top of this
 verified primitive:
 
 1. **xmax encoding** — represent a MultiXactId in the tuple header
-   (`HEAP_XMAX_IS_MULTI`) and a member store (in-memory analog of the multixact
-   SLRU). Keystone for everything below.
+   (`HEAP_XMAX_IS_MULTI`). The member store (in-memory analog of the multixact
+   SLRU) **landed this loop** (`store.go`, see above); what remains of this
+   keystone is the tuple-header half: set `HEAP_XMAX_IS_MULTI` in `t_infomask`,
+   stamp the `MultiXactId` into the `xmax` field, and make the freeze/visibility
+   readers (`internal/storage`) decode it via `Store.Members`. This is the
+   sibling-path step — the stamp (encode) and the `isConcurrentlyUpdated`/freeze
+   (decode) twins must change together ([[pattern_sibling_paths_must_agree]]).
 2. **`stampLockInner` member combination** — teach branch (a)
    (`operators_lockrows.go`) to *combine* a new locker with an in-progress
    updater into a multixact instead of skipping.
