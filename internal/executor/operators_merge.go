@@ -811,7 +811,7 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	s.Lock()
 	oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), slot)
 	if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, ctx.Tx.XID, &ctx.Snap, ctx.MultiXact) {
-		xmax := oldTup.Header.Xmax
+		xmax := concurrentModifierXID(oldTup.Header, ctx.MultiXact)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		if epqWait(ctx, xmax) {
@@ -920,7 +920,7 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	s.Lock()
 	oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), slot)
 	if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, ctx.Tx.XID, &ctx.Snap, ctx.MultiXact) {
-		xmax := oldTup.Header.Xmax
+		xmax := concurrentModifierXID(oldTup.Header, ctx.MultiXact)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		if epqWait(ctx, xmax) {

@@ -188,6 +188,19 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       NEXT: shared `stampUpdaterXmaxPreservingLockers` helper, gated on a
       pre-existing foreign non-conflicting active lock-only xmax (bounded blast
       radius), then make the UPDATE conflict-wait multixact-aware.
+      **2026-06-22 write-side EPQ-wait half landed (design 0118-0010):** the
+      UPDATE/DELETE/MERGE EvalPlanQual loops fed the RAW `xmax` (a MultiXactId
+      when updater-bearing) to `epqWait`/`HasInProgress`/`HasAbortedXID`/
+      `IsXIDActive`; new shared `concurrentModifierXID(hdr, mxs)` resolves the
+      real updater member at all 9 EPQ-wait sites (7 storage + 2 merge), the
+      write-side twin of 0118-0009. Latent-bug fix; regression batch green with
+      `-race`; spec still deferred. **Producer discovery:** the spec's `name`
+      UPDATE is HOT-eligible, so the old-tuple stamp goes through
+      `PageStampHotOldTuple` in `tryApplyHOTUpdate`, NOT the
+      `PageSetHeapTupleXmax` sites — the producer needs a NEW multi-aware
+      HOT-stamp storage primitive (CTID + `HEAP_HOT_UPDATED` + multi xmax) in
+      addition to the plain delete+insert / merge / upsert wiring, plus full
+      UPDATE-hot-path gates (pgbench + regress-port).
       (b) `deadlock-parallel` needs a lock-group abstraction goopg lacks — defer.
 - [ ] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,

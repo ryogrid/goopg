@@ -2008,6 +2008,28 @@ func multixactFirstActiveMember(mxs *multixact.Store, txnMgr *mvcc.Manager, self
 	return storage.InvalidTransactionID
 }
 
+// concurrentModifierXID resolves the transaction id an UPDATE / DELETE / MERGE
+// EvalPlanQual wait must block on for a tuple that isConcurrentlyUpdated has
+// just flagged. For a single-xid xmax it is the xmax itself; for an
+// updater-bearing MultiXactId (IS_MULTI && !LOCK_ONLY) the raw t_xmax is a
+// MultiXactId — NOT a transaction id — so the real updater member is resolved
+// from the member store before it ever reaches epqWait / WaitForXID / the
+// wait-for graph / snap.HasInProgress / HasAbortedXID / IsXIDActive. This is the
+// write-path twin of stampLockInner's read-side multi resolution (commit
+// ab3881e8) and of isConcurrentlyUpdated's own resolution (which the caller has
+// already run, so an updater member is present). Falls back to the raw xmax only
+// when the multi is unresolvable (store nil / membership lost after a restart),
+// matching the conservative path isConcurrentlyUpdated took to return true.
+// M0118-0004.
+func concurrentModifierXID(hdr storage.HeapTupleHeader, mxs *multixact.Store) storage.TransactionID {
+	if storage.IsHeapTupleXmaxMulti(hdr.Infomask) && !storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		if upd := multixactUpdaterXID(mxs, hdr.Xmax); upd != storage.InvalidTransactionID {
+			return upd
+		}
+	}
+	return hdr.Xmax
+}
+
 // tryApplyHOTUpdate attempts a same-page HOT update of the tuple at
 // (blk, oldSlot). It:
 //  1. Encodes newRow with HeapOnlyTuple set in the tuple infomask.
@@ -2096,7 +2118,7 @@ func tryApplyHOTUpdate(
 	// fall back to the delete+insert path so it can re-check visibility.
 	if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), oldSlot); gerr == nil &&
 		isConcurrentlyUpdated(oldTuple.Header, ctx.Tx.XID, &ctx.Snap, ctx.MultiXact) {
-		xmax := oldTuple.Header.Xmax
+		xmax := concurrentModifierXID(oldTuple.Header, ctx.MultiXact)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		if epqWait(ctx, xmax) {
@@ -2437,7 +2459,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				// M0100-0005: when epqDoUpdate is set (abort confirmed on previous
 				// iteration), skip the EPQ check and fall through to the update code.
 				if !epqDoUpdate && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
-					xmax := oldTup.Header.Xmax
+					xmax := concurrentModifierXID(oldTup.Header, o.ctx.MultiXact)
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
@@ -2923,7 +2945,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					s.Lock()
 					tupHdr, tErr := storage.PageGetHeapTuple(s.Page(), writeSlot)
 					noConflict := tErr != nil || !isConcurrentlyUpdated(tupHdr.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact)
-					xmax := tupHdr.Header.Xmax
+					xmax := concurrentModifierXID(tupHdr.Header, o.ctx.MultiXact)
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					if noConflict {
@@ -3120,7 +3142,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				s.Lock()
 				oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
 				if !epqDoUpdateSeq && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
-					xmax := oldTup.Header.Xmax
+					xmax := concurrentModifierXID(oldTup.Header, o.ctx.MultiXact)
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
@@ -3586,7 +3608,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					s.Lock()
 					tupHdr, tErr := storage.PageGetHeapTuple(s.Page(), deleteSlot)
 					noConflict := tErr != nil || !isConcurrentlyUpdated(tupHdr.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact)
-					xmax := tupHdr.Header.Xmax
+					xmax := concurrentModifierXID(tupHdr.Header, o.ctx.MultiXact)
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					if noConflict {
@@ -3708,7 +3730,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			// exclusive Lock before our own stamp.
 			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
 			if !epqDoDelete && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
-				xmax := oldTup.Header.Xmax
+				xmax := concurrentModifierXID(oldTup.Header, o.ctx.MultiXact)
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
@@ -4087,7 +4109,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				continue // slot gone (concurrent prune)
 			}
 			if isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
-				xmax := oldTup.Header.Xmax
+				xmax := concurrentModifierXID(oldTup.Header, o.ctx.MultiXact)
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				// EPQ: wait for the concurrent transaction and recheck. M0100-0010.
