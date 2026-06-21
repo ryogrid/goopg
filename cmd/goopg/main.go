@@ -515,6 +515,21 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// FirstMultiXactId; persisting/seeding from pg_control.nextMulti is a
 		// deferred enhancement (membership is in-memory and transient in v0).
 		cfg.MultiXact = multixact.NewStore()
+		// Wire the storage-package vacuum/freeze/prune read paths to the
+		// process-shared member store so they can resolve an updater-bearing
+		// multixact xmax (a MultiXactId, not an xid) to its updater before
+		// treating it as a deleter. storage cannot import internal/multixact
+		// (cycle), hence this callback. Mirrors how mvcc.TupleVisible /
+		// executor.isConcurrentlyUpdated take the Store directly. (M0118-0003.)
+		mxStore := cfg.MultiXact
+		storage.ResolveMultiUpdater = func(xmax storage.TransactionID) (storage.TransactionID, bool, bool) {
+			members, ok := mxStore.Members(multixact.MultiXactId(xmax))
+			if !ok {
+				return storage.InvalidTransactionID, false, false
+			}
+			upd, hasUpdater := multixact.GetUpdateXid(members)
+			return upd, hasUpdater, true
+		}
 		cfg.FSM = rt.FSM
 		cfg.VM = rt.VM
 		cfg.Checkpointer = rt.Checkpointer

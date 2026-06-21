@@ -54,7 +54,25 @@ func PagePruneOpt(p Page, oldestXmin TransactionID) (PruneResult, error) {
 		if IsHeapTupleLockOnly(hdr.Infomask) {
 			return false
 		}
-		return hdr.Xmax < oldestXmin
+		// For an updater-bearing multixact xmax, hdr.Xmax is a MultiXactId, not
+		// a transaction id; comparing it to the oldestXmin horizon would be a
+		// category error (it could spuriously mark a live, only-locked row dead
+		// and prune it). Resolve the updater member and test that xid instead. A
+		// multi with no updater (only lockers) is not a delete, and an
+		// unresolvable multi is conservatively NOT dead — never prune a tuple we
+		// cannot prove dead.
+		effXmax := hdr.Xmax
+		if IsHeapTupleXmaxMulti(hdr.Infomask) {
+			if ResolveMultiUpdater == nil {
+				return false
+			}
+			upd, hasUpdater, resolved := ResolveMultiUpdater(hdr.Xmax)
+			if !resolved || !hasUpdater {
+				return false
+			}
+			effXmax = upd
+		}
+		return effXmax < oldestXmin
 	}
 
 	count, err := PageLinePointerCount(p)

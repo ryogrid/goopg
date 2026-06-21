@@ -284,11 +284,52 @@ unavailable / multi absent → conservatively invisible). The single-xid, own-xi
 and lock-only cases remain under `TestTupleVisibleBasicCases` / `…OwnXIDRules` /
 `…LockOnlyXmax` / `…NonLockXmaxRegression`.
 
-**Still deferred on the read side** (tracked in resume point #2): `storage/freeze.go`
-(package `storage` cannot import `multixact` — that is an import cycle — so it needs
-a resolver callback injected at init). That plus the producer are gated together:
-the updater-bearing producer (branch (a) of `stampLockInner`) **must not** land
-until `freeze.go` is also multixact-aware.
+### Hot-path wiring slice 2 (continued, 2): storage vacuum read consumers (`freeze.go` / `prune.go` / `vm.go`)
+
+The last read consumers live in package `storage`, which **cannot** import
+`internal/multixact` — `multixact` imports `storage`, so a direct dependency would
+cycle. Instead `storage` exposes a process-level resolver hook
+`storage.ResolveMultiUpdater` (in `heap.go`, beside `IsHeapTupleXmaxMulti`), wired
+once from the process-shared `multixact.Store` in `cmd/goopg/main.go` right after
+the store is created. It returns `(updater TransactionID, hasUpdater bool, resolved
+bool)`, mirroring `Store.Members` + `multixact.GetUpdateXid`:
+
+- `resolved == false` — MultiXactId not in the member store (or no hook installed);
+  the caller must fall back to its own conservative default and must **not** read
+  xmax as an xid.
+- `resolved && !hasUpdater` — multi holds only lockers; the tuple is still live.
+- `resolved && hasUpdater` — `updater` is the updater member's xid; reason about it
+  exactly as a plain xmax xid.
+
+Two `storage` read paths interpret xmax as a deleter and now funnel an
+`IsHeapTupleXmaxMulti && !IsHeapTupleLockOnly` xmax through the hook before judging
+it:
+
+- **`PageFreezeOldTuples` (`freeze.go`)** — a non-lock-only xmax normally means
+  "deleted, skip freezing"; for a multi it resolves the updater: only-lockers →
+  the row is live and its xmin is frozen, updater present (or unresolved/nil hook)
+  → skip. Pinned by `TestPageFreezeMultiXactXmax`.
+- **`PagePruneOpt`'s `isDead` (`prune.go`)** — the old `hdr.Xmax < oldestXmin`
+  horizon test was a **category error** for a multi (`hdr.Xmax` is a MultiXactId,
+  not an xid, so the comparison could spuriously mark a live, only-locked row dead
+  and prune it). It now resolves the updater and applies the horizon test to the
+  *updater* xid; only-lockers / unresolved / nil-hook → conservatively **not**
+  dead (never prune a tuple we cannot prove dead). Pinned by
+  `TestPagePruneOptMultiXactXmax`, whose `updater newer than horizon` subtest is a
+  direct regression guard for the category error.
+
+`vm.go`'s `PageAllVisible` needs **no** resolver: an updater-bearing multi lands in
+its `!IsHeapTupleLockOnly` "deleted" arm and correctly fails all-visible (the
+conservative direction); resolving could only ever mark *more* pages all-visible,
+and an all-locker multi already carries `LOCK_ONLY`. Only a clarifying comment was
+added. `amcheck/verify_heapam.go`'s `checkXmaxBounds` already returns early on
+`HEAP_XMAX_IS_MULTI` (it validates the multi separately — a deferred AC-003 path),
+so it never misreads the MultiXactId either.
+
+With all three storage consumers correct, **every** xmax read consumer
+(`isConcurrentlyUpdated`, `mvcc.TupleVisible`, `freeze`/`prune`) now agrees on the
+updater-bearing-multi interpretation — the producer gate
+([[pattern_sibling_paths_must_agree]]) is satisfied.
 
 ## Verification
 
@@ -364,16 +405,19 @@ verified primitive:
      scans / index / index-only / upsert / toast + `followHOTChain` helpers pass
      `ctx.MultiXact`; vacuum/analyze stats scans pass `nil` until the producer
      slice threads them). See *Hot-path wiring slice 2 (continued)* above.
-   - ⛔ `storage/freeze.go` — must resolve the updater before freezing; package
-     `storage` cannot import `multixact` (cycle), so inject a resolver callback
-     (set at init, like other storage hooks) rather than a direct import.
+   - ✅ `storage` vacuum read consumers (`freeze.go` / `prune.go`; `vm.go`
+     conservative, no change) are multixact-aware via the `storage.ResolveMultiUpdater`
+     hook wired from `cmd/goopg/main.go` — see *Hot-path wiring slice 2 (continued, 2)*
+     above. This was the **last** read consumer; the producer gate is now satisfied.
    - ⛔ **producer**: branch (a) of `stampLockInner` (`operators_lockrows.go`, the
      "non-key update + `FOR KEY SHARE`" path that currently skips) must *combine*
      a new locker with the in-progress updater into a multixact and stamp a
-     **non**-lock-only multi. **GATE: do not land the producer until the one
-     remaining consumer above (`storage/freeze.go`) is multixact-aware** — unlike
-     the lock-only case this is **not** transparent to visibility, so producer +
-     *all* visibility consumers must agree ([[pattern_sibling_paths_must_agree]]).
+     **non**-lock-only multi. All read consumers now agree, so the producer may
+     land next — unlike the lock-only case this is **not** transparent to
+     visibility, so re-run the executor/storage/mvcc/btree + full isolation
+     row-lock suite when it does ([[pattern_sibling_paths_must_agree]]). When the
+     producer lands, also thread the real `Store` through vacuum/analyze (the
+     stats scans currently pass `nil`).
 3. **4-way lock strength + savepoint/subxact members** — goopg's `lockStrength`
    collapses PG's four lock modes to two (`ShrLock`/`ExclLock`); faithful
    `tuplelock-conflict`/`tuplelock-upgrade-no-deadlock` parity needs the full

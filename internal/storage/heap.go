@@ -160,6 +160,33 @@ func IsHeapTupleXmaxMulti(infomask uint16) bool {
 	return infomask&HeapXmaxIsMulti != 0
 }
 
+// ResolveMultiUpdater, when non-nil, resolves an updater-bearing multixact xmax
+// to its updater transaction id. When a tuple's xmax has HEAP_XMAX_IS_MULTI set
+// and HEAP_XMAX_LOCK_ONLY clear, the raw xmax field holds a MultiXactId — an
+// index into the member store — not a transaction id; comparing it against an
+// xid horizon (oldestXmin / freezeBelow) or treating it as a deleter would be a
+// category error. The vacuum/freeze/prune read paths in this package must funnel
+// such an xmax through this hook before reasoning about it as an xid.
+//
+// The storage package cannot import internal/multixact (multixact imports
+// storage, so the dependency would cycle); instead the process owner wires this
+// callback from the process-shared multixact.Store at startup (cmd/goopg/main.go),
+// mirroring how mvcc.TupleVisible / executor.isConcurrentlyUpdated take the Store
+// directly. The three return values mirror Store.Members + GetUpdateXid:
+//
+//   - resolved == false: the MultiXactId was not found in the member store, or
+//     no resolver is installed. The caller cannot interpret xmax and must apply
+//     its own conservative default (never freeze/prune a tuple it cannot judge).
+//   - resolved == true, hasUpdater == false: the multi holds only lockers (no
+//     update/delete member) — the tuple is still live.
+//   - resolved == true, hasUpdater == true: `updater` is the updater member's
+//     transaction id; reason about it exactly as a plain xmax xid.
+//
+// Lock-only multis (all lockers) carry HEAP_XMAX_LOCK_ONLY (see multixact.HintBits),
+// so callers gate on IsHeapTupleXmaxMulti && !IsHeapTupleLockOnly before invoking
+// this — an all-locker multi never reaches the hook.
+var ResolveMultiUpdater func(xmax TransactionID) (updater TransactionID, hasUpdater bool, resolved bool)
+
 // MovedPartitionsOffsetNumber is the special t_ctid.ip_posid value
 // PostgreSQL stamps on a tuple whose UPDATE moved the row to a
 // different partition (the old version's CTID can't point to the new
