@@ -1161,6 +1161,44 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create RANGE partition prange_am: %v", err)
 	}
 
+	// Slice 300: a nested-arithmetic EXPRESSION partition key — the third deparse
+	// context fed by executor.defaultExprToSQL (after slice 298's index PREDICATE
+	// and slice 299's index COLUMN), reached via pg_get_partkeydef(oid). Every
+	// prior partition fixture uses a bare COLUMN key, so this is the first to
+	// exercise the expression branch. It exposed (and now pins the fix for) a real
+	// divergence: pg_get_partkeydef_worker (ruleutils.c) wraps each non-function
+	// expression key in `(%s)` (the `looks_like_function` branch), but goopg's
+	// pg_get_partkeydef emitted defaultExprToSQL(keyExpr) with NO wrap — so
+	// `PARTITION BY RANGE (((a + b) * c))` dumped as `RANGE (((a + b) * c))`, one
+	// paren short of real pg_dump 18.3's `RANGE ((((a + b) * c)))` (verified
+	// byte-identical against a live PG 18.3 instance). The fix adds the `(%s)`
+	// wrap unless the key is a *parser.FuncCall (goopg's single representation for
+	// every callable form — `abs(a)` correctly stays unwrapped as `RANGE (abs(a))`).
+	// `pexpr` carries its own table so the many `foo` asserts are untouched.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pexpr (a integer, b integer, c integer) PARTITION BY RANGE (((a + b) * c))"); err != nil {
+		t.Fatalf("create expression-key partitioned table pexpr: %v", err)
+	}
+
+	// Slice 262: a MULTI-COLUMN RANGE partition with a MINVALUE/MAXVALUE open edge
+	// on a NON-leading column. Every prior partition fixture (part/prange_am) is
+	// single-column, so the per-element bound machinery added in slices 169/261 —
+	// FormatPartitionBound's `, `-joined multi-element tuple, the parallel
+	// From/ToValueLiterals capture, and the parallel From/ToUnbounded[Max] flag
+	// tuples that route a concrete prefix column against an unbounded suffix edge —
+	// had never been exercised end to end through pg_dump. `pmc` is partitioned BY
+	// RANGE (a, b); `pmc_lo` keeps a fully-open lower bound `(MINVALUE, MINVALUE)`
+	// and a mixed upper bound `(10, MAXVALUE)` (concrete leading + open trailing),
+	// the exact shape PG requires (once an element is MINVALUE/MAXVALUE, every
+	// trailing element must match). pg_dump must re-emit the two-element tuples
+	// verbatim with bare keywords (not quoted literals) so the relpartbound restores
+	// as the same unbounded edges.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pmc (a integer, b integer, val text) PARTITION BY RANGE (a, b)"); err != nil {
+		t.Fatalf("create multi-column RANGE-partitioned table pmc: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pmc_lo PARTITION OF public.pmc FOR VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)"); err != nil {
+		t.Fatalf("create multi-column RANGE partition pmc_lo: %v", err)
+	}
+
 	// Slice 190: a DEFAULT partition (`CREATE TABLE child PARTITION OF parent
 	// DEFAULT`) must round-trip. pg_dump reads the catch-all child's bound via
 	// pg_get_expr(c.relpartbound, …), which returns the bare keyword `DEFAULT`,
@@ -1267,6 +1305,874 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create leaf partition psub_east_lo: %v", err)
 	}
 
+	// Slice 263: a WIDE multi-level partition tree — beyond slice 171's single-leaf
+	// `psub_east` chain. Two distinct fan-out shapes that slice 171 never exercised:
+	//   (a) one middle node with MULTIPLE leaves: `psub_east` gains a second leaf
+	//       `psub_east_hi` alongside `psub_east_lo`, so pg_inherits must emit TWO
+	//       child rows that both point at the same `psub_east` parent (the per-parent
+	//       inhseqno counter in catalog.go must increment independently per leaf), and
+	//       pg_dump must emit a separate ATTACH for each.
+	//   (b) a SIBLING sub-partitioned middle node: `psub_west` is a second LIST
+	//       partition of `psub` that is itself partitioned BY RANGE, with its own leaf
+	//       `psub_west_lo`. This proves a leaf resolves its IMMEDIATE parent (the leaf
+	//       under `psub_west` must ATTACH to `psub_west`, NOT to the sibling
+	//       `psub_east` nor the grandparent `psub`) when several middle nodes coexist.
+	// No production change — pg_inherits already keys parent rows by each child's own
+	// PartitionParentOID (catalog.go ~4110); this slice proves + guards the wide tree.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.psub_east_hi PARTITION OF public.psub_east FOR VALUES FROM (100) TO (200)"); err != nil {
+		t.Fatalf("create second leaf partition psub_east_hi: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.psub_west PARTITION OF public.psub FOR VALUES IN ('west') PARTITION BY RANGE (id)"); err != nil {
+		t.Fatalf("create sibling sub-partitioned partition psub_west: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.psub_west_lo PARTITION OF public.psub_west FOR VALUES FROM (0) TO (100)"); err != nil {
+		t.Fatalf("create leaf partition psub_west_lo: %v", err)
+	}
+
+	// Slice 264: a CHILD-ONLY CHECK constraint on a LIST partition leaf must
+	// round-trip through pg_dump. A partition child inherits every column from
+	// the partitioned parent, so pg_dump prints NONE of them (shouldPrintColumn
+	// is false for an inherited attribute) — the leaf's CREATE TABLE body is
+	// otherwise empty. But a named CHECK declared in the PARTITION OF
+	// column-override list (`(CONSTRAINT pchk_1_pos CHECK (a > 0))`) is LOCAL to
+	// the leaf: execCreatePartitionChild routes it through tbl.AddCheck, which
+	// records IsLocal=true / InhCount=0 (operators_ddl.go ~3178). goopg's
+	// pg_constraint VirtualRows then emits that row with conislocal='t',
+	// conrelid=leaf OID, and pg_get_constraintdef renders `CHECK ((a > 0))`
+	// (expr.go ~6727), so the real pg_dump 18.3 emits `CONSTRAINT pchk_1_pos
+	// CHECK ((a > 0))` INSIDE the leaf's column-less CREATE TABLE body, then the
+	// ATTACH. Every prior partition fixture (psub*/part/prange*/pmc/pdef/pfo/
+	// ptbs/puse) left the partition-leaf local-constraint dump path untested; this
+	// slice proves and guards it. No production change.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pchk (a integer) PARTITION BY LIST (a)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pchk: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pchk_1 PARTITION OF public.pchk (CONSTRAINT pchk_1_pos CHECK (a > 0)) FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pchk_1 with child-only CHECK: %v", err)
+	}
+
+	// Slice 265: a CHILD-ONLY column DEFAULT on a LIST partition leaf must
+	// round-trip through pg_dump. This is the column-ATTRIBUTE sibling of slice
+	// 264's table-level CHECK: where the CHECK appears as a separate constraint
+	// item, a per-column DEFAULT must be re-attached to its column INSIDE the
+	// leaf's column list. Critically, pg_dump prints the leaf's FULL inherited
+	// column list either way — shouldPrintColumn (pg_dump.c:9970) returns true
+	// for every column of a partition (`tbinfo->ispartition`), so the body is
+	// NOT column-less (slice 264's comment that a leaf "prints no columns" is
+	// inaccurate; real pg_dump 18.3 emits `a integer` for pchk_1 too). The
+	// DEFAULT declared in the PARTITION OF column-override list (`(b DEFAULT
+	// 42)`) is LOCAL to the leaf: execCreatePartitionChild records it on the
+	// leaf's catalog.Column.DefaultExpr, so goopg's pg_attrdef emits the leaf's
+	// adbin (atthasdef=true) and pg_get_expr renders `42`. Real pg_dump 18.3
+	// then emits the leaf body `a integer, b integer DEFAULT 42` followed by the
+	// LIST-bound ATTACH (verified byte-identical vs PG 18.3 and a fresh goopg
+	// server). Every prior partition fixture exercised bounds, storage/AM
+	// clauses, or a table-level CHECK, never a per-column override DEFAULT on a
+	// leaf; this slice proves and guards that pg_attrdef path. No production
+	// change — execCreatePartitionChild's column-override DEFAULT handling and
+	// the pg_attrdef/pg_get_expr leaf path already exist.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pdfl (a integer, b integer) PARTITION BY LIST (a)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pdfl: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pdfl_1 PARTITION OF public.pdfl (b DEFAULT 42) FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pdfl_1 with child-only DEFAULT: %v", err)
+	}
+
+	// Slice 266: child-only NOT NULL override on a partition leaf — the LAST
+	// per-column override form (after CHECK in slice 264 and DEFAULT in slice
+	// 265). The leaf `pnnl_1` of `pnnl (a integer, b integer)` carries `(b NOT
+	// NULL)` in its PARTITION OF column-override list. As with the DEFAULT case,
+	// shouldPrintColumn (pg_dump.c:9970) returns true for every partition column
+	// (`tbinfo->ispartition`), so the leaf body is NOT column-less: real pg_dump
+	// 18.3 emits the full body `a integer, b integer NOT NULL` followed by the
+	// LIST-bound ATTACH (verified byte-identical vs PG 18.3 this loop). The NOT
+	// NULL is LOCAL to the leaf: execCreatePartitionChild records it on the
+	// leaf's catalog.Column.NotNull, and pg_dump's per-column attribute renderer
+	// appends ` NOT NULL` inline. In PG18 a NOT NULL is also a named pg_constraint
+	// (contype='n'), but for a partition leaf pg_dump still emits the inline
+	// `NOT NULL` decoration on the column (not a separate CONSTRAINT clause), so
+	// this guards the inline-NOT-NULL leaf path. No production change —
+	// execCreatePartitionChild's column-override NOT NULL handling and the inline
+	// pg_dump column decoration already exist.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pnnl (a integer, b integer) PARTITION BY LIST (a)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pnnl: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pnnl_1 PARTITION OF public.pnnl (b NOT NULL) FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pnnl_1 with child-only NOT NULL: %v", err)
+	}
+
+	// Slice 281 (partition-leaf counterpart of the inherited NOT NULL body forms,
+	// 271/277/279/280): a NOT NULL added to a partition leaf's INHERITED column via
+	// `ALTER TABLE ADD CONSTRAINT` is routed to the INLINE column form, NOT the
+	// standalone body form the legacy-inheritance `mninh`/`idfnd` siblings produce.
+	// shouldPrintColumn (pg_dump.c:9970) returns `attislocal[j] || ispartition`, so
+	// for a partition leaf EVERY column prints inline; the standalone-body branch
+	// (`!shouldPrintColumn && notnull_islocal`, pg_dump.c:17213) is therefore NEVER
+	// reached. Instead print_notnull (pg_dump.c:17116, true because `ispartition`)
+	// renders the constraint as the inline decoration at pg_dump.c:17178-17183 —
+	// `CONSTRAINT <name> NOT NULL` when the name is non-default, bare ` NOT NULL`
+	// when it collapses. `pnna_1` adds TWO conislocal NOT NULLs on distinct inherited
+	// columns: `qb` keeps a NON-default name (`pnna_named` != auto-name
+	// `pnna_1_qb_not_null`) so its inline decoration is `qb integer CONSTRAINT
+	// pnna_named NOT NULL`, while `qc`'s name EQUALS its auto-name
+	// (`pnna_1_qc_not_null`) so it collapses to the bare `qc text NOT NULL`. This is
+	// the partition twin of slice 280 (which proved the same per-column collapse on
+	// the legacy-inheritance STANDALONE body path): here the SAME ALTER shape routes
+	// INLINE because ispartition flips shouldPrintColumn. The partition key column
+	// `qa` stays a plain `qa integer` (no NOT NULL). No production change — goopg
+	// already exposes the conislocal NOT NULL pg_constraint rows + attnotnull for the
+	// ALTER path (proven by mninh/idfnd) and reports the leaf as a partition (proven
+	// by pnnl), so real pg_dump 18.3 renders the inline form. Verified byte-identical
+	// vs PG 18.3 this loop. A regression that emitted the standalone body form for a
+	// partition leaf (ignoring ispartition in shouldPrintColumn) would print
+	// `CONSTRAINT pnna_named NOT NULL qb` after the column list; one that collapsed
+	// globally would drop the `CONSTRAINT pnna_named` prefix on qb; one that lost
+	// either AlterTableAddNotNull would drop an inline decoration.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pnna (qa integer, qb integer, qc text) PARTITION BY LIST (qa)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pnna: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pnna_1 PARTITION OF public.pnna FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pnna_1: %v", err)
+	}
+	// qb FIRST (non-default name → keeps inline CONSTRAINT prefix)...
+	if err := runSQLSimple(t, c, "ALTER TABLE public.pnna_1 ADD CONSTRAINT pnna_named NOT NULL qb"); err != nil {
+		t.Fatalf("add named NOT NULL on partition leaf inherited column pnna_1.qb: %v", err)
+	}
+	// ...then qc (default name → collapses to bare inline NOT NULL).
+	if err := runSQLSimple(t, c, "ALTER TABLE public.pnna_1 ADD CONSTRAINT pnna_1_qc_not_null NOT NULL qc"); err != nil {
+		t.Fatalf("add default-named NOT NULL on partition leaf inherited column pnna_1.qc: %v", err)
+	}
+
+	// Slice 282: a DEFAULT applied to a partition leaf's INHERITED column via
+	// `ALTER TABLE <leaf> ALTER COLUMN <inherited-col> SET DEFAULT <expr>`. This is
+	// the DEFAULT analog of slice 281 (which proved the NOT NULL ALTER path rides
+	// INLINE on a partition leaf) and the partition-INLINE twin of slice 269 (which
+	// proved the SAME ALTER shape on a LEGACY-inheritance child emits a STANDALONE
+	// `ALTER TABLE ONLY ... ALTER COLUMN ... SET DEFAULT`). The discriminator is the
+	// `attrdefs[].separate` flag (pg_dump.c:9507-9535): pg_dump marks a default
+	// `separate` (→ standalone ALTER) only on the `!shouldPrintColumn` branch; for a
+	// partition leaf shouldPrintColumn returns `attislocal[j] || ispartition`
+	// (pg_dump.c:9964) → true for EVERY column, so `separate` stays false and the
+	// DEFAULT rides INLINE on the already-printed column (`kb integer DEFAULT 7`).
+	// The standalone `ALTER TABLE ONLY public.pdfa_1 ALTER COLUMN kb SET DEFAULT 7;`
+	// form (slice 269's legacy shape) must therefore NEVER appear. The partition key
+	// column `ka` stays a plain `ka integer`. NO production change — goopg already
+	// records the ALTER-path DEFAULT on the child column (AlterTableSetDefault, added
+	// for slice 269: Column.DefaultExpr → pg_attrdef + atthasdef) and reports the leaf
+	// as a partition (proven by pnnl/pnna), so real pg_dump 18.3 renders the inline
+	// form. Verified byte-identical vs PG 18.3 this loop. A regression that ignored
+	// ispartition in shouldPrintColumn would suppress `kb` and emit the standalone
+	// ALTER; one that lost AlterTableSetDefault would drop the `DEFAULT 7` decoration.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pdfa (ka integer, kb integer) PARTITION BY LIST (ka)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pdfa: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pdfa_1 PARTITION OF public.pdfa FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pdfa_1: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.pdfa_1 ALTER COLUMN kb SET DEFAULT 7"); err != nil {
+		t.Fatalf("set DEFAULT on partition leaf inherited column pdfa_1.kb: %v", err)
+	}
+
+	// Slice 283: a STORED GENERATED column inherited onto a partition leaf. The
+	// parent pgna declares `gb` as `GENERATED ALWAYS AS (ga * 2) STORED`; the
+	// partition leaf pgna_1 INHERITS the generated column (attislocal=false). This
+	// exercises a DIFFERENT discriminator branch than slices 281/282: there the
+	// default/NOT-NULL rode inline because shouldPrintColumn forced every partition
+	// column to print; here the dominant force is attgenerated. pg_dump.c:9507
+	// sets `attrdefs[].separate = false` UNCONDITIONALLY whenever
+	// `tbinfo->attgenerated[adnum-1]` is non-empty — a generation expression can
+	// NEVER be split into a standalone `ALTER TABLE ... ALTER COLUMN ... SET
+	// DEFAULT` (that syntax cannot express a generated column). So even before
+	// ispartition enters the picture, `separate` is false and the generation clause
+	// must ride INLINE on the column. Layered on the partition leaf's ispartition=true
+	// (shouldPrintColumn true for every column, slices 281/282), the leaf body prints
+	// `gb integer GENERATED ALWAYS AS (ga * 2) STORED` inline. NO production change —
+	// goopg already round-trips STORED generated columns on standalone tables (slice
+	// 59: attgenerated='s' + a pg_attrdef row carrying the deparse) and inherits
+	// parent columns onto partition leaves (slices 281/282). Verified byte-identical
+	// vs PG 18.3. A regression that dropped the generation expression on the inherited
+	// column would print a bare `gb integer`; one that mis-set `separate` would try to
+	// emit an (illegal) standalone SET DEFAULT for a generated column.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgna (ga integer, gb integer GENERATED ALWAYS AS (ga * 2) STORED) PARTITION BY LIST (ga)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgna with generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgna_1 PARTITION OF public.pgna FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pgna_1: %v", err)
+	}
+
+	// Slice 284: the VIRTUAL counterpart of slice 283. The parent pvna declares
+	// `vb` as `GENERATED ALWAYS AS (va * 2) VIRTUAL` (attgenerated='v', slice 194);
+	// the partition leaf pvna_1 INHERITS the virtual generated column
+	// (attislocal=false). This rides the SAME separate=false-via-attgenerated branch
+	// as slice 283 — pg_dump.c:9507 sets `attrdefs[].separate = false` UNCONDITIONALLY
+	// whenever `tbinfo->attgenerated[adnum-1]` is non-empty, and ATTRIBUTE_GENERATED_VIRTUAL
+	// ('v') is non-empty exactly like ATTRIBUTE_GENERATED_STORED ('s') — but the
+	// RENDER differs: pg_dump.c:17171 emits `GENERATED ALWAYS AS (%s)` with NO trailing
+	// keyword for a virtual column (the STORED branch at 17168 is skipped). Layered on
+	// the leaf's ispartition=true (shouldPrintColumn true for every column, slices
+	// 281/282), the leaf body prints `vb integer GENERATED ALWAYS AS (va * 2)` inline,
+	// bare. NO production change — goopg already round-trips VIRTUAL generated columns on
+	// standalone tables (slice 194: attGeneratedFor reports 'v') and inherits parent
+	// columns onto partition leaves (slices 281/282/283); the two facts compose. A
+	// regression that mis-mapped attgenerated 'v'→'s' would print a spurious trailing
+	// STORED; one that dropped the generation expression would print a bare `vb integer`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pvna (va integer, vb integer GENERATED ALWAYS AS (va * 2) VIRTUAL) PARTITION BY LIST (va)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pvna with virtual generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pvna_1 PARTITION OF public.pvna FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pvna_1: %v", err)
+	}
+
+	// Slice 285: a MULTI-ATTRIBUTE generation expression inherited onto a partition
+	// leaf. Slices 283/284 proved a generated column whose expression references a
+	// SINGLE other column (`ga * 2`); this slice proves the generation deparse
+	// resolves TWO distinct inherited column references through the leaf. The parent
+	// pgmc declares `gb` as `GENERATED ALWAYS AS (ga + gc) STORED` over two plain
+	// columns `ga`, `gc`; the partition leaf pgmc_1 INHERITS all three (attislocal=false).
+	// The render path is identical to slice 283 — attgenerated forces
+	// attrdefs[].separate=false unconditionally (pg_dump.c:9507), ispartition forces
+	// shouldPrintColumn true for every column (slices 281/282), so the leaf body prints
+	// `gb integer GENERATED ALWAYS AS (ga + gc) STORED` inline — but the NEW fact under
+	// test is the deparse of a binary expression over two Vars: each Var must resolve to
+	// the correct inherited column NAME on the leaf (not an attnum-shifted or dropped
+	// reference). A regression in the multi-Var generation deparse (e.g. one that resolved
+	// only the first Var, or that swapped ga↔gc by attnum) would surface as a corrupted
+	// generation clause here. NO production change — goopg already deparses multi-column
+	// expressions for generated columns (slice 59 attgenerated='s' + pg_attrdef deparse)
+	// and inherits parent columns onto partition leaves (slices 281–284); the two compose.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgmc (ga integer, gc integer, gb integer GENERATED ALWAYS AS (ga + gc) STORED) PARTITION BY LIST (ga)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgmc with multi-attr generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgmc_1 PARTITION OF public.pgmc FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pgmc_1: %v", err)
+	}
+
+	// Slice 286: a FORWARD-REFERENCE generation expression inherited onto a partition
+	// leaf. Slice 285 proved a multi-attr generation expression where every referenced
+	// column was declared BEFORE the generated column (ga=attnum1, gc=attnum2 →
+	// gb=attnum3). This slice flips the declaration order: the generated column `gz` is
+	// attnum 1 and references `ya` (attnum 2) and `yc` (attnum 3), both declared AFTER
+	// it. The new fact under test is that the generation deparse resolves each Var by
+	// column NAME (not by a positional/forward-only scan that would only see columns up
+	// to the generated column's own attnum). PG places all table columns in scope for a
+	// generation expression regardless of declaration order, so `(ya + yc)` is legal even
+	// though both operands come later in the body. The render path is identical to slices
+	// 283/285 — attgenerated forces attrdefs[].separate=false unconditionally
+	// (pg_dump.c:9507), ispartition forces shouldPrintColumn true for every column (slices
+	// 281/282) — so the leaf body prints columns in attnum order: the inline
+	// `gz integer GENERATED ALWAYS AS (ya + yc) STORED` FIRST, then `ya integer`,
+	// `yc integer`. A regression that resolved Vars positionally relative to the generated
+	// column's attnum (a forward-only scan) would drop or corrupt the `(ya + yc)` clause
+	// here, where neither operand precedes `gz`. NO production change — goopg resolves
+	// generation-expression columns by name (evalGeneratedExpr over catalog.Column) and
+	// inherits parent columns onto partition leaves (slices 281–285); the two compose.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgfr (gz integer GENERATED ALWAYS AS (ya + yc) STORED, ya integer, yc integer) PARTITION BY LIST (ya)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgfr with forward-reference generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgfr_1 PARTITION OF public.pgfr FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pgfr_1: %v", err)
+	}
+
+	// Slice 287: a generated column placed in the MIDDLE (attnum 2) whose single
+	// expression resolves a BACKWARD Var (`ma`, attnum 1), a literal Const (`1`),
+	// and a FORWARD Var (`mc`, attnum 3) — all in one deparse. Slice 285 referenced
+	// only columns before the generated column; slice 286 referenced only columns
+	// after it. This slice exercises BOTH directions plus a literal simultaneously:
+	// `mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED` sits between `ma` and
+	// `mc`. The partition leaf pgmx_1 INHERITS all three (attislocal=false), and the
+	// same render path holds — attgenerated forces attrdefs[].separate=false
+	// (pg_dump.c:9507), ispartition forces shouldPrintColumn true for every column
+	// (slices 281/282) — so the leaf body prints in attnum order: `ma integer`,
+	// then the inline generated `mg`, then `mc integer`. NO production change —
+	// goopg stores the generation expression as verbatim source text and renders it
+	// back through pg_get_expr (slices 283–286); pg_dump wraps it `(%s)`, so the
+	// three-operand `ma + 1 + mc` prints flat with no nested parens. A regression
+	// that resolved Vars by a forward-only positional scan would lose `ma` (declared
+	// before `mg`); a backward-only scan would lose `mc` (declared after `mg`). Only
+	// NAME-based resolution renders both operands of this mid-position column.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgmx (ma integer, mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED, mc integer) PARTITION BY LIST (ma)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgmx with mid-position mixed-direction generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgmx_1 PARTITION OF public.pgmx FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pgmx_1: %v", err)
+	}
+
+	// Slice 288: a generated column of TEXT type whose expression uses the string
+	// concatenation operator `||` instead of integer arithmetic. Every prior
+	// generation slice (283–287) used an integer column over `+`/`*` operators;
+	// this one proves the inherited-leaf generation render path is BOTH type-
+	// agnostic (the column is `text`, not `integer`) AND operator-agnostic (`||`,
+	// not `+`). The render path keys only off attgenerated ('s') and the verbatim
+	// pg_get_expr text — attGeneratedFor (pg18_user_catalog_rows.go:834) inspects
+	// no type, and goopg's pg_get_expr is a pass-through of the stored expression
+	// source, so `cc text GENERATED ALWAYS AS (ca || cb) STORED` round-trips by the
+	// SAME mechanism as the integer slices. The `||` token joins flat (no parens,
+	// no function call), so the deparse stays faithful: pg_dump wraps it `(%s)` →
+	// `(ca || cb)`. The partition leaf pgcc_1 INHERITS all three columns
+	// (attislocal=false); attgenerated forces attrdefs[].separate=false
+	// (pg_dump.c:9507) and ispartition forces shouldPrintColumn true for every
+	// column (slices 281/282), so the leaf body prints in attnum order: `ca text`,
+	// `cb text`, then the inline generated `cc`. A regression that special-cased
+	// integer generated columns, or one that lost a non-arithmetic operator in the
+	// deparse, would drop or corrupt `cc` here.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgcc (ca text, cb text, cc text GENERATED ALWAYS AS (ca || cb) STORED) PARTITION BY LIST (ca)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgcc with text concatenation generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgcc_1 PARTITION OF public.pgcc FOR VALUES IN ('x')"); err != nil {
+		t.Fatalf("create partition leaf pgcc_1: %v", err)
+	}
+
+	// Slice 289: a generation expression with PRECEDENCE-GROUPING PARENS
+	// (`(fa + fb) * 2`) inherited onto a partition leaf. Every prior generation
+	// slice (283–288) used a FLAT operator chain (`ga * 2`, `ga + gc`, `ca || cb`)
+	// whose captured tokens space-join faithfully. A parenthesised expression
+	// exposed a deparse defect: goopg captured the GENERATED expression as raw
+	// tokens and joined them with single spaces, so `(fa + fb) * 2` became
+	// `( fa + fb ) * 2` — and pg_dump wrapped that to `(( fa + fb ) * 2)`, which
+	// diverges from real pg_dump's `((fa + fb) * 2)` (pg_get_expr renders the
+	// precedence paren tightly). This slice carries the PRODUCTION fix:
+	// joinGeneratedExprTokens (parser/ddl.go) reconstructs pg_get_expr's spacing —
+	// tight grouping parens and tight function calls, spaced binary operators — so
+	// the stored generation source now matches pg_get_expr verbatim. The render
+	// path is otherwise identical to slices 283–288: attgenerated ('s') forces
+	// attrdefs[].separate=false (pg_dump.c:9507) and ispartition forces
+	// shouldPrintColumn for every column (slices 281/282), so the leaf pgpp_1
+	// inherits all three columns and prints `fa integer`, `fb integer`, then the
+	// inline `fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED`. Before the
+	// fix this slice failed against the real-pg_dump oracle with the spurious
+	// inner spaces.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgpp (fa integer, fb integer, fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED) PARTITION BY LIST (fa)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgpp with parenthesised generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgpp_1 PARTITION OF public.pgpp FOR VALUES IN (1)"); err != nil {
+		t.Fatalf("create partition leaf pgpp_1: %v", err)
+	}
+
+	// Slice 290: a generation expression that is a FUNCTION CALL (`upper(fn)`)
+	// inherited onto a partition leaf. Every prior generation slice (283–289) used
+	// only operators — flat arithmetic (`ga * 2`, `ga + gc`), string concat
+	// (`ca || cb`), or precedence-grouped arithmetic (`(fa + fb) * 2`). This is the
+	// FIRST slice whose generation body is a function invocation, exercising the
+	// joinGeneratedExprTokens call-paren branch end-to-end: the helper renders the
+	// call parens TIGHT (`upper(fn)`, not `upper ( fn )`) so the stored source
+	// matches pg_get_expr. The render path is otherwise identical to slices 283–289
+	// — attgenerated ('s') forces attrdefs[].separate=false (pg_dump.c:9507) and
+	// ispartition forces shouldPrintColumn for every column (slices 281/282), so the
+	// leaf pgfx_1 inherits both columns and prints `fn text`, then the inline
+	// generated `fu text GENERATED ALWAYS AS (upper(fn)) STORED`. No rows are
+	// inserted, so this rides the dump-time deparse path only (materialization of
+	// upper() is not exercised here).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgfx (fn text, fu text GENERATED ALWAYS AS (upper(fn)) STORED) PARTITION BY LIST (fn)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgfx with function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgfx_1 PARTITION OF public.pgfx FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pgfx_1: %v", err)
+	}
+
+	// Slice 291: a generation expression that is a TWO-ARGUMENT function call
+	// (`coalesce(cn, dn)`) inherited onto a partition leaf. Slice 290 proved the
+	// single-argument call-paren branch of joinGeneratedExprTokens end-to-end
+	// (`upper(fn)`); this slice pins the `, `-separated ARGUMENT-LIST branch on the
+	// oracle: the helper must render the comma TIGHT to its left operand and SPACED
+	// to its right (`coalesce(cn, dn)`, not `coalesce(cn ,dn)` or `coalesce(cn,dn)`)
+	// so the stored source byte-matches what pg_get_expr returns. goopg's source is
+	// what real pg_dump reads back (this test dumps a live goopg server), so the
+	// lowercase `coalesce` is preserved verbatim — there is no real-PG pg_get_expr
+	// case normalization in this path. The render path is otherwise identical to
+	// slices 281–290: attgenerated ('s') forces attrdefs[].separate=false
+	// (pg_dump.c:9507) and ispartition forces shouldPrintColumn for every column, so
+	// the leaf pgcl_1 inherits both columns and prints `cn text`, `dn text`, then the
+	// inline generated `en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED`. No
+	// rows are inserted, so this rides the dump-time deparse path only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgcl (cn text, dn text, en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED) PARTITION BY LIST (cn)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgcl with two-arg function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgcl_1 PARTITION OF public.pgcl FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pgcl_1: %v", err)
+	}
+
+	// Slice 292: a NESTED function-call generation expression
+	// (`upper(coalesce(gn, hn))`) inherited onto a partition leaf. Slices 290/291
+	// pinned the single- and two-argument call-paren branches of
+	// joinGeneratedExprTokens at one nesting level; this slice pins their
+	// COMPOSITION — a call whose argument is itself a call — proving the helper
+	// keeps BOTH call parens tight while spacing the inner argument comma:
+	// `upper(coalesce(gn, hn))`, not `upper ( coalesce ( gn ,hn ) )` or any
+	// intermediate. The token walk relies on the `(`-after-ident rule firing twice
+	// (once for `upper(`, once for the inner `coalesce(`) and the `)`-is-always-tight
+	// rule firing twice at the tail, so a regression that special-cased only a
+	// single paren depth would corrupt the inner or outer call. goopg's stored
+	// source is what real pg_dump reads back (this test dumps a live goopg server),
+	// so both lowercase function names are preserved verbatim — no real-PG
+	// pg_get_expr case normalization in this path. The render path is otherwise
+	// identical to slices 281–291: attgenerated ('s') forces attrdefs[].separate=false
+	// (pg_dump.c:9507) and ispartition forces shouldPrintColumn for every column, so
+	// the leaf pgnc_1 inherits both columns and prints `gn text`, `hn text`, then the
+	// inline generated `jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED`.
+	// No rows are inserted, so this rides the dump-time deparse path only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgnc (gn text, hn text, jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED) PARTITION BY LIST (gn)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgnc with nested function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgnc_1 PARTITION OF public.pgnc FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pgnc_1: %v", err)
+	}
+
+	// Slice 293: a THREE-argument function-call generation expression
+	// (`concat(ka, la, ma)`) inherited onto a partition leaf. Slice 291 pinned
+	// the two-argument call-paren branch of joinGeneratedExprTokens (one comma in
+	// the argument list); this slice extends that to a REPEATED-comma argument
+	// list — `concat(ka, la, ma)` exercises the comma-spacing rule firing twice
+	// inside a single call, proving the helper emits `, ` between every adjacent
+	// argument pair (`concat(ka, la, ma)`, not `concat(ka, la,ma)` or
+	// `concat(ka ,la ,ma)`) while keeping the single call paren tight. The
+	// argument count is the only thing that varies from slice 291, so a
+	// regression that hard-coded the two-token argument list would corrupt the
+	// third argument's separator. goopg's stored source is what real pg_dump
+	// reads back (this test dumps a live goopg server), so the lowercase function
+	// name is preserved verbatim — no real-PG pg_get_expr case normalization in
+	// this path. The render path is otherwise identical to slices 281–292:
+	// attgenerated ('s') forces attrdefs[].separate=false (pg_dump.c:9507) and
+	// ispartition forces shouldPrintColumn for every column, so the leaf pg3c_1
+	// inherits all three plain columns and prints `ka text`, `la text`, `ma text`,
+	// then the inline generated `na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED`.
+	// No rows are inserted, so this rides the dump-time deparse path only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pg3c (ka text, la text, ma text, na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED) PARTITION BY LIST (ka)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pg3c with three-arg function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pg3c_1 PARTITION OF public.pg3c FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pg3c_1: %v", err)
+	}
+
+	// Slice 294 (PRODUCTION fix): a function-call generation expression with a
+	// STRING-LITERAL argument (`concat(ka, '-', la)`) inherited onto a partition
+	// leaf. Slices 291–293 pinned the call-paren / comma-spacing branches of
+	// joinGeneratedExprTokens for IDENTIFIER arguments only. A string-literal
+	// argument exposed a latent bug: the lexer stores a literal's UNQUOTED body
+	// (`'-'` → Token.Value "-"), and the helper space-joined token values raw, so
+	// `concat(ka, '-', la)` would have round-tripped as the MALFORMED
+	// `concat(ka, -, la)` (the quotes dropped, the literal indistinguishable from
+	// a minus operator). The fix re-quotes TokenStringLit tokens (doubling any
+	// embedded single quote) and gates the punctuation spacing rules on
+	// TokenSymbol so a literal body of ")"/","/"("/"." can't be mistaken for a
+	// punctuator. Because this test dumps a LIVE goopg server, real pg_dump reads
+	// goopg's stored generation source verbatim — so the assertion pins goopg's
+	// own canonical rendering `concat(ka, '-', la)` (goopg does not add the
+	// `::text` cast that real PG's pg_get_expr would inject; that divergence is
+	// out of scope, like the lowercase-function-name divergence of slices 290–293).
+	// Render path is otherwise identical to slices 281–293: attgenerated ('s')
+	// forces attrdefs[].separate=false (pg_dump.c:9507) and ispartition forces
+	// shouldPrintColumn for every column, so the leaf pglc_1 inherits both plain
+	// columns and prints `ka text`, `la text`, then the inline generated
+	// `na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED`. No rows are
+	// inserted, so this rides the dump-time deparse path only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pglc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED) PARTITION BY LIST (ka)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pglc with string-literal-argument function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pglc_1 PARTITION OF public.pglc FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pglc_1: %v", err)
+	}
+
+	// Slice 295: a function-call generation expression whose string-literal
+	// argument's BODY IS A COMMA (`concat(ka, ',', la)`) inherited onto a
+	// partition leaf — the adversarial complement to slice 294. Here the literal
+	// `','` directly COLLIDES with the argument-separator comma. Slice 294's fix
+	// gates the punctuation spacing rules on TokenSymbol; this fixture exercises
+	// that gating on the ORACLE path. The pre-slice-294 Value-based switch would
+	// have matched the literal token's `,` value against the separator `,` case
+	// (noSpace) AND dropped its quotes, collapsing the three commas into the
+	// malformed `concat(ka,,,la)`. With the fix, the TokenStringLit literal is
+	// skipped by the symbol-only switch and re-quoted, so it renders distinctly
+	// as `concat(ka, ',', la)`. Because this test dumps a LIVE goopg server, real
+	// pg_dump reads goopg's stored source verbatim, pinning goopg's own canonical
+	// rendering (no `::text` cast — that pg_get_expr divergence is out of scope,
+	// like slices 290–294). Render path is otherwise identical to slice 294:
+	// attgenerated ('s') forces attrdefs[].separate=false (pg_dump.c:9507) and
+	// ispartition forces shouldPrintColumn for every column, so the leaf pgkc_1
+	// inherits both plain columns and prints `ka text`, `la text`, then the
+	// inline generated `na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED`.
+	// No rows are inserted, so this rides the dump-time deparse path only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgkc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED) PARTITION BY LIST (ka)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgkc with comma-literal-argument function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgkc_1 PARTITION OF public.pgkc FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pgkc_1: %v", err)
+	}
+
+	// Slice 296: a function-call generation expression whose string-literal
+	// argument's BODY IS A SINGLE QUOTE (`concat(ka, '''', la)`) inherited onto a
+	// partition leaf — the adversarial complement to slices 294 (body `-`) and 295
+	// (body `,`). This is the only fixture that exercises slice 294's quote-DOUBLING
+	// (`strings.ReplaceAll(t.Value, "'", "''")` in joinGeneratedExprTokens.renderTok)
+	// on the ORACLE path. The lexer stores a literal's UNQUOTED, un-escaped body, so
+	// the SQL literal `''''` (four quotes = a literal containing one `'`) is stored
+	// as the single byte `'`. The pre-slice-294 helper space-joined that raw byte
+	// into the malformed `concat(ka, ', la)` (the lone `'` opening a phantom string
+	// that swallows the rest of the expression); a fix that re-quoted but FORGOT to
+	// double the embedded quote would emit `concat(ka, ''', la)` (three quotes —
+	// unbalanced). The fix re-quotes AND doubles, so the literal renders as the
+	// balanced four-quote `''''`. Because this test dumps a LIVE goopg server, real
+	// pg_dump reads goopg's stored source verbatim, pinning goopg's own canonical
+	// rendering (no `::text` cast — that pg_get_expr divergence is out of scope, like
+	// slices 290–295). Render path is otherwise identical to slice 295: attgenerated
+	// ('s') forces attrdefs[].separate=false (pg_dump.c:9507) and ispartition forces
+	// shouldPrintColumn for every column, so the leaf pgqc_1 inherits both plain
+	// columns and prints `ka text`, `la text`, then the inline generated
+	// `na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED`. No rows are
+	// inserted, so this rides the dump-time deparse path only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgqc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED) PARTITION BY LIST (ka)"); err != nil {
+		t.Fatalf("create LIST-partitioned table pgqc with embedded-quote-literal-argument function-call generated column: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pgqc_1 PARTITION OF public.pgqc FOR VALUES IN ('a')"); err != nil {
+		t.Fatalf("create partition leaf pgqc_1: %v", err)
+	}
+
+	// Slice 267: a LOCAL CHECK constraint on a LEGACY (non-partition) INHERITS
+	// child must round-trip. Slices 264–266 covered the per-child override forms
+	// on a PARTITION leaf, where `tbinfo->ispartition` forces shouldPrintColumn
+	// (pg_dump.c:9970) to print EVERY column. A legacy INHERITS child is the
+	// opposite regime: ispartition is false, so shouldPrintColumn gates on
+	// attislocal ALONE — the inherited columns (`pid`, `pname`, attislocal=false)
+	// are OMITTED while the child's own local column (`extra`, attislocal=true)
+	// prints. Layered on top, a CHECK declared in the child's CREATE TABLE
+	// (`CONSTRAINT ichk_child_pos CHECK (extra > 0)`) is conislocal='t': pg_dump
+	// emits it INSIDE the child's body alongside the local column, then the
+	// `INHERITS (public.ichk_parent)` clause (NOT an ATTACH — legacy inheritance,
+	// not a partition). Slice 170 proved column-omission + the INHERITS clause for
+	// a plain child; slice 264 proved a conislocal CHECK on a partition leaf; this
+	// slice proves their INTERSECTION — a conislocal CHECK on a column-omitting
+	// legacy child — which neither prior fixture exercised. Real pg_dump 18.3 emits
+	// the body `extra integer, CONSTRAINT ichk_child_pos CHECK ((extra > 0))`
+	// followed by `INHERITS (public.ichk_parent)` (verified byte-identical this
+	// loop). No production change — the conislocal CHECK path (operators_ddl.go
+	// AddCheck → pg_constraint VirtualRows) and the legacy-inheritance column
+	// omission (Table.InheritsParentOIDs + Column.Inherited) already exist.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ichk_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create legacy inheritance parent ichk_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ichk_child (extra integer, CONSTRAINT ichk_child_pos CHECK (extra > 0)) INHERITS (public.ichk_parent)"); err != nil {
+		t.Fatalf("create legacy inheritance child ichk_child with local CHECK: %v", err)
+	}
+
+	// Slice 268: a LOCAL column DEFAULT on a LEGACY (non-partition) INHERITS child
+	// must round-trip. This is the pg_attrdef sibling of slice 267's table-level
+	// CHECK: instead of a conislocal CHECK, the child's own local column carries an
+	// attrdef (`extra integer DEFAULT 42`). The same column-omission regime applies
+	// — `idfl_child`'s inherited `pid`/`pname` (attislocal=false) are dropped while
+	// its local `extra` (attislocal=true) prints — but the new wrinkle is that the
+	// DEFAULT must ride INLINE on that local column. Slice 265 proved a child-only
+	// DEFAULT on a PARTITION leaf (ispartition forces every column to print, so the
+	// DEFAULT rode an already-printed column); this slice proves the DEFAULT still
+	// rides correctly when the column is printed BECAUSE OF attislocal, not despite
+	// it — the legacy-inheritance code path that slices 170/267 exercise. Real
+	// pg_dump 18.3 emits the body `extra integer DEFAULT 42` followed by
+	// `INHERITS (public.idfl_parent)` (verified byte-identical this loop). No
+	// production change — the local-column attrdef path (operators_ddl.go column
+	// DEFAULT → pg_attrdef) and the legacy-inheritance column omission
+	// (Table.InheritsParentOIDs + Column.Inherited) already exist.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfl_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create legacy inheritance parent idfl_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfl_child (extra integer DEFAULT 42) INHERITS (public.idfl_parent)"); err != nil {
+		t.Fatalf("create legacy inheritance child idfl_child with local DEFAULT: %v", err)
+	}
+
+	// Slice 269: a child-level DEFAULT applied to an INHERITED column via
+	// `ALTER TABLE child ALTER COLUMN <inherited-col> SET DEFAULT <expr>`.
+	// Slices 265/268 rode the DEFAULT INLINE on a column that pg_dump prints;
+	// this slice exercises the OPPOSITE — a DEFAULT on an inherited column that
+	// pg_dump SUPPRESSES from the child's column list (attislocal=false). Because
+	// the column is not printed, pg_dump cannot ride the DEFAULT inline; instead
+	// pg_dump.c marks `attrdefs[].separate` (the `!shouldPrintColumn` branch,
+	// pg_dump.c:9527) and emits it as a STANDALONE
+	// `ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;`
+	// (dumpAttrDef, pg_dump.c:18028). This required NEW production support:
+	// `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT` was previously swallowed as
+	// a no-op by the parser. The new AlterTableSetDefault action records the
+	// parsed expr on the child's catalog column (Column.DefaultExpr), which feeds
+	// both pg_attrdef (catalog attrDefRowsLocked) and the pg_attribute heap
+	// atthasdef flag (flushed via the same delete-old-rows + syncTableToCatalogHeap
+	// path SET STORAGE/COMPRESSION use). idfa_child keeps a purely-local column
+	// (`extra`) so its CREATE TABLE body is non-empty and the inherited
+	// `pid`/`pname` are still omitted (arriving via INHERITS).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfa_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create legacy inheritance parent idfa_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfa_child (extra integer) INHERITS (public.idfa_parent)"); err != nil {
+		t.Fatalf("create legacy inheritance child idfa_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.idfa_child ALTER COLUMN pid SET DEFAULT 7"); err != nil {
+		t.Fatalf("set DEFAULT on inherited column idfa_child.pid: %v", err)
+	}
+
+	// Slice 270: child-level `SET NOT NULL` on an INHERITED column of a legacy
+	// INHERITS child. This is the NOT NULL twin of slice 269's DEFAULT case, but
+	// pg_dump takes a DIFFERENT catalog path: PG18 records NOT NULL as a
+	// pg_constraint row (contype='n'), and pg_dump's getTableAttrs LEFT-JOINs
+	// pg_constraint to populate notnull_constrs/notnull_islocal. Because the
+	// inherited column is suppressed from the child's column list
+	// (!shouldPrintColumn) yet carries a LOCAL NOT NULL constraint
+	// (conislocal='t'), pg_dump emits it as a STANDALONE `NOT NULL <col>`
+	// constraint item INSIDE the CREATE TABLE body (pg_dump.c:17213-17232) —
+	// NOT as a separate ALTER (the way DEFAULT is dumped). The auto-name matches
+	// PG's `<table>_<col>_not_null`, so notnull_constrs is the unnamed "" form.
+	// This required NEW production support: `ALTER TABLE ... ALTER COLUMN ...
+	// SET NOT NULL` was previously swallowed as a no-op by the parser. The new
+	// AlterTableSetNotNull action sets Column.NotNull AND records a contype='n'
+	// constraint (catalog.Table.AddNotNull, conislocal=true, coninhcount=0),
+	// flushing pg_attribute.attnotnull via the same delete-old-rows +
+	// syncTableToCatalogHeap path. idfn_child keeps a purely-local column
+	// (`extra`) so its body is non-empty; inherited `pid`/`pname` arrive via
+	// INHERITS, with `NOT NULL pid` emitted in the body in attnum order.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfn_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create legacy inheritance parent idfn_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfn_child (extra integer) INHERITS (public.idfn_parent)"); err != nil {
+		t.Fatalf("create legacy inheritance child idfn_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.idfn_child ALTER COLUMN pid SET NOT NULL"); err != nil {
+		t.Fatalf("set NOT NULL on inherited column idfn_child.pid: %v", err)
+	}
+
+	// Slice 271: a *named* NOT NULL on an inherited column via PG18's
+	// `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>`. This is the named
+	// counterpart of slice 270's unnamed `""` path. pg_dump reads the
+	// constraint's conname (notnull_name) and compares it against the computed
+	// default `<table>_<col>_not_null`; because `idfnn_nn` differs, notnull_constrs
+	// carries the real name and pg_dump prints `CONSTRAINT idfnn_nn NOT NULL pid`
+	// — the named body form (pg_dump.c:17228) — rather than the unnamed
+	// `NOT NULL pid`. New production support: the ADD CONSTRAINT NOT NULL parser
+	// branch (previously the column-level `NOT NULL` was only parsed inline) plus
+	// the AlterTableAddNotNull executor action, which records a contype='n'
+	// constraint with the EXPLICIT name (conislocal=true, coninhcount=0) and
+	// flushes pg_attribute.attnotnull via the same delete-old-rows +
+	// syncTableToCatalogHeap path as SET NOT NULL. idfnn_child keeps a local
+	// `extra` column so its body is non-empty; the inherited `pid`/`pname` arrive
+	// via INHERITS, with `CONSTRAINT idfnn_nn NOT NULL pid` emitted in the body.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfnn_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create legacy inheritance parent idfnn_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfnn_child (extra integer) INHERITS (public.idfnn_parent)"); err != nil {
+		t.Fatalf("create legacy inheritance child idfnn_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.idfnn_child ADD CONSTRAINT idfnn_nn NOT NULL pid"); err != nil {
+		t.Fatalf("add named NOT NULL on inherited column idfnn_child.pid: %v", err)
+	}
+
+	// Slice 272: a `NO INHERIT` NOT NULL on a STANDALONE (non-inherited) table,
+	// dumped INLINE as `<col> <type> NOT NULL NO INHERIT`. Slices 270/271 covered
+	// NOT NULL on *inherited* columns (standalone body items); this exercises the
+	// `connoinherit='t'` rendering on a plain local column. PG18 records the NOT
+	// NULL as a contype='n' pg_constraint row with connoinherit='t'; pg_dump reads
+	// it as notnull_noinh[j] and appends ` NO INHERIT` after the inline `NOT NULL`
+	// (pg_dump.c:17188). Because the column is local (notnull_islocal='t') and the
+	// constraint name equals the computed default `nninh_c_not_null`, pg_dump emits
+	// the UNNAMED inline form `c integer NOT NULL NO INHERIT` (no CONSTRAINT prefix).
+	// The whole production path already existed — the inline parser consumes the
+	// `NO INHERIT` trailer into ColumnDef.NotNullNoInherit (ddl.go), the CREATE
+	// TABLE executor threads it through `AddNotNull(..., noInherit, isLocal=true)`
+	// (operators_ddl.go), and the pg_constraint virtual builder renders
+	// connoinherit from NamedNotNullConstraint.NoInherit (catalog.go) — but no dump
+	// path had asserted it. Verified byte-for-byte against real pg_dump 18.3:
+	// `c integer NOT NULL NO INHERIT,\n    d integer`. A regression that dropped the
+	// NoInherit thread would emit a plain `c integer NOT NULL` (connoinherit='f').
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh (c integer NOT NULL NO INHERIT, d integer)"); err != nil {
+		t.Fatalf("create standalone table nninh with NOT NULL NO INHERIT column: %v", err)
+	}
+
+	// Slice 273: a NAMED inline NOT NULL whose name differs from PG's auto-name,
+	// dumped INLINE as `<col> <type> CONSTRAINT <name> NOT NULL [NO INHERIT]`.
+	// Slice 272 covered the UNNAMED inline form (name == default → bare `NOT
+	// NULL`); here the explicit `CONSTRAINT c_nn` name (≠ `nninh2_c_not_null`)
+	// forces pg_dump to re-emit the `CONSTRAINT <name>` prefix (pg_dump.c:17184),
+	// followed by ` NO INHERIT` (connoinherit='t'). Before this slice goopg's
+	// inline-CONSTRAINT parser arm had no NOT NULL case, so `CONSTRAINT c_nn NOT
+	// NULL` was silently dropped (column dumped as a plain `c integer`). The fix
+	// captures the name into ColumnDef.NotNullConstraintName (ddl.go) and the
+	// executor threads it onto AddNotNull (operators_ddl.go) so the pg_constraint
+	// virtual row carries the user-given conname; pg_dump's getTableAttrs query
+	// then reports a non-default notnull name. Second column `e` carries a named
+	// NOT NULL WITHOUT NO INHERIT (`CONSTRAINT e_nn`) to assert the suffix is not
+	// spuriously added. Verified against real pg_dump 18.3:
+	// `c integer CONSTRAINT c_nn NOT NULL NO INHERIT,\n    e integer CONSTRAINT e_nn NOT NULL`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh2 (c integer CONSTRAINT c_nn NOT NULL NO INHERIT, e integer CONSTRAINT e_nn NOT NULL)"); err != nil {
+		t.Fatalf("create standalone table nninh2 with named NOT NULL columns: %v", err)
+	}
+
+	// Slice 274: a NAMED inline NOT NULL whose name EQUALS PG's computed default
+	// `<table>_<col>_not_null` must COLLAPSE back to the bare `NOT NULL` form —
+	// pg_dump only emits the `CONSTRAINT <name>` prefix when the conname differs
+	// from the default (pg_dump.c:17184 ChooseConstraintName match). Slice 273
+	// covered the DIFFERING-name case (prefix re-emitted); this is the boundary
+	// twin: the user spells out the exact auto-name `nninh3_c_not_null`, so even
+	// though goopg records it as an EXPLICIT name on AddNotNull, pg_dump's
+	// default-name comparison finds them equal and drops the prefix. A regression
+	// that unconditionally emitted the `CONSTRAINT` prefix whenever an explicit
+	// name was given (instead of letting pg_dump's default match decide) would
+	// leak `CONSTRAINT nninh3_c_not_null` into the dump. Verified against real
+	// pg_dump 18.3: `c integer NOT NULL` (bare, no CONSTRAINT prefix).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh3 (c integer CONSTRAINT nninh3_c_not_null NOT NULL, d integer)"); err != nil {
+		t.Fatalf("create standalone table nninh3 with default-named NOT NULL column: %v", err)
+	}
+
+	// Slice 275: a NAMED `NO INHERIT` NOT NULL added to a LOCAL column via
+	// `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT`, dumped
+	// INLINE as `<col> <type> CONSTRAINT <name> NOT NULL NO INHERIT`. This is the
+	// ALTER-path counterpart of slice 273/274's CREATE-TABLE-inline cases: nninh2
+	// proved the inline form when the constraint is spelled at table-creation
+	// time; here the SAME inline rendering must result when the named NO INHERIT
+	// constraint arrives AFTER the fact through the AlterTableAddNotNull executor.
+	// It combines slice 271's ADD CONSTRAINT NOT NULL parser/executor branch with
+	// slice 272's NO INHERIT thread on a STANDALONE (non-inherited) table: the
+	// parser captures the `NO INHERIT` trailer into AlterTableAction.NoInherit
+	// (ddl.go:5483) and the executor records a contype='n' pg_constraint row with
+	// connoinherit='t' via tbl.AddNotNull(name, col, oid, act.NoInherit=true,
+	// isLocal=true, 0) (operators_ddl.go:5498), then flushes attnotnull through
+	// the delete-old-rows + syncTableToCatalogHeap path. Because the column is
+	// LOCAL (notnull_islocal='t') and the name `nn4` differs from the auto-name
+	// `nninh4_c_not_null`, pg_dump re-emits the `CONSTRAINT nn4` prefix and the
+	// ` NO INHERIT` suffix on the INLINE column (pg_dump.c:17184/17188), exactly
+	// like nninh2's `c`. A regression that dropped act.NoInherit on the ALTER path
+	// (while the CREATE-inline path kept it) would dump a plain
+	// `c integer CONSTRAINT nn4 NOT NULL` here — the silent-twin failure mode the
+	// "sibling paths must agree" rule guards against. Verified to match real
+	// pg_dump 18.3's rendering of pg_constraint (which is creation-method-agnostic;
+	// nninh2 anchors the byte form).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh4 (c integer, d integer)"); err != nil {
+		t.Fatalf("create standalone table nninh4: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nninh4 ADD CONSTRAINT nn4 NOT NULL c NO INHERIT"); err != nil {
+		t.Fatalf("add named NO INHERIT NOT NULL on local column nninh4.c: %v", err)
+	}
+
+	// Slice 276 (negative twin of slice 275): a NAMED NOT NULL added to a LOCAL
+	// column via `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col>` — WITHOUT
+	// the `NO INHERIT` trailer — must dump INLINE as `<col> <type> CONSTRAINT
+	// <name> NOT NULL` and must NOT grow a spurious ` NO INHERIT` suffix. Slice
+	// 275 proved the ALTER path THREADS act.NoInherit when present; this twin
+	// proves it does not FABRICATE it when absent. The parser leaves
+	// AlterTableAction.NoInherit=false (no `NO INHERIT` trailer at ddl.go:5483),
+	// the executor records a contype='n' row with connoinherit='f' via
+	// tbl.AddNotNull(name, col, oid, false, isLocal=true, 0) (operators_ddl.go:5498),
+	// and pg_dump (pg_dump.c:17184/17188) emits the `CONSTRAINT nn5` prefix
+	// (LOCAL + name `nn5` ≠ auto-name `nninh5_c_not_null`) but NO suffix. A
+	// regression that defaulted connoinherit to 't' on the ALTER path, or that
+	// echoed a stray NO INHERIT, would emit `c integer CONSTRAINT nn5 NOT NULL NO
+	// INHERIT` — the exact byte form slice 275 wants but which is WRONG here. This
+	// is the inline-rendered ALTER-path counterpart of slice 273's `nninh2.e`
+	// (`e integer CONSTRAINT e_nn NOT NULL`), which arrived at table-creation time.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh5 (c integer, d integer)"); err != nil {
+		t.Fatalf("create standalone table nninh5: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nninh5 ADD CONSTRAINT nn5 NOT NULL c"); err != nil {
+		t.Fatalf("add named NOT NULL on local column nninh5.c: %v", err)
+	}
+
+	// Slice 277 (ALTER-path counterpart of slice 274's CREATE-inline nninh3):
+	// a NAMED NOT NULL added to a LOCAL column via `ALTER TABLE ... ADD CONSTRAINT
+	// <name> NOT NULL <col>` whose explicit name EQUALS the auto-name
+	// `<table>_<col>_not_null` must COLLAPSE to the bare `<col> <type> NOT NULL`
+	// form — pg_dump must NOT leak the `CONSTRAINT nninh6_c_not_null` prefix even
+	// though the constraint was created with an explicit name. Slice 274 proved
+	// this collapse for the inline-at-creation path; this twin proves the ALTER
+	// path stores the same `conname` (so pg_dump's auto-name suppression at
+	// pg_dump.c:17184 — which fires when conname == the computed default — also
+	// applies). A regression that stored a different conname, or that skipped the
+	// auto-name comparison on the ALTER path, would leak `c integer CONSTRAINT
+	// nninh6_c_not_null NOT NULL` into the dump.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh6 (c integer, d integer)"); err != nil {
+		t.Fatalf("create standalone table nninh6: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nninh6 ADD CONSTRAINT nninh6_c_not_null NOT NULL c"); err != nil {
+		t.Fatalf("add default-named NOT NULL on local column nninh6.c: %v", err)
+	}
+
+	// Slice 278 (combines slice 277's auto-name collapse with slice 275's NO
+	// INHERIT suffix): a NAMED `NO INHERIT` NOT NULL added to a LOCAL column via
+	// `ALTER TABLE ... ADD CONSTRAINT <name> NOT NULL <col> NO INHERIT` whose
+	// explicit name EQUALS the auto-name `nninh7_c_not_null` must COLLAPSE the
+	// `CONSTRAINT` prefix (conname == computed default, suppressed at
+	// pg_dump.c:17184) while the `NO INHERIT` suffix SURVIVES — yielding the bare
+	// `c integer NOT NULL NO INHERIT` form. pg_dump renders the column constraint
+	// in two independent steps (pg_dump.c:17179-17188): the name-vs-default
+	// decision picks bare ` NOT NULL`, then `notnull_noinh[j]` appends ` NO
+	// INHERIT`. This twin proves the ALTER path threads BOTH the collapsible
+	// conname AND the NO INHERIT bit together: a regression dropping the noinh bit
+	// would emit `c integer NOT NULL` (missing suffix); one storing a non-default
+	// conname would leak `c integer CONSTRAINT nninh7_c_not_null NOT NULL NO
+	// INHERIT`.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nninh7 (c integer, d integer)"); err != nil {
+		t.Fatalf("create standalone table nninh7: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nninh7 ADD CONSTRAINT nninh7_c_not_null NOT NULL c NO INHERIT"); err != nil {
+		t.Fatalf("add default-named NO INHERIT NOT NULL on local column nninh7.c: %v", err)
+	}
+
+	// Slice 279 (inherited-child counterpart of slice 277): a DEFAULT-named NOT
+	// NULL added to an INHERITED column via `ALTER TABLE ... ADD CONSTRAINT
+	// <child>_<col>_not_null NOT NULL <inherited_col>` whose explicit name EQUALS
+	// the auto-name must COLLAPSE the `CONSTRAINT` prefix in the STANDALONE body
+	// form — pg_dump emits the bare `NOT NULL pid` (no `CONSTRAINT` prefix) rather
+	// than `CONSTRAINT idfnd_child_pid_not_null NOT NULL pid`. Slice 271 proved the
+	// NAMED (non-default) body form for a conislocal NOT NULL on an inherited
+	// column (`CONSTRAINT idfnn_nn NOT NULL pid`); slice 277 proved the auto-name
+	// COLLAPSE for a LOCAL inline column on the ALTER path. This twin proves their
+	// INTERSECTION: the collapse also fires in the inherited-column body branch
+	// (pg_dump.c:17225-17232), which emits `NOT NULL <col>` when notnull_constrs[j]
+	// is empty (conname == computed default) and `CONSTRAINT <name> NOT NULL <col>`
+	// otherwise. No production change required — the standalone body form reuses the
+	// SAME notnull_constrs[] array as the inline path, so once goopg's ALTER path
+	// stores the collapsible default conname (slice 277) and getTableAttrs suppresses
+	// it, the inherited body form collapses identically. Note the body branch never
+	// appends ` NO INHERIT` (that is inline-only, pg_dump.c:17187), so this slice
+	// deliberately omits the NO INHERIT dimension. A regression storing a non-default
+	// conname (or skipping the default-name comparison) would leak
+	// `CONSTRAINT idfnd_child_pid_not_null NOT NULL pid`; one that lost
+	// AlterTableAddNotNull would drop the NOT NULL entirely.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfnd_parent (pid integer, pname text)"); err != nil {
+		t.Fatalf("create legacy inheritance parent idfnd_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.idfnd_child (extra integer) INHERITS (public.idfnd_parent)"); err != nil {
+		t.Fatalf("create legacy inheritance child idfnd_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.idfnd_child ADD CONSTRAINT idfnd_child_pid_not_null NOT NULL pid"); err != nil {
+		t.Fatalf("add default-named NOT NULL on inherited column idfnd_child.pid: %v", err)
+	}
+
+	// Slice 280 (multi-column inherited NOT NULL body form — attnum ordering +
+	// per-column collapse): two conislocal NOT NULL constraints on DISTINCT
+	// inherited columns of the same child, added in REVERSE attnum order, must
+	// emit their STANDALONE body items in ATTNUM order (not constraint-creation
+	// order) because the pg_dump body loop iterates `j` over columns
+	// (pg_dump.c:17175-17233). Slices 271/279 proved the named/default body form
+	// for a SINGLE inherited column; this twin proves (a) the body emits multiple
+	// `NOT NULL <col>` items sorted by attnum and (b) the COLLAPSE decision is
+	// PER-COLUMN: `mb`'s constraint carries a NON-default name (`mninh_named` !=
+	// `mninh_child_mb_not_null`) so its body item keeps the `CONSTRAINT mninh_named`
+	// prefix, while `ma`'s name EQUALS its auto-name (`mninh_child_ma_not_null`) so
+	// its body item collapses to the bare `NOT NULL ma`. The ALTERs run mb-first
+	// (attnum 2) then ma-second (attnum 1) so a regression that emitted in
+	// creation order would print `mb` before `ma`. No production change — the body
+	// loop already walks columns in attnum order and reuses the same per-column
+	// notnull_constrs[] entries proven by slices 271/277/279. A regression that
+	// sorted by constraint OID/creation order would flip the two items; one that
+	// applied the default-name collapse globally would drop the `CONSTRAINT
+	// mninh_named` prefix; one that lost either AlterTableAddNotNull would drop a
+	// body item.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.mninh_parent (ma integer, mb integer, mname text)"); err != nil {
+		t.Fatalf("create multi-col inheritance parent mninh_parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.mninh_child (extra integer) INHERITS (public.mninh_parent)"); err != nil {
+		t.Fatalf("create multi-col inheritance child mninh_child: %v", err)
+	}
+	// mb FIRST (attnum 2, non-default name → keeps CONSTRAINT prefix)...
+	if err := runSQLSimple(t, c, "ALTER TABLE public.mninh_child ADD CONSTRAINT mninh_named NOT NULL mb"); err != nil {
+		t.Fatalf("add named NOT NULL on inherited column mninh_child.mb: %v", err)
+	}
+	// ...then ma SECOND (attnum 1, default name → collapses to bare NOT NULL).
+	if err := runSQLSimple(t, c, "ALTER TABLE public.mninh_child ADD CONSTRAINT mninh_child_ma_not_null NOT NULL ma"); err != nil {
+		t.Fatalf("add default-named NOT NULL on inherited column mninh_child.ma: %v", err)
+	}
+
 	// Slice 172: MULTI-parent legacy inheritance (`INHERITS (a, b)`). Slice 170
 	// only exercised a single parent; multi-parent additionally relies on (a) the
 	// column-merge dedup (a column present in both parents — `shared` — is kept
@@ -1368,8 +2274,30 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// const-folded value as `'1 day'::interval`; both are valid, re-parseable SQL
 	// that round-trips). The `span interval` column guards the interval-literal
 	// path end-to-end.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3], grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END, pair integer DEFAULT (1, 2), span interval DEFAULT INTERVAL '1' day, nflag boolean DEFAULT (1 IS NOT NULL), bflag boolean DEFAULT (true IS NOT TRUE), dflag boolean DEFAULT (1 IS DISTINCT FROM 2))"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE TABLE public.defcol (id integer, status integer DEFAULT 0, created timestamptz DEFAULT now(), touched timestamptz DEFAULT CURRENT_TIMESTAMP, label text DEFAULT lpad('x', 5), meta jsonb DEFAULT '{}'::jsonb, vals integer[] DEFAULT ARRAY[1, 2, 3], grade integer DEFAULT CASE WHEN true THEN 1 ELSE 0 END, pair integer DEFAULT (1, 2), span interval DEFAULT INTERVAL '1' day, nflag boolean DEFAULT (1 IS NOT NULL), bflag boolean DEFAULT (true IS NOT TRUE), dflag boolean DEFAULT (1 IS DISTINCT FROM 2), calc integer DEFAULT (1 + 2) * 3)"); err != nil {
 		t.Fatalf("create table defcol with function-call default: %v", err)
+	}
+
+	// Slice 302: a column DEFAULT containing a UNARY MINUS. The parser tags `-x`
+	// with OpUnaryNeg (NOT OpSub — that is binary subtraction `a - b`), but both
+	// deparse twins (catalog.formatExprForAttrdef / executor.defaultExprToSQL)
+	// only handled `case parser.OpSub`, so a unary-minus default NEVER matched and
+	// fell through to fmt.Sprintf("%v", e) — dumping a Go pointer string like
+	// `&{0 - 0xc0001a2f00}` and corrupting every `DEFAULT -…` clause pg_dump
+	// re-emits. Both twins now key on OpUnaryNeg. For a unary minus on a COMPOUND
+	// operand (an OpExpr PG does NOT constant-fold) PG's get_rule_expr deparses
+	// `(- (operand))`, byte-identical to real pg_dump 18.3 (verified):
+	//   nb integer DEFAULT (- (1 + 2))
+	//   nc integer DEFAULT ((- (1 + 2)) * 3)
+	// (A unary minus applied DIRECTLY to a numeric literal — `DEFAULT -5` — is
+	// folded by PG's parser into a negative typed Const and deparsed as
+	// `'-5'::integer`; goopg is type-blind in this renderer and emits the
+	// re-parseable `-5` instead. That bare-literal `'-N'::type` cast form is a
+	// separate, deferred slice, so this fixture exercises only the byte-identical
+	// COMPOUND cases.) The `nb`/`nc` columns guard the unary-minus path
+	// end-to-end through real pg_dump.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.negdef (id integer, nb integer DEFAULT -(1 + 2), nc integer DEFAULT -(1 + 2) * 3)"); err != nil {
+		t.Fatalf("create table negdef with unary-minus default: %v", err)
 	}
 
 	// Slice 182: a per-column storage override (`ALTER TABLE ... ALTER COLUMN
@@ -1529,6 +2457,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	}
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_qty_partial_idx ON public.foo (qty) WHERE qty > 0"); err != nil {
 		t.Fatalf("create partial index: %v", err)
+	}
+	// Slice 298: a partial-index predicate with NESTED arithmetic exercises the
+	// executor's defaultExprToSQL BinaryOp parenthesization (the index-predicate
+	// twin of slice 297's column-default fix). Without full parenthesization the
+	// predicate `(qty + id) * mgr_id > 0` deparses to the precedence-corrupted
+	// `qty + id * mgr_id > 0`, which restores as `qty + (id * mgr_id) > 0` — a
+	// silent semantic change. Real pg_dump 18.3 emits the fully-parenthesized form.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_calc_partial_idx ON public.foo (qty) WHERE (qty + id) * mgr_id > 0"); err != nil {
+		t.Fatalf("create nested-arithmetic partial index: %v", err)
+	}
+	// Slice 299: a nested-arithmetic *expression-index column* `((qty + id) * mgr_id)`
+	// exercises slice 298's executor.defaultExprToSQL BinaryOp parenthesization in the
+	// SECOND deparse context that renderer feeds — the index-key expression stored in
+	// catalog.Index.ColExprStrings (vs slice 298's index *predicate*). pg_get_indexdef
+	// wraps the deparsed key in `(%s)` inside the `USING btree (...)` column-list parens,
+	// so real pg_dump 18.3 emits FOUR nested parens `((((qty + id) * mgr_id)))` (verified
+	// byte-identical). Without the BinaryOp parens the key would deparse to the
+	// precedence-corrupt `(qty + id * mgr_id)`, restoring as `qty + (id * mgr_id)` — a
+	// silent change to the indexed value. This is the oracle-verified expression-column
+	// complement to slice 298's predicate fixture.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_calc_expr_idx ON public.foo (((qty + id) * mgr_id))"); err != nil {
+		t.Fatalf("create nested-arithmetic expression index: %v", err)
 	}
 	// DESC NULLS LAST exercises the DESC branch with a non-default NULLS override.
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_name_desc_idx ON public.foo (name DESC NULLS LAST)"); err != nil {
@@ -2701,6 +3651,45 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create function add_default: %v", err)
 	}
 
+	// Slice 301: a function whose parameter DEFAULT is a NESTED-ARITHMETIC binary
+	// op (`a integer DEFAULT (1 + 2) * 3`). This is the FOURTH (and last) deparse
+	// context fed by executor.defaultExprToSQL — after slice 298's index predicate,
+	// slice 299's expression-index column, and slice 300's partition key. The
+	// function-arg-default path differs from those three: pg_dump reconstructs the
+	// signature from pg_get_function_arguments(oid), and PG's print_function_arguments
+	// (ruleutils.c:3428) appends the default via `deparse_expression(expr, NIL, false,
+	// false)` — which, UNLIKE pg_get_partkeydef (slice 300), adds NO extra `(%s)`
+	// wrap. The full parenthesization comes entirely from goopg storing the
+	// deparse-canonical `((1 + 2) * 3)` in catalog.Routine.ArgDefaults (the parser's
+	// `a.Default` → defaultExprToSQL at CREATE FUNCTION time, operators_ddl.go:7138),
+	// matching get_oper_expr's non-pretty mode which wraps every OpExpr in parens.
+	// So this slice is FIXTURE-ONLY: defaultExprToSQL's slice-298 BinaryOp fix already
+	// produces the correct `((1 + 2) * 3)`, and buildFunctionArguments emits it
+	// verbatim after ` DEFAULT `. Verified byte-identical vs real pg_dump 18.3:
+	//   CREATE FUNCTION public.add_calcdef(a integer DEFAULT ((1 + 2) * 3)) RETURNS integer
+	//       LANGUAGE sql
+	//       AS $_$ SELECT $1 $_$;
+	// A precedence-corrupted render (`DEFAULT 1 + 2 * 3`, re-parsing as 1+(2*3)=7
+	// not (1+2)*3=9) or a one-paren-short `DEFAULT (1 + 2) * 3` would surface in the
+	// assertion below. The `$1` body forces the `$_$` delimiter (same as add_default).
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.add_calcdef(a integer DEFAULT (1 + 2) * 3) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function add_calcdef: %v", err)
+	}
+
+	// Slice 302 (executor twin): a FUNCTION-ARGUMENT default with a UNARY MINUS on
+	// a compound operand. pg_dump reconstructs the signature from
+	// pg_get_function_arguments(oid), which goopg answers from the deparse-canonical
+	// string stored in catalog.Routine.ArgDefaults (the parser's `a.Default` →
+	// executor.defaultExprToSQL at CREATE FUNCTION time). Before slice 302 the
+	// unary minus matched no arm (OpUnaryNeg vs the dead OpSub case) and stored a Go
+	// pointer string; it now renders `(- (1 + 2))`, byte-identical to real pg_dump
+	// 18.3 (verified):
+	//   CREATE FUNCTION public.fneg(x integer DEFAULT (- (1 + 2))) RETURNS integer
+	// The `$1` body forces the `$_$` delimiter (same as add_calcdef/add_default).
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.fneg(x integer DEFAULT -(1 + 2)) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function fneg: %v", err)
+	}
+
 	// Slice 161: a SET-RETURNING function (`RETURNS SETOF integer`). Every prior
 	// function slice returned a single scalar (`RETURNS integer`/`void`), so the
 	// proretset='t' return-clause shape was never exercised end-to-end. This drives
@@ -3365,6 +4354,41 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')") {
 			t.Errorf("pg_dump emitted an unquoted/invalid RANGE bound; want %q\n  full stdout=%q", "ATTACH PARTITION public.prange_am FOR VALUES FROM (MINVALUE) TO ('m')", res.Stdout)
 		}
+		// **Slice 300 closed (asserted):** a nested-arithmetic EXPRESSION partition
+		// key — the third deparse context fed by defaultExprToSQL (index predicate
+		// → slice 298, index column → slice 299, partition key → here), reached via
+		// pg_get_partkeydef. pg_get_partkeydef_worker wraps each non-function key in
+		// `(%s)`, so `RANGE (((a + b) * c))` dumps as the FOUR-paren form
+		// `RANGE ((((a + b) * c)))` (verified byte-identical vs real pg_dump 18.3).
+		// goopg previously emitted only THREE parens (no `(%s)` wrap). The exact
+		// four-paren clause is a tight guard: the three-paren bug form is NOT a
+		// superstring of it, so a missing wrap fails this assertion.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.pexpr (") ||
+			!strings.Contains(res.Stdout, "PARTITION BY RANGE ((((a + b) * c)))") {
+			t.Errorf("pg_dump dropped/mangled the expression partition key; want CREATE TABLE public.pexpr / PARTITION BY RANGE ((((a + b) * c)))\n  full stdout=%q", res.Stdout)
+		}
+		// Negative guard on the INNER BinaryOp parenthesization (slice 298): the
+		// precedence-corrupt `a + b * c` (the `+` left un-parenthesized) must NOT
+		// appear — the correct render is `((a + b) * c)`, where a `)` always
+		// separates `b` from ` *`, so this literal is absent unless the inner wrap
+		// regressed.
+		if strings.Contains(res.Stdout, "RANGE ((a + b * c))") {
+			t.Errorf("pg_dump emitted a precedence-corrupt expression partition key (inner BinaryOp parens dropped); found %q\n  full stdout=%q", "RANGE ((a + b * c))", res.Stdout)
+		}
+		// **Slice 262 closed (asserted):** a MULTI-COLUMN RANGE bound with a
+		// MINVALUE/MAXVALUE open edge on a non-leading column. FormatPartitionBound
+		// joins the parallel From/ToValueLiterals tuples with `, `, so the two-element
+		// bounds must re-emit verbatim with bare keywords (slices 169/261). Assert (1)
+		// the parent's multi-column key clause `PARTITION BY RANGE (a, b)`, and (2) the
+		// child's mixed open/concrete two-element bound, proving the suffix MINVALUE/
+		// MAXVALUE survive un-quoted alongside the concrete leading `10`.
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.pmc (") ||
+			!strings.Contains(res.Stdout, "PARTITION BY RANGE (a, b)") {
+			t.Errorf("pg_dump dropped/mangled the multi-column RANGE parent; missing CREATE TABLE public.pmc / PARTITION BY RANGE (a, b)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pmc_lo FOR VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)") {
+			t.Errorf("pg_dump dropped/mangled the multi-column RANGE bound; want %q\n  full stdout=%q", "ATTACH PARTITION public.pmc_lo FOR VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)", res.Stdout)
+		}
 		// **Slice 190 (asserted):** a DEFAULT (catch-all) partition. pg_dump reads
 		// the bound via pg_get_expr(relpartbound), which yields the bare keyword
 		// `DEFAULT`, and emits `ATTACH PARTITION public.<child> DEFAULT` (no FOR
@@ -3529,6 +4553,1182 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.psub_east_lo FOR VALUES FROM (0) TO (100)") {
 			t.Errorf("pg_dump dropped the leaf's ATTACH-to-middle bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.psub_east_lo FOR VALUES FROM (0) TO (100)", res.Stdout)
 		}
+		// **Slice 263 (asserted):** WIDE multi-level partition tree. Two fan-out
+		// shapes beyond slice 171's single leaf: (a) `psub_east` now has TWO leaves —
+		// the second leaf `psub_east_hi` must get its own ATTACH with the (100,200)
+		// bound, proving the per-parent inhseqno counter increments independently per
+		// child; (b) the sibling sub-partitioned middle node `psub_west` must emit its
+		// OWN PARTITION BY clause, its ATTACH-to-top with the LIST bound, and its leaf
+		// `psub_west_lo` must ATTACH to `psub_west` (NOT the sibling `psub_east` nor the
+		// grandparent `psub`) even though its (0,100) bound text is identical to
+		// `psub_east_lo`'s. The immediate-parent link is verified via the full
+		// `ALTER TABLE ONLY public.psub_west ATTACH PARTITION public.psub_west_lo`
+		// single-line form, which a wrong-parent regression would break.
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.psub_east_hi FOR VALUES FROM (100) TO (200)") {
+			t.Errorf("pg_dump dropped the second leaf's ATTACH-to-middle bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.psub_east_hi FOR VALUES FROM (100) TO (200)", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE TABLE public.psub_west (") ||
+			!strings.Contains(res.Stdout, "ATTACH PARTITION public.psub_west FOR VALUES IN ('west')") {
+			t.Errorf("pg_dump dropped the sibling sub-partitioned middle node psub_west (CREATE TABLE / ATTACH-to-top with LIST bound)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER TABLE ONLY public.psub_west ATTACH PARTITION public.psub_west_lo FOR VALUES FROM (0) TO (100)") {
+			t.Errorf("pg_dump linked the leaf psub_west_lo to the wrong parent; missing immediate-parent ATTACH %q\n  full stdout=%q", "ALTER TABLE ONLY public.psub_west ATTACH PARTITION public.psub_west_lo FOR VALUES FROM (0) TO (100)", res.Stdout)
+		}
+		// **Slice 264 (asserted):** child-only CHECK on a partition leaf. The leaf
+		// pchk_1 inherits column `a` from pchk (pg_dump prints no columns for it),
+		// but its locally-declared CHECK (conislocal='t') must survive: pg_dump
+		// emits `CONSTRAINT pchk_1_pos CHECK ((a > 0))` inside the otherwise
+		// column-less CREATE TABLE body, then the LIST-bound ATTACH. A regression
+		// that dropped conislocal, the pg_constraint row, or the
+		// pg_get_constraintdef CHECK branch would lose the constraint silently.
+		if !strings.Contains(res.Stdout, "CONSTRAINT pchk_1_pos CHECK ((a > 0))") {
+			t.Errorf("pg_dump dropped the partition leaf's child-only CHECK; missing %q\n  full stdout=%q", "CONSTRAINT pchk_1_pos CHECK ((a > 0))", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pchk_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pchk_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 265 (asserted):** child-only column DEFAULT on a partition leaf.
+		// The leaf pdfl_1 prints its full inherited column list (shouldPrintColumn
+		// is true for every partition column); the per-column override DEFAULT must
+		// re-attach inside that list as `b integer DEFAULT 42`, with the inherited
+		// `a integer` kept and no spurious default on it. A regression dropping the
+		// leaf's pg_attrdef row (or mis-rendering adbin) would lose `DEFAULT 42`
+		// silently and break restore (the leaf would no longer default b to 42).
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pdfl_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "a integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited column; want %q in pdfl_1 block\n  block=%q", "a integer", block)
+			}
+			if !strings.Contains(block, "b integer DEFAULT 42") {
+				t.Errorf("pg_dump dropped/corrupted the child-only DEFAULT; want %q in pdfl_1 block\n  block=%q", "b integer DEFAULT 42", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pdfl_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pdfl_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pdfl_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 266 (asserted):** child-only NOT NULL override on a partition
+		// leaf — the LAST per-column override form. The leaf pnnl_1 prints its full
+		// inherited column list (shouldPrintColumn is true for every partition
+		// column); the per-column override NOT NULL must re-attach inside that list
+		// as the inline decoration `b integer NOT NULL`, with the inherited
+		// `a integer` kept and no spurious NOT NULL on it. A regression dropping the
+		// leaf's local NOT NULL (or rendering it as a separate CONSTRAINT clause
+		// instead of the inline column decoration) would diverge from PG 18.3 and
+		// could lose the constraint on restore.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pnnl_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "a integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited column; want %q in pnnl_1 block\n  block=%q", "a integer", block)
+			}
+			if !strings.Contains(block, "b integer NOT NULL") {
+				t.Errorf("pg_dump dropped/corrupted the child-only NOT NULL; want %q in pnnl_1 block\n  block=%q", "b integer NOT NULL", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pnnl_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pnnl_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pnnl_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 281 (asserted):** NOT NULL added to a partition leaf's INHERITED
+		// column via ALTER TABLE ADD CONSTRAINT routes to the INLINE column form (not
+		// the standalone body form the legacy-inheritance mninh/idfnd siblings use),
+		// because shouldPrintColumn returns true for every partition column
+		// (ispartition). The leaf pnna_1 prints its full inherited column list with
+		// the two ALTER-added NOT NULLs as INLINE decorations: `qb` keeps its
+		// non-default name (`qb integer CONSTRAINT pnna_named NOT NULL`) while `qc`'s
+		// default name collapses to the bare `qc text NOT NULL`; the partition key
+		// `qa` stays a plain `qa integer`. The standalone body form
+		// (`CONSTRAINT pnna_named NOT NULL qb` with a trailing column name) must NOT
+		// appear — its presence would mean ispartition was ignored in
+		// shouldPrintColumn. Twin of slice 280 (same per-column collapse on the
+		// legacy-inheritance standalone path).
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pnna_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "qa integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited partition-key column; want %q in pnna_1 block\n  block=%q", "qa integer", block)
+			}
+			if !strings.Contains(block, "qb integer CONSTRAINT pnna_named NOT NULL") {
+				t.Errorf("pg_dump dropped/corrupted the non-default inline NOT NULL on a partition leaf; want %q in pnna_1 block\n  block=%q", "qb integer CONSTRAINT pnna_named NOT NULL", block)
+			}
+			if !strings.Contains(block, "qc text NOT NULL") {
+				t.Errorf("pg_dump dropped/corrupted the collapsed default-named inline NOT NULL on a partition leaf; want %q in pnna_1 block\n  block=%q", "qc text NOT NULL", block)
+			}
+			if strings.Contains(block, "CONSTRAINT pnna_1_qc_not_null") {
+				t.Errorf("pg_dump leaked the default constraint name on a partition leaf; want bare %q, not %q in pnna_1 block\n  block=%q", "qc text NOT NULL", "CONSTRAINT pnna_1_qc_not_null NOT NULL qc", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pnna_1\n  full stdout=%q", res.Stdout)
+		}
+		// The standalone inherited-NOT-NULL body form (column name AFTER the keyword)
+		// is the legacy-inheritance shape; it must never appear for a partition leaf.
+		if strings.Contains(res.Stdout, "CONSTRAINT pnna_named NOT NULL qb") {
+			t.Errorf("pg_dump emitted the standalone body NOT NULL form for a partition leaf (ispartition ignored in shouldPrintColumn); unexpected %q\n  full stdout=%q", "CONSTRAINT pnna_named NOT NULL qb", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pnna_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pnna_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 282 (asserted):** a DEFAULT added to a partition leaf's INHERITED
+		// column via ALTER TABLE ALTER COLUMN SET DEFAULT rides INLINE on the printed
+		// column (`kb integer DEFAULT 7`), not as a standalone ALTER. shouldPrintColumn
+		// is true for every partition column (ispartition), so attrdefs[].separate stays
+		// false (pg_dump.c:9527-9535) and the default joins the CREATE TABLE body. The
+		// partition key `ka` stays a plain `ka integer`. The legacy-inheritance standalone
+		// form (slice 269) must NOT appear. DEFAULT analog of slice 281; partition-inline
+		// twin of slice 269.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pdfa_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "ka integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited partition-key column; want %q in pdfa_1 block\n  block=%q", "ka integer", block)
+			}
+			if !strings.Contains(block, "kb integer DEFAULT 7") {
+				t.Errorf("pg_dump dropped/corrupted the inline DEFAULT on a partition leaf; want %q in pdfa_1 block\n  block=%q", "kb integer DEFAULT 7", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pdfa_1\n  full stdout=%q", res.Stdout)
+		}
+		// The standalone SET DEFAULT form is the legacy-inheritance shape (slice 269);
+		// it must never appear for a partition leaf whose column already prints inline.
+		if strings.Contains(res.Stdout, "ALTER COLUMN kb SET DEFAULT 7") {
+			t.Errorf("pg_dump emitted the standalone SET DEFAULT form for a partition leaf (separate flag set despite ispartition); unexpected %q\n  full stdout=%q", "ALTER COLUMN kb SET DEFAULT 7", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pdfa_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pdfa_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 283 (asserted):** a STORED generated column inherited onto a
+		// partition leaf prints its generation clause INLINE in the leaf body
+		// (`gb integer GENERATED ALWAYS AS (ga * 2) STORED`). attgenerated forces
+		// attrdefs[].separate=false UNCONDITIONALLY (pg_dump.c:9507) — a generation
+		// expression can never be split into a standalone ALTER ... SET DEFAULT — and
+		// ispartition makes every column print (slices 281/282). The partition key
+		// `ga` stays a plain `ga integer`. Discriminator-distinct from slices 281/282:
+		// here separate is held false by attgenerated, not (only) by ispartition.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgna_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "ga integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited partition-key column; want %q in pgna_1 block\n  block=%q", "ga integer", block)
+			}
+			if !strings.Contains(block, "gb integer GENERATED ALWAYS AS (ga * 2) STORED") {
+				t.Errorf("pg_dump dropped/corrupted the inline generated column on a partition leaf; want %q in pgna_1 block\n  block=%q", "gb integer GENERATED ALWAYS AS (ga * 2) STORED", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgna_1\n  full stdout=%q", res.Stdout)
+		}
+		// A generation expression can never be a standalone SET DEFAULT; assert the
+		// illegal standalone form is absent for the leaf's generated column.
+		if strings.Contains(res.Stdout, "ALTER COLUMN gb SET DEFAULT") {
+			t.Errorf("pg_dump emitted an (illegal) standalone SET DEFAULT for a generated partition-leaf column (separate set despite attgenerated); unexpected %q\n  full stdout=%q", "ALTER COLUMN gb SET DEFAULT", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgna_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgna_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 284 (asserted):** the VIRTUAL counterpart of slice 283. A VIRTUAL
+		// generated column inherited onto a partition leaf prints its generation
+		// clause INLINE in the leaf body, but rendered WITHOUT a trailing keyword
+		// (`vb integer GENERATED ALWAYS AS (va * 2)`). attgenerated forces
+		// attrdefs[].separate=false UNCONDITIONALLY (pg_dump.c:9507) exactly as for
+		// STORED — ATTRIBUTE_GENERATED_VIRTUAL ('v') is non-empty like
+		// ATTRIBUTE_GENERATED_STORED ('s') — but the render branch differs:
+		// pg_dump.c:17171 emits `GENERATED ALWAYS AS (%s)` with NO trailing STORED for
+		// a virtual column (the STORED branch at 17168 is skipped). ispartition makes
+		// every column print (slices 281/282). Discriminator-distinct from slice 283:
+		// the render must NOT carry a trailing STORED.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pvna_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "va integer") {
+				t.Errorf("pg_dump dropped the leaf's inherited partition-key column; want %q in pvna_1 block\n  block=%q", "va integer", block)
+			}
+			if !strings.Contains(block, "vb integer GENERATED ALWAYS AS (va * 2)") {
+				t.Errorf("pg_dump dropped/corrupted the inline virtual generated column on a partition leaf; want %q in pvna_1 block\n  block=%q", "vb integer GENERATED ALWAYS AS (va * 2)", block)
+			}
+			// A virtual generated column must NOT render a trailing STORED: a regression
+			// that mis-mapped attgenerated 'v'→'s' (pg_dump.c:17168) would surface here.
+			if strings.Contains(block, "vb integer GENERATED ALWAYS AS (va * 2) STORED") {
+				t.Errorf("pg_dump emitted a spurious trailing STORED on a VIRTUAL generated partition-leaf column\n  block=%q", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pvna_1\n  full stdout=%q", res.Stdout)
+		}
+		// A generation expression can never be a standalone SET DEFAULT; assert the
+		// illegal standalone form is absent for the leaf's virtual generated column.
+		if strings.Contains(res.Stdout, "ALTER COLUMN vb SET DEFAULT") {
+			t.Errorf("pg_dump emitted an (illegal) standalone SET DEFAULT for a virtual generated partition-leaf column (separate set despite attgenerated); unexpected %q\n  full stdout=%q", "ALTER COLUMN vb SET DEFAULT", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pvna_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pvna_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 285 (asserted):** a MULTI-ATTRIBUTE generation expression inherited
+		// onto a partition leaf. Where slices 283/284 referenced a single column in the
+		// generation clause (`ga * 2`), pgmc_1's inherited `gb` is
+		// `GENERATED ALWAYS AS (ga + gc) STORED` — a binary expression over two distinct
+		// inherited Vars. The render path is identical to slice 283 (attgenerated forces
+		// separate=false, ispartition forces every column to print) but this asserts the
+		// deparse resolves BOTH Vars to the right column names: the leaf body must carry
+		// all three plain columns (`ga integer`, `gc integer`) plus the inline generated
+		// `gb integer GENERATED ALWAYS AS (ga + gc) STORED`. A regression that resolved
+		// only the first Var or swapped ga↔gc by attnum would corrupt the clause here.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgmc_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "ga integer") {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgmc_1 block\n  block=%q", "ga integer", block)
+			}
+			if !strings.Contains(block, "gc integer") {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgmc_1 block\n  block=%q", "gc integer", block)
+			}
+			if !strings.Contains(block, "gb integer GENERATED ALWAYS AS (ga + gc) STORED") {
+				t.Errorf("pg_dump dropped/corrupted the multi-attr inline generated column on a partition leaf; want %q in pgmc_1 block\n  block=%q", "gb integer GENERATED ALWAYS AS (ga + gc) STORED", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgmc_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgmc_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgmc_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 286 (asserted):** a FORWARD-REFERENCE generation expression inherited
+		// onto a partition leaf. Where slice 285's `gb` referenced only columns declared
+		// before it, pgfr_1's inherited `gz` is attnum 1 and references `ya` (attnum 2) and
+		// `yc` (attnum 3), both declared AFTER it. The leaf body must carry the inline
+		// generated `gz integer GENERATED ALWAYS AS (ya + yc) STORED` FIRST (attnum order),
+		// then the two plain columns `ya integer`, `yc integer`. This asserts the generation
+		// deparse resolves both Vars by NAME even though neither operand precedes the
+		// generated column — a forward-only positional scan would corrupt the `(ya + yc)`
+		// clause here.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgfr_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			gzIdx := strings.Index(block, "gz integer GENERATED ALWAYS AS (ya + yc) STORED")
+			if gzIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the forward-reference inline generated column on a partition leaf; want %q in pgfr_1 block\n  block=%q", "gz integer GENERATED ALWAYS AS (ya + yc) STORED", block)
+			}
+			yaIdx := strings.Index(block, "ya integer")
+			if yaIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgfr_1 block\n  block=%q", "ya integer", block)
+			}
+			if !strings.Contains(block, "yc integer") {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgfr_1 block\n  block=%q", "yc integer", block)
+			}
+			// Forward-reference ordering: the generated column (attnum 1) must print BEFORE
+			// the columns its expression references (attnum 2/3).
+			if gzIdx >= 0 && yaIdx >= 0 && gzIdx > yaIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want generated %q before %q in pgfr_1 block\n  block=%q", "gz", "ya", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgfr_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgfr_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgfr_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 287 (asserted):** a mid-position generated column mixing a backward
+		// Var, a literal, and a forward Var in one expression. pgmx_1's inherited `mg`
+		// is attnum 2 and references `ma` (attnum 1, declared BEFORE) and `mc` (attnum
+		// 3, declared AFTER) plus the literal `1`. The leaf body must print in attnum
+		// order: `ma integer`, then the inline `mg integer GENERATED ALWAYS AS
+		// (ma + 1 + mc) STORED`, then `mc integer`. This asserts the generation deparse
+		// resolves BOTH directions by NAME in a single expression (slices 285/286 each
+		// exercised only one direction); the three-operand `ma + 1 + mc` prints flat.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgmx_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			maIdx := strings.Index(block, "ma integer")
+			if maIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgmx_1 block\n  block=%q", "ma integer", block)
+			}
+			mgIdx := strings.Index(block, "mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED")
+			if mgIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the mid-position mixed-direction generated column on a partition leaf; want %q in pgmx_1 block\n  block=%q", "mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED", block)
+			}
+			mcIdx := strings.Index(block, "mc integer")
+			if mcIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgmx_1 block\n  block=%q", "mc integer", block)
+			}
+			// Attnum order: ma (1) before mg (2) before mc (3) — the generated column
+			// prints between the two columns its expression references.
+			if maIdx >= 0 && mgIdx >= 0 && maIdx > mgIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgmx_1 block\n  block=%q", "ma", "mg", block)
+			}
+			if mgIdx >= 0 && mcIdx >= 0 && mgIdx > mcIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want generated %q before %q in pgmx_1 block\n  block=%q", "mg", "mc", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgmx_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgmx_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgmx_1 FOR VALUES IN (1)", res.Stdout)
+		}
+		// **Slice 288 (asserted):** a TEXT generated column over the `||` string
+		// concatenation operator (every prior generation slice used integer `+`/`*`).
+		// pgcc_1's inherited `cc` is attnum 3 and references `ca`/`cb` (both text);
+		// the leaf body must print in attnum order `ca text`, `cb text`, then the
+		// inline `cc text GENERATED ALWAYS AS (ca || cb) STORED`. This asserts the
+		// inherited-leaf generation render path is type-agnostic (text, not integer)
+		// and operator-agnostic (`||`, not arithmetic): attGeneratedFor inspects no
+		// type and goopg's pg_get_expr passes the source through verbatim, so the
+		// `||` deparse stays flat with no nested parens.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgcc_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			caIdx := strings.Index(block, "ca text")
+			if caIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgcc_1 block\n  block=%q", "ca text", block)
+			}
+			cbIdx := strings.Index(block, "cb text")
+			if cbIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgcc_1 block\n  block=%q", "cb text", block)
+			}
+			ccIdx := strings.Index(block, "cc text GENERATED ALWAYS AS (ca || cb) STORED")
+			if ccIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the text-concatenation generated column on a partition leaf; want %q in pgcc_1 block\n  block=%q", "cc text GENERATED ALWAYS AS (ca || cb) STORED", block)
+			}
+			// Attnum order: ca (1) before cb (2) before cc (3).
+			if caIdx >= 0 && cbIdx >= 0 && caIdx > cbIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pgcc_1 block\n  block=%q", "ca", "cb", block)
+			}
+			if cbIdx >= 0 && ccIdx >= 0 && cbIdx > ccIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgcc_1 block\n  block=%q", "cb", "cc", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgcc_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgcc_1 FOR VALUES IN ('x')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgcc_1 FOR VALUES IN ('x')", res.Stdout)
+		}
+		// **Slice 289 (asserted):** a generation expression with precedence-grouping
+		// parens (`(fa + fb) * 2`). This is the FIRST generation slice with nested
+		// parens; it pins the production deparse fix (joinGeneratedExprTokens). The
+		// leaf pgpp_1 must print `fa integer`, `fb integer`, then the inline
+		// generated `fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED` — with
+		// the inner precedence paren rendered TIGHT (`(fa + fb)`, not `( fa + fb )`),
+		// matching real pg_dump's pg_get_expr. A regression to the naive space-join
+		// would reintroduce the spurious inner spaces and fail the exact-substring
+		// check below.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgpp_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			faIdx := strings.Index(block, "fa integer")
+			if faIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgpp_1 block\n  block=%q", "fa integer", block)
+			}
+			fbIdx := strings.Index(block, "fb integer")
+			if fbIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgpp_1 block\n  block=%q", "fb integer", block)
+			}
+			fcIdx := strings.Index(block, "fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED")
+			if fcIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the parenthesised generated column on a partition leaf; want %q in pgpp_1 block\n  block=%q", "fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED", block)
+			}
+			// Attnum order: fa (1) before fb (2) before fc (3).
+			if faIdx >= 0 && fbIdx >= 0 && faIdx > fbIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pgpp_1 block\n  block=%q", "fa", "fb", block)
+			}
+			if fbIdx >= 0 && fcIdx >= 0 && fbIdx > fcIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgpp_1 block\n  block=%q", "fb", "fc", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgpp_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgpp_1 FOR VALUES IN (1)") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgpp_1 FOR VALUES IN (1)", res.Stdout)
+		}
+
+		// **Slice 290 (asserted):** function-call generation expression on a
+		// partition leaf. The leaf pgfx_1 must print `fn text`, then the inline
+		// generated `fu text GENERATED ALWAYS AS (upper(fn)) STORED` — with the call
+		// parens rendered TIGHT (`upper(fn)`, not `upper ( fn )`), matching real
+		// pg_dump's pg_get_expr. A regression to the naive space-join would emit the
+		// spurious inner spaces and fail the exact-substring check below.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgfx_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			fnIdx := strings.Index(block, "fn text")
+			if fnIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgfx_1 block\n  block=%q", "fn text", block)
+			}
+			fuIdx := strings.Index(block, "fu text GENERATED ALWAYS AS (upper(fn)) STORED")
+			if fuIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the function-call generated column on a partition leaf; want %q in pgfx_1 block\n  block=%q", "fu text GENERATED ALWAYS AS (upper(fn)) STORED", block)
+			}
+			// Attnum order: fn (1) before fu (2).
+			if fnIdx >= 0 && fuIdx >= 0 && fnIdx > fuIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgfx_1 block\n  block=%q", "fn", "fu", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgfx_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgfx_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgfx_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+
+		// **Slice 291 (asserted):** TWO-ARGUMENT function-call generation expression
+		// on a partition leaf. The leaf pgcl_1 must print `cn text`, `dn text`, then
+		// the inline generated `en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED`
+		// — with the argument list rendered `cn, dn` (comma tight-left, spaced-right),
+		// matching what pg_get_expr returns for goopg's stored source. A regression to
+		// a naive space-join would emit `coalesce(cn , dn)` (or drop the comma's
+		// trailing space) and fail the exact-substring check below.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgcl_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			cnIdx := strings.Index(block, "cn text")
+			if cnIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgcl_1 block\n  block=%q", "cn text", block)
+			}
+			dnIdx := strings.Index(block, "dn text")
+			if dnIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgcl_1 block\n  block=%q", "dn text", block)
+			}
+			enIdx := strings.Index(block, "en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED")
+			if enIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the two-arg function-call generated column on a partition leaf; want %q in pgcl_1 block\n  block=%q", "en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED", block)
+			}
+			// Attnum order: cn (1) before dn (2) before en (3).
+			if cnIdx >= 0 && dnIdx >= 0 && cnIdx > dnIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pgcl_1 block\n  block=%q", "cn", "dn", block)
+			}
+			if dnIdx >= 0 && enIdx >= 0 && dnIdx > enIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgcl_1 block\n  block=%q", "dn", "en", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgcl_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgcl_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgcl_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+
+		// **Slice 292 (asserted):** NESTED function-call generation expression on a
+		// partition leaf. The leaf pgnc_1 must print `gn text`, `hn text`, then the
+		// inline generated `jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED`
+		// — with BOTH call parens rendered tight and only the inner argument comma
+		// spaced (`upper(coalesce(gn, hn))`), matching what pg_get_expr returns for
+		// goopg's stored source. A regression to a naive space-join would emit
+		// `upper ( coalesce ( gn ,hn ) )` (or any variant with stray paren spaces) and
+		// fail the exact-substring check below.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgnc_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			gnIdx := strings.Index(block, "gn text")
+			if gnIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgnc_1 block\n  block=%q", "gn text", block)
+			}
+			hnIdx := strings.Index(block, "hn text")
+			if hnIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgnc_1 block\n  block=%q", "hn text", block)
+			}
+			jnIdx := strings.Index(block, "jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED")
+			if jnIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the nested function-call generated column on a partition leaf; want %q in pgnc_1 block\n  block=%q", "jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED", block)
+			}
+			// Attnum order: gn (1) before hn (2) before jn (3).
+			if gnIdx >= 0 && hnIdx >= 0 && gnIdx > hnIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pgnc_1 block\n  block=%q", "gn", "hn", block)
+			}
+			if hnIdx >= 0 && jnIdx >= 0 && hnIdx > jnIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgnc_1 block\n  block=%q", "hn", "jn", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgnc_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgnc_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgnc_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+
+		// **Slice 293 (asserted):** THREE-argument function-call generation
+		// expression on a partition leaf. The leaf pg3c_1 must print `ka text`,
+		// `la text`, `ma text`, then the inline generated
+		// `na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED` — with the
+		// single call paren tight and BOTH argument commas spaced (`, `), matching
+		// what pg_get_expr returns for goopg's stored source. A regression that
+		// emitted only one separator (`concat(ka, la,ma)`) or stray paren spaces
+		// would fail the exact-substring check below.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pg3c_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			kaIdx := strings.Index(block, "ka text")
+			if kaIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pg3c_1 block\n  block=%q", "ka text", block)
+			}
+			laIdx := strings.Index(block, "la text")
+			if laIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pg3c_1 block\n  block=%q", "la text", block)
+			}
+			maIdx := strings.Index(block, "ma text")
+			if maIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pg3c_1 block\n  block=%q", "ma text", block)
+			}
+			naIdx := strings.Index(block, "na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED")
+			if naIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the three-arg function-call generated column on a partition leaf; want %q in pg3c_1 block\n  block=%q", "na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED", block)
+			}
+			// Attnum order: ka (1) before la (2) before ma (3) before na (4).
+			if kaIdx >= 0 && laIdx >= 0 && kaIdx > laIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pg3c_1 block\n  block=%q", "ka", "la", block)
+			}
+			if laIdx >= 0 && maIdx >= 0 && laIdx > maIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pg3c_1 block\n  block=%q", "la", "ma", block)
+			}
+			if maIdx >= 0 && naIdx >= 0 && maIdx > naIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pg3c_1 block\n  block=%q", "ma", "na", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pg3c_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pg3c_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pg3c_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+
+		// **Slice 294 (asserted):** function-call generation expression with a
+		// STRING-LITERAL argument on a partition leaf. The leaf pglc_1 must print
+		// `ka text`, `la text`, then the inline generated
+		// `na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED` — with the
+		// literal RE-QUOTED (`'-'`, not the bare `-` the pre-fix helper would have
+		// emitted) and the surrounding commas spaced. The substring check below is
+		// the production-fix regression guard: before slice 294 the helper dropped
+		// the literal's quotes, so this block would have contained the malformed
+		// `concat(ka, -, la)`.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pglc_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			kaIdx := strings.Index(block, "ka text")
+			if kaIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pglc_1 block\n  block=%q", "ka text", block)
+			}
+			laIdx := strings.Index(block, "la text")
+			if laIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pglc_1 block\n  block=%q", "la text", block)
+			}
+			naIdx := strings.Index(block, "na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED")
+			if naIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the string-literal-argument function-call generated column on a partition leaf; want %q in pglc_1 block\n  block=%q", "na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED", block)
+			}
+			// Guard against the pre-fix regression: the malformed bare-literal
+			// form must NOT appear (quotes were dropped → `concat(ka, -, la)`).
+			if strings.Contains(block, "concat(ka, -, la)") {
+				t.Errorf("pg_dump emitted the pre-slice-294 malformed generation expr with the string literal's quotes dropped; got %q in pglc_1 block\n  block=%q", "concat(ka, -, la)", block)
+			}
+			// Attnum order: ka (1) before la (2) before na (3).
+			if kaIdx >= 0 && laIdx >= 0 && kaIdx > laIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pglc_1 block\n  block=%q", "ka", "la", block)
+			}
+			if laIdx >= 0 && naIdx >= 0 && laIdx > naIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pglc_1 block\n  block=%q", "la", "na", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pglc_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pglc_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pglc_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+
+		// **Slice 295 (asserted):** function-call generation expression whose
+		// string-literal argument's BODY IS A COMMA on a partition leaf — the
+		// adversarial complement to slice 294. The leaf pgkc_1 must print `ka text`,
+		// `la text`, then the inline generated
+		// `na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED` — with the
+		// comma literal RE-QUOTED and distinct from the separator commas. The
+		// regression guard below pins slice 294's TokenSymbol gating on the oracle
+		// path: a Value-based switch would have matched the literal `,` against the
+		// separator case and dropped its quotes, collapsing the block into the
+		// malformed `concat(ka,,,la)`.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgkc_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			kaIdx := strings.Index(block, "ka text")
+			if kaIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgkc_1 block\n  block=%q", "ka text", block)
+			}
+			laIdx := strings.Index(block, "la text")
+			if laIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgkc_1 block\n  block=%q", "la text", block)
+			}
+			naIdx := strings.Index(block, "na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED")
+			if naIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the comma-literal-argument function-call generated column on a partition leaf; want %q in pgkc_1 block\n  block=%q", "na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED", block)
+			}
+			// Guard against the pre-fix regression: the malformed collapsed-comma
+			// form must NOT appear (quotes dropped, literal merged into separators).
+			if strings.Contains(block, "concat(ka,,,la)") {
+				t.Errorf("pg_dump emitted the pre-slice-294 malformed generation expr with the comma literal collapsed into the separators; got %q in pgkc_1 block\n  block=%q", "concat(ka,,,la)", block)
+			}
+			// Attnum order: ka (1) before la (2) before na (3).
+			if kaIdx >= 0 && laIdx >= 0 && kaIdx > laIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pgkc_1 block\n  block=%q", "ka", "la", block)
+			}
+			if laIdx >= 0 && naIdx >= 0 && laIdx > naIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgkc_1 block\n  block=%q", "la", "na", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgkc_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgkc_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgkc_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+
+		// **Slice 296 (asserted):** function-call generation expression whose
+		// string-literal argument's BODY IS A SINGLE QUOTE on a partition leaf — the
+		// adversarial complement to slices 294 (body `-`) and 295 (body `,`), and the
+		// only fixture that exercises slice 294's quote-DOUBLING on the oracle path.
+		// The leaf pgqc_1 must print `ka text`, `la text`, then the inline generated
+		// `na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED` — the embedded
+		// quote DOUBLED to the balanced four-quote literal. The regression guards
+		// below pin renderTok's quote-doubling: a fix that re-quoted but forgot to
+		// double the embedded `'` would emit the unbalanced three-quote
+		// `concat(ka, ''', la)`; the pre-slice-294 raw space-join would emit the
+		// single-quote `concat(ka, ', la)` (the lone `'` opening a phantom string).
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.pgqc_1 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			kaIdx := strings.Index(block, "ka text")
+			if kaIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgqc_1 block\n  block=%q", "ka text", block)
+			}
+			laIdx := strings.Index(block, "la text")
+			if laIdx < 0 {
+				t.Errorf("pg_dump dropped an inherited plain column on a partition leaf; want %q in pgqc_1 block\n  block=%q", "la text", block)
+			}
+			naIdx := strings.Index(block, "na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED")
+			if naIdx < 0 {
+				t.Errorf("pg_dump dropped/corrupted the embedded-quote-literal-argument function-call generated column on a partition leaf; want %q in pgqc_1 block\n  block=%q", "na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED", block)
+			}
+			// Guard against the forgot-to-double regression: the unbalanced
+			// three-quote form must NOT appear (embedded quote re-quoted but not
+			// doubled). `''''` contains `'''` as a substring, so match the full
+			// generated column text minus the trailing quote to isolate the bug.
+			if strings.Contains(block, "concat(ka, ''', la)") {
+				t.Errorf("pg_dump emitted the forgot-to-double malformed generation expr (embedded quote not doubled); got %q in pgqc_1 block\n  block=%q", "concat(ka, ''', la)", block)
+			}
+			// Attnum order: ka (1) before la (2) before na (3).
+			if kaIdx >= 0 && laIdx >= 0 && kaIdx > laIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before %q in pgqc_1 block\n  block=%q", "ka", "la", block)
+			}
+			if laIdx >= 0 && naIdx >= 0 && laIdx > naIdx {
+				t.Errorf("pg_dump emitted partition-leaf columns out of attnum order; want %q before generated %q in pgqc_1 block\n  block=%q", "la", "na", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.pgqc_1\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ATTACH PARTITION public.pgqc_1 FOR VALUES IN ('a')") {
+			t.Errorf("pg_dump dropped the partition leaf's ATTACH bound; missing %q\n  full stdout=%q", "ATTACH PARTITION public.pgqc_1 FOR VALUES IN ('a')", res.Stdout)
+		}
+		// **Slice 267 (asserted):** local CHECK on a legacy (non-partition) INHERITS
+		// child. Unlike the partition leaves above (whose ispartition forces every
+		// column to print), ichk_child must (1) print ONLY its local column `extra`
+		// — the inherited `pid`/`pname` are omitted because shouldPrintColumn gates
+		// on attislocal alone here — (2) emit its conislocal CHECK
+		// `CONSTRAINT ichk_child_pos CHECK ((extra > 0))` inside that body, and
+		// (3) close with the `INHERITS (public.ichk_parent)` clause (legacy
+		// inheritance, NOT an ATTACH). A regression that re-emitted the inherited
+		// columns, dropped the conislocal CHECK, or lost the INHERITS clause would
+		// produce a structurally different table on restore.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.ichk_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the legacy child's local column; want %q in ichk_child block\n  block=%q", "extra integer", block)
+			}
+			if !strings.Contains(block, "CONSTRAINT ichk_child_pos CHECK ((extra > 0))") {
+				t.Errorf("pg_dump dropped the legacy child's local CHECK; want %q in ichk_child block\n  block=%q", "CONSTRAINT ichk_child_pos CHECK ((extra > 0))", block)
+			}
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in ichk_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.ichk_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.ichk_parent)") {
+			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.ichk_parent)", res.Stdout)
+		}
+		// **Slice 268 (asserted):** local column DEFAULT on a legacy (non-partition)
+		// INHERITS child. Like ichk_child above, idfl_child must (1) print ONLY its
+		// local column `extra` — the inherited `pid`/`pname` are omitted because
+		// shouldPrintColumn gates on attislocal alone — but now (2) that local column
+		// must carry its attrdef inline as `extra integer DEFAULT 42`, and (3) the
+		// block must close with the `INHERITS (public.idfl_parent)` clause. A
+		// regression that re-emitted the inherited columns, dropped the DEFAULT, or
+		// lost the INHERITS clause would restore a structurally different table.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.idfl_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer DEFAULT 42") {
+				t.Errorf("pg_dump dropped the legacy child's local DEFAULT; want %q in idfl_child block\n  block=%q", "extra integer DEFAULT 42", block)
+			}
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in idfl_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.idfl_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.idfl_parent)") {
+			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfl_parent)", res.Stdout)
+		}
+		// **Slice 269 (asserted):** child-level DEFAULT on an INHERITED column,
+		// emitted as a SEPARATE ALTER (not inline). idfa_child's CREATE TABLE
+		// body must print ONLY its local `extra` column — the inherited
+		// `pid`/`pname` are suppressed (attislocal=false) and arrive via the
+		// INHERITS clause — and the DEFAULT set on the suppressed `pid` must
+		// surface as the standalone statement
+		// `ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;`
+		// (pg_dump.c marks attrdefs[].separate for non-printed columns). A
+		// regression that lost the new AlterTableSetDefault support would drop
+		// the ALTER entirely (atthasdef=false → pg_dump emits nothing); a
+		// regression that re-emitted the inherited columns or rode the DEFAULT
+		// inline would diverge from PG 18.3.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.idfa_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the legacy child's local column; want %q in idfa_child block\n  block=%q", "extra integer", block)
+			}
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in idfa_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.idfa_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.idfa_parent)") {
+			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfa_parent)", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;") {
+			t.Errorf("pg_dump dropped the child-level DEFAULT on the inherited column; missing %q\n  full stdout=%q", "ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;", res.Stdout)
+		}
+		// **Slice 270 (asserted):** child-level NOT NULL on an INHERITED column,
+		// emitted as a standalone `NOT NULL pid` constraint item INSIDE the body
+		// (NOT a separate ALTER — the NOT NULL twin of the slice 269 DEFAULT
+		// case). idfn_child's CREATE TABLE body must print its local `extra`
+		// column AND `NOT NULL pid`; the inherited `pid`/`pname` are suppressed
+		// as full columns (attislocal=false) and arrive via INHERITS. Verified
+		// against real pg_dump 18.3: `NOT NULL pid` precedes `extra integer` in
+		// attnum order. A regression that lost AlterTableSetNotNull would drop
+		// the contype='n' constraint (pg_dump emits nothing); a regression that
+		// re-emitted the inherited columns or rode the constraint inline as
+		// `pid integer NOT NULL` would diverge from PG 18.3.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.idfn_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the legacy child's local column; want %q in idfn_child block\n  block=%q", "extra integer", block)
+			}
+			if !strings.Contains(block, "NOT NULL pid") {
+				t.Errorf("pg_dump dropped the child-level NOT NULL on the inherited column; want %q in idfn_child block\n  block=%q", "NOT NULL pid", block)
+			}
+			// The inherited columns must NOT be re-emitted as full columns.
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in idfn_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.idfn_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.idfn_parent)") {
+			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfn_parent)", res.Stdout)
+		}
+		// **Slice 271 (asserted):** a *named* NOT NULL on an inherited column,
+		// emitted as the `CONSTRAINT idfnn_nn NOT NULL pid` body form — the named
+		// counterpart of slice 270's unnamed `NOT NULL pid`. pg_dump prints the
+		// CONSTRAINT prefix only when the conname differs from the computed default
+		// `<table>_<col>_not_null` (pg_dump.c:17228), so the explicit `idfnn_nn`
+		// name must survive into pg_constraint.conname. idfnn_child's body must
+		// print its local `extra` column AND `CONSTRAINT idfnn_nn NOT NULL pid`;
+		// the inherited `pid`/`pname` are suppressed and arrive via INHERITS. A
+		// regression that dropped the explicit name would fall back to the unnamed
+		// form (no `CONSTRAINT idfnn_nn` prefix); one that lost AlterTableAddNotNull
+		// would emit nothing for the NOT NULL.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.idfnn_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the legacy child's local column; want %q in idfnn_child block\n  block=%q", "extra integer", block)
+			}
+			if !strings.Contains(block, "CONSTRAINT idfnn_nn NOT NULL pid") {
+				t.Errorf("pg_dump dropped the named child-level NOT NULL; want %q in idfnn_child block\n  block=%q", "CONSTRAINT idfnn_nn NOT NULL pid", block)
+			}
+			// The inherited columns must NOT be re-emitted as full columns.
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in idfnn_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.idfnn_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.idfnn_parent)") {
+			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfnn_parent)", res.Stdout)
+		}
+		// **Slice 272 (asserted):** a `NO INHERIT` NOT NULL on a STANDALONE table,
+		// dumped inline as `c integer NOT NULL NO INHERIT`. pg_dump appends ` NO
+		// INHERIT` after the inline `NOT NULL` only when pg_constraint reports
+		// connoinherit='t' (notnull_noinh[j]; pg_dump.c:17188); the column is local
+		// and the constraint name matches the default, so the UNNAMED inline form is
+		// emitted. A regression that lost the NoInherit thread (parser → executor →
+		// pg_constraint builder) would dump a plain `c integer NOT NULL` here.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer NOT NULL NO INHERIT") {
+				t.Errorf("pg_dump dropped the NO INHERIT on a standalone NOT NULL column; want %q in nninh block\n  block=%q", "c integer NOT NULL NO INHERIT", block)
+			}
+			if !strings.Contains(block, "d integer") {
+				t.Errorf("pg_dump dropped the standalone table's plain column; want %q in nninh block\n  block=%q", "d integer", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 273 (asserted):** a NAMED inline NOT NULL whose name differs from
+		// the auto-name forces pg_dump to re-emit the `CONSTRAINT <name>` prefix
+		// (pg_dump.c:17184). `c` carries NO INHERIT, `e` does not. A regression that
+		// dropped the inline named NOT NULL (the pre-slice-273 parser had no NOT
+		// NULL arm in the inline-CONSTRAINT switch) would dump a plain `c integer` /
+		// `e integer` with no NOT NULL at all.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh2 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer CONSTRAINT c_nn NOT NULL NO INHERIT") {
+				t.Errorf("pg_dump dropped the named NOT NULL NO INHERIT; want %q in nninh2 block\n  block=%q", "c integer CONSTRAINT c_nn NOT NULL NO INHERIT", block)
+			}
+			if !strings.Contains(block, "e integer CONSTRAINT e_nn NOT NULL") {
+				t.Errorf("pg_dump dropped the named NOT NULL; want %q in nninh2 block\n  block=%q", "e integer CONSTRAINT e_nn NOT NULL", block)
+			}
+			// The plain named NOT NULL on `e` must NOT spuriously gain NO INHERIT.
+			if strings.Contains(block, "e integer CONSTRAINT e_nn NOT NULL NO INHERIT") {
+				t.Errorf("pg_dump added a spurious NO INHERIT to a plain named NOT NULL\n  block=%q", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh2\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 274 (asserted):** a NAMED inline NOT NULL whose name EQUALS the
+		// computed default `<table>_<col>_not_null` must COLLAPSE to the bare
+		// `NOT NULL` form. The user spelled out `CONSTRAINT nninh3_c_not_null`,
+		// but because it matches pg_dump's default name the `CONSTRAINT <name>`
+		// prefix is dropped (pg_dump.c:17184). This is slice 273's boundary twin:
+		// 273 asserted the prefix is re-emitted when the name DIFFERS; here it is
+		// suppressed when the name MATCHES. A regression that always emitted the
+		// prefix for an explicitly-named NOT NULL would leak `CONSTRAINT
+		// nninh3_c_not_null` into the column definition.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh3 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer NOT NULL") {
+				t.Errorf("pg_dump dropped the NOT NULL on the default-named column; want %q in nninh3 block\n  block=%q", "c integer NOT NULL", block)
+			}
+			// The default-named NOT NULL must NOT carry a CONSTRAINT prefix.
+			if strings.Contains(block, "CONSTRAINT nninh3_c_not_null") {
+				t.Errorf("pg_dump leaked the default constraint name; want bare %q, not %q in nninh3 block\n  block=%q", "c integer NOT NULL", "CONSTRAINT nninh3_c_not_null", block)
+			}
+			if !strings.Contains(block, "d integer") {
+				t.Errorf("pg_dump dropped the standalone table's plain column; want %q in nninh3 block\n  block=%q", "d integer", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh3\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 275 (asserted):** a NAMED `NO INHERIT` NOT NULL added to a LOCAL
+		// column via `ALTER TABLE ... ADD CONSTRAINT nn4 NOT NULL c NO INHERIT`
+		// must dump INLINE as `c integer CONSTRAINT nn4 NOT NULL NO INHERIT` —
+		// identical to nninh2's inline-created `c`, proving the AlterTableAddNotNull
+		// executor threads act.NoInherit (operators_ddl.go:5498) and the conname
+		// just as the CREATE-TABLE-inline path does. A regression that dropped the
+		// NO INHERIT on the ALTER path would emit `c integer CONSTRAINT nn4 NOT
+		// NULL` (connoinherit='f'); one that dropped the name would emit a bare
+		// `c integer NOT NULL NO INHERIT`.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh4 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer CONSTRAINT nn4 NOT NULL NO INHERIT") {
+				t.Errorf("pg_dump dropped the named NO INHERIT NOT NULL added via ALTER; want %q in nninh4 block\n  block=%q", "c integer CONSTRAINT nn4 NOT NULL NO INHERIT", block)
+			}
+			if !strings.Contains(block, "d integer") {
+				t.Errorf("pg_dump dropped the standalone table's plain column; want %q in nninh4 block\n  block=%q", "d integer", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh4\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 276 (asserted, negative twin of slice 275):** a NAMED NOT NULL
+		// added to a LOCAL column via `ALTER TABLE ... ADD CONSTRAINT nn5 NOT NULL
+		// c` (no `NO INHERIT`) must dump INLINE as `c integer CONSTRAINT nn5 NOT
+		// NULL` and must NOT acquire a spurious ` NO INHERIT` suffix. This proves
+		// the AlterTableAddNotNull executor records connoinherit='f' when the
+		// trailer is absent — it does not fabricate NO INHERIT. A regression that
+		// defaulted connoinherit to 't' on the ALTER path would emit `c integer
+		// CONSTRAINT nn5 NOT NULL NO INHERIT` (the slice-275 byte form, wrong here).
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh5 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer CONSTRAINT nn5 NOT NULL") {
+				t.Errorf("pg_dump dropped the named NOT NULL added via ALTER; want %q in nninh5 block\n  block=%q", "c integer CONSTRAINT nn5 NOT NULL", block)
+			}
+			if strings.Contains(block, "CONSTRAINT nn5 NOT NULL NO INHERIT") {
+				t.Errorf("pg_dump fabricated a NO INHERIT suffix on the named NOT NULL; want bare %q, not %q in nninh5 block\n  block=%q", "c integer CONSTRAINT nn5 NOT NULL", "CONSTRAINT nn5 NOT NULL NO INHERIT", block)
+			}
+			if !strings.Contains(block, "d integer") {
+				t.Errorf("pg_dump dropped the standalone table's plain column; want %q in nninh5 block\n  block=%q", "d integer", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh5\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 277 (asserted, ALTER-path counterpart of slice 274):** a NAMED
+		// NOT NULL added to a LOCAL column via `ALTER TABLE ... ADD CONSTRAINT
+		// nninh6_c_not_null NOT NULL c`, whose explicit name EQUALS the auto-name
+		// `nninh6_c_not_null`, must COLLAPSE to the bare `c integer NOT NULL` form.
+		// pg_dump suppresses a NOT NULL constraint name when it matches the computed
+		// default (pg_dump.c:17184), so the explicit name must NOT leak into the
+		// dump. A regression storing a non-default conname on the ALTER path would
+		// emit `c integer CONSTRAINT nninh6_c_not_null NOT NULL`.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh6 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer NOT NULL") {
+				t.Errorf("pg_dump dropped the default-named NOT NULL added via ALTER; want %q in nninh6 block\n  block=%q", "c integer NOT NULL", block)
+			}
+			if strings.Contains(block, "CONSTRAINT nninh6_c_not_null") {
+				t.Errorf("pg_dump leaked the default constraint name from the ALTER path; want bare %q, not %q in nninh6 block\n  block=%q", "c integer NOT NULL", "CONSTRAINT nninh6_c_not_null", block)
+			}
+			if !strings.Contains(block, "d integer") {
+				t.Errorf("pg_dump dropped the standalone table's plain column; want %q in nninh6 block\n  block=%q", "d integer", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh6\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 278 (combines slice 277's collapse with slice 275's suffix):
+		// `ALTER TABLE public.nninh7 ADD CONSTRAINT nninh7_c_not_null NOT NULL c
+		// NO INHERIT`, whose explicit name EQUALS the auto-name `nninh7_c_not_null`,
+		// must COLLAPSE the `CONSTRAINT` prefix while keeping `NO INHERIT` — the
+		// bare `c integer NOT NULL NO INHERIT` form. pg_dump suppresses the
+		// matching default name (pg_dump.c:17184) but still appends ` NO INHERIT`
+		// from notnull_noinh (pg_dump.c:17187). A regression dropping the noinh bit
+		// would emit `c integer NOT NULL`; one storing a non-default conname would
+		// leak `CONSTRAINT nninh7_c_not_null`.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.nninh7 ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "c integer NOT NULL NO INHERIT") {
+				t.Errorf("pg_dump dropped the NO INHERIT or collapsed form on the default-named NO INHERIT NOT NULL added via ALTER; want %q in nninh7 block\n  block=%q", "c integer NOT NULL NO INHERIT", block)
+			}
+			if strings.Contains(block, "CONSTRAINT nninh7_c_not_null") {
+				t.Errorf("pg_dump leaked the default constraint name from the ALTER path; want bare %q, not %q in nninh7 block\n  block=%q", "c integer NOT NULL NO INHERIT", "CONSTRAINT nninh7_c_not_null", block)
+			}
+			if !strings.Contains(block, "d integer") {
+				t.Errorf("pg_dump dropped the standalone table's plain column; want %q in nninh7 block\n  block=%q", "d integer", block)
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.nninh7\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 279 (inherited-child counterpart of slice 277):
+		// `ALTER TABLE public.idfnd_child ADD CONSTRAINT idfnd_child_pid_not_null
+		// NOT NULL pid`, whose explicit name EQUALS the auto-name
+		// `idfnd_child_pid_not_null`, must COLLAPSE the `CONSTRAINT` prefix in the
+		// STANDALONE body form — the bare `NOT NULL pid` (pg_dump.c:17225-17232
+		// emits `NOT NULL <col>` when notnull_constrs[j] is empty). idfnd_child's
+		// body must print its local `extra` column AND `NOT NULL pid`; the inherited
+		// `pid`/`pname` are suppressed and arrive via INHERITS. A regression storing
+		// a non-default conname would leak `CONSTRAINT idfnd_child_pid_not_null`;
+		// one that lost AlterTableAddNotNull would emit nothing for the NOT NULL.
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.idfnd_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the legacy child's local column; want %q in idfnd_child block\n  block=%q", "extra integer", block)
+			}
+			if !strings.Contains(block, "NOT NULL pid") {
+				t.Errorf("pg_dump dropped the default-named NOT NULL on the inherited column; want %q in idfnd_child block\n  block=%q", "NOT NULL pid", block)
+			}
+			if strings.Contains(block, "CONSTRAINT idfnd_child_pid_not_null") {
+				t.Errorf("pg_dump leaked the default constraint name from the ALTER path; want bare %q, not %q in idfnd_child block\n  block=%q", "NOT NULL pid", "CONSTRAINT idfnd_child_pid_not_null NOT NULL pid", block)
+			}
+			// The inherited columns must NOT be re-emitted as full columns.
+			for _, inheritedCol := range []string{"pid integer", "pname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in idfnd_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.idfnd_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.idfnd_parent)") {
+			t.Errorf("pg_dump dropped the legacy child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.idfnd_parent)", res.Stdout)
+		}
+		// Slice 280 (multi-column inherited NOT NULL body form — attnum ordering +
+		// per-column collapse): mninh_child carries two conislocal NOT NULL
+		// constraints on distinct inherited columns, added in reverse attnum order.
+		// The body must (1) print the local `extra` column, (2) collapse `ma`'s
+		// default-named constraint to the bare `NOT NULL ma`, (3) keep `mb`'s
+		// non-default name as `CONSTRAINT mninh_named NOT NULL mb`, (4) emit `ma`
+		// BEFORE `mb` (attnum order despite mb being ALTERed first), and (5) suppress
+		// the inherited columns (they arrive via INHERITS).
+		if start := strings.Index(res.Stdout, "CREATE TABLE public.mninh_child ("); start >= 0 {
+			rest := res.Stdout[start:]
+			end := strings.Index(rest, ");")
+			if end < 0 {
+				end = len(rest)
+			}
+			block := rest[:end]
+			if !strings.Contains(block, "extra integer") {
+				t.Errorf("pg_dump dropped the child's local column; want %q in mninh_child block\n  block=%q", "extra integer", block)
+			}
+			maIdx := strings.Index(block, "NOT NULL ma")
+			mbIdx := strings.Index(block, "NOT NULL mb")
+			if maIdx < 0 {
+				t.Errorf("pg_dump dropped the default-named NOT NULL on inherited column ma; want %q in mninh_child block\n  block=%q", "NOT NULL ma", block)
+			}
+			if mbIdx < 0 {
+				t.Errorf("pg_dump dropped the named NOT NULL on inherited column mb; want %q in mninh_child block\n  block=%q", "NOT NULL mb", block)
+			}
+			if strings.Contains(block, "CONSTRAINT mninh_child_ma_not_null") {
+				t.Errorf("pg_dump leaked the default constraint name from the ALTER path; want bare %q, not %q in mninh_child block\n  block=%q", "NOT NULL ma", "CONSTRAINT mninh_child_ma_not_null NOT NULL ma", block)
+			}
+			if !strings.Contains(block, "CONSTRAINT mninh_named NOT NULL mb") {
+				t.Errorf("pg_dump dropped the non-default constraint name on mb; want %q in mninh_child block\n  block=%q", "CONSTRAINT mninh_named NOT NULL mb", block)
+			}
+			if maIdx >= 0 && mbIdx >= 0 && maIdx >= mbIdx {
+				t.Errorf("pg_dump emitted the standalone NOT NULL body items out of attnum order; want %q (attnum 1) before %q (attnum 2) despite mb being ALTERed first\n  block=%q", "NOT NULL ma", "NOT NULL mb", block)
+			}
+			// The inherited columns must NOT be re-emitted as full columns.
+			for _, inheritedCol := range []string{"ma integer", "mb integer", "mname text"} {
+				if strings.Contains(block, inheritedCol) {
+					t.Errorf("pg_dump re-emitted inherited column %q in mninh_child (should arrive via INHERITS)\n  block=%q", inheritedCol, block)
+				}
+			}
+		} else {
+			t.Errorf("pg_dump missing CREATE TABLE public.mninh_child\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "INHERITS (public.mninh_parent)") {
+			t.Errorf("pg_dump dropped the multi-col child's INHERITS clause; missing %q\n  full stdout=%q", "INHERITS (public.mninh_parent)", res.Stdout)
+		}
 		// **Slice 172 (asserted):** multi-parent legacy inheritance. minh_child
 		// inherits from BOTH minh_a and minh_b, which share column `shared` (merged
 		// once). The same machinery slice 170 added for a single parent must, for two
@@ -3669,6 +5869,47 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(block, "1 IS DISTINCT FROM 2") {
 				t.Errorf("pg_dump dropped/corrupted the IS DISTINCT FROM default; want %q in defcol block\n  block=%q", "1 IS DISTINCT FROM 2", block)
 			}
+			// **Slice 297 (asserted):** a NESTED-arithmetic column DEFAULT must
+			// round-trip with PG-faithful FULL parenthesization. The `calc` column
+			// carries `DEFAULT (1 + 2) * 3`, parsed as Mul(Add(1,2), 3). PG's
+			// pg_get_expr (prettyFlags=0, the mode pg_dump uses for pg_attrdef.adbin)
+			// wraps every binary OpExpr node, so real PG 18.3 emits
+			// `DEFAULT ((1 + 2) * 3)` (empirically verified). Before slice 297
+			// formatExprForAttrdef rendered the operator WITHOUT parens, so the dump
+			// emitted `DEFAULT 1 + 2 * 3` — which re-parses to Mul(1, Mul(2,3)) and
+			// evaluates to 7, not 9, on restore: a SILENT precedence corruption.
+			// The fix wraps each BinaryOp `(left op right)`; the recursion
+			// parenthesizes the inner Add. Assert the fully-parenthesized form.
+			if !strings.Contains(block, "calc integer DEFAULT ((1 + 2) * 3)") {
+				t.Errorf("pg_dump dropped/corrupted the nested-arithmetic default; want %q in defcol block\n  block=%q", "calc integer DEFAULT ((1 + 2) * 3)", block)
+			}
+			// Guard the pre-fix corruption shape explicitly: the un-parenthesized
+			// `DEFAULT 1 + 2 * 3` (precedence-changed) must NOT appear.
+			if strings.Contains(block, "DEFAULT 1 + 2 * 3") {
+				t.Errorf("pg_dump emitted the precedence-corrupted (un-parenthesized) nested-arithmetic default `DEFAULT 1 + 2 * 3`\n  block=%q", block)
+			}
+		}
+		// **Slice 302 (asserted):** a UNARY-MINUS column DEFAULT on a compound
+		// operand. The parser tags unary minus with OpUnaryNeg (NOT OpSub), but
+		// both deparse twins only handled OpSub — so a `DEFAULT -…` fell through to
+		// fmt.Sprintf("%v", e) and dumped a Go pointer string. `negdef.nb` carries
+		// `DEFAULT -(1 + 2)` and `negdef.nc` carries `DEFAULT -(1 + 2) * 3`. PG's
+		// get_rule_expr deparses a unary minus on a non-folded OpExpr as
+		// `(- (operand))`, so real pg_dump 18.3 emits `DEFAULT (- (1 + 2))` and
+		// `DEFAULT ((- (1 + 2)) * 3)` (empirically verified). Assert the PG-faithful
+		// forms.
+		for _, sub := range []string{
+			"nb integer DEFAULT (- (1 + 2))",
+			"nc integer DEFAULT ((- (1 + 2)) * 3)",
+		} {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped/corrupted a unary-minus default; want %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// Guard the pre-fix corruption shape: the OpUnaryNeg fall-through dumped a
+		// Go pointer string `&{… - 0x…}`. Its `DEFAULT &{` form must NOT appear.
+		if strings.Contains(res.Stdout, "DEFAULT &{") {
+			t.Errorf("pg_dump emitted the pre-fix Go-pointer-string corruption for a unary-minus default (`DEFAULT &{…}`)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 182 (asserted):** per-column storage overrides. `storcol.a` was
 		// SET STORAGE EXTERNAL and `storcol.b` SET STORAGE MAIN; both differ from
@@ -4256,6 +6497,36 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if !strings.Contains(res.Stdout, "    LANGUAGE sql\n    AS $_$ SELECT $1 + $2 $_$;") {
 			t.Errorf("pg_dump dropped/mangled add_default's body\n  full stdout=%q", res.Stdout)
 		}
+		// **Slice 301 (asserted):** the function whose parameter DEFAULT is a
+		// nested-arithmetic binary op (add_calcdef) must round-trip the default as
+		// the FULLY parenthesized `((1 + 2) * 3)` — the function-arg-default deparse
+		// context of executor.defaultExprToSQL (the fourth, after slice 298 index
+		// predicate / 299 index column / 300 partition key). pg_dump reads the
+		// signature from pg_get_function_arguments(oid); goopg stores the canonical
+		// `((1 + 2) * 3)` in ArgDefaults and buildFunctionArguments emits it verbatim
+		// after ` DEFAULT `. A one-paren-short `(1 + 2) * 3` or a precedence-corrupted
+		// `1 + 2 * 3` (evaluates to 7 not 9 on restore) surfaces exactly here. Real
+		// pg_dump 18.3 renders (verified byte-identical):
+		//   CREATE FUNCTION public.add_calcdef(a integer DEFAULT ((1 + 2) * 3)) RETURNS integer
+		//       LANGUAGE sql
+		//       AS $_$ SELECT $1 $_$;
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.add_calcdef(a integer DEFAULT ((1 + 2) * 3)) RETURNS integer") {
+			t.Errorf("pg_dump dropped/corrupted add_calcdef's nested-arithmetic parameter default; want fully-parenthesized %q\n  full stdout=%q", "DEFAULT ((1 + 2) * 3)", res.Stdout)
+		}
+		// Negative guard: the precedence-corrupted one-paren-short form must NOT appear.
+		if strings.Contains(res.Stdout, "add_calcdef(a integer DEFAULT (1 + 2) * 3)") {
+			t.Errorf("pg_dump emitted the one-paren-short add_calcdef default (re-parses with wrong precedence)\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 302 (asserted, executor twin):** a UNARY-MINUS function-argument
+		// default. pg_dump rebuilds the signature from pg_get_function_arguments,
+		// which goopg answers from catalog.Routine.ArgDefaults (populated via
+		// executor.defaultExprToSQL). Before slice 302 the unary minus matched the
+		// dead OpSub arm and stored a Go pointer string; it now renders
+		// `(- (1 + 2))`, so real pg_dump 18.3 emits (empirically verified):
+		//   CREATE FUNCTION public.fneg(x integer DEFAULT (- (1 + 2))) RETURNS integer
+		if !strings.Contains(res.Stdout, "CREATE FUNCTION public.fneg(x integer DEFAULT (- (1 + 2))) RETURNS integer") {
+			t.Errorf("pg_dump dropped/corrupted fneg's unary-minus parameter default; want %q\n  full stdout=%q", "DEFAULT (- (1 + 2))", res.Stdout)
+		}
 		// **Slice 161 (asserted):** the SET-RETURNING function (gen_one) must
 		// round-trip its `RETURNS SETOF integer` return clause. pg_dump reads
 		// proretset/prorettype directly from pg_proc; goopg's runtime pg_proc view
@@ -4353,8 +6624,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		indexDefs := []string{
 			// plain (all-default ASC NULLS LAST) — no ordering clause
 			"CREATE INDEX foo_name_idx ON public.foo USING btree (name);",
-			// partial index predicate (slice-56 regression guard — already worked)
-			"CREATE INDEX foo_qty_partial_idx ON public.foo USING btree (qty) WHERE qty > 0;",
+			// partial index predicate. Slice 298 PRODUCTION fix: real pg_dump 18.3
+			// fully parenthesizes the predicate (pg_get_expr prettyFlags=0), so even a
+			// single top-level comparison dumps as `WHERE (qty > 0)`, not the bare
+			// `WHERE qty > 0` goopg previously emitted — a fidelity divergence the
+			// old self-substring assertion masked.
+			"CREATE INDEX foo_qty_partial_idx ON public.foo USING btree (qty) WHERE (qty > 0);",
+			// Slice 298: nested arithmetic in the predicate must be fully
+			// parenthesized to preserve precedence on restore (verified byte-identical
+			// vs real pg_dump 18.3).
+			"CREATE INDEX foo_calc_partial_idx ON public.foo USING btree (qty) WHERE (((qty + id) * mgr_id) > 0);",
+			// Slice 299: a nested-arithmetic expression-index COLUMN. pg_get_indexdef
+			// wraps the deparsed key `((qty + id) * mgr_id)` in `(%s)` inside the
+			// `USING btree (...)` column-list parens → four nested parens, byte-identical
+			// to real pg_dump 18.3. Locks in slice 298's defaultExprToSQL BinaryOp
+			// parenthesization in the index-key-expression deparse context.
+			"CREATE INDEX foo_calc_expr_idx ON public.foo USING btree ((((qty + id) * mgr_id)));",
 			// DESC with a non-default NULLS LAST override
 			"CREATE INDEX foo_name_desc_idx ON public.foo USING btree (name DESC NULLS LAST);",
 			// DESC (default NULLS FIRST suppressed) + ASC NULLS FIRST override
@@ -4392,6 +6677,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped/mangled a secondary index; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// Slice 298 negative guard: the precedence-corrupt under-parenthesized
+		// predicate must NOT appear — its presence would mean a restore re-parses
+		// `(qty + id) * mgr_id` as `qty + (id * mgr_id)`, silently changing which
+		// rows the partial index covers.
+		if strings.Contains(res.Stdout, "WHERE qty + id * mgr_id") {
+			t.Errorf("pg_dump emitted a precedence-corrupt (under-parenthesized) index predicate\n  full stdout=%q", res.Stdout)
+		}
+		// Slice 299 negative guard: the precedence-corrupt under-parenthesized
+		// expression-INDEX-COLUMN form must NOT appear — `(qty + id * mgr_id)` would
+		// restore as `qty + (id * mgr_id)`, silently changing the indexed value.
+		if strings.Contains(res.Stdout, "(qty + id * mgr_id)") {
+			t.Errorf("pg_dump emitted a precedence-corrupt (under-parenthesized) expression-index column\n  full stdout=%q", res.Stdout)
 		}
 		// Slice 134/135/136/137/138 (regression guard): a plain unique/secondary
 		// index or a default-distinct UNIQUE constraint must NOT gain a stray NULLS

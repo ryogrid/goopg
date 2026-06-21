@@ -39,6 +39,12 @@ type BeginStmt struct {
 	pos            int
 	IsolationLevel string // "" = use session default
 	ReadOnly       bool   // true when START TRANSACTION READ ONLY / BEGIN READ ONLY
+	// Deferrable is true when the DEFERRABLE transaction mode was supplied
+	// (and NOT cleared by a later NOT DEFERRABLE). For a SERIALIZABLE READ ONLY
+	// transaction it requests the GetSafeSnapshot deferral (predicate.c): the
+	// transaction waits for a safe snapshot instead of risking a 40001 abort.
+	// M0118-0001 (read-only-anomaly-3).
+	Deferrable bool
 }
 
 func (s *BeginStmt) Pos() int  { return s.pos }
@@ -959,6 +965,13 @@ type ColumnDef struct {
 	// (PG18: `c int NOT NULL NO INHERIT`). goopg v0 tracks the flag to emit
 	// the partitioned-table error for LIKE INCLUDING ALL. M0097-0023.
 	NotNullNoInherit bool
+	// NotNullConstraintName holds the user-given name when the inline NOT NULL is
+	// written with an explicit `CONSTRAINT <name>` prefix
+	// (`c int CONSTRAINT myname NOT NULL [NO INHERIT]`). When this differs from
+	// PG's auto-name (<table>_<col>_not_null), pg_dump re-emits the inline
+	// `CONSTRAINT <name> NOT NULL` form rather than a bare `NOT NULL`. Empty for
+	// the common unnamed case. DU-002 slice 273.
+	NotNullConstraintName string
 	// CheckNoInherit is true when the inline CHECK constraint carries NO INHERIT.
 	// Stored so LIKE INCLUDING ALL can error on partitioned tables. M0097-0023.
 	CheckNoInherit bool
@@ -1755,10 +1768,55 @@ const (
 	// column purely for pg_dump round-trip fidelity (goopg does not TOAST).
 	// CompressionType holds the method; ColumnName holds the column. DU-002 slice 183.
 	AlterTableSetCompression
+	// AlterTableSetDefault — `ALTER COLUMN name SET DEFAULT expr`.
+	// Records the parsed DEFAULT expression on the catalog column
+	// (Column.DefaultExpr) so it surfaces in pg_attrdef and round-trips
+	// through pg_dump — inline on a printed local column, or as a separate
+	// `ALTER TABLE ONLY ... ALTER COLUMN ... SET DEFAULT` when the column is a
+	// suppressed inherited column. DefaultExpr holds the expression;
+	// ColumnName holds the column. DU-002 slice 269.
+	AlterTableSetDefault
+	// AlterTableDropDefault — `ALTER COLUMN name DROP DEFAULT`.
+	// Clears the catalog column's DEFAULT expression. ColumnName holds the
+	// column. DU-002 slice 269.
+	AlterTableDropDefault
+	// AlterTableSetNotNull — `ALTER COLUMN name SET NOT NULL`.
+	// Marks the catalog column NOT NULL (Column.NotNull) and records a named
+	// NOT NULL constraint (pg_constraint contype='n', conislocal='t') so it
+	// surfaces in pg_attribute.attnotnull and round-trips through pg_dump —
+	// inline on a printed local column, or as a standalone `NOT NULL <col>`
+	// constraint item in the child CREATE TABLE body when the column is a
+	// suppressed inherited column (pg_dump.c:17213). ColumnName holds the
+	// column. DU-002 slice 270.
+	AlterTableSetNotNull
+	// AlterTableDropNotNull — `ALTER COLUMN name DROP NOT NULL`.
+	// Clears the catalog column's NOT NULL and drops its contype='n'
+	// constraint. ColumnName holds the column. DU-002 slice 270.
+	AlterTableDropNotNull
+	// AlterTableAddNotNull — `ADD [CONSTRAINT name] NOT NULL col [NO INHERIT]`.
+	// The named (PG18) counterpart of AlterTableSetNotNull: marks the column
+	// NOT NULL and records a contype='n' constraint carrying the EXPLICIT name
+	// from ConstraintName (auto-named `<table>_<col>_not_null` when omitted).
+	// When the name differs from that default, pg_dump prints the
+	// `CONSTRAINT <name> NOT NULL <col>` form (pg_dump.c:17228). ColumnName
+	// holds the column; ConstraintName holds the optional name; NoInherit is
+	// set for the `NO INHERIT` trailer. DU-002 slice 271.
+	AlterTableAddNotNull
 	// AlterIndexAttachPartition — `ALTER INDEX parent ATTACH PARTITION child`.
 	// Registers child as a partition of parent in the index partition tree.
 	// ConstraintName holds the parent index name; ChildIndexName holds the child. M0097-0023.
 	AlterIndexAttachPartition
+	// AlterTableSetReloptions — `ALTER TABLE name SET (param = value, …)`.
+	// Merges table-level storage parameters into the relation's reloptions
+	// (e.g. parallel_workers, fillfactor, autovacuum_enabled, toast_tuple_target).
+	// With holds the parsed name→value pairs. Only options goopg models as
+	// pg_class.reloptions take effect; others are accepted and ignored, matching
+	// the CREATE TABLE WITH path. M0118-0001.
+	AlterTableSetReloptions
+	// AlterTableResetReloptions — `ALTER TABLE name RESET (param, …)`.
+	// Clears the named table-level storage parameters back to their defaults.
+	// With holds the option names as keys (values empty). M0118-0001.
+	AlterTableResetReloptions
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1814,12 +1872,23 @@ type AlterTableAction struct {
 	// CompressionType is the TOAST compression method for AlterTableSetCompression.
 	// Values: "pglz", "lz4". DU-002 slice 183.
 	CompressionType string
+	// DefaultExpr is the parsed DEFAULT expression for AlterTableSetDefault
+	// (`ALTER COLUMN name SET DEFAULT expr`). Nil for AlterTableDropDefault.
+	// DU-002 slice 269.
+	DefaultExpr Expr
 	// SetOptions holds the per-column attribute options captured from
 	// `ALTER COLUMN name SET (opt=value, …)` for AlterTableAlterColumnSet, each
 	// entry normalized to PG's stored `name=value` form (e.g. "n_distinct=0.5").
 	// Recorded on catalog.Column.Options so pg_dump re-emits the clause via
 	// pg_attribute.attoptions. DU-002 slice 185.
 	SetOptions []string
+	// With holds the table-level storage parameters for AlterTableSetReloptions
+	// (name→value) and the option names for AlterTableResetReloptions (names as
+	// keys, empty values). Parsed by parseWithOptions. M0118-0001.
+	With map[string]string
+	// NoInherit is set for AlterTableAddNotNull when the constraint carries a
+	// `NO INHERIT` trailer (contype='n', connoinherit='t'). DU-002 slice 271.
+	NoInherit bool
 	// ChildIndexName is populated for AlterIndexAttachPartition and holds
 	// the name of the child index to attach. M0097-0023.
 	ChildIndexName string

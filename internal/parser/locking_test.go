@@ -127,6 +127,41 @@ func TestParseSelectForUpdateAfterLimit(t *testing.T) {
 	}
 }
 
+// TestParseSelectForUpdateBeforeLimit — PostgreSQL's grammar permits the
+// select_limit to FOLLOW the for_locking_clause as well:
+// `... ORDER BY id FOR UPDATE [SKIP LOCKED | NOWAIT] LIMIT n`. The upstream
+// skip-locked / nowait isolation specs emit exactly this ordering. Before
+// M0118-0003 the parser rejected the trailing LIMIT with a syntax error.
+func TestParseSelectForUpdateBeforeLimit(t *testing.T) {
+	cases := []struct {
+		sql        string
+		wantPolicy LockWaitPolicy
+	}{
+		{"SELECT * FROM queue ORDER BY id FOR UPDATE LIMIT 1", LockWaitBlock},
+		{"SELECT * FROM queue ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1", LockWaitSkipLocked},
+		{"SELECT * FROM queue ORDER BY id FOR UPDATE NOWAIT LIMIT 1", LockWaitNoWait},
+		{"SELECT * FROM queue ORDER BY id FOR UPDATE LIMIT 1 OFFSET 2", LockWaitBlock},
+	}
+	for _, tc := range cases {
+		t.Run(tc.sql, func(t *testing.T) {
+			stmts, err := Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+			}
+			s := stmts[0].(*SelectStmt)
+			if len(s.Locking) != 1 {
+				t.Fatalf("Locking len = %d, want 1", len(s.Locking))
+			}
+			if s.Locking[0].WaitPolicy != tc.wantPolicy {
+				t.Errorf("WaitPolicy = %v, want %v", s.Locking[0].WaitPolicy, tc.wantPolicy)
+			}
+			if s.Limit == nil {
+				t.Error("Limit nil — trailing LIMIT after locking clause was dropped")
+			}
+		})
+	}
+}
+
 // TestParseSelectForRejectsBadStrength — only UPDATE / SHARE are
 // accepted in v0; anything else (e.g. FOR READ ONLY, FOR ALL) is
 // rejected at parse time.

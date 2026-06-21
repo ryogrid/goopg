@@ -87,6 +87,21 @@ func (m Mode) String() string {
 	return modeNames[m]
 }
 
+// ParseMode maps an upstream lock-mode name (the canonical internal
+// spelling, e.g. "AccessExclusiveLock") back to its Mode. Returns
+// (NoLock, false) for an unrecognised name. The SQL parser emits
+// exactly these names for `LOCK TABLE ... IN <mode> MODE`, so the
+// executor can round-trip the requested mode into the lock manager
+// without a second translation table.
+func ParseMode(name string) (Mode, bool) {
+	for i := 1; i < len(modeNames); i++ {
+		if modeNames[i] == name {
+			return Mode(i), true
+		}
+	}
+	return NoLock, false
+}
+
 // conflictTab is the bitmask of modes a given mode conflicts with.
 // Index = mode (1..8); slot 0 unused. Taken verbatim from
 // postgres/src/backend/storage/lmgr/lock.c LockConflicts[].
@@ -207,6 +222,53 @@ func (s *lockState) grantedExcept(b BackendID) Mask {
 	return g
 }
 
+// canGrantImmediately reports whether a request for mode `m` by backend
+// `b` can be satisfied without blocking. It captures two upstream cases:
+//
+//  1. No conflict with other backends' holdings and no waiter queued —
+//     the plain immediate grant in LockAcquireExtended (lock.c).
+//  2. `b` already holds a lock on the tag and would be inserted ahead of
+//     a waiter whose requested mode conflicts with what `b` holds, and
+//     the new request conflicts neither with the requests ahead of that
+//     insertion point nor with any other backend's current holdings —
+//     the "special case" early grant in JoinWaitQueue (proc.c). This is
+//     what lets a backend that already holds, say, AccessExclusive take
+//     a weaker self-compatible mode immediately even while a conflicting
+//     EXCLUSIVE waiter is parked ahead of it (the lock-nowait spec).
+//
+// Caller must hold lm.mu and must already have handled the "already hold
+// m exactly" no-op. The deadlock sub-case from JoinWaitQueue (the ahead
+// waiter holds a lock that conflicts with `m`) is subsumed by the
+// grantedExcept conflict check: that holder's mode is in `others`, so we
+// simply decline and let the normal wait path / deadlock detector run.
+func (s *lockState) canGrantImmediately(b BackendID, m Mode) bool {
+	others := s.grantedExcept(b)
+	if len(s.waiters) == 0 {
+		return !ConflictsWith(m, others)
+	}
+	// Early-grant special case only applies when b already holds a lock
+	// on this tag (upstream: `myHeldLocks != 0`).
+	myHeld := s.holders[b]
+	if myHeld == 0 {
+		return false
+	}
+	var aheadRequests Mask
+	for _, w := range s.waiters {
+		if w.Backend == b {
+			continue
+		}
+		// Must this waiter wait for me? (its requested mode conflicts
+		// with a lock I already hold). If so, I'd be inserted ahead of
+		// it; grant now iff I conflict with neither the requests ahead
+		// of the insertion point nor any other backend's holdings.
+		if ConflictsWith(w.Mode, myHeld) {
+			return !ConflictsWith(m, aheadRequests) && !ConflictsWith(m, others)
+		}
+		aheadRequests |= bit(w.Mode)
+	}
+	return false
+}
+
 // LockManager is the lock table. Use New to construct.
 type LockManager struct {
 	mu              sync.Mutex
@@ -275,7 +337,7 @@ func (lm *LockManager) TryAcquire(b BackendID, t LockTag, m Mode) error {
 	if st.holders[b]&bit(m) != 0 {
 		return nil
 	}
-	if len(st.waiters) == 0 && !ConflictsWith(m, st.grantedExcept(b)) {
+	if st.canGrantImmediately(b, m) {
 		st.holders[b] |= bit(m)
 		st.granted |= bit(m)
 		return nil
@@ -298,11 +360,13 @@ func (lm *LockManager) Acquire(ctx context.Context, b BackendID, t LockTag, m Mo
 		lm.mu.Unlock()
 		return nil
 	}
-	// No conflict and no waiters in front? Grant immediately.
-	// If any waiters are queued, falling in behind them preserves
-	// FIFO fairness so a strong waiter doesn't get starved by a
-	// stream of compatible-with-current-holders newcomers.
-	if len(st.waiters) == 0 && !ConflictsWith(m, st.grantedExcept(b)) {
+	// Grant immediately when there's no conflict and no waiter to fall
+	// in behind, or when this backend already holds a lock here and may
+	// jump ahead of a conflicting waiter (canGrantImmediately captures
+	// both upstream cases). Otherwise queueing behind waiters preserves
+	// FIFO fairness so a strong waiter doesn't get starved by a stream
+	// of compatible-with-current-holders newcomers.
+	if st.canGrantImmediately(b, m) {
 		st.holders[b] |= bit(m)
 		st.granted |= bit(m)
 		lm.mu.Unlock()

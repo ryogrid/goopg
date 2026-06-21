@@ -1267,6 +1267,18 @@ type LockRows struct {
 	pos   int
 	Child Node
 	Locks []LockedRel
+
+	// LimitCount / OffsetCount carry the LIMIT / OFFSET expressions when a
+	// SKIP LOCKED query's Limit was lifted ABOVE this LockRows. PG plans
+	// `Limit → LockRows → Sort` so the row lock claims rows in the LIMIT's
+	// order and stops after LIMIT (+OFFSET) *successfully-locked* rows,
+	// skipping rows held by other transactions. goopg's default plan puts the
+	// Limit below the LockRows, which would cut the scan before locking and
+	// turn a skipped row into a missing result. The executor evaluates these
+	// at Open to cap drainAndStamp at LIMIT+OFFSET locked rows. nil when no
+	// Limit was lifted (unbounded drain). M0118-0003.
+	LimitCount  Expr
+	OffsetCount Expr
 }
 
 func (n *LockRows) Pos() int       { return n.pos }
@@ -1464,6 +1476,7 @@ type Transaction struct {
 	Name           string // savepoint name for TxSavepoint / TxRelease / TxRollbackTo
 	IsolationLevel string // for TxBegin: "read committed", "repeatable read", etc.; "" = session default
 	ReadOnly       bool   // for TxBegin: true when BEGIN/START TRANSACTION READ ONLY
+	Deferrable     bool   // for TxBegin: true when BEGIN/START TRANSACTION DEFERRABLE
 }
 
 func (n *Transaction) Pos() int       { return n.pos }

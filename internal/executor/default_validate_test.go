@@ -3,6 +3,8 @@ package executor
 import (
 	"strings"
 	"testing"
+
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestDefaultExprRejectsNestedColumnRefs is a regression test for the
@@ -120,6 +122,67 @@ func TestDefaultExprAcceptsConstantCompounds(t *testing.T) {
 
 			if err := runDDL(t, ctx, ddl); err != nil {
 				t.Fatalf("valid compound DEFAULT rejected: %v (%q)", err, ddl)
+			}
+		})
+	}
+}
+
+// TestDefaultExprToSQLBinaryParen guards the executor-side deparse renderer's
+// BinaryOp full parenthesization (DU-002 slice 298). defaultExprToSQL feeds the
+// non-pretty pg_get_expr contexts — index predicates (CREATE INDEX ... WHERE),
+// expression index columns, partition-key expressions, and function-argument
+// defaults. Real pg_dump 18.3 fully parenthesizes every binary OpExpr in those
+// contexts, so `qty > 0` dumps as `(qty > 0)` and `(qty + id) * mgr_id` dumps as
+// `((qty + id) * mgr_id)`. Without the parens, nested arithmetic round-trips with
+// corrupted precedence on restore. This is the executor twin of the catalog
+// renderer covered by TestFormatExprForAttrdefExpr; the two MUST stay in sync.
+func TestDefaultExprToSQLBinaryParen(t *testing.T) {
+	cases := []struct {
+		name string
+		expr parser.Expr
+		want string
+	}{
+		{
+			"simple comparison",
+			&parser.BinaryOp{Op: parser.OpGt, Left: &parser.ColumnRef{Column: "qty"}, Right: &parser.IntegerConst{Value: 0}},
+			"(qty > 0)",
+		},
+		{
+			"binary add",
+			&parser.BinaryOp{Op: parser.OpAdd, Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 1}},
+			"(1 + 1)",
+		},
+		{
+			// `(qty + id) * mgr_id > 0` parses to Gt(Mul(Add(qty,id),mgr_id),0); the
+			// recursion parenthesizes each operand → byte-identical to real pg_dump 18.3.
+			"nested arithmetic predicate",
+			&parser.BinaryOp{Op: parser.OpGt,
+				Left: &parser.BinaryOp{Op: parser.OpMul,
+					Left:  &parser.BinaryOp{Op: parser.OpAdd, Left: &parser.ColumnRef{Column: "qty"}, Right: &parser.ColumnRef{Column: "id"}},
+					Right: &parser.ColumnRef{Column: "mgr_id"}},
+				Right: &parser.IntegerConst{Value: 0}},
+			"(((qty + id) * mgr_id) > 0)",
+		},
+		{
+			// Unary minus is tagged OpUnaryNeg (NOT OpSub); a bare numeric operand
+			// renders `-N` (PG folds it to `'-N'::type`, deferred). DU-002 slice 302.
+			"unary minus literal",
+			&parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: &parser.IntegerConst{Value: 1}},
+			"-1",
+		},
+		{
+			// Unary minus on a COMPOUND operand deparses `(- (operand))`,
+			// byte-identical to real pg_dump 18.3. Twin of the catalog renderer's
+			// "unary minus compound" case; the two MUST stay in sync. DU-002 slice 302.
+			"unary minus compound",
+			&parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: &parser.BinaryOp{Op: parser.OpAdd, Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 2}}},
+			"(- (1 + 2))",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := defaultExprToSQL(tc.expr); got != tc.want {
+				t.Errorf("defaultExprToSQL = %q, want %q", got, tc.want)
 			}
 		})
 	}

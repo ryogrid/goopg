@@ -1563,27 +1563,27 @@ func (p *parser) parseCreateTableTail(pos int, unlogged bool) (Stmt, error) {
 								p.advance() // consume AS
 								if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
 									p.advance() // consume (
-									var exprToks []string
+									var exprToks []Token
 									exprDepth := 1
 									for exprDepth > 0 && p.cur().Kind != TokenEOF {
 										tok := p.cur()
 										if tok.Kind == TokenSymbol && tok.Value == "(" {
 											exprDepth++
-											exprToks = append(exprToks, tok.Value)
+											exprToks = append(exprToks, tok)
 										} else if tok.Kind == TokenSymbol && tok.Value == ")" {
 											exprDepth--
 											if exprDepth > 0 {
-												exprToks = append(exprToks, tok.Value)
+												exprToks = append(exprToks, tok)
 											}
 										} else {
-											exprToks = append(exprToks, tok.Value)
+											exprToks = append(exprToks, tok)
 										}
 										p.advance()
 									}
 									_ = p.acceptIdentKeyword("stored")
 									poc.ColGeneratedExprs = append(poc.ColGeneratedExprs, PartitionColGenerated{
 										ColName: curColName,
-										Expr:    strings.Join(exprToks, " "),
+										Expr:    joinGeneratedExprTokens(exprToks),
 									})
 								}
 							}
@@ -2454,6 +2454,77 @@ func normalizeCompressionMethod(method string) string {
 }
 
 // parseColumnDef parses `name TYPE [NOT NULL | PRIMARY KEY]`.
+// joinGeneratedExprTokens reconstructs the canonical SQL text of a
+// `GENERATED ALWAYS AS (...)` expression from its captured token stream. PG
+// stores the generation expression as a parsed node and pg_dump re-emits it via
+// pg_get_expr, which renders function calls tightly (`upper(fn)`,
+// `coalesce(a, b)`) and precedence-grouping parens tightly (`(a + b) * 2`) while
+// spacing binary operators. A naive strings.Join(toks, " ") produced
+// `upper ( fn )` / `( a + b ) * 2`, diverging from pg_get_expr and breaking the
+// pg_dump round-trip for any function-call or parenthesised generation
+// expression. This join keys off punctuation to match pg_get_expr's spacing for
+// the operator / function-call / grouping-paren / qualified-name surface goopg
+// supports. The result re-parses to the same node, so evalGeneratedExpr (which
+// re-parses the stored string) is unaffected. DU-002 slice 289.
+//
+// String-literal tokens get special handling (DU-002 slice 294): the lexer
+// stores a literal's UNQUOTED body (`'-'` → Value "-"), so they must be
+// re-quoted (with embedded single quotes doubled) to reproduce pg_get_expr's
+// rendering — otherwise `concat(ka, '-', la)` would round-trip as the malformed
+// `concat(ka, -, la)`. The punctuation spacing rules are also gated on
+// TokenSymbol so a literal whose body happens to be ")"/","/"("/"." can never be
+// mistaken for the matching punctuator; for the operator/call/grouping-paren
+// expressions of slices 283–293 (which contain no string literals) every
+// punctuator is already a TokenSymbol, so this gating is a no-op there.
+func joinGeneratedExprTokens(toks []Token) string {
+	// renderTok reproduces a token's canonical SQL text: string literals are
+	// re-quoted (their stored body is unquoted), everything else is verbatim.
+	renderTok := func(t Token) string {
+		if t.Kind == TokenStringLit {
+			return "'" + strings.ReplaceAll(t.Value, "'", "''") + "'"
+		}
+		return t.Value
+	}
+	var b strings.Builder
+	for i, t := range toks {
+		if i == 0 {
+			b.WriteString(renderTok(t))
+			continue
+		}
+		prev := toks[i-1]
+		noSpace := false
+		// The punctuation spacing rules apply to SYMBOL tokens only — a string
+		// literal whose body is ")"/","/"("/"." must not trigger them.
+		if t.Kind == TokenSymbol {
+			switch t.Value {
+			case ")", ",":
+				// Never a space before a close-paren or an argument comma.
+				noSpace = true
+			case "(":
+				// Tight before a call paren (prev is a function name or a closing
+				// paren); spaced before a grouping paren (prev is an operator,
+				// keyword, or open paren).
+				if prev.Kind == TokenIdent || prev.Kind == TokenQuotedIdent || (prev.Kind == TokenSymbol && prev.Value == ")") {
+					noSpace = true
+				}
+			case ".":
+				// Qualified name (`schema.func`): no space around the dot.
+				noSpace = true
+			}
+		}
+		// Tight after an open paren or a dot; the comma's trailing space is
+		// supplied by the default branch (the token after a comma is spaced).
+		if prev.Kind == TokenSymbol && (prev.Value == "(" || prev.Value == ".") {
+			noSpace = true
+		}
+		if !noSpace {
+			b.WriteByte(' ')
+		}
+		b.WriteString(renderTok(t))
+	}
+	return b.String()
+}
+
 func (p *parser) parseColumnDef() (ColumnDef, error) {
 	pos := p.cur().Pos
 	nameTok, err := p.parseIdent()
@@ -2570,10 +2641,13 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			if !p.acceptSymbol("(") {
 				return ColumnDef{}, p.errAtCur("expected '(' after GENERATED ALWAYS AS")
 			}
-			// Collect the raw expression text.
+			// Collect the raw expression tokens (kind + value) so the canonical
+			// join below can reproduce pg_get_expr's spacing — tight function
+			// calls (`upper(fn)`) and grouping parens (`(a + b) * 2`), spaced
+			// binary operators. DU-002 slice 289.
 			depth := 1
 			start := p.cur().Pos
-			var exprToks []string
+			var exprToks []Token
 			for depth > 0 && p.cur().Kind != TokenEOF {
 				t := p.cur()
 				if t.Kind == TokenSymbol && t.Value == "(" {
@@ -2584,7 +2658,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 						break
 					}
 				}
-				exprToks = append(exprToks, t.Value)
+				exprToks = append(exprToks, t)
 				p.advance()
 				_ = start
 			}
@@ -2604,7 +2678,7 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				col.GeneratedVirtual = true
 			}
 			col.GeneratedAlways = true
-			col.GeneratedExpr = strings.Join(exprToks, " ")
+			col.GeneratedExpr = joinGeneratedExprTokens(exprToks)
 		// WITH OPTIONS modifier in PARTITION OF column override (M0096-0007)
 		case p.acceptIdentKeyword("with"):
 			if p.acceptIdentKeyword("options") {
@@ -2758,6 +2832,24 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				// Optional DEFERRABLE trailer (named inline column UNIQUE).
 				// DU-002 slice 141.
 				p.parseConstraintDeferrable(&col.UniqueDeferrable, &col.UniqueInitiallyDeferred)
+			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
+				// CONSTRAINT name NOT NULL [NO INHERIT] — named inline NOT NULL.
+				// PG18 lets a column carry an explicitly named NOT NULL; when the
+				// name differs from the auto-name (<table>_<col>_not_null) pg_dump
+				// re-emits `<col> <type> CONSTRAINT <name> NOT NULL`. Capture the
+				// name + optional NO INHERIT so the constraint round-trips with its
+				// user-given name instead of being dropped by the default skip arm.
+				// DU-002 slice 273.
+				p.advance() // NOT
+				if _, err := p.expectKeyword(KwNull); err != nil {
+					return ColumnDef{}, err
+				}
+				col.NotNull = true
+				col.NotNullConstraintName = identText(cnameTok)
+				if p.acceptIdentKeyword("no") {
+					_ = p.acceptIdentKeyword("inherit")
+					col.NotNullNoInherit = true
+				}
 			case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwReferences:
 				// CONSTRAINT name REFERENCES table (cols) — FK; parsed below.
 				// Fall through to FK parsing path by continuing the outer loop.
@@ -4945,6 +5037,65 @@ func (p *parser) parseAlter() (Stmt, error) {
 				})
 				return stmt, nil
 			}
+			// SET DEFAULT expr — record the parsed DEFAULT expression on the
+			// catalog column. pg_dump re-emits it inline on a printed local
+			// column, or as a separate `ALTER TABLE ONLY ... ALTER COLUMN ...
+			// SET DEFAULT` when the column is a suppressed inherited column.
+			// DU-002 slice 269.
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+				p.advance() // consume DEFAULT
+				expr, err := p.parseExpr()
+				if err != nil {
+					return nil, err
+				}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:        AlterTableSetDefault,
+					ColumnName:  colName,
+					DefaultExpr: expr,
+				})
+				return stmt, nil
+			}
+			// SET NOT NULL — mark the column NOT NULL. The executor records a
+			// contype='n' constraint so pg_dump re-emits the NOT NULL: inline on
+			// a printed local column, or as a standalone `NOT NULL <col>` item in
+			// the child CREATE TABLE body when the column is a suppressed
+			// inherited column. DU-002 slice 270.
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
+				p.advance() // consume NOT
+				if _, err := p.expectKeyword(KwNull); err != nil {
+					return nil, err
+				}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:       AlterTableSetNotNull,
+					ColumnName: colName,
+				})
+				return stmt, nil
+			}
+		}
+		// DROP DEFAULT / DROP NOT NULL — clear the column's DEFAULT expression or
+		// NOT NULL flag. Other DROP forms (DROP IDENTITY, …) fall through to the
+		// no-op consume below for now. DU-002 slices 269, 270.
+		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDrop {
+			p.advance() // consume DROP
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+				p.advance() // consume DEFAULT
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:       AlterTableDropDefault,
+					ColumnName: colName,
+				})
+				return stmt, nil
+			}
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot {
+				p.advance() // consume NOT
+				if _, err := p.expectKeyword(KwNull); err != nil {
+					return nil, err
+				}
+				stmt.Actions = append(stmt.Actions, AlterTableAction{
+					Kind:       AlterTableDropNotNull,
+					ColumnName: colName,
+				})
+				return stmt, nil
+			}
 		}
 		// Check for TYPE newtype pattern.
 		// "type" is not in goopg's keyword map — arrives as TokenIdent.
@@ -5038,6 +5189,20 @@ func (p *parser) parseColumnSetOptions() []string {
 		}
 	}
 	return opts
+}
+
+// isAlterReloptVerb reports whether tok begins a table-level reloptions action
+// (`SET (...)` or `RESET (...)`). SET/RESET are unreserved keywords, so they may
+// arrive as a keyword token or, in some lexing contexts, a bare identifier;
+// accept both spellings (mirroring the ALTER COLUMN ... SET dispatch). M0118-0001.
+func isAlterReloptVerb(tok Token) bool {
+	if tok.Kind == TokenKeyword && (tok.Keyword == KwSet || tok.Keyword == KwReset) {
+		return true
+	}
+	if tok.Kind == TokenIdent && (strings.EqualFold(tok.Value, "set") || strings.EqualFold(tok.Value, "reset")) {
+		return true
+	}
+	return false
 }
 
 func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
@@ -5203,6 +5368,28 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			}, nil
 		}
 		return AlterTableAction{}, p.errAtCur("expected column or constraint name after DROP")
+	}
+	// SET (reloptions) / RESET (reloptions) — table-level storage parameters,
+	// e.g. `ALTER TABLE foo SET (parallel_workers = 2)` or
+	// `RESET (fillfactor)`. Only the parenthesized form is a reloptions update;
+	// the bare SET SCHEMA / SET TABLESPACE / SET LOGGED actions are distinct and
+	// fall through to the ADD/DROP dispatch below (unchanged). RESET shares the
+	// WITH-options parser — its option list carries bare names (empty values),
+	// and the executor clears the named storage parameters. M0118-0001.
+	if cur := p.cur(); isAlterReloptVerb(cur) && p.peek(1).Kind == TokenSymbol && p.peek(1).Value == "(" {
+		reset := cur.Kind == TokenKeyword && cur.Keyword == KwReset ||
+			cur.Kind == TokenIdent && strings.EqualFold(cur.Value, "reset")
+		pos := cur.Pos
+		p.advance() // SET or RESET
+		opts, err := p.parseWithOptions()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		kind := AlterTableSetReloptions
+		if reset {
+			kind = AlterTableResetReloptions
+		}
+		return AlterTableAction{pos: pos, Kind: kind, With: opts}, nil
 	}
 	if !p.acceptKeyword(KwAdd) {
 		return AlterTableAction{}, p.errAtCur("expected ADD or DROP")
@@ -5385,6 +5572,27 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			return AlterTableAction{pos: pos, Kind: AlterTableNoOp}, nil
 		}
 		act.Kind = AlterTableAddUnique
+		return act, nil
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwNot:
+		// ADD [CONSTRAINT name] NOT NULL col [NO INHERIT] — PG18 named NOT NULL
+		// constraint. The named counterpart of `ALTER COLUMN col SET NOT NULL`:
+		// when ConstraintName differs from PG's auto-name (<table>_<col>_not_null)
+		// pg_dump prints `CONSTRAINT <name> NOT NULL <col>`. DU-002 slice 271.
+		p.advance() // consume NOT
+		if _, err := p.expectKeyword(KwNull); err != nil {
+			return AlterTableAction{}, err
+		}
+		colTok, err := p.parseIdent()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		act.ColumnName = identText(colTok)
+		// Optional `NO INHERIT` trailer (connoinherit='t').
+		if p.acceptIdentKeyword("no") {
+			_ = p.acceptIdentKeyword("inherit")
+			act.NoInherit = true
+		}
+		act.Kind = AlterTableAddNotNull
 		return act, nil
 	default:
 		// ADD [COLUMN] column_def — bare ident or COLUMN keyword.

@@ -1063,6 +1063,75 @@ func TestCompareKeyToRangeBoundDisambiguation(t *testing.T) {
 	})
 }
 
+// TestRangeTupleMultiColumnOpenEdge exercises the multi-column RANGE routing path
+// where an unbounded MINVALUE/MAXVALUE edge sits on a NON-leading column, with a
+// concrete leading column — the exact bound shape pg_dump slice 262 round-trips
+// (FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)). Every prior routing test is
+// single-column, so the per-element flag tuples driving rangeStrTupleGE/LT across
+// a concrete prefix + open suffix were never directly exercised. DU-002 slice 262.
+func TestRangeTupleMultiColumnOpenEdge(t *testing.T) {
+	// pmc_lo: FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE).
+	from := []string{"MINVALUE", "MINVALUE"}
+	fromUnb, fromMax := []bool{true, true}, []bool{false, false}
+	to := []string{"10", "MAXVALUE"}
+	toUnb, toMax := []bool{false, true}, []bool{false, true}
+
+	inLo := func(key []string) bool {
+		return rangeStrTupleGE(key, from, fromUnb, fromMax) &&
+			rangeStrTupleLT(key, to, toUnb, toMax)
+	}
+
+	t.Run("fully-open lower bound admits any key", func(t *testing.T) {
+		// (MINVALUE, MINVALUE) is −∞ on both columns: every key is >= it.
+		if !rangeStrTupleGE([]string{"5", "99"}, from, fromUnb, fromMax) {
+			t.Errorf("(5, 99) >= (MINVALUE, MINVALUE) should be true")
+		}
+		if !rangeStrTupleGE([]string{"-100", "-100"}, from, fromUnb, fromMax) {
+			t.Errorf("(-100, -100) >= (MINVALUE, MINVALUE) should be true")
+		}
+	})
+
+	t.Run("concrete prefix below upper bound is in-partition", func(t *testing.T) {
+		// Leading column 5 < 10, so the suffix never matters: in pmc_lo.
+		if !inLo([]string{"5", "99999"}) {
+			t.Errorf("(5, 99999) should route to pmc_lo")
+		}
+	})
+
+	t.Run("MAXVALUE suffix opens the whole second column at the boundary prefix", func(t *testing.T) {
+		// Upper bound (10, MAXVALUE): with leading column == 10, the trailing
+		// MAXVALUE (+∞) means EVERY (10, x) is strictly below the upper edge, so
+		// it stays in pmc_lo (PG treats the suffix edge as +∞).
+		if !inLo([]string{"10", "0"}) {
+			t.Errorf("(10, 0) should route to pmc_lo (10 == prefix, suffix < +∞)")
+		}
+		if !inLo([]string{"10", "999999"}) {
+			t.Errorf("(10, 999999) should route to pmc_lo (suffix still < +∞)")
+		}
+	})
+
+	t.Run("concrete prefix above upper bound is out-of-partition", func(t *testing.T) {
+		// Leading column 11 > 10: above the upper edge regardless of suffix.
+		if rangeStrTupleLT([]string{"11", "0"}, to, toUnb, toMax) {
+			t.Errorf("(11, 0) < (10, MAXVALUE) should be false")
+		}
+	})
+
+	t.Run("concrete prefix + MAXVALUE lower edge excludes equal-prefix keys", func(t *testing.T) {
+		// A sibling pmc_hi would start FROM (10, MAXVALUE): a key (10, x) is NOT
+		// >= (10, +∞) for any finite x — it belongs to pmc_lo, not pmc_hi. This
+		// is the mirror invariant that keeps the two partitions non-overlapping.
+		hiFrom := []string{"10", "MAXVALUE"}
+		hiUnb, hiMax := []bool{false, true}, []bool{false, true}
+		if rangeStrTupleGE([]string{"10", "5"}, hiFrom, hiUnb, hiMax) {
+			t.Errorf("(10, 5) >= (10, MAXVALUE) should be false (suffix +∞ excludes equal prefix)")
+		}
+		if !rangeStrTupleGE([]string{"11", "0"}, hiFrom, hiUnb, hiMax) {
+			t.Errorf("(11, 0) >= (10, MAXVALUE) should be true (leading column exceeds)")
+		}
+	})
+}
+
 // TestPgInheritsEmitsLegacyInheritanceRows pins DU-002 slice 170: a table
 // created via CREATE TABLE child (...) INHERITS (parent) must surface a
 // pg_inherits row per (child, parent) pair in declaration order, so pg_dump
@@ -1196,9 +1265,22 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 			"0::numeric",
 		},
 		{
-			"unary minus",
-			&parser.UnaryOp{Op: parser.OpSub, Operand: &parser.IntegerConst{Value: 1}},
+			// The parser tags unary minus with OpUnaryNeg (NOT OpSub — that is
+			// binary subtraction). A bare numeric operand renders `-N` (PG folds it
+			// to a `'-N'::type` Const, which is type-dependent and deferred). DU-002
+			// slice 302 fixed the opcode (was matching OpSub, so it fell through to a
+			// Go pointer string).
+			"unary minus literal",
+			&parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: &parser.IntegerConst{Value: 1}},
 			"-1",
+		},
+		{
+			// Unary minus on a COMPOUND operand (an OpExpr PG does not fold):
+			// get_rule_expr deparses `(- (operand))`, byte-identical to real
+			// pg_dump 18.3 (`DEFAULT -(1 + 2)` dumps as `DEFAULT (- (1 + 2))`).
+			"unary minus compound",
+			&parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: &parser.BinaryOp{Op: parser.OpAdd, Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 2}}},
+			"(- (1 + 2))",
 		},
 		{
 			"unary not",
@@ -1206,14 +1288,31 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 			"NOT true",
 		},
 		{
+			// PG's pg_get_expr fully parenthesizes every binary OpExpr node, so a
+			// bare `1 + 1` default dumps as `(1 + 1)` (DU-002 slice 297).
 			"binary add",
 			&parser.BinaryOp{Op: parser.OpAdd, Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 1}},
-			"1 + 1",
+			"(1 + 1)",
 		},
 		{
+			// Parenthesized like every binary OpExpr (slice 297). (Real PG also
+			// decorates the literals with `::text`, but that type-inference layer is
+			// orthogonal to the renderer under test here.)
 			"binary concat",
 			&parser.BinaryOp{Op: parser.OpConcat, Left: &parser.StringConst{Value: "a"}, Right: &parser.StringConst{Value: "b"}},
-			"'a' || 'b'",
+			"('a' || 'b')",
+		},
+		{
+			// Nested arithmetic: `DEFAULT (1 + 2) * 3` parses to Mul(Add(1,2), 3).
+			// The recursion parenthesizes the inner Add as an operand of Mul, so the
+			// render is `((1 + 2) * 3)` — byte-identical to real PG 18.3's pg_get_expr.
+			// Pre-slice-297 this rendered `1 + 2 * 3` (a precedence change that
+			// evaluates to 7, not 9, on restore). DU-002 slice 297.
+			"binary nested precedence",
+			&parser.BinaryOp{Op: parser.OpMul,
+				Left:  &parser.BinaryOp{Op: parser.OpAdd, Left: &parser.IntegerConst{Value: 1}, Right: &parser.IntegerConst{Value: 2}},
+				Right: &parser.IntegerConst{Value: 3}},
+			"((1 + 2) * 3)",
 		},
 		{
 			"typed string lit",
@@ -1289,7 +1388,7 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 				&parser.IntegerConst{Value: 1},
 				&parser.BinaryOp{Op: parser.OpConcat, Left: &parser.StringConst{Value: "a"}, Right: &parser.StringConst{Value: "b"}},
 			}},
-			"ROW(1, 'a' || 'b')",
+			"ROW(1, ('a' || 'b'))",
 		},
 		{
 			// `DEFAULT INTERVAL '1' day` on an interval column parses to a

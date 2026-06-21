@@ -664,6 +664,14 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	}
 	// Cache rel once — avoids the catalog RLock on every Next() call.
 	o.rel = ctx.Catalog.RelFileNode(o.tbl)
+	// M0118-0001: a SERIALIZABLE seq scan takes a relation-level SIREAD
+	// predicate lock so a concurrent writer's INSERT of a matching row forms
+	// the rw-conflict (phantom). Mirrors PredicateLockRelation in upstream
+	// heap_beginscan; temp / matview relations are excluded exactly as
+	// PredicateLockingNeededForRelation does (system catalogs gated in the hook).
+	if o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView) {
+		ssiRecordRelationRead(ctx, o.rel)
+	}
 	if err := ctx.acquireRelLock(o.rel, lockmgr.AccessShareLock); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.pos
@@ -829,6 +837,14 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}
+				// M0118-0001: SSI phantom conflict-out. The tuple is physically
+				// present but invisible to us because a concurrent transaction
+				// inserted it; register the reader→inserter rw-edge so an
+				// INSERT-before-READ ordering still forms the dangerous structure
+				// (heapam.c HeapCheckForSerializableConflictOut, !visible path).
+				if err := ssiRecordInvisibleTupleRead(o.ctx, rel, tuple.Header.Xmin); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			// M0115-0004: lazily cache HeapXminCommitted in the on-page infomask
@@ -855,7 +871,16 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// rw-conflict edge to the producing writer (xmin). Helper
 			// short-circuits to a single inline check for RC/RR readers.
 			// curSlot was already advanced past the just-fetched slot.
-			ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin, tuple.Header.Xmax)
+			// M0118-0001: a non-nil error means this read closed a dangerous
+			// structure to an already-committed writer and the reader must
+			// abort mid-statement (40001). Release the per-tuple page RLock
+			// before returning; Close()/the pin handles buffer release.
+			if err := ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
+				if o.pinned != nil {
+					o.pinned.RUnlock()
+				}
+				return nil, err
+			}
 			// M0054-0005a: decode into the reusable o.scanRow
 			// buffer. M0073-0004: route varchar / char / text /
 			// bytea payload through the per-page arena so per-
@@ -1291,11 +1316,14 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if ierr := emitCanonicalHeapInsert(o.ctx, targetRel, ptr); ierr != nil {
 				return nil, ierr
 			}
-			// M0104-0007: SSI write-path hook on the newly inserted
-			// tuple's (block, slot). Conflict-in installs an rw-edge
-			// against any concurrent SERIALIZABLE reader that holds a
-			// covering predicate lock (page or relation grain).
-			ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset)
+			// M0104-0007 / M0118-0001: SSI write-path hook on the newly
+			// inserted tuple's (block, slot). Conflict-in installs an rw-edge
+			// against any SERIALIZABLE reader that holds a covering predicate
+			// lock (page or relation grain), and aborts this INSERT in place
+			// (40001) when it closes a dangerous structure to a committed pivot.
+			if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
+				return nil, serr
+			}
 			maintainUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, ptr)
 			o.appendInsertRetRow(row)
 			o.rowsAffected++
@@ -1315,8 +1343,11 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		if ierr := emitCanonicalHeapInsert(o.ctx, targetRel, ptr); ierr != nil {
 			return nil, ierr
 		}
-		// M0104-0007: SSI write-path hook for the non-partitioned insert path.
-		ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset)
+		// M0104-0007 / M0118-0001: SSI write-path hook for the non-partitioned
+		// insert path; aborts in place (40001) on a committed-pivot structure.
+		if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
+			return nil, serr
+		}
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)
 		// AFTER INSERT triggers (M0097-0140).
 		if len(o.plan.Table.Triggers) > 0 {
@@ -2586,6 +2617,17 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 		}
 		if !epqSkip {
+			// M0118-0001: SSI write-path hook on the prior live slot, mirroring
+			// the seqscan-based updateOp path (operators_storage.go ~3210). The
+			// index-based UPDATE path previously skipped this, so a SERIALIZABLE
+			// UPDATE driven by a PRIMARY KEY / index lookup never installed the
+			// rw-conflict-in edge from concurrent SIREAD holders — a sibling-path
+			// gap that made total-cash's `wy2`-before-`rxy1` permutations miss the
+			// dangerous structure. The conflict target is the OLD tuple's
+			// (rel, blk, slot), the same slot a concurrent reader predicate-locks.
+			if serr := ssiRecordTupleWrite(o.ctx, rel, pu.blk, pu.slot); serr != nil {
+				return nil, serr
+			}
 			// AFTER UPDATE triggers (M0097-0140).
 			if len(idxTbl.Triggers) > 0 {
 				fireTriggers(o.ctx, idxTbl, "after", "update", pu.oldRow, pu.newRow)
@@ -3198,7 +3240,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			// xmax stamped on old) and non-HOT (xmax stamp + writeHeapRow)
 			// paths — the rw-conflict target is the SLOT that any concurrent
 			// SERIALIZABLE reader would have predicate-locked.
-			ssiRecordTupleWrite(o.ctx, puRel, pu.blk, pu.slot)
+			if serr := ssiRecordTupleWrite(o.ctx, puRel, pu.blk, pu.slot); serr != nil {
+				return nil, serr
+			}
 			// AFTER UPDATE triggers (M0097-0140).
 			scanTblForAfterTrig := pu.scanTbl
 			if scanTblForAfterTrig == nil {
@@ -3619,7 +3663,9 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			// M0104-0007: SSI write-path hook on the deleted tuple's slot.
 			// The rw-conflict target is the slot a concurrent SERIALIZABLE
 			// reader would have predicate-locked before the xmax stamp.
-			ssiRecordTupleWrite(o.ctx, victimRel, v.blk, v.slot)
+			if serr := ssiRecordTupleWrite(o.ctx, victimRel, v.blk, v.slot); serr != nil {
+				return nil, serr
+			}
 			// AFTER DELETE triggers (M0097-0140).
 			if len(tbl.Triggers) > 0 {
 				delRow := v.row
@@ -4061,7 +4107,9 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				}
 			}
 		}
-		ssiRecordTupleWrite(o.ctx, puSrcRel, pu.blk, pu.slot)
+		if serr := ssiRecordTupleWrite(o.ctx, puSrcRel, pu.blk, pu.slot); serr != nil {
+			return nil, serr
+		}
 		o.rowsAffected++
 		// Use retNewRow for RETURNING when available (inheritance children). M0097-0078.
 		retForRet := pu.newRow
@@ -4256,7 +4304,9 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		if cerr := emitCanonicalHeapDelete(o.ctx, vRel, v.blk, v.slot); cerr != nil {
 			return nil, cerr
 		}
-		ssiRecordTupleWrite(o.ctx, vRel, v.blk, v.slot)
+		if serr := ssiRecordTupleWrite(o.ctx, vRel, v.blk, v.slot); serr != nil {
+			return nil, serr
+		}
 		// Use parent-aligned retOldRow for RETURNING when available. M0097-0078.
 		delRetRow := v.oldRow
 		if v.retOldRow != nil {
@@ -4366,7 +4416,15 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			// rw-conflict, and must check conflict-out against both
 			// xmin (visible writer) and xmax (concurrent overwriter
 			// hidden by snapshot).
-			ssiRecordTupleRead(ctx, rel, blk, slot, tuple.Header.Xmin, tuple.Header.Xmax)
+			// M0118-0001: a non-nil error means this read closed a dangerous
+			// structure to an already-committed writer and the reading
+			// UPDATE/DELETE must abort mid-statement (40001). Release the
+			// page RLock + pin before returning, like the decode-error path.
+			if err := ssiRecordTupleRead(ctx, rel, blk, slot, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				return err
+			}
 			storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
 			if err := DecodeRowIntoMctxPGTuple(scanRow, cols, tuple.Data, tuple.Bitmap, storedNatts, nil); err != nil {
 				continue // skip undecodable tuples (e.g. schema mismatch)
@@ -4903,10 +4961,12 @@ func buildExclusionConstraintDetail(idx *catalog.Index, cols []catalog.Column, r
 func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTree, key []byte, idxName, detail string, pos int) error {
 	var inflightXmin storage.TransactionID
 	var liveConflict bool
+	var conflictPtr storage.ItemPointer
 
 	scanOnce := func() {
 		inflightXmin = storage.InvalidTransactionID
 		liveConflict = false
+		conflictPtr = storage.ItemPointer{}
 		_ = tree.RangeScan(key, key, func(_ []byte, ptr storage.ItemPointer) (bool, error) {
 			slot, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 			if perr != nil {
@@ -4930,6 +4990,7 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTre
 			}
 			if isLiveForUniqueCheck(ctx, xmin, tuple.Header.Xmax) {
 				liveConflict = true
+				conflictPtr = ptr
 				return false, nil
 			}
 			return true, nil
@@ -4947,7 +5008,44 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTre
 			liveConflict = true
 		}
 		if liveConflict {
-			if ctx.Tx.Isolation == mvcc.IsolationSerializable || ctx.Tx.Isolation == mvcc.IsolationRepeatableRead {
+			if ctx.Tx.Isolation == mvcc.IsolationSerializable {
+				// M0118-0001: a post-wait unique conflict between two SERIALIZABLE
+				// writers is a serialization failure (40001) only when THIS writer
+				// is the pivot of a dangerous rw-structure — i.e. another
+				// SERIALIZABLE reader holds a predicate lock covering the
+				// conflicting key AND this writer has an out-conflict to an
+				// already-committed xact. We must NOT blanket-raise 40001: that
+				// over-fires for read-write-unique-4 permutations `r1 w1 w2 …`
+				// and `r2 w1 w2 …`, where only one xact read first so there is no
+				// pivot and upstream raises a plain 23505 duplicate-key error.
+				//
+				// Defer the decision to the SSI conflict-in walk against the
+				// committed conflicting tuple's location (tuple → page →
+				// relation holders, incl. retained-committed readers). It fires
+				// 40001 for read-write-unique{,-2,-4} permutation 1 (both xacts
+				// read first → the pivot closes to the just-committed peer) and
+				// stays silent when no dangerous structure exists, where the
+				// duplicate falls through to the 23505 below — mirroring
+				// upstream's _bt_check_unique / CheckForSerializableConflictIn
+				// ordering.
+				if conflictPtr.Offset != 0 {
+					if serr := ssiRecordTupleWrite(ctx, rel, conflictPtr.Block, conflictPtr.Offset); serr != nil {
+						return serr
+					}
+					// No dangerous structure → fall through to 23505 below.
+				} else {
+					// liveConflict was forced by a THIRD still-in-flight xact
+					// (no committed location to walk). Preserve the prior
+					// conservative serialization failure.
+					return &ExecError{
+						Code:    "40001",
+						Pos:     pos,
+						Message: "could not serialize access due to read/write dependencies among transactions",
+						Detail:  "Reason code: Canceled on identification as a pivot, during write.",
+						Hint:    "The transaction might succeed if retried.",
+					}
+				}
+			} else if ctx.Tx.Isolation == mvcc.IsolationRepeatableRead {
 				return &ExecError{
 					Code:    "40001",
 					Pos:     pos,
@@ -4956,7 +5054,6 @@ func uniqueCheckWithWait(ctx *Context, rel storage.RelFileNode, tree *btree.BTre
 					Hint:    "The transaction might succeed if retried.",
 				}
 			}
-			// RC: fall through to 23505 below.
 		} else {
 			// Other xact rolled back — no conflict.
 			return nil

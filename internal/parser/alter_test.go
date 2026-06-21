@@ -233,6 +233,126 @@ func TestParseAlterTableSetCompression(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableSetDropDefault covers `ALTER TABLE ... ALTER COLUMN c SET
+// DEFAULT <expr>` and `... DROP DEFAULT` (DU-002 slice 269). SET DEFAULT records
+// the parsed expression on DefaultExpr; DROP DEFAULT records the column with a
+// nil DefaultExpr. Both previously fell through to the no-op consume.
+func TestParseAlterTableSetDropDefault(t *testing.T) {
+	// SET DEFAULT — expression must be captured.
+	stmts, err := Parse("ALTER TABLE t ALTER COLUMN c SET DEFAULT 7")
+	if err != nil {
+		t.Fatalf("Parse SET DEFAULT: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetDefault {
+		t.Fatalf("SET DEFAULT: actions=%+v", at.Actions)
+	}
+	if at.Actions[0].ColumnName != "c" {
+		t.Errorf("SET DEFAULT: ColumnName=%q want %q", at.Actions[0].ColumnName, "c")
+	}
+	if at.Actions[0].DefaultExpr == nil {
+		t.Errorf("SET DEFAULT: DefaultExpr is nil, want the parsed expression")
+	}
+
+	// DROP DEFAULT — no expression, action recorded with nil DefaultExpr.
+	stmts, err = Parse("ALTER TABLE t ALTER COLUMN c DROP DEFAULT")
+	if err != nil {
+		t.Fatalf("Parse DROP DEFAULT: %v", err)
+	}
+	at, ok = stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableDropDefault {
+		t.Fatalf("DROP DEFAULT: actions=%+v", at.Actions)
+	}
+	if at.Actions[0].ColumnName != "c" {
+		t.Errorf("DROP DEFAULT: ColumnName=%q want %q", at.Actions[0].ColumnName, "c")
+	}
+	if at.Actions[0].DefaultExpr != nil {
+		t.Errorf("DROP DEFAULT: DefaultExpr=%v want nil", at.Actions[0].DefaultExpr)
+	}
+}
+
+// TestParseAlterTableSetDropNotNull covers `ALTER TABLE ... ALTER COLUMN c SET
+// NOT NULL` and `... DROP NOT NULL` (DU-002 slice 270). Both previously fell
+// through to the no-op consume; now they record a dedicated action kind so the
+// executor can mutate pg_attribute.attnotnull and the contype='n' constraint.
+func TestParseAlterTableSetDropNotNull(t *testing.T) {
+	stmts, err := Parse("ALTER TABLE t ALTER COLUMN c SET NOT NULL")
+	if err != nil {
+		t.Fatalf("Parse SET NOT NULL: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetNotNull {
+		t.Fatalf("SET NOT NULL: actions=%+v", at.Actions)
+	}
+	if at.Actions[0].ColumnName != "c" {
+		t.Errorf("SET NOT NULL: ColumnName=%q want %q", at.Actions[0].ColumnName, "c")
+	}
+
+	stmts, err = Parse("ALTER TABLE t ALTER COLUMN c DROP NOT NULL")
+	if err != nil {
+		t.Fatalf("Parse DROP NOT NULL: %v", err)
+	}
+	at, ok = stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableDropNotNull {
+		t.Fatalf("DROP NOT NULL: actions=%+v", at.Actions)
+	}
+	if at.Actions[0].ColumnName != "c" {
+		t.Errorf("DROP NOT NULL: ColumnName=%q want %q", at.Actions[0].ColumnName, "c")
+	}
+}
+
+// TestParseAlterTableAddNotNull covers the PG18 named NOT NULL constraint form
+// `ALTER TABLE ... ADD [CONSTRAINT name] NOT NULL col [NO INHERIT]` (DU-002
+// slice 271). It records AlterTableAddNotNull with the column, optional explicit
+// name, and the NO INHERIT flag so the executor records a contype='n' row whose
+// conname round-trips through pg_dump as `CONSTRAINT <name> NOT NULL <col>`.
+func TestParseAlterTableAddNotNull(t *testing.T) {
+	for _, tc := range []struct {
+		sql           string
+		wantCol       string
+		wantName      string
+		wantNoInherit bool
+	}{
+		{"ALTER TABLE t ADD CONSTRAINT my_nn NOT NULL c", "c", "my_nn", false},
+		{"ALTER TABLE t ADD NOT NULL c", "c", "", false},
+		{"ALTER TABLE t ADD CONSTRAINT my_nn NOT NULL c NO INHERIT", "c", "my_nn", true},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableAddNotNull {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		a := at.Actions[0]
+		if a.ColumnName != tc.wantCol {
+			t.Errorf("Parse(%q): ColumnName=%q want %q", tc.sql, a.ColumnName, tc.wantCol)
+		}
+		if a.ConstraintName != tc.wantName {
+			t.Errorf("Parse(%q): ConstraintName=%q want %q", tc.sql, a.ConstraintName, tc.wantName)
+		}
+		if a.NoInherit != tc.wantNoInherit {
+			t.Errorf("Parse(%q): NoInherit=%v want %v", tc.sql, a.NoInherit, tc.wantNoInherit)
+		}
+	}
+}
+
 // TestParseCreateTableColumnCompression covers the inline `COMPRESSION <method>`
 // clause in a CREATE TABLE column definition (`a text COMPRESSION lz4`), which
 // threads the method onto ColumnDef.Compression. DU-002 slice 183.
@@ -256,6 +376,72 @@ func TestParseCreateTableColumnCompression(t *testing.T) {
 	}
 	if ct.Columns[2].Compression != "" {
 		t.Errorf("d.Compression=%q want \"\"", ct.Columns[2].Compression)
+	}
+}
+
+// TestParseCreateTableColumnNotNullNoInherit covers the inline column-level
+// `NOT NULL NO INHERIT` form in CREATE TABLE (DU-002 slice 272). PG18 records the
+// NOT NULL as a contype='n' pg_constraint row with connoinherit='t'; the parser
+// must consume the optional ` NO INHERIT` trailer into ColumnDef.NotNullNoInherit
+// so the executor can thread it onto the constraint. A plain `NOT NULL` (no
+// trailer) must leave NotNullNoInherit false.
+func TestParseCreateTableColumnNotNullNoInherit(t *testing.T) {
+	stmts, err := Parse("CREATE TABLE t (c integer NOT NULL NO INHERIT, d integer NOT NULL, e integer)")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(ct.Columns) != 3 {
+		t.Fatalf("columns=%d want 3", len(ct.Columns))
+	}
+	if !ct.Columns[0].NotNull || !ct.Columns[0].NotNullNoInherit {
+		t.Errorf("c: NotNull=%v NotNullNoInherit=%v want both true", ct.Columns[0].NotNull, ct.Columns[0].NotNullNoInherit)
+	}
+	if !ct.Columns[1].NotNull || ct.Columns[1].NotNullNoInherit {
+		t.Errorf("d: NotNull=%v NotNullNoInherit=%v want true/false", ct.Columns[1].NotNull, ct.Columns[1].NotNullNoInherit)
+	}
+	if ct.Columns[2].NotNull || ct.Columns[2].NotNullNoInherit {
+		t.Errorf("e: NotNull=%v NotNullNoInherit=%v want false/false", ct.Columns[2].NotNull, ct.Columns[2].NotNullNoInherit)
+	}
+}
+
+// TestParseCreateTableColumnNamedNotNull covers the inline column-level
+// `CONSTRAINT <name> NOT NULL [NO INHERIT]` form in CREATE TABLE (DU-002 slice
+// 273). PG18 lets a column carry an explicitly named NOT NULL; the parser must
+// capture the user-given name into ColumnDef.NotNullConstraintName (and the
+// optional ` NO INHERIT` trailer into NotNullNoInherit) so the executor threads
+// the name onto the constraint and pg_dump re-emits the inline `CONSTRAINT
+// <name> NOT NULL` form. Before this slice the inline CONSTRAINT switch had no
+// NOT NULL arm, so the constraint was silently dropped by the default skip.
+func TestParseCreateTableColumnNamedNotNull(t *testing.T) {
+	stmts, err := Parse("CREATE TABLE t (c integer CONSTRAINT c_nn NOT NULL NO INHERIT, d integer CONSTRAINT d_nn NOT NULL, e integer NOT NULL)")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	ct, ok := stmts[0].(*CreateTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(ct.Columns) != 3 {
+		t.Fatalf("columns=%d want 3", len(ct.Columns))
+	}
+	// c: named NOT NULL with NO INHERIT.
+	if !ct.Columns[0].NotNull || ct.Columns[0].NotNullConstraintName != "c_nn" || !ct.Columns[0].NotNullNoInherit {
+		t.Errorf("c: NotNull=%v name=%q NoInherit=%v want true/\"c_nn\"/true",
+			ct.Columns[0].NotNull, ct.Columns[0].NotNullConstraintName, ct.Columns[0].NotNullNoInherit)
+	}
+	// d: named NOT NULL, no NO INHERIT.
+	if !ct.Columns[1].NotNull || ct.Columns[1].NotNullConstraintName != "d_nn" || ct.Columns[1].NotNullNoInherit {
+		t.Errorf("d: NotNull=%v name=%q NoInherit=%v want true/\"d_nn\"/false",
+			ct.Columns[1].NotNull, ct.Columns[1].NotNullConstraintName, ct.Columns[1].NotNullNoInherit)
+	}
+	// e: unnamed NOT NULL — NotNullConstraintName must stay empty.
+	if !ct.Columns[2].NotNull || ct.Columns[2].NotNullConstraintName != "" {
+		t.Errorf("e: NotNull=%v name=%q want true/\"\"",
+			ct.Columns[2].NotNull, ct.Columns[2].NotNullConstraintName)
 	}
 }
 

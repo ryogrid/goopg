@@ -35,6 +35,26 @@ func (e *SerializationFailureError) Error() string {
 	return fmt.Sprintf("could not serialize access due to read/write dependencies among transactions (%s)", e.Reason)
 }
 
+// PrimaryMessage returns the bare errmsg PostgreSQL's predicate.c emits for a
+// serialization failure — with NO reason code appended. This is the line psql
+// and isolationtester print on the `ERROR:` line; the reason belongs in DETAIL
+// (see Detail). Wire-protocol callers must use this rather than Error(), whose
+// parenthesised reason is for Go-side logging only.
+func (e *SerializationFailureError) PrimaryMessage() string {
+	return "could not serialize access due to read/write dependencies among transactions"
+}
+
+// Detail returns the upstream-style errdetail line ("Reason code: ....") that
+// predicate.c attaches via errdetail_internal. isolationtester suppresses
+// DETAIL, but psql and the wire protocol surface it, so keeping it faithful
+// preserves parity for non-isolationtester clients.
+func (e *SerializationFailureError) Detail() string {
+	if e == nil || e.Reason == "" {
+		return ""
+	}
+	return "Reason code: " + e.Reason + "."
+}
+
 // SQLSTATE returns the SQLSTATE code carried by this error. Provided so
 // the executor's error-conversion layer can detect the typed error via
 // a public method without type-asserting through the mvcc package.
@@ -137,14 +157,15 @@ func (m *Manager) preCommitCheckForSerializationFailureLocked(handle TxnHandle) 
 				pivot.Doomed = true
 				break
 			}
-			if tin.FinishedAt == InvalidCommitSeqNo && !tin.Doomed {
-				// The 3-cycle case: Tin is still in-flight, not doomed.
-				// `!SxactIsCommitted(t0) && !SxactIsDoomed(t0)` upstream.
-				// goopg does not yet model READ ONLY transactions
-				// distinctly, so the upstream READ ONLY optimisation
-				// (skip Tin if read-only and overlaps writer) is
-				// conservatively absent — false positives, never
-				// false negatives.
+			if tin.FinishedAt == InvalidCommitSeqNo && !tin.Doomed && !tin.ReadOnly {
+				// The 3-cycle case: Tin is still in-flight, not doomed,
+				// and not declared READ ONLY.
+				// `!SxactIsCommitted(t0) && !SxactIsReadOnly(t0) &&
+				// !SxactIsDoomed(t0)` upstream (predicate.c). A declared
+				// READ ONLY Tin in-flight cannot complete the dangerous
+				// structure here — it writes nothing, so it can still
+				// resolve RO-safe — which is exactly the receipt-report
+				// de-facto READ ONLY false-positive avoidance. M0118-0001.
 				pivot.Doomed = true
 				break
 			}

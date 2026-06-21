@@ -60,6 +60,157 @@ func TestNamedCheckPropagatesThroughLikeConstraints(t *testing.T) {
 	}
 }
 
+// TestAlterTableSetDropNotNull verifies that `ALTER TABLE ... ALTER COLUMN c
+// SET NOT NULL` marks the column NOT NULL AND records a contype='n' constraint
+// (catalog.Table.AddNotNull, conislocal=true), and that `DROP NOT NULL` clears
+// both. This is the catalog-side prerequisite for pg_dump re-emitting the NOT
+// NULL on an inherited column as a standalone `NOT NULL <col>` body item.
+// DU-002 slice 270.
+func TestAlterTableSetDropNotNull(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE nnt (a integer, b integer)`); err != nil {
+		t.Fatalf("CREATE TABLE nnt: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE nnt ALTER COLUMN a SET NOT NULL`); err != nil {
+		t.Fatalf("SET NOT NULL: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "nnt"})
+	if !ok {
+		t.Fatal("nnt table not found")
+	}
+	if !tbl.Columns[0].NotNull {
+		t.Errorf("column a should be NotNull after SET NOT NULL")
+	}
+	nnFor := func(col string) (catalog.NamedNotNullConstraint, bool) {
+		for _, nc := range tbl.NotNullConstraints {
+			if strings.EqualFold(nc.ColName, col) {
+				return nc, true
+			}
+		}
+		return catalog.NamedNotNullConstraint{}, false
+	}
+	nc, ok := nnFor("a")
+	if !ok {
+		t.Fatalf("SET NOT NULL did not record a contype='n' constraint for a; got %+v", tbl.NotNullConstraints)
+	}
+	if nc.Name != "nnt_a_not_null" {
+		t.Errorf("NOT NULL constraint name=%q want nnt_a_not_null", nc.Name)
+	}
+	if !nc.IsLocal {
+		t.Errorf("NOT NULL constraint for a should be conislocal=true")
+	}
+
+	// SET NOT NULL is idempotent — a second SET must not add a duplicate row.
+	if err := runDDL(t, ctx, `ALTER TABLE nnt ALTER COLUMN a SET NOT NULL`); err != nil {
+		t.Fatalf("second SET NOT NULL: %v", err)
+	}
+	count := 0
+	for _, c := range tbl.NotNullConstraints {
+		if strings.EqualFold(c.ColName, "a") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("idempotent SET NOT NULL produced %d constraints for a, want 1", count)
+	}
+
+	// DROP NOT NULL clears both the flag and the constraint.
+	if err := runDDL(t, ctx, `ALTER TABLE nnt ALTER COLUMN a DROP NOT NULL`); err != nil {
+		t.Fatalf("DROP NOT NULL: %v", err)
+	}
+	if tbl.Columns[0].NotNull {
+		t.Errorf("column a should not be NotNull after DROP NOT NULL")
+	}
+	if _, ok := nnFor("a"); ok {
+		t.Errorf("DROP NOT NULL left a contype='n' constraint for a; got %+v", tbl.NotNullConstraints)
+	}
+}
+
+// TestAlterTableAddNotNullNamed verifies that `ALTER TABLE ... ADD CONSTRAINT
+// <name> NOT NULL <col>` marks the column NOT NULL AND records a contype='n'
+// constraint carrying the EXPLICIT name (not the auto-name), with
+// conislocal=true. When the name differs from PG's default
+// `<table>_<col>_not_null`, pg_dump prints the `CONSTRAINT <name> NOT NULL
+// <col>` form. A bare `ADD NOT NULL <col>` (no name) falls back to the
+// auto-name. DU-002 slice 271.
+func TestAlterTableAddNotNullNamed(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE annt (a integer, b integer)`); err != nil {
+		t.Fatalf("CREATE TABLE annt: %v", err)
+	}
+	// Named form: the constraint keeps the explicit name `my_nn`.
+	if err := runDDL(t, ctx, `ALTER TABLE annt ADD CONSTRAINT my_nn NOT NULL a`); err != nil {
+		t.Fatalf("ADD CONSTRAINT my_nn NOT NULL a: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "annt"})
+	if !ok {
+		t.Fatal("annt table not found")
+	}
+	if !tbl.Columns[0].NotNull {
+		t.Errorf("column a should be NotNull after ADD CONSTRAINT NOT NULL")
+	}
+	nnFor := func(col string) (catalog.NamedNotNullConstraint, bool) {
+		for _, nc := range tbl.NotNullConstraints {
+			if strings.EqualFold(nc.ColName, col) {
+				return nc, true
+			}
+		}
+		return catalog.NamedNotNullConstraint{}, false
+	}
+	nc, ok := nnFor("a")
+	if !ok {
+		t.Fatalf("ADD CONSTRAINT NOT NULL did not record a contype='n' constraint for a; got %+v", tbl.NotNullConstraints)
+	}
+	if nc.Name != "my_nn" {
+		t.Errorf("NOT NULL constraint name=%q want my_nn (explicit name)", nc.Name)
+	}
+	if !nc.IsLocal {
+		t.Errorf("NOT NULL constraint for a should be conislocal=true")
+	}
+
+	// Idempotent: a second ADD on the same column must not add a duplicate row.
+	if err := runDDL(t, ctx, `ALTER TABLE annt ADD CONSTRAINT other_nn NOT NULL a`); err != nil {
+		t.Fatalf("second ADD NOT NULL a: %v", err)
+	}
+	count := 0
+	for _, c := range tbl.NotNullConstraints {
+		if strings.EqualFold(c.ColName, "a") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("idempotent ADD NOT NULL produced %d constraints for a, want 1", count)
+	}
+
+	// Bare `ADD NOT NULL b` (no CONSTRAINT name) falls back to the auto-name.
+	if err := runDDL(t, ctx, `ALTER TABLE annt ADD NOT NULL b`); err != nil {
+		t.Fatalf("ADD NOT NULL b: %v", err)
+	}
+	if !tbl.Columns[1].NotNull {
+		t.Errorf("column b should be NotNull after ADD NOT NULL")
+	}
+	ncb, ok := nnFor("b")
+	if !ok {
+		t.Fatalf("ADD NOT NULL b did not record a constraint; got %+v", tbl.NotNullConstraints)
+	}
+	if ncb.Name != "annt_b_not_null" {
+		t.Errorf("unnamed ADD NOT NULL name=%q want annt_b_not_null (auto-name)", ncb.Name)
+	}
+
+	// A missing column raises 42703.
+	err := runDDL(t, ctx, `ALTER TABLE annt ADD CONSTRAINT z_nn NOT NULL nope`)
+	if err == nil {
+		t.Fatal("ADD NOT NULL on a missing column should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42703" {
+		t.Errorf("missing column: err=%v want SQLSTATE 42703", err)
+	}
+}
+
 // TestCheckViolationReportsNameAndDetail verifies that a CHECK constraint
 // violation reports the constraint name and a "Failing row contains (…)"
 // DETAIL line, matching PostgreSQL (SQLSTATE 23514). M0097-0023.

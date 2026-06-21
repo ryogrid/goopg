@@ -7636,8 +7636,1140 @@ string (not ±∞), that the flag-driven edges behave as ±∞, and that nil fla
 the existing `prange_am` fixture (`FOR VALUES FROM (MINVALUE) TO ('m')`) in `TestPort_PgDumpConnectionSetup`
 continues to byte-match real pg_dump 18.3, proving the keyword-node rewrite preserves the dump round-trip.
 
-> **Next (slice 262+):** multi-level / `INHERITS` partition-tree dump fidelity, or per-element open-edge multi-column
-> RANGE bounds (`FROM (a, MINVALUE) TO (b, MAXVALUE)`) routing coverage.
+### Slice 262 — multi-column RANGE partition with a non-leading open edge (`FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)`)
+
+Every partition fixture through slice 261 was **single-column** (`part`, `prange_am`, `pdef`, …). The per-element
+RANGE-bound machinery built up over slices 169 (parallel `From/ToValueLiterals` tuples + `, `-joined
+`FormatPartitionBound`) and 261 (parallel `From/ToUnbounded[Max]` flag tuples + `compareKeyToRangeBound`) was written
+for multi-column tuples but had never been exercised end to end through pg_dump, nor had the routing been directly
+unit-tested across a **concrete prefix column + an unbounded suffix edge**. This slice closes that coverage gap; no
+production code changed — the existing machinery already round-trips the shape, and this slice proves (and guards) it.
+
+- **pg_dump fixture (`pgdump_connsetup_test.go`)** — `public.pmc (a integer, b integer, val text) PARTITION BY RANGE
+  (a, b)` with one child `pmc_lo FOR VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)`. The bound is the canonical
+  PG shape: once an element is `MINVALUE`/`MAXVALUE`, every trailing element must match, so `(MINVALUE, MINVALUE)`
+  (fully open) and `(10, MAXVALUE)` (concrete leading + open trailing) are both legal. Assertions: the parent's
+  two-column key clause `PARTITION BY RANGE (a, b)` and the verbatim child bound `ATTACH PARTITION public.pmc_lo FOR
+  VALUES FROM (MINVALUE, MINVALUE) TO (10, MAXVALUE)` — the contiguous `, `-joined tuples with **bare keywords** (not
+  quoted `'MINVALUE'`) prove the multi-element `FormatPartitionBound` join + the keyword renderer both hold.
+- **Routing unit test (`catalog_test.go::TestRangeTupleMultiColumnOpenEdge`)** — drives `rangeStrTupleGE`/
+  `rangeStrTupleLT` directly with the `pmc_lo` flag tuples: a fully-open lower bound admits any key; a concrete prefix
+  below `10` is in-partition regardless of suffix; at the boundary prefix `10` the trailing `MAXVALUE` (+∞) keeps
+  every `(10, x)` strictly below the upper edge (so it stays in `pmc_lo`); a prefix `11 > 10` is out; and the mirror
+  invariant `(10, x) NOT >= (10, MAXVALUE)` keeps a hypothetical `pmc_hi FROM (10, MAXVALUE)` non-overlapping.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `catalog.TestRangeTupleMultiColumnOpenEdge`.
+
+> **Next (slice 263+):** ~~multi-level partition-tree dump fidelity beyond the single-leaf `psub` tree~~ — done in
+> slice 263. Remaining: per-partition column-level options on a partition child, or `INHERITS`-tree dump fidelity.
+
+### Slice 263 — wide multi-level partition tree (multiple leaves + sibling sub-partitioned middle node)
+
+Slice 171 first exercised a *sub-partitioned* partition (`psub_east`: a `LIST` child of `psub` that is itself
+partitioned `BY RANGE`, with one leaf `psub_east_lo`). That proved the single node that is simultaneously
+`relispartition=true` AND `relkind='p'` round-trips. But the tree was a single chain — one middle node, one leaf. This
+slice widens it to the two fan-out shapes a real tree has, neither previously exercised end to end:
+
+- **One middle node, multiple leaves** — `psub_east` gains a second leaf `psub_east_hi FOR VALUES FROM (100) TO (200)`
+  alongside `psub_east_lo`. pg_inherits must emit **two** child rows that both point at the same `psub_east` parent; the
+  per-parent `inhseqno` counter (`parentSeq` map in `catalog.go::pg_inherits.VirtualRows`) must increment independently
+  per leaf, and pg_dump must emit a separate `ATTACH` for each.
+- **Sibling sub-partitioned middle node** — `psub_west` is a *second* `LIST` partition of `psub`, itself partitioned
+  `BY RANGE`, with its own leaf `psub_west_lo FOR VALUES FROM (0) TO (100)`. Crucially `psub_west_lo`'s bound text is
+  **identical** to `psub_east_lo`'s, so the leaf-to-parent linkage cannot be inferred from the bound — it must come from
+  each child's own `PartitionParentOID`. The test verifies the immediate parent via the full single-line form
+  `ALTER TABLE ONLY public.psub_west ATTACH PARTITION public.psub_west_lo FOR VALUES FROM (0) TO (100)`, which a
+  wrong-parent regression (attaching to the sibling `psub_east` or the grandparent `psub`) would break.
+
+No production code changed — `pg_inherits` already keys each parent row off the child's own `PartitionParentOID`
+(`catalog.go` ~4110), so width and a second middle node fall out for free; this slice proves and guards the wide tree.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+### Slice 264 — child-only `CHECK` constraint on a partition leaf
+
+The whole partition-fixture family so far (`psub*`, `part`, `prange*`, `pmc`, `pdef`, `pfo`, `ptbs`, `puse`) exercised
+the *bound* (the `ATTACH … FOR VALUES …`) and the leaf's storage/access-method clauses, but never a **local
+constraint** on a partition child. This slice adds one: `pchk_1` is a `LIST` leaf of `pchk` carrying
+`(CONSTRAINT pchk_1_pos CHECK (a > 0))` in its `PARTITION OF` column-override list.
+
+The interesting property is that a partition child prints **no columns** in its dumped `CREATE TABLE` body — every
+attribute is inherited from the partitioned parent, so pg_dump's `shouldPrintColumn` is false for all of them. The CHECK,
+by contrast, is *local* to the leaf: the parser collects it into `PartitionOfClause.CheckConstraints` (`ddl.go` ~1516)
+and `execCreatePartitionChild` routes it through `tbl.AddCheck`, which stamps `IsLocal=true` / `InhCount=0`
+(`catalog.go::AddCheck`). goopg's `pg_constraint` `VirtualRows` then emits that row with `conislocal='t'`,
+`conrelid`=leaf OID, and `pg_get_constraintdef` renders `CHECK ((a > 0))` (the double-paren deparser form, `expr.go`
+~6727). The real pg_dump 18.3 therefore emits `CONSTRAINT pchk_1_pos CHECK ((a > 0))` inside the leaf's otherwise
+column-less `CREATE TABLE` body, followed by the `ATTACH PARTITION public.pchk_1 FOR VALUES IN (1)`.
+
+No production code changed — the column-override-list CHECK path (M0097-0023) and the `pg_constraint`/`pg_get_constraintdef`
+CHECK branches (slice 49) already existed; this slice proves the partition-leaf local-constraint dump path end to end and
+guards it against a silent `conislocal`/constraint-row regression.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+> **Next (slice 265+):** a child-only `DEFAULT` or `NOT NULL` override on a partition leaf (the other two
+> column-override forms), or `INHERITS`-tree dump fidelity beyond the single child (local constraint on a legacy
+> inheritance child).
+
+### Slice 265 — child-only column `DEFAULT` on a partition leaf
+
+The column-attribute sibling of slice 264's table-level CHECK: `pdfl_1` is a `LIST` leaf of `pdfl (a integer, b integer)`
+carrying `(b DEFAULT 42)` in its `PARTITION OF` column-override list. Where the CHECK surfaces as a separate constraint
+item, a per-column `DEFAULT` must re-attach to its column **inside** the leaf's printed column list.
+
+**Correction to slice 264:** that section claimed a partition child "prints **no columns**." That is inaccurate.
+`shouldPrintColumn` (`pg_dump.c:9970`) returns `tbinfo->attislocal[colno] || tbinfo->ispartition`, so **every** column of a
+partition leaf is printed — real pg_dump 18.3 emits `a integer` for `pchk_1` too, with the CHECK as an additional
+constraint item. The leaf body is *not* column-less.
+
+The `DEFAULT 42` is local to the leaf: `execCreatePartitionChild` records it on the leaf's `catalog.Column.DefaultExpr`,
+so goopg's `pg_attrdef` emits the leaf's `adbin` (`atthasdef=true`) and `pg_get_expr` renders `42`. Real pg_dump 18.3
+emits the leaf body `a integer, b integer DEFAULT 42` followed by `ATTACH PARTITION public.pdfl_1 FOR VALUES IN (1)`
+(verified byte-identical vs PG 18.3 and a fresh goopg server). Every prior partition fixture exercised bounds,
+storage/AM clauses, or a table-level CHECK, never a per-column override `DEFAULT` on a leaf; this slice proves and guards
+that `pg_attrdef` path.
+
+No production code changed — `execCreatePartitionChild`'s column-override `DEFAULT` handling and the
+`pg_attrdef`/`pg_get_expr` leaf path already existed.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+### Slice 266 — child-only `NOT NULL` override on a partition leaf
+
+The last of the three per-column override forms (after slice 264's table-level CHECK and slice 265's column DEFAULT):
+`pnnl_1` is a `LIST` leaf of `pnnl (a integer, b integer)` carrying `(b NOT NULL)` in its `PARTITION OF`
+column-override list. Like the DEFAULT, a per-column `NOT NULL` re-attaches to its column **inside** the leaf's printed
+column list — as the inline decoration `b integer NOT NULL`, not a separate `CONSTRAINT` clause.
+
+The `NOT NULL` is local to the leaf: `execCreatePartitionChild` records it on the leaf's `catalog.Column.NotNull`, and
+pg_dump's per-column attribute renderer appends ` NOT NULL` inline. In PG18 a `NOT NULL` is *also* a named
+`pg_constraint` row (`contype='n'`), but for a partition leaf pg_dump still emits the inline `NOT NULL` decoration on the
+column rather than a separate constraint item — real pg_dump 18.3 emits the leaf body `a integer, b integer NOT NULL`
+followed by `ATTACH PARTITION public.pnnl_1 FOR VALUES IN (1)` (verified byte-identical vs PG 18.3 and a fresh goopg
+server this loop). This slice proves and guards that inline-NOT-NULL leaf path.
+
+No production code changed — `execCreatePartitionChild`'s column-override `NOT NULL` handling and the inline pg_dump
+column decoration already existed.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+> **Next (slice 267):** see slice 267 below — a local CHECK on a legacy (non-partition) INHERITS child.
+
+### Slice 267 — local `CHECK` constraint on a legacy (non-partition) `INHERITS` child
+
+Slices 264–266 covered the per-child override forms on a **partition leaf**, where `tbinfo->ispartition` forces
+`shouldPrintColumn` (pg_dump.c:9970) to print *every* column. A legacy `INHERITS` child is the opposite regime:
+`ispartition` is false, so `shouldPrintColumn` gates on `attislocal` **alone** — the inherited columns are omitted while
+the child's own local column prints. This slice proves the **intersection** of slice 170 (column omission + the
+`INHERITS` clause for a plain child) and slice 264 (a `conislocal` CHECK), which neither prior fixture exercised on its
+own: a `conislocal` CHECK on a *column-omitting* legacy child.
+
+`ichk_child (extra integer, CONSTRAINT ichk_child_pos CHECK (extra > 0)) INHERITS (ichk_parent (pid integer, pname text))`.
+Real pg_dump 18.3 emits:
+
+```
+CREATE TABLE public.ichk_child (
+    extra integer,
+    CONSTRAINT ichk_child_pos CHECK ((extra > 0))
+)
+INHERITS (public.ichk_parent);
+```
+
+i.e. (1) only the local `extra integer` prints — `pid`/`pname` are omitted (they arrive via `INHERITS`), (2) the
+`conislocal='t'` CHECK prints inside the body, and (3) the `INHERITS (public.ichk_parent)` clause closes it (legacy
+inheritance, **not** an `ATTACH`). Verified byte-identical vs PG 18.3 and a fresh goopg server this loop.
+
+No production code changed — the `conislocal` CHECK path (`operators_ddl.go` `AddCheck` → pg_constraint `VirtualRows`)
+and the legacy-inheritance column omission (`Table.InheritsParentOIDs` + `Column.Inherited`) already existed.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+### Slice 268 — local column `DEFAULT` on a legacy (non-partition) `INHERITS` child
+
+The `pg_attrdef` sibling of slice 267's table-level CHECK. Instead of a `conislocal` CHECK, the child's own local column
+carries an attrdef. The same column-omission regime applies — `idfl_child`'s inherited `pid`/`pname` (`attislocal=false`)
+are dropped while its local `extra` (`attislocal=true`) prints — but the new wrinkle is that the DEFAULT must ride
+**inline** on that local column. Slice 265 proved a child-only DEFAULT on a **partition leaf** (`ispartition` forces every
+column to print, so the DEFAULT rode an already-printed column); this slice proves the DEFAULT still rides correctly when
+the column prints *because of* `attislocal`, not despite it — the legacy-inheritance path that slices 170/267 exercise.
+
+`idfl_child (extra integer DEFAULT 42) INHERITS (idfl_parent (pid integer, pname text))`. Real pg_dump 18.3 emits:
+
+```
+CREATE TABLE public.idfl_child (
+    extra integer DEFAULT 42
+)
+INHERITS (public.idfl_parent);
+```
+
+i.e. (1) only the local `extra integer` prints — `pid`/`pname` are omitted (they arrive via `INHERITS`), (2) the DEFAULT
+rides inline as `extra integer DEFAULT 42`, and (3) the `INHERITS (public.idfl_parent)` clause closes it. Verified
+byte-identical vs PG 18.3 and a fresh goopg server this loop.
+
+No production code changed — the local-column attrdef path (`operators_ddl.go` column DEFAULT → pg_attrdef) and the
+legacy-inheritance column omission (`Table.InheritsParentOIDs` + `Column.Inherited`) already existed.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3).
+
+> **Next (slice 269+):** a child-level DEFAULT/NOT NULL applied to an *inherited* column (`ALTER TABLE child ALTER
+> COLUMN ... SET DEFAULT/SET NOT NULL`), which pg_dump emits as a separate `ALTER TABLE ... ALTER COLUMN` statement rather
+> than inline.
+
+### Slice 269 — child-level `SET DEFAULT` on an *inherited* column (separate ALTER)
+
+Slices 265/268 rode a column DEFAULT **inline** on a column pg_dump prints. This slice is the opposite: a DEFAULT on an
+*inherited* column that pg_dump **suppresses** from the child's column list (`attislocal=false`). Because the column is
+not printed, the DEFAULT cannot ride inline — pg_dump.c marks `attrdefs[].separate` in the `!shouldPrintColumn` branch
+(`pg_dump.c:9527`) and emits it as a STANDALONE statement via `dumpAttrDef` (`pg_dump.c:18028`):
+
+```
+CREATE TABLE public.idfa_child (
+    extra integer
+)
+INHERITS (public.idfa_parent);
+...
+ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;
+```
+
+This required **new production support**: `ALTER TABLE ... ALTER COLUMN ... SET DEFAULT` (and `DROP DEFAULT`) were
+previously swallowed as a no-op by the parser (`ddl.go` ALTER COLUMN block fell through to the "consume rest" loop). The
+change adds:
+
+- **Parser** (`internal/parser/ddl.go`): a `SET DEFAULT <expr>` branch (parses the expression via `parseExpr`) inside the
+  ALTER COLUMN `SET` block, plus a `DROP DEFAULT` branch. New AST kinds `AlterTableSetDefault` / `AlterTableDropDefault`
+  and an `AlterTableAction.DefaultExpr` field (`internal/parser/ast.go`).
+- **Executor** (`internal/executor/operators_ddl.go`): `AlterTableSetDefault` validates the expression with the same
+  `validateDefaultExpr` CREATE TABLE uses (no column refs, aggregates, subqueries, SRFs), sets `Column.DefaultExpr` on the
+  target column, and flushes the `pg_attribute` heap (`atthasdef`) via the established delete-old-rows +
+  `syncTableToCatalogHeap` path (the same one SET STORAGE/COMPRESSION/STATISTICS use, because `pg_attribute` is a heap
+  populated at CREATE TABLE — an in-memory mutation alone is invisible to pg_dump). `AlterTableDropDefault` clears it.
+  A missing column raises `42703 column "…" of relation "…" does not exist`.
+
+The DEFAULT then surfaces in two places pg_dump reads: `pg_attrdef` (catalog `attrDefRowsLocked` renders
+`Column.DefaultExpr` via `formatExprForAttrdef`) and `pg_attribute.atthasdef` (the re-synced heap row). The fixture keeps
+a purely-local column (`extra`) on the child so the CREATE TABLE body is non-empty and the inherited `pid`/`pname` are
+still omitted (arriving via INHERITS). Verified end-to-end: real pg_dump 18.3 against goopg emits the separate
+`ALTER TABLE ONLY ... SET DEFAULT 7;`.
+
+Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `TestParseAlterTableSetDropDefault`
+(parser AST).
+
+### Slice 270 — child-level `SET NOT NULL` on an *inherited* column (standalone body item)
+
+The NOT NULL twin of slice 269, but a **different catalog path**. In PG 18 a NOT NULL is a `pg_constraint` row
+(contype='n'), and pg_dump's `getTableAttrs` LEFT-JOINs `pg_constraint` (`contype='n' AND conkey=array[attnum]`) to
+populate `notnull_constrs`/`notnull_islocal` (`pg_dump.c:9260`). When the column is **suppressed** from the child's
+column list (`!shouldPrintColumn`, `attislocal=false`) but carries a **local** NOT NULL constraint
+(`conislocal='t'`), pg_dump emits the constraint as a STANDALONE item INSIDE the CREATE TABLE body
+(`pg_dump.c:17213-17232`) — *not* as a separate ALTER (the way DEFAULT is dumped). Because the constraint's name
+matches PG's auto-generated `<table>_<col>_not_null`, `notnull_constrs` is the unnamed `""` form, so the printed text
+is `NOT NULL <col>`. Verified against real pg_dump 18.3 — `NOT NULL pid` precedes `extra integer` in attnum order:
+
+```
+CREATE TABLE public.idfn_child (
+    NOT NULL pid,
+    extra integer
+)
+INHERITS (public.idfn_parent);
+```
+
+This required **new production support**: `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL` (and `DROP NOT NULL`) were
+previously swallowed as a no-op by the parser. The change adds:
+
+- **Parser** (`internal/parser/ddl.go`): a `SET NOT NULL` branch inside the ALTER COLUMN `SET` block, plus a
+  `DROP NOT NULL` branch in the DROP block. New AST kinds `AlterTableSetNotNull` / `AlterTableDropNotNull`
+  (`internal/parser/ast.go`).
+- **Executor** (`internal/executor/operators_ddl.go`): `AlterTableSetNotNull` sets `Column.NotNull` AND records a
+  contype='n' constraint via `catalog.Table.AddNotNull(name, col, oid, noInherit=false, isLocal=true, inhCount=0)`
+  — auto-named `<table>_<col>_not_null` — unless one already exists (idempotent, matching PG). It then flushes
+  `pg_attribute.attnotnull` via the established delete-old-rows + `syncTableToCatalogHeap` path. `AlterTableDropNotNull`
+  clears the flag and removes the constraint. A missing column raises `42703`.
+
+The constraint surfaces through the existing `pg_constraint` virtual builder (`catalog.go:3954`), which already renders
+contype='n' rows with `conislocal`/`coninhcount`/`connoinherit`/`conkey` from `NamedNotNullConstraint`.
+
+Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `TestParseAlterTableSetDropNotNull`
+(parser AST) + `TestAlterTableSetDropNotNull` (executor catalog state, incl. idempotence + DROP).
+
+### Slice 271 — *named* NOT NULL on an inherited column (`CONSTRAINT <name> NOT NULL <col>` body form)
+
+The named counterpart of slice 270. PG 18's `ALTER TABLE ... ADD [CONSTRAINT <name>] NOT NULL <col>` records a
+`pg_constraint` contype='n' row carrying the **explicit** name. pg_dump's `getTableAttrs` reads that `conname` as
+`notnull_name` and, for a PG18 server, compares it against the computed default `<table>_<col>_not_null`
+(`pg_dump.c:9926`). When they **match**, `notnull_constrs[j]` becomes the unnamed `""` (slice 270's path). When they
+**differ**, `notnull_constrs[j]` keeps the real name, and the standalone body emitter prints
+`CONSTRAINT <name> NOT NULL <col>` instead of the bare `NOT NULL <col>` (`pg_dump.c:17228`). Verified against real
+pg_dump 18.3 — `idfnn_nn` differs from `idfnn_child_pid_not_null`, so:
+
+```
+CREATE TABLE public.idfnn_child (
+    CONSTRAINT idfnn_nn NOT NULL pid,
+    extra integer
+)
+INHERITS (public.idfnn_parent);
+```
+
+New production support — the `ADD CONSTRAINT ... NOT NULL <col>` shape was previously unparseable (the column-level
+`NOT NULL` was only recognized inline in a CREATE TABLE / ADD COLUMN coldef):
+
+- **Parser** (`internal/parser/ddl.go`): a `NOT NULL` case in the `ALTER TABLE ... ADD [CONSTRAINT name]` switch that
+  consumes `NOT NULL <col>` plus an optional `NO INHERIT` trailer. New AST kind `AlterTableAddNotNull` carrying
+  `ColumnName`, the optional `ConstraintName`, and a new `NoInherit` flag (`internal/parser/ast.go`).
+- **Executor** (`internal/executor/operators_ddl.go`): `AlterTableAddNotNull` marks `Column.NotNull` and records a
+  contype='n' constraint via `catalog.Table.AddNotNull(name, col, oid, NoInherit, isLocal=true, inhCount=0)` — using
+  the **explicit** name when given, else the auto-name `<table>_<col>_not_null`. Idempotent (no duplicate row for a
+  column that already has a NOT NULL), and a missing column raises `42703`. The `pg_attribute.attnotnull` flush rides
+  the same delete-old-rows + `syncTableToCatalogHeap` path as SET NOT NULL.
+
+The constraint surfaces through the existing `pg_constraint` virtual builder (`catalog.go:3954`), which already renders
+`conname` from `NamedNotNullConstraint.Name` — so no builder change was needed; the explicit name flows straight
+through to pg_dump's `notnull_name`.
+
+Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3) + `TestParseAlterTableAddNotNull`
+(parser AST: named, unnamed, and `NO INHERIT` forms) + `TestAlterTableAddNotNullNamed` (executor catalog state:
+explicit name retained, unnamed fallback to auto-name, idempotence, 42703 on missing column).
+
+### Slice 272 — `NO INHERIT` NOT NULL on a *standalone* table (inline `NOT NULL NO INHERIT`)
+
+Slices 270/271 covered NOT NULL on *inherited* columns (emitted as standalone body items because the column is
+suppressed). Slice 272 exercises the same `connoinherit='t'` bit on an ordinary **local** column of a non-inherited
+table, where pg_dump renders it INLINE. PG18 records a contype='n' pg_constraint row with `connoinherit='t'`; pg_dump
+reads it as `notnull_noinh[j]` and appends ` NO INHERIT` after the inline `NOT NULL` (`pg_dump.c:17188`). Because the
+column is local (`notnull_islocal='t'`) and the constraint name equals the computed default `<table>_<col>_not_null`,
+pg_dump emits the **unnamed** inline form. Verified byte-for-byte against real pg_dump 18.3:
+
+```
+CREATE TABLE public.nninh (
+    c integer NOT NULL NO INHERIT,
+    d integer
+);
+```
+
+No production change was required — the whole path already existed but had never been asserted by a dump:
+
+- **Parser** (`internal/parser/ddl.go:2475`): `parseColumnDef` already consumes the optional ` NO INHERIT` trailer
+  after a column-level `NOT NULL` into `ColumnDef.NotNullNoInherit`.
+- **Executor** (`internal/executor/operators_ddl.go:2493`): the CREATE TABLE NOT-NULL loop threads
+  `explicitNoInherit[col]` (from `ColumnDef.NotNullNoInherit`) into `AddNotNull(name, col, oid, noInherit, isLocal=true, 0)`.
+  The PG18 guard that rejects `NO INHERIT` (`operators_ddl.go:913`) fires only for *partitioned* tables, so a plain
+  standalone table is allowed.
+- **Catalog** (`internal/catalog/catalog.go:3992`): the pg_constraint virtual builder already renders `connoinherit`
+  from `NamedNotNullConstraint.NoInherit`, so `connoinherit='t'` flows straight to pg_dump.
+
+Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3 — `c integer NOT NULL NO INHERIT`) +
+`TestParseCreateTableColumnNotNullNoInherit` (parser: the inline ` NO INHERIT` trailer sets `NotNullNoInherit`, a plain
+`NOT NULL` leaves it false). A regression that dropped the NoInherit thread anywhere in the chain would dump a plain
+`c integer NOT NULL` (connoinherit='f').
+
+> **Next (slice 273+):** a `NO INHERIT` NOT NULL added to a standalone table via `ALTER TABLE ... ADD CONSTRAINT
+> <name> NOT NULL <col> NO INHERIT` (slice 271's ADD-CONSTRAINT path now exercised with the `NO INHERIT` trailer end-to-end
+> through a dump) — or the *named*-differs variant rendered inline as `c integer CONSTRAINT <name> NOT NULL NO INHERIT`.
+
+### Slice 273 — *named* inline NOT NULL on a *standalone* table (`CONSTRAINT <name> NOT NULL [NO INHERIT]`)
+
+Slice 272 dumped the **unnamed** inline NOT NULL (name == auto-name → bare `NOT NULL`). Slice 273 covers the *named*
+inline form: when a column's NOT NULL constraint name **differs** from PG's auto-name `<table>_<col>_not_null`, pg_dump
+re-emits the explicit `CONSTRAINT <name>` prefix on the inline column definition (`pg_dump.c:17184`), followed by
+` NO INHERIT` when `connoinherit='t'`. Verified byte-for-byte against real pg_dump 18.3:
+
+```
+CREATE TABLE public.nninh2 (
+    c integer CONSTRAINT c_nn NOT NULL NO INHERIT,
+    e integer CONSTRAINT e_nn NOT NULL
+);
+```
+
+This slice **did** require a production fix — goopg's inline-`CONSTRAINT` parser switch had no `NOT NULL` arm, so
+`CONSTRAINT c_nn NOT NULL` fell through to the default skip and the constraint was silently dropped (column dumped as a
+plain `c integer`):
+
+- **AST** (`internal/parser/ast.go`): new `ColumnDef.NotNullConstraintName` holds the user-given name from an inline
+  `CONSTRAINT <name> NOT NULL`.
+- **Parser** (`internal/parser/ddl.go:2761`): a new `KwNot` case inside the inline-`CONSTRAINT` switch consumes
+  `NOT NULL`, records `NotNullConstraintName = <name>`, and accepts the optional ` NO INHERIT` trailer
+  (`NotNullNoInherit = true`).
+- **Executor** (`internal/executor/operators_ddl.go:2464`): the CREATE TABLE NOT-NULL loop builds an
+  `explicitNotNullName[col]` map from the parsed defs and uses the custom name (instead of the computed auto-name) in the
+  `AddNotNull(name, col, oid, noInherit, isLocal=true, 0)` call, so the pg_constraint virtual row carries the user-given
+  conname. pg_dump's `getTableAttrs` query then reports a non-default notnull name and emits the `CONSTRAINT <name>` prefix.
+
+The unnamed path (slice 272) is unaffected: `explicitNotNullName` is empty for a bare `NOT NULL`, so the auto-name still
+wins and pg_dump emits the bare inline form.
+
+Guards: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3 — `c integer CONSTRAINT c_nn NOT NULL NO
+INHERIT` and `e integer CONSTRAINT e_nn NOT NULL`, with a negative check that the plain named NOT NULL on `e` does NOT
+gain a spurious ` NO INHERIT`) + `TestParseCreateTableColumnNamedNotNull` (parser: the inline `CONSTRAINT <name>` arm sets
+`NotNullConstraintName` + `NotNullNoInherit`; an unnamed `NOT NULL` leaves `NotNullConstraintName` empty).
+
+### Slice 274 — *named* inline NOT NULL whose name EQUALS the auto-name (collapses to bare `NOT NULL`)
+
+Slice 273's boundary twin. Slice 273 asserted that a named inline NOT NULL whose conname *differs* from PG's computed
+default `<table>_<col>_not_null` forces pg_dump to re-emit the `CONSTRAINT <name>` prefix. This slice covers the *equal*
+case: a user who spells out the exact default name (`CREATE TABLE nninh3 (c integer CONSTRAINT nninh3_c_not_null NOT
+NULL, d integer)`) must see the constraint COLLAPSE back to the bare `c integer NOT NULL` form — pg_dump only emits the
+`CONSTRAINT <name>` prefix when the name differs from the default it would itself choose (pg_dump.c:17184,
+`ChooseConstraintName` match).
+
+**No production change required.** Slice 273's code records the user-given name on `AddNotNull(...)` so the pg_constraint
+virtual row carries conname `nninh3_c_not_null`; the *real* pg_dump 18.3 binary then compares that against its own
+computed default, finds them equal, and drops the prefix on its own. The slice is a verification/regression guard that
+locks in the correct boundary behavior: goopg must record the explicit name faithfully (so the comparison is against the
+true conname, not a synthesized one) and must NOT itself force the prefix whenever an explicit name is present.
+
+Guard: `TestPort_PgDumpConnectionSetup` (byte-matches real pg_dump 18.3 — asserts the `nninh3` block contains the bare
+`c integer NOT NULL` and does NOT contain `CONSTRAINT nninh3_c_not_null`, plus the plain `d integer` survives). A
+regression that unconditionally emitted the `CONSTRAINT` prefix for any explicitly-named NOT NULL would fail the
+negative check.
+
+### Slice 275 — *named* `NO INHERIT` NOT NULL added to a *local* column via `ALTER TABLE ADD CONSTRAINT` (inline)
+
+The ALTER-path counterpart of slice 273's CREATE-TABLE-inline case. Slice 271 exercised `ALTER TABLE ... ADD
+CONSTRAINT <name> NOT NULL <col>` on an *inherited* column (rendered as a standalone `CONSTRAINT <name> NOT NULL <col>`
+body item); slice 272 exercised `NO INHERIT` on a *standalone* table but via the CREATE-TABLE-inline parser; nninh2
+(slice 273) proved the inline `c integer CONSTRAINT c_nn NOT NULL NO INHERIT` form when the constraint is spelled at
+table-creation time. This slice closes the matrix: the SAME inline rendering must result when a named `NO INHERIT`
+NOT NULL arrives AFTER the fact on a LOCAL column —
+`CREATE TABLE nninh4 (c integer, d integer); ALTER TABLE nninh4 ADD CONSTRAINT nn4 NOT NULL c NO INHERIT` →
+`c integer CONSTRAINT nn4 NOT NULL NO INHERIT`.
+
+**No production change required.** The path already exists end-to-end: the parser captures the `NO INHERIT` trailer into
+`AlterTableAction.NoInherit` (`ddl.go:5483`) and the executor records a contype='n' pg_constraint row with
+connoinherit='t' via `tbl.AddNotNull(name, col, oid, act.NoInherit=true, isLocal=true, 0)` (`operators_ddl.go:5498`),
+then flushes attnotnull through the delete-old-rows + `syncTableToCatalogHeap` path (same as SET NOT NULL). Because the
+column is LOCAL (notnull_islocal='t') and `nn4` differs from the auto-name `nninh4_c_not_null`, real pg_dump re-emits
+the `CONSTRAINT nn4` prefix (pg_dump.c:17184) and the ` NO INHERIT` suffix (pg_dump.c:17188) on the inline column —
+exactly as for nninh2's inline-created `c`. The slice is a "sibling paths must agree" regression guard: it locks in that
+the **ALTER** path threads `act.NoInherit` and the conname identically to the **CREATE-inline** path. A regression that
+dropped `act.NoInherit` only on the ALTER arm would emit `c integer CONSTRAINT nn4 NOT NULL` (connoinherit='f') — a
+silent twin failure a green CREATE-inline test would not catch.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `nninh4`
+block contains `c integer CONSTRAINT nn4 NOT NULL NO INHERIT` and the plain `d integer` survives).
+
+### Slice 276 — *named* NOT NULL (no `NO INHERIT`) added to a *local* column via `ALTER TABLE ADD CONSTRAINT` (inline, negative twin)
+
+The negative twin of slice 275. Slice 275 proved the ALTER path **threads** `act.NoInherit` when the `NO INHERIT`
+trailer is present; this slice proves it does not **fabricate** it when the trailer is absent —
+`CREATE TABLE nninh5 (c integer, d integer); ALTER TABLE nninh5 ADD CONSTRAINT nn5 NOT NULL c` →
+`c integer CONSTRAINT nn5 NOT NULL` (no ` NO INHERIT` suffix). It is the inline-rendered ALTER-path counterpart of
+slice 273's `nninh2.e` (`e integer CONSTRAINT e_nn NOT NULL`), which arrived at table-creation time.
+
+**No production change required.** The parser leaves `AlterTableAction.NoInherit=false` (no `NO INHERIT` trailer at
+`ddl.go:5483`); the executor records a contype='n' pg_constraint row with connoinherit='f' via
+`tbl.AddNotNull(name, col, oid, false, isLocal=true, 0)` (`operators_ddl.go:5498`). Because the column is LOCAL and
+`nn5` differs from the auto-name `nninh5_c_not_null`, real pg_dump emits the `CONSTRAINT nn5` prefix
+(pg_dump.c:17184) but NO suffix (pg_dump.c:17188 is gated on connoinherit). A regression that defaulted connoinherit to
+'t' on the ALTER arm — or echoed a stray NO INHERIT — would emit `c integer CONSTRAINT nn5 NOT NULL NO INHERIT` (the
+exact slice-275 byte form, but wrong here); the assertion explicitly rejects that suffix in addition to requiring the
+bare named form.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `nninh5`
+block contains `c integer CONSTRAINT nn5 NOT NULL`, does NOT contain `CONSTRAINT nn5 NOT NULL NO INHERIT`, and the plain
+`d integer` survives).
+
+### Slice 277 — *default-named* NOT NULL added to a *local* column via `ALTER TABLE ADD CONSTRAINT` collapses to bare form
+
+The ALTER-path counterpart of slice 274's CREATE-inline `nninh3`. Slice 274 proved that a named NOT NULL whose explicit
+name equals the auto-name `<table>_<col>_not_null` collapses to the bare `<col> <type> NOT NULL` form at table-creation
+time; this twin proves the same collapse when the constraint is added later via ALTER —
+`CREATE TABLE nninh6 (c integer, d integer); ALTER TABLE nninh6 ADD CONSTRAINT nninh6_c_not_null NOT NULL c` →
+`c integer NOT NULL` (no `CONSTRAINT nninh6_c_not_null` prefix).
+
+**No production change required.** The AlterTableAddNotNull executor stores the user-supplied `conname`
+(`nninh6_c_not_null`) on a contype='n' pg_constraint row, identical to the value real PostgreSQL computes as the default.
+pg_dump suppresses the constraint name when it matches the computed default (`<table>_<col>_not_null`, pg_dump.c:17184),
+so the explicit name does NOT leak into the dump. A regression that stored a non-default conname on the ALTER path — or
+skipped the auto-name comparison — would emit `c integer CONSTRAINT nninh6_c_not_null NOT NULL`; the assertion explicitly
+rejects that leaked prefix in addition to requiring the bare named form.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `nninh6`
+block contains `c integer NOT NULL`, does NOT contain `CONSTRAINT nninh6_c_not_null`, and the plain `d integer` survives).
+
+### Slice 278 — *default-named* `NO INHERIT` NOT NULL added to a *local* column via `ALTER TABLE ADD CONSTRAINT` collapses the prefix but keeps the suffix
+
+Combines slice 277's auto-name collapse with slice 275's `NO INHERIT` suffix threading on the ALTER path —
+`CREATE TABLE nninh7 (c integer, d integer); ALTER TABLE nninh7 ADD CONSTRAINT nninh7_c_not_null NOT NULL c NO INHERIT` →
+`c integer NOT NULL NO INHERIT` (the `CONSTRAINT nninh7_c_not_null` prefix collapses because the explicit name equals the
+auto-name, but the `NO INHERIT` suffix survives).
+
+**No production change required.** pg_dump renders the column NOT NULL clause in two independent steps
+(pg_dump.c:17179-17188): the name-vs-default decision picks bare ` NOT NULL` (the conname matches the computed default
+`<table>_<col>_not_null`, suppressed at pg_dump.c:17184), then `notnull_noinh[j]` appends ` NO INHERIT`
+(pg_dump.c:17187). Slice 275 already proved the AlterTableAddNotNull executor threads the NO INHERIT bit onto the
+contype='n' pg_constraint row; slice 277 proved it stores the collapsible default conname. This twin proves BOTH travel
+together on the ALTER path. A regression dropping the noinh bit would emit `c integer NOT NULL` (missing suffix); one
+storing a non-default conname would leak `c integer CONSTRAINT nninh7_c_not_null NOT NULL NO INHERIT`; the assertion
+rejects both.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `nninh7`
+block contains `c integer NOT NULL NO INHERIT`, does NOT contain `CONSTRAINT nninh7_c_not_null`, and the plain
+`d integer` survives).
+
+### Slice 279 — *default-named* NOT NULL added to an *inherited* column via `ALTER TABLE ADD CONSTRAINT` collapses to the bare body form
+
+The inherited-child counterpart of slice 277. A DEFAULT-named NOT NULL added to an INHERITED column —
+`CREATE TABLE idfnd_parent (pid integer, pname text); CREATE TABLE idfnd_child (extra integer) INHERITS (idfnd_parent);
+ALTER TABLE idfnd_child ADD CONSTRAINT idfnd_child_pid_not_null NOT NULL pid` — whose explicit name EQUALS the auto-name
+`idfnd_child_pid_not_null` must COLLAPSE the `CONSTRAINT` prefix in the STANDALONE body form: pg_dump emits the bare
+`NOT NULL pid`, not `CONSTRAINT idfnd_child_pid_not_null NOT NULL pid`.
+
+**No production change required.** pg_dump renders a conislocal NOT NULL on a non-printed (inherited) column through the
+standalone body branch (pg_dump.c:17225-17232): `NOT NULL <col>` when `notnull_constrs[j][0]=='\0'` (conname == the
+computed default `<table>_<col>_not_null`) and `CONSTRAINT <name> NOT NULL <col>` otherwise. This branch reuses the SAME
+`notnull_constrs[]` array as the inline-column branch, so once goopg's ALTER path stores the collapsible default conname
+(proven by slice 277 for a local column) and getTableAttrs suppresses it, the inherited body form collapses identically.
+Slice 271 already proved the NAMED (non-default) body form (`CONSTRAINT idfnn_nn NOT NULL pid`); this twin proves the
+auto-name collapse for the same body branch. Note the body branch never appends ` NO INHERIT` (inline-only,
+pg_dump.c:17187), so this slice deliberately omits the NO INHERIT dimension. A regression storing a non-default conname
+(or skipping the default-name comparison on the ALTER path) would leak `CONSTRAINT idfnd_child_pid_not_null NOT NULL pid`;
+one that lost AlterTableAddNotNull would drop the NOT NULL entirely.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 against a live goopg server — asserts the `idfnd_child`
+block prints its local `extra integer` and the bare `NOT NULL pid`, does NOT contain `CONSTRAINT idfnd_child_pid_not_null`,
+does NOT re-emit the inherited `pid integer`/`pname text` columns, and that `INHERITS (public.idfnd_parent)` survives).
+
+> **Next (slice 280+):** the partition-leaf counterpart — a conislocal NOT NULL on a partition leaf column (where
+> `tbinfo->ispartition` changes the column-omission decision), or a multi-column inherited NOT NULL body form proving the
+> attnum ordering of multiple standalone `NOT NULL <col>` body items.
+
+### Slice 280 — multi-column inherited NOT NULL body form: attnum ordering + per-column collapse
+
+The multi-column generalization of slices 271/279. Two conislocal NOT NULL constraints on DISTINCT inherited columns of
+the same child, added in REVERSE attnum order —
+`CREATE TABLE mninh_parent (ma integer, mb integer, mname text); CREATE TABLE mninh_child (extra integer) INHERITS (mninh_parent);
+ALTER TABLE mninh_child ADD CONSTRAINT mninh_named NOT NULL mb; ALTER TABLE mninh_child ADD CONSTRAINT mninh_child_ma_not_null NOT NULL ma`
+— must emit their STANDALONE body items in ATTNUM order (`NOT NULL ma` before `… mb`), not constraint-creation order, AND
+apply the auto-name COLLAPSE decision PER-COLUMN.
+
+**No production change required.** The pg_dump body loop iterates `j` over columns (pg_dump.c:17175-17233), so the two
+standalone `NOT NULL <col>` items are naturally sorted by attnum regardless of when each constraint was created — `mb` is
+ALTERed first (attnum 2) but `ma` (attnum 1) still prints first. The collapse test (`notnull_constrs[j][0]=='\0'`,
+pg_dump.c:17226) is evaluated independently per column: `ma`'s explicit name EQUALS its auto-name
+`mninh_child_ma_not_null` so it collapses to the bare `NOT NULL ma`, while `mb`'s name (`mninh_named`) DIFFERS from
+`mninh_child_mb_not_null` so it keeps `CONSTRAINT mninh_named NOT NULL mb`. Slices 271/277/279 already proved the
+per-constraint name handling and collapse; this twin proves they compose correctly across multiple columns of one table.
+A regression that sorted body items by constraint OID/creation order would flip `ma`/`mb`; one that applied the
+default-name collapse globally would drop the `CONSTRAINT mninh_named` prefix; one that lost either AlterTableAddNotNull
+would drop a body item.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `mninh_child` block prints `extra integer`,
+the bare `NOT NULL ma` (no `CONSTRAINT mninh_child_ma_not_null`), `CONSTRAINT mninh_named NOT NULL mb`, that `NOT NULL ma`
+precedes `NOT NULL mb` (attnum order despite mb-first ALTER), does NOT re-emit the inherited `ma integer`/`mb integer`/
+`mname text` columns, and that `INHERITS (public.mninh_parent)` survives).
+
+> **Next (slice 281+):** ~~the partition-leaf counterpart — a conislocal NOT NULL on a partition leaf column (where
+> `tbinfo->ispartition` changes the column-omission decision)~~ — done in slice 281 below.
+
+### Slice 281 — partition-leaf NOT NULL added via `ALTER TABLE ADD CONSTRAINT` routes to the INLINE form (ispartition discriminator)
+
+The partition-leaf counterpart of the legacy-inheritance inherited-NOT-NULL body forms (271/277/279/280). The SAME
+`ALTER TABLE leaf ADD CONSTRAINT <name> NOT NULL <inherited-col>` shape that produces the STANDALONE body item
+(`CONSTRAINT <name> NOT NULL <col>`) on a legacy-inheritance child (`mninh`/`idfnd`) instead produces the INLINE column
+decoration (`<col> <type> CONSTRAINT <name> NOT NULL`) on a partition leaf —
+`CREATE TABLE pnna (qa integer, qb integer, qc text) PARTITION BY LIST (qa); CREATE TABLE pnna_1 PARTITION OF pnna FOR VALUES IN (1);
+ALTER TABLE pnna_1 ADD CONSTRAINT pnna_named NOT NULL qb; ALTER TABLE pnna_1 ADD CONSTRAINT pnna_1_qc_not_null NOT NULL qc`.
+
+**No production change required.** `shouldPrintColumn` (pg_dump.c:9970) returns `attislocal[j] || tbinfo->ispartition`, so for
+a partition leaf EVERY column prints inline and the standalone-body branch (`!shouldPrintColumn && notnull_islocal[j]`,
+pg_dump.c:17213) is never reached. `print_notnull` (pg_dump.c:17116) is true because `ispartition`, so the constraint
+renders as the inline decoration at pg_dump.c:17178-17183 — `CONSTRAINT <name> NOT NULL` for the non-default name (`qb` →
+`pnna_named` ≠ auto-name `pnna_1_qb_not_null`) and the bare ` NOT NULL` for the collapsing default name (`qc` →
+`pnna_1_qc_not_null` matches its auto-name). This is the partition twin of slice 280: that slice proved the per-column
+collapse on the legacy-inheritance STANDALONE path; this one proves the SAME per-column collapse on the partition INLINE
+path, with `ispartition` as the sole discriminator routing the identical ALTER shape to a different output form. goopg
+already exposes the conislocal NOT NULL `pg_constraint` rows + `attnotnull` for the ALTER path (slices 277/280) and reports
+the leaf as a partition (slice 266), so real pg_dump 18.3 renders the inline form unaided. Verified byte-identical vs PG
+18.3 (`qa integer`, `qb integer CONSTRAINT pnna_named NOT NULL`, `qc text NOT NULL`). A regression that ignored
+`ispartition` in `shouldPrintColumn` would emit the standalone body form (`CONSTRAINT pnna_named NOT NULL qb`) after the
+column list; one that collapsed the name globally would drop the `CONSTRAINT pnna_named` prefix on `qb`; one that lost
+either AlterTableAddNotNull would drop an inline decoration.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pnna_1` block prints `qa integer`,
+`qb integer CONSTRAINT pnna_named NOT NULL` and the collapsed `qc text NOT NULL`, that NO standalone
+`CONSTRAINT pnna_named NOT NULL qb` body item appears anywhere, that `CONSTRAINT pnna_1_qc_not_null` never leaks, and that
+`ATTACH PARTITION public.pnna_1 FOR VALUES IN (1)` survives).
+
+### Slice 282 — partition-leaf `SET DEFAULT` on an *inherited* column rides INLINE (separate-flag discriminator)
+
+The DEFAULT analog of slice 281, and the partition-INLINE twin of slice 269. The SAME
+`ALTER TABLE <leaf> ALTER COLUMN <inherited-col> SET DEFAULT <expr>` shape that produces a STANDALONE
+`ALTER TABLE ONLY ... ALTER COLUMN ... SET DEFAULT` on a legacy-inheritance child (slice 269, `idfa_child`) instead rides
+INLINE on the printed column for a partition leaf —
+`CREATE TABLE pdfa (ka integer, kb integer) PARTITION BY LIST (ka); CREATE TABLE pdfa_1 PARTITION OF pdfa FOR VALUES IN (1);
+ALTER TABLE pdfa_1 ALTER COLUMN kb SET DEFAULT 7`.
+
+**No production change required.** The discriminator is the `attrdefs[].separate` flag (pg_dump.c:9507-9535): pg_dump marks
+a default `separate` (→ standalone ALTER) only on the `!shouldPrintColumn` branch. Because `shouldPrintColumn`
+(pg_dump.c:9964) returns `attislocal[j] || tbinfo->ispartition`, every column of a partition leaf prints inline, so
+`separate` stays false and the default joins the CREATE TABLE body (`kb integer DEFAULT 7`). This is the exact mirror of
+slice 269, where the legacy-inheritance child's inherited column is suppressed (`attislocal=false`, `ispartition=false`) →
+`separate=true` → standalone `ALTER TABLE ONLY public.idfa_child ALTER COLUMN pid SET DEFAULT 7;`. goopg already records the
+ALTER-path DEFAULT on the child column (`AlterTableSetDefault`, added for slice 269: `Column.DefaultExpr` → `pg_attrdef` +
+`atthasdef`) and reports the leaf as a partition (slices 266/281), so real pg_dump 18.3 renders the inline form unaided.
+Verified byte-identical vs PG 18.3 (`ka integer`, `kb integer DEFAULT 7`, no standalone SET DEFAULT). A regression that
+ignored `ispartition` in `shouldPrintColumn` would suppress `kb` and emit the standalone ALTER; one that lost
+`AlterTableSetDefault` would drop the `DEFAULT 7` decoration.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pdfa_1` block prints `ka integer` and the
+inline `kb integer DEFAULT 7`, that NO standalone `ALTER COLUMN kb SET DEFAULT 7` appears anywhere, and that
+`ATTACH PARTITION public.pdfa_1 FOR VALUES IN (1)` survives).
+
+### Slice 283 — STORED generated column inherited onto a partition leaf rides INLINE (attgenerated discriminator)
+
+The generated-column counterpart of slices 281/282, and a *different* discriminator branch. Where slices 281/282 held
+`attrdefs[].separate=false` via `shouldPrintColumn` (every partition column prints because `ispartition`), slice 283 holds
+`separate=false` via **`attgenerated`**: pg_dump.c:9507 sets `attrdefs[adnum-1].separate = false` UNCONDITIONALLY whenever
+`tbinfo->attgenerated[adnum-1]` is non-empty — a generation expression can never be split into a standalone
+`ALTER TABLE ... ALTER COLUMN ... SET DEFAULT` (that syntax cannot express a generated column). The parent
+`CREATE TABLE pgna (ga integer, gb integer GENERATED ALWAYS AS (ga * 2) STORED) PARTITION BY LIST (ga)` declares the
+generated column; the leaf `CREATE TABLE pgna_1 PARTITION OF pgna FOR VALUES IN (1)` INHERITS it (`attislocal=false`).
+Layered on the partition leaf's `ispartition=true`, the leaf body prints `gb integer GENERATED ALWAYS AS (ga * 2) STORED`
+inline.
+
+**No production change required.** goopg already round-trips STORED generated columns on standalone tables (slice 59:
+`attgenerated='s'` + a `pg_attrdef` row carrying the deparse, rendered `GENERATED ALWAYS AS (w * h) STORED`) and inherits
+parent columns onto partition leaves (slices 281/282). The two facts compose: the leaf's `gb` carries both the inherited
+`attgenerated='s'` and the inherited generation expression, so real pg_dump 18.3 prints the inline form unaided. Verified
+byte-identical vs PG 18.3 (`ga integer`, `gb integer GENERATED ALWAYS AS (ga * 2) STORED`, no standalone SET DEFAULT for
+`gb`). A regression that dropped the generation expression on the inherited column would print a bare `gb integer`; one
+that mis-set `separate` would try to emit an (illegal) standalone SET DEFAULT for a generated column.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgna_1` block prints `ga integer` and the
+inline `gb integer GENERATED ALWAYS AS (ga * 2) STORED`, that NO standalone `ALTER COLUMN gb SET DEFAULT` appears, and that
+`ATTACH PARTITION public.pgna_1 FOR VALUES IN (1)` survives).
+
+### Slice 284 — VIRTUAL generated column inherited onto a partition leaf rides INLINE, rendered bare (no trailing STORED)
+
+The VIRTUAL counterpart of slice 283. Both ride the **same** `separate=false`-via-`attgenerated` branch — pg_dump.c:9507
+sets `attrdefs[adnum-1].separate = false` UNCONDITIONALLY whenever `tbinfo->attgenerated[adnum-1]` is non-empty, and
+`ATTRIBUTE_GENERATED_VIRTUAL` (`'v'`) is non-empty exactly like `ATTRIBUTE_GENERATED_STORED` (`'s'`) — but the *render*
+differs: pg_dump.c:17171 emits `GENERATED ALWAYS AS (%s)` with **no trailing keyword** for a virtual column (the STORED
+branch at 17168 is skipped). The parent
+`CREATE TABLE pvna (va integer, vb integer GENERATED ALWAYS AS (va * 2) VIRTUAL) PARTITION BY LIST (va)` declares the
+virtual generated column; the leaf `CREATE TABLE pvna_1 PARTITION OF pvna FOR VALUES IN (1)` INHERITS it
+(`attislocal=false`). Layered on the leaf's `ispartition=true` (every column prints, slices 281/282), the leaf body prints
+`vb integer GENERATED ALWAYS AS (va * 2)` inline, bare.
+
+**No production change required.** goopg already round-trips VIRTUAL generated columns on standalone tables (slice 194:
+`attGeneratedFor` reports `'v'`) and inherits parent columns onto partition leaves (slices 281/282/283). The two facts
+compose: the leaf's `vb` carries the inherited `attgenerated='v'` and generation expression, so real pg_dump 18.3 prints
+the bare inline form unaided. Verified vs PG 18.3. A regression that mis-mapped `attgenerated` `'v'→'s'` would print a
+spurious trailing `STORED`; one that dropped the generation expression would print a bare `vb integer`; one that mis-set
+`separate` would try to emit an (illegal) standalone SET DEFAULT for a generated column.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pvna_1` block prints `va integer` and the
+inline `vb integer GENERATED ALWAYS AS (va * 2)`, that NO trailing `STORED` follows it, that NO standalone
+`ALTER COLUMN vb SET DEFAULT` appears, and that `ATTACH PARTITION public.pvna_1 FOR VALUES IN (1)` survives).
+
+### Slice 285 — multi-attribute generation expression inherited onto a partition leaf (multi-Var deparse through the leaf)
+
+Where slices 283/284 referenced a **single** column in the generation clause (`ga * 2`), this slice proves the generation
+deparse resolves **two** distinct inherited Var references through the leaf. The parent
+`CREATE TABLE pgmc (ga integer, gc integer, gb integer GENERATED ALWAYS AS (ga + gc) STORED) PARTITION BY LIST (ga)`
+declares a generated column over a binary expression of two plain columns; the leaf
+`CREATE TABLE pgmc_1 PARTITION OF pgmc FOR VALUES IN (1)` INHERITS all three (`attislocal=false`). The *render path* is
+identical to slice 283 — `attgenerated` forces `attrdefs[].separate=false` unconditionally (pg_dump.c:9507) and
+`ispartition` forces `shouldPrintColumn` true for every column (slices 281/282) — so the leaf body prints
+`gb integer GENERATED ALWAYS AS (ga + gc) STORED` inline. The **new** fact under test is the deparse of a binary
+expression over two Vars: each Var must resolve to the correct inherited column NAME on the leaf (not an attnum-shifted,
+dropped, or swapped reference).
+
+**No production change required.** goopg already deparses multi-column expressions for generated columns (slice 59:
+`attgenerated='s'` + pg_attrdef deparse) and inherits parent columns onto partition leaves (slices 281–284); the two
+compose. Verified byte-identical vs PG 18.3. A regression that resolved only the first Var, or that swapped `ga↔gc` by
+attnum, would surface as a corrupted generation clause.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgmc_1` block prints both plain inherited
+columns `ga integer` and `gc integer` plus the inline `gb integer GENERATED ALWAYS AS (ga + gc) STORED`, and that
+`ATTACH PARTITION public.pgmc_1 FOR VALUES IN (1)` survives).
+
+### Slice 286 — forward-reference generation expression inherited onto a partition leaf (name-based Var resolution, not declaration order)
+
+Slices 283/285 proved a generated column whose expression references columns declared **before** it (`gb` at attnum 3 over
+`ga`/`gc` at attnum 1/2). This slice flips the declaration order: the parent
+`CREATE TABLE pgfr (gz integer GENERATED ALWAYS AS (ya + yc) STORED, ya integer, yc integer) PARTITION BY LIST (ya)`
+declares the generated column `gz` **first** (attnum 1), referencing `ya` (attnum 2) and `yc` (attnum 3) — both declared
+*after* it. PG places every table column in scope for a generation expression regardless of declaration order, so
+`(ya + yc)` is legal as a forward reference. The leaf `CREATE TABLE pgfr_1 PARTITION OF pgfr FOR VALUES IN (1)` INHERITS
+all three (`attislocal=false`). The *render path* is identical to slice 285 — `attgenerated` forces
+`attrdefs[].separate=false` unconditionally (pg_dump.c:9507) and `ispartition` forces `shouldPrintColumn` true for every
+column (slices 281/282) — so the leaf body prints columns in attnum order: the inline
+`gz integer GENERATED ALWAYS AS (ya + yc) STORED` first, then `ya integer`, `yc integer`. The **new** fact under test is
+that the generation deparse resolves each Var by column NAME, not via a forward-only positional scan that would only see
+columns up to the generated column's own attnum (where it would find neither operand).
+
+**No production change required.** goopg resolves generation-expression columns by name (`evalGeneratedExpr` over
+`catalog.Column`) and inherits parent columns onto partition leaves (slices 281–285); the two compose. Verified
+byte-identical vs PG 18.3. A regression that resolved Vars positionally relative to the generated column's attnum would
+corrupt the `(ya + yc)` clause here, where neither operand precedes `gz`.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgfr_1` block prints the inline
+`gz integer GENERATED ALWAYS AS (ya + yc) STORED` **before** the two plain inherited columns `ya integer` and
+`yc integer`, and that `ATTACH PARTITION public.pgfr_1 FOR VALUES IN (1)` survives).
+
+### Slice 287 — mid-position generation expression mixing a backward Var, a literal, and a forward Var (both directions, one deparse)
+
+Slices 285/286 each exercised a single direction: 285's `gb` (attnum 3) referenced only columns declared **before** it,
+286's `gz` (attnum 1) referenced only columns declared **after** it. This slice places the generated column in the
+**middle** so a single expression resolves **both** directions at once. The parent
+`CREATE TABLE pgmx (ma integer, mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED, mc integer) PARTITION BY LIST (ma)`
+declares `mg` at attnum 2, referencing `ma` (attnum 1, **backward**), the literal `1`, and `mc` (attnum 3, **forward**).
+The leaf `CREATE TABLE pgmx_1 PARTITION OF pgmx FOR VALUES IN (1)` INHERITS all three (`attislocal=false`). The render
+path is identical to slices 283–286 — `attgenerated` forces `attrdefs[].separate=false` (pg_dump.c:9507) and
+`ispartition` forces `shouldPrintColumn` true for every column (slices 281/282) — so the leaf body prints in attnum
+order: `ma integer`, then the inline `mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED`, then `mc integer`. The
+**new** fact under test is that the generation deparse resolves both a backward and a forward Var by NAME within one
+expression; a forward-only positional scan would lose `ma`, a backward-only scan would lose `mc`.
+
+**No production change required.** goopg stores the generation expression as verbatim source text and renders it back
+through `pg_get_expr` (slices 283–286); pg_dump wraps it with one paren set (`GENERATED ALWAYS AS (%s) STORED`), so the
+three-operand `ma + 1 + mc` prints flat with no nested parens — matching goopg's existing flat-render convention
+(`GENERATED ALWAYS AS (a + b + 1000) STORED`). Verified byte-identical vs PG 18.3.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgmx_1` block prints `ma integer`
+**before** the inline `mg integer GENERATED ALWAYS AS (ma + 1 + mc) STORED`, which prints **before** `mc integer`, and
+that `ATTACH PARTITION public.pgmx_1 FOR VALUES IN (1)` survives).
+
+> **Next (slice 288):** see slice 288 below — a TEXT generated column over the `||` operator (type/operator-agnostic
+> render path). A FuncExpr generation expression (`upper(name)`) is **deferred**: goopg's parser stores `GeneratedExpr`
+> as space-joined tokens (`ddl.go:2607`), so `upper(fn)` becomes `upper ( fn )` and mismatches real pg_dump's `upper(fn)`
+> — that needs expression canonicalization (a production change), not a pure test slice.
+
+### Slice 288 — TEXT generated column over the `||` string-concatenation operator (type- and operator-agnostic render path)
+
+Every prior generation slice (283–287) used an **integer** column over the `+`/`*` arithmetic operators. This slice
+proves the inherited-leaf generation render path carries **neither** assumption: the parent
+`CREATE TABLE pgcc (ca text, cb text, cc text GENERATED ALWAYS AS (ca || cb) STORED) PARTITION BY LIST (ca)` declares a
+**text** generated column `cc` (attnum 3) over the **`||`** string-concatenation operator. The leaf
+`CREATE TABLE pgcc_1 PARTITION OF pgcc FOR VALUES IN ('x')` INHERITS all three columns (`attislocal=false`).
+
+**No production change required.** The render path keys only off `attgenerated` ('s', via `attGeneratedFor`,
+pg18_user_catalog_rows.go:834, which inspects no column type) and the verbatim `pg_get_expr` pass-through of the stored
+generation source. `attgenerated` forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces
+`shouldPrintColumn` true for every column (slices 281/282), so the leaf body prints in attnum order: `ca text`,
+`cb text`, then the inline `cc text GENERATED ALWAYS AS (ca || cb) STORED`. The `||` token joins flat (no parens, no
+function call), so the deparse stays faithful — pg_dump wraps it `(%s)` → `(ca || cb)`. Verified vs PG 18.3.
+
+Guard: `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgcc_1` block prints `ca text` before
+`cb text` before the inline `cc text GENERATED ALWAYS AS (ca || cb) STORED`, and that
+`ATTACH PARTITION public.pgcc_1 FOR VALUES IN ('x')` survives).
+
+### Slice 289 — parenthesised generation expression `(fa + fb) * 2` (PRODUCTION: canonical `GeneratedExpr` deparse)
+
+Every prior generation slice (283–288) used a **flat** operator chain (`ga * 2`, `ga + gc`, `ma + 1 + mc`, `ca || cb`),
+whose captured tokens space-join faithfully. The **first** parenthesised / function-call generation expression exposed a
+deparse defect: goopg captured the `GENERATED ALWAYS AS (...)` body as raw lexer tokens and joined them with single
+spaces (`strings.Join(toks, " ")`), so `(fa + fb) * 2` became `( fa + fb ) * 2` and `upper(fn)` became `upper ( fn )`.
+pg_dump wraps the stored source `(%s)`, so goopg emitted `(( fa + fb ) * 2)` where real pg_dump's `pg_get_expr` renders
+the precedence paren **tight**: `((fa + fb) * 2)`. The two diverged, and any function-call or parenthesised generation
+column failed the round-trip.
+
+**Production fix (this slice):** `joinGeneratedExprTokens` (parser/ddl.go) reconstructs `pg_get_expr`'s spacing from the
+captured token stream — tight function calls (`upper(fn)`), `, `-separated argument lists (`coalesce(a, b)`), tight
+grouping/precedence parens (`(fa + fb) * 2`), tight qualified names (`schema.fn`), spaced binary operators. It keys off
+punctuation + the previous token's `Kind` (a `(` is tight when it follows an identifier or `)` — a call paren — and
+spaced otherwise — a grouping paren). Both `GeneratedExpr` capture sites (the column-def path and the
+`PARTITION OF (... WITH OPTIONS GENERATED ALWAYS AS ...)` override path) now route through this helper. The result
+re-parses to the same node, so `evalGeneratedExpr` (which re-parses the stored string for materialization) is
+unaffected, and every flat-chain slice (283–288) keeps its byte-identical stored source.
+
+The render path is otherwise identical to slices 283–288: `attgenerated` ('s') forces `attrdefs[].separate=false`
+(pg_dump.c:9507) and `ispartition` forces `shouldPrintColumn` for every column (slices 281/282), so the leaf
+`CREATE TABLE pgpp_1 PARTITION OF pgpp FOR VALUES IN (1)` inherits all three columns and prints `fa integer`,
+`fb integer`, then the inline `fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED`. Verified vs PG 18.3.
+
+Guards:
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgpp_1` block prints the inline
+  `fc integer GENERATED ALWAYS AS ((fa + fb) * 2) STORED` with the inner precedence paren **tight**, in attnum order, and
+  that `ATTACH PARTITION public.pgpp_1 FOR VALUES IN (1)` survives).
+- `TestGeneratedColumnExprCanonicalSpacing` (parser, no server — pins the canonical spacing for function calls, two-arg
+  calls, grouping parens, a nested call inside arithmetic, plain operator chains, and `||`).
+
+### Slice 290 — function-call generation expression `upper(fn)` (end-to-end on the pg_dump oracle)
+
+Slice 289 landed the production deparse fix (`joinGeneratedExprTokens`) and unit-tested its function-call branch. This
+slice exercises that branch **end-to-end** against the real pg_dump 18.3 oracle: the **first** generation slice whose body
+is a function invocation rather than pure operators. Every prior generation slice (283–289) used arithmetic (`ga * 2`,
+`ga + gc`, `(fa + fb) * 2`) or string concat (`ca || cb`); this one uses `upper(fn)`, a built-in `pg_catalog` function.
+
+`CREATE TABLE pgfx (fn text, fu text GENERATED ALWAYS AS (upper(fn)) STORED) PARTITION BY LIST (fn)` with leaf
+`pgfx_1 PARTITION OF pgfx FOR VALUES IN ('a')`. goopg stores the generation source via `joinGeneratedExprTokens`, which
+renders the call parens **tight** (`upper(fn)`, not `upper ( fn )`); real pg_dump reads that back through `pg_get_expr`
+verbatim and emits the inline `fu text GENERATED ALWAYS AS (upper(fn)) STORED`. The render path is otherwise identical to
+slices 283–289: `attgenerated` ('s') forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces
+`shouldPrintColumn` for every column, so the leaf inherits both columns in attnum order. No rows are inserted, so this
+rides the dump-time deparse path only (materialization of `upper()` is not exercised). Verified vs PG 18.3.
+
+Guards:
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgfx_1` block prints `fn text` then the inline
+  `fu text GENERATED ALWAYS AS (upper(fn)) STORED` with the call parens **tight**, in attnum order, and that
+  `ATTACH PARTITION public.pgfx_1 FOR VALUES IN ('a')` survives).
+
+### Slice 291 — two-argument function-call generation expression `coalesce(cn, dn)` (end-to-end on the pg_dump oracle)
+
+Slice 290 proved the single-argument call-paren branch of `joinGeneratedExprTokens` end-to-end (`upper(fn)`). This slice
+pins the **`, `-separated argument-list branch** on the oracle — the **first** generation slice whose body is a
+multi-argument function call. The comma branch is already unit-tested in `gen_override_test.go` (`coalesce(fn, gn)`); this
+slice proves it round-trips through real pg_dump 18.3.
+
+`CREATE TABLE pgcl (cn text, dn text, en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED) PARTITION BY LIST (cn)` with
+leaf `pgcl_1 PARTITION OF pgcl FOR VALUES IN ('a')`. `joinGeneratedExprTokens` renders the comma **tight to its left
+operand and spaced to its right** (`coalesce(cn, dn)`, not `coalesce(cn ,dn)` or `coalesce(cn,dn)`) so the stored source
+byte-matches `pg_get_expr`. Because this test dumps a **live goopg server**, the source pg_dump reads back is goopg's
+stored form — the lowercase `coalesce` is preserved verbatim (no real-PG `pg_get_expr` case normalization in this path).
+The render path is otherwise identical to slices 281–290: `attgenerated` ('s') forces `attrdefs[].separate=false`
+(pg_dump.c:9507) and `ispartition` forces `shouldPrintColumn` for every column, so the leaf inherits all three columns in
+attnum order (`cn`, `dn`, then the inline generated `en`). No rows are inserted, so this rides the dump-time deparse path
+only. Verified vs PG 18.3. TEST-ONLY — no production change.
+
+Guards:
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgcl_1` block prints `cn text`, `dn text`,
+  then the inline `en text GENERATED ALWAYS AS (coalesce(cn, dn)) STORED` with the argument list rendered `cn, dn`, in
+  attnum order, and that `ATTACH PARTITION public.pgcl_1 FOR VALUES IN ('a')` survives).
+
+### Slice 292 — nested function-call generation expression `upper(coalesce(gn, hn))` (end-to-end on the pg_dump oracle)
+
+Slices 290/291 pinned the single- and two-argument call-paren branches of `joinGeneratedExprTokens` at **one** nesting
+level. This slice pins their **composition** — a function call whose argument is itself a function call — proving the
+helper keeps **both** call parens tight while spacing only the inner argument comma.
+
+`CREATE TABLE pgnc (gn text, hn text, jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED) PARTITION BY LIST (gn)`
+with leaf `pgnc_1 PARTITION OF pgnc FOR VALUES IN ('a')`. The token walk relies on the `(`-after-ident rule firing
+**twice** (`upper(`, then the inner `coalesce(`) and the `)`-is-always-tight rule firing twice at the tail, yielding
+`upper(coalesce(gn, hn))` — not `upper ( coalesce ( gn ,hn ) )` or any single-depth variant. Because this test dumps a
+**live goopg server**, the source pg_dump reads back is goopg's stored form, so both lowercase function names are
+preserved verbatim (no real-PG `pg_get_expr` case normalization in this path). The render path is otherwise identical to
+slices 281–291: `attgenerated` ('s') forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces
+`shouldPrintColumn` for every column, so the leaf inherits all three columns in attnum order (`gn`, `hn`, then the inline
+generated `jn`). No rows are inserted, so this rides the dump-time deparse path only. Production already handled nested
+calls (the `joinGeneratedExprTokens` paren rules are depth-agnostic); this slice is the oracle round-trip proof. Verified
+vs PG 18.3. TEST-ONLY — no production change.
+
+Guards:
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgnc_1` block prints `gn text`, `hn text`,
+  then the inline `jn text GENERATED ALWAYS AS (upper(coalesce(gn, hn))) STORED` with both call parens tight and only the
+  inner comma spaced, in attnum order, and that `ATTACH PARTITION public.pgnc_1 FOR VALUES IN ('a')` survives).
+
+### Slice 293 — three-argument function-call generation expression `concat(ka, la, ma)` (end-to-end on the pg_dump oracle)
+
+Slice 291 pinned the two-argument call-paren branch of `joinGeneratedExprTokens` (one comma in the argument list). This
+slice extends that to a **repeated-comma** argument list, proving the helper emits `, ` between **every** adjacent
+argument pair while keeping the single call paren tight.
+
+`CREATE TABLE pg3c (ka text, la text, ma text, na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED) PARTITION BY LIST (ka)`
+with leaf `pg3c_1 PARTITION OF pg3c FOR VALUES IN ('a')`. The argument count is the only thing that varies from slice
+291, so the comma-spacing rule fires **twice** inside a single call, yielding `concat(ka, la, ma)` — not
+`concat(ka, la,ma)` (one separator) or `concat(ka ,la ,ma)` (stray pre-comma spaces). A regression that hard-coded a
+two-token argument list would corrupt the third argument's separator. Because this test dumps a **live goopg server**,
+the source pg_dump reads back is goopg's stored form, so the lowercase function name is preserved verbatim (no real-PG
+`pg_get_expr` case normalization in this path). The render path is otherwise identical to slices 281–292: `attgenerated`
+('s') forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces `shouldPrintColumn` for every column,
+so the leaf inherits all four columns in attnum order (`ka`, `la`, `ma`, then the inline generated `na`). No rows are
+inserted, so this rides the dump-time deparse path only. Production already handled the N-argument list (the comma rule
+is count-agnostic); this slice is the oracle round-trip proof. Verified vs PG 18.3. TEST-ONLY — no production change.
+
+Guards:
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pg3c_1` block prints `ka text`, `la text`,
+  `ma text`, then the inline `na text GENERATED ALWAYS AS (concat(ka, la, ma)) STORED` with the call paren tight and both
+  argument commas spaced, in attnum order, and that `ATTACH PARTITION public.pg3c_1 FOR VALUES IN ('a')` survives).
+
+### Slice 294 — **PRODUCTION fix:** string-literal argument in a function-call generation expression `concat(ka, '-', la)`
+
+Slices 291–293 pinned the call-paren / comma-spacing branches of `joinGeneratedExprTokens` for **identifier** arguments
+only. A **string-literal** argument exposed a latent production bug: the lexer stores a literal's **unquoted body**
+(`'-'` → `Token.Value` `"-"`), and `joinGeneratedExprTokens` space-joined token *values* raw — so
+`concat(ka, '-', la)` would have round-tripped as the **malformed** `concat(ka, -, la)` (quotes dropped, the literal
+indistinguishable from a minus operator). The fix:
+
+- **Re-quote `TokenStringLit`** tokens in a new `renderTok` closure: `'` + the body with embedded single quotes doubled
+  + `'`. This reproduces `pg_get_expr`'s rendering and re-parses to the same node (so `evalGeneratedExpr` is unaffected).
+- **Gate the punctuation spacing rules on `TokenSymbol`** so a literal whose body happens to be `)`/`,`/`(`/`.` can never
+  be mistaken for the matching punctuator. For the operator/call/grouping-paren expressions of slices 283–293 (which
+  contain no string literals) every punctuator is already a `TokenSymbol`, so this gating is a **no-op** there — byte-for-byte
+  identical output, zero regression.
+
+`CREATE TABLE pglc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED) PARTITION BY LIST (ka)`
+with leaf `pglc_1 PARTITION OF pglc FOR VALUES IN ('a')`. Because this test dumps a **live goopg server**, real pg_dump
+reads goopg's stored generation source verbatim, so the assertion pins goopg's own canonical rendering
+`concat(ka, '-', la)`. goopg does **not** add the `::text` cast that real PG's `pg_get_expr` injects for a bare literal;
+that divergence is out of scope (like the lowercase-function-name divergence of slices 290–293). Render path is otherwise
+identical to slices 281–293. No rows are inserted, so this rides the dump-time deparse path only. Verified vs PG 18.3.
+
+Guards:
+- `TestGeneratedColumnExprCanonicalSpacing` (parser unit, three new cases): `concat(fa, '-', fb)`, `fa || '-' || fb`
+  (literal **operand**, not in a call), and `concat(fa, '''', fb)` (embedded-quote literal, body `'`, re-quoted as `''''`).
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pglc_1` block prints `ka text`, `la text`,
+  then the inline `na text GENERATED ALWAYS AS (concat(ka, '-', la)) STORED`, that the pre-fix malformed
+  `concat(ka, -, la)` is **absent**, columns are in attnum order, and `ATTACH PARTITION public.pglc_1 FOR VALUES IN ('a')`
+  survives).
+
+### Slice 295 — comma-literal argument in a function-call generation expression `concat(ka, ',', la)` (end-to-end on the pg_dump oracle)
+
+The adversarial complement to slice 294. Slice 294's fix gated the punctuation spacing rules on `TokenSymbol` so a
+string literal whose body happens to be a punctuator can't be mistaken for one. This slice makes the literal body **be a
+comma** — `concat(ka, ',', la)` — directly colliding the literal `','` with the argument-separator comma. The pre-slice-294
+`Value`-based switch would have matched the literal token's `,` value against the `,` case (`noSpace`) **and** dropped its
+quotes, collapsing the three commas into the malformed `concat(ka,,,la)`. With the fix, the `TokenStringLit` literal is
+skipped by the symbol-only switch and re-quoted, so it renders distinctly as `concat(ka, ',', la)`. This is a TEST-ONLY
+slice — no production change; it pins slice 294's `TokenSymbol` gating on the **oracle** path (slice 294 already proved a
+string literal whose body is `-`; this proves the harder case where the body equals the separator itself).
+
+`CREATE TABLE pgkc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED) PARTITION BY LIST (ka)`
+with leaf `pgkc_1 PARTITION OF pgkc FOR VALUES IN ('a')`. Dumping a **live goopg server**, real pg_dump reads goopg's
+stored generation source verbatim, so the assertion pins goopg's own canonical rendering `concat(ka, ',', la)` (no
+`::text` cast — that pg_get_expr divergence is out of scope, like slices 290–294). Render path is otherwise identical to
+slices 281–294: attgenerated (`'s'`) forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces
+`shouldPrintColumn` for every column, so the leaf `pgkc_1` inherits both plain columns and prints `ka text`, `la text`,
+then the inline `na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED`. No rows are inserted, so this rides the
+dump-time deparse path only. Verified vs PG 18.3.
+
+Guards:
+- `TestGeneratedColumnExprCanonicalSpacing` (parser unit, one new case `comma_literal_arg`): `concat(fa, ',', fb)` →
+  `concat(fa, ',', fb)`.
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgkc_1` block prints `ka text`, `la text`,
+  then the inline `na text GENERATED ALWAYS AS (concat(ka, ',', la)) STORED`, that the pre-fix malformed
+  `concat(ka,,,la)` is **absent**, columns are in attnum order, and `ATTACH PARTITION public.pgkc_1 FOR VALUES IN ('a')`
+  survives).
+
+### Slice 296 — embedded-quote-literal argument in a function-call generation expression `concat(ka, '''', la)` (end-to-end on the pg_dump oracle)
+
+The adversarial complement to slices 294 (body `-`) and 295 (body `,`), and the **only** fixture that exercises slice 294's
+quote-**DOUBLING** on the oracle path. Slice 294's `renderTok` re-quotes a `TokenStringLit` by doubling embedded quotes —
+`"'" + strings.ReplaceAll(t.Value, "'", "''") + "'"`. This slice makes the literal body **be a single quote**:
+`concat(ka, '''', la)`. The lexer stores a literal's **unquoted, un-escaped** body, so the SQL four-quote literal `''''`
+(= a literal containing one `'`) is stored as the single byte `'`. The pre-slice-294 raw space-join emitted the malformed
+single-quote `concat(ka, ', la)` (the lone `'` opening a phantom string that swallows the rest of the expression); a fix
+that re-quoted but **forgot to double** the embedded quote would emit the unbalanced three-quote `concat(ka, ''', la)`.
+With the doubling, the literal renders as the balanced four-quote `''''`. TEST-ONLY — no production change; pins slice
+294's quote-doubling on the **oracle** path (the unit `embedded_quote_literal` case already exercised the helper directly).
+
+`CREATE TABLE pgqc (ka text, la text, na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED) PARTITION BY LIST (ka)`
+with leaf `pgqc_1 PARTITION OF pgqc FOR VALUES IN ('a')`. Dumping a **live goopg server**, real pg_dump reads goopg's
+stored generation source verbatim, so the assertion pins goopg's own canonical rendering `concat(ka, '''', la)` (no
+`::text` cast — that pg_get_expr divergence is out of scope, like slices 290–295). Render path is otherwise identical to
+slices 281–295: attgenerated (`'s'`) forces `attrdefs[].separate=false` (pg_dump.c:9507) and `ispartition` forces
+`shouldPrintColumn` for every column, so the leaf `pgqc_1` inherits both plain columns and prints `ka text`, `la text`,
+then the inline `na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED`. No rows are inserted, so this rides the
+dump-time deparse path only. Verified vs PG 18.3.
+
+Guards:
+- `TestGeneratedColumnExprCanonicalSpacing` (parser unit, existing case `embedded_quote_literal`): `concat(fa, '''', fb)` →
+  `concat(fa, '''', fb)`.
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `pgqc_1` block prints `ka text`, `la text`,
+  then the inline `na text GENERATED ALWAYS AS (concat(ka, '''', la)) STORED`, that the forgot-to-double malformed
+  `concat(ka, ''', la)` is **absent**, columns are in attnum order, and `ATTACH PARTITION public.pgqc_1 FOR VALUES IN ('a')`
+  survives).
+
+> **Next (slice 297+):** a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path, OR a
+> string-literal generation expression with an embedded backslash / E'' escape to exercise the literal re-quoting
+> against `standard_conforming_strings` edge cases.
+
+### Slice 297 — **PRODUCTION fix:** nested-arithmetic column DEFAULT full parenthesization `(1 + 2) * 3` → `((1 + 2) * 3)`
+
+A **correctness** fix, distinct from the generation-expression saga (281–296): generation expressions deparse
+token-by-token via `joinGeneratedExprTokens`, which preserves the user's literal parens; **column DEFAULTs** instead
+deparse from a parsed `Expr` AST via `catalog.formatExprForAttrdef` (the goopg-side `pg_get_expr` pass-through feeding
+`pg_attrdef.adbin`). That renderer emitted each `BinaryOp` **without parentheses** — `left op right`. For a nested
+expression like `DEFAULT (1 + 2) * 3` (AST `Mul(Add(1,2), 3)`) it produced `1 + 2 * 3`, which **re-parses** to
+`Mul(1, Mul(2,3))` and evaluates to **7, not 9** on restore: a silent precedence corruption of the dumped DDL.
+
+PG's `pg_get_expr` with `prettyFlags=0` (the mode `pg_dump` uses for `pg_attrdef.adbin`) **fully parenthesizes** every
+binary `OpExpr`/`BoolExpr` node — it does not minimize parens by precedence. Empirically verified vs real PG 18.3:
+a bare `1 + 1` default deparses to `(1 + 1)`, and `(1 + 2) * 3` to `((1 + 2) * 3)`. The fix wraps each `BinaryOp`
+`(left op right)`; the recursion naturally parenthesizes operands, yielding byte-identical output. A new helper
+`binaryOpSymbol(parser.OpCode) string` maps the operator to its SQL text so the wrap is uniform across all operators.
+
+**Scope / sibling-paths note.** The change is confined to `catalog.formatExprForAttrdef` — the **isolated**
+`pg_attrdef` column-default path. Its historical twin `executor.defaultExprToSQL` is overloaded for **index predicates**
+(`idx.PredicateString`), **expression-index columns**, **function-argument defaults**, and **partition keys**, each with
+its own round-trip fixtures (e.g. the slice-56 partial-index `WHERE qty > 0`). PG fully-parenthesizes those contexts too
+(`WHERE (qty > 0)`, `WHERE ((a + b) > 0)`), so the twin is *also* under-parenthesized — but wrapping it has a large blast
+radius and must update each affected fixture. That is deferred to a follow-up slice (see the deferral ledger); this slice
+deliberately fixes only the column-default path it has a fixture for.
+
+`public.defcol` gains a `calc integer DEFAULT (1 + 2) * 3` column. Dumping a **live goopg server**, real pg_dump
+transports goopg's `pg_get_expr` output, so the assertion pins goopg's own rendering `calc integer DEFAULT ((1 + 2) * 3)`
+and explicitly guards that the pre-fix corruption shape `DEFAULT 1 + 2 * 3` is **absent**. Verified vs PG 18.3.
+
+Guards:
+- `TestFormatExprForAttrdefExpr` (catalog unit): `binary add` → `(1 + 1)`, `binary concat` → `('a' || 'b')`,
+  `binary nested precedence` `Mul(Add(1,2),3)` → `((1 + 2) * 3)`, and the row-nested concat → `ROW(1, ('a' || 'b'))`.
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3 — asserts the `defcol` block prints
+  `calc integer DEFAULT ((1 + 2) * 3)` and that `DEFAULT 1 + 2 * 3` does not appear).
+
+> **Next (slice 298+):** apply the same full-parenthesization to `executor.defaultExprToSQL` and update the
+> index-predicate / expression-index / function-arg-default / partition-key fixtures (the deferred twin), OR a
+> multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
+
+### Slice 298 — **PRODUCTION fix:** index-predicate BinaryOp full parenthesization `WHERE qty > 0` → `WHERE (qty > 0)`
+
+The deferred twin from slice 297. `executor.defaultExprToSQL` is the goopg-side deparse renderer feeding the
+**non-pretty** `pg_get_expr` contexts: index predicates (`idx.PredicateString`, rendered as `... WHERE <pred>`),
+expression-index columns (`idx.ColExprStrings[i]`, wrapped `(<expr>)` by `BuildIndexDef`), partition-key expressions
+(`expr.go` partition deparse), and function-argument defaults (`proargdefaults`). Like the pre-297 `formatExprForAttrdef`,
+it emitted each `BinaryOp` **without parentheses** — so a partial index `WHERE (qty + id) * mgr_id > 0` deparsed to the
+precedence-corrupt `WHERE qty + id * mgr_id > 0`, which **re-parses** as `qty + (id * mgr_id) > 0` on restore: a silent
+change to *which rows the partial index covers*.
+
+**Empirically the blast radius was small, contrary to the slice-297 deferral note.** A sweep of the round-trip fixtures
+found the *only* binary-op expression flowing through `defaultExprToSQL` was the slice-56 partial-index `WHERE qty > 0`
+(the function-arg-default and expression-index fixtures use a bare integer / a function call, no binary op). Crucially,
+that fixture's assertion was a **substring `Contains` on goopg's own dump output**, not a true diff vs real pg_dump — so
+it *masked* the divergence: real pg_dump 18.3 emits `WHERE (qty > 0)` (it fully parenthesizes even a single top-level
+comparison), but the fixture asserted the bare `WHERE qty > 0`.
+
+The fix mirrors slice 297: a `binaryOpSymbolForDefault(parser.OpCode) string` helper (the executor-package twin of
+`catalog.binaryOpSymbol`; duplicated because catalog ⇄ executor cannot import each other) maps the operator to its SQL
+text, and the `BinaryOp` arm now returns `"(" + left + " " + sym + " " + right + ")"`. The recursion parenthesizes
+operands, yielding byte-identical output across all four contexts. Verified vs real PG 18.3:
+`WHERE (qty > 0)`, `WHERE (((qty + id) * mgr_id) > 0)`, expr-index `(((qty + 1)))`, func default `((1 + 2) * 3)`,
+`PARTITION BY RANGE ((((a + b) * c)))`.
+
+Guards:
+- `TestDefaultExprToSQLBinaryParen` (executor unit, twin of `TestFormatExprForAttrdefExpr`): `(qty > 0)`, `(1 + 1)`,
+  nested `(((qty + id) * mgr_id) > 0)`.
+- `TestPort_PgDumpConnectionSetup` (drives real pg_dump 18.3): the existing `foo_qty_partial_idx` assertion is corrected
+  to `WHERE (qty > 0)`; a new `foo_calc_partial_idx` index pins `WHERE (((qty + id) * mgr_id) > 0)`, plus an absence
+  guard that the precedence-corrupt `WHERE qty + id * mgr_id` does not appear.
+
+> **Next (slice 299+):** the still-unfixtured `defaultExprToSQL` contexts now also benefit from the parenthesization
+> (expression-index columns with binary ops, partition-key expressions, function-arg defaults with binary ops) — add an
+> oracle-verified fixture for one of them to lock it in; OR a multi-column / NULL-typed DEFAULT variant on the
+> partition-leaf ALTER path.
+
+### Slice 299 — nested-arithmetic **expression-index column** `((qty + id) * mgr_id)` → `((((qty + id) * mgr_id)))` (oracle-verified fixture)
+
+The oracle-verified complement to slice 298, in the **second** deparse context `executor.defaultExprToSQL` feeds: the
+index-key expression stored in `catalog.Index.ColExprStrings[i]` (vs slice 298's index *predicate* in `PredicateString`).
+Both populate from the same `defaultExprToSQL(e)` call at index-creation time, so slice 298's `BinaryOp`
+parenthesization already produces the correct bytes here — this slice **locks it in** with a byte-verified fixture
+rather than fixing new code.
+
+The paren-nesting arithmetic is worth recording because it is easy to mis-count (it cost a wrong first prediction this
+loop). For `CREATE INDEX foo_calc_expr_idx ON public.foo (((qty + id) * mgr_id))` the dumped key nests **four** parens:
+
+| layer | source | contributes |
+|-------|--------|-------------|
+| inner `(qty + id)` | `defaultExprToSQL` `BinaryOp` arm (the `+`) | `(qty + id)` |
+| `* mgr_id` wrap | `defaultExprToSQL` `BinaryOp` arm (the `*`) | `((qty + id) * mgr_id)` |
+| per-column `(%s)` | `BuildIndexDef` expression-column branch (`sb.WriteByte('(')` … `')'`) | `(((qty + id) * mgr_id))` |
+| column-list `(…)` | `BuildIndexDef` `USING btree (` … `)` | `((((qty + id) * mgr_id)))` |
+
+This mirrors real pg_dump 18.3 exactly: `pg_get_indexdef` (prettyFlags = `PRETTYFLAG_INDENT`, **no** `PRETTYFLAG_PAREN`)
+deparses the key via `deparse_expression_pretty` to `((qty + id) * mgr_id)` — identical to `pg_get_expr(indexprs)`, which
+this loop verified returns the same string — then wraps it `(%s)` (`ruleutils.c` `pg_get_indexdef_worker`,
+`looks_like_function` false) inside the `USING btree (…)` column-list parens. Verified byte-identical:
+`CREATE INDEX foo_calc_expr_idx ON public.foo USING btree ((((qty + id) * mgr_id)));`.
+
+Guards (`TestPort_PgDumpConnectionSetup`, drives real pg_dump 18.3): the `foo_calc_expr_idx` fixture pins the four-paren
+form, plus an absence guard that the precedence-corrupt under-parenthesized column `(qty + id * mgr_id)` (which would
+re-parse as `qty + (id * mgr_id)`, silently changing the indexed value) does **not** appear.
+
+### Slice 300 — nested-arithmetic **partition-key expression** `((a + b) * c)` → `RANGE ((((a + b) * c)))` (PRODUCTION fix)
+
+The **third** deparse context `executor.defaultExprToSQL` feeds (after slice 298's index *predicate* and slice 299's
+index *column*): the partition-key expression, reached via `pg_get_partkeydef(oid)` (`internal/executor/expr.go`). Unlike
+slices 298/299 — where slice 298's `BinaryOp` parenthesization already produced correct bytes and the fixtures only
+locked it in — this context had a **real divergence** that needed a production fix.
+
+Real PG's `pg_get_partkeydef_worker` (`ruleutils.c`) wraps each **expression** key in `(%s)` *unless* it
+`looks_like_function` — a bare function call (and the `func_expr_common_subexpr` family: `COALESCE`/`NULLIF`/`GREATEST`/
+`LEAST`, SQL value functions, XML/JSON) deparses **without** the extra parens, while operators, casts, `CASE`, … are
+wrapped. goopg's `pg_get_partkeydef` emitted `defaultExprToSQL(keyExpr)` with **no** wrap, so a binary-op key was one
+paren short:
+
+| key | goopg (before) | real pg_dump 18.3 |
+|-----|----------------|-------------------|
+| `((a + b) * c)` | `RANGE (((a + b) * c))` ❌ | `RANGE ((((a + b) * c)))` |
+| `abs(a)` | `RANGE (abs(a))` ✅ | `RANGE (abs(a))` |
+
+Both forms re-parse to the same expression (the extra paren is cosmetic), so this is a **byte-fidelity** fix rather than
+a correctness one — but byte-identical round-trip vs real pg_dump is the milestone's bar. The four-paren nesting for
+`((a + b) * c)`:
+
+| layer | source | contributes |
+|-------|--------|-------------|
+| inner `(a + b)` | `defaultExprToSQL` `BinaryOp` arm (the `+`) | `(a + b)` |
+| `* c` wrap | `defaultExprToSQL` `BinaryOp` arm (the `*`) | `((a + b) * c)` |
+| per-key `(%s)` | `pg_get_partkeydef` wrap (NEW; `looks_like_function` false) | `(((a + b) * c))` |
+| `RANGE (…)` | `pg_get_partkeydef` strategy-list parens | `((((a + b) * c)))` |
+
+**The fix** (`internal/executor/expr.go`, `pg_get_partkeydef` case): after `part = defaultExprToSQL(keyExpr)`, wrap
+`part = "(" + part + ")"` unless `keyExpr` is a `*parser.FuncCall`. goopg represents every callable form — including
+`COALESCE`/`GREATEST`/`NULLIF` (generic `FuncCall`, no special parser node) and the niladic value functions
+(`FuncCall` with 0 args, rendered as a bare uppercase keyword) — as `*parser.FuncCall`, so that single type check mirrors
+PG's node-tag switch. The opclass/collation suffixes are appended *after* the wrap, matching PG's append order. Verified
+byte-identical against a live PG 18.3 instance: `PARTITION BY RANGE ((((a + b) * c)))` and `PARTITION BY RANGE (abs(a))`.
+
+Guard (`TestPort_PgDumpConnectionSetup`, drives real pg_dump 18.3): the `pexpr` fixture pins the four-paren form, plus a
+negative guard that the inner-precedence-corrupt `RANGE ((a + b * c))` (the `+` un-parenthesized) does **not** appear.
+
+### Slice 301 — nested-arithmetic **function-argument default** `(1 + 2) * 3` → `DEFAULT ((1 + 2) * 3)` (fixture-only)
+
+The **fourth and last** deparse context `executor.defaultExprToSQL` feeds, after slice 298's index *predicate*, slice
+299's index *column*, and slice 300's partition *key*: the parameter DEFAULT expression of a `CREATE FUNCTION`, reached
+via `pg_get_function_arguments(oid)`. Unlike slice 300 (a real one-paren-short divergence), this context is
+**fixture-only** — the parenthesization was already correct end-to-end:
+
+PG's `print_function_arguments` (`ruleutils.c:3428`) appends the default with `deparse_expression(expr, NIL, false,
+false)`. Critically — and **unlike** `pg_get_partkeydef` (slice 300) — it adds **no** extra `(%s)` wrap; the full
+parenthesization comes entirely from `deparse_expression`'s non-pretty mode, where `get_oper_expr` wraps every `OpExpr`
+in parens. goopg mirrors this exactly: at `CREATE FUNCTION` time the parser's `a.Default` is rendered by
+`defaultExprToSQL` (`operators_ddl.go:7138`) and stored verbatim in `catalog.Routine.ArgDefaults`; `buildFunctionArguments`
+emits it after ` DEFAULT `. Slice 298's `BinaryOp` arm already produces the canonical `((1 + 2) * 3)`, so no production
+change was needed.
+
+| layer | produced by | cumulative |
+|---|---|---|
+| inner `(1 + 2)` | `defaultExprToSQL` `BinaryOp` arm (the `+`) | `(1 + 2)` |
+| `* 3` wrap | `defaultExprToSQL` `BinaryOp` arm (the `*`) | `((1 + 2) * 3)` |
+| ` DEFAULT %s` | `buildFunctionArguments` (no extra wrap; matches `print_function_arguments`) | `DEFAULT ((1 + 2) * 3)` |
+
+Verified byte-identical against a live PG 18.3 instance:
+`CREATE FUNCTION public.add_calcdef(a integer DEFAULT ((1 + 2) * 3)) RETURNS integer`. Guard
+(`TestPort_PgDumpConnectionSetup`, drives real pg_dump 18.3): the `add_calcdef` fixture pins the fully-parenthesized form,
+plus a negative guard that the one-paren-short `DEFAULT (1 + 2) * 3` (re-parses with wrong precedence: 1+2*3=7 not
+(1+2)*3=9) does **not** appear. This closes all four `defaultExprToSQL` deparse contexts.
+
+> **Next (slice 302+):** all four `defaultExprToSQL` binary-op contexts are now byte-verified. Candidate next surfaces:
+> a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path, or the keyword-vs-literal `MINVALUE`
+> partition-bound ambiguity noted in slice 169's deferral.
+
+### Slice 302 — **unary-minus DEFAULT** `-(1 + 2)` → `DEFAULT (- (1 + 2))` (PRODUCTION fix — both twins)
+
+A latent **opcode bug** in *both* default-deparse twins. The parser tags a unary minus `-x` with `OpUnaryNeg`
+(`select.go:2420`), but `catalog.formatExprForAttrdef` and `executor.defaultExprToSQL` both had only a
+`case parser.OpSub` arm — and `OpSub` is **binary** subtraction `a - b`, never emitted for a unary minus. So a real
+`DEFAULT -…` matched no arm and fell through to `fmt.Sprintf("%v", e)`, dumping a Go pointer string like
+`&{0 - 0xc0001a2f00}` and corrupting every unary-minus default pg_dump re-emits. (The pre-existing unit test
+`TestFormatExprForAttrdefExpr` masked this by manually constructing `UnaryOp{Op: OpSub}` — a node the parser never
+produces — so the test was green while the live path was broken: a sibling-path divergence.)
+
+Both twins now key on `parser.OpUnaryNeg`, mirroring PG's `get_rule_expr`:
+
+- **Bare numeric operand** (`DEFAULT -5`): PG's parser folds `- ICONST` into a negative typed `Const` at parse time
+  (`gram.y` `doNegate`), which `pg_get_expr` deparses as `'-5'::integer`. goopg is **type-blind** in this renderer, so it
+  emits the re-parseable `-5` (semantically identical; byte-differs from PG's `'-N'::type`). Matching the exact cast form
+  needs the column/argument type — **deferred** to a future slice.
+- **Compound operand** (`DEFAULT -(1 + 2)`, an `OpExpr` PG does **not** fold): `get_rule_expr` deparses `(- (operand))`.
+  goopg now emits `"(- " + operand + ")"`; the recursion parenthesizes the operand, byte-identical to real pg_dump 18.3.
+
+| input default | goopg (pre-302) | goopg (post-302) | real pg_dump 18.3 |
+|---|---|---|---|
+| `-5` | `&{0 - 0x…}` (garbage) | `-5` | `'-5'::integer` (deferred) |
+| `-(1 + 2)` | `&{0 - 0x…}` (garbage) | `(- (1 + 2))` | `(- (1 + 2))` ✓ |
+| `-(1 + 2) * 3` | `(&{…} * 3)` (garbage) | `((- (1 + 2)) * 3)` | `((- (1 + 2)) * 3)` ✓ |
+
+Guards: unit twins `TestFormatExprForAttrdefExpr` / `TestDefaultExprToSQLBinaryParen` (corrected to `OpUnaryNeg`; new
+"unary minus literal" + "unary minus compound" cases). End-to-end `TestPort_PgDumpConnectionSetup` (real pg_dump 18.3):
+table `public.negdef` pins `nb integer DEFAULT (- (1 + 2))` and `nc integer DEFAULT ((- (1 + 2)) * 3)`, function
+`public.fneg(x integer DEFAULT (- (1 + 2)))` pins the executor twin via `pg_get_function_arguments`, plus a negative
+guard that the pre-fix `DEFAULT &{` Go-pointer corruption does **not** appear.
+
+> **Next (slice 303+):** the bare-literal `'-N'::type` typed-Const form (needs column/argument type threaded into the
+> renderer); `OpUnaryPos` (`+x`) / `OpBitNot` (`~x`) unary-default arms (still fall through to `fmt.Sprintf` garbage); or
+> a multi-column / NULL-typed DEFAULT variant on the partition-leaf ALTER path.
 
 ## Deferred (002–010) — catalog surface estimate
 

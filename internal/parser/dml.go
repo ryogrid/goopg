@@ -22,7 +22,14 @@ func (p *parser) parseInsert() (Stmt, error) {
 		return nil, err
 	}
 	stmt := &InsertStmt{pos: t.Pos, Target: target}
-	if p.acceptSymbol("(") {
+	// A leading '(' is an INSERT column list ONLY when it is not the start of
+	// a parenthesised query source. PostgreSQL's insert_rest permits a fully
+	// parenthesised SelectStmt as the source (select_with_parens), so
+	// `INSERT INTO t (SELECT …)`, `(VALUES …)`, `(WITH …)`, `(TABLE …)`, and
+	// nested forms like `((SELECT …))` have no column list. Distinguish by
+	// peeking past the '(' run for a query-starting keyword.
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "(" && !p.nextIsParenQuerySource() {
+		p.advance() // consume '('
 		cols, err := p.parseColumnNameList()
 		if err != nil {
 			return nil, err
@@ -32,8 +39,25 @@ func (p *parser) parseInsert() (Stmt, error) {
 			return nil, p.errAtCur("expected ')'")
 		}
 	}
-	// INSERT … SELECT | INSERT … VALUES | INSERT … DEFAULT VALUES
-	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect {
+	// INSERT … (SELECT …) | INSERT … SELECT | INSERT … VALUES | INSERT … DEFAULT VALUES.
+	switch {
+	case p.nextIsParenQuerySource():
+		// A fully parenthesised query source, e.g. `INSERT INTO t (SELECT …)`.
+		// SELECT … INTO is not permitted inside INSERT's source (M0097-0020).
+		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
+		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
+		p.selectIntoNoPos = false
+		sel, err := p.parseParenthesisedSelectStmt()
+		p.selectIntoErrMsg, p.selectIntoNoPos = old, oldNoPos
+		if err != nil {
+			return nil, err
+		}
+		ss, ok := sel.(*SelectStmt)
+		if !ok {
+			return nil, p.errAtCur("expected SELECT statement")
+		}
+		stmt.Select = ss
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwSelect:
 		// SELECT … INTO is not permitted inside INSERT's SELECT (M0097-0020).
 		old, oldNoPos := p.selectIntoErrMsg, p.selectIntoNoPos
 		p.selectIntoErrMsg = "SELECT ... INTO is not allowed here"
@@ -48,7 +72,7 @@ func (p *parser) parseInsert() (Stmt, error) {
 		} else {
 			return nil, p.errAtCur("expected SELECT statement")
 		}
-	} else if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault {
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwDefault:
 		// M0103-0007 rung 17: `INSERT INTO t DEFAULT VALUES` — the
 		// all-defaults form. The keyword pair is parsed here; the
 		// planner's rewriteInsertDefaultMarkers expands it into a
@@ -61,7 +85,7 @@ func (p *parser) parseInsert() (Stmt, error) {
 			return nil, err
 		}
 		stmt.DefaultValues = true
-	} else {
+	default:
 		if _, err := p.expectKeyword(KwValues); err != nil {
 			return nil, err
 		}
@@ -86,6 +110,33 @@ func (p *parser) parseInsert() (Stmt, error) {
 		stmt.Returning = ret
 	}
 	return stmt, nil
+}
+
+// isQueryStartKeyword reports whether tok begins a (sub)query: SELECT,
+// VALUES, WITH, or TABLE. These are reserved keywords in PostgreSQL, so they
+// can never appear as a bare INSERT column name — which is what lets us use
+// them to tell a parenthesised query source apart from a column list.
+func isQueryStartKeyword(tok Token) bool {
+	return tok.Kind == TokenKeyword &&
+		(tok.Keyword == KwSelect || tok.Keyword == KwValues ||
+			tok.Keyword == KwWith || tok.Keyword == KwTable)
+}
+
+// nextIsParenQuerySource reports whether the tokens at the current position
+// form a parenthesised query source — a run of '(' followed by a
+// query-starting keyword (e.g. `(SELECT …)`, `((VALUES …))`) — rather than an
+// INSERT column list `(col, …)`. The parser position is not advanced.
+func (p *parser) nextIsParenQuerySource() bool {
+	if !(p.cur().Kind == TokenSymbol && p.cur().Value == "(") {
+		return false
+	}
+	for off := 1; ; off++ {
+		tok := p.peek(off)
+		if tok.Kind == TokenSymbol && tok.Value == "(" {
+			continue
+		}
+		return isQueryStartKeyword(tok)
+	}
 }
 
 // parseOnConflict parses the upstream `ON CONFLICT …` tail. The
@@ -245,7 +296,7 @@ func (p *parser) parseConflictTargetColumnList() ([]string, []Expr, error) {
 		// reserved keyword like DO, WHERE, ',', ')')
 		if p.cur().Kind == TokenIdent {
 			next := p.peek(1)
-			if next.Kind != TokenSymbol || (next.Value != "(" ) {
+			if next.Kind != TokenSymbol || (next.Value != "(") {
 				// looks like an opclass name — skip it
 				p.advance()
 			}

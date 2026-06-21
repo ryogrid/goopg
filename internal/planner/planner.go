@@ -165,7 +165,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		return &DDL{pos: stmt.Pos(), Stmt: stmt}, nil
 
 	case *parser.BeginStmt:
-		return &Transaction{pos: s.Pos(), Verb: TxBegin, IsolationLevel: s.IsolationLevel, ReadOnly: s.ReadOnly}, nil
+		return &Transaction{pos: s.Pos(), Verb: TxBegin, IsolationLevel: s.IsolationLevel, ReadOnly: s.ReadOnly, Deferrable: s.Deferrable}, nil
 	case *parser.CommitStmt:
 		return &Transaction{pos: s.Pos(), Verb: TxCommit}, nil
 	case *parser.RollbackStmt:
@@ -1327,7 +1327,21 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 		if lerr != nil {
 			return nil, lerr
 		}
-		out = &LockRows{pos: s.Locking[0].Pos(), Child: out, Locks: locks}
+		// SKIP LOCKED with a LIMIT must lock rows in the LIMIT's order and stop
+		// after the LIMIT count of *successfully-locked* rows (PG plans
+		// `Limit → LockRows → Sort`). goopg's default plan above produced
+		// `Project(Limit(Sort(...)))`, putting the Limit below the LockRows —
+		// which would cut the scan to N rows before locking, turning a skipped
+		// (contended) row into a missing result. When any lock clause uses
+		// SKIP LOCKED and the top Project directly wraps a (non-WITH-TIES)
+		// Limit, lift that Limit ABOVE the LockRows and hand its LIMIT/OFFSET
+		// expressions to the LockRows so the executor caps the drain at
+		// LIMIT+OFFSET locked rows. M0118-0003.
+		if lifted := liftLimitAboveLockRows(out, locks, s.Locking[0].Pos()); lifted != nil {
+			out = lifted
+		} else {
+			out = &LockRows{pos: s.Locking[0].Pos(), Child: out, Locks: locks}
+		}
 	}
 	// Collapse all-constant sub-expressions in the final plan tree.
 	// A non-nil return means a constant evaluation error (e.g. division by zero)
@@ -1473,6 +1487,57 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 // preprocess_rowmarks. The analyzer (M0021-0001 step 2) has
 // already verified the OF target names resolve, so this
 // helper's lookup paths are second-line defence.
+// locksHaveSkipLocked reports whether any resolved locking clause uses the
+// SKIP LOCKED wait policy. SKIP LOCKED is the only policy whose contention
+// handling (silently dropping a contended row) changes the row count, so it is
+// the sole trigger for lifting the LIMIT above the LockRows. M0118-0003.
+func locksHaveSkipLocked(locks []LockedRel) bool {
+	for i := range locks {
+		if locks[i].WaitPolicy == LockWaitSkipLocked {
+			return true
+		}
+	}
+	return false
+}
+
+// liftLimitAboveLockRows restructures `Project(Limit(child))` into
+// `Limit(LockRows(Project(child)))` when the locking clause uses SKIP LOCKED,
+// so the row lock claims rows in the LIMIT's order and stops after LIMIT
+// (+OFFSET) successfully-locked rows (PG plans `Limit → LockRows → Sort`). The
+// LIMIT/OFFSET expressions are duplicated onto the LockRows (LimitCount /
+// OffsetCount) so the executor can cap its drain. Returns the new top node, or
+// nil when no lift applies (caller falls back to the default LockRows wrap):
+//   - no SKIP LOCKED clause,
+//   - the top node is not a Project directly wrapping a Limit, or
+//   - the Limit uses WITH TIES (its emission count is data-dependent and can
+//     exceed LIMIT, which the fixed drain cap cannot model).
+func liftLimitAboveLockRows(out Node, locks []LockedRel, pos int) Node {
+	if !locksHaveSkipLocked(locks) {
+		return nil
+	}
+	proj, ok := out.(*Project)
+	if !ok {
+		return nil
+	}
+	lim, ok := proj.Child.(*Limit)
+	if !ok || lim.WithTies {
+		return nil
+	}
+	// Detach the Limit: the Project now wraps the Limit's child (Sort/Scan)
+	// directly, the LockRows wraps the Project, and the Limit re-wraps the
+	// LockRows at the top.
+	proj.Child = lim.Child
+	lock := &LockRows{
+		pos:         pos,
+		Child:       out,
+		Locks:       locks,
+		LimitCount:  lim.Limit,
+		OffsetCount: lim.Offset,
+	}
+	lim.Child = lock
+	return lim
+}
+
 func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, error) {
 	if ctx == nil {
 		return nil, &PlanError{Pos: s.Pos(), Code: "0A000", Message: "FOR UPDATE/SHARE requires a FROM clause"}

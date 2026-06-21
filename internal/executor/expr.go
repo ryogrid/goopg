@@ -2189,8 +2189,26 @@ func evalTypedStringLit(x *planner.TypedStringLit) (Datum, error) {
 	case "timestamp", "timestamptz":
 		// Try a few common upstream layouts in order. The
 		// `2006-01-02 15:04:05` form is what TPC-H and pgbench
-		// use; `2006-01-02T15:04:05Z` is RFC3339 fallback.
-		layouts := []string{"2006-01-02 15:04:05.999999", "2006-01-02 15:04:05", "2006-01-02"}
+		// use. PostgreSQL's timestamp(tz) input also accepts a
+		// seconds-less `HH:MM` time and an optional numeric
+		// timezone offset (e.g. `2010-04-01 10:00` and
+		// `2010-04-01 10:00:00-04`); the tz-suffixed and
+		// seconds-less variants below cover those. The tz-bearing
+		// layouts are tried first so an explicit offset is honoured
+		// before the zone-less fallbacks treat the wall clock as UTC.
+		// Without these the isolation classroom-scheduling /
+		// receipt-report specs (which book rooms on the half-hour with
+		// `TIMESTAMP WITH TIME ZONE '2010-04-01 10:00'`) fail their
+		// setup INSERT with `invalid timestamp` (22007).
+		layouts := []string{
+			"2006-01-02 15:04:05.999999-07",
+			"2006-01-02 15:04:05-07",
+			"2006-01-02 15:04-07",
+			"2006-01-02 15:04:05.999999",
+			"2006-01-02 15:04:05",
+			"2006-01-02 15:04",
+			"2006-01-02",
+		}
 		for _, layout := range layouts {
 			if t, err := time.Parse(layout, x.Value); err == nil {
 				x.CachedTime = t.UTC()
@@ -6837,6 +6855,23 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			if keyExpr != nil {
 				part = defaultExprToSQL(keyExpr)
+				// pg_get_partkeydef_worker (ruleutils.c) wraps each EXPRESSION key
+				// in `(%s)` unless it "looks like a function call"
+				// (looks_like_function): a bare function call — and the
+				// func_expr_common_subexpr family (COALESCE/NULLIF/GREATEST/LEAST,
+				// SQL value functions, XML/JSON) — deparses without the extra parens,
+				// while everything else (operators, casts, CASE, …) is wrapped. goopg
+				// represents every one of those callable forms as *parser.FuncCall
+				// (including the niladic value functions, which defaultExprToSQL emits
+				// as bare uppercase keywords), so that single type check mirrors PG's
+				// node-tag switch. Without this wrap a binary-op key
+				// `((a + b) * c)` dumped as `RANGE (((a + b) * c))` — one paren short
+				// of real pg_dump 18.3's `RANGE ((((a + b) * c)))` (verified
+				// byte-identical). The opclass/collation suffixes below are appended
+				// AFTER the wrap, matching PG's append order (DU-002 slice 300).
+				if _, isFunc := keyExpr.(*parser.FuncCall); !isFunc {
+					part = "(" + part + ")"
+				}
 			} else {
 				part = colName
 			}

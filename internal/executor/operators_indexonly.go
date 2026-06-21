@@ -51,6 +51,18 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		return err
 	}
 
+	// M0118-0001: a SERIALIZABLE index-only scan takes a relation-level SIREAD
+	// predicate lock on the heap relation, exactly like the seq-scan and
+	// (heap-fetching) index-scan paths. Acquired BEFORE the probe-bound lookups
+	// below so it is held even when the scan matches no key — that empty-result
+	// case is precisely the phantom the lock must cover (read-write-unique-2/-3
+	// probe a non-existent key first, then both INSERT it). Gated to
+	// SERIALIZABLE inside ssiRecordRelationRead; temp / matview relations are
+	// excluded as PredicateLockingNeededForRelation requires.
+	if o.plan.Table == nil || (!o.plan.Table.Temp && !o.plan.Table.IsMatView) {
+		ssiRecordRelationRead(ctx, heapRel)
+	}
+
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
 	tree, err := btree.Open(ctx.Pool, idxRel)
 	if err != nil {
@@ -120,11 +132,42 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 			return false, err
 		}
 		slot.RLock()
-		tuple, _, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID)
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID)
+		// M0118-0001: SSI phantom conflict-out for an index-only-scanned tuple
+		// present at this TID but invisible because a concurrent transaction
+		// inserted it — the IOS analog of the seq-scan invisible-tuple path. The
+		// VM bit is cleared by a concurrent in-flight insert, so this fallback
+		// (non-ALL_VISIBLE) branch is exactly where that phantom surfaces.
+		var invisXmin storage.TransactionID
+		if !found && ssiActive(ctx) {
+			if raw, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset); terr == nil {
+				invisXmin = raw.Header.Xmin
+			}
+		}
 		slot.RUnlock()
 		ctx.Pool.Unpin(slot)
 		if !found {
+			if invisXmin != storage.InvalidTransactionID {
+				if serr := ssiRecordInvisibleTupleRead(ctx, heapRel, invisXmin); serr != nil {
+					return false, serr
+				}
+			}
 			return true, nil
+		}
+		// M0118-0001: SSI read-path per-tuple conflict-out on the HOT-resolved
+		// live version. The ALL_VISIBLE fast path needs no heap tuple, but this
+		// non-ALL_VISIBLE fallback already fetched it, so record the rw-edge
+		// against the tuple's xmin (a concurrent inserter) AND xmax (a concurrent
+		// deleter/updater) — the latter is the referential-integrity write-skew
+		// edge where this reader sees a row an in-flight SERIALIZABLE peer has
+		// DELETEd. Mirrors the heap-fetching index-scan path
+		// (operators_index.go); the helper short-circuits for RC/RR and the
+		// tuple-grain predicate lock it would take is pruned by the relation-grain
+		// SIREAD already held (ssiRecordRelationRead above). The page RLock/pin is
+		// released above, so a non-nil error (reader closed a dangerous structure
+		// to an already-committed writer) propagates as a mid-statement 40001.
+		if serr := ssiRecordTupleRead(ctx, heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); serr != nil {
+			return false, serr
 		}
 		row, err := o.decodeRowFromHeap(tuple)
 		if err != nil {
@@ -219,13 +262,22 @@ func decodeIndexKeyColumn(key []byte, col catalog.Column) (Datum, int, error) {
 		}
 		v, err := btree.DecodeFloat8(key[:8])
 		return NewStringDatum(strconv.FormatFloat(v, 'g', -1, 64)), 8, err
-	case isTimestampType(typeName):
+	case isTimestampType(typeName) || isTimestamptzType(typeName):
+		// timestamp and timestamptz share the int64-micros key form. M0118-0001.
 		if len(key) < 8 {
 			return NullDatum, 0, fmt.Errorf("btree: timestamp key truncated, got %d bytes", len(key))
 		}
 		v, err := btree.DecodeTimestamp(key[:8])
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
 		return NewTimeDatum(ts), 8, err
+	case isDateType(typeName):
+		// date is encoded as int4 days since the PG epoch. M0118-0001.
+		if len(key) < 4 {
+			return NullDatum, 0, fmt.Errorf("btree: date key truncated, got %d bytes", len(key))
+		}
+		v, err := btree.DecodeInt4(key[:4])
+		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
+		return NewTimeDatum(ts), 4, err
 	case isVarcharType(typeName), isCharType(typeName), isTextType(typeName), isNameType(typeName),
 		strings.ToLower(typeName) == "uuid":
 		raw, n, err := btree.DecodeVarcharLen(key)
@@ -313,12 +365,22 @@ func decodeBTreeKeyToDatum(key []byte, col catalog.Column) (Datum, error) {
 		}
 		return NewStringDatum(string(b)), nil
 
-	case isTimestampType(typeName):
+	case isTimestampType(typeName) || isTimestamptzType(typeName):
+		// timestamp and timestamptz share the int64-micros key form. M0118-0001.
 		v, err := btree.DecodeTimestamp(key)
 		if err != nil {
 			return NullDatum, err
 		}
 		ts := pgEpoch.Add(time.Duration(v) * time.Microsecond)
+		return NewTimeDatum(ts), nil
+
+	case isDateType(typeName):
+		// date is encoded as int4 days since the PG epoch. M0118-0001.
+		v, err := btree.DecodeInt4(key)
+		if err != nil {
+			return NullDatum, err
+		}
+		ts := pgEpoch.Add(time.Duration(v) * 24 * time.Hour)
 		return NewTimeDatum(ts), nil
 
 	default:

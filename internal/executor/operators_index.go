@@ -209,6 +209,14 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 		}
 		return err
 	}
+	// M0118-0001: the SERIALIZABLE index-scan SIREAD predicate lock is no
+	// longer acquired eagerly here. Its granularity now depends on what the
+	// probe matches and is decided at the end of Rescan once the matching TID
+	// set is known (ssiRecordIndexScanGapLock): a matched equality probe relies
+	// on the exact per-tuple SIREAD locks recorded in Next, while an empty
+	// equality probe (the read-write-unique phantom gap) or a range scan falls
+	// back to the relation-grain SIREAD. See ssiRecordIndexScanGapLock for the
+	// multiple-row-versions rationale.
 	idxRel := ctx.Catalog.IndexRelFileNode(o.plan.Index)
 	tree, err := btree.Open(ctx.Pool, idxRel)
 	if err != nil {
@@ -245,6 +253,18 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: "indexScanOp.Rescan called before Open"}
 	}
 
+	// M0118-0001: only a FULL-KEY point lookup on a single-column index can
+	// rely on the exact per-tuple SIREAD locks recorded in Next when it
+	// matches. A leading-column probe on a composite index (e.g.
+	// read-write-unique-4's `WHERE year = 2016` on PK (year, invoice_number))
+	// is a RANGE over the unspecified trailing columns: it matches existing
+	// rows yet still has a gap a concurrent (2016, N) INSERT could fall into,
+	// so it must keep the relation-grain gap lock. Range scans likewise. The
+	// decision is finalised by ssiRecordIndexScanGapLock once o.tids is known
+	// (after RangeScan, or on the unbound/NULL-key early returns).
+	isFullKeyProbe := len(o.plan.Index.Columns) == 1 &&
+		(o.plan.Key != nil || len(o.plan.Keys) > 0)
+
 	var loBytes, hiBytes []byte
 	if len(o.plan.Keys) > 0 {
 		// Multi-column equality probe (M0054-0006-followup-Q9-
@@ -258,6 +278,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 			return err
 		}
 		if !ok {
+			o.ssiRecordIndexScanGapLock(isFullKeyProbe)
 			return nil
 		}
 		loBytes = key
@@ -269,6 +290,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 			return err
 		}
 		if !ok {
+			o.ssiRecordIndexScanGapLock(isFullKeyProbe)
 			return nil
 		}
 		loBytes = key
@@ -289,6 +311,7 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 			return err
 		}
 		if !ok {
+			o.ssiRecordIndexScanGapLock(isFullKeyProbe)
 			return nil
 		}
 		loBytes = lo
@@ -309,7 +332,38 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if err := o.tree.RangeScan(loBytes, hiBytes, scanFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
+	o.ssiRecordIndexScanGapLock(isFullKeyProbe)
 	return nil
+}
+
+// ssiRecordIndexScanGapLock finalises the SERIALIZABLE index-scan SIREAD
+// predicate lock after Rescan has determined the matching TID set.
+//
+// A matched full-key probe (isFullKeyProbe && len(tids) > 0) relies on the
+// exact per-tuple SIREAD locks recorded in Next: each locks the precise
+// (block, slot) version the reader actually observed. A coarser relation-grain
+// lock would over-approximate — it covers EVERY version of the matched key, so
+// a later SERIALIZABLE writer that overwrites a DIFFERENT version (one the
+// reader never read) would spuriously find this reader in its conflict-in walk
+// and install a false rw-edge. That false edge is exactly what made the
+// multiple-row-versions spec over-abort (the intermediate s2 write produces a
+// version s3 overwrites, which s1 never read, so s1→s3 must NOT form).
+//
+// isFullKeyProbe is true only for a point lookup that binds every index column
+// of a single-column index. A leading-column probe on a composite index, an
+// empty probe (the read-write-unique phantom gap, where no tuple was read so no
+// per-tuple lock exists), and a range scan all retain the relation-grain SIREAD
+// — the walk-reachable analog of upstream's btree PredicateLockPage — because
+// each leaves a gap a phantom INSERT could fall into. ssiRecordRelationRead
+// gates to SERIALIZABLE and excludes system relations; temp / matview relations
+// are filtered here.
+func (o *indexScanOp) ssiRecordIndexScanGapLock(isFullKeyProbe bool) {
+	if isFullKeyProbe && len(o.tids) > 0 {
+		return
+	}
+	if o.plan.Table == nil || (!o.plan.Table.Temp && !o.plan.Table.IsMatView) {
+		ssiRecordRelationRead(o.ctx, o.heapRel)
+	}
 }
 
 func (o *indexScanOp) Next() (TupleSlot, error) {
@@ -338,10 +392,31 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		slot.RLock()
 		tuple, actualSlot, found := followHOTChainNoCopy(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
 		if !found {
+			// M0118-0001: SSI phantom conflict-out for an index-scanned tuple
+			// that is physically present at this TID but invisible to us because
+			// a concurrent transaction inserted it. Register the reader→inserter
+			// rw-edge — the index-scan analog of the seq-scan invisible-tuple
+			// path (operators_storage.go) — so an INSERT-before-READ ordering
+			// still closes the dangerous structure (read-write-unique-3: each
+			// session probes the key, finds the peer's in-flight insert
+			// invisible, then inserts the duplicate itself). ssiActive gates the
+			// extra page read to SERIALIZABLE; the Manager filters the aborted /
+			// committed-before-snapshot (wr-dependency) cases.
+			var invisXmin storage.TransactionID
+			if ssiActive(o.ctx) {
+				if raw, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset); terr == nil {
+					invisXmin = raw.Header.Xmin
+				}
+			}
 			slot.RUnlock()
 			o.ctx.Pool.Unpin(slot)
 			// Tuple invisible (deleted / not yet committed at snap);
-			// skip this TID and try the next.
+			// register the SSI conflict-out then skip this TID.
+			if invisXmin != storage.InvalidTransactionID {
+				if serr := ssiRecordInvisibleTupleRead(o.ctx, o.heapRel, invisXmin); serr != nil {
+					return nil, serr
+				}
+			}
 			continue
 		}
 		if o.scanRow == nil || len(o.scanRow) != len(o.plan.Table.Columns) {
@@ -387,7 +462,13 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// Helper short-circuits for RC/RR; for SERIALIZABLE this installs a
 		// tuple-grain predicate lock and an rw-conflict edge to the writer
 		// identified by the visible tuple's xmin.
-		ssiRecordTupleRead(o.ctx, o.heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax)
+		// M0118-0001: a non-nil error means the reader closed a dangerous
+		// structure to an already-committed writer and must abort the scan
+		// mid-statement (40001). The heap page RLock/pin was already released
+		// above (after the decode), so just propagate the error.
+		if err := ssiRecordTupleRead(o.ctx, o.heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
+			return nil, err
+		}
 		// M0092-0007: stack-aliased slot — reuse o.slot across
 		// every Next() call. Caller must consume / Materialize
 		// before the next Next() invocation.

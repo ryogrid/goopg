@@ -89,6 +89,13 @@ const (
 	HeapXminInvalid   uint16 = 0x0200 // xmin is invalid / rolled-back (cached hint)
 	HeapXmaxInvalid   uint16 = 0x0800
 	HeapXmaxCommitted uint16 = 0x0400
+	// HeapXmaxIsMulti indicates xmax is a MultiXactId (a *set* of
+	// transactions resolved via the multixact member store) rather than a
+	// single TransactionID. When set, readers must resolve xmax through
+	// internal/multixact's Store.Members to learn the lock holders and
+	// (at most one) updater. Mirrors PostgreSQL's HEAP_XMAX_IS_MULTI
+	// (0x1000, htup_details.h:209).
+	HeapXmaxIsMulti    uint16 = 0x1000
 	HeapXmaxLockOnly   uint16 = 0x0080
 	HeapXmaxKeyShrLock uint16 = 0x0010
 	HeapXmaxExclLock   uint16 = 0x0040
@@ -134,6 +141,23 @@ const (
 // upstream's HEAP_XMAX_IS_LOCKED_ONLY macro.
 func IsHeapTupleLockOnly(infomask uint16) bool {
 	return infomask&HeapXmaxLockOnly != 0
+}
+
+// IsHeapTupleXmaxMulti reports whether the tuple's xmax is a MultiXactId
+// (HEAP_XMAX_IS_MULTI set) rather than a single TransactionID. When true,
+// xmax must be resolved through the multixact member store (Store.Members)
+// to enumerate the lock holders and the at-most-one updater; a single-xid
+// reader (e.g. plain WaitForXID / TransactionIdIsCurrent) must not be applied
+// to it directly. Mirrors testing PostgreSQL's HEAP_XMAX_IS_MULTI bit.
+//
+// Note: HEAP_XMAX_LOCK_ONLY is the orthogonal "this xmax is a lock, not an
+// update" predicate (IsHeapTupleLockOnly). The multixact encoder stamps
+// HEAP_XMAX_LOCK_ONLY whenever a multi has no updater, so for goopg's
+// from-initdb tuples (no pg_upgrade legacy) IsHeapTupleLockOnly alone
+// correctly classifies multi xmax as locked-only vs. updated without needing
+// upstream's pre-9.3 EXCL_LOCK fallback clause.
+func IsHeapTupleXmaxMulti(infomask uint16) bool {
+	return infomask&HeapXmaxIsMulti != 0
 }
 
 // MovedPartitionsOffsetNumber is the special t_ctid.ip_posid value
@@ -971,7 +995,6 @@ func PageSetHeapTupleMovedPartition(p Page, slot uint16, xmax TransactionID) err
 	}
 	return nil
 }
-
 
 // PageSetHeapTupleCtid overwrites only the t_ctid field of the heap tuple
 // at the given 1-based slot. Used by non-HOT cross-page UPDATE: after the

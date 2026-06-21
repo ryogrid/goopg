@@ -99,6 +99,16 @@ type lockRowsOp struct {
 	// the new row — matching PostgreSQL's EvalPlanQualFetchRowMark behaviour.
 	filterPred planner.Expr
 	filterCols []catalog.Column
+
+	// waitPolicy is the effective NOWAIT / SKIP LOCKED / (default) blocking
+	// policy for the per-tuple lock acquisition in stampLock. Resolved once at
+	// Open from Locks[0].WaitPolicy (v0 assumes a single policy per LockRows;
+	// multi-clause merge is deferred, consistent with lockStrength). M0118-0003.
+	waitPolicy planner.LockWaitPolicy
+	// lockRelName is the name of the first locked relation, used to format the
+	// NOWAIT "could not obtain lock on row in relation \"%s\"" diagnostic with
+	// the upstream-canonical relation name. Resolved at Open from Locks[0].
+	lockRelName string
 }
 
 type pendingLockedRow struct {
@@ -338,6 +348,12 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 			// FOR UPDATE (and FOR NO KEY UPDATE mapped to ForUpdate) use an exclusive lock.
 			o.lockStrength = storage.HeapXmaxExclLock
 		}
+		// Resolve the wait policy and relation name once for stampLock's
+		// per-tuple acquisition (NOWAIT / SKIP LOCKED). M0118-0003.
+		o.waitPolicy = o.plan.Locks[0].WaitPolicy
+		if o.plan.Locks[0].Table != nil {
+			o.lockRelName = o.plan.Locks[0].Table.Name
+		}
 	}
 	for i := range o.plan.Locks {
 		lk := &o.plan.Locks[i]
@@ -352,7 +368,13 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 		rel := ctx.Catalog.RelFileNode(lk.Table)
 		var err error
 		switch lk.WaitPolicy {
-		case planner.LockWaitBlock:
+		case planner.LockWaitBlock, planner.LockWaitSkipLocked:
+			// SKIP LOCKED affects only per-row locks: the relation-level
+			// RowShareLock is always acquired with the normal blocking
+			// policy. Mirrors upstream — the LockWaitPolicy governs
+			// heap_lock_tuple, not the relation lock. The actual row
+			// skipping happens per-tuple in stampLock / stampLockInner.
+			// M0118-0003.
 			err = ctx.acquireRelLock(rel, lockmgr.RowShareLock)
 		case planner.LockWaitNoWait:
 			// NOWAIT: try once and bail with 55P03 if the
@@ -361,20 +383,6 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 			// row" diagnostic at the relation-coarse layer
 			// goopg has today.
 			err = ctx.tryAcquireRelLock(rel, lockmgr.RowShareLock)
-		case planner.LockWaitSkipLocked:
-			// SKIP LOCKED needs tuple-level lock probing to
-			// silently drop contended rows from the result.
-			// goopg's row-locking is relation-coarse — there
-			// are no individual rows to skip, only the whole
-			// relation. Reject here so users see the specific
-			// "tuple-level pessimistic locking is the
-			// follow-up" message rather than silently producing
-			// an empty result on contention.
-			return &ExecError{
-				Code:    "0A000",
-				Pos:     o.plan.Pos(),
-				Message: "SKIP LOCKED requires tuple-level pessimistic locking (deferred follow-up to M0021)",
-			}
 		default:
 			return &ExecError{
 				Code:    "XX000",
@@ -418,6 +426,31 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	// out-of-range error and incorrectly skip the row (M0100-0010).
 	if o.filterPred != nil && filterPredMaxColRef(o.filterPred) >= len(o.filterCols) {
 		o.filterPred = nil
+	}
+	// When the planner lifted a LIMIT above this LockRows (SKIP LOCKED), cap the
+	// drain at LIMIT (+OFFSET) successfully-locked rows so the row lock claims
+	// only as many rows as the LIMIT demands — skipped (contended) rows do not
+	// count toward the cap (see drainAndStamp). Evaluated here exactly like
+	// limitOp.Open. nil LimitCount → unbounded drain (existing behaviour, and
+	// the EXISTS maxDrain=1 set by existsImpl is preserved). M0118-0003.
+	if o.plan.LimitCount != nil {
+		v, err := evalExpr(o.plan.LimitCount, nil, ctx)
+		if err != nil {
+			return err
+		}
+		if !v.IsNull() && v.Kind == KindInt && v.Int >= 0 {
+			drain := v.Int
+			if o.plan.OffsetCount != nil {
+				ov, oerr := evalExpr(o.plan.OffsetCount, nil, ctx)
+				if oerr != nil {
+					return oerr
+				}
+				if !ov.IsNull() && ov.Kind == KindInt && ov.Int > 0 {
+					drain += ov.Int
+				}
+			}
+			o.maxDrain = int(drain)
+		}
 	}
 	return nil
 }
@@ -583,9 +616,43 @@ func (o *lockRowsOp) stampLock(rel storage.RelFileNode, ptr storage.ItemPointer)
 	}
 	// Acquire the tuple-level lock first so a concurrent UPDATE
 	// that races with us can't slip through between the xmax
-	// stamp and the lock registration.
-	if err := o.ctx.acquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
-		return storage.ItemPointer{}, false, false, err
+	// stamp and the lock registration. The wait policy decides how
+	// contention is handled: NOWAIT fails fast with 55P03, mirroring
+	// heapam.c's "could not obtain lock on row in relation \"%s\""
+	// (relation-qualified, ERRCODE_LOCK_NOT_AVAILABLE); the default
+	// blocks until the conflicting holder releases. The lockmgr tuple
+	// tag is the cross-session gate — a concurrent FOR UPDATE holder
+	// makes TryAcquire return ErrLockNotAvailable. M0118-0003.
+	switch o.waitPolicy {
+	case planner.LockWaitNoWait:
+		if err := o.ctx.tryAcquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Code == "55P03" {
+				return storage.ItemPointer{}, false, false, &ExecError{
+					Code:    "55P03",
+					Pos:     o.plan.Pos(),
+					Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
+				}
+			}
+			return storage.ItemPointer{}, false, false, err
+		}
+	case planner.LockWaitSkipLocked:
+		// SKIP LOCKED: try the tuple lock once. If a concurrent session holds
+		// it (it is mid-statement on this row), skip the row silently rather
+		// than blocking — mirrors heap_lock_tuple returning HeapTupleWouldBlock
+		// under LockWaitSkip. Cross-statement conflicts are detected later from
+		// the persisted lock-only xmax in stampLockInner (goopg's lockmgr tuple
+		// lock is statement-scoped, so a committed-but-active holder's lock has
+		// already been released here but its heap xmax persists). M0118-0003.
+		if err := o.ctx.tryAcquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Code == "55P03" {
+				return storage.ItemPointer{}, false, true, nil // epqSkipped: drop contended row
+			}
+			return storage.ItemPointer{}, false, false, err
+		}
+	default:
+		if err := o.ctx.acquireTupleLock(rel, ptr, o.tupleLockMode()); err != nil {
+			return storage.ItemPointer{}, false, false, err
+		}
 	}
 	return o.stampLockInner(rel, ptr, 0)
 }
@@ -686,6 +753,63 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		}
 		// Indicate that the entry's row data should be refetched.
 		return succ, true, false, nil
+	}
+
+	// Another transaction holds a row-level *lock* (lock-only xmax) on this
+	// tuple. Unlike a real updater (handled above) the row is not relocated,
+	// but a conflicting request must still honour the holder rather than
+	// silently overwriting its xmax. The lockmgr tuple lock is statement-scoped
+	// (released at each Query message's end in dispatch.go), so cross-statement
+	// conflict detection relies on this persisted lock-only xmax — the same
+	// durable signal the real-updater path reads above.
+	if gerr == nil &&
+		tup.Header.Xmax != storage.InvalidTransactionID &&
+		storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
+		tup.Header.Xmax != o.ctx.Tx.XID &&
+		tupleLockConflicts(o.lockStrength, tup.Header.Infomask) {
+
+		// Conflict resolution honours the wait policy (M0118-0003):
+		//   SKIP LOCKED -> drop the contended row silently.
+		//   NOWAIT      -> fail fast with 55P03 (relation-qualified).
+		//   blocking    -> wait for the holder to commit/abort, then retry
+		//     from the top. The holder may have committed its lock (released,
+		//     so we stamp our own), aborted (row live again), or upgraded to a
+		//     real update (the real-updater branch above takes over on retry).
+		//     Mirrors that branch's WaitForXID so the isolation scheduler sees
+		//     the step block (<waiting ...>) and resume on the holder's COMMIT.
+		// Multixact shared-lock combination (two non-conflicting FOR SHARE /
+		// FOR KEY SHARE holders) remains a separate follow-up; tupleLockConflicts
+		// only enters here on a genuine conflict.
+		xmax := tup.Header.Xmax
+		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
+			slot.Unlock()
+			o.ctx.Pool.Unpin(slot)
+			switch o.waitPolicy {
+			case planner.LockWaitSkipLocked:
+				// SKIP LOCKED: silently drop the contended row.
+				return storage.ItemPointer{}, false, true, nil // epqSkipped
+			case planner.LockWaitNoWait:
+				return storage.ItemPointer{}, false, false, &ExecError{
+					Code:    "55P03",
+					Pos:     o.plan.Pos(),
+					Message: fmt.Sprintf(`could not obtain lock on row in relation "%s"`, o.lockRelName),
+				}
+			default:
+				// Blocking FOR UPDATE/FOR SHARE: wait for the row-lock holder
+				// to finish, then re-evaluate the tuple from scratch.
+				qctx := o.ctx.Ctx
+				if qctx == nil {
+					qctx = context.Background()
+				}
+				if werr := o.ctx.TxnMgr.WaitForXID(qctx, xmax); werr != nil {
+					// Context cancelled — skip this row silently.
+					return storage.ItemPointer{}, false, false, nil
+				}
+				return o.stampLockInner(rel, ptr, depth+1)
+			}
+		}
+		// Locker is no longer active (committed/aborted): its row lock is
+		// released, so fall through and stamp our own lock-only xmax.
 	}
 
 	// Tuple is live (no real updater xmax from another xact). Stamp it.
@@ -813,6 +937,28 @@ func (o *lockRowsOp) tupleLockMode() lockmgr.Mode {
 		return lockmgr.RowShareLock
 	}
 	return lockmgr.ExclusiveLock
+}
+
+// tupleLockConflicts reports whether a newly requested row-lock strength
+// conflicts with the strength already recorded in a lock-only xmax infomask.
+// goopg distinguishes two effective strengths: FOR UPDATE → HeapXmaxExclLock
+// (pure exclusive bit) and FOR SHARE / KEY SHARE → HeapXmaxShrLock (both bits).
+// FOR UPDATE conflicts with any held row lock; a shared request conflicts only
+// with an exclusive (FOR UPDATE) holder. This mirrors the relevant rows of
+// PostgreSQL's row-lock conflict table for the single-locker (non-multixact)
+// case. M0118-0003.
+func tupleLockConflicts(requested, heldInfomask uint16) bool {
+	held := heldInfomask & storage.HeapXmaxLockMask
+	if held == 0 {
+		return false
+	}
+	// FOR UPDATE: exclusive bit set, key-share bit clear → conflicts with all.
+	if requested&storage.HeapXmaxExclLock != 0 && requested&storage.HeapXmaxKeyShrLock == 0 {
+		return true
+	}
+	// Shared request (FOR SHARE / KEY SHARE): conflicts only with a holder that
+	// took the pure-exclusive FOR UPDATE lock.
+	return held == storage.HeapXmaxExclLock
 }
 
 // markHeapLockDirty centralises the choice between

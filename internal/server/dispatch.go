@@ -1449,6 +1449,13 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				if connTx.Session() != nil {
 					connTx.Session().SetReadOnlyTxn(txNode.ReadOnly)
 				}
+				// Record the declared READ ONLY / DEFERRABLE modes on the SSI
+				// xact so the snapshot path applies PostgreSQL's GetSafeSnapshot
+				// deferral for a SERIALIZABLE READ ONLY DEFERRABLE transaction.
+				// No-op for RC/RR. M0118-0001 (read-only-anomaly-3).
+				if ctx.Tx.Isolation == mvcc.IsolationSerializable {
+					s.cfg.TxnMgr.MarkSerializableModes(ctx.Tx.Handle, txNode.ReadOnly, txNode.Deferrable)
+				}
 				if ctx.BeginLocalTransaction != nil {
 					ctx.BeginLocalTransaction()
 				}
@@ -1509,8 +1516,20 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						ctx.PendingEnumRenames = nil
 						ctx.PendingCreatedEnums = nil
 						ctx.PendingCreatedComposites = nil
+						// Primary message is the bare upstream errmsg; the reason
+						// code rides in DETAIL (predicate.c parity). isolationtester
+						// and psql print only the errmsg line.
+						var ssiFields []protocol.ErrorField
+						if sfe, ok := ssiErr.(*mvcc.SerializationFailureError); ok {
+							if d := sfe.Detail(); d != "" {
+								ssiFields = append(ssiFields,
+									protocol.ErrorField{Code: protocol.FieldDetail, Value: d},
+									protocol.ErrorField{Code: protocol.FieldHint, Value: "The transaction might succeed if retried."})
+							}
+						}
 						return s.writeQueryError(w, "40001",
-							"could not serialize access due to read/write dependencies among transactions: "+ssiErr.Error())
+							"could not serialize access due to read/write dependencies among transactions",
+							ssiFields...)
 					}
 				}
 				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {

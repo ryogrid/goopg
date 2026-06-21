@@ -536,6 +536,18 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// debug_parallel_query (renamed from force_parallel_mode) — a developer
+	// GUC that forces a parallel plan for testing. goopg has no parallel
+	// executor so it is a no-op, but SET must succeed so upstream isolation
+	// specs (serializable-parallel*) that flip it during session setup don't
+	// fail with "unrecognized configuration parameter". Enum off/on/regress
+	// mirrors postgres/src/backend/utils/misc/guc_tables.c.
+	r.MustRegister(NewVariable(Variable{
+		Name: "debug_parallel_query", Type: TypeEnum, BootVal: "off",
+		EnumOptions: []string{"off", "on", "regress"},
+		Context:     ContextUserset,
+		Scope:       ScopeSession | ScopeTransaction,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "search_path", Type: TypeString, BootVal: `"$user", public`,
 		Context: ContextUserset,
@@ -595,6 +607,28 @@ func BuildDefaultRegistry() *Registry {
 	r.MustRegister(NewVariable(Variable{
 		Name: "seq_page_cost", Type: TypeReal, BootVal: "1.0",
 		MinVal: 0, MaxVal: 1 << 30,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// Per-tuple / per-operator planner cost estimates (guc_tables.c). goopg's
+	// planner does not consume these yet, but they must be registered so
+	// upstream specs that tune them (e.g. the index-only-scan isolation spec)
+	// can SET them without an "unrecognized configuration parameter" error.
+	r.MustRegister(NewVariable(Variable{
+		Name: "cpu_tuple_cost", Type: TypeReal, BootVal: "0.01",
+		MinVal: 0, MaxVal: 1e9,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "cpu_index_tuple_cost", Type: TypeReal, BootVal: "0.005",
+		MinVal: 0, MaxVal: 1e9,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	r.MustRegister(NewVariable(Variable{
+		Name: "cpu_operator_cost", Type: TypeReal, BootVal: "0.0025",
+		MinVal: 0, MaxVal: 1e9,
 		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))

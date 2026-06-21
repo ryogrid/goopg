@@ -145,6 +145,73 @@ func TestLockManagerSelfDoesNotConflict(t *testing.T) {
 	}
 }
 
+// TestParseModeRoundTrip pins ParseMode as the inverse of Mode.String()
+// across every real mode, and confirms it rejects unknown / sentinel
+// names. The SQL parser emits exactly these canonical names for
+// LOCK TABLE, so a drift here would silently mis-map a requested mode.
+func TestParseModeRoundTrip(t *testing.T) {
+	for m := AccessShareLock; m <= maxMode; m++ {
+		got, ok := ParseMode(m.String())
+		if !ok || got != m {
+			t.Errorf("ParseMode(%q) = (%v, %v), want (%v, true)", m.String(), got, ok, m)
+		}
+	}
+	for _, bad := range []string{"", "INVALID", "NoLock", "RowExclusive", "accessexclusivelock"} {
+		if got, ok := ParseMode(bad); ok {
+			t.Errorf("ParseMode(%q) = (%v, true), want (NoLock, false)", bad, got)
+		}
+	}
+}
+
+// TestLockManagerEarlyGrantAheadOfWaiter mirrors the upstream lock-nowait
+// spec: a backend that already holds a strong lock may take a weaker
+// self-compatible mode immediately even while a conflicting waiter is
+// parked ahead of it, because it would be inserted in front of that
+// waiter (JoinWaitQueue's "special case" early grant, proc.c). Backend 1
+// holds AccessExclusive; backend 2 blocks on Exclusive (queued); backend 1
+// then requests ShareRowExclusive NOWAIT, which must succeed.
+func TestLockManagerEarlyGrantAheadOfWaiter(t *testing.T) {
+	lm := New()
+	if err := lm.Acquire(context.Background(), 1, testTag, AccessExclusiveLock); err != nil {
+		t.Fatal(err)
+	}
+	// Backend 2 wants Exclusive; conflicts with backend 1's
+	// AccessExclusive, so it parks as a waiter.
+	w2 := make(chan error, 1)
+	go func() { w2 <- lm.Acquire(context.Background(), 2, testTag, ExclusiveLock) }()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && len(lm.Waiters(testTag)) != 1 {
+		time.Sleep(time.Millisecond)
+	}
+	if len(lm.Waiters(testTag)) != 1 {
+		t.Fatal("backend 2 never queued as waiter")
+	}
+	// Backend 1 already holds a lock here, so its ShareRowExclusive
+	// request jumps ahead of waiter 2 and must be granted immediately
+	// even via the NOWAIT path.
+	if err := lm.TryAcquire(1, testTag, ShareRowExclusiveLock); err != nil {
+		t.Fatalf("early-grant NOWAIT ahead of waiter: %v", err)
+	}
+	if got := lm.Holders(testTag)[1]; got&bit(ShareRowExclusiveLock) == 0 {
+		t.Errorf("holders[1]=%b, want ShareRowExclusive bit set", got)
+	}
+	// A third backend that holds nothing here must NOT jump the queue:
+	// its conflicting request fails fast under NOWAIT.
+	if err := lm.TryAcquire(3, testTag, ExclusiveLock); err != ErrLockNotAvailable {
+		t.Errorf("backend 3 (no held lock) TryAcquire = %v, want ErrLockNotAvailable", err)
+	}
+	// Releasing backend 1 lets the parked Exclusive waiter through.
+	lm.ReleaseAll(1)
+	select {
+	case err := <-w2:
+		if err != nil {
+			t.Errorf("backend 2: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("backend 2 never woke after backend 1 released")
+	}
+}
+
 // TestLockManagerIdempotentAcquire: a second Acquire of an already-
 // held mode is a no-op. The wire-protocol dispatcher will call this
 // path repeatedly for re-prepared statements.

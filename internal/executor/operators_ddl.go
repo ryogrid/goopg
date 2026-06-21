@@ -2460,11 +2460,19 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// explicit or inherited columns get auto-name <tablename>_<colname>_not_null.
 	// M0097-0023.
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		// Build set of explicit column defs that carry NOT NULL NO INHERIT.
+		// Build set of explicit column defs that carry NOT NULL NO INHERIT, plus
+		// any user-given inline constraint name (`CONSTRAINT <name> NOT NULL`).
+		// A non-default name makes pg_dump re-emit the inline
+		// `CONSTRAINT <name> NOT NULL` form rather than a bare `NOT NULL`.
+		// DU-002 slice 273.
 		explicitNoInherit := make(map[string]bool)
+		explicitNotNullName := make(map[string]string)
 		for _, origCol := range s.Columns {
 			if origCol.NotNullNoInherit {
 				explicitNoInherit[strings.ToLower(origCol.Name)] = true
+			}
+			if origCol.NotNullConstraintName != "" {
+				explicitNotNullName[strings.ToLower(origCol.Name)] = origCol.NotNullConstraintName
 			}
 		}
 		// PG18 records a contype='n' NOT NULL constraint for EVERY not-null
@@ -2481,6 +2489,11 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			colKey := strings.ToLower(col.Name)
 			noInherit := explicitNoInherit[colKey]
 			name := strings.ToLower(tbl.Name) + "_" + colKey + "_not_null"
+			if custom, ok2 := explicitNotNullName[colKey]; ok2 {
+				// Explicit inline `CONSTRAINT <name> NOT NULL` overrides the
+				// auto-name. DU-002 slice 273.
+				name = custom
+			}
 			if entry, ok2 := likeNotNullByCol[colKey]; ok2 {
 				// LIKE INCLUDING preserves the source NOT NULL constraint name.
 				if entry.name != "" {
@@ -3374,6 +3387,51 @@ func exprToString(e parser.Expr) string {
 // defaultExprToSQL converts a default-argument expression to a SQL string
 // that can be re-evaluated at call time. Handles literal constants; for
 // complex expressions it falls back to a best-effort fmt.Sprintf form.
+// binaryOpSymbolForDefault maps a parser.BinaryOp operator to the SQL operator
+// text PG's pg_get_expr emits between the operands. Returns "" for an operator
+// the renderer does not model (the caller then falls through, leaving the
+// expression un-rendered as before). This is the executor-package twin of
+// catalog.binaryOpSymbol (DU-002 slice 297) — the two MUST stay in sync; they
+// are deliberately duplicated because catalog and executor cannot import each
+// other (DU-002 slice 298).
+func binaryOpSymbolForDefault(op parser.OpCode) string {
+	switch op {
+	case parser.OpAdd:
+		return "+"
+	case parser.OpSub:
+		return "-"
+	case parser.OpMul:
+		return "*"
+	case parser.OpDiv:
+		return "/"
+	case parser.OpMod:
+		return "%"
+	case parser.OpConcat:
+		return "||"
+	case parser.OpEq:
+		return "="
+	case parser.OpLt:
+		return "<"
+	case parser.OpGt:
+		return ">"
+	case parser.OpLe:
+		return "<="
+	case parser.OpGe:
+		return ">="
+	case parser.OpNe:
+		return "<>"
+	case parser.OpAnd:
+		return "AND"
+	case parser.OpOr:
+		return "OR"
+	case parser.OpLike:
+		return "LIKE"
+	case parser.OpNotLike:
+		return "NOT LIKE"
+	}
+	return ""
+}
+
 func defaultExprToSQL(e parser.Expr) string {
 	if e == nil {
 		return ""
@@ -3419,47 +3477,46 @@ func defaultExprToSQL(e parser.Expr) string {
 		return defaultExprToSQL(v.Operand) + "::" + v.Type.Name
 	case *parser.UnaryOp:
 		switch v.Op {
-		case parser.OpSub:
-			return "-" + defaultExprToSQL(v.Operand)
+		case parser.OpUnaryNeg:
+			// Unary minus. The parser tags `-x` with OpUnaryNeg (NOT OpSub —
+			// OpSub is binary subtraction); the previous `case parser.OpSub` arm
+			// never matched a real unary minus, so a `DEFAULT -…` fell through to
+			// fmt.Sprintf("%v") and dumped a Go pointer string (DU-002 slice 302).
+			// PG's parser folds a unary minus applied DIRECTLY to a numeric literal
+			// into a negative typed Const at parse time (gram.y doNegate), which
+			// pg_get_expr deparses as `'-N'::type`. goopg is type-blind in this
+			// renderer, so for a bare numeric operand it emits the re-parseable
+			// `-N` (semantically identical; byte-differs from PG's `'-N'::type` —
+			// matching that cast form needs column/argument type and is deferred).
+			// For a unary minus on a COMPOUND operand (an OpExpr PG does NOT fold),
+			// get_rule_expr deparses `(- (operand))`; the recursion parenthesizes
+			// the operand, so mirror that exact form. Keep in sync with the catalog
+			// twin catalog.formatExprForAttrdef.
+			switch v.Operand.(type) {
+			case *parser.IntegerConst, *parser.NumericConst:
+				return "-" + defaultExprToSQL(v.Operand)
+			default:
+				return "(- " + defaultExprToSQL(v.Operand) + ")"
+			}
 		case parser.OpNot:
 			return "NOT " + defaultExprToSQL(v.Operand)
 		}
 	case *parser.BinaryOp:
+		// Fully parenthesize every binary OpExpr `(left op right)`, matching PG's
+		// pg_get_expr in the prettyFlags=0 mode it uses for the contexts this
+		// renderer feeds — index predicates (pg_get_indexdef WHERE), expression
+		// index columns, partition-key expressions, and function-argument defaults
+		// (pg_get_function_arguments). Empirically vs real pg_dump 18.3:
+		// `WHERE a > 0` dumps `WHERE (a > 0)`, `DEFAULT (1+2)*3` dumps
+		// `DEFAULT ((1 + 2) * 3)`. Without the parens a nested-arithmetic predicate/
+		// default round-trips with corrupted precedence on restore (e.g.
+		// `(1 + 2) * 3` deparsed as `1 + 2 * 3` evaluates to 7, not 9). This is the
+		// executor-twin of catalog.formatExprForAttrdef's parenthesization
+		// (DU-002 slice 297); keep the two in sync (DU-002 slice 298).
 		left := defaultExprToSQL(v.Left)
 		right := defaultExprToSQL(v.Right)
-		switch v.Op {
-		case parser.OpAdd:
-			return left + " + " + right
-		case parser.OpSub:
-			return left + " - " + right
-		case parser.OpMul:
-			return left + " * " + right
-		case parser.OpDiv:
-			return left + " / " + right
-		case parser.OpMod:
-			return left + " % " + right
-		case parser.OpConcat:
-			return left + " || " + right
-		case parser.OpEq:
-			return left + " = " + right
-		case parser.OpLt:
-			return left + " < " + right
-		case parser.OpGt:
-			return left + " > " + right
-		case parser.OpLe:
-			return left + " <= " + right
-		case parser.OpGe:
-			return left + " >= " + right
-		case parser.OpNe:
-			return left + " <> " + right
-		case parser.OpAnd:
-			return left + " AND " + right
-		case parser.OpOr:
-			return left + " OR " + right
-		case parser.OpLike:
-			return left + " LIKE " + right
-		case parser.OpNotLike:
-			return left + " NOT LIKE " + right
+		if sym := binaryOpSymbolForDefault(v.Op); sym != "" {
+			return "(" + left + " " + sym + " " + right + ")"
 		}
 	case *parser.TypedStringLit:
 		return v.Type + " '" + strings.ReplaceAll(v.Value, "'", "''") + "'"
@@ -5257,6 +5314,22 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+		case parser.AlterTableSetReloptions:
+			// SET (param = value, …) — merge table-level storage parameters into the
+			// relation's reloptions. pg_class.reloptions is rendered from the live
+			// catalog.Table fields (the virtual pg_class builder), so updating the
+			// fields is immediately visible to pg_dump / pg_class — no heap re-sync
+			// is needed (unlike the pg_attribute-backed column options above). Only
+			// the storage parameters goopg models take effect; unrecognized (but
+			// lowercase) names are accepted and ignored, matching the CREATE TABLE
+			// WITH path. M0118-0001.
+			if err := o.execAlterTableSetReloptions(tbl, act, s.Pos()); err != nil {
+				return err
+			}
+		case parser.AlterTableResetReloptions:
+			// RESET (param, …) — clear the named storage parameters back to their
+			// defaults. Acts on the same live catalog.Table fields as SET. M0118-0001.
+			o.execAlterTableResetReloptions(tbl, act)
 		case parser.AlterTableAlterColumnSet:
 			// SET (opt=value, …) — record the per-column attribute options on the
 			// catalog column AND rewrite the pg_attribute heap row so pg_dump
@@ -5291,6 +5364,211 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+		case parser.AlterTableSetDefault:
+			// SET DEFAULT expr — record the parsed DEFAULT on the catalog column
+			// AND rewrite the pg_attribute heap row so pg_dump observes
+			// atthasdef. The default surfaces in pg_attrdef (catalog
+			// attrDefRowsLocked reads Column.DefaultExpr) and round-trips through
+			// pg_dump: inline on a printed local column, or as a separate
+			// `ALTER TABLE ONLY ... ALTER COLUMN ... SET DEFAULT` when the column
+			// is a suppressed inherited column (pg_dump.c marks
+			// attrdefs[].separate when !shouldPrintColumn). Like the SET STORAGE/
+			// COMPRESSION/STATISTICS arms, the in-memory mutation alone is
+			// invisible because pg_attribute is a heap populated at CREATE TABLE;
+			// the change must be flushed via delete-old-rows + re-sync. The same
+			// validation CREATE TABLE applies (no column refs, aggregates,
+			// subqueries, SRFs) runs here. DU-002 slice 269.
+			if act.DefaultExpr != nil {
+				if err := validateDefaultExpr(act.DefaultExpr, act.Pos(), o.ctx); err != nil {
+					return err
+				}
+			}
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					tbl.Columns[i].DefaultExpr = act.DefaultExpr
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
+		case parser.AlterTableDropDefault:
+			// DROP DEFAULT — clear the column's DEFAULT (same heap re-sync as
+			// SET DEFAULT). DROP DEFAULT on a column with no default is a no-op
+			// in PG; we mirror that (no error). DU-002 slice 269.
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					tbl.Columns[i].DefaultExpr = nil
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
+		case parser.AlterTableSetNotNull:
+			// SET NOT NULL — mark the column NOT NULL (pg_attribute.attnotnull)
+			// AND record a contype='n' constraint (pg_constraint) so pg_dump's
+			// getTableAttrs LEFT JOIN sees it. pg_dump re-emits the NOT NULL
+			// inline on a printed local column, or as a standalone `NOT NULL
+			// <col>` constraint item in the child CREATE TABLE body when the
+			// column is a suppressed inherited column (pg_dump.c:17213,
+			// !shouldPrintColumn && notnull_islocal). The auto-name matches PG's
+			// `<table>_<col>_not_null`, conislocal='t', coninhcount=0 — so
+			// pg_dump prints the unnamed `NOT NULL <col>` form. Like SET DEFAULT,
+			// the in-memory mutation alone is invisible: pg_attribute is a heap
+			// populated at CREATE TABLE, so the change is flushed via
+			// delete-old-rows + re-sync. DU-002 slice 270.
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					tbl.Columns[i].NotNull = true
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			// Add a named NOT NULL constraint unless one already exists for the
+			// column (SET NOT NULL is idempotent in PG — no duplicate row).
+			hasNN := false
+			for _, nc := range tbl.NotNullConstraints {
+				if strings.EqualFold(nc.ColName, act.ColumnName) {
+					hasNN = true
+					break
+				}
+			}
+			if !hasNN {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					name := strings.ToLower(tbl.Name) + "_" + strings.ToLower(act.ColumnName) + "_not_null"
+					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), false, true, 0)
+				}
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
+		case parser.AlterTableDropNotNull:
+			// DROP NOT NULL — clear the column's NOT NULL flag and drop its
+			// contype='n' constraint (same heap re-sync as SET NOT NULL). DROP
+			// NOT NULL on a column with no NOT NULL is a no-op in PG; we mirror
+			// that (no error). DU-002 slice 270.
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					tbl.Columns[i].NotNull = false
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			kept := tbl.NotNullConstraints[:0]
+			for _, nc := range tbl.NotNullConstraints {
+				if !strings.EqualFold(nc.ColName, act.ColumnName) {
+					kept = append(kept, nc)
+				}
+			}
+			tbl.NotNullConstraints = kept
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
+		case parser.AlterTableAddNotNull:
+			// ADD [CONSTRAINT name] NOT NULL col — the named (PG18) counterpart
+			// of SET NOT NULL. Marks the column NOT NULL AND records a contype='n'
+			// constraint with the EXPLICIT name (auto-named when omitted). When
+			// the name differs from PG's default `<table>_<col>_not_null`,
+			// pg_dump prints the `CONSTRAINT <name> NOT NULL <col>` form
+			// (pg_dump.c:17228) instead of the unnamed `NOT NULL <col>` form. The
+			// pg_attribute.attnotnull flush goes through the same delete-old-rows
+			// + syncTableToCatalogHeap path as SET NOT NULL. DU-002 slice 271.
+			found := false
+			for i := range tbl.Columns {
+				if strings.EqualFold(tbl.Columns[i].Name, act.ColumnName) {
+					tbl.Columns[i].NotNull = true
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42703", Pos: act.Pos(),
+					Message: fmt.Sprintf("column %q of relation %q does not exist", act.ColumnName, tbl.Name)}
+			}
+			// Idempotent: a column already carrying a NOT NULL constraint is left
+			// as-is (PG raises no error and adds no duplicate row).
+			hasNN := false
+			for _, nc := range tbl.NotNullConstraints {
+				if strings.EqualFold(nc.ColName, act.ColumnName) {
+					hasNN = true
+					break
+				}
+			}
+			if !hasNN {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					name := act.ConstraintName
+					if name == "" {
+						name = strings.ToLower(tbl.Name) + "_" + strings.ToLower(act.ColumnName) + "_not_null"
+					}
+					tbl.AddNotNull(name, act.ColumnName, im.AllocOID(), act.NoInherit, true, 0)
+				}
+			}
+			if catalogHeapSyncAvailable(o.ctx) {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					xmax := o.ctx.Tx.XID
+					for _, dbOid := range catalogDBOids(o.ctx) {
+						deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+					}
+				}
+				if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+					return fmt.Errorf("DDL catalog sync: %w", syncErr)
+				}
+			}
 		case parser.AlterTableAlterColumnType:
 			if err := o.execAlterColumnType(tbl, act); err != nil {
 				return err
@@ -5304,6 +5582,128 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		}
 	}
 	return nil
+}
+
+// execAlterTableSetReloptions applies an `ALTER TABLE … SET (param = value, …)`
+// clause, merging the named table-level storage parameters into the relation's
+// in-memory catalog fields. goopg surfaces pg_class.reloptions from those fields
+// (the virtual pg_class builder), so the mutation is immediately visible to
+// pg_dump and pg_class without a heap re-sync.
+//
+// Only the storage parameters goopg models are applied; any other lowercase name
+// is accepted and ignored, exactly as the CREATE TABLE WITH path does. The four
+// recognized options (parallel_workers, fillfactor, autovacuum_enabled,
+// toast_tuple_target) cover every reloption upstream's regress/isolation suites
+// ever set via ALTER TABLE; the autovacuum_* long tail is only ever declared at
+// CREATE time. Values are bounds-checked with the same ranges and SQLSTATEs as
+// CREATE so the two paths stay in lock-step. M0118-0001.
+//
+// PG validates the entire option list and only then applies it, so a
+// multi-option SET in which one value is out of range leaves the relation
+// untouched (statement atomicity). Mirror that: validate every option into a
+// pending set first, and commit the mutations only after the whole list passes.
+// Map iteration order is unspecified in Go, so applying field-by-field would
+// otherwise leave a nondeterministic partial state on a rejected statement.
+func (o *ddlOp) execAlterTableSetReloptions(tbl *catalog.Table, act parser.AlterTableAction, pos int) error {
+	var (
+		parallelWorkers  *int
+		fillfactor       *int
+		autovacEnabled   *bool
+		toastTupleTarget *int
+	)
+	for k, v := range act.With {
+		// Double-quoted mixed-case names are unrecognized (PG/CREATE reject them);
+		// all modeled option names are lowercase.
+		if k != strings.ToLower(k) {
+			return &ExecError{Code: "42000", Pos: pos,
+				Message: fmt.Sprintf("unrecognized parameter %q", k)}
+		}
+		switch k {
+		case "parallel_workers":
+			pw, convErr := strconv.Atoi(strings.TrimSpace(v))
+			if convErr != nil {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("invalid value for integer option \"parallel_workers\": %s", v)}
+			}
+			if pw < 0 || pw > 1024 {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("value %d out of bounds for option \"parallel_workers\"", pw),
+					Detail:  "Valid values are between \"0\" and \"1024\"."}
+			}
+			parallelWorkers = &pw
+		case "fillfactor":
+			ff, convErr := strconv.Atoi(strings.TrimSpace(v))
+			if convErr != nil {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("invalid value for integer option \"fillfactor\": %s", v)}
+			}
+			if ff < 10 || ff > 100 {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("value %d out of bounds for option \"fillfactor\"", ff),
+					Detail:  "Valid values are between \"10\" and \"100\"."}
+			}
+			fillfactor = &ff
+		case "autovacuum_enabled":
+			b, parsed := parseReloptionBool(strings.TrimSpace(v))
+			if !parsed {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("invalid value for boolean option \"autovacuum_enabled\": %s", v)}
+			}
+			autovacEnabled = &b
+		case "toast_tuple_target":
+			tt, convErr := strconv.Atoi(strings.TrimSpace(v))
+			if convErr != nil {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("invalid value for integer option \"toast_tuple_target\": %s", v)}
+			}
+			if tt < 128 || tt > 8160 {
+				return &ExecError{Code: "22023", Pos: pos,
+					Message: fmt.Sprintf("value %d out of bounds for option \"toast_tuple_target\"", tt),
+					Detail:  "Valid values are between \"128\" and \"8160\"."}
+			}
+			toastTupleTarget = &tt
+		default:
+			// Unrecognized but lowercase: accept and ignore (CREATE TABLE WITH
+			// behaves the same — it only stores the options it models).
+		}
+	}
+	// Every option validated — commit the changes (merge, not replace: only the
+	// named options are touched, preserving previously-set storage parameters).
+	if parallelWorkers != nil {
+		tbl.ParallelWorkers = *parallelWorkers
+		tbl.ParallelWorkersSet = true
+	}
+	if fillfactor != nil {
+		tbl.Fillfactor = *fillfactor
+	}
+	if autovacEnabled != nil {
+		tbl.AutovacuumEnabled = *autovacEnabled
+		tbl.AutovacuumEnabledSet = true
+	}
+	if toastTupleTarget != nil {
+		tbl.ToastTupleTarget = *toastTupleTarget
+	}
+	return nil
+}
+
+// execAlterTableResetReloptions applies an `ALTER TABLE … RESET (param, …)`
+// clause, clearing each named storage parameter back to its unset default on the
+// in-memory catalog table. Names goopg does not model are ignored. M0118-0001.
+func (o *ddlOp) execAlterTableResetReloptions(tbl *catalog.Table, act parser.AlterTableAction) {
+	for k := range act.With {
+		switch strings.ToLower(k) {
+		case "parallel_workers":
+			tbl.ParallelWorkers = 0
+			tbl.ParallelWorkersSet = false
+		case "fillfactor":
+			tbl.Fillfactor = 0
+		case "autovacuum_enabled":
+			tbl.AutovacuumEnabled = false
+			tbl.AutovacuumEnabledSet = false
+		case "toast_tuple_target":
+			tbl.ToastTupleTarget = 0
+		}
+	}
 }
 
 func (o *ddlOp) execAlterTableAddColumn(stmt *parser.AlterTableStmt, tbl *catalog.Table, act parser.AlterTableAction) error {
@@ -6303,12 +6703,24 @@ func encodeBTreeKeyForColumn(v Datum, col *catalog.Column, pos int) ([]byte, *Ex
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a string at runtime", col.Name)}
 		}
 		return btree.EncodeChar([]byte(v.StringValue())), nil
-	case isTimestampType(col.Type.Name):
+	case isTimestampType(col.Type.Name) || isTimestamptzType(col.Type.Name):
+		// timestamp and timestamptz share the int64-micros-since-epoch on-disk
+		// form, so both encode via EncodeTimestamp. M0118-0001.
 		if v.Kind != KindTime {
 			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a timestamp at runtime", col.Name)}
 		}
 		micros := v.TimeValue().Sub(pgEpoch).Microseconds()
 		return btree.EncodeTimestamp(micros), nil
+	case isDateType(col.Type.Name):
+		// date stored as int32 days since the PG epoch (2000-01-01); encode via
+		// the order-preserving int4 path. Mirrors the codec date encoding so a
+		// probe key built from a DATE literal matches the backfilled row. M0118-0001.
+		if v.Kind != KindTime {
+			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is not a date at runtime", col.Name)}
+		}
+		micros := v.TimeValue().UnixMicro() - pgEpochUnixMicros
+		days := int32(micros / (24 * 3600 * 1000000))
+		return btree.EncodeInt4(days), nil
 	case strings.ToLower(col.Type.Name) == "uuid":
 		// uuid stored as canonical lowercase-dashes text; sort order matches byte order.
 		if v.Kind != KindString {
@@ -6474,6 +6886,27 @@ func isTimestampType(name string) bool {
 	}
 }
 
+// isDateType returns true for the date type accepted by B-tree key encoding.
+// A date is stored as int32 days since the PG epoch (2000-01-01), so the key
+// is encoded order-preservingly via the int4 path. M0118-0001.
+func isDateType(name string) bool {
+	return strings.ToLower(name) == "date"
+}
+
+// isTimestamptzType returns true for the timestamp-with-time-zone type accepted
+// by B-tree key encoding. PG stores timestamptz as int64 microseconds since the
+// epoch (2000-01-01) normalized to UTC — byte-for-byte the same on-disk form as
+// timestamp without time zone — so it reuses the timestamp key path
+// (EncodeTimestamp). M0118-0001 (classroom-scheduling).
+func isTimestamptzType(name string) bool {
+	switch strings.ToLower(name) {
+	case "timestamptz", "timestamp with time zone":
+		return true
+	default:
+		return false
+	}
+}
+
 // isFloat8Type returns true for float8 / float4 / real / double precision.
 func isFloat8Type(name string) bool {
 	switch strings.ToLower(name) {
@@ -6502,7 +6935,8 @@ func isSupportedBTreeKeyType(name string) bool {
 	}
 	return isInt4Type(name) || isInt8Type(name) || isNumericType(name) ||
 		isVarcharType(name) || isCharType(name) || isTimestampType(name) ||
-		isFloat8Type(name) || strings.ToLower(name) == "uuid"
+		isTimestamptzType(name) || isDateType(name) || isFloat8Type(name) ||
+		strings.ToLower(name) == "uuid"
 }
 
 func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
@@ -9134,6 +9568,16 @@ func (o *ddlOp) execRefreshMatView(s *parser.RefreshMatViewStmt) error {
 	}
 	// Truncate existing data (stamp xmax on all rows).
 	rel := o.ctx.Catalog.RelFileNode(tbl)
+	// SSI: REFRESH logically mass-deletes and rewrites the entire matview heap,
+	// so under SERIALIZABLE it must record an rw-conflict in from every
+	// transaction holding a predicate lock on the matview — the writer-side edge
+	// the matview-write-skew spec needs (s2 reads the matview, s1 refreshes it).
+	// Mirrors upstream CheckTableForSerializableConflictIn for TRUNCATE/DROP.
+	// Run before the heap mutation so a doomed-writer abort leaves nothing
+	// half-written. M0118-0001.
+	if serr := ssiRecordTableWrite(o.ctx, rel); serr != nil {
+		return serr
+	}
 	if err := truncateRelation(o.ctx, rel); err != nil {
 		return err
 	}
@@ -11475,6 +11919,15 @@ func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
 // (a) for views: all tables/views referenced by the view's body;
 // (b) for tables: all inheritance children.
 // This mirrors PostgreSQL's behaviour for LOCK TABLE. M0097.
+//
+// NB: this records locks in the in-memory registry (pg_locks visibility)
+// only — it does NOT yet acquire real heavyweight locks via the lock
+// manager, so a conflicting LOCK TABLE in another session does not block.
+// Real transaction-scoped table locking is deferred (see the lock-nowait
+// resume point in .ralph/deferral_ledger.md): the lockmgr early-grant
+// primitive it needs has landed (M0118-0003), but lockmgr locks are
+// currently statement-scoped (released per Query message in dispatch.go)
+// whereas LOCK TABLE must hold until COMMIT.
 func lockRelationTransitively(sess Session, dbOID uint32, mode string, tbl *catalog.Table, cat catalog.Catalog, visited map[uint32]bool) {
 	if visited[tbl.OID] {
 		return

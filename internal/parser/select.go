@@ -278,82 +278,8 @@ func (p *parser) parseSelect() (Stmt, error) {
 		}
 		s.OrderBy = ob
 	}
-	if p.acceptKeyword(KwLimit) {
-		e, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		s.Limit = e
-	}
-	if p.acceptKeyword(KwOffset) {
-		e, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		s.Offset = e
-		// Optional `{ROW | ROWS}` trailer per SQL standard.
-		// Both are no-ops for v0 — OFFSET applies the same way.
-		p.acceptIdentKeyword("row", "rows")
-		// SQL allows OFFSET to precede LIMIT (e.g. `ORDER BY x OFFSET 10 LIMIT 5`).
-		// If no LIMIT was parsed before the OFFSET, check for one now.
-		if s.Limit == nil {
-			if p.acceptKeyword(KwLimit) {
-				lim, lerr := p.parseExpr()
-				if lerr != nil {
-					return nil, lerr
-				}
-				s.Limit = lim
-			}
-		}
-	}
-	// SQL-standard `FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY`
-	// is accepted as a synonym for `LIMIT n`. Upstream allows it
-	// after both LIMIT and OFFSET; v0 treats it as an alternative
-	// to LIMIT — combining FETCH and LIMIT in the same SELECT is
-	// an error.
-	if p.acceptIdentKeyword("fetch") {
-		if !p.acceptIdentKeyword("first", "next") {
-			return nil, p.errAtCur("expected FIRST or NEXT after FETCH")
-		}
-		// Count is optional — `FETCH FIRST ROW ONLY` defaults to 1.
-		var count Expr
-		if !(p.cur().Kind == TokenIdent && (strings.EqualFold(p.cur().Value, "row") || strings.EqualFold(p.cur().Value, "rows"))) {
-			e, err := p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
-			count = e
-		} else {
-			count = &IntegerConst{pos: p.cur().Pos, Value: 1}
-		}
-		if !p.acceptIdentKeyword("row", "rows") {
-			return nil, p.errAtCur("expected ROW or ROWS after FETCH count")
-		}
-		if p.acceptIdentKeyword("only") {
-			// FETCH FIRST n ROWS ONLY — standard SQL limit.
-		} else if p.acceptKeyword(KwWith) {
-			// FETCH FIRST n ROWS WITH TIES — include rows that tie with the n-th row. M0097-0042.
-			if !p.acceptIdentKeyword("ties") {
-				return nil, p.errAtCur("expected TIES after WITH in FETCH … WITH TIES")
-			}
-			s.WithTies = true
-		} else {
-			return nil, p.errAtCur("expected ONLY or WITH TIES after FETCH … ROW(S)")
-		}
-		if s.Limit != nil {
-			return nil, p.errAtCur("LIMIT and FETCH FIRST cannot both be specified")
-		}
-		s.Limit = count
-		// SQL standard also allows OFFSET to follow FETCH FIRST … ONLY/WITH TIES.
-		// E.g. `ORDER BY x FETCH FIRST 5 ROWS WITH TIES OFFSET 10`. M0097-0042.
-		if s.Offset == nil && p.acceptKeyword(KwOffset) {
-			e, err := p.parseExpr()
-			if err != nil {
-				return nil, err
-			}
-			s.Offset = e
-			p.acceptIdentKeyword("row", "rows")
-		}
+	if err := p.parseSelectLimitClauses(s); err != nil {
+		return nil, err
 	}
 	if setOp, ok, err := p.parseSetOpClause(); err != nil {
 		return nil, err
@@ -400,6 +326,16 @@ func (p *parser) parseSelect() (Stmt, error) {
 			return nil, err
 		}
 		s.Locking = append(s.Locking, lc)
+	}
+	// PostgreSQL's grammar permits select_limit to FOLLOW the
+	// for_locking_clause as well: `… ORDER BY id FOR UPDATE [SKIP LOCKED |
+	// NOWAIT] LIMIT n` (used by the upstream skip-locked / nowait isolation
+	// specs). Accept a trailing select_limit when a locking clause was parsed
+	// and no LIMIT/OFFSET/FETCH preceded it. M0118-0003.
+	if len(s.Locking) > 0 && s.Limit == nil && s.Offset == nil {
+		if err := p.parseSelectLimitClauses(s); err != nil {
+			return nil, err
+		}
 	}
 	if err := RewriteIndirectionStarTargets(s, nil); err != nil {
 		return nil, err
@@ -529,6 +465,93 @@ func isParserAggregateName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// parseSelectLimitClauses parses the optional select_limit tail —
+// `[LIMIT n] [OFFSET n [ROW|ROWS]] [LIMIT n]` plus the SQL-standard
+// `FETCH {FIRST|NEXT} [n] {ROW|ROWS} {ONLY | WITH TIES}` synonym — into s.
+// PostgreSQL's grammar (gram.y select_no_parens) permits this select_limit
+// either before OR after a for_locking_clause, so parseSelect invokes it at
+// both sites. Combining FETCH and LIMIT in one SELECT is an error.
+func (p *parser) parseSelectLimitClauses(s *SelectStmt) error {
+	if p.acceptKeyword(KwLimit) {
+		e, err := p.parseExpr()
+		if err != nil {
+			return err
+		}
+		s.Limit = e
+	}
+	if p.acceptKeyword(KwOffset) {
+		e, err := p.parseExpr()
+		if err != nil {
+			return err
+		}
+		s.Offset = e
+		// Optional `{ROW | ROWS}` trailer per SQL standard.
+		// Both are no-ops for v0 — OFFSET applies the same way.
+		p.acceptIdentKeyword("row", "rows")
+		// SQL allows OFFSET to precede LIMIT (e.g. `ORDER BY x OFFSET 10 LIMIT 5`).
+		// If no LIMIT was parsed before the OFFSET, check for one now.
+		if s.Limit == nil {
+			if p.acceptKeyword(KwLimit) {
+				lim, lerr := p.parseExpr()
+				if lerr != nil {
+					return lerr
+				}
+				s.Limit = lim
+			}
+		}
+	}
+	// SQL-standard `FETCH {FIRST | NEXT} [n] {ROW | ROWS} ONLY`
+	// is accepted as a synonym for `LIMIT n`. Upstream allows it
+	// after both LIMIT and OFFSET; v0 treats it as an alternative
+	// to LIMIT — combining FETCH and LIMIT in the same SELECT is
+	// an error.
+	if p.acceptIdentKeyword("fetch") {
+		if !p.acceptIdentKeyword("first", "next") {
+			return p.errAtCur("expected FIRST or NEXT after FETCH")
+		}
+		// Count is optional — `FETCH FIRST ROW ONLY` defaults to 1.
+		var count Expr
+		if !(p.cur().Kind == TokenIdent && (strings.EqualFold(p.cur().Value, "row") || strings.EqualFold(p.cur().Value, "rows"))) {
+			e, err := p.parseExpr()
+			if err != nil {
+				return err
+			}
+			count = e
+		} else {
+			count = &IntegerConst{pos: p.cur().Pos, Value: 1}
+		}
+		if !p.acceptIdentKeyword("row", "rows") {
+			return p.errAtCur("expected ROW or ROWS after FETCH count")
+		}
+		if p.acceptIdentKeyword("only") {
+			// FETCH FIRST n ROWS ONLY — standard SQL limit.
+		} else if p.acceptKeyword(KwWith) {
+			// FETCH FIRST n ROWS WITH TIES — include rows that tie with the n-th row. M0097-0042.
+			if !p.acceptIdentKeyword("ties") {
+				return p.errAtCur("expected TIES after WITH in FETCH … WITH TIES")
+			}
+			s.WithTies = true
+		} else {
+			return p.errAtCur("expected ONLY or WITH TIES after FETCH … ROW(S)")
+		}
+		if s.Limit != nil {
+			return p.errAtCur("LIMIT and FETCH FIRST cannot both be specified")
+		}
+		s.Limit = count
+		// SQL standard also allows OFFSET to follow FETCH FIRST … ONLY/WITH TIES.
+		// E.g. `ORDER BY x FETCH FIRST 5 ROWS WITH TIES OFFSET 10`. M0097-0042.
+		if s.Offset == nil && p.acceptKeyword(KwOffset) {
+			e, err := p.parseExpr()
+			if err != nil {
+				return err
+			}
+			s.Offset = e
+			p.acceptIdentKeyword("row", "rows")
+		}
+	}
+	return nil
 }
 
 // parseLockingClause parses one `FOR { UPDATE | SHARE | NO KEY UPDATE |

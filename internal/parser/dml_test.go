@@ -49,6 +49,73 @@ func TestParseInsertNoColumnsMultipleRows(t *testing.T) {
 	}
 }
 
+// TestParseInsertParenthesisedSelectSource: `INSERT INTO t (SELECT …)` — a
+// fully parenthesised query source. The leading '(' is NOT a column list
+// (PostgreSQL's insert_rest allows a parenthesised SelectStmt as the source).
+// Pins the disambiguation added for the partial-index isolation spec, whose
+// setup uses `insert into test_t (select generate_series(0, 10000), 'a', 2)`.
+func TestParseInsertParenthesisedSelectSource(t *testing.T) {
+	stmts, err := Parse("INSERT INTO test_t (select generate_series(0, 10000), 'a', 2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins, ok := stmts[0].(*InsertStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if ins.Columns != nil {
+		t.Errorf("Columns=%+v want nil (the '(' opens a query, not a column list)", ins.Columns)
+	}
+	if ins.Rows != nil {
+		t.Errorf("Rows=%+v want nil", ins.Rows)
+	}
+	if ins.Select == nil {
+		t.Fatalf("Select=nil want a SelectStmt source")
+	}
+	if !ins.Select.Parenthesized {
+		t.Errorf("Select.Parenthesized=false want true")
+	}
+	if len(ins.Select.Targets) != 3 {
+		t.Errorf("Select.Targets=%d want 3", len(ins.Select.Targets))
+	}
+}
+
+// TestParseInsertColumnListThenParenthesisedSelect: a column list followed by
+// a parenthesised query source, e.g. `INSERT INTO t (a, b) (SELECT …)`. Both
+// the explicit column list and the parenthesised SELECT must be recognised.
+func TestParseInsertColumnListThenParenthesisedSelect(t *testing.T) {
+	stmts, err := Parse("INSERT INTO t (a, b) (SELECT x, y FROM s)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins := stmts[0].(*InsertStmt)
+	if len(ins.Columns) != 2 || ins.Columns[0] != "a" || ins.Columns[1] != "b" {
+		t.Errorf("Columns=%+v want [a b]", ins.Columns)
+	}
+	if ins.Select == nil || !ins.Select.Parenthesized {
+		t.Fatalf("Select=%+v want a parenthesised SelectStmt", ins.Select)
+	}
+}
+
+// TestParseInsertPlainSelectSourceUnchanged: the non-parenthesised
+// `INSERT INTO t SELECT …` form must keep working after the disambiguation.
+func TestParseInsertPlainSelectSourceUnchanged(t *testing.T) {
+	stmts, err := Parse("INSERT INTO t SELECT a, b FROM s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ins := stmts[0].(*InsertStmt)
+	if ins.Columns != nil {
+		t.Errorf("Columns=%+v want nil", ins.Columns)
+	}
+	if ins.Select == nil {
+		t.Fatalf("Select=nil want a SelectStmt source")
+	}
+	if ins.Select.Parenthesized {
+		t.Errorf("Select.Parenthesized=true want false (no enclosing parens)")
+	}
+}
+
 // TestParseInsertReturning verifies RETURNING reuses the SELECT target
 // list shape (so RETURNING * works too).
 func TestParseInsertReturning(t *testing.T) {
@@ -184,7 +251,6 @@ func TestParseDMLSyntaxErrors(t *testing.T) {
 	}
 }
 
-
 // TestParseInsertValuesAcceptsDefaultKeyword: rung 15 — VALUES rows
 // accept the bare DEFAULT keyword. The cell becomes a *DefaultMarker
 // AST node; planInsert substitutes the column's catalog DefaultExpr
@@ -241,7 +307,6 @@ func TestParseInsertValuesRejectsBareDefaultInExpression(t *testing.T) {
 	}
 }
 
-
 // TestParseUpdateSetDefaultKeyword: rung 16 — the bare DEFAULT keyword
 // is accepted on the RHS of an UPDATE SET assignment and parsed as a
 // *DefaultMarker sentinel. Plan() substitutes the marker with the
@@ -297,7 +362,6 @@ func TestParseUpdateSetRejectsBareDefaultInExpression(t *testing.T) {
 		t.Fatal("expected syntax error, got nil")
 	}
 }
-
 
 // TestParseInsertDefaultValues: rung 17 — `INSERT INTO t DEFAULT VALUES`
 // parses as an InsertStmt with DefaultValues=true, empty Rows, and no

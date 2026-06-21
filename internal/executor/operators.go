@@ -414,6 +414,17 @@ type sortOp struct {
 	rows []Row
 	idx  int
 
+	// ctids carries the per-row TID side-channel (hasCTID / ctidBlock /
+	// ctidOff) in lockstep with rows so a parent LockRows can stamp row locks
+	// on `ORDER BY ... FOR UPDATE` queries (PG plans `LockRows → Sort`, with
+	// ctid as a resjunk column the sort preserves). Only the fully in-memory
+	// path preserves it: once the sort spills, ctidsDisabled is set and ctids
+	// is dropped — the N-way merge can't carry it. That is rare for row-locking
+	// queries and no worse than the prior behaviour (Sort lost the TID
+	// entirely). M0118-0003.
+	ctids         []sortCTID
+	ctidsDisabled bool
+
 	// External-sort state. Populated only when at least one spill
 	// has occurred during Open().
 	spillFiles []string
@@ -421,6 +432,14 @@ type sortOp struct {
 	mergeReady bool
 
 	sortErr error
+}
+
+// sortCTID is the compact per-row TID side-channel carried through the
+// in-memory sort (see sortOp.ctids).
+type sortCTID struct {
+	block uint32
+	off   uint16
+	has   bool
 }
 
 func newSortOp(plan *planner.Sort, child Operator) *sortOp {
@@ -470,8 +489,12 @@ func (o *sortOp) Open(ctx *Context) error {
 		// across many Next() calls, so the slot's lifetime
 		// contract requires us to take ownership of an
 		// independent row. (M0071-0010 Stage B.)
-		row := slot.Materialize().Row()
+		ms := slot.Materialize()
+		row := ms.Row()
 		o.rows = append(o.rows, row)
+		if !o.ctidsDisabled {
+			o.ctids = append(o.ctids, sortCTID{block: ms.ctidBlock, off: ms.ctidOff, has: ms.hasCTID})
+		}
 		chunkBytes += estimatedRowBytes(row)
 		pulled++
 		if chunkBytes >= limit {
@@ -479,11 +502,16 @@ func (o *sortOp) Open(ctx *Context) error {
 				return err
 			}
 			o.rows = o.rows[:0]
+			// Spilling drops the TID side-channel: the N-way merge over spill
+			// files reconstructs rows without ctids. Disable it permanently so
+			// the in-memory Next() path doesn't emit stale/misaligned TIDs.
+			o.ctidsDisabled = true
+			o.ctids = nil
 			chunkBytes = 0
 		}
 	}
-	// Sort the final in-memory tail.
-	o.sortChunk(o.rows)
+	// Sort the final in-memory tail, keeping ctids in lockstep.
+	o.sortTailWithCTIDs()
 	if o.sortErr != nil {
 		return o.sortErr
 	}
@@ -496,6 +524,35 @@ func (o *sortOp) sortChunk(rows []Row) {
 	sort.SliceStable(rows, func(i, j int) bool {
 		return o.lessRows(rows[i], rows[j])
 	})
+}
+
+// sortTailWithCTIDs sorts the final in-memory tail (o.rows). When the TID
+// side-channel is live (no spill occurred), it reorders o.ctids in lockstep
+// with o.rows via a permutation so each emitted row keeps its own ctid.
+// Falls back to the plain row sort when ctids are disabled/absent.
+func (o *sortOp) sortTailWithCTIDs() {
+	if o.ctidsDisabled || len(o.ctids) != len(o.rows) {
+		o.sortChunk(o.rows)
+		return
+	}
+	perm := make([]int, len(o.rows))
+	for i := range perm {
+		perm[i] = i
+	}
+	sort.SliceStable(perm, func(i, j int) bool {
+		return o.lessRows(o.rows[perm[i]], o.rows[perm[j]])
+	})
+	if o.sortErr != nil {
+		return
+	}
+	newRows := make([]Row, len(o.rows))
+	newCtids := make([]sortCTID, len(o.ctids))
+	for i, p := range perm {
+		newRows[i] = o.rows[p]
+		newCtids[i] = o.ctids[p]
+	}
+	o.rows = newRows
+	o.ctids = newCtids
 }
 
 // lessRows returns true iff a should sort before b under the
@@ -572,6 +629,7 @@ func (o *sortOp) flushChunk() error {
 func (o *sortOp) Schema() planner.Schema { return o.child.Schema() }
 func (o *sortOp) Close() error {
 	o.rows = nil
+	o.ctids = nil
 	o.idx = 0
 	o.ctx = nil
 	if o.heap != nil {
@@ -596,8 +654,16 @@ func (o *sortOp) Next() (TupleSlot, error) {
 			return nil, EOF
 		}
 		row := o.rows[o.idx]
+		slot := SlotFromRow(o.Schema(), row)
+		// Re-attach the per-row TID side-channel so a parent LockRows can stamp
+		// row locks (ORDER BY ... FOR UPDATE). M0118-0003.
+		if !o.ctidsDisabled && o.idx < len(o.ctids) && o.ctids[o.idx].has {
+			slot.hasCTID = true
+			slot.ctidBlock = o.ctids[o.idx].block
+			slot.ctidOff = o.ctids[o.idx].off
+		}
 		o.idx++
-		return asSlot(o.Schema(), row), nil
+		return slot, nil
 	}
 	if !o.mergeReady {
 		if err := o.initMerge(); err != nil {
