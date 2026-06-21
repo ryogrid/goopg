@@ -845,6 +845,148 @@ func TestForShareFormsLockOnlyMultiXact(t *testing.T) {
 	}
 }
 
+// TestForShareJoinsInProgressUpdaterFormsMultiXact pins the updater-bearing
+// MultiXact producer (M0118-0003): branch (a) of stampLockInner. A FOR SHARE
+// lock arriving on a row whose xmax is another transaction's in-progress no-key
+// UPDATE must combine BOTH holders into a single updater-bearing MultiXactId
+// (HEAP_XMAX_LOCK_ONLY clear, GetUpdateXid resolving to the updater) rather than
+// silently dropping the lock (the pre-M0118 skip). This is the twin of
+// TestForShareFormsLockOnlyMultiXact for the non-lock-only case.
+func TestForShareJoinsInProgressUpdaterFormsMultiXact(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+	store := multixact.NewStore()
+	mkSession := func(b lockmgr.BackendID) *Context {
+		tx, _ := ctx.TxnMgr.Begin(0)
+		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
+		s := makeCtx(lm, b)
+		s.Pool = ctx.Pool
+		s.Catalog = ctx.Catalog
+		s.TxnMgr = ctx.TxnMgr
+		s.MultiXact = store
+		s.Tx = tx
+		s.Snap = snap
+		return s
+	}
+
+	// Session A: a no-key UPDATE on id=1 (label is unindexed → HEAP_KEYS_UPDATED
+	// stays clear). Leaves the old version's xmax = sA, non-lock-only, with sA
+	// still in progress. Release sA's statement-scoped lockmgr locks so sB's FOR
+	// SHARE reaches the heap-xmax branch (a) instead of blocking at the lockmgr —
+	// the same release dispatch.go performs at each Query message's end.
+	sA := mkSession(1)
+	defer ctx.TxnMgr.Rollback(sA.Tx)
+	if _, err := runForUpdate(t, sA, "UPDATE items SET label = 'zzz' WHERE id = 1"); err != nil {
+		t.Fatalf("session-A no-key UPDATE: %v", err)
+	}
+	if sA.Tx.XID == storage.InvalidTransactionID {
+		t.Fatal("session-A UPDATE did not materialise a real XID")
+	}
+	lm.ReleaseAll(1)
+
+	// Session B: FOR SHARE on id=1. Under READ COMMITTED sB still sees the old
+	// version (sA uncommitted) and locks it → branch (a) forms the multi.
+	sB := mkSession(2)
+	defer ctx.TxnMgr.Rollback(sB.Tx)
+	if _, err := runForUpdate(t, sB, "SELECT id FROM items WHERE id = 1 FOR SHARE"); err != nil {
+		t.Fatalf("session-B FOR SHARE: %v", err)
+	}
+
+	// The old version's xmax is now an updater-bearing MultiXactId: IS_MULTI set,
+	// LOCK_ONLY clear, naming both the updater (sA) and the locker (sB).
+	_, hdr := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return storage.IsHeapTupleXmaxMulti(h.Infomask) && !storage.IsHeapTupleLockOnly(h.Infomask)
+	})
+	if !storage.IsHeapTupleXmaxMulti(hdr.Infomask) {
+		t.Fatal("no tuple carries an updater-bearing MultiXactId xmax after FOR SHARE met an in-progress updater")
+	}
+	if storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		t.Errorf("updater-bearing multi must NOT be lock-only (Infomask=%#x)", hdr.Infomask)
+	}
+	members, ok := store.Members(multixact.MultiXactId(hdr.Xmax))
+	if !ok {
+		t.Fatalf("store has no members for multi %d", hdr.Xmax)
+	}
+	if len(members) != 2 {
+		t.Fatalf("multi has %d members, want 2: %+v", len(members), members)
+	}
+	byXid := map[storage.TransactionID]multixact.Status{}
+	for _, m := range members {
+		byXid[m.Xid] = m.Status
+	}
+	if st, ok := byXid[sA.Tx.XID]; !ok || st != multixact.StatusNoKeyUpdate {
+		t.Errorf("updater sA (xid=%d) member missing/wrong status=%v members=%+v", sA.Tx.XID, st, members)
+	}
+	if st, ok := byXid[sB.Tx.XID]; !ok || st != multixact.StatusForShare {
+		t.Errorf("locker sB (xid=%d) member missing/wrong status=%v members=%+v", sB.Tx.XID, st, members)
+	}
+	if upd, has := multixact.GetUpdateXid(members); !has || upd != sA.Tx.XID {
+		t.Errorf("GetUpdateXid = (%d, %v), want (%d, true)", upd, has, sA.Tx.XID)
+	}
+}
+
+// TestForShareSkipsAbortedUpdaterNoMultiXact is the negative twin: when the
+// foreign updater has ABORTED, the producer's MultiXactIdExpand-style survivor
+// filter drops it (an aborted updater leaves no live holder), so no multi is
+// formed — the M0118-0003 skip is preserved. Guards the survivor filter's
+// aborted-updater drop in stampMultiUpdaterLock.
+func TestForShareSkipsAbortedUpdaterNoMultiXact(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+	store := multixact.NewStore()
+	mkSession := func(b lockmgr.BackendID) *Context {
+		tx, _ := ctx.TxnMgr.Begin(0)
+		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
+		s := makeCtx(lm, b)
+		s.Pool = ctx.Pool
+		s.Catalog = ctx.Catalog
+		s.TxnMgr = ctx.TxnMgr
+		s.MultiXact = store
+		s.Tx = tx
+		s.Snap = snap
+		return s
+	}
+
+	// Session A: no-key UPDATE on id=1, then ABORT. The old version keeps xmax =
+	// sA, but sA is now in the aborted set.
+	sA := mkSession(1)
+	if _, err := runForUpdate(t, sA, "UPDATE items SET label = 'zzz' WHERE id = 1"); err != nil {
+		t.Fatalf("session-A no-key UPDATE: %v", err)
+	}
+	lm.ReleaseAll(1)
+	if err := ctx.TxnMgr.Rollback(sA.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Session B: FOR SHARE on id=1 reaches branch (a) (xmax = aborted sA, non-
+	// lock-only) but the survivor filter drops the aborted updater → no multi.
+	sB := mkSession(2)
+	defer ctx.TxnMgr.Rollback(sB.Tx)
+	if _, err := runForUpdate(t, sB, "SELECT id FROM items WHERE id = 1 FOR SHARE"); err != nil {
+		t.Fatalf("session-B FOR SHARE: %v", err)
+	}
+	slot, _ := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return storage.IsHeapTupleXmaxMulti(h.Infomask) && !storage.IsHeapTupleLockOnly(h.Infomask)
+	})
+	if slot != 0 {
+		t.Errorf("an updater-bearing multi was formed for an aborted updater (slot=%d) — survivor filter failed", slot)
+	}
+}
+
 // TestLockRowsSkipLockedNoContention — SKIP LOCKED is now honored
 // (M0118-0003). With no concurrent locker there is nothing to skip,
 // so `FOR UPDATE SKIP LOCKED` must succeed and return every row, just

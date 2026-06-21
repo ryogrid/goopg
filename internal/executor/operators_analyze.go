@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -153,14 +154,16 @@ func analyzeRelationCtx(ctx *Context, tbl *catalog.Table) (*catalog.TableStats, 
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
-	return analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, target, rand.New(rand.NewSource(seed)))
+	return analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, target, rand.New(rand.NewSource(seed)), ctx.MultiXact)
 }
 
 // analyzeRelation is kept as a thin wrapper for tests that don't
 // thread a Context — it uses the upstream-default stats target
 // and a wall-clock-seeded sampler.
 func analyzeRelation(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog, tbl *catalog.Table) (*catalog.TableStats, error) {
-	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(time.Now().UnixNano())))
+	// nil store: analyzeRelation is the test-only convenience wrapper with no
+	// executor.Context (hence no MultiXact) in scope. M0118-0003.
+	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(time.Now().UnixNano())), nil)
 }
 
 // analyzeRelationWith walks every block of tbl under a fresh
@@ -168,7 +171,7 @@ func analyzeRelation(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog,
 // reservoir-samples them with `targrows = target *
 // upstreamSampleMultiplier`, and computes per-table + per-column
 // statistics from the sample (RowCount and Pages remain exact).
-func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog, tbl *catalog.Table, target int, rng *rand.Rand) (*catalog.TableStats, error) {
+func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog, tbl *catalog.Table, target int, rng *rand.Rand, mxs *multixact.Store) (*catalog.TableStats, error) {
 	rel := cat.RelFileNode(tbl)
 
 	tx, err := mgr.Begin(mvcc.IsolationReadCommitted)
@@ -222,12 +225,12 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 				pool.Unpin(slot)
 				return nil, perr
 			}
-			// nil MultiXact store: this stats-sampling scan has no store in
-			// scope (analyzeRelationWith takes raw pool/mgr). Until the
-			// updater-bearing multixact producer lands no tuple carries a
-			// non-lock-only multi xmax, so the multi branch is unreachable;
-			// the producer slice will thread the real store here.
-			if !mvcc.TupleVisible(t.Header, snap, tx.XID, nil) {
+			// MultiXact store threaded from the caller (ctx.MultiXact for the
+			// live SQL ANALYZE path; nil for the test-only analyzeRelation
+			// wrapper). Resolves an updater-bearing multi xmax to its updater
+			// before judging visibility — a stats-sampling scan must not
+			// undercount a live, only-row-locked tuple as invisible. M0118-0003.
+			if !mvcc.TupleVisible(t.Header, snap, tx.XID, mxs) {
 				continue
 			}
 			// Decode the PG-physical tuple body using the header (natts +

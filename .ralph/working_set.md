@@ -1,54 +1,53 @@
-Task: M0118-0003 multixact — LANDED the two REMAINING wait-on-deleter consumers +
-the stampAtPtr recheck. The producer gate ([[pattern_sibling_paths_must_agree]]) is
-now SATISFIED — the updater-bearing producer can land next.
+Task: M0118-0003 multixact — LANDED the updater-bearing MultiXact PRODUCER
+(stampLockInner branch (a)). This was the final ⛔ resume-point #2 item; the
+producer gate is now fully closed end-to-end (producer + every consumer wired).
 
-DONE this loop (#49), committed:
-- Two shared package-level resolvers in operators_storage.go (next to
-  isConcurrentlyUpdated; file already imports multixact/mvcc so no new import in
-  operators_upsert.go):
-  - `multixactUpdaterXID(mxs, xmax)` → updater member xid or Invalid (nil store /
-    unknown multi / lockers-only).
-  - `multixactFirstActiveMember(mxs, txnMgr, self, xmax)` → first active non-self
-    member xid or Invalid (wait on ONE live holder; re-probe drains the rest).
-- `scanRelForFKMatch` (operators_fk.go): updater-bearing multi → resolve effXmax,
-  record the real updater xid in fkPendingRef (WaitForXID/HasAborted/epqChain see a
-  real xid); all-locker/unresolvable → clean match (lockers don't delete the parent).
-- `findInProgressConflictKey` (operators_upsert.go): Case 2 resolves updater for a
-  non-lock-only multi; Case 3 now handles a lock-only MULTI via
-  multixactFirstActiveMember (already reachable today via the live lock-only producer).
-- `stampAtPtr` (operators_lockrows.go): refactored the "another real updater arrived"
-  recheck into `anotherRealUpdaterArrived(h)` which resolves the updater member for an
-  updater-bearing multi (byte-identical for all currently-producible states).
-- Tests: TestMultixactUpdaterXIDHelper + TestMultixactFirstActiveMemberHelper
-  (concurrent_update_xmax_test.go; latter uses AssignXID to materialise active XIDs —
-  beginTxn assigns XID lazily so t.XID==0).
-- Design 0118-0002: new §"slice 2 (continued, 4)" + flipped "Producer gate: NOW
-  SATISFIED"; resume-point list ⛔→✅ for the 3 consumers; README index status+body.
+DONE this loop (#50), committed:
+- `stampMultiUpdaterLock` (operators_lockrows.go): the updater-bearing twin of
+  stampMultiLock. Branch (a) (FOR SHARE/KEY SHARE meets a non-lock-only no-key
+  updater) no longer skips — it combines our share locker + the updater into a
+  **non**-lock-only MultiXactId. Survivor filter mirrors MultiXactIdExpand: keep
+  in-progress holders + a COMMITTED updater (committed ≡ !IsXIDActive &&
+  !HasAbortedXID), drop dead lockers / aborted updater; no survivor → preserve
+  the M0100-0005f skip. Helper `updaterMemberStatus(keysUpdated)` decodes the
+  single-xid updater's status. Our member = lockMemberStatus() (StatusForShare;
+  4-way distinction deferred — HintBits unaffected, updater dominates).
+- Threaded the REAL *multixact.Store through the last two nil read consumers:
+  executor `analyzeRelationWith` (ctx.MultiXact; analyzeRelation test-wrapper
+  passes nil) and `vacuum.Analyze` (new param; autovacuum Launcher.MultiXact
+  field — launcher is test-only in prod, so nil there is harmless).
+- Tests (operators_lockrows_test.go): TestForShareJoinsInProgressUpdaterForms
+  MultiXact (forms {updater@NoKeyUpdate, locker@ForShare}, GetUpdateXid=updater)
+  + TestForShareSkipsAbortedUpdaterNoMultiXact (aborted updater → no multi).
+- Design 0118-0002: status line; new "slice 3" section; resume #2 producer ⛔→✅.
+  README index: status col + body slice-3 paragraph + deferred renumber.
 
-GATES this loop: go build ./... OK; go vet ./internal/executor OK; full
-`go test ./internal/executor` PASS; `-race` FK/Upsert/Conflict/Concurrent/Multixact/
-LockRows subset PASS; 9 dedicated row-lock isolation specs PASS (LockCommittedUpdate/
-Keyupdate, MergeUpdate, MergeInsertUpdate, PredicateLockHotTuple, SkipLocked, Nowait,
-Nowait3, UpdateLockedTuple). gofmt: 3 files flagged but ALL pre-existing go1.25/1.26
-skew (verified via git stash baseline) — do NOT gofmt -w. ralph-state-guard: run before
-status. Stage ONLY code/doc/.ralph files; do NOT git add stray `postgres`, weekly_loc.*,
-requirements.txt.
+GATES this loop (all PASS): go build ./...; go vet executor/vacuum/autovacuum;
+full `go test ./internal/executor`; affected pkgs (mvcc/multixact/vacuum/
+autovacuum/storage); btree (internal/access/btree); -race subset (executor row-
+lock/FK/upsert + mvcc + multixact); **9 dedicated isolation row-lock specs PASS**
+(LockCommittedUpdate/Keyupdate, MergeUpdate, MergeInsertUpdate, PredicateLockHot
+Tuple, SkipLocked, Nowait, Nowait3, UpdateLockedTuple) — producer is byte-
+identical to the prior skip for yielded rows, only ADDS the multixact record.
+gofmt: fixed one self-introduced double blank line; rest of tree is pre-existing
+go1.25/1.26 skew — do NOT gofmt -w. tpch-spotcheck INFRA-BLOCKED (SLRU backfill
+>60s); pgbench pre-commit hook is the live guard. Stage ONLY code/doc/.ralph;
+do NOT add stray `postgres`, weekly_loc.*, requirements.txt.
 
->>> NEXT STEP (the PRODUCER — now unblocked): stampLockInner branch (a) in
-    operators_lockrows.go (the non-key-update + FOR KEY SHARE skip path). Build
-    {updater@NoKeyUpdate (the in-progress xmax updater), locker@ForShare/ForKeyShare},
-    CreateFromMembers (keep in-progress holders + committed updater, drop dead lockers/
-    aborted updater per MultiXactIdExpand semantics), HintBits (NOT lock-only),
-    PageSetHeapTupleXmaxMulti. Thread the REAL Store through vacuum/analyze stats scans
-    (currently pass nil — see TupleVisible/TupleVisibleSubxact callers). HOT-PATH
-    WARNING: updater-bearing multis are NOT visibility-transparent — re-run
-    executor/storage/mvcc/btree + FULL isolation row-lock suite after the producer.
+>>> NEXT STEP: with the producer live, the MultiXact-cluster specs are the
+    payoff. Start by RUNNING (oracle-diff, not promoting yet) lock-update-
+    traversal / propagate-lock-delete / multixact-no-forget / aborted-keyrevoke
+    to measure the remaining gap. Most still need resume #3 (4-way FOR KEY SHARE
+    / FOR SHARE / FOR NO KEY UPDATE / FOR UPDATE member status — goopg collapses
+    to ShrLock/ExclLock; thread the distinction into lockStrength + member
+    status) and/or #4 (deadlock detection across the row-lock wait graph for
+    multixact-no-deadlock / tuplelock-upgrade-no-deadlock). Pick the spec whose
+    only blocker is the 4-way distinction and land #3 as the next slice.
 
-GOTCHAS: MultiXactId and TransactionID share the uint32 space; HEAP_XMAX_IS_MULTI is
-the ONLY disambiguator — never feed a raw multi to IsXIDActive/WaitForXID. The
-lock-only producer is ALREADY live (cbf5bf75), so lock-only multis exist NOW (Case 3
-fix was a real latent bug, not just future-proofing). multixact path only fires with
-≥2 concurrent row-lock holders (never pgbench/TPC-H); TPS blast radius nil. No producer
-emits non-lock-only multis yet, so the updater-bearing branches are behavior-identical
-for existing tuples. tpch-spotcheck INFRA-BLOCKED (startup SLRU backfill >60s); pgbench
-pre-commit smoke (hook) is the live commit guard.
+GOTCHAS: MultiXactId and TransactionID share uint32; HEAP_XMAX_IS_MULTI is the
+ONLY disambiguator. Producer only fires with a foreign no-key updater + our
+ShrLock (never pgbench/TPC-H) → TPS blast radius nil. Updater-bearing multis are
+NOT visibility-transparent — if you touch any xmax reader, re-run the row-lock
+isolation suite. WAL persistence of members still deferred (resume #4-was-now-2):
+lock-only + updater-bearing multis are in-memory only, lost on crash (correct for
+transient lock state; pg_multixact SLRU parity is the deferred work).

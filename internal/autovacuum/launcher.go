@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 	"github.com/goopg/goopg/internal/vacuum"
@@ -28,6 +29,12 @@ type Launcher struct {
 	// VM, when non-nil, gets ALL_VISIBLE bits set per page after
 	// autovacuum so index-only scans can skip heap fetches (M0046-0004).
 	VM *storage.VisibilityMap
+
+	// MultiXact is the process-shared MultiXact member store, passed to
+	// vacuum.Analyze so its live-row count resolves an updater-bearing multi
+	// xmax to its updater rather than undercounting an only-row-locked tuple.
+	// nil disables the multi path (single-holder behaviour). M0118-0003.
+	MultiXact *multixact.Store
 
 	// NapInterval is the time between launcher wakeups.
 	NapInterval time.Duration
@@ -158,7 +165,7 @@ func (l *Launcher) tick(ctx context.Context, log *slog.Logger) {
 		if last, ok := l.lastAnalyze[key]; !ok || now.Sub(last) >= l.MinAnalyzeAge {
 			if l.needsAnalyze(tbl) {
 				log.Info("autovacuum: running analyze", "table", key)
-				stats, err := vacuum.Analyze(l.Pool, l.TxnMgr, rel)
+				stats, err := vacuum.Analyze(l.Pool, l.TxnMgr, rel, l.MultiXact)
 				if err != nil {
 					log.Error("autovacuum: analyze failed", "table", key, "error", err)
 				} else {

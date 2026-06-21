@@ -1,9 +1,9 @@
 # MultiXact tuple-lock subsystem (engine-first slice) — M0118-0003/0004
 
 - Status: accepted (partial — engine core + member store + tuple-header
-  hint-bit encoder + **cross-session lock-only multixact producer/consumer
-  wired into `stampLockInner`**; updater-bearing multixact + WAL persistence +
-  spec promotion deferred)
+  hint-bit encoder + **cross-session lock-only AND updater-bearing multixact
+  producer/consumer wired into `stampLockInner`**; 4-way lock-strength members +
+  WAL persistence + spec promotion deferred)
 - Date: 2026-06-21
 - Supersedes: none
 - Related: [0118-0001](0118-0001-isolation-spec-port-strategy.md) (isolation
@@ -399,17 +399,61 @@ Pinned by `TestMultixactUpdaterXIDHelper` and `TestMultixactFirstActiveMemberHel
 (`concurrent_update_xmax_test.go`), plus the existing FK / upsert / lock-rows and
 row-lock isolation suites (behaviour-identical for existing tuples).
 
-### Producer gate: NOW SATISFIED
+### Producer gate: SATISFIED
 
 With `isConcurrentlyUpdated`, `mvcc.TupleVisible`, `mvcc.TupleVisibleSubxact`,
 `freeze`/`prune` (visibility consumers) **and** `scanRelForFKMatch`,
 `findInProgressConflictKey`, `stampAtPtr` (wait-on-deleter consumers) all
 multixact-aware, every `IsHeapTupleLockOnly`/raw-xmax consumer agrees on how to read
 an updater-bearing multi. The producer-gate ([[pattern_sibling_paths_must_agree]]) is
-**satisfied** — the updater-bearing producer (resume point #2) can now land. The
+**satisfied**, and the updater-bearing producer (slice 3, below) has now landed. The
 lesson stands: enumerate consumers by *mechanically sweeping every
 `IsHeapTupleLockOnly` site*, not from a hand-maintained list (that sweep found the
 `TupleVisibleSubxact` and these two wait-on-deleter consumers the hand list missed).
+
+### Hot-path wiring slice 3: updater-bearing producer (`stampLockInner` branch (a))
+
+With the gate satisfied, the **updater-bearing producer** lands — the twin of the
+slice-1 lock-only producer for the case where the combined member set contains an
+**updater**. Branch (a) of `stampLockInner` (`operators_lockrows.go`) is the path
+where our request is a shared lock (`FOR KEY SHARE`/`FOR SHARE` → goopg's collapsed
+`ShrLock`) and the tuple carries a non-lock-only no-key updater xmax from another
+transaction. `FOR KEY SHARE` does not conflict with a no-key update (`AccessShareLock`
+vs. `ExclusiveLock`), so the branch previously **skipped** stamping (M0100-0005f) —
+the single-holder xmax had nowhere to record the second holder. It now combines both:
+
+- **Producer** (`stampMultiUpdaterLock`): enumerate the existing holders (a single
+  updater xmax decoded via `updaterMemberStatus`, or an already updater-bearing multi
+  resolved through `Store.Members`), apply the `MultiXactIdExpand` survivor filter
+  (keep in-progress holders **plus a committed updater** — committed ≡ `!IsXIDActive
+  && !HasAbortedXID`; drop dead pure lockers and an aborted updater), append our share
+  locker (`lockMemberStatus`), `Store.CreateFromMembers`, compute `HintBits`, and stamp
+  via `storage.PageSetHeapTupleXmaxMulti`. Because the set has an updater, `HintBits`
+  **clears** `HEAP_XMAX_LOCK_ONLY`: the result is an **updater-bearing** multi. When no
+  holder survives (e.g. the updater aborted) it returns "not formed" and the caller
+  preserves the M0100-0005f skip.
+
+Unlike slice 1, an updater-bearing multi is **not** transparent to visibility — its
+xmax must be resolved to the updater before any single-xid reasoning. That is exactly
+what the slice-2 consumers were made to do; this producer is what finally exercises
+them. The last two `nil`-store read consumers (`vacuum.Analyze`'s live-row count and
+`executor.analyzeRelationWith`'s stats-sampling scan) are now threaded with the real
+`*multixact.Store` (`ctx.MultiXact` for the live SQL `ANALYZE`; the process-shared
+store via the autovacuum `Launcher.MultiXact` field for the background path) so they
+do not undercount a live, only-row-locked tuple as invisible.
+
+The collapse of `FOR KEY SHARE`/`FOR SHARE` to one `ShrLock` strength means our member
+is recorded as `StatusForShare` regardless; `HintBits` is unaffected (the updater's
+strength dominates the lock-strength bits and neither share status reserves the key).
+The faithful 4-way member status is deferred (resume point #3).
+
+Pinned by `TestForShareJoinsInProgressUpdaterFormsMultiXact` (FOR SHARE meets an
+in-progress no-key updater → updater-bearing multi `{updater@NoKeyUpdate,
+locker@ForShare}`, `GetUpdateXid` resolves the updater) and
+`TestForShareSkipsAbortedUpdaterNoMultiXact` (aborted updater → survivor filter drops
+it → no multi). The full row-lock isolation suite (9 dedicated specs) stays green —
+the producer is byte-identical to the prior skip for the rows that yield (it only
+*additionally* records the multixact), so query output is unchanged.
 
 ## Verification
 
@@ -504,15 +548,13 @@ verified primitive:
    - ✅ `stampAtPtr` (`operators_lockrows.go`) — the "another real updater arrived"
      recheck (`anotherRealUpdaterArrived`) resolves the updater member for an
      updater-bearing multi. See *slice 2 (continued, 4)* above.
-   - ⛔ **producer**: branch (a) of `stampLockInner` (`operators_lockrows.go`, the
-     "non-key update + `FOR KEY SHARE`" path that currently skips) must *combine*
-     a new locker with the in-progress updater into a multixact and stamp a
-     **non**-lock-only multi. **Now UNBLOCKED** — every read + wait-on-deleter
-     consumer is multixact-aware (producer gate satisfied). Unlike the lock-only case
-     this is **not** transparent to visibility, so re-run the
-     executor/storage/mvcc/btree + full isolation row-lock suite when it lands
-     ([[pattern_sibling_paths_must_agree]]). When the producer lands, also thread the
-     real `Store` through vacuum/analyze (the stats scans currently pass `nil`).
+   - ✅ **producer**: branch (a) of `stampLockInner` (`operators_lockrows.go`,
+     `stampMultiUpdaterLock`) combines a new share locker with the in-progress/
+     committed no-key updater into a **non**-lock-only MultiXactId — see *Hot-path
+     wiring slice 3* above. The real `Store` is now threaded through the two
+     `vacuum.Analyze` / `analyzeRelationWith` read consumers that previously passed
+     `nil`. Re-ran executor/storage/mvcc/btree + the 9 dedicated isolation row-lock
+     specs (all green) ([[pattern_sibling_paths_must_agree]]).
 3. **4-way lock strength + savepoint/subxact members** — goopg's `lockStrength`
    collapses PG's four lock modes to two (`ShrLock`/`ExclLock`); faithful
    `tuplelock-conflict`/`tuplelock-upgrade-no-deadlock` parity needs the full

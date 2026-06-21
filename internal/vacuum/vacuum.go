@@ -10,6 +10,7 @@ package vacuum
 import (
 	"errors"
 
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/storage"
 )
@@ -212,7 +213,7 @@ type AnalyzeStats struct {
 // Analyze walks every block of rel and returns row count plus average
 // tuple width. v0 uses a fresh snapshot from mgr to count "currently
 // live" tuples, matching upstream's reltuples definition.
-func Analyze(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (AnalyzeStats, error) {
+func Analyze(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode, mxs *multixact.Store) (AnalyzeStats, error) {
 	tx, err := mgr.Begin(mvcc.IsolationReadCommitted)
 	if err != nil {
 		return AnalyzeStats{}, err
@@ -254,11 +255,12 @@ func Analyze(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode) (An
 				pool.Unpin(slot)
 				return out, err
 			}
-			// nil MultiXact store: vacuum's live-row count has no store in
-			// scope (the public Vacuum/Analyze API takes pool/mgr/rel). No
-			// tuple carries a non-lock-only multi xmax until the producer
-			// slice lands, which will also thread the store through here.
-			if !mvcc.TupleVisible(t.Header, snap, tx.XID, nil) {
+			// MultiXact store threaded from the caller (the autovacuum
+			// Launcher's process-shared store; nil disables the multi path).
+			// Resolves an updater-bearing multi xmax to its updater before
+			// judging visibility so the live-row count does not undercount a
+			// live, only-row-locked tuple as invisible. M0118-0003.
+			if !mvcc.TupleVisible(t.Header, snap, tx.XID, mxs) {
 				continue
 			}
 			out.Rows++

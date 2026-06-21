@@ -685,8 +685,33 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		keysUpdated := (tup.Header.Infomask2 & storage.HeapKeysUpdated) != 0
 		keyConflict := o.lockStrength == storage.HeapXmaxExclLock || keysUpdated
 		if !keyConflict {
-			// Non-key update with FOR KEY SHARE: no conflict.
-			// Preserve M0100-0005f: do not overwrite real updater's xmax.
+			// Non-key update + FOR (KEY) SHARE: the two locks do not conflict
+			// (AccessShareLock vs ExclusiveLock). Rather than silently dropping
+			// our lock — M0100-0005f skipped here because the single-holder xmax
+			// had nowhere to record a second holder — combine our share locker
+			// with the in-progress/committed no-key updater into a MultiXactId
+			// that records BOTH (the updater-bearing MultiXact producer,
+			// M0118-0003). The combined set has an updater, so HintBits clears
+			// HEAP_XMAX_LOCK_ONLY: unlike the lock-only case this multi is NOT
+			// transparent to visibility, which is why every read / wait-on-
+			// deleter consumer was made multixact-aware first (producer gate,
+			// docs/design/0118-0002).
+			if o.ctx.MultiXact != nil && o.ctx.TxnMgr != nil {
+				multiPtr, formed, merr := o.stampMultiUpdaterLock(slot, ptr, tup.Header, keysUpdated)
+				if merr != nil {
+					slot.Unlock()
+					o.ctx.Pool.Unpin(slot)
+					return storage.ItemPointer{}, false, false, merr
+				}
+				if formed {
+					slot.Unlock()
+					o.ctx.Pool.Unpin(slot)
+					return multiPtr, false, false, nil
+				}
+				// No surviving holder to combine with (updater gone/aborted):
+				// fall through to preserve the M0100-0005f skip below.
+			}
+			// Preserve M0100-0005f: do not overwrite the real updater's xmax.
 			slot.Unlock()
 			o.ctx.Pool.Unpin(slot)
 			return storage.ItemPointer{}, false, false, nil
@@ -1034,6 +1059,18 @@ func lockOnlyMemberStatus(infomask uint16) multixact.Status {
 	}
 }
 
+// updaterMemberStatus maps a single-xid (non-multi) updater xmax to its
+// MultiXactStatus, read from the tuple's HEAP_KEYS_UPDATED bit: a key-changing
+// UPDATE/DELETE is StatusUpdate, a no-key UPDATE is StatusNoKeyUpdate. The xmax
+// reaching the updater-bearing producer is non-lock-only — i.e. an actual
+// update — so it is never a FOR-lock status. M0118-0003.
+func updaterMemberStatus(keysUpdated bool) multixact.Status {
+	if keysUpdated {
+		return multixact.StatusUpdate
+	}
+	return multixact.StatusNoKeyUpdate
+}
+
 // lockMemberStatus maps this lockRowsOp's requested strength to the multixact
 // member Status it records when it joins (or forms) a MultiXact on a tuple.
 // goopg's two effective strengths map to the corresponding pure-lock statuses.
@@ -1136,6 +1173,88 @@ func (o *lockRowsOp) stampMultiLock(slot *storage.Slot, ptr storage.ItemPointer,
 	// multixact state is transient — the holders' transactions do not survive a
 	// crash — so losing it on recovery is correct. WAL persistence of multixact
 	// members is deferred (see docs/design/0118-0002). M0118-0003.
+	o.ctx.Pool.MarkDirty(slot)
+	return ptr, true, nil
+}
+
+// stampMultiUpdaterLock is the updater-bearing MultiXact producer
+// (M0118-0003) — the twin of stampMultiLock for branch (a) of stampLockInner,
+// where the tuple carries a real (non-lock-only) in-progress or committed
+// no-key updater xmax and our request is a shared (FOR KEY SHARE / FOR SHARE)
+// lock. FOR KEY SHARE does not conflict with a no-key update, so instead of
+// silently dropping our lock (the M0100-0005f skip) we combine our share
+// locker with the updater into a MultiXactId that names BOTH holders.
+//
+// Unlike stampMultiLock the resulting member set has an updater, so HintBits
+// clears HEAP_XMAX_LOCK_ONLY: the multi is updater-bearing and therefore NOT
+// transparent to MVCC visibility — every read / wait-on-deleter consumer was
+// made multixact-aware first (the producer gate, docs/design/0118-0002).
+//
+// Member retention mirrors MultiXactIdExpand (see multixact.Store.Expand):
+// keep every still-in-progress holder plus a COMMITTED updater (committed ==
+// not active AND not aborted — the committed no-key update is preserved so a
+// later key-share / visibility consumer still resolves it), and drop dead pure
+// lockers and an aborted updater. Returns (ptr, true, nil) when a multi was
+// stamped; (zero, false, nil) when no holder survived to combine with (e.g.
+// the updater aborted) so the caller preserves the M0100-0005f skip.
+//
+// goopg collapses FOR KEY SHARE and FOR SHARE to a single ShrLock strength, so
+// our member is recorded as lockMemberStatus() (StatusForShare); the faithful
+// 4-way FOR KEY SHARE distinction is deferred (docs/design/0118-0002 resume 3).
+// HintBits is unaffected — the updater's strength dominates the lock-strength
+// bits and neither share status reserves the key.
+func (o *lockRowsOp) stampMultiUpdaterLock(slot *storage.Slot, ptr storage.ItemPointer, hdr storage.HeapTupleHeader, keysUpdated bool) (storage.ItemPointer, bool, error) {
+	// Enumerate the existing holders. The producer is gated (branch (a)) on a
+	// non-lock-only foreign xmax, so the set always contains an updater — either
+	// a single-xid updater or an already updater-bearing multi.
+	var existing []multixact.Member
+	if storage.IsHeapTupleXmaxMulti(hdr.Infomask) {
+		members, ok := o.ctx.MultiXact.Members(multixact.MultiXactId(hdr.Xmax))
+		if !ok {
+			// Membership lost (e.g. stamped before a restart with no persisted
+			// store): nothing resolvable to combine with; keep the single xmax.
+			return storage.ItemPointer{}, false, nil
+		}
+		existing = members
+	} else {
+		existing = []multixact.Member{{Xid: hdr.Xmax, Status: updaterMemberStatus(keysUpdated)}}
+	}
+
+	// Keep members still of interest (MultiXactIdExpand, multixact.c:561):
+	// in-progress holders, plus a committed updater. Drop dead pure lockers and
+	// an aborted updater.
+	survivors := make([]multixact.Member, 0, len(existing)+1)
+	for _, m := range existing {
+		if m.Xid == o.ctx.Tx.XID {
+			continue // re-added once below at our current strength
+		}
+		switch {
+		case o.ctx.TxnMgr.IsXIDActive(m.Xid):
+			survivors = append(survivors, m)
+		case m.Status.IsUpdate() && !o.ctx.TxnMgr.HasAbortedXID(m.Xid):
+			// Committed updater (not active AND not aborted): retained.
+			survivors = append(survivors, m)
+		}
+	}
+	if len(survivors) == 0 {
+		// No live holder and no committed updater survived (e.g. the updater
+		// aborted): nothing to combine with — caller preserves the skip.
+		return storage.ItemPointer{}, false, nil
+	}
+	survivors = append(survivors, multixact.Member{Xid: o.ctx.Tx.XID, Status: o.lockMemberStatus()})
+
+	multi, err := o.ctx.MultiXact.CreateFromMembers(survivors)
+	if err != nil {
+		return storage.ItemPointer{}, false, err
+	}
+	infomask, infomask2 := multixact.HintBits(survivors)
+	if err := storage.PageSetHeapTupleXmaxMulti(slot.Page(), ptr.Offset, storage.TransactionID(multi), infomask, infomask2); err != nil {
+		return storage.ItemPointer{}, false, err
+	}
+	// Same WAL-persistence caveat as stampMultiLock: membership is in-memory
+	// process-shared state, marked dirty without a logical heap-lock record (the
+	// record carries a single xid + strength and cannot describe a multi). WAL
+	// persistence of multixact members is deferred (docs/design/0118-0002).
 	o.ctx.Pool.MarkDirty(slot)
 	return ptr, true, nil
 }
