@@ -1,30 +1,31 @@
 (idle — nothing in flight)
 
-Loop #35: LANDED INSERT…SELECT crash fix (design 0118-0038, M0118-0002/0008 enabler,
-NOT a spec promotion). `INSERT INTO t SELECT a,b` with no explicit column list +
-fewer source columns than the table panicked the backend (`index out of range` in
-`insertOp.Next`, operators_storage.go:1187 — ColumnIndex=[0,1,2] indexed a 2-col
-row). Fixed in `planInsert` (planner.go ~L7113): reconcile source arity with
-colIndex — over-wide→42601, explicit-list under-wide→42601, implicit-list
-under-wide→truncate colIndex so executor applyDefaultsForMissing fills the rest.
-Type-independent; VALUES path unaffected. Units TestPlanInsertSelect{FewerColumns…,
-MoreColumnsErrors,ExplicitListArityMismatchErrors}; e2e default-fill verified;
-planner+executor suites + pgbench smoke (0-failed, -S ~14.3k TPS) green.
+Loop #36: PROMOTED `truncate-conflict` (M0118-0008 tenth promotion, design 0118-0039,
+first of the `*-conflict` family) — all 8 permutations byte-for-byte vs PG 18.3.
 
-Probed ALL 16 remaining M0118-0008 specs this loop (ranking table in design
-0118-0038). NONE is a single-loop promotion — each needs a milestone-sized
-subsystem: transactional DDL catalog visibility (alter-table-1/2/4), role/ACL
-privilege enforcement (truncate/vacuum/cluster-conflict), real TOAST relations
-(reindex-concurrently-toast, plpgsql-toast), partition CONCURRENTLY +
-ATTACH/DETACH (detach-*, partition-concurrent-attach), pg_locks population +
-recursive partition lock (partition-drop-index-locking), reltuples accounting +
-buffer-pin cleanup-lock (vacuum-no-cleanup-lock).
+Three problems solved:
+1. CREATE-ROLE batch-swallow (the working-set bug): setup `CREATE ROLE x; CREATE TABLE y`
+   is one batch the parser can't parse; the recovery path handed the whole batch to
+   tryHandleRoleDDL which dropped the CREATE TABLE. New splitLeadingRoleDDL +
+   firstTopLevelSemicolon (role_ddl.go) peel the leading role stmt off and recurse on the
+   remainder (dispatch.go); standalone role DDL untouched (DROP ROLE already parsed).
+2. TRUNCATE privilege model: catalog ACL store tableACLs +
+   Catalog.GrantTablePrivilege/HasTablePrivilege/DropTableACL (catalog.go); SET/RESET ROLE
+   now set connTx.NonSuperuserRole (query.go); autocommit table-level GRANT recorder
+   (server/grant_ddl.go, new); pre-lock check in execTruncate (operators_ddl.go):
+   NonSuperuserRole!="" && !HasTablePrivilege(oid,role,"TRUNCATE") ⇒ 42501 immediately.
+3. Granted autocommit TRUNCATE must WAIT for a conflicting lock: execTruncate switched
+   acquireDDLLockTxn (no-op in autocommit) → acquireRelLockMaybeTransient. Preserves
+   inherit-temp (its TRUNCATE is in an explicit txn → identical hold-to-commit).
 
-Adjacent bug found (NOT fixed): dispatch.go ~L131 tryHandleRoleDDL swallows an
-entire simple-query batch `CREATE ROLE x; CREATE TABLE y;` and drops the
-CREATE TABLE — why the *-conflict setups leave the table missing. Needs
-statement-splitting in the parser-fail recovery path.
+Gates green: TestPort_IsolationTruncateConflict strict + -race; all sibling M0118-0008
+specs (inherit-temp/create-trigger/alter-table-3/sequence-ddl/vacuum-*/reindex-*/
+multiple-cic); createuser/dropuser/amcheck; catalog/parser/server/executor units;
+pgbench smoke 0-failed ~15.2k TPS. Design 0118-0039 + README + CSV/MD port-status +
+fix_plan updated.
 
-Next step: pick the next M0118 spec needing a bounded mechanism, OR start one of
-the milestone-sized subsystems above (role/ACL enforcement unblocks 4 *-conflict
-specs at once and is broadly useful).
+Next step: `vacuum-conflict` / `cluster-conflict` need OWNERSHIP-based checks (VACUUM/
+CLUSTER require relation ownership or MAINTAIN, not a grantable privilege) — extend the
+0118-0039 ACL store with per-relation owner tracking (relowner is currently hardcoded
+"10"). Then the rest of the deferred M0118-0008 tail (alter-table-{1,2,4}, partition
+ATTACH/DETACH, reindex-toast, vacuum-no-cleanup-lock, plpgsql-toast).

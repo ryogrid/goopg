@@ -126,6 +126,29 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			}
 			return w.WriteReadyForQuery(protocol.TxStatusIdle)
 		}
+		// A multi-statement batch whose FIRST statement is CREATE/DROP ROLE
+		// (which the parser does not recognise, so the whole batch lands here)
+		// must not be swallowed wholesale by the single-statement role-DDL
+		// intercept below — that would drop the trailing statements (e.g. the
+		// CREATE TABLE in a "CREATE ROLE x; CREATE TABLE y" isolation setup).
+		// Peel the leading role statement off, handle it, then recurse on the
+		// remainder so every statement runs. M0118-0008.
+		if first, rest, ok := splitLeadingRoleDDL(sql); ok {
+			if handled, herr := s.tryHandleRoleDDL(first); handled {
+				if herr != nil {
+					return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error())
+				}
+				normFirst := normalizeCompatSQL(first)
+				tag := "CREATE ROLE"
+				if !strings.HasPrefix(normFirst, "create ") {
+					tag = "DROP ROLE"
+				}
+				if err := w.WriteCommandComplete(tag); err != nil {
+					return err
+				}
+				return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, rest, connTx, prepStmts)
+			}
+		}
 		// Role DDL (CREATE/DROP ROLE/USER) is not yet in the parser but needs
 		// actual role tracking so DROP ROLE fails on nonexistent roles.
 		if handled, herr := s.tryHandleRoleDDL(sql); handled {

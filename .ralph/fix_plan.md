@@ -516,11 +516,34 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       strict PASS; full `TestPort_IsolationSuite` + all dedicated strict
       `TestPort_Isolation*` PASS; catalog/config/planner/server/executor units;
       pgbench smoke.
+      **2026-06-23 tenth promotion (design 0118-0039): `truncate-conflict`
+      PROMOTED — first of the `*-conflict` family, all 8 permutations
+      byte-for-byte.** A TRUNCATE-scoped privilege model: new catalog ACL store
+      (`tableACLs`; `Catalog.GrantTablePrivilege`/`HasTablePrivilege`/`DropTableACL`),
+      `SET ROLE`/`RESET ROLE` now track `connTx.NonSuperuserRole`, an autocommit
+      table-level `GRANT … ON … TO …` recorder (`server/grant_ddl.go`), and a
+      **pre-lock** check in `execTruncate` (`NonSuperuserRole != "" &&
+      !HasTablePrivilege(oid,role,"TRUNCATE")` ⇒ `42501 permission denied for
+      table <name>` immediately, no wait; superuser/owner bypass). Also fixed the
+      CREATE-ROLE batch-swallow (working-set bug): the setup
+      `CREATE ROLE …; CREATE TABLE …;` is one batch the parser can't parse, and
+      the recovery path handed the whole batch to `tryHandleRoleDDL` which
+      dropped the `CREATE TABLE` — new `splitLeadingRoleDDL`/
+      `firstTopLevelSemicolon` peel the leading role stmt off and recurse on the
+      remainder (standalone role DDL untouched). And `execTruncate` switched from
+      `acquireDDLLockTxn` (no-op in autocommit) to `acquireRelLockMaybeTransient`
+      so a granted autocommit TRUNCATE waits behind a concurrent open SELECT
+      (preserves `inherit-temp`, whose TRUNCATE is in an explicit txn).
+      `TestPort_IsolationTruncateConflict` strict PASS; all sibling M0118-0008
+      specs PASS; createuser/dropuser/amcheck PASS; catalog/parser/server/executor
+      units; `-race`; pgbench smoke 0-failed ~15.2k TPS.
       **Remaining (deferred, ledger 2026-06-22):**
       `alter-table-{1,2,4}`
-      (ADD/VALIDATE CONSTRAINT lock semantics; INHERITS), the `*-conflict` family —
-      truncate/vacuum/cluster — (need CREATE ROLE/GRANT/SET ROLE privilege infra +
-      permission-denied), `reindex-concurrently-toast` (`allow_system_table_mods`
+      (ADD/VALIDATE CONSTRAINT lock semantics; INHERITS), the rest of the
+      `*-conflict` family — vacuum/cluster-conflict — (need **ownership**-based
+      privilege checks: VACUUM/CLUSTER require relation ownership or MAINTAIN, not
+      a grantable table privilege — extend the 0118-0039 ACL store with owner
+      tracking), `reindex-concurrently-toast` (`allow_system_table_mods`
       GUC + TOAST-relation reindex), partition specs (ATTACH/DETACH PARTITION),
       `vacuum-no-cleanup-lock` (reltuples accounting), `plpgsql-toast` (TOAST in
       PL/pgSQL). FK/MERGE/VACUUM inherit-temp filtering (bounded follow-up). Group

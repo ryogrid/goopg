@@ -7034,6 +7034,28 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		}
 	}
 
+	// Privilege check (M0118-0008, truncate-conflict). When the session is
+	// running as a non-superuser role (SET ROLE), TRUNCATE on each explicitly
+	// named relation requires the TRUNCATE privilege (granted via GRANT, the
+	// owning superuser bypasses this). This runs BEFORE any lock is acquired so
+	// an unprivileged TRUNCATE fails immediately instead of waiting for a
+	// conflicting lock — matching PostgreSQL's pre-lock ACL check.
+	if role := o.ctx.NonSuperuserRole; role != "" {
+		for _, name := range s.Names {
+			tbl, ok := o.ctx.Catalog.LookupTable(name)
+			if !ok {
+				continue
+			}
+			if !o.ctx.Catalog.HasTablePrivilege(tbl.OID, role, "TRUNCATE") {
+				return &ExecError{
+					Code:    "42501",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("permission denied for table %s", tbl.Name),
+				}
+			}
+		}
+	}
+
 	// FK constraint check / CASCADE expansion.
 	// For each table in the set, find all tables (not in the set) that have an FK
 	// pointing to it. If behavior is CASCADE, expand the set and emit NOTICEs.
@@ -7136,12 +7158,15 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 	// TRUNCATE takes an AccessExclusiveLock on every target relation (PG
 	// AlterTableGetLockLevel / ExecuteTruncate). Held to commit inside an
 	// explicit transaction so a concurrent scan of the parent (AccessShareLock)
-	// blocks until the TRUNCATE transaction commits; no-op in autocommit. This
-	// is what makes inherit-temp's last two permutations block s2_select_p
-	// (scanning inh_parent) while s2_select_c (its own temp child) proceeds.
-	// Design 0118-0037 (M0118-0008 inherit-temp).
+	// blocks until the TRUNCATE transaction commits (inherit-temp's last two
+	// permutations: s2_select_p on inh_parent blocks while s2_select_c on its
+	// own temp child proceeds — design 0118-0037). In autocommit the lock is
+	// acquired transiently — the WAIT still happens during acquisition, so a
+	// TRUNCATE issued while another session holds the table open blocks until
+	// that session commits (truncate-conflict's granted permutations — design
+	// 0118-0039). Both via acquireRelLockMaybeTransient. M0118-0008.
 	for _, entry := range tableSet {
-		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(entry.tbl), lockmgr.AccessExclusiveLock); err != nil {
+		if err := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(entry.tbl), lockmgr.AccessExclusiveLock); err != nil {
 			return err
 		}
 	}

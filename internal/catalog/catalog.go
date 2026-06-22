@@ -1174,6 +1174,16 @@ type Catalog interface {
 	RegisterRole(name string)
 	// UnregisterRole removes a role from the registry. M0097-drop_if_exists.
 	UnregisterRole(name string)
+	// GrantTablePrivilege records that role may exercise priv on the relation
+	// identified by relOID. priv is an upper-cased keyword ("TRUNCATE", …); role
+	// is matched case-insensitively. Minimal ACL store for the *-conflict
+	// isolation specs. M0118-0008 (design 0118-0039).
+	GrantTablePrivilege(relOID uint32, role, priv string)
+	// HasTablePrivilege reports whether role was granted priv on relOID.
+	HasTablePrivilege(relOID uint32, role, priv string) bool
+	// DropTableACL forgets all privileges recorded for relOID (called when the
+	// relation is dropped so a recycled OID does not inherit stale grants).
+	DropTableACL(relOID uint32)
 	IndexesOnTable(table *Table) []*Index
 	// AllIndexes returns every index in the catalog, sorted by OID. M0097-0023.
 	AllIndexes() []*Index
@@ -1331,6 +1341,14 @@ type InMemory struct {
 	// DROP ROLE IF EXISTS to produce proper "does not exist" notices.
 	// M0097-drop_if_exists.
 	roles map[string]struct{}
+
+	// tableACLs records per-relation privileges granted to non-owner roles, the
+	// minimal ACL store the *-conflict isolation specs need (currently only
+	// TRUNCATE — truncate-conflict, design 0118-0039). Keyed relOID →
+	// lower-cased role name → set of upper-cased privilege keywords
+	// ("TRUNCATE", "SELECT", …). The owning superuser bypasses this map
+	// entirely; an empty/absent entry means "no privilege granted". M0118-0008.
+	tableACLs map[uint32]map[string]map[string]struct{}
 
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
@@ -1634,6 +1652,7 @@ func NewInMemory() *InMemory {
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
 		roles:          make(map[string]struct{}),
+		tableACLs:      make(map[uint32]map[string]map[string]struct{}),
 		comments:       make(map[commentKey]string),
 		statisticsObjs: make(map[string]*StatisticsObject),
 		extensions:     make(map[string]*extensionRow),
@@ -6701,6 +6720,55 @@ func (c *InMemory) UnregisterRole(name string) {
 	delete(c.roles, strings.ToLower(name))
 }
 
+// GrantTablePrivilege records that role may exercise priv on relOID. See the
+// Catalog interface doc. Role names are stored lower-cased and privilege
+// keywords upper-cased so lookups are case-insensitive. M0118-0008.
+func (c *InMemory) GrantTablePrivilege(relOID uint32, role, priv string) {
+	role = strings.ToLower(strings.TrimSpace(role))
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	if role == "" || priv == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	byRole := c.tableACLs[relOID]
+	if byRole == nil {
+		byRole = make(map[string]map[string]struct{})
+		c.tableACLs[relOID] = byRole
+	}
+	privs := byRole[role]
+	if privs == nil {
+		privs = make(map[string]struct{})
+		byRole[role] = privs
+	}
+	privs[priv] = struct{}{}
+}
+
+// HasTablePrivilege reports whether role was granted priv on relOID. M0118-0008.
+func (c *InMemory) HasTablePrivilege(relOID uint32, role, priv string) bool {
+	role = strings.ToLower(strings.TrimSpace(role))
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	byRole := c.tableACLs[relOID]
+	if byRole == nil {
+		return false
+	}
+	privs := byRole[role]
+	if privs == nil {
+		return false
+	}
+	_, ok := privs[priv]
+	return ok
+}
+
+// DropTableACL forgets all privileges recorded for relOID. M0118-0008.
+func (c *InMemory) DropTableACL(relOID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.tableACLs, relOID)
+}
+
 // RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
 // Used so that DROP X (without IF EXISTS) can succeed when CREATE X was also a noop.
 func (c *InMemory) RegisterCompatObject(objType, name string) {
@@ -6830,6 +6898,7 @@ func (c *InMemory) DropTable(name parser.ObjectName) error {
 		delete(c.byTable, tbl.OID)
 	}
 	delete(c.tables, k)
+	delete(c.tableACLs, tbl.OID) // forget any granted privileges (M0118-0008)
 	return nil
 }
 

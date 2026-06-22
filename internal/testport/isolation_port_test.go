@@ -350,6 +350,24 @@ func TestPort_IsolationInheritTemp(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/inherit-temp.spec")
 }
 
+// TestPort_IsolationTruncateConflict exercises the truncate-conflict spec
+// (M0118-0008, design 0118-0039). A role created with CREATE ROLE has no
+// privileges on a table it does not own, so TRUNCATE under SET ROLE fails
+// immediately with "permission denied for table truncate_tab" (42501) WITHOUT
+// waiting for a lock; after GRANT TRUNCATE the command succeeds and instead
+// blocks behind a concurrent session holding the table open. Requires the
+// catalog ACL store (Catalog.GrantTablePrivilege / HasTablePrivilege), SET/RESET
+// ROLE tracking the effective role, an autocommit table-level GRANT recorder,
+// and the pre-lock TRUNCATE privilege check in execTruncate — byte-identical to
+// PG 18.3 across all eight permutations.
+func TestPort_IsolationTruncateConflict(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_truncate_conflict")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/truncate-conflict.spec")
+}
+
 // TestPort_IsolationSequenceDdl exercises the sequence-ddl spec (M0118-0008).
 // nextval() takes a transaction-scoped RowExclusiveLock on the sequence
 // relation and ALTER SEQUENCE takes an AccessExclusiveLock; the two conflict,
