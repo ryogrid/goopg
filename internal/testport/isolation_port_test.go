@@ -304,12 +304,18 @@ func TestPort_IsolationInsertConflictSpecconflict(t *testing.T) {
 
 // TestPort_IsolationDropIndexConcurrently1 exercises the drop-index-concurrently-1 spec.
 // Requires: BEGIN ISOLATION LEVEL, DROP INDEX CONCURRENTLY.
+//
+// PASS-REQUIRED (M0118-0007, design 0118-0024): the spec matches PG 18.3
+// byte-for-byte. DROP INDEX CONCURRENTLY's two-phase invalidation, the
+// EXPLAIN-driven plan-format output (seqscan-vs-indexscan after the index is
+// dropped), and READ COMMITTED snapshot visibility were already correct from
+// prior milestones; this is a promotion with no engine change.
 func TestPort_IsolationDropIndexConcurrently1(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_drop_idx_cc")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/drop-index-concurrently-1.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/drop-index-concurrently-1.spec")
 }
 
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.

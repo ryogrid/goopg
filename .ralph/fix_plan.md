@@ -274,6 +274,14 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       functions were switched to it. D-002 CSV rationale updated.
 - [ ] **M0118-0007** — Planner / output-format blockers: eval-plan-qual (planner
       RETURNING support), drop-index-concurrently-1 (EXPLAIN EXECUTE plan-format parity).
+      **PARTIAL (2026-06-22, design 0118-0024):** `drop-index-concurrently-1` promoted
+      to pass-required with NO engine change — it matches PG 18.3 byte-for-byte (DROP
+      INDEX CONCURRENTLY two-phase invalidation + index→seqscan EXPLAIN plan-format
+      fallback + READ COMMITTED visibility all already correct). Switched
+      `TestPort_IsolationDropIndexConcurrently1` soft→`runIsoSpecStrict`. **Remaining
+      (deferred, ledger 2026-06-22):** `eval-plan-qual` — a cross-table EvalPlanQual
+      recheck returns `(0 rows)` where PG re-projects the updated row after a concurrent
+      UPDATE (EPQ-over-join executor work, ~L1171 of expected). Group stays open.
 - [ ] **M0118-0008** — DDL / VACUUM / maintenance concurrency: alter-table-{1,2,3,4},
       detach-partition-concurrently-{1,2,3,4}, partition-concurrent-attach,
       partition-drop-index-locking, reindex-concurrently{,-toast}, reindex-schema,
