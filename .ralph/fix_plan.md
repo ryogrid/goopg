@@ -186,8 +186,16 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       **2026-06-23 hardening (design 0118-0042):** the `SKIP LOCKED` family
       (`skip-locked{,-2,-3,-4}`) promoted from `runIsoSpec` (silent-skip on
       regression) to `runIsoSpecStrict` (hard red) — all four already byte-match PG
-      18.3, no engine change. Follow-up of the same shape: the sibling `nowait*`
-      family + the rest of the M0118-0003 row-lock specs still run non-strict.
+      18.3, no engine change.
+      **2026-06-23 hardening completed (design 0118-0043):** the remaining 16
+      dedicated row-lock tests promoted to `runIsoSpecStrict` —
+      `nowait{,-2,-3,-4,-5}`, `lock-nowait`,
+      `tuplelock-{conflict,update,partition,upgrade-no-deadlock}`,
+      `lock-update-{traversal,delete}`, `update-locked-tuple`,
+      `propagate-lock-delete`, `lock-committed-{update,keyupdate}`. All 16 already
+      byte-match PG 18.3 (single `go test` over the family `ok` in ~83 s, strict),
+      no engine change. **All 20 M0118-0003 row-lock specs are now strict — none can
+      regress silently.**
 - [ ] **M0118-0004** — Deadlock detection: deadlock-{hard,simple,soft,soft-2,parallel},
       multixact-no-deadlock. **Done so far:** `deadlock-simple` (slice 16, design
       0118-0004) + `deadlock-hard` (general timeout-driven multi-object detector,

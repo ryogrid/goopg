@@ -129,7 +129,7 @@ func TestPort_IsolationLockCommittedUpdate(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-committed-update.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/lock-committed-update.spec")
 }
 
 // runIsoSpec is a helper that runs one spec and logs the diff when output
@@ -226,7 +226,7 @@ func TestPort_IsolationLockCommittedKeyupdate(t *testing.T) {
 	c := newCluster(t, "iso_lock_keyupdate")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-committed-keyupdate.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/lock-committed-keyupdate.spec")
 }
 
 // TestPort_IsolationInsertConflictDoUpdate exercises the insert-conflict-do-update spec.
@@ -946,7 +946,7 @@ func TestPort_IsolationNowait(t *testing.T) {
 	c := newCluster(t, "iso_nowait")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/nowait.spec")
 }
 
 // TestPort_IsolationNowait3 exercises the nowait-3 spec: s1 holds a FOR UPDATE
@@ -960,7 +960,7 @@ func TestPort_IsolationNowait3(t *testing.T) {
 	c := newCluster(t, "iso_nowait3")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-3.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/nowait-3.spec")
 }
 
 // TestPort_IsolationUpdateLockedTuple exercises the update-locked-tuple spec:
@@ -975,7 +975,7 @@ func TestPort_IsolationUpdateLockedTuple(t *testing.T) {
 	c := newCluster(t, "iso_update_locked_tuple")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/update-locked-tuple.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/update-locked-tuple.spec")
 }
 
 // TestPort_IsolationLockUpdateTraversal exercises the lock-update-traversal
@@ -991,7 +991,7 @@ func TestPort_IsolationLockUpdateTraversal(t *testing.T) {
 	c := newCluster(t, "iso_lock_update_traversal")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-update-traversal.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/lock-update-traversal.spec")
 }
 
 // TestPort_IsolationLockUpdateDelete exercises the lock-update-delete spec: s2
@@ -1009,7 +1009,7 @@ func TestPort_IsolationLockUpdateDelete(t *testing.T) {
 	c := newCluster(t, "iso_lock_update_delete")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-update-delete.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/lock-update-delete.spec")
 }
 
 // TestPort_IsolationSkipLocked2 exercises the skip-locked-2 spec: s1 and s2 both
@@ -1033,7 +1033,7 @@ func TestPort_IsolationNowait2(t *testing.T) {
 	c := newCluster(t, "iso_nowait2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/nowait-2.spec")
 }
 
 // TestPort_IsolationTuplelockConflict exercises the tuplelock-conflict spec:
@@ -1045,7 +1045,7 @@ func TestPort_IsolationTuplelockConflict(t *testing.T) {
 	c := newCluster(t, "iso_tuplelock_conflict")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-conflict.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-conflict.spec")
 }
 
 // TestPort_IsolationSkipLocked3 exercises skip-locked-3 (SKIP LOCKED with tuple
@@ -1068,7 +1068,7 @@ func TestPort_IsolationNowait5(t *testing.T) {
 	c := newCluster(t, "iso_nowait5")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-5.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/nowait-5.spec")
 }
 
 // TestPort_IsolationSkipLocked4 exercises skip-locked-4 (SKIP LOCKED over an
@@ -1090,7 +1090,7 @@ func TestPort_IsolationNowait4(t *testing.T) {
 	c := newCluster(t, "iso_nowait4")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-4.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/nowait-4.spec")
 }
 
 // TestPort_IsolationTuplelockUpdate exercises the tuplelock-update spec: s1 first
@@ -1106,7 +1106,7 @@ func TestPort_IsolationTuplelockUpdate(t *testing.T) {
 	c := newCluster(t, "iso_tuplelock_update")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-update.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-update.spec")
 }
 
 // TestPort_IsolationTuplelockPartition exercises the tuplelock-partition spec:
@@ -1118,7 +1118,7 @@ func TestPort_IsolationTuplelockPartition(t *testing.T) {
 	c := newCluster(t, "iso_tuplelock_partition")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-partition.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-partition.spec")
 }
 
 // TestPort_IsolationPropagateLockDelete exercises the propagate-lock-delete
@@ -1134,7 +1134,7 @@ func TestPort_IsolationPropagateLockDelete(t *testing.T) {
 	c := newCluster(t, "iso_propagate_lock_delete")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/propagate-lock-delete.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/propagate-lock-delete.spec")
 }
 
 // TestPort_IsolationLockNowait exercises the lock-nowait spec: s1 takes ACCESS
@@ -1150,7 +1150,7 @@ func TestPort_IsolationLockNowait(t *testing.T) {
 	c := newCluster(t, "iso_lock_nowait")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-nowait.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/lock-nowait.spec")
 }
 
 // TestPort_IsolationDeleteAbortSavept exercises the delete-abort-savept spec:
@@ -1347,7 +1347,7 @@ func TestPort_IsolationTuplelockUpgradeNoDeadlock(t *testing.T) {
 	c := newCluster(t, "iso_tuplelock_upgrade_no_deadlock")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec")
 }
 
 // buildDSN constructs a lib/pq DSN for the given cluster.
