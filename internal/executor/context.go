@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/lockwait"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -534,8 +536,8 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	if err == lockmgr.ErrDeadlockDetected {
 		return &ExecError{Code: "40P01", Message: "deadlock detected"}
 	}
-	if err == context.Canceled || err == context.DeadlineExceeded {
-		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+	if ee := lockWaitCancelError(err); ee != nil {
+		return ee
 	}
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }
@@ -565,8 +567,8 @@ func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPoin
 	if err == lockmgr.ErrDeadlockDetected {
 		return &ExecError{Code: "40P01", Message: "deadlock detected"}
 	}
-	if err == context.Canceled || err == context.DeadlineExceeded {
-		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+	if ee := lockWaitCancelError(err); ee != nil {
+		return ee
 	}
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }
@@ -702,10 +704,47 @@ func (c *Context) acquireRelLockTxn(rel storage.RelFileNode, mode lockmgr.Mode, 
 	if err == lockmgr.ErrDeadlockDetected {
 		return &ExecError{Code: "40P01", Message: "deadlock detected"}
 	}
-	if err == context.Canceled || err == context.DeadlineExceeded {
-		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+	if ee := lockWaitCancelError(err); ee != nil {
+		return ee
 	}
 	return &ExecError{Code: "XX000", Message: err.Error()}
+}
+
+// lockWaitCancelError maps the cancellation/timeout error returned by a
+// lock-wait primitive (lockmgr.Acquire* or mvcc.WaitForXID) to the matching
+// SQLSTATE-57014 ExecError, or nil when err is not a recognised cancellation.
+// The three message variants mirror PostgreSQL exactly:
+//   - lock_timeout      → "canceling statement due to lock timeout"
+//   - statement_timeout → "canceling statement due to statement timeout"
+//   - client cancel     → "canceling statement due to user request"
+//
+// statement_timeout is the only source of a context *deadline* in goopg, so
+// context.DeadlineExceeded is reported as a statement timeout; a plain
+// context.Canceled is a CancelRequest / connection teardown. M0118-0009.
+func lockWaitCancelError(err error) *ExecError {
+	if ee := lockWaitTimeoutError(err); ee != nil {
+		return ee
+	}
+	if errors.Is(err, context.Canceled) {
+		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+	}
+	return nil
+}
+
+// lockWaitTimeoutError is the subset of lockWaitCancelError that recognises
+// only the two *timeout* causes — lock_timeout and statement_timeout — and
+// returns nil for a plain client cancellation. Lock-wait sites that retry on
+// connection teardown (epqWait, the row-lock chain walk) use it so only an
+// explicit timeout aborts the statement. M0118-0009.
+func lockWaitTimeoutError(err error) *ExecError {
+	switch {
+	case errors.Is(err, lockwait.ErrLockTimeout):
+		return &ExecError{Code: "57014", Message: "canceling statement due to lock timeout"}
+	case errors.Is(err, context.DeadlineExceeded):
+		return &ExecError{Code: "57014", Message: "canceling statement due to statement timeout"}
+	default:
+		return nil
+	}
 }
 
 // deadlockTimeout returns the session-effective `deadlock_timeout` GUC as

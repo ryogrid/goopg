@@ -13,6 +13,21 @@ import (
 	"github.com/goopg/goopg/internal/storage"
 )
 
+// rowWaitTimeoutError maps a WaitForXID error that must abort the statement —
+// the session's lock_timeout (lockwait.ErrLockTimeout) or statement_timeout
+// (context.DeadlineExceeded) — to its SQLSTATE-57014 ExecError, tagged with
+// the lock op's position. A plain client cancellation (context.Canceled)
+// returns nil: the long-standing row-lock behaviour is to give up on the row
+// silently when the connection goes away, so only the explicit timeouts
+// surface to the client. M0118-0009 (timeouts).
+func (o *lockRowsOp) rowWaitTimeoutError(werr error) *ExecError {
+	ee := lockWaitTimeoutError(werr)
+	if ee != nil {
+		ee.Pos = o.plan.Pos()
+	}
+	return ee
+}
+
 // lockRowsOp is the runtime for `SELECT … FOR UPDATE / FOR SHARE`
 // (M0021-0003 — Stage A). Acquires the upstream-canonical
 // relation-level lock on each LockedRel.Table at Open time and
@@ -858,7 +873,10 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 			}
 			for _, hx := range multiHolders {
 				if werr := o.ctx.TxnMgr.WaitForXID(qctx, hx); werr != nil {
-					// Context cancelled — skip this row silently.
+					if ee := o.rowWaitTimeoutError(werr); ee != nil {
+						return storage.ItemPointer{}, false, false, ee
+					}
+					// Plain client cancel — skip this row silently.
 					return storage.ItemPointer{}, false, false, nil
 				}
 			}
@@ -892,7 +910,10 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 				qctx = context.Background()
 			}
 			if werr := o.ctx.TxnMgr.WaitForXID(qctx, xmax); werr != nil {
-				// Context cancelled — skip this row silently.
+				if ee := o.rowWaitTimeoutError(werr); ee != nil {
+					return storage.ItemPointer{}, false, false, ee
+				}
+				// Plain client cancel — skip this row silently.
 				return storage.ItemPointer{}, false, false, nil
 			}
 		}
@@ -1025,7 +1046,10 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 				}
 				for _, hx := range conflicting {
 					if werr := o.ctx.TxnMgr.WaitForXID(qctx, hx); werr != nil {
-						// Context cancelled — skip this row silently.
+						if ee := o.rowWaitTimeoutError(werr); ee != nil {
+							return storage.ItemPointer{}, false, false, ee
+						}
+						// Plain client cancel — skip this row silently.
 						return storage.ItemPointer{}, false, false, nil
 					}
 				}
@@ -1801,7 +1825,10 @@ func (o *lockRowsOp) propagateLockForward(rel storage.RelFileNode, start storage
 					qctx = context.Background()
 				}
 				if werr := o.ctx.TxnMgr.WaitForXID(qctx, waitXID); werr != nil {
-					// Context cancelled — give up on the chain walk silently;
+					if ee := o.rowWaitTimeoutError(werr); ee != nil {
+						return chainLockOK, storage.ItemPointer{}, ee
+					}
+					// Plain client cancel — give up on the chain walk silently;
 					// the caller keeps the originally-locked version.
 					return chainLockOK, storage.ItemPointer{}, nil
 				}

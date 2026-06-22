@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/goopg/goopg/internal/lockwait"
 )
 
 // ErrDeadlockDetected is returned by Acquire when the deadlock
@@ -461,6 +463,18 @@ func (lm *LockManager) acquire(ctx context.Context, b BackendID, t LockTag, m Mo
 		defer timer.Stop()
 	}
 
+	// Arm the session's lock_timeout, if set. Like upstream's
+	// enable_timeout_after(LOCK_TIMEOUT) at the top of ProcSleep, the timer
+	// starts when THIS wait begins; expiry aborts the acquire with the
+	// dedicated lock-timeout sentinel (distinct from a statement_timeout,
+	// which arrives through ctx.Done()). M0118-0009 (timeouts).
+	var lockTimeoutCh <-chan time.Time
+	if d, ok := lockwait.Timeout(ctx); ok {
+		lt := time.NewTimer(d)
+		defer lt.Stop()
+		lockTimeoutCh = lt.C
+	}
+
 	select {
 	case <-w.signal:
 		// Promoted to holder by Release's wake-pass.
@@ -473,34 +487,47 @@ func (lm *LockManager) acquire(ctx context.Context, b BackendID, t LockTag, m Mo
 		// progress without waiting for an explicit ReleaseAll.
 		lm.ReleaseAll(b)
 		return ErrDeadlockDetected
+	case <-lockTimeoutCh:
+		// lock_timeout elapsed while parked. Unpark with the same
+		// bookkeeping as a cancellation and report the lock-timeout
+		// sentinel so the executor emits "canceling statement due to
+		// lock timeout".
+		lm.unparkWaiter(t, w, b, m)
+		return lockwait.ErrLockTimeout
 	case <-ctx.Done():
-		// Splice ourselves out of the queue if we're still there;
-		// a racing wake-pass may have already promoted us.
-		lm.mu.Lock()
-		st := lm.states[t]
-		if st != nil {
-			for i, q := range st.waiters {
-				if q == w {
-					st.waiters = append(st.waiters[:i], st.waiters[i+1:]...)
-					break
-				}
-			}
-			// If a Release promoted us between the ctx cancel and
-			// our taking lm.mu, the holder bit is set — release it
-			// to keep state consistent with the cancelled return.
-			if st.holders[b]&bit(m) != 0 {
-				st.holders[b] &^= bit(m)
-				if st.holders[b] == 0 {
-					delete(st.holders, b)
-				}
-				st.recomputeGranted()
-				lm.wakePassLocked(t, st)
-			}
-			lm.gcLocked(t, st)
-		}
-		lm.mu.Unlock()
+		lm.unparkWaiter(t, w, b, m)
 		return ctx.Err()
 	}
+}
+
+// unparkWaiter removes waiter w (backend b's pending request for mode m on
+// tag t) from the wait queue after the wait was abandoned (ctx cancellation
+// or lock_timeout). It is splice-and-repair: if a racing Release promoted us
+// to holder between the wakeup and our taking lm.mu, the momentarily-set
+// holder bit is dropped and the queue re-pumped so the abandoned grant does
+// not strand the next waiter.
+func (lm *LockManager) unparkWaiter(t LockTag, w *Waiter, b BackendID, m Mode) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	st := lm.states[t]
+	if st == nil {
+		return
+	}
+	for i, q := range st.waiters {
+		if q == w {
+			st.waiters = append(st.waiters[:i], st.waiters[i+1:]...)
+			break
+		}
+	}
+	if st.holders[b]&bit(m) != 0 {
+		st.holders[b] &^= bit(m)
+		if st.holders[b] == 0 {
+			delete(st.holders, b)
+		}
+		st.recomputeGranted()
+		lm.wakePassLocked(t, st)
+	}
+	lm.gcLocked(t, st)
 }
 
 // Release drops mode `m` from backend `b`'s holdings on tag `t`.

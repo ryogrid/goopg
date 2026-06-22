@@ -114,13 +114,18 @@ func deregisterWFG(myXID storage.TransactionID) {
 // deadlock is possible. Context cancellation (connection close, query
 // timeout) is propagated via commitCond.Broadcast inside WaitForXID.
 // M0098-0004, M0099-0004, M0100-0003.
-func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool) {
+// The second result, timeout, is non-nil when the wait was aborted by the
+// session's lock_timeout or statement_timeout: the caller must surface it
+// (SQLSTATE 57014) instead of retrying. A plain client cancellation is still
+// swallowed (returns false, nil) so connection teardown falls through to the
+// snapshot refresh + caller retry as before. M0118-0009.
+func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool, timeout *ExecError) {
 	if ctx.TxnMgr == nil {
-		return false
+		return false, nil
 	}
 	if ctx.Tx.XID != storage.InvalidTransactionID {
 		if registerWFGAndCheckCycle(ctx.Tx.XID, xmax) {
-			return true
+			return true, nil
 		}
 		defer deregisterWFG(ctx.Tx.XID)
 	}
@@ -128,16 +133,20 @@ func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool) {
 	// All four call sites release page pins before reaching here
 	// (verified at lines 923-924, 1159-1160, 1333-1334, 1520-1521).
 	if ctx.Ctx != nil {
-		// Ignore cancellation errors — treat as a non-deadlock signal
-		// and fall through to the snapshot refresh + caller retry.
-		_ = ctx.TxnMgr.WaitForXID(ctx.Ctx, xmax)
+		if werr := ctx.TxnMgr.WaitForXID(ctx.Ctx, xmax); werr != nil {
+			if ee := lockWaitTimeoutError(werr); ee != nil {
+				return false, ee
+			}
+			// Plain cancellation: treat as a non-deadlock signal and fall
+			// through to the snapshot refresh + caller retry.
+		}
 	}
 	// Refresh the snapshot so the next epqRecheckVisible call sees any
 	// committed changes from the conflicting transaction.
 	if snap, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
 		ctx.Snap = snap.Clone()
 	}
-	return false
+	return false, nil
 }
 
 // epqRecheckVisible re-reads the tuple at (rel, blk, slot) and reports
@@ -2322,7 +2331,9 @@ func tryApplyHOTUpdate(
 		xmax := concurrentModifierXID(oldTuple.Header, ctx.MultiXact)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		if epqWait(ctx, xmax) {
+		if dl, terr := epqWait(ctx, xmax); terr != nil {
+			return false, terr
+		} else if dl {
 			// Deadlock detected — surface 40001 immediately rather than
 			// looping into the delete+insert EPQ path.
 			return false, &ExecError{
@@ -2708,7 +2719,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// the original snapshot, matching PG's EvalPlanQual semantics
 					// (chain-follow uses refreshed snapshot; qual eval uses origSnap).
 					origSnap := o.ctx.Snap
-					if epqWait(o.ctx, xmax) {
+					if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+						terr.Pos = o.plan.Pos()
+						return nil, terr
+					} else if dl {
 						return nil, &ExecError{
 							Code:    "40001",
 							Pos:     o.plan.Pos(),
@@ -3198,7 +3212,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update"}
 					}
-					if epqWait(o.ctx, xmax) {
+					if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+						terr.Pos = o.plan.Pos()
+						return terr
+					} else if dl {
 						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update (deadlock)"}
 					}
@@ -3389,7 +3406,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 							Message: "could not serialize access due to concurrent update",
 						}
 					}
-					if epqWait(o.ctx, xmax) {
+					if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+						terr.Pos = o.plan.Pos()
+						return nil, terr
+					} else if dl {
 						return nil, &ExecError{
 							Code:    "40001",
 							Pos:     o.plan.Pos(),
@@ -3860,7 +3880,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update"}
 					}
-					if epqWait(o.ctx, xmax) {
+					if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+						terr.Pos = o.plan.Pos()
+						return terr
+					} else if dl {
 						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update (deadlock)"}
 					}
@@ -3982,7 +4005,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 						Message: "could not serialize access due to concurrent update",
 					}
 				}
-				if epqWait(o.ctx, xmax) {
+				if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+					terr.Pos = o.plan.Pos()
+					return nil, terr
+				} else if dl {
 					return nil, &ExecError{
 						Code:    "40001",
 						Pos:     o.plan.Pos(),
@@ -4371,7 +4397,10 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 						Message: "could not serialize access due to concurrent update"}
 				}
 				origSnap := o.ctx.Snap
-				if epqWait(o.ctx, xmax) {
+				if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+					terr.Pos = o.plan.Pos()
+					return nil, terr
+				} else if dl {
 					return nil, &ExecError{Code: "40P01", Pos: o.plan.Pos(),
 						Message: "deadlock detected"}
 				}
@@ -5008,7 +5037,10 @@ func waitForConflictingRowLock(ctx *Context, rel storage.RelFileNode, blk storag
 			return nil
 		}
 		for _, hx := range holders {
-			if epqWait(ctx, hx) {
+			if dl, terr := epqWait(ctx, hx); terr != nil {
+				terr.Pos = pos
+				return terr
+			} else if dl {
 				return &ExecError{Code: "40001", Pos: pos,
 					Message: "could not serialize access due to concurrent update (deadlock)"}
 			}

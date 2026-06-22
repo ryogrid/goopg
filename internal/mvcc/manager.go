@@ -7,7 +7,9 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/goopg/goopg/internal/lockwait"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -589,11 +591,27 @@ func (m *Manager) WaitForXID(ctx context.Context, xid storage.TransactionID) err
 	}()
 	defer close(done)
 
+	// Arm the session's lock_timeout, if set. The deadline is taken from the
+	// start of THIS wait (mirroring upstream's per-ProcSleep arming); when it
+	// elapses the wait returns ErrLockTimeout so the executor emits
+	// "canceling statement due to lock timeout", distinct from a
+	// statement_timeout that arrives via ctx cancellation. M0118-0009.
+	lockTimeout, hasLockTimeout := lockwait.Timeout(ctx)
+	var lockDeadline time.Time
+	if hasLockTimeout {
+		lockDeadline = time.Now().Add(lockTimeout)
+		lt := time.AfterFunc(lockTimeout, func() { m.commitCond.Broadcast() })
+		defer lt.Stop()
+	}
+
 	m.waitMu.Lock()
 	defer m.waitMu.Unlock()
 	for m.xidActiveWithSubxact(xid) {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if hasLockTimeout && !time.Now().Before(lockDeadline) {
+			return lockwait.ErrLockTimeout
 		}
 		m.commitCond.Wait()
 	}

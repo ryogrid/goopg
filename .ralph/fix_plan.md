@@ -290,7 +290,19 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       the old tuple's non-conflicting lockers forward onto the new tuple version
       (`carryForwardLockersToNewTuple` + shared `survivingLockersForUpdate`, the
       new-version half of heap_update) so after the updater commits s3 FOR UPDATE
-      waits on the inherited KEY SHARE. **Remaining (deferred, ledger 2026-06-22):**
-      lock carry-forward on the non-HOT update paths (delete+insert / `UPDATE…FROM`
-      / MERGE / upsert) — bounded follow-up, same narrow gate, not exercised by any
-      current `port` spec. Plus the other M0118-0009 misc specs untouched.
+      waits on the inherited KEY SHARE. `timeouts` ROW-LEVEL half implemented
+      (design 0118-0017) — `lock_timeout` GUC now armed in `lockmgr.acquire` +
+      `mvcc.WaitForXID` via new leaf pkg `internal/lockwait`; lock-wait cancel
+      messages corrected (statement_timeout→"statement timeout",
+      lock_timeout→"lock timeout", client cancel→"user request"); `epqWait`
+      propagates timeouts to ~11 write-path sites instead of swallowing into a
+      spurious 40001. Verified `TestPort_TimeoutsRowLevel` 4/4; NOT promoted
+      (table-level half needs ACCESS SHARE on scans — deferred). **Remaining
+      (deferred, ledger 2026-06-22):** (a) `timeouts` table-level half: plain
+      SELECT must take a txn-scoped ACCESS SHARE on `tableLockMgr` so a later
+      `LOCK TABLE` conflicts — perf-sensitive design reversal; gate on
+      `TxnLockBackendID` like LOCK TABLE, then promote `timeouts.spec`.
+      (b) lock carry-forward on the non-HOT update paths (delete+insert /
+      `UPDATE…FROM` / MERGE / upsert) — bounded follow-up, same narrow gate, not
+      exercised by any current `port` spec. Plus the other M0118-0009 misc specs
+      untouched.

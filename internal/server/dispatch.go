@@ -16,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/lockwait"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -679,11 +680,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// context.DeadlineExceeded and the executor surfaces error 57014.
 		savedCtx := ectx.Ctx
 		var stmtCancel context.CancelFunc
+		stmtCtx := ctx
 		if timeoutMs := sessionStatementTimeout(sess); timeoutMs > 0 {
-			var stmtCtx context.Context
 			stmtCtx, stmtCancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
-			ectx.Ctx = stmtCtx
 		}
+		// Carry the session's lock_timeout down to the lock-wait primitives
+		// (lockmgr / WaitForXID) so a statement that blocks on a lock is
+		// aborted with "canceling statement due to lock timeout" after the
+		// configured interval, independent of statement_timeout. M0118-0009.
+		if ltMs := sessionLockTimeout(sess); ltMs > 0 {
+			stmtCtx = lockwait.WithTimeout(stmtCtx, time.Duration(ltMs)*time.Millisecond)
+		}
+		ectx.Ctx = stmtCtx
 		err := s.executeOneSimpleStmt(w, ectx, stmt, connTx, &autoCommit, precached)
 		if stmtCancel != nil {
 			stmtCancel()
@@ -824,6 +832,27 @@ func sessionStatementTimeout(sess *config.SessionRegistry) int64 {
 		return 0
 	}
 	_, eff, ok := sess.Get("statement_timeout")
+	if !ok {
+		return 0
+	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64)
+	if err != nil || ms <= 0 {
+		return 0
+	}
+	return ms
+}
+
+// sessionLockTimeout reads the effective `lock_timeout` GUC from the session
+// and returns it in milliseconds. Returns 0 (no timeout) if the setting is
+// missing, zero, or unparseable. Unlike statement_timeout this bounds only
+// the time spent *waiting for a lock*, so it is plumbed into the lock-wait
+// primitives via lockwait.WithTimeout rather than the statement deadline.
+// M0118-0009.
+func sessionLockTimeout(sess *config.SessionRegistry) int64 {
+	if sess == nil {
+		return 0
+	}
+	_, eff, ok := sess.Get("lock_timeout")
 	if !ok {
 		return 0
 	}

@@ -814,7 +814,10 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		xmax := concurrentModifierXID(oldTup.Header, ctx.MultiXact)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		if epqWait(ctx, xmax) {
+		if dl, terr := epqWait(ctx, xmax); terr != nil {
+			terr.Pos = pos
+			return terr
+		} else if dl {
 			return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
 		}
 		// For RC: refresh snapshot so committed xmax is visible as "deleted"
@@ -932,7 +935,10 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		xmax := concurrentModifierXID(oldTup.Header, ctx.MultiXact)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		if epqWait(ctx, xmax) {
+		if dl, terr := epqWait(ctx, xmax); terr != nil {
+			terr.Pos = pos
+			return terr
+		} else if dl {
 			return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
 		}
 		// Refresh snapshot (RC) so the committed xmax is visible as "deleted".
