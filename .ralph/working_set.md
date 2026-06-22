@@ -1,26 +1,34 @@
-(idle — nothing in flight)
+Loop #42: M0118-0008 enabler (design 0118-0044) — NOT a promotion.
 
-Loop #41: COMPLETED the M0118-0003 row-lock hardening begun in 0118-0042.
-Promoted the remaining 16 dedicated row-lock isolation tests from soft
-`runIsoSpec` (silent t.Skip on a regression) to strict `runIsoSpecStrict`
-(hard red): nowait{,-2,-3,-4,-5}, lock-nowait, tuplelock-{conflict,update,
-partition,upgrade-no-deadlock}, lock-update-{traversal,delete},
-update-locked-tuple, propagate-lock-delete, lock-committed-{update,keyupdate}.
-All 16 already byte-match PG 18.3 — NO engine change. **All 20 M0118-0003
-row-lock specs are now strict; none can regress silently.**
+Made the isolation harness's `splitSQLStatements` dollar-quote aware. It
+handled single-quotes + `--` comments but NOT `$$…$$`/`$tag$…$tag$`, so a
+`do $$ … commit; … $$;` STEP body (plpgsql-toast) was split at the first
+body-internal `;` and goopg got the truncated `do $$\n declare x text` →
+false `unterminated dollar-quoted string` lex error (a harness artifact;
+goopg lexes `$$` fine). New `dollarOpener` helper recognises a `$tag$`
+opener (empty/identifier tag, no `$` inside, rejects `$1`); splitter tracks
+an active `dollarCloser`, copies bytes verbatim until the exact closer.
 
-Verified: single `go test -run` over the family through scripts/goopg-test-run.sh
-returned `ok` in ~83 s (strict helper fails, never skips, on a non-pass — so
-`ok` proves every one passed). go vet clean.
+Setup blocks (dollar-quoted CREATE FUNCTION) bypass the splitter
+(execGlobalSetup/execConnSetupCapture) so unaffected. Only `merge-update` is
+already-strict with a dollar-quoted step; its `$$` has no top-level `;` →
+byte-identical under both splitters (verified strict PASS).
 
-Files: internal/testport/isolation_port_test.go (16 helper switches);
-docs/design/0118-0043-rowlock-family-strict.md + README index row;
-fix_plan M0118-0003 note.
+Result: plpgsql-toast's first divergence now points at the REAL blocker —
+`unsupported PL/pgSQL statement` (COMMIT inside a DO block). Still deferred.
 
-Gates: 16 promoted tests strict PASS; build+vet clean; ralph-state-guard OK
-(repaired prev-loop completed marker); pgbench smoke = pre-commit hook.
+Files: internal/testport/framework/isolation_runner.go (splitSQLStatements +
+dollarOpener); internal/testport/framework/isolation_test.go
+(TestSplitSQLStatementsDollarQuote); docs/design/0118-0044-* + README index;
+fix_plan M0118-0008 note; deferral ledger.
 
-Next step: tackle the M0118-0008 engine-work tail (cheapest first-divergence
-first: plpgsql-toast dollar-quoted-string ($$) parsing, then
-detach-partition-concurrently / alter-table-{1,2,4} ADD/VALIDATE CONSTRAINT
-lock semantics). These need real engine work, not a helper flip.
+Gates: TestSplitSQLStatementsDollarQuote PASS; framework pkg PASS;
+TestPort_IsolationMergeUpdate strict PASS (no regression); go vet clean;
+ralph-state-guard; pgbench smoke = pre-commit hook.
+
+Next step: M0118-0008 hard tail needs real engine work. Cheapest probed:
+`vacuum-no-cleanup-lock` (add `vacuum_multixact_freeze_min_age` GUC +
+reltuples/relpages accounting under a pin holder) OR parser additions
+(`NOT VALID`/`VALIDATE CONSTRAINT` for alter-table-1/2). The alter-table-4 /
+partition-attach/detach specs need transactional-DDL cross-session
+visibility (goopg applies catalog DDL immediately) — a large subsystem.

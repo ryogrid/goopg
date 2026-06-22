@@ -795,16 +795,36 @@ func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session str
 }
 
 // splitSQLStatements splits a multi-statement SQL block into individual
-// statement strings. Handles single-quoted strings (with ” escapes) and
-// single-line (--) comments. Sufficient for all isolation spec files.
+// statement strings. Handles single-quoted strings (with ” escapes),
+// dollar-quoted strings ($$...$$ / $tag$...$tag$), and single-line (--)
+// comments. Dollar-quote awareness is required for PL/pgSQL DO blocks and
+// function bodies whose payload embeds its own statement-terminating
+// semicolons (e.g. `do $$ ... commit; ... $$;` in plpgsql-toast): a naive
+// split on `;` would cut the block inside the body and hand goopg an
+// unterminated dollar-quoted string.
 func splitSQLStatements(sql string) []string {
 	var stmts []string
 	var cur strings.Builder
 	inSingleQuote := false
+	// dollarCloser is the active dollar-quote terminator (e.g. "$$" or
+	// "$body$") while inside a dollar-quoted literal; empty when not.
+	dollarCloser := ""
 
 	i := 0
 	for i < len(sql) {
 		c := sql[i]
+
+		if dollarCloser != "" {
+			if c == '$' && i+len(dollarCloser) <= len(sql) && sql[i:i+len(dollarCloser)] == dollarCloser {
+				cur.WriteString(dollarCloser)
+				i += len(dollarCloser)
+				dollarCloser = ""
+				continue
+			}
+			cur.WriteByte(c)
+			i++
+			continue
+		}
 
 		if inSingleQuote {
 			cur.WriteByte(c)
@@ -819,6 +839,19 @@ func splitSQLStatements(sql string) []string {
 			}
 			i++
 			continue
+		}
+
+		if c == '$' {
+			// Try to open a dollar-quoted literal: $tag$ where tag is
+			// empty or a SQL identifier (no '$' inside the tag). If the
+			// closing '$' of the opener is absent it is a positional
+			// parameter ($1) or stray '$' — fall through to copy it.
+			if closer, n := dollarOpener(sql, i); n > 0 {
+				cur.WriteString(sql[i : i+n])
+				dollarCloser = closer
+				i += n
+				continue
+			}
 		}
 
 		switch c {
@@ -852,6 +885,30 @@ func splitSQLStatements(sql string) []string {
 		stmts = append(stmts, stmt)
 	}
 	return stmts
+}
+
+// dollarOpener checks whether a dollar-quote literal opens at sql[i] (which
+// must be '$'). On success it returns the matching closer string (e.g. "$$"
+// or "$body$") and the byte length of the opener; otherwise ("", 0). The tag
+// between the dollar signs is empty or a SQL identifier and cannot itself
+// contain a '$' (PG manual §4.1.2.4).
+func dollarOpener(sql string, i int) (string, int) {
+	j := i + 1
+	for j < len(sql) {
+		ch := sql[j]
+		if ch == '$' {
+			opener := sql[i : j+1] // includes both '$' delimiters
+			return opener, len(opener)
+		}
+		isTagChar := ch == '_' ||
+			(ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(j > i+1 && ch >= '0' && ch <= '9')
+		if !isTagChar {
+			return "", 0
+		}
+		j++
+	}
+	return "", 0
 }
 
 // execOneStatement executes a single SQL statement on conn and returns the

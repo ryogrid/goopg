@@ -598,6 +598,19 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `vacuum-no-cleanup-lock` (reltuples accounting), `plpgsql-toast` (TOAST in
       PL/pgSQL). FK/MERGE/VACUUM inherit-temp filtering (bounded follow-up). Group
       stays open.
+      **2026-06-23 enabler (design 0118-0044, NOT a promotion):** made the
+      isolation harness's `splitSQLStatements` dollar-quote aware (new
+      `dollarOpener` + active-`dollarCloser` tracking) so a `do $$ … commit; …
+      $$;` step is no longer split at the first body-internal `;` — `plpgsql-toast`'s
+      first divergence moved from a harness-induced `unterminated dollar-quoted
+      string` lex error to the real blocker, `unsupported PL/pgSQL statement`
+      (`COMMIT` inside a `DO` block). Test-harness only; `merge-update` strict
+      no-regression; unit `TestSplitSQLStatementsDollarQuote`. Probe ranking of
+      the remaining tail: most specs (`alter-table-4`, partition ATTACH/DETACH)
+      apply DDL immediately/non-transactionally so a concurrent parent SELECT
+      neither waits nor sees the pre-change child set — the hard tail needs
+      transactional-DDL cross-session visibility; others need parser support
+      (`NOT VALID`/`VALIDATE CONSTRAINT`, `DETACH … CONCURRENTLY`).
 - [ ] **M0118-0009** — Misc / system-level specs: async-notify, timeouts, stats, horizons,
       freeze-the-dead, inplace-inval, intra-grant-inplace{,-db}, subxid-overflow,
       prepared-transactions{,-cic}, temp-schema-cleanup, multixact-no-forget,
