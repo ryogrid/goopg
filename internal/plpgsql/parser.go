@@ -289,6 +289,16 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 			return nil, p.errAtCur("expected ';' to terminate NULL statement")
 		}
 		return &NullStmt{pos: nullTok.Pos}, nil
+	// COMMIT; / ROLLBACK; — PL/pgSQL transaction control (non-atomic context
+	// only). M0118-0008 (plpgsql-toast).
+	case t.Kind == parser.TokenKeyword && (t.Keyword == parser.KwCommit || t.Keyword == parser.KwRollback):
+		tok := p.cur()
+		rollback := t.Keyword == parser.KwRollback
+		p.advance() // consume COMMIT/ROLLBACK
+		if !p.acceptSymbol(";") {
+			return nil, p.errAtCur("expected ';' to terminate transaction-control statement")
+		}
+		return &TxControlStmt{pos: tok.Pos, Rollback: rollback}, nil
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwExit:
 		return p.parseExit()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwContinue:

@@ -222,6 +222,16 @@ type Context struct {
 	BeginLocalTransaction func()
 	EndLocalTransaction   func()
 
+	// PLpgSQLCommitChain commits (rollback=false) or rolls back (rollback=true)
+	// the current transaction and immediately begins a fresh one, updating
+	// ctx.Tx / ctx.Snap in place. It backs PL/pgSQL `COMMIT;` / `ROLLBACK;`
+	// transaction-control statements in a non-atomic execution context (a
+	// top-level DO block / procedure run outside an explicit transaction). It is
+	// installed by the simple-query dispatch ONLY when the statement runs in
+	// auto-commit mode; inside an explicit BEGIN block it is nil, so the runtime
+	// raises SQLSTATE 2D000 (invalid transaction termination). M0118-0008.
+	PLpgSQLCommitChain func(rollback bool) error
+
 	// EnableOpportunisticPrune mirrors the enable_opportunistic_prune
 	// GUC (M0046-0002). When true, the HOT-update path calls
 	// PagePruneOpt before falling back to a relation extension.

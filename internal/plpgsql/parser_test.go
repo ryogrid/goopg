@@ -181,6 +181,33 @@ func TestParseExceptionHandlerNullBody(t *testing.T) {
 	}
 }
 
+// TestParseTransactionControl: `COMMIT;` and `ROLLBACK;` parse into
+// TxControlStmt nodes (PL/pgSQL transaction control). M0118-0008 (plpgsql-toast).
+func TestParseTransactionControl(t *testing.T) {
+	for _, tc := range []struct {
+		src      string
+		rollback bool
+	}{
+		{"BEGIN COMMIT; END", false},
+		{"BEGIN ROLLBACK; END", true},
+	} {
+		blk, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("%q: expected parse, got %v", tc.src, err)
+		}
+		if len(blk.Statements) != 1 {
+			t.Fatalf("%q: got %d stmts, want 1", tc.src, len(blk.Statements))
+		}
+		st, ok := blk.Statements[0].(*TxControlStmt)
+		if !ok {
+			t.Fatalf("%q: stmt = %T, want *TxControlStmt", tc.src, blk.Statements[0])
+		}
+		if st.Rollback != tc.rollback {
+			t.Errorf("%q: Rollback = %v, want %v", tc.src, st.Rollback, tc.rollback)
+		}
+	}
+}
+
 // TestParseReturnExpressionError: a malformed expression inside
 // RETURN surfaces a SyntaxError pinned at the expression's start
 // position so the diagnostic points at the offending source.

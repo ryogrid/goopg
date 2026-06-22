@@ -196,6 +196,20 @@ type NullStmt struct {
 func (n *NullStmt) Pos() int         { return n.pos }
 func (n *NullStmt) plpgsqlStmtNode() {}
 
+// TxControlStmt is a PL/pgSQL transaction-control statement: `COMMIT;` or
+// `ROLLBACK;`. Permitted only in a non-atomic execution context (a top-level
+// DO block or a procedure invoked outside an explicit transaction block); in
+// an atomic context it raises SQLSTATE 2D000 (invalid transaction
+// termination). After a COMMIT/ROLLBACK the surrounding routine continues in a
+// fresh transaction. M0118-0008 (plpgsql-toast).
+type TxControlStmt struct {
+	pos      int
+	Rollback bool // false = COMMIT, true = ROLLBACK
+}
+
+func (t *TxControlStmt) Pos() int         { return t.pos }
+func (t *TxControlStmt) plpgsqlStmtNode() {}
+
 // ReturnStmt is `RETURN expr;`. Stage A only emits scalar return
 // values; SETOF / TABLE / RETURN NEXT / RETURN QUERY arrive in
 // Stage B.

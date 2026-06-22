@@ -1144,6 +1144,22 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		// `NULL;` — no-op placeholder. M0118-0009.
 		return Datum{}, flowNone, nil
 
+	case *plpgsql.TxControlStmt:
+		// `COMMIT;` / `ROLLBACK;` — transaction control inside a non-atomic
+		// PL/pgSQL routine (top-level DO / procedure outside an explicit
+		// transaction block). The dispatch installs PLpgSQLCommitChain only in
+		// auto-commit mode; when it is nil we are in an atomic context, which
+		// PG rejects with SQLSTATE 2D000 (invalid transaction termination).
+		// M0118-0008 (plpgsql-toast).
+		if ctx.PLpgSQLCommitChain == nil {
+			return Datum{}, flowNone, &ExecError{Code: "2D000", Pos: s.Pos(),
+				Message: "invalid transaction termination"}
+		}
+		if err := ctx.PLpgSQLCommitChain(s.Rollback); err != nil {
+			return Datum{}, flowNone, err
+		}
+		return Datum{}, flowNone, nil
+
 	case *plpgsql.ExitStmt:
 		if s.Cond != nil {
 			cond, err := evalPLpgSQLExpr(s.Cond, frame, ctx)

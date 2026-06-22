@@ -615,6 +615,25 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (post-detach SELECT rows now correct). Full promotion still deferred on the
       Effort-L two-phase concurrent-detach + transactional-DDL cross-session
       catalog visibility. `TestParseAlterTableDetachPartition` PASS.
+      **2026-06-23 enabler (design 0118-0049, NOT a promotion): PL/pgSQL
+      transaction control.** `COMMIT;`/`ROLLBACK;` inside a non-atomic DO block
+      (top-level / procedure outside an explicit txn) now commit/roll back the
+      current transaction and chain into a fresh one; an atomic context (DO
+      inside `BEGIN … COMMIT`) raises SQLSTATE `2D000`. New `Context.PLpgSQLCommitChain`
+      callback bridges the server-owned txn lifecycle to the executor; the
+      dispatch installs it only in auto-commit mode (closure commits/rolls back
+      the current `tx`, releases only xact-scoped advisory locks, begins a fresh
+      RC tx+snapshot, reassigns the outer `tx`/`snap` + `ctx.Tx`/`ctx.Snap`).
+      New `TxControlStmt` AST/parser/runtime. Lifts `plpgsql-toast`'s first
+      blocker (`unsupported PL/pgSQL statement` at `COMMIT`); its divergence now
+      advances to the next gap — PL/pgSQL `SELECT … INTO var`/record handling
+      (deferred, separate Effort-L slice; goopg captures `SELECT … INTO x` as
+      raw embedded SQL and mis-parses it as SQL `SELECT … INTO <table>`). Blast
+      radius nil (only the new `TxControlStmt` case calls the callback). Gates:
+      `TestParseTransactionControl`; `TestPlpgSQLDoCommitChainDurability`/
+      `…RollbackChain`/`…CommitInExplicitBlockRejected`;
+      `TestPort_IsolationSubxidOverflow`/`FreezeTheDead` strict PASS (no
+      regression); executor+server units; `go vet`; pgbench smoke.
       **Remaining (deferred):** `alter-table-4` (INHERITS + transactional-DDL
       cross-session visibility), `detach-partition-concurrently-{1,2,3,4}` +
       `partition-concurrent-attach` (transactional partition visibility),

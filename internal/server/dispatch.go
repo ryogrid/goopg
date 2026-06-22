@@ -399,6 +399,43 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		s.wireExtensionRows(ectx, connTx.DBName)
 	}
 
+	// Wire PL/pgSQL transaction control (COMMIT/ROLLBACK inside a DO block or a
+	// procedure) ONLY in auto-commit mode — i.e. not inside an explicit BEGIN
+	// block, where PG rejects transaction termination (SQLSTATE 2D000). The
+	// callback commits/rolls back the current auto-commit transaction and chains
+	// into a fresh one, updating the outer `tx`/`snap` so the trailing
+	// auto-commit (and per-statement RC snapshot refresh) operate on the new
+	// transaction. Session-scoped advisory locks survive (only xact-scoped locks
+	// are released), matching PG. M0118-0008 (plpgsql-toast).
+	if autoCommit {
+		var chainPN int32
+		if connTx != nil {
+			chainPN = connTx.ProcNum
+		}
+		ectx.PLpgSQLCommitChain = func(rollback bool) error {
+			if rollback {
+				_ = s.cfg.TxnMgr.Rollback(tx)
+			} else if cerr := s.cfg.TxnMgr.Commit(tx); cerr != nil {
+				return cerr
+			}
+			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
+			newTx, berr := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, chainPN)
+			if berr != nil {
+				return berr
+			}
+			newSnap, serr := s.cfg.TxnMgr.SnapshotFor(newTx)
+			if serr != nil {
+				_ = s.cfg.TxnMgr.Rollback(newTx)
+				return serr
+			}
+			tx = newTx
+			snap = newSnap
+			ectx.Tx = newTx
+			ectx.Snap = newSnap
+			return nil
+		}
+	}
+
 	// Update pg_stat_activity before dispatching.
 	// M0107-0005: use procNum (int32) for the atomic hot path.
 	if reg := s.cfg.Activity; reg != nil && connTx != nil {
