@@ -67,19 +67,32 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 	}
 	for _, at := range targets {
 		tbl := at.tbl
-		// ANALYZE (SKIP_LOCKED): take the per-relation ShareUpdateExclusiveLock
-		// conditionally (analyze.c uses ShareUpdateExclusiveLock). A contended
-		// relation is skipped — with a WARNING only when the user named it
-		// explicitly; partition children reached by expanding a partitioned
-		// table are skipped silently. M0118-0008 (vacuum-skip-locked).
+		rel := o.ctx.Catalog.RelFileNode(tbl)
+		// ANALYZE takes the per-relation ShareUpdateExclusiveLock (analyze.c).
+		// With SKIP_LOCKED the acquire is conditional and a contended relation is
+		// skipped — with a WARNING only when the user named it explicitly;
+		// partition children reached by expanding a partitioned table are skipped
+		// silently. Without SKIP_LOCKED the acquire blocks, so ANALYZE waits
+		// behind a conflicting holder such as LOCK ... IN SHARE MODE. M0118-0008.
 		if o.stmt.SkipLocked {
-			rel := o.ctx.Catalog.RelFileNode(tbl)
 			if !o.ctx.tryAcquireMaintenanceLock(rel, lockmgr.ShareUpdateExclusiveLock) {
 				if at.explicit {
 					o.ctx.AddWarning(fmt.Sprintf("skipping analyze of %q --- lock not available", tbl.Name))
 				}
 				continue
 			}
+		} else if err := o.ctx.acquireRelLockMaybeTransient(rel, lockmgr.ShareUpdateExclusiveLock); err != nil {
+			continue
+		}
+		// After taking the lock the relation may have been dropped by a
+		// transaction that committed while we waited (see vacuumOp). Skip it,
+		// with a WARNING only for an explicitly named target. M0118-0008
+		// (vacuum-concurrent-drop).
+		if !relationStillExists(o.ctx, tbl) {
+			if at.explicit {
+				o.ctx.AddWarning(fmt.Sprintf("skipping analyze of %q --- relation no longer exists", tbl.Name))
+			}
+			continue
 		}
 		stats, err := analyzeRelationCtx(o.ctx, tbl)
 		if err != nil {

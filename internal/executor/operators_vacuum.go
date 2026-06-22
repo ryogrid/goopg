@@ -75,13 +75,32 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 	for _, vt := range targets {
 		tbl := vt.tbl
 		rel := o.ctx.Catalog.RelFileNode(tbl)
-		if vs.SkipLocked && !o.ctx.tryAcquireMaintenanceLock(rel, lmMode) {
-			// Only a relation the user named explicitly produces a WARNING;
-			// partition children reached by expanding a partitioned table are
-			// skipped silently (vacuum.c get_all_vacuum_rels / expand_vacuum_rel
-			// passes a log-skip flag only for explicitly listed relations).
+		if vs.SkipLocked {
+			if !o.ctx.tryAcquireMaintenanceLock(rel, lmMode) {
+				// Only a relation the user named explicitly produces a WARNING;
+				// partition children reached by expanding a partitioned table are
+				// skipped silently (vacuum.c get_all_vacuum_rels / expand_vacuum_rel
+				// passes a log-skip flag only for explicitly listed relations).
+				if vt.explicit {
+					o.ctx.AddWarning(fmt.Sprintf("skipping vacuum of %q --- lock not available", tbl.Name))
+				}
+				continue
+			}
+		} else if err := o.ctx.acquireRelLockMaybeTransient(rel, lmMode); err != nil {
+			// Without SKIP_LOCKED the per-relation lock is acquired blocking
+			// (vacuum.c vacuum_open_relation → LockRelationOid), so VACUUM waits
+			// behind a conflicting holder such as LOCK ... IN SHARE MODE. A
+			// failed acquire (deadlock / cancel) skips just this relation.
+			continue
+		}
+		// After taking the lock the relation may have been dropped by a
+		// transaction that committed while we waited (PG re-checks via
+		// try_relation_open in vacuum_open_relation, logging "skipping ... ---
+		// relation no longer exists" for an explicitly named target, silently
+		// for an expanded partition child). M0118-0008 (vacuum-concurrent-drop).
+		if !relationStillExists(o.ctx, tbl) {
 			if vt.explicit {
-				o.ctx.AddWarning(fmt.Sprintf("skipping vacuum of %q --- lock not available", tbl.Name))
+				o.ctx.AddWarning(fmt.Sprintf("skipping vacuum of %q --- relation no longer exists", tbl.Name))
 			}
 			continue
 		}
@@ -201,6 +220,22 @@ func analyzeInheritanceWait(ctx *Context, parent *catalog.Table) {
 		rel := ctx.Catalog.RelFileNode(child)
 		_ = ctx.acquireRelLockMaybeTransient(rel, lockmgr.AccessShareLock)
 	}
+}
+
+// relationStillExists reports whether tbl is still present in the catalog,
+// looked up by OID. VACUUM/ANALYZE resolve their target list up front, then
+// acquire a per-relation lock that may wait behind a conflicting holder; while
+// waiting, a concurrent transaction can DROP one of the targets and commit.
+// After the lock is taken the relation must be re-checked, mirroring PG's
+// try_relation_open inside vacuum_open_relation. M0118-0008
+// (vacuum-concurrent-drop).
+func relationStillExists(ctx *Context, tbl *catalog.Table) bool {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return true
+	}
+	_, exists := im.LookupTableByOID(tbl.OID)
+	return exists
 }
 
 // vacuumIndexes removes stale B-tree index entries that point to dead heap

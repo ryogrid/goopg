@@ -425,6 +425,21 @@ func TestPort_IsolationVacuumSkipLocked(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-skip-locked.spec")
 }
 
+// TestPort_IsolationVacuumConcurrentDrop exercises the vacuum-concurrent-drop
+// spec (M0118-0008). Without SKIP_LOCKED, VACUUM/ANALYZE take a blocking
+// per-relation ShareUpdateExclusiveLock, so they wait behind a concurrent
+// LOCK ... IN SHARE MODE; after the wait a target dropped by the committing
+// session is re-detected and skipped — with a "relation no longer exists"
+// WARNING for an explicitly named target, silently for an expanded partition
+// child.
+func TestPort_IsolationVacuumConcurrentDrop(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_vacuum_concurrent_drop")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-concurrent-drop.spec")
+}
+
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
 // Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
 func TestPort_IsolationFkSnapshot(t *testing.T) {

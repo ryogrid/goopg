@@ -422,12 +422,47 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       unchanged). `TestPort_IsolationVacuumSkipLocked` strict PASS (16 perms);
       full `TestPort_Isolation*` suite PASS (no severity-change regression);
       framework + executor vacuum/analyze units; `-race` lockmgr; pgbench smoke.
+      **2026-06-22 eighth promotion (design 0118-0035): `vacuum-concurrent-drop`
+      PROMOTED.** `VACUUM`/`ANALYZE` of partition targets while a concurrent
+      session holds `part1` in `SHARE` then DROPs `part2` and commits. Two fixes
+      mirroring `vacuum.c` `vacuum_open_relation`: (1) on the **non-SKIP_LOCKED**
+      path the per-target loop now takes a BLOCKING `ShareUpdateExclusiveLock`
+      (or `AccessExclusiveLock` for `VACUUM FULL`) via
+      `acquireRelLockMaybeTransient` so `s2` waits behind `LOCK part1 IN SHARE
+      MODE` (`<waiting ...>`) instead of proceeding immediately — previously a
+      heavyweight lock was taken only on the SKIP_LOCKED path; (2) after the lock
+      the target is re-checked against the live catalog via the new
+      `relationStillExists` helper (`InMemory.LookupTableByOID`, the
+      `try_relation_open` analog) and a target DROPped by the committing session
+      is skipped — `WARNING: skipping vacuum/analyze of "X" --- relation no
+      longer exists` only for an explicit (`vacuumTarget.explicit`) target,
+      silently for an expanded partition child. `TestPort_IsolationVacuumConcurrentDrop`
+      strict PASS (6 perms); `TestPort_IsolationVacuumSkipLocked` PASS (no
+      regression); executor vacuum/analyze units; `-race` lockmgr; pgbench smoke.
+      **2026-06-22 SRF-in-expression enabler (design 0118-0034, NOT a spec
+      promotion):** fixed a silent row-dropping correctness bug — a
+      set-returning function nested inside a larger SELECT-list scalar
+      expression (e.g. `generate_series(1,1000) % 4`) collapsed to ONE row
+      (the SRF's start value) instead of one row per element, so
+      `INSERT INTO b SELECT generate_series(1,1000) % 4` inserted 1 row not
+      1000. `buildSelectSrfProjectSet` only expanded a BARE target SRF; a
+      nested SRF fell through to the scalar `generate_series` fallback. Fix:
+      detect a nested generate_series, expand it into a temp eval-row slot
+      (`ChildWidth+k`), and apply a WRAPPER expr (the resolved target with the
+      SRF `FuncCall` replaced by a `ColumnRef` to that slot) per step (new
+      `findFirstNestedSRF`/`replaceExprNode`; `SrfCol.Wrapped`,
+      `ProjectSet.{Wrappers,ChildWidth,EvalRowWidth}`; executor builds the
+      eval row + evaluates wrappers). Bounded to generate_series-when-nested;
+      bare/FROM SRFs + no-wrapper path byte-identical. Unblocks the
+      `alter-table-1/2` data setup (still deferred on FK `NOT VALID` parse +
+      `VALIDATE CONSTRAINT` + lock semantics). Gates:
+      `TestSelectListSRFInsideExpression`; planner+executor units;
+      regress-port; pgbench smoke.
       **Remaining (deferred, ledger 2026-06-22):** `alter-table-{1,2,4}`
       (ADD/VALIDATE CONSTRAINT lock semantics; INHERITS), the `*-conflict` family —
       truncate/vacuum/cluster — (need CREATE ROLE/GRANT/SET ROLE privilege infra +
       permission-denied), `reindex-concurrently-toast` (`allow_system_table_mods`
       GUC + TOAST-relation reindex), partition specs (ATTACH/DETACH PARTITION),
-      `vacuum-concurrent-drop` (concurrent DROP during partitioned VACUUM),
       `vacuum-no-cleanup-lock` (reltuples accounting), `inherit-temp`
       (RELATION_IS_OTHER_TEMP exclusion), `plpgsql-toast` (TOAST in PL/pgSQL).
       Group stays open.
