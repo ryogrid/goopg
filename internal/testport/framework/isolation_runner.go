@@ -433,7 +433,19 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 					outcome.notices = q.drain()
 				}
 				sb.WriteString(formatWaitingStepHeader(step.Name, step.SQL))
+				// Report any pending (blocked) step that has since completed BEFORE
+				// this step's own completion. isolationtester reports waiting steps
+				// in dispatch order, and a (*)-marked step may itself have waited on
+				// an earlier-dispatched blocked step (e.g. multiple-cic's s2i waits
+				// for the older concurrent build s1i to drain), so that step's
+				// <... completed> must print first. EXCLUDE pending steps explicitly
+				// gated on THIS step (a BlockerStepComplete, e.g. deadlock-hard's
+				// s7a8(s8a1)): those must print AFTER it. Steps still blocked simply
+				// time out of the drain and stay pending.
+				gatedOnStar, ungated := partitionGatedOn(pending, step.Name)
+				ungated = drainWithTimeout(&sb, spec, sessionQueues, ungated, postStepDrainWait)
 				writeCompletedStep(&sb, step.Name, step.SQL, outcome)
+				pending = append(ungated, gatedOnStar...)
 				pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait)
 			} else {
 				// Honor completion blockers: delay reporting this step's
@@ -711,6 +723,28 @@ func drainCompleted(sb *strings.Builder, spec IsolationSpec, queues map[string]*
 // drainWithTimeout drains pending steps that complete within the given window.
 // After a regular step completes, this lets unblocked waiting steps surface
 // before the next regular step, matching PostgreSQL isolationtester ordering.
+// partitionGatedOn splits pending into (gated, ungated): gated steps carry a
+// BlockerStepComplete that names stepName, meaning isolationtester withholds
+// their completion report until stepName completes. Dispatch order is otherwise
+// preserved within each partition.
+func partitionGatedOn(pending []pendingStep, stepName string) (gated, ungated []pendingStep) {
+	for _, p := range pending {
+		isGated := false
+		for _, b := range p.blockers {
+			if b.Kind == BlockerStepComplete && b.StepName == stepName {
+				isGated = true
+				break
+			}
+		}
+		if isGated {
+			gated = append(gated, p)
+		} else {
+			ungated = append(ungated, p)
+		}
+	}
+	return gated, ungated
+}
+
 func drainWithTimeout(sb *strings.Builder, spec IsolationSpec, queues map[string]*sessionNoticeQueue, pending []pendingStep, window time.Duration) []pendingStep {
 	if len(pending) == 0 {
 		return pending

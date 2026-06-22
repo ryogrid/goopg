@@ -3102,8 +3102,9 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 		}
 		stmt.IfNotExists = true
 	}
-	// Skip optional CONCURRENTLY keyword (goopg builds indexes synchronously).
-	p.acceptIdentKeyword("concurrently")
+	// CONCURRENTLY: goopg builds the index synchronously, but records the flag so
+	// the build waits for already-running transactions to drain before completing.
+	stmt.Concurrently = p.acceptIdentKeyword("concurrently")
 	// Optional index name. If the next token is ON, the name is omitted.
 	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn) {
 		nameTok, err := p.parseIdent()

@@ -1258,6 +1258,11 @@ type CreateIndexStmt struct {
 	Predicate          Expr     // WHERE predicate expression (nil if no WHERE clause)
 	IncludeColumns     []string // non-key covering columns from INCLUDE (…)
 	OnOnly             bool     // ON ONLY — create on parent table without propagating to children
+	// Concurrently records the CONCURRENTLY keyword. goopg still builds the
+	// index synchronously, but a concurrent build waits for transactions that
+	// were already running when it started to drain before it completes — the
+	// observable wait modelled by the isolation spec multiple-cic.
+	Concurrently bool
 	// ColOrders captures the per-key-column ASC/DESC + NULLS FIRST/LAST ordering,
 	// parallel to Columns (ColOrders[i] applies to Columns[i]). Mirrors PG's
 	// pg_index.indoption so pg_get_indexdef can reproduce a non-default ordering.

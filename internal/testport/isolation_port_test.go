@@ -368,6 +368,27 @@ func TestPort_IsolationReindexSchema(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/reindex-schema.spec")
 }
 
+// TestPort_IsolationMultipleCic exercises the multiple-cic spec (M0118-0008):
+// two CREATE INDEX CONCURRENTLY builds running simultaneously, each with a
+// partial-index predicate that calls an IMMUTABLE advisory-lock function.
+//
+// PASS-REQUIRED (design 0118-0031). Two engine changes: (1) a partial-index
+// predicate that references no table columns is const-folded — evaluated once
+// at build time, mirroring PostgreSQL's eval_const_expressions in
+// BuildIndexInfo — so the predicate's advisory-lock call fires even though the
+// table is empty, making s1i block; (2) CREATE INDEX CONCURRENTLY waits for the
+// transactions that were already running when it started to drain before it
+// completes (a start-time snapshot of active slots, drained after the build),
+// so the second build (s2i) completes only after the first (s1i), matching
+// PG 18.3 byte-for-byte.
+func TestPort_IsolationMultipleCic(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_multiple_cic")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/multiple-cic.spec")
+}
+
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
 // Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
 func TestPort_IsolationFkSnapshot(t *testing.T) {

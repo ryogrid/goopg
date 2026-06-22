@@ -356,14 +356,42 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       txn, transient acquire+release in autocommit so the wait still happens
       during acquisition). `TestPort_IsolationReindexSchema` strict PASS (2
       perms); `-race` lockmgr; lock-sibling regression PASS; pgbench smoke
-      0-failed. **Remaining (deferred, ledger 2026-06-22):** `alter-table-*`
+      0-failed.
+      **2026-06-22 fifth promotion (design 0118-0031): `multiple-cic` PROMOTED.**
+      Two simultaneous `CREATE INDEX CONCURRENTLY` builds whose partial-index
+      `WHERE` predicates call IMMUTABLE advisory-lock functions on EMPTY tables.
+      Two engine fixes + one runner fix: (1) **const-fold** — `execCreateIndex`
+      now evaluates a partial-index predicate that references no table columns
+      ONCE at build time (new exported `planner.ExprContainsColumnRef` guard +
+      `evalExpr(pred,nil,ctx)`), mirroring PG `eval_const_expressions` in
+      `BuildIndexInfo`, so the IMMUTABLE fn's advisory-lock call fires despite
+      zero rows and `s1i` blocks; stored predicate untouched (pg_get_indexdef/
+      pg_dump unaffected); (2) **CIC drain** — `CreateIndexStmt.Concurrently` is
+      now recorded by the parser and a concurrent build captures the active-txn
+      slot set at START (`mvcc.SnapshotActiveOtherSlots`, refactored out of
+      `WaitForOlderSlotsToCommit`) and drains it after the build
+      (`WaitForSlotsToCommit`) so the newer build (`s2i`) completes only after the
+      older (`s1i`) — start-time snapshot (not wait-time) avoids a mutual wait;
+      (3) **runner** — the `(*)` star branch drains UNGATED pending steps before
+      the star step's own completion (`partitionGatedOn` keeps
+      `BlockerStepComplete`-gated steps like deadlock-hard `s7a8(s8a1)` reported
+      after), matching isolationtester dispatch-order completion. Gated on
+      `Concurrently` (plain CREATE INDEX unaffected; only multiple-cic +
+      deferred prepared-transactions-cic use CIC). `TestPort_IsolationMultipleCic`
+      strict PASS; every strict `(*)` spec (deadlock-{hard,soft,soft-2},
+      classroom-scheduling, project-manager, serializable-parallel{,-2},
+      temporal-range-integrity, multixact-no-deadlock,
+      tuplelock-upgrade-no-deadlock, timeouts) PASS; lock-sibling regression PASS;
+      `-race` mvcc/lockmgr; parser/planner/executor units; pgbench smoke.
+      **Remaining (deferred, ledger 2026-06-22):** `alter-table-*`
       (ADD/VALIDATE CONSTRAINT lock semantics), the `*-conflict` family —
       truncate/vacuum/cluster — (need CREATE ROLE/GRANT/SET ROLE privilege infra +
       permission-denied), `reindex-concurrently-toast` (`allow_system_table_mods`
-      GUC), `multiple-cic` (CREATE INDEX CONCURRENTLY must constant-fold an
-      immutable partial-index predicate function during build) / partition specs
-      (ATTACH/DETACH PARTITION), `inherit-temp` (RELATION_IS_OTHER_TEMP
-      exclusion), `plpgsql-toast` (TOAST in PL/pgSQL). Group stays open.
+      GUC + TOAST-relation reindex), partition specs (ATTACH/DETACH PARTITION),
+      `vacuum-skip-locked`/`vacuum-concurrent-drop` (partitioned VACUUM + log
+      parity), `vacuum-no-cleanup-lock` (reltuples accounting), `inherit-temp`
+      (RELATION_IS_OTHER_TEMP exclusion), `plpgsql-toast` (TOAST in PL/pgSQL).
+      Group stays open.
 - [ ] **M0118-0009** — Misc / system-level specs: async-notify, timeouts, stats, horizons,
       freeze-the-dead, inplace-inval, intra-grant-inplace{,-db}, subxid-overflow,
       prepared-transactions{,-cic}, temp-schema-cleanup, multixact-no-forget,

@@ -1,45 +1,56 @@
 (idle — nothing in flight)
 
-Last loop (#22, M0118-0008): promoted `reindex-schema` (4th M0118-0008
-promotion, design 0118-0030). Committed + pushed.
+Last loop (#23, M0118-0008): promoted `multiple-cic` (5th M0118-0008
+promotion, design 0118-0031). Committed + pushed.
 
 ## What landed
-- `reindexOp.Next` (operators_reindex.go) gained a `SCHEMA` case: enumerate the
-  schema's non-virtual user tables via `Catalog.TablesInSchema`, sort by OID
-  (creation order) in new helper `schemaRelsByOID`, then per relation take a
-  `ShareLock` (plain) via `acquireRelLockMaybeTransient`, or — for CONCURRENTLY —
-  `waitForRelationLockers` (reused 0118-0029 primitive).
-- `context.go`: extracted `acquireSequenceLockTxn` body into mode-parameterised
-  `(*Context).acquireRelLockMaybeTransient(rel, mode)` (held-to-commit in explicit
-  txn; transient acquire+release in autocommit so the wait still happens).
-  `acquireSequenceLockTxn` now delegates with `RowExclusiveLock` (no behaviour
-  change).
-- `TestPort_IsolationReindexSchema` strict PASS (2 perms).
-GATES: build PASS; reindex-schema strict PASS; lock-sibling regression
-(reindex-concurrently/create-trigger/sequence-ddl/drop-index-concurrently-1/
-timeouts-table-level) PASS; -race lockmgr PASS; executor units PASS; pgbench
-smoke 0-failed (pre-commit). CSV field count verified 7; coverage/inventory/
-port-status regenerated.
+- `execCreateIndex` (operators_ddl.go): const-fold a partial-index WHERE
+  predicate that references NO table columns — evaluate once via
+  `evalExpr(pred, nil, ctx)` (new exported `planner.ExprContainsColumnRef`
+  guard), mirroring PG `eval_const_expressions` in BuildIndexInfo. Stored
+  `idx.Predicate` untouched (pg_get_indexdef/pg_dump unaffected). Makes the
+  IMMUTABLE advisory-lock predicate fire on an EMPTY table so s1i blocks.
+- `CreateIndexStmt.Concurrently` added (parser/ast.go) + recorded in
+  `parseCreateIndexTail` (parser/ddl.go). CIC now captures active-txn slots at
+  START (`mvcc.SnapshotActiveOtherSlots`, refactored out of
+  `WaitForOlderSlotsToCommit`) and drains them after build
+  (`WaitForSlotsToCommit`) → newer build completes after older. Start-time
+  snapshot avoids mutual wait between two simultaneous CICs.
+- Runner (isolation_runner.go): `(*)` star branch now drains UNGATED pending
+  steps before the star step's own completion; `partitionGatedOn` keeps
+  `BlockerStepComplete`-gated steps (deadlock-hard s7a8(s8a1)) reported AFTER.
+- `TestPort_IsolationMultipleCic` strict PASS.
+GATES: build PASS; multiple-cic strict PASS; ALL strict `(*)` specs
+(deadlock-{hard,soft,soft-2}, classroom-scheduling, project-manager,
+serializable-parallel{,-2}, temporal-range-integrity, multixact-no-deadlock,
+tuplelock-upgrade-no-deadlock, timeouts) PASS; lock-sibling regression PASS;
+-race mvcc/lockmgr; parser/planner/executor units; pgbench smoke (pre-commit).
+CSV field count verified 7; coverage/inventory/port-status regenerated.
 
-KEY METHODOLOGY: throwaway zz_probe_test.go (RunAndCompare → log status+diff)
-ranked candidates. multiple-cic was the alternative but needs immutable-function
-constant-folding in a partial-index WHERE predicate during CREATE INDEX
-CONCURRENTLY build (PG evaluates `lck_shr(281457)` via eval_const_expressions →
-blocks on advisory lock) — harder, deferred.
+KEY METHODOLOGY: throwaway zz_probe_test.go ranked the M0118-0008 tail by
+first-divergence cost. multiple-cic was 1 line off (only completion order) once
+const-fold + CIC-drain landed.
 
-NEXT loop candidates (remaining M0118-0008 tail — probe-first to confirm
-divergence):
-- `acquireRelLockMaybeTransient` + `waitForRelationLockers` are REUSABLE.
-- `multiple-cic`: CREATE INDEX CONCURRENTLY must constant-fold an IMMUTABLE
-  partial-index predicate fn during build (advisory-lock block). Probe showed
-  s1i does not wait — predicate fn never called.
-- `reindex-concurrently-toast`: needs `allow_system_table_mods` GUC (no-op bool
-  accept) + pg_toast.<name> reindex + ALTER TABLE/INDEX RENAME of toast rels.
-- biggest leverage = ROLE/ACL infra (CREATE ROLE/GRANT/SET ROLE/permission-denied)
-  unblocks truncate/vacuum/cluster-conflict {,-partition}.
-- `alter-table-1/2`: ADD CONSTRAINT … NOT VALID + VALIDATE CONSTRAINT + FK
-  validation + lock semantics.
-- partition specs: ATTACH/DETACH PARTITION (+ CONCURRENTLY, pg_backend_pid+cancel).
+NEXT loop candidates (remaining M0118-0008 tail — probe-first):
+- biggest leverage = ROLE/ACL infra (CREATE ROLE/GRANT/SET ROLE/ALTER OWNER +
+  permission-denied 42501) unblocks truncate-conflict/vacuum-conflict/
+  cluster-conflict. goopg has only a wire-layer string CREATE/DROP ROLE
+  (server/role_ddl.go); no GRANT/SET ROLE/privilege model. Large.
+- `alter-table-1/2`: parser gaps (FK `... NOT VALID` errors "expected keyword
+  deferrable"; `ALTER TABLE ... VALIDATE CONSTRAINT` errors "expected ADD or
+  DROP") + ShareUpdateExclusive(VALIDATE)/ShareRowExclusive(ADD) lock semantics
+  + 140/48 perms. Medium-large.
+- `inherit-temp`: goopg includes ANOTHER session's temp child in a parent
+  SELECT (global catalog, no per-session temp ownership). Needs session-scoped
+  temp tables + RELATION_IS_OTHER_TEMP inheritance exclusion. Large.
+- `reindex-concurrently-toast`: needs `allow_system_table_mods` GUC + real TOAST
+  rels in pg_class (reltoastrelid) + pg_toast.<name> reindex. Large.
+- partition specs / vacuum-skip-locked / vacuum-concurrent-drop: PARTITION BY
+  LIST + partitioned VACUUM log parity.
+
+REUSABLE: `acquireRelLockMaybeTransient` + `waitForRelationLockers` (locks);
+`mvcc.SnapshotActiveOtherSlots`/`WaitForSlotsToCommit` (CIC drain);
+`planner.ExprContainsColumnRef` (const-fold guard).
 
 GOTCHAS: isolation specs run goopg as SUBPROCESS (debug→file). D-002 CSV is one
 giant single-line row #13 (field 6 rationale COMMA-FREE; append before

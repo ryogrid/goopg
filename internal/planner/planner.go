@@ -1747,6 +1747,11 @@ func nodeReferencesOuter(n Node) bool {
 	return planHasOuterRef(n)
 }
 
+// ExprContainsColumnRef reports whether a resolved planner expression references
+// any table column (a *ColumnRef). It is the exported entry point used by the
+// executor's CREATE INDEX const-folding of partial-index predicates.
+func ExprContainsColumnRef(e Expr) bool { return exprContainsColumnRef(e) }
+
 func exprContainsColumnRef(e Expr) bool {
 	if e == nil {
 		return false

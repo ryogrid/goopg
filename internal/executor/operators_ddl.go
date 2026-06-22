@@ -4605,10 +4605,42 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
 	}
+	// CREATE INDEX CONCURRENTLY waits for transactions that were already running
+	// when it started to drain before it completes (PostgreSQL waits for any
+	// snapshot that could predate the new index). Capture that set NOW, before
+	// the const-fold below may itself block — waiting on a start-time snapshot
+	// (rather than re-scanning at wait time) keeps two simultaneous concurrent
+	// builds from waiting on each other. The wait itself happens after the build.
+	var cicWaitSlots []int
+	if s.Concurrently && o.ctx.TxnMgr != nil && o.ctx.Tx.Handle != 0 {
+		cicWaitSlots = o.ctx.TxnMgr.SnapshotActiveOtherSlots(o.ctx.Tx.Handle)
+	}
 	// For partial indexes, resolve the WHERE predicate so bulk build can filter rows.
 	var resolvedPred planner.Expr
 	if s.HasPredicate && s.Predicate != nil {
 		resolvedPred, _ = planner.ResolveIndexPredicate(s.Predicate, tbl)
+	}
+	// Const-fold a partial-index predicate that references no table columns,
+	// mirroring PostgreSQL's eval_const_expressions over the index predicate in
+	// BuildIndexInfo: an IMMUTABLE function with constant arguments is evaluated
+	// exactly once at build time, not per heap tuple. This matters for the
+	// function's observable effects — e.g. a predicate that takes an advisory
+	// lock — and is why CREATE INDEX CONCURRENTLY on an empty table can still
+	// block another session (isolation spec multiple-cic). The stored predicate
+	// (idx.Predicate) keeps the original expression so pg_get_indexdef / pg_dump
+	// still render the WHERE clause verbatim.
+	if resolvedPred != nil && !planner.ExprContainsColumnRef(resolvedPred) {
+		pv, pErr := evalExpr(resolvedPred, nil, o.ctx)
+		if pErr != nil {
+			return pErr
+		}
+		if pv.IsNull() || (pv.Kind == KindBool && !pv.BoolValue()) {
+			// Constant FALSE/NULL ⇒ no heap tuple qualifies; build an empty index.
+			resolvedPred = &planner.BooleanConst{}
+		} else {
+			// Constant TRUE ⇒ every heap tuple qualifies; drop the predicate.
+			resolvedPred = nil
+		}
 	}
 	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, resolvedPred); err != nil {
 		return err
@@ -4644,6 +4676,15 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 				idx.ColDescending = desc
 				idx.ColNullsFirst = nullsFirst
 			}
+		}
+	}
+	// CREATE INDEX CONCURRENTLY: drain the transactions that were running when
+	// the build started (captured above). Once they finish, no snapshot that
+	// predates the new index remains. Two simultaneous concurrent builds do not
+	// deadlock here because each waits only on its own start-time snapshot.
+	if s.Concurrently && len(cicWaitSlots) > 0 && o.ctx.Ctx != nil {
+		if err := o.ctx.TxnMgr.WaitForSlotsToCommit(o.ctx.Ctx, cicWaitSlots); err != nil {
+			return &ExecError{Code: "57014", Pos: s.Pos(), Message: "CREATE INDEX CONCURRENTLY cancelled"}
 		}
 	}
 	return nil

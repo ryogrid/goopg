@@ -628,9 +628,20 @@ func (m *Manager) WaitForXID(ctx context.Context, xid storage.TransactionID) err
 // the DROP is still running, so the index may be safely removed.
 // M0100-0009.
 func (m *Manager) WaitForOlderSlotsToCommit(ctx context.Context, selfHandle TxnHandle) error {
-	selfIdx := int(selfHandle) - 1 // Handle = procNum+1
+	return m.WaitForSlotsToCommit(ctx, m.SnapshotActiveOtherSlots(selfHandle))
+}
 
-	// Snapshot which slots are active right now (excluding self).
+// SnapshotActiveOtherSlots returns the indices of every backend slot that is
+// currently in an active transaction (inTxn==1), excluding the caller's own
+// slot (selfHandle). Capturing the active set is split from the wait so a
+// caller can snapshot at one point (e.g. the start of CREATE INDEX
+// CONCURRENTLY, before it might itself block) and drain that fixed set later.
+// Waiting on a start-time snapshot — rather than re-scanning at wait time —
+// prevents two CONCURRENTLY builds that begin nearly simultaneously from each
+// waiting on the other (a mutual wait): each only ever waits for transactions
+// that were already running when it started.
+func (m *Manager) SnapshotActiveOtherSlots(selfHandle TxnHandle) []int {
+	selfIdx := int(selfHandle) - 1 // Handle = procNum+1
 	active := make([]int, 0, 4)
 	for i := range m.procArray.slots {
 		if i == selfIdx {
@@ -640,6 +651,14 @@ func (m *Manager) WaitForOlderSlotsToCommit(ctx context.Context, selfHandle TxnH
 			active = append(active, i)
 		}
 	}
+	return active
+}
+
+// WaitForSlotsToCommit blocks until every slot in active has finished its
+// transaction (inTxn back to 0), or ctx is cancelled. The active set is the
+// caller's responsibility to capture (see SnapshotActiveOtherSlots). A nil/empty
+// set returns immediately.
+func (m *Manager) WaitForSlotsToCommit(ctx context.Context, active []int) error {
 	if len(active) == 0 {
 		return nil
 	}
