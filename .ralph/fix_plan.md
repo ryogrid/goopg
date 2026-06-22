@@ -276,7 +276,12 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       defeating the row-lock wait); plus sub-XID-scoped NEW-tuple xmin
       (`writeHeapRowReturning{,PG}` + HOT) and HEAP_KEYS_UPDATED on the single-xid
       old-tuple xmax stamp; descendant-direction subxact self-visibility in
-      `isCurrentTxXID`. **Remaining (deferred, ledger 2026-06-22):**
-      `delete-abort-savept-2` (FOR NO KEY UPDATE pure-lock upgrade restore on the
-      row-lock path), `multixact-no-forget` (whole-txn ROLLBACK of an updater
-      member must retain the surviving locker). Plus the other misc specs untouched.
+      `isCurrentTxXID`. `delete-abort-savept-2` PASS (design 0118-0015) — a SELF
+      lock-only upgrade inside a savepoint (FOR KEY SHARE → FOR NO KEY UPDATE under
+      the sub-XID) now routes through `stampMultiLock` (gate widened by new
+      `hasOuterSelfLockMember`) so the outer top-level KEY SHARE survives as a multi
+      member; `ROLLBACK TO` drops only the sub-XID and a conflicting FOR UPDATE
+      waiter keeps waiting on the restored KEY SHARE. **Remaining (deferred, ledger
+      2026-06-22):** `multixact-no-forget` (whole-txn ROLLBACK of an updater member
+      must retain the surviving locker on the read path). Plus the other misc specs
+      untouched.

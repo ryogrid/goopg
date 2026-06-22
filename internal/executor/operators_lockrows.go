@@ -1039,10 +1039,24 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 	// holder is handled by the wait/skip/nowait branch above), so the combined
 	// member set is lock-only and stays transparent to visibility — HintBits
 	// sets HEAP_XMAX_LOCK_ONLY whenever there is no updater member.
+	//
+	// The SAME backend upgrading its OWN lock inside a savepoint (s1 holds FOR
+	// KEY SHARE at the top level, then takes FOR NO KEY UPDATE under sub-XID f)
+	// must ALSO go through the producer so the outer-level member survives: a
+	// plain single-xmax overwrite below would discard the top-level KEY SHARE,
+	// and ROLLBACK TO f — which only aborts the sub-XID member — would then leave
+	// the row with no surviving lock at all, letting a conflicting waiter wake
+	// prematurely (delete-abort-savept-2 perms 1/2: s2's FOR UPDATE must keep
+	// waiting on the restored outer KEY SHARE until s1 commits). stampMultiLock
+	// keeps every active member whose xid differs from our current writerXID as a
+	// survivor, so it preserves the outer self lock; for a same-level self re-lock
+	// (no outer member, e.g. a plain FOR UPDATE re-acquire) it finds no survivor
+	// and returns combined=false, falling through to the single-holder stamp
+	// unchanged. M0118-0009 (docs/design/0118-0015).
 	if o.ctx.MultiXact != nil &&
 		tup.Header.Xmax != storage.InvalidTransactionID &&
 		storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
-		!o.isSelfXID(tup.Header.Xmax) {
+		(!o.isSelfXID(tup.Header.Xmax) || o.hasOuterSelfLockMember(tup.Header)) {
 		multiPtr, combined, merr := o.stampMultiLock(slot, ptr, tup.Header)
 		if merr != nil {
 			slot.Unlock()
@@ -1425,6 +1439,39 @@ func (o *lockRowsOp) conflictingLockHolders(xmax storage.TransactionID, infomask
 		return []storage.TransactionID{xmax}
 	}
 	return nil
+}
+
+// hasOuterSelfLockMember reports whether the lock-only xmax in `hdr` carries an
+// active row-lock member belonging to THIS backend's transaction tree but
+// stamped under a (sub)transaction OTHER than the current writerXID — i.e. an
+// outer-level self lock (the top-level XID, or a parent savepoint's sub-XID)
+// that a self lock-upgrade inside a savepoint must preserve rather than
+// overwrite. Used to route such an upgrade through stampMultiLock so ROLLBACK TO
+// the inner savepoint reverts to the outer strength instead of leaving the row
+// unlocked (delete-abort-savept-2). A same-level self re-lock (the only member
+// is our own current writerXID) returns false — the caller then takes the plain
+// single-xmax stamp, unchanged. M0118-0009 (docs/design/0118-0015).
+func (o *lockRowsOp) hasOuterSelfLockMember(hdr storage.HeapTupleHeader) bool {
+	if o.ctx.TxnMgr == nil {
+		return false
+	}
+	wxid := o.writerXID()
+	if storage.IsHeapTupleXmaxMulti(hdr.Infomask) {
+		if o.ctx.MultiXact == nil {
+			return false
+		}
+		members, ok := o.ctx.MultiXact.Members(multixact.MultiXactId(hdr.Xmax))
+		if !ok {
+			return false
+		}
+		for _, m := range members {
+			if m.Xid != wxid && o.isSelfXID(m.Xid) && o.ctx.TxnMgr.IsXIDActive(m.Xid) {
+				return true
+			}
+		}
+		return false
+	}
+	return hdr.Xmax != wxid && o.isSelfXID(hdr.Xmax) && o.ctx.TxnMgr.IsXIDActive(hdr.Xmax)
 }
 
 // stampMultiLock combines this lock request with the existing active lock
