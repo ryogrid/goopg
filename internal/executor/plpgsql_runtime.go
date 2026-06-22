@@ -158,6 +158,25 @@ func bindSelectIntoRow(targets []string, row Row, schema planner.Schema, frame *
 				_ = frame.add(colKey, sc.Type, val)
 			}
 		}
+		// Also bind the record/composite variable itself to a single composite
+		// Datum and register its field schema, so that `r.field` reads,
+		// `r.field := …` field assignment, and `r::text` reassembly observe the
+		// SELECT INTO result. Before this, a `select * into r` only populated the
+		// `_r_<col>` sub-fields, leaving the record variable NULL — so `r::text`
+		// rendered NULL. M0118-0008 (plpgsql-toast assign3,
+		// expanded_record_set_field).
+		if idx, ok := frame.indexByName[name]; ok && len(row) > 0 {
+			parts := make([]string, len(schema))
+			cf := make([]catalog.CompositeField, len(schema))
+			for i, sc := range schema {
+				if i < len(row) && !row[i].IsNull() {
+					parts[i] = row[i].Format()
+				}
+				cf[i] = catalog.CompositeField{Name: sc.Name, ColType: sc.Type.Name}
+			}
+			frame.values[idx] = NewStringDatum("(" + strings.Join(parts, ",") + ")")
+			frame.compositeVarFields[name] = cf
+		}
 		return
 	}
 	for i, tgt := range targets {
