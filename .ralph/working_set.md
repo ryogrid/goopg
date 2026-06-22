@@ -1,32 +1,34 @@
 (idle — nothing in flight)
 
-Loop #39: PROMOTED `cluster-conflict-partition` (4 perms) — M0118-0008 twelfth
-promotion, partitioned sibling of `cluster-conflict`, byte-for-byte vs PG 18.3
-with NO engine change (design 0118-0041).
+Loop #40: HARDENED the `FOR UPDATE/SHARE SKIP LOCKED` row-lock family to
+pass-required (design 0118-0042). M0118-0003 is marked COMPLETE yet its
+`skip-locked{,-2,-3,-4}` tests still ran through non-strict `runIsoSpec`
+(silent t.Skip on a regression). All four already byte-match PG 18.3 (probe:
+status=pass, empty diff, NO engine change), so flipped them to
+`runIsoSpecStrict` + enriched the terse `-3`/`-4` docstrings.
 
-Key insight: `ALTER TABLE … OWNER TO` does NOT recurse to partition children
-(`tablecmds.c` `AT_ChangeOwner` "never recurses") so only the parent is owned by
-the role. Upstream CLUSTER locks the PARENT AccessExclusive (waits behind a
-concurrent `LOCK … IN SHARE UPDATE EXCLUSIVE MODE` on the parent then completes —
-perms 1/2), then enumerates leaves WITHOUT locking them and skips every leaf the
-role does not own (WARNING suppressed by `client_min_messages=ERROR`), so a
-locked leaf is never touched and CLUSTER returns immediately (perms 3/4).
-goopg's no-op `clusterOp.Next` locks only the named parent and never processes
-leaves → output matches by both routes. Probe (zz_probe_test.go, deleted)
-returned status=pass empty-diff immediately → free promotion.
+Probe (zz_probe_test.go, deleted) over the M0118-0008 tail also reconfirmed
+vacuum-skip-locked / vacuum-concurrent-drop / reindex-schema already pass strict
+(already promoted in earlier loops). The genuinely-deferred specs all still
+diverge and need real engine work:
+  - plpgsql-toast: dollar-quoted-string ($$) parse error + advisory-gated
+    VACUUM-blocks-TOAST behavior.
+  - detach-partition-concurrently-{1,2,3,4}: needs DETACH PARTITION ...
+    CONCURRENTLY parsing + the two-txn concurrent-detach protocol.
+  - alter-table-{1,2,4}: ADD/VALIDATE CONSTRAINT lock semantics, INHERITS.
+  - partition-concurrent-attach, partition-drop-index-locking,
+    reindex-concurrently-toast, vacuum-no-cleanup-lock.
 
-Files: internal/testport/isolation_port_test.go (+TestPort_IsolationClusterConflictPartition);
-docs/design/0118-0041 + README; port-status.csv D-002 rationale (comma-free!) +
-regen port-status.md/target-inventory.md/upstream-isolation-coverage.md;
-fix_plan + ledger.
+Files: internal/testport/isolation_port_test.go (4 helper switches +
+docstrings); docs/design/0118-0042 + README index; port-status.csv D-002
+rationale (comma-free, verified 70 lines / M0060-0004 tail intact) + regen
+port-status.md; fix_plan M0118-0003 note.
 
-Gates: new strict test PASS; conflict-family siblings (cluster/vacuum/truncate-
-conflict) PASS; build+vet clean; pgbench smoke = pre-commit hook.
+Gates: TestPort_IsolationSkipLocked{,2,3,4} strict PASS; build+vet clean;
+ralph-state-guard OK (repaired prev-loop completed marker); pgbench smoke =
+pre-commit hook.
 
-Next step: M0118-0008 tail. Closest remaining: `alter-table-{1,2,4}` (ADD/VALIDATE
-CONSTRAINT lock semantics; INHERITS), partition ATTACH/DETACH specs
-(detach-partition-concurrently-{1,2,3,4}, partition-concurrent-attach,
-partition-drop-index-locking), `reindex-concurrently-toast`
-(allow_system_table_mods GUC + TOAST reindex), `vacuum-no-cleanup-lock`
-(reltuples accounting + cursor pin), `plpgsql-toast`. Probe-first each
-(zz_probe_test.go → RunAndCompare .Diff) and rank by first-divergence cost.
+Next step: same-shape follow-up — promote the sibling `nowait*` family
+(nowait{,-2,-3,-4,-5}, lock-nowait) + remaining M0118-0003 row-lock specs to
+strict (probe-confirm byte-match, flip helper). Then tackle the M0118-0008
+engine-work tail (cheapest first-divergence: plpgsql-toast dollar-quote parsing).

@@ -934,7 +934,7 @@ func TestPort_IsolationSkipLocked(t *testing.T) {
 	c := newCluster(t, "iso_skip_locked")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/skip-locked.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/skip-locked.spec")
 }
 
 // TestPort_IsolationNowait exercises the nowait spec: when one session holds a
@@ -1022,7 +1022,7 @@ func TestPort_IsolationSkipLocked2(t *testing.T) {
 	c := newCluster(t, "iso_skip_locked2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/skip-locked-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/skip-locked-2.spec")
 }
 
 // TestPort_IsolationNowait2 exercises the nowait-2 spec: like skip-locked-2 but
@@ -1049,13 +1049,16 @@ func TestPort_IsolationTuplelockConflict(t *testing.T) {
 }
 
 // TestPort_IsolationSkipLocked3 exercises skip-locked-3 (SKIP LOCKED with tuple
-// locks). M0118-0003.
+// locks): s1 holds a plain FOR UPDATE on the first row and a third session forces
+// a tuple-lock wait queue, so s2's FOR UPDATE SKIP LOCKED must skip the
+// tuple-locked row rather than join the queue. Pass-required (M0118-0003 row-lock
+// family hardened to strict; design 0118-0042).
 func TestPort_IsolationSkipLocked3(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_skip_locked3")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/skip-locked-3.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/skip-locked-3.spec")
 }
 
 // TestPort_IsolationNowait5 exercises nowait-5 (NOWAIT on an updated tuple
@@ -1068,12 +1071,18 @@ func TestPort_IsolationNowait5(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-5.spec")
 }
 
+// TestPort_IsolationSkipLocked4 exercises skip-locked-4 (SKIP LOCKED over an
+// updated tuple chain): s1's FOR UPDATE SKIP LOCKED is gated behind an advisory
+// lock while s2 UPDATEs the first row (building a ctid chain) then locks it; when
+// the advisory lock is released s1 must follow the chain, find the live successor
+// row-locked by s2, and skip it — claiming the other row instead of blocking.
+// Pass-required (M0118-0003 row-lock family hardened to strict; design 0118-0042).
 func TestPort_IsolationSkipLocked4(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_skiplocked4")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/skip-locked-4.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/skip-locked-4.spec")
 }
 
 func TestPort_IsolationNowait4(t *testing.T) {

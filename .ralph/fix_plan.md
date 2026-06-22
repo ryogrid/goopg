@@ -183,6 +183,11 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       lock-committed-{update,keyupdate}. The cumulative multixact producer +
       subxact-scoped row-lock infra (M0118-0003/0004 slices) carried the final
       batch green; CSV rows already `pass`.
+      **2026-06-23 hardening (design 0118-0042):** the `SKIP LOCKED` family
+      (`skip-locked{,-2,-3,-4}`) promoted from `runIsoSpec` (silent-skip on
+      regression) to `runIsoSpecStrict` (hard red) — all four already byte-match PG
+      18.3, no engine change. Follow-up of the same shape: the sibling `nowait*`
+      family + the rest of the M0118-0003 row-lock specs still run non-strict.
 - [ ] **M0118-0004** — Deadlock detection: deadlock-{hard,simple,soft,soft-2,parallel},
       multixact-no-deadlock. **Done so far:** `deadlock-simple` (slice 16, design
       0118-0004) + `deadlock-hard` (general timeout-driven multi-object detector,
