@@ -210,6 +210,12 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 		}
 		return err
 	}
+	if err := ctx.acquireScanReadLockTxn(o.heapRel); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 	// M0118-0001: the SERIALIZABLE index-scan SIREAD predicate lock is no
 	// longer acquired eagerly here. Its granularity now depends on what the
 	// probe matches and is decided at the end of Rescan once the matching TID

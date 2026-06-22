@@ -1,44 +1,40 @@
-Task: M0118-0009 `timeouts` (row-level half) — `lock_timeout` GUC + statement-timeout-
-aware lock waits. COMMITTING this loop. Design 0118-0017.
+Task: M0118-0009 `timeouts` (table-level half) — DONE this loop. `timeouts.spec`
+PROMOTED to `pass` (all 8 permutations). Design 0118-0018. COMMITTING.
 
 WHAT LANDED:
-- NEW leaf pkg internal/lockwait: WithTimeout(ctx,d)/Timeout(ctx) carries the
-  lock_timeout budget as a DURATION (re-armed per wait, like ProcSleep), + sentinel
-  ErrLockTimeout. Imports stdlib only → no cycle (lockmgr+mvcc depend on it).
-- lockmgr.acquire: new lock-timeout `select` case → ErrLockTimeout; shared splice
-  cleanup factored into unparkWaiter (also used by ctx.Done()).
-- mvcc.WaitForXID: arms time.AfterFunc(broadcast) + checks lock deadline after ctx.Err().
-- dispatch.go: sessionLockTimeout + attaches lockwait.WithTimeout when lock_timeout>0
-  (independent of statement_timeout).
-- executor/context.go: lockWaitTimeoutError (ErrLockTimeout→"lock timeout",
-  DeadlineExceeded→"statement timeout") + lockWaitCancelError (adds Canceled→"user
-  request"). Fixed the 3 acquireRel*/Tuple/RelTxn sites (were ALL "user request").
-- epqWait now returns (deadlock bool, timeout *ExecError); ~11 call sites in
-  operators_storage.go + operators_merge.go surface the timeout (plain client cancel
-  still swallowed→retry). lockRowsOp 4 WaitForXID sites use o.rowWaitTimeoutError.
+- NEW `Context.acquireScanReadLockTxn(rel)` (executor/context.go): takes a
+  txn-scoped ACCESS SHARE on `tableLockMgr` via the existing `acquireRelLockTxn`
+  (keyed by TxnLockBackendID, released at txn end). No-op when
+  TxnLockBackendID==0 (autocommit) or rel is a system catalog (RelOid<16384,
+  new const firstNormalObjectOID). Reuses LOCK TABLE machinery.
+- Wired at the 3 relation-read scan opens (alongside the existing no-op
+  acquireRelLock(AccessShareLock)): operators_storage.go seqscan (~L708),
+  operators_index.go (~L213), operators_indexonly.go (~L53).
+- Effect: a plain SELECT in an explicit txn now holds ACCESS SHARE, so a later
+  bare LOCK TABLE (ACCESS EXCLUSIVE) conflicts/parks/times out — the lock_timeout
+  /statement_timeout cancel machinery from 0118-0017 already covers the wait.
 
-KEY INSIGHT: plain DELETE/UPDATE row-wait goes through epqWait (operators_storage.go),
-NOT lockRowsOp — epqWait did `_ = WaitForXID` then spun into a spurious 40001. That was
-the real fix needed for the row-level permutations.
+KEY INSIGHT: tableLockMgr is a SINGLE-mutex manager, so the perf risk is real;
+mitigated by the autocommit + catalog gates + lockmgr idempotency (re-scan in a
+txn is a mask-check no-op) + ACCESS SHARE conflicting only with ACCESS EXCLUSIVE
+(grants instantly absent a concurrent LOCK TABLE/DDL). pgbench -N 230 tps / -S
+14.7k tps, 0 failed — no regression (-S is autocommit so hits the no-op path).
 
-Gates: TestPort_TimeoutsRowLevel 4/4 (statement/lock/lock-wins/statement-wins, msg +
-~300ms timing); TestLockManagerLockTimeout* -race; full row-lock/savepoint/merge/
-multixact/deadlock/skip-locked/nowait isolation batch no regression; -race executor/
-mvcc/lockmgr; executor unit; pgbench smoke 0-failed; ralph-state-guard OK.
+Gates (all green): TestPort_TimeoutsTableLevel 4/4; TestPort_TimeoutsRowLevel
+4/4; full `TestPort_Isolation` batch 388s exit 0 (no regression); -race
+executor+mvcc+lockmgr; executor unit; pgbench smoke 0-failed; gofmt clean for my
+edits (operators_storage.go pre-existing go1.25/1.26 diffs at L2820/3087 are NOT
+mine — never gofmt -w); ralph-state-guard OK. CSV promoted + coverage/inventory
+md regenerated.
 
-NOT promoting timeouts.spec to `port` (CSV stays failed): table-level half (rdtbl…
-locktbl) needs plain SELECT to take txn-scoped ACCESS SHARE on tableLockMgr so LOCK
-TABLE conflicts — perf-sensitive design reversal, DEFERRED (ledger 2026-06-22). The
-lock_timeout machinery already covers the LOCK TABLE wait; that half needs only the
-scan-side ACCESS SHARE acquisition (gate on TxnLockBackendID like LOCK TABLE).
+NEXT loop: pick another M0118-0009 misc spec — all remaining need substantial new
+subsystems: async-notify (LISTEN/NOTIFY), stats (pg_stat_* + plpgsql), horizons/
+freeze-the-dead/inplace-inval/intra-grant-inplace{,-db} (vacuum/freeze/inplace +
+datfrozenxid, overlaps M0117-0008), subxid-overflow (plpgsql), prepared-
+transactions{,-cic} (2PC), temp-schema-cleanup (temp schema + plpgsql + advisory).
+OR a different M0118 group (0118-0005 FK, 0118-0006 MERGE, 0118-0008 DDL/VACUUM).
 
-NEXT loop: either (a) the table-level ACCESS SHARE work to finish+promote timeouts.spec
-(measure pgbench!), or (b) pick another M0118-0009 misc spec — async-notify (no
-LISTEN/NOTIFY executor support yet), subxid-overflow (needs plpgsql), prepared-
-transactions (2PC), horizons/freeze-the-dead/inplace-inval/intra-grant-inplace (vacuum/
-freeze/inplace-update internals) — all need substantial new subsystems.
-
-GOTCHAS: never gofmt -w (go1.25 repo vs local 1.26). Isolation specs run goopg as a
-SUBPROCESS. CSV rationale must be comma-free. cd /home/ryo/work/goopg/goopg first.
-tpch-spotcheck INFRA-BLOCKED; pgbench smoke is the live guard. Untracked postgres/ +
-weekly_loc.* + requirements.txt are stray artifacts — leave them.
+GOTCHAS: never gofmt -w (go1.25 repo vs local 1.26). Isolation specs run goopg as
+a SUBPROCESS. CSV rationale kept comma-free. cd /home/ryo/work/goopg/goopg first.
+tpch-spotcheck INFRA-BLOCKED; pgbench smoke is the live guard. Untracked postgres/
++ weekly_loc.* + requirements.txt are stray artifacts — leave them.

@@ -710,6 +710,38 @@ func (c *Context) acquireRelLockTxn(rel storage.RelFileNode, mode lockmgr.Mode, 
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }
 
+// firstNormalObjectOID is the first OID assigned to user-created objects
+// (mirrors upstream FirstNormalObjectId). Relations below it are system
+// catalogs, which goopg serves from virtual/in-memory builders and never
+// AccessExclusive-locks, so scan-read locking skips them.
+const firstNormalObjectOID = 16384
+
+// acquireScanReadLockTxn takes a transaction-scoped ACCESS SHARE heavyweight
+// lock on the relation a scan is about to read, so a concurrent LOCK TABLE (or
+// any other AccessExclusive acquirer) in another session blocks until this
+// transaction ends — matching PostgreSQL, where every relation a query reads is
+// locked in ACCESS SHARE mode for the lifetime of the transaction.
+//
+// It is deliberately confined to keep the heavyweight manager off the hot path:
+//   - outside an explicit transaction block (TxnLockBackendID == 0) it is a
+//     no-op, so single-statement autocommit reads never touch tableLockMgr —
+//     they cannot participate in a cross-statement lock conflict anyway;
+//   - system catalogs (OID < firstNormalObjectOID) are skipped.
+//
+// ACCESS SHARE is self-compatible and conflicts only with ACCESS EXCLUSIVE, so
+// in the common case (no concurrent LOCK TABLE / DDL) the acquire is granted
+// instantly, and lockmgr is idempotent so re-scanning the same relation within a
+// transaction is a cheap mask check. When it does wait, the lock_timeout /
+// statement_timeout budget carried on the statement context governs the wait
+// exactly like LOCK TABLE does (acquireRelLockTxn). This is the table-level half
+// of the timeouts isolation spec. M0118-0009.
+func (c *Context) acquireScanReadLockTxn(rel storage.RelFileNode) error {
+	if c.TxnLockBackendID == 0 || rel.RelOid < firstNormalObjectOID {
+		return nil
+	}
+	return c.acquireRelLockTxn(rel, lockmgr.AccessShareLock, false)
+}
+
 // lockWaitCancelError maps the cancellation/timeout error returned by a
 // lock-wait primitive (lockmgr.Acquire* or mvcc.WaitForXID) to the matching
 // SQLSTATE-57014 ExecError, or nil when err is not a recognised cancellation.

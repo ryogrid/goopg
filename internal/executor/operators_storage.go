@@ -705,6 +705,12 @@ func (o *seqScanOp) Open(ctx *Context) error {
 		}
 		return err
 	}
+	if err := ctx.acquireScanReadLockTxn(o.rel); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.pos
+		}
+		return err
+	}
 	n, err := ctx.Pool.NBlocks(o.rel)
 	if err != nil {
 		return err

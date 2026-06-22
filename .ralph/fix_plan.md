@@ -296,12 +296,18 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       messages corrected (statement_timeout→"statement timeout",
       lock_timeout→"lock timeout", client cancel→"user request"); `epqWait`
       propagates timeouts to ~11 write-path sites instead of swallowing into a
-      spurious 40001. Verified `TestPort_TimeoutsRowLevel` 4/4; NOT promoted
-      (table-level half needs ACCESS SHARE on scans — deferred). **Remaining
-      (deferred, ledger 2026-06-22):** (a) `timeouts` table-level half: plain
-      SELECT must take a txn-scoped ACCESS SHARE on `tableLockMgr` so a later
-      `LOCK TABLE` conflicts — perf-sensitive design reversal; gate on
-      `TxnLockBackendID` like LOCK TABLE, then promote `timeouts.spec`.
+      spurious 40001. Verified `TestPort_TimeoutsRowLevel` 4/4. `timeouts`
+      TABLE-LEVEL half LANDED ⇒ **`timeouts.spec` PROMOTED to `pass`** (design
+      0118-0018): new `Context.acquireScanReadLockTxn` makes a plain SELECT take
+      a txn-scoped ACCESS SHARE on `tableLockMgr` (wired at the
+      seqscan/index/index-only opens) so a later bare `LOCK TABLE` (ACCESS
+      EXCLUSIVE) conflicts, parks, and is cancelled by the shorter timeout.
+      Bounded blast radius: no-op outside an explicit txn
+      (`TxnLockBackendID==0`) and for system catalogs (`RelOid<16384`);
+      idempotent re-acquire; ACCESS SHARE grants instantly absent a concurrent
+      LOCK TABLE/DDL. `TestPort_TimeoutsTableLevel` 4/4; full isolation batch +
+      `-race` executor/mvcc/lockmgr + pgbench smoke (0-failed, no TPS
+      regression) green. **Remaining (deferred, ledger 2026-06-22):**
       (b) lock carry-forward on the non-HOT update paths (delete+insert /
       `UPDATE…FROM` / MERGE / upsert) — bounded follow-up, same narrow gate, not
       exercised by any current `port` spec. Plus the other M0118-0009 misc specs
