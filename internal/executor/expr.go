@@ -5815,6 +5815,29 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return newVal, nil
 		}
 		return NullDatum, nil
+	case "pg_backend_pid":
+		// pg_backend_pid() → int4: the PID of the server process attached to the
+		// current session. goopg is a single OS process multiplexing connections,
+		// so the "PID" is the per-connection integer assigned at connect time
+		// (s.nextPID) and reported in BackendKeyData; it is what
+		// pg_stat_activity.pid joins on and what pg_cancel_backend(pid) targets.
+		// Resolved via the activity registry (ctx.backendPID()), falling back to
+		// the goopg.backend_pid GUC the server stamps at startup. M0118-0008
+		// (detach-partition-concurrently-3/4 s2snitch step).
+		if ctx != nil {
+			pidStr := ctx.backendPID()
+			if pidStr == "" && ctx.GetSetting != nil {
+				if v, ok := ctx.GetSetting("goopg.backend_pid"); ok {
+					pidStr = v
+				}
+			}
+			if pidStr != "" {
+				if n, err := strconv.ParseInt(pidStr, 10, 32); err == nil {
+					return NewIntDatum(n), nil
+				}
+			}
+		}
+		return NewIntDatum(0), nil
 	case "current_database":
 		return NewStringDatum("postgres"), nil
 	case "current_schema":
