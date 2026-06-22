@@ -5200,9 +5200,48 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !ok {
 				break
 			}
+			// Capture the RelFileNodes before the unregister flips the child's
+			// PartitionParentOID — needed for the CONCURRENTLY wait below.
+			parentRel := o.ctx.Catalog.RelFileNode(tbl)
+			childRel := o.ctx.Catalog.RelFileNode(childTbl)
 			im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
 			childTbl.PartitionParentOID = 0
 			childTbl.PartitionBounds = nil
+
+			// ALTER TABLE … DETACH PARTITION … CONCURRENTLY must not complete
+			// while another transaction is still actively using the partitioned
+			// table: upstream's two-phase detach (tablecmds.c
+			// ATExecDetachPartition → DetachPartitionFinalize) marks the partition
+			// "detach-pending", commits, then waits for every transaction whose
+			// snapshot predates that change to terminate before unsetting
+			// relpartbound. goopg keeps a single shared catalog (the membership
+			// change is globally visible the instant we unregister, matching the
+			// READ COMMITTED case where the partition disappears from concurrent
+			// snapshots immediately), so the only piece missing for the
+			// concurrent-detach contract is the wait: block until no OTHER backend
+			// holds a transaction-scoped lock on the parent or the partition being
+			// detached. A bare SELECT on the parent expands to per-partition scans,
+			// each taking a txn-scoped ACCESS SHARE on the child it reads, so a
+			// reader that touched the detached partition holds its lock until
+			// commit and the detacher parks behind it (rendered as `<waiting ...>`
+			// by the isolation runner's timing). Reuses the WaitForLockers analog
+			// (no lock of its own, so concurrent readers/writers proceed). Gated on
+			// CONCURRENTLY — plain DETACH / DETACH FINALIZE are synchronous and
+			// unaffected. M0118-0008 (detach-partition-concurrently specs).
+			if act.DetachConcurrently {
+				if err := o.ctx.waitForRelationLockers(parentRel); err != nil {
+					if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = act.Pos()
+					}
+					return err
+				}
+				if err := o.ctx.waitForRelationLockers(childRel); err != nil {
+					if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = act.Pos()
+					}
+					return err
+				}
+			}
 
 		case parser.AlterIndexAttachPartition:
 			// ALTER INDEX parent ATTACH PARTITION child — register index partition hierarchy.
