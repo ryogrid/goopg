@@ -1067,3 +1067,26 @@ func (c *Context) MaterializeWriterXID() error {
 // EnumRenameEntry records one ALTER TYPE … RENAME TO operation for transactional rollback.
 // OldName and NewName are lowercase. M0097-0022.
 type EnumRenameEntry struct{ OldName, NewName string }
+
+// sessionUniqueIDer is satisfied by *config.SessionRegistry (and test doubles).
+// It exposes the stable per-connection identity without the executor importing
+// the config package's concrete type into this signature.
+type sessionUniqueIDer interface{ UniqueID() uint64 }
+
+// sessionTempOwner returns the owning-session token for temporary relations
+// created by, or visible to, this Context. It is derived from the stable
+// per-connection SessionRegistry carried in AdvisorySessionIdentity. The empty
+// string means "no session identity" (internal/test contexts): such temp
+// relations are owned by nobody and stay visible to all sessions, preserving
+// legacy single-session behaviour. Design 0118-0036 (M0118-0008 inherit-temp).
+func sessionTempOwner(ctx *Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if s, ok := ctx.AdvisorySessionIdentity.(sessionUniqueIDer); ok && s != nil {
+		if id := s.UniqueID(); id != 0 {
+			return "s" + strconv.FormatUint(id, 10)
+		}
+	}
+	return ""
+}

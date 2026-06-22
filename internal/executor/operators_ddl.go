@@ -1947,6 +1947,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	tbl.Unlogged = s.Unlogged
 	tbl.Temp = s.Temporary
+	if s.Temporary {
+		tbl.TempOwner = sessionTempOwner(o.ctx)
+	}
 	tbl.Fillfactor = fillfactor
 	tbl.ParallelWorkers = parallelWorkers
 	tbl.ParallelWorkersSet = parallelWorkersSet
@@ -2934,6 +2937,9 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// Set persistence flags on the child.
 	tbl.Unlogged = s.Unlogged
 	tbl.Temp = s.Temporary
+	if s.Temporary {
+		tbl.TempOwner = sessionTempOwner(o.ctx)
+	}
 	// Persist the leaf partition's fillfactor so pg_class.reloptions surfaces it
 	// and pg_dump re-emits `WITH (fillfactor='N')`. DU-002 slice 191.
 	tbl.Fillfactor = childFillfactor

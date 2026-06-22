@@ -458,7 +458,27 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `VALIDATE CONSTRAINT` + lock semantics). Gates:
       `TestSelectListSRFInsideExpression`; planner+executor units;
       regress-port; pgbench smoke.
-      **Remaining (deferred, ledger 2026-06-22):** `alter-table-{1,2,4}`
+      **2026-06-22 inherit-temp foundation (design 0118-0036, NOT a spec
+      promotion):** laid the per-session temp-relation ownership concept the
+      `inherit-temp` spec needs. goopg keeps all relations in ONE shared catalog,
+      so a parent's inheritance expansion wrongly scans ANOTHER session's temp
+      child (PG isolates each backend's `pg_temp_N` via `RELATION_IS_OTHER_TEMP`):
+      `s1`'s `SELECT a FROM inh_parent` returns 6 rows vs PG's 4. A faithful fix
+      is multi-site (planner SELECT + UPDATE/DELETE/TRUNCATE/FK/MERGE expansion)
+      and must land atomically (sibling-paths discipline / silent-row-count risk),
+      so this loop landed the zero-blast-radius central pieces only:
+      `catalog.Table.TempOwner`, the shared filter
+      `catalog.AccessibleInheritanceChildren(children, owner)` (the single
+      chokepoint the wiring loop calls at every site), a stable
+      `config.SessionRegistry.UniqueID()` per-connection identity, and
+      `executor.sessionTempOwner(ctx)` (`"s<id>"`) stamped at both
+      `CREATE TEMPORARY TABLE` sites. Nothing reads `TempOwner` in live paths yet
+      (behaviour unchanged). Units `TestAccessibleInheritanceChildren`/
+      `TestSessionRegistryUniqueID`/`TestSessionTempOwner`; catalog/config/
+      executor packages green. Resume = the wiring fan-out + planner-token
+      plumbing (enumerated in the design doc / ledger).
+      **Remaining (deferred, ledger 2026-06-22):** `inherit-temp` wiring (above),
+      `alter-table-{1,2,4}`
       (ADD/VALIDATE CONSTRAINT lock semantics; INHERITS), the `*-conflict` family —
       truncate/vacuum/cluster — (need CREATE ROLE/GRANT/SET ROLE privilege infra +
       permission-denied), `reindex-concurrently-toast` (`allow_system_table_mods`

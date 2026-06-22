@@ -1,30 +1,42 @@
-(idle — nothing in flight)
+Last loop (#31): M0118-0008 — landed the **inherit-temp foundation** (design
+0118-0036). NOT a spec promotion (inherit-temp stays `defer`). Commit + push
+pending.
 
-Last loop (#30): M0118-0008 — promoted `vacuum-concurrent-drop` (design
-0118-0035). Committed + pushed pending. Eighth M0118-0008 promotion.
+What landed (zero blast radius — nothing reads TempOwner in live paths yet):
+- `catalog.Table.TempOwner string` — owning session's token ("" = permanent or
+  session-less temp = visible to all).
+- `catalog.AccessibleInheritanceChildren(children, sessionTempOwner)` — shared
+  filter that drops other-session temp children (keeps permanent/own/unowned).
+  The single chokepoint the wiring loop will call at every expansion site.
+- `config.SessionRegistry.UniqueID() uint64` — process-unique, non-zero,
+  lifetime-stable per-connection id (atomic counter in NewSessionRegistry).
+- `executor.sessionTempOwner(ctx)` — derives "s<id>" from
+  ctx.AdvisorySessionIdentity (UniqueID interface); stamped at BOTH CREATE
+  TEMPORARY TABLE sites (operators_ddl.go base ~1949 + partition leaf ~2936).
+- Units: TestAccessibleInheritanceChildren / TestSessionRegistryUniqueID /
+  TestSessionTempOwner. fix_plan + ledger + design README updated.
 
-What landed:
-- `internal/executor/operators_vacuum.go` / `operators_analyze.go`: on the
-  NON-SKIP_LOCKED path VACUUM/ANALYZE now take a BLOCKING per-relation
-  ShareUpdateExclusiveLock (acquireRelLockMaybeTransient) so they wait behind a
-  concurrent `LOCK part1 IN SHARE MODE` (`<waiting ...>`). New helper
-  `relationStillExists` (InMemory.LookupTableByOID) re-checks each target after
-  the lock; a target DROPped by the committing session is skipped — WARNING
-  "skipping vacuum/analyze of X --- relation no longer exists" for an explicit
-  target, silent for an expanded partition child.
-- `TestPort_IsolationVacuumConcurrentDrop` strict (6 perms PASS).
-- CSV: target-inventory row → status=pass; D-002 rationale appended; 3 md
-  regenerated. fix_plan + design README + design 0118-0035.
+Gates run: catalog/config/executor packages green; full executor pkg PASS;
+gofmt clean on touched files; build ./... OK; pgbench smoke via pre-commit hook.
 
-Gates run: strict new test PASS; vacuum-skip-locked PASS (no regression);
-executor vacuum/analyze units; `-race` lockmgr; pgbench smoke.
+WHY foundation-only: faithful RELATION_IS_OTHER_TEMP exclusion is MULTI-SITE
+(planner SELECT collectInheritanceDescendants planner.go:2189 / :2142 +
+executor UPDATE storage.go:3122, DELETE :3836/:4658, UPDATE…FROM :4252,
+TRUNCATE/DDL operators_ddl.go, FK/MERGE/VACUUM). Sibling-paths discipline: must
+wire ALL atomically or a missed site = silent row-count regression. Planner
+SELECT site has no session identity — needs a CurrentTempOwner() channel on
+sessionPlanCatalog (dispatch.go:870) + currentTempOwner(cat) walk in
+planScanRangeVar threaded into the collect funcs.
 
-Next loop: pick another M0118 deferred spec. Remaining M0118-0008 tail is hard
-(probed loop #30): alter-table-{1,2,4} (ADD/VALIDATE CONSTRAINT lock semantics),
-*-conflict family (role/GRANT privilege infra), partition ATTACH/DETACH (need
-snapshot-aware partition visibility — see detach-partition-concurrently-1),
-vacuum-no-cleanup-lock, inherit-temp (inheritance scanning), plpgsql-toast.
-Other groups: fk-deadlock (FK KEY-SHARE wait over-conflicts + deadlock-timeout
-interplay — deep MVCC), eval-plan-qual (EPQ-over-join), predicate-hash (SSI
-granularity), horizons (dollar-quote lexer + EXPLAIN JSON), intra-grant-inplace
-(catalog-tuple xmax locks — hardest). No cheap no-engine-change wins remain.
+Next step (resume = the deferred WIRING loop): call
+`catalog.AccessibleInheritanceChildren` at every site above (executor:
+owner=sessionTempOwner(ctx); planner: thread the token), then verify strict
+9-perm `TestPort_IsolationInheritTemp` byte-for-byte — incl. the last two
+permutations' TRUNCATE-on-parent blocking (s2_select_p waits behind s1's
+in-progress TRUNCATE; s2_select_c on its own temp child does not). Full gates:
+regress-port + pgbench + -race executor + full TestPort_Isolation*.
+
+Other deferred M0118 tail (hard, see ledger): alter-table-{1,2,4}, *-conflict
+(role/GRANT infra), partition ATTACH/DETACH-concurrently, vacuum-no-cleanup-lock,
+reindex-toast, plpgsql-toast; fk-deadlock, ri-trigger, eval-plan-qual,
+predicate-hash/gin/gist, horizons, intra-grant-inplace, 2PC/async-notify.

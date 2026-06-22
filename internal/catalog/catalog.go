@@ -389,6 +389,18 @@ type Table struct {
 	Unlogged bool
 	Temp     bool
 
+	// TempOwner identifies the session that owns this temporary relation. In
+	// PostgreSQL every backend has its own temp namespace (pg_temp_N); a temp
+	// relation is only part of *its* backend's catalog. goopg keeps all
+	// relations in one shared in-memory catalog, so we record the owning
+	// session's stable token here to recover that per-session isolation. It is
+	// empty for permanent/unlogged tables and for temp tables created without a
+	// session identity (internal/test contexts). Consumers must treat an
+	// empty-owner temp relation as visible to all sessions to preserve legacy
+	// single-session behaviour. See AccessibleInheritanceChildren and design
+	// 0118-0036 (RELATION_IS_OTHER_TEMP inheritance exclusion).
+	TempOwner string
+
 	// Fillfactor stores the table's `WITH (fillfactor=N)` storage parameter
 	// (10–100). Zero means unset (PG's default 100 / no reloptions). pg_class's
 	// reloptions cell surfaces this as the text[] element `fillfactor=N`, which
@@ -1816,6 +1828,46 @@ func (c *InMemory) UnregisterInheritanceChild(parentOID, childOID uint32) {
 			return
 		}
 	}
+}
+
+// AccessibleInheritanceChildren filters a list of inheritance/partition child
+// relations down to those visible to the session identified by sessionTempOwner,
+// mirroring PostgreSQL's RELATION_IS_OTHER_TEMP exclusion in inheritance
+// expansion (see expand_single_inheritance_child / find_inheritance_children).
+//
+// A temporary child relation owned by a *different* session is dropped: in
+// upstream PG it lives in another backend's pg_temp_N namespace and is never
+// part of this backend's scan of the inheritance parent. A permanent child, an
+// own temp child (TempOwner == sessionTempOwner), and an unowned temp child
+// (TempOwner == "", i.e. created without a session identity in internal/test
+// contexts) are all retained so legacy single-session behaviour is preserved.
+//
+// The slice is filtered in place when nothing is dropped (returning the same
+// backing array); otherwise a fresh slice is returned. nil-in / nil-out.
+// Design 0118-0036 (M0118-0008 inherit-temp).
+func AccessibleInheritanceChildren(children []*Table, sessionTempOwner string) []*Table {
+	if len(children) == 0 {
+		return children
+	}
+	// Fast path: nothing to drop.
+	drop := false
+	for _, c := range children {
+		if c != nil && c.Temp && c.TempOwner != "" && c.TempOwner != sessionTempOwner {
+			drop = true
+			break
+		}
+	}
+	if !drop {
+		return children
+	}
+	out := make([]*Table, 0, len(children))
+	for _, c := range children {
+		if c != nil && c.Temp && c.TempOwner != "" && c.TempOwner != sessionTempOwner {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // InheritanceChildren returns the direct inheritance children of parentOID.
