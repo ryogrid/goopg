@@ -616,25 +616,28 @@ func TestPort_IsolationMultipleRowVersions(t *testing.T) {
 // two SERIALIZABLE transactions each SELECT i IN (5,7) then UPDATE one of the
 // two rows. The reads cross-cover the other writer's target row, forming a
 // write-skew dangerous structure, so the later committer (s2) must abort with
-// 40001.
+// 40001. Promoted to pass-required (M0118-0002, design 0118-0026) — matches
+// PG 18.3 byte-for-byte with no engine change.
 func TestPort_IsolationPredicateLockHotTuple(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_pred_lock_hot")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/predicate-lock-hot-tuple.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/predicate-lock-hot-tuple.spec")
 }
 
 // TestPort_IsolationPartialIndex exercises partial-index: an UPDATE that moves a
 // row out of a partial index (CREATE INDEX ... WHERE val2 = 1) under SERIALIZABLE
 // must still create the read/write dependency a full-table read would, so any
-// overlap between the two transactions raises 40001.
+// overlap between the two transactions raises 40001. Promoted to pass-required
+// (M0118-0002, design 0118-0026) — matches PG 18.3 byte-for-byte with no engine
+// change.
 func TestPort_IsolationPartialIndex(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_partial_index")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/partial-index.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/partial-index.spec")
 }
 
 // TestPort_IsolationTemporalRangeIntegrity exercises temporal-range-integrity: a
@@ -700,12 +703,14 @@ func TestPort_IsolationFkDeadlock2(t *testing.T) {
 // DELETEs the matching row from the other table. Any overlap forms a
 // rw-dependency cycle so the second committer must abort with 40001; the two
 // serialized orderings (rxwy1 c1 rywx2 c2 / rywx2 c2 rxwy1 c1) commit cleanly.
+// Promoted to pass-required (M0118-0002, design 0118-0026) — matches PG 18.3
+// byte-for-byte with no engine change.
 func TestPort_IsolationIndexOnlyScan(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_index_only_scan")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/index-only-scan.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/index-only-scan.spec")
 }
 
 // TestPort_IsolationSkipLocked exercises the skip-locked spec: two sessions

@@ -151,6 +151,19 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
 - [ ] **M0118-0002** — Predicate-lock granularity per access method / scan type:
       predicate-gin, predicate-gist, predicate-hash, predicate-lock-hot-tuple,
       index-only-scan, index-only-bitmapscan, partial-index.
+      **PARTIAL (2026-06-22, design 0118-0026):** probe-first ranked all 7; three
+      promoted to pass-required (strict) with NO engine change —
+      `predicate-lock-hot-tuple`, `partial-index`, `index-only-scan` already match
+      PG 18.3 byte-for-byte (SERIALIZABLE pinned snapshot M0100 + SSI 40001
+      detector M0104 form the write-skew structure across HOT-tuple updates,
+      partial-index row-movement, and all-visible index-only scans). Switched
+      `TestPort_IsolationPredicateLockHotTuple/PartialIndex/IndexOnlyScan`
+      soft→`runIsoSpecStrict`. **Remaining (deferred, ledger 2026-06-22):**
+      `index-only-bitmapscan` (global-setup connection crash — bitmap-scan path),
+      `predicate-gin` (int-array `{1}` + GIN AM), `predicate-gist` (point type +
+      GiST AM) need missing index access methods; `predicate-hash` OVER-detects a
+      40001 where PG commits — goopg's coarse relation-grain SIREAD vs PG's finer
+      hash-index predicate locking (the canonical granularity gap). Group stays open.
 - [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
       All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
       nowait{,-2,-3,-4,-5}, lock-nowait,
