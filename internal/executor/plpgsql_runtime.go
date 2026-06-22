@@ -1822,6 +1822,14 @@ func exceptionHandlerMatches(conditions []string, sqlstate string, conditionName
 }
 
 func evalPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame, ctx *Context) (Datum, error) {
+	// A top-level scalar subquery (`x := (SELECT ...)`) cannot be lowered to a
+	// planner.Expr — it must be planned and executed against the live catalog to
+	// produce its single value. PL/pgSQL treats `(SELECT ...)` in a scalar
+	// context as returning the first column of the first row (NULL if no row).
+	// M0118-0008 (plpgsql-toast assign2).
+	if sq, ok := e.(*parser.SubqueryExpr); ok {
+		return evalScalarSubquery(sq, ctx)
+	}
 	pe, err := lowerPLpgSQLExpr(e, frame)
 	if err != nil {
 		return Datum{}, err
@@ -1834,6 +1842,49 @@ func evalPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame, ctx *Context) (Datum, e
 		return Datum{}, err
 	}
 	return d, nil
+}
+
+// evalScalarSubquery plans and executes a scalar subquery from a PL/pgSQL
+// expression, returning the first column of the first row (NULL Datum when the
+// query produces no rows, matching PostgreSQL's scalar-subquery semantics). An
+// error is raised if the subquery returns more than one row. M0118-0008.
+func evalScalarSubquery(sq *parser.SubqueryExpr, ctx *Context) (Datum, error) {
+	if sq.Inner == nil {
+		return Datum{}, &ExecError{Code: "42601", Pos: sq.Pos(), Message: "empty subquery in PL/pgSQL expression"}
+	}
+	plan, err := planner.Plan(sq.Inner, ctxPlanCatalog(ctx))
+	if err != nil {
+		return Datum{}, err
+	}
+	op, err := Build(plan)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := op.Open(ctx); err != nil {
+		op.Close()
+		return Datum{}, err
+	}
+	defer op.Close()
+	slot, nerr := op.Next()
+	if nerr != nil && nerr != EOF {
+		return Datum{}, nerr
+	}
+	if slot == nil || nerr == EOF {
+		// No rows ⇒ NULL.
+		return Datum{}, nil
+	}
+	row := slotRow(slot)
+	if len(row) == 0 {
+		return Datum{}, nil
+	}
+	result := row[0]
+	// A scalar subquery may return at most one row.
+	if s2, e2 := op.Next(); e2 == nil && s2 != nil {
+		return Datum{}, &ExecError{Code: "21000", Pos: sq.Pos(), Message: "more than one row returned by a subquery used as an expression"}
+	} else if e2 != nil && e2 != EOF {
+		return Datum{}, e2
+	}
+	return result, nil
 }
 
 func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) {

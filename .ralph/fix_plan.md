@@ -654,6 +654,21 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (Effort-L). Gates: `TestParseSelectInto`/`TestParseSelectNoIntoIsEmbeddedSQL`;
       `TestPlpgSQLSelectInto`; full executor+plpgsql units; txctl/subxid-overflow
       regression PASS; `go vet`; pgbench smoke = pre-commit hook.
+      **2026-06-23 enabler (design 0118-0051, NOT a promotion): PL/pgSQL
+      scalar subquery.** A top-level `(SELECT …)` in a PL/pgSQL expression
+      (assignment RHS or `RETURN` operand) is now planned+executed against the
+      live catalog → first column of the first row (NULL when no row; `21000`
+      when >1 row), instead of the blanket `0A000 subqueries are not supported`.
+      Intercepted in `evalPLpgSQLExpr` before lowering (a subquery can't lower to
+      a `planner.Expr`) via new `evalScalarSubquery` mirroring the
+      `SelectIntoStmt`/`ForSelectStmt` machinery (0118-0050). Lifts
+      `plpgsql-toast`'s `assign2` blocker (`x := (select test1.b from test1)`);
+      probe confirms `assign1`/`assign2` now byte-match PG (both `length(x) =
+      6000`) and the first divergence advances to `assign3` (expanded-record
+      field assignment `r.b := (select …)` + `length(r::text)` → `6004` vs
+      `<NULL>`). A subquery nested inside a larger expr still `0A000` (no spec
+      needs it). Executor-only; `TestPlpgSQLScalarSubquery`; `internal/executor`
+      PASS; `go build` clean; pgbench smoke = pre-commit hook.
       **Remaining (deferred):** `alter-table-4` (INHERITS + transactional-DDL
       cross-session visibility), `detach-partition-concurrently-{1,2,3,4}` +
       `partition-concurrent-attach` (transactional partition visibility),
