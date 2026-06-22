@@ -401,13 +401,34 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (48 perms); lock-sibling + savepoint/abort (`delete-abort-savept{,2}`,
       `aborted-keyrevoke`) + SSI regression PASS; `-race` lockmgr/server;
       parser/executor units; pgbench smoke.
+      **2026-06-22 seventh promotion (design 0118-0033): `vacuum-skip-locked`
+      PROMOTED.** `VACUUM`/`ANALYZE (SKIP_LOCKED)` against a partitioned table
+      while another session holds `part1` in `SHARE`/`ACCESS EXCLUSIVE`. Three
+      fixes: (1) new `(*Context).tryAcquireMaintenanceLock` (mirrors PG
+      `ConditionalLockRelationOid`) — conditional `TryAcquire` of
+      `ShareUpdateExclusiveLock` (or `AccessExclusiveLock` for `VACUUM FULL`)
+      under the active backend, release-immediately, `false` on contention ⇒ skip
+      not wait; (2) `expandVacuumTargets`/`expandAnalyzeTargets` tag each relation
+      explicit (user-named ⇒ `WARNING: skipping vacuum/analyze of "X" --- lock not
+      available` via `AddWarning`) vs expanded (partition child ⇒ silent skip) and
+      record partitioned parents; `ANALYZE` of a partitioned parent then reads
+      each leaf partition under a BLOCKING `AccessShareLock`
+      (`analyzeInheritanceWait` → `acquireRelLockMaybeTransient`) — `SKIP_LOCKED`
+      does not cover the inheritance scan — so ANALYZE waits under `ACCESS
+      EXCLUSIVE` (conflicts with AccessShare) but not `SHARE` (compatible); plain
+      VACUUM never waits; (3) the isolation runner now echoes each captured server
+      message with its real protocol severity (`pq.Error.Severity`) instead of a
+      hard-coded `NOTICE:`, so `WARNING:` lines render (NOTICE-emitting specs
+      unchanged). `TestPort_IsolationVacuumSkipLocked` strict PASS (16 perms);
+      full `TestPort_Isolation*` suite PASS (no severity-change regression);
+      framework + executor vacuum/analyze units; `-race` lockmgr; pgbench smoke.
       **Remaining (deferred, ledger 2026-06-22):** `alter-table-{1,2,4}`
       (ADD/VALIDATE CONSTRAINT lock semantics; INHERITS), the `*-conflict` family —
       truncate/vacuum/cluster — (need CREATE ROLE/GRANT/SET ROLE privilege infra +
       permission-denied), `reindex-concurrently-toast` (`allow_system_table_mods`
       GUC + TOAST-relation reindex), partition specs (ATTACH/DETACH PARTITION),
-      `vacuum-skip-locked`/`vacuum-concurrent-drop` (partitioned VACUUM + log
-      parity), `vacuum-no-cleanup-lock` (reltuples accounting), `inherit-temp`
+      `vacuum-concurrent-drop` (concurrent DROP during partitioned VACUUM),
+      `vacuum-no-cleanup-lock` (reltuples accounting), `inherit-temp`
       (RELATION_IS_OTHER_TEMP exclusion), `plpgsql-toast` (TOAST in PL/pgSQL).
       Group stays open.
 - [ ] **M0118-0009** — Misc / system-level specs: async-notify, timeouts, stats, horizons,

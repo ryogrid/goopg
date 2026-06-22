@@ -118,7 +118,7 @@ func TestNormalizeBoolWireText(t *testing.T) {
 func TestDrainCompleted_EmitsPendingStepNotices(t *testing.T) {
 	var sb strings.Builder
 	q := &sessionNoticeQueue{}
-	q.push("hello from pending step")
+	q.push("NOTICE", "hello from pending step")
 	pending := []pendingStep{{
 		session: "s1",
 		outCh:   make(chan stepOutcome),
@@ -140,7 +140,7 @@ func TestDrainCompleted_EmitsPendingStepNotices(t *testing.T) {
 func TestDrainWithTimeout_EmitsPendingStepNotices(t *testing.T) {
 	var sb strings.Builder
 	q := &sessionNoticeQueue{}
-	q.push("hello after unblock")
+	q.push("NOTICE", "hello after unblock")
 	pending := []pendingStep{{
 		session: "s2",
 		outCh:   make(chan stepOutcome),

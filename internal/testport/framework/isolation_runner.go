@@ -169,9 +169,19 @@ type sessionNoticeQueue struct {
 	total   int // monotonic count of all notices ever pushed; never reset by drain
 }
 
-func (q *sessionNoticeQueue) push(msg string) {
+// push records a server message, prefixed with its protocol severity
+// ("WARNING:  " / "NOTICE:  " / …) exactly as upstream isolationtester echoes
+// it. PostgreSQL emits both NOTICE- and WARNING-severity NoticeResponses during
+// a step (e.g. VACUUM (SKIP_LOCKED) emits a WARNING when a relation is skipped),
+// and the expected output distinguishes them, so the real severity must be
+// preserved rather than hard-coded to "NOTICE". An empty severity (older driver
+// or non-localized path) falls back to "NOTICE".
+func (q *sessionNoticeQueue) push(severity, msg string) {
+	if severity == "" {
+		severity = "NOTICE"
+	}
 	q.mu.Lock()
-	q.notices = append(q.notices, msg)
+	q.notices = append(q.notices, severity+":  "+msg)
 	q.total++
 	q.mu.Unlock()
 }
@@ -211,7 +221,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		base, err := pq.NewConnector(r.DSN)
 		if err == nil {
 			withNotice := pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
-				q.push(n.Message)
+				q.push(n.Severity, n.Message)
 			})
 			sessionDBs[sname] = sql.OpenDB(withNotice)
 		} else {
@@ -470,7 +480,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			// isolationtester's output format.
 			if q != nil {
 				for _, notice := range q.drain() {
-					fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", step.Session, notice)
+					fmt.Fprintf(&sb, "%s: %s\n", step.Session, notice)
 				}
 			}
 			// Upstream isolationtester echoes step SQL verbatim and appends
@@ -681,7 +691,7 @@ func reportStepGatedOnBlockers(sb *strings.Builder, spec IsolationSpec, queues m
 func writeCompletedStep(sb *strings.Builder, name, sql string, o stepOutcome) {
 	for _, notice := range o.notices {
 		if o.session != "" {
-			fmt.Fprintf(sb, "%s: NOTICE:  %s\n", o.session, notice)
+			fmt.Fprintf(sb, "%s: %s\n", o.session, notice)
 		}
 	}
 	fmt.Fprintf(sb, "step %s: <... completed>\n", name)
@@ -696,7 +706,7 @@ func drainPendingStepNotices(sb *strings.Builder, p pendingStep) {
 		return
 	}
 	for _, notice := range p.queue.drain() {
-		fmt.Fprintf(sb, "%s: NOTICE:  %s\n", p.session, notice)
+		fmt.Fprintf(sb, "%s: %s\n", p.session, notice)
 	}
 }
 
@@ -975,7 +985,7 @@ func formatStepOutput(name, sqlText string, o stepOutcome, afterWaiting bool) st
 		// NOTICEs appear BEFORE the step SQL line (matches PostgreSQL isolationtester).
 		for _, notice := range o.notices {
 			if o.session != "" {
-				fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", o.session, notice)
+				fmt.Fprintf(&sb, "%s: %s\n", o.session, notice)
 			}
 		}
 		// Upstream isolationtester echoes step SQL verbatim after `step

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -60,13 +61,25 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 	if o.ctx == nil || o.ctx.Pool == nil || o.ctx.Catalog == nil || o.ctx.TxnMgr == nil {
 		return nil, &ExecError{Code: "0A000", Pos: o.stmt.Pos(), Message: "ANALYZE requires Pool/Catalog/TxnMgr in Context"}
 	}
-	for _, name := range o.targets() {
-		tbl, ok := o.ctx.Catalog.LookupTable(name)
-		if !ok {
-			return nil, &ExecError{Code: "42P01", Pos: o.stmt.Pos(), Message: fmt.Sprintf("relation %q does not exist", name.String())}
-		}
-		if tbl.Virtual {
-			continue
+	targets, parents, terr := o.expandAnalyzeTargets()
+	if terr != nil {
+		return nil, terr
+	}
+	for _, at := range targets {
+		tbl := at.tbl
+		// ANALYZE (SKIP_LOCKED): take the per-relation ShareUpdateExclusiveLock
+		// conditionally (analyze.c uses ShareUpdateExclusiveLock). A contended
+		// relation is skipped — with a WARNING only when the user named it
+		// explicitly; partition children reached by expanding a partitioned
+		// table are skipped silently. M0118-0008 (vacuum-skip-locked).
+		if o.stmt.SkipLocked {
+			rel := o.ctx.Catalog.RelFileNode(tbl)
+			if !o.ctx.tryAcquireMaintenanceLock(rel, lockmgr.ShareUpdateExclusiveLock) {
+				if at.explicit {
+					o.ctx.AddWarning(fmt.Sprintf("skipping analyze of %q --- lock not available", tbl.Name))
+				}
+				continue
+			}
 		}
 		stats, err := analyzeRelationCtx(o.ctx, tbl)
 		if err != nil {
@@ -79,7 +92,48 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 			_ = werr
 		}
 	}
+	// Inheritance-tree statistics for partitioned parents read every leaf
+	// partition under a blocking AccessShareLock (SKIP_LOCKED does not cover
+	// this scan), so ANALYZE of a partitioned table waits on a child held in a
+	// conflicting mode by another session. M0118-0008.
+	for _, parent := range parents {
+		analyzeInheritanceWait(o.ctx, parent)
+	}
 	return nil, EOF
+}
+
+// expandAnalyzeTargets resolves the ANALYZE target list into concrete heap
+// relations, expanding any partitioned table into its leaf partitions (marked
+// non-explicit ⇒ silent SKIP_LOCKED skip) and returning the partitioned parents
+// encountered for the inheritance-statistics AccessShare scan. A named target
+// that does not exist is a hard 42P01 error, matching the prior behaviour.
+func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *ExecError) {
+	cat := o.ctx.Catalog
+	im, _ := cat.(*catalog.InMemory)
+	var out []vacuumTarget
+	var parents []*catalog.Table
+	var add func(tbl *catalog.Table, explicit bool)
+	add = func(tbl *catalog.Table, explicit bool) {
+		if tbl == nil || tbl.Virtual {
+			return
+		}
+		if tbl.PartitionMethod != "" && im != nil {
+			parents = append(parents, tbl)
+			for _, child := range im.PartitionChildren(tbl.OID) {
+				add(child, false)
+			}
+			return
+		}
+		out = append(out, vacuumTarget{tbl: tbl, explicit: explicit})
+	}
+	for _, name := range o.targets() {
+		tbl, ok := cat.LookupTable(name)
+		if !ok {
+			return nil, nil, &ExecError{Code: "42P01", Pos: o.stmt.Pos(), Message: fmt.Sprintf("relation %q does not exist", name.String())}
+		}
+		add(tbl, true)
+	}
+	return out, parents, nil
 }
 
 func (o *analyzeOp) Close() error { return nil }

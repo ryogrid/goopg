@@ -848,6 +848,40 @@ func (c *Context) acquireRelLockMaybeTransient(rel storage.RelFileNode, mode loc
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }
 
+// tryAcquireMaintenanceLock is the conditional (non-blocking) lock acquire that
+// backs VACUUM/ANALYZE (SKIP_LOCKED): it mirrors PostgreSQL's
+// ConditionalLockRelationOid, returning true when `mode` is free to take on rel
+// and false the instant a conflicting lock is held by any other backend (the
+// caller then skips the relation rather than waiting). The lock is released
+// immediately on success — goopg's VACUUM/ANALYZE is a self-contained statement
+// that needs the lock only to detect contention, not to hold off concurrent
+// access for its duration. System catalogs (OID < firstNormalObjectOID) are
+// never contended this way, so they always report available.
+//
+// The acquire runs under whichever backend identity is active — the transaction
+// backend inside an explicit block, else the per-statement backend — both of
+// which are minted from the same counter and unique, so the targeted Release
+// drops exactly this probe. A zero backend (no identity at all) reports
+// available. M0118-0008 (vacuum-skip-locked).
+func (c *Context) tryAcquireMaintenanceLock(rel storage.RelFileNode, mode lockmgr.Mode) bool {
+	if rel.RelOid < firstNormalObjectOID {
+		return true
+	}
+	backend := c.BackendID
+	if c.TxnLockBackendID != 0 {
+		backend = c.TxnLockBackendID
+	}
+	if backend == 0 {
+		return true
+	}
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	if err := tableLockMgr.TryAcquire(backend, tag, mode); err != nil {
+		return false
+	}
+	tableLockMgr.Release(backend, tag, mode)
+	return true
+}
+
 // waitForRelationLockers blocks until no OTHER backend holds a transaction-
 // scoped table lock on rel, mirroring PostgreSQL's WaitForLockers, which
 // REINDEX … CONCURRENTLY and CREATE INDEX CONCURRENTLY invoke at each phase

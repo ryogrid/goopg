@@ -410,6 +410,21 @@ func TestPort_IsolationAlterTable3(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-3.spec")
 }
 
+// TestPort_IsolationVacuumSkipLocked exercises the vacuum-skip-locked spec
+// (M0118-0008). VACUUM/ANALYZE (SKIP_LOCKED) take a conditional per-relation
+// lock: a relation held by another session is skipped — with a WARNING when
+// named explicitly, silently when reached by partition expansion. ANALYZE of a
+// partitioned parent then reads each leaf partition under a blocking
+// AccessShareLock for inheritance stats, so it waits on a child locked in
+// ACCESS EXCLUSIVE (but not SHARE).
+func TestPort_IsolationVacuumSkipLocked(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_vacuum_skip_locked")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-skip-locked.spec")
+}
+
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
 // Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
 func TestPort_IsolationFkSnapshot(t *testing.T) {
