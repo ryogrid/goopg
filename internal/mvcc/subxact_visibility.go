@@ -376,13 +376,24 @@ func (m *Manager) RegisterSubXid(subxid, parentXid storage.TransactionID) {
 	m.addSubxactEntry(subxid, parentXid)
 }
 
-// MarkSubxactAborted records that subxid was individually rolled back.
+// MarkSubxactAborted records that subxid was individually rolled back, then
+// wakes any WaitForXID sleeper: a blocked row-lock waiter that conflicts with a
+// lock acquired inside this savepoint must re-evaluate now that the savepoint's
+// lock is released (xidActiveWithSubxact will report the subxid dead). The
+// broadcast happens under waitMu after the abort state is recorded, mirroring
+// the top-level abort path in markXactEnd — the state change (under subxactMu /
+// the persistent map) and the broadcast (under waitMu) are disjoint, never
+// nested, so there is no lock-ordering hazard with WaitForXID (waitMu → subxactMu).
+// M0118-0004 (docs/design/0118-0012).
 func (m *Manager) MarkSubxactAborted(subxid storage.TransactionID) {
 	if sm := m.attachedSubxactMap(); sm != nil {
 		sm.MarkAborted(subxid)
-		return
+	} else {
+		m.markSubxactAborted(subxid)
 	}
-	m.markSubxactAborted(subxid)
+	m.waitMu.Lock()
+	m.commitCond.Broadcast()
+	m.waitMu.Unlock()
 }
 
 // attachedSubxactMap returns the persistent SubxactMap installed via

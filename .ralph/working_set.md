@@ -1,58 +1,57 @@
-Task: M0118-0004 `tuplelock-upgrade-no-deadlock` — PRODUCER side landed (design 0118-0011).
-Spec advanced 0 → 8 of 9 permutations matching. Spec still `defer` (perm 9 fails).
+Task: M0118-0004 `tuplelock-upgrade-no-deadlock` perm 9 (savepoint tuple-lock retry).
+Design 0118-0012. Spec at 8/9; perm 9 divergence moved expected L216 → L238 this loop.
 
-DONE this loop (committed):
-- NEW storage primitive `storage.PageStampHotOldTupleMulti` (heap.go) — multi xmax +
-  multi hint bits + HOT chain CTID + HEAP_HOT_UPDATED; pd_prune_xid from updater xid.
-- NEW shared helper `stampUpdaterXmaxPreservingLockers(ctx, hdr, keysUpdated)`
-  (operators_storage.go) — gated on lock-only xmax; keeps only still-active foreign
-  lockers NOT conflicting (multixact.StatusesConflict) with our updater; appends our
-  member; builds {updater+survivors} multi. + non-HOT wrapper `stampUpdaterXmaxNonHOT`.
-- Wired ALL old-tuple xmax stamp twins (sibling-paths): tryApplyHOTUpdate (spec path,
-  keysUpdated=false); index/seqscan UPDATE delete-half; index/seqscan DELETE +
-  DELETE…USING; UPDATE…FROM; merge update/delete; upsert update+delete. key-UPDATE/
-  DELETE (StatusUpdate) conflicts with all modes → always plain-stamp (no-op there).
-- Crash-safe: HOT/delete WAL records carry single updater xid → replay degrades to
-  single-xid (transient lockers don't survive crash; 0118-0002 precedent).
-- Unit tests: TestPageStampHotOldTupleMulti (storage), TestStampUpdaterXmaxPreservingLockers
-  (executor). Files: heap.go, heap_test.go, operators_storage.go, operators_merge.go,
-  operators_upsert.go, concurrent_update_xmax_test.go, design 0118-0011 + README, fix_plan,
-  deferral ledger.
+DONE this loop (committed): three gated engine pieces of the savepoint-scoped
+row-lock subsystem perm 9 needs:
+- (A) `mvcc.Manager.xidActiveWithSubxact` (manager.go) — IsXIDActive/WaitForXID now
+  subxact-aware: subxid active iff top-level parent in progress AND subxid not
+  individually aborted. Top-level fast path first → ordinary xids unchanged.
+  (subxids deliberately NOT in proc-array per AllocateSubXid.)
+- (B) `lockRowsOp.conflictingLockHolders` (operators_lockrows.go) — lock-only conflict
+  branch waits ONLY on members whose mode conflicts (multixact.StatusesConflict) with
+  the request (MultiXactIdWait semantics), not every active member.
+- (C) `MarkSubxactAborted` (subxact_visibility.go) — commitCond.Broadcast() under
+  waitMu after the abort state is set (disjoint from subxactMu → no lock-order hazard)
+  so a blocked row-lock waiter wakes on ROLLBACK TO SAVEPOINT.
+Files: manager.go, subxact_visibility.go, operators_lockrows.go, design 0118-0012 (NEW)
++ README index, fix_plan, deferral_ledger.
 
-GATES (all PASS): build/vet/gofmt clean (my lines NOT in gofmt diff — do NOT gofmt -w);
-new unit tests PASS; -race batch (Multixact*/Tuplelock*/LockUpdate*/UpdateLocked*/
-PropagateLock*/LockCommitted*/EvalPlanQual*/SkipLocked*/Nowait*/Merge*/StampUpdater*/
-*HOTUpdate*/Upsert*) PASS; internal/multixact+storage -race PASS; full executor+wal+mvcc
-PASS; CI-parity pgbench smoke (standard/-N/-S) 0-failed. DO NOT stage: postgres,
-weekly_loc.*, requirements.txt, weekkly_loc_history.py.
+GATES (all PASS): build/vet clean; -race internal/mvcc + internal/multixact + row-lock
+executor units; row-lock isolation batch (Tuplelock*/LockUpdate*/UpdateLockedTuple/
+PropagateLockDelete/LockCommitted*/MultixactNoDeadlock/SkipLocked{,2,3,4}/Nowait{,2,3,4,5}/
+LockNowait) PASS; deadlock+merge batch (DeadlockHard/Simple/Soft{,2}/Merge*/EvalPlanQual*)
+PASS; full executor+multixact units PASS; pgbench smoke via pre-commit hook. DO NOT stage:
+postgres, weekly_loc.*, requirements.txt, weekkly_loc_history.py.
 
-VERIFY of 8/9: runIsoSpec first divergence is expected L216, INSIDE perm 9 (starts L194)
-→ perms 1-8 all match. Perm boundaries in expected .out: L3/34/61/88/114/139/164/179/194.
+VERIFY: `go test -v -run TestPort_IsolationTuplelockUpgradeNoDeadlock ./internal/testport/`
+now diverges at expected L238 (was L216): s2_fornokeyupd completes at the full s1_rollback
+instead of at s1_rollback_e.
 
->>> NEXT STEP (continue M0118-0004 — PERM 9, the last failing perm):
-    Perm 9 = `s1_keyshare s3_for_update s2_for_keyshare s1_savept_e s1_share s1_savept_f
-    s1_fornokeyupd s2_fornokeyupd s0_begin s0_keyshare s1_rollback_f s0_keyshare
-    s1_rollback_e s1_rollback s2_rollback s0_rollback s3_rollback`. It exercises the
-    SAVEPOINT-driven tuple-lock RETRY: (a) `rollback to savepoint` must RELEASE a
-    subtransaction's row lock so a blocked waiter becomes grantable; (b) s2 must re-run
-    the whole tuple-lock acquisition after initially avoiding a deadlock. goopg has NO
-    subtransaction-scoped row-lock lifecycle (row locks ride xmax/multixact + WaitForXID,
-    not a savepoint-aware structure). PLAN: figure how goopg models savepoints/subxacts
-    (search ROLLBACK TO / Savepoint / subxact in internal/executor + mvcc), and whether a
-    subxact's multixact membership can be retracted on rollback-to-savepoint so the
-    tuple's xmax members drop the rolled-back locker → blocked waiter re-probes and
-    proceeds. This is a DISTINCT subsystem — its own loop. Likely large; may need a
-    design slice first. SEPARATELY (lower priority, its own slice): make the UPDATE/DELETE
-    conflict-WAIT on a CONFLICTING lock-only locker (today dropped by plain stamp).
-    Then deadlock-parallel — DEFER (needs lock-group abstraction goopg lacks).
-    Promotion workflow when perm 9 lands: fix→green full spec→CSV failed→pass (rationale
-    COMMA-FREE) → regen gen-oracle-inventory + gen-isolation-coverage → design slice +
-    README + ledger.
+>>> NEXT STEP (continue perm 9 — GAP D, the root blocker):
+    goopg's ENTIRE heap write path stamps the TOP-LEVEL xid: ectx.Tx = session.tx via
+    connTx.Tx()→CurrentTransaction() (server/dispatch.go:240,187; session.go:116-120),
+    and lockRowsOp calls MaterializeWriterXID which short-circuits on the already-set
+    top xid. INSERT too (operators_storage.go:2175/2177 stamp ctx.Tx.XID). So s1's
+    FOR SHARE / FOR NO KEY UPDATE upgrades inside savepoints e/f are recorded under
+    s1's top-level xid (stampMultiLock re-adds the member at the upgraded strength
+    under the SAME xid) → ROLLBACK TO SAVEPOINT can't revert them → Gaps A/B/C have no
+    subxid member to act on. FIX: (1) make the lock path (lockRowsOp) stamp under
+    EffectiveWriterXID() (the current savepoint subxid) instead of ctx.Tx.XID — the
+    statement's writer xid must reflect currentSubXid; (2) make EVERY row-lock
+    self-identity check top-level-aware: activeLockHolders/conflictingLockHolders/
+    stampMultiLock `m.Xid == o.ctx.Tx.XID` + the `tup.Header.Xmax != o.ctx.Tx.XID`
+    conflict gates (operators_lockrows.go ~L722,955,1306,1349) → self = same top-level
+    ancestor (mvcc.IsSelfXID / TopLevelXid), so a subtxn never blocks on / clobbers its
+    own parent/sibling member. HIGHER BLAST RADIUS (changes what xid a lock is stamped
+    under; contradicts the uniform top-level-stamping convention) → its own loop with
+    FULL gates (race + ALL isolation specs + pgbench + recovery smoke). After perm 9:
+    deadlock-parallel (DEFER: needs lock-group abstraction goopg lacks).
+    Promotion workflow when perm 9 lands: green full spec → CSV failed→pass (rationale
+    COMMA-FREE) → regen gen-oracle-inventory + gen-isolation-coverage → design + ledger.
 
 GOTCHAS: CSV rationale MUST be comma-free [[serena_replace_content_dotall_eats_file]];
-prefer built-in Edit for Go. gofmt version mismatch — never gofmt -w
-[[goopg_gofmt_version_mismatch_no_w]]. goopg DELETE keeps initial CTID
-{InvalidBlockNumber,0} [[goopg_delete_no_heap_keys_updated]]. tpch-spotcheck
-INFRA-BLOCKED (SLRU backfill >60s); locker-preservation gate never fires in pgbench
-TPC-B/TPC-H so TPS blast radius nil. Existing producers to mirror: stampMultiLock /
-stampMultiUpdaterLock (operators_lockrows.go ~L1328/L1406) — the LOCK path twins.
+prefer built-in Edit for Go; never gofmt -w [[goopg_gofmt_version_mismatch_no_w]].
+mvcc.IsSelfXID(xid, ctx.Tx.XID, ctx.TxnMgr) already exists (top-level-aware self check
+used by scan paths) — reuse for the row-lock self checks. tpch-spotcheck INFRA-BLOCKED
+(SLRU backfill >60s); savepoint row-lock path never fires in pgbench TPC-B/TPC-H → TPS
+blast radius nil. Pre-existing repo lints (unusedfunc/QF1003/etc.) are NOT mine.

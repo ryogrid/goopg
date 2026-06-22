@@ -968,8 +968,15 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		// holders are resolved through the shared member store — the raw value
 		// must NOT be passed to IsXIDActive / WaitForXID, which expect a single
 		// TransactionID from a different numbering space. M0118-0003.
-		active := o.activeLockHolders(tup.Header.Xmax, tup.Header.Infomask)
-		if len(active) > 0 {
+		// Wait only on the holders whose mode actually CONFLICTS with our
+		// request (MultiXactIdWait semantics): a multi may also name compatible
+		// co-holders — e.g. the same backend's top-level FOR KEY SHARE alongside
+		// a stronger savepoint sub-lock — and blocking on those would make us
+		// wait for an unrelated transaction to end rather than becoming grantable
+		// when the conflicting holder releases (tuplelock-upgrade-no-deadlock
+		// perm 9). docs/design/0118-0012.
+		conflicting := o.conflictingLockHolders(tup.Header.Xmax, tup.Header.Infomask, tup.Header.Infomask2)
+		if len(conflicting) > 0 {
 			slot.Unlock()
 			o.ctx.Pool.Unpin(slot)
 			switch o.waitPolicy {
@@ -984,13 +991,16 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 				}
 			default:
 				// Blocking FOR UPDATE/FOR SHARE: wait for every still-active
-				// holder to finish (a multi may name several), then re-evaluate
-				// the tuple from scratch.
+				// conflicting holder to finish (a multi may name several), then
+				// re-evaluate the tuple from scratch. A WaitForXID on a savepoint
+				// sub-lock holder returns as soon as ROLLBACK TO SAVEPOINT marks
+				// that subxid aborted (xidActiveWithSubxact + the MarkSubxactAborted
+				// broadcast), so the retry sees the reverted (weaker) membership.
 				qctx := o.ctx.Ctx
 				if qctx == nil {
 					qctx = context.Background()
 				}
-				for _, hx := range active {
+				for _, hx := range conflicting {
 					if werr := o.ctx.TxnMgr.WaitForXID(qctx, hx); werr != nil {
 						// Context cancelled — skip this row silently.
 						return storage.ItemPointer{}, false, false, nil
@@ -999,8 +1009,9 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 				return o.stampLockInner(rel, ptr, depth+1)
 			}
 		}
-		// No holder still active (committed/aborted): the row lock(s) are
-		// released, so fall through and stamp our own lock-only xmax.
+		// No conflicting holder still active (committed/aborted/non-conflicting):
+		// the conflicting lock(s) are released, so fall through and combine our
+		// lock-only xmax with any surviving compatible holders below.
 	}
 
 	// Tuple is live (no real updater xmax from another xact). Stamp it.
@@ -1310,6 +1321,52 @@ func (o *lockRowsOp) activeLockHolders(xmax storage.TransactionID, infomask uint
 		return out
 	}
 	if xmax != o.ctx.Tx.XID && o.ctx.TxnMgr.IsXIDActive(xmax) {
+		return []storage.TransactionID{xmax}
+	}
+	return nil
+}
+
+// conflictingLockHolders returns the still-active row-lock holders on a tuple
+// whose lock mode CONFLICTS with this op's requested mode — the subset of
+// activeLockHolders a blocking waiter must actually wait on, mirroring upstream
+// MultiXactIdWait, which sleeps only on members whose status conflicts
+// (StatusesConflict) with the requested status rather than on every member. A
+// non-conflicting co-holder (e.g. a FOR KEY SHARE member when we request FOR NO
+// KEY UPDATE) must NOT be waited on, or the waiter blocks until that unrelated
+// holder's whole transaction ends instead of becoming grantable as soon as the
+// conflicting holder releases. In tuplelock-upgrade-no-deadlock perm 9 the
+// conflicting holders are savepoint sub-locks released by ROLLBACK TO SAVEPOINT
+// while the same backend's top-level FOR KEY SHARE persists: waiting only on the
+// conflicting members lets the waiter wake and re-probe at the right step.
+// M0118-0004 (docs/design/0118-0012).
+func (o *lockRowsOp) conflictingLockHolders(xmax storage.TransactionID, infomask, infomask2 uint16) []storage.TransactionID {
+	if o.ctx.TxnMgr == nil {
+		return nil
+	}
+	req := o.lockMemberStatus()
+	if storage.IsHeapTupleXmaxMulti(infomask) {
+		if o.ctx.MultiXact == nil {
+			return nil
+		}
+		members, ok := o.ctx.MultiXact.Members(multixact.MultiXactId(xmax))
+		if !ok {
+			return nil
+		}
+		var out []storage.TransactionID
+		for _, m := range members {
+			if m.Xid == o.ctx.Tx.XID || !o.ctx.TxnMgr.IsXIDActive(m.Xid) {
+				continue
+			}
+			if multixact.StatusesConflict(m.Status, req) {
+				out = append(out, m.Xid)
+			}
+		}
+		return out
+	}
+	if xmax == o.ctx.Tx.XID || !o.ctx.TxnMgr.IsXIDActive(xmax) {
+		return nil
+	}
+	if multixact.StatusesConflict(lockOnlyMemberStatus(infomask, infomask2), req) {
 		return []storage.TransactionID{xmax}
 	}
 	return nil

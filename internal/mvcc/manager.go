@@ -584,7 +584,7 @@ func (m *Manager) WaitForXID(ctx context.Context, xid storage.TransactionID) err
 
 	m.waitMu.Lock()
 	defer m.waitMu.Unlock()
-	for m.xidInProgress(xid) {
+	for m.xidActiveWithSubxact(xid) {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -669,7 +669,31 @@ func (m *Manager) IsXIDActive(xid storage.TransactionID) bool {
 	if xid == storage.InvalidTransactionID {
 		return false
 	}
-	return m.xidInProgress(xid)
+	return m.xidActiveWithSubxact(xid)
+}
+
+// xidActiveWithSubxact reports whether xid belongs to a currently-running
+// transaction, treating a subtransaction xid as active iff its top-level parent
+// is still running AND the subxid has not been individually rolled back
+// (ROLLBACK TO SAVEPOINT). Subxact xids are deliberately not held in the
+// proc-array (see AllocateSubXid), so xidInProgress alone reports every subxid
+// as dead; row-lock liveness (executor activeLockHolders / WaitForXID) needs the
+// resolved view so a lock acquired inside a savepoint keeps blocking conflicting
+// waiters until that savepoint is released or rolled back. The top-level fast
+// path returns first, so behaviour for ordinary (non-subxact) xids is byte-for-
+// byte unchanged. execRollbackTo marks every discarded savepoint level aborted,
+// so a per-subxid IsAborted check is sufficient (no ancestry walk needed).
+// M0118-0004 (docs/design/0118-0012).
+func (m *Manager) xidActiveWithSubxact(xid storage.TransactionID) bool {
+	if m.xidInProgress(xid) {
+		return true
+	}
+	top := m.TopLevelXid(xid)
+	if top == xid {
+		// Not a subxid (or unresolved) — already shown not in progress above.
+		return false
+	}
+	return m.xidInProgress(top) && !m.IsAborted(xid)
 }
 
 // HasAbortedXID reports whether xid is recorded in the manager's aborted

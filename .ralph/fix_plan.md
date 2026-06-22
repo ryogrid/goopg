@@ -216,10 +216,20 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (transient lockers don't survive a crash; multixact WAL persistence deferred
       0118-0002). Unit tests `TestPageStampHotOldTupleMulti`/
       `TestStampUpdaterXmaxPreservingLockers`; `-race` batch + multixact/storage/
-      executor/wal/mvcc PASS; pgbench smoke 0-failed. **Spec STILL `defer`:**
-      perm 9 needs savepoint-scoped row-lock release on ROLLBACK TO SAVEPOINT
-      (tuple-lock retry) — NOT in goopg; + UPDATE/DELETE conflict-wait-on-a-
-      conflicting-locker still deferred. Both ledger'd.
+      executor/wal/mvcc PASS; pgbench smoke 0-failed.
+      **2026-06-22 perm-9 partial (design 0118-0012):** landed three pieces of
+      the savepoint-scoped row-lock subsystem — subxact-aware `IsXIDActive`/
+      `WaitForXID` (`mvcc.Manager.xidActiveWithSubxact`), conflict-filtered wait
+      (`lockRowsOp.conflictingLockHolders`, MultiXactIdWait semantics), and
+      `commitCond.Broadcast()` on `MarkSubxactAborted`; moved the spec's first
+      divergence from expected L216 → L238. **Spec STILL `defer`:** discovered
+      **Gap D** — goopg's whole heap write path stamps the TOP-LEVEL xid
+      (`ctx.Tx.XID` = `CurrentTransaction`, not `EffectiveWriterXID`; INSERT too,
+      `operators_storage.go:2175`), so s1's lock upgrades aren't recorded under the
+      savepoint subxids and rollback-to-savepoint can't revert them. Closing Gap D
+      = stamp the lock path under `EffectiveWriterXID()` + make every row-lock
+      self-check top-level-aware — higher blast radius, its own loop. + UPDATE/
+      DELETE conflict-wait-on-a-conflicting-locker still deferred. All ledger'd.
       (b) `deadlock-parallel` needs a lock-group abstraction goopg lacks — defer.
 - [ ] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,
