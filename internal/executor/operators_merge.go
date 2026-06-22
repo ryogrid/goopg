@@ -877,7 +877,7 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	// PageSetHeapTupleXmax + stampOldCtid chain. M0100-0007.
 	crossPart := destRel != rel
 	if crossPart {
-		if err := storage.PageSetHeapTupleMovedPartition(s.Page(), slot, ctx.Tx.XID); err != nil {
+		if err := storage.PageSetHeapTupleMovedPartition(s.Page(), slot, effectiveWriterXID(ctx)); err != nil {
 			s.Unlock()
 			ctx.Pool.Unpin(s)
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
@@ -890,7 +890,7 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		if oldGerr == nil {
 			mErr = stampUpdaterXmaxNonHOT(ctx, s.Page(), slot, oldTup.Header, true)
 		} else {
-			mErr = storage.PageSetHeapTupleXmax(s.Page(), slot, ctx.Tx.XID)
+			mErr = storage.PageSetHeapTupleXmax(s.Page(), slot, effectiveWriterXID(ctx))
 		}
 		if err := mErr; err != nil {
 			s.Unlock()
@@ -898,7 +898,7 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}
 	}
-	derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, ctx.Tx.XID, oldTupleBytes)
+	derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, effectiveWriterXID(ctx), oldTupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
 	if derr != nil {
@@ -989,7 +989,7 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	if oldGerr == nil {
 		mErr = stampUpdaterXmaxNonHOT(ctx, s.Page(), slot, oldTup.Header, true)
 	} else {
-		mErr = storage.PageSetHeapTupleXmax(s.Page(), slot, ctx.Tx.XID)
+		mErr = storage.PageSetHeapTupleXmax(s.Page(), slot, effectiveWriterXID(ctx))
 	}
 	if err := mErr; err != nil {
 		s.Unlock()
@@ -999,7 +999,7 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		}
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
-	derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, ctx.Tx.XID, oldTupleBytes)
+	derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, effectiveWriterXID(ctx), oldTupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
 	return derr

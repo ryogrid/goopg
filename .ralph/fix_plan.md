@@ -147,11 +147,14 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
 - [ ] **M0118-0002** — Predicate-lock granularity per access method / scan type:
       predicate-gin, predicate-gist, predicate-hash, predicate-lock-hot-tuple,
       index-only-scan, index-only-bitmapscan, partial-index.
-- [ ] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT):
-      skip-locked{,-2,-3,-4}, nowait{,-2,-3,-4,-5}, lock-nowait,
+- [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
+      All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
+      nowait{,-2,-3,-4,-5}, lock-nowait,
       tuplelock-{conflict,partition,update,upgrade-no-deadlock},
       lock-update-{delete,traversal}, update-locked-tuple, propagate-lock-delete,
-      lock-committed-keyupdate.
+      lock-committed-{update,keyupdate}. The cumulative multixact producer +
+      subxact-scoped row-lock infra (M0118-0003/0004 slices) carried the final
+      batch green; CSV rows already `pass`.
 - [ ] **M0118-0004** — Deadlock detection: deadlock-{hard,simple,soft,soft-2,parallel},
       multixact-no-deadlock. **Done so far:** `deadlock-simple` (slice 16, design
       0118-0004) + `deadlock-hard` (general timeout-driven multi-object detector,
@@ -262,3 +265,12 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       freeze-the-dead, inplace-inval, intra-grant-inplace{,-db}, subxid-overflow,
       prepared-transactions{,-cic}, temp-schema-cleanup, multixact-no-forget,
       aborted-keyrevoke, delete-abort-savept{,-2}.
+      **Done so far:** `delete-abort-savept` PASS (design 0118-0013) — subxact-scoped
+      DELETE/UPDATE xmax stamping (`effectiveWriterXID` at all 24 old-tuple-xmax +
+      paired-WAL sites), producer preserves an outer-level self locker so ROLLBACK TO
+      restores it, and `lockRowsOp` treats a subxact-aborted xmax (`IsAborted`) as a
+      rolled-back updater. **Remaining (deferred, ledger 2026-06-22):**
+      `delete-abort-savept-2` (FOR NO KEY UPDATE pure-lock upgrade restore on the
+      row-lock path), `aborted-keyrevoke` (rolled-back UPDATE's NEW-tuple xmin must
+      also be sub-XID-scoped), `multixact-no-forget` (whole-txn ROLLBACK of an updater
+      member must retain the surviving locker). Plus the other misc specs untouched.

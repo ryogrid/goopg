@@ -2050,6 +2050,29 @@ func concurrentModifierXID(hdr storage.HeapTupleHeader, mxs *multixact.Store) st
 // case — so the caller keeps the plain single-xid stamp. The bounded gate (a
 // pre-existing active foreign lock-only holder) never arises on the pgbench
 // TPC-B / TPC-H hot path, so the plain stamp remains the fast path. M0118-0004.
+// effectiveWriterXID returns the (sub)transaction id that heap mutations in
+// this statement must stamp as the old tuple's xmax (and the deletion's WAL
+// record). Inside an open savepoint it is the session's current sub-XID; the
+// per-statement ctx.Tx.XID is always rebuilt from the connection's top-level
+// transaction (dispatch.go `ectx.Tx = tx`) and so never reflects an open
+// savepoint on its own — the live sub-XID is read from the session, exactly as
+// lockRowsOp.writerXID does for the row-lock path. Stamping xmax under the
+// sub-XID is what lets ROLLBACK TO SAVEPOINT revert a DELETE/UPDATE:
+// MarkSubxactAborted flips the sub-XID dead, so the subxact-aware visibility
+// check (SeesCommittedXIDWithSubxacts) treats the deletion as never-happened and
+// the tuple stays live. Mirrors upstream heap_delete/heap_update stamping
+// GetCurrentTransactionId(), which returns the current subtransaction id.
+// Outside a savepoint EffectiveWriterXID() == the top-level XID, so this is a
+// strict no-op. M0118-0009 (docs/design/0118-0013).
+func effectiveWriterXID(ctx *Context) storage.TransactionID {
+	if sess, ok := ctx.Session.(*BasicSession); ok {
+		if x := sess.EffectiveWriterXID(); x != storage.InvalidTransactionID {
+			return x
+		}
+	}
+	return ctx.Tx.XID
+}
+
 func stampUpdaterXmaxPreservingLockers(ctx *Context, hdr storage.HeapTupleHeader, keysUpdated bool) (multixact.MultiXactId, uint16, uint16, bool, error) {
 	if ctx.MultiXact == nil || ctx.TxnMgr == nil {
 		return 0, 0, 0, false, nil
@@ -2087,23 +2110,38 @@ func stampUpdaterXmaxPreservingLockers(ctx *Context, hdr storage.HeapTupleHeader
 	// no-key UPDATE (StatusNoKeyUpdate) preserves a non-conflicting FOR KEY SHARE
 	// holder — the spec scenario. Self is dropped (re-added below as the updater).
 	ourStatus := updaterMemberStatus(keysUpdated)
+	ourXID := effectiveWriterXID(ctx) // sub-XID inside a savepoint; else top-level
+	ourTop := ctx.TxnMgr.TopLevelXid(ourXID)
 	survivors := make([]multixact.Member, 0, len(existing)+1)
 	for _, m := range existing {
-		if m.Xid == ctx.Tx.XID {
-			continue // re-added once below as our updater
+		if m.Xid == ourXID {
+			continue // exactly our writer: re-added once below as the updater
+		}
+		// A member from our own transaction tree but at an OUTER level (the
+		// top-level xact, or a savepoint we are nested inside) is a lock this
+		// transaction took before the current savepoint. It never conflicts with
+		// us (same xact) and MUST be carried forward unchanged so ROLLBACK TO this
+		// savepoint restores it: dropping the savepoint's own updater member then
+		// leaves the outer locker as the surviving xmax, so a DELETE/UPDATE inside
+		// a savepoint over a row this xact already locked FOR KEY SHARE keeps that
+		// lock alive after the rollback (delete-abort-savept). Bypasses the
+		// foreign-locker liveness/conflict filtering below (self never conflicts).
+		if ctx.TxnMgr.TopLevelXid(m.Xid) == ourTop {
+			survivors = append(survivors, m)
+			continue
 		}
 		if !ctx.TxnMgr.IsXIDActive(m.Xid) {
-			continue // dead locker: lock already released
+			continue // dead foreign locker: lock already released
 		}
 		if multixact.StatusesConflict(m.Status, ourStatus) {
-			continue // conflicting locker: must be waited for, not preserved
+			continue // conflicting foreign locker: must be waited for, not preserved
 		}
 		survivors = append(survivors, m)
 	}
 	if len(survivors) == 0 {
 		return 0, 0, 0, false, nil
 	}
-	survivors = append(survivors, multixact.Member{Xid: ctx.Tx.XID, Status: ourStatus})
+	survivors = append(survivors, multixact.Member{Xid: ourXID, Status: ourStatus})
 
 	multi, err := ctx.MultiXact.CreateFromMembers(survivors)
 	if err != nil {
@@ -2129,7 +2167,7 @@ func stampUpdaterXmaxNonHOT(ctx *Context, page storage.Page, slot uint16, hdr st
 	if ok {
 		return storage.PageSetHeapTupleXmaxMulti(page, slot, storage.TransactionID(multi), im, im2)
 	}
-	return storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
+	return storage.PageSetHeapTupleXmax(page, slot, effectiveWriterXID(ctx))
 }
 
 // tryApplyHOTUpdate attempts a same-page HOT update of the tuple at
@@ -2275,10 +2313,10 @@ func tryApplyHOTUpdate(
 				return perr
 			}
 			if ok {
-				return storage.PageStampHotOldTupleMulti(s.Page(), oldSlot, storage.TransactionID(multi), im, im2, ctx.Tx.XID, blk, newSlot)
+				return storage.PageStampHotOldTupleMulti(s.Page(), oldSlot, storage.TransactionID(multi), im, im2, effectiveWriterXID(ctx), blk, newSlot)
 			}
 		}
-		return storage.PageStampHotOldTuple(s.Page(), oldSlot, ctx.Tx.XID, blk, newSlot)
+		return storage.PageStampHotOldTuple(s.Page(), oldSlot, effectiveWriterXID(ctx), blk, newSlot)
 	}()
 	if stampErr != nil {
 		s.Unlock()
@@ -2293,7 +2331,7 @@ func tryApplyHOTUpdate(
 		return false, stampErr
 	}
 
-	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, ctx.Tx.XID, tupleBytes)
+	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
 	if derr == nil && ctx.InDMLCTE && ctx.CTEWriteFence != nil {
@@ -2779,7 +2817,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				}
 				var stampIdxErr error
 				if isCrossPartitionMoveIdx {
-					stampIdxErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, o.ctx.Tx.XID)
+					stampIdxErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
 				} else if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), pu.slot); herr == nil {
 					// Preserve a pre-existing non-conflicting foreign locker into a
 					// {updater + survivors} multi (M0118-0004 producer). Non-HOT
@@ -2787,7 +2825,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// below), so the updater status is StatusUpdate (keysUpdated=true).
 					stampIdxErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
 				} else {
-					stampIdxErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
+					stampIdxErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
 				}
 				if stampIdxErr != nil {
 					s.Unlock()
@@ -2801,7 +2839,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					}
 					return nil, stampIdxErr
 				}
-				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
+				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				if derr != nil {
@@ -3426,14 +3464,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				}
 				var stampErr error
 				if isCrossPartitionMove {
-					stampErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, o.ctx.Tx.XID)
+					stampErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
 				} else if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), pu.slot); herr == nil {
 					// Preserve a pre-existing non-conflicting foreign locker into a
 					// {updater + survivors} multi (M0118-0004 producer). Non-HOT
 					// UPDATE is key-changing in goopg, so keysUpdated=true.
 					stampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
 				} else {
-					stampErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
+					stampErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
 				}
 				if stampErr != nil {
 					s.Unlock()
@@ -3443,7 +3481,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					return nil, stampErr
 				}
-				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puRel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
+				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puRel, pu.blk, pu.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				if derr != nil {
@@ -3949,7 +3987,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				// parity with the UPDATE delete-half.
 				delStampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), v.slot, oldTup.Header, true)
 			} else {
-				delStampErr = storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID)
+				delStampErr = storage.PageSetHeapTupleXmax(s.Page(), v.slot, effectiveWriterXID(o.ctx))
 			}
 			if err := delStampErr; err != nil {
 				s.Unlock()
@@ -3960,7 +3998,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				}
 				return nil, err
 			}
-			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, victimRel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, victimRel, v.blk, v.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
@@ -4373,7 +4411,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				}
 				return nil, stampErr
 			}
-			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puSrcRel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puSrcRel, pu.blk, pu.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
@@ -4613,7 +4651,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 			}
 			return nil, stampErr
 		}
-		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, vRel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
+		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, vRel, v.blk, v.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
 		s.Unlock()
 		o.ctx.Pool.Unpin(s)
 		if derr != nil {

@@ -868,6 +868,61 @@ func TestPort_IsolationLockNowait(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-nowait.spec")
 }
 
+// TestPort_IsolationDeleteAbortSavept exercises the delete-abort-savept spec:
+// s1 takes FOR KEY SHARE, opens a SAVEPOINT, upgrades the lock via DELETE, then
+// ROLLBACK TO the savepoint — which must RESTORE the original FOR KEY SHARE
+// lock (not leave the tuple unlocked). s2's FOR UPDATE must still wait behind
+// the restored KEY SHARE lock until s1 commits. Rides the M0118-0004 subxact-
+// scoped row-lock restore (stampMultiLock keeps outer-level self members as
+// survivors so ROLLBACK TO reverts to the outer strength). M0118-0009.
+func TestPort_IsolationDeleteAbortSavept(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_delete_abort_savept")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept.spec")
+}
+
+// TestPort_IsolationDeleteAbortSavept2 is the funkier delete-abort-savept
+// variant: the subxact upgrade is FOR NO KEY UPDATE (not DELETE) and s2 probes
+// with both FOR UPDATE and FOR NO KEY UPDATE. ROLLBACK TO must revert to the
+// outer FOR KEY SHARE strength. M0118-0009.
+func TestPort_IsolationDeleteAbortSavept2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_delete_abort_savept2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept-2.spec")
+}
+
+// TestPort_IsolationAbortedKeyrevoke exercises the aborted-keyrevoke spec: s1
+// opens a SAVEPOINT, UPDATEs the key (obtaining KEY REVOKE), ROLLBACK TO the
+// savepoint (losing KEY REVOKE), then takes FOR KEY SHARE. s2's FOR KEY SHARE
+// must be compatible (both KEY SHARE) and proceed — the rolled-back key-update
+// must not leave a phantom conflicting lock. Exercises subxact lock-restore on
+// the multixact lock-only path. M0118-0009.
+func TestPort_IsolationAbortedKeyrevoke(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_aborted_keyrevoke")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/aborted-keyrevoke.spec")
+}
+
+// TestPort_IsolationMultixactNoForget exercises the multixact-no-forget spec: s1
+// holds FOR KEY SHARE; s2 UPDATEs (forming a {s2-update, s1-keyshare} multixact)
+// then ABORTS — the abort must NOT forget s1's still-held KEY SHARE lock. s3
+// then probes with FOR KEY SHARE (compatible), FOR NO KEY UPDATE / FOR UPDATE
+// (conflicting, must wait). Validates that an aborted updater member is dropped
+// from the multixact while the surviving locker member is preserved. M0118-0009.
+func TestPort_IsolationMultixactNoForget(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_multixact_no_forget")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/multixact-no-forget.spec")
+}
+
 // TestPort_IsolationDeadlockSimple exercises the deadlock-simple spec: two
 // sessions each take ACCESS SHARE on a1, then each attempts a lock upgrade to
 // ACCESS EXCLUSIVE. Neither upgrade can complete until the other releases its

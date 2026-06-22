@@ -885,7 +885,18 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 			}
 		}
 
-		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
+		// "Updater rolled back" covers two abort flavours: a whole-transaction
+		// ROLLBACK (HasAbortedXID, the top-level aborted set) AND a sub-transaction
+		// rolled back via ROLLBACK TO SAVEPOINT (IsAborted, the pg_subtrans map).
+		// A DELETE/UPDATE stamped inside a savepoint carries the sub-XID as xmax
+		// (effectiveWriterXID), so when that savepoint is rolled back the deletion
+		// never happened and the row is live at the original ptr — exactly the
+		// top-level-abort case. Without the IsAborted arm the subxid is neither
+		// active nor in the top-level aborted set, so the code below would treat the
+		// dead deletion as a committed one and follow the (chain-tail) CTID to "no
+		// live successor", dropping a row that is in fact still present
+		// (delete-abort-savept). M0118-0009 (docs/design/0118-0013).
+		if o.ctx.TxnMgr != nil && (o.ctx.TxnMgr.HasAbortedXID(xmax) || o.ctx.TxnMgr.IsAborted(xmax)) {
 			// Updater rolled back: row is live at original ptr. Stamp it.
 			ptr2, followed2, err2 := o.stampAtPtr(rel, ptr)
 			return ptr2, followed2, false, err2

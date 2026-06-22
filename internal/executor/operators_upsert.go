@@ -937,7 +937,7 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 	if oldHdrTup, herr := storage.PageGetHeapTuple(pinned.Page(), oldPtr.Offset); herr == nil {
 		upErr = stampUpdaterXmaxNonHOT(o.ctx, pinned.Page(), oldPtr.Offset, oldHdrTup.Header, o.onConflictUpdateTouchesKeyColumn())
 	} else {
-		upErr = storage.PageSetHeapTupleXmax(pinned.Page(), oldPtr.Offset, o.ctx.Tx.XID)
+		upErr = storage.PageSetHeapTupleXmax(pinned.Page(), oldPtr.Offset, effectiveWriterXID(o.ctx))
 	}
 	if err := upErr; err != nil {
 		pinned.Unlock()
@@ -954,7 +954,7 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 		// (tuplelock-partition).
 		_ = storage.PageSetHeapTupleKeysUpdated(pinned.Page(), oldPtr.Offset)
 	}
-	derr := markHeapDeleteDirty(o.ctx.Pool, pinned, rel, oldPtr.Block, oldPtr.Offset, o.ctx.Tx.XID, nil)
+	derr := markHeapDeleteDirty(o.ctx.Pool, pinned, rel, oldPtr.Block, oldPtr.Offset, effectiveWriterXID(o.ctx), nil)
 	pinned.Unlock()
 	o.ctx.Pool.Unpin(pinned)
 	if derr != nil {
@@ -1301,11 +1301,11 @@ func (o *upsertOp) cancelSpeculativeRow(rel storage.RelFileNode, ptr storage.Ite
 	if oldHdrTup, herr := storage.PageGetHeapTuple(pinned.Page(), ptr.Offset); herr == nil {
 		serr = stampUpdaterXmaxNonHOT(o.ctx, pinned.Page(), ptr.Offset, oldHdrTup.Header, true)
 	} else {
-		serr = storage.PageSetHeapTupleXmax(pinned.Page(), ptr.Offset, o.ctx.Tx.XID)
+		serr = storage.PageSetHeapTupleXmax(pinned.Page(), ptr.Offset, effectiveWriterXID(o.ctx))
 	}
 	var derr error
 	if serr == nil {
-		derr = markHeapDeleteDirty(o.ctx.Pool, pinned, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, nil)
+		derr = markHeapDeleteDirty(o.ctx.Pool, pinned, rel, ptr.Block, ptr.Offset, effectiveWriterXID(o.ctx), nil)
 	}
 	pinned.Unlock()
 	o.ctx.Pool.Unpin(pinned)
