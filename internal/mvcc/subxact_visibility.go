@@ -332,10 +332,35 @@ func isCurrentTxXID(xid, currentXID storage.TransactionID, r SubxactResolver) bo
 	if xid == currentXID {
 		return true
 	}
-	if r == nil || !r.IsSubxact(currentXID) {
+	if r == nil {
 		return false
 	}
-	return xid == r.TopLevelXid(currentXID)
+	// Ancestor direction: currentXID is a subtransaction and xid is an XID at an
+	// outer level (the top-level xact, resolved in one hop). Tuples written
+	// before the savepoint remain self-visible inside it.
+	if r.IsSubxact(currentXID) && xid == r.TopLevelXid(currentXID) {
+		return true
+	}
+	// Descendant direction: xid is a still-open subtransaction of our own
+	// transaction tree (a savepoint we opened, writing under its sub-XID). A
+	// tuple it inserted is self-visible; a tuple it deleted is self-invisible —
+	// exactly as if the top-level xact had written it. An *individually
+	// rolled-back* subxact (ROLLBACK TO SAVEPOINT) is excluded, so its writes
+	// fall through to the snapshot/abort check and become invisible
+	// (aborted-keyrevoke: a rolled-back UPDATE's NEW tuple must disappear, while
+	// its still-self-visible-before-rollback semantics are preserved here). The
+	// pre-existing code resolved only the ancestor hop; the live sub-XID writer
+	// is the reverse direction. M0118-0009.
+	if r.IsSubxact(xid) && !r.IsAborted(xid) {
+		top := r.TopLevelXid(xid)
+		if top == currentXID {
+			return true
+		}
+		if r.IsSubxact(currentXID) && top == r.TopLevelXid(currentXID) {
+			return true
+		}
+	}
+	return false
 }
 
 // SubxactMapForManager attaches a SubxactMap to the Manager's subxact

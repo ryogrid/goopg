@@ -350,6 +350,22 @@ func (o *transactionOp) execSavepoint() error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(),
 			Message: "savepoints require BasicSession"}
 	}
+	// Materialise the top-level XID BEFORE allocating the sub-XID. Transaction
+	// XIDs are assigned lazily (only on first write), so a SAVEPOINT issued
+	// before any write — e.g. BEGIN; SAVEPOINT f; UPDATE … (aborted-keyrevoke) —
+	// would otherwise register the sub-XID with parent = 0. A zero parent breaks
+	// cross-session resolution: another backend's TopLevelXid(subxid) returns 0,
+	// so its snapshot cannot map the subxid to a running top-level xact and wrongly
+	// treats the savepoint's uncommitted writes as visible (and a conflicting
+	// row-lock waiter never blocks). delete-abort-savept escaped this only because
+	// its FOR KEY SHARE assigned the top-level XID before the savepoint. Eager
+	// assignment at SAVEPOINT keeps the subxid→parent link correct from birth;
+	// it is a strict no-op once a top-level XID already exists. M0118-0009.
+	if sess.tx.XID == storage.InvalidTransactionID {
+		if err := o.ctx.MaterializeWriterXID(); err != nil {
+			return err
+		}
+	}
 	subXid, err := o.ctx.TxnMgr.AllocateSubXid(sess.tx.XID)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}

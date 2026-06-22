@@ -269,8 +269,14 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       DELETE/UPDATE xmax stamping (`effectiveWriterXID` at all 24 old-tuple-xmax +
       paired-WAL sites), producer preserves an outer-level self locker so ROLLBACK TO
       restores it, and `lockRowsOp` treats a subxact-aborted xmax (`IsAborted`) as a
-      rolled-back updater. **Remaining (deferred, ledger 2026-06-22):**
+      rolled-back updater. `aborted-keyrevoke` PASS (design 0118-0014) — SAVEPOINT now
+      eagerly materialises the top-level XID before `AllocateSubXid` so the subxid→parent
+      link is non-zero from birth (SAVEPOINT-before-first-write previously registered
+      parent=0, making the subxact's uncommitted writes cross-session-visible and
+      defeating the row-lock wait); plus sub-XID-scoped NEW-tuple xmin
+      (`writeHeapRowReturning{,PG}` + HOT) and HEAP_KEYS_UPDATED on the single-xid
+      old-tuple xmax stamp; descendant-direction subxact self-visibility in
+      `isCurrentTxXID`. **Remaining (deferred, ledger 2026-06-22):**
       `delete-abort-savept-2` (FOR NO KEY UPDATE pure-lock upgrade restore on the
-      row-lock path), `aborted-keyrevoke` (rolled-back UPDATE's NEW-tuple xmin must
-      also be sub-XID-scoped), `multixact-no-forget` (whole-txn ROLLBACK of an updater
+      row-lock path), `multixact-no-forget` (whole-txn ROLLBACK of an updater
       member must retain the surviving locker). Plus the other misc specs untouched.

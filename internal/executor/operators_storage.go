@@ -2167,7 +2167,23 @@ func stampUpdaterXmaxNonHOT(ctx *Context, page storage.Page, slot uint16, hdr st
 	if ok {
 		return storage.PageSetHeapTupleXmaxMulti(page, slot, storage.TransactionID(multi), im, im2)
 	}
-	return storage.PageSetHeapTupleXmax(page, slot, effectiveWriterXID(ctx))
+	if serr := storage.PageSetHeapTupleXmax(page, slot, effectiveWriterXID(ctx)); serr != nil {
+		return serr
+	}
+	// A key-changing UPDATE / DELETE must mark the old tuple HEAP_KEYS_UPDATED so
+	// a concurrent FOR KEY SHARE locker recognises the conflict and WAITS on the
+	// updater instead of following the CTID chain to the (uncommitted) new
+	// version. The multi path above already encodes this through the updater
+	// member's StatusUpdate (multixact.HintBits sets the bit); the single-xid
+	// fallback — taken when there is no pre-existing locker to combine with, the
+	// common case — must set it explicitly. Mirrors upstream heap_update /
+	// heap_delete stamping HEAP_KEYS_UPDATED on the old tuple. Without it, s2's
+	// FOR KEY SHARE in aborted-keyrevoke (perms 7-9) reads keysUpdated=false and
+	// proceeds out of order. M0118-0009.
+	if keysUpdated {
+		return storage.PageSetHeapTupleKeysUpdated(page, slot)
+	}
+	return nil
 }
 
 // tryApplyHOTUpdate attempts a same-page HOT update of the tuple at
@@ -2208,11 +2224,16 @@ func tryApplyHOTUpdate(
 		return false, &ExecError{Code: "XX000", Message: encErr.Error()}
 	}
 	bitmap := NullBitmapPG(newRow)
+	// xmin = effective writer XID (sub-XID inside an open savepoint) so a HOT new
+	// version created in a savepoint disappears on ROLLBACK TO, mirroring the
+	// old-tuple xmax stamp below (PageStampHotOldTuple under effectiveWriterXID);
+	// no-op outside a savepoint. M0118-0009.
+	xmin := effectiveWriterXID(ctx)
 	var tup storage.HeapTuple
 	if len(bitmap) > 0 {
-		tup = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
+		tup = storage.NewHeapTupleWithNulls(xmin, storage.InvalidTransactionID, bitmap, body)
 	} else {
-		tup = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+		tup = storage.NewHeapTuple(xmin, storage.InvalidTransactionID, body)
 	}
 	tup.Header.Infomask |= storage.HeapOnlyTuple
 	tup.Header.SetNatts(len(cols))
@@ -5730,11 +5751,17 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return ptr, &ExecError{Code: "XX000", Message: encErr.Error()}
 	}
 	bitmap := NullBitmapPG(row)
+	// xmin = the effective writer XID: inside an open savepoint this is the
+	// current sub-XID, so a row inserted in a savepoint (incl. an UPDATE's new
+	// version) disappears when that savepoint is rolled back — its sub-XID flips
+	// aborted and the subxact-aware visibility check hides it (aborted-keyrevoke,
+	// M0118-0009). Outside a savepoint it equals ctx.Tx.XID, so this is a no-op.
+	xmin := effectiveWriterXID(ctx)
 	var tuple storage.HeapTuple
 	if len(bitmap) > 0 {
-		tuple = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
+		tuple = storage.NewHeapTupleWithNulls(xmin, storage.InvalidTransactionID, bitmap, body)
 	} else {
-		tuple = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+		tuple = storage.NewHeapTuple(xmin, storage.InvalidTransactionID, body)
 	}
 	tuple.Header.SetNatts(len(cols))
 	tuple.Header.Infomask |= storage.HeapXmaxInvalid
@@ -5950,11 +5977,15 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		return ptr, &ExecError{Code: "XX000", Message: err.Error()}
 	}
 	bitmap := NullBitmapPG(row)
+	// xmin = effective writer XID (sub-XID inside an open savepoint) so a
+	// savepoint-inserted row disappears on ROLLBACK TO; no-op outside a
+	// savepoint. M0118-0009 — twin of writeHeapRowReturning above.
+	xmin := effectiveWriterXID(ctx)
 	var tuple storage.HeapTuple
 	if len(bitmap) > 0 {
-		tuple = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
+		tuple = storage.NewHeapTupleWithNulls(xmin, storage.InvalidTransactionID, bitmap, body)
 	} else {
-		tuple = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+		tuple = storage.NewHeapTuple(xmin, storage.InvalidTransactionID, body)
 	}
 	// Set t_infomask2 natts so PG's heap_deform_tuple can locate each attribute.
 	// Set HEAP_XMAX_INVALID so PG's visibility code treats xmax as invalid
