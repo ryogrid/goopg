@@ -4851,6 +4851,36 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		}
 		return nil
 	}
+	// Handle OWNER TO role — record the new owning role on the in-memory table so
+	// the VACUUM/ANALYZE/CLUSTER maintenance-privilege check (a non-superuser
+	// session may only maintain a relation it owns) sees the change. PostgreSQL
+	// takes an AccessExclusiveLock for ALTER TABLE ... OWNER TO
+	// (AlterTableGetLockLevel), so we take the same transaction-scoped DDL lock
+	// (a no-op in autocommit, which is how the vacuum-conflict / cluster-conflict
+	// specs issue the grant). M0118-0008.
+	if s.OwnerTo != "" {
+		tbl, ok := o.lookupTableWithSearch(s.Name)
+		if !ok {
+			if s.IfExists {
+				return nil
+			}
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
+		}
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+				ee.Pos = s.Pos()
+			}
+			return err
+		}
+		// The parser sentinel "current_user" (also SESSION_USER / CURRENT_ROLE)
+		// means "the bootstrap superuser" in goopg — recorded as an empty owner.
+		if strings.EqualFold(s.OwnerTo, "current_user") {
+			tbl.Owner = ""
+		} else {
+			tbl.Owner = s.OwnerTo
+		}
+		return nil
+	}
 	tbl, ok := o.lookupTableWithSearch(s.Name)
 	if !ok {
 		// Not a heap table — check if it's an index.

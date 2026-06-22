@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/access/btree"
 	"github.com/goopg/goopg/internal/catalog"
@@ -184,6 +185,17 @@ func (o *vacuumOp) expandVacuumTargets(vs *parser.VacuumStmt) ([]vacuumTarget, [
 			if !ok {
 				continue
 			}
+			// Maintenance-privilege check (vacuum_is_permitted_to_vacuum). A
+			// non-superuser session (SET ROLE) may only vacuum a relation it owns
+			// (or holds MAINTAIN on); otherwise the relation is skipped with a
+			// WARNING. PostgreSQL performs this in expand_vacuum_rel using the
+			// pg_class syscache with NO lock, so an unprivileged VACUUM skips
+			// immediately instead of waiting behind a conflicting lock holder.
+			// M0118-0008 (vacuum-conflict).
+			if !maintenancePermitted(o.ctx, tbl) {
+				o.ctx.AddWarning(fmt.Sprintf("permission denied to vacuum %q, skipping it", tbl.Name))
+				continue
+			}
 			add(tbl, true)
 		}
 		return out, parents
@@ -220,6 +232,26 @@ func analyzeInheritanceWait(ctx *Context, parent *catalog.Table) {
 		rel := ctx.Catalog.RelFileNode(child)
 		_ = ctx.acquireRelLockMaybeTransient(rel, lockmgr.AccessShareLock)
 	}
+}
+
+// maintenancePermitted reports whether the session's effective role may run a
+// maintenance command (VACUUM / ANALYZE / CLUSTER) on tbl. It mirrors
+// PostgreSQL's vacuum_is_permitted_to_vacuum (and the equivalent CLUSTER owner
+// check): the bootstrap superuser — a session that has NOT done SET ROLE to a
+// non-superuser — may always maintain any relation; a non-superuser role may
+// only maintain a relation it owns (Table.Owner, set via ALTER TABLE OWNER TO)
+// or one on which it holds the MAINTAIN privilege. Owner comparison is
+// case-insensitive (NonSuperuserRole is stored verbatim from SET ROLE; Owner
+// from the parsed ALTER statement). M0118-0008 (vacuum-conflict / cluster-conflict).
+func maintenancePermitted(ctx *Context, tbl *catalog.Table) bool {
+	role := ctx.NonSuperuserRole
+	if role == "" {
+		return true // bootstrap superuser: full privileges
+	}
+	if tbl.Owner != "" && strings.EqualFold(tbl.Owner, role) {
+		return true
+	}
+	return ctx.Catalog.HasTablePrivilege(tbl.OID, role, "MAINTAIN")
 }
 
 // relationStillExists reports whether tbl is still present in the catalog,

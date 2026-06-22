@@ -1926,6 +1926,12 @@ type AlterTableStmt struct {
 	// statement takes a transaction-scoped ShareRowExclusiveLock in PostgreSQL,
 	// which the executor must acquire (alter-table-3 isolation spec, M0118-0008).
 	EnableDisableTrigger bool
+	// OwnerTo holds the target role name for ALTER TABLE ... OWNER TO role. Empty
+	// means no OWNER TO action. The executor records it as the table's owning
+	// role so the VACUUM/ANALYZE/CLUSTER maintenance-privilege check can tell
+	// whether a SET ROLE session owns the relation. M0118-0008 (vacuum-conflict /
+	// cluster-conflict).
+	OwnerTo string
 }
 
 func (s *AlterTableStmt) Pos() int  { return s.pos }

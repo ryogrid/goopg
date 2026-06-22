@@ -477,6 +477,35 @@ func TestPort_IsolationVacuumConcurrentDrop(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-concurrent-drop.spec")
 }
 
+// TestPort_IsolationVacuumConflict exercises the vacuum-conflict spec
+// (M0118-0008). VACUUM/ANALYZE perform a maintenance-privilege check
+// (vacuum_is_permitted_to_vacuum) BEFORE taking any lock: a non-superuser
+// session (SET ROLE) that does not own the table skips it immediately with a
+// "permission denied to vacuum/analyze ... skipping it" WARNING (no wait). After
+// ALTER TABLE ... OWNER TO grants ownership, VACUUM/ANALYZE are permitted and
+// block on a conflicting LOCK ... IN SHARE UPDATE EXCLUSIVE MODE until commit.
+// Byte-identical to PG 18.3.
+func TestPort_IsolationVacuumConflict(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_vacuum_conflict")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-conflict.spec")
+}
+
+// TestPort_IsolationClusterConflict exercises the cluster-conflict spec
+// (M0118-0008). The table is owned by the test role (ALTER TABLE OWNER TO in
+// setup), so CLUSTER is permitted; it takes an AccessExclusiveLock and therefore
+// blocks behind a concurrent LOCK ... IN SHARE UPDATE EXCLUSIVE MODE until that
+// holder commits, then completes. Byte-identical to PG 18.3.
+func TestPort_IsolationClusterConflict(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_cluster_conflict")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/cluster-conflict.spec")
+}
+
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
 // Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
 func TestPort_IsolationFkSnapshot(t *testing.T) {

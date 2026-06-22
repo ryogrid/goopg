@@ -144,6 +144,16 @@ func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *E
 		if !ok {
 			return nil, nil, &ExecError{Code: "42P01", Pos: o.stmt.Pos(), Message: fmt.Sprintf("relation %q does not exist", name.String())}
 		}
+		// Maintenance-privilege check (vacuum_is_permitted_to_vacuum, analyze
+		// verb). A non-superuser session may only analyze a relation it owns (or
+		// holds MAINTAIN on); otherwise the relation is skipped with a WARNING,
+		// emitted with NO lock so an unprivileged ANALYZE skips immediately rather
+		// than waiting behind a conflicting lock holder. M0118-0008
+		// (vacuum-conflict).
+		if !maintenancePermitted(o.ctx, tbl) {
+			o.ctx.AddWarning(fmt.Sprintf("permission denied to analyze %q, skipping it", tbl.Name))
+			continue
+		}
 		add(tbl, true)
 	}
 	return out, parents, nil

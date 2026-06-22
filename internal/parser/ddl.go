@@ -4853,19 +4853,30 @@ func (p *parser) parseAlter() (Stmt, error) {
 	if p.cur().Kind == TokenOperator && p.cur().Value == "*" {
 		p.advance()
 	}
-	// OWNER TO role — parse as a no-op (return empty AlterTableStmt).
-	// "owner" is an identifier in goopg's lexer.
+	// OWNER TO role — record the target role name so the executor can update the
+	// relation's owner (drives the VACUUM/ANALYZE/CLUSTER maintenance-privilege
+	// check, M0118-0008). "owner" is an identifier in goopg's lexer.
 	if p.acceptIdentKeyword("owner") {
 		if _, err := p.expectKeyword(KwTo); err != nil {
 			return nil, err
 		}
-		// consume role name or CURRENT_USER / SESSION_USER / CURRENT_ROLE
-		if !p.acceptIdentKeyword("current_user") &&
-			!p.acceptIdentKeyword("session_user") &&
-			!p.acceptIdentKeyword("current_role") {
-			_, _ = p.parseIdent()
+		// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the bootstrap
+		// superuser in goopg (no real role identity for the session); a plain
+		// identifier names the new owning role.
+		if p.acceptIdentKeyword("current_user") ||
+			p.acceptIdentKeyword("session_user") ||
+			p.acceptIdentKeyword("current_role") {
+			stmt.OwnerTo = "" // bootstrap superuser
+		} else if tok, err := p.parseIdent(); err == nil {
+			stmt.OwnerTo = identText(tok)
 		}
-		// Return empty actions list — executor will skip it.
+		if stmt.OwnerTo == "" {
+			// No explicit role captured (current_user etc.): still mark the
+			// statement as an OWNER TO action so the executor takes the DDL lock
+			// and does not fall through to "no actions". Use a sentinel the
+			// executor maps back to the bootstrap superuser.
+			stmt.OwnerTo = "current_user"
+		}
 		return stmt, nil
 	}
 	// RENAME COLUMN old TO new  |  RENAME TO new_name  |  RENAME VALUE 'old' TO 'new'.

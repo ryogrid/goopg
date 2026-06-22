@@ -401,6 +401,18 @@ type Table struct {
 	// 0118-0036 (RELATION_IS_OTHER_TEMP inheritance exclusion).
 	TempOwner string
 
+	// Owner records the table's owning role NAME, as set by
+	// `ALTER TABLE ... OWNER TO role`. Empty means the bootstrap superuser (OID
+	// 10) — goopg's default for every freshly created relation. It drives the
+	// ownership half of the VACUUM/ANALYZE/CLUSTER maintenance-privilege check
+	// (vacuum_is_permitted_to_vacuum): a non-superuser session (SET ROLE) may
+	// only run those commands on a relation it owns (or holds MAINTAIN on),
+	// otherwise the command skips the relation with a WARNING. Stored as the role
+	// name (case-insensitive) to compare against Context.NonSuperuserRole. The
+	// pg_class.relowner OID column is still rendered as the bootstrap superuser
+	// (catalog/dump output unaffected). M0118-0008 (vacuum-conflict / cluster-conflict).
+	Owner string
+
 	// Fillfactor stores the table's `WITH (fillfactor=N)` storage parameter
 	// (10–100). Zero means unset (PG's default 100 / no reloptions). pg_class's
 	// reloptions cell surfaces this as the text[] element `fillfactor=N`, which

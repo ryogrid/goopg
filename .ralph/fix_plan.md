@@ -537,13 +537,34 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `TestPort_IsolationTruncateConflict` strict PASS; all sibling M0118-0008
       specs PASS; createuser/dropuser/amcheck PASS; catalog/parser/server/executor
       units; `-race`; pgbench smoke 0-failed ~15.2k TPS.
+      **2026-06-23 eleventh promotion (design 0118-0040): `vacuum-conflict` (16
+      perms) + `cluster-conflict` (2 perms) PROMOTED — ownership-based maintenance
+      privilege.** Unlike `truncate-conflict`'s grantable privilege, VACUUM/
+      ANALYZE/CLUSTER key on **table ownership**. Four changes: (1) new
+      `catalog.Table.Owner` (role name; empty = bootstrap superuser; pg_class
+      output unchanged); (2) `ALTER TABLE … OWNER TO role` now records the owner —
+      parser captures it into `AlterTableStmt.OwnerTo` (was discarded), executor
+      sets `tbl.Owner` + takes a txn-scoped `AccessExclusiveLock`
+      (`AlterTableGetLockLevel`, no-op in autocommit); (3) new
+      `maintenancePermitted(ctx,tbl)` wired into the explicit-target loop of
+      `expandVacuumTargets`/`expandAnalyzeTargets` **before any lock** (mirrors
+      `expand_vacuum_rel`'s no-lock pg_class ACL check) — an unprivileged explicit
+      target is skipped with `WARNING: permission denied to vacuum/analyze
+      "<name>", skipping it` and NO wait; after `ALTER … OWNER TO` the role owns
+      the table so the command is permitted and blocks on the conflicting `LOCK …
+      IN SHARE UPDATE EXCLUSIVE MODE` until commit; (4) `clusterOp.Next` now takes
+      a blocking `AccessExclusiveLock` (`acquireRelLockMaybeTransient`) so CLUSTER
+      waits behind the same `SHARE UPDATE EXCLUSIVE` holder then completes. Blast
+      radius nil for superuser usage (`Owner` empty ⇒ always permitted; pgbench/
+      TPC-H unchanged). `TestPort_IsolationVacuumConflict`/`ClusterConflict` strict
+      PASS; sibling M0118-0008 specs PASS; `-race` executor/catalog; catalog/
+      parser/executor units; pgbench smoke 0-failed ~15.2k TPS.
       **Remaining (deferred, ledger 2026-06-22):**
       `alter-table-{1,2,4}`
-      (ADD/VALIDATE CONSTRAINT lock semantics; INHERITS), the rest of the
-      `*-conflict` family — vacuum/cluster-conflict — (need **ownership**-based
-      privilege checks: VACUUM/CLUSTER require relation ownership or MAINTAIN, not
-      a grantable table privilege — extend the 0118-0039 ACL store with owner
-      tracking), `reindex-concurrently-toast` (`allow_system_table_mods`
+      (ADD/VALIDATE CONSTRAINT lock semantics; INHERITS),
+      `cluster-conflict-partition` (CLUSTER of a partitioned table — per-child
+      lock) + a faithful non-owner CLUSTER `must be owner of table` error (no
+      `port` spec exercises it), `reindex-concurrently-toast` (`allow_system_table_mods`
       GUC + TOAST-relation reindex), partition specs (ATTACH/DETACH PARTITION),
       `vacuum-no-cleanup-lock` (reltuples accounting), `plpgsql-toast` (TOAST in
       PL/pgSQL). FK/MERGE/VACUUM inherit-temp filtering (bounded follow-up). Group
