@@ -331,6 +331,25 @@ func TestPort_IsolationCreateTrigger(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/create-trigger.spec")
 }
 
+// TestPort_IsolationInheritTemp exercises the inherit-temp spec (M0118-0008):
+// an inheritance tree whose children are TEMPORARY tables created in different
+// sessions. Each backend owns its own temp namespace, so s1's scan/UPDATE/
+// DELETE/TRUNCATE of the persistent parent must include its own temp child but
+// exclude s2's (RELATION_IS_OTHER_TEMP). goopg keeps all relations in one
+// shared catalog; the per-session TempOwner token (design 0118-0036) plus the
+// AccessibleInheritanceChildren filter wired at the planner SELECT site and the
+// executor UPDATE/DELETE/UPDATE…FROM/TRUNCATE expansion sites (design 0118-0037)
+// reproduce PG 18.3 byte-for-byte across all nine permutations, including the
+// last two where TRUNCATE inh_parent in s1 blocks s2's scan of the parent but
+// not s2's scan of its own temp child.
+func TestPort_IsolationInheritTemp(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_inherit_temp")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/inherit-temp.spec")
+}
+
 // TestPort_IsolationSequenceDdl exercises the sequence-ddl spec (M0118-0008).
 // nextval() takes a transaction-scoped RowExclusiveLock on the sequence
 // relation and ALTER SEQUENCE takes an AccessExclusiveLock; the two conflict,

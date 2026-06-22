@@ -3119,7 +3119,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	var inheritChildOIDs map[uint32]bool
 	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		updateScanTables = append(updateScanTables, imU.PartitionChildren(tbl.OID)...)
-		inheritChildren := imU.InheritanceChildren(tbl.OID)
+		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
+		// Design 0118-0036 (M0118-0008 inherit-temp).
+		inheritChildren := catalog.AccessibleInheritanceChildren(imU.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
 		updateScanTables = append(updateScanTables, inheritChildren...)
 		if len(inheritChildren) > 0 {
 			inheritChildOIDs = make(map[uint32]bool, len(inheritChildren))
@@ -3833,7 +3835,9 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 	var delInheritChildOIDs map[uint32]bool
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		scanTables = append(scanTables, im.PartitionChildren(tbl.OID)...)
-		delInheritChildren := im.InheritanceChildren(tbl.OID)
+		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
+		// Design 0118-0036 (M0118-0008 inherit-temp).
+		delInheritChildren := catalog.AccessibleInheritanceChildren(im.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
 		scanTables = append(scanTables, delInheritChildren...)
 		if len(delInheritChildren) > 0 {
 			delInheritChildOIDs = make(map[uint32]bool, len(delInheritChildren))
@@ -4248,8 +4252,9 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				tbl:  pc,
 			})
 		}
-		// Inheritance children: require column remapping.
-		for _, ic := range imFrom.InheritanceChildren(o.plan.Table.OID) {
+		// Inheritance children: require column remapping. Drop other-session
+		// temp children (RELATION_IS_OTHER_TEMP). Design 0118-0036.
+		for _, ic := range catalog.AccessibleInheritanceChildren(imFrom.InheritanceChildren(o.plan.Table.OID), sessionTempOwner(o.ctx)) {
 			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lockmgr.RowExclusiveLock); err != nil {
 				return nil, err
 			}
@@ -4655,7 +4660,8 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 	}
 	usingScanTargets := []usingScanTarget{{rel: rel, cols: tgtCols}}
 	if imDel, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		for _, ic := range imDel.InheritanceChildren(tbl.OID) {
+		// Drop other-session temp inheritance children. Design 0118-0036.
+		for _, ic := range catalog.AccessibleInheritanceChildren(imDel.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx)) {
 			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lockmgr.RowExclusiveLock); err != nil {
 				return nil, err
 			}

@@ -723,9 +723,12 @@ const firstNormalObjectOID = 16384
 // locked in ACCESS SHARE mode for the lifetime of the transaction.
 //
 // It is deliberately confined to keep the heavyweight manager off the hot path:
-//   - outside an explicit transaction block (TxnLockBackendID == 0) it is a
-//     no-op, so single-statement autocommit reads never touch tableLockMgr —
-//     they cannot participate in a cross-statement lock conflict anyway;
+//   - inside an explicit transaction block (TxnLockBackendID != 0) the ACCESS
+//     SHARE lock is held to end-of-transaction (acquireRelLockTxn);
+//   - in autocommit it is acquired and immediately released (transient), so a
+//     single-statement read still blocks while a conflicting ACCESS EXCLUSIVE
+//     (TRUNCATE / DDL / LOCK TABLE) is held by another backend, then proceeds
+//     once the holder commits — but holds nothing itself (acquireRelLockMaybeTransient);
 //   - system catalogs (OID < firstNormalObjectOID) are skipped.
 //
 // ACCESS SHARE is self-compatible and conflicts only with ACCESS EXCLUSIVE, so
@@ -733,13 +736,14 @@ const firstNormalObjectOID = 16384
 // instantly, and lockmgr is idempotent so re-scanning the same relation within a
 // transaction is a cheap mask check. When it does wait, the lock_timeout /
 // statement_timeout budget carried on the statement context governs the wait
-// exactly like LOCK TABLE does (acquireRelLockTxn). This is the table-level half
-// of the timeouts isolation spec. M0118-0009.
+// exactly like LOCK TABLE does. This is the table-level half of the timeouts
+// isolation spec (M0118-0009) and the scan-side of inherit-temp's
+// TRUNCATE-blocks-parent-scan permutations (design 0118-0037).
 func (c *Context) acquireScanReadLockTxn(rel storage.RelFileNode) error {
-	if c.TxnLockBackendID == 0 || rel.RelOid < firstNormalObjectOID {
+	if rel.RelOid < firstNormalObjectOID {
 		return nil
 	}
-	return c.acquireRelLockTxn(rel, lockmgr.AccessShareLock, false)
+	return c.acquireRelLockMaybeTransient(rel, lockmgr.AccessShareLock)
 }
 
 // acquireWriteLockTxn takes a transaction-scoped ROW EXCLUSIVE heavyweight lock

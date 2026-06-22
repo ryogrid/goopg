@@ -477,15 +477,43 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `TestSessionRegistryUniqueID`/`TestSessionTempOwner`; catalog/config/
       executor packages green. Resume = the wiring fan-out + planner-token
       plumbing (enumerated in the design doc / ledger).
-      **Remaining (deferred, ledger 2026-06-22):** `inherit-temp` wiring (above),
+      **2026-06-22 ninth promotion (design 0118-0037): `inherit-temp` PROMOTED ⇒
+      all 9 permutations byte-for-byte.** Wired the 0118-0036
+      `catalog.AccessibleInheritanceChildren` filter into every data-path
+      inheritance expansion the spec exercises: planner SELECT
+      (`collectInheritanceDescendants`; owner threaded via new
+      `SearchPathCatalog.TempOwnerToken`/`CurrentTempOwner()` +
+      `planner.currentTempOwner` wrapper walk, set in
+      `sessionPlanCatalog`/`ctxPlanCatalog`) and executor
+      UPDATE/DELETE/UPDATE…FROM/DELETE…USING/TRUNCATE (owner from
+      `sessionTempOwner(ctx)`). Two load-bearing additions: (1) the cross-session
+      plan cache (M0098-0005) is BYPASSED when
+      `catalog.HasTempInheritanceChildren()` is true (else `s1`'s cached
+      `SELECT a FROM inh_parent` plan is wrongly served to `s2` →
+      `s2_select_p` returned 1,2,3,4 not 1,2,5,6) — gated in BOTH simple
+      (`dispatch.go`) + extended (`dispatch_extended.go`) paths; (2)
+      TRUNCATE-blocks-parent-scan — `execTruncate` now takes a txn-scoped
+      `AccessExclusiveLock` (`acquireDDLLockTxn`) and the scan-read hook
+      `acquireScanReadLockTxn` now takes a TRANSIENT `AccessShareLock` in
+      autocommit (`acquireRelLockMaybeTransient`) so a bare `s2_select_p` parks
+      behind s1's in-progress `TRUNCATE inh_parent` while `s2_select_c` (own temp
+      child, no parent scan) proceeds. `PartitionChildren`/FK/MERGE/VACUUM
+      inheritance NOT filtered (temp partition of a permanent parent is illegal in
+      PG; FK/MERGE/VACUUM unexercised by any `port` spec — bounded follow-up,
+      ledger). Hot-path: only bare autocommit reads newly lock; pgbench smoke
+      0-failed, `-S` ~14.7k TPS/0.136 ms. Gates: `TestPort_IsolationInheritTemp`
+      strict PASS; full `TestPort_IsolationSuite` + all dedicated strict
+      `TestPort_Isolation*` PASS; catalog/config/planner/server/executor units;
+      pgbench smoke.
+      **Remaining (deferred, ledger 2026-06-22):**
       `alter-table-{1,2,4}`
       (ADD/VALIDATE CONSTRAINT lock semantics; INHERITS), the `*-conflict` family —
       truncate/vacuum/cluster — (need CREATE ROLE/GRANT/SET ROLE privilege infra +
       permission-denied), `reindex-concurrently-toast` (`allow_system_table_mods`
       GUC + TOAST-relation reindex), partition specs (ATTACH/DETACH PARTITION),
-      `vacuum-no-cleanup-lock` (reltuples accounting), `inherit-temp`
-      (RELATION_IS_OTHER_TEMP exclusion), `plpgsql-toast` (TOAST in PL/pgSQL).
-      Group stays open.
+      `vacuum-no-cleanup-lock` (reltuples accounting), `plpgsql-toast` (TOAST in
+      PL/pgSQL). FK/MERGE/VACUUM inherit-temp filtering (bounded follow-up). Group
+      stays open.
 - [ ] **M0118-0009** — Misc / system-level specs: async-notify, timeouts, stats, horizons,
       freeze-the-dead, inplace-inval, intra-grant-inplace{,-db}, subxid-overflow,
       prepared-transactions{,-cic}, temp-schema-cleanup, multixact-no-forget,

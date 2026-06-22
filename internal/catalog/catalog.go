@@ -1791,6 +1791,32 @@ func (c *InMemory) RegisterInheritanceChild(parentOID, childOID uint32) {
 	c.mu.Unlock()
 }
 
+// HasTempInheritanceChildren reports whether any inheritance parent currently
+// has a session-owned temporary child registered. When true, a query that
+// scans an inheritance parent expands to a session-specific child set
+// (RELATION_IS_OTHER_TEMP, see AccessibleInheritanceChildren), so its plan must
+// NOT be served from the cross-session plan cache. Cheap (O(1)) in the common
+// case of no inheritance at all. Design 0118-0037 (M0118-0008 inherit-temp).
+func (c *InMemory) HasTempInheritanceChildren() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.inheritanceChildren) == 0 {
+		return false
+	}
+	childOIDs := make(map[uint32]bool)
+	for _, children := range c.inheritanceChildren {
+		for _, oid := range children {
+			childOIDs[oid] = true
+		}
+	}
+	for _, t := range c.tables {
+		if t.Temp && t.TempOwner != "" && childOIDs[t.OID] {
+			return true
+		}
+	}
+	return false
+}
+
 // IsInheritanceDescendant reports whether descendantOID appears anywhere in
 // the transitive inheritance-children subtree of rootOID. Used to detect
 // circular inheritance before registering a new parent-child edge.
@@ -8224,6 +8250,12 @@ func (c *InMemory) resolveColumnTypeLocked(typeName string) string {
 type SearchPathCatalog struct {
 	Catalog
 	GetSchemas func() []string
+	// TempOwnerToken is the querying session's temp-relation ownership token
+	// ("s<id>", see executor.sessionTempOwner / config.SessionRegistry.UniqueID).
+	// Empty for session-less contexts. The planner reads it via CurrentTempOwner
+	// to drop other-session temp inheritance children during expansion
+	// (RELATION_IS_OTHER_TEMP). Design 0118-0036 (M0118-0008 inherit-temp).
+	TempOwnerToken string
 }
 
 // WithSearchPath returns a SearchPathCatalog that falls back to the schemas
@@ -8232,6 +8264,12 @@ type SearchPathCatalog struct {
 func WithSearchPath(cat Catalog, getSchemas func() []string) *SearchPathCatalog {
 	return &SearchPathCatalog{Catalog: cat, GetSchemas: getSchemas}
 }
+
+// CurrentTempOwner returns the querying session's temp-relation ownership token
+// so inheritance-expansion sites can apply AccessibleInheritanceChildren. The
+// planner discovers it via a tempOwnerCarrier interface walk over the catalog
+// wrapper chain. Design 0118-0036.
+func (c *SearchPathCatalog) CurrentTempOwner() string { return c.TempOwnerToken }
 
 // LookupTable overrides the embedded Catalog.LookupTable to apply the
 // current search_path when the name has no explicit schema qualifier.

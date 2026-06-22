@@ -7101,7 +7101,10 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 			for {
 				expanded := false
 				for _, entry := range tableSet {
-					children := append(im.PartitionChildren(entry.tbl.OID), im.InheritanceChildren(entry.tbl.OID)...)
+					// Exclude other-session temp inheritance children from CASCADE
+					// expansion (RELATION_IS_OTHER_TEMP). Design 0118-0036.
+					children := append(im.PartitionChildren(entry.tbl.OID),
+						catalog.AccessibleInheritanceChildren(im.InheritanceChildren(entry.tbl.OID), sessionTempOwner(o.ctx))...)
 					for _, child := range children {
 						if _, inSet := tableSet[child.OID]; inSet {
 							continue
@@ -7127,6 +7130,19 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 					Hint:    "Do not specify the ONLY keyword, or use TRUNCATE ONLY on the partitions directly.",
 				}
 			}
+		}
+	}
+
+	// TRUNCATE takes an AccessExclusiveLock on every target relation (PG
+	// AlterTableGetLockLevel / ExecuteTruncate). Held to commit inside an
+	// explicit transaction so a concurrent scan of the parent (AccessShareLock)
+	// blocks until the TRUNCATE transaction commits; no-op in autocommit. This
+	// is what makes inherit-temp's last two permutations block s2_select_p
+	// (scanning inh_parent) while s2_select_c (its own temp child) proceeds.
+	// Design 0118-0037 (M0118-0008 inherit-temp).
+	for _, entry := range tableSet {
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(entry.tbl), lockmgr.AccessExclusiveLock); err != nil {
+			return err
 		}
 	}
 
@@ -7294,7 +7310,10 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 					return err
 				}
 			}
-			for _, child := range im.InheritanceChildren(tbl.OID) {
+			// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP):
+			// TRUNCATE inh_parent must not touch another backend's temp child.
+			// Design 0118-0036 (M0118-0008 inherit-temp).
+			for _, child := range catalog.AccessibleInheritanceChildren(im.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx)) {
 				if err := o.truncateTableAndPartitions(child, pos, false); err != nil {
 					return err
 				}

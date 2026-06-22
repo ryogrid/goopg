@@ -2186,7 +2186,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// grandchildren (e.g. stud_emp → emp → person) are included too.
 	// FROM ONLY tablename skips all children (M0097-0099).
 	if im := inMemoryCat(cat); im != nil && !rv.Only {
-		allDesc := collectInheritanceDescendants(im, tbl.OID)
+		allDesc := collectInheritanceDescendants(im, tbl.OID, currentTempOwner(cat))
 
 		if len(allDesc) > 0 {
 			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}
@@ -2246,10 +2246,12 @@ func inMemoryCat(cat catalog.Catalog) *catalog.InMemory {
 
 // stud_emp inherits from both emp and student which both inherit from person).
 // M0097-0046.
-func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32) []*catalog.Table {
+func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32, sessionTempOwner string) []*catalog.Table {
 	var result []*catalog.Table
 	seen := make(map[uint32]bool)
-	queue := im.InheritanceChildren(parentOID)
+	// Drop temporary children owned by other sessions at every BFS level
+	// (RELATION_IS_OTHER_TEMP). Design 0118-0036 (M0118-0008 inherit-temp).
+	queue := catalog.AccessibleInheritanceChildren(im.InheritanceChildren(parentOID), sessionTempOwner)
 	for len(queue) > 0 {
 		child := queue[0]
 		queue = queue[1:]
@@ -2258,9 +2260,32 @@ func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32) []*ca
 		}
 		seen[child.OID] = true
 		result = append(result, child)
-		queue = append(queue, im.InheritanceChildren(child.OID)...)
+		queue = append(queue, catalog.AccessibleInheritanceChildren(im.InheritanceChildren(child.OID), sessionTempOwner)...)
 	}
 	return result
+}
+
+// tempOwnerCarrier is satisfied by *catalog.SearchPathCatalog: it surfaces the
+// querying session's temp-relation ownership token. currentTempOwner walks the
+// catalog wrapper chain (peeling SearchPathCatalog/etc. via Unwrap, like
+// inMemoryCat) looking for the first carrier. Returns "" when no session
+// identity is attached (internal/test contexts) so legacy single-session
+// behaviour is preserved. Design 0118-0036.
+func currentTempOwner(cat catalog.Catalog) string {
+	type carrier interface{ CurrentTempOwner() string }
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if c, ok := cat.(carrier); ok {
+			if tok := c.CurrentTempOwner(); tok != "" {
+				return tok
+			}
+		}
+		if u, ok := cat.(unwrapper); ok {
+			cat = u.Unwrap()
+		} else {
+			return ""
+		}
+	}
 }
 
 // collectAllPartitionLeaves does a BFS over the partition hierarchy rooted at

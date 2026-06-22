@@ -657,7 +657,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// plan, cache, then execute.
 		var precached planner.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !sessionTempInheritanceActive(s.cfg.Catalog) {
 			cacheKey = normalizeCompatSQL(sql)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -863,6 +863,27 @@ func sessionLockTimeout(sess *config.SessionRegistry) int64 {
 	return ms
 }
 
+// sessionTempInheritanceActive reports whether the base catalog currently has a
+// session-owned temporary inheritance child. When true the cross-session plan
+// cache must be bypassed: a query scanning an inheritance parent expands to a
+// session-specific child set (RELATION_IS_OTHER_TEMP), so one session's cached
+// plan would wrongly be served to another. Returns false (cache enabled) for
+// any catalog that does not expose the check. Design 0118-0037 (inherit-temp).
+func sessionTempInheritanceActive(base catalog.Catalog) bool {
+	type tempInheritChecker interface{ HasTempInheritanceChildren() bool }
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if c, ok := base.(tempInheritChecker); ok {
+			return c.HasTempInheritanceChildren()
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+		} else {
+			return false
+		}
+	}
+}
+
 // sessionPlanCatalog returns a search-path-aware catalog wrapper for use when
 // calling planner.Plan. The wrapper re-reads search_path dynamically so that
 // SET search_path changes take effect on the next statement. When sess is nil
@@ -871,9 +892,16 @@ func sessionPlanCatalog(sess *config.SessionRegistry, base catalog.Catalog) cata
 	if sess == nil {
 		return base
 	}
-	return catalog.WithSearchPath(base, func() []string {
+	wrapped := catalog.WithSearchPath(base, func() []string {
 		return searchPathSchemas(sess)
 	})
+	// Carry the session's temp-relation ownership token so the planner drops
+	// other-session temp inheritance children during expansion. Must match
+	// executor.sessionTempOwner: "s"+UniqueID(). Design 0118-0036 (inherit-temp).
+	if id := sess.UniqueID(); id != 0 {
+		wrapped.TempOwnerToken = "s" + strconv.FormatUint(id, 10)
+	}
+	return wrapped
 }
 
 // ctxPlanCatalog is like sessionPlanCatalog but reads search_path from an
@@ -884,13 +912,21 @@ func ctxPlanCatalog(ctx *executor.Context, base catalog.Catalog) catalog.Catalog
 		return base
 	}
 	getSetting := ctx.GetSetting // capture
-	return catalog.WithSearchPath(base, func() []string {
+	wrapped := catalog.WithSearchPath(base, func() []string {
 		sp, ok := getSetting("search_path")
 		if !ok || sp == "" {
 			return []string{"public"}
 		}
 		return parseSearchPathSchemas(sp)
 	})
+	// Carry the session temp-owner token (matches executor.sessionTempOwner) so
+	// the planner applies the RELATION_IS_OTHER_TEMP exclusion. Design 0118-0036.
+	if s, ok := ctx.AdvisorySessionIdentity.(interface{ UniqueID() uint64 }); ok && s != nil {
+		if id := s.UniqueID(); id != 0 {
+			wrapped.TempOwnerToken = "s" + strconv.FormatUint(id, 10)
+		}
+	}
+	return wrapped
 }
 
 // parseSearchPathSchemas parses a search_path string (e.g. "temp_func_test, public")
