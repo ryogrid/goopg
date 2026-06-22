@@ -208,6 +208,74 @@ func TestParseTransactionControl(t *testing.T) {
 	}
 }
 
+// TestParseSelectInto pins the M0118-0008 PL/pgSQL SELECT … INTO statement
+// form: a top-level INTO clause is reinterpreted as variable assignment (not
+// SQL's CREATE-TABLE-AS), the INTO clause is stripped from the captured query,
+// and the target variable name(s) are recorded.
+func TestParseSelectInto(t *testing.T) {
+	for _, tc := range []struct {
+		src         string
+		wantSQL     string
+		wantTargets []string
+		wantStrict  bool
+	}{
+		{
+			src:         "BEGIN select test1.b into x from test1; END",
+			wantSQL:     "select test1.b  from test1",
+			wantTargets: []string{"x"},
+		},
+		{
+			src:         "BEGIN select * into r from test1; END",
+			wantSQL:     "select *  from test1",
+			wantTargets: []string{"r"},
+		},
+		{
+			src:         "BEGIN select a, b into strict x, y from t where a = 1; END",
+			wantSQL:     "select a, b  from t where a = 1",
+			wantTargets: []string{"x", "y"},
+			wantStrict:  true,
+		},
+	} {
+		blk, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("%q: expected parse, got %v", tc.src, err)
+		}
+		if len(blk.Statements) != 1 {
+			t.Fatalf("%q: got %d stmts, want 1", tc.src, len(blk.Statements))
+		}
+		st, ok := blk.Statements[0].(*SelectIntoStmt)
+		if !ok {
+			t.Fatalf("%q: stmt = %T, want *SelectIntoStmt", tc.src, blk.Statements[0])
+		}
+		if st.SQL != tc.wantSQL {
+			t.Errorf("%q: SQL = %q, want %q", tc.src, st.SQL, tc.wantSQL)
+		}
+		if len(st.Targets) != len(tc.wantTargets) {
+			t.Fatalf("%q: Targets = %v, want %v", tc.src, st.Targets, tc.wantTargets)
+		}
+		for i := range tc.wantTargets {
+			if st.Targets[i] != tc.wantTargets[i] {
+				t.Errorf("%q: Targets[%d] = %q, want %q", tc.src, i, st.Targets[i], tc.wantTargets[i])
+			}
+		}
+		if st.Strict != tc.wantStrict {
+			t.Errorf("%q: Strict = %v, want %v", tc.src, st.Strict, tc.wantStrict)
+		}
+	}
+}
+
+// TestParseSelectNoIntoIsEmbeddedSQL confirms a plain SELECT (no INTO) is still
+// captured verbatim as a *SQLStmt, not a SelectIntoStmt.
+func TestParseSelectNoIntoIsEmbeddedSQL(t *testing.T) {
+	blk, err := Parse("BEGIN select count(*) from t; END")
+	if err != nil {
+		t.Fatalf("expected parse, got %v", err)
+	}
+	if _, ok := blk.Statements[0].(*SQLStmt); !ok {
+		t.Fatalf("stmt = %T, want *SQLStmt", blk.Statements[0])
+	}
+}
+
 // TestParseReturnExpressionError: a malformed expression inside
 // RETURN surfaces a SyntaxError pinned at the expression's start
 // position so the diagnostic points at the offending source.

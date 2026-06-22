@@ -634,6 +634,26 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `…RollbackChain`/`…CommitInExplicitBlockRejected`;
       `TestPort_IsolationSubxidOverflow`/`FreezeTheDead` strict PASS (no
       regression); executor+server units; `go vet`; pgbench smoke.
+      **2026-06-23 enabler (design 0118-0050, NOT a promotion): PL/pgSQL
+      `SELECT … INTO`.** `select … into [strict] target[, …] from …` inside a
+      PL/pgSQL body now binds the first result row to the named variable(s)
+      instead of being mis-parsed as SQL's CREATE-TABLE-AS (`SELECT … INTO
+      <table>`). `parseSQLStmt` special-cases a leading SELECT: detects a
+      top-level (`depth==0`) `INTO`, peels off optional `STRICT` + the
+      comma-separated target list (dotted names allowed), reconstructs the query
+      with the INTO clause excised, returns new `*SelectIntoStmt{SQL,Targets,
+      Strict}` (plain SELECT still → verbatim `*SQLStmt`). Runtime
+      `bindSelectIntoRow` mirrors the FOR-loop conventions: single target+1 col
+      → scalar; single target+N cols → record `_<target>_<col>` sub-fields;
+      multiple targets → positional scalar; no row ⇒ NULL (schema from
+      `op.Schema()` before first Next); STRICT ⇒ P0002/P0003. Lifts
+      `plpgsql-toast`'s next blocker after 0118-0049: probe shows `assign1` now
+      runs and emits `length(x) = 6000`; divergence advances to subquery-valued
+      assignment (`assign2`: `x := (select …)`), expanded record/detoast paths
+      (`assign3-6`), and the `<waiting ...>` concurrency marker — all deferred
+      (Effort-L). Gates: `TestParseSelectInto`/`TestParseSelectNoIntoIsEmbeddedSQL`;
+      `TestPlpgSQLSelectInto`; full executor+plpgsql units; txctl/subxid-overflow
+      regression PASS; `go vet`; pgbench smoke = pre-commit hook.
       **Remaining (deferred):** `alter-table-4` (INHERITS + transactional-DDL
       cross-session visibility), `detach-partition-concurrently-{1,2,3,4}` +
       `partition-concurrent-attach` (transactional partition visibility),

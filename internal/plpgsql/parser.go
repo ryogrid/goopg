@@ -913,18 +913,73 @@ func parseExprFromTokens(toks []parser.Token) (parser.Expr, error) {
 
 // parseSQLStmt captures an embedded SQL statement (INSERT / UPDATE / DELETE /
 // SELECT) up to the trailing `;` and stores it verbatim. M0096-0012.
-func (p *bodyParser) parseSQLStmt() (*SQLStmt, error) {
+//
+// A leading `SELECT` is special-cased: PL/pgSQL reinterprets a top-level
+// `INTO [STRICT] target[, target...]` clause as variable assignment rather than
+// SQL's CREATE-TABLE-AS spelling. When such a clause is found, the INTO clause
+// is stripped from the query text and a *SelectIntoStmt is returned so the
+// executor binds the first result row to the named variable(s). M0118-0008.
+func (p *bodyParser) parseSQLStmt() (Stmt, error) {
 	startPos := p.cur().Pos
+	isSelect := p.cur().Kind == parser.TokenKeyword && p.cur().Keyword == parser.KwSelect
 	depth := 0
+	intoByteStart := -1 // byte offset of the INTO token (once found)
+	targetsEndByte := -1
+	var targets []string
+	strict := false
 	for p.cur().Kind != parser.TokenEOF {
 		t := p.cur()
 		if t.Kind == parser.TokenSymbol && t.Value == "(" {
 			depth++
 		} else if t.Kind == parser.TokenSymbol && t.Value == ")" {
 			depth--
+		} else if isSelect && depth == 0 && intoByteStart < 0 &&
+			t.Kind == parser.TokenKeyword && t.Keyword == parser.KwInto {
+			// Top-level INTO clause: capture its byte span and parse the
+			// target variable list, then resume scanning for `;` from the
+			// token that ends the list (e.g. FROM).
+			intoByteStart = t.Pos
+			p.advance() // consume INTO
+			if st := p.cur(); st.Kind == parser.TokenIdent && strings.EqualFold(st.Value, "strict") {
+				strict = true
+				p.advance()
+			}
+			for {
+				nt := p.cur()
+				if nt.Kind != parser.TokenIdent {
+					break
+				}
+				name := nt.Value
+				p.advance()
+				// Capture a dotted target (record field, e.g. r.b).
+				for p.cur().Kind == parser.TokenSymbol && p.cur().Value == "." {
+					p.advance() // consume '.'
+					fld := p.cur()
+					if fld.Kind != parser.TokenIdent {
+						break
+					}
+					name += "." + fld.Value
+					p.advance()
+				}
+				targets = append(targets, name)
+				if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "," {
+					p.advance()
+					continue
+				}
+				break
+			}
+			targetsEndByte = p.cur().Pos
+			continue // re-enter loop without the trailing advance below
 		} else if t.Kind == parser.TokenSymbol && t.Value == ";" && depth == 0 {
 			endPos := t.Pos
 			p.advance() // consume `;`
+			if intoByteStart >= 0 && len(targets) > 0 {
+				if targetsEndByte < 0 || targetsEndByte > endPos {
+					targetsEndByte = endPos
+				}
+				query := strings.TrimSpace(p.src[startPos:intoByteStart] + " " + p.src[targetsEndByte:endPos])
+				return &SelectIntoStmt{pos: startPos, SQL: query, Targets: targets, Strict: strict}, nil
+			}
 			sql := strings.TrimSpace(p.src[startPos:endPos])
 			return &SQLStmt{pos: startPos, SQL: sql}, nil
 		}

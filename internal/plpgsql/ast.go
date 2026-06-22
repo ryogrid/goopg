@@ -253,6 +253,23 @@ type SQLStmt struct {
 func (s *SQLStmt) Pos() int          { return s.pos }
 func (s *SQLStmt) plpgsqlStmtNode() {}
 
+// SelectIntoStmt is `SELECT ... INTO [STRICT] target[, target...] FROM ...`
+// inside a PL/pgSQL body. Unlike SQL's SELECT-INTO (which is CREATE TABLE AS),
+// PL/pgSQL reinterprets the INTO clause as variable assignment: the query is
+// the SELECT with the INTO clause removed, and the first result row's columns
+// are bound positionally to the named target variable(s). A single record /
+// composite target receives all result columns; scalar targets receive one
+// column each. M0118-0008 (plpgsql-toast).
+type SelectIntoStmt struct {
+	pos     int
+	SQL     string   // the SELECT query with the INTO clause stripped
+	Targets []string // target variable name(s), lower-cased preserved as written
+	Strict  bool     // STRICT modifier (exactly one row required)
+}
+
+func (s *SelectIntoStmt) Pos() int          { return s.pos }
+func (s *SelectIntoStmt) plpgsqlStmtNode() {}
+
 // ExceptionHandler is one WHEN clause in an EXCEPTION block.
 // Conditions are SQLSTATE codes or condition names. M0097-0012.
 type ExceptionHandler struct {

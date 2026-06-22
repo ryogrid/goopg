@@ -1,37 +1,43 @@
-Loop #47: M0118-0008 enabler (design 0118-0049) — PL/pgSQL transaction control
-(`COMMIT;`/`ROLLBACK;` in a non-atomic DO block). NOT a promotion.
+Loop #48: M0118-0008 enabler (design 0118-0050) — PL/pgSQL `SELECT … INTO`
+statement form. NOT a promotion.
 
-Done: `COMMIT`/`ROLLBACK` in a top-level DO (or procedure outside an explicit
-txn) now commit/roll back the current tx and chain into a fresh one; atomic
-context (DO inside BEGIN…COMMIT) ⇒ SQLSTATE 2D000. New `Context.PLpgSQLCommitChain`
-callback installed by dispatch only in auto-commit mode bridges the server-owned
-txn lifecycle to the executor. New `TxControlStmt` AST/parser/runtime.
+Done: `select … into [strict] target[, …] from …` inside a PL/pgSQL body now
+binds the first result row to the named variable(s). Was mis-parsed as SQL
+CREATE-TABLE-AS (`SELECT … INTO <table>`). parseSQLStmt special-cases a leading
+SELECT: detect top-level (depth==0) `INTO`, peel optional STRICT + comma target
+list (dotted names ok), reconstruct query with INTO clause excised → new
+`*SelectIntoStmt{SQL,Targets,Strict}` (plain SELECT still → verbatim *SQLStmt).
+Runtime `bindSelectIntoRow`: single target+1col → scalar; single target+Ncols →
+record `_<target>_<col>` sub-fields; multi-target → positional scalar; no row ⇒
+NULL (schema from op.Schema() before first Next); STRICT ⇒ P0002/P0003.
 
-Files: internal/plpgsql/ast.go (+TxControlStmt), internal/plpgsql/parser.go
-(parseStmt COMMIT/ROLLBACK case), internal/executor/context.go
-(+PLpgSQLCommitChain field), internal/executor/plpgsql_runtime.go (+runtime
-case), internal/server/dispatch.go (install closure when autoCommit),
-internal/plpgsql/parser_test.go (+TestParseTransactionControl),
-internal/testport/plpgsql_txctl_test.go (3 behavioral tests),
-docs/design/0118-0049-* + README index, fix_plan.md, deferral_ledger.md.
+Files: internal/plpgsql/ast.go (+SelectIntoStmt), internal/plpgsql/parser.go
+(parseSQLStmt SELECT-INTO detection), internal/plpgsql/parser_test.go
+(+TestParseSelectInto/+TestParseSelectNoIntoIsEmbeddedSQL),
+internal/executor/plpgsql_runtime.go (+SelectIntoStmt case + bindSelectIntoRow),
+internal/executor/plpgsql_select_into_test.go (TestPlpgSQLSelectInto),
+docs/design/0118-0050-* + README index, fix_plan.md, deferral_ledger.md.
 
-Gates run: TestParseTransactionControl PASS; behavioral commit-chain/rollback-
-chain/atomic-reject PASS; TestPort_IsolationSubxidOverflow + FreezeTheDead strict
-PASS (no dispatch regression); internal/executor + internal/server units PASS;
-go vet clean; pgbench smoke = pre-commit hook.
+Gates run: TestParseSelectInto + TestParseSelectNoIntoIsEmbeddedSQL PASS;
+TestPlpgSQLSelectInto PASS (scalar/multi-target/no-row→NULL); full
+internal/executor + internal/plpgsql PASS; txctl (DoCommitChain/RollbackChain/
+CommitInExplicit) + SubxidOverflow PASS (no DO-path regression); go vet clean;
+pgbench smoke = pre-commit hook. Probe: plpgsql-toast assign1 now runs (emits
+length(x)=6000); first divergence moved past SELECT INTO.
 
-Next step (M0118-0008 hard tail — all Effort-L, one slice per loop):
-- plpgsql-toast NEXT blocker = PL/pgSQL `SELECT … INTO var` (scalar+record):
-  goopg captures `select test1.b into x from test1` as raw embedded SQL and
-  mis-parses it as SQL `SELECT … INTO <table>`. Resume = add a PL/pgSQL
-  `SELECT … INTO` statement form (strip INTO target before re-parsing the query,
-  bind first row to the named var(s)) + record/composite (`r record`, `r test2`,
-  `r.b := …`) + `FOR rec IN SELECT … LOOP` + post-COMMIT advisory-lock wait
-  (7 perms). The COMMIT-in-loop machinery (assign6/fetch-after-commit) is now
-  in place via this loop's PLpgSQLCommitChain.
-- Other tail specs (all Effort-L, each a new subsystem): alter-table-4 +
-  partition ATTACH/DETACH (transactional catalog/inheritance visibility — lock
-  is COUPLED to visibility, can't split), partition-drop-index-locking (real
-  pg_locks view: relation/mode/granted/pid join with pg_stat_activity),
-  reindex-concurrently-toast (TOAST relations as catalog objects +
-  allow_system_table_mods).
+Next step (M0118-0008 hard tail — all Effort-L, one slice per loop). plpgsql-toast
+next blockers (in order the probe surfaces them):
+- assign2: subquery-valued assignment `x := (select test1.b from test1)` —
+  PL/pgSQL scalar exprs reject subqueries (`subqueries are not supported in
+  PL/pgSQL expressions in v0`). Resume = let evalPLpgSQLExpr handle a top-level
+  scalar SubqueryExpr (plan+run, take first row first col).
+- assign3/4: expanded record (`r record`, `r test2`) with `r.b := (select …)`
+  and `length(r::text)` — needs record reassembly to text.
+- assign5/6: `FOR r IN SELECT … LOOP` detoast + COMMIT-in-loop.
+- detoast-across-COMMIT: free external TOAST pointers at the assignment boundary
+  so a concurrent VACUUM can't orphan chunks; + the runner `<waiting ...>`
+  advisory-lock/VACUUM timing marker.
+- Other tail specs (each a new subsystem): alter-table-4 (INHERITS + transactional
+  catalog visibility), partition ATTACH/DETACH concurrent visibility,
+  partition-drop-index-locking (real pg_locks view), reindex-concurrently-toast
+  (TOAST relations as catalog objects).

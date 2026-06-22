@@ -121,6 +121,63 @@ func (f *plpgsqlFrame) lookup(name string) (int, bool) {
 	return idx, ok
 }
 
+// bindSelectIntoRow binds a SELECT … INTO result row to its PL/pgSQL target
+// variable(s), mirroring the FOR-loop record/scalar binding conventions:
+//   - a single target with a single-column row binds directly to the scalar
+//     variable (when one exists);
+//   - a single target with a multi-column row is treated as a record and bound
+//     to `_<target>_<colname>` sub-fields (auto-registered if absent);
+//   - multiple targets bind result columns positionally to scalar variables.
+//
+// A missing column yields NULL. M0118-0008 (plpgsql-toast).
+func bindSelectIntoRow(targets []string, row Row, schema planner.Schema, frame *plpgsqlFrame) {
+	if len(targets) == 0 {
+		return
+	}
+	if len(targets) == 1 {
+		name := strings.ToLower(targets[0])
+		if len(schema) == 1 {
+			if idx, ok := frame.indexByName[name]; ok {
+				if len(row) > 0 {
+					frame.values[idx] = row[0]
+				} else {
+					frame.values[idx] = NullDatum
+				}
+				return
+			}
+		}
+		for i, sc := range schema {
+			colKey := "_" + name + "_" + strings.ToLower(sc.Name)
+			val := NullDatum
+			if i < len(row) {
+				val = row[i]
+			}
+			if idx, ok := frame.indexByName[colKey]; ok {
+				frame.values[idx] = val
+			} else {
+				_ = frame.add(colKey, sc.Type, val)
+			}
+		}
+		return
+	}
+	for i, tgt := range targets {
+		name := strings.ToLower(tgt)
+		val := NullDatum
+		if i < len(row) {
+			val = row[i]
+		}
+		if idx, ok := frame.indexByName[name]; ok {
+			frame.values[idx] = val
+		} else {
+			var typ catalog.Type
+			if i < len(schema) {
+				typ = schema[i].Type
+			}
+			_ = frame.add(name, typ, val)
+		}
+	}
+}
+
 // evalStoredRoutineFuncCall resolves and executes user-defined
 // routines (M0015 Stage A runtime path) when a call is not one of
 // the built-ins handled directly in expr.go.
@@ -1424,6 +1481,72 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if err := execPLpgSQLEmbeddedSQL(s.SQL, frame, ctx); err != nil {
 			return Datum{}, flowNone, err
 		}
+		return Datum{}, flowNone, nil
+
+	case *plpgsql.SelectIntoStmt:
+		// SELECT ... INTO [STRICT] target[, ...] — bind the first result row
+		// to the named PL/pgSQL variable(s). The query has already had its
+		// INTO clause stripped by the parser. M0118-0008 (plpgsql-toast).
+		sql := s.SQL
+		if frame.trig != nil {
+			sql = substituteTriggerRefs(sql, frame.trig)
+		}
+		stmts, err := parser.Parse(sql)
+		if err != nil {
+			return Datum{}, flowNone, &ExecError{Code: "42601", Message: fmt.Sprintf("SELECT INTO query parse error: %v", err)}
+		}
+		if len(stmts) == 0 {
+			return Datum{}, flowNone, nil
+		}
+		plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		op, err := Build(plan)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		if err := op.Open(ctx); err != nil {
+			op.Close()
+			return Datum{}, flowNone, err
+		}
+		// Capture the output schema up front so a no-row result can still bind
+		// NULL to the target(s) (PG sets unmatched SELECT INTO targets to NULL).
+		schema := op.Schema()
+		slot, nerr := op.Next()
+		var firstRow Row
+		rowCount := 0
+		if slot != nil && (nerr == nil || nerr == EOF) {
+			r0 := slotRow(slot)
+			if r0 != nil && nerr == nil {
+				firstRow = append(Row(nil), r0...)
+				if s := slot.Schema(); len(s) > 0 {
+					schema = s
+				}
+				rowCount = 1
+				// STRICT needs to know if a second row exists.
+				if s.Strict {
+					if s2, e2 := op.Next(); e2 == nil && s2 != nil {
+						rowCount = 2
+					} else if e2 != nil && e2 != EOF {
+						nerr = e2
+					}
+				}
+			}
+		}
+		op.Close()
+		if nerr != nil && nerr != EOF {
+			return Datum{}, flowNone, nerr
+		}
+		if s.Strict {
+			if rowCount == 0 {
+				return Datum{}, flowNone, &ExecError{Code: "P0002", Message: "query returned no rows"}
+			}
+			if rowCount > 1 {
+				return Datum{}, flowNone, &ExecError{Code: "P0003", Message: "query returned more than one row"}
+			}
+		}
+		bindSelectIntoRow(s.Targets, firstRow, schema, frame)
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.ForSelectStmt:
