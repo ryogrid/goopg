@@ -4821,6 +4821,30 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		tbl.Schema = s.SetSchema
 		return nil
 	}
+	// Handle ENABLE/DISABLE TRIGGER — a semantic no-op in v0, but it takes a
+	// transaction-scoped ShareRowExclusiveLock on the table in PostgreSQL
+	// (AlterTableGetLockLevel → ShareRowExclusiveLock for AT_EnableTrig /
+	// AT_DisableTrig). That lock conflicts with a concurrent INSERT/UPDATE/DELETE
+	// (RowExclusiveLock) but not with reads (AccessShareLock) or SELECT ... FOR
+	// UPDATE (RowShareLock), so within an open transaction a concurrent write
+	// blocks until COMMIT while a concurrent FOR UPDATE proceeds. M0118-0008
+	// (alter-table-3 isolation spec).
+	if s.EnableDisableTrigger {
+		tbl, ok := o.lookupTableWithSearch(s.Name)
+		if !ok {
+			if s.IfExists {
+				return nil
+			}
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
+		}
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+				ee.Pos = s.Pos()
+			}
+			return err
+		}
+		return nil
+	}
 	tbl, ok := o.lookupTableWithSearch(s.Name)
 	if !ok {
 		// Not a heap table — check if it's an index.

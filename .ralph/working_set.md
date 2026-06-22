@@ -1,61 +1,59 @@
 (idle — nothing in flight)
 
-Last loop (#23, M0118-0008): promoted `multiple-cic` (5th M0118-0008
-promotion, design 0118-0031). Committed + pushed.
+Last loop (#24, M0118-0008): promoted `alter-table-3` (6th M0118-0008
+promotion, design 0118-0032). Committed + pushed.
 
-## What landed
-- `execCreateIndex` (operators_ddl.go): const-fold a partial-index WHERE
-  predicate that references NO table columns — evaluate once via
-  `evalExpr(pred, nil, ctx)` (new exported `planner.ExprContainsColumnRef`
-  guard), mirroring PG `eval_const_expressions` in BuildIndexInfo. Stored
-  `idx.Predicate` untouched (pg_get_indexdef/pg_dump unaffected). Makes the
-  IMMUTABLE advisory-lock predicate fire on an EMPTY table so s1i blocks.
-- `CreateIndexStmt.Concurrently` added (parser/ast.go) + recorded in
-  `parseCreateIndexTail` (parser/ddl.go). CIC now captures active-txn slots at
-  START (`mvcc.SnapshotActiveOtherSlots`, refactored out of
-  `WaitForOlderSlotsToCommit`) and drains them after build
-  (`WaitForSlotsToCommit`) → newer build completes after older. Start-time
-  snapshot avoids mutual wait between two simultaneous CICs.
-- Runner (isolation_runner.go): `(*)` star branch now drains UNGATED pending
-  steps before the star step's own completion; `partitionGatedOn` keeps
-  `BlockerStepComplete`-gated steps (deadlock-hard s7a8(s8a1)) reported AFTER.
-- `TestPort_IsolationMultipleCic` strict PASS.
-GATES: build PASS; multiple-cic strict PASS; ALL strict `(*)` specs
-(deadlock-{hard,soft,soft-2}, classroom-scheduling, project-manager,
-serializable-parallel{,-2}, temporal-range-integrity, multixact-no-deadlock,
-tuplelock-upgrade-no-deadlock, timeouts) PASS; lock-sibling regression PASS;
--race mvcc/lockmgr; parser/planner/executor units; pgbench smoke (pre-commit).
-CSV field count verified 7; coverage/inventory/port-status regenerated.
+## What landed (one task)
+ENABLE/DISABLE TRIGGER lock + abort-time table-lock release.
+- Parser (ast.go + ddl.go): ENABLE/DISABLE arm (was a pure no-op) now scans for
+  a TRIGGER target and sets `AlterTableStmt.EnableDisableTrigger`; RULE/other
+  variants keep the no-op.
+- Executor (operators_ddl.go execAlterTable): when the flag is set, look up the
+  table and take a txn-scoped `ShareRowExclusiveLock` via the existing
+  `acquireDDLLockTxn` (mirrors PG AlterTableGetLockLevel). Conflicts with
+  INSERT's RowExclusiveLock (waits), not FOR UPDATE's RowShareLock (proceeds).
+- Server (conn_tx.go connTxState.Fail()): now releases the failed txn's
+  tableLockMgr locks immediately via `ReleaseTableLocks(c.LockBackendID)`, GATED
+  on `c.sess.SavepointDepth()==0`. Mirrors PG AbortTransaction dropping
+  heavyweight locks at abort, NOT at the explicit ROLLBACK (empirically verified
+  on real PG 18.3: zero pg_locks rows while `idle in transaction (aborted)`).
+  Subtransaction abort (savepoint open) retains locks per PG. Idempotent with
+  End(). Only tableLockMgr released (relation/advisory left to End()).
+- TestPort_IsolationAlterTable3 strict PASS (48 perms).
+GATES: build PASS; alter-table-3 strict PASS; lock-sibling (create-trigger,
+sequence-ddl, reindex-schema, multiple-cic, lock-nowait, nowait×5, insert-
+conflict×7) PASS; savepoint/abort (delete-abort-savept{,2}, aborted-keyrevoke)
+PASS; SSI (simple-write-skew, receipt-report, read-only-anomaly{,2},
+serializable-parallel{,2}) PASS; -race lockmgr+server; parser/executor units;
+state-guard OK. CSV field count 7 verified; docs regenerated.
 
 KEY METHODOLOGY: throwaway zz_probe_test.go ranked the M0118-0008 tail by
-first-divergence cost. multiple-cic was 1 line off (only completion order) once
-const-fold + CIC-drain landed.
+first-divergence cost — alter-table-3 diverged only at L62 (61 lines matched).
+The 2nd fix (abort-release) needed empirical PG verification via FIFO psql.
 
 NEXT loop candidates (remaining M0118-0008 tail — probe-first):
-- biggest leverage = ROLE/ACL infra (CREATE ROLE/GRANT/SET ROLE/ALTER OWNER +
-  permission-denied 42501) unblocks truncate-conflict/vacuum-conflict/
-  cluster-conflict. goopg has only a wire-layer string CREATE/DROP ROLE
-  (server/role_ddl.go); no GRANT/SET ROLE/privilege model. Large.
-- `alter-table-1/2`: parser gaps (FK `... NOT VALID` errors "expected keyword
-  deferrable"; `ALTER TABLE ... VALIDATE CONSTRAINT` errors "expected ADD or
-  DROP") + ShareUpdateExclusive(VALIDATE)/ShareRowExclusive(ADD) lock semantics
-  + 140/48 perms. Medium-large.
-- `inherit-temp`: goopg includes ANOTHER session's temp child in a parent
-  SELECT (global catalog, no per-session temp ownership). Needs session-scoped
-  temp tables + RELATION_IS_OTHER_TEMP inheritance exclusion. Large.
-- `reindex-concurrently-toast`: needs `allow_system_table_mods` GUC + real TOAST
-  rels in pg_class (reltoastrelid) + pg_toast.<name> reindex. Large.
-- partition specs / vacuum-skip-locked / vacuum-concurrent-drop: PARTITION BY
-  LIST + partitioned VACUUM log parity.
+- `alter-table-4`: table INHERITS + ALTER TABLE INHERIT/NO INHERIT + child-lock
+  identification ordering (inheritance reads parent+children: SUM=11 not 1). Med.
+- `alter-table-1/2`: FK `NOT VALID` parsing + `ALTER TABLE VALIDATE CONSTRAINT` +
+  ShareUpdateExclusive(VALIDATE)/ShareRowExclusive(ADD) lock semantics. Med-large.
+- `*-conflict` family (truncate/vacuum/cluster): CREATE ROLE/SET ROLE/OWNER ACL
+  infra. Large (biggest unblock leverage).
+- `vacuum-no-cleanup-lock`: needs `vacuum_multixact_freeze_min_age` GUC accepted
+  + reltuples accounting. GUC is the immediate blocker (probe L4).
+- `detach-partition-concurrently-1`: DETACH PARTITION CONCURRENTLY parse (probe
+  showed syntax error) + concurrent-detach semantics.
 
-REUSABLE: `acquireRelLockMaybeTransient` + `waitForRelationLockers` (locks);
-`mvcc.SnapshotActiveOtherSlots`/`WaitForSlotsToCommit` (CIC drain);
-`planner.ExprContainsColumnRef` (const-fold guard).
+REUSABLE: `acquireDDLLockTxn`(ShareRowExclusive/AccessExclusive) +
+`acquireWriteLockTxn`(RowExclusive) + `acquireScanReadLockTxn`(AccessShare) +
+`acquireRelLockMaybeTransient` + `waitForRelationLockers`;
+`mvcc.SnapshotActiveOtherSlots`/`WaitForSlotsToCommit`;
+`planner.ExprContainsColumnRef`. NEW: connTxState.Fail() abort-release pattern.
 
-GOTCHAS: isolation specs run goopg as SUBPROCESS (debug→file). D-002 CSV is one
-giant single-line row #13 (field 6 rationale COMMA-FREE; append before
-`,M0060-0004`; verify `awk -F, 'NR==13{print NF}'` == 7). regen: gen-oracle-
-port-status + gen-isolation-coverage --repo-root . + gen-oracle-inventory
---repo-root . NEVER `cd` into postgres/. never gofmt -w. Untracked postgres/ +
-weekly_loc.* + requirements.txt are stray — leave. .ralph/progress.json is
-driver-managed — don't commit it.
+GOTCHAS: isolation specs run goopg as SUBPROCESS (debug→file). real-PG manual
+test needs `LD_LIBRARY_PATH=postgres/local_install/lib` (psql symbol-lookup err
+otherwise) + FIFO for multi-session. D-002 CSV is giant single-line row #13
+(field 6 rationale COMMA-FREE; append before `,M0060-0004`; verify
+`awk -F, 'NR==13{print NF}'`==7). regen: gen-oracle-port-status +
+gen-isolation-coverage --repo-root . + gen-oracle-inventory --repo-root .
+NEVER `cd` into postgres/. never gofmt -w. Untracked postgres/ + weekly_loc.* +
+requirements.txt are stray — leave. .ralph/progress.json driver-managed.

@@ -4942,15 +4942,23 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return stmt, nil
 		}
 	}
-	// ENABLE/DISABLE TRIGGER — parse as a no-op.
+	// ENABLE/DISABLE [REPLICA|ALWAYS] TRIGGER | RULE — semantic no-op in v0.
+	// The TRIGGER variant takes a ShareRowExclusiveLock in PostgreSQL, so flag
+	// it for the executor to acquire that transaction-scoped lock (alter-table-3
+	// isolation spec, M0118-0008). RULE / other variants keep the old no-op.
 	if p.acceptIdentKeyword("enable") || p.acceptIdentKeyword("disable") {
-		// consume rest of statement until ';' or EOF
+		isTrigger := false
+		// consume rest of statement until ';' or EOF, noting a TRIGGER target.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break
 			}
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTrigger {
+				isTrigger = true
+			}
 			p.advance()
 		}
+		stmt.EnableDisableTrigger = isTrigger
 		return stmt, nil
 	}
 	// DROP CONSTRAINT name [RESTRICT|CASCADE] — real action (M0097-0036).

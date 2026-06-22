@@ -389,6 +389,27 @@ func TestPort_IsolationMultipleCic(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/multiple-cic.spec")
 }
 
+// TestPort_IsolationAlterTable3 exercises the alter-table-3 spec (M0118-0008):
+// ALTER TABLE ... ENABLE/DISABLE TRIGGER mixed with concurrent writes and
+// SELECT ... FOR UPDATE.
+//
+// PASS-REQUIRED (design 0118-0032). Two fixes: (1) ALTER TABLE ENABLE/DISABLE
+// TRIGGER now takes a transaction-scoped ShareRowExclusiveLock (mirrors
+// PostgreSQL's AlterTableGetLockLevel), so a concurrent INSERT (RowExclusiveLock)
+// blocks until the ALTER transaction commits while a concurrent SELECT ... FOR
+// UPDATE (RowShareLock) proceeds; (2) when a statement errors at the top level
+// of a transaction the aborted transaction's table locks are released
+// immediately (mirrors PostgreSQL's AbortTransaction releasing locks at abort,
+// not at the explicit ROLLBACK), so a later conflicting ALTER in another session
+// does not wait on the aborted transaction. Byte-identical to PG 18.3.
+func TestPort_IsolationAlterTable3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_alter_table_3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-3.spec")
+}
+
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
 // Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
 func TestPort_IsolationFkSnapshot(t *testing.T) {

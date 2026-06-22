@@ -383,8 +383,26 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       temporal-range-integrity, multixact-no-deadlock,
       tuplelock-upgrade-no-deadlock, timeouts) PASS; lock-sibling regression PASS;
       `-race` mvcc/lockmgr; parser/planner/executor units; pgbench smoke.
-      **Remaining (deferred, ledger 2026-06-22):** `alter-table-*`
-      (ADD/VALIDATE CONSTRAINT lock semantics), the `*-conflict` family —
+      **2026-06-22 sixth promotion (design 0118-0032): `alter-table-3`
+      PROMOTED.** Mixes `ALTER TABLE … ENABLE/DISABLE TRIGGER` with a concurrent
+      `SELECT … FOR UPDATE` and a duplicate-key `INSERT`. Two engine fixes:
+      (1) the ENABLE/DISABLE TRIGGER parser arm (was a pure no-op) now flags
+      `AlterTableStmt.EnableDisableTrigger` and `execAlterTable` takes a
+      transaction-scoped `ShareRowExclusiveLock` via the existing
+      `acquireDDLLockTxn` (mirrors PG `AlterTableGetLockLevel`), conflicting with
+      a concurrent INSERT's `RowExclusiveLock` (waits) but not FOR UPDATE's
+      `RowShareLock` (proceeds); (2) `connTxState.Fail()` now releases the failed
+      transaction's `tableLockMgr` locks immediately
+      (`ReleaseTableLocks(LockBackendID)`), gated on `SavepointDepth()==0`,
+      mirroring PG `AbortTransaction` dropping heavyweight locks at abort (NOT at
+      the explicit ROLLBACK — verified zero `pg_locks` rows on real PG 18.3 while
+      `idle in transaction (aborted)`), so a later conflicting ALTER doesn't wait
+      on a dead failed-INSERT lock. `TestPort_IsolationAlterTable3` strict PASS
+      (48 perms); lock-sibling + savepoint/abort (`delete-abort-savept{,2}`,
+      `aborted-keyrevoke`) + SSI regression PASS; `-race` lockmgr/server;
+      parser/executor units; pgbench smoke.
+      **Remaining (deferred, ledger 2026-06-22):** `alter-table-{1,2,4}`
+      (ADD/VALIDATE CONSTRAINT lock semantics; INHERITS), the `*-conflict` family —
       truncate/vacuum/cluster — (need CREATE ROLE/GRANT/SET ROLE privilege infra +
       permission-denied), `reindex-concurrently-toast` (`allow_system_table_mods`
       GUC + TOAST-relation reindex), partition specs (ATTACH/DETACH PARTITION),

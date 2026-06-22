@@ -1921,6 +1921,11 @@ type AlterTableStmt struct {
 	SetSchema string
 	// SetLogged is "logged" or "unlogged" when ALTER TABLE SET LOGGED/UNLOGGED is parsed.
 	SetLogged string
+	// EnableDisableTrigger is true for ALTER TABLE ... ENABLE/DISABLE TRIGGER.
+	// The trigger enable/disable itself is a semantic no-op in v0, but the
+	// statement takes a transaction-scoped ShareRowExclusiveLock in PostgreSQL,
+	// which the executor must acquire (alter-table-3 isolation spec, M0118-0008).
+	EnableDisableTrigger bool
 }
 
 func (s *AlterTableStmt) Pos() int  { return s.pos }

@@ -128,6 +128,20 @@ type connTxState struct {
 func (c *connTxState) Fail() {
 	c.mu.Lock()
 	c.failed = true
+	// Mirror PostgreSQL's AbortTransaction: when a statement errors at the top
+	// level of a transaction (no open savepoint/subtransaction), the aborted
+	// transaction's heavyweight LOCK TABLE / DDL / DML table locks are released
+	// immediately — pg_locks shows none held — rather than lingering until the
+	// explicit ROLLBACK. A concurrent session's conflicting DDL/DML therefore
+	// proceeds without waiting for the aborted transaction to be rolled back
+	// (alter-table-3 isolation spec, M0118-0008). When a savepoint is open the
+	// error aborts only the current subtransaction, whose locks transfer to the
+	// parent (PostgreSQL retains them across ROLLBACK TO SAVEPOINT), so we keep
+	// them and let End() release them on the eventual COMMIT/ROLLBACK. The
+	// release is idempotent: End() releases again under the same identity.
+	if c.sess != nil && c.sess.SavepointDepth() == 0 {
+		executor.ReleaseTableLocks(c.LockBackendID)
+	}
 	c.mu.Unlock()
 }
 
