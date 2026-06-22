@@ -5005,6 +5005,46 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				NotValid:   act.NotValid,
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
+		case parser.AlterTableValidateConstraint:
+			// VALIDATE CONSTRAINT name — validate a constraint added with
+			// NOT VALID. PostgreSQL's AlterTableGetLockLevel maps
+			// AT_ValidateConstraint to ShareUpdateExclusiveLock (the minimum
+			// lock), which does NOT conflict with concurrent reads
+			// (AccessShareLock), SELECT … FOR UPDATE (RowShareLock), or
+			// INSERT/UPDATE/DELETE (RowExclusiveLock); it conflicts only with
+			// another ShareUpdateExclusive-or-stronger holder. Held to COMMIT
+			// inside an open transaction so a concurrent ALTER waits, while a
+			// no-op in autocommit / for system catalogs keeps the dump/load
+			// path lock-free. M0118-0008 (alter-table-1 isolation spec).
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareUpdateExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = act.Pos()
+				}
+				return err
+			}
+			// Flip the constraint's convalidated flag from 'f' to 't'. The
+			// only validatable constraint goopg models is the FK (NOT VALID);
+			// a CHECK NOT VALID is accepted but already enforced. An unknown
+			// name matches PostgreSQL's error.
+			found := false
+			for i := range tbl.ForeignKeys {
+				if strings.EqualFold(tbl.ForeignKeys[i].Name, act.ConstraintName) {
+					tbl.ForeignKeys[i].NotValid = false
+					found = true
+					break
+				}
+			}
+			if !found {
+				for i := range tbl.NamedChecks {
+					if strings.EqualFold(tbl.NamedChecks[i].Name, act.ConstraintName) {
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42704", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q of relation %q does not exist", act.ConstraintName, tbl.Name)}
+			}
 		case parser.AlterTableAddCheck:
 			// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
 			// Track the constraint name so violations report it. A named

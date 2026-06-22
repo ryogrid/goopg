@@ -5352,6 +5352,23 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableNoInherit, InheritParent: parentName}, nil
 	}
+	// VALIDATE CONSTRAINT name — validate a constraint added with NOT VALID.
+	// VALIDATE is not a reserved keyword in goopg's lexer, so match it as an
+	// identifier-keyword. M0118-0008 (alter-table-1).
+	if p.acceptIdentKeyword("validate") {
+		if !p.acceptKeyword(KwConstraint) {
+			return AlterTableAction{}, p.errAtCur("expected CONSTRAINT after VALIDATE")
+		}
+		nameTok, err := p.parseIdent()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{
+			pos:            nameTok.Pos,
+			Kind:           AlterTableValidateConstraint,
+			ConstraintName: identText(nameTok),
+		}, nil
+	}
 	// DROP COLUMN name / DROP CONSTRAINT name in the multi-action loop.
 	// Both forms share this path so comma-separated "DROP COLUMN a, DROP COLUMN b"
 	// work correctly. M0097-0028.

@@ -589,6 +589,23 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `<waiting ...>` marker. `TestPort_IsolationClusterConflictPartition` strict
       PASS; conflict-family siblings (cluster/vacuum/truncate-conflict) PASS;
       build+vet clean; pgbench smoke (pre-commit hook).
+      **2026-06-23 fifteenth promotion (design 0118-0047): `alter-table-1`
+      PROMOTED ⇒ all 170 permutations byte-for-byte.** Only new piece on top of
+      `alter-table-2`'s ADD FK NOT VALID: `ALTER TABLE … VALIDATE CONSTRAINT name`
+      now parses (new `AlterTableValidateConstraint` action; `VALIDATE` is an
+      identifier-keyword) and takes only a transaction-scoped
+      `ShareUpdateExclusiveLock` via `acquireDDLLockTxn`
+      (`AlterTableGetLockLevel` → `AT_ValidateConstraint`, the minimum lock) and
+      flips the named FK's `convalidated` `'f'`→`'t'` (unknown name ⇒ 42704).
+      `ShareUpdateExclusive` does NOT conflict with `AccessShare` reads /
+      `RowShare` FOR UPDATE / `RowExclusive` INSERT, so VALIDATE never blocks the
+      reader session and the only wait is the INSERT behind the still-uncommitted
+      ADD CONSTRAINT's `ShareRowExclusiveLock` — exactly as alter-table-2.
+      `TestPort_IsolationAlterTable1` strict PASS; sibling alter-table-2/3 strict
+      PASS; parser/executor units; `go vet` clean.
+      **Remaining (deferred):** `alter-table-4` (INHERITS + transactional-DDL
+      cross-session visibility), `reindex-concurrently-toast`, partition
+      ATTACH/DETACH, `plpgsql-toast`. Group stays open.
       **2026-06-23 fourteenth promotion (design 0118-0046): `alter-table-2`
       PROMOTED ⇒ all 48 permutations byte-for-byte.** Two changes: (1) the
       `ALTER TABLE … ADD FOREIGN KEY …` parser now accepts the `NOT VALID`

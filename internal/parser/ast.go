@@ -1822,6 +1822,13 @@ const (
 	// Clears the named table-level storage parameters back to their defaults.
 	// With holds the option names as keys (values empty). M0118-0001.
 	AlterTableResetReloptions
+	// AlterTableValidateConstraint — `VALIDATE CONSTRAINT name`.
+	// Validates a constraint previously added with NOT VALID, flipping
+	// pg_constraint.convalidated from 'f' to 't'. Takes only a
+	// ShareUpdateExclusiveLock (AlterTableGetLockLevel → AT_ValidateConstraint),
+	// so it does not conflict with concurrent reads or writes. ConstraintName
+	// holds the constraint name. M0118-0008 (alter-table-1 isolation spec).
+	AlterTableValidateConstraint
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
