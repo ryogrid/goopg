@@ -139,11 +139,15 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
 `go run ./cmd/gen-isolation-coverage --repo-root .` and
 `go run ./cmd/gen-oracle-inventory --repo-root .`. Pick one coherent spec group per loop.
 
-- [ ] **M0118-0001** — SERIALIZABLE / SSI anomaly specs (write-skew + dangerous-structure
+- [x] **M0118-0001** — SERIALIZABLE / SSI anomaly specs (write-skew + dangerous-structure
       40001): simple-write-skew, matview-write-skew, read-only-anomaly{,-2,-3},
       read-write-unique{,-2,-3,-4}, two-ids, total-cash, receipt-report, project-manager,
       classroom-scheduling, multiple-row-versions, update-conflict-out,
-      serializable-parallel{,-2,-3}.
+      serializable-parallel{,-2,-3}. **COMPLETE (2026-06-22, design 0118-0025).** All
+      19 specs already matched PG 18.3 byte-for-byte (SERIALIZABLE pinned snapshot
+      M0100 + real SSI 40001 dangerous-structure detector M0104); promoted the whole
+      group from soft `runIsoSpec` to `runIsoSpecStrict` in their dedicated
+      `TestPort_Isolation*` functions with NO engine change. D-002 CSV rationale updated.
 - [ ] **M0118-0002** — Predicate-lock granularity per access method / scan type:
       predicate-gin, predicate-gist, predicate-hash, predicate-lock-hot-tuple,
       index-only-scan, index-only-bitmapscan, partial-index.

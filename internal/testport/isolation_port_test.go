@@ -86,7 +86,7 @@ func TestPort_IsolationReadWriteUnique(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-write-unique.spec")
 }
 
 // TestPort_IsolationReadWriteUnique2 exercises read-write-unique-2: two SSI
@@ -97,7 +97,7 @@ func TestPort_IsolationReadWriteUnique2(t *testing.T) {
 	c := newCluster(t, "iso_rw_unique2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-2.spec")
 }
 
 // TestPort_IsolationReadWriteUnique3 exercises read-write-unique-3 (bug 9301):
@@ -107,7 +107,7 @@ func TestPort_IsolationReadWriteUnique3(t *testing.T) {
 	c := newCluster(t, "iso_rw_unique3")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-3.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-3.spec")
 }
 
 // TestPort_IsolationReadWriteUnique4 exercises read-write-unique-4: a gapless
@@ -118,7 +118,7 @@ func TestPort_IsolationReadWriteUnique4(t *testing.T) {
 	c := newCluster(t, "iso_rw_unique4")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-4.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-4.spec")
 }
 
 // TestPort_IsolationLockCommittedUpdate exercises a spec that produces <waiting ...>
@@ -436,7 +436,7 @@ func TestPort_IsolationSimpleWriteSkew(t *testing.T) {
 	c := newCluster(t, "iso_simple_ws")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/simple-write-skew.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/simple-write-skew.spec")
 }
 
 // TestPort_IsolationMatviewWriteSkew exercises the matview-write-skew spec: a
@@ -449,7 +449,7 @@ func TestPort_IsolationMatviewWriteSkew(t *testing.T) {
 	c := newCluster(t, "iso_matview_ws")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/matview-write-skew.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/matview-write-skew.spec")
 }
 
 // TestPort_IsolationTwoIds exercises the two-ids spec: a SERIALIZABLE
@@ -459,7 +459,7 @@ func TestPort_IsolationTwoIds(t *testing.T) {
 	c := newCluster(t, "iso_two_ids")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/two-ids.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/two-ids.spec")
 }
 
 // TestPort_IsolationTotalCash exercises the total-cash spec: a SERIALIZABLE
@@ -469,7 +469,7 @@ func TestPort_IsolationTotalCash(t *testing.T) {
 	c := newCluster(t, "iso_total_cash")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/total-cash.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/total-cash.spec")
 }
 
 // TestPort_IsolationReceiptReport exercises the receipt-report spec: the
@@ -479,7 +479,7 @@ func TestPort_IsolationReceiptReport(t *testing.T) {
 	c := newCluster(t, "iso_receipt_report")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/receipt-report.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/receipt-report.spec")
 }
 
 // TestPort_IsolationProjectManager exercises the project-manager spec: a
@@ -489,7 +489,7 @@ func TestPort_IsolationProjectManager(t *testing.T) {
 	c := newCluster(t, "iso_project_manager")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/project-manager.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/project-manager.spec")
 }
 
 // TestPort_IsolationClassroomScheduling exercises the classroom-scheduling
@@ -499,7 +499,7 @@ func TestPort_IsolationClassroomScheduling(t *testing.T) {
 	c := newCluster(t, "iso_classroom_sched")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/classroom-scheduling.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/classroom-scheduling.spec")
 }
 
 // TestPort_IsolationReadOnlyAnomaly exercises the read-only-anomaly spec: the
@@ -512,7 +512,7 @@ func TestPort_IsolationReadOnlyAnomaly(t *testing.T) {
 	c := newCluster(t, "iso_ro_anomaly")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly.spec")
 }
 
 // TestPort_IsolationReadOnlyAnomaly2 exercises read-only-anomaly-2: same O'Neil
@@ -523,7 +523,7 @@ func TestPort_IsolationReadOnlyAnomaly2(t *testing.T) {
 	c := newCluster(t, "iso_ro_anomaly2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-2.spec")
 }
 
 // TestPort_IsolationReadOnlyAnomaly3 exercises read-only-anomaly-3: the same
@@ -539,7 +539,7 @@ func TestPort_IsolationReadOnlyAnomaly3(t *testing.T) {
 	c := newCluster(t, "iso_ro_anomaly3")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-3.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-3.spec")
 }
 
 // TestPort_IsolationSerializableParallel exercises serializable-parallel: the
@@ -554,7 +554,7 @@ func TestPort_IsolationSerializableParallel(t *testing.T) {
 	c := newCluster(t, "iso_serializable_parallel")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel.spec")
 }
 
 // TestPort_IsolationSerializableParallel2 exercises serializable-parallel-2:
@@ -570,7 +570,7 @@ func TestPort_IsolationSerializableParallel2(t *testing.T) {
 	c := newCluster(t, "iso_serializable_parallel2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel-2.spec")
 }
 
 // TestPort_IsolationSerializableParallel3 exercises serializable-parallel-3:
@@ -586,7 +586,7 @@ func TestPort_IsolationSerializableParallel3(t *testing.T) {
 	c := newCluster(t, "iso_serializable_parallel3")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel-3.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel-3.spec")
 }
 
 // TestPort_IsolationUpdateConflictOut exercises update-conflict-out: SSI
@@ -597,7 +597,7 @@ func TestPort_IsolationUpdateConflictOut(t *testing.T) {
 	c := newCluster(t, "iso_update_conflict_out")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/update-conflict-out.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/update-conflict-out.spec")
 }
 
 // TestPort_IsolationMultipleRowVersions exercises the multiple-row-versions
@@ -609,7 +609,7 @@ func TestPort_IsolationMultipleRowVersions(t *testing.T) {
 	c := newCluster(t, "iso_multi_row_ver")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/multiple-row-versions.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/multiple-row-versions.spec")
 }
 
 // TestPort_IsolationPredicateLockHotTuple exercises predicate-lock-hot-tuple:
