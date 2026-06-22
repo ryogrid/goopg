@@ -1843,6 +1843,7 @@ type AlterTableAction struct {
 	Deferrable bool     // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
 	OnDelete   FKAction // referential action for ON DELETE (default NO ACTION)
 	OnUpdate   FKAction // referential action for ON UPDATE (default NO ACTION)
+	NotValid   bool     // true if `NOT VALID` (skip validation of existing rows)
 
 	// AttachPartitionOf is populated for AlterTableAttachPartition.
 	// It holds the child table name and partition bounds. M0096-0007.

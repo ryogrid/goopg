@@ -589,9 +589,27 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `<waiting ...>` marker. `TestPort_IsolationClusterConflictPartition` strict
       PASS; conflict-family siblings (cluster/vacuum/truncate-conflict) PASS;
       build+vet clean; pgbench smoke (pre-commit hook).
+      **2026-06-23 fourteenth promotion (design 0118-0046): `alter-table-2`
+      PROMOTED ⇒ all 48 permutations byte-for-byte.** Two changes: (1) the
+      `ALTER TABLE … ADD FOREIGN KEY …` parser now accepts the `NOT VALID`
+      trailer (in any order with `[NOT] DEFERRABLE [INITIALLY …]`) — new AST
+      field `AlterTableAction.NotValid`, surfaced as
+      `pg_constraint.convalidated='f'` via new `catalog.ForeignKey.NotValid`;
+      (2) the `AlterTableAddForeignKey` executor case takes a transaction-scoped
+      `ShareRowExclusiveLock` on the altered table via the existing
+      `acquireDDLLockTxn` (PG `AlterTableGetLockLevel` → `AT_AddConstraint`). The
+      standard lock matrix drives every perm: a concurrent `INSERT`
+      (RowExclusiveLock) conflicts so one of `s1b`/`s2d` waits until the other
+      commits, while `SELECT … FOR UPDATE` (RowShareLock) + plain reads proceed.
+      No-op in autocommit / for system catalogs (pg_dump-restore / HammerDB-load
+      + pgbench untouched); only the altered table is locked (the spec cannot
+      distinguish the referenced-table lock — `s2e INSERT INTO a` always follows
+      `s2d INSERT INTO b`). `TestPort_IsolationAlterTable2` strict PASS; sibling
+      alter-table-3 / create-trigger / sequence-ddl PASS; parser/executor/catalog
+      units; pgbench smoke 0-failed.
       **Remaining (deferred, ledger 2026-06-22):**
-      `alter-table-{1,2,4}`
-      (ADD/VALIDATE CONSTRAINT lock semantics; INHERITS),
+      `alter-table-{1,4}`
+      (`alter-table-1`: VALIDATE CONSTRAINT lock semantics; `alter-table-4`: INHERITS),
       per-leaf CLUSTER processing + a faithful non-owner CLUSTER `must be owner of
       table` error (no `port` spec exercises a role that owns a leaf), `reindex-concurrently-toast` (`allow_system_table_mods`
       GUC + TOAST-relation reindex), partition specs (ATTACH/DETACH PARTITION),

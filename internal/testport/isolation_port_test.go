@@ -447,6 +447,27 @@ func TestPort_IsolationAlterTable3(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-3.spec")
 }
 
+// TestPort_IsolationAlterTable2 exercises the alter-table-2 spec (M0118-0008):
+// ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID mixed with
+// concurrent writes and SELECT ... FOR UPDATE on both the referencing and
+// referenced tables.
+//
+// PASS-REQUIRED (design 0118-0046). Two changes: (1) the ALTER TABLE ADD
+// FOREIGN KEY parser now accepts the NOT VALID trailer (any order with
+// [NOT] DEFERRABLE), recording convalidated='f' in pg_constraint; (2) ADD
+// CONSTRAINT takes a transaction-scoped ShareRowExclusiveLock on the altered
+// table (AlterTableGetLockLevel → AT_AddConstraint), so a concurrent INSERT
+// (RowExclusiveLock) blocks until the ALTER transaction commits while a
+// concurrent SELECT ... FOR UPDATE (RowShareLock) proceeds. Byte-identical to
+// PG 18.3 across all 48 permutations.
+func TestPort_IsolationAlterTable2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_alter_table_2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-2.spec")
+}
+
 // TestPort_IsolationVacuumSkipLocked exercises the vacuum-skip-locked spec
 // (M0118-0008). VACUUM/ANALYZE (SKIP_LOCKED) take a conditional per-relation
 // lock: a relation held by another session is skipped — with a WARNING when

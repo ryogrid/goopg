@@ -819,6 +819,10 @@ type ForeignKey struct {
 	OnUpdate          parser.FKAction
 	Deferrable        bool
 	InitiallyDeferred bool
+	// NotValid is true when the constraint was added with NOT VALID — existing
+	// rows were not checked, so pg_constraint.convalidated is 'f' until a
+	// VALIDATE CONSTRAINT runs. M0118-0008 (alter-table-1/2).
+	NotValid bool
 }
 
 // fkActionChar maps a parsed FK referential action to the single-char code
@@ -4185,7 +4189,11 @@ func (c *InMemory) registerSystemTables() {
 				} else {
 					row[5] = "f" // condeferred
 				}
-				row[6] = "t"                        // convalidated
+				if fk.NotValid {
+					row[6] = "f" // convalidated — NOT VALID, not yet validated
+				} else {
+					row[6] = "t" // convalidated
+				}
 				row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
 				row[8] = "0"                        // contypid
 				row[9] = "0"                        // conindid (unique idx on ref tbl; unused by deparse)

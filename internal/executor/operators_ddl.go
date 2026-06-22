@@ -4962,6 +4962,23 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// column-level validation is deferred. Store the FK
 			// so TRUNCATE CASCADE BFS can find referencing tables.
 			// See docs/design/0003-0004-hammerdb-tpch-integration.md.
+			//
+			// ADD CONSTRAINT … FOREIGN KEY takes a ShareRowExclusiveLock on the
+			// table being altered (AlterTableGetLockLevel → AT_AddConstraint),
+			// which conflicts with a concurrent INSERT/UPDATE/DELETE
+			// (RowExclusiveLock, acquireWriteLockTxn) but not with reads
+			// (AccessShareLock) or SELECT … FOR UPDATE (RowShareLock). Within an
+			// open transaction the lock is held to COMMIT, so a concurrent write
+			// to the table blocks until this transaction ends while a concurrent
+			// FOR UPDATE proceeds. No-op in autocommit / for system catalogs
+			// (acquireDDLLockTxn), keeping the pg_dump-restore / HammerDB-load
+			// path lock-free. M0118-0008 (alter-table-2 isolation spec).
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = act.Pos()
+				}
+				return err
+			}
 			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable); !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
 			}
@@ -4985,6 +5002,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				OnDelete:   act.OnDelete,
 				OnUpdate:   act.OnUpdate,
 				Deferrable: act.Deferrable,
+				NotValid:   act.NotValid,
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		case parser.AlterTableAddCheck:

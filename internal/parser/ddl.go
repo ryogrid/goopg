@@ -5514,21 +5514,40 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				onUpdate = action
 			}
 		}
-		// Optional [NOT] DEFERRABLE trailer.
+		// Optional [NOT] DEFERRABLE [INITIALLY …] and/or NOT VALID trailers, in
+		// any order (PG grammar allows `… DEFERRABLE NOT VALID` etc.). `NOT VALID`
+		// (ALTER TABLE ADD FOREIGN KEY … NOT VALID) creates the constraint without
+		// checking pre-existing rows; a later VALIDATE CONSTRAINT performs the
+		// scan. M0118-0008 (alter-table-1/2 isolation specs).
 		deferrable := false
-		if p.acceptKeyword(KwNot) {
-			if _, err := p.expectKeyword(KwDeferrable); err != nil {
-				return AlterTableAction{}, err
+		notValid := false
+		for {
+			if p.acceptKeyword(KwNot) {
+				if p.acceptIdentKeyword("valid") {
+					notValid = true
+					continue
+				}
+				if _, err := p.expectKeyword(KwDeferrable); err != nil {
+					return AlterTableAction{}, err
+				}
+				deferrable = false
+				continue
 			}
-			deferrable = false
-		} else if p.acceptKeyword(KwDeferrable) {
-			deferrable = true
+			if p.acceptKeyword(KwDeferrable) {
+				deferrable = true
+				if p.acceptIdentKeyword("initially") {
+					_ = p.acceptIdentKeyword("deferred") || p.acceptIdentKeyword("immediate")
+				}
+				continue
+			}
+			break
 		}
 		act.Kind = AlterTableAddForeignKey
 		act.Columns = cols
 		act.RefTable = refTable
 		act.RefColumns = refCols
 		act.Deferrable = deferrable
+		act.NotValid = notValid
 		act.OnDelete = onDelete
 		act.OnUpdate = onUpdate
 		return act, nil
