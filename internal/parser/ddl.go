@@ -5324,14 +5324,17 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 	// DETACH PARTITION child [CONCURRENTLY|FINALIZE]
 	if p.acceptIdentKeyword("detach") {
 		_ = p.acceptKeyword(KwPartition)
-		// Accept optional CONCURRENTLY / FINALIZE (PG14+) — ignored for now.
-		p.acceptIdentKeyword("concurrently")
-		p.acceptIdentKeyword("finalize")
 		childName, err := p.parseObjectName()
 		if err != nil {
 			return AlterTableAction{}, err
 		}
-		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableDetachPartition, DetachPartitionChild: childName}, nil
+		// The optional CONCURRENTLY / FINALIZE trailer (PG14+) follows the
+		// child name, not precedes it. CONCURRENTLY is recorded for the
+		// (deferred) two-phase detach; FINALIZE is accepted and ignored. The
+		// executor performs a synchronous detach in either case for now.
+		concurrently := p.acceptIdentKeyword("concurrently")
+		p.acceptIdentKeyword("finalize")
+		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableDetachPartition, DetachPartitionChild: childName, DetachConcurrently: concurrently}, nil
 	}
 	// INHERIT parent_table (M0097-0048)
 	if p.acceptIdentKeyword("inherit") {

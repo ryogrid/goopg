@@ -603,9 +603,25 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       ADD CONSTRAINT's `ShareRowExclusiveLock` — exactly as alter-table-2.
       `TestPort_IsolationAlterTable1` strict PASS; sibling alter-table-2/3 strict
       PASS; parser/executor units; `go vet` clean.
+      **2026-06-23 enabler (design 0118-0048, NOT a promotion):** fixed a
+      `DETACH PARTITION child CONCURRENTLY`/`FINALIZE` parser-position bug — the
+      optional trailer was consumed BEFORE the child name, so the valid form
+      failed with `syntax error … (got concurrently)` and aborted step
+      `s2detach` of all four `detach-partition-concurrently-{1,2,3,4}` specs.
+      Moved the trailer accept after `parseObjectName`; new AST field
+      `AlterTableAction.DetachConcurrently`; FINALIZE accepted+ignored; executor
+      unchanged (synchronous detach). Probe confirms detach-1's first divergence
+      moved syntax-error → the unmodelled `<waiting ...>` concurrent-wait marker
+      (post-detach SELECT rows now correct). Full promotion still deferred on the
+      Effort-L two-phase concurrent-detach + transactional-DDL cross-session
+      catalog visibility. `TestParseAlterTableDetachPartition` PASS.
       **Remaining (deferred):** `alter-table-4` (INHERITS + transactional-DDL
-      cross-session visibility), `reindex-concurrently-toast`, partition
-      ATTACH/DETACH, `plpgsql-toast`. Group stays open.
+      cross-session visibility), `detach-partition-concurrently-{1,2,3,4}` +
+      `partition-concurrent-attach` (transactional partition visibility),
+      `partition-drop-index-locking` (pg_locks view parity),
+      `reindex-concurrently-toast` (toast relations as catalog objects +
+      `allow_system_table_mods`), `plpgsql-toast` (COMMIT in DO + detoast).
+      Group stays open.
       **2026-06-23 fourteenth promotion (design 0118-0046): `alter-table-2`
       PROMOTED ⇒ all 48 permutations byte-for-byte.** Two changes: (1) the
       `ALTER TABLE … ADD FOREIGN KEY …` parser now accepts the `NOT VALID`

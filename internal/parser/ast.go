@@ -1908,6 +1908,12 @@ type AlterTableAction struct {
 	// DetachPartitionChild is populated for AlterTableDetachPartition and
 	// holds the child table name. M0097-0028.
 	DetachPartitionChild ObjectName
+	// DetachConcurrently records the `CONCURRENTLY` trailer on
+	// `DETACH PARTITION child CONCURRENTLY` (PG14+). The trailer follows the
+	// child name; it is recorded here so the (deferred) two-phase concurrent
+	// detach semantics can branch on it. The executor currently performs a
+	// synchronous detach regardless. M0118-0008.
+	DetachConcurrently bool
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

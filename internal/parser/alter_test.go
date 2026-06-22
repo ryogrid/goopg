@@ -521,3 +521,41 @@ func TestParseAlterTableSetColumnOptions(t *testing.T) {
 		}
 	}
 }
+
+// TestParseAlterTableDetachPartition pins the partition-DETACH grammar,
+// including the PG14+ `CONCURRENTLY` / `FINALIZE` trailer that follows the
+// child name. A prior bug accepted the trailer BEFORE the child name, so the
+// valid form `DETACH PARTITION child CONCURRENTLY` failed with a syntax error
+// (the unconsumed CONCURRENTLY token) — the very first step of every
+// detach-partition-concurrently isolation spec. M0118-0008.
+func TestParseAlterTableDetachPartition(t *testing.T) {
+	cases := []struct {
+		sql         string
+		wantChild   string
+		wantConcurr bool
+	}{
+		{"ALTER TABLE d_listp DETACH PARTITION d_listp2", "d_listp2", false},
+		{"ALTER TABLE d_listp DETACH PARTITION d_listp2 CONCURRENTLY", "d_listp2", true},
+		{"ALTER TABLE d_listp DETACH PARTITION d_listp2 FINALIZE", "d_listp2", false},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableDetachPartition {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		act := at.Actions[0]
+		if got := act.DetachPartitionChild.String(); got != tc.wantChild {
+			t.Errorf("Parse(%q): child=%q want %q", tc.sql, got, tc.wantChild)
+		}
+		if act.DetachConcurrently != tc.wantConcurr {
+			t.Errorf("Parse(%q): concurrently=%v want %v", tc.sql, act.DetachConcurrently, tc.wantConcurr)
+		}
+	}
+}
