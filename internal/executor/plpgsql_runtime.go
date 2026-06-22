@@ -121,6 +121,63 @@ func (f *plpgsqlFrame) lookup(name string) (int, bool) {
 	return idx, ok
 }
 
+// isRecordVar reports whether the named PL/pgSQL variable is a record or
+// composite-type variable (as opposed to a plain scalar). Such a variable, when
+// bound from a query row, must hold a `(c0,c1,…)` composite value — even for a
+// single-column query — so that `var::text` reassembles the composite framing
+// the way PostgreSQL's expanded-record representation does. M0118-0008
+// (plpgsql-toast assign5/6).
+func (f *plpgsqlFrame) isRecordVar(name string) bool {
+	key := strings.ToLower(strings.TrimSpace(name))
+	if idx, ok := f.indexByName[key]; ok && strings.EqualFold(f.types[idx].Name, "record") {
+		return true
+	}
+	return len(f.compositeVarFields[key]) > 0
+}
+
+// bindRecordRowComposite binds a query result row to a record/composite PL/pgSQL
+// variable. It (1) registers the per-column `_<var>_<col>` sub-fields used for
+// field access (r.a), (2) binds the variable itself to a single `(c0,c1,…)`
+// composite Datum, and (3) records its field schema, so that `r.field` reads,
+// `r.field := …` field assignment, and `r::text` reassembly all observe the row.
+// Mirrors PostgreSQL's expanded-record representation; shared by SELECT … INTO
+// (bindSelectIntoRow) and the record FOR-loop binding. M0118-0008
+// (plpgsql-toast assign3/4/5/6).
+func bindRecordRowComposite(varName string, row Row, schema planner.Schema, frame *plpgsqlFrame) {
+	name := strings.ToLower(varName)
+	for i, sc := range schema {
+		colKey := "_" + name + "_" + strings.ToLower(sc.Name)
+		val := NullDatum
+		if i < len(row) {
+			val = row[i]
+		}
+		if idx, ok := frame.indexByName[colKey]; ok {
+			frame.values[idx] = val
+		} else {
+			_ = frame.add(colKey, sc.Type, val)
+		}
+	}
+	idx, ok := frame.indexByName[name]
+	if !ok {
+		return
+	}
+	if len(row) == 0 {
+		// No row: the record stays NULL (FOUND=false), like PG.
+		frame.values[idx] = NullDatum
+		return
+	}
+	parts := make([]string, len(schema))
+	cf := make([]catalog.CompositeField, len(schema))
+	for i, sc := range schema {
+		if i < len(row) && !row[i].IsNull() {
+			parts[i] = row[i].Format()
+		}
+		cf[i] = catalog.CompositeField{Name: sc.Name, ColType: sc.Type.Name}
+	}
+	frame.values[idx] = NewStringDatum("(" + strings.Join(parts, ",") + ")")
+	frame.compositeVarFields[name] = cf
+}
+
 // bindSelectIntoRow binds a SELECT … INTO result row to its PL/pgSQL target
 // variable(s), mirroring the FOR-loop record/scalar binding conventions:
 //   - a single target with a single-column row binds directly to the scalar
@@ -146,37 +203,7 @@ func bindSelectIntoRow(targets []string, row Row, schema planner.Schema, frame *
 				return
 			}
 		}
-		for i, sc := range schema {
-			colKey := "_" + name + "_" + strings.ToLower(sc.Name)
-			val := NullDatum
-			if i < len(row) {
-				val = row[i]
-			}
-			if idx, ok := frame.indexByName[colKey]; ok {
-				frame.values[idx] = val
-			} else {
-				_ = frame.add(colKey, sc.Type, val)
-			}
-		}
-		// Also bind the record/composite variable itself to a single composite
-		// Datum and register its field schema, so that `r.field` reads,
-		// `r.field := …` field assignment, and `r::text` reassembly observe the
-		// SELECT INTO result. Before this, a `select * into r` only populated the
-		// `_r_<col>` sub-fields, leaving the record variable NULL — so `r::text`
-		// rendered NULL. M0118-0008 (plpgsql-toast assign3,
-		// expanded_record_set_field).
-		if idx, ok := frame.indexByName[name]; ok && len(row) > 0 {
-			parts := make([]string, len(schema))
-			cf := make([]catalog.CompositeField, len(schema))
-			for i, sc := range schema {
-				if i < len(row) && !row[i].IsNull() {
-					parts[i] = row[i].Format()
-				}
-				cf[i] = catalog.CompositeField{Name: sc.Name, ColType: sc.Type.Name}
-			}
-			frame.values[idx] = NewStringDatum("(" + strings.Join(parts, ",") + ")")
-			frame.compositeVarFields[name] = cf
-		}
+		bindRecordRowComposite(name, row, schema, frame)
 		return
 	}
 	for i, tgt := range targets {
@@ -1629,9 +1656,16 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			if slot != nil && slot.Schema() != nil {
 				row := slotRow(slot)
 				schema := slot.Schema()
-				// Scalar shortcut: if varName exists in frame and the query
-				// returns one column, assign directly to varName.
-				if len(schema) == 1 {
+				// Record/composite loop variable: bind the whole row as a
+				// `(c0,c1,…)` composite Datum (plus `_<var>_<col>` sub-fields for
+				// field access) so `r::text` reassembles the composite framing —
+				// even for a single-column query. Without this a single-column
+				// record loop var held the raw column value, so `length(r::text)`
+				// was the value length, not the composite length. M0118-0008
+				// (plpgsql-toast assign5/6).
+				if frame.isRecordVar(varName) {
+					bindRecordRowComposite(varName, row, schema, frame)
+				} else if len(schema) == 1 {
 					if idx, ok := frame.indexByName[varName]; ok {
 						if len(row) > 0 {
 							frame.values[idx] = row[0]
