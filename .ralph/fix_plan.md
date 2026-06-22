@@ -249,7 +249,18 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (b) `deadlock-parallel` needs a lock-group abstraction goopg lacks — defer.
 - [ ] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,
-      temporal-range-integrity.
+      temporal-range-integrity. **PARTIAL (2026-06-22, design 0118-0023):** five
+      specs promoted to pass-required (strict) with NO engine change —
+      `referential-integrity`, `temporal-range-integrity`, `fk-snapshot`,
+      `fk-contention`, `fk-deadlock2` already match PG 18.3 (FK KEY-SHARE-vs-non-key-
+      UPDATE non-conflict rides the M0118-0003/0004 multixact lock-only producer; SSI
+      specs ride the 40001 machinery). Switched 3 dedicated tests soft→`runIsoSpecStrict`
+      + added `TestPort_IsolationFk{Contention,Deadlock2}`. **Remaining (deferred,
+      ledger 2026-06-22):** `fk-deadlock` (goopg's FK-check KEY SHARE wait
+      over-conflicts — INSERT-into-child blocks where PG proceeds; needs a
+      non-conflicting KEY-SHARE join on the wait path), `ri-trigger` (user RI
+      constraint-trigger firing), `fk-partitioned-1/2` (`ALTER TABLE ATTACH
+      PARTITION` + partitioned-FK enforcement). Group stays open until those land.
 - [x] **M0118-0006** — MERGE & INSERT ON CONFLICT output parity: merge-{update,delete,
       insert-update,match-recheck,join}, insert-conflict-do-update-{2,3,4},
       insert-conflict-specconflict, insert-conflict-do-nothing-2. **COMPLETE

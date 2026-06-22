@@ -319,7 +319,7 @@ func TestPort_IsolationFkSnapshot(t *testing.T) {
 	c := newCluster(t, "iso_fk_snapshot")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/fk-snapshot.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-snapshot.spec")
 }
 
 // TestPort_IsolationPartitionKeyUpdate1 exercises the partition-key-update-1 spec.
@@ -640,7 +640,7 @@ func TestPort_IsolationTemporalRangeIntegrity(t *testing.T) {
 	c := newCluster(t, "iso_temporal_range")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/temporal-range-integrity.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/temporal-range-integrity.spec")
 }
 
 // TestPort_IsolationReferentialIntegrity exercises referential-integrity: a
@@ -655,7 +655,37 @@ func TestPort_IsolationReferentialIntegrity(t *testing.T) {
 	c := newCluster(t, "iso_referential_integrity")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/referential-integrity.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/referential-integrity.spec")
+}
+
+// TestPort_IsolationFkContention exercises fk-contention: a child INSERT takes a
+// FOR KEY SHARE row lock on its referenced parent row to enforce the FK while a
+// concurrent session repeatedly UPDATEs a *non-key* parent column. The non-key
+// UPDATE and the FK KEY SHARE lock do not conflict (the multixact lock-only +
+// no-key-update producer landed in M0118-0003/0004), so neither session blocks
+// and the output matches PG 18.3 byte-for-byte. Promoted to pass-required
+// (M0118-0005, design 0118-0023).
+func TestPort_IsolationFkContention(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_fk_contention")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-contention.spec")
+}
+
+// TestPort_IsolationFkDeadlock2 exercises fk-deadlock2: two sessions each insert
+// a child row (taking FOR KEY SHARE on the shared parent — non-conflicting, so
+// both proceed via a multixact lock set) and then UPDATE disjoint parent rows.
+// No lock cycle forms, so both commit without a deadlock abort, matching PG 18.3.
+// The sibling fk-deadlock spec (where the parent UPDATEs *do* form a cycle)
+// remains deferred — goopg's FK row-lock wait over-conflicts there (ledger
+// 2026-06-22). Promoted to pass-required (M0118-0005, design 0118-0023).
+func TestPort_IsolationFkDeadlock2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_fk_deadlock2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-deadlock2.spec")
 }
 
 // TestPort_IsolationIndexOnlyScan exercises the index-only-scan spec: a
