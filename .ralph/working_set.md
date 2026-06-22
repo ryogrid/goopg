@@ -1,32 +1,32 @@
 (idle — nothing in flight)
 
-Loop #37: PROMOTED `vacuum-conflict` (16 perms) + `cluster-conflict` (2 perms)
-(M0118-0008 eleventh promotion, design 0118-0040, second/third of the `*-conflict`
-family) — both byte-for-byte vs PG 18.3.
+Loop #39: PROMOTED `cluster-conflict-partition` (4 perms) — M0118-0008 twelfth
+promotion, partitioned sibling of `cluster-conflict`, byte-for-byte vs PG 18.3
+with NO engine change (design 0118-0041).
 
-Ownership-based maintenance privilege (unlike truncate-conflict's grantable priv):
-1. New `catalog.Table.Owner` (role name; empty = bootstrap superuser OID 10;
-   pg_class.relowner output unchanged — field is check-only).
-2. `ALTER TABLE … OWNER TO role` records the owner: parser captures into
-   `AlterTableStmt.OwnerTo` (was discarded at ddl.go main ALTER path); executor
-   `execAlterTable` sets `tbl.Owner` + takes txn-scoped AccessExclusiveLock
-   (no-op in autocommit — how the spec issues the grant). `current_user` sentinel
-   → empty owner (bootstrap superuser).
-3. `maintenancePermitted(ctx,tbl)` (operators_vacuum.go): superuser (NonSuperuserRole=="")
-   always OK; else owner match (EqualFold) or HasTablePrivilege MAINTAIN. Wired into
-   the EXPLICIT-target loop of expandVacuumTargets + expandAnalyzeTargets BEFORE any
-   lock (mirrors expand_vacuum_rel no-lock pg_class ACL check) ⇒ unprivileged target
-   skipped with `WARNING: permission denied to vacuum/analyze "X", skipping it`, no wait.
-4. `clusterOp.Next` (operators_cluster.go) now takes a blocking AccessExclusiveLock
-   via acquireRelLockMaybeTransient so CLUSTER waits behind SHARE UPDATE EXCLUSIVE.
+Key insight: `ALTER TABLE … OWNER TO` does NOT recurse to partition children
+(`tablecmds.c` `AT_ChangeOwner` "never recurses") so only the parent is owned by
+the role. Upstream CLUSTER locks the PARENT AccessExclusive (waits behind a
+concurrent `LOCK … IN SHARE UPDATE EXCLUSIVE MODE` on the parent then completes —
+perms 1/2), then enumerates leaves WITHOUT locking them and skips every leaf the
+role does not own (WARNING suppressed by `client_min_messages=ERROR`), so a
+locked leaf is never touched and CLUSTER returns immediately (perms 3/4).
+goopg's no-op `clusterOp.Next` locks only the named parent and never processes
+leaves → output matches by both routes. Probe (zz_probe_test.go, deleted)
+returned status=pass empty-diff immediately → free promotion.
 
-Gates green: TestPort_IsolationVacuumConflict + ClusterConflict strict; all sibling
-M0118-0008 specs (truncate-conflict/vacuum-skip-locked/vacuum-concurrent-drop/
-create-trigger/sequence-ddl/reindex-*/inherit-temp); -race executor+catalog;
-parser units; pgbench smoke 0-failed ~15.2k TPS. Design 0118-0040 + README + CSV/MD
-port-status (D-002 rationale) + fix_plan + ledger updated.
+Files: internal/testport/isolation_port_test.go (+TestPort_IsolationClusterConflictPartition);
+docs/design/0118-0041 + README; port-status.csv D-002 rationale (comma-free!) +
+regen port-status.md/target-inventory.md/upstream-isolation-coverage.md;
+fix_plan + ledger.
 
-Next step: M0118-0008 tail — `cluster-conflict-partition` (per-child lock enumeration)
-is the closest sibling to this loop's work. Then `alter-table-{1,2,4}` (ADD/VALIDATE
-CONSTRAINT lock semantics), partition ATTACH/DETACH specs, reindex-concurrently-toast,
-vacuum-no-cleanup-lock, plpgsql-toast.
+Gates: new strict test PASS; conflict-family siblings (cluster/vacuum/truncate-
+conflict) PASS; build+vet clean; pgbench smoke = pre-commit hook.
+
+Next step: M0118-0008 tail. Closest remaining: `alter-table-{1,2,4}` (ADD/VALIDATE
+CONSTRAINT lock semantics; INHERITS), partition ATTACH/DETACH specs
+(detach-partition-concurrently-{1,2,3,4}, partition-concurrent-attach,
+partition-drop-index-locking), `reindex-concurrently-toast`
+(allow_system_table_mods GUC + TOAST reindex), `vacuum-no-cleanup-lock`
+(reltuples accounting + cursor pin), `plpgsql-toast`. Probe-first each
+(zz_probe_test.go → RunAndCompare .Diff) and rank by first-divergence cost.

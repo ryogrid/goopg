@@ -559,12 +559,28 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       TPC-H unchanged). `TestPort_IsolationVacuumConflict`/`ClusterConflict` strict
       PASS; sibling M0118-0008 specs PASS; `-race` executor/catalog; catalog/
       parser/executor units; pgbench smoke 0-failed ~15.2k TPS.
+      **2026-06-23 twelfth promotion (design 0118-0041): `cluster-conflict-partition`
+      (4 perms) PROMOTED — partitioned sibling of `cluster-conflict`, NO engine
+      change.** `ALTER TABLE … OWNER TO` does NOT recurse to partition children
+      (`tablecmds.c` `AT_ChangeOwner` "never recurses") so only the parent is owned
+      by the role. Upstream CLUSTER takes an `AccessExclusiveLock` on the named
+      PARENT (waits behind a concurrent `LOCK … IN SHARE UPDATE EXCLUSIVE MODE` on
+      the parent then completes on commit — perms 1/2) and enumerates leaves WITHOUT
+      locking them, skipping every leaf the role does not own
+      (`cluster_is_permitted_for_relation` false; WARNING suppressed by
+      `client_min_messages=ERROR`) so a leaf held in SHARE UPDATE EXCLUSIVE is never
+      touched and CLUSTER returns immediately (perms 3/4). goopg's `clusterOp.Next`
+      (no-op rewrite, 0118-0040) locks only the named parent and never processes
+      leaves, so the captured output is byte-identical by both routes; the runner's
+      300 ms timing threshold renders the immediate-completion perms without a
+      `<waiting ...>` marker. `TestPort_IsolationClusterConflictPartition` strict
+      PASS; conflict-family siblings (cluster/vacuum/truncate-conflict) PASS;
+      build+vet clean; pgbench smoke (pre-commit hook).
       **Remaining (deferred, ledger 2026-06-22):**
       `alter-table-{1,2,4}`
       (ADD/VALIDATE CONSTRAINT lock semantics; INHERITS),
-      `cluster-conflict-partition` (CLUSTER of a partitioned table — per-child
-      lock) + a faithful non-owner CLUSTER `must be owner of table` error (no
-      `port` spec exercises it), `reindex-concurrently-toast` (`allow_system_table_mods`
+      per-leaf CLUSTER processing + a faithful non-owner CLUSTER `must be owner of
+      table` error (no `port` spec exercises a role that owns a leaf), `reindex-concurrently-toast` (`allow_system_table_mods`
       GUC + TOAST-relation reindex), partition specs (ATTACH/DETACH PARTITION),
       `vacuum-no-cleanup-lock` (reltuples accounting), `plpgsql-toast` (TOAST in
       PL/pgSQL). FK/MERGE/VACUUM inherit-temp filtering (bounded follow-up). Group

@@ -506,6 +506,30 @@ func TestPort_IsolationClusterConflict(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/cluster-conflict.spec")
 }
 
+// TestPort_IsolationClusterConflictPartition exercises the
+// cluster-conflict-partition spec (M0118-0008). CLUSTER of a partitioned table
+// owned by the test role (ALTER TABLE OWNER TO does NOT recurse to partition
+// children — tablecmds.c AT_ChangeOwner "never recurses") behaves as:
+//   - CLUSTER takes an AccessExclusiveLock on the named PARENT, so it blocks
+//     behind a concurrent LOCK cluster_part_tab IN SHARE UPDATE EXCLUSIVE MODE
+//     and completes once the holder commits (permutations 1, 2).
+//   - When only a partition LEAF is locked, CLUSTER never touches it: upstream
+//     skips every leaf the role does not own (the children stay owned by the
+//     bootstrap superuser; cluster_is_permitted_for_relation returns false, the
+//     WARNING suppressed by client_min_messages=ERROR), and goopg's CLUSTER is a
+//     no-op rewrite that only locks the named parent — so the locked leaf is
+//     irrelevant and CLUSTER completes immediately (permutations 3, 4).
+//
+// Byte-identical to PG 18.3 with no engine change (rides the cluster-conflict
+// AccessExclusiveLock from design 0118-0040 + existing partition catalog).
+func TestPort_IsolationClusterConflictPartition(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_cluster_conflict_partition")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/cluster-conflict-partition.spec")
+}
+
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
 // Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
 func TestPort_IsolationFkSnapshot(t *testing.T) {
