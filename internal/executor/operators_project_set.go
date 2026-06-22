@@ -113,8 +113,9 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 
 		// 2. Evaluate each generate_series SRF and collect series values.
 		type seriesResult struct {
-			colIdx int
-			vals   []int64
+			colIdx  int
+			vals    []int64
+			wrapped bool // raw value goes into the eval row, not the output row
 		}
 		genResults := make([]seriesResult, len(o.plan.SrfCols))
 		maxLen := 0
@@ -150,7 +151,7 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 					vals = append(vals, v)
 				}
 			}
-			genResults[k] = seriesResult{colIdx: sc.ColIdx, vals: vals}
+			genResults[k] = seriesResult{colIdx: sc.ColIdx, vals: vals, wrapped: sc.Wrapped}
 			if len(vals) > maxLen {
 				maxLen = len(vals)
 			}
@@ -221,14 +222,28 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 		}
 
 		// 3. Zip: emit maxLen rows, null-padding shorter series.
+		hasWrappers := len(o.plan.Wrappers) > 0
 		for step := 0; step < maxLen; step++ {
 			outRow := make(Row, n)
 			copy(outRow, otherVals)
+			// Eval row for nested-SRF wrappers: child row in [0:ChildWidth),
+			// wrapped-SRF per-step raw values in the temp slots above. M0118-0008.
+			var evalRow Row
+			if hasWrappers {
+				evalRow = make(Row, o.plan.EvalRowWidth)
+				copy(evalRow, childRow)
+			}
 			for _, sr := range genResults {
+				var val Datum
 				if step < len(sr.vals) {
-					outRow[sr.colIdx] = NewIntDatum(sr.vals[step])
+					val = NewIntDatum(sr.vals[step])
 				} else {
-					outRow[sr.colIdx] = Datum{} // NULL
+					val = Datum{} // NULL
+				}
+				if sr.wrapped {
+					evalRow[sr.colIdx] = val
+				} else {
+					outRow[sr.colIdx] = val
 				}
 			}
 			for _, unnr := range unnestResults {
@@ -244,6 +259,15 @@ func (o *projectSetOp) openSelectSrfMode(ctx *Context) error {
 				} else {
 					outRow[ur.colIdx] = Datum{} // NULL
 				}
+			}
+			// Apply nested-SRF wrappers: each reads its SRF's per-step value
+			// from evalRow and writes the enclosing scalar result. M0118-0008.
+			for _, w := range o.plan.Wrappers {
+				d, werr := evalExpr(w.Expr, evalRow, ctx)
+				if werr != nil {
+					return werr
+				}
+				outRow[w.OutCol] = d
 			}
 			o.rows = append(o.rows, outRow)
 		}

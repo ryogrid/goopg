@@ -2794,6 +2794,92 @@ func projectSetCompositeSchema(name string) Schema {
 	return nil
 }
 
+// isNestedSRFName reports whether fname is a built-in set-returning function
+// that buildSelectSrfProjectSet expands when it appears nested inside a larger
+// SELECT-list target expression (e.g. `generate_series(1,n) % 4`). Limited to
+// generate_series for now; bare and FROM-clause SRFs keep their existing paths.
+// M0118-0008.
+func isNestedSRFName(fname string) bool {
+	return strings.EqualFold(fname, "generate_series")
+}
+
+// findFirstNestedSRF returns the first set-returning FuncCall (DFS) inside a
+// resolved SELECT-list target expression, or nil when none is present. It walks
+// the same node kinds as replaceExprNode so the two stay in lockstep. M0118-0008.
+func findFirstNestedSRF(e Expr) *FuncCall {
+	switch x := e.(type) {
+	case *FuncCall:
+		if isNestedSRFName(x.Name) {
+			return x
+		}
+		for _, a := range x.Args {
+			if f := findFirstNestedSRF(a); f != nil {
+				return f
+			}
+		}
+	case *BinaryOp:
+		if f := findFirstNestedSRF(x.Left); f != nil {
+			return f
+		}
+		return findFirstNestedSRF(x.Right)
+	case *UnaryOp:
+		return findFirstNestedSRF(x.Operand)
+	case *CastExpr:
+		return findFirstNestedSRF(x.Operand)
+	case *CollateExpr:
+		return findFirstNestedSRF(x.Operand)
+	case *CaseExpr:
+		if f := findFirstNestedSRF(x.Operand); f != nil {
+			return f
+		}
+		for _, w := range x.Whens {
+			if f := findFirstNestedSRF(w.When); f != nil {
+				return f
+			}
+			if f := findFirstNestedSRF(w.Then); f != nil {
+				return f
+			}
+		}
+		return findFirstNestedSRF(x.Else)
+	}
+	return nil
+}
+
+// replaceExprNode returns a copy of e with the node target (matched by pointer
+// identity) replaced by repl. Mirrors findFirstNestedSRF's node coverage and
+// shiftColumnRefsBy's rebuild discipline. M0118-0008.
+func replaceExprNode(e Expr, target Expr, repl Expr) Expr {
+	if e == nil {
+		return nil
+	}
+	if e == target {
+		return repl
+	}
+	switch x := e.(type) {
+	case *FuncCall:
+		args := make([]Expr, len(x.Args))
+		for i, a := range x.Args {
+			args[i] = replaceExprNode(a, target, repl)
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
+	case *BinaryOp:
+		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: replaceExprNode(x.Left, target, repl), Right: replaceExprNode(x.Right, target, repl), ResultType: x.ResultType}
+	case *UnaryOp:
+		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: replaceExprNode(x.Operand, target, repl)}
+	case *CastExpr:
+		return &CastExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+	case *CollateExpr:
+		return &CollateExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), CollationName: x.CollationName}
+	case *CaseExpr:
+		whens := make([]CaseWhen, len(x.Whens))
+		for i, w := range x.Whens {
+			whens[i] = CaseWhen{When: replaceExprNode(w.When, target, repl), Then: replaceExprNode(w.Then, target, repl)}
+		}
+		return &CaseExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), Whens: whens, Else: replaceExprNode(x.Else, target, repl)}
+	}
+	return e
+}
+
 // buildSelectSrfProjectSet detects generate_series(...) and user-defined SETOF
 // function calls in the SELECT target list and wraps the child node in a
 // ProjectSet that expands the SRFs. Multiple SRF calls are "zipped" together
@@ -2873,10 +2959,6 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			}
 		}
 	}
-	if len(srfs) == 0 && len(unnests) == 0 && len(userSrfs) == 0 {
-		return nil, nil
-	}
-
 	// Build per-column resolved expressions.
 	srfColMap := make(map[int]bool, len(srfs)+len(unnests)+len(userSrfs))
 	for _, e := range srfs {
@@ -2889,10 +2971,70 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		srfColMap[e.colIdx] = true
 	}
 
+	// Detect a set-returning function nested inside a larger SELECT-list target
+	// expression (e.g. `generate_series(1,n) % 4`). Such a target is not a bare
+	// SRF FuncCall, so the loop above skipped it and the normal scalar path
+	// would collapse the SRF to its start value — silently dropping rows
+	// (M0118-0008). We resolve the target, locate the nested SRF, and rewrite it
+	// into a wrapper expression that reads the SRF's expanded per-step value from
+	// a temp eval-row slot.
+	type wrappedSRF struct {
+		expr    Expr      // wrapper expr (SRF replaced by a ColumnRef temp slot)
+		srfNode *FuncCall // the nested SRF call (resolved args reused verbatim)
+		slotIdx int       // temp eval-row slot holding the raw per-step SRF value
+	}
+	childWidth := 0
+	if child != nil {
+		childWidth = len(child.Output())
+	}
+	wrapped := make(map[int]wrappedSRF)
+	wrapSlot := 0
+	for i, t := range s.Targets {
+		if srfColMap[i] {
+			continue
+		}
+		var resolved Expr
+		var rerr error
+		if agg != nil {
+			resolved, rerr = resolveExprAfterAggregate(t.Expr, agg)
+		} else {
+			resolved, rerr = resolveExpr(t.Expr, ctx)
+		}
+		if rerr != nil {
+			continue // let the normal target-resolution path report the error
+		}
+		srfNode := findFirstNestedSRF(resolved)
+		if srfNode == nil {
+			continue
+		}
+		if len(srfNode.Args) < 2 || len(srfNode.Args) > 3 { // generate_series arity
+			continue
+		}
+		slotIdx := childWidth + wrapSlot
+		repl := &ColumnRef{pos: srfNode.Pos(), Index: slotIdx, Name: strings.ToLower(srfNode.Name), Type: catalog.Type{Name: "int8"}}
+		wrapped[i] = wrappedSRF{expr: replaceExprNode(resolved, srfNode, repl), srfNode: srfNode, slotIdx: slotIdx}
+		wrapSlot++
+	}
+
+	if len(srfs) == 0 && len(unnests) == 0 && len(userSrfs) == 0 && len(wrapped) == 0 {
+		return nil, nil
+	}
+
 	schema := make(Schema, len(s.Targets))
 	otherExprs := make([]Expr, len(s.Targets))
 	for i, t := range s.Targets {
 		alias := t.Alias
+		if w, isWrapped := wrapped[i]; isWrapped {
+			// Nested-SRF column: the output is the enclosing wrapper expression
+			// (the raw SRF value lives in a temp eval-row slot). M0118-0008.
+			name := alias
+			if name == "" {
+				name = exprOutputName(t.Expr)
+			}
+			schema[i] = SchemaColumn{Name: name, Type: exprType(w.expr)}
+			otherExprs[i] = nil // filled by the wrapper, not as a passthrough
+			continue
+		}
 		if srfColMap[i] {
 			// SRF column: determine output name and type.
 			name := alias
@@ -3050,14 +3192,30 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		userSrfCols[k] = UserSrfCol{ColIdx: u.colIdx, FuncPos: u.fc.Pos(), Args: resolvedArgs, Routine: u.routine}
 	}
 
+	// Nested-SRF wrappers: each expands a generate_series into its temp slot
+	// (Wrapped: true → executor writes the raw value to the eval row, not the
+	// output row) and applies the enclosing scalar expression. M0118-0008.
+	wrappers := make([]SrfWrapper, 0, len(wrapped))
+	for i, w := range wrapped {
+		sc := SrfCol{ColIdx: w.slotIdx, Start: w.srfNode.Args[0], Stop: w.srfNode.Args[1], Wrapped: true}
+		if len(w.srfNode.Args) == 3 {
+			sc.Step = w.srfNode.Args[2]
+		}
+		srfCols = append(srfCols, sc)
+		wrappers = append(wrappers, SrfWrapper{OutCol: i, Expr: w.expr})
+	}
+
 	return &ProjectSet{
-		pos:         s.Pos(),
-		Child:       child,
-		SrfCols:     srfCols,
-		UnnestCols:  unnestCols,
-		UserSrfCols: userSrfCols,
-		OtherExprs:  otherExprs,
-		schema:      schema,
+		pos:          s.Pos(),
+		Child:        child,
+		SrfCols:      srfCols,
+		UnnestCols:   unnestCols,
+		UserSrfCols:  userSrfCols,
+		OtherExprs:   otherExprs,
+		schema:       schema,
+		Wrappers:     wrappers,
+		ChildWidth:   childWidth,
+		EvalRowWidth: childWidth + wrapSlot,
 	}, nil
 }
 

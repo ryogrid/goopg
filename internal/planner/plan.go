@@ -1045,6 +1045,12 @@ type SrfCol struct {
 	Start  Expr // generate_series start arg
 	Stop   Expr // generate_series stop arg
 	Step   Expr // generate_series step arg (nil → step 1)
+	// Wrapped marks an SRF that feeds an enclosing scalar expression (e.g.
+	// `generate_series(1,n) % 4`). When true the executor writes the raw
+	// per-step SRF value into the eval row at ColIdx (a temp slot beyond the
+	// child width, NOT a visible output column) so the matching ProjectSet
+	// wrapper expression can reference it via a ColumnRef. M0118-0008.
+	Wrapped bool
 }
 
 // UnnestCol represents an unnest(array) SRF column in a SELECT list. M0097-0106.
@@ -1052,6 +1058,20 @@ type UnnestCol struct {
 	ColIdx   int    // which output column this SRF fills
 	ArrExpr  Expr   // the array argument
 	CastType string // cast each element to this type (e.g. "int4"), empty=no cast. M0097-0035.
+	// Wrapped: see SrfCol.Wrapped. M0118-0008.
+	Wrapped bool
+}
+
+// SrfWrapper applies an enclosing scalar expression to a set-returning function
+// nested inside a SELECT-list target (e.g. `generate_series(1,n) % 4`). Expr is
+// the resolved target expression with the SRF call replaced by a ColumnRef that
+// reads the SRF's expanded per-step value from the eval row; the result is
+// written to output column OutCol. Without this, a SELECT-list SRF buried in an
+// expression collapsed to a single scalar (the SRF's start value), silently
+// dropping rows. M0118-0008.
+type SrfWrapper struct {
+	OutCol int  // visible output column to write
+	Expr   Expr // wrapper expression referencing the SRF value via a ColumnRef
 }
 
 // UserSrfCol describes one user-defined SETOF SQL function call in the SELECT
@@ -1078,6 +1098,14 @@ type ProjectSet struct {
 	UnnestCols  []UnnestCol  // one per unnest(array) call in target list. M0097-0106.
 	UserSrfCols []UserSrfCol // one per user-defined SETOF function call. M0097-0020.
 	OtherExprs  []Expr       // non-SRF target expressions; nil slot = SRF slot
+	// Wrappers hold enclosing scalar expressions over a nested SRF (e.g.
+	// `generate_series(1,n) % 4`). When non-empty the executor builds a
+	// per-step eval row of width EvalRowWidth (child row in [0:ChildWidth),
+	// wrapped-SRF raw values in temp slots above) and evaluates each wrapper
+	// against it. M0118-0008.
+	Wrappers     []SrfWrapper
+	ChildWidth   int // width of the child schema; base index of wrapped-SRF temp slots
+	EvalRowWidth int // ChildWidth + number of wrapped SRFs (eval-row size)
 }
 
 func (n *ProjectSet) Pos() int       { return n.pos }
