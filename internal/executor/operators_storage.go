@@ -2074,15 +2074,59 @@ func effectiveWriterXID(ctx *Context) storage.TransactionID {
 }
 
 func stampUpdaterXmaxPreservingLockers(ctx *Context, hdr storage.HeapTupleHeader, keysUpdated bool) (multixact.MultiXactId, uint16, uint16, bool, error) {
-	if ctx.MultiXact == nil || ctx.TxnMgr == nil {
+	survivors, err := survivingLockersForUpdate(ctx, hdr, keysUpdated)
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	if len(survivors) == 0 {
 		return 0, 0, 0, false, nil
+	}
+	// Re-add our writer as the updater member alongside the preserved lockers.
+	members := append(survivors, multixact.Member{Xid: effectiveWriterXID(ctx), Status: updaterMemberStatus(keysUpdated)})
+	multi, err := ctx.MultiXact.CreateFromMembers(members)
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	infomask, infomask2 := multixact.HintBits(members)
+	return multi, infomask, infomask2, true, nil
+}
+
+// survivingLockersForUpdate returns the pre-existing lock-only holders on a
+// tuple about to be updated/deleted by this transaction that must be PRESERVED
+// (carried forward), i.e. NOT including our own updater member. It is the shared
+// core of two producers: the old tuple's {updater + survivors} stamp
+// (stampUpdaterXmaxPreservingLockers) AND the new tuple version's inherited lock
+// xmax (carryForwardLockersToNewTuple) — upstream heap_update propagates the
+// non-conflicting lockers both onto the old tuple's xmax (so a chain walker still
+// honours them) and forward onto the new version (so the lock is not forgotten
+// when the updater commits, multixact-no-forget).
+//
+// Retention rules (mirroring MultiXactIdExpand / compute_new_xmax_infomask):
+//   - drop our own current writer member (re-added as the updater by the caller
+//     that needs it);
+//   - carry forward, unchanged, any member from our OWN transaction tree at an
+//     outer level (top-level xact or an enclosing savepoint) — never conflicts
+//     with us and ROLLBACK TO must restore it (delete-abort-savept);
+//   - drop dead foreign lockers (lock already released);
+//   - drop foreign lockers whose mode CONFLICTS with our update (they must be
+//     waited for upstream, not preserved);
+//   - keep still-active non-conflicting foreign lockers (e.g. FOR KEY SHARE
+//     under a no-key UPDATE — the multixact-no-forget scenario).
+//
+// Returns an empty slice (the common case) when the xmax is not a preserved
+// lock-only holder set, so callers keep the plain single-xid stamp. The gate (a
+// pre-existing active foreign lock-only holder) never arises on the pgbench
+// TPC-B / TPC-H hot path. M0118-0009 (docs/design/0118-0016).
+func survivingLockersForUpdate(ctx *Context, hdr storage.HeapTupleHeader, keysUpdated bool) ([]multixact.Member, error) {
+	if ctx.MultiXact == nil || ctx.TxnMgr == nil {
+		return nil, nil
 	}
 	// Only the lock-only case is preserved here. A non-lock-only (updater-bearing)
 	// xmax means a concurrent modify, which isConcurrentlyUpdated/EPQ handles
 	// upstream of the stamp; reaching the stamp with such an xmax is not this
 	// producer's concern.
 	if hdr.Xmax == storage.InvalidTransactionID || !storage.IsHeapTupleLockOnly(hdr.Infomask) {
-		return 0, 0, 0, false, nil
+		return nil, nil
 	}
 
 	// Enumerate the existing lock holders (single-xid or multi).
@@ -2092,40 +2136,21 @@ func stampUpdaterXmaxPreservingLockers(ctx *Context, hdr storage.HeapTupleHeader
 		if !ok {
 			// Membership lost (stamped before a restart with no persisted store):
 			// nothing resolvable to combine with; keep the plain stamp.
-			return 0, 0, 0, false, nil
+			return nil, nil
 		}
 		existing = members
 	} else {
 		existing = []multixact.Member{{Xid: hdr.Xmax, Status: lockOnlyMemberStatus(hdr.Infomask, hdr.Infomask2)}}
 	}
 
-	// Keep only still-active foreign lockers whose lock mode does NOT conflict
-	// with our update. A dead locker's lock is released; a *conflicting* locker
-	// must be waited for, not carried into the multi — preserving it would let an
-	// update coexist with a lock it should block on. (The conflict-wait itself is
-	// handled upstream of the stamp; an unwaited conflicting locker is dropped by
-	// the plain single-xid stamp, the pre-existing behaviour, until that wait
-	// lands.) This makes a key-changing UPDATE / DELETE (StatusUpdate, which
-	// conflicts with every lock mode incl. FOR KEY SHARE) a no-op here, while a
-	// no-key UPDATE (StatusNoKeyUpdate) preserves a non-conflicting FOR KEY SHARE
-	// holder — the spec scenario. Self is dropped (re-added below as the updater).
 	ourStatus := updaterMemberStatus(keysUpdated)
 	ourXID := effectiveWriterXID(ctx) // sub-XID inside a savepoint; else top-level
 	ourTop := ctx.TxnMgr.TopLevelXid(ourXID)
 	survivors := make([]multixact.Member, 0, len(existing)+1)
 	for _, m := range existing {
 		if m.Xid == ourXID {
-			continue // exactly our writer: re-added once below as the updater
+			continue // exactly our writer: re-added by the updater-stamp caller
 		}
-		// A member from our own transaction tree but at an OUTER level (the
-		// top-level xact, or a savepoint we are nested inside) is a lock this
-		// transaction took before the current savepoint. It never conflicts with
-		// us (same xact) and MUST be carried forward unchanged so ROLLBACK TO this
-		// savepoint restores it: dropping the savepoint's own updater member then
-		// leaves the outer locker as the surviving xmax, so a DELETE/UPDATE inside
-		// a savepoint over a row this xact already locked FOR KEY SHARE keeps that
-		// lock alive after the rollback (delete-abort-savept). Bypasses the
-		// foreign-locker liveness/conflict filtering below (self never conflicts).
 		if ctx.TxnMgr.TopLevelXid(m.Xid) == ourTop {
 			survivors = append(survivors, m)
 			continue
@@ -2138,17 +2163,32 @@ func stampUpdaterXmaxPreservingLockers(ctx *Context, hdr storage.HeapTupleHeader
 		}
 		survivors = append(survivors, m)
 	}
-	if len(survivors) == 0 {
-		return 0, 0, 0, false, nil
-	}
-	survivors = append(survivors, multixact.Member{Xid: ourXID, Status: ourStatus})
+	return survivors, nil
+}
 
-	multi, err := ctx.MultiXact.CreateFromMembers(survivors)
-	if err != nil {
-		return 0, 0, 0, false, err
+// carryForwardLockersToNewTuple stamps the new tuple version (at newSlot, already
+// inserted on `page`) with the non-conflicting lockers inherited from the old
+// tuple `oldHdr`, as a lock-only MultiXactId. This is the new-version half of
+// PostgreSQL heap_update's lock propagation (compute_new_xmax_infomask): KEY
+// SHARE / SHARE lockers that do not conflict with a no-key update are carried
+// onto the successor so the lock survives the updater's commit — otherwise a
+// later locker on the committed-updated row finds no holder and proceeds out of
+// order (multixact-no-forget: after s2's no-key UPDATE commits, s3's FOR UPDATE
+// must still wait on s1's inherited FOR KEY SHARE until s1 commits).
+//
+// No-op (returns nil) when there is nothing to carry — the common case and the
+// pgbench hot path. M0118-0009 (docs/design/0118-0016).
+func carryForwardLockersToNewTuple(ctx *Context, page storage.Page, oldHdr storage.HeapTupleHeader, newSlot uint16, keysUpdated bool) error {
+	lockers, err := survivingLockersForUpdate(ctx, oldHdr, keysUpdated)
+	if err != nil || len(lockers) == 0 {
+		return err
 	}
-	infomask, infomask2 := multixact.HintBits(survivors)
-	return multi, infomask, infomask2, true, nil
+	multi, err := ctx.MultiXact.CreateFromMembers(lockers)
+	if err != nil {
+		return err
+	}
+	infomask, infomask2 := multixact.HintBits(lockers)
+	return storage.PageSetHeapTupleXmaxMulti(page, newSlot, storage.TransactionID(multi), infomask, infomask2)
 }
 
 // stampUpdaterXmaxNonHOT is the non-HOT (delete-half / DELETE) convenience
@@ -2329,6 +2369,14 @@ func tryApplyHOTUpdate(
 	// docs/design/0118-0002).
 	stampErr := func() error {
 		if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), oldSlot); herr == nil {
+			// Carry the old tuple's non-conflicting lockers forward onto the new
+			// version BEFORE re-stamping the old tuple's xmax (the stamp below
+			// rewrites it). A HOT update never changes a key column, so the
+			// updater status is no-key (keysUpdated=false) and a FOR KEY SHARE
+			// holder is preserved (multixact-no-forget). M0118-0009.
+			if cerr := carryForwardLockersToNewTuple(ctx, s.Page(), oldHdrTup.Header, newSlot, false); cerr != nil {
+				return cerr
+			}
 			multi, im, im2, ok, perr := stampUpdaterXmaxPreservingLockers(ctx, oldHdrTup.Header, false)
 			if perr != nil {
 				return perr

@@ -281,7 +281,16 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       the sub-XID) now routes through `stampMultiLock` (gate widened by new
       `hasOuterSelfLockMember`) so the outer top-level KEY SHARE survives as a multi
       member; `ROLLBACK TO` drops only the sub-XID and a conflicting FOR UPDATE
-      waiter keeps waiting on the restored KEY SHARE. **Remaining (deferred, ledger
-      2026-06-22):** `multixact-no-forget` (whole-txn ROLLBACK of an updater member
-      must retain the surviving locker on the read path). Plus the other misc specs
-      untouched.
+      waiter keeps waiting on the restored KEY SHARE. `multixact-no-forget` PASS
+      (design 0118-0016) — two fixes: (1) `stampLockInner`'s real-updater branch
+      conflict-filters its co-member wait set via `conflictingLockHolders` (not
+      `activeLockHolders`, now removed) so s3 FOR NO KEY UPDATE doesn't wait on a
+      surviving non-conflicting KEY SHARE after the updater aborts, and `stampAtPtr`
+      preserves survivors via `stampMultiLock`; (2) the HOT UPDATE producer carries
+      the old tuple's non-conflicting lockers forward onto the new tuple version
+      (`carryForwardLockersToNewTuple` + shared `survivingLockersForUpdate`, the
+      new-version half of heap_update) so after the updater commits s3 FOR UPDATE
+      waits on the inherited KEY SHARE. **Remaining (deferred, ledger 2026-06-22):**
+      lock carry-forward on the non-HOT update paths (delete+insert / `UPDATE…FROM`
+      / MERGE / upsert) — bounded follow-up, same narrow gate, not exercised by any
+      current `port` spec. Plus the other M0118-0009 misc specs untouched.

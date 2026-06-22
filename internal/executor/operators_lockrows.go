@@ -814,7 +814,19 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		var multiHolders []storage.TransactionID
 		if storage.IsHeapTupleXmaxMulti(infomask) {
 			updater := o.updaterXID(tup.Header)
-			for _, hx := range o.activeLockHolders(xmax, infomask) {
+			// Wait only on co-members whose lock mode CONFLICTS with our request
+			// (MultiXactIdWait semantics), not on every active member. A surviving
+			// NON-conflicting locker recorded alongside the updater must NOT be
+			// waited on: in multixact-no-forget, after s2's no-key UPDATE aborts the
+			// row's xmax is a multi {s1 FOR KEY SHARE (active), s2 no-key-update
+			// (aborted)}; s3's FOR NO KEY UPDATE is compatible with KEY SHARE, so it
+			// must become grantable immediately once the aborted updater is resolved
+			// rather than blocking on s1 until s1 commits. A conflicting upgrader
+			// (s3's FOR UPDATE) still finds the key-share member conflicting and
+			// waits — preserving tuplelock-upgrade-no-deadlock perms 2/3. The updater
+			// itself is resolved as `xmax` and handled by the wait/abort logic below,
+			// so exclude it from this set. M0118-0009 (docs/design/0118-0016).
+			for _, hx := range o.conflictingLockHolders(xmax, infomask, tup.Header.Infomask2) {
 				if hx != updater {
 					multiHolders = append(multiHolders, hx)
 				}
@@ -824,11 +836,11 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
 
-		// Wait for any still-active non-updater MultiXact lock member before the
-		// updater itself. An existing holder upgrading its own lock is excluded
-		// here (activeLockHolders skips Tx.XID) and so proceeds ahead of a pure
-		// waiter, matching PostgreSQL's lock-release order. The wait policy is
-		// honoured exactly as for the updater wait below.
+		// Wait for any still-active CONFLICTING non-updater MultiXact lock member
+		// before the updater itself. An existing holder upgrading its own lock is
+		// excluded here (conflictingLockHolders skips self) and so proceeds ahead
+		// of a pure waiter, matching PostgreSQL's lock-release order. The wait
+		// policy is honoured exactly as for the updater wait below.
 		if len(multiHolders) > 0 {
 			switch o.waitPolicy {
 			case planner.LockWaitSkipLocked:
@@ -1111,6 +1123,30 @@ func (o *lockRowsOp) stampAtPtr(rel storage.RelFileNode, ptr storage.ItemPointer
 		o.ctx.Pool.Unpin(slot)
 		return storage.ItemPointer{}, false, nil
 	}
+	// "Don't forget the lock": the aborted updater may have been recorded in a
+	// MultiXactId that ALSO names a still-active lock-only holder (s1's FOR KEY
+	// SHARE in multixact-no-forget). A plain single-locker overwrite below would
+	// discard that surviving member. stampMultiLock keeps every still-active
+	// member (dropping the aborted updater, which is no longer active) and adds
+	// our locker, so s1's lock survives into the new multi. It returns
+	// combined=false when there is no surviving holder (e.g. a single aborted
+	// updater with no co-locker, as in delete-abort-savept), in which case we
+	// fall through to the single-locker stamp unchanged. M0118-0009
+	// (docs/design/0118-0016).
+	if o.ctx.MultiXact != nil && tup.Header.Xmax != storage.InvalidTransactionID {
+		multiPtr, combined, merr := o.stampMultiLock(slot, ptr, tup.Header)
+		if merr != nil {
+			slot.Unlock()
+			o.ctx.Pool.Unpin(slot)
+			return storage.ItemPointer{}, false, merr
+		}
+		if combined {
+			// stampMultiLock already marked the page dirty.
+			slot.Unlock()
+			o.ctx.Pool.Unpin(slot)
+			return multiPtr, false, nil
+		}
+	}
 	wxid := o.writerXID()
 	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, wxid, o.lockStrength); err != nil {
 		slot.Unlock()
@@ -1359,40 +1395,6 @@ func (o *lockRowsOp) isSelfXID(xid storage.TransactionID) bool {
 		return false
 	}
 	return o.ctx.TxnMgr.TopLevelXid(xid) == o.ctx.TxnMgr.TopLevelXid(o.ctx.Tx.XID)
-}
-
-// activeLockHolders returns the still-active transactions holding a row lock on
-// a tuple whose xmax is `xmax` with hint bits `infomask`. For a single-xid
-// lock-only xmax it is at most the one holder; for a MultiXactId xmax
-// (HEAP_XMAX_IS_MULTI) it is the subset of members still in progress, resolved
-// through the shared member store. The current transaction is never included
-// (it never blocks on its own lock). A multi whose membership cannot be
-// resolved (no store wired, or members not found after a restart) is treated as
-// released rather than hanging the waiter. M0118-0003.
-func (o *lockRowsOp) activeLockHolders(xmax storage.TransactionID, infomask uint16) []storage.TransactionID {
-	if o.ctx.TxnMgr == nil {
-		return nil
-	}
-	if storage.IsHeapTupleXmaxMulti(infomask) {
-		if o.ctx.MultiXact == nil {
-			return nil
-		}
-		members, ok := o.ctx.MultiXact.Members(multixact.MultiXactId(xmax))
-		if !ok {
-			return nil
-		}
-		var out []storage.TransactionID
-		for _, m := range members {
-			if !o.isSelfXID(m.Xid) && o.ctx.TxnMgr.IsXIDActive(m.Xid) {
-				out = append(out, m.Xid)
-			}
-		}
-		return out
-	}
-	if !o.isSelfXID(xmax) && o.ctx.TxnMgr.IsXIDActive(xmax) {
-		return []storage.TransactionID{xmax}
-	}
-	return nil
 }
 
 // conflictingLockHolders returns the still-active row-lock holders on a tuple
