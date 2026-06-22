@@ -345,6 +345,21 @@ func TestPort_IsolationSequenceDdl(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/sequence-ddl.spec")
 }
 
+// TestPort_IsolationReindexConcurrently exercises the reindex-concurrently spec
+// (M0118-0008). REINDEX TABLE CONCURRENTLY waits for every transaction holding a
+// lock on the table to finish (the WaitForLockers analog, waitForRelationLockers)
+// without itself blocking concurrent reads or writes, so a REINDEX issued while
+// another session has the table open reports `<waiting ...>` and completes only
+// after that transaction commits — byte-identical to PG 18.3 across all six
+// permutations.
+func TestPort_IsolationReindexConcurrently(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_reindex_conc")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/reindex-concurrently.spec")
+}
+
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
 // Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
 func TestPort_IsolationFkSnapshot(t *testing.T) {

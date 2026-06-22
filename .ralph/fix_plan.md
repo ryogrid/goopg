@@ -326,11 +326,27 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       relations (`IsSequence`, user OID) reached via `LookupTable`→`RelFileNode`;
       `RowExclusiveLock` self-compatible so concurrent nextvals/SERIAL inserts
       never block. `TestPort_IsolationSequenceDdl` strict PASS (5 perms);
-      `-race` lockmgr/executor; pgbench smoke 0-failed. **Remaining
+      `-race` lockmgr/executor; pgbench smoke 0-failed.
+      **2026-06-22 third promotion (design 0118-0029): `reindex-concurrently`
+      PROMOTED.** Two fixes: (1) `parseReindex` now accepts `CONCURRENTLY` in the
+      modern post-type position (`REINDEX TABLE CONCURRENTLY name`), not only the
+      legacy pre-type spelling; (2) new `(*Context).waitForRelationLockers` (the
+      `WaitForLockers` analog) polls `tableLockMgr.Holders` and returns once no
+      OTHER backend holds a lock on the table, taking NO lock of its own so
+      concurrent reads/writes proceed (the CONCURRENTLY contract — REINDEX holds
+      only ShareUpdateExclusive). The runner detects blocking by timing (300 ms)
+      so the poll loop renders as `<waiting ...>` and completes the instant the
+      lockers drain; a bare `BEGIN` registers no table lock so perm 1 returns
+      immediately while blocking perms complete after the last concurrent commit.
+      Read-only on lockmgr, gated on `Concurrently && TABLE` ⇒ zero hot-path
+      blast radius; reusable by the other CONCURRENTLY specs.
+      `TestPort_IsolationReindexConcurrently` strict PASS (6 perms); `-race`
+      lockmgr/executor; parser units; pgbench smoke. **Remaining
       (deferred, ledger 2026-06-22):** `alter-table-*` (ADD/VALIDATE CONSTRAINT
       lock semantics), the `*-conflict` family — truncate/vacuum/cluster — (need
-      CREATE ROLE/GRANT/SET ROLE privilege infra + permission-denied), `reindex-*`
-      (REINDEX SCHEMA CONCURRENTLY parsing + `allow_system_table_mods` GUC +
+      CREATE ROLE/GRANT/SET ROLE privilege infra + permission-denied),
+      `reindex-concurrently-toast` (`allow_system_table_mods` GUC),
+      `reindex-schema` (REINDEX SCHEMA CONCURRENTLY parsing +
       concurrent wait), `multiple-cic`/partition specs (CREATE INDEX CONCURRENTLY
       waiting + ATTACH/DETACH PARTITION), `inherit-temp` (RELATION_IS_OTHER_TEMP
       exclusion), `plpgsql-toast` (TOAST in PL/pgSQL). Group stays open.

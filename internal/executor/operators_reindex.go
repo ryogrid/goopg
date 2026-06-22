@@ -59,12 +59,25 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 			}
 		}
 	case "TABLE":
-		if _, ok := o.ctx.Catalog.LookupTable(name); !ok {
-			if _, ok2 := o.ctx.Catalog.LookupTable(parser.ObjectName{Name: name.Name}); !ok2 {
+		tbl, ok := o.ctx.Catalog.LookupTable(name)
+		if !ok {
+			if tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Name: name.Name}); !ok {
 				return nil, &ExecError{
 					Code:    "42P01",
 					Message: fmt.Sprintf("relation %q does not exist", o.stmt.Name),
 				}
+			}
+		}
+		// REINDEX TABLE CONCURRENTLY waits for every transaction that holds a
+		// lock on the table to finish before it can swap in the rebuilt index,
+		// without itself blocking concurrent reads or writes (it holds only
+		// ShareUpdateExclusive). goopg's index rebuild is a no-op, but the wait
+		// is observable concurrency behaviour, so reproduce it via the
+		// WaitForLockers analog on the dedicated table lock manager. M0118-0008
+		// (reindex-concurrently isolation spec).
+		if o.stmt.Concurrently {
+			if err := o.ctx.waitForRelationLockers(o.ctx.Catalog.RelFileNode(tbl)); err != nil {
+				return nil, err
 			}
 		}
 	}

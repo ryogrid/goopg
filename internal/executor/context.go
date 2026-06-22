@@ -836,6 +836,73 @@ func (c *Context) acquireSequenceLockTxn(rel storage.RelFileNode) error {
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }
 
+// waitForRelationLockers blocks until no OTHER backend holds a transaction-
+// scoped table lock on rel, mirroring PostgreSQL's WaitForLockers, which
+// REINDEX … CONCURRENTLY and CREATE INDEX CONCURRENTLY invoke at each phase
+// boundary. Unlike a lock acquisition it takes NO conflicting lock of its own,
+// so concurrent DML (ROW EXCLUSIVE) and reads (ACCESS SHARE) proceed unimpeded
+// while it waits — that is the CONCURRENTLY contract (a ShareUpdateExclusive
+// holder must not block ordinary readers/writers). It returns once every other
+// transaction that held the relation locked during the wait has committed or
+// rolled back (its locks dropped by ReleaseTableLocks at end-of-transaction).
+//
+// Because the heavyweight table locks it observes are only registered inside an
+// explicit transaction (acquireScanReadLockTxn / acquireWriteLockTxn under
+// TxnLockBackendID), a bare BEGIN with no table access registers nothing, so a
+// CONCURRENTLY operation started before any concurrent session has touched the
+// relation returns immediately — matching PostgreSQL, where REINDEX CONCURRENTLY
+// only waits for transactions that actually hold a lock on the table.
+//
+// System catalogs (OID < firstNormalObjectOID) are skipped, and a context
+// cancellation/timeout (statement_timeout / client cancel) aborts the wait with
+// the matching SQLSTATE-57014 error exactly like the lock-wait helpers.
+// M0118-0008 (reindex-concurrently isolation spec).
+func (c *Context) waitForRelationLockers(rel storage.RelFileNode) error {
+	if rel.RelOid < firstNormalObjectOID {
+		return nil
+	}
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	lockCtx := context.Background()
+	if c.Ctx != nil {
+		lockCtx = c.Ctx
+	}
+	const pollInterval = 10 * time.Millisecond
+	waiting := false
+	for {
+		hasOther := false
+		for b := range tableLockMgr.Holders(tag) {
+			if b == c.TxnLockBackendID || b == c.BackendID {
+				continue
+			}
+			hasOther = true
+			break
+		}
+		if !hasOther {
+			if waiting && c.Activity != nil {
+				c.Activity.WaitEventEnd(c.ProcNum)
+			}
+			return nil
+		}
+		if !waiting {
+			waiting = true
+			if c.Activity != nil {
+				c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitRelationLock)
+			}
+		}
+		select {
+		case <-lockCtx.Done():
+			if c.Activity != nil {
+				c.Activity.WaitEventEnd(c.ProcNum)
+			}
+			if ee := lockWaitCancelError(lockCtx.Err()); ee != nil {
+				return ee
+			}
+			return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		case <-time.After(pollInterval):
+		}
+	}
+}
+
 // lockWaitCancelError maps the cancellation/timeout error returned by a
 // lock-wait primitive (lockmgr.Acquire* or mvcc.WaitForXID) to the matching
 // SQLSTATE-57014 ExecError, or nil when err is not a recognised cancellation.
