@@ -8,9 +8,12 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
+	"github.com/goopg/goopg/internal/storage"
 )
 
 type reindexOp struct {
@@ -80,9 +83,61 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 				return nil, err
 			}
 		}
+	case "SCHEMA":
+		// REINDEX SCHEMA rebuilds every index on every table in the schema.
+		// goopg's physical rebuild is a no-op, but the lock behaviour is
+		// observable: a plain reindex takes a ShareLock per relation (which
+		// conflicts with a concurrent SHARE UPDATE EXCLUSIVE holder, so it
+		// waits), while REINDEX SCHEMA CONCURRENTLY takes no conflicting lock
+		// and instead waits for existing lockers to drain (the CONCURRENTLY
+		// contract). Relations are processed in OID (creation) order so the
+		// stall lands on the earliest-created locked table first — which lets a
+		// concurrent DROP of a later, not-yet-reached table proceed while the
+		// reindex waits, exactly like upstream. M0118-0008 (reindex-schema).
+		schemaName := name.Name
+		if name.Schema != "" {
+			schemaName = name.Schema
+		}
+		for _, rel := range o.schemaRelsByOID(schemaName) {
+			if o.stmt.Concurrently {
+				if err := o.ctx.waitForRelationLockers(rel); err != nil {
+					return nil, err
+				}
+			} else {
+				if err := o.ctx.acquireRelLockMaybeTransient(rel, lockmgr.ShareLock); err != nil {
+					return nil, err
+				}
+			}
+		}
 	}
 	// Physical reindex is a no-op in v0.
 	return nil, EOF
+}
+
+// schemaRelsByOID returns the RelFileNodes of every non-virtual user table in
+// schemaName, ordered by OID (creation order). REINDEX SCHEMA locks/waits on
+// relations in this order so the first stall is on the earliest-created locked
+// table, matching upstream's relation processing order. M0118-0008.
+func (o *reindexOp) schemaRelsByOID(schemaName string) []storage.RelFileNode {
+	tables := o.ctx.Catalog.TablesInSchema(schemaName)
+	type relOID struct {
+		rfn storage.RelFileNode
+		oid uint32
+	}
+	rels := make([]relOID, 0, len(tables))
+	for _, tn := range tables {
+		tbl, ok := o.ctx.Catalog.LookupTable(tn)
+		if !ok {
+			continue
+		}
+		rels = append(rels, relOID{rfn: o.ctx.Catalog.RelFileNode(tbl), oid: tbl.OID})
+	}
+	sort.Slice(rels, func(i, j int) bool { return rels[i].oid < rels[j].oid })
+	out := make([]storage.RelFileNode, len(rels))
+	for i, r := range rels {
+		out[i] = r.rfn
+	}
+	return out
 }
 
 // indexOfDot returns the index of '.' in s, or -1 if not present.

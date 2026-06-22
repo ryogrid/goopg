@@ -341,14 +341,28 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       Read-only on lockmgr, gated on `Concurrently && TABLE` ⇒ zero hot-path
       blast radius; reusable by the other CONCURRENTLY specs.
       `TestPort_IsolationReindexConcurrently` strict PASS (6 perms); `-race`
-      lockmgr/executor; parser units; pgbench smoke. **Remaining
-      (deferred, ledger 2026-06-22):** `alter-table-*` (ADD/VALIDATE CONSTRAINT
-      lock semantics), the `*-conflict` family — truncate/vacuum/cluster — (need
-      CREATE ROLE/GRANT/SET ROLE privilege infra + permission-denied),
-      `reindex-concurrently-toast` (`allow_system_table_mods` GUC),
-      `reindex-schema` (REINDEX SCHEMA CONCURRENTLY parsing +
-      concurrent wait), `multiple-cic`/partition specs (CREATE INDEX CONCURRENTLY
-      waiting + ATTACH/DETACH PARTITION), `inherit-temp` (RELATION_IS_OTHER_TEMP
+      lockmgr/executor; parser units; pgbench smoke.
+      **2026-06-22 fourth promotion (design 0118-0030): `reindex-schema`
+      PROMOTED.** `reindexOp.Next` gained a `SCHEMA` case: it enumerates the
+      schema's non-virtual user tables (`Catalog.TablesInSchema`), sorts by OID
+      (creation) order, then per relation takes a `ShareLock` (plain reindex) or —
+      for `CONCURRENTLY` — waits for lockers via the 0118-0029
+      `waitForRelationLockers` primitive. `ShareLock`/`ShareUpdateExclusive`
+      conflict with the `SHARE UPDATE EXCLUSIVE` held by `lock1`, so the reindex
+      stalls on the earliest-created locked table (`tab_locked`) and never
+      reaches `tab_dropped`, letting a concurrent `DROP TABLE` proceed. The
+      autocommit lock uses the new `(*Context).acquireRelLockMaybeTransient`
+      (generalised out of `acquireSequenceLockTxn`: held-to-commit in an explicit
+      txn, transient acquire+release in autocommit so the wait still happens
+      during acquisition). `TestPort_IsolationReindexSchema` strict PASS (2
+      perms); `-race` lockmgr; lock-sibling regression PASS; pgbench smoke
+      0-failed. **Remaining (deferred, ledger 2026-06-22):** `alter-table-*`
+      (ADD/VALIDATE CONSTRAINT lock semantics), the `*-conflict` family —
+      truncate/vacuum/cluster — (need CREATE ROLE/GRANT/SET ROLE privilege infra +
+      permission-denied), `reindex-concurrently-toast` (`allow_system_table_mods`
+      GUC), `multiple-cic` (CREATE INDEX CONCURRENTLY must constant-fold an
+      immutable partial-index predicate function during build) / partition specs
+      (ATTACH/DETACH PARTITION), `inherit-temp` (RELATION_IS_OTHER_TEMP
       exclusion), `plpgsql-toast` (TOAST in PL/pgSQL). Group stays open.
 - [ ] **M0118-0009** — Misc / system-level specs: async-notify, timeouts, stats, horizons,
       freeze-the-dead, inplace-inval, intra-grant-inplace{,-db}, subxid-overflow,

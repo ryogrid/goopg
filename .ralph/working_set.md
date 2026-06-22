@@ -1,34 +1,50 @@
 (idle — nothing in flight)
 
-Last loop (#20, M0118-0008): committed the in-flight `sequence-ddl` promotion that
-the prior loop built but left uncommitted (working_set wrongly said idle; tree had
-WIP). Verified coherent + committed (design 0118-0028):
-- `acquireSequenceLockTxn` (context.go): nextval RowExclusiveLock on the sequence
-  rel — held to commit in an explicit txn (TxnLockBackendID), transient
-  acquire+release under per-statement BackendID in autocommit (wait still happens
-  on acquire). Self-compatible ⇒ concurrent nextval/SERIAL never block.
-- `execAlterSequence` (operators_ddl.go): AccessExclusiveLock via acquireDDLLockTxn.
-- `evalNextval` (operators_sequence.go): resolves seq Table via LookupTable→RelFileNode.
-- `TestPort_IsolationSequenceDdl` strict PASS (5 perms).
-GATES: build PASS; sequence-ddl strict PASS; -race lockmgr+executor PASS; doc regen
-no-drift; pgbench smoke via pre-commit hook. CSV/coverage/inventory/port-status all
-current. Committed+pushed (verify next loop).
+Last loop (#22, M0118-0008): promoted `reindex-schema` (4th M0118-0008
+promotion, design 0118-0030). Committed + pushed.
 
-NEXT loop candidates (remaining M0118-0008 DDL/VACUUM tail, all real-feature):
-- biggest leverage = ROLE/ACL infra (CREATE ROLE/GRANT/SET ROLE/ALTER TABLE OWNER +
-  permission-denied) unblocks truncate-conflict + vacuum-conflict + cluster-conflict
-  {,-partition} (4 specs).
-- alter-table-* need ADD/VALIDATE CONSTRAINT lock semantics. reindex-* need REINDEX
-  SCHEMA CONCURRENTLY parsing + allow_system_table_mods. multiple-cic/partition need
-  CIC waiting + ATTACH/DETACH. inherit-temp, plpgsql-toast distinct.
-- Other groups: M0118-0002 predicate-hash (SSI granularity), M0118-0005 fk-deadlock/
-  ri-trigger/fk-partitioned, M0118-0007 eval-plan-qual, M0118-0009 misc — all hard.
+## What landed
+- `reindexOp.Next` (operators_reindex.go) gained a `SCHEMA` case: enumerate the
+  schema's non-virtual user tables via `Catalog.TablesInSchema`, sort by OID
+  (creation order) in new helper `schemaRelsByOID`, then per relation take a
+  `ShareLock` (plain) via `acquireRelLockMaybeTransient`, or — for CONCURRENTLY —
+  `waitForRelationLockers` (reused 0118-0029 primitive).
+- `context.go`: extracted `acquireSequenceLockTxn` body into mode-parameterised
+  `(*Context).acquireRelLockMaybeTransient(rel, mode)` (held-to-commit in explicit
+  txn; transient acquire+release in autocommit so the wait still happens).
+  `acquireSequenceLockTxn` now delegates with `RowExclusiveLock` (no behaviour
+  change).
+- `TestPort_IsolationReindexSchema` strict PASS (2 perms).
+GATES: build PASS; reindex-schema strict PASS; lock-sibling regression
+(reindex-concurrently/create-trigger/sequence-ddl/drop-index-concurrently-1/
+timeouts-table-level) PASS; -race lockmgr PASS; executor units PASS; pgbench
+smoke 0-failed (pre-commit). CSV field count verified 7; coverage/inventory/
+port-status regenerated.
 
-GOTCHAS: isolation specs run goopg as SUBPROCESS (debug→file). tuplelock-upgrade-no-
-deadlock TIMING-SENSITIVE on WSL2 under load (not a regression). D-002 CSV is one
-giant single-line row #13 (field 6 rationale COMMA-FREE; append before `,M0060-0004`).
-regen: gen-oracle-port-status + gen-isolation-coverage + gen-oracle-inventory. PROBE:
-throwaway zz_probe_test.go (RunAndCompare, log status+Diff). NEVER `cd` into postgres/.
-never gofmt -w. Untracked postgres/ + weekly_loc.* + requirements.txt are stray — leave.
-The "lone --live loop shows as 2 ralph_loop.sh" is the timeout subshell (ppid chain),
-NOT a concurrent loop — verify ppid before fearing tree corruption.
+KEY METHODOLOGY: throwaway zz_probe_test.go (RunAndCompare → log status+diff)
+ranked candidates. multiple-cic was the alternative but needs immutable-function
+constant-folding in a partial-index WHERE predicate during CREATE INDEX
+CONCURRENTLY build (PG evaluates `lck_shr(281457)` via eval_const_expressions →
+blocks on advisory lock) — harder, deferred.
+
+NEXT loop candidates (remaining M0118-0008 tail — probe-first to confirm
+divergence):
+- `acquireRelLockMaybeTransient` + `waitForRelationLockers` are REUSABLE.
+- `multiple-cic`: CREATE INDEX CONCURRENTLY must constant-fold an IMMUTABLE
+  partial-index predicate fn during build (advisory-lock block). Probe showed
+  s1i does not wait — predicate fn never called.
+- `reindex-concurrently-toast`: needs `allow_system_table_mods` GUC (no-op bool
+  accept) + pg_toast.<name> reindex + ALTER TABLE/INDEX RENAME of toast rels.
+- biggest leverage = ROLE/ACL infra (CREATE ROLE/GRANT/SET ROLE/permission-denied)
+  unblocks truncate/vacuum/cluster-conflict {,-partition}.
+- `alter-table-1/2`: ADD CONSTRAINT … NOT VALID + VALIDATE CONSTRAINT + FK
+  validation + lock semantics.
+- partition specs: ATTACH/DETACH PARTITION (+ CONCURRENTLY, pg_backend_pid+cancel).
+
+GOTCHAS: isolation specs run goopg as SUBPROCESS (debug→file). D-002 CSV is one
+giant single-line row #13 (field 6 rationale COMMA-FREE; append before
+`,M0060-0004`; verify `awk -F, 'NR==13{print NF}'` == 7). regen: gen-oracle-
+port-status + gen-isolation-coverage --repo-root . + gen-oracle-inventory
+--repo-root . NEVER `cd` into postgres/. never gofmt -w. Untracked postgres/ +
+weekly_loc.* + requirements.txt are stray — leave. .ralph/progress.json is
+driver-managed — don't commit it.

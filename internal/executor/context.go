@@ -797,17 +797,29 @@ func (c *Context) acquireDDLLockTxn(rel storage.RelFileNode, mode lockmgr.Mode) 
 // SERIAL/IDENTITY inserts) never block each other at the table level. System
 // catalogs (OID < firstNormalObjectOID) are skipped. M0118-0008 (sequence-ddl).
 func (c *Context) acquireSequenceLockTxn(rel storage.RelFileNode) error {
+	return c.acquireRelLockMaybeTransient(rel, lockmgr.RowExclusiveLock)
+}
+
+// acquireRelLockMaybeTransient acquires the heavyweight lock `mode` on rel.
+// Inside an explicit transaction (TxnLockBackendID != 0) the lock is held to
+// end-of-transaction (via acquireRelLockTxn); in autocommit it is acquired
+// transiently under the per-statement BackendID and released the instant it is
+// granted, so the WAIT on a conflicting holder still happens during acquisition
+// but no lock lingers past the statement — matching PostgreSQL's single-
+// statement implicit transaction. The per-statement BackendID is globally
+// unique (minted from the same counter as LockBackendID) and never touches
+// tableLockMgr elsewhere, so the targeted Release drops exactly this lock with
+// no risk to other backends. System catalogs (OID < firstNormalObjectOID) are
+// skipped. Used by nextval() (RowExclusiveLock, sequence-ddl) and by REINDEX
+// SCHEMA (ShareLock per relation, reindex-schema). M0118-0008.
+func (c *Context) acquireRelLockMaybeTransient(rel storage.RelFileNode, mode lockmgr.Mode) error {
 	if rel.RelOid < firstNormalObjectOID {
 		return nil
 	}
 	if c.TxnLockBackendID != 0 {
 		// Explicit transaction: held until end-of-transaction.
-		return c.acquireRelLockTxn(rel, lockmgr.RowExclusiveLock, false)
+		return c.acquireRelLockTxn(rel, mode, false)
 	}
-	// Autocommit: transient acquire+release under the per-statement backend ID.
-	// The per-statement BackendID is globally unique (minted from the same
-	// counter as LockBackendID) and never touches tableLockMgr elsewhere, so the
-	// targeted Release drops exactly this lock with no risk to other backends.
 	if c.BackendID == 0 {
 		return nil
 	}
@@ -819,12 +831,12 @@ func (c *Context) acquireSequenceLockTxn(rel storage.RelFileNode) error {
 	if c.Ctx != nil {
 		lockCtx = c.Ctx
 	}
-	err := tableLockMgr.AcquireWithTimeout(lockCtx, c.BackendID, tag, lockmgr.RowExclusiveLock, c.deadlockTimeout())
+	err := tableLockMgr.AcquireWithTimeout(lockCtx, c.BackendID, tag, mode, c.deadlockTimeout())
 	if c.Activity != nil {
 		c.Activity.WaitEventEnd(c.ProcNum)
 	}
 	if err == nil {
-		tableLockMgr.Release(c.BackendID, tag, lockmgr.RowExclusiveLock)
+		tableLockMgr.Release(c.BackendID, tag, mode)
 		return nil
 	}
 	if err == lockmgr.ErrDeadlockDetected {
