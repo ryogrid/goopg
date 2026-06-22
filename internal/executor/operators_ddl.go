@@ -9221,6 +9221,21 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", name)}
 	}
 
+	// ALTER SEQUENCE takes a transaction-scoped AccessExclusiveLock on the
+	// sequence relation (mirrors PostgreSQL): it conflicts with the
+	// RowExclusiveLock nextval() holds (acquireSequenceLockTxn), so a concurrent
+	// nextval blocks until this transaction commits, and an ALTER blocks while
+	// another session holds an in-progress nextval lock. M0118-0008
+	// (sequence-ddl isolation spec).
+	if tbl, ok := o.ctx.Catalog.LookupTable(s.Name); ok {
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+				ee.Pos = s.Pos()
+			}
+			return err
+		}
+	}
+
 	// Snapshot current state for sticky-default computation.
 	seq.mu.Lock()
 	curMin := seq.min

@@ -1,38 +1,34 @@
 (idle — nothing in flight)
 
-Last loop (#17, M0118-0008 PARTIAL): probe-first ranked all 25 DDL/VACUUM specs —
-NONE passed as-is (this group is the hard tail). Promoted `create-trigger` to
-pass-required (design 0118-0027) by adding the write+DDL siblings of the existing
-read-side `acquireScanReadLockTxn` (0118-0018, txn-scoped AccessShare):
-- `Context.acquireWriteLockTxn(rel)` → txn-scoped RowExclusiveLock, wired at
-  insertOp/updateOp/deleteOp.Open (operators_storage.go).
-- `Context.acquireDDLLockTxn(rel,mode)` → txn-scoped mode, wired at
-  execCreateTrigger (operators_ddl.go) with ShareRowExclusiveLock.
-Same confinement as read sibling (no-op when TxnLockBackendID==0 or system
-catalog). RowExclusiveLock self-compatible ⇒ concurrent DML never blocks at table
-level (pgbench TPC-B 0-failed). `TestPort_IsolationCreateTrigger` strict PASS.
-GATES: -race lockmgr/mvcc/executor PASS; full executor suite PASS; row-lock/
-deadlock/merge/timeout batch PASS; pgbench smoke 0-failed. CSV D-002 + coverage +
-inventory + port-status regenerated. Committed+pushed? (verify).
+Last loop (#20, M0118-0008): committed the in-flight `sequence-ddl` promotion that
+the prior loop built but left uncommitted (working_set wrongly said idle; tree had
+WIP). Verified coherent + committed (design 0118-0028):
+- `acquireSequenceLockTxn` (context.go): nextval RowExclusiveLock on the sequence
+  rel — held to commit in an explicit txn (TxnLockBackendID), transient
+  acquire+release under per-statement BackendID in autocommit (wait still happens
+  on acquire). Self-compatible ⇒ concurrent nextval/SERIAL never block.
+- `execAlterSequence` (operators_ddl.go): AccessExclusiveLock via acquireDDLLockTxn.
+- `evalNextval` (operators_sequence.go): resolves seq Table via LookupTable→RelFileNode.
+- `TestPort_IsolationSequenceDdl` strict PASS (5 perms).
+GATES: build PASS; sequence-ddl strict PASS; -race lockmgr+executor PASS; doc regen
+no-drift; pgbench smoke via pre-commit hook. CSV/coverage/inventory/port-status all
+current. Committed+pushed (verify next loop).
 
-NEXT loop candidates (remaining M0118 groups, all real-feature tails):
-- M0118-0008 remaining 24 specs (deferred, ledger 2026-06-22): biggest leverage =
-  ROLE/ACL infra (CREATE ROLE/GRANT/SET ROLE/ALTER TABLE OWNER + permission-denied)
-  unblocks truncate-conflict + vacuum-conflict + cluster-conflict{,-partition} (4
-  specs). sequence-ddl (ALTER SEQUENCE lock-on-nextval) is self-contained-ish.
-  alter-table-* need ADD/VALIDATE CONSTRAINT. reindex/partition/CIC/inherit-temp all
-  distinct features.
-- M0118-0002 predicate-hash (SSI granularity), M0118-0005 fk-deadlock/ri-trigger/
-  fk-partitioned, M0118-0007 eval-plan-qual, M0118-0009 misc (LISTEN/NOTIFY, 2PC,
-  pg_stat_*, horizons) — all deferred, all hard.
+NEXT loop candidates (remaining M0118-0008 DDL/VACUUM tail, all real-feature):
+- biggest leverage = ROLE/ACL infra (CREATE ROLE/GRANT/SET ROLE/ALTER TABLE OWNER +
+  permission-denied) unblocks truncate-conflict + vacuum-conflict + cluster-conflict
+  {,-partition} (4 specs).
+- alter-table-* need ADD/VALIDATE CONSTRAINT lock semantics. reindex-* need REINDEX
+  SCHEMA CONCURRENTLY parsing + allow_system_table_mods. multiple-cic/partition need
+  CIC waiting + ATTACH/DETACH. inherit-temp, plpgsql-toast distinct.
+- Other groups: M0118-0002 predicate-hash (SSI granularity), M0118-0005 fk-deadlock/
+  ri-trigger/fk-partitioned, M0118-0007 eval-plan-qual, M0118-0009 misc — all hard.
 
-GOTCHAS: isolation specs run goopg as SUBPROCESS (debug→file). tuplelock-upgrade-
-no-deadlock is TIMING-SENSITIVE — defers under heavy parallel test load on WSL2 but
-passes in isolation (NOT a regression; verify isolated before blaming a change).
-D-002 CSV is one giant single-line row #13 (field 6 rationale COMMA-FREE; append
-before `,M0060-0004`). regen: gen-isolation-coverage + gen-oracle-inventory +
-gen-oracle-port-status. PROBE pattern: throwaway zz_probe_test.go in
-internal/testport importing internal/testutil/cluster + framework; RunAndCompare,
-log status+Diff; delete after. NEVER `cd` into postgres/ in Bash (cwd persists →
-breaks `go test ./...`). never gofmt -w. Untracked postgres/ + weekly_loc.* +
-requirements.txt are stray — leave them.
+GOTCHAS: isolation specs run goopg as SUBPROCESS (debug→file). tuplelock-upgrade-no-
+deadlock TIMING-SENSITIVE on WSL2 under load (not a regression). D-002 CSV is one
+giant single-line row #13 (field 6 rationale COMMA-FREE; append before `,M0060-0004`).
+regen: gen-oracle-port-status + gen-isolation-coverage + gen-oracle-inventory. PROBE:
+throwaway zz_probe_test.go (RunAndCompare, log status+Diff). NEVER `cd` into postgres/.
+never gofmt -w. Untracked postgres/ + weekly_loc.* + requirements.txt are stray — leave.
+The "lone --live loop shows as 2 ralph_loop.sh" is the timeout subshell (ppid chain),
+NOT a concurrent loop — verify ppid before fearing tree corruption.

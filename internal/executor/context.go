@@ -779,6 +779,63 @@ func (c *Context) acquireDDLLockTxn(rel storage.RelFileNode, mode lockmgr.Mode) 
 	return c.acquireRelLockTxn(rel, mode, false)
 }
 
+// acquireSequenceLockTxn takes the heavyweight ROW EXCLUSIVE lock that nextval()
+// holds on a sequence relation, mirroring PostgreSQL's lock_and_open_sequence
+// (sequence.c, RowExclusiveLock). It conflicts with the AccessExclusiveLock that
+// ALTER SEQUENCE takes (acquireDDLLockTxn), so:
+//
+//   - inside an explicit transaction the lock is held until COMMIT/ROLLBACK
+//     under the transaction backend identity (TxnLockBackendID), so a later
+//     ALTER SEQUENCE in another session waits for this transaction to end; and
+//   - in autocommit the same lock is taken transiently under the per-statement
+//     backend identity and released as soon as it is granted — the WAIT still
+//     happens during acquisition (so an autocommit nextval blocks while another
+//     session holds a conflicting ALTER SEQUENCE lock from its open
+//     transaction), matching PostgreSQL's single-statement implicit transaction.
+//
+// RowExclusiveLock is self-compatible, so concurrent nextval()s (including
+// SERIAL/IDENTITY inserts) never block each other at the table level. System
+// catalogs (OID < firstNormalObjectOID) are skipped. M0118-0008 (sequence-ddl).
+func (c *Context) acquireSequenceLockTxn(rel storage.RelFileNode) error {
+	if rel.RelOid < firstNormalObjectOID {
+		return nil
+	}
+	if c.TxnLockBackendID != 0 {
+		// Explicit transaction: held until end-of-transaction.
+		return c.acquireRelLockTxn(rel, lockmgr.RowExclusiveLock, false)
+	}
+	// Autocommit: transient acquire+release under the per-statement backend ID.
+	// The per-statement BackendID is globally unique (minted from the same
+	// counter as LockBackendID) and never touches tableLockMgr elsewhere, so the
+	// targeted Release drops exactly this lock with no risk to other backends.
+	if c.BackendID == 0 {
+		return nil
+	}
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	if c.Activity != nil {
+		c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitRelationLock)
+	}
+	lockCtx := context.Background()
+	if c.Ctx != nil {
+		lockCtx = c.Ctx
+	}
+	err := tableLockMgr.AcquireWithTimeout(lockCtx, c.BackendID, tag, lockmgr.RowExclusiveLock, c.deadlockTimeout())
+	if c.Activity != nil {
+		c.Activity.WaitEventEnd(c.ProcNum)
+	}
+	if err == nil {
+		tableLockMgr.Release(c.BackendID, tag, lockmgr.RowExclusiveLock)
+		return nil
+	}
+	if err == lockmgr.ErrDeadlockDetected {
+		return &ExecError{Code: "40P01", Message: "deadlock detected"}
+	}
+	if ee := lockWaitCancelError(err); ee != nil {
+		return ee
+	}
+	return &ExecError{Code: "XX000", Message: err.Error()}
+}
+
 // lockWaitCancelError maps the cancellation/timeout error returned by a
 // lock-wait primitive (lockmgr.Acquire* or mvcc.WaitForXID) to the matching
 // SQLSTATE-57014 ExecError, or nil when err is not a recognised cancellation.

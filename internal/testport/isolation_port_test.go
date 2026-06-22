@@ -331,6 +331,20 @@ func TestPort_IsolationCreateTrigger(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/create-trigger.spec")
 }
 
+// TestPort_IsolationSequenceDdl exercises the sequence-ddl spec (M0118-0008).
+// nextval() takes a transaction-scoped RowExclusiveLock on the sequence
+// relation and ALTER SEQUENCE takes an AccessExclusiveLock; the two conflict,
+// so a concurrent nextval blocks while another session is mid-ALTER SEQUENCE
+// and a later ALTER SEQUENCE waits for an in-progress nextval to commit —
+// byte-identical to PG 18.3 across all five permutations.
+func TestPort_IsolationSequenceDdl(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_sequence_ddl")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/sequence-ddl.spec")
+}
+
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
 // Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
 func TestPort_IsolationFkSnapshot(t *testing.T) {

@@ -314,15 +314,26 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       CREATE TRIGGER txn commits while SELECT…FOR UPDATE (RowShareLock) proceeds.
       Same confinement (no-op in autocommit + system catalogs); RowExclusiveLock
       self-compatible so concurrent DML never blocks at table level (pgbench
-      smoke 0-failed). `TestPort_IsolationCreateTrigger` strict PASS. **Remaining
+      smoke 0-failed). `TestPort_IsolationCreateTrigger` strict PASS.
+      **2026-06-22 second promotion (design 0118-0028): `sequence-ddl` PROMOTED.**
+      `nextval()` now takes a transaction-scoped `RowExclusiveLock` on the
+      sequence relation (new `acquireSequenceLockTxn`: held to commit inside an
+      explicit txn; transient acquire+release under the globally-unique
+      per-statement `BackendID` in autocommit so the wait still happens during
+      acquisition — a single autocommit statement is its own implicit txn) and
+      `ALTER SEQUENCE` takes an `AccessExclusiveLock` via `acquireDDLLockTxn`
+      (mirrors upstream `lock_and_open_sequence`). Sequences are virtual catalog
+      relations (`IsSequence`, user OID) reached via `LookupTable`→`RelFileNode`;
+      `RowExclusiveLock` self-compatible so concurrent nextvals/SERIAL inserts
+      never block. `TestPort_IsolationSequenceDdl` strict PASS (5 perms);
+      `-race` lockmgr/executor; pgbench smoke 0-failed. **Remaining
       (deferred, ledger 2026-06-22):** `alter-table-*` (ADD/VALIDATE CONSTRAINT
       lock semantics), the `*-conflict` family — truncate/vacuum/cluster — (need
       CREATE ROLE/GRANT/SET ROLE privilege infra + permission-denied), `reindex-*`
       (REINDEX SCHEMA CONCURRENTLY parsing + `allow_system_table_mods` GUC +
-      concurrent wait), `sequence-ddl` (ALTER SEQUENCE lock-on-nextval),
-      `multiple-cic`/partition specs (CREATE INDEX CONCURRENTLY waiting +
-      ATTACH/DETACH PARTITION), `inherit-temp` (RELATION_IS_OTHER_TEMP exclusion),
-      `plpgsql-toast` (TOAST in PL/pgSQL). Group stays open.
+      concurrent wait), `multiple-cic`/partition specs (CREATE INDEX CONCURRENTLY
+      waiting + ATTACH/DETACH PARTITION), `inherit-temp` (RELATION_IS_OTHER_TEMP
+      exclusion), `plpgsql-toast` (TOAST in PL/pgSQL). Group stays open.
 - [ ] **M0118-0009** — Misc / system-level specs: async-notify, timeouts, stats, horizons,
       freeze-the-dead, inplace-inval, intra-grant-inplace{,-db}, subxid-overflow,
       prepared-transactions{,-cic}, temp-schema-cleanup, multixact-no-forget,
