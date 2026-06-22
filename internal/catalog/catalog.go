@@ -1143,6 +1143,7 @@ type Catalog interface {
 	CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool) (*Table, error)
 	DropView(name parser.ObjectName, ifExists bool) error
 	SetTableStats(table *Table, stats *TableStats)
+	UpdateRelStats(table *Table, pages int, tuples int64)
 	AddColumn(table *Table, col Column) (*Column, error)
 	DropTable(name parser.ObjectName) error
 	DropIndex(name parser.ObjectName) error
@@ -2835,6 +2836,19 @@ func (c *InMemory) registerSystemTables() {
 			if len(t.ToastReloptions) > 0 {
 				reltoastrelid = strconv.Itoa(int(t.OID) + toastRelidOffset)
 			}
+			// relpages / reltuples: 0 until VACUUM or ANALYZE has run (Stats==nil),
+			// then the persisted block count and live-tuple estimate. Mirrors
+			// pg_class — a freshly created, never-analyzed relation reads back as
+			// relpages=0 / reltuples=-1 in real PG, but goopg has historically
+			// surfaced 0 here, so keep 0 for the unanalyzed case to avoid churning
+			// every catalog-reading test; populate the real counts once Stats lands.
+			// M0118-0008 (vacuum-no-cleanup-lock).
+			relpages := "0"
+			reltuples := "0"
+			if t.Stats != nil {
+				relpages = strconv.Itoa(t.Stats.Pages)
+				reltuples = strconv.FormatInt(t.Stats.RowCount, 10)
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // 0:  oid
 				t.Name,                       // 1:  relname
@@ -2845,8 +2859,8 @@ func (c *InMemory) registerSystemTables() {
 				relam,                        // 6:  relam (heap=2; 0 for sequences)
 				strconv.Itoa(int(t.OID)),     // 7:  relfilenode
 				"0",                          // 8:  reltablespace
-				"0",                          // 9:  relpages
-				"0",                          // 10: reltuples
+				relpages,                     // 9:  relpages
+				reltuples,                    // 10: reltuples
 				"0",                          // 11: relallvisible
 				"0",                          // 12: relallfrozen
 				reltoastrelid,                // 13: reltoastrelid
@@ -6321,6 +6335,31 @@ func (c *InMemory) SetTableStats(table *Table, stats *TableStats) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	table.Stats = stats
+}
+
+// UpdateRelStats publishes VACUUM's pg_class.reltuples / relpages counters
+// (vac_update_relstats) without discarding any per-column pg_statistic from a
+// prior ANALYZE. Plain VACUUM recomputes the live-tuple count and block count
+// but does not sample column distributions, so it must merge into — not replace
+// — the existing Stats struct (mirrors upstream, where VACUUM and ANALYZE both
+// call vac_update_relstats but only ANALYZE rewrites pg_statistic). A nil Stats
+// is created on first VACUUM so pg_class surfaces a non-zero reltuples even
+// before the table has ever been ANALYZEd.
+func (c *InMemory) UpdateRelStats(table *Table, pages int, tuples int64) {
+	if table == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if table.Stats == nil {
+		table.Stats = &TableStats{Pages: pages, RowCount: tuples}
+		return
+	}
+	// Pointer-replace so a concurrent reader never sees a torn struct.
+	merged := *table.Stats
+	merged.Pages = pages
+	merged.RowCount = tuples
+	table.Stats = &merged
 }
 
 // DropView removes a view from the catalog. Errors when the

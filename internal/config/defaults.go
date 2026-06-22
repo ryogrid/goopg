@@ -649,6 +649,15 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextPostmaster,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// vacuum_multixact_freeze_min_age is the MultiXact-age analog of
+	// vacuum_freeze_min_age: the minimum MultiXactId age before VACUUM
+	// replaces a tuple's xmax MultiXact with a plain XID / FrozenTransactionId.
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_multixact_freeze_min_age", Type: TypeInt, BootVal: "5000000",
+		MinVal: 0, MaxVal: 1000000000,
+		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 
 	// Planner toggle GUCs. Upstream uses them for testing (`SET
 	// enable_seqscan = off` to force an index plan). v0's planner

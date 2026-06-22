@@ -595,9 +595,33 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       per-leaf CLUSTER processing + a faithful non-owner CLUSTER `must be owner of
       table` error (no `port` spec exercises a role that owns a leaf), `reindex-concurrently-toast` (`allow_system_table_mods`
       GUC + TOAST-relation reindex), partition specs (ATTACH/DETACH PARTITION),
-      `vacuum-no-cleanup-lock` (reltuples accounting), `plpgsql-toast` (TOAST in
+      `plpgsql-toast` (TOAST in
       PL/pgSQL). FK/MERGE/VACUUM inherit-temp filtering (bounded follow-up). Group
       stays open.
+      **2026-06-23 thirteenth promotion (design 0118-0045): `vacuum-no-cleanup-lock`
+      PROMOTED ⇒ all permutations byte-for-byte.** The spec asserts
+      `pg_class.relpages|reltuples` track what a non-aggressive `VACUUM` observes
+      even while a cursor pins the table's only heap page (no cleanup lock). Two
+      gaps: (1) registered the `vacuum_multixact_freeze_min_age` GUC (the
+      `vacuumer` setup SETs it; +`postgresql.conf.sample` line for the parity
+      gate); (2) the virtual `pg_class` builder (`catalog.VirtualRows`, the live
+      read path) hard-coded `relpages`/`reltuples` to `0` and nothing updated them
+      on VACUUM. New `catalog.(*InMemory).UpdateRelStats` (the `vac_update_relstats`
+      analog) overwrites `Pages`/`RowCount` while **merging** into any existing
+      `Stats` so a prior ANALYZE's per-column `pg_statistic` survives; the builder
+      reads `t.Stats` (nil ⇒ `0|0`, so untouched tables/the broad catalog-reading
+      surface are unchanged); `vacuumOp.Next` publishes after a successful vacuum.
+      Load-bearing subtlety: `reltuples` is published from `vacuum.Analyze`'s
+      **fresh-snapshot visible-tuple count**, NOT the prune's surviving-
+      line-pointer count — a recently-dead tuple (deleted+committed but not
+      removable because the pin holder holds `OldestXmin` back) survives the prune
+      yet must be excluded from `reltuples` (PG counts `HEAPTUPLE_LIVE`, not
+      `RECENTLY_DEAD`); the visible count gets it right (`22`→`21` in the pinholder
+      permutation). Heap `pg_class` write-once DDL row left at `0` (not the read
+      path). `TestPort_IsolationVacuumNoCleanupLock` strict PASS;
+      `TestUpdateRelStatsPreservesColumns`; `TestSampleConfigCoversRegistry`;
+      sibling vacuum/freeze specs PASS; `-race` vacuum/mvcc; executor/catalog/
+      config PASS; pgbench smoke.
       **2026-06-23 enabler (design 0118-0044, NOT a promotion):** made the
       isolation harness's `splitSQLStatements` dollar-quote aware (new
       `dollarOpener` + active-`dollarCloser` tracking) so a `do $$ … commit; …

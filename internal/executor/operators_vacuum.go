@@ -106,6 +106,20 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 			continue
 		}
 		stats, err := vacuum.VacuumWithOptions(o.ctx.Pool, o.ctx.TxnMgr, rel, opts)
+		if err == nil {
+			// Publish reltuples / relpages to pg_class (vac_update_relstats).
+			// reltuples is the count of tuples visible to a FRESH snapshot — the
+			// "currently live" definition upstream uses — NOT the prune's
+			// surviving-line-pointer count: a recently-dead tuple (deleted and
+			// committed, but not yet removable because a concurrent backend holds
+			// OldestXmin back) survives the prune yet must be excluded from
+			// reltuples, exactly as the vacuum-no-cleanup-lock spec requires.
+			// Preserves any per-column pg_statistic from a prior ANALYZE.
+			// M0118-0008 (vacuum-no-cleanup-lock).
+			if as, aerr := vacuum.Analyze(o.ctx.Pool, o.ctx.TxnMgr, rel, o.ctx.MultiXact); aerr == nil {
+				o.ctx.Catalog.UpdateRelStats(tbl, as.Pages, int64(as.Rows))
+			}
+		}
 		if err == nil && freezeBelow > 0 && stats.NewFrozenXID != 0 {
 			// Advance relfrozenxid to the lowest unfrozen xmin found.
 			tbl.RelFrozenXID = stats.NewFrozenXID

@@ -530,6 +530,22 @@ func TestPort_IsolationClusterConflictPartition(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/cluster-conflict-partition.spec")
 }
 
+// TestPort_IsolationVacuumNoCleanupLock exercises the vacuum-no-cleanup-lock
+// spec (M0118-0008). It asserts that pg_class.relpages / reltuples reflect what
+// VACUUM observes, even when a concurrent backend (a cursor holding a heap-page
+// pin) prevents VACUUM from acquiring a cleanup lock. goopg publishes reltuples
+// from a fresh-snapshot visible-tuple count (vac_update_relstats) so a recently
+// dead tuple — deleted and committed but not yet removable because the pin
+// holder holds OldestXmin back — is excluded from reltuples, matching PG 18.3.
+// The vacuumer session also SETs vacuum_multixact_freeze_min_age (new GUC).
+func TestPort_IsolationVacuumNoCleanupLock(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_vacuum_no_cleanup")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-no-cleanup-lock.spec")
+}
+
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
 // Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
 func TestPort_IsolationFkSnapshot(t *testing.T) {

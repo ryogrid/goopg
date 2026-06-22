@@ -257,6 +257,7 @@
 #application_name = ''                  # session label echoed in pg_stat_activity
 #session_authorization = ''             # role identity for the session
 #vacuum_freeze_min_age = 50000000       # 0-1000000000 xids
+#vacuum_multixact_freeze_min_age = 5000000  # 0-1000000000 multixacts
 
 # - Locale and Formatting -
 
