@@ -250,9 +250,17 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
 - [ ] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,
       temporal-range-integrity.
-- [ ] **M0118-0006** — MERGE & INSERT ON CONFLICT output parity: merge-{update,delete,
+- [x] **M0118-0006** — MERGE & INSERT ON CONFLICT output parity: merge-{update,delete,
       insert-update,match-recheck,join}, insert-conflict-do-update-{2,3,4},
-      insert-conflict-specconflict, insert-conflict-do-nothing-2.
+      insert-conflict-specconflict, insert-conflict-do-nothing-2. **COMPLETE
+      (2026-06-22, design 0118-0022).** All ten specs already matched PG 18.3
+      byte-for-byte by construction (MERGE executor + ON CONFLICT arbiter +
+      SSI/REPEATABLE-READ semantics were already correct from prior milestones);
+      this loop PROMOTED the group to pass-required with no engine change. New
+      `runIsoSpecStrict` helper hard-asserts a `pass` status (a non-pass result is
+      now a red test, not a silent `t.Skip` as with `runIsoSpec`), and the ten
+      dedicated `TestPort_IsolationMerge*` / `TestPort_IsolationInsertConflict*`
+      functions were switched to it. D-002 CSV rationale updated.
 - [ ] **M0118-0007** — Planner / output-format blockers: eval-plan-qual (planner
       RETURNING support), drop-index-concurrently-1 (EXPLAIN EXECUTE plan-format parity).
 - [ ] **M0118-0008** — DDL / VACUUM / maintenance concurrency: alter-table-{1,2,3,4},

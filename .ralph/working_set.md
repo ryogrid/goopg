@@ -1,43 +1,44 @@
-Task: M0118-0009 `subxid-overflow` — DONE this loop. Spec PROMOTED `failed`→`pass`.
-Design 0118-0021. Committing.
+Task: M0118-0006 — MERGE & INSERT ON CONFLICT output parity. COMPLETE this loop.
+Whole group CLOSED (design 0118-0022). Committing.
 
-WHAT LANDED (PL/pgSQL front-end only — NO MVCC/storage change):
-- The spec's recursive `gen_subxids(n)` function opens 100 nested subxids via
-  per-frame EXCEPTION handlers (overflows subxid cache) while other sessions probe
-  XidInMVCCSnapshot / XactLockTableWait. goopg's subxact visibility+lock machinery
-  was ALREADY correct — the function just wouldn't COMPILE. Two parser gaps:
-  1. Bare `RETURN;` rejected at parse (parseReturn always demanded an expr).
-     FIX: parseReturn accepts immediate `;` → ReturnStmt{Expr:nil}. Runtime
-     (plpgsql_runtime.go ReturnStmt arm) short-circuits nil Expr: trigger→
-     flowReturnTriggerNull; VOID fn→NullDatum/flowReturn; value fn→ExecError
-     42601 "missing expression" (mirrors upstream make_return_stmt).
-  2. `NULL;` no-op stmt (empty EXCEPTION handler body) → "unsupported PL/pgSQL
-     statement". FIX: new NullStmt AST node (ast.go), parseStmt case for KwNull
-     (parser.go), no-op runtime arm (plpgsql_runtime.go).
-- Files: internal/plpgsql/{parser.go,ast.go,parser_test.go},
-  internal/executor/plpgsql_runtime.go, internal/testport/isolation_port_test.go
-  (new TestPort_IsolationSubxidOverflow), docs/design/0118-0021-*.md + README,
-  docs/test-port inventory row 603 failed→pass + regen'd coverage/inventory md,
-  .ralph/fix_plan.md.
-- Replaced obsolete TestParseRejectsBareReturn with TestParseAcceptsBareReturn;
-  added TestParseNullStatement, TestParseExceptionHandlerNullBody.
+WHAT LANDED (NO engine change — promotion only):
+- All ten M0118-0006 specs already matched PG 18.3 byte-for-byte (verified via a
+  throwaway zz_probe_test.go that logged RunAndCompare .Status — every one
+  status=pass). The MERGE executor + EvalPlanQual recheck + ON CONFLICT arbiter +
+  SSI/REPEATABLE-READ DO NOTHING semantics all landed in prior milestones.
+- Promotion mechanism: new test helper `runIsoSpecStrict` (isolation_port_test.go)
+  — identical to `runIsoSpec` except a non-`pass` status is a `t.Errorf` (red
+  test) instead of `t.Skip`. Switched the ten dedicated test funcs to it:
+  TestPort_IsolationMerge{Update,Delete,InsertUpdate,MatchRecheck,Join},
+  TestPort_IsolationInsertConflict{DoUpdate2,DoUpdate3,DoUpdate4,Specconflict,
+  DoNothing2}.
+- Files: internal/testport/isolation_port_test.go (helper + 10 one-line switches),
+  docs/test-port/postgres-oracle-port-status.{csv,md} (D-002 rationale + regen),
+  docs/design/0118-0022-*.md + README row, .ralph/fix_plan.md ([x] M0118-0006).
+- Removed the throwaway zz_probe_test.go after use.
 
-Gates (green): TestPort_IsolationSubxidOverflow 4/4 PASS; plpgsql -race;
-executor plpgsql unit; isolation regression batch (FreezeTheDead, InplaceInval,
-MultixactNoForget, AbortedKeyrevoke, EvalPlanQualTrigger, DeleteAbortSavept) PASS;
-gofmt flags on ast.go/plpgsql_runtime.go are PRE-EXISTING go1.25-vs-1.26 churn (NOT
-my lines — never gofmt -w); pgbench smoke via pre-commit hook at commit.
+Gates (green): all 10 promoted tests PASS under strict gate (~55s);
+go vet ./internal/testport/ clean; make ralph-state-guard OK; pgbench smoke via
+pre-commit hook at commit.
 
-NEXT loop candidates (remaining M0118-0009 misc, all need NEW subsystems — probed
-this loop, ranked by cost): intra-grant-inplace (ALTER TABLE ADD PK must `<waiting>`
-on a GRANT's pg_class catalog-tuple xmax lock — needs catalog row lock; ~9 lines from
-match but semantic gap large); horizons ($$-dollar-quoted EXPLAIN bodies choke the
-isolation lexer + EXPLAIN FORMAT json + json `->` ops + explain_json()); temp-schema-
-cleanup (pg_my_temp_schema() + temp object cleanup on exit/DISCARD + advisory locks);
-stats (pg_stat_force_next_flush + pg_stat_* infra); async-notify (LISTEN/NOTIFY
-unimplemented in parser/executor — large); prepared-transactions (2PC). OR a different
-M0118 group (0118-0005 FK, 0118-0006 MERGE, 0118-0008 DDL/VACUUM).
+NEXT loop candidates (probed this loop, ranked by first-divergence cost):
+- intra-grant-inplace: output matches EXCEPT one `<waiting>` divergence on
+  `ALTER TABLE … ADD PRIMARY KEY` (addk2 should wait on GRANT's pg_class
+  catalog-tuple xmax). Closest by output, but needs pg_class catalog-tuple row
+  locks across 9 perms — large gap vs virtual pg_class. NOT cheap.
+- M0118-0005 FK: referential-integrity + fk-snapshot already PASS (soft anchors
+  exist) but ri-trigger DEFERS — group can't fully close; could promote the 2
+  passing ones strictly + document ri-trigger/fk-contention/fk-deadlock/
+  fk-partitioned/temporal-range-integrity as deferred. PARTIAL win available.
+- M0118-0008 DDL/VACUUM: sequence-ddl, vacuum-skip-locked, truncate-conflict,
+  vacuum-conflict, alter-table-1, create-trigger, inherit-temp ALL still defer
+  (probed) — real engine work.
+- M0118-0009 misc remaining (intra-grant-inplace-db needs pg_database.datfrozenxid
+  col; temp-schema-cleanup needs pg_my_temp_schema(); horizons needs $$-dollar-quote
+  isolation lexer + EXPLAIN FORMAT json + json `->`; async-notify LISTEN/NOTIFY;
+  prepared-transactions 2PC) — all NEW subsystems.
 
-GOTCHAS: never gofmt -w (go1.25 repo vs local 1.26). Isolation specs run goopg as a
-SUBPROCESS. CSV rationale comma-free. tpch-spotcheck INFRA-BLOCKED; pgbench smoke is
-the live guard. Untracked postgres/ + weekly_loc.* + requirements.txt are stray — leave.
+GOTCHAS: isolation specs run goopg as a SUBPROCESS. CSV rationale must be
+comma-free inside a field (it's a CSV). tpch-spotcheck INFRA-BLOCKED; pgbench
+smoke is the live guard. never gofmt -w (go1.25 repo vs local 1.26). Untracked
+postgres/ + weekly_loc.* + requirements.txt are stray — leave them.

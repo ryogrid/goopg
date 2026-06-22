@@ -158,6 +158,29 @@ func runIsoSpec(t *testing.T, root string, c *cluster.Cluster, specRelPath strin
 	}
 }
 
+// runIsoSpecStrict is the pass-required variant of runIsoSpec: the spec MUST
+// match PG 18.3 byte-for-byte. Unlike runIsoSpec (which t.Skip()s a `defer`
+// result so an unported spec does not turn the suite red), a non-`pass` status
+// here is a hard test failure. Use it only for specs that have been promoted to
+// pass_required in docs/test-port (D-002) — a regression must surface as a red
+// test, not a silent skip.
+func runIsoSpecStrict(t *testing.T, root string, c *cluster.Cluster, specRelPath string) {
+	t.Helper()
+	dsn := buildDSN(t, c)
+	runner := &framework.IsolationRunner{DSN: dsn}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	result := runner.RunAndCompare(ctx, root, specRelPath)
+	if result.Status != "pass" {
+		t.Errorf("pass-required spec %s did not match PG (status=%q):\n%s",
+			specRelPath, result.Status, result.Diff)
+		return
+	}
+	t.Logf("PASS: %s", specRelPath)
+}
+
 // ── M0096-0001 dedicated sequential isolation tests ──────────────────────────
 //
 // One function per spec from the 21-spec RC isolation target list.
@@ -223,7 +246,7 @@ func TestPort_IsolationInsertConflictDoUpdate2(t *testing.T) {
 	c := newCluster(t, "iso_icd_update2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-2.spec")
 }
 
 // TestPort_IsolationInsertConflictDoUpdate3 exercises the insert-conflict-do-update-3 spec.
@@ -233,7 +256,7 @@ func TestPort_IsolationInsertConflictDoUpdate3(t *testing.T) {
 	c := newCluster(t, "iso_icd_update3")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-3.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-3.spec")
 }
 
 // TestPort_IsolationInsertConflictDoUpdate4 exercises the insert-conflict-do-update-4 spec.
@@ -243,7 +266,7 @@ func TestPort_IsolationInsertConflictDoUpdate4(t *testing.T) {
 	c := newCluster(t, "iso_icd_update4")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-4.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-4.spec")
 }
 
 // TestPort_IsolationInsertConflictDoNothing exercises the insert-conflict-do-nothing spec.
@@ -266,7 +289,7 @@ func TestPort_IsolationInsertConflictDoNothing2(t *testing.T) {
 	c := newCluster(t, "iso_icd_nothing2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-nothing-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-nothing-2.spec")
 }
 
 // TestPort_IsolationInsertConflictSpecconflict exercises the insert-conflict-specconflict spec.
@@ -276,7 +299,7 @@ func TestPort_IsolationInsertConflictSpecconflict(t *testing.T) {
 	c := newCluster(t, "iso_icd_specconf")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-specconflict.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-specconflict.spec")
 }
 
 // TestPort_IsolationDropIndexConcurrently1 exercises the drop-index-concurrently-1 spec.
@@ -346,7 +369,7 @@ func TestPort_IsolationMergeUpdate(t *testing.T) {
 	c := newCluster(t, "iso_merge_update")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-update.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/merge-update.spec")
 }
 
 // TestPort_IsolationMergeDelete exercises the merge-delete spec.
@@ -356,7 +379,7 @@ func TestPort_IsolationMergeDelete(t *testing.T) {
 	c := newCluster(t, "iso_merge_delete")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-delete.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/merge-delete.spec")
 }
 
 // TestPort_IsolationMergeInsertUpdate exercises the merge-insert-update spec.
@@ -366,7 +389,7 @@ func TestPort_IsolationMergeInsertUpdate(t *testing.T) {
 	c := newCluster(t, "iso_merge_ins_upd")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-insert-update.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/merge-insert-update.spec")
 }
 
 // TestPort_IsolationMergeMatchRecheck exercises the merge-match-recheck spec.
@@ -376,7 +399,7 @@ func TestPort_IsolationMergeMatchRecheck(t *testing.T) {
 	c := newCluster(t, "iso_merge_recheck")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-match-recheck.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/merge-match-recheck.spec")
 }
 
 // TestPort_IsolationMergeJoin exercises the merge-join spec.
@@ -386,7 +409,7 @@ func TestPort_IsolationMergeJoin(t *testing.T) {
 	c := newCluster(t, "iso_merge_join")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-join.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/merge-join.spec")
 }
 
 // ── M0118-0001 SSI / SERIALIZABLE anomaly specs ──────────────────────────────
