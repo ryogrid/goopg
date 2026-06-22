@@ -318,6 +318,19 @@ func TestPort_IsolationDropIndexConcurrently1(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/drop-index-concurrently-1.spec")
 }
 
+// TestPort_IsolationCreateTrigger exercises the create-trigger spec
+// (M0118-0008). CREATE TRIGGER takes a transaction-scoped ShareRowExclusiveLock
+// on the table; a concurrent UPDATE (RowExclusiveLock) blocks until the
+// CREATE TRIGGER transaction commits, while a concurrent SELECT ... FOR UPDATE
+// (RowShareLock) proceeds — byte-identical to PG 18.3.
+func TestPort_IsolationCreateTrigger(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_create_trigger")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/create-trigger.spec")
+}
+
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
 // Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
 func TestPort_IsolationFkSnapshot(t *testing.T) {

@@ -305,6 +305,24 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       multiple-cic, vacuum-{concurrent-drop,conflict,no-cleanup-lock,skip-locked},
       truncate-conflict, sequence-ddl, cluster-conflict{,-partition}, create-trigger,
       inherit-temp, plpgsql-toast.
+      **PARTIAL (2026-06-22, design 0118-0027):** probe-first ranked all 25 specs;
+      none passed as-is (the group's hard tail). `create-trigger` promoted to
+      pass-required — CREATE TRIGGER now takes a txn-scoped ShareRowExclusiveLock
+      (`acquireDDLLockTxn`) and INSERT/UPDATE/DELETE a txn-scoped RowExclusiveLock
+      (`acquireWriteLockTxn`), the write/DDL siblings of the read-side
+      `acquireScanReadLockTxn` (0118-0018); a concurrent UPDATE blocks until the
+      CREATE TRIGGER txn commits while SELECT…FOR UPDATE (RowShareLock) proceeds.
+      Same confinement (no-op in autocommit + system catalogs); RowExclusiveLock
+      self-compatible so concurrent DML never blocks at table level (pgbench
+      smoke 0-failed). `TestPort_IsolationCreateTrigger` strict PASS. **Remaining
+      (deferred, ledger 2026-06-22):** `alter-table-*` (ADD/VALIDATE CONSTRAINT
+      lock semantics), the `*-conflict` family — truncate/vacuum/cluster — (need
+      CREATE ROLE/GRANT/SET ROLE privilege infra + permission-denied), `reindex-*`
+      (REINDEX SCHEMA CONCURRENTLY parsing + `allow_system_table_mods` GUC +
+      concurrent wait), `sequence-ddl` (ALTER SEQUENCE lock-on-nextval),
+      `multiple-cic`/partition specs (CREATE INDEX CONCURRENTLY waiting +
+      ATTACH/DETACH PARTITION), `inherit-temp` (RELATION_IS_OTHER_TEMP exclusion),
+      `plpgsql-toast` (TOAST in PL/pgSQL). Group stays open.
 - [ ] **M0118-0009** — Misc / system-level specs: async-notify, timeouts, stats, horizons,
       freeze-the-dead, inplace-inval, intra-grant-inplace{,-db}, subxid-overflow,
       prepared-transactions{,-cic}, temp-schema-cleanup, multixact-no-forget,

@@ -8850,6 +8850,18 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
+	// CREATE TRIGGER takes a transaction-scoped ShareRowExclusiveLock on the
+	// table (mirrors PostgreSQL): it conflicts with concurrent writes
+	// (RowExclusiveLock) but not reads (AccessShareLock) or SELECT ... FOR
+	// UPDATE (RowShareLock), so a concurrent UPDATE blocks until this
+	// transaction commits while a concurrent read proceeds. M0118-0008
+	// (create-trigger isolation spec).
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = s.Pos()
+		}
+		return err
+	}
 	trig := catalog.Trigger{
 		Name:       s.Name,
 		TableOID:   tbl.OID,

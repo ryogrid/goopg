@@ -742,6 +742,43 @@ func (c *Context) acquireScanReadLockTxn(rel storage.RelFileNode) error {
 	return c.acquireRelLockTxn(rel, lockmgr.AccessShareLock, false)
 }
 
+// acquireWriteLockTxn takes a transaction-scoped ROW EXCLUSIVE heavyweight lock
+// on a relation a DML write (INSERT/UPDATE/DELETE) is about to modify, so a
+// concurrent CREATE TRIGGER / CREATE INDEX / ALTER TABLE (any acquirer of
+// ShareLock / ShareRowExclusiveLock / ExclusiveLock / AccessExclusiveLock) in
+// another session blocks until this transaction ends — matching PostgreSQL,
+// where the target of a write is locked in ROW EXCLUSIVE mode for the lifetime
+// of the transaction.
+//
+// Same confinement as acquireScanReadLockTxn (the read-side sibling): a no-op
+// outside an explicit transaction block and for system catalogs. ROW EXCLUSIVE
+// is self-compatible and compatible with ACCESS SHARE / ROW SHARE / ROW
+// EXCLUSIVE, so concurrent DML on the same relation never blocks at the table
+// level (it only conflicts with DDL-grade lock modes), keeping the common path
+// — including pgbench's UPDATE-heavy TPC-B — free of new cross-session blocking.
+// This is the write half of the table-level DDL/DML conflict machinery used by
+// the create-trigger isolation spec. M0118-0008.
+func (c *Context) acquireWriteLockTxn(rel storage.RelFileNode) error {
+	if c.TxnLockBackendID == 0 || rel.RelOid < firstNormalObjectOID {
+		return nil
+	}
+	return c.acquireRelLockTxn(rel, lockmgr.RowExclusiveLock, false)
+}
+
+// acquireDDLLockTxn takes a transaction-scoped heavyweight lock in the requested
+// mode on a relation a DDL statement is about to alter, so the lock is held
+// until COMMIT/ROLLBACK and conflicting concurrent DML/DDL blocks. CREATE
+// TRIGGER uses ShareRowExclusiveLock (conflicts with concurrent writes but not
+// reads or SELECT ... FOR UPDATE), mirroring PostgreSQL. Same confinement as the
+// scan/write siblings: a no-op outside an explicit transaction and for system
+// catalogs. M0118-0008.
+func (c *Context) acquireDDLLockTxn(rel storage.RelFileNode, mode lockmgr.Mode) error {
+	if c.TxnLockBackendID == 0 || rel.RelOid < firstNormalObjectOID {
+		return nil
+	}
+	return c.acquireRelLockTxn(rel, mode, false)
+}
+
 // lockWaitCancelError maps the cancellation/timeout error returned by a
 // lock-wait primitive (lockmgr.Acquire* or mvcc.WaitForXID) to the matching
 // SQLSTATE-57014 ExecError, or nil when err is not a recognised cancellation.

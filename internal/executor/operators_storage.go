@@ -1113,6 +1113,12 @@ func (o *insertOp) Open(ctx *Context) error {
 		}
 		return err
 	}
+	if err := ctx.acquireWriteLockTxn(rel); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 	return o.child.Open(ctx)
 }
 
@@ -2521,6 +2527,12 @@ func (o *updateOp) Open(ctx *Context) error {
 		}
 		return err
 	}
+	if err := ctx.acquireWriteLockTxn(rel); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 	return nil
 }
 
@@ -3758,6 +3770,12 @@ func (o *deleteOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
+	if err := ctx.acquireWriteLockTxn(rel); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
