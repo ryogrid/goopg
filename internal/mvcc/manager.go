@@ -424,7 +424,14 @@ func (m *Manager) AllocateSubXid(parentXid storage.TransactionID) (storage.Trans
 			"mvcc: database must be vacuumed within %d transactions to prevent XID wraparound",
 			^storage.TransactionID(0)-subXid)
 	}
-	m.addSubxactEntry(subXid, parentXid)
+	// Register through RegisterSubXid (not addSubxactEntry directly) so the
+	// subxid→parent link lands in the persistent SubxactMap when one is attached
+	// (initdb.Open's SetSubxactMap, the real-server path). TopLevelXid / IsAborted
+	// / MarkSubxactAborted all read the attached map first; writing only the
+	// in-memory subxactParents fallback here would leave TopLevelXid(subxid)
+	// unresolved, so xidActiveWithSubxact would report a savepoint-scoped row lock
+	// as dead and conflicting waiters would never block on it. M0118-0004.
+	m.RegisterSubXid(subXid, parentXid)
 	return subXid, nil
 }
 

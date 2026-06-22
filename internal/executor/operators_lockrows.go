@@ -719,7 +719,7 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 	if gerr == nil &&
 		tup.Header.Xmax != storage.InvalidTransactionID &&
 		!storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
-		tup.Header.Xmax != o.ctx.Tx.XID {
+		!o.isSelfXID(tup.Header.Xmax) {
 
 		keysUpdated := (tup.Header.Infomask2 & storage.HeapKeysUpdated) != 0
 		keyConflict := o.lockStrength == storage.HeapXmaxExclLock || keysUpdated
@@ -952,7 +952,7 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 	if gerr == nil &&
 		tup.Header.Xmax != storage.InvalidTransactionID &&
 		storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
-		tup.Header.Xmax != o.ctx.Tx.XID &&
+		!o.isSelfXID(tup.Header.Xmax) &&
 		tupleLockConflicts(o.lockMemberStatus(), tup.Header.Infomask, tup.Header.Infomask2) {
 
 		// Conflict resolution honours the wait policy (M0118-0003):
@@ -1031,7 +1031,7 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 	if o.ctx.MultiXact != nil &&
 		tup.Header.Xmax != storage.InvalidTransactionID &&
 		storage.IsHeapTupleLockOnly(tup.Header.Infomask) &&
-		tup.Header.Xmax != o.ctx.Tx.XID {
+		!o.isSelfXID(tup.Header.Xmax) {
 		multiPtr, combined, merr := o.stampMultiLock(slot, ptr, tup.Header)
 		if merr != nil {
 			slot.Unlock()
@@ -1046,7 +1046,8 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		// No surviving active holder to combine with — fall through to the
 		// single-holder stamp below.
 	}
-	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, o.ctx.Tx.XID, o.lockStrength); err != nil {
+	wxid := o.writerXID()
+	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, wxid, o.lockStrength); err != nil {
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
 		return storage.ItemPointer{}, false, false, err
@@ -1059,7 +1060,7 @@ func (o *lockRowsOp) stampLockInner(rel storage.RelFileNode, ptr storage.ItemPoi
 		o.ctx.Pool.Unpin(slot)
 		return storage.ItemPointer{}, false, false, err
 	}
-	derr := markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, o.lockStrength)
+	derr := markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, wxid, o.lockStrength)
 	slot.Unlock()
 	o.ctx.Pool.Unpin(slot)
 	return ptr, false, false, derr
@@ -1085,7 +1086,8 @@ func (o *lockRowsOp) stampAtPtr(rel storage.RelFileNode, ptr storage.ItemPointer
 		o.ctx.Pool.Unpin(slot)
 		return storage.ItemPointer{}, false, nil
 	}
-	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, o.ctx.Tx.XID, o.lockStrength); err != nil {
+	wxid := o.writerXID()
+	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, wxid, o.lockStrength); err != nil {
 		slot.Unlock()
 		o.ctx.Pool.Unpin(slot)
 		return storage.ItemPointer{}, false, err
@@ -1095,7 +1097,7 @@ func (o *lockRowsOp) stampAtPtr(rel storage.RelFileNode, ptr storage.ItemPointer
 		o.ctx.Pool.Unpin(slot)
 		return storage.ItemPointer{}, false, err
 	}
-	derr := markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, o.lockStrength)
+	derr := markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, wxid, o.lockStrength)
 	slot.Unlock()
 	o.ctx.Pool.Unpin(slot)
 	return ptr, false, derr
@@ -1119,7 +1121,7 @@ func (o *lockRowsOp) anotherRealUpdaterArrived(h storage.HeapTupleHeader) bool {
 			return false
 		}
 	}
-	return effXmax != o.ctx.Tx.XID
+	return !o.isSelfXID(effXmax)
 }
 
 // epqRecheckFilter reads the heap tuple at (rel, ptr), decodes it using
@@ -1292,6 +1294,48 @@ func (o *lockRowsOp) lockMemberStatus() multixact.Status {
 	return multixact.StatusForKeyShare
 }
 
+// writerXID returns the (sub)transaction id this lock acquisition must be
+// STAMPED under. Inside an open savepoint it is the current sub-XID — the
+// statement's own context still carries the top-level XID (the per-statement
+// ectx.Tx is rebuilt from the session's top-level transaction each Query), so
+// the live sub-XID is read from the session. Recording the lock under the
+// sub-XID is what lets ROLLBACK TO SAVEPOINT revert it: the aborted sub-XID's
+// member drops out of the multixact, restoring the pre-savepoint lock strength.
+// Mirrors heap_lock_tuple stamping GetCurrentTransactionId(). Outside a
+// savepoint EffectiveWriterXID() == the top-level XID, so this is a strict
+// no-op. M0118-0004 (docs/design/0118-0012).
+func (o *lockRowsOp) writerXID() storage.TransactionID {
+	if sess, ok := o.ctx.Session.(*BasicSession); ok {
+		if x := sess.EffectiveWriterXID(); x != storage.InvalidTransactionID {
+			return x
+		}
+	}
+	return o.ctx.Tx.XID
+}
+
+// isSelfXID reports whether xid belongs to this backend's own transaction tree
+// — the top-level xact or any of its sub-xacts. A subtransaction must never
+// wait on, nor clobber, a lock its own parent or a sibling savepoint holds:
+// when s1 upgrades FOR KEY SHARE → FOR SHARE → FOR NO KEY UPDATE across nested
+// savepoints, each strength is a separate multixact member under a distinct
+// sub-XID, and they are all "self". Because the statement's own o.ctx.Tx.XID is
+// the top-level XID, the plain `m.Xid == o.ctx.Tx.XID` test would miss a member
+// stamped under a sub-XID; resolving both sides to their top-level ancestor
+// catches the whole tree. Reduces to xid == o.ctx.Tx.XID when no savepoint is
+// open. M0118-0004 (docs/design/0118-0012).
+func (o *lockRowsOp) isSelfXID(xid storage.TransactionID) bool {
+	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	if xid == o.ctx.Tx.XID {
+		return true
+	}
+	if o.ctx.TxnMgr == nil {
+		return false
+	}
+	return o.ctx.TxnMgr.TopLevelXid(xid) == o.ctx.TxnMgr.TopLevelXid(o.ctx.Tx.XID)
+}
+
 // activeLockHolders returns the still-active transactions holding a row lock on
 // a tuple whose xmax is `xmax` with hint bits `infomask`. For a single-xid
 // lock-only xmax it is at most the one holder; for a MultiXactId xmax
@@ -1314,13 +1358,13 @@ func (o *lockRowsOp) activeLockHolders(xmax storage.TransactionID, infomask uint
 		}
 		var out []storage.TransactionID
 		for _, m := range members {
-			if m.Xid != o.ctx.Tx.XID && o.ctx.TxnMgr.IsXIDActive(m.Xid) {
+			if !o.isSelfXID(m.Xid) && o.ctx.TxnMgr.IsXIDActive(m.Xid) {
 				out = append(out, m.Xid)
 			}
 		}
 		return out
 	}
-	if xmax != o.ctx.Tx.XID && o.ctx.TxnMgr.IsXIDActive(xmax) {
+	if !o.isSelfXID(xmax) && o.ctx.TxnMgr.IsXIDActive(xmax) {
 		return []storage.TransactionID{xmax}
 	}
 	return nil
@@ -1354,7 +1398,7 @@ func (o *lockRowsOp) conflictingLockHolders(xmax storage.TransactionID, infomask
 		}
 		var out []storage.TransactionID
 		for _, m := range members {
-			if m.Xid == o.ctx.Tx.XID || !o.ctx.TxnMgr.IsXIDActive(m.Xid) {
+			if o.isSelfXID(m.Xid) || !o.ctx.TxnMgr.IsXIDActive(m.Xid) {
 				continue
 			}
 			if multixact.StatusesConflict(m.Status, req) {
@@ -1363,7 +1407,7 @@ func (o *lockRowsOp) conflictingLockHolders(xmax storage.TransactionID, infomask
 		}
 		return out
 	}
-	if xmax == o.ctx.Tx.XID || !o.ctx.TxnMgr.IsXIDActive(xmax) {
+	if o.isSelfXID(xmax) || !o.ctx.TxnMgr.IsXIDActive(xmax) {
 		return nil
 	}
 	if multixact.StatusesConflict(lockOnlyMemberStatus(infomask, infomask2), req) {
@@ -1401,9 +1445,16 @@ func (o *lockRowsOp) stampMultiLock(slot *storage.Slot, ptr storage.ItemPointer,
 	// Keep only members whose transaction is still in progress — a dead
 	// locker's lock is released and must not be carried forward. (Committed-
 	// updater retention is part of the deferred updater-bearing multi producer.)
+	// Re-add only the member stamped under our CURRENT (sub)transaction; an
+	// outer-level self member (the top-level XID, or a parent savepoint's
+	// sub-XID) is a still-held weaker lock that must be carried forward as a
+	// survivor, so ROLLBACK TO an inner savepoint reverts to it. Exact-match on
+	// writerXID (not isSelfXID) is deliberate: isSelfXID would collapse the whole
+	// transaction tree into one member and lose the outer-level locks. M0118-0004.
+	wxid := o.writerXID()
 	survivors := make([]multixact.Member, 0, len(existing)+1)
 	for _, m := range existing {
-		if m.Xid == o.ctx.Tx.XID {
+		if m.Xid == wxid {
 			continue // re-added once below with our current strength
 		}
 		if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(m.Xid) {
@@ -1413,7 +1464,7 @@ func (o *lockRowsOp) stampMultiLock(slot *storage.Slot, ptr storage.ItemPointer,
 	if len(survivors) == 0 {
 		return storage.ItemPointer{}, false, nil
 	}
-	survivors = append(survivors, multixact.Member{Xid: o.ctx.Tx.XID, Status: o.lockMemberStatus()})
+	survivors = append(survivors, multixact.Member{Xid: wxid, Status: o.lockMemberStatus()})
 
 	multi, err := o.ctx.MultiXact.CreateFromMembers(survivors)
 	if err != nil {
@@ -1480,9 +1531,10 @@ func (o *lockRowsOp) stampMultiUpdaterLock(slot *storage.Slot, ptr storage.ItemP
 	// Keep members still of interest (MultiXactIdExpand, multixact.c:561):
 	// in-progress holders, plus a committed updater. Drop dead pure lockers and
 	// an aborted updater.
+	wxid := o.writerXID()
 	survivors := make([]multixact.Member, 0, len(existing)+1)
 	for _, m := range existing {
-		if m.Xid == o.ctx.Tx.XID {
+		if m.Xid == wxid {
 			continue // re-added once below at our current strength
 		}
 		switch {
@@ -1498,7 +1550,7 @@ func (o *lockRowsOp) stampMultiUpdaterLock(slot *storage.Slot, ptr storage.ItemP
 		// aborted): nothing to combine with — caller preserves the skip.
 		return storage.ItemPointer{}, false, nil
 	}
-	survivors = append(survivors, multixact.Member{Xid: o.ctx.Tx.XID, Status: o.lockMemberStatus()})
+	survivors = append(survivors, multixact.Member{Xid: wxid, Status: o.lockMemberStatus()})
 
 	multi, err := o.ctx.MultiXact.CreateFromMembers(survivors)
 	if err != nil {
@@ -1600,7 +1652,7 @@ func (o *lockRowsOp) classifyChainConflict(hdr storage.HeapTupleHeader, self sto
 	}
 	reqStatus := o.lockMemberStatus()
 	for _, m := range o.chainMembers(hdr, self) {
-		if m.Xid == o.ctx.Tx.XID {
+		if o.isSelfXID(m.Xid) {
 			continue // already locked by us
 		}
 		switch {
@@ -1679,7 +1731,7 @@ func (o *lockRowsOp) propagateLockForward(rel storage.RelFileNode, start storage
 		// conflicting in-flight holder forces a WAIT (then a re-read of the SAME
 		// version, like its `goto l4`); a committed conflicting updater ends the
 		// walk with TM_Updated / TM_Deleted.
-		if tup.Header.Xmax != storage.InvalidTransactionID && tup.Header.Xmax != o.ctx.Tx.XID {
+		if tup.Header.Xmax != storage.InvalidTransactionID && !o.isSelfXID(tup.Header.Xmax) {
 			needWait, waitXID, committedConflict := o.classifyChainConflict(tup.Header, cur)
 			if needWait {
 				slot.Unlock()
@@ -1739,7 +1791,7 @@ func (o *lockRowsOp) propagateLockForward(rel storage.RelFileNode, start storage
 // our lock-only xmax is stamped directly. A surviving foreign *updater* that
 // cannot be combined is left untouched so we never clobber a real updater's xmax.
 func (o *lockRowsOp) lockSuccessorVersion(slot *storage.Slot, rel storage.RelFileNode, ptr storage.ItemPointer, hdr storage.HeapTupleHeader) error {
-	if hdr.Xmax != storage.InvalidTransactionID && hdr.Xmax != o.ctx.Tx.XID && o.ctx.MultiXact != nil {
+	if hdr.Xmax != storage.InvalidTransactionID && !o.isSelfXID(hdr.Xmax) && o.ctx.MultiXact != nil {
 		if storage.IsHeapTupleLockOnly(hdr.Infomask) {
 			if _, combined, err := o.stampMultiLock(slot, ptr, hdr); err != nil {
 				return err
@@ -1759,13 +1811,14 @@ func (o *lockRowsOp) lockSuccessorVersion(slot *storage.Slot, rel storage.RelFil
 			return nil
 		}
 	}
-	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, o.ctx.Tx.XID, o.lockStrength); err != nil {
+	wxid := o.writerXID()
+	if err := storage.PageSetHeapTupleLockOnly(slot.Page(), ptr.Offset, wxid, o.lockStrength); err != nil {
 		return err
 	}
 	if err := storage.PageSetHeapTupleLockKeysUpdated(slot.Page(), ptr.Offset, o.lockKeysUpdated); err != nil {
 		return err
 	}
-	return markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, o.lockStrength)
+	return markHeapLockDirty(o.ctx.Pool, slot, rel, ptr.Block, ptr.Offset, wxid, o.lockStrength)
 }
 
 // markHeapLockDirty centralises the choice between

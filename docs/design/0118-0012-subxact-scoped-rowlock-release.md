@@ -2,7 +2,7 @@
 
 * Milestone: M0118-0004 (deadlock-detection slice)
 * Spec: `postgres/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec`, permutation 9
-* Status: **partially implemented** — Gaps A/B/C landed & gated (spec divergence moved from expected L216 → L238); Gap D (locks stamped under the top-level xid, not the savepoint subxid) discovered mid-loop and deferred — see §6.
+* Status: **complete** — all four gaps (A/B/C/D) landed & gated; `TestPort_IsolationTuplelockUpgradeNoDeadlock` PASSES all 9 permutations byte-identical vs PG 18.3. Gaps A/B/C in §5; Gap D resolution in §6.
 * Predecessors: [[0118-0008]] (chain-tail sentinel), [[0118-0009]] (read-side multixact-aware updater wait), [[0118-0010]] (write-side EPQ-wait), [[0118-0011]] (locker-preserving producer — got the spec to **8/9** permutations)
 * Subxact infrastructure: [[0050-0001]] (subxact stack & state machine), [[0050-0002]] (subxact xid & visibility)
 
@@ -228,6 +228,86 @@ not block on or clobber its own parent/sibling members. That is a higher-blast-r
 change (it alters what xid a lock is stamped under and touches every self-check on the
 row-lock path) and contradicts the current uniform top-level-stamping convention — its
 own loop, with the full gate suite of §4. Deferred (ledger 2026-06-22).
+
+## 6. Gap D resolution — subxid-scoped lock stamping + the latent SubxactMap split (landed)
+
+Gap D landed in its own loop (2026-06-22) and brought perm 9 to a full PASS. Two
+distinct fixes were needed; the second was a latent inconsistency the first exposed.
+
+### 6.1 Stamp lock members under the effective writer xid; make self-checks tree-aware
+
+The per-statement executor `Context.Tx.XID` is **always the top-level xid**: each
+`Query` message rebuilds `ectx.Tx` from `connTx.Tx()` → `session.CurrentTransaction()`
+= `session.tx` (top-level). `execSavepoint`'s `o.ctx.Tx.XID = subXid` only mutates that
+one statement's context *copy*; it is discarded at end-of-statement and never written
+back to `session.tx`. The live savepoint subxid lives on the session as
+`currentSubXid`, surfaced by `session.EffectiveWriterXID()`.
+
+Two new `lockRowsOp` helpers (`operators_lockrows.go`):
+
+* **`writerXID()`** — the xid a lock is STAMPED under: `session.EffectiveWriterXID()`
+  (the current sub-XID inside a savepoint, else the top-level xid). Used at every
+  lock-only stamp site (`PageSetHeapTupleLockOnly` / `markHeapLockDirty` in
+  `stampLockInner` / `stampAtPtr` / `lockSuccessorVersion`) and for the member re-added
+  by `stampMultiLock` / `stampMultiUpdaterLock`. The drop-and-re-add survivor filter
+  matches the **exact** `writerXID()` (not the tree) so an outer-level self member (the
+  top-level KS, or a parent savepoint's SHARE) is carried forward as a survivor instead
+  of being collapsed away — that is what lets `ROLLBACK TO` an inner savepoint revert to
+  the outer strength.
+* **`isSelfXID(xid)`** — whether `xid` belongs to this backend's transaction tree
+  (top-level xact or any sub-xact), via `Manager.TopLevelXid` on both sides. Replaces
+  every `m.Xid == o.ctx.Tx.XID` / `tup.Header.Xmax != o.ctx.Tx.XID` self/conflict gate
+  in the row-lock path (`activeLockHolders`, `conflictingLockHolders`,
+  `classifyChainConflict`, `anotherRealUpdaterArrived`, `propagateLockForward`,
+  `lockSuccessorVersion`, and the three `stampLockInner` branch gates). `IsSelfXID`
+  itself is **not** reusable here: it resolves *currentXID* upward and only matches when
+  *currentXID* is the subxact — but here `o.ctx.Tx.XID` is the top-level and the *member*
+  is the subxid, the reverse direction. Resolving both sides to their top-level ancestor
+  catches the whole tree and reduces to `==` when no savepoint is open.
+
+Both helpers are strict no-ops outside a savepoint (`EffectiveWriterXID()` == top-level
+xid; `TopLevelXid(x)` == x), so the 8 already-passing permutations and every other
+isolation spec are unaffected — confirmed by the full regression batch.
+
+### 6.2 The latent split: `AllocateSubXid` wrote the wrong subxact map
+
+With §6.1, s1's upgrades correctly became members `{subE:SHARE, subF:NKU}` — but s2
+*still* did not block at step 8 (it completed immediately). Root cause: a pre-existing
+inconsistency that only a subxid-stamped lock member could expose.
+
+`Manager` has two subxact stores: the in-memory `subxactParents`/`subxactAborted` maps
+(fallback) and an **attached** persistent `SubxactMap` (pg_subtrans-backed, installed by
+`initdb.Open` via `SetSubxactMap` — i.e. present on the **real server**, absent in most
+unit tests). `TopLevelXid` / `IsAborted` / `MarkSubxactAborted` all prefer the attached
+map. But `AllocateSubXid` registered the parent link via `addSubxactEntry`, which writes
+**only** the fallback map. On the real server the link therefore never reached the map
+`TopLevelXid` reads, so `TopLevelXid(subE)` returned `subE`, `xidActiveWithSubxact(subE)`
+took its `top == xid` early-false branch, and `IsXIDActive(subE)` reported the live
+savepoint lock as **dead** — `conflictingLockHolders` filtered subE/subF out and s2 saw
+no conflict. (Gaps A/B/C never hit this because, before §6.1, lock members were stamped
+under the *top-level* xid, which resolves via the `xidInProgress` fast path and never
+consults the subxact map.)
+
+Fix: `AllocateSubXid` now registers through `RegisterSubXid`, which writes the attached
+map when present (and best-effort mirrors the parent link to the pg_subtrans SLRU,
+exactly as the lazy first-write registration path does) and falls back to the in-memory
+map otherwise. This makes allocation, abort (`MarkSubxactAborted`), and resolution
+(`TopLevelXid`/`IsAborted`) all agree on one store. No behaviour change when no map is
+attached (unit-test path identical).
+
+### 6.3 Gates run
+
+* `go test -race ./internal/mvcc/... ./internal/multixact/...` — PASS.
+* `go test -race -run 'LockRows|Savepoint|Subxact|TupleLock|RowLock' ./internal/executor/...`
+  and the full `./internal/executor/...` unit suite — PASS.
+* `TestPort_IsolationTuplelockUpgradeNoDeadlock` — **PASS, all 9 permutations**
+  byte-identical vs PG 18.3.
+* Full row-lock / deadlock / merge / EPQ isolation regression batch
+  (`Tuplelock|LockUpdate|UpdateLockedTuple|PropagateLockDelete|LockCommitted|MultixactNoDeadlock|SkipLocked|Nowait|LockNowait|DeadlockHard|DeadlockSimple|DeadlockSoft|Merge|EvalPlanQual`)
+  — PASS, no regression.
+* CI-parity pgbench smoke via the pre-commit hook on commit. Recovery/standby unaffected
+  (subxact liveness is in-memory runtime state; the only on-disk touch is the pre-existing
+  best-effort pg_subtrans parent-link mirror, already written for write-subxids).
 
 ## 7. Out of scope (separately deferred)
 
