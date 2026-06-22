@@ -489,6 +489,28 @@ func TestPort_IsolationAlterTable1(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-1.spec")
 }
 
+// TestPort_IsolationPlpgsqlToast exercises the plpgsql-toast spec (M0118-0008):
+// PL/pgSQL procedures with transaction control (COMMIT inside a DO block) where
+// VACUUM in a second session — synchronized via advisory locks — runs between a
+// variable's last assignment and its use, exercising the six assignment code
+// paths plus a fetch-after-commit case.
+//
+// PASS-REQUIRED (design 0118-0054). Two final pieces on top of 0118-0049..0053:
+// (1) a FOR-query loop now materializes its rows up front so the loop survives a
+// DELETE/COMMIT in its body (PG holds the implicit cursor's snapshot across the
+// commit) — fixes assign6's three iterations; (2) SELECT … INTO inside a body now
+// substitutes PL/pgSQL frame variables including record-field refs (r.a) before
+// planning — fixes fetch-after-commit. Byte-identical to PG 18.3 across all
+// permutations. goopg stores text inline (no external TOAST chunk to orphan), so
+// the detoast-correctness the spec guards is satisfied structurally.
+func TestPort_IsolationPlpgsqlToast(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_plpgsql_toast")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/plpgsql-toast.spec")
+}
+
 // TestPort_IsolationVacuumSkipLocked exercises the vacuum-skip-locked spec
 // (M0118-0008). VACUUM/ANALYZE (SKIP_LOCKED) take a conditional per-relation
 // lock: a relation held by another session is skipped — with a WARNING when

@@ -1,46 +1,41 @@
-Loop #51: M0118-0008 enabler (design 0118-0053) — PL/pgSQL record FOR-loop
-`record::text` framing. NOT a promotion.
+Loop #52: M0118-0008 — `plpgsql-toast` PROMOTED (design 0118-0054). All 7
+permutations byte-for-byte. This is a PROMOTION (16th of the M0118-0008 group).
 
-Done: closed the `r::text` output gap for plpgsql-toast assign4/5/6.
-- assign4 (`r test2; select * into r`) was ALREADY correct after 0118-0052
-  (named composite flows through the same bindSelectIntoRow multi-col branch) —
-  verified `length(r::text)=6004` by probe. The working-set note predicting
-  `<NULL>`/`6002` was STALE.
-- assign5/6 fixed: a single-column record FOR-loop var held the RAW column value
-  (6000) not the composite framing `(…)` (6002). `ForSelectStmt`'s scalar
-  shortcut (`frame.values[idx]=row[0]`) was taken for any 1-col query — correct
-  for scalar loop vars, wrong for `record` vars.
+Done: closed the last two plpgsql-toast divergences on top of 0118-0049..0053.
+Probe-first found assign1-5 already PASS; only assign6 + fetch-after-commit left.
+- assign6: FOR-loop over a query whose body does `delete; commit;` only ran ONCE
+  (live operator hit EOF after the delete). Fix: `ForSelectStmt` now materializes
+  ALL rows up front (deep-copied; operator closed) BEFORE running the body —
+  mirrors PG holding the implicit cursor snapshot across COMMIT (holdable).
+- fetch-after-commit: `select b into t … where a = r.a` failed `42P01 missing
+  FROM-clause entry for table "r"`. Two fixes: (a) `SelectIntoStmt` now calls
+  `substitutePlpgsqlFrameVarsInSQL` (was missing on this path); (b) that function
+  now substitutes `r.field` when `r` isRecordVar (literal from `_<var>_<field>`),
+  guarded so plain `table.column` is untouched.
 
-Fix (internal/executor/plpgsql_runtime.go):
-- `(*plpgsqlFrame).isRecordVar` — declared type `record` OR registered
-  compositeVarFields (named composite).
-- `bindRecordRowComposite` helper — extracted from bindSelectIntoRow (sub-fields
-  + composite Datum + field schema; no-row⇒NULL). bindSelectIntoRow now calls it
-  (sibling-paths sync).
-- ForSelectStmt per-row binding branches on isRecordVar FIRST → composite bind
-  regardless of column count; scalar shortcut + legacy sub-field branch unchanged
-  for non-record vars.
+Files: internal/executor/plpgsql_runtime.go (ForSelectStmt materialize +
+SelectIntoStmt substitution + record-field branch in substitutePlpgsqlFrameVarsInSQL),
+internal/executor/plpgsql_record_forloop_test.go (new
+TestPlpgSQLForLoopMaterializeAndRecordFieldSubst),
+internal/testport/isolation_port_test.go (new strict TestPort_IsolationPlpgsqlToast),
+docs/test-port/postgres-oracle-port-status.{csv,md} (D-002 rationale append),
+docs/design/0118-0054-* + README index.
 
-Files: internal/executor/plpgsql_runtime.go, internal/executor/
-plpgsql_record_forloop_test.go (new TestPlpgSQLRecordForLoopAndText),
-docs/design/0118-0053-* + README index.
+Gates: TestPort_IsolationPlpgsqlToast strict PASS (7 perms);
+TestPlpgSQLForLoopMaterializeAndRecordFieldSubst PASS; full internal/executor
+PASS; TestPort_IsolationSubxidOverflow+FreezeTheDead PASS (no regression);
+go vet + go build ./... clean; pgbench smoke = pre-commit hook. COMMITTING.
 
-Gates: TestPlpgSQLRecordForLoopAndText PASS (a4=6004/a5=6002/a6=`6002 9002
-12002`); TestPlpgSQLRecordFieldAndText+SelectInto+ScalarSubquery+Composite* PASS;
-full internal/executor PASS; go vet + go build clean; ralph-state-guard OK
-(auto-repaired prev-loop completed marker). pgbench smoke = pre-commit hook.
-COMMITTING this loop.
-
-Next step (M0118-0008 hard tail — all Effort-L, one slice per loop). plpgsql-toast
-still NOT portable; remaining blockers:
-- assign6 `COMMIT` inside the FOR-loop body (hold cursor across COMMIT via
-  0118-0049 PLpgSQLCommitChain) + detoast-across-COMMIT: free external TOAST
-  pointers at the assignment boundary so a concurrent VACUUM can't orphan chunks.
-- runner `<waiting ...>` advisory-lock/VACUUM timing marker (spec's LAST
-  structural blocker; runner decides blocking purely by 300ms timeout — see
-  iso_runner_blocking_is_timing_only memory).
-- record_out quote/escape framing (current comma-join is unquoted).
-Other tail specs (each a new subsystem): alter-table-4 (INHERITS + txn catalog
-visibility), partition ATTACH/DETACH concurrent visibility,
-partition-drop-index-locking (real pg_locks view), reindex-concurrently-toast
-(allow_system_table_mods + TOAST relations as catalog objects).
+Next step (M0118-0008 hard tail — all Effort-L, one new subsystem each, one slice
+per loop). plpgsql-toast is DONE. Remaining:
+- `reindex-concurrently-toast`: TOAST relations as catalog objects +
+  `allow_system_table_mods` GUC (probe to find first divergence).
+- `alter-table-4`: INHERITS + transactional-DDL cross-session catalog visibility
+  (COUPLED to visibility per memory — can't split).
+- `detach-partition-concurrently-{1,2,3,4}` + `partition-concurrent-attach`:
+  transactional partition visibility (0118-0048 fixed the parser; the wait/
+  two-phase concurrent-detach visibility remains).
+- `partition-drop-index-locking`: real pg_locks view parity.
+Suggested: probe each with a throwaway zz_probe_test.go (copy the loop #52 probe:
+IsolationRunner.RunAndCompare → t.Logf STATUS+Diff) and rank by first-divergence
+cost before committing to one.

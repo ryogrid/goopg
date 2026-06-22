@@ -669,13 +669,42 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `<NULL>`). A subquery nested inside a larger expr still `0A000` (no spec
       needs it). Executor-only; `TestPlpgSQLScalarSubquery`; `internal/executor`
       PASS; `go build` clean; pgbench smoke = pre-commit hook.
+      **2026-06-23 sixteenth promotion (design 0118-0054): `plpgsql-toast`
+      PROMOTED ⇒ all 7 permutations byte-for-byte.** The last blocker of the
+      spec, on top of enablers 0118-0049..0053. Two executor-only fixes: (1)
+      **`assign6` FOR-loop snapshot stability** — `for r in select … loop …
+      delete; commit; … end loop` must iterate over all rows fetched at loop
+      start even though the body deletes every row and commits each iteration.
+      goopg streamed rows from a live operator (`op.Next()` between body runs),
+      so after the first `DELETE`/`COMMIT` the scan hit EOF and the loop ran once
+      (`6002` not `6002 9002 12002`). `ForSelectStmt` now materializes the full
+      result (each row deep-copied; operator closed) BEFORE running any body
+      statement, mirroring PG holding the implicit cursor's snapshot across a
+      `COMMIT` (made holdable) — also strictly more PG-faithful for the no-commit
+      case (a body modifying the scanned table no longer sees its own writes
+      mid-scan). (2) **`fetch-after-commit` record-field ref** — `select b into t
+      from test1 where a = r.a` failed `42P01 missing FROM-clause entry for table
+      "r"`: the `SELECT … INTO` path did NO PL/pgSQL var substitution and the
+      substitutor skipped qualified names. `SelectIntoStmt` now calls
+      `substitutePlpgsqlFrameVarsInSQL` (as the general embedded-SQL path
+      already did), and that function now substitutes a single-level `r.field`
+      token when `r` `isRecordVar` (literal from the `_<var>_<field>` binding),
+      guarded so a plain `table.column` qualifier is untouched. goopg stores
+      `text` inline (no external TOAST chunk for VACUUM to orphan) so the
+      missing-chunk detoast correctness the spec guards is satisfied
+      structurally; the advisory-lock/VACUUM `<waiting …>` markers ride the
+      runner's 300 ms timing. `TestPort_IsolationPlpgsqlToast` strict PASS;
+      `TestPlpgSQLForLoopMaterializeAndRecordFieldSubst` + the
+      `TestPlpgSQL{RecordForLoopAndText,RecordFieldAndText,SelectInto,
+      ScalarSubquery,DoCommitChain*}` suite PASS; full `internal/executor` PASS;
+      `TestPort_IsolationSubxidOverflow`/`FreezeTheDead` PASS (no regression);
+      `go build` clean; pgbench smoke = pre-commit hook.
       **Remaining (deferred):** `alter-table-4` (INHERITS + transactional-DDL
       cross-session visibility), `detach-partition-concurrently-{1,2,3,4}` +
       `partition-concurrent-attach` (transactional partition visibility),
       `partition-drop-index-locking` (pg_locks view parity),
       `reindex-concurrently-toast` (toast relations as catalog objects +
-      `allow_system_table_mods`), `plpgsql-toast` (COMMIT in DO + detoast).
-      Group stays open.
+      `allow_system_table_mods`). Group stays open.
       **2026-06-23 fourteenth promotion (design 0118-0046): `alter-table-2`
       PROMOTED ⇒ all 48 permutations byte-for-byte.** Two changes: (1) the
       `ALTER TABLE … ADD FOREIGN KEY …` parser now accepts the `NOT VALID`

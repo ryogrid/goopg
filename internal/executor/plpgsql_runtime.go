@@ -1537,6 +1537,12 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if frame.trig != nil {
 			sql = substituteTriggerRefs(sql, frame.trig)
 		}
+		// Substitute PL/pgSQL frame variables (scalars and record-field refs
+		// like `r.a`) into the query before planning, mirroring the embedded
+		// SQL path (execPLpgSQLEmbeddedSQL). Without this a SELECT … INTO whose
+		// WHERE clause references a loop record field (`… where a = r.a`) plans
+		// `r` as a missing table. M0118-0008 (plpgsql-toast fetch-after-commit).
+		sql = substitutePlpgsqlFrameVarsInSQL(sql, frame)
 		stmts, err := parser.Parse(sql)
 		if err != nil {
 			return Datum{}, flowNone, &ExecError{Code: "42601", Message: fmt.Sprintf("SELECT INTO query parse error: %v", err)}
@@ -1640,6 +1646,20 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			return Datum{}, flowNone, err
 		}
 		varName := strings.ToLower(s.Var)
+		// Materialize every row up front, then close the operator, before
+		// running any loop-body statement. This mirrors PostgreSQL, where a
+		// PL/pgSQL FOR-query cursor holds its snapshot across a COMMIT issued
+		// inside the loop body (the implicit portal is made holdable on
+		// commit), so the loop iterates over the rows fetched at loop start
+		// regardless of DELETE/COMMIT side effects in the body. Streaming row
+		// by row from a live operator would instead see the body's deletes and
+		// truncate the loop after the first iteration. M0118-0008
+		// (plpgsql-toast assign6).
+		type forRow struct {
+			row    Row
+			schema planner.Schema
+		}
+		var collected []forRow
 		for {
 			slot, err := op.Next()
 			if err == EOF {
@@ -1649,13 +1669,25 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				op.Close()
 				return Datum{}, flowNone, err
 			}
+			var fr forRow
+			if slot != nil && slot.Schema() != nil {
+				fr.schema = slot.Schema()
+				src := slotRow(slot)
+				cp := make(Row, len(src))
+				copy(cp, src)
+				fr.row = cp
+			}
+			collected = append(collected, fr)
+		}
+		op.Close()
+		for _, fr := range collected {
 			// Bind row columns to the loop variable.
 			// - For record/row variables: assign to _<var>_<colname> sub-fields.
 			// - For scalar variables: if the loop var exists directly in frame
 			//   and the query returns exactly 1 column, assign to it directly.
-			if slot != nil && slot.Schema() != nil {
-				row := slotRow(slot)
-				schema := slot.Schema()
+			if fr.row != nil && fr.schema != nil {
+				row := fr.row
+				schema := fr.schema
 				// Record/composite loop variable: bind the whole row as a
 				// `(c0,c1,…)` composite Datum (plus `_<var>_<col>` sub-fields for
 				// field access) so `r::text` reassembles the composite framing —
@@ -1707,18 +1739,15 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			}
 			v, flow, err := executePLpgSQLStmtList(s.Body, r, frame, ctx)
 			if err != nil {
-				op.Close()
 				return Datum{}, flowNone, err
 			}
 			if flow == flowReturn || flow == flowReturnTriggerOld || flow == flowReturnTriggerNew || flow == flowReturnTriggerNull {
-				op.Close()
 				return v, flow, nil
 			}
 			if flow == flowExit {
 				break
 			}
 		}
-		op.Close()
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.Block:
@@ -2887,6 +2916,31 @@ func substitutePlpgsqlFrameVarsInSQL(sql string, frame *plpgsqlFrame) string {
 			preceded := i > 0 && s1[i-1] == '.'
 			followed := j < len(s1) && (s1[j] == '.' || s1[j] == '[')
 			varName := s1[i:j]
+			// Qualified record-field reference: `r.field` where `r` is a
+			// record/composite PL/pgSQL variable. Substitute the whole
+			// `r.field` with the field's SQL literal — the field is bound as
+			// `_<var>_<field>` in the frame by bindRecordRowComposite. Only a
+			// single-level qualifier with no further `.`/`[` is handled; a
+			// plain table.column reference (varName is not a record var) falls
+			// through untouched, so a real column qualifier is unaffected.
+			// M0118-0008 (plpgsql-toast fetch-after-commit).
+			if !preceded && j < len(s1) && s1[j] == '.' && frame.isRecordVar(varName) {
+				k := j + 1
+				if k < len(s1) && isIdentStartByte(s1[k]) {
+					f := k
+					for f < len(s1) && isIdentContByte(s1[f]) {
+						f++
+					}
+					if !(f < len(s1) && (s1[f] == '.' || s1[f] == '[')) {
+						fieldKey := "_" + strings.ToLower(varName) + "_" + strings.ToLower(s1[k:f])
+						if fi, ok := frame.lookup(fieldKey); ok {
+							out.WriteString(datumToSQLLiteral(frame.values[fi]))
+							i = f
+							continue
+						}
+					}
+				}
+			}
 			if !preceded && !followed {
 				if fi, ok := frame.lookup(varName); ok {
 					out.WriteString(datumToSQLLiteral(frame.values[fi]))
