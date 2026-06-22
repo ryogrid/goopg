@@ -57,13 +57,17 @@ func VacuumWithOptions(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFil
 // tuples are still pinned and re-flushed only if any tuple was
 // reclaimed; otherwise they're left untouched.
 //
-// When the buffer pool has a `LogHeapVacuum` hook wired (the normal
-// runtime case), each pruned page emits a logical heap-vacuum redo
-// record carrying the reclaimed slot list — replay then re-runs
-// `VacuumHeapPageBySlots` against the existing page bytes for a
-// bit-exact prune. When the hook is absent (test pools), Vacuum
-// falls back to MarkDirty so the FPI-on-every-dirty path keeps the
-// change durable.
+// Reclamation goes through the HOT-chain / multixact-aware
+// `storage.PageVacuumPrune` (the sibling of the opportunistic
+// `PagePruneOpt`): dead HOT chain roots become `ItemIDRedirect` so the
+// index entry keeps resolving to the live tip, and an updater-bearing
+// multixact xmax is resolved to its updater before the horizon compare.
+// When the buffer pool has a `LogHeapPruneOpt` hook wired (the normal
+// runtime case), each pruned page emits a logical prune redo record
+// carrying the redirect + unused slot lists — replay reproduces the
+// same redirects bit-for-bit. When the hook is absent (test pools),
+// Vacuum falls back to MarkDirty so the FPI-on-every-dirty path keeps
+// the change durable.
 //
 // VACUUM does not touch indexes — see Reindex for the bridge until
 // B-tree page deletion lands.
@@ -91,13 +95,7 @@ func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
 		return Stats{}, err
 	}
 	stats := Stats{OldestXmin: horizon}
-	isDead := func(h storage.HeapTupleHeader) bool {
-		if h.Xmax == storage.InvalidTransactionID {
-			return false
-		}
-		return h.Xmax < horizon
-	}
-	logVac := pool.LogHeapVacuum()
+	logPrune := pool.LogHeapPruneOpt()
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		slot, err := pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -118,23 +116,24 @@ func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
 
 		pageDirty := false
 
-		// Dead-tuple reclamation pass.
-		deadSlots, err := storage.CollectDeadHeapSlots(page, isDead)
+		// Dead-tuple reclamation pass. PageVacuumPrune is HOT-chain-aware
+		// (dead chain roots become ItemIDRedirect so the index entry keeps
+		// resolving to the live tip) and multixact-aware (an updater-bearing
+		// multi xmax resolves its updater before the horizon compare). The old
+		// naive "xmax < horizon → remove slot" pass broke HOT chains and treated
+		// a raw MultiXactId as an xid — see the freeze-the-dead spec (M0118-0009).
+		pr, liveOnPage, err := storage.PageVacuumPrune(page, horizon)
 		if err != nil {
 			slot.Unlock()
 			pool.Unpin(slot)
 			return stats, err
 		}
-		ps, err := storage.VacuumHeapPageBySlots(page, deadSlots)
-		if err != nil {
-			slot.Unlock()
-			pool.Unpin(slot)
-			return stats, err
-		}
-		if ps.Dead > 0 {
-			if logVac != nil {
+		reclaimed := len(pr.Redirects) + len(pr.Unused)
+		stats.Live += liveOnPage
+		if reclaimed > 0 {
+			if logPrune != nil {
 				err = pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
-					return logVac(rel, blk, deadSlots)
+					return logPrune(rel, blk, pr.Redirects, pr.Unused)
 				})
 				if err != nil {
 					slot.Unlock()
@@ -145,8 +144,13 @@ func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
 				pool.MarkDirty(slot)
 			}
 			pageDirty = true
-			// Collect dead TIDs for index vacuum (M0047-0002).
-			for _, s := range deadSlots {
+			stats.Dead += reclaimed
+			// Collect dead TIDs for index vacuum (M0047-0002). Only the
+			// fully-removed (Unused) line pointers may carry an index entry
+			// that must be cleared; redirected roots keep their index entry
+			// valid. HOT-only Unused tuples have no index entry, so removing a
+			// (nonexistent) entry for their TID is a harmless no-op.
+			for _, s := range pr.Unused {
 				stats.DeadTIDs = append(stats.DeadTIDs, storage.ItemPointer{Block: blk, Offset: s})
 			}
 		}
@@ -196,8 +200,7 @@ func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
 		slot.Unlock()
 		pool.Unpin(slot)
 		stats.Pages++
-		stats.Live += ps.Live
-		stats.Dead += ps.Dead
+		// stats.Live / stats.Dead are accumulated in the reclamation pass above.
 	}
 	return stats, nil
 }

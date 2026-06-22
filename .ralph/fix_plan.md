@@ -314,7 +314,17 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (`len(c.byTable[oid])>0`), so there is no heap tuple / catcache oldtup /
       `heap_inplace_update` byte to clobber; both permutations observe
       `relhasindex=t` byte-identical to PG 18.3. Dedicated test
-      `TestPort_IsolationInplaceInval`. **Remaining (deferred, ledger 2026-06-22):**
+      `TestPort_IsolationInplaceInval`. `freeze-the-dead` PASS (design 0118-0020) —
+      VACUUM (`vacuumCore`) reclaimed dead tuples with a naive `xmax<horizon` slot
+      removal that (1) compared a MultiXactId xmax to the xid horizon (a category
+      error marking a live, still-locked HOT chain root "dead") and (2) physically
+      removed the chain root, orphaning the live tip → the updated row vanished from
+      index scans + the final select. Fix unifies VACUUM onto the already-correct
+      opportunistic-prune kernel: shared `pagePruneCore`, new `storage.PageVacuumPrune`
+      (HOT-chain-aware: dead roots → `ItemIDRedirect`; multixact-aware: resolves the
+      updater before the horizon compare), and `vacuumCore` emits
+      `RecordKindHeapPruneOpt` (redirects+unused, replay exists). Dedicated test
+      `TestPort_IsolationFreezeTheDead`. **Remaining (deferred, ledger 2026-06-22):**
       (b) lock carry-forward on the non-HOT update paths (delete+insert /
       `UPDATE…FROM` / MERGE / upsert) — bounded follow-up, same narrow gate, not
       exercised by any current `port` spec. Plus the other M0118-0009 misc specs

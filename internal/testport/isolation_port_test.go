@@ -939,6 +939,17 @@ func TestPort_IsolationInplaceInval(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/inplace-inval.spec")
 }
 
+// TestPort_IsolationFreezeTheDead exercises the freeze-the-dead spec: tuple
+// freezing interactions with dead/recently-dead tuples via multixact FOR KEY
+// SHARE. M0118-0009.
+func TestPort_IsolationFreezeTheDead(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_freeze_the_dead")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/freeze-the-dead.spec")
+}
+
 // TestPort_IsolationDeadlockSimple exercises the deadlock-simple spec: two
 // sessions each take ACCESS SHARE on a1, then each attempts a lock upgrade to
 // ACCESS EXCLUSIVE. Neither upgrade can complete until the other releases its
