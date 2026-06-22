@@ -280,6 +280,15 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		return p.parseNestedBlock()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwPerform:
 		return p.parsePerform()
+	// `NULL;` — the no-op placeholder statement (e.g. an empty EXCEPTION
+	// handler body). M0118-0009.
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwNull:
+		nullTok := p.cur()
+		p.advance() // consume NULL
+		if !p.acceptSymbol(";") {
+			return nil, p.errAtCur("expected ';' to terminate NULL statement")
+		}
+		return &NullStmt{pos: nullTok.Pos}, nil
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwExit:
 		return p.parseExit()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwContinue:
@@ -1162,6 +1171,12 @@ func (p *bodyParser) parseReturn() (Stmt, error) {
 	retTok, err := p.expectKeyword(parser.KwReturn)
 	if err != nil {
 		return nil, err
+	}
+	// Bare `RETURN;` (no expression) — valid for functions returning VOID, and
+	// the canonical way to exit a procedure / void function early. PostgreSQL
+	// treats the result as NULL. M0118-0009 (subxid-overflow gen_subxids).
+	if p.acceptSymbol(";") {
+		return &ReturnStmt{pos: retTok.Pos, Expr: nil}, nil
 	}
 	// RETURN NEXT expr; — PL/pgSQL SETOF row emitter. M0097-0073.
 	if p.cur().Kind == parser.TokenIdent && strings.EqualFold(p.cur().Value, "next") {

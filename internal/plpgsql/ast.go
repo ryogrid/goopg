@@ -186,6 +186,16 @@ type PerformStmt struct {
 func (p *PerformStmt) Pos() int         { return p.pos }
 func (p *PerformStmt) plpgsqlStmtNode() {}
 
+// NullStmt is the PL/pgSQL `NULL;` no-op statement — a placeholder that does
+// nothing (e.g. an empty EXCEPTION handler body `WHEN ... THEN NULL;`).
+// M0118-0009 (subxid-overflow gen_subxids).
+type NullStmt struct {
+	pos int
+}
+
+func (n *NullStmt) Pos() int         { return n.pos }
+func (n *NullStmt) plpgsqlStmtNode() {}
+
 // ReturnStmt is `RETURN expr;`. Stage A only emits scalar return
 // values; SETOF / TABLE / RETURN NEXT / RETURN QUERY arrive in
 // Stage B.

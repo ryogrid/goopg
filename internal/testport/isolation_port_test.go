@@ -950,6 +950,24 @@ func TestPort_IsolationFreezeTheDead(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/freeze-the-dead.spec")
 }
 
+// TestPort_IsolationSubxidOverflow exercises the subxid-overflow spec: a
+// recursive PL/pgSQL function (gen_subxids) opens 100 nested subtransactions
+// via per-frame EXCEPTION handlers, overflowing the subxid cache, while other
+// sessions probe MVCC visibility (XidInMVCCSnapshot) and lock-waits
+// (XactLockTableWait) against the overflowed parent. Two PL/pgSQL gaps blocked
+// it: a bare `RETURN;` (upstream-legal in a VOID function) was rejected at
+// parse time, and the `NULL;` no-op statement (used as the empty EXCEPTION
+// handler body) was an "unsupported PL/pgSQL statement". With both supported,
+// goopg's existing subxact visibility/lock machinery already matches PG 18.3.
+// M0118-0009.
+func TestPort_IsolationSubxidOverflow(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_subxid_overflow")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/subxid-overflow.spec")
+}
+
 // TestPort_IsolationDeadlockSimple exercises the deadlock-simple spec: two
 // sessions each take ACCESS SHARE on a1, then each attempts a lock upgrade to
 // ACCESS EXCLUSIVE. Neither upgrade can complete until the other releases its

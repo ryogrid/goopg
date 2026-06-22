@@ -1140,6 +1140,10 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		return Datum{}, flowNone, nil
 
+	case *plpgsql.NullStmt:
+		// `NULL;` — no-op placeholder. M0118-0009.
+		return Datum{}, flowNone, nil
+
 	case *plpgsql.ExitStmt:
 		if s.Cond != nil {
 			cond, err := evalPLpgSQLExpr(s.Cond, frame, ctx)
@@ -1165,6 +1169,24 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		return Datum{}, flowContinue, nil
 
 	case *plpgsql.ReturnStmt:
+		// Bare `RETURN;` (nil expression) — exit the function returning NULL.
+		// Valid for VOID-returning functions / procedures and the canonical
+		// early-exit form. A value-returning function must supply an expression
+		// (upstream pl_gram.y treats it as a "missing expression" error).
+		// M0118-0009 (subxid-overflow gen_subxids).
+		if s.Expr == nil {
+			if frame.trig != nil {
+				return Datum{}, flowReturnTriggerNull, nil
+			}
+			if !strings.EqualFold(r.ReturnType.Name, "void") {
+				return Datum{}, flowNone, &ExecError{
+					Code:    "42601",
+					Pos:     s.Pos(),
+					Message: "missing expression",
+				}
+			}
+			return NullDatum, flowReturn, nil
+		}
 		// In trigger context, detect RETURN OLD / RETURN NEW / RETURN NULL.
 		if frame.trig != nil {
 			if cr, ok := s.Expr.(*parser.ColumnRef); ok && cr.Table == "" && cr.Schema == "" {

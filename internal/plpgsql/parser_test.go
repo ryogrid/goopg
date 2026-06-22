@@ -134,16 +134,50 @@ func TestParseRejectsUnsupportedStatement(t *testing.T) {
 	}
 }
 
-// TestParseRejectsBareReturn: Stage A requires a return value;
-// `RETURN;` (which is upstream-legal for void / OUT-only routines)
-// surfaces a specific diagnostic.
-func TestParseRejectsBareReturn(t *testing.T) {
-	_, err := Parse("BEGIN RETURN; END")
-	if err == nil {
-		t.Fatal("expected SyntaxError for RETURN without value")
+// TestParseAcceptsBareReturn: `RETURN;` (no expression) is upstream-legal for
+// void-returning functions and procedures, and is the canonical early-exit
+// form. It must parse to a ReturnStmt with a nil expression; the void-vs-value
+// distinction is enforced at runtime (it needs the function's return type,
+// which the parser does not know). M0118-0009 (subxid-overflow gen_subxids).
+func TestParseAcceptsBareReturn(t *testing.T) {
+	blk, err := Parse("BEGIN RETURN; END")
+	if err != nil {
+		t.Fatalf("expected bare RETURN to parse, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "RETURN") {
-		t.Errorf("err = %v", err)
+	if len(blk.Statements) != 1 {
+		t.Fatalf("got %d stmts, want 1", len(blk.Statements))
+	}
+	rs, ok := blk.Statements[0].(*ReturnStmt)
+	if !ok {
+		t.Fatalf("stmt = %T, want *ReturnStmt", blk.Statements[0])
+	}
+	if rs.Expr != nil {
+		t.Errorf("Expr = %v, want nil for bare RETURN", rs.Expr)
+	}
+}
+
+// TestParseNullStatement: the PL/pgSQL `NULL;` no-op statement (used as an
+// empty EXCEPTION handler body) parses to a NullStmt. M0118-0009.
+func TestParseNullStatement(t *testing.T) {
+	blk, err := Parse("BEGIN NULL; END")
+	if err != nil {
+		t.Fatalf("expected NULL; to parse, got %v", err)
+	}
+	if len(blk.Statements) != 1 {
+		t.Fatalf("got %d stmts, want 1", len(blk.Statements))
+	}
+	if _, ok := blk.Statements[0].(*NullStmt); !ok {
+		t.Fatalf("stmt = %T, want *NullStmt", blk.Statements[0])
+	}
+}
+
+// TestParseExceptionHandlerNullBody: a full function-style body with an empty
+// EXCEPTION handler (`WHEN ... THEN NULL;`) parses — the exact shape used by
+// the subxid-overflow gen_subxids function. M0118-0009.
+func TestParseExceptionHandlerNullBody(t *testing.T) {
+	src := "BEGIN\n  PERFORM 1;\n  RETURN;\nEXCEPTION\n  WHEN raise_exception THEN NULL;\nEND"
+	if _, err := Parse(src); err != nil {
+		t.Fatalf("expected EXCEPTION/NULL body to parse, got %v", err)
 	}
 }
 

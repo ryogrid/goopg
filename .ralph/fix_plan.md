@@ -324,8 +324,23 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (HOT-chain-aware: dead roots → `ItemIDRedirect`; multixact-aware: resolves the
       updater before the horizon compare), and `vacuumCore` emits
       `RecordKindHeapPruneOpt` (redirects+unused, replay exists). Dedicated test
-      `TestPort_IsolationFreezeTheDead`. **Remaining (deferred, ledger 2026-06-22):**
+      `TestPort_IsolationFreezeTheDead`. `subxid-overflow` PASS (design 0118-0021) —
+      promoted `failed`→`pass` with PL/pgSQL front-end work only (no MVCC/storage
+      change). The spec's recursive `gen_subxids` opens 100 nested subxids via
+      per-frame `EXCEPTION` handlers (overflowing the subxid cache) while other
+      sessions probe `XidInMVCCSnapshot`/`XactLockTableWait`; goopg's subxact
+      visibility/lock machinery was already correct, the function just wouldn't
+      compile. Two parser gaps lifted: bare `RETURN;` (`parseReturn` now yields
+      `ReturnStmt{Expr:nil}`; runtime returns NULL for VOID, errors `42601 missing
+      expression` for a value function — mirrors upstream `make_return_stmt`) and
+      the `NULL;` no-op statement (new `NullStmt` AST node + `parseStmt` case +
+      no-op runtime arm). Dedicated test `TestPort_IsolationSubxidOverflow`; unit
+      `TestParse{AcceptsBareReturn,NullStatement,ExceptionHandlerNullBody}`.
+      **Remaining (deferred, ledger 2026-06-22):**
       (b) lock carry-forward on the non-HOT update paths (delete+insert /
       `UPDATE…FROM` / MERGE / upsert) — bounded follow-up, same narrow gate, not
       exercised by any current `port` spec. Plus the other M0118-0009 misc specs
-      untouched.
+      untouched (async-notify [LISTEN/NOTIFY unimpl], horizons [dollar-quote lexer +
+      EXPLAIN JSON], intra-grant-inplace [catalog-row lock on GRANT tuple xmax],
+      stats [pg_stat_* infra], temp-schema-cleanup [pg_my_temp_schema + temp
+      cleanup], prepared-transactions [2PC]).
