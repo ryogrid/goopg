@@ -923,6 +923,22 @@ func TestPort_IsolationMultixactNoForget(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/multixact-no-forget.spec")
 }
 
+// TestPort_IsolationInplaceInval exercises the inplace-inval spec: an inplace
+// update (CREATE INDEX setting pg_class.relhasindex=true) must not be reverted
+// by a later heap_update of a cached oldtup. In upstream PostgreSQL this is a
+// real catcache/heap_inplace_update hazard. goopg is immune by construction:
+// pg_class is a VIRTUAL relation whose relhasindex is derived live from the
+// in-memory index set (len(c.byTable[oid]) > 0) on every read, so there is no
+// heap tuple, no catcache oldtup to go stale, and no inplace-update path to
+// revert. Both permutations therefore observe relhasindex=t. M0118-0009.
+func TestPort_IsolationInplaceInval(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_inplace_inval")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/inplace-inval.spec")
+}
+
 // TestPort_IsolationDeadlockSimple exercises the deadlock-simple spec: two
 // sessions each take ACCESS SHARE on a1, then each attempts a lock upgrade to
 // ACCESS EXCLUSIVE. Neither upgrade can complete until the other releases its

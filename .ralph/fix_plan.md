@@ -307,7 +307,14 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       idempotent re-acquire; ACCESS SHARE grants instantly absent a concurrent
       LOCK TABLE/DDL. `TestPort_TimeoutsTableLevel` 4/4; full isolation batch +
       `-race` executor/mvcc/lockmgr + pgbench smoke (0-failed, no TPS
-      regression) green. **Remaining (deferred, ledger 2026-06-22):**
+      regression) green. `inplace-inval` PASS (design 0118-0019) — promoted
+      `failed`→`pass` with NO code change: goopg is immune to the upstream
+      inplace-update-revert hazard by construction because `pg_class` is virtual
+      and `relhasindex` is derived live from the in-memory index set
+      (`len(c.byTable[oid])>0`), so there is no heap tuple / catcache oldtup /
+      `heap_inplace_update` byte to clobber; both permutations observe
+      `relhasindex=t` byte-identical to PG 18.3. Dedicated test
+      `TestPort_IsolationInplaceInval`. **Remaining (deferred, ledger 2026-06-22):**
       (b) lock carry-forward on the non-HOT update paths (delete+insert /
       `UPDATE…FROM` / MERGE / upsert) — bounded follow-up, same narrow gate, not
       exercised by any current `port` spec. Plus the other M0118-0009 misc specs
