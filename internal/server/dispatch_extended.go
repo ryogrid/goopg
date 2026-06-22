@@ -157,6 +157,15 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	if s.applyLauncher != nil {
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
 	}
+	// Wire pg_cancel_backend(pid) here too (sibling of the simple-query path) so
+	// the SQL function works regardless of protocol. Depends only on the
+	// process-wide cancel registry, not on per-session Activity. M0118-0008.
+	ectx.CancelBackend = func(pid int32) bool {
+		if pid <= 0 {
+			return false
+		}
+		return s.cancelReg.cancelByPID(uint32(pid))
+	}
 
 	op, err := executor.Build(node)
 	if err != nil {

@@ -354,6 +354,16 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.TxnLockBackendID = connTx.LockBackendID
 	}
 	ectx.Activity = s.cfg.Activity
+	// Wire pg_cancel_backend(pid) to the process-wide cancel registry so a
+	// backend can signal a peer's in-flight query (privileged, no secret key —
+	// the caller is an authenticated session, not an off-wire CancelRequest).
+	// M0118-0008 (detach-partition-concurrently-3/4 s1cancel).
+	ectx.CancelBackend = func(pid int32) bool {
+		if pid <= 0 {
+			return false
+		}
+		return s.cancelReg.cancelByPID(uint32(pid))
+	}
 	if connTx != nil {
 		ectx.ProcNum = connTx.ProcNum
 	}
