@@ -1,42 +1,30 @@
-Last loop (#31): M0118-0008 — landed the **inherit-temp foundation** (design
-0118-0036). NOT a spec promotion (inherit-temp stays `defer`). Commit + push
-pending.
+(idle — nothing in flight)
 
-What landed (zero blast radius — nothing reads TempOwner in live paths yet):
-- `catalog.Table.TempOwner string` — owning session's token ("" = permanent or
-  session-less temp = visible to all).
-- `catalog.AccessibleInheritanceChildren(children, sessionTempOwner)` — shared
-  filter that drops other-session temp children (keeps permanent/own/unowned).
-  The single chokepoint the wiring loop will call at every expansion site.
-- `config.SessionRegistry.UniqueID() uint64` — process-unique, non-zero,
-  lifetime-stable per-connection id (atomic counter in NewSessionRegistry).
-- `executor.sessionTempOwner(ctx)` — derives "s<id>" from
-  ctx.AdvisorySessionIdentity (UniqueID interface); stamped at BOTH CREATE
-  TEMPORARY TABLE sites (operators_ddl.go base ~1949 + partition leaf ~2936).
-- Units: TestAccessibleInheritanceChildren / TestSessionRegistryUniqueID /
-  TestSessionTempOwner. fix_plan + ledger + design README updated.
+Loop #35: LANDED INSERT…SELECT crash fix (design 0118-0038, M0118-0002/0008 enabler,
+NOT a spec promotion). `INSERT INTO t SELECT a,b` with no explicit column list +
+fewer source columns than the table panicked the backend (`index out of range` in
+`insertOp.Next`, operators_storage.go:1187 — ColumnIndex=[0,1,2] indexed a 2-col
+row). Fixed in `planInsert` (planner.go ~L7113): reconcile source arity with
+colIndex — over-wide→42601, explicit-list under-wide→42601, implicit-list
+under-wide→truncate colIndex so executor applyDefaultsForMissing fills the rest.
+Type-independent; VALUES path unaffected. Units TestPlanInsertSelect{FewerColumns…,
+MoreColumnsErrors,ExplicitListArityMismatchErrors}; e2e default-fill verified;
+planner+executor suites + pgbench smoke (0-failed, -S ~14.3k TPS) green.
 
-Gates run: catalog/config/executor packages green; full executor pkg PASS;
-gofmt clean on touched files; build ./... OK; pgbench smoke via pre-commit hook.
+Probed ALL 16 remaining M0118-0008 specs this loop (ranking table in design
+0118-0038). NONE is a single-loop promotion — each needs a milestone-sized
+subsystem: transactional DDL catalog visibility (alter-table-1/2/4), role/ACL
+privilege enforcement (truncate/vacuum/cluster-conflict), real TOAST relations
+(reindex-concurrently-toast, plpgsql-toast), partition CONCURRENTLY +
+ATTACH/DETACH (detach-*, partition-concurrent-attach), pg_locks population +
+recursive partition lock (partition-drop-index-locking), reltuples accounting +
+buffer-pin cleanup-lock (vacuum-no-cleanup-lock).
 
-WHY foundation-only: faithful RELATION_IS_OTHER_TEMP exclusion is MULTI-SITE
-(planner SELECT collectInheritanceDescendants planner.go:2189 / :2142 +
-executor UPDATE storage.go:3122, DELETE :3836/:4658, UPDATE…FROM :4252,
-TRUNCATE/DDL operators_ddl.go, FK/MERGE/VACUUM). Sibling-paths discipline: must
-wire ALL atomically or a missed site = silent row-count regression. Planner
-SELECT site has no session identity — needs a CurrentTempOwner() channel on
-sessionPlanCatalog (dispatch.go:870) + currentTempOwner(cat) walk in
-planScanRangeVar threaded into the collect funcs.
+Adjacent bug found (NOT fixed): dispatch.go ~L131 tryHandleRoleDDL swallows an
+entire simple-query batch `CREATE ROLE x; CREATE TABLE y;` and drops the
+CREATE TABLE — why the *-conflict setups leave the table missing. Needs
+statement-splitting in the parser-fail recovery path.
 
-Next step (resume = the deferred WIRING loop): call
-`catalog.AccessibleInheritanceChildren` at every site above (executor:
-owner=sessionTempOwner(ctx); planner: thread the token), then verify strict
-9-perm `TestPort_IsolationInheritTemp` byte-for-byte — incl. the last two
-permutations' TRUNCATE-on-parent blocking (s2_select_p waits behind s1's
-in-progress TRUNCATE; s2_select_c on its own temp child does not). Full gates:
-regress-port + pgbench + -race executor + full TestPort_Isolation*.
-
-Other deferred M0118 tail (hard, see ledger): alter-table-{1,2,4}, *-conflict
-(role/GRANT infra), partition ATTACH/DETACH-concurrently, vacuum-no-cleanup-lock,
-reindex-toast, plpgsql-toast; fk-deadlock, ri-trigger, eval-plan-qual,
-predicate-hash/gin/gist, horizons, intra-grant-inplace, 2PC/async-notify.
+Next step: pick the next M0118 spec needing a bounded mechanism, OR start one of
+the milestone-sized subsystems above (role/ACL enforcement unblocks 4 *-conflict
+specs at once and is broadly useful).

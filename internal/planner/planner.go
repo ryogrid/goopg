@@ -7116,6 +7116,35 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 			return nil, err
 		}
 		source = sel
+		// Reconcile the source arity with the target column list, mirroring
+		// PostgreSQL transformInsertStmt:
+		//   * more source expressions than target columns is an error;
+		//   * with NO explicit column list, fewer source expressions is legal —
+		//     the leading columns are filled and the trailing target columns
+		//     fall back to their DEFAULT (or NULL). PG: "if there are only N
+		//     columns supplied … the first N column names". Truncating colIndex
+		//     here leaves the remaining columns flagged missing in the executor
+		//     (insertOp.Next) so applyDefaultsForMissing fills them; without the
+		//     truncation the executor indexes past the shorter source row and
+		//     panics (index out of range).
+		srcWidth := len(sel.Output())
+		if srcWidth > len(colIndex) {
+			return nil, &PlanError{
+				Pos:     s.Pos(),
+				Code:    "42601",
+				Message: "INSERT has more expressions than target columns",
+			}
+		}
+		if len(s.Columns) > 0 && srcWidth < len(colIndex) {
+			return nil, &PlanError{
+				Pos:     s.Pos(),
+				Code:    "42601",
+				Message: "INSERT has more target columns than expressions",
+			}
+		}
+		if srcWidth < len(colIndex) {
+			colIndex = colIndex[:srcWidth]
+		}
 	} else {
 		// Validate row arity and build planner expressions.
 		if len(s.Rows) == 0 {

@@ -164,6 +164,17 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       GiST AM) need missing index access methods; `predicate-hash` OVER-detects a
       40001 where PG commits — goopg's coarse relation-grain SIREAD vs PG's finer
       hash-index predicate locking (the canonical granularity gap). Group stays open.
+      **2026-06-23 (design 0118-0038, enabler — NOT a promotion):** the
+      `index-only-bitmapscan` global-setup "connection crash" was a backend PANIC
+      (`index out of range` in `insertOp.Next`) on `INSERT INTO t SELECT g.i, g.i`
+      into a 3-column table (`pad char(1024) DEFAULT ''`) — `INSERT … SELECT` with
+      no column list + fewer source columns than the table indexed past the shorter
+      source row instead of default-filling the trailing columns. Fixed in
+      `planInsert` (reconcile source arity with `ColumnIndex`: over-wide →42601,
+      explicit-list under-wide →42601, implicit-list under-wide → truncate so the
+      executor defaults the rest). Spec still deferred — remaining blockers:
+      `VACUUM (TRUNCATE false)` option parse + `EXPLAIN DECLARE CURSOR` + cursor
+      FETCH semantics.
 - [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
       All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
       nowait{,-2,-3,-4,-5}, lock-nowait,

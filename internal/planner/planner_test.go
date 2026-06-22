@@ -975,6 +975,76 @@ func TestPlanInsertDefaultValuesSkipsGeneratedColumns(t *testing.T) {
 	}
 }
 
+// TestPlanInsertSelectFewerColumnsTruncatesColumnIndex: INSERT ... SELECT with
+// NO explicit column list, where the SELECT yields fewer columns than the
+// table. PostgreSQL fills the leading columns and lets the trailing target
+// columns fall back to their DEFAULT. The planner must truncate ColumnIndex to
+// the source width so the executor does not index past the shorter source row
+// (the panic regression fixed in design 0118-0038 / index-only-bitmapscan
+// setup crash). The remaining column is then flagged missing and defaulted.
+func TestPlanInsertSelectFewerColumnsTruncatesColumnIndex(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+		{Name: "pad", Type: catalog.Type{Name: "text"}, DefaultExpr: &parser.StringConst{Value: ""}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t SELECT 1, 2"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins := node.(*Insert)
+	if got, want := ins.ColumnIndex, []int{0, 1}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("ColumnIndex=%v want %v (truncated to source width)", got, want)
+	}
+}
+
+// TestPlanInsertSelectMoreColumnsErrors: INSERT ... SELECT where the SELECT
+// produces MORE columns than the table is a syntax error, mirroring PG
+// transformInsertStmt ("INSERT has more expressions than target columns").
+func TestPlanInsertSelectMoreColumnsErrors(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Plan(parseOne(t, "INSERT INTO t SELECT 1, 2, 3"), c)
+	if err == nil {
+		t.Fatal("expected error for over-wide INSERT ... SELECT")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok || pe.Code != "42601" {
+		t.Fatalf("err=%v want PlanError code 42601", err)
+	}
+}
+
+// TestPlanInsertSelectExplicitListArityMismatchErrors: with an EXPLICIT column
+// list, a SELECT narrower than the list is the symmetric error ("INSERT has
+// more target columns than expressions") — truncation only applies to the
+// implicit-column-list form.
+func TestPlanInsertSelectExplicitListArityMismatchErrors(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+		{Name: "pad", Type: catalog.Type{Name: "text"}, DefaultExpr: &parser.StringConst{Value: ""}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Plan(parseOne(t, "INSERT INTO t (a, b, pad) SELECT 1, 2"), c)
+	if err == nil {
+		t.Fatal("expected error for explicit-list arity mismatch")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok || pe.Code != "42601" {
+		t.Fatalf("err=%v want PlanError code 42601", err)
+	}
+}
+
 // TestPlanUpdate: pgbench's abalance UPDATE plans into
 // Update(Filter(SeqScan)) with Set[2] populated.
 func TestPlanUpdate(t *testing.T) {
