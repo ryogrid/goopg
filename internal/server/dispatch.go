@@ -644,6 +644,25 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				// Since we have the parsed query, reconstruct by storing
 				// the original sql text (trimmed to the cursor portion).
 				connTx.cursorDeclare(dc.Name, sql)
+				// Materialise the cursor eagerly at DECLARE, mirroring PG: a
+				// cursor's portal is opened and its snapshot taken at DECLARE,
+				// not at first FETCH. This matters for snapshot stability and
+				// for locking: inside an explicit transaction the materialising
+				// scan takes a txn-scoped AccessShare on every relation it reads
+				// (acquireScanReadLockTxn), held to commit, so a concurrent
+				// ALTER TABLE … DETACH PARTITION … CONCURRENTLY parks behind the
+				// open cursor (it waits for relation lockers) and a later FETCH
+				// returns the declaration-time partition set rather than the
+				// post-detach one. goopg already buffers all rows at first FETCH,
+				// so this only shifts the materialisation point earlier (no new
+				// memory cost). M0118-0008 detach-partition-concurrently-4
+				// (design 0118-0063). A materialisation error surfaces at DECLARE
+				// (as in PG, where planning/opening happens at DECLARE).
+				if cur, found := connTx.cursorLookup(dc.Name); found {
+					if err := s.materializeCursor(ectx, cur, dc.Name); err != nil {
+						return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+					}
+				}
 			}
 			if err := w.WriteCommandComplete("DECLARE CURSOR"); err != nil {
 				return err
@@ -714,6 +733,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 					// the batch (PG aborts the whole message on error).
 					if !autoCommit && connTx != nil && connTx.InExplicit() {
 						connTx.Fail()
+						connTx.ReleasePinnedSnapshotOnFail(ectx.TxnMgr)
 					}
 					return nil
 				}
@@ -778,6 +798,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				// in the same transaction block get 25P02 (M0100-0005).
 				if !autoCommit && connTx != nil && connTx.InExplicit() {
 					connTx.Fail()
+					connTx.ReleasePinnedSnapshotOnFail(ectx.TxnMgr)
 				}
 				return nil
 			}

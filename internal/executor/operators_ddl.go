@@ -5319,6 +5319,18 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				if werr == nil && o.ctx.TxnMgr != nil {
 					werr = o.ctx.TxnMgr.WaitForPinnedSnapshotsToCommit(o.ctx.Ctx, o.ctx.Tx.Handle)
+					// WaitForPinnedSnapshotsToCommit returns the raw context error
+					// (context.Canceled / DeadlineExceeded) on interruption, not an
+					// ExecError; map it to the matching SQLSTATE-57014 cancel/timeout
+					// message exactly as the lock-wait helpers do, so a cancel during
+					// the pinned-snapshot wait reports "canceling statement due to user
+					// request" rather than the bare "context canceled". M0118-0008
+					// (detach-partition-concurrently-4). Design 0118-0063.
+					if werr != nil {
+						if ee := lockWaitCancelError(werr); ee != nil {
+							werr = ee
+						}
+					}
 				}
 				if werr != nil {
 					// Interrupted before finalize (lock/statement timeout, cancel):

@@ -653,7 +653,78 @@ func (m *Manager) WaitForOlderSlotsToCommit(ctx context.Context, selfHandle TxnH
 // issued BEGIN (no table access) avoid blocking the detacher. Design 0118-0060
 // (M0118-0008 detach-partition-concurrently-2 permutation 5).
 func (m *Manager) WaitForPinnedSnapshotsToCommit(ctx context.Context, selfHandle TxnHandle) error {
-	return m.WaitForSlotsToCommit(ctx, m.SnapshotActiveOtherPinnedSlots(selfHandle))
+	return m.WaitForPinnedSnapshotsReleased(ctx, m.SnapshotActiveOtherPinnedSlots(selfHandle))
+}
+
+// WaitForPinnedSnapshotsReleased blocks until every slot in active has released
+// its transaction-pinned (RR/SSI) snapshot, or ctx is cancelled. A slot's
+// snapshot is released either when its transaction ends (commit/rollback clears
+// pinnedSnap in End) OR when a statement errors at the top level and the
+// transaction enters the aborted state (ReleasePinnedSnapshot clears pinnedSnap
+// while inTxn stays 1 until the eventual ROLLBACK). The latter mirrors
+// PostgreSQL's AbortTransaction, which drops the transaction snapshot the moment
+// a top-level statement errors — so a concurrent DETACH PARTITION CONCURRENTLY
+// that was waiting for an RR session's snapshot unblocks as soon as that session
+// hits an error, BEFORE its explicit ROLLBACK/COMMIT (detach-partition-
+// concurrently-4 permutation `s1brr s1s s2detach s1insert s1c`, where s1insert's
+// FK error must let s2detach complete ahead of s1c). Design 0118-0063.
+func (m *Manager) WaitForPinnedSnapshotsReleased(ctx context.Context, active []int) error {
+	if len(active) == 0 {
+		return nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			m.commitCond.Broadcast()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	m.waitMu.Lock()
+	defer m.waitMu.Unlock()
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		allDone := true
+		for _, i := range active {
+			s := &m.procArray.slots[i]
+			if s.inTxn.Load() == 1 && s.pinnedSnap.Load() {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			return nil
+		}
+		m.commitCond.Wait()
+	}
+}
+
+// ReleasePinnedSnapshot clears the transaction-pinned snapshot marker on the
+// slot identified by handle without ending the transaction (inTxn stays 1). It
+// is called when a statement errors at the top level of an explicit transaction
+// (no open savepoint), mirroring PostgreSQL's AbortTransaction releasing the
+// transaction snapshot at abort: the aborted transaction can only ROLLBACK from
+// here, so its RR/SSI snapshot will never be used again and a concurrent waiter
+// (WaitForPinnedSnapshotsReleased, e.g. DETACH PARTITION CONCURRENTLY) must stop
+// waiting for it. The broadcast wakes any such waiter to re-check. A no-op when
+// the slot held no pinned snapshot (RC sessions, or a slot already released).
+// Design 0118-0063 (M0118-0008 detach-partition-concurrently-4).
+func (m *Manager) ReleasePinnedSnapshot(handle TxnHandle) {
+	idx := int(handle) - 1
+	if idx < 0 || idx >= len(m.procArray.slots) {
+		return
+	}
+	s := &m.procArray.slots[idx]
+	if s.pinnedSnap.Swap(false) {
+		m.waitMu.Lock()
+		m.commitCond.Broadcast()
+		m.waitMu.Unlock()
+	}
 }
 
 // SnapshotActiveOtherPinnedSlots is SnapshotActiveOtherSlots filtered to slots

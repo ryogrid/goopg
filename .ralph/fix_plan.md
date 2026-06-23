@@ -736,10 +736,27 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       diff confined to the 8 cursor permutations. Siblings detach-1/2/3 +
       FkSnapshot/FkContention/PartitionKeyUpdate1..4 PASS; executor/catalog units
       PASS; pgbench smoke 0-failed.
-      **Remaining (deferred):** `detach-partition-concurrently-4` cursor
-      permutations need cursor-pinned-snapshot machinery (cursor snapshot pinning
-      at DECLARE so FETCH sees the declaration-time partition set; detacher waits
-      on an open cursor) — see ledger; `alter-table-4` (INHERITS + transactional-
+      **2026-06-24 partial (design 0118-0063): `detach-partition-concurrently-4`
+      cursor + abort/cancel permutations LANDED (still NOT promoted — only the 3
+      `WHERE CURRENT OF` perms remain).** Three fixes: (1) eager cursor
+      materialisation at DECLARE (`dispatch.go`) — mirrors PG opening the portal +
+      taking snapshot/locks at DECLARE; the materialising scan takes a txn-scoped
+      AccessShare (so the concurrent DETACH parks behind the open cursor) and
+      buffers the declaration-time partition set; (2) abort releases the RR/SSI
+      pinned snapshot — new `mvcc.ReleasePinnedSnapshot`/`WaitForPinnedSnapshotsReleased`
+      + `connTxState.ReleasePinnedSnapshotOnFail` (gated `SavepointDepth()==0`),
+      mirroring PG `AbortTransaction` dropping the snapshot the instant a top-level
+      statement errors (so a detacher unblocks at the error, before the explicit
+      ROLLBACK/COMMIT); (3) cancel-message mapping — the detach pinned-snapshot
+      wait now maps through `lockWaitCancelError` (57014 "canceling statement due
+      to user request"). Probe: first divergence moved spec L80 → the 3 updcur
+      perms. detach-1/2/3 + vacuum-no-cleanup-lock + alter-table-1/2/3 +
+      conflict-family + FK + SSI + inherit-temp + savepoint/abort siblings PASS.
+      **Remaining (deferred):** `detach-partition-concurrently-4` needs ONLY
+      `WHERE CURRENT OF` positioned UPDATE/DELETE (`s1updcur`: `update d4_fk set
+      a=1 where current of f`) — `CurrentOf` is parsed but never executed; needs
+      per-row CTID capture in the cursor + a CTID-restricted UPDATE (see ledger);
+      `alter-table-4` (INHERITS + transactional-
       DDL cross-session visibility), `partition-concurrent-attach`
       (transactional partition visibility),
       `partition-drop-index-locking` (pg_locks view parity),

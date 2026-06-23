@@ -145,6 +145,26 @@ func (c *connTxState) Fail() {
 	c.mu.Unlock()
 }
 
+// ReleasePinnedSnapshotOnFail clears the transaction-pinned (RR/SSI) snapshot
+// marker after a top-level statement error, mirroring PostgreSQL's
+// AbortTransaction dropping the transaction snapshot at abort. Gated on
+// SavepointDepth()==0 exactly like Fail()'s lock release: when a savepoint is
+// open the error aborts only the subtransaction and ROLLBACK TO SAVEPOINT
+// resumes the SAME transaction snapshot, so it must be retained. Lets a
+// concurrent DETACH PARTITION CONCURRENTLY waiting on this session's snapshot
+// unblock as soon as the session errors, before its explicit ROLLBACK/COMMIT.
+// Design 0118-0063 (M0118-0008 detach-partition-concurrently-4).
+func (c *connTxState) ReleasePinnedSnapshotOnFail(mgr *mvcc.Manager) {
+	if mgr == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sess != nil && c.sess.SavepointDepth() == 0 {
+		mgr.ReleasePinnedSnapshot(c.tx.Handle)
+	}
+}
+
 // ClearFailed clears the failed transaction state.  Used after ROLLBACK TO
 // SAVEPOINT restores the transaction to a pre-error state.
 func (c *connTxState) ClearFailed() {
