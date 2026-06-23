@@ -2156,7 +2156,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					// buildInheritanceRemapProject wraps the scan in a Project
 					// that reorders to the root table's logical schema.
 					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
-					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema}
+					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID}
 					var leafNode Node = leafScan
 					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
 						leafNode = buildInheritanceRemapProject(rv.Pos(), leafScan, tbl, leaf, sourceIdx)

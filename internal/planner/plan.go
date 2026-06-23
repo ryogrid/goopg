@@ -509,6 +509,14 @@ type SeqScan struct {
 	Table  *catalog.Table
 	Alias  string // FROM-clause alias; empty when not specified
 	schema Schema
+	// LockParentOID, when non-zero, is the OID of a partitioned parent that was
+	// expanded into this leaf scan. Scanning a partitioned table THROUGH the
+	// parent takes AccessShare on the parent relation too (PostgreSQL locks the
+	// whole hierarchy from the queried root), so a concurrent AccessExclusive
+	// holder on the parent (e.g. DROP of a partition pending detach, which grabs
+	// the parent lock) blocks the scan. Zero for a leaf scanned directly.
+	// M0118-0008 (detach-partition-concurrently-3).
+	LockParentOID uint32
 }
 
 func (n *SeqScan) Pos() int       { return n.pos }

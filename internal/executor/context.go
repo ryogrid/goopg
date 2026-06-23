@@ -782,10 +782,16 @@ func (c *Context) acquireScanReadLockTxn(rel storage.RelFileNode) error {
 // This is the write half of the table-level DDL/DML conflict machinery used by
 // the create-trigger isolation spec. M0118-0008.
 func (c *Context) acquireWriteLockTxn(rel storage.RelFileNode) error {
-	if c.TxnLockBackendID == 0 || rel.RelOid < firstNormalObjectOID {
-		return nil
-	}
-	return c.acquireRelLockTxn(rel, lockmgr.RowExclusiveLock, false)
+	// Symmetric with the read-side acquireScanReadLockTxn: held to
+	// end-of-transaction inside an explicit block, and acquired+released
+	// transiently in autocommit so the acquisition still WAITS behind a
+	// conflicting holder (e.g. an AccessExclusiveLock from DETACH … FINALIZE on
+	// the partition). RowExclusive is self-compatible and compatible with
+	// AccessShare/RowShare/RowExclusive, so concurrent DML/reads never block at
+	// the table level — only a DDL-grade lock (Share/ShareRowExclusive/
+	// Exclusive/AccessExclusive) does, matching PostgreSQL. M0118-0008
+	// (detach-partition-concurrently-3, autocommit INSERT behind FINALIZE).
+	return c.acquireRelLockMaybeTransient(rel, lockmgr.RowExclusiveLock)
 }
 
 // acquireDDLLockTxn takes a transaction-scoped heavyweight lock in the requested

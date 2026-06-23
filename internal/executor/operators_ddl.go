@@ -4433,6 +4433,24 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error
 	}
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	relOID := tbl.OID
+	// Dropping a partition left in the incomplete-detach state
+	// (DetachPendingEpoch != 0) also grabs an AccessExclusiveLock on the parent,
+	// because the parent's partition descriptor still references it: upstream
+	// RangeVarCallbackForDropRelation / heap_drop locks the parent when removing a
+	// partition pending detach so concurrent readers of the parent see a
+	// consistent set. Held to end-of-transaction inside an explicit block (a
+	// no-op in autocommit), so a concurrent SELECT on the parent blocks until the
+	// dropping transaction commits. M0118-0008 (detach-partition-concurrently-3).
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && tbl.DetachPendingEpoch != 0 && tbl.PartitionParentOID != 0 {
+		if parentTbl, ok2 := im.LookupTableByOID(tbl.PartitionParentOID); ok2 {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(parentTbl), lockmgr.AccessExclusiveLock); err != nil {
+				if ee, ok3 := err.(*ExecError); ok3 && ee.Pos == 0 {
+					ee.Pos = name.Pos()
+				}
+				return err
+			}
+		}
+	}
 	// Use the table's stored name for DropTable so that bare-keyed tables
 	// (schema="") found via a schema-qualified lookup can be removed correctly.
 	// M0097-0023.
@@ -4940,6 +4958,18 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		return &ExecError{Code: "42501", Pos: s.Pos(),
 			Message: fmt.Sprintf("permission denied: %q is a system catalog", tbl.Name)}
 	}
+	// Disallow any ALTER TABLE on a partition left in an incomplete-detach state
+	// (a DETACH PARTITION CONCURRENTLY that was cancelled mid-wait, so the child
+	// is still registered but marked detach-pending). Mirrors PG ATPrepCmd
+	// (tablecmds.c): `cmd->subtype != AT_DetachPartitionFinalize &&
+	// PartitionHasPendingDetach(rel)`. The only way out is
+	// ALTER TABLE parent DETACH PARTITION child FINALIZE, which targets the
+	// PARENT (so tbl there is not the pending child). M0118-0008
+	// (detach-partition-concurrently-3).
+	if tbl.DetachPendingEpoch != 0 && tbl.PartitionParentOID != 0 {
+		return &ExecError{Code: "55000", Pos: s.Pos(),
+			Message: fmt.Sprintf("cannot alter partition %q with an incomplete detach", tbl.Name)}
+	}
 	for _, act := range s.Actions {
 		switch act.Kind {
 		case parser.AlterTableAddColumn:
@@ -5240,6 +5270,24 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// synchronously (no wait) before marking detach-pending so routing
 				// still resolves the child. Design 0118-0060
 				// (detach-partition-concurrently-2).
+				// MarkInheritDetached (tablecmds.c): a partitioned table may have
+				// at most one partition pending detach at a time. Scan the parent's
+				// children; if any is already detach-pending (e.g. an earlier
+				// concurrent detach was cancelled mid-wait, leaving an incomplete
+				// detach), reject naming that child. M0118-0008
+				// (detach-partition-concurrently-3, permutation s2detach2 after a
+				// cancelled s2detach).
+				for _, sib := range im.PartitionChildren(tbl.OID) {
+					if sib.DetachPendingEpoch != 0 {
+						parentSchema := tbl.Schema
+						if parentSchema == "" {
+							parentSchema = "public"
+						}
+						return &ExecError{Code: "55000", Pos: act.Pos(),
+							Message: fmt.Sprintf("partition %q already pending detach in partitioned table %q",
+								sib.Name, parentSchema+"."+tbl.Name)}
+					}
+				}
 				if ferr := detachPartitionFKRefCheck(o.ctx, tbl, childTbl); ferr != nil {
 					if ee, ok := ferr.(*ExecError); ok && ee.Pos == 0 {
 						ee.Pos = act.Pos()
@@ -5274,10 +5322,14 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 				if werr != nil {
 					// Interrupted before finalize (lock/statement timeout, cancel):
-					// revert phase 1 so the partition stays attached. Resuming an
-					// interrupted concurrent detach via FINALIZE is a separate slice
-					// (detach-partition-concurrently-3/4, deferred).
-					im.ClearPartitionDetachPending(childTbl.OID)
+					// leave phase 1 in place — the partition stays in the
+					// "incomplete detach" state (still registered, relpartbound set,
+					// inhdetachpending marked). Upstream commits the
+					// inhdetachpending mark in its own transaction BEFORE waiting, so
+					// a cancel during the wait does NOT roll it back; the partition
+					// is omitted from every newer snapshot and must be completed with
+					// ALTER TABLE ... DETACH PARTITION ... FINALIZE (or dropped).
+					// M0118-0008 (detach-partition-concurrently-3). Design 0118-0061.
 					if ee, ok := werr.(*ExecError); ok && ee.Pos == 0 {
 						ee.Pos = act.Pos()
 					}
@@ -5289,10 +5341,37 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				childTbl.PartitionBounds = nil
 				im.ClearPartitionDetachPending(childTbl.OID)
 			} else {
-				// Plain DETACH / DETACH FINALIZE: synchronous, single-phase.
+				// Plain DETACH / DETACH FINALIZE: single-phase. FINALIZE also
+				// completes a partition left in the incomplete-detach state by a
+				// cancelled DETACH … CONCURRENTLY: unregister, drop the bound, and
+				// clear the detach-pending mark. M0118-0008
+				// (detach-partition-concurrently-3).
+				//
+				// FINALIZE/plain DETACH takes an AccessExclusiveLock on the
+				// partition (tablecmds.c DetachPartitionFinalize / ATExecDetachPartition),
+				// so it must wait behind any other backend still holding a lock on
+				// the partition — e.g. a session that read the partition directly
+				// (s1spart) or read the parent while the partition was still
+				// attached (s1s before the detach). It does NOT wait on the parent:
+				// only ShareUpdateExclusive is held there, compatible with a
+				// concurrent reader, so a session that scanned the parent AFTER the
+				// partition went detach-pending (and thus never locked the
+				// partition) does not block FINALIZE. acquireRelLockMaybeTransient
+				// holds the AEL to end-of-transaction inside an explicit block (so a
+				// later concurrent read of the partition blocks until COMMIT) and
+				// acquires+releases transiently in autocommit (the wait still
+				// happens during acquisition). The wait is rendered `<waiting ...>`
+				// by the runner's timing.
+				if werr := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(childTbl), lockmgr.AccessExclusiveLock); werr != nil {
+					if ee, ok := werr.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = act.Pos()
+					}
+					return werr
+				}
 				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
 				childTbl.PartitionParentOID = 0
 				childTbl.PartitionBounds = nil
+				im.ClearPartitionDetachPending(childTbl.OID)
 			}
 
 		case parser.AlterIndexAttachPartition:
@@ -7510,6 +7589,14 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	if !only {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 			for _, child := range im.PartitionChildren(tbl.OID) {
+				// A partition pending detach (incomplete DETACH … CONCURRENTLY) is
+				// no longer logically part of the parent: TRUNCATE on the parent
+				// must not touch it. Mirrors PG's find_all_inheritors omitting
+				// inhdetachpending children. M0118-0008
+				// (detach-partition-concurrently-3).
+				if child.DetachPendingEpoch != 0 {
+					continue
+				}
 				if err := o.truncateTableAndPartitions(child, pos, false); err != nil {
 					return err
 				}

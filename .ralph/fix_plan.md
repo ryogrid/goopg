@@ -699,9 +699,30 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       ScalarSubquery,DoCommitChain*}` suite PASS; full `internal/executor` PASS;
       `TestPort_IsolationSubxidOverflow`/`FreezeTheDead` PASS (no regression);
       `go build` clean; pgbench smoke = pre-commit hook.
+      **2026-06-24 promotion (design 0118-0061): `detach-partition-concurrently-3`
+      PROMOTED ⇒ all 18 permutations byte-for-byte** (strict
+      `TestPort_IsolationDetachPartitionConcurrently3`). Builds the
+      incomplete-detach lifecycle: a `DETACH … CONCURRENTLY` cancelled mid-wait
+      now LEAVES the partition detach-pending (interrupt path no longer reverts
+      `MarkPartitionDetachPending`). Nine gated pieces — persist-on-cancel;
+      `already pending detach` guard (55000); ALTER-on-pending guard (55000
+      `cannot alter partition X with an incomplete detach`); `pg_partition_tree`
+      skips the pending child / NULL-parent standalone root; TRUNCATE omits it
+      (DROP still cascades); `DETACH … FINALIZE` clears the mark + takes
+      AccessExclusive on the partition via `acquireRelLockMaybeTransient`; DROP
+      of the pending child grabs AccessExclusive on the parent; partitioned-parent
+      scan now locks the parent (`SeqScan.LockParentOID`→AccessShare); and
+      `acquireWriteLockTxn` made symmetric with the read side so an autocommit
+      write blocks behind a conflicting AEL. Changes 1–7 gated on
+      `DetachPendingEpoch != 0`; 8–9 only conflict with DDL-grade locks. Gates:
+      strict PASS; detach-1/2 + create-trigger/alter-table-1/2/3/inherit-temp/
+      truncate-conflict/vacuum-conflict/cluster-conflict/timeouts/row-lock/
+      write-skew/merge/FK siblings PASS; `-race` executor/lockmgr/mvcc; pgbench
+      smoke 0-failed.
       **Remaining (deferred):** `alter-table-4` (INHERITS + transactional-DDL
-      cross-session visibility), `detach-partition-concurrently-{1,2,3,4}` +
-      `partition-concurrent-attach` (transactional partition visibility),
+      cross-session visibility), `detach-partition-concurrently-4` (cancel-then-
+      resume of the concurrent detach itself) + `partition-concurrent-attach`
+      (transactional partition visibility),
       `partition-drop-index-locking` (pg_locks view parity),
       `reindex-concurrently-toast` (toast relations as catalog objects +
       `allow_system_table_mods`). Group stays open.

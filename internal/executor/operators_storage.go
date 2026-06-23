@@ -594,6 +594,10 @@ type seqScanOp struct {
 	pos    int
 	rel    storage.RelFileNode // cached once in Open; avoids catalog lock per Next call
 
+	// lockParentOID is the partitioned parent this leaf was expanded from (a
+	// scan THROUGH the parent locks the parent too); 0 for a direct leaf scan.
+	lockParentOID uint32
+
 	ctx  *Context
 	cols []catalog.Column
 
@@ -659,10 +663,11 @@ const seqScanLookahead storage.BlockNumber = 4
 
 func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 	return &seqScanOp{
-		schema: p.Output(),
-		tbl:    p.Table,
-		pos:    p.Pos(),
-		cols:   p.Table.Columns,
+		schema:        p.Output(),
+		tbl:           p.Table,
+		pos:           p.Pos(),
+		cols:          p.Table.Columns,
+		lockParentOID: p.LockParentOID,
 	}
 }
 
@@ -710,6 +715,24 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			ee.Pos = o.pos
 		}
 		return err
+	}
+	// Scanning a partition THROUGH its partitioned parent locks the parent
+	// (AccessShare) as well — PostgreSQL locks the whole hierarchy from the
+	// queried root. A concurrent AccessExclusive holder on the parent (e.g. a
+	// DROP of a sibling partition pending detach, which grabs the parent lock)
+	// therefore blocks this scan until it commits. M0118-0008
+	// (detach-partition-concurrently-3).
+	if o.lockParentOID != 0 {
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if parentTbl, ok2 := im.LookupTableByOID(o.lockParentOID); ok2 {
+				if err := ctx.acquireScanReadLockTxn(ctx.Catalog.RelFileNode(parentTbl)); err != nil {
+					if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = o.pos
+					}
+					return err
+				}
+			}
+		}
 	}
 	n, err := ctx.Pool.NBlocks(o.rel)
 	if err != nil {

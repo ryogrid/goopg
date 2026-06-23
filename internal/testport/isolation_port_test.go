@@ -654,6 +654,35 @@ func TestPort_IsolationDetachPartitionConcurrently2(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/detach-partition-concurrently-2.spec")
 }
 
+// TestPort_IsolationDetachPartitionConcurrently3 exercises the
+// detach-partition-concurrently-3 spec (M0118-0008): things that may happen to
+// a partition left in an "incomplete detach" state — a DETACH PARTITION
+// CONCURRENTLY that was cancelled (pg_cancel_backend) while it waited. Across
+// all 18 permutations, byte-identical to PG 18.3:
+//   - The cancel LEAVES the partition detach-pending (no revert): it is omitted
+//     from the parent for every newer snapshot, so INSERT into the parent of a
+//     value that lived only in it fails "no partition found"; a REPEATABLE READ
+//     session whose snapshot predates the detach still sees it.
+//   - pg_partition_tree omits the pending child from the parent and reports it as
+//     a standalone root (NULL parent); ALTER on it errors 55000 "cannot alter
+//     partition … with an incomplete detach"; a second concurrent DETACH errors
+//     55000 "partition … already pending detach".
+//   - TRUNCATE of the parent skips it; DROP of the parent still drops it; DROP of
+//     the pending child grabs an AccessExclusiveLock on the parent (so a
+//     concurrent parent SELECT blocks); DETACH … FINALIZE completes it, taking an
+//     AccessExclusiveLock on the partition (a concurrent read/insert of the
+//     partition blocks until FINALIZE's transaction commits, but a parent scan
+//     does not).
+//
+// Design 0118-0061.
+func TestPort_IsolationDetachPartitionConcurrently3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_detach_partition_3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/detach-partition-concurrently-3.spec")
+}
+
 // TestPort_IsolationVacuumNoCleanupLock exercises the vacuum-no-cleanup-lock
 // spec (M0118-0008). It asserts that pg_class.relpages / reltuples reflect what
 // VACUUM observes, even when a concurrent backend (a cursor holding a heap-page
