@@ -2519,6 +2519,53 @@ func newUpdateOp(p *planner.Update) (*updateOp, error) {
 
 func (o *updateOp) Schema() planner.Schema { return o.plan.ReturningSchema }
 
+// childFKsToRecheck returns the foreign keys declared ON the updated table
+// whose referencing columns are modified by this UPDATE's SET list. PostgreSQL
+// fires the RI_FKey_check (the referenced parent row must exist) AFTER trigger
+// only when a key column actually changes, so an UPDATE that touches no FK
+// column performs no parent lookup. Mirroring that both matches PG and bounds
+// the new check's blast radius to FK-key UPDATEs on tables that have FKs.
+// Computed once per UPDATE (the SET list is fixed). M0118-0008
+// (detach-partition-concurrently-4).
+func (o *updateOp) childFKsToRecheck() []catalog.ForeignKey {
+	tbl := o.plan.Table
+	if len(tbl.ForeignKeys) == 0 {
+		return nil
+	}
+	var out []catalog.ForeignKey
+	for _, fk := range tbl.ForeignKeys {
+		for _, fc := range fk.Columns {
+			idx := -1
+			for i, col := range tbl.Columns {
+				if strings.EqualFold(col.Name, fc) {
+					idx = i
+					break
+				}
+			}
+			if idx >= 0 && idx < len(o.plan.Set) && o.plan.Set[idx] != nil {
+				out = append(out, fk)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// recheckChildFKs verifies that newRow's modified FK key values still reference
+// an existing parent row. newRow must be aligned to o.plan.Table.Columns; pass
+// scanTbl so rows that came from an inheritance child (different column layout)
+// are skipped — those children carry their own FKs and are not exercised here.
+// M0118-0008 (detach-partition-concurrently-4).
+func (o *updateOp) recheckChildFKs(fks []catalog.ForeignKey, newRow Row, scanTbl *catalog.Table) error {
+	if len(fks) == 0 {
+		return nil
+	}
+	if scanTbl != nil && scanTbl != o.plan.Table {
+		return nil
+	}
+	return checkFKInsertForConstraints(o.ctx, o.plan.Table, nil, newRow, fks)
+}
+
 // appendUpdateRetRow evaluates the plan's RETURNING expressions against
 // newRow and appends the result to o.retRows. No-op when RETURNING is absent.
 func (o *updateOp) appendUpdateRetRow(newRow Row) {
@@ -2704,6 +2751,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	if !hotEligible {
 		updReqStatus = multixact.StatusUpdate
 	}
+	fksToRecheckIdx := o.childFKsToRecheck()
 	for _, pu := range pending {
 		// Honour a row lock propagated forward onto this live version by
 		// heap_lock_updated_tuple before writing: wait for every still-active
@@ -2725,6 +2773,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 			pu.newRow = retRow
 			trigFiredViaIdx = true
+		}
+		// RI_FKey_check: the new FK key value must reference an existing parent
+		// row. M0118-0008 (detach-partition-concurrently-4).
+		if err := o.recheckChildFKs(fksToRecheckIdx, pu.newRow, idxTbl); err != nil {
+			return nil, err
 		}
 		used := false
 		if hotEligible {
@@ -3395,6 +3448,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	if !hotEligibleSeq {
 		updReqStatusSeq = multixact.StatusUpdate
 	}
+	fksToRecheckSeq := o.childFKsToRecheck()
 	for _, pu := range pending {
 		// Honour a row lock propagated forward onto this live version by
 		// heap_lock_updated_tuple before writing: wait for every still-active
@@ -3421,6 +3475,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				continue // RETURN NULL — skip this row
 			}
 			pu.newRow = retRow
+		}
+		// RI_FKey_check: the new FK key value must reference an existing parent
+		// row (after BEFORE triggers may have rewritten it). M0118-0008.
+		if err := o.recheckChildFKs(fksToRecheckSeq, pu.newRow, pu.scanTbl); err != nil {
+			return nil, err
 		}
 		puRel := pu.rel
 		if puRel == (storage.RelFileNode{}) {
@@ -4400,6 +4459,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	// pu.rel    = relation where the new row is written (destination; may differ on cross-partition move).
 	// pu.tgtCols = columns of the destination relation. M0097-0078, M0100-0010.
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
+	fksToRecheckFrom := o.childFKsToRecheck()
 	seen := make(map[[2]uint64]bool)
 	for _, pu := range pending {
 		puSrcRel := pu.srcRel
@@ -4427,6 +4487,11 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				continue
 			}
 			pu.newRow = retRow
+		}
+		// RI_FKey_check: the new FK key value must reference an existing parent
+		// row. M0118-0008 (detach-partition-concurrently-4).
+		if err := o.recheckChildFKs(fksToRecheckFrom, pu.newRow, pu.tbl); err != nil {
+			return nil, err
 		}
 		used := false
 		if hotEligible && puSrcRel == rel && puRel == rel {

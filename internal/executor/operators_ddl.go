@@ -5347,6 +5347,38 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 					return werr
 				}
+				// Re-validate RI_PartitionRemove_Check after the wait. The first
+				// check (above, before MarkPartitionDetachPending) ran under the
+				// statement-start snapshot, which could not see a referencing row
+				// inserted/updated by a concurrent transaction the detacher then
+				// waited on — e.g. a cursor-pinned REPEATABLE READ session that did
+				// `update d4_fk set a = 1 where current of f` (routing the row into
+				// this very partition) and only committed during the wait. Upstream
+				// re-runs the partition-removal RI check after WaitForLockers; do the
+				// same here. Use a FRESH snapshot (so the now-committed row is
+				// visible) but with PartitionDetachEpoch=0 so routeToPartition still
+				// recognises the row as routing to this — now detach-pending — child
+				// (a fresh snapshot's epoch would otherwise filter it out). The child
+				// is still registered (UnregisterPartitionChild runs below) so its
+				// 1-based ordinal → cloned-constraint suffix is unchanged. M0118-0008
+				// (detach-partition-concurrently-4, perm s1updcur-before-detach).
+				// Design 0118-0064.
+				if o.ctx.TxnMgr != nil && o.ctx.Tx.Handle != 0 {
+					savedSnap := o.ctx.Snap
+					if fresh, serr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); serr == nil {
+						refreshed := fresh.Clone()
+						refreshed.PartitionDetachEpoch = 0
+						o.ctx.Snap = refreshed
+					}
+					ferr := detachPartitionFKRefCheck(o.ctx, tbl, childTbl)
+					o.ctx.Snap = savedSnap
+					if ferr != nil {
+						if ee, ok := ferr.(*ExecError); ok && ee.Pos == 0 {
+							ee.Pos = act.Pos()
+						}
+						return ferr
+					}
+				}
 				// Phase 2: finalize the detach.
 				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
 				childTbl.PartitionParentOID = 0

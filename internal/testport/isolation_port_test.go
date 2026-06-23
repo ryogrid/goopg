@@ -683,6 +683,33 @@ func TestPort_IsolationDetachPartitionConcurrently3(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/detach-partition-concurrently-3.spec")
 }
 
+// TestPort_IsolationDetachPartitionConcurrently4 exercises the
+// detach-partition-concurrently-4 spec (M0118-0008): foreign keys in the face
+// of concurrent DETACH PARTITION … CONCURRENTLY of the referenced table. Across
+// all 21 permutations, byte-identical to PG 18.3:
+//   - Inserting/updating a value that lives only in a concurrently-detaching
+//     partition fails its FK check even under REPEATABLE READ, because the RI
+//     existence query observes the current detach epoch (design 0118-0062),
+//     while a cursor/SELECT in the same RR txn still sees that very row.
+//   - An UPDATE that sets an FK column fires the RI parent-existence check
+//     (RI_FKey_check) just like an INSERT, so `update d4_fk set a = 1 where
+//     current of f` (value 1 invisible in the detaching partition) raises 23503
+//     (design 0118-0064, Fix 1).
+//   - When the referencing row is created/updated by a concurrent session that
+//     the detacher waits on, the detach re-validates RI_PartitionRemove_Check
+//     after the wait (fresh snapshot, routing the pending child back in) and
+//     fails "removing partition … violates foreign key constraint …_1"
+//     (design 0118-0064, Fix 2).
+//   - Cursor pinning at DECLARE + abort-releases-snapshot + cancel-message
+//     mapping (design 0118-0063).
+func TestPort_IsolationDetachPartitionConcurrently4(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_detach_partition_4")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/detach-partition-concurrently-4.spec")
+}
+
 // TestPort_IsolationVacuumNoCleanupLock exercises the vacuum-no-cleanup-lock
 // spec (M0118-0008). It asserts that pg_class.relpages / reltuples reflect what
 // VACUUM observes, even when a concurrent backend (a cursor holding a heap-page

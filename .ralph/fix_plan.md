@@ -752,13 +752,38 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       to user request"). Probe: first divergence moved spec L80 → the 3 updcur
       perms. detach-1/2/3 + vacuum-no-cleanup-lock + alter-table-1/2/3 +
       conflict-family + FK + SSI + inherit-temp + savepoint/abort siblings PASS.
-      **Remaining (deferred):** `detach-partition-concurrently-4` needs ONLY
-      `WHERE CURRENT OF` positioned UPDATE/DELETE (`s1updcur`: `update d4_fk set
-      a=1 where current of f`) — `CurrentOf` is parsed but never executed; needs
-      per-row CTID capture in the cursor + a CTID-restricted UPDATE (see ledger);
-      `alter-table-4` (INHERITS + transactional-
-      DDL cross-session visibility), `partition-concurrent-attach`
-      (transactional partition visibility),
+      **2026-06-24 promotion (design 0118-0064): `detach-partition-concurrently-4`
+      PROMOTED ⇒ all 21 permutations byte-for-byte** (strict
+      `TestPort_IsolationDetachPartitionConcurrently4`). Closed the last 3
+      (`WHERE CURRENT OF`) perms via two FK behaviours (NOT positioned-DML):
+      (Fix 1) **UPDATE now fires the RI_FKey_check parent-existence assertion** —
+      goopg only ran `checkFKInsert` from `insertOp`; `updateOp` did no parent
+      lookup, so `update d4_fk set a=1` (value 1 lives only in the
+      concurrently-detaching partition, invisible to the latest snapshot per
+      0118-0062) silently succeeded. New `updateOp.childFKsToRecheck()` (FKs whose
+      referencing cols are in the SET list — mirrors PG firing the RI AFTER-trigger
+      only on a key-column change, bounding blast radius to FK-key UPDATEs on FK
+      tables) + `recheckChildFKs()` (delegates to new `checkFKInsertForConstraints`),
+      wired into all 3 write paths (`Next` seqscan / `updateViaIndex` /
+      `updateWithFrom`) after BEFORE triggers, before the heap write ⇒ raises
+      23503. (Fix 2) **DETACH re-validates `RI_PartitionRemove_Check` after the
+      hybrid wait** — the first check ran before the wait under the
+      statement-start snapshot, missing a referencing row a waited-on session
+      committed during the wait; the detacher now re-runs it with a FRESH snapshot
+      (`TxnMgr.SnapshotFor(Tx).Clone`) whose `PartitionDetachEpoch` is forced to 0
+      so `routeToPartition` keeps the now-pending child in the routing set and the
+      violation is recognised (`d4_fk_a_fkey_1`). `WHERE CURRENT OF` positioned-DML
+      is indistinguishable here (`d4_fk` has 1 row) and is a separate project-wide
+      follow-up (ledger). Gates: strict PASS (21 perms); detach-1/2/3 +
+      Fk{Snapshot,Contention,Deadlock2}/ReferentialIntegrity/TemporalRangeIntegrity
+      + PartitionKeyUpdate1..4 + Merge* + InsertConflictDoUpdate* PASS; regress-port
+      foreign_key/update/constraints/inherit no regression; `-race`
+      ./internal/executor/; `go build` clean; pgbench smoke (pre-commit).
+      **Remaining (deferred):** `WHERE CURRENT OF` positioned UPDATE/DELETE
+      (project-wide, parsed but no executor site consumes `CurrentOf`; needs
+      per-row CTID capture in the cursor + a CTID-restricted rewrite — see ledger),
+      `alter-table-4` (INHERITS + transactional-DDL cross-session visibility),
+      `partition-concurrent-attach` (transactional partition visibility),
       `partition-drop-index-locking` (pg_locks view parity),
       `reindex-concurrently-toast` (toast relations as catalog objects +
       `allow_system_table_mods`). Group stays open.

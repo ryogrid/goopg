@@ -1,45 +1,31 @@
-Loop #21: M0118-0008 — detach-partition-concurrently-4 cursor + abort/cancel permutations LANDED (design 0118-0063, PARTIAL — NOT promoted).
+Loop #22: M0118-0008 — detach-partition-concurrently-4 PROMOTED (design 0118-0064, all 21 perms byte-for-byte). COMMITTED? pending commit at loop end.
 
-What landed (three fixes; closes every detach-4 permutation EXCEPT the 3 WHERE CURRENT OF perms):
-1. Eager cursor materialisation at DECLARE (internal/server/dispatch.go,
-   DeclareCursorStmt branch): materializeCursor now runs at DECLARE instead of
-   lazily on first FETCH (mirrors PG opening the portal + taking snapshot/locks
-   at DECLARE). The materialising scan takes a txn-scoped AccessShare
-   (acquireScanReadLockTxn, held to commit ⇒ concurrent DETACH … CONCURRENTLY
-   parks behind the open cursor via waitForRelationLockers) AND buffers the
-   declaration-time snapshot's rows (FETCH returns the pre-detach partition set).
-   goopg already buffered all rows at first FETCH so only the timing shifts;
-   executeFetch guards on !cur.Materialized.
-2. Abort releases the RR/SSI pinned snapshot (internal/mvcc/manager.go +
-   internal/server/conn_tx.go + dispatch.go): new ReleasePinnedSnapshot(handle)
-   clears pinnedSnap WITHOUT ending the txn + broadcasts commitCond; new
-   WaitForPinnedSnapshotsReleased waits until each slot is inTxn==0 OR
-   pinnedSnap==false (now used by WaitForPinnedSnapshotsToCommit);
-   connTxState.ReleasePinnedSnapshotOnFail(mgr) calls it after Fail() gated
-   SavepointDepth()==0, wired at both Fail() sites. Mirrors PG AbortTransaction
-   dropping the snapshot the instant a top-level stmt errors ⇒ a detacher
-   waiting on an RR session unblocks at the error, BEFORE the explicit
-   ROLLBACK/COMMIT (perm s1brr s1s s2detach s1insert s1c).
-3. Cancel-message mapping (internal/executor/operators_ddl.go): the detach's
-   WaitForPinnedSnapshotsToCommit result is mapped through lockWaitCancelError
-   so a cancel reports 57014 "canceling statement due to user request" not the
-   bare "context canceled".
+What landed (two FK behaviours closed the last 3 WHERE-CURRENT-OF perms; NOT positioned-DML):
+1. UPDATE now fires the RI_FKey_check parent-existence assertion (operators_fk.go +
+   operators_storage.go). goopg only ran checkFKInsert from insertOp; updateOp did no
+   parent lookup. New updateOp.childFKsToRecheck() (FKs whose referencing cols are in the
+   SET list — mirrors PG firing the RI AFTER-trigger only on a key-column change, bounds
+   blast radius to FK-key UPDATEs on FK tables) + recheckChildFKs() (delegates to new
+   checkFKInsertForConstraints). Wired into ALL 3 update write paths (Next seqscan /
+   updateViaIndex / updateWithFrom) right after BEFORE triggers, before the heap write.
+2. DETACH re-validates RI_PartitionRemove_Check AFTER the hybrid wait (operators_ddl.go,
+   ~line 5350, before Phase-2 finalize). First detachPartitionFKRefCheck runs before the
+   wait under the stmt-start snapshot (misses a row a waited-on session commits during the
+   wait); re-run with FRESH snapshot (TxnMgr.SnapshotFor(Tx).Clone) + PartitionDetachEpoch=0
+   so routeToPartition keeps the now-pending child in the routing set ⇒ d4_fk_a_fkey_1.
 
-Gates run: probe (RunAndCompare) first divergence moved spec L80 → the 3 updcur
-perms (71-73). detach-1/2/3 + vacuum-no-cleanup-lock(cursor) + alter-table-1/2/3
-+ truncate/vacuum/cluster-conflict + Fk(Contention,Snapshot)/ReferentialIntegrity
-+ SimpleWriteSkew/ReadOnlyAnomaly + InheritTemp + DeleteAbortSavept{,2}/
-AbortedKeyrevoke/SubxidOverflow strict PASS (no regression); -race ./internal/mvcc/...;
-mvcc/server/executor units PASS; go build clean; state-guard OK (repaired).
+Files: internal/executor/operators_fk.go, operators_storage.go, operators_ddl.go,
+internal/testport/isolation_port_test.go (new TestPort_IsolationDetachPartitionConcurrently4),
+docs/test-port/postgres-oracle-target-inventory.csv (failed→pass) + regen .md,
+docs/design/0118-0064-*.md + README index, fix_plan + deferral_ledger.
 
-Next step: detach-4 promotion needs ONLY positioned UPDATE/DELETE — `update
-d4_fk set a=1 where current of f` (s1updcur, perms 71-73). CurrentOf is parsed
-(parser.UpdateStmt.CurrentOf / dml.go) but NO server/executor site consumes it.
-Impl: (a) capture each buffered cursor row's CTID at materialisation (the
-MaterializedSlot carries ctidBlock/ctidOff/hasCTID but materializeCursor only
-clones Row=[]Datum, dropping it); (b) track the cursor's current-position CTID;
-(c) restrict the UPDATE/DELETE to that CTID (CTID-predicated rewrite or TID-scan).
-Probe with internal/testport zz_probe_test.go (import testutil/cluster; RunAndCompare
-→ log .Diff + /tmp/iso_actual_out.txt). Other M0118-0008 tail: alter-table-4
-(INHERITS), partition-concurrent-attach, partition-drop-index-locking (pg_locks),
+Gates run: strict TestPort_IsolationDetachPartitionConcurrently4 PASS (21 perms);
+detach-1/2/3 + Fk{Snapshot,Contention,Deadlock2}/ReferentialIntegrity/TemporalRangeIntegrity
++ PartitionKeyUpdate1..4 + Merge{Update,Delete,InsertUpdate,MatchRecheck,Join} +
+InsertConflictDoUpdate{,2,3,4} PASS; regress-port foreign_key/update/constraints/inherit
+no regression (exit 0); -race ./internal/executor/; go build clean. pgbench smoke = pre-commit hook.
+
+Next step: commit + push. Then M0118-0008 tail: WHERE CURRENT OF positioned-DML
+(project-wide, ledger), alter-table-4 (INHERITS + transactional-DDL cross-session
+visibility), partition-concurrent-attach, partition-drop-index-locking (pg_locks),
 reindex-concurrently-toast (toast relations + allow_system_table_mods).

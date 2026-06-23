@@ -36,7 +36,16 @@ import (
 // appears in the MESSAGE — the routed leaf partition for partition-routed
 // INSERTs.  Pass reportTbl==nil to default to fkOwnerTbl.
 func checkFKInsert(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *catalog.Table, row Row) error {
-	for _, fk := range fkOwnerTbl.ForeignKeys {
+	return checkFKInsertForConstraints(ctx, fkOwnerTbl, reportTbl, row, fkOwnerTbl.ForeignKeys)
+}
+
+// checkFKInsertForConstraints is checkFKInsert restricted to a caller-supplied
+// subset of the owner table's foreign keys. INSERT passes every constraint;
+// UPDATE passes only those whose referencing columns the SET list changed
+// (mirrors PostgreSQL firing the RI_FKey_check AFTER trigger only when a key
+// column is modified). M0118-0008 (detach-partition-concurrently-4).
+func checkFKInsertForConstraints(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *catalog.Table, row Row, fks []catalog.ForeignKey) error {
+	for _, fk := range fks {
 		// Gather the FK column values.
 		vals, allNull := fkColValues(fkOwnerTbl.Columns, fk.Columns, row)
 		if allNull {
