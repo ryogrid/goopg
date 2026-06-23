@@ -5234,11 +5234,43 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				// transaction to finish) is the correct primitive — a lock-only
 				// wait would let the detacher complete too early for those
 				// permutations.
+				// RI_PartitionRemove_Check (ri_triggers.c): if this partition is on
+				// the referenced side of a foreign key and a committed referencing
+				// row routes to it, detaching would orphan that row — fail
+				// synchronously (no wait) before marking detach-pending so routing
+				// still resolves the child. Design 0118-0060
+				// (detach-partition-concurrently-2).
+				if ferr := detachPartitionFKRefCheck(o.ctx, tbl, childTbl); ferr != nil {
+					if ee, ok := ferr.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = act.Pos()
+					}
+					return ferr
+				}
 				epoch := mvcc.NextPartitionDetachEpoch()
 				im.MarkPartitionDetachPending(childTbl.OID, epoch)
+				// The wait is HYBRID, because goopg's locks are statement-scoped
+				// and BEGIN takes a snapshot — neither alone reproduces upstream's
+				// WaitForLockers (which keys off planning locks held to commit):
+				//   (a) waitForRelationLockers on the parent and every partition
+				//       leaf — catches READ COMMITTED sessions that touched the
+				//       table (a scan holds a txn-scoped AccessShare on the leaves
+				//       it read until commit, acquireScanReadLockTxn); and
+				//   (b) WaitForPinnedSnapshotsToCommit — catches RR/SSI sessions
+				//       holding a pinned snapshot that still sees the partition
+				//       attached even with no table lock (e.g. only PREPAREd).
+				// A READ COMMITTED session that merely issued BEGIN holds neither,
+				// so it does NOT block the detacher (detach-partition-
+				// concurrently-2 permutation 5). Design 0118-0060.
 				var werr error
-				if o.ctx.TxnMgr != nil {
-					werr = o.ctx.TxnMgr.WaitForOlderSlotsToCommit(o.ctx.Ctx, o.ctx.Tx.Handle)
+				waitRels := append([]*catalog.Table{tbl, childTbl}, allDescendants(im, tbl, 0)...)
+				for _, wr := range waitRels {
+					if werr != nil {
+						break
+					}
+					werr = o.ctx.waitForRelationLockers(o.ctx.Catalog.RelFileNode(wr))
+				}
+				if werr == nil && o.ctx.TxnMgr != nil {
+					werr = o.ctx.TxnMgr.WaitForPinnedSnapshotsToCommit(o.ctx.Ctx, o.ctx.Tx.Handle)
 				}
 				if werr != nil {
 					// Interrupted before finalize (lock/statement timeout, cancel):

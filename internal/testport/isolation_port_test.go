@@ -608,10 +608,11 @@ func TestPort_IsolationClusterConflictPartition(t *testing.T) {
 //     catalog.VisiblePartitionChildren by the snapshot epoch, so s3's INSERT of a
 //     row that would route to the detached partition fails with "no partition
 //     found" exactly as the SELECT omits it.
-//   - The detacher then waits for every older transaction to terminate
-//     (WaitForOlderSlotsToCommit — snapshot-based, so a REPEATABLE READ session
-//     that only PREPAREd a statement is still waited for), rendered as
-//     `<waiting ...>` by the runner's timing.
+//   - The detacher then waits via a HYBRID of relation-locker draining (READ
+//     COMMITTED sessions that touched the table) and pinned-snapshot draining
+//     (WaitForPinnedSnapshotsToCommit — a REPEATABLE READ session that only
+//     PREPAREd a statement is still waited for), rendered as `<waiting ...>` by
+//     the runner's timing. Design 0118-0060.
 //   - Phase 2 unregisters the child, clears relpartbound (now NULL, so s3i flips
 //     f→t), and clears the pending mark.
 //
@@ -624,6 +625,33 @@ func TestPort_IsolationDetachPartitionConcurrently1(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/detach-partition-concurrently-1.spec")
+}
+
+// TestPort_IsolationDetachPartitionConcurrently2 exercises the
+// detach-partition-concurrently-2 spec (M0118-0008): DETACH PARTITION
+// CONCURRENTLY makes the partition safe for a foreign key that references the
+// partitioned table. Three behaviours, all snapshot-relative:
+//   - A concurrent INSERT into the referencing table of a value that lives only
+//     in the detaching partition fails its FK check (23503): the partition is
+//     invisible to the inserter's snapshot, so the FK existence scan
+//     (assertParentExists → allDescendants filtered by ctx.Snap.PartitionDetachEpoch)
+//     does not find the parent key. A value in a still-attached partition succeeds.
+//   - If a referencing row already exists (committed before the detach) whose
+//     key routes to the detaching partition, the DETACH itself fails synchronously
+//     with `removing partition … violates foreign key constraint <fkname>_<N>`
+//     (RI_PartitionRemove_Check; detachPartitionFKRefCheck), N being the child's
+//     ordinal among the parent's partitions.
+//   - The detacher does NOT wait for a READ COMMITTED session that only issued
+//     BEGIN (it holds no relation lock and no pinned snapshot), but does wait for
+//     one that read the partitioned table (txn-scoped relation lock). Hybrid wait.
+//
+// Byte-identical to PG 18.3 across all 5 permutations. Design 0118-0060.
+func TestPort_IsolationDetachPartitionConcurrently2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_detach_partition_2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/detach-partition-concurrently-2.spec")
 }
 
 // TestPort_IsolationVacuumNoCleanupLock exercises the vacuum-no-cleanup-lock

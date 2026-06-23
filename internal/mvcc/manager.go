@@ -222,6 +222,7 @@ func (m *Manager) Begin(iso IsolationLevel, procNums ...int32) (Transaction, err
 		s.xid.Store(0)
 		s.xmin.Store(^uint64(0))
 		s.firstSnap = nil
+		s.pinnedSnap.Store(false)
 		s.snapshotXmin = ^uint32(0)
 		s.isolation = int32(iso)
 		// inTxn already set to 1 by CAS above.
@@ -246,6 +247,7 @@ func (m *Manager) Begin(iso IsolationLevel, procNums ...int32) (Transaction, err
 	s.xid.Store(0)
 	s.xmin.Store(^uint64(0))
 	s.firstSnap = nil
+	s.pinnedSnap.Store(false)
 	s.snapshotXmin = ^uint32(0)
 	s.isolation = int32(iso)
 	s.inTxn.Store(1)
@@ -371,6 +373,12 @@ func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 			snap := m.captureSnapshot()
 			s.firstSnap = &snap
 			s.xmin.Store(uint64(snap.Xmin))
+			// Mark the slot as holding a snapshot pinned for the whole txn: DETACH
+			// PARTITION CONCURRENTLY must wait for such a session to finish (its
+			// snapshot keeps seeing the partition attached). RC sessions never set
+			// this — their per-statement snapshot is released, so a txn-scoped
+			// relation lock is the proxy instead. Design 0118-0060.
+			s.pinnedSnap.Store(true)
 			if tx.Isolation == IsolationSerializable {
 				// Capture lastCommitBeforeSnapshot for the de-facto READ ONLY
 				// SSI optimisation (predicate.c). M0118-0001 (receipt-report).
@@ -524,6 +532,7 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 	// Clear the slot.
 	s.xid.Store(0)
 	s.firstSnap = nil
+	s.pinnedSnap.Store(false)
 	s.xmin.Store(^uint64(0))
 	s.inTxn.Store(0)
 
@@ -629,6 +638,40 @@ func (m *Manager) WaitForXID(ctx context.Context, xid storage.TransactionID) err
 // M0100-0009.
 func (m *Manager) WaitForOlderSlotsToCommit(ctx context.Context, selfHandle TxnHandle) error {
 	return m.WaitForSlotsToCommit(ctx, m.SnapshotActiveOtherSlots(selfHandle))
+}
+
+// WaitForPinnedSnapshotsToCommit waits until every OTHER backend that holds a
+// transaction-pinned MVCC snapshot (REPEATABLE READ / SERIALIZABLE) has
+// finished its transaction. Used by DETACH PARTITION CONCURRENTLY together with
+// the relation-locker wait: an RR/SSI session keeps a snapshot that still sees
+// the partition attached even when it holds no table lock (e.g. it only
+// PREPAREd a statement), so the detacher must wait for it. READ COMMITTED
+// sessions are deliberately excluded — their per-statement snapshot is released
+// between steps, so a durable txn-scoped relation lock (waitForRelationLockers)
+// is the correct proxy for "still using the partition", NOT mere
+// in-transaction status. This is what lets a READ COMMITTED session that only
+// issued BEGIN (no table access) avoid blocking the detacher. Design 0118-0060
+// (M0118-0008 detach-partition-concurrently-2 permutation 5).
+func (m *Manager) WaitForPinnedSnapshotsToCommit(ctx context.Context, selfHandle TxnHandle) error {
+	return m.WaitForSlotsToCommit(ctx, m.SnapshotActiveOtherPinnedSlots(selfHandle))
+}
+
+// SnapshotActiveOtherPinnedSlots is SnapshotActiveOtherSlots filtered to slots
+// that hold a transaction-pinned (RR/SSI) snapshot. See
+// WaitForPinnedSnapshotsToCommit.
+func (m *Manager) SnapshotActiveOtherPinnedSlots(selfHandle TxnHandle) []int {
+	selfIdx := int(selfHandle) - 1 // Handle = procNum+1
+	active := make([]int, 0, 4)
+	for i := range m.procArray.slots {
+		if i == selfIdx {
+			continue
+		}
+		s := &m.procArray.slots[i]
+		if s.inTxn.Load() == 1 && s.pinnedSnap.Load() {
+			active = append(active, i)
+		}
+	}
+	return active
 }
 
 // SnapshotActiveOtherSlots returns the indices of every backend slot that is

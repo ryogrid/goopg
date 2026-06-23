@@ -1,32 +1,26 @@
-Loop #58: M0118-0008 — detach-partition-concurrently-1 PROMOTED (design 0118-0059)
+Loop #59: M0118-0008 — detach-partition-concurrently-2 PROMOTED (design 0118-0060)
 
-The 0118-0058 foundation primitives are now WIRED into six live sites and the
-spec passes byte-for-byte. TestPort_IsolationDetachPartitionConcurrently1
-strict PASS (13 perms, 11s). Committed.
+detach-partition-concurrently-2 passes byte-for-byte across all 5 permutations
+(TestPort_IsolationDetachPartitionConcurrently2, runIsoSpecStrict). Committed.
 
-What landed (all six wiring sites, sibling paths agree):
-- operators_ddl.go AlterTableDetachPartition DetachConcurrently → two-phase
-  epoch protocol: phase1 NextPartitionDetachEpoch+MarkPartitionDetachPending
-  (child STAYS registered, relpartbound set ⇒ s3i=f), wait
-  WaitForOlderSlotsToCommit (snapshot-based, not lock-based), interrupt reverts
-  via ClearPartitionDetachPending, phase2 UnregisterPartitionChild+clear (⇒ s3i
-  flips f→t). Plain DETACH/FINALIZE = synchronous else branch.
-- dispatch.go ctxPlanCatalog → stamps SnapshotPartitionDetachEpoch on
-  SearchPathCatalog (ctx.Snap IS established before planner.Plan — confirmed).
-- planner.go collectAllPartitionLeaves(+detachEpoch) via new
-  currentPartitionDetachEpoch wrapper-walk + VisiblePartitionChildren at every
-  BFS level; TypedVirtualCell pg_node_tree empty→NullConst (relpartbound IS NULL).
-- operators_storage.go routeToPartitionDepth filters child by epoch (INSERT twin).
-- dispatch.go + dispatch_extended.go plan-cache bypass via partitionDetachPending.
+What landed (FK-safe concurrent detach):
+- operators_fk.go: allDescendants now takes snapEpoch and prunes detach-pending
+  leaves invisible to the snapshot (both FK existence-scan twins) ⇒ INSERT of a
+  value living only in the detaching partition fails 23503.
+- operators_fk.go: detachPartitionFKRefCheck + scanRefTableForDetachedPartitionMatch
+  (RI_PartitionRemove_Check analog) — run BEFORE MarkPartitionDetachPending so
+  routeToPartition resolves the child; errors "removing partition X violates
+  foreign key constraint <fkname>_<N>" (N=child ordinal).
+- HYBRID detach wait (operators_ddl.go): waitForRelationLockers(parent+leaves)
+  for RC table-touchers + WaitForPinnedSnapshotsToCommit for RR/SSI pinned
+  snapshots. New atomic procSlot.pinnedSnap marker (mvcc) set in SnapshotFor
+  RR/SSI branch, cleared at Begin/txn-end. Replaces 0118-0059's
+  WaitForOlderSlotsToCommit; a RC BEGIN-only session no longer blocks detacher.
 
-Gates: TestPort_IsolationDetachPartitionConcurrently1 strict PASS;
-internal/planner+catalog+executor+mvcc PASS; build+vet clean; TPC-H spotcheck =
-known WSL2 SLRU-backfill infra-hang (killed; change gated on DetachPendingEpoch
-!=0 so TPC-H unaffected); pgbench smoke = pre-commit hook.
+Gates: detach-2 + detach-1 strict PASS; -race ./internal/mvcc PASS;
+executor/catalog/planner/server PASS; gofmt clean; build clean; state-guard OK.
 
-Next step (next loop): probe detach-partition-concurrently-2 — it likely falls
-out of the SAME machinery with no new engine work (run a throwaway probe with
-runIsoSpec/log .Diff). If it passes, promote it (strict test + CSV/coverage
-regen). Otherwise its first divergence names the next bounded blocker.
-detach-3/4 additionally need persisted two-phase inhdetachpending state +
-pg_partition_tree + DETACH … FINALIZE + cancel-then-resume (larger; deferred).
+Next step: probe detach-partition-concurrently-3 (run throwaway probe with
+RunAndCompare, log .Diff). detach-3/4 need persisted inhdetachpending state +
+pg_partition_tree + DETACH … FINALIZE + cancel-then-resume (s1cancel) — larger
+scope; first divergence will name the next bounded blocker.
