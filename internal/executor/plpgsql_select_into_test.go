@@ -59,4 +59,21 @@ $$`)
 	if got := runQuery(t, ctx, `SELECT sel_norow()`)[0][0]; !got.IsNull() {
 		t.Errorf("sel_norow() = %v, want NULL", got.Format())
 	}
+
+	// Single-column SELECT INTO a `record` target: the result must stay a
+	// first-class composite so the column remains addressable as a field
+	// (r.table_name), instead of being scalar-bound to r and losing the field
+	// name. This mirrors reindex-concurrently-toast's setup DO-block,
+	// `SELECT INTO r reltoastrelid::regclass::text AS table_name ...` then
+	// `EXECUTE 'ALTER TABLE ' || r.table_name || ...`. M0118-0008.
+	mustDDL(`CREATE FUNCTION sel_rec_field() RETURNS text LANGUAGE plpgsql AS $$
+declare r record;
+begin
+  select b as fname into r from t where a = 1;
+  return 'ALTER ' || r.fname || ' X';
+end;
+$$`)
+	if got := runQuery(t, ctx, `SELECT sel_rec_field()`)[0][0].StringValue(); got != "ALTER hello X" {
+		t.Errorf("sel_rec_field() = %q, want %q", got, "ALTER hello X")
+	}
 }

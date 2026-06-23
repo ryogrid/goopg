@@ -1,38 +1,47 @@
-Loop #23: M0118-0008 — allow_system_table_mods GUC enabler (design 0118-0065). COMMITTED? pending at loop end.
+Loop #24: M0118-0008 — PL/pgSQL single-column `SELECT … INTO record` field-access
+enabler (design 0118-0066). COMMITTED + pushed at loop end.
 
 ## What landed (enabler, NOT a promotion)
-reindex-concurrently-toast.spec global setup runs `SET allow_system_table_mods TO true;`.
-goopg didn't register the GUC ⇒ setup failed `unrecognized configuration parameter
-"allow_system_table_mods" (22023)`, aborting permutation 0. Registered it mirroring PG
-guc_tables.c: PGC_SUSET (→ContextSuset), bool, boot off, DEVELOPER_OPTIONS — following the
-allow_in_place_tablespaces precedent (recognised developer no-op; goopg gates NO catalog
-modification on it). Added mandatory `#allow_system_table_mods = off` to postgresql.conf.sample
-(TestSampleConfigCoversRegistry requires every file-settable GUC there) + unit test.
+reindex-concurrently-toast.spec setup `DO` block: `SELECT INTO r reltoastrelid::regclass::text
+AS table_name …` then `EXECUTE 'ALTER TABLE ' || r.table_name || …`. After the 0118-0065
+GUC enabler the first divergence was `qualified names are not supported in PL/pgSQL
+expressions (0A000)` on `r.table_name`. Root cause = a real PL/pgSQL gap:
+`bindSelectIntoRow` (plpgsql_runtime.go) scalar-shortcut a SINGLE-COLUMN `SELECT … INTO`
+straight onto the target even when the target is a `record` var, so the `_<var>_<col>`
+sub-field + `compositeVarFields` entry the qualified-name expr path reads were never
+registered. Fix: guard the scalar shortcut with `!frame.isRecordVar(name)` so a record
+target routes to `bindRecordRowComposite` (the multi-column `SELECT * INTO r` path,
+0118-0054). Plain scalar targets unaffected.
 
-Files: internal/config/defaults.go (register after allow_in_place_tablespaces),
-internal/config/postgresql.conf.sample (DEVELOPER OPTIONS section),
-internal/config/allow_system_table_mods_test.go (new),
-docs/design/0118-0065-allow-system-table-mods-guc.md + README index, deferral_ledger.
+Files: internal/executor/plpgsql_runtime.go (bindSelectIntoRow guard + comment),
+internal/executor/plpgsql_select_into_test.go (new sel_rec_field case),
+docs/design/0118-0066-plpgsql-select-into-record-field.md + README index,
+.ralph/deferral_ledger.md + fix_plan note.
 
-Gates: TestAllowSystemTableModsGUC + full internal/config (incl. sample parity) PASS;
-go vet ./internal/config clean; go build ./... clean; live probe confirms reind-con-toast
-setup divergence advanced GUC-error → PL/pgSQL `qualified names not supported in expressions`
-(r.table_name in EXECUTE). pgbench smoke = pre-commit hook.
+Key symbols: bindSelectIntoRow, frame.isRecordVar, bindRecordRowComposite,
+lowerPLpgSQLExpr (qualified-ColumnRef handler, plpgsql_runtime.go ~L2061).
 
-## Probe ranking of the M0118-0008 hard tail (this loop, throwaway zz_probe deleted)
-- reindex-concurrently-toast: was GUC error; now PL/pgSQL qualified-name in EXECUTE → then
-  FUNDAMENTAL: needs real TOAST relations as catalog objects (goopg stores text/bytea INLINE,
-  reltoastrelid=0, nothing to rename/REINDEX CONCURRENTLY). Multi-loop subsystem.
-- partition-concurrent-attach: first div L7 — INSERT into default partition must <waiting>
-  behind concurrent uncommitted ATTACH then ERROR partition-constraint after commit; needs
-  default-partition implicit constraint (complement of sibling bounds) + lock + re-validate.
-- alter-table-4: first div L6 — SELECT SUM(a) FROM p must <waiting> behind uncommitted
-  ALTER…NO INHERIT/INHERIT then still see old children (sum 11). COUPLED to transactional
-  DDL catalog visibility (goopg applies DDL to shared in-mem catalog non-transactionally,
-  visible cross-session immediately). Milestone-sized MVCC catalog subsystem.
-- partition-drop-index-locking: needs full pg_locks view population (returns 0 rows today).
-- WHERE CURRENT OF positioned UPDATE/DELETE: parsed (CurrentOf) but no executor site; needs
-  per-row CTID capture in cursor + CTID-restricted rewrite. Project-wide.
+Gates: new TestPlpgSQLSelectInto/sel_rec_field PASS; go test ./internal/executor/ PASS;
+TestPlpgSQLRecordFieldAndText/ScalarSubquery/ForLoopMaterializeAndRecordFieldSubst/
+DoCommitChain* PASS; TestPort_IsolationPlpgsqlToast strict PASS (no regression);
+go build ./... clean; stash A/B probe confirms reind-con-toast divergence advanced
+0A000 → routine_column_usage 42P01. pgbench smoke = pre-commit hook.
 
-Next step: commit + push this enabler. Then pick next M0118-0008 tail slice — all remaining
-are Effort-L distinct subsystems; partition-drop-index-locking (pg_locks) is broadly reusable.
+## M0118-0008 hard tail (all Effort-L, deferred — ledger has full blocker maps)
+- reindex-concurrently-toast: FUNDAMENTAL — needs real TOAST relations as catalog
+  objects (reltoastrelid=0; text/bytea stored inline). New post-enabler wall:
+  routine_column_usage (42P01) during the toast-rename EXECUTE. Multi-loop.
+- partition-concurrent-attach + alter-table-4: both need transactional DDL cross-session
+  catalog visibility (goopg applies DDL to shared in-mem catalog non-transactionally).
+  Milestone-sized MVCC catalog subsystem.
+- partition-drop-index-locking: pg_locks today reads ONLY the explicit-LOCK-TABLE
+  registry (globalRelLockMgr, pid hardcoded "0"), NOT the real heavyweight lockmgr
+  holders/waiters; needs a real-lockmgr pg_locks bridge + DROP INDEX recursive
+  partition-tree locking + partitioned-index CREATE propagation + pg_stat_activity
+  pid join. Probe: s3getlocks returns 0 rows; s2drop does not wait. Multi-loop.
+- WHERE CURRENT OF positioned UPDATE/DELETE: project-wide, parsed (CurrentOf) but no
+  executor site; needs per-row CTID capture in cursor + CTID-restricted rewrite.
+
+Next step: pick another bounded enabler from the hard tail next loop. partition-drop-
+index-locking's pg_locks→real-lockmgr bridge is the most broadly reusable, but it must
+land WITH DROP INDEX recursive locking to advance the spec (pid-only wiring is marginal).

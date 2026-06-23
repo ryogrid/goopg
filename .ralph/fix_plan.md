@@ -787,6 +787,24 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `partition-drop-index-locking` (pg_locks view parity),
       `reindex-concurrently-toast` (toast relations as catalog objects +
       `allow_system_table_mods`). Group stays open.
+      **2026-06-24 enabler (design 0118-0066, NOT a promotion): PL/pgSQL
+      single-column `SELECT … INTO record` keeps field access.** `bindSelectIntoRow`
+      (0118-0050) scalar-shortcut a single-column `SELECT … INTO` straight onto the
+      target even when it is a `record` var (`DECLARE r record`), so the
+      `_<var>_<col>` sub-field + `compositeVarFields` entry the qualified-name
+      expression path reads were never registered ⇒ `r.table_name` hit the catch-all
+      `qualified names are not supported in PL/pgSQL expressions (0A000)`. Guarded
+      the scalar shortcut with `!frame.isRecordVar(name)` so a record target routes
+      to `bindRecordRowComposite` (the multi-column `SELECT * INTO r` path,
+      0118-0054); `r.field` resolves via `extractCompositeField`, matching PG
+      expanded-record semantics; plain scalar targets unaffected. Lifts
+      `reindex-concurrently-toast`'s post-GUC blocker: the setup `DO` block now runs
+      `EXECUTE 'ALTER TABLE ' || r.table_name || …` and the first divergence advances
+      to `relation "routine_column_usage" does not exist (42P01)`; spec still
+      fundamentally needs real TOAST relations (`reltoastrelid=0`), stays `defer`.
+      Gates: new `TestPlpgSQLSelectInto/sel_rec_field`; `go test ./internal/executor/`
+      PASS; `TestPort_IsolationPlpgsqlToast` strict PASS (no regression); `go build`
+      clean; pgbench smoke = pre-commit hook.
       **2026-06-23 fourteenth promotion (design 0118-0046): `alter-table-2`
       PROMOTED ⇒ all 48 permutations byte-for-byte.** Two changes: (1) the
       `ALTER TABLE … ADD FOREIGN KEY …` parser now accepts the `NOT VALID`

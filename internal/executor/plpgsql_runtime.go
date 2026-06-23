@@ -193,7 +193,15 @@ func bindSelectIntoRow(targets []string, row Row, schema planner.Schema, frame *
 	}
 	if len(targets) == 1 {
 		name := strings.ToLower(targets[0])
-		if len(schema) == 1 {
+		// A single-column result binds directly to a plain scalar variable. But a
+		// `record`/composite target must remain a first-class composite so its
+		// field stays addressable (r.field) even when the query has only one
+		// column — `SELECT INTO r reltoastrelid::regclass::text AS table_name`
+		// then `r.table_name`. Route such a target to the composite binder, which
+		// registers the `_<var>_<col>` sub-field and compositeVarFields entry that
+		// the qualified-name expression path reads. M0118-0008
+		// (reindex-concurrently-toast setup).
+		if len(schema) == 1 && !frame.isRecordVar(name) {
 			if idx, ok := frame.indexByName[name]; ok {
 				if len(row) > 0 {
 					frame.values[idx] = row[0]
