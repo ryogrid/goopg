@@ -1,51 +1,32 @@
-Loop #57: M0118-0008 — partition-detach snapshot-visibility FOUNDATION LANDED
-(NOT a promotion; design 0118-0058).
+Loop #58: M0118-0008 — detach-partition-concurrently-1 PROMOTED (design 0118-0059)
 
-Why a foundation, not the "step 1 plan-cache bypass" the prev working_set named:
-analysis this loop showed goopg unregisters the partition child SYNCHRONOUSLY
-(operators_ddl.go:5207) on a non-MVCC shared catalog, so the detach-1 RC view
-("partition gone now") and RR view ("partition stays until commit") are COUPLED.
-A plan-cache bypass alone fixes RC perms but REGRESSES the RR perms that pass
-today by accident (stale cache → 2 rows). The real fix is a snapshot-relative
-partition descriptor; this loop lays its zero-blast-radius primitives (mirrors
-inherit-temp 0118-0036 → 0118-0037).
+The 0118-0058 foundation primitives are now WIRED into six live sites and the
+spec passes byte-for-byte. TestPort_IsolationDetachPartitionConcurrently1
+strict PASS (13 perms, 11s). Committed.
 
-Landed (nothing wired to a live path → behaviour byte-identical):
-- mvcc: global partitionDetachEpoch (Next/CurrentPartitionDetachEpoch) +
-  Snapshot.PartitionDetachEpoch captured in captureSnapshot/Clone.
-- catalog: Table.DetachPendingEpoch; InMemory.MarkPartitionDetachPending /
-  ClearPartitionDetachPending (O(1) pendingPartitionDetachCount) /
-  HasPendingPartitionDetach; VisiblePartitionChildren(children, snapshotEpoch)
-  filter (drop child stamped e when snapshotEpoch>=e; keep when <e or e==0).
+What landed (all six wiring sites, sibling paths agree):
+- operators_ddl.go AlterTableDetachPartition DetachConcurrently → two-phase
+  epoch protocol: phase1 NextPartitionDetachEpoch+MarkPartitionDetachPending
+  (child STAYS registered, relpartbound set ⇒ s3i=f), wait
+  WaitForOlderSlotsToCommit (snapshot-based, not lock-based), interrupt reverts
+  via ClearPartitionDetachPending, phase2 UnregisterPartitionChild+clear (⇒ s3i
+  flips f→t). Plain DETACH/FINALIZE = synchronous else branch.
+- dispatch.go ctxPlanCatalog → stamps SnapshotPartitionDetachEpoch on
+  SearchPathCatalog (ctx.Snap IS established before planner.Plan — confirmed).
+- planner.go collectAllPartitionLeaves(+detachEpoch) via new
+  currentPartitionDetachEpoch wrapper-walk + VisiblePartitionChildren at every
+  BFS level; TypedVirtualCell pg_node_tree empty→NullConst (relpartbound IS NULL).
+- operators_storage.go routeToPartitionDepth filters child by epoch (INSERT twin).
+- dispatch.go + dispatch_extended.go plan-cache bypass via partitionDetachPending.
 
-Files: internal/mvcc/partition_detach_epoch.go (NEW), internal/mvcc/{snapshot,
-manager}.go, internal/mvcc/partition_detach_epoch_test.go (NEW),
-internal/catalog/catalog.go, internal/catalog/partition_detach_visibility_test.go
-(NEW), docs/design/0118-0058 + README index, deferral_ledger.
+Gates: TestPort_IsolationDetachPartitionConcurrently1 strict PASS;
+internal/planner+catalog+executor+mvcc PASS; build+vet clean; TPC-H spotcheck =
+known WSL2 SLRU-backfill infra-hang (killed; change gated on DetachPendingEpoch
+!=0 so TPC-H unaffected); pgbench smoke = pre-commit hook.
 
-Gates: TestVisiblePartitionChildren/TestPartitionDetachPendingLifecycle +
-TestPartitionDetachEpochMonotonic/TestCaptureSnapshotRecordsPartitionDetachEpoch
-PASS; go build ./... + go vet clean; full internal/catalog PASS; -race
-./internal/mvcc/... ./internal/wal/... PASS; pgbench smoke = pre-commit hook.
-
-Next step (the actual detach-1 promotion — atomic multi-site WIRING, design
-0118-0058 §"Next loop"):
-0. FIRST confirm: is ctx.Snap established BEFORE planner.Plan runs for a
-   statement? (decides the threading approach / whether re-plan is needed).
-1. Detach executor (operators_ddl.go AlterTableDetachPartition + DetachConcurrently):
-   mvcc.NextPartitionDetachEpoch() + MarkPartitionDetachPending KEEPING the child
-   registered; wait; THEN UnregisterPartitionChild + clear bounds +
-   ClearPartitionDetachPending (so s3i relpartbound = 'f' during wait, 't' after).
-2. Thread ctx.Snap.PartitionDetachEpoch to planner via new
-   SearchPathCatalog.SnapshotPartitionDetachEpoch (parallel to TempOwnerToken in
-   sessionPlanCatalog/ctxPlanCatalog; read like currentTempOwner).
-3. Filter BOTH SELECT expansion (planner.go collectAllPartitionLeaves ~L2139 /
-   the len(tbl.PartitionKey)>0 branch) AND INSERT routing (operators_storage.go
-   routeToPartition/routeToPartitionDepth) through VisiblePartitionChildren —
-   sibling paths MUST agree or row counts silently diverge.
-4. Plan-cache bypass: extend dispatch.go L730 gate (+ dispatch_extended sibling)
-   with HasPendingPartitionDetach() (walk-unwrap like sessionTempInheritanceActive).
-Then probe all 13 detach-1 perms byte-match PG 18.3 → promote
-TestPort_IsolationDetachPartitionConcurrently1 strict + update D-002 CSV +
-regen coverage/inventory. detach-2 likely falls out; detach-3/4 additionally
-need two-phase inhdetachpending/pg_partition_tree/FINALIZE/cancel-then-resume.
+Next step (next loop): probe detach-partition-concurrently-2 — it likely falls
+out of the SAME machinery with no new engine work (run a throwaway probe with
+runIsoSpec/log .Diff). If it passes, promote it (strict test + CSV/coverage
+regen). Otherwise its first divergence names the next bounded blocker.
+detach-3/4 additionally need persisted two-phase inhdetachpending state +
+pg_partition_tree + DETACH … FINALIZE + cancel-then-resume (larger; deferred).

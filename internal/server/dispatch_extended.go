@@ -50,7 +50,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	// The same parameterized query is shared across all 100 pgbench
 	// connections — one planning call serves them all.
 	var node planner.Node
-	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) {
+	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) {
 		key := normalizeCompatSQL(query)
 		if cached, ok := s.pc.Get(key); ok {
 			node = cached

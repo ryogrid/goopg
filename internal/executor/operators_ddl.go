@@ -5200,47 +5200,67 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !ok {
 				break
 			}
-			// Capture the RelFileNodes before the unregister flips the child's
-			// PartitionParentOID — needed for the CONCURRENTLY wait below.
-			parentRel := o.ctx.Catalog.RelFileNode(tbl)
-			childRel := o.ctx.Catalog.RelFileNode(childTbl)
-			im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
-			childTbl.PartitionParentOID = 0
-			childTbl.PartitionBounds = nil
-
-			// ALTER TABLE … DETACH PARTITION … CONCURRENTLY must not complete
-			// while another transaction is still actively using the partitioned
-			// table: upstream's two-phase detach (tablecmds.c
-			// ATExecDetachPartition → DetachPartitionFinalize) marks the partition
-			// "detach-pending", commits, then waits for every transaction whose
-			// snapshot predates that change to terminate before unsetting
-			// relpartbound. goopg keeps a single shared catalog (the membership
-			// change is globally visible the instant we unregister, matching the
-			// READ COMMITTED case where the partition disappears from concurrent
-			// snapshots immediately), so the only piece missing for the
-			// concurrent-detach contract is the wait: block until no OTHER backend
-			// holds a transaction-scoped lock on the parent or the partition being
-			// detached. A bare SELECT on the parent expands to per-partition scans,
-			// each taking a txn-scoped ACCESS SHARE on the child it reads, so a
-			// reader that touched the detached partition holds its lock until
-			// commit and the detacher parks behind it (rendered as `<waiting ...>`
-			// by the isolation runner's timing). Reuses the WaitForLockers analog
-			// (no lock of its own, so concurrent readers/writers proceed). Gated on
-			// CONCURRENTLY — plain DETACH / DETACH FINALIZE are synchronous and
-			// unaffected. M0118-0008 (detach-partition-concurrently specs).
 			if act.DetachConcurrently {
-				if err := o.ctx.waitForRelationLockers(parentRel); err != nil {
-					if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+				// ALTER TABLE … DETACH PARTITION … CONCURRENTLY is two-phase
+				// (tablecmds.c ATExecDetachPartition → DetachPartitionFinalize):
+				// phase 1 marks the partition pg_inherits.inhdetachpending and
+				// COMMITS, then waits for every transaction whose snapshot predates
+				// that change to terminate; phase 2 removes the partition and
+				// unsets relpartbound. goopg keeps a single non-MVCC shared catalog,
+				// so it orders the change with a global epoch instead of the
+				// pg_inherits tuple's xmin: phase 1 bumps the partition-detach epoch
+				// and stamps the child detach-pending KEEPING it registered (and
+				// relpartbound set, so `s3i` still reads relpartbound IS NULL = f);
+				// every snapshot acquired afterwards captures the higher epoch and
+				// omits the child (READ COMMITTED — gone immediately), while a
+				// snapshot taken before still includes it (REPEATABLE READ — visible
+				// until commit). The SELECT planner expansion + INSERT routing both
+				// filter through catalog.VisiblePartitionChildren by the snapshot
+				// epoch (sibling-paths). The wait blocks until no OTHER backend holds
+				// a transaction-scoped lock on the parent or the partition: a reader
+				// that touched the detached partition holds its txn-scoped ACCESS
+				// SHARE until commit, so the detacher parks behind it (rendered as
+				// `<waiting ...>` by the runner's timing). Phase 2 then physically
+				// unregisters the child, clears relpartbound, and clears the pending
+				// mark. Design 0118-0059 (detach-partition-concurrently-1).
+				//
+				// The wait is snapshot-based, not lock-based: upstream's phase 1
+				// commits then waits for every transaction whose snapshot predates
+				// the change ("hangs until it sees any older transaction
+				// terminate"). A REPEATABLE READ session that has only PREPAREd a
+				// statement holds no lock on the table yet still has an older
+				// snapshot, so WaitForOlderSlotsToCommit (the DROP INDEX
+				// CONCURRENTLY drain, which waits for every other active backend
+				// transaction to finish) is the correct primitive — a lock-only
+				// wait would let the detacher complete too early for those
+				// permutations.
+				epoch := mvcc.NextPartitionDetachEpoch()
+				im.MarkPartitionDetachPending(childTbl.OID, epoch)
+				var werr error
+				if o.ctx.TxnMgr != nil {
+					werr = o.ctx.TxnMgr.WaitForOlderSlotsToCommit(o.ctx.Ctx, o.ctx.Tx.Handle)
+				}
+				if werr != nil {
+					// Interrupted before finalize (lock/statement timeout, cancel):
+					// revert phase 1 so the partition stays attached. Resuming an
+					// interrupted concurrent detach via FINALIZE is a separate slice
+					// (detach-partition-concurrently-3/4, deferred).
+					im.ClearPartitionDetachPending(childTbl.OID)
+					if ee, ok := werr.(*ExecError); ok && ee.Pos == 0 {
 						ee.Pos = act.Pos()
 					}
-					return err
+					return werr
 				}
-				if err := o.ctx.waitForRelationLockers(childRel); err != nil {
-					if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
-						ee.Pos = act.Pos()
-					}
-					return err
-				}
+				// Phase 2: finalize the detach.
+				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
+				childTbl.PartitionParentOID = 0
+				childTbl.PartitionBounds = nil
+				im.ClearPartitionDetachPending(childTbl.OID)
+			} else {
+				// Plain DETACH / DETACH FINALIZE: synchronous, single-phase.
+				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
+				childTbl.PartitionParentOID = 0
+				childTbl.PartitionBounds = nil
 			}
 
 		case parser.AlterIndexAttachPartition:

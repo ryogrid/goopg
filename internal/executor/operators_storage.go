@@ -1707,6 +1707,17 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 			child = im.FindHashPartitionForValue(parent.OID, keyStr)
 		}
 	}
+	// Snapshot-relative partition visibility: a child marked detach-pending by an
+	// in-progress ALTER TABLE … DETACH PARTITION … CONCURRENTLY is invisible to
+	// any statement whose snapshot epoch is at or after the detach epoch, so
+	// routing an INSERT to it must fail with "no partition found" — exactly as the
+	// SELECT-side planner expansion omits it (sibling-paths discipline). A
+	// REPEATABLE READ transaction (snapshot frozen before the detach) keeps routing
+	// to it. Design 0118-0059 (M0118-0008 detach-partition-concurrently-1, s3ins2).
+	if child != nil && ctx != nil && child.DetachPendingEpoch != 0 &&
+		ctx.Snap.PartitionDetachEpoch >= child.DetachPendingEpoch {
+		child = nil
+	}
 	if child == nil {
 		return nil, nil
 	}

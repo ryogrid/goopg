@@ -8494,6 +8494,13 @@ type SearchPathCatalog struct {
 	// to drop other-session temp inheritance children during expansion
 	// (RELATION_IS_OTHER_TEMP). Design 0118-0036 (M0118-0008 inherit-temp).
 	TempOwnerToken string
+	// SnapshotPartitionDetachEpoch is the querying statement's snapshot
+	// partition-detach epoch (mvcc.Snapshot.PartitionDetachEpoch). The planner
+	// reads it via CurrentPartitionDetachEpoch to drop partition children that
+	// became detach-pending at or before this snapshot (VisiblePartitionChildren).
+	// Zero for snapshot-less contexts (no filtering). Design 0118-0059
+	// (M0118-0008 detach-partition-concurrently).
+	SnapshotPartitionDetachEpoch uint64
 }
 
 // WithSearchPath returns a SearchPathCatalog that falls back to the schemas
@@ -8508,6 +8515,15 @@ func WithSearchPath(cat Catalog, getSchemas func() []string) *SearchPathCatalog 
 // planner discovers it via a tempOwnerCarrier interface walk over the catalog
 // wrapper chain. Design 0118-0036.
 func (c *SearchPathCatalog) CurrentTempOwner() string { return c.TempOwnerToken }
+
+// CurrentPartitionDetachEpoch returns the querying statement's snapshot
+// partition-detach epoch so the planner's partition-expansion site can apply
+// VisiblePartitionChildren. The planner discovers it via a
+// partitionDetachEpochCarrier interface walk over the catalog wrapper chain.
+// Design 0118-0059 (M0118-0008 detach-partition-concurrently).
+func (c *SearchPathCatalog) CurrentPartitionDetachEpoch() uint64 {
+	return c.SnapshotPartitionDetachEpoch
+}
 
 // LookupTable overrides the embedded Catalog.LookupTable to apply the
 // current search_path when the name has no explicit schema qualifier.

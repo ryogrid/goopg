@@ -594,6 +594,38 @@ func TestPort_IsolationClusterConflictPartition(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/cluster-conflict-partition.spec")
 }
 
+// TestPort_IsolationDetachPartitionConcurrently1 exercises the
+// detach-partition-concurrently-1 spec (M0118-0008). ALTER TABLE … DETACH
+// PARTITION … CONCURRENTLY makes the partition invisible at the correct,
+// snapshot-relative time:
+//   - Phase 1 bumps a global partition-detach epoch (mvcc) and stamps the child
+//     detach-pending, KEEPING it registered (relpartbound stays set, so s3i reads
+//     `relpartbound IS NULL` = f). Every snapshot taken afterwards captures the
+//     higher epoch and omits the child (READ COMMITTED — gone immediately) while a
+//     snapshot taken before still includes it (REPEATABLE READ — visible until
+//     commit). Both the SELECT planner expansion (collectAllPartitionLeaves) and
+//     INSERT routing (routeToPartitionDepth) filter through
+//     catalog.VisiblePartitionChildren by the snapshot epoch, so s3's INSERT of a
+//     row that would route to the detached partition fails with "no partition
+//     found" exactly as the SELECT omits it.
+//   - The detacher then waits for every older transaction to terminate
+//     (WaitForOlderSlotsToCommit — snapshot-based, so a REPEATABLE READ session
+//     that only PREPAREd a statement is still waited for), rendered as
+//     `<waiting ...>` by the runner's timing.
+//   - Phase 2 unregisters the child, clears relpartbound (now NULL, so s3i flips
+//     f→t), and clears the pending mark.
+//
+// The cross-session plan cache is bypassed while any detach is pending
+// (partitionDetachPending), so each statement re-plans against its own snapshot
+// epoch. Byte-identical to PG 18.3 across all 13 permutations. Design 0118-0059.
+func TestPort_IsolationDetachPartitionConcurrently1(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_detach_partition_1")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/detach-partition-concurrently-1.spec")
+}
+
 // TestPort_IsolationVacuumNoCleanupLock exercises the vacuum-no-cleanup-lock
 // spec (M0118-0008). It asserts that pg_class.relpages / reltuples reflect what
 // VACUUM observes, even when a concurrent backend (a cursor holding a heap-page

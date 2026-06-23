@@ -727,7 +727,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// plan, cache, then execute.
 		var precached planner.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !sessionTempInheritanceActive(s.cfg.Catalog) {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) {
 			cacheKey = normalizeCompatSQL(sql)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -954,6 +954,29 @@ func sessionTempInheritanceActive(base catalog.Catalog) bool {
 	}
 }
 
+// partitionDetachPending reports whether the base catalog currently has a
+// partition child marked detach-pending by an in-progress
+// ALTER TABLE … DETACH PARTITION … CONCURRENTLY. When true the cross-session
+// plan cache must be bypassed: the visible partition set is snapshot-relative
+// (catalog.VisiblePartitionChildren), so a query scanning the parent must
+// re-plan against its own snapshot epoch rather than reuse a plan baked at a
+// different epoch. Returns false (cache enabled) for any catalog that does not
+// expose the check. Design 0118-0059 (detach-partition-concurrently).
+func partitionDetachPending(base catalog.Catalog) bool {
+	type checker interface{ HasPendingPartitionDetach() bool }
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if c, ok := base.(checker); ok {
+			return c.HasPendingPartitionDetach()
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+		} else {
+			return false
+		}
+	}
+}
+
 // sessionPlanCatalog returns a search-path-aware catalog wrapper for use when
 // calling planner.Plan. The wrapper re-reads search_path dynamically so that
 // SET search_path changes take effect on the next statement. When sess is nil
@@ -996,6 +1019,12 @@ func ctxPlanCatalog(ctx *executor.Context, base catalog.Catalog) catalog.Catalog
 			wrapped.TempOwnerToken = "s" + strconv.FormatUint(id, 10)
 		}
 	}
+	// Carry this statement's snapshot partition-detach epoch so the planner
+	// omits partition children concurrently detach-pending at or before the
+	// snapshot (catalog.VisiblePartitionChildren). Plan caching is bypassed
+	// while any detach is pending (partitionDetachPending), so this re-plans
+	// per statement against the live snapshot epoch. Design 0118-0059.
+	wrapped.SnapshotPartitionDetachEpoch = ctx.Snap.PartitionDetachEpoch
 	return wrapped
 }
 

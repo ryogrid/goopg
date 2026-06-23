@@ -2138,8 +2138,11 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// collecting ALL leaf descendants, not only direct children.
 	if len(tbl.PartitionKey) > 0 {
 		if im := inMemoryCat(cat); im != nil {
-			// Collect all leaf partitions recursively.
-			leaves := collectAllPartitionLeaves(im, tbl.OID)
+			// Collect all leaf partitions recursively, dropping any child
+			// concurrently detach-pending at or before this statement's
+			// snapshot epoch (snapshot-relative partition visibility).
+			// Design 0118-0059 (M0118-0008).
+			leaves := collectAllPartitionLeaves(im, tbl.OID, currentPartitionDetachEpoch(cat))
 			if len(leaves) > 0 {
 				// Build a UNION ALL of SeqScans over all leaf partitions.
 				// Per-leaf wrap with a Project that adds `tableoid`
@@ -2288,16 +2291,46 @@ func currentTempOwner(cat catalog.Catalog) string {
 	}
 }
 
+// currentPartitionDetachEpoch walks the catalog wrapper chain (peeling
+// SearchPathCatalog/etc. via Unwrap, like currentTempOwner) and returns the
+// querying statement's snapshot partition-detach epoch. The partition-scan
+// expansion drops a child marked detach-pending at or before this epoch
+// (catalog.VisiblePartitionChildren), so a READ COMMITTED statement (fresh
+// snapshot, higher epoch) omits a concurrently-detached partition while a
+// REPEATABLE READ transaction (snapshot frozen at BEGIN, lower epoch) still
+// sees it. Returns 0 when no snapshot epoch is attached (legacy/test contexts),
+// which disables filtering. Design 0118-0059 (M0118-0008).
+func currentPartitionDetachEpoch(cat catalog.Catalog) uint64 {
+	type carrier interface{ CurrentPartitionDetachEpoch() uint64 }
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if c, ok := cat.(carrier); ok {
+			if e := c.CurrentPartitionDetachEpoch(); e != 0 {
+				return e
+			}
+		}
+		if u, ok := cat.(unwrapper); ok {
+			cat = u.Unwrap()
+		} else {
+			return 0
+		}
+	}
+}
+
 // collectAllPartitionLeaves does a BFS over the partition hierarchy rooted at
 // parentOID and returns all LEAF partitions (non-partitioned tables). Nested
 // partitioned tables (which are themselves PARTITION BY) are NOT included in
 // the result — only their leaf descendants are. This is required for correct
 // scanning of multi-level partition hierarchies (e.g. range_parted → part_b_10_b_20
 // (partitioned) → part_c_1_100 (leaf)). M0097-0105.
-func collectAllPartitionLeaves(im *catalog.InMemory, parentOID uint32) []*catalog.Table {
+func collectAllPartitionLeaves(im *catalog.InMemory, parentOID uint32, detachEpoch uint64) []*catalog.Table {
 	var leaves []*catalog.Table
 	seen := make(map[uint32]bool)
-	queue := im.PartitionChildren(parentOID)
+	// VisiblePartitionChildren drops a child stamped detach-pending at or before
+	// detachEpoch at every level, so a concurrently-detached intermediate node
+	// (and all its leaves) vanishes from the scan for snapshots after the detach.
+	// Design 0118-0059 (M0118-0008).
+	queue := catalog.VisiblePartitionChildren(im.PartitionChildren(parentOID), detachEpoch)
 	for len(queue) > 0 {
 		child := queue[0]
 		queue = queue[1:]
@@ -2307,7 +2340,7 @@ func collectAllPartitionLeaves(im *catalog.InMemory, parentOID uint32) []*catalo
 		seen[child.OID] = true
 		if len(child.PartitionKey) > 0 {
 			// Intermediate partitioned node: recurse into its children.
-			queue = append(queue, im.PartitionChildren(child.OID)...)
+			queue = append(queue, catalog.VisiblePartitionChildren(im.PartitionChildren(child.OID), detachEpoch)...)
 		} else {
 			// Leaf partition: include in the scan.
 			leaves = append(leaves, child)
@@ -2443,6 +2476,19 @@ func TypedVirtualCell(pos int, value, colType string) Expr {
 		// reloptions (DU-002 slice 47: nonemptyReloptions saw strlen>2). A
 		// non-empty value is the array text literal ("{a,b}") and passes
 		// through verbatim.
+		if value == "" {
+			return &NullConst{pos: pos}
+		}
+		return &StringConst{pos: pos, Value: value}
+	case "pg_node_tree":
+		// Decompiled-expression catalog columns (relpartbound, pg_attrdef.adbin,
+		// pg_constraint.conbin, pg_index.indexprs/indpred, …). PostgreSQL stores
+		// SQL NULL when the expression is absent — e.g. relpartbound is NULL for a
+		// non-partition (and for a partition detached via DETACH … CONCURRENTLY,
+		// which is exactly what detach-partition-concurrently-1's s3i tests:
+		// `relpartbound IS NULL` flips f→t once the detach finalizes). An empty
+		// cell routed through the default StringConst branch yields a non-NULL
+		// empty string, so `IS NULL` would wrongly read false. Design 0118-0059.
 		if value == "" {
 			return &NullConst{pos: pos}
 		}
