@@ -302,6 +302,11 @@
                                         # CREATE TABLESPACE ... LOCATION ''
                                         # to create a tablespace directly
                                         # inside pg_tblspc (for testing)
+#allow_system_table_mods = off          # developer-only: permits modifying
+                                        # the structure of system tables;
+                                        # recognised as a no-op (goopg gates
+                                        # no catalog change on it) so test
+                                        # setups that SET it succeed
 #debug_parallel_query = off             # off, on, regress; no-op in goopg
                                         # (no parallel executor) — accepted so
                                         # test scripts that force parallel

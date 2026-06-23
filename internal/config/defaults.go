@@ -603,6 +603,19 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSuset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// allow_system_table_mods — developer/regression option permitting
+	// modifications of the structure of system tables (e.g. REINDEX of a
+	// TOAST relation, ALTER on a catalog). PGC_SUSET, DEVELOPER_OPTIONS,
+	// GUC_NOT_IN_SAMPLE, boot off (guc_tables.c). Registered so test scripts
+	// that `SET allow_system_table_mods = on` during setup succeed rather than
+	// failing with `unrecognized configuration parameter`; goopg does not yet
+	// gate any catalog-structure modification on it (M0118-0008,
+	// reindex-concurrently-toast enabler).
+	r.MustRegister(NewVariable(Variable{
+		Name: "allow_system_table_mods", Type: TypeBool, BootVal: "off",
+		Context: ContextSuset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 	// seq_page_cost — planner cost estimate for sequential page fetch.
 	r.MustRegister(NewVariable(Variable{
 		Name: "seq_page_cost", Type: TypeReal, BootVal: "1.0",

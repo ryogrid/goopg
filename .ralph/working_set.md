@@ -1,31 +1,38 @@
-Loop #22: M0118-0008 — detach-partition-concurrently-4 PROMOTED (design 0118-0064, all 21 perms byte-for-byte). COMMITTED? pending commit at loop end.
+Loop #23: M0118-0008 — allow_system_table_mods GUC enabler (design 0118-0065). COMMITTED? pending at loop end.
 
-What landed (two FK behaviours closed the last 3 WHERE-CURRENT-OF perms; NOT positioned-DML):
-1. UPDATE now fires the RI_FKey_check parent-existence assertion (operators_fk.go +
-   operators_storage.go). goopg only ran checkFKInsert from insertOp; updateOp did no
-   parent lookup. New updateOp.childFKsToRecheck() (FKs whose referencing cols are in the
-   SET list — mirrors PG firing the RI AFTER-trigger only on a key-column change, bounds
-   blast radius to FK-key UPDATEs on FK tables) + recheckChildFKs() (delegates to new
-   checkFKInsertForConstraints). Wired into ALL 3 update write paths (Next seqscan /
-   updateViaIndex / updateWithFrom) right after BEFORE triggers, before the heap write.
-2. DETACH re-validates RI_PartitionRemove_Check AFTER the hybrid wait (operators_ddl.go,
-   ~line 5350, before Phase-2 finalize). First detachPartitionFKRefCheck runs before the
-   wait under the stmt-start snapshot (misses a row a waited-on session commits during the
-   wait); re-run with FRESH snapshot (TxnMgr.SnapshotFor(Tx).Clone) + PartitionDetachEpoch=0
-   so routeToPartition keeps the now-pending child in the routing set ⇒ d4_fk_a_fkey_1.
+## What landed (enabler, NOT a promotion)
+reindex-concurrently-toast.spec global setup runs `SET allow_system_table_mods TO true;`.
+goopg didn't register the GUC ⇒ setup failed `unrecognized configuration parameter
+"allow_system_table_mods" (22023)`, aborting permutation 0. Registered it mirroring PG
+guc_tables.c: PGC_SUSET (→ContextSuset), bool, boot off, DEVELOPER_OPTIONS — following the
+allow_in_place_tablespaces precedent (recognised developer no-op; goopg gates NO catalog
+modification on it). Added mandatory `#allow_system_table_mods = off` to postgresql.conf.sample
+(TestSampleConfigCoversRegistry requires every file-settable GUC there) + unit test.
 
-Files: internal/executor/operators_fk.go, operators_storage.go, operators_ddl.go,
-internal/testport/isolation_port_test.go (new TestPort_IsolationDetachPartitionConcurrently4),
-docs/test-port/postgres-oracle-target-inventory.csv (failed→pass) + regen .md,
-docs/design/0118-0064-*.md + README index, fix_plan + deferral_ledger.
+Files: internal/config/defaults.go (register after allow_in_place_tablespaces),
+internal/config/postgresql.conf.sample (DEVELOPER OPTIONS section),
+internal/config/allow_system_table_mods_test.go (new),
+docs/design/0118-0065-allow-system-table-mods-guc.md + README index, deferral_ledger.
 
-Gates run: strict TestPort_IsolationDetachPartitionConcurrently4 PASS (21 perms);
-detach-1/2/3 + Fk{Snapshot,Contention,Deadlock2}/ReferentialIntegrity/TemporalRangeIntegrity
-+ PartitionKeyUpdate1..4 + Merge{Update,Delete,InsertUpdate,MatchRecheck,Join} +
-InsertConflictDoUpdate{,2,3,4} PASS; regress-port foreign_key/update/constraints/inherit
-no regression (exit 0); -race ./internal/executor/; go build clean. pgbench smoke = pre-commit hook.
+Gates: TestAllowSystemTableModsGUC + full internal/config (incl. sample parity) PASS;
+go vet ./internal/config clean; go build ./... clean; live probe confirms reind-con-toast
+setup divergence advanced GUC-error → PL/pgSQL `qualified names not supported in expressions`
+(r.table_name in EXECUTE). pgbench smoke = pre-commit hook.
 
-Next step: commit + push. Then M0118-0008 tail: WHERE CURRENT OF positioned-DML
-(project-wide, ledger), alter-table-4 (INHERITS + transactional-DDL cross-session
-visibility), partition-concurrent-attach, partition-drop-index-locking (pg_locks),
-reindex-concurrently-toast (toast relations + allow_system_table_mods).
+## Probe ranking of the M0118-0008 hard tail (this loop, throwaway zz_probe deleted)
+- reindex-concurrently-toast: was GUC error; now PL/pgSQL qualified-name in EXECUTE → then
+  FUNDAMENTAL: needs real TOAST relations as catalog objects (goopg stores text/bytea INLINE,
+  reltoastrelid=0, nothing to rename/REINDEX CONCURRENTLY). Multi-loop subsystem.
+- partition-concurrent-attach: first div L7 — INSERT into default partition must <waiting>
+  behind concurrent uncommitted ATTACH then ERROR partition-constraint after commit; needs
+  default-partition implicit constraint (complement of sibling bounds) + lock + re-validate.
+- alter-table-4: first div L6 — SELECT SUM(a) FROM p must <waiting> behind uncommitted
+  ALTER…NO INHERIT/INHERIT then still see old children (sum 11). COUPLED to transactional
+  DDL catalog visibility (goopg applies DDL to shared in-mem catalog non-transactionally,
+  visible cross-session immediately). Milestone-sized MVCC catalog subsystem.
+- partition-drop-index-locking: needs full pg_locks view population (returns 0 rows today).
+- WHERE CURRENT OF positioned UPDATE/DELETE: parsed (CurrentOf) but no executor site; needs
+  per-row CTID capture in cursor + CTID-restricted rewrite. Project-wide.
+
+Next step: commit + push this enabler. Then pick next M0118-0008 tail slice — all remaining
+are Effort-L distinct subsystems; partition-drop-index-locking (pg_locks) is broadly reusable.
