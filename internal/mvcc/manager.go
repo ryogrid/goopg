@@ -916,11 +916,12 @@ func (m *Manager) captureSnapshot() Snapshot {
 	m.abortedMu.RUnlock()
 
 	return Snapshot{
-		Xmin:       xmin,
-		Xmax:       xmax,
-		InProgress: inProgress,
-		Aborted:    aborted,
-		clog:       clog,
+		Xmin:                 xmin,
+		Xmax:                 xmax,
+		InProgress:           inProgress,
+		Aborted:              aborted,
+		clog:                 clog,
+		PartitionDetachEpoch: CurrentPartitionDetachEpoch(),
 	}
 }
 

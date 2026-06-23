@@ -367,6 +367,18 @@ type Table struct {
 	// routing and display. For LIST: InValues strings; for RANGE: one
 	// PartitionBound with From/To strings.
 	PartitionBounds []PartitionBound
+	// DetachPendingEpoch, when non-zero, marks this partition child as
+	// "detach pending" by an in-progress ALTER TABLE … DETACH PARTITION …
+	// CONCURRENTLY: the partition is still physically registered (so a
+	// snapshot taken before the detach still scans it) but is omitted from
+	// the partition descriptor for any statement whose snapshot epoch is
+	// >= DetachPendingEpoch. It mirrors PostgreSQL's pg_inherits
+	// inhdetachpending flag + the snapshot-relative omission performed by
+	// find_inheritance_children_extended. Set/cleared via
+	// InMemory.MarkPartitionDetachPending / ClearPartitionDetachPending and
+	// consulted by VisiblePartitionChildren. Zero for every ordinary
+	// partition. Design 0118-0058 (M0118-0008 detach-partition-concurrently).
+	DetachPendingEpoch uint64
 	// PartitionKeyOpClasses is the operator class name per key column.
 	// Empty string means "use the default hash function". M0097-0027.
 	PartitionKeyOpClasses []string
@@ -1311,6 +1323,14 @@ type InMemory struct {
 	// for partition index trees (ALTER INDEX parent ATTACH PARTITION child). M0097-0023.
 	indexPartitionChildren map[uint32][]uint32
 
+	// pendingPartitionDetachCount counts partition children currently marked
+	// "detach pending" (DetachPendingEpoch != 0) by an in-progress
+	// ALTER TABLE … DETACH PARTITION … CONCURRENTLY. Maintained by
+	// MarkPartitionDetachPending / ClearPartitionDetachPending so
+	// HasPendingPartitionDetach is O(1). Zero in the steady state. Design
+	// 0118-0058 (M0118-0008 detach-partition snapshot visibility).
+	pendingPartitionDetachCount int
+
 	// inheritanceChildren maps parent table OID → slice of child OIDs
 	// for table inheritance support (M0096-0009).
 	inheritanceChildren map[uint32][]uint32
@@ -1995,6 +2015,96 @@ func (c *InMemory) UnregisterPartitionChild(parentOID, childOID uint32) {
 	}
 	c.partitionChildren[parentOID] = filtered
 	c.mu.Unlock()
+}
+
+// MarkPartitionDetachPending stamps the partition child childOID with epoch as
+// its "detach pending" boundary (ALTER TABLE … DETACH PARTITION … CONCURRENTLY).
+// The child stays physically registered — VisiblePartitionChildren omits it only
+// for statements whose snapshot epoch is >= epoch, so a snapshot taken before the
+// detach (e.g. a REPEATABLE READ transaction that began earlier) still scans the
+// partition while concurrent READ COMMITTED statements stop seeing it. epoch must
+// be a fresh value from mvcc.NextPartitionDetachEpoch(). No-op (returns false) if
+// the child is unknown. Idempotent: re-stamping the same child does not double the
+// pending count. Design 0118-0058 (M0118-0008 detach-partition-concurrently).
+func (c *InMemory) MarkPartitionDetachPending(childOID uint32, epoch uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, t := range c.tables {
+		if t.OID == childOID {
+			if t.DetachPendingEpoch == 0 {
+				c.pendingPartitionDetachCount++
+			}
+			t.DetachPendingEpoch = epoch
+			return true
+		}
+	}
+	return false
+}
+
+// ClearPartitionDetachPending removes the detach-pending mark from childOID,
+// called when the concurrent detach finalizes (or is rolled back) so the child
+// is either fully unregistered or restored to ordinary visibility. Idempotent.
+// Design 0118-0058 (M0118-0008 detach-partition-concurrently).
+func (c *InMemory) ClearPartitionDetachPending(childOID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, t := range c.tables {
+		if t.OID == childOID {
+			if t.DetachPendingEpoch != 0 {
+				t.DetachPendingEpoch = 0
+				if c.pendingPartitionDetachCount > 0 {
+					c.pendingPartitionDetachCount--
+				}
+			}
+			return
+		}
+	}
+}
+
+// HasPendingPartitionDetach reports whether any partition child is currently
+// marked detach-pending. When true, a query scanning a partitioned parent
+// expands to a snapshot-dependent partition set (see VisiblePartitionChildren),
+// so its plan must NOT be served from / stored in the cross-session plan cache —
+// the same constraint HasTempInheritanceChildren imposes for temp inheritance.
+// O(1) (a maintained counter). Design 0118-0058 (M0118-0008).
+func (c *InMemory) HasPendingPartitionDetach() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.pendingPartitionDetachCount > 0
+}
+
+// VisiblePartitionChildren filters a partition child list down to those visible
+// to a statement whose snapshot epoch is snapshotEpoch, mirroring PostgreSQL's
+// snapshot-relative omission of a concurrently-detached partition
+// (find_inheritance_children_extended honouring inhdetachpending against the
+// active snapshot). A child stamped DetachPendingEpoch == e is dropped when
+// snapshotEpoch >= e (the detach is "visible" to this statement) and retained
+// when snapshotEpoch < e (the statement's snapshot predates the detach) or when
+// e == 0 (not detaching). Filtered in place when nothing is dropped (same backing
+// array); otherwise a fresh slice is returned. nil-in / nil-out. Design 0118-0058
+// (M0118-0008 detach-partition-concurrently).
+func VisiblePartitionChildren(children []*Table, snapshotEpoch uint64) []*Table {
+	if len(children) == 0 {
+		return children
+	}
+	drop := false
+	for _, c := range children {
+		if c != nil && c.DetachPendingEpoch != 0 && snapshotEpoch >= c.DetachPendingEpoch {
+			drop = true
+			break
+		}
+	}
+	if !drop {
+		return children
+	}
+	out := make([]*Table, 0, len(children))
+	for _, c := range children {
+		if c != nil && c.DetachPendingEpoch != 0 && snapshotEpoch >= c.DetachPendingEpoch {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // RegisterIndexPartitionChild registers childOID as a partition child of

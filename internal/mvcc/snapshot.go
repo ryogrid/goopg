@@ -72,6 +72,15 @@ type Snapshot struct {
 	InProgress []storage.TransactionID
 	Aborted    []storage.TransactionID
 
+	// PartitionDetachEpoch is the value of the global partition-detach epoch
+	// (CurrentPartitionDetachEpoch) at the moment this snapshot was captured.
+	// catalog.VisiblePartitionChildren omits a partition child whose
+	// DetachPendingEpoch is <= this value, so a snapshot taken before a
+	// concurrent DETACH PARTITION CONCURRENTLY still scans the partition while
+	// later snapshots do not. Zero for snapshots captured outside the manager
+	// (e.g. in unit tests). Design 0118-0058 (M0118-0008).
+	PartitionDetachEpoch uint64
+
 	// clog, when non-nil, is the durable commit log consulted as a fallback
 	// for in-window XIDs the in-memory InProgress/Aborted arrays cannot
 	// classify (gap G4 / M0117-0002). It mirrors PostgreSQL's
@@ -85,11 +94,12 @@ type Snapshot struct {
 // from manager internals.
 func (s Snapshot) Clone() Snapshot {
 	out := Snapshot{
-		Xmin:       s.Xmin,
-		Xmax:       s.Xmax,
-		InProgress: make([]storage.TransactionID, len(s.InProgress)),
-		Aborted:    make([]storage.TransactionID, len(s.Aborted)),
-		clog:       s.clog,
+		Xmin:                 s.Xmin,
+		Xmax:                 s.Xmax,
+		InProgress:           make([]storage.TransactionID, len(s.InProgress)),
+		Aborted:              make([]storage.TransactionID, len(s.Aborted)),
+		clog:                 s.clog,
+		PartitionDetachEpoch: s.PartitionDetachEpoch,
 	}
 	copy(out.InProgress, s.InProgress)
 	copy(out.Aborted, s.Aborted)
