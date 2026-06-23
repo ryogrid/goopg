@@ -586,14 +586,22 @@ func allDescendants(im *catalog.InMemory, tbl *catalog.Table, snapEpoch uint64) 
 	return out
 }
 
-// snapDetachEpoch extracts the current statement's partition-detach snapshot
-// epoch from ctx, or 0 when no snapshot is established. Used to filter
-// detach-pending partition children out of FK existence scans.
-func snapDetachEpoch(ctx *Context) uint64 {
-	if ctx != nil {
-		return ctx.Snap.PartitionDetachEpoch
-	}
-	return 0
+// snapDetachEpoch returns the epoch used to filter detach-pending partition
+// children out of FK existence scans. Unlike ordinary queries (which expand the
+// partition set against their own snapshot epoch, ctx.Snap.PartitionDetachEpoch,
+// so a REPEATABLE READ transaction whose snapshot predates the detach still sees
+// the partition), a referential-integrity existence check observes the CURRENT
+// detach state regardless of the enforcing transaction's isolation level: in
+// PostgreSQL the RI trigger query runs under the latest snapshot, so a row that
+// lives only in a concurrently-detached (detach-pending) partition is invisible
+// to the FK check the instant the detach is marked — even under REPEATABLE READ,
+// where a cursor/SELECT on the referenced table can still see that very row
+// (detach-partition-concurrently-4: "Trying to insert into a partially detached
+// partition is rejected … even under REPEATABLE READ mode"). Returns the global
+// mvcc.CurrentPartitionDetachEpoch(). Design 0118-0062 (M0118-0008,
+// detach-partition-concurrently-4).
+func snapDetachEpoch(_ *Context) uint64 {
+	return mvcc.CurrentPartitionDetachEpoch()
 }
 
 func scanTableForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, error) {

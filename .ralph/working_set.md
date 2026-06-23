@@ -1,32 +1,37 @@
-Loop #60: M0118-0008 — detach-partition-concurrently-3 PROMOTED (design 0118-0061)
+Loop #20: M0118-0008 — detach-partition-concurrently-4 FK behaviour landed (design 0118-0062, PARTIAL)
 
-detach-partition-concurrently-3 passes byte-for-byte across all 18 permutations
-(TestPort_IsolationDetachPartitionConcurrently3, runIsoSpecStrict). Committed.
+Landed the FK-current-epoch fix (NOT a promotion — detach-4 still defers on cursors).
 
-What landed (incomplete-detach lifecycle — built on detach-1/2 epoch machinery):
-- operators_ddl.go: cancel mid-wait now PERSISTS the detach-pending mark (no
-  revert); `already pending detach` guard (55000) before a 2nd concurrent detach;
-  ALTER-on-pending guard (55000) in execAlterTable; DETACH FINALIZE clears the
-  mark + takes AccessExclusive on the partition via acquireRelLockMaybeTransient;
-  DROP of a pending child grabs AccessExclusive on the PARENT (acquireDDLLockTxn).
-- operators_pg_partition_tree.go: partitionTableTree skips a detach-pending child
-  from the parent, NULL-parent when it's the queried root.
-- truncateTableAndPartitions: omits a detach-pending child.
-- planner SeqScan.LockParentOID + seqScanOp: a partitioned-parent scan locks the
-  parent relation (AccessShare) so a concurrent parent AEL (from DROP) blocks it.
-- context.go acquireWriteLockTxn: made SYMMETRIC with acquireScanReadLockTxn —
-  routes through acquireRelLockMaybeTransient(RowExclusive) so an autocommit write
-  WAITS behind a conflicting AEL (FINALIZE). RowExclusive only conflicts with
-  DDL-grade modes ⇒ no new DML/read blocking; pgbench smoke 0-failed.
+What landed:
+- internal/executor/operators_fk.go: snapDetachEpoch now returns the GLOBAL
+  mvcc.CurrentPartitionDetachEpoch() instead of ctx.Snap.PartitionDetachEpoch.
+  Root cause: detach-4 requires the FK existence check to reject inserting a
+  value that lives only in a concurrently-detaching partition EVEN UNDER
+  REPEATABLE READ (PG's RI_FKey_check runs under the latest snapshot). goopg
+  filtered by the enforcing statement's snapshot epoch — correct for RC (fresh
+  per-stmt snapshot) but wrong for RR (txn snapshot predates the detach ⇒ not
+  filtered ⇒ FK wrongly found the value). Scoped to the two FK existence scans
+  (scanTableForMatch/scanTableForMatchFKWait via allDescendants); ordinary
+  query/cursor partition expansion still uses the snapshot epoch, preserving the
+  RR-visible-row asymmetry. Dropped now-unused ctx param + os import.
 
-Gates: detach-3 strict PASS; detach-1/2 + create-trigger/alter-table-1/2/3/
-inherit-temp/truncate-conflict/vacuum-conflict/cluster-conflict/timeouts/
-row-lock/write-skew/merge/FK siblings PASS; -race executor+lockmgr+mvcc PASS;
-executor/planner/catalog units PASS; build clean; state-guard OK.
+Gates run: probe (RunAndCompare) — FK permutations RC+RR now byte-match, residual
+diff confined to the 8 cursor permutations; detach-1/2/3 strict PASS;
+FkSnapshot/FkContention/PartitionKeyUpdate1..4 PASS; executor+catalog units PASS;
+go build ./... + go vet ./internal/executor/ clean; state-guard OK (repaired).
 
-Next step: probe detach-partition-concurrently-4 (RunAndCompare, log .Diff).
-detach-4 adds cancel-then-resume of the concurrent detach itself (re-driving the
-wait after an interrupted DETACH … CONCURRENTLY) on top of the now-landed
-incomplete-detach state. Other M0118-0008 tail: alter-table-4 (INHERITS +
-transactional-DDL visibility), partition-concurrent-attach, partition-drop-index-
-locking (pg_locks view), reindex-concurrently-toast (toast as catalog objects).
+Next step: detach-4 cursor permutations need cursor-pinned-snapshot machinery
+(two coupled pieces, land together):
+  (1) Cursor snapshot pinning at DECLARE — goopg materialises a cursor lazily on
+      first FETCH (cursorEntry, internal/server/conn_tx.go), so a cursor declared
+      before a detach but fetched after sees the post-detach partition set (1 row)
+      instead of its declaration-time set (2 rows). Capture the snapshot (incl.
+      PartitionDetachEpoch) at DECLARE; expand partitions against that frozen
+      epoch at FETCH.
+  (2) Detacher waits on an open cursor — DECLARE CURSOR over the partitioned
+      parent must register a pinned snapshot / relation lock so the concurrent
+      DETACH … CONCURRENTLY blocks (<waiting>) and is cancellable. Today the
+      cursor holds neither ⇒ detacher completes immediately ⇒ s1cancel no-op.
+Probe with internal/testport zz_probe_test.go (RunAndCompare → log .Diff +
+/tmp/iso_actual_out.txt). Other M0118-0008 tail: alter-table-4,
+partition-concurrent-attach, partition-drop-index-locking, reindex-concurrently-toast.

@@ -719,9 +719,28 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       truncate-conflict/vacuum-conflict/cluster-conflict/timeouts/row-lock/
       write-skew/merge/FK siblings PASS; `-race` executor/lockmgr/mvcc; pgbench
       smoke 0-failed.
-      **Remaining (deferred):** `alter-table-4` (INHERITS + transactional-DDL
-      cross-session visibility), `detach-partition-concurrently-4` (cancel-then-
-      resume of the concurrent detach itself) + `partition-concurrent-attach`
+      **2026-06-24 partial (design 0118-0062): `detach-partition-concurrently-4`
+      FK behaviour landed (NOT yet promoted — cursor work deferred).** detach-4
+      asserts inserting a value living only in a concurrently-detaching partition
+      fails its FK check EVEN UNDER REPEATABLE READ (PG's `RI_FKey_check` runs
+      under the latest snapshot ⇒ a detach-pending partition is invisible to the
+      FK check the instant it is marked, while a plain SELECT/cursor in the same
+      RR txn still sees the row). goopg filtered detach-pending partitions out of
+      the FK existence scan by the ENFORCING STATEMENT's snapshot epoch (design
+      0118-0060) — correct for RC (fresh per-stmt snapshot) but wrong for RR
+      (txn snapshot predates the detach ⇒ partition not filtered ⇒ FK wrongly
+      found the value). Fix: `snapDetachEpoch` (`operators_fk.go`) now returns the
+      global `mvcc.CurrentPartitionDetachEpoch()`; scoped to the two FK existence
+      scans, ordinary query/cursor expansion untouched (preserves the RR-visible-
+      row asymmetry). Probe: FK permutations (RC + RR) now byte-match; residual
+      diff confined to the 8 cursor permutations. Siblings detach-1/2/3 +
+      FkSnapshot/FkContention/PartitionKeyUpdate1..4 PASS; executor/catalog units
+      PASS; pgbench smoke 0-failed.
+      **Remaining (deferred):** `detach-partition-concurrently-4` cursor
+      permutations need cursor-pinned-snapshot machinery (cursor snapshot pinning
+      at DECLARE so FETCH sees the declaration-time partition set; detacher waits
+      on an open cursor) — see ledger; `alter-table-4` (INHERITS + transactional-
+      DDL cross-session visibility), `partition-concurrent-attach`
       (transactional partition visibility),
       `partition-drop-index-locking` (pg_locks view parity),
       `reindex-concurrently-toast` (toast relations as catalog objects +
