@@ -1034,9 +1034,15 @@ func (p *bodyParser) parseExecute() (*ExecuteStmt, error) {
 
 	stmt := &ExecuteStmt{pos: pos, Query: queryExpr}
 
-	// Optional INTO clause
+	// Optional INTO [STRICT] clause
 	if p.cur().Kind == parser.TokenKeyword && p.cur().Keyword == parser.KwInto {
 		p.advance() // consume INTO
+		// STRICT is an unreserved word; it surfaces as a plain identifier here
+		// (mirrors the SELECT ... INTO STRICT handling above).
+		if st := p.cur(); st.Kind == parser.TokenIdent && strings.EqualFold(st.Value, "strict") {
+			stmt.Strict = true
+			p.advance()
+		}
 		varTok := p.advance()
 		if varTok.Kind != parser.TokenIdent {
 			return nil, p.errAt(varTok.Pos, "expected variable name after INTO")

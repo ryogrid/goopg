@@ -295,12 +295,13 @@ type ExceptionBlock struct {
 func (e *ExceptionBlock) Pos() int         { return e.pos }
 func (e *ExceptionBlock) plpgsqlStmtNode() {}
 
-// ExecuteStmt is `EXECUTE expr [INTO var] [USING expr, ...]`.
+// ExecuteStmt is `EXECUTE expr [INTO [STRICT] var] [USING expr, ...]`.
 // Executes a dynamically-constructed SQL string. M0100-0005.
 type ExecuteStmt struct {
 	pos     int
 	Query   parser.Expr   // expression producing the SQL string
 	IntoVar string        // target variable name (empty if no INTO clause)
+	Strict  bool          // STRICT modifier on INTO (exactly one row required)
 	Using   []parser.Expr // USING argument expressions (may be nil)
 }
 

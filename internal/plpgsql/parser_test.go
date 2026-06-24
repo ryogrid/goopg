@@ -594,3 +594,40 @@ func TestParseTriggerOldFieldAssign(t *testing.T) {
 		t.Errorf("Target = %q, want %q", a.Target, "_old_a")
 	}
 }
+
+// TestParseExecuteIntoStrict pins the EXECUTE … INTO STRICT var form
+// (horizons.spec enabler, M0118-0009 design 0118-0101): the optional STRICT
+// modifier between INTO and the target variable is recognised and flagged on
+// the ExecuteStmt, while a plain INTO stays non-strict.
+func TestParseExecuteIntoStrict(t *testing.T) {
+	blk, err := Parse("BEGIN EXECUTE p_query INTO STRICT v_ret; END")
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(blk.Statements) != 1 {
+		t.Fatalf("Statements len = %d, want 1", len(blk.Statements))
+	}
+	ex, ok := blk.Statements[0].(*ExecuteStmt)
+	if !ok {
+		t.Fatalf("Statements[0] = %T, want *ExecuteStmt", blk.Statements[0])
+	}
+	if !ex.Strict {
+		t.Errorf("Strict = false, want true")
+	}
+	if ex.IntoVar != "v_ret" {
+		t.Errorf("IntoVar = %q, want %q", ex.IntoVar, "v_ret")
+	}
+
+	// Plain INTO (no STRICT) must stay non-strict.
+	blk2, err := Parse("BEGIN EXECUTE p_query INTO v_ret; END")
+	if err != nil {
+		t.Fatalf("Parse non-strict: %v", err)
+	}
+	ex2 := blk2.Statements[0].(*ExecuteStmt)
+	if ex2.Strict {
+		t.Errorf("non-strict Strict = true, want false")
+	}
+	if ex2.IntoVar != "v_ret" {
+		t.Errorf("non-strict IntoVar = %q, want %q", ex2.IntoVar, "v_ret")
+	}
+}

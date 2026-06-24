@@ -1219,6 +1219,15 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       emission, then the Effort-L MVCC core (index-only-scan heap-fetch counts
       reflecting pruning + prune/VACUUM respecting a concurrent older snapshot
       for permanent vs temp tables). Ledger row recorded.
+      **2026-06-25 (design 0118-0101, enabler — NOT a promotion):** added plpgsql
+      `EXECUTE … INTO STRICT var` (the next horizons rung): `ExecuteStmt.Strict`
+      (AST) + optional `STRICT` after `INTO` in `parseExecute` + runtime row-count
+      enforcement (0 rows→P0002, >1→P0003, mirroring `SELECT … INTO STRICT`).
+      `horizons.spec`'s `explain_json` setup helper now creates + runs; re-probe
+      shows the divergence advanced to the EXPLAIN `Heap Fetches` pruning counts.
+      Spec stays `failed` — remaining blockers are the Effort-L EXPLAIN JSON
+      `Heap Fetches` emission + MVCC pruning-horizon core. Tests
+      `TestParseExecuteIntoStrict` + `TestPlpgSQLExecuteIntoStrict`. Ledger row.
       **Remaining M0118-0009:** `intra-grant-inplace` (pg_class sibling — ALTER
       TABLE ADD PRIMARY KEY `<waiting>` behind FOR KEY SHARE on pg_class; needs
       runtime shared-catalog MVCC-tuple row locks — heavy), `horizons`

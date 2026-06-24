@@ -1528,18 +1528,37 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			return Datum{}, flowNone, addExecCtx(perr)
 		}
 		slot, perr := op.Next()
-		// Copy the INTO result datum before Close() so releaseRow() does not
-		// zero it out underneath us. M0100-0005 fix: slot row is pooled.
+		// Copy the INTO result datum before the next Next()/Close() so the
+		// pooled slot row is not zeroed underneath us. M0100-0005 fix.
 		var intoVal Datum
-		if s.IntoVar != "" && slot != nil && (perr == nil || perr == EOF) {
+		rowCount := 0
+		if slot != nil && perr == nil {
 			row := slot.Row()
 			if len(row) > 0 {
 				intoVal = row[0]
+			}
+			rowCount = 1
+			// EXECUTE ... INTO STRICT requires exactly one row; pull a second to
+			// detect a multi-row result (mirrors the SELECT ... INTO STRICT path).
+			if s.Strict {
+				if s2, e2 := op.Next(); e2 == nil && s2 != nil {
+					rowCount = 2
+				} else if e2 != nil && e2 != EOF {
+					perr = e2
+				}
 			}
 		}
 		op.Close()
 		if perr != nil && perr != EOF {
 			return Datum{}, flowNone, addExecCtx(perr)
+		}
+		if s.Strict {
+			if rowCount == 0 {
+				return Datum{}, flowNone, addExecCtx(&ExecError{Code: "P0002", Message: "query returned no rows"})
+			}
+			if rowCount > 1 {
+				return Datum{}, flowNone, addExecCtx(&ExecError{Code: "P0003", Message: "query returned more than one row"})
+			}
 		}
 		if s.IntoVar != "" {
 			if idx, ok := frame.lookup(s.IntoVar); ok {
