@@ -5008,6 +5008,39 @@ func ApplyPendingIndexDrops(ctx *Context, sess *BasicSession) {
 	}
 }
 
+// ApplyPendingPartitionAttaches performs the deferred catalog registration for
+// every ATTACH PARTITION that the AlterTableAttachPartition case deferred to
+// COMMIT (see PendingPartitionAttach). It sets the child's partition bounds and
+// registers the parent-child link, making the new partition routable/visible to
+// other sessions for the first time. Callers MUST invoke it from the commit paths
+// BEFORE TxnMgr.Commit, mirroring ApplyPendingIndexDrops. A ROLLBACK never calls
+// this; EndExplicitTransaction discards the pending list. M0118-0008.
+func ApplyPendingPartitionAttaches(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	attaches := sess.TakePendingPartitionAttaches()
+	if len(attaches) == 0 {
+		return
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	for _, a := range attaches {
+		childTbl, ok := im.LookupTableByOID(a.ChildOID)
+		if !ok {
+			// The child was dropped within the same transaction before commit;
+			// nothing to register.
+			continue
+		}
+		if a.Bounds != nil {
+			childTbl.PartitionBounds = a.Bounds
+		}
+		im.RegisterPartitionChild(a.ParentOID, a.ChildOID)
+	}
+}
+
 // lockDropIndexTree acquires the full set of AccessExclusiveLocks that
 // PostgreSQL's DROP INDEX (non-CONCURRENTLY) takes, in PG's acquisition order:
 //  1. the target index relation itself (granted before any blocking),
@@ -5489,11 +5522,12 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// OWN PARTITION BY clause and must NOT be overwritten by the parent's values.
 			// Build partition bounds. M0097-0015 adds HASH.
 			var pb catalog.PartitionBound
+			var boundsToSet []catalog.PartitionBound
 			if poc.IsHash {
 				pb.IsHash = true
 				pb.Modulus = poc.Modulus
 				pb.Remainder = poc.Remainder
-				childTbl.PartitionBounds = []catalog.PartitionBound{pb}
+				boundsToSet = []catalog.PartitionBound{pb}
 			} else {
 				for _, e := range poc.InValues {
 					pb.InValues = append(pb.InValues, exprToString(e))
@@ -5516,11 +5550,42 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					pb.ToUnbounded, pb.ToUnboundMax = rangeBoundUnboundedFlags(poc.ToValues)
 				}
 				if len(pb.InValues) > 0 || pb.From != "" || pb.To != "" {
-					childTbl.PartitionBounds = []catalog.PartitionBound{pb}
+					boundsToSet = []catalog.PartitionBound{pb}
 				}
 			}
-			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				im.RegisterPartitionChild(tbl.OID, childTbl.OID)
+			// M0118-0008: ATTACH PARTITION inside an explicit transaction defers the
+			// catalog registration (partition bounds + parent-child link) to COMMIT,
+			// so a concurrent session does not see the new partition and an INSERT
+			// routing through the parent falls to the DEFAULT partition — where it
+			// blocks on the default-partition AccessExclusiveLock taken above. This
+			// mirrors PG transactional-DDL visibility: an uncommitted ATTACH is
+			// invisible to other snapshots (partition-concurrent-attach spec). In
+			// autocommit the registration stays immediate. The default-partition lock
+			// and the data-conflict check above always run at statement time, as in
+			// PG. The child's own indexes are still propagated immediately below
+			// (harmless: the child is not yet routable until commit).
+			var deferAttach *BasicSession
+			if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+				if bs, oks := o.ctx.Session.(*BasicSession); oks {
+					if _, okc := o.ctx.Catalog.(*catalog.InMemory); okc {
+						deferAttach = bs
+					}
+				}
+			}
+			if deferAttach != nil {
+				deferAttach.AddPendingPartitionAttach(PendingPartitionAttach{
+					ParentOID:      tbl.OID,
+					ChildOID:       childTbl.OID,
+					Bounds:         boundsToSet,
+					SavepointDepth: deferAttach.SavepointDepth(),
+				})
+			} else {
+				if boundsToSet != nil {
+					childTbl.PartitionBounds = boundsToSet
+				}
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					im.RegisterPartitionChild(tbl.OID, childTbl.OID)
+				}
 			}
 			// Propagate parent unique/PK indexes to the newly attached child
 			// partition. In PostgreSQL, ATTACH PARTITION requires the child to

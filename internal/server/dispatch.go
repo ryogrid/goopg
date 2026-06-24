@@ -1735,6 +1735,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				// TxnMgr.Commit so the drop WAL precedes the commit record.
 				if sess := connTx.Session(); sess != nil {
 					executor.ApplyPendingIndexDrops(ctx, sess)
+					// M0118-0008: register ATTACH PARTITION deferred to COMMIT (the
+					// simple-query path bypasses execCommit).
+					executor.ApplyPendingPartitionAttaches(ctx, sess)
 				}
 				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
 					undoEnumDDLForRollback(connTx, s.cfg.Catalog)

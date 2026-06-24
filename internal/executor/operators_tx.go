@@ -156,6 +156,9 @@ func (o *transactionOp) execCommit() error {
 	// the pg_class xmax stamp uses the still-live XID.
 	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
 		ApplyPendingIndexDrops(o.ctx, sess)
+		// M0118-0008: register ATTACH PARTITION deferred to COMMIT (the new
+		// partition was invisible to other sessions until now).
+		ApplyPendingPartitionAttaches(o.ctx, sess)
 	}
 	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
@@ -448,9 +451,11 @@ func (o *transactionOp) execRollbackTo() error {
 			}
 		}
 	}
-	// M0118-0008: discard DROP INDEX removals deferred inside the rolled-back
-	// savepoint so they are not applied at the outer COMMIT.
+	// M0118-0008: discard DROP INDEX removals and ATTACH PARTITION registrations
+	// deferred inside the rolled-back savepoint so they are not applied at the
+	// outer COMMIT.
 	sess.CancelPendingIndexDropsToDepth(newDepth)
+	sess.CancelPendingPartitionAttachesToDepth(newDepth)
 	o.ctx.Tx.XID = newSubXid
 	return nil
 }

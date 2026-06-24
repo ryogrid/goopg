@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/parser"
 )
@@ -114,5 +115,120 @@ func TestAttachPartitionNoDefaultNoLock(t *testing.T) {
 			h.Tag.Rel == sibOID && h.Tag.Block == 0 && h.Tag.Offset == 0 {
 			t.Errorf("ATTACH with no default partition wrongly AccessExclusive-locked sibling tpb_1 (oid %d)", sibOID)
 		}
+	}
+}
+
+// hasPartChild reports whether parentOID's registered partition-child set
+// contains childOID.
+func hasPartChild(im *catalog.InMemory, parentOID, childOID uint32) bool {
+	for _, c := range im.PartitionChildren(parentOID) {
+		if c.OID == childOID {
+			return true
+		}
+	}
+	return false
+}
+
+// TestAttachPartitionDeferredUntilCommit verifies piece (a) of the
+// partition-concurrent-attach isolation spec (M0118-0008): ALTER TABLE … ATTACH
+// PARTITION issued inside an explicit transaction defers its catalog
+// registration (partition bounds + parent-child link) to COMMIT. Until the
+// attaching transaction commits, the new partition is NOT registered, so a
+// concurrent session does not see it and an INSERT routing through the parent
+// falls to the DEFAULT partition — mirroring PG transactional-DDL visibility (an
+// uncommitted ATTACH is invisible to other snapshots). ApplyPendingPartitionAttaches
+// performs the real registration at commit.
+func TestAttachPartitionDeferredUntilCommit(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+	im := cat.(*catalog.InMemory)
+
+	// Build the partition tree in autocommit (Session nil) so only the ATTACH
+	// under test exercises the deferral.
+	for _, s := range []string{
+		"CREATE TABLE tpc (i int, j text) PARTITION BY RANGE (i)",
+		"CREATE TABLE tpc_def PARTITION OF tpc DEFAULT",
+		"CREATE TABLE tpc_1 PARTITION OF tpc FOR VALUES FROM (0) TO (100)",
+		"CREATE TABLE tpc_2 (LIKE tpc)",
+	} {
+		if err := runDDL(t, ctx, s); err != nil {
+			t.Fatalf("setup %q: %v", s, err)
+		}
+	}
+	oidOf := func(name string) uint32 {
+		tbl, ok := cat.LookupTable(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("table %q not found", name)
+		}
+		return tbl.OID
+	}
+	parentOID := oidOf("tpc")
+	childOID := oidOf("tpc_2")
+
+	// Enter an explicit transaction: the attach must now defer.
+	sess := NewBasicSession()
+	sess.BeginExplicitTransaction(ctx.Tx, ctx.Snap)
+	ctx.Session = sess
+	const backend lockmgr.BackendID = 91005
+	ctx.TxnLockBackendID = backend
+	defer tableLockMgr.ReleaseAll(backend)
+
+	if err := runDDL(t, ctx, "ALTER TABLE tpc ATTACH PARTITION tpc_2 FOR VALUES FROM (100) TO (200)"); err != nil {
+		t.Fatalf("ATTACH PARTITION: %v", err)
+	}
+
+	// Deferred: the child is not yet registered (invisible to other sessions).
+	if hasPartChild(im, parentOID, childOID) {
+		t.Fatalf("ATTACH inside a transaction registered tpc_2 immediately; want deferred to COMMIT")
+	}
+	if got := len(sess.pendingPartAttaches); got != 1 {
+		t.Fatalf("pendingPartAttaches len=%d, want 1", got)
+	}
+
+	// Commit applies the registration.
+	ApplyPendingPartitionAttaches(ctx, sess)
+	if !hasPartChild(im, parentOID, childOID) {
+		t.Fatalf("ApplyPendingPartitionAttaches did not register tpc_2 at commit")
+	}
+	if got := len(sess.pendingPartAttaches); got != 0 {
+		t.Fatalf("pendingPartAttaches len=%d after apply, want 0 (drained)", got)
+	}
+	childTbl, _ := im.LookupTableByOID(childOID)
+	if len(childTbl.PartitionBounds) != 1 || childTbl.PartitionBounds[0].From == "" {
+		t.Fatalf("child partition bounds not set at commit: %+v", childTbl.PartitionBounds)
+	}
+}
+
+// TestAttachPartitionImmediateInAutocommit is the control: ATTACH PARTITION in
+// autocommit (no explicit transaction) registers the partition immediately, as
+// before — the deferral applies only inside an explicit transaction.
+func TestAttachPartitionImmediateInAutocommit(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+	im := cat.(*catalog.InMemory)
+
+	for _, s := range []string{
+		"CREATE TABLE tpd (i int, j text) PARTITION BY RANGE (i)",
+		"CREATE TABLE tpd_def PARTITION OF tpd DEFAULT",
+		"CREATE TABLE tpd_2 (LIKE tpd)",
+	} {
+		if err := runDDL(t, ctx, s); err != nil {
+			t.Fatalf("setup %q: %v", s, err)
+		}
+	}
+	parentOID := func() uint32 {
+		tbl, _ := cat.LookupTable(parser.ObjectName{Name: "tpd"})
+		return tbl.OID
+	}()
+	childOID := func() uint32 {
+		tbl, _ := cat.LookupTable(parser.ObjectName{Name: "tpd_2"})
+		return tbl.OID
+	}()
+
+	if err := runDDL(t, ctx, "ALTER TABLE tpd ATTACH PARTITION tpd_2 FOR VALUES FROM (100) TO (200)"); err != nil {
+		t.Fatalf("ATTACH PARTITION: %v", err)
+	}
+	if !hasPartChild(im, parentOID, childOID) {
+		t.Fatalf("autocommit ATTACH did not register tpd_2 immediately")
 	}
 }

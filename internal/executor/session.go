@@ -66,6 +66,24 @@ type PendingIndexDrop struct {
 	SavepointDepth int                 // savepoint depth at drop time (for ROLLBACK TO cancel)
 }
 
+// PendingPartitionAttach records an ALTER TABLE … ATTACH PARTITION issued inside
+// an explicit transaction whose catalog registration is deferred until COMMIT.
+// Until the attaching transaction commits, the new partition is NOT registered in
+// the shared catalog, so a concurrent session does not see it and an INSERT
+// routing through the parent falls to the parent's DEFAULT partition (PG
+// transactional-DDL visibility: an uncommitted ATTACH is invisible to other
+// snapshots, exactly what the partition-concurrent-attach isolation spec needs to
+// make s2's insert route to the default and block on the default-partition lock).
+// The recorded fields are everything ApplyPendingPartitionAttaches needs to
+// perform the real registration at commit. In autocommit the attach stays
+// immediate. M0118-0008.
+type PendingPartitionAttach struct {
+	ParentOID      uint32                   // partitioned parent table OID
+	ChildOID       uint32                   // attached child table OID
+	Bounds         []catalog.PartitionBound // child relpartbound (nil if none computed)
+	SavepointDepth int                      // savepoint depth at attach time (ROLLBACK TO cancel)
+}
+
 // relPageSnapshot captures the full page contents of one relation before
 // a TRUNCATE so that ROLLBACK can restore them.
 type relPageSnapshot struct {
@@ -89,22 +107,23 @@ type SeqRestoreEntry struct {
 // BasicSession is a minimal Session implementation for the v0
 // executor path.
 type BasicSession struct {
-	isolation        mvcc.IsolationLevel
-	inTx             bool
-	tx               mvcc.Transaction
-	snap             mvcc.Snapshot
-	pendingDDL          []DDLUndoEntry      // DDL creates pending rollback
-	pendingRoutineDrops []*catalog.Routine  // routines dropped in current tx, for rollback
-	pendingTruncates    []TruncateUndoEntry // heap/index page snapshots for TRUNCATE rollback
-	pendingSeqRestores  []SeqRestoreEntry   // sequence counter restores for RESTART IDENTITY rollback
-	savepointDDLDrops   []DDLDropUndoEntry  // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
-	pendingIndexDrops   []PendingIndexDrop  // DROP INDEX deferred to COMMIT (M0118-0008)
-	subxactStack        mvcc.SubxactStack   // savepoint stack (M0050-0004)
-	currentSubXid       storage.TransactionID // 0 = use top-level tx.XID
-	txFailed            bool                // in_failed_sql_transaction (25P02)
-	txnReadOnly         bool                // true while inside a READ ONLY transaction (M0097-0024)
-	deferredFKChecks    []DeferredFKCheck   // INITIALLY DEFERRED FK checks (M0096-0011)
-	activeQueryTables   map[uint32]bool     // OIDs of tables currently in active DML (M0097-0023)
+	isolation           mvcc.IsolationLevel
+	inTx                bool
+	tx                  mvcc.Transaction
+	snap                mvcc.Snapshot
+	pendingDDL          []DDLUndoEntry           // DDL creates pending rollback
+	pendingRoutineDrops []*catalog.Routine       // routines dropped in current tx, for rollback
+	pendingTruncates    []TruncateUndoEntry      // heap/index page snapshots for TRUNCATE rollback
+	pendingSeqRestores  []SeqRestoreEntry        // sequence counter restores for RESTART IDENTITY rollback
+	savepointDDLDrops   []DDLDropUndoEntry       // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
+	pendingIndexDrops   []PendingIndexDrop       // DROP INDEX deferred to COMMIT (M0118-0008)
+	pendingPartAttaches []PendingPartitionAttach // ATTACH PARTITION deferred to COMMIT (M0118-0008)
+	subxactStack        mvcc.SubxactStack        // savepoint stack (M0050-0004)
+	currentSubXid       storage.TransactionID    // 0 = use top-level tx.XID
+	txFailed            bool                     // in_failed_sql_transaction (25P02)
+	txnReadOnly         bool                     // true while inside a READ ONLY transaction (M0097-0024)
+	deferredFKChecks    []DeferredFKCheck        // INITIALLY DEFERRED FK checks (M0096-0011)
+	activeQueryTables   map[uint32]bool          // OIDs of tables currently in active DML (M0097-0023)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -171,6 +190,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.pendingSeqRestores = nil
 	s.savepointDDLDrops = nil
 	s.pendingIndexDrops = nil
+	s.pendingPartAttaches = nil
 	s.subxactStack = mvcc.SubxactStack{}
 	s.currentSubXid = 0
 	s.txFailed = false
@@ -374,6 +394,36 @@ func (s *BasicSession) CancelPendingIndexDropsToDepth(depth int) {
 		}
 	}
 	s.pendingIndexDrops = keep
+}
+
+// AddPendingPartitionAttach records an ATTACH PARTITION whose catalog
+// registration is deferred until COMMIT (see PendingPartitionAttach). M0118-0008.
+func (s *BasicSession) AddPendingPartitionAttach(e PendingPartitionAttach) {
+	s.pendingPartAttaches = append(s.pendingPartAttaches, e)
+}
+
+// TakePendingPartitionAttaches drains and returns the deferred ATTACH PARTITION
+// entries. Called from the commit paths (ApplyPendingPartitionAttaches) to
+// perform the real registration; a full ROLLBACK simply lets
+// EndExplicitTransaction discard them. M0118-0008.
+func (s *BasicSession) TakePendingPartitionAttaches() []PendingPartitionAttach {
+	out := s.pendingPartAttaches
+	s.pendingPartAttaches = nil
+	return out
+}
+
+// CancelPendingPartitionAttachesToDepth discards deferred ATTACH PARTITION
+// entries recorded at savepoint depth >= depth, so ROLLBACK TO SAVEPOINT before a
+// deferred ATTACH does not still register the partition at the outer COMMIT.
+// Mirrors CancelPendingIndexDropsToDepth. M0118-0008.
+func (s *BasicSession) CancelPendingPartitionAttachesToDepth(depth int) {
+	keep := s.pendingPartAttaches[:0]
+	for _, e := range s.pendingPartAttaches {
+		if e.SavepointDepth < depth {
+			keep = append(keep, e)
+		}
+	}
+	s.pendingPartAttaches = keep
 }
 
 // MarkTableActive marks a table OID as currently being mutated by a DML
