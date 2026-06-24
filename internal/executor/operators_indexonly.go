@@ -56,6 +56,15 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		}
 		return err
 	}
+	// PostgreSQL locks every index of the scanned relation in AccessShare, not
+	// only the one this scan reads (get_relation_info opens them all). M0118-0008
+	// (partition-drop-index-locking).
+	if err := ctx.acquireScanIndexReadLocksTxn(o.plan.Table); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 
 	// M0118-0001: a SERIALIZABLE index-only scan takes a relation-level SIREAD
 	// predicate lock on the heap relation, exactly like the seq-scan and

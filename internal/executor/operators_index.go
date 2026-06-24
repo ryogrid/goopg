@@ -216,6 +216,15 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 		}
 		return err
 	}
+	// PostgreSQL locks every index of the scanned relation in AccessShare, not
+	// only the one this scan probes (get_relation_info opens them all). M0118-0008
+	// (partition-drop-index-locking).
+	if err := ctx.acquireScanIndexReadLocksTxn(o.plan.Table); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 	// M0118-0001: the SERIALIZABLE index-scan SIREAD predicate lock is no
 	// longer acquired eagerly here. Its granularity now depends on what the
 	// probe matches and is decided at the end of Rescan once the matching TID

@@ -765,6 +765,35 @@ func (c *Context) acquireScanReadLockTxn(rel storage.RelFileNode) error {
 	return c.acquireRelLockMaybeTransient(rel, lockmgr.AccessShareLock)
 }
 
+// acquireScanIndexReadLocksTxn takes a transaction-scoped ACCESS SHARE lock on
+// every index of tbl, mirroring PostgreSQL where the planner opens — and, for a
+// read, locks in AccessShare — ALL of a scanned relation's indexes regardless of
+// which scan method is finally chosen (get_relation_info → index_open with
+// AccessShareLock). A bare SELECT against a leaf partition therefore holds
+// AccessShare on the partition's own indexes too, so a concurrent DROP INDEX
+// (which AccessExclusive-locks the index relation tree, design 0118-0071) blocks
+// behind the still-open reader. This is the index-side companion to the
+// table-level acquireScanReadLockTxn and shares its confinement exactly: held to
+// end-of-transaction inside an explicit transaction block, acquired+released
+// transiently in autocommit, and system catalogs skipped (both via the
+// acquireScanReadLockTxn hook). AccessShare is self-compatible and conflicts
+// only with AccessExclusive, so concurrent reads never block on each other.
+// M0118-0008 (partition-drop-index-locking, blocker 2).
+func (c *Context) acquireScanIndexReadLocksTxn(tbl *catalog.Table) error {
+	if tbl == nil || c.Catalog == nil {
+		return nil
+	}
+	for _, idx := range c.Catalog.IndexesOnTable(tbl) {
+		if idx == nil {
+			continue
+		}
+		if err := c.acquireScanReadLockTxn(c.Catalog.IndexRelFileNode(idx)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // acquireWriteLockTxn takes a transaction-scoped ROW EXCLUSIVE heavyweight lock
 // on a relation a DML write (INSERT/UPDATE/DELETE) is about to modify, so a
 // concurrent CREATE TRIGGER / CREATE INDEX / ALTER TABLE (any acquirer of

@@ -1,56 +1,57 @@
-Loop #29: M0118-0008 — DROP INDEX locks the index relation tree (design 0118-0071).
-COMMITTED + pushed at loop end. NOT a promotion (closes "blocker 1" of 4).
+Loop #6 (this run): M0118-0008 — SELECT locks the scanned relation's indexes
+(design 0118-0072). COMMITTED + pushed at loop end. NOT a promotion (closes
+"blocker 2" of 4 for partition-drop-index-locking).
 
 ## What landed (enabler)
-execDropIndex (!s.Concurrent) now calls lockDropIndexTree(idx) acquiring locks in
-PG RangeVarCallbackForDropRelation order:
-1. lockDropIndexSelf — AccessExclusiveLock on the target index's own RelFileNode
-   (IndexRelFileNode), granted before any blocking.
-2. lockDropIndexTableTree — pre-existing heap partition-tree walk; BLOCKS on a leaf
-   partition a reader holds in ACCESS SHARE.
-3. lockDropIndexChildren — recurses InMemory.IndexPartitionChildren (the
-   PartitionParentOID/RegisterIndexPartitionChild linkage from 0118-0068),
-   AccessExclusiveLock each descendant child index; reached only after (2) unblocks.
-Order is load-bearing: acquireRelLockTxn genuinely blocks (AcquireWithTimeout), so
-1st s3getlocks shows target index granted + child indexes ABSENT, 2nd shows child
-indexes granted once DROP completes — both match PG. New locks are real tableLockMgr
-locks surfaced by the 0118-0070 bridge; no bridge/dedup change.
+New helper (*Context).acquireScanIndexReadLocksTxn(tbl) in context.go: enumerates
+Catalog.IndexesOnTable(tbl) and AccessShare-locks each via the existing
+acquireScanReadLockTxn hook (held-to-commit in explicit txn / transient in
+autocommit / system catalogs skipped). Wired into all 3 scan-open paths that
+already take the table AccessShare lock:
+- seq scan: operators_storage.go (o.tbl)
+- index scan: operators_index.go openPrep (o.plan.Table)
+- index-only scan: operators_indexonly.go (o.plan.Table)
+PG locks ALL indexes of a scanned relation (get_relation_info→index_open), not
+just the probed one — so a bare SELECT on a leaf partition now appears in pg_locks
+holding AccessShare on its indexes, blocking a concurrent DROP INDEX (0118-0071).
 
-Files: internal/executor/operators_ddl.go (lockDropIndexTree + lockDropIndexSelf +
-lockDropIndexChildren, comment update at execDropIndex), partition_drop_index_lock_test.go
-(new), docs/design/0118-0071-*.md + README index, deferral_ledger.md.
+Files: internal/executor/context.go (helper), operators_storage.go,
+operators_index.go, operators_indexonly.go (wiring),
+partition_drop_index_lock_test.go (new TestSelectLocksLeafPartitionIndexes),
+docs/design/0118-0072-*.md + README index, deferral_ledger.md.
 
-Key symbols: lockDropIndexTree, lockDropIndexSelf, lockDropIndexChildren,
-catalog.InMemory.IndexPartitionChildren, IndexRelFileNode, acquireDDLLockTxn.
-
-Gates: new TestDropIndexLocksIndexRelationTree + TestCreateIndexRecursesPartitionTree
-PASS; no regression DropIndexConcurrently1/LockNowait/AlterTable1/2/3/CreateTrigger
-(59s); go test -race ./internal/lockmgr/; go build ./... clean; pgbench smoke=pre-commit.
+Key symbols: acquireScanIndexReadLocksTxn, acquireScanReadLockTxn,
+catalog.IndexesOnTable, catalog.IndexRelFileNode.
 
 ## Probe result (2026-06-24)
-1st s3getlocks now has part_drop_index_locking_idx AccessExclusive|t (was missing);
-2nd has _subpart_child_id_idx + _subpart_id_idx AccessExclusive|t. DROP-side rows
-match PG. Remaining first-getlocks gap = 2 SELECT-index AccessShare rows (blocker 2)
-+ empty query column (blocker 3).
+1st s3getlocks now shows the open SELECT holding AccessShareLock|t on the leaf
+table + BOTH leaf indexes (_subpart_child_id_idx{,1}) — 3 rows previously absent.
+DROP-side rows unchanged. Spec still `defer`. Remaining first-getlocks gap is now
+only the empty query column (blocker 3); 2nd getlocks shows 5 vs 6 rows (blocker 4).
 
 ## partition-drop-index-locking remaining blockers (resume point)
-2. **SELECT locks the leaf's INDEXES** (mechanical, NEXT): acquireScanReadLockTxn
-   (context.go:760) locks the table only; missing rows = _subpart_child_id_idx{,1}
-   AccessShare|t in 1st s3getlocks. Lock the leaf's indexes during the scan-open.
-3. **pg_stat_activity idle-query retention**: s.query empty for idle-in-txn backends;
-   goopg clears Query on return to idle (activity/registry.go UpdateState
-   `else if state=="idle"`); PG retains the most-recent query for idle-in-txn.
+3. **pg_stat_activity idle-query retention**: s.query empty for idle-in-txn
+   backends; goopg clears Query on return to idle (activity/registry.go
+   UpdateState `else if state=="idle"`) and drops trailing ';'. PG retains the
+   most-recent query for idle-in-txn. NEXT (mechanical-ish).
 4. **Transactional-DDL cross-session catalog visibility** (MILESTONE-SIZED, shared
-   with alter-table-4 / partition-concurrent-attach): 2nd s3getlocks must still show
-   the dropped index's pg_class row + locks until s2commit; goopg removes from the
-   shared in-memory catalog synchronously.
+   with alter-table-4 / partition-concurrent-attach): 2nd s3getlocks must still
+   show the dropped index's pg_class row + locks until s2commit; goopg removes
+   from the shared in-memory catalog synchronously (5 vs 6 rows).
 
-Next step: blocker (2) — SELECT taking AccessShare on the leaf's indexes during scan
-open (mechanical). Then idle-query retention (3) + the txnl-DDL visibility milestone (4).
+Next step: blocker (3) idle-query retention — retain the last query text (with
+trailing ';') for idle-in-transaction backends in activity/registry.go so the
+s3getlocks `query` column matches. Then the txnl-DDL visibility milestone (4).
 
 ## M0118-0008 hard tail (all Effort-L, deferred)
-- partition-drop-index-locking: blockers 2/3/4 above.
+- partition-drop-index-locking: blockers 3/4 above.
 - alter-table-4 + partition-concurrent-attach: transactional-DDL cross-session
   catalog visibility (milestone-sized MVCC catalog subsystem).
 - reindex-concurrently-toast: real TOAST relations (reltoastrelid=0; text inline).
 - WHERE CURRENT OF positioned UPDATE/DELETE: project-wide, parsed (CurrentOf) no executor site.
+
+Gates run: go build ./... clean; TestSelectLocksLeafPartitionIndexes +
+TestDropIndexLocksIndexRelationTree + TestCreateIndexRecursesPartitionTree PASS;
+full ./internal/executor/ PASS; -race ./internal/lockmgr/; isolation no-regression
+batch (Reindex*/MultipleCic/DropIndexConcurrently1/InheritTemp/CreateTrigger/
+Truncate-Vacuum-Cluster-Conflict/AlterTable1-2-3) PASS; pgbench smoke=pre-commit.

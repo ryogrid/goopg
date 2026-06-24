@@ -716,6 +716,16 @@ func (o *seqScanOp) Open(ctx *Context) error {
 		}
 		return err
 	}
+	// PostgreSQL locks every index of a scanned relation in AccessShare too
+	// (get_relation_info opens all indexes regardless of the chosen scan method),
+	// so a bare SELECT on a leaf partition blocks a concurrent DROP INDEX behind
+	// the open reader. M0118-0008 (partition-drop-index-locking).
+	if err := ctx.acquireScanIndexReadLocksTxn(o.tbl); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.pos
+		}
+		return err
+	}
 	// Scanning a partition THROUGH its partitioned parent locks the parent
 	// (AccessShare) as well — PostgreSQL locks the whole hierarchy from the
 	// queried root. A concurrent AccessExclusive holder on the parent (e.g. a

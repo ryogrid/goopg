@@ -7,6 +7,80 @@ import (
 	"github.com/goopg/goopg/internal/parser"
 )
 
+// TestSelectLocksLeafPartitionIndexes verifies that a bare SELECT on a leaf
+// partition takes a transaction-scoped AccessShare lock not only on the leaf
+// table but on EVERY index of that leaf, mirroring PostgreSQL (get_relation_info
+// opens — and AccessShare-locks for a read — all of a scanned relation's
+// indexes). This is blocker 2 of the partition-drop-index-locking isolation spec
+// (M0118-0008): the spec's s3getlocks lists the open SELECT holding AccessShare
+// on the leaf's `..._subpart_child_id_idx` and `..._subpart_child_id_idx1`, which
+// is what makes a concurrent DROP INDEX block behind the reader.
+func TestSelectLocksLeafPartitionIndexes(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	// Explicit-transaction backend so the AccessShare scan locks are held to
+	// end-of-transaction (acquireScanReadLockTxn is transient in autocommit).
+	const backend lockmgr.BackendID = 91002
+	ctx.TxnLockBackendID = backend
+	defer tableLockMgr.ReleaseAll(backend)
+
+	for _, s := range []string{
+		"CREATE TABLE part_dil (id int) PARTITION BY RANGE(id)",
+		"CREATE TABLE part_dil_subpart PARTITION OF part_dil FOR VALUES FROM (1) TO (100) PARTITION BY RANGE(id)",
+		"CREATE TABLE part_dil_subpart_child PARTITION OF part_dil_subpart FOR VALUES FROM (1) TO (100)",
+		"CREATE INDEX part_dil_idx ON part_dil(id)",
+		"CREATE INDEX part_dil_subpart_idx ON part_dil_subpart(id)",
+	} {
+		if err := runDDL(t, ctx, s); err != nil {
+			t.Fatalf("runDDL(%q): %v", s, err)
+		}
+	}
+
+	leafOID := func(name string) uint32 {
+		tbl, ok := cat.LookupTable(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("table %q not found", name)
+		}
+		return tbl.OID
+	}
+	idxOID := func(name string) uint32 {
+		idx, ok := cat.LookupIndex(parser.ObjectName{Name: name})
+		if !ok {
+			t.Fatalf("index %q not found", name)
+		}
+		return idx.OID
+	}
+	leafTbl := leafOID("part_dil_subpart_child")
+	leafIdx1 := idxOID("part_dil_subpart_child_id_idx")  // from part_dil_idx
+	leafIdx2 := idxOID("part_dil_subpart_child_id_idx1") // from part_dil_subpart_idx
+
+	if _, err := runQueryWithErr(ctx, "SELECT * FROM part_dil_subpart_child"); err != nil {
+		t.Fatalf("SELECT: %v", err)
+	}
+
+	held := make(map[uint32]bool)
+	for _, h := range tableLockMgr.AllLocks() {
+		if h.Backend == backend && h.Granted && h.Mode == lockmgr.AccessShareLock &&
+			h.Tag.Block == 0 && h.Tag.Offset == 0 {
+			held[h.Tag.Rel] = true
+		}
+	}
+
+	for _, w := range []struct {
+		name string
+		oid  uint32
+	}{
+		{"part_dil_subpart_child (leaf table)", leafTbl},
+		{"part_dil_subpart_child_id_idx (leaf index)", leafIdx1},
+		{"part_dil_subpart_child_id_idx1 (leaf index)", leafIdx2},
+	} {
+		if !held[w.oid] {
+			t.Errorf("expected AccessShareLock on %s (oid %d); held=%v", w.name, w.oid, held)
+		}
+	}
+}
+
 // TestDropIndexLocksIndexRelationTree verifies that DROP INDEX (non-CONCURRENTLY)
 // inside an explicit transaction AccessExclusive-locks the index relation itself
 // AND every partition-descendant child index, in addition to the table tree.
