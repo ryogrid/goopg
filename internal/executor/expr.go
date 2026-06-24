@@ -5854,6 +5854,22 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 		}
 		return NewIntDatum(0), nil
+	case "pg_my_temp_schema":
+		// pg_my_temp_schema() → oid: the OID of the current session's temporary
+		// namespace (pg_temp_<id>), or 0 (InvalidOid) if the session has not
+		// created a temporary object. goopg models the per-backend temp namespace
+		// in the shared catalog keyed by the session's temp-owner token; the
+		// namespace is established lazily on the first CREATE TEMPORARY object and
+		// persists until the session exits (matching PostgreSQL, which reuses
+		// pg_temp_N even after every temp object is dropped). M0118-0009
+		// (temp-schema-cleanup, design 0118-0091).
+		if ctx != nil {
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+				oid := im.TempNamespaceOID(sessionTempOwner(ctx))
+				return NewIntDatum(int64(oid)), nil
+			}
+		}
+		return NewIntDatum(0), nil
 	case "pg_cancel_backend":
 		// pg_cancel_backend(pid int4) → bool: signal the backend whose
 		// pg_backend_pid() == pid to cancel its currently-executing query (the

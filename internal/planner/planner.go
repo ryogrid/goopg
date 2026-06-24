@@ -8735,6 +8735,10 @@ func exprType(e Expr) catalog.Type {
 		case "bt_index_check", "bt_index_parent_check":
 			// amcheck verification functions RETURN void (slice S4 of 0110-0008).
 			return catalog.Type{Name: "void"}
+		case "pg_my_temp_schema":
+			// Returns the OID of the session's temporary namespace (0 if none).
+			// M0118-0009 (temp-schema-cleanup).
+			return catalog.Type{Name: "oid"}
 		case "round", "ceil", "ceiling", "floor", "trunc", "sign":
 			// Preserve input numeric type; default to numeric when unknown.
 			if len(x.Args) > 0 {

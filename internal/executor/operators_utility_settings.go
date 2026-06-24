@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
@@ -123,6 +124,19 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 				o.ctx.LastSeqSet = false
 				o.ctx.LastSeqVal = 0
 				o.ctx.LastSeqName = ""
+			}
+		}
+		// DISCARD TEMP / TEMPORARY (and DISCARD ALL) drop every temporary
+		// relation owned by the calling session. The session's temp namespace
+		// (pg_temp_<id>) itself persists — PostgreSQL keeps the namespace for the
+		// life of the backend and reuses it. A subsequent cross-session scan of
+		// pg_class WHERE relnamespace = pg_my_temp_schema() therefore finds no
+		// rows. M0118-0009 (temp-schema-cleanup, design 0118-0091).
+		if stmt.Mode == "TEMP" || stmt.Mode == "ALL" {
+			if o.ctx != nil {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					im.DropSessionTempObjects(sessionTempOwner(o.ctx))
+				}
 			}
 		}
 		return nil, EOF

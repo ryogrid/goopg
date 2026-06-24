@@ -1547,6 +1547,24 @@ func TestPort_IsolationSubxidOverflow(t *testing.T) {
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/subxid-overflow.spec")
 }
 
+// TestPort_IsolationTempSchemaCleanup exercises the temp-schema-cleanup spec
+// (M0118-0009, design 0118-0091). Permutation 1 (DISCARD TEMP cleanup) passes
+// on the per-session temp-namespace model + pg_my_temp_schema() + DISCARD TEMP
+// drop landed this loop and is hard-guarded by
+// TestSyntax_TempSchema_MyTempSchemaAndDiscard. Permutation 2 (backend
+// self-termination via pg_terminate_backend, session-exit temp+namespace
+// cleanup with advisory-lock release ordering, the isolationtester
+// connection-death "FATAL / server closed the connection unexpectedly"
+// rendering, and temp-type dependency cascade of uses_a_temp_type) is deferred
+// — this anchor runIsoSpec()-skips until the whole spec matches byte-for-byte.
+func TestPort_IsolationTempSchemaCleanup(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_temp_schema_cleanup")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/temp-schema-cleanup.spec")
+}
+
 // TestPort_IsolationDeadlockSimple exercises the deadlock-simple spec: two
 // sessions each take ACCESS SHARE on a1, then each attempts a lock upgrade to
 // ACCESS EXCLUSIVE. Neither upgrade can complete until the other releases its

@@ -1669,6 +1669,19 @@ type InMemory struct {
 	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
 	schemas map[string]uint32
 
+	// tempNamespaces maps a session's temp-owner token ("s<id>", see
+	// executor.sessionTempOwner) → the OID of that session's temporary
+	// namespace (pg_temp_<id>). In PostgreSQL every backend that creates a
+	// temporary object gets a per-backend namespace (pg_temp_N); pg_class /
+	// pg_proc / pg_type entries for its temp objects carry that namespace OID,
+	// pg_my_temp_schema() returns it, and the namespace persists (in the shared
+	// pg_namespace catalog) for the life of the backend even after its temp
+	// objects are dropped. goopg keeps one shared in-memory catalog, so we model
+	// the per-backend namespace here: an entry is allocated lazily on the first
+	// CREATE TEMPORARY object (EnsureTempNamespace) and removed on session exit
+	// (DropTempNamespace). M0118-0009 (temp-schema-cleanup, design 0118-0091).
+	tempNamespaces map[string]uint32
+
 	// roles tracks user-created roles (CREATE ROLE / CREATE USER). Used by
 	// DROP ROLE IF EXISTS to produce proper "does not exist" notices.
 	// M0097-drop_if_exists.
@@ -1985,6 +1998,7 @@ func NewInMemory() *InMemory {
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
 		roles:          make(map[string]struct{}),
+		tempNamespaces: make(map[string]uint32),
 		tableACLs:      make(map[uint32]map[string]map[string]struct{}),
 		comments:       make(map[commentKey]string),
 		statisticsObjs: make(map[string]*StatisticsObject),
@@ -3147,6 +3161,17 @@ func (c *InMemory) registerSystemTables() {
 			nsOID := c.schemas[strings.ToLower(schema)]
 			if nsOID == 0 {
 				nsOID = 2200 // default to public
+			}
+			// A temporary relation lives in its owning session's per-backend
+			// namespace (pg_temp_<id>), not public — mirrors PostgreSQL so a
+			// `WHERE relnamespace = pg_my_temp_schema()` scan finds it (and finds
+			// nothing once it is cleaned up). M0118-0009 (temp-schema-cleanup,
+			// design 0118-0091). Falls back to the schema OID for legacy
+			// session-less temp relations (TempOwner == "").
+			if t.Temp && t.TempOwner != "" {
+				if tns := c.tempNamespaceOIDLocked(t.TempOwner); tns != 0 {
+					nsOID = tns
+				}
 			}
 			hasIdx := "f"
 			if len(c.byTable[t.OID]) > 0 {
@@ -7287,14 +7312,84 @@ func (c *InMemory) allSchemasLocked() []struct {
 	out := make([]struct {
 		name string
 		oid  uint32
-	}, 0, len(c.schemas))
+	}, 0, len(c.schemas)+len(c.tempNamespaces))
 	for name, oid := range c.schemas {
 		out = append(out, struct {
 			name string
 			oid  uint32
 		}{name, oid})
 	}
+	// Surface each session's temporary namespace (pg_temp_<id>) so a
+	// cross-session pg_namespace join and pg_my_temp_schema()'s OID resolve
+	// to a real catalog row, mirroring PostgreSQL's shared pg_namespace.
+	// M0118-0009 (temp-schema-cleanup, design 0118-0091).
+	for owner, oid := range c.tempNamespaces {
+		out = append(out, struct {
+			name string
+			oid  uint32
+		}{tempNamespaceName(owner), oid})
+	}
 	return out
+}
+
+// tempNamespaceName renders the pg_temp_<id> namespace name for a temp-owner
+// token ("s<id>" → "pg_temp_<id>"). Mirrors PostgreSQL's pg_temp_N naming.
+func tempNamespaceName(owner string) string {
+	return "pg_temp_" + strings.TrimPrefix(owner, "s")
+}
+
+// EnsureTempNamespace lazily allocates and returns the OID of the temporary
+// namespace owned by the session identified by owner ("s<id>"). Called from the
+// CREATE TEMPORARY path on first temp-object creation. Idempotent: a session's
+// temp namespace persists for the rest of its life (PostgreSQL reuses pg_temp_N
+// even after every temp object is dropped). A blank owner (session-less context)
+// gets no namespace and returns 0. M0118-0009 (temp-schema-cleanup, 0118-0091).
+func (c *InMemory) EnsureTempNamespace(owner string) uint32 {
+	if owner == "" {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if oid, ok := c.tempNamespaces[owner]; ok {
+		return oid
+	}
+	oid := c.nextOID
+	c.nextOID++
+	c.tempNamespaces[owner] = oid
+	return oid
+}
+
+// TempNamespaceOID returns the OID of owner's temporary namespace, or 0 if the
+// session has not created one. Backs pg_my_temp_schema(). M0118-0009.
+func (c *InMemory) TempNamespaceOID(owner string) uint32 {
+	if owner == "" {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.tempNamespaces[owner]
+}
+
+// DropTempNamespace removes owner's temporary namespace registration. Called on
+// session exit, after the session's temp objects have been dropped, so a later
+// cross-session pg_namespace scan no longer sees the dead pg_temp_<id> row.
+// M0118-0009 (temp-schema-cleanup, design 0118-0091).
+func (c *InMemory) DropTempNamespace(owner string) {
+	if owner == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.tempNamespaces, owner)
+}
+
+// tempNamespaceOIDLocked is the lock-free variant for callers already holding
+// c.mu (e.g. the pg_class VirtualRows builder).
+func (c *InMemory) tempNamespaceOIDLocked(owner string) uint32 {
+	if owner == "" {
+		return 0
+	}
+	return c.tempNamespaces[owner]
 }
 
 // RoleExists reports whether a role with the given name has been registered.
@@ -7499,6 +7594,39 @@ func (c *InMemory) DropTable(name parser.ObjectName) error {
 	delete(c.tables, k)
 	delete(c.tableACLs, tbl.OID) // forget any granted privileges (M0118-0008)
 	return nil
+}
+
+// DropSessionTempObjects removes every temporary relation owned by the session
+// identified by owner ("s<id>"), along with their indexes and ACLs. It backs
+// DISCARD TEMP (drop the calling session's temp objects, keep the namespace) and
+// connection teardown (full cleanup). It does NOT remove the temp namespace
+// itself — DISCARD TEMP keeps it (PostgreSQL reuses pg_temp_N), and session exit
+// calls DropTempNamespace separately. Returns the number of relations dropped.
+// M0118-0009 (temp-schema-cleanup, design 0118-0091).
+func (c *InMemory) DropSessionTempObjects(owner string) int {
+	if owner == "" {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var victims []string
+	for k, t := range c.tables {
+		if t != nil && t.Temp && t.TempOwner == owner {
+			victims = append(victims, k)
+		}
+	}
+	for _, k := range victims {
+		tbl := c.tables[k]
+		if idxs, ok := c.byTable[tbl.OID]; ok {
+			for idxKey := range idxs {
+				delete(c.indexes, idxKey)
+			}
+			delete(c.byTable, tbl.OID)
+		}
+		delete(c.tables, k)
+		delete(c.tableACLs, tbl.OID)
+	}
+	return len(victims)
 }
 
 // DropIndex removes an index from the catalog.

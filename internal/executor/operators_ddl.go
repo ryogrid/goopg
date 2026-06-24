@@ -1949,6 +1949,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.Temp = s.Temporary
 	if s.Temporary {
 		tbl.TempOwner = sessionTempOwner(o.ctx)
+		// Lazily establish the session's per-backend temp namespace
+		// (pg_temp_<id>) so the relation renders in it and
+		// pg_my_temp_schema() resolves. M0118-0009 (temp-schema-cleanup).
+		if tbl.TempOwner != "" {
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				im.EnsureTempNamespace(tbl.TempOwner)
+			}
+		}
 	}
 	tbl.Fillfactor = fillfactor
 	tbl.ParallelWorkers = parallelWorkers
@@ -2939,6 +2947,11 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	tbl.Temp = s.Temporary
 	if s.Temporary {
 		tbl.TempOwner = sessionTempOwner(o.ctx)
+		if tbl.TempOwner != "" {
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				im.EnsureTempNamespace(tbl.TempOwner)
+			}
+		}
 	}
 	// Persist the leaf partition's fillfactor so pg_class.reloptions surfaces it
 	// and pg_dump re-emits `WITH (fillfactor='N')`. DU-002 slice 191.
