@@ -1363,6 +1363,15 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			// Partition children may have columns in a different order (ATTACH
 			// PARTITION allows mismatched column order). M0096-0013.
 			partRow := remapRowForPartition(o.plan.Table.Columns, partTable.Columns, row)
+			// Default-partition constraint (M0118-0008, design 0118-0078): a row
+			// routed to (or directly inserted into) a default partition must not
+			// belong to a non-default sibling. After a concurrent ATTACH PARTITION
+			// commits, the new sibling is visible by the time this INSERT's lock is
+			// granted, so re-routing claims the row and we raise 23514 —
+			// partition-concurrent-attach.
+			if cerr := checkDefaultPartitionInsertConstraint(o.ctx, partTable, partTable.Columns, partRow, o.plan.Pos()); cerr != nil {
+				return nil, cerr
+			}
 			// NOT NULL check at the leaf partition level (PG names the child table).
 			for i, col := range partTable.Columns {
 				if col.NotNull && i < len(partRow) && partRow[i].IsNull() {
@@ -1402,6 +1411,13 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			continue
 		}
 		// No matching partition found (or non-partitioned) — write to parent.
+		// If the target is itself a (non-partitioned) partition child, enforce its
+		// partition constraint — a direct INSERT into a leaf default partition must
+		// not write a row owned by a non-default sibling (design 0118-0078). No-op
+		// for non-partition-child tables (the walk exits when there is no parent).
+		if cerr := checkDefaultPartitionInsertConstraint(o.ctx, o.plan.Table, cols, row, o.plan.Pos()); cerr != nil {
+			return nil, cerr
+		}
 		if uerr := checkUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, o.plan.Pos()); uerr != nil {
 			return nil, uerr
 		}
@@ -1765,6 +1781,134 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 		}
 	}
 	return child, nil
+}
+
+// checkDefaultPartitionInsertConstraint enforces a DEFAULT partition's partition
+// constraint at INSERT time: a row written into (or routed to) a default partition
+// must NOT belong to any of its non-default sibling partitions. PostgreSQL attaches
+// this implicit constraint (the negation of every sibling's bounds) to the default
+// partition and checks it on every insert — direct or partition-routed — via
+// ExecPartitionCheck. goopg has no per-row partition-constraint expression, so we
+// reconstruct the check from the live catalog: walk the leaf's partition ancestry
+// and, for every ancestor that is a DEFAULT partition, re-route the row's
+// corresponding parent partition-key value through the parent's scheme; if it lands
+// on a non-default sibling, the default's constraint is violated.
+//
+// This is what makes partition-concurrent-attach fail correctly: when a concurrent
+// ALTER TABLE … ATTACH PARTITION commits while this INSERT is blocked on the default
+// partition's lock, the newly attached non-default sibling is visible by the time
+// the lock is granted, so the re-routing now claims the row and we raise 23514 —
+// exactly as PG (design 0118-0078). leafCols/leafRow are in the routed leaf's column
+// order; a partition child always carries every ancestor partition-key column by
+// name, so an ancestor's key resolves directly from a leaf-ordered row. Returns nil
+// when no default ancestor claims the row (the normal case, including ordinary
+// routing to a default that legitimately owns the value).
+func checkDefaultPartitionInsertConstraint(ctx *Context, leaf *catalog.Table, leafCols []catalog.Column, leafRow Row, pos int) error {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	cur := leaf
+	for guard := 0; cur != nil && cur.PartitionParentOID != 0 && guard < 8; guard++ {
+		parent, ok := im.LookupTableByOID(cur.PartitionParentOID)
+		if !ok || parent == nil {
+			break
+		}
+		if isDefaultPartitionChild(cur) {
+			sib := routePartitionKeyToImmediateChild(parent, leafCols, leafRow, im, ctx)
+			if sib != nil && sib.OID != cur.OID {
+				return &ExecError{Code: "23514", Pos: pos,
+					Message: fmt.Sprintf("new row for relation %q violates partition constraint", cur.Name)}
+			}
+		}
+		cur = parent
+	}
+	return nil
+}
+
+// isDefaultPartitionChild reports whether t is a DEFAULT partition.
+func isDefaultPartitionChild(t *catalog.Table) bool {
+	for _, pb := range t.PartitionBounds {
+		if pb.IsDefault {
+			return true
+		}
+	}
+	return false
+}
+
+// routePartitionKeyToImmediateChild routes a row to the IMMEDIATE partition child
+// of parent (no recursion into sub-partitions), reading parent's partition-key
+// columns by NAME from leafCols/leafRow. Returns nil for unsupported key shapes
+// (expression keys, HASH) so the caller never raises a false-positive constraint
+// violation.
+func routePartitionKeyToImmediateChild(parent *catalog.Table, leafCols []catalog.Column, leafRow Row, im *catalog.InMemory, ctx *Context) *catalog.Table {
+	if len(parent.PartitionKey) == 0 {
+		return nil // expression-key partitioning: out of scope, no false positive
+	}
+	resolve := func(name string) (Datum, bool) {
+		for idx, c := range leafCols {
+			if strings.EqualFold(c.Name, name) && idx < len(leafRow) {
+				return leafRow[idx], true
+			}
+		}
+		return NullDatum, false
+	}
+	switch parent.PartitionMethod {
+	case "RANGE":
+		keyStrs := make([]string, 0, len(parent.PartitionKey))
+		for _, kc := range parent.PartitionKey {
+			d, ok := resolve(kc)
+			if !ok {
+				return nil
+			}
+			keyStrs = append(keyStrs, partitionKeyDatumToRangeStr(d))
+		}
+		return im.FindRangePartitionForDatums(parent.OID, keyStrs)
+	case "LIST":
+		d, ok := resolve(parent.PartitionKey[0])
+		if !ok {
+			return nil
+		}
+		return im.FindPartitionForValue(parent.OID, partitionKeyDatumToListStr(d))
+	}
+	return nil
+}
+
+// partitionKeyDatumToRangeStr formats a datum the way FindRangePartitionForDatums
+// expects (mirrors the RANGE arm of routeToPartitionDepth).
+func partitionKeyDatumToRangeStr(d Datum) string {
+	switch d.Kind {
+	case KindInt:
+		return fmt.Sprintf("%d", d.Int)
+	case KindString, KindNumeric:
+		return d.StringValue()
+	default:
+		if d.IsNull() {
+			return "null"
+		}
+		return d.Format()
+	}
+}
+
+// partitionKeyDatumToListStr formats a datum the way FindPartitionForValue expects
+// (mirrors the LIST arm of routeToPartitionDepth).
+func partitionKeyDatumToListStr(d Datum) string {
+	switch d.Kind {
+	case KindInt:
+		return fmt.Sprintf("%d", d.Int)
+	case KindString:
+		return d.StringValue()
+	case KindBool:
+		if d.Int != 0 {
+			return "true"
+		}
+		return "false"
+	default:
+		if d.IsNull() {
+			return "null"
+		}
+		return d.Format()
+	}
 }
 
 // extractScanAndPredicate walks an Update/Delete child plan and pulls

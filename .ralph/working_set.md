@@ -1,57 +1,59 @@
-Loop #11 (this run): M0118-0008 — `partition-concurrent-attach` **enabler 0118-0077**
-(NOT a promotion). Landed piece (a): deferred-until-commit ATTACH visibility. COMMITTED.
-Spec stays `defer`.
+Loop #12 (this run): M0118-0008 — `partition-concurrent-attach` **enabler 0118-0078**
+(NOT a promotion). Landed piece (c): INSERT-time DEFAULT partition constraint
+enforcement. COMMITTED + pushed. Spec stays `defer`.
 
-## What landed
-`ALTER TABLE … ATTACH PARTITION` (non-default, inside an explicit txn) now DEFERS
-its catalog registration (RegisterPartitionChild + PartitionBounds) to COMMIT, so
-the uncommitted new partition is invisible to other sessions and a concurrent
-INSERT routes to the DEFAULT partition (where it blocks on piece (b)'s
-AccessExclusiveLock). Mirrors 0118-0074 DROP INDEX deferral, opposite direction
-(keep invisible vs visible).
+## What landed (piece (c))
+`insertOp.Next` now enforces a DEFAULT partition's implicit constraint at INSERT
+time (PG `ExecPartitionCheck`). New `checkDefaultPartitionInsertConstraint(ctx,
+leaf, leafCols, leafRow, pos)` in operators_storage.go walks `PartitionParentOID`
+ancestry; for every ancestor that IS a default partition it re-routes the row's
+parent partition-key value ONE level via `routePartitionKeyToImmediateChild`
+(→ `FindRangePartitionForDatums`/`FindPartitionForValue`); a NON-default sibling
+match ⇒ `23514 new row for relation "<default>" violates partition constraint`.
+Wired at BOTH heap-write sites: routed-leaf path (on partTable/partRow) + the
+non-partitioned path (on o.plan.Table, for a direct insert into a leaf default).
+Reads the LIVE catalog AFTER the INSERT's RowExclusiveLock is granted (the
+0118-0076/0077 wait), so it sees the just-committed sibling — PG's
+route-pre-commit / check-post-commit. No-op in ordinary operation.
+Helpers: `isDefaultPartitionChild`, `partitionKeyDatumToRangeStr/ListStr`.
 
-- session.go: PendingPartitionAttach{ParentOID,ChildOID,Bounds,SavepointDepth} +
-  pendingPartAttaches slice + AddPendingPartitionAttach/TakePendingPartitionAttaches/
-  CancelPendingPartitionAttachesToDepth; EndExplicitTransaction nils it.
-- operators_ddl.go: AlterTableAttachPartition case computes boundsToSet, records a
-  PendingPartitionAttach when InExplicitTransaction over *InMemory (else immediate);
-  new ApplyPendingPartitionAttaches(ctx,sess) (LookupTableByOID → set bounds →
-  RegisterPartitionChild).
-- operators_tx.go: ApplyPendingPartitionAttaches in execCommit (beside
-  ApplyPendingIndexDrops) + CancelPendingPartitionAttachesToDepth in rollbackToSavepoint.
-- dispatch.go: ApplyPendingPartitionAttaches in TxCommit branch.
-- attach_default_lock_test.go: +TestAttachPartitionDeferredUntilCommit /
-  +TestAttachPartitionImmediateInAutocommit.
-- design 0118-0077 + README index; ledger.
+Files: internal/executor/operators_storage.go (helpers ~after routeToPartitionDepth
++ 2 call sites in insertOp.Next), internal/executor/default_partition_constraint_test.go
+(NEW: TestDefaultPartitionInsertConstraint + TestDefaultPartitionConstraintSubPartitioned),
+docs/design/0118-0078 + README index; ledger.
 
-Key symbols: PendingPartitionAttach, ApplyPendingPartitionAttaches,
-AlterTableAttachPartition case, CancelPendingPartitionAttachesToDepth.
+## Spec state (probed) — partition-concurrent-attach (3 perms)
+- perm 2 (`s2i2` direct INSERT INTO tpart_default): **NOW byte-for-byte PG** —
+  waits, completes, ERRORs 23514, final 3 rows. ✓
+- perm 1 (`s2i` INSERT INTO tpart, routes THROUGH default): does NOT yet wait —
+  goopg locks only the routed leaf, not the intermediate tpart_default along the
+  routing path, so the re-route runs before tpart_2 commits → row lands (6 rows).
+- perm 3 (reverse: s2i first, then s1a attach): attach doesn't wait for s2's
+  routed insert. Attach-side leaf re-scan ALREADY exists
+  (`checkDefaultPartitionDataConflict` → 23P01 "updated partition constraint for
+  default partition tpart_default_default would be violated by some row").
 
-## partition-concurrent-attach — remaining pieces (probed)
-Probe after (a): permutation 2 (s2i2 = direct INSERT into tpart_default) NOW shows
-`<waiting ...>`/`<... completed>` ✓. Remaining to PROMOTE:
-- perm 1 (INSERT INTO tpart, routes THROUGH the default subtree): goopg locks only
-  the routed leaf, not the intermediate tpart_default — so s2i does NOT wait. Needs
-  INSERT routing to take RowExclusiveLock on EACH partition along the routing path.
-- piece (c): post-wait constraint re-validation — perm 1/2 must ERROR "new row for
-  relation tpart_default violates partition constraint"; perm 3 reverse: attach
-  waits for s2's insert then re-scans the default leaf → "updated partition
-  constraint for default partition tpart_default_default would be violated".
-These are milestone-sized per-session MVCC-catalog + routing-lock work, shared with
-alter-table-4.
+## Next step (next enabler): INSERT routing-path locks
+Make INSERT routing take a `RowExclusiveLock` on EACH partition along the routing
+path (not just the routed leaf) — esp. the intermediate DEFAULT partition. Then:
+- perm 1: s2i's route-to-default takes RowExclusiveLock on tpart_default → blocks
+  behind s1's AccessExclusiveLock (0118-0076) → after s1c the constraint re-route
+  (already landed) sees tpart_2 → 23514. Likely fully fixes perm 1.
+- perm 3: s2i's routed insert holds RowExclusiveLock on tpart_default → s1a's
+  attach AccessExclusiveLock on the default contends → attach waits for s2c →
+  re-scan (existing) finds the committed rows → 23P01. Likely fully fixes perm 3.
+If perms 1+3 both go green, the spec PROMOTES. Routing-path lock site: insertOp
+routing in operators_storage.go (~line 1335, routeToPartition); take the write
+lock on each intermediate parent along the path, mirroring PG ExecInsert's
+`ExecGetTriggerResultRel`/partition lock acquisition. Milestone-shared w/ alter-table-4.
 
 ## M0118-0008 hard tail (remaining, all Effort-L)
-- alter-table-4 + partition-concurrent-attach: per-session MVCC catalog visibility +
-  routing-path locks + post-wait constraint re-validation (THE next milestone).
+- partition-concurrent-attach: routing-path locks (above) → PROMOTE.
+- alter-table-4: per-session MVCC catalog visibility.
 - reindex-concurrently-toast: real TOAST relations (reltoastrelid=0).
 - WHERE CURRENT OF positioned UPDATE/DELETE: parsed (CurrentOf), no executor site.
 
-Next step: piece (c) — post-wait constraint re-validation. When a buffered INSERT
-that waited on the default-partition lock unblocks (s1 committed), re-check the
-default's now-narrowed partition constraint against the rows and raise 23514 if
-violated. Then perm-1 routing-path RowExclusiveLocks.
-
-Gates run: go build ./... clean; new attach tests (2) PASS; go test ./internal/executor/
-+ ./internal/server/ PASS; TestPort_IsolationDetachPartitionConcurrently1 +
-PartitionDropIndexLocking strict PASS (no regression); probe confirmed perm-2 wait;
+Gates run: go build ./... clean; new unit tests (2) PASS; go test ./internal/executor/
+PASS; probe confirmed perm-2 byte-match; TestPort_IsolationDetachPartitionConcurrently1
++ PartitionDropIndexLocking + InheritTemp strict PASS (no regression);
 make ralph-state-guard (before status block); pgbench smoke = pre-commit hook.
