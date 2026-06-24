@@ -1,43 +1,46 @@
 (idle — nothing in flight)
 
-Loop #37 COMPLETE: M0118-0009 `predicate-hash.spec` PROMOTED `failed`→`pass`
-(all 40 permutations byte-identical, strict TestPort_IsolationPredicateHash).
-Design 0118-0099.
+Loop #38 COMPLETE: M0118-0009 JSON accessor operators `->` / `->>` ADDED
+(enabler, design 0118-0100 — NOT a spec promotion). Previously a hard lex error.
 
-What landed — page (bucket) level predicate locking in a hash index:
-- catalog/catalog.go: new in-memory `Index.DeclaredHash` (Method stays "btree";
-  catalog/pg_am/pg_dump/WAL unchanged).
-- executor/operators_ddl.go (execCreateIndex): set DeclaredHash after the btree
-  build for `USING hash`.
-- executor/ssi.go: `ssiHashBucket` (FNV 31-bit bucket of encoded key);
-  `ssiRecordHashBucketRead` (PageLockTag(db,indexOID,bucket) SIREAD);
-  `ssiConflictOutTupleRead`/`ssiConflictOutOnWriters` (conflict-out only, no heap
-  SIREAD — avoids heap-page coarsening false positive); `ssiRecordHashIndexInsert`
-  (bucket conflict-in on INSERT path).
-- executor/operators_index.go + operators_indexonly.go: for a declared-hash
-  equality probe, take the bucket SIREAD instead of the relation-grain lock and
-  use conflict-out-only per-tuple reads.
-- executor/operators_storage.go: call ssiRecordHashIndexInsert after
-  ssiRecordTupleWrite in both INSERT paths.
-- docs/design/0118-0099 + README index; target-inventory CSV failed→pass + regen
-  upstream-isolation-coverage.md; fix_plan + tally.
+What landed — JSON `->` (element/field as json) + `->>` (as text):
+- parser/lexer.go: greedy multi-char op match adds `->` (2-char) and promotes
+  `->>` (3-char, same pattern as `!~`→`!~*`).
+- parser/op.go: new OpJSONGet / OpJSONGetText; ParseBinaryOp + String() round-trip.
+- parser/select.go: peekBinaryOp maps both at new precJSON=6 ("other operators"
+  group, same as ||, left-associative).
+- executor/expr.go: evalBinary case → evalJSONArrow: json.Decoder+UseNumber()
+  (exact int round-trip), int key indexes array (neg from end), text key selects
+  object field, type-mismatch/missing→SQL NULL, `->` re-encodes element as
+  canonical json (json null→"null"), `->>` scalar→bare text / json null→SQL NULL
+  / container→compact json. Invalid json left operand → 22P02.
+- Tests: parser/json_arrow_test.go (lex + left-assoc parse chain + ->> opcode),
+  executor/json_arrow_test.go (field/index/neg/OOB/mismatch/json-null/->>-text/
+  invalid-json/chained).
+- docs/design/0118-0100 + README index; deferral ledger + fix_plan note.
 
-Root cause found via debug: `CREATE INDEX … USING hash` was silently rewritten
-to btree in the catalog (operators_ddl.go:4709), so the equality scan took a
-relation-grain SIREAD → over-aborted 30 vs PG's 18. DeclaredHash flag (not a
-catalog Method change) keeps blast radius off pg_am/dump/planner.
+Why enabler not promotion: horizons.spec needs MUCH more. Re-probe after `->`:
+first divergence advanced from the `->` lex error to plpgsql
+`EXECUTE … INTO STRICT v_ret`. horizons' remaining blockers (in order):
+(1) plpgsql `EXECUTE … INTO STRICT`; (2) EXPLAIN (FORMAT json) emit
+`Heap Fetches` for index-only scans (operators_explain.go); (3) Effort-L MVCC
+core — IOS heap-fetch count reflecting pruning + prune/VACUUM respecting a
+concurrent older snapshot for permanent vs temp tables.
 
-Gates: TestPort_IsolationPredicateHash strict PASS (18 failures matching PG, was
-30); 6 pass-required SSI specs + predicate-lock-hot-tuple/partial-index/
-simple-write-skew PASS no regression; executor/mvcc/planner/catalog units +
-`-race` SSI/predicate tests PASS; build+vet clean; gofmt only pre-existing
-M0111 misformat (version mismatch, untouched). pgbench smoke = pre-commit hook.
-State guard repaired→consistent.
+Probe-ranked ALL 12 remaining failed isolation specs this loop — every one is
+Effort-L: intra-grant-inplace (full pg_class catalog-tuple row-lock matrix +
+multixact + deadlock, 11 perms), horizons (above), index-only-bitmapscan
+(DECLARE CURSOR + VACUUM TRUNCATE opt), fk-partitioned-1/2 (ATTACH PARTITION +
+partitioned-FK), predicate-gin (GIN AM + intarray), predicate-gist (GiST AM +
+point), stats (pg_stat_force_next_flush + cumulative stats), deadlock-parallel
+(LANGUAGE internal + parallel workers), prepared-transactions{,-cic} (2PC).
 
-Isolation failed-spec count now 12 (was 13). Remaining M0118-0009 failed:
-intra-grant-inplace (pg_class row locks — heavy), horizons (JSON `->` + EXPLAIN
-json), stats (pg_stat infra), prepared-transactions{,-cic} (2PC).
-predicate-gin/gist still failed (AM-specific predicate-lock granularity).
+Gates: parser+executor JSON-arrow units PASS; full internal/parser +
+internal/executor suites PASS no regression; build+vet clean; gofmt -l only
+pre-existing go1.25↔1.26 noise (op.go/lexer.go unrelated regions). pgbench smoke
+= pre-commit hook. State guard repaired→consistent.
 
-NEXT candidate: horizons likely cheapest front-end (JSON `->` operator parse +
-explain_json + EXPLAIN FORMAT json Heap Fetches) — probe-rank first.
+NEXT: no cheap isolation-spec promotion remains. Either keep laddering horizons
+(plpgsql EXECUTE INTO STRICT next) or start intra-grant-inplace perm1 (reuse the
+loop #36 / 0118-0098 GRANT-xmax-wait mechanism for the pg_class relhasindex
+inplace update).

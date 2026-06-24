@@ -1210,8 +1210,18 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       AM-specific granularity; `DeclaredHash` not WAL-persisted (reverts to
       relation-grain after restart); UPDATE/DELETE on a hash column not yet
       bucket-locked.
+      **2026-06-25 (design 0118-0100, enabler — NOT a promotion):** added JSON
+      accessor operators `->`/`->>` (lexer 2-/3-char match + `OpJSONGet`/
+      `OpJSONGetText` at `precJSON=6` + executor `evalJSONArrow`). Previously a
+      hard lex error; broadly useful + clears `horizons`' first divergence. Spec
+      stays `failed` — re-probe shows the next blockers are plpgsql
+      `EXECUTE … INTO STRICT`, then `EXPLAIN (FORMAT json)` `Heap Fetches`
+      emission, then the Effort-L MVCC core (index-only-scan heap-fetch counts
+      reflecting pruning + prune/VACUUM respecting a concurrent older snapshot
+      for permanent vs temp tables). Ledger row recorded.
       **Remaining M0118-0009:** `intra-grant-inplace` (pg_class sibling — ALTER
       TABLE ADD PRIMARY KEY `<waiting>` behind FOR KEY SHARE on pg_class; needs
       runtime shared-catalog MVCC-tuple row locks — heavy), `horizons`
-      (JSON `->` + EXPLAIN FORMAT json), `stats` (pg_stat_force_next_flush),
+      (plpgsql `EXECUTE INTO STRICT` + EXPLAIN FORMAT json `Heap Fetches` +
+      pruning-horizon MVCC core), `stats` (pg_stat_force_next_flush),
       `prepared-transactions{,-cic}` (2PC).

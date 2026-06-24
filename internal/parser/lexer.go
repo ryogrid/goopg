@@ -450,12 +450,17 @@ func (l *lexer) next() (Token, error) {
 			two = l.src[l.pos : l.pos+2]
 		}
 		switch two {
-		case "<=", ">=", "<>", "!=", "||", "<<", ">>", "~*", "!~", "=>", "<@", "@>", "&&":
+		case "<=", ">=", "<>", "!=", "||", "<<", ">>", "~*", "!~", "=>", "<@", "@>", "&&", "->":
 			l.pos += 2
 			// Check for 3-char operators (e.g., !~*).
 			if l.pos < len(l.src) && l.src[l.pos] == '*' && (two == "!~") {
 				l.pos++
 				return Token{Kind: TokenOperator, Value: "!~*", Pos: start}, nil
+			}
+			// JSON text-extraction operator ->> (3-char). M0118-0009.
+			if l.pos < len(l.src) && l.src[l.pos] == '>' && two == "->" {
+				l.pos++
+				return Token{Kind: TokenOperator, Value: "->>", Pos: start}, nil
 			}
 			return Token{Kind: TokenOperator, Value: two, Pos: start}, nil
 		}

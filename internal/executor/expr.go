@@ -9,6 +9,7 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
@@ -1380,8 +1381,108 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 			result = !(aur[0] < bll[0] || bur[0] < all[0] || aur[1] < bll[1] || bur[1] < all[1])
 		}
 		return NewBoolDatum(result), nil
+	case parser.OpJSONGet, parser.OpJSONGetText:
+		// json/jsonb -> int|text  →  element/field (json), and ->> → text.
+		// goopg carries json/jsonb as KindString; NULL operands already
+		// returned NullDatum above. M0118-0009 (horizons enabler).
+		return evalJSONArrow(op, left, right, pos)
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
+}
+
+// evalJSONArrow evaluates the JSON accessor operators -> and ->>.
+//
+//	json -> int   → array element at index (negative counts from the end), as json
+//	json -> text  → object field by key, as json
+//	json ->> int  → array element as text
+//	json ->> text → object field as text
+//
+// A non-array left operand with an int key, a non-object left operand with a
+// text key, or a missing index/key yields SQL NULL — matching PostgreSQL. The
+// left operand must be syntactically valid JSON (else 22P02). Numbers are
+// decoded via json.Number so integer/exponent formatting round-trips exactly
+// (e.g. the EXPLAIN-FORMAT-json "Heap Fetches" the horizons spec inspects).
+//
+// goopg has no distinct json vs jsonb storage, so -> re-encodes the navigated
+// element as canonical JSON (jsonb-style: whitespace-collapsed, keys sorted by
+// the encoder). The final scalar surface form is identical to PostgreSQL; only
+// object/array key-order fidelity of the `json` (text) type differs — noted in
+// design 0118-0100.
+func evalJSONArrow(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
+	ls, ok := datumAsString(left)
+	if !ok {
+		return Datum{}, &ExecError{Code: "42883", Pos: pos,
+			Message: fmt.Sprintf("operator %s requires a json left operand", op)}
+	}
+	dec := json.NewDecoder(strings.NewReader(ls))
+	dec.UseNumber()
+	var doc any
+	if err := dec.Decode(&doc); err != nil {
+		return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+			Message: "invalid input syntax for type json"}
+	}
+
+	var elem any
+	var found bool
+	switch right.Kind {
+	case KindInt:
+		arr, isArr := doc.([]any)
+		if !isArr {
+			return NullDatum, nil
+		}
+		idx := int(right.Int)
+		if idx < 0 {
+			idx = len(arr) + idx
+		}
+		if idx < 0 || idx >= len(arr) {
+			return NullDatum, nil
+		}
+		elem, found = arr[idx], true
+	case KindString, KindBytes:
+		obj, isObj := doc.(map[string]any)
+		if !isObj {
+			return NullDatum, nil
+		}
+		key, _ := datumAsString(right)
+		elem, found = obj[key]
+	default:
+		// Any other key type: PG has no matching operator; treat as NULL.
+		return NullDatum, nil
+	}
+	if !found {
+		return NullDatum, nil
+	}
+
+	if op == parser.OpJSONGetText {
+		// ->> : a JSON null element is SQL NULL; scalars become their bare
+		// text; objects/arrays become their compact JSON text.
+		if elem == nil {
+			return NullDatum, nil
+		}
+		switch x := elem.(type) {
+		case string:
+			return NewStringDatum(x), nil
+		case json.Number:
+			return NewStringDatum(x.String()), nil
+		case bool:
+			if x {
+				return NewStringDatum("true"), nil
+			}
+			return NewStringDatum("false"), nil
+		default:
+			b, err := json.Marshal(x)
+			if err != nil {
+				return NullDatum, nil
+			}
+			return NewStringDatum(string(b)), nil
+		}
+	}
+	// -> : return the element re-encoded as JSON (a JSON null → the text "null").
+	b, err := json.Marshal(elem)
+	if err != nil {
+		return NullDatum, nil
+	}
+	return NewStringDatum(string(b)), nil
 }
 
 // datumAsString returns d's character payload as a Go string when

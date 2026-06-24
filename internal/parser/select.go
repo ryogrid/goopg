@@ -1619,6 +1619,9 @@ const (
 	// as `'x' || (2+3)`, matching PostgreSQL's operator precedence table
 	// where || is in the "other operators" group below + and -. M0097-0063.
 	precConcat = 6 // || — below +/- (7) so `a || 2+3` → `a || (2+3)`
+	// JSON accessor operators (-> ->>) are "other operators" in PG's
+	// precedence table, the same class as ||. M0118-0009.
+	precJSON   = 6
 	precAddSub = 7
 	precMulDiv = 8
 	precUnary  = 10
@@ -2412,6 +2415,10 @@ func (p *parser) peekBinaryOp() (OpCode, int, bool) {
 			return OpContains, precCompare, true
 		case "&&":
 			return OpOverlap, precCompare, true
+		case "->":
+			return OpJSONGet, precJSON, true
+		case "->>":
+			return OpJSONGetText, precJSON, true
 		}
 	case TokenSymbol:
 		// '*' is also a symbol token (target-list wildcard) — but in
