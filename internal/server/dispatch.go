@@ -364,6 +364,17 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		return s.cancelReg.cancelByPID(uint32(pid))
 	}
+	// Wire pg_terminate_backend(pid) to the process-wide registry so a backend
+	// can terminate a peer's connection (privileged in-server path). Self-
+	// termination does NOT reach here — the expr layer returns ErrSelfTerminate
+	// so the serve loop emits the FATAL and tears down its own connection.
+	// M0118-0009 (temp-schema-cleanup process-exit permutation).
+	ectx.TerminateBackend = func(pid int32) bool {
+		if pid <= 0 {
+			return false
+		}
+		return s.cancelReg.terminateByPID(uint32(pid))
+	}
 	// pg_notify(channel, payload) buffers into the connection's transaction so it
 	// publishes to LISTENers at commit, exactly like the NOTIFY statement.
 	// M0118-0009 (async-notify).
@@ -1908,6 +1919,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 	}
 	if err := op.Open(ctx); err != nil {
 		_ = op.Close()
+		if errors.Is(err, executor.ErrSelfTerminate) {
+			return err
+		}
 		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 	}
 
@@ -1948,6 +1962,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		}
 		if err != nil {
 			_ = op.Close()
+			if errors.Is(err, executor.ErrSelfTerminate) {
+				return err
+			}
 			return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 		}
 		if schema != nil {

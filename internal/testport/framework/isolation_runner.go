@@ -3,6 +3,8 @@ package framework
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -13,6 +15,35 @@ import (
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 )
+
+// backendTerminationMessage is the verbatim text libpq surfaces (and upstream
+// isolationtester prints) when the server sends a FATAL and closes the
+// connection mid-query — the server's primary error line followed by libpq's
+// standard connection-loss note. goopg's lib/pq driver collapses this into
+// driver.ErrBadConn (the FATAL ErrorResponse is dropped once the socket EOFs),
+// so the harness reconstructs it for the pg_terminate_backend self-termination
+// case (temp-schema-cleanup process-exit permutation). The trailing newline
+// reproduces the blank separator line upstream emits after the block.
+// M0118-0009.
+const backendTerminationMessage = "FATAL:  terminating connection due to administrator command\n" +
+	"server closed the connection unexpectedly\n" +
+	"\tThis probably means the server terminated abnormally\n" +
+	"\tbefore or while processing the request.\n"
+
+// isBackendTerminationError reports whether err indicates the server closed the
+// connection because the step terminated its own backend via
+// pg_terminate_backend(pg_backend_pid()). Gated on the step SQL so an unrelated
+// connection drop (a real crash) is NOT mislabelled as an administrator
+// termination. M0118-0009.
+func isBackendTerminationError(err error, sqlText string) bool {
+	if err == nil {
+		return false
+	}
+	if !strings.Contains(strings.ToLower(sqlText), "pg_terminate_backend") {
+		return false
+	}
+	return errors.Is(err, driver.ErrBadConn) || strings.Contains(err.Error(), "bad connection")
+}
 
 const (
 	// blockDetectWait is how long a step must run before we assume it is
@@ -1017,6 +1048,9 @@ func dollarOpener(sql string, i int) (string, int) {
 func execOneStatement(ctx context.Context, conn *sql.Conn, sqlText string) (oneResult, string) {
 	rows, err := conn.QueryContext(ctx, sqlText)
 	if err != nil {
+		if isBackendTerminationError(err, sqlText) {
+			return oneResult{}, backendTerminationMessage
+		}
 		return oneResult{}, formatPQError(err)
 	}
 	defer rows.Close()

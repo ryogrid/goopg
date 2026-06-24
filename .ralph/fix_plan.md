@@ -1112,11 +1112,17 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       the `NULL;` no-op statement (new `NullStmt` AST node + `parseStmt` case +
       no-op runtime arm). Dedicated test `TestPort_IsolationSubxidOverflow`; unit
       `TestParse{AcceptsBareReturn,NullStatement,ExceptionHandlerNullBody}`.
+      `async-notify` PASS (designs 0118-0089/0090). `temp-schema-cleanup` PASS
+      (designs 0118-0091 perm-1 + 0118-0092 cascade enabler + 0118-0093 perm-2
+      process-exit) — `pg_terminate_backend(pg_backend_pid())` self-termination
+      (`executor.ErrSelfTerminate` → FATAL "terminating connection due to
+      administrator command" + close) + backend-exit temp cleanup ordered before
+      advisory-lock release + `Context.TerminateBackend` peer path + harness
+      `lib/pq` connection-death rendering; promoted `runIsoSpecStrict`.
       **Remaining (deferred, ledger 2026-06-22):**
       (b) lock carry-forward on the non-HOT update paths (delete+insert /
       `UPDATE…FROM` / MERGE / upsert) — bounded follow-up, same narrow gate, not
       exercised by any current `port` spec. Plus the other M0118-0009 misc specs
-      untouched (async-notify [LISTEN/NOTIFY unimpl], horizons [dollar-quote lexer +
-      EXPLAIN JSON], intra-grant-inplace [catalog-row lock on GRANT tuple xmax],
-      stats [pg_stat_* infra], temp-schema-cleanup [pg_my_temp_schema + temp
-      cleanup], prepared-transactions [2PC]).
+      untouched (horizons [dollar-quote lexer + EXPLAIN JSON], intra-grant-inplace
+      [catalog-row lock on GRANT tuple xmax], stats [pg_stat_* infra],
+      prepared-transactions [2PC]).

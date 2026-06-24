@@ -37,6 +37,7 @@ import (
 	"log/slog"
 	"net"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -872,6 +873,10 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}
 	cancelEntry := s.cancelReg.register(pid, secret)
 	defer s.cancelReg.unregister(pid)
+	// Wire the connection-termination function so a peer's pg_terminate_backend(pid)
+	// can tear this connection down (cancelling connCtx fires the FATAL path at the
+	// top of the serve loop). M0118-0009.
+	cancelEntry.setTerminate(cancel)
 
 	if err := s.sendStartupReply(w, sess, pid, secret); err != nil {
 		logger.Info("startup reply failed", "err", err)
@@ -1086,6 +1091,40 @@ func (s *Server) rollbackOpenTxnOnTeardown(connTx *connTxState, logger *slog.Log
 	}
 }
 
+// cleanupSessionTempObjects drops every temporary object owned by sess at
+// backend exit, mirroring PostgreSQL's RemoveTempRelations: the session's temp
+// tables (and their implicit composite rowtypes), the non-temp routines that
+// depend on those rowtypes (the same name-keyed cascade DISCARD TEMP uses, since
+// goopg has no OID-level pg_depend graph), and finally the temp namespace
+// registration itself (unlike DISCARD TEMP, which keeps the namespace for reuse).
+// A no-op for a session that never created a temporary object. The owner token
+// matches executor.sessionTempOwner ("s"+UniqueID). M0118-0009.
+func (s *Server) cleanupSessionTempObjects(sess *config.SessionRegistry) {
+	if sess == nil || s.cfg.Catalog == nil {
+		return
+	}
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	id := sess.UniqueID()
+	if id == 0 {
+		return
+	}
+	owner := "s" + strconv.FormatUint(id, 10)
+	// Capture the temp tables' names BEFORE dropping them: a temp table's
+	// implicit composite rowtype dies with it and cascades to any routine
+	// referencing that rowtype (e.g. the spec's uses_a_temp_type).
+	tempTypeNames := im.SessionTempTableNames(owner)
+	im.DropSessionTempObjects(owner)
+	if len(tempTypeNames) > 0 {
+		if rs := im.Routines(); rs != nil {
+			rs.DropRoutinesReferencingTypes(tempTypeNames)
+		}
+	}
+	im.DropTempNamespace(owner)
+}
+
 func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mctx.Context, pid uint32) {
 	extended := newExtendedState()
 	// Assign a ProcArray slot for this backend (M0107-0004). The slot is
@@ -1125,6 +1164,15 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 	// (defers run LIFO) so the xact-scoped release there is a harmless no-op.
 	// M0118-0003.
 	defer executor.ReleaseAllAdvisoryLocks(sess)
+	// On connection teardown, drop this session's temporary objects (temp tables,
+	// their implicit composite rowtypes, the non-temp routines that depend on
+	// those rowtypes, and finally the temp namespace itself). PostgreSQL performs
+	// this at backend exit via RemoveTempRelations, and crucially BEFORE releasing
+	// session-level advisory locks — the temp-schema-cleanup spec relies on that
+	// ordering: a peer waiting on the same advisory lock only unblocks once the
+	// catalog is clean. Registered AFTER the advisory-release defer so LIFO runs
+	// it FIRST. M0118-0009 (temp-schema-cleanup process-exit permutation).
+	defer s.cleanupSessionTempObjects(sess)
 	// On connection teardown (client disconnect, EOF, read error, admin
 	// shutdown — every `return` from the loop below), roll back any still-open
 	// explicit transaction so its XID is released from the ProcArray and any
@@ -1226,6 +1274,17 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 			entry.clearQueryCancel()
 			queryCancel()
 			if err != nil {
+				if errors.Is(err, executor.ErrSelfTerminate) {
+					// pg_terminate_backend(pg_backend_pid()): the query targeted
+					// this backend. Emit the FATAL and close the connection,
+					// matching PostgreSQL's SIGTERM-at-CHECK_FOR_INTERRUPTS path
+					// (the client sees only the FATAL, no result row). The deferred
+					// teardown (temp-object cleanup, advisory-lock release, open-txn
+					// rollback) then runs before the socket closes. M0118-0009
+					// (temp-schema-cleanup process-exit permutation).
+					s.writeFatal(w, sqlstate.AdminShutdown, "terminating connection due to administrator command")
+					return
+				}
 				if errors.Is(err, errQueryErrorSent) {
 					// Error + ReadyForQuery already sent cleanly; keep connection.
 					// The client received the error and will send the next Query.

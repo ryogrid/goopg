@@ -1562,7 +1562,7 @@ func TestPort_IsolationTempSchemaCleanup(t *testing.T) {
 	c := newCluster(t, "iso_temp_schema_cleanup")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/temp-schema-cleanup.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/temp-schema-cleanup.spec")
 }
 
 // TestPort_IsolationDeadlockSimple exercises the deadlock-simple spec: two

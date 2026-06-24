@@ -12,6 +12,19 @@ type cancelEntry struct {
 	mu          sync.Mutex
 	secretKey   uint32
 	queryCancel context.CancelFunc
+	// terminate cancels the connection's ROOT context (set once at connection
+	// start). Firing it makes the backend's serve loop tear the connection down
+	// — the engine behind pg_terminate_backend(pid) for a peer backend. nil
+	// until set by the backend goroutine. M0118-0009.
+	terminate context.CancelFunc
+}
+
+// setTerminate installs fn as the connection-termination function (the
+// connection's root-context cancel). Called once at connection start.
+func (e *cancelEntry) setTerminate(fn context.CancelFunc) {
+	e.mu.Lock()
+	e.terminate = fn
+	e.mu.Unlock()
 }
 
 // setQueryCancel installs fn as the cancel function for the
@@ -99,6 +112,28 @@ func (r *backendCancelRegistry) cancelQuery(pid, secretKey uint32) {
 		return
 	}
 	e.cancel(secretKey)
+}
+
+// terminateByPID terminates the backend with the given pid by firing its
+// connection-termination function (cancelling its root context, which makes
+// the serve loop emit a FATAL and close the connection) — the privileged,
+// in-server path behind pg_terminate_backend(pid) for a PEER backend. Returns
+// true if a backend with that pid is registered, false if the pid is unknown.
+// Self-termination never reaches here (handled inline via ErrSelfTerminate).
+func (r *backendCancelRegistry) terminateByPID(pid uint32) bool {
+	r.mu.Lock()
+	e, ok := r.entries[pid]
+	r.mu.Unlock()
+	if !ok {
+		return false
+	}
+	e.mu.Lock()
+	fn := e.terminate
+	e.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+	return true
 }
 
 // cancelByPID cancels the in-flight query of the backend with the given pid

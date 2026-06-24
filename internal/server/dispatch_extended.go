@@ -166,6 +166,13 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		}
 		return s.cancelReg.cancelByPID(uint32(pid))
 	}
+	// pg_terminate_backend(pid) sibling of the simple-query path. M0118-0009.
+	ectx.TerminateBackend = func(pid int32) bool {
+		if pid <= 0 {
+			return false
+		}
+		return s.cancelReg.terminateByPID(uint32(pid))
+	}
 
 	op, err := executor.Build(node)
 	if err != nil {

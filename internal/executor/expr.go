@@ -5893,6 +5893,43 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewBoolDatum(ctx.CancelBackend(int32(pidArg.Int))), nil
 		}
 		return NewBoolDatum(false), nil
+	case "pg_terminate_backend":
+		// pg_terminate_backend(pid int4) → bool: terminate the backend whose
+		// pg_backend_pid() == pid (the SQL analog of sending SIGTERM). When the
+		// target is THIS backend (pid == our own pg_backend_pid()), the query is
+		// aborted immediately via ErrSelfTerminate: the server emits the FATAL
+		// "terminating connection due to administrator command" ErrorResponse and
+		// closes the connection, so the client sees no result row — exactly as PG
+		// does, where the SIGTERM is processed at CHECK_FOR_INTERRUPTS inside the
+		// function and the connection dies before a value is returned. A peer pid
+		// goes through ctx.TerminateBackend (process-wide registry) and returns a
+		// bool. Strict: NULL arg → NULL. M0118-0009 (temp-schema-cleanup
+		// process-exit permutation).
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		pidArg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		if pidArg.IsNull() {
+			return NullDatum, nil
+		}
+		target := int32(pidArg.Int)
+		// Self-termination: abort the current query so the client receives only
+		// the FATAL + connection close. Resolve our own backend PID the same way
+		// pg_backend_pid() does.
+		if ctx != nil {
+			if selfStr := ctx.backendPID(); selfStr != "" {
+				if self, perr := strconv.ParseInt(selfStr, 10, 32); perr == nil && int32(self) == target {
+					return NullDatum, ErrSelfTerminate
+				}
+			}
+		}
+		if ctx != nil && ctx.TerminateBackend != nil {
+			return NewBoolDatum(ctx.TerminateBackend(target)), nil
+		}
+		return NewBoolDatum(false), nil
 	case "pg_notify":
 		// pg_notify(channel text, payload text) → void: the SQL-function form of
 		// the NOTIFY statement. Buffers a notification (delivered to LISTENers at

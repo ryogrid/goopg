@@ -434,6 +434,18 @@ type Context struct {
 	// backends exist. M0118-0008 (detach-partition-concurrently-3/4 s1cancel).
 	CancelBackend func(pid int32) bool
 
+	// TerminateBackend, when non-nil, signals the backend identified by pid to
+	// terminate (close its connection) — the engine behind the
+	// pg_terminate_backend(pid) SQL function (the SQL analog of SIGTERM).
+	// Returns true if a backend with that pid is connected, false if the pid is
+	// unknown. The server wires this to its process-wide cancel registry, whose
+	// entries carry the connection's root-context cancel func; nil in
+	// unit/embedded contexts. Self-termination does NOT go through this callback
+	// (the expr layer returns ErrSelfTerminate instead, so the server can emit
+	// the FATAL and tear down its own connection cleanly). M0118-0009
+	// (temp-schema-cleanup process-exit permutation).
+	TerminateBackend func(pid int32) bool
+
 	// QueueNotify, when non-nil, buffers a notification (the engine behind the
 	// pg_notify(channel, payload) SQL function) into the connection's
 	// transaction so it is published to LISTENers at commit — exactly as the
