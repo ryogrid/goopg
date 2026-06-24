@@ -296,12 +296,21 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `fk-contention`, `fk-deadlock2` already match PG 18.3 (FK KEY-SHARE-vs-non-key-
       UPDATE non-conflict rides the M0118-0003/0004 multixact lock-only producer; SSI
       specs ride the 40001 machinery). Switched 3 dedicated tests soft→`runIsoSpecStrict`
-      + added `TestPort_IsolationFk{Contention,Deadlock2}`. **Remaining (deferred,
-      ledger 2026-06-22):** `fk-deadlock` (goopg's FK-check KEY SHARE wait
-      over-conflicts — INSERT-into-child blocks where PG proceeds; needs a
-      non-conflicting KEY-SHARE join on the wait path), `ri-trigger` (user RI
-      constraint-trigger firing), `fk-partitioned-1/2` (`ALTER TABLE ATTACH
-      PARTITION` + partitioned-FK enforcement). Group stays open until those land.
+      + added `TestPort_IsolationFk{Contention,Deadlock2}`. **`fk-deadlock` PROMOTED
+      (2026-06-25, design 0118-0094):** the FK existence scan `scanRelForFKMatch`
+      was made FOR-KEY-SHARE-aware — it waits on a matched parent row's in-flight
+      `xmax` only when that `xmax` is a key-changing modification (key UPDATE with
+      `HEAP_KEYS_UPDATED`; structurally-detected DELETE via self-pointing/invalid
+      `t_ctid`; or a multixact updater member `StatusUpdate`) and treats a
+      concurrent no-key UPDATE (`StatusNoKeyUpdate`) as a clean match, so a child
+      INSERT no longer blocks where PG proceeds (sibling-paths fix vs `lockRowsOp`,
+      which already keyed its wait on `keysUpdated`); the only blocking left is the
+      two parent no-key UPDATEs serialising via the existing UPDATE-conflict path.
+      New helpers `fkXmaxIsKeyChanging` + `multixactUpdaterIsKeyChanging`; strict
+      `TestPort_IsolationFkDeadlock` 14/14 byte-identical. **Remaining (deferred,
+      ledger 2026-06-22):** `ri-trigger` (user RI constraint-trigger firing),
+      `fk-partitioned-1/2` (`ALTER TABLE ATTACH PARTITION` + partitioned-FK
+      enforcement). Group stays open until those land.
 - [x] **M0118-0006** — MERGE & INSERT ON CONFLICT output parity: merge-{update,delete,
       insert-update,match-recheck,join}, insert-conflict-do-update-{2,3,4},
       insert-conflict-specconflict, insert-conflict-do-nothing-2. **COMPLETE

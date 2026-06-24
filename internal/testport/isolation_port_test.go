@@ -1192,15 +1192,35 @@ func TestPort_IsolationFkContention(t *testing.T) {
 // a child row (taking FOR KEY SHARE on the shared parent — non-conflicting, so
 // both proceed via a multixact lock set) and then UPDATE disjoint parent rows.
 // No lock cycle forms, so both commit without a deadlock abort, matching PG 18.3.
-// The sibling fk-deadlock spec (where the parent UPDATEs *do* form a cycle)
-// remains deferred — goopg's FK row-lock wait over-conflicts there (ledger
-// 2026-06-22). Promoted to pass-required (M0118-0005, design 0118-0023).
+// Promoted to pass-required (M0118-0005, design 0118-0023). The sibling
+// fk-deadlock spec is now also promoted (see TestPort_IsolationFkDeadlock,
+// design 0118-0094).
 func TestPort_IsolationFkDeadlock2(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_fk_deadlock2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-deadlock2.spec")
+}
+
+// TestPort_IsolationFkDeadlock exercises fk-deadlock: two sessions each INSERT a
+// child row referencing the same parent (each taking an implicit FOR KEY SHARE
+// on that parent row), then each issues a *no-key* UPDATE of the parent. The FK
+// KEY SHARE check must be COMPATIBLE with a concurrent in-flight no-key UPDATE —
+// only a key UPDATE or a DELETE conflicts with FOR KEY SHARE — so the child
+// INSERTs never wait; the blocking that does appear comes solely from the two
+// no-key UPDATEs serialising against each other. goopg previously over-waited:
+// the FK match scan (scanRelForFKMatch) treated ANY in-flight non-self updater
+// as a conflict, so a child INSERT blocked where PG proceeds. Fixed by making
+// the FK scan key-aware (only a key-changing updater — StatusUpdate /
+// structurally-detected DELETE — is a conflict). Promoted to pass-required
+// (M0118-0005, design 0118-0094).
+func TestPort_IsolationFkDeadlock(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_fk_deadlock")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-deadlock.spec")
 }
 
 // TestPort_IsolationIndexOnlyScan exercises the index-only-scan spec: a

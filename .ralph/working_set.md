@@ -1,18 +1,29 @@
 (idle — nothing in flight)
 
-Loop #30 COMPLETE + COMMITTED: M0118-0009 temp-schema-cleanup.spec PROMOTED to
-pass (runIsoSpecStrict) — both permutations byte-for-byte vs PG 18.3. Landed
-perm-2 process-exit (design 0118-0093): pg_terminate_backend(pg_backend_pid())
-self-termination (executor.ErrSelfTerminate → FATAL "terminating connection due
-to administrator command" + close), backend-exit temp cleanup ordered before
-advisory-lock release (Server.cleanupSessionTempObjects defer after
-ReleaseAllAdvisoryLocks = LIFO runs first), Context.TerminateBackend peer path
-(cancelReg.terminateByPID), harness lib/pq connection-death rendering.
+Loop #31 COMPLETE + COMMITTED: M0118-0005 `fk-deadlock.spec` PROMOTED defer→pass
+(design 0118-0094), all 14 permutations byte-identical vs PG 18.3, strict
+`TestPort_IsolationFkDeadlock`.
 
-Next loop: pick another M0118-0009 spec — horizons (EXPLAIN FORMAT json ANALYZE
-Heap Fetches + IOS + temp-prune horizon; dollar-quote lexer), intra-grant-inplace
-{,-db} (FOR UPDATE on virtual pg_class/pg_database rows + GRANT tuple-xmax lock +
-VACUUM FREEZE inplace wait), stats (pg_stat_* infra), prepared-transactions{,-cic}
-(2PC). Or other open M0118 groups: M0118-0002 (predicate-gin/gist/hash AMs),
-M0118-0004 (deadlock-parallel lock-group), M0118-0005 (fk-deadlock, ri-trigger,
-fk-partitioned), M0118-0007 (eval-plan-qual EPQ-over-join).
+Root cause: a child INSERT's FK check is `SELECT … FOR KEY SHARE` on the parent
+row, which conflicts ONLY with a key-changing modification (key UPDATE / DELETE)
+and is COMPATIBLE with a concurrent no-key UPDATE. `scanRelForFKMatch`
+(internal/executor/operators_fk.go) treated ANY in-flight non-self non-lock-only
+xmax as a wait, so a child INSERT blocked behind a peer's in-flight no-key parent
+UPDATE where PG proceeds (sibling-paths gap vs lockRowsOp, which already keys its
+wait on keysUpdated). Fix: new helpers `fkXmaxIsKeyChanging` (single-xid:
+HEAP_KEYS_UPDATED OR structural-delete via self-pointing/invalid t_ctid) +
+`multixactUpdaterIsKeyChanging` (updater member StatusUpdate vs StatusNoKeyUpdate);
+no-key updater = clean match (no wait), key UPDATE/DELETE still waits+rescans.
+
+Next loop options (all genuinely large remaining M0118 subsystems — none is a cheap
+front-end promotion, the easy ones are harvested):
+- M0118-0005 remaining: ri-trigger (user RI constraint-trigger firing),
+  fk-partitioned-1/2 (ALTER TABLE ATTACH PARTITION + partitioned-FK).
+- M0118-0007: eval-plan-qual (EPQ-over-join recheck re-projection).
+- M0118-0009 misc (each a full subsystem): horizons (jsonb `->`/`->>` operators —
+  NO opcode/eval today, plus EXPLAIN json Heap Fetches + IOS prune horizon),
+  intra-grant-inplace{,-db} (real pg_class MVCC tuple + tuple-lock + catalog
+  deadlock — pg_class is virtual), stats (pg_stat_* cumulative-stats infra +
+  pg_stat_force_next_flush), prepared-transactions{,-cic} (2PC + SSI integration).
+- Probe new candidates with a throwaway zz_probe_test.go (TestProbe → RunAndCompare,
+  log .Diff) before committing to one.

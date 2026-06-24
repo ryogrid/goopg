@@ -20,11 +20,57 @@ import (
 	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
 )
+
+// fkXmaxIsKeyChanging reports whether a single-transaction (non-multi,
+// non-lock-only) xmax stamped on a matched parent row represents a
+// key-changing modification — a key-column UPDATE or a DELETE — which is the
+// only kind of in-flight change that conflicts with FK enforcement's implicit
+// FOR KEY SHARE lock.  A plain no-key UPDATE (HEAP_KEYS_UPDATED clear, with a
+// successor t_ctid) leaves the referenced key intact and does NOT conflict, so
+// the FK check must not wait on it (isolation spec fk-deadlock).
+//
+// goopg does not stamp HEAP_KEYS_UPDATED on DELETE the way upstream
+// heap_delete does, so a delete is recognised structurally: its t_ctid points
+// at the tuple itself (or is invalid) rather than at a successor version —
+// the same test used by lockRowsOp.chainMembers (M0118-0003).
+func fkXmaxIsKeyChanging(hdr storage.HeapTupleHeader, self storage.ItemPointer) bool {
+	if hdr.Infomask2&storage.HeapKeysUpdated != 0 {
+		return true
+	}
+	if hdr.CTID.Block == storage.InvalidBlockNumber ||
+		(hdr.CTID.Block == self.Block && hdr.CTID.Offset == self.Offset) {
+		return true
+	}
+	return false
+}
+
+// multixactUpdaterIsKeyChanging reports whether the updater member of an
+// updater-bearing MultiXactId xmax performed a key-changing modification
+// (StatusUpdate = key UPDATE or DELETE) as opposed to a no-key UPDATE
+// (StatusNoKeyUpdate).  Only a key-changing updater conflicts with FK
+// enforcement's FOR KEY SHARE lock.  Callers MUST have already established
+// that the xmax is a non-lock-only multi with an updater member.
+func multixactUpdaterIsKeyChanging(mxs *multixact.Store, xmax storage.TransactionID) bool {
+	if mxs == nil {
+		return false
+	}
+	members, ok := mxs.Members(multixact.MultiXactId(xmax))
+	if !ok {
+		return false
+	}
+	for _, m := range members {
+		if m.Status.IsUpdate() {
+			return m.Status == multixact.StatusUpdate
+		}
+	}
+	return false
+}
 
 // checkFKInsert verifies all FK constraints on fkOwnerTbl for the given
 // inserted row. Returns a 23503 (foreign_key_violation) error when a
@@ -922,10 +968,22 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 			// the raw t_xmax is a MultiXactId, not a transaction id — resolve
 			// the updater member before any single-transaction test, and never
 			// record a MultiXactId as the xid to wait on.
+			//
+			// FK enforcement performs the equivalent of SELECT ... FOR KEY
+			// SHARE on the matched parent row.  A KEY SHARE lock conflicts ONLY
+			// with a key-changing modification of that row — a key UPDATE or a
+			// DELETE (MultiXactStatusUpdate) — and is COMPATIBLE with a
+			// concurrent no-key UPDATE (StatusNoKeyUpdate) as well as with pure
+			// row locks.  So we wait on the matched row's in-flight xmax only
+			// when it represents a key-changing modification; a no-key updater
+			// leaves the referenced key intact and the FK is satisfied
+			// immediately, without serialising (upstream RI_FKey_check;
+			// isolation spec fk-deadlock).
 			xmax := tuple.Header.Xmax
 			infomask := tuple.Header.Infomask
 			effXmax := xmax
 			isLockOnly := storage.IsHeapTupleLockOnly(infomask)
+			keyChanging := false
 			if storage.IsHeapTupleXmaxMulti(infomask) && !isLockOnly {
 				effXmax = multixactUpdaterXID(ctx.MultiXact, xmax)
 				if effXmax == storage.InvalidTransactionID {
@@ -933,11 +991,18 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 					// holders do not delete the matched row, so this is a
 					// clean FK match just like a lock-only xmax.
 					isLockOnly = true
+				} else {
+					keyChanging = multixactUpdaterIsKeyChanging(ctx.MultiXact, xmax)
 				}
+			} else if !isLockOnly && xmax != storage.InvalidTransactionID {
+				keyChanging = fkXmaxIsKeyChanging(tuple.Header,
+					storage.ItemPointer{Block: blk, Offset: slotIdx})
 			}
-			if effXmax == storage.InvalidTransactionID || isLockOnly ||
+			if effXmax == storage.InvalidTransactionID || isLockOnly || !keyChanging ||
 				effXmax == ctx.Tx.XID || ctx.TxnMgr == nil || !ctx.TxnMgr.IsXIDActive(effXmax) {
-				// Clean match: no in-flight non-self updater.
+				// Clean match: no in-flight key-changing modification —
+				// FK is satisfied (FOR KEY SHARE is compatible with the
+				// in-flight no-key update / pure lock, if any).
 				s.RUnlock()
 				ctx.Pool.Unpin(s)
 				return true, nil, nil
