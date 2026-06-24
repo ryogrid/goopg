@@ -1087,6 +1087,13 @@ func sessionPlanCatalog(sess *config.SessionRegistry, base catalog.Catalog) cata
 	if id := sess.UniqueID(); id != 0 {
 		wrapped.TempOwnerToken = "s" + strconv.FormatUint(id, 10)
 	}
+	// Carry the session's enable_seqscan toggle so the planner can promote an
+	// ordered covering index scan to an IndexOnlyScan when seqscan is disabled
+	// (PG-faithful, drops the Sort). Bool GUCs normalise to "on"/"off". Design
+	// 0118-0103 (M0118-0009 horizons enabler).
+	if _, eff, ok := sess.Get("enable_seqscan"); ok && strings.EqualFold(eff, "off") {
+		wrapped.DisableSeqScan = true
+	}
 	return wrapped
 }
 
@@ -1118,6 +1125,12 @@ func ctxPlanCatalog(ctx *executor.Context, base catalog.Catalog) catalog.Catalog
 	// while any detach is pending (partitionDetachPending), so this re-plans
 	// per statement against the live snapshot epoch. Design 0118-0059.
 	wrapped.SnapshotPartitionDetachEpoch = ctx.Snap.PartitionDetachEpoch
+	// Carry the session's enable_seqscan toggle (matches sessionPlanCatalog) so
+	// the planner promotes an ordered covering index scan to an IndexOnlyScan
+	// when seqscan is disabled. Design 0118-0103 (horizons).
+	if v, ok := getSetting("enable_seqscan"); ok && strings.EqualFold(v, "off") {
+		wrapped.DisableSeqScan = true
+	}
 	return wrapped
 }
 

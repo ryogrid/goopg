@@ -9144,6 +9144,14 @@ type SearchPathCatalog struct {
 	// Zero for snapshot-less contexts (no filtering). Design 0118-0059
 	// (M0118-0008 detach-partition-concurrently).
 	SnapshotPartitionDetachEpoch uint64
+	// DisableSeqScan mirrors the querying session's `enable_seqscan = off` GUC.
+	// goopg's planner is otherwise rule-based and ignores the planner toggle
+	// GUCs, but the planner reads this one (via SeqScanDisabled) to promote an
+	// ordered full-index scan that covers the projection to an IndexOnlyScan —
+	// eliminating the Sort the way PG does once a SeqScan is disabled. Bounded:
+	// false in the default (toggle-untouched) case so legacy plans are unchanged.
+	// Design 0118-0103 (M0118-0009 horizons enabler).
+	DisableSeqScan bool
 }
 
 // WithSearchPath returns a SearchPathCatalog that falls back to the schemas
@@ -9158,6 +9166,12 @@ func WithSearchPath(cat Catalog, getSchemas func() []string) *SearchPathCatalog 
 // planner discovers it via a tempOwnerCarrier interface walk over the catalog
 // wrapper chain. Design 0118-0036.
 func (c *SearchPathCatalog) CurrentTempOwner() string { return c.TempOwnerToken }
+
+// SeqScanDisabled reports the querying session's `enable_seqscan = off` GUC so
+// the planner can promote an ordered covering index scan to an IndexOnlyScan
+// (dropping the Sort). The planner discovers it via a seqScanToggleCarrier
+// interface walk over the catalog wrapper chain. Design 0118-0103 (horizons).
+func (c *SearchPathCatalog) SeqScanDisabled() bool { return c.DisableSeqScan }
 
 // CurrentPartitionDetachEpoch returns the querying statement's snapshot
 // partition-detach epoch so the planner's partition-expansion site can apply

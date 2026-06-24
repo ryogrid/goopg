@@ -1,46 +1,43 @@
-(idle — nothing in flight)
+Loop #41 COMPLETE: M0118-0009 horizons ENABLER ADDED (design 0118-0103 — NOT a
+spec promotion). Closes the PLANNER half of the horizons ladder. Next is the
+final rung: the Effort-L MVCC pruning-horizon core.
 
-Loop #40 COMPLETE: M0118-0009 horizons EXPLAIN enabler ADDED
-(design 0118-0102 — NOT a spec promotion). The next horizons rung after
-0118-0101 (EXECUTE INTO STRICT).
+What landed (ordered IndexOnlyScan under `enable_seqscan = off`):
+- internal/catalog/catalog.go: SearchPathCatalog.DisableSeqScan field +
+  SeqScanDisabled() accessor (mirrors TempOwnerToken/CurrentTempOwner pattern).
+- internal/server/dispatch.go: sessionPlanCatalog + ctxPlanCatalog read
+  enable_seqscan GUC (normalises to "on"/"off") → set wrapped.DisableSeqScan.
+- internal/planner/planner.go: currentSeqScanDisabled (catalog-wrapper Unwrap()
+  walk) + tryPromoteOrderedIndexOnlyScan — replaces Project(Sort(SeqScan)) with
+  an unbounded IndexOnlyScan (nil Key/Keys/bounds → full-range RangeScan ascending,
+  Sort dropped) when a non-partial btree index's leading key cols match the
+  ASC/NULLS-LAST ORDER BY keys AND key+INCLUDE cover the projection. Wired as
+  `else if` after tryPromoteIndexOnlyScan in planSelect's promotion block.
+- internal/planner/ordered_indexonlyscan_test.go (NEW): 3 tests (promoted when
+  disabled / not promoted by default / DESC not promoted). NB filename gotcha:
+  `*_ios_test.go` is a GOOS=ios build constraint — never name a Go file `_ios`.
+- docs/design/0118-0103 + README index; fix_plan note + ledger row.
 
-What landed (all internal/executor, EXPLAIN infrastructure):
-- operators_explain.go: `EXPLAIN (FORMAT JSON)` now nests the plan tree under
-  a top-level "Plan" key (PG-faithful) — `[ { "Plan": {root}, "Planning
-  Time":…, "Execution Time":… } ]`. goopg flattened the node into the array
-  element before, so horizons' `…->0->'Plan'->…` returned NULL. Both JSON
-  paths (plain + ANALYZE) wrap.
-- operators_explain.go: describePlan/describePlanVerbose render
-  `Index Only Scan using <idx> on <table>` (was %T default).
-- instrument.go: nodeStats.heapFetches + `heapFetchCounter` interface;
-  maybeInstrument hands the IOS &stats.heapFetches.
-- operators_indexonly.go: indexOnlyScanOp.heapFetchCount ++ per non-ALL_VISIBLE
-  fallback entry (mirrors ioss_HeapFetches).
-- operators_explain.go: planToJSONWithStats emits "Heap Fetches" JSON key +
-  walkPlanAnalyze emits "Heap Fetches: N" text line, IOS-only, ANALYZE-only.
-- Tests: new explain_heap_fetches_test.go (2 before VACUUM / 0 after, IOS
-  label, text line); updated 6 internal JSON tests for the "Plan" wrapper.
-- docs/design/0118-0102 + README; fix_plan note + ledger row.
+RESIDUAL horizons BLOCKER (isolated via live re-probe — only 3 lines differ now):
+The IOS plan + `…->0->'Plan'->'Heap Fetches'` navigation now MATCH. Remaining:
+- L125 expected 0 / actual 2 — TEMP table: deleted rows SHOULD be prunable
+  despite a concurrent older snapshot; goopg does NOT opportunistically prune the
+  temp heap during the IOS.
+- L244 + L254 expected 2 / actual 0 — PERMANENT table: VACUUM must NOT remove
+  rows still visible to lifeline's older RR snapshot; goopg VACUUM ignores the
+  concurrent OldestXmin horizon → removes them.
 
-RESIDUAL horizons BLOCKER (isolated this loop via live re-probe — actual ""):
-goopg's PLANNER emits `Sort → Seq Scan` (NOT an IOS) for `SELECT * FROM
-horizons_tst ORDER BY data` and does NOT honor `enable_seqscan/indexscan/
-bitmapscan=false`, so no IOS node → no Heap Fetches key → navigation NULL.
-
-NEXT (Effort-L, in order):
-(1) PLANNER: honor enable_seqscan/indexscan/bitmapscan GUCs + promote an
-    ordered full-index scan to IndexOnlyScan when the index provides ORDER BY
-    and covers the projection (today IOS promotion needs an equality/range
-    IndexScan child via tryPromoteIndexOnlyScan; a bare ORDER BY full scan
-    stays Sort→SeqScan). Only then does Heap Fetches become non-NULL.
-(2) MVCC pruning-horizon core: IOS heap-fetch counts reflecting opportunistic
-    pruning + prune/VACUUM respecting a concurrent older snapshot for
-    permanent vs temp tables (perms 1/3/4 expected to match with this loop's
-    IOS infra, 2/5 differ on temp prunability).
+NEXT (Effort-L, the spec's actual subject): MVCC pruning-horizon core —
+opportunistic prune during the IOS + VACUUM cutoff that respects the global xmin
+horizon (GlobalVisHorizon / vacuum_get_cutoffs OldestXmin) for PERMANENT
+relations but treats TEMP relations as always-prunable (the temp short-circuit).
+Separate MVCC change → race gate `go test -race ./internal/mvcc/... ./internal/wal/...`.
 
 Other remaining M0118-0009 (all Effort-L): intra-grant-inplace (pg_class
-xmax-wait), stats (pg_stat_force_next_flush + cumulative stats), prepared-
-transactions{,-cic} (2PC).
+xmax-wait — runtime shared-catalog MVCC-tuple row locks), stats
+(pg_stat_force_next_flush + cumulative stats), prepared-transactions{,-cic} (2PC).
 
-Gates: TestExplainHeapFetchesIndexOnlyScan + full internal/executor +
-internal/planner PASS; build+vet clean; pgbench smoke = pre-commit hook.
+Gates run: TestOrderedIndexOnlyScan{Promoted…,NotPromotedByDefault,RequiresAscending}
++ full internal/planner + internal/catalog + internal/executor + internal/server
+PASS; build+vet+gofmt clean; horizons re-probe (IOS plan matches); pgbench smoke =
+pre-commit hook.

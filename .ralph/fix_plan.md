@@ -1243,6 +1243,32 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       no IOS node exists → `Heap Fetches` NULL. NEXT (Effort-L): planner
       GUC-honoring + ordered-full-index→IOS promotion, then the MVCC
       pruning-horizon core. `TestExplainHeapFetchesIndexOnlyScan` PASS. Ledger.
+      **2026-06-25 (design 0118-0103, enabler — NOT a promotion):** ordered
+      full-index→IndexOnlyScan promotion gated on `enable_seqscan = off` (the
+      GUC `horizons`' `pruner` session sets). goopg's rule-based planner ignored
+      the planner-toggle GUCs and built `Project(Sort(SeqScan))` for an
+      ORDER-BY-only query, so `EXPLAIN (COSTS OFF) SELECT * FROM horizons_tst
+      ORDER BY data` showed `Sort → Seq Scan` not the expected `Index Only Scan
+      using horizons_tst_data_key on horizons_tst`. Three pieces: (1)
+      `dispatch.go` `sessionPlanCatalog`/`ctxPlanCatalog` thread `enable_seqscan`
+      into new `catalog.SearchPathCatalog.DisableSeqScan`; (2) planner
+      `currentSeqScanDisabled` walks the catalog wrapper chain (same `Unwrap()`
+      carrier pattern as `currentTempOwner`); (3) `tryPromoteOrderedIndexOnlyScan`
+      replaces `Project(Sort(SeqScan))` with an unbounded `IndexOnlyScan` (nil
+      Key/Keys/bounds → full-range `RangeScan` in ascending order, Sort dropped)
+      when a non-partial B-tree index's leading key columns match the
+      ASC/NULLS-LAST ORDER BY keys and its key+INCLUDE columns cover the
+      projection. PG-faithful gate (PG picks the IOS *because* SeqScan is
+      disabled) bounds blast radius to seqscan-disabled sessions — TPC-H/pgbench
+      never set it, so the branch no-ops and their plans are byte-identical.
+      Re-probe: IOS plan + `Heap Fetches` navigation now match; only 3 lines
+      differ — `L125` (temp prune-despite-older-snapshot expected 0/actual 2),
+      `L244`/`L254` (perm-table VACUUM-must-not-remove-still-visible expected
+      2/actual 0) — isolating the residual blocker to the Effort-L MVCC
+      pruning-horizon core (temp-always-prunable vs perm-respects-OldestXmin +
+      matching VACUUM cutoff). Tests `TestOrderedIndexOnlyScan{Promoted…,
+      NotPromotedByDefault,RequiresAscending}`; planner/catalog/executor/server
+      suites PASS; build+vet clean; pgbench smoke = pre-commit hook. Ledger row.
       **Remaining M0118-0009:** `intra-grant-inplace` (pg_class sibling — ALTER
       TABLE ADD PRIMARY KEY `<waiting>` behind FOR KEY SHARE on pg_class; needs
       runtime shared-catalog MVCC-tuple row locks — heavy), `horizons`
