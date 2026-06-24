@@ -527,6 +527,16 @@ type SeqScan struct {
 	// table still errors "does not exist"). M0118-0008 (alter-table-4 perm 3:
 	// `DROP TABLE c1` concurrent with `SELECT SUM(a) FROM p`).
 	SkipIfVanished bool
+	// InheritParentOID, when non-zero, is the OID of the inheritance parent this
+	// child scan was expanded from. After the scan acquires the child's lock
+	// (i.e. once any concurrent ALTER on the child has committed), the child's
+	// column types are re-validated against the parent's — a column whose type no
+	// longer matches the parent's raises "attribute %s of relation %s does not
+	// match parent's type", mirroring PostgreSQL's make_inh_translation_list
+	// (optimizer/util/appendinfo.c). Set together with SkipIfVanished on every
+	// inheritance-child scan. M0118-0008 (alter-table-4 perm 4: concurrent
+	// `ALTER TABLE c1 ALTER COLUMN a TYPE float`).
+	InheritParentOID uint32
 }
 
 func (n *SeqScan) Pos() int       { return n.pos }

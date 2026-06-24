@@ -2203,8 +2203,9 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// SkipIfVanished: this child was identified before locking it; if a
 				// concurrent DROP of the child commits while the scan waits on its
 				// lock, skip the now-gone child instead of erroring. M0118-0008
-				// (alter-table-4 perm 3).
-				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true}
+				// (alter-table-4 perm 3). InheritParentOID drives the post-lock
+				// type re-validation against the parent (alter-table-4 perm 4).
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
 				// wrap the scan in a remap Project that emits columns in parent

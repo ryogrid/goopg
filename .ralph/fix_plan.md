@@ -917,6 +917,29 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       AlterTable1/AlterTable3/CreateTrigger/TruncateConflict; `go test
       ./internal/{catalog,executor,server}/` + `-race`; `go build ./...` + `go vet`
       clean; pgbench smoke = pre-commit.
+      **2026-06-24 promotion (design 0118-0082): `alter-table-4` PROMOTED ⇒ all 4
+      permutations byte-for-byte.** Closes the spec on top of 0118-0080 (perms 1-2)
+      + 0118-0081 (perm 3). Perm 4 runs `ALTER TABLE c1 ALTER COLUMN a TYPE float`
+      on the inheritance child while a concurrent `SELECT SUM(a) FROM p` waits on
+      `c1`'s lock; once `s1` commits, PG `make_inh_translation_list`
+      (`optimizer/util/appendinfo.c`) re-matches each parent attr to the child by
+      name and raises `attribute "a" of relation "c1" does not match parent's type`
+      (42611) because `a` is now float on c1 / integer on p. goopg mutates c1's type
+      in the SHARED catalog immediately so the post-lock child scan from 0118-0081
+      (which only skipped a vanished child) now also re-validates TYPES: new
+      `planner.SeqScan.InheritParentOID` (set beside `SkipIfVanished` on every
+      inheritance-child scan) drives `validateInheritedColumnTypes` in
+      `seqScanOp.Open` mirroring `make_inh_translation_list` (match each non-dropped
+      parent column to the child by name, compare canonical type class via new
+      `canonicalTypeClass` which collapses integer/int4 + double precision/float8/
+      float + resolves domains while ignoring typmod args ⇒ only a genuine base-type
+      change trips it). Runs only for inheritance-child scans AFTER the lock (so the
+      error appears post-`<... completed>`, not reordering `<waiting ...>`);
+      partition leaves (`LockParentOID`) + direct scans untouched ⇒ zero false
+      positives (confirmed: AlterTable1/AlterTable3/InheritTemp strict + full
+      executor unit suite unchanged). `TestPort_IsolationAlterTable4` strict PASS (4
+      perms); `go test ./internal/{executor,planner,catalog}/`; `go build ./...` +
+      gofmt clean; pgbench smoke = pre-commit.
       **2026-06-24 enabler (design 0118-0076, NOT a promotion):
       `partition-concurrent-attach` piece (b) — ATTACH locks the DEFAULT
       partition.** `ALTER TABLE … ATTACH PARTITION` (non-default), inside an

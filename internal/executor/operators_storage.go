@@ -604,6 +604,13 @@ type seqScanOp struct {
 	// (alter-table-4 perm 3).
 	skipIfVanished bool
 
+	// inheritParentOID is the inheritance parent this child scan was expanded
+	// from (0 for a non-inheritance scan). After the child's lock is acquired
+	// (a concurrent ALTER on the child has committed) the child's column types
+	// are re-validated against the parent's; a mismatch raises the upstream
+	// "does not match parent's type" error. M0118-0008 (alter-table-4 perm 4).
+	inheritParentOID uint32
+
 	ctx  *Context
 	cols []catalog.Column
 
@@ -667,14 +674,93 @@ type seqScanOp struct {
 // latencies. A future loop turns this into a tunable GUC.
 const seqScanLookahead storage.BlockNumber = 4
 
+// validateInheritedColumnTypes mirrors PostgreSQL's make_inh_translation_list
+// (optimizer/util/appendinfo.c): for every parent column it finds the child
+// column of the same name and verifies the declared types still match. goopg
+// only produces a mismatch via a concurrent `ALTER TABLE child ALTER COLUMN c
+// TYPE …` (CREATE TABLE … INHERITS copies the parent's column types), so this
+// fires exactly when upstream does — after the child's lock is acquired during
+// inheritance expansion. A mismatch raises ERRCODE_INVALID_COLUMN_DEFINITION
+// (42611) with the parent attribute name and the child relation name, matching
+// upstream. Types are compared by canonical class so that equivalent aliases
+// (integer/int4, double precision/float8) never trip a false positive on a
+// legitimate inheritance scan. M0118-0008 (alter-table-4 perm 4).
+func validateInheritedColumnTypes(im *catalog.InMemory, parent, child *catalog.Table) error {
+	for _, pc := range parent.Columns {
+		if pc.Dropped {
+			continue
+		}
+		var cc *catalog.Column
+		for i := range child.Columns {
+			if child.Columns[i].Dropped {
+				continue
+			}
+			if strings.EqualFold(child.Columns[i].Name, pc.Name) {
+				cc = &child.Columns[i]
+				break
+			}
+		}
+		if cc == nil {
+			// A missing inherited column is a distinct (rare) failure mode handled
+			// elsewhere; do not synthesize a type-mismatch error for it.
+			continue
+		}
+		if canonicalTypeClass(im, pc.Type) != canonicalTypeClass(im, cc.Type) {
+			return &ExecError{
+				Code:    "42611",
+				Message: fmt.Sprintf("attribute %q of relation %q does not match parent's type", pc.Name, child.Name),
+			}
+		}
+	}
+	return nil
+}
+
+// canonicalTypeClass reduces a catalog type to a comparison token so that
+// equivalent spellings collapse to the same value (integer/int4/int → "int4",
+// double precision/float8/float → "float8", …), resolving domains to their base
+// type first. The array flag is folded in; the typmod args are intentionally NOT
+// compared (a coarser check than PostgreSQL's exact atttypmod) so the only thing
+// that can trip validateInheritedColumnTypes is a genuine base-type change.
+func canonicalTypeClass(im *catalog.InMemory, t catalog.Type) string {
+	name := strings.ToLower(t.Name)
+	if im != nil {
+		name = strings.ToLower(im.ResolveColumnType(name))
+	}
+	switch name {
+	case "int", "integer", "int4", "serial", "serial4":
+		name = "int4"
+	case "smallint", "int2", "smallserial", "serial2":
+		name = "int2"
+	case "bigint", "int8", "bigserial", "serial8":
+		name = "int8"
+	case "real", "float4":
+		name = "float4"
+	case "double precision", "double", "float8", "float":
+		name = "float8"
+	case "decimal", "numeric":
+		name = "numeric"
+	case "varchar", "character varying":
+		name = "varchar"
+	case "char", "character", "bpchar":
+		name = "bpchar"
+	case "bool", "boolean":
+		name = "bool"
+	}
+	if t.IsArray {
+		name += "[]"
+	}
+	return name
+}
+
 func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 	return &seqScanOp{
-		schema:         p.Output(),
-		tbl:            p.Table,
-		pos:            p.Pos(),
-		cols:           p.Table.Columns,
-		lockParentOID:  p.LockParentOID,
-		skipIfVanished: p.SkipIfVanished,
+		schema:           p.Output(),
+		tbl:              p.Table,
+		pos:              p.Pos(),
+		cols:             p.Table.Columns,
+		lockParentOID:    p.LockParentOID,
+		skipIfVanished:   p.SkipIfVanished,
+		inheritParentOID: p.InheritParentOID,
 	}
 }
 
@@ -736,6 +822,23 @@ func (o *seqScanOp) Open(ctx *Context) error {
 				o.nBlocks = 0
 				o.curBlock = 0
 				return nil
+			}
+			// M0118-0008 (alter-table-4 perm 4): now that we hold the child's lock
+			// (any concurrent ALTER on it has committed), re-validate the child's
+			// column types against the inheritance parent's, exactly as PostgreSQL's
+			// make_inh_translation_list does after locking each child during
+			// inheritance expansion (optimizer/util/appendinfo.c). A column whose
+			// type no longer matches the parent's (e.g. a concurrent
+			// `ALTER COLUMN a TYPE float`) raises ERRCODE_INVALID_COLUMN_DEFINITION.
+			if o.inheritParentOID != 0 {
+				if parent, ok2 := im.LookupTableByOID(o.inheritParentOID); ok2 {
+					if err := validateInheritedColumnTypes(im, parent, o.tbl); err != nil {
+						if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+							ee.Pos = o.pos
+						}
+						return err
+					}
+				}
 			}
 		}
 	}

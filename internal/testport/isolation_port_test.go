@@ -489,6 +489,27 @@ func TestPort_IsolationAlterTable1(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-1.spec")
 }
 
+// TestPort_IsolationAlterTable4 exercises the alter-table-4 spec (M0118-0008):
+// add/remove inheritance (ALTER TABLE NO INHERIT / INHERIT), DROP TABLE of an
+// inheritance child, and ALTER COLUMN TYPE on a child, all concurrent with
+// SELECT SUM(a) FROM the parent.
+//
+// PASS-REQUIRED (designs 0118-0080/0081/0082). Children are identified at plan
+// time but locked only when the scan opens, so a concurrent NO INHERIT / INHERIT
+// is not seen by the in-flight SELECT (perms 1-2), a concurrent DROP of a child
+// is coped with by skipping the vanished child (perm 3), and a concurrent
+// ALTER COLUMN a TYPE float on the child raises "attribute \"a\" of relation
+// \"c1\" does not match parent's type" once the child's lock is acquired
+// post-commit (perm 4) — mirroring PostgreSQL's make_inh_translation_list.
+// Byte-identical to PG 18.3 across all four permutations.
+func TestPort_IsolationAlterTable4(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_alter_table_4")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-4.spec")
+}
+
 // TestPort_IsolationPlpgsqlToast exercises the plpgsql-toast spec (M0118-0008):
 // PL/pgSQL procedures with transaction control (COMMIT inside a DO block) where
 // VACUUM in a second session — synchronized via advisory locks — runs between a
