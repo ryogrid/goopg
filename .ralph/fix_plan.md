@@ -850,6 +850,40 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `…NestedDefaultNamesLeaf`); `go test ./internal/executor/` PASS;
       `TestPort_IsolationDetachPartitionConcurrently1` strict PASS (shares attach
       setup, no false positive); `go build ./...` clean; pgbench smoke = pre-commit.
+      **2026-06-24 promotion (design 0118-0079): `partition-concurrent-attach`
+      PROMOTED ⇒ all 3 permutations byte-for-byte** (strict
+      `TestPort_IsolationPartitionConcurrentAttach`), closing the spec on top of
+      enablers 0118-0075..0078. Two final gaps. **Gap 1 (INSERT routing-path lock,
+      perms 1 & 3):** PG `ExecInsert` opens every partition a tuple is routed into
+      in `RowExclusiveLock`; goopg locked only the NAMED INSERT target (`tpart`)
+      and nothing along the routing path, so an `INSERT INTO tpart` routing THROUGH
+      the intermediate DEFAULT `tpart_default` never contended with a concurrent
+      ATTACH's `AccessExclusiveLock` (0118-0076) on that default. New
+      `lockRoutingPathPartitions(ctx, named, leaf)` (operators_storage.go) walks
+      the parent chain from the routed leaf up to (excluding) the named target and
+      `RowExclusive`-locks each INTERMEDIATE partition via `acquireWriteLockTxn`,
+      wired into `insertOp.Next` right after routing resolves the leaf ⇒ locks
+      `tpart_default`: perm 1's `s2i` waits behind the ATTACH then (post-commit,
+      live catalog has `tpart_2`) `checkDefaultPartitionInsertConstraint` re-routes
+      onto it → 23514; perm 3's `s2i` holds the lock to commit so `s1a`'s
+      `lockDefaultPartitionForAttach` acquire waits. RowExclusive is
+      self-compatible/DML-grade ⇒ concurrent partitioned INSERTs never block each
+      other; single-level partitioned tables (leaf's parent IS the named target)
+      and non-partitioned INSERTs are a no-op. **Gap 2 (fresh snapshot for the
+      ATTACH re-scan, perm 3):** once `s1a` waits it is unblocked only after `s2c`
+      commits, but its statement snapshot predates the wait, so
+      `checkDefaultPartitionDataConflict`'s scan didn't see `s2`'s just-committed
+      rows (attach wrongly succeeded → 6 rows). PG's
+      `check_default_partition_contents` scans under the latest snapshot; the
+      conflict scan now refreshes `synthCtx.Snap = TxnMgr.SnapshotFor(ctx.Tx)`
+      before opening (mirrors detach-4 post-wait RI re-validation 0118-0064; a
+      fresh snapshot also sees the txn's own writes ⇒ synchronous CREATE/ATTACH
+      unaffected) ⇒ `s1a` finds the rows → 23P01 naming leaf default
+      `tpart_default_default`. Gates: strict PASS (3 perms); no regression across
+      DetachPartitionConcurrently1/2/3/4 + AlterTable1/2/3 + CreateTrigger +
+      InheritTemp + TruncateConflict + ClusterConflict{,Partition} + VacuumConflict
+      (14 strict PASS, single run); `go test ./internal/executor/` + `-race`
+      partition/insert paths; `go build ./...` clean; pgbench smoke = pre-commit.
       **2026-06-24 enabler (design 0118-0076, NOT a promotion):
       `partition-concurrent-attach` piece (b) — ATTACH locks the DEFAULT
       partition.** `ALTER TABLE … ATTACH PARTITION` (non-default), inside an

@@ -1343,6 +1343,17 @@ func (o *insertOp) Next() (TupleSlot, error) {
 					return nil, &ExecError{Code: "23514", Pos: o.plan.Pos(),
 						Message: fmt.Sprintf("no partition of relation %q found for row", o.plan.Table.Name)}
 				}
+				// Lock every intermediate partition along the routing path (esp. a
+				// sub-partitioned DEFAULT) so a concurrent ATTACH PARTITION that holds
+				// ACCESS EXCLUSIVE on the default blocks this routed INSERT — and vice
+				// versa — until one transaction commits, then the live catalog is
+				// re-checked. partition-concurrent-attach (design 0118-0079).
+				if lerr := lockRoutingPathPartitions(o.ctx, o.plan.Table, routedPart); lerr != nil {
+					if ee, ok := lerr.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = o.plan.Pos()
+					}
+					return nil, lerr
+				}
 			}
 		}
 
@@ -1822,6 +1833,48 @@ func checkDefaultPartitionInsertConstraint(ctx *Context, leaf *catalog.Table, le
 			}
 		}
 		cur = parent
+	}
+	return nil
+}
+
+// lockRoutingPathPartitions takes a transaction-scoped ROW EXCLUSIVE lock on every
+// INTERMEDIATE partition the router descended through on the way from the named
+// INSERT target down to the routed leaf — i.e. every node strictly between the two.
+// The named target itself is already locked in insertOp.Open and the leaf is the
+// heap-write target (its locking is unchanged), so this fills in only the
+// in-between partitions, mirroring PostgreSQL, where ExecInsert opens every
+// partition a tuple is routed into in RowExclusiveLock.
+//
+// The load-bearing case is an intermediate DEFAULT partition that is itself
+// sub-partitioned (partition-concurrent-attach): an INSERT INTO tpart whose row
+// routes tpart → tpart_default → tpart_default_default must hold ROW EXCLUSIVE on
+// tpart_default so a concurrent ALTER TABLE tpart ATTACH PARTITION — which holds
+// ACCESS EXCLUSIVE on the default partition (design 0118-0076) — blocks it until
+// the attach commits. Once the lock is granted, the just-committed sibling is
+// visible in the live catalog, so checkDefaultPartitionInsertConstraint re-routes
+// the row onto it and raises 23514 (perm 1/2). Symmetrically, when the INSERT
+// commits first, ATTACH's AccessExclusive acquire on the default waits behind this
+// ROW EXCLUSIVE until the INSERT's transaction ends, then the attach-side re-scan
+// (checkDefaultPartitionDataConflict) finds the rows and raises 23P01 (perm 3).
+//
+// RowExclusive is self-compatible and conflicts only with DDL-grade lock modes, so
+// ordinary concurrent partitioned INSERTs never block each other. A single-level
+// partitioned table (leaf's parent IS the named target) has no intermediates, so
+// this is a no-op there. M0118-0008 (design 0118-0079).
+func lockRoutingPathPartitions(ctx *Context, named, leaf *catalog.Table) error {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || named == nil || leaf == nil || leaf.PartitionParentOID == 0 {
+		return nil
+	}
+	cur, found := im.LookupTableByOID(leaf.PartitionParentOID)
+	for guard := 0; found && cur != nil && cur.OID != named.OID && guard < 8; guard++ {
+		if err := ctx.acquireWriteLockTxn(ctx.Catalog.RelFileNode(cur)); err != nil {
+			return err
+		}
+		if cur.PartitionParentOID == 0 {
+			break
+		}
+		cur, found = im.LookupTableByOID(cur.PartitionParentOID)
 	}
 	return nil
 }

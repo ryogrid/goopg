@@ -1183,6 +1183,22 @@ func checkDefaultPartitionDataConflict(childName string, parent *catalog.Table, 
 		return nil
 	}
 	synthCtx := *ctx
+	// Use a FRESH snapshot for the conflict scan. An ALTER TABLE … ATTACH
+	// PARTITION that blocked on a concurrent INSERT routing to this default
+	// (RowExclusiveLock on the default vs the attach's AccessExclusiveLock,
+	// design 0118-0079) is unblocked only after that INSERT's transaction
+	// commits — but the attaching statement's own snapshot was taken at
+	// statement start, before the wait, so it cannot see the just-committed
+	// rows. PostgreSQL's check_default_partition_contents scans under the latest
+	// snapshot; mirror that so the offending rows are found
+	// (partition-concurrent-attach perm 3). A fresh snapshot also sees the
+	// transaction's own uncommitted writes, so the synchronous CREATE/ATTACH
+	// paths are unaffected.
+	if ctx.TxnMgr != nil && ctx.Tx.Handle != 0 {
+		if fresh, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
+			synthCtx.Snap = fresh
+		}
+	}
 	if err := op.Open(&synthCtx); err != nil {
 		op.Close()
 		return nil

@@ -619,6 +619,26 @@ func TestPort_IsolationClusterConflictPartition(t *testing.T) {
 // The cross-session plan cache is bypassed while any detach is pending
 // (partitionDetachPending), so each statement re-plans against its own snapshot
 // epoch. Byte-identical to PG 18.3 across all 13 permutations. Design 0118-0059.
+// TestPort_IsolationPartitionConcurrentAttach exercises the
+// partition-concurrent-attach spec (M0118-0008): a non-default partition is
+// attached to a range-partitioned table concurrently with an INSERT that, under
+// its pre-attach snapshot, routes through the table's sub-partitioned DEFAULT
+// partition. The INSERT takes a ROW EXCLUSIVE lock on every intermediate
+// partition along its routing path (esp. the default), which conflicts with the
+// ATTACH's ACCESS EXCLUSIVE lock on the default (design 0118-0076), so whichever
+// statement runs second waits for the other's transaction to commit; the loser
+// is then re-validated against a fresh snapshot — the routed INSERT re-routes
+// onto the now-visible sibling and raises 23514, or the ATTACH's default-content
+// re-scan finds the rows and raises 23P01. Byte-identical to PG 18.3 across all 3
+// permutations. Design 0118-0079.
+func TestPort_IsolationPartitionConcurrentAttach(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_partition_concurrent_attach")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/partition-concurrent-attach.spec")
+}
+
 func TestPort_IsolationDetachPartitionConcurrently1(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_detach_partition_1")
