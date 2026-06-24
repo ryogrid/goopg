@@ -1,29 +1,28 @@
 (idle — nothing in flight)
 
-Loop #31 COMPLETE + COMMITTED: M0118-0005 `fk-deadlock.spec` PROMOTED defer→pass
-(design 0118-0094), all 14 permutations byte-identical vs PG 18.3, strict
-`TestPort_IsolationFkDeadlock`.
+Loop #32 COMPLETE + COMMITTED: M0118-0007 `eval-plan-qual-trigger.spec` PROMOTED
+soft→strict (design 0118-0095). Probe found it already matches PG 18.3 byte-for-byte
+across all 38 active permutations with NO engine change — the harder half of the EPQ
+output-parity pair (BEFORE/AFTER row triggers + READ COMMITTED EvalPlanQual rechecks +
+key-update CTID-chain following + ON CONFLICT DO UPDATE upserts + REPEATABLE READ 40001,
+all via RETURNING + noisy_oper() NOTICE WHERE quals). Switched
+`TestPort_IsolationEvalPlanQualTrigger` to `runIsoSpecStrict`; CSV D-002 rationale +
+md regenerated (inventory already had `pass`). Strict PASS, stable.
 
-Root cause: a child INSERT's FK check is `SELECT … FOR KEY SHARE` on the parent
-row, which conflicts ONLY with a key-changing modification (key UPDATE / DELETE)
-and is COMPATIBLE with a concurrent no-key UPDATE. `scanRelForFKMatch`
-(internal/executor/operators_fk.go) treated ANY in-flight non-self non-lock-only
-xmax as a wait, so a child INSERT blocked behind a peer's in-flight no-key parent
-UPDATE where PG proceeds (sibling-paths gap vs lockRowsOp, which already keys its
-wait on keysUpdated). Fix: new helpers `fkXmaxIsKeyChanging` (single-xid:
-HEAP_KEYS_UPDATED OR structural-delete via self-pointing/invalid t_ctid) +
-`multixactUpdaterIsKeyChanging` (updater member StatusUpdate vs StatusNoKeyUpdate);
-no-key updater = clean match (no wait), key UPDATE/DELETE still waits+rescans.
+M0118-0007 STILL OPEN: sibling `eval-plan-qual` defers (cross-table EPQ recheck returns
+`(0 rows)` where PG re-projects updated row + EXPLAIN/column-format diffs ~L1171).
 
-Next loop options (all genuinely large remaining M0118 subsystems — none is a cheap
-front-end promotion, the easy ones are harvested):
-- M0118-0005 remaining: ri-trigger (user RI constraint-trigger firing),
-  fk-partitioned-1/2 (ALTER TABLE ATTACH PARTITION + partitioned-FK).
-- M0118-0007: eval-plan-qual (EPQ-over-join recheck re-projection).
-- M0118-0009 misc (each a full subsystem): horizons (jsonb `->`/`->>` operators —
-  NO opcode/eval today, plus EXPLAIN json Heap Fetches + IOS prune horizon),
-  intra-grant-inplace{,-db} (real pg_class MVCC tuple + tuple-lock + catalog
-  deadlock — pg_class is virtual), stats (pg_stat_* cumulative-stats infra +
-  pg_stat_force_next_flush), prepared-transactions{,-cic} (2PC + SSI integration).
-- Probe new candidates with a throwaway zz_probe_test.go (TestProbe → RunAndCompare,
-  log .Diff) before committing to one.
+Probe results this loop (throwaway zz_probe_test.go, since removed):
+- eval-plan-qual-trigger = PASS (promoted this loop)
+- eval-plan-qual = defer (EXPLAIN/col-format diffs ~L1172)
+- ri-trigger = defer (separator-line/format diffs)
+- horizons = defer (jsonb ops + IOS prune horizon)
+- fk-partitioned-1/2 = defer (ALTER TABLE ATTACH PARTITION + partitioned-FK)
+
+Next loop options (all genuinely large remaining M0118 subsystems):
+- M0118-0007: eval-plan-qual (EPQ-over-join re-projection + EXPLAIN format).
+- M0118-0005: ri-trigger, fk-partitioned-1/2.
+- M0118-0009 misc (each a full subsystem): horizons (jsonb ->/->> + IOS prune horizon),
+  intra-grant-inplace{,-db} (pg_class MVCC tuple — virtual today), stats (pg_stat_*
+  cumulative infra), prepared-transactions{,-cic} (2PC + SSI).
+- Probe new candidates with throwaway zz_probe_test.go before committing.

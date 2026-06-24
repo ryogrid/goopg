@@ -203,13 +203,22 @@ func TestPort_IsolationEvalPlanQual(t *testing.T) {
 }
 
 // TestPort_IsolationEvalPlanQualTrigger exercises the eval-plan-qual-trigger spec.
-// Requires: BEGIN ISOLATION LEVEL, CREATE TRIGGER, CREATE TABLE INHERITS.
+// PROMOTED to pass-required (2026-06-25, design 0118-0095): all 38 active
+// permutations match PG 18.3 byte-for-byte. The spec is the hardest half of the
+// EPQ output-parity pair — it stacks BEFORE/AFTER row triggers (plpgsql
+// trig_report firing on INSERT/UPDATE/DELETE) on top of READ COMMITTED EPQ
+// rechecks, key-update CTID-chain following, ON CONFLICT DO UPDATE upserts, and
+// REPEATABLE READ 40001 serialization failures, all with RETURNING projection
+// and NOTICE-emitting noisy_oper() WHERE quals. Its byte-for-byte match
+// evidences that goopg's EvalPlanQual re-projects through the trigger queue and
+// the upsert arbiter exactly as PG does. The sibling eval-plan-qual spec still
+// defers (EXPLAIN/column-format diffs), so the M0118-0007 group stays open.
 func TestPort_IsolationEvalPlanQualTrigger(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_eval_pq_trig")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual-trigger.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual-trigger.spec")
 }
 
 // TestPort_IsolationLockCommittedKeyupdate exercises the lock-committed-keyupdate
