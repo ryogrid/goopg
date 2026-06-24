@@ -169,6 +169,55 @@ func epqRecheckVisible(ctx *Context, rel storage.RelFileNode, blk storage.BlockN
 	return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.MultiXact), nil
 }
 
+// epqXmaxSettled classifies a concurrent modifier xid for an EvalPlanQual
+// recheck under REPEATABLE READ / SERIALIZABLE, using the transaction manager
+// authoritatively rather than the (frozen) snapshot's InProgress set. It must be
+// called only AFTER epqWait has returned, i.e. xmax is no longer running.
+//
+// The trap it closes: a transaction that began AFTER our frozen RR/SSI snapshot
+// is absent from snap.InProgress, so the legacy "absent ⇒ aborted" shortcut
+// (`!snap.HasInProgress(xmax)`) misclassifies a concurrently-COMMITTED updater
+// as aborted and proceeds with our write — a silent lost update where PG raises
+// SQLSTATE 40001. Consulting the manager makes the decision robust to the timing
+// at which the RR/SSI snapshot was pinned. 0118-0105.
+//
+// Returns aborted=true when xmax rolled back (caller proceeds with its write);
+// committed=true when xmax committed (caller raises 40001); both false when xmax
+// is still active (caller retries). When no manager is wired (unit-test paths)
+// both are false so callers fall back to their legacy snapshot heuristic.
+func epqXmaxSettled(ctx *Context, xmax storage.TransactionID) (aborted, committed bool) {
+	if ctx.TxnMgr == nil {
+		return false, false
+	}
+	if ctx.TxnMgr.HasAbortedXID(xmax) {
+		return true, false
+	}
+	if ctx.TxnMgr.IsXIDActive(xmax) {
+		return false, false
+	}
+	return false, true
+}
+
+// epqSerializationErr builds the SQLSTATE 40001 error for an EvalPlanQual abort,
+// distinguishing a concurrent DELETE from a concurrent UPDATE by the original
+// tuple's CTID: goopg leaves a DELETE'd tuple's CTID at the initial
+// {InvalidBlockNumber,0} (stampOldCtid only runs on UPDATE), so an
+// InvalidBlockNumber block means the row was deleted. 0118-0105.
+func epqSerializationErr(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16, pos int) *ExecError {
+	errMsg := "could not serialize access due to concurrent update"
+	if sp, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk}); perr == nil {
+		sp.RLock()
+		if ot, gerr := storage.PageGetHeapTuple(sp.Page(), slot); gerr == nil {
+			if ot.Header.CTID.Block == storage.InvalidBlockNumber {
+				errMsg = "could not serialize access due to concurrent delete"
+			}
+		}
+		sp.RUnlock()
+		ctx.Pool.Unpin(sp)
+	}
+	return &ExecError{Code: "40001", Pos: pos, Message: errMsg}
+}
+
 // epqFollowHOT follows the HOT chain from (rel, blk, slot) to find the
 // latest visible version after a concurrent UPDATE committed (M0100-0004).
 // Re-evaluates pred (WHERE) against the latest tuple; returns the slot,
@@ -3200,6 +3249,21 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 					visible, _ := epqRecheckVisible(o.ctx, rel, pu.blk, pu.slot)
 					if visible {
+						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+							// RR/SSI: classify xmax authoritatively, not by snapshot
+							// membership — a committer that started after our frozen
+							// snapshot is absent from snap.InProgress (0118-0105).
+							aborted, committed := epqXmaxSettled(o.ctx, xmax)
+							if aborted {
+								epqDoUpdate = true
+								continue
+							}
+							if committed {
+								return nil, epqSerializationErr(o.ctx, rel, pu.blk, pu.slot, o.plan.Pos())
+							}
+							continue // still active; retry
+						}
+						// RC (or no manager): legacy snapshot heuristic.
 						// xmax aborted; row still exists at original slot.
 						if !o.ctx.Snap.HasInProgress(xmax) {
 							// M0100-0005: mark as do-update and retry so the
@@ -3687,33 +3751,26 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					visible, _ := epqRecheckVisible(o.ctx, captureRel, writeBlk, writeSlot)
 					if visible {
+						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+							// RR/SSI: classify xmax authoritatively, not by snapshot
+							// membership — a committer that started after our frozen
+							// snapshot is absent from snap.InProgress (0118-0105).
+							aborted, committed := epqXmaxSettled(o.ctx, xmax)
+							if aborted {
+								break // xmax aborted; row unchanged
+							}
+							if committed {
+								// frozen snapshot is stale; serialize-fail.
+								return epqSerializationErr(o.ctx, captureRel, writeBlk, writeSlot, o.plan.Pos())
+							}
+							continue // still active; retry
+						}
+						// RC (or no manager): legacy snapshot heuristic.
 						if !o.ctx.Snap.HasInProgress(xmax) {
 							break // xmax aborted; row unchanged
 						}
-						// RR/SSI: snapshot is frozen at BEGIN; HasInProgress may still
-						// return true for a xmax that has since settled globally.
-						if o.ctx.TxnMgr != nil {
-							if o.ctx.TxnMgr.HasAbortedXID(xmax) {
-								break // xmax globally aborted; row unchanged
-							}
-							if !o.ctx.TxnMgr.IsXIDActive(xmax) {
-								// xmax committed; frozen snapshot is stale. Raise 40001.
-								errMsg := "could not serialize access due to concurrent update"
-								if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: captureRel, Block: writeBlk}); perr == nil {
-									sp.RLock()
-									if ot, gerr := storage.PageGetHeapTuple(sp.Page(), writeSlot); gerr == nil {
-										ctid := ot.Header.CTID
-										// goopg initial CTID is {InvalidBlockNumber,0}; stampOldCtid
-										// only runs on UPDATE. InvalidBlockNumber ⇒ deleted.
-										if ctid.Block == storage.InvalidBlockNumber {
-											errMsg = "could not serialize access due to concurrent delete"
-										}
-									}
-									sp.RUnlock()
-									o.ctx.Pool.Unpin(sp)
-								}
-								return &ExecError{Code: "40001", Pos: o.plan.Pos(), Message: errMsg}
-							}
+						if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
+							break // xmax globally aborted; row unchanged
 						}
 						continue
 					}
@@ -3897,19 +3954,30 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 					visible, _ := epqRecheckVisible(o.ctx, puRel, pu.blk, pu.slot)
 					if visible {
-						// xmax aborted; row still exists.
+						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+							// RR/SSI: classify xmax authoritatively, not by snapshot membership —
+							// a committer that started after our frozen snapshot is absent from
+							// snap.InProgress (0118-0105).
+							aborted, committed := epqXmaxSettled(o.ctx, xmax)
+							if aborted {
+								epqDoUpdateSeq = true
+								continue // bypass EPQ on next iter; update code executes
+							}
+							if committed {
+								return nil, epqSerializationErr(o.ctx, puRel, pu.blk, pu.slot, o.plan.Pos())
+							}
+							continue // still active; retry
+						}
+						// RC (or no manager): legacy snapshot heuristic.
 						if !o.ctx.Snap.HasInProgress(xmax) {
 							epqDoUpdateSeq = true
 							continue // bypass EPQ on next iter; update code executes
 						}
-						// M0100-0011: RR/Serializable firstSnap is frozen at BEGIN;
-						// HasInProgress may still return true for an XID that has
-						// since aborted. Confirm via the manager's global abort list.
 						if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
 							epqDoUpdateSeq = true
-							continue
+							continue // bypass EPQ on next iter; update code executes
 						}
-						continue // still in-progress; retry
+						continue
 					}
 					// Concurrent tx committed — row was updated or deleted.
 					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
@@ -4382,19 +4450,25 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					}
 					visible, _ := epqRecheckVisible(o.ctx, captureRel, deleteBlk, deleteSlot)
 					if visible {
+						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+							// RR/SSI: classify xmax authoritatively, not by snapshot membership —
+							// a committer that started after our frozen snapshot is absent from
+							// snap.InProgress (0118-0105).
+							aborted, committed := epqXmaxSettled(o.ctx, xmax)
+							if aborted {
+								break // xmax aborted; row unchanged, proceed with delete
+							}
+							if committed {
+								return epqSerializationErr(o.ctx, captureRel, deleteBlk, deleteSlot, o.plan.Pos())
+							}
+							continue // still active; retry
+						}
+						// RC (or no manager): legacy snapshot heuristic.
 						if !o.ctx.Snap.HasInProgress(xmax) {
 							break // xmax aborted; row unchanged, proceed with delete
 						}
-						// RR/SSI: snapshot frozen at BEGIN; check global state.
-						if o.ctx.TxnMgr != nil {
-							if o.ctx.TxnMgr.HasAbortedXID(xmax) {
-								break // xmax globally aborted; row unchanged
-							}
-							if !o.ctx.TxnMgr.IsXIDActive(xmax) {
-								// xmax committed; frozen snapshot is stale. Raise 40001.
-								return &ExecError{Code: "40001", Pos: o.plan.Pos(),
-									Message: "could not serialize access due to concurrent update"}
-							}
+						if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
+							break // xmax aborted; row unchanged, proceed with delete
 						}
 						continue
 					}
@@ -4517,19 +4591,30 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 				visible, _ := epqRecheckVisible(o.ctx, victimRel, v.blk, v.slot)
 				if visible {
-					// xmax aborted; row still exists.
+					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+						// RR/SSI: classify xmax authoritatively, not by snapshot membership —
+						// a committer that started after our frozen snapshot is absent from
+						// snap.InProgress (0118-0105).
+						aborted, committed := epqXmaxSettled(o.ctx, xmax)
+						if aborted {
+							epqDoDelete = true
+							continue // bypass EPQ on next iter; delete code executes
+						}
+						if committed {
+							return nil, epqSerializationErr(o.ctx, victimRel, v.blk, v.slot, o.plan.Pos())
+						}
+						continue // still active; retry
+					}
+					// RC (or no manager): legacy snapshot heuristic.
 					if !o.ctx.Snap.HasInProgress(xmax) {
 						epqDoDelete = true
 						continue // bypass EPQ on next iter; delete code executes
 					}
-					// M0100-0011: RR/Serializable firstSnap is frozen at BEGIN;
-					// HasInProgress may still return true for an XID that has
-					// since aborted. Confirm via the manager's global abort list.
 					if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
 						epqDoDelete = true
-						continue
+						continue // bypass EPQ on next iter; delete code executes
 					}
-					continue // still in-progress; retry
+					continue
 				}
 				// Concurrent tx committed — row was updated or deleted.
 				if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {

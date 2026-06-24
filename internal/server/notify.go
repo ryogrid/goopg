@@ -174,6 +174,25 @@ func isNotifyStmt(stmt parser.Stmt) bool {
 	return false
 }
 
+// stmtTakesSnapshot reports whether stmt reads MVCC heap data and therefore
+// causes PostgreSQL to acquire the transaction's snapshot. Used by the simple-
+// query batch loop to pin a REPEATABLE READ / SERIALIZABLE transaction's
+// snapshot at the first *data* statement of a batched `BEGIN ISOLATION LEVEL …`
+// message (PG-correct timing), while NOT pinning it for a trailing utility
+// statement such as SET/SHOW/RESET that takes no snapshot (e.g. a batched
+// `BEGIN … SERIALIZABLE; SET debug_parallel_query = on;`). It is an allowlist
+// of the data-reading statement kinds: a statement not listed simply falls back
+// to the historical lazy pin (at the next separate-message statement), so a
+// miss is conservative, never an SSI/RR correctness hazard. Design 0118-0105.
+func stmtTakesSnapshot(stmt parser.Stmt) bool {
+	switch stmt.(type) {
+	case *parser.SelectStmt, *parser.InsertStmt, *parser.UpdateStmt,
+		*parser.DeleteStmt, *parser.MergeStmt, *parser.DeclareCursorStmt:
+		return true
+	}
+	return false
+}
+
 // execNotifyStmt handles LISTEN/NOTIFY/UNLISTEN at the server layer. Returns
 // handled=false for any other statement so the normal planner path runs. LISTEN
 // and UNLISTEN take effect immediately (PostgreSQL applies them at commit, but

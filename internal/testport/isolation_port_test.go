@@ -1667,7 +1667,7 @@ func TestPort_IsolationHorizons(t *testing.T) {
 	c := newCluster(t, "iso_horizons")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/horizons.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/horizons.spec")
 }
 
 // TestPort_IsolationDeadlockSimple exercises the deadlock-simple spec: two

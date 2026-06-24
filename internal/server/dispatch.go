@@ -731,6 +731,27 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 			}
 			ectx.Snap = snap2
+		} else if stmtTakesSnapshot(stmt) {
+			// RR/SSI: pin the transaction's snapshot at the FIRST snapshot-taking
+			// batched statement after a `BEGIN ISOLATION LEVEL …` that shares its
+			// simple-query message with following statements (PG-correct timing —
+			// PG defers the SSI/RR snapshot to the first statement that actually
+			// reads MVCC data, NOT to BEGIN and NOT to a utility statement like
+			// SET/SHOW/RESET). SnapshotFor pins firstSnap + registers the
+			// proc-array xmin on the first call and returns the pinned clone
+			// thereafter, so this is idempotent across the batch. Without it a
+			// batched `BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1;` never
+			// registers its xmin and OldestXmin/VACUUM ignore the session
+			// (horizons perm 4). Gating on stmtTakesSnapshot keeps a batched
+			// `BEGIN … SERIALIZABLE; SET debug_parallel_query = on;` from pinning
+			// the snapshot before the session's first real read
+			// (serializable-parallel). The lost-update hazard this earlier pin
+			// would otherwise expose is handled authoritatively in the
+			// EvalPlanQual write paths (epqXmaxSettled). Design 0118-0105.
+			snap2, err := s.cfg.TxnMgr.SnapshotFor(ectx.Tx)
+			if err == nil {
+				ectx.Snap = snap2
+			}
 		}
 		// Per-statement reset: clear the DML-CTE write fence and the regular-CTE
 		// row cache from any previous statement. The row cache is query-scoped:
