@@ -44,6 +44,20 @@ func (e *cancelEntry) cancel(secretKey uint32) bool {
 	return true
 }
 
+// cancelNoSecret fires the active query cancel function without checking the
+// secret key. Used by the in-server, privileged pg_cancel_backend(pid) path
+// (the caller is an authenticated backend signalling a peer, not an
+// unauthenticated CancelRequest off the wire). It is a no-op when the backend
+// is idle (queryCancel == nil); the caller treats the mere existence of the
+// entry as "the backend exists" for the returned boolean.
+func (e *cancelEntry) cancelNoSecret() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.queryCancel != nil {
+		e.queryCancel()
+	}
+}
+
 // backendCancelRegistry is a process-wide map from backend pid to its
 // cancel entry. The registry is safe for concurrent use.
 type backendCancelRegistry struct {
@@ -85,4 +99,21 @@ func (r *backendCancelRegistry) cancelQuery(pid, secretKey uint32) {
 		return
 	}
 	e.cancel(secretKey)
+}
+
+// cancelByPID cancels the in-flight query of the backend with the given pid
+// WITHOUT a secret key — the privileged, in-server path behind the
+// pg_cancel_backend(pid) SQL function. Returns true if a backend with that pid
+// is registered (the signal was "sent", mirroring PG returning true when the
+// target is a live backend even if idle), false if the pid is unknown (PG emits
+// a WARNING and returns false in that case).
+func (r *backendCancelRegistry) cancelByPID(pid uint32) bool {
+	r.mu.Lock()
+	e, ok := r.entries[pid]
+	r.mu.Unlock()
+	if !ok {
+		return false
+	}
+	e.cancelNoSecret()
+	return true
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/lockwait"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -124,6 +125,29 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				return err
 			}
 			return w.WriteReadyForQuery(protocol.TxStatusIdle)
+		}
+		// A multi-statement batch whose FIRST statement is CREATE/DROP ROLE
+		// (which the parser does not recognise, so the whole batch lands here)
+		// must not be swallowed wholesale by the single-statement role-DDL
+		// intercept below — that would drop the trailing statements (e.g. the
+		// CREATE TABLE in a "CREATE ROLE x; CREATE TABLE y" isolation setup).
+		// Peel the leading role statement off, handle it, then recurse on the
+		// remainder so every statement runs. M0118-0008.
+		if first, rest, ok := splitLeadingRoleDDL(sql); ok {
+			if handled, herr := s.tryHandleRoleDDL(first); handled {
+				if herr != nil {
+					return s.writeQueryError(w, roleErrorSQLState(herr), herr.Error())
+				}
+				normFirst := normalizeCompatSQL(first)
+				tag := "CREATE ROLE"
+				if !strings.HasPrefix(normFirst, "create ") {
+					tag = "DROP ROLE"
+				}
+				if err := w.WriteCommandComplete(tag); err != nil {
+					return err
+				}
+				return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, rest, connTx, prepStmts)
+			}
 		}
 		// Role DDL (CREATE/DROP ROLE/USER) is not yet in the parser but needs
 		// actual role tracking so DROP ROLE fails on nonexistent roles.
@@ -236,6 +260,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	ectx.Catalog = s.cfg.Catalog
 	// PlanCatalog will be set to a search-path-aware wrapper after sess is wired.
 	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.MultiXact = s.cfg.MultiXact
 	ectx.Tx = tx
 	// Wire the per-connection session into the executor so advisory locks
 	// and other session-scoped state are properly tracked.
@@ -304,10 +329,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// use it when calling planner.Plan for internal validation. M0097-0022.
 		ectx.PlanCatalog = sessionPlanCatalog(sess, s.cfg.Catalog)
 	}
-	if ectx.Session != nil {
-		advisoryReleaseTarget = ectx.Session
-	} else if ectx.AdvisorySessionIdentity != nil {
+	// Match advisorySessionIDFromContext's preference order: the per-connection
+	// AdvisorySessionIdentity (SessionRegistry) is the stable advisory owner, so
+	// xact-scoped advisory locks must be released under THAT identity at txn end
+	// — not the BasicSession, which is nil before the first BEGIN. M0118-0003.
+	if ectx.AdvisorySessionIdentity != nil {
 		advisoryReleaseTarget = ectx.AdvisorySessionIdentity
+	} else if ectx.Session != nil {
+		advisoryReleaseTarget = ectx.Session
 	}
 	ectx.EnableOpportunisticPrune = sessionOpportunisticPrune(sess)
 	ectx.FSM = s.cfg.FSM
@@ -316,7 +345,25 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	ectx.PubSub = s.cfg.PubSub
 	ectx.LockMgr = s.cfg.LockMgr
 	ectx.BackendID = backendID
+	// Inside an explicit transaction block, expose the stable per-connection
+	// lock-manager identity so LOCK TABLE can hold a transaction-scoped
+	// heavyweight lock that survives this statement's ReleaseAll(backendID)
+	// and is released only at COMMIT/ROLLBACK (connTxState.End). Zero outside
+	// an explicit block keeps autocommit LOCK display-only. M0118-0003.
+	if connTx != nil && connTx.InExplicit() {
+		ectx.TxnLockBackendID = connTx.LockBackendID
+	}
 	ectx.Activity = s.cfg.Activity
+	// Wire pg_cancel_backend(pid) to the process-wide cancel registry so a
+	// backend can signal a peer's in-flight query (privileged, no secret key —
+	// the caller is an authenticated session, not an off-wire CancelRequest).
+	// M0118-0008 (detach-partition-concurrently-3/4 s1cancel).
+	ectx.CancelBackend = func(pid int32) bool {
+		if pid <= 0 {
+			return false
+		}
+		return s.cancelReg.cancelByPID(uint32(pid))
+	}
 	if connTx != nil {
 		ectx.ProcNum = connTx.ProcNum
 	}
@@ -360,6 +407,43 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	// executeExtendedQueryViaExecutor.
 	if connTx != nil {
 		s.wireExtensionRows(ectx, connTx.DBName)
+	}
+
+	// Wire PL/pgSQL transaction control (COMMIT/ROLLBACK inside a DO block or a
+	// procedure) ONLY in auto-commit mode — i.e. not inside an explicit BEGIN
+	// block, where PG rejects transaction termination (SQLSTATE 2D000). The
+	// callback commits/rolls back the current auto-commit transaction and chains
+	// into a fresh one, updating the outer `tx`/`snap` so the trailing
+	// auto-commit (and per-statement RC snapshot refresh) operate on the new
+	// transaction. Session-scoped advisory locks survive (only xact-scoped locks
+	// are released), matching PG. M0118-0008 (plpgsql-toast).
+	if autoCommit {
+		var chainPN int32
+		if connTx != nil {
+			chainPN = connTx.ProcNum
+		}
+		ectx.PLpgSQLCommitChain = func(rollback bool) error {
+			if rollback {
+				_ = s.cfg.TxnMgr.Rollback(tx)
+			} else if cerr := s.cfg.TxnMgr.Commit(tx); cerr != nil {
+				return cerr
+			}
+			executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
+			newTx, berr := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, chainPN)
+			if berr != nil {
+				return berr
+			}
+			newSnap, serr := s.cfg.TxnMgr.SnapshotFor(newTx)
+			if serr != nil {
+				_ = s.cfg.TxnMgr.Rollback(newTx)
+				return serr
+			}
+			tx = newTx
+			snap = newSnap
+			ectx.Tx = newTx
+			ectx.Snap = newSnap
+			return nil
+		}
 	}
 
 	// Update pg_stat_activity before dispatching.
@@ -560,6 +644,25 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				// Since we have the parsed query, reconstruct by storing
 				// the original sql text (trimmed to the cursor portion).
 				connTx.cursorDeclare(dc.Name, sql)
+				// Materialise the cursor eagerly at DECLARE, mirroring PG: a
+				// cursor's portal is opened and its snapshot taken at DECLARE,
+				// not at first FETCH. This matters for snapshot stability and
+				// for locking: inside an explicit transaction the materialising
+				// scan takes a txn-scoped AccessShare on every relation it reads
+				// (acquireScanReadLockTxn), held to commit, so a concurrent
+				// ALTER TABLE … DETACH PARTITION … CONCURRENTLY parks behind the
+				// open cursor (it waits for relation lockers) and a later FETCH
+				// returns the declaration-time partition set rather than the
+				// post-detach one. goopg already buffers all rows at first FETCH,
+				// so this only shifts the materialisation point earlier (no new
+				// memory cost). M0118-0008 detach-partition-concurrently-4
+				// (design 0118-0063). A materialisation error surfaces at DECLARE
+				// (as in PG, where planning/opening happens at DECLARE).
+				if cur, found := connTx.cursorLookup(dc.Name); found {
+					if err := s.materializeCursor(ectx, cur, dc.Name); err != nil {
+						return s.writeQueryError(w, execErrCode(err), execErrMsg(err))
+					}
+				}
 			}
 			if err := w.WriteCommandComplete("DECLARE CURSOR"); err != nil {
 				return err
@@ -630,6 +733,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 					// the batch (PG aborts the whole message on error).
 					if !autoCommit && connTx != nil && connTx.InExplicit() {
 						connTx.Fail()
+						connTx.ReleasePinnedSnapshotOnFail(ectx.TxnMgr)
 					}
 					return nil
 				}
@@ -643,7 +747,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// plan, cache, then execute.
 		var precached planner.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) {
 			cacheKey = normalizeCompatSQL(sql)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -666,11 +770,18 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// context.DeadlineExceeded and the executor surfaces error 57014.
 		savedCtx := ectx.Ctx
 		var stmtCancel context.CancelFunc
+		stmtCtx := ctx
 		if timeoutMs := sessionStatementTimeout(sess); timeoutMs > 0 {
-			var stmtCtx context.Context
 			stmtCtx, stmtCancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
-			ectx.Ctx = stmtCtx
 		}
+		// Carry the session's lock_timeout down to the lock-wait primitives
+		// (lockmgr / WaitForXID) so a statement that blocks on a lock is
+		// aborted with "canceling statement due to lock timeout" after the
+		// configured interval, independent of statement_timeout. M0118-0009.
+		if ltMs := sessionLockTimeout(sess); ltMs > 0 {
+			stmtCtx = lockwait.WithTimeout(stmtCtx, time.Duration(ltMs)*time.Millisecond)
+		}
+		ectx.Ctx = stmtCtx
 		err := s.executeOneSimpleStmt(w, ectx, stmt, connTx, &autoCommit, precached)
 		if stmtCancel != nil {
 			stmtCancel()
@@ -687,6 +798,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				// in the same transaction block get 25P02 (M0100-0005).
 				if !autoCommit && connTx != nil && connTx.InExplicit() {
 					connTx.Fail()
+					connTx.ReleasePinnedSnapshotOnFail(ectx.TxnMgr)
 				}
 				return nil
 			}
@@ -821,6 +933,71 @@ func sessionStatementTimeout(sess *config.SessionRegistry) int64 {
 	return ms
 }
 
+// sessionLockTimeout reads the effective `lock_timeout` GUC from the session
+// and returns it in milliseconds. Returns 0 (no timeout) if the setting is
+// missing, zero, or unparseable. Unlike statement_timeout this bounds only
+// the time spent *waiting for a lock*, so it is plumbed into the lock-wait
+// primitives via lockwait.WithTimeout rather than the statement deadline.
+// M0118-0009.
+func sessionLockTimeout(sess *config.SessionRegistry) int64 {
+	if sess == nil {
+		return 0
+	}
+	_, eff, ok := sess.Get("lock_timeout")
+	if !ok {
+		return 0
+	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(eff), 10, 64)
+	if err != nil || ms <= 0 {
+		return 0
+	}
+	return ms
+}
+
+// sessionTempInheritanceActive reports whether the base catalog currently has a
+// session-owned temporary inheritance child. When true the cross-session plan
+// cache must be bypassed: a query scanning an inheritance parent expands to a
+// session-specific child set (RELATION_IS_OTHER_TEMP), so one session's cached
+// plan would wrongly be served to another. Returns false (cache enabled) for
+// any catalog that does not expose the check. Design 0118-0037 (inherit-temp).
+func sessionTempInheritanceActive(base catalog.Catalog) bool {
+	type tempInheritChecker interface{ HasTempInheritanceChildren() bool }
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if c, ok := base.(tempInheritChecker); ok {
+			return c.HasTempInheritanceChildren()
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+		} else {
+			return false
+		}
+	}
+}
+
+// partitionDetachPending reports whether the base catalog currently has a
+// partition child marked detach-pending by an in-progress
+// ALTER TABLE … DETACH PARTITION … CONCURRENTLY. When true the cross-session
+// plan cache must be bypassed: the visible partition set is snapshot-relative
+// (catalog.VisiblePartitionChildren), so a query scanning the parent must
+// re-plan against its own snapshot epoch rather than reuse a plan baked at a
+// different epoch. Returns false (cache enabled) for any catalog that does not
+// expose the check. Design 0118-0059 (detach-partition-concurrently).
+func partitionDetachPending(base catalog.Catalog) bool {
+	type checker interface{ HasPendingPartitionDetach() bool }
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if c, ok := base.(checker); ok {
+			return c.HasPendingPartitionDetach()
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+		} else {
+			return false
+		}
+	}
+}
+
 // sessionPlanCatalog returns a search-path-aware catalog wrapper for use when
 // calling planner.Plan. The wrapper re-reads search_path dynamically so that
 // SET search_path changes take effect on the next statement. When sess is nil
@@ -829,9 +1006,16 @@ func sessionPlanCatalog(sess *config.SessionRegistry, base catalog.Catalog) cata
 	if sess == nil {
 		return base
 	}
-	return catalog.WithSearchPath(base, func() []string {
+	wrapped := catalog.WithSearchPath(base, func() []string {
 		return searchPathSchemas(sess)
 	})
+	// Carry the session's temp-relation ownership token so the planner drops
+	// other-session temp inheritance children during expansion. Must match
+	// executor.sessionTempOwner: "s"+UniqueID(). Design 0118-0036 (inherit-temp).
+	if id := sess.UniqueID(); id != 0 {
+		wrapped.TempOwnerToken = "s" + strconv.FormatUint(id, 10)
+	}
+	return wrapped
 }
 
 // ctxPlanCatalog is like sessionPlanCatalog but reads search_path from an
@@ -842,13 +1026,27 @@ func ctxPlanCatalog(ctx *executor.Context, base catalog.Catalog) catalog.Catalog
 		return base
 	}
 	getSetting := ctx.GetSetting // capture
-	return catalog.WithSearchPath(base, func() []string {
+	wrapped := catalog.WithSearchPath(base, func() []string {
 		sp, ok := getSetting("search_path")
 		if !ok || sp == "" {
 			return []string{"public"}
 		}
 		return parseSearchPathSchemas(sp)
 	})
+	// Carry the session temp-owner token (matches executor.sessionTempOwner) so
+	// the planner applies the RELATION_IS_OTHER_TEMP exclusion. Design 0118-0036.
+	if s, ok := ctx.AdvisorySessionIdentity.(interface{ UniqueID() uint64 }); ok && s != nil {
+		if id := s.UniqueID(); id != 0 {
+			wrapped.TempOwnerToken = "s" + strconv.FormatUint(id, 10)
+		}
+	}
+	// Carry this statement's snapshot partition-detach epoch so the planner
+	// omits partition children concurrently detach-pending at or before the
+	// snapshot (catalog.VisiblePartitionChildren). Plan caching is bypassed
+	// while any detach is pending (partitionDetachPending), so this re-plans
+	// per statement against the live snapshot epoch. Design 0118-0059.
+	wrapped.SnapshotPartitionDetachEpoch = ctx.Snap.PartitionDetachEpoch
+	return wrapped
 }
 
 // parseSearchPathSchemas parses a search_path string (e.g. "temp_func_test, public")

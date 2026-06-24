@@ -367,6 +367,18 @@ type Table struct {
 	// routing and display. For LIST: InValues strings; for RANGE: one
 	// PartitionBound with From/To strings.
 	PartitionBounds []PartitionBound
+	// DetachPendingEpoch, when non-zero, marks this partition child as
+	// "detach pending" by an in-progress ALTER TABLE … DETACH PARTITION …
+	// CONCURRENTLY: the partition is still physically registered (so a
+	// snapshot taken before the detach still scans it) but is omitted from
+	// the partition descriptor for any statement whose snapshot epoch is
+	// >= DetachPendingEpoch. It mirrors PostgreSQL's pg_inherits
+	// inhdetachpending flag + the snapshot-relative omission performed by
+	// find_inheritance_children_extended. Set/cleared via
+	// InMemory.MarkPartitionDetachPending / ClearPartitionDetachPending and
+	// consulted by VisiblePartitionChildren. Zero for every ordinary
+	// partition. Design 0118-0058 (M0118-0008 detach-partition-concurrently).
+	DetachPendingEpoch uint64
 	// PartitionKeyOpClasses is the operator class name per key column.
 	// Empty string means "use the default hash function". M0097-0027.
 	PartitionKeyOpClasses []string
@@ -388,6 +400,30 @@ type Table struct {
 	// Unlogged / Temp track relpersistence. 'u' for UNLOGGED, 't' for TEMP, 'p' for permanent.
 	Unlogged bool
 	Temp     bool
+
+	// TempOwner identifies the session that owns this temporary relation. In
+	// PostgreSQL every backend has its own temp namespace (pg_temp_N); a temp
+	// relation is only part of *its* backend's catalog. goopg keeps all
+	// relations in one shared in-memory catalog, so we record the owning
+	// session's stable token here to recover that per-session isolation. It is
+	// empty for permanent/unlogged tables and for temp tables created without a
+	// session identity (internal/test contexts). Consumers must treat an
+	// empty-owner temp relation as visible to all sessions to preserve legacy
+	// single-session behaviour. See AccessibleInheritanceChildren and design
+	// 0118-0036 (RELATION_IS_OTHER_TEMP inheritance exclusion).
+	TempOwner string
+
+	// Owner records the table's owning role NAME, as set by
+	// `ALTER TABLE ... OWNER TO role`. Empty means the bootstrap superuser (OID
+	// 10) — goopg's default for every freshly created relation. It drives the
+	// ownership half of the VACUUM/ANALYZE/CLUSTER maintenance-privilege check
+	// (vacuum_is_permitted_to_vacuum): a non-superuser session (SET ROLE) may
+	// only run those commands on a relation it owns (or holds MAINTAIN on),
+	// otherwise the command skips the relation with a WARNING. Stored as the role
+	// name (case-insensitive) to compare against Context.NonSuperuserRole. The
+	// pg_class.relowner OID column is still rendered as the bootstrap superuser
+	// (catalog/dump output unaffected). M0118-0008 (vacuum-conflict / cluster-conflict).
+	Owner string
 
 	// Fillfactor stores the table's `WITH (fillfactor=N)` storage parameter
 	// (10–100). Zero means unset (PG's default 100 / no reloptions). pg_class's
@@ -795,6 +831,10 @@ type ForeignKey struct {
 	OnUpdate          parser.FKAction
 	Deferrable        bool
 	InitiallyDeferred bool
+	// NotValid is true when the constraint was added with NOT VALID — existing
+	// rows were not checked, so pg_constraint.convalidated is 'f' until a
+	// VALIDATE CONSTRAINT runs. M0118-0008 (alter-table-1/2).
+	NotValid bool
 }
 
 // fkActionChar maps a parsed FK referential action to the single-char code
@@ -1119,6 +1159,7 @@ type Catalog interface {
 	CreateView(name parser.ObjectName, cols []Column, aliases []string, query *parser.SelectStmt, orReplace bool) (*Table, error)
 	DropView(name parser.ObjectName, ifExists bool) error
 	SetTableStats(table *Table, stats *TableStats)
+	UpdateRelStats(table *Table, pages int, tuples int64)
 	AddColumn(table *Table, col Column) (*Column, error)
 	DropTable(name parser.ObjectName) error
 	DropIndex(name parser.ObjectName) error
@@ -1162,6 +1203,16 @@ type Catalog interface {
 	RegisterRole(name string)
 	// UnregisterRole removes a role from the registry. M0097-drop_if_exists.
 	UnregisterRole(name string)
+	// GrantTablePrivilege records that role may exercise priv on the relation
+	// identified by relOID. priv is an upper-cased keyword ("TRUNCATE", …); role
+	// is matched case-insensitively. Minimal ACL store for the *-conflict
+	// isolation specs. M0118-0008 (design 0118-0039).
+	GrantTablePrivilege(relOID uint32, role, priv string)
+	// HasTablePrivilege reports whether role was granted priv on relOID.
+	HasTablePrivilege(relOID uint32, role, priv string) bool
+	// DropTableACL forgets all privileges recorded for relOID (called when the
+	// relation is dropped so a recycled OID does not inherit stale grants).
+	DropTableACL(relOID uint32)
 	IndexesOnTable(table *Table) []*Index
 	// AllIndexes returns every index in the catalog, sorted by OID. M0097-0023.
 	AllIndexes() []*Index
@@ -1272,6 +1323,14 @@ type InMemory struct {
 	// for partition index trees (ALTER INDEX parent ATTACH PARTITION child). M0097-0023.
 	indexPartitionChildren map[uint32][]uint32
 
+	// pendingPartitionDetachCount counts partition children currently marked
+	// "detach pending" (DetachPendingEpoch != 0) by an in-progress
+	// ALTER TABLE … DETACH PARTITION … CONCURRENTLY. Maintained by
+	// MarkPartitionDetachPending / ClearPartitionDetachPending so
+	// HasPendingPartitionDetach is O(1). Zero in the steady state. Design
+	// 0118-0058 (M0118-0008 detach-partition snapshot visibility).
+	pendingPartitionDetachCount int
+
 	// inheritanceChildren maps parent table OID → slice of child OIDs
 	// for table inheritance support (M0096-0009).
 	inheritanceChildren map[uint32][]uint32
@@ -1319,6 +1378,14 @@ type InMemory struct {
 	// DROP ROLE IF EXISTS to produce proper "does not exist" notices.
 	// M0097-drop_if_exists.
 	roles map[string]struct{}
+
+	// tableACLs records per-relation privileges granted to non-owner roles, the
+	// minimal ACL store the *-conflict isolation specs need (currently only
+	// TRUNCATE — truncate-conflict, design 0118-0039). Keyed relOID →
+	// lower-cased role name → set of upper-cased privilege keywords
+	// ("TRUNCATE", "SELECT", …). The owning superuser bypasses this map
+	// entirely; an empty/absent entry means "no privilege granted". M0118-0008.
+	tableACLs map[uint32]map[string]map[string]struct{}
 
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
@@ -1622,6 +1689,7 @@ func NewInMemory() *InMemory {
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
 		roles:          make(map[string]struct{}),
+		tableACLs:      make(map[uint32]map[string]map[string]struct{}),
 		comments:       make(map[commentKey]string),
 		statisticsObjs: make(map[string]*StatisticsObject),
 		extensions:     make(map[string]*extensionRow),
@@ -1779,6 +1847,32 @@ func (c *InMemory) RegisterInheritanceChild(parentOID, childOID uint32) {
 	c.mu.Unlock()
 }
 
+// HasTempInheritanceChildren reports whether any inheritance parent currently
+// has a session-owned temporary child registered. When true, a query that
+// scans an inheritance parent expands to a session-specific child set
+// (RELATION_IS_OTHER_TEMP, see AccessibleInheritanceChildren), so its plan must
+// NOT be served from the cross-session plan cache. Cheap (O(1)) in the common
+// case of no inheritance at all. Design 0118-0037 (M0118-0008 inherit-temp).
+func (c *InMemory) HasTempInheritanceChildren() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.inheritanceChildren) == 0 {
+		return false
+	}
+	childOIDs := make(map[uint32]bool)
+	for _, children := range c.inheritanceChildren {
+		for _, oid := range children {
+			childOIDs[oid] = true
+		}
+	}
+	for _, t := range c.tables {
+		if t.Temp && t.TempOwner != "" && childOIDs[t.OID] {
+			return true
+		}
+	}
+	return false
+}
+
 // IsInheritanceDescendant reports whether descendantOID appears anywhere in
 // the transitive inheritance-children subtree of rootOID. Used to detect
 // circular inheritance before registering a new parent-child edge.
@@ -1816,6 +1910,46 @@ func (c *InMemory) UnregisterInheritanceChild(parentOID, childOID uint32) {
 			return
 		}
 	}
+}
+
+// AccessibleInheritanceChildren filters a list of inheritance/partition child
+// relations down to those visible to the session identified by sessionTempOwner,
+// mirroring PostgreSQL's RELATION_IS_OTHER_TEMP exclusion in inheritance
+// expansion (see expand_single_inheritance_child / find_inheritance_children).
+//
+// A temporary child relation owned by a *different* session is dropped: in
+// upstream PG it lives in another backend's pg_temp_N namespace and is never
+// part of this backend's scan of the inheritance parent. A permanent child, an
+// own temp child (TempOwner == sessionTempOwner), and an unowned temp child
+// (TempOwner == "", i.e. created without a session identity in internal/test
+// contexts) are all retained so legacy single-session behaviour is preserved.
+//
+// The slice is filtered in place when nothing is dropped (returning the same
+// backing array); otherwise a fresh slice is returned. nil-in / nil-out.
+// Design 0118-0036 (M0118-0008 inherit-temp).
+func AccessibleInheritanceChildren(children []*Table, sessionTempOwner string) []*Table {
+	if len(children) == 0 {
+		return children
+	}
+	// Fast path: nothing to drop.
+	drop := false
+	for _, c := range children {
+		if c != nil && c.Temp && c.TempOwner != "" && c.TempOwner != sessionTempOwner {
+			drop = true
+			break
+		}
+	}
+	if !drop {
+		return children
+	}
+	out := make([]*Table, 0, len(children))
+	for _, c := range children {
+		if c != nil && c.Temp && c.TempOwner != "" && c.TempOwner != sessionTempOwner {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // InheritanceChildren returns the direct inheritance children of parentOID.
@@ -1881,6 +2015,96 @@ func (c *InMemory) UnregisterPartitionChild(parentOID, childOID uint32) {
 	}
 	c.partitionChildren[parentOID] = filtered
 	c.mu.Unlock()
+}
+
+// MarkPartitionDetachPending stamps the partition child childOID with epoch as
+// its "detach pending" boundary (ALTER TABLE … DETACH PARTITION … CONCURRENTLY).
+// The child stays physically registered — VisiblePartitionChildren omits it only
+// for statements whose snapshot epoch is >= epoch, so a snapshot taken before the
+// detach (e.g. a REPEATABLE READ transaction that began earlier) still scans the
+// partition while concurrent READ COMMITTED statements stop seeing it. epoch must
+// be a fresh value from mvcc.NextPartitionDetachEpoch(). No-op (returns false) if
+// the child is unknown. Idempotent: re-stamping the same child does not double the
+// pending count. Design 0118-0058 (M0118-0008 detach-partition-concurrently).
+func (c *InMemory) MarkPartitionDetachPending(childOID uint32, epoch uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, t := range c.tables {
+		if t.OID == childOID {
+			if t.DetachPendingEpoch == 0 {
+				c.pendingPartitionDetachCount++
+			}
+			t.DetachPendingEpoch = epoch
+			return true
+		}
+	}
+	return false
+}
+
+// ClearPartitionDetachPending removes the detach-pending mark from childOID,
+// called when the concurrent detach finalizes (or is rolled back) so the child
+// is either fully unregistered or restored to ordinary visibility. Idempotent.
+// Design 0118-0058 (M0118-0008 detach-partition-concurrently).
+func (c *InMemory) ClearPartitionDetachPending(childOID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, t := range c.tables {
+		if t.OID == childOID {
+			if t.DetachPendingEpoch != 0 {
+				t.DetachPendingEpoch = 0
+				if c.pendingPartitionDetachCount > 0 {
+					c.pendingPartitionDetachCount--
+				}
+			}
+			return
+		}
+	}
+}
+
+// HasPendingPartitionDetach reports whether any partition child is currently
+// marked detach-pending. When true, a query scanning a partitioned parent
+// expands to a snapshot-dependent partition set (see VisiblePartitionChildren),
+// so its plan must NOT be served from / stored in the cross-session plan cache —
+// the same constraint HasTempInheritanceChildren imposes for temp inheritance.
+// O(1) (a maintained counter). Design 0118-0058 (M0118-0008).
+func (c *InMemory) HasPendingPartitionDetach() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.pendingPartitionDetachCount > 0
+}
+
+// VisiblePartitionChildren filters a partition child list down to those visible
+// to a statement whose snapshot epoch is snapshotEpoch, mirroring PostgreSQL's
+// snapshot-relative omission of a concurrently-detached partition
+// (find_inheritance_children_extended honouring inhdetachpending against the
+// active snapshot). A child stamped DetachPendingEpoch == e is dropped when
+// snapshotEpoch >= e (the detach is "visible" to this statement) and retained
+// when snapshotEpoch < e (the statement's snapshot predates the detach) or when
+// e == 0 (not detaching). Filtered in place when nothing is dropped (same backing
+// array); otherwise a fresh slice is returned. nil-in / nil-out. Design 0118-0058
+// (M0118-0008 detach-partition-concurrently).
+func VisiblePartitionChildren(children []*Table, snapshotEpoch uint64) []*Table {
+	if len(children) == 0 {
+		return children
+	}
+	drop := false
+	for _, c := range children {
+		if c != nil && c.DetachPendingEpoch != 0 && snapshotEpoch >= c.DetachPendingEpoch {
+			drop = true
+			break
+		}
+	}
+	if !drop {
+		return children
+	}
+	out := make([]*Table, 0, len(children))
+	for _, c := range children {
+		if c != nil && c.DetachPendingEpoch != 0 && snapshotEpoch >= c.DetachPendingEpoch {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // RegisterIndexPartitionChild registers childOID as a partition child of
@@ -2726,6 +2950,19 @@ func (c *InMemory) registerSystemTables() {
 			if len(t.ToastReloptions) > 0 {
 				reltoastrelid = strconv.Itoa(int(t.OID) + toastRelidOffset)
 			}
+			// relpages / reltuples: 0 until VACUUM or ANALYZE has run (Stats==nil),
+			// then the persisted block count and live-tuple estimate. Mirrors
+			// pg_class — a freshly created, never-analyzed relation reads back as
+			// relpages=0 / reltuples=-1 in real PG, but goopg has historically
+			// surfaced 0 here, so keep 0 for the unanalyzed case to avoid churning
+			// every catalog-reading test; populate the real counts once Stats lands.
+			// M0118-0008 (vacuum-no-cleanup-lock).
+			relpages := "0"
+			reltuples := "0"
+			if t.Stats != nil {
+				relpages = strconv.Itoa(t.Stats.Pages)
+				reltuples = strconv.FormatInt(t.Stats.RowCount, 10)
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // 0:  oid
 				t.Name,                       // 1:  relname
@@ -2736,8 +2973,8 @@ func (c *InMemory) registerSystemTables() {
 				relam,                        // 6:  relam (heap=2; 0 for sequences)
 				strconv.Itoa(int(t.OID)),     // 7:  relfilenode
 				"0",                          // 8:  reltablespace
-				"0",                          // 9:  relpages
-				"0",                          // 10: reltuples
+				relpages,                     // 9:  relpages
+				reltuples,                    // 10: reltuples
 				"0",                          // 11: relallvisible
 				"0",                          // 12: relallfrozen
 				reltoastrelid,                // 13: reltoastrelid
@@ -4062,7 +4299,11 @@ func (c *InMemory) registerSystemTables() {
 				} else {
 					row[5] = "f" // condeferred
 				}
-				row[6] = "t"                        // convalidated
+				if fk.NotValid {
+					row[6] = "f" // convalidated — NOT VALID, not yet validated
+				} else {
+					row[6] = "t" // convalidated
+				}
 				row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
 				row[8] = "0"                        // contypid
 				row[9] = "0"                        // conindid (unique idx on ref tbl; unused by deparse)
@@ -6214,6 +6455,31 @@ func (c *InMemory) SetTableStats(table *Table, stats *TableStats) {
 	table.Stats = stats
 }
 
+// UpdateRelStats publishes VACUUM's pg_class.reltuples / relpages counters
+// (vac_update_relstats) without discarding any per-column pg_statistic from a
+// prior ANALYZE. Plain VACUUM recomputes the live-tuple count and block count
+// but does not sample column distributions, so it must merge into — not replace
+// — the existing Stats struct (mirrors upstream, where VACUUM and ANALYZE both
+// call vac_update_relstats but only ANALYZE rewrites pg_statistic). A nil Stats
+// is created on first VACUUM so pg_class surfaces a non-zero reltuples even
+// before the table has ever been ANALYZEd.
+func (c *InMemory) UpdateRelStats(table *Table, pages int, tuples int64) {
+	if table == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if table.Stats == nil {
+		table.Stats = &TableStats{Pages: pages, RowCount: tuples}
+		return
+	}
+	// Pointer-replace so a concurrent reader never sees a torn struct.
+	merged := *table.Stats
+	merged.Pages = pages
+	merged.RowCount = tuples
+	table.Stats = &merged
+}
+
 // DropView removes a view from the catalog. Errors when the
 // name resolves to a non-view relation; respects ifExists.
 func (c *InMemory) DropView(name parser.ObjectName, ifExists bool) error {
@@ -6623,6 +6889,55 @@ func (c *InMemory) UnregisterRole(name string) {
 	delete(c.roles, strings.ToLower(name))
 }
 
+// GrantTablePrivilege records that role may exercise priv on relOID. See the
+// Catalog interface doc. Role names are stored lower-cased and privilege
+// keywords upper-cased so lookups are case-insensitive. M0118-0008.
+func (c *InMemory) GrantTablePrivilege(relOID uint32, role, priv string) {
+	role = strings.ToLower(strings.TrimSpace(role))
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	if role == "" || priv == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	byRole := c.tableACLs[relOID]
+	if byRole == nil {
+		byRole = make(map[string]map[string]struct{})
+		c.tableACLs[relOID] = byRole
+	}
+	privs := byRole[role]
+	if privs == nil {
+		privs = make(map[string]struct{})
+		byRole[role] = privs
+	}
+	privs[priv] = struct{}{}
+}
+
+// HasTablePrivilege reports whether role was granted priv on relOID. M0118-0008.
+func (c *InMemory) HasTablePrivilege(relOID uint32, role, priv string) bool {
+	role = strings.ToLower(strings.TrimSpace(role))
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	byRole := c.tableACLs[relOID]
+	if byRole == nil {
+		return false
+	}
+	privs := byRole[role]
+	if privs == nil {
+		return false
+	}
+	_, ok := privs[priv]
+	return ok
+}
+
+// DropTableACL forgets all privileges recorded for relOID. M0118-0008.
+func (c *InMemory) DropTableACL(relOID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.tableACLs, relOID)
+}
+
 // RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
 // Used so that DROP X (without IF EXISTS) can succeed when CREATE X was also a noop.
 func (c *InMemory) RegisterCompatObject(objType, name string) {
@@ -6752,6 +7067,7 @@ func (c *InMemory) DropTable(name parser.ObjectName) error {
 		delete(c.byTable, tbl.OID)
 	}
 	delete(c.tables, k)
+	delete(c.tableACLs, tbl.OID) // forget any granted privileges (M0118-0008)
 	return nil
 }
 
@@ -8172,6 +8488,19 @@ func (c *InMemory) resolveColumnTypeLocked(typeName string) string {
 type SearchPathCatalog struct {
 	Catalog
 	GetSchemas func() []string
+	// TempOwnerToken is the querying session's temp-relation ownership token
+	// ("s<id>", see executor.sessionTempOwner / config.SessionRegistry.UniqueID).
+	// Empty for session-less contexts. The planner reads it via CurrentTempOwner
+	// to drop other-session temp inheritance children during expansion
+	// (RELATION_IS_OTHER_TEMP). Design 0118-0036 (M0118-0008 inherit-temp).
+	TempOwnerToken string
+	// SnapshotPartitionDetachEpoch is the querying statement's snapshot
+	// partition-detach epoch (mvcc.Snapshot.PartitionDetachEpoch). The planner
+	// reads it via CurrentPartitionDetachEpoch to drop partition children that
+	// became detach-pending at or before this snapshot (VisiblePartitionChildren).
+	// Zero for snapshot-less contexts (no filtering). Design 0118-0059
+	// (M0118-0008 detach-partition-concurrently).
+	SnapshotPartitionDetachEpoch uint64
 }
 
 // WithSearchPath returns a SearchPathCatalog that falls back to the schemas
@@ -8179,6 +8508,21 @@ type SearchPathCatalog struct {
 // unqualified name.
 func WithSearchPath(cat Catalog, getSchemas func() []string) *SearchPathCatalog {
 	return &SearchPathCatalog{Catalog: cat, GetSchemas: getSchemas}
+}
+
+// CurrentTempOwner returns the querying session's temp-relation ownership token
+// so inheritance-expansion sites can apply AccessibleInheritanceChildren. The
+// planner discovers it via a tempOwnerCarrier interface walk over the catalog
+// wrapper chain. Design 0118-0036.
+func (c *SearchPathCatalog) CurrentTempOwner() string { return c.TempOwnerToken }
+
+// CurrentPartitionDetachEpoch returns the querying statement's snapshot
+// partition-detach epoch so the planner's partition-expansion site can apply
+// VisiblePartitionChildren. The planner discovers it via a
+// partitionDetachEpochCarrier interface walk over the catalog wrapper chain.
+// Design 0118-0059 (M0118-0008 detach-partition-concurrently).
+func (c *SearchPathCatalog) CurrentPartitionDetachEpoch() uint64 {
+	return c.SnapshotPartitionDetachEpoch
 }
 
 // LookupTable overrides the embedded Catalog.LookupTable to apply the

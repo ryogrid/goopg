@@ -826,6 +826,79 @@ func TestPlanUpdateSetDefaultColumnWithoutDefaultGivesNull(t *testing.T) {
 	}
 }
 
+// nextvalArg asserts e is a planner nextval(<seqName>) call and returns nothing
+// on success; otherwise it fails t. SERIAL / IDENTITY columns carry no catalog
+// DefaultExpr in goopg (the executor's auto-generation loop is authoritative for
+// OMITTED columns), so an explicit DEFAULT keyword must be rewritten to a
+// nextval('<table>_<column>_seq') call rather than NULL — else it collapses to
+// NULL and trips the SERIAL NOT NULL constraint.
+func nextvalArg(t *testing.T, e Expr, wantSeq string) {
+	t.Helper()
+	fc, ok := e.(*FuncCall)
+	if !ok {
+		t.Fatalf("expr=%T want *FuncCall (nextval)", e)
+	}
+	if strings.ToLower(fc.Name) != "nextval" {
+		t.Errorf("func name=%q want nextval", fc.Name)
+	}
+	if len(fc.Args) != 1 {
+		t.Fatalf("nextval args=%d want 1", len(fc.Args))
+	}
+	sc, ok := fc.Args[0].(*StringConst)
+	if !ok {
+		t.Fatalf("nextval arg=%T want *StringConst", fc.Args[0])
+	}
+	if sc.Value != wantSeq {
+		t.Errorf("nextval arg=%q want %q", sc.Value, wantSeq)
+	}
+}
+
+// TestPlanInsertValuesDefaultSerialSubstitutesNextval: a bare DEFAULT in a
+// positional VALUES row (no column list) targeting a SERIAL column must be
+// rewritten to nextval('<table>_<col>_seq'), mirroring PostgreSQL where SERIAL's
+// column default literally IS that call. Regression for the tuplelock-update
+// setup `INSERT INTO pktab VALUES (1, DEFAULT)` (M0118-0003).
+func TestPlanInsertValuesDefaultSerialSubstitutesNextval(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "pktab"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "data", Type: catalog.Type{Name: "serial"}, NotNull: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO pktab VALUES (1, DEFAULT)"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	values := node.(*Insert).Source.(*Values)
+	if len(values.Rows) != 1 || len(values.Rows[0]) != 2 {
+		t.Fatalf("values shape=%v", values.Rows)
+	}
+	nextvalArg(t, values.Rows[0][1], "pktab_data_seq")
+}
+
+// TestPlanUpdateSetDefaultSerialSubstitutesNextval: `UPDATE t SET data = DEFAULT`
+// on a SERIAL column must likewise resolve to nextval, not NULL. Regression for
+// the tuplelock-update chain step `UPDATE pktab SET data = DEFAULT` (M0118-0003).
+func TestPlanUpdateSetDefaultSerialSubstitutesNextval(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "pktab"}, []catalog.Column{
+		{Name: "id", Type: catalog.Type{Name: "int4"}},
+		{Name: "data", Type: catalog.Type{Name: "serial"}, NotNull: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "UPDATE pktab SET data = DEFAULT"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	upd := node.(*Update)
+	if len(upd.Set) != 2 {
+		t.Fatalf("Set len=%d want 2", len(upd.Set))
+	}
+	nextvalArg(t, upd.Set[1], "pktab_data_seq")
+}
+
 // TestPlanInsertDefaultValuesExpandsToColumnDefaults: rung 17 — the
 // all-defaults `INSERT INTO t DEFAULT VALUES` form is expanded by
 // rewriteInsertDefaultMarkers into a single VALUES row whose cells
@@ -899,6 +972,76 @@ func TestPlanInsertDefaultValuesSkipsGeneratedColumns(t *testing.T) {
 	}
 	if len(ins.ColumnIndex) != 1 || ins.ColumnIndex[0] != 0 {
 		t.Errorf("ColumnIndex=%v want [0]", ins.ColumnIndex)
+	}
+}
+
+// TestPlanInsertSelectFewerColumnsTruncatesColumnIndex: INSERT ... SELECT with
+// NO explicit column list, where the SELECT yields fewer columns than the
+// table. PostgreSQL fills the leading columns and lets the trailing target
+// columns fall back to their DEFAULT. The planner must truncate ColumnIndex to
+// the source width so the executor does not index past the shorter source row
+// (the panic regression fixed in design 0118-0038 / index-only-bitmapscan
+// setup crash). The remaining column is then flagged missing and defaulted.
+func TestPlanInsertSelectFewerColumnsTruncatesColumnIndex(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+		{Name: "pad", Type: catalog.Type{Name: "text"}, DefaultExpr: &parser.StringConst{Value: ""}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := Plan(parseOne(t, "INSERT INTO t SELECT 1, 2"), c)
+	if err != nil {
+		t.Fatalf("Plan: %v", err)
+	}
+	ins := node.(*Insert)
+	if got, want := ins.ColumnIndex, []int{0, 1}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("ColumnIndex=%v want %v (truncated to source width)", got, want)
+	}
+}
+
+// TestPlanInsertSelectMoreColumnsErrors: INSERT ... SELECT where the SELECT
+// produces MORE columns than the table is a syntax error, mirroring PG
+// transformInsertStmt ("INSERT has more expressions than target columns").
+func TestPlanInsertSelectMoreColumnsErrors(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Plan(parseOne(t, "INSERT INTO t SELECT 1, 2, 3"), c)
+	if err == nil {
+		t.Fatal("expected error for over-wide INSERT ... SELECT")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok || pe.Code != "42601" {
+		t.Fatalf("err=%v want PlanError code 42601", err)
+	}
+}
+
+// TestPlanInsertSelectExplicitListArityMismatchErrors: with an EXPLICIT column
+// list, a SELECT narrower than the list is the symmetric error ("INSERT has
+// more target columns than expressions") — truncation only applies to the
+// implicit-column-list form.
+func TestPlanInsertSelectExplicitListArityMismatchErrors(t *testing.T) {
+	c := catalog.NewInMemory()
+	if _, err := c.CreateTable(parser.ObjectName{Name: "t"}, []catalog.Column{
+		{Name: "a", Type: catalog.Type{Name: "int4"}},
+		{Name: "b", Type: catalog.Type{Name: "int4"}},
+		{Name: "pad", Type: catalog.Type{Name: "text"}, DefaultExpr: &parser.StringConst{Value: ""}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Plan(parseOne(t, "INSERT INTO t (a, b, pad) SELECT 1, 2"), c)
+	if err == nil {
+		t.Fatal("expected error for explicit-list arity mismatch")
+	}
+	pe, ok := err.(*PlanError)
+	if !ok || pe.Code != "42601" {
+		t.Fatalf("err=%v want PlanError code 42601", err)
 	}
 }
 

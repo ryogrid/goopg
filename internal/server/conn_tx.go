@@ -26,6 +26,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -101,6 +102,22 @@ type connTxState struct {
 	// superuser (e.g. LEAKPROOF function attribute) are rejected. Cleared by
 	// RESET SESSION AUTHORIZATION or SET SESSION AUTHORIZATION DEFAULT/postgres.
 	NonSuperuserRole string
+	// AdvisoryID is the stable per-connection advisory-lock owner identity (the
+	// SessionRegistry). It is assigned once at connection start in
+	// runPostStartupLoop and matches advisorySessionIDFromContext's preferred
+	// identity, so transaction-end and connection-teardown release the same
+	// advisory locks that pg_advisory_*lock() acquired — regardless of whether
+	// the lock was taken in autocommit or inside an explicit transaction.
+	// M0118-0003.
+	AdvisoryID any
+	// LockBackendID is a stable lock-manager backend identity for the
+	// whole connection (distinct from the per-statement BackendID minted
+	// in dispatch.go) that backs transaction-scoped LOCK TABLE heavyweight
+	// locks. A LOCK acquired in one statement survives the per-statement
+	// ReleaseAll and is dropped only here in End() (via
+	// executor.ReleaseTableLocks) on COMMIT/ROLLBACK. Assigned once at
+	// connection start in runPostStartupLoop. M0118-0003 (lock-nowait).
+	LockBackendID lockmgr.BackendID
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr
@@ -111,7 +128,41 @@ type connTxState struct {
 func (c *connTxState) Fail() {
 	c.mu.Lock()
 	c.failed = true
+	// Mirror PostgreSQL's AbortTransaction: when a statement errors at the top
+	// level of a transaction (no open savepoint/subtransaction), the aborted
+	// transaction's heavyweight LOCK TABLE / DDL / DML table locks are released
+	// immediately — pg_locks shows none held — rather than lingering until the
+	// explicit ROLLBACK. A concurrent session's conflicting DDL/DML therefore
+	// proceeds without waiting for the aborted transaction to be rolled back
+	// (alter-table-3 isolation spec, M0118-0008). When a savepoint is open the
+	// error aborts only the current subtransaction, whose locks transfer to the
+	// parent (PostgreSQL retains them across ROLLBACK TO SAVEPOINT), so we keep
+	// them and let End() release them on the eventual COMMIT/ROLLBACK. The
+	// release is idempotent: End() releases again under the same identity.
+	if c.sess != nil && c.sess.SavepointDepth() == 0 {
+		executor.ReleaseTableLocks(c.LockBackendID)
+	}
 	c.mu.Unlock()
+}
+
+// ReleasePinnedSnapshotOnFail clears the transaction-pinned (RR/SSI) snapshot
+// marker after a top-level statement error, mirroring PostgreSQL's
+// AbortTransaction dropping the transaction snapshot at abort. Gated on
+// SavepointDepth()==0 exactly like Fail()'s lock release: when a savepoint is
+// open the error aborts only the subtransaction and ROLLBACK TO SAVEPOINT
+// resumes the SAME transaction snapshot, so it must be retained. Lets a
+// concurrent DETACH PARTITION CONCURRENTLY waiting on this session's snapshot
+// unblock as soon as the session errors, before its explicit ROLLBACK/COMMIT.
+// Design 0118-0063 (M0118-0008 detach-partition-concurrently-4).
+func (c *connTxState) ReleasePinnedSnapshotOnFail(mgr *mvcc.Manager) {
+	if mgr == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sess != nil && c.sess.SavepointDepth() == 0 {
+		mgr.ReleasePinnedSnapshot(c.tx.Handle)
+	}
 }
 
 // ClearFailed clears the failed transaction state.  Used after ROLLBACK TO
@@ -180,8 +231,22 @@ func (c *connTxState) Session() *executor.BasicSession {
 func (c *connTxState) End() {
 	c.mu.Lock()
 	if c.sess != nil {
-		executor.ReleaseAdvisoryTransactionLocks(c.sess)
+		// Release xact-scoped advisory locks under the stable per-connection
+		// identity (AdvisoryID = SessionRegistry), which is what acquired them —
+		// NOT c.sess (the BasicSession), which is no longer the advisory owner.
+		// Falls back to c.sess for callers that never set AdvisoryID (unit tests).
+		// M0118-0003.
+		advID := c.AdvisoryID
+		if advID == nil {
+			advID = c.sess
+		}
+		executor.ReleaseAdvisoryTransactionLocks(advID)
 		executor.ReleaseRelationLocks(c.sess)
+		// Drop transaction-scoped LOCK TABLE heavyweight locks held under the
+		// stable per-connection backend identity. Per-statement locks use a
+		// different (per-Query) BackendID and are released in dispatch.go;
+		// these survive until end-of-transaction. M0118-0003 (lock-nowait).
+		executor.ReleaseTableLocks(c.LockBackendID)
 		c.sess.EndExplicitTransaction()
 	}
 	c.active = false

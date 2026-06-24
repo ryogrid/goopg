@@ -5815,6 +5815,52 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return newVal, nil
 		}
 		return NullDatum, nil
+	case "pg_backend_pid":
+		// pg_backend_pid() → int4: the PID of the server process attached to the
+		// current session. goopg is a single OS process multiplexing connections,
+		// so the "PID" is the per-connection integer assigned at connect time
+		// (s.nextPID) and reported in BackendKeyData; it is what
+		// pg_stat_activity.pid joins on and what pg_cancel_backend(pid) targets.
+		// Resolved via the activity registry (ctx.backendPID()), falling back to
+		// the goopg.backend_pid GUC the server stamps at startup. M0118-0008
+		// (detach-partition-concurrently-3/4 s2snitch step).
+		if ctx != nil {
+			pidStr := ctx.backendPID()
+			if pidStr == "" && ctx.GetSetting != nil {
+				if v, ok := ctx.GetSetting("goopg.backend_pid"); ok {
+					pidStr = v
+				}
+			}
+			if pidStr != "" {
+				if n, err := strconv.ParseInt(pidStr, 10, 32); err == nil {
+					return NewIntDatum(n), nil
+				}
+			}
+		}
+		return NewIntDatum(0), nil
+	case "pg_cancel_backend":
+		// pg_cancel_backend(pid int4) → bool: signal the backend whose
+		// pg_backend_pid() == pid to cancel its currently-executing query (the
+		// SQL analog of sending SIGINT). goopg multiplexes connections in one OS
+		// process, so this reaches back to the server's process-wide cancel
+		// registry via ctx.CancelBackend. Returns true if such a backend is
+		// connected (signal sent — true even if the target is idle, matching PG),
+		// false otherwise (PG additionally emits a WARNING for an unknown pid).
+		// Strict: NULL arg → NULL. M0118-0008 (detach-partition-concurrently-3/4).
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		pidArg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		if pidArg.IsNull() {
+			return NullDatum, nil
+		}
+		if ctx != nil && ctx.CancelBackend != nil {
+			return NewBoolDatum(ctx.CancelBackend(int32(pidArg.Int))), nil
+		}
+		return NewBoolDatum(false), nil
 	case "current_database":
 		return NewStringDatum("postgres"), nil
 	case "current_schema":

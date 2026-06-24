@@ -603,6 +603,19 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSuset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// allow_system_table_mods — developer/regression option permitting
+	// modifications of the structure of system tables (e.g. REINDEX of a
+	// TOAST relation, ALTER on a catalog). PGC_SUSET, DEVELOPER_OPTIONS,
+	// GUC_NOT_IN_SAMPLE, boot off (guc_tables.c). Registered so test scripts
+	// that `SET allow_system_table_mods = on` during setup succeed rather than
+	// failing with `unrecognized configuration parameter`; goopg does not yet
+	// gate any catalog-structure modification on it (M0118-0008,
+	// reindex-concurrently-toast enabler).
+	r.MustRegister(NewVariable(Variable{
+		Name: "allow_system_table_mods", Type: TypeBool, BootVal: "off",
+		Context: ContextSuset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
 	// seq_page_cost — planner cost estimate for sequential page fetch.
 	r.MustRegister(NewVariable(Variable{
 		Name: "seq_page_cost", Type: TypeReal, BootVal: "1.0",
@@ -647,6 +660,15 @@ func BuildDefaultRegistry() *Registry {
 		Name: "autovacuum_freeze_max_age", Type: TypeInt, BootVal: "200000000",
 		MinVal: 100000, MaxVal: 2000000000,
 		Context: ContextPostmaster,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// vacuum_multixact_freeze_min_age is the MultiXact-age analog of
+	// vacuum_freeze_min_age: the minimum MultiXactId age before VACUUM
+	// replaces a tuple's xmax MultiXact with a plain XID / FrozenTransactionId.
+	r.MustRegister(NewVariable(Variable{
+		Name: "vacuum_multixact_freeze_min_age", Type: TypeInt, BootVal: "5000000",
+		MinVal: 0, MaxVal: 1000000000,
+		Context: ContextUserset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 
@@ -713,6 +735,18 @@ func BuildDefaultRegistry() *Registry {
 		Name: "idle_in_transaction_session_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "0",
 		MinVal: 0, MaxVal: 2147483647,
 		Context: ContextUserset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// deadlock_timeout: how long a backend waits on a lock before running the
+	// deadlock detector. Superuser-set (PGC_SUSET), default 1s. goopg honours it
+	// for LOCK TABLE waits on the transaction-scoped heavyweight lock manager
+	// (executor.acquireRelLockTxn → lockmgr); the isolation deadlock specs set
+	// it per session so the session with the shortest timeout deterministically
+	// discovers the cycle. Mirrors guc_tables.c (M0118-0004).
+	r.MustRegister(NewVariable(Variable{
+		Name: "deadlock_timeout", Type: TypeInt, Unit: UnitMs, BootVal: "1000",
+		MinVal: 1, MaxVal: 2147483647,
+		Context: ContextSuset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
 	// transaction_timeout (PG 17+). pg_dump's setup_connection disables it

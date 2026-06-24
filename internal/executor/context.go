@@ -2,12 +2,17 @@ package executor
 
 import (
 	"context"
+	"errors"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/goopg/goopg/internal/activity"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/lockwait"
 	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -52,6 +57,16 @@ type Context struct {
 	TxnMgr      *mvcc.Manager
 	Tx          mvcc.Transaction
 	Snap        mvcc.Snapshot
+
+	// MultiXact is the process-shared MultiXact member store (the SLRU
+	// analog). It is consulted by the row-locking path (stampLockInner) to
+	// (a) combine a new lock holder with an existing active lock holder into a
+	// MultiXactId rather than overwriting it, and (b) resolve a tuple's
+	// MultiXactId xmax back to its member transactions when checking lock
+	// conflicts. nil disables the multixact path entirely — the single-holder
+	// xmax behaviour (one TransactionID per tuple) is preserved, so tests and
+	// deployments that don't wire a store keep working unchanged. M0118-0003.
+	MultiXact *multixact.Store
 
 	// Session, if set, is consulted by the Transaction operator to
 	// drive BEGIN/COMMIT/ROLLBACK. It also tracks whether the current
@@ -156,6 +171,17 @@ type Context struct {
 	// policy from M0012-0002 relies on the monotonic shape.
 	BackendID lockmgr.BackendID
 
+	// TxnLockBackendID identifies the *transaction* (rather than the
+	// single statement) to the lock manager. It is stable for the life
+	// of an explicit transaction block, so heavyweight locks acquired
+	// under it survive the per-statement ReleaseAll(BackendID) in
+	// dispatch.go and are only dropped at COMMIT/ROLLBACK. LOCK TABLE
+	// uses it to hold its relation lock until end-of-transaction, the
+	// way upstream's lockmgr does. Zero means "not inside an explicit
+	// transaction" — execLockTable then falls back to display-only
+	// registration (no real blocking lock). M0118-0003 (lock-nowait).
+	TxnLockBackendID lockmgr.BackendID
+
 	// ProcNum is the backend's slot index in the Manager's ProcArray.
 	// Set once per connection in serveConn and carried on every ectx so
 	// operators that call TxnMgr.Begin (e.g. execBegin) can supply it.
@@ -195,6 +221,16 @@ type Context struct {
 	// Wired to SessionRegistry.BeginTransaction / EndTransaction. M0097-0023.
 	BeginLocalTransaction func()
 	EndLocalTransaction   func()
+
+	// PLpgSQLCommitChain commits (rollback=false) or rolls back (rollback=true)
+	// the current transaction and immediately begins a fresh one, updating
+	// ctx.Tx / ctx.Snap in place. It backs PL/pgSQL `COMMIT;` / `ROLLBACK;`
+	// transaction-control statements in a non-atomic execution context (a
+	// top-level DO block / procedure run outside an explicit transaction). It is
+	// installed by the simple-query dispatch ONLY when the statement runs in
+	// auto-commit mode; inside an explicit BEGIN block it is nil, so the runtime
+	// raises SQLSTATE 2D000 (invalid transaction termination). M0118-0008.
+	PLpgSQLCommitChain func(rollback bool) error
 
 	// EnableOpportunisticPrune mirrors the enable_opportunistic_prune
 	// GUC (M0046-0002). When true, the HOT-update path calls
@@ -389,6 +425,15 @@ type Context struct {
 	// passes the role name or "" to restore superuser status.
 	SetSessionAuthorization func(role string)
 
+	// CancelBackend, when non-nil, signals the backend identified by pid to
+	// cancel its currently-executing query (the engine behind the
+	// pg_cancel_backend(pid) SQL function). Returns true if a backend with that
+	// pid is connected (signal sent — true even when the target is idle, as in
+	// PG), false if the pid is unknown. The server wires this to its
+	// process-wide cancel registry; nil in unit/embedded contexts where no peer
+	// backends exist. M0118-0008 (detach-partition-concurrently-3/4 s1cancel).
+	CancelBackend func(pid int32) bool
+
 	// MergeAction holds the current MERGE action for MergeActionExpr evaluation
 	// in a MERGE RETURNING clause. Set by mergeOp.collectReturningRow. M0100-0007.
 	MergeAction planner.MergeActionKind
@@ -510,8 +555,8 @@ func (c *Context) acquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) err
 	if err == lockmgr.ErrDeadlockDetected {
 		return &ExecError{Code: "40P01", Message: "deadlock detected"}
 	}
-	if err == context.Canceled || err == context.DeadlineExceeded {
-		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+	if ee := lockWaitCancelError(err); ee != nil {
+		return ee
 	}
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }
@@ -541,8 +586,8 @@ func (c *Context) acquireTupleLock(rel storage.RelFileNode, ptr storage.ItemPoin
 	if err == lockmgr.ErrDeadlockDetected {
 		return &ExecError{Code: "40P01", Message: "deadlock detected"}
 	}
-	if err == context.Canceled || err == context.DeadlineExceeded {
-		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+	if ee := lockWaitCancelError(err); ee != nil {
+		return ee
 	}
 	return &ExecError{Code: "XX000", Message: err.Error()}
 }
@@ -602,6 +647,393 @@ func (c *Context) tryAcquireRelLock(rel storage.RelFileNode, mode lockmgr.Mode) 
 		return &ExecError{Code: "55P03", Message: "could not obtain lock on relation"}
 	}
 	return &ExecError{Code: "XX000", Message: err.Error()}
+}
+
+// tableLockMgr is the dedicated, always-on heavyweight lock manager
+// that backs `LOCK TABLE` (M0118-0003 lock-nowait). It is deliberately
+// SEPARATE from Context.LockMgr (which is nil in the production server,
+// so the relation/tuple acquireRelLock helpers are no-ops there and
+// cross-statement row blocking instead rides xmax/WaitForXID). Keeping
+// LOCK TABLE on its own manager confines the blast radius of real
+// heavyweight locking to explicit LOCK statements: ordinary scans,
+// DML and DDL never touch it, so enabling it can't introduce new
+// blocking on the pgbench/TPC-H hot paths.
+var tableLockMgr = lockmgr.New()
+
+// ReleaseTableLocks drops every LOCK TABLE heavyweight lock held by the
+// given transaction backend identity. The wire layer calls it from
+// connTxState.End() at COMMIT/ROLLBACK (and on connection teardown), so
+// LOCK TABLE locks live exactly as long as the transaction that took
+// them. M0118-0003 (lock-nowait).
+func ReleaseTableLocks(b lockmgr.BackendID) {
+	if b == 0 {
+		return
+	}
+	tableLockMgr.ReleaseAll(b)
+}
+
+// acquireRelLockTxn acquires a LOCK TABLE relation lock on the dedicated
+// tableLockMgr under the *transaction* backend identity
+// (TxnLockBackendID) rather than the per-statement BackendID, so the
+// lock is held until COMMIT/ROLLBACK instead of being dropped by
+// dispatch.go's per-statement ReleaseAll. A LOCK acquired in one
+// statement therefore still blocks a conflicting session two statements
+// later, the way upstream's transaction-scoped lockmgr does.
+//
+// nowait selects the non-blocking path (LOCK … NOWAIT): on contention
+// it returns SQLSTATE 55P03 immediately instead of waiting. The
+// lockmgr early-grant rule lets a session that already holds a
+// self-compatible mode jump ahead of a conflicting parked waiter, so
+// NOWAIT can still succeed when the requester already holds a stronger
+// lock (the lock-nowait spec's s1b step).
+//
+// A zero TxnLockBackendID (statement run outside an explicit
+// transaction block) makes this a no-op so autocommit LOCK keeps its
+// historical display-only behaviour and never leaks a lock that nothing
+// would release.
+func (c *Context) acquireRelLockTxn(rel storage.RelFileNode, mode lockmgr.Mode, nowait bool) error {
+	if c.TxnLockBackendID == 0 {
+		return nil
+	}
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	if nowait {
+		err := tableLockMgr.TryAcquire(c.TxnLockBackendID, tag, mode)
+		if err == nil {
+			return nil
+		}
+		if err == lockmgr.ErrLockNotAvailable {
+			return &ExecError{Code: "55P03", Message: "could not obtain lock on relation"}
+		}
+		return &ExecError{Code: "XX000", Message: err.Error()}
+	}
+	if c.Activity != nil {
+		c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitRelationLock)
+	}
+	lockCtx := context.Background()
+	if c.Ctx != nil {
+		lockCtx = c.Ctx
+	}
+	err := tableLockMgr.AcquireWithTimeout(lockCtx, c.TxnLockBackendID, tag, mode, c.deadlockTimeout())
+	if c.Activity != nil {
+		c.Activity.WaitEventEnd(c.ProcNum)
+	}
+	if err == nil {
+		return nil
+	}
+	if err == lockmgr.ErrDeadlockDetected {
+		return &ExecError{Code: "40P01", Message: "deadlock detected"}
+	}
+	if ee := lockWaitCancelError(err); ee != nil {
+		return ee
+	}
+	return &ExecError{Code: "XX000", Message: err.Error()}
+}
+
+// firstNormalObjectOID is the first OID assigned to user-created objects
+// (mirrors upstream FirstNormalObjectId). Relations below it are system
+// catalogs, which goopg serves from virtual/in-memory builders and never
+// AccessExclusive-locks, so scan-read locking skips them.
+const firstNormalObjectOID = 16384
+
+// acquireScanReadLockTxn takes a transaction-scoped ACCESS SHARE heavyweight
+// lock on the relation a scan is about to read, so a concurrent LOCK TABLE (or
+// any other AccessExclusive acquirer) in another session blocks until this
+// transaction ends — matching PostgreSQL, where every relation a query reads is
+// locked in ACCESS SHARE mode for the lifetime of the transaction.
+//
+// It is deliberately confined to keep the heavyweight manager off the hot path:
+//   - inside an explicit transaction block (TxnLockBackendID != 0) the ACCESS
+//     SHARE lock is held to end-of-transaction (acquireRelLockTxn);
+//   - in autocommit it is acquired and immediately released (transient), so a
+//     single-statement read still blocks while a conflicting ACCESS EXCLUSIVE
+//     (TRUNCATE / DDL / LOCK TABLE) is held by another backend, then proceeds
+//     once the holder commits — but holds nothing itself (acquireRelLockMaybeTransient);
+//   - system catalogs (OID < firstNormalObjectOID) are skipped.
+//
+// ACCESS SHARE is self-compatible and conflicts only with ACCESS EXCLUSIVE, so
+// in the common case (no concurrent LOCK TABLE / DDL) the acquire is granted
+// instantly, and lockmgr is idempotent so re-scanning the same relation within a
+// transaction is a cheap mask check. When it does wait, the lock_timeout /
+// statement_timeout budget carried on the statement context governs the wait
+// exactly like LOCK TABLE does. This is the table-level half of the timeouts
+// isolation spec (M0118-0009) and the scan-side of inherit-temp's
+// TRUNCATE-blocks-parent-scan permutations (design 0118-0037).
+func (c *Context) acquireScanReadLockTxn(rel storage.RelFileNode) error {
+	if rel.RelOid < firstNormalObjectOID {
+		return nil
+	}
+	return c.acquireRelLockMaybeTransient(rel, lockmgr.AccessShareLock)
+}
+
+// acquireWriteLockTxn takes a transaction-scoped ROW EXCLUSIVE heavyweight lock
+// on a relation a DML write (INSERT/UPDATE/DELETE) is about to modify, so a
+// concurrent CREATE TRIGGER / CREATE INDEX / ALTER TABLE (any acquirer of
+// ShareLock / ShareRowExclusiveLock / ExclusiveLock / AccessExclusiveLock) in
+// another session blocks until this transaction ends — matching PostgreSQL,
+// where the target of a write is locked in ROW EXCLUSIVE mode for the lifetime
+// of the transaction.
+//
+// Same confinement as acquireScanReadLockTxn (the read-side sibling): a no-op
+// outside an explicit transaction block and for system catalogs. ROW EXCLUSIVE
+// is self-compatible and compatible with ACCESS SHARE / ROW SHARE / ROW
+// EXCLUSIVE, so concurrent DML on the same relation never blocks at the table
+// level (it only conflicts with DDL-grade lock modes), keeping the common path
+// — including pgbench's UPDATE-heavy TPC-B — free of new cross-session blocking.
+// This is the write half of the table-level DDL/DML conflict machinery used by
+// the create-trigger isolation spec. M0118-0008.
+func (c *Context) acquireWriteLockTxn(rel storage.RelFileNode) error {
+	// Symmetric with the read-side acquireScanReadLockTxn: held to
+	// end-of-transaction inside an explicit block, and acquired+released
+	// transiently in autocommit so the acquisition still WAITS behind a
+	// conflicting holder (e.g. an AccessExclusiveLock from DETACH … FINALIZE on
+	// the partition). RowExclusive is self-compatible and compatible with
+	// AccessShare/RowShare/RowExclusive, so concurrent DML/reads never block at
+	// the table level — only a DDL-grade lock (Share/ShareRowExclusive/
+	// Exclusive/AccessExclusive) does, matching PostgreSQL. M0118-0008
+	// (detach-partition-concurrently-3, autocommit INSERT behind FINALIZE).
+	return c.acquireRelLockMaybeTransient(rel, lockmgr.RowExclusiveLock)
+}
+
+// acquireDDLLockTxn takes a transaction-scoped heavyweight lock in the requested
+// mode on a relation a DDL statement is about to alter, so the lock is held
+// until COMMIT/ROLLBACK and conflicting concurrent DML/DDL blocks. CREATE
+// TRIGGER uses ShareRowExclusiveLock (conflicts with concurrent writes but not
+// reads or SELECT ... FOR UPDATE), mirroring PostgreSQL. Same confinement as the
+// scan/write siblings: a no-op outside an explicit transaction and for system
+// catalogs. M0118-0008.
+func (c *Context) acquireDDLLockTxn(rel storage.RelFileNode, mode lockmgr.Mode) error {
+	if c.TxnLockBackendID == 0 || rel.RelOid < firstNormalObjectOID {
+		return nil
+	}
+	return c.acquireRelLockTxn(rel, mode, false)
+}
+
+// acquireSequenceLockTxn takes the heavyweight ROW EXCLUSIVE lock that nextval()
+// holds on a sequence relation, mirroring PostgreSQL's lock_and_open_sequence
+// (sequence.c, RowExclusiveLock). It conflicts with the AccessExclusiveLock that
+// ALTER SEQUENCE takes (acquireDDLLockTxn), so:
+//
+//   - inside an explicit transaction the lock is held until COMMIT/ROLLBACK
+//     under the transaction backend identity (TxnLockBackendID), so a later
+//     ALTER SEQUENCE in another session waits for this transaction to end; and
+//   - in autocommit the same lock is taken transiently under the per-statement
+//     backend identity and released as soon as it is granted — the WAIT still
+//     happens during acquisition (so an autocommit nextval blocks while another
+//     session holds a conflicting ALTER SEQUENCE lock from its open
+//     transaction), matching PostgreSQL's single-statement implicit transaction.
+//
+// RowExclusiveLock is self-compatible, so concurrent nextval()s (including
+// SERIAL/IDENTITY inserts) never block each other at the table level. System
+// catalogs (OID < firstNormalObjectOID) are skipped. M0118-0008 (sequence-ddl).
+func (c *Context) acquireSequenceLockTxn(rel storage.RelFileNode) error {
+	return c.acquireRelLockMaybeTransient(rel, lockmgr.RowExclusiveLock)
+}
+
+// acquireRelLockMaybeTransient acquires the heavyweight lock `mode` on rel.
+// Inside an explicit transaction (TxnLockBackendID != 0) the lock is held to
+// end-of-transaction (via acquireRelLockTxn); in autocommit it is acquired
+// transiently under the per-statement BackendID and released the instant it is
+// granted, so the WAIT on a conflicting holder still happens during acquisition
+// but no lock lingers past the statement — matching PostgreSQL's single-
+// statement implicit transaction. The per-statement BackendID is globally
+// unique (minted from the same counter as LockBackendID) and never touches
+// tableLockMgr elsewhere, so the targeted Release drops exactly this lock with
+// no risk to other backends. System catalogs (OID < firstNormalObjectOID) are
+// skipped. Used by nextval() (RowExclusiveLock, sequence-ddl) and by REINDEX
+// SCHEMA (ShareLock per relation, reindex-schema). M0118-0008.
+func (c *Context) acquireRelLockMaybeTransient(rel storage.RelFileNode, mode lockmgr.Mode) error {
+	if rel.RelOid < firstNormalObjectOID {
+		return nil
+	}
+	if c.TxnLockBackendID != 0 {
+		// Explicit transaction: held until end-of-transaction.
+		return c.acquireRelLockTxn(rel, mode, false)
+	}
+	if c.BackendID == 0 {
+		return nil
+	}
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	if c.Activity != nil {
+		c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitRelationLock)
+	}
+	lockCtx := context.Background()
+	if c.Ctx != nil {
+		lockCtx = c.Ctx
+	}
+	err := tableLockMgr.AcquireWithTimeout(lockCtx, c.BackendID, tag, mode, c.deadlockTimeout())
+	if c.Activity != nil {
+		c.Activity.WaitEventEnd(c.ProcNum)
+	}
+	if err == nil {
+		tableLockMgr.Release(c.BackendID, tag, mode)
+		return nil
+	}
+	if err == lockmgr.ErrDeadlockDetected {
+		return &ExecError{Code: "40P01", Message: "deadlock detected"}
+	}
+	if ee := lockWaitCancelError(err); ee != nil {
+		return ee
+	}
+	return &ExecError{Code: "XX000", Message: err.Error()}
+}
+
+// tryAcquireMaintenanceLock is the conditional (non-blocking) lock acquire that
+// backs VACUUM/ANALYZE (SKIP_LOCKED): it mirrors PostgreSQL's
+// ConditionalLockRelationOid, returning true when `mode` is free to take on rel
+// and false the instant a conflicting lock is held by any other backend (the
+// caller then skips the relation rather than waiting). The lock is released
+// immediately on success — goopg's VACUUM/ANALYZE is a self-contained statement
+// that needs the lock only to detect contention, not to hold off concurrent
+// access for its duration. System catalogs (OID < firstNormalObjectOID) are
+// never contended this way, so they always report available.
+//
+// The acquire runs under whichever backend identity is active — the transaction
+// backend inside an explicit block, else the per-statement backend — both of
+// which are minted from the same counter and unique, so the targeted Release
+// drops exactly this probe. A zero backend (no identity at all) reports
+// available. M0118-0008 (vacuum-skip-locked).
+func (c *Context) tryAcquireMaintenanceLock(rel storage.RelFileNode, mode lockmgr.Mode) bool {
+	if rel.RelOid < firstNormalObjectOID {
+		return true
+	}
+	backend := c.BackendID
+	if c.TxnLockBackendID != 0 {
+		backend = c.TxnLockBackendID
+	}
+	if backend == 0 {
+		return true
+	}
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	if err := tableLockMgr.TryAcquire(backend, tag, mode); err != nil {
+		return false
+	}
+	tableLockMgr.Release(backend, tag, mode)
+	return true
+}
+
+// waitForRelationLockers blocks until no OTHER backend holds a transaction-
+// scoped table lock on rel, mirroring PostgreSQL's WaitForLockers, which
+// REINDEX … CONCURRENTLY and CREATE INDEX CONCURRENTLY invoke at each phase
+// boundary. Unlike a lock acquisition it takes NO conflicting lock of its own,
+// so concurrent DML (ROW EXCLUSIVE) and reads (ACCESS SHARE) proceed unimpeded
+// while it waits — that is the CONCURRENTLY contract (a ShareUpdateExclusive
+// holder must not block ordinary readers/writers). It returns once every other
+// transaction that held the relation locked during the wait has committed or
+// rolled back (its locks dropped by ReleaseTableLocks at end-of-transaction).
+//
+// Because the heavyweight table locks it observes are only registered inside an
+// explicit transaction (acquireScanReadLockTxn / acquireWriteLockTxn under
+// TxnLockBackendID), a bare BEGIN with no table access registers nothing, so a
+// CONCURRENTLY operation started before any concurrent session has touched the
+// relation returns immediately — matching PostgreSQL, where REINDEX CONCURRENTLY
+// only waits for transactions that actually hold a lock on the table.
+//
+// System catalogs (OID < firstNormalObjectOID) are skipped, and a context
+// cancellation/timeout (statement_timeout / client cancel) aborts the wait with
+// the matching SQLSTATE-57014 error exactly like the lock-wait helpers.
+// M0118-0008 (reindex-concurrently isolation spec).
+func (c *Context) waitForRelationLockers(rel storage.RelFileNode) error {
+	if rel.RelOid < firstNormalObjectOID {
+		return nil
+	}
+	tag := lockmgr.LockTag{DB: rel.DBOid, Rel: rel.RelOid}
+	lockCtx := context.Background()
+	if c.Ctx != nil {
+		lockCtx = c.Ctx
+	}
+	const pollInterval = 10 * time.Millisecond
+	waiting := false
+	for {
+		hasOther := false
+		for b := range tableLockMgr.Holders(tag) {
+			if b == c.TxnLockBackendID || b == c.BackendID {
+				continue
+			}
+			hasOther = true
+			break
+		}
+		if !hasOther {
+			if waiting && c.Activity != nil {
+				c.Activity.WaitEventEnd(c.ProcNum)
+			}
+			return nil
+		}
+		if !waiting {
+			waiting = true
+			if c.Activity != nil {
+				c.Activity.WaitEventStart(c.ProcNum, activity.WaitTypeLock, activity.WaitRelationLock)
+			}
+		}
+		select {
+		case <-lockCtx.Done():
+			if c.Activity != nil {
+				c.Activity.WaitEventEnd(c.ProcNum)
+			}
+			if ee := lockWaitCancelError(lockCtx.Err()); ee != nil {
+				return ee
+			}
+			return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+		case <-time.After(pollInterval):
+		}
+	}
+}
+
+// lockWaitCancelError maps the cancellation/timeout error returned by a
+// lock-wait primitive (lockmgr.Acquire* or mvcc.WaitForXID) to the matching
+// SQLSTATE-57014 ExecError, or nil when err is not a recognised cancellation.
+// The three message variants mirror PostgreSQL exactly:
+//   - lock_timeout      → "canceling statement due to lock timeout"
+//   - statement_timeout → "canceling statement due to statement timeout"
+//   - client cancel     → "canceling statement due to user request"
+//
+// statement_timeout is the only source of a context *deadline* in goopg, so
+// context.DeadlineExceeded is reported as a statement timeout; a plain
+// context.Canceled is a CancelRequest / connection teardown. M0118-0009.
+func lockWaitCancelError(err error) *ExecError {
+	if ee := lockWaitTimeoutError(err); ee != nil {
+		return ee
+	}
+	if errors.Is(err, context.Canceled) {
+		return &ExecError{Code: "57014", Message: "canceling statement due to user request"}
+	}
+	return nil
+}
+
+// lockWaitTimeoutError is the subset of lockWaitCancelError that recognises
+// only the two *timeout* causes — lock_timeout and statement_timeout — and
+// returns nil for a plain client cancellation. Lock-wait sites that retry on
+// connection teardown (epqWait, the row-lock chain walk) use it so only an
+// explicit timeout aborts the statement. M0118-0009.
+func lockWaitTimeoutError(err error) *ExecError {
+	switch {
+	case errors.Is(err, lockwait.ErrLockTimeout):
+		return &ExecError{Code: "57014", Message: "canceling statement due to lock timeout"}
+	case errors.Is(err, context.DeadlineExceeded):
+		return &ExecError{Code: "57014", Message: "canceling statement due to statement timeout"}
+	default:
+		return nil
+	}
+}
+
+// deadlockTimeout returns the session-effective `deadlock_timeout` GUC as
+// a duration, governing how long a LOCK TABLE wait parks before the
+// deadlock detector runs. Falls back to lockmgr.DefaultDeadlockTimeout
+// when the GUC is unset or unparseable. The effective GUC value is a bare
+// integer in milliseconds (UnitMs canonicalises away the unit suffix).
+// M0118-0004.
+func (c *Context) deadlockTimeout() time.Duration {
+	if c.GetSetting == nil {
+		return lockmgr.DefaultDeadlockTimeout
+	}
+	v, ok := c.GetSetting("deadlock_timeout")
+	if !ok {
+		return lockmgr.DefaultDeadlockTimeout
+	}
+	ms, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	if err != nil || ms <= 0 {
+		return lockmgr.DefaultDeadlockTimeout
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // Checkpointer is the contract the SQL `CHECKPOINT` verb uses to
@@ -664,3 +1096,26 @@ func (c *Context) MaterializeWriterXID() error {
 // EnumRenameEntry records one ALTER TYPE … RENAME TO operation for transactional rollback.
 // OldName and NewName are lowercase. M0097-0022.
 type EnumRenameEntry struct{ OldName, NewName string }
+
+// sessionUniqueIDer is satisfied by *config.SessionRegistry (and test doubles).
+// It exposes the stable per-connection identity without the executor importing
+// the config package's concrete type into this signature.
+type sessionUniqueIDer interface{ UniqueID() uint64 }
+
+// sessionTempOwner returns the owning-session token for temporary relations
+// created by, or visible to, this Context. It is derived from the stable
+// per-connection SessionRegistry carried in AdvisorySessionIdentity. The empty
+// string means "no session identity" (internal/test contexts): such temp
+// relations are owned by nobody and stay visible to all sessions, preserving
+// legacy single-session behaviour. Design 0118-0036 (M0118-0008 inherit-temp).
+func sessionTempOwner(ctx *Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if s, ok := ctx.AdvisorySessionIdentity.(sessionUniqueIDer); ok && s != nil {
+		if id := s.UniqueID(); id != 0 {
+			return "s" + strconv.FormatUint(id, 10)
+		}
+	}
+	return ""
+}

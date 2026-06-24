@@ -73,8 +73,23 @@ func PageFreezeOldTuples(p Page, freezeBelow TransactionID) (PageFreezeStats, er
 			// Read infomask (bytes 20-22) to check lock-only.
 			infomask := binary.LittleEndian.Uint16(p[off+20 : off+22])
 			if !IsHeapTupleLockOnly(infomask) {
-				// Tuple is deleted — skip freezing (it will be vacuumed away).
-				continue
+				// A non-lock-only xmax marks the tuple deleted/updated, so its
+				// xmin is not worth freezing — EXCEPT when xmax is an updater-
+				// bearing multixact that, once resolved, holds only lockers (no
+				// updater): then the row is still live and freezable. Here xmax
+				// is a MultiXactId, not an xid, so resolve it through the member
+				// store rather than trusting the raw value.
+				deleted := true
+				if IsHeapTupleXmaxMulti(infomask) && ResolveMultiUpdater != nil {
+					if _, hasUpdater, resolved := ResolveMultiUpdater(xmax); resolved && !hasUpdater {
+						deleted = false // all lockers: row still live
+					}
+				}
+				if deleted {
+					// Deleted (or an unresolvable multi we won't risk freezing) —
+					// skip; vacuum will reclaim it.
+					continue
+				}
 			}
 		}
 

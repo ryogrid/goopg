@@ -17,6 +17,7 @@ import (
 	"github.com/goopg/goopg/internal/analyzer"
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
@@ -1946,6 +1947,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	tbl.Unlogged = s.Unlogged
 	tbl.Temp = s.Temporary
+	if s.Temporary {
+		tbl.TempOwner = sessionTempOwner(o.ctx)
+	}
 	tbl.Fillfactor = fillfactor
 	tbl.ParallelWorkers = parallelWorkers
 	tbl.ParallelWorkersSet = parallelWorkersSet
@@ -2933,6 +2937,9 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// Set persistence flags on the child.
 	tbl.Unlogged = s.Unlogged
 	tbl.Temp = s.Temporary
+	if s.Temporary {
+		tbl.TempOwner = sessionTempOwner(o.ctx)
+	}
 	// Persist the leaf partition's fillfactor so pg_class.reloptions surfaces it
 	// and pg_dump re-emits `WITH (fillfactor='N')`. DU-002 slice 191.
 	tbl.Fillfactor = childFillfactor
@@ -4426,6 +4433,24 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error
 	}
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	relOID := tbl.OID
+	// Dropping a partition left in the incomplete-detach state
+	// (DetachPendingEpoch != 0) also grabs an AccessExclusiveLock on the parent,
+	// because the parent's partition descriptor still references it: upstream
+	// RangeVarCallbackForDropRelation / heap_drop locks the parent when removing a
+	// partition pending detach so concurrent readers of the parent see a
+	// consistent set. Held to end-of-transaction inside an explicit block (a
+	// no-op in autocommit), so a concurrent SELECT on the parent blocks until the
+	// dropping transaction commits. M0118-0008 (detach-partition-concurrently-3).
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && tbl.DetachPendingEpoch != 0 && tbl.PartitionParentOID != 0 {
+		if parentTbl, ok2 := im.LookupTableByOID(tbl.PartitionParentOID); ok2 {
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(parentTbl), lockmgr.AccessExclusiveLock); err != nil {
+				if ee, ok3 := err.(*ExecError); ok3 && ee.Pos == 0 {
+					ee.Pos = name.Pos()
+				}
+				return err
+			}
+		}
+	}
 	// Use the table's stored name for DropTable so that bare-keyed tables
 	// (schema="") found via a schema-qualified lookup can be removed correctly.
 	// M0097-0023.
@@ -4604,10 +4629,42 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if method != "btree" {
 		return &ExecError{Code: "0A000", Pos: s.Pos(), Message: fmt.Sprintf("index method %q is not supported in v0", method)}
 	}
+	// CREATE INDEX CONCURRENTLY waits for transactions that were already running
+	// when it started to drain before it completes (PostgreSQL waits for any
+	// snapshot that could predate the new index). Capture that set NOW, before
+	// the const-fold below may itself block — waiting on a start-time snapshot
+	// (rather than re-scanning at wait time) keeps two simultaneous concurrent
+	// builds from waiting on each other. The wait itself happens after the build.
+	var cicWaitSlots []int
+	if s.Concurrently && o.ctx.TxnMgr != nil && o.ctx.Tx.Handle != 0 {
+		cicWaitSlots = o.ctx.TxnMgr.SnapshotActiveOtherSlots(o.ctx.Tx.Handle)
+	}
 	// For partial indexes, resolve the WHERE predicate so bulk build can filter rows.
 	var resolvedPred planner.Expr
 	if s.HasPredicate && s.Predicate != nil {
 		resolvedPred, _ = planner.ResolveIndexPredicate(s.Predicate, tbl)
+	}
+	// Const-fold a partial-index predicate that references no table columns,
+	// mirroring PostgreSQL's eval_const_expressions over the index predicate in
+	// BuildIndexInfo: an IMMUTABLE function with constant arguments is evaluated
+	// exactly once at build time, not per heap tuple. This matters for the
+	// function's observable effects — e.g. a predicate that takes an advisory
+	// lock — and is why CREATE INDEX CONCURRENTLY on an empty table can still
+	// block another session (isolation spec multiple-cic). The stored predicate
+	// (idx.Predicate) keeps the original expression so pg_get_indexdef / pg_dump
+	// still render the WHERE clause verbatim.
+	if resolvedPred != nil && !planner.ExprContainsColumnRef(resolvedPred) {
+		pv, pErr := evalExpr(resolvedPred, nil, o.ctx)
+		if pErr != nil {
+			return pErr
+		}
+		if pv.IsNull() || (pv.Kind == KindBool && !pv.BoolValue()) {
+			// Constant FALSE/NULL ⇒ no heap tuple qualifies; build an empty index.
+			resolvedPred = &planner.BooleanConst{}
+		} else {
+			// Constant TRUE ⇒ every heap tuple qualifies; drop the predicate.
+			resolvedPred = nil
+		}
 	}
 	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, resolvedPred); err != nil {
 		return err
@@ -4643,6 +4700,15 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 				idx.ColDescending = desc
 				idx.ColNullsFirst = nullsFirst
 			}
+		}
+	}
+	// CREATE INDEX CONCURRENTLY: drain the transactions that were running when
+	// the build started (captured above). Once they finish, no snapshot that
+	// predates the new index remains. Two simultaneous concurrent builds do not
+	// deadlock here because each waits only on its own start-time snapshot.
+	if s.Concurrently && len(cicWaitSlots) > 0 && o.ctx.Ctx != nil {
+		if err := o.ctx.TxnMgr.WaitForSlotsToCommit(o.ctx.Ctx, cicWaitSlots); err != nil {
+			return &ExecError{Code: "57014", Pos: s.Pos(), Message: "CREATE INDEX CONCURRENTLY cancelled"}
 		}
 	}
 	return nil
@@ -4779,6 +4845,60 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		tbl.Schema = s.SetSchema
 		return nil
 	}
+	// Handle ENABLE/DISABLE TRIGGER — a semantic no-op in v0, but it takes a
+	// transaction-scoped ShareRowExclusiveLock on the table in PostgreSQL
+	// (AlterTableGetLockLevel → ShareRowExclusiveLock for AT_EnableTrig /
+	// AT_DisableTrig). That lock conflicts with a concurrent INSERT/UPDATE/DELETE
+	// (RowExclusiveLock) but not with reads (AccessShareLock) or SELECT ... FOR
+	// UPDATE (RowShareLock), so within an open transaction a concurrent write
+	// blocks until COMMIT while a concurrent FOR UPDATE proceeds. M0118-0008
+	// (alter-table-3 isolation spec).
+	if s.EnableDisableTrigger {
+		tbl, ok := o.lookupTableWithSearch(s.Name)
+		if !ok {
+			if s.IfExists {
+				return nil
+			}
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
+		}
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+				ee.Pos = s.Pos()
+			}
+			return err
+		}
+		return nil
+	}
+	// Handle OWNER TO role — record the new owning role on the in-memory table so
+	// the VACUUM/ANALYZE/CLUSTER maintenance-privilege check (a non-superuser
+	// session may only maintain a relation it owns) sees the change. PostgreSQL
+	// takes an AccessExclusiveLock for ALTER TABLE ... OWNER TO
+	// (AlterTableGetLockLevel), so we take the same transaction-scoped DDL lock
+	// (a no-op in autocommit, which is how the vacuum-conflict / cluster-conflict
+	// specs issue the grant). M0118-0008.
+	if s.OwnerTo != "" {
+		tbl, ok := o.lookupTableWithSearch(s.Name)
+		if !ok {
+			if s.IfExists {
+				return nil
+			}
+			return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
+		}
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+				ee.Pos = s.Pos()
+			}
+			return err
+		}
+		// The parser sentinel "current_user" (also SESSION_USER / CURRENT_ROLE)
+		// means "the bootstrap superuser" in goopg — recorded as an empty owner.
+		if strings.EqualFold(s.OwnerTo, "current_user") {
+			tbl.Owner = ""
+		} else {
+			tbl.Owner = s.OwnerTo
+		}
+		return nil
+	}
 	tbl, ok := o.lookupTableWithSearch(s.Name)
 	if !ok {
 		// Not a heap table — check if it's an index.
@@ -4838,6 +4958,18 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 		return &ExecError{Code: "42501", Pos: s.Pos(),
 			Message: fmt.Sprintf("permission denied: %q is a system catalog", tbl.Name)}
 	}
+	// Disallow any ALTER TABLE on a partition left in an incomplete-detach state
+	// (a DETACH PARTITION CONCURRENTLY that was cancelled mid-wait, so the child
+	// is still registered but marked detach-pending). Mirrors PG ATPrepCmd
+	// (tablecmds.c): `cmd->subtype != AT_DetachPartitionFinalize &&
+	// PartitionHasPendingDetach(rel)`. The only way out is
+	// ALTER TABLE parent DETACH PARTITION child FINALIZE, which targets the
+	// PARENT (so tbl there is not the pending child). M0118-0008
+	// (detach-partition-concurrently-3).
+	if tbl.DetachPendingEpoch != 0 && tbl.PartitionParentOID != 0 {
+		return &ExecError{Code: "55000", Pos: s.Pos(),
+			Message: fmt.Sprintf("cannot alter partition %q with an incomplete detach", tbl.Name)}
+	}
 	for _, act := range s.Actions {
 		switch act.Kind {
 		case parser.AlterTableAddColumn:
@@ -4860,6 +4992,23 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// column-level validation is deferred. Store the FK
 			// so TRUNCATE CASCADE BFS can find referencing tables.
 			// See docs/design/0003-0004-hammerdb-tpch-integration.md.
+			//
+			// ADD CONSTRAINT … FOREIGN KEY takes a ShareRowExclusiveLock on the
+			// table being altered (AlterTableGetLockLevel → AT_AddConstraint),
+			// which conflicts with a concurrent INSERT/UPDATE/DELETE
+			// (RowExclusiveLock, acquireWriteLockTxn) but not with reads
+			// (AccessShareLock) or SELECT … FOR UPDATE (RowShareLock). Within an
+			// open transaction the lock is held to COMMIT, so a concurrent write
+			// to the table blocks until this transaction ends while a concurrent
+			// FOR UPDATE proceeds. No-op in autocommit / for system catalogs
+			// (acquireDDLLockTxn), keeping the pg_dump-restore / HammerDB-load
+			// path lock-free. M0118-0008 (alter-table-2 isolation spec).
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = act.Pos()
+				}
+				return err
+			}
 			if _, ok := o.ctx.Catalog.LookupTable(act.RefTable); !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.RefTable.String())}
 			}
@@ -4883,8 +5032,49 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				OnDelete:   act.OnDelete,
 				OnUpdate:   act.OnUpdate,
 				Deferrable: act.Deferrable,
+				NotValid:   act.NotValid,
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
+		case parser.AlterTableValidateConstraint:
+			// VALIDATE CONSTRAINT name — validate a constraint added with
+			// NOT VALID. PostgreSQL's AlterTableGetLockLevel maps
+			// AT_ValidateConstraint to ShareUpdateExclusiveLock (the minimum
+			// lock), which does NOT conflict with concurrent reads
+			// (AccessShareLock), SELECT … FOR UPDATE (RowShareLock), or
+			// INSERT/UPDATE/DELETE (RowExclusiveLock); it conflicts only with
+			// another ShareUpdateExclusive-or-stronger holder. Held to COMMIT
+			// inside an open transaction so a concurrent ALTER waits, while a
+			// no-op in autocommit / for system catalogs keeps the dump/load
+			// path lock-free. M0118-0008 (alter-table-1 isolation spec).
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareUpdateExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = act.Pos()
+				}
+				return err
+			}
+			// Flip the constraint's convalidated flag from 'f' to 't'. The
+			// only validatable constraint goopg models is the FK (NOT VALID);
+			// a CHECK NOT VALID is accepted but already enforced. An unknown
+			// name matches PostgreSQL's error.
+			found := false
+			for i := range tbl.ForeignKeys {
+				if strings.EqualFold(tbl.ForeignKeys[i].Name, act.ConstraintName) {
+					tbl.ForeignKeys[i].NotValid = false
+					found = true
+					break
+				}
+			}
+			if !found {
+				for i := range tbl.NamedChecks {
+					if strings.EqualFold(tbl.NamedChecks[i].Name, act.ConstraintName) {
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42704", Pos: act.Pos(), Message: fmt.Sprintf("constraint %q of relation %q does not exist", act.ConstraintName, tbl.Name)}
+			}
 		case parser.AlterTableAddCheck:
 			// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
 			// Track the constraint name so violations report it. A named
@@ -5040,9 +5230,193 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !ok {
 				break
 			}
-			im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
-			childTbl.PartitionParentOID = 0
-			childTbl.PartitionBounds = nil
+			if act.DetachConcurrently {
+				// ALTER TABLE … DETACH PARTITION … CONCURRENTLY is two-phase
+				// (tablecmds.c ATExecDetachPartition → DetachPartitionFinalize):
+				// phase 1 marks the partition pg_inherits.inhdetachpending and
+				// COMMITS, then waits for every transaction whose snapshot predates
+				// that change to terminate; phase 2 removes the partition and
+				// unsets relpartbound. goopg keeps a single non-MVCC shared catalog,
+				// so it orders the change with a global epoch instead of the
+				// pg_inherits tuple's xmin: phase 1 bumps the partition-detach epoch
+				// and stamps the child detach-pending KEEPING it registered (and
+				// relpartbound set, so `s3i` still reads relpartbound IS NULL = f);
+				// every snapshot acquired afterwards captures the higher epoch and
+				// omits the child (READ COMMITTED — gone immediately), while a
+				// snapshot taken before still includes it (REPEATABLE READ — visible
+				// until commit). The SELECT planner expansion + INSERT routing both
+				// filter through catalog.VisiblePartitionChildren by the snapshot
+				// epoch (sibling-paths). The wait blocks until no OTHER backend holds
+				// a transaction-scoped lock on the parent or the partition: a reader
+				// that touched the detached partition holds its txn-scoped ACCESS
+				// SHARE until commit, so the detacher parks behind it (rendered as
+				// `<waiting ...>` by the runner's timing). Phase 2 then physically
+				// unregisters the child, clears relpartbound, and clears the pending
+				// mark. Design 0118-0059 (detach-partition-concurrently-1).
+				//
+				// The wait is snapshot-based, not lock-based: upstream's phase 1
+				// commits then waits for every transaction whose snapshot predates
+				// the change ("hangs until it sees any older transaction
+				// terminate"). A REPEATABLE READ session that has only PREPAREd a
+				// statement holds no lock on the table yet still has an older
+				// snapshot, so WaitForOlderSlotsToCommit (the DROP INDEX
+				// CONCURRENTLY drain, which waits for every other active backend
+				// transaction to finish) is the correct primitive — a lock-only
+				// wait would let the detacher complete too early for those
+				// permutations.
+				// RI_PartitionRemove_Check (ri_triggers.c): if this partition is on
+				// the referenced side of a foreign key and a committed referencing
+				// row routes to it, detaching would orphan that row — fail
+				// synchronously (no wait) before marking detach-pending so routing
+				// still resolves the child. Design 0118-0060
+				// (detach-partition-concurrently-2).
+				// MarkInheritDetached (tablecmds.c): a partitioned table may have
+				// at most one partition pending detach at a time. Scan the parent's
+				// children; if any is already detach-pending (e.g. an earlier
+				// concurrent detach was cancelled mid-wait, leaving an incomplete
+				// detach), reject naming that child. M0118-0008
+				// (detach-partition-concurrently-3, permutation s2detach2 after a
+				// cancelled s2detach).
+				for _, sib := range im.PartitionChildren(tbl.OID) {
+					if sib.DetachPendingEpoch != 0 {
+						parentSchema := tbl.Schema
+						if parentSchema == "" {
+							parentSchema = "public"
+						}
+						return &ExecError{Code: "55000", Pos: act.Pos(),
+							Message: fmt.Sprintf("partition %q already pending detach in partitioned table %q",
+								sib.Name, parentSchema+"."+tbl.Name)}
+					}
+				}
+				if ferr := detachPartitionFKRefCheck(o.ctx, tbl, childTbl); ferr != nil {
+					if ee, ok := ferr.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = act.Pos()
+					}
+					return ferr
+				}
+				epoch := mvcc.NextPartitionDetachEpoch()
+				im.MarkPartitionDetachPending(childTbl.OID, epoch)
+				// The wait is HYBRID, because goopg's locks are statement-scoped
+				// and BEGIN takes a snapshot — neither alone reproduces upstream's
+				// WaitForLockers (which keys off planning locks held to commit):
+				//   (a) waitForRelationLockers on the parent and every partition
+				//       leaf — catches READ COMMITTED sessions that touched the
+				//       table (a scan holds a txn-scoped AccessShare on the leaves
+				//       it read until commit, acquireScanReadLockTxn); and
+				//   (b) WaitForPinnedSnapshotsToCommit — catches RR/SSI sessions
+				//       holding a pinned snapshot that still sees the partition
+				//       attached even with no table lock (e.g. only PREPAREd).
+				// A READ COMMITTED session that merely issued BEGIN holds neither,
+				// so it does NOT block the detacher (detach-partition-
+				// concurrently-2 permutation 5). Design 0118-0060.
+				var werr error
+				waitRels := append([]*catalog.Table{tbl, childTbl}, allDescendants(im, tbl, 0)...)
+				for _, wr := range waitRels {
+					if werr != nil {
+						break
+					}
+					werr = o.ctx.waitForRelationLockers(o.ctx.Catalog.RelFileNode(wr))
+				}
+				if werr == nil && o.ctx.TxnMgr != nil {
+					werr = o.ctx.TxnMgr.WaitForPinnedSnapshotsToCommit(o.ctx.Ctx, o.ctx.Tx.Handle)
+					// WaitForPinnedSnapshotsToCommit returns the raw context error
+					// (context.Canceled / DeadlineExceeded) on interruption, not an
+					// ExecError; map it to the matching SQLSTATE-57014 cancel/timeout
+					// message exactly as the lock-wait helpers do, so a cancel during
+					// the pinned-snapshot wait reports "canceling statement due to user
+					// request" rather than the bare "context canceled". M0118-0008
+					// (detach-partition-concurrently-4). Design 0118-0063.
+					if werr != nil {
+						if ee := lockWaitCancelError(werr); ee != nil {
+							werr = ee
+						}
+					}
+				}
+				if werr != nil {
+					// Interrupted before finalize (lock/statement timeout, cancel):
+					// leave phase 1 in place — the partition stays in the
+					// "incomplete detach" state (still registered, relpartbound set,
+					// inhdetachpending marked). Upstream commits the
+					// inhdetachpending mark in its own transaction BEFORE waiting, so
+					// a cancel during the wait does NOT roll it back; the partition
+					// is omitted from every newer snapshot and must be completed with
+					// ALTER TABLE ... DETACH PARTITION ... FINALIZE (or dropped).
+					// M0118-0008 (detach-partition-concurrently-3). Design 0118-0061.
+					if ee, ok := werr.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = act.Pos()
+					}
+					return werr
+				}
+				// Re-validate RI_PartitionRemove_Check after the wait. The first
+				// check (above, before MarkPartitionDetachPending) ran under the
+				// statement-start snapshot, which could not see a referencing row
+				// inserted/updated by a concurrent transaction the detacher then
+				// waited on — e.g. a cursor-pinned REPEATABLE READ session that did
+				// `update d4_fk set a = 1 where current of f` (routing the row into
+				// this very partition) and only committed during the wait. Upstream
+				// re-runs the partition-removal RI check after WaitForLockers; do the
+				// same here. Use a FRESH snapshot (so the now-committed row is
+				// visible) but with PartitionDetachEpoch=0 so routeToPartition still
+				// recognises the row as routing to this — now detach-pending — child
+				// (a fresh snapshot's epoch would otherwise filter it out). The child
+				// is still registered (UnregisterPartitionChild runs below) so its
+				// 1-based ordinal → cloned-constraint suffix is unchanged. M0118-0008
+				// (detach-partition-concurrently-4, perm s1updcur-before-detach).
+				// Design 0118-0064.
+				if o.ctx.TxnMgr != nil && o.ctx.Tx.Handle != 0 {
+					savedSnap := o.ctx.Snap
+					if fresh, serr := o.ctx.TxnMgr.SnapshotFor(o.ctx.Tx); serr == nil {
+						refreshed := fresh.Clone()
+						refreshed.PartitionDetachEpoch = 0
+						o.ctx.Snap = refreshed
+					}
+					ferr := detachPartitionFKRefCheck(o.ctx, tbl, childTbl)
+					o.ctx.Snap = savedSnap
+					if ferr != nil {
+						if ee, ok := ferr.(*ExecError); ok && ee.Pos == 0 {
+							ee.Pos = act.Pos()
+						}
+						return ferr
+					}
+				}
+				// Phase 2: finalize the detach.
+				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
+				childTbl.PartitionParentOID = 0
+				childTbl.PartitionBounds = nil
+				im.ClearPartitionDetachPending(childTbl.OID)
+			} else {
+				// Plain DETACH / DETACH FINALIZE: single-phase. FINALIZE also
+				// completes a partition left in the incomplete-detach state by a
+				// cancelled DETACH … CONCURRENTLY: unregister, drop the bound, and
+				// clear the detach-pending mark. M0118-0008
+				// (detach-partition-concurrently-3).
+				//
+				// FINALIZE/plain DETACH takes an AccessExclusiveLock on the
+				// partition (tablecmds.c DetachPartitionFinalize / ATExecDetachPartition),
+				// so it must wait behind any other backend still holding a lock on
+				// the partition — e.g. a session that read the partition directly
+				// (s1spart) or read the parent while the partition was still
+				// attached (s1s before the detach). It does NOT wait on the parent:
+				// only ShareUpdateExclusive is held there, compatible with a
+				// concurrent reader, so a session that scanned the parent AFTER the
+				// partition went detach-pending (and thus never locked the
+				// partition) does not block FINALIZE. acquireRelLockMaybeTransient
+				// holds the AEL to end-of-transaction inside an explicit block (so a
+				// later concurrent read of the partition blocks until COMMIT) and
+				// acquires+releases transiently in autocommit (the wait still
+				// happens during acquisition). The wait is rendered `<waiting ...>`
+				// by the runner's timing.
+				if werr := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(childTbl), lockmgr.AccessExclusiveLock); werr != nil {
+					if ee, ok := werr.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = act.Pos()
+					}
+					return werr
+				}
+				im.UnregisterPartitionChild(tbl.OID, childTbl.OID)
+				childTbl.PartitionParentOID = 0
+				childTbl.PartitionBounds = nil
+				im.ClearPartitionDetachPending(childTbl.OID)
+			}
 
 		case parser.AlterIndexAttachPartition:
 			// ALTER INDEX parent ATTACH PARTITION child — register index partition hierarchy.
@@ -6962,6 +7336,28 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		}
 	}
 
+	// Privilege check (M0118-0008, truncate-conflict). When the session is
+	// running as a non-superuser role (SET ROLE), TRUNCATE on each explicitly
+	// named relation requires the TRUNCATE privilege (granted via GRANT, the
+	// owning superuser bypasses this). This runs BEFORE any lock is acquired so
+	// an unprivileged TRUNCATE fails immediately instead of waiting for a
+	// conflicting lock — matching PostgreSQL's pre-lock ACL check.
+	if role := o.ctx.NonSuperuserRole; role != "" {
+		for _, name := range s.Names {
+			tbl, ok := o.ctx.Catalog.LookupTable(name)
+			if !ok {
+				continue
+			}
+			if !o.ctx.Catalog.HasTablePrivilege(tbl.OID, role, "TRUNCATE") {
+				return &ExecError{
+					Code:    "42501",
+					Pos:     s.Pos(),
+					Message: fmt.Sprintf("permission denied for table %s", tbl.Name),
+				}
+			}
+		}
+	}
+
 	// FK constraint check / CASCADE expansion.
 	// For each table in the set, find all tables (not in the set) that have an FK
 	// pointing to it. If behavior is CASCADE, expand the set and emit NOTICEs.
@@ -7029,7 +7425,10 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 			for {
 				expanded := false
 				for _, entry := range tableSet {
-					children := append(im.PartitionChildren(entry.tbl.OID), im.InheritanceChildren(entry.tbl.OID)...)
+					// Exclude other-session temp inheritance children from CASCADE
+					// expansion (RELATION_IS_OTHER_TEMP). Design 0118-0036.
+					children := append(im.PartitionChildren(entry.tbl.OID),
+						catalog.AccessibleInheritanceChildren(im.InheritanceChildren(entry.tbl.OID), sessionTempOwner(o.ctx))...)
 					for _, child := range children {
 						if _, inSet := tableSet[child.OID]; inSet {
 							continue
@@ -7055,6 +7454,22 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 					Hint:    "Do not specify the ONLY keyword, or use TRUNCATE ONLY on the partitions directly.",
 				}
 			}
+		}
+	}
+
+	// TRUNCATE takes an AccessExclusiveLock on every target relation (PG
+	// AlterTableGetLockLevel / ExecuteTruncate). Held to commit inside an
+	// explicit transaction so a concurrent scan of the parent (AccessShareLock)
+	// blocks until the TRUNCATE transaction commits (inherit-temp's last two
+	// permutations: s2_select_p on inh_parent blocks while s2_select_c on its
+	// own temp child proceeds — design 0118-0037). In autocommit the lock is
+	// acquired transiently — the WAIT still happens during acquisition, so a
+	// TRUNCATE issued while another session holds the table open blocks until
+	// that session commits (truncate-conflict's granted permutations — design
+	// 0118-0039). Both via acquireRelLockMaybeTransient. M0118-0008.
+	for _, entry := range tableSet {
+		if err := o.ctx.acquireRelLockMaybeTransient(o.ctx.Catalog.RelFileNode(entry.tbl), lockmgr.AccessExclusiveLock); err != nil {
+			return err
 		}
 	}
 
@@ -7218,11 +7633,22 @@ func (o *ddlOp) truncateTableAndPartitions(tbl *catalog.Table, pos int, only boo
 	if !only {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 			for _, child := range im.PartitionChildren(tbl.OID) {
+				// A partition pending detach (incomplete DETACH … CONCURRENTLY) is
+				// no longer logically part of the parent: TRUNCATE on the parent
+				// must not touch it. Mirrors PG's find_all_inheritors omitting
+				// inhdetachpending children. M0118-0008
+				// (detach-partition-concurrently-3).
+				if child.DetachPendingEpoch != 0 {
+					continue
+				}
 				if err := o.truncateTableAndPartitions(child, pos, false); err != nil {
 					return err
 				}
 			}
-			for _, child := range im.InheritanceChildren(tbl.OID) {
+			// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP):
+			// TRUNCATE inh_parent must not touch another backend's temp child.
+			// Design 0118-0036 (M0118-0008 inherit-temp).
+			for _, child := range catalog.AccessibleInheritanceChildren(im.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx)) {
 				if err := o.truncateTableAndPartitions(child, pos, false); err != nil {
 					return err
 				}
@@ -8849,6 +9275,18 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 	if !ok {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
 	}
+	// CREATE TRIGGER takes a transaction-scoped ShareRowExclusiveLock on the
+	// table (mirrors PostgreSQL): it conflicts with concurrent writes
+	// (RowExclusiveLock) but not reads (AccessShareLock) or SELECT ... FOR
+	// UPDATE (RowShareLock), so a concurrent UPDATE blocks until this
+	// transaction commits while a concurrent read proceeds. M0118-0008
+	// (create-trigger isolation spec).
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.ShareRowExclusiveLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = s.Pos()
+		}
+		return err
+	}
 	trig := catalog.Trigger{
 		Name:       s.Name,
 		TableOID:   tbl.OID,
@@ -9208,6 +9646,21 @@ func (o *ddlOp) execAlterSequence(s *parser.AlterSequenceStmt) error {
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", name)}
 	}
 
+	// ALTER SEQUENCE takes a transaction-scoped AccessExclusiveLock on the
+	// sequence relation (mirrors PostgreSQL): it conflicts with the
+	// RowExclusiveLock nextval() holds (acquireSequenceLockTxn), so a concurrent
+	// nextval blocks until this transaction commits, and an ALTER blocks while
+	// another session holds an in-progress nextval lock. M0118-0008
+	// (sequence-ddl isolation spec).
+	if tbl, ok := o.ctx.Catalog.LookupTable(s.Name); ok {
+		if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+			if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+				ee.Pos = s.Pos()
+			}
+			return err
+		}
+	}
+
 	// Snapshot current state for sticky-default computation.
 	seq.mu.Lock()
 	curMin := seq.min
@@ -9341,7 +9794,7 @@ func truncateRelation(ctx *Context, rel storage.RelFileNode) error {
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				continue
 			}
 			_ = storage.PageSetHeapTupleXmax(page, slot, ctx.Tx.XID)
@@ -11662,7 +12115,7 @@ func (o *ddlOp) execAlterDropColumn(tbl *catalog.Table, act parser.AlterTableAct
 			if terr != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
 				continue
 			}
 			row := acquireRow(len(oldCols))
@@ -11825,7 +12278,7 @@ func (o *ddlOp) execAlterColumnType(tbl *catalog.Table, act parser.AlterTableAct
 			if terr != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
 				continue
 			}
 			row := acquireRow(len(oldCols))
@@ -11910,7 +12363,16 @@ func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
 				Message: fmt.Sprintf("relation \"%s\" does not exist", rel.Name),
 			}
 		}
-		lockRelationTransitively(sess, dbOID, s.Mode, tbl, o.ctx.Catalog, visited)
+		// Parse the requested mode into the lock manager's vocabulary; the
+		// parser already emits the canonical internal spelling
+		// ("AccessExclusiveLock", …) so this round-trips without a second
+		// translation table. An unrecognised name leaves lmMode == NoLock and
+		// acquireRelLockTxn becomes a no-op (display-only), preserving the
+		// historical behaviour for any exotic mode.
+		lmMode, _ := lockmgr.ParseMode(s.Mode)
+		if err := lockRelationTransitively(o.ctx, sess, dbOID, s.Mode, lmMode, s.NoWait, tbl, o.ctx.Catalog, visited); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -11920,20 +12382,28 @@ func (o *ddlOp) execLockTable(s *parser.LockTableStmt) error {
 // (b) for tables: all inheritance children.
 // This mirrors PostgreSQL's behaviour for LOCK TABLE. M0097.
 //
-// NB: this records locks in the in-memory registry (pg_locks visibility)
-// only — it does NOT yet acquire real heavyweight locks via the lock
-// manager, so a conflicting LOCK TABLE in another session does not block.
-// Real transaction-scoped table locking is deferred (see the lock-nowait
-// resume point in .ralph/deferral_ledger.md): the lockmgr early-grant
-// primitive it needs has landed (M0118-0003), but lockmgr locks are
-// currently statement-scoped (released per Query message in dispatch.go)
-// whereas LOCK TABLE must hold until COMMIT.
-func lockRelationTransitively(sess Session, dbOID uint32, mode string, tbl *catalog.Table, cat catalog.Catalog, visited map[uint32]bool) {
+// It records each relation in the in-memory registry for pg_locks
+// visibility AND acquires a real transaction-scoped heavyweight lock via
+// the lock manager (ctx.acquireRelLockTxn) so a conflicting LOCK TABLE in
+// another session actually blocks until this transaction commits. The
+// lockmgr lock is keyed by ctx.TxnLockBackendID (stable for the txn), so
+// it survives dispatch.go's per-statement ReleaseAll and is released only
+// at COMMIT/ROLLBACK. Outside an explicit transaction block
+// (TxnLockBackendID == 0) the acquire is a no-op and only the display
+// registration happens, matching historical autocommit behaviour.
+// M0118-0003 (lock-nowait).
+func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode string, lmMode lockmgr.Mode, nowait bool, tbl *catalog.Table, cat catalog.Catalog, visited map[uint32]bool) error {
 	if visited[tbl.OID] {
-		return
+		return nil
 	}
 	visited[tbl.OID] = true
 	globalRelLockMgr.AddRelationLock(sess, dbOID, tbl.OID, mode)
+	if lmMode != lockmgr.NoLock {
+		rel := storage.RelFileNode{DBOid: dbOID, RelOid: tbl.OID}
+		if err := ctx.acquireRelLockTxn(rel, lmMode, nowait); err != nil {
+			return err
+		}
+	}
 	if tbl.View != nil {
 		// Walk the view body to find referenced tables/views.
 		refs := collectSelectTableRefs(tbl.View)
@@ -11945,17 +12415,22 @@ func lockRelationTransitively(sess Session, dbOID uint32, mode string, tbl *cata
 			if !ok {
 				continue
 			}
-			lockRelationTransitively(sess, dbOID, mode, dep, cat, visited)
+			if err := lockRelationTransitively(ctx, sess, dbOID, mode, lmMode, nowait, dep, cat, visited); err != nil {
+				return err
+			}
 		}
 	} else {
 		// Lock inheritance children transitively (PostgreSQL also acquires
 		// locks on all children when a parent table is locked).
 		if im, ok := cat.(*catalog.InMemory); ok {
 			for _, child := range im.InheritanceChildren(tbl.OID) {
-				lockRelationTransitively(sess, dbOID, mode, child, cat, visited)
+				if err := lockRelationTransitively(ctx, sess, dbOID, mode, lmMode, nowait, child, cat, visited); err != nil {
+					return err
+				}
 			}
 		}
 	}
+	return nil
 }
 
 // collectSelectTableRefs walks a SelectStmt and collects all table/view

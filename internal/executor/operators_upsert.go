@@ -656,7 +656,7 @@ func (o *upsertOp) probeArbiterByKey(rel storage.RelFileNode, cols []catalog.Col
 				hotBuf, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
 				if perr == nil {
 					hotBuf.RLock()
-					liveTuple, liveSlot, liveFound := followHOTChain(hotBuf.Page(), tuple.Header.CTID.Offset, o.ctx.Snap, o.ctx.Tx.XID)
+					liveTuple, liveSlot, liveFound := followHOTChain(hotBuf.Page(), tuple.Header.CTID.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
 					hotBuf.RUnlock()
 					o.ctx.Pool.Unpin(hotBuf)
 					if liveFound && isLiveForUniqueCheck(o.ctx, liveTuple.Header.Xmin, liveTuple.Header.Xmax) {
@@ -795,10 +795,18 @@ func (o *upsertOp) findInProgressConflictKey(rel storage.RelFileNode, key []byte
 		// middle of deleting (or cross-partition-moving) what would otherwise
 		// be a real arbiter conflict. Upstream `_bt_check_unique` waits on
 		// this xmax to determine whether the apparent conflict survives.
+		// For an updater-bearing multixact (IS_MULTI set, LOCK_ONLY clear)
+		// t_xmax is a MultiXactId — wait on its updater member, never on the
+		// raw MultiXactId.
 		if xmax != storage.InvalidTransactionID && xmax != selfXID && !storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
+			effXmax := xmax
+			if storage.IsHeapTupleXmaxMulti(tuple.Header.Infomask) {
+				effXmax = multixactUpdaterXID(o.ctx.MultiXact, xmax)
+			}
 			xminSettled := xmin == selfXID || (o.ctx.Snap.SeesCommittedXID(xmin))
-			if xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
-				foundXID = xmax
+			if effXmax != storage.InvalidTransactionID && effXmax != selfXID &&
+				xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(effXmax) {
+				foundXID = effXmax
 				case1 = false
 				return false, nil
 			}
@@ -809,13 +817,22 @@ func (o *upsertOp) findInProgressConflictKey(rel storage.RelFileNode, key []byte
 		// re-probes. The row is still live (xmin settled, xmax is only a
 		// lock stamp) — we must wait because the lock holder may
 		// subsequently UPDATE or DELETE the conflicting row before
-		// committing, changing the arbiter outcome.
+		// committing, changing the arbiter outcome. For a lock-only
+		// multixact t_xmax is a MultiXactId of lock holders — wait on one
+		// live holder (the re-probe loop drains the rest), never on the
+		// MultiXactId itself.
 		if xmax != storage.InvalidTransactionID && xmax != selfXID && storage.IsHeapTupleLockOnly(tuple.Header.Infomask) {
 			xminSettled := xmin == selfXID || o.ctx.Snap.SeesCommittedXID(xmin)
-			if xminSettled && o.ctx.TxnMgr != nil && o.ctx.TxnMgr.IsXIDActive(xmax) {
-				foundXID = xmax
-				case1 = false
-				return false, nil
+			if xminSettled && o.ctx.TxnMgr != nil {
+				waitXID := xmax
+				if storage.IsHeapTupleXmaxMulti(tuple.Header.Infomask) {
+					waitXID = multixactFirstActiveMember(o.ctx.MultiXact, o.ctx.TxnMgr, selfXID, xmax)
+				}
+				if waitXID != storage.InvalidTransactionID && o.ctx.TxnMgr.IsXIDActive(waitXID) {
+					foundXID = waitXID
+					case1 = false
+					return false, nil
+				}
 			}
 		}
 		return true, nil
@@ -912,12 +929,32 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 		return err
 	}
 	pinned.Lock()
-	if err := storage.PageSetHeapTupleXmax(pinned.Page(), oldPtr.Offset, o.ctx.Tx.XID); err != nil {
+	// Preserve a pre-existing non-conflicting foreign locker into a {updater +
+	// survivors} multi (M0118-0004 producer); plain single-xid stamp otherwise.
+	// keysUpdated tracks whether the ON CONFLICT DO UPDATE SET list assigns a key
+	// column (StatusUpdate vs StatusNoKeyUpdate).
+	var upErr error
+	if oldHdrTup, herr := storage.PageGetHeapTuple(pinned.Page(), oldPtr.Offset); herr == nil {
+		upErr = stampUpdaterXmaxNonHOT(o.ctx, pinned.Page(), oldPtr.Offset, oldHdrTup.Header, o.onConflictUpdateTouchesKeyColumn())
+	} else {
+		upErr = storage.PageSetHeapTupleXmax(pinned.Page(), oldPtr.Offset, effectiveWriterXID(o.ctx))
+	}
+	if err := upErr; err != nil {
 		pinned.Unlock()
 		o.ctx.Pool.Unpin(pinned)
 		return err
 	}
-	derr := markHeapDeleteDirty(o.ctx.Pool, pinned, rel, oldPtr.Block, oldPtr.Offset, o.ctx.Tx.XID, nil)
+	if o.onConflictUpdateTouchesKeyColumn() {
+		// ON CONFLICT DO UPDATE whose SET list assigns a key column locks the
+		// conflicting tuple FOR UPDATE (LockTupleExclusive), reserving the key
+		// via HEAP_KEYS_UPDATED so a concurrent FOR KEY SHARE waits until this
+		// transaction commits — even when the key VALUE is unchanged (SET key=1).
+		// Mirrors PG's ExecUpdateLockMode, which keys off ExecGetAllUpdatedCols
+		// (the SET-list columns), not value comparison. M0118-0003
+		// (tuplelock-partition).
+		_ = storage.PageSetHeapTupleKeysUpdated(pinned.Page(), oldPtr.Offset)
+	}
+	derr := markHeapDeleteDirty(o.ctx.Pool, pinned, rel, oldPtr.Block, oldPtr.Offset, effectiveWriterXID(o.ctx), nil)
 	pinned.Unlock()
 	o.ctx.Pool.Unpin(pinned)
 	if derr != nil {
@@ -929,6 +966,15 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 	}
 	if o.ctx.InDMLCTE && o.ctx.CTEWriteFence != nil {
 		o.ctx.CTEWriteFence[newPtr] = struct{}{}
+	}
+	// Link the old tuple to the new version via t_ctid so a concurrent locker
+	// (e.g. FOR KEY SHARE on a key-UPDATE conflict) that waits on the old
+	// tuple's xmax can follow the ctid chain to the live successor instead of
+	// reading a stale/self-pointing ctid. ON CONFLICT DO UPDATE never moves
+	// partitions, so old and new always share rel. Mirrors the regular UPDATE
+	// path's stampOldCtid. M0118-0003 (tuplelock-partition).
+	if cerr := stampOldCtid(o.ctx, rel, oldPtr.Block, oldPtr.Offset, newPtr); cerr != nil {
+		return cerr
 	}
 	o.trackWrittenPtr(newPtr)
 	// For expression-based arbiters, re-evaluate the arbiter expression for the
@@ -948,6 +994,49 @@ func (o *upsertOp) applyUpdate(rel storage.RelFileNode, tbl *catalog.Table, cols
 		o.maintainNonArbiterIndexesForUpdate(tbl, cols, updatedLeaf, newPtr, 0)
 	}
 	return nil
+}
+
+// onConflictUpdateTouchesKeyColumn reports whether the ON CONFLICT DO UPDATE
+// SET list assigns any column that participates in a unique/primary-key index
+// of the target table. PG's ExecUpdateLockMode locks the conflicting tuple
+// with LockTupleExclusive (key-reserving, HEAP_KEYS_UPDATED) whenever the set
+// of updated columns overlaps INDEX_ATTR_BITMAP_KEY — regardless of whether the
+// new key value differs from the old. A no-key UPDATE (SET on non-key columns)
+// stays LockTupleNoKeyExclusive and does NOT conflict with a concurrent
+// FOR KEY SHARE. M0118-0003 (tuplelock-partition).
+func (o *upsertOp) onConflictUpdateTouchesKeyColumn() bool {
+	oc := o.plan.OnConflict
+	if oc == nil || oc.Action != planner.OnConflictActionUpdate || len(oc.UpdateSet) == 0 {
+		return false
+	}
+	tbl := o.plan.Table
+	if tbl == nil || o.ctx.Catalog == nil {
+		return false
+	}
+	setCols := make(map[string]struct{})
+	for i, expr := range oc.UpdateSet {
+		if expr == nil || i >= len(tbl.Columns) {
+			continue
+		}
+		setCols[tbl.Columns[i].Name] = struct{}{}
+	}
+	if len(setCols) == 0 {
+		return false
+	}
+	for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+		if idx == nil || (!idx.Unique && !idx.Primary) {
+			continue
+		}
+		for _, col := range idx.Columns {
+			if col == "" { // expression index column — no plain name to match
+				continue
+			}
+			if _, ok := setCols[col]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // maintainArbiter inserts a precomputed (conflict-key → ptr) entry into the
@@ -1205,10 +1294,18 @@ func (o *upsertOp) cancelSpeculativeRow(rel storage.RelFileNode, ptr storage.Ite
 		return err
 	}
 	pinned.Lock()
-	serr := storage.PageSetHeapTupleXmax(pinned.Page(), ptr.Offset, o.ctx.Tx.XID)
+	// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
+	// producer). This is a DELETE (StatusUpdate, keysUpdated=true) → no-op unless
+	// a non-conflicting locker survives; wired for sibling-path parity.
+	var serr error
+	if oldHdrTup, herr := storage.PageGetHeapTuple(pinned.Page(), ptr.Offset); herr == nil {
+		serr = stampUpdaterXmaxNonHOT(o.ctx, pinned.Page(), ptr.Offset, oldHdrTup.Header, true)
+	} else {
+		serr = storage.PageSetHeapTupleXmax(pinned.Page(), ptr.Offset, effectiveWriterXID(o.ctx))
+	}
 	var derr error
 	if serr == nil {
-		derr = markHeapDeleteDirty(o.ctx.Pool, pinned, rel, ptr.Block, ptr.Offset, o.ctx.Tx.XID, nil)
+		derr = markHeapDeleteDirty(o.ctx.Pool, pinned, rel, ptr.Block, ptr.Offset, effectiveWriterXID(o.ctx), nil)
 	}
 	pinned.Unlock()
 	o.ctx.Pool.Unpin(pinned)

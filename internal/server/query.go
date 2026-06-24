@@ -60,6 +60,20 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 	}
 
 	upper := strings.ToUpper(matchable)
+
+	// A single-statement, autocommit table-level GRANT is recorded in the
+	// catalog ACL store so SET ROLE + a privileged command (e.g. TRUNCATE) is
+	// enforced (truncate-conflict isolation spec, M0118-0008). Inside an
+	// explicit transaction we fall through to the executor's no-op path so
+	// transaction state and the protocol response are handled normally.
+	if strings.HasPrefix(upper, "GRANT ") && (connTx == nil || !connTx.InExplicit()) {
+		s.tryRecordTableGrant(matchable)
+		if err := w.WriteCommandComplete("GRANT"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	}
+
 	switch {
 	case upper == "SHOW ALL":
 		return s.handleShowAll(w, sess)
@@ -129,9 +143,23 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			return err
 		}
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
-	// SET ROLE rolename — no-op: goopg has no role management.
+	// SET ROLE rolename — track the effective role for privilege checks.
 	// Must be before the generic "SET " case so "ROLE" is not passed to handleSet.
+	// Like SET SESSION AUTHORIZATION, a non-superuser target populates
+	// connTx.NonSuperuserRole so the executor enforces object privileges
+	// (e.g. TRUNCATE — truncate-conflict isolation spec, M0118-0008); NONE /
+	// DEFAULT / the bootstrap superuser restore full privileges.
 	case strings.HasPrefix(upper, "SET ROLE "), upper == "SET ROLE":
+		if connTx != nil {
+			role := strings.TrimSpace(matchable[len("SET ROLE"):])
+			role = strings.Trim(role, `"'`)
+			switch strings.ToUpper(role) {
+			case "", "DEFAULT", "NONE", "POSTGRES":
+				connTx.NonSuperuserRole = ""
+			default:
+				connTx.NonSuperuserRole = role
+			}
+		}
 		if err := w.WriteCommandComplete("SET"); err != nil {
 			return err
 		}
@@ -155,8 +183,11 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			return err
 		}
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
-	// RESET ROLE — no-op: goopg has no role management.
+	// RESET ROLE — restore the bootstrap superuser's full privileges.
 	case upper == "RESET ROLE":
+		if connTx != nil {
+			connTx.NonSuperuserRole = ""
+		}
 		if err := w.WriteCommandComplete("RESET"); err != nil {
 			return err
 		}

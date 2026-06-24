@@ -121,6 +121,117 @@ func (f *plpgsqlFrame) lookup(name string) (int, bool) {
 	return idx, ok
 }
 
+// isRecordVar reports whether the named PL/pgSQL variable is a record or
+// composite-type variable (as opposed to a plain scalar). Such a variable, when
+// bound from a query row, must hold a `(c0,c1,…)` composite value — even for a
+// single-column query — so that `var::text` reassembles the composite framing
+// the way PostgreSQL's expanded-record representation does. M0118-0008
+// (plpgsql-toast assign5/6).
+func (f *plpgsqlFrame) isRecordVar(name string) bool {
+	key := strings.ToLower(strings.TrimSpace(name))
+	if idx, ok := f.indexByName[key]; ok && strings.EqualFold(f.types[idx].Name, "record") {
+		return true
+	}
+	return len(f.compositeVarFields[key]) > 0
+}
+
+// bindRecordRowComposite binds a query result row to a record/composite PL/pgSQL
+// variable. It (1) registers the per-column `_<var>_<col>` sub-fields used for
+// field access (r.a), (2) binds the variable itself to a single `(c0,c1,…)`
+// composite Datum, and (3) records its field schema, so that `r.field` reads,
+// `r.field := …` field assignment, and `r::text` reassembly all observe the row.
+// Mirrors PostgreSQL's expanded-record representation; shared by SELECT … INTO
+// (bindSelectIntoRow) and the record FOR-loop binding. M0118-0008
+// (plpgsql-toast assign3/4/5/6).
+func bindRecordRowComposite(varName string, row Row, schema planner.Schema, frame *plpgsqlFrame) {
+	name := strings.ToLower(varName)
+	for i, sc := range schema {
+		colKey := "_" + name + "_" + strings.ToLower(sc.Name)
+		val := NullDatum
+		if i < len(row) {
+			val = row[i]
+		}
+		if idx, ok := frame.indexByName[colKey]; ok {
+			frame.values[idx] = val
+		} else {
+			_ = frame.add(colKey, sc.Type, val)
+		}
+	}
+	idx, ok := frame.indexByName[name]
+	if !ok {
+		return
+	}
+	if len(row) == 0 {
+		// No row: the record stays NULL (FOUND=false), like PG.
+		frame.values[idx] = NullDatum
+		return
+	}
+	parts := make([]string, len(schema))
+	cf := make([]catalog.CompositeField, len(schema))
+	for i, sc := range schema {
+		if i < len(row) && !row[i].IsNull() {
+			parts[i] = row[i].Format()
+		}
+		cf[i] = catalog.CompositeField{Name: sc.Name, ColType: sc.Type.Name}
+	}
+	frame.values[idx] = NewStringDatum("(" + strings.Join(parts, ",") + ")")
+	frame.compositeVarFields[name] = cf
+}
+
+// bindSelectIntoRow binds a SELECT … INTO result row to its PL/pgSQL target
+// variable(s), mirroring the FOR-loop record/scalar binding conventions:
+//   - a single target with a single-column row binds directly to the scalar
+//     variable (when one exists);
+//   - a single target with a multi-column row is treated as a record and bound
+//     to `_<target>_<colname>` sub-fields (auto-registered if absent);
+//   - multiple targets bind result columns positionally to scalar variables.
+//
+// A missing column yields NULL. M0118-0008 (plpgsql-toast).
+func bindSelectIntoRow(targets []string, row Row, schema planner.Schema, frame *plpgsqlFrame) {
+	if len(targets) == 0 {
+		return
+	}
+	if len(targets) == 1 {
+		name := strings.ToLower(targets[0])
+		// A single-column result binds directly to a plain scalar variable. But a
+		// `record`/composite target must remain a first-class composite so its
+		// field stays addressable (r.field) even when the query has only one
+		// column — `SELECT INTO r reltoastrelid::regclass::text AS table_name`
+		// then `r.table_name`. Route such a target to the composite binder, which
+		// registers the `_<var>_<col>` sub-field and compositeVarFields entry that
+		// the qualified-name expression path reads. M0118-0008
+		// (reindex-concurrently-toast setup).
+		if len(schema) == 1 && !frame.isRecordVar(name) {
+			if idx, ok := frame.indexByName[name]; ok {
+				if len(row) > 0 {
+					frame.values[idx] = row[0]
+				} else {
+					frame.values[idx] = NullDatum
+				}
+				return
+			}
+		}
+		bindRecordRowComposite(name, row, schema, frame)
+		return
+	}
+	for i, tgt := range targets {
+		name := strings.ToLower(tgt)
+		val := NullDatum
+		if i < len(row) {
+			val = row[i]
+		}
+		if idx, ok := frame.indexByName[name]; ok {
+			frame.values[idx] = val
+		} else {
+			var typ catalog.Type
+			if i < len(schema) {
+				typ = schema[i].Type
+			}
+			_ = frame.add(name, typ, val)
+		}
+	}
+}
+
 // evalStoredRoutineFuncCall resolves and executes user-defined
 // routines (M0015 Stage A runtime path) when a call is not one of
 // the built-ins handled directly in expr.go.
@@ -1140,6 +1251,26 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		return Datum{}, flowNone, nil
 
+	case *plpgsql.NullStmt:
+		// `NULL;` — no-op placeholder. M0118-0009.
+		return Datum{}, flowNone, nil
+
+	case *plpgsql.TxControlStmt:
+		// `COMMIT;` / `ROLLBACK;` — transaction control inside a non-atomic
+		// PL/pgSQL routine (top-level DO / procedure outside an explicit
+		// transaction block). The dispatch installs PLpgSQLCommitChain only in
+		// auto-commit mode; when it is nil we are in an atomic context, which
+		// PG rejects with SQLSTATE 2D000 (invalid transaction termination).
+		// M0118-0008 (plpgsql-toast).
+		if ctx.PLpgSQLCommitChain == nil {
+			return Datum{}, flowNone, &ExecError{Code: "2D000", Pos: s.Pos(),
+				Message: "invalid transaction termination"}
+		}
+		if err := ctx.PLpgSQLCommitChain(s.Rollback); err != nil {
+			return Datum{}, flowNone, err
+		}
+		return Datum{}, flowNone, nil
+
 	case *plpgsql.ExitStmt:
 		if s.Cond != nil {
 			cond, err := evalPLpgSQLExpr(s.Cond, frame, ctx)
@@ -1165,6 +1296,24 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		return Datum{}, flowContinue, nil
 
 	case *plpgsql.ReturnStmt:
+		// Bare `RETURN;` (nil expression) — exit the function returning NULL.
+		// Valid for VOID-returning functions / procedures and the canonical
+		// early-exit form. A value-returning function must supply an expression
+		// (upstream pl_gram.y treats it as a "missing expression" error).
+		// M0118-0009 (subxid-overflow gen_subxids).
+		if s.Expr == nil {
+			if frame.trig != nil {
+				return Datum{}, flowReturnTriggerNull, nil
+			}
+			if !strings.EqualFold(r.ReturnType.Name, "void") {
+				return Datum{}, flowNone, &ExecError{
+					Code:    "42601",
+					Pos:     s.Pos(),
+					Message: "missing expression",
+				}
+			}
+			return NullDatum, flowReturn, nil
+		}
 		// In trigger context, detect RETURN OLD / RETURN NEW / RETURN NULL.
 		if frame.trig != nil {
 			if cr, ok := s.Expr.(*parser.ColumnRef); ok && cr.Table == "" && cr.Schema == "" {
@@ -1388,6 +1537,78 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		return Datum{}, flowNone, nil
 
+	case *plpgsql.SelectIntoStmt:
+		// SELECT ... INTO [STRICT] target[, ...] — bind the first result row
+		// to the named PL/pgSQL variable(s). The query has already had its
+		// INTO clause stripped by the parser. M0118-0008 (plpgsql-toast).
+		sql := s.SQL
+		if frame.trig != nil {
+			sql = substituteTriggerRefs(sql, frame.trig)
+		}
+		// Substitute PL/pgSQL frame variables (scalars and record-field refs
+		// like `r.a`) into the query before planning, mirroring the embedded
+		// SQL path (execPLpgSQLEmbeddedSQL). Without this a SELECT … INTO whose
+		// WHERE clause references a loop record field (`… where a = r.a`) plans
+		// `r` as a missing table. M0118-0008 (plpgsql-toast fetch-after-commit).
+		sql = substitutePlpgsqlFrameVarsInSQL(sql, frame)
+		stmts, err := parser.Parse(sql)
+		if err != nil {
+			return Datum{}, flowNone, &ExecError{Code: "42601", Message: fmt.Sprintf("SELECT INTO query parse error: %v", err)}
+		}
+		if len(stmts) == 0 {
+			return Datum{}, flowNone, nil
+		}
+		plan, err := planner.Plan(stmts[0], ctxPlanCatalog(ctx))
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		op, err := Build(plan)
+		if err != nil {
+			return Datum{}, flowNone, err
+		}
+		if err := op.Open(ctx); err != nil {
+			op.Close()
+			return Datum{}, flowNone, err
+		}
+		// Capture the output schema up front so a no-row result can still bind
+		// NULL to the target(s) (PG sets unmatched SELECT INTO targets to NULL).
+		schema := op.Schema()
+		slot, nerr := op.Next()
+		var firstRow Row
+		rowCount := 0
+		if slot != nil && (nerr == nil || nerr == EOF) {
+			r0 := slotRow(slot)
+			if r0 != nil && nerr == nil {
+				firstRow = append(Row(nil), r0...)
+				if s := slot.Schema(); len(s) > 0 {
+					schema = s
+				}
+				rowCount = 1
+				// STRICT needs to know if a second row exists.
+				if s.Strict {
+					if s2, e2 := op.Next(); e2 == nil && s2 != nil {
+						rowCount = 2
+					} else if e2 != nil && e2 != EOF {
+						nerr = e2
+					}
+				}
+			}
+		}
+		op.Close()
+		if nerr != nil && nerr != EOF {
+			return Datum{}, flowNone, nerr
+		}
+		if s.Strict {
+			if rowCount == 0 {
+				return Datum{}, flowNone, &ExecError{Code: "P0002", Message: "query returned no rows"}
+			}
+			if rowCount > 1 {
+				return Datum{}, flowNone, &ExecError{Code: "P0003", Message: "query returned more than one row"}
+			}
+		}
+		bindSelectIntoRow(s.Targets, firstRow, schema, frame)
+		return Datum{}, flowNone, nil
+
 	case *plpgsql.ForSelectStmt:
 		// FOR rec IN query LOOP ... END LOOP — query cursor loop. M0097-0012.
 		sql := s.SQL
@@ -1433,6 +1654,20 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			return Datum{}, flowNone, err
 		}
 		varName := strings.ToLower(s.Var)
+		// Materialize every row up front, then close the operator, before
+		// running any loop-body statement. This mirrors PostgreSQL, where a
+		// PL/pgSQL FOR-query cursor holds its snapshot across a COMMIT issued
+		// inside the loop body (the implicit portal is made holdable on
+		// commit), so the loop iterates over the rows fetched at loop start
+		// regardless of DELETE/COMMIT side effects in the body. Streaming row
+		// by row from a live operator would instead see the body's deletes and
+		// truncate the loop after the first iteration. M0118-0008
+		// (plpgsql-toast assign6).
+		type forRow struct {
+			row    Row
+			schema planner.Schema
+		}
+		var collected []forRow
 		for {
 			slot, err := op.Next()
 			if err == EOF {
@@ -1442,16 +1677,35 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 				op.Close()
 				return Datum{}, flowNone, err
 			}
+			var fr forRow
+			if slot != nil && slot.Schema() != nil {
+				fr.schema = slot.Schema()
+				src := slotRow(slot)
+				cp := make(Row, len(src))
+				copy(cp, src)
+				fr.row = cp
+			}
+			collected = append(collected, fr)
+		}
+		op.Close()
+		for _, fr := range collected {
 			// Bind row columns to the loop variable.
 			// - For record/row variables: assign to _<var>_<colname> sub-fields.
 			// - For scalar variables: if the loop var exists directly in frame
 			//   and the query returns exactly 1 column, assign to it directly.
-			if slot != nil && slot.Schema() != nil {
-				row := slotRow(slot)
-				schema := slot.Schema()
-				// Scalar shortcut: if varName exists in frame and the query
-				// returns one column, assign directly to varName.
-				if len(schema) == 1 {
+			if fr.row != nil && fr.schema != nil {
+				row := fr.row
+				schema := fr.schema
+				// Record/composite loop variable: bind the whole row as a
+				// `(c0,c1,…)` composite Datum (plus `_<var>_<col>` sub-fields for
+				// field access) so `r::text` reassembles the composite framing —
+				// even for a single-column query. Without this a single-column
+				// record loop var held the raw column value, so `length(r::text)`
+				// was the value length, not the composite length. M0118-0008
+				// (plpgsql-toast assign5/6).
+				if frame.isRecordVar(varName) {
+					bindRecordRowComposite(varName, row, schema, frame)
+				} else if len(schema) == 1 {
 					if idx, ok := frame.indexByName[varName]; ok {
 						if len(row) > 0 {
 							frame.values[idx] = row[0]
@@ -1493,18 +1747,15 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			}
 			v, flow, err := executePLpgSQLStmtList(s.Body, r, frame, ctx)
 			if err != nil {
-				op.Close()
 				return Datum{}, flowNone, err
 			}
 			if flow == flowReturn || flow == flowReturnTriggerOld || flow == flowReturnTriggerNew || flow == flowReturnTriggerNull {
-				op.Close()
 				return v, flow, nil
 			}
 			if flow == flowExit {
 				break
 			}
 		}
-		op.Close()
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.Block:
@@ -1661,6 +1912,14 @@ func exceptionHandlerMatches(conditions []string, sqlstate string, conditionName
 }
 
 func evalPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame, ctx *Context) (Datum, error) {
+	// A top-level scalar subquery (`x := (SELECT ...)`) cannot be lowered to a
+	// planner.Expr — it must be planned and executed against the live catalog to
+	// produce its single value. PL/pgSQL treats `(SELECT ...)` in a scalar
+	// context as returning the first column of the first row (NULL if no row).
+	// M0118-0008 (plpgsql-toast assign2).
+	if sq, ok := e.(*parser.SubqueryExpr); ok {
+		return evalScalarSubquery(sq, ctx)
+	}
 	pe, err := lowerPLpgSQLExpr(e, frame)
 	if err != nil {
 		return Datum{}, err
@@ -1673,6 +1932,49 @@ func evalPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame, ctx *Context) (Datum, e
 		return Datum{}, err
 	}
 	return d, nil
+}
+
+// evalScalarSubquery plans and executes a scalar subquery from a PL/pgSQL
+// expression, returning the first column of the first row (NULL Datum when the
+// query produces no rows, matching PostgreSQL's scalar-subquery semantics). An
+// error is raised if the subquery returns more than one row. M0118-0008.
+func evalScalarSubquery(sq *parser.SubqueryExpr, ctx *Context) (Datum, error) {
+	if sq.Inner == nil {
+		return Datum{}, &ExecError{Code: "42601", Pos: sq.Pos(), Message: "empty subquery in PL/pgSQL expression"}
+	}
+	plan, err := planner.Plan(sq.Inner, ctxPlanCatalog(ctx))
+	if err != nil {
+		return Datum{}, err
+	}
+	op, err := Build(plan)
+	if err != nil {
+		return Datum{}, err
+	}
+	if err := op.Open(ctx); err != nil {
+		op.Close()
+		return Datum{}, err
+	}
+	defer op.Close()
+	slot, nerr := op.Next()
+	if nerr != nil && nerr != EOF {
+		return Datum{}, nerr
+	}
+	if slot == nil || nerr == EOF {
+		// No rows ⇒ NULL.
+		return Datum{}, nil
+	}
+	row := slotRow(slot)
+	if len(row) == 0 {
+		return Datum{}, nil
+	}
+	result := row[0]
+	// A scalar subquery may return at most one row.
+	if s2, e2 := op.Next(); e2 == nil && s2 != nil {
+		return Datum{}, &ExecError{Code: "21000", Pos: sq.Pos(), Message: "more than one row returned by a subquery used as an expression"}
+	} else if e2 != nil && e2 != EOF {
+		return Datum{}, e2
+	}
+	return result, nil
 }
 
 func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) {
@@ -2622,6 +2924,31 @@ func substitutePlpgsqlFrameVarsInSQL(sql string, frame *plpgsqlFrame) string {
 			preceded := i > 0 && s1[i-1] == '.'
 			followed := j < len(s1) && (s1[j] == '.' || s1[j] == '[')
 			varName := s1[i:j]
+			// Qualified record-field reference: `r.field` where `r` is a
+			// record/composite PL/pgSQL variable. Substitute the whole
+			// `r.field` with the field's SQL literal — the field is bound as
+			// `_<var>_<field>` in the frame by bindRecordRowComposite. Only a
+			// single-level qualifier with no further `.`/`[` is handled; a
+			// plain table.column reference (varName is not a record var) falls
+			// through untouched, so a real column qualifier is unaffected.
+			// M0118-0008 (plpgsql-toast fetch-after-commit).
+			if !preceded && j < len(s1) && s1[j] == '.' && frame.isRecordVar(varName) {
+				k := j + 1
+				if k < len(s1) && isIdentStartByte(s1[k]) {
+					f := k
+					for f < len(s1) && isIdentContByte(s1[f]) {
+						f++
+					}
+					if !(f < len(s1) && (s1[f] == '.' || s1[f] == '[')) {
+						fieldKey := "_" + strings.ToLower(varName) + "_" + strings.ToLower(s1[k:f])
+						if fi, ok := frame.lookup(fieldKey); ok {
+							out.WriteString(datumToSQLLiteral(frame.values[fi]))
+							i = f
+							continue
+						}
+					}
+				}
+			}
 			if !preceded && !followed {
 				if fi, ok := frame.lookup(varName); ok {
 					out.WriteString(datumToSQLLiteral(frame.values[fi]))

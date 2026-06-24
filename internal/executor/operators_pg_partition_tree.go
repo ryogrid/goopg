@@ -125,8 +125,15 @@ func partitionTableTree(root *catalog.Table, im *catalog.InMemory) []Row {
 		level      int
 	}
 
+	// A partition left in the incomplete-detach state (DetachPendingEpoch != 0,
+	// e.g. a cancelled DETACH … CONCURRENTLY) is treated as fully detached for
+	// hierarchy traversal: it is omitted from its parent's child list and, when
+	// it is itself the queried root, reports a NULL parent. Mirrors PG's
+	// get_partition_ancestors stopping at the detached boundary and
+	// find_all_inheritors omitting inhdetachpending children. M0118-0008
+	// (detach-partition-concurrently-3).
 	startParentName := ""
-	if root.PartitionParentOID != 0 {
+	if root.PartitionParentOID != 0 && root.DetachPendingEpoch == 0 {
 		if parentTbl, ok2 := im.LookupTableByOID(root.PartitionParentOID); ok2 {
 			startParentName = parentTbl.Name
 		}
@@ -151,6 +158,10 @@ func partitionTableTree(root *catalog.Table, im *catalog.InMemory) []Row {
 			level:      cur.level,
 		})
 		for _, child := range children {
+			// Skip a detach-pending child — it is no longer part of this tree.
+			if child.DetachPendingEpoch != 0 {
+				continue
+			}
 			queue = append(queue, bfsItem{tbl: child, level: cur.level + 1, parentName: cur.tbl.Name})
 		}
 	}

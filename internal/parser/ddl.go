@@ -3102,8 +3102,9 @@ func (p *parser) parseCreateIndexTail(pos int, unique bool) (Stmt, error) {
 		}
 		stmt.IfNotExists = true
 	}
-	// Skip optional CONCURRENTLY keyword (goopg builds indexes synchronously).
-	p.acceptIdentKeyword("concurrently")
+	// CONCURRENTLY: goopg builds the index synchronously, but records the flag so
+	// the build waits for already-running transactions to drain before completing.
+	stmt.Concurrently = p.acceptIdentKeyword("concurrently")
 	// Optional index name. If the next token is ON, the name is omitted.
 	if !(p.cur().Kind == TokenKeyword && p.cur().Keyword == KwOn) {
 		nameTok, err := p.parseIdent()
@@ -4852,19 +4853,30 @@ func (p *parser) parseAlter() (Stmt, error) {
 	if p.cur().Kind == TokenOperator && p.cur().Value == "*" {
 		p.advance()
 	}
-	// OWNER TO role — parse as a no-op (return empty AlterTableStmt).
-	// "owner" is an identifier in goopg's lexer.
+	// OWNER TO role — record the target role name so the executor can update the
+	// relation's owner (drives the VACUUM/ANALYZE/CLUSTER maintenance-privilege
+	// check, M0118-0008). "owner" is an identifier in goopg's lexer.
 	if p.acceptIdentKeyword("owner") {
 		if _, err := p.expectKeyword(KwTo); err != nil {
 			return nil, err
 		}
-		// consume role name or CURRENT_USER / SESSION_USER / CURRENT_ROLE
-		if !p.acceptIdentKeyword("current_user") &&
-			!p.acceptIdentKeyword("session_user") &&
-			!p.acceptIdentKeyword("current_role") {
-			_, _ = p.parseIdent()
+		// CURRENT_USER / SESSION_USER / CURRENT_ROLE resolve to the bootstrap
+		// superuser in goopg (no real role identity for the session); a plain
+		// identifier names the new owning role.
+		if p.acceptIdentKeyword("current_user") ||
+			p.acceptIdentKeyword("session_user") ||
+			p.acceptIdentKeyword("current_role") {
+			stmt.OwnerTo = "" // bootstrap superuser
+		} else if tok, err := p.parseIdent(); err == nil {
+			stmt.OwnerTo = identText(tok)
 		}
-		// Return empty actions list — executor will skip it.
+		if stmt.OwnerTo == "" {
+			// No explicit role captured (current_user etc.): still mark the
+			// statement as an OWNER TO action so the executor takes the DDL lock
+			// and does not fall through to "no actions". Use a sentinel the
+			// executor maps back to the bootstrap superuser.
+			stmt.OwnerTo = "current_user"
+		}
 		return stmt, nil
 	}
 	// RENAME COLUMN old TO new  |  RENAME TO new_name  |  RENAME VALUE 'old' TO 'new'.
@@ -4941,15 +4953,23 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return stmt, nil
 		}
 	}
-	// ENABLE/DISABLE TRIGGER — parse as a no-op.
+	// ENABLE/DISABLE [REPLICA|ALWAYS] TRIGGER | RULE — semantic no-op in v0.
+	// The TRIGGER variant takes a ShareRowExclusiveLock in PostgreSQL, so flag
+	// it for the executor to acquire that transaction-scoped lock (alter-table-3
+	// isolation spec, M0118-0008). RULE / other variants keep the old no-op.
 	if p.acceptIdentKeyword("enable") || p.acceptIdentKeyword("disable") {
-		// consume rest of statement until ';' or EOF
+		isTrigger := false
+		// consume rest of statement until ';' or EOF, noting a TRIGGER target.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 				break
 			}
+			if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTrigger {
+				isTrigger = true
+			}
 			p.advance()
 		}
+		stmt.EnableDisableTrigger = isTrigger
 		return stmt, nil
 	}
 	// DROP CONSTRAINT name [RESTRICT|CASCADE] — real action (M0097-0036).
@@ -5304,14 +5324,17 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 	// DETACH PARTITION child [CONCURRENTLY|FINALIZE]
 	if p.acceptIdentKeyword("detach") {
 		_ = p.acceptKeyword(KwPartition)
-		// Accept optional CONCURRENTLY / FINALIZE (PG14+) — ignored for now.
-		p.acceptIdentKeyword("concurrently")
-		p.acceptIdentKeyword("finalize")
 		childName, err := p.parseObjectName()
 		if err != nil {
 			return AlterTableAction{}, err
 		}
-		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableDetachPartition, DetachPartitionChild: childName}, nil
+		// The optional CONCURRENTLY / FINALIZE trailer (PG14+) follows the
+		// child name, not precedes it. CONCURRENTLY is recorded for the
+		// (deferred) two-phase detach; FINALIZE is accepted and ignored. The
+		// executor performs a synchronous detach in either case for now.
+		concurrently := p.acceptIdentKeyword("concurrently")
+		p.acceptIdentKeyword("finalize")
+		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableDetachPartition, DetachPartitionChild: childName, DetachConcurrently: concurrently}, nil
 	}
 	// INHERIT parent_table (M0097-0048)
 	if p.acceptIdentKeyword("inherit") {
@@ -5331,6 +5354,23 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			return AlterTableAction{}, err
 		}
 		return AlterTableAction{pos: p.cur().Pos, Kind: AlterTableNoInherit, InheritParent: parentName}, nil
+	}
+	// VALIDATE CONSTRAINT name — validate a constraint added with NOT VALID.
+	// VALIDATE is not a reserved keyword in goopg's lexer, so match it as an
+	// identifier-keyword. M0118-0008 (alter-table-1).
+	if p.acceptIdentKeyword("validate") {
+		if !p.acceptKeyword(KwConstraint) {
+			return AlterTableAction{}, p.errAtCur("expected CONSTRAINT after VALIDATE")
+		}
+		nameTok, err := p.parseIdent()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{
+			pos:            nameTok.Pos,
+			Kind:           AlterTableValidateConstraint,
+			ConstraintName: identText(nameTok),
+		}, nil
 	}
 	// DROP COLUMN name / DROP CONSTRAINT name in the multi-action loop.
 	// Both forms share this path so comma-separated "DROP COLUMN a, DROP COLUMN b"
@@ -5494,21 +5534,40 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				onUpdate = action
 			}
 		}
-		// Optional [NOT] DEFERRABLE trailer.
+		// Optional [NOT] DEFERRABLE [INITIALLY …] and/or NOT VALID trailers, in
+		// any order (PG grammar allows `… DEFERRABLE NOT VALID` etc.). `NOT VALID`
+		// (ALTER TABLE ADD FOREIGN KEY … NOT VALID) creates the constraint without
+		// checking pre-existing rows; a later VALIDATE CONSTRAINT performs the
+		// scan. M0118-0008 (alter-table-1/2 isolation specs).
 		deferrable := false
-		if p.acceptKeyword(KwNot) {
-			if _, err := p.expectKeyword(KwDeferrable); err != nil {
-				return AlterTableAction{}, err
+		notValid := false
+		for {
+			if p.acceptKeyword(KwNot) {
+				if p.acceptIdentKeyword("valid") {
+					notValid = true
+					continue
+				}
+				if _, err := p.expectKeyword(KwDeferrable); err != nil {
+					return AlterTableAction{}, err
+				}
+				deferrable = false
+				continue
 			}
-			deferrable = false
-		} else if p.acceptKeyword(KwDeferrable) {
-			deferrable = true
+			if p.acceptKeyword(KwDeferrable) {
+				deferrable = true
+				if p.acceptIdentKeyword("initially") {
+					_ = p.acceptIdentKeyword("deferred") || p.acceptIdentKeyword("immediate")
+				}
+				continue
+			}
+			break
 		}
 		act.Kind = AlterTableAddForeignKey
 		act.Columns = cols
 		act.RefTable = refTable
 		act.RefColumns = refCols
 		act.Deferrable = deferrable
+		act.NotValid = notValid
 		act.OnDelete = onDelete
 		act.OnUpdate = onUpdate
 		return act, nil

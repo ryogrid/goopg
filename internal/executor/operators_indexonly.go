@@ -50,6 +50,12 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		}
 		return err
 	}
+	if err := ctx.acquireScanReadLockTxn(heapRel); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 
 	// M0118-0001: a SERIALIZABLE index-only scan takes a relation-level SIREAD
 	// predicate lock on the heap relation, exactly like the seq-scan and
@@ -132,7 +138,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 			return false, err
 		}
 		slot.RLock()
-		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID)
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID, ctx.MultiXact)
 		// M0118-0001: SSI phantom conflict-out for an index-only-scanned tuple
 		// present at this TID but invisible because a concurrent transaction
 		// inserted it — the IOS analog of the seq-scan invisible-tuple path. The

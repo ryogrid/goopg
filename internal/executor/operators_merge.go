@@ -266,7 +266,7 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 				}
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
 				continue
 			}
 			tgtRow, err := DecodeHeapTupleRow(scanTbl.Columns, tuple, nil)
@@ -810,11 +810,14 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	}
 	s.Lock()
 	oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), slot)
-	if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, ctx.Tx.XID, &ctx.Snap) {
-		xmax := oldTup.Header.Xmax
+	if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, ctx.Tx.XID, &ctx.Snap, ctx.MultiXact) {
+		xmax := concurrentModifierXID(oldTup.Header, ctx.MultiXact)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		if epqWait(ctx, xmax) {
+		if dl, terr := epqWait(ctx, xmax); terr != nil {
+			terr.Pos = pos
+			return terr
+		} else if dl {
 			return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
 		}
 		// For RC: refresh snapshot so committed xmax is visible as "deleted"
@@ -877,19 +880,28 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	// PageSetHeapTupleXmax + stampOldCtid chain. M0100-0007.
 	crossPart := destRel != rel
 	if crossPart {
-		if err := storage.PageSetHeapTupleMovedPartition(s.Page(), slot, ctx.Tx.XID); err != nil {
+		if err := storage.PageSetHeapTupleMovedPartition(s.Page(), slot, effectiveWriterXID(ctx)); err != nil {
 			s.Unlock()
 			ctx.Pool.Unpin(s)
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}
 	} else {
-		if err := storage.PageSetHeapTupleXmax(s.Page(), slot, ctx.Tx.XID); err != nil {
+		// Preserve a pre-existing non-conflicting foreign locker into a {updater +
+		// survivors} multi (M0118-0004 producer); plain single-xid stamp otherwise.
+		// keysUpdated=true (non-HOT MERGE update).
+		var mErr error
+		if oldGerr == nil {
+			mErr = stampUpdaterXmaxNonHOT(ctx, s.Page(), slot, oldTup.Header, true)
+		} else {
+			mErr = storage.PageSetHeapTupleXmax(s.Page(), slot, effectiveWriterXID(ctx))
+		}
+		if err := mErr; err != nil {
 			s.Unlock()
 			ctx.Pool.Unpin(s)
 			return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 		}
 	}
-	derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, ctx.Tx.XID, oldTupleBytes)
+	derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, effectiveWriterXID(ctx), oldTupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
 	if derr != nil {
@@ -919,11 +931,14 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	}
 	s.Lock()
 	oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), slot)
-	if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, ctx.Tx.XID, &ctx.Snap) {
-		xmax := oldTup.Header.Xmax
+	if oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, ctx.Tx.XID, &ctx.Snap, ctx.MultiXact) {
+		xmax := concurrentModifierXID(oldTup.Header, ctx.MultiXact)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		if epqWait(ctx, xmax) {
+		if dl, terr := epqWait(ctx, xmax); terr != nil {
+			terr.Pos = pos
+			return terr
+		} else if dl {
 			return &ExecError{Code: "40001", Pos: pos, Message: "could not serialize access due to concurrent update"}
 		}
 		// Refresh snapshot (RC) so the committed xmax is visible as "deleted".
@@ -973,7 +988,16 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 	if oldGerr == nil {
 		oldTupleBytes, _ = oldTup.MarshalBinary()
 	}
-	if err := storage.PageSetHeapTupleXmax(s.Page(), slot, ctx.Tx.XID); err != nil {
+	// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
+	// producer). MERGE DELETE is StatusUpdate (keysUpdated=true) → no-op unless a
+	// non-conflicting locker survives; wired for sibling-path parity.
+	var mErr error
+	if oldGerr == nil {
+		mErr = stampUpdaterXmaxNonHOT(ctx, s.Page(), slot, oldTup.Header, true)
+	} else {
+		mErr = storage.PageSetHeapTupleXmax(s.Page(), slot, effectiveWriterXID(ctx))
+	}
+	if err := mErr; err != nil {
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		if errors.Is(err, storage.ErrUnsupportedItem) {
@@ -981,7 +1005,7 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 		}
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
-	derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, ctx.Tx.XID, oldTupleBytes)
+	derr := markHeapDeleteDirtyAndClearVM(ctx, s, rel, blk, slot, effectiveWriterXID(ctx), oldTupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
 	return derr

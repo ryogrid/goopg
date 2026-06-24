@@ -2,9 +2,12 @@ package lockmgr
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/goopg/goopg/internal/lockwait"
 )
 
 var testTag = LockTag{DB: 1, Rel: 100}
@@ -372,5 +375,47 @@ func TestLockManagerGCEmptiesState(t *testing.T) {
 	lm.Release(1, testTag, AccessShareLock)
 	if got := lm.Holders(testTag); got != nil {
 		t.Errorf("Holders(testTag) = %v after final release, want nil (entry GC'd)", got)
+	}
+}
+
+// TestLockManagerLockTimeoutAbortsWait verifies that a parked Acquire whose
+// context carries a lockwait budget is released with lockwait.ErrLockTimeout
+// once the budget elapses (the holder never releases), and that the waiter is
+// spliced cleanly out of the queue so the holder can still be released
+// afterwards. Mirrors PostgreSQL's lock_timeout. M0118-0009.
+func TestLockManagerLockTimeoutAbortsWait(t *testing.T) {
+	lm := New()
+	// b1 holds AccessExclusive; b2's AccessExclusive request must conflict.
+	if err := lm.Acquire(context.Background(), 1, testTag, AccessExclusiveLock); err != nil {
+		t.Fatalf("b1 acquire: %v", err)
+	}
+	ctx := lockwait.WithTimeout(context.Background(), 40*time.Millisecond)
+	start := time.Now()
+	err := lm.Acquire(ctx, 2, testTag, AccessExclusiveLock)
+	elapsed := time.Since(start)
+	if !errors.Is(err, lockwait.ErrLockTimeout) {
+		t.Fatalf("b2 acquire err = %v, want ErrLockTimeout", err)
+	}
+	if elapsed < 30*time.Millisecond {
+		t.Errorf("returned after %v, expected to wait ~40ms", elapsed)
+	}
+	// b2 must not be left as a waiter or holder.
+	if got := lm.Holders(testTag)[2]; got != 0 {
+		t.Errorf("b2 holders = %b, want 0 (no stranded grant)", got)
+	}
+	// Releasing b1 must still cleanly grant a fresh waiter.
+	lm.Release(1, testTag, AccessExclusiveLock)
+	if err := lm.Acquire(context.Background(), 3, testTag, AccessExclusiveLock); err != nil {
+		t.Fatalf("b3 acquire after release: %v", err)
+	}
+}
+
+// TestLockManagerLockTimeoutNoFalsePositive verifies a lockwait budget does
+// not abort an acquire that can be granted immediately. M0118-0009.
+func TestLockManagerLockTimeoutNoFalsePositive(t *testing.T) {
+	lm := New()
+	ctx := lockwait.WithTimeout(context.Background(), 10*time.Millisecond)
+	if err := lm.Acquire(ctx, 1, testTag, AccessExclusiveLock); err != nil {
+		t.Fatalf("uncontended acquire with lock_timeout set: %v", err)
 	}
 }

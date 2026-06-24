@@ -241,7 +241,7 @@ func TestAnalyzeReturnsRowCountAndAvgWidth(t *testing.T) {
 	addTuple(t, pool, rel, 0, storage.NewHeapTuple(creator.XID, storage.InvalidTransactionID, []byte("ab")))
 	addTuple(t, pool, rel, 0, storage.NewHeapTuple(creator.XID, storage.InvalidTransactionID, []byte("hello")))
 
-	stats, err := Analyze(pool, mvccMgr, rel)
+	stats, err := Analyze(pool, mvccMgr, rel, nil)
 	if err != nil {
 		t.Fatalf("Analyze: %v", err)
 	}

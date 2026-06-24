@@ -19,6 +19,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/goopg/goopg/internal/lockwait"
 )
 
 // ErrDeadlockDetected is returned by Acquire when the deadlock
@@ -269,6 +271,41 @@ func (s *lockState) canGrantImmediately(b BackendID, m Mode) bool {
 	return false
 }
 
+// hasSimpleDeadlock reports whether enqueueing a request for mode `m` by
+// backend `b` (which does not already hold `m`) would constitute an
+// immediate "simple" deadlock — the special case upstream's JoinWaitQueue
+// (proc.c) resolves synchronously instead of waiting for deadlock_timeout.
+//
+// The cycle: `b` already holds a lock here; an earlier waiter `w` is parked
+// whose requested mode conflicts with what `b` holds (so `w` must wait for
+// `b`); and `b`'s requested mode `m` conflicts with what `w` already holds
+// (so `b` must wait for `w`). Neither can complete its upgrade — a deadlock
+// that PostgreSQL detects the instant the second upgrader joins the queue
+// (the deadlock-simple isolation spec). The requester `b` is the victim.
+//
+// Mirrors the JoinWaitQueue scan exactly: only the first waiter that "must
+// wait for me" decides the outcome (deadlock / early-grant / ordinary wait),
+// so we return at that waiter. Caller must hold lm.mu.
+func (s *lockState) hasSimpleDeadlock(b BackendID, m Mode) bool {
+	myHeld := s.holders[b]
+	if myHeld == 0 || len(s.waiters) == 0 {
+		return false
+	}
+	for _, w := range s.waiters {
+		if w.Backend == b {
+			continue
+		}
+		// Must this waiter wait for me? (its requested mode conflicts with a
+		// lock I already hold). The first such waiter is my insertion point;
+		// it is a deadlock iff I must also wait for it — i.e. my requested
+		// mode conflicts with a lock it already holds.
+		if ConflictsWith(w.Mode, myHeld) {
+			return ConflictsWith(m, s.holders[w.Backend])
+		}
+	}
+	return false
+}
+
 // LockManager is the lock table. Use New to construct.
 type LockManager struct {
 	mu              sync.Mutex
@@ -346,6 +383,24 @@ func (lm *LockManager) TryAcquire(b BackendID, t LockTag, m Mode) error {
 }
 
 func (lm *LockManager) Acquire(ctx context.Context, b BackendID, t LockTag, m Mode) error {
+	return lm.acquire(ctx, b, t, m, useConfiguredTimeout)
+}
+
+// AcquireWithTimeout is Acquire with a per-call deadlock timeout. LOCK
+// TABLE uses it so each session's `deadlock_timeout` GUC governs how
+// long that session waits before running the detector — the spec suite
+// relies on the session with the shortest timeout discovering (and being
+// rolled back for) the cycle. A timeout <= 0 disables the auto-fire timer
+// for this acquire. M0118-0004.
+func (lm *LockManager) AcquireWithTimeout(ctx context.Context, b BackendID, t LockTag, m Mode, timeout time.Duration) error {
+	return lm.acquire(ctx, b, t, m, timeout)
+}
+
+// useConfiguredTimeout is the sentinel passed to acquire to make it fall
+// back to the manager-wide deadlockTimeout field (read under lm.mu).
+const useConfiguredTimeout time.Duration = -1
+
+func (lm *LockManager) acquire(ctx context.Context, b BackendID, t LockTag, m Mode, timeout time.Duration) error {
 	if m <= NoLock || m > maxMode {
 		return fmt.Errorf("lockmgr: invalid mode %d", int(m))
 	}
@@ -372,6 +427,17 @@ func (lm *LockManager) Acquire(ctx context.Context, b BackendID, t LockTag, m Mo
 		lm.mu.Unlock()
 		return nil
 	}
+	// Simple deadlock: `b` already holds a lock here and would queue behind a
+	// conflicting waiter that itself conflicts with `b`'s held locks. Upstream
+	// (JoinWaitQueue) resolves this synchronously rather than parking and
+	// waiting for deadlock_timeout. `b` is the victim; release its other
+	// holdings so the surviving upgrader can proceed (mirrors the timeout
+	// victim path's ReleaseAll), then report the deadlock.
+	if st.hasSimpleDeadlock(b, m) {
+		lm.mu.Unlock()
+		lm.ReleaseAll(b)
+		return ErrDeadlockDetected
+	}
 	// Conflict: enqueue and block.
 	w := &Waiter{
 		Backend: b,
@@ -381,15 +447,32 @@ func (lm *LockManager) Acquire(ctx context.Context, b BackendID, t LockTag, m Mo
 		victim:  make(chan struct{}, 1),
 	}
 	st.waiters = append(st.waiters, w)
-	timeout := lm.deadlockTimeout
+	if timeout == useConfiguredTimeout {
+		timeout = lm.deadlockTimeout
+	}
 	lm.mu.Unlock()
 
 	// Schedule a deadlock check after the configured timeout.
-	// Idempotent and cheap; concurrent fires serialise on lm.mu.
+	// Idempotent and cheap; concurrent fires serialise on lm.mu. The
+	// check prefers THIS backend as the victim when it is part of a
+	// cycle — mirroring PostgreSQL, where the backend whose
+	// deadlock_timeout expires runs DeadLockCheck and is rolled back.
 	var timer *time.Timer
 	if timeout > 0 {
-		timer = time.AfterFunc(timeout, lm.runDeadlockCheck)
+		timer = time.AfterFunc(timeout, func() { lm.runDeadlockCheckFor(b) })
 		defer timer.Stop()
+	}
+
+	// Arm the session's lock_timeout, if set. Like upstream's
+	// enable_timeout_after(LOCK_TIMEOUT) at the top of ProcSleep, the timer
+	// starts when THIS wait begins; expiry aborts the acquire with the
+	// dedicated lock-timeout sentinel (distinct from a statement_timeout,
+	// which arrives through ctx.Done()). M0118-0009 (timeouts).
+	var lockTimeoutCh <-chan time.Time
+	if d, ok := lockwait.Timeout(ctx); ok {
+		lt := time.NewTimer(d)
+		defer lt.Stop()
+		lockTimeoutCh = lt.C
 	}
 
 	select {
@@ -404,34 +487,47 @@ func (lm *LockManager) Acquire(ctx context.Context, b BackendID, t LockTag, m Mo
 		// progress without waiting for an explicit ReleaseAll.
 		lm.ReleaseAll(b)
 		return ErrDeadlockDetected
+	case <-lockTimeoutCh:
+		// lock_timeout elapsed while parked. Unpark with the same
+		// bookkeeping as a cancellation and report the lock-timeout
+		// sentinel so the executor emits "canceling statement due to
+		// lock timeout".
+		lm.unparkWaiter(t, w, b, m)
+		return lockwait.ErrLockTimeout
 	case <-ctx.Done():
-		// Splice ourselves out of the queue if we're still there;
-		// a racing wake-pass may have already promoted us.
-		lm.mu.Lock()
-		st := lm.states[t]
-		if st != nil {
-			for i, q := range st.waiters {
-				if q == w {
-					st.waiters = append(st.waiters[:i], st.waiters[i+1:]...)
-					break
-				}
-			}
-			// If a Release promoted us between the ctx cancel and
-			// our taking lm.mu, the holder bit is set — release it
-			// to keep state consistent with the cancelled return.
-			if st.holders[b]&bit(m) != 0 {
-				st.holders[b] &^= bit(m)
-				if st.holders[b] == 0 {
-					delete(st.holders, b)
-				}
-				st.recomputeGranted()
-				lm.wakePassLocked(t, st)
-			}
-			lm.gcLocked(t, st)
-		}
-		lm.mu.Unlock()
+		lm.unparkWaiter(t, w, b, m)
 		return ctx.Err()
 	}
+}
+
+// unparkWaiter removes waiter w (backend b's pending request for mode m on
+// tag t) from the wait queue after the wait was abandoned (ctx cancellation
+// or lock_timeout). It is splice-and-repair: if a racing Release promoted us
+// to holder between the wakeup and our taking lm.mu, the momentarily-set
+// holder bit is dropped and the queue re-pumped so the abandoned grant does
+// not strand the next waiter.
+func (lm *LockManager) unparkWaiter(t LockTag, w *Waiter, b BackendID, m Mode) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	st := lm.states[t]
+	if st == nil {
+		return
+	}
+	for i, q := range st.waiters {
+		if q == w {
+			st.waiters = append(st.waiters[:i], st.waiters[i+1:]...)
+			break
+		}
+	}
+	if st.holders[b]&bit(m) != 0 {
+		st.holders[b] &^= bit(m)
+		if st.holders[b] == 0 {
+			delete(st.holders, b)
+		}
+		st.recomputeGranted()
+		lm.wakePassLocked(t, st)
+	}
+	lm.gcLocked(t, st)
 }
 
 // Release drops mode `m` from backend `b`'s holdings on tag `t`.

@@ -186,6 +186,30 @@ type PerformStmt struct {
 func (p *PerformStmt) Pos() int         { return p.pos }
 func (p *PerformStmt) plpgsqlStmtNode() {}
 
+// NullStmt is the PL/pgSQL `NULL;` no-op statement — a placeholder that does
+// nothing (e.g. an empty EXCEPTION handler body `WHEN ... THEN NULL;`).
+// M0118-0009 (subxid-overflow gen_subxids).
+type NullStmt struct {
+	pos int
+}
+
+func (n *NullStmt) Pos() int         { return n.pos }
+func (n *NullStmt) plpgsqlStmtNode() {}
+
+// TxControlStmt is a PL/pgSQL transaction-control statement: `COMMIT;` or
+// `ROLLBACK;`. Permitted only in a non-atomic execution context (a top-level
+// DO block or a procedure invoked outside an explicit transaction block); in
+// an atomic context it raises SQLSTATE 2D000 (invalid transaction
+// termination). After a COMMIT/ROLLBACK the surrounding routine continues in a
+// fresh transaction. M0118-0008 (plpgsql-toast).
+type TxControlStmt struct {
+	pos      int
+	Rollback bool // false = COMMIT, true = ROLLBACK
+}
+
+func (t *TxControlStmt) Pos() int         { return t.pos }
+func (t *TxControlStmt) plpgsqlStmtNode() {}
+
 // ReturnStmt is `RETURN expr;`. Stage A only emits scalar return
 // values; SETOF / TABLE / RETURN NEXT / RETURN QUERY arrive in
 // Stage B.
@@ -228,6 +252,23 @@ type SQLStmt struct {
 
 func (s *SQLStmt) Pos() int          { return s.pos }
 func (s *SQLStmt) plpgsqlStmtNode() {}
+
+// SelectIntoStmt is `SELECT ... INTO [STRICT] target[, target...] FROM ...`
+// inside a PL/pgSQL body. Unlike SQL's SELECT-INTO (which is CREATE TABLE AS),
+// PL/pgSQL reinterprets the INTO clause as variable assignment: the query is
+// the SELECT with the INTO clause removed, and the first result row's columns
+// are bound positionally to the named target variable(s). A single record /
+// composite target receives all result columns; scalar targets receive one
+// column each. M0118-0008 (plpgsql-toast).
+type SelectIntoStmt struct {
+	pos     int
+	SQL     string   // the SELECT query with the INTO clause stripped
+	Targets []string // target variable name(s), lower-cased preserved as written
+	Strict  bool     // STRICT modifier (exactly one row required)
+}
+
+func (s *SelectIntoStmt) Pos() int          { return s.pos }
+func (s *SelectIntoStmt) plpgsqlStmtNode() {}
 
 // ExceptionHandler is one WHEN clause in an EXCEPTION block.
 // Conditions are SQLSTATE codes or condition names. M0097-0012.

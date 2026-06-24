@@ -280,7 +280,11 @@ func PageAllVisible(p Page, horizon TransactionID) bool {
 		if t.Header.Xmin == InvalidTransactionID || t.Header.Xmin >= horizon {
 			return false
 		}
-		// Tuple must not be deleted.
+		// Tuple must not be deleted. An updater-bearing multixact xmax
+		// (IS_MULTI && !LOCK_ONLY) lands here as "deleted" and correctly fails
+		// all-visible — the conservative direction needs no multixact resolution
+		// (resolving could only ever mark MORE pages all-visible, and an
+		// all-locker multi already carries LOCK_ONLY, so it is handled below).
 		if t.Header.Xmax != InvalidTransactionID && !IsHeapTupleLockOnly(t.Header.Infomask) {
 			return false
 		}

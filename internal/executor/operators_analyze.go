@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -59,12 +61,37 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 	if o.ctx == nil || o.ctx.Pool == nil || o.ctx.Catalog == nil || o.ctx.TxnMgr == nil {
 		return nil, &ExecError{Code: "0A000", Pos: o.stmt.Pos(), Message: "ANALYZE requires Pool/Catalog/TxnMgr in Context"}
 	}
-	for _, name := range o.targets() {
-		tbl, ok := o.ctx.Catalog.LookupTable(name)
-		if !ok {
-			return nil, &ExecError{Code: "42P01", Pos: o.stmt.Pos(), Message: fmt.Sprintf("relation %q does not exist", name.String())}
+	targets, parents, terr := o.expandAnalyzeTargets()
+	if terr != nil {
+		return nil, terr
+	}
+	for _, at := range targets {
+		tbl := at.tbl
+		rel := o.ctx.Catalog.RelFileNode(tbl)
+		// ANALYZE takes the per-relation ShareUpdateExclusiveLock (analyze.c).
+		// With SKIP_LOCKED the acquire is conditional and a contended relation is
+		// skipped — with a WARNING only when the user named it explicitly;
+		// partition children reached by expanding a partitioned table are skipped
+		// silently. Without SKIP_LOCKED the acquire blocks, so ANALYZE waits
+		// behind a conflicting holder such as LOCK ... IN SHARE MODE. M0118-0008.
+		if o.stmt.SkipLocked {
+			if !o.ctx.tryAcquireMaintenanceLock(rel, lockmgr.ShareUpdateExclusiveLock) {
+				if at.explicit {
+					o.ctx.AddWarning(fmt.Sprintf("skipping analyze of %q --- lock not available", tbl.Name))
+				}
+				continue
+			}
+		} else if err := o.ctx.acquireRelLockMaybeTransient(rel, lockmgr.ShareUpdateExclusiveLock); err != nil {
+			continue
 		}
-		if tbl.Virtual {
+		// After taking the lock the relation may have been dropped by a
+		// transaction that committed while we waited (see vacuumOp). Skip it,
+		// with a WARNING only for an explicitly named target. M0118-0008
+		// (vacuum-concurrent-drop).
+		if !relationStillExists(o.ctx, tbl) {
+			if at.explicit {
+				o.ctx.AddWarning(fmt.Sprintf("skipping analyze of %q --- relation no longer exists", tbl.Name))
+			}
 			continue
 		}
 		stats, err := analyzeRelationCtx(o.ctx, tbl)
@@ -78,7 +105,58 @@ func (o *analyzeOp) Next() (TupleSlot, error) {
 			_ = werr
 		}
 	}
+	// Inheritance-tree statistics for partitioned parents read every leaf
+	// partition under a blocking AccessShareLock (SKIP_LOCKED does not cover
+	// this scan), so ANALYZE of a partitioned table waits on a child held in a
+	// conflicting mode by another session. M0118-0008.
+	for _, parent := range parents {
+		analyzeInheritanceWait(o.ctx, parent)
+	}
 	return nil, EOF
+}
+
+// expandAnalyzeTargets resolves the ANALYZE target list into concrete heap
+// relations, expanding any partitioned table into its leaf partitions (marked
+// non-explicit ⇒ silent SKIP_LOCKED skip) and returning the partitioned parents
+// encountered for the inheritance-statistics AccessShare scan. A named target
+// that does not exist is a hard 42P01 error, matching the prior behaviour.
+func (o *analyzeOp) expandAnalyzeTargets() ([]vacuumTarget, []*catalog.Table, *ExecError) {
+	cat := o.ctx.Catalog
+	im, _ := cat.(*catalog.InMemory)
+	var out []vacuumTarget
+	var parents []*catalog.Table
+	var add func(tbl *catalog.Table, explicit bool)
+	add = func(tbl *catalog.Table, explicit bool) {
+		if tbl == nil || tbl.Virtual {
+			return
+		}
+		if tbl.PartitionMethod != "" && im != nil {
+			parents = append(parents, tbl)
+			for _, child := range im.PartitionChildren(tbl.OID) {
+				add(child, false)
+			}
+			return
+		}
+		out = append(out, vacuumTarget{tbl: tbl, explicit: explicit})
+	}
+	for _, name := range o.targets() {
+		tbl, ok := cat.LookupTable(name)
+		if !ok {
+			return nil, nil, &ExecError{Code: "42P01", Pos: o.stmt.Pos(), Message: fmt.Sprintf("relation %q does not exist", name.String())}
+		}
+		// Maintenance-privilege check (vacuum_is_permitted_to_vacuum, analyze
+		// verb). A non-superuser session may only analyze a relation it owns (or
+		// holds MAINTAIN on); otherwise the relation is skipped with a WARNING,
+		// emitted with NO lock so an unprivileged ANALYZE skips immediately rather
+		// than waiting behind a conflicting lock holder. M0118-0008
+		// (vacuum-conflict).
+		if !maintenancePermitted(o.ctx, tbl) {
+			o.ctx.AddWarning(fmt.Sprintf("permission denied to analyze %q, skipping it", tbl.Name))
+			continue
+		}
+		add(tbl, true)
+	}
+	return out, parents, nil
 }
 
 func (o *analyzeOp) Close() error { return nil }
@@ -153,14 +231,16 @@ func analyzeRelationCtx(ctx *Context, tbl *catalog.Table) (*catalog.TableStats, 
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
-	return analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, target, rand.New(rand.NewSource(seed)))
+	return analyzeRelationWith(ctx.Pool, ctx.TxnMgr, ctx.Catalog, tbl, target, rand.New(rand.NewSource(seed)), ctx.MultiXact)
 }
 
 // analyzeRelation is kept as a thin wrapper for tests that don't
 // thread a Context — it uses the upstream-default stats target
 // and a wall-clock-seeded sampler.
 func analyzeRelation(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog, tbl *catalog.Table) (*catalog.TableStats, error) {
-	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(time.Now().UnixNano())))
+	// nil store: analyzeRelation is the test-only convenience wrapper with no
+	// executor.Context (hence no MultiXact) in scope. M0118-0003.
+	return analyzeRelationWith(pool, mgr, cat, tbl, upstreamDefaultStatsTarget, rand.New(rand.NewSource(time.Now().UnixNano())), nil)
 }
 
 // analyzeRelationWith walks every block of tbl under a fresh
@@ -168,7 +248,7 @@ func analyzeRelation(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog,
 // reservoir-samples them with `targrows = target *
 // upstreamSampleMultiplier`, and computes per-table + per-column
 // statistics from the sample (RowCount and Pages remain exact).
-func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog, tbl *catalog.Table, target int, rng *rand.Rand) (*catalog.TableStats, error) {
+func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Catalog, tbl *catalog.Table, target int, rng *rand.Rand, mxs *multixact.Store) (*catalog.TableStats, error) {
 	rel := cat.RelFileNode(tbl)
 
 	tx, err := mgr.Begin(mvcc.IsolationReadCommitted)
@@ -222,7 +302,12 @@ func analyzeRelationWith(pool *storage.Pool, mgr *mvcc.Manager, cat catalog.Cata
 				pool.Unpin(slot)
 				return nil, perr
 			}
-			if !mvcc.TupleVisible(t.Header, snap, tx.XID) {
+			// MultiXact store threaded from the caller (ctx.MultiXact for the
+			// live SQL ANALYZE path; nil for the test-only analyzeRelation
+			// wrapper). Resolves an updater-bearing multi xmax to its updater
+			// before judging visibility — a stats-sampling scan must not
+			// undercount a live, only-row-locked tuple as invisible. M0118-0003.
+			if !mvcc.TupleVisible(t.Header, snap, tx.XID, mxs) {
 				continue
 			}
 			// Decode the PG-physical tuple body using the header (natts +

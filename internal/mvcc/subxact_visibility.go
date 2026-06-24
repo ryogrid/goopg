@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -222,7 +223,7 @@ func SeesCommittedXIDWithSubxacts(snap Snapshot, xid storage.TransactionID, r Su
 // visibility resolution. When resolver is nil it degrades to the
 // standard TupleVisible behaviour, so all existing callers continue
 // to work.
-func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.TransactionID, r SubxactResolver) bool {
+func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID storage.TransactionID, r SubxactResolver, mxs *multixact.Store) bool {
 	if h.Xmin == storage.InvalidTransactionID {
 		return false
 	}
@@ -262,7 +263,40 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 	if xmaxIsLockOnly {
 		return true
 	}
-	if isCurrentTxXID(h.Xmax, currentXID, r) {
+
+	// effXmax is the transaction id that actually updated/deleted the tuple.
+	// We reach here only with xmax set and NOT lock-only. If the IS_MULTI bit
+	// is set, h.Xmax is a MultiXactId (a row updated under a shared lock: an
+	// updater plus one or more lockers), not a transaction id — resolve the
+	// updater member so the self/snapshot checks below reason about the real
+	// xid. This is the subtransaction-aware twin of mvcc.TupleVisible's
+	// HEAP_XMAX_IS_MULTI handling and must agree with it
+	// (pattern_sibling_paths_must_agree). The conservative directions follow the
+	// visibility contract: an all-locker multi (no updater) -> visible (a lock is
+	// not a delete); an unresolvable multi (nil store / missing record, both
+	// unreachable while no producer emits non-lock-only multis) -> invisible
+	// (never expose a version whose committed successor we cannot rule out).
+	// M0118-0003.
+	effXmax := h.Xmax
+	if storage.IsHeapTupleXmaxMulti(h.Infomask) {
+		if mxs == nil {
+			return false
+		}
+		members, ok := mxs.Members(multixact.MultiXactId(h.Xmax))
+		if !ok {
+			return false
+		}
+		upd, has := multixact.GetUpdateXid(members)
+		if !has {
+			// Only lockers in the multi (no updater): not a delete. An
+			// all-locker multi should carry LOCK_ONLY and return above; treat
+			// this inconsistent case as a pure row lock — tuple visible.
+			return true
+		}
+		effXmax = upd
+	}
+
+	if isCurrentTxXID(effXmax, currentXID, r) {
 		return false
 	}
 	// M0115-0002: hint-bit read for xmax.
@@ -273,9 +307,9 @@ func TupleVisibleSubxact(h storage.HeapTupleHeader, snap Snapshot, currentXID st
 		// HeapXmaxCommitted cached that xmax committed, but this snapshot
 		// may have been taken before xmax committed (xmax was in-progress
 		// when the snapshot was taken, e.g. origSnap in EPQ re-evaluation).
-		return !snap.SeesCommittedXID(h.Xmax)
+		return !snap.SeesCommittedXID(effXmax)
 	}
-	return !SeesCommittedXIDWithSubxacts(snap, h.Xmax, r)
+	return !SeesCommittedXIDWithSubxacts(snap, effXmax, r)
 }
 
 // IsSelfXID reports whether xid belongs to the current transaction — either
@@ -298,10 +332,35 @@ func isCurrentTxXID(xid, currentXID storage.TransactionID, r SubxactResolver) bo
 	if xid == currentXID {
 		return true
 	}
-	if r == nil || !r.IsSubxact(currentXID) {
+	if r == nil {
 		return false
 	}
-	return xid == r.TopLevelXid(currentXID)
+	// Ancestor direction: currentXID is a subtransaction and xid is an XID at an
+	// outer level (the top-level xact, resolved in one hop). Tuples written
+	// before the savepoint remain self-visible inside it.
+	if r.IsSubxact(currentXID) && xid == r.TopLevelXid(currentXID) {
+		return true
+	}
+	// Descendant direction: xid is a still-open subtransaction of our own
+	// transaction tree (a savepoint we opened, writing under its sub-XID). A
+	// tuple it inserted is self-visible; a tuple it deleted is self-invisible —
+	// exactly as if the top-level xact had written it. An *individually
+	// rolled-back* subxact (ROLLBACK TO SAVEPOINT) is excluded, so its writes
+	// fall through to the snapshot/abort check and become invisible
+	// (aborted-keyrevoke: a rolled-back UPDATE's NEW tuple must disappear, while
+	// its still-self-visible-before-rollback semantics are preserved here). The
+	// pre-existing code resolved only the ancestor hop; the live sub-XID writer
+	// is the reverse direction. M0118-0009.
+	if r.IsSubxact(xid) && !r.IsAborted(xid) {
+		top := r.TopLevelXid(xid)
+		if top == currentXID {
+			return true
+		}
+		if r.IsSubxact(currentXID) && top == r.TopLevelXid(currentXID) {
+			return true
+		}
+	}
+	return false
 }
 
 // SubxactMapForManager attaches a SubxactMap to the Manager's subxact
@@ -342,13 +401,24 @@ func (m *Manager) RegisterSubXid(subxid, parentXid storage.TransactionID) {
 	m.addSubxactEntry(subxid, parentXid)
 }
 
-// MarkSubxactAborted records that subxid was individually rolled back.
+// MarkSubxactAborted records that subxid was individually rolled back, then
+// wakes any WaitForXID sleeper: a blocked row-lock waiter that conflicts with a
+// lock acquired inside this savepoint must re-evaluate now that the savepoint's
+// lock is released (xidActiveWithSubxact will report the subxid dead). The
+// broadcast happens under waitMu after the abort state is recorded, mirroring
+// the top-level abort path in markXactEnd — the state change (under subxactMu /
+// the persistent map) and the broadcast (under waitMu) are disjoint, never
+// nested, so there is no lock-ordering hazard with WaitForXID (waitMu → subxactMu).
+// M0118-0004 (docs/design/0118-0012).
 func (m *Manager) MarkSubxactAborted(subxid storage.TransactionID) {
 	if sm := m.attachedSubxactMap(); sm != nil {
 		sm.MarkAborted(subxid)
-		return
+	} else {
+		m.markSubxactAborted(subxid)
 	}
-	m.markSubxactAborted(subxid)
+	m.waitMu.Lock()
+	m.commitCond.Broadcast()
+	m.waitMu.Unlock()
 }
 
 // attachedSubxactMap returns the persistent SubxactMap installed via

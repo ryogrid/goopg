@@ -118,7 +118,7 @@ func TestNormalizeBoolWireText(t *testing.T) {
 func TestDrainCompleted_EmitsPendingStepNotices(t *testing.T) {
 	var sb strings.Builder
 	q := &sessionNoticeQueue{}
-	q.push("hello from pending step")
+	q.push("NOTICE", "hello from pending step")
 	pending := []pendingStep{{
 		session: "s1",
 		outCh:   make(chan stepOutcome),
@@ -140,7 +140,7 @@ func TestDrainCompleted_EmitsPendingStepNotices(t *testing.T) {
 func TestDrainWithTimeout_EmitsPendingStepNotices(t *testing.T) {
 	var sb strings.Builder
 	q := &sessionNoticeQueue{}
-	q.push("hello after unblock")
+	q.push("NOTICE", "hello after unblock")
 	pending := []pendingStep{{
 		session: "s2",
 		outCh:   make(chan stepOutcome),
@@ -608,5 +608,55 @@ func TestParseIsolationSpecPopulatesBlockers(t *testing.T) {
 	}
 	if len(pb[1]) != 1 || pb[1][0].Kind != BlockerNotices || pb[1][0].Count != 10 {
 		t.Errorf("s2_upsert blocker = %+v, want notices 10", pb[1])
+	}
+}
+
+// TestSplitSQLStatementsDollarQuote verifies the statement splitter does not
+// cut inside a dollar-quoted body whose payload embeds its own semicolons
+// (PL/pgSQL DO blocks / function bodies, e.g. plpgsql-toast's `do $$ ...
+// commit; ... $$;`). A naive split on `;` would truncate the block and hand
+// goopg an unterminated dollar-quoted string. M0118-0008.
+func TestSplitSQLStatementsDollarQuote(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		want []string
+	}{
+		{
+			name: "do block with embedded semicolons",
+			sql:  "do $$\n  begin\n    delete from t;\n    commit;\n  end;\n$$;",
+			want: []string{"do $$\n  begin\n    delete from t;\n    commit;\n  end;\n$$"},
+		},
+		{
+			name: "tagged dollar quote",
+			sql:  "create function f() returns int as $body$ begin return 1; end; $body$ language plpgsql; select f();",
+			want: []string{
+				"create function f() returns int as $body$ begin return 1; end; $body$ language plpgsql",
+				"select f()",
+			},
+		},
+		{
+			name: "plain statements unaffected",
+			sql:  "select 1; select 2;",
+			want: []string{"select 1", "select 2"},
+		},
+		{
+			name: "positional parameter is not a dollar quote",
+			sql:  "select $1; select $2;",
+			want: []string{"select $1", "select $2"},
+		},
+		{
+			name: "single-quote with semicolon still respected",
+			sql:  "select ';'; select 2;",
+			want: []string{"select ';'", "select 2"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := splitSQLStatements(tc.sql)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("splitSQLStatements(%q):\n got  %#v\n want %#v", tc.sql, got, tc.want)
+			}
+		})
 	}
 }

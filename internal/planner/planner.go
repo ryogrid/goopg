@@ -1564,12 +1564,24 @@ func resolveLockedRels(s *parser.SelectStmt, ctx *resolveContext) ([]LockedRel, 
 	return out, nil
 }
 
+// lockStrengthFromParser maps a parser row-locking strength to its planner
+// counterpart 1:1, preserving the full four-way FOR UPDATE / FOR NO KEY UPDATE /
+// FOR SHARE / FOR KEY SHARE distinction. The executor needs the precise strength
+// to stamp the correct tuple-lock infomask bits and record the right MultiXact
+// member status — a no-key UPDATE must not conflict with a FOR KEY SHARE lock,
+// which collapsing KEY SHARE→SHARE / NO KEY UPDATE→UPDATE would break (M0118-0003,
+// docs/design/0118-0002). The only consumer of LockedRel.Strength is the
+// lockRowsOp executor, so widening from two strengths to four is local.
 func lockStrengthFromParser(s parser.LockStrength) LockStrength {
 	switch s {
-	case parser.LockStrengthForUpdate, parser.LockStrengthForNoKeyUpdate:
+	case parser.LockStrengthForUpdate:
 		return LockStrengthForUpdate
-	case parser.LockStrengthForShare, parser.LockStrengthForKeyShare:
+	case parser.LockStrengthForNoKeyUpdate:
+		return LockStrengthForNoKeyUpdate
+	case parser.LockStrengthForShare:
 		return LockStrengthForShare
+	case parser.LockStrengthForKeyShare:
+		return LockStrengthForKeyShare
 	}
 	return LockStrengthForUpdate
 }
@@ -1734,6 +1746,11 @@ func nodeReferencesOuter(n Node) bool {
 	// General case: walk the plan tree for OuterColumnRef expressions.
 	return planHasOuterRef(n)
 }
+
+// ExprContainsColumnRef reports whether a resolved planner expression references
+// any table column (a *ColumnRef). It is the exported entry point used by the
+// executor's CREATE INDEX const-folding of partial-index predicates.
+func ExprContainsColumnRef(e Expr) bool { return exprContainsColumnRef(e) }
 
 func exprContainsColumnRef(e Expr) bool {
 	if e == nil {
@@ -2121,8 +2138,11 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// collecting ALL leaf descendants, not only direct children.
 	if len(tbl.PartitionKey) > 0 {
 		if im := inMemoryCat(cat); im != nil {
-			// Collect all leaf partitions recursively.
-			leaves := collectAllPartitionLeaves(im, tbl.OID)
+			// Collect all leaf partitions recursively, dropping any child
+			// concurrently detach-pending at or before this statement's
+			// snapshot epoch (snapshot-relative partition visibility).
+			// Design 0118-0059 (M0118-0008).
+			leaves := collectAllPartitionLeaves(im, tbl.OID, currentPartitionDetachEpoch(cat))
 			if len(leaves) > 0 {
 				// Build a UNION ALL of SeqScans over all leaf partitions.
 				// Per-leaf wrap with a Project that adds `tableoid`
@@ -2136,7 +2156,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 					// buildInheritanceRemapProject wraps the scan in a Project
 					// that reorders to the root table's logical schema.
 					leafPhysSchema := tableSchemaWithSource(leaf, sourceIdx)
-					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema}
+					leafScan := &SeqScan{pos: rv.Pos(), Table: leaf, Alias: rv.Alias, schema: leafPhysSchema, LockParentOID: tbl.OID}
 					var leafNode Node = leafScan
 					if len(leaf.Columns) != len(tbl.Columns) || !columnsInSameOrder(leaf.Columns, tbl.Columns) {
 						leafNode = buildInheritanceRemapProject(rv.Pos(), leafScan, tbl, leaf, sourceIdx)
@@ -2169,7 +2189,7 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 	// grandchildren (e.g. stud_emp → emp → person) are included too.
 	// FROM ONLY tablename skips all children (M0097-0099).
 	if im := inMemoryCat(cat); im != nil && !rv.Only {
-		allDesc := collectInheritanceDescendants(im, tbl.OID)
+		allDesc := collectInheritanceDescendants(im, tbl.OID, currentTempOwner(cat))
 
 		if len(allDesc) > 0 {
 			parentScan := &SeqScan{pos: rv.Pos(), Table: tbl, Alias: rv.Alias, schema: ctx.schema}
@@ -2229,10 +2249,12 @@ func inMemoryCat(cat catalog.Catalog) *catalog.InMemory {
 
 // stud_emp inherits from both emp and student which both inherit from person).
 // M0097-0046.
-func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32) []*catalog.Table {
+func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32, sessionTempOwner string) []*catalog.Table {
 	var result []*catalog.Table
 	seen := make(map[uint32]bool)
-	queue := im.InheritanceChildren(parentOID)
+	// Drop temporary children owned by other sessions at every BFS level
+	// (RELATION_IS_OTHER_TEMP). Design 0118-0036 (M0118-0008 inherit-temp).
+	queue := catalog.AccessibleInheritanceChildren(im.InheritanceChildren(parentOID), sessionTempOwner)
 	for len(queue) > 0 {
 		child := queue[0]
 		queue = queue[1:]
@@ -2241,9 +2263,58 @@ func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32) []*ca
 		}
 		seen[child.OID] = true
 		result = append(result, child)
-		queue = append(queue, im.InheritanceChildren(child.OID)...)
+		queue = append(queue, catalog.AccessibleInheritanceChildren(im.InheritanceChildren(child.OID), sessionTempOwner)...)
 	}
 	return result
+}
+
+// tempOwnerCarrier is satisfied by *catalog.SearchPathCatalog: it surfaces the
+// querying session's temp-relation ownership token. currentTempOwner walks the
+// catalog wrapper chain (peeling SearchPathCatalog/etc. via Unwrap, like
+// inMemoryCat) looking for the first carrier. Returns "" when no session
+// identity is attached (internal/test contexts) so legacy single-session
+// behaviour is preserved. Design 0118-0036.
+func currentTempOwner(cat catalog.Catalog) string {
+	type carrier interface{ CurrentTempOwner() string }
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if c, ok := cat.(carrier); ok {
+			if tok := c.CurrentTempOwner(); tok != "" {
+				return tok
+			}
+		}
+		if u, ok := cat.(unwrapper); ok {
+			cat = u.Unwrap()
+		} else {
+			return ""
+		}
+	}
+}
+
+// currentPartitionDetachEpoch walks the catalog wrapper chain (peeling
+// SearchPathCatalog/etc. via Unwrap, like currentTempOwner) and returns the
+// querying statement's snapshot partition-detach epoch. The partition-scan
+// expansion drops a child marked detach-pending at or before this epoch
+// (catalog.VisiblePartitionChildren), so a READ COMMITTED statement (fresh
+// snapshot, higher epoch) omits a concurrently-detached partition while a
+// REPEATABLE READ transaction (snapshot frozen at BEGIN, lower epoch) still
+// sees it. Returns 0 when no snapshot epoch is attached (legacy/test contexts),
+// which disables filtering. Design 0118-0059 (M0118-0008).
+func currentPartitionDetachEpoch(cat catalog.Catalog) uint64 {
+	type carrier interface{ CurrentPartitionDetachEpoch() uint64 }
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if c, ok := cat.(carrier); ok {
+			if e := c.CurrentPartitionDetachEpoch(); e != 0 {
+				return e
+			}
+		}
+		if u, ok := cat.(unwrapper); ok {
+			cat = u.Unwrap()
+		} else {
+			return 0
+		}
+	}
 }
 
 // collectAllPartitionLeaves does a BFS over the partition hierarchy rooted at
@@ -2252,10 +2323,14 @@ func collectInheritanceDescendants(im *catalog.InMemory, parentOID uint32) []*ca
 // the result — only their leaf descendants are. This is required for correct
 // scanning of multi-level partition hierarchies (e.g. range_parted → part_b_10_b_20
 // (partitioned) → part_c_1_100 (leaf)). M0097-0105.
-func collectAllPartitionLeaves(im *catalog.InMemory, parentOID uint32) []*catalog.Table {
+func collectAllPartitionLeaves(im *catalog.InMemory, parentOID uint32, detachEpoch uint64) []*catalog.Table {
 	var leaves []*catalog.Table
 	seen := make(map[uint32]bool)
-	queue := im.PartitionChildren(parentOID)
+	// VisiblePartitionChildren drops a child stamped detach-pending at or before
+	// detachEpoch at every level, so a concurrently-detached intermediate node
+	// (and all its leaves) vanishes from the scan for snapshots after the detach.
+	// Design 0118-0059 (M0118-0008).
+	queue := catalog.VisiblePartitionChildren(im.PartitionChildren(parentOID), detachEpoch)
 	for len(queue) > 0 {
 		child := queue[0]
 		queue = queue[1:]
@@ -2265,7 +2340,7 @@ func collectAllPartitionLeaves(im *catalog.InMemory, parentOID uint32) []*catalo
 		seen[child.OID] = true
 		if len(child.PartitionKey) > 0 {
 			// Intermediate partitioned node: recurse into its children.
-			queue = append(queue, im.PartitionChildren(child.OID)...)
+			queue = append(queue, catalog.VisiblePartitionChildren(im.PartitionChildren(child.OID), detachEpoch)...)
 		} else {
 			// Leaf partition: include in the scan.
 			leaves = append(leaves, child)
@@ -2401,6 +2476,19 @@ func TypedVirtualCell(pos int, value, colType string) Expr {
 		// reloptions (DU-002 slice 47: nonemptyReloptions saw strlen>2). A
 		// non-empty value is the array text literal ("{a,b}") and passes
 		// through verbatim.
+		if value == "" {
+			return &NullConst{pos: pos}
+		}
+		return &StringConst{pos: pos, Value: value}
+	case "pg_node_tree":
+		// Decompiled-expression catalog columns (relpartbound, pg_attrdef.adbin,
+		// pg_constraint.conbin, pg_index.indexprs/indpred, …). PostgreSQL stores
+		// SQL NULL when the expression is absent — e.g. relpartbound is NULL for a
+		// non-partition (and for a partition detached via DETACH … CONCURRENTLY,
+		// which is exactly what detach-partition-concurrently-1's s3i tests:
+		// `relpartbound IS NULL` flips f→t once the detach finalizes). An empty
+		// cell routed through the default StringConst branch yields a non-NULL
+		// empty string, so `IS NULL` would wrongly read false. Design 0118-0059.
 		if value == "" {
 			return &NullConst{pos: pos}
 		}
@@ -2777,6 +2865,92 @@ func projectSetCompositeSchema(name string) Schema {
 	return nil
 }
 
+// isNestedSRFName reports whether fname is a built-in set-returning function
+// that buildSelectSrfProjectSet expands when it appears nested inside a larger
+// SELECT-list target expression (e.g. `generate_series(1,n) % 4`). Limited to
+// generate_series for now; bare and FROM-clause SRFs keep their existing paths.
+// M0118-0008.
+func isNestedSRFName(fname string) bool {
+	return strings.EqualFold(fname, "generate_series")
+}
+
+// findFirstNestedSRF returns the first set-returning FuncCall (DFS) inside a
+// resolved SELECT-list target expression, or nil when none is present. It walks
+// the same node kinds as replaceExprNode so the two stay in lockstep. M0118-0008.
+func findFirstNestedSRF(e Expr) *FuncCall {
+	switch x := e.(type) {
+	case *FuncCall:
+		if isNestedSRFName(x.Name) {
+			return x
+		}
+		for _, a := range x.Args {
+			if f := findFirstNestedSRF(a); f != nil {
+				return f
+			}
+		}
+	case *BinaryOp:
+		if f := findFirstNestedSRF(x.Left); f != nil {
+			return f
+		}
+		return findFirstNestedSRF(x.Right)
+	case *UnaryOp:
+		return findFirstNestedSRF(x.Operand)
+	case *CastExpr:
+		return findFirstNestedSRF(x.Operand)
+	case *CollateExpr:
+		return findFirstNestedSRF(x.Operand)
+	case *CaseExpr:
+		if f := findFirstNestedSRF(x.Operand); f != nil {
+			return f
+		}
+		for _, w := range x.Whens {
+			if f := findFirstNestedSRF(w.When); f != nil {
+				return f
+			}
+			if f := findFirstNestedSRF(w.Then); f != nil {
+				return f
+			}
+		}
+		return findFirstNestedSRF(x.Else)
+	}
+	return nil
+}
+
+// replaceExprNode returns a copy of e with the node target (matched by pointer
+// identity) replaced by repl. Mirrors findFirstNestedSRF's node coverage and
+// shiftColumnRefsBy's rebuild discipline. M0118-0008.
+func replaceExprNode(e Expr, target Expr, repl Expr) Expr {
+	if e == nil {
+		return nil
+	}
+	if e == target {
+		return repl
+	}
+	switch x := e.(type) {
+	case *FuncCall:
+		args := make([]Expr, len(x.Args))
+		for i, a := range x.Args {
+			args[i] = replaceExprNode(a, target, repl)
+		}
+		return &FuncCall{pos: x.Pos(), Name: x.Name, Args: args, Star: x.Star, Variadic: x.Variadic, ReturnType: x.ReturnType}
+	case *BinaryOp:
+		return &BinaryOp{pos: x.Pos(), Op: x.Op, Left: replaceExprNode(x.Left, target, repl), Right: replaceExprNode(x.Right, target, repl), ResultType: x.ResultType}
+	case *UnaryOp:
+		return &UnaryOp{pos: x.Pos(), Op: x.Op, Operand: replaceExprNode(x.Operand, target, repl)}
+	case *CastExpr:
+		return &CastExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), TargetType: x.TargetType, SourceType: x.SourceType, Typmod: x.Typmod}
+	case *CollateExpr:
+		return &CollateExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), CollationName: x.CollationName}
+	case *CaseExpr:
+		whens := make([]CaseWhen, len(x.Whens))
+		for i, w := range x.Whens {
+			whens[i] = CaseWhen{When: replaceExprNode(w.When, target, repl), Then: replaceExprNode(w.Then, target, repl)}
+		}
+		return &CaseExpr{pos: x.Pos(), Operand: replaceExprNode(x.Operand, target, repl), Whens: whens, Else: replaceExprNode(x.Else, target, repl)}
+	}
+	return e
+}
+
 // buildSelectSrfProjectSet detects generate_series(...) and user-defined SETOF
 // function calls in the SELECT target list and wraps the child node in a
 // ProjectSet that expands the SRFs. Multiple SRF calls are "zipped" together
@@ -2856,10 +3030,6 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 			}
 		}
 	}
-	if len(srfs) == 0 && len(unnests) == 0 && len(userSrfs) == 0 {
-		return nil, nil
-	}
-
 	// Build per-column resolved expressions.
 	srfColMap := make(map[int]bool, len(srfs)+len(unnests)+len(userSrfs))
 	for _, e := range srfs {
@@ -2872,10 +3042,70 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		srfColMap[e.colIdx] = true
 	}
 
+	// Detect a set-returning function nested inside a larger SELECT-list target
+	// expression (e.g. `generate_series(1,n) % 4`). Such a target is not a bare
+	// SRF FuncCall, so the loop above skipped it and the normal scalar path
+	// would collapse the SRF to its start value — silently dropping rows
+	// (M0118-0008). We resolve the target, locate the nested SRF, and rewrite it
+	// into a wrapper expression that reads the SRF's expanded per-step value from
+	// a temp eval-row slot.
+	type wrappedSRF struct {
+		expr    Expr      // wrapper expr (SRF replaced by a ColumnRef temp slot)
+		srfNode *FuncCall // the nested SRF call (resolved args reused verbatim)
+		slotIdx int       // temp eval-row slot holding the raw per-step SRF value
+	}
+	childWidth := 0
+	if child != nil {
+		childWidth = len(child.Output())
+	}
+	wrapped := make(map[int]wrappedSRF)
+	wrapSlot := 0
+	for i, t := range s.Targets {
+		if srfColMap[i] {
+			continue
+		}
+		var resolved Expr
+		var rerr error
+		if agg != nil {
+			resolved, rerr = resolveExprAfterAggregate(t.Expr, agg)
+		} else {
+			resolved, rerr = resolveExpr(t.Expr, ctx)
+		}
+		if rerr != nil {
+			continue // let the normal target-resolution path report the error
+		}
+		srfNode := findFirstNestedSRF(resolved)
+		if srfNode == nil {
+			continue
+		}
+		if len(srfNode.Args) < 2 || len(srfNode.Args) > 3 { // generate_series arity
+			continue
+		}
+		slotIdx := childWidth + wrapSlot
+		repl := &ColumnRef{pos: srfNode.Pos(), Index: slotIdx, Name: strings.ToLower(srfNode.Name), Type: catalog.Type{Name: "int8"}}
+		wrapped[i] = wrappedSRF{expr: replaceExprNode(resolved, srfNode, repl), srfNode: srfNode, slotIdx: slotIdx}
+		wrapSlot++
+	}
+
+	if len(srfs) == 0 && len(unnests) == 0 && len(userSrfs) == 0 && len(wrapped) == 0 {
+		return nil, nil
+	}
+
 	schema := make(Schema, len(s.Targets))
 	otherExprs := make([]Expr, len(s.Targets))
 	for i, t := range s.Targets {
 		alias := t.Alias
+		if w, isWrapped := wrapped[i]; isWrapped {
+			// Nested-SRF column: the output is the enclosing wrapper expression
+			// (the raw SRF value lives in a temp eval-row slot). M0118-0008.
+			name := alias
+			if name == "" {
+				name = exprOutputName(t.Expr)
+			}
+			schema[i] = SchemaColumn{Name: name, Type: exprType(w.expr)}
+			otherExprs[i] = nil // filled by the wrapper, not as a passthrough
+			continue
+		}
 		if srfColMap[i] {
 			// SRF column: determine output name and type.
 			name := alias
@@ -3033,14 +3263,30 @@ func buildSelectSrfProjectSet(s *parser.SelectStmt, child Node, ctx *resolveCont
 		userSrfCols[k] = UserSrfCol{ColIdx: u.colIdx, FuncPos: u.fc.Pos(), Args: resolvedArgs, Routine: u.routine}
 	}
 
+	// Nested-SRF wrappers: each expands a generate_series into its temp slot
+	// (Wrapped: true → executor writes the raw value to the eval row, not the
+	// output row) and applies the enclosing scalar expression. M0118-0008.
+	wrappers := make([]SrfWrapper, 0, len(wrapped))
+	for i, w := range wrapped {
+		sc := SrfCol{ColIdx: w.slotIdx, Start: w.srfNode.Args[0], Stop: w.srfNode.Args[1], Wrapped: true}
+		if len(w.srfNode.Args) == 3 {
+			sc.Step = w.srfNode.Args[2]
+		}
+		srfCols = append(srfCols, sc)
+		wrappers = append(wrappers, SrfWrapper{OutCol: i, Expr: w.expr})
+	}
+
 	return &ProjectSet{
-		pos:         s.Pos(),
-		Child:       child,
-		SrfCols:     srfCols,
-		UnnestCols:  unnestCols,
-		UserSrfCols: userSrfCols,
-		OtherExprs:  otherExprs,
-		schema:      schema,
+		pos:          s.Pos(),
+		Child:        child,
+		SrfCols:      srfCols,
+		UnnestCols:   unnestCols,
+		UserSrfCols:  userSrfCols,
+		OtherExprs:   otherExprs,
+		schema:       schema,
+		Wrappers:     wrappers,
+		ChildWidth:   childWidth,
+		EvalRowWidth: childWidth + wrapSlot,
 	}, nil
 }
 
@@ -6696,6 +6942,37 @@ func tryRangeIndexScan(where parser.Expr, tbl *catalog.Table, ctx *resolveContex
 	return &Filter{pos: where.Pos(), Child: scan, Predicate: fullPred}, true, nil
 }
 
+// defaultMarkerReplacement returns the expression a `*parser.DefaultMarker`
+// cell targeting tbl.Columns[ordinal] should be rewritten to: the column's
+// catalog DefaultExpr when present, else a synthesized nextval('<tbl>_<col>_seq')
+// call for SERIAL / BIGSERIAL / SMALLSERIAL and GENERATED AS IDENTITY columns,
+// else a NULL literal. goopg leaves catalog.Column.DefaultExpr nil for serial/
+// identity columns — the executor's auto-generation loop is authoritative for
+// OMITTED columns — so an explicit DEFAULT keyword (e.g.
+// `INSERT INTO t VALUES (1, DEFAULT)` / `UPDATE t SET data = DEFAULT`) would
+// otherwise collapse to NULL and trip the NOT NULL constraint. Mirroring
+// PostgreSQL, where SERIAL's column default literally IS nextval(...), we emit
+// that call so the value path produces the next sequence value. The standard
+// "<table>_<column>_seq" name matches the executor's seqName derivation; a
+// renamed sequence (rare, and not survivable by name anywhere in goopg) is not
+// resolved here.
+func defaultMarkerReplacement(tbl *catalog.Table, ordinal int) parser.Expr {
+	if ordinal >= 0 && ordinal < len(tbl.Columns) {
+		col := tbl.Columns[ordinal]
+		if def := col.DefaultExpr; def != nil {
+			return def
+		}
+		if catalog.IsSerialTypeName(col.Type.Name) || col.IdentityColumn {
+			seqName := strings.ToLower(tbl.Name) + "_" + strings.ToLower(col.Name) + "_seq"
+			return &parser.FuncCall{
+				Name: parser.ObjectName{Name: "nextval"},
+				Args: []parser.Expr{&parser.StringConst{Value: seqName}},
+			}
+		}
+	}
+	return &parser.NullConst{}
+}
+
 // rewriteInsertDefaultMarkers substitutes `*parser.DefaultMarker` cells
 // in an INSERT's VALUES rows with the target column's catalog
 // `DefaultExpr` (or `*parser.NullConst` when the column has no
@@ -6773,15 +7050,7 @@ func rewriteInsertDefaultMarkers(s *parser.InsertStmt, cat catalog.Catalog) erro
 				continue
 			}
 			tgt := colIndex[i]
-			if tgt < 0 || tgt >= len(tbl.Columns) {
-				r[i] = &parser.NullConst{}
-				continue
-			}
-			if def := tbl.Columns[tgt].DefaultExpr; def != nil {
-				r[i] = def
-			} else {
-				r[i] = &parser.NullConst{}
-			}
+			r[i] = defaultMarkerReplacement(tbl, tgt)
 		}
 	}
 	return nil
@@ -6823,11 +7092,7 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 				if !ok {
 					return nil
 				}
-				if def := tbl.Columns[col.Ordinal].DefaultExpr; def != nil {
-					row.Elems[j] = def
-				} else {
-					row.Elems[j] = &parser.NullConst{}
-				}
+				row.Elems[j] = defaultMarkerReplacement(tbl, col.Ordinal)
 			}
 			continue
 		}
@@ -6841,11 +7106,7 @@ func rewriteUpdateDefaultMarkers(s *parser.UpdateStmt, cat catalog.Catalog) erro
 			// uniform.
 			return nil
 		}
-		if def := tbl.Columns[col.Ordinal].DefaultExpr; def != nil {
-			a.Expr = def
-		} else {
-			a.Expr = &parser.NullConst{}
-		}
+		a.Expr = defaultMarkerReplacement(tbl, col.Ordinal)
 	}
 	return nil
 }
@@ -6901,6 +7162,35 @@ func planInsert(s *parser.InsertStmt, cat catalog.Catalog) (Node, error) {
 			return nil, err
 		}
 		source = sel
+		// Reconcile the source arity with the target column list, mirroring
+		// PostgreSQL transformInsertStmt:
+		//   * more source expressions than target columns is an error;
+		//   * with NO explicit column list, fewer source expressions is legal —
+		//     the leading columns are filled and the trailing target columns
+		//     fall back to their DEFAULT (or NULL). PG: "if there are only N
+		//     columns supplied … the first N column names". Truncating colIndex
+		//     here leaves the remaining columns flagged missing in the executor
+		//     (insertOp.Next) so applyDefaultsForMissing fills them; without the
+		//     truncation the executor indexes past the shorter source row and
+		//     panics (index out of range).
+		srcWidth := len(sel.Output())
+		if srcWidth > len(colIndex) {
+			return nil, &PlanError{
+				Pos:     s.Pos(),
+				Code:    "42601",
+				Message: "INSERT has more expressions than target columns",
+			}
+		}
+		if len(s.Columns) > 0 && srcWidth < len(colIndex) {
+			return nil, &PlanError{
+				Pos:     s.Pos(),
+				Code:    "42601",
+				Message: "INSERT has more target columns than expressions",
+			}
+		}
+		if srcWidth < len(colIndex) {
+			colIndex = colIndex[:srcWidth]
+		}
 	} else {
 		// Validate row arity and build planner expressions.
 		if len(s.Rows) == 0 {

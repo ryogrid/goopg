@@ -396,7 +396,7 @@ func subScanInt2(t *testing.T, db *subDB, tableName string, cols []catalog.Colum
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisible(tup.Header, snap, tx.XID) {
+			if !mvcc.TupleVisible(tup.Header, snap, tx.XID, nil) {
 				continue
 			}
 			row, _ := executor.DecodeRow(cols, tup.Data)
@@ -437,7 +437,7 @@ func scanIntCol(t *testing.T, db *subDB, rel storage.RelFileNode, cols []catalog
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisible(tup.Header, snap, tx.XID) {
+			if !mvcc.TupleVisible(tup.Header, snap, tx.XID, nil) {
 				continue
 			}
 			row, _ := executor.DecodeRow(cols, tup.Data)

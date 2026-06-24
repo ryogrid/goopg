@@ -7,7 +7,9 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/goopg/goopg/internal/lockwait"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -220,6 +222,7 @@ func (m *Manager) Begin(iso IsolationLevel, procNums ...int32) (Transaction, err
 		s.xid.Store(0)
 		s.xmin.Store(^uint64(0))
 		s.firstSnap = nil
+		s.pinnedSnap.Store(false)
 		s.snapshotXmin = ^uint32(0)
 		s.isolation = int32(iso)
 		// inTxn already set to 1 by CAS above.
@@ -244,6 +247,7 @@ func (m *Manager) Begin(iso IsolationLevel, procNums ...int32) (Transaction, err
 	s.xid.Store(0)
 	s.xmin.Store(^uint64(0))
 	s.firstSnap = nil
+	s.pinnedSnap.Store(false)
 	s.snapshotXmin = ^uint32(0)
 	s.isolation = int32(iso)
 	s.inTxn.Store(1)
@@ -369,6 +373,12 @@ func (m *Manager) SnapshotFor(tx Transaction) (Snapshot, error) {
 			snap := m.captureSnapshot()
 			s.firstSnap = &snap
 			s.xmin.Store(uint64(snap.Xmin))
+			// Mark the slot as holding a snapshot pinned for the whole txn: DETACH
+			// PARTITION CONCURRENTLY must wait for such a session to finish (its
+			// snapshot keeps seeing the partition attached). RC sessions never set
+			// this — their per-statement snapshot is released, so a txn-scoped
+			// relation lock is the proxy instead. Design 0118-0060.
+			s.pinnedSnap.Store(true)
 			if tx.Isolation == IsolationSerializable {
 				// Capture lastCommitBeforeSnapshot for the de-facto READ ONLY
 				// SSI optimisation (predicate.c). M0118-0001 (receipt-report).
@@ -424,7 +434,14 @@ func (m *Manager) AllocateSubXid(parentXid storage.TransactionID) (storage.Trans
 			"mvcc: database must be vacuumed within %d transactions to prevent XID wraparound",
 			^storage.TransactionID(0)-subXid)
 	}
-	m.addSubxactEntry(subXid, parentXid)
+	// Register through RegisterSubXid (not addSubxactEntry directly) so the
+	// subxid→parent link lands in the persistent SubxactMap when one is attached
+	// (initdb.Open's SetSubxactMap, the real-server path). TopLevelXid / IsAborted
+	// / MarkSubxactAborted all read the attached map first; writing only the
+	// in-memory subxactParents fallback here would leave TopLevelXid(subxid)
+	// unresolved, so xidActiveWithSubxact would report a savepoint-scoped row lock
+	// as dead and conflicting waiters would never block on it. M0118-0004.
+	m.RegisterSubXid(subXid, parentXid)
 	return subXid, nil
 }
 
@@ -515,6 +532,7 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 	// Clear the slot.
 	s.xid.Store(0)
 	s.firstSnap = nil
+	s.pinnedSnap.Store(false)
 	s.xmin.Store(^uint64(0))
 	s.inTxn.Store(0)
 
@@ -582,11 +600,27 @@ func (m *Manager) WaitForXID(ctx context.Context, xid storage.TransactionID) err
 	}()
 	defer close(done)
 
+	// Arm the session's lock_timeout, if set. The deadline is taken from the
+	// start of THIS wait (mirroring upstream's per-ProcSleep arming); when it
+	// elapses the wait returns ErrLockTimeout so the executor emits
+	// "canceling statement due to lock timeout", distinct from a
+	// statement_timeout that arrives via ctx cancellation. M0118-0009.
+	lockTimeout, hasLockTimeout := lockwait.Timeout(ctx)
+	var lockDeadline time.Time
+	if hasLockTimeout {
+		lockDeadline = time.Now().Add(lockTimeout)
+		lt := time.AfterFunc(lockTimeout, func() { m.commitCond.Broadcast() })
+		defer lt.Stop()
+	}
+
 	m.waitMu.Lock()
 	defer m.waitMu.Unlock()
-	for m.xidInProgress(xid) {
+	for m.xidActiveWithSubxact(xid) {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if hasLockTimeout && !time.Now().Before(lockDeadline) {
+			return lockwait.ErrLockTimeout
 		}
 		m.commitCond.Wait()
 	}
@@ -603,9 +637,125 @@ func (m *Manager) WaitForXID(ctx context.Context, xid storage.TransactionID) err
 // the DROP is still running, so the index may be safely removed.
 // M0100-0009.
 func (m *Manager) WaitForOlderSlotsToCommit(ctx context.Context, selfHandle TxnHandle) error {
-	selfIdx := int(selfHandle) - 1 // Handle = procNum+1
+	return m.WaitForSlotsToCommit(ctx, m.SnapshotActiveOtherSlots(selfHandle))
+}
 
-	// Snapshot which slots are active right now (excluding self).
+// WaitForPinnedSnapshotsToCommit waits until every OTHER backend that holds a
+// transaction-pinned MVCC snapshot (REPEATABLE READ / SERIALIZABLE) has
+// finished its transaction. Used by DETACH PARTITION CONCURRENTLY together with
+// the relation-locker wait: an RR/SSI session keeps a snapshot that still sees
+// the partition attached even when it holds no table lock (e.g. it only
+// PREPAREd a statement), so the detacher must wait for it. READ COMMITTED
+// sessions are deliberately excluded — their per-statement snapshot is released
+// between steps, so a durable txn-scoped relation lock (waitForRelationLockers)
+// is the correct proxy for "still using the partition", NOT mere
+// in-transaction status. This is what lets a READ COMMITTED session that only
+// issued BEGIN (no table access) avoid blocking the detacher. Design 0118-0060
+// (M0118-0008 detach-partition-concurrently-2 permutation 5).
+func (m *Manager) WaitForPinnedSnapshotsToCommit(ctx context.Context, selfHandle TxnHandle) error {
+	return m.WaitForPinnedSnapshotsReleased(ctx, m.SnapshotActiveOtherPinnedSlots(selfHandle))
+}
+
+// WaitForPinnedSnapshotsReleased blocks until every slot in active has released
+// its transaction-pinned (RR/SSI) snapshot, or ctx is cancelled. A slot's
+// snapshot is released either when its transaction ends (commit/rollback clears
+// pinnedSnap in End) OR when a statement errors at the top level and the
+// transaction enters the aborted state (ReleasePinnedSnapshot clears pinnedSnap
+// while inTxn stays 1 until the eventual ROLLBACK). The latter mirrors
+// PostgreSQL's AbortTransaction, which drops the transaction snapshot the moment
+// a top-level statement errors — so a concurrent DETACH PARTITION CONCURRENTLY
+// that was waiting for an RR session's snapshot unblocks as soon as that session
+// hits an error, BEFORE its explicit ROLLBACK/COMMIT (detach-partition-
+// concurrently-4 permutation `s1brr s1s s2detach s1insert s1c`, where s1insert's
+// FK error must let s2detach complete ahead of s1c). Design 0118-0063.
+func (m *Manager) WaitForPinnedSnapshotsReleased(ctx context.Context, active []int) error {
+	if len(active) == 0 {
+		return nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			m.commitCond.Broadcast()
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	m.waitMu.Lock()
+	defer m.waitMu.Unlock()
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		allDone := true
+		for _, i := range active {
+			s := &m.procArray.slots[i]
+			if s.inTxn.Load() == 1 && s.pinnedSnap.Load() {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			return nil
+		}
+		m.commitCond.Wait()
+	}
+}
+
+// ReleasePinnedSnapshot clears the transaction-pinned snapshot marker on the
+// slot identified by handle without ending the transaction (inTxn stays 1). It
+// is called when a statement errors at the top level of an explicit transaction
+// (no open savepoint), mirroring PostgreSQL's AbortTransaction releasing the
+// transaction snapshot at abort: the aborted transaction can only ROLLBACK from
+// here, so its RR/SSI snapshot will never be used again and a concurrent waiter
+// (WaitForPinnedSnapshotsReleased, e.g. DETACH PARTITION CONCURRENTLY) must stop
+// waiting for it. The broadcast wakes any such waiter to re-check. A no-op when
+// the slot held no pinned snapshot (RC sessions, or a slot already released).
+// Design 0118-0063 (M0118-0008 detach-partition-concurrently-4).
+func (m *Manager) ReleasePinnedSnapshot(handle TxnHandle) {
+	idx := int(handle) - 1
+	if idx < 0 || idx >= len(m.procArray.slots) {
+		return
+	}
+	s := &m.procArray.slots[idx]
+	if s.pinnedSnap.Swap(false) {
+		m.waitMu.Lock()
+		m.commitCond.Broadcast()
+		m.waitMu.Unlock()
+	}
+}
+
+// SnapshotActiveOtherPinnedSlots is SnapshotActiveOtherSlots filtered to slots
+// that hold a transaction-pinned (RR/SSI) snapshot. See
+// WaitForPinnedSnapshotsToCommit.
+func (m *Manager) SnapshotActiveOtherPinnedSlots(selfHandle TxnHandle) []int {
+	selfIdx := int(selfHandle) - 1 // Handle = procNum+1
+	active := make([]int, 0, 4)
+	for i := range m.procArray.slots {
+		if i == selfIdx {
+			continue
+		}
+		s := &m.procArray.slots[i]
+		if s.inTxn.Load() == 1 && s.pinnedSnap.Load() {
+			active = append(active, i)
+		}
+	}
+	return active
+}
+
+// SnapshotActiveOtherSlots returns the indices of every backend slot that is
+// currently in an active transaction (inTxn==1), excluding the caller's own
+// slot (selfHandle). Capturing the active set is split from the wait so a
+// caller can snapshot at one point (e.g. the start of CREATE INDEX
+// CONCURRENTLY, before it might itself block) and drain that fixed set later.
+// Waiting on a start-time snapshot — rather than re-scanning at wait time —
+// prevents two CONCURRENTLY builds that begin nearly simultaneously from each
+// waiting on the other (a mutual wait): each only ever waits for transactions
+// that were already running when it started.
+func (m *Manager) SnapshotActiveOtherSlots(selfHandle TxnHandle) []int {
+	selfIdx := int(selfHandle) - 1 // Handle = procNum+1
 	active := make([]int, 0, 4)
 	for i := range m.procArray.slots {
 		if i == selfIdx {
@@ -615,6 +765,14 @@ func (m *Manager) WaitForOlderSlotsToCommit(ctx context.Context, selfHandle TxnH
 			active = append(active, i)
 		}
 	}
+	return active
+}
+
+// WaitForSlotsToCommit blocks until every slot in active has finished its
+// transaction (inTxn back to 0), or ctx is cancelled. The active set is the
+// caller's responsibility to capture (see SnapshotActiveOtherSlots). A nil/empty
+// set returns immediately.
+func (m *Manager) WaitForSlotsToCommit(ctx context.Context, active []int) error {
 	if len(active) == 0 {
 		return nil
 	}
@@ -669,7 +827,31 @@ func (m *Manager) IsXIDActive(xid storage.TransactionID) bool {
 	if xid == storage.InvalidTransactionID {
 		return false
 	}
-	return m.xidInProgress(xid)
+	return m.xidActiveWithSubxact(xid)
+}
+
+// xidActiveWithSubxact reports whether xid belongs to a currently-running
+// transaction, treating a subtransaction xid as active iff its top-level parent
+// is still running AND the subxid has not been individually rolled back
+// (ROLLBACK TO SAVEPOINT). Subxact xids are deliberately not held in the
+// proc-array (see AllocateSubXid), so xidInProgress alone reports every subxid
+// as dead; row-lock liveness (executor activeLockHolders / WaitForXID) needs the
+// resolved view so a lock acquired inside a savepoint keeps blocking conflicting
+// waiters until that savepoint is released or rolled back. The top-level fast
+// path returns first, so behaviour for ordinary (non-subxact) xids is byte-for-
+// byte unchanged. execRollbackTo marks every discarded savepoint level aborted,
+// so a per-subxid IsAborted check is sufficient (no ancestry walk needed).
+// M0118-0004 (docs/design/0118-0012).
+func (m *Manager) xidActiveWithSubxact(xid storage.TransactionID) bool {
+	if m.xidInProgress(xid) {
+		return true
+	}
+	top := m.TopLevelXid(xid)
+	if top == xid {
+		// Not a subxid (or unresolved) — already shown not in progress above.
+		return false
+	}
+	return m.xidInProgress(top) && !m.IsAborted(xid)
 }
 
 // HasAbortedXID reports whether xid is recorded in the manager's aborted
@@ -848,11 +1030,12 @@ func (m *Manager) captureSnapshot() Snapshot {
 	m.abortedMu.RUnlock()
 
 	return Snapshot{
-		Xmin:       xmin,
-		Xmax:       xmax,
-		InProgress: inProgress,
-		Aborted:    aborted,
-		clog:       clog,
+		Xmin:                 xmin,
+		Xmax:                 xmax,
+		InProgress:           inProgress,
+		Aborted:              aborted,
+		clog:                 clog,
+		PartitionDetachEpoch: CurrentPartitionDetachEpoch(),
 	}
 }
 

@@ -257,6 +257,7 @@
 #application_name = ''                  # session label echoed in pg_stat_activity
 #session_authorization = ''             # role identity for the session
 #vacuum_freeze_min_age = 50000000       # 0-1000000000 xids
+#vacuum_multixact_freeze_min_age = 5000000  # 0-1000000000 multixacts
 
 # - Locale and Formatting -
 
@@ -289,6 +290,8 @@
                                         # (SIGHUP to apply)
 #max_prepared_transactions = 0          # 0-262143; zero disables 2PC
                                         # (change requires restart)
+#deadlock_timeout = 1000                # 1-2147483647 ms; wait before
+                                        # running the deadlock detector
 
 
 #------------------------------------------------------------------------------
@@ -299,6 +302,11 @@
                                         # CREATE TABLESPACE ... LOCATION ''
                                         # to create a tablespace directly
                                         # inside pg_tblspc (for testing)
+#allow_system_table_mods = off          # developer-only: permits modifying
+                                        # the structure of system tables;
+                                        # recognised as a no-op (goopg gates
+                                        # no catalog change on it) so test
+                                        # setups that SET it succeed
 #debug_parallel_query = off             # off, on, regress; no-op in goopg
                                         # (no parallel executor) — accepted so
                                         # test scripts that force parallel

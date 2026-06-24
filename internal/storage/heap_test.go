@@ -227,6 +227,49 @@ func TestPageSetHeapTupleLockOnlyInvalidSlot(t *testing.T) {
 	}
 }
 
+// TestPageSetHeapTupleLockKeysUpdated round-trips the HEAP_KEYS_UPDATED
+// infomask2 bit the row-lock producer sets for a FOR UPDATE lock (and clears
+// for the weaker strengths so a stale bit from a prior FOR UPDATE lock on the
+// same line pointer can't mis-decode a later FOR NO KEY UPDATE holder as FOR
+// UPDATE). M0118-0003.
+func TestPageSetHeapTupleLockKeysUpdated(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	tuple := NewHeapTuple(TransactionID(100), InvalidTransactionID, []byte("v"))
+	slot, err := PageAddHeapTuple(p, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// FOR UPDATE: lock-only ExclLock + KEYS_UPDATED.
+	if err := PageSetHeapTupleLockOnly(p, slot, TransactionID(7), HeapXmaxExclLock); err != nil {
+		t.Fatal(err)
+	}
+	if err := PageSetHeapTupleLockKeysUpdated(p, slot, true); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := PageGetHeapTuple(p, slot)
+	if got.Header.Infomask2&HeapKeysUpdated == 0 {
+		t.Errorf("Infomask2 = %#x, KEYS_UPDATED should be set for FOR UPDATE", got.Header.Infomask2)
+	}
+	// Re-lock FOR NO KEY UPDATE on the same line pointer: the stale bit must clear.
+	if err := PageSetHeapTupleLockOnly(p, slot, TransactionID(8), HeapXmaxExclLock); err != nil {
+		t.Fatal(err)
+	}
+	if err := PageSetHeapTupleLockKeysUpdated(p, slot, false); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = PageGetHeapTuple(p, slot)
+	if got.Header.Infomask2&HeapKeysUpdated != 0 {
+		t.Errorf("Infomask2 = %#x, KEYS_UPDATED should have cleared for FOR NO KEY UPDATE", got.Header.Infomask2)
+	}
+	// Invalid slots behave like the sibling helpers.
+	if err := PageSetHeapTupleLockKeysUpdated(p, 0, true); !errors.Is(err, ErrInvalidSlot) {
+		t.Errorf("slot 0 err = %v, want ErrInvalidSlot", err)
+	}
+}
+
 // TestPageSetHeapTupleMovedPartition pins the storage primitive added
 // for cross-partition UPDATE (M0100-0005n): stamping the
 // moved-to-another-partition sentinel sets xmax, writes
@@ -275,6 +318,65 @@ func TestPageSetHeapTupleMovedPartition(t *testing.T) {
 	}
 }
 
+// TestPageStampHotOldTupleMulti pins the MultiXact-bearing HOT-update stamp
+// (M0118-0004 producer): a no-key UPDATE whose old tuple already carries a
+// non-conflicting FOR KEY SHARE locker preserves it into a {updater + survivors}
+// MultiXactId. The stamp must set xmax to the multi id, OR in the multi hint
+// bits (HEAP_XMAX_IS_MULTI), clear HEAP_XMAX_LOCK_ONLY, set HEAP_HOT_UPDATED,
+// refresh HEAP_KEYS_UPDATED from infomask2Bits, write the HOT chain CTID, and
+// advance pd_prune_xid from the *updater* xid (the multi id is not a
+// TransactionID).
+func TestPageStampHotOldTupleMulti(t *testing.T) {
+	p := make(Page, BlockSize)
+	if err := InitPage(p); err != nil {
+		t.Fatal(err)
+	}
+	tuple := NewHeapTuple(TransactionID(100), InvalidTransactionID, []byte("old"))
+	// Pre-set a stale lock-only key-share stamp; the multi stamp must clear it.
+	tuple.Header.Infomask = HeapXmaxLockOnly | HeapXmaxKeyShrLock
+	slot, err := PageAddHeapTuple(p, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const multi = TransactionID(0x50000001)
+	const updater = TransactionID(0x1234)
+	const newSlot = uint16(7)
+	const newBlk = BlockNumber(3)
+	infomaskBits := uint16(HeapXmaxIsMulti | HeapXmaxExclLock)
+	infomask2Bits := uint16(HeapKeysUpdated)
+	if err := PageStampHotOldTupleMulti(p, slot, multi, infomaskBits, infomask2Bits, updater, newBlk, newSlot); err != nil {
+		t.Fatal(err)
+	}
+	got, err := PageGetHeapTuple(p, slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Header.Xmax != multi {
+		t.Errorf("Xmax = %#x, want multi %#x", got.Header.Xmax, multi)
+	}
+	if got.Header.Infomask&HeapXmaxIsMulti == 0 {
+		t.Errorf("Infomask = %#x, HEAP_XMAX_IS_MULTI should be set", got.Header.Infomask)
+	}
+	if got.Header.Infomask&HeapXmaxLockOnly != 0 {
+		t.Errorf("Infomask = %#x, HEAP_XMAX_LOCK_ONLY should have cleared", got.Header.Infomask)
+	}
+	if got.Header.Infomask&HeapHotUpdated == 0 {
+		t.Errorf("Infomask = %#x, HEAP_HOT_UPDATED should be set", got.Header.Infomask)
+	}
+	if got.Header.Infomask2&HeapKeysUpdated == 0 {
+		t.Errorf("Infomask2 = %#x, HEAP_KEYS_UPDATED should be set", got.Header.Infomask2)
+	}
+	if got.Header.CTID.Block != newBlk || got.Header.CTID.Offset != newSlot {
+		t.Errorf("CTID = %+v, want {%d,%d}", got.Header.CTID, newBlk, newSlot)
+	}
+	if pxid := MustHeader(p).PruneXID(); pxid != uint32(updater) {
+		t.Errorf("PruneXID = %d, want updater %d", pxid, uint32(updater))
+	}
+	// Invalid slot behaves like the sibling helpers.
+	if err := PageStampHotOldTupleMulti(p, 0, multi, infomaskBits, infomask2Bits, updater, newBlk, newSlot); !errors.Is(err, ErrInvalidSlot) {
+		t.Errorf("slot 0 err = %v, want ErrInvalidSlot", err)
+	}
+}
 
 // TestPageSetHeapTupleCtid verifies that PageSetHeapTupleCtid updates only
 // the t_ctid field of an existing tuple — used by non-HOT cross-page UPDATE

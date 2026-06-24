@@ -86,7 +86,7 @@ func TestPort_IsolationReadWriteUnique(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-write-unique.spec")
 }
 
 // TestPort_IsolationReadWriteUnique2 exercises read-write-unique-2: two SSI
@@ -97,7 +97,7 @@ func TestPort_IsolationReadWriteUnique2(t *testing.T) {
 	c := newCluster(t, "iso_rw_unique2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-2.spec")
 }
 
 // TestPort_IsolationReadWriteUnique3 exercises read-write-unique-3 (bug 9301):
@@ -107,7 +107,7 @@ func TestPort_IsolationReadWriteUnique3(t *testing.T) {
 	c := newCluster(t, "iso_rw_unique3")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-3.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-3.spec")
 }
 
 // TestPort_IsolationReadWriteUnique4 exercises read-write-unique-4: a gapless
@@ -118,7 +118,7 @@ func TestPort_IsolationReadWriteUnique4(t *testing.T) {
 	c := newCluster(t, "iso_rw_unique4")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-4.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-write-unique-4.spec")
 }
 
 // TestPort_IsolationLockCommittedUpdate exercises a spec that produces <waiting ...>
@@ -129,7 +129,7 @@ func TestPort_IsolationLockCommittedUpdate(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-committed-update.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/lock-committed-update.spec")
 }
 
 // runIsoSpec is a helper that runs one spec and logs the diff when output
@@ -156,6 +156,29 @@ func runIsoSpec(t *testing.T, root string, c *cluster.Cluster, specRelPath strin
 	default:
 		t.Errorf("unexpected status %q", result.Status)
 	}
+}
+
+// runIsoSpecStrict is the pass-required variant of runIsoSpec: the spec MUST
+// match PG 18.3 byte-for-byte. Unlike runIsoSpec (which t.Skip()s a `defer`
+// result so an unported spec does not turn the suite red), a non-`pass` status
+// here is a hard test failure. Use it only for specs that have been promoted to
+// pass_required in docs/test-port (D-002) — a regression must surface as a red
+// test, not a silent skip.
+func runIsoSpecStrict(t *testing.T, root string, c *cluster.Cluster, specRelPath string) {
+	t.Helper()
+	dsn := buildDSN(t, c)
+	runner := &framework.IsolationRunner{DSN: dsn}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	result := runner.RunAndCompare(ctx, root, specRelPath)
+	if result.Status != "pass" {
+		t.Errorf("pass-required spec %s did not match PG (status=%q):\n%s",
+			specRelPath, result.Status, result.Diff)
+		return
+	}
+	t.Logf("PASS: %s", specRelPath)
 }
 
 // ── M0096-0001 dedicated sequential isolation tests ──────────────────────────
@@ -203,7 +226,7 @@ func TestPort_IsolationLockCommittedKeyupdate(t *testing.T) {
 	c := newCluster(t, "iso_lock_keyupdate")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/lock-committed-keyupdate.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/lock-committed-keyupdate.spec")
 }
 
 // TestPort_IsolationInsertConflictDoUpdate exercises the insert-conflict-do-update spec.
@@ -223,7 +246,7 @@ func TestPort_IsolationInsertConflictDoUpdate2(t *testing.T) {
 	c := newCluster(t, "iso_icd_update2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-2.spec")
 }
 
 // TestPort_IsolationInsertConflictDoUpdate3 exercises the insert-conflict-do-update-3 spec.
@@ -233,7 +256,7 @@ func TestPort_IsolationInsertConflictDoUpdate3(t *testing.T) {
 	c := newCluster(t, "iso_icd_update3")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-3.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-3.spec")
 }
 
 // TestPort_IsolationInsertConflictDoUpdate4 exercises the insert-conflict-do-update-4 spec.
@@ -243,7 +266,7 @@ func TestPort_IsolationInsertConflictDoUpdate4(t *testing.T) {
 	c := newCluster(t, "iso_icd_update4")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-4.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-update-4.spec")
 }
 
 // TestPort_IsolationInsertConflictDoNothing exercises the insert-conflict-do-nothing spec.
@@ -266,7 +289,7 @@ func TestPort_IsolationInsertConflictDoNothing2(t *testing.T) {
 	c := newCluster(t, "iso_icd_nothing2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-nothing-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-do-nothing-2.spec")
 }
 
 // TestPort_IsolationInsertConflictSpecconflict exercises the insert-conflict-specconflict spec.
@@ -276,17 +299,431 @@ func TestPort_IsolationInsertConflictSpecconflict(t *testing.T) {
 	c := newCluster(t, "iso_icd_specconf")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-specconflict.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/insert-conflict-specconflict.spec")
 }
 
 // TestPort_IsolationDropIndexConcurrently1 exercises the drop-index-concurrently-1 spec.
 // Requires: BEGIN ISOLATION LEVEL, DROP INDEX CONCURRENTLY.
+//
+// PASS-REQUIRED (M0118-0007, design 0118-0024): the spec matches PG 18.3
+// byte-for-byte. DROP INDEX CONCURRENTLY's two-phase invalidation, the
+// EXPLAIN-driven plan-format output (seqscan-vs-indexscan after the index is
+// dropped), and READ COMMITTED snapshot visibility were already correct from
+// prior milestones; this is a promotion with no engine change.
 func TestPort_IsolationDropIndexConcurrently1(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_drop_idx_cc")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/drop-index-concurrently-1.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/drop-index-concurrently-1.spec")
+}
+
+// TestPort_IsolationCreateTrigger exercises the create-trigger spec
+// (M0118-0008). CREATE TRIGGER takes a transaction-scoped ShareRowExclusiveLock
+// on the table; a concurrent UPDATE (RowExclusiveLock) blocks until the
+// CREATE TRIGGER transaction commits, while a concurrent SELECT ... FOR UPDATE
+// (RowShareLock) proceeds — byte-identical to PG 18.3.
+func TestPort_IsolationCreateTrigger(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_create_trigger")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/create-trigger.spec")
+}
+
+// TestPort_IsolationInheritTemp exercises the inherit-temp spec (M0118-0008):
+// an inheritance tree whose children are TEMPORARY tables created in different
+// sessions. Each backend owns its own temp namespace, so s1's scan/UPDATE/
+// DELETE/TRUNCATE of the persistent parent must include its own temp child but
+// exclude s2's (RELATION_IS_OTHER_TEMP). goopg keeps all relations in one
+// shared catalog; the per-session TempOwner token (design 0118-0036) plus the
+// AccessibleInheritanceChildren filter wired at the planner SELECT site and the
+// executor UPDATE/DELETE/UPDATE…FROM/TRUNCATE expansion sites (design 0118-0037)
+// reproduce PG 18.3 byte-for-byte across all nine permutations, including the
+// last two where TRUNCATE inh_parent in s1 blocks s2's scan of the parent but
+// not s2's scan of its own temp child.
+func TestPort_IsolationInheritTemp(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_inherit_temp")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/inherit-temp.spec")
+}
+
+// TestPort_IsolationTruncateConflict exercises the truncate-conflict spec
+// (M0118-0008, design 0118-0039). A role created with CREATE ROLE has no
+// privileges on a table it does not own, so TRUNCATE under SET ROLE fails
+// immediately with "permission denied for table truncate_tab" (42501) WITHOUT
+// waiting for a lock; after GRANT TRUNCATE the command succeeds and instead
+// blocks behind a concurrent session holding the table open. Requires the
+// catalog ACL store (Catalog.GrantTablePrivilege / HasTablePrivilege), SET/RESET
+// ROLE tracking the effective role, an autocommit table-level GRANT recorder,
+// and the pre-lock TRUNCATE privilege check in execTruncate — byte-identical to
+// PG 18.3 across all eight permutations.
+func TestPort_IsolationTruncateConflict(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_truncate_conflict")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/truncate-conflict.spec")
+}
+
+// TestPort_IsolationSequenceDdl exercises the sequence-ddl spec (M0118-0008).
+// nextval() takes a transaction-scoped RowExclusiveLock on the sequence
+// relation and ALTER SEQUENCE takes an AccessExclusiveLock; the two conflict,
+// so a concurrent nextval blocks while another session is mid-ALTER SEQUENCE
+// and a later ALTER SEQUENCE waits for an in-progress nextval to commit —
+// byte-identical to PG 18.3 across all five permutations.
+func TestPort_IsolationSequenceDdl(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_sequence_ddl")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/sequence-ddl.spec")
+}
+
+// TestPort_IsolationReindexConcurrently exercises the reindex-concurrently spec
+// (M0118-0008). REINDEX TABLE CONCURRENTLY waits for every transaction holding a
+// lock on the table to finish (the WaitForLockers analog, waitForRelationLockers)
+// without itself blocking concurrent reads or writes, so a REINDEX issued while
+// another session has the table open reports `<waiting ...>` and completes only
+// after that transaction commits — byte-identical to PG 18.3 across all six
+// permutations.
+func TestPort_IsolationReindexConcurrently(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_reindex_conc")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/reindex-concurrently.spec")
+}
+
+func TestPort_IsolationReindexSchema(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_reindex_schema")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/reindex-schema.spec")
+}
+
+// TestPort_IsolationMultipleCic exercises the multiple-cic spec (M0118-0008):
+// two CREATE INDEX CONCURRENTLY builds running simultaneously, each with a
+// partial-index predicate that calls an IMMUTABLE advisory-lock function.
+//
+// PASS-REQUIRED (design 0118-0031). Two engine changes: (1) a partial-index
+// predicate that references no table columns is const-folded — evaluated once
+// at build time, mirroring PostgreSQL's eval_const_expressions in
+// BuildIndexInfo — so the predicate's advisory-lock call fires even though the
+// table is empty, making s1i block; (2) CREATE INDEX CONCURRENTLY waits for the
+// transactions that were already running when it started to drain before it
+// completes (a start-time snapshot of active slots, drained after the build),
+// so the second build (s2i) completes only after the first (s1i), matching
+// PG 18.3 byte-for-byte.
+func TestPort_IsolationMultipleCic(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_multiple_cic")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/multiple-cic.spec")
+}
+
+// TestPort_IsolationAlterTable3 exercises the alter-table-3 spec (M0118-0008):
+// ALTER TABLE ... ENABLE/DISABLE TRIGGER mixed with concurrent writes and
+// SELECT ... FOR UPDATE.
+//
+// PASS-REQUIRED (design 0118-0032). Two fixes: (1) ALTER TABLE ENABLE/DISABLE
+// TRIGGER now takes a transaction-scoped ShareRowExclusiveLock (mirrors
+// PostgreSQL's AlterTableGetLockLevel), so a concurrent INSERT (RowExclusiveLock)
+// blocks until the ALTER transaction commits while a concurrent SELECT ... FOR
+// UPDATE (RowShareLock) proceeds; (2) when a statement errors at the top level
+// of a transaction the aborted transaction's table locks are released
+// immediately (mirrors PostgreSQL's AbortTransaction releasing locks at abort,
+// not at the explicit ROLLBACK), so a later conflicting ALTER in another session
+// does not wait on the aborted transaction. Byte-identical to PG 18.3.
+func TestPort_IsolationAlterTable3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_alter_table_3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-3.spec")
+}
+
+// TestPort_IsolationAlterTable2 exercises the alter-table-2 spec (M0118-0008):
+// ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID mixed with
+// concurrent writes and SELECT ... FOR UPDATE on both the referencing and
+// referenced tables.
+//
+// PASS-REQUIRED (design 0118-0046). Two changes: (1) the ALTER TABLE ADD
+// FOREIGN KEY parser now accepts the NOT VALID trailer (any order with
+// [NOT] DEFERRABLE), recording convalidated='f' in pg_constraint; (2) ADD
+// CONSTRAINT takes a transaction-scoped ShareRowExclusiveLock on the altered
+// table (AlterTableGetLockLevel → AT_AddConstraint), so a concurrent INSERT
+// (RowExclusiveLock) blocks until the ALTER transaction commits while a
+// concurrent SELECT ... FOR UPDATE (RowShareLock) proceeds. Byte-identical to
+// PG 18.3 across all 48 permutations.
+func TestPort_IsolationAlterTable2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_alter_table_2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-2.spec")
+}
+
+// TestPort_IsolationAlterTable1 exercises the alter-table-1 spec (M0118-0008):
+// ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID followed by
+// ALTER TABLE ... VALIDATE CONSTRAINT, mixed with concurrent reads, writes,
+// and an INSERT.
+//
+// PASS-REQUIRED (design 0118-0047). One new piece on top of alter-table-2's
+// ADD FK NOT VALID: VALIDATE CONSTRAINT now parses and takes only a
+// transaction-scoped ShareUpdateExclusiveLock (AlterTableGetLockLevel →
+// AT_ValidateConstraint), which does NOT conflict with concurrent reads
+// (AccessShareLock) or writes (RowExclusiveLock) — so the only blocking in the
+// spec is a concurrent INSERT waiting on the uncommitted ADD CONSTRAINT's
+// ShareRowExclusiveLock, exactly as in alter-table-2. Byte-identical to PG 18.3
+// across all permutations.
+func TestPort_IsolationAlterTable1(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_alter_table_1")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-1.spec")
+}
+
+// TestPort_IsolationPlpgsqlToast exercises the plpgsql-toast spec (M0118-0008):
+// PL/pgSQL procedures with transaction control (COMMIT inside a DO block) where
+// VACUUM in a second session — synchronized via advisory locks — runs between a
+// variable's last assignment and its use, exercising the six assignment code
+// paths plus a fetch-after-commit case.
+//
+// PASS-REQUIRED (design 0118-0054). Two final pieces on top of 0118-0049..0053:
+// (1) a FOR-query loop now materializes its rows up front so the loop survives a
+// DELETE/COMMIT in its body (PG holds the implicit cursor's snapshot across the
+// commit) — fixes assign6's three iterations; (2) SELECT … INTO inside a body now
+// substitutes PL/pgSQL frame variables including record-field refs (r.a) before
+// planning — fixes fetch-after-commit. Byte-identical to PG 18.3 across all
+// permutations. goopg stores text inline (no external TOAST chunk to orphan), so
+// the detoast-correctness the spec guards is satisfied structurally.
+func TestPort_IsolationPlpgsqlToast(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_plpgsql_toast")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/plpgsql-toast.spec")
+}
+
+// TestPort_IsolationVacuumSkipLocked exercises the vacuum-skip-locked spec
+// (M0118-0008). VACUUM/ANALYZE (SKIP_LOCKED) take a conditional per-relation
+// lock: a relation held by another session is skipped — with a WARNING when
+// named explicitly, silently when reached by partition expansion. ANALYZE of a
+// partitioned parent then reads each leaf partition under a blocking
+// AccessShareLock for inheritance stats, so it waits on a child locked in
+// ACCESS EXCLUSIVE (but not SHARE).
+func TestPort_IsolationVacuumSkipLocked(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_vacuum_skip_locked")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-skip-locked.spec")
+}
+
+// TestPort_IsolationVacuumConcurrentDrop exercises the vacuum-concurrent-drop
+// spec (M0118-0008). Without SKIP_LOCKED, VACUUM/ANALYZE take a blocking
+// per-relation ShareUpdateExclusiveLock, so they wait behind a concurrent
+// LOCK ... IN SHARE MODE; after the wait a target dropped by the committing
+// session is re-detected and skipped — with a "relation no longer exists"
+// WARNING for an explicitly named target, silently for an expanded partition
+// child.
+func TestPort_IsolationVacuumConcurrentDrop(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_vacuum_concurrent_drop")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-concurrent-drop.spec")
+}
+
+// TestPort_IsolationVacuumConflict exercises the vacuum-conflict spec
+// (M0118-0008). VACUUM/ANALYZE perform a maintenance-privilege check
+// (vacuum_is_permitted_to_vacuum) BEFORE taking any lock: a non-superuser
+// session (SET ROLE) that does not own the table skips it immediately with a
+// "permission denied to vacuum/analyze ... skipping it" WARNING (no wait). After
+// ALTER TABLE ... OWNER TO grants ownership, VACUUM/ANALYZE are permitted and
+// block on a conflicting LOCK ... IN SHARE UPDATE EXCLUSIVE MODE until commit.
+// Byte-identical to PG 18.3.
+func TestPort_IsolationVacuumConflict(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_vacuum_conflict")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-conflict.spec")
+}
+
+// TestPort_IsolationClusterConflict exercises the cluster-conflict spec
+// (M0118-0008). The table is owned by the test role (ALTER TABLE OWNER TO in
+// setup), so CLUSTER is permitted; it takes an AccessExclusiveLock and therefore
+// blocks behind a concurrent LOCK ... IN SHARE UPDATE EXCLUSIVE MODE until that
+// holder commits, then completes. Byte-identical to PG 18.3.
+func TestPort_IsolationClusterConflict(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_cluster_conflict")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/cluster-conflict.spec")
+}
+
+// TestPort_IsolationClusterConflictPartition exercises the
+// cluster-conflict-partition spec (M0118-0008). CLUSTER of a partitioned table
+// owned by the test role (ALTER TABLE OWNER TO does NOT recurse to partition
+// children — tablecmds.c AT_ChangeOwner "never recurses") behaves as:
+//   - CLUSTER takes an AccessExclusiveLock on the named PARENT, so it blocks
+//     behind a concurrent LOCK cluster_part_tab IN SHARE UPDATE EXCLUSIVE MODE
+//     and completes once the holder commits (permutations 1, 2).
+//   - When only a partition LEAF is locked, CLUSTER never touches it: upstream
+//     skips every leaf the role does not own (the children stay owned by the
+//     bootstrap superuser; cluster_is_permitted_for_relation returns false, the
+//     WARNING suppressed by client_min_messages=ERROR), and goopg's CLUSTER is a
+//     no-op rewrite that only locks the named parent — so the locked leaf is
+//     irrelevant and CLUSTER completes immediately (permutations 3, 4).
+//
+// Byte-identical to PG 18.3 with no engine change (rides the cluster-conflict
+// AccessExclusiveLock from design 0118-0040 + existing partition catalog).
+func TestPort_IsolationClusterConflictPartition(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_cluster_conflict_partition")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/cluster-conflict-partition.spec")
+}
+
+// TestPort_IsolationDetachPartitionConcurrently1 exercises the
+// detach-partition-concurrently-1 spec (M0118-0008). ALTER TABLE … DETACH
+// PARTITION … CONCURRENTLY makes the partition invisible at the correct,
+// snapshot-relative time:
+//   - Phase 1 bumps a global partition-detach epoch (mvcc) and stamps the child
+//     detach-pending, KEEPING it registered (relpartbound stays set, so s3i reads
+//     `relpartbound IS NULL` = f). Every snapshot taken afterwards captures the
+//     higher epoch and omits the child (READ COMMITTED — gone immediately) while a
+//     snapshot taken before still includes it (REPEATABLE READ — visible until
+//     commit). Both the SELECT planner expansion (collectAllPartitionLeaves) and
+//     INSERT routing (routeToPartitionDepth) filter through
+//     catalog.VisiblePartitionChildren by the snapshot epoch, so s3's INSERT of a
+//     row that would route to the detached partition fails with "no partition
+//     found" exactly as the SELECT omits it.
+//   - The detacher then waits via a HYBRID of relation-locker draining (READ
+//     COMMITTED sessions that touched the table) and pinned-snapshot draining
+//     (WaitForPinnedSnapshotsToCommit — a REPEATABLE READ session that only
+//     PREPAREd a statement is still waited for), rendered as `<waiting ...>` by
+//     the runner's timing. Design 0118-0060.
+//   - Phase 2 unregisters the child, clears relpartbound (now NULL, so s3i flips
+//     f→t), and clears the pending mark.
+//
+// The cross-session plan cache is bypassed while any detach is pending
+// (partitionDetachPending), so each statement re-plans against its own snapshot
+// epoch. Byte-identical to PG 18.3 across all 13 permutations. Design 0118-0059.
+func TestPort_IsolationDetachPartitionConcurrently1(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_detach_partition_1")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/detach-partition-concurrently-1.spec")
+}
+
+// TestPort_IsolationDetachPartitionConcurrently2 exercises the
+// detach-partition-concurrently-2 spec (M0118-0008): DETACH PARTITION
+// CONCURRENTLY makes the partition safe for a foreign key that references the
+// partitioned table. Three behaviours, all snapshot-relative:
+//   - A concurrent INSERT into the referencing table of a value that lives only
+//     in the detaching partition fails its FK check (23503): the partition is
+//     invisible to the inserter's snapshot, so the FK existence scan
+//     (assertParentExists → allDescendants filtered by ctx.Snap.PartitionDetachEpoch)
+//     does not find the parent key. A value in a still-attached partition succeeds.
+//   - If a referencing row already exists (committed before the detach) whose
+//     key routes to the detaching partition, the DETACH itself fails synchronously
+//     with `removing partition … violates foreign key constraint <fkname>_<N>`
+//     (RI_PartitionRemove_Check; detachPartitionFKRefCheck), N being the child's
+//     ordinal among the parent's partitions.
+//   - The detacher does NOT wait for a READ COMMITTED session that only issued
+//     BEGIN (it holds no relation lock and no pinned snapshot), but does wait for
+//     one that read the partitioned table (txn-scoped relation lock). Hybrid wait.
+//
+// Byte-identical to PG 18.3 across all 5 permutations. Design 0118-0060.
+func TestPort_IsolationDetachPartitionConcurrently2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_detach_partition_2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/detach-partition-concurrently-2.spec")
+}
+
+// TestPort_IsolationDetachPartitionConcurrently3 exercises the
+// detach-partition-concurrently-3 spec (M0118-0008): things that may happen to
+// a partition left in an "incomplete detach" state — a DETACH PARTITION
+// CONCURRENTLY that was cancelled (pg_cancel_backend) while it waited. Across
+// all 18 permutations, byte-identical to PG 18.3:
+//   - The cancel LEAVES the partition detach-pending (no revert): it is omitted
+//     from the parent for every newer snapshot, so INSERT into the parent of a
+//     value that lived only in it fails "no partition found"; a REPEATABLE READ
+//     session whose snapshot predates the detach still sees it.
+//   - pg_partition_tree omits the pending child from the parent and reports it as
+//     a standalone root (NULL parent); ALTER on it errors 55000 "cannot alter
+//     partition … with an incomplete detach"; a second concurrent DETACH errors
+//     55000 "partition … already pending detach".
+//   - TRUNCATE of the parent skips it; DROP of the parent still drops it; DROP of
+//     the pending child grabs an AccessExclusiveLock on the parent (so a
+//     concurrent parent SELECT blocks); DETACH … FINALIZE completes it, taking an
+//     AccessExclusiveLock on the partition (a concurrent read/insert of the
+//     partition blocks until FINALIZE's transaction commits, but a parent scan
+//     does not).
+//
+// Design 0118-0061.
+func TestPort_IsolationDetachPartitionConcurrently3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_detach_partition_3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/detach-partition-concurrently-3.spec")
+}
+
+// TestPort_IsolationDetachPartitionConcurrently4 exercises the
+// detach-partition-concurrently-4 spec (M0118-0008): foreign keys in the face
+// of concurrent DETACH PARTITION … CONCURRENTLY of the referenced table. Across
+// all 21 permutations, byte-identical to PG 18.3:
+//   - Inserting/updating a value that lives only in a concurrently-detaching
+//     partition fails its FK check even under REPEATABLE READ, because the RI
+//     existence query observes the current detach epoch (design 0118-0062),
+//     while a cursor/SELECT in the same RR txn still sees that very row.
+//   - An UPDATE that sets an FK column fires the RI parent-existence check
+//     (RI_FKey_check) just like an INSERT, so `update d4_fk set a = 1 where
+//     current of f` (value 1 invisible in the detaching partition) raises 23503
+//     (design 0118-0064, Fix 1).
+//   - When the referencing row is created/updated by a concurrent session that
+//     the detacher waits on, the detach re-validates RI_PartitionRemove_Check
+//     after the wait (fresh snapshot, routing the pending child back in) and
+//     fails "removing partition … violates foreign key constraint …_1"
+//     (design 0118-0064, Fix 2).
+//   - Cursor pinning at DECLARE + abort-releases-snapshot + cancel-message
+//     mapping (design 0118-0063).
+func TestPort_IsolationDetachPartitionConcurrently4(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_detach_partition_4")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/detach-partition-concurrently-4.spec")
+}
+
+// TestPort_IsolationVacuumNoCleanupLock exercises the vacuum-no-cleanup-lock
+// spec (M0118-0008). It asserts that pg_class.relpages / reltuples reflect what
+// VACUUM observes, even when a concurrent backend (a cursor holding a heap-page
+// pin) prevents VACUUM from acquiring a cleanup lock. goopg publishes reltuples
+// from a fresh-snapshot visible-tuple count (vac_update_relstats) so a recently
+// dead tuple — deleted and committed but not yet removable because the pin
+// holder holds OldestXmin back — is excluded from reltuples, matching PG 18.3.
+// The vacuumer session also SETs vacuum_multixact_freeze_min_age (new GUC).
+func TestPort_IsolationVacuumNoCleanupLock(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_vacuum_no_cleanup")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-no-cleanup-lock.spec")
 }
 
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
@@ -296,7 +733,7 @@ func TestPort_IsolationFkSnapshot(t *testing.T) {
 	c := newCluster(t, "iso_fk_snapshot")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/fk-snapshot.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-snapshot.spec")
 }
 
 // TestPort_IsolationPartitionKeyUpdate1 exercises the partition-key-update-1 spec.
@@ -346,7 +783,7 @@ func TestPort_IsolationMergeUpdate(t *testing.T) {
 	c := newCluster(t, "iso_merge_update")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-update.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/merge-update.spec")
 }
 
 // TestPort_IsolationMergeDelete exercises the merge-delete spec.
@@ -356,7 +793,7 @@ func TestPort_IsolationMergeDelete(t *testing.T) {
 	c := newCluster(t, "iso_merge_delete")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-delete.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/merge-delete.spec")
 }
 
 // TestPort_IsolationMergeInsertUpdate exercises the merge-insert-update spec.
@@ -366,7 +803,7 @@ func TestPort_IsolationMergeInsertUpdate(t *testing.T) {
 	c := newCluster(t, "iso_merge_ins_upd")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-insert-update.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/merge-insert-update.spec")
 }
 
 // TestPort_IsolationMergeMatchRecheck exercises the merge-match-recheck spec.
@@ -376,7 +813,7 @@ func TestPort_IsolationMergeMatchRecheck(t *testing.T) {
 	c := newCluster(t, "iso_merge_recheck")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-match-recheck.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/merge-match-recheck.spec")
 }
 
 // TestPort_IsolationMergeJoin exercises the merge-join spec.
@@ -386,7 +823,7 @@ func TestPort_IsolationMergeJoin(t *testing.T) {
 	c := newCluster(t, "iso_merge_join")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/merge-join.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/merge-join.spec")
 }
 
 // ── M0118-0001 SSI / SERIALIZABLE anomaly specs ──────────────────────────────
@@ -407,7 +844,7 @@ func TestPort_IsolationSimpleWriteSkew(t *testing.T) {
 	c := newCluster(t, "iso_simple_ws")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/simple-write-skew.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/simple-write-skew.spec")
 }
 
 // TestPort_IsolationMatviewWriteSkew exercises the matview-write-skew spec: a
@@ -420,7 +857,7 @@ func TestPort_IsolationMatviewWriteSkew(t *testing.T) {
 	c := newCluster(t, "iso_matview_ws")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/matview-write-skew.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/matview-write-skew.spec")
 }
 
 // TestPort_IsolationTwoIds exercises the two-ids spec: a SERIALIZABLE
@@ -430,7 +867,7 @@ func TestPort_IsolationTwoIds(t *testing.T) {
 	c := newCluster(t, "iso_two_ids")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/two-ids.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/two-ids.spec")
 }
 
 // TestPort_IsolationTotalCash exercises the total-cash spec: a SERIALIZABLE
@@ -440,7 +877,7 @@ func TestPort_IsolationTotalCash(t *testing.T) {
 	c := newCluster(t, "iso_total_cash")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/total-cash.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/total-cash.spec")
 }
 
 // TestPort_IsolationReceiptReport exercises the receipt-report spec: the
@@ -450,7 +887,7 @@ func TestPort_IsolationReceiptReport(t *testing.T) {
 	c := newCluster(t, "iso_receipt_report")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/receipt-report.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/receipt-report.spec")
 }
 
 // TestPort_IsolationProjectManager exercises the project-manager spec: a
@@ -460,7 +897,7 @@ func TestPort_IsolationProjectManager(t *testing.T) {
 	c := newCluster(t, "iso_project_manager")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/project-manager.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/project-manager.spec")
 }
 
 // TestPort_IsolationClassroomScheduling exercises the classroom-scheduling
@@ -470,7 +907,7 @@ func TestPort_IsolationClassroomScheduling(t *testing.T) {
 	c := newCluster(t, "iso_classroom_sched")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/classroom-scheduling.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/classroom-scheduling.spec")
 }
 
 // TestPort_IsolationReadOnlyAnomaly exercises the read-only-anomaly spec: the
@@ -483,7 +920,7 @@ func TestPort_IsolationReadOnlyAnomaly(t *testing.T) {
 	c := newCluster(t, "iso_ro_anomaly")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly.spec")
 }
 
 // TestPort_IsolationReadOnlyAnomaly2 exercises read-only-anomaly-2: same O'Neil
@@ -494,7 +931,7 @@ func TestPort_IsolationReadOnlyAnomaly2(t *testing.T) {
 	c := newCluster(t, "iso_ro_anomaly2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-2.spec")
 }
 
 // TestPort_IsolationReadOnlyAnomaly3 exercises read-only-anomaly-3: the same
@@ -510,7 +947,7 @@ func TestPort_IsolationReadOnlyAnomaly3(t *testing.T) {
 	c := newCluster(t, "iso_ro_anomaly3")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-3.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/read-only-anomaly-3.spec")
 }
 
 // TestPort_IsolationSerializableParallel exercises serializable-parallel: the
@@ -525,7 +962,7 @@ func TestPort_IsolationSerializableParallel(t *testing.T) {
 	c := newCluster(t, "iso_serializable_parallel")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel.spec")
 }
 
 // TestPort_IsolationSerializableParallel2 exercises serializable-parallel-2:
@@ -541,7 +978,7 @@ func TestPort_IsolationSerializableParallel2(t *testing.T) {
 	c := newCluster(t, "iso_serializable_parallel2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel-2.spec")
 }
 
 // TestPort_IsolationSerializableParallel3 exercises serializable-parallel-3:
@@ -557,7 +994,7 @@ func TestPort_IsolationSerializableParallel3(t *testing.T) {
 	c := newCluster(t, "iso_serializable_parallel3")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel-3.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/serializable-parallel-3.spec")
 }
 
 // TestPort_IsolationUpdateConflictOut exercises update-conflict-out: SSI
@@ -568,7 +1005,7 @@ func TestPort_IsolationUpdateConflictOut(t *testing.T) {
 	c := newCluster(t, "iso_update_conflict_out")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/update-conflict-out.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/update-conflict-out.spec")
 }
 
 // TestPort_IsolationMultipleRowVersions exercises the multiple-row-versions
@@ -580,32 +1017,35 @@ func TestPort_IsolationMultipleRowVersions(t *testing.T) {
 	c := newCluster(t, "iso_multi_row_ver")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/multiple-row-versions.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/multiple-row-versions.spec")
 }
 
 // TestPort_IsolationPredicateLockHotTuple exercises predicate-lock-hot-tuple:
 // two SERIALIZABLE transactions each SELECT i IN (5,7) then UPDATE one of the
 // two rows. The reads cross-cover the other writer's target row, forming a
 // write-skew dangerous structure, so the later committer (s2) must abort with
-// 40001.
+// 40001. Promoted to pass-required (M0118-0002, design 0118-0026) — matches
+// PG 18.3 byte-for-byte with no engine change.
 func TestPort_IsolationPredicateLockHotTuple(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_pred_lock_hot")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/predicate-lock-hot-tuple.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/predicate-lock-hot-tuple.spec")
 }
 
 // TestPort_IsolationPartialIndex exercises partial-index: an UPDATE that moves a
 // row out of a partial index (CREATE INDEX ... WHERE val2 = 1) under SERIALIZABLE
 // must still create the read/write dependency a full-table read would, so any
-// overlap between the two transactions raises 40001.
+// overlap between the two transactions raises 40001. Promoted to pass-required
+// (M0118-0002, design 0118-0026) — matches PG 18.3 byte-for-byte with no engine
+// change.
 func TestPort_IsolationPartialIndex(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_partial_index")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/partial-index.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/partial-index.spec")
 }
 
 // TestPort_IsolationTemporalRangeIntegrity exercises temporal-range-integrity: a
@@ -617,7 +1057,7 @@ func TestPort_IsolationTemporalRangeIntegrity(t *testing.T) {
 	c := newCluster(t, "iso_temporal_range")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/temporal-range-integrity.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/temporal-range-integrity.spec")
 }
 
 // TestPort_IsolationReferentialIntegrity exercises referential-integrity: a
@@ -632,7 +1072,37 @@ func TestPort_IsolationReferentialIntegrity(t *testing.T) {
 	c := newCluster(t, "iso_referential_integrity")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/referential-integrity.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/referential-integrity.spec")
+}
+
+// TestPort_IsolationFkContention exercises fk-contention: a child INSERT takes a
+// FOR KEY SHARE row lock on its referenced parent row to enforce the FK while a
+// concurrent session repeatedly UPDATEs a *non-key* parent column. The non-key
+// UPDATE and the FK KEY SHARE lock do not conflict (the multixact lock-only +
+// no-key-update producer landed in M0118-0003/0004), so neither session blocks
+// and the output matches PG 18.3 byte-for-byte. Promoted to pass-required
+// (M0118-0005, design 0118-0023).
+func TestPort_IsolationFkContention(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_fk_contention")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-contention.spec")
+}
+
+// TestPort_IsolationFkDeadlock2 exercises fk-deadlock2: two sessions each insert
+// a child row (taking FOR KEY SHARE on the shared parent — non-conflicting, so
+// both proceed via a multixact lock set) and then UPDATE disjoint parent rows.
+// No lock cycle forms, so both commit without a deadlock abort, matching PG 18.3.
+// The sibling fk-deadlock spec (where the parent UPDATEs *do* form a cycle)
+// remains deferred — goopg's FK row-lock wait over-conflicts there (ledger
+// 2026-06-22). Promoted to pass-required (M0118-0005, design 0118-0023).
+func TestPort_IsolationFkDeadlock2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_fk_deadlock2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-deadlock2.spec")
 }
 
 // TestPort_IsolationIndexOnlyScan exercises the index-only-scan spec: a
@@ -641,12 +1111,14 @@ func TestPort_IsolationReferentialIntegrity(t *testing.T) {
 // DELETEs the matching row from the other table. Any overlap forms a
 // rw-dependency cycle so the second committer must abort with 40001; the two
 // serialized orderings (rxwy1 c1 rywx2 c2 / rywx2 c2 rxwy1 c1) commit cleanly.
+// Promoted to pass-required (M0118-0002, design 0118-0026) — matches PG 18.3
+// byte-for-byte with no engine change.
 func TestPort_IsolationIndexOnlyScan(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_index_only_scan")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/index-only-scan.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/index-only-scan.spec")
 }
 
 // TestPort_IsolationSkipLocked exercises the skip-locked spec: two sessions
@@ -658,7 +1130,7 @@ func TestPort_IsolationSkipLocked(t *testing.T) {
 	c := newCluster(t, "iso_skip_locked")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/skip-locked.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/skip-locked.spec")
 }
 
 // TestPort_IsolationNowait exercises the nowait spec: when one session holds a
@@ -670,7 +1142,7 @@ func TestPort_IsolationNowait(t *testing.T) {
 	c := newCluster(t, "iso_nowait")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/nowait.spec")
 }
 
 // TestPort_IsolationNowait3 exercises the nowait-3 spec: s1 holds a FOR UPDATE
@@ -684,7 +1156,7 @@ func TestPort_IsolationNowait3(t *testing.T) {
 	c := newCluster(t, "iso_nowait3")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/nowait-3.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/nowait-3.spec")
 }
 
 // TestPort_IsolationUpdateLockedTuple exercises the update-locked-tuple spec:
@@ -699,7 +1171,379 @@ func TestPort_IsolationUpdateLockedTuple(t *testing.T) {
 	c := newCluster(t, "iso_update_locked_tuple")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/update-locked-tuple.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/update-locked-tuple.spec")
+}
+
+// TestPort_IsolationLockUpdateTraversal exercises the lock-update-traversal
+// spec: s1 takes a FOR KEY SHARE lock on a row that s2 has updated in-flight
+// (forming an updater-bearing multixact), then after s2 commits a third step
+// DELETEs (s2d1) / key-UPDATEs (s2d2) / no-key-UPDATEs (s2d3) the row. The
+// DELETE and key-UPDATE must wait for s1's KEY SHARE lock; the no-key-UPDATE
+// must proceed immediately (KEY SHARE does not conflict with a no-key update).
+// This is the cleanest proof of the 4-way row-lock-strength distinction
+// (FOR KEY SHARE must NOT be collapsed to FOR SHARE). M0118-0003.
+func TestPort_IsolationLockUpdateTraversal(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_lock_update_traversal")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/lock-update-traversal.spec")
+}
+
+// TestPort_IsolationLockUpdateDelete exercises the lock-update-delete spec: s2
+// holds a session-level advisory lock (lock 0) so that s1's
+// SELECT ... WHERE pg_advisory_xact_lock(0) IS NOT NULL ... FOR KEY SHARE blocks
+// at the advisory gate while s2 builds an update chain (UPDATE then DELETE /
+// key-UPDATE / no-key-UPDATE) on the same tuple. When s2 unlocks the advisory
+// lock, s1's locker must traverse the update chain: it proceeds immediately for
+// the no-key UPDATE blocker but waits on the in-flight DELETE / key-UPDATE until
+// s2 commits or aborts (committing DELETE/key-UPDATE leaves 0 rows; aborting
+// lets s1 lock the surviving row). Layers the advisory-lock synchroniser on top
+// of the M0118-0003 update-chain wait-on-deleter path. M0118-0003.
+func TestPort_IsolationLockUpdateDelete(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_lock_update_delete")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/lock-update-delete.spec")
+}
+
+// TestPort_IsolationSkipLocked2 exercises the skip-locked-2 spec: s1 and s2 both
+// take FOR SHARE on the same row (forming a multixact lock with two SHARE
+// members), then s2 tries FOR UPDATE SKIP LOCKED and must skip the row because
+// the FOR UPDATE conflicts with s1's still-held SHARE member of the multixact.
+// Validates the multixact-aware SKIP LOCKED conflict path. M0118-0003.
+func TestPort_IsolationSkipLocked2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_skip_locked2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/skip-locked-2.spec")
+}
+
+// TestPort_IsolationNowait2 exercises the nowait-2 spec: like skip-locked-2 but
+// s2 uses FOR UPDATE NOWAIT and must abort with 55P03 instead of skipping when
+// the multixact SHARE member held by s1 blocks the upgrade. M0118-0003.
+func TestPort_IsolationNowait2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_nowait2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/nowait-2.spec")
+}
+
+// TestPort_IsolationTuplelockConflict exercises the tuplelock-conflict spec:
+// verifies the tuple-lock conflict table across all 4 strengths, including the
+// multixact cases where a SAVEPOINT subxid locks the same tuple as the main
+// xid. M0118-0003.
+func TestPort_IsolationTuplelockConflict(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_tuplelock_conflict")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-conflict.spec")
+}
+
+// TestPort_IsolationSkipLocked3 exercises skip-locked-3 (SKIP LOCKED with tuple
+// locks): s1 holds a plain FOR UPDATE on the first row and a third session forces
+// a tuple-lock wait queue, so s2's FOR UPDATE SKIP LOCKED must skip the
+// tuple-locked row rather than join the queue. Pass-required (M0118-0003 row-lock
+// family hardened to strict; design 0118-0042).
+func TestPort_IsolationSkipLocked3(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_skip_locked3")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/skip-locked-3.spec")
+}
+
+// TestPort_IsolationNowait5 exercises nowait-5 (NOWAIT on an updated tuple
+// chain). M0118-0003.
+func TestPort_IsolationNowait5(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_nowait5")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/nowait-5.spec")
+}
+
+// TestPort_IsolationSkipLocked4 exercises skip-locked-4 (SKIP LOCKED over an
+// updated tuple chain): s1's FOR UPDATE SKIP LOCKED is gated behind an advisory
+// lock while s2 UPDATEs the first row (building a ctid chain) then locks it; when
+// the advisory lock is released s1 must follow the chain, find the live successor
+// row-locked by s2, and skip it — claiming the other row instead of blocking.
+// Pass-required (M0118-0003 row-lock family hardened to strict; design 0118-0042).
+func TestPort_IsolationSkipLocked4(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_skiplocked4")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/skip-locked-4.spec")
+}
+
+func TestPort_IsolationNowait4(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_nowait4")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/nowait-4.spec")
+}
+
+// TestPort_IsolationTuplelockUpdate exercises the tuplelock-update spec: s1 first
+// builds an update chain via s1_chain (UPDATE pktab SET data = DEFAULT) then takes
+// FOR KEY SHARE on the live row (s1_grablock). Three other sessions (s2/s3/s4)
+// each have a pending no-key UPDATE gated behind one of three advisory locks s1
+// holds; releasing each advisory lock in turn lets that updater run. Each no-key
+// UPDATE does NOT conflict with FOR KEY SHARE, so the updater follows the ctid
+// chain, propagates the KEY SHARE lock forward onto the new version, and proceeds
+// immediately rather than blocking. M0118-0003.
+func TestPort_IsolationTuplelockUpdate(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_tuplelock_update")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-update.spec")
+}
+
+// TestPort_IsolationTuplelockPartition exercises the tuplelock-partition spec:
+// INSERT ON CONFLICT UPDATE on a LIST-partitioned table. A no-key UPDATE arm
+// (col1/col2) does not conflict with a concurrent FOR KEY SHARE; a key UPDATE
+// arm (SET key=1) blocks the FOR KEY SHARE until s1 commits. M0118-0003.
+func TestPort_IsolationTuplelockPartition(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_tuplelock_partition")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-partition.spec")
+}
+
+// TestPort_IsolationPropagateLockDelete exercises the propagate-lock-delete
+// spec: s1 and s2 each INSERT INTO child VALUES(1), which takes a FOR KEY SHARE
+// lock on the parent row i=1 (RI_FKey_check). s3 then UPDATEs parent (no-key or
+// key-update SET i=i, optionally with an aborted savepoint) — which must NOT
+// drop the propagated FK locks — and finally DELETEs parent. The DELETE must
+// wait on the still-in-flight child INSERTs (s1/s2 uncommitted) and, once they
+// commit, raise the FK violation 23503 because the now-visible child rows still
+// reference the parent. M0118-0003.
+func TestPort_IsolationPropagateLockDelete(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_propagate_lock_delete")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/propagate-lock-delete.spec")
+}
+
+// TestPort_IsolationLockNowait exercises the lock-nowait spec: s1 takes ACCESS
+// EXCLUSIVE on a1, then s2 requests EXCLUSIVE (blocks behind s1). While s2 waits,
+// s1 requests SHARE ROW EXCLUSIVE NOWAIT — which must be granted IMMEDIATELY (s1
+// already holds a stronger self-compatible lock, so it jumps ahead of the parked
+// conflicting s2 waiter rather than failing on NOWAIT). After s1 commits, s2's
+// EXCLUSIVE is granted. Exercises transaction-scoped LOCK TABLE heavyweight locks
+// (held until COMMIT, not released per statement) plus lockmgr's JoinWaitQueue
+// early-grant special case. M0118-0003.
+func TestPort_IsolationLockNowait(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_lock_nowait")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/lock-nowait.spec")
+}
+
+// TestPort_IsolationDeleteAbortSavept exercises the delete-abort-savept spec:
+// s1 takes FOR KEY SHARE, opens a SAVEPOINT, upgrades the lock via DELETE, then
+// ROLLBACK TO the savepoint — which must RESTORE the original FOR KEY SHARE
+// lock (not leave the tuple unlocked). s2's FOR UPDATE must still wait behind
+// the restored KEY SHARE lock until s1 commits. Rides the M0118-0004 subxact-
+// scoped row-lock restore (stampMultiLock keeps outer-level self members as
+// survivors so ROLLBACK TO reverts to the outer strength). M0118-0009.
+func TestPort_IsolationDeleteAbortSavept(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_delete_abort_savept")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept.spec")
+}
+
+// TestPort_IsolationDeleteAbortSavept2 is the funkier delete-abort-savept
+// variant: the subxact upgrade is FOR NO KEY UPDATE (not DELETE) and s2 probes
+// with both FOR UPDATE and FOR NO KEY UPDATE. ROLLBACK TO must revert to the
+// outer FOR KEY SHARE strength. M0118-0009.
+func TestPort_IsolationDeleteAbortSavept2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_delete_abort_savept2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept-2.spec")
+}
+
+// TestPort_IsolationAbortedKeyrevoke exercises the aborted-keyrevoke spec: s1
+// opens a SAVEPOINT, UPDATEs the key (obtaining KEY REVOKE), ROLLBACK TO the
+// savepoint (losing KEY REVOKE), then takes FOR KEY SHARE. s2's FOR KEY SHARE
+// must be compatible (both KEY SHARE) and proceed — the rolled-back key-update
+// must not leave a phantom conflicting lock. Exercises subxact lock-restore on
+// the multixact lock-only path. M0118-0009.
+func TestPort_IsolationAbortedKeyrevoke(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_aborted_keyrevoke")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/aborted-keyrevoke.spec")
+}
+
+// TestPort_IsolationMultixactNoForget exercises the multixact-no-forget spec: s1
+// holds FOR KEY SHARE; s2 UPDATEs (forming a {s2-update, s1-keyshare} multixact)
+// then ABORTS — the abort must NOT forget s1's still-held KEY SHARE lock. s3
+// then probes with FOR KEY SHARE (compatible), FOR NO KEY UPDATE / FOR UPDATE
+// (conflicting, must wait). Validates that an aborted updater member is dropped
+// from the multixact while the surviving locker member is preserved. M0118-0009.
+func TestPort_IsolationMultixactNoForget(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_multixact_no_forget")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/multixact-no-forget.spec")
+}
+
+// TestPort_IsolationInplaceInval exercises the inplace-inval spec: an inplace
+// update (CREATE INDEX setting pg_class.relhasindex=true) must not be reverted
+// by a later heap_update of a cached oldtup. In upstream PostgreSQL this is a
+// real catcache/heap_inplace_update hazard. goopg is immune by construction:
+// pg_class is a VIRTUAL relation whose relhasindex is derived live from the
+// in-memory index set (len(c.byTable[oid]) > 0) on every read, so there is no
+// heap tuple, no catcache oldtup to go stale, and no inplace-update path to
+// revert. Both permutations therefore observe relhasindex=t. M0118-0009.
+func TestPort_IsolationInplaceInval(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_inplace_inval")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/inplace-inval.spec")
+}
+
+// TestPort_IsolationFreezeTheDead exercises the freeze-the-dead spec: tuple
+// freezing interactions with dead/recently-dead tuples via multixact FOR KEY
+// SHARE. M0118-0009.
+func TestPort_IsolationFreezeTheDead(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_freeze_the_dead")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/freeze-the-dead.spec")
+}
+
+// TestPort_IsolationSubxidOverflow exercises the subxid-overflow spec: a
+// recursive PL/pgSQL function (gen_subxids) opens 100 nested subtransactions
+// via per-frame EXCEPTION handlers, overflowing the subxid cache, while other
+// sessions probe MVCC visibility (XidInMVCCSnapshot) and lock-waits
+// (XactLockTableWait) against the overflowed parent. Two PL/pgSQL gaps blocked
+// it: a bare `RETURN;` (upstream-legal in a VOID function) was rejected at
+// parse time, and the `NULL;` no-op statement (used as the empty EXCEPTION
+// handler body) was an "unsupported PL/pgSQL statement". With both supported,
+// goopg's existing subxact visibility/lock machinery already matches PG 18.3.
+// M0118-0009.
+func TestPort_IsolationSubxidOverflow(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_subxid_overflow")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/subxid-overflow.spec")
+}
+
+// TestPort_IsolationDeadlockSimple exercises the deadlock-simple spec: two
+// sessions each take ACCESS SHARE on a1, then each attempts a lock upgrade to
+// ACCESS EXCLUSIVE. Neither upgrade can complete until the other releases its
+// ACCESS SHARE, so the deadlock detector must abort one session with 40P01.
+// M0118-0003.
+func TestPort_IsolationDeadlockSimple(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_deadlock_simple")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/deadlock-simple.spec")
+}
+
+// TestPort_IsolationDeadlockHard exercises the deadlock-hard spec: eight
+// sessions each LOCK TABLE their own relation then attempt to LOCK the next in a
+// ring (s1→a2, s2→a3, …, s8→a1), forming an 8-way cycle. Every session sets a
+// 100s deadlock_timeout except s8 (10ms), so s8's wait-timer fires first; the
+// main lock detector finds the multi-relation cycle and rolls back the session
+// that discovered it (s8) with 40P01. Exercises the general (timeout-driven)
+// wait-for-graph deadlock detector over the transaction-scoped LOCK TABLE
+// heavyweight locks, per-session deadlock_timeout, and triggering-backend
+// victim selection. M0118-0004.
+func TestPort_IsolationDeadlockHard(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_deadlock_hard")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/deadlock-hard.spec")
+}
+
+// TestPort_IsolationDeadlockSoft exercises the deadlock-soft spec: four
+// sessions form a 4-cycle with two hard edges (e1→d1, e2→d2: an
+// ACCESS EXCLUSIVE waiter behind an ACCESS SHARE holder) and two soft edges
+// (d2→e1, d1→e2: an ACCESS SHARE waiter queued behind a conflicting
+// ACCESS EXCLUSIVE waiter). Because the cycle contains soft edges, the
+// detector resolves it by REORDERING a wait queue (moving d1 ahead of e2 on
+// a2) rather than aborting anyone — d1 is granted immediately and nobody
+// fails. Exercises soft-deadlock wait-queue rearrangement (deadlock.c
+// TopoSort / ExpandConstraints). M0118-0004.
+func TestPort_IsolationDeadlockSoft(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_deadlock_soft")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/deadlock-soft.spec")
+}
+
+// TestPort_IsolationDeadlockSoft2 exercises the deadlock-soft-2 spec: the
+// blocked session s1 must jump over BOTH s3 and s4 (which are hard-blocked on
+// a2's ACCESS EXCLUSIVE request behind s2's ACCESS SHARE) and acquire its
+// SHARE UPDATE EXCLUSIVE lock on a2 immediately, since s1's request does not
+// conflict with the holder. This requires the soft-deadlock resolver to
+// topologically reorder a multi-waiter queue (s1 ahead of s3, s4) instead of
+// aborting. M0118-0004.
+func TestPort_IsolationDeadlockSoft2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_deadlock_soft2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/deadlock-soft-2.spec")
+}
+
+// TestPort_IsolationMultixactNoDeadlock exercises the multixact-no-deadlock
+// spec: s1 takes FOR SHARE on the row, then s2 also takes FOR SHARE (turning the
+// row's tuple lock into a multixact). s3 then requests FOR UPDATE, which
+// conflicts with the SHARE multixact and waits. While s3 waits, s1 re-requests
+// FOR SHARE (s1lock2) — a lock it already holds — and must NOT be forced to
+// queue behind the waiting s3 (which would deadlock); since s1 is already a
+// member of the SHARE multixact it proceeds immediately. Once s2 and s1 commit,
+// s3's FOR UPDATE is granted. M0118-0004.
+func TestPort_IsolationMultixactNoDeadlock(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_multixact_no_deadlock")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/multixact-no-deadlock.spec")
+}
+
+// TestPort_IsolationTuplelockUpgradeNoDeadlock exercises the
+// tuplelock-upgrade-no-deadlock spec: multiple sessions take row-level locks of
+// varying strength (FOR KEY SHARE / FOR SHARE / FOR NO KEY UPDATE / FOR UPDATE /
+// UPDATE / DELETE) on a single row across 9 permutations. It verifies that a
+// session upgrading its already-held row lock while others wait does NOT
+// deadlock, that sessions which do not upgrade acquire the lock in arrival
+// order, and that the heap_lock_tuple algorithm correctly retries (re-evaluates
+// the tuple lock after initially avoiding a deadlock) when an intervening
+// rollback-to-savepoint changes the multixact membership. Rides the row-lock
+// xmax / WaitForXID path (stampLockInner / tupleLockConflicts / multixact
+// membership), not the heavyweight lockmgr. M0118-0004.
+func TestPort_IsolationTuplelockUpgradeNoDeadlock(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_tuplelock_upgrade_no_deadlock")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec")
 }
 
 // buildDSN constructs a lib/pq DSN for the given cluster.

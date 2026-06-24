@@ -321,18 +321,28 @@ func advisorySessionIDFromContext(ctx *Context) uintptr {
 	if ctx == nil {
 		return 0
 	}
-	// Prefer the Session pointer: it is allocated once per connection and
-	// stays stable across all statements on that connection. BackendID is
-	// per-statement in the simple-query dispatch path.
-	if ctx.Session != nil {
-		return advisorySessionID(ctx.Session)
-	}
+	// Prefer the per-connection AdvisorySessionIdentity (the SessionRegistry):
+	// it is created once in serveConn and stays stable for the ENTIRE connection
+	// lifetime, independent of explicit-transaction state. ctx.Session (the
+	// BasicSession) is nil before the first BEGIN and non-nil afterward, so
+	// keying advisory locks on it FLIPS the owner identity at the first BEGIN —
+	// a pg_advisory_lock() taken in autocommit setup (SessionRegistry identity)
+	// can then never be matched by a pg_advisory_unlock() issued after BEGIN
+	// (BasicSession identity), so the lock leaks ("you don't own a lock" on
+	// unlock) and every later acquirer of the same key blocks forever. Both
+	// identities are per-connection stable (which is what the M0097-0010
+	// self-deadlock fix needs); AdvisorySessionIdentity is simply the one that
+	// also covers the autocommit-before-first-BEGIN window. M0118-0003.
 	if ctx.AdvisorySessionIdentity != nil {
 		if id := advisoryPointerID(ctx.AdvisorySessionIdentity); id != 0 {
 			return id
 		}
 	}
-	// Fallback for contexts that have neither (e.g. unit tests with no Session).
+	// Fallback to the BasicSession pointer (e.g. unit tests that wire only a
+	// Session), then to the per-statement BackendID as a last resort.
+	if ctx.Session != nil {
+		return advisorySessionID(ctx.Session)
+	}
 	return uintptr(ctx.BackendID)
 }
 
@@ -341,6 +351,19 @@ func advisorySessionIDFromContext(ctx *Context) uintptr {
 func ReleaseAdvisoryTransactionLocks(identity any) {
 	if id := advisoryPointerID(identity); id != 0 {
 		globalAdvisoryMgr.releaseAllXact(id)
+	}
+}
+
+// ReleaseAllAdvisoryLocks releases EVERY advisory lock held by the given stable
+// session identity, both session-scoped and transaction-scoped. PostgreSQL
+// releases all advisory locks (regardless of scope) when a backend exits, so
+// this must run on connection teardown — a session-scoped pg_advisory_lock()
+// that the client never unlocked (or abandoned the connection while holding)
+// would otherwise persist for the lifetime of the server process and block
+// every future acquirer of the same key. M0118-0003.
+func ReleaseAllAdvisoryLocks(identity any) {
+	if id := advisoryPointerID(identity); id != 0 {
+		globalAdvisoryMgr.releaseAll(id)
 	}
 }
 

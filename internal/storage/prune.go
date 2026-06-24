@@ -34,18 +34,53 @@ type PruneResult struct {
 //
 // The caller must hold the page's exclusive content lock for the entire call.
 func PagePruneOpt(p Page, oldestXmin TransactionID) (PruneResult, error) {
-	var result PruneResult
-
 	if oldestXmin == InvalidTransactionID {
-		return result, nil
+		return PruneResult{}, nil
 	}
 
 	h := MustHeader(p)
 	pruneXID := TransactionID(h.PruneXID())
 	if pruneXID == InvalidTransactionID || pruneXID >= oldestXmin {
 		// Fast path: pd_prune_xid not set or not old enough.
-		return result, nil
+		return PruneResult{}, nil
 	}
+
+	res, _, err := pagePruneCore(p, oldestXmin)
+	return res, err
+}
+
+// PageVacuumPrune is the VACUUM-time counterpart of PagePruneOpt. It applies
+// the identical HOT-chain-aware, multixact-aware dead-tuple reclamation, but
+// UNCONDITIONALLY — VACUUM must prune regardless of the pd_prune_xid hint,
+// which is only an optimisation for the opportunistic (HOT-update) path.
+//
+// Using the shared core (rather than the old naive "xmax < horizon, remove the
+// slot" pass) is load-bearing for correctness: a tuple whose xmax is an
+// updater-bearing MultiXactId must resolve its updater member before the
+// horizon comparison (a raw multi vs xid compare is a category error that can
+// prune a live, still-locked row), and a dead HOT chain root must be converted
+// to an ItemIDRedirect pointing at the live chain tip so the index entry keeps
+// resolving — physically removing the root breaks the chain and the row
+// vanishes from index scans. See the freeze-the-dead isolation spec
+// (M0118-0009). The caller must hold the page's exclusive content lock.
+//
+// The second return value is the count of live (LP_NORMAL) tuples remaining on
+// the page after the prune — VACUUM threads it into Stats.Live (reltuples).
+func PageVacuumPrune(p Page, oldestXmin TransactionID) (PruneResult, int, error) {
+	if oldestXmin == InvalidTransactionID {
+		return PruneResult{}, 0, nil
+	}
+	return pagePruneCore(p, oldestXmin)
+}
+
+// pagePruneCore is the shared dead-tuple reclamation kernel behind both
+// PagePruneOpt (opportunistic, gated on pd_prune_xid) and PageVacuumPrune
+// (VACUUM, unconditional). It builds the multixact/HOT-aware dead set,
+// converts dead chain roots to redirects, marks HOT-only and standalone dead
+// tuples unused, compacts the page, and clears pd_prune_xid. The second return
+// value is the number of surviving LP_NORMAL tuples on the page.
+func pagePruneCore(p Page, oldestXmin TransactionID) (PruneResult, int, error) {
+	var result PruneResult
 
 	isDead := func(hdr HeapTupleHeader) bool {
 		if hdr.Xmax == InvalidTransactionID {
@@ -54,19 +89,38 @@ func PagePruneOpt(p Page, oldestXmin TransactionID) (PruneResult, error) {
 		if IsHeapTupleLockOnly(hdr.Infomask) {
 			return false
 		}
-		return hdr.Xmax < oldestXmin
+		// For an updater-bearing multixact xmax, hdr.Xmax is a MultiXactId, not
+		// a transaction id; comparing it to the oldestXmin horizon would be a
+		// category error (it could spuriously mark a live, only-locked row dead
+		// and prune it). Resolve the updater member and test that xid instead. A
+		// multi with no updater (only lockers) is not a delete, and an
+		// unresolvable multi is conservatively NOT dead — never prune a tuple we
+		// cannot prove dead.
+		effXmax := hdr.Xmax
+		if IsHeapTupleXmaxMulti(hdr.Infomask) {
+			if ResolveMultiUpdater == nil {
+				return false
+			}
+			upd, hasUpdater, resolved := ResolveMultiUpdater(hdr.Xmax)
+			if !resolved || !hasUpdater {
+				return false
+			}
+			effXmax = upd
+		}
+		return effXmax < oldestXmin
 	}
 
 	count, err := PageLinePointerCount(p)
 	if err != nil {
-		return result, err
+		return result, 0, err
 	}
 
+	liveNormals := 0
 	for idx := 0; idx < count; idx++ {
 		slot := uint16(idx + 1)
 		item, err := readItemID(p, idx)
 		if err != nil {
-			return result, err
+			return result, 0, err
 		}
 		if item.Flags != ItemIDNormal {
 			continue
@@ -81,6 +135,7 @@ func PagePruneOpt(p Page, oldestXmin TransactionID) (PruneResult, error) {
 			continue
 		}
 		if !isDead(t.Header) {
+			liveNormals++
 			continue
 		}
 
@@ -93,7 +148,7 @@ func PagePruneOpt(p Page, oldestXmin TransactionID) (PruneResult, error) {
 			liveTip := pruneChainTip(p, t.Header.CTID.Offset, isDead)
 			if liveTip != 0 && liveTip != slot {
 				if err := PageSetItemIDRedirect(p, slot, liveTip); err != nil {
-					return result, err
+					return result, 0, err
 				}
 				result.Redirects = append(result.Redirects, [2]uint16{slot, liveTip})
 			} else {
@@ -107,28 +162,32 @@ func PagePruneOpt(p Page, oldestXmin TransactionID) (PruneResult, error) {
 	}
 
 	if len(result.Redirects) == 0 && len(result.Unused) == 0 {
-		return result, nil
+		return result, liveNormals, nil
 	}
 
 	// Compact the page: mark unused slots and repack live tuple data.
+	// VacuumHeapPageBySlots recomputes the surviving-LP_NORMAL count after the
+	// repack (redirected roots become ItemIDRedirect, not normal), so use its
+	// Live as the authoritative live-tuple count.
+	var vs HeapPageVacuumStats
 	if len(result.Unused) > 0 {
-		if _, err := VacuumHeapPageBySlots(p, result.Unused); err != nil {
-			return result, err
+		if vs, err = VacuumHeapPageBySlots(p, result.Unused); err != nil {
+			return result, 0, err
 		}
 	} else {
 		// No unused slots but we have redirects: the tuple data for the
 		// redirected slots needs to be freed. Run a compaction pass with
 		// an empty dead set — VacuumHeapPageBySlots will zero the region
 		// and repack surviving ItemIDNormal tuples, which is sufficient.
-		if _, err := VacuumHeapPageBySlots(p, nil); err != nil {
-			return result, err
+		if vs, err = VacuumHeapPageBySlots(p, nil); err != nil {
+			return result, 0, err
 		}
 	}
 
 	// Clear pd_prune_xid: page is pruned; next check is a no-op until
 	// new dead-tuple xmax values accumulate.
-	h.SetPruneXID(0)
-	return result, nil
+	MustHeader(p).SetPruneXID(0)
+	return result, vs.Live, nil
 }
 
 // pruneChainTip follows the CTID chain starting at startSlot and returns

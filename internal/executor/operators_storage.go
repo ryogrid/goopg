@@ -11,6 +11,7 @@ import (
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -113,13 +114,18 @@ func deregisterWFG(myXID storage.TransactionID) {
 // deadlock is possible. Context cancellation (connection close, query
 // timeout) is propagated via commitCond.Broadcast inside WaitForXID.
 // M0098-0004, M0099-0004, M0100-0003.
-func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool) {
+// The second result, timeout, is non-nil when the wait was aborted by the
+// session's lock_timeout or statement_timeout: the caller must surface it
+// (SQLSTATE 57014) instead of retrying. A plain client cancellation is still
+// swallowed (returns false, nil) so connection teardown falls through to the
+// snapshot refresh + caller retry as before. M0118-0009.
+func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool, timeout *ExecError) {
 	if ctx.TxnMgr == nil {
-		return false
+		return false, nil
 	}
 	if ctx.Tx.XID != storage.InvalidTransactionID {
 		if registerWFGAndCheckCycle(ctx.Tx.XID, xmax) {
-			return true
+			return true, nil
 		}
 		defer deregisterWFG(ctx.Tx.XID)
 	}
@@ -127,16 +133,20 @@ func epqWait(ctx *Context, xmax storage.TransactionID) (deadlock bool) {
 	// All four call sites release page pins before reaching here
 	// (verified at lines 923-924, 1159-1160, 1333-1334, 1520-1521).
 	if ctx.Ctx != nil {
-		// Ignore cancellation errors — treat as a non-deadlock signal
-		// and fall through to the snapshot refresh + caller retry.
-		_ = ctx.TxnMgr.WaitForXID(ctx.Ctx, xmax)
+		if werr := ctx.TxnMgr.WaitForXID(ctx.Ctx, xmax); werr != nil {
+			if ee := lockWaitTimeoutError(werr); ee != nil {
+				return false, ee
+			}
+			// Plain cancellation: treat as a non-deadlock signal and fall
+			// through to the snapshot refresh + caller retry.
+		}
 	}
 	// Refresh the snapshot so the next epqRecheckVisible call sees any
 	// committed changes from the conflicting transaction.
 	if snap, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
 		ctx.Snap = snap.Clone()
 	}
-	return false
+	return false, nil
 }
 
 // epqRecheckVisible re-reads the tuple at (rel, blk, slot) and reports
@@ -156,7 +166,7 @@ func epqRecheckVisible(ctx *Context, rel storage.RelFileNode, blk storage.BlockN
 	if gerr != nil {
 		return false, nil // page read error → treat as not visible
 	}
-	return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID), nil
+	return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.MultiXact), nil
 }
 
 // epqFollowHOT follows the HOT chain from (rel, blk, slot) to find the
@@ -186,7 +196,7 @@ func epqFollowHOT(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber
 		return 0, nil, false, false
 	}
 	s.RLock()
-	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID)
+	latestTup, latestSlot, found := followHOTChain(s.Page(), slot, ctx.Snap, ctx.Tx.XID, ctx.MultiXact)
 	s.RUnlock()
 	ctx.Pool.Unpin(s)
 	if !found {
@@ -396,6 +406,24 @@ type epqChainResult struct {
 	ok   bool
 }
 
+// isChainTailCTID reports whether ctid is a t_ctid chain-tail sentinel — i.e.
+// there is no live successor version to follow from (curBlk, curSlot). True
+// when ctid:
+//   - has an invalid block number (no successor was ever stamped), or
+//   - has a zero offset (goopg's initial CTID is {InvalidBlockNumber,0}; a
+//     DELETE leaves it untouched, so a deleted-but-never-updated row reports
+//     a tail here), or
+//   - points at (curBlk, curSlot) itself (the latest version self-CTID).
+//
+// Shared by epqFollowChainFull (EPQ chain walk) and lockRowsOp.stampLockInner
+// (FOR UPDATE/SHARE chain-follow after a committed updater) so both sibling
+// paths terminate identically; following a sentinel CTID would Pin a
+// non-existent block and surface storage.ErrShortRead.
+func isChainTailCTID(ctid storage.ItemPointer, curBlk storage.BlockNumber, curSlot uint16) bool {
+	return ctid.Block == storage.InvalidBlockNumber || ctid.Offset == 0 ||
+		(ctid.Block == curBlk && ctid.Offset == curSlot)
+}
+
 // epqFollowChainFull walks the t_ctid chain and returns the live successor row.
 // movedPart is true if the chain ended because of a moved-partition sentinel.
 // origSnap, if non-nil, is used temporarily for predicate evaluation so that
@@ -425,10 +453,9 @@ func epqFollowChainFull(ctx *Context, rel storage.RelFileNode, blk storage.Block
 		// Chain terminates when CTID is invalid (no successor stamped) or
 		// points at self (latest version sentinel). At the tail, evaluate
 		// visibility + predicate against this tuple.
-		atTail := ctid.Block == storage.InvalidBlockNumber || ctid.Offset == 0 ||
-			(ctid.Block == curBlk && ctid.Offset == curSlot)
+		atTail := isChainTailCTID(ctid, curBlk, curSlot)
 		if atTail {
-			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID) {
+			if !mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.MultiXact) {
 				return rel, epqChainResult{}, false
 			}
 			row, decErr := DecodeHeapTupleRow(cols, tup, nil)
@@ -567,6 +594,10 @@ type seqScanOp struct {
 	pos    int
 	rel    storage.RelFileNode // cached once in Open; avoids catalog lock per Next call
 
+	// lockParentOID is the partitioned parent this leaf was expanded from (a
+	// scan THROUGH the parent locks the parent too); 0 for a direct leaf scan.
+	lockParentOID uint32
+
 	ctx  *Context
 	cols []catalog.Column
 
@@ -632,10 +663,11 @@ const seqScanLookahead storage.BlockNumber = 4
 
 func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 	return &seqScanOp{
-		schema: p.Output(),
-		tbl:    p.Table,
-		pos:    p.Pos(),
-		cols:   p.Table.Columns,
+		schema:        p.Output(),
+		tbl:           p.Table,
+		pos:           p.Pos(),
+		cols:          p.Table.Columns,
+		lockParentOID: p.LockParentOID,
 	}
 }
 
@@ -677,6 +709,30 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			ee.Pos = o.pos
 		}
 		return err
+	}
+	if err := ctx.acquireScanReadLockTxn(o.rel); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.pos
+		}
+		return err
+	}
+	// Scanning a partition THROUGH its partitioned parent locks the parent
+	// (AccessShare) as well — PostgreSQL locks the whole hierarchy from the
+	// queried root. A concurrent AccessExclusive holder on the parent (e.g. a
+	// DROP of a sibling partition pending detach, which grabs the parent lock)
+	// therefore blocks this scan until it commits. M0118-0008
+	// (detach-partition-concurrently-3).
+	if o.lockParentOID != 0 {
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if parentTbl, ok2 := im.LookupTableByOID(o.lockParentOID); ok2 {
+				if err := ctx.acquireScanReadLockTxn(ctx.Catalog.RelFileNode(parentTbl)); err != nil {
+					if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = o.pos
+					}
+					return err
+				}
+			}
+		}
 	}
 	n, err := ctx.Pool.NBlocks(o.rel)
 	if err != nil {
@@ -833,7 +889,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				// partial page writes or WAL-replay debris.
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}
@@ -1075,6 +1131,12 @@ func (o *insertOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
+	if err := ctx.acquireWriteLockTxn(rel); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
@@ -1668,6 +1730,17 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 			child = im.FindHashPartitionForValue(parent.OID, keyStr)
 		}
 	}
+	// Snapshot-relative partition visibility: a child marked detach-pending by an
+	// in-progress ALTER TABLE … DETACH PARTITION … CONCURRENTLY is invisible to
+	// any statement whose snapshot epoch is at or after the detach epoch, so
+	// routing an INSERT to it must fail with "no partition found" — exactly as the
+	// SELECT-side planner expansion omits it (sibling-paths discipline). A
+	// REPEATABLE READ transaction (snapshot frozen before the detach) keeps routing
+	// to it. Design 0118-0059 (M0118-0008 detach-partition-concurrently-1, s3ins2).
+	if child != nil && ctx != nil && child.DetachPendingEpoch != 0 &&
+		ctx.Snap.PartitionDetachEpoch >= child.DetachPendingEpoch {
+		child = nil
+	}
 	if child == nil {
 		return nil, nil
 	}
@@ -1797,7 +1870,7 @@ func idxRowHasConcurrentXmax(ctx *Context, rel storage.RelFileNode, blk storage.
 	if gerr != nil {
 		return false
 	}
-	return isConcurrentlyUpdated(t.Header, ctx.Tx.XID, &ctx.Snap)
+	return isConcurrentlyUpdated(t.Header, ctx.Tx.XID, &ctx.Snap, ctx.MultiXact)
 }
 
 func hotUpdateEligible(plan *planner.Update, ctx *Context) bool {
@@ -1875,11 +1948,44 @@ func markHeapHotUpdateDirty(
 //
 // A lock-only xmax (SELECT FOR UPDATE) is NOT treated as a concurrent
 // update — the lock holder does not own the row's write intent.
-func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionID, snap *mvcc.Snapshot) bool {
+//
+// mxs is the process-shared multixact store (nil only in unit tests that
+// build single-xid headers). When the xmax is an updater-bearing
+// multixact (IS_MULTI && !LOCK_ONLY), the real updater xid is resolved
+// from the member store before the abort/self checks — the raw
+// MultiXactId must never be fed to a single-xid API (myXID equality,
+// snap.HasAborted). Mirrors activeLockHolders' multi resolution. M0118-0003.
+func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionID, snap *mvcc.Snapshot, mxs *multixact.Store) bool {
+	// effXmax is the transaction id that actually updated/deleted the
+	// tuple. For an updater-bearing multixact xmax, h.Xmax is a
+	// MultiXactId, not a transaction id — resolve the updater member.
+	effXmax := h.Xmax
+	if storage.IsHeapTupleXmaxMulti(h.Infomask) && !storage.IsHeapTupleLockOnly(h.Infomask) {
+		if mxs == nil {
+			// Cannot resolve the multi; the IS_MULTI/!LOCK_ONLY bits say an
+			// updater is present, so conservatively treat the row as
+			// concurrently updated (forces an EPQ recheck under lock).
+			return true
+		}
+		members, ok := mxs.Members(multixact.MultiXactId(h.Xmax))
+		if !ok {
+			return true
+		}
+		upd, has := multixact.GetUpdateXid(members)
+		if !has {
+			// Only lockers in the multi (no updater) — not a concurrent
+			// update. (An all-locker multi should carry LOCK_ONLY; handle
+			// the inconsistent case defensively rather than mis-reading the
+			// MultiXactId as a deleter.)
+			return false
+		}
+		effXmax = upd
+	}
+
 	// "Our own xmax stamp" — re-update in the same transaction is
 	// always legal, regardless of HeapHotUpdated or other bits set
 	// by our prior write.
-	if h.Xmax != storage.InvalidTransactionID && h.Xmax == myXID {
+	if effXmax != storage.InvalidTransactionID && effXmax == myXID {
 		return false
 	}
 	// Beyond this point, any xmax/HOT marker is from a DIFFERENT
@@ -1888,12 +1994,12 @@ func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionI
 		// M0100-0005: If the HOT-updating transaction already aborted, the
 		// HeapHotUpdated flag is stale — the row is not actually "concurrently
 		// updated", so proceed directly without EPQ retry.
-		if snap != nil && h.Xmax != storage.InvalidTransactionID && snap.HasAborted(h.Xmax) {
+		if snap != nil && effXmax != storage.InvalidTransactionID && snap.HasAborted(effXmax) {
 			return false
 		}
 		return true
 	}
-	if h.Xmax == storage.InvalidTransactionID {
+	if effXmax == storage.InvalidTransactionID {
 		return false
 	}
 	if h.Infomask&storage.HeapXmaxInvalid != 0 {
@@ -1906,10 +2012,273 @@ func isConcurrentlyUpdated(h storage.HeapTupleHeader, myXID storage.TransactionI
 	}
 	// If the deleting/updating transaction already aborted, the xmax is stale
 	// — the row was never actually deleted or updated. M0100-0007.
-	if snap != nil && snap.HasAborted(h.Xmax) {
+	if snap != nil && snap.HasAborted(effXmax) {
 		return false
 	}
 	return true
+}
+
+// multixactUpdaterXID resolves the update-member transaction id of an
+// updater-bearing MultiXactId xmax (the value a tuple stores in t_xmax when
+// IS_MULTI is set and LOCK_ONLY is clear). It returns InvalidTransactionID
+// when the store is nil, the multixact is unknown, or the multixact carries
+// only lockers (no updater). Callers MUST have already checked
+// storage.IsHeapTupleXmaxMulti(infomask): feeding a raw MultiXactId to a
+// single-transaction API such as mvcc.Manager.IsXIDActive / WaitForXID reads
+// the multixact id as an unrelated transaction id and is a correctness bug.
+func multixactUpdaterXID(mxs *multixact.Store, xmax storage.TransactionID) storage.TransactionID {
+	if mxs == nil {
+		return storage.InvalidTransactionID
+	}
+	members, ok := mxs.Members(multixact.MultiXactId(xmax))
+	if !ok {
+		return storage.InvalidTransactionID
+	}
+	upd, has := multixact.GetUpdateXid(members)
+	if !has {
+		return storage.InvalidTransactionID
+	}
+	return upd
+}
+
+// multixactFirstActiveMember returns the first member of a (typically
+// lock-only) MultiXactId xmax that is still active and is not self, or
+// InvalidTransactionID when every member has settled or only self holds the
+// lock. A waiter blocks on the returned xid and re-probes; one wait per
+// remaining holder converges because settled members drop out of IsXIDActive.
+// Callers MUST have already checked storage.IsHeapTupleXmaxMulti(infomask).
+func multixactFirstActiveMember(mxs *multixact.Store, txnMgr *mvcc.Manager, self, xmax storage.TransactionID) storage.TransactionID {
+	if mxs == nil || txnMgr == nil {
+		return storage.InvalidTransactionID
+	}
+	members, ok := mxs.Members(multixact.MultiXactId(xmax))
+	if !ok {
+		return storage.InvalidTransactionID
+	}
+	for _, m := range members {
+		if m.Xid != self && txnMgr.IsXIDActive(m.Xid) {
+			return m.Xid
+		}
+	}
+	return storage.InvalidTransactionID
+}
+
+// concurrentModifierXID resolves the transaction id an UPDATE / DELETE / MERGE
+// EvalPlanQual wait must block on for a tuple that isConcurrentlyUpdated has
+// just flagged. For a single-xid xmax it is the xmax itself; for an
+// updater-bearing MultiXactId (IS_MULTI && !LOCK_ONLY) the raw t_xmax is a
+// MultiXactId — NOT a transaction id — so the real updater member is resolved
+// from the member store before it ever reaches epqWait / WaitForXID / the
+// wait-for graph / snap.HasInProgress / HasAbortedXID / IsXIDActive. This is the
+// write-path twin of stampLockInner's read-side multi resolution (commit
+// ab3881e8) and of isConcurrentlyUpdated's own resolution (which the caller has
+// already run, so an updater member is present). Falls back to the raw xmax only
+// when the multi is unresolvable (store nil / membership lost after a restart),
+// matching the conservative path isConcurrentlyUpdated took to return true.
+// M0118-0004.
+func concurrentModifierXID(hdr storage.HeapTupleHeader, mxs *multixact.Store) storage.TransactionID {
+	if storage.IsHeapTupleXmaxMulti(hdr.Infomask) && !storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		if upd := multixactUpdaterXID(mxs, hdr.Xmax); upd != storage.InvalidTransactionID {
+			return upd
+		}
+	}
+	return hdr.Xmax
+}
+
+// stampUpdaterXmaxPreservingLockers is the UPDATE/DELETE producer twin of the
+// row-lock path's stampMultiLock / stampMultiUpdaterLock (operators_lockrows.go):
+// when the old tuple already carries a pre-existing *lock-only* xmax naming one
+// or more still-active foreign lockers (e.g. a FOR KEY SHARE holder), the writer
+// must preserve those lockers into a {updater + survivors} MultiXactId instead of
+// clobbering them with a plain single-xid updater stamp. This mirrors upstream
+// heap_update / heap_delete, which call MultiXactIdCreate/Expand on the
+// HEAP_XMAX_IS_LOCKED_ONLY pre-existing-locker path so a concurrent non-
+// conflicting locker is not silently dropped.
+//
+// keysUpdated is whether the write changes a key column (DELETE and key-changing
+// UPDATE → StatusUpdate; no-key UPDATE → StatusNoKeyUpdate). It is recorded as
+// our updater member's status and drives the HEAP_KEYS_UPDATED hint bit.
+//
+// Returns ok=true with the MultiXactId and hint bits when a preserving multi
+// should be stamped (the caller must use the multi-aware stamp primitive);
+// ok=false when there is no surviving foreign locker to preserve — the common
+// case — so the caller keeps the plain single-xid stamp. The bounded gate (a
+// pre-existing active foreign lock-only holder) never arises on the pgbench
+// TPC-B / TPC-H hot path, so the plain stamp remains the fast path. M0118-0004.
+// effectiveWriterXID returns the (sub)transaction id that heap mutations in
+// this statement must stamp as the old tuple's xmax (and the deletion's WAL
+// record). Inside an open savepoint it is the session's current sub-XID; the
+// per-statement ctx.Tx.XID is always rebuilt from the connection's top-level
+// transaction (dispatch.go `ectx.Tx = tx`) and so never reflects an open
+// savepoint on its own — the live sub-XID is read from the session, exactly as
+// lockRowsOp.writerXID does for the row-lock path. Stamping xmax under the
+// sub-XID is what lets ROLLBACK TO SAVEPOINT revert a DELETE/UPDATE:
+// MarkSubxactAborted flips the sub-XID dead, so the subxact-aware visibility
+// check (SeesCommittedXIDWithSubxacts) treats the deletion as never-happened and
+// the tuple stays live. Mirrors upstream heap_delete/heap_update stamping
+// GetCurrentTransactionId(), which returns the current subtransaction id.
+// Outside a savepoint EffectiveWriterXID() == the top-level XID, so this is a
+// strict no-op. M0118-0009 (docs/design/0118-0013).
+func effectiveWriterXID(ctx *Context) storage.TransactionID {
+	if sess, ok := ctx.Session.(*BasicSession); ok {
+		if x := sess.EffectiveWriterXID(); x != storage.InvalidTransactionID {
+			return x
+		}
+	}
+	return ctx.Tx.XID
+}
+
+func stampUpdaterXmaxPreservingLockers(ctx *Context, hdr storage.HeapTupleHeader, keysUpdated bool) (multixact.MultiXactId, uint16, uint16, bool, error) {
+	survivors, err := survivingLockersForUpdate(ctx, hdr, keysUpdated)
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	if len(survivors) == 0 {
+		return 0, 0, 0, false, nil
+	}
+	// Re-add our writer as the updater member alongside the preserved lockers.
+	members := append(survivors, multixact.Member{Xid: effectiveWriterXID(ctx), Status: updaterMemberStatus(keysUpdated)})
+	multi, err := ctx.MultiXact.CreateFromMembers(members)
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	infomask, infomask2 := multixact.HintBits(members)
+	return multi, infomask, infomask2, true, nil
+}
+
+// survivingLockersForUpdate returns the pre-existing lock-only holders on a
+// tuple about to be updated/deleted by this transaction that must be PRESERVED
+// (carried forward), i.e. NOT including our own updater member. It is the shared
+// core of two producers: the old tuple's {updater + survivors} stamp
+// (stampUpdaterXmaxPreservingLockers) AND the new tuple version's inherited lock
+// xmax (carryForwardLockersToNewTuple) — upstream heap_update propagates the
+// non-conflicting lockers both onto the old tuple's xmax (so a chain walker still
+// honours them) and forward onto the new version (so the lock is not forgotten
+// when the updater commits, multixact-no-forget).
+//
+// Retention rules (mirroring MultiXactIdExpand / compute_new_xmax_infomask):
+//   - drop our own current writer member (re-added as the updater by the caller
+//     that needs it);
+//   - carry forward, unchanged, any member from our OWN transaction tree at an
+//     outer level (top-level xact or an enclosing savepoint) — never conflicts
+//     with us and ROLLBACK TO must restore it (delete-abort-savept);
+//   - drop dead foreign lockers (lock already released);
+//   - drop foreign lockers whose mode CONFLICTS with our update (they must be
+//     waited for upstream, not preserved);
+//   - keep still-active non-conflicting foreign lockers (e.g. FOR KEY SHARE
+//     under a no-key UPDATE — the multixact-no-forget scenario).
+//
+// Returns an empty slice (the common case) when the xmax is not a preserved
+// lock-only holder set, so callers keep the plain single-xid stamp. The gate (a
+// pre-existing active foreign lock-only holder) never arises on the pgbench
+// TPC-B / TPC-H hot path. M0118-0009 (docs/design/0118-0016).
+func survivingLockersForUpdate(ctx *Context, hdr storage.HeapTupleHeader, keysUpdated bool) ([]multixact.Member, error) {
+	if ctx.MultiXact == nil || ctx.TxnMgr == nil {
+		return nil, nil
+	}
+	// Only the lock-only case is preserved here. A non-lock-only (updater-bearing)
+	// xmax means a concurrent modify, which isConcurrentlyUpdated/EPQ handles
+	// upstream of the stamp; reaching the stamp with such an xmax is not this
+	// producer's concern.
+	if hdr.Xmax == storage.InvalidTransactionID || !storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		return nil, nil
+	}
+
+	// Enumerate the existing lock holders (single-xid or multi).
+	var existing []multixact.Member
+	if storage.IsHeapTupleXmaxMulti(hdr.Infomask) {
+		members, ok := ctx.MultiXact.Members(multixact.MultiXactId(hdr.Xmax))
+		if !ok {
+			// Membership lost (stamped before a restart with no persisted store):
+			// nothing resolvable to combine with; keep the plain stamp.
+			return nil, nil
+		}
+		existing = members
+	} else {
+		existing = []multixact.Member{{Xid: hdr.Xmax, Status: lockOnlyMemberStatus(hdr.Infomask, hdr.Infomask2)}}
+	}
+
+	ourStatus := updaterMemberStatus(keysUpdated)
+	ourXID := effectiveWriterXID(ctx) // sub-XID inside a savepoint; else top-level
+	ourTop := ctx.TxnMgr.TopLevelXid(ourXID)
+	survivors := make([]multixact.Member, 0, len(existing)+1)
+	for _, m := range existing {
+		if m.Xid == ourXID {
+			continue // exactly our writer: re-added by the updater-stamp caller
+		}
+		if ctx.TxnMgr.TopLevelXid(m.Xid) == ourTop {
+			survivors = append(survivors, m)
+			continue
+		}
+		if !ctx.TxnMgr.IsXIDActive(m.Xid) {
+			continue // dead foreign locker: lock already released
+		}
+		if multixact.StatusesConflict(m.Status, ourStatus) {
+			continue // conflicting foreign locker: must be waited for, not preserved
+		}
+		survivors = append(survivors, m)
+	}
+	return survivors, nil
+}
+
+// carryForwardLockersToNewTuple stamps the new tuple version (at newSlot, already
+// inserted on `page`) with the non-conflicting lockers inherited from the old
+// tuple `oldHdr`, as a lock-only MultiXactId. This is the new-version half of
+// PostgreSQL heap_update's lock propagation (compute_new_xmax_infomask): KEY
+// SHARE / SHARE lockers that do not conflict with a no-key update are carried
+// onto the successor so the lock survives the updater's commit — otherwise a
+// later locker on the committed-updated row finds no holder and proceeds out of
+// order (multixact-no-forget: after s2's no-key UPDATE commits, s3's FOR UPDATE
+// must still wait on s1's inherited FOR KEY SHARE until s1 commits).
+//
+// No-op (returns nil) when there is nothing to carry — the common case and the
+// pgbench hot path. M0118-0009 (docs/design/0118-0016).
+func carryForwardLockersToNewTuple(ctx *Context, page storage.Page, oldHdr storage.HeapTupleHeader, newSlot uint16, keysUpdated bool) error {
+	lockers, err := survivingLockersForUpdate(ctx, oldHdr, keysUpdated)
+	if err != nil || len(lockers) == 0 {
+		return err
+	}
+	multi, err := ctx.MultiXact.CreateFromMembers(lockers)
+	if err != nil {
+		return err
+	}
+	infomask, infomask2 := multixact.HintBits(lockers)
+	return storage.PageSetHeapTupleXmaxMulti(page, newSlot, storage.TransactionID(multi), infomask, infomask2)
+}
+
+// stampUpdaterXmaxNonHOT is the non-HOT (delete-half / DELETE) convenience
+// wrapper around stampUpdaterXmaxPreservingLockers: it stamps the old tuple's
+// xmax at `slot` on `page` with a {updater + surviving lockers} MultiXactId when
+// a pre-existing foreign non-conflicting locker must be preserved, else falls
+// back to the plain single-xid updater stamp. Unlike the HOT path it writes no
+// CTID / HEAP_HOT_UPDATED (the new version lives in a different slot/page and the
+// chain link is written separately by the caller). The bounded gate means the
+// plain stamp remains the fast path for every hot-path write. M0118-0004.
+func stampUpdaterXmaxNonHOT(ctx *Context, page storage.Page, slot uint16, hdr storage.HeapTupleHeader, keysUpdated bool) error {
+	multi, im, im2, ok, err := stampUpdaterXmaxPreservingLockers(ctx, hdr, keysUpdated)
+	if err != nil {
+		return err
+	}
+	if ok {
+		return storage.PageSetHeapTupleXmaxMulti(page, slot, storage.TransactionID(multi), im, im2)
+	}
+	if serr := storage.PageSetHeapTupleXmax(page, slot, effectiveWriterXID(ctx)); serr != nil {
+		return serr
+	}
+	// A key-changing UPDATE / DELETE must mark the old tuple HEAP_KEYS_UPDATED so
+	// a concurrent FOR KEY SHARE locker recognises the conflict and WAITS on the
+	// updater instead of following the CTID chain to the (uncommitted) new
+	// version. The multi path above already encodes this through the updater
+	// member's StatusUpdate (multixact.HintBits sets the bit); the single-xid
+	// fallback — taken when there is no pre-existing locker to combine with, the
+	// common case — must set it explicitly. Mirrors upstream heap_update /
+	// heap_delete stamping HEAP_KEYS_UPDATED on the old tuple. Without it, s2's
+	// FOR KEY SHARE in aborted-keyrevoke (perms 7-9) reads keysUpdated=false and
+	// proceeds out of order. M0118-0009.
+	if keysUpdated {
+		return storage.PageSetHeapTupleKeysUpdated(page, slot)
+	}
+	return nil
 }
 
 // tryApplyHOTUpdate attempts a same-page HOT update of the tuple at
@@ -1950,11 +2319,16 @@ func tryApplyHOTUpdate(
 		return false, &ExecError{Code: "XX000", Message: encErr.Error()}
 	}
 	bitmap := NullBitmapPG(newRow)
+	// xmin = effective writer XID (sub-XID inside an open savepoint) so a HOT new
+	// version created in a savepoint disappears on ROLLBACK TO, mirroring the
+	// old-tuple xmax stamp below (PageStampHotOldTuple under effectiveWriterXID);
+	// no-op outside a savepoint. M0118-0009.
+	xmin := effectiveWriterXID(ctx)
 	var tup storage.HeapTuple
 	if len(bitmap) > 0 {
-		tup = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
+		tup = storage.NewHeapTupleWithNulls(xmin, storage.InvalidTransactionID, bitmap, body)
 	} else {
-		tup = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+		tup = storage.NewHeapTuple(xmin, storage.InvalidTransactionID, body)
 	}
 	tup.Header.Infomask |= storage.HeapOnlyTuple
 	tup.Header.SetNatts(len(cols))
@@ -1999,11 +2373,13 @@ func tryApplyHOTUpdate(
 	// wait for the conflicting transaction (with deadlock detection) and
 	// fall back to the delete+insert path so it can re-check visibility.
 	if oldTuple, gerr := storage.PageGetHeapTuple(s.Page(), oldSlot); gerr == nil &&
-		isConcurrentlyUpdated(oldTuple.Header, ctx.Tx.XID, &ctx.Snap) {
-		xmax := oldTuple.Header.Xmax
+		isConcurrentlyUpdated(oldTuple.Header, ctx.Tx.XID, &ctx.Snap, ctx.MultiXact) {
+		xmax := concurrentModifierXID(oldTuple.Header, ctx.MultiXact)
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		if epqWait(ctx, xmax) {
+		if dl, terr := epqWait(ctx, xmax); terr != nil {
+			return false, terr
+		} else if dl {
 			// Deadlock detected — surface 40001 immediately rather than
 			// looping into the delete+insert EPQ path.
 			return false, &ExecError{
@@ -2038,20 +2414,50 @@ func tryApplyHOTUpdate(
 		return false, addErr
 	}
 
-	if err := storage.PageStampHotOldTuple(s.Page(), oldSlot, ctx.Tx.XID, blk, newSlot); err != nil {
+	// Stamp the old tuple's xmax + HOT chain link. If the old tuple already
+	// carries a pre-existing non-conflicting foreign locker (a lock-only xmax,
+	// e.g. FOR KEY SHARE), preserve it into a {updater + survivors} MultiXactId
+	// instead of clobbering it with the plain single-xid stamp (M0118-0004
+	// producer). A HOT update never changes a key column, so the updater status
+	// is always no-key (keysUpdated=false). The HeapHotUpdate WAL record still
+	// carries the single updater xid (markHeapHotUpdateDirty below), so crash
+	// recovery degrades to the single-xid stamp — correct, since the transient
+	// lockers do not survive a crash (multixact WAL persistence deferred; see
+	// docs/design/0118-0002).
+	stampErr := func() error {
+		if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), oldSlot); herr == nil {
+			// Carry the old tuple's non-conflicting lockers forward onto the new
+			// version BEFORE re-stamping the old tuple's xmax (the stamp below
+			// rewrites it). A HOT update never changes a key column, so the
+			// updater status is no-key (keysUpdated=false) and a FOR KEY SHARE
+			// holder is preserved (multixact-no-forget). M0118-0009.
+			if cerr := carryForwardLockersToNewTuple(ctx, s.Page(), oldHdrTup.Header, newSlot, false); cerr != nil {
+				return cerr
+			}
+			multi, im, im2, ok, perr := stampUpdaterXmaxPreservingLockers(ctx, oldHdrTup.Header, false)
+			if perr != nil {
+				return perr
+			}
+			if ok {
+				return storage.PageStampHotOldTupleMulti(s.Page(), oldSlot, storage.TransactionID(multi), im, im2, effectiveWriterXID(ctx), blk, newSlot)
+			}
+		}
+		return storage.PageStampHotOldTuple(s.Page(), oldSlot, effectiveWriterXID(ctx), blk, newSlot)
+	}()
+	if stampErr != nil {
 		s.Unlock()
 		ctx.Pool.Unpin(s)
-		if errors.Is(err, storage.ErrUnsupportedItem) || errors.Is(err, storage.ErrInvalidSlot) {
+		if errors.Is(stampErr, storage.ErrUnsupportedItem) || errors.Is(stampErr, storage.ErrInvalidSlot) {
 			// PagePruneOpt above (page-full fallback) can invalidate
 			// the old slot in a tight window between our pre-check
 			// and this stamp. Caller treats (false, nil) as "skip
 			// this row" — same fall-through as the page-full case.
 			return false, nil
 		}
-		return false, err
+		return false, stampErr
 	}
 
-	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, ctx.Tx.XID, tupleBytes)
+	derr := markHeapHotUpdateDirty(ctx.Pool, s, rel, blk, oldSlot, effectiveWriterXID(ctx), tupleBytes)
 	s.Unlock()
 	ctx.Pool.Unpin(s)
 	if derr == nil && ctx.InDMLCTE && ctx.CTEWriteFence != nil {
@@ -2113,6 +2519,53 @@ func newUpdateOp(p *planner.Update) (*updateOp, error) {
 
 func (o *updateOp) Schema() planner.Schema { return o.plan.ReturningSchema }
 
+// childFKsToRecheck returns the foreign keys declared ON the updated table
+// whose referencing columns are modified by this UPDATE's SET list. PostgreSQL
+// fires the RI_FKey_check (the referenced parent row must exist) AFTER trigger
+// only when a key column actually changes, so an UPDATE that touches no FK
+// column performs no parent lookup. Mirroring that both matches PG and bounds
+// the new check's blast radius to FK-key UPDATEs on tables that have FKs.
+// Computed once per UPDATE (the SET list is fixed). M0118-0008
+// (detach-partition-concurrently-4).
+func (o *updateOp) childFKsToRecheck() []catalog.ForeignKey {
+	tbl := o.plan.Table
+	if len(tbl.ForeignKeys) == 0 {
+		return nil
+	}
+	var out []catalog.ForeignKey
+	for _, fk := range tbl.ForeignKeys {
+		for _, fc := range fk.Columns {
+			idx := -1
+			for i, col := range tbl.Columns {
+				if strings.EqualFold(col.Name, fc) {
+					idx = i
+					break
+				}
+			}
+			if idx >= 0 && idx < len(o.plan.Set) && o.plan.Set[idx] != nil {
+				out = append(out, fk)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// recheckChildFKs verifies that newRow's modified FK key values still reference
+// an existing parent row. newRow must be aligned to o.plan.Table.Columns; pass
+// scanTbl so rows that came from an inheritance child (different column layout)
+// are skipped — those children carry their own FKs and are not exercised here.
+// M0118-0008 (detach-partition-concurrently-4).
+func (o *updateOp) recheckChildFKs(fks []catalog.ForeignKey, newRow Row, scanTbl *catalog.Table) error {
+	if len(fks) == 0 {
+		return nil
+	}
+	if scanTbl != nil && scanTbl != o.plan.Table {
+		return nil
+	}
+	return checkFKInsertForConstraints(o.ctx, o.plan.Table, nil, newRow, fks)
+}
+
 // appendUpdateRetRow evaluates the plan's RETURNING expressions against
 // newRow and appends the result to o.retRows. No-op when RETURNING is absent.
 func (o *updateOp) appendUpdateRetRow(newRow Row) {
@@ -2150,6 +2603,12 @@ func (o *updateOp) Open(ctx *Context) error {
 	o.ctx = ctx
 	rel := ctx.Catalog.RelFileNode(o.plan.Table)
 	if err := ctx.acquireRelLock(rel, lockmgr.RowExclusiveLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
+	if err := ctx.acquireWriteLockTxn(rel); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.plan.Pos()
 		}
@@ -2211,7 +2670,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		slot.RLock()
 		// Follow the HOT chain: the index pointer may be stale (pointing
 		// to an earlier version whose CTID leads to the live version).
-		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
+		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
 		if !found {
@@ -2229,7 +2688,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				return false, err
 			}
 			slot2.RLock()
-			tuple, actualSlot, found = followHOTChain(slot2.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID)
+			tuple, actualSlot, found = followHOTChain(slot2.Page(), ptr.Offset, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.MultiXact)
 			slot2.RUnlock()
 			o.ctx.Pool.Unpin(slot2)
 			if !found {
@@ -2282,7 +2741,25 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 	// Modification phase: HOT update when eligible, else delete+insert.
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
 	idxTbl := o.plan.Table
+	// M0118-0003 (write-path half): an UPDATE that changes an index *key*
+	// column (hotEligible is false — INCLUDE columns are excluded from a
+	// covering index's key list, so this matches the HEAP_KEYS_UPDATED stamp
+	// below) is a StatusUpdate that conflicts with every lock strength; a no-key
+	// UPDATE is a StatusNoKeyUpdate that does NOT conflict with FOR KEY SHARE.
+	// Classify once so the write-path wait matches how the locker decoded it.
+	updReqStatus := multixact.StatusNoKeyUpdate
+	if !hotEligible {
+		updReqStatus = multixact.StatusUpdate
+	}
+	fksToRecheckIdx := o.childFKsToRecheck()
 	for _, pu := range pending {
+		// Honour a row lock propagated forward onto this live version by
+		// heap_lock_updated_tuple before writing: wait for every still-active
+		// foreign holder whose strength conflicts with this UPDATE. A lock-only
+		// xmax does not relocate the row, so pu.blk/pu.slot stay valid.
+		if err := waitForConflictingRowLock(o.ctx, rel, pu.blk, pu.slot, updReqStatus, o.plan.Pos()); err != nil {
+			return nil, err
+		}
 		// Fire BEFORE UPDATE trigger if the row has no concurrent xmax (i.e. a
 		// HOT-eligible write or a plain non-concurrent update). When a concurrent
 		// xmax is present (concurrent DELETE / UPDATE in progress), defer the
@@ -2296,6 +2773,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 			pu.newRow = retRow
 			trigFiredViaIdx = true
+		}
+		// RI_FKey_check: the new FK key value must reference an existing parent
+		// row. M0118-0008 (detach-partition-concurrently-4).
+		if err := o.recheckChildFKs(fksToRecheckIdx, pu.newRow, idxTbl); err != nil {
+			return nil, err
 		}
 		used := false
 		if hotEligible {
@@ -2323,8 +2805,8 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
 				// M0100-0005: when epqDoUpdate is set (abort confirmed on previous
 				// iteration), skip the EPQ check and fall through to the update code.
-				if !epqDoUpdate && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
-					xmax := oldTup.Header.Xmax
+				if !epqDoUpdate && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
+					xmax := concurrentModifierXID(oldTup.Header, o.ctx.MultiXact)
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
@@ -2342,7 +2824,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// the original snapshot, matching PG's EvalPlanQual semantics
 					// (chain-follow uses refreshed snapshot; qual eval uses origSnap).
 					origSnap := o.ctx.Snap
-					if epqWait(o.ctx, xmax) {
+					if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+						terr.Pos = o.plan.Pos()
+						return nil, terr
+					} else if dl {
 						return nil, &ExecError{
 							Code:    "40001",
 							Pos:     o.plan.Pos(),
@@ -2480,7 +2965,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					s.Lock()
 					// Re-check for concurrent modification during trigger execution.
 					freshTup, freshErr := storage.PageGetHeapTuple(s.Page(), pu.slot)
-					if freshErr != nil || isConcurrentlyUpdated(freshTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+					if freshErr != nil || isConcurrentlyUpdated(freshTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
 						s.Unlock()
 						o.ctx.Pool.Unpin(s)
 						if freshErr != nil {
@@ -2520,9 +3005,15 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 				}
 				var stampIdxErr error
 				if isCrossPartitionMoveIdx {
-					stampIdxErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, o.ctx.Tx.XID)
+					stampIdxErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
+				} else if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), pu.slot); herr == nil {
+					// Preserve a pre-existing non-conflicting foreign locker into a
+					// {updater + survivors} multi (M0118-0004 producer). Non-HOT
+					// UPDATE is treated key-changing by goopg (KeysUpdated stamped
+					// below), so the updater status is StatusUpdate (keysUpdated=true).
+					stampIdxErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
 				} else {
-					stampIdxErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
+					stampIdxErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
 				}
 				if stampIdxErr != nil {
 					s.Unlock()
@@ -2536,7 +3027,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					}
 					return nil, stampIdxErr
 				}
-				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
+				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, rel, pu.blk, pu.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				if derr != nil {
@@ -2715,7 +3206,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 	var inheritChildOIDs map[uint32]bool
 	if imU, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		updateScanTables = append(updateScanTables, imU.PartitionChildren(tbl.OID)...)
-		inheritChildren := imU.InheritanceChildren(tbl.OID)
+		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
+		// Design 0118-0036 (M0118-0008 inherit-temp).
+		inheritChildren := catalog.AccessibleInheritanceChildren(imU.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
 		updateScanTables = append(updateScanTables, inheritChildren...)
 		if len(inheritChildren) > 0 {
 			inheritChildOIDs = make(map[uint32]bool, len(inheritChildren))
@@ -2809,8 +3302,8 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					s.Lock()
 					tupHdr, tErr := storage.PageGetHeapTuple(s.Page(), writeSlot)
-					noConflict := tErr != nil || !isConcurrentlyUpdated(tupHdr.Header, o.ctx.Tx.XID, &o.ctx.Snap)
-					xmax := tupHdr.Header.Xmax
+					noConflict := tErr != nil || !isConcurrentlyUpdated(tupHdr.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact)
+					xmax := concurrentModifierXID(tupHdr.Header, o.ctx.MultiXact)
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					if noConflict {
@@ -2826,7 +3319,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update"}
 					}
-					if epqWait(o.ctx, xmax) {
+					if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+						terr.Pos = o.plan.Pos()
+						return terr
+					} else if dl {
 						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update (deadlock)"}
 					}
@@ -2942,7 +3438,29 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		}
 	}
 	hotEligibleSeq := hotUpdateEligible(o.plan, o.ctx)
+	// M0118-0003 (write-path half): classify this UPDATE for the row-lock wait
+	// exactly as updateViaIndex does (key-column change → StatusUpdate, else
+	// StatusNoKeyUpdate), so a propagated FOR KEY SHARE lock blocks a key-UPDATE
+	// but not a no-key UPDATE — the same hotEligible signal that stamps
+	// HEAP_KEYS_UPDATED. INCLUDE columns are excluded from a covering index's
+	// key list, so a no-key UPDATE stays no-key here.
+	updReqStatusSeq := multixact.StatusNoKeyUpdate
+	if !hotEligibleSeq {
+		updReqStatusSeq = multixact.StatusUpdate
+	}
+	fksToRecheckSeq := o.childFKsToRecheck()
 	for _, pu := range pending {
+		// Honour a row lock propagated forward onto this live version by
+		// heap_lock_updated_tuple before writing: wait for every still-active
+		// conflicting foreign holder. A lock-only xmax does not relocate the
+		// row, so pu.blk/pu.slot stay valid.
+		puWaitRel := pu.rel
+		if puWaitRel == (storage.RelFileNode{}) {
+			puWaitRel = rel
+		}
+		if err := waitForConflictingRowLock(o.ctx, puWaitRel, pu.blk, pu.slot, updReqStatusSeq, o.plan.Pos()); err != nil {
+			return nil, err
+		}
 		// Fire BEFORE UPDATE triggers (e.g. RAISE NOTICE) before writing.
 		// M0100-0005o: when the row came from a partition/inheritance child,
 		// fire that child's triggers — partition-key-update-1.spec defines
@@ -2957,6 +3475,11 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				continue // RETURN NULL — skip this row
 			}
 			pu.newRow = retRow
+		}
+		// RI_FKey_check: the new FK key value must reference an existing parent
+		// row (after BEFORE triggers may have rewritten it). M0118-0008.
+		if err := o.recheckChildFKs(fksToRecheckSeq, pu.newRow, pu.scanTbl); err != nil {
+			return nil, err
 		}
 		puRel := pu.rel
 		if puRel == (storage.RelFileNode{}) {
@@ -2985,8 +3508,8 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				}
 				s.Lock()
 				oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), pu.slot)
-				if !epqDoUpdateSeq && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
-					xmax := oldTup.Header.Xmax
+				if !epqDoUpdateSeq && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
+					xmax := concurrentModifierXID(oldTup.Header, o.ctx.MultiXact)
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
@@ -2996,7 +3519,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 							Message: "could not serialize access due to concurrent update",
 						}
 					}
-					if epqWait(o.ctx, xmax) {
+					if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+						terr.Pos = o.plan.Pos()
+						return nil, terr
+					} else if dl {
 						return nil, &ExecError{
 							Code:    "40001",
 							Pos:     o.plan.Pos(),
@@ -3140,9 +3666,14 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				}
 				var stampErr error
 				if isCrossPartitionMove {
-					stampErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, o.ctx.Tx.XID)
+					stampErr = storage.PageSetHeapTupleMovedPartition(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
+				} else if oldHdrTup, herr := storage.PageGetHeapTuple(s.Page(), pu.slot); herr == nil {
+					// Preserve a pre-existing non-conflicting foreign locker into a
+					// {updater + survivors} multi (M0118-0004 producer). Non-HOT
+					// UPDATE is key-changing in goopg, so keysUpdated=true.
+					stampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldHdrTup.Header, true)
 				} else {
-					stampErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
+					stampErr = storage.PageSetHeapTupleXmax(s.Page(), pu.slot, effectiveWriterXID(o.ctx))
 				}
 				if stampErr != nil {
 					s.Unlock()
@@ -3152,7 +3683,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					return nil, stampErr
 				}
-				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puRel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
+				derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puRel, pu.blk, pu.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				if derr != nil {
@@ -3339,6 +3870,12 @@ func (o *deleteOp) Open(ctx *Context) error {
 		}
 		return err
 	}
+	if err := ctx.acquireWriteLockTxn(rel); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 	return nil
 }
 
@@ -3391,7 +3928,9 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 	var delInheritChildOIDs map[uint32]bool
 	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 		scanTables = append(scanTables, im.PartitionChildren(tbl.OID)...)
-		delInheritChildren := im.InheritanceChildren(tbl.OID)
+		// Drop other-session temp inheritance children (RELATION_IS_OTHER_TEMP).
+		// Design 0118-0036 (M0118-0008 inherit-temp).
+		delInheritChildren := catalog.AccessibleInheritanceChildren(im.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx))
 		scanTables = append(scanTables, delInheritChildren...)
 		if len(delInheritChildren) > 0 {
 			delInheritChildOIDs = make(map[uint32]bool, len(delInheritChildren))
@@ -3451,8 +3990,8 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					}
 					s.Lock()
 					tupHdr, tErr := storage.PageGetHeapTuple(s.Page(), deleteSlot)
-					noConflict := tErr != nil || !isConcurrentlyUpdated(tupHdr.Header, o.ctx.Tx.XID, &o.ctx.Snap)
-					xmax := tupHdr.Header.Xmax
+					noConflict := tErr != nil || !isConcurrentlyUpdated(tupHdr.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact)
+					xmax := concurrentModifierXID(tupHdr.Header, o.ctx.MultiXact)
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
 					if noConflict {
@@ -3462,7 +4001,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update"}
 					}
-					if epqWait(o.ctx, xmax) {
+					if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+						terr.Pos = o.plan.Pos()
+						return terr
+					} else if dl {
 						return &ExecError{Code: "40001", Pos: o.plan.Pos(),
 							Message: "could not serialize access due to concurrent update (deadlock)"}
 					}
@@ -3550,6 +4092,16 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		if victimRel == (storage.RelFileNode{}) {
 			victimRel = rel // fallback to parent rel
 		}
+		// M0118-0003 (write-path half): honour a row lock propagated forward
+		// onto this live version by heap_lock_updated_tuple. A DELETE conflicts
+		// with every lock strength incl. FOR KEY SHARE, so wait for every
+		// still-active foreign holder before stamping our xmax. The lock-only
+		// xmax does not relocate the row, so v.blk/v.slot stay valid; a genuine
+		// concurrent updater is handled by the isConcurrentlyUpdated EPQ loop
+		// below (this only covers pure row locks the lockmgr already released).
+		if err := waitForConflictingRowLock(o.ctx, victimRel, v.blk, v.slot, multixact.StatusUpdate, o.plan.Pos()); err != nil {
+			return nil, err
+		}
 		// EvalPlanQual retry loop (M0098-0004): on concurrent xmax conflict,
 		// wait for the conflicting transaction and re-check visibility.
 		epqSkipDel := false
@@ -3563,8 +4115,8 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			// M0090-0002: detect concurrent xmax-stamp under the
 			// exclusive Lock before our own stamp.
 			oldTup, oldGerr := storage.PageGetHeapTuple(s.Page(), v.slot)
-			if !epqDoDelete && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
-				xmax := oldTup.Header.Xmax
+			if !epqDoDelete && oldGerr == nil && isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
+				xmax := concurrentModifierXID(oldTup.Header, o.ctx.MultiXact)
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				if epqRetry >= epqRetryLimit(o.ctx.Tx.Isolation) {
@@ -3574,7 +4126,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 						Message: "could not serialize access due to concurrent update",
 					}
 				}
-				if epqWait(o.ctx, xmax) {
+				if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+					terr.Pos = o.plan.Pos()
+					return nil, terr
+				} else if dl {
 					return nil, &ExecError{
 						Code:    "40001",
 						Pos:     o.plan.Pos(),
@@ -3639,7 +4194,18 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			if oldGerr == nil {
 				oldTupleBytes, _ = oldTup.MarshalBinary()
 			}
-			if err := storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID); err != nil {
+			var delStampErr error
+			if oldGerr == nil {
+				// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
+				// producer). A DELETE is StatusUpdate (keysUpdated=true), which
+				// conflicts with every lock mode, so this is a no-op unless a
+				// non-conflicting locker somehow survives; wired for sibling-path
+				// parity with the UPDATE delete-half.
+				delStampErr = stampUpdaterXmaxNonHOT(o.ctx, s.Page(), v.slot, oldTup.Header, true)
+			} else {
+				delStampErr = storage.PageSetHeapTupleXmax(s.Page(), v.slot, effectiveWriterXID(o.ctx))
+			}
+			if err := delStampErr; err != nil {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				if errors.Is(err, storage.ErrUnsupportedItem) {
@@ -3648,7 +4214,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				}
 				return nil, err
 			}
-			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, victimRel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, victimRel, v.blk, v.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
@@ -3779,8 +4345,9 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				tbl:  pc,
 			})
 		}
-		// Inheritance children: require column remapping.
-		for _, ic := range imFrom.InheritanceChildren(o.plan.Table.OID) {
+		// Inheritance children: require column remapping. Drop other-session
+		// temp children (RELATION_IS_OTHER_TEMP). Design 0118-0036.
+		for _, ic := range catalog.AccessibleInheritanceChildren(imFrom.InheritanceChildren(o.plan.Table.OID), sessionTempOwner(o.ctx)) {
 			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lockmgr.RowExclusiveLock); err != nil {
 				return nil, err
 			}
@@ -3892,6 +4459,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 	// pu.rel    = relation where the new row is written (destination; may differ on cross-partition move).
 	// pu.tgtCols = columns of the destination relation. M0097-0078, M0100-0010.
 	hotEligible := hotUpdateEligible(o.plan, o.ctx)
+	fksToRecheckFrom := o.childFKsToRecheck()
 	seen := make(map[[2]uint64]bool)
 	for _, pu := range pending {
 		puSrcRel := pu.srcRel
@@ -3920,6 +4488,11 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 			}
 			pu.newRow = retRow
 		}
+		// RI_FKey_check: the new FK key value must reference an existing parent
+		// row. M0118-0008 (detach-partition-concurrently-4).
+		if err := o.recheckChildFKs(fksToRecheckFrom, pu.newRow, pu.tbl); err != nil {
+			return nil, err
+		}
 		used := false
 		if hotEligible && puSrcRel == rel && puRel == rel {
 			var err error
@@ -3942,8 +4515,8 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				o.ctx.Pool.Unpin(s)
 				continue // slot gone (concurrent prune)
 			}
-			if isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
-				xmax := oldTup.Header.Xmax
+			if isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
+				xmax := concurrentModifierXID(oldTup.Header, o.ctx.MultiXact)
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
 				// EPQ: wait for the concurrent transaction and recheck. M0100-0010.
@@ -3952,7 +4525,10 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 						Message: "could not serialize access due to concurrent update"}
 				}
 				origSnap := o.ctx.Snap
-				if epqWait(o.ctx, xmax) {
+				if dl, terr := epqWait(o.ctx, xmax); terr != nil {
+					terr.Pos = o.plan.Pos()
+					return nil, terr
+				} else if dl {
 					return nil, &ExecError{Code: "40P01", Pos: o.plan.Pos(),
 						Message: "deadlock detected"}
 				}
@@ -4049,7 +4625,10 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				continue
 			}
 			oldTupleBytes, _ = oldTup.MarshalBinary()
-			stampErr := storage.PageSetHeapTupleXmax(s.Page(), pu.slot, o.ctx.Tx.XID)
+			// Preserve a pre-existing non-conflicting foreign locker into a
+			// {updater + survivors} multi (M0118-0004 producer); plain single-xid
+			// stamp otherwise. keysUpdated=true (non-HOT write).
+			stampErr := stampUpdaterXmaxNonHOT(o.ctx, s.Page(), pu.slot, oldTup.Header, true)
 			if stampErr != nil {
 				s.Unlock()
 				o.ctx.Pool.Unpin(s)
@@ -4058,7 +4637,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 				}
 				return nil, stampErr
 			}
-			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puSrcRel, pu.blk, pu.slot, o.ctx.Tx.XID, oldTupleBytes)
+			derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, puSrcRel, pu.blk, pu.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if derr != nil {
@@ -4180,7 +4759,8 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 	}
 	usingScanTargets := []usingScanTarget{{rel: rel, cols: tgtCols}}
 	if imDel, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-		for _, ic := range imDel.InheritanceChildren(tbl.OID) {
+		// Drop other-session temp inheritance children. Design 0118-0036.
+		for _, ic := range catalog.AccessibleInheritanceChildren(imDel.InheritanceChildren(tbl.OID), sessionTempOwner(o.ctx)) {
 			if err := o.ctx.acquireRelLock(o.ctx.Catalog.RelFileNode(ic), lockmgr.RowExclusiveLock); err != nil {
 				return nil, err
 			}
@@ -4281,13 +4861,16 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 			o.ctx.Pool.Unpin(s)
 			continue
 		}
-		if isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap) {
+		if isConcurrentlyUpdated(oldTup.Header, o.ctx.Tx.XID, &o.ctx.Snap, o.ctx.MultiXact) {
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			continue // skip concurrent-update EPQ for USING case
 		}
 		oldTupleBytes, _ := oldTup.MarshalBinary()
-		if stampErr := storage.PageSetHeapTupleXmax(s.Page(), v.slot, o.ctx.Tx.XID); stampErr != nil {
+		// Preserve a pre-existing non-conflicting foreign locker (M0118-0004
+		// producer). DELETE is StatusUpdate (keysUpdated=true) → no-op unless a
+		// non-conflicting locker survives; wired for sibling-path parity.
+		if stampErr := stampUpdaterXmaxNonHOT(o.ctx, s.Page(), v.slot, oldTup.Header, true); stampErr != nil {
 			s.Unlock()
 			o.ctx.Pool.Unpin(s)
 			if errors.Is(stampErr, storage.ErrUnsupportedItem) {
@@ -4295,7 +4878,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 			}
 			return nil, stampErr
 		}
-		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, vRel, v.blk, v.slot, o.ctx.Tx.XID, oldTupleBytes)
+		derr := markHeapDeleteDirtyAndClearVM(o.ctx, s, vRel, v.blk, v.slot, effectiveWriterXID(o.ctx), oldTupleBytes)
 		s.Unlock()
 		o.ctx.Pool.Unpin(s)
 		if derr != nil {
@@ -4387,7 +4970,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 				ctx.Pool.Unpin(s)
 				return err
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				// CTESelfModifiedErrors: if a sub-command during the CTE phase
 				// modified this invisible (own-xmax) tuple, the outer
 				// UPDATE/DELETE must raise ERRCODE_TRIGGERED_DATA_CHANGE_VIOLATION.
@@ -4490,6 +5073,108 @@ func lockedByForeign(h storage.HeapTupleHeader, currentXID storage.TransactionID
 		return h.Xmax
 	}
 	return storage.InvalidTransactionID
+}
+
+// conflictingRowLockHolders returns the still-active foreign transactions that
+// hold a row-level *lock* on tuple h whose strength conflicts with a write of
+// the given request status. It is the write-path analogue of
+// lockRowsOp.activeLockHolders: heap_lock_updated_tuple propagates a row lock
+// forward onto the live version of an updated tuple (the locker half of
+// M0118-0003, propagateLockForward), so a plain UPDATE / DELETE must honour
+// that lock across statements. The lockmgr tuple tag is statement-scoped
+// (ReleaseAll at each Query message's end), so a cross-statement holder has
+// already dropped it — cross-statement blocking instead rides this persisted
+// lock-only xmax, the same durable signal stampLockInner's wait branch reads.
+//
+// reqStatus is StatusUpdate for a DELETE or a key-column UPDATE (conflicts with
+// every lock strength incl. FOR KEY SHARE) and StatusNoKeyUpdate for a no-key
+// UPDATE (does NOT conflict with FOR KEY SHARE). Returns nil when the tuple
+// carries no foreign lock-only xmax, when the held strength does not conflict,
+// or when no naming holder is still active (the lock was already released).
+//
+// GOTCHA: a MultiXactId and a TransactionID share the uint32 space and
+// HEAP_XMAX_IS_MULTI is the only disambiguator, so a multi xmax is resolved
+// through the member store and never handed to IsXIDActive directly. A real
+// updater/deleter (xmax not lock-only) is left to the isConcurrentlyUpdated /
+// EPQ path; this helper only covers pure row locks.
+func conflictingRowLockHolders(ctx *Context, h storage.HeapTupleHeader, reqStatus multixact.Status) []storage.TransactionID {
+	if ctx.TxnMgr == nil {
+		return nil
+	}
+	if h.Xmax == storage.InvalidTransactionID || h.Xmax == ctx.Tx.XID {
+		return nil
+	}
+	if !storage.IsHeapTupleLockOnly(h.Infomask) {
+		return nil
+	}
+	if storage.IsHeapTupleXmaxMulti(h.Infomask) {
+		if ctx.MultiXact == nil {
+			return nil
+		}
+		members, ok := ctx.MultiXact.Members(multixact.MultiXactId(h.Xmax))
+		if !ok {
+			return nil
+		}
+		var out []storage.TransactionID
+		for _, m := range members {
+			// Per-member conflict: a FOR KEY SHARE member does not block a
+			// no-key UPDATE even when a FOR SHARE member in the same multi
+			// does, so we wait only on the members we actually conflict with
+			// (mirrors Do_MultiXactIdWait's per-member DoLockModesConflict).
+			if m.Xid != ctx.Tx.XID && ctx.TxnMgr.IsXIDActive(m.Xid) &&
+				multixact.StatusesConflict(m.Status, reqStatus) {
+				out = append(out, m.Xid)
+			}
+		}
+		return out
+	}
+	// Single-holder lock-only xmax: the strength lives in the infomask bits.
+	if !tupleLockConflicts(reqStatus, h.Infomask, h.Infomask2) {
+		return nil
+	}
+	if ctx.TxnMgr.IsXIDActive(h.Xmax) {
+		return []storage.TransactionID{h.Xmax}
+	}
+	return nil
+}
+
+// waitForConflictingRowLock blocks the current write until no still-active
+// foreign transaction holds a conflicting row lock on (rel,blk,slot). It is the
+// write-path counterpart to the lock-only wait branch in stampLockInner: a row
+// lock propagated forward by heap_lock_updated_tuple onto a live version must
+// stall a conflicting UPDATE / DELETE until the holder commits or aborts (the
+// heap_update / heap_delete MultiXactIdWait / XactLockTableWait step). A
+// lock-only xmax never relocates the row, so blk/slot stay valid across the
+// wait; a genuine concurrent updater is still handled by the caller's EPQ loop.
+// Each holder is waited on via epqWait, which registers a wait-for-graph edge,
+// so a lock cycle surfaces as a 40001 deadlock rather than hanging.
+func waitForConflictingRowLock(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16, reqStatus multixact.Status, pos int) error {
+	for {
+		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if err != nil {
+			return err
+		}
+		s.RLock()
+		tup, gerr := storage.PageGetHeapTuple(s.Page(), slot)
+		var holders []storage.TransactionID
+		if gerr == nil {
+			holders = conflictingRowLockHolders(ctx, tup.Header, reqStatus)
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+		if len(holders) == 0 {
+			return nil
+		}
+		for _, hx := range holders {
+			if dl, terr := epqWait(ctx, hx); terr != nil {
+				terr.Pos = pos
+				return terr
+			} else if dl {
+				return &ExecError{Code: "40001", Pos: pos,
+					Message: "could not serialize access due to concurrent update (deadlock)"}
+			}
+		}
+	}
 }
 
 // encodeIndexKeyFromCols builds a btree key for an index by looking up
@@ -5275,11 +5960,17 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 		return ptr, &ExecError{Code: "XX000", Message: encErr.Error()}
 	}
 	bitmap := NullBitmapPG(row)
+	// xmin = the effective writer XID: inside an open savepoint this is the
+	// current sub-XID, so a row inserted in a savepoint (incl. an UPDATE's new
+	// version) disappears when that savepoint is rolled back — its sub-XID flips
+	// aborted and the subxact-aware visibility check hides it (aborted-keyrevoke,
+	// M0118-0009). Outside a savepoint it equals ctx.Tx.XID, so this is a no-op.
+	xmin := effectiveWriterXID(ctx)
 	var tuple storage.HeapTuple
 	if len(bitmap) > 0 {
-		tuple = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
+		tuple = storage.NewHeapTupleWithNulls(xmin, storage.InvalidTransactionID, bitmap, body)
 	} else {
-		tuple = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+		tuple = storage.NewHeapTuple(xmin, storage.InvalidTransactionID, body)
 	}
 	tuple.Header.SetNatts(len(cols))
 	tuple.Header.Infomask |= storage.HeapXmaxInvalid
@@ -5495,11 +6186,15 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		return ptr, &ExecError{Code: "XX000", Message: err.Error()}
 	}
 	bitmap := NullBitmapPG(row)
+	// xmin = effective writer XID (sub-XID inside an open savepoint) so a
+	// savepoint-inserted row disappears on ROLLBACK TO; no-op outside a
+	// savepoint. M0118-0009 — twin of writeHeapRowReturning above.
+	xmin := effectiveWriterXID(ctx)
 	var tuple storage.HeapTuple
 	if len(bitmap) > 0 {
-		tuple = storage.NewHeapTupleWithNulls(ctx.Tx.XID, storage.InvalidTransactionID, bitmap, body)
+		tuple = storage.NewHeapTupleWithNulls(xmin, storage.InvalidTransactionID, bitmap, body)
 	} else {
-		tuple = storage.NewHeapTuple(ctx.Tx.XID, storage.InvalidTransactionID, body)
+		tuple = storage.NewHeapTuple(xmin, storage.InvalidTransactionID, body)
 	}
 	// Set t_infomask2 natts so PG's heap_deform_tuple can locate each attribute.
 	// Set HEAP_XMAX_INVALID so PG's visibility code treats xmax as invalid

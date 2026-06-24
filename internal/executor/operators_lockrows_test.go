@@ -7,6 +7,7 @@ import (
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 	"github.com/goopg/goopg/internal/storage"
@@ -162,31 +163,112 @@ func TestLockRowsNoWaitFailsOnContention(t *testing.T) {
 // (HeapXmaxExclLock) conflicts with every held row lock; a shared request
 // (FOR SHARE / KEY SHARE) conflicts only with a pure-exclusive FOR UPDATE
 // holder; an unlocked (no-lock-bits) infomask never conflicts.
+// TestTupleLockConflicts pins the full four-way row-lock conflict matrix
+// (FOR KEY SHARE / FOR SHARE / FOR NO KEY UPDATE / FOR UPDATE) the lockRows
+// producer enforces against a persisted lock-only holder. The expected results
+// are the upstream tuple-lock compatibility table: a FOR KEY SHARE request does
+// NOT conflict with a held FOR NO KEY UPDATE (a FK key lock vs a no-key update),
+// while FOR SHARE does. Conflict is symmetric. M0118-0003.
 func TestTupleLockConflicts(t *testing.T) {
-	const (
-		excl   = storage.HeapXmaxExclLock   // FOR UPDATE
-		shr    = storage.HeapXmaxShrLock    // FOR SHARE
-		keyshr = storage.HeapXmaxKeyShrLock // FOR KEY SHARE
-	)
+	// held strength → (infomask, infomask2) as the single-holder stamp records it.
+	type held struct {
+		infomask, infomask2 uint16
+	}
+	keyShareHeld := held{storage.HeapXmaxKeyShrLock, 0}
+	shareHeld := held{storage.HeapXmaxShrLock, 0}
+	noKeyUpdateHeld := held{storage.HeapXmaxExclLock, 0}
+	updateHeld := held{storage.HeapXmaxExclLock, storage.HeapKeysUpdated}
+
+	ks := multixact.StatusForKeyShare
+	sh := multixact.StatusForShare
+	nku := multixact.StatusForNoKeyUpdate
+	up := multixact.StatusForUpdate
+
 	cases := []struct {
-		name      string
-		requested uint16
-		held      uint16
-		want      bool
+		name string
+		req  multixact.Status
+		held held
+		want bool
 	}{
-		{"update vs none", excl, 0, false},
-		{"update vs update", excl, excl, true},
-		{"update vs share", excl, shr, true},
-		{"update vs keyshare", excl, keyshr, true},
-		{"share vs update", shr, excl, true},
-		{"share vs share", shr, shr, false},
-		{"share vs keyshare", shr, keyshr, false},
+		// held FOR KEY SHARE — conflicts only with FOR UPDATE.
+		{"keyshare vs keyshare", ks, keyShareHeld, false},
+		{"share vs keyshare", sh, keyShareHeld, false},
+		{"nokeyupdate vs keyshare", nku, keyShareHeld, false},
+		{"update vs keyshare", up, keyShareHeld, true},
+		// held FOR SHARE — conflicts with NO KEY UPDATE and UPDATE.
+		{"keyshare vs share", ks, shareHeld, false},
+		{"share vs share", sh, shareHeld, false},
+		{"nokeyupdate vs share", nku, shareHeld, true},
+		{"update vs share", up, shareHeld, true},
+		// held FOR NO KEY UPDATE — conflicts with everything except FOR KEY SHARE.
+		{"keyshare vs nokeyupdate", ks, noKeyUpdateHeld, false},
+		{"share vs nokeyupdate", sh, noKeyUpdateHeld, true},
+		{"nokeyupdate vs nokeyupdate", nku, noKeyUpdateHeld, true},
+		{"update vs nokeyupdate", up, noKeyUpdateHeld, true},
+		// held FOR UPDATE — conflicts with everything.
+		{"keyshare vs update", ks, updateHeld, true},
+		{"share vs update", sh, updateHeld, true},
+		{"nokeyupdate vs update", nku, updateHeld, true},
+		{"update vs update", up, updateHeld, true},
+		// no holder — never conflicts.
+		{"update vs none", up, held{0, 0}, false},
+		{"keyshare vs none", ks, held{0, 0}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := tupleLockConflicts(tc.requested, tc.held); got != tc.want {
-				t.Errorf("tupleLockConflicts(%#x, %#x) = %v, want %v",
-					tc.requested, tc.held, got, tc.want)
+			if got := tupleLockConflicts(tc.req, tc.held.infomask, tc.held.infomask2); got != tc.want {
+				t.Errorf("tupleLockConflicts(%v, %#x, %#x) = %v, want %v",
+					tc.req, tc.held.infomask, tc.held.infomask2, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLockMemberStatusFourWay pins the encode side of the four-way row-lock
+// strength → MultiXact member Status mapping the producer records. M0118-0003.
+func TestLockMemberStatusFourWay(t *testing.T) {
+	cases := []struct {
+		name        string
+		strength    uint16
+		keysUpdated bool
+		want        multixact.Status
+	}{
+		{"key share", storage.HeapXmaxKeyShrLock, false, multixact.StatusForKeyShare},
+		{"share", storage.HeapXmaxShrLock, false, multixact.StatusForShare},
+		{"no key update", storage.HeapXmaxExclLock, false, multixact.StatusForNoKeyUpdate},
+		{"for update", storage.HeapXmaxExclLock, true, multixact.StatusForUpdate},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := &lockRowsOp{lockStrength: tc.strength, lockKeysUpdated: tc.keysUpdated}
+			if got := o.lockMemberStatus(); got != tc.want {
+				t.Errorf("lockMemberStatus() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLockOnlyMemberStatusFourWay pins the decode side — reading a holder's
+// recorded infomask/infomask2 lock bits back to its member Status. It is the
+// twin of lockMemberStatus (per [[pattern_sibling_paths_must_agree]]); a FOR
+// UPDATE lock is only distinguishable from FOR NO KEY UPDATE by HEAP_KEYS_UPDATED.
+func TestLockOnlyMemberStatusFourWay(t *testing.T) {
+	cases := []struct {
+		name      string
+		infomask  uint16
+		infomask2 uint16
+		want      multixact.Status
+	}{
+		{"key share", storage.HeapXmaxKeyShrLock, 0, multixact.StatusForKeyShare},
+		{"share", storage.HeapXmaxShrLock, 0, multixact.StatusForShare},
+		{"no key update", storage.HeapXmaxExclLock, 0, multixact.StatusForNoKeyUpdate},
+		{"for update", storage.HeapXmaxExclLock, storage.HeapKeysUpdated, multixact.StatusForUpdate},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lockOnlyMemberStatus(tc.infomask, tc.infomask2); got != tc.want {
+				t.Errorf("lockOnlyMemberStatus(%#x, %#x) = %v, want %v",
+					tc.infomask, tc.infomask2, got, tc.want)
 			}
 		})
 	}
@@ -375,9 +457,15 @@ func TestUpdateBlocksOnForeignTupleLock(t *testing.T) {
 		t.Fatal("session 2 did not register as a tuple-tag waiter within 2s")
 	}
 
-	// Release session 1's transaction-scoped locks; session 2
-	// should now wake and complete.
+	// Release session 1's statement-scoped lockmgr lock AND end its
+	// transaction. Cross-statement row-lock blocking now rides the locker's
+	// transaction (M0118-0003 write-path half): the conflicting UPDATE waits on
+	// session 1's xact via WaitForXID, so a bare lockmgr release no longer
+	// unblocks it — the holder must commit or abort to release the row lock.
 	lm.ReleaseAll(1)
+	if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
+		t.Fatalf("rollback session 1: %v", err)
+	}
 	select {
 	case err := <-done:
 		if err != nil {
@@ -548,7 +636,13 @@ func TestUpdateViaIndexScanBlocksOnForeignTupleLock(t *testing.T) {
 		<-done
 		t.Fatal("session 2 did not register as a tuple-tag waiter via the IndexScan-driven UPDATE path")
 	}
+	// Release the lockmgr lock AND end session 1's transaction: the
+	// cross-statement write-path wait (M0118-0003) blocks on the locker's
+	// transaction, so the holder must commit/abort to release the row lock.
 	lm.ReleaseAll(1)
+	if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
+		t.Fatalf("rollback session 1: %v", err)
+	}
 	select {
 	case err := <-done:
 		if err != nil {
@@ -670,17 +764,26 @@ func TestForShareCompatibleMultipleHolders(t *testing.T) {
 		t.Fatal("session 3 UPDATE did not register as waiter")
 	}
 
-	// Release session 1; session 3 must still be blocked
-	// (session 2 still holds RowShareLock).
+	// End session 1's transaction (statement-scoped lockmgr release + abort);
+	// session 3 must still be blocked because session 2 still holds the FOR
+	// SHARE row lock. The write-path wait (M0118-0003) keys off active holders,
+	// so the holder's transaction — not a bare lockmgr release — is the gate.
 	lm.ReleaseAll(1)
+	if err := ctx.TxnMgr.Rollback(s1tx); err != nil {
+		t.Fatalf("rollback session 1: %v", err)
+	}
 	select {
 	case err := <-done:
 		t.Fatalf("session 3 unblocked too early — session 2 still holds: %v", err)
 	case <-time.After(100 * time.Millisecond):
 		// expected — still blocked
 	}
-	// Release session 2; session 3 should now wake.
+	// End session 2's transaction; session 3 should now wake (no active holder
+	// remains, so neither acquireTupleLock nor the conflict wait blocks).
 	lm.ReleaseAll(2)
+	if err := ctx.TxnMgr.Rollback(s2tx); err != nil {
+		t.Fatalf("rollback session 2: %v", err)
+	}
 	select {
 	case err := <-done:
 		if err != nil {
@@ -688,6 +791,461 @@ func TestForShareCompatibleMultipleHolders(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("session 3 did not unblock after both holders released")
+	}
+}
+
+// scanBlock0 walks block 0 of tbl and returns the (1-based) slot and header of
+// the first tuple matching pred, or slot==0 when none match. Used by the
+// MultiXact tests to inspect the post-stamp page state.
+func scanBlock0(t *testing.T, ctx *Context, tbl *catalog.Table, pred func(storage.HeapTupleHeader) bool) (uint16, storage.HeapTupleHeader) {
+	t.Helper()
+	rel := ctx.Catalog.RelFileNode(tbl)
+	pinned, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctx.Pool.Unpin(pinned)
+	pinned.RLock()
+	defer pinned.RUnlock()
+	page := pinned.Page()
+	count, err := storage.PageLinePointerCount(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for slot := uint16(1); slot <= uint16(count); slot++ {
+		raw, err := storage.PageGetItemRaw(page, slot)
+		if err != nil {
+			continue
+		}
+		parsed, err := storage.ParseHeapTuple(raw)
+		if err != nil {
+			continue
+		}
+		if pred(parsed.Header) {
+			return slot, parsed.Header
+		}
+	}
+	return 0, storage.HeapTupleHeader{}
+}
+
+// TestForShareFormsLockOnlyMultiXact is the headline MultiXact producer +
+// consumer test (M0118-0003). It exercises the whole round-trip against the
+// real hint-bit encoder:
+//
+//   - PRODUCER: two concurrent FOR SHARE holders on the same row must combine
+//     into a single lock-only MultiXactId xmax naming both holders, rather than
+//     the second silently overwriting the first's xmax.
+//   - CONSUMER (live multi): a third FOR UPDATE NOWAIT must resolve the multi's
+//     members, see that they are still active, and fail fast with 55P03 —
+//     proving the raw MultiXactId is not mis-read as a single TransactionID.
+//   - CONSUMER (holders gone): once both holders' transactions end, a fresh FOR
+//     UPDATE finds no live member and re-stamps a plain single-holder xmax.
+func TestForShareFormsLockOnlyMultiXact(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+	store := multixact.NewStore()
+
+	mkSession := func(b lockmgr.BackendID) *Context {
+		tx, _ := ctx.TxnMgr.Begin(0)
+		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
+		s := makeCtx(lm, b)
+		s.Pool = ctx.Pool
+		s.Catalog = ctx.Catalog
+		s.TxnMgr = ctx.TxnMgr
+		s.MultiXact = store
+		s.Tx = tx
+		s.Snap = snap
+		return s
+	}
+
+	s1 := mkSession(1)
+	s2 := mkSession(2)
+	if _, err := runForUpdate(t, s1, "SELECT id FROM items WHERE id = 1 FOR SHARE"); err != nil {
+		t.Fatalf("session-1 FOR SHARE: %v", err)
+	}
+	if _, err := runForUpdate(t, s2, "SELECT id FROM items WHERE id = 1 FOR SHARE"); err != nil {
+		t.Fatalf("session-2 FOR SHARE: %v", err)
+	}
+
+	// PRODUCER: id=1's tuple now carries a lock-only MultiXactId xmax.
+	_, hdr := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return storage.IsHeapTupleXmaxMulti(h.Infomask)
+	})
+	if hdr.Xmax == storage.InvalidTransactionID {
+		t.Fatal("no tuple carries a MultiXactId xmax after two FOR SHARE holders")
+	}
+	if !storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		t.Errorf("multi xmax not lock-only (Infomask=%#x)", hdr.Infomask)
+	}
+	members, ok := store.Members(multixact.MultiXactId(hdr.Xmax))
+	if !ok {
+		t.Fatalf("store has no members for multi %d", hdr.Xmax)
+	}
+	if len(members) != 2 {
+		t.Fatalf("multi has %d members, want 2: %+v", len(members), members)
+	}
+	byXid := map[storage.TransactionID]multixact.Status{}
+	for _, m := range members {
+		byXid[m.Xid] = m.Status
+	}
+	if st, ok := byXid[s1.Tx.XID]; !ok || st != multixact.StatusForShare {
+		t.Errorf("s1 (xid=%d) member missing/wrong status=%v members=%+v", s1.Tx.XID, st, members)
+	}
+	if st, ok := byXid[s2.Tx.XID]; !ok || st != multixact.StatusForShare {
+		t.Errorf("s2 (xid=%d) member missing/wrong status=%v members=%+v", s2.Tx.XID, st, members)
+	}
+
+	// CONSUMER (live multi): drop both holders' statement-scoped lockmgr tuple
+	// locks (their transactions stay active) so a third session reaches the
+	// heap-xmax conflict detection instead of blocking at the lockmgr. FOR
+	// UPDATE NOWAIT must fail fast with 55P03 because the multi is still live.
+	lm.ReleaseAll(1)
+	lm.ReleaseAll(2)
+	s3 := mkSession(3)
+	defer ctx.TxnMgr.Rollback(s3.Tx)
+	if _, err := runForUpdate(t, s3, "SELECT id FROM items WHERE id = 1 FOR UPDATE NOWAIT"); err == nil {
+		t.Fatal("FOR UPDATE NOWAIT against a live lock-only multi did not fail")
+	} else if ee, ok := err.(*ExecError); !ok || ee.Code != "55P03" {
+		t.Fatalf("FOR UPDATE NOWAIT error = %v, want 55P03", err)
+	}
+	// NOWAIT grants the lockmgr tuple tag before the heap-level 55P03 fires; in
+	// production dispatch releases it at statement end. Mirror that so the next
+	// session does not block on s3's leftover ExclusiveLock.
+	lm.ReleaseAll(3)
+
+	// CONSUMER (holders gone): end both holders' transactions; a fresh FOR
+	// UPDATE finds no live member and re-stamps a plain single-holder xmax.
+	if err := ctx.TxnMgr.Rollback(s1.Tx); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.TxnMgr.Rollback(s2.Tx); err != nil {
+		t.Fatal(err)
+	}
+	s4 := mkSession(4)
+	defer ctx.TxnMgr.Rollback(s4.Tx)
+	if _, err := runForUpdate(t, s4, "SELECT id FROM items WHERE id = 1 FOR UPDATE"); err != nil {
+		t.Fatalf("session-4 FOR UPDATE after holders gone: %v", err)
+	}
+	_, hdr4 := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return h.Xmax == s4.Tx.XID && !storage.IsHeapTupleXmaxMulti(h.Infomask)
+	})
+	if hdr4.Xmax != s4.Tx.XID {
+		t.Fatalf("after holders gone, no single-holder xmax==%d found", s4.Tx.XID)
+	}
+	if storage.IsHeapTupleXmaxMulti(hdr4.Infomask) {
+		t.Errorf("s4 single FOR UPDATE left a multi xmax (Infomask=%#x)", hdr4.Infomask)
+	}
+	if !storage.IsHeapTupleLockOnly(hdr4.Infomask) || hdr4.Infomask&storage.HeapXmaxExclLock == 0 {
+		t.Errorf("s4 xmax not lock-only exclusive (Infomask=%#x)", hdr4.Infomask)
+	}
+}
+
+// TestForShareJoinsInProgressUpdaterFormsMultiXact pins the updater-bearing
+// MultiXact producer (M0118-0003): branch (a) of stampLockInner. A FOR SHARE
+// lock arriving on a row whose xmax is another transaction's in-progress no-key
+// UPDATE must combine BOTH holders into a single updater-bearing MultiXactId
+// (HEAP_XMAX_LOCK_ONLY clear, GetUpdateXid resolving to the updater) rather than
+// silently dropping the lock (the pre-M0118 skip). This is the twin of
+// TestForShareFormsLockOnlyMultiXact for the non-lock-only case.
+func TestForShareJoinsInProgressUpdaterFormsMultiXact(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+	store := multixact.NewStore()
+	mkSession := func(b lockmgr.BackendID) *Context {
+		tx, _ := ctx.TxnMgr.Begin(0)
+		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
+		s := makeCtx(lm, b)
+		s.Pool = ctx.Pool
+		s.Catalog = ctx.Catalog
+		s.TxnMgr = ctx.TxnMgr
+		s.MultiXact = store
+		s.Tx = tx
+		s.Snap = snap
+		return s
+	}
+
+	// Session A: a no-key UPDATE on id=1 (label is unindexed → HEAP_KEYS_UPDATED
+	// stays clear). Leaves the old version's xmax = sA, non-lock-only, with sA
+	// still in progress. Release sA's statement-scoped lockmgr locks so sB's FOR
+	// SHARE reaches the heap-xmax branch (a) instead of blocking at the lockmgr —
+	// the same release dispatch.go performs at each Query message's end.
+	sA := mkSession(1)
+	defer ctx.TxnMgr.Rollback(sA.Tx)
+	if _, err := runForUpdate(t, sA, "UPDATE items SET label = 'zzz' WHERE id = 1"); err != nil {
+		t.Fatalf("session-A no-key UPDATE: %v", err)
+	}
+	if sA.Tx.XID == storage.InvalidTransactionID {
+		t.Fatal("session-A UPDATE did not materialise a real XID")
+	}
+	lm.ReleaseAll(1)
+
+	// Session B: FOR SHARE on id=1. Under READ COMMITTED sB still sees the old
+	// version (sA uncommitted) and locks it → branch (a) forms the multi.
+	sB := mkSession(2)
+	defer ctx.TxnMgr.Rollback(sB.Tx)
+	if _, err := runForUpdate(t, sB, "SELECT id FROM items WHERE id = 1 FOR SHARE"); err != nil {
+		t.Fatalf("session-B FOR SHARE: %v", err)
+	}
+
+	// The old version's xmax is now an updater-bearing MultiXactId: IS_MULTI set,
+	// LOCK_ONLY clear, naming both the updater (sA) and the locker (sB).
+	_, hdr := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return storage.IsHeapTupleXmaxMulti(h.Infomask) && !storage.IsHeapTupleLockOnly(h.Infomask)
+	})
+	if !storage.IsHeapTupleXmaxMulti(hdr.Infomask) {
+		t.Fatal("no tuple carries an updater-bearing MultiXactId xmax after FOR SHARE met an in-progress updater")
+	}
+	if storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		t.Errorf("updater-bearing multi must NOT be lock-only (Infomask=%#x)", hdr.Infomask)
+	}
+	members, ok := store.Members(multixact.MultiXactId(hdr.Xmax))
+	if !ok {
+		t.Fatalf("store has no members for multi %d", hdr.Xmax)
+	}
+	if len(members) != 2 {
+		t.Fatalf("multi has %d members, want 2: %+v", len(members), members)
+	}
+	byXid := map[storage.TransactionID]multixact.Status{}
+	for _, m := range members {
+		byXid[m.Xid] = m.Status
+	}
+	if st, ok := byXid[sA.Tx.XID]; !ok || st != multixact.StatusNoKeyUpdate {
+		t.Errorf("updater sA (xid=%d) member missing/wrong status=%v members=%+v", sA.Tx.XID, st, members)
+	}
+	if st, ok := byXid[sB.Tx.XID]; !ok || st != multixact.StatusForShare {
+		t.Errorf("locker sB (xid=%d) member missing/wrong status=%v members=%+v", sB.Tx.XID, st, members)
+	}
+	if upd, has := multixact.GetUpdateXid(members); !has || upd != sA.Tx.XID {
+		t.Errorf("GetUpdateXid = (%d, %v), want (%d, true)", upd, has, sA.Tx.XID)
+	}
+}
+
+// TestForKeySharePropagatesLockToUpdatedSuccessor pins the locker half of
+// update-chain lock propagation (lock-update-traversal): when SELECT ... FOR KEY
+// SHARE locks a version that an in-progress no-key UPDATE has already superseded,
+// the locker must traverse the update chain forward and lock the newer version
+// too — otherwise a later DELETE / key-UPDATE on the live successor would not see
+// the lock. goopg analog of heap_lock_updated_tuple. Companion to
+// TestForShareJoinsInProgressUpdaterFormsMultiXact (which checks only the old
+// version's combined multi); this asserts the successor carries our lock.
+func TestForKeySharePropagatesLockToUpdatedSuccessor(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+	store := multixact.NewStore()
+	mkSession := func(b lockmgr.BackendID) *Context {
+		tx, _ := ctx.TxnMgr.Begin(0)
+		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
+		s := makeCtx(lm, b)
+		s.Pool = ctx.Pool
+		s.Catalog = ctx.Catalog
+		s.TxnMgr = ctx.TxnMgr
+		s.MultiXact = store
+		s.Tx = tx
+		s.Snap = snap
+		return s
+	}
+
+	// Session A: in-progress no-key UPDATE on id=1 — creates a successor version
+	// (xmin = sA) and stamps the old version's xmax = sA (non-lock-only). Release
+	// sA's statement-scoped lockmgr locks like dispatch.go does at Query end so
+	// sB's FOR KEY SHARE reaches the heap-xmax combine branch.
+	sA := mkSession(1)
+	defer ctx.TxnMgr.Rollback(sA.Tx)
+	if _, err := runForUpdate(t, sA, "UPDATE items SET label = 'zzz' WHERE id = 1"); err != nil {
+		t.Fatalf("session-A no-key UPDATE: %v", err)
+	}
+	if sA.Tx.XID == storage.InvalidTransactionID {
+		t.Fatal("session-A UPDATE did not materialise a real XID")
+	}
+	lm.ReleaseAll(1)
+
+	// Session B: FOR KEY SHARE on id=1. Under READ COMMITTED sB still sees the old
+	// version (sA uncommitted) and locks it, then must propagate the lock forward
+	// to sA's successor version.
+	sB := mkSession(2)
+	defer ctx.TxnMgr.Rollback(sB.Tx)
+	if _, err := runForUpdate(t, sB, "SELECT id FROM items WHERE id = 1 FOR KEY SHARE"); err != nil {
+		t.Fatalf("session-B FOR KEY SHARE: %v", err)
+	}
+
+	// The successor version (the only tuple with xmin = sA) must now carry sB's
+	// FOR KEY SHARE lock-only xmax.
+	slot, hdr := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return h.Xmin == sA.Tx.XID
+	})
+	if slot == 0 {
+		t.Fatal("no successor version (xmin = sA) found on block 0 — update did not create a new version, or it landed off block 0")
+	}
+	if hdr.Xmax != sB.Tx.XID {
+		t.Fatalf("successor xmax = %d, want propagated sB locker xid %d (Infomask=%#x)", hdr.Xmax, sB.Tx.XID, hdr.Infomask)
+	}
+	if !storage.IsHeapTupleLockOnly(hdr.Infomask) {
+		t.Errorf("propagated lock on successor must be lock-only (Infomask=%#x)", hdr.Infomask)
+	}
+	if st := lockOnlyMemberStatus(hdr.Infomask, hdr.Infomask2); st != multixact.StatusForKeyShare {
+		t.Errorf("successor lock status = %v, want StatusForKeyShare", st)
+	}
+}
+
+// TestConflictingRowLockHoldersHonoursStrengthMatrix proves the write-path
+// decision half of M0118-0003: once a FOR KEY SHARE lock has been propagated
+// forward onto an updated tuple's successor version (the locker half, see
+// TestForKeySharePropagatesLockToUpdatedSuccessor), a plain UPDATE/DELETE must
+// classify the held lock against its own write strength before stamping xmax.
+// A DELETE or key-column UPDATE (StatusUpdate) conflicts with FOR KEY SHARE and
+// must wait on the holder; a no-key UPDATE (StatusNoKeyUpdate) does NOT conflict
+// and proceeds immediately. This is the exact discriminator that makes
+// lock-update-traversal's s2d1/s2d2 block while s2d3 runs through. We assert the
+// decision (conflictingRowLockHolders) directly — deterministic, no blocking;
+// the end-to-end <waiting ...> behaviour is pinned by the isolation spec test.
+func TestConflictingRowLockHoldersHonoursStrengthMatrix(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+	store := multixact.NewStore()
+	mkSession := func(b lockmgr.BackendID) *Context {
+		tx, _ := ctx.TxnMgr.Begin(0)
+		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
+		s := makeCtx(lm, b)
+		s.Pool = ctx.Pool
+		s.Catalog = ctx.Catalog
+		s.TxnMgr = ctx.TxnMgr
+		s.MultiXact = store
+		s.Tx = tx
+		s.Snap = snap
+		return s
+	}
+
+	// Session A: in-progress no-key UPDATE on id=1 (creates a successor version),
+	// then release its statement-scoped lockmgr locks like dispatch.go does.
+	sA := mkSession(1)
+	defer ctx.TxnMgr.Rollback(sA.Tx)
+	if _, err := runForUpdate(t, sA, "UPDATE items SET label = 'zzz' WHERE id = 1"); err != nil {
+		t.Fatalf("session-A no-key UPDATE: %v", err)
+	}
+	lm.ReleaseAll(1)
+
+	// Session B: FOR KEY SHARE on id=1 — propagates the lock forward to sA's
+	// successor version (the locker half).
+	sB := mkSession(2)
+	defer ctx.TxnMgr.Rollback(sB.Tx)
+	if _, err := runForUpdate(t, sB, "SELECT id FROM items WHERE id = 1 FOR KEY SHARE"); err != nil {
+		t.Fatalf("session-B FOR KEY SHARE: %v", err)
+	}
+
+	// Locate the successor version carrying sB's propagated FOR KEY SHARE lock.
+	slot, hdr := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return h.Xmin == sA.Tx.XID
+	})
+	if slot == 0 {
+		t.Fatal("no successor version (xmin = sA) found on block 0")
+	}
+	if !storage.IsHeapTupleLockOnly(hdr.Infomask) || hdr.Xmax != sB.Tx.XID {
+		t.Fatalf("precondition failed: successor must carry sB's lock-only xmax (xmax=%d, infomask=%#x)", hdr.Xmax, hdr.Infomask)
+	}
+
+	// Session C is the writer that evaluates the conflict against sB's lock.
+	sC := mkSession(3)
+	defer ctx.TxnMgr.Rollback(sC.Tx)
+
+	// DELETE / key-UPDATE (StatusUpdate) conflicts with FOR KEY SHARE: must
+	// surface the still-active holder sB so the write waits.
+	if got := conflictingRowLockHolders(sC, hdr, multixact.StatusUpdate); len(got) != 1 || got[0] != sB.Tx.XID {
+		t.Errorf("StatusUpdate (DELETE/key-UPDATE) holders = %v, want [%d] (must wait on sB)", got, sB.Tx.XID)
+	}
+
+	// No-key UPDATE (StatusNoKeyUpdate) does NOT conflict with FOR KEY SHARE:
+	// the write proceeds immediately, so no holder is returned.
+	if got := conflictingRowLockHolders(sC, hdr, multixact.StatusNoKeyUpdate); len(got) != 0 {
+		t.Errorf("StatusNoKeyUpdate (no-key UPDATE) holders = %v, want none (must NOT wait on FOR KEY SHARE)", got)
+	}
+
+	// A holder that is no longer active (rolled back) must not block any writer.
+	ctx.TxnMgr.Rollback(sB.Tx)
+	if got := conflictingRowLockHolders(sC, hdr, multixact.StatusUpdate); len(got) != 0 {
+		t.Errorf("after holder rollback, StatusUpdate holders = %v, want none", got)
+	}
+}
+
+// TestForShareSkipsAbortedUpdaterNoMultiXact is the negative twin: when the
+// foreign updater has ABORTED, the producer's MultiXactIdExpand-style survivor
+// filter drops it (an aborted updater leaves no live holder), so no multi is
+// formed — the M0118-0003 skip is preserved. Guards the survivor filter's
+// aborted-updater drop in stampMultiUpdaterLock.
+func TestForShareSkipsAbortedUpdaterNoMultiXact(t *testing.T) {
+	ctx, cat, cleanup := newStorageFixture(t)
+	defer cleanup()
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "items"})
+	seedItems(t, ctx, tbl)
+	if err := ctx.TxnMgr.Commit(ctx.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	lm := lockmgr.New()
+	store := multixact.NewStore()
+	mkSession := func(b lockmgr.BackendID) *Context {
+		tx, _ := ctx.TxnMgr.Begin(0)
+		snap, _ := ctx.TxnMgr.SnapshotFor(tx)
+		s := makeCtx(lm, b)
+		s.Pool = ctx.Pool
+		s.Catalog = ctx.Catalog
+		s.TxnMgr = ctx.TxnMgr
+		s.MultiXact = store
+		s.Tx = tx
+		s.Snap = snap
+		return s
+	}
+
+	// Session A: no-key UPDATE on id=1, then ABORT. The old version keeps xmax =
+	// sA, but sA is now in the aborted set.
+	sA := mkSession(1)
+	if _, err := runForUpdate(t, sA, "UPDATE items SET label = 'zzz' WHERE id = 1"); err != nil {
+		t.Fatalf("session-A no-key UPDATE: %v", err)
+	}
+	lm.ReleaseAll(1)
+	if err := ctx.TxnMgr.Rollback(sA.Tx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Session B: FOR SHARE on id=1 reaches branch (a) (xmax = aborted sA, non-
+	// lock-only) but the survivor filter drops the aborted updater → no multi.
+	sB := mkSession(2)
+	defer ctx.TxnMgr.Rollback(sB.Tx)
+	if _, err := runForUpdate(t, sB, "SELECT id FROM items WHERE id = 1 FOR SHARE"); err != nil {
+		t.Fatalf("session-B FOR SHARE: %v", err)
+	}
+	slot, _ := scanBlock0(t, ctx, tbl, func(h storage.HeapTupleHeader) bool {
+		return storage.IsHeapTupleXmaxMulti(h.Infomask) && !storage.IsHeapTupleLockOnly(h.Infomask)
+	})
+	if slot != 0 {
+		t.Errorf("an updater-bearing multi was formed for an aborted updater (slot=%d) — survivor filter failed", slot)
 	}
 }
 

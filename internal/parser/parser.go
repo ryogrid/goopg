@@ -1371,7 +1371,10 @@ func (p *parser) parseSet() (Stmt, error) {
 // Syntax accepted:
 //
 //	REINDEX [(VERBOSE)] [CONCURRENTLY] {INDEX|TABLE|DATABASE|SCHEMA|SYSTEM}
-//	  [IF EXISTS] name
+//	  [CONCURRENTLY] [IF EXISTS] name
+//
+// CONCURRENTLY is accepted in either the legacy pre-type position or the
+// modern post-type position (`REINDEX TABLE CONCURRENTLY name`).
 //
 // Executor stub: always succeeds without performing any index rebuild.
 func (p *parser) parseReindex() (Stmt, error) {
@@ -1418,6 +1421,14 @@ func (p *parser) parseReindex() (Stmt, error) {
 		r.ObjectType = "SYSTEM"
 	default:
 		return nil, p.errAtCur("expected INDEX, TABLE, DATABASE, SCHEMA, or SYSTEM after REINDEX")
+	}
+
+	// CONCURRENTLY may also appear AFTER the object-type keyword and before the
+	// name — this is the modern PostgreSQL position, e.g.
+	// `REINDEX TABLE CONCURRENTLY name` (the pre-type position handled above is
+	// the legacy form). Accept either spelling.
+	if !r.Concurrently && p.acceptIdentKeyword("concurrently") {
+		r.Concurrently = true
 	}
 
 	// Optional IF EXISTS

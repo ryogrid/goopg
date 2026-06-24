@@ -169,9 +169,19 @@ type sessionNoticeQueue struct {
 	total   int // monotonic count of all notices ever pushed; never reset by drain
 }
 
-func (q *sessionNoticeQueue) push(msg string) {
+// push records a server message, prefixed with its protocol severity
+// ("WARNING:  " / "NOTICE:  " / …) exactly as upstream isolationtester echoes
+// it. PostgreSQL emits both NOTICE- and WARNING-severity NoticeResponses during
+// a step (e.g. VACUUM (SKIP_LOCKED) emits a WARNING when a relation is skipped),
+// and the expected output distinguishes them, so the real severity must be
+// preserved rather than hard-coded to "NOTICE". An empty severity (older driver
+// or non-localized path) falls back to "NOTICE".
+func (q *sessionNoticeQueue) push(severity, msg string) {
+	if severity == "" {
+		severity = "NOTICE"
+	}
 	q.mu.Lock()
-	q.notices = append(q.notices, msg)
+	q.notices = append(q.notices, severity+":  "+msg)
 	q.total++
 	q.mu.Unlock()
 }
@@ -211,7 +221,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 		base, err := pq.NewConnector(r.DSN)
 		if err == nil {
 			withNotice := pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
-				q.push(n.Message)
+				q.push(n.Severity, n.Message)
 			})
 			sessionDBs[sname] = sql.OpenDB(withNotice)
 		} else {
@@ -290,22 +300,34 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 	}
 	specBase = strings.TrimSuffix(specBase, ".spec")
 
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "starting permutation: %s\n", strings.Join(perm, " "))
+
 	// Per-session setup: set application_name first so pg_locks queries
 	// filtered by application_name can identify sessions. M0100-0006b.
+	//
+	// PostgreSQL isolationtester.c (run_permutation) prints a per-session
+	// setup block's result set at the top of every permutation — right after
+	// the "starting permutation:" line — when the block's final command returns
+	// tuples (PGRES_TUPLES_OK). e.g. lock-update-delete's s2 setup runs
+	// `SELECT pg_advisory_lock(0)` and PG emits its one-row result before any
+	// step. COMMAND_OK setups (BEGIN/SET/INSERT) print nothing. We mirror this:
+	// the SET application_name (a goopg-only addition PG never runs) is executed
+	// uncaptured, then the spec's setup block is run with output captured and
+	// emitted in session order. M0118-0003.
 	for _, sname := range sessionNames {
 		appName := "isolation/" + specBase + "/" + sname
 		if err := execConn(ctx, conns[sname], "SET application_name = '"+appName+"'"); err != nil {
 			return "", fmt.Errorf("session %q set application_name: %w", sname, err)
 		}
 		if setupSQL, ok := spec.SessionSetup[sname]; ok && setupSQL != "" {
-			if err := execConn(ctx, conns[sname], setupSQL); err != nil {
-				return "", fmt.Errorf("session %q setup: %w", sname, err)
+			out, errText := execConnSetupCapture(ctx, conns[sname], setupSQL)
+			if errText != "" {
+				return "", fmt.Errorf("session %q setup: %s", sname, errText)
 			}
+			sb.WriteString(out)
 		}
 	}
-
-	var sb strings.Builder
-	fmt.Fprintf(&sb, "starting permutation: %s\n", strings.Join(perm, " "))
 
 	var pending []pendingStep
 
@@ -396,18 +418,59 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			// Step completed immediately — release its context.
 			stepCancel()
 			activeSteps[step.Session] = nil
-			// Honor completion blockers: delay reporting this step's
-			// completion until the markers are satisfied (e.g. "notices <n>").
-			waitForStepBlockers(spec, sessionQueues, stepBlockers, stepBaselines)
-			// Drain notices generated during this non-blocking step.
-			if q != nil {
-				outcome.notices = q.drain()
+			if hasPendingStepCompleteBlocker(stepBlockers, pending) {
+				// PostgreSQL isolationtester: a step annotated with a
+				// step-completion blocker that names a still-pending (blocked)
+				// step — e.g. s1_advunlock1(s2_update) — is rendered in the
+				// waiting/completed format, its own completion report withheld
+				// until the referenced blocker step finishes. The step's query
+				// has already run (here, releasing the advisory lock the blocker
+				// waits on), so awaiting the blocker now lets it surface in the
+				// stable upstream order.
+				pending = reportStepGatedOnBlockers(&sb, spec, sessionQueues,
+					step.Name, step.SQL, outcome, q, stepBlockers, pending)
+			} else if hasStarBlocker(stepBlockers) {
+				// PostgreSQL isolationtester (*) marker: the step is expected
+				// to block, so it is ALWAYS reported in waiting/completed
+				// format even when goopg observed it complete immediately. The
+				// deadlock specs use it for the victim step whose
+				// deadlock_timeout fires too fast to reliably catch in a wait
+				// state (deadlock-hard's s8a1(*)). Mirror the immediate-else
+				// branch's notice drain + post-step drain so unblocked waiters
+				// (e.g. s7a8, gated on s8a1) still surface in upstream order.
+				waitForStepBlockers(spec, sessionQueues, stepBlockers, stepBaselines)
+				if q != nil {
+					outcome.notices = q.drain()
+				}
+				sb.WriteString(formatWaitingStepHeader(step.Name, step.SQL))
+				// Report any pending (blocked) step that has since completed BEFORE
+				// this step's own completion. isolationtester reports waiting steps
+				// in dispatch order, and a (*)-marked step may itself have waited on
+				// an earlier-dispatched blocked step (e.g. multiple-cic's s2i waits
+				// for the older concurrent build s1i to drain), so that step's
+				// <... completed> must print first. EXCLUDE pending steps explicitly
+				// gated on THIS step (a BlockerStepComplete, e.g. deadlock-hard's
+				// s7a8(s8a1)): those must print AFTER it. Steps still blocked simply
+				// time out of the drain and stay pending.
+				gatedOnStar, ungated := partitionGatedOn(pending, step.Name)
+				ungated = drainWithTimeout(&sb, spec, sessionQueues, ungated, postStepDrainWait)
+				writeCompletedStep(&sb, step.Name, step.SQL, outcome)
+				pending = append(ungated, gatedOnStar...)
+				pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait)
+			} else {
+				// Honor completion blockers: delay reporting this step's
+				// completion until the markers are satisfied (e.g. "notices <n>").
+				waitForStepBlockers(spec, sessionQueues, stepBlockers, stepBaselines)
+				// Drain notices generated during this non-blocking step.
+				if q != nil {
+					outcome.notices = q.drain()
+				}
+				// Print the current step first, then give pending steps a brief
+				// window to complete (matching PostgreSQL isolationtester order:
+				// unblocked waiting steps appear before the next regular step).
+				sb.WriteString(formatStepOutput(step.Name, step.SQL, outcome, false))
+				pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait)
 			}
-			// Print the current step first, then give pending steps a brief
-			// window to complete (matching PostgreSQL isolationtester order:
-			// unblocked waiting steps appear before the next regular step).
-			sb.WriteString(formatStepOutput(step.Name, step.SQL, outcome, false))
-			pending = drainWithTimeout(&sb, spec, sessionQueues, pending, postStepDrainWait)
 
 		case <-time.After(blockDetectWait):
 			// Step appears blocked.  Drain notices that arrived before the
@@ -417,7 +480,7 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			// isolationtester's output format.
 			if q != nil {
 				for _, notice := range q.drain() {
-					fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", step.Session, notice)
+					fmt.Fprintf(&sb, "%s: %s\n", step.Session, notice)
 				}
 			}
 			// Upstream isolationtester echoes step SQL verbatim and appends
@@ -540,13 +603,95 @@ func waitForStepBlockers(spec IsolationSpec, queues map[string]*sessionNoticeQue
 	}
 }
 
+// hasPendingStepCompleteBlocker reports whether any of the step's blockers is a
+// BlockerStepComplete that references a step currently in `pending` (launched
+// but not yet reported complete). Such a step must be rendered in PostgreSQL
+// isolationtester's waiting/completed format with its report gated behind the
+// referenced blocker step.
+// hasStarBlocker reports whether any of the step's blockers is the (*) marker
+// (BlockerStar), which in PostgreSQL isolationtester forces the step to be
+// reported in waiting/completed format regardless of observed timing.
+func hasStarBlocker(blockers []StepBlocker) bool {
+	for _, b := range blockers {
+		if b.Kind == BlockerStar {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPendingStepCompleteBlocker(blockers []StepBlocker, pending []pendingStep) bool {
+	for _, b := range blockers {
+		if b.Kind != BlockerStepComplete {
+			continue
+		}
+		for _, p := range pending {
+			if p.name == b.StepName {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// reportStepGatedOnBlockers renders a step that completed immediately but is
+// annotated with one or more BlockerStepComplete markers referencing pending
+// (still-blocked) steps. Mirrors PostgreSQL isolationtester: the step is echoed
+// with the "<waiting ...>" marker, then each referenced blocker step is awaited
+// and reported complete, and finally this step is reported complete. The step's
+// own query has already executed (its outcome is in `outcome`) — typically it
+// released the lock the blocker steps were waiting on. Returns the pending slice
+// with the completed blocker steps removed.
+func reportStepGatedOnBlockers(sb *strings.Builder, spec IsolationSpec, queues map[string]*sessionNoticeQueue,
+	name, sql string, outcome stepOutcome, queue *sessionNoticeQueue, blockers []StepBlocker, pending []pendingStep) []pendingStep {
+	sb.WriteString(formatWaitingStepHeader(name, sql))
+	for _, b := range blockers {
+		if b.Kind != BlockerStepComplete {
+			continue
+		}
+		for i := 0; i < len(pending); i++ {
+			p := pending[i]
+			if p.name != b.StepName {
+				continue
+			}
+			select {
+			case o := <-p.outCh:
+				if p.cancelFn != nil {
+					p.cancelFn()
+				}
+				waitForStepBlockers(spec, queues, p.blockers, p.baselines)
+				if p.queue != nil {
+					o.notices = p.queue.drain()
+				}
+				writeCompletedStep(sb, p.name, p.sql, o)
+			case <-time.After(drainWindow):
+				fmt.Fprintf(sb, "step %s: <... timed out waiting>\n", p.name)
+				if p.cancelFn != nil {
+					p.cancelFn()
+					select {
+					case <-p.outCh:
+					case <-time.After(2 * time.Second):
+					}
+				}
+			}
+			pending = append(pending[:i], pending[i+1:]...)
+			break
+		}
+	}
+	if queue != nil {
+		outcome.notices = queue.drain()
+	}
+	writeCompletedStep(sb, name, sql, outcome)
+	return pending
+}
+
 // writeCompletedStep writes a blocked step's completed output: NOTICEs first
 // (matching PostgreSQL isolationtester's ordering for waiting steps), then
 // the "<... completed>" marker, then result rows.
 func writeCompletedStep(sb *strings.Builder, name, sql string, o stepOutcome) {
 	for _, notice := range o.notices {
 		if o.session != "" {
-			fmt.Fprintf(sb, "%s: NOTICE:  %s\n", o.session, notice)
+			fmt.Fprintf(sb, "%s: %s\n", o.session, notice)
 		}
 	}
 	fmt.Fprintf(sb, "step %s: <... completed>\n", name)
@@ -561,7 +706,7 @@ func drainPendingStepNotices(sb *strings.Builder, p pendingStep) {
 		return
 	}
 	for _, notice := range p.queue.drain() {
-		fmt.Fprintf(sb, "%s: NOTICE:  %s\n", p.session, notice)
+		fmt.Fprintf(sb, "%s: %s\n", p.session, notice)
 	}
 }
 
@@ -588,6 +733,28 @@ func drainCompleted(sb *strings.Builder, spec IsolationSpec, queues map[string]*
 // drainWithTimeout drains pending steps that complete within the given window.
 // After a regular step completes, this lets unblocked waiting steps surface
 // before the next regular step, matching PostgreSQL isolationtester ordering.
+// partitionGatedOn splits pending into (gated, ungated): gated steps carry a
+// BlockerStepComplete that names stepName, meaning isolationtester withholds
+// their completion report until stepName completes. Dispatch order is otherwise
+// preserved within each partition.
+func partitionGatedOn(pending []pendingStep, stepName string) (gated, ungated []pendingStep) {
+	for _, p := range pending {
+		isGated := false
+		for _, b := range p.blockers {
+			if b.Kind == BlockerStepComplete && b.StepName == stepName {
+				isGated = true
+				break
+			}
+		}
+		if isGated {
+			gated = append(gated, p)
+		} else {
+			ungated = append(ungated, p)
+		}
+	}
+	return gated, ungated
+}
+
 func drainWithTimeout(sb *strings.Builder, spec IsolationSpec, queues map[string]*sessionNoticeQueue, pending []pendingStep, window time.Duration) []pendingStep {
 	if len(pending) == 0 {
 		return pending
@@ -628,16 +795,36 @@ func execStepFromQueue(ctx context.Context, conn *sql.Conn, sqlText, session str
 }
 
 // splitSQLStatements splits a multi-statement SQL block into individual
-// statement strings. Handles single-quoted strings (with ” escapes) and
-// single-line (--) comments. Sufficient for all isolation spec files.
+// statement strings. Handles single-quoted strings (with ” escapes),
+// dollar-quoted strings ($$...$$ / $tag$...$tag$), and single-line (--)
+// comments. Dollar-quote awareness is required for PL/pgSQL DO blocks and
+// function bodies whose payload embeds its own statement-terminating
+// semicolons (e.g. `do $$ ... commit; ... $$;` in plpgsql-toast): a naive
+// split on `;` would cut the block inside the body and hand goopg an
+// unterminated dollar-quoted string.
 func splitSQLStatements(sql string) []string {
 	var stmts []string
 	var cur strings.Builder
 	inSingleQuote := false
+	// dollarCloser is the active dollar-quote terminator (e.g. "$$" or
+	// "$body$") while inside a dollar-quoted literal; empty when not.
+	dollarCloser := ""
 
 	i := 0
 	for i < len(sql) {
 		c := sql[i]
+
+		if dollarCloser != "" {
+			if c == '$' && i+len(dollarCloser) <= len(sql) && sql[i:i+len(dollarCloser)] == dollarCloser {
+				cur.WriteString(dollarCloser)
+				i += len(dollarCloser)
+				dollarCloser = ""
+				continue
+			}
+			cur.WriteByte(c)
+			i++
+			continue
+		}
 
 		if inSingleQuote {
 			cur.WriteByte(c)
@@ -652,6 +839,19 @@ func splitSQLStatements(sql string) []string {
 			}
 			i++
 			continue
+		}
+
+		if c == '$' {
+			// Try to open a dollar-quoted literal: $tag$ where tag is
+			// empty or a SQL identifier (no '$' inside the tag). If the
+			// closing '$' of the opener is absent it is a positional
+			// parameter ($1) or stray '$' — fall through to copy it.
+			if closer, n := dollarOpener(sql, i); n > 0 {
+				cur.WriteString(sql[i : i+n])
+				dollarCloser = closer
+				i += n
+				continue
+			}
 		}
 
 		switch c {
@@ -685,6 +885,30 @@ func splitSQLStatements(sql string) []string {
 		stmts = append(stmts, stmt)
 	}
 	return stmts
+}
+
+// dollarOpener checks whether a dollar-quote literal opens at sql[i] (which
+// must be '$'). On success it returns the matching closer string (e.g. "$$"
+// or "$body$") and the byte length of the opener; otherwise ("", 0). The tag
+// between the dollar signs is empty or a SQL identifier and cannot itself
+// contain a '$' (PG manual §4.1.2.4).
+func dollarOpener(sql string, i int) (string, int) {
+	j := i + 1
+	for j < len(sql) {
+		ch := sql[j]
+		if ch == '$' {
+			opener := sql[i : j+1] // includes both '$' delimiters
+			return opener, len(opener)
+		}
+		isTagChar := ch == '_' ||
+			(ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+			(j > i+1 && ch >= '0' && ch <= '9')
+		if !isTagChar {
+			return "", 0
+		}
+		j++
+	}
+	return "", 0
 }
 
 // execOneStatement executes a single SQL statement on conn and returns the
@@ -818,7 +1042,7 @@ func formatStepOutput(name, sqlText string, o stepOutcome, afterWaiting bool) st
 		// NOTICEs appear BEFORE the step SQL line (matches PostgreSQL isolationtester).
 		for _, notice := range o.notices {
 			if o.session != "" {
-				fmt.Fprintf(&sb, "%s: NOTICE:  %s\n", o.session, notice)
+				fmt.Fprintf(&sb, "%s: %s\n", o.session, notice)
 			}
 		}
 		// Upstream isolationtester echoes step SQL verbatim after `step
@@ -985,6 +1209,31 @@ func execConnCapture(ctx context.Context, conn *sql.Conn, sqlText string) string
 		return ""
 	}
 	return pqprintFormat(rs.rows[0], rs.rows[1:], rs.colTypes)
+}
+
+// execConnSetupCapture runs a per-session (or global) setup block and returns
+// the result-set text PostgreSQL's isolationtester would print for it, plus any
+// error text. Mirrors isolationtester.c run_permutation: a setup is one PQexec
+// whose result is printed only when the final command returns tuples
+// (PGRES_TUPLES_OK); COMMAND_OK setups (BEGIN/SET/INSERT/DDL) print nothing.
+// libpq's PQexec yields only the final result of a multi-statement string, so
+// when a block runs several statements we format the LAST row-bearing result
+// (e.g. `BEGIN; SELECT * FROM force_snapshot;` prints the SELECT). Side effects
+// (advisory-lock acquisition, opened transaction) occur exactly as with the
+// uncaptured path — execStep runs the same statements, just capturing rows.
+func execConnSetupCapture(ctx context.Context, conn *sql.Conn, sqlText string) (string, string) {
+	outcome := execStep(ctx, conn, sqlText, "")
+	if outcome.errText != "" {
+		return "", outcome.errText
+	}
+	if len(outcome.results) == 0 {
+		return "", ""
+	}
+	rs := outcome.results[len(outcome.results)-1]
+	if len(rs.rows) == 0 || len(rs.rows[0]) == 0 {
+		return "", ""
+	}
+	return pqprintFormat(rs.rows[0], rs.rows[1:], rs.colTypes), ""
 }
 
 // formatPQError formats a database error as isolationtester would print it.

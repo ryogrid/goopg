@@ -1461,3 +1461,40 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 		}
 	}
 }
+
+// TestUpdateRelStatsPreservesColumns verifies that VACUUM's relstats publish
+// (UpdateRelStats) overwrites reltuples / relpages but leaves any per-column
+// pg_statistic from a prior ANALYZE intact, and seeds a fresh Stats when none
+// exists. M0118-0008 (vacuum-no-cleanup-lock).
+func TestUpdateRelStatsPreservesColumns(t *testing.T) {
+	c := NewInMemory()
+	tbl, err := c.CreateTable(parser.ObjectName{Name: "smalltbl"}, []Column{
+		{Name: "id", Type: Type{Name: "int4"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First VACUUM on a never-analyzed relation: Stats is seeded.
+	c.UpdateRelStats(tbl, 1, 20)
+	if tbl.Stats == nil || tbl.Stats.Pages != 1 || tbl.Stats.RowCount != 20 {
+		t.Fatalf("seed: got %+v want pages=1 rows=20", tbl.Stats)
+	}
+
+	// Simulate an ANALYZE having published column stats + avg width.
+	c.SetTableStats(tbl, &TableStats{
+		Pages:    1,
+		RowCount: 20,
+		AvgWidth: 68,
+		Columns:  []ColumnStats{{NDistinct: 20}},
+	})
+
+	// A subsequent VACUUM updates the counts but must NOT discard columns.
+	c.UpdateRelStats(tbl, 1, 21)
+	if tbl.Stats.RowCount != 21 || tbl.Stats.Pages != 1 {
+		t.Fatalf("merge counts: got %+v want pages=1 rows=21", tbl.Stats)
+	}
+	if tbl.Stats.AvgWidth != 68 || len(tbl.Stats.Columns) != 1 || tbl.Stats.Columns[0].NDistinct != 20 {
+		t.Fatalf("merge dropped column stats: %+v", tbl.Stats)
+	}
+}

@@ -31,7 +31,8 @@ type procSlot struct {
 	snapshotXmin uint32        // running min Xmin for OldestXmin
 	isolation    int32         // IsolationLevel stored as int32
 	inTxn        atomic.Uint32 // 1 = active txn; 0 = idle
-	_pad         [28]byte      // explicit pad to 64 B
+	pinnedSnap   atomic.Bool   // true once an RR/SSI snapshot is pinned for the txn
+	_pad         [24]byte      // explicit pad to 64 B
 }
 
 // ProcArray is the shared array of per-backend transaction slots.

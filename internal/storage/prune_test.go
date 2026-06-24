@@ -231,3 +231,112 @@ func TestPagePruneOptHOTChainRedirect(t *testing.T) {
 		t.Errorf("slot 2 data: %q", got.Data)
 	}
 }
+
+// TestPagePruneOptMultiXactXmax exercises the updater-bearing multixact arm of
+// the prune dead-tuple test. A MultiXactId in xmax must NOT be compared to the
+// oldestXmin horizon directly (a category error that could prune a live row);
+// PagePruneOpt resolves the updater member via storage.ResolveMultiUpdater and
+// applies the horizon test to the updater xid instead. (M0118-0003.)
+func TestPagePruneOptMultiXactXmax(t *testing.T) {
+	const multiID = TransactionID(1000)    // a MultiXactId, NOT an xid
+	const oldestXmin = TransactionID(2000) // note: multiID < oldestXmin
+
+	build := func(t *testing.T) Page {
+		page := make(Page, BlockSize)
+		if err := InitPage(page); err != nil {
+			t.Fatal(err)
+		}
+		tup := NewHeapTuple(1, InvalidTransactionID, []byte("multi"))
+		slot, err := PageAddHeapTuple(page, tup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Updater-bearing multi: IS_MULTI set, LOCK_ONLY clear.
+		if err := PageSetHeapTupleXmaxMulti(page, slot, multiID, HeapXmaxIsMulti|HeapXmaxExclLock, HeapKeysUpdated); err != nil {
+			t.Fatal(err)
+		}
+		// pd_prune_xid must be < oldestXmin or PagePruneOpt fast-paths out before
+		// it ever inspects a tuple.
+		MustHeader(page).SetPruneXID(1)
+		return page
+	}
+
+	setResolver := func(t *testing.T, fn func(TransactionID) (TransactionID, bool, bool)) {
+		prev := ResolveMultiUpdater
+		ResolveMultiUpdater = fn
+		t.Cleanup(func() { ResolveMultiUpdater = prev })
+	}
+
+	pruned := func(r PruneResult) bool { return len(r.Unused)+len(r.Redirects) != 0 }
+
+	t.Run("updater older than horizon -> dead, pruned", func(t *testing.T) {
+		page := build(t)
+		setResolver(t, func(x TransactionID) (TransactionID, bool, bool) {
+			if x != multiID {
+				t.Errorf("resolver got xmax=%d, want MultiXactId %d", x, multiID)
+			}
+			return 100, true, true // updater 100 < oldestXmin 2000
+		})
+		result, err := PagePruneOpt(page, oldestXmin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Unused) != 1 || result.Unused[0] != 1 {
+			t.Errorf("updater older than horizon must be pruned, got %+v", result)
+		}
+	})
+
+	t.Run("updater newer than horizon -> live, not pruned (no category error)", func(t *testing.T) {
+		page := build(t)
+		setResolver(t, func(TransactionID) (TransactionID, bool, bool) {
+			return 50000, true, true // updater 50000 >= oldestXmin 2000
+		})
+		result, err := PagePruneOpt(page, oldestXmin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pruned(result) {
+			t.Errorf("MultiXactId(%d) < oldestXmin(%d) must NOT prune when the resolved updater (50000) is newer than the horizon; got %+v (category-error regression)", multiID, oldestXmin, result)
+		}
+	})
+
+	t.Run("all lockers (no updater) -> live, not pruned", func(t *testing.T) {
+		page := build(t)
+		setResolver(t, func(TransactionID) (TransactionID, bool, bool) {
+			return InvalidTransactionID, false, true
+		})
+		result, err := PagePruneOpt(page, oldestXmin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pruned(result) {
+			t.Errorf("all-locker multi must not be pruned, got %+v", result)
+		}
+	})
+
+	t.Run("unresolvable multi -> conservatively not pruned", func(t *testing.T) {
+		page := build(t)
+		setResolver(t, func(TransactionID) (TransactionID, bool, bool) {
+			return InvalidTransactionID, false, false
+		})
+		result, err := PagePruneOpt(page, oldestXmin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pruned(result) {
+			t.Errorf("unresolvable multi must not be pruned, got %+v", result)
+		}
+	})
+
+	t.Run("nil resolver -> conservatively not pruned", func(t *testing.T) {
+		page := build(t)
+		setResolver(t, nil)
+		result, err := PagePruneOpt(page, oldestXmin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pruned(result) {
+			t.Errorf("nil resolver must not prune an IS_MULTI xmax, got %+v", result)
+		}
+	})
+}

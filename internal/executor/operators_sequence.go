@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // seqState holds the mutable state of one sequence.
@@ -376,6 +377,21 @@ func evalNextval(args []Datum, ctx *Context) (Datum, error) {
 	s := LookupSequence(name)
 	if s == nil {
 		return Datum{}, &ExecError{Code: "42P01", Message: fmt.Sprintf("relation %q does not exist", name)}
+	}
+	// nextval holds a RowExclusiveLock on the sequence relation (mirrors
+	// PostgreSQL's lock_and_open_sequence), so it waits while another session is
+	// mid-ALTER SEQUENCE (AccessExclusiveLock) and a later ALTER SEQUENCE waits
+	// for an in-progress nextval. M0118-0008 (sequence-ddl isolation spec).
+	if ctx != nil && ctx.Catalog != nil {
+		on := parser.ObjectName{Name: name}
+		if i := strings.LastIndex(name, "."); i >= 0 {
+			on = parser.ObjectName{Schema: name[:i], Name: name[i+1:]}
+		}
+		if tbl, ok := ctx.Catalog.LookupTable(on); ok {
+			if err := ctx.acquireSequenceLockTxn(ctx.Catalog.RelFileNode(tbl)); err != nil {
+				return Datum{}, err
+			}
+		}
 	}
 	v, err := s.nextVal()
 	if err != nil {

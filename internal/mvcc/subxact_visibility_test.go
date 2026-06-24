@@ -3,6 +3,7 @@ package mvcc
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/storage"
 )
 
@@ -133,8 +134,8 @@ func TestTupleVisibleSubxactDegrades(t *testing.T) {
 		Xmax:     storage.InvalidTransactionID,
 		Infomask: 0,
 	}
-	want := TupleVisible(h, snap, 999)
-	got := TupleVisibleSubxact(h, snap, 999, nil)
+	want := TupleVisible(h, snap, 999, nil)
+	got := TupleVisibleSubxact(h, snap, 999, nil, nil)
 	if got != want {
 		t.Errorf("TupleVisibleSubxact degraded: got %v want %v", got, want)
 	}
@@ -172,7 +173,7 @@ func TestSubxactAbortHidesRowAfterParentCommit(t *testing.T) {
 		Infomask: 0,
 	}
 	// Row was created by an aborted subxact — must be invisible.
-	if TupleVisibleSubxact(h, snapAfter, txP.XID+500, mgr) {
+	if TupleVisibleSubxact(h, snapAfter, txP.XID+500, mgr, nil) {
 		t.Error("row created by aborted subxact should be invisible after parent commit")
 	}
 
@@ -185,7 +186,96 @@ func TestSubxactAbortHidesRowAfterParentCommit(t *testing.T) {
 		Xmax:     storage.InvalidTransactionID,
 		Infomask: 0,
 	}
-	if !TupleVisibleSubxact(h2, snapAfter, txP.XID+500, mgr) {
+	if !TupleVisibleSubxact(h2, snapAfter, txP.XID+500, mgr, nil) {
 		t.Error("row created by committed subxact should be visible after parent commit")
+	}
+}
+
+// TestTupleVisibleSubxactMultiXact pins the subtransaction-aware twin of
+// TestTupleVisibleMultiXact (M0118-0003). TupleVisibleSubxact is the visibility
+// check used by the main seqscan path (operators_storage.go), FK enforcement,
+// MERGE, and DDL table rewrites; like TupleVisible it must resolve an
+// updater-bearing MultiXactId xmax (HEAP_XMAX_IS_MULTI set, LOCK_ONLY clear) to
+// its real updater member before judging visibility, instead of mis-reading the
+// MultiXactId as a deleter xid. With a nil SubxactResolver it must behave
+// exactly like TupleVisible's multixact branch (pattern_sibling_paths_must_agree).
+func TestTupleVisibleSubxactMultiXact(t *testing.T) {
+	// xid < 10 is seen as committed; 15 is in-progress; >= 20 is in the future.
+	snap := Snapshot{
+		Xmin:       10,
+		Xmax:       20,
+		InProgress: []storage.TransactionID{15},
+	}
+	const current = storage.TransactionID(18)
+
+	store := multixact.NewStore()
+	updCommitted, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 5, Status: multixact.StatusForShare},
+		{Xid: 9, Status: multixact.StatusNoKeyUpdate}, // committed updater
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(committed): %v", err)
+	}
+	updInProgress, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 5, Status: multixact.StatusForShare},
+		{Xid: 15, Status: multixact.StatusNoKeyUpdate}, // in-progress updater
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(in-progress): %v", err)
+	}
+	updFuture, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 5, Status: multixact.StatusForShare},
+		{Xid: 30, Status: multixact.StatusUpdate}, // future updater
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(future): %v", err)
+	}
+	updSelf, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 5, Status: multixact.StatusForShare},
+		{Xid: current, Status: multixact.StatusUpdate}, // our own xact updated it
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(self): %v", err)
+	}
+	// Only lockers, no updater (LOCK_ONLY deliberately left clear to exercise
+	// the defensive "no resolvable updater → treat as a pure lock" branch).
+	lockersOnly, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 5, Status: multixact.StatusForShare},
+		{Xid: 6, Status: multixact.StatusForKeyShare},
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(lockers only): %v", err)
+	}
+
+	mk := func(multi multixact.MultiXactId) storage.HeapTupleHeader {
+		return storage.HeapTupleHeader{
+			Xmin:     8, // long-committed creator → scan reaches xmax logic
+			Xmax:     storage.TransactionID(multi),
+			Infomask: storage.HeapXmaxIsMulti, // IS_MULTI set, LOCK_ONLY clear
+		}
+	}
+
+	cases := []struct {
+		name string
+		h    storage.HeapTupleHeader
+		mxs  *multixact.Store
+		want bool
+	}{
+		{"committed updater → invisible", mk(updCommitted), store, false},
+		{"in-progress updater → visible", mk(updInProgress), store, true},
+		{"future updater → visible", mk(updFuture), store, true},
+		{"our own updater → invisible", mk(updSelf), store, false},
+		{"lockers only (no updater) → visible", mk(lockersOnly), store, true},
+		{"store unavailable → invisible (conservative)", mk(updCommitted), nil, false},
+		{"multi absent from store → invisible (conservative)", mk(9999), store, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// nil SubxactResolver: the multixact branch must match TupleVisible
+			// exactly (the updater xids are plain top-level xids).
+			if got := TupleVisibleSubxact(c.h, snap, current, nil, c.mxs); got != c.want {
+				t.Errorf("TupleVisibleSubxact = %v, want %v; header=%+v", got, c.want, c.h)
+			}
+		})
 	}
 }

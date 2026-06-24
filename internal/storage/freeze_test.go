@@ -122,3 +122,98 @@ func TestFrozenTransactionIDVisibility(t *testing.T) {
 		t.Errorf("FrozenTransactionID(%d) must be < snapshotXmin(%d)", xmin, snapshotXmin)
 	}
 }
+
+// TestPageFreezeMultiXactXmax exercises the updater-bearing multixact arm of the
+// freeze liveness check. When a tuple's xmax is a MultiXactId (IS_MULTI set,
+// LOCK_ONLY clear) the raw field is not a transaction id, so PageFreezeOldTuples
+// resolves it through storage.ResolveMultiUpdater before deciding whether the row
+// is deleted (skip) or still live (freeze its xmin). (M0118-0003.)
+func TestPageFreezeMultiXactXmax(t *testing.T) {
+	const multiID = TransactionID(1000) // a MultiXactId, NOT an xid
+
+	build := func(t *testing.T) Page {
+		page := make(Page, BlockSize)
+		if err := InitPage(page); err != nil {
+			t.Fatal(err)
+		}
+		// xmin=5 is < freezeBelow(100), so the only thing keeping it from being
+		// frozen is the xmax liveness verdict under test.
+		tup := NewHeapTuple(5, InvalidTransactionID, []byte("multi"))
+		slot, err := PageAddHeapTuple(page, tup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Updater-bearing multi: IS_MULTI set, LOCK_ONLY deliberately clear.
+		if err := PageSetHeapTupleXmaxMulti(page, slot, multiID, HeapXmaxIsMulti|HeapXmaxExclLock, HeapKeysUpdated); err != nil {
+			t.Fatal(err)
+		}
+		return page
+	}
+
+	setResolver := func(t *testing.T, fn func(TransactionID) (TransactionID, bool, bool)) {
+		prev := ResolveMultiUpdater
+		ResolveMultiUpdater = fn
+		t.Cleanup(func() { ResolveMultiUpdater = prev })
+	}
+
+	t.Run("updater present -> deleted, not frozen", func(t *testing.T) {
+		page := build(t)
+		setResolver(t, func(x TransactionID) (TransactionID, bool, bool) {
+			if x != multiID {
+				t.Errorf("resolver got xmax=%d, want MultiXactId %d", x, multiID)
+			}
+			return 42, true, true // updater xid 42
+		})
+		stats, err := PageFreezeOldTuples(page, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Frozen != 0 {
+			t.Errorf("updater-bearing multi xmax must not be frozen, got Frozen=%d", stats.Frozen)
+		}
+	})
+
+	t.Run("all lockers (no updater) -> live, frozen", func(t *testing.T) {
+		page := build(t)
+		setResolver(t, func(TransactionID) (TransactionID, bool, bool) {
+			return InvalidTransactionID, false, true // resolved, no updater
+		})
+		stats, err := PageFreezeOldTuples(page, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Frozen != 1 {
+			t.Fatalf("all-locker multi xmax is live and must freeze its xmin, got Frozen=%d", stats.Frozen)
+		}
+		tup, _ := PageGetHeapTuple(page, 1)
+		if tup.Header.Xmin != FrozenTransactionID {
+			t.Errorf("xmin not rewritten to FrozenTransactionID, got %d", tup.Header.Xmin)
+		}
+	})
+
+	t.Run("unresolvable multi -> conservatively not frozen", func(t *testing.T) {
+		page := build(t)
+		setResolver(t, func(TransactionID) (TransactionID, bool, bool) {
+			return InvalidTransactionID, false, false // not found in member store
+		})
+		stats, err := PageFreezeOldTuples(page, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Frozen != 0 {
+			t.Errorf("unresolvable multi must not be frozen, got Frozen=%d", stats.Frozen)
+		}
+	})
+
+	t.Run("nil resolver -> conservatively not frozen", func(t *testing.T) {
+		page := build(t)
+		setResolver(t, nil)
+		stats, err := PageFreezeOldTuples(page, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Frozen != 0 {
+			t.Errorf("nil resolver must not freeze an IS_MULTI xmax, got Frozen=%d", stats.Frozen)
+		}
+	})
+}

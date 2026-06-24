@@ -1258,6 +1258,11 @@ type CreateIndexStmt struct {
 	Predicate          Expr     // WHERE predicate expression (nil if no WHERE clause)
 	IncludeColumns     []string // non-key covering columns from INCLUDE (…)
 	OnOnly             bool     // ON ONLY — create on parent table without propagating to children
+	// Concurrently records the CONCURRENTLY keyword. goopg still builds the
+	// index synchronously, but a concurrent build waits for transactions that
+	// were already running when it started to drain before it completes — the
+	// observable wait modelled by the isolation spec multiple-cic.
+	Concurrently bool
 	// ColOrders captures the per-key-column ASC/DESC + NULLS FIRST/LAST ordering,
 	// parallel to Columns (ColOrders[i] applies to Columns[i]). Mirrors PG's
 	// pg_index.indoption so pg_get_indexdef can reproduce a non-default ordering.
@@ -1817,6 +1822,13 @@ const (
 	// Clears the named table-level storage parameters back to their defaults.
 	// With holds the option names as keys (values empty). M0118-0001.
 	AlterTableResetReloptions
+	// AlterTableValidateConstraint — `VALIDATE CONSTRAINT name`.
+	// Validates a constraint previously added with NOT VALID, flipping
+	// pg_constraint.convalidated from 'f' to 't'. Takes only a
+	// ShareUpdateExclusiveLock (AlterTableGetLockLevel → AT_ValidateConstraint),
+	// so it does not conflict with concurrent reads or writes. ConstraintName
+	// holds the constraint name. M0118-0008 (alter-table-1 isolation spec).
+	AlterTableValidateConstraint
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -1838,6 +1850,7 @@ type AlterTableAction struct {
 	Deferrable bool     // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
 	OnDelete   FKAction // referential action for ON DELETE (default NO ACTION)
 	OnUpdate   FKAction // referential action for ON UPDATE (default NO ACTION)
+	NotValid   bool     // true if `NOT VALID` (skip validation of existing rows)
 
 	// AttachPartitionOf is populated for AlterTableAttachPartition.
 	// It holds the child table name and partition bounds. M0096-0007.
@@ -1895,6 +1908,12 @@ type AlterTableAction struct {
 	// DetachPartitionChild is populated for AlterTableDetachPartition and
 	// holds the child table name. M0097-0028.
 	DetachPartitionChild ObjectName
+	// DetachConcurrently records the `CONCURRENTLY` trailer on
+	// `DETACH PARTITION child CONCURRENTLY` (PG14+). The trailer follows the
+	// child name; it is recorded here so the (deferred) two-phase concurrent
+	// detach semantics can branch on it. The executor currently performs a
+	// synchronous detach regardless. M0118-0008.
+	DetachConcurrently bool
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }
@@ -1916,6 +1935,17 @@ type AlterTableStmt struct {
 	SetSchema string
 	// SetLogged is "logged" or "unlogged" when ALTER TABLE SET LOGGED/UNLOGGED is parsed.
 	SetLogged string
+	// EnableDisableTrigger is true for ALTER TABLE ... ENABLE/DISABLE TRIGGER.
+	// The trigger enable/disable itself is a semantic no-op in v0, but the
+	// statement takes a transaction-scoped ShareRowExclusiveLock in PostgreSQL,
+	// which the executor must acquire (alter-table-3 isolation spec, M0118-0008).
+	EnableDisableTrigger bool
+	// OwnerTo holds the target role name for ALTER TABLE ... OWNER TO role. Empty
+	// means no OWNER TO action. The executor records it as the table's owning
+	// role so the VACUUM/ANALYZE/CLUSTER maintenance-privilege check can tell
+	// whether a SET ROLE session owns the relation. M0118-0008 (vacuum-conflict /
+	// cluster-conflict).
+	OwnerTo string
 }
 
 func (s *AlterTableStmt) Pos() int  { return s.pos }

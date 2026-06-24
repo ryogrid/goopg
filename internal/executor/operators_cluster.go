@@ -10,6 +10,7 @@ package executor
 import (
 	"fmt"
 
+	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
@@ -51,14 +52,31 @@ func (o *clusterOp) Next() (TupleSlot, error) {
 	// Try schema-qualified first (e.g. "public.test1"), then bare name
 	// (e.g. "test1") for user tables created without an explicit schema.
 	if o.ctx != nil && o.ctx.Catalog != nil {
-		_, ok := o.ctx.Catalog.LookupTable(*o.stmt.Target)
+		tbl, ok := o.ctx.Catalog.LookupTable(*o.stmt.Target)
 		if !ok && o.stmt.Target.Schema != "" {
-			_, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Name: o.stmt.Target.Name})
+			tbl, ok = o.ctx.Catalog.LookupTable(parser.ObjectName{Name: o.stmt.Target.Name})
 		}
 		if !ok {
 			return nil, &ExecError{
 				Code:    "42P01",
 				Message: fmt.Sprintf("relation %q does not exist", o.stmt.Target.Name),
+			}
+		}
+		// CLUSTER takes an AccessExclusiveLock on the table (cluster.c
+		// cluster_rel → LockRelationOid(AccessExclusiveLock)). That conflicts with
+		// every other lock mode, so CLUSTER blocks behind a concurrent
+		// LOCK ... IN SHARE UPDATE EXCLUSIVE MODE until the holder commits, then
+		// proceeds. acquireRelLockMaybeTransient holds the lock to commit inside an
+		// explicit transaction and acquires+releases it transiently in autocommit
+		// (so the wait still happens during acquisition). M0118-0008
+		// (cluster-conflict).
+		if tbl != nil {
+			rel := o.ctx.Catalog.RelFileNode(tbl)
+			if err := o.ctx.acquireRelLockMaybeTransient(rel, lockmgr.AccessExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = o.stmt.Pos()
+				}
+				return nil, err
 			}
 		}
 	}

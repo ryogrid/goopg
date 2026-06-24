@@ -36,7 +36,16 @@ import (
 // appears in the MESSAGE — the routed leaf partition for partition-routed
 // INSERTs.  Pass reportTbl==nil to default to fkOwnerTbl.
 func checkFKInsert(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *catalog.Table, row Row) error {
-	for _, fk := range fkOwnerTbl.ForeignKeys {
+	return checkFKInsertForConstraints(ctx, fkOwnerTbl, reportTbl, row, fkOwnerTbl.ForeignKeys)
+}
+
+// checkFKInsertForConstraints is checkFKInsert restricted to a caller-supplied
+// subset of the owner table's foreign keys. INSERT passes every constraint;
+// UPDATE passes only those whose referencing columns the SET list changed
+// (mirrors PostgreSQL firing the RI_FKey_check AFTER trigger only when a key
+// column is modified). M0118-0008 (detach-partition-concurrently-4).
+func checkFKInsertForConstraints(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *catalog.Table, row Row, fks []catalog.ForeignKey) error {
+	for _, fk := range fks {
 		// Gather the FK column values.
 		vals, allNull := fkColValues(fkOwnerTbl.Columns, fk.Columns, row)
 		if allNull {
@@ -176,7 +185,7 @@ func fullTableFKCheck(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignK
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -428,7 +437,7 @@ func fkCascadeDelete(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKe
 				if err != nil {
 					continue
 				}
-				if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+				if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 					continue
 				}
 				row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -506,7 +515,7 @@ func fkSetNull(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, val
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -558,7 +567,16 @@ func fkSetNull(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignKey, val
 // (direct children, their children, etc.) in breadth-first order.
 // Multi-level partition hierarchies (e.g. trunc_a → trunc_a2 → trunc_a21)
 // require this recursive expansion so FK scans find leaf partition data.
-func allDescendants(im *catalog.InMemory, tbl *catalog.Table) []*catalog.Table {
+// allDescendants returns every inheritance / partition descendant of tbl,
+// pruned to those VISIBLE to the snapshot identified by snapEpoch. A partition
+// child stamped DetachPendingEpoch != 0 that became detach-pending at or before
+// the snapshot (snapEpoch >= DetachPendingEpoch) is omitted AND its subtree is
+// not descended into — mirroring the planner's collectAllPartitionLeaves /
+// catalog.VisiblePartitionChildren so FK existence scans against a
+// concurrently-detached partition see the same row set as ordinary queries.
+// Pass snapEpoch == 0 to disable detach filtering (e.g. when no snapshot epoch
+// is established). Design 0118-0060 (M0118-0008, detach-partition-concurrently-2).
+func allDescendants(im *catalog.InMemory, tbl *catalog.Table, snapEpoch uint64) []*catalog.Table {
 	var out []*catalog.Table
 	queue := []*catalog.Table{tbl}
 	for len(queue) > 0 {
@@ -567,11 +585,32 @@ func allDescendants(im *catalog.InMemory, tbl *catalog.Table) []*catalog.Table {
 		kids := append([]*catalog.Table(nil), im.InheritanceChildren(cur.OID)...)
 		kids = append(kids, im.PartitionChildren(cur.OID)...)
 		for _, k := range kids {
+			if k != nil && k.DetachPendingEpoch != 0 && snapEpoch >= k.DetachPendingEpoch {
+				continue // detach-pending and invisible to this snapshot — skip subtree
+			}
 			out = append(out, k)
 			queue = append(queue, k)
 		}
 	}
 	return out
+}
+
+// snapDetachEpoch returns the epoch used to filter detach-pending partition
+// children out of FK existence scans. Unlike ordinary queries (which expand the
+// partition set against their own snapshot epoch, ctx.Snap.PartitionDetachEpoch,
+// so a REPEATABLE READ transaction whose snapshot predates the detach still sees
+// the partition), a referential-integrity existence check observes the CURRENT
+// detach state regardless of the enforcing transaction's isolation level: in
+// PostgreSQL the RI trigger query runs under the latest snapshot, so a row that
+// lives only in a concurrently-detached (detach-pending) partition is invisible
+// to the FK check the instant the detach is marked — even under REPEATABLE READ,
+// where a cursor/SELECT on the referenced table can still see that very row
+// (detach-partition-concurrently-4: "Trying to insert into a partially detached
+// partition is rejected … even under REPEATABLE READ mode"). Returns the global
+// mvcc.CurrentPartitionDetachEpoch(). Design 0118-0062 (M0118-0008,
+// detach-partition-concurrently-4).
+func snapDetachEpoch(_ *Context) uint64 {
+	return mvcc.CurrentPartitionDetachEpoch()
 }
 
 func scanTableForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, error) {
@@ -580,7 +619,7 @@ func scanTableForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 		return found, err
 	}
 	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-		for _, child := range allDescendants(im, tbl) {
+		for _, child := range allDescendants(im, tbl, snapDetachEpoch(ctx)) {
 			found, err = scanRelForMatch(ctx, child, colNames, vals)
 			if err != nil || found {
 				return found, err
@@ -588,6 +627,176 @@ func scanTableForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 		}
 	}
 	return false, nil
+}
+
+// detachPartitionFKRefCheck implements RI_PartitionRemove_Check
+// (ri_triggers.c): when a partition on the REFERENCED side of a foreign key is
+// detached, any referencing row whose key value routes to that partition would
+// be orphaned, so the detach must fail. PostgreSQL runs this right after marking
+// the partition detach-pending; goopg runs it BEFORE MarkPartitionDetachPending
+// so routeToPartition still resolves the (not-yet-pending) child instead of
+// filtering it out by snapshot epoch. The error names the per-partition cloned
+// constraint <fkname>_<N>, where N is the child's 1-based ordinal among the
+// parent's partition children — PostgreSQL's ChooseConstraintName dedup suffix
+// for the cloned action-trigger constraint. Design 0118-0060
+// (M0118-0008 detach-partition-concurrently-2).
+func detachPartitionFKRefCheck(ctx *Context, parentTbl, childTbl *catalog.Table) error {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || parentTbl == nil || childTbl == nil {
+		return nil
+	}
+	// 1-based ordinal of the detaching child among the parent's partition
+	// children (PG appends this as the cloned-constraint dedup suffix).
+	suffix := 0
+	for i, c := range im.PartitionChildren(parentTbl.OID) {
+		if c != nil && c.OID == childTbl.OID {
+			suffix = i + 1
+			break
+		}
+	}
+	for _, fkTbl := range im.AllTables() {
+		if fkTbl == nil {
+			continue
+		}
+		for _, fk := range fkTbl.ForeignKeys {
+			if !strings.EqualFold(fk.RefTable, parentTbl.Name) {
+				continue
+			}
+			violating, verr := scanRefTableForDetachedPartitionMatch(ctx, im, fkTbl, fk, parentTbl, childTbl)
+			if verr != nil {
+				return verr
+			}
+			if violating == nil {
+				continue
+			}
+			cname := fkConstraintName(fkTbl, fk)
+			if fk.Name != "" {
+				cname = fk.Name
+			}
+			if suffix > 0 {
+				cname = fmt.Sprintf("%s_%d", cname, suffix)
+			}
+			return &ExecError{
+				Code: "23503",
+				Message: fmt.Sprintf("removing partition %q violates foreign key constraint %q",
+					childTbl.Name, cname),
+				Detail: fmt.Sprintf("Key (%s)=(%s) is still referenced from table %q.",
+					strings.Join(fk.Columns, ", "), fkValsForDetail(violating), fkTbl.Name),
+			}
+		}
+	}
+	return nil
+}
+
+// scanRefTableForDetachedPartitionMatch scans the referencing table fkTbl for
+// the first visible row whose (non-null) FK key value routes to childTbl under
+// parentTbl's partition scheme. Returns the matched FK column values, or nil
+// when no such row exists. Mirrors the SELECT fk JOIN pk WHERE <partconstraint>
+// query in RI_PartitionRemove_Check.
+func scanRefTableForDetachedPartitionMatch(ctx *Context, im *catalog.InMemory, fkTbl *catalog.Table, fk catalog.ForeignKey, parentTbl, childTbl *catalog.Table) ([]Datum, error) {
+	// Referenced parent columns, in FK-column order.
+	refCols := fk.RefColumns
+	if len(refCols) == 0 {
+		refCols = pkColumns(parentTbl)
+	}
+	if len(refCols) != len(fk.Columns) {
+		return nil, nil
+	}
+	// Precompute parent column indexes for the referenced columns.
+	parentIdx := make([]int, len(refCols))
+	for i, rc := range refCols {
+		parentIdx[i] = -1
+		for j, col := range parentTbl.Columns {
+			if strings.EqualFold(col.Name, rc) {
+				parentIdx[i] = j
+				break
+			}
+		}
+		if parentIdx[i] < 0 {
+			return nil, nil // referenced column not found — cannot route
+		}
+	}
+	rel := ctx.Catalog.RelFileNode(fkTbl)
+	cols := fkTbl.Columns
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return nil, nil
+	}
+	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
+		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
+		if perr != nil {
+			return nil, perr
+		}
+		s.RLock()
+		page := s.Page()
+		if storage.IsNew(page) {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		count, cerr := storage.PageLinePointerCount(page)
+		if cerr != nil {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			return nil, cerr
+		}
+		for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
+			tuple, terr := storage.PageGetHeapTuple(page, slotIdx)
+			if terr != nil {
+				continue
+			}
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
+				continue
+			}
+			row, derr := DecodeHeapTupleRow(cols, tuple, nil)
+			if derr != nil {
+				continue
+			}
+			// Extract FK column values; MATCH SIMPLE skips rows with any NULL.
+			fkVals := make([]Datum, len(fk.Columns))
+			anyNull := false
+			for i, fc := range fk.Columns {
+				d := NullDatum
+				for j, col := range cols {
+					if strings.EqualFold(col.Name, fc) {
+						if j < len(row) {
+							d = row[j]
+						}
+						break
+					}
+				}
+				if d.IsNull() {
+					anyNull = true
+					break
+				}
+				fkVals[i] = d
+			}
+			if anyNull {
+				continue
+			}
+			// Build a parent-shaped row carrying the referenced key values and
+			// route it; a row that lands in the detaching child is a violation.
+			parentRow := make(Row, len(parentTbl.Columns))
+			for i := range parentRow {
+				parentRow[i] = NullDatum
+			}
+			for i := range fkVals {
+				parentRow[parentIdx[i]] = fkVals[i]
+			}
+			dest, rerr := routeToPartition(parentTbl, parentRow, im, ctx)
+			if rerr != nil {
+				continue
+			}
+			if dest != nil && dest.OID == childTbl.OID {
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				return fkVals, nil
+			}
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+	}
+	return nil, nil
 }
 
 func scanRelForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals []Datum) (bool, error) {
@@ -620,7 +829,7 @@ func scanRelForMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals [
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -698,7 +907,7 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 			if err != nil {
 				continue
 			}
-			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr) {
+			if !mvcc.TupleVisibleSubxact(tuple.Header, ctx.Snap, ctx.Tx.XID, ctx.TxnMgr, ctx.MultiXact) {
 				continue
 			}
 			row, err := DecodeHeapTupleRow(cols, tuple, nil)
@@ -708,11 +917,26 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 			if !fkRowMatches(cols, colNames, row, vals) {
 				continue
 			}
-			// Matched.  Decide whether to wait on the updater.
+			// Matched.  Decide whether to wait on the updater.  For an
+			// updater-bearing multixact xmax (IS_MULTI set, LOCK_ONLY clear)
+			// the raw t_xmax is a MultiXactId, not a transaction id — resolve
+			// the updater member before any single-transaction test, and never
+			// record a MultiXactId as the xid to wait on.
 			xmax := tuple.Header.Xmax
-			isLockOnly := storage.IsHeapTupleLockOnly(tuple.Header.Infomask)
-			if xmax == storage.InvalidTransactionID || isLockOnly ||
-				xmax == ctx.Tx.XID || ctx.TxnMgr == nil || !ctx.TxnMgr.IsXIDActive(xmax) {
+			infomask := tuple.Header.Infomask
+			effXmax := xmax
+			isLockOnly := storage.IsHeapTupleLockOnly(infomask)
+			if storage.IsHeapTupleXmaxMulti(infomask) && !isLockOnly {
+				effXmax = multixactUpdaterXID(ctx.MultiXact, xmax)
+				if effXmax == storage.InvalidTransactionID {
+					// Only lockers (or an unknown multi / no store): lock
+					// holders do not delete the matched row, so this is a
+					// clean FK match just like a lock-only xmax.
+					isLockOnly = true
+				}
+			}
+			if effXmax == storage.InvalidTransactionID || isLockOnly ||
+				effXmax == ctx.Tx.XID || ctx.TxnMgr == nil || !ctx.TxnMgr.IsXIDActive(effXmax) {
 				// Clean match: no in-flight non-self updater.
 				s.RUnlock()
 				ctx.Pool.Unpin(s)
@@ -720,7 +944,7 @@ func scanRelForFKMatch(ctx *Context, tbl *catalog.Table, colNames []string, vals
 			}
 			// Pending: record only the first encountered.
 			if pending == nil {
-				pending = &fkPendingRef{xid: xmax, rel: rel, blk: blk, slot: slotIdx}
+				pending = &fkPendingRef{xid: effXmax, rel: rel, blk: blk, slot: slotIdx}
 			}
 		}
 		s.RUnlock()
@@ -759,7 +983,7 @@ func scanTableForMatchFKWait(ctx *Context, tbl *catalog.Table, colNames []string
 		// first clean match, accumulate the first pending xmax we see.
 		// Recursive expansion is required for multi-level partition trees.
 		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
-			for _, child := range allDescendants(im, tbl) {
+			for _, child := range allDescendants(im, tbl, snapDetachEpoch(ctx)) {
 				cfound, cpending, cerr := scanRelForFKMatch(ctx, child, colNames, vals)
 				if cerr != nil {
 					return false, cerr

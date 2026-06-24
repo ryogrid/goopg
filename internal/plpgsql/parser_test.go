@@ -134,16 +134,145 @@ func TestParseRejectsUnsupportedStatement(t *testing.T) {
 	}
 }
 
-// TestParseRejectsBareReturn: Stage A requires a return value;
-// `RETURN;` (which is upstream-legal for void / OUT-only routines)
-// surfaces a specific diagnostic.
-func TestParseRejectsBareReturn(t *testing.T) {
-	_, err := Parse("BEGIN RETURN; END")
-	if err == nil {
-		t.Fatal("expected SyntaxError for RETURN without value")
+// TestParseAcceptsBareReturn: `RETURN;` (no expression) is upstream-legal for
+// void-returning functions and procedures, and is the canonical early-exit
+// form. It must parse to a ReturnStmt with a nil expression; the void-vs-value
+// distinction is enforced at runtime (it needs the function's return type,
+// which the parser does not know). M0118-0009 (subxid-overflow gen_subxids).
+func TestParseAcceptsBareReturn(t *testing.T) {
+	blk, err := Parse("BEGIN RETURN; END")
+	if err != nil {
+		t.Fatalf("expected bare RETURN to parse, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "RETURN") {
-		t.Errorf("err = %v", err)
+	if len(blk.Statements) != 1 {
+		t.Fatalf("got %d stmts, want 1", len(blk.Statements))
+	}
+	rs, ok := blk.Statements[0].(*ReturnStmt)
+	if !ok {
+		t.Fatalf("stmt = %T, want *ReturnStmt", blk.Statements[0])
+	}
+	if rs.Expr != nil {
+		t.Errorf("Expr = %v, want nil for bare RETURN", rs.Expr)
+	}
+}
+
+// TestParseNullStatement: the PL/pgSQL `NULL;` no-op statement (used as an
+// empty EXCEPTION handler body) parses to a NullStmt. M0118-0009.
+func TestParseNullStatement(t *testing.T) {
+	blk, err := Parse("BEGIN NULL; END")
+	if err != nil {
+		t.Fatalf("expected NULL; to parse, got %v", err)
+	}
+	if len(blk.Statements) != 1 {
+		t.Fatalf("got %d stmts, want 1", len(blk.Statements))
+	}
+	if _, ok := blk.Statements[0].(*NullStmt); !ok {
+		t.Fatalf("stmt = %T, want *NullStmt", blk.Statements[0])
+	}
+}
+
+// TestParseExceptionHandlerNullBody: a full function-style body with an empty
+// EXCEPTION handler (`WHEN ... THEN NULL;`) parses — the exact shape used by
+// the subxid-overflow gen_subxids function. M0118-0009.
+func TestParseExceptionHandlerNullBody(t *testing.T) {
+	src := "BEGIN\n  PERFORM 1;\n  RETURN;\nEXCEPTION\n  WHEN raise_exception THEN NULL;\nEND"
+	if _, err := Parse(src); err != nil {
+		t.Fatalf("expected EXCEPTION/NULL body to parse, got %v", err)
+	}
+}
+
+// TestParseTransactionControl: `COMMIT;` and `ROLLBACK;` parse into
+// TxControlStmt nodes (PL/pgSQL transaction control). M0118-0008 (plpgsql-toast).
+func TestParseTransactionControl(t *testing.T) {
+	for _, tc := range []struct {
+		src      string
+		rollback bool
+	}{
+		{"BEGIN COMMIT; END", false},
+		{"BEGIN ROLLBACK; END", true},
+	} {
+		blk, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("%q: expected parse, got %v", tc.src, err)
+		}
+		if len(blk.Statements) != 1 {
+			t.Fatalf("%q: got %d stmts, want 1", tc.src, len(blk.Statements))
+		}
+		st, ok := blk.Statements[0].(*TxControlStmt)
+		if !ok {
+			t.Fatalf("%q: stmt = %T, want *TxControlStmt", tc.src, blk.Statements[0])
+		}
+		if st.Rollback != tc.rollback {
+			t.Errorf("%q: Rollback = %v, want %v", tc.src, st.Rollback, tc.rollback)
+		}
+	}
+}
+
+// TestParseSelectInto pins the M0118-0008 PL/pgSQL SELECT … INTO statement
+// form: a top-level INTO clause is reinterpreted as variable assignment (not
+// SQL's CREATE-TABLE-AS), the INTO clause is stripped from the captured query,
+// and the target variable name(s) are recorded.
+func TestParseSelectInto(t *testing.T) {
+	for _, tc := range []struct {
+		src         string
+		wantSQL     string
+		wantTargets []string
+		wantStrict  bool
+	}{
+		{
+			src:         "BEGIN select test1.b into x from test1; END",
+			wantSQL:     "select test1.b  from test1",
+			wantTargets: []string{"x"},
+		},
+		{
+			src:         "BEGIN select * into r from test1; END",
+			wantSQL:     "select *  from test1",
+			wantTargets: []string{"r"},
+		},
+		{
+			src:         "BEGIN select a, b into strict x, y from t where a = 1; END",
+			wantSQL:     "select a, b  from t where a = 1",
+			wantTargets: []string{"x", "y"},
+			wantStrict:  true,
+		},
+	} {
+		blk, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("%q: expected parse, got %v", tc.src, err)
+		}
+		if len(blk.Statements) != 1 {
+			t.Fatalf("%q: got %d stmts, want 1", tc.src, len(blk.Statements))
+		}
+		st, ok := blk.Statements[0].(*SelectIntoStmt)
+		if !ok {
+			t.Fatalf("%q: stmt = %T, want *SelectIntoStmt", tc.src, blk.Statements[0])
+		}
+		if st.SQL != tc.wantSQL {
+			t.Errorf("%q: SQL = %q, want %q", tc.src, st.SQL, tc.wantSQL)
+		}
+		if len(st.Targets) != len(tc.wantTargets) {
+			t.Fatalf("%q: Targets = %v, want %v", tc.src, st.Targets, tc.wantTargets)
+		}
+		for i := range tc.wantTargets {
+			if st.Targets[i] != tc.wantTargets[i] {
+				t.Errorf("%q: Targets[%d] = %q, want %q", tc.src, i, st.Targets[i], tc.wantTargets[i])
+			}
+		}
+		if st.Strict != tc.wantStrict {
+			t.Errorf("%q: Strict = %v, want %v", tc.src, st.Strict, tc.wantStrict)
+		}
+	}
+}
+
+// TestParseSelectNoIntoIsEmbeddedSQL confirms a plain SELECT (no INTO) is still
+// captured verbatim as a *SQLStmt, not a SelectIntoStmt.
+func TestParseSelectNoIntoIsEmbeddedSQL(t *testing.T) {
+	blk, err := Parse("BEGIN select count(*) from t; END")
+	if err != nil {
+		t.Fatalf("expected parse, got %v", err)
+	}
+	if _, ok := blk.Statements[0].(*SQLStmt); !ok {
+		t.Fatalf("stmt = %T, want *SQLStmt", blk.Statements[0])
 	}
 }
 

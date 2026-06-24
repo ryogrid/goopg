@@ -50,7 +50,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	// The same parameterized query is shared across all 100 pgbench
 	// connections — one planning call serves them all.
 	var node planner.Node
-	if s.pc != nil {
+	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) {
 		key := normalizeCompatSQL(query)
 		if cached, ok := s.pc.Get(key); ok {
 			node = cached
@@ -111,6 +111,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.Catalog = s.cfg.Catalog
 	s.wireExtensionRows(ectx, dbName) // per-database pg_extension (M0110-0003 gap #7c)
 	ectx.TxnMgr = s.cfg.TxnMgr
+	ectx.MultiXact = s.cfg.MultiXact
 	ectx.Tx = tx
 	ectx.Snap = snap
 	ectx.Params = datums
@@ -139,10 +140,14 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 		ectx.BeginLocalTransaction = sess.BeginTransaction
 		ectx.EndLocalTransaction = sess.EndTransaction
 	}
-	if ectx.Session != nil {
-		advisoryReleaseTarget = ectx.Session
-	} else if ectx.AdvisorySessionIdentity != nil {
+	// Match advisorySessionIDFromContext's preference: the per-connection
+	// AdvisorySessionIdentity (SessionRegistry) is the stable advisory owner, so
+	// xact-scoped advisory locks release under it at txn end (not the
+	// BasicSession, which is nil before the first BEGIN). M0118-0003.
+	if ectx.AdvisorySessionIdentity != nil {
 		advisoryReleaseTarget = ectx.AdvisorySessionIdentity
+	} else if ectx.Session != nil {
+		advisoryReleaseTarget = ectx.Session
 	}
 	ectx.PubSub = s.cfg.PubSub
 	ectx.WAL = s.cfg.WAL
@@ -151,6 +156,15 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	ectx.SyncCommitMode = sessionSyncCommitMode(sess)
 	if s.applyLauncher != nil {
 		ectx.OnSubscriptionChange = s.applyLauncher.Wake
+	}
+	// Wire pg_cancel_backend(pid) here too (sibling of the simple-query path) so
+	// the SQL function works regardless of protocol. Depends only on the
+	// process-wide cancel registry, not on per-session Activity. M0118-0008.
+	ectx.CancelBackend = func(pid int32) bool {
+		if pid <= 0 {
+			return false
+		}
+		return s.cancelReg.cancelByPID(uint32(pid))
 	}
 
 	op, err := executor.Build(node)

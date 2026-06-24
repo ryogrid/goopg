@@ -3,7 +3,14 @@ package config
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 )
+
+// sessionIDCounter mints a process-unique, monotonically increasing identity
+// for each SessionRegistry. Used as a stable per-session token (e.g. to record
+// which session owns a temporary relation — see UniqueID / TempOwner). The
+// zero value is never handed out so callers can treat 0 as "no session".
+var sessionIDCounter atomic.Uint64
 
 // SessionRegistry layers SET (session-scoped) and SET LOCAL
 // (transaction-scoped) overrides on top of a global Registry.
@@ -15,6 +22,7 @@ import (
 // goroutine.
 type SessionRegistry struct {
 	global  *Registry
+	id      uint64            // stable, process-unique per-session identity (see UniqueID)
 	session map[string]string // session-scoped values, canonicalised
 	local   map[string]string // transaction-scoped values, canonicalised
 	custom  map[string]*Variable
@@ -31,10 +39,23 @@ type SessionRegistry struct {
 func NewSessionRegistry(global *Registry) *SessionRegistry {
 	return &SessionRegistry{
 		global:  global,
+		id:      sessionIDCounter.Add(1),
 		session: map[string]string{},
 		local:   map[string]string{},
 		custom:  map[string]*Variable{},
 	}
+}
+
+// UniqueID returns this session's stable, process-unique identity. It is fixed
+// for the SessionRegistry's lifetime (one per connection) and is used as the
+// owning-session token for temporary relations so that inheritance expansion
+// can exclude another backend's temp children (PostgreSQL's RELATION_IS_OTHER_TEMP
+// rule). Always non-zero. Design 0118-0036.
+func (s *SessionRegistry) UniqueID() uint64 {
+	if s == nil {
+		return 0
+	}
+	return s.id
 }
 
 // SetReportableHook installs the ParameterStatus callback. Pass nil to

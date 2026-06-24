@@ -280,6 +280,25 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 		return p.parseNestedBlock()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwPerform:
 		return p.parsePerform()
+	// `NULL;` — the no-op placeholder statement (e.g. an empty EXCEPTION
+	// handler body). M0118-0009.
+	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwNull:
+		nullTok := p.cur()
+		p.advance() // consume NULL
+		if !p.acceptSymbol(";") {
+			return nil, p.errAtCur("expected ';' to terminate NULL statement")
+		}
+		return &NullStmt{pos: nullTok.Pos}, nil
+	// COMMIT; / ROLLBACK; — PL/pgSQL transaction control (non-atomic context
+	// only). M0118-0008 (plpgsql-toast).
+	case t.Kind == parser.TokenKeyword && (t.Keyword == parser.KwCommit || t.Keyword == parser.KwRollback):
+		tok := p.cur()
+		rollback := t.Keyword == parser.KwRollback
+		p.advance() // consume COMMIT/ROLLBACK
+		if !p.acceptSymbol(";") {
+			return nil, p.errAtCur("expected ';' to terminate transaction-control statement")
+		}
+		return &TxControlStmt{pos: tok.Pos, Rollback: rollback}, nil
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwExit:
 		return p.parseExit()
 	case t.Kind == parser.TokenKeyword && t.Keyword == parser.KwContinue:
@@ -894,18 +913,73 @@ func parseExprFromTokens(toks []parser.Token) (parser.Expr, error) {
 
 // parseSQLStmt captures an embedded SQL statement (INSERT / UPDATE / DELETE /
 // SELECT) up to the trailing `;` and stores it verbatim. M0096-0012.
-func (p *bodyParser) parseSQLStmt() (*SQLStmt, error) {
+//
+// A leading `SELECT` is special-cased: PL/pgSQL reinterprets a top-level
+// `INTO [STRICT] target[, target...]` clause as variable assignment rather than
+// SQL's CREATE-TABLE-AS spelling. When such a clause is found, the INTO clause
+// is stripped from the query text and a *SelectIntoStmt is returned so the
+// executor binds the first result row to the named variable(s). M0118-0008.
+func (p *bodyParser) parseSQLStmt() (Stmt, error) {
 	startPos := p.cur().Pos
+	isSelect := p.cur().Kind == parser.TokenKeyword && p.cur().Keyword == parser.KwSelect
 	depth := 0
+	intoByteStart := -1 // byte offset of the INTO token (once found)
+	targetsEndByte := -1
+	var targets []string
+	strict := false
 	for p.cur().Kind != parser.TokenEOF {
 		t := p.cur()
 		if t.Kind == parser.TokenSymbol && t.Value == "(" {
 			depth++
 		} else if t.Kind == parser.TokenSymbol && t.Value == ")" {
 			depth--
+		} else if isSelect && depth == 0 && intoByteStart < 0 &&
+			t.Kind == parser.TokenKeyword && t.Keyword == parser.KwInto {
+			// Top-level INTO clause: capture its byte span and parse the
+			// target variable list, then resume scanning for `;` from the
+			// token that ends the list (e.g. FROM).
+			intoByteStart = t.Pos
+			p.advance() // consume INTO
+			if st := p.cur(); st.Kind == parser.TokenIdent && strings.EqualFold(st.Value, "strict") {
+				strict = true
+				p.advance()
+			}
+			for {
+				nt := p.cur()
+				if nt.Kind != parser.TokenIdent {
+					break
+				}
+				name := nt.Value
+				p.advance()
+				// Capture a dotted target (record field, e.g. r.b).
+				for p.cur().Kind == parser.TokenSymbol && p.cur().Value == "." {
+					p.advance() // consume '.'
+					fld := p.cur()
+					if fld.Kind != parser.TokenIdent {
+						break
+					}
+					name += "." + fld.Value
+					p.advance()
+				}
+				targets = append(targets, name)
+				if p.cur().Kind == parser.TokenSymbol && p.cur().Value == "," {
+					p.advance()
+					continue
+				}
+				break
+			}
+			targetsEndByte = p.cur().Pos
+			continue // re-enter loop without the trailing advance below
 		} else if t.Kind == parser.TokenSymbol && t.Value == ";" && depth == 0 {
 			endPos := t.Pos
 			p.advance() // consume `;`
+			if intoByteStart >= 0 && len(targets) > 0 {
+				if targetsEndByte < 0 || targetsEndByte > endPos {
+					targetsEndByte = endPos
+				}
+				query := strings.TrimSpace(p.src[startPos:intoByteStart] + " " + p.src[targetsEndByte:endPos])
+				return &SelectIntoStmt{pos: startPos, SQL: query, Targets: targets, Strict: strict}, nil
+			}
 			sql := strings.TrimSpace(p.src[startPos:endPos])
 			return &SQLStmt{pos: startPos, SQL: sql}, nil
 		}
@@ -1162,6 +1236,12 @@ func (p *bodyParser) parseReturn() (Stmt, error) {
 	retTok, err := p.expectKeyword(parser.KwReturn)
 	if err != nil {
 		return nil, err
+	}
+	// Bare `RETURN;` (no expression) — valid for functions returning VOID, and
+	// the canonical way to exit a procedure / void function early. PostgreSQL
+	// treats the result as NULL. M0118-0009 (subxid-overflow gen_subxids).
+	if p.acceptSymbol(";") {
+		return &ReturnStmt{pos: retTok.Pos, Expr: nil}, nil
 	}
 	// RETURN NEXT expr; — PL/pgSQL SETOF row emitter. M0097-0073.
 	if p.cur().Kind == parser.TokenIdent && strings.EqualFold(p.cur().Value, "next") {

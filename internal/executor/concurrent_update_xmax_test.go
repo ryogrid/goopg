@@ -3,6 +3,7 @@ package executor
 import (
 	"testing"
 
+	"github.com/goopg/goopg/internal/multixact"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -136,10 +137,260 @@ func TestIsConcurrentlyUpdatedHelper(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := isConcurrentlyUpdated(c.h, myXID, nil); got != c.want {
+			if got := isConcurrentlyUpdated(c.h, myXID, nil, nil); got != c.want {
 				t.Errorf("isConcurrentlyUpdated = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// TestIsConcurrentlyUpdatedMultiXact pins the M0118-0003 visibility-consumer
+// slice: when a tuple's xmax is an updater-bearing MultiXactId (IS_MULTI set,
+// LOCK_ONLY clear), isConcurrentlyUpdated must resolve the real updater xid
+// from the member store rather than treating the raw MultiXactId as the
+// deleting transaction id. Lock-only and single-xid cases are covered by
+// TestIsConcurrentlyUpdatedHelper.
+func TestIsConcurrentlyUpdatedMultiXact(t *testing.T) {
+	const myXID storage.TransactionID = 100
+	store := multixact.NewStore()
+
+	// A multi whose updater is a DIFFERENT transaction (xid 60).
+	updByOther, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 50, Status: multixact.StatusForShare},    // locker
+		{Xid: 60, Status: multixact.StatusNoKeyUpdate}, // updater
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(other updater): %v", err)
+	}
+	// A multi whose updater is OUR OWN transaction.
+	updBySelf, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 50, Status: multixact.StatusForShare},
+		{Xid: myXID, Status: multixact.StatusUpdate},
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(self updater): %v", err)
+	}
+	// A multi with only lockers (no updater). Such a multi should normally
+	// carry LOCK_ONLY; we deliberately leave that bit clear to exercise the
+	// defensive "no resolvable updater" branch.
+	lockersOnly, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 50, Status: multixact.StatusForShare},
+		{Xid: 60, Status: multixact.StatusForKeyShare},
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(lockers only): %v", err)
+	}
+
+	mk := func(multi multixact.MultiXactId) storage.HeapTupleHeader {
+		// IS_MULTI set, LOCK_ONLY clear: an updater-bearing multixact xmax.
+		return storage.HeapTupleHeader{Xmax: storage.TransactionID(multi), Infomask: storage.HeapXmaxIsMulti}
+	}
+
+	cases := []struct {
+		name string
+		h    storage.HeapTupleHeader
+		mxs  *multixact.Store
+		want bool
+	}{
+		{"updater is another active xact", mk(updByOther), store, true},
+		{"updater is our own xact", mk(updBySelf), store, false},
+		{"multi has only lockers (no updater)", mk(lockersOnly), store, false},
+		{"updater-multi but store unavailable", mk(updByOther), nil, true},
+		{"updater-multi not present in store", mk(9999), store, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := isConcurrentlyUpdated(c.h, myXID, nil, c.mxs); got != c.want {
+				t.Errorf("isConcurrentlyUpdated = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestMultixactUpdaterXIDHelper pins multixactUpdaterXID, the shared resolver
+// the FK-wait, ON CONFLICT arbiter, and SELECT FOR UPDATE re-stamp consumers
+// use to turn an updater-bearing MultiXactId t_xmax into the real updater
+// transaction id before any single-transaction test. It must never hand back a
+// MultiXactId.
+func TestMultixactUpdaterXIDHelper(t *testing.T) {
+	store := multixact.NewStore()
+	updByOther, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 50, Status: multixact.StatusForShare},    // locker
+		{Xid: 60, Status: multixact.StatusNoKeyUpdate}, // updater
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(updater): %v", err)
+	}
+	lockersOnly, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: 50, Status: multixact.StatusForShare},
+		{Xid: 60, Status: multixact.StatusForKeyShare},
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers(lockers only): %v", err)
+	}
+
+	cases := []struct {
+		name string
+		mxs  *multixact.Store
+		xmax storage.TransactionID
+		want storage.TransactionID
+	}{
+		{"resolves updater member", store, storage.TransactionID(updByOther), 60},
+		{"lockers only -> invalid", store, storage.TransactionID(lockersOnly), storage.InvalidTransactionID},
+		{"nil store -> invalid", nil, storage.TransactionID(updByOther), storage.InvalidTransactionID},
+		{"unknown multi -> invalid", store, 9999, storage.InvalidTransactionID},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := multixactUpdaterXID(c.mxs, c.xmax); got != c.want {
+				t.Errorf("multixactUpdaterXID = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+// TestMultixactFirstActiveMemberHelper pins multixactFirstActiveMember, the
+// resolver the ON CONFLICT arbiter (Case 3) uses to pick ONE live holder of a
+// lock-only multixact to wait on (the re-probe loop drains the rest). It must
+// skip self and settled members and never return a MultiXactId.
+func TestMultixactFirstActiveMemberHelper(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+
+	// Two concurrently-live lock holders. XIDs are lazily assigned, so
+	// materialise a concrete in-progress XID for each (mirrors a real row
+	// lock, which assigns the locker's XID before stamping t_xmax).
+	t1 := beginTxn(t, ctx)
+	t2 := beginTxn(t, ctx)
+	xid1, err := ctx.TxnMgr.AssignXID(t1)
+	if err != nil {
+		t.Fatalf("AssignXID t1: %v", err)
+	}
+	xid2, err := ctx.TxnMgr.AssignXID(t2)
+	if err != nil {
+		t.Fatalf("AssignXID t2: %v", err)
+	}
+	store := multixact.NewStore()
+	multi, err := store.CreateFromMembers([]multixact.Member{
+		{Xid: xid1, Status: multixact.StatusForShare},
+		{Xid: xid2, Status: multixact.StatusForKeyShare},
+	})
+	if err != nil {
+		t.Fatalf("CreateFromMembers: %v", err)
+	}
+	xmax := storage.TransactionID(multi)
+
+	// With self == xid1, the first active non-self holder is xid2.
+	if got := multixactFirstActiveMember(store, ctx.TxnMgr, xid1, xmax); got != xid2 {
+		t.Errorf("first active member (self=xid1) = %d, want %d", got, xid2)
+	}
+	// nil store / nil manager are defensive -> invalid.
+	if got := multixactFirstActiveMember(nil, ctx.TxnMgr, xid1, xmax); got != storage.InvalidTransactionID {
+		t.Errorf("nil store = %d, want invalid", got)
+	}
+	if got := multixactFirstActiveMember(store, nil, xid1, xmax); got != storage.InvalidTransactionID {
+		t.Errorf("nil manager = %d, want invalid", got)
+	}
+
+	// Settle t2; now no active non-self holder remains for self == xid1.
+	if err := ctx.TxnMgr.Commit(t2); err != nil {
+		t.Fatalf("commit t2: %v", err)
+	}
+	if got := multixactFirstActiveMember(store, ctx.TxnMgr, xid1, xmax); got != storage.InvalidTransactionID {
+		t.Errorf("after t2 settled = %d, want invalid", got)
+	}
+	_ = ctx.TxnMgr.Rollback(t1)
+}
+
+// TestStampUpdaterXmaxPreservingLockers pins the M0118-0004 UPDATE/DELETE
+// producer: when the old tuple already carries a pre-existing non-conflicting
+// foreign lock-only xmax, the writer preserves it into a {updater + survivors}
+// MultiXactId rather than clobbering it with the plain single-xid stamp.
+func TestStampUpdaterXmaxPreservingLockers(t *testing.T) {
+	ctx, _, cleanup := newStorageFixture(t)
+	defer cleanup()
+	ctx.MultiXact = multixact.NewStore()
+
+	// Materialise self's writer XID (the updater).
+	if err := ctx.MaterializeWriterXID(); err != nil {
+		t.Fatalf("MaterializeWriterXID: %v", err)
+	}
+	self := ctx.Tx.XID
+
+	// A foreign, still-active FOR KEY SHARE locker.
+	locker := beginTxn(t, ctx)
+	defer func() { _ = ctx.TxnMgr.Rollback(locker) }()
+	lockerXID, err := ctx.TxnMgr.AssignXID(locker)
+	if err != nil {
+		t.Fatalf("AssignXID locker: %v", err)
+	}
+	keyShareHdr := storage.HeapTupleHeader{
+		Xmax:     lockerXID,
+		Infomask: storage.HeapXmaxLockOnly | storage.HeapXmaxKeyShrLock,
+	}
+
+	// Case 1: no-key UPDATE — FOR KEY SHARE does NOT conflict with a no-key
+	// update, so the locker is preserved into {locker keyshare, self nokeyupdate}.
+	multi, im, _, ok, err := stampUpdaterXmaxPreservingLockers(ctx, keyShareHdr, false)
+	if err != nil {
+		t.Fatalf("no-key update: %v", err)
+	}
+	if !ok {
+		t.Fatalf("no-key update: ok=false, want a preserving multi")
+	}
+	if im&storage.HeapXmaxIsMulti == 0 {
+		t.Errorf("no-key update: infomask %#x missing HEAP_XMAX_IS_MULTI", im)
+	}
+	if im&storage.HeapXmaxLockOnly != 0 {
+		t.Errorf("no-key update: infomask %#x still has HEAP_XMAX_LOCK_ONLY (updater-bearing multi)", im)
+	}
+	members, found := ctx.MultiXact.Members(multi)
+	if !found {
+		t.Fatalf("no-key update: multi %d has no members", multi)
+	}
+	haveLocker, haveSelf := false, false
+	for _, m := range members {
+		if m.Xid == lockerXID && m.Status == multixact.StatusForKeyShare {
+			haveLocker = true
+		}
+		if m.Xid == self && m.Status == multixact.StatusNoKeyUpdate {
+			haveSelf = true
+		}
+	}
+	if !haveLocker || !haveSelf {
+		t.Errorf("no-key update members = %+v, want {locker keyshare, self nokeyupdate}", members)
+	}
+
+	// Case 2: key UPDATE / DELETE — StatusUpdate conflicts with FOR KEY SHARE,
+	// so nothing is preserved (caller falls back to the plain single-xid stamp).
+	if _, _, _, ok, err := stampUpdaterXmaxPreservingLockers(ctx, keyShareHdr, true); err != nil || ok {
+		t.Errorf("key update/delete: ok=%v err=%v, want ok=false (conflict drops locker)", ok, err)
+	}
+
+	// Case 3: a non-lock-only (updater-bearing) xmax is out of scope -> ok=false.
+	updHdr := storage.HeapTupleHeader{Xmax: lockerXID} // no LOCK_ONLY bit
+	if _, _, _, ok, err := stampUpdaterXmaxPreservingLockers(ctx, updHdr, false); err != nil || ok {
+		t.Errorf("non-lock-only xmax: ok=%v err=%v, want ok=false", ok, err)
+	}
+
+	// Case 4: the only holder is self -> nothing foreign to preserve -> ok=false.
+	selfHdr := storage.HeapTupleHeader{Xmax: self, Infomask: storage.HeapXmaxLockOnly | storage.HeapXmaxKeyShrLock}
+	if _, _, _, ok, err := stampUpdaterXmaxPreservingLockers(ctx, selfHdr, false); err != nil || ok {
+		t.Errorf("self-only holder: ok=%v err=%v, want ok=false", ok, err)
+	}
+
+	// Case 5: a dead (committed) foreign locker -> lock released -> ok=false.
+	deadLocker := beginTxn(t, ctx)
+	deadXID, err := ctx.TxnMgr.AssignXID(deadLocker)
+	if err != nil {
+		t.Fatalf("AssignXID dead locker: %v", err)
+	}
+	if err := ctx.TxnMgr.Commit(deadLocker); err != nil {
+		t.Fatalf("commit dead locker: %v", err)
+	}
+	deadHdr := storage.HeapTupleHeader{Xmax: deadXID, Infomask: storage.HeapXmaxLockOnly | storage.HeapXmaxKeyShrLock}
+	if _, _, _, ok, err := stampUpdaterXmaxPreservingLockers(ctx, deadHdr, false); err != nil || ok {
+		t.Errorf("dead locker: ok=%v err=%v, want ok=false", ok, err)
 	}
 }
 
