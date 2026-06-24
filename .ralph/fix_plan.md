@@ -884,6 +884,39 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       InheritTemp + TruncateConflict + ClusterConflict{,Partition} + VacuumConflict
       (14 strict PASS, single run); `go test ./internal/executor/` + `-race`
       partition/insert paths; `go build ./...` clean; pgbench smoke = pre-commit.
+      **2026-06-24 enabler (design 0118-0080, NOT a promotion): `alter-table-4`
+      perms 1 & 2 byte-for-byte.** Inheritance DDL (`c1 NO INHERIT p`,
+      `c2 INHERIT p`) inside an explicit txn vs a concurrent `SELECT SUM(a) FROM p`:
+      PG identifies the parent's children from the reader's snapshot THEN locks
+      them, so the reader blocks on the writer's AccessExclusiveLock on `c1` and the
+      change is invisible until commit. goopg mutated the SHARED catalog
+      synchronously + took no lock ⇒ `s2sel` planned `{p}` and returned immediately.
+      The SELECT side already locks each child AccessShare
+      (`collectInheritanceDescendants`→per-child SeqScan→`acquireScanReadLockTxn`);
+      added the DDL-side pieces (mirror DROP INDEX 0118-0074 / ATTACH 0118-0077):
+      (1) `AlterTableInherit`/`AlterTableNoInherit` take a txn-scoped
+      AccessExclusiveLock on the child via `acquireDDLLockTxn`; (2) inside an
+      explicit txn (`(*ddlOp).inheritDeferSession()`) the register/unregister +
+      INHERIT column-copy is recorded in `BasicSession.pendingInheritChng`
+      (`PendingInheritanceChange` + Add/Take/CancelToDepth) and applied at commit by
+      `ApplyPendingInheritanceChanges` on BOTH commit paths (executor + dispatch),
+      discarded by `DiscardPendingInheritanceChanges` in `ProcessRollbackUndos` /
+      to-depth in `rollbackToSavepointOp` (validation still immediate); (3) new
+      `catalog.InMemory` O(1) counter `Has/Mark/UnmarkInheritanceChangePending`
+      bypasses the cross-session plan cache while pending (`inheritanceChangePending`
+      in both dispatch guards) so the 2nd `s2sel` re-plans → 1 (perm 1) / 101
+      (perm 2). Blast radius nil: deferral+lock only inside an explicit txn over
+      InMemory; autocommit unchanged; partitioning untouched
+      (`RegisterPartitionChild` is a separate path). **Spec stays `defer`** — perm 3
+      (`DROP c1`) needs deferred DROP TABLE + post-lock skip-of-vanished-child,
+      perm 4 (`ALTER COLUMN TYPE`) needs deferred column-type change + post-lock
+      parent-type re-validation error (ledger). Gates: probe perms 1&2 byte-match
+      (divergence → perm 3); new units `TestInheritanceChangePendingCounter` +
+      `TestPendingInheritanceChangeSession`; no regression across
+      InheritTemp/DetachPartitionConcurrently1..4/PartitionConcurrentAttach/
+      AlterTable1/AlterTable3/CreateTrigger/TruncateConflict; `go test
+      ./internal/{catalog,executor,server}/` + `-race`; `go build ./...` + `go vet`
+      clean; pgbench smoke = pre-commit.
       **2026-06-24 enabler (design 0118-0076, NOT a promotion):
       `partition-concurrent-attach` piece (b) — ATTACH locks the DEFAULT
       partition.** `ALTER TABLE … ATTACH PARTITION` (non-default), inside an

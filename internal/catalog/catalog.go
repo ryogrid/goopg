@@ -1335,6 +1335,17 @@ type InMemory struct {
 	// for table inheritance support (M0096-0009).
 	inheritanceChildren map[uint32][]uint32
 
+	// pendingInheritanceChangeCount counts ALTER TABLE … {NO} INHERIT operations
+	// issued inside an in-progress explicit transaction whose catalog mutation is
+	// deferred to COMMIT (so the change is invisible to concurrent sessions until
+	// commit — PG transactional-DDL visibility, alter-table-4 isolation spec).
+	// While > 0 the cross-session plan cache is bypassed so a query scanning the
+	// parent re-plans against the current (pre-commit) child set rather than reuse
+	// a plan baked across the inheritance change. Maintained by
+	// MarkInheritanceChangePending / UnmarkInheritanceChangePending; zero in the
+	// steady state. Design 0118-0080 (M0118-0008).
+	pendingInheritanceChangeCount int
+
 	// enumTypes holds user-defined enum types. M0097-0017.
 	enumTypes map[string]*EnumType
 	// domains holds user-defined domain types. M0097-0017.
@@ -2071,6 +2082,38 @@ func (c *InMemory) HasPendingPartitionDetach() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.pendingPartitionDetachCount > 0
+}
+
+// MarkInheritanceChangePending increments the deferred-inheritance-change counter
+// when an ALTER TABLE … {NO} INHERIT inside an explicit transaction records its
+// catalog mutation for replay at COMMIT. Design 0118-0080 (M0118-0008).
+func (c *InMemory) MarkInheritanceChangePending() {
+	c.mu.Lock()
+	c.pendingInheritanceChangeCount++
+	c.mu.Unlock()
+}
+
+// UnmarkInheritanceChangePending decrements the counter when a deferred
+// inheritance change is applied (at COMMIT) or discarded (at ROLLBACK / ROLLBACK
+// TO SAVEPOINT). Clamped at zero. Design 0118-0080 (M0118-0008).
+func (c *InMemory) UnmarkInheritanceChangePending() {
+	c.mu.Lock()
+	if c.pendingInheritanceChangeCount > 0 {
+		c.pendingInheritanceChangeCount--
+	}
+	c.mu.Unlock()
+}
+
+// HasPendingInheritanceChange reports whether any ALTER TABLE … {NO} INHERIT is
+// currently deferred to COMMIT in an in-progress explicit transaction. When true
+// the cross-session plan cache must be bypassed so a query scanning the parent
+// re-plans against the current child set rather than reuse a plan baked across
+// the inheritance change (mirrors HasPendingPartitionDetach for detach). O(1).
+// Design 0118-0080 (M0118-0008 alter-table-4).
+func (c *InMemory) HasPendingInheritanceChange() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.pendingInheritanceChangeCount > 0
 }
 
 // VisiblePartitionChildren filters a partition child list down to those visible

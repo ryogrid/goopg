@@ -84,6 +84,22 @@ type PendingPartitionAttach struct {
 	SavepointDepth int                      // savepoint depth at attach time (ROLLBACK TO cancel)
 }
 
+// PendingInheritanceChange records an ALTER TABLE … {NO} INHERIT issued inside an
+// explicit transaction whose catalog mutation (register/unregister the parent↔child
+// inheritance link) is deferred until COMMIT. Until the altering transaction
+// commits the shared catalog keeps the OLD inheritance state, so a concurrent
+// session scanning the parent still expands to the pre-change child set (and a
+// child being un-inherited stays scanned, blocking on the AccessExclusiveLock the
+// altering session holds on it) — PG transactional-DDL visibility, the
+// alter-table-4 isolation spec. In autocommit the mutation stays immediate.
+// ApplyPendingInheritanceChanges replays the recorded change at commit. M0118-0008.
+type PendingInheritanceChange struct {
+	ParentOID      uint32 // inheritance parent table OID
+	ChildOID       uint32 // inheritance child table OID
+	NoInherit      bool   // true = NO INHERIT (unregister); false = INHERIT (register)
+	SavepointDepth int    // savepoint depth at statement time (ROLLBACK TO cancel)
+}
+
 // relPageSnapshot captures the full page contents of one relation before
 // a TRUNCATE so that ROLLBACK can restore them.
 type relPageSnapshot struct {
@@ -111,19 +127,20 @@ type BasicSession struct {
 	inTx                bool
 	tx                  mvcc.Transaction
 	snap                mvcc.Snapshot
-	pendingDDL          []DDLUndoEntry           // DDL creates pending rollback
-	pendingRoutineDrops []*catalog.Routine       // routines dropped in current tx, for rollback
-	pendingTruncates    []TruncateUndoEntry      // heap/index page snapshots for TRUNCATE rollback
-	pendingSeqRestores  []SeqRestoreEntry        // sequence counter restores for RESTART IDENTITY rollback
-	savepointDDLDrops   []DDLDropUndoEntry       // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
-	pendingIndexDrops   []PendingIndexDrop       // DROP INDEX deferred to COMMIT (M0118-0008)
-	pendingPartAttaches []PendingPartitionAttach // ATTACH PARTITION deferred to COMMIT (M0118-0008)
-	subxactStack        mvcc.SubxactStack        // savepoint stack (M0050-0004)
-	currentSubXid       storage.TransactionID    // 0 = use top-level tx.XID
-	txFailed            bool                     // in_failed_sql_transaction (25P02)
-	txnReadOnly         bool                     // true while inside a READ ONLY transaction (M0097-0024)
-	deferredFKChecks    []DeferredFKCheck        // INITIALLY DEFERRED FK checks (M0096-0011)
-	activeQueryTables   map[uint32]bool          // OIDs of tables currently in active DML (M0097-0023)
+	pendingDDL          []DDLUndoEntry             // DDL creates pending rollback
+	pendingRoutineDrops []*catalog.Routine         // routines dropped in current tx, for rollback
+	pendingTruncates    []TruncateUndoEntry        // heap/index page snapshots for TRUNCATE rollback
+	pendingSeqRestores  []SeqRestoreEntry          // sequence counter restores for RESTART IDENTITY rollback
+	savepointDDLDrops   []DDLDropUndoEntry         // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
+	pendingIndexDrops   []PendingIndexDrop         // DROP INDEX deferred to COMMIT (M0118-0008)
+	pendingPartAttaches []PendingPartitionAttach   // ATTACH PARTITION deferred to COMMIT (M0118-0008)
+	pendingInheritChng  []PendingInheritanceChange // ALTER TABLE {NO} INHERIT deferred to COMMIT (M0118-0008)
+	subxactStack        mvcc.SubxactStack          // savepoint stack (M0050-0004)
+	currentSubXid       storage.TransactionID      // 0 = use top-level tx.XID
+	txFailed            bool                       // in_failed_sql_transaction (25P02)
+	txnReadOnly         bool                       // true while inside a READ ONLY transaction (M0097-0024)
+	deferredFKChecks    []DeferredFKCheck          // INITIALLY DEFERRED FK checks (M0096-0011)
+	activeQueryTables   map[uint32]bool            // OIDs of tables currently in active DML (M0097-0023)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -191,6 +208,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.savepointDDLDrops = nil
 	s.pendingIndexDrops = nil
 	s.pendingPartAttaches = nil
+	s.pendingInheritChng = nil
 	s.subxactStack = mvcc.SubxactStack{}
 	s.currentSubXid = 0
 	s.txFailed = false
@@ -424,6 +442,40 @@ func (s *BasicSession) CancelPendingPartitionAttachesToDepth(depth int) {
 		}
 	}
 	s.pendingPartAttaches = keep
+}
+
+// AddPendingInheritanceChange records an ALTER TABLE … {NO} INHERIT whose catalog
+// mutation is deferred until COMMIT (see PendingInheritanceChange). M0118-0008.
+func (s *BasicSession) AddPendingInheritanceChange(e PendingInheritanceChange) {
+	s.pendingInheritChng = append(s.pendingInheritChng, e)
+}
+
+// TakePendingInheritanceChanges drains and returns the deferred inheritance
+// changes. Called from the commit paths (ApplyPendingInheritanceChanges) to apply
+// the real catalog mutation, and from the rollback path (via
+// DiscardPendingInheritanceChanges) to discard them. M0118-0008.
+func (s *BasicSession) TakePendingInheritanceChanges() []PendingInheritanceChange {
+	out := s.pendingInheritChng
+	s.pendingInheritChng = nil
+	return out
+}
+
+// CancelPendingInheritanceChangesToDepth discards deferred inheritance changes
+// recorded at savepoint depth >= depth and returns the count discarded, so the
+// caller can drop the matching catalog pending-counter marks. Mirrors
+// CancelPendingPartitionAttachesToDepth. M0118-0008.
+func (s *BasicSession) CancelPendingInheritanceChangesToDepth(depth int) int {
+	keep := s.pendingInheritChng[:0]
+	cancelled := 0
+	for _, e := range s.pendingInheritChng {
+		if e.SavepointDepth < depth {
+			keep = append(keep, e)
+		} else {
+			cancelled++
+		}
+	}
+	s.pendingInheritChng = keep
+	return cancelled
 }
 
 // MarkTableActive marks a table OID as currently being mutated by a DML

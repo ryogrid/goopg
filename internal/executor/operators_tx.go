@@ -159,6 +159,9 @@ func (o *transactionOp) execCommit() error {
 		// M0118-0008: register ATTACH PARTITION deferred to COMMIT (the new
 		// partition was invisible to other sessions until now).
 		ApplyPendingPartitionAttaches(o.ctx, sess)
+		// M0118-0008: apply ALTER TABLE {NO} INHERIT deferred to COMMIT (the
+		// inheritance link change was invisible to other sessions until now).
+		ApplyPendingInheritanceChanges(o.ctx, sess)
 	}
 	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
@@ -287,6 +290,10 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 			}
 		}
 	}
+	// Drop any ALTER TABLE {NO} INHERIT changes deferred to COMMIT — a ROLLBACK
+	// leaves the inheritance state untouched (and clears the catalog pending-change
+	// marks that bypass the plan cache). M0118-0008 (alter-table-4).
+	DiscardPendingInheritanceChanges(ctx, sess)
 }
 
 func (o *transactionOp) clearCtxTransaction() {
@@ -456,6 +463,16 @@ func (o *transactionOp) execRollbackTo() error {
 	// outer COMMIT.
 	sess.CancelPendingIndexDropsToDepth(newDepth)
 	sess.CancelPendingPartitionAttachesToDepth(newDepth)
+	// Discard deferred ALTER TABLE {NO} INHERIT changes recorded inside the
+	// rolled-back savepoint, clearing the matching catalog pending-change marks.
+	// M0118-0008 (alter-table-4).
+	if cancelled := sess.CancelPendingInheritanceChangesToDepth(newDepth); cancelled > 0 {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			for i := 0; i < cancelled; i++ {
+				im.UnmarkInheritanceChangePending()
+			}
+		}
+	}
 	o.ctx.Tx.XID = newSubXid
 	return nil
 }

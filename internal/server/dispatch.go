@@ -747,7 +747,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// plan, cache, then execute.
 		var precached planner.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 			cacheKey = normalizeCompatSQL(sql)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -989,6 +989,29 @@ func partitionDetachPending(base catalog.Catalog) bool {
 	for {
 		if c, ok := base.(checker); ok {
 			return c.HasPendingPartitionDetach()
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+		} else {
+			return false
+		}
+	}
+}
+
+// inheritanceChangePending reports whether the base catalog currently has an
+// ALTER TABLE … {NO} INHERIT deferred to COMMIT by an in-progress explicit
+// transaction. When true the cross-session plan cache must be bypassed: a query
+// scanning the inheritance parent must re-plan against the current (pre-commit)
+// child set rather than reuse a plan cached across the inheritance change — the
+// same constraint partitionDetachPending imposes for concurrent detach. Returns
+// false for any catalog that does not expose the check. Design 0118-0080
+// (M0118-0008 alter-table-4).
+func inheritanceChangePending(base catalog.Catalog) bool {
+	type checker interface{ HasPendingInheritanceChange() bool }
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if c, ok := base.(checker); ok {
+			return c.HasPendingInheritanceChange()
 		}
 		if u, ok := base.(unwrapper); ok {
 			base = u.Unwrap()
@@ -1738,6 +1761,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					// M0118-0008: register ATTACH PARTITION deferred to COMMIT (the
 					// simple-query path bypasses execCommit).
 					executor.ApplyPendingPartitionAttaches(ctx, sess)
+					// M0118-0008: apply ALTER TABLE {NO} INHERIT deferred to COMMIT
+					// (the simple-query path bypasses execCommit).
+					executor.ApplyPendingInheritanceChanges(ctx, sess)
 				}
 				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
 					undoEnumDDLForRollback(connTx, s.cfg.Catalog)

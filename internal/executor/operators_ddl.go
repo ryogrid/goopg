@@ -5041,6 +5041,70 @@ func ApplyPendingPartitionAttaches(ctx *Context, sess *BasicSession) {
 	}
 }
 
+// ApplyPendingInheritanceChanges performs the deferred catalog mutation for every
+// ALTER TABLE … {NO} INHERIT the AlterTableInherit/AlterTableNoInherit cases
+// deferred to COMMIT (the inheritance link was kept at its pre-statement state so
+// concurrent sessions did not see the change until now). Must run BEFORE
+// TxnMgr.Commit, mirroring ApplyPendingPartitionAttaches. A ROLLBACK discards the
+// changes via DiscardPendingInheritanceChanges instead. Design 0118-0080
+// (M0118-0008 alter-table-4).
+func ApplyPendingInheritanceChanges(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	changes := sess.TakePendingInheritanceChanges()
+	if len(changes) == 0 {
+		return
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	for _, ch := range changes {
+		if ch.NoInherit {
+			im.UnregisterInheritanceChild(ch.ParentOID, ch.ChildOID)
+		} else {
+			im.RegisterInheritanceChild(ch.ParentOID, ch.ChildOID)
+			// Copy parent columns the child doesn't already have, matching the
+			// immediate (autocommit) INHERIT path. In alter-table-4 the child
+			// already has matching columns so this is a no-op.
+			if childTbl, okc := im.LookupTableByOID(ch.ChildOID); okc {
+				if parentTbl, okp := im.LookupTableByOID(ch.ParentOID); okp {
+					childCols := make(map[string]bool, len(childTbl.Columns))
+					for _, c := range childTbl.Columns {
+						childCols[strings.ToLower(c.Name)] = true
+					}
+					for _, pc := range parentTbl.Columns {
+						if !childCols[strings.ToLower(pc.Name)] {
+							childTbl.Columns = append(childTbl.Columns, pc)
+						}
+					}
+				}
+			}
+		}
+		im.UnmarkInheritanceChangePending()
+	}
+}
+
+// DiscardPendingInheritanceChanges drops every deferred inheritance change without
+// applying it, clearing the matching catalog pending-counter marks. Called from
+// the rollback path (ProcessRollbackUndos) so a ROLLBACK leaves the inheritance
+// state untouched. Design 0118-0080 (M0118-0008).
+func DiscardPendingInheritanceChanges(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	changes := sess.TakePendingInheritanceChanges()
+	if len(changes) == 0 {
+		return
+	}
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		for range changes {
+			im.UnmarkInheritanceChangePending()
+		}
+	}
+}
+
 // lockDropIndexTree acquires the full set of AccessExclusiveLocks that
 // PostgreSQL's DROP INDEX (non-CONCURRENTLY) takes, in PG's acquisition order:
 //  1. the target index relation itself (granted before any blocking),
@@ -5162,6 +5226,26 @@ func (o *ddlOp) lockPartitionSubtreeAccessExcl(im *catalog.InMemory, tbl *catalo
 // default's tightened constraint can reject the routed rows. Transaction-scoped
 // via acquireDDLLockTxn (a no-op in autocommit / for system relations), so the
 // hot path and plain CREATE TABLE … PARTITION OF are unaffected.
+// inheritDeferSession returns the BasicSession to record a deferred-to-COMMIT
+// ALTER TABLE … {NO} INHERIT change against, or nil when the change must be
+// applied immediately. It returns non-nil only inside an explicit transaction
+// over an InMemory catalog (mirrors the ATTACH PARTITION deferral gate): in
+// autocommit the inheritance mutation is applied at statement time as before.
+// Design 0118-0080 (M0118-0008 alter-table-4).
+func (o *ddlOp) inheritDeferSession() *BasicSession {
+	if o.ctx == nil || o.ctx.Session == nil || !o.ctx.Session.InExplicitTransaction() {
+		return nil
+	}
+	bs, ok := o.ctx.Session.(*BasicSession)
+	if !ok {
+		return nil
+	}
+	if _, ok := o.ctx.Catalog.(*catalog.InMemory); !ok {
+		return nil
+	}
+	return bs
+}
+
 func (o *ddlOp) lockDefaultPartitionForAttach(parent *catalog.Table) error {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
@@ -5946,6 +6030,15 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.InheritParent.String())}
 			}
+			// Take a transaction-scoped AccessExclusiveLock on the child being added
+			// to the inheritance tree, mirroring PG ATExecAddInherit. No-op in
+			// autocommit / for system catalogs. M0118-0008 (alter-table-4).
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = act.Pos()
+				}
+				return err
+			}
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				// Self-inheritance.
 				if parentTbl.OID == tbl.OID {
@@ -5964,6 +6057,20 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						return &ExecError{Code: "42710", Pos: act.Pos(),
 							Message: fmt.Sprintf("relation %q would be inherited from more than once", parentTbl.Name)}
 					}
+				}
+				// Inside an explicit transaction, defer the registration (and the
+				// column copy below) to COMMIT so the new inheritance link is
+				// invisible to concurrent sessions until commit — PG transactional-
+				// DDL visibility (alter-table-4). In autocommit, apply immediately.
+				if defSess := o.inheritDeferSession(); defSess != nil {
+					defSess.AddPendingInheritanceChange(PendingInheritanceChange{
+						ParentOID:      parentTbl.OID,
+						ChildOID:       tbl.OID,
+						NoInherit:      false,
+						SavepointDepth: defSess.SavepointDepth(),
+					})
+					im.MarkInheritanceChangePending()
+					break
 				}
 				im.RegisterInheritanceChild(parentTbl.OID, tbl.OID)
 			}
@@ -5985,9 +6092,34 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.InheritParent.String())}
 			}
+			// Take a transaction-scoped AccessExclusiveLock on the child being
+			// removed from the inheritance tree, mirroring PG ATExecDropInherit, so
+			// a concurrent SELECT on the parent that still includes this child (the
+			// unlink is deferred to commit below) blocks on this lock until commit.
+			// No-op in autocommit / for system catalogs. M0118-0008 (alter-table-4).
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = act.Pos()
+				}
+				return err
+			}
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				// Silently ignore if not currently a child (matches PG behavior on repeated NO INHERIT).
-				im.UnregisterInheritanceChild(parentTbl.OID, tbl.OID)
+				// Inside an explicit transaction, defer the unregister to COMMIT so
+				// concurrent sessions keep seeing the child until commit (and a
+				// parent scan keeps including it, blocking on the lock above). In
+				// autocommit, unregister immediately. Silently ignores a relation
+				// that is not currently a child (matches PG on repeated NO INHERIT).
+				if defSess := o.inheritDeferSession(); defSess != nil {
+					defSess.AddPendingInheritanceChange(PendingInheritanceChange{
+						ParentOID:      parentTbl.OID,
+						ChildOID:       tbl.OID,
+						NoInherit:      true,
+						SavepointDepth: defSess.SavepointDepth(),
+					})
+					im.MarkInheritanceChangePending()
+				} else {
+					im.UnregisterInheritanceChild(parentTbl.OID, tbl.OID)
+				}
 			}
 		case parser.AlterTableSetStorage:
 			// SET STORAGE type — record on the catalog column AND rewrite the
