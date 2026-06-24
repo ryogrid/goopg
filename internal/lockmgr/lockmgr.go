@@ -642,3 +642,48 @@ func (lm *LockManager) Waiters(t LockTag) []Waiter {
 	}
 	return out
 }
+
+// LockHolding is one (backend, mode) lock entry on a tag — the
+// enumeration unit the pg_locks view consumes. A backend's holder Mask
+// is expanded into one LockHolding per set mode bit (Granted=true); each
+// queued waiter becomes one LockHolding with Granted=false. Tuple-level
+// tags (Block/Offset non-zero) are included; callers that want only
+// relation locks filter on Tag.Block==0 && Tag.Offset==0.
+type LockHolding struct {
+	Tag     LockTag
+	Backend BackendID
+	Mode    Mode
+	Granted bool
+}
+
+// AllLocks returns every currently-tracked lock holding and waiter across
+// all tags, one entry per (backend, mode). It is the read-side analog of
+// upstream's GetLockStatusData() (lock.c) that backs the pg_locks view:
+// holders surface as Granted=true (one row per mode bit in the Mask, so a
+// backend holding several self-compatible modes on a tag yields several
+// rows, matching upstream's one-LOCK-per-mode accounting), waiters as
+// Granted=false. Ordering is unspecified (map iteration) — callers sort.
+//
+// Read-only: takes the manager lock, copies out, holds nothing. The
+// returned slice is owned by the caller.
+func (lm *LockManager) AllLocks() []LockHolding {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	var out []LockHolding
+	for tag, st := range lm.states {
+		if st == nil {
+			continue
+		}
+		for b, mask := range st.holders {
+			for m := AccessShareLock; m <= maxMode; m++ {
+				if mask&bit(m) != 0 {
+					out = append(out, LockHolding{Tag: tag, Backend: b, Mode: m, Granted: true})
+				}
+			}
+		}
+		for _, w := range st.waiters {
+			out = append(out, LockHolding{Tag: tag, Backend: w.Backend, Mode: w.Mode, Granted: false})
+		}
+	}
+	return out
+}
