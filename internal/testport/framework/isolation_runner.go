@@ -1004,6 +1004,21 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcom
 	if len(stmts) == 0 {
 		stmts = []string{sqlText}
 	}
+	// PostgreSQL isolationtester sends each step's body verbatim as a single
+	// simple-query, so pg_stat_activity.query echoes the exact text the client
+	// sent — INCLUDING the trailing ';'. splitSQLStatements strips the
+	// terminator (it returns bare statements for execution). For a
+	// single-statement step, send the trimmed verbatim body instead so the
+	// query goopg stores matches PG byte-for-byte; this is what the
+	// partition-drop-index-locking spec's s3getlocks observes when it joins
+	// pg_locks to pg_stat_activity on s.query. Multi-statement steps keep the
+	// split form (goopg's simple-query path executes them one at a time).
+	// M0118-0008, design 0118-0073.
+	if len(stmts) == 1 {
+		if trimmed := strings.TrimSpace(sqlText); trimmed != "" {
+			stmts[0] = trimmed
+		}
+	}
 	var result stepOutcome
 	for _, stmt := range stmts {
 		rs, errText := execOneStatement(ctx, conn, stmt)

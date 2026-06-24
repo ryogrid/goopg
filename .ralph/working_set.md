@@ -1,57 +1,50 @@
-Loop #6 (this run): M0118-0008 — SELECT locks the scanned relation's indexes
-(design 0118-0072). COMMITTED + pushed at loop end. NOT a promotion (closes
-"blocker 2" of 4 for partition-drop-index-locking).
+Loop #7 (this run): M0118-0008 — pg_stat_activity retains last query on idle
+(design 0118-0073). Closes "blocker 3" of 4 for partition-drop-index-locking.
+NOT a promotion. COMMIT + push pending at loop end.
 
 ## What landed (enabler)
-New helper (*Context).acquireScanIndexReadLocksTxn(tbl) in context.go: enumerates
-Catalog.IndexesOnTable(tbl) and AccessShare-locks each via the existing
-acquireScanReadLockTxn hook (held-to-commit in explicit txn / transient in
-autocommit / system catalogs skipped). Wired into all 3 scan-open paths that
-already take the table AccessShare lock:
-- seq scan: operators_storage.go (o.tbl)
-- index scan: operators_index.go openPrep (o.plan.Table)
-- index-only scan: operators_indexonly.go (o.plan.Table)
-PG locks ALL indexes of a scanned relation (get_relation_info→index_open), not
-just the probed one — so a bare SELECT on a leaf partition now appears in pg_locks
-holding AccessShare on its indexes, blocking a concurrent DROP INDEX (0118-0071).
+Two surgical halves so s3getlocks' `s.query` column matches PG byte-for-byte:
+1. ENGINE: internal/activity/registry.go UpdateState — removed the
+   `else if state=="idle" { c.Query.Store(nil) }` branch. Active query text now
+   persists through idle (PG: query shows the last executed query in all
+   non-active states; never-run backend still NULL; QueryStart untouched).
+2. RUNNER FIDELITY: internal/testport/framework/isolation_runner.go execStep —
+   for a SINGLE-statement step, send the trimmed verbatim body (keeps trailing
+   ';') instead of the ';'-stripped splitSQLStatements result. splitSQLStatements
+   + its unit test unchanged; multi-statement steps keep the split form.
 
-Files: internal/executor/context.go (helper), operators_storage.go,
-operators_index.go, operators_indexonly.go (wiring),
-partition_drop_index_lock_test.go (new TestSelectLocksLeafPartitionIndexes),
-docs/design/0118-0072-*.md + README index, deferral_ledger.md.
+Files: internal/activity/registry.go, internal/activity/activity_test.go (new
+TestUpdateStateRetainsQueryOnIdle), internal/testport/framework/isolation_runner.go,
+docs/design/0118-0073-*.md + README index.
 
-Key symbols: acquireScanIndexReadLocksTxn, acquireScanReadLockTxn,
-catalog.IndexesOnTable, catalog.IndexRelFileNode.
+Key symbols: ActivityRegistry.UpdateState, coldActivity.Query, execStep,
+splitSQLStatements (unchanged).
 
 ## Probe result (2026-06-24)
-1st s3getlocks now shows the open SELECT holding AccessShareLock|t on the leaf
-table + BOTH leaf indexes (_subpart_child_id_idx{,1}) — 3 rows previously absent.
-DROP-side rows unchanged. Spec still `defer`. Remaining first-getlocks gap is now
-only the empty query column (blocker 3); 2nd getlocks shows 5 vs 6 rows (blocker 4).
+Throwaway probe of partition-drop-index-locking.spec: the ENTIRE first
+s3getlocks snapshot now matches PG (idle SELECT...; row + active DROP INDEX...;
+rows, all with ';'). Diff now starts at blocker 4 only.
 
-## partition-drop-index-locking remaining blockers (resume point)
-3. **pg_stat_activity idle-query retention**: s.query empty for idle-in-txn
-   backends; goopg clears Query on return to idle (activity/registry.go
-   UpdateState `else if state=="idle"`) and drops trailing ';'. PG retains the
-   most-recent query for idle-in-txn. NEXT (mechanical-ish).
-4. **Transactional-DDL cross-session catalog visibility** (MILESTONE-SIZED, shared
-   with alter-table-4 / partition-concurrent-attach): 2nd s3getlocks must still
-   show the dropped index's pg_class row + locks until s2commit; goopg removes
-   from the shared in-memory catalog synchronously (5 vs 6 rows).
+## partition-drop-index-locking remaining blocker (resume point)
+4. **Transactional-DDL cross-session catalog visibility** (MILESTONE-SIZED,
+   shared with alter-table-4 / partition-concurrent-attach): 2nd s3getlocks must
+   still show the dropped index's pg_class row + locks until s2commit. goopg
+   removes the index from the shared in-memory catalog synchronously at DROP
+   INDEX, so the pg_locks JOIN pg_class loses the row → 5 vs 6 rows. Needs MVCC
+   catalog visibility (uncommitted DDL invisible cross-session until commit).
 
-Next step: blocker (3) idle-query retention — retain the last query text (with
-trailing ';') for idle-in-transaction backends in activity/registry.go so the
-s3getlocks `query` column matches. Then the txnl-DDL visibility milestone (4).
+Next step: blocker 4 is the only remaining blocker but is milestone-sized (MVCC
+catalog subsystem). Either start that milestone, or pivot to another M0118-0008
+tail spec. See hard-tail list below.
 
 ## M0118-0008 hard tail (all Effort-L, deferred)
-- partition-drop-index-locking: blockers 3/4 above.
-- alter-table-4 + partition-concurrent-attach: transactional-DDL cross-session
-  catalog visibility (milestone-sized MVCC catalog subsystem).
+- partition-drop-index-locking: blocker 4 only (MVCC catalog visibility).
+- alter-table-4 + partition-concurrent-attach: same MVCC catalog visibility.
 - reindex-concurrently-toast: real TOAST relations (reltoastrelid=0; text inline).
-- WHERE CURRENT OF positioned UPDATE/DELETE: project-wide, parsed (CurrentOf) no executor site.
+- WHERE CURRENT OF positioned UPDATE/DELETE: parsed (CurrentOf), no executor site.
 
-Gates run: go build ./... clean; TestSelectLocksLeafPartitionIndexes +
-TestDropIndexLocksIndexRelationTree + TestCreateIndexRecursesPartitionTree PASS;
-full ./internal/executor/ PASS; -race ./internal/lockmgr/; isolation no-regression
-batch (Reindex*/MultipleCic/DropIndexConcurrently1/InheritTemp/CreateTrigger/
-Truncate-Vacuum-Cluster-Conflict/AlterTable1-2-3) PASS; pgbench smoke=pre-commit.
+Gates run: go build ./... clean; TestUpdateStateRetainsQueryOnIdle PASS;
+go test ./internal/activity/ + -race PASS; go test ./internal/testport/framework/
+PASS; strict isolation no-regression batch (LockCommittedUpdate/
+DropIndexConcurrently1/CreateTrigger/InheritTemp/TruncateConflict/
+ReindexConcurrently/MultipleCic) all PASS; pgbench smoke = pre-commit hook.
