@@ -792,6 +792,43 @@ type Table struct {
 // (internal/executor/toast.go: RelOid + 100_000_000).
 const toastRelidOffset = 100_000_000
 
+// columnTypeIsToastable reports whether a column's declared type is a varlena
+// (variable-length) type that PostgreSQL would store out-of-line via TOAST.
+// Mirrors the executor's isToastableType set (internal/executor/toast.go) plus
+// array columns (every SQL array is varlena). Kept in sync with the storage
+// path so reltoastrelid existence matches where goopg actually toasts.
+func columnTypeIsToastable(col Column) bool {
+	if col.Type.IsArray {
+		return true
+	}
+	switch strings.ToLower(col.Type.Name) {
+	case "text", "varchar", "character varying",
+		"char", "character", "bpchar",
+		"bytea", "json", "jsonb", "jsonpath", "xml":
+		return true
+	}
+	return false
+}
+
+// tableNeedsToastRelation mirrors PostgreSQL's needs_toast_table
+// (src/backend/catalog/toasting.c): a relation gets an auto-created TOAST
+// relation when it has at least one non-dropped column of a toastable type.
+// PG attaches the TOAST relation only to ordinary tables / materialized views /
+// partition leaves — never to partitioned parents (relkind='p', no storage),
+// views, sequences, or composite types. The caller restricts this to the
+// heap-storage relkinds, so here we only inspect the column set.
+func tableNeedsToastRelation(t *Table) bool {
+	for _, col := range t.Columns {
+		if col.Dropped {
+			continue
+		}
+		if columnTypeIsToastable(col) {
+			return true
+		}
+	}
+	return false
+}
+
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
 // parser package in contexts that only need the catalog. M0096-0012.
 type TriggerTiming int
@@ -2985,12 +3022,25 @@ func (c *InMemory) registerSystemTables() {
 			if len(relopts) > 0 {
 				reloptions = "{" + strings.Join(relopts, ",") + "}"
 			}
-			// reltoastrelid: when the table carries any `toast.*` storage
-			// parameters, point it at a synthesized TOAST relation (emitted
-			// below) so pg_dump's toast LEFT JOIN resolves and re-emits the
-			// `toast.*` reloptions. Otherwise 0 (no TOAST relation). DU-002 slice 224.
+			// reltoastrelid: PG auto-creates a TOAST relation for every ordinary
+			// table / materialized view with at least one toastable (varlena)
+			// column (needs_toast_table, src/backend/catalog/toasting.c), plus
+			// any table carrying explicit `toast.*` storage parameters. Point
+			// reltoastrelid at the synthesized pg_toast_<oid> row emitted below
+			// so `reltoastrelid::regclass` resolves and pg_dump's toast LEFT JOIN
+			// re-emits the `toast.*` reloptions. Partitioned parents (relkind='p',
+			// no storage), views, sequences and foreign tables never get one.
+			// DU-002 slice 224 + M0118-0008 TOAST-exposure slice 1 (0118-0084).
+			// Auto-exposure is restricted to USER relations (OID >= 16384):
+			// goopg serves system catalogs virtually with no real heap storage,
+			// so attaching a reltoastrelid to e.g. pg_type/pg_attribute would make
+			// pg_amcheck follow the join and fail to open the non-existent toast
+			// heap. Explicit toast.* reloptions only ever land on user tables.
+			hasToastRel := len(t.ToastReloptions) > 0 ||
+				(!IsSystemRelation(t.OID) && (relkind == "r" || relkind == "m") &&
+					tableNeedsToastRelation(t))
 			reltoastrelid := "0"
-			if len(t.ToastReloptions) > 0 {
+			if hasToastRel {
 				reltoastrelid = strconv.Itoa(int(t.OID) + toastRelidOffset)
 			}
 			// relpages / reltuples: 0 until VACUUM or ANALYZE has run (Stats==nil),
@@ -3047,17 +3097,22 @@ func (c *InMemory) registerSystemTables() {
 				reloptions,  // 32: reloptions ({fillfactor=N} or NULL)
 				partBound,   // 33: relpartbound
 			})
-			// Synthesize the TOAST relation (relkind='t') when the table carries
-			// `toast.*` storage parameters. pg_dump joins to it via
-			// reltoastrelid and reads its reloptions (stored WITHOUT the
-			// `toast.` prefix), re-emitting them as `WITH (toast.<opt>='…')`.
+			// Synthesize the TOAST relation (relkind='t') whenever the table owns
+			// one (hasToastRel: a toastable column or explicit `toast.*` reloptions).
+			// pg_dump joins to it via reltoastrelid and reads its reloptions (stored
+			// WITHOUT the `toast.` prefix), re-emitting them as `WITH (toast.<opt>='…')`.
 			// The TOAST row is filtered out of pg_dump's getTables WHERE
 			// (relkind IN r/S/v/c/m/f/p — not 't') so it is never dumped as an
 			// object; it exists only as a join target. Named pg_toast_<oid> in
-			// the pg_toast namespace (OID 99), mirroring PG. DU-002 slice 224.
-			if len(t.ToastReloptions) > 0 {
+			// the pg_toast namespace (OID 99), mirroring PG. DU-002 slice 224 +
+			// M0118-0008 TOAST-exposure slice 1 (0118-0084).
+			if hasToastRel {
 				toastOID := int(t.OID) + toastRelidOffset
-				toastReloptions := "{" + strings.Join(t.ToastReloptions, ",") + "}"
+				// reloptions is NULL unless the table set explicit toast.* params.
+				toastReloptions := ""
+				if len(t.ToastReloptions) > 0 {
+					toastReloptions = "{" + strings.Join(t.ToastReloptions, ",") + "}"
+				}
 				out = append(out, []string{
 					strconv.Itoa(toastOID),                 // 0:  oid
 					"pg_toast_" + strconv.Itoa(int(t.OID)), // 1:  relname
