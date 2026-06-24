@@ -130,6 +130,39 @@ func (h *notifyHub) DrainPending(sess *config.SessionRegistry) []Notification {
 	return q
 }
 
+// notifyQueueCapacity is the modelled maximum number of undelivered
+// notifications the async-notification "queue" can hold, used solely to render
+// pg_notification_queue_usage() as an occupied fraction in [0, 1]. PostgreSQL's
+// async.c sizes the queue from max_notify_queue_pages × entries-per-SLRU-page;
+// goopg keeps the in-memory inbox unbounded, so this constant is a presentation
+// denominator only — the exact value is immaterial as long as a single pending
+// entry yields a strictly-positive fraction (the property the async-notify spec
+// asserts via `pg_notification_queue_usage() > 0`). M0118-0009.
+const notifyQueueCapacity = 1 << 20
+
+// QueueUsage returns the fraction of the async-notification queue currently
+// occupied by undelivered notifications, in [0, 1] — the engine behind the
+// pg_notification_queue_usage() SQL function. It sums the pending (delivered to
+// a session's inbox but not yet drained to the client) notifications across all
+// listeners and divides by notifyQueueCapacity. Returns 0.0 when nothing is
+// pending (the common case). Mirrors PostgreSQL's asyncQueueUsage(). M0118-0009.
+func (h *notifyHub) QueueUsage() float64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	total := 0
+	for _, q := range h.pending {
+		total += len(q)
+	}
+	if total == 0 {
+		return 0
+	}
+	usage := float64(total) / float64(notifyQueueCapacity)
+	if usage > 1 {
+		usage = 1
+	}
+	return usage
+}
+
 // isNotifyStmt reports whether stmt is a LISTEN/NOTIFY/UNLISTEN statement,
 // which the dispatch layer routes through execNotifyStmt (and excludes from the
 // plan cache, since the planner has no node for them). M0118-0009.

@@ -372,6 +372,11 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			connTx.bufferNotify(channel, payload, connTx.BackendPID)
 		}
 	}
+	// pg_notification_queue_usage() reports the occupied fraction of the async
+	// queue (undelivered notifications across all listeners). M0118-0009.
+	if s.notify != nil {
+		ectx.NotifyQueueUsage = s.notify.QueueUsage
+	}
 	if connTx != nil {
 		ectx.ProcNum = connTx.ProcNum
 	}
@@ -822,6 +827,21 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			connTx.PendingEnumRenames = ectx.PendingEnumRenames
 			connTx.PendingCreatedEnums = ectx.PendingCreatedEnums
 			connTx.PendingCreatedComposites = ectx.PendingCreatedComposites
+		}
+		// Keep the savepoint-aware NOTIFY buffer in sync with the just-executed
+		// savepoint command so a later ROLLBACK TO SAVEPOINT discards the
+		// notifications queued since the savepoint and RELEASE merges them
+		// (PostgreSQL async.c per-subtransaction pendingNotifies). Runs only on
+		// success — an erroring statement returned above. M0118-0009.
+		if connTx != nil {
+			switch sp := stmt.(type) {
+			case *parser.SavepointStmt:
+				connTx.notifySavepoint(sp.Name)
+			case *parser.ReleaseSavepointStmt:
+				connTx.notifyReleaseSavepoint(sp.Name)
+			case *parser.RollbackToSavepointStmt:
+				connTx.notifyRollbackToSavepoint(sp.Name)
+			}
 		}
 	}
 	// Update pg_stat_activity to idle after successful execution.
@@ -1691,6 +1711,15 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					}
 				}
 				connTx.Begin(ctx.Tx)
+				// connTx.Begin lazily creates the BasicSession; when BEGIN is the
+				// first statement of a multi-statement simple-query message the
+				// session did not exist at dispatch entry (ectx.Session was wired
+				// nil), so a later same-batch SAVEPOINT/transaction op would fail
+				// with "transaction statements require Session in Context". Re-wire
+				// the now-live session for the remainder of the batch. M0118-0009.
+				if sess := connTx.Session(); sess != nil {
+					ctx.Session = sess
+				}
 				// Propagate READ ONLY / READ WRITE mode from START TRANSACTION / BEGIN.
 				if connTx.Session() != nil {
 					connTx.Session().SetReadOnlyTxn(txNode.ReadOnly)

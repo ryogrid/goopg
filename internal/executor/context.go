@@ -441,6 +441,13 @@ type Context struct {
 	// nil in unit/embedded contexts. M0118-0009 (async-notify).
 	QueueNotify func(channel, payload string)
 
+	// NotifyQueueUsage, when non-nil, returns the fraction (in [0, 1]) of the
+	// async-notification queue currently occupied by undelivered notifications —
+	// the engine behind the pg_notification_queue_usage() SQL function. The
+	// server wires this to notifyHub.QueueUsage; nil in unit/embedded contexts
+	// (treated as 0.0). M0118-0009 (async-notify).
+	NotifyQueueUsage func() float64
+
 	// MergeAction holds the current MERGE action for MergeActionExpr evaluation
 	// in a MERGE RETURNING clause. Set by mergeOp.collectReturningRow. M0100-0007.
 	MergeAction planner.MergeActionKind

@@ -203,6 +203,76 @@ func (q *sessionNoticeQueue) drain() []string {
 	return n
 }
 
+// sessionNotifyQueue is a thread-safe FIFO of asynchronous notifications
+// ('A' NotificationResponse messages) received on one session's connection.
+// lib/pq's notification handler (set via pq.ConnectorWithNotificationHandler)
+// pushes here synchronously while reading a step's query response; the main
+// runner goroutine drains it after the step to emit the upstream
+// isolationtester notification lines. M0118-0009 (async-notify).
+type sessionNotifyQueue struct {
+	mu     sync.Mutex
+	notifs []pq.Notification
+}
+
+// push records one received notification.
+func (q *sessionNotifyQueue) push(n *pq.Notification) {
+	if n == nil {
+		return
+	}
+	q.mu.Lock()
+	q.notifs = append(q.notifs, *n)
+	q.mu.Unlock()
+}
+
+// drain returns and clears all collected notifications in arrival (FIFO) order.
+func (q *sessionNotifyQueue) drain() []pq.Notification {
+	q.mu.Lock()
+	n := append([]pq.Notification(nil), q.notifs...)
+	q.notifs = q.notifs[:0]
+	q.mu.Unlock()
+	return n
+}
+
+// backendPIDOf returns the backend PID of conn (SELECT pg_backend_pid()), used
+// to attribute captured notifications to their source session. Returns
+// (0, false) if the query fails or returns no row. M0118-0009.
+func backendPIDOf(ctx context.Context, conn *sql.Conn) (int, bool) {
+	row := conn.QueryRowContext(ctx, "SELECT pg_backend_pid()")
+	var pid int
+	if err := row.Scan(&pid); err != nil {
+		return 0, false
+	}
+	return pid, true
+}
+
+// drainAllNotifications drains every session's notification queue in
+// session-declaration order and writes one upstream isolationtester line per
+// notification:
+//
+//	<receiving-session>: NOTIFY "<channel>" with payload "<payload>" from <source-session>
+//
+// matching PostgreSQL's isolationtester, which after each step polls
+// PQnotifies() on every connection in session order and prints exactly this
+// format (notify->relname, notify->extra, and the session resolved from
+// notify->be_pid). The source session is resolved via pidToSession; an
+// unrecognized PID falls back to its numeric form. M0118-0009 (async-notify).
+func drainAllNotifications(sb *strings.Builder, sessionNames []string, queues map[string]*sessionNotifyQueue, pidToSession map[int]string) {
+	for _, sname := range sessionNames {
+		q := queues[sname]
+		if q == nil {
+			continue
+		}
+		for _, n := range q.drain() {
+			src, ok := pidToSession[n.BePid]
+			if !ok {
+				src = fmt.Sprintf("%d", n.BePid)
+			}
+			fmt.Fprintf(sb, "%s: NOTIFY %q with payload %q from %s\n",
+				sname, n.Channel, n.Extra, src)
+		}
+	}
+}
+
 // runPermutation executes one permutation using fresh session connections.
 func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec IsolationSpec, perm []string, permBlockers [][]StepBlocker) (string, error) {
 	sessionNames := spec.Sessions
@@ -213,19 +283,34 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 	// Build a per-session pq connector with a notice handler so NOTICE messages
 	// emitted during step execution are captured. Uses pq.ConnectorWithNoticeHandler
 	// to attach the handler at DB-open time (works regardless of Go version).
+	//
+	// A notification handler is chained on top so asynchronous 'A'
+	// NotificationResponse messages (LISTEN/NOTIFY) delivered on a session's
+	// connection during a step's query read are captured per session. lib/pq
+	// invokes both handlers synchronously while reading the query response to
+	// ReadyForQuery, so by the time a step's goroutine returns, every
+	// notification the server delivered during that step is in the queue —
+	// mirroring upstream isolationtester, which polls PQnotifies() on every
+	// connection after each step completes. M0118-0009 (async-notify).
 	sessionQueues := make(map[string]*sessionNoticeQueue, len(sessionNames))
+	notifyQueues := make(map[string]*sessionNotifyQueue, len(sessionNames))
 	sessionDBs := make(map[string]*sql.DB, len(sessionNames))
 	for _, sname := range sessionNames {
 		q := &sessionNoticeQueue{}
 		sessionQueues[sname] = q
+		nq := &sessionNotifyQueue{}
+		notifyQueues[sname] = nq
 		base, err := pq.NewConnector(r.DSN)
 		if err == nil {
 			withNotice := pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
 				q.push(n.Severity, n.Message)
 			})
-			sessionDBs[sname] = sql.OpenDB(withNotice)
+			withNotify := pq.ConnectorWithNotificationHandler(withNotice, func(n *pq.Notification) {
+				nq.push(n)
+			})
+			sessionDBs[sname] = sql.OpenDB(withNotify)
 		} else {
-			// Fallback: use the shared db without notice capture.
+			// Fallback: use the shared db without notice/notification capture.
 			sessionDBs[sname] = db
 		}
 	}
@@ -315,10 +400,19 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 	// the SET application_name (a goopg-only addition PG never runs) is executed
 	// uncaptured, then the spec's setup block is run with output captured and
 	// emitted in session order. M0118-0003.
+	// pidToSession maps each session's backend PID to its session name, so a
+	// captured notification (which carries the NOTIFYing backend's PID) can be
+	// attributed to the source session in the "from <session>" suffix, exactly
+	// as upstream isolationtester resolves notify->be_pid. Built once per
+	// permutation on the dedicated session connections. M0118-0009.
+	pidToSession := make(map[int]string, len(sessionNames))
 	for _, sname := range sessionNames {
 		appName := "isolation/" + specBase + "/" + sname
 		if err := execConn(ctx, conns[sname], "SET application_name = '"+appName+"'"); err != nil {
 			return "", fmt.Errorf("session %q set application_name: %w", sname, err)
+		}
+		if pid, ok := backendPIDOf(ctx, conns[sname]); ok {
+			pidToSession[pid] = sname
 		}
 		if setupSQL, ok := spec.SessionSetup[sname]; ok && setupSQL != "" {
 			out, errText := execConnSetupCapture(ctx, conns[sname], setupSQL)
@@ -494,6 +588,13 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			sb.WriteString(formatWaitingStepHeader(step.Name, step.SQL))
 			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh, queue: q, cancelFn: stepCancel, blockers: stepBlockers, baselines: stepBaselines})
 		}
+
+		// After the step completes, emit any asynchronous notifications delivered
+		// on any session's connection during it, in session-declaration order —
+		// the goopg analog of upstream isolationtester polling PQnotifies() on
+		// every connection at the end of try_complete_step. A no-op for every
+		// spec that does not use LISTEN/NOTIFY (all queues empty). M0118-0009.
+		drainAllNotifications(&sb, sessionNames, notifyQueues, pidToSession)
 	}
 
 	// Wait for all remaining blocked steps.
@@ -919,7 +1020,46 @@ func execOneStatement(ctx context.Context, conn *sql.Conn, sqlText string) (oneR
 		return oneResult{}, formatPQError(err)
 	}
 	defer rows.Close()
+	return scanResultSet(rows)
+}
 
+// execMultiStatement executes a multi-statement step body as a SINGLE
+// simple-query message (one QueryContext call), so the statements run inside
+// one implicit transaction exactly as upstream isolationtester's PQexec does —
+// a prerequisite for transaction-scoped semantics like NOTIFY de-duplication
+// and ROLLBACK TO SAVEPOINT discard (async-notify), which a per-statement split
+// (each its own autocommit transaction) would defeat. Every result set the
+// batch produces is captured via database/sql's NextResultSet, preserving the
+// prior behavior of emitting one block per rows-bearing statement. M0118-0009.
+func execMultiStatement(ctx context.Context, conn *sql.Conn, sqlText string) ([]oneResult, string) {
+	rows, err := conn.QueryContext(ctx, sqlText)
+	if err != nil {
+		return nil, formatPQError(err)
+	}
+	defer rows.Close()
+	var results []oneResult
+	for {
+		rs, errText := scanResultSet(rows)
+		if errText != "" {
+			return nil, errText
+		}
+		if len(rs.rows) > 0 {
+			results = append(results, rs)
+		}
+		if !rows.NextResultSet() {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, formatPQError(err)
+	}
+	return results, ""
+}
+
+// scanResultSet reads the current result set of rows into a oneResult. It does
+// not close rows (the caller owns the lifetime, so it can iterate further
+// result sets via NextResultSet). Returns ("", errText) on a scan error.
+func scanResultSet(rows *sql.Rows) (oneResult, string) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return oneResult{}, formatPQError(err)
@@ -1018,6 +1158,21 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcom
 		if trimmed := strings.TrimSpace(sqlText); trimmed != "" {
 			stmts[0] = trimmed
 		}
+	}
+	// Multi-statement steps are sent as a single simple-query message so they
+	// execute in one implicit transaction (upstream isolationtester PQexec
+	// semantics), which transaction-scoped behaviors such as NOTIFY
+	// de-duplication and ROLLBACK TO SAVEPOINT discard depend on. A
+	// per-statement split would run each as its own autocommit transaction and
+	// defeat them. Single-statement steps keep the verbatim-body path so
+	// pg_stat_activity.query matches PG byte-for-byte (design 0118-0073).
+	// M0118-0009.
+	if len(stmts) > 1 {
+		results, errText := execMultiStatement(ctx, conn, strings.TrimSpace(sqlText))
+		if errText != "" {
+			return stepOutcome{errText: errText}
+		}
+		return stepOutcome{results: results}
 	}
 	var result stepOutcome
 	for _, stmt := range stmts {

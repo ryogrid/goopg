@@ -5907,7 +5907,29 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		if ctx != nil && ctx.QueueNotify != nil {
 			ctx.QueueNotify(chArg.StringValue(), payload)
 		}
-		return NullDatum, nil
+		// pg_notify returns void — a non-NULL empty value (like the advisory-lock
+		// builtins), so `count(pg_notify(...))` counts every row (PostgreSQL's
+		// async-notify `bignotify` step expects 1000, not 0 from count skipping
+		// NULLs). It still renders as an empty field in a scalar SELECT.
+		return NewStringDatum(""), nil
+	case "pg_notification_queue_usage":
+		// pg_notification_queue_usage() → float8 in [0, 1]: the fraction of the
+		// asynchronous notification queue currently occupied by notifications
+		// that have been committed but not yet delivered to every listener. The
+		// server wires ctx.NotifyQueueUsage to notifyHub.QueueUsage; absent it
+		// (unit/embedded contexts) the queue is reported empty. Rendered as a
+		// formatted float8 like random(), so a `> 0` comparison resolves
+		// correctly. M0118-0009 (async-notify).
+		usage := 0.0
+		if ctx != nil && ctx.NotifyQueueUsage != nil {
+			usage = ctx.NotifyQueueUsage()
+		}
+		// Format with the minimal 'g' representation so an empty queue renders as
+		// "0" (not "0.000000000000000"): a float8 string with a fractional part
+		// of only zeros compares incorrectly against an integer literal in
+		// goopg's text-vs-int comparison path, so `... > 0` would wrongly be true.
+		// "0" compares correctly. M0118-0009.
+		return NewStringDatum(strconv.FormatFloat(usage, 'g', -1, 64)), nil
 	case "current_database":
 		return NewStringDatum("postgres"), nil
 	case "current_schema":

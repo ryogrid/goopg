@@ -128,35 +128,117 @@ type connTxState struct {
 	// LISTEN/NOTIFY hub key (same SessionRegistry as AdvisoryID, typed for
 	// direct hub calls). M0118-0009.
 	NotifySession *config.SessionRegistry
-	// pendingNotify buffers NOTIFY messages emitted by the current transaction.
-	// PostgreSQL makes notifications visible only when the notifying transaction
-	// commits, so they are published to the hub at COMMIT and discarded at
-	// ROLLBACK. Deduplicated by (channel,payload) the way async.c collapses
-	// duplicate same-transaction notifications. M0118-0009.
-	pendingNotify []Notification
+	// pendingNotify is the savepoint-aware stack of NOTIFY messages emitted by
+	// the current transaction. PostgreSQL makes notifications visible only when
+	// the notifying transaction commits, so they are published to the hub at
+	// COMMIT and discarded at ROLLBACK. Each entry is one (sub)transaction
+	// level, mirroring async.c's per-subtransaction pendingNotifies list:
+	// pendingNotify[0] is the transaction top level (name ""), and a SAVEPOINT
+	// pushes a new level. ROLLBACK TO SAVEPOINT discards the notifications
+	// queued since that savepoint; RELEASE SAVEPOINT merges them into the
+	// enclosing level. Notifications are deduplicated by (channel,payload)
+	// across ALL active levels, the way async.c collapses duplicate
+	// same-transaction notifications. M0118-0009.
+	pendingNotify []notifyLevel
+}
+
+// notifyLevel holds one (sub)transaction level's buffered notifications.
+// name is the savepoint name that opened the level ("" for the transaction top
+// level). M0118-0009 (async-notify).
+type notifyLevel struct {
+	name   string
+	notifs []Notification
 }
 
 // bufferNotify queues one NOTIFY for publication at the current transaction's
-// commit, collapsing an exact (channel,payload) duplicate already buffered by
-// this transaction (PostgreSQL's async.c de-duplicates identical notifications
-// emitted within one transaction). M0118-0009.
+// commit, collapsing an exact (channel,payload) duplicate already buffered at
+// any active level of this transaction (PostgreSQL's async.c de-duplicates
+// identical notifications emitted within one transaction, across
+// subtransaction levels). The notification is appended to the current
+// (innermost) level so a later ROLLBACK TO SAVEPOINT can discard it.
+// M0118-0009.
 func (c *connTxState) bufferNotify(channel, payload string, srcPID uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, n := range c.pendingNotify {
-		if n.Channel == channel && n.Payload == payload {
-			return
+	for _, lvl := range c.pendingNotify {
+		for _, n := range lvl.notifs {
+			if n.Channel == channel && n.Payload == payload {
+				return
+			}
 		}
 	}
-	c.pendingNotify = append(c.pendingNotify, Notification{PID: srcPID, Channel: channel, Payload: payload})
+	if len(c.pendingNotify) == 0 {
+		c.pendingNotify = append(c.pendingNotify, notifyLevel{})
+	}
+	top := len(c.pendingNotify) - 1
+	c.pendingNotify[top].notifs = append(c.pendingNotify[top].notifs,
+		Notification{PID: srcPID, Channel: channel, Payload: payload})
 }
 
-// takePendingNotify returns and clears the buffered notifications (called at
-// COMMIT to publish them, and discards them otherwise). M0118-0009.
+// notifySavepoint pushes a new (empty) notification level for a SAVEPOINT, so
+// notifications queued until the matching ROLLBACK TO / RELEASE are isolated to
+// it. M0118-0009.
+func (c *connTxState) notifySavepoint(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.pendingNotify) == 0 {
+		c.pendingNotify = append(c.pendingNotify, notifyLevel{})
+	}
+	c.pendingNotify = append(c.pendingNotify, notifyLevel{name: name})
+}
+
+// notifyReleaseSavepoint merges the named savepoint level (and any levels above
+// it) into the enclosing level, mirroring RELEASE SAVEPOINT keeping the
+// subtransaction's effects. A no-op if the name is not found. M0118-0009.
+func (c *connTxState) notifyReleaseSavepoint(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idx := c.findNotifyLevel(name)
+	if idx <= 0 {
+		return
+	}
+	for i := idx; i < len(c.pendingNotify); i++ {
+		c.pendingNotify[idx-1].notifs = append(c.pendingNotify[idx-1].notifs, c.pendingNotify[i].notifs...)
+	}
+	c.pendingNotify = c.pendingNotify[:idx]
+}
+
+// notifyRollbackToSavepoint discards every notification queued since the named
+// savepoint was established (the named level and anything above it), keeping
+// the savepoint itself active as the current level — mirroring ROLLBACK TO
+// SAVEPOINT aborting the subtransaction's pending notifies. A no-op if the name
+// is not found. M0118-0009.
+func (c *connTxState) notifyRollbackToSavepoint(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idx := c.findNotifyLevel(name)
+	if idx <= 0 {
+		return
+	}
+	c.pendingNotify[idx].notifs = nil
+	c.pendingNotify = c.pendingNotify[:idx+1]
+}
+
+// findNotifyLevel returns the index of the topmost notification level opened by
+// the named savepoint, or -1 if absent. Caller holds c.mu. M0118-0009.
+func (c *connTxState) findNotifyLevel(name string) int {
+	for i := len(c.pendingNotify) - 1; i >= 1; i-- {
+		if c.pendingNotify[i].name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// takePendingNotify flattens every level into a single FIFO slice and clears
+// the buffer (called at COMMIT to publish; discards otherwise). M0118-0009.
 func (c *connTxState) takePendingNotify() []Notification {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	out := c.pendingNotify
+	var out []Notification
+	for _, lvl := range c.pendingNotify {
+		out = append(out, lvl.notifs...)
+	}
 	c.pendingNotify = nil
 	return out
 }

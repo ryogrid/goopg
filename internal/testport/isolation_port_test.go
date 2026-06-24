@@ -331,6 +331,23 @@ func TestPort_IsolationCreateTrigger(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/create-trigger.spec")
 }
 
+// TestPort_IsolationAsyncNotify exercises the async-notify spec (M0118-0009,
+// design 0118-0090): LISTEN/NOTIFY/UNLISTEN, pg_notify(), and
+// pg_notification_queue_usage() across self- and cross-backend delivery, with
+// same-transaction de-duplication and ROLLBACK TO SAVEPOINT discard. Requires
+// the server-side notify hub (LISTEN/NOTIFY engine), the savepoint-aware NOTIFY
+// buffer (notifyLevel stack), pg_notification_queue_usage, multi-statement steps
+// running as one implicit transaction, and the isolation runner's per-step
+// notification capture (pq.ConnectorWithNotificationHandler → "<sess>: NOTIFY
+// ... from <src>" lines). Byte-identical to PG 18.3 across all six permutations.
+func TestPort_IsolationAsyncNotify(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_async_notify")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/async-notify.spec")
+}
+
 // TestPort_IsolationInheritTemp exercises the inherit-temp spec (M0118-0008):
 // an inheritance tree whose children are TEMPORARY tables created in different
 // sessions. Each backend owns its own temp namespace, so s1's scan/UPDATE/

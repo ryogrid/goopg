@@ -1,32 +1,36 @@
-Loop #26: **M0118-0009 async-notify — engine-side LISTEN/NOTIFY subsystem LANDED**
-(design 0118-0089). Probed all remaining M0118-0009 specs; each is a distinct
-multi-loop subsystem. Chose async-notify (additive, bounded blast radius — no
-MVCC/storage/WAL). Built the complete engine side:
-- Parser: ListenStmt/NotifyStmt/UnlistenStmt (ident-led) + grammar test.
-- protocol: 'A' MsgNotificationResponse + WriteNotificationResponse.
-- server/notify.go: notifyHub (mutex; listeners[ch]→set<session>, per-session
-  pending inbox keyed by *config.SessionRegistry). conn_tx.go: pendingNotify
-  buffer (de-dup), published at COMMIT (autocommit batch end + explicit COMMIT),
-  discarded on ROLLBACK/End(). dispatch.go: execNotifyStmt + publishPendingNotify
-  + deliverNotifications (drain before ReadyForQuery). server.go: hub init +
-  BackendPID/NotifySession + RemoveSession on teardown.
-- executor: Context.QueueNotify + pg_notify() builtin (expr.go).
-Verified: TestParseListenNotifyUnlisten (6), TestNotifyHub,
-TestConnTxBufferNotifyDedup all PASS; -race server clean; build/vet clean;
-async-notify.spec wire probe now executes EVERY statement PG-identically (was
-syntax-error on first NOTIFY). gofmt: protocol.go/messages.go fail at HEAD too
-(pre-existing go1.25/1.26 mismatch) — NOT touched.
+Loop #27: **M0118-0009 async-notify.spec PROMOTED `failed`→`pass`** (all 6 perms
+byte-identical to PG 18.3, strict `TestPort_IsolationAsyncNotify`; design 0118-0090).
+Closed last loop's resume point on top of the 0118-0089 engine. COMMITTED.
 
-**Next step (to PROMOTE async-notify.spec, deferred — ledger 2026-06-24):**
-harness-only now. Enhance internal/testport/framework/IsolationRunner: wrap each
-session connector with pq.ConnectorWithNotificationHandler (fires synchronously
-during query-response reads → matches goopg's command-boundary delivery), record
-per-session notifications WITH source PID, map srcPID→session-name, emit
-isolationtester lines `<recv>: NOTIFY "<ch>" with payload "<p>" from <src>` with
-byte-exact placement; then runIsoSpecStrict + flip CSV/inventory row.
+Four gaps fixed (two were engine bugs the syntax-only wiring had hidden):
+- HARNESS (isolation_runner.go): chain `pq.ConnectorWithNotificationHandler` per
+  session → `sessionNotifyQueue`; `drainAllNotifications` after each step emits
+  `<recv>: NOTIFY "<ch>" with payload "<p>" from <src>` in session order (src via
+  `pg_backend_pid()`→session map). No-op for non-LISTEN specs.
+- ENGINE (notify.go/context.go/expr.go): `pg_notification_queue_usage()`
+  (`notifyHub.QueueUsage`→`Context.NotifyQueueUsage`), rendered `FormatFloat('g',-1)`
+  so empty queue = "0" (a float8 string of all-zero fraction wrongly compares `>0`
+  true — pre-existing cast bug sidestepped). `pg_notify` returns non-NULL void so
+  `count(pg_notify(...))`=1000.
+- HARNESS+ENGINE: multi-statement steps run as ONE simple-query message
+  (`execMultiStatement` iterating result sets) → one implicit transaction (PQexec
+  semantics). Required re-wiring `ectx.Session` in the BEGIN handler (connTx.Begin
+  lazily creates the session).
+- ENGINE (conn_tx.go/dispatch.go): `pendingNotify` is now a savepoint-aware
+  `notifyLevel` stack (push SAVEPOINT, merge RELEASE, discard ROLLBACK TO; de-dup
+  across levels), wired from the dispatch loop after each savepoint stmt.
 
-Other M0118-0009 specs still untouched (each a subsystem): horizons (EXPLAIN
-FORMAT json ANALYZE + json `->` ops + IOS pruning), intra-grant-inplace
-(GRANT catalog-tuple-xmax lock-wait), temp-schema-cleanup (pg_my_temp_schema +
-per-session temp namespace OID model), stats (pg_stat_force_next_flush + cumulative
-counters), prepared-transactions{,-cic} (2PC). Other open: M0118-0002/0004/0005/0007.
+Gates: `TestPort_IsolationAsyncNotify` strict PASS; full `TestPort_Isolation*` =
+101 pass. The 3 run-to-run "failures" (update-locked-tuple, vacuum-skip-locked,
+vacuum-concurrent-drop, tuplelock-upgrade-no-deadlock) are a PRE-EXISTING 300ms
+blocking-detection timing flake under WSL2 load — VERIFIED update-locked-tuple
+fails 3/3 on clean HEAD too (git stash test); the failing set varies per run; all
+pass isolated on an unloaded machine. NOT a regression. `-race` server clean;
+build/vet/gofmt clean; pgbench smoke = pre-commit hook.
+
+Next step: M0118-0009 has more sub-specs deferred (each a distinct subsystem):
+timeouts (statement_timeout/lock_timeout interplay), stats
+(pg_stat_force_next_flush + cumulative counters), horizons (EXPLAIN FORMAT json
+ANALYZE + json ops + IOS pruning), intra-grant-inplace (GRANT tuple-xmax
+lock-wait), temp-schema-cleanup (pg_my_temp_schema + per-session temp namespace),
+prepared-transactions{,-cic} (2PC). Pick one next loop.
