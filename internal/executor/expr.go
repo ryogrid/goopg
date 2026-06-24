@@ -587,6 +587,15 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
 			switch v.Kind {
 			case KindInt:
+				// InvalidOid (0) renders as "-", matching PG's regclassout
+				// (src/backend/utils/adt/regproc.c). Without this guard a
+				// `reltoastrelid::regclass` for a table with no TOAST relation
+				// (reltoastrelid = 0) matches the first virtual relation whose
+				// OID is unset (also 0), e.g. information_schema.routines.
+				// M0118-0008 (reindex-concurrently-toast probing).
+				if v.Int == 0 {
+					return NewStringDatum("-"), nil
+				}
 				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 					if tbl, found := im.LookupTableByOID(uint32(v.Int)); found && tbl != nil {
 						return NewStringDatum(tbl.Name), nil

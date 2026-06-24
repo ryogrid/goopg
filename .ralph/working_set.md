@@ -1,41 +1,44 @@
-Loop #16: M0118-0008 `alter-table-4` **PROMOTED** (design 0118-0082) — all 4
-permutations byte-for-byte vs PG 18.3 via strict `TestPort_IsolationAlterTable4`.
-Committed + pushed. Spec fully closed (perms 1&2 = 0118-0080, perm 3 = 0118-0081,
-perm 4 = this loop).
+Loop #18: M0118-0008 — `reindex-concurrently-toast` is the LAST unpromoted spec
+(other 24 all pass strict). Landed a safe on-path correctness fix + the blocker
+design doc (0118-0083); the spec itself stays `defer` (multi-loop TOAST epic).
 
-## What landed (perm 4 — the last permutation)
-Post-lock inherited-column TYPE re-validation, mirroring PG
-`make_inh_translation_list` (optimizer/util/appendinfo.c):
-- `planner.SeqScan.InheritParentOID` set (beside `SkipIfVanished`) on every
-  inheritance-child scan in the `allDesc` expansion loop (planner.go).
-- `seqScanOp.Open`, inside the existing post-lock `skipIfVanished` block (child
-  proven to still exist), calls `validateInheritedColumnTypes(im, parent, child)`
-  when `inheritParentOID != 0`: match each non-dropped parent col to the child by
-  name, compare `canonicalTypeClass` (collapses integer/int4, double precision/
-  float8/float, resolves domains, folds IsArray, IGNORES typmod args ⇒ only a real
-  base-type change trips it). Mismatch → `ExecError{42611, "attribute %q of
-  relation %q does not match parent's type"}` (parent attr name + child rel name).
-- Runs only for inheritance-child scans AFTER the lock (error appears post-`<...
-  completed>`, not reordering `<waiting ...>`). Zero false positives.
+## What landed
+`InvalidOid (0)::regclass` now renders `-` (PG `regclassout`, regproc.c) instead
+of matching the first virtual relation whose OID is unset
+(`information_schema.routines`). Surfaced while probing the spec setup
+(`reltoastrelid::regclass::text` on a no-TOAST table gave "routines"). Fix:
+internal/executor/expr.go CastExpr regclass arm — `if v.Int == 0 { return "-" }`
+before LookupTableByOID. Non-zero unmatched OID still falls through to numeric
+rendering (matches PG). Test: internal/executor/regclass_invalid_oid_test.go
+(TestRegclassInvalidOidRendersDash).
 
-Files: internal/planner/plan.go + planner.go; internal/executor/operators_storage.go;
-internal/testport/isolation_port_test.go (TestPort_IsolationAlterTable4);
-docs/design/0118-0082 + README; port-status CSV + regen md; fix_plan + ledger.
+Files: internal/executor/expr.go; internal/executor/regclass_invalid_oid_test.go;
+docs/design/0118-0083-reindex-concurrently-toast-blocker.md + README; deferral
+ledger. (internal/testport/zz_probe_test.go = throwaway probe, untracked.)
 
-## Next step (new task — pick from M0118-0008 hard tail, all Effort-L)
-alter-table-4 is DONE. Remaining M0118-0008 tail:
-- **reindex-concurrently-toast**: needs real TOAST relations as catalog objects
-  (reltoastrelid=0 today) + `allow_system_table_mods`; global-setup fails at
-  `reltoastrelid::regclass::text`. Bigger subsystem.
-- **WHERE CURRENT OF** positioned UPDATE/DELETE (project-wide; `CurrentOf` parsed,
-  no executor site consumes it) — blocks detach-partition-concurrently-4's last 3
-  perms.
-Probe a candidate with a throwaway zz_probe test (RunAndCompare → log .Diff),
-rank by first-divergence cost before committing.
+## Why the spec is deferred (multi-loop epic — see 0118-0083)
+Needs auto-TOAST-relation EXPOSURE in the catalog: PG auto-creates a TOAST
+relation for ANY toastable column; goopg only emits the synthetic `pg_toast`
+pg_class row when explicit `toast.*` reloptions exist. goopg ALREADY has the
+out-of-line storage (toast.go, RelOid+100_000_000) and OID convention matches.
+Remaining: (1) auto-set reltoastrelid + emit pg_toast row for toastable cols;
+(2) resolve toast OID→name in LookupTableByOID (synthetic row is only in the
+virtual pg_class builder, not c.tables); (3) synthesize toast index in pg_index;
+(4) ALTER RENAME + pg_toast.<name> resolution under allow_system_table_mods;
+(5) REINDEX {TABLE,INDEX} CONCURRENTLY pg_toast.<name> (rides 0118-0029).
+HIGH BLAST RADIUS: relation enumeration feeds pg_dump/pg_amcheck/\d parity
+suites (pgdump_connsetup, pgamcheck00{2,3}*, scripts_port) — land incrementally,
+re-run each parity suite. NOT Effort-S.
+
+## Next step
+Start the TOAST-exposure epic slice 1: a catalog helper
+`tableNeedsToastRelation(t)` (mirrors PG needs_toast_table — any toastable col)
++ auto-set reltoastrelid and emit the pg_toast pg_class row, THEN immediately
+run pgdump_connsetup + a pgamcheck port test to measure the parity blast radius
+before going further. If a parity suite breaks, gate/narrow before adding the
+index + RENAME + REINDEX routing.
 
 ## Gates run (this loop)
-build+vet clean; gofmt clean (only pre-existing go1.25/1.26 noise in untouched
-blocks); go test ./internal/{executor,planner,catalog}/ PASS; strict
-TestPort_IsolationAlterTable4 PASS (4 perms); no regression across
-AlterTable1/AlterTable3/InheritTemp strict; make ralph-state-guard OK (repaired);
-pgbench smoke = pre-commit hook.
+go test ./internal/{executor,catalog}/ PASS; TestRegclassInvalidOidRendersDash +
+TestPlpgSQLSelectInto PASS; go vet ./internal/executor/ clean; gofmt clean on
+touched files; make ralph-state-guard (below); pgbench smoke = pre-commit hook.
