@@ -792,6 +792,15 @@ type Table struct {
 // (internal/executor/toast.go: RelOid + 100_000_000).
 const toastRelidOffset = 100_000_000
 
+// toastIndexOidOffset derives the synthetic OID of a TOAST relation's unique
+// btree index (pg_toast_<parentOID>_index) from its parent table's OID. PG
+// auto-creates this index on every TOAST relation; goopg has no real TOAST
+// index, so the OID is catalog/regclass-only. Kept a full 100M above
+// toastRelidOffset so the index range [200M, 300M) never overlaps the TOAST
+// relation range [100M, 200M) for any realistic user OID (< 100M). M0118-0008
+// TOAST-exposure slice 3.
+const toastIndexOidOffset = 200_000_000
+
 // columnTypeIsToastable reports whether a column's declared type is a varlena
 // (variable-length) type that PostgreSQL would store out-of-line via TOAST.
 // Mirrors the executor's isToastableType set (internal/executor/toast.go) plus
@@ -838,7 +847,10 @@ func tableNeedsToastRelation(t *Table) bool {
 // can never diverge. Mirrors PG needs_toast_table (src/backend/catalog/
 // toasting.c); system catalogs are excluded because goopg serves them virtually
 // with no real heap, so a reltoastrelid join target would break pg_amcheck's
-// whole-DB walk. M0118-0008 TOAST-exposure (design 0118-0084).
+// whole-DB walk. M0118-0008 TOAST-exposure (design 0118-0084). The pg_class
+// virtual builder emits a relkind='t' TOAST row (and relkind='i' TOAST-index
+// row, slice 3) for exactly this set; toastBearingTables enumerates the same
+// set for the pg_index builder so the two catalogs never diverge.
 func tableHasToastRelation(t *Table) bool {
 	if len(t.ToastReloptions) > 0 {
 		return true
@@ -866,6 +878,18 @@ func tableHasToastRelation(t *Table) bool {
 // parent table owns no auto-exposed TOAST relation. M0118-0008 TOAST-exposure
 // slice 2 (design 0118-0084).
 func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
+	// The TOAST index range [200M, 300M) sits above the TOAST relation range
+	// [100M, 200M); check it first. The index name is pg_toast_<parentOID>_index.
+	if oid >= toastIndexOidOffset {
+		parentOID := oid - toastIndexOidOffset
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		t, ok := c.tableByOID(parentOID)
+		if !ok || !tableHasToastRelation(t) {
+			return "", false
+		}
+		return "pg_toast.pg_toast_" + strconv.Itoa(int(parentOID)) + "_index", true
+	}
 	if oid < toastRelidOffset {
 		return "", false
 	}
@@ -877,6 +901,40 @@ func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
 		return "", false
 	}
 	return "pg_toast.pg_toast_" + strconv.Itoa(int(parentOID)), true
+}
+
+// toastBearingTables returns every relation that owns an auto-exposed TOAST
+// relation, under the SAME visibility filter the pg_class virtual builder
+// applies to its main table loop (non-virtual ordinary tables plus
+// materialized views and user sequences/views are admitted to the loop;
+// tableHasToastRelation then keeps only relkind 'r'/'m'). The pg_class builder
+// emits the synthetic relkind='t' TOAST row and relkind='i' TOAST-index row for
+// exactly this set, so the pg_index builder must enumerate the same set or the
+// two catalogs diverge (an indexrelid with no matching pg_class row). Returned
+// tables share the registry's backing storage; callers must only read.
+// M0118-0008 TOAST-exposure slice 3.
+func (c *InMemory) toastBearingTables() []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.tables))
+	for k := range c.tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]*Table, 0)
+	for _, k := range keys {
+		t := c.tables[k]
+		// Mirror the pg_class main-loop skip: drop system-catalog virtual
+		// tables but keep user views, matviews and sequences (which
+		// tableHasToastRelation subsequently rejects unless they are 'r'/'m').
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if tableHasToastRelation(t) {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
@@ -3179,7 +3237,7 @@ func (c *InMemory) registerSystemTables() {
 					"0",                                    // 11: relallvisible
 					"0",                                    // 12: relallfrozen
 					"0",                                    // 13: reltoastrelid
-					"f",                                    // 14: relhasindex
+					"t",                                    // 14: relhasindex (pg_toast_<oid>_index)
 					"f",                                    // 15: relisshared
 					relpers,                                // 16: relpersistence (inherits the table's)
 					"t",                                    // 17: relkind (TOAST)
@@ -3199,6 +3257,51 @@ func (c *InMemory) registerSystemTables() {
 					"",                                     // 31: relacl (NULL)
 					toastReloptions,                        // 32: reloptions ({autovacuum_enabled=false})
 					"",                                     // 33: relpartbound
+				})
+				// Synthesize the TOAST relation's unique btree index
+				// pg_toast_<oid>_index (relkind='i'), mirroring the index PG
+				// auto-creates on every TOAST relation's (chunk_id, chunk_seq).
+				// Lives in the pg_toast namespace (OID 99); the matching pg_index
+				// row (indexrelid=toastIdxOID, indrelid=toastOID) is emitted by the
+				// pg_index virtual builder. Isolation specs locate it via
+				// `indexrelid::regclass` from pg_index. M0118-0008 TOAST-exposure
+				// slice 3.
+				toastIdxOID := int(t.OID) + toastIndexOidOffset
+				out = append(out, []string{
+					strconv.Itoa(toastIdxOID),                         // 0:  oid
+					"pg_toast_" + strconv.Itoa(int(t.OID)) + "_index", // 1:  relname
+					"99",                      // 2:  relnamespace (pg_toast)
+					"0",                       // 3:  reltype
+					"0",                       // 4:  reloftype
+					"10",                      // 5:  relowner
+					"403",                     // 6:  relam (btree)
+					strconv.Itoa(toastIdxOID), // 7:  relfilenode
+					"0",                       // 8:  reltablespace
+					"0",                       // 9:  relpages
+					"-1",                      // 10: reltuples (-1 = unknown for indexes)
+					"0",                       // 11: relallvisible
+					"0",                       // 12: relallfrozen
+					"0",                       // 13: reltoastrelid
+					"f",                       // 14: relhasindex
+					"f",                       // 15: relisshared
+					relpers,                   // 16: relpersistence (inherits the table's)
+					"i",                       // 17: relkind (index)
+					"2",                       // 18: relnatts (chunk_id, chunk_seq)
+					"0",                       // 19: relchecks
+					"f",                       // 20: relhasrules
+					"f",                       // 21: relhastriggers
+					"f",                       // 22: relhassubclass
+					"f",                       // 23: relrowsecurity
+					"f",                       // 24: relforcerowsecurity
+					"t",                       // 25: relispopulated
+					"n",                       // 26: relreplident
+					"f",                       // 27: relispartition
+					"0",                       // 28: relrewrite
+					"0",                       // 29: relfrozenxid
+					"1",                       // 30: relminmxid
+					"",                        // 31: relacl (NULL)
+					"",                        // 32: reloptions (NULL)
+					"",                        // 33: relpartbound
 				})
 			}
 		}
@@ -4689,6 +4792,42 @@ func (c *InMemory) registerSystemTables() {
 				"",                               // indexprs (NULL)
 				"",                               // indpred (NULL)
 				"",                               // indcoloptions (NULL)
+			})
+		}
+		// Synthesize the unique btree index PG auto-creates on every TOAST
+		// relation (on chunk_id, chunk_seq). The pg_class virtual builder emits
+		// the matching relkind='i' row named pg_toast_<oid>_index; this row lets
+		//   SELECT indexrelid::regclass FROM pg_index
+		//     WHERE indrelid = (SELECT oid FROM pg_class WHERE relname=<toast rel>)
+		// resolve (reindex-concurrently-toast setup). toastBearingTables uses the
+		// SAME gate as the pg_class TOAST-row emission so the two never diverge.
+		// M0118-0008 TOAST-exposure slice 3.
+		for _, t := range c.toastBearingTables() {
+			toastRelOID := int(t.OID) + toastRelidOffset
+			toastIdxOID := int(t.OID) + toastIndexOidOffset
+			out = append(out, []string{
+				fmt.Sprintf("%d", toastIdxOID), // indexrelid
+				fmt.Sprintf("%d", toastRelOID), // indrelid
+				"2",                            // indnatts (chunk_id, chunk_seq)
+				"2",                            // indnkeyatts
+				"t",                            // indisunique
+				"f",                            // indnullsnotdistinct
+				"f",                            // indisprimary
+				"f",                            // indisexclusion
+				"t",                            // indimmediate
+				"f",                            // indisclustered
+				"t",                            // indisvalid
+				"f",                            // indcheckxmin
+				"t",                            // indisready
+				"t",                            // indislive
+				"f",                            // indisreplident
+				"1 2",                          // indkey (chunk_id=1, chunk_seq=2)
+				"0 0",                          // indcollation (int4 columns: no collation)
+				"1978 1978",                    // indclass (int4_ops btree)
+				"0 0",                          // indoption
+				"",                             // indexprs (NULL)
+				"",                             // indpred (NULL)
+				"",                             // indcoloptions (NULL)
 			})
 		}
 		return out
