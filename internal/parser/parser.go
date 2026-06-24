@@ -456,13 +456,21 @@ identLedStatement:
 			// they don't bubble up as parse errors when the server is
 			// running multi-statement batches.
 			p.advance()
+			// Scan the remaining tokens for an `ON DATABASE` object class so the
+			// executor can model PG's catalog-tuple-xmax serialization between an
+			// ACL change and a concurrent in-place datfrozenxid update (design
+			// 0118-0098, intra-grant-inplace-db).
+			databaseACL := false
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break
 				}
+				if strings.EqualFold(p.cur().Value, "on") && strings.EqualFold(p.peek(1).Value, "database") {
+					databaseACL = true
+				}
 				p.advance()
 			}
-			return &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value)}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value), DatabaseACL: databaseACL}, nil
 		case "comment":
 			p.advance() // consume "comment" token
 			// COMMENT ON {TABLE|INDEX|COLUMN|CONSTRAINT} … IS 'text'|NULL

@@ -11356,6 +11356,20 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 // If the statement carries ObjType+ObjName, it registers the object in the compat
 // registry so subsequent DROP statements can verify its existence. M0097-drop_if_exists.
 func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
+	// A GRANT/REVOKE … ON DATABASE changes the pg_database ACL. PostgreSQL takes
+	// no heavyweight lock for an ACL change — the lock IS the catalog tuple's
+	// xmax — so a concurrent in-place datfrozenxid update (a database-wide VACUUM)
+	// must wait for the ACL-change transaction to commit/abort. goopg has no real
+	// pg_database heap tuple, so we materialize this transaction's writer XID and
+	// record it as the database ACL-change xmax; vacuumOp waits on it via
+	// mvcc.WaitForXID. Design 0118-0098 (intra-grant-inplace-db).
+	if s.DatabaseACL {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.TxnMgr != nil {
+			if err := o.ctx.MaterializeWriterXID(); err == nil {
+				im.SetDatabaseACLChangeXID(o.ctx.Tx.XID)
+			}
+		}
+	}
 	if s.ObjType == "" {
 		return nil // pure no-op (GRANT, REVOKE, COMMENT, etc.)
 	}

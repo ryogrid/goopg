@@ -1167,3 +1167,28 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       in c59eb91d / design 0118-0094) had its suite-level CSV flipped but not the
       per-spec inventory — set failed→pass + regen (isolation tally now 106 pass /
       15 failed).
+      **2026-06-25 promotion (design 0118-0098): `intra-grant-inplace-db`
+      PROMOTED ⇒ single permutation byte-identical.** Closes the one behavioural
+      gap 0118-0096 left: `VACUUM (FREEZE)` must `<waiting ...>` behind an
+      uncommitted `GRANT TEMP ON DATABASE` and resume on commit. Upstream `GRANT …
+      ON DATABASE` takes NO heavyweight lock — its lock IS the `pg_database` tuple
+      `xmax` — and a database-wide VACUUM's in-place `datfrozenxid` update waits on
+      that xmax (`heap_inplace_update_scan` → `XactLockTableWait`). goopg serves
+      `pg_database` virtually (no real tuple/xmax), so the wait is REPLAYED: parser
+      flags `GRANT/REVOKE … ON DATABASE` (`CompatNoopStmt.DatabaseACL`);
+      `execCompatNoop` materializes the writer XID and stores it as the
+      database-ACL-change xmax (`InMemory.SetDatabaseACLChangeXID`, `atomic.Uint32`);
+      a database-wide VACUUM (`len(vs.Targets)==0` — the only case PG advances
+      datfrozenxid) calls `mvcc.WaitForXID` on it first (`vacuumOp.waitForDatabaseACLChange`).
+      Runner decides `<waiting>` by 300 ms timeout so the XID-block reproduces the
+      output exactly. Blast radius nil (targeted VACUUM never consults the marker;
+      no-ACL-change marker is 0 → instant; committed marker → instant; no
+      MVCC/storage/WAL surface). `TestPort_IsolationIntraGrantInplaceDb` strict
+      PASS; sibling Vacuum/Cluster/Truncate-conflict + CreateTrigger PASS
+      (`VacuumConcurrentDrop` fails identically on clean HEAD — pre-existing timing
+      flake, unrelated); parser/catalog/executor units; build+vet+gofmt clean;
+      pgbench smoke = pre-commit hook. Isolation tally now 107 pass / 14 failed.
+      **Remaining M0118-0009:** `intra-grant-inplace` (pg_class sibling — ALTER
+      TABLE ADD PRIMARY KEY `<waiting>` behind FOR KEY SHARE on pg_class), `horizons`
+      (JSON `->` + EXPLAIN FORMAT json), `stats` (pg_stat_force_next_flush),
+      `prepared-transactions{,-cic}` (2PC).

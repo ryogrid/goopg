@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -46,6 +47,18 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 	}
 
 	vs := o.plan.Stmt.(*parser.VacuumStmt)
+
+	// A database-wide VACUUM (no explicit target list) advances the cluster
+	// datfrozenxid in pg_database via an in-place update (vac_update_datfrozenxid
+	// → heap_inplace_update_scan). That in-place update locks the pg_database
+	// tuple and waits for any concurrent uncommitted GRANT/REVOKE … ON DATABASE
+	// (whose lock IS that tuple's xmax) to finish first. goopg has no real
+	// pg_database heap tuple, so we replay the wait directly: block on the writer
+	// XID recorded by the ACL change until it commits/aborts. Design 0118-0098
+	// (intra-grant-inplace-db).
+	if len(vs.Targets) == 0 {
+		o.waitForDatabaseACLChange()
+	}
 
 	// Compute freeze horizon (M0046-0005): tuples with xmin < freezeBelow
 	// will have their xmin rewritten to FrozenTransactionID.
@@ -157,6 +170,29 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 		}
 	}
 	return nil, EOF
+}
+
+// waitForDatabaseACLChange blocks until any uncommitted GRANT/REVOKE … ON
+// DATABASE transaction has committed or aborted, mirroring PostgreSQL's
+// heap_inplace_update_scan waiting on the pg_database tuple's xmax before a
+// database-wide VACUUM advances datfrozenxid in place. The writer XID is
+// recorded by execCompatNoop when it processes the ACL change. WaitForXID
+// returns immediately when the recorded XID has already finished (or none was
+// recorded), so this is a no-op in the common case. Design 0118-0098.
+func (o *vacuumOp) waitForDatabaseACLChange() {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok || o.ctx.TxnMgr == nil {
+		return
+	}
+	xid := im.DatabaseACLChangeXID()
+	if xid == storage.InvalidTransactionID || xid == o.ctx.Tx.XID {
+		return
+	}
+	qctx := o.ctx.Ctx
+	if qctx == nil {
+		qctx = context.Background()
+	}
+	_ = o.ctx.TxnMgr.WaitForXID(qctx, xid)
 }
 
 // vacuumTarget is one relation to vacuum, tagged with whether the user named it

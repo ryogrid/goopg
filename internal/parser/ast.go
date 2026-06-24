@@ -1627,6 +1627,12 @@ type CompatNoopStmt struct {
 	ArgTypes  []string   // optional: arg types for operator compat registry (e.g. ["bigint","bigint"])
 	TableName ObjectName // optional: table name for rule compat registry
 	RuleKind  string     // optional: rule kind for COPY DML error messages (M0097-0140)
+	// DatabaseACL is set for a GRANT/REVOKE … ON DATABASE … statement. Such an
+	// ACL change takes no heavyweight lock in PostgreSQL — its lock is the
+	// pg_database tuple's xmax — so the executor records the writer XID
+	// (Catalog.SetDatabaseACLChangeXID) and a concurrent database-wide VACUUM
+	// waits on it before advancing datfrozenxid in place. Design 0118-0098.
+	DatabaseACL bool
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }

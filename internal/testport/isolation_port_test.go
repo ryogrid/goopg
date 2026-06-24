@@ -221,6 +221,24 @@ func TestPort_IsolationEvalPlanQualTrigger(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual-trigger.spec")
 }
 
+// TestPort_IsolationIntraGrantInplaceDb exercises the intra-grant-inplace-db
+// spec (M0118-0009, design 0118-0098). It verifies the catalog-tuple-xmax
+// serialization between a GRANT … ON DATABASE and a concurrent in-place
+// datfrozenxid update: a database-wide VACUUM (FREEZE) must <waiting ...> behind
+// an uncommitted GRANT TEMP ON DATABASE (whose lock IS the pg_database tuple's
+// xmax) and complete only after that transaction commits — exactly as PG's
+// heap_inplace_update_scan waits on the tuple xmax. goopg has no real pg_database
+// heap tuple, so the GRANT records its writer XID (Catalog.SetDatabaseACLChangeXID)
+// and the database-wide VACUUM waits on it via mvcc.WaitForXID. The observed
+// datfrozenxid never retreats (cmp3 → 0 rows). All output byte-identical to PG 18.3.
+func TestPort_IsolationIntraGrantInplaceDb(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_intra_grant_db")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/intra-grant-inplace-db.spec")
+}
+
 // TestPort_IsolationLockCommittedKeyupdate exercises the lock-committed-keyupdate
 // spec: a FOR KEY SHARE lock on a tuple whose key was UPDATEd by a concurrent
 // committed transaction. Unlike lock-committed-update (a no-key update, which is

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -1723,6 +1724,17 @@ type InMemory struct {
 	// reject duplicates and to map a dropped name back to its OID/directory.
 	// M0095-0003 (in-place tablespace).
 	tablespaces map[string]*tablespaceRow
+
+	// dbACLChangeXID is the XID of the most recent transaction that performed a
+	// GRANT/REVOKE … ON DATABASE (a pg_database ACL change). PostgreSQL records
+	// no heavyweight lock for an ACL change — the lock IS the catalog tuple's
+	// xmax — so a concurrent in-place update of the same pg_database row
+	// (VACUUM advancing datfrozenxid via heap_inplace_update_scan) must wait for
+	// that xmax XID to commit/abort before it can rewrite the tuple. goopg has no
+	// real pg_database heap tuple, so we record the writer XID here and have a
+	// database-wide VACUUM wait on it (mvcc.WaitForXID). Atomic so the VACUUM
+	// reader never contends on c.mu. Design 0118-0098 (intra-grant-inplace-db).
+	dbACLChangeXID atomic.Uint32
 }
 
 // extensionRow is one runtime CREATE EXTENSION record backing pg_extension.
@@ -7986,6 +7998,22 @@ func (c *InMemory) DatFrozenXID() storage.TransactionID {
 		}
 	}
 	return oldest
+}
+
+// SetDatabaseACLChangeXID records xid as the writer of the most recent
+// GRANT/REVOKE … ON DATABASE (a pg_database ACL change). See the
+// dbACLChangeXID field comment. Design 0118-0098 (intra-grant-inplace-db).
+func (c *InMemory) SetDatabaseACLChangeXID(xid storage.TransactionID) {
+	c.dbACLChangeXID.Store(uint32(xid))
+}
+
+// DatabaseACLChangeXID returns the writer XID of the most recent GRANT/REVOKE …
+// ON DATABASE, or InvalidTransactionID (0) if none has occurred. A database-wide
+// VACUUM consults it and waits (mvcc.WaitForXID) so an in-place datfrozenxid
+// update serialises behind a concurrent uncommitted ACL change, mirroring
+// PostgreSQL's heap_inplace_update_scan waiting on the catalog tuple's xmax.
+func (c *InMemory) DatabaseACLChangeXID() storage.TransactionID {
+	return storage.TransactionID(c.dbACLChangeXID.Load())
 }
 
 // AllUserViews returns deep copies of every user-created non-materialized view.
