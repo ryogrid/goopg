@@ -1,53 +1,64 @@
-Loop #27: M0118-0008 — `LockManager.AllLocks()` enumeration enabler (design 0118-0069).
-COMMITTED + pushed at loop end. NOT a promotion.
+Loop #28: M0118-0008 — live `tableLockMgr`→`pg_locks` bridge (design 0118-0070).
+COMMITTED + pushed at loop end. NOT a promotion (blocker 1 of 4).
 
 ## What landed (enabler)
-`lockmgr.LockManager.AllLocks() []LockHolding` — read-side analog of upstream
-`GetLockStatusData()` (lock.c) that backs pg_locks. Walks `lm.states` under the
-manager lock, returns one `LockHolding{Tag,Backend,Mode,Granted}` per (backend,mode):
-holders→Granted=true (a holder Mask is expanded one row per set mode bit, matching
-pg_locks one-LOCK-per-mode), waiters→Granted=false. Tuple tags (Block/Offset!=0)
-included; relation-only callers filter Tag.Block==0&&Tag.Offset==0. Pure addition —
-NO live call site references it yet → byte-identical behaviour, zero regression risk.
+The live pg_locks bridge for partition-drop-index-locking's s3getlocks
+(`pg_locks JOIN pg_class JOIN pg_stat_activity`). Three parts:
+1. `lockBackendPID` registry (relation_locks.go): connection's stable
+   `LockBackendID` → wire PID. Register/Unregister per connection in server.go
+   (runPostStartupLoop, has both LockBackendID + pid). Per-statement autocommit
+   BackendIDs NOT registered → pid 0 (dropped by the pg_stat_activity join).
+2. `tableLockMgrPgLockRows()`: enumerates `tableLockMgr.AllLocks()` (0118-0069),
+   filters relation-level tags (Block==0&&Offset==0), one pg_locks row per
+   holder/waiter (mode=Mode.String(), granted=t/f), appended to
+   globalRelLockMgr.PgLockRows() in the RelationLockRowsFunc init.
+3. Dedup (lockRelationTransitively, operators_ddl.go): record in globalRelLockMgr
+   ONLY when no real lock taken (autocommit TxnLockBackendID==0 OR lmMode==NoLock).
+   Explicit-txn LOCK TABLE is now surfaced solely by the bridge with a real PID
+   (else doubled).
 
-Files: internal/lockmgr/lockmgr.go (new LockHolding struct + AllLocks method,
-inserted after the Waiters method), internal/lockmgr/alllocks_test.go (new),
-docs/design/0118-0069-lockmanager-alllocks-enumeration.md + README index,
-.ralph/deferral_ledger.md.
+Files: internal/executor/relation_locks.go, operators_ddl.go (dedup gate),
+internal/server/server.go (register/unregister), relation_locks_bridge_test.go
+(new), docs/design/0118-0070-*.md + README index, deferral_ledger.md.
 
-Key symbols: lockmgr.LockManager.AllLocks, lockmgr.LockHolding, lockState.holders
-(map[BackendID]Mask), lockState.waiters, modeNames (already pg_locks spelling),
-bit()/maxMode (mode-bit iteration), Mode.String().
+Key symbols: lockBackendPID, RegisterLockBackendPID/UnregisterLockBackendPID,
+tableLockMgrPgLockRows, lockmgr.LockManager.AllLocks, lockRelationTransitively
+(operators_ddl.go ~12546), connTxState.LockBackendID, runPostStartupLoop (pid).
 
-Gates: go test -race ./internal/lockmgr/ PASS (5 new AllLocks tests + full suite);
-go build ./... clean; pgbench smoke = pre-commit hook.
+Gates: new bridge test -race PASS; lock-touching strict spec set PASS ~131s
+(lock-nowait/alter-table-1/2/3/create-trigger/truncate-vacuum-cluster-conflict/
+inherit-temp/reindex-concurrently/sequence-ddl/drop-index-concurrently-1/
+vacuum-no-cleanup-lock/detach-partition-concurrently-1..4/insert-conflict-specconflict);
+go test -race ./internal/lockmgr/; go build ./... clean; pgbench smoke=pre-commit hook.
+
+## Probe result (2026-06-24)
+Spec's 1st s3getlocks advanced 0 → 4/7 expected rows, all PID-joined:
+DROP INDEX partition-tree AccessExclusive (parent/subpart t, _child f-waiter) +
+s1 _child AccessShare t. PID mapping validated through the real SQL join.
 
 ## partition-drop-index-locking remaining blockers (resume point)
-Full promotion needs THREE more pieces (AllLocks is necessary, not sufficient):
-1. **Live pg_locks→tableLockMgr bridge** (next loop, the mechanical one): wire
-   `AllLocks()` into `catalog.RelationLockRowsFunc` (relation_locks.go) emitting one
-   row per LockHolding: locktype=relation, relation=Tag.Rel, mode=Mode.String()
-   (already "AccessExclusiveLock" etc.), granted=Granted, pid=holder's session pid.
-   Needs a BackendID→pid registry (TxnLockBackendID → pg_stat_activity pid). DEDUP:
-   LOCK TABLE records in BOTH globalRelLockMgr AND tableLockMgr → must unify on one
-   source or s1's AccessShare doubles. Regression surface TINY: only
-   partition-drop-index-locking reads relation locks (insert-conflict-specconflict
-   filters spectoken/transactionid) — verified by grep over ported specs.
-2. **SELECT locks the leaf's INDEXES** (AccessShare), not just the table —
-   acquireScanReadLockTxn (0118-0018) locks the table only; spec s1select rows include
-   ..._subpart_child_id_idx{,1}.
-3. **Transactional-DDL cross-session catalog visibility** (MILESTONE-SIZED, shared with
-   alter-table-4 / partition-concurrent-attach): the 2nd s3getlocks (after s2drop
-   completes, before s2commit) must still show the dropped index's pg_class row — goopg
-   removes it from the shared in-memory catalog synchronously, so s3's snapshot loses it.
+1. **DROP INDEX must lock the index relation itself** (mechanical): expected has
+   `part_drop_index_locking_idx` AccessExclusive|t. lockDropIndexTableTree
+   (0118-0067) locks idx.Table + partition descendants but NOT the index oid.
+2. **SELECT locks the leaf's INDEXES** (mechanical, blocker 2): acquireScanReadLockTxn
+   (0118-0018) locks the table only; the 2 missing rows are
+   _subpart_child_id_idx{,1} AccessShare|t. Do (1)+(2) next → advances to 6/7.
+3. **pg_stat_activity idle-query retention**: s.query empty for the s1 AccessShare
+   row — goopg clears Query on return to idle (activity/registry.go UpdateState
+   `else if state=="idle"`); PG retains the most-recent query for idle-in-txn.
+4. **Transactional-DDL cross-session catalog visibility** (MILESTONE-SIZED, shared
+   with alter-table-4 / partition-concurrent-attach): 2nd s3getlocks (after
+   s1commit, before s2commit) must still show the dropped index's pg_class row +
+   index-child AccessExclusive locks; goopg removes it from the shared in-memory
+   catalog synchronously.
 
-Next step: the live pg_locks bridge (blocker 1) — wire AllLocks + BackendID→pid map +
-dedup. Budget the lock-table/conflict spec suite as the gate (regression surface is
-small but verify partition-drop-index-locking + insert-conflict-specconflict).
+Next step: blockers (1)+(2) — index-relation + SELECT-index AccessShare locks
+(both mechanical, advance 4/7 → 6/7). Then idle-query retention + the txnl-DDL
+visibility milestone.
 
 ## M0118-0008 hard tail (all Effort-L, deferred)
-- partition-drop-index-locking: live bridge + SELECT-index-locks + txnl-DDL visibility.
-- alter-table-4 + partition-concurrent-attach: transactional-DDL cross-session catalog
-  visibility (milestone-sized MVCC catalog subsystem).
+- partition-drop-index-locking: blockers above.
+- alter-table-4 + partition-concurrent-attach: transactional-DDL cross-session
+  catalog visibility (milestone-sized MVCC catalog subsystem).
 - reindex-concurrently-toast: real TOAST relations (reltoastrelid=0; text inline).
 - WHERE CURRENT OF positioned UPDATE/DELETE: project-wide, parsed (CurrentOf) no executor site.

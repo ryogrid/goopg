@@ -1097,6 +1097,12 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 	// connTxState.End() at COMMIT/ROLLBACK (and on teardown via
 	// rollbackOpenTxnOnTeardown).
 	connTx.LockBackendID = lockmgr.BackendID(s.nextBackendID.Add(1))
+	// Map this connection's transaction-scoped lock identity to its backend PID
+	// so transaction-scoped relation locks (LOCK TABLE / DDL / scan-read ACCESS
+	// SHARE) held on the executor's tableLockMgr surface in pg_locks with a PID
+	// that joins pg_stat_activity (design 0118-0070). Dropped at teardown.
+	executor.RegisterLockBackendPID(connTx.LockBackendID, pid)
+	defer executor.UnregisterLockBackendPID(connTx.LockBackendID)
 	// On connection teardown, release EVERY advisory lock this backend still
 	// holds — session-scoped as well as transaction-scoped. PostgreSQL frees all
 	// advisory locks at backend exit; without this a session-scoped

@@ -12543,7 +12543,16 @@ func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode str
 		return nil
 	}
 	visited[tbl.OID] = true
-	globalRelLockMgr.AddRelationLock(sess, dbOID, tbl.OID, mode)
+	// Dedup against the live tableLockMgr → pg_locks bridge (design 0118-0070):
+	// only register in the display-only globalRelLockMgr when this LOCK takes NO
+	// real heavyweight lock — i.e. in autocommit (TxnLockBackendID == 0, where
+	// acquireRelLockTxn is a no-op) or for an exotic/unparsable mode
+	// (lmMode == NoLock). An explicit-transaction LOCK TABLE with a parsable mode
+	// takes a real tableLockMgr lock, which the bridge already surfaces with a
+	// real PID; recording it here too would double it in pg_locks.
+	if lmMode == lockmgr.NoLock || ctx.TxnLockBackendID == 0 {
+		globalRelLockMgr.AddRelationLock(sess, dbOID, tbl.OID, mode)
+	}
 	if lmMode != lockmgr.NoLock {
 		rel := storage.RelFileNode{DBOid: dbOID, RelOid: tbl.OID}
 		if err := ctx.acquireRelLockTxn(rel, lmMode, nowait); err != nil {

@@ -16,6 +16,7 @@ import (
 	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/lockmgr"
 )
 
 type relLockEntry struct {
@@ -93,9 +94,107 @@ func (m *relLockMgr) PgLockRows() [][]string {
 	return rows
 }
 
+// ——— Live tableLockMgr → pg_locks bridge (design 0118-0070) ————————————————
+//
+// globalRelLockMgr above is the display-only registry for relation locks that
+// take NO real heavyweight lock (autocommit LOCK TABLE, exotic modes). The
+// transaction-scoped relation locks that DO take a real lock — LOCK TABLE in an
+// explicit transaction, DDL (DROP INDEX / ALTER TABLE / CREATE TRIGGER), and
+// per-scan ACCESS SHARE — live on the executor's dedicated tableLockMgr
+// (context.go). The bridge below enumerates that manager so those locks appear
+// in pg_locks with a real backend PID, matching upstream's GetLockStatusData()
+// feeding the pg_locks SRF.
+
+// lockBackendPID maps a transaction-scoped lock-manager BackendID (a
+// connection's stable LockBackendID, minted in runPostStartupLoop) to its
+// wire-protocol backend PID, so each tableLockMgr relation lock can be stamped
+// with the PID that pg_stat_activity joins on (pg_locks.pid = pg_stat_activity.pid).
+// Registered once per connection at startup, removed at teardown. The
+// per-statement BackendID used for autocommit-transient locks is deliberately
+// NOT registered: such locks are held only for the duration of one statement,
+// so a concurrent pg_locks reader almost never observes them, and when it does
+// they surface with PID 0 (filtered out by the pg_stat_activity join).
+var (
+	lockBackendPIDMu sync.RWMutex
+	lockBackendPID   = map[lockmgr.BackendID]string{}
+)
+
+// RegisterLockBackendPID records the PID that backs the given transaction-scoped
+// lock-manager identity. Called once per connection from runPostStartupLoop.
+func RegisterLockBackendPID(b lockmgr.BackendID, pid uint32) {
+	if b == 0 {
+		return
+	}
+	lockBackendPIDMu.Lock()
+	lockBackendPID[b] = fmt.Sprintf("%d", pid)
+	lockBackendPIDMu.Unlock()
+}
+
+// UnregisterLockBackendPID drops the mapping at connection teardown.
+func UnregisterLockBackendPID(b lockmgr.BackendID) {
+	if b == 0 {
+		return
+	}
+	lockBackendPIDMu.Lock()
+	delete(lockBackendPID, b)
+	lockBackendPIDMu.Unlock()
+}
+
+func lookupLockBackendPID(b lockmgr.BackendID) string {
+	lockBackendPIDMu.RLock()
+	pid := lockBackendPID[b]
+	lockBackendPIDMu.RUnlock()
+	return pid
+}
+
+// tableLockMgrPgLockRows enumerates the executor's dedicated tableLockMgr as
+// pg_locks rows. Every granted holder and queued waiter on a RELATION-level tag
+// (tuple-level tags — Block/Offset non-zero — are filtered out, since the
+// pg_locks relation column is meaningful only for relation locks) becomes one
+// row, stamped with the holder's backend PID resolved via lockBackendPID. This
+// is the live half of the pg_locks relation-lock view (design 0118-0070).
+func tableLockMgrPgLockRows() [][]string {
+	all := tableLockMgr.AllLocks()
+	if len(all) == 0 {
+		return nil
+	}
+	rows := make([][]string, 0, len(all))
+	for _, h := range all {
+		if h.Tag.Block != 0 || h.Tag.Offset != 0 {
+			continue // tuple-level lock; not a relation lock
+		}
+		pid := lookupLockBackendPID(h.Backend)
+		if pid == "" {
+			// Per-statement (autocommit-transient) lock with no stable PID
+			// mapping. Emit "0" like the display-only registry: pg_stat_activity
+			// has no pid-0 row, so the pg_locks view's join drops it.
+			pid = "0"
+		}
+		granted := "f"
+		if h.Granted {
+			granted = "t"
+		}
+		rows = append(rows, []string{
+			"relation",                   // locktype
+			fmt.Sprintf("%d", h.Tag.DB),  // database
+			fmt.Sprintf("%d", h.Tag.Rel), // relation
+			"", "", "", "",               // page, tuple, virtualxid, transactionid
+			"", "", "",                   // classid, objid, objsubid
+			"",                           // virtualtransaction
+			pid,                          // pid
+			h.Mode.String(),              // mode
+			granted,                      // granted
+			"f",                          // fastpath
+			"",                           // waitstart
+		})
+	}
+	return rows
+}
+
 func init() {
 	catalog.RelationLockRowsFunc = func() [][]string {
-		return globalRelLockMgr.PgLockRows()
+		rows := globalRelLockMgr.PgLockRows()
+		return append(rows, tableLockMgrPgLockRows()...)
 	}
 }
 
