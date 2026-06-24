@@ -829,6 +829,56 @@ func tableNeedsToastRelation(t *Table) bool {
 	return false
 }
 
+// tableHasToastRelation reports whether the table owns an auto-exposed TOAST
+// relation: it carries explicit `toast.*` reloptions, or it is a USER ordinary
+// table / materialized view (relkind 'r' or 'm') with at least one toastable
+// (varlena) column. This is the single source of truth for the `hasToastRel`
+// gate in the pg_class virtual builder AND for ToastRelName's OID→name
+// resolution, so reltoastrelid exposure and `reltoastrelid::regclass` rendering
+// can never diverge. Mirrors PG needs_toast_table (src/backend/catalog/
+// toasting.c); system catalogs are excluded because goopg serves them virtually
+// with no real heap, so a reltoastrelid join target would break pg_amcheck's
+// whole-DB walk. M0118-0008 TOAST-exposure (design 0118-0084).
+func tableHasToastRelation(t *Table) bool {
+	if len(t.ToastReloptions) > 0 {
+		return true
+	}
+	if IsSystemRelation(t.OID) {
+		return false
+	}
+	// relkind must be ordinary table ('r') or materialized view ('m'): exclude
+	// sequences ('S'), plain views ('v') and partitioned parents ('p'), matching
+	// the relkind computation in the virtual builder.
+	if t.IsSequence || (t.View != nil && !t.IsMatView) ||
+		(t.PartitionMethod != "" && t.PartitionParentOID == 0) {
+		return false
+	}
+	return tableNeedsToastRelation(t)
+}
+
+// ToastRelName resolves a synthetic TOAST relation OID (parent OID +
+// toastRelidOffset) to its schema-qualified name `pg_toast.pg_toast_<parentOID>`,
+// matching PG's regclassout for a relation in the pg_toast namespace (which is
+// never in search_path, hence always schema-qualified). The synthetic TOAST
+// pg_class row lives only in the virtual builder's output, not in c.tables, so
+// `reltoastrelid::regclass` cannot find it via tableByOID and must reconstruct
+// the name here. Returns false when the OID is below the TOAST range or its
+// parent table owns no auto-exposed TOAST relation. M0118-0008 TOAST-exposure
+// slice 2 (design 0118-0084).
+func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
+	if oid < toastRelidOffset {
+		return "", false
+	}
+	parentOID := oid - toastRelidOffset
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	t, ok := c.tableByOID(parentOID)
+	if !ok || !tableHasToastRelation(t) {
+		return "", false
+	}
+	return "pg_toast.pg_toast_" + strconv.Itoa(int(parentOID)), true
+}
+
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
 // parser package in contexts that only need the catalog. M0096-0012.
 type TriggerTiming int
@@ -3036,9 +3086,10 @@ func (c *InMemory) registerSystemTables() {
 			// so attaching a reltoastrelid to e.g. pg_type/pg_attribute would make
 			// pg_amcheck follow the join and fail to open the non-existent toast
 			// heap. Explicit toast.* reloptions only ever land on user tables.
-			hasToastRel := len(t.ToastReloptions) > 0 ||
-				(!IsSystemRelation(t.OID) && (relkind == "r" || relkind == "m") &&
-					tableNeedsToastRelation(t))
+			// hasToastRel is computed by tableHasToastRelation (shared with
+			// ToastRelName so exposure and regclass rendering stay in sync). The
+			// relkind 'r'/'m' filter lives inside that helper.
+			hasToastRel := tableHasToastRelation(t)
 			reltoastrelid := "0"
 			if hasToastRel {
 				reltoastrelid = strconv.Itoa(int(t.OID) + toastRelidOffset)

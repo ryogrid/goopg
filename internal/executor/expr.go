@@ -600,6 +600,13 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 					if tbl, found := im.LookupTableByOID(uint32(v.Int)); found && tbl != nil {
 						return NewStringDatum(tbl.Name), nil
 					}
+					// Synthetic TOAST relation OIDs (parent OID + 100M) live only in
+					// the virtual pg_class builder, not c.tables, so reconstruct the
+					// schema-qualified pg_toast.pg_toast_<oid> name PG's regclassout
+					// would emit. M0118-0008 TOAST-exposure slice 2 (0118-0084).
+					if name, found := im.ToastRelName(uint32(v.Int)); found {
+						return NewStringDatum(name), nil
+					}
 				}
 				// Also resolve index OIDs to index names. M0097-0023.
 				for _, idx := range ctx.Catalog.AllIndexes() {

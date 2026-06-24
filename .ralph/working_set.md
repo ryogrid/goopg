@@ -1,39 +1,39 @@
-Loop #19: M0118-0008 — `reindex-concurrently-toast` (LAST unpromoted spec; other
-24 pass strict). Landed TOAST-exposure epic SLICE 1 (design 0118-0084). Spec
-stays `defer` (steps 2–5 of the 5-step epic remain).
+Loop #20: M0118-0008 — `reindex-concurrently-toast` (LAST unpromoted spec; other
+24 pass strict). Landed TOAST-exposure epic SLICE 2 (design 0118-0085). Spec
+stays `defer` (steps 3–5 of the 5-step epic remain).
 
-## What landed (slice 1 of N)
-The pg_class virtual builder now auto-exposes a TOAST relation for USER tables
-with a toastable column — previously gated only on explicit `toast.*` reloptions.
-New `tableNeedsToastRelation(t)` (mirrors PG needs_toast_table) + `columnTypeIsToastable(col)`
-(varlena type-name set synced with executor isToastableType, plus array cols).
-Gate: `hasToastRel := len(ToastReloptions)>0 || (!IsSystemRelation(OID) &&
-relkind IN ('r','m') && tableNeedsToastRelation(t))`. Parent reltoastrelid →
-OID+100_000_000; toast-row reloptions NULL unless explicit toast.* set.
+## What landed (slice 2 of N)
+`reltoastrelid::regclass` now renders the schema-qualified `pg_toast.pg_toast_<oid>`
+name (PG regclassout always qualifies pg_toast — never in search_path) instead of
+the numeric OID. The synthetic toast pg_class row lives only in the virtual
+builder output, not c.tables, so the regclass cast couldn't name it via tableByOID.
+- NEW `catalog.tableHasToastRelation(t)` — extracts the slice-1 hasToastRel gate
+  into ONE shared function (builder gate + OID→name resolver can't diverge).
+- NEW `(*InMemory).ToastRelName(oid)` — for oid >= toastRelidOffset (100_000_000)
+  whose parent table still owns an auto-exposed toast rel, returns
+  `pg_toast.pg_toast_<parentOID>`, true; else false.
+- `expr.go` CastExpr regclass arm: after LookupTableByOID miss, fall through to
+  `im.ToastRelName(...)`. InvalidOid→"-" guard (0118-0083) still runs first; a
+  non-zero unmatched OID still renders numeric.
 
-## Blast-radius decision (by measurement — the key finding)
-USER relations only. First un-scoped attempt attached reltoastrelid to virtual
-system catalogs (pg_type=1247, pg_attribute=1249); pg_amcheck's whole-DB walk
-FOLLOWS reltoastrelid → `could not open relation` on pg_toast_1247/1249 (goopg
-has no real heap there). `!IsSystemRelation(t.OID)` fixes it AND preserves prior
-DU-002 slice-224 behaviour (explicit toast.* only ever on user tables).
+Files: internal/catalog/catalog.go (tableHasToastRelation, ToastRelName, builder
+gate at ~L3089 now calls helper); internal/executor/expr.go (regclass arm ~L599);
+internal/executor/toast_relation_exposure_test.go (NEW TestReltoastrelidRegclassRendersToastName);
+docs/design/0118-0085-*.md + README; deferral ledger.
 
-Files: internal/catalog/catalog.go (2 helpers + both gate sites ~L795, L3000, L3066);
-internal/executor/toast_relation_exposure_test.go (NEW TestToastRelationAutoExposed);
-docs/design/0118-0084-*.md + README; deferral ledger.
-
-## Next step (slice 2)
-Resolve the toast OID→name in `LookupTableByOID`/`tableByOID` so
-`reltoastrelid::regclass` renders `pg_toast.pg_toast_<oid>` instead of the numeric
-OID (the synthetic row lives only in the virtual pg_class builder, not c.tables —
-regclassout consults tableByOID). Re-run pgdump_connsetup + pgamcheck after, since
-naming the toast relation may change \d/regclass output. Then slices 3 (toast
-index in pg_index), 4 (pg_toast RENAME under allow_system_table_mods), 5 (REINDEX
-CONCURRENTLY pg_toast.<name> routing, rides 0118-0029).
+## Next step (slice 3)
+Synthesize the TOAST index `pg_toast_<oid>_index` in pg_index AND pg_class
+(relkind='i') so the spec's `SELECT indexrelid::regclass::text FROM pg_index
+WHERE indrelid = (SELECT oid FROM pg_class WHERE relname='reind_con_toast')`
+resolves. Then slice 4 (pg_toast RENAME under allow_system_table_mods +
+pg_toast.<name> resolution), slice 5 (REINDEX CONCURRENTLY pg_toast.<name>
+routing, rides 0118-0029). Re-run blast-radius parity suites after each
+(pg_index/pg_class enumeration feeds pg_dump/pg_amcheck/\d).
 
 ## Gates run (this loop)
-go test ./internal/{catalog,executor}/ PASS; TestToastRelationAutoExposed PASS;
-ALL blast-radius parity suites PASS (PgDumpConnectionSetup, PgDump*, PgAmcheck*
-incl. alltables/002 whole-DB walks, Scripts*); IsolationPlpgsqlToast +
+go test ./internal/{catalog,executor}/ PASS; TestReltoastrelidRegclassRendersToastName
++ TestToastRelationAutoExposed + TestRegclassInvalidOidRendersDash PASS; ALL
+blast-radius parity suites PASS (PgDumpConnectionSetup, PgDump*, PgAmcheck* incl.
+alltables/002 whole-DB walks, Scripts*); IsolationPlpgsqlToast +
 IsolationReindexConcurrently PASS; build/gofmt/vet clean; make ralph-state-guard
-(below); pgbench smoke = pre-commit hook.
+OK (auto-repaired prev-loop completed marker); pgbench smoke = pre-commit hook.

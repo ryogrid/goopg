@@ -87,3 +87,35 @@ func TestToastRelationAutoExposed(t *testing.T) {
 		t.Errorf("unexpected pg_toast row (%s) for an all-fixed-width table", narrowToastName)
 	}
 }
+
+// TestReltoastrelidRegclassRendersToastName verifies M0118-0008 TOAST-exposure
+// slice 2 (design 0118-0084): `reltoastrelid::regclass` for a table that owns an
+// auto-exposed TOAST relation renders the schema-qualified `pg_toast.pg_toast_<oid>`
+// name PG's regclassout emits (the pg_toast namespace is never in search_path,
+// so the name is always schema-qualified). The synthetic TOAST pg_class row
+// lives only in the virtual builder output — not in c.tables — so the regclass
+// cast resolves the OID via InMemory.ToastRelName rather than tableByOID. This
+// is exactly the value the reindex-concurrently-toast spec's setup feeds into
+// `EXECUTE 'ALTER TABLE ' || r.table_name || ' RENAME TO …'`.
+func TestReltoastrelidRegclassRendersToastName(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE reind_con_wide (id int primary key, data text)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	wideTbl, ok := cat.LookupTable(parser.ObjectName{Name: "reind_con_wide"})
+	if !ok {
+		t.Fatal("reind_con_wide not found")
+	}
+
+	want := "pg_toast.pg_toast_" + strconv.Itoa(int(wideTbl.OID))
+	rows := runQuery(t, ctx,
+		`SELECT reltoastrelid::regclass::text FROM pg_class WHERE oid = 'reind_con_wide'::regclass`)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row, got %d", len(rows))
+	}
+	if got := rows[0][0].StringValue(); got != want {
+		t.Errorf("reltoastrelid::regclass::text = %q, want %q", got, want)
+	}
+}
