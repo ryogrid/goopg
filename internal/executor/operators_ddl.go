@@ -4702,6 +4702,22 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			}
 		}
 	}
+	// CREATE INDEX on a partitioned table recurses into every existing partition
+	// descendant, building a matching index on each and attaching it to the
+	// parent index (pg_inherits), exactly as PostgreSQL's DefineIndex does. The
+	// partition-key/leaf distinction is `tbl.PartitionMethod != ""`: a partitioned
+	// table fans out, a leaf builds an ordinary index. Each child is auto-named
+	// `<partition>_<col>_idx` (deduped to _idx1, _idx2, … on collision), so a
+	// two-level tree where two ancestor indexes both reach the same leaf yields
+	// `_id_idx` and `_id_idx1` — the names the partition-drop-index-locking
+	// isolation spec observes. M0118-0008.
+	if tbl.PartitionMethod != "" {
+		if parentIdx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			if err := o.createPartitionChildIndexes(s, tbl, parentIdx, resolvedPred); err != nil {
+				return err
+			}
+		}
+	}
 	// CREATE INDEX CONCURRENTLY: drain the transactions that were running when
 	// the build started (captured above). Once they finish, no snapshot that
 	// predates the new index remains. Two simultaneous concurrent builds do not
@@ -4709,6 +4725,77 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if s.Concurrently && len(cicWaitSlots) > 0 && o.ctx.Ctx != nil {
 		if err := o.ctx.TxnMgr.WaitForSlotsToCommit(o.ctx.Ctx, cicWaitSlots); err != nil {
 			return &ExecError{Code: "57014", Pos: s.Pos(), Message: "CREATE INDEX CONCURRENTLY cancelled"}
+		}
+	}
+	return nil
+}
+
+// createPartitionChildIndexes recursively materialises a matching index on
+// every partition descendant of a partitioned table when CREATE INDEX runs on
+// the parent. PostgreSQL's DefineIndex recurses into existing partitions: each
+// intermediate partitioned partition gets its own (storage-less in upstream)
+// index entry and recursion continues, each leaf gets an ordinary index, and
+// every child is attached to its *immediate* parent index via pg_inherits so
+// the whole tree drops and locks as a unit. Children are auto-named
+// `<partition>_<col>_idx`, deduped to `_idx1`/`_idx2`/… on collision, mirroring
+// upstream's ChooseRelationName. resolvedPred carries the (already const-folded)
+// partial-index predicate so each child filters identically. M0118-0008
+// (partition-drop-index-locking isolation spec).
+func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl *catalog.Table, parentIdx *catalog.Index, resolvedPred planner.Expr) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	// Naming mirrors the attach-time inheritance path: expression columns (empty
+	// name) contribute "expr" so two expression indexes on one child dedup to
+	// `_expr_idx` / `_expr_idx1`.
+	nameCols := make([]string, len(s.Columns))
+	for i, col := range s.Columns {
+		if col == "" {
+			nameCols[i] = "expr"
+		} else {
+			nameCols[i] = col
+		}
+	}
+	for _, childTbl := range im.PartitionChildren(parentTbl.OID) {
+		childIdxName := parser.ObjectName{
+			Schema: childTbl.Schema,
+			Name:   o.autoIndexNameWithIncludes(childTbl, nameCols, s.IncludeColumns, "idx"),
+		}
+		// resolvedPred is a nil planner.Expr when there is no partial predicate;
+		// createBTreeIndex treats a nil predExpr[0] as "no predicate".
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, childTbl, s.Columns, s.ColExprs, s.Unique, false, resolvedPred); err != nil {
+			return err
+		}
+		childIdx, ok2 := o.ctx.Catalog.LookupIndex(childIdxName)
+		if !ok2 {
+			continue
+		}
+		// Attach to the immediate parent index. pg_inherits then renders the
+		// child as inheriting from the parent index, so an external pg_dump
+		// recreates it implicitly via the parent CREATE INDEX (no standalone
+		// statement) and DROP/lock walks treat the tree as one object.
+		childIdx.PartitionParentOID = parentIdx.OID
+		im.RegisterIndexPartitionChild(parentIdx.OID, childIdx.OID)
+		// Carry the parent's partial-index / INCLUDE / expression metadata so the
+		// child's pg_get_indexdef renders identically.
+		if s.HasPredicate {
+			childIdx.HasPredicate = s.HasPredicate
+			childIdx.Predicate = s.Predicate
+			childIdx.PredicateString = parentIdx.PredicateString
+		}
+		childIdx.IncludeColumns = s.IncludeColumns
+		for i, str := range parentIdx.ColExprStrings {
+			if str != "" && i < len(childIdx.ColExprStrings) {
+				childIdx.ColExprStrings[i] = str
+			}
+		}
+		// Intermediate partitioned partition: recurse into its own children,
+		// rooting each grandchild at this level's index.
+		if childTbl.PartitionMethod != "" {
+			if err := o.createPartitionChildIndexes(s, childTbl, childIdx, resolvedPred); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
