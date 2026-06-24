@@ -323,12 +323,23 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (deferred, ledger 2026-06-22):** `eval-plan-qual` — a cross-table EvalPlanQual
       recheck returns `(0 rows)` where PG re-projects the updated row after a concurrent
       UPDATE (EPQ-over-join executor work, ~L1171 of expected). Group stays open.
-- [ ] **M0118-0008** — DDL / VACUUM / maintenance concurrency: alter-table-{1,2,3,4},
+- [x] **M0118-0008** — DDL / VACUUM / maintenance concurrency: alter-table-{1,2,3,4},
       detach-partition-concurrently-{1,2,3,4}, partition-concurrent-attach,
       partition-drop-index-locking, reindex-concurrently{,-toast}, reindex-schema,
       multiple-cic, vacuum-{concurrent-drop,conflict,no-cleanup-lock,skip-locked},
       truncate-conflict, sequence-ddl, cluster-conflict{,-partition}, create-trigger,
       inherit-temp, plpgsql-toast.
+      **COMPLETE (2026-06-24, loop #24).** All 25 specs are strict-promoted
+      (`runIsoSpecStrict`) and byte-for-byte vs PG 18.3 — `reindex-concurrently-toast`
+      (design 0118-0088) was the last, closing the TOAST-exposure epic. This loop
+      reconciled the lagging D-002 inventory: 34 strict-passing isolation specs
+      (the M0118-0008 group + earlier M0118-0005/0006/0007 promotions whose CSV rows
+      were never flipped) set `failed`→`pass` in
+      `postgres-oracle-target-inventory.csv`, regenerated
+      `upstream-isolation-coverage.md` + `postgres-oracle-target-inventory.md`.
+      Smoke-verified `Reindex­ConcurrentlyToast`/`AlterTable4`/`PlpgsqlToast` strict
+      PASS (24.6 s). Isolation tally now 101 pass / 20 failed (remaining 20 span
+      M0118-0002/0004/0005/0007/0009 — distinct unbuilt subsystems).
       **PARTIAL (2026-06-22, design 0118-0027):** probe-first ranked all 25 specs;
       none passed as-is (the group's hard tail). `create-trigger` promoted to
       pass-required — CREATE TRIGGER now takes a txn-scoped ShareRowExclusiveLock
