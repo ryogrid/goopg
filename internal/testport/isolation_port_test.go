@@ -726,6 +726,25 @@ func TestPort_IsolationVacuumNoCleanupLock(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-no-cleanup-lock.spec")
 }
 
+// TestPort_IsolationPartitionDropIndexLocking exercises the
+// partition-drop-index-locking spec (M0118-0008). DROP INDEX on a partitioned
+// index, while a concurrent SELECT holds ACCESS SHARE on a leaf partition, must
+// (a) block on the partition-tree AccessExclusiveLock acquired top-down and
+// (b) keep the dropped index's pg_class row + the dropper's lock visible to a
+// third observing session's `pg_locks JOIN pg_class` until the dropping
+// transaction commits. The latter is the transactional-DDL visibility piece:
+// execDropIndex defers the catalog/relfile/WAL removal of a non-CONCURRENTLY
+// DROP INDEX issued inside an explicit transaction to COMMIT
+// (ApplyPendingIndexDrops), so the index stays in the shared catalog meanwhile.
+// Byte-identical to PG 18.3 (design 0118-0074).
+func TestPort_IsolationPartitionDropIndexLocking(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_part_drop_idx_lock")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/partition-drop-index-locking.spec")
+}
+
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
 // Requires: BEGIN ISOLATION LEVEL, CREATE TABLE with REFERENCES (FK), CREATE TRIGGER.
 func TestPort_IsolationFkSnapshot(t *testing.T) {

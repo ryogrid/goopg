@@ -49,6 +49,23 @@ type DDLDropUndoEntry struct {
 	SavepointDepth int // subxactStack depth at time of drop
 }
 
+// PendingIndexDrop records a non-CONCURRENTLY DROP INDEX issued inside an
+// explicit transaction whose catalog removal is deferred until COMMIT. Until the
+// dropping transaction commits, the index stays in the shared catalog so other
+// sessions still observe its pg_class row and the dropper's AccessExclusiveLock
+// (PG transactional-DDL visibility; partition-drop-index-locking isolation
+// spec). The recorded fields are everything ApplyPendingIndexDrops needs to
+// perform the real removal at commit (catalog + relfile + WAL + pg_class xmax).
+// M0118-0008.
+type PendingIndexDrop struct {
+	Name           parser.ObjectName   // catalog lookup key passed to Catalog.DropIndex
+	OID            uint32              // index relation OID (WAL + pg_class xmax)
+	Schema         string              // index schema (WAL payload)
+	IdxName        string              // bare index name (WAL payload)
+	Rel            storage.RelFileNode // physical relfile to invalidate + drop
+	SavepointDepth int                 // savepoint depth at drop time (for ROLLBACK TO cancel)
+}
+
 // relPageSnapshot captures the full page contents of one relation before
 // a TRUNCATE so that ROLLBACK can restore them.
 type relPageSnapshot struct {
@@ -81,6 +98,7 @@ type BasicSession struct {
 	pendingTruncates    []TruncateUndoEntry // heap/index page snapshots for TRUNCATE rollback
 	pendingSeqRestores  []SeqRestoreEntry   // sequence counter restores for RESTART IDENTITY rollback
 	savepointDDLDrops   []DDLDropUndoEntry  // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
+	pendingIndexDrops   []PendingIndexDrop  // DROP INDEX deferred to COMMIT (M0118-0008)
 	subxactStack        mvcc.SubxactStack   // savepoint stack (M0050-0004)
 	currentSubXid       storage.TransactionID // 0 = use top-level tx.XID
 	txFailed            bool                // in_failed_sql_transaction (25P02)
@@ -152,6 +170,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.pendingTruncates = nil
 	s.pendingSeqRestores = nil
 	s.savepointDDLDrops = nil
+	s.pendingIndexDrops = nil
 	s.subxactStack = mvcc.SubxactStack{}
 	s.currentSubXid = 0
 	s.txFailed = false
@@ -325,6 +344,36 @@ func (s *BasicSession) TakePendingDDLDrops() []DDLDropUndoEntry {
 	out := s.savepointDDLDrops
 	s.savepointDDLDrops = nil
 	return out
+}
+
+// AddPendingIndexDrop records a DROP INDEX whose catalog removal is deferred
+// until COMMIT (see PendingIndexDrop). M0118-0008.
+func (s *BasicSession) AddPendingIndexDrop(e PendingIndexDrop) {
+	s.pendingIndexDrops = append(s.pendingIndexDrops, e)
+}
+
+// TakePendingIndexDrops drains and returns the deferred DROP INDEX entries.
+// Called from the commit paths (ApplyPendingIndexDrops) to perform the real
+// removal; a full ROLLBACK simply lets EndExplicitTransaction discard them.
+// M0118-0008.
+func (s *BasicSession) TakePendingIndexDrops() []PendingIndexDrop {
+	out := s.pendingIndexDrops
+	s.pendingIndexDrops = nil
+	return out
+}
+
+// CancelPendingIndexDropsToDepth discards deferred DROP INDEX entries recorded
+// at savepoint depth >= depth, so ROLLBACK TO SAVEPOINT before a deferred DROP
+// INDEX does not still remove the index at the outer COMMIT. Mirrors
+// RollbackDDLDropsToDepth's convention. M0118-0008.
+func (s *BasicSession) CancelPendingIndexDropsToDepth(depth int) {
+	keep := s.pendingIndexDrops[:0]
+	for _, e := range s.pendingIndexDrops {
+		if e.SavepointDepth < depth {
+			keep = append(keep, e)
+		}
+	}
+	s.pendingIndexDrops = keep
 }
 
 // MarkTableActive marks a table OID as currently being mutated by a DML

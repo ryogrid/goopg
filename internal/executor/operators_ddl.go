@@ -4834,6 +4834,23 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		}
 	}
 
+	// Transactional-DDL visibility (M0118-0008, partition-drop-index-locking):
+	// a non-CONCURRENTLY DROP INDEX inside an explicit transaction defers the
+	// actual catalog/relfile/WAL removal until COMMIT. The AccessExclusiveLock
+	// taken by lockDropIndexTree below is already held to commit, so until the
+	// dropping transaction commits the index stays in the shared catalog and
+	// another session's `pg_locks JOIN pg_class` still observes its row and the
+	// dropper's lock — matching PG, which keeps the old catalog tuple visible to
+	// other snapshots until commit. In autocommit (no lock held, historical
+	// behaviour) the removal stays immediate. ApplyPendingIndexDrops performs
+	// the deferred removal; a ROLLBACK discards it via EndExplicitTransaction.
+	var deferSess *BasicSession
+	if !s.Concurrent && o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		if bs, ok := o.ctx.Session.(*BasicSession); ok {
+			deferSess = bs
+		}
+	}
+
 	flagInval := false
 	droppedOIDs := make([]uint32, 0, len(s.Names))
 	for _, name := range s.Names {
@@ -4873,6 +4890,19 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		dropOID := idx.OID
 		dropSchema := idx.Schema
 		dropName := idx.Name
+		// Explicit transaction: defer the real removal to COMMIT (see the
+		// transactional-DDL note above). M0118-0008.
+		if deferSess != nil {
+			deferSess.AddPendingIndexDrop(PendingIndexDrop{
+				Name:           name,
+				OID:            dropOID,
+				Schema:         dropSchema,
+				IdxName:        dropName,
+				Rel:            rel,
+				SavepointDepth: deferSess.SavepointDepth(),
+			})
+			continue
+		}
 		if err := o.ctx.Catalog.DropIndex(name); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
@@ -4925,6 +4955,57 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		}
 	}
 	return nil
+}
+
+// ApplyPendingIndexDrops performs the deferred catalog/relfile/WAL removal for
+// every DROP INDEX that execDropIndex deferred to COMMIT (see PendingIndexDrop).
+// It mirrors execDropIndex's immediate-removal path. Callers MUST invoke it from
+// the commit paths BEFORE TxnMgr.Commit so the drop's WAL precedes the commit
+// record and the pg_class xmax stamp uses the still-live transaction XID. A
+// ROLLBACK never calls this; EndExplicitTransaction discards the pending list.
+// M0118-0008.
+func ApplyPendingIndexDrops(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	drops := sess.TakePendingIndexDrops()
+	if len(drops) == 0 {
+		return
+	}
+	flagInval := false
+	droppedOIDs := make([]uint32, 0, len(drops))
+	for _, d := range drops {
+		if err := ctx.Catalog.DropIndex(d.Name); err != nil {
+			// Best-effort: the index may already be gone (e.g. a concurrent
+			// drop). Skip rather than abort an in-progress commit.
+			continue
+		}
+		flagInval = true
+		droppedOIDs = append(droppedOIDs, d.OID)
+		if ctx.Pool != nil {
+			ctx.Pool.InvalidateRel(d.Rel)
+			_ = ctx.Pool.Manager().DropRelation(d.Rel)
+			payload := wal.EncodeDropIndex(wal.DropIndexPayload{
+				OID:    d.OID,
+				Schema: d.Schema,
+				Name:   d.IdxName,
+			})
+			_, _ = ctx.Pool.LogChangeRecord(payload)
+		}
+	}
+	if flagInval && ctx.TxnMgr != nil {
+		ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+	if catalogHeapSyncAvailable(ctx) {
+		if err := ctx.MaterializeWriterXID(); err == nil {
+			xmax := ctx.Tx.XID
+			for _, dbOid := range catalogDBOids(ctx) {
+				for _, oid := range droppedOIDs {
+					deleteCatalogRowsForOID(ctx, dbOid, oid, xmax)
+				}
+			}
+		}
+	}
 }
 
 // lockDropIndexTree acquires the full set of AccessExclusiveLocks that

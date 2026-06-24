@@ -150,6 +150,13 @@ func (o *transactionOp) execCommit() error {
 		}
 		return ssiErr
 	}
+	// M0118-0008: apply DROP INDEX removals deferred to COMMIT (the index's
+	// pg_class row + lock were kept visible to other sessions until now). Must
+	// run BEFORE TxnMgr.Commit so the drop WAL precedes the commit record and
+	// the pg_class xmax stamp uses the still-live XID.
+	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
+		ApplyPendingIndexDrops(o.ctx, sess)
+	}
 	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
@@ -441,6 +448,9 @@ func (o *transactionOp) execRollbackTo() error {
 			}
 		}
 	}
+	// M0118-0008: discard DROP INDEX removals deferred inside the rolled-back
+	// savepoint so they are not applied at the outer COMMIT.
+	sess.CancelPendingIndexDropsToDepth(newDepth)
 	o.ctx.Tx.XID = newSubXid
 	return nil
 }

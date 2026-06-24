@@ -1730,6 +1730,12 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 							ssiFields...)
 					}
 				}
+				// M0118-0008: apply DROP INDEX removals deferred to COMMIT (the
+				// simple-query path bypasses execCommit). Must run BEFORE
+				// TxnMgr.Commit so the drop WAL precedes the commit record.
+				if sess := connTx.Session(); sess != nil {
+					executor.ApplyPendingIndexDrops(ctx, sess)
+				}
 				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
 					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
