@@ -3822,6 +3822,16 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 5},
 			// datistemplate: standard pg_database column; false for all live databases (M0097-0021).
 			{Name: "datistemplate", Type: Type{Name: "boolean"}, Ordinal: 6},
+			// datfrozenxid / datminmxid: standard pg_database wraparound-horizon
+			// columns. goopg already computes the cluster-wide datfrozenxid
+			// candidate (DatFrozenXID = min(relfrozenxid) across user heaps,
+			// mirroring vac_update_datfrozenxid) but never exposed it through the
+			// catalog; surfacing it here lets monitoring queries such as
+			// `SELECT datname, age(datfrozenxid) FROM pg_database` and the
+			// intra-grant-inplace-db isolation spec's `SELECT datfrozenxid FROM
+			// pg_database` resolve the column instead of erroring 42703. M0117-0008.
+			{Name: "datfrozenxid", Type: Type{Name: "xid"}, Ordinal: 7},
+			{Name: "datminmxid", Type: Type{Name: "xid"}, Ordinal: 8},
 		},
 		OID:     1262, // upstream's DatabaseRelationId
 		Virtual: true,
@@ -3831,6 +3841,18 @@ func (c *InMemory) registerSystemTables() {
 		// of hard-coding a single `postgres` row. CREATE DATABASE
 		// adds entries; the recovery driver replays them.
 		names := c.ListDatabases()
+		// datfrozenxid: the cluster-wide candidate (min relfrozenxid across user
+		// heaps). When no user heap has been frozen yet DatFrozenXID returns
+		// InvalidTransactionID(0); report the bootstrap FrozenTransactionID(2)
+		// instead so the column never shows a non-existent XID 0 (mirrors PG's
+		// fresh-database datfrozenxid). datminmxid is the FirstMultiXactId(1)
+		// bootstrap value — goopg never advances a per-database multixact freeze
+		// horizon, so 1 is the accurate floor.
+		datFrozen := c.DatFrozenXID()
+		if datFrozen == storage.InvalidTransactionID {
+			datFrozen = storage.FrozenTransactionID
+		}
+		datFrozenStr := strconv.FormatUint(uint64(datFrozen), 10)
 		out := make([][]string, 0, len(names))
 		for _, n := range names {
 			// The bootstrap template databases carry their canonical PG
@@ -3855,6 +3877,8 @@ func (c *InMemory) registerSystemTables() {
 				datallowconn,  // datallowconn: allow connections
 				"0",           // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
 				datistemplate, // datistemplate: true for template0/template1
+				datFrozenStr,  // datfrozenxid: cluster-wide min(relfrozenxid), bootstrap floor 2
+				"1",           // datminmxid: FirstMultiXactId bootstrap floor
 			})
 		}
 		return out

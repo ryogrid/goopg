@@ -1144,3 +1144,17 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       untouched (horizons [dollar-quote lexer + EXPLAIN JSON], intra-grant-inplace
       [catalog-row lock on GRANT tuple xmax], stats [pg_stat_* infra],
       prepared-transactions [2PC]).
+      **2026-06-25 enabler (design 0118-0096, NOT a promotion):** `pg_database`
+      virtual catalog now projects the standard `datfrozenxid` (= `DatFrozenXID()`
+      cluster-wide min relfrozenxid, bootstrap floor 2) + `datminmxid`
+      (FirstMultiXactId 1) columns — clears `intra-grant-inplace-db`'s `snap3`
+      `SELECT datfrozenxid FROM pg_database` 42703 first-divergence and serves real
+      `age(datfrozenxid)` monitoring queries (M0117-0008 catalog-surface alignment).
+      `intra-grant-inplace-db` still deferred (ledger 2026-06-25): the hard blocker
+      is a runtime shared-catalog MVCC-tuple lock — `VACUUM (FREEZE)` must
+      `<waiting ...>` behind an uncommitted `GRANT … ON DATABASE` row update on
+      `global/1262`; same capability gates `intra-grant-inplace` on `pg_class`.
+      Also reconciled a stale inventory row this loop: `fk-deadlock.spec` (promoted
+      in c59eb91d / design 0118-0094) had its suite-level CSV flipped but not the
+      per-spec inventory — set failed→pass + regen (isolation tally now 106 pass /
+      15 failed).

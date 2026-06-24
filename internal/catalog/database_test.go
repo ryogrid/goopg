@@ -103,3 +103,40 @@ func TestPgDatabaseVirtualRowsEnumeratesRegistry(t *testing.T) {
 		t.Errorf("pg_database rows = %v, want both postgres and tpch", rows)
 	}
 }
+
+// TestPgDatabaseExposesFrozenXidColumns pins the M0117-0008 catalog-parity
+// addition: pg_database now projects datfrozenxid and datminmxid so monitoring
+// queries (`age(datfrozenxid)`) and the intra-grant-inplace-db isolation spec
+// resolve the columns. With no user heap frozen yet datfrozenxid reports the
+// bootstrap FrozenTransactionID(2); datminmxid is the FirstMultiXactId(1) floor.
+func TestPgDatabaseExposesFrozenXidColumns(t *testing.T) {
+	c := NewInMemory()
+	tbl, ok := c.tables["pg_catalog.pg_database"]
+	if !ok {
+		t.Fatalf("pg_database virtual table not registered")
+	}
+	colIdx := map[string]int{}
+	for i, col := range tbl.Columns {
+		colIdx[col.Name] = i
+	}
+	fi, ok := colIdx["datfrozenxid"]
+	if !ok {
+		t.Fatalf("pg_database missing datfrozenxid column; columns=%v", tbl.Columns)
+	}
+	mi, ok := colIdx["datminmxid"]
+	if !ok {
+		t.Fatalf("pg_database missing datminmxid column; columns=%v", tbl.Columns)
+	}
+	rows := tbl.VirtualRows()
+	if len(rows) == 0 {
+		t.Fatalf("pg_database returned no rows")
+	}
+	for _, r := range rows {
+		if r[fi] != "2" {
+			t.Errorf("datfrozenxid = %q for db %q, want bootstrap floor 2", r[fi], r[1])
+		}
+		if r[mi] != "1" {
+			t.Errorf("datminmxid = %q for db %q, want FirstMultiXactId 1", r[mi], r[1])
+		}
+	}
+}
