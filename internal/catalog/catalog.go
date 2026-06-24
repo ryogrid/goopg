@@ -979,6 +979,55 @@ func (c *InMemory) LookupToastRel(schema, name string) (oid uint32, isIndex bool
 	return parentOID + toastRelidOffset, false, true
 }
 
+// ToastParentTable maps a synthetic TOAST relation/index OID back to the user
+// table that owns it. REINDEX … CONCURRENTLY pg_toast.<name> routing uses it to
+// wait on the parent's relation lockers (the synthetic TOAST relation has no
+// heavyweight lock of its own — REINDEX CONCURRENTLY on a TOAST relation waits
+// for transactions touching the parent table, exactly like upstream, whose
+// toast reindex acquires its lock through the parent). Returns false when the
+// OID falls outside the synthetic TOAST ranges or the parent no longer owns an
+// auto-exposed TOAST relation. M0118-0008 TOAST-exposure slice 5 (design 0118-0088).
+func (c *InMemory) ToastParentTable(toastOID uint32) (*Table, bool) {
+	var parentOID uint32
+	switch {
+	case toastOID >= toastIndexOidOffset:
+		parentOID = toastOID - toastIndexOidOffset
+	case toastOID >= toastRelidOffset:
+		parentOID = toastOID - toastRelidOffset
+	default:
+		return nil, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	t, ok := c.tableByOID(parentOID)
+	if !ok || !tableHasToastRelation(t) {
+		return nil, false
+	}
+	return t, true
+}
+
+// ToastRelFileNode returns the heavyweight-lock RelFileNode of the synthetic
+// TOAST relation owned by the table at parentRel, when it has an auto-exposed
+// TOAST relation. The node carries the parent's DB/tablespace with the RelOid
+// replaced by the synthetic TOAST relation OID (parentOID + toastRelidOffset);
+// only DB+RelOid are significant in a lock tag. DML writes (acquireWriteLockTxn)
+// and DROP TABLE (dropTableByRef) register a lock on this node, so REINDEX …
+// CONCURRENTLY pg_toast.<name> can wait for transactions that toasted a value or
+// dropped the table — a bare LOCK TABLE on the parent never touches it, matching
+// PG, whose toast relation is locked only on a toast write or a drop, not on an
+// explicit parent LOCK TABLE. M0118-0008 TOAST-exposure slice 5 (design 0118-0088).
+func (c *InMemory) ToastRelFileNode(parentRel storage.RelFileNode) (storage.RelFileNode, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	t, ok := c.tableByOID(parentRel.RelOid)
+	if !ok || !tableHasToastRelation(t) {
+		return storage.RelFileNode{}, false
+	}
+	toast := parentRel
+	toast.RelOid = parentRel.RelOid + toastRelidOffset
+	return toast, true
+}
+
 // toastBearingTables returns every relation that owns an auto-exposed TOAST
 // relation, under the SAME visibility filter the pg_class virtual builder
 // applies to its main table loop (non-virtual ordinary tables plus

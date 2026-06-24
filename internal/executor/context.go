@@ -820,7 +820,24 @@ func (c *Context) acquireWriteLockTxn(rel storage.RelFileNode) error {
 	// the table level — only a DDL-grade lock (Share/ShareRowExclusive/
 	// Exclusive/AccessExclusive) does, matching PostgreSQL. M0118-0008
 	// (detach-partition-concurrently-3, autocommit INSERT behind FINALIZE).
-	return c.acquireRelLockMaybeTransient(rel, lockmgr.RowExclusiveLock)
+	if err := c.acquireRelLockMaybeTransient(rel, lockmgr.RowExclusiveLock); err != nil {
+		return err
+	}
+	// A write to a toast-bearing table also locks that table's TOAST relation
+	// (PG opens the toast rel with RowExclusiveLock when it stores a toasted
+	// value). goopg stores toast inline, but the lock is observable: REINDEX …
+	// CONCURRENTLY pg_toast.<name> waits for toast-relation lockers, so a
+	// concurrent DML write must register one — whereas a bare LOCK TABLE on the
+	// parent must not (it never touches the toast rel). M0118-0008
+	// (reindex-concurrently-toast, design 0118-0088).
+	if im, ok := c.Catalog.(*catalog.InMemory); ok {
+		if toastRel, has := im.ToastRelFileNode(rel); has {
+			if err := c.acquireRelLockMaybeTransient(toastRel, lockmgr.RowExclusiveLock); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // acquireDDLLockTxn takes a transaction-scoped heavyweight lock in the requested

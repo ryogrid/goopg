@@ -397,6 +397,27 @@ func TestPort_IsolationReindexConcurrently(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/reindex-concurrently.spec")
 }
 
+// TestPort_IsolationReindexConcurrentlyToast exercises the reindex-concurrently-toast
+// spec (M0118-0008) — the last unpromoted spec of the suite. The spec renames a
+// table's TOAST relation/index to deterministic names under allow_system_table_mods
+// (TOAST-exposure epic slices 1–4) and then runs REINDEX {TABLE,INDEX} CONCURRENTLY
+// pg_toast.<name> while a concurrent session holds the parent table locked. The
+// REINDEX waits for the parent's lockers (waitForRelationLockers) without blocking
+// concurrent DML, completes after the holder commits/rolls back, and errors
+// `relation "pg_toast.<name>" does not exist` when the holder dropped the parent —
+// byte-identical to PG 18.3 across all 60 permutations.
+//
+// PASS-REQUIRED (design 0118-0088): the synthetic TOAST relation/index resolves
+// through its parent (catalog.ToastParentTable + LookupToastRel) so the REINDEX
+// routes to the same CONCURRENTLY wait the non-toast reindex-concurrently spec uses.
+func TestPort_IsolationReindexConcurrentlyToast(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_reindex_conc_toast")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/reindex-concurrently-toast.spec")
+}
+
 func TestPort_IsolationReindexSchema(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_reindex_schema")

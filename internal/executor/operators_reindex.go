@@ -9,7 +9,9 @@ package executor
 import (
 	"fmt"
 	"sort"
+	"strings"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -48,6 +50,51 @@ func (o *reindexOp) Next() (TupleSlot, error) {
 	if dotIdx := indexOfDot(o.stmt.Name); dotIdx >= 0 {
 		name.Schema = o.stmt.Name[:dotIdx]
 		name.Name = o.stmt.Name[dotIdx+1:]
+	}
+
+	// REINDEX {TABLE,INDEX} CONCURRENTLY pg_toast.<name> targets a synthetic
+	// TOAST relation/index (exposed by the TOAST-exposure epic slices 1–4). It
+	// has no physical heap/btree to rebuild, but the spec exercises the
+	// CONCURRENTLY wait: REINDEX waits for every transaction holding the PARENT
+	// table locked to finish before swapping the rebuilt index, then — if the
+	// parent was dropped while it waited — errors that the TOAST relation no
+	// longer exists (PG resolves the toast relation through its parent). Route
+	// both object types here so the synthetic TOAST name resolves before the
+	// real-relation lookups below (which would only see numeric pg_toast names).
+	// M0118-0008 (reindex-concurrently-toast, design 0118-0088).
+	if im, isMem := o.ctx.Catalog.(*catalog.InMemory); isMem && strings.EqualFold(name.Schema, "pg_toast") {
+		toastOID, _, ok := im.LookupToastRel(name.Schema, name.Name)
+		if !ok {
+			return nil, &ExecError{
+				Code:    "42P01",
+				Message: fmt.Sprintf("relation %q does not exist", o.stmt.Name),
+			}
+		}
+		if o.stmt.Concurrently {
+			// Wait for lockers of the TOAST relation (parentOID + offset), not
+			// the parent table: REINDEX CONCURRENTLY on a toast relation/index
+			// waits for transactions that toasted a value or dropped the table
+			// (which lock the toast rel), not for a bare LOCK TABLE on the parent
+			// (which doesn't). Both REINDEX TABLE and REINDEX INDEX on a toast
+			// object resolve to the same toast relation's lockers.
+			if parent, pok := im.ToastParentTable(toastOID); pok {
+				if toastRel, has := im.ToastRelFileNode(im.RelFileNode(parent)); has {
+					if err := o.ctx.waitForRelationLockers(toastRel); err != nil {
+						return nil, err
+					}
+				}
+			}
+			// The wait above returned once the locking transaction ended; if it
+			// dropped the parent table the synthetic TOAST relation is gone too.
+			if _, _, stillOK := im.LookupToastRel(name.Schema, name.Name); !stillOK {
+				return nil, &ExecError{
+					Code:    "42P01",
+					Message: fmt.Sprintf("relation %q does not exist", o.stmt.Name),
+				}
+			}
+		}
+		// Physical reindex of the synthetic TOAST object is a no-op in v0.
+		return nil, EOF
 	}
 
 	switch o.stmt.ObjectType {

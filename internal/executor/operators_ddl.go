@@ -4448,6 +4448,22 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table, allow
 		}
 		return err
 	}
+	// DROP also AccessExclusive-locks the table's TOAST relation, mirroring PG
+	// (performDeletion drops the toast rel under the same lock). The lock is
+	// observable to REINDEX … CONCURRENTLY pg_toast.<name>, which waits for
+	// toast-relation lockers, so an in-progress concurrent reindex blocks until
+	// this DROP's transaction commits or rolls back. M0118-0008
+	// (reindex-concurrently-toast, design 0118-0088).
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		if toastRel, has := im.ToastRelFileNode(o.ctx.Catalog.RelFileNode(tbl)); has {
+			if err := o.ctx.acquireDDLLockTxn(toastRel, lockmgr.AccessExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = name.Pos()
+				}
+				return err
+			}
+		}
+	}
 	if allowDefer {
 		if bsess, ok := o.ctx.Session.(*BasicSession); ok && bsess.InExplicitTransaction() {
 			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 &&
