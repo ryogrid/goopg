@@ -1442,7 +1442,7 @@ func TestPort_IsolationDeleteAbortSavept(t *testing.T) {
 	c := newCluster(t, "iso_delete_abort_savept")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept.spec")
 }
 
 // TestPort_IsolationDeleteAbortSavept2 is the funkier delete-abort-savept
@@ -1454,7 +1454,7 @@ func TestPort_IsolationDeleteAbortSavept2(t *testing.T) {
 	c := newCluster(t, "iso_delete_abort_savept2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept-2.spec")
 }
 
 // TestPort_IsolationAbortedKeyrevoke exercises the aborted-keyrevoke spec: s1
@@ -1468,7 +1468,7 @@ func TestPort_IsolationAbortedKeyrevoke(t *testing.T) {
 	c := newCluster(t, "iso_aborted_keyrevoke")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/aborted-keyrevoke.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/aborted-keyrevoke.spec")
 }
 
 // TestPort_IsolationMultixactNoForget exercises the multixact-no-forget spec: s1
