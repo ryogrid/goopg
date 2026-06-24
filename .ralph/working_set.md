@@ -1,37 +1,43 @@
 (idle — nothing in flight)
 
-Loop #36 COMPLETE + committed: M0118-0009 `intra-grant-inplace-db.spec` PROMOTED
-`failed`→`pass` (single permutation byte-identical, strict
-TestPort_IsolationIntraGrantInplaceDb). Design 0118-0098.
+Loop #37 COMPLETE: M0118-0009 `predicate-hash.spec` PROMOTED `failed`→`pass`
+(all 40 permutations byte-identical, strict TestPort_IsolationPredicateHash).
+Design 0118-0099.
 
-What landed: replays PG's pg_database-tuple-xmax serialization between an ACL
-change and a concurrent in-place datfrozenxid update, WITHOUT a real heap tuple:
-- internal/parser/{parser.go,ast.go}: GRANT/REVOKE no-op arm flags ON DATABASE →
-  CompatNoopStmt.DatabaseACL.
-- internal/catalog/catalog.go: InMemory.dbACLChangeXID (atomic.Uint32) +
-  Set/Get DatabaseACLChangeXID — the in-memory stand-in for the tuple xmax.
-- internal/executor/operators_ddl.go (execCompatNoop): DatabaseACL stmt
-  materializes the writer XID + records it as the ACL-change xmax.
-- internal/executor/operators_vacuum.go (vacuumOp.Next + waitForDatabaseACLChange):
-  a database-wide VACUUM (len(vs.Targets)==0) WaitForXIDs on the marker first.
-- docs/design/0118-0098 + README; CSV+coverage md regen; fix_plan + ledger.
+What landed — page (bucket) level predicate locking in a hash index:
+- catalog/catalog.go: new in-memory `Index.DeclaredHash` (Method stays "btree";
+  catalog/pg_am/pg_dump/WAL unchanged).
+- executor/operators_ddl.go (execCreateIndex): set DeclaredHash after the btree
+  build for `USING hash`.
+- executor/ssi.go: `ssiHashBucket` (FNV 31-bit bucket of encoded key);
+  `ssiRecordHashBucketRead` (PageLockTag(db,indexOID,bucket) SIREAD);
+  `ssiConflictOutTupleRead`/`ssiConflictOutOnWriters` (conflict-out only, no heap
+  SIREAD — avoids heap-page coarsening false positive); `ssiRecordHashIndexInsert`
+  (bucket conflict-in on INSERT path).
+- executor/operators_index.go + operators_indexonly.go: for a declared-hash
+  equality probe, take the bucket SIREAD instead of the relation-grain lock and
+  use conflict-out-only per-tuple reads.
+- executor/operators_storage.go: call ssiRecordHashIndexInsert after
+  ssiRecordTupleWrite in both INSERT paths.
+- docs/design/0118-0099 + README index; target-inventory CSV failed→pass + regen
+  upstream-isolation-coverage.md; fix_plan + tally.
 
-Gates: TestPort_IsolationIntraGrantInplaceDb strict PASS; sibling
-VacuumConflict/VacuumNoCleanupLock/ClusterConflict/TruncateConflict/CreateTrigger
-PASS (VacuumConcurrentDrop fails identically on clean HEAD = PRE-EXISTING timing
-flake on this WSL2 host, NOT a regression — it uses only targeted VACUUM/ANALYZE);
-parser/catalog units PASS; executor Vacuum|Grant|CompatNoop|Freeze units PASS;
-build+vet+gofmt clean. pgbench smoke = pre-commit hook.
+Root cause found via debug: `CREATE INDEX … USING hash` was silently rewritten
+to btree in the catalog (operators_ddl.go:4709), so the equality scan took a
+relation-grain SIREAD → over-aborted 30 vs PG's 18. DeclaredHash flag (not a
+catalog Method change) keeps blast radius off pg_am/dump/planner.
 
-Remaining M0118-0009 failed specs (4): intra-grant-inplace (pg_class sibling —
-same xmax-wait but for ALTER TABLE ADD PRIMARY KEY behind FOR KEY SHARE on
-pg_class), horizons (JSON `->` operator + EXPLAIN FORMAT json heap-fetch parity),
-stats (pg_stat_force_next_flush + cumulative-stats infra),
-prepared-transactions{,-cic} (2PC). Other M0118 remainders span
-M0118-0002/0004/0005/0007 (distinct unbuilt subsystems). Isolation tally 107
-pass / 14 failed.
+Gates: TestPort_IsolationPredicateHash strict PASS (18 failures matching PG, was
+30); 6 pass-required SSI specs + predicate-lock-hot-tuple/partial-index/
+simple-write-skew PASS no regression; executor/mvcc/planner/catalog units +
+`-race` SSI/predicate tests PASS; build+vet clean; gofmt only pre-existing
+M0111 misformat (version mismatch, untouched). pgbench smoke = pre-commit hook.
+State guard repaired→consistent.
 
-NEXT candidate: intra-grant-inplace (the pg_class sibling) likely reuses this
-loop's xmax-wait pattern — but the blocker is ALTER TABLE ADD PRIMARY KEY waiting
-behind a FOR KEY SHARE row lock on the pg_class tuple (relhasindex inplace
-update), a different lock shape. Probe-rank first.
+Isolation failed-spec count now 12 (was 13). Remaining M0118-0009 failed:
+intra-grant-inplace (pg_class row locks — heavy), horizons (JSON `->` + EXPLAIN
+json), stats (pg_stat infra), prepared-transactions{,-cic} (2PC).
+predicate-gin/gist still failed (AM-specific predicate-lock granularity).
+
+NEXT candidate: horizons likely cheapest front-end (JSON `->` operator parse +
+explain_json + EXPLAIN FORMAT json Heap Fetches) — probe-rank first.

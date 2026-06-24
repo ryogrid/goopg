@@ -66,6 +66,17 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		return err
 	}
 
+	// M0118-0009 (design 0118-0099): a hash index supports only equality, and PG
+	// takes a PAGE-grain predicate lock on the probed bucket (PredicateLockPage in
+	// hash.c) rather than a relation-grain lock — so a concurrent INSERT into a
+	// DIFFERENT bucket forms no rw-conflict (predicate-hash "reduced false
+	// positives"). For a hash index we therefore SKIP the relation-grain SIREAD
+	// here and instead take the bucket-grain lock once the probe key is encoded
+	// (below); the per-tuple heap reads also switch to conflict-out-only so they
+	// do not coarsen into a heap-page lock that would re-introduce the false
+	// positive. DeclaredHash marks an index created `USING hash` (Method stays
+	// "btree" since goopg builds it on the B-tree substrate).
+	isHashIdx := o.plan.Index != nil && o.plan.Index.DeclaredHash
 	// M0118-0001: a SERIALIZABLE index-only scan takes a relation-level SIREAD
 	// predicate lock on the heap relation, exactly like the seq-scan and
 	// (heap-fetching) index-scan paths. Acquired BEFORE the probe-bound lookups
@@ -74,7 +85,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	// probe a non-existent key first, then both INSERT it). Gated to
 	// SERIALIZABLE inside ssiRecordRelationRead; temp / matview relations are
 	// excluded as PredicateLockingNeededForRelation requires.
-	if o.plan.Table == nil || (!o.plan.Table.Temp && !o.plan.Table.IsMatView) {
+	if !isHashIdx && (o.plan.Table == nil || (!o.plan.Table.Temp && !o.plan.Table.IsMatView)) {
 		ssiRecordRelationRead(ctx, heapRel)
 	}
 
@@ -129,6 +140,14 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		}
 	}
 
+	// Hash-index equality probe: take the bucket-grain SIREAD on the index
+	// (design 0118-0099) in place of the relation-grain lock skipped above.
+	// loBytes is the encoded probe key (== hiBytes for the single-column
+	// equality a hash index supports). No-op outside SERIALIZABLE.
+	if isHashIdx && len(loBytes) > 0 {
+		ssiRecordHashBucketRead(ctx, heapRel.DBOid, o.plan.Index.OID, loBytes)
+	}
+
 	scanFn := func(key []byte, ptr storage.ItemPointer) (bool, error) {
 		// Fast path: ALL_VISIBLE → decode from key, zero heap reads.
 		if ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block) {
@@ -181,7 +200,15 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		// SIREAD already held (ssiRecordRelationRead above). The page RLock/pin is
 		// released above, so a non-nil error (reader closed a dangerous structure
 		// to an already-committed writer) propagates as a mid-statement 40001.
-		if serr := ssiRecordTupleRead(ctx, heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); serr != nil {
+		if isHashIdx {
+			// Hash bucket page lock already covers the phantom (above); a heap
+			// tuple SIREAD here would coarsen to a heap-page lock and re-introduce
+			// the different-bucket false positive. Keep conflict-out only so the
+			// write-before-read same-bucket edge still forms (design 0118-0099).
+			if serr := ssiConflictOutTupleRead(ctx, tuple.Header.Xmin, tuple.Header.Xmax); serr != nil {
+				return false, serr
+			}
+		} else if serr := ssiRecordTupleRead(ctx, heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); serr != nil {
 			return false, serr
 		}
 		row, err := o.decodeRowFromHeap(tuple)

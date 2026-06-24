@@ -2,6 +2,7 @@ package executor
 
 import (
 	"errors"
+	"hash/fnv"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -52,23 +53,103 @@ func ssiRecordTupleRead(ctx *Context, rel storage.RelFileNode, block storage.Blo
 	}
 	tag := mvcc.TupleLockTag(rel.DBOid, rel.RelOid, block, slot)
 	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
-	// Conflict-out against the inserter — handles the reader-after-write
-	// shape (reader observes a concurrent SERIALIZABLE writer's new
-	// tuple version directly).
+	return ssiConflictOutOnWriters(ctx, writerXmin, writerXmax)
+}
+
+// ssiConflictOutTupleRead records ONLY the read→writer conflict-out edges for a
+// tuple a SERIALIZABLE reader observed, WITHOUT acquiring a tuple-grain SIREAD
+// predicate lock. It is the variant used by hash index-only scans, whose
+// phantom coverage comes from a bucket-grain page lock on the INDEX
+// (ssiRecordHashBucketRead), not the heap. Acquiring per-tuple heap SIREAD
+// locks there would coarsen to a heap-page lock (max_pred_locks_per_page = 2)
+// and then spuriously conflict with a DIFFERENT-bucket INSERT that merely lands
+// on the same heap page — exactly the false positive predicate-hash checks for.
+// PG's index-only scan likewise takes no heap predicate lock; it relies on the
+// hash bucket page lock (predicate.c / hash.c PredicateLockPage). The conflict-
+// out walk is still required so the write-before-read ordering (reader observes
+// an in-flight same-bucket inserter's invisible row) closes the structure.
+func ssiConflictOutTupleRead(ctx *Context, writerXmin, writerXmax storage.TransactionID) error {
+	if !ssiActive(ctx) {
+		return nil
+	}
+	return ssiConflictOutOnWriters(ctx, writerXmin, writerXmax)
+}
+
+// ssiConflictOutOnWriters runs the reader→writer conflict-out checks shared by
+// ssiRecordTupleRead and ssiConflictOutTupleRead: against the inserter (xmin —
+// the reader-after-write shape) and, when distinct, the deleter/updater (xmax —
+// the M0104-0008 write-skew edge where the reader sees a row an in-flight
+// SERIALIZABLE peer has DELETEd/UPDATEd). The Manager filters InvalidXID /
+// Bootstrap / Frozen and elides the self-modify case.
+func ssiConflictOutOnWriters(ctx *Context, writerXmin, writerXmax storage.TransactionID) error {
 	if err := ctx.TxnMgr.CheckForSerializableConflictOutReportingFailure(ctx.Tx.Handle, writerXmin); err != nil {
 		return ssiReadAbortError(err)
 	}
-	// M0104-0008: conflict-out against the deleter/updater. When the
-	// reader's snapshot hides a concurrent SERIALIZABLE writer's NEWER
-	// version of this tuple, the visible OLD version still carries the
-	// concurrent writer's XID in its xmax slot. Reading it must install
-	// the reader→writer rw-edge so write-skew (e.g. simple-write-skew
-	// spec) closes the 2-cycle at pre-commit. The Manager filters
-	// InvalidXID / Bootstrap / Frozen and elides the self-modify case,
-	// so an unconditional second check is safe when xmax != xmin.
 	if writerXmax != writerXmin {
 		if err := ctx.TxnMgr.CheckForSerializableConflictOutReportingFailure(ctx.Tx.Handle, writerXmax); err != nil {
 			return ssiReadAbortError(err)
+		}
+	}
+	return nil
+}
+
+// ssiHashBucket maps an encoded index key to a stable pseudo-bucket page number,
+// emulating PG's hash-index bucket assignment for page-level predicate locking
+// (PredicateLockPage on the bucket's primary page in _hash_first /
+// _hash_doinsert). goopg stores every index physically as a B-tree (no hash
+// buckets), so the bucket is derived deterministically from the encoded key
+// bytes: equal keys always map to the same bucket; distinct keys collide only
+// with ~2^-31 probability. A collision merely re-introduces a false-positive
+// conflict (the safe over-abort direction), never a missed one. Masked to 31
+// bits so the result is never InvalidBlockNumber (0xFFFFFFFF), which
+// mvcc.PageLockTag rejects.
+func ssiHashBucket(key []byte) storage.BlockNumber {
+	h := fnv.New32a()
+	_, _ = h.Write(key)
+	return storage.BlockNumber(h.Sum32() & 0x7FFFFFFF)
+}
+
+// ssiRecordHashBucketRead acquires a bucket-grain (page) SIREAD predicate lock
+// on a hash index for a SERIALIZABLE equality scan, keyed by the index OID and
+// the pseudo-bucket of the probe key. This is the phantom mechanism for hash
+// indexes: a later SERIALIZABLE INSERT of a row whose indexed value hashes to
+// the same bucket (ssiRecordHashIndexInsert) finds this reader via the
+// conflict-in walk and forms the rw-edge, while an INSERT into a DIFFERENT
+// bucket does not — reproducing PG's reduced false positives (predicate-hash
+// spec, "page level predicate locking in hash index"). The index OID is used as
+// the predicate-lock relation so these page tags never collide with the heap
+// relation's tuple/page locks.
+func ssiRecordHashBucketRead(ctx *Context, dbOid, indexOID uint32, key []byte) {
+	if !ssiActive(ctx) || indexOID == 0 || len(key) == 0 {
+		return
+	}
+	tag := mvcc.PageLockTag(dbOid, indexOID, ssiHashBucket(key))
+	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
+}
+
+// ssiRecordHashIndexInsert is the SERIALIZABLE write-path hook for INSERTs into
+// a table carrying one or more hash indexes. For each hash index it computes the
+// inserted row's bucket page tag (matching ssiRecordHashBucketRead's keying via
+// the shared encodeBTreeKeyForColumn encoder used by encodeIndexKeyFromCols) and
+// runs the conflict-in walk, installing an rw-edge from every SERIALIZABLE
+// reader holding that bucket's SIREAD — and aborting this INSERT in place
+// (40001) when it closes a dangerous structure to an already-committed pivot,
+// exactly like ssiRecordTupleWrite. No-op for non-hash tables / RC / RR.
+func ssiRecordHashIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, dbOid uint32) error {
+	if !ssiActive(ctx) || tbl == nil {
+		return nil
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if !idx.DeclaredHash {
+			continue
+		}
+		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
+		if err != nil || len(key) == 0 {
+			continue
+		}
+		tag := mvcc.PageLockTag(dbOid, idx.OID, ssiHashBucket(key))
+		if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); cerr != nil {
+			return ssiReadAbortError(cerr)
 		}
 	}
 	return nil

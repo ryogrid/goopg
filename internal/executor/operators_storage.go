@@ -1545,6 +1545,12 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
 				return nil, serr
 			}
+			// SSI hash-index bucket conflict-in (design 0118-0099): forms the
+			// rw-edge against a SERIALIZABLE reader holding the inserted value's
+			// bucket SIREAD on a hash index.
+			if serr := ssiRecordHashIndexInsert(o.ctx, partTable, partTable.Columns, partRow, targetRel.DBOid); serr != nil {
+				return nil, serr
+			}
 			maintainUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, ptr)
 			o.appendInsertRetRow(row)
 			o.rowsAffected++
@@ -1574,6 +1580,12 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// M0104-0007 / M0118-0001: SSI write-path hook for the non-partitioned
 		// insert path; aborts in place (40001) on a committed-pivot structure.
 		if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
+			return nil, serr
+		}
+		// SSI hash-index bucket conflict-in (design 0118-0099): forms the rw-edge
+		// against a SERIALIZABLE reader holding the inserted value's bucket SIREAD
+		// on a hash index.
+		if serr := ssiRecordHashIndexInsert(o.ctx, o.plan.Table, cols, row, targetRel.DBOid); serr != nil {
 			return nil, serr
 		}
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)

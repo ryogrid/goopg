@@ -4706,6 +4706,12 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 				Message: fmt.Sprintf("access method \"%s\" does not support included columns", method)}
 		}
 	}
+	// goopg has no native hash access method: a hash index is built on the
+	// B-tree substrate. The catalog Method stays "btree" (pg_am / pg_dump
+	// unchanged), but remember the declared method so a SERIALIZABLE equality
+	// scan takes a bucket-grain SIREAD predicate lock (design 0118-0099); the
+	// flag is applied to the created index below.
+	declaredHash := method == "hash"
 	if method == "hash" {
 		method = "btree"
 	}
@@ -4784,6 +4790,15 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	}
 	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, resolvedPred); err != nil {
 		return err
+	}
+	if declaredHash {
+		// Record the declared hash access method on the freshly built index so a
+		// SERIALIZABLE equality scan uses bucket-grain predicate locking (design
+		// 0118-0099). Catalog Method stays "btree"; this flag is consulted only by
+		// the SSI scan/insert hooks.
+		if hidx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			hidx.DeclaredHash = true
+		}
 	}
 	// Store INCLUDE columns, partial index flag, predicate expression, and the
 	// per-column ASC/DESC + NULLS ordering. The ordering is recorded only when

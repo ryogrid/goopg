@@ -1188,7 +1188,30 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (`VacuumConcurrentDrop` fails identically on clean HEAD — pre-existing timing
       flake, unrelated); parser/catalog/executor units; build+vet+gofmt clean;
       pgbench smoke = pre-commit hook. Isolation tally now 107 pass / 14 failed.
+      **2026-06-25 promotion (design 0118-0099): `predicate-hash` PROMOTED ⇒
+      all 40 permutations byte-identical.** Page (bucket) level predicate locking
+      in a hash index. goopg has no native hash AM (hash index built on the
+      B-tree substrate, `Method` stays btree), so a SERIALIZABLE equality scan
+      took a relation-grain SIREAD → over-aborted (30 vs PG's 18 serialization
+      failures, the 12 different-bucket interleavings). New in-memory
+      `catalog.Index.DeclaredHash` marks `USING hash`; `ssiHashBucket` →
+      stable 31-bit FNV bucket of the encoded equality key;
+      `ssiRecordHashBucketRead` takes a `PageLockTag(db,indexOID,bucket)` SIREAD
+      on the index/index-only scan in place of the relation lock; per-tuple heap
+      reads switch to `ssiConflictOutTupleRead` (conflict-out only — no heap
+      SIREAD that would coarsen to a heap-page lock and re-introduce the false
+      positive); `ssiRecordHashIndexInsert` runs the bucket conflict-in on the
+      INSERT path. Blast radius bounded to SERIALIZABLE equality scans/INSERTs on
+      declared-hash indexes; the 6 pass-required btree/seqscan SSI specs +
+      predicate-lock-hot-tuple/partial-index/simple-write-skew PASS no
+      regression; executor/mvcc/planner/catalog units + `-race` SSI tests;
+      build+vet clean; pgbench smoke = pre-commit hook. Isolation failed-spec
+      count now 12 (was 13). Follow-ups: `predicate-gin`/`predicate-gist` need
+      AM-specific granularity; `DeclaredHash` not WAL-persisted (reverts to
+      relation-grain after restart); UPDATE/DELETE on a hash column not yet
+      bucket-locked.
       **Remaining M0118-0009:** `intra-grant-inplace` (pg_class sibling — ALTER
-      TABLE ADD PRIMARY KEY `<waiting>` behind FOR KEY SHARE on pg_class), `horizons`
+      TABLE ADD PRIMARY KEY `<waiting>` behind FOR KEY SHARE on pg_class; needs
+      runtime shared-catalog MVCC-tuple row locks — heavy), `horizons`
       (JSON `->` + EXPLAIN FORMAT json), `stats` (pg_stat_force_next_flush),
       `prepared-transactions{,-cic}` (2PC).

@@ -1159,6 +1159,25 @@ func TestPort_IsolationPredicateLockHotTuple(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/predicate-lock-hot-tuple.spec")
 }
 
+// TestPort_IsolationPredicateHash exercises predicate-hash: PAGE (bucket) level
+// predicate locking in a hash index. Two SERIALIZABLE transactions each probe a
+// hash-indexed column by equality and INSERT rows. A scan and an insert that
+// touch the SAME bucket form an rw-conflict (so an overlapping interleaving
+// aborts the loser with 40001), while a scan and an insert that touch DIFFERENT
+// buckets must NOT conflict — the reduced-false-positive half of the test.
+// Promoted to pass-required (M0118-0009, design 0118-0099): a declared-hash
+// index now drives a bucket-grain SIREAD predicate lock (ssiRecordHashBucketRead
+// / ssiRecordHashIndexInsert) instead of a seq scan's relation-grain lock, so
+// goopg matches PG 18.3 byte-for-byte across all 40 permutations (previously
+// over-aborted the 12 different-bucket interleavings).
+func TestPort_IsolationPredicateHash(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_predicate_hash")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/predicate-hash.spec")
+}
+
 // TestPort_IsolationPartialIndex exercises partial-index: an UPDATE that moves a
 // row out of a partial index (CREATE INDEX ... WHERE val2 = 1) under SERIALIZABLE
 // must still create the read/write dependency a full-table read would, so any

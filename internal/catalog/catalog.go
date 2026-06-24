@@ -1271,6 +1271,16 @@ type Index struct {
 	Method  string
 	Primary bool
 	OID     uint32
+	// DeclaredHash records that the index was created `USING hash`. goopg has no
+	// native hash access method — a hash index is built on the B-tree substrate,
+	// so Method stays "btree" (catalog/pg_am/pg_dump unchanged) — but a
+	// SERIALIZABLE equality scan must take a bucket-grain (page) SIREAD predicate
+	// lock on it rather than a relation-grain lock, to reproduce PG's reduced
+	// false positives (predicate-hash spec; design 0118-0099). In-memory only:
+	// not persisted to the index-DDL WAL record, so it resets to false after a
+	// restart (a hash index then reverts to relation-grain SSI locking — a known
+	// follow-up, no durability regression over the prior hash→btree rewrite).
+	DeclaredHash bool
 	// ColExprs holds the parsed expression AST for expression-based index
 	// columns (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil
 	// when Columns[i] == "" (expression column); nil for plain column names.
