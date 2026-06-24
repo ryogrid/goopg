@@ -364,6 +364,14 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		return s.cancelReg.cancelByPID(uint32(pid))
 	}
+	// pg_notify(channel, payload) buffers into the connection's transaction so it
+	// publishes to LISTENers at commit, exactly like the NOTIFY statement.
+	// M0118-0009 (async-notify).
+	if connTx != nil {
+		ectx.QueueNotify = func(channel, payload string) {
+			connTx.bufferNotify(channel, payload, connTx.BackendPID)
+		}
+	}
 	if connTx != nil {
 		ectx.ProcNum = connTx.ProcNum
 	}
@@ -747,7 +755,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// plan, cache, then execute.
 		var precached planner.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 			cacheKey = normalizeCompatSQL(sql)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -827,6 +835,16 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		commit = true
 		maybeForceGCAfterCommit()
+		// NOTIFY becomes visible to listeners at the notifying transaction's
+		// commit; publish the buffer accumulated by this autocommit batch.
+		// M0118-0009.
+		s.publishPendingNotify(connTx)
+	}
+	// Deliver any notifications queued for this session (by this transaction's
+	// own NOTIFY and/or other backends) at the command boundary, before
+	// ReadyForQuery. M0118-0009 (async-notify).
+	if err := s.deliverNotifications(w, connTx); err != nil {
+		return err
 	}
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
@@ -1605,6 +1623,13 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
 // cachedNode, when non-nil, is a pre-validated plan from the cross-session
 // plan cache — planner.Plan is skipped. M0098-0005.
 func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Context, stmt parser.Stmt, connTx *connTxState, autoCommitPtr *bool, cachedNode ...planner.Node) error {
+	// LISTEN / NOTIFY / UNLISTEN are handled at the server layer: the
+	// notification hub is cross-session server state, not an executor operator,
+	// and NOTIFY buffers until the transaction commits. Handle before planning
+	// (the planner has no node for them). M0118-0009 (async-notify).
+	if handled, err := s.execNotifyStmt(w, stmt, connTx); handled {
+		return err
+	}
 	var node planner.Node
 	if len(cachedNode) > 0 && cachedNode[0] != nil {
 		node = cachedNode[0]
@@ -1784,6 +1809,11 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				if sess := connTx.Session(); sess != nil {
 					sess.TakePendingRoutineDrops()
 				}
+				// Publish NOTIFYs buffered by this explicit transaction now that it
+				// has committed — BEFORE connTx.End() discards the buffer. Delivery
+				// to this session happens at the trailing ReadyForQuery via
+				// deliverNotifications. M0118-0009 (async-notify).
+				s.publishPendingNotify(connTx)
 				connTx.End()
 				if ctx.EndLocalTransaction != nil {
 					ctx.EndLocalTransaction()

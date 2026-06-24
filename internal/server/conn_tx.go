@@ -25,6 +25,7 @@ import (
 	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
@@ -118,6 +119,46 @@ type connTxState struct {
 	// executor.ReleaseTableLocks) on COMMIT/ROLLBACK. Assigned once at
 	// connection start in runPostStartupLoop. M0118-0003 (lock-nowait).
 	LockBackendID lockmgr.BackendID
+	// BackendPID is this connection's backend PID (the value in BackendKeyData /
+	// pg_backend_pid). Stamped once at connection start; used as the source PID
+	// of NOTIFY deliveries (the int32 of the 'A' NotificationResponse).
+	// M0118-0009 (async-notify).
+	BackendPID uint32
+	// NotifySession is the stable per-connection identity used as the
+	// LISTEN/NOTIFY hub key (same SessionRegistry as AdvisoryID, typed for
+	// direct hub calls). M0118-0009.
+	NotifySession *config.SessionRegistry
+	// pendingNotify buffers NOTIFY messages emitted by the current transaction.
+	// PostgreSQL makes notifications visible only when the notifying transaction
+	// commits, so they are published to the hub at COMMIT and discarded at
+	// ROLLBACK. Deduplicated by (channel,payload) the way async.c collapses
+	// duplicate same-transaction notifications. M0118-0009.
+	pendingNotify []Notification
+}
+
+// bufferNotify queues one NOTIFY for publication at the current transaction's
+// commit, collapsing an exact (channel,payload) duplicate already buffered by
+// this transaction (PostgreSQL's async.c de-duplicates identical notifications
+// emitted within one transaction). M0118-0009.
+func (c *connTxState) bufferNotify(channel, payload string, srcPID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, n := range c.pendingNotify {
+		if n.Channel == channel && n.Payload == payload {
+			return
+		}
+	}
+	c.pendingNotify = append(c.pendingNotify, Notification{PID: srcPID, Channel: channel, Payload: payload})
+}
+
+// takePendingNotify returns and clears the buffered notifications (called at
+// COMMIT to publish them, and discards them otherwise). M0118-0009.
+func (c *connTxState) takePendingNotify() []Notification {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := c.pendingNotify
+	c.pendingNotify = nil
+	return out
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr
@@ -256,6 +297,11 @@ func (c *connTxState) End() {
 	c.PendingEnumRenames = nil
 	c.PendingCreatedEnums = nil
 	c.PendingCreatedComposites = nil
+	// Discard any NOTIFYs not yet published. On COMMIT the publish happens
+	// before End() is called; reaching here with a non-empty buffer means
+	// ROLLBACK (or commit-cleanup after publish), where the notifications must
+	// not be delivered. M0118-0009.
+	c.pendingNotify = nil
 	c.mu.Unlock()
 }
 

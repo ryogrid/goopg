@@ -1,21 +1,32 @@
-(idle — nothing in flight)
+Loop #26: **M0118-0009 async-notify — engine-side LISTEN/NOTIFY subsystem LANDED**
+(design 0118-0089). Probed all remaining M0118-0009 specs; each is a distinct
+multi-loop subsystem. Chose async-notify (additive, bounded blast radius — no
+MVCC/storage/WAL). Built the complete engine side:
+- Parser: ListenStmt/NotifyStmt/UnlistenStmt (ident-led) + grammar test.
+- protocol: 'A' MsgNotificationResponse + WriteNotificationResponse.
+- server/notify.go: notifyHub (mutex; listeners[ch]→set<session>, per-session
+  pending inbox keyed by *config.SessionRegistry). conn_tx.go: pendingNotify
+  buffer (de-dup), published at COMMIT (autocommit batch end + explicit COMMIT),
+  discarded on ROLLBACK/End(). dispatch.go: execNotifyStmt + publishPendingNotify
+  + deliverNotifications (drain before ReadyForQuery). server.go: hub init +
+  BackendPID/NotifySession + RemoveSession on teardown.
+- executor: Context.QueueNotify + pg_notify() builtin (expr.go).
+Verified: TestParseListenNotifyUnlisten (6), TestNotifyHub,
+TestConnTxBufferNotifyDedup all PASS; -race server clean; build/vet clean;
+async-notify.spec wire probe now executes EVERY statement PG-identically (was
+syntax-error on first NOTIFY). gofmt: protocol.go/messages.go fail at HEAD too
+(pre-existing go1.25/1.26 mismatch) — NOT touched.
 
-Loop #25: **M0118-0009 partial reconciliation** (no engine change). Resolved the
-documented-PASS-but-CSV-lagging drift flagged by loop #24's working_set: the
-savepoint/abort row-lock-restore family — `delete-abort-savept`,
-`delete-abort-savept-2`, `aborted-keyrevoke` — were all green (designs
-0118-0013/0014/0015) but two CSV rows were still `failed` and all three tests used
-soft `runIsoSpec`. Promoted the three `TestPort_Isolation{DeleteAbortSavept,
-DeleteAbortSavept2,AbortedKeyrevoke}` to `runIsoSpecStrict`, flipped the two
-lagging rows `failed`→`pass` in `postgres-oracle-target-inventory.csv` (rationale =
-test func name), regenerated `upstream-isolation-coverage.md` +
-`postgres-oracle-target-inventory.md`. Isolation tally 101→103 pass / 20→18 failed.
-Verified all three strict PASS (10.2 s). fix_plan NOT edited (driver-churn rule).
+**Next step (to PROMOTE async-notify.spec, deferred — ledger 2026-06-24):**
+harness-only now. Enhance internal/testport/framework/IsolationRunner: wrap each
+session connector with pq.ConnectorWithNotificationHandler (fires synchronously
+during query-response reads → matches goopg's command-boundary delivery), record
+per-session notifications WITH source PID, map srcPID→session-name, emit
+isolationtester lines `<recv>: NOTIFY "<ch>" with payload "<p>" from <src>` with
+byte-exact placement; then runIsoSpecStrict + flip CSV/inventory row.
 
-Remaining M0118-0009 specs (each a distinct unbuilt subsystem): async-notify
-(LISTEN/NOTIFY), horizons (dollar-quote lexer + EXPLAIN JSON), intra-grant-inplace
-{,-db} (catalog-row lock on GRANT tuple xmax), stats (pg_stat_* infra),
-temp-schema-cleanup (pg_my_temp_schema + temp cleanup), prepared-transactions{,-cic}
-(2PC). Other open milestones: M0118-0002 (predicate-locks: GIN/GiST/hash AMs),
-M0118-0004 (deadlock-parallel: lock-group abstraction), M0118-0005 (fk-deadlock,
-ri-trigger, fk-partitioned-1/2), M0118-0007 (eval-plan-qual: EPQ-over-join).
+Other M0118-0009 specs still untouched (each a subsystem): horizons (EXPLAIN
+FORMAT json ANALYZE + json `->` ops + IOS pruning), intra-grant-inplace
+(GRANT catalog-tuple-xmax lock-wait), temp-schema-cleanup (pg_my_temp_schema +
+per-session temp namespace OID model), stats (pg_stat_force_next_flush + cumulative
+counters), prepared-transactions{,-cic} (2PC). Other open: M0118-0002/0004/0005/0007.

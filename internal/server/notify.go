@@ -1,0 +1,220 @@
+package server
+
+import (
+	"sync"
+
+	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/parser"
+	"github.com/goopg/goopg/internal/protocol"
+)
+
+// notifyHub is the server-wide LISTEN/NOTIFY exchange (M0118-0009, async-notify).
+//
+// PostgreSQL implements asynchronous notifications in src/backend/commands/
+// async.c: a backend registers interest with LISTEN, NOTIFY queues entries that
+// become visible to listeners only when the notifying transaction COMMITs, and
+// each listening backend is delivered the pending entries at a command boundary
+// (ProcessCompletedNotifies, fired before ReadyForQuery / when idle). goopg
+// multiplexes every connection in one OS process, so the "queue" is an in-memory
+// per-session inbox guarded by a single mutex rather than the SLRU-backed shared
+// queue PostgreSQL uses across processes.
+//
+// Sessions are identified by their stable *config.SessionRegistry — the same
+// per-connection identity used as the advisory-lock owner — so registrations and
+// pending deliveries survive across the per-statement executor contexts.
+type notifyHub struct {
+	mu sync.Mutex
+	// listeners[channel] is the set of sessions LISTENing on that channel.
+	listeners map[string]map[*config.SessionRegistry]struct{}
+	// pending[session] is the FIFO of notifications delivered to but not yet
+	// drained by that session.
+	pending map[*config.SessionRegistry][]Notification
+}
+
+// Notification is one delivered LISTEN/NOTIFY message. PID is the backend PID of
+// the notifying session (rendered as the int32 of the 'A' NotificationResponse
+// and joined to pg_stat_activity by clients).
+type Notification struct {
+	PID     uint32
+	Channel string
+	Payload string
+}
+
+func newNotifyHub() *notifyHub {
+	return &notifyHub{
+		listeners: make(map[string]map[*config.SessionRegistry]struct{}),
+		pending:   make(map[*config.SessionRegistry][]Notification),
+	}
+}
+
+// Listen registers sess's interest in channel. Idempotent: a second LISTEN on an
+// already-listened channel is a no-op, matching PostgreSQL.
+func (h *notifyHub) Listen(sess *config.SessionRegistry, channel string) {
+	if sess == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	set := h.listeners[channel]
+	if set == nil {
+		set = make(map[*config.SessionRegistry]struct{})
+		h.listeners[channel] = set
+	}
+	set[sess] = struct{}{}
+}
+
+// Unlisten removes sess's registration for channel (no-op if absent).
+func (h *notifyHub) Unlisten(sess *config.SessionRegistry, channel string) {
+	if sess == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if set := h.listeners[channel]; set != nil {
+		delete(set, sess)
+		if len(set) == 0 {
+			delete(h.listeners, channel)
+		}
+	}
+}
+
+// UnlistenAll removes every channel registration for sess (UNLISTEN *).
+func (h *notifyHub) UnlistenAll(sess *config.SessionRegistry) {
+	if sess == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch, set := range h.listeners {
+		delete(set, sess)
+		if len(set) == 0 {
+			delete(h.listeners, ch)
+		}
+	}
+}
+
+// Notify enqueues a notification on channel to every currently-LISTENing
+// session, including the notifying session itself when it listens on the
+// channel (PostgreSQL delivers self-notifications). PostgreSQL also collapses
+// duplicate (channel, payload) notifications emitted by the same transaction;
+// goopg performs that de-duplication per publish batch at the call site
+// (connTxState.pendingNotify), so Notify itself delivers exactly what it is
+// given.
+func (h *notifyHub) Notify(channel, payload string, srcPID uint32) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	set := h.listeners[channel]
+	if len(set) == 0 {
+		return
+	}
+	n := Notification{PID: srcPID, Channel: channel, Payload: payload}
+	for sess := range set {
+		h.pending[sess] = append(h.pending[sess], n)
+	}
+}
+
+// DrainPending removes and returns sess's queued notifications in FIFO order.
+// Returns nil when none are pending (the common case, so callers can cheaply
+// skip writing any 'A' frames).
+func (h *notifyHub) DrainPending(sess *config.SessionRegistry) []Notification {
+	if sess == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	q := h.pending[sess]
+	if len(q) == 0 {
+		return nil
+	}
+	delete(h.pending, sess)
+	return q
+}
+
+// isNotifyStmt reports whether stmt is a LISTEN/NOTIFY/UNLISTEN statement,
+// which the dispatch layer routes through execNotifyStmt (and excludes from the
+// plan cache, since the planner has no node for them). M0118-0009.
+func isNotifyStmt(stmt parser.Stmt) bool {
+	switch stmt.(type) {
+	case *parser.ListenStmt, *parser.NotifyStmt, *parser.UnlistenStmt:
+		return true
+	}
+	return false
+}
+
+// execNotifyStmt handles LISTEN/NOTIFY/UNLISTEN at the server layer. Returns
+// handled=false for any other statement so the normal planner path runs. LISTEN
+// and UNLISTEN take effect immediately (PostgreSQL applies them at commit, but
+// in goopg's common autocommit case that is equivalent — transaction-scoped
+// LISTEN registration is a deferred refinement). NOTIFY buffers into connTx for
+// publication at commit. M0118-0009 (async-notify).
+func (s *Server) execNotifyStmt(w *protocol.FrameWriter, stmt parser.Stmt, connTx *connTxState) (bool, error) {
+	switch n := stmt.(type) {
+	case *parser.ListenStmt:
+		if connTx != nil {
+			s.notify.Listen(connTx.NotifySession, n.Channel)
+		}
+		return true, w.WriteCommandComplete("LISTEN")
+	case *parser.NotifyStmt:
+		if connTx != nil {
+			connTx.bufferNotify(n.Channel, n.Payload, connTx.BackendPID)
+		}
+		return true, w.WriteCommandComplete("NOTIFY")
+	case *parser.UnlistenStmt:
+		if connTx != nil {
+			if n.All {
+				s.notify.UnlistenAll(connTx.NotifySession)
+			} else {
+				s.notify.Unlisten(connTx.NotifySession, n.Channel)
+			}
+		}
+		return true, w.WriteCommandComplete("UNLISTEN")
+	}
+	return false, nil
+}
+
+// publishPendingNotify publishes the NOTIFYs buffered by the just-committed
+// transaction to the hub, making them visible to listeners. Called only after a
+// successful COMMIT (autocommit or explicit). M0118-0009.
+func (s *Server) publishPendingNotify(connTx *connTxState) {
+	if connTx == nil {
+		return
+	}
+	for _, n := range connTx.takePendingNotify() {
+		s.notify.Notify(n.Channel, n.Payload, n.PID)
+	}
+}
+
+// deliverNotifications drains this session's pending notifications and writes one
+// 'A' NotificationResponse per entry. Called at a command boundary, just before
+// ReadyForQuery — the point at which PostgreSQL delivers queued notifications to
+// an otherwise-idle backend. A no-op (no frames) when nothing is pending, which
+// is the common case. M0118-0009.
+func (s *Server) deliverNotifications(w *protocol.FrameWriter, connTx *connTxState) error {
+	if connTx == nil {
+		return nil
+	}
+	for _, n := range s.notify.DrainPending(connTx.NotifySession) {
+		if err := w.WriteNotificationResponse(n.PID, n.Channel, n.Payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RemoveSession drops all of sess's registrations and any undelivered pending
+// notifications. Called at connection teardown so a disconnected backend leaves
+// no entries behind (PostgreSQL frees the listen state at backend exit).
+func (h *notifyHub) RemoveSession(sess *config.SessionRegistry) {
+	if sess == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch, set := range h.listeners {
+		delete(set, sess)
+		if len(set) == 0 {
+			delete(h.listeners, ch)
+		}
+	}
+	delete(h.pending, sess)
+}

@@ -434,6 +434,13 @@ type Context struct {
 	// backends exist. M0118-0008 (detach-partition-concurrently-3/4 s1cancel).
 	CancelBackend func(pid int32) bool
 
+	// QueueNotify, when non-nil, buffers a notification (the engine behind the
+	// pg_notify(channel, payload) SQL function) into the connection's
+	// transaction so it is published to LISTENers at commit — exactly as the
+	// NOTIFY statement does. The server wires this to connTxState.bufferNotify;
+	// nil in unit/embedded contexts. M0118-0009 (async-notify).
+	QueueNotify func(channel, payload string)
+
 	// MergeAction holds the current MERGE action for MergeActionExpr evaluation
 	// in a MERGE RETURNING clause. Set by mergeOp.collectReturningRow. M0100-0007.
 	MergeAction planner.MergeActionKind

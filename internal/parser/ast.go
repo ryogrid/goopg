@@ -452,6 +452,43 @@ type DiscardStmt struct {
 func (s *DiscardStmt) Pos() int  { return s.pos }
 func (s *DiscardStmt) stmtNode() {}
 
+// ListenStmt is `LISTEN channel` — registers the current session's interest in
+// asynchronous notifications on Channel. The channel is an identifier (or
+// double-quoted name); it is matched case-foldingly the same way PostgreSQL
+// folds an unquoted identifier. M0118-0009 (async-notify).
+type ListenStmt struct {
+	pos     int
+	Channel string
+}
+
+func (s *ListenStmt) Pos() int  { return s.pos }
+func (s *ListenStmt) stmtNode() {}
+
+// NotifyStmt is `NOTIFY channel [, 'payload']` — queues a notification that is
+// delivered to every session LISTENing on Channel when the notifying
+// transaction commits. HasPayload distinguishes an explicit empty payload from
+// none (both deliver an empty payload string; tracked for fidelity). M0118-0009.
+type NotifyStmt struct {
+	pos        int
+	Channel    string
+	Payload    string
+	HasPayload bool
+}
+
+func (s *NotifyStmt) Pos() int  { return s.pos }
+func (s *NotifyStmt) stmtNode() {}
+
+// UnlistenStmt is `UNLISTEN channel` or `UNLISTEN *` — removes one (or all, when
+// All is true) of the current session's channel registrations. M0118-0009.
+type UnlistenStmt struct {
+	pos     int
+	Channel string
+	All     bool
+}
+
+func (s *UnlistenStmt) Pos() int  { return s.pos }
+func (s *UnlistenStmt) stmtNode() {}
+
 // ResTarget is one entry in a SELECT target list: `expr [AS alias]`.
 type ResTarget struct {
 	pos   int

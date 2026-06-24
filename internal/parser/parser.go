@@ -504,6 +504,12 @@ identLedStatement:
 			// LOCK [TABLE] [ONLY] rel [, ...] [IN lock_mode MODE] [NOWAIT].
 			// M0097: parse into LockTableStmt so the executor can track locks in pg_locks.
 			return p.parseLockTable(t.Pos)
+		case "listen":
+			return p.parseListen()
+		case "notify":
+			return p.parseNotify()
+		case "unlisten":
+			return p.parseUnlisten()
 		}
 	}
 	return nil, p.errAtCur("unsupported statement")
@@ -927,6 +933,63 @@ func (p *parser) parseSavepointName() (string, error) {
 	}
 	p.advance()
 	return t.Value, nil
+}
+
+// parseChannelName reads a LISTEN/NOTIFY/UNLISTEN channel identifier. An
+// unquoted identifier is matched case-folded (the lexer already lowercases
+// TokenIdent / TokenKeyword); a double-quoted identifier preserves case. This
+// mirrors PostgreSQL, which treats the channel as a regular identifier.
+func (p *parser) parseChannelName() (string, error) {
+	t := p.cur()
+	if t.Kind != TokenIdent && t.Kind != TokenKeyword && t.Kind != TokenQuotedIdent {
+		return "", p.errAtCur("expected channel name")
+	}
+	p.advance()
+	return t.Value, nil
+}
+
+// parseListen: LISTEN channel. M0118-0009 (async-notify).
+func (p *parser) parseListen() (Stmt, error) {
+	t := p.advance() // consume "listen"
+	ch, err := p.parseChannelName()
+	if err != nil {
+		return nil, err
+	}
+	return &ListenStmt{pos: t.Pos, Channel: ch}, nil
+}
+
+// parseNotify: NOTIFY channel [, 'payload']. M0118-0009 (async-notify).
+func (p *parser) parseNotify() (Stmt, error) {
+	t := p.advance() // consume "notify"
+	ch, err := p.parseChannelName()
+	if err != nil {
+		return nil, err
+	}
+	stmt := &NotifyStmt{pos: t.Pos, Channel: ch}
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+		p.advance() // consume ,
+		payload, perr := p.parseStrLit()
+		if perr != nil {
+			return nil, perr
+		}
+		stmt.Payload = payload
+		stmt.HasPayload = true
+	}
+	return stmt, nil
+}
+
+// parseUnlisten: UNLISTEN { channel | * }. M0118-0009 (async-notify).
+func (p *parser) parseUnlisten() (Stmt, error) {
+	t := p.advance() // consume "unlisten"
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+		p.advance()
+		return &UnlistenStmt{pos: t.Pos, All: true}, nil
+	}
+	ch, err := p.parseChannelName()
+	if err != nil {
+		return nil, err
+	}
+	return &UnlistenStmt{pos: t.Pos, Channel: ch}, nil
 }
 
 // parseVacuum: VACUUM [(opt [, opt …])] [target [, target …]]

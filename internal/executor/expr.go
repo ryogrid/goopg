@@ -5877,6 +5877,37 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewBoolDatum(ctx.CancelBackend(int32(pidArg.Int))), nil
 		}
 		return NewBoolDatum(false), nil
+	case "pg_notify":
+		// pg_notify(channel text, payload text) → void: the SQL-function form of
+		// the NOTIFY statement. Buffers a notification (delivered to LISTENers at
+		// the current transaction's commit) via ctx.QueueNotify, which the server
+		// wires to the connection's notify buffer. A NULL payload is treated as
+		// the empty payload (matching NOTIFY without a payload). A NULL/empty
+		// channel is a no-op here. Returns void (empty value). M0118-0009.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		chArg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		if chArg.IsNull() {
+			return NullDatum, nil
+		}
+		payload := ""
+		if len(x.Args) >= 2 {
+			pArg, perr := evalExpr(x.Args[1], row, ctx)
+			if perr != nil {
+				return NullDatum, perr
+			}
+			if !pArg.IsNull() {
+				payload = pArg.StringValue()
+			}
+		}
+		if ctx != nil && ctx.QueueNotify != nil {
+			ctx.QueueNotify(chArg.StringValue(), payload)
+		}
+		return NullDatum, nil
 	case "current_database":
 		return NewStringDatum("postgres"), nil
 	case "current_schema":

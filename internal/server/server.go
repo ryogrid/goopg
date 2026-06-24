@@ -323,6 +323,11 @@ type Server struct {
 	// auto-launcher (M0103-0002). nil when PubSub is unconfigured.
 	// Constructed in New, started in Run, drained on Run exit.
 	applyLauncher *ApplyLauncher
+
+	// notify is the cross-session LISTEN/NOTIFY hub (M0118-0009,
+	// async-notify). Always non-nil; channel registrations and queued
+	// notifications are keyed by each connection's stable SessionRegistry.
+	notify *notifyHub
 }
 
 // New constructs a Server but does not start listening. Use Run to start.
@@ -333,6 +338,7 @@ func New(cfg Config) *Server {
 		ready:     make(chan struct{}),
 		cancelReg: newCancelRegistry(),
 		roles:     map[string]struct{}{"postgres": {}},
+		notify:    newNotifyHub(),
 	}
 	s.nextPID.Store(0)
 	// Initialize plan cache when storage handles are present (M0098-0005).
@@ -1097,6 +1103,13 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 	// connTxState.End() at COMMIT/ROLLBACK (and on teardown via
 	// rollbackOpenTxnOnTeardown).
 	connTx.LockBackendID = lockmgr.BackendID(s.nextBackendID.Add(1))
+	// LISTEN/NOTIFY identity: the backend PID is the source of NOTIFY deliveries
+	// and the SessionRegistry is the hub key. On teardown drop every channel
+	// registration and undelivered notification for this session, mirroring
+	// PostgreSQL freeing the listen state at backend exit. M0118-0009.
+	connTx.BackendPID = pid
+	connTx.NotifySession = sess
+	defer s.notify.RemoveSession(sess)
 	// Map this connection's transaction-scoped lock identity to its backend PID
 	// so transaction-scoped relation locks (LOCK TABLE / DDL / scan-read ACCESS
 	// SHARE) held on the executor's tableLockMgr surface in pg_locks with a PID
