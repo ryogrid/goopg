@@ -805,6 +805,26 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       Gates: new `TestPlpgSQLSelectInto/sel_rec_field`; `go test ./internal/executor/`
       PASS; `TestPort_IsolationPlpgsqlToast` strict PASS (no regression); `go build`
       clean; pgbench smoke = pre-commit hook.
+      **2026-06-24 enabler (design 0118-0067, NOT a promotion): `DROP INDEX`
+      partition-tree locking.** Non-CONCURRENTLY `DROP INDEX` now takes a
+      txn-scoped `AccessExclusiveLock` on the index's table + recursively on
+      every partition descendant (top-down) before dropping, mirroring PG
+      `RangeVarCallbackForDropRelation`. New `execDropIndex` call (gated
+      `!s.Concurrent`) → `lockDropIndexTableTree` → `lockPartitionSubtreeAccessExcl`
+      (`idx.Table` + `im.PartitionChildren` recursion, `acquireDDLLockTxn` each),
+      riding the same `tableLockMgr` as `LOCK TABLE`. Lifts
+      `partition-drop-index-locking`'s first divergence: `s2drop`/`s2dropsub` now
+      `<waiting ...>` behind `s1`'s ACCESS SHARE on the leaf and complete on
+      `s1commit` (byte-match). No-op in autocommit (`TxnLockBackendID==0`) ⇒ zero
+      hot-path blast radius; CONCURRENTLY excluded (drop-index-concurrently-1 stays
+      green). **Still deferred (full promotion):** (1) `pg_locks`→real-`tableLockMgr`
+      bridge (per-backend granted/waiting + `BackendID→pid` for the
+      `pg_stat_activity` join — today `s3getlocks` returns 0 rows); (2)
+      partitioned-index child-index creation with PG auto-naming. Gates: live
+      probe (divergence advanced to `s3getlocks`); no regression across
+      DropIndexConcurrently1/ReindexConcurrently/DetachPartitionConcurrently3/
+      CreateTrigger/AlterTable1/InheritTemp/TruncateConflict/ClusterConflict;
+      `go test ./internal/executor/` PASS; `go build` clean; pgbench smoke = pre-commit.
       **2026-06-23 fourteenth promotion (design 0118-0046): `alter-table-2`
       PROMOTED ⇒ all 48 permutations byte-for-byte.** Two changes: (1) the
       `ALTER TABLE … ADD FOREIGN KEY …` parser now accepts the `NOT VALID`

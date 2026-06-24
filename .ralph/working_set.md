@@ -1,47 +1,50 @@
-Loop #24: M0118-0008 — PL/pgSQL single-column `SELECT … INTO record` field-access
-enabler (design 0118-0066). COMMITTED + pushed at loop end.
+Loop #25: M0118-0008 — `DROP INDEX` partition-tree locking enabler (design 0118-0067).
+COMMITTED + pushed at loop end. NOT a promotion.
 
-## What landed (enabler, NOT a promotion)
-reindex-concurrently-toast.spec setup `DO` block: `SELECT INTO r reltoastrelid::regclass::text
-AS table_name …` then `EXECUTE 'ALTER TABLE ' || r.table_name || …`. After the 0118-0065
-GUC enabler the first divergence was `qualified names are not supported in PL/pgSQL
-expressions (0A000)` on `r.table_name`. Root cause = a real PL/pgSQL gap:
-`bindSelectIntoRow` (plpgsql_runtime.go) scalar-shortcut a SINGLE-COLUMN `SELECT … INTO`
-straight onto the target even when the target is a `record` var, so the `_<var>_<col>`
-sub-field + `compositeVarFields` entry the qualified-name expr path reads were never
-registered. Fix: guard the scalar shortcut with `!frame.isRecordVar(name)` so a record
-target routes to `bindRecordRowComposite` (the multi-column `SELECT * INTO r` path,
-0118-0054). Plain scalar targets unaffected.
+## What landed (enabler)
+Non-CONCURRENTLY `DROP INDEX` now takes a txn-scoped `AccessExclusiveLock` on the
+index's table + recursively on every partition descendant (top-down) before the
+catalog/heap drop, mirroring PG `RangeVarCallbackForDropRelation`. New
+`execDropIndex` call (gated `!s.Concurrent`) → `lockDropIndexTableTree(idx)` →
+`lockPartitionSubtreeAccessExcl(im, tbl, visited)` (locks `idx.Table` then recurses
+`im.PartitionChildren`, `acquireDDLLockTxn(AccessExclusive)` each). Rides the same
+`tableLockMgr` as `LOCK TABLE` (`acquireRelLockTxn`), so `partition-drop-index-locking`'s
+`s2drop`/`s2dropsub` now `<waiting ...>` behind `s1`'s ACCESS SHARE on the leaf and
+complete on `s1commit` — byte-match PG. No-op in autocommit (TxnLockBackendID==0) ⇒
+zero hot-path blast radius; CONCURRENTLY excluded.
 
-Files: internal/executor/plpgsql_runtime.go (bindSelectIntoRow guard + comment),
-internal/executor/plpgsql_select_into_test.go (new sel_rec_field case),
-docs/design/0118-0066-plpgsql-select-into-record-field.md + README index,
-.ralph/deferral_ledger.md + fix_plan note.
+Files: internal/executor/operators_ddl.go (execDropIndex + lockDropIndexTableTree +
+lockPartitionSubtreeAccessExcl), docs/design/0118-0067-drop-index-partition-tree-locking.md
++ README index, .ralph/deferral_ledger.md + fix_plan note.
 
-Key symbols: bindSelectIntoRow, frame.isRecordVar, bindRecordRowComposite,
-lowerPLpgSQLExpr (qualified-ColumnRef handler, plpgsql_runtime.go ~L2061).
+Key symbols: execDropIndex, lockDropIndexTableTree, lockPartitionSubtreeAccessExcl,
+acquireDDLLockTxn, tableLockMgr, catalog.InMemory.PartitionChildren, idx.Table.
 
-Gates: new TestPlpgSQLSelectInto/sel_rec_field PASS; go test ./internal/executor/ PASS;
-TestPlpgSQLRecordFieldAndText/ScalarSubquery/ForLoopMaterializeAndRecordFieldSubst/
-DoCommitChain* PASS; TestPort_IsolationPlpgsqlToast strict PASS (no regression);
-go build ./... clean; stash A/B probe confirms reind-con-toast divergence advanced
-0A000 → routine_column_usage 42P01. pgbench smoke = pre-commit hook.
+Gates: live probe — first divergence advanced "s2drop does not wait" → s3getlocks
+returns 0 rows (the pg_locks bridge). No regression: DropIndexConcurrently1 (excluded),
+ReindexConcurrently, DetachPartitionConcurrently3, CreateTrigger, AlterTable1,
+InheritTemp, TruncateConflict, ClusterConflict all PASS. go test ./internal/executor/
+PASS; go build ./... clean; pgbench smoke = pre-commit hook.
+
+## partition-drop-index-locking next step (resume point)
+The ONLY remaining divergence is `s3getlocks` (returns 0 rows). Needs:
+1. pg_locks → real-tableLockMgr bridge: add `LockManager.AllLocks()` enumerating
+   `lm.states` (tag → per-backend mode mask + waiters), wire into
+   `catalog.RelationLockRowsFunc` ALONGSIDE the existing globalRelLockMgr rows, with
+   real `granted` (t for holders, f for waiters) and a `BackendID→pid` map so the
+   rows join pg_stat_activity. Today relation_locks.go hardcodes pid="0", granted="t".
+2. Partitioned-index child-index creation with PG auto-naming
+   (`<table>_<col>_idx`, deduped `_idx1`) — expected output references
+   `..._subpart_child_id_idx` / `..._id_idx1`.
 
 ## M0118-0008 hard tail (all Effort-L, deferred — ledger has full blocker maps)
-- reindex-concurrently-toast: FUNDAMENTAL — needs real TOAST relations as catalog
-  objects (reltoastrelid=0; text/bytea stored inline). New post-enabler wall:
-  routine_column_usage (42P01) during the toast-rename EXECUTE. Multi-loop.
-- partition-concurrent-attach + alter-table-4: both need transactional DDL cross-session
-  catalog visibility (goopg applies DDL to shared in-mem catalog non-transactionally).
-  Milestone-sized MVCC catalog subsystem.
-- partition-drop-index-locking: pg_locks today reads ONLY the explicit-LOCK-TABLE
-  registry (globalRelLockMgr, pid hardcoded "0"), NOT the real heavyweight lockmgr
-  holders/waiters; needs a real-lockmgr pg_locks bridge + DROP INDEX recursive
-  partition-tree locking + partitioned-index CREATE propagation + pg_stat_activity
-  pid join. Probe: s3getlocks returns 0 rows; s2drop does not wait. Multi-loop.
-- WHERE CURRENT OF positioned UPDATE/DELETE: project-wide, parsed (CurrentOf) but no
-  executor site; needs per-row CTID capture in cursor + CTID-restricted rewrite.
+- partition-drop-index-locking: pg_locks bridge + partitioned-index children (above).
+- alter-table-4 + partition-concurrent-attach: transactional-DDL cross-session catalog
+  visibility (milestone-sized MVCC catalog subsystem).
+- reindex-concurrently-toast: needs real TOAST relations (reltoastrelid=0; text inline);
+  post-0118-0066 wall = routine_column_usage 42P01.
+- WHERE CURRENT OF positioned UPDATE/DELETE: project-wide, parsed (CurrentOf) no executor site.
 
-Next step: pick another bounded enabler from the hard tail next loop. partition-drop-
-index-locking's pg_locks→real-lockmgr bridge is the most broadly reusable, but it must
-land WITH DROP INDEX recursive locking to advance the spec (pid-only wiring is marginal).
+Next step: pick another bounded enabler. The pg_locks→real-tableLockMgr bridge (item 1
+above) is the most broadly reusable and is now the SOLE blocker for promoting
+partition-drop-index-locking — strong candidate for next loop.

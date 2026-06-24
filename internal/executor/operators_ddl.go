@@ -4762,6 +4762,25 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 			}
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("index %q does not exist", name.String())}
 		}
+		// DROP INDEX (non-CONCURRENTLY) takes an AccessExclusiveLock on the
+		// index's table; for a partitioned index it must lock all downward
+		// sub-partitions and partitions before the indexes, mirroring
+		// PostgreSQL's RangeVarCallbackForDropRelation (which acquires the
+		// table-tree lock so a concurrent reader holding ACCESS SHARE on a leaf
+		// partition blocks the DROP). The lock is transaction-scoped: a no-op in
+		// autocommit (TxnLockBackendID==0) so ordinary DROP INDEX keeps its
+		// historical non-blocking behaviour, and held to COMMIT/ROLLBACK inside an
+		// explicit transaction. CONCURRENTLY is excluded — it holds only
+		// ShareUpdateExclusive and must not block readers (drop-index-concurrently-1).
+		// M0118-0008 (partition-drop-index-locking isolation spec).
+		if !s.Concurrent {
+			if err := o.lockDropIndexTableTree(idx); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = s.Pos()
+				}
+				return err
+			}
+		}
 		rel := o.ctx.Catalog.IndexRelFileNode(idx)
 		dropOID := idx.OID
 		dropSchema := idx.Schema
@@ -4815,6 +4834,46 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 					deleteCatalogRowsForOID(o.ctx, dbOid, oid, xmax)
 				}
 			}
+		}
+	}
+	return nil
+}
+
+// lockDropIndexTableTree takes a transaction-scoped AccessExclusiveLock on the
+// table that owns idx and, recursively, on every partition descendant. This
+// mirrors PostgreSQL's DROP INDEX path, which locks all downward sub-partitions
+// and partitions before the indexes so a concurrent session holding ACCESS
+// SHARE on a leaf partition blocks the DROP. The lock is a no-op in autocommit
+// (acquireDDLLockTxn returns immediately when TxnLockBackendID==0) and for
+// system catalogs, confining the new blocking to explicit-transaction DROP
+// INDEX. M0118-0008 (partition-drop-index-locking).
+func (o *ddlOp) lockDropIndexTableTree(idx *catalog.Index) error {
+	if idx == nil || idx.Table == nil {
+		return nil
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	visited := make(map[uint32]bool)
+	return o.lockPartitionSubtreeAccessExcl(im, idx.Table, visited)
+}
+
+// lockPartitionSubtreeAccessExcl AccessExclusive-locks tbl then recurses into
+// its partition children (which may themselves be partitioned), top-down, the
+// way PostgreSQL descends the partition tree. visited guards against cycles /
+// re-locking. Each acquire is transaction-scoped via acquireDDLLockTxn.
+func (o *ddlOp) lockPartitionSubtreeAccessExcl(im *catalog.InMemory, tbl *catalog.Table, visited map[uint32]bool) error {
+	if tbl == nil || visited[tbl.OID] {
+		return nil
+	}
+	visited[tbl.OID] = true
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+		return err
+	}
+	for _, child := range im.PartitionChildren(tbl.OID) {
+		if err := o.lockPartitionSubtreeAccessExcl(im, child, visited); err != nil {
+			return err
 		}
 	}
 	return nil
