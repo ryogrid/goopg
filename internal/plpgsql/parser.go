@@ -512,20 +512,44 @@ func (p *bodyParser) parseFor() (Stmt, error) {
 	}, nil
 }
 
-// parsePerform parses `PERFORM expr ;`.
+// parsePerform parses `PERFORM query ;`.
+//
+// PostgreSQL executes the text after PERFORM as `SELECT <query>` (so it may be
+// a full query with FROM/WHERE, not only a scalar expression) and sets FOUND.
+// We capture the raw source up to the terminating ';' and, when it happens to
+// parse as a plain expression (the common `PERFORM foo()` case), also keep the
+// parsed Expr for the scalar fast path. M0118-0009 (design 0118-0097).
 func (p *bodyParser) parsePerform() (*PerformStmt, error) {
 	perfTok, err := p.expectKeyword(parser.KwPerform)
 	if err != nil {
 		return nil, err
 	}
-	expr, err := p.scanExprToSemicolon("PERFORM expression")
-	if err != nil {
-		return nil, err
+	srcStart := p.cur().Pos
+	if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+		return nil, p.errAt(srcStart, "PERFORM expression requires a non-empty expression")
 	}
-	if !p.acceptSymbol(";") {
+	for p.cur().Kind != parser.TokenEOF {
+		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+			break
+		}
+		p.advance()
+	}
+	if p.cur().Kind != parser.TokenSymbol || p.cur().Value != ";" {
 		return nil, p.errAtCur("expected ';' to terminate PERFORM statement")
 	}
-	return &PerformStmt{pos: perfTok.Pos, Expr: expr}, nil
+	raw := strings.TrimSpace(p.src[srcStart:p.cur().Pos])
+	p.advance() // consume ';'
+	if raw == "" {
+		return nil, p.errAt(srcStart, "PERFORM expression requires a non-empty expression")
+	}
+	stmt := &PerformStmt{pos: perfTok.Pos, Query: raw}
+	// Scalar fast path: keep the parsed expression when the source is a plain
+	// expression. A query form (FROM/WHERE/…) fails ParseExpr and is executed
+	// as SQL by the runtime via Query.
+	if expr, perr := parser.ParseExpr(raw); perr == nil {
+		stmt.Expr = expr
+	}
+	return stmt, nil
 }
 
 // parseExit parses `EXIT [ WHEN cond ] ;`.

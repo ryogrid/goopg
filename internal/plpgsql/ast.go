@@ -176,11 +176,18 @@ type ContinueStmt struct {
 func (c *ContinueStmt) Pos() int         { return c.pos }
 func (c *ContinueStmt) plpgsqlStmtNode() {}
 
-// PerformStmt is `PERFORM expression;`. Stage A only supports
-// scalar expressions.
+// PerformStmt is `PERFORM query;` — PostgreSQL runs the rest of the
+// statement as `SELECT <query>`, discards the result rows, and sets FOUND
+// from whether any row was produced.
+//
+// Expr is set (the scalar fast path) when the text after PERFORM parses as a
+// plain expression, e.g. `PERFORM foo()`. Query always holds the raw source
+// after PERFORM so a full query form (`PERFORM TRUE FROM t WHERE …`) can be
+// executed as SQL. M0118-0009 (design 0118-0097).
 type PerformStmt struct {
-	pos  int
-	Expr parser.Expr
+	pos   int
+	Expr  parser.Expr
+	Query string
 }
 
 func (p *PerformStmt) Pos() int         { return p.pos }

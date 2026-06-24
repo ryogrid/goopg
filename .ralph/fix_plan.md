@@ -307,8 +307,17 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       which already keyed its wait on `keysUpdated`); the only blocking left is the
       two parent no-key UPDATEs serialising via the existing UPDATE-conflict path.
       New helpers `fkXmaxIsKeyChanging` + `multixactUpdaterIsKeyChanging`; strict
-      `TestPort_IsolationFkDeadlock` 14/14 byte-identical. **Remaining (deferred,
-      ledger 2026-06-22):** `ri-trigger` (user RI constraint-trigger firing),
+      `TestPort_IsolationFkDeadlock` 14/14 byte-identical. **`ri-trigger`
+      PROMOTED (2026-06-25, design 0118-0097):** trigger-based RI under
+      SERIALIZABLE now matches PG 18.3 byte-for-byte (all 10 perms, strict
+      `TestPort_IsolationRiTrigger`) after three plpgsql/trigger fixes: (1)
+      `fireTriggers` now returns `(Row,bool,error)` and PROPAGATES a trigger
+      body's `RAISE` (was silently swallowed at all ~21 INSERT/UPDATE/DELETE/
+      MERGE/upsert call sites — a real correctness bug: user-trigger constraints
+      were ignored), (2) `PERFORM` accepts a full query form (`PERFORM TRUE FROM
+      t WHERE …` runs as `SELECT <query>`; scalar `PERFORM foo()` fast path
+      kept), (3) `FOUND` implemented as a per-frame bool set from the last SQL
+      statement's row count. **Remaining (deferred, ledger 2026-06-22):**
       `fk-partitioned-1/2` (`ALTER TABLE ATTACH PARTITION` + partitioned-FK
       enforcement). Group stays open until those land.
 - [x] **M0118-0006** — MERGE & INSERT ON CONFLICT output parity: merge-{update,delete,

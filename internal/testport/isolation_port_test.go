@@ -1232,6 +1232,20 @@ func TestPort_IsolationFkDeadlock(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-deadlock.spec")
 }
 
+// TestPort_IsolationRiTrigger exercises trigger-based referential integrity
+// under SERIALIZABLE: BEFORE UPDATE/DELETE and BEFORE INSERT/UPDATE plpgsql
+// triggers that PERFORM a query and RAISE on FOUND / NOT FOUND, plus SSI 40001
+// when the two transactions' read/write sets overlap. Promoted M0118-0009
+// (design 0118-0097): trigger-body errors now abort the DML, PERFORM accepts a
+// full query form, and FOUND is tracked.
+func TestPort_IsolationRiTrigger(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_ri_trigger")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/ri-trigger.spec")
+}
+
 // TestPort_IsolationIndexOnlyScan exercises the index-only-scan spec: a
 // SERIALIZABLE write skew across two all-visible tables (tabx / taby) where each
 // transaction reads one table via an index-only scan of SELECT min(id) and

@@ -26,11 +26,14 @@ import (
 // DELETE can suppress deletion by returning NULL).
 // For AFTER triggers the return value is always ignored (pass-through).
 //
-// M0096-0012.
-func fireTriggers(ctx *Context, tbl *catalog.Table, timing, event string, oldRow, newRow Row) (Row, bool) {
+// A non-nil error means a trigger body raised an exception (e.g. plpgsql
+// RAISE) or hit a runtime error; callers MUST propagate it to abort the DML,
+// exactly as PostgreSQL aborts the statement when a trigger errors. M0096-0012;
+// error propagation M0118-0009 (design 0118-0097).
+func fireTriggers(ctx *Context, tbl *catalog.Table, timing, event string, oldRow, newRow Row) (Row, bool, error) {
 	rs := ctx.Catalog.Routines()
 	if rs == nil {
-		return newRow, true
+		return newRow, true, nil
 	}
 	timingLow := strings.ToLower(timing)
 	eventLow := strings.ToLower(event)
@@ -60,17 +63,16 @@ func fireTriggers(ctx *Context, tbl *catalog.Table, timing, event string, oldRow
 		}
 		retRow, ok, err := executePLpgSQLTriggerBody(r, trigCtx, ctx)
 		if err != nil {
-			// Trigger execution errors abort the DML.
-			// Surface the error via a panic recovered by the operator.
-			// For now, silently skip — production should propagate.
-			continue
+			// A trigger body raised an exception or hit a runtime error;
+			// propagate so the caller aborts the DML (PostgreSQL semantics).
+			return nil, false, err
 		}
 		if !ok {
 			continue
 		}
 		if timingLow == "before" {
 			if retRow == nil {
-				return nil, false // RETURN NULL suppresses the row
+				return nil, false, nil // RETURN NULL suppresses the row
 			}
 			// BEFORE INSERT/UPDATE: use the returned row.
 			if eventLow == "insert" || eventLow == "update" {
@@ -79,7 +81,7 @@ func fireTriggers(ctx *Context, tbl *catalog.Table, timing, event string, oldRow
 			// BEFORE DELETE: if trigger returned OLD (non-nil), proceed.
 		}
 	}
-	return newRow, true
+	return newRow, true, nil
 }
 
 // fireStatementTriggers fires FOR EACH STATEMENT triggers for the given event

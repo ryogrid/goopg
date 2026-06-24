@@ -1419,7 +1419,10 @@ func (o *insertOp) Next() (TupleSlot, error) {
 
 		// BEFORE INSERT triggers (M0096-0012).
 		if len(o.plan.Table.Triggers) > 0 {
-			newRow, ok := fireTriggers(o.ctx, o.plan.Table, "before", "insert", nil, row)
+			newRow, ok, err := fireTriggers(o.ctx, o.plan.Table, "before", "insert", nil, row)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue // trigger returned NULL — skip this row
 			}
@@ -1576,7 +1579,9 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)
 		// AFTER INSERT triggers (M0097-0140).
 		if len(o.plan.Table.Triggers) > 0 {
-			fireTriggers(o.ctx, o.plan.Table, "after", "insert", nil, row)
+			if _, _, err := fireTriggers(o.ctx, o.plan.Table, "after", "insert", nil, row); err != nil {
+				return nil, err
+			}
 		}
 		o.appendInsertRetRow(row)
 		o.rowsAffected++
@@ -3100,7 +3105,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		// actually be written. M0100-0005-merge-delete-fix.
 		trigFiredViaIdx := false
 		if len(idxTbl.Triggers) > 0 && !idxRowHasConcurrentXmax(o.ctx, rel, pu.blk, pu.slot) {
-			retRow, ok := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue // RETURN NULL — skip this row
 			}
@@ -3282,7 +3290,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					trigFiredViaIdx = true
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					retRow, trigOK := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+					retRow, trigOK, trigErr := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+					if trigErr != nil {
+						// s already unlocked/unpinned above before firing.
+						return nil, trigErr
+					}
 					if !trigOK {
 						// RETURN NULL — skip this row
 						epqSkip = true
@@ -3454,7 +3466,9 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 			// AFTER UPDATE triggers (M0097-0140).
 			if len(idxTbl.Triggers) > 0 {
-				fireTriggers(o.ctx, idxTbl, "after", "update", pu.oldRow, pu.newRow)
+				if _, _, err := fireTriggers(o.ctx, idxTbl, "after", "update", pu.oldRow, pu.newRow); err != nil {
+					return nil, err
+				}
 			}
 			o.appendUpdateRetRow(pu.newRow)
 			o.rowsAffected++
@@ -3744,7 +3758,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					continue
 				}
 				if len(scanTbl.Triggers) > 0 {
-					ret, ok := fireTriggers(o.ctx, scanTbl, "before", "update", oldRow, newRow)
+					ret, ok, err := fireTriggers(o.ctx, scanTbl, "before", "update", oldRow, newRow)
+					if err != nil {
+						return err
+					}
 					if !ok {
 						return nil // RETURN NULL — skip row
 					}
@@ -3803,7 +3820,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			scanTblForTrig = tbl
 		}
 		if !pu.beforeFired && len(scanTblForTrig.Triggers) > 0 {
-			retRow, ok := fireTriggers(o.ctx, scanTblForTrig, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggers(o.ctx, scanTblForTrig, "before", "update", pu.oldRow, pu.newRow)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue // RETURN NULL — skip this row
 			}
@@ -3988,7 +4008,12 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				// the EPQ refetch so OLD reflects the concurrent updater's
 				// committed changes.
 				if isCrossPartitionMove && pu.scanTbl != nil && len(pu.scanTbl.Triggers) > 0 {
-					_, ok := fireTriggers(o.ctx, pu.scanTbl, "before", "delete", pu.oldRow, nil)
+					_, ok, err := fireTriggers(o.ctx, pu.scanTbl, "before", "delete", pu.oldRow, nil)
+					if err != nil {
+						s.Unlock()
+						o.ctx.Pool.Unpin(s)
+						return nil, err
+					}
 					if !ok {
 						// RETURN NULL — suppress the row.
 						s.Unlock()
@@ -4113,7 +4138,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				scanTblForAfterTrig = tbl
 			}
 			if len(scanTblForAfterTrig.Triggers) > 0 {
-				fireTriggers(o.ctx, scanTblForAfterTrig, "after", "update", pu.oldRow, pu.newRow)
+				if _, _, err := fireTriggers(o.ctx, scanTblForAfterTrig, "after", "update", pu.oldRow, pu.newRow); err != nil {
+					return nil, err
+				}
 			}
 			// Use parent-aligned retRow for RETURNING when available (inheritance
 			// children store a remapped row so RETURNING exprs work correctly). M0097-0078.
@@ -4386,7 +4413,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					trigTbl = tbl
 				}
 				if len(trigTbl.Triggers) > 0 {
-					_, ok := fireTriggers(o.ctx, trigTbl, "before", "delete", cloneRow(deleteRow), nil)
+					_, ok, err := fireTriggers(o.ctx, trigTbl, "before", "delete", cloneRow(deleteRow), nil)
+					if err != nil {
+						return err
+					}
 					if !ok {
 						return nil // trigger returned NULL — skip deletion
 					}
@@ -4409,7 +4439,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			trigTbl = tbl
 		}
 		if !v.beforeFired && len(trigTbl.Triggers) > 0 {
-			_, ok := fireTriggers(o.ctx, trigTbl, "before", "delete", v.row, nil)
+			_, ok, err := fireTriggers(o.ctx, trigTbl, "before", "delete", v.row, nil)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue // trigger returned NULL — skip deletion
 			}
@@ -4571,7 +4604,9 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				if v.retRow != nil {
 					delRow = v.retRow
 				}
-				fireTriggers(o.ctx, tbl, "after", "delete", delRow, nil)
+				if _, _, err := fireTriggers(o.ctx, tbl, "after", "delete", delRow, nil); err != nil {
+					return nil, err
+				}
 			}
 			// Use parent-aligned retRow for RETURNING when available (inheritance children). M0097-0078.
 			if v.retRow != nil {
@@ -4815,7 +4850,10 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 
 		// Fire BEFORE UPDATE triggers.
 		if len(o.plan.Table.Triggers) > 0 {
-			retRow, ok := fireTriggers(o.ctx, o.plan.Table, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggers(o.ctx, o.plan.Table, "before", "update", pu.oldRow, pu.newRow)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue
 			}
@@ -5175,7 +5213,10 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		}
 		// Fire BEFORE DELETE triggers and enforce FK constraints.
 		if len(tbl.Triggers) > 0 {
-			_, ok := fireTriggers(o.ctx, tbl, "before", "delete", v.oldRow, nil)
+			_, ok, err := fireTriggers(o.ctx, tbl, "before", "delete", v.oldRow, nil)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue
 			}

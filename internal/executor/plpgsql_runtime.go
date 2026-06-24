@@ -78,6 +78,11 @@ type plpgsqlFrame struct {
 	// (and for function arguments) so that field access / assignment works
 	// inside the PL/pgSQL body. M0097-composite.
 	compositeVarFields map[string][]catalog.CompositeField
+	// found is the PL/pgSQL special FOUND boolean for this frame. It is set
+	// by SQL-issuing statements (PERFORM, SELECT INTO, embedded DML, …) to
+	// whether the underlying query produced at least one row, and read via a
+	// bare `FOUND` reference. M0118-0009 (design 0118-0097).
+	found bool
 }
 
 // plpgsqlTrigCtx holds the trigger execution context injected into
@@ -1245,10 +1250,23 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.PerformStmt:
-		_, err := evalPLpgSQLExpr(s.Expr, frame, ctx)
+		// PERFORM runs its argument as `SELECT <query>`, discards the rows, and
+		// sets FOUND from the row count. M0118-0009 (design 0118-0097).
+		if s.Expr != nil {
+			// Scalar fast path (e.g. PERFORM foo()): evaluate for side effects.
+			// `SELECT <scalar>` yields exactly one row, so FOUND is true.
+			if _, err := evalPLpgSQLExpr(s.Expr, frame, ctx); err != nil {
+				return Datum{}, flowNone, err
+			}
+			frame.found = true
+			return Datum{}, flowNone, nil
+		}
+		// Query form (FROM/WHERE/…): run as SELECT and set FOUND from row count.
+		n, err := execPLpgSQLEmbeddedSQL("SELECT "+s.Query, frame, ctx)
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
+		frame.found = n > 0
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.NullStmt:
@@ -1532,9 +1550,13 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 
 	case *plpgsql.SQLStmt:
 		// Execute embedded SQL with trigger OLD/NEW substitution. M0096-0012.
-		if err := execPLpgSQLEmbeddedSQL(s.SQL, frame, ctx); err != nil {
+		n, err := execPLpgSQLEmbeddedSQL(s.SQL, frame, ctx)
+		if err != nil {
 			return Datum{}, flowNone, err
 		}
+		// PostgreSQL sets FOUND after a SQL statement to whether it produced /
+		// affected at least one row. M0118-0009 (design 0118-0097).
+		frame.found = n > 0
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.SelectIntoStmt:
@@ -2099,6 +2121,11 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 		}
 		idx, ok := frame.lookup(x.Column)
 		if !ok {
+			// FOUND special variable: only when not shadowed by a declared
+			// variable of the same name. M0118-0009 (design 0118-0097).
+			if strings.EqualFold(x.Column, "found") {
+				return &planner.BooleanConst{Value: frame.found}, nil
+			}
 			return nil, &ExecError{Code: "42703", Pos: x.Pos(), Message: fmt.Sprintf("variable %q does not exist", x.Column)}
 		}
 		return &planner.ColumnRef{Index: idx, Name: x.Column, Type: frame.types[idx]}, nil
@@ -2570,7 +2597,7 @@ func plpgsqlFormatDynArg(d Datum) string {
 	}
 }
 
-func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error {
+func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) (int, error) {
 	// Substitute OLD.* → VALUES(v1, v2, ...) and OLD.col → literal.
 	if frame.trig != nil {
 		sql = substituteTriggerRefs(sql, frame.trig)
@@ -2579,25 +2606,29 @@ func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error
 	sql = substitutePlpgsqlFrameVarsInSQL(sql, frame)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
-		return &ExecError{Code: "42601", Message: fmt.Sprintf("PL/pgSQL embedded SQL parse error: %v", err)}
+		return 0, &ExecError{Code: "42601", Message: fmt.Sprintf("PL/pgSQL embedded SQL parse error: %v", err)}
 	}
 	if len(stmts) == 0 {
-		return nil
+		return 0, nil
 	}
+	// rows counts the result rows produced by the last statement, so callers
+	// can derive FOUND (PostgreSQL sets FOUND from the final query's row count).
+	rows := 0
 	for _, stmt := range stmts {
 		plan, err := planner.Plan(stmt, ctxPlanCatalog(ctx))
 		if err != nil {
-			return err
+			return 0, err
 		}
 		op, err := Build(plan)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if err := op.Open(ctx); err != nil {
 			op.Close()
-			return err
+			return 0, err
 		}
-		// Drain all rows (side-effect execution).
+		// Drain all rows (side-effect execution), counting them.
+		rows = 0
 		for {
 			_, err := op.Next()
 			if err == EOF {
@@ -2605,12 +2636,13 @@ func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error
 			}
 			if err != nil {
 				op.Close()
-				return err
+				return 0, err
 			}
+			rows++
 		}
 		op.Close()
 	}
-	return nil
+	return rows, nil
 }
 
 // substituteTriggerRefs replaces OLD.* / NEW.* / OLD.colname / NEW.colname
