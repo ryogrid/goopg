@@ -31,6 +31,11 @@ type indexOnlyScanOp struct {
 	// fetch — the EXPLAIN ANALYZE "Heap Fetches" tally (design 0118-0102).
 	// Set by maybeInstrument only under EXPLAIN ANALYZE; nil otherwise.
 	heapFetchCount *int64
+	// touchedBlocks records the heap blocks visited on the non-ALL_VISIBLE
+	// fallback path; for a TEMPORARY relation they are opportunistically pruned
+	// after the scan so a subsequent index-only scan reflects PG's prune-on-read
+	// (horizons.spec, M0118-0009). nil keys are never inserted.
+	touchedBlocks map[storage.BlockNumber]struct{}
 }
 
 // setHeapFetchCounter implements the heapFetchCounter interface so EXPLAIN
@@ -169,19 +174,36 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 			return true, nil
 		}
 
-		// Fallback: heap fetch + HOT chain + MVCC. The page was not
-		// ALL_VISIBLE so this entry costs a heap fetch — count it for
-		// EXPLAIN ANALYZE "Heap Fetches" (design 0118-0102), mirroring
-		// upstream's ioss_HeapFetches++ which fires per visited entry
-		// regardless of the eventual visibility verdict.
-		if o.heapFetchCount != nil {
-			*o.heapFetchCount++
-		}
+		// Fallback: heap fetch + HOT chain + MVCC. The page was not ALL_VISIBLE.
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
 		if err != nil {
 			return false, err
 		}
 		slot.RLock()
+		// Peek the index entry's root line pointer first. If it was reclaimed
+		// (LP_UNUSED / LP_DEAD) by a prior prune — the goopg analog of an index
+		// entry PG's kill_prior_tuple would have marked LP_DEAD — this entry
+		// resolves to no heap tuple: it costs no heap fetch and yields no row.
+		// Skipping it here is what drops "Heap Fetches" to 0 on a re-scan after a
+		// temp relation's deleted rows are pruned (horizons.spec, M0118-0009).
+		if rootID, idErr := storage.PageGetItemID(slot.Page(), ptr.Offset); idErr == nil &&
+			(rootID.Flags == storage.ItemIDUnused || rootID.Flags == storage.ItemIDDead) {
+			slot.RUnlock()
+			ctx.Pool.Unpin(slot)
+			return true, nil
+		}
+		// A genuine heap fetch — count it for EXPLAIN ANALYZE "Heap Fetches"
+		// (design 0118-0102), mirroring upstream's ioss_HeapFetches++ which fires
+		// per visited entry regardless of the eventual visibility verdict.
+		if o.heapFetchCount != nil {
+			*o.heapFetchCount++
+		}
+		if o.plan.Table != nil && o.plan.Table.Temp {
+			if o.touchedBlocks == nil {
+				o.touchedBlocks = make(map[storage.BlockNumber]struct{})
+			}
+			o.touchedBlocks[ptr.Block] = struct{}{}
+		}
 		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID, ctx.MultiXact)
 		// M0118-0001: SSI phantom conflict-out for an index-only-scanned tuple
 		// present at this TID but invisible because a concurrent transaction
@@ -238,7 +260,68 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	if err := tree.RangeScan(loBytes, hiBytes, scanFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
+
+	// Prune-on-read for TEMPORARY relations (horizons.spec, M0118-0009). PG
+	// opportunistically prunes a heap page whenever a scan visits it; for a temp
+	// relation that prune uses the session-local horizon (GlobalVisTempRels), so
+	// rows the owning backend deleted in a committed statement are reclaimed even
+	// while another session holds an older snapshot — that session cannot see the
+	// temp table at all. Permanent relations are deliberately NOT pruned here:
+	// their reclamation flows through VACUUM at the global horizon. We do NOT set
+	// the VM ALL_VISIBLE bit, so a subsequent scan stays on this heap-checking
+	// fallback path and skips the now-LP_UNUSED entries (see the root-line-pointer
+	// peek above) instead of trusting the index key, which would resurrect the
+	// deleted rows.
+	o.pruneTouchedTempPages(ctx, heapRel)
 	return nil
+}
+
+// pruneTouchedTempPages opportunistically reclaims dead tuples on the heap
+// blocks this index-only scan fetched, for a TEMPORARY relation only, using the
+// session-local horizon. Mirrors vacuumCore's reclamation kernel
+// (storage.PageVacuumPrune + the LogHeapPruneOpt WAL hook / MarkDirty fallback)
+// but takes no relation lock and never touches the Visibility Map. Best-effort:
+// any error leaves the page untouched rather than failing the read.
+func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.RelFileNode) {
+	if len(o.touchedBlocks) == 0 || ctx.Pool == nil || ctx.TxnMgr == nil {
+		return
+	}
+	if o.plan.Table == nil || !o.plan.Table.Temp {
+		return
+	}
+	horizon := ctx.TxnMgr.OldestXminForProc(int32(ctx.Tx.Handle) - 1)
+	if horizon == storage.InvalidTransactionID {
+		return
+	}
+	logPrune := ctx.Pool.LogHeapPruneOpt()
+	for blk := range o.touchedBlocks {
+		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: blk})
+		if err != nil {
+			continue
+		}
+		page := slot.Page()
+		if storage.IsNew(page) {
+			ctx.Pool.Unpin(slot)
+			continue
+		}
+		slot.Lock()
+		pr, _, perr := storage.PageVacuumPrune(page, horizon)
+		if perr != nil || (len(pr.Redirects) == 0 && len(pr.Unused) == 0) {
+			slot.Unlock()
+			ctx.Pool.Unpin(slot)
+			continue
+		}
+		if logPrune != nil {
+			blkCopy := blk
+			_ = ctx.Pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+				return logPrune(heapRel, blkCopy, pr.Redirects, pr.Unused)
+			})
+		} else {
+			ctx.Pool.MarkDirty(slot)
+		}
+		slot.Unlock()
+		ctx.Pool.Unpin(slot)
+	}
 }
 
 func (o *indexOnlyScanOp) Next() (TupleSlot, error) {

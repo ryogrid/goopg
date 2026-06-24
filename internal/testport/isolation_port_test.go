@@ -1645,6 +1645,31 @@ func TestPort_IsolationTempSchemaCleanup(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/temp-schema-cleanup.spec")
 }
 
+// TestPort_IsolationHorizons exercises the horizons spec (M0118-0009, design
+// 0118-0104): pruning and vacuuming must respect concurrent sessions. For a
+// TEMPORARY relation, rows a session deleted ARE reclaimable despite another
+// session's older snapshot (temp data is private to the owning backend, so the
+// index-only scan's Heap Fetches drops to 0 after a prune-on-read or VACUUM);
+// for a PERMANENT relation those rows must survive (Heap Fetches stays 2) while
+// the older snapshot lives. This loop landed the TEMPORARY half plus the
+// no-vacuum permanent permutations — 4 of 5 permutations match PG 18.3: temp
+// relations vacuum and prune at the session-local horizon
+// (mvcc.OldestXminForProc), the index-only scan prunes the temp heap pages it
+// touched after the scan, and a reclaimed index entry (LP_UNUSED/LP_DEAD root)
+// is skipped without a heap-fetch tally. runIsoSpec (soft) until the final
+// permanent-table VACUUM-respects-snapshot permutation lands: it needs an
+// explicit RR transaction's snapshot xmin registered in the proc array, which
+// requires capturing the RR snapshot at the batched BEGIN+first-statement step,
+// and doing so exposes a latent RR concurrent-update (40001) detection gap that
+// regresses eval-plan-qual-trigger (deferred; see the design doc).
+func TestPort_IsolationHorizons(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_horizons")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/horizons.spec")
+}
+
 // TestPort_IsolationDeadlockSimple exercises the deadlock-simple spec: two
 // sessions each take ACCESS SHARE on a1, then each attempts a lock upgrade to
 // ACCESS EXCLUSIVE. Neither upgrade can complete until the other releases its

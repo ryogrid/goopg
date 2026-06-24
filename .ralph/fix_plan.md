@@ -1269,6 +1269,36 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       matching VACUUM cutoff). Tests `TestOrderedIndexOnlyScan{Promoted…,
       NotPromotedByDefault,RequiresAscending}`; planner/catalog/executor/server
       suites PASS; build+vet clean; pgbench smoke = pre-commit hook. Ledger row.
+      **2026-06-25 (design 0118-0104, enabler — NOT a promotion): the MVCC
+      pruning-horizon core, 4/5 horizons permutations now match PG 18.3.** Lands
+      the TEMPORARY half + no-vacuum permanent permutations: (1)
+      `mvcc.OldestXminForProc(procNum)` — session-local horizon
+      `min(nextXID, slot.xid, slot.xmin)` for one backend (falls back to global),
+      ignores other backends' snapshots but respects the owner's own in-progress
+      txn (keeps perm 3 "delete-in-open-txn" at Heap Fetches=2); (2)
+      `vacuum.VacuumOptions.Horizon` override + `operators_vacuum.go` passes the
+      session-local horizon for `tbl.Temp` targets → perm 5 temp VACUUM reclaims
+      rows (vacuumIndexes clears the B-tree entries) → 0; (3) IOS
+      `pruneTouchedTempPages` prunes the temp heap blocks the scan fetched at the
+      session-local horizon (reusing PageVacuumPrune + LogHeapPruneOpt) WITHOUT
+      setting VM ALL_VISIBLE (next scan stays on the fallback path, skips
+      reclaimed entries rather than resurrecting deleted rows) → perm 2 drops
+      2→0; (4) IOS counting rule (kill_prior_tuple analog) skips an index entry
+      whose root line pointer is LP_UNUSED/LP_DEAD without a Heap Fetches tally.
+      **horizons stays `failed`** — residual = perm 4 only (perm-table
+      VACUUM-respects-older-snapshot, Heap Fetches must stay 2): lifeline's
+      batched `BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1;` never registers
+      the RR tx's snapshot xmin (goopg captures an RR snapshot lazily at the
+      first SEPARATE-message statement); capturing it at the batched first
+      statement (PG-correct) was implemented in dispatch.go and REVERTED because
+      it regresses `eval-plan-qual-trigger` (same batched `BEGIN RR; SELECT 1`
+      shape) by exposing a latent goopg RR concurrent-update (40001) detection
+      gap. NEXT: fix that detection to be snapshot-timing-robust, then re-apply
+      the batched-BEGIN RR snapshot-pinning. Tests `TestPort_IsolationHorizons`
+      (soft 4/5) + `TestOldestXminForProc_SessionLocalIgnoresOtherSnapshots`;
+      `-race` mvcc/vacuum/storage + executor/server PASS; predicate-hash/
+      eval-plan-qual-trigger non-regression confirmed; build+vet+gofmt clean;
+      pgbench smoke = pre-commit hook. Ledger row.
       **Remaining M0118-0009:** `intra-grant-inplace` (pg_class sibling — ALTER
       TABLE ADD PRIMARY KEY `<waiting>` behind FOR KEY SHARE on pg_class; needs
       runtime shared-catalog MVCC-tuple row locks — heavy), `horizons`

@@ -482,6 +482,37 @@ func (m *Manager) OldestXmin() storage.TransactionID {
 	return result
 }
 
+// OldestXminForProc is the session-local pruning horizon: the lowest xid still
+// observable by ONLY the transaction occupying proc slot procNum, ignoring all
+// other backends. PostgreSQL applies this narrower horizon (GlobalVisTempRels)
+// to TEMPORARY relations — a temp table is private to its owning backend, so a
+// concurrent session holding an older snapshot cannot see (and therefore cannot
+// be harmed by reclaiming) the temp table's deleted rows. Used by VACUUM and the
+// index-only-scan prune-on-read for temp relations (horizons.spec, M0118-0009).
+//
+// It still respects the owning backend's OWN in-progress transaction: the slot's
+// assigned xid (a row the backend itself just deleted but has not committed) and
+// its snapshot xmin both floor the result, so an uncommitted delete is never
+// reclaimable. Falls back to the global OldestXmin when procNum is out of range
+// or the slot is idle (conservative — never reclaims more than the global path).
+func (m *Manager) OldestXminForProc(procNum int32) storage.TransactionID {
+	if procNum < 0 || int(procNum) >= len(m.procArray.slots) {
+		return m.OldestXmin()
+	}
+	s := &m.procArray.slots[procNum]
+	if s.inTxn.Load() == 0 {
+		return m.OldestXmin()
+	}
+	result := storage.TransactionID(m.xidgen.Peek())
+	if xid := s.xid.Load(); xid != 0 && storage.TransactionID(xid) < result {
+		result = storage.TransactionID(xid)
+	}
+	if xmin := s.xmin.Load(); xmin != ^uint64(0) && storage.TransactionID(xmin) < result {
+		result = storage.TransactionID(xmin)
+	}
+	return result
+}
+
 func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 	procNum := int32(tx.Handle) - 1
 	if procNum < 0 || int(procNum) >= len(m.procArray.slots) {

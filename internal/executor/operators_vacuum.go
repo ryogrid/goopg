@@ -118,7 +118,16 @@ func (o *vacuumOp) Next() (TupleSlot, error) {
 			}
 			continue
 		}
-		stats, err := vacuum.VacuumWithOptions(o.ctx.Pool, o.ctx.TxnMgr, rel, opts)
+		// A TEMPORARY relation is private to its owning backend, so reclamation
+		// uses the session-local horizon (PG's GlobalVisTempRels) — a concurrent
+		// session's older snapshot must NOT pin temp-row reclamation it can never
+		// observe. Permanent relations keep the global OldestXmin (opts.Horizon
+		// left 0 → vacuumCore derives it). horizons.spec (M0118-0009).
+		relOpts := opts
+		if tbl.Temp {
+			relOpts.Horizon = o.ctx.TxnMgr.OldestXminForProc(int32(o.ctx.Tx.Handle) - 1)
+		}
+		stats, err := vacuum.VacuumWithOptions(o.ctx.Pool, o.ctx.TxnMgr, rel, relOpts)
 		if err == nil {
 			// Publish reltuples / relpages to pg_class (vac_update_relstats).
 			// reltuples is the count of tuples visible to a FRESH snapshot — the

@@ -431,6 +431,50 @@ func TestOldestXmin_PreservedByReadOnlySnapshotXmin(t *testing.T) {
 	_ = m.Rollback(txR)
 }
 
+// TestOldestXminForProc_SessionLocalIgnoresOtherSnapshots verifies that the
+// session-local horizon used by TEMPORARY-relation prune/vacuum (M0118-0009
+// horizons) ignores another backend's older snapshot: a concurrent RR reader
+// pins the global OldestXmin, yet OldestXminForProc(writer) stays at the
+// writer's own (newer) horizon so the writer can reclaim its own temp rows.
+func TestOldestXminForProc_SessionLocalIgnoresOtherSnapshots(t *testing.T) {
+	m := NewManager()
+	// txR is a read-only RR session that takes an early snapshot and holds it.
+	txR, _ := m.Begin(IsolationRepeatableRead)
+	snapR, err := m.SnapshotFor(txR)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Advance the XID counter so a later session's horizon is strictly newer.
+	txW0, _ := m.Begin(IsolationReadCommitted)
+	if _, err := m.AssignXID(txW0); err != nil {
+		t.Fatal(err)
+	}
+	_ = m.Commit(txW0)
+	// txS is a separate session (the temp-table owner) that takes its snapshot
+	// AFTER txR's. Its session-local horizon must not be pinned by txR.
+	txS, _ := m.Begin(IsolationReadCommitted)
+	snapS, err := m.SnapshotFor(txS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	procS := int32(txS.Handle) - 1
+
+	// Global OldestXmin is pinned by txR's older snapshot.
+	if g := m.OldestXmin(); g > snapR.Xmin {
+		t.Errorf("global OldestXmin=%d not pinned by txR snapshot xmin=%d", g, snapR.Xmin)
+	}
+	// Session-local horizon ignores txR entirely and tracks txS's own xmin.
+	local := m.OldestXminForProc(procS)
+	if local < snapR.Xmin {
+		t.Errorf("OldestXminForProc=%d unexpectedly below txR snapshot xmin=%d (should ignore other backends)", local, snapR.Xmin)
+	}
+	if local > snapS.Xmin {
+		t.Errorf("OldestXminForProc=%d above txS own snapshot xmin=%d (must respect own snapshot)", local, snapS.Xmin)
+	}
+	_ = m.Rollback(txS)
+	_ = m.Rollback(txR)
+}
+
 // TestActiveSet_HandlesNotXIDsKey — multiple read-only txns coexist
 // without collision, even though they all have XID == 0.
 func TestActiveSet_HandlesNotXIDsKey(t *testing.T) {

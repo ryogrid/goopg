@@ -43,6 +43,12 @@ type VacuumOptions struct {
 	// Any tuple with xmin < FreezeBelow is rewritten to FrozenTransactionID
 	// so XID wraparound cannot make it invisible.
 	FreezeBelow storage.TransactionID
+	// Horizon, when > 0, overrides the dead-tuple reclamation cutoff that
+	// vacuumCore otherwise derives from mgr.OldestXmin(). The VACUUM operator
+	// passes the session-local horizon (mgr.OldestXminForProc) for TEMPORARY
+	// relations so a concurrent session's older snapshot does not pin reclamation
+	// of temp-table rows it cannot see (horizons.spec, M0118-0009).
+	Horizon storage.TransactionID
 }
 
 // VacuumWithOptions is the full-featured Vacuum entry point. All optional
@@ -89,7 +95,10 @@ func VacuumWithFSMAndVM(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFi
 
 func vacuumCore(pool *storage.Pool, mgr *mvcc.Manager, rel storage.RelFileNode,
 	opts VacuumOptions) (Stats, error) {
-	horizon := mgr.OldestXmin()
+	horizon := opts.Horizon
+	if horizon == storage.InvalidTransactionID {
+		horizon = mgr.OldestXmin()
+	}
 	nBlocks, err := pool.NBlocks(rel)
 	if err != nil {
 		return Stats{}, err
