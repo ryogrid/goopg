@@ -80,8 +80,12 @@ func TestExplainFormatJSONProducesValidJSON(t *testing.T) {
 	if len(top) != 1 {
 		t.Fatalf("root array has %d entries, want 1", len(top))
 	}
-	if _, ok := top[0]["Node Type"]; !ok {
-		t.Errorf("root object missing 'Node Type' key: %+v", top[0])
+	plan, ok := top[0]["Plan"].(map[string]any)
+	if !ok {
+		t.Fatalf("top[0] missing \"Plan\" object: %+v", top[0])
+	}
+	if _, ok := plan["Node Type"]; !ok {
+		t.Errorf("plan object missing 'Node Type' key: %+v", plan)
 	}
 }
 
@@ -97,8 +101,12 @@ func TestExplainFormatJSONOmitsOutputWithoutVerbose(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &top); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := top[0]["Output"]; ok {
-		t.Errorf("non-verbose JSON includes 'Output' key: %+v", top[0])
+	plan, ok := top[0]["Plan"].(map[string]any)
+	if !ok {
+		t.Fatalf("top[0] missing \"Plan\" object: %+v", top[0])
+	}
+	if _, ok := plan["Output"]; ok {
+		t.Errorf("non-verbose JSON includes 'Output' key: %+v", plan)
 	}
 }
 
@@ -117,9 +125,13 @@ func TestExplainFormatJSONHonoursVerbose(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &top); err != nil {
 		t.Fatal(err)
 	}
-	out, ok := top[0]["Output"]
+	plan, ok := top[0]["Plan"].(map[string]any)
 	if !ok {
-		t.Fatalf("verbose JSON missing 'Output' key: %+v", top[0])
+		t.Fatalf("top[0] missing \"Plan\" object: %+v", top[0])
+	}
+	out, ok := plan["Output"]
+	if !ok {
+		t.Fatalf("verbose JSON missing 'Output' key: %+v", plan)
 	}
 	cols, ok := out.([]any)
 	if !ok || len(cols) == 0 {
@@ -187,6 +199,12 @@ func TestExplainIncludesWindowAggNodeJSON(t *testing.T) {
 func jsonPlanHasNodeType(node map[string]any, needle string) bool {
 	if nodeType, ok := node["Node Type"].(string); ok && strings.HasPrefix(nodeType, needle) {
 		return true
+	}
+	// 0118-0102: the top-level array element wraps the plan tree under "Plan".
+	if p, ok := node["Plan"].(map[string]any); ok {
+		if jsonPlanHasNodeType(p, needle) {
+			return true
+		}
 	}
 	children, ok := node["Plans"].([]any)
 	if !ok {

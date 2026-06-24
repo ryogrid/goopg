@@ -1228,6 +1228,21 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       Spec stays `failed` — remaining blockers are the Effort-L EXPLAIN JSON
       `Heap Fetches` emission + MVCC pruning-horizon core. Tests
       `TestParseExecuteIntoStrict` + `TestPlpgSQLExecuteIntoStrict`. Ledger row.
+      **2026-06-25 (design 0118-0102, enabler — NOT a promotion):** EXPLAIN
+      infrastructure for the `Heap Fetches` rung — (1) `EXPLAIN (FORMAT JSON)`
+      now nests the plan tree under a top-level `"Plan"` key (PG-faithful;
+      `Planning/Execution Time` siblings) so `…->0->'Plan'->…` resolves (goopg
+      flattened it before); (2) IndexOnlyScan renders `Index Only Scan using
+      <idx> on <table>` (was the `%T` default); (3) EXPLAIN ANALYZE reports
+      `Heap Fetches` for IOS nodes (JSON key + text line), counted from the
+      operator's non-`ALL_VISIBLE` fallback (new `nodeStats.heapFetches` +
+      `heapFetchCounter` interface). 6 internal JSON tests updated for the
+      wrapper. **horizons re-probe isolates the residual blocker:** goopg's
+      planner emits `Sort → Seq Scan` (not an IOS) for `SELECT * … ORDER BY
+      data` and does NOT honor `enable_seqscan/indexscan/bitmapscan=false`, so
+      no IOS node exists → `Heap Fetches` NULL. NEXT (Effort-L): planner
+      GUC-honoring + ordered-full-index→IOS promotion, then the MVCC
+      pruning-horizon core. `TestExplainHeapFetchesIndexOnlyScan` PASS. Ledger.
       **Remaining M0118-0009:** `intra-grant-inplace` (pg_class sibling — ALTER
       TABLE ADD PRIMARY KEY `<waiting>` behind FOR KEY SHARE on pg_class; needs
       runtime shared-catalog MVCC-tuple row locks — heavy), `horizons`

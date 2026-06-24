@@ -26,7 +26,16 @@ type indexOnlyScanOp struct {
 	// M0092-0007: embedded slot reused across every Next() call
 	// so we don't allocate a fresh MaterializedSlot per emission.
 	slot MaterializedSlot
+	// heapFetchCount, when non-nil, is incremented once per index entry
+	// whose heap page was NOT ALL_VISIBLE and therefore required a heap
+	// fetch — the EXPLAIN ANALYZE "Heap Fetches" tally (design 0118-0102).
+	// Set by maybeInstrument only under EXPLAIN ANALYZE; nil otherwise.
+	heapFetchCount *int64
 }
+
+// setHeapFetchCounter implements the heapFetchCounter interface so EXPLAIN
+// ANALYZE can surface this scan's heap-fetch count (design 0118-0102).
+func (o *indexOnlyScanOp) setHeapFetchCounter(c *int64) { o.heapFetchCount = c }
 
 func newIndexOnlyScanOp(p *planner.IndexOnlyScan) *indexOnlyScanOp {
 	return &indexOnlyScanOp{plan: p}
@@ -160,7 +169,14 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 			return true, nil
 		}
 
-		// Fallback: heap fetch + HOT chain + MVCC.
+		// Fallback: heap fetch + HOT chain + MVCC. The page was not
+		// ALL_VISIBLE so this entry costs a heap fetch — count it for
+		// EXPLAIN ANALYZE "Heap Fetches" (design 0118-0102), mirroring
+		// upstream's ioss_HeapFetches++ which fires per visited entry
+		// regardless of the eventual visibility verdict.
+		if o.heapFetchCount != nil {
+			*o.heapFetchCount++
+		}
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
 		if err != nil {
 			return false, err

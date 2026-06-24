@@ -67,15 +67,19 @@ func TestExplainAnalyzeTimingOffJSONOmitsTimeKeys(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &top); err != nil {
 		t.Fatal(err)
 	}
-	root := top[0]
+	// 0118-0102: per-node Actual* keys live under the "Plan" wrapper.
+	plan, ok := top[0]["Plan"].(map[string]any)
+	if !ok {
+		t.Fatalf("top[0] missing \"Plan\" object: %+v", top[0])
+	}
 	for _, must := range []string{"Actual Rows", "Actual Loops"} {
-		if _, ok := root[must]; !ok {
-			t.Errorf("expected %q present even with TIMING off: %+v", must, root)
+		if _, ok := plan[must]; !ok {
+			t.Errorf("expected %q present even with TIMING off: %+v", must, plan)
 		}
 	}
 	for _, mustNot := range []string{"Actual Total Time", "Actual Startup Time"} {
-		if _, ok := root[mustNot]; ok {
-			t.Errorf("TIMING off must omit %q: %+v", mustNot, root)
+		if _, ok := plan[mustNot]; ok {
+			t.Errorf("TIMING off must omit %q: %+v", mustNot, plan)
 		}
 	}
 }
@@ -116,18 +120,27 @@ func TestExplainJSONShapeStable(t *testing.T) {
 		t.Fatalf("root array has %d entries, want 1", len(top))
 	}
 	root := top[0]
+	// 0118-0102: the plan tree nests under "Plan".
+	plan, ok := root["Plan"].(map[string]any)
+	if !ok {
+		t.Fatalf("top[0] missing \"Plan\" object: %+v", root)
+	}
 	// Required key.
-	if _, ok := root["Node Type"]; !ok {
+	if _, ok := plan["Node Type"]; !ok {
 		t.Error("missing required 'Node Type'")
 	}
-	// Gated keys must be absent without their option.
+	// Gated keys must be absent without their option (checked at both the
+	// root and the plan-node level).
 	for _, mustNot := range []string{
 		"Output", "Actual Rows", "Actual Loops",
 		"Actual Total Time", "Actual Startup Time",
 		"Planning Time", "Execution Time",
 	} {
+		if _, ok := plan[mustNot]; ok {
+			t.Errorf("non-ANALYZE JSON plan should not include %q: %+v", mustNot, plan)
+		}
 		if _, ok := root[mustNot]; ok {
-			t.Errorf("non-ANALYZE JSON should not include %q: %+v", mustNot, root)
+			t.Errorf("non-ANALYZE JSON root should not include %q: %+v", mustNot, root)
 		}
 	}
 }

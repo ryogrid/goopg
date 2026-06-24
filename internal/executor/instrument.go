@@ -25,6 +25,12 @@ type nodeStats struct {
 	gotFirst   bool  // first Next-since-Open returned a row
 	openTime   time.Time
 	rowDeltaT  time.Time
+	// heapFetches counts the heap tuples an IndexOnlyScan had to fetch
+	// because the page was not ALL_VISIBLE (design 0118-0102). Mirrors
+	// upstream's IndexOnlyScanState.ioss_HeapFetches, surfaced by EXPLAIN
+	// ANALYZE as the "Heap Fetches" line / JSON key. The IOS operator
+	// increments it directly via a pointer handed to it in maybeInstrument.
+	heapFetches int64
 }
 
 // instrumentedOp wraps inner so the EXPLAIN ANALYZE renderer can
@@ -100,6 +106,14 @@ func (o *instrumentedOp) RowsAffected() int64 {
 	return 0
 }
 
+// heapFetchCounter is implemented by operators that fetch heap tuples
+// behind an index-only scan and want EXPLAIN ANALYZE to report a "Heap
+// Fetches" count (design 0118-0102). maybeInstrument hands the operator
+// a pointer to its node's stats.heapFetches so it can ++ on each fetch.
+type heapFetchCounter interface {
+	setHeapFetchCounter(*int64)
+}
+
 // nodeStatsTable maps a planner.Node back to its instrumentation
 // counters. The EXPLAIN ANALYZE renderer walks the plan tree the
 // same way the static path does and looks up stats in this map
@@ -149,5 +163,11 @@ func maybeInstrument(plan planner.Node, op Operator) Operator {
 	}
 	stats := &nodeStats{timing: instrumentScope.timing}
 	instrumentScope.table[plan] = stats
+	// Hand an IndexOnlyScan (or any heap-fetch-counting operator) a pointer
+	// to its stats.heapFetches so it can tally heap fetches during Open;
+	// the EXPLAIN ANALYZE renderer reads them back via the table. (0118-0102)
+	if hf, ok := op.(heapFetchCounter); ok {
+		hf.setHeapFetchCounter(&stats.heapFetches)
+	}
 	return &instrumentedOp{inner: op, plan: plan, stats: stats}
 }
