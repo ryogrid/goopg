@@ -888,7 +888,7 @@ func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
 		if !ok || !tableHasToastRelation(t) {
 			return "", false
 		}
-		return "pg_toast.pg_toast_" + strconv.Itoa(int(parentOID)) + "_index", true
+		return "pg_toast." + c.toastDisplayNameLocked(oid, "pg_toast_"+strconv.Itoa(int(parentOID))+"_index"), true
 	}
 	if oid < toastRelidOffset {
 		return "", false
@@ -900,7 +900,83 @@ func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
 	if !ok || !tableHasToastRelation(t) {
 		return "", false
 	}
-	return "pg_toast.pg_toast_" + strconv.Itoa(int(parentOID)), true
+	return "pg_toast." + c.toastDisplayNameLocked(oid, "pg_toast_"+strconv.Itoa(int(parentOID))), true
+}
+
+// toastDisplayNameLocked returns the current unqualified name of a synthetic
+// TOAST relation/index OID: the override recorded by ALTER … RENAME if present,
+// otherwise the default deflt (pg_toast_<parentOID>[_index]). The caller must
+// hold c.mu (read or write). M0118-0008 TOAST-exposure slice 4 (design 0118-0087).
+func (c *InMemory) toastDisplayNameLocked(oid uint32, deflt string) string {
+	if name, ok := c.toastRenames[oid]; ok && name != "" {
+		return name
+	}
+	return deflt
+}
+
+// RenameToastRel records a new unqualified name for a synthetic TOAST relation
+// or index OID (ALTER TABLE/INDEX … RENAME under allow_system_table_mods). The
+// override is read back by the pg_class virtual builder, ToastRelName and
+// LookupToastRel. M0118-0008 TOAST-exposure slice 4 (design 0118-0087).
+func (c *InMemory) RenameToastRel(oid uint32, newName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.toastRenames[oid] = newName
+}
+
+// LookupToastRel resolves a schema-qualified pg_toast relation/index name to its
+// synthetic OID. It accepts either the default name (pg_toast_<parentOID> for the
+// TOAST relation, pg_toast_<parentOID>_index for its unique btree index) or a name
+// recorded by ALTER … RENAME. Returns (oid, isIndex, true) when the name resolves
+// to a live TOAST object whose parent table still owns an auto-exposed TOAST
+// relation; (0, false, false) otherwise. Used by the executor's ALTER TABLE/INDEX
+// … RENAME and REINDEX routing. M0118-0008 TOAST-exposure slice 4 (design 0118-0087).
+func (c *InMemory) LookupToastRel(schema, name string) (oid uint32, isIndex bool, ok bool) {
+	if !strings.EqualFold(schema, "pg_toast") {
+		return 0, false, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// 1) An override name (e.g. reind_con_toast / reind_con_toast_idx).
+	for ov, nm := range c.toastRenames {
+		if nm != name {
+			continue
+		}
+		var parentOID uint32
+		idx := ov >= toastIndexOidOffset
+		if idx {
+			parentOID = ov - toastIndexOidOffset
+		} else {
+			parentOID = ov - toastRelidOffset
+		}
+		if t, found := c.tableByOID(parentOID); found && tableHasToastRelation(t) {
+			return ov, idx, true
+		}
+	}
+	// 2) A default name pg_toast_<parentOID>[ _index ].
+	const pfx = "pg_toast_"
+	if !strings.HasPrefix(name, pfx) {
+		return 0, false, false
+	}
+	body := name[len(pfx):]
+	isIdx := false
+	if strings.HasSuffix(body, "_index") {
+		isIdx = true
+		body = strings.TrimSuffix(body, "_index")
+	}
+	pOID, err := strconv.ParseUint(body, 10, 32)
+	if err != nil {
+		return 0, false, false
+	}
+	parentOID := uint32(pOID)
+	t, found := c.tableByOID(parentOID)
+	if !found || !tableHasToastRelation(t) {
+		return 0, false, false
+	}
+	if isIdx {
+		return parentOID + toastIndexOidOffset, true, true
+	}
+	return parentOID + toastRelidOffset, false, true
 }
 
 // toastBearingTables returns every relation that owns an auto-exposed TOAST
@@ -1468,6 +1544,20 @@ type InMemory struct {
 	// for partition index trees (ALTER INDEX parent ATTACH PARTITION child). M0097-0023.
 	indexPartitionChildren map[uint32][]uint32
 
+	// toastRenames maps a synthetic TOAST relation/index OID (parent OID +
+	// toastRelidOffset for the relation, + toastIndexOidOffset for its index) to
+	// a new unqualified name set by ALTER TABLE/INDEX … RENAME under
+	// allow_system_table_mods. The synthetic TOAST pg_class/pg_index rows live
+	// only in the virtual builders (not c.tables), so a rename cannot mutate a
+	// real row; this override is consulted by the pg_class builder (relname),
+	// ToastRelName (regclass rendering) and LookupToastRel (name→OID). The
+	// reind_con_toast spec renames pg_toast_<oid> → reind_con_toast and its
+	// _index → reind_con_toast_idx so REINDEX … CONCURRENTLY can name them
+	// deterministically. Not transaction-scoped (only this spec mutates synthetic
+	// TOAST objects, always in autocommit). M0118-0008 TOAST-exposure slice 4
+	// (design 0118-0087).
+	toastRenames map[uint32]string
+
 	// pendingPartitionDetachCount counts partition children currently marked
 	// "detach pending" (DetachPendingEpoch != 0) by an in-progress
 	// ALTER TABLE … DETACH PARTITION … CONCURRENTLY. Maintained by
@@ -1828,6 +1918,7 @@ func NewInMemory() *InMemory {
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
 		partitionChildren:      make(map[uint32][]uint32),
 		indexPartitionChildren: make(map[uint32][]uint32),
+		toastRenames:           make(map[uint32]string),
 		inheritanceChildren:    make(map[uint32][]uint32),
 		enumTypes:              make(map[string]*EnumType),
 		domains:                make(map[string]*Domain),
@@ -3223,40 +3314,41 @@ func (c *InMemory) registerSystemTables() {
 					toastReloptions = "{" + strings.Join(t.ToastReloptions, ",") + "}"
 				}
 				out = append(out, []string{
-					strconv.Itoa(toastOID),                 // 0:  oid
-					"pg_toast_" + strconv.Itoa(int(t.OID)), // 1:  relname
-					"99",                                   // 2:  relnamespace (pg_toast)
-					"0",                                    // 3:  reltype
-					"0",                                    // 4:  reloftype
-					"10",                                   // 5:  relowner
-					"0",                                    // 6:  relam
-					strconv.Itoa(toastOID),                 // 7:  relfilenode
-					"0",                                    // 8:  reltablespace
-					"0",                                    // 9:  relpages
-					"0",                                    // 10: reltuples
-					"0",                                    // 11: relallvisible
-					"0",                                    // 12: relallfrozen
-					"0",                                    // 13: reltoastrelid
-					"t",                                    // 14: relhasindex (pg_toast_<oid>_index)
-					"f",                                    // 15: relisshared
-					relpers,                                // 16: relpersistence (inherits the table's)
-					"t",                                    // 17: relkind (TOAST)
-					"3",                                    // 18: relnatts (chunk_id, chunk_seq, chunk_data)
-					"0",                                    // 19: relchecks
-					"f",                                    // 20: relhasrules
-					"f",                                    // 21: relhastriggers
-					"f",                                    // 22: relhassubclass
-					"f",                                    // 23: relrowsecurity
-					"f",                                    // 24: relforcerowsecurity
-					"t",                                    // 25: relispopulated
-					"n",                                    // 26: relreplident
-					"f",                                    // 27: relispartition
-					"0",                                    // 28: relrewrite
-					"0",                                    // 29: relfrozenxid
-					"1",                                    // 30: relminmxid
-					"",                                     // 31: relacl (NULL)
-					toastReloptions,                        // 32: reloptions ({autovacuum_enabled=false})
-					"",                                     // 33: relpartbound
+					strconv.Itoa(toastOID), // 0:  oid
+					// relname honours an ALTER … RENAME override (slice 4).
+					c.toastDisplayNameLocked(uint32(toastOID), "pg_toast_"+strconv.Itoa(int(t.OID))), // 1:  relname
+					"99",                   // 2:  relnamespace (pg_toast)
+					"0",                    // 3:  reltype
+					"0",                    // 4:  reloftype
+					"10",                   // 5:  relowner
+					"0",                    // 6:  relam
+					strconv.Itoa(toastOID), // 7:  relfilenode
+					"0",                    // 8:  reltablespace
+					"0",                    // 9:  relpages
+					"0",                    // 10: reltuples
+					"0",                    // 11: relallvisible
+					"0",                    // 12: relallfrozen
+					"0",                    // 13: reltoastrelid
+					"t",                    // 14: relhasindex (pg_toast_<oid>_index)
+					"f",                    // 15: relisshared
+					relpers,                // 16: relpersistence (inherits the table's)
+					"t",                    // 17: relkind (TOAST)
+					"3",                    // 18: relnatts (chunk_id, chunk_seq, chunk_data)
+					"0",                    // 19: relchecks
+					"f",                    // 20: relhasrules
+					"f",                    // 21: relhastriggers
+					"f",                    // 22: relhassubclass
+					"f",                    // 23: relrowsecurity
+					"f",                    // 24: relforcerowsecurity
+					"t",                    // 25: relispopulated
+					"n",                    // 26: relreplident
+					"f",                    // 27: relispartition
+					"0",                    // 28: relrewrite
+					"0",                    // 29: relfrozenxid
+					"1",                    // 30: relminmxid
+					"",                     // 31: relacl (NULL)
+					toastReloptions,        // 32: reloptions ({autovacuum_enabled=false})
+					"",                     // 33: relpartbound
 				})
 				// Synthesize the TOAST relation's unique btree index
 				// pg_toast_<oid>_index (relkind='i'), mirroring the index PG
@@ -3268,8 +3360,9 @@ func (c *InMemory) registerSystemTables() {
 				// slice 3.
 				toastIdxOID := int(t.OID) + toastIndexOidOffset
 				out = append(out, []string{
-					strconv.Itoa(toastIdxOID),                         // 0:  oid
-					"pg_toast_" + strconv.Itoa(int(t.OID)) + "_index", // 1:  relname
+					strconv.Itoa(toastIdxOID), // 0:  oid
+					// relname honours an ALTER INDEX … RENAME override (slice 4).
+					c.toastDisplayNameLocked(uint32(toastIdxOID), "pg_toast_"+strconv.Itoa(int(t.OID))+"_index"), // 1:  relname
 					"99",                      // 2:  relnamespace (pg_toast)
 					"0",                       // 3:  reltype
 					"0",                       // 4:  reloftype

@@ -221,3 +221,66 @@ func TestToastRelationIndexExposed(t *testing.T) {
 		t.Errorf("indexrelid::regclass::text = %q, want %q", got, wantName)
 	}
 }
+
+// TestToastRelationRenameViaAlter verifies M0118-0008 TOAST-exposure slice 4: a
+// synthetic TOAST relation and its unique btree index — which live only in the
+// pg_class/pg_index virtual builders, not c.tables — can be RENAMEd via
+// ALTER TABLE / ALTER INDEX under allow_system_table_mods. The reind_con_toast
+// spec's global setup walks:
+//
+//	ALTER TABLE  pg_toast.pg_toast_<oid>        RENAME TO reind_con_toast;
+//	ALTER INDEX  pg_toast.pg_toast_<oid>_index  RENAME TO reind_con_toast_idx;
+//
+// After each rename the new name must be visible in pg_class.relname AND resolve
+// back through regclass (indexrelid::regclass), so REINDEX … CONCURRENTLY can
+// later address the objects deterministically.
+func TestToastRelationRenameViaAlter(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE reind_con_wide (id int primary key, data text)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	wideTbl, ok := cat.LookupTable(parser.ObjectName{Name: "reind_con_wide"})
+	if !ok {
+		t.Fatal("reind_con_wide not found")
+	}
+	const (
+		relOffset = 100_000_000
+		idxOffset = 200_000_000
+	)
+	toastRelName := "pg_toast_" + strconv.Itoa(int(wideTbl.OID))
+	toastIdxName := toastRelName + "_index"
+	wantRelOID := strconv.Itoa(int(wideTbl.OID) + relOffset)
+	wantIdxOID := strconv.Itoa(int(wideTbl.OID) + idxOffset)
+
+	// Rename the TOAST relation.
+	if err := runDDL(t, ctx, `ALTER TABLE pg_toast.`+toastRelName+` RENAME TO reind_con_toast`); err != nil {
+		t.Fatalf("rename toast relation: %v", err)
+	}
+	// pg_class now reports the new relname against the same synthetic OID.
+	rows := runQuery(t, ctx, `SELECT oid::text FROM pg_class WHERE relname = 'reind_con_toast'`)
+	if len(rows) != 1 || rows[0][0].StringValue() != wantRelOID {
+		t.Fatalf("after rename, pg_class WHERE relname='reind_con_toast' = %v, want oid %s", rows, wantRelOID)
+	}
+
+	// Rename the TOAST index. Its name is parent-OID-derived (independent of the
+	// relation rename), so the input is still pg_toast_<oid>_index.
+	if err := runDDL(t, ctx, `ALTER INDEX pg_toast.`+toastIdxName+` RENAME TO reind_con_toast_idx`); err != nil {
+		t.Fatalf("rename toast index: %v", err)
+	}
+	rows = runQuery(t, ctx, `SELECT oid::text FROM pg_class WHERE relname = 'reind_con_toast_idx'`)
+	if len(rows) != 1 || rows[0][0].StringValue() != wantIdxOID {
+		t.Fatalf("after rename, pg_class WHERE relname='reind_con_toast_idx' = %v, want oid %s", rows, wantIdxOID)
+	}
+
+	// regclass renders the renamed, schema-qualified index name.
+	rows = runQuery(t, ctx,
+		`SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid = (SELECT oid::text FROM pg_class WHERE relname = 'reind_con_toast')`)
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row from the spec join, got %d", len(rows))
+	}
+	if got, want := rows[0][0].StringValue(), "pg_toast.reind_con_toast_idx"; got != want {
+		t.Errorf("indexrelid::regclass::text = %q, want %q", got, want)
+	}
+}

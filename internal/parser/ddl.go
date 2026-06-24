@@ -4639,6 +4639,27 @@ func (p *parser) parseAlter() (Stmt, error) {
 			})
 			return stmt, nil
 		}
+		// ALTER INDEX name RENAME TO newname — share the executor's
+		// AlterTableRenameTable path (carries Name so a synthetic pg_toast index
+		// rename can be intercepted). Previously fell into the no-op branch below
+		// with an empty Name, so the rename was silently dropped. M0118-0008
+		// TOAST-exposure slice 4 (design 0118-0087).
+		if p.acceptIdentKeyword("rename") {
+			if _, err := p.expectKeyword(KwTo); err != nil {
+				return nil, err
+			}
+			newNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt := &AlterTableStmt{pos: t.Pos, Name: idxName}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				pos:     newNameTok.Pos,
+				Kind:    AlterTableRenameTable,
+				NewName: identText(newNameTok),
+			})
+			return stmt, nil
+		}
 		// Other ALTER INDEX forms: consume rest as no-op.
 		for p.cur().Kind != TokenEOF {
 			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {

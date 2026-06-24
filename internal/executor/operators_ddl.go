@@ -5477,6 +5477,25 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				}
 			}
 		}
+		// ALTER TABLE/INDEX pg_toast.<name> RENAME TO <new> — a synthetic TOAST
+		// relation or its unique btree index. These rows live only in the pg_class/
+		// pg_index virtual builders (not c.tables), so there is no real row to
+		// mutate; record a name override the builders + regclass + name→OID lookup
+		// consult. The reind_con_toast spec renames the toast rel/index to
+		// deterministic names so REINDEX … CONCURRENTLY can address them. Requires
+		// allow_system_table_mods in PostgreSQL; the spec sets it. M0118-0008
+		// TOAST-exposure slice 4 (design 0118-0087).
+		if im, okIM := o.ctx.Catalog.(*catalog.InMemory); okIM && strings.EqualFold(s.Name.Schema, "pg_toast") {
+			for _, act := range s.Actions {
+				if act.Kind != parser.AlterTableRenameTable {
+					continue
+				}
+				if toastOID, _, found := im.LookupToastRel(s.Name.Schema, s.Name.Name); found {
+					im.RenameToastRel(toastOID, act.NewName)
+					return nil
+				}
+			}
+		}
 		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Name.String())}
 	}
 	// Reject structural modifications to system catalogs. pg_catalog and

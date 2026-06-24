@@ -1,46 +1,49 @@
-Loop #21: M0118-0008 — `reindex-concurrently-toast` (LAST unpromoted spec; other
-24 pass strict). Landed TOAST-exposure epic SLICE 3 (design 0118-0086). Spec
-stays `defer` (steps 4–5 of the 5-step epic remain).
+Loop #22: M0118-0008 — `reindex-concurrently-toast` (LAST unpromoted spec; other
+24 pass strict). Landed TOAST-exposure epic SLICE 4 (design 0118-0087). Spec
+stays `defer` (slice 5 of the 5-slice epic remains).
 
-## What landed (slice 3 of 5)
-The TOAST relation's auto-created UNIQUE btree index `pg_toast_<oid>_index`
-(on chunk_id, chunk_seq) is now exposed in BOTH pg_class (relkind='i') and
-pg_index, so the spec setup's join
-`SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid =
-(SELECT oid FROM pg_class WHERE relname=<toast rel>)` resolves the index name.
-Catalog-only — goopg has no real TOAST index (catalog/regclass-only).
-- NEW const `toastIndexOidOffset = 200_000_000` (idx OID = parent OID + 200M;
-  100M above toastRelidOffset so [200M,300M) never overlaps [100M,200M)).
-- `ToastRelName(oid)` now resolves the index range FIRST → `pg_toast.pg_toast_
-  <oid>_index`; expr.go regclass arm already falls through to it.
-- pg_class builder emits the relkind='i' row (relnamespace=99, relam=403,
-  relnatts=2) inside the existing `if hasToastRel` block; toast-rel row's
-  relhasindex flips f→t.
-- pg_index builder emits one toast-index row per toast-bearing table
-  (indexrelid=OID+200M, indrelid=OID+100M, unique, indkey="1 2").
-- NEW `(*InMemory).toastBearingTables()` — enumerates the SAME table set the
-  pg_class TOAST emission uses (shared `tableHasToastRelation` gate) so pg_class
-  and pg_index can't diverge into an indexrelid with no pg_class row.
+## What landed (slice 4 of 5)
+ALTER TABLE/INDEX … RENAME on a synthetic pg_toast relation/index under
+allow_system_table_mods now works → the spec's global setup runs byte-for-byte.
+Two blockers fixed:
+- The synthetic toast rel/idx rows live ONLY in the virtual builders, not
+  c.tables, so a rename can't mutate a real row. Record a NAME OVERRIDE instead:
+  - NEW catalog field `toastRenames map[uint32]string` (synthetic OID → new name),
+    init in ctor.
+  - `toastDisplayNameLocked(oid, deflt)` (override or default; caller holds c.mu),
+    `RenameToastRel(oid, newName)`, `LookupToastRel(schema, name) (oid, isIdx, ok)`
+    (override OR default `pg_toast_<oid>[_index]` pattern, re-validates parent).
+  - `ToastRelName` + BOTH pg_class synthetic rows (rel + idx relname) render via
+    `toastDisplayNameLocked`. pg_index carries no names → unchanged.
+- The ALTER INDEX parser had NO RENAME arm (fell into the no-op branch → empty
+  Name). Added `ALTER INDEX … RENAME TO` arm emitting AlterTableRenameTable +
+  Name. (ddl.go, right after the ATTACH PARTITION block.)
+- Executor `execAlterTable`: when both table+index lookups miss and Name.Schema ==
+  "pg_toast", a RENAME action resolves via LookupToastRel → RenameToastRel.
 
-Files: internal/catalog/catalog.go (toastIndexOidOffset, ToastRelName index arm,
-toastBearingTables, pg_class toast-index row + relhasindex flip, pg_index
-toast-index rows); internal/executor/toast_relation_exposure_test.go (NEW
-TestToastRelationIndexExposed); docs/design/0118-0086-*.md + README; ledger.
+Inert when override map empty (every non-spec flow) ⇒ pg_class/pg_index/regclass
+byte-identical, so no pg_dump/pg_amcheck re-run needed.
 
-## Next step (slice 4)
-`ALTER TABLE/INDEX … RENAME` on a pg_toast relation/index under
-allow_system_table_mods (setup renames pg_toast_<oid>→reind_con_toast and its
-_index→reind_con_toast_idx) + `pg_toast.<newname>` name resolution. The synthetic
-toast rows live only in the virtual builder, not c.tables — RENAME must record an
-override map (old synthetic OID → new name) consulted by both the virtual builder
-AND name→OID lookup. Then slice 5 = REINDEX {TABLE,INDEX} CONCURRENTLY
-pg_toast.<name> routing (rides 0118-0029 waitForRelationLockers). Re-run
-blast-radius parity suites after each.
+Files: internal/catalog/catalog.go; internal/parser/ddl.go (ALTER INDEX RENAME);
+internal/executor/operators_ddl.go (pg_toast RENAME intercept);
+internal/executor/toast_relation_exposure_test.go (NEW TestToastRelationRenameViaAlter);
+docs/design/0118-0087-*.md + README; ledger.
+
+## Next step (slice 5 — LAST)
+`REINDEX {TABLE,INDEX} CONCURRENTLY pg_toast.<name>` routing. Probe divergence is
+now EXACTLY at the REINDEX steps: `relation "pg_toast.reind_con_toast" does not
+exist`. Plan: in reindexOp (internal/executor/operators_*.go — find via
+`parseReindex`/`reindexOp.Next`), resolve a pg_toast schema-qualified target via
+catalog.LookupToastRel (already built). The reindex itself is a catalog no-op on
+the synthetic object BUT must wait for relation lockers on the PARENT table
+(reind_con_wide) so the `<waiting …>`/`<... completed>` markers ride 0118-0029
+`(*Context).waitForRelationLockers`. Handle DROP-during-reindex perms (parent
+dropped → toast gone, sel2 errors `relation "reind_con_wide" does not exist`).
+Then promote: switch TestPort_IsolationReindexConcurrentlyToast soft→strict, set
+the D-002 CSV rationale, regen coverage/inventory md.
 
 ## Gates run (this loop)
-go test ./internal/{catalog,executor}/ PASS; TestToastRelationIndexExposed +
-TestToastRelationAutoExposed + TestReltoastrelidRegclassRendersToastName PASS;
-ALL blast-radius parity suites PASS (PgDump001Basic, PgDumpConnectionSetup,
-PgAmcheck* incl. AllTables/002/BtreeIndexCheck whole-DB walks, Scripts*);
-IsolationReindexConcurrently + IsolationPlpgsqlToast PASS; build/gofmt clean;
-pgbench smoke = pre-commit hook.
+go test ./internal/{catalog,parser}/ PASS; TestToastRelationRenameViaAlter +
+slices 1-3 toast tests PASS; strict IsolationReindexConcurrently/ReindexSchema/
+MultipleCic/DropIndexConcurrently1/AlterTable3 PASS; probe = global setup now
+passes (divergence at REINDEX steps); go build clean; pgbench smoke = pre-commit.
