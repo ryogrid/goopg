@@ -135,7 +135,21 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 		if stmt.Mode == "TEMP" || stmt.Mode == "ALL" {
 			if o.ctx != nil {
 				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-					im.DropSessionTempObjects(sessionTempOwner(o.ctx))
+					owner := sessionTempOwner(o.ctx)
+					// Capture the temp tables' names before dropping them: a temp
+					// table's implicit composite rowtype is dropped with it, which
+					// cascades to any (possibly non-temp) routine that takes or
+					// returns that rowtype — e.g. the temp-schema-cleanup spec's
+					// uses_a_temp_type(just_give_me_a_type). PostgreSQL tracks this
+					// via pg_depend; goopg matches by the temp table's
+					// session-unique name. M0118-0009 (temp-schema-cleanup).
+					tempTypeNames := im.SessionTempTableNames(owner)
+					im.DropSessionTempObjects(owner)
+					if len(tempTypeNames) > 0 {
+						if rs := o.ctx.Catalog.Routines(); rs != nil {
+							rs.DropRoutinesReferencingTypes(tempTypeNames)
+						}
+					}
 				}
 			}
 		}

@@ -383,6 +383,69 @@ func (rs *Routines) DropRoutine(r *Routine) error {
 	return nil
 }
 
+// DropRoutinesReferencingTypes drops every registered routine whose argument
+// or return type name matches one of typeNames (case-insensitive), returning
+// the dropped routines. It backs temporary-object cleanup (DISCARD TEMP /
+// backend exit): dropping a temporary table also drops its implicit composite
+// rowtype, which in PostgreSQL cascades (via pg_depend) to any function that
+// takes or returns that rowtype — e.g. the spec's
+// uses_a_temp_type(just_give_me_a_type). goopg has no OID-level type-dependency
+// graph, so the temp table's (session-unique) name is the dependency signal;
+// callers pass the names of the just-dropped temp tables. M0118-0009
+// (temp-schema-cleanup).
+func (rs *Routines) DropRoutinesReferencingTypes(typeNames []string) []*Routine {
+	if len(typeNames) == 0 {
+		return nil
+	}
+	want := make(map[string]bool, len(typeNames))
+	for _, n := range typeNames {
+		if n != "" {
+			want[strings.ToLower(n)] = true
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	var dropped []*Routine
+	for k, r := range rs.byKey {
+		if r == nil {
+			continue
+		}
+		referenced := want[strings.ToLower(r.ReturnType.Name)]
+		if !referenced {
+			for _, at := range r.ArgTypes {
+				if want[strings.ToLower(at.Name)] {
+					referenced = true
+					break
+				}
+			}
+		}
+		if !referenced {
+			continue
+		}
+		delete(rs.byKey, k)
+		schema := r.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		nk := nameKey(schema, r.Name)
+		keys := rs.byName[nk]
+		for i, kk := range keys {
+			if kk == k {
+				rs.byName[nk] = append(keys[:i], keys[i+1:]...)
+				break
+			}
+		}
+		if len(rs.byName[nk]) == 0 {
+			delete(rs.byName, nk)
+		}
+		dropped = append(dropped, r)
+	}
+	return dropped
+}
+
 // List returns every registered routine in deterministic OID order.
 // Used by `pg_catalog.pg_proc`'s virtual-row provider.
 // LookupByOID returns the routine with the given OID, or nil if not found.

@@ -1,36 +1,50 @@
-Loop #28: **M0118-0009 temp-schema-cleanup permutation 1 PASSES byte-for-byte**
-(design 0118-0091). Per-session temporary-namespace model + pg_my_temp_schema()
-+ real DISCARD TEMP cleanup. COMMITTED. Spec NOT yet promoted (perm 2 deferred).
+Loop #29: **M0118-0009 temp-schema-cleanup perm-2 enabler — temp-type
+dependency cascade on DISCARD TEMP** (design 0118-0092). Enabler, NOT a
+promotion. COMMITTED.
 
 Landed:
-- catalog.go: InMemory.tempNamespaces (owner "s<id>"→nsOID) + EnsureTempNamespace
-  (lazy/idempotent, persists for session), TempNamespaceOID, DropTempNamespace,
-  DropSessionTempObjects (owner-scoped relation drop, keeps namespace),
-  tempNamespaceOIDLocked. allSchemasLocked emits pg_temp_<id> rows. pg_class
-  VirtualRows renders temp rels (t.Temp && t.TempOwner!="") in pg_temp_<id> ns.
-- expr.go: pg_my_temp_schema() evaluator. operators_ddl.go: both CREATE TEMP
-  paths call EnsureTempNamespace. operators_utility_settings.go: DISCARD TEMP/ALL
-  → DropSessionTempObjects (was a silent no-op). planner.go exprType→oid.
-- Tests: catalog TestTempNamespaceLifecycle/TestDropSessionTempObjects;
-  testport TestSyntax_TempSchema_MyTempSchemaAndDiscard (cluster, hard guard);
-  anchor TestPort_IsolationTempSchemaCleanup (runIsoSpec, skips until full pass).
+- catalog/catalog.go: `(*InMemory).SessionTempTableNames(owner) []string`
+  (read-only temp-relation name list for a session; call BEFORE
+  DropSessionTempObjects).
+- catalog/routines.go: `(*Routines).DropRoutinesReferencingTypes(typeNames)
+  []*Routine` — drops every routine whose arg/return Type.Name matches one of
+  typeNames (case-insensitive; maintains byKey + byName). The cascade goopg uses
+  in lieu of an OID-level pg_depend graph (temp table's implicit composite
+  rowtype shares the table name).
+- executor/operators_utility_settings.go: DISCARD TEMP now captures
+  SessionTempTableNames(owner) → DropSessionTempObjects(owner) →
+  Routines().DropRoutinesReferencingTypes(names). So perm-1's DISCARD TEMP
+  cascade-drops the public function uses_a_temp_type(just_give_me_a_type), and
+  perm-2's re-create of s1_create_temp_objects no longer fails "already exists".
+- Test: catalog TestSessionTempTableNamesAndTypeCascade.
+- docs/design/0118-0092 + README index; deferral ledger 2026-06-25.
 
-Gates run: catalog+executor+planner unit PASS; TestSyntax_TempSchema PASS;
-TestPort_IsolationInheritTemp PASS (cross-session temp regression guard);
-go build ./... clean; gofmt clean (the operators_utility_settings.go EOF-newline
-flag is PRE-EXISTING, verified via git stash — do NOT gofmt -w, version mismatch).
+Effect: temp-schema-cleanup.spec perm-2 first divergence advanced L80 → L88
+(everything through L87 now byte-matches PG 18.3).
 
-Next step (perm 2, ledger 2026-06-25): (1) pg_terminate_backend evaluator
-(sibling of pg_cancel_backend in expr.go ~5857); (2) IsolationRunner connection-
-death rendering — self-terminating step emits "FATAL: terminating connection due
-to administrator command" + "server closed the connection unexpectedly\n\tThis
-probably means…", blocked peer step then "<... completed>"; (3) on-disconnect:
-DropSessionTempObjects THEN DropTempNamespace THEN release session advisory locks
-(ordering: s2_advisory must see clean catalog); (4) temp-type dependency cascade
-— drop public uses_a_temp_type(just_give_me_a_type) when its temp rowtype drops
-(else perm 2's re-run of s1_create_temp_objects fails "function already exists").
-Probe first: throwaway test RunAndCompare on temp-schema-cleanup.spec → diff
-currently starts at L80 (perm 2). Other M0118-0009 specs still open: horizons
-(JSON -> ops + EXPLAIN json ANALYZE Heap Fetches/IOS), intra-grant-inplace{,-db}
-(catalog tuple-xmax lock on virtual pg_class/pg_database), stats, prepared-
-transactions{,-cic} (2PC).
+Gates run: internal/catalog + internal/executor units PASS;
+TestSessionTempTableNamesAndTypeCascade PASS; TestDropSessionTempObjects/
+TestTempNamespaceLifecycle PASS; TestSyntax_TempSchema_MyTempSchemaAndDiscard
+PASS (perm-1 DISCARD guard, exercises the cascade); TestPort_IsolationInheritTemp
+PASS (cross-session temp regression guard); go build ./... clean; pgbench smoke =
+pre-commit hook.
+
+Next step (perm 2 process-exit path, ledger 2026-06-25): the remaining 22 diff
+lines from L88 are ALL the self-termination block. (1) pg_terminate_backend
+evaluator in expr.go (~5856, sibling of pg_cancel_backend; needs a
+ctx.TerminateBackend callback reaching the server's connection registry to close
+the self connection); (2) IsolationRunner connection-death rendering — the
+self-terminating step emits "FATAL:  terminating connection due to administrator
+command" + "server closed the connection unexpectedly\n\tThis probably means the
+server terminated abnormally\n\tbefore or while processing the request." then the
+blocked peer step (s2_advisory) renders "<... completed>"; (3) on-disconnect
+cleanup ordering — SessionTempTableNames→DropSessionTempObjects+
+DropRoutinesReferencingTypes→DropTempNamespace→release session-level advisory
+locks (the cascade helpers from THIS loop are the catalog half; s2_advisory must
+observe a clean catalog only AFTER temp cleanup). Probe: re-run
+`go test -run TestPort_IsolationTempSchemaCleanup ./internal/testport/ -v` →
+diff now starts at L88. Other M0118-0009 specs still open: horizons (EXPLAIN
+FORMAT json ANALYZE Heap Fetches + IOS + temp-prune horizon), intra-grant-inplace
+{,-db} (FOR UPDATE on virtual pg_class/pg_database rows + GRANT tuple-xmax lock +
+VACUUM FREEZE inplace wait), stats (pg_stat_* infra), prepared-transactions{,-cic}
+(2PC).

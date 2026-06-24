@@ -7629,6 +7629,29 @@ func (c *InMemory) DropSessionTempObjects(owner string) int {
 	return len(victims)
 }
 
+// SessionTempTableNames returns the (bare) names of every temporary relation
+// owned by owner ("s<id>"). It is read-only and is used by temporary-object
+// cleanup (DISCARD TEMP / backend exit) to cascade drops to (possibly non-temp)
+// routines that depend on a temp table's implicit composite rowtype — the
+// rowtype shares the table's name, so the table name is the dependency signal
+// goopg uses in lieu of an OID-level pg_depend graph. Call it BEFORE
+// DropSessionTempObjects (which removes the tables). M0118-0009
+// (temp-schema-cleanup).
+func (c *InMemory) SessionTempTableNames(owner string) []string {
+	if owner == "" {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var names []string
+	for _, t := range c.tables {
+		if t != nil && t.Temp && t.TempOwner == owner {
+			names = append(names, t.Name)
+		}
+	}
+	return names
+}
+
 // DropIndex removes an index from the catalog.
 func (c *InMemory) DropIndex(name parser.ObjectName) error {
 	c.mu.Lock()
