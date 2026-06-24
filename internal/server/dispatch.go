@@ -1764,6 +1764,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					// M0118-0008: apply ALTER TABLE {NO} INHERIT deferred to COMMIT
 					// (the simple-query path bypasses execCommit).
 					executor.ApplyPendingInheritanceChanges(ctx, sess)
+					// M0118-0008 (alter-table-4 perm 3): apply DROP TABLE removals
+					// deferred to COMMIT (the simple-query path bypasses execCommit).
+					executor.ApplyPendingTableDrops(ctx, sess)
 				}
 				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
 					undoEnumDDLForRollback(connTx, s.cfg.Catalog)

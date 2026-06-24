@@ -4103,7 +4103,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 						return err
 					}
 					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
-					if err := o.dropTableByRef(childName, child); err != nil {
+					if err := o.dropTableByRef(childName, child, false); err != nil {
 						return err
 					}
 				}
@@ -4164,7 +4164,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 						continue
 					}
 					cascadeDropped[childName.String()] = true
-					if err := o.dropTableByRef(childName, child); err != nil {
+					if err := o.dropTableByRef(childName, child, false); err != nil {
 						return err
 					}
 				}
@@ -4307,7 +4307,11 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				}
 			}
 		}
-		if err := o.dropTableByRef(name, tbl); err != nil {
+		// Defer the leaf removal to COMMIT inside an explicit transaction
+		// (transactional-DDL visibility, alter-table-4 perm 3). CASCADE already
+		// removed dependents immediately above, so a deferred table would be
+		// inconsistent with its (gone) dependents — keep CASCADE immediate.
+		if err := o.dropTableByRef(name, tbl, s.Behavior != parser.DropCascade); err != nil {
 			return err
 		}
 	}
@@ -4423,7 +4427,63 @@ func routineCascadeDisplayName(r *catalog.Routine) string {
 }
 
 // dropTableByRef drops a single table by its catalog.Table reference.
-func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error {
+//
+// It first takes an AccessExclusiveLock on the relation (PG
+// RangeVarCallbackForDropRelation; transaction-scoped, a no-op in autocommit so
+// ordinary DROP TABLE keeps its historical non-blocking behaviour, held to
+// COMMIT/ROLLBACK inside an explicit transaction). When allowDefer is set and the
+// drop is a simple leaf (no partition/inheritance children, no pending-detach
+// state, no temp shadow) inside an explicit transaction, the catalog/relfile/WAL
+// removal is deferred to COMMIT via PendingTableDrop, so a concurrent reader that
+// identified this table (e.g. as an inheritance child of a parent it is scanning)
+// blocks on the lock and only sees the table vanish at commit — PG
+// transactional-DDL visibility (alter-table-4 perm 3). Cascade/partition recursion
+// passes allowDefer=false so dependent removal stays immediate and ordered.
+// M0118-0008.
+func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table, allowDefer bool) error {
+	// AccessExclusiveLock on the table being dropped (transaction-scoped).
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = name.Pos()
+		}
+		return err
+	}
+	if allowDefer {
+		if bsess, ok := o.ctx.Session.(*BasicSession); ok && bsess.InExplicitTransaction() {
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 &&
+				tbl.PartitionParentOID == 0 &&
+				tbl.DetachPendingEpoch == 0 &&
+				len(im.PartitionChildren(tbl.OID)) == 0 &&
+				len(im.InheritanceChildren(tbl.OID)) == 0 &&
+				!o.dropHasTempShadow(name) {
+				bsess.AddPendingTableDrop(PendingTableDrop{
+					Name:           name,
+					Table:          tbl,
+					SavepointDepth: bsess.SavepointDepth(),
+				})
+				return nil
+			}
+		}
+	}
+	return o.dropTableByRefImmediate(name, tbl)
+}
+
+// dropHasTempShadow reports whether the named table is currently shadowing a
+// permanent table of the same name (so dropping it would restore the permanent
+// one). Deferring such a drop would leave the shadow/restore bookkeeping
+// inconsistent until COMMIT, so the deferral gate excludes it. M0118-0008.
+func (o *ddlOp) dropHasTempShadow(name parser.ObjectName) bool {
+	if o.ctx.TempTableShadows == nil {
+		return false
+	}
+	return o.ctx.TempTableShadows[strings.ToLower(name.Name)] != nil
+}
+
+// dropTableByRefImmediate performs the actual catalog/relfile/WAL removal for one
+// table. It is called directly by dropTableByRef (autocommit, cascade/partition
+// recursion, or a non-deferrable explicit-txn drop) and by ApplyPendingTableDrops
+// at COMMIT for drops that were deferred. M0118-0008.
+func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Table) error {
 	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
 	idxRels := make([]storage.RelFileNode, 0, len(idxs))
 	idxOIDs := make([]uint32, 0, len(idxs))
@@ -4529,6 +4589,33 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error
 		}
 	}
 	return nil
+}
+
+// ApplyPendingTableDrops performs the deferred catalog/relfile/WAL removal for
+// every DROP TABLE that dropTableByRef deferred to COMMIT (see PendingTableDrop).
+// It mirrors ApplyPendingIndexDrops: callers MUST invoke it from the commit paths
+// BEFORE TxnMgr.Commit so the drop's WAL precedes the commit record and the
+// pg_class xmax stamp uses the still-live transaction XID. A ROLLBACK never calls
+// this; EndExplicitTransaction discards the pending list. The AccessExclusiveLock
+// taken when the drop was deferred is still held and released at commit, so a
+// concurrent reader parked behind it now proceeds and finds the table gone.
+// M0118-0008 (alter-table-4 perm 3).
+func ApplyPendingTableDrops(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	drops := sess.TakePendingTableDrops()
+	if len(drops) == 0 {
+		return
+	}
+	op := &ddlOp{ctx: ctx}
+	for _, d := range drops {
+		// Best-effort: the table may already be gone (e.g. dropped by a
+		// cascade earlier in the same transaction). dropTableByRefImmediate is
+		// idempotent on a missing relation (DropTable / DropRelation guard); skip
+		// rather than abort an in-progress commit (mirrors ApplyPendingIndexDrops).
+		_ = op.dropTableByRefImmediate(d.Name, d.Table)
+	}
 }
 
 func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
@@ -10666,7 +10753,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				}
 				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("foreign table %q does not exist", name.String())}
 			}
-			if err := o.dropTableByRef(name, tbl); err != nil {
+			if err := o.dropTableByRef(name, tbl, false); err != nil {
 				return err
 			}
 		}

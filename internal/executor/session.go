@@ -100,6 +100,28 @@ type PendingInheritanceChange struct {
 	SavepointDepth int    // savepoint depth at statement time (ROLLBACK TO cancel)
 }
 
+// PendingTableDrop records a DROP TABLE issued inside an explicit transaction
+// whose catalog/relfile/WAL removal is deferred until COMMIT. Until the dropping
+// transaction commits, the table stays in the shared catalog so a concurrent
+// session still expands the parent's inheritance tree to include it and blocks on
+// the AccessExclusiveLock the dropper holds on it (PG transactional-DDL
+// visibility, alter-table-4 isolation spec perm 3: `DROP TABLE c1` while a
+// concurrent `SELECT SUM(a) FROM p` runs — the reader identifies c1 as a child
+// before locking it, waits behind the drop, then skips the now-vanished child).
+// Deferral is gated narrowly (see dropTableByRef): only a leaf table with no
+// partition/inheritance children, no pending-detach state, and no temp shadow —
+// so cascade/partition removal keeps its immediate, ordered behaviour. In
+// autocommit the removal stays immediate. ApplyPendingTableDrops replays the
+// recorded removal at commit. Like the DROP INDEX deferral (PendingIndexDrop),
+// the dropping session itself also keeps seeing the table until commit — goopg's
+// shared catalog has no per-session MVCC visibility — a known limitation the
+// spec never exercises (s1 does not reference c1 after dropping it). M0118-0008.
+type PendingTableDrop struct {
+	Name           parser.ObjectName // catalog lookup key passed to dropTableByRefImmediate
+	Table          *catalog.Table    // resolved table (carries OID/Schema/Name for removal)
+	SavepointDepth int               // savepoint depth at drop time (for ROLLBACK TO cancel)
+}
+
 // relPageSnapshot captures the full page contents of one relation before
 // a TRUNCATE so that ROLLBACK can restore them.
 type relPageSnapshot struct {
@@ -135,6 +157,7 @@ type BasicSession struct {
 	pendingIndexDrops   []PendingIndexDrop         // DROP INDEX deferred to COMMIT (M0118-0008)
 	pendingPartAttaches []PendingPartitionAttach   // ATTACH PARTITION deferred to COMMIT (M0118-0008)
 	pendingInheritChng  []PendingInheritanceChange // ALTER TABLE {NO} INHERIT deferred to COMMIT (M0118-0008)
+	pendingTableDrops   []PendingTableDrop         // DROP TABLE deferred to COMMIT (M0118-0008 alter-table-4)
 	subxactStack        mvcc.SubxactStack          // savepoint stack (M0050-0004)
 	currentSubXid       storage.TransactionID      // 0 = use top-level tx.XID
 	txFailed            bool                       // in_failed_sql_transaction (25P02)
@@ -209,6 +232,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.pendingIndexDrops = nil
 	s.pendingPartAttaches = nil
 	s.pendingInheritChng = nil
+	s.pendingTableDrops = nil
 	s.subxactStack = mvcc.SubxactStack{}
 	s.currentSubXid = 0
 	s.txFailed = false
@@ -476,6 +500,36 @@ func (s *BasicSession) CancelPendingInheritanceChangesToDepth(depth int) int {
 	}
 	s.pendingInheritChng = keep
 	return cancelled
+}
+
+// AddPendingTableDrop records a DROP TABLE whose catalog/relfile removal is
+// deferred until COMMIT (see PendingTableDrop). M0118-0008 (alter-table-4).
+func (s *BasicSession) AddPendingTableDrop(e PendingTableDrop) {
+	s.pendingTableDrops = append(s.pendingTableDrops, e)
+}
+
+// TakePendingTableDrops drains and returns the deferred DROP TABLE entries.
+// Called from the commit paths (ApplyPendingTableDrops) to perform the real
+// removal; a full ROLLBACK simply lets EndExplicitTransaction discard them.
+// M0118-0008 (alter-table-4).
+func (s *BasicSession) TakePendingTableDrops() []PendingTableDrop {
+	out := s.pendingTableDrops
+	s.pendingTableDrops = nil
+	return out
+}
+
+// CancelPendingTableDropsToDepth discards deferred DROP TABLE entries recorded at
+// savepoint depth >= depth, so ROLLBACK TO SAVEPOINT before a deferred DROP TABLE
+// does not still remove the table at the outer COMMIT. Mirrors
+// CancelPendingIndexDropsToDepth. M0118-0008 (alter-table-4).
+func (s *BasicSession) CancelPendingTableDropsToDepth(depth int) {
+	keep := s.pendingTableDrops[:0]
+	for _, e := range s.pendingTableDrops {
+		if e.SavepointDepth < depth {
+			keep = append(keep, e)
+		}
+	}
+	s.pendingTableDrops = keep
 }
 
 // MarkTableActive marks a table OID as currently being mutated by a DML

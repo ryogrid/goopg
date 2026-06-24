@@ -598,6 +598,12 @@ type seqScanOp struct {
 	// scan THROUGH the parent locks the parent too); 0 for a direct leaf scan.
 	lockParentOID uint32
 
+	// skipIfVanished is set on an inheritance-child scan: if the child relation
+	// was dropped by a concurrent committed transaction while this scan waited
+	// on its lock, skip it (zero rows) instead of erroring. M0118-0008
+	// (alter-table-4 perm 3).
+	skipIfVanished bool
+
 	ctx  *Context
 	cols []catalog.Column
 
@@ -663,11 +669,12 @@ const seqScanLookahead storage.BlockNumber = 4
 
 func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 	return &seqScanOp{
-		schema:        p.Output(),
-		tbl:           p.Table,
-		pos:           p.Pos(),
-		cols:          p.Table.Columns,
-		lockParentOID: p.LockParentOID,
+		schema:         p.Output(),
+		tbl:            p.Table,
+		pos:            p.Pos(),
+		cols:           p.Table.Columns,
+		lockParentOID:  p.LockParentOID,
+		skipIfVanished: p.SkipIfVanished,
 	}
 }
 
@@ -715,6 +722,22 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			ee.Pos = o.pos
 		}
 		return err
+	}
+	// M0118-0008 (alter-table-4 perm 3): an inheritance-child scan that waited on
+	// this child's lock may find the child gone — a concurrent transaction
+	// committed a DROP of it while we blocked. Mirror PostgreSQL's
+	// try_table_open → NULL during inheritance expansion: skip the child (zero
+	// rows) rather than recreating its relfile (NBlocks would O_CREATE it) or
+	// erroring. Only inheritance children set skipIfVanished; a direct scan of a
+	// dropped table still errors elsewhere.
+	if o.skipIfVanished && o.tbl != nil {
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if _, exists := im.LookupTableByOID(o.tbl.OID); !exists {
+				o.nBlocks = 0
+				o.curBlock = 0
+				return nil
+			}
+		}
 	}
 	// PostgreSQL locks every index of a scanned relation in AccessShare too
 	// (get_relation_info opens all indexes regardless of the chosen scan method),

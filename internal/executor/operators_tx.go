@@ -162,6 +162,10 @@ func (o *transactionOp) execCommit() error {
 		// M0118-0008: apply ALTER TABLE {NO} INHERIT deferred to COMMIT (the
 		// inheritance link change was invisible to other sessions until now).
 		ApplyPendingInheritanceChanges(o.ctx, sess)
+		// M0118-0008 (alter-table-4 perm 3): apply DROP TABLE removals deferred to
+		// COMMIT (the table's catalog row + the dropper's AccessExclusiveLock were
+		// kept visible to other sessions until now).
+		ApplyPendingTableDrops(o.ctx, sess)
 	}
 	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
@@ -463,6 +467,9 @@ func (o *transactionOp) execRollbackTo() error {
 	// outer COMMIT.
 	sess.CancelPendingIndexDropsToDepth(newDepth)
 	sess.CancelPendingPartitionAttachesToDepth(newDepth)
+	// Discard DROP TABLE removals deferred inside the rolled-back savepoint so
+	// they are not applied at the outer COMMIT. M0118-0008 (alter-table-4).
+	sess.CancelPendingTableDropsToDepth(newDepth)
 	// Discard deferred ALTER TABLE {NO} INHERIT changes recorded inside the
 	// rolled-back savepoint, clearing the matching catalog pending-change marks.
 	// M0118-0008 (alter-table-4).

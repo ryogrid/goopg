@@ -2200,7 +2200,11 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// Use the child's own physical schema for the SeqScan so that
 				// physical column indices are correct for the child's row layout.
 				childScanSchema := tableSchemaWithSource(child, sourceIdx)
-				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema}
+				// SkipIfVanished: this child was identified before locking it; if a
+				// concurrent DROP of the child commits while the scan waits on its
+				// lock, skip the now-gone child instead of erroring. M0118-0008
+				// (alter-table-4 perm 3).
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
 				// wrap the scan in a remap Project that emits columns in parent

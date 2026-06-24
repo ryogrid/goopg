@@ -517,6 +517,16 @@ type SeqScan struct {
 	// the parent lock) blocks the scan. Zero for a leaf scanned directly.
 	// M0118-0008 (detach-partition-concurrently-3).
 	LockParentOID uint32
+	// SkipIfVanished is set on a SeqScan produced by expanding an inheritance
+	// parent into its children. Such a child is identified at plan time but
+	// locked only when the scan opens; if a concurrent transaction committed a
+	// DROP of that child while this scan waited on its lock, the child relation
+	// is gone and must be skipped (zero rows) rather than erroring — mirroring
+	// PostgreSQL's try_table_open → NULL during inheritance expansion. A
+	// directly-scanned relation never sets this (a plain SELECT on a dropped
+	// table still errors "does not exist"). M0118-0008 (alter-table-4 perm 3:
+	// `DROP TABLE c1` concurrent with `SELECT SUM(a) FROM p`).
+	SkipIfVanished bool
 }
 
 func (n *SeqScan) Pos() int       { return n.pos }
