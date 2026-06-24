@@ -825,6 +825,31 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       DropIndexConcurrently1/ReindexConcurrently/DetachPartitionConcurrently3/
       CreateTrigger/AlterTable1/InheritTemp/TruncateConflict/ClusterConflict;
       `go test ./internal/executor/` PASS; `go build` clean; pgbench smoke = pre-commit.
+      **2026-06-24 enabler (design 0118-0075, NOT a promotion):
+      `partition-concurrent-attach`.** `ALTER TABLE … ATTACH PARTITION` now
+      enforces the default-partition conflict check (PG
+      `ATExecAttachPartition` → `check_default_partition_contents`): attaching a
+      non-default partition over rows already living in the parent's visible
+      DEFAULT raises `23P01 updated partition constraint for default partition
+      "X" would be violated by some row`. goopg enforced this only on the
+      `CREATE TABLE … PARTITION OF` path (`validatePartitionChild` →
+      `checkDefaultPartitionDataConflict`); wired the same check into the
+      `AlterTableAttachPartition` executor case (gated `!poc.Default &&
+      !poc.IsHash`) + made `checkDefaultPartitionDataConflict` name the LEAF
+      default (walks a sub-partitioned default's own default recursively, so the
+      message reads `tpart_default_default` not the intermediate
+      `tpart_default`; detection still scans the whole default subtree, only the
+      name refined ⇒ CREATE path's non-nested behaviour unchanged). Standalone,
+      plain-SQL-testable core of the spec; spec stays `defer` — remaining
+      blockers (deferred-until-commit ATTACH visibility so a concurrent INSERT
+      routes to the default; ATTACH AccessExclusiveLock on the default so that
+      INSERT `<waiting ...>`; constraint re-validation after the wait) are the
+      milestone-sized per-session MVCC-catalog work shared with `alter-table-4`
+      (ledger). Gates: new `attach_default_conflict_test.go`
+      (`TestAttachPartitionRejectsDefaultConflict`/`…NoConflictSucceeds`/
+      `…NestedDefaultNamesLeaf`); `go test ./internal/executor/` PASS;
+      `TestPort_IsolationDetachPartitionConcurrently1` strict PASS (shares attach
+      setup, no false positive); `go build ./...` clean; pgbench smoke = pre-commit.
       **2026-06-23 fourteenth promotion (design 0118-0046): `alter-table-2`
       PROMOTED ⇒ all 48 permutations byte-for-byte.** Two changes: (1) the
       `ALTER TABLE … ADD FOREIGN KEY …` parser now accepts the `NOT VALID`

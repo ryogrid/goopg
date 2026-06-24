@@ -1,48 +1,55 @@
-Loop #8 (this run): M0118-0008 — partition-drop-index-locking **PROMOTED** (design
-0118-0074). Closed the LAST blocker (4 of 4): transactional-DDL cross-session
-catalog visibility. COMMIT + push pending at loop end (after regress suite confirms).
+Loop #9 (this run): M0118-0008 — `partition-concurrent-attach` **enabler 0118-0075**
+(NOT a promotion). Landed the default-partition conflict check on the ALTER
+ATTACH path. COMMITTED. Spec stays `defer`.
 
-## What landed (PROMOTION, not just an enabler)
-A non-CONCURRENTLY `DROP INDEX` issued INSIDE an explicit transaction now DEFERS
-its catalog/relfile/WAL/pg_class-xmax removal to COMMIT, so the dropped index
-stays in the shared catalog (pg_class row visible to s3) and s2 is shown holding
-its AccessExclusiveLock until s2commit → PG's 6 rows now match (was 5).
+## What landed
+`ALTER TABLE … ATTACH PARTITION` now rejects attaching a non-default partition
+over rows already in the parent's visible DEFAULT (PG `23P01`, mirrors
+`ATExecAttachPartition` → `check_default_partition_contents`). The check existed
+only on the CREATE TABLE PARTITION OF path; wired it into the
+`AlterTableAttachPartition` executor case + made the message name the LEAF
+default (nested sub-partitioned default).
 
-- session.go: `PendingIndexDrop` type + `BasicSession.pendingIndexDrops` +
-  `AddPendingIndexDrop`/`TakePendingIndexDrops`/`CancelPendingIndexDropsToDepth`;
-  `EndExplicitTransaction` nils the slice (safety net for every ROLLBACK path).
-- operators_ddl.go: `execDropIndex` computes `deferSess` (!Concurrent &&
-  InExplicitTransaction); records the drop + `continue`s instead of removing;
-  new `ApplyPendingIndexDrops(ctx, sess)` does the real removal (mirrors the
-  immediate path) — called BEFORE TxnMgr.Commit.
-- operators_tx.go: `execCommit` calls ApplyPendingIndexDrops; ROLLBACK TO
-  SAVEPOINT calls CancelPendingIndexDropsToDepth.
-- dispatch.go: server simple-query TxCommit path calls ApplyPendingIndexDrops
-  before TxnMgr.Commit (this is the path the isolation runner uses).
-- isolation_port_test.go: TestPort_IsolationPartitionDropIndexLocking (strict).
-- docs/test-port CSV (D-002 rationale sentence) + regenerated .md.
-- docs/design/0118-0074-*.md + README index.
+- operators_ddl.go: ATTACH case calls `checkDefaultPartitionDataConflict`
+  (gated `!poc.Default && !poc.IsHash`, `return err`).
+- operators_ddl_partition.go: `checkDefaultPartitionDataConflict` walks down to
+  the leaf default for the error name (detection unchanged — scans subtree via
+  immediate default).
+- attach_default_conflict_test.go (new): reject / no-conflict / nested-leaf.
+- design 0118-0075 + README index; ledger + fix_plan note.
 
-Key symbols: PendingIndexDrop, ApplyPendingIndexDrops, execDropIndex,
-BasicSession.{pendingIndexDrops,EndExplicitTransaction}, CancelPendingIndexDropsToDepth.
+Key symbols: checkDefaultPartitionDataConflict, AlterTableAttachPartition case.
 
-## Known limitation (NOT a gap for this spec)
-The deferral keeps the index visible to the dropping session too (shared catalog,
-not per-session MVCC-filtered). This spec never re-queries it from s2, so output
-is byte-identical. Full same-session invisibility = the MVCC-catalog milestone.
+## Probe result (partition-concurrent-attach, BEFORE this loop)
+First divergence L7: PG `s2i … <waiting ...>` then ERROR "violates partition
+constraint"; goopg s2i succeeds immediately (no wait, no error), final 6 rows in
+tpart_2 vs PG's 3. Perm 3: PG s1a `<waiting>` then ERROR "updated partition
+constraint for default partition tpart_default_default would be violated".
+
+## Why still deferred (the coupled milestone)
+Full promotion needs ALL of (shared with alter-table-4):
+(a) deferred-until-commit ATTACH visibility — a concurrent session must NOT see
+    the uncommitted new partition, so its INSERT routes to the DEFAULT;
+(b) ATTACH takes AccessExclusiveLock on the DEFAULT partition so the routed
+    INSERT renders `<waiting ...>` until the attach txn commits;
+(c) constraint re-validation after the wait sees the other session's committed
+    rows (perm 3 error fires only then).
+These three are interlocking — none alone moves a clean divergence boundary.
+This is the per-session MVCC catalog visibility milestone.
 
 ## M0118-0008 hard tail (remaining, all Effort-L)
-- alter-table-4 + partition-concurrent-attach: need FULL per-session MVCC catalog
-  visibility (dropping/altering session must see its own uncommitted DDL effects).
-  THIS is the next milestone to start.
-- reindex-concurrently-toast: real TOAST relations (reltoastrelid=0; text inline).
+- alter-table-4 + partition-concurrent-attach: per-session MVCC catalog
+  visibility (THE next milestone — highest leverage, unlocks two specs).
+- reindex-concurrently-toast: real TOAST relations (reltoastrelid=0).
 - WHERE CURRENT OF positioned UPDATE/DELETE: parsed (CurrentOf), no executor site.
 
-Next step: start the per-session MVCC catalog visibility milestone (shared by
-alter-table-4 + partition-concurrent-attach), OR pivot to reindex-concurrently-toast.
+Next step: start the per-session MVCC catalog visibility milestone; for
+partition-concurrent-attach specifically, begin with (a) deferred-until-commit
+ATTACH (mirror the loop-#8 DROP INDEX deferral: PendingPartitionAttach recorded
+in the session, applied before TxnMgr.Commit on both commit paths) + the global
+attach-epoch so older snapshots don't see the new child.
 
-Gates run: go build ./... clean; TestPort_IsolationPartitionDropIndexLocking
-strict PASS (both perms); DropIndexConcurrently1/ReindexConcurrently/ReindexSchema/
-MultipleCic PASS; go test ./internal/executor/ + -race (DROP INDEX/txn/savepoint/
-commit) PASS; TestPort_RegressSuite running (confirm before commit); pgbench
-smoke = pre-commit hook.
+Gates run: go build ./... clean; new attach_default_conflict_test.go (3) PASS;
+go test ./internal/executor/ PASS; TestPort_IsolationDetachPartitionConcurrently1
+strict PASS; make ralph-state-guard (run before status block); pgbench smoke =
+pre-commit hook.

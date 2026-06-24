@@ -1105,7 +1105,33 @@ func checkDefaultPartitionDataConflict(childName string, parent *catalog.Table, 
 		return nil
 	}
 	keyCol := `"` + parent.PartitionKey[0] + `"`
+	// Detect by scanning the whole default subtree via the immediate default
+	// partition (a partitioned default expands to all its descendants).
 	defName := `"` + defPart.Name + `"`
+	// Resolve the LEAF default partition (a sub-partitioned default's own
+	// default, recursively) for the error message: PostgreSQL's
+	// check_default_partition_contents recurses into a partitioned default and
+	// names the specific leaf default that would hold an offending row
+	// (e.g. tpart_default_default, not the intermediate tpart_default).
+	leafDef := defPart
+	for {
+		next := (*catalog.Table)(nil)
+		for _, sub := range im.PartitionChildren(leafDef.OID) {
+			for _, pb := range sub.PartitionBounds {
+				if pb.IsDefault {
+					next = sub
+					break
+				}
+			}
+			if next != nil {
+				break
+			}
+		}
+		if next == nil {
+			break
+		}
+		leafDef = next
+	}
 
 	var predicate string
 	switch {
@@ -1166,7 +1192,7 @@ func checkDefaultPartitionDataConflict(childName string, parent *catalog.Table, 
 	op.Close()
 	if hasRow {
 		return &ExecError{Code: "23P01", Pos: pos,
-			Message: fmt.Sprintf("updated partition constraint for default partition %q would be violated by some row", defPart.Name)}
+			Message: fmt.Sprintf("updated partition constraint for default partition %q would be violated by some row", leafDef.Name)}
 	}
 	return nil
 }

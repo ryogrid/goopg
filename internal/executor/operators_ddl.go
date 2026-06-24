@@ -5431,6 +5431,19 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !ok {
 				break // child doesn't exist yet, skip
 			}
+			// Reject the attach if the parent's existing DEFAULT partition holds
+			// (committed/visible) rows that would now be claimed by the new
+			// partition — PostgreSQL's ATExecAttachPartition →
+			// check_default_partition_contents. goopg already enforces this on the
+			// CREATE TABLE … PARTITION OF path (validatePartitionChild); wire the
+			// same check into ALTER TABLE … ATTACH PARTITION (the path the
+			// partition-concurrent-attach spec exercises). Skipped for HASH (no
+			// default partitions) and for attaching the DEFAULT itself.
+			if !poc.Default && !poc.IsHash {
+				if err := checkDefaultPartitionDataConflict(childTbl.Name, tbl, poc, act.Pos(), o.ctx); err != nil {
+					return err
+				}
+			}
 			// Set partition metadata on the child.
 			// ATTACH PARTITION only establishes the parent-child relationship and
 			// partition bounds. The child's PartitionKey/Method are properties of its
