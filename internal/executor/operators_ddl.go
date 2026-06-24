@@ -5114,6 +5114,36 @@ func (o *ddlOp) lockPartitionSubtreeAccessExcl(im *catalog.InMemory, tbl *catalo
 	return nil
 }
 
+// lockDefaultPartitionForAttach takes a transaction-scoped AccessExclusiveLock
+// on the parent's existing DEFAULT partition (if any) before a new non-default
+// partition is attached, mirroring PostgreSQL ATExecAttachPartition:
+//
+//	defaultPartOid = get_default_oid_from_partdesc(RelationGetPartitionDesc(rel, true));
+//	if (OidIsValid(defaultPartOid))
+//	    LockRelationOid(defaultPartOid, AccessExclusiveLock);
+//
+// Attaching a new partition narrows the default partition's implicit
+// constraint, so PG locks it exclusively for the duration of the attaching
+// transaction. A concurrent INSERT that routes to the default
+// (RowExclusiveLock) then waits until the attach commits, after which the
+// default's tightened constraint can reject the routed rows. Transaction-scoped
+// via acquireDDLLockTxn (a no-op in autocommit / for system relations), so the
+// hot path and plain CREATE TABLE … PARTITION OF are unaffected.
+func (o *ddlOp) lockDefaultPartitionForAttach(parent *catalog.Table) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	for _, child := range im.PartitionChildren(parent.OID) {
+		for _, pb := range child.PartitionBounds {
+			if pb.IsDefault {
+				return o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(child), lockmgr.AccessExclusiveLock)
+			}
+		}
+	}
+	return nil
+}
+
 func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 	// Handle SET LOGGED / SET UNLOGGED.
 	if s.SetLogged != "" {
@@ -5430,6 +5460,15 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			childTbl, ok := o.ctx.Catalog.LookupTable(poc.Parent)
 			if !ok {
 				break // child doesn't exist yet, skip
+			}
+			// Lock the parent's existing DEFAULT partition AccessExclusive for the
+			// attaching transaction — PG ATExecAttachPartition locks it first
+			// because the new partition narrows the default's constraint, so a
+			// concurrent INSERT routing to the default blocks until the attach
+			// commits (partition-concurrent-attach spec). Done before the
+			// conflict check, exactly as in PG.
+			if err := o.lockDefaultPartitionForAttach(tbl); err != nil {
+				return err
 			}
 			// Reject the attach if the parent's existing DEFAULT partition holds
 			// (committed/visible) rows that would now be claimed by the new

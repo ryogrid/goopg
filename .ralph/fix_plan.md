@@ -850,6 +850,28 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `…NestedDefaultNamesLeaf`); `go test ./internal/executor/` PASS;
       `TestPort_IsolationDetachPartitionConcurrently1` strict PASS (shares attach
       setup, no false positive); `go build ./...` clean; pgbench smoke = pre-commit.
+      **2026-06-24 enabler (design 0118-0076, NOT a promotion):
+      `partition-concurrent-attach` piece (b) — ATTACH locks the DEFAULT
+      partition.** `ALTER TABLE … ATTACH PARTITION` (non-default), inside an
+      explicit txn, now takes a transaction-scoped `AccessExclusiveLock` on the
+      parent's existing DEFAULT partition before the conflict check — PG
+      `ATExecAttachPartition` (`get_default_oid_from_partdesc` →
+      `LockRelationOid(defaultPartOid, AccessExclusiveLock)`), because the new
+      partition narrows the default's implicit constraint. New
+      `(*ddlOp).lockDefaultPartitionForAttach(parent)` (scans
+      `InMemory.PartitionChildren` for `PartitionBound.IsDefault`, locks via
+      `acquireDDLLockTxn` ⇒ no-op in autocommit / for system rels, held-to-commit
+      in an explicit txn). A concurrent INSERT routing to the default
+      (`RowExclusiveLock`) would then block behind the open attach. Spec stays
+      `defer` — the lock is only contended once piece (a) deferred-until-commit
+      attach visibility routes `s2`'s insert to the default (today the shared
+      catalog makes uncommitted `tpart_2` visible ⇒ insert routes there); (a)+(c)
+      remain the per-session MVCC-catalog milestone shared with `alter-table-4`.
+      Gates: new `attach_default_lock_test.go`
+      (`TestAttachPartitionLocksDefaultPartition`/`TestAttachPartitionNoDefaultNoLock`);
+      0118-0075 attach tests + full `go test ./internal/executor/` PASS;
+      `TestPort_IsolationDetachPartitionConcurrently1` strict PASS; `go build
+      ./...` clean; pgbench smoke = pre-commit.
       **2026-06-23 fourteenth promotion (design 0118-0046): `alter-table-2`
       PROMOTED ⇒ all 48 permutations byte-for-byte.** Two changes: (1) the
       `ALTER TABLE … ADD FOREIGN KEY …` parser now accepts the `NOT VALID`

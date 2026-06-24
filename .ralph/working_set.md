@@ -1,55 +1,52 @@
-Loop #9 (this run): M0118-0008 — `partition-concurrent-attach` **enabler 0118-0075**
-(NOT a promotion). Landed the default-partition conflict check on the ALTER
-ATTACH path. COMMITTED. Spec stays `defer`.
+Loop #10 (this run): M0118-0008 — `partition-concurrent-attach` **enabler 0118-0076**
+(NOT a promotion). Landed piece (b): ATTACH locks the DEFAULT partition. COMMITTED.
+Spec stays `defer`.
 
 ## What landed
-`ALTER TABLE … ATTACH PARTITION` now rejects attaching a non-default partition
-over rows already in the parent's visible DEFAULT (PG `23P01`, mirrors
-`ATExecAttachPartition` → `check_default_partition_contents`). The check existed
-only on the CREATE TABLE PARTITION OF path; wired it into the
-`AlterTableAttachPartition` executor case + made the message name the LEAF
-default (nested sub-partitioned default).
+`ALTER TABLE … ATTACH PARTITION` (non-default, inside an explicit txn) now takes a
+transaction-scoped `AccessExclusiveLock` on the parent's existing DEFAULT
+partition before the conflict check — PG `ATExecAttachPartition`
+(`get_default_oid_from_partdesc` → `LockRelationOid(defaultPartOid,
+AccessExclusiveLock)`). A concurrent INSERT routing to the default
+(`RowExclusiveLock`) would then block until the attach commits.
 
-- operators_ddl.go: ATTACH case calls `checkDefaultPartitionDataConflict`
-  (gated `!poc.Default && !poc.IsHash`, `return err`).
-- operators_ddl_partition.go: `checkDefaultPartitionDataConflict` walks down to
-  the leaf default for the error name (detection unchanged — scans subtree via
-  immediate default).
-- attach_default_conflict_test.go (new): reject / no-conflict / nested-leaf.
-- design 0118-0075 + README index; ledger + fix_plan note.
+- operators_ddl.go: new `(*ddlOp).lockDefaultPartitionForAttach(parent)` (near
+  `lockPartitionSubtreeAccessExcl`) — scans `InMemory.PartitionChildren` for
+  `PartitionBound.IsDefault`, locks via `acquireDDLLockTxn` (no-op in autocommit /
+  for system rels). Called in the `AlterTableAttachPartition` case before
+  `checkDefaultPartitionDataConflict`.
+- attach_default_lock_test.go (new): TestAttachPartitionLocksDefaultPartition,
+  TestAttachPartitionNoDefaultNoLock.
+- design 0118-0076 + README index; ledger + fix_plan note.
 
-Key symbols: checkDefaultPartitionDataConflict, AlterTableAttachPartition case.
+Key symbols: lockDefaultPartitionForAttach, acquireDDLLockTxn, AlterTableAttachPartition case.
 
-## Probe result (partition-concurrent-attach, BEFORE this loop)
-First divergence L7: PG `s2i … <waiting ...>` then ERROR "violates partition
-constraint"; goopg s2i succeeds immediately (no wait, no error), final 6 rows in
-tpart_2 vs PG's 3. Perm 3: PG s1a `<waiting>` then ERROR "updated partition
-constraint for default partition tpart_default_default would be violated".
-
-## Why still deferred (the coupled milestone)
-Full promotion needs ALL of (shared with alter-table-4):
-(a) deferred-until-commit ATTACH visibility — a concurrent session must NOT see
-    the uncommitted new partition, so its INSERT routes to the DEFAULT;
-(b) ATTACH takes AccessExclusiveLock on the DEFAULT partition so the routed
-    INSERT renders `<waiting ...>` until the attach txn commits;
-(c) constraint re-validation after the wait sees the other session's committed
-    rows (perm 3 error fires only then).
-These three are interlocking — none alone moves a clean divergence boundary.
-This is the per-session MVCC catalog visibility milestone.
+## partition-concurrent-attach — remaining 3-piece interlock
+- (a) deferred-until-commit ATTACH visibility — concurrent s2 must NOT see the
+  uncommitted new partition, so its INSERT routes to the DEFAULT. **Today goopg's
+  SHARED catalog makes the uncommitted tpart_2 visible ⇒ s2's insert routes there,
+  so piece (b)'s lock is never contended along the spec path.** THIS is the blocker.
+- (b) DONE this loop (lock the default).
+- (c) constraint re-validation after the wait sees s2's committed rows (perm 3).
+(a)+(c) are the milestone-sized per-session MVCC catalog visibility work shared
+with alter-table-4.
 
 ## M0118-0008 hard tail (remaining, all Effort-L)
-- alter-table-4 + partition-concurrent-attach: per-session MVCC catalog
-  visibility (THE next milestone — highest leverage, unlocks two specs).
+- alter-table-4 + partition-concurrent-attach: per-session MVCC catalog visibility
+  (THE next milestone — highest leverage, unlocks two specs). For
+  partition-concurrent-attach the NEXT concrete piece is (a): defer the ATTACH's
+  partition registration (RegisterPartitionChild + PartitionBounds) to COMMIT via a
+  session PendingPartitionAttach, applied before TxnMgr.Commit on BOTH commit paths
+  (mirror loop-#8 DROP INDEX deferral 0118-0074) + a global attach-epoch so older
+  snapshots don't route to the new child.
 - reindex-concurrently-toast: real TOAST relations (reltoastrelid=0).
 - WHERE CURRENT OF positioned UPDATE/DELETE: parsed (CurrentOf), no executor site.
 
-Next step: start the per-session MVCC catalog visibility milestone; for
-partition-concurrent-attach specifically, begin with (a) deferred-until-commit
-ATTACH (mirror the loop-#8 DROP INDEX deferral: PendingPartitionAttach recorded
-in the session, applied before TxnMgr.Commit on both commit paths) + the global
-attach-epoch so older snapshots don't see the new child.
+Next step: start (a) — deferred-until-commit ATTACH. Record a PendingPartitionAttach
+on BasicSession when InExplicitTransaction (defer RegisterPartitionChild +
+PartitionBounds assignment), apply at commit on both paths, discard on rollback via
+EndExplicitTransaction; add the attach-epoch routing guard.
 
-Gates run: go build ./... clean; new attach_default_conflict_test.go (3) PASS;
-go test ./internal/executor/ PASS; TestPort_IsolationDetachPartitionConcurrently1
-strict PASS; make ralph-state-guard (run before status block); pgbench smoke =
-pre-commit hook.
+Gates run: go build ./... clean; new attach_default_lock_test.go (2) PASS; go test
+./internal/executor/ PASS; TestPort_IsolationDetachPartitionConcurrently1 strict
+PASS; make ralph-state-guard (before status block); pgbench smoke = pre-commit hook.
