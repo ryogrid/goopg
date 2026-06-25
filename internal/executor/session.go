@@ -226,6 +226,18 @@ func (s *BasicSession) BeginExplicitTransaction(tx mvcc.Transaction, snap mvcc.S
 	s.inTx = true
 }
 
+// RelocateTransaction updates the session's cached transaction handle after the
+// transaction has been moved to a dedicated proc slot (PREPARE TRANSACTION
+// detach). The XID, snapshot and pending-work state are unchanged; only the
+// Handle (and thus the proc slot the later COMMIT/ROLLBACK PREPARED finalises)
+// differs. No-op outside an open explicit transaction. M0118-0009.
+func (s *BasicSession) RelocateTransaction(tx mvcc.Transaction) {
+	if !s.inTx {
+		return
+	}
+	s.tx = tx
+}
+
 // OnTopLevelXIDAssigned is invoked by Context.MaterializeWriterXID
 // after the top-level transaction's XID is lazily materialised
 // (M0093 Design B). It keeps the session's cached tx.XID in sync

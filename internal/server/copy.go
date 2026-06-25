@@ -148,8 +148,8 @@ func (s *Server) dispatchCopyViaExecutor(ctx context.Context, w *protocol.FrameW
 	// Offset by half the ProcArray to avoid the typical connection range.
 	var copyProcNum int32
 	if connTx != nil {
-		const halfSize = mvcc.DefaultProcArraySize / 2
-		copyProcNum = (connTx.ProcNum + halfSize) % mvcc.DefaultProcArraySize
+		const halfSize = mvcc.ConnSlotCount / 2
+		copyProcNum = (connTx.ProcNum + halfSize) % mvcc.ConnSlotCount
 	}
 	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, copyProcNum)
 	if err != nil {

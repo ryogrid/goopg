@@ -329,17 +329,25 @@ type Server struct {
 	// async-notify). Always non-nil; channel registrations and queued
 	// notifications are keyed by each connection's stable SessionRegistry.
 	notify *notifyHub
+
+	// preparedXacts is the process-wide registry of detached prepared
+	// transactions, keyed by gid. A RC/RR PREPARE TRANSACTION parks its
+	// transaction here (off its originating backend) so a later COMMIT/ROLLBACK
+	// PREPARED can finalise it from ANY backend. Always non-nil. M0118-0009
+	// (stats — cross-backend two-phase commit).
+	preparedXacts *preparedXactStore
 }
 
 // New constructs a Server but does not start listening. Use Run to start.
 func New(cfg Config) *Server {
 	cfg.defaults()
 	s := &Server{
-		cfg:       cfg,
-		ready:     make(chan struct{}),
-		cancelReg: newCancelRegistry(),
-		roles:     map[string]struct{}{"postgres": {}},
-		notify:    newNotifyHub(),
+		cfg:           cfg,
+		ready:         make(chan struct{}),
+		cancelReg:     newCancelRegistry(),
+		roles:         map[string]struct{}{"postgres": {}},
+		notify:        newNotifyHub(),
+		preparedXacts: newPreparedXactStore(),
 	}
 	s.nextPID.Store(0)
 	// Initialize plan cache when storage handles are present (M0098-0005).
@@ -780,7 +788,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	// can call WaitEventStart(procNum, ...) atomically instead of acquiring
 	// the old Registry.mu on every wire frame.
 	pidStr := activity.PID(pid)
-	procNum := int32((pid - 1) % uint32(mvcc.DefaultProcArraySize))
+	procNum := int32((pid - 1) % uint32(mvcc.ConnSlotCount))
 	reg := s.cfg.Activity
 	if reg != nil {
 		clientAddr := raw.RemoteAddr().String()
@@ -1130,7 +1138,7 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 	// Assign a ProcArray slot for this backend (M0107-0004). The slot is
 	// reused across all transactions on this connection; Begin clears and
 	// re-initialises it on each new transaction.
-	procNum := int32((pid - 1) % uint32(mvcc.DefaultProcArraySize))
+	procNum := int32((pid - 1) % uint32(mvcc.ConnSlotCount))
 	extended.ProcNum = procNum                                                                   // thread through to executeExtendedQueryViaExecutor
 	extended.DBName = dbName                                                                     // scopes pg_extension per database (M0110-0003 gap #7c)
 	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum, DBName: dbName, AdvisoryID: sess} // per-connection explicit transaction state (M0096-0005); DBName scopes pg_extension (M0110-0003 gap #7c); AdvisoryID = stable advisory-lock owner identity (M0118-0003)

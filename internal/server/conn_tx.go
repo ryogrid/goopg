@@ -456,6 +456,59 @@ func (c *connTxState) ClearPrepared() {
 	c.mu.Unlock()
 }
 
+// DetachPrepared moves this connection's active transaction into a standalone
+// connTxState (for parking in the server's prepared-xact registry) and resets
+// the live connection to a free auto-commit state — preserving the
+// per-connection identities (ProcNum, lock/advisory backend identities, backend
+// PID, NOTIFY session) so the connection can run further transactions while the
+// prepared one awaits COMMIT/ROLLBACK PREPARED. newTx is the transaction after
+// it has been relocated to its dedicated proc slot. The parked session, its
+// deferred DROP FUNCTION drops, buffered NOTIFYs and pending enum DDL all travel
+// with the returned holder so the later finalisation reuses the canonical
+// commit/rollback path. M0118-0009 (stats — cross-backend two-phase commit).
+//
+// Note: the parked holder shares the originating connection's lock/advisory
+// backend identities, so xact-scoped heavyweight/advisory locks held by the
+// prepared transaction are released under the same identity the live connection
+// keeps using. The isolation specs that exercise cross-backend 2PC hold no such
+// locks across the PREPARE..finalise window, so this is sound for them; full
+// dummy-PGPROC lock hand-off is deferred.
+func (c *connTxState) DetachPrepared(gid string, newTx mvcc.Transaction) *connTxState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := &connTxState{
+		active:                   true,
+		failed:                   c.failed,
+		preparedGid:              gid,
+		tx:                       newTx,
+		sess:                     c.sess,
+		ProcNum:                  c.ProcNum,
+		DBName:                   c.DBName,
+		LockBackendID:            c.LockBackendID,
+		AdvisoryID:               c.AdvisoryID,
+		BackendPID:               c.BackendPID,
+		NotifySession:            c.NotifySession,
+		PendingEnumValues:        c.PendingEnumValues,
+		PendingEnumRenames:       c.PendingEnumRenames,
+		PendingCreatedEnums:      c.PendingCreatedEnums,
+		PendingCreatedComposites: c.PendingCreatedComposites,
+		pendingNotify:            c.pendingNotify,
+	}
+	// Reset the live connection to free/auto-commit, keeping the per-connection
+	// identities (left untouched above).
+	c.active = false
+	c.failed = false
+	c.preparedGid = ""
+	c.tx = mvcc.Transaction{}
+	c.sess = nil
+	c.PendingEnumValues = nil
+	c.PendingEnumRenames = nil
+	c.PendingCreatedEnums = nil
+	c.PendingCreatedComposites = nil
+	c.pendingNotify = nil
+	return p
+}
+
 type preparedStatementDef struct {
 	stmt        parser.Stmt
 	sql         string   // original PREPARE … AS … text for pg_prepared_statements

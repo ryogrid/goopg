@@ -19,18 +19,76 @@ package server
 // SERIALIZABLE transactions in prepared-transactions.spec) thus fires at
 // COMMIT PREPARED, exactly as in upstream.
 //
-// Deferred (not needed by any port spec): cross-backend COMMIT PREPARED, the
-// pg_prepared_xacts catalog view, persistence of prepared state across a
-// restart (pg_twophase), and detaching a prepared xact so the originating
-// connection can run further transactions while it stays prepared.
+// For SERIALIZABLE transactions (prepared-transactions{,-cic}.spec) goopg keeps
+// this same-backend keep-open subset: SSI predicate-lock / rw-conflict state is
+// keyed by the transaction Handle and cannot be relocated to a dedicated slot
+// without re-keying, and those specs never run further work on the originating
+// connection between PREPARE and COMMIT/ROLLBACK PREPARED.
+//
+// For READ COMMITTED / REPEATABLE READ transactions (stats.spec's 2PC stat-drop
+// permutations) goopg additionally supports DETACHING the prepared transaction:
+// at PREPARE the transaction is relocated to a dedicated proc slot
+// (mvcc.DetachToDedicatedSlot, the dummy-PGPROC analogue) and parked in the
+// server's process-wide preparedXactStore, freeing the originating connection to
+// run further transactions. A later COMMIT/ROLLBACK PREPARED — from the SAME or
+// a DIFFERENT backend — looks the gid up in the store and finalises it through
+// the canonical commit/rollback path with the executor context retargeted at the
+// parked session/transaction.
+//
+// Deferred (not needed by any port spec): the pg_prepared_xacts catalog view,
+// persistence of prepared state across a restart (pg_twophase), cross-backend
+// finalisation of a SERIALIZABLE prepared xact, and full dummy-PGPROC lock
+// hand-off.
 
 import (
+	"sync"
+
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
 )
+
+// preparedXactStore is the process-wide registry of detached (RC/RR) prepared
+// transactions, keyed by gid. Each value is a parked connTxState carrying the
+// prepared transaction's session, relocated transaction handle and finalisation
+// state. M0118-0009 (stats — cross-backend two-phase commit).
+type preparedXactStore struct {
+	mu sync.Mutex
+	m  map[string]*connTxState
+}
+
+func newPreparedXactStore() *preparedXactStore {
+	return &preparedXactStore{m: make(map[string]*connTxState)}
+}
+
+// has reports whether a prepared transaction with this gid is registered.
+func (p *preparedXactStore) has(gid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.m[gid]
+	return ok
+}
+
+// put registers a parked prepared transaction. The caller has already verified
+// the gid is free via has().
+func (p *preparedXactStore) put(gid string, px *connTxState) {
+	p.mu.Lock()
+	p.m[gid] = px
+	p.mu.Unlock()
+}
+
+// take removes and returns the parked prepared transaction for gid.
+func (p *preparedXactStore) take(gid string) (*connTxState, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	px, ok := p.m[gid]
+	if ok {
+		delete(p.m, gid)
+	}
+	return px, ok
+}
 
 // isTwoPhaseStmt reports whether stmt is a two-phase-commit statement handled
 // at the server layer (the planner has no node for them, so they must be kept
@@ -78,25 +136,69 @@ func (s *Server) execPrepareTransaction(w *protocol.FrameWriter, ctx *executor.C
 		// reports "does not exist", exactly as upstream. M0118-0009.
 		return s.executeOneSimpleStmt(w, ctx, &parser.RollbackStmt{}, connTx, autoCommitPtr)
 	}
-	// SSI dangerous-structure check at PREPARE time. Upstream's
-	// PrepareTransaction calls PreCommit_CheckForSerializationFailure before the
-	// prepare record is written; a failure aborts the transaction so the later
-	// COMMIT PREPARED reports "does not exist". This is what makes the third
-	// PREPARE in prepared-transactions.spec (against an already-prepared pivot)
-	// fail on itself. On success the SerializableXact is marked PREPARED so a
-	// later committer cannot doom it. M0118-0009.
 	explicitTx := connTx.Tx()
-	if explicitTx.Isolation == mvcc.IsolationSerializable && explicitTx.Handle != 0 {
-		if ssiErr := s.cfg.TxnMgr.PrepareCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
-			return s.abortForPrepareSSIFailure(w, ctx, connTx, explicitTx, ssiErr)
+	if explicitTx.Isolation == mvcc.IsolationSerializable {
+		// SSI dangerous-structure check at PREPARE time. Upstream's
+		// PrepareTransaction calls PreCommit_CheckForSerializationFailure before the
+		// prepare record is written; a failure aborts the transaction so the later
+		// COMMIT PREPARED reports "does not exist". This is what makes the third
+		// PREPARE in prepared-transactions.spec (against an already-prepared pivot)
+		// fail on itself. On success the SerializableXact is marked PREPARED so a
+		// later committer cannot doom it. M0118-0009.
+		if explicitTx.Handle != 0 {
+			if ssiErr := s.cfg.TxnMgr.PrepareCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
+				return s.abortForPrepareSSIFailure(w, ctx, connTx, explicitTx, ssiErr)
+			}
 		}
+		// Keep the transaction open on its slot; record the gid. The connection
+		// stays "in a transaction block" from goopg's view (invisible to the
+		// isolation tester, which does not inspect the ReadyForQuery status byte)
+		// and the same-backend COMMIT/ROLLBACK PREPARED reuses the canonical
+		// finalisation path with the transaction's session/locks/SSI state fully
+		// wired. SERIALIZABLE specs never run further work on this connection
+		// before finalising, so keeping the slot is safe.
+		connTx.MarkPrepared(st.Gid)
+		if autoCommitPtr != nil {
+			*autoCommitPtr = false
+		}
+		return w.WriteCommandComplete("PREPARE TRANSACTION")
 	}
-	// Keep the transaction open; record the gid. The connection stays "in a
-	// transaction block" from goopg's view, which is invisible to the isolation
-	// tester (it does not inspect the ReadyForQuery status byte) and lets the
-	// subsequent COMMIT/ROLLBACK PREPARED reuse the canonical finalisation path
-	// with the transaction's session/locks fully wired.
-	connTx.MarkPrepared(st.Gid)
+	// READ COMMITTED / REPEATABLE READ: detach the transaction to a dedicated
+	// proc slot and park it in the registry so the originating connection is
+	// freed and a later COMMIT/ROLLBACK PREPARED (same OR different backend) can
+	// finalise it. M0118-0009 (stats).
+	if s.preparedXacts.has(st.Gid) {
+		return s.writeQueryError(w, sqlstate.DuplicateObject,
+			"transaction identifier \""+st.Gid+"\" is already in use")
+	}
+	newTx, err := s.cfg.TxnMgr.DetachToDedicatedSlot(explicitTx)
+	if err != nil {
+		// Relocation failed (e.g. no free slot): fall back to the same-backend
+		// keep-open behaviour so the PREPARE still succeeds for a same-backend
+		// finalisation.
+		connTx.MarkPrepared(st.Gid)
+		if autoCommitPtr != nil {
+			*autoCommitPtr = false
+		}
+		return w.WriteCommandComplete("PREPARE TRANSACTION")
+	}
+	if sess := connTx.Session(); sess != nil {
+		sess.RelocateTransaction(newTx)
+	}
+	px := connTx.DetachPrepared(st.Gid, newTx)
+	s.preparedXacts.put(st.Gid, px)
+	// The per-statement context's transaction-scoped pending enum state moved to
+	// the parked holder; clear it so the dispatch write-back does not re-attach it
+	// to the now-freed connection.
+	if ctx != nil {
+		ctx.PendingEnumValues = nil
+		ctx.PendingEnumRenames = nil
+		ctx.PendingCreatedEnums = nil
+		ctx.PendingCreatedComposites = nil
+	}
+	// Leave *autoCommitPtr = false: the originating transaction now lives on its
+	// dedicated slot (owned by the registry), so the dispatch end must NOT commit
+	// or roll back the freed connection slot.
 	if autoCommitPtr != nil {
 		*autoCommitPtr = false
 	}
@@ -148,12 +250,40 @@ func (s *Server) abortForPrepareSSIFailure(w *protocol.FrameWriter, ctx *executo
 // deferred catalog operations and NOTIFY publication all behave identically to
 // a normal COMMIT/ROLLBACK. M0118-0009.
 func (s *Server) execFinalizePrepared(w *protocol.FrameWriter, ctx *executor.Context, gid string, connTx *connTxState, autoCommitPtr *bool, finalize parser.Stmt) error {
-	if connTx == nil || connTx.PreparedGid() != gid {
-		// Same-backend only: a gid this connection did not prepare is treated as
-		// non-existent (cross-backend prepared-xact lookup is deferred).
+	// Same-backend keep-open path (SERIALIZABLE): the originating connection still
+	// holds the prepared transaction on its slot.
+	if connTx != nil && connTx.PreparedGid() == gid {
+		connTx.ClearPrepared()
+		return s.executeOneSimpleStmt(w, ctx, finalize, connTx, autoCommitPtr)
+	}
+	// Detached path (RC/RR): look the gid up in the process-wide registry and
+	// finalise the parked transaction through the canonical commit/rollback path,
+	// with the executor context retargeted at the parked session/transaction.
+	// Works regardless of which backend issues the COMMIT/ROLLBACK PREPARED.
+	px, ok := s.preparedXacts.take(gid)
+	if !ok {
 		return s.writeQueryError(w, sqlstate.UndefinedObject,
 			"prepared transaction with identifier \""+gid+"\" does not exist")
 	}
-	connTx.ClearPrepared()
-	return s.executeOneSimpleStmt(w, ctx, finalize, connTx, autoCommitPtr)
+	sess := px.Session()
+	ctx.Session = sess
+	ctx.Tx = px.Tx()
+	if snap, serr := s.cfg.TxnMgr.SnapshotFor(px.Tx()); serr == nil {
+		ctx.Snap = snap
+	}
+	ctx.PendingEnumValues = px.PendingEnumValues
+	ctx.PendingEnumRenames = px.PendingEnumRenames
+	ctx.PendingCreatedEnums = px.PendingCreatedEnums
+	ctx.PendingCreatedComposites = px.PendingCreatedComposites
+	ctx.TxnLockBackendID = px.LockBackendID
+	// The parked holder owns its own session/lock lifecycle via px.End() inside
+	// the canonical finalise path; the originating connection's SET LOCAL scope
+	// is unrelated to this backend's context, so suppress EndLocalTransaction.
+	ctx.BeginLocalTransaction = nil
+	ctx.EndLocalTransaction = nil
+	// Route through the canonical COMMIT/ROLLBACK handling with the parked holder
+	// as the active transaction. A throwaway auto-commit flag keeps the finalise
+	// from disturbing the issuing connection's own statement bookkeeping.
+	var throwaway bool
+	return s.executeOneSimpleStmt(w, ctx, finalize, px, &throwaway)
 }

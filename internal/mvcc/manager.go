@@ -22,6 +22,10 @@ const (
 var (
 	ErrUnknownTransaction = errors.New("mvcc: unknown transaction")
 	ErrXIDWraparound      = errors.New("mvcc: xid wraparound is not implemented")
+	// ErrUnsupportedDetach is returned by DetachToDedicatedSlot for a
+	// SERIALIZABLE transaction, whose SSI bookkeeping is keyed by the
+	// transaction Handle and cannot be relocated without re-keying. M0118-0009.
+	ErrUnsupportedDetach = errors.New("mvcc: cannot detach a SERIALIZABLE transaction to a dedicated slot")
 )
 
 // TxnHandle is an opaque, monotonically-allocated identifier for an
@@ -220,7 +224,9 @@ func (m *Manager) Begin(iso IsolationLevel, procNums ...int32) (Transaction, err
 		// that pass an explicit procNum — the old counter-based approach falsely
 		// allocated slot 1 on the very first call, clobbering a live connection.
 		found := false
-		sz := len(m.procArray.slots)
+		// Scan only the connection/internal region; the high region is reserved
+		// for detached prepared transactions (DetachToDedicatedSlot). M0118-0009.
+		sz := min(ConnSlotCount, len(m.procArray.slots))
 		for i := 1; i < sz; i++ {
 			if m.procArray.slots[i].inTxn.CompareAndSwap(0, 1) {
 				procNum = int32(i)
@@ -428,6 +434,67 @@ func (m *Manager) Commit(tx Transaction) error {
 // or escalate.
 func (m *Manager) Rollback(tx Transaction) error {
 	return m.finish(tx, XactAbort)
+}
+
+// DetachToDedicatedSlot relocates tx off its originating backend's proc slot
+// onto a fresh dedicated slot, returning the moved Transaction (a new Handle,
+// the same XID / isolation / snapshot). It is the goopg analogue of PostgreSQL
+// handing a PREPAREd transaction to a dummy PGPROC: the originating backend's
+// slot is freed so the backend can begin further transactions, while the
+// prepared transaction's state (active XID, snapshot xmin) stays live in the
+// proc array — visible as in-progress to other sessions and committable /
+// abortable later from ANY backend via Commit/Rollback on the returned
+// Transaction.
+//
+// Restricted to READ COMMITTED / REPEATABLE READ (ErrUnsupportedDetach for
+// SERIALIZABLE): SSI predicate locks and rw-conflict records are keyed by the
+// transaction Handle and would need re-keying. The SERIALIZABLE 2PC paths keep
+// the transaction on its original slot (same-backend finalisation) instead.
+// M0118-0009 (stats — cross-backend two-phase commit).
+func (m *Manager) DetachToDedicatedSlot(tx Transaction) (Transaction, error) {
+	if tx.Isolation == IsolationSerializable {
+		return Transaction{}, ErrUnsupportedDetach
+	}
+	oldProc := int32(tx.Handle) - 1
+	if oldProc < 0 || int(oldProc) >= len(m.procArray.slots) {
+		return Transaction{}, ErrUnknownTransaction
+	}
+	old := &m.procArray.slots[oldProc]
+	if old.inTxn.Load() == 0 {
+		return Transaction{}, ErrUnknownTransaction
+	}
+	// Claim a fresh dedicated slot from the reserved high region so no backend
+	// reusing a connection/internal procNum can later clobber it.
+	newProc := int32(-1)
+	for i := ConnSlotCount; i < len(m.procArray.slots); i++ {
+		if m.procArray.slots[i].inTxn.CompareAndSwap(0, 1) {
+			newProc = int32(i)
+			break
+		}
+	}
+	if newProc < 0 {
+		return Transaction{}, fmt.Errorf("mvcc: no free process slots to detach prepared transaction")
+	}
+	xid := old.xid.Load()
+	ns := &m.procArray.slots[newProc]
+	// Populate the dedicated slot fully BEFORE clearing the old one so a
+	// concurrent OldestXmin/snapshot reader always observes the XID as active in
+	// at least one slot (it may briefly appear in both — harmless).
+	ns.xid.Store(xid)
+	ns.xmin.Store(old.xmin.Load())
+	ns.firstSnap = old.firstSnap
+	ns.snapshotXmin = old.snapshotXmin
+	ns.isolation = old.isolation
+	ns.pinnedSnap.Store(old.pinnedSnap.Load())
+	// ns.inTxn already 1 from the CAS above.
+	// Release the originating backend's slot so it can begin new transactions.
+	old.xid.Store(0)
+	old.firstSnap = nil
+	old.pinnedSnap.Store(false)
+	old.xmin.Store(^uint64(0))
+	old.snapshotXmin = ^uint32(0)
+	old.inTxn.Store(0)
+	return Transaction{Handle: TxnHandle(newProc + 1), XID: storage.TransactionID(xid), Isolation: tx.Isolation}, nil
 }
 
 // AllocateSubXid allocates a fresh XID for a subtransaction and registers

@@ -1,24 +1,35 @@
 (idle — nothing in flight)
 
-Last landed (loop #73): `stats` rung 4 (M0118-0009, design 0118-0126) —
-implemented `stats_fetch_consistency = 'cache'/'snapshot'` per-transaction
-stat-value caching. First divergence advanced **L1587 → L2036**.
-Files: internal/executor/pgstat_functions.go (funcStatSnapshot type, copyAll,
-fetchFuncStat single read entry point), internal/executor/session.go
-(BasicSession.statsSnapshot + ensureStatsSnapshot/ClearStatsSnapshot; cleared in
-EndExplicitTransaction), internal/executor/expr.go (3 getters → fetchFuncStat;
-pg_stat_clear_snapshot now clears). Test: TestFetchFuncStatConsistency.
-Gates: executor+config units + vet PASS (also -race); TestPort_PLpgSQL* PASS;
-TestPort_IsolationStats soft probe L1587→L2036; build clean; pgbench smoke via
+Last landed (loop #74): `stats` rung 5 (M0118-0009, design 0118-0127) —
+cross-backend two-phase commit for RC/RR prepared transactions. First divergence
+advanced **L2036 → L2180**.
+Files: internal/mvcc/manager.go (DetachToDedicatedSlot + ErrUnsupportedDetach +
+auto-assign Begin bounded to ConnSlotCount), internal/mvcc/procarray.go
+(ReservedPreparedSlots=64 + ConnSlotCount consts), internal/server/twophase.go
+(preparedXactStore + RC/RR detach in execPrepareTransaction + registry finalise
+in execFinalizePrepared), internal/server/conn_tx.go (DetachPrepared),
+internal/server/server.go (preparedXacts field + 2× procNum→ConnSlotCount),
+internal/server/{copy.go,dispatch_extended.go} (half-offset→ConnSlotCount),
+internal/executor/session.go (RelocateTransaction). Tests:
+TestDetachToDedicatedSlot{,RejectsSerializable}.
+Gates: mvcc unit+race PASS; executor+server+config units PASS;
+TestPort_TwoPhaseCommitSameBackend PASS; TestPort_IsolationPreparedTransactions
++ ...CIC strict PASS; stats probe L2036→L2180; build+vet clean; pgbench smoke via
 pre-commit hook.
 
-Key insight: snapshot/cache distinction only observable across statements of the
-same txn with a concurrent flush between → only inside an explicit txn. In
-autocommit / 'none' the getters read live (trivial single-read perms unchanged).
+Key insight: goopg ties tx.Handle to a reusable per-backend proc slot, so a
+prepared txn that the originating backend keeps working past WILL get its slot
+clobbered. Fix = relocate to a RESERVED high-region slot (PG dummy-PGPROC
+analogue) + bound all connection/internal allocators to ConnSlotCount.
+SERIALIZABLE 2PC kept on the unchanged same-backend keep-open path (SSI state is
+Handle-keyed → can't relocate without re-keying); prepared-transactions.spec
+never continues the originating backend so it's unaffected.
 
 NEXT rung for `stats` (each Effort-L; spec stays `defer`):
-- **L2036 — 2PC stats**: `s1_prepare_a` / `s{1,2}_{commit,rollback}_prepared_a`
-  (`PREPARE TRANSACTION 'a'` then COMMIT/ROLLBACK PREPARED) — goopg errors
-  "prepared transaction … does not exist"; rides 0118-0110 same-backend 2PC.
-- Later: relation tuple stats (pg_stat_get_numscans/_tuples_*,
-  pg_stat_get_xact_*, L2130+), SLRU stats (pg_stat_slru).
+- **L2180 — relation tuple stats**: `pg_stat_get_numscans(oid)` errors "function
+  does not exist"; also `pg_stat_get_tuples_{returned,fetched,inserted,...}`,
+  `pg_stat_get_live_tuples`/`_dead_tuples`, `pg_stat_get_xact_*` (per-txn). Needs
+  a relation-stats counter store fed by seq/index scans + DML, mirroring
+  pgstat_relation. Look at the `s_*_table_stats` steps + the seq_scan/n_tup_ins
+  column block around stats.spec L2160+.
+- Later: SLRU stats (`pg_stat_slru`).

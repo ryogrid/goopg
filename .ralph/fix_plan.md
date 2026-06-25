@@ -1651,3 +1651,30 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `stats_fetch_consistency='cache'/'snapshot'` (per-txn stat caching), then
       L2026 = 2PC `PREPARE TRANSACTION` stats. Tests `TestDeferredRoutineDropSession`
       + `TestRoutinesResolveForDrop` + updated `TestFunctionStatsManager`.
+      **2026-06-25 (design 0118-0127, enabler — NOT a promotion): `stats` rung 5.**
+      Cross-backend two-phase commit for RC/RR; first divergence advanced
+      **L2036 → L2180**. The four "2PC handling of stat drops" permutations
+      (S1-prepares then S1 OR S2 commits/aborts prepared) now match byte-for-byte.
+      Prior 2PC (0118-0110) was same-backend only (prepared txn kept open on the
+      originating connection's slot). New mechanism (PG dummy-PGPROC analogue):
+      (1) `mvcc.Manager.DetachToDedicatedSlot(tx)` relocates an RC/RR txn off its
+      backend's proc slot to a fresh dedicated slot (same XID/iso/snapshot, stays
+      `inTxn=1` so writes stay visible-as-in-progress + committable from any
+      backend; `ErrUnsupportedDetach` for SERIALIZABLE — Handle-keyed SSI). (2)
+      Reserved proc-array region: top `ReservedPreparedSlots=64` slots
+      `[ConnSlotCount, DefaultProcArraySize)` for detached prepared txns; ALL
+      low-region allocators bounded to `ConnSlotCount` (server.go×2,
+      dispatch_extended.go, copy.go, Begin auto-assign) so no backend reusing a
+      `procNum=(pid-1)%size` clobbers a parked slot. (3) `preparedXactStore`
+      (gid→parked `*connTxState`) + `connTxState.DetachPrepared` (moves session +
+      deferred DROP FUNCTION drops + NOTIFYs + enum DDL into the holder, frees the
+      live connection) + `BasicSession.RelocateTransaction`. (4)
+      `execFinalizePrepared` retargets the executor context at the parked
+      session/tx and routes the synthetic COMMIT/ROLLBACK through the canonical
+      `executeOneSimpleStmt` path (reuses SSI check, ApplyDeferredRoutineDrops→
+      funcStats.dropFunction, NOTIFY publish, lock release). SERIALIZABLE keeps the
+      unchanged same-backend keep-open path. New first divergence L2180 = relation
+      tuple stats (`pg_stat_get_numscans`/`_tuples_*`/`_xact_*`), then SLRU.
+      Tests: `TestDetachToDedicatedSlot{,RejectsSerializable}` (mvcc, also -race);
+      regression `TestPort_TwoPhaseCommitSameBackend` +
+      `TestPort_IsolationPreparedTransactions{,CIC}` strict PASS.

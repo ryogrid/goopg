@@ -615,3 +615,95 @@ func TestClassifyXID_ClogAbortedFallback(t *testing.T) {
 		t.Errorf("ClassifyXID(clog-committed xid=%d) = %v, want XidVisCommitted", recoveredCommit, got)
 	}
 }
+
+// TestDetachToDedicatedSlot verifies that relocating a prepared transaction off
+// its originating backend's proc slot keeps its XID visible as in-progress (so
+// its writes stay invisible), frees the original slot for reuse without
+// clobbering the relocated transaction, and lets the relocated handle be
+// committed afterwards. M0118-0009 (stats — cross-backend two-phase commit).
+func TestDetachToDedicatedSlot(t *testing.T) {
+	m := NewManager()
+	// Originating backend's transaction with a materialised (writing) XID.
+	tx, err := m.Begin(IsolationReadCommitted, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xid, err := m.AssignXID(tx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.XID = xid
+
+	moved, err := m.DetachToDedicatedSlot(tx)
+	if err != nil {
+		t.Fatalf("DetachToDedicatedSlot: %v", err)
+	}
+	if moved.Handle == tx.Handle {
+		t.Fatalf("expected a new handle, got the original %d", moved.Handle)
+	}
+	if moved.XID != xid {
+		t.Fatalf("relocated XID = %d, want %d", moved.XID, xid)
+	}
+	// The dedicated slot must live in the reserved high region.
+	if int(moved.Handle)-1 < ConnSlotCount {
+		t.Fatalf("dedicated slot %d not in reserved region [%d, %d)", int(moved.Handle)-1, ConnSlotCount, DefaultProcArraySize)
+	}
+
+	// The relocated XID must still read as in-progress in a fresh snapshot.
+	observer, err := m.Begin(IsolationReadCommitted, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := m.SnapshotFor(observer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.HasInProgress(xid) {
+		t.Fatalf("relocated prepared xid=%d not in-progress after detach", xid)
+	}
+
+	// The originating backend may reuse its freed slot (procNum 5) without
+	// disturbing the relocated transaction.
+	reuse, err := m.Begin(IsolationReadCommitted, 5)
+	if err != nil {
+		t.Fatalf("reuse of freed origin slot: %v", err)
+	}
+	if err := m.Commit(reuse); err != nil {
+		t.Fatalf("commit of reuse txn: %v", err)
+	}
+	// The relocated prepared transaction is still in-progress.
+	snap2, err := m.SnapshotFor(observer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap2.HasInProgress(xid) {
+		t.Fatalf("relocated xid=%d lost in-progress after origin-slot reuse", xid)
+	}
+
+	// Finalising the relocated handle commits the prepared transaction.
+	if err := m.Commit(moved); err != nil {
+		t.Fatalf("commit relocated prepared txn: %v", err)
+	}
+	snap3, err := m.SnapshotFor(observer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap3.HasInProgress(xid) {
+		t.Fatalf("xid=%d still in-progress after COMMIT PREPARED", xid)
+	}
+	_ = m.Commit(observer)
+}
+
+// TestDetachToDedicatedSlotRejectsSerializable verifies SERIALIZABLE detach is
+// refused (its SSI bookkeeping is Handle-keyed). M0118-0009.
+func TestDetachToDedicatedSlotRejectsSerializable(t *testing.T) {
+	m := NewManager()
+	tx, err := m.Begin(IsolationSerializable, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.DetachToDedicatedSlot(tx); !errors.Is(err, ErrUnsupportedDetach) {
+		t.Fatalf("expected ErrUnsupportedDetach, got %v", err)
+	}
+	_ = m.Rollback(tx)
+}
