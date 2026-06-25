@@ -1391,6 +1391,33 @@ func TestPort_IsolationFkPartitioned1(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-partitioned-1.spec")
 }
 
+// TestPort_IsolationFkPartitioned2 exercises fk-partitioned-2: an FK that
+// references a PARTITIONED table (pfk -> ppk, both list-partitioned) must
+// enforce referential integrity across the concurrent INSERT-vs-DELETE race.
+//   - INSERT into pfk while the referenced ppk row is being concurrently
+//     deleted: the FK's SELECT FOR KEY SHARE blocks <waiting ...> on the
+//     deleter; once it commits, READ COMMITTED re-evaluates and emits the
+//     23503 FK violation, while REPEATABLE READ / SERIALIZABLE cannot walk the
+//     update chain past their snapshot and surface 40001 "could not serialize
+//     access due to concurrent update".
+//   - DELETE FROM the partitioned parent ppk (routed to leaf ppk1) while a
+//     referencing pfk row is being concurrently inserted: blocks on the
+//     inserter, then errors naming the LEAF partition and its ordinal-suffixed
+//     clone constraint, "update or delete on table \"ppk1\" violates foreign
+//     key constraint \"pfk_a_fkey_1\" on table \"pfk\"".
+//
+// Promoted M0118-0005 (design 0118-0121): scanTableForMatchFKWait raises 40001
+// on a committed key-changing parent updater under RR/SSI, and enforceFKOnDelete
+// routes a partitioned-parent delete to its leaf so the referenced-side
+// violation names the per-partition clone.
+func TestPort_IsolationFkPartitioned2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_fk_partitioned2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-partitioned-2.spec")
+}
+
 // TestPort_IsolationRiTrigger exercises trigger-based referential integrity
 // under SERIALIZABLE: BEFORE UPDATE/DELETE and BEFORE INSERT/UPDATE plpgsql
 // triggers that PERFORM a query and RAISE on FOUND / NOT FOUND, plus SSI 40001

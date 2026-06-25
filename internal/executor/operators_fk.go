@@ -118,6 +118,22 @@ func enforceFKOnDelete(ctx *Context, parentTbl *catalog.Table, parentRow Row) er
 	if !ok {
 		return nil
 	}
+	// When the deleted row lives in a LEAF PARTITION of a partitioned referenced
+	// table (DELETE FROM the partitioned parent routes the tuple to a leaf),
+	// PostgreSQL fires the per-partition cloned RI trigger, so a NO ACTION /
+	// RESTRICT violation must name the LEAF partition and its ordinal-suffixed
+	// constraint clone (`pfk_a_fkey_1` on table `ppk1`) — not the partitioned
+	// parent. Route the row to its leaf so enforceFKOnDeletePartitionAncestor can
+	// name it, and suppress the parent-named assertNoChildRows below in that
+	// case. (When the DELETE targets a leaf directly, parentTbl already IS the
+	// leaf and routing is a no-op.) fk-partitioned-2.
+	leafTbl := parentTbl
+	if len(im.PartitionChildren(parentTbl.OID)) > 0 {
+		if leaf, rerr := routeToPartition(parentTbl, parentRow, im, ctx); rerr == nil && leaf != nil {
+			leafTbl = leaf
+		}
+	}
+	leafIsPartition := leafTbl != parentTbl && im.IsPartitionChild(leafTbl.OID)
 	refs := im.FindFKsReferencingTable(parentTbl.Name)
 	for _, ref := range refs {
 		// Get the referenced column values from the deleted parent row.
@@ -159,9 +175,13 @@ func enforceFKOnDelete(ctx *Context, parentTbl *catalog.Table, parentRow Row) er
 				return err
 			}
 		case parser.FKActionRestrict:
-			// RESTRICT: always immediate.
-			if err := assertNoChildRows(ctx, ref.Child, fk, vals); err != nil {
-				return err
+			// RESTRICT: always immediate. When the deleted row lives in a leaf
+			// partition of the referenced table, the leaf-named clone constraint
+			// is reported by the partition-ancestor pass below instead.
+			if !leafIsPartition {
+				if err := assertNoChildRows(ctx, ref.Child, fk, vals); err != nil {
+					return err
+				}
 			}
 		default: // NO ACTION
 			if fk.Deferrable && fk.InitiallyDeferred && ctx.Session != nil && ctx.Session.InExplicitTransaction() {
@@ -170,8 +190,13 @@ func enforceFKOnDelete(ctx *Context, parentTbl *catalog.Table, parentRow Row) er
 					continue
 				}
 			}
-			if err := assertNoChildRows(ctx, ref.Child, fk, vals); err != nil {
-				return err
+			// Leaf-partition deletes defer the violation to the partition-ancestor
+			// pass (leaf-named clone constraint); the unconditional wait above
+			// already serialised against any concurrent referencing INSERT.
+			if !leafIsPartition {
+				if err := assertNoChildRows(ctx, ref.Child, fk, vals); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -179,7 +204,7 @@ func enforceFKOnDelete(ctx *Context, parentTbl *catalog.Table, parentRow Row) er
 	// referenced table: the FK's action triggers are cloned to each partition of
 	// the referenced side, so deleting from `ppk1` (a partition of the referenced
 	// `ppk`) must still verify no referencing row depends on it. fk-partitioned-1.
-	if err := enforceFKOnDeletePartitionAncestor(ctx, parentTbl, parentRow); err != nil {
+	if err := enforceFKOnDeletePartitionAncestor(ctx, leafTbl, parentRow); err != nil {
 		return err
 	}
 	return nil
@@ -285,6 +310,17 @@ func fkDeleteAncestorPass(ctx *Context, im *catalog.InMemory, leafTbl *catalog.T
 			vals, allNull := fkColValues(leafTbl.Columns, refCols, leafRow)
 			if allNull {
 				continue
+			}
+			// Deferrable INITIALLY DEFERRED FK: the referenced-side check runs at
+			// COMMIT, not now — the referenced row may be re-inserted before commit
+			// (fk-snapshot's DELETE + re-INSERT in one txn). Queue the deferred
+			// check (deduped against the parent-keyed first-loop queue in
+			// enforceFKOnDelete) and skip the immediate raise. fk-snapshot.
+			if fk.Deferrable && fk.InitiallyDeferred && ctx.Session != nil && ctx.Session.InExplicitTransaction() {
+				if sess, ok := ctx.Session.(*BasicSession); ok {
+					sess.AddDeferredFKCheck(DeferredFKCheck{ChildTableName: ref.Child.Name, FK: fk})
+					continue
+				}
 			}
 			found, err := scanTableForMatch(ctx, ref.Child, fk.Columns, vals)
 			if err != nil {
@@ -1312,6 +1348,24 @@ func scanTableForMatchFKWait(ctx *Context, tbl *catalog.Table, colNames []string
 		if !ctx.Snap.HasAborted(pending.xid) &&
 			epqChainCheckMovedPartition(ctx, pending.rel, pending.blk, pending.slot) {
 			return false, errMovedToAnotherPartition(pos)
+		}
+		// RR / Serializable: the FK's FOR KEY SHARE lock encountered a parent row
+		// that a concurrent transaction key-changed (DELETE or key UPDATE — only
+		// such xmaxes are recorded as pending, never a no-key update or pure
+		// locker) and that transaction has now committed.  Under REPEATABLE READ /
+		// SERIALIZABLE the lock cannot silently walk the update chain past our
+		// snapshot, so PostgreSQL surfaces 40001 rather than re-evaluating: see
+		// heap_lock_tuple's HeapTupleUpdated → ERRCODE_T_R_SERIALIZATION_FAILURE.
+		// Under READ COMMITTED we fall through and re-scan, which finds the row
+		// gone (DELETE) and lets the caller emit the 23503 FK violation, or
+		// re-finds a still-matching version.  Mirrors fkChildWaitForInFlightInsert
+		// on the referenced-DELETE side (isolation spec fk-partitioned-2).
+		if ctx.Tx.Isolation != mvcc.IsolationReadCommitted &&
+			ctx.TxnMgr != nil && !ctx.TxnMgr.HasAbortedXID(pending.xid) {
+			return false, &ExecError{
+				Code:    "40001",
+				Message: "could not serialize access due to concurrent update",
+			}
 		}
 	}
 	return false, nil

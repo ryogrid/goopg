@@ -304,7 +304,7 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       regenerated. **Still deferred:** UPDATE/DELETE conflict-wait-on-a-conflicting-
       locker (independent slice, ledger'd).
       (b) `deadlock-parallel` needs a lock-group abstraction goopg lacks — defer.
-- [ ] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
+- [x] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,
       temporal-range-integrity. **PARTIAL (2026-06-22, design 0118-0023):** five
       specs promoted to pass-required (strict) with NO engine change —
@@ -366,7 +366,23 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       snapshot, and re-evaluates (now the clone is skipped + ROOT named), so the
       delete renders `<waiting ...>` then errors once the attach commits. All 18
       active perms byte-identical to PG 18.3; strict `TestPort_IsolationFkPartitioned1`.
-      **Remaining for the group: `fk-partitioned-2` only.**
+      **`fk-partitioned-2` PROMOTED (2026-06-25, design 0118-0121) — GROUP CLOSED:**
+      FK referencing a partitioned table (`pfk(a) references ppk`, both list-
+      partitioned). Two gaps: (A) INSERT-side `scanTableForMatchFKWait` now raises
+      `40001 could not serialize access due to concurrent update` (not `23503`)
+      when the FOR-KEY-SHARE wait finds the parent row key-changed by a COMMITTED
+      concurrent xact under REPEATABLE READ / SERIALIZABLE (PG `heap_lock_tuple`
+      `HeapTupleUpdated`); (B) `DELETE FROM` the partitioned parent `ppk` (routed
+      to leaf `ppk1`) now names the per-partition clone — `enforceFKOnDelete`
+      routes the deleted row to its leaf via `routeToPartition`, skips the
+      parent-named NO ACTION/RESTRICT `assertNoChildRows` for a partition-leaf row
+      (the unconditional `fkChildWaitForInFlightInsert` still serialises), and runs
+      `enforceFKOnDeletePartitionAncestor` from the leaf so it reports
+      `pfk_a_fkey_1 on table pfk`. Follow-up: `fkDeleteAncestorPass` now honours
+      DEFERRABLE INITIALLY DEFERRED FKs (queues a deduped deferred check, no
+      immediate raise) so `fk-snapshot`'s delete+re-insert stays green. All six
+      perms byte-identical to PG 18.3; strict `TestPort_IsolationFkPartitioned2`.
+      **M0118-0005 group fully promoted to pass-required.**
 - [x] **M0118-0006** — MERGE & INSERT ON CONFLICT output parity: merge-{update,delete,
       insert-update,match-recheck,join}, insert-conflict-do-update-{2,3,4},
       insert-conflict-specconflict, insert-conflict-do-nothing-2. **COMPLETE
