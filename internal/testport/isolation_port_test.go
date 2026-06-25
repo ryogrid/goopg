@@ -194,12 +194,23 @@ func runIsoSpecStrict(t *testing.T, root string, c *cluster.Cluster, specRelPath
 
 // TestPort_IsolationEvalPlanQual exercises the eval-plan-qual spec.
 // Requires: BEGIN ISOLATION LEVEL, GENERATED ALWAYS AS, CREATE TABLE INHERITS.
+// PROMOTED to pass-required (2026-06-25, design 0118-0106): all 50 permutations
+// match PG 18.3 byte-for-byte. The last divergence was the EPQ-over-join case
+// `selectresultforupdate` (FOR UPDATE OF jt over a join whose locked relation is
+// the inner index scan): goopg folded the index key condition `jt.id = y` into
+// the per-row EPQ recheck, but `y` is a join input's column whose index lives in
+// the join coordinate space — misread against the 2-column jointest tuple as
+// `jt.id = jt.data`, dropping the post-update row (returned 0 rows). Fixed by
+// only folding a row-local (constant) index key into the recheck; join/
+// correlated keys are excluded (the CTID-chain logic still catches key-column
+// changes). A sibling fix preserves build-side heap ctids through a lazy hash
+// join for the FOR-UPDATE-over-hash-join variant.
 func TestPort_IsolationEvalPlanQual(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_eval_plan_qual")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual.spec")
 }
 
 // TestPort_IsolationEvalPlanQualTrigger exercises the eval-plan-qual-trigger spec.

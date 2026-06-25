@@ -226,6 +226,41 @@ func filterPredMaxColRef(expr planner.Expr) int {
 	return max
 }
 
+// exprRefsColumnOrOuter reports whether expr references any column of a row
+// (ColumnRef) or an outer/correlated input (OuterColumnRef). An index scan's
+// key expression that satisfies this is a join/correlated lookup key rather
+// than a row-local constant, so it must not be folded into the per-row EPQ
+// recheck filter (its column indices live in a different coordinate space than
+// the locked table's own columns). M0118-0009.
+func exprRefsColumnOrOuter(expr planner.Expr) bool {
+	found := false
+	var walk func(planner.Expr)
+	walk = func(e planner.Expr) {
+		if e == nil || found {
+			return
+		}
+		switch x := e.(type) {
+		case *planner.ColumnRef:
+			found = true
+		case *planner.OuterColumnRef:
+			found = true
+		case *planner.BinaryOp:
+			walk(x.Left)
+			walk(x.Right)
+		case *planner.UnaryOp:
+			walk(x.Operand)
+		case *planner.CastExpr:
+			walk(x.Operand)
+		case *planner.FuncCall:
+			for _, a := range x.Args {
+				walk(a)
+			}
+		}
+	}
+	walk(expr)
+	return found
+}
+
 // currentTIDProvider is the interface a scan leaf implements to
 // expose the (rel, ItemPointer) of its most recently emitted
 // row. Implemented by *seqScanOp (M0021 step 2a) and
@@ -355,6 +390,26 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) currentTIDPr
 	}
 }
 
+// markJoinPreserveCTID walks the operator tree below a LockRows and tags every
+// joinOp with the relation whose heap ctid must survive the build-side drain
+// (M0118-0009, eval-plan-qual). Each tagged join decides at its own Open whether
+// targetRel actually lands on its build side; the tag is a harmless hint
+// otherwise. Recurses through Project / Filter wrappers and into both join
+// children so a join nested under another join is reached too.
+func markJoinPreserveCTID(op Operator, targetRel storage.RelFileNode) {
+	switch v := op.(type) {
+	case *projectOp:
+		markJoinPreserveCTID(v.child, targetRel)
+	case *filterOp:
+		markJoinPreserveCTID(v.child, targetRel)
+	case *joinOp:
+		rel := targetRel
+		v.preserveCTIDRel = &rel
+		markJoinPreserveCTID(v.left, targetRel)
+		markJoinPreserveCTID(v.right, targetRel)
+	}
+}
+
 func (o *lockRowsOp) Schema() planner.Schema { return o.plan.Output() }
 
 func (o *lockRowsOp) Open(ctx *Context) error {
@@ -432,6 +487,16 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 			return err
 		}
 	}
+	// M0118-0009 (eval-plan-qual): if the first locked relation can land on the
+	// BUILD side of a lazy hash join below, that scan is drained + closed at the
+	// join's Open and its currentTID is lost before drainAndStamp runs. Tell the
+	// join(s) to preserve that relation's heap ctid through the build so the
+	// emitted slot carries it (recovered via the ms.hasCTID fallback in
+	// drainAndStamp). Must run BEFORE o.child.Open builds the hash table.
+	if len(o.plan.Locks) > 0 && o.plan.Locks[0].Table != nil {
+		targetRel := ctx.Catalog.RelFileNode(o.plan.Locks[0].Table)
+		markJoinPreserveCTID(o.child, targetRel)
+	}
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
@@ -472,7 +537,21 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	// EvalPlanQual re-running the whole plan (index recheck included). The
 	// synthesised ref points at the indexed column's table ordinal, so it stays
 	// within filterCols; guard anyway for safety. M0118-0003.
-	if ix, ok := o.scan.(*indexScanOp); ok && ix.plan != nil && len(o.filterCols) > 0 {
+	// Fold the index key condition ONLY when its key expression is row-local —
+	// a constant such as `key = 1`. When the locked index scan is the inner of a
+	// join its key is a join/correlated reference (e.g. `jt.id = y` where y is
+	// another input's column), and indexScanPredicate emits that reference with
+	// a column index in the OUTER/join coordinate space. Re-applying it in
+	// epqRecheckFilter — which decodes only the locked table's own columns —
+	// silently misreads that index as a locked-table column (`jt.id = jt.data`)
+	// and wrongly drops the row (eval-plan-qual selectresultforupdate: the
+	// post-update jt row was discarded, returning 0 rows). filterPredMaxColRef
+	// can't catch this because the misaligned index happens to fall inside
+	// [0,len(filterCols)). For a non-key UPDATE the join key is preserved on the
+	// successor, so skipping its recheck is correct; key-column changes are still
+	// caught by the CTID-chain logic. M0118-0009 (docs/design/0118-0106).
+	if ix, ok := o.scan.(*indexScanOp); ok && ix.plan != nil && len(o.filterCols) > 0 &&
+		ix.plan.Key != nil && !exprRefsColumnOrOuter(ix.plan.Key) {
 		if idxPred := indexScanPredicate(ix.plan); idxPred != nil &&
 			filterPredMaxColRef(idxPred) < len(o.filterCols) {
 			if o.filterPred == nil {

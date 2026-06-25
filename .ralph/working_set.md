@@ -1,38 +1,42 @@
-Loop #43 COMPLETE: M0118-0009 `horizons.spec` PROMOTED (failed→pass, all 5 perms),
-design 0118-0105. Committed + pushed pending. This CLOSES the 0118-0104 perm-4 deferral.
+Loop #45 COMPLETE: M0118-0007 group CLOSED — `eval-plan-qual.spec` PROMOTED
+(failed→pass, all 50 perms strict), design 0118-0106. Committing + pushing.
 
-What landed (two coupled changes):
-- internal/server/dispatch.go: RR/SSI snapshot now pinned at the FIRST
-  snapshot-taking statement of a batched `BEGIN ISOLATION LEVEL …` message
-  (PG-correct timing) so `BEGIN RR; SELECT 1;` registers its proc-array xmin →
-  OldestXmin/VACUUM retain rows (perm 4 Heap Fetches stays 2). Gated by new
-  `stmtTakesSnapshot` allowlist (internal/server/notify.go: SELECT/INSERT/UPDATE/
-  DELETE/MERGE/DECLARE CURSOR) so a trailing `SET …` does NOT over-pin
-  (serializable-parallel s3 would else see Y=0 not Y=20).
-- internal/executor/operators_storage.go: fixed a latent LOST-UPDATE bug the
-  early pin exposed. All 5 EvalPlanQual write sites classified a settled xmax by
-  snapshot membership (`!snap.HasInProgress(xmax)`⇒aborted); a tx that STARTED
-  AFTER a frozen RR/SSI snapshot is also absent yet may have COMMITTED → row
-  silently overwritten instead of 40001. New shared `epqXmaxSettled(ctx,xmax)`
-  consults TxnMgr authoritatively (HasAbortedXID→proceed / IsXIDActive→retry /
-  else committed→40001) for RR/SSI ONLY; RC path byte-identical (guarded). New
-  `epqSerializationErr` centralises concurrent-delete-vs-update message.
-- internal/testport/isolation_port_test.go: TestPort_IsolationHorizons soft→strict.
-- docs/design/0118-0105 + README index; inventory CSV horizons failed→pass;
-  coverage/inventory md regenerated.
+What landed (EPQ recheck over a join — two coupled executor fixes):
+- internal/executor/operators_lockrows.go: the index key condition was folded
+  into the per-row EvalPlanQual recheck filter unconditionally; when the locked
+  index scan is the inner of a join its key `ix.Key` is a join/correlated column
+  ref (`jt.id = y`) whose ColumnRef.Index is in the JOIN coordinate space, but
+  epqRecheckFilter decodes only the locked table's own columns → `y`(idx 1)
+  misread as jointest.data → `jt.id=jt.data` → false → post-update row dropped
+  (0 rows). Fix: fold idxPred ONLY when `ix.Key` is row-local/constant — new
+  `exprRefsColumnOrOuter(expr)` guard. Non-key UPDATE preserves join key so
+  skipping its recheck is correct; key changes still caught by CTID-chain.
+  Also added `markJoinPreserveCTID` walker (sets preserveCTIDRel before child Open).
+- internal/executor/operators_join_agg.go (SIBLING latent-bug fix): a lazy hash
+  join whose locked relation lands on the BUILD side (drained+closed at Open)
+  lost its currentTID → FOR UPDATE silently returned the STALE pre-update row.
+  New joinOp fields preserveCTIDRel/preserveBuildSide/lazyHashCTID/lazyMatchCTIDs;
+  buildHashRightWithCTID captures build-side ctids via drainRowsCtxCTID; nextLazy
+  stamps the matched build row's ctid onto the emitted slot → lockRowsOp
+  ms.hasCTID fallback recovers TID. nil/no-op for queries without FOR UPDATE →
+  TPC-H hash-join hot path byte-identical.
+- internal/testport/isolation_port_test.go: TestPort_IsolationEvalPlanQual
+  soft→strict (runIsoSpecStrict).
+- docs/design/0118-0106 + README index; inventory CSV failed→pass; D-002 narrative;
+  coverage/inventory md regenerated. Isolation tally now 111 pass / 10 failed.
 
-Gates run (ALL PASS): TestPort_IsolationHorizons strict 5/5; EvalPlanQualTrigger
-strict; broad RR/SSI+EPQ+row-lock+SSI-parallel+merge/insert-conflict/fk/deadlock/
-skip-locked/nowait batch (~57 specs across two runs) no regression; -race
-mvcc/server/executor; go vet + build + gofmt(edited regions) clean. pgbench smoke
-= pre-commit hook (on commit).
+Gates run (PASS): TestPort_IsolationEvalPlanQual strict 50/50; EPQ-trigger +
+lock-update-{delete,traversal} + update-locked-tuple + tuplelock-update +
+partial-index + simple-write-skew + predicate-lock-hot-tuple PASS no regression;
+-race executor join/lockrows; full executor unit suite; go build+vet clean;
+gofmt my-regions clean (pre-existing compact-style lines NOT touched per version
+rule). TPC-H spotcheck = known WSL2 startup-hang infra failure (not a regression;
+change provably gated off for non-FOR-UPDATE queries); pgbench smoke = pre-commit hook.
 
-NEXT (remaining M0118-0009, all Effort-L, distinct unbuilt subsystems):
-- intra-grant-inplace (pg_class): shared-catalog MVCC-tuple rowmarks (FOR NO KEY
-  UPDATE/KEY SHARE/UPDATE on pg_class) + inplace update (relhasindex) + LockTuple
-  deadlocks. Hardest. db-sibling done via dbACLChangeXID shortcut (0118-0098) but
-  pg_class needs real rowmark machinery — NOT a simple reuse.
-- stats: full cumulative-stats subsystem (pg_stat_force_next_flush, track_functions,
-  pg_stat_reset_single_function_counters, stats_fetch_consistency snapshot, SLRU
-  stats, 2PC interaction). Large.
-- prepared-transactions{,-cic}: 2PC (PREPARE TRANSACTION / COMMIT PREPARED).
+NEXT (remaining M0118, all Effort-L distinct unbuilt subsystems):
+- intra-grant-inplace (pg_class): runtime shared-catalog MVCC-tuple row locks.
+- stats: cumulative function-stats + stats_fetch_consistency + 2PC interaction.
+- prepared-transactions{,-cic}: 2PC (PREPARE/COMMIT PREPARED) — also gates stats.
+- Non-0009: deadlock-parallel (lock groups), fk-partitioned-1/2 (ATTACH PARTITION
+  + partitioned FK), index-only-bitmapscan (BitmapOr plan + EXPLAIN DECLARE CURSOR
+  + VACUUM (TRUNCATE false)), predicate-gin/gist (AM granularity).

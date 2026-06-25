@@ -331,8 +331,25 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       now a red test, not a silent `t.Skip` as with `runIsoSpec`), and the ten
       dedicated `TestPort_IsolationMerge*` / `TestPort_IsolationInsertConflict*`
       functions were switched to it. D-002 CSV rationale updated.
-- [ ] **M0118-0007** — Planner / output-format blockers: eval-plan-qual (planner
+- [x] **M0118-0007** — Planner / output-format blockers: eval-plan-qual (planner
       RETURNING support), drop-index-concurrently-1 (EXPLAIN EXECUTE plan-format parity).
+      **COMPLETE (2026-06-25, design 0118-0106): `eval-plan-qual` PROMOTED — group
+      closed.** All three specs (drop-index-concurrently-1, eval-plan-qual-trigger,
+      eval-plan-qual) now strict-pass byte-for-byte vs PG 18.3. The last divergence was
+      the EPQ-over-join `selectresultforupdate` case: `SELECT … FOR UPDATE OF jt` over a
+      join whose locked `jt` is the inner index scan — goopg folded the index key
+      condition `jt.id = y` into the per-row EvalPlanQual recheck, but `y` is another
+      join input's column whose `ColumnRef.Index` lives in the join coordinate space,
+      misread against the 2-col jointest tuple as `jt.id = jt.data` → post-update row
+      wrongly dropped (0 rows). Fixed by only folding a row-local/constant index key into
+      the recheck (`exprRefsColumnOrOuter` guard); join/correlated keys excluded (CTID-
+      chain logic still catches key-column changes). Sibling fix: a lazy hash join now
+      preserves build-side heap ctids (`markJoinPreserveCTID`/`preserveCTIDRel`/
+      `lazyHashCTID`/`buildHashRightWithCTID`, stamped by `nextLazy`) so FOR UPDATE over
+      the hash-join variant recovers the locked TID after the build scan is drained+closed
+      (nil/no-op for queries without FOR UPDATE → TPC-H hash-join hot path untouched).
+      `TestPort_IsolationEvalPlanQual` strict 50/50; EPQ-trigger+row-lock regression PASS;
+      `-race` executor; TPC-H Q12/Q13 spot-check; pgbench smoke.
       **PARTIAL (2026-06-22, design 0118-0024):** `drop-index-concurrently-1` promoted
       to pass-required with NO engine change — it matches PG 18.3 byte-for-byte (DROP
       INDEX CONCURRENTLY two-phase invalidation + index→seqscan EXPLAIN plan-format
@@ -1299,9 +1316,18 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `-race` mvcc/vacuum/storage + executor/server PASS; predicate-hash/
       eval-plan-qual-trigger non-regression confirmed; build+vet+gofmt clean;
       pgbench smoke = pre-commit hook. Ledger row.
-      **Remaining M0118-0009:** `intra-grant-inplace` (pg_class sibling — ALTER
-      TABLE ADD PRIMARY KEY `<waiting>` behind FOR KEY SHARE on pg_class; needs
-      runtime shared-catalog MVCC-tuple row locks — heavy), `horizons`
-      (plpgsql `EXECUTE INTO STRICT` + EXPLAIN FORMAT json `Heap Fetches` +
-      pruning-horizon MVCC core), `stats` (pg_stat_force_next_flush),
-      `prepared-transactions{,-cic}` (2PC).
+      `horizons` PROMOTED (loop #43, design 0118-0105). **Remaining M0118-0009:**
+      `intra-grant-inplace` (pg_class sibling — ALTER TABLE ADD PRIMARY KEY
+      `<waiting>` behind FOR KEY SHARE on pg_class; needs runtime shared-catalog
+      MVCC-tuple row locks — heavy), `stats` (pg_stat_force_next_flush + cumulative
+      function-stats + stats_fetch_consistency + 2PC interaction), `prepared-
+      transactions{,-cic}` (2PC PREPARE/COMMIT PREPARED — also gates the `stats`
+      spec's PREPARE TRANSACTION steps). All three remaining are genuinely Effort-L
+      unbuilt subsystems.
+      **2026-06-25 (design 0118-0106): `eval-plan-qual` PROMOTED — closes the
+      M0118-0007 planner/output-format group.** EPQ recheck over a join: the index
+      key fold into the per-row recheck was unsound when `ix.Key` is a join/
+      correlated reference (coordinate-space mismatch dropped the post-update row);
+      fold now gated on a row-local constant key (`exprRefsColumnOrOuter`). Sibling
+      latent fix: lazy hash join preserves build-side heap ctids for FOR UPDATE over
+      the hash-join variant. Detail in the M0118-0007 entry above.
