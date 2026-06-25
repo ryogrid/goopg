@@ -427,6 +427,28 @@ func TestPort_IsolationPreparedTransactionsCIC(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/prepared-transactions-cic.spec")
 }
 
+// TestPort_IsolationPreparedTransactions exercises the prepared-transactions
+// spec (M0118-0009, design 0118-0112): three overlapping SERIALIZABLE
+// transactions drive an s1 --rw--> s2 --rw--> s3 dangerous structure under
+// two-phase commit across all 1500 permutations, and exactly one of the three
+// must abort with 40001 in every permutation. Building on the same-backend 2PC
+// enabler (design 0118-0110), goopg now runs the SSI dangerous-structure check
+// at PREPARE TRANSACTION time (Manager.PrepareCheckForSerializationFailure) and
+// treats a PREPARED-but-not-committed peer like an already-committed one in the
+// read/write conflict hooks (Prepared/PrepareSeqNo mirror SXACT_FLAG_PREPARED /
+// prepareSeqNo). A dangerous structure whose pivot is already PREPARED makes the
+// preparer/committer commit suicide rather than dooming the durable pivot; an
+// rw-edge to a PREPARED writer dooms the reader. PREPARE on an already-aborted
+// block silently rolls back (no 25P02), matching PrepareTransactionBlock on
+// TBLOCK_ABORT. Byte-identical to PG 18.3 across all 1500 permutations.
+func TestPort_IsolationPreparedTransactions(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_prepared_transactions")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/prepared-transactions.spec")
+}
+
 // TestPort_IsolationInheritTemp exercises the inherit-temp spec (M0118-0008):
 // an inheritance tree whose children are TEMPORARY tables created in different
 // sessions. Each backend owns its own temp namespace, so s1's scan/UPDATE/

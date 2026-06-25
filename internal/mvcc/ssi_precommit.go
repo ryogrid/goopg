@@ -120,6 +120,34 @@ func (m *Manager) PreCommitCheckForSerializationFailure(handle TxnHandle) error 
 	return m.preCommitCheckForSerializationFailureLocked(handle)
 }
 
+// PrepareCheckForSerializationFailure runs the pre-commit dangerous-structure
+// check at PREPARE TRANSACTION time (same-backend 2PC, M0118-0009) and, on
+// success, marks the SerializableXact PREPARED. Upstream's
+// PreCommit_CheckForSerializationFailure both performs the check and sets
+// SXACT_FLAG_PREPARED (predicate.c line ~4773); goopg splits the two so a
+// normal COMMIT never sets the flag (it finishes immediately and is gated out
+// by FinishedAt). A PREPARED still-in-flight pivot cannot be doomed by a later
+// committer — see the Prepared branch of
+// preCommitCheckForSerializationFailureLocked.
+//
+// On a returned error the caller must abort the transaction; the flag is left
+// unset. Safe for concurrent use.
+func (m *Manager) PrepareCheckForSerializationFailure(handle TxnHandle) error {
+	m.ssiMu.Lock()
+	defer m.ssiMu.Unlock()
+	if err := m.preCommitCheckForSerializationFailureLocked(handle); err != nil {
+		return err
+	}
+	if m.ssiState.xacts != nil {
+		if me, ok := m.ssiState.xacts[handle]; ok && me != nil {
+			me.Prepared = true
+			me.PrepareSeqNo = m.ssiState.nextCommitSeqNo
+			m.ssiState.nextCommitSeqNo++
+		}
+	}
+	return nil
+}
+
 func (m *Manager) preCommitCheckForSerializationFailureLocked(handle TxnHandle) error {
 	if m.ssiState.xacts == nil {
 		return nil
@@ -151,13 +179,12 @@ func (m *Manager) preCommitCheckForSerializationFailureLocked(handle TxnHandle) 
 			if tin == nil {
 				continue
 			}
+			dangerous := false
 			if tin == me {
 				// The 2-cycle case: write-skew between me and the pivot.
 				// `farConflict->sxactOut == MySerializableXact` upstream.
-				pivot.Doomed = true
-				break
-			}
-			if tin.FinishedAt == InvalidCommitSeqNo && !tin.Doomed && !tin.ReadOnly {
+				dangerous = true
+			} else if tin.FinishedAt == InvalidCommitSeqNo && !tin.Doomed && !tin.ReadOnly {
 				// The 3-cycle case: Tin is still in-flight, not doomed,
 				// and not declared READ ONLY.
 				// `!SxactIsCommitted(t0) && !SxactIsReadOnly(t0) &&
@@ -166,9 +193,26 @@ func (m *Manager) preCommitCheckForSerializationFailureLocked(handle TxnHandle) 
 				// structure here — it writes nothing, so it can still
 				// resolve RO-safe — which is exactly the receipt-report
 				// de-facto READ ONLY false-positive avoidance. M0118-0001.
-				pivot.Doomed = true
-				break
+				dangerous = true
 			}
+			if !dangerous {
+				continue
+			}
+			if pivot.Prepared {
+				// The pivot is already PREPARED (same-backend 2PC,
+				// M0118-0009) — upstream cannot kill a prepared pivot
+				// (it may yet COMMIT PREPARED and is durable on disk), so
+				// the committing/preparing xact commits suicide instead.
+				// `if (SxactIsPrepared(nearConflict->sxactOut)) ... ereport`
+				// (predicate.c line ~4756). This is what makes the third
+				// PREPARE TRANSACTION in prepared-transactions.spec fail on
+				// itself rather than dooming the already-prepared pivot.
+				return &SerializationFailureError{
+					Reason: "Canceled on commit attempt with conflict in from prepared pivot",
+				}
+			}
+			pivot.Doomed = true
+			break
 		}
 	}
 	return nil

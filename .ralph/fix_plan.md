@@ -1414,6 +1414,19 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       site maps via the shared `lockWaitTimeoutError` helper — no sibling path).
       Blast radius nil: byte-unchanged when lock_timeout=0; only caller is the CIC
       drain. Gates: strict spec PASS + `-race ./internal/mvcc/...` green.
+      **2026-06-25 (design 0118-0112, PROMOTION): `prepared-transactions`
+      PROMOTED to pass-required** (`runIsoSpecStrict` in
+      `TestPort_IsolationPreparedTransactions`, all 1500 permutations
+      byte-identical to PG 18.3). The SSI dangerous-structure check now runs at
+      PREPARE TRANSACTION time (`Manager.PrepareCheckForSerializationFailure`)
+      and a PREPARED-but-not-committed peer is treated like a committed-first one
+      in the read/write conflict hooks (`SerializableXact.Prepared`/`PrepareSeqNo`
+      mirror `SXACT_FLAG_PREPARED`/`prepareSeqNo`): a dangerous structure whose
+      pivot is already prepared makes the preparer commit suicide (40001) while an
+      rw-edge to a prepared writer dooms the reader; PREPARE on an already-aborted
+      block silently rolls back (no 25P02, matching `PrepareTransactionBlock` on
+      `TBLOCK_ABORT`). Blast radius nil for non-2PC: every new branch is guarded by
+      `Prepared`, never set outside `PREPARE TRANSACTION`. Gates: strict spec PASS
+      (137s) + `-race ./internal/mvcc/...` green.
       **Remaining M0118-0009:** `intra-grant-inplace` (pg_class rowmark locking),
-      `stats` (pg_stat_* subsystem), `prepared-transactions` (full 1500-perm SSI
-      verification across held prepared xacts).
+      `stats` (pg_stat_* subsystem).

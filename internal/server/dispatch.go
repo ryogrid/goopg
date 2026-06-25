@@ -490,7 +490,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			_, isCommit := stmt.(*parser.CommitStmt)
 			_, isRollback := stmt.(*parser.RollbackStmt)
 			_, isRollbackTo := stmt.(*parser.RollbackToSavepointStmt)
-			if !isCommit && !isRollback && !isRollbackTo {
+			// Two-phase-commit statements are also allowed through: PG's
+			// PREPARE TRANSACTION on an aborted block silently rolls back
+			// (no 25P02), and COMMIT/ROLLBACK PREPARED of a gid the failed
+			// connection never prepared reports "does not exist". Handled in
+			// execTwoPhaseStmt. M0118-0009 (prepared-transactions).
+			if !isCommit && !isRollback && !isRollbackTo && !isTwoPhaseStmt(stmt) {
 				return s.writeQueryError(w, "25P02",
 					"current transaction is aborted, commands ignored until end of transaction block")
 			}

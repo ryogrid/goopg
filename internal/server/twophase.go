@@ -26,6 +26,7 @@ package server
 
 import (
 	"github.com/goopg/goopg/internal/executor"
+	"github.com/goopg/goopg/internal/mvcc"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/protocol"
 	"github.com/goopg/goopg/internal/sqlstate"
@@ -48,7 +49,7 @@ func isTwoPhaseStmt(stmt parser.Stmt) bool {
 func (s *Server) execTwoPhaseStmt(w *protocol.FrameWriter, ctx *executor.Context, stmt parser.Stmt, connTx *connTxState, autoCommitPtr *bool) (bool, error) {
 	switch st := stmt.(type) {
 	case *parser.PrepareTransactionStmt:
-		return true, s.execPrepareTransaction(w, st, connTx, autoCommitPtr)
+		return true, s.execPrepareTransaction(w, ctx, st, connTx, autoCommitPtr)
 	case *parser.CommitPreparedStmt:
 		return true, s.execFinalizePrepared(w, ctx, st.Gid, connTx, autoCommitPtr, &parser.CommitStmt{})
 	case *parser.RollbackPreparedStmt:
@@ -62,14 +63,33 @@ func (s *Server) execTwoPhaseStmt(w *protocol.FrameWriter, ctx *executor.Context
 // open transaction prepared (keeping it open) so a later COMMIT/ROLLBACK
 // PREPARED can finalise it. PREPARE TRANSACTION is only valid inside an
 // explicit, non-aborted transaction block. M0118-0009.
-func (s *Server) execPrepareTransaction(w *protocol.FrameWriter, st *parser.PrepareTransactionStmt, connTx *connTxState, autoCommitPtr *bool) error {
+func (s *Server) execPrepareTransaction(w *protocol.FrameWriter, ctx *executor.Context, st *parser.PrepareTransactionStmt, connTx *connTxState, autoCommitPtr *bool) error {
 	if connTx == nil || !connTx.InExplicit() {
 		return s.writeQueryError(w, sqlstate.NoActiveSQLTransaction,
 			"PREPARE TRANSACTION can only be used in transaction blocks")
 	}
 	if connTx.IsFailed() {
-		return s.writeQueryError(w, sqlstate.InFailedSQLTransaction,
-			"current transaction is aborted, commands ignored until end of transaction block")
+		// PREPARE TRANSACTION on an aborted transaction block silently rolls
+		// back in PostgreSQL: EndTransactionBlock moves TBLOCK_ABORT →
+		// TBLOCK_ABORT_END and PrepareTransactionBlock returns result=false, so
+		// no error and no PREPARE result tag are sent — the transaction is just
+		// discarded. Reuse the canonical ROLLBACK path (clears the failed state,
+		// ends the txn); the subsequent COMMIT/ROLLBACK PREPARED of this gid then
+		// reports "does not exist", exactly as upstream. M0118-0009.
+		return s.executeOneSimpleStmt(w, ctx, &parser.RollbackStmt{}, connTx, autoCommitPtr)
+	}
+	// SSI dangerous-structure check at PREPARE time. Upstream's
+	// PrepareTransaction calls PreCommit_CheckForSerializationFailure before the
+	// prepare record is written; a failure aborts the transaction so the later
+	// COMMIT PREPARED reports "does not exist". This is what makes the third
+	// PREPARE in prepared-transactions.spec (against an already-prepared pivot)
+	// fail on itself. On success the SerializableXact is marked PREPARED so a
+	// later committer cannot doom it. M0118-0009.
+	explicitTx := connTx.Tx()
+	if explicitTx.Isolation == mvcc.IsolationSerializable && explicitTx.Handle != 0 {
+		if ssiErr := s.cfg.TxnMgr.PrepareCheckForSerializationFailure(explicitTx.Handle); ssiErr != nil {
+			return s.abortForPrepareSSIFailure(w, ctx, connTx, explicitTx, ssiErr)
+		}
 	}
 	// Keep the transaction open; record the gid. The connection stays "in a
 	// transaction block" from goopg's view, which is invisible to the isolation
@@ -81,6 +101,44 @@ func (s *Server) execPrepareTransaction(w *protocol.FrameWriter, st *parser.Prep
 		*autoCommitPtr = false
 	}
 	return w.WriteCommandComplete("PREPARE TRANSACTION")
+}
+
+// abortForPrepareSSIFailure rolls back the transaction whose PREPARE failed the
+// SSI dangerous-structure check and reports SQLSTATE 40001, mirroring the
+// COMMIT-time SSI rollback in the simple-query dispatch path. The transaction
+// is fully torn down (no prepared marker is set) so a subsequent COMMIT/ROLLBACK
+// PREPARED of this gid reports "does not exist", exactly as upstream. M0118-0009.
+func (s *Server) abortForPrepareSSIFailure(w *protocol.FrameWriter, ctx *executor.Context, connTx *connTxState, explicitTx mvcc.Transaction, ssiErr error) error {
+	if sess := connTx.Session(); sess != nil {
+		if rs := s.cfg.Catalog.Routines(); rs != nil {
+			for _, r := range sess.TakePendingRoutineDrops() {
+				_, _ = rs.Create(r, true)
+			}
+		}
+	}
+	_ = s.cfg.TxnMgr.Rollback(explicitTx)
+	undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+	connTx.End()
+	if ctx != nil && ctx.EndLocalTransaction != nil {
+		ctx.EndLocalTransaction()
+	}
+	if ctx != nil {
+		ctx.PendingEnumValues = nil
+		ctx.PendingEnumRenames = nil
+		ctx.PendingCreatedEnums = nil
+		ctx.PendingCreatedComposites = nil
+	}
+	var ssiFields []protocol.ErrorField
+	if sfe, ok := ssiErr.(*mvcc.SerializationFailureError); ok {
+		if d := sfe.Detail(); d != "" {
+			ssiFields = append(ssiFields,
+				protocol.ErrorField{Code: protocol.FieldDetail, Value: d},
+				protocol.ErrorField{Code: protocol.FieldHint, Value: "The transaction might succeed if retried."})
+		}
+	}
+	return s.writeQueryError(w, "40001",
+		"could not serialize access due to read/write dependencies among transactions",
+		ssiFields...)
 }
 
 // execFinalizePrepared implements COMMIT PREPARED / ROLLBACK PREPARED. It
