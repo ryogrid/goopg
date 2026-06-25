@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -310,6 +311,28 @@ func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos in
 			Message: fmt.Sprintf("%s(%s) is a procedure", r.Name, routineArgTypesStr(r)),
 			Hint:    "To call a procedure, use CALL."}
 	}
+	// Cumulative function statistics (pgstat). When the calling session's
+	// track_functions GUC enables it, time the call and accumulate one
+	// invocation into the session's pending stats (flushed to the shared store
+	// by pg_stat_force_next_flush). Default track_functions='none' skips this
+	// entirely, so the normal call path is untouched. Design 0118-0124.
+	if shouldTrackFunction(ctx, r) {
+		start := time.Now()
+		d, err := dispatchStoredRoutineByLanguage(r, args, ctx, pos)
+		elapsed := time.Since(start)
+		// goopg does not separate nested-call time, so self == total. The spec
+		// only checks total_time/self_time > 0, which holds for any executed
+		// body (the spec's functions pg_sleep to guarantee a positive interval).
+		funcStats.record(sessionStatsID(ctx), r.OID, elapsed, elapsed)
+		return d, err
+	}
+	return dispatchStoredRoutineByLanguage(r, args, ctx, pos)
+}
+
+// dispatchStoredRoutineByLanguage runs a (non-procedure) stored routine by its
+// implementation language. Split out of executeStoredRoutine so the
+// function-statistics path can wrap it with timing.
+func dispatchStoredRoutineByLanguage(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
 	switch strings.ToLower(r.Language) {
 	case "plpgsql":
 		return executePLpgSQLRoutine(r, args, ctx, pos)

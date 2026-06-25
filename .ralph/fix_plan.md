@@ -1602,5 +1602,32 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `pg_stat_get_xact_*`; `pg_stat_reset()`; real snapshot caching; 2PC stats
       interaction (rides 0118-0110). Tests `TestPgStatFlushSnapshotVoidNoops`
       (executor) + `TestStatsGUCs` (config).
+      **2026-06-25 (design 0118-0124, enabler — NOT a promotion): `stats` rung 2.**
+      Built the cumulative function-statistics subsystem + the runner setup-echo
+      needed to observe it; first divergence advanced **L4 → L449** (the first ≈8
+      permutations — function-stats counting, multi-connection accumulation,
+      cross-txn flush, `pg_stat_reset*` — now byte-identical to PG 18.3, counts and
+      `total_time>0`/`self_time>0` included). Pieces: (1) process-global
+      `functionStatsManager` (`internal/executor/pgstat_functions.go`) with
+      per-session `pending[sessionID][oid]` → cluster-global `shared[oid]` merged on
+      `pg_stat_force_next_flush()`; one server process per cluster + fresh server per
+      spec ⇒ store starts empty per cluster (like fresh initdb). (2) Counting hook in
+      `executeStoredRoutine` (split out `dispatchStoredRoutineByLanguage`), gated by
+      `track_functions` (all/pl/none; boot none ⇒ zero hot-path overhead); times the
+      dispatch, `self==total` (spec only checks `>0`, guaranteed by `pg_sleep(10µs)`
+      bodies). (3) `evalFuncCall` getters `pg_stat_get_function_calls/_total_time/
+      _self_time(oid)` (NULL when no flushed stats; ms as NUMERIC so `>0` compares) +
+      `pg_stat_reset_single_function_counters(oid)` + `pg_stat_reset()`;
+      `pg_stat_force_next_flush()` upgraded from no-op to flush. OIDs via
+      `'name'::regproc`→`Routine.OID`. (4) Runner: global setup blocks run via
+      `execConnSetupCapture`, the tuple-returning setup result (`SELECT
+      pg_stat_force_next_flush()`) echoed right after `starting permutation:` like
+      `isolationtester.c` (safe: a passing strict spec with a tuple setup would
+      already have diverged). Spec stays `defer` — new first divergence is the
+      **uncommitted `DROP FUNCTION` cross-session visibility** case (no per-session
+      MVCC catalog; same gap as alter-table-4). Tests `TestFunctionStatsManager` +
+      `TestShouldTrackFunction`.
       **Remaining M0118-0009:** `stats` (pg_stat_* cumulative subsystem, Effort-L —
-      rung 1 enabler landed 0118-0123; the counters/getters subsystem remains).
+      rungs 1+2 enablers landed 0118-0123/0124; remaining rungs: uncommitted-DROP
+      MVCC-catalog visibility, 2PC stat-drops, `stats_fetch_consistency` snapshot/
+      cache models, relation tuple stats + `pg_stat_get_xact_*`, SLRU stats).

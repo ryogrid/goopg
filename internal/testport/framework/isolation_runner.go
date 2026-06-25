@@ -148,6 +148,14 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		if len(setupBlocks) == 0 && spec.SetupSQL != "" {
 			setupBlocks = []string{spec.SetupSQL}
 		}
+		// PostgreSQL isolationtester.c (run_permutation) prints the result set of
+		// each global setup block whose final command returns tuples
+		// (PGRES_TUPLES_OK) — right after the "starting permutation:" line, before
+		// any step. e.g. stats.spec's setup ends with SELECT
+		// pg_stat_force_next_flush(), so its one-row block is echoed before every
+		// permutation. COMMAND_OK setups (CREATE TABLE / INSERT) print nothing.
+		// Capture that output here and hand it to runPermutation. M0118-0009.
+		var setupResult string
 		if len(setupBlocks) > 0 {
 			monitor, err := db.Conn(ctx)
 			if err != nil {
@@ -157,10 +165,12 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 				if strings.TrimSpace(blk) == "" {
 					continue
 				}
-				if err := execConn(ctx, monitor, blk); err != nil {
+				out, errText := execConnSetupCapture(ctx, monitor, blk)
+				if errText != "" {
 					_ = monitor.Close()
-					return "", fmt.Errorf("global setup (permutation %d): %w", i, err)
+					return "", fmt.Errorf("global setup (permutation %d): %s", i, errText)
 				}
+				setupResult += out
 			}
 			_ = monitor.Close()
 		}
@@ -169,7 +179,7 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		if i < len(spec.PermutationBlockers) {
 			permBlockers = spec.PermutationBlockers[i]
 		}
-		out, err := r.runPermutation(ctx, db, spec, perm, permBlockers)
+		out, err := r.runPermutation(ctx, db, spec, perm, permBlockers, setupResult)
 
 		// Global teardown runs after each permutation (mirrors isolationtester.c).
 		if spec.TeardownSQL != "" {
@@ -305,7 +315,7 @@ func drainAllNotifications(sb *strings.Builder, sessionNames []string, queues ma
 }
 
 // runPermutation executes one permutation using fresh session connections.
-func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec IsolationSpec, perm []string, permBlockers [][]StepBlocker) (string, error) {
+func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec IsolationSpec, perm []string, permBlockers [][]StepBlocker, setupResult string) (string, error) {
 	sessionNames := spec.Sessions
 	if len(sessionNames) == 0 {
 		sessionNames = []string{"s1"}
@@ -418,6 +428,11 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "starting permutation: %s\n", strings.Join(perm, " "))
+	// Global setup result block (e.g. stats.spec's trailing SELECT
+	// pg_stat_force_next_flush()), echoed exactly as isolationtester does —
+	// immediately after the header, before per-session setup and steps. Empty
+	// for the vast majority of specs whose setup is pure DDL/DML. M0118-0009.
+	sb.WriteString(setupResult)
 
 	// Per-session setup: set application_name first so pg_locks queries
 	// filtered by application_name can identify sessions. M0100-0006b.

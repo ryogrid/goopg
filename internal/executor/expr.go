@@ -9228,12 +9228,76 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		return evalAclDefault(x, row, ctx)
 	// pg_stat_force_next_flush() → void: forces the next cumulative-statistics
 	// flush in the current backend to proceed unconditionally (upstream skips a
-	// flush if the rate-limit interval has not elapsed). goopg has no separate
-	// statistics-collector process to flush to — pending stats are applied
-	// synchronously — so this is a faithful no-op. The `stats` isolation spec
-	// calls it between mutating and observing steps to make pending stats
-	// visible; that ordering already holds in goopg. (M0118-0009 stats enabler.)
+	// flush if the rate-limit interval has not elapsed). goopg accumulates
+	// function-call stats in per-session pending counters; this flushes them
+	// into the shared, cluster-global store so the pg_stat_get_function_* getters
+	// (and other sessions) observe them. The `stats` isolation spec calls it
+	// between mutating and observing steps. Design 0118-0124 (M0118-0009 rung 2).
 	case "pg_stat_force_next_flush":
+		funcStats.flush(sessionStatsID(ctx))
+		return NewStringDatum(""), nil
+	// pg_stat_get_function_calls(oid) → bigint: number of times the function has
+	// been called (flushed), or NULL when no stats exist for it. Design 0118-0124.
+	case "pg_stat_get_function_calls":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		if c, found := funcStats.get(oid); found {
+			return NewIntDatum(c.calls), nil
+		}
+		return NullDatum, nil
+	// pg_stat_get_function_total_time(oid) → double precision: total wall time
+	// spent in the function (and the functions it called), in milliseconds, or
+	// NULL when no stats exist. Design 0118-0124.
+	case "pg_stat_get_function_total_time":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		if c, found := funcStats.get(oid); found {
+			return newNumericFromFloat(float64(c.totalTime.Nanoseconds()) / 1e6), nil
+		}
+		return NullDatum, nil
+	// pg_stat_get_function_self_time(oid) → double precision: wall time spent in
+	// the function itself excluding nested calls, in milliseconds, or NULL when
+	// no stats exist. goopg does not separate nested time, so self == total
+	// (the spec only checks > 0). Design 0118-0124.
+	case "pg_stat_get_function_self_time":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		if c, found := funcStats.get(oid); found {
+			return newNumericFromFloat(float64(c.selfTime.Nanoseconds()) / 1e6), nil
+		}
+		return NullDatum, nil
+	// pg_stat_reset_single_function_counters(oid) → void: drop the cumulative
+	// counters for one function. A non-existent OID is a silent no-op (matching
+	// PG, which only resets a present shared entry). Design 0118-0124.
+	case "pg_stat_reset_single_function_counters":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if ok {
+			funcStats.resetSingle(oid)
+		}
+		return NewStringDatum(""), nil
+	// pg_stat_reset() → void: reset all cumulative statistics for the current
+	// database. goopg currently tracks only function stats, so this clears the
+	// shared function-stats store. Design 0118-0124.
+	case "pg_stat_reset":
+		funcStats.resetAll()
 		return NewStringDatum(""), nil
 	// pg_stat_clear_snapshot() → void: discards the current transaction's cached
 	// statistics snapshot (used with stats_fetch_consistency = 'snapshot'/'cache').
