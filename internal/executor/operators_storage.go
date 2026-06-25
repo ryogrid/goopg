@@ -102,6 +102,43 @@ func deregisterWFG(myXID storage.TransactionID) {
 	wfgMu.Unlock()
 }
 
+// waitPgClassInplaceXID is the deadlock-aware wait that the intra-grant-inplace
+// pg_class virtual-tuple locks serialise on. goopg has no real pg_class heap
+// tuple, so GRANT/REVOKE (the ACL-change "xmax"), explicit rowmarks
+// (SELECT … FROM pg_class … FOR …), and the in-place relhasindex update
+// (ALTER TABLE ADD PRIMARY KEY → heap_inplace_update) all serialise on a
+// recorded writer XID instead of a heavyweight tuple lock. Before blocking on
+// blockingXID we register the edge ctx.Tx.XID→blockingXID in the shared
+// wait-for graph and walk it for a cycle; a cycle is a deadlock (e.g.
+// intra-grant-inplace permutation `b2 sfnku2 b1 grant1 addk2`, where GRANT
+// awaits the rowmark's xmax while ADD PRIMARY KEY blocks behind GRANT) and the
+// caller raises SQLSTATE 40P01. Otherwise we block on WaitForXID until the
+// holder commits or aborts. The caller must have materialised its own writer
+// XID so the edge it registers is observable by the peer closing the cycle.
+// Design 0118-0114 (intra-grant-inplace perms 7-8).
+func waitPgClassInplaceXID(ctx *Context, blockingXID storage.TransactionID) (deadlock bool, timeout *ExecError) {
+	if ctx == nil || ctx.TxnMgr == nil || ctx.Ctx == nil {
+		return false, nil
+	}
+	if blockingXID == storage.InvalidTransactionID || blockingXID == ctx.Tx.XID {
+		return false, nil
+	}
+	if ctx.Tx.XID != storage.InvalidTransactionID {
+		if registerWFGAndCheckCycle(ctx.Tx.XID, blockingXID) {
+			return true, nil
+		}
+		defer deregisterWFG(ctx.Tx.XID)
+	}
+	if werr := ctx.TxnMgr.WaitForXID(ctx.Ctx, blockingXID); werr != nil {
+		if ee := lockWaitTimeoutError(werr); ee != nil {
+			return false, ee
+		}
+		// Plain cancellation (connection close / statement timeout via ctx):
+		// fall through; the caller proceeds as if the holder finished.
+	}
+	return false, nil
+}
+
 // epqWait detects deadlock cycles via the wait-for graph (WFG), blocks on
 // the holder XID, then refreshes the snapshot. Returns true if a deadlock
 // cycle is confirmed — caller must immediately escalate to SQLSTATE 40001.

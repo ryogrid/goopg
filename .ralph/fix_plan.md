@@ -1446,5 +1446,28 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `-race` mvcc/catalog green. Spec stays `defer` — perms 7–10 need the
       `GRANT`/`REVOKE`/`DELETE FROM pg_class` `LockTuple` + deadlock-detection
       core (the Effort-L runtime shared-catalog MVCC-tuple-lock core).
-      **Remaining M0118-0009:** `intra-grant-inplace` (pg_class `LockTuple` +
-      deadlock detection, perms 7–10), `stats` (pg_stat_* subsystem).
+      **2026-06-25 (design 0118-0114, enabler — NOT a promotion):**
+      `intra-grant-inplace` permutations 1–7 now byte-identical AND perm 8's
+      deadlock line exact (first divergence L141→L184). Added the reverse-
+      direction wait + deadlock detection: (1) GRANT/REVOKE on a table now
+      AWAITS a conflicting concurrent `pg_class` rowmark — `execCompatNoop`'s
+      TableACL branch records its ACL-change `xmax` FIRST (so a peer ADD PRIMARY
+      KEY observes it and serialises after the GRANT's commit — perm 7's
+      load-bearing ordering) then calls `waitForPgClassRowMarks`; (2) deadlock
+      detection via a new shared helper `waitPgClassInplaceXID` that registers
+      `myXID→blockingXID` in the EXISTING process-global EPQ wait-for graph
+      (`registerWFGAndCheckCycle`) and walks for a cycle BEFORE blocking — perm 8
+      (`b2 sfnku2 b1 grant1 addk2`) forms `s1→s2→s1` so `addk2` (the `(*)`
+      victim) raises 40P01 "deadlock detected" synchronously. All three
+      `pg_class`-tuple waits route through the helper and now return `*ExecError`.
+      Spec stays `defer` — perm 8's ONLY residual is a grant1/c2 completion-order
+      swap (goopg keeps the deadlock victim's XID active until the explicit
+      COMMIT, so grant1 unblocks at c2 not at the abort — needs
+      AbortTransaction-releases-XID-but-block-open semantics); perm 9 needs
+      plpgsql-DO-block `REVOKE` parsing + lockRows-awaits-ACL; perm 10 needs
+      `DELETE FROM pg_class` virtual-tuple semantics. Non-regression
+      IntraGrantInplaceDb/TruncateConflict/TuplelockUpgradeNoDeadlock/DeadlockHard
+      strict PASS; `-race` lock/deadlock executor tests green.
+      **Remaining M0118-0009:** `intra-grant-inplace` (perms 8–10 — victim-XID
+      deactivation + plpgsql REVOKE + DELETE FROM pg_class), `stats` (pg_stat_*
+      subsystem).

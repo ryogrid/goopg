@@ -7025,12 +7025,16 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	// has no real pg_class heap tuple, so we replay that wait on the writer XID
 	// recorded by execCompatNoop. WaitForXID returns immediately when none is
 	// pending or it has already finished. Design 0118-0109 (intra-grant-inplace).
-	o.waitForTableACLChange(tbl)
+	if ee := o.waitForTableACLChange(tbl); ee != nil {
+		return ee
+	}
 	// Likewise wait on any concurrent explicit rowmark of the same pg_class
 	// tuple (SELECT … FROM pg_class … FOR NO KEY UPDATE / SHARE / UPDATE) whose
 	// mode conflicts with this no-key in-place update. FOR KEY SHARE does not
 	// conflict and is skipped. Design 0118-0113 (intra-grant-inplace).
-	o.waitForPgClassRowMarks(tbl)
+	if ee := o.waitForPgClassRowMarks(tbl); ee != nil {
+		return ee
+	}
 	if o.ctx.Catalog.HasPrimaryKey(tbl) {
 		return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("multiple primary keys for table %q are not allowed", tbl.QualifiedName())}
 	}
@@ -7085,16 +7089,39 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 // execCompatNoop. WaitForXID returns immediately when the recorded XID has
 // already finished (or none was recorded), so this is a no-op in the common
 // case. Design 0118-0109 (intra-grant-inplace).
-func (o *ddlOp) waitForTableACLChange(tbl *catalog.Table) {
+//
+// The wait is deadlock-aware: it registers a wait-for-graph edge so a cycle
+// with a concurrent GRANT that is itself awaiting this transaction's rowmark
+// is detected and reported as SQLSTATE 40P01 (intra-grant-inplace perm 8,
+// where `addk2` is the deadlock victim). Returns a non-nil *ExecError only on
+// a deadlock or lock-timeout; nil in the common (no-wait / clean-wait) case.
+func (o *ddlOp) waitForTableACLChange(tbl *catalog.Table) *ExecError {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
-	if !ok || o.ctx.TxnMgr == nil || tbl == nil {
-		return
+	if !ok || o.ctx.TxnMgr == nil || tbl == nil || o.ctx.Ctx == nil {
+		return nil
 	}
 	xid := im.TableACLChangeXID(tbl.OID)
-	if xid == storage.InvalidTransactionID || xid == o.ctx.Tx.XID || o.ctx.Ctx == nil {
-		return
+	if xid == storage.InvalidTransactionID {
+		return nil
 	}
-	_ = o.ctx.TxnMgr.WaitForXID(o.ctx.Ctx, xid)
+	// Materialise our writer XID so the edge we register is observable by a
+	// peer (the GRANT) closing the deadlock cycle.
+	_ = o.ctx.MaterializeWriterXID()
+	if xid == o.ctx.Tx.XID {
+		return nil
+	}
+	// A holder in this transaction's own tree (a savepoint) never blocks us.
+	selfTop := o.ctx.TxnMgr.TopLevelXid(o.ctx.Tx.XID)
+	if selfTop != storage.InvalidTransactionID &&
+		o.ctx.TxnMgr.TopLevelXid(xid) == selfTop {
+		return nil
+	}
+	if dl, ee := waitPgClassInplaceXID(o.ctx, xid); ee != nil {
+		return ee
+	} else if dl {
+		return &ExecError{Code: "40P01", Message: "deadlock detected"}
+	}
+	return nil
 }
 
 // waitForPgClassRowMarks blocks until every conflicting explicit rowmark on
@@ -7105,15 +7132,23 @@ func (o *ddlOp) waitForTableACLChange(tbl *catalog.Table) {
 // never blocks its own in-place update). WaitForXID returns immediately for an
 // already-finished holder, so a stale entry is harmless. Design 0118-0113
 // (intra-grant-inplace).
-func (o *ddlOp) waitForPgClassRowMarks(tbl *catalog.Table) {
+//
+// The wait is deadlock-aware via the shared wait-for graph, so a GRANT/REVOKE
+// that calls this while a concurrent ADD PRIMARY KEY awaits the GRANT's own
+// ACL-change xmax detects the cycle and returns SQLSTATE 40P01. Returns a
+// non-nil *ExecError only on a deadlock or lock-timeout; nil otherwise.
+func (o *ddlOp) waitForPgClassRowMarks(tbl *catalog.Table) *ExecError {
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok || o.ctx.TxnMgr == nil || tbl == nil || o.ctx.Ctx == nil {
-		return
+		return nil
 	}
 	marks := im.PgClassRowMarks(tbl.OID)
 	if len(marks) == 0 {
-		return
+		return nil
 	}
+	// Materialise our writer XID so the edge we register is observable by a
+	// peer closing the deadlock cycle.
+	_ = o.ctx.MaterializeWriterXID()
 	selfTop := o.ctx.TxnMgr.TopLevelXid(o.ctx.Tx.XID)
 	for _, m := range marks {
 		if !m.ConflictsWithInplace || m.XID == uint32(o.ctx.Tx.XID) {
@@ -7123,8 +7158,13 @@ func (o *ddlOp) waitForPgClassRowMarks(tbl *catalog.Table) {
 		if selfTop != storage.InvalidTransactionID && o.ctx.TxnMgr.TopLevelXid(mxid) == selfTop {
 			continue // same transaction tree (e.g. a savepoint locker)
 		}
-		_ = o.ctx.TxnMgr.WaitForXID(o.ctx.Ctx, mxid)
+		if dl, ee := waitPgClassInplaceXID(o.ctx, mxid); ee != nil {
+			return ee
+		} else if dl {
+			return &ExecError{Code: "40P01", Message: "deadlock detected"}
+		}
 	}
+	return nil
 }
 
 // execAlterTableAddUnique handles ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)].
@@ -11468,8 +11508,22 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 	if s.TableACL != "" {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.TxnMgr != nil {
 			if tbl, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Name: s.TableACL}); ok && tbl != nil {
+				// Record this ACL change as the pg_class tuple xmax BEFORE waiting,
+				// so a concurrent ADD PRIMARY KEY that blocks behind us observes our
+				// XID and serialises after our commit (intra-grant-inplace perm 7).
 				if err := o.ctx.MaterializeWriterXID(); err == nil {
 					im.SetTableACLChangeXID(tbl.OID, uint32(o.ctx.Tx.XID))
+				}
+				// PostgreSQL's GRANT/REVOKE acquires a LockTuple on the pg_class
+				// row and then awaits the tuple's current xmax/multixact before its
+				// heap_update. Replay that: wait on any conflicting concurrent
+				// explicit rowmark (SELECT … FROM pg_class … FOR NO KEY UPDATE /
+				// SHARE / UPDATE) held by another transaction. The wait is
+				// deadlock-aware — perm 8 forms a cycle (GRANT awaits the rowmark
+				// while ADD PRIMARY KEY blocks behind GRANT) and surfaces 40P01.
+				// Design 0118-0114 (intra-grant-inplace perms 7-8).
+				if ee := o.waitForPgClassRowMarks(tbl); ee != nil {
+					return ee
 				}
 			}
 		}
