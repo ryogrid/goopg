@@ -175,6 +175,22 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       executor defaults the rest). Spec still deferred — remaining blockers:
       `VACUUM (TRUNCATE false)` option parse + `EXPLAIN DECLARE CURSOR` + cursor
       FETCH semantics.
+      **2026-06-25 (design 0118-0108, enabler — NOT a promotion):** cleared the
+      `VACUUM (TRUNCATE false)` parse blocker. `VACUUM (TRUNCATE false) <tbl>`
+      (documented PG syntax) was rejected `unrecognised VACUUM option (got
+      truncate)`: the option list had a `truncate` case but matched only via
+      `acceptIdentKeyword`, while the lexer classifies `TRUNCATE` as the
+      unreserved keyword `KwTruncate` (leads `TRUNCATE TABLE`), so it fell
+      through to `default`. Fix = also accept the keyword token
+      (`p.acceptKeyword(KwTruncate) || p.acceptIdentKeyword("truncate")`);
+      `TRUNCATE` is the only VACUUM option word that is also a SQL keyword.
+      `NoTruncate` is recorded for parity but `vacuumCore` never physically
+      truncates trailing empty pages, so both `TRUNCATE false/true` are no-ops
+      today. Cursor FETCH already works; re-probe shows the first divergence
+      moved to `s1_explain` (`EXPLAIN (COSTS OFF) DECLARE … CURSOR` — executor
+      rejects `*parser.DeclareCursorStmt`) and the spec's core requirement, the
+      `BitmapOr` bitmap-scan plan the EXPLAIN must render byte-for-byte. Both
+      remain Effort-L → spec stays deferred. `TestParseVacuumTruncateOption`.
 - [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
       All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
       nowait{,-2,-3,-4,-5}, lock-nowait,

@@ -1,35 +1,36 @@
-Loop #46 COMPLETE: M0118-0009 — `timeouts.spec` PROMOTED to pass-required
-(soft→strict), design 0118-0107. Committing + pushing.
+Loop #47 COMPLETE: M0118-0002 — `VACUUM (TRUNCATE …)` option parse fix
+(index-only-bitmapscan enabler, NOT a promotion), design 0118-0108. Committing + pushing.
 
-What landed (zero engine change — test promotion + docs):
-- internal/testport/isolation_port_test.go: new TestPort_IsolationTimeouts
-  using runIsoSpecStrict on postgres/src/test/isolation/specs/timeouts.spec.
-  Found via a throwaway zz_probe_test.go that ran the remaining deferred
-  M0118-0009/0002/0004/0005 candidates and reported divergence cost — timeouts
-  was already byte-identical (the only pass among the probed set). statement_timeout
-  / lock_timeout vs table-level (LOCK TABLE) + row-level (DELETE behind concurrent
-  UPDATE) lock waits; 8 permutations; shorter timeout fires first → 57014 stmt /
-  55P03 lock; blocked steps (*)-marked upstream (10ms may fire before tester sees
-  "waiting"); goopg runner's 300ms blocking threshold is independent so output stable.
-- docs/design/0118-0107-timeouts-spec-promotion.md + README index row.
-- CSV D-002 rationale appended; postgres-oracle-port-status.md regenerated via
-  `go run ./cmd/gen-oracle-port-status`.
-- fix_plan.md M0118-0009 entry updated.
+What landed (parser-only, low blast radius):
+- internal/parser/parser.go: VACUUM option loop `truncate` case now accepts the
+  KwTruncate keyword token (`p.acceptKeyword(KwTruncate) || p.acceptIdentKeyword("truncate")`).
+  Root cause: `TRUNCATE` lexes as unreserved keyword KwTruncate (leads TRUNCATE TABLE),
+  not TokenIdent, so `acceptIdentKeyword("truncate")` never matched → fell to default
+  `unrecognised VACUUM option (got truncate)`. It's the ONLY VACUUM option word that
+  is also a SQL keyword. NoTruncate recorded for parity; vacuumCore never physically
+  truncates trailing empty pages so TRUNCATE false/true are behavioral no-ops today.
+- internal/parser/parser_test.go: TestParseVacuumTruncateOption (false/FALSE/true/bare/
+  mixed-with-VERBOSE/ANALYZE).
+- docs/design/0118-0108-*.md + README index row.
+- fix_plan.md M0118-0002 entry + deferral_ledger.md line.
 
-Gates run (PASS): TestPort_IsolationTimeouts strict 8/8 perms, stable across
--count=3 then -count=5 (8 runs total); go build ./... clean; go vet
-./internal/testport clean. Test-only change (no executor/codec path) → pgbench
-smoke = pre-commit hook.
+Gates run (PASS): TestParseVacuumTruncateOption + TestParseVacuum; go vet
+./internal/parser clean; go build ./... clean. Parser-only (no executor/codec path)
+→ pgbench smoke = pre-commit hook. Re-probe of index-only-bitmapscan confirmed first
+divergence moved past s2_vacuum to the EXPLAIN-DECLARE-CURSOR blocker.
 
-NEXT (remaining M0118, all Effort-L distinct unbuilt subsystems):
-- intra-grant-inplace (pg_class): runtime shared-catalog MVCC-tuple row locks
-  (ALTER TABLE ADD PRIMARY KEY <waiting> behind FOR KEY SHARE on pg_class).
-- stats: pg_stat_force_next_flush + cumulative function-stats +
-  stats_fetch_consistency + 2PC interaction.
-- prepared-transactions{,-cic}: 2PC (PREPARE/COMMIT PREPARED) — also gates stats.
-- Non-0009: deadlock-parallel (lock groups + "language internal" SQL funcs),
-  fk-partitioned-1/2 (ATTACH PARTITION + partitioned FK), index-only-bitmapscan
-  (BitmapOr plan), predicate-gin/gist (AM granularity + int-array/point types).
-Probe results (difflen) for reference: deadlock-parallel 113 (lang internal),
-predicate-gin 97 (int-array {1} parse), stats 101 (pg_stat_force_next_flush
-missing), prepared-transactions 2434, intra-grant-inplace 2294.
+NEXT (all remaining M0118 are Effort-L distinct unbuilt subsystems — no freebies left;
+each loop lands one enabler):
+- index-only-bitmapscan: now blocked on (1) EXPLAIN over *parser.DeclareCursorStmt
+  (executor rejects it), then (2) a BitmapOr / Bitmap Heap Scan / Bitmap Index Scan
+  plan for `a>0 OR b>0` that EXPLAIN must render byte-for-byte (goopg has no bitmap-OR
+  plan). (2) is the Effort-L core.
+- stats: pg_stat_force_next_flush() + cumulative stats subsystem (setup-fails today).
+- predicate-gin: int4[] COLUMN type (CREATE TABLE `p int4[]` stored as int4 → INSERT
+  array[1] errors "{1}" to integer) + GIN AM (setup-fails today).
+- deadlock-parallel: LANGUAGE internal funcs + parallel query workers (setup-fails).
+- prepared-transactions{,-cic} (2PC, difflen ~2434), intra-grant-inplace (runtime
+  shared-catalog MVCC-tuple row lock on pg_class GRANT tuple, difflen ~2294).
+Probe helper pattern: throwaway zz_probe_test.go in internal/testport using
+framework.IsolationRunner.RunAndCompare → log result.Status/Diff (import
+internal/testutil/cluster NOT internal/cluster).

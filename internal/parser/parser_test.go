@@ -82,6 +82,39 @@ func TestParseVacuum(t *testing.T) {
 	}
 }
 
+// TestParseVacuumTruncateOption covers the parenthesised TRUNCATE option.
+// TRUNCATE lexes as the unreserved keyword KwTruncate (it also leads TRUNCATE
+// TABLE), so the option list must accept the keyword token — not just an
+// identifier — otherwise VACUUM (TRUNCATE false) is wrongly rejected with
+// "unrecognised VACUUM option". Regression for the index-only-bitmapscan
+// isolation spec, whose s2_vacuum step issues VACUUM (TRUNCATE false).
+func TestParseVacuumTruncateOption(t *testing.T) {
+	tests := []struct {
+		in         string
+		noTruncate bool
+	}{
+		{"VACUUM (TRUNCATE false) t", true},
+		{"VACUUM (TRUNCATE FALSE) t", true},
+		{"VACUUM (TRUNCATE true) t", false},
+		{"VACUUM (TRUNCATE) t", false},
+		{"VACUUM (VERBOSE, TRUNCATE false) t", true},
+		{"VACUUM (TRUNCATE false, ANALYZE) t", true},
+	}
+	for _, c := range tests {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		v, ok := stmts[0].(*VacuumStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T want *VacuumStmt", c.in, stmts[0])
+		}
+		if v.NoTruncate != c.noTruncate {
+			t.Errorf("Parse(%q): NoTruncate=%v want %v", c.in, v.NoTruncate, c.noTruncate)
+		}
+	}
+}
+
 // TestParseAnalyze is the analyze-only variant (subset of VACUUM
 // options).
 func TestParseAnalyze(t *testing.T) {

@@ -1080,7 +1080,13 @@ func (p *parser) parseVacuumOptionList(v *VacuumStmt) error {
 			} else {
 				_ = p.acceptIdentKeyword("auto")
 			}
-		case p.acceptIdentKeyword("truncate"):
+		case p.acceptKeyword(KwTruncate) || p.acceptIdentKeyword("truncate"):
+			// TRUNCATE lexes as the unreserved keyword KwTruncate (it also
+			// leads the TRUNCATE TABLE statement), so acceptIdentKeyword alone
+			// never matches inside the VACUUM option list — accept the keyword
+			// token too. goopg's VACUUM (vacuumCore) never physically truncates
+			// trailing empty pages, so NoTruncate is honoured trivially; we
+			// still record it for parity and future relation-truncation work.
 			if p.acceptKeyword(KwFalse) || p.acceptIdentKeyword("false") {
 				v.NoTruncate = true
 			} else {
