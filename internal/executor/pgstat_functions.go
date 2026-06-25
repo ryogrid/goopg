@@ -115,6 +115,82 @@ func (m *functionStatsManager) get(oid uint32) (funcStatCounters, bool) {
 	return *c, true
 }
 
+// copyAll returns a by-value copy of every shared function counter, used to
+// build a 'snapshot'-consistency transaction snapshot (all objects frozen at the
+// first access). Mirrors pgstat_build_snapshot copying the whole shared store.
+func (m *functionStatsManager) copyAll() map[uint32]funcStatCounters {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[uint32]funcStatCounters, len(m.shared))
+	for oid, c := range m.shared {
+		out[oid] = *c
+	}
+	return out
+}
+
+// cachedFuncStat is one object's cached read inside a 'cache'-consistency
+// transaction snapshot — including its presence flag, so a cached absence keeps
+// reading SQL NULL for the rest of the transaction.
+type cachedFuncStat struct {
+	c     funcStatCounters
+	found bool
+}
+
+// funcStatSnapshot caches cumulative function-stat reads for the duration of one
+// explicit transaction, implementing stats_fetch_consistency = 'cache'/'snapshot'.
+// Mirrors PG's per-transaction stats snapshot: a 'cache' snapshot fills lazily,
+// per object, on that object's first access; a 'snapshot' snapshot copies the
+// whole shared store at the first access to any object. Both are discarded at
+// end of transaction (AtEOXact_PgStat) or by pg_stat_clear_snapshot(). The
+// distinction only matters across statements, which is why a snapshot is built
+// only inside an explicit transaction — within a single autocommit statement no
+// concurrent flush can intervene, so a live read is already consistent.
+// M0118-0009 (`stats`).
+type funcStatSnapshot struct {
+	full       bool                        // a 'snapshot'-mode full copy has been taken
+	allFlushed map[uint32]funcStatCounters // entire shared store frozen at first access (snapshot mode)
+	perObject  map[uint32]cachedFuncStat   // lazily cached single-object reads (cache mode)
+}
+
+// fetchFuncStat reads the cumulative counters for a function OID honouring the
+// session's stats_fetch_consistency setting. Outside an explicit transaction (or
+// with consistency 'none') it reads the live shared store directly. Inside an
+// explicit transaction it consults/populates the per-transaction snapshot so a
+// given object reads stably for the rest of the transaction ('cache'), or every
+// object freezes at the first access ('snapshot'). M0118-0009 (`stats`).
+func fetchFuncStat(ctx *Context, oid uint32) (funcStatCounters, bool) {
+	sess, _ := ctx.Session.(*BasicSession)
+	if sess == nil || !sess.InExplicitTransaction() {
+		return funcStats.get(oid)
+	}
+	mode := "none"
+	if ctx.GetSetting != nil {
+		if v, ok := ctx.GetSetting("stats_fetch_consistency"); ok {
+			mode = v
+		}
+	}
+	switch mode {
+	case "cache":
+		snap := sess.ensureStatsSnapshot()
+		if e, ok := snap.perObject[oid]; ok {
+			return e.c, e.found
+		}
+		c, found := funcStats.get(oid)
+		snap.perObject[oid] = cachedFuncStat{c: c, found: found}
+		return c, found
+	case "snapshot":
+		snap := sess.ensureStatsSnapshot()
+		if !snap.full {
+			snap.allFlushed = funcStats.copyAll()
+			snap.full = true
+		}
+		c, ok := snap.allFlushed[oid]
+		return c, ok
+	default: // "none"
+		return funcStats.get(oid)
+	}
+}
+
 // dropFunction removes all cumulative statistics for a function OID — both the
 // shared (flushed) counters and any not-yet-flushed pending counters across
 // every session. Mirrors pgstat_drop_function (called transactionally when a

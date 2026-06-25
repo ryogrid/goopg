@@ -1,27 +1,24 @@
 (idle — nothing in flight)
 
-Last landed (loop #72): `stats` rung 3 (M0118-0009, design 0118-0125) — made
-DROP FUNCTION transactional + finished the function-stats lifecycle. First
-divergence advanced **L449 → L1587**. Files: internal/catalog/routines.go
-(ResolveByName/ResolveBySig), internal/executor/session.go (DeferredRoutineDrop
-+ deferRoutineDrops list/methods), operators_ddl.go (execDropFunction defer +
-autocommit stats-drop; execCreateFunction recreate guard; ApplyDeferredRoutine
-Drops), operators_tx.go (commit apply / rollback discard / ROLLBACK-TO cancel),
-server/dispatch.go (simple-query commit apply), pgstat_functions.go (dropFunction
-+ resetSingle/resetAll zero-in-place). Tests: TestDeferredRoutineDropSession,
-TestRoutinesResolveForDrop, updated TestFunctionStatsManager. Gates: executor/
-catalog/server units + vet PASS; regress-port create_function_sql/drop_if_exists
-PASS; TestPort_IsolationStats soft probe L449→L1587; build clean; pgbench smoke
-via pre-commit hook.
+Last landed (loop #73): `stats` rung 4 (M0118-0009, design 0118-0126) —
+implemented `stats_fetch_consistency = 'cache'/'snapshot'` per-transaction
+stat-value caching. First divergence advanced **L1587 → L2036**.
+Files: internal/executor/pgstat_functions.go (funcStatSnapshot type, copyAll,
+fetchFuncStat single read entry point), internal/executor/session.go
+(BasicSession.statsSnapshot + ensureStatsSnapshot/ClearStatsSnapshot; cleared in
+EndExplicitTransaction), internal/executor/expr.go (3 getters → fetchFuncStat;
+pg_stat_clear_snapshot now clears). Test: TestFetchFuncStatConsistency.
+Gates: executor+config units + vet PASS (also -race); TestPort_PLpgSQL* PASS;
+TestPort_IsolationStats soft probe L1587→L2036; build clean; pgbench smoke via
+pre-commit hook.
 
-NEXT rung for `stats` (each Effort-L; pick one; spec stays `defer`):
-- **L1587 — `stats_fetch_consistency = 'cache'/'snapshot'`**: within a txn,
-  once a backend reads a function stat it must CACHE the value for the rest of
-  the txn (perm `s1_fetch_consistency_cache`: s1 reads 1, s2 flushes +1, s1 must
-  still read 1, not 2). Needs a per-txn stat-value cache keyed by OID, populated
-  on first getter read, cleared at txn end; default 'none' = current live-read.
-- L2026 — 2PC stats: `s1_prepare_a`/`s2_rollback_prepared_a` (`PREPARE
-  TRANSACTION 'a'` then COMMIT/ROLLBACK PREPARED) — goopg errors "prepared
-  transaction … does not exist"; rides 0118-0110 same-backend 2PC.
+Key insight: snapshot/cache distinction only observable across statements of the
+same txn with a concurrent flush between → only inside an explicit txn. In
+autocommit / 'none' the getters read live (trivial single-read perms unchanged).
+
+NEXT rung for `stats` (each Effort-L; spec stays `defer`):
+- **L2036 — 2PC stats**: `s1_prepare_a` / `s{1,2}_{commit,rollback}_prepared_a`
+  (`PREPARE TRANSACTION 'a'` then COMMIT/ROLLBACK PREPARED) — goopg errors
+  "prepared transaction … does not exist"; rides 0118-0110 same-backend 2PC.
 - Later: relation tuple stats (pg_stat_get_numscans/_tuples_*,
-  pg_stat_get_xact_*), SLRU stats (pg_stat_slru).
+  pg_stat_get_xact_*, L2130+), SLRU stats (pg_stat_slru).

@@ -186,6 +186,7 @@ type BasicSession struct {
 	txnReadOnly         bool                       // true while inside a READ ONLY transaction (M0097-0024)
 	deferredFKChecks    []DeferredFKCheck          // INITIALLY DEFERRED FK checks (M0096-0011)
 	activeQueryTables   map[uint32]bool            // OIDs of tables currently in active DML (M0097-0023)
+	statsSnapshot       *funcStatSnapshot          // per-txn cumulative-stats snapshot (M0118-0009 stats_fetch_consistency)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -261,7 +262,26 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.txFailed = false
 	s.deferredFKChecks = nil
 	s.activeQueryTables = nil
+	// Discard the per-transaction cumulative-stats snapshot — PG's AtEOXact_PgStat
+	// drops the stats snapshot at every transaction boundary so the next
+	// transaction reads live values again. M0118-0009 (stats_fetch_consistency).
+	s.statsSnapshot = nil
 }
+
+// ensureStatsSnapshot returns the session's per-transaction cumulative-stats
+// snapshot, allocating it on first use. Used by fetchFuncStat to honour
+// stats_fetch_consistency = 'cache'/'snapshot'. M0118-0009.
+func (s *BasicSession) ensureStatsSnapshot() *funcStatSnapshot {
+	if s.statsSnapshot == nil {
+		s.statsSnapshot = &funcStatSnapshot{perObject: make(map[uint32]cachedFuncStat)}
+	}
+	return s.statsSnapshot
+}
+
+// ClearStatsSnapshot discards the per-transaction cumulative-stats snapshot,
+// forcing the next stat read to consult live shared values. Invoked by
+// pg_stat_clear_snapshot(). M0118-0009.
+func (s *BasicSession) ClearStatsSnapshot() { s.statsSnapshot = nil }
 
 // AddDeferredFKCheck queues a FK constraint to be checked at COMMIT time.
 // M0096-0011.
