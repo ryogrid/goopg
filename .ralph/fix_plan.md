@@ -1678,3 +1678,30 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       Tests: `TestDetachToDedicatedSlot{,RejectsSerializable}` (mvcc, also -race);
       regression `TestPort_TwoPhaseCommitSameBackend` +
       `TestPort_IsolationPreparedTransactions{,CIC}` strict PASS.
+
+      **2026-06-25 (design 0118-0128, enabler — NOT a promotion): `stats` rung 6.**
+      Relation tuple statistics; first divergence advanced **L2180 → L2704**. All
+      seven non-2PC table-stats permutations (drop-removes-stats, `track_counts
+      off/on` access, cumulative seq-scan/DML counts) AND the 2PC COMMIT PREPARED
+      permutations now match PG 18.3 byte-for-byte. New
+      `internal/executor/pgstat_relations.go` mirrors the function-stats two-tier
+      shape: `relStats` with `shared[oid]` + per-session `pending[sessionID][oid]`;
+      `recordScan/Insert/Update/Delete` (INSERT +1 live/row; DELETE +1 dead −1
+      live/row; UPDATE +1 dead/row, live unchanged — no HOT); `flush` merges
+      pending→shared (via `pg_stat_force_next_flush()`); `get` returns 0 NOT NULL
+      for absent OID (PG relation-getter semantics); `dropTable(oid)` clears shared
+      + every session's pending (no revival on a peer's later flush). Getters in
+      expr.go: `pg_stat_get_numscans/_tuples_returned/_tuples_fetched/_tuples_{inserted,
+      updated,deleted}/_live_tuples/_dead_tuples/_vacuum_count` (live/dead clamp ≥0;
+      fetched/vacuum_count=0). Counting hooks (gated by `track_counts`, boot on):
+      `seqScanOp` (statReturned per tuple, record one scan in Close); `scanMatching`
+      gains `statOID` param (UPDATE/DELETE base scan; FK sites pass 0); insert/update/
+      deleteOp.Close per-statement rowsAffected; dropTableByRefImmediate drops stats.
+      Per-statement Close recording = "applied at commit" for the autocommit
+      simple-query path (no per-txn staging yet). New first divergence L2704 =
+      `s1_…_rollback_prepared_a`: transactional-counter abort/2PC reconciliation
+      (aborted insert/update → dead not live; `truncdropped` for in-txn TRUNCATE/DROP;
+      2PC handoff of staged rel counters). Then later: index-scan `tuples_fetched`,
+      VACUUM `vacuum_count`/live-dead recompute, SLRU stats. Tests:
+      `pgstat_relations_test.go` (accumulate/flush/get, update dead-delta,
+      drop-without-revival); `TestPort_IsolationStats` soft probe L2180→L2704.

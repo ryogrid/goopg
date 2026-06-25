@@ -754,6 +754,11 @@ type seqScanOp struct {
 	// consume / Materialize before the next Next() invocation.
 	slot MaterializedSlot
 
+	// statReturned counts visible tuples this scan has yielded; recorded into
+	// cumulative relation stats (numscans + tuples_returned) at Close.
+	// M0118-0009 (`stats`, rung 6; design 0118-0128).
+	statReturned int64
+
 	// enumTypes[i] is non-nil when cols[i] is a user-defined enum type.
 	// Used to convert KindString heap datums to KindEnum for correct ORDER BY. M0097-enum.
 	enumTypes []*catalog.EnumType
@@ -1025,6 +1030,13 @@ func (o *seqScanOp) Close() error {
 		o.sctx.Release()
 		o.sctx = nil
 	}
+	// Record this sequential scan into cumulative relation stats: one scan that
+	// read statReturned visible tuples (mirrors pgstat_count_heap_scan +
+	// pgstat_count_heap_getnext). Non-transactional, gated by track_counts.
+	// M0118-0009 (`stats`, rung 6; design 0118-0128).
+	if o.ctx != nil && o.tbl != nil {
+		recordRelScan(o.ctx, o.tbl.OID, o.statReturned)
+	}
 	return nil
 }
 
@@ -1253,6 +1265,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			o.slot.hasCTID = true
 			o.slot.ctidBlock = uint32(o.curBlock)
 			o.slot.ctidOff = uint16(o.curSlot - 1)
+			o.statReturned++ // cumulative relation stats (tuples_returned)
 			return &o.slot, nil
 		}
 		o.releasePinned()
@@ -1373,7 +1386,14 @@ func (o *insertOp) Open(ctx *Context) error {
 	return o.child.Open(ctx)
 }
 
-func (o *insertOp) Close() error { return o.child.Close() }
+func (o *insertOp) Close() error {
+	// Cumulative relation stats: count inserted tuples (one live tuple each),
+	// gated by track_counts. M0118-0009 (`stats`, rung 6; design 0118-0128).
+	if shouldTrackCounts(o.ctx) {
+		relStats.recordInsert(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
+	}
+	return o.child.Close()
+}
 
 // Next runs the insert as a one-shot side effect on first call. With
 // RETURNING (M0100-0005) the inserted rows are accumulated in o.retRows
@@ -3059,7 +3079,14 @@ func (o *updateOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *updateOp) Close() error { return nil }
+func (o *updateOp) Close() error {
+	// Cumulative relation stats: count updated tuples (each leaves a dead tuple;
+	// goopg has no HOT update). Gated by track_counts. M0118-0009 (`stats`, rung 6).
+	if shouldTrackCounts(o.ctx) {
+		relStats.recordUpdate(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
+	}
+	return nil
+}
 
 // updateViaIndex uses the B-tree to find the tuple to update (O(log n))
 // instead of scanning all pages. Falls back to the path in Next() when
@@ -3704,7 +3731,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		if isInheritChild {
 			scanPred = nil
 		}
-		if err := scanMatching(o.ctx, scanRel, scanCols, scanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
+		if err := scanMatching(o.ctx, scanRel, scanTbl.OID, scanCols, scanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
 			// Clear multi-column subquery cache so each row gets a fresh evaluation.
 			clear(o.ctx.MultiAssignSubqCache)
 			evalRow := row
@@ -4455,7 +4482,14 @@ func (o *deleteOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *deleteOp) Close() error { return nil }
+func (o *deleteOp) Close() error {
+	// Cumulative relation stats: count deleted tuples (each removes a live tuple
+	// and produces a dead one). Gated by track_counts. M0118-0009 (`stats`, rung 6).
+	if shouldTrackCounts(o.ctx) {
+		relStats.recordDelete(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
+	}
+	return nil
+}
 
 func (o *deleteOp) Next() (TupleSlot, error) {
 	if o.done {
@@ -4545,7 +4579,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		if isDelInheritChild {
 			delScanPred = nil // apply predicate manually after row remapping
 		}
-		if err := scanMatching(o.ctx, scanRel, scanTbl.Columns, delScanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
+		if err := scanMatching(o.ctx, scanRel, scanTbl.OID, scanTbl.Columns, delScanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
 			var retRow Row
 			if isDelInheritChild {
 				parentAligned := remapChildRowToParent(row, delInheritColMap)
@@ -4974,7 +5008,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 
 	for _, fst := range fromScanTargets {
 		fst := fst // capture
-		if err := scanMatching(o.ctx, fst.rel, fst.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
+		if err := scanMatching(o.ctx, fst.rel, 0, fst.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
 			// For inheritance children: remap raw child row to parent col positions so
 			// FromPred and SET exprs (which use parent ordinals) evaluate correctly. M0097-0078.
 			var tgtRow Row
@@ -5389,7 +5423,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 
 	for _, ust := range usingScanTargets {
 		ust := ust // capture
-		if err := scanMatching(o.ctx, ust.rel, ust.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
+		if err := scanMatching(o.ctx, ust.rel, 0, ust.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
 			key := [2]uint64{uint64(blk), uint64(slot)}
 			if seen[key] {
 				return nil
@@ -5544,11 +5578,18 @@ func foreignLockOnly(h storage.HeapTupleHeader, currentXID storage.TransactionID
 	return storage.IsHeapTupleLockOnly(h.Infomask)
 }
 
-func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, pred planner.Expr, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
+// scanMatching sequentially scans `rel`, decoding every visible tuple, applying
+// `pred`, and invoking `fn` for each match. statOID is the catalog OID of the
+// relation for cumulative relation-stats accounting (0 = do not count, used by
+// internal FK-maintenance scans that PG does not attribute to the user table):
+// the whole call is one sequential scan reading every visible tuple, recorded
+// (numscans + tuples_returned) at clean completion. M0118-0009 (`stats`, rung 6).
+func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []catalog.Column, pred planner.Expr, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return err
 	}
+	var examined int64 // visible tuples read across all blocks (tuples_returned)
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -5640,6 +5681,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 		}
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
+		examined += int64(len(visible)) // tuples this scan returned (pre-qual)
 		// Process visible tuples one at a time: eval predicate then call fn
 		// immediately, so WHERE side-effects (NOTICE) and trigger NOTICEs
 		// interleave per-row rather than all predicates firing before all
@@ -5677,6 +5719,10 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			}
 		}
 	}
+	// One sequential scan reading `examined` visible tuples (the UPDATE/DELETE
+	// base scan); recorded into cumulative relation stats, gated by track_counts.
+	// M0118-0009 (`stats`, rung 6; design 0118-0128).
+	recordRelScan(ctx, statOID, examined)
 	return nil
 }
 

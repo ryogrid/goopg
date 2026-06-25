@@ -9235,6 +9235,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// between mutating and observing steps. Design 0118-0124 (M0118-0009 rung 2).
 	case "pg_stat_force_next_flush":
 		funcStats.flush(sessionStatsID(ctx))
+		relStats.flush(sessionStatsID(ctx))
 		return NewStringDatum(""), nil
 	// pg_stat_get_function_calls(oid) → bigint: number of times the function has
 	// been called (flushed), or NULL when no stats exist for it. Design 0118-0124.
@@ -9298,6 +9299,7 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// shared function-stats store. Design 0118-0124.
 	case "pg_stat_reset":
 		funcStats.resetAll()
+		relStats.resetAll()
 		return NewStringDatum(""), nil
 	// pg_stat_clear_snapshot() → void: discards the current transaction's cached
 	// statistics snapshot (used with stats_fetch_consistency = 'snapshot'/'cache')
@@ -9307,6 +9309,58 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			sess.ClearStatsSnapshot()
 		}
 		return NewStringDatum(""), nil
+	// Relation (table) cumulative-stats getters. Unlike the function-stats
+	// getters, these return 0 (not SQL NULL) for an OID with no flushed stats —
+	// matching PG, where pg_stat_get_numscans of a dropped/never-touched relation
+	// reads 0. Design 0118-0128 (M0118-0009 rung 6).
+	case "pg_stat_get_numscans",
+		"pg_stat_get_tuples_returned",
+		"pg_stat_get_tuples_fetched",
+		"pg_stat_get_tuples_inserted",
+		"pg_stat_get_tuples_updated",
+		"pg_stat_get_tuples_deleted",
+		"pg_stat_get_live_tuples",
+		"pg_stat_get_dead_tuples",
+		"pg_stat_get_vacuum_count":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		c, _ := relStats.get(oid)
+		var v int64
+		switch name {
+		case "pg_stat_get_numscans":
+			v = c.numScans
+		case "pg_stat_get_tuples_returned":
+			v = c.tuplesReturned
+		case "pg_stat_get_tuples_fetched":
+			// Index-scan fetched tuples are not yet tracked (no index-scan
+			// counting rung); report 0 as PG does before any index scan.
+			v = 0
+		case "pg_stat_get_tuples_inserted":
+			v = c.tuplesInserted
+		case "pg_stat_get_tuples_updated":
+			v = c.tuplesUpdated
+		case "pg_stat_get_tuples_deleted":
+			v = c.tuplesDeleted
+		case "pg_stat_get_live_tuples":
+			v = c.deltaLive
+			if v < 0 {
+				v = 0 // PG clamps live-tuple estimate to non-negative
+			}
+		case "pg_stat_get_dead_tuples":
+			v = c.deltaDead
+			if v < 0 {
+				v = 0
+			}
+		case "pg_stat_get_vacuum_count":
+			// No VACUUM-driven relation stats yet; PG reads 0 until first vacuum.
+			v = 0
+		}
+		return NewIntDatum(v), nil
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.

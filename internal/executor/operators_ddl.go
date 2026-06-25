@@ -4539,6 +4539,13 @@ func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Tab
 	}
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	relOID := tbl.OID
+	// Cumulative relation stats are removed with the relation (pgstat_drop_relation):
+	// after the drop the getters read 0 and any concurrent backend's stale pending
+	// counts for this OID are discarded rather than revived. This hook fires when
+	// the catalog entry is actually removed (immediately for autocommit DROP, and
+	// at commit for the deferred-drop path that funnels through here).
+	// M0118-0009 (`stats`, rung 6; design 0118-0128).
+	relStats.dropTable(relOID)
 	// Dropping a partition left in the incomplete-detach state
 	// (DetachPendingEpoch != 0) also grabs an AccessExclusiveLock on the parent,
 	// because the parent's partition descriptor still references it: upstream
