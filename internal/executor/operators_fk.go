@@ -226,6 +226,29 @@ func enforceFKOnDeletePartitionAncestor(ctx *Context, leafTbl *catalog.Table, le
 	if !ok || leafTbl == nil {
 		return nil
 	}
+	// One pass either fires the 23503, finds nothing, or waits on an in-flight
+	// concurrent ATTACH PARTITION (returning retry=true). After a wait the attach
+	// has committed (or aborted), so re-run the walk: a committed attach is now a
+	// registered partition child whose clone is skipped, letting the ROOT
+	// partitioned table name the violation. Capped to bound a pathological chain
+	// of successive concurrent attaches (in practice 1 wait suffices).
+	for attempt := 0; attempt < 8; attempt++ {
+		retry, err := fkDeleteAncestorPass(ctx, im, leafTbl, leafRow)
+		if err != nil {
+			return err
+		}
+		if !retry {
+			return nil
+		}
+	}
+	return nil
+}
+
+// fkDeleteAncestorPass performs a single referenced-side partition check for a
+// deleted leaf row. It returns retry=true after blocking on a concurrent,
+// still-uncommitted ATTACH PARTITION whose cloned foreign key references the
+// deleted key — the caller re-runs the walk once the attach resolves.
+func fkDeleteAncestorPass(ctx *Context, im *catalog.InMemory, leafTbl *catalog.Table, leafRow Row) (bool, error) {
 	// Walk the partition-ancestor chain (leaf → … → root partitioned parent),
 	// firing any FK that references an ancestor. partitionParentTable consults the
 	// live partitionChildren map (works for both PARTITION OF and ATTACH).
@@ -246,10 +269,11 @@ func enforceFKOnDeletePartitionAncestor(ctx *Context, leafTbl *catalog.Table, le
 		}
 		for _, ref := range im.FindFKsReferencingTable(parent.Name) {
 			// Skip per-partition FK clones (e.g. the copy ATTACH PARTITION places on
-			// pfk1): the violation must name the FK's ROOT partitioned table (pfk),
-			// and scanning that root already descends into every partition, so the
-			// clone is redundant. Matches PG, which reports the referencing relation
-			// where the constraint was declared, not the leaf partition.
+			// pfk1) once they are committed: the violation must name the FK's ROOT
+			// partitioned table (pfk), and scanning that root already descends into
+			// every partition, so the clone is redundant. Matches PG, which reports
+			// the referencing relation where the constraint was declared, not the
+			// leaf partition.
 			if ref.Child != nil && im.IsPartitionChild(ref.Child.OID) {
 				continue
 			}
@@ -264,16 +288,43 @@ func enforceFKOnDeletePartitionAncestor(ctx *Context, leafTbl *catalog.Table, le
 			}
 			found, err := scanTableForMatch(ctx, ref.Child, fk.Columns, vals)
 			if err != nil {
-				return err
+				return false, err
 			}
 			if !found {
 				continue
+			}
+			// ref.Child holds a referencing row for the deleted key but is not (yet)
+			// a registered partition child. If a concurrent transaction is in the
+			// middle of ATTACHing it (the clone FK is visible but the partition
+			// registration is deferred to that transaction's COMMIT), block until
+			// that attach resolves — PG holds FOR KEY SHARE on the referenced rows
+			// to commit, so this DELETE waits, then re-evaluates (the now-committed
+			// clone is skipped and the ROOT pfk names the violation).
+			// fk-partitioned-1 concurrent Class B.
+			if axid, ok := im.PendingAttachXID(ref.Child.OID); ok &&
+				axid != uint32(ctx.Tx.XID) && ctx.TxnMgr != nil &&
+				ctx.TxnMgr.IsXIDActive(storage.TransactionID(axid)) {
+				qctx := ctx.Ctx
+				if qctx == nil {
+					qctx = context.Background()
+				}
+				if werr := ctx.TxnMgr.WaitForXID(qctx, storage.TransactionID(axid)); werr != nil {
+					// Connection close / query timeout: stop waiting and let the
+					// caller fall through to a non-retry pass.
+					return false, nil
+				}
+				// Refresh the snapshot so the re-evaluation sees the attach's
+				// committed catalog state.
+				if snap, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
+					ctx.Snap = snap.Clone()
+				}
+				return true, nil
 			}
 			cname := fkConstraintName(ref.Child, fk)
 			if suffix > 0 {
 				cname = fmt.Sprintf("%s_%d", cname, suffix)
 			}
-			return &ExecError{
+			return false, &ExecError{
 				Code: "23503",
 				Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint %q on table %q",
 					leafTbl.Name, cname, ref.Child.Name),
@@ -283,7 +334,7 @@ func enforceFKOnDeletePartitionAncestor(ctx *Context, leafTbl *catalog.Table, le
 		}
 		child = parent
 	}
-	return nil
+	return false, nil
 }
 
 // runAllDeferredFKChecks verifies every queued deferred FK constraint.

@@ -1364,6 +1364,33 @@ func TestPort_IsolationFkDeadlock(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-deadlock.spec")
 }
 
+
+// TestPort_IsolationFkPartitioned1 exercises fk-partitioned-1: cloning a foreign
+// key onto a partition (ALTER TABLE pfk ATTACH PARTITION pfk1) must ensure the
+// referenced values still exist, even while a referenced row is being
+// concurrently deleted. Three classes of permutation:
+//   - Class A: the referenced row is deleted before/during the attach → the
+//     attach's RI_Initial_Check fails 23503 naming "pfk1"/"pfk_a_fkey".
+//   - committed Class B: the attach commits, then DELETE FROM ppk1 (a leaf of
+//     the *referenced* ppk) is rejected on the referenced side, 23503 naming
+//     "pfk_a_fkey_1" on table "pfk".
+//   - concurrent Class B: DELETE FROM ppk1 runs while the attach is still
+//     uncommitted → it blocks <waiting ...> behind the attach's held-to-commit
+//     KEY SHARE on the referenced rows, then errors once the attach commits.
+//
+// Promoted M0118-0005/0009 across three slices: design 0118-0118 (Class A
+// referencing-side clone + validation on ATTACH), 0118-0119 (committed Class B
+// referenced-side check + ordinal-suffixed constraint name), and 0118-0120 (the
+// concurrent Class B wait: the deferred attach records its XID so a concurrent
+// referenced-row DELETE waits for it to commit, then re-evaluates).
+func TestPort_IsolationFkPartitioned1(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_fk_partitioned1")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-partitioned-1.spec")
+}
+
 // TestPort_IsolationRiTrigger exercises trigger-based referential integrity
 // under SERIALIZABLE: BEFORE UPDATE/DELETE and BEFORE INSERT/UPDATE plpgsql
 // triggers that PERFORM a query and RAISE on FOUND / NOT FOUND, plus SSI 40001

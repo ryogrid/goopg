@@ -5204,6 +5204,11 @@ func ApplyPendingPartitionAttaches(ctx *Context, sess *BasicSession) {
 			childTbl.PartitionBounds = a.Bounds
 		}
 		im.RegisterPartitionChild(a.ParentOID, a.ChildOID)
+		// fk-partitioned-1 (design 0118-0120): the partition is now registered
+		// (IsPartitionChild true), so a concurrent DELETE that was waiting on
+		// this attach can resolve via the normal committed-clone path; drop the
+		// in-flight marker.
+		im.ClearPendingAttachXID(a.ChildOID)
 	}
 }
 
@@ -5858,6 +5863,22 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					Bounds:         boundsToSet,
 					SavepointDepth: deferAttach.SavepointDepth(),
 				})
+				// fk-partitioned-1 concurrent Class B (design 0118-0120): when the
+				// parent carries a foreign key, the clone just placed on childTbl
+				// (cloneAndValidateAttachPartitionFKs above) referenced the parent
+				// table's rows under the equivalent of FOR KEY SHARE. Record this
+				// in-flight attach's XID so a concurrent DELETE of one of those
+				// referenced rows waits for the attach to commit before firing the
+				// referenced-side partition check — mirroring PG, where the attach
+				// holds the KEY SHARE locks to commit. Materialize the XID so the
+				// waiter has a real transaction id to block on.
+				if len(tbl.ForeignKeys) > 0 {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+							im.SetPendingAttachXID(childTbl.OID, uint32(o.ctx.Tx.XID))
+						}
+					}
+				}
 			} else {
 				if boundsToSet != nil {
 					childTbl.PartitionBounds = boundsToSet

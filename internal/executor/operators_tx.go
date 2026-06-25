@@ -219,6 +219,16 @@ func (o *transactionOp) execRollback() error {
 				_, _ = rs.Create(r, true)
 			}
 		}
+		// fk-partitioned-1 (design 0118-0120): a deferred ATTACH PARTITION never
+		// registers on ROLLBACK, so drop any in-flight-attach FK markers it set
+		// (the partition stays unattached; a concurrent DELETE must not keep
+		// waiting on this aborted attach — IsXIDActive already guards that, but
+		// clear the markers eagerly to keep the map bounded).
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			for _, a := range sess.TakePendingPartitionAttaches() {
+				im.ClearPendingAttachXID(a.ChildOID)
+			}
+		}
 	}
 	if err := o.ctx.TxnMgr.Rollback(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}

@@ -354,6 +354,19 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (referenced-side `pfk_a_fkey_1` restrict "on table pfk" + lock-held-to-commit
       so a concurrent `delete from ppk1` `<waiting ...>` behind an uncommitted
       attach) is the remaining slice (ledger 2026-06-25).
+      **`fk-partitioned-1` PROMOTED (2026-06-25, designs 0118-0119 + 0118-0120):**
+      committed Class B = new `enforceFKOnDeletePartitionAncestor` walks the
+      deleted leaf's partition-ancestor chain, skips committed per-partition FK
+      clones (`IsPartitionChild`) so the ROOT `pfk` names the violation, appends
+      the leaf's 1-based ordinal as `<fkname>_<N>` (`pfk_a_fkey_1`). Concurrent
+      Class B = the deferred ATTACH records its XID (`catalog.pendingAttachXID`,
+      set when the parent has FKs, cleared on COMMIT/ROLLBACK); a concurrent
+      `DELETE FROM ppk1` that finds a referencing row in a not-yet-registered
+      partition with an active pending-attach XID `WaitForXID`s it, refreshes the
+      snapshot, and re-evaluates (now the clone is skipped + ROOT named), so the
+      delete renders `<waiting ...>` then errors once the attach commits. All 18
+      active perms byte-identical to PG 18.3; strict `TestPort_IsolationFkPartitioned1`.
+      **Remaining for the group: `fk-partitioned-2` only.**
 - [x] **M0118-0006** — MERGE & INSERT ON CONFLICT output parity: merge-{update,delete,
       insert-update,match-recheck,join}, insert-conflict-do-update-{2,3,4},
       insert-conflict-specconflict, insert-conflict-do-nothing-2. **COMPLETE

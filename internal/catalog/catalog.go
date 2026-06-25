@@ -1600,6 +1600,15 @@ type InMemory struct {
 	// partitionChildren maps parent table OID → slice of child OIDs
 	// for partitioned-table support (M0096-0007).
 	partitionChildren map[uint32][]uint32
+	// pendingAttachXID maps a partition child's OID → the XID of the
+	// transaction whose ATTACH PARTITION has cloned a foreign key onto that
+	// child but not yet committed (the registration is deferred to COMMIT, so
+	// IsPartitionChild is still false during this window). A concurrent DELETE
+	// of a referenced row consults this to wait for the in-flight attach,
+	// mirroring PostgreSQL's RI_Initial_Check holding FOR KEY SHARE on the
+	// referenced rows until the attaching transaction commits. fk-partitioned-1
+	// concurrent Class B (design 0118-0120).
+	pendingAttachXID map[uint32]uint32
 	// indexPartitionChildren maps parent index OID → slice of child index OIDs
 	// for partition index trees (ALTER INDEX parent ATTACH PARTITION child). M0097-0023.
 	indexPartitionChildren map[uint32][]uint32
@@ -2419,6 +2428,35 @@ func (c *InMemory) PartitionParentOf(childOID uint32) (uint32, bool) {
 		}
 	}
 	return 0, false
+}
+
+// SetPendingAttachXID records that the transaction XID has an in-flight ATTACH
+// PARTITION of childOID whose foreign-key clone is visible but whose partition
+// registration is deferred to COMMIT. fk-partitioned-1 (design 0118-0120).
+func (c *InMemory) SetPendingAttachXID(childOID uint32, xid uint32) {
+	c.mu.Lock()
+	if c.pendingAttachXID == nil {
+		c.pendingAttachXID = make(map[uint32]uint32)
+	}
+	c.pendingAttachXID[childOID] = xid
+	c.mu.Unlock()
+}
+
+// PendingAttachXID returns the XID of an in-flight ATTACH of childOID, if any.
+func (c *InMemory) PendingAttachXID(childOID uint32) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	xid, ok := c.pendingAttachXID[childOID]
+	return xid, ok
+}
+
+// ClearPendingAttachXID drops the in-flight-attach marker for childOID. Called
+// from both the COMMIT path (after RegisterPartitionChild) and the ROLLBACK
+// path (the deferred attach is discarded).
+func (c *InMemory) ClearPendingAttachXID(childOID uint32) {
+	c.mu.Lock()
+	delete(c.pendingAttachXID, childOID)
+	c.mu.Unlock()
 }
 
 // UnregisterPartitionChild removes childOID from parentOID's partition children
