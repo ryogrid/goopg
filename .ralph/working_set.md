@@ -1,25 +1,28 @@
 (idle — nothing in flight)
 
-Last loop (#54) COMPLETE: M0118-0009 — intra-grant-inplace ENABLER (design 0118-0114,
-NOT a promotion). Added the reverse-direction wait + deadlock detection:
-- GRANT/REVOKE on a table now AWAITS a conflicting concurrent pg_class rowmark
-  (execCompatNoop TableACL: record ACL xmax FIRST, then waitForPgClassRowMarks).
-- New shared helper executor.waitPgClassInplaceXID registers an edge in the EXISTING
-  process-global EPQ wait-for graph (registerWFGAndCheckCycle) → perm8 deadlock detected
-  synchronously, addk2 raises 40P01. All 3 pg_class-tuple waits route through it.
-Result: perms 1-7 byte-exact + perm 8 deadlock line exact; first divergence L141→L184.
-Committed + pushed.
+Last loop (#56) COMPLETE: committed loop #55's verified-but-uncommitted WIP for
+M0118-0009 — intra-grant-inplace ENABLER (design 0118-0115, NOT a promotion). Loop
+#55 hit a usage limit mid-task (progress.json showed api_limit); the code + design +
+test were complete and correct but never committed. This loop verified and landed it.
 
-Remaining intra-grant-inplace gaps (perms 8-10, all distinct, deferred — see ledger):
-- perm8 (ordering): ONLY residual is grant1/c2 completion-order swap. goopg keeps the
-  deadlock victim's XID ACTIVE until the explicit COMMIT, so grant1's WaitForXID(s2)
-  unblocks at c2 not at the abort. Fix = deactivate victim XID at deadlock-abort time
-  while keeping the txn block open (AbortTransaction-releases-XID-but-block-open). The
-  cheapest next intra-grant-inplace step IF it generalises.
-- perm9: revoke4 is `DO $$ … REVOKE … $$` — plpgsql parser rejects bare REVOKE in a DO
-  body; also needs lockRowsOp on pg_class to await ACL xmax (sfu3-after-grant1).
-- perm10: drop1 = `DELETE FROM pg_class` — virtual-pg_class DELETE (deferred drop at
-  commit) + SearchSysCacheLocked1 find-then-none → "WARNING: cache lookup failed".
+What landed (design 0118-0115, intra-grant-inplace perm-8 ordering):
+- mvcc.Manager.ReleaseXIDWaiters(xid): records xid in releasedWaiterXIDs set + broadcasts
+  commitCond; xidActiveWithSubxact returns false for a released XID (and its top parent)
+  WITHOUT clearing the proc-array slot. finish() clears the marker. Snapshot visibility
+  NOT consulted against the set (victim is write-less).
+- Context.DeadlockVictim: set only in waitPgClassInplaceXID on cycle detection; reset in
+  wire dispatch per-statement block.
+- connTxState.AbortInPlaceOnFail(mgr): calls ReleaseXIDWaiters(currentTx.XID), gated on
+  SavepointDepth()==0. Called from dispatch.go failure path ONLY when DeadlockVictim set.
+- Result: perms 1-8 byte-identical; first divergence advanced L184 → L206 (verified via
+  throwaway probe). Spec stays `defer`.
+
+Remaining intra-grant-inplace gaps (perms 9-10, distinct unbuilt subsystems):
+- perm9: revoke4 is `DO $$ BEGIN REVOKE … END $$` — plpgsql parser rejects bare REVOKE in
+  a DO body ("invalid PL/pgSQL DO body: ... expected ':=' or '=' after revoke"); also needs
+  the REVOKE to take a pg_class rowmark + await ACL/rowmark xmax (sfu3-after-grant1).
+- perm10: drop1 = `DELETE FROM pg_class WHERE relname=…` — virtual-pg_class tuple delete
+  (deferred drop at commit) + SearchSysCacheLocked1 find-then-none "cache lookup failed".
 
 Other failing M0118 specs (distinct unbuilt subsystems): index-only-bitmapscan
 (EXPLAIN DECLARE CURSOR + BitmapOr plan), predicate-gin/gist (GIN/GiST AMs),

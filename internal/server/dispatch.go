@@ -768,6 +768,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.CTESelfModErr = nil
 		ectx.InDMLCTE = false
 		ectx.CTERowCache = nil
+		ectx.DeadlockVictim = false
 
 		// COPY inside a multi-statement simple-query batch (psql `\;`).
 		// Intercept before the plan-cache / executeOneSimpleStmt path —
@@ -849,6 +850,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				if !autoCommit && connTx != nil && connTx.InExplicit() {
 					connTx.Fail()
 					connTx.ReleasePinnedSnapshotOnFail(ectx.TxnMgr)
+					// A deadlock victim releases its XID at the abort, not at the
+					// eventual explicit ROLLBACK, so a peer blocked on its catalog
+					// tuple xmax unblocks immediately. M0118-0009 (design 0118-0115,
+					// intra-grant-inplace perm 8).
+					if ectx.DeadlockVictim {
+						connTx.AbortInPlaceOnFail(ectx.TxnMgr)
+					}
 				}
 				return nil
 			}

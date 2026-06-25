@@ -297,6 +297,39 @@ func (c *connTxState) ReleasePinnedSnapshotOnFail(mgr *mvcc.Manager) {
 	}
 }
 
+// AbortInPlaceOnFail releases this transaction's XID for the purpose of
+// WaitForXID / IsXIDActive the moment a top-level statement is aborted as a
+// deadlock victim, WITHOUT clearing its proc-array slot. This mirrors
+// PostgreSQL's AbortTransaction releasing the transaction's XID at the abort, so
+// a concurrent session blocked on this transaction's catalog-tuple xmax (the
+// intra-grant-inplace pg_class in-place wait) unblocks at the abort rather than
+// at the eventual explicit ROLLBACK. The slot stays open so the subsequent
+// COMMIT/ROLLBACK on this block still finalises it through the canonical path —
+// the victim is write-less (its statement errored before writing), so there is
+// nothing to make visible or roll back.
+//
+// Gated on SavepointDepth()==0 exactly like Fail()/ReleasePinnedSnapshotOnFail:
+// when a savepoint is open the error aborts only the subtransaction and ROLLBACK
+// TO SAVEPOINT resumes the same top-level XID, which must therefore stay active.
+// Used only when the executor flagged the statement as a deadlock victim
+// (Context.DeadlockVictim), so the blast radius is confined to the pg_class
+// in-place deadlock path. Design 0118-0115 (intra-grant-inplace perm 8).
+func (c *connTxState) AbortInPlaceOnFail(mgr *mvcc.Manager) {
+	if mgr == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sess == nil || c.sess.SavepointDepth() != 0 {
+		return
+	}
+	tx := c.tx
+	if curTx, _, ok := c.sess.CurrentTransaction(); ok {
+		tx = curTx
+	}
+	mgr.ReleaseXIDWaiters(tx.XID)
+}
+
 // ClearFailed clears the failed transaction state.  Used after ROLLBACK TO
 // SAVEPOINT restores the transaction to a pre-error state.
 func (c *connTxState) ClearFailed() {

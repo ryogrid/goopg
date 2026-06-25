@@ -395,6 +395,18 @@ type Context struct {
 	// Write operators register their output pointers in CTEWriteFence when this is set.
 	InDMLCTE bool
 
+	// DeadlockVictim is set by the pg_class in-place lock waits
+	// (waitPgClassInplaceXID) when this statement is chosen as a deadlock
+	// victim and raises SQLSTATE 40P01. The wire dispatch layer reads it on the
+	// failure path to abort this transaction's MVCC state in place — clearing
+	// its proc-array slot and waking any WaitForXID waiter — while keeping the
+	// transaction block open, mirroring PostgreSQL's AbortTransaction releasing
+	// the XID the moment the deadlock is reported (the winner blocked on the
+	// victim's catalog-tuple xmax must unblock at the abort, not at the victim's
+	// later explicit ROLLBACK). Reset per statement. Design 0118-0115
+	// (intra-grant-inplace perm 8).
+	DeadlockVictim bool
+
 	// PrepStmtsRows, when non-nil, is called by the valuesOp that backs
 	// pg_prepared_statements to return the session's current prepared
 	// statement rows (name, statement, parameter_types, result_types).

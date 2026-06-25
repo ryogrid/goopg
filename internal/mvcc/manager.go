@@ -60,6 +60,21 @@ type Manager struct {
 	abortedMu   sync.RWMutex
 	abortedXIDs []storage.TransactionID
 
+	// releasedWaiterXIDs holds top-level XIDs whose transaction block is still
+	// open in its proc-array slot but whose statement-level abort (a deadlock
+	// victim, mirroring PostgreSQL's AbortTransaction) has already released the
+	// XID for the purpose of WaitForXID / IsXIDActive. A peer blocked on this
+	// XID's catalog-tuple xmax (the intra-grant-inplace pg_class in-place wait)
+	// then unblocks at the abort rather than at the victim's later explicit
+	// ROLLBACK/COMMIT, while the slot itself stays active so that explicit
+	// COMMIT/ROLLBACK still finalises the (write-less) transaction normally —
+	// the victim never recorded any heap write to make visible. Snapshot
+	// visibility is intentionally NOT consulted against this set (it reads the
+	// slot/CLOG as before). Cleared when the slot is finished. Design 0118-0115
+	// (intra-grant-inplace perm 8).
+	releasedWaiterMu   sync.RWMutex
+	releasedWaiterXIDs map[storage.TransactionID]struct{}
+
 	// clog, when non-nil, is the durable commit log attached to every snapshot
 	// this Manager captures (M0117-0002). It lets Snapshot.SeesCommittedXID fall
 	// back to the persistent CLOG for in-window XIDs the in-memory arrays cannot
@@ -575,6 +590,16 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 		m.abortedMu.Unlock()
 	}
 
+	// Drop any deadlock-victim waiter-release marker now that the slot is
+	// genuinely finished. Design 0118-0115 (intra-grant-inplace perm 8).
+	if xid != storage.InvalidTransactionID {
+		m.releasedWaiterMu.Lock()
+		if m.releasedWaiterXIDs != nil {
+			delete(m.releasedWaiterXIDs, xid)
+		}
+		m.releasedWaiterMu.Unlock()
+	}
+
 	// M0104-0002: release SSI bookkeeping for SERIALIZABLE
 	// transactions (commit or abort). Stamps FinishedAt with the
 	// next CommitSeqNo and deletes the entry from the registry.
@@ -902,6 +927,9 @@ func (m *Manager) IsXIDActive(xid storage.TransactionID) bool {
 // so a per-subxid IsAborted check is sufficient (no ancestry walk needed).
 // M0118-0004 (docs/design/0118-0012).
 func (m *Manager) xidActiveWithSubxact(xid storage.TransactionID) bool {
+	if m.xidWaitersReleased(xid) {
+		return false
+	}
 	if m.xidInProgress(xid) {
 		return true
 	}
@@ -910,7 +938,53 @@ func (m *Manager) xidActiveWithSubxact(xid storage.TransactionID) bool {
 		// Not a subxid (or unresolved) — already shown not in progress above.
 		return false
 	}
+	if m.xidWaitersReleased(top) {
+		return false
+	}
 	return m.xidInProgress(top) && !m.IsAborted(xid)
+}
+
+// xidWaitersReleased reports whether xid was released for WaitForXID/IsXIDActive
+// purposes by a deadlock-victim statement abort while its slot stays open
+// (ReleaseXIDWaiters). Design 0118-0115 (intra-grant-inplace perm 8).
+func (m *Manager) xidWaitersReleased(xid storage.TransactionID) bool {
+	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	m.releasedWaiterMu.RLock()
+	defer m.releasedWaiterMu.RUnlock()
+	if m.releasedWaiterXIDs == nil {
+		return false
+	}
+	_, ok := m.releasedWaiterXIDs[xid]
+	return ok
+}
+
+// ReleaseXIDWaiters marks xid as no longer active for the purpose of WaitForXID /
+// IsXIDActive and wakes every blocked waiter, WITHOUT clearing xid's proc-array
+// slot. It is the in-place half of PostgreSQL's AbortTransaction for a deadlock
+// victim: the victim's transaction block stays open (so its eventual explicit
+// COMMIT/ROLLBACK still finalises the slot through the canonical path) but a peer
+// blocked on the victim's catalog-tuple xmax — the intra-grant-inplace pg_class
+// in-place wait — unblocks at the abort rather than at the victim's later
+// ROLLBACK. The victim is write-less in every spec that uses this (its statement
+// errored before writing), so leaving snapshot visibility to read the still-open
+// slot/CLOG unchanged is correct. The marker is cleared when the slot is finished.
+// Design 0118-0115 (intra-grant-inplace perm 8).
+func (m *Manager) ReleaseXIDWaiters(xid storage.TransactionID) {
+	if xid == storage.InvalidTransactionID {
+		return
+	}
+	m.releasedWaiterMu.Lock()
+	if m.releasedWaiterXIDs == nil {
+		m.releasedWaiterXIDs = make(map[storage.TransactionID]struct{})
+	}
+	m.releasedWaiterXIDs[xid] = struct{}{}
+	m.releasedWaiterMu.Unlock()
+
+	m.waitMu.Lock()
+	m.commitCond.Broadcast()
+	m.waitMu.Unlock()
 }
 
 // HasAbortedXID reports whether xid is recorded in the manager's aborted

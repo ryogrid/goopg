@@ -125,6 +125,12 @@ func waitPgClassInplaceXID(ctx *Context, blockingXID storage.TransactionID) (dea
 	}
 	if ctx.Tx.XID != storage.InvalidTransactionID {
 		if registerWFGAndCheckCycle(ctx.Tx.XID, blockingXID) {
+			// We are the deadlock victim. Flag the statement so the wire
+			// dispatch layer aborts this transaction's XID in place on the
+			// failure path, unblocking the peer that is waiting on our
+			// catalog-tuple xmax immediately rather than at our explicit
+			// ROLLBACK. Design 0118-0115 (intra-grant-inplace perm 8).
+			ctx.DeadlockVictim = true
 			return true, nil
 		}
 		defer deregisterWFG(ctx.Tx.XID)
