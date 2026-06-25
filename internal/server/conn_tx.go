@@ -53,8 +53,17 @@ type connTxState struct {
 	mu     sync.Mutex
 	active bool
 	failed bool // 25P02: in_failed_sql_transaction
-	tx     mvcc.Transaction
-	sess   *executor.BasicSession // session state, non-nil when active
+	// preparedGid is the global transaction identifier set by
+	// `PREPARE TRANSACTION 'gid'`. While non-empty the connection's active
+	// transaction is "prepared": its writes, locks and SSI predicate-lock
+	// state persist (the transaction is kept open) until a matching
+	// `COMMIT PREPARED 'gid'` / `ROLLBACK PREPARED 'gid'` finalises it via the
+	// canonical commit/rollback path. Same-backend only — cross-backend commit
+	// of a prepared xact and the pg_prepared_xacts view are deferred.
+	// M0118-0009 (prepared-transactions).
+	preparedGid string
+	tx          mvcc.Transaction
+	sess        *executor.BasicSession // session state, non-nil when active
 	// SessCtx is the per-connection session-level mctx (M0107-0001).
 	// Wired by serveConn after creating the session context; stmt-level
 	// contexts are acquired as children in dispatchSimpleQueryViaExecutor.
@@ -374,6 +383,7 @@ func (c *connTxState) End() {
 	}
 	c.active = false
 	c.failed = false
+	c.preparedGid = ""
 	c.tx = mvcc.Transaction{}
 	c.PendingEnumValues = nil
 	c.PendingEnumRenames = nil
@@ -384,6 +394,32 @@ func (c *connTxState) End() {
 	// ROLLBACK (or commit-cleanup after publish), where the notifications must
 	// not be delivered. M0118-0009.
 	c.pendingNotify = nil
+	c.mu.Unlock()
+}
+
+// MarkPrepared records the two-phase-commit gid on the active transaction. The
+// transaction is kept open so its writes, locks and SSI state persist until a
+// matching COMMIT/ROLLBACK PREPARED finalises it. M0118-0009.
+func (c *connTxState) MarkPrepared(gid string) {
+	c.mu.Lock()
+	c.preparedGid = gid
+	c.mu.Unlock()
+}
+
+// PreparedGid returns the gid of the active prepared transaction, or "" when the
+// connection has no prepared transaction. M0118-0009.
+func (c *connTxState) PreparedGid() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.preparedGid
+}
+
+// ClearPrepared drops the prepared marker without ending the transaction. Called
+// just before the canonical COMMIT/ROLLBACK path finalises the prepared xact.
+// M0118-0009.
+func (c *connTxState) ClearPrepared() {
+	c.mu.Lock()
+	c.preparedGid = ""
 	c.mu.Unlock()
 }
 

@@ -792,7 +792,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// plan, cache, then execute.
 		var precached planner.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 			cacheKey = normalizeCompatSQL(sql)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -1693,6 +1693,13 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 	// and NOTIFY buffers until the transaction commits. Handle before planning
 	// (the planner has no node for them). M0118-0009 (async-notify).
 	if handled, err := s.execNotifyStmt(w, stmt, connTx); handled {
+		return err
+	}
+	// PREPARE TRANSACTION / COMMIT PREPARED / ROLLBACK PREPARED — two-phase
+	// commit. Handled at the server layer (the planner has no node for them);
+	// COMMIT/ROLLBACK PREPARED re-enter this function with a synthetic
+	// COMMIT/ROLLBACK so the canonical finalisation path runs. M0118-0009.
+	if handled, err := s.execTwoPhaseStmt(w, ctx, stmt, connTx, autoCommitPtr); handled {
 		return err
 	}
 	var node planner.Node

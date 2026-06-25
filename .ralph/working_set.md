@@ -1,39 +1,40 @@
-Loop #48 COMPLETE: M0118-0009 — `intra-grant-inplace` enabler (design 0118-0109).
-Committing + pushing. NOT a promotion (perm 1 only; spec stays defer).
+Loop #49 COMPLETE: M0118-0009 — same-backend two-phase commit ENABLER (design 0118-0110).
+Committing + pushing. NOT a promotion (specs stay defer).
 
-What landed (low blast radius, parser + executor xmax-wait replay):
-- Permutation 1 of intra-grant-inplace.spec now byte-identical; first divergence
-  advanced L17→L62. `ALTER TABLE … ADD PRIMARY KEY` (in-place relhasindex=true on
-  the pg_class tuple) must `<waiting ...>` behind a concurrent uncommitted
-  `GRANT SELECT ON <table>` — PG's lock for an ACL change IS the catalog tuple
-  xmax. Replayed the wait (pg_class sibling of 0118-0098's pg_database case):
-  - internal/parser/{ast.go,parser.go}: GRANT/REVOKE scan now resolves a table
-    target into CompatNoopStmt.TableACL (helpers grantObjectName / grantNonTableClass;
-    default object class is TABLE).
-  - internal/catalog/catalog.go: tableACLChangeXID map[oid]xid (mutex-guarded) +
-    SetTableACLChangeXID / TableACLChangeXID.
-  - internal/executor/operators_ddl.go: execCompatNoop records the writer XID keyed
-    by table OID for a TableACL grant; execAlterTableAddPrimaryKey calls new
-    waitForTableACLChange → mvcc.WaitForXID before building the PK index.
-  - internal/parser/op_compat_test.go: TestParseGrantTableACL.
-  - docs/design/0118-0109-*.md + README row; fix_plan M0118-0009 entry; ledger row.
+What landed (blast radius nil — handler returns handled=false for all non-2PC stmts):
+- goopg had NO 2PC; `PREPARE TRANSACTION 's1'` did not even parse. Added the three
+  statements `prepared-transactions{,-cic}` + `stats` need:
+  - parser: AST PrepareTransactionStmt/CommitPreparedStmt/RollbackPreparedStmt;
+    parsePrepare branches on KwTransaction; parseCommit/parseRollback branch on the
+    unreserved `prepared` ident (peekIdentText); gid via parseStrLit.
+    (internal/parser/{ast.go,parser.go,twophase_test.go})
+  - server: connTxState.preparedGid + MarkPrepared/PreparedGid/ClearPrepared (End clears).
+    execTwoPhaseStmt (internal/server/twophase.go): PREPARE TRANSACTION keeps the txn
+    OPEN as the connection's active txn (writes/locks/SSI predicate locks persist) and
+    records the gid; COMMIT/ROLLBACK PREPARED validate gid (42704 if unknown), clear it,
+    then RE-ENTER executeOneSimpleStmt with a synthetic Commit/RollbackStmt → reuses the
+    CANONICAL commit path (SSI check, deferred DDL, NOTIFY, connTx.End) — no sibling
+    commit path. 25P01 outside txn block. isTwoPhaseStmt keeps them out of plan-cache
+    pre-plan (dispatch.go, like isNotifyStmt).
+  - docs/design/0118-0110 + README row; fix_plan + ledger rows.
 
-Gates (PASS): TestParseGrantTableACL; internal/parser + internal/catalog units;
-non-regression TestPort_IsolationIntraGrantInplaceDb (shared GRANT/DatabaseACL
-path) + TestPort_IsolationTruncateConflict (GRANT-on-table) strict; go build +
-go vet + gofmt clean. pgbench smoke = pre-commit hook.
+Gates (PASS): TestParseTwoPhaseCommit; TestPort_TwoPhaseCommitSameBackend (commit-prepared
+visibility incl. cross-session isolation of the uncommitted prepared row, rollback-prepared
+discard, 25P01, 42704); internal/parser + internal/server units; build+vet+gofmt clean
+(fixed one struct-alignment line my edit introduced). pgbench smoke = pre-commit hook.
+Probe of prepared-transactions-cic: STATUS=defer but mechanism works — held txn keeps its
+MVCC slot active so CIC waits + unblocks at COMMIT PREPARED; ONLY residual = CIC wait
+doesn't honour lock_timeout (PG cancels cic2 with 55P03).
 
-NEXT (all remaining M0118 are Effort-L distinct unbuilt subsystems):
-- intra-grant-inplace EFFORT-L CORE: perms 3,4,7–11 need real pg_class ROWMARK
-  locking — `SELECT relhasindex FROM pg_class … FOR NO KEY UPDATE`/`FOR UPDATE`/
-  `FOR KEY SHARE` + `DELETE FROM pg_class` taking a genuine MVCC tuple lock on a
-  VIRTUAL catalog row, cross-session FOR-KEY-SHARE-vs-FOR-NO-KEY-UPDATE multixact
-  conflict, plus LockTuple-vs-xmax deadlock detection (perm 8 is an intentional
-  deadlock). The runtime shared-catalog MVCC-tuple-lock subsystem.
-- stats (pg_stat_force_next_flush + cumulative function-stats + 2PC interaction),
-  prepared-transactions{,-cic} (2PC PREPARE/COMMIT PREPARED), index-only-bitmapscan
-  (BitmapOr plan + EXPLAIN DECLARE CURSOR), predicate-gin/gist (GIN/GiST AM +
-  int4[]/point types), deadlock-parallel (parallel workers), fk-partitioned-1/2.
-Probe helper: throwaway zz_probe_test.go in internal/testport using
-framework.IsolationRunner.RunAndCompare → log Status/Diff (import
-internal/testutil/cluster).
+NEXT (all remaining M0118-0009 Effort-L):
+- prepared-transactions-cic: thread session lock_timeout into the CIC active-slot wait
+  (mvcc.WaitForSlotsToCommit / design 0118-0031) and abort with 55P03 "canceling
+  statement due to lock timeout" — likely the cheapest next promotion (1 permutation).
+- prepared-transactions: full 1500-perm SERIALIZABLE SSI verification across held
+  prepared xacts (mechanism in place; validate byte-for-byte, close any first-committer/
+  conflict-ordering gaps). Probe via throwaway zz_probe_test.go (IsolationRunner.RunAndCompare).
+- stats: needs the cumulative pg_stat_* subsystem (function/relation/SLRU stats,
+  pg_stat_force_next_flush, track_functions, stats_fetch_consistency) on top of 2PC.
+- intra-grant-inplace: pg_class rowmark locking (Effort-L MVCC-tuple-lock core).
+Other failing M0118 specs: index-only-bitmapscan, predicate-gin/gist, deadlock-parallel,
+fk-partitioned-1/2 (all distinct unbuilt subsystems).

@@ -929,13 +929,40 @@ func (p *parser) parseIsolationLevelName() (string, error) {
 // parseCommit: COMMIT [WORK | TRANSACTION] | END [WORK | TRANSACTION]
 func (p *parser) parseCommit() (Stmt, error) {
 	t := p.advance()
+	// COMMIT PREPARED 'gid' — two-phase-commit commit phase. "PREPARED" is an
+	// unreserved word lexed as an identifier. M0118-0009 (prepared-transactions).
+	if p.peekIdentText("prepared") {
+		p.advance() // PREPARED
+		gid, gerr := p.parseStrLit()
+		if gerr != nil {
+			return nil, gerr
+		}
+		return &CommitPreparedStmt{pos: t.Pos, Gid: gid}, nil
+	}
 	_ = p.acceptKeyword(KwWork) || p.acceptKeyword(KwTransaction)
 	return &CommitStmt{pos: t.Pos}, nil
+}
+
+// peekIdentText reports whether the current token is an identifier matching the
+// given (lowercase) text. The lexer lowercases unquoted identifiers, so callers
+// pass a lowercase literal. M0118-0009.
+func (p *parser) peekIdentText(text string) bool {
+	t := p.cur()
+	return t.Kind == TokenIdent && t.Value == text
 }
 
 // parseRollback: ROLLBACK [WORK | TRANSACTION] | ROLLBACK TO [SAVEPOINT] name | ABORT [WORK | TRANSACTION]
 func (p *parser) parseRollback() (Stmt, error) {
 	t := p.advance()
+	// ROLLBACK PREPARED 'gid' — two-phase-commit abort phase. M0118-0009.
+	if p.peekIdentText("prepared") {
+		p.advance() // PREPARED
+		gid, gerr := p.parseStrLit()
+		if gerr != nil {
+			return nil, gerr
+		}
+		return &RollbackPreparedStmt{pos: t.Pos, Gid: gid}, nil
+	}
 	// ROLLBACK TO [SAVEPOINT] name
 	if p.acceptKeyword(KwTo) {
 		_ = p.acceptKeyword(KwSavepoint)
@@ -1609,6 +1636,17 @@ func (p *parser) parseCluster() (Stmt, error) {
 // parsePrepare: PREPARE name [(param_type, …)] AS query (M0096-0006)
 func (p *parser) parsePrepare() (Stmt, error) {
 	t := p.advance() // PREPARE
+	// PREPARE TRANSACTION 'gid' — two-phase-commit prepare phase. Shares the
+	// PREPARE keyword with prepared statements; the TRANSACTION keyword
+	// disambiguates. M0118-0009 (prepared-transactions).
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTransaction {
+		p.advance() // TRANSACTION
+		gid, gerr := p.parseStrLit()
+		if gerr != nil {
+			return nil, gerr
+		}
+		return &PrepareTransactionStmt{pos: t.Pos, Gid: gid}, nil
+	}
 	nameIdent, err := p.parseIdent()
 	if err != nil {
 		return nil, err

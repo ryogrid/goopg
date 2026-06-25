@@ -171,6 +171,38 @@ type PrepareStmt struct {
 func (s *PrepareStmt) Pos() int  { return s.pos }
 func (s *PrepareStmt) stmtNode() {}
 
+// PrepareTransactionStmt — `PREPARE TRANSACTION 'gid'`.
+// M0118-0009 (prepared-transactions): the two-phase-commit prepare phase.
+// Distinct from PrepareStmt (the prepared-statement PREPARE) — they share the
+// PREPARE keyword but the TRANSACTION keyword disambiguates them in the parser.
+type PrepareTransactionStmt struct {
+	pos int
+	Gid string // the global transaction identifier (a string literal)
+}
+
+func (s *PrepareTransactionStmt) Pos() int  { return s.pos }
+func (s *PrepareTransactionStmt) stmtNode() {}
+
+// CommitPreparedStmt — `COMMIT PREPARED 'gid'`.
+// M0118-0009 (prepared-transactions): commits a previously prepared txn by gid.
+type CommitPreparedStmt struct {
+	pos int
+	Gid string
+}
+
+func (s *CommitPreparedStmt) Pos() int  { return s.pos }
+func (s *CommitPreparedStmt) stmtNode() {}
+
+// RollbackPreparedStmt — `ROLLBACK PREPARED 'gid'`.
+// M0118-0009 (prepared-transactions): rolls back a previously prepared txn.
+type RollbackPreparedStmt struct {
+	pos int
+	Gid string
+}
+
+func (s *RollbackPreparedStmt) Pos() int  { return s.pos }
+func (s *RollbackPreparedStmt) stmtNode() {}
+
 // ExecuteStmt — `EXECUTE name [(param, …)]`.
 // M0096-0006: executor retrieves and runs the named prepared statement.
 type ExecuteStmt struct {

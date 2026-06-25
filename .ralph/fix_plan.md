@@ -1373,3 +1373,36 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       a virtual catalog row + `LockTuple` deadlock detection), the Effort-L runtime
       shared-catalog MVCC-tuple-lock core. `TestParseGrantTableACL`; non-regression
       IntraGrantInplaceDb + TruncateConflict strict PASS.
+      **2026-06-25 (design 0118-0110, enabler — NOT a promotion): same-backend
+      two-phase commit.** Adds the 2PC statements `prepared-transactions`,
+      `prepared-transactions-cic` and `stats` need. goopg had NO 2PC —
+      `PREPARE TRANSACTION 's1'` did not parse (mis-lexed as the prepared-
+      statement PREPARE), so every permutation diverged at the first prepare
+      step. New parser AST (`PrepareTransactionStmt`/`CommitPreparedStmt`/
+      `RollbackPreparedStmt`; `parsePrepare` branches on the `TRANSACTION`
+      keyword, `parseCommit`/`parseRollback` on the unreserved `PREPARED`
+      word) + same-backend executor (`internal/server/twophase.go`). Every
+      target spec PREPAREs and COMMIT/ROLLBACK PREPAREs the gid from the SAME
+      idle-in-between session, so goopg keeps the prepared txn OPEN as the
+      connection's active txn (writes/locks/SSI predicate locks persist),
+      records `connTxState.preparedGid`, and finalises COMMIT/ROLLBACK PREPARED
+      by re-entering `executeOneSimpleStmt` with a synthetic CommitStmt/
+      RollbackStmt — reusing the CANONICAL commit path verbatim (SSI pre-commit
+      check, deferred DDL, NOTIFY publish, connTx.End) so no parallel commit
+      path drifts and the SSI check fires at COMMIT PREPARED as upstream.
+      PREPARE TRANSACTION outside a txn block → 25P01; unknown gid → 42704.
+      `isTwoPhaseStmt` keeps them out of the plan-cache pre-plan. Blast radius
+      nil (handler returns handled=false for all other statements; no port spec
+      uses these). A prepared-transactions-cic probe confirms the held txn keeps
+      its MVCC slot active so CREATE INDEX CONCURRENTLY waits for it and unblocks
+      at COMMIT PREPARED — first divergence advanced from "parse error at p1" to
+      the final cic2/c1 timing; ONLY residual gap = goopg's CIC active-slot wait
+      doesn't honour `lock_timeout` (PG cancels with 55P03). Specs stay defer
+      pending (1) CIC lock_timeout, (2) full 1500-perm SSI verification of
+      prepared-transactions, (3) the pg_stat_* subsystem for stats. Tests
+      `TestParseTwoPhaseCommit` + `TestPort_TwoPhaseCommitSameBackend`
+      (commit-prepared visibility incl. cross-session isolation, rollback-
+      prepared discard, 25P01, 42704). **Remaining M0118-0009:**
+      `intra-grant-inplace` (pg_class rowmark locking), `stats` (pg_stat_*
+      subsystem), `prepared-transactions{,-cic}` (CIC lock_timeout + full SSI
+      verification).
