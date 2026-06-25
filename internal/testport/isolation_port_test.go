@@ -407,6 +407,26 @@ func TestPort_IsolationTimeouts(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/timeouts.spec")
 }
 
+// TestPort_IsolationPreparedTransactionsCIC exercises the prepared-transactions-cic
+// spec (M0118-0009): CREATE INDEX CONCURRENTLY must interact correctly with a
+// prepared transaction. s1 PREPAREs a transaction that inserted a row; goopg keeps
+// the prepared transaction's mvcc slot active (same-backend 2PC, design 0118-0110)
+// so s2's CREATE INDEX CONCURRENTLY parks waiting for that start-time snapshot to
+// drain. With lock_timeout=10ms set, that wait is cancelled with "canceling
+// statement due to lock timeout" — mvcc.WaitForSlotsToCommit now arms the session
+// lock_timeout carried on the context (lockwait.Timeout) exactly like the
+// heavyweight lock manager's ProcSleep (design 0118-0111). After c1 COMMIT PREPARED
+// finalises the row, r2 reads it back (seqscan disabled is only a preference, so the
+// SELECT still succeeds even though the concurrent index build was cancelled).
+// Byte-identical to PG 18.3.
+func TestPort_IsolationPreparedTransactionsCIC(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_prepared_cic")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/prepared-transactions-cic.spec")
+}
+
 // TestPort_IsolationInheritTemp exercises the inherit-temp spec (M0118-0008):
 // an inheritance tree whose children are TEMPORARY tables created in different
 // sessions. Each backend owns its own temp namespace, so s1's scan/UPDATE/

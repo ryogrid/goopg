@@ -4855,6 +4855,17 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// deadlock here because each waits only on its own start-time snapshot.
 	if s.Concurrently && len(cicWaitSlots) > 0 && o.ctx.Ctx != nil {
 		if err := o.ctx.TxnMgr.WaitForSlotsToCommit(o.ctx.Ctx, cicWaitSlots); err != nil {
+			// A lock_timeout (or statement_timeout) that fired while parked
+			// waiting for the start-time snapshot set to drain must surface the
+			// matching cancellation message — "canceling statement due to lock
+			// timeout" — exactly like a heavyweight lock wait, so the
+			// prepared-transactions-cic isolation spec sees the right error
+			// (M0118-0009). Any other cancellation is a plain client/connection
+			// teardown of the concurrent build.
+			if ee := lockWaitTimeoutError(err); ee != nil {
+				ee.Pos = s.Pos()
+				return ee
+			}
 			return &ExecError{Code: "57014", Pos: s.Pos(), Message: "CREATE INDEX CONCURRENTLY cancelled"}
 		}
 	}

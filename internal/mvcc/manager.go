@@ -800,18 +800,41 @@ func (m *Manager) SnapshotActiveOtherSlots(selfHandle TxnHandle) []int {
 }
 
 // WaitForSlotsToCommit blocks until every slot in active has finished its
-// transaction (inTxn back to 0), or ctx is cancelled. The active set is the
-// caller's responsibility to capture (see SnapshotActiveOtherSlots). A nil/empty
-// set returns immediately.
+// transaction (inTxn back to 0), or ctx is cancelled, or the session's
+// lock_timeout budget carried on ctx (lockwait.Timeout) elapses. The active set
+// is the caller's responsibility to capture (see SnapshotActiveOtherSlots). A
+// nil/empty set returns immediately.
+//
+// The lock_timeout arm mirrors the heavyweight lock manager (lockmgr.ProcSleep):
+// a CREATE INDEX CONCURRENTLY that parks here waiting on a still-running
+// transaction — including a prepared transaction whose slot stays active until
+// COMMIT/ROLLBACK PREPARED — is cancelled with lockwait.ErrLockTimeout once the
+// budget elapses, which the executor maps to "canceling statement due to lock
+// timeout", independent of statement_timeout (prepared-transactions-cic
+// isolation spec, M0118-0009).
 func (m *Manager) WaitForSlotsToCommit(ctx context.Context, active []int) error {
 	if len(active) == 0 {
 		return nil
 	}
 
+	// Arm the session's lock_timeout, if one is carried on ctx. The timer is
+	// re-armed from the moment this wait begins, matching upstream's
+	// enable_timeout_after(LOCK_TIMEOUT) at the top of ProcSleep.
+	var lockTimeoutCh <-chan time.Time
+	if d, ok := lockwait.Timeout(ctx); ok {
+		lt := time.NewTimer(d)
+		defer lt.Stop()
+		lockTimeoutCh = lt.C
+	}
+
+	timedOut := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
+			m.commitCond.Broadcast()
+		case <-lockTimeoutCh:
+			close(timedOut)
 			m.commitCond.Broadcast()
 		case <-done:
 		}
@@ -823,6 +846,11 @@ func (m *Manager) WaitForSlotsToCommit(ctx context.Context, active []int) error 
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		select {
+		case <-timedOut:
+			return lockwait.ErrLockTimeout
+		default:
 		}
 		allDone := true
 		for _, i := range active {

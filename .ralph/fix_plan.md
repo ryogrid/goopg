@@ -1402,7 +1402,18 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       prepared-transactions, (3) the pg_stat_* subsystem for stats. Tests
       `TestParseTwoPhaseCommit` + `TestPort_TwoPhaseCommitSameBackend`
       (commit-prepared visibility incl. cross-session isolation, rollback-
-      prepared discard, 25P01, 42704). **Remaining M0118-0009:**
-      `intra-grant-inplace` (pg_class rowmark locking), `stats` (pg_stat_*
-      subsystem), `prepared-transactions{,-cic}` (CIC lock_timeout + full SSI
-      verification).
+      prepared discard, 25P01, 42704).
+      **2026-06-25 (design 0118-0111, PROMOTION): `prepared-transactions-cic`
+      PROMOTED to pass-required** (`runIsoSpecStrict` in
+      `TestPort_IsolationPreparedTransactionsCIC`, byte-identical to PG 18.3).
+      Closes the 0118-0110 residual gap: `mvcc.WaitForSlotsToCommit` now arms the
+      session `lock_timeout` carried on ctx (`lockwait.Timeout`) exactly like
+      `lockmgr.ProcSleep`, so a CREATE INDEX CONCURRENTLY parked waiting for a
+      still-running prepared txn's MVCC slot to drain is cancelled with
+      "canceling statement due to lock timeout" at the 10ms budget (CIC drain
+      site maps via the shared `lockWaitTimeoutError` helper — no sibling path).
+      Blast radius nil: byte-unchanged when lock_timeout=0; only caller is the CIC
+      drain. Gates: strict spec PASS + `-race ./internal/mvcc/...` green.
+      **Remaining M0118-0009:** `intra-grant-inplace` (pg_class rowmark locking),
+      `stats` (pg_stat_* subsystem), `prepared-transactions` (full 1500-perm SSI
+      verification across held prepared xacts).
