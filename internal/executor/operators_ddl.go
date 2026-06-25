@@ -7006,6 +7006,15 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: "ALTER TABLE ADD PRIMARY KEY requires Pool in Context"}
 	}
+	// Creating the primary-key index sets relhasindex=true on the table's pg_class
+	// tuple — an in-place update in PostgreSQL (heap_inplace_update). It takes no
+	// heavyweight lock; it serialises only on the tuple's xmax. So if a concurrent
+	// uncommitted GRANT/REVOKE … ON <table> changed the same pg_class ACL row, this
+	// must wait for that transaction to finish before "rewriting" the tuple. goopg
+	// has no real pg_class heap tuple, so we replay that wait on the writer XID
+	// recorded by execCompatNoop. WaitForXID returns immediately when none is
+	// pending or it has already finished. Design 0118-0109 (intra-grant-inplace).
+	o.waitForTableACLChange(tbl)
 	if o.ctx.Catalog.HasPrimaryKey(tbl) {
 		return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("multiple primary keys for table %q are not allowed", tbl.QualifiedName())}
 	}
@@ -7051,6 +7060,25 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		}
 	}
 	return nil
+}
+
+// waitForTableACLChange blocks until any uncommitted GRANT/REVOKE … ON <table>
+// transaction has committed or aborted, mirroring PostgreSQL's
+// heap_inplace_update waiting on the pg_class tuple's xmax before ALTER TABLE
+// ADD PRIMARY KEY flips relhasindex in place. The writer XID is recorded by
+// execCompatNoop. WaitForXID returns immediately when the recorded XID has
+// already finished (or none was recorded), so this is a no-op in the common
+// case. Design 0118-0109 (intra-grant-inplace).
+func (o *ddlOp) waitForTableACLChange(tbl *catalog.Table) {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok || o.ctx.TxnMgr == nil || tbl == nil {
+		return
+	}
+	xid := im.TableACLChangeXID(tbl.OID)
+	if xid == storage.InvalidTransactionID || xid == o.ctx.Tx.XID || o.ctx.Ctx == nil {
+		return
+	}
+	_ = o.ctx.TxnMgr.WaitForXID(o.ctx.Ctx, xid)
 }
 
 // execAlterTableAddUnique handles ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)].
@@ -11382,6 +11410,21 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.TxnMgr != nil {
 			if err := o.ctx.MaterializeWriterXID(); err == nil {
 				im.SetDatabaseACLChangeXID(o.ctx.Tx.XID)
+			}
+		}
+	}
+	// A GRANT/REVOKE … ON [TABLE] <name> changes the pg_class ACL. As with the
+	// database case above, the lock IS the pg_class tuple's xmax, so a concurrent
+	// in-place pg_class update (ALTER TABLE ADD PRIMARY KEY setting relhasindex)
+	// must wait for the ACL-change transaction to commit/abort. We record the
+	// writer XID keyed by the table OID; execAlterTableAddPrimaryKey waits on it
+	// via mvcc.WaitForXID. Design 0118-0109 (intra-grant-inplace).
+	if s.TableACL != "" {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.TxnMgr != nil {
+			if tbl, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Name: s.TableACL}); ok && tbl != nil {
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					im.SetTableACLChangeXID(tbl.OID, uint32(o.ctx.Tx.XID))
+				}
 			}
 		}
 	}

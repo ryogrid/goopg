@@ -251,6 +251,30 @@ func (p *parser) advance() Token {
 	return t
 }
 
+// grantObjectName resolves the relation name in a GRANT/REVOKE object list,
+// given the name token and the two tokens that follow it. A schema-qualified
+// `schema.table` (name, ".", table) yields the table component; otherwise the
+// bare name. Used to key a table ACL change to its pg_class tuple (0118-0109).
+func grantObjectName(name, after1, after2 Token) string {
+	if after1.Kind == TokenSymbol && after1.Value == "." {
+		return after2.Value
+	}
+	return name.Value
+}
+
+// grantNonTableClass reports whether word names a GRANT object class other than
+// TABLE (the default). Such grants do not change a pg_class ACL tuple, so the
+// in-place relhasindex serialization (0118-0109) does not apply.
+func grantNonTableClass(word string) bool {
+	switch strings.ToLower(word) {
+	case "schema", "sequence", "function", "procedure", "routine",
+		"domain", "type", "language", "tablespace", "foreign",
+		"large", "all", "parameter", "system":
+		return true
+	}
+	return false
+}
+
 // errAtCur builds a SyntaxError pinned at the current token. The
 // message echoes the token text, matching upstream's "at or near".
 func (p *parser) errAtCur(msg string) error {
@@ -456,21 +480,36 @@ identLedStatement:
 			// they don't bubble up as parse errors when the server is
 			// running multi-statement batches.
 			p.advance()
-			// Scan the remaining tokens for an `ON DATABASE` object class so the
-			// executor can model PG's catalog-tuple-xmax serialization between an
-			// ACL change and a concurrent in-place datfrozenxid update (design
-			// 0118-0098, intra-grant-inplace-db).
+			// Scan the remaining tokens for the ACL object class so the executor can
+			// model PG's catalog-tuple-xmax serialization between an ACL change and a
+			// concurrent in-place catalog update: `ON DATABASE` (datfrozenxid via
+			// VACUUM, design 0118-0098) or `ON [TABLE] <name>` (relhasindex via ALTER
+			// TABLE ADD PRIMARY KEY, design 0118-0109). The default GRANT object class
+			// is TABLE, so a bare `ON <ident>` is a table grant.
 			databaseACL := false
+			tableACL := ""
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break
 				}
-				if strings.EqualFold(p.cur().Value, "on") && strings.EqualFold(p.peek(1).Value, "database") {
-					databaseACL = true
+				if strings.EqualFold(p.cur().Value, "on") {
+					next := p.peek(1)
+					switch {
+					case strings.EqualFold(next.Value, "database"):
+						databaseACL = true
+					case strings.EqualFold(next.Value, "table"):
+						// `ON TABLE <name>` — the name follows the TABLE keyword.
+						tableACL = grantObjectName(p.peek(2), p.peek(3), p.peek(4))
+					case grantNonTableClass(next.Value):
+						// SCHEMA/SEQUENCE/FUNCTION/… — not a per-table ACL change.
+					default:
+						// Default object class is TABLE: `ON <name>`.
+						tableACL = grantObjectName(next, p.peek(2), p.peek(3))
+					}
 				}
 				p.advance()
 			}
-			return &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value), DatabaseACL: databaseACL}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value), DatabaseACL: databaseACL, TableACL: tableACL}, nil
 		case "comment":
 			p.advance() // consume "comment" token
 			// COMMENT ON {TABLE|INDEX|COLUMN|CONSTRAINT} … IS 'text'|NULL

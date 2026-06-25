@@ -1745,6 +1745,18 @@ type InMemory struct {
 	// database-wide VACUUM wait on it (mvcc.WaitForXID). Atomic so the VACUUM
 	// reader never contends on c.mu. Design 0118-0098 (intra-grant-inplace-db).
 	dbACLChangeXID atomic.Uint32
+
+	// tableACLChangeXID maps a table OID → the XID of the most recent transaction
+	// that performed a GRANT/REVOKE … ON [TABLE] <name> (a pg_class ACL change).
+	// As with dbACLChangeXID, PostgreSQL records no heavyweight lock for the ACL
+	// change — its lock is the pg_class tuple's xmax — so a concurrent in-place
+	// update of the same row (ALTER TABLE ADD PRIMARY KEY setting relhasindex via
+	// heap_inplace_update) must wait for that XID to commit/abort. goopg has no
+	// real pg_class heap tuple, so we record the writer XID here and have ADD
+	// PRIMARY KEY wait on it (mvcc.WaitForXID). Design 0118-0109
+	// (intra-grant-inplace).
+	tableACLChangeXID   map[uint32]uint32
+	tableACLChangeXIDMu sync.Mutex
 }
 
 // extensionRow is one runtime CREATE EXTENSION record backing pg_extension.
@@ -8024,6 +8036,29 @@ func (c *InMemory) SetDatabaseACLChangeXID(xid storage.TransactionID) {
 // PostgreSQL's heap_inplace_update_scan waiting on the catalog tuple's xmax.
 func (c *InMemory) DatabaseACLChangeXID() storage.TransactionID {
 	return storage.TransactionID(c.dbACLChangeXID.Load())
+}
+
+// SetTableACLChangeXID records xid as the writer of the most recent
+// GRANT/REVOKE … ON [TABLE] for the relation identified by oid (a pg_class ACL
+// change). See the tableACLChangeXID field comment. Design 0118-0109.
+func (c *InMemory) SetTableACLChangeXID(oid, xid uint32) {
+	c.tableACLChangeXIDMu.Lock()
+	defer c.tableACLChangeXIDMu.Unlock()
+	if c.tableACLChangeXID == nil {
+		c.tableACLChangeXID = make(map[uint32]uint32)
+	}
+	c.tableACLChangeXID[oid] = xid
+}
+
+// TableACLChangeXID returns the writer XID of the most recent GRANT/REVOKE …
+// ON [TABLE] for the relation oid, or InvalidTransactionID (0) if none. ALTER
+// TABLE ADD PRIMARY KEY consults it and waits (mvcc.WaitForXID) so its in-place
+// relhasindex update serialises behind a concurrent uncommitted ACL change,
+// mirroring PostgreSQL's heap_inplace_update waiting on the pg_class tuple xmax.
+func (c *InMemory) TableACLChangeXID(oid uint32) storage.TransactionID {
+	c.tableACLChangeXIDMu.Lock()
+	defer c.tableACLChangeXIDMu.Unlock()
+	return storage.TransactionID(c.tableACLChangeXID[oid])
 }
 
 // AllUserViews returns deep copies of every user-created non-materialized view.

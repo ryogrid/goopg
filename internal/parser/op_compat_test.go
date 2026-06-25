@@ -4,6 +4,41 @@ import (
 	"testing"
 )
 
+// TestParseGrantTableACL verifies a GRANT/REVOKE on a table records the target
+// relation name in CompatNoopStmt.TableACL (design 0118-0109,
+// intra-grant-inplace) while a GRANT on a non-table object class or ON DATABASE
+// leaves it empty.
+func TestParseGrantTableACL(t *testing.T) {
+	cases := []struct {
+		sql      string
+		wantTbl  string
+		wantDBup bool
+	}{
+		{"GRANT SELECT ON intra_grant_inplace TO PUBLIC", "intra_grant_inplace", false},
+		{"GRANT SELECT ON TABLE foo TO bar", "foo", false},
+		{"REVOKE SELECT ON public.foo FROM bar", "foo", false},
+		{"GRANT TEMP ON DATABASE postgres TO PUBLIC", "", true},
+		{"GRANT USAGE ON SCHEMA s TO bar", "", false},
+		{"GRANT USAGE ON SEQUENCE seq1 TO bar", "", false},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q) error: %v", tc.sql, err)
+		}
+		ns, ok := stmts[0].(*CompatNoopStmt)
+		if !ok {
+			t.Fatalf("%q: expected *CompatNoopStmt, got %T", tc.sql, stmts[0])
+		}
+		if ns.TableACL != tc.wantTbl {
+			t.Errorf("%q: TableACL = %q, want %q", tc.sql, ns.TableACL, tc.wantTbl)
+		}
+		if ns.DatabaseACL != tc.wantDBup {
+			t.Errorf("%q: DatabaseACL = %v, want %v", tc.sql, ns.DatabaseACL, tc.wantDBup)
+		}
+	}
+}
+
 func TestParseCreateOperatorArgTypes(t *testing.T) {
 	sql := `CREATE OPERATOR @#@
         (leftarg = int8, rightarg = int8, procedure = int8xor)`

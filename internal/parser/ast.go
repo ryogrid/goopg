@@ -1633,6 +1633,14 @@ type CompatNoopStmt struct {
 	// (Catalog.SetDatabaseACLChangeXID) and a concurrent database-wide VACUUM
 	// waits on it before advancing datfrozenxid in place. Design 0118-0098.
 	DatabaseACL bool
+	// TableACL holds the relation name of a GRANT/REVOKE … ON [TABLE] <name>
+	// statement (the default object class for GRANT is TABLE). Like DatabaseACL,
+	// such an ACL change takes no heavyweight lock — its lock is the pg_class
+	// tuple's xmax — so the executor records the writer XID keyed by the table
+	// OID (Catalog.SetTableACLChangeXID) and a concurrent in-place pg_class update
+	// (ALTER TABLE ADD PRIMARY KEY setting relhasindex) waits on it. Empty when the
+	// grant targets a non-table object class. Design 0118-0109 (intra-grant-inplace).
+	TableACL string
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }

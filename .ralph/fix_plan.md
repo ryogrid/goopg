@@ -1356,3 +1356,20 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       a probe of remaining deferred specs — cheapest available promotion. Stable
       across 8 runs. **Remaining M0118-0009 (all Effort-L unbuilt subsystems):**
       `intra-grant-inplace{,-db only -db done}`, `stats`, `prepared-transactions{,-cic}`.
+      **2026-06-25 (design 0118-0109, enabler — NOT a promotion):**
+      `intra-grant-inplace` permutation 1 now byte-identical (first divergence
+      L17→L62). `ALTER TABLE … ADD PRIMARY KEY` (an in-place `relhasindex=true`
+      update on the `pg_class` tuple) must `<waiting ...>` behind a concurrent
+      uncommitted `GRANT SELECT ON <table>`; PG takes no heavyweight lock — its
+      lock IS the catalog tuple `xmax`. Replayed the `xmax` wait (the pg_class
+      sibling of 0118-0098's database case): parser resolves a table-target
+      GRANT/REVOKE into `CompatNoopStmt.TableACL` (`grantObjectName`/
+      `grantNonTableClass`); `execCompatNoop` records the writer XID keyed by
+      table OID (`InMemory.SetTableACLChangeXID`, mutex-guarded `map[oid]xid`);
+      `execAlterTableAddPrimaryKey` calls `waitForTableACLChange`→`mvcc.WaitForXID`
+      before building the index. Spec stays `defer` — perms 3,4,7–11 need
+      `pg_class` rowmark locking (`SELECT relhasindex … FOR NO KEY UPDATE`/`FOR
+      UPDATE`/`FOR KEY SHARE` + `DELETE FROM pg_class` taking a real tuple lock on
+      a virtual catalog row + `LockTuple` deadlock detection), the Effort-L runtime
+      shared-catalog MVCC-tuple-lock core. `TestParseGrantTableACL`; non-regression
+      IntraGrantInplaceDb + TruncateConflict strict PASS.
