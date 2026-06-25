@@ -386,6 +386,27 @@ func TestPort_IsolationAsyncNotify(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/async-notify.spec")
 }
 
+// TestPort_IsolationTimeouts exercises the timeouts spec (M0118-0009): the
+// statement_timeout and lock_timeout GUCs against both table-level (LOCK TABLE)
+// and row-level (DELETE on a row a concurrent UPDATE holds) lock waits. When a
+// waiter blocks behind a conflicting lock, whichever of the two timeouts is set
+// shorter fires first and cancels the statement with the matching SQLSTATE —
+// "canceling statement due to statement timeout" (57014) or "canceling
+// statement due to lock timeout" (55P03). The eight permutations cover every
+// combination of {statement-only, lock-only, lock-shorter, statement-shorter} ×
+// {table lock, row lock}. The blocked steps are marked (*) upstream because the
+// short 10ms timeouts mean the isolation tester may cancel the step before it
+// observes it as "waiting"; goopg reproduces PG 18.3 byte-for-byte across all
+// permutations with no engine change (statement_timeout/lock_timeout already
+// drive query cancellation), so this spec is promoted to pass-required.
+func TestPort_IsolationTimeouts(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_timeouts")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/timeouts.spec")
+}
+
 // TestPort_IsolationInheritTemp exercises the inherit-temp spec (M0118-0008):
 // an inheritance tree whose children are TEMPORARY tables created in different
 // sessions. Each backend owns its own temp namespace, so s1's scan/UPDATE/

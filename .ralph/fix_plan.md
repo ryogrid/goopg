@@ -1331,3 +1331,12 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       fold now gated on a row-local constant key (`exprRefsColumnOrOuter`). Sibling
       latent fix: lazy hash join preserves build-side heap ctids for FOR UPDATE over
       the hash-join variant. Detail in the M0118-0007 entry above.
+      **2026-06-25 (design 0118-0107): `timeouts` PROMOTED — pass-required via
+      `TestPort_IsolationTimeouts`.** `statement_timeout`/`lock_timeout` against
+      table-level (`LOCK TABLE`) and row-level (`DELETE` behind a concurrent
+      `UPDATE`) lock waits; all 8 permutations byte-identical to PG 18.3 with NO
+      engine change (the shorter of the two timeouts fires first → 57014 statement
+      timeout / 55P03 lock timeout; blocked steps `(*)`-marked upstream). Found via
+      a probe of remaining deferred specs — cheapest available promotion. Stable
+      across 8 runs. **Remaining M0118-0009 (all Effort-L unbuilt subsystems):**
+      `intra-grant-inplace{,-db only -db done}`, `stats`, `prepared-transactions{,-cic}`.
