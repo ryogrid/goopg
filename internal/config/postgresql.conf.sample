@@ -213,7 +213,10 @@
 # - Process Title / I/O Timing -
 
 #track_activities = on                  # collect info in pg_stat_activity
+#track_counts = on                      # collect per-relation row statistics
+#track_functions = none                 # none | pl | all
 #track_io_timing = off                  # collect per-I/O wait timing
+#stats_fetch_consistency = cache        # none | cache | snapshot
 #jit = off                              # allow JIT compilation
 #compute_query_id = off                 # compute query identifiers
 #plan_cache_mode = auto                 # plan cache mode

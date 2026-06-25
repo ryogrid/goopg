@@ -1581,4 +1581,26 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `CreateTrigger`/`DeadlockSimple`/`DeadlockSoft`/`ReceiptReport`/
       `ProjectManager` + plpgsql procedure/DO-txctl tests PASS; `-race`
       executor/catalog/plpgsql green; CSV D-002 flipped failed→pass + md regen.
-      **Remaining M0118-0009:** `stats` (pg_stat_* cumulative subsystem, Effort-L).
+      **2026-06-25 (design 0118-0123, enabler — NOT a promotion): `stats` rung 1.**
+      The last failed M0118-0009 spec, `stats`, exercises the `pgstat` cumulative-
+      statistics subsystem. Every permutation aborted in global `setup` at
+      `SELECT pg_stat_force_next_flush()` (`42883` — pg_proc seed has the rows but
+      `evalFuncCall` had no case → fell through to `evalStoredRoutineFuncCall`),
+      and the `SET track_functions/track_counts/stats_fetch_consistency` steps hit
+      unregistered GUCs. Landed three faithful low-blast pieces: (1) registered the
+      three GUCs (`track_counts` bool/on/SUSET; `track_functions` enum
+      none|pl|all/none/SUSET; `stats_fetch_consistency` enum
+      none|cache|snapshot/cache/USERSET) mirroring `guc_tables.c` + matching
+      `postgresql.conf.sample` lines (M0108 `TestSampleConfigCoversRegistry`
+      parity); (2) `pg_stat_force_next_flush()` → void no-op (goopg has no async
+      stats collector to flush); (3) `pg_stat_clear_snapshot()` → void no-op (no
+      per-txn stats snapshot cache). First divergence advanced from global-setup
+      failure (perm 0) → first permutation's `pg_stat_get_function_calls does not
+      exist`. Spec stays `defer`. Remaining rungs (each Effort-L): runner echo of a
+      setup query's result block; function-stats counters/getters +
+      `pg_stat_reset_single_function_counters`; relation tuple stats +
+      `pg_stat_get_xact_*`; `pg_stat_reset()`; real snapshot caching; 2PC stats
+      interaction (rides 0118-0110). Tests `TestPgStatFlushSnapshotVoidNoops`
+      (executor) + `TestStatsGUCs` (config).
+      **Remaining M0118-0009:** `stats` (pg_stat_* cumulative subsystem, Effort-L —
+      rung 1 enabler landed 0118-0123; the counters/getters subsystem remains).

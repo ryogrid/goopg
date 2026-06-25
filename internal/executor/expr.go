@@ -9226,6 +9226,21 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// against the stored *acl column. M0110-0001 / DU-002 slice 2.
 	case "acldefault":
 		return evalAclDefault(x, row, ctx)
+	// pg_stat_force_next_flush() → void: forces the next cumulative-statistics
+	// flush in the current backend to proceed unconditionally (upstream skips a
+	// flush if the rate-limit interval has not elapsed). goopg has no separate
+	// statistics-collector process to flush to — pending stats are applied
+	// synchronously — so this is a faithful no-op. The `stats` isolation spec
+	// calls it between mutating and observing steps to make pending stats
+	// visible; that ordering already holds in goopg. (M0118-0009 stats enabler.)
+	case "pg_stat_force_next_flush":
+		return NewStringDatum(""), nil
+	// pg_stat_clear_snapshot() → void: discards the current transaction's cached
+	// statistics snapshot (used with stats_fetch_consistency = 'snapshot'/'cache').
+	// goopg reads cumulative stats directly with no per-transaction snapshot
+	// cache, so this is a faithful no-op. (M0118-0009 stats enabler.)
+	case "pg_stat_clear_snapshot":
+		return NewStringDatum(""), nil
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.

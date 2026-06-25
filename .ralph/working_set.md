@@ -1,34 +1,39 @@
 (idle — nothing in flight)
 
-Last loop (#64) COMPLETE + committed: PROMOTED `index-only-bitmapscan` (M0118-0002,
-design 0118-0122). The spec is an upstream regression guard for an unsound
-index-only bitmap heap scan; its real check is the FETCH row counts after a
-concurrent VACUUM marks dead pages all-visible (`s1_fetch_1`→1 row,
-`s1_fetch_all`→0 rows). goopg already produced those. The SOLE remaining blocker
-was step `s1_explain`: `EXPLAIN (COSTS OFF) DECLARE foo ... CURSOR FOR <query>`
-raised `0A000 unsupported statement type *parser.DeclareCursorStmt` because
-`planner.Plan`'s `ExplainStmt` case planned `s.Inner` directly.
+Last loop (#65) COMPLETE + committed: `stats` spec enabler rung 1 (M0118-0009,
+design 0118-0123). `stats.spec` is the LAST of the 4 remaining failed isolation
+specs (all Effort-L unbuilt subsystems: also predicate-gin/predicate-gist =
+GIN/GiST AMs + new types; deadlock-parallel = parallel-worker lock groups).
 
-Fix (1 site): `internal/planner/planner.go` ExplainStmt case now unwraps a
-`DeclareCursorStmt` inner to its `.Query` before planning (PG
-ExplainOneUtility→ExplainOneQuery). Key insight: `normalizeIsoOutput` STRIPS the
-EXPLAIN plan block on both sides (established plan-strategy policy, same as
-merge-join), so goopg rendering no BitmapOr node is irrelevant — the prior
-"must render BitmapOr byte-for-byte" assessment was an over-estimate.
+This loop: every `stats` permutation aborted in global setup at
+`SELECT pg_stat_force_next_flush()` (42883 — pg_proc seed had the rows but
+`evalFuncCall` had no case → fell to `evalStoredRoutineFuncCall`), and the
+`SET track_functions/track_counts/stats_fetch_consistency` steps hit
+unregistered GUCs. Landed: (1) registered those 3 GUCs in
+`internal/config/defaults.go` (+ `postgresql.conf.sample` lines for the M0108
+`TestSampleConfigCoversRegistry` parity gate) mirroring guc_tables.c;
+(2) `pg_stat_force_next_flush()` + `pg_stat_clear_snapshot()` → faithful void
+no-ops in `evalFuncCall` (`internal/executor/expr.go`, return
+`NewStringDatum("")`). First divergence advanced perm-0 setup-failure → first
+permutation's `pg_stat_get_function_calls does not exist`. Spec stays defer.
 
-Landed: planner fix + `TestExplainDeclareCursorExplainsInnerQuery` (executor unit)
-+ strict `TestPort_IsolationIndexOnlyBitmapscan` + CSV failed→pass + regen
-inventory/coverage md + design 0118-0122 + README index + fix_plan M0118-0002 note.
-Isolation tally now **117 pass / 4 failed**.
+Files: internal/config/{defaults.go, postgresql.conf.sample, stats_gucs_test.go},
+internal/executor/{expr.go, pg_stat_flush_test.go}, docs/design/0118-0123 +
+README, fix_plan, ledger.
 
-REMAINING failed isolation specs (all genuinely Effort-L unbuilt subsystems):
-- `deadlock-parallel`  — M0118-0004; needs a lock-group abstraction goopg lacks.
-- `predicate-gin`      — M0118-0002; needs int[] type + GIN AM + AM-grain SIREAD.
-- `predicate-gist`     — M0118-0002; needs point type + GiST AM + AM-grain SIREAD.
-- `stats`              — M0118-0009; needs the pg_stat_* cumulative subsystem.
-(`predicate-hash` already promoted; it over-detected before — coarse relation-grain
-SIREAD — but is now strict per memory `goopg_hash_index_ssi_bucket_locking`.)
+NEXT rung for `stats` (each Effort-L; pick one per loop):
+- runner: echo a global/session SETUP query's result block (PG's isolationtester
+  prints the setup `SELECT pg_stat_force_next_flush()` block once before steps;
+  goopg's runner does not — this is the L4 divergence). Probe via a throwaway
+  `internal/testport/zz_probe_test.go` running RunAndCompare on stats.spec.
+- function stats: a cluster-global per-function counter store keyed by func OID,
+  incremented on user-function invocation gated by `track_functions`, +
+  `pg_stat_get_function_calls/total_time/self_time(oid)` +
+  `pg_stat_reset_single_function_counters(oid)`. This is the heart of the spec.
+- then: relation tuple stats + pg_stat_get_xact_*; pg_stat_reset(); real
+  stats_fetch_consistency snapshot caching; 2PC stats (rides 0118-0110).
 
-Gates run: build clean; planner units PASS; executor explain family PASS; strict
-TestPort_IsolationIndexOnlyBitmapscan PASS; ralph-state-guard OK; pgbench smoke =
-pre-commit hook.
+Gates run this loop: build clean; TestPgStatFlushSnapshotVoidNoops +
+TestStatsGUCs + TestSampleConfigCoversRegistry PASS; go test
+./internal/config/ ./internal/executor/ PASS; ralph-state-guard (pending);
+pgbench smoke = pre-commit hook.
