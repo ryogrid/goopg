@@ -1468,6 +1468,24 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `DELETE FROM pg_class` virtual-tuple semantics. Non-regression
       IntraGrantInplaceDb/TruncateConflict/TuplelockUpgradeNoDeadlock/DeadlockHard
       strict PASS; `-race` lock/deadlock executor tests green.
-      **Remaining M0118-0009:** `intra-grant-inplace` (perms 8–10 — victim-XID
-      deactivation + plpgsql REVOKE + DELETE FROM pg_class), `stats` (pg_stat_*
-      subsystem).
+      **2026-06-25 (design 0118-0116, enabler — NOT a promotion):**
+      `intra-grant-inplace` permutation 9 now byte-identical (first divergence
+      L206→L235). Perm 9 (`b1 grant1 b3 sfu3 revoke4 c1 r3`) needed two fixes:
+      (1) the plpgsql body parser rejected a bare `REVOKE` inside `revoke4`'s
+      `DO $$ … $$` block (`GRANT`/`REVOKE` are not reserved keywords, so a leading
+      `REVOKE` fell through to `parseAssign` → `expected ':=' or '=' after
+      "revoke"` BEFORE the EXCEPTION handler could run) — added a leading
+      `grant`/`revoke`-ident case to `parseStmt` routing to `parseSQLStmt` (general
+      fix: GRANT/REVOKE work in any plpgsql function/DO body now;
+      `TestParseGrantRevokeEmbeddedSQL`); (2) `sfu3`'s `pg_class` rowmark
+      (`SELECT … FOR UPDATE`) completed immediately instead of `<waiting ...>`
+      behind grant1's uncommitted ACL change — refactored `waitForTableACLChange`
+      into the free `waitTableACLChange(ctx, oid)` and made
+      `lockRowsOp.maybeRecordPgClassRowMark` record the mark FIRST (so a peer
+      REVOKE blocks behind it) THEN await the table's ACL `xmax` (PG order:
+      acquire LockTuple, then await tuple xmax). Blast radius nil (rowmark wait
+      reached only for `pg_class` + `oid=<const>`; no-op with no pending ACL
+      change). Spec stays `defer` — perm 10 (`drop1` = `DELETE FROM pg_class`)
+      needs virtual-catalog tuple-delete + `SearchSysCacheLocked1` find-then-none.
+      **Remaining M0118-0009:** `intra-grant-inplace` (perm 10 — DELETE FROM
+      pg_class virtual-tuple delete), `stats` (pg_stat_* subsystem).

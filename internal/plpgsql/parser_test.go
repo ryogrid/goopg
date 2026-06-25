@@ -631,3 +631,29 @@ func TestParseExecuteIntoStrict(t *testing.T) {
 		t.Errorf("non-strict IntoVar = %q, want %q", ex2.IntoVar, "v_ret")
 	}
 }
+
+// TestParseGrantRevokeEmbeddedSQL: GRANT/REVOKE in a PL/pgSQL body parse as
+// embedded SQL statements (not bare-identifier assignments). The intra-grant-
+// inplace spec's revoke4 step wraps `REVOKE … FROM PUBLIC;` inside a DO block;
+// before M0118-0009 this failed with "expected ':=' or '=' after revoke".
+func TestParseGrantRevokeEmbeddedSQL(t *testing.T) {
+	for _, sql := range []string{
+		"BEGIN REVOKE SELECT ON intra_grant_inplace FROM PUBLIC; END",
+		"BEGIN GRANT SELECT ON intra_grant_inplace TO PUBLIC; END",
+	} {
+		blk, err := Parse(sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", sql, err)
+		}
+		if len(blk.Statements) != 1 {
+			t.Fatalf("Parse(%q): Statements len = %d, want 1", sql, len(blk.Statements))
+		}
+		stmt, ok := blk.Statements[0].(*SQLStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): stmt = %T, want *SQLStmt", sql, blk.Statements[0])
+		}
+		if !strings.HasSuffix(stmt.SQL, "PUBLIC") {
+			t.Errorf("Parse(%q): SQL = %q, want it to capture the full statement", sql, stmt.SQL)
+		}
+	}
+}

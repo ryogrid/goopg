@@ -1,30 +1,34 @@
 (idle — nothing in flight)
 
-Last loop (#56) COMPLETE: committed loop #55's verified-but-uncommitted WIP for
-M0118-0009 — intra-grant-inplace ENABLER (design 0118-0115, NOT a promotion). Loop
-#55 hit a usage limit mid-task (progress.json showed api_limit); the code + design +
-test were complete and correct but never committed. This loop verified and landed it.
+Last loop (#57) COMPLETE + committed: M0118-0009 intra-grant-inplace ENABLER
+(design 0118-0116, NOT a promotion). Made permutation 9 byte-identical; first
+divergence advanced L206 → L235 (now perm 10). Spec stays `defer`.
 
-What landed (design 0118-0115, intra-grant-inplace perm-8 ordering):
-- mvcc.Manager.ReleaseXIDWaiters(xid): records xid in releasedWaiterXIDs set + broadcasts
-  commitCond; xidActiveWithSubxact returns false for a released XID (and its top parent)
-  WITHOUT clearing the proc-array slot. finish() clears the marker. Snapshot visibility
-  NOT consulted against the set (victim is write-less).
-- Context.DeadlockVictim: set only in waitPgClassInplaceXID on cycle detection; reset in
-  wire dispatch per-statement block.
-- connTxState.AbortInPlaceOnFail(mgr): calls ReleaseXIDWaiters(currentTx.XID), gated on
-  SavepointDepth()==0. Called from dispatch.go failure path ONLY when DeadlockVictim set.
-- Result: perms 1-8 byte-identical; first divergence advanced L184 → L206 (verified via
-  throwaway probe). Spec stays `defer`.
+What landed (perm 9 = `b1 grant1 b3 sfu3 revoke4 c1 r3`):
+- plpgsql parser: `parseStmt` now routes a leading `grant`/`revoke` identifier to
+  `parseSQLStmt` (they're not reserved keywords, so a bare REVOKE in revoke4's
+  `DO $$ … $$` block previously hit parseAssign → "expected ':=' or '=' after
+  revoke" BEFORE the EXCEPTION handler). General fix: GRANT/REVOKE now parse in
+  any plpgsql function/DO body. Unit: TestParseGrantRevokeEmbeddedSQL.
+- executor: refactored `ddlOp.waitForTableACLChange` into free func
+  `waitTableACLChange(ctx, tableOID)`; `lockRowsOp.maybeRecordPgClassRowMark`
+  now records the rowmark FIRST (so peer REVOKE blocks behind it via
+  waitForPgClassRowMarks) THEN awaits the table's ACL xmax (PG: acquire LockTuple,
+  then await tuple xmax). Returns *ExecError, propagated by drainAndStamp.
+  Gated on pg_class + oid=<const> → nil blast radius for user-table FOR UPDATE.
 
-Remaining intra-grant-inplace gaps (perms 9-10, distinct unbuilt subsystems):
-- perm9: revoke4 is `DO $$ BEGIN REVOKE … END $$` — plpgsql parser rejects bare REVOKE in
-  a DO body ("invalid PL/pgSQL DO body: ... expected ':=' or '=' after revoke"); also needs
-  the REVOKE to take a pg_class rowmark + await ACL/rowmark xmax (sfu3-after-grant1).
-- perm10: drop1 = `DELETE FROM pg_class WHERE relname=…` — virtual-pg_class tuple delete
-  (deferred drop at commit) + SearchSysCacheLocked1 find-then-none "cache lookup failed".
+Remaining intra-grant-inplace gap (perm 10, distinct unbuilt subsystem):
+- perm10 = `b1 drop1 b3 sfu3 revoke4 c1 r3`: drop1 = `DELETE FROM pg_class WHERE
+  relname='intra_grant_inplace'` — virtual-catalog tuple delete (deferred drop at
+  commit) recording a delete xmax sfu3 must wait on; sfu3 then returns (0 rows)
+  and revoke4 finds the relation gone (`WARNING: got: cache lookup failed for
+  relation REDACTED`). Needs virtual pg_class row delete + SearchSysCacheLocked1
+  find-then-none. Likely a `SetTablePgClassDeleteXID`-style store mirroring the
+  ACL-xmax store + waitTableACLChange, plus relation-gone detection in the REVOKE
+  path. Resume here for perm 10.
 
-Other failing M0118 specs (distinct unbuilt subsystems): index-only-bitmapscan
-(EXPLAIN DECLARE CURSOR + BitmapOr plan), predicate-gin/gist (GIN/GiST AMs),
-deadlock-parallel (lock-group abstraction), fk-partitioned-1/2 (ATTACH PARTITION +
-partitioned-FK enforcement), stats (pg_stat_* cumulative subsystem).
+Other remaining M0118-0009 spec: `stats` (pg_stat_* cumulative subsystem,
+Effort-L). Other failing M0118 specs (distinct unbuilt subsystems):
+index-only-bitmapscan (EXPLAIN DECLARE CURSOR + BitmapOr), predicate-gin/gist
+(GIN/GiST AMs), deadlock-parallel (lock-group), fk-partitioned-1/2 (ATTACH
+PARTITION + partitioned-FK).

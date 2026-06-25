@@ -7096,27 +7096,44 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 // where `addk2` is the deadlock victim). Returns a non-nil *ExecError only on
 // a deadlock or lock-timeout; nil in the common (no-wait / clean-wait) case.
 func (o *ddlOp) waitForTableACLChange(tbl *catalog.Table) *ExecError {
-	im, ok := o.ctx.Catalog.(*catalog.InMemory)
-	if !ok || o.ctx.TxnMgr == nil || tbl == nil || o.ctx.Ctx == nil {
+	if tbl == nil {
 		return nil
 	}
-	xid := im.TableACLChangeXID(tbl.OID)
+	return waitTableACLChange(o.ctx, tbl.OID)
+}
+
+// waitTableACLChange is the shared core of waitForTableACLChange: it blocks
+// until any uncommitted GRANT/REVOKE … ON the table with OID tableOID has
+// committed or aborted (the pg_class-tuple "xmax" recorded by execCompatNoop).
+// Two callers serialise on the same recorded writer XID: an in-place catalog
+// update (ALTER TABLE ADD PRIMARY KEY → heap_inplace_update) and an explicit
+// pg_class rowmark (SELECT … FROM pg_class … FOR UPDATE/NO KEY UPDATE), which
+// must block behind a concurrent uncommitted ACL change exactly as PG's tuple
+// lock waits on the pg_class tuple xmax (intra-grant-inplace perm 9: sfu3's FOR
+// UPDATE on pg_class waits behind grant1). Deadlock-aware via
+// waitPgClassInplaceXID. Design 0118-0116 (intra-grant-inplace perm 9).
+func waitTableACLChange(ctx *Context, tableOID uint32) *ExecError {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || ctx.TxnMgr == nil || ctx.Ctx == nil {
+		return nil
+	}
+	xid := im.TableACLChangeXID(tableOID)
 	if xid == storage.InvalidTransactionID {
 		return nil
 	}
 	// Materialise our writer XID so the edge we register is observable by a
 	// peer (the GRANT) closing the deadlock cycle.
-	_ = o.ctx.MaterializeWriterXID()
-	if xid == o.ctx.Tx.XID {
+	_ = ctx.MaterializeWriterXID()
+	if xid == ctx.Tx.XID {
 		return nil
 	}
 	// A holder in this transaction's own tree (a savepoint) never blocks us.
-	selfTop := o.ctx.TxnMgr.TopLevelXid(o.ctx.Tx.XID)
+	selfTop := ctx.TxnMgr.TopLevelXid(ctx.Tx.XID)
 	if selfTop != storage.InvalidTransactionID &&
-		o.ctx.TxnMgr.TopLevelXid(xid) == selfTop {
+		ctx.TxnMgr.TopLevelXid(xid) == selfTop {
 		return nil
 	}
-	if dl, ee := waitPgClassInplaceXID(o.ctx, xid); ee != nil {
+	if dl, ee := waitPgClassInplaceXID(ctx, xid); ee != nil {
 		return ee
 	} else if dl {
 		return &ExecError{Code: "40P01", Message: "deadlock detected"}

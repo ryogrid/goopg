@@ -593,7 +593,9 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	// instead record the rowmark in the catalog so a concurrent in-place catalog
 	// update (ALTER TABLE ADD PRIMARY KEY → relhasindex) waits on it. Design
 	// 0118-0113.
-	o.maybeRecordPgClassRowMark()
+	if ee := o.maybeRecordPgClassRowMark(); ee != nil {
+		return ee
+	}
 	return nil
 }
 
@@ -601,34 +603,45 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 // LockRows targets pg_class with a single `oid = <const>` predicate. A no-op
 // for every other relation, so the normal heap row-lock path is byte-unchanged.
 // Design 0118-0113 (intra-grant-inplace).
-func (o *lockRowsOp) maybeRecordPgClassRowMark() {
+//
+// After recording the mark it serialises behind any concurrent uncommitted
+// GRANT/REVOKE on the same table, mirroring PG: SELECT … FROM pg_class … FOR
+// UPDATE acquires the tuple lock (the rowmark, recorded first so a peer
+// GRANT/REVOKE blocks behind it) then waits on the pg_class tuple xmax held by
+// the in-flight ACL change (intra-grant-inplace perm 9: sfu3 waits behind
+// grant1). Design 0118-0116. Returns a non-nil *ExecError only on a deadlock /
+// lock-timeout during that wait.
+func (o *lockRowsOp) maybeRecordPgClassRowMark() *ExecError {
 	if len(o.plan.Locks) == 0 || o.plan.Locks[0].Table == nil {
-		return
+		return nil
 	}
 	if o.plan.Locks[0].Table.OID != catalog.RelationRelationId {
-		return
+		return nil
 	}
 	im, ok := o.ctx.Catalog.(*catalog.InMemory)
 	if !ok {
-		return
+		return nil
 	}
 	relOID, ok := o.pgClassFilterOID()
 	if !ok {
-		return
+		return nil
 	}
 	// The locker must hold a real (materialised) XID so the in-place updater can
 	// WaitForXID on it.
 	if err := o.ctx.MaterializeWriterXID(); err != nil {
-		return
+		return nil
 	}
 	xid := uint32(o.writerXID())
 	if xid == 0 {
-		return
+		return nil
 	}
 	// Every row-lock strength conflicts with a concurrent in-place pg_class
 	// update (heap_inplace_update's no-key update) except FOR KEY SHARE.
 	conflicts := o.plan.Locks[0].Strength != planner.LockStrengthForKeyShare
 	im.AddPgClassRowMark(relOID, xid, conflicts)
+	// Now block behind any uncommitted ACL change on the same table — the
+	// rowmark is already recorded so a concurrent GRANT/REVOKE blocks behind us.
+	return waitTableACLChange(o.ctx, relOID)
 }
 
 // pgClassFilterOID extracts the relation OID from a `oid = <const>` equality in

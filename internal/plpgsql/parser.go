@@ -317,6 +317,15 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 	// RAISE [NOTICE|WARNING|ERROR|EXCEPTION] 'msg'. M0096-0012.
 	case t.Kind == parser.TokenIdent && strings.EqualFold(t.Value, "raise"):
 		return p.parseRaise()
+	// GRANT / REVOKE embedded in a PL/pgSQL body. The main SQL lexer keeps
+	// these as plain identifiers (no reserved keyword), so a bare `REVOKE
+	// SELECT ON t FROM PUBLIC;` would otherwise fall through to parseAssign
+	// and fail with "expected ':=' or '='". Route them to the embedded-SQL
+	// path like INSERT/UPDATE/etc. (the main parser resolves them to a
+	// CompatNoopStmt.TableACL). M0118-0009 (intra-grant-inplace perm 9).
+	case t.Kind == parser.TokenIdent &&
+		(strings.EqualFold(t.Value, "grant") || strings.EqualFold(t.Value, "revoke")):
+		return p.parseSQLStmt()
 	case t.Kind == parser.TokenIdent:
 		// Stage A 4b: bare identifier at statement start.
 		// Handle: ident := value (assignment)
