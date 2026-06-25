@@ -1,36 +1,27 @@
 (idle — nothing in flight)
 
-Last loop (#62) COMPLETE + committed: M0118-0005 `fk-partitioned-2`
-**PROMOTED** → pass (design 0118-0121). This CLOSES the M0118-0005 FK /
-referential-integrity isolation group (all 7 specs strict).
+Last loop (#63) COMPLETE + committed: reconciled the stale per-spec isolation
+inventory. Three specs were PROMOTED in prior loops (strict `runIsoSpecStrict`
+tests, suite-level CSV flipped) but their rows in
+`docs/test-port/postgres-oracle-target-inventory.csv` still read `failed`:
+- `fk-partitioned-2` (design 0118-0121, M0118-0005 group close)
+- `prepared-transactions` (design 0118-0112)
+- `prepared-transactions-cic` (design 0118-0111)
+Flipped all three failed→pass with proper promotion rationales; regenerated
+`postgres-oracle-target-inventory.md` + `upstream-isolation-coverage.md` via
+`go run ./cmd/gen-oracle-inventory` + `go run ./cmd/gen-isolation-coverage`.
+Both sources now consistent: **116 pass / 5 failed** isolation specs.
 
-Spec: an FK referencing a PARTITIONED table (`pfk(a) references ppk`, both
-list-partitioned). Two divergences fixed in `internal/executor/operators_fk.go`:
+REMAINING failed isolation specs (all genuinely Effort-L unbuilt subsystems —
+need dedicated full-gate sessions; probe each with a throwaway zz_probe test to
+rank by first-divergence cost before committing):
+- `deadlock-parallel`   — M0118-0004; needs a lock-group abstraction goopg lacks.
+- `index-only-bitmapscan` — M0118-0002; needs real Bitmap Heap Scan + BitmapOr +
+  EXPLAIN DECLARE CURSOR plan rendering. Enablers already landed: INSERT…SELECT
+  arity fix (0118-0038), VACUUM (TRUNCATE false) parse (0118-0108), cursor FETCH.
+- `predicate-gin`       — M0118-0002; needs int[] type + GIN AM + AM-grain SIREAD.
+- `predicate-gist`      — M0118-0002; needs point type + GiST AM + AM-grain SIREAD.
+- `stats`              — M0118-0009; needs the pg_stat_* cumulative subsystem
+  (pg_stat_force_next_flush + function-stats + stats_fetch_consistency + 2PC).
 
-- **Gap A (RR/SSI INSERT side):** `scanTableForMatchFKWait` waits on the parent
-  row's in-flight key-changing xmax, refreshes snapshot, re-scans — correct under
-  READ COMMITTED (row gone → 23503) but under REPEATABLE READ / SERIALIZABLE PG
-  raises `40001 could not serialize access due to concurrent update`
-  (heap_lock_tuple HeapTupleUpdated). Added: after the wait + move-partition
-  check, if `ctx.Tx.Isolation != ReadCommitted` && updater committed → 40001.
-- **Gap B (partitioned-parent DELETE naming):** `DELETE FROM ppk` enters
-  `enforceFKOnDelete` with the partitioned parent, firing parent-named
-  `assertNoChildRows` (ppk / pfk_a_fkey). PG fires the LEAF clone (ppk1 /
-  pfk_a_fkey_1). Fix: route deleted row to leaf via `routeToPartition`; skip the
-  parent-named NO ACTION/RESTRICT assert when the row lives in a partition leaf
-  (the unconditional `fkChildWaitForInFlightInsert` still gives `<waiting ...>`);
-  run `enforceFKOnDeletePartitionAncestor` from the leaf.
-- **Gap B follow-up (fk-snapshot regression):** routing exposed that
-  `fkDeleteAncestorPass` raised immediately, breaking fk-snapshot's legal
-  delete+re-insert under a DEFERRABLE INITIALLY DEFERRED FK. It now queues a
-  deduped deferred check + skips the immediate raise inside an explicit txn.
-
-Files: internal/executor/operators_fk.go,
-internal/testport/isolation_port_test.go (TestPort_IsolationFkPartitioned2),
-docs/test-port CSV+md, docs/design/0118-0121 + README.
-
-NEXT remaining M0118 (all Effort-L unbuilt subsystems): index-only-bitmapscan
-(real Bitmap Heap Scan + BitmapOr / EXPLAIN DECLARE CURSOR), predicate-gin/gist
-(int[]/point + GIN/GiST AMs), predicate-hash (coarse SIREAD over-detects),
-deadlock-parallel (lock-group), stats (pg_stat_* cumulative subsystem). Probe
-each with a throwaway zz_probe test first to rank by first-divergence cost.
+No code change this loop (docs/tracking only).
