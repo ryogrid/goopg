@@ -4309,6 +4309,99 @@ func newDeleteOp(p *planner.Delete) (*deleteOp, error) {
 	return &deleteOp{plan: p, scan: scan, pred: pred, idxScan: idxScan}, nil
 }
 
+// tryPgClassCatalogDelete handles `DELETE FROM pg_class WHERE { relname = '<rel>'
+// | oid = <n> }` as a transaction-deferred table drop (intra-grant-inplace perm
+// 10). PostgreSQL's heap_delete on the pg_class tuple stamps its delete xmax and
+// keeps the row visible until the deleting transaction commits; a concurrent
+// rowmark or in-place updater waits on that xmax, then finds the tuple gone once
+// the delete commits. goopg has no pg_class heap, so we record the deleting
+// transaction's writer XID as the pg_class delete xmax (a concurrent
+// SELECT … FOR UPDATE waits on it via waitTablePendingDrop) and defer the actual
+// catalog removal to COMMIT (the relation stays visible to other sessions until
+// then). Returns handled=true when the delete targeted pg_class and was applied
+// (or matched no live relation); false to fall through to the generic delete.
+// Design 0118-0117.
+func (o *deleteOp) tryPgClassCatalogDelete() (bool, error) {
+	if o.plan.Table == nil || o.plan.Table.OID != catalog.RelationRelationId {
+		return false, nil
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return false, nil
+	}
+	// Deferral requires an explicit transaction block — outside one (autocommit)
+	// no spec exercises this, so fall through to the generic (no-op) path rather
+	// than dropping the relation out from under the virtual catalog.
+	bsess, isBasic := o.ctx.Session.(*BasicSession)
+	if !isBasic || !bsess.InExplicitTransaction() {
+		return false, nil
+	}
+	oid, ok := o.pgClassDeleteTargetOID()
+	if !ok {
+		// Unsupported predicate shape, or the relname resolved to no relation:
+		// the delete matches no row. Treat as handled (0 rows) so we do not run
+		// the generic heap scan against the virtual catalog.
+		return true, nil
+	}
+	tbl, found := im.LookupTableByOID(oid)
+	if !found || tbl == nil {
+		return true, nil // already gone → 0 rows affected
+	}
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return false, err
+	}
+	// Record the pg_class delete xmax BEFORE deferring so a concurrent rowmark
+	// that records itself and then waits (waitTablePendingDrop) observes our XID.
+	im.SetTablePendingDropXID(tbl.OID, uint32(o.ctx.Tx.XID))
+	bsess.AddPendingTableDrop(PendingTableDrop{
+		Name:           parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name},
+		Table:          tbl,
+		SavepointDepth: bsess.SavepointDepth(),
+	})
+	o.rowsAffected++
+	return true, nil
+}
+
+// pgClassDeleteTargetOID extracts the relation OID targeted by a single
+// `relname = '<name>'` or `oid = <n>` equality predicate over pg_class. Returns
+// ok=false for any other shape, or when a relname does not resolve to a live
+// relation. Design 0118-0117 (intra-grant-inplace perm 10).
+func (o *deleteOp) pgClassDeleteTargetOID() (uint32, bool) {
+	bo, ok := o.pred.(*planner.BinaryOp)
+	if !ok || bo.Op != parser.OpEq {
+		return 0, false
+	}
+	cr, ok := bo.Left.(*planner.ColumnRef)
+	constExpr := bo.Right
+	if !ok {
+		if cr, ok = bo.Right.(*planner.ColumnRef); !ok {
+			return 0, false
+		}
+		constExpr = bo.Left
+	}
+	cols := o.plan.Table.Columns
+	if cr.Index < 0 || cr.Index >= len(cols) {
+		return 0, false
+	}
+	d, err := evalExpr(constExpr, nil, o.ctx)
+	if err != nil || d.IsNull() {
+		return 0, false
+	}
+	switch strings.ToLower(cols[cr.Index].Name) {
+	case "oid":
+		if d.Kind == KindInt && d.Int > 0 {
+			return uint32(d.Int), true
+		}
+	case "relname":
+		if name := d.StringValue(); name != "" {
+			if tbl, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Name: name}); ok && tbl != nil {
+				return tbl.OID, true
+			}
+		}
+	}
+	return 0, false
+}
+
 func (o *deleteOp) Schema() planner.Schema { return o.plan.ReturningSchema }
 
 // appendDeleteRetRow evaluates RETURNING expressions against the old row
@@ -4385,6 +4478,17 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		return o.deleteWithUsing()
 	}
 	o.done = true
+	// intra-grant-inplace perm 10: `DELETE FROM pg_class WHERE relname = '<rel>'`
+	// is a virtual-catalog tuple delete. goopg serves pg_class from the virtual
+	// builder (no heap), so the generic scan below would match nothing; handle it
+	// here as a transaction-deferred table drop that records the pg_class delete
+	// xmax a concurrent rowmark (SELECT … FROM pg_class … FOR UPDATE) waits on.
+	// Design 0118-0117.
+	if handled, herr := o.tryPgClassCatalogDelete(); herr != nil {
+		return nil, herr
+	} else if handled {
+		return nil, EOF
+	}
 	// M0093: DELETE is unconditionally a write — materialise the
 	// transaction's XID before the scan so foreign-lock checks see
 	// the real XID.

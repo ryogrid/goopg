@@ -136,6 +136,16 @@ type lockRowsOp struct {
 	// NOWAIT "could not obtain lock on row in relation \"%s\"" diagnostic with
 	// the upstream-canonical relation name. Resolved at Open from Locks[0].
 	lockRelName string
+
+	// pgClassRowMarkOID / pgClassRowMarkXID record the explicit pg_class rowmark
+	// this LockRows took up front in maybeRecordPgClassRowMark (so a concurrent
+	// GRANT/REVOKE blocks behind it during the wait). If the post-wait scan then
+	// yields no row — the relation's pg_class tuple was concurrently DELETEd and
+	// committed — PG holds no tuple lock, so we retract the mark immediately
+	// (ClearPgClassRowMark) and a peer waiting behind it proceeds without waiting
+	// for our transaction to end. Design 0118-0117 (intra-grant-inplace perm 10).
+	pgClassRowMarkOID uint32
+	pgClassRowMarkXID uint32
 }
 
 type pendingLockedRow struct {
@@ -639,9 +649,18 @@ func (o *lockRowsOp) maybeRecordPgClassRowMark() *ExecError {
 	// update (heap_inplace_update's no-key update) except FOR KEY SHARE.
 	conflicts := o.plan.Locks[0].Strength != planner.LockStrengthForKeyShare
 	im.AddPgClassRowMark(relOID, xid, conflicts)
+	o.pgClassRowMarkOID = relOID
+	o.pgClassRowMarkXID = xid
 	// Now block behind any uncommitted ACL change on the same table — the
 	// rowmark is already recorded so a concurrent GRANT/REVOKE blocks behind us.
-	return waitTableACLChange(o.ctx, relOID)
+	if ee := waitTableACLChange(o.ctx, relOID); ee != nil {
+		return ee
+	}
+	// Also block behind an uncommitted DROP TABLE deferred to COMMIT: PG's tuple
+	// lock waits on the pg_class delete xmax, then finds the tuple gone once the
+	// DROP commits. intra-grant-inplace perm 10 (sfu3 waits behind drop1). Design
+	// 0118-0117.
+	return waitTablePendingDrop(o.ctx, relOID)
 }
 
 // pgClassFilterOID extracts the relation OID from a `oid = <const>` equality in
@@ -806,6 +825,17 @@ func (o *lockRowsOp) drainAndStamp() error {
 		}
 		o.pending = append(o.pending, entry)
 		successCount++
+	}
+	// intra-grant-inplace perm 10: a pg_class rowmark recorded up front that ends
+	// up locking no tuple (the relation was concurrently DELETEd and committed
+	// during our wait, so the scan now yields 0 rows) holds no lock in PG —
+	// retract the mark so a peer GRANT/REVOKE blocked behind it proceeds at once.
+	// Design 0118-0117.
+	if len(o.pending) == 0 && o.pgClassRowMarkOID != 0 {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			im.ClearPgClassRowMark(o.pgClassRowMarkOID, o.pgClassRowMarkXID)
+		}
+		o.pgClassRowMarkOID = 0
 	}
 	return nil
 }

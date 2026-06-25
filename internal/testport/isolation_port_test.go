@@ -250,6 +250,27 @@ func TestPort_IsolationIntraGrantInplaceDb(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/intra-grant-inplace-db.spec")
 }
 
+// TestPort_IsolationIntraGrantInplace exercises the intra-grant-inplace spec
+// (M0118-0009, design 0118-0117). It verifies the pg_class-tuple-xmax
+// serialization for GRANT/REVOKE ACL changes, FOR UPDATE/SHARE rowmarks, the
+// in-place relhasindex update (ALTER TABLE ADD PRIMARY KEY), and a virtual-
+// catalog tuple DELETE — all of which take no heavyweight lock on the object
+// but serialise on the pg_class tuple's xmax. The capstone permutation 10
+// (`b1 drop1 b3 sfu3 revoke4 c1 r3`) issues `DELETE FROM pg_class WHERE
+// relname = …` as a transaction-deferred table drop: sfu3's FOR UPDATE rowmark
+// <waiting ...> behind the delete xmax, returns 0 rows once it commits (the
+// relation is gone), and revoke4 — blocked behind sfu3's tuple lock — finds the
+// relation gone and raises the internal "cache lookup failed for relation <oid>"
+// elog, which the spec's DO block EXCEPTION handler catches and re-raises as a
+// REDACTED WARNING. All 10 permutations byte-identical to PG 18.3.
+func TestPort_IsolationIntraGrantInplace(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_intra_grant")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/intra-grant-inplace.spec")
+}
+
 // TestPort_IsolationLockCommittedKeyupdate exercises the lock-committed-keyupdate
 // spec: a FOR KEY SHARE lock on a tuple whose key was UPDATEd by a concurrent
 // committed transaction. Unlike lock-committed-update (a no-key update, which is

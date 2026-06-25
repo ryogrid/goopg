@@ -1487,5 +1487,33 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       reached only for `pg_class` + `oid=<const>`; no-op with no pending ACL
       change). Spec stays `defer` — perm 10 (`drop1` = `DELETE FROM pg_class`)
       needs virtual-catalog tuple-delete + `SearchSysCacheLocked1` find-then-none.
-      **Remaining M0118-0009:** `intra-grant-inplace` (perm 10 — DELETE FROM
-      pg_class virtual-tuple delete), `stats` (pg_stat_* subsystem).
+      **2026-06-25 (design 0118-0117): `intra-grant-inplace` PROMOTED — all 10
+      permutations byte-identical to PG 18.3; `TestPort_IsolationIntraGrantInplace`
+      strict.** Closed perm 10 (`b1 drop1 b3 sfu3 revoke4 c1 r3`) where `drop1` is
+      the locally-adapted `DELETE FROM pg_class WHERE relname = …` (virtual-catalog
+      tuple delete). Six pieces: (1) new `tablePendingDropXID` catalog store (the
+      `pg_class` delete xmax, mirrors `tableACLChangeXID`); (2)
+      `deleteOp.tryPgClassCatalogDelete` routes `DELETE FROM pg_class WHERE
+      {relname|oid}=…` in an explicit txn to a transaction-deferred table drop —
+      records the delete xmax + defers removal to COMMIT via `AddPendingTableDrop`
+      (relation stays visible until then); (3) `maybeRecordPgClassRowMark` also
+      `waitTablePendingDrop` (shared deadlock-aware core `waitPgClassTupleXID`) and
+      RETRACTS its rowmark when the post-wait scan yields 0 rows
+      (`Catalog.ClearPgClassRowMark`) — PG holds no tuple lock when it locks
+      nothing; (4) `waitForPgClassRowMarks` now waits on the MARK's release
+      (`waitPgClassRowMarkReleased` polls the mark + keeps WFG deadlock check) not
+      the holder's whole txn (`WaitForXID`), so revoke4 unblocks the instant sfu3
+      releases — before r3; (5) the REVOKE re-checks `LookupTableByOID` after the
+      wait → `XX000 cache lookup failed for relation <oid>` (PG's
+      `SearchSysCacheLocked1` find-then-none); (6) three latent **plpgsql EXCEPTION**
+      fixes — `parseTopBlock`/`parseNestedBlock` now set `ExceptionBlock.TryBody`
+      (handlers were DEAD before: body ran as siblings so an error aborted before
+      any handler), the handler binds `SQLERRM`/`SQLSTATE` frame vars, and
+      `RAISE WARNING` routes to `AddWarning` (WARNING severity not NOTICE) — so the
+      DO block catches the elog and re-raises the REDACTED WARNING. Blast radius
+      nil. Gates: strict 10/10; non-regression `IntraGrantInplaceDb`/`RiTrigger`/
+      `EvalPlanQualTrigger`/`DeadlockHard`/`TuplelockUpgradeNoDeadlock`/
+      `CreateTrigger`/`DeadlockSimple`/`DeadlockSoft`/`ReceiptReport`/
+      `ProjectManager` + plpgsql procedure/DO-txctl tests PASS; `-race`
+      executor/catalog/plpgsql green; CSV D-002 flipped failed→pass + md regen.
+      **Remaining M0118-0009:** `stats` (pg_stat_* cumulative subsystem, Effort-L).

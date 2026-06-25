@@ -1758,6 +1758,19 @@ type InMemory struct {
 	tableACLChangeXID   map[uint32]uint32
 	tableACLChangeXIDMu sync.Mutex
 
+	// tablePendingDropXID maps a table OID → the XID of the in-flight transaction
+	// that issued a `DROP TABLE` deferred to COMMIT (the catalog row is kept
+	// visible until then). PostgreSQL's DROP performs a heap_delete on the
+	// pg_class tuple, stamping its xmax; a concurrent explicit rowmark
+	// (`SELECT … FROM pg_class … FOR UPDATE`) or in-place updater must wait on
+	// that xmax before proceeding, and once the DROP commits the tuple is gone so
+	// the locker finds no row. goopg has no real pg_class heap tuple, so the
+	// deferred DROP records its writer XID here and the pg_class rowmark waits on
+	// it (mvcc.WaitForXID), exactly like the ACL-change xmax above. Design
+	// 0118-0117 (intra-grant-inplace perm 10).
+	tablePendingDropXID   map[uint32]uint32
+	tablePendingDropXIDMu sync.Mutex
+
 	// pgClassRowMarks records explicit row-level locks taken on a pg_class tuple
 	// by `SELECT … FROM pg_class WHERE oid = <rel> FOR { KEY SHARE | NO KEY
 	// UPDATE | SHARE | UPDATE }`. PostgreSQL takes no heavyweight lock for such a
@@ -8084,6 +8097,47 @@ func (c *InMemory) TableACLChangeXID(oid uint32) storage.TransactionID {
 	return storage.TransactionID(c.tableACLChangeXID[oid])
 }
 
+// SetTablePendingDropXID records xid as the in-flight transaction that issued a
+// `DROP TABLE` deferred to COMMIT for the relation identified by oid. See the
+// tablePendingDropXID field comment. Design 0118-0117 (intra-grant-inplace perm
+// 10). Cleared by ClearTablePendingDropXID once the DROP is applied at COMMIT or
+// cancelled at ROLLBACK; a stale entry is harmless because the wait short-
+// circuits the moment the recorded XID is no longer active.
+func (c *InMemory) SetTablePendingDropXID(oid, xid uint32) {
+	if oid == 0 || xid == 0 {
+		return
+	}
+	c.tablePendingDropXIDMu.Lock()
+	defer c.tablePendingDropXIDMu.Unlock()
+	if c.tablePendingDropXID == nil {
+		c.tablePendingDropXID = make(map[uint32]uint32)
+	}
+	c.tablePendingDropXID[oid] = xid
+}
+
+// TablePendingDropXID returns the writer XID of the in-flight deferred DROP TABLE
+// for the relation oid, or InvalidTransactionID (0) if none. A pg_class rowmark
+// consults it and waits (mvcc.WaitForXID) so its FOR UPDATE/SHARE serialises
+// behind the concurrent uncommitted DROP, mirroring PostgreSQL's tuple lock
+// waiting on the pg_class tuple's delete xmax. Design 0118-0117.
+func (c *InMemory) TablePendingDropXID(oid uint32) storage.TransactionID {
+	c.tablePendingDropXIDMu.Lock()
+	defer c.tablePendingDropXIDMu.Unlock()
+	return storage.TransactionID(c.tablePendingDropXID[oid])
+}
+
+// ClearTablePendingDropXID drops the pending-DROP xmax entry for relation oid.
+// Called when the deferred DROP is applied at COMMIT or cancelled at ROLLBACK.
+// Design 0118-0117.
+func (c *InMemory) ClearTablePendingDropXID(oid uint32) {
+	if oid == 0 {
+		return
+	}
+	c.tablePendingDropXIDMu.Lock()
+	defer c.tablePendingDropXIDMu.Unlock()
+	delete(c.tablePendingDropXID, oid)
+}
+
 // AddPgClassRowMark records that transaction xid holds an explicit row lock on
 // the pg_class tuple for relation relOID. conflictsWithInplace is true when the
 // lock mode (FOR SHARE / FOR NO KEY UPDATE / FOR UPDATE) conflicts with a
@@ -8123,6 +8177,27 @@ func (c *InMemory) PgClassRowMarks(relOID uint32) []PgClassRowMark {
 		out = append(out, PgClassRowMark{XID: xid, ConflictsWithInplace: conflicts})
 	}
 	return out
+}
+
+// ClearPgClassRowMark drops the single pg_class rowmark held by transaction xid
+// on relation relOID. Called when a FOR UPDATE/SHARE locker that recorded the
+// mark up front (so a peer would block behind it) ends up locking no tuple —
+// e.g. the relation's pg_class row was concurrently DELETEd and the locker now
+// returns 0 rows. PG holds no tuple lock in that case, so a peer waiting behind
+// the mark must proceed immediately. Design 0118-0117 (intra-grant-inplace perm
+// 10).
+func (c *InMemory) ClearPgClassRowMark(relOID, xid uint32) {
+	if relOID == 0 || xid == 0 {
+		return
+	}
+	c.pgClassRowMarksMu.Lock()
+	defer c.pgClassRowMarksMu.Unlock()
+	if holders := c.pgClassRowMarks[relOID]; holders != nil {
+		delete(holders, xid)
+		if len(holders) == 0 {
+			delete(c.pgClassRowMarks, relOID)
+		}
+	}
 }
 
 // ClearPgClassRowMarksForXID drops every pg_class rowmark held by transaction

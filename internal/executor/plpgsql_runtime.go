@@ -126,6 +126,17 @@ func (f *plpgsqlFrame) lookup(name string) (int, bool) {
 	return idx, ok
 }
 
+// setPlpgsqlFrameVar binds name to value, adding the variable as a text scalar if
+// it does not already exist or overwriting it in place if it does. Used to inject
+// the SQLERRM / SQLSTATE diagnostics into an exception handler's frame. M0118-0009.
+func setPlpgsqlFrameVar(f *plpgsqlFrame, name string, value Datum) {
+	if idx, ok := f.lookup(name); ok {
+		f.values[idx] = value
+		return
+	}
+	_ = f.add(name, catalog.Type{Name: "text"}, value)
+}
+
 // isRecordVar reports whether the named PL/pgSQL variable is a record or
 // composite-type variable (as opposed to a plain scalar). Such a variable, when
 // bound from a query row, must hold a `(c0,c1,…)` composite value — even for a
@@ -1478,7 +1489,14 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		if ctx != nil {
 			msg := raiseMsgEval()
-			ctx.AddNotice(msg)
+			// RAISE WARNING surfaces at WARNING severity (vs NOTICE/INFO/LOG/DEBUG).
+			// The isolation runner echoes each message with its real protocol
+			// severity, so the level must be preserved. M0118-0009 (perm 10).
+			if strings.EqualFold(s.Level, "warning") {
+				ctx.AddWarning(msg)
+			} else {
+				ctx.AddNotice(msg)
+			}
 		}
 		return Datum{}, flowNone, nil
 
@@ -1825,16 +1843,24 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if err == nil {
 			return v, flow, nil
 		}
-		// Determine SQLSTATE and condition name from error.
+		// Determine SQLSTATE, condition name, and message text from error.
 		sqlstate := "XX000"
 		condName := ""
+		errMsg := err.Error()
 		if ee, ok := err.(*ExecError); ok {
 			sqlstate = ee.Code
 			condName = ee.ConditionName
+			errMsg = ee.Message // SQLERRM is the bare message, not the wire string
 		}
 		// Try each handler.
 		for _, h := range s.Handlers {
 			if exceptionHandlerMatches(h.Conditions, sqlstate, condName) {
+				// Bind the special diagnostic variables SQLERRM / SQLSTATE so the
+				// handler body can reference them (e.g. RAISE WARNING 'got: %',
+				// regexp_replace(sqlerrm, …)). Mirrors PostgreSQL's exception block.
+				// M0118-0009 (intra-grant-inplace perm 10, design 0118-0117).
+				setPlpgsqlFrameVar(frame, "sqlerrm", NewStringDatum(errMsg))
+				setPlpgsqlFrameVar(frame, "sqlstate", NewStringDatum(sqlstate))
 				hv, hflow, herr := executePLpgSQLStmtList(h.Body, r, frame, ctx)
 				if herr != nil {
 					return Datum{}, flowNone, herr

@@ -128,7 +128,13 @@ func (p *bodyParser) parseTopBlock() (*Block, error) {
 		return nil, err
 	}
 	if excBlock != nil {
-		block.Statements = append(stmts, excBlock)
+		// The statements preceding EXCEPTION are the protected body: wrap them in
+		// the ExceptionBlock's TryBody so a runtime error in any of them is caught
+		// by the WHEN handlers. (Previously they were appended as siblings, leaving
+		// TryBody empty — so an error aborted the list before the handler could
+		// run.) M0118-0009 (intra-grant-inplace perm 10, design 0118-0117).
+		excBlock.TryBody = stmts
+		block.Statements = []Stmt{excBlock}
 	} else {
 		block.Statements = stmts
 	}
@@ -350,7 +356,10 @@ func (p *bodyParser) parseNestedBlock() (*Block, error) {
 	p.acceptSymbol(";")
 	block := &Block{pos: beginPos, Statements: stmts}
 	if excBlock != nil {
-		block.Statements = append(stmts, excBlock)
+		// Wrap the preceding statements as the ExceptionBlock's protected body so
+		// their errors are caught by the handlers (see parseTopBlock). M0118-0009.
+		excBlock.TryBody = stmts
+		block.Statements = []Stmt{excBlock}
 	}
 	return block, nil
 }

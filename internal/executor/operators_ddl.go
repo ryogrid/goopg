@@ -4490,6 +4490,15 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table, allow
 					Table:          tbl,
 					SavepointDepth: bsess.SavepointDepth(),
 				})
+				// Record this deferred DROP as the pg_class tuple's delete xmax so a
+				// concurrent explicit rowmark (SELECT … FROM pg_class … FOR UPDATE)
+				// or in-place updater waits on it, exactly as PG's tuple lock waits
+				// on the delete xmax stamped by heap_delete. The XID must be
+				// materialised so the waiter can WaitForXID on it. Design 0118-0117
+				// (intra-grant-inplace perm 10).
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					im.SetTablePendingDropXID(tbl.OID, uint32(o.ctx.Tx.XID))
+				}
 				return nil
 			}
 		}
@@ -4638,12 +4647,19 @@ func ApplyPendingTableDrops(ctx *Context, sess *BasicSession) {
 		return
 	}
 	op := &ddlOp{ctx: ctx}
+	im, _ := ctx.Catalog.(*catalog.InMemory)
 	for _, d := range drops {
 		// Best-effort: the table may already be gone (e.g. dropped by a
 		// cascade earlier in the same transaction). dropTableByRefImmediate is
 		// idempotent on a missing relation (DropTable / DropRelation guard); skip
 		// rather than abort an in-progress commit (mirrors ApplyPendingIndexDrops).
 		_ = op.dropTableByRefImmediate(d.Name, d.Table)
+		// The deferred DROP is now applied; clear its pg_class delete-xmax marker
+		// (a waiting rowmark already unblocks once the XID is no longer active, so
+		// this only keeps the map tidy). Design 0118-0117.
+		if im != nil && d.Table != nil {
+			im.ClearTablePendingDropXID(d.Table.OID)
+		}
 	}
 }
 
@@ -7117,12 +7133,36 @@ func waitTableACLChange(ctx *Context, tableOID uint32) *ExecError {
 	if !ok || ctx.TxnMgr == nil || ctx.Ctx == nil {
 		return nil
 	}
-	xid := im.TableACLChangeXID(tableOID)
-	if xid == storage.InvalidTransactionID {
+	return waitPgClassTupleXID(ctx, im.TableACLChangeXID(tableOID))
+}
+
+// waitTablePendingDrop blocks (deadlock-aware) until an in-flight `DROP TABLE …`
+// on the relation with OID tableOID, deferred to COMMIT, has committed or
+// aborted. The deferred DROP records its writer XID as the pg_class tuple's
+// delete xmax (Catalog.SetTablePendingDropXID); an explicit rowmark
+// (SELECT … FROM pg_class … FOR UPDATE) must wait on it exactly as PG's tuple
+// lock waits on the delete xmax stamped by heap_delete — intra-grant-inplace
+// perm 10 (sfu3 waits behind drop1, then finds the relation gone). Design
+// 0118-0117.
+func waitTablePendingDrop(ctx *Context, tableOID uint32) *ExecError {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || ctx.TxnMgr == nil || ctx.Ctx == nil {
+		return nil
+	}
+	return waitPgClassTupleXID(ctx, im.TablePendingDropXID(tableOID))
+}
+
+// waitPgClassTupleXID is the shared deadlock-aware core for the pg_class-tuple
+// xmax waits (ACL change and pending DROP). It blocks until xid commits/aborts,
+// returning nil for an invalid xid, our own xid, or a holder in our own
+// transaction tree (a savepoint). Returns SQLSTATE 40P01 on a detected deadlock
+// cycle. Design 0118-0117.
+func waitPgClassTupleXID(ctx *Context, xid storage.TransactionID) *ExecError {
+	if xid == storage.InvalidTransactionID || ctx.TxnMgr == nil || ctx.Ctx == nil {
 		return nil
 	}
 	// Materialise our writer XID so the edge we register is observable by a
-	// peer (the GRANT) closing the deadlock cycle.
+	// peer closing the deadlock cycle.
 	_ = ctx.MaterializeWriterXID()
 	if xid == ctx.Tx.XID {
 		return nil
@@ -7175,13 +7215,69 @@ func (o *ddlOp) waitForPgClassRowMarks(tbl *catalog.Table) *ExecError {
 		if selfTop != storage.InvalidTransactionID && o.ctx.TxnMgr.TopLevelXid(mxid) == selfTop {
 			continue // same transaction tree (e.g. a savepoint locker)
 		}
-		if dl, ee := waitPgClassInplaceXID(o.ctx, mxid); ee != nil {
+		// Wait on the MARK's release, not the holder's whole transaction: a
+		// rowmark whose locker ends up locking no tuple (the relation's pg_class
+		// row was concurrently DELETEd) is retracted early, and PG lets a peer
+		// blocked behind it proceed at once rather than at the locker's commit/
+		// rollback (intra-grant-inplace perm 10). Design 0118-0117.
+		if dl, ee := waitPgClassRowMarkReleased(o.ctx, mxid, tbl.OID); ee != nil {
 			return ee
 		} else if dl {
 			return &ExecError{Code: "40P01", Message: "deadlock detected"}
 		}
 	}
 	return nil
+}
+
+// waitPgClassRowMarkReleased blocks until transaction holderXID's conflicting
+// explicit rowmark on relation relOID is released — either because the holder's
+// transaction ended (ClearPgClassRowMarksForXID) or because the holder locked no
+// tuple and retracted the mark early (ClearPgClassRowMark). Unlike WaitForXID,
+// which only wakes at transaction end, this polls the mark itself so an early
+// release unblocks the waiter (intra-grant-inplace perm 10: sfu3 finds the
+// relation gone and returns 0 rows, so revoke4 — blocked behind sfu3's mark —
+// proceeds before s3's ROLLBACK). Deadlock-aware: registers the wait-for edge
+// and walks for a cycle before polling, exactly like waitPgClassInplaceXID.
+// Design 0118-0117.
+func waitPgClassRowMarkReleased(ctx *Context, holderXID storage.TransactionID, relOID uint32) (deadlock bool, timeout *ExecError) {
+	if ctx == nil || ctx.TxnMgr == nil || ctx.Ctx == nil {
+		return false, nil
+	}
+	if holderXID == storage.InvalidTransactionID || holderXID == ctx.Tx.XID {
+		return false, nil
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return false, nil
+	}
+	if ctx.Tx.XID != storage.InvalidTransactionID {
+		if registerWFGAndCheckCycle(ctx.Tx.XID, holderXID) {
+			ctx.DeadlockVictim = true
+			return true, nil
+		}
+		defer deregisterWFG(ctx.Tx.XID)
+	}
+	const pollInterval = 5 * time.Millisecond
+	for {
+		held := false
+		for _, m := range im.PgClassRowMarks(relOID) {
+			if m.XID == uint32(holderXID) && m.ConflictsWithInplace {
+				held = true
+				break
+			}
+		}
+		if !held || !ctx.TxnMgr.IsXIDActive(holderXID) {
+			return false, nil
+		}
+		select {
+		case <-ctx.Ctx.Done():
+			if ee := lockWaitCancelError(ctx.Ctx.Err()); ee != nil {
+				return false, ee
+			}
+			return false, nil
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 // execAlterTableAddUnique handles ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)].
@@ -11541,6 +11637,21 @@ func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
 				// Design 0118-0114 (intra-grant-inplace perms 7-8).
 				if ee := o.waitForPgClassRowMarks(tbl); ee != nil {
 					return ee
+				}
+				// SearchSysCacheLocked1() semantics: PG's GRANT/REVOKE locked the
+				// pg_class tuple, then re-reads it after the wait. If a concurrent
+				// transaction committed a DELETE of that tuple while we waited
+				// (intra-grant-inplace perm 10: drop1 = DELETE FROM pg_class,
+				// committed at c1 while revoke4 blocked behind sfu3's rowmark), the
+				// tuple is gone and the lookup fails with the internal "cache lookup
+				// failed for relation <oid>" elog. The spec's DO block EXCEPTION
+				// handler catches it and re-raises a REDACTED WARNING. Design
+				// 0118-0117 (intra-grant-inplace perm 10).
+				if _, stillThere := im.LookupTableByOID(tbl.OID); !stillThere {
+					return &ExecError{
+						Code:    "XX000",
+						Message: fmt.Sprintf("cache lookup failed for relation %d", tbl.OID),
+					}
 				}
 			}
 		}
