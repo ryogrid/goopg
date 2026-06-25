@@ -1757,6 +1757,29 @@ type InMemory struct {
 	// (intra-grant-inplace).
 	tableACLChangeXID   map[uint32]uint32
 	tableACLChangeXIDMu sync.Mutex
+
+	// pgClassRowMarks records explicit row-level locks taken on a pg_class tuple
+	// by `SELECT … FROM pg_class WHERE oid = <rel> FOR { KEY SHARE | NO KEY
+	// UPDATE | SHARE | UPDATE }`. PostgreSQL takes no heavyweight lock for such a
+	// rowmark — it is a tuple lock recorded in the pg_class tuple's xmax (a
+	// multixact when several sessions hold it). An in-place catalog update of the
+	// same tuple (ALTER TABLE ADD PRIMARY KEY flipping relhasindex via
+	// heap_inplace_update) must wait for any concurrent locker whose mode
+	// conflicts with that no-key update — i.e. every mode except FOR KEY SHARE.
+	// goopg has no real pg_class heap tuple, so we mirror the wait here: each
+	// locking SELECT records (relOID → holderXID → conflictsWithInplace) and ADD
+	// PRIMARY KEY waits (mvcc.WaitForXID) on every conflicting holder from another
+	// transaction. Design 0118-0113 (intra-grant-inplace rowmarks).
+	pgClassRowMarks   map[uint32]map[uint32]bool
+	pgClassRowMarksMu sync.Mutex
+}
+
+// PgClassRowMark is one explicit pg_class tuple lock: the holder's transaction
+// id and whether its lock mode conflicts with a concurrent in-place update of
+// the same tuple (true for every FOR-clause strength except FOR KEY SHARE).
+type PgClassRowMark struct {
+	XID                  uint32
+	ConflictsWithInplace bool
 }
 
 // extensionRow is one runtime CREATE EXTENSION record backing pg_extension.
@@ -8059,6 +8082,66 @@ func (c *InMemory) TableACLChangeXID(oid uint32) storage.TransactionID {
 	c.tableACLChangeXIDMu.Lock()
 	defer c.tableACLChangeXIDMu.Unlock()
 	return storage.TransactionID(c.tableACLChangeXID[oid])
+}
+
+// AddPgClassRowMark records that transaction xid holds an explicit row lock on
+// the pg_class tuple for relation relOID. conflictsWithInplace is true when the
+// lock mode (FOR SHARE / FOR NO KEY UPDATE / FOR UPDATE) conflicts with a
+// concurrent in-place update of that tuple; FOR KEY SHARE records false. See the
+// pgClassRowMarks field comment. Design 0118-0113.
+func (c *InMemory) AddPgClassRowMark(relOID, xid uint32, conflictsWithInplace bool) {
+	if relOID == 0 || xid == 0 {
+		return
+	}
+	c.pgClassRowMarksMu.Lock()
+	defer c.pgClassRowMarksMu.Unlock()
+	if c.pgClassRowMarks == nil {
+		c.pgClassRowMarks = make(map[uint32]map[uint32]bool)
+	}
+	holders := c.pgClassRowMarks[relOID]
+	if holders == nil {
+		holders = make(map[uint32]bool)
+		c.pgClassRowMarks[relOID] = holders
+	}
+	// A stronger later acquisition by the same xid (e.g. KEY SHARE then NO KEY
+	// UPDATE) must not be downgraded by an earlier weak mark — OR the flag.
+	holders[xid] = holders[xid] || conflictsWithInplace
+}
+
+// PgClassRowMarks returns the explicit row-lock holders on relation relOID's
+// pg_class tuple. The caller filters out its own transaction tree and waits on
+// the conflicting remainder. Design 0118-0113.
+func (c *InMemory) PgClassRowMarks(relOID uint32) []PgClassRowMark {
+	c.pgClassRowMarksMu.Lock()
+	defer c.pgClassRowMarksMu.Unlock()
+	holders := c.pgClassRowMarks[relOID]
+	if len(holders) == 0 {
+		return nil
+	}
+	out := make([]PgClassRowMark, 0, len(holders))
+	for xid, conflicts := range holders {
+		out = append(out, PgClassRowMark{XID: xid, ConflictsWithInplace: conflicts})
+	}
+	return out
+}
+
+// ClearPgClassRowMarksForXID drops every pg_class rowmark held by transaction
+// xid. Called when the transaction commits or aborts so a finished locker no
+// longer appears as a held lock. Design 0118-0113.
+func (c *InMemory) ClearPgClassRowMarksForXID(xid uint32) {
+	if xid == 0 {
+		return
+	}
+	c.pgClassRowMarksMu.Lock()
+	defer c.pgClassRowMarksMu.Unlock()
+	for relOID, holders := range c.pgClassRowMarks {
+		if _, ok := holders[xid]; ok {
+			delete(holders, xid)
+			if len(holders) == 0 {
+				delete(c.pgClassRowMarks, relOID)
+			}
+		}
+	}
 }
 
 // AllUserViews returns deep copies of every user-created non-materialized view.

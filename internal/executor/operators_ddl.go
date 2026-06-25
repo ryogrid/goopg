@@ -7026,6 +7026,11 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	// recorded by execCompatNoop. WaitForXID returns immediately when none is
 	// pending or it has already finished. Design 0118-0109 (intra-grant-inplace).
 	o.waitForTableACLChange(tbl)
+	// Likewise wait on any concurrent explicit rowmark of the same pg_class
+	// tuple (SELECT … FROM pg_class … FOR NO KEY UPDATE / SHARE / UPDATE) whose
+	// mode conflicts with this no-key in-place update. FOR KEY SHARE does not
+	// conflict and is skipped. Design 0118-0113 (intra-grant-inplace).
+	o.waitForPgClassRowMarks(tbl)
 	if o.ctx.Catalog.HasPrimaryKey(tbl) {
 		return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("multiple primary keys for table %q are not allowed", tbl.QualifiedName())}
 	}
@@ -7090,6 +7095,36 @@ func (o *ddlOp) waitForTableACLChange(tbl *catalog.Table) {
 		return
 	}
 	_ = o.ctx.TxnMgr.WaitForXID(o.ctx.Ctx, xid)
+}
+
+// waitForPgClassRowMarks blocks until every conflicting explicit rowmark on
+// tbl's pg_class tuple held by another transaction has finished, mirroring
+// PostgreSQL's heap_inplace_update waiting on the tuple's xmax/multixact before
+// flipping relhasindex. A rowmark conflicts unless it is a FOR KEY SHARE lock.
+// Rowmarks held by this transaction's own tree are skipped (a same-xact rowmark
+// never blocks its own in-place update). WaitForXID returns immediately for an
+// already-finished holder, so a stale entry is harmless. Design 0118-0113
+// (intra-grant-inplace).
+func (o *ddlOp) waitForPgClassRowMarks(tbl *catalog.Table) {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok || o.ctx.TxnMgr == nil || tbl == nil || o.ctx.Ctx == nil {
+		return
+	}
+	marks := im.PgClassRowMarks(tbl.OID)
+	if len(marks) == 0 {
+		return
+	}
+	selfTop := o.ctx.TxnMgr.TopLevelXid(o.ctx.Tx.XID)
+	for _, m := range marks {
+		if !m.ConflictsWithInplace || m.XID == uint32(o.ctx.Tx.XID) {
+			continue
+		}
+		mxid := storage.TransactionID(m.XID)
+		if selfTop != storage.InvalidTransactionID && o.ctx.TxnMgr.TopLevelXid(mxid) == selfTop {
+			continue // same transaction tree (e.g. a savepoint locker)
+		}
+		_ = o.ctx.TxnMgr.WaitForXID(o.ctx.Ctx, mxid)
+	}
 }
 
 // execAlterTableAddUnique handles ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)].

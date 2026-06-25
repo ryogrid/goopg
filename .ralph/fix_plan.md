@@ -1428,5 +1428,23 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `TBLOCK_ABORT`). Blast radius nil for non-2PC: every new branch is guarded by
       `Prepared`, never set outside `PREPARE TRANSACTION`. Gates: strict spec PASS
       (137s) + `-race ./internal/mvcc/...` green.
-      **Remaining M0118-0009:** `intra-grant-inplace` (pg_class rowmark locking),
-      `stats` (pg_stat_* subsystem).
+      **2026-06-25 (design 0118-0113, enabler — NOT a promotion):**
+      `intra-grant-inplace` permutations 2–6 now byte-identical (first divergence
+      L62→L141). The `pg_class` **rowmark** half (the GRANT-`xmax` half was
+      0118-0109): an explicit `SELECT … FROM pg_class WHERE oid=<rel> FOR {KEY
+      SHARE|NO KEY UPDATE|SHARE|UPDATE}` takes a tuple lock that ADD PRIMARY KEY's
+      in-place `relhasindex` update must serialise behind (FOR KEY SHARE alone
+      does NOT conflict). goopg has no real pg_class heap tuple, so
+      `lockRowsOp.maybeRecordPgClassRowMark` (fires only when locked OID ==
+      `catalog.RelationRelationId`, OID from the `oid=<const>` filter) records
+      holder+conflict flag in a new catalog store (`pgClassRowMarks`;
+      `AddPgClassRowMark`/`PgClassRowMarks`/`ClearPgClassRowMarksForXID`);
+      `execAlterTableAddPrimaryKey`→`waitForPgClassRowMarks`→`mvcc.WaitForXID` on
+      conflicting other-tree holders (`TopLevelXid` skips same-xact/savepoint —
+      perms 5/6); commit/rollback clear the txn's marks. `TestPgClassRowMarks` +
+      non-regression IntraGrantInplaceDb/TruncateConflict + row-lock family PASS;
+      `-race` mvcc/catalog green. Spec stays `defer` — perms 7–10 need the
+      `GRANT`/`REVOKE`/`DELETE FROM pg_class` `LockTuple` + deadlock-detection
+      core (the Effort-L runtime shared-catalog MVCC-tuple-lock core).
+      **Remaining M0118-0009:** `intra-grant-inplace` (pg_class `LockTuple` +
+      deadlock detection, perms 7–10), `stats` (pg_stat_* subsystem).

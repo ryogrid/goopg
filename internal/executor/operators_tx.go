@@ -170,6 +170,7 @@ func (o *transactionOp) execCommit() error {
 	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
+	o.clearPgClassRowMarks(tx)
 	// M0102-0005: synchronous-replication wait. The xactMarker hook
 	// in initdb.Open writes the commit WAL record and flushes locally
 	// before TxnMgr.Commit returns; if SyncRep is configured and the
@@ -222,6 +223,7 @@ func (o *transactionOp) execRollback() error {
 	if err := o.ctx.TxnMgr.Rollback(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
+	o.clearPgClassRowMarks(tx)
 	o.ctx.Session.EndExplicitTransaction()
 	if o.ctx.EndLocalTransaction != nil {
 		o.ctx.EndLocalTransaction()
@@ -230,6 +232,21 @@ func (o *transactionOp) execRollback() error {
 	undoEnumDDLFromContext(o.ctx)
 	o.clearCtxTransaction()
 	return nil
+}
+
+// clearPgClassRowMarks drops any explicit pg_class rowmarks this transaction
+// recorded (SELECT … FROM pg_class … FOR …) now that it has finished, so a
+// later in-place catalog updater no longer sees them as held. Keyed by the
+// transaction's top-level id (the common case; savepoint sub-XID rowmarks, which
+// no current spec uses, are left behind but are harmless — WaitForXID returns
+// immediately once that sub-XID is no longer active). Harmless no-op when none
+// were recorded. Design 0118-0113 (intra-grant-inplace).
+func (o *transactionOp) clearPgClassRowMarks(tx mvcc.Transaction) {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok || tx.XID == storage.InvalidTransactionID {
+		return
+	}
+	im.ClearPgClassRowMarksForXID(uint32(tx.XID))
 }
 
 // rollbackDDLCreate undoes one CREATE TABLE or CREATE INDEX by removing the

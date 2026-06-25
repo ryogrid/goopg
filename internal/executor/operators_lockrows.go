@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
@@ -586,7 +587,76 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 			o.maxDrain = int(drain)
 		}
 	}
+	// intra-grant-inplace: a `SELECT … FROM pg_class WHERE oid = <rel> FOR …`
+	// takes an explicit row lock on the pg_class tuple. goopg has no real
+	// pg_class heap tuple, so the heap-stamping path above is a no-op for it;
+	// instead record the rowmark in the catalog so a concurrent in-place catalog
+	// update (ALTER TABLE ADD PRIMARY KEY → relhasindex) waits on it. Design
+	// 0118-0113.
+	o.maybeRecordPgClassRowMark()
 	return nil
+}
+
+// maybeRecordPgClassRowMark records an explicit pg_class tuple lock when this
+// LockRows targets pg_class with a single `oid = <const>` predicate. A no-op
+// for every other relation, so the normal heap row-lock path is byte-unchanged.
+// Design 0118-0113 (intra-grant-inplace).
+func (o *lockRowsOp) maybeRecordPgClassRowMark() {
+	if len(o.plan.Locks) == 0 || o.plan.Locks[0].Table == nil {
+		return
+	}
+	if o.plan.Locks[0].Table.OID != catalog.RelationRelationId {
+		return
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	relOID, ok := o.pgClassFilterOID()
+	if !ok {
+		return
+	}
+	// The locker must hold a real (materialised) XID so the in-place updater can
+	// WaitForXID on it.
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return
+	}
+	xid := uint32(o.writerXID())
+	if xid == 0 {
+		return
+	}
+	// Every row-lock strength conflicts with a concurrent in-place pg_class
+	// update (heap_inplace_update's no-key update) except FOR KEY SHARE.
+	conflicts := o.plan.Locks[0].Strength != planner.LockStrengthForKeyShare
+	im.AddPgClassRowMark(relOID, xid, conflicts)
+}
+
+// pgClassFilterOID extracts the relation OID from a `oid = <const>` equality in
+// the child scan's filter predicate (the shape every intra-grant-inplace rowmark
+// SELECT uses). Returns ok=false for any other predicate shape so the rowmark is
+// simply not recorded. Design 0118-0113.
+func (o *lockRowsOp) pgClassFilterOID() (uint32, bool) {
+	bo, ok := findFilterPred(o.child).(*planner.BinaryOp)
+	if !ok || bo.Op != parser.OpEq {
+		return 0, false
+	}
+	cr, ok := bo.Left.(*planner.ColumnRef)
+	constExpr := bo.Right
+	if !ok {
+		if cr, ok = bo.Right.(*planner.ColumnRef); !ok {
+			return 0, false
+		}
+		constExpr = bo.Left
+	}
+	if cr.Index < 0 || cr.Index >= len(o.filterCols) ||
+		!strings.EqualFold(o.filterCols[cr.Index].Name, "oid") {
+		return 0, false
+	}
+	d, err := evalExpr(constExpr, nil, o.ctx)
+	if err != nil || d.IsNull() || d.Kind != KindInt || d.Int <= 0 {
+		return 0, false
+	}
+	return uint32(d.Int), true
 }
 
 // Next implements the two-pass lock-then-yield protocol. First
