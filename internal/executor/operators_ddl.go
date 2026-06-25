@@ -5777,6 +5777,16 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					return err
 				}
 			}
+			// Clone the parent partitioned table's foreign keys onto the new
+			// partition and validate its existing rows against the referenced
+			// table — PG ATExecAttachPartition → CloneForeignKeyConstraints. Runs
+			// at statement time (not deferred to commit) so the validation's
+			// FOR-KEY-SHARE wait on a concurrently-deleted referenced row renders
+			// as `<waiting ...>` and the eventual 23503 surfaces during the ALTER,
+			// exactly as upstream. No-op unless the parent has FKs. (fk-partitioned-1)
+			if err := cloneAndValidateAttachPartitionFKs(o.ctx, tbl, childTbl); err != nil {
+				return err
+			}
 			// Set partition metadata on the child.
 			// ATTACH PARTITION only establishes the parent-child relationship and
 			// partition bounds. The child's PartitionKey/Method are properties of its

@@ -1,29 +1,31 @@
 (idle — nothing in flight)
 
-Last loop (#58) COMPLETE + committed: M0118-0009 `intra-grant-inplace` PROMOTED
-(design 0118-0117). All 10 permutations byte-identical to PG 18.3;
-`TestPort_IsolationIntraGrantInplace` strict. NOT an enabler — full promotion.
+Last loop (#59) COMPLETE + committed: M0118-0009 `fk-partitioned-1` ENABLER
+(design 0118-0118, NOT a promotion). ATTACH PARTITION now clones a partitioned
+parent's FOREIGN KEY onto the attached partition and validates its existing
+rows against the referenced table.
 
-Perm 10 (`b1 drop1 b3 sfu3 revoke4 c1 r3`); `drop1` = locally-adapted
-`DELETE FROM pg_class WHERE relname=…` (virtual-catalog tuple delete). Six pieces:
-1. catalog `tablePendingDropXID` store (Set/Get/Clear) = pg_class delete xmax.
-2. `deleteOp.tryPgClassCatalogDelete`/`pgClassDeleteTargetOID`
-   (operators_storage.go): DELETE FROM pg_class in a txn → records delete xmax +
-   defers removal to COMMIT via AddPendingTableDrop.
-3. `maybeRecordPgClassRowMark` (operators_lockrows.go): also `waitTablePendingDrop`
-   (shared core `waitPgClassTupleXID`); retracts rowmark on 0-row drain
-   (ClearPgClassRowMark).
-4. `waitForPgClassRowMarks` → `waitPgClassRowMarkReleased` (operators_ddl.go):
-   POLLS mark presence (not WaitForXID) + keeps WFG deadlock check, so revoke4
-   unblocks at sfu3's release (before r3).
-5. REVOKE re-checks LookupTableByOID post-wait → XX000 cache lookup failed.
-6. plpgsql EXCEPTION fixes (LATENT BUGS, broad reach): parseTopBlock/
-   parseNestedBlock now set ExceptionBlock.TryBody (handlers were DEAD);
-   handler binds SQLERRM/SQLSTATE (setPlpgsqlFrameVar); RAISE WARNING →
-   AddWarning (WARNING severity).
+Files: internal/executor/operators_fk.go (new `cloneAndValidateAttachPartitionFKs`
++ `fkConstraintName` honours explicit `fk.Name`), operators_ddl.go (call in the
+`AlterTableAttachPartition` case, statement-time, before the explicit-txn defer).
 
-Remaining M0118-0009: `stats` (pg_stat_* cumulative subsystem, Effort-L) — only
-remaining intra-grant work is done. Other failing M0118 specs (distinct unbuilt
-subsystems): index-only-bitmapscan (EXPLAIN DECLARE CURSOR + BitmapOr),
-predicate-gin/gist (GIN/GiST AMs), deadlock-parallel (lock-group),
-fk-partitioned-1/2 (ATTACH PARTITION + partitioned-FK).
+Result: all **Class A** `fk-partitioned-1` perms (referenced row deleted
+before/during attach → `insert or update on table "pfk1" violates foreign key
+constraint "pfk_a_fkey"`, incl. `<waiting ...>`) byte-identical to PG 18.3;
+first divergence moved to the first **Class B** perm. Spec stays `defer`.
+
+Class B remaining (ledger 2026-06-25): (1) referenced-side per-partition
+enforcement — `delete from ppk1` restricted reporting constraint `pfk_a_fkey_1`
+"on table pfk" (PG's cloned referenced-side constraint with `_N` suffix + leaf
+name; goopg's `assertNoChildRows` reports declared RefTable + the referencing
+table's own name); (2) attach's FOR-KEY-SHARE lock HELD TO COMMIT so a
+concurrent `delete from ppk1` `<waiting ...>` behind an uncommitted attach;
+(3) secondary `table "pfk1" does not exist` error on Class-B post-attach path.
+
+Remaining M0118 failing isolation specs (all Effort-L unbuilt subsystems):
+fk-partitioned-1/2 (Class B above), index-only-bitmapscan (needs real
+Bitmap Heap Scan + BitmapOr plan node — goopg has NO bitmap scan; the ONLY
+divergence is s1_explain rendering the BitmapOr plan), predicate-gin/gist
+(int[]/point types + GIN/GiST AMs), deadlock-parallel (lock-group), stats
+(pg_stat_force_next_flush + cumulative stats subsystem), prepared-transactions
+{,-cic} (full 2PC SSI).

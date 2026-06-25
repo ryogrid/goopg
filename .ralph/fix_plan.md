@@ -336,6 +336,24 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       statement's row count. **Remaining (deferred, ledger 2026-06-22):**
       `fk-partitioned-1/2` (`ALTER TABLE ATTACH PARTITION` + partitioned-FK
       enforcement). Group stays open until those land.
+      **2026-06-25 enabler (design 0118-0118, NOT a promotion):** ATTACH PARTITION
+      of a partitioned parent carrying a FOREIGN KEY now clones the referencing FK
+      onto the attached partition and validates its EXISTING rows against the
+      referenced table (PG `ATExecAttachPartition`→`CloneForeignKeyConstraints`→
+      `RI_Initial_Check`) — new `cloneAndValidateAttachPartitionFKs` runs
+      `fullTableFKCheck` (per-row `assertParentExists`→wait-aware
+      `scanTableForMatchFKWait`, descends the referenced partitioned table and
+      BLOCKS on an in-flight referenced-row delete); `fkConstraintName` now honours
+      an explicit `fk.Name` so the clone carries the parent constraint name. Wired
+      at statement time so the FOR-KEY-SHARE wait renders `<waiting ...>` and the
+      23503 surfaces during the ALTER. All **Class A** `fk-partitioned-1`
+      permutations (referenced row deleted before/during attach →
+      `insert or update on table "pfk1" violates foreign key constraint
+      "pfk_a_fkey"`) byte-identical to PG 18.3; first divergence moved to the
+      first **Class B** perm. `fk-partitioned-1` stays `defer` — Class B
+      (referenced-side `pfk_a_fkey_1` restrict "on table pfk" + lock-held-to-commit
+      so a concurrent `delete from ppk1` `<waiting ...>` behind an uncommitted
+      attach) is the remaining slice (ledger 2026-06-25).
 - [x] **M0118-0006** — MERGE & INSERT ON CONFLICT output parity: merge-{update,delete,
       insert-update,match-recheck,join}, insert-conflict-do-update-{2,3,4},
       insert-conflict-specconflict, insert-conflict-do-nothing-2. **COMPLETE

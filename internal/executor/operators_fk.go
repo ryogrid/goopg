@@ -254,6 +254,55 @@ func fullTableFKCheck(ctx *Context, childTbl *catalog.Table, fk catalog.ForeignK
 	return nil
 }
 
+// cloneAndValidateAttachPartitionFKs clones every foreign key declared on a
+// partitioned parent (parentTbl) onto a partition being attached (childTbl) and
+// validates the partition's existing rows against the referenced table —
+// mirroring PostgreSQL ATExecAttachPartition → CloneForeignKeyConstraints, which
+// for each cloned referencing FK runs RI_Initial_Check over the new partition.
+//
+// The validation reuses fullTableFKCheck, whose per-row assertParentExists goes
+// through the wait-aware scan (scanTableForMatchFKWait): if a matching parent
+// row is being concurrently deleted (in-flight xmax), the attach blocks until
+// that deleter commits/aborts (the spec's `<waiting ...>` step) and then either
+// re-validates or raises 23503 once the referenced row is gone. The cloned FK
+// carries the PARENT constraint's name so the violation reports
+// `... violates foreign key constraint "<parent>_<col>_fkey"` exactly as PG.
+//
+// Only the referencing side is cloned here; the referenced-side per-partition
+// constraint (`..._fkey_N`) and the lock-held-to-commit that lets a later
+// parent DELETE block on an uncommitted attach are a separate slice (see the
+// fk-partitioned-1 deferral). Scoped to a partitioned parent that actually has
+// FKs, so non-FK partition attaches are unaffected.
+func cloneAndValidateAttachPartitionFKs(ctx *Context, parentTbl, childTbl *catalog.Table) error {
+	if parentTbl == nil || childTbl == nil || len(parentTbl.ForeignKeys) == 0 {
+		return nil
+	}
+	for _, pfk := range parentTbl.ForeignKeys {
+		// Resolve the parent constraint's reported name once, then carry it onto
+		// the clone so the validation error names the parent constraint.
+		clone := pfk
+		clone.Name = fkConstraintName(parentTbl, pfk)
+		// Validate the partition's existing rows BEFORE recording the clone, so a
+		// failed attach leaves no half-attached FK behind.
+		if err := fullTableFKCheck(ctx, childTbl, clone); err != nil {
+			return err
+		}
+		// Record the clone for ongoing enforcement of future INSERTs into the
+		// partition (idempotent: skip if a same-named FK is already present).
+		already := false
+		for _, existing := range childTbl.ForeignKeys {
+			if strings.EqualFold(existing.Name, clone.Name) {
+				already = true
+				break
+			}
+		}
+		if !already {
+			childTbl.ForeignKeys = append(childTbl.ForeignKeys, clone)
+		}
+	}
+	return nil
+}
+
 // assertParentExists verifies that the parent table (fk.RefTable) contains a
 // row whose reference columns match vals. Returns 23503 if not found.
 //
@@ -312,6 +361,15 @@ func assertParentExists(ctx *Context, fkOwnerTbl *catalog.Table, reportTbl *cata
 // upstream's ChooseConstraintName for inline `col REFERENCES ...`
 // declarations.
 func fkConstraintName(childTbl *catalog.Table, fk catalog.ForeignKey) string {
+	// Honour an explicitly recorded constraint name. For inline/table FKs goopg
+	// already stores the auto-generated <table>_<col>_fkey name at CREATE TABLE
+	// time, so this is identical to the synthesised result in the common case;
+	// it additionally preserves a user-given CONSTRAINT name and a cloned
+	// parent-partition FK name (ATTACH PARTITION carries the parent's
+	// constraint name onto the child for the validation error). DU-002 / fk-partitioned-1.
+	if fk.Name != "" {
+		return fk.Name
+	}
 	tbl := ""
 	if childTbl != nil {
 		tbl = childTbl.Name
