@@ -180,3 +180,41 @@ func TestRoutinesListIsOIDOrdered(t *testing.T) {
 		}
 	}
 }
+
+// TestRoutinesResolveForDrop verifies the read-only resolve twins used by
+// deferred DROP FUNCTION (M0118-0009 `stats`): ResolveByName / ResolveBySig find
+// the target WITHOUT removing it, and mirror the Drop/DropByName error contract
+// (ErrRoutineNotFound / ErrRoutineAmbiguous).
+func TestRoutinesResolveForDrop(t *testing.T) {
+	rs := NewRoutines()
+	f0, _ := rs.Create(makeRoutine("public", "f", nil, Type{Name: "void"}, "BEGIN END"), false)
+	rs.Create(makeRoutine("public", "g", []Type{{Name: "int"}}, Type{Name: "void"}, "BEGIN END"), false)
+	rs.Create(makeRoutine("public", "g", []Type{{Name: "text"}}, Type{Name: "void"}, "BEGIN END"), false)
+
+	// ResolveByName: unique bare name resolves; does not remove.
+	r, err := rs.ResolveByName(parser.ObjectName{Name: "f"})
+	if err != nil || r == nil || r.OID != f0.OID {
+		t.Fatalf("ResolveByName(f) = (%v, %v), want OID %d", r, err, f0.OID)
+	}
+	if _, ok := rs.Lookup(parser.ObjectName{Name: "f"}, nil); !ok {
+		t.Fatalf("ResolveByName must not remove the routine")
+	}
+
+	// Ambiguous bare name (two overloads of g) → ErrRoutineAmbiguous.
+	if _, err := rs.ResolveByName(parser.ObjectName{Name: "g"}); !errors.Is(err, ErrRoutineAmbiguous) {
+		t.Fatalf("ResolveByName(g) err = %v, want ErrRoutineAmbiguous", err)
+	}
+	// Not found → ErrRoutineNotFound.
+	if _, err := rs.ResolveByName(parser.ObjectName{Name: "nope"}); !errors.Is(err, ErrRoutineNotFound) {
+		t.Fatalf("ResolveByName(nope) err = %v, want ErrRoutineNotFound", err)
+	}
+
+	// ResolveBySig selects the exact overload.
+	r, err = rs.ResolveBySig(parser.ObjectName{Name: "g"}, []Type{{Name: "text"}})
+	if err != nil || r == nil || len(r.ArgTypes) != 1 || r.ArgTypes[0].Name != "text" {
+		t.Fatalf("ResolveBySig(g,text) = (%v, %v), want the text overload", r, err)
+	}
+	if _, err := rs.ResolveBySig(parser.ObjectName{Name: "g"}, []Type{{Name: "bool"}}); !errors.Is(err, ErrRoutineNotFound) {
+		t.Fatalf("ResolveBySig(g,bool) err = %v, want ErrRoutineNotFound", err)
+	}
+}

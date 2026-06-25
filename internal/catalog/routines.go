@@ -383,6 +383,75 @@ func (rs *Routines) DropRoutine(r *Routine) error {
 	return nil
 }
 
+// ResolveByName resolves the single routine matching a bare name (no argument
+// list) WITHOUT removing it — the read-only twin of DropByName. Used by deferred
+// DROP FUNCTION (M0118-0009 `stats`), which must identify the target routine at
+// statement time but defer its registry removal to COMMIT. Returns the same
+// error contract as DropByName: ErrRoutineNotFound / ErrRoutineAmbiguous. When
+// schema is empty, searches all schemas.
+func (rs *Routines) ResolveByName(name parser.ObjectName) (*Routine, error) {
+	schema := name.Schema
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	if schema == "" {
+		var allKeys []string
+		for nk, keys := range rs.byName {
+			if strings.HasSuffix(nk, "."+strings.ToLower(name.Name)) {
+				allKeys = append(allKeys, keys...)
+			}
+		}
+		switch len(allKeys) {
+		case 0:
+			return nil, fmt.Errorf("%w: %s", ErrRoutineNotFound, name.Name)
+		case 1:
+			return rs.byKey[allKeys[0]], nil
+		default:
+			return nil, fmt.Errorf("%w: %s", ErrRoutineAmbiguous, name.Name)
+		}
+	}
+	keys := rs.byName[nameKey(schema, name.Name)]
+	switch len(keys) {
+	case 0:
+		return nil, fmt.Errorf("%w: %s.%s", ErrRoutineNotFound, schema, name.Name)
+	case 1:
+		return rs.byKey[keys[0]], nil
+	default:
+		return nil, fmt.Errorf("%w: %s.%s has %d overloads", ErrRoutineAmbiguous, schema, name.Name, len(keys))
+	}
+}
+
+// ResolveBySig resolves the routine with the given schema+name+argtypes WITHOUT
+// removing it — the read-only twin of Drop, used by deferred DROP FUNCTION
+// (M0118-0009 `stats`). Returns ErrRoutineNotFound when the signature doesn't
+// resolve. When schema is empty, searches public then all schemas.
+func (rs *Routines) ResolveBySig(name parser.ObjectName, argTypes []Type) (*Routine, error) {
+	stub := &Routine{Name: name.Name, ArgTypes: argTypes}
+	signature := stub.Signature()
+	schema := name.Schema
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	if schema == "" {
+		if _, ok := rs.byKey[routineKey("public", name.Name, signature)]; ok {
+			schema = "public"
+		} else {
+			for _, r := range rs.byKey {
+				if strings.EqualFold(r.Name, name.Name) && r.Signature() == signature {
+					schema = r.Schema
+					break
+				}
+			}
+		}
+		if schema == "" {
+			return nil, fmt.Errorf("%w: %s%s", ErrRoutineNotFound, name.Name, signature)
+		}
+	}
+	r, ok := rs.byKey[routineKey(schema, name.Name, signature)]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s.%s%s", ErrRoutineNotFound, schema, name.Name, signature)
+	}
+	return r, nil
+}
+
 // DropRoutinesReferencingTypes drops every registered routine whose argument
 // or return type name matches one of typeNames (case-insensitive), returning
 // the dropped routines. It backs temporary-object cleanup (DISCARD TEMP /

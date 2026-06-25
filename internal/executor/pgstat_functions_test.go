@@ -48,20 +48,44 @@ func TestFunctionStatsManager(t *testing.T) {
 	}
 
 	// resetSingle drops only the targeted OID.
+	// resetSingle ZEROES the targeted OID's entry in place (kept, not removed) so
+	// the getter returns 0 rather than NULL — PG's
+	// pg_stat_reset_single_function_counters resets the shared counters without
+	// dropping the entry. Other OIDs are untouched.
 	m.record(sess1, oidB, time.Millisecond, time.Millisecond)
 	m.flush(sess1)
 	m.resetSingle(oidA)
-	if _, ok := m.get(oidA); ok {
-		t.Fatalf("oidA should be gone after resetSingle")
+	if c, ok := m.get(oidA); !ok || c.calls != 0 || c.totalTime != 0 || c.selfTime != 0 {
+		t.Fatalf("after resetSingle oidA must be present and zeroed, got ok=%v %+v", ok, c)
 	}
-	if _, ok := m.get(oidB); !ok {
-		t.Fatalf("oidB should survive resetSingle of oidA")
+	if c, ok := m.get(oidB); !ok || c.calls != 1 {
+		t.Fatalf("oidB should survive resetSingle of oidA, got ok=%v calls=%d", ok, c.calls)
+	}
+	// resetSingle on an OID with no entry is a no-op (stays NULL).
+	m.resetSingle(uint32(999999))
+	if _, ok := m.get(uint32(999999)); ok {
+		t.Fatalf("resetSingle must not materialise an entry for an unseen OID")
 	}
 
-	// resetAll clears everything.
+	// resetAll zeroes every entry in place (kept, not removed).
 	m.resetAll()
+	if c, ok := m.get(oidB); !ok || c.calls != 0 {
+		t.Fatalf("after resetAll oidB must be present and zeroed, got ok=%v calls=%d", ok, c.calls)
+	}
+
+	// dropFunction removes the OID from BOTH shared and every session's pending,
+	// so the getter returns NULL and a stale pending count is not revived on a
+	// later flush. Mirrors pgstat_drop_function on DROP FUNCTION commit.
+	m.record(sess1, oidB, time.Millisecond, time.Millisecond)
+	m.flush(sess1)                                            // shared[oidB] exists
+	m.record(sess2, oidB, time.Millisecond, time.Millisecond) // sess2 pending for oidB
+	m.dropFunction(oidB)
 	if _, ok := m.get(oidB); ok {
-		t.Fatalf("oidB should be gone after resetAll")
+		t.Fatalf("oidB must be gone after dropFunction")
+	}
+	m.flush(sess2) // the dropped OID's stale pending must not revive it
+	if _, ok := m.get(oidB); ok {
+		t.Fatalf("dropFunction must discard pending so a later flush does not revive the OID")
 	}
 
 	// A non-existent session flush is a no-op (no panic).

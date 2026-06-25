@@ -115,20 +115,53 @@ func (m *functionStatsManager) get(oid uint32) (funcStatCounters, bool) {
 	return *c, true
 }
 
-// resetSingle drops the shared counters for one function OID
-// (pg_stat_reset_single_function_counters). A non-existent OID is a no-op.
-func (m *functionStatsManager) resetSingle(oid uint32) {
+// dropFunction removes all cumulative statistics for a function OID — both the
+// shared (flushed) counters and any not-yet-flushed pending counters across
+// every session. Mirrors pgstat_drop_function (called transactionally when a
+// DROP FUNCTION commits): after the drop, the getters return SQL NULL and a
+// concurrent backend's stale pending counts for the OID are discarded rather
+// than revived into the shared store on its next flush. M0118-0009 (`stats`).
+func (m *functionStatsManager) dropFunction(oid uint32) {
+	if oid == 0 {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.shared, oid)
+	for _, sess := range m.pending {
+		delete(sess, oid)
+	}
 }
 
-// resetAll drops every shared function counter (the function-stats portion of
-// pg_stat_reset, which resets all stats for the current database).
+// resetSingle zeroes the shared counters for one function OID in place
+// (pg_stat_reset_single_function_counters). The entry is KEPT (calls reset to 0,
+// total/self time to 0), so a subsequent getter returns 0 rather than SQL NULL —
+// PG resets the shared entry's counters without removing it. An OID with no
+// flushed entry is a no-op (the getter keeps returning NULL): PG's reset does
+// not materialise a zeroed entry for a function that has none.
+func (m *functionStatsManager) resetSingle(oid uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if c, ok := m.shared[oid]; ok {
+		c.calls = 0
+		c.totalTime = 0
+		c.selfTime = 0
+	}
+}
+
+// resetAll zeroes every shared function counter in place (the function-stats
+// portion of pg_stat_reset, which resets all stats for the current database).
+// Like resetSingle, existing entries are KEPT and zeroed — a subsequent getter
+// returns 0, not SQL NULL — so a function that already had flushed stats reads
+// back as 0 calls after the reset.
 func (m *functionStatsManager) resetAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.shared = make(map[uint32]*funcStatCounters)
+	for _, c := range m.shared {
+		c.calls = 0
+		c.totalTime = 0
+		c.selfTime = 0
+	}
 }
 
 // sessionStatsID returns the stable per-connection identity used to key pending

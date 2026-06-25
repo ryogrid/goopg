@@ -1942,6 +1942,21 @@ func TestPort_IsolationTuplelockUpgradeNoDeadlock(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec")
 }
 
+// TestPort_IsolationStats drives the cumulative-statistics isolation spec
+// (pg_stat_* function/relation/SLRU stats). Soft (runIsoSpec) — the spec
+// exercises several pgstat subsystems still being built rung by rung
+// (M0118-0009); this anchor t.Skip()s with the first-divergence diff until the
+// whole spec matches PG 18.3 byte-for-byte. The function-statistics half plus
+// transactional DROP FUNCTION cross-session visibility (designs 0118-0123/0124
+// and the deferred-routine-drop rung) are landed.
+func TestPort_IsolationStats(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_stats")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/stats.spec")
+}
+
 // buildDSN constructs a lib/pq DSN for the given cluster.
 func buildDSN(t *testing.T, c *cluster.Cluster) string {
 	t.Helper()

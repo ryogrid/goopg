@@ -1631,3 +1631,23 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       rungs 1+2 enablers landed 0118-0123/0124; remaining rungs: uncommitted-DROP
       MVCC-catalog visibility, 2PC stat-drops, `stats_fetch_consistency` snapshot/
       cache models, relation tuple stats + `pg_stat_get_xact_*`, SLRU stats).
+      **2026-06-25 (design 0118-0125, enabler — NOT a promotion): `stats` rung 3.**
+      Made DROP FUNCTION transactional + finished the function-stats lifecycle;
+      first divergence advanced **L449 → L1587**. (1) Deferred DROP FUNCTION
+      (mirrors deferred DROP TABLE): `DeferredRoutineDrop` + `BasicSession.
+      deferRoutineDrops`; in an explicit txn `execDropFunction` resolves the
+      target (read-only `Routines.ResolveByName`/`ResolveBySig`) but defers removal
+      to COMMIT (`ApplyDeferredRoutineDrops` on both `execCommit` + simple-query
+      dispatch), so a concurrent session still calls it until commit; ROLLBACK
+      discards, ROLLBACK TO cancels by depth. (2) Autocommit DROP now drops the
+      function's cumulative stats too (`funcStats.dropFunction`, mirrors
+      `pgstat_drop_function`). (3) `dropFunction(oid)` clears shared + every
+      session's pending; `resetSingle`/`resetAll` ZERO entries in place (getter
+      returns 0 not NULL; absent OID stays NULL). (4) DROP-then-CREATE same
+      signature in one txn handled by `TakeDeferredRoutineDropMatching` (applies
+      the deferred drop early). Known limitation (accepted, like deferred DROP
+      TABLE): dropping session sees its own dropped function until commit (no
+      per-session catalog MVCC). New first divergence L1587 =
+      `stats_fetch_consistency='cache'/'snapshot'` (per-txn stat caching), then
+      L2026 = 2PC `PREPARE TRANSACTION` stats. Tests `TestDeferredRoutineDropSession`
+      + `TestRoutinesResolveForDrop` + updated `TestFunctionStatsManager`.

@@ -4671,6 +4671,34 @@ func ApplyPendingTableDrops(ctx *Context, sess *BasicSession) {
 	}
 }
 
+// ApplyDeferredRoutineDrops performs the registry removal and cumulative
+// function-stats drop for every DROP FUNCTION that was deferred to COMMIT inside
+// the committing transaction (see DeferredRoutineDrop). Called from the commit
+// path before TxnMgr.Commit. ROLLBACK instead calls TakeDeferredRoutineDrops to
+// discard the entries (the routines were never removed). M0118-0009 (`stats`).
+func ApplyDeferredRoutineDrops(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	drops := sess.TakeDeferredRoutineDrops()
+	if len(drops) == 0 {
+		return
+	}
+	rs := ctx.Catalog.Routines()
+	for _, d := range drops {
+		if d.Routine == nil {
+			continue
+		}
+		// Best-effort: the routine may already be gone (e.g. an early-applied
+		// recreate in the same transaction). DropRoutine is idempotent on a
+		// missing routine; skip rather than abort an in-progress commit.
+		if rs != nil {
+			_ = rs.DropRoutine(d.Routine)
+		}
+		funcStats.dropFunction(d.Routine.OID)
+	}
+}
+
 func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE INDEX requires Pool in Context"}
@@ -8782,6 +8810,17 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	if lang == "sql" {
 		extractRoutineDeps(r.Body, r.ArgDefaults, schema, r, o.ctx.Catalog)
 	}
+	// DROP-then-CREATE of the same signature inside one transaction: a deferred
+	// DROP FUNCTION (M0118-0009 `stats`) leaves the old routine in the registry
+	// until COMMIT, which would make this CREATE collide and would later drop the
+	// freshly created routine at COMMIT. Apply that deferred drop now (remove the
+	// old routine + its stats) so the recreate replaces it cleanly.
+	if bsess, ok := o.ctx.Session.(*BasicSession); ok {
+		if old := bsess.TakeDeferredRoutineDropMatching(r.Schema, r.Name, r.Signature()); old != nil {
+			_ = rs.DropRoutine(old)
+			funcStats.dropFunction(old.OID)
+		}
+	}
 	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
 		if errors.Is(err, catalog.ErrRoutineExists) {
@@ -9700,18 +9739,59 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		}
 	}
 
-	var err error
-	if s.Args == nil {
-		err = rs.DropByName(s.Name)
-	} else {
-		argTypes := make([]catalog.Type, len(s.Args))
+	// Build the argument-type list once (used by both the immediate and the
+	// deferred paths).
+	var argTypes []catalog.Type
+	if s.Args != nil {
+		argTypes = make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
 			argTypes[i] = catalog.Type{
 				Name: strings.ToLower(a.Type.Name),
 				Args: append([]int64(nil), a.Type.Args...),
 			}
 		}
-		err = rs.Drop(s.Name, argTypes)
+	}
+
+	// Inside an explicit transaction, DROP FUNCTION removal is deferred to
+	// COMMIT: the routine stays in the shared registry (and keeps its cumulative
+	// stats) so a concurrent session still resolves and calls it until the
+	// dropping transaction commits — PG transactional-DDL visibility, exercised
+	// by the `stats` isolation spec. The target is resolved now (so a missing /
+	// ambiguous function still errors at statement time), but the actual removal
+	// + pg_stat function-stats drop happen in ApplyDeferredRoutineDrops at COMMIT;
+	// ROLLBACK discards the entry. M0118-0009 (`stats`).
+	var err error
+	if bsess, ok := o.ctx.Session.(*BasicSession); ok && bsess.InExplicitTransaction() {
+		var target *catalog.Routine
+		if s.Args == nil {
+			target, err = rs.ResolveByName(s.Name)
+		} else {
+			target, err = rs.ResolveBySig(s.Name, argTypes)
+		}
+		if err == nil {
+			bsess.AddDeferredRoutineDrop(DeferredRoutineDrop{
+				Routine:        target,
+				SavepointDepth: bsess.SavepointDepth(),
+			})
+			return nil
+		}
+	} else {
+		// Autocommit: remove immediately AND drop the function's cumulative
+		// statistics (mirrors pgstat_drop_function on the implicit commit).
+		// Resolve first to obtain the OID for the stats drop, then remove by
+		// identity. Resolution mirrors DropByName/Drop, returning the same
+		// ErrRoutineNotFound / ErrRoutineAmbiguous sentinels handled below.
+		var target *catalog.Routine
+		if s.Args == nil {
+			target, err = rs.ResolveByName(s.Name)
+		} else {
+			target, err = rs.ResolveBySig(s.Name, argTypes)
+		}
+		if err == nil {
+			if err = rs.DropRoutine(target); err == nil {
+				funcStats.dropFunction(target.OID)
+			}
+		}
 	}
 	if err == nil {
 		return nil

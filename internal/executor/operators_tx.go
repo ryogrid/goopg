@@ -166,6 +166,10 @@ func (o *transactionOp) execCommit() error {
 		// COMMIT (the table's catalog row + the dropper's AccessExclusiveLock were
 		// kept visible to other sessions until now).
 		ApplyPendingTableDrops(o.ctx, sess)
+		// M0118-0009 (`stats`): apply DROP FUNCTION removals deferred to COMMIT
+		// (the routine + its cumulative function-stats were kept visible/callable
+		// to other sessions until now).
+		ApplyDeferredRoutineDrops(o.ctx, sess)
 	}
 	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
@@ -219,6 +223,10 @@ func (o *transactionOp) execRollback() error {
 				_, _ = rs.Create(r, true)
 			}
 		}
+		// M0118-0009 (`stats`): discard DROP FUNCTION drops deferred to COMMIT —
+		// the routines were never removed from the registry (kept visible until
+		// commit), so ROLLBACK only needs to drop the deferred entries.
+		sess.TakeDeferredRoutineDrops()
 		// fk-partitioned-1 (design 0118-0120): a deferred ATTACH PARTITION never
 		// registers on ROLLBACK, so drop any in-flight-attach FK markers it set
 		// (the partition stays unattached; a concurrent DELETE must not keep
@@ -497,6 +505,9 @@ func (o *transactionOp) execRollbackTo() error {
 	// Discard DROP TABLE removals deferred inside the rolled-back savepoint so
 	// they are not applied at the outer COMMIT. M0118-0008 (alter-table-4).
 	sess.CancelPendingTableDropsToDepth(newDepth)
+	// Discard DROP FUNCTION removals deferred inside the rolled-back savepoint so
+	// the function survives the outer COMMIT. M0118-0009 (`stats`).
+	sess.CancelDeferredRoutineDropsToDepth(newDepth)
 	// Discard deferred ALTER TABLE {NO} INHERIT changes recorded inside the
 	// rolled-back savepoint, clearing the matching catalog pending-change marks.
 	// M0118-0008 (alter-table-4).

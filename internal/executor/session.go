@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -122,6 +123,26 @@ type PendingTableDrop struct {
 	SavepointDepth int               // savepoint depth at drop time (for ROLLBACK TO cancel)
 }
 
+// DeferredRoutineDrop records a DROP FUNCTION issued inside an explicit
+// transaction whose registry removal AND cumulative function-stats drop are
+// deferred until COMMIT. Until the dropping transaction commits, the routine
+// stays in the shared registry so a concurrent session still resolves and calls
+// it (PG transactional-DDL visibility, `stats` isolation spec: s1 BEGINs, drops
+// test_stat_func, and s2 must still SELECT test_stat_func() until s1 commits;
+// the function's pg_stat_get_function_* counters likewise survive until then).
+// ApplyDeferredRoutineDrops performs the real removal at commit; ROLLBACK simply
+// discards the entry (the routine was never removed). Like PendingTableDrop, the
+// dropping session itself also keeps seeing the function until commit — goopg's
+// shared catalog has no per-session MVCC visibility — a limitation the spec
+// never exercises (s1 does not call test_stat_func after dropping it); a
+// CREATE FUNCTION of the same signature in the same transaction is handled by
+// TakeDeferredRoutineDropMatching (the deferred drop is applied early so the
+// recreate proceeds). M0118-0009 (`stats`).
+type DeferredRoutineDrop struct {
+	Routine        *catalog.Routine
+	SavepointDepth int
+}
+
 // relPageSnapshot captures the full page contents of one relation before
 // a TRUNCATE so that ROLLBACK can restore them.
 type relPageSnapshot struct {
@@ -158,6 +179,7 @@ type BasicSession struct {
 	pendingPartAttaches []PendingPartitionAttach   // ATTACH PARTITION deferred to COMMIT (M0118-0008)
 	pendingInheritChng  []PendingInheritanceChange // ALTER TABLE {NO} INHERIT deferred to COMMIT (M0118-0008)
 	pendingTableDrops   []PendingTableDrop         // DROP TABLE deferred to COMMIT (M0118-0008 alter-table-4)
+	deferRoutineDrops   []DeferredRoutineDrop      // DROP FUNCTION deferred to COMMIT (M0118-0009 stats)
 	subxactStack        mvcc.SubxactStack          // savepoint stack (M0050-0004)
 	currentSubXid       storage.TransactionID      // 0 = use top-level tx.XID
 	txFailed            bool                       // in_failed_sql_transaction (25P02)
@@ -233,6 +255,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.pendingPartAttaches = nil
 	s.pendingInheritChng = nil
 	s.pendingTableDrops = nil
+	s.deferRoutineDrops = nil
 	s.subxactStack = mvcc.SubxactStack{}
 	s.currentSubXid = 0
 	s.txFailed = false
@@ -530,6 +553,65 @@ func (s *BasicSession) CancelPendingTableDropsToDepth(depth int) {
 		}
 	}
 	s.pendingTableDrops = keep
+}
+
+// AddDeferredRoutineDrop records a DROP FUNCTION whose registry removal and
+// cumulative-stats drop are deferred until COMMIT (see DeferredRoutineDrop).
+// M0118-0009 (`stats`).
+func (s *BasicSession) AddDeferredRoutineDrop(e DeferredRoutineDrop) {
+	s.deferRoutineDrops = append(s.deferRoutineDrops, e)
+}
+
+// TakeDeferredRoutineDrops drains and returns the deferred DROP FUNCTION
+// entries. The commit path (ApplyDeferredRoutineDrops) performs the real
+// removal; ROLLBACK calls this only to discard them (the routines were never
+// removed, so there is nothing to undo). M0118-0009 (`stats`).
+func (s *BasicSession) TakeDeferredRoutineDrops() []DeferredRoutineDrop {
+	out := s.deferRoutineDrops
+	s.deferRoutineDrops = nil
+	return out
+}
+
+// CancelDeferredRoutineDropsToDepth discards deferred DROP FUNCTION entries
+// recorded at savepoint depth >= depth, so ROLLBACK TO SAVEPOINT before a
+// deferred DROP FUNCTION does not still remove the function at the outer COMMIT.
+// Mirrors CancelPendingTableDropsToDepth. M0118-0009 (`stats`).
+func (s *BasicSession) CancelDeferredRoutineDropsToDepth(depth int) {
+	keep := s.deferRoutineDrops[:0]
+	for _, e := range s.deferRoutineDrops {
+		if e.SavepointDepth < depth {
+			keep = append(keep, e)
+		}
+	}
+	s.deferRoutineDrops = keep
+}
+
+// TakeDeferredRoutineDropMatching removes and returns the deferred DROP FUNCTION
+// entry whose target routine matches the given schema, name, and signature, or
+// nil if none. CREATE FUNCTION calls this so that a DROP-then-CREATE of the same
+// signature inside one transaction proceeds cleanly: the deferred drop is
+// applied early (the old routine removed now) instead of dropping the freshly
+// created routine at COMMIT. M0118-0009 (`stats`).
+func (s *BasicSession) TakeDeferredRoutineDropMatching(schema, name, signature string) *catalog.Routine {
+	for i, e := range s.deferRoutineDrops {
+		r := e.Routine
+		if r == nil {
+			continue
+		}
+		rSchema := r.Schema
+		if rSchema == "" {
+			rSchema = "public"
+		}
+		wantSchema := schema
+		if wantSchema == "" {
+			wantSchema = "public"
+		}
+		if strings.EqualFold(rSchema, wantSchema) && strings.EqualFold(r.Name, name) && r.Signature() == signature {
+			s.deferRoutineDrops = append(s.deferRoutineDrops[:i], s.deferRoutineDrops[i+1:]...)
+			return r
+		}
+	}
+	return nil
 }
 
 // MarkTableActive marks a table OID as currently being mutated by a DML
