@@ -2382,6 +2382,45 @@ func (c *InMemory) RegisterPartitionChild(parentOID, childOID uint32) {
 	c.mu.Unlock()
 }
 
+// IsPartitionChild reports whether oid is registered as a partition of some
+// parent. Unlike the Table.PartitionParentOID field — which is only populated on
+// the CREATE TABLE … PARTITION OF path — this consults the live partitionChildren
+// map, so it is also true for a table linked via ALTER TABLE … ATTACH PARTITION
+// (RegisterPartitionChild updates the map but leaves PartitionParentOID 0).
+// fk-partitioned-1: distinguishes a root FK-owning table from a per-partition
+// FK clone when naming a referenced-side violation.
+func (c *InMemory) IsPartitionChild(oid uint32) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, kids := range c.partitionChildren {
+		for _, k := range kids {
+			if k == oid {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// PartitionParentOf returns the OID of the partitioned parent that childOID is
+// registered under, consulting the live partitionChildren map. Like
+// IsPartitionChild, this is reliable for both CREATE TABLE … PARTITION OF and
+// ALTER TABLE … ATTACH PARTITION (the latter leaves Table.PartitionParentOID 0).
+// Returns (0,false) when childOID is not a partition of anything.
+// fk-partitioned-1: walk a deleted leaf partition up to the referenced parent.
+func (c *InMemory) PartitionParentOf(childOID uint32) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for parent, kids := range c.partitionChildren {
+		for _, k := range kids {
+			if k == childOID {
+				return parent, true
+			}
+		}
+	}
+	return 0, false
+}
+
 // UnregisterPartitionChild removes childOID from parentOID's partition children
 // list (DETACH PARTITION). M0097-0028.
 func (c *InMemory) UnregisterPartitionChild(parentOID, childOID uint32) {

@@ -1,31 +1,38 @@
 (idle — nothing in flight)
 
-Last loop (#59) COMPLETE + committed: M0118-0009 `fk-partitioned-1` ENABLER
-(design 0118-0118, NOT a promotion). ATTACH PARTITION now clones a partitioned
-parent's FOREIGN KEY onto the attached partition and validates its existing
-rows against the referenced table.
+Last loop (#60) COMPLETE + committed: M0118-0005/0009 `fk-partitioned-1`
+referenced-side ENABLER (design 0118-0119, NOT a promotion). A `DELETE FROM ppk1`
+(leaf of the *referenced* partitioned `ppk`) is now rejected referenced-side once
+`pfk1` is attached as a partition of FK-owner `pfk`:
+`update or delete on table "ppk1" violates foreign key constraint "pfk_a_fkey_1"
+on table "pfk"`.
 
-Files: internal/executor/operators_fk.go (new `cloneAndValidateAttachPartitionFKs`
-+ `fkConstraintName` honours explicit `fk.Name`), operators_ddl.go (call in the
-`AlterTableAttachPartition` case, statement-time, before the explicit-txn defer).
+Files:
+- internal/executor/operators_fk.go — new `enforceFKOnDeletePartitionAncestor`
+  (called at end of `enforceFKOnDelete`) + `partitionParentTable` helper. Walks
+  the deleted leaf's partition ancestors, fires any FK referencing an ancestor,
+  SKIPS per-partition FK clones (`IsPartitionChild`) so it names the ROOT `pfk`,
+  appends `<fkname>_<N>` ordinal suffix (`pfk_a_fkey_1`).
+- internal/catalog/catalog.go — new `IsPartitionChild` + `PartitionParentOf`
+  (map-backed; reliable for ATTACH partitions whose `Table.PartitionParentOID`==0).
+- internal/executor/operators_ddl.go — `dropPartitionDescendants` now marks
+  cascade-dropped partitions in `cascadeDropped` so teardown
+  `DROP TABLE ppk, pfk, pfk1` doesn't raise `table "pfk1" does not exist`.
 
-Result: all **Class A** `fk-partitioned-1` perms (referenced row deleted
-before/during attach → `insert or update on table "pfk1" violates foreign key
-constraint "pfk_a_fkey"`, incl. `<waiting ...>`) byte-identical to PG 18.3;
-first divergence moved to the first **Class B** perm. Spec stays `defer`.
+Result: Class A (0118-0118) + the 4 committed-attach Class B perms byte-identical
+to PG 18.3. Probe `defer` 130/133 lines; first divergence = first CONCURRENT
+Class B perm (`s1b s2b s2a s1d s2c s1c`). Spec stays `defer`.
 
-Class B remaining (ledger 2026-06-25): (1) referenced-side per-partition
-enforcement — `delete from ppk1` restricted reporting constraint `pfk_a_fkey_1`
-"on table pfk" (PG's cloned referenced-side constraint with `_N` suffix + leaf
-name; goopg's `assertNoChildRows` reports declared RefTable + the referencing
-table's own name); (2) attach's FOR-KEY-SHARE lock HELD TO COMMIT so a
-concurrent `delete from ppk1` `<waiting ...>` behind an uncommitted attach;
-(3) secondary `table "pfk1" does not exist` error on Class-B post-attach path.
+NEXT (concurrent Class B, 3 perms — ledger 2026-06-25): `s1d delete from ppk1`
+must `<waiting ...>` behind an UNCOMMITTED `s2a attach` and error once it commits.
+Needs the attach's referenced-row FOR-KEY-SHARE lock HELD TO COMMIT (today
+`cloneAndValidateAttachPartitionFKs`/`scanTableForMatchFKWait` waits on in-flight
+deletes but leaves NO lock a later delete blocks on). During the uncommitted
+window `IsPartitionChild(pfk1)` is still false (RegisterPartitionChild deferred to
+commit) so the referenced-side check fires eagerly + mis-names the clone — both
+fixed by adding the lock.
 
-Remaining M0118 failing isolation specs (all Effort-L unbuilt subsystems):
-fk-partitioned-1/2 (Class B above), index-only-bitmapscan (needs real
-Bitmap Heap Scan + BitmapOr plan node — goopg has NO bitmap scan; the ONLY
-divergence is s1_explain rendering the BitmapOr plan), predicate-gin/gist
-(int[]/point types + GIN/GiST AMs), deadlock-parallel (lock-group), stats
-(pg_stat_force_next_flush + cumulative stats subsystem), prepared-transactions
-{,-cic} (full 2PC SSI).
+Other remaining M0118 (all Effort-L unbuilt subsystems): fk-partitioned-1 (above)
+/ fk-partitioned-2, index-only-bitmapscan (real Bitmap Heap Scan + BitmapOr),
+predicate-gin/gist (int[]/point + GIN/GiST AMs), predicate-hash, deadlock-parallel
+(lock-group), stats (pg_stat_* cumulative subsystem).

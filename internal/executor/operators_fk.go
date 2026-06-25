@@ -175,6 +175,114 @@ func enforceFKOnDelete(ctx *Context, parentTbl *catalog.Table, parentRow Row) er
 			}
 		}
 	}
+	// Referenced-side check for a row that lives in a LEAF PARTITION of a
+	// referenced table: the FK's action triggers are cloned to each partition of
+	// the referenced side, so deleting from `ppk1` (a partition of the referenced
+	// `ppk`) must still verify no referencing row depends on it. fk-partitioned-1.
+	if err := enforceFKOnDeletePartitionAncestor(ctx, parentTbl, parentRow); err != nil {
+		return err
+	}
+	return nil
+}
+
+// enforceFKOnDeletePartitionAncestor handles the referenced-side FK check when
+// the row being deleted (or whose key is being updated) lives in a LEAF
+// PARTITION of a table that is referenced by a foreign key. PostgreSQL clones
+// the FK's referenced-side action triggers down to every partition of the
+// referenced table, so `DELETE FROM ppk1` (ppk1 a partition of the referenced
+// `ppk`) must still reject the delete when a referencing row exists. The
+// violation names the LEAF partition as the referenced table, the per-partition
+// cloned constraint `<fkname>_<N>` (N = the leaf's 1-based ordinal among the
+// referenced parent's partition children — ChooseConstraintName's dedup suffix,
+// the same scheme as detachPartitionFKRefCheck), and the referencing (FK-owning)
+// table. fk-partitioned-1 Class B. The concurrent variant (a delete blocking
+// `<waiting ...>` behind an uncommitted ATTACH that holds the referenced rows)
+// is a separate slice — this only covers the committed-attach perms.
+// partitionParentTable returns the partitioned parent of child, preferring the
+// Table.PartitionParentOID field (set on the CREATE TABLE … PARTITION OF path)
+// and falling back to the live partitionChildren map (ATTACH PARTITION leaves
+// the field 0). Returns nil when child is not a partition of anything.
+func partitionParentTable(im *catalog.InMemory, child *catalog.Table) *catalog.Table {
+	if im == nil || child == nil {
+		return nil
+	}
+	poid := child.PartitionParentOID
+	if poid == 0 {
+		var ok bool
+		poid, ok = im.PartitionParentOf(child.OID)
+		if !ok {
+			return nil
+		}
+	}
+	parent, ok := im.LookupTableByOID(poid)
+	if !ok {
+		return nil
+	}
+	return parent
+}
+
+func enforceFKOnDeletePartitionAncestor(ctx *Context, leafTbl *catalog.Table, leafRow Row) error {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || leafTbl == nil {
+		return nil
+	}
+	// Walk the partition-ancestor chain (leaf → … → root partitioned parent),
+	// firing any FK that references an ancestor. partitionParentTable consults the
+	// live partitionChildren map (works for both PARTITION OF and ATTACH).
+	child := leafTbl
+	for child != nil {
+		parent := partitionParentTable(im, child)
+		if parent == nil {
+			break
+		}
+		// 1-based ordinal of `child` among `parent`'s partition children — the
+		// dedup suffix PostgreSQL appends to the cloned per-partition constraint.
+		suffix := 0
+		for i, c := range im.PartitionChildren(parent.OID) {
+			if c != nil && c.OID == child.OID {
+				suffix = i + 1
+				break
+			}
+		}
+		for _, ref := range im.FindFKsReferencingTable(parent.Name) {
+			// Skip per-partition FK clones (e.g. the copy ATTACH PARTITION places on
+			// pfk1): the violation must name the FK's ROOT partitioned table (pfk),
+			// and scanning that root already descends into every partition, so the
+			// clone is redundant. Matches PG, which reports the referencing relation
+			// where the constraint was declared, not the leaf partition.
+			if ref.Child != nil && im.IsPartitionChild(ref.Child.OID) {
+				continue
+			}
+			fk := ref.FK
+			refCols := fk.RefColumns
+			if len(refCols) == 0 {
+				refCols = pkColumns(parent)
+			}
+			vals, allNull := fkColValues(leafTbl.Columns, refCols, leafRow)
+			if allNull {
+				continue
+			}
+			found, err := scanTableForMatch(ctx, ref.Child, fk.Columns, vals)
+			if err != nil {
+				return err
+			}
+			if !found {
+				continue
+			}
+			cname := fkConstraintName(ref.Child, fk)
+			if suffix > 0 {
+				cname = fmt.Sprintf("%s_%d", cname, suffix)
+			}
+			return &ExecError{
+				Code: "23503",
+				Message: fmt.Sprintf("update or delete on table %q violates foreign key constraint %q on table %q",
+					leafTbl.Name, cname, ref.Child.Name),
+				Detail: fmt.Sprintf("Key (%s)=(%s) is still referenced from table %q.",
+					strings.Join(refCols, ", "), fkValsForDetail(vals), ref.Child.Name),
+			}
+		}
+		child = parent
+	}
 	return nil
 }
 

@@ -4119,6 +4119,14 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 					if err := o.dropTableByRef(childName, child, false); err != nil {
 						return err
 					}
+					// Record the cascade-dropped partition so a later EXPLICIT mention of
+					// the same partition in this multi-table DROP (e.g. teardown
+					// `DROP TABLE ppk, pfk, pfk1` where pfk1 is a partition of pfk) is
+					// skipped instead of raising "table ... does not exist". PostgreSQL
+					// resolves all DROP targets as one set, so a partition listed
+					// alongside its parent is dropped once, not twice. fk-partitioned-1.
+					cascadeDropped[childName.String()] = true
+					cascadeDropped[child.Name] = true
 				}
 				return nil
 			}
