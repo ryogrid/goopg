@@ -1448,6 +1448,32 @@ func TestPort_IsolationIndexOnlyScan(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/index-only-scan.spec")
 }
 
+// TestPort_IsolationIndexOnlyBitmapscan exercises the index-only-bitmapscan
+// spec: a regression guard for an unsound index-only bitmap heap scan removed
+// upstream. s1 opens a NO SCROLL cursor over `SELECT row_number() OVER () FROM
+// ios_bitmap WHERE a > 0 OR b > 0` (a BitmapOr over two indexes), FETCHes one
+// row to force the index-scan portion to run, then s2 VACUUMs after deleting
+// nearly all rows. With the historical bug the post-FETCH `FETCH ALL` returned
+// rows from pages VACUUM had marked all-visible despite their tuples being
+// dead; the correct result is 0 rows. goopg returns 1 row then 0 rows, matching
+// PG 18.3.
+//
+// Promoted to pass-required (M0118-0002, design 0118-0122). The sole remaining
+// blocker was that `EXPLAIN (COSTS OFF) DECLARE foo ... CURSOR FOR <query>`
+// (step s1_explain) raised 0A000 because the planner rejected a
+// DeclareCursorStmt inner — now unwrapped to plan the cursor's query. The
+// EXPLAIN plan body is stripped on both sides by the runner's established
+// plan-strategy normalization policy (goopg renders no BitmapOr node), so the
+// spec's actual anomaly check — the FETCH row counts — is what is compared and
+// it matches byte-for-byte with no execution-engine change.
+func TestPort_IsolationIndexOnlyBitmapscan(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_iob")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/index-only-bitmapscan.spec")
+}
+
 // TestPort_IsolationSkipLocked exercises the skip-locked spec: two sessions
 // each repeatedly SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1 from a 2-row queue.
 // SKIP LOCKED must skip rows already row-locked by the other session, so the

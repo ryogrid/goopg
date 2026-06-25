@@ -193,7 +193,16 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		// executor's explainOp now drives the inner plan
 		// through an instrumentation wrapper and reports actual
 		// rows/loops/timing per node.
-		inner, err := Plan(s.Inner, cat)
+		//
+		// EXPLAIN DECLARE c CURSOR FOR <query> explains the cursor's
+		// underlying query, mirroring PG's ExplainOneUtility →
+		// ExplainOneQuery dispatch for a DeclareCursorStmt. The cursor
+		// is never created; only its query is planned and rendered.
+		explainInner := s.Inner
+		if dc, ok := explainInner.(*parser.DeclareCursorStmt); ok {
+			explainInner = dc.Query
+		}
+		inner, err := Plan(explainInner, cat)
 		if err != nil {
 			return nil, err
 		}

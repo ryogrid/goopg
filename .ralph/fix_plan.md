@@ -191,6 +191,24 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       rejects `*parser.DeclareCursorStmt`) and the spec's core requirement, the
       `BitmapOr` bitmap-scan plan the EXPLAIN must render byte-for-byte. Both
       remain Effort-L → spec stays deferred. `TestParseVacuumTruncateOption`.
+      **`index-only-bitmapscan` PROMOTED (2026-06-25, design 0118-0122):** the
+      `s1_explain` `DeclareCursorStmt` rejection was the SOLE remaining blocker.
+      `planner.Plan`'s `ExplainStmt` case now unwraps a `DeclareCursorStmt`
+      inner to its `.Query` before planning (PG `ExplainOneUtility`→
+      `ExplainOneQuery`; the cursor is never created, only its query explained).
+      The earlier "must render `BitmapOr` byte-for-byte" requirement was an
+      over-estimate: `normalizeIsoOutput` STRIPS the EXPLAIN plan block on both
+      sides (established plan-strategy policy, same as merge-join), so goopg
+      rendering no `BitmapOr` node is irrelevant — only the EXPLAIN's success +
+      the spec's real anomaly check (the FETCH row counts: `s1_fetch_1`→1 row,
+      `s1_fetch_all`→0 rows, verifying the second VACUUM didn't wrongly mark
+      dead pages all-visible) are compared, and goopg already produces those on
+      its existing index-scan + cursor + VACUUM machinery. Strict
+      `TestPort_IsolationIndexOnlyBitmapscan` + executor unit
+      `TestExplainDeclareCursorExplainsInnerQuery`. Group stays open:
+      `predicate-gin`/`predicate-gist` need real GIN/GiST AMs; `predicate-hash`
+      over-detects 40001 (coarse relation-grain SIREAD). Isolation tally now
+      117 pass / 4 failed.
 - [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
       All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
       nowait{,-2,-3,-4,-5}, lock-nowait,
