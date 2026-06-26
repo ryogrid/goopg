@@ -2795,6 +2795,18 @@ func tryApplyHOTUpdate(
 	tup.Header.Infomask |= storage.HeapOnlyTuple
 	tup.Header.SetNatts(len(cols))
 	tup.Header.Infomask |= storage.HeapXmaxInvalid
+	// HEAP_HASVARWIDTH: PG18 nocachegetattr crashes when this bit is
+	// missing on a TupleDesc with varlena attrs. Mirrors PG's
+	// heap_fill_tuple (heaptuple.c:326). M0118-0129.
+	if pgRowHasVarWidth(cols, newRow) {
+		tup.Header.Infomask |= storage.HeapHasVarWidth
+	}
+	// HEAP_HASEXTERNAL: PG's heap_deform_tuple needs this bit to skip
+	// external TOAST pointers. Mirrors heap_fill_tuple (heaptuple.c:343).
+	// M0118-0129.
+	if pgRowHasExternal(cols, newRow) {
+		tup.Header.Infomask |= storage.HeapHasExternal
+	}
 	tupleBytes, err := tup.MarshalBinary()
 	if err != nil {
 		return false, err
@@ -2907,6 +2919,17 @@ func tryApplyHOTUpdate(
 		return storage.PageStampHotOldTuple(s.Page(), oldSlot, effectiveWriterXID(ctx), blk, newSlot)
 	}()
 	if stampErr != nil {
+		// Clean up the orphan new tuple: PageAddHeapTuple already
+		// wrote it to the page, but the old-slot stamp failed
+		// (e.g. PagePruneOpt invalidated the old slot). Without
+		// cleanup the tuple persists as a live HEAP_ONLY_TUPLE
+		// with no CTID link, wasting space and inflating the
+		// line-pointer count. M0118-0129.
+		if remErr := storage.PageRemoveHeapTuple(s.Page(), newSlot); remErr != nil {
+			// Non-fatal: page is still structurally valid; the
+			// orphan wastes space until the next VACUUM repacks
+			// the page. Do not surface this to the client.
+		}
 		s.Unlock()
 		ctx.Pool.Unpin(s)
 		if errors.Is(stampErr, storage.ErrUnsupportedItem) || errors.Is(stampErr, storage.ErrInvalidSlot) {
@@ -6638,6 +6661,21 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	}
 	tuple.Header.SetNatts(len(cols))
 	tuple.Header.Infomask |= storage.HeapXmaxInvalid
+	// HEAP_HASVARWIDTH: PG18's nocachegetattr fast path crashes when
+	// this bit is missing on a TupleDesc with varlena attrs. Mirrors
+	// PG's heap_fill_tuple (postgres/src/backend/access/common/
+	// heaptuple.c:326). The PG-canonical sibling
+	// writeHeapRowReturningPG already sets this; the regular path was
+	// missing it. M0118-0129.
+	if pgRowHasVarWidth(cols, row) {
+		tuple.Header.Infomask |= storage.HeapHasVarWidth
+	}
+	// HEAP_HASEXTERNAL: PG's heap_deform_tuple needs this bit to skip
+	// external TOAST pointers when computing attribute offsets.
+	// Mirrors PG's heap_fill_tuple (heaptuple.c:343). M0118-0129.
+	if pgRowHasExternal(cols, row) {
+		tuple.Header.Infomask |= storage.HeapHasExternal
+	}
 	tupleBytes, err := tuple.MarshalBinary()
 	if err != nil {
 		return ptr, err
@@ -6875,6 +6913,11 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 	// on pg_class). M0106-0010 batched-49.
 	if pgRowHasVarWidth(cols, row) {
 		tuple.Header.Infomask |= storage.HeapHasVarWidth
+	}
+	// HEAP_HASEXTERNAL: PG's heap_deform_tuple needs this bit
+	// for TOAST-external columns. M0118-0129.
+	if pgRowHasExternal(cols, row) {
+		tuple.Header.Infomask |= storage.HeapHasExternal
 	}
 	tupleBytes, err := tuple.MarshalBinary()
 	if err != nil {
