@@ -651,11 +651,16 @@ func (bt *BTree) pinNewOrRecycled() (*storage.Slot, storage.BlockNumber, error) 
 			return bt.pool.PinNew(bt.rel)
 		}
 		// Re-initialise the page bytes so the recycled slot looks
-		// like a fresh PinNew result.
+		// like a fresh PinNew result. The page must be zeroed under
+		// the content lock so a concurrent reader never observes a
+		// partially-zeroed page (M0118-0130: "btree: item length
+		// mismatch keyLen=9 total=37").
+		slot.Lock()
 		page := slot.Page()
 		for i := range page {
 			page[i] = 0
 		}
+		slot.Unlock()
 		// Caller will write opaque/header before MarkDirty.
 		return slot, blk, nil
 	}
