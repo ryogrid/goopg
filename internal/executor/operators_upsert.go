@@ -243,7 +243,10 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		// before the conflict probe, so BEFORE INSERT NOTICEs appear before any
 		// lock wait (M0100-0011).
 		if len(writeTbl.Triggers) > 0 {
-			ret, ok := fireTriggers(o.ctx, writeTbl, "before", "insert", nil, insertedForLeaf)
+			ret, ok, err := fireTriggers(o.ctx, writeTbl, "before", "insert", nil, insertedForLeaf)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue // BEFORE INSERT returned NULL — skip the row
 			}
@@ -287,7 +290,9 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				conflictRow = specConflictRow
 			} else {
 				if len(writeTbl.Triggers) > 0 {
-					fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf)
+					if _, _, err := fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf); err != nil {
+						return nil, err
+					}
 				}
 				o.appendUpsertRetRow(inserted)
 				o.rowsAffected++
@@ -429,7 +434,9 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 							continue
 						}
 						if len(writeTbl.Triggers) > 0 {
-							fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf)
+							if _, _, err := fireTriggers(o.ctx, writeTbl, "after", "insert", nil, insertedForLeaf); err != nil {
+								return nil, err
+							}
 						}
 						o.appendUpsertRetRow(inserted)
 						o.rowsAffected++
@@ -468,7 +475,10 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 				}
 				// Fire BEFORE UPDATE trigger per-row before applying the update (M0100-0011).
 				if len(writeTbl.Triggers) > 0 {
-					ret, ok := fireTriggers(o.ctx, writeTbl, "before", "update", conflictRow, updatedForLeaf)
+					ret, ok, err := fireTriggers(o.ctx, writeTbl, "before", "update", conflictRow, updatedForLeaf)
+					if err != nil {
+						return nil, err
+					}
 					if !ok {
 						continue nextSourceRow
 					}
@@ -483,7 +493,9 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 					return nil, err
 				}
 				if len(writeTbl.Triggers) > 0 {
-					fireTriggers(o.ctx, writeTbl, "after", "update", conflictRow, updatedForLeaf)
+					if _, _, err := fireTriggers(o.ctx, writeTbl, "after", "update", conflictRow, updatedForLeaf); err != nil {
+						return nil, err
+					}
 				}
 				o.appendUpsertRetRow(updated)
 				o.rowsAffected++

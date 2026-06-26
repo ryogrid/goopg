@@ -1,47 +1,40 @@
-Loop #24: M0118-0008 — PL/pgSQL single-column `SELECT … INTO record` field-access
-enabler (design 0118-0066). COMMITTED + pushed at loop end.
+Last landed (loop #75): `stats` rung 6 (M0118-0009, design 0118-0128) — relation
+tuple statistics. First divergence advanced **L2180 → L2704**. All 7 non-2PC
+table-stats permutations + the 2PC COMMIT PREPARED permutations match PG 18.3.
 
-## What landed (enabler, NOT a promotion)
-reindex-concurrently-toast.spec setup `DO` block: `SELECT INTO r reltoastrelid::regclass::text
-AS table_name …` then `EXECUTE 'ALTER TABLE ' || r.table_name || …`. After the 0118-0065
-GUC enabler the first divergence was `qualified names are not supported in PL/pgSQL
-expressions (0A000)` on `r.table_name`. Root cause = a real PL/pgSQL gap:
-`bindSelectIntoRow` (plpgsql_runtime.go) scalar-shortcut a SINGLE-COLUMN `SELECT … INTO`
-straight onto the target even when the target is a `record` var, so the `_<var>_<col>`
-sub-field + `compositeVarFields` entry the qualified-name expr path reads were never
-registered. Fix: guard the scalar shortcut with `!frame.isRecordVar(name)` so a record
-target routes to `bindRecordRowComposite` (the multi-column `SELECT * INTO r` path,
-0118-0054). Plain scalar targets unaffected.
+Files: internal/executor/pgstat_relations.go (NEW: relationStatsManager `relStats`
++ recordScan/Insert/Update/Delete + flush/get/dropTable/resetAll + shouldTrackCounts
++ recordRelScan + tableOIDFromCatalog), internal/executor/pgstat_relations_test.go
+(NEW), internal/executor/expr.go (9 pg_stat_get_* relation getters; flush+reset
+also drive relStats), internal/executor/operators_storage.go (seqScanOp.statReturned
++ Close record; scanMatching gains statOID param + 4 call sites; insert/update/
+deleteOp.Close record rowsAffected), internal/executor/operators_ddl.go
+(dropTableByRefImmediate → relStats.dropTable). Docs: design 0118-0128 + README row +
+fix_plan note.
 
-Files: internal/executor/plpgsql_runtime.go (bindSelectIntoRow guard + comment),
-internal/executor/plpgsql_select_into_test.go (new sel_rec_field case),
-docs/design/0118-0066-plpgsql-select-into-record-field.md + README index,
-.ralph/deferral_ledger.md + fix_plan note.
+Gates: go test ./internal/executor/ PASS; new pgstat_relations_test.go PASS;
+TestPort_IsolationStats soft probe L2180→L2704; build clean; pgbench smoke
+445305 txns 0 failed; tpch-spotcheck infra-FAIL (stale systemd scope, known WSL2
+issue — query output unchanged by counter-only hooks).
 
-Key symbols: bindSelectIntoRow, frame.isRecordVar, bindRecordRowComposite,
-lowerPLpgSQLExpr (qualified-ColumnRef handler, plpgsql_runtime.go ~L2061).
+Key model: numscans/tuples_returned NON-transactional (counted as scans run);
+ins/upd/del + live/dead deltas recorded at op.Close (= "applied at commit" for the
+autocommit simple-query path). INSERT +1 live/row; DELETE +1 dead −1 live/row;
+UPDATE +1 dead/row, live unchanged (no HOT). Getters return 0 (not NULL) for absent
+OID. track_counts (boot on) gates all counting.
 
-Gates: new TestPlpgSQLSelectInto/sel_rec_field PASS; go test ./internal/executor/ PASS;
-TestPlpgSQLRecordFieldAndText/ScalarSubquery/ForLoopMaterializeAndRecordFieldSubst/
-DoCommitChain* PASS; TestPort_IsolationPlpgsqlToast strict PASS (no regression);
-go build ./... clean; stash A/B probe confirms reind-con-toast divergence advanced
-0A000 → routine_column_usage 42P01. pgbench smoke = pre-commit hook.
-
-## M0118-0008 hard tail (all Effort-L, deferred — ledger has full blocker maps)
-- reindex-concurrently-toast: FUNDAMENTAL — needs real TOAST relations as catalog
-  objects (reltoastrelid=0; text/bytea stored inline). New post-enabler wall:
-  routine_column_usage (42P01) during the toast-rename EXECUTE. Multi-loop.
-- partition-concurrent-attach + alter-table-4: both need transactional DDL cross-session
-  catalog visibility (goopg applies DDL to shared in-mem catalog non-transactionally).
-  Milestone-sized MVCC catalog subsystem.
-- partition-drop-index-locking: pg_locks today reads ONLY the explicit-LOCK-TABLE
-  registry (globalRelLockMgr, pid hardcoded "0"), NOT the real heavyweight lockmgr
-  holders/waiters; needs a real-lockmgr pg_locks bridge + DROP INDEX recursive
-  partition-tree locking + partitioned-index CREATE propagation + pg_stat_activity
-  pid join. Probe: s3getlocks returns 0 rows; s2drop does not wait. Multi-loop.
-- WHERE CURRENT OF positioned UPDATE/DELETE: project-wide, parsed (CurrentOf) but no
-  executor site; needs per-row CTID capture in cursor + CTID-restricted rewrite.
-
-Next step: pick another bounded enabler from the hard tail next loop. partition-drop-
-index-locking's pg_locks→real-lockmgr bridge is the most broadly reusable, but it must
-land WITH DROP INDEX recursive locking to advance the spec (pid-only wiring is marginal).
+NEXT rung for `stats` (Effort-L; spec stays `defer`): **L2704 — transactional-counter
+abort/2PC reconciliation for relation stats.** The new first divergence is the
+`s1_begin … s1_prepare_a … s1_rollback_prepared_a` permutation (expected
+live=1/dead=8, current 3/6). Needs:
+- Stage tuples_inserted/_updated/_deleted + live/dead deltas PER TRANSACTION
+  (mirror PG_Stat_TableXactStatus), fold into shared at commit, and on
+  abort/ROLLBACK PREPARED: aborted insert+update tuples become DEAD (no live
+  increment); follow AtEOXact_PgStat_Relations rules incl. the `truncdropped` path
+  for in-txn TRUNCATE/DROP (later permutations L2775/L2815/L2861/L2901/L2947).
+- 2PC handoff of the staged relation counters to the prepared txn so cross-backend
+  COMMIT/ROLLBACK PREPARED applies them (mirror function-stats 2PC, design 0118-0127).
+- This requires replacing the op.Close "apply immediately" model with per-txn
+  staging for the transactional counters (non-transactional scan counters stay as-is).
+Then later: index-scan tuples_fetched, VACUUM vacuum_count/live-dead recompute, SLRU
+stats (pg_stat_slru).

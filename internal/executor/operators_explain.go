@@ -86,7 +86,12 @@ func (o *explainOp) Open(ctx *Context) error {
 		execNs = time.Since(execStart).Nanoseconds()
 
 		if opts.Format == parser.ExplainFormatJSON {
-			root := planToJSONWithStats(o.plan.Child, opts, stats)
+			// Upstream nests the plan tree under a top-level "Plan" key, with
+			// Planning Time / Execution Time as its siblings:
+			//   [ { "Plan": {...}, "Planning Time": .., "Execution Time": .. } ]
+			// horizons.spec reads ...->0->'Plan'->'Heap Fetches', so the
+			// wrapper is load-bearing (design 0118-0102).
+			root := map[string]any{"Plan": planToJSONWithStats(o.plan.Child, opts, stats)}
 			if summary {
 				root["Planning Time"] = nsToMs(planNs)
 				root["Execution Time"] = nsToMs(execNs)
@@ -111,11 +116,10 @@ func (o *explainOp) Open(ctx *Context) error {
 
 	if opts.Format == parser.ExplainFormatJSON {
 		// FORMAT JSON: emit one row whose cell is the JSON-
-		// encoded plan tree. The wrapping single-element array
-		// matches upstream's `[ {root} ]` shape so future
-		// extensions (multiple top-level entries) don't require
-		// a schema change.
-		root := planToJSON(o.plan.Child, opts)
+		// encoded plan tree, nested under a top-level "Plan" key
+		// inside the single-element array, matching upstream's
+		// `[ { "Plan": {root} } ]` shape (design 0118-0102).
+		root := map[string]any{"Plan": planToJSON(o.plan.Child, opts)}
 		out, err := json.MarshalIndent([]any{root}, "", "  ")
 		if err != nil {
 			return fmt.Errorf("explain: marshal JSON: %w", err)
@@ -464,6 +468,14 @@ func walkPlanAnalyzeFiltered(n planner.Node, depth int, rows *[]Row, opts parser
 	detailIndent := strings.Repeat(" ", len(prefix)+2)
 	emitNodeDetailLines(n, detailIndent, rows, attachedFilter)
 
+	// IndexOnlyScan emits a "Heap Fetches: N" detail line under ANALYZE,
+	// matching upstream's text format (design 0118-0102).
+	if _, isIOS := n.(*planner.IndexOnlyScan); isIOS {
+		if s, ok := stats[n]; ok && s != nil {
+			*rows = append(*rows, Row{NewStringDatum(detailIndent + fmt.Sprintf("Heap Fetches: %d", s.heapFetches))})
+		}
+	}
+
 	if opts.Verbose {
 		if cols := schemaColumnNames(n); len(cols) > 0 {
 			outline := indent + "  Output: " + strings.Join(cols, ", ")
@@ -488,6 +500,12 @@ func planToJSONWithStats(n planner.Node, opts parser.ExplainOptions, stats nodeS
 		if s.timing {
 			obj["Actual Startup Time"] = nsToMs(s.startupNs)
 			obj["Actual Total Time"] = nsToMs(s.totalNs)
+		}
+		// "Heap Fetches" is an IndexOnlyScan-only field upstream emits under
+		// ANALYZE (design 0118-0102). horizons.spec reads it via
+		// ...->'Plan'->'Heap Fetches'.
+		if _, isIOS := n.(*planner.IndexOnlyScan); isIOS {
+			obj["Heap Fetches"] = s.heapFetches
 		}
 	}
 	// Re-render Plans recursively with stats, replacing the
@@ -563,6 +581,8 @@ func describePlanVerbose(n planner.Node, verbose bool) string {
 		return "Seq Scan on " + tname
 	case *planner.IndexScan:
 		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
+	case *planner.IndexOnlyScan:
+		return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), schemaQualify(p.Table.QualifiedName()))
 	case *planner.Insert:
 		return "Insert on " + schemaQualify(p.Table.QualifiedName())
 	case *planner.Update:
@@ -626,6 +646,11 @@ func describePlan(n planner.Node) string {
 		return fmt.Sprintf("Seq Scan on %s", p.Table.QualifiedName())
 	case *planner.IndexScan:
 		return fmt.Sprintf("Index Scan using %s on %s", p.Index.QualifiedName(), p.Table.QualifiedName())
+	case *planner.IndexOnlyScan:
+		// M0118-0009 (design 0118-0102): horizons.spec inspects the IOS
+		// label via `EXPLAIN (COSTS OFF)` (pruner_query_plan) — mirror
+		// upstream's "Index Only Scan using <idx> on <table>".
+		return fmt.Sprintf("Index Only Scan using %s on %s", p.Index.QualifiedName(), p.Table.QualifiedName())
 	case *planner.Insert:
 		return fmt.Sprintf("Insert on %s", p.Table.QualifiedName())
 	case *planner.Update:

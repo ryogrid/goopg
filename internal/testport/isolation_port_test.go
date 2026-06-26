@@ -194,22 +194,81 @@ func runIsoSpecStrict(t *testing.T, root string, c *cluster.Cluster, specRelPath
 
 // TestPort_IsolationEvalPlanQual exercises the eval-plan-qual spec.
 // Requires: BEGIN ISOLATION LEVEL, GENERATED ALWAYS AS, CREATE TABLE INHERITS.
+// PROMOTED to pass-required (2026-06-25, design 0118-0106): all 50 permutations
+// match PG 18.3 byte-for-byte. The last divergence was the EPQ-over-join case
+// `selectresultforupdate` (FOR UPDATE OF jt over a join whose locked relation is
+// the inner index scan): goopg folded the index key condition `jt.id = y` into
+// the per-row EPQ recheck, but `y` is a join input's column whose index lives in
+// the join coordinate space — misread against the 2-column jointest tuple as
+// `jt.id = jt.data`, dropping the post-update row (returned 0 rows). Fixed by
+// only folding a row-local (constant) index key into the recheck; join/
+// correlated keys are excluded (the CTID-chain logic still catches key-column
+// changes). A sibling fix preserves build-side heap ctids through a lazy hash
+// join for the FOR-UPDATE-over-hash-join variant.
 func TestPort_IsolationEvalPlanQual(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_eval_plan_qual")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual.spec")
 }
 
 // TestPort_IsolationEvalPlanQualTrigger exercises the eval-plan-qual-trigger spec.
-// Requires: BEGIN ISOLATION LEVEL, CREATE TRIGGER, CREATE TABLE INHERITS.
+// PROMOTED to pass-required (2026-06-25, design 0118-0095): all 38 active
+// permutations match PG 18.3 byte-for-byte. The spec is the hardest half of the
+// EPQ output-parity pair — it stacks BEFORE/AFTER row triggers (plpgsql
+// trig_report firing on INSERT/UPDATE/DELETE) on top of READ COMMITTED EPQ
+// rechecks, key-update CTID-chain following, ON CONFLICT DO UPDATE upserts, and
+// REPEATABLE READ 40001 serialization failures, all with RETURNING projection
+// and NOTICE-emitting noisy_oper() WHERE quals. Its byte-for-byte match
+// evidences that goopg's EvalPlanQual re-projects through the trigger queue and
+// the upsert arbiter exactly as PG does. The sibling eval-plan-qual spec still
+// defers (EXPLAIN/column-format diffs), so the M0118-0007 group stays open.
 func TestPort_IsolationEvalPlanQualTrigger(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_eval_pq_trig")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual-trigger.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/eval-plan-qual-trigger.spec")
+}
+
+// TestPort_IsolationIntraGrantInplaceDb exercises the intra-grant-inplace-db
+// spec (M0118-0009, design 0118-0098). It verifies the catalog-tuple-xmax
+// serialization between a GRANT … ON DATABASE and a concurrent in-place
+// datfrozenxid update: a database-wide VACUUM (FREEZE) must <waiting ...> behind
+// an uncommitted GRANT TEMP ON DATABASE (whose lock IS the pg_database tuple's
+// xmax) and complete only after that transaction commits — exactly as PG's
+// heap_inplace_update_scan waits on the tuple xmax. goopg has no real pg_database
+// heap tuple, so the GRANT records its writer XID (Catalog.SetDatabaseACLChangeXID)
+// and the database-wide VACUUM waits on it via mvcc.WaitForXID. The observed
+// datfrozenxid never retreats (cmp3 → 0 rows). All output byte-identical to PG 18.3.
+func TestPort_IsolationIntraGrantInplaceDb(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_intra_grant_db")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/intra-grant-inplace-db.spec")
+}
+
+// TestPort_IsolationIntraGrantInplace exercises the intra-grant-inplace spec
+// (M0118-0009, design 0118-0117). It verifies the pg_class-tuple-xmax
+// serialization for GRANT/REVOKE ACL changes, FOR UPDATE/SHARE rowmarks, the
+// in-place relhasindex update (ALTER TABLE ADD PRIMARY KEY), and a virtual-
+// catalog tuple DELETE — all of which take no heavyweight lock on the object
+// but serialise on the pg_class tuple's xmax. The capstone permutation 10
+// (`b1 drop1 b3 sfu3 revoke4 c1 r3`) issues `DELETE FROM pg_class WHERE
+// relname = …` as a transaction-deferred table drop: sfu3's FOR UPDATE rowmark
+// <waiting ...> behind the delete xmax, returns 0 rows once it commits (the
+// relation is gone), and revoke4 — blocked behind sfu3's tuple lock — finds the
+// relation gone and raises the internal "cache lookup failed for relation <oid>"
+// elog, which the spec's DO block EXCEPTION handler catches and re-raises as a
+// REDACTED WARNING. All 10 permutations byte-identical to PG 18.3.
+func TestPort_IsolationIntraGrantInplace(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_intra_grant")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/intra-grant-inplace.spec")
 }
 
 // TestPort_IsolationLockCommittedKeyupdate exercises the lock-committed-keyupdate
@@ -331,6 +390,86 @@ func TestPort_IsolationCreateTrigger(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/create-trigger.spec")
 }
 
+// TestPort_IsolationAsyncNotify exercises the async-notify spec (M0118-0009,
+// design 0118-0090): LISTEN/NOTIFY/UNLISTEN, pg_notify(), and
+// pg_notification_queue_usage() across self- and cross-backend delivery, with
+// same-transaction de-duplication and ROLLBACK TO SAVEPOINT discard. Requires
+// the server-side notify hub (LISTEN/NOTIFY engine), the savepoint-aware NOTIFY
+// buffer (notifyLevel stack), pg_notification_queue_usage, multi-statement steps
+// running as one implicit transaction, and the isolation runner's per-step
+// notification capture (pq.ConnectorWithNotificationHandler → "<sess>: NOTIFY
+// ... from <src>" lines). Byte-identical to PG 18.3 across all six permutations.
+func TestPort_IsolationAsyncNotify(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_async_notify")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/async-notify.spec")
+}
+
+// TestPort_IsolationTimeouts exercises the timeouts spec (M0118-0009): the
+// statement_timeout and lock_timeout GUCs against both table-level (LOCK TABLE)
+// and row-level (DELETE on a row a concurrent UPDATE holds) lock waits. When a
+// waiter blocks behind a conflicting lock, whichever of the two timeouts is set
+// shorter fires first and cancels the statement with the matching SQLSTATE —
+// "canceling statement due to statement timeout" (57014) or "canceling
+// statement due to lock timeout" (55P03). The eight permutations cover every
+// combination of {statement-only, lock-only, lock-shorter, statement-shorter} ×
+// {table lock, row lock}. The blocked steps are marked (*) upstream because the
+// short 10ms timeouts mean the isolation tester may cancel the step before it
+// observes it as "waiting"; goopg reproduces PG 18.3 byte-for-byte across all
+// permutations with no engine change (statement_timeout/lock_timeout already
+// drive query cancellation), so this spec is promoted to pass-required.
+func TestPort_IsolationTimeouts(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_timeouts")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/timeouts.spec")
+}
+
+// TestPort_IsolationPreparedTransactionsCIC exercises the prepared-transactions-cic
+// spec (M0118-0009): CREATE INDEX CONCURRENTLY must interact correctly with a
+// prepared transaction. s1 PREPAREs a transaction that inserted a row; goopg keeps
+// the prepared transaction's mvcc slot active (same-backend 2PC, design 0118-0110)
+// so s2's CREATE INDEX CONCURRENTLY parks waiting for that start-time snapshot to
+// drain. With lock_timeout=10ms set, that wait is cancelled with "canceling
+// statement due to lock timeout" — mvcc.WaitForSlotsToCommit now arms the session
+// lock_timeout carried on the context (lockwait.Timeout) exactly like the
+// heavyweight lock manager's ProcSleep (design 0118-0111). After c1 COMMIT PREPARED
+// finalises the row, r2 reads it back (seqscan disabled is only a preference, so the
+// SELECT still succeeds even though the concurrent index build was cancelled).
+// Byte-identical to PG 18.3.
+func TestPort_IsolationPreparedTransactionsCIC(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_prepared_cic")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/prepared-transactions-cic.spec")
+}
+
+// TestPort_IsolationPreparedTransactions exercises the prepared-transactions
+// spec (M0118-0009, design 0118-0112): three overlapping SERIALIZABLE
+// transactions drive an s1 --rw--> s2 --rw--> s3 dangerous structure under
+// two-phase commit across all 1500 permutations, and exactly one of the three
+// must abort with 40001 in every permutation. Building on the same-backend 2PC
+// enabler (design 0118-0110), goopg now runs the SSI dangerous-structure check
+// at PREPARE TRANSACTION time (Manager.PrepareCheckForSerializationFailure) and
+// treats a PREPARED-but-not-committed peer like an already-committed one in the
+// read/write conflict hooks (Prepared/PrepareSeqNo mirror SXACT_FLAG_PREPARED /
+// prepareSeqNo). A dangerous structure whose pivot is already PREPARED makes the
+// preparer/committer commit suicide rather than dooming the durable pivot; an
+// rw-edge to a PREPARED writer dooms the reader. PREPARE on an already-aborted
+// block silently rolls back (no 25P02), matching PrepareTransactionBlock on
+// TBLOCK_ABORT. Byte-identical to PG 18.3 across all 1500 permutations.
+func TestPort_IsolationPreparedTransactions(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_prepared_transactions")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/prepared-transactions.spec")
+}
+
 // TestPort_IsolationInheritTemp exercises the inherit-temp spec (M0118-0008):
 // an inheritance tree whose children are TEMPORARY tables created in different
 // sessions. Each backend owns its own temp namespace, so s1's scan/UPDATE/
@@ -395,6 +534,27 @@ func TestPort_IsolationReindexConcurrently(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/reindex-concurrently.spec")
+}
+
+// TestPort_IsolationReindexConcurrentlyToast exercises the reindex-concurrently-toast
+// spec (M0118-0008) — the last unpromoted spec of the suite. The spec renames a
+// table's TOAST relation/index to deterministic names under allow_system_table_mods
+// (TOAST-exposure epic slices 1–4) and then runs REINDEX {TABLE,INDEX} CONCURRENTLY
+// pg_toast.<name> while a concurrent session holds the parent table locked. The
+// REINDEX waits for the parent's lockers (waitForRelationLockers) without blocking
+// concurrent DML, completes after the holder commits/rolls back, and errors
+// `relation "pg_toast.<name>" does not exist` when the holder dropped the parent —
+// byte-identical to PG 18.3 across all 60 permutations.
+//
+// PASS-REQUIRED (design 0118-0088): the synthetic TOAST relation/index resolves
+// through its parent (catalog.ToastParentTable + LookupToastRel) so the REINDEX
+// routes to the same CONCURRENTLY wait the non-toast reindex-concurrently spec uses.
+func TestPort_IsolationReindexConcurrentlyToast(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_reindex_conc_toast")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/reindex-concurrently-toast.spec")
 }
 
 func TestPort_IsolationReindexSchema(t *testing.T) {
@@ -487,6 +647,27 @@ func TestPort_IsolationAlterTable1(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-1.spec")
+}
+
+// TestPort_IsolationAlterTable4 exercises the alter-table-4 spec (M0118-0008):
+// add/remove inheritance (ALTER TABLE NO INHERIT / INHERIT), DROP TABLE of an
+// inheritance child, and ALTER COLUMN TYPE on a child, all concurrent with
+// SELECT SUM(a) FROM the parent.
+//
+// PASS-REQUIRED (designs 0118-0080/0081/0082). Children are identified at plan
+// time but locked only when the scan opens, so a concurrent NO INHERIT / INHERIT
+// is not seen by the in-flight SELECT (perms 1-2), a concurrent DROP of a child
+// is coped with by skipping the vanished child (perm 3), and a concurrent
+// ALTER COLUMN a TYPE float on the child raises "attribute \"a\" of relation
+// \"c1\" does not match parent's type" once the child's lock is acquired
+// post-commit (perm 4) — mirroring PostgreSQL's make_inh_translation_list.
+// Byte-identical to PG 18.3 across all four permutations.
+func TestPort_IsolationAlterTable4(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_alter_table_4")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/alter-table-4.spec")
 }
 
 // TestPort_IsolationPlpgsqlToast exercises the plpgsql-toast spec (M0118-0008):
@@ -619,6 +800,26 @@ func TestPort_IsolationClusterConflictPartition(t *testing.T) {
 // The cross-session plan cache is bypassed while any detach is pending
 // (partitionDetachPending), so each statement re-plans against its own snapshot
 // epoch. Byte-identical to PG 18.3 across all 13 permutations. Design 0118-0059.
+// TestPort_IsolationPartitionConcurrentAttach exercises the
+// partition-concurrent-attach spec (M0118-0008): a non-default partition is
+// attached to a range-partitioned table concurrently with an INSERT that, under
+// its pre-attach snapshot, routes through the table's sub-partitioned DEFAULT
+// partition. The INSERT takes a ROW EXCLUSIVE lock on every intermediate
+// partition along its routing path (esp. the default), which conflicts with the
+// ATTACH's ACCESS EXCLUSIVE lock on the default (design 0118-0076), so whichever
+// statement runs second waits for the other's transaction to commit; the loser
+// is then re-validated against a fresh snapshot — the routed INSERT re-routes
+// onto the now-visible sibling and raises 23514, or the ATTACH's default-content
+// re-scan finds the rows and raises 23P01. Byte-identical to PG 18.3 across all 3
+// permutations. Design 0118-0079.
+func TestPort_IsolationPartitionConcurrentAttach(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_partition_concurrent_attach")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/partition-concurrent-attach.spec")
+}
+
 func TestPort_IsolationDetachPartitionConcurrently1(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_detach_partition_1")
@@ -724,6 +925,25 @@ func TestPort_IsolationVacuumNoCleanupLock(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/vacuum-no-cleanup-lock.spec")
+}
+
+// TestPort_IsolationPartitionDropIndexLocking exercises the
+// partition-drop-index-locking spec (M0118-0008). DROP INDEX on a partitioned
+// index, while a concurrent SELECT holds ACCESS SHARE on a leaf partition, must
+// (a) block on the partition-tree AccessExclusiveLock acquired top-down and
+// (b) keep the dropped index's pg_class row + the dropper's lock visible to a
+// third observing session's `pg_locks JOIN pg_class` until the dropping
+// transaction commits. The latter is the transactional-DDL visibility piece:
+// execDropIndex defers the catalog/relfile/WAL removal of a non-CONCURRENTLY
+// DROP INDEX issued inside an explicit transaction to COMMIT
+// (ApplyPendingIndexDrops), so the index stays in the shared catalog meanwhile.
+// Byte-identical to PG 18.3 (design 0118-0074).
+func TestPort_IsolationPartitionDropIndexLocking(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_part_drop_idx_lock")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/partition-drop-index-locking.spec")
 }
 
 // TestPort_IsolationFkSnapshot exercises the fk-snapshot spec.
@@ -1034,6 +1254,25 @@ func TestPort_IsolationPredicateLockHotTuple(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/predicate-lock-hot-tuple.spec")
 }
 
+// TestPort_IsolationPredicateHash exercises predicate-hash: PAGE (bucket) level
+// predicate locking in a hash index. Two SERIALIZABLE transactions each probe a
+// hash-indexed column by equality and INSERT rows. A scan and an insert that
+// touch the SAME bucket form an rw-conflict (so an overlapping interleaving
+// aborts the loser with 40001), while a scan and an insert that touch DIFFERENT
+// buckets must NOT conflict — the reduced-false-positive half of the test.
+// Promoted to pass-required (M0118-0009, design 0118-0099): a declared-hash
+// index now drives a bucket-grain SIREAD predicate lock (ssiRecordHashBucketRead
+// / ssiRecordHashIndexInsert) instead of a seq scan's relation-grain lock, so
+// goopg matches PG 18.3 byte-for-byte across all 40 permutations (previously
+// over-aborted the 12 different-bucket interleavings).
+func TestPort_IsolationPredicateHash(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_predicate_hash")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/predicate-hash.spec")
+}
+
 // TestPort_IsolationPartialIndex exercises partial-index: an UPDATE that moves a
 // row out of a partial index (CREATE INDEX ... WHERE val2 = 1) under SERIALIZABLE
 // must still create the read/write dependency a full-table read would, so any
@@ -1094,15 +1333,103 @@ func TestPort_IsolationFkContention(t *testing.T) {
 // a child row (taking FOR KEY SHARE on the shared parent — non-conflicting, so
 // both proceed via a multixact lock set) and then UPDATE disjoint parent rows.
 // No lock cycle forms, so both commit without a deadlock abort, matching PG 18.3.
-// The sibling fk-deadlock spec (where the parent UPDATEs *do* form a cycle)
-// remains deferred — goopg's FK row-lock wait over-conflicts there (ledger
-// 2026-06-22). Promoted to pass-required (M0118-0005, design 0118-0023).
+// Promoted to pass-required (M0118-0005, design 0118-0023). The sibling
+// fk-deadlock spec is now also promoted (see TestPort_IsolationFkDeadlock,
+// design 0118-0094).
 func TestPort_IsolationFkDeadlock2(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_fk_deadlock2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-deadlock2.spec")
+}
+
+// TestPort_IsolationFkDeadlock exercises fk-deadlock: two sessions each INSERT a
+// child row referencing the same parent (each taking an implicit FOR KEY SHARE
+// on that parent row), then each issues a *no-key* UPDATE of the parent. The FK
+// KEY SHARE check must be COMPATIBLE with a concurrent in-flight no-key UPDATE —
+// only a key UPDATE or a DELETE conflicts with FOR KEY SHARE — so the child
+// INSERTs never wait; the blocking that does appear comes solely from the two
+// no-key UPDATEs serialising against each other. goopg previously over-waited:
+// the FK match scan (scanRelForFKMatch) treated ANY in-flight non-self updater
+// as a conflict, so a child INSERT blocked where PG proceeds. Fixed by making
+// the FK scan key-aware (only a key-changing updater — StatusUpdate /
+// structurally-detected DELETE — is a conflict). Promoted to pass-required
+// (M0118-0005, design 0118-0094).
+func TestPort_IsolationFkDeadlock(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_fk_deadlock")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-deadlock.spec")
+}
+
+
+// TestPort_IsolationFkPartitioned1 exercises fk-partitioned-1: cloning a foreign
+// key onto a partition (ALTER TABLE pfk ATTACH PARTITION pfk1) must ensure the
+// referenced values still exist, even while a referenced row is being
+// concurrently deleted. Three classes of permutation:
+//   - Class A: the referenced row is deleted before/during the attach → the
+//     attach's RI_Initial_Check fails 23503 naming "pfk1"/"pfk_a_fkey".
+//   - committed Class B: the attach commits, then DELETE FROM ppk1 (a leaf of
+//     the *referenced* ppk) is rejected on the referenced side, 23503 naming
+//     "pfk_a_fkey_1" on table "pfk".
+//   - concurrent Class B: DELETE FROM ppk1 runs while the attach is still
+//     uncommitted → it blocks <waiting ...> behind the attach's held-to-commit
+//     KEY SHARE on the referenced rows, then errors once the attach commits.
+//
+// Promoted M0118-0005/0009 across three slices: design 0118-0118 (Class A
+// referencing-side clone + validation on ATTACH), 0118-0119 (committed Class B
+// referenced-side check + ordinal-suffixed constraint name), and 0118-0120 (the
+// concurrent Class B wait: the deferred attach records its XID so a concurrent
+// referenced-row DELETE waits for it to commit, then re-evaluates).
+func TestPort_IsolationFkPartitioned1(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_fk_partitioned1")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-partitioned-1.spec")
+}
+
+// TestPort_IsolationFkPartitioned2 exercises fk-partitioned-2: an FK that
+// references a PARTITIONED table (pfk -> ppk, both list-partitioned) must
+// enforce referential integrity across the concurrent INSERT-vs-DELETE race.
+//   - INSERT into pfk while the referenced ppk row is being concurrently
+//     deleted: the FK's SELECT FOR KEY SHARE blocks <waiting ...> on the
+//     deleter; once it commits, READ COMMITTED re-evaluates and emits the
+//     23503 FK violation, while REPEATABLE READ / SERIALIZABLE cannot walk the
+//     update chain past their snapshot and surface 40001 "could not serialize
+//     access due to concurrent update".
+//   - DELETE FROM the partitioned parent ppk (routed to leaf ppk1) while a
+//     referencing pfk row is being concurrently inserted: blocks on the
+//     inserter, then errors naming the LEAF partition and its ordinal-suffixed
+//     clone constraint, "update or delete on table \"ppk1\" violates foreign
+//     key constraint \"pfk_a_fkey_1\" on table \"pfk\"".
+//
+// Promoted M0118-0005 (design 0118-0121): scanTableForMatchFKWait raises 40001
+// on a committed key-changing parent updater under RR/SSI, and enforceFKOnDelete
+// routes a partitioned-parent delete to its leaf so the referenced-side
+// violation names the per-partition clone.
+func TestPort_IsolationFkPartitioned2(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_fk_partitioned2")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/fk-partitioned-2.spec")
+}
+
+// TestPort_IsolationRiTrigger exercises trigger-based referential integrity
+// under SERIALIZABLE: BEFORE UPDATE/DELETE and BEFORE INSERT/UPDATE plpgsql
+// triggers that PERFORM a query and RAISE on FOUND / NOT FOUND, plus SSI 40001
+// when the two transactions' read/write sets overlap. Promoted M0118-0009
+// (design 0118-0097): trigger-body errors now abort the DML, PERFORM accepts a
+// full query form, and FOUND is tracked.
+func TestPort_IsolationRiTrigger(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_ri_trigger")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/ri-trigger.spec")
 }
 
 // TestPort_IsolationIndexOnlyScan exercises the index-only-scan spec: a
@@ -1119,6 +1446,32 @@ func TestPort_IsolationIndexOnlyScan(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/index-only-scan.spec")
+}
+
+// TestPort_IsolationIndexOnlyBitmapscan exercises the index-only-bitmapscan
+// spec: a regression guard for an unsound index-only bitmap heap scan removed
+// upstream. s1 opens a NO SCROLL cursor over `SELECT row_number() OVER () FROM
+// ios_bitmap WHERE a > 0 OR b > 0` (a BitmapOr over two indexes), FETCHes one
+// row to force the index-scan portion to run, then s2 VACUUMs after deleting
+// nearly all rows. With the historical bug the post-FETCH `FETCH ALL` returned
+// rows from pages VACUUM had marked all-visible despite their tuples being
+// dead; the correct result is 0 rows. goopg returns 1 row then 0 rows, matching
+// PG 18.3.
+//
+// Promoted to pass-required (M0118-0002, design 0118-0122). The sole remaining
+// blocker was that `EXPLAIN (COSTS OFF) DECLARE foo ... CURSOR FOR <query>`
+// (step s1_explain) raised 0A000 because the planner rejected a
+// DeclareCursorStmt inner — now unwrapped to plan the cursor's query. The
+// EXPLAIN plan body is stripped on both sides by the runner's established
+// plan-strategy normalization policy (goopg renders no BitmapOr node), so the
+// spec's actual anomaly check — the FETCH row counts — is what is compared and
+// it matches byte-for-byte with no execution-engine change.
+func TestPort_IsolationIndexOnlyBitmapscan(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_iob")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/index-only-bitmapscan.spec")
 }
 
 // TestPort_IsolationSkipLocked exercises the skip-locked spec: two sessions
@@ -1361,7 +1714,7 @@ func TestPort_IsolationDeleteAbortSavept(t *testing.T) {
 	c := newCluster(t, "iso_delete_abort_savept")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept.spec")
 }
 
 // TestPort_IsolationDeleteAbortSavept2 is the funkier delete-abort-savept
@@ -1373,7 +1726,7 @@ func TestPort_IsolationDeleteAbortSavept2(t *testing.T) {
 	c := newCluster(t, "iso_delete_abort_savept2")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept-2.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/delete-abort-savept-2.spec")
 }
 
 // TestPort_IsolationAbortedKeyrevoke exercises the aborted-keyrevoke spec: s1
@@ -1387,7 +1740,7 @@ func TestPort_IsolationAbortedKeyrevoke(t *testing.T) {
 	c := newCluster(t, "iso_aborted_keyrevoke")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/aborted-keyrevoke.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/aborted-keyrevoke.spec")
 }
 
 // TestPort_IsolationMultixactNoForget exercises the multixact-no-forget spec: s1
@@ -1447,6 +1800,49 @@ func TestPort_IsolationSubxidOverflow(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/subxid-overflow.spec")
+}
+
+// TestPort_IsolationTempSchemaCleanup exercises the temp-schema-cleanup spec
+// (M0118-0009, design 0118-0091). Permutation 1 (DISCARD TEMP cleanup) passes
+// on the per-session temp-namespace model + pg_my_temp_schema() + DISCARD TEMP
+// drop landed this loop and is hard-guarded by
+// TestSyntax_TempSchema_MyTempSchemaAndDiscard. Permutation 2 (backend
+// self-termination via pg_terminate_backend, session-exit temp+namespace
+// cleanup with advisory-lock release ordering, the isolationtester
+// connection-death "FATAL / server closed the connection unexpectedly"
+// rendering, and temp-type dependency cascade of uses_a_temp_type) is deferred
+// — this anchor runIsoSpec()-skips until the whole spec matches byte-for-byte.
+func TestPort_IsolationTempSchemaCleanup(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_temp_schema_cleanup")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/temp-schema-cleanup.spec")
+}
+
+// TestPort_IsolationHorizons exercises the horizons spec (M0118-0009, design
+// 0118-0104): pruning and vacuuming must respect concurrent sessions. For a
+// TEMPORARY relation, rows a session deleted ARE reclaimable despite another
+// session's older snapshot (temp data is private to the owning backend, so the
+// index-only scan's Heap Fetches drops to 0 after a prune-on-read or VACUUM);
+// for a PERMANENT relation those rows must survive (Heap Fetches stays 2) while
+// the older snapshot lives. This loop landed the TEMPORARY half plus the
+// no-vacuum permanent permutations — 4 of 5 permutations match PG 18.3: temp
+// relations vacuum and prune at the session-local horizon
+// (mvcc.OldestXminForProc), the index-only scan prunes the temp heap pages it
+// touched after the scan, and a reclaimed index entry (LP_UNUSED/LP_DEAD root)
+// is skipped without a heap-fetch tally. runIsoSpec (soft) until the final
+// permanent-table VACUUM-respects-snapshot permutation lands: it needs an
+// explicit RR transaction's snapshot xmin registered in the proc array, which
+// requires capturing the RR snapshot at the batched BEGIN+first-statement step,
+// and doing so exposes a latent RR concurrent-update (40001) detection gap that
+// regresses eval-plan-qual-trigger (deferred; see the design doc).
+func TestPort_IsolationHorizons(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_horizons")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/horizons.spec")
 }
 
 // TestPort_IsolationDeadlockSimple exercises the deadlock-simple spec: two
@@ -1544,6 +1940,21 @@ func TestPort_IsolationTuplelockUpgradeNoDeadlock(t *testing.T) {
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/tuplelock-upgrade-no-deadlock.spec")
+}
+
+// TestPort_IsolationStats drives the cumulative-statistics isolation spec
+// (pg_stat_* function/relation/SLRU stats). Soft (runIsoSpec) — the spec
+// exercises several pgstat subsystems still being built rung by rung
+// (M0118-0009); this anchor t.Skip()s with the first-divergence diff until the
+// whole spec matches PG 18.3 byte-for-byte. The function-statistics half plus
+// transactional DROP FUNCTION cross-session visibility (designs 0118-0123/0124
+// and the deferred-routine-drop rung) are landed.
+func TestPort_IsolationStats(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_stats")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/stats.spec")
 }
 
 // buildDSN constructs a lib/pq DSN for the given cluster.

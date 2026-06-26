@@ -251,6 +251,30 @@ func (p *parser) advance() Token {
 	return t
 }
 
+// grantObjectName resolves the relation name in a GRANT/REVOKE object list,
+// given the name token and the two tokens that follow it. A schema-qualified
+// `schema.table` (name, ".", table) yields the table component; otherwise the
+// bare name. Used to key a table ACL change to its pg_class tuple (0118-0109).
+func grantObjectName(name, after1, after2 Token) string {
+	if after1.Kind == TokenSymbol && after1.Value == "." {
+		return after2.Value
+	}
+	return name.Value
+}
+
+// grantNonTableClass reports whether word names a GRANT object class other than
+// TABLE (the default). Such grants do not change a pg_class ACL tuple, so the
+// in-place relhasindex serialization (0118-0109) does not apply.
+func grantNonTableClass(word string) bool {
+	switch strings.ToLower(word) {
+	case "schema", "sequence", "function", "procedure", "routine",
+		"domain", "type", "language", "tablespace", "foreign",
+		"large", "all", "parameter", "system":
+		return true
+	}
+	return false
+}
+
 // errAtCur builds a SyntaxError pinned at the current token. The
 // message echoes the token text, matching upstream's "at or near".
 func (p *parser) errAtCur(msg string) error {
@@ -456,13 +480,36 @@ identLedStatement:
 			// they don't bubble up as parse errors when the server is
 			// running multi-statement batches.
 			p.advance()
+			// Scan the remaining tokens for the ACL object class so the executor can
+			// model PG's catalog-tuple-xmax serialization between an ACL change and a
+			// concurrent in-place catalog update: `ON DATABASE` (datfrozenxid via
+			// VACUUM, design 0118-0098) or `ON [TABLE] <name>` (relhasindex via ALTER
+			// TABLE ADD PRIMARY KEY, design 0118-0109). The default GRANT object class
+			// is TABLE, so a bare `ON <ident>` is a table grant.
+			databaseACL := false
+			tableACL := ""
 			for p.cur().Kind != TokenEOF {
 				if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
 					break
 				}
+				if strings.EqualFold(p.cur().Value, "on") {
+					next := p.peek(1)
+					switch {
+					case strings.EqualFold(next.Value, "database"):
+						databaseACL = true
+					case strings.EqualFold(next.Value, "table"):
+						// `ON TABLE <name>` — the name follows the TABLE keyword.
+						tableACL = grantObjectName(p.peek(2), p.peek(3), p.peek(4))
+					case grantNonTableClass(next.Value):
+						// SCHEMA/SEQUENCE/FUNCTION/… — not a per-table ACL change.
+					default:
+						// Default object class is TABLE: `ON <name>`.
+						tableACL = grantObjectName(next, p.peek(2), p.peek(3))
+					}
+				}
 				p.advance()
 			}
-			return &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value)}, nil
+			return &CompatNoopStmt{pos: t.Pos, Tag: strings.ToUpper(t.Value), DatabaseACL: databaseACL, TableACL: tableACL}, nil
 		case "comment":
 			p.advance() // consume "comment" token
 			// COMMENT ON {TABLE|INDEX|COLUMN|CONSTRAINT} … IS 'text'|NULL
@@ -504,6 +551,12 @@ identLedStatement:
 			// LOCK [TABLE] [ONLY] rel [, ...] [IN lock_mode MODE] [NOWAIT].
 			// M0097: parse into LockTableStmt so the executor can track locks in pg_locks.
 			return p.parseLockTable(t.Pos)
+		case "listen":
+			return p.parseListen()
+		case "notify":
+			return p.parseNotify()
+		case "unlisten":
+			return p.parseUnlisten()
 		}
 	}
 	return nil, p.errAtCur("unsupported statement")
@@ -876,13 +929,40 @@ func (p *parser) parseIsolationLevelName() (string, error) {
 // parseCommit: COMMIT [WORK | TRANSACTION] | END [WORK | TRANSACTION]
 func (p *parser) parseCommit() (Stmt, error) {
 	t := p.advance()
+	// COMMIT PREPARED 'gid' — two-phase-commit commit phase. "PREPARED" is an
+	// unreserved word lexed as an identifier. M0118-0009 (prepared-transactions).
+	if p.peekIdentText("prepared") {
+		p.advance() // PREPARED
+		gid, gerr := p.parseStrLit()
+		if gerr != nil {
+			return nil, gerr
+		}
+		return &CommitPreparedStmt{pos: t.Pos, Gid: gid}, nil
+	}
 	_ = p.acceptKeyword(KwWork) || p.acceptKeyword(KwTransaction)
 	return &CommitStmt{pos: t.Pos}, nil
+}
+
+// peekIdentText reports whether the current token is an identifier matching the
+// given (lowercase) text. The lexer lowercases unquoted identifiers, so callers
+// pass a lowercase literal. M0118-0009.
+func (p *parser) peekIdentText(text string) bool {
+	t := p.cur()
+	return t.Kind == TokenIdent && t.Value == text
 }
 
 // parseRollback: ROLLBACK [WORK | TRANSACTION] | ROLLBACK TO [SAVEPOINT] name | ABORT [WORK | TRANSACTION]
 func (p *parser) parseRollback() (Stmt, error) {
 	t := p.advance()
+	// ROLLBACK PREPARED 'gid' — two-phase-commit abort phase. M0118-0009.
+	if p.peekIdentText("prepared") {
+		p.advance() // PREPARED
+		gid, gerr := p.parseStrLit()
+		if gerr != nil {
+			return nil, gerr
+		}
+		return &RollbackPreparedStmt{pos: t.Pos, Gid: gid}, nil
+	}
 	// ROLLBACK TO [SAVEPOINT] name
 	if p.acceptKeyword(KwTo) {
 		_ = p.acceptKeyword(KwSavepoint)
@@ -927,6 +1007,63 @@ func (p *parser) parseSavepointName() (string, error) {
 	}
 	p.advance()
 	return t.Value, nil
+}
+
+// parseChannelName reads a LISTEN/NOTIFY/UNLISTEN channel identifier. An
+// unquoted identifier is matched case-folded (the lexer already lowercases
+// TokenIdent / TokenKeyword); a double-quoted identifier preserves case. This
+// mirrors PostgreSQL, which treats the channel as a regular identifier.
+func (p *parser) parseChannelName() (string, error) {
+	t := p.cur()
+	if t.Kind != TokenIdent && t.Kind != TokenKeyword && t.Kind != TokenQuotedIdent {
+		return "", p.errAtCur("expected channel name")
+	}
+	p.advance()
+	return t.Value, nil
+}
+
+// parseListen: LISTEN channel. M0118-0009 (async-notify).
+func (p *parser) parseListen() (Stmt, error) {
+	t := p.advance() // consume "listen"
+	ch, err := p.parseChannelName()
+	if err != nil {
+		return nil, err
+	}
+	return &ListenStmt{pos: t.Pos, Channel: ch}, nil
+}
+
+// parseNotify: NOTIFY channel [, 'payload']. M0118-0009 (async-notify).
+func (p *parser) parseNotify() (Stmt, error) {
+	t := p.advance() // consume "notify"
+	ch, err := p.parseChannelName()
+	if err != nil {
+		return nil, err
+	}
+	stmt := &NotifyStmt{pos: t.Pos, Channel: ch}
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "," {
+		p.advance() // consume ,
+		payload, perr := p.parseStrLit()
+		if perr != nil {
+			return nil, perr
+		}
+		stmt.Payload = payload
+		stmt.HasPayload = true
+	}
+	return stmt, nil
+}
+
+// parseUnlisten: UNLISTEN { channel | * }. M0118-0009 (async-notify).
+func (p *parser) parseUnlisten() (Stmt, error) {
+	t := p.advance() // consume "unlisten"
+	if p.cur().Kind == TokenSymbol && p.cur().Value == "*" {
+		p.advance()
+		return &UnlistenStmt{pos: t.Pos, All: true}, nil
+	}
+	ch, err := p.parseChannelName()
+	if err != nil {
+		return nil, err
+	}
+	return &UnlistenStmt{pos: t.Pos, Channel: ch}, nil
 }
 
 // parseVacuum: VACUUM [(opt [, opt …])] [target [, target …]]
@@ -1009,7 +1146,13 @@ func (p *parser) parseVacuumOptionList(v *VacuumStmt) error {
 			} else {
 				_ = p.acceptIdentKeyword("auto")
 			}
-		case p.acceptIdentKeyword("truncate"):
+		case p.acceptKeyword(KwTruncate) || p.acceptIdentKeyword("truncate"):
+			// TRUNCATE lexes as the unreserved keyword KwTruncate (it also
+			// leads the TRUNCATE TABLE statement), so acceptIdentKeyword alone
+			// never matches inside the VACUUM option list — accept the keyword
+			// token too. goopg's VACUUM (vacuumCore) never physically truncates
+			// trailing empty pages, so NoTruncate is honoured trivially; we
+			// still record it for parity and future relation-truncation work.
 			if p.acceptKeyword(KwFalse) || p.acceptIdentKeyword("false") {
 				v.NoTruncate = true
 			} else {
@@ -1493,6 +1636,17 @@ func (p *parser) parseCluster() (Stmt, error) {
 // parsePrepare: PREPARE name [(param_type, …)] AS query (M0096-0006)
 func (p *parser) parsePrepare() (Stmt, error) {
 	t := p.advance() // PREPARE
+	// PREPARE TRANSACTION 'gid' — two-phase-commit prepare phase. Shares the
+	// PREPARE keyword with prepared statements; the TRANSACTION keyword
+	// disambiguates. M0118-0009 (prepared-transactions).
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTransaction {
+		p.advance() // TRANSACTION
+		gid, gerr := p.parseStrLit()
+		if gerr != nil {
+			return nil, gerr
+		}
+		return &PrepareTransactionStmt{pos: t.Pos, Gid: gid}, nil
+	}
 	nameIdent, err := p.parseIdent()
 	if err != nil {
 		return nil, err

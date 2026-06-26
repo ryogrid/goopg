@@ -155,6 +155,14 @@ type indexScanOp struct {
 	// The returned `&o.slot` pointer is stable across calls; its
 	// `row` field is overwritten each Next.
 	slot MaterializedSlot
+
+	// hashBucketScan is set in Open when this is a SERIALIZABLE equality scan
+	// over a HASH index (design 0118-0099). When true the scan takes a
+	// bucket-grain SIREAD on the index instead of a relation-grain / per-tuple
+	// heap lock, and the per-tuple reads in Next switch to conflict-out-only so
+	// they cannot coarsen into a heap-page lock that would re-introduce the
+	// different-bucket false positive (predicate-hash spec).
+	hashBucketScan bool
 }
 
 func newIndexScanOp(p *planner.IndexScan) *indexScanOp {
@@ -216,6 +224,15 @@ func (o *indexScanOp) openPrep(ctx *Context) error {
 		}
 		return err
 	}
+	// PostgreSQL locks every index of the scanned relation in AccessShare, not
+	// only the one this scan probes (get_relation_info opens them all). M0118-0008
+	// (partition-drop-index-locking).
+	if err := ctx.acquireScanIndexReadLocksTxn(o.plan.Table); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 	// M0118-0001: the SERIALIZABLE index-scan SIREAD predicate lock is no
 	// longer acquired eagerly here. Its granularity now depends on what the
 	// probe matches and is decided at the end of Rescan once the matching TID
@@ -271,6 +288,10 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	// (after RangeScan, or on the unbound/NULL-key early returns).
 	isFullKeyProbe := len(o.plan.Index.Columns) == 1 &&
 		(o.plan.Key != nil || len(o.plan.Keys) > 0)
+	// A hash index supports only single-column equality, so any full-key probe
+	// over a declared-hash index is a bucket probe (design 0118-0099). Mark it so
+	// the gap-lock and per-tuple-read paths use bucket-grain predicate locking.
+	o.hashBucketScan = isFullKeyProbe && o.plan.Index.DeclaredHash
 
 	var loBytes, hiBytes []byte
 	if len(o.plan.Keys) > 0 {
@@ -339,6 +360,11 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 	if err := o.tree.RangeScan(loBytes, hiBytes, scanFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
+	if o.hashBucketScan && len(loBytes) > 0 {
+		// Bucket-grain SIREAD on the hash index in place of the relation-grain
+		// gap lock (design 0118-0099). loBytes is the encoded equality key.
+		ssiRecordHashBucketRead(o.ctx, o.heapRel.DBOid, o.plan.Index.OID, loBytes)
+	}
 	o.ssiRecordIndexScanGapLock(isFullKeyProbe)
 	return nil
 }
@@ -366,6 +392,13 @@ func (o *indexScanOp) Rescan(outerSlot SlotView, outerWidth int) error {
 // are filtered here.
 func (o *indexScanOp) ssiRecordIndexScanGapLock(isFullKeyProbe bool) {
 	if isFullKeyProbe && len(o.tids) > 0 {
+		return
+	}
+	if o.hashBucketScan {
+		// A hash bucket probe never takes the relation-grain gap lock — the
+		// bucket-grain SIREAD (taken in Open from the probe key) is the whole
+		// phantom mechanism, even when the probe matched no tuple. Design
+		// 0118-0099.
 		return
 	}
 	if o.plan.Table == nil || (!o.plan.Table.Temp && !o.plan.Table.IsMatView) {
@@ -473,7 +506,16 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		// structure to an already-committed writer and must abort the scan
 		// mid-statement (40001). The heap page RLock/pin was already released
 		// above (after the decode), so just propagate the error.
-		if err := ssiRecordTupleRead(o.ctx, o.heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
+		if o.hashBucketScan {
+			// Conflict-out only: the bucket-grain SIREAD on the index (Open)
+			// covers the phantom; a heap tuple SIREAD here would coarsen to a
+			// heap-page lock and re-introduce the different-bucket false positive
+			// (design 0118-0099). The write-before-read same-bucket edge still
+			// forms via this conflict-out against the in-flight inserter's xmin.
+			if err := ssiConflictOutTupleRead(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
+				return nil, err
+			}
+		} else if err := ssiRecordTupleRead(o.ctx, o.heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
 			return nil, err
 		}
 		// M0092-0007: stack-aliased slot — reuse o.slot across

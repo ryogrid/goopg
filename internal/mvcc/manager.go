@@ -22,6 +22,10 @@ const (
 var (
 	ErrUnknownTransaction = errors.New("mvcc: unknown transaction")
 	ErrXIDWraparound      = errors.New("mvcc: xid wraparound is not implemented")
+	// ErrUnsupportedDetach is returned by DetachToDedicatedSlot for a
+	// SERIALIZABLE transaction, whose SSI bookkeeping is keyed by the
+	// transaction Handle and cannot be relocated without re-keying. M0118-0009.
+	ErrUnsupportedDetach = errors.New("mvcc: cannot detach a SERIALIZABLE transaction to a dedicated slot")
 )
 
 // TxnHandle is an opaque, monotonically-allocated identifier for an
@@ -59,6 +63,21 @@ type Manager struct {
 
 	abortedMu   sync.RWMutex
 	abortedXIDs []storage.TransactionID
+
+	// releasedWaiterXIDs holds top-level XIDs whose transaction block is still
+	// open in its proc-array slot but whose statement-level abort (a deadlock
+	// victim, mirroring PostgreSQL's AbortTransaction) has already released the
+	// XID for the purpose of WaitForXID / IsXIDActive. A peer blocked on this
+	// XID's catalog-tuple xmax (the intra-grant-inplace pg_class in-place wait)
+	// then unblocks at the abort rather than at the victim's later explicit
+	// ROLLBACK/COMMIT, while the slot itself stays active so that explicit
+	// COMMIT/ROLLBACK still finalises the (write-less) transaction normally —
+	// the victim never recorded any heap write to make visible. Snapshot
+	// visibility is intentionally NOT consulted against this set (it reads the
+	// slot/CLOG as before). Cleared when the slot is finished. Design 0118-0115
+	// (intra-grant-inplace perm 8).
+	releasedWaiterMu   sync.RWMutex
+	releasedWaiterXIDs map[storage.TransactionID]struct{}
 
 	// clog, when non-nil, is the durable commit log attached to every snapshot
 	// this Manager captures (M0117-0002). It lets Snapshot.SeesCommittedXID fall
@@ -205,7 +224,9 @@ func (m *Manager) Begin(iso IsolationLevel, procNums ...int32) (Transaction, err
 		// that pass an explicit procNum — the old counter-based approach falsely
 		// allocated slot 1 on the very first call, clobbering a live connection.
 		found := false
-		sz := len(m.procArray.slots)
+		// Scan only the connection/internal region; the high region is reserved
+		// for detached prepared transactions (DetachToDedicatedSlot). M0118-0009.
+		sz := min(ConnSlotCount, len(m.procArray.slots))
 		for i := 1; i < sz; i++ {
 			if m.procArray.slots[i].inTxn.CompareAndSwap(0, 1) {
 				procNum = int32(i)
@@ -415,6 +436,67 @@ func (m *Manager) Rollback(tx Transaction) error {
 	return m.finish(tx, XactAbort)
 }
 
+// DetachToDedicatedSlot relocates tx off its originating backend's proc slot
+// onto a fresh dedicated slot, returning the moved Transaction (a new Handle,
+// the same XID / isolation / snapshot). It is the goopg analogue of PostgreSQL
+// handing a PREPAREd transaction to a dummy PGPROC: the originating backend's
+// slot is freed so the backend can begin further transactions, while the
+// prepared transaction's state (active XID, snapshot xmin) stays live in the
+// proc array — visible as in-progress to other sessions and committable /
+// abortable later from ANY backend via Commit/Rollback on the returned
+// Transaction.
+//
+// Restricted to READ COMMITTED / REPEATABLE READ (ErrUnsupportedDetach for
+// SERIALIZABLE): SSI predicate locks and rw-conflict records are keyed by the
+// transaction Handle and would need re-keying. The SERIALIZABLE 2PC paths keep
+// the transaction on its original slot (same-backend finalisation) instead.
+// M0118-0009 (stats — cross-backend two-phase commit).
+func (m *Manager) DetachToDedicatedSlot(tx Transaction) (Transaction, error) {
+	if tx.Isolation == IsolationSerializable {
+		return Transaction{}, ErrUnsupportedDetach
+	}
+	oldProc := int32(tx.Handle) - 1
+	if oldProc < 0 || int(oldProc) >= len(m.procArray.slots) {
+		return Transaction{}, ErrUnknownTransaction
+	}
+	old := &m.procArray.slots[oldProc]
+	if old.inTxn.Load() == 0 {
+		return Transaction{}, ErrUnknownTransaction
+	}
+	// Claim a fresh dedicated slot from the reserved high region so no backend
+	// reusing a connection/internal procNum can later clobber it.
+	newProc := int32(-1)
+	for i := ConnSlotCount; i < len(m.procArray.slots); i++ {
+		if m.procArray.slots[i].inTxn.CompareAndSwap(0, 1) {
+			newProc = int32(i)
+			break
+		}
+	}
+	if newProc < 0 {
+		return Transaction{}, fmt.Errorf("mvcc: no free process slots to detach prepared transaction")
+	}
+	xid := old.xid.Load()
+	ns := &m.procArray.slots[newProc]
+	// Populate the dedicated slot fully BEFORE clearing the old one so a
+	// concurrent OldestXmin/snapshot reader always observes the XID as active in
+	// at least one slot (it may briefly appear in both — harmless).
+	ns.xid.Store(xid)
+	ns.xmin.Store(old.xmin.Load())
+	ns.firstSnap = old.firstSnap
+	ns.snapshotXmin = old.snapshotXmin
+	ns.isolation = old.isolation
+	ns.pinnedSnap.Store(old.pinnedSnap.Load())
+	// ns.inTxn already 1 from the CAS above.
+	// Release the originating backend's slot so it can begin new transactions.
+	old.xid.Store(0)
+	old.firstSnap = nil
+	old.pinnedSnap.Store(false)
+	old.xmin.Store(^uint64(0))
+	old.snapshotXmin = ^uint32(0)
+	old.inTxn.Store(0)
+	return Transaction{Handle: TxnHandle(newProc + 1), XID: storage.TransactionID(xid), Isolation: tx.Isolation}, nil
+}
+
 // AllocateSubXid allocates a fresh XID for a subtransaction and registers
 // it as a child of parentXid. The sub-XID is not tracked in the proc-array
 // (subxact XIDs are not independent top-level transactions); visibility is
@@ -482,6 +564,37 @@ func (m *Manager) OldestXmin() storage.TransactionID {
 	return result
 }
 
+// OldestXminForProc is the session-local pruning horizon: the lowest xid still
+// observable by ONLY the transaction occupying proc slot procNum, ignoring all
+// other backends. PostgreSQL applies this narrower horizon (GlobalVisTempRels)
+// to TEMPORARY relations — a temp table is private to its owning backend, so a
+// concurrent session holding an older snapshot cannot see (and therefore cannot
+// be harmed by reclaiming) the temp table's deleted rows. Used by VACUUM and the
+// index-only-scan prune-on-read for temp relations (horizons.spec, M0118-0009).
+//
+// It still respects the owning backend's OWN in-progress transaction: the slot's
+// assigned xid (a row the backend itself just deleted but has not committed) and
+// its snapshot xmin both floor the result, so an uncommitted delete is never
+// reclaimable. Falls back to the global OldestXmin when procNum is out of range
+// or the slot is idle (conservative — never reclaims more than the global path).
+func (m *Manager) OldestXminForProc(procNum int32) storage.TransactionID {
+	if procNum < 0 || int(procNum) >= len(m.procArray.slots) {
+		return m.OldestXmin()
+	}
+	s := &m.procArray.slots[procNum]
+	if s.inTxn.Load() == 0 {
+		return m.OldestXmin()
+	}
+	result := storage.TransactionID(m.xidgen.Peek())
+	if xid := s.xid.Load(); xid != 0 && storage.TransactionID(xid) < result {
+		result = storage.TransactionID(xid)
+	}
+	if xmin := s.xmin.Load(); xmin != ^uint64(0) && storage.TransactionID(xmin) < result {
+		result = storage.TransactionID(xmin)
+	}
+	return result
+}
+
 func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 	procNum := int32(tx.Handle) - 1
 	if procNum < 0 || int(procNum) >= len(m.procArray.slots) {
@@ -542,6 +655,16 @@ func (m *Manager) finish(tx Transaction, kind XactMarker) error {
 		m.abortedMu.Lock()
 		m.abortedXIDs = insertSortedXID(m.abortedXIDs, xid)
 		m.abortedMu.Unlock()
+	}
+
+	// Drop any deadlock-victim waiter-release marker now that the slot is
+	// genuinely finished. Design 0118-0115 (intra-grant-inplace perm 8).
+	if xid != storage.InvalidTransactionID {
+		m.releasedWaiterMu.Lock()
+		if m.releasedWaiterXIDs != nil {
+			delete(m.releasedWaiterXIDs, xid)
+		}
+		m.releasedWaiterMu.Unlock()
 	}
 
 	// M0104-0002: release SSI bookkeeping for SERIALIZABLE
@@ -769,18 +892,41 @@ func (m *Manager) SnapshotActiveOtherSlots(selfHandle TxnHandle) []int {
 }
 
 // WaitForSlotsToCommit blocks until every slot in active has finished its
-// transaction (inTxn back to 0), or ctx is cancelled. The active set is the
-// caller's responsibility to capture (see SnapshotActiveOtherSlots). A nil/empty
-// set returns immediately.
+// transaction (inTxn back to 0), or ctx is cancelled, or the session's
+// lock_timeout budget carried on ctx (lockwait.Timeout) elapses. The active set
+// is the caller's responsibility to capture (see SnapshotActiveOtherSlots). A
+// nil/empty set returns immediately.
+//
+// The lock_timeout arm mirrors the heavyweight lock manager (lockmgr.ProcSleep):
+// a CREATE INDEX CONCURRENTLY that parks here waiting on a still-running
+// transaction — including a prepared transaction whose slot stays active until
+// COMMIT/ROLLBACK PREPARED — is cancelled with lockwait.ErrLockTimeout once the
+// budget elapses, which the executor maps to "canceling statement due to lock
+// timeout", independent of statement_timeout (prepared-transactions-cic
+// isolation spec, M0118-0009).
 func (m *Manager) WaitForSlotsToCommit(ctx context.Context, active []int) error {
 	if len(active) == 0 {
 		return nil
 	}
 
+	// Arm the session's lock_timeout, if one is carried on ctx. The timer is
+	// re-armed from the moment this wait begins, matching upstream's
+	// enable_timeout_after(LOCK_TIMEOUT) at the top of ProcSleep.
+	var lockTimeoutCh <-chan time.Time
+	if d, ok := lockwait.Timeout(ctx); ok {
+		lt := time.NewTimer(d)
+		defer lt.Stop()
+		lockTimeoutCh = lt.C
+	}
+
+	timedOut := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
+			m.commitCond.Broadcast()
+		case <-lockTimeoutCh:
+			close(timedOut)
 			m.commitCond.Broadcast()
 		case <-done:
 		}
@@ -792,6 +938,11 @@ func (m *Manager) WaitForSlotsToCommit(ctx context.Context, active []int) error 
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		select {
+		case <-timedOut:
+			return lockwait.ErrLockTimeout
+		default:
 		}
 		allDone := true
 		for _, i := range active {
@@ -843,6 +994,9 @@ func (m *Manager) IsXIDActive(xid storage.TransactionID) bool {
 // so a per-subxid IsAborted check is sufficient (no ancestry walk needed).
 // M0118-0004 (docs/design/0118-0012).
 func (m *Manager) xidActiveWithSubxact(xid storage.TransactionID) bool {
+	if m.xidWaitersReleased(xid) {
+		return false
+	}
 	if m.xidInProgress(xid) {
 		return true
 	}
@@ -851,7 +1005,53 @@ func (m *Manager) xidActiveWithSubxact(xid storage.TransactionID) bool {
 		// Not a subxid (or unresolved) — already shown not in progress above.
 		return false
 	}
+	if m.xidWaitersReleased(top) {
+		return false
+	}
 	return m.xidInProgress(top) && !m.IsAborted(xid)
+}
+
+// xidWaitersReleased reports whether xid was released for WaitForXID/IsXIDActive
+// purposes by a deadlock-victim statement abort while its slot stays open
+// (ReleaseXIDWaiters). Design 0118-0115 (intra-grant-inplace perm 8).
+func (m *Manager) xidWaitersReleased(xid storage.TransactionID) bool {
+	if xid == storage.InvalidTransactionID {
+		return false
+	}
+	m.releasedWaiterMu.RLock()
+	defer m.releasedWaiterMu.RUnlock()
+	if m.releasedWaiterXIDs == nil {
+		return false
+	}
+	_, ok := m.releasedWaiterXIDs[xid]
+	return ok
+}
+
+// ReleaseXIDWaiters marks xid as no longer active for the purpose of WaitForXID /
+// IsXIDActive and wakes every blocked waiter, WITHOUT clearing xid's proc-array
+// slot. It is the in-place half of PostgreSQL's AbortTransaction for a deadlock
+// victim: the victim's transaction block stays open (so its eventual explicit
+// COMMIT/ROLLBACK still finalises the slot through the canonical path) but a peer
+// blocked on the victim's catalog-tuple xmax — the intra-grant-inplace pg_class
+// in-place wait — unblocks at the abort rather than at the victim's later
+// ROLLBACK. The victim is write-less in every spec that uses this (its statement
+// errored before writing), so leaving snapshot visibility to read the still-open
+// slot/CLOG unchanged is correct. The marker is cleared when the slot is finished.
+// Design 0118-0115 (intra-grant-inplace perm 8).
+func (m *Manager) ReleaseXIDWaiters(xid storage.TransactionID) {
+	if xid == storage.InvalidTransactionID {
+		return
+	}
+	m.releasedWaiterMu.Lock()
+	if m.releasedWaiterXIDs == nil {
+		m.releasedWaiterXIDs = make(map[storage.TransactionID]struct{})
+	}
+	m.releasedWaiterXIDs[xid] = struct{}{}
+	m.releasedWaiterMu.Unlock()
+
+	m.waitMu.Lock()
+	m.commitCond.Broadcast()
+	m.waitMu.Unlock()
 }
 
 // HasAbortedXID reports whether xid is recorded in the manager's aborted

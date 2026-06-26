@@ -128,7 +128,13 @@ func (p *bodyParser) parseTopBlock() (*Block, error) {
 		return nil, err
 	}
 	if excBlock != nil {
-		block.Statements = append(stmts, excBlock)
+		// The statements preceding EXCEPTION are the protected body: wrap them in
+		// the ExceptionBlock's TryBody so a runtime error in any of them is caught
+		// by the WHEN handlers. (Previously they were appended as siblings, leaving
+		// TryBody empty — so an error aborted the list before the handler could
+		// run.) M0118-0009 (intra-grant-inplace perm 10, design 0118-0117).
+		excBlock.TryBody = stmts
+		block.Statements = []Stmt{excBlock}
 	} else {
 		block.Statements = stmts
 	}
@@ -317,6 +323,15 @@ func (p *bodyParser) parseStmt() (Stmt, error) {
 	// RAISE [NOTICE|WARNING|ERROR|EXCEPTION] 'msg'. M0096-0012.
 	case t.Kind == parser.TokenIdent && strings.EqualFold(t.Value, "raise"):
 		return p.parseRaise()
+	// GRANT / REVOKE embedded in a PL/pgSQL body. The main SQL lexer keeps
+	// these as plain identifiers (no reserved keyword), so a bare `REVOKE
+	// SELECT ON t FROM PUBLIC;` would otherwise fall through to parseAssign
+	// and fail with "expected ':=' or '='". Route them to the embedded-SQL
+	// path like INSERT/UPDATE/etc. (the main parser resolves them to a
+	// CompatNoopStmt.TableACL). M0118-0009 (intra-grant-inplace perm 9).
+	case t.Kind == parser.TokenIdent &&
+		(strings.EqualFold(t.Value, "grant") || strings.EqualFold(t.Value, "revoke")):
+		return p.parseSQLStmt()
 	case t.Kind == parser.TokenIdent:
 		// Stage A 4b: bare identifier at statement start.
 		// Handle: ident := value (assignment)
@@ -341,7 +356,10 @@ func (p *bodyParser) parseNestedBlock() (*Block, error) {
 	p.acceptSymbol(";")
 	block := &Block{pos: beginPos, Statements: stmts}
 	if excBlock != nil {
-		block.Statements = append(stmts, excBlock)
+		// Wrap the preceding statements as the ExceptionBlock's protected body so
+		// their errors are caught by the handlers (see parseTopBlock). M0118-0009.
+		excBlock.TryBody = stmts
+		block.Statements = []Stmt{excBlock}
 	}
 	return block, nil
 }
@@ -512,20 +530,44 @@ func (p *bodyParser) parseFor() (Stmt, error) {
 	}, nil
 }
 
-// parsePerform parses `PERFORM expr ;`.
+// parsePerform parses `PERFORM query ;`.
+//
+// PostgreSQL executes the text after PERFORM as `SELECT <query>` (so it may be
+// a full query with FROM/WHERE, not only a scalar expression) and sets FOUND.
+// We capture the raw source up to the terminating ';' and, when it happens to
+// parse as a plain expression (the common `PERFORM foo()` case), also keep the
+// parsed Expr for the scalar fast path. M0118-0009 (design 0118-0097).
 func (p *bodyParser) parsePerform() (*PerformStmt, error) {
 	perfTok, err := p.expectKeyword(parser.KwPerform)
 	if err != nil {
 		return nil, err
 	}
-	expr, err := p.scanExprToSemicolon("PERFORM expression")
-	if err != nil {
-		return nil, err
+	srcStart := p.cur().Pos
+	if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+		return nil, p.errAt(srcStart, "PERFORM expression requires a non-empty expression")
 	}
-	if !p.acceptSymbol(";") {
+	for p.cur().Kind != parser.TokenEOF {
+		if p.cur().Kind == parser.TokenSymbol && p.cur().Value == ";" {
+			break
+		}
+		p.advance()
+	}
+	if p.cur().Kind != parser.TokenSymbol || p.cur().Value != ";" {
 		return nil, p.errAtCur("expected ';' to terminate PERFORM statement")
 	}
-	return &PerformStmt{pos: perfTok.Pos, Expr: expr}, nil
+	raw := strings.TrimSpace(p.src[srcStart:p.cur().Pos])
+	p.advance() // consume ';'
+	if raw == "" {
+		return nil, p.errAt(srcStart, "PERFORM expression requires a non-empty expression")
+	}
+	stmt := &PerformStmt{pos: perfTok.Pos, Query: raw}
+	// Scalar fast path: keep the parsed expression when the source is a plain
+	// expression. A query form (FROM/WHERE/…) fails ParseExpr and is executed
+	// as SQL by the runtime via Query.
+	if expr, perr := parser.ParseExpr(raw); perr == nil {
+		stmt.Expr = expr
+	}
+	return stmt, nil
 }
 
 // parseExit parses `EXIT [ WHEN cond ] ;`.
@@ -1010,9 +1052,15 @@ func (p *bodyParser) parseExecute() (*ExecuteStmt, error) {
 
 	stmt := &ExecuteStmt{pos: pos, Query: queryExpr}
 
-	// Optional INTO clause
+	// Optional INTO [STRICT] clause
 	if p.cur().Kind == parser.TokenKeyword && p.cur().Keyword == parser.KwInto {
 		p.advance() // consume INTO
+		// STRICT is an unreserved word; it surfaces as a plain identifier here
+		// (mirrors the SELECT ... INTO STRICT handling above).
+		if st := p.cur(); st.Kind == parser.TokenIdent && strings.EqualFold(st.Value, "strict") {
+			stmt.Strict = true
+			p.advance()
+		}
 		varTok := p.advance()
 		if varTok.Kind != parser.TokenIdent {
 			return nil, p.errAt(varTok.Pos, "expected variable name after INTO")

@@ -44,6 +44,30 @@ func TestUpdateState(t *testing.T) {
 	}
 }
 
+// TestUpdateStateRetainsQueryOnIdle verifies PG's pg_stat_activity.query
+// semantics: once a backend has executed a statement, its query text is
+// retained through the return to idle (and idle-in-transaction). It must NOT
+// be cleared when the dispatcher reports the backend idle with an empty query
+// string — an idle-in-transaction backend must still expose its last
+// statement so pg_locks JOIN pg_stat_activity (the
+// partition-drop-index-locking spec's s3getlocks) observes it.
+// M0118-0008, design 0118-0073.
+func TestUpdateStateRetainsQueryOnIdle(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&Backend{PID: "1", State: "active"})
+	// Dispatcher marks the backend active with the running statement...
+	r.UpdateState(procNumOf(1), "active", "SELECT * FROM t;")
+	// ...then idle with an empty query string once execution completes.
+	r.UpdateState(procNumOf(1), "idle", "")
+	snap := r.Snapshot()
+	if snap[0].State != "idle" {
+		t.Errorf("state = %q, want idle", snap[0].State)
+	}
+	if snap[0].Query != "SELECT * FROM t;" {
+		t.Errorf("query = %q, want retained %q", snap[0].Query, "SELECT * FROM t;")
+	}
+}
+
 func TestUpdateStateNonExistent(t *testing.T) {
 	r := NewRegistry()
 	// Unregistered procNum — must not panic or error.

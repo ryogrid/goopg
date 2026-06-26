@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
@@ -78,6 +79,11 @@ type plpgsqlFrame struct {
 	// (and for function arguments) so that field access / assignment works
 	// inside the PL/pgSQL body. M0097-composite.
 	compositeVarFields map[string][]catalog.CompositeField
+	// found is the PL/pgSQL special FOUND boolean for this frame. It is set
+	// by SQL-issuing statements (PERFORM, SELECT INTO, embedded DML, …) to
+	// whether the underlying query produced at least one row, and read via a
+	// bare `FOUND` reference. M0118-0009 (design 0118-0097).
+	found bool
 }
 
 // plpgsqlTrigCtx holds the trigger execution context injected into
@@ -119,6 +125,17 @@ func (f *plpgsqlFrame) add(name string, typ catalog.Type, value Datum) error {
 func (f *plpgsqlFrame) lookup(name string) (int, bool) {
 	idx, ok := f.indexByName[strings.ToLower(strings.TrimSpace(name))]
 	return idx, ok
+}
+
+// setPlpgsqlFrameVar binds name to value, adding the variable as a text scalar if
+// it does not already exist or overwriting it in place if it does. Used to inject
+// the SQLERRM / SQLSTATE diagnostics into an exception handler's frame. M0118-0009.
+func setPlpgsqlFrameVar(f *plpgsqlFrame, name string, value Datum) {
+	if idx, ok := f.lookup(name); ok {
+		f.values[idx] = value
+		return
+	}
+	_ = f.add(name, catalog.Type{Name: "text"}, value)
 }
 
 // isRecordVar reports whether the named PL/pgSQL variable is a record or
@@ -294,6 +311,28 @@ func executeStoredRoutine(r *catalog.Routine, args []Datum, ctx *Context, pos in
 			Message: fmt.Sprintf("%s(%s) is a procedure", r.Name, routineArgTypesStr(r)),
 			Hint:    "To call a procedure, use CALL."}
 	}
+	// Cumulative function statistics (pgstat). When the calling session's
+	// track_functions GUC enables it, time the call and accumulate one
+	// invocation into the session's pending stats (flushed to the shared store
+	// by pg_stat_force_next_flush). Default track_functions='none' skips this
+	// entirely, so the normal call path is untouched. Design 0118-0124.
+	if shouldTrackFunction(ctx, r) {
+		start := time.Now()
+		d, err := dispatchStoredRoutineByLanguage(r, args, ctx, pos)
+		elapsed := time.Since(start)
+		// goopg does not separate nested-call time, so self == total. The spec
+		// only checks total_time/self_time > 0, which holds for any executed
+		// body (the spec's functions pg_sleep to guarantee a positive interval).
+		funcStats.record(sessionStatsID(ctx), r.OID, elapsed, elapsed)
+		return d, err
+	}
+	return dispatchStoredRoutineByLanguage(r, args, ctx, pos)
+}
+
+// dispatchStoredRoutineByLanguage runs a (non-procedure) stored routine by its
+// implementation language. Split out of executeStoredRoutine so the
+// function-statistics path can wrap it with timing.
+func dispatchStoredRoutineByLanguage(r *catalog.Routine, args []Datum, ctx *Context, pos int) (Datum, error) {
 	switch strings.ToLower(r.Language) {
 	case "plpgsql":
 		return executePLpgSQLRoutine(r, args, ctx, pos)
@@ -1245,10 +1284,23 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.PerformStmt:
-		_, err := evalPLpgSQLExpr(s.Expr, frame, ctx)
+		// PERFORM runs its argument as `SELECT <query>`, discards the rows, and
+		// sets FOUND from the row count. M0118-0009 (design 0118-0097).
+		if s.Expr != nil {
+			// Scalar fast path (e.g. PERFORM foo()): evaluate for side effects.
+			// `SELECT <scalar>` yields exactly one row, so FOUND is true.
+			if _, err := evalPLpgSQLExpr(s.Expr, frame, ctx); err != nil {
+				return Datum{}, flowNone, err
+			}
+			frame.found = true
+			return Datum{}, flowNone, nil
+		}
+		// Query form (FROM/WHERE/…): run as SELECT and set FOUND from row count.
+		n, err := execPLpgSQLEmbeddedSQL("SELECT "+s.Query, frame, ctx)
 		if err != nil {
 			return Datum{}, flowNone, err
 		}
+		frame.found = n > 0
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.NullStmt:
@@ -1460,7 +1512,14 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		}
 		if ctx != nil {
 			msg := raiseMsgEval()
-			ctx.AddNotice(msg)
+			// RAISE WARNING surfaces at WARNING severity (vs NOTICE/INFO/LOG/DEBUG).
+			// The isolation runner echoes each message with its real protocol
+			// severity, so the level must be preserved. M0118-0009 (perm 10).
+			if strings.EqualFold(s.Level, "warning") {
+				ctx.AddWarning(msg)
+			} else {
+				ctx.AddNotice(msg)
+			}
 		}
 		return Datum{}, flowNone, nil
 
@@ -1510,18 +1569,37 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 			return Datum{}, flowNone, addExecCtx(perr)
 		}
 		slot, perr := op.Next()
-		// Copy the INTO result datum before Close() so releaseRow() does not
-		// zero it out underneath us. M0100-0005 fix: slot row is pooled.
+		// Copy the INTO result datum before the next Next()/Close() so the
+		// pooled slot row is not zeroed underneath us. M0100-0005 fix.
 		var intoVal Datum
-		if s.IntoVar != "" && slot != nil && (perr == nil || perr == EOF) {
+		rowCount := 0
+		if slot != nil && perr == nil {
 			row := slot.Row()
 			if len(row) > 0 {
 				intoVal = row[0]
+			}
+			rowCount = 1
+			// EXECUTE ... INTO STRICT requires exactly one row; pull a second to
+			// detect a multi-row result (mirrors the SELECT ... INTO STRICT path).
+			if s.Strict {
+				if s2, e2 := op.Next(); e2 == nil && s2 != nil {
+					rowCount = 2
+				} else if e2 != nil && e2 != EOF {
+					perr = e2
+				}
 			}
 		}
 		op.Close()
 		if perr != nil && perr != EOF {
 			return Datum{}, flowNone, addExecCtx(perr)
+		}
+		if s.Strict {
+			if rowCount == 0 {
+				return Datum{}, flowNone, addExecCtx(&ExecError{Code: "P0002", Message: "query returned no rows"})
+			}
+			if rowCount > 1 {
+				return Datum{}, flowNone, addExecCtx(&ExecError{Code: "P0003", Message: "query returned more than one row"})
+			}
 		}
 		if s.IntoVar != "" {
 			if idx, ok := frame.lookup(s.IntoVar); ok {
@@ -1532,9 +1610,13 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 
 	case *plpgsql.SQLStmt:
 		// Execute embedded SQL with trigger OLD/NEW substitution. M0096-0012.
-		if err := execPLpgSQLEmbeddedSQL(s.SQL, frame, ctx); err != nil {
+		n, err := execPLpgSQLEmbeddedSQL(s.SQL, frame, ctx)
+		if err != nil {
 			return Datum{}, flowNone, err
 		}
+		// PostgreSQL sets FOUND after a SQL statement to whether it produced /
+		// affected at least one row. M0118-0009 (design 0118-0097).
+		frame.found = n > 0
 		return Datum{}, flowNone, nil
 
 	case *plpgsql.SelectIntoStmt:
@@ -1784,16 +1866,24 @@ func executePLpgSQLStmt(stmt plpgsql.Stmt, r *catalog.Routine, frame *plpgsqlFra
 		if err == nil {
 			return v, flow, nil
 		}
-		// Determine SQLSTATE and condition name from error.
+		// Determine SQLSTATE, condition name, and message text from error.
 		sqlstate := "XX000"
 		condName := ""
+		errMsg := err.Error()
 		if ee, ok := err.(*ExecError); ok {
 			sqlstate = ee.Code
 			condName = ee.ConditionName
+			errMsg = ee.Message // SQLERRM is the bare message, not the wire string
 		}
 		// Try each handler.
 		for _, h := range s.Handlers {
 			if exceptionHandlerMatches(h.Conditions, sqlstate, condName) {
+				// Bind the special diagnostic variables SQLERRM / SQLSTATE so the
+				// handler body can reference them (e.g. RAISE WARNING 'got: %',
+				// regexp_replace(sqlerrm, …)). Mirrors PostgreSQL's exception block.
+				// M0118-0009 (intra-grant-inplace perm 10, design 0118-0117).
+				setPlpgsqlFrameVar(frame, "sqlerrm", NewStringDatum(errMsg))
+				setPlpgsqlFrameVar(frame, "sqlstate", NewStringDatum(sqlstate))
 				hv, hflow, herr := executePLpgSQLStmtList(h.Body, r, frame, ctx)
 				if herr != nil {
 					return Datum{}, flowNone, herr
@@ -2099,6 +2189,11 @@ func lowerPLpgSQLExpr(e parser.Expr, frame *plpgsqlFrame) (planner.Expr, error) 
 		}
 		idx, ok := frame.lookup(x.Column)
 		if !ok {
+			// FOUND special variable: only when not shadowed by a declared
+			// variable of the same name. M0118-0009 (design 0118-0097).
+			if strings.EqualFold(x.Column, "found") {
+				return &planner.BooleanConst{Value: frame.found}, nil
+			}
 			return nil, &ExecError{Code: "42703", Pos: x.Pos(), Message: fmt.Sprintf("variable %q does not exist", x.Column)}
 		}
 		return &planner.ColumnRef{Index: idx, Name: x.Column, Type: frame.types[idx]}, nil
@@ -2570,7 +2665,7 @@ func plpgsqlFormatDynArg(d Datum) string {
 	}
 }
 
-func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error {
+func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) (int, error) {
 	// Substitute OLD.* → VALUES(v1, v2, ...) and OLD.col → literal.
 	if frame.trig != nil {
 		sql = substituteTriggerRefs(sql, frame.trig)
@@ -2579,25 +2674,29 @@ func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error
 	sql = substitutePlpgsqlFrameVarsInSQL(sql, frame)
 	stmts, err := parser.Parse(sql)
 	if err != nil {
-		return &ExecError{Code: "42601", Message: fmt.Sprintf("PL/pgSQL embedded SQL parse error: %v", err)}
+		return 0, &ExecError{Code: "42601", Message: fmt.Sprintf("PL/pgSQL embedded SQL parse error: %v", err)}
 	}
 	if len(stmts) == 0 {
-		return nil
+		return 0, nil
 	}
+	// rows counts the result rows produced by the last statement, so callers
+	// can derive FOUND (PostgreSQL sets FOUND from the final query's row count).
+	rows := 0
 	for _, stmt := range stmts {
 		plan, err := planner.Plan(stmt, ctxPlanCatalog(ctx))
 		if err != nil {
-			return err
+			return 0, err
 		}
 		op, err := Build(plan)
 		if err != nil {
-			return err
+			return 0, err
 		}
 		if err := op.Open(ctx); err != nil {
 			op.Close()
-			return err
+			return 0, err
 		}
-		// Drain all rows (side-effect execution).
+		// Drain all rows (side-effect execution), counting them.
+		rows = 0
 		for {
 			_, err := op.Next()
 			if err == EOF {
@@ -2605,12 +2704,13 @@ func execPLpgSQLEmbeddedSQL(sql string, frame *plpgsqlFrame, ctx *Context) error
 			}
 			if err != nil {
 				op.Close()
-				return err
+				return 0, err
 			}
+			rows++
 		}
 		op.Close()
 	}
-	return nil
+	return rows, nil
 }
 
 // substituteTriggerRefs replaces OLD.* / NEW.* / OLD.colname / NEW.colname

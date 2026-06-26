@@ -315,14 +315,30 @@ func (m *Manager) onConflictCheckLocked(reader, writer, current *SerializableXac
 	// reason receipt-report has 6 true failures rather than 48.
 	if !failure {
 		for _, t2 := range writer.outConflicts {
-			if t2 == nil || t2.FinishedAt == InvalidCommitSeqNo {
+			if t2 == nil {
 				continue
 			}
-			if (reader.FinishedAt == InvalidCommitSeqNo || t2.FinishedAt <= reader.FinishedAt) &&
-				(writer.FinishedAt == InvalidCommitSeqNo || t2.FinishedAt <= writer.FinishedAt) &&
-				(!reader.ReadOnly || committedBeforeSnapshot(t2, reader)) {
-				failure = true
-				break
+			if t2.FinishedAt != InvalidCommitSeqNo {
+				if (reader.FinishedAt == InvalidCommitSeqNo || t2.FinishedAt <= reader.FinishedAt) &&
+					(writer.FinishedAt == InvalidCommitSeqNo || t2.FinishedAt <= writer.FinishedAt) &&
+					(!reader.ReadOnly || committedBeforeSnapshot(t2, reader)) {
+					failure = true
+					break
+				}
+				continue
+			}
+			// M0118-0009: T2 is PREPARED but not yet committed (same-backend
+			// 2PC). Upstream gates this branch on SxactIsPrepared(t2) and
+			// compares against t2->prepareSeqNo (predicate.c lines 4591-4601):
+			// "T2 has already checked for conflicts, so if it commits first,
+			// making the above conflict real, it's too late for it to abort."
+			if t2.Prepared {
+				if (reader.FinishedAt == InvalidCommitSeqNo || t2.PrepareSeqNo <= reader.FinishedAt) &&
+					(writer.FinishedAt == InvalidCommitSeqNo || t2.PrepareSeqNo <= writer.FinishedAt) &&
+					(!reader.ReadOnly || (reader.SnapshotSeqNo != InvalidCommitSeqNo && t2.PrepareSeqNo <= reader.SnapshotSeqNo)) {
+					failure = true
+					break
+				}
 			}
 		}
 	}
@@ -347,6 +363,26 @@ func (m *Manager) onConflictCheckLocked(reader, writer, current *SerializableXac
 		}
 	}
 
+	// Case 3, PREPARED writer (M0118-0009): identical to the committed-writer
+	// case above but the writer is PREPARED-but-not-committed (same-backend 2PC).
+	// Upstream gates Case 3 on SxactIsPrepared(writer) — which is true for both a
+	// committed and a merely-prepared writer — and compares t0 against
+	// writer->prepareSeqNo (predicate.c lines 4618-4647). This is what dooms the
+	// reader-pivot the moment it forms an rw-edge to a writer that has already
+	// PREPAREd (the prepared-transactions.spec r2-after-p3 case).
+	if !failure && !writerCommitted && writer.Prepared && !reader.ReadOnly {
+		for _, t0 := range reader.inConflicts {
+			if t0 == nil || t0.Doomed {
+				continue
+			}
+			if (t0.FinishedAt == InvalidCommitSeqNo || t0.FinishedAt >= writer.PrepareSeqNo) &&
+				(!t0.ReadOnly || (t0.SnapshotSeqNo != InvalidCommitSeqNo && t0.SnapshotSeqNo >= writer.PrepareSeqNo)) {
+				failure = true
+				break
+			}
+		}
+	}
+
 	if !failure {
 		return
 	}
@@ -357,10 +393,12 @@ func (m *Manager) onConflictCheckLocked(reader, writer, current *SerializableXac
 		// We are the pivot writer: "Canceled on identification as a pivot,
 		// during write." Upstream aborts us in place; we doom ourselves.
 		writer.Doomed = true
-	case writerCommitted:
-		// The writer has already committed and cannot be aborted, so the
-		// reader (the current xact) must die: upstream's "Canceled on conflict
-		// out to pivot, during read."
+	case writerCommitted || writer.Prepared:
+		// The writer has already committed OR is PREPARED (same-backend 2PC,
+		// M0118-0009) and cannot be aborted, so the reader (the current xact)
+		// must die: upstream's `else if (SxactIsPrepared(writer))` arm, "Canceled
+		// on conflict out to pivot, during read." SxactIsPrepared is set on a
+		// committed xact too, hence both committed and prepared select the reader.
 		reader.Doomed = true
 	default:
 		// Normal case: kill the in-flight pivot writer so a retry of the

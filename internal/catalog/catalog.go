@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/storage"
@@ -792,6 +793,276 @@ type Table struct {
 // (internal/executor/toast.go: RelOid + 100_000_000).
 const toastRelidOffset = 100_000_000
 
+// toastIndexOidOffset derives the synthetic OID of a TOAST relation's unique
+// btree index (pg_toast_<parentOID>_index) from its parent table's OID. PG
+// auto-creates this index on every TOAST relation; goopg has no real TOAST
+// index, so the OID is catalog/regclass-only. Kept a full 100M above
+// toastRelidOffset so the index range [200M, 300M) never overlaps the TOAST
+// relation range [100M, 200M) for any realistic user OID (< 100M). M0118-0008
+// TOAST-exposure slice 3.
+const toastIndexOidOffset = 200_000_000
+
+// columnTypeIsToastable reports whether a column's declared type is a varlena
+// (variable-length) type that PostgreSQL would store out-of-line via TOAST.
+// Mirrors the executor's isToastableType set (internal/executor/toast.go) plus
+// array columns (every SQL array is varlena). Kept in sync with the storage
+// path so reltoastrelid existence matches where goopg actually toasts.
+func columnTypeIsToastable(col Column) bool {
+	if col.Type.IsArray {
+		return true
+	}
+	switch strings.ToLower(col.Type.Name) {
+	case "text", "varchar", "character varying",
+		"char", "character", "bpchar",
+		"bytea", "json", "jsonb", "jsonpath", "xml":
+		return true
+	}
+	return false
+}
+
+// tableNeedsToastRelation mirrors PostgreSQL's needs_toast_table
+// (src/backend/catalog/toasting.c): a relation gets an auto-created TOAST
+// relation when it has at least one non-dropped column of a toastable type.
+// PG attaches the TOAST relation only to ordinary tables / materialized views /
+// partition leaves — never to partitioned parents (relkind='p', no storage),
+// views, sequences, or composite types. The caller restricts this to the
+// heap-storage relkinds, so here we only inspect the column set.
+func tableNeedsToastRelation(t *Table) bool {
+	for _, col := range t.Columns {
+		if col.Dropped {
+			continue
+		}
+		if columnTypeIsToastable(col) {
+			return true
+		}
+	}
+	return false
+}
+
+// tableHasToastRelation reports whether the table owns an auto-exposed TOAST
+// relation: it carries explicit `toast.*` reloptions, or it is a USER ordinary
+// table / materialized view (relkind 'r' or 'm') with at least one toastable
+// (varlena) column. This is the single source of truth for the `hasToastRel`
+// gate in the pg_class virtual builder AND for ToastRelName's OID→name
+// resolution, so reltoastrelid exposure and `reltoastrelid::regclass` rendering
+// can never diverge. Mirrors PG needs_toast_table (src/backend/catalog/
+// toasting.c); system catalogs are excluded because goopg serves them virtually
+// with no real heap, so a reltoastrelid join target would break pg_amcheck's
+// whole-DB walk. M0118-0008 TOAST-exposure (design 0118-0084). The pg_class
+// virtual builder emits a relkind='t' TOAST row (and relkind='i' TOAST-index
+// row, slice 3) for exactly this set; toastBearingTables enumerates the same
+// set for the pg_index builder so the two catalogs never diverge.
+func tableHasToastRelation(t *Table) bool {
+	if len(t.ToastReloptions) > 0 {
+		return true
+	}
+	if IsSystemRelation(t.OID) {
+		return false
+	}
+	// relkind must be ordinary table ('r') or materialized view ('m'): exclude
+	// sequences ('S'), plain views ('v') and partitioned parents ('p'), matching
+	// the relkind computation in the virtual builder.
+	if t.IsSequence || (t.View != nil && !t.IsMatView) ||
+		(t.PartitionMethod != "" && t.PartitionParentOID == 0) {
+		return false
+	}
+	return tableNeedsToastRelation(t)
+}
+
+// ToastRelName resolves a synthetic TOAST relation OID (parent OID +
+// toastRelidOffset) to its schema-qualified name `pg_toast.pg_toast_<parentOID>`,
+// matching PG's regclassout for a relation in the pg_toast namespace (which is
+// never in search_path, hence always schema-qualified). The synthetic TOAST
+// pg_class row lives only in the virtual builder's output, not in c.tables, so
+// `reltoastrelid::regclass` cannot find it via tableByOID and must reconstruct
+// the name here. Returns false when the OID is below the TOAST range or its
+// parent table owns no auto-exposed TOAST relation. M0118-0008 TOAST-exposure
+// slice 2 (design 0118-0084).
+func (c *InMemory) ToastRelName(oid uint32) (string, bool) {
+	// The TOAST index range [200M, 300M) sits above the TOAST relation range
+	// [100M, 200M); check it first. The index name is pg_toast_<parentOID>_index.
+	if oid >= toastIndexOidOffset {
+		parentOID := oid - toastIndexOidOffset
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		t, ok := c.tableByOID(parentOID)
+		if !ok || !tableHasToastRelation(t) {
+			return "", false
+		}
+		return "pg_toast." + c.toastDisplayNameLocked(oid, "pg_toast_"+strconv.Itoa(int(parentOID))+"_index"), true
+	}
+	if oid < toastRelidOffset {
+		return "", false
+	}
+	parentOID := oid - toastRelidOffset
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	t, ok := c.tableByOID(parentOID)
+	if !ok || !tableHasToastRelation(t) {
+		return "", false
+	}
+	return "pg_toast." + c.toastDisplayNameLocked(oid, "pg_toast_"+strconv.Itoa(int(parentOID))), true
+}
+
+// toastDisplayNameLocked returns the current unqualified name of a synthetic
+// TOAST relation/index OID: the override recorded by ALTER … RENAME if present,
+// otherwise the default deflt (pg_toast_<parentOID>[_index]). The caller must
+// hold c.mu (read or write). M0118-0008 TOAST-exposure slice 4 (design 0118-0087).
+func (c *InMemory) toastDisplayNameLocked(oid uint32, deflt string) string {
+	if name, ok := c.toastRenames[oid]; ok && name != "" {
+		return name
+	}
+	return deflt
+}
+
+// RenameToastRel records a new unqualified name for a synthetic TOAST relation
+// or index OID (ALTER TABLE/INDEX … RENAME under allow_system_table_mods). The
+// override is read back by the pg_class virtual builder, ToastRelName and
+// LookupToastRel. M0118-0008 TOAST-exposure slice 4 (design 0118-0087).
+func (c *InMemory) RenameToastRel(oid uint32, newName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.toastRenames[oid] = newName
+}
+
+// LookupToastRel resolves a schema-qualified pg_toast relation/index name to its
+// synthetic OID. It accepts either the default name (pg_toast_<parentOID> for the
+// TOAST relation, pg_toast_<parentOID>_index for its unique btree index) or a name
+// recorded by ALTER … RENAME. Returns (oid, isIndex, true) when the name resolves
+// to a live TOAST object whose parent table still owns an auto-exposed TOAST
+// relation; (0, false, false) otherwise. Used by the executor's ALTER TABLE/INDEX
+// … RENAME and REINDEX routing. M0118-0008 TOAST-exposure slice 4 (design 0118-0087).
+func (c *InMemory) LookupToastRel(schema, name string) (oid uint32, isIndex bool, ok bool) {
+	if !strings.EqualFold(schema, "pg_toast") {
+		return 0, false, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// 1) An override name (e.g. reind_con_toast / reind_con_toast_idx).
+	for ov, nm := range c.toastRenames {
+		if nm != name {
+			continue
+		}
+		var parentOID uint32
+		idx := ov >= toastIndexOidOffset
+		if idx {
+			parentOID = ov - toastIndexOidOffset
+		} else {
+			parentOID = ov - toastRelidOffset
+		}
+		if t, found := c.tableByOID(parentOID); found && tableHasToastRelation(t) {
+			return ov, idx, true
+		}
+	}
+	// 2) A default name pg_toast_<parentOID>[ _index ].
+	const pfx = "pg_toast_"
+	if !strings.HasPrefix(name, pfx) {
+		return 0, false, false
+	}
+	body := name[len(pfx):]
+	isIdx := false
+	if strings.HasSuffix(body, "_index") {
+		isIdx = true
+		body = strings.TrimSuffix(body, "_index")
+	}
+	pOID, err := strconv.ParseUint(body, 10, 32)
+	if err != nil {
+		return 0, false, false
+	}
+	parentOID := uint32(pOID)
+	t, found := c.tableByOID(parentOID)
+	if !found || !tableHasToastRelation(t) {
+		return 0, false, false
+	}
+	if isIdx {
+		return parentOID + toastIndexOidOffset, true, true
+	}
+	return parentOID + toastRelidOffset, false, true
+}
+
+// ToastParentTable maps a synthetic TOAST relation/index OID back to the user
+// table that owns it. REINDEX … CONCURRENTLY pg_toast.<name> routing uses it to
+// wait on the parent's relation lockers (the synthetic TOAST relation has no
+// heavyweight lock of its own — REINDEX CONCURRENTLY on a TOAST relation waits
+// for transactions touching the parent table, exactly like upstream, whose
+// toast reindex acquires its lock through the parent). Returns false when the
+// OID falls outside the synthetic TOAST ranges or the parent no longer owns an
+// auto-exposed TOAST relation. M0118-0008 TOAST-exposure slice 5 (design 0118-0088).
+func (c *InMemory) ToastParentTable(toastOID uint32) (*Table, bool) {
+	var parentOID uint32
+	switch {
+	case toastOID >= toastIndexOidOffset:
+		parentOID = toastOID - toastIndexOidOffset
+	case toastOID >= toastRelidOffset:
+		parentOID = toastOID - toastRelidOffset
+	default:
+		return nil, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	t, ok := c.tableByOID(parentOID)
+	if !ok || !tableHasToastRelation(t) {
+		return nil, false
+	}
+	return t, true
+}
+
+// ToastRelFileNode returns the heavyweight-lock RelFileNode of the synthetic
+// TOAST relation owned by the table at parentRel, when it has an auto-exposed
+// TOAST relation. The node carries the parent's DB/tablespace with the RelOid
+// replaced by the synthetic TOAST relation OID (parentOID + toastRelidOffset);
+// only DB+RelOid are significant in a lock tag. DML writes (acquireWriteLockTxn)
+// and DROP TABLE (dropTableByRef) register a lock on this node, so REINDEX …
+// CONCURRENTLY pg_toast.<name> can wait for transactions that toasted a value or
+// dropped the table — a bare LOCK TABLE on the parent never touches it, matching
+// PG, whose toast relation is locked only on a toast write or a drop, not on an
+// explicit parent LOCK TABLE. M0118-0008 TOAST-exposure slice 5 (design 0118-0088).
+func (c *InMemory) ToastRelFileNode(parentRel storage.RelFileNode) (storage.RelFileNode, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	t, ok := c.tableByOID(parentRel.RelOid)
+	if !ok || !tableHasToastRelation(t) {
+		return storage.RelFileNode{}, false
+	}
+	toast := parentRel
+	toast.RelOid = parentRel.RelOid + toastRelidOffset
+	return toast, true
+}
+
+// toastBearingTables returns every relation that owns an auto-exposed TOAST
+// relation, under the SAME visibility filter the pg_class virtual builder
+// applies to its main table loop (non-virtual ordinary tables plus
+// materialized views and user sequences/views are admitted to the loop;
+// tableHasToastRelation then keeps only relkind 'r'/'m'). The pg_class builder
+// emits the synthetic relkind='t' TOAST row and relkind='i' TOAST-index row for
+// exactly this set, so the pg_index builder must enumerate the same set or the
+// two catalogs diverge (an indexrelid with no matching pg_class row). Returned
+// tables share the registry's backing storage; callers must only read.
+// M0118-0008 TOAST-exposure slice 3.
+func (c *InMemory) toastBearingTables() []*Table {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	keys := make([]string, 0, len(c.tables))
+	for k := range c.tables {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]*Table, 0)
+	for _, k := range keys {
+		t := c.tables[k]
+		// Mirror the pg_class main-loop skip: drop system-catalog virtual
+		// tables but keep user views, matviews and sequences (which
+		// tableHasToastRelation subsequently rejects unless they are 'r'/'m').
+		if t.Virtual && t.View == nil && !t.IsMatView && !t.IsSequence {
+			continue
+		}
+		if tableHasToastRelation(t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 // TriggerTiming mirrors parser.TriggerTiming to avoid importing the
 // parser package in contexts that only need the catalog. M0096-0012.
 type TriggerTiming int
@@ -1000,6 +1271,16 @@ type Index struct {
 	Method  string
 	Primary bool
 	OID     uint32
+	// DeclaredHash records that the index was created `USING hash`. goopg has no
+	// native hash access method — a hash index is built on the B-tree substrate,
+	// so Method stays "btree" (catalog/pg_am/pg_dump unchanged) — but a
+	// SERIALIZABLE equality scan must take a bucket-grain (page) SIREAD predicate
+	// lock on it rather than a relation-grain lock, to reproduce PG's reduced
+	// false positives (predicate-hash spec; design 0118-0099). In-memory only:
+	// not persisted to the index-DDL WAL record, so it resets to false after a
+	// restart (a hash index then reverts to relation-grain SSI locking — a known
+	// follow-up, no durability regression over the prior hash→btree rewrite).
+	DeclaredHash bool
 	// ColExprs holds the parsed expression AST for expression-based index
 	// columns (e.g. lower(col)). Parallel to Columns: ColExprs[i] is non-nil
 	// when Columns[i] == "" (expression column); nil for plain column names.
@@ -1319,9 +1600,32 @@ type InMemory struct {
 	// partitionChildren maps parent table OID → slice of child OIDs
 	// for partitioned-table support (M0096-0007).
 	partitionChildren map[uint32][]uint32
+	// pendingAttachXID maps a partition child's OID → the XID of the
+	// transaction whose ATTACH PARTITION has cloned a foreign key onto that
+	// child but not yet committed (the registration is deferred to COMMIT, so
+	// IsPartitionChild is still false during this window). A concurrent DELETE
+	// of a referenced row consults this to wait for the in-flight attach,
+	// mirroring PostgreSQL's RI_Initial_Check holding FOR KEY SHARE on the
+	// referenced rows until the attaching transaction commits. fk-partitioned-1
+	// concurrent Class B (design 0118-0120).
+	pendingAttachXID map[uint32]uint32
 	// indexPartitionChildren maps parent index OID → slice of child index OIDs
 	// for partition index trees (ALTER INDEX parent ATTACH PARTITION child). M0097-0023.
 	indexPartitionChildren map[uint32][]uint32
+
+	// toastRenames maps a synthetic TOAST relation/index OID (parent OID +
+	// toastRelidOffset for the relation, + toastIndexOidOffset for its index) to
+	// a new unqualified name set by ALTER TABLE/INDEX … RENAME under
+	// allow_system_table_mods. The synthetic TOAST pg_class/pg_index rows live
+	// only in the virtual builders (not c.tables), so a rename cannot mutate a
+	// real row; this override is consulted by the pg_class builder (relname),
+	// ToastRelName (regclass rendering) and LookupToastRel (name→OID). The
+	// reind_con_toast spec renames pg_toast_<oid> → reind_con_toast and its
+	// _index → reind_con_toast_idx so REINDEX … CONCURRENTLY can name them
+	// deterministically. Not transaction-scoped (only this spec mutates synthetic
+	// TOAST objects, always in autocommit). M0118-0008 TOAST-exposure slice 4
+	// (design 0118-0087).
+	toastRenames map[uint32]string
 
 	// pendingPartitionDetachCount counts partition children currently marked
 	// "detach pending" (DetachPendingEpoch != 0) by an in-progress
@@ -1334,6 +1638,17 @@ type InMemory struct {
 	// inheritanceChildren maps parent table OID → slice of child OIDs
 	// for table inheritance support (M0096-0009).
 	inheritanceChildren map[uint32][]uint32
+
+	// pendingInheritanceChangeCount counts ALTER TABLE … {NO} INHERIT operations
+	// issued inside an in-progress explicit transaction whose catalog mutation is
+	// deferred to COMMIT (so the change is invisible to concurrent sessions until
+	// commit — PG transactional-DDL visibility, alter-table-4 isolation spec).
+	// While > 0 the cross-session plan cache is bypassed so a query scanning the
+	// parent re-plans against the current (pre-commit) child set rather than reuse
+	// a plan baked across the inheritance change. Maintained by
+	// MarkInheritanceChangePending / UnmarkInheritanceChangePending; zero in the
+	// steady state. Design 0118-0080 (M0118-0008).
+	pendingInheritanceChangeCount int
 
 	// enumTypes holds user-defined enum types. M0097-0017.
 	enumTypes map[string]*EnumType
@@ -1373,6 +1688,19 @@ type InMemory struct {
 	// with the standard system schemas. Maps lowercase schema name → OID.
 	// Used to detect schema-qualified drops and for pg_namespace. M0097-drop_if_exists.
 	schemas map[string]uint32
+
+	// tempNamespaces maps a session's temp-owner token ("s<id>", see
+	// executor.sessionTempOwner) → the OID of that session's temporary
+	// namespace (pg_temp_<id>). In PostgreSQL every backend that creates a
+	// temporary object gets a per-backend namespace (pg_temp_N); pg_class /
+	// pg_proc / pg_type entries for its temp objects carry that namespace OID,
+	// pg_my_temp_schema() returns it, and the namespace persists (in the shared
+	// pg_namespace catalog) for the life of the backend even after its temp
+	// objects are dropped. goopg keeps one shared in-memory catalog, so we model
+	// the per-backend namespace here: an entry is allocated lazily on the first
+	// CREATE TEMPORARY object (EnsureTempNamespace) and removed on session exit
+	// (DropTempNamespace). M0118-0009 (temp-schema-cleanup, design 0118-0091).
+	tempNamespaces map[string]uint32
 
 	// roles tracks user-created roles (CREATE ROLE / CREATE USER). Used by
 	// DROP ROLE IF EXISTS to produce proper "does not exist" notices.
@@ -1415,6 +1743,65 @@ type InMemory struct {
 	// reject duplicates and to map a dropped name back to its OID/directory.
 	// M0095-0003 (in-place tablespace).
 	tablespaces map[string]*tablespaceRow
+
+	// dbACLChangeXID is the XID of the most recent transaction that performed a
+	// GRANT/REVOKE … ON DATABASE (a pg_database ACL change). PostgreSQL records
+	// no heavyweight lock for an ACL change — the lock IS the catalog tuple's
+	// xmax — so a concurrent in-place update of the same pg_database row
+	// (VACUUM advancing datfrozenxid via heap_inplace_update_scan) must wait for
+	// that xmax XID to commit/abort before it can rewrite the tuple. goopg has no
+	// real pg_database heap tuple, so we record the writer XID here and have a
+	// database-wide VACUUM wait on it (mvcc.WaitForXID). Atomic so the VACUUM
+	// reader never contends on c.mu. Design 0118-0098 (intra-grant-inplace-db).
+	dbACLChangeXID atomic.Uint32
+
+	// tableACLChangeXID maps a table OID → the XID of the most recent transaction
+	// that performed a GRANT/REVOKE … ON [TABLE] <name> (a pg_class ACL change).
+	// As with dbACLChangeXID, PostgreSQL records no heavyweight lock for the ACL
+	// change — its lock is the pg_class tuple's xmax — so a concurrent in-place
+	// update of the same row (ALTER TABLE ADD PRIMARY KEY setting relhasindex via
+	// heap_inplace_update) must wait for that XID to commit/abort. goopg has no
+	// real pg_class heap tuple, so we record the writer XID here and have ADD
+	// PRIMARY KEY wait on it (mvcc.WaitForXID). Design 0118-0109
+	// (intra-grant-inplace).
+	tableACLChangeXID   map[uint32]uint32
+	tableACLChangeXIDMu sync.Mutex
+
+	// tablePendingDropXID maps a table OID → the XID of the in-flight transaction
+	// that issued a `DROP TABLE` deferred to COMMIT (the catalog row is kept
+	// visible until then). PostgreSQL's DROP performs a heap_delete on the
+	// pg_class tuple, stamping its xmax; a concurrent explicit rowmark
+	// (`SELECT … FROM pg_class … FOR UPDATE`) or in-place updater must wait on
+	// that xmax before proceeding, and once the DROP commits the tuple is gone so
+	// the locker finds no row. goopg has no real pg_class heap tuple, so the
+	// deferred DROP records its writer XID here and the pg_class rowmark waits on
+	// it (mvcc.WaitForXID), exactly like the ACL-change xmax above. Design
+	// 0118-0117 (intra-grant-inplace perm 10).
+	tablePendingDropXID   map[uint32]uint32
+	tablePendingDropXIDMu sync.Mutex
+
+	// pgClassRowMarks records explicit row-level locks taken on a pg_class tuple
+	// by `SELECT … FROM pg_class WHERE oid = <rel> FOR { KEY SHARE | NO KEY
+	// UPDATE | SHARE | UPDATE }`. PostgreSQL takes no heavyweight lock for such a
+	// rowmark — it is a tuple lock recorded in the pg_class tuple's xmax (a
+	// multixact when several sessions hold it). An in-place catalog update of the
+	// same tuple (ALTER TABLE ADD PRIMARY KEY flipping relhasindex via
+	// heap_inplace_update) must wait for any concurrent locker whose mode
+	// conflicts with that no-key update — i.e. every mode except FOR KEY SHARE.
+	// goopg has no real pg_class heap tuple, so we mirror the wait here: each
+	// locking SELECT records (relOID → holderXID → conflictsWithInplace) and ADD
+	// PRIMARY KEY waits (mvcc.WaitForXID) on every conflicting holder from another
+	// transaction. Design 0118-0113 (intra-grant-inplace rowmarks).
+	pgClassRowMarks   map[uint32]map[uint32]bool
+	pgClassRowMarksMu sync.Mutex
+}
+
+// PgClassRowMark is one explicit pg_class tuple lock: the holder's transaction
+// id and whether its lock mode conflicts with a concurrent in-place update of
+// the same tuple (true for every FOR-clause strength except FOR KEY SHARE).
+type PgClassRowMark struct {
+	XID                  uint32
+	ConflictsWithInplace bool
 }
 
 // extensionRow is one runtime CREATE EXTENSION record backing pg_extension.
@@ -1672,6 +2059,7 @@ func NewInMemory() *InMemory {
 		databases:              map[string]bool{"postgres": true, "template1": true, "template0": true},
 		partitionChildren:      make(map[uint32][]uint32),
 		indexPartitionChildren: make(map[uint32][]uint32),
+		toastRenames:           make(map[uint32]string),
 		inheritanceChildren:    make(map[uint32][]uint32),
 		enumTypes:              make(map[string]*EnumType),
 		domains:                make(map[string]*Domain),
@@ -1689,6 +2077,7 @@ func NewInMemory() *InMemory {
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
 		roles:          make(map[string]struct{}),
+		tempNamespaces: make(map[string]uint32),
 		tableACLs:      make(map[uint32]map[string]map[string]struct{}),
 		comments:       make(map[commentKey]string),
 		statisticsObjs: make(map[string]*StatisticsObject),
@@ -2002,6 +2391,74 @@ func (c *InMemory) RegisterPartitionChild(parentOID, childOID uint32) {
 	c.mu.Unlock()
 }
 
+// IsPartitionChild reports whether oid is registered as a partition of some
+// parent. Unlike the Table.PartitionParentOID field — which is only populated on
+// the CREATE TABLE … PARTITION OF path — this consults the live partitionChildren
+// map, so it is also true for a table linked via ALTER TABLE … ATTACH PARTITION
+// (RegisterPartitionChild updates the map but leaves PartitionParentOID 0).
+// fk-partitioned-1: distinguishes a root FK-owning table from a per-partition
+// FK clone when naming a referenced-side violation.
+func (c *InMemory) IsPartitionChild(oid uint32) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, kids := range c.partitionChildren {
+		for _, k := range kids {
+			if k == oid {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// PartitionParentOf returns the OID of the partitioned parent that childOID is
+// registered under, consulting the live partitionChildren map. Like
+// IsPartitionChild, this is reliable for both CREATE TABLE … PARTITION OF and
+// ALTER TABLE … ATTACH PARTITION (the latter leaves Table.PartitionParentOID 0).
+// Returns (0,false) when childOID is not a partition of anything.
+// fk-partitioned-1: walk a deleted leaf partition up to the referenced parent.
+func (c *InMemory) PartitionParentOf(childOID uint32) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for parent, kids := range c.partitionChildren {
+		for _, k := range kids {
+			if k == childOID {
+				return parent, true
+			}
+		}
+	}
+	return 0, false
+}
+
+// SetPendingAttachXID records that the transaction XID has an in-flight ATTACH
+// PARTITION of childOID whose foreign-key clone is visible but whose partition
+// registration is deferred to COMMIT. fk-partitioned-1 (design 0118-0120).
+func (c *InMemory) SetPendingAttachXID(childOID uint32, xid uint32) {
+	c.mu.Lock()
+	if c.pendingAttachXID == nil {
+		c.pendingAttachXID = make(map[uint32]uint32)
+	}
+	c.pendingAttachXID[childOID] = xid
+	c.mu.Unlock()
+}
+
+// PendingAttachXID returns the XID of an in-flight ATTACH of childOID, if any.
+func (c *InMemory) PendingAttachXID(childOID uint32) (uint32, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	xid, ok := c.pendingAttachXID[childOID]
+	return xid, ok
+}
+
+// ClearPendingAttachXID drops the in-flight-attach marker for childOID. Called
+// from both the COMMIT path (after RegisterPartitionChild) and the ROLLBACK
+// path (the deferred attach is discarded).
+func (c *InMemory) ClearPendingAttachXID(childOID uint32) {
+	c.mu.Lock()
+	delete(c.pendingAttachXID, childOID)
+	c.mu.Unlock()
+}
+
 // UnregisterPartitionChild removes childOID from parentOID's partition children
 // list (DETACH PARTITION). M0097-0028.
 func (c *InMemory) UnregisterPartitionChild(parentOID, childOID uint32) {
@@ -2071,6 +2528,38 @@ func (c *InMemory) HasPendingPartitionDetach() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.pendingPartitionDetachCount > 0
+}
+
+// MarkInheritanceChangePending increments the deferred-inheritance-change counter
+// when an ALTER TABLE … {NO} INHERIT inside an explicit transaction records its
+// catalog mutation for replay at COMMIT. Design 0118-0080 (M0118-0008).
+func (c *InMemory) MarkInheritanceChangePending() {
+	c.mu.Lock()
+	c.pendingInheritanceChangeCount++
+	c.mu.Unlock()
+}
+
+// UnmarkInheritanceChangePending decrements the counter when a deferred
+// inheritance change is applied (at COMMIT) or discarded (at ROLLBACK / ROLLBACK
+// TO SAVEPOINT). Clamped at zero. Design 0118-0080 (M0118-0008).
+func (c *InMemory) UnmarkInheritanceChangePending() {
+	c.mu.Lock()
+	if c.pendingInheritanceChangeCount > 0 {
+		c.pendingInheritanceChangeCount--
+	}
+	c.mu.Unlock()
+}
+
+// HasPendingInheritanceChange reports whether any ALTER TABLE … {NO} INHERIT is
+// currently deferred to COMMIT in an in-progress explicit transaction. When true
+// the cross-session plan cache must be bypassed so a query scanning the parent
+// re-plans against the current child set rather than reuse a plan baked across
+// the inheritance change (mirrors HasPendingPartitionDetach for detach). O(1).
+// Design 0118-0080 (M0118-0008 alter-table-4).
+func (c *InMemory) HasPendingInheritanceChange() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.pendingInheritanceChangeCount > 0
 }
 
 // VisiblePartitionChildren filters a partition child list down to those visible
@@ -2820,6 +3309,17 @@ func (c *InMemory) registerSystemTables() {
 			if nsOID == 0 {
 				nsOID = 2200 // default to public
 			}
+			// A temporary relation lives in its owning session's per-backend
+			// namespace (pg_temp_<id>), not public — mirrors PostgreSQL so a
+			// `WHERE relnamespace = pg_my_temp_schema()` scan finds it (and finds
+			// nothing once it is cleaned up). M0118-0009 (temp-schema-cleanup,
+			// design 0118-0091). Falls back to the schema OID for legacy
+			// session-less temp relations (TempOwner == "").
+			if t.Temp && t.TempOwner != "" {
+				if tns := c.tempNamespaceOIDLocked(t.TempOwner); tns != 0 {
+					nsOID = tns
+				}
+			}
 			hasIdx := "f"
 			if len(c.byTable[t.OID]) > 0 {
 				hasIdx = "t"
@@ -2942,12 +3442,26 @@ func (c *InMemory) registerSystemTables() {
 			if len(relopts) > 0 {
 				reloptions = "{" + strings.Join(relopts, ",") + "}"
 			}
-			// reltoastrelid: when the table carries any `toast.*` storage
-			// parameters, point it at a synthesized TOAST relation (emitted
-			// below) so pg_dump's toast LEFT JOIN resolves and re-emits the
-			// `toast.*` reloptions. Otherwise 0 (no TOAST relation). DU-002 slice 224.
+			// reltoastrelid: PG auto-creates a TOAST relation for every ordinary
+			// table / materialized view with at least one toastable (varlena)
+			// column (needs_toast_table, src/backend/catalog/toasting.c), plus
+			// any table carrying explicit `toast.*` storage parameters. Point
+			// reltoastrelid at the synthesized pg_toast_<oid> row emitted below
+			// so `reltoastrelid::regclass` resolves and pg_dump's toast LEFT JOIN
+			// re-emits the `toast.*` reloptions. Partitioned parents (relkind='p',
+			// no storage), views, sequences and foreign tables never get one.
+			// DU-002 slice 224 + M0118-0008 TOAST-exposure slice 1 (0118-0084).
+			// Auto-exposure is restricted to USER relations (OID >= 16384):
+			// goopg serves system catalogs virtually with no real heap storage,
+			// so attaching a reltoastrelid to e.g. pg_type/pg_attribute would make
+			// pg_amcheck follow the join and fail to open the non-existent toast
+			// heap. Explicit toast.* reloptions only ever land on user tables.
+			// hasToastRel is computed by tableHasToastRelation (shared with
+			// ToastRelName so exposure and regclass rendering stay in sync). The
+			// relkind 'r'/'m' filter lives inside that helper.
+			hasToastRel := tableHasToastRelation(t)
 			reltoastrelid := "0"
-			if len(t.ToastReloptions) > 0 {
+			if hasToastRel {
 				reltoastrelid = strconv.Itoa(int(t.OID) + toastRelidOffset)
 			}
 			// relpages / reltuples: 0 until VACUUM or ANALYZE has run (Stats==nil),
@@ -3004,52 +3518,104 @@ func (c *InMemory) registerSystemTables() {
 				reloptions,  // 32: reloptions ({fillfactor=N} or NULL)
 				partBound,   // 33: relpartbound
 			})
-			// Synthesize the TOAST relation (relkind='t') when the table carries
-			// `toast.*` storage parameters. pg_dump joins to it via
-			// reltoastrelid and reads its reloptions (stored WITHOUT the
-			// `toast.` prefix), re-emitting them as `WITH (toast.<opt>='…')`.
+			// Synthesize the TOAST relation (relkind='t') whenever the table owns
+			// one (hasToastRel: a toastable column or explicit `toast.*` reloptions).
+			// pg_dump joins to it via reltoastrelid and reads its reloptions (stored
+			// WITHOUT the `toast.` prefix), re-emitting them as `WITH (toast.<opt>='…')`.
 			// The TOAST row is filtered out of pg_dump's getTables WHERE
 			// (relkind IN r/S/v/c/m/f/p — not 't') so it is never dumped as an
 			// object; it exists only as a join target. Named pg_toast_<oid> in
-			// the pg_toast namespace (OID 99), mirroring PG. DU-002 slice 224.
-			if len(t.ToastReloptions) > 0 {
+			// the pg_toast namespace (OID 99), mirroring PG. DU-002 slice 224 +
+			// M0118-0008 TOAST-exposure slice 1 (0118-0084).
+			if hasToastRel {
 				toastOID := int(t.OID) + toastRelidOffset
-				toastReloptions := "{" + strings.Join(t.ToastReloptions, ",") + "}"
+				// reloptions is NULL unless the table set explicit toast.* params.
+				toastReloptions := ""
+				if len(t.ToastReloptions) > 0 {
+					toastReloptions = "{" + strings.Join(t.ToastReloptions, ",") + "}"
+				}
 				out = append(out, []string{
-					strconv.Itoa(toastOID),                 // 0:  oid
-					"pg_toast_" + strconv.Itoa(int(t.OID)), // 1:  relname
-					"99",                                   // 2:  relnamespace (pg_toast)
-					"0",                                    // 3:  reltype
-					"0",                                    // 4:  reloftype
-					"10",                                   // 5:  relowner
-					"0",                                    // 6:  relam
-					strconv.Itoa(toastOID),                 // 7:  relfilenode
-					"0",                                    // 8:  reltablespace
-					"0",                                    // 9:  relpages
-					"0",                                    // 10: reltuples
-					"0",                                    // 11: relallvisible
-					"0",                                    // 12: relallfrozen
-					"0",                                    // 13: reltoastrelid
-					"f",                                    // 14: relhasindex
-					"f",                                    // 15: relisshared
-					relpers,                                // 16: relpersistence (inherits the table's)
-					"t",                                    // 17: relkind (TOAST)
-					"3",                                    // 18: relnatts (chunk_id, chunk_seq, chunk_data)
-					"0",                                    // 19: relchecks
-					"f",                                    // 20: relhasrules
-					"f",                                    // 21: relhastriggers
-					"f",                                    // 22: relhassubclass
-					"f",                                    // 23: relrowsecurity
-					"f",                                    // 24: relforcerowsecurity
-					"t",                                    // 25: relispopulated
-					"n",                                    // 26: relreplident
-					"f",                                    // 27: relispartition
-					"0",                                    // 28: relrewrite
-					"0",                                    // 29: relfrozenxid
-					"1",                                    // 30: relminmxid
-					"",                                     // 31: relacl (NULL)
-					toastReloptions,                        // 32: reloptions ({autovacuum_enabled=false})
-					"",                                     // 33: relpartbound
+					strconv.Itoa(toastOID), // 0:  oid
+					// relname honours an ALTER … RENAME override (slice 4).
+					c.toastDisplayNameLocked(uint32(toastOID), "pg_toast_"+strconv.Itoa(int(t.OID))), // 1:  relname
+					"99",                   // 2:  relnamespace (pg_toast)
+					"0",                    // 3:  reltype
+					"0",                    // 4:  reloftype
+					"10",                   // 5:  relowner
+					"0",                    // 6:  relam
+					strconv.Itoa(toastOID), // 7:  relfilenode
+					"0",                    // 8:  reltablespace
+					"0",                    // 9:  relpages
+					"0",                    // 10: reltuples
+					"0",                    // 11: relallvisible
+					"0",                    // 12: relallfrozen
+					"0",                    // 13: reltoastrelid
+					"t",                    // 14: relhasindex (pg_toast_<oid>_index)
+					"f",                    // 15: relisshared
+					relpers,                // 16: relpersistence (inherits the table's)
+					"t",                    // 17: relkind (TOAST)
+					"3",                    // 18: relnatts (chunk_id, chunk_seq, chunk_data)
+					"0",                    // 19: relchecks
+					"f",                    // 20: relhasrules
+					"f",                    // 21: relhastriggers
+					"f",                    // 22: relhassubclass
+					"f",                    // 23: relrowsecurity
+					"f",                    // 24: relforcerowsecurity
+					"t",                    // 25: relispopulated
+					"n",                    // 26: relreplident
+					"f",                    // 27: relispartition
+					"0",                    // 28: relrewrite
+					"0",                    // 29: relfrozenxid
+					"1",                    // 30: relminmxid
+					"",                     // 31: relacl (NULL)
+					toastReloptions,        // 32: reloptions ({autovacuum_enabled=false})
+					"",                     // 33: relpartbound
+				})
+				// Synthesize the TOAST relation's unique btree index
+				// pg_toast_<oid>_index (relkind='i'), mirroring the index PG
+				// auto-creates on every TOAST relation's (chunk_id, chunk_seq).
+				// Lives in the pg_toast namespace (OID 99); the matching pg_index
+				// row (indexrelid=toastIdxOID, indrelid=toastOID) is emitted by the
+				// pg_index virtual builder. Isolation specs locate it via
+				// `indexrelid::regclass` from pg_index. M0118-0008 TOAST-exposure
+				// slice 3.
+				toastIdxOID := int(t.OID) + toastIndexOidOffset
+				out = append(out, []string{
+					strconv.Itoa(toastIdxOID), // 0:  oid
+					// relname honours an ALTER INDEX … RENAME override (slice 4).
+					c.toastDisplayNameLocked(uint32(toastIdxOID), "pg_toast_"+strconv.Itoa(int(t.OID))+"_index"), // 1:  relname
+					"99",                      // 2:  relnamespace (pg_toast)
+					"0",                       // 3:  reltype
+					"0",                       // 4:  reloftype
+					"10",                      // 5:  relowner
+					"403",                     // 6:  relam (btree)
+					strconv.Itoa(toastIdxOID), // 7:  relfilenode
+					"0",                       // 8:  reltablespace
+					"0",                       // 9:  relpages
+					"-1",                      // 10: reltuples (-1 = unknown for indexes)
+					"0",                       // 11: relallvisible
+					"0",                       // 12: relallfrozen
+					"0",                       // 13: reltoastrelid
+					"f",                       // 14: relhasindex
+					"f",                       // 15: relisshared
+					relpers,                   // 16: relpersistence (inherits the table's)
+					"i",                       // 17: relkind (index)
+					"2",                       // 18: relnatts (chunk_id, chunk_seq)
+					"0",                       // 19: relchecks
+					"f",                       // 20: relhasrules
+					"f",                       // 21: relhastriggers
+					"f",                       // 22: relhassubclass
+					"f",                       // 23: relrowsecurity
+					"f",                       // 24: relforcerowsecurity
+					"t",                       // 25: relispopulated
+					"n",                       // 26: relreplident
+					"f",                       // 27: relispartition
+					"0",                       // 28: relrewrite
+					"0",                       // 29: relfrozenxid
+					"1",                       // 30: relminmxid
+					"",                        // 31: relacl (NULL)
+					"",                        // 32: reloptions (NULL)
+					"",                        // 33: relpartbound
 				})
 			}
 		}
@@ -3403,6 +3969,16 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "datconnlimit", Type: Type{Name: "int4"}, Ordinal: 5},
 			// datistemplate: standard pg_database column; false for all live databases (M0097-0021).
 			{Name: "datistemplate", Type: Type{Name: "boolean"}, Ordinal: 6},
+			// datfrozenxid / datminmxid: standard pg_database wraparound-horizon
+			// columns. goopg already computes the cluster-wide datfrozenxid
+			// candidate (DatFrozenXID = min(relfrozenxid) across user heaps,
+			// mirroring vac_update_datfrozenxid) but never exposed it through the
+			// catalog; surfacing it here lets monitoring queries such as
+			// `SELECT datname, age(datfrozenxid) FROM pg_database` and the
+			// intra-grant-inplace-db isolation spec's `SELECT datfrozenxid FROM
+			// pg_database` resolve the column instead of erroring 42703. M0117-0008.
+			{Name: "datfrozenxid", Type: Type{Name: "xid"}, Ordinal: 7},
+			{Name: "datminmxid", Type: Type{Name: "xid"}, Ordinal: 8},
 		},
 		OID:     1262, // upstream's DatabaseRelationId
 		Virtual: true,
@@ -3412,6 +3988,18 @@ func (c *InMemory) registerSystemTables() {
 		// of hard-coding a single `postgres` row. CREATE DATABASE
 		// adds entries; the recovery driver replays them.
 		names := c.ListDatabases()
+		// datfrozenxid: the cluster-wide candidate (min relfrozenxid across user
+		// heaps). When no user heap has been frozen yet DatFrozenXID returns
+		// InvalidTransactionID(0); report the bootstrap FrozenTransactionID(2)
+		// instead so the column never shows a non-existent XID 0 (mirrors PG's
+		// fresh-database datfrozenxid). datminmxid is the FirstMultiXactId(1)
+		// bootstrap value — goopg never advances a per-database multixact freeze
+		// horizon, so 1 is the accurate floor.
+		datFrozen := c.DatFrozenXID()
+		if datFrozen == storage.InvalidTransactionID {
+			datFrozen = storage.FrozenTransactionID
+		}
+		datFrozenStr := strconv.FormatUint(uint64(datFrozen), 10)
 		out := make([][]string, 0, len(names))
 		for _, n := range names {
 			// The bootstrap template databases carry their canonical PG
@@ -3436,6 +4024,8 @@ func (c *InMemory) registerSystemTables() {
 				datallowconn,  // datallowconn: allow connections
 				"0",           // datconnlimit: 0 = default (vacuumdb filters datconnlimit <> -2)
 				datistemplate, // datistemplate: true for template0/template1
+				datFrozenStr,  // datfrozenxid: cluster-wide min(relfrozenxid), bootstrap floor 2
+				"1",           // datminmxid: FirstMultiXactId bootstrap floor
 			})
 		}
 		return out
@@ -4540,6 +5130,42 @@ func (c *InMemory) registerSystemTables() {
 				"",                               // indexprs (NULL)
 				"",                               // indpred (NULL)
 				"",                               // indcoloptions (NULL)
+			})
+		}
+		// Synthesize the unique btree index PG auto-creates on every TOAST
+		// relation (on chunk_id, chunk_seq). The pg_class virtual builder emits
+		// the matching relkind='i' row named pg_toast_<oid>_index; this row lets
+		//   SELECT indexrelid::regclass FROM pg_index
+		//     WHERE indrelid = (SELECT oid FROM pg_class WHERE relname=<toast rel>)
+		// resolve (reindex-concurrently-toast setup). toastBearingTables uses the
+		// SAME gate as the pg_class TOAST-row emission so the two never diverge.
+		// M0118-0008 TOAST-exposure slice 3.
+		for _, t := range c.toastBearingTables() {
+			toastRelOID := int(t.OID) + toastRelidOffset
+			toastIdxOID := int(t.OID) + toastIndexOidOffset
+			out = append(out, []string{
+				fmt.Sprintf("%d", toastIdxOID), // indexrelid
+				fmt.Sprintf("%d", toastRelOID), // indrelid
+				"2",                            // indnatts (chunk_id, chunk_seq)
+				"2",                            // indnkeyatts
+				"t",                            // indisunique
+				"f",                            // indnullsnotdistinct
+				"f",                            // indisprimary
+				"f",                            // indisexclusion
+				"t",                            // indimmediate
+				"f",                            // indisclustered
+				"t",                            // indisvalid
+				"f",                            // indcheckxmin
+				"t",                            // indisready
+				"t",                            // indislive
+				"f",                            // indisreplident
+				"1 2",                          // indkey (chunk_id=1, chunk_seq=2)
+				"0 0",                          // indcollation (int4 columns: no collation)
+				"1978 1978",                    // indclass (int4_ops btree)
+				"0 0",                          // indoption
+				"",                             // indexprs (NULL)
+				"",                             // indpred (NULL)
+				"",                             // indcoloptions (NULL)
 			})
 		}
 		return out
@@ -6857,14 +7483,84 @@ func (c *InMemory) allSchemasLocked() []struct {
 	out := make([]struct {
 		name string
 		oid  uint32
-	}, 0, len(c.schemas))
+	}, 0, len(c.schemas)+len(c.tempNamespaces))
 	for name, oid := range c.schemas {
 		out = append(out, struct {
 			name string
 			oid  uint32
 		}{name, oid})
 	}
+	// Surface each session's temporary namespace (pg_temp_<id>) so a
+	// cross-session pg_namespace join and pg_my_temp_schema()'s OID resolve
+	// to a real catalog row, mirroring PostgreSQL's shared pg_namespace.
+	// M0118-0009 (temp-schema-cleanup, design 0118-0091).
+	for owner, oid := range c.tempNamespaces {
+		out = append(out, struct {
+			name string
+			oid  uint32
+		}{tempNamespaceName(owner), oid})
+	}
 	return out
+}
+
+// tempNamespaceName renders the pg_temp_<id> namespace name for a temp-owner
+// token ("s<id>" → "pg_temp_<id>"). Mirrors PostgreSQL's pg_temp_N naming.
+func tempNamespaceName(owner string) string {
+	return "pg_temp_" + strings.TrimPrefix(owner, "s")
+}
+
+// EnsureTempNamespace lazily allocates and returns the OID of the temporary
+// namespace owned by the session identified by owner ("s<id>"). Called from the
+// CREATE TEMPORARY path on first temp-object creation. Idempotent: a session's
+// temp namespace persists for the rest of its life (PostgreSQL reuses pg_temp_N
+// even after every temp object is dropped). A blank owner (session-less context)
+// gets no namespace and returns 0. M0118-0009 (temp-schema-cleanup, 0118-0091).
+func (c *InMemory) EnsureTempNamespace(owner string) uint32 {
+	if owner == "" {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if oid, ok := c.tempNamespaces[owner]; ok {
+		return oid
+	}
+	oid := c.nextOID
+	c.nextOID++
+	c.tempNamespaces[owner] = oid
+	return oid
+}
+
+// TempNamespaceOID returns the OID of owner's temporary namespace, or 0 if the
+// session has not created one. Backs pg_my_temp_schema(). M0118-0009.
+func (c *InMemory) TempNamespaceOID(owner string) uint32 {
+	if owner == "" {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.tempNamespaces[owner]
+}
+
+// DropTempNamespace removes owner's temporary namespace registration. Called on
+// session exit, after the session's temp objects have been dropped, so a later
+// cross-session pg_namespace scan no longer sees the dead pg_temp_<id> row.
+// M0118-0009 (temp-schema-cleanup, design 0118-0091).
+func (c *InMemory) DropTempNamespace(owner string) {
+	if owner == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.tempNamespaces, owner)
+}
+
+// tempNamespaceOIDLocked is the lock-free variant for callers already holding
+// c.mu (e.g. the pg_class VirtualRows builder).
+func (c *InMemory) tempNamespaceOIDLocked(owner string) uint32 {
+	if owner == "" {
+		return 0
+	}
+	return c.tempNamespaces[owner]
 }
 
 // RoleExists reports whether a role with the given name has been registered.
@@ -7069,6 +7765,62 @@ func (c *InMemory) DropTable(name parser.ObjectName) error {
 	delete(c.tables, k)
 	delete(c.tableACLs, tbl.OID) // forget any granted privileges (M0118-0008)
 	return nil
+}
+
+// DropSessionTempObjects removes every temporary relation owned by the session
+// identified by owner ("s<id>"), along with their indexes and ACLs. It backs
+// DISCARD TEMP (drop the calling session's temp objects, keep the namespace) and
+// connection teardown (full cleanup). It does NOT remove the temp namespace
+// itself — DISCARD TEMP keeps it (PostgreSQL reuses pg_temp_N), and session exit
+// calls DropTempNamespace separately. Returns the number of relations dropped.
+// M0118-0009 (temp-schema-cleanup, design 0118-0091).
+func (c *InMemory) DropSessionTempObjects(owner string) int {
+	if owner == "" {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var victims []string
+	for k, t := range c.tables {
+		if t != nil && t.Temp && t.TempOwner == owner {
+			victims = append(victims, k)
+		}
+	}
+	for _, k := range victims {
+		tbl := c.tables[k]
+		if idxs, ok := c.byTable[tbl.OID]; ok {
+			for idxKey := range idxs {
+				delete(c.indexes, idxKey)
+			}
+			delete(c.byTable, tbl.OID)
+		}
+		delete(c.tables, k)
+		delete(c.tableACLs, tbl.OID)
+	}
+	return len(victims)
+}
+
+// SessionTempTableNames returns the (bare) names of every temporary relation
+// owned by owner ("s<id>"). It is read-only and is used by temporary-object
+// cleanup (DISCARD TEMP / backend exit) to cascade drops to (possibly non-temp)
+// routines that depend on a temp table's implicit composite rowtype — the
+// rowtype shares the table's name, so the table name is the dependency signal
+// goopg uses in lieu of an OID-level pg_depend graph. Call it BEFORE
+// DropSessionTempObjects (which removes the tables). M0118-0009
+// (temp-schema-cleanup).
+func (c *InMemory) SessionTempTableNames(owner string) []string {
+	if owner == "" {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var names []string
+	for _, t := range c.tables {
+		if t != nil && t.Temp && t.TempOwner == owner {
+			names = append(names, t.Name)
+		}
+	}
+	return names
 }
 
 // DropIndex removes an index from the catalog.
@@ -7381,6 +8133,167 @@ func (c *InMemory) DatFrozenXID() storage.TransactionID {
 		}
 	}
 	return oldest
+}
+
+// SetDatabaseACLChangeXID records xid as the writer of the most recent
+// GRANT/REVOKE … ON DATABASE (a pg_database ACL change). See the
+// dbACLChangeXID field comment. Design 0118-0098 (intra-grant-inplace-db).
+func (c *InMemory) SetDatabaseACLChangeXID(xid storage.TransactionID) {
+	c.dbACLChangeXID.Store(uint32(xid))
+}
+
+// DatabaseACLChangeXID returns the writer XID of the most recent GRANT/REVOKE …
+// ON DATABASE, or InvalidTransactionID (0) if none has occurred. A database-wide
+// VACUUM consults it and waits (mvcc.WaitForXID) so an in-place datfrozenxid
+// update serialises behind a concurrent uncommitted ACL change, mirroring
+// PostgreSQL's heap_inplace_update_scan waiting on the catalog tuple's xmax.
+func (c *InMemory) DatabaseACLChangeXID() storage.TransactionID {
+	return storage.TransactionID(c.dbACLChangeXID.Load())
+}
+
+// SetTableACLChangeXID records xid as the writer of the most recent
+// GRANT/REVOKE … ON [TABLE] for the relation identified by oid (a pg_class ACL
+// change). See the tableACLChangeXID field comment. Design 0118-0109.
+func (c *InMemory) SetTableACLChangeXID(oid, xid uint32) {
+	c.tableACLChangeXIDMu.Lock()
+	defer c.tableACLChangeXIDMu.Unlock()
+	if c.tableACLChangeXID == nil {
+		c.tableACLChangeXID = make(map[uint32]uint32)
+	}
+	c.tableACLChangeXID[oid] = xid
+}
+
+// TableACLChangeXID returns the writer XID of the most recent GRANT/REVOKE …
+// ON [TABLE] for the relation oid, or InvalidTransactionID (0) if none. ALTER
+// TABLE ADD PRIMARY KEY consults it and waits (mvcc.WaitForXID) so its in-place
+// relhasindex update serialises behind a concurrent uncommitted ACL change,
+// mirroring PostgreSQL's heap_inplace_update waiting on the pg_class tuple xmax.
+func (c *InMemory) TableACLChangeXID(oid uint32) storage.TransactionID {
+	c.tableACLChangeXIDMu.Lock()
+	defer c.tableACLChangeXIDMu.Unlock()
+	return storage.TransactionID(c.tableACLChangeXID[oid])
+}
+
+// SetTablePendingDropXID records xid as the in-flight transaction that issued a
+// `DROP TABLE` deferred to COMMIT for the relation identified by oid. See the
+// tablePendingDropXID field comment. Design 0118-0117 (intra-grant-inplace perm
+// 10). Cleared by ClearTablePendingDropXID once the DROP is applied at COMMIT or
+// cancelled at ROLLBACK; a stale entry is harmless because the wait short-
+// circuits the moment the recorded XID is no longer active.
+func (c *InMemory) SetTablePendingDropXID(oid, xid uint32) {
+	if oid == 0 || xid == 0 {
+		return
+	}
+	c.tablePendingDropXIDMu.Lock()
+	defer c.tablePendingDropXIDMu.Unlock()
+	if c.tablePendingDropXID == nil {
+		c.tablePendingDropXID = make(map[uint32]uint32)
+	}
+	c.tablePendingDropXID[oid] = xid
+}
+
+// TablePendingDropXID returns the writer XID of the in-flight deferred DROP TABLE
+// for the relation oid, or InvalidTransactionID (0) if none. A pg_class rowmark
+// consults it and waits (mvcc.WaitForXID) so its FOR UPDATE/SHARE serialises
+// behind the concurrent uncommitted DROP, mirroring PostgreSQL's tuple lock
+// waiting on the pg_class tuple's delete xmax. Design 0118-0117.
+func (c *InMemory) TablePendingDropXID(oid uint32) storage.TransactionID {
+	c.tablePendingDropXIDMu.Lock()
+	defer c.tablePendingDropXIDMu.Unlock()
+	return storage.TransactionID(c.tablePendingDropXID[oid])
+}
+
+// ClearTablePendingDropXID drops the pending-DROP xmax entry for relation oid.
+// Called when the deferred DROP is applied at COMMIT or cancelled at ROLLBACK.
+// Design 0118-0117.
+func (c *InMemory) ClearTablePendingDropXID(oid uint32) {
+	if oid == 0 {
+		return
+	}
+	c.tablePendingDropXIDMu.Lock()
+	defer c.tablePendingDropXIDMu.Unlock()
+	delete(c.tablePendingDropXID, oid)
+}
+
+// AddPgClassRowMark records that transaction xid holds an explicit row lock on
+// the pg_class tuple for relation relOID. conflictsWithInplace is true when the
+// lock mode (FOR SHARE / FOR NO KEY UPDATE / FOR UPDATE) conflicts with a
+// concurrent in-place update of that tuple; FOR KEY SHARE records false. See the
+// pgClassRowMarks field comment. Design 0118-0113.
+func (c *InMemory) AddPgClassRowMark(relOID, xid uint32, conflictsWithInplace bool) {
+	if relOID == 0 || xid == 0 {
+		return
+	}
+	c.pgClassRowMarksMu.Lock()
+	defer c.pgClassRowMarksMu.Unlock()
+	if c.pgClassRowMarks == nil {
+		c.pgClassRowMarks = make(map[uint32]map[uint32]bool)
+	}
+	holders := c.pgClassRowMarks[relOID]
+	if holders == nil {
+		holders = make(map[uint32]bool)
+		c.pgClassRowMarks[relOID] = holders
+	}
+	// A stronger later acquisition by the same xid (e.g. KEY SHARE then NO KEY
+	// UPDATE) must not be downgraded by an earlier weak mark — OR the flag.
+	holders[xid] = holders[xid] || conflictsWithInplace
+}
+
+// PgClassRowMarks returns the explicit row-lock holders on relation relOID's
+// pg_class tuple. The caller filters out its own transaction tree and waits on
+// the conflicting remainder. Design 0118-0113.
+func (c *InMemory) PgClassRowMarks(relOID uint32) []PgClassRowMark {
+	c.pgClassRowMarksMu.Lock()
+	defer c.pgClassRowMarksMu.Unlock()
+	holders := c.pgClassRowMarks[relOID]
+	if len(holders) == 0 {
+		return nil
+	}
+	out := make([]PgClassRowMark, 0, len(holders))
+	for xid, conflicts := range holders {
+		out = append(out, PgClassRowMark{XID: xid, ConflictsWithInplace: conflicts})
+	}
+	return out
+}
+
+// ClearPgClassRowMark drops the single pg_class rowmark held by transaction xid
+// on relation relOID. Called when a FOR UPDATE/SHARE locker that recorded the
+// mark up front (so a peer would block behind it) ends up locking no tuple —
+// e.g. the relation's pg_class row was concurrently DELETEd and the locker now
+// returns 0 rows. PG holds no tuple lock in that case, so a peer waiting behind
+// the mark must proceed immediately. Design 0118-0117 (intra-grant-inplace perm
+// 10).
+func (c *InMemory) ClearPgClassRowMark(relOID, xid uint32) {
+	if relOID == 0 || xid == 0 {
+		return
+	}
+	c.pgClassRowMarksMu.Lock()
+	defer c.pgClassRowMarksMu.Unlock()
+	if holders := c.pgClassRowMarks[relOID]; holders != nil {
+		delete(holders, xid)
+		if len(holders) == 0 {
+			delete(c.pgClassRowMarks, relOID)
+		}
+	}
+}
+
+// ClearPgClassRowMarksForXID drops every pg_class rowmark held by transaction
+// xid. Called when the transaction commits or aborts so a finished locker no
+// longer appears as a held lock. Design 0118-0113.
+func (c *InMemory) ClearPgClassRowMarksForXID(xid uint32) {
+	if xid == 0 {
+		return
+	}
+	c.pgClassRowMarksMu.Lock()
+	defer c.pgClassRowMarksMu.Unlock()
+	for relOID, holders := range c.pgClassRowMarks {
+		if _, ok := holders[xid]; ok {
+			delete(holders, xid)
+			if len(holders) == 0 {
+				delete(c.pgClassRowMarks, relOID)
+			}
+		}
+	}
 }
 
 // AllUserViews returns deep copies of every user-created non-materialized view.
@@ -8501,6 +9414,14 @@ type SearchPathCatalog struct {
 	// Zero for snapshot-less contexts (no filtering). Design 0118-0059
 	// (M0118-0008 detach-partition-concurrently).
 	SnapshotPartitionDetachEpoch uint64
+	// DisableSeqScan mirrors the querying session's `enable_seqscan = off` GUC.
+	// goopg's planner is otherwise rule-based and ignores the planner toggle
+	// GUCs, but the planner reads this one (via SeqScanDisabled) to promote an
+	// ordered full-index scan that covers the projection to an IndexOnlyScan —
+	// eliminating the Sort the way PG does once a SeqScan is disabled. Bounded:
+	// false in the default (toggle-untouched) case so legacy plans are unchanged.
+	// Design 0118-0103 (M0118-0009 horizons enabler).
+	DisableSeqScan bool
 }
 
 // WithSearchPath returns a SearchPathCatalog that falls back to the schemas
@@ -8515,6 +9436,12 @@ func WithSearchPath(cat Catalog, getSchemas func() []string) *SearchPathCatalog 
 // planner discovers it via a tempOwnerCarrier interface walk over the catalog
 // wrapper chain. Design 0118-0036.
 func (c *SearchPathCatalog) CurrentTempOwner() string { return c.TempOwnerToken }
+
+// SeqScanDisabled reports the querying session's `enable_seqscan = off` GUC so
+// the planner can promote an ordered covering index scan to an IndexOnlyScan
+// (dropping the Sort). The planner discovers it via a seqScanToggleCarrier
+// interface walk over the catalog wrapper chain. Design 0118-0103 (horizons).
+func (c *SearchPathCatalog) SeqScanDisabled() bool { return c.DisableSeqScan }
 
 // CurrentPartitionDetachEpoch returns the querying statement's snapshot
 // partition-detach epoch so the planner's partition-expansion site can apply

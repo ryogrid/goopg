@@ -75,6 +75,20 @@ type joinOp struct {
 	// lockRowsOp can stamp tuple locks after the scan is closed.
 	leftCTIDs     []joinRowCTID
 	rowSourceLeft []int
+
+	// M0118-0009 (eval-plan-qual): when a downstream LockRows (FOR UPDATE OF
+	// <rel>) needs to lock a relation that ends up on the BUILD side of a lazy
+	// hash join, the build scan is drained + closed at Open so its currentTID
+	// is gone by the time lockRowsOp.drainAndStamp runs. preserveCTIDRel is set
+	// by lockRowsOp.Open (before child Open) to that relation; when the build
+	// side contains it, the build loop captures each build row's heap ctid into
+	// lazyHashCTID (parallel to lazyHash) and nextLazy stamps it onto the
+	// emitted slot so lockRowsOp's ms.hasCTID fallback recovers the TID. nil /
+	// off for every normal query, so the hot hash-join path is unaffected.
+	preserveCTIDRel   *storage.RelFileNode
+	preserveBuildSide bool
+	lazyHashCTID      map[string][]joinRowCTID
+	lazyMatchCTIDs    []joinRowCTID
 }
 
 func newJoinOp(plan *planner.Join, left, right Operator) *joinOp {
@@ -450,6 +464,13 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 		return nil
 	}
 	if err := o.right.Open(ctx); err != nil { return err }
+	// M0118-0009 (eval-plan-qual): preserve build-side heap ctids when a
+	// downstream FOR UPDATE locks a relation on this (right) build side.
+	if o.preserveCTIDRel != nil {
+		if sl := findScanLeafForRel(o.right, *o.preserveCTIDRel); sl != nil {
+			return o.buildHashRightWithCTID(ctx, sl, leftWidth, rightWidth)
+		}
+	}
 	buildOp, err := drainRowsBounded(o.right, budget)
 	_ = o.right.Close()
 	if err != nil { return err }
@@ -488,6 +509,56 @@ func (o *joinOp) openLazyHashJoin(ctx *Context) error {
 	}
 	_ = buildOp.Close()
 	if err := o.left.Open(ctx); err != nil { return err }
+	o.lazyProbe = o.left
+	return nil
+}
+
+// buildHashRightWithCTID is the ctid-preserving variant of the !BuildLeft build
+// loop: it drains the right (build) side capturing each row's heap ctid via
+// scanLeaf, then builds lazyHash + the parallel lazyHashCTID map so nextLazy can
+// stamp the build row's TID onto the emitted slot. Used only when a downstream
+// FOR UPDATE locks a relation that landed on the build side of this hash join
+// (M0118-0009, eval-plan-qual selectresultforupdate). o.right is already Open;
+// drainRowsCtxCTID consumes it to EOF without an extra Close. The materialising
+// drain (no spill) is acceptable because FOR UPDATE result sets are small.
+func (o *joinOp) buildHashRightWithCTID(ctx *Context, scanLeaf currentTIDProvider, leftWidth, rightWidth int) error {
+	rows, ctids, err := drainRowsCtxCTID(o.right, ctx, scanLeaf)
+	if err != nil {
+		return err
+	}
+	o.preserveBuildSide = true
+	o.lazyHashCTID = make(map[string][]joinRowCTID)
+	var nullLeft Row
+	var keyRow Row
+	for i, r := range rows {
+		if rightWidth == 0 && len(r) > 0 {
+			rightWidth = len(r)
+			o.lazyRW = rightWidth
+		}
+		if nullLeft == nil {
+			nullLeft = nullRow(leftWidth)
+		}
+		if keyRow == nil || len(keyRow) != leftWidth+rightWidth {
+			keyRow = make(Row, leftWidth+rightWidth)
+		}
+		copy(keyRow[:leftWidth], nullLeft)
+		copy(keyRow[leftWidth:], r)
+		key, ok, err := o.evalHashKey(o.plan.RightKey, keyRow)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			continue
+		}
+		if o.lazyHash == nil {
+			o.lazyHash = make(map[string][]Row)
+		}
+		o.lazyHash[key] = append(o.lazyHash[key], r)
+		o.lazyHashCTID[key] = append(o.lazyHashCTID[key], ctids[i])
+	}
+	if err := o.left.Open(ctx); err != nil {
+		return err
+	}
 	o.lazyProbe = o.left
 	return nil
 }
@@ -797,7 +868,8 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 		// pushed onto the part-join). Without the post-hash filter
 		// those extras are silently dropped and the join over-emits.
 		for o.lazyActive && o.lazyMatchIdx < len(o.lazyMatches) {
-			m := o.lazyMatches[o.lazyMatchIdx]
+			mi := o.lazyMatchIdx
+			m := o.lazyMatches[mi]
 			o.lazyMatchIdx++
 			o.lazyBuildSlot.row = m
 			o.lazyProbeSlot.row = o.lazyRow
@@ -807,6 +879,19 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			}
 			if !ok {
 				continue
+			}
+			// M0118-0009 (eval-plan-qual): stamp the matched build row's heap
+			// ctid onto the emitted slot so a downstream LockRows can recover
+			// the TID of a locked relation on the build side (whose scan was
+			// drained + closed at Open). Materialises the composed row only in
+			// this rare FOR-UPDATE path; the hot path returns the shared
+			// VirtualSlot untouched.
+			if o.preserveBuildSide && mi < len(o.lazyMatchCTIDs) && o.lazyMatchCTIDs[mi].hasCTID {
+				ms := o.lazyVirtualOut.Materialize()
+				ms.hasCTID = true
+				ms.ctidBlock = uint32(o.lazyMatchCTIDs[mi].ptr.Block)
+				ms.ctidOff = o.lazyMatchCTIDs[mi].ptr.Offset
+				return ms, nil
 			}
 			return o.lazyVirtualOut, nil
 		}
@@ -914,6 +999,9 @@ func (o *joinOp) nextLazy() (TupleSlot, error) {
 			continue
 		}
 		o.lazyMatches = matches
+		if o.preserveBuildSide {
+			o.lazyMatchCTIDs = o.lazyHashCTID[key]
+		}
 		o.lazyMatchIdx = 0
 		o.lazyActive = true
 		// Continue loop to yield first match.

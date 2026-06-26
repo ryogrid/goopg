@@ -10,6 +10,16 @@ import (
 // remain. Operators must keep returning EOF on subsequent Next calls.
 var EOF = errors.New("executor: end of stream")
 
+// ErrSelfTerminate is the sentinel returned when a query calls
+// pg_terminate_backend(pid) targeting its own backend PID. The current query
+// is aborted immediately (no result row, mirroring PostgreSQL's
+// SIGTERM-at-CHECK_FOR_INTERRUPTS behaviour where the connection dies inside
+// the function rather than returning a value); the server layer recognises it,
+// emits the FATAL "terminating connection due to administrator command"
+// ErrorResponse, and closes the connection. M0118-0009 (temp-schema-cleanup
+// process-exit permutation).
+var ErrSelfTerminate = errors.New("executor: backend self-termination requested")
+
 // Operator is the iterator interface every executor node implements.
 //
 // Lifecycle:

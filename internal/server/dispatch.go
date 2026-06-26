@@ -364,6 +364,30 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		}
 		return s.cancelReg.cancelByPID(uint32(pid))
 	}
+	// Wire pg_terminate_backend(pid) to the process-wide registry so a backend
+	// can terminate a peer's connection (privileged in-server path). Self-
+	// termination does NOT reach here — the expr layer returns ErrSelfTerminate
+	// so the serve loop emits the FATAL and tears down its own connection.
+	// M0118-0009 (temp-schema-cleanup process-exit permutation).
+	ectx.TerminateBackend = func(pid int32) bool {
+		if pid <= 0 {
+			return false
+		}
+		return s.cancelReg.terminateByPID(uint32(pid))
+	}
+	// pg_notify(channel, payload) buffers into the connection's transaction so it
+	// publishes to LISTENers at commit, exactly like the NOTIFY statement.
+	// M0118-0009 (async-notify).
+	if connTx != nil {
+		ectx.QueueNotify = func(channel, payload string) {
+			connTx.bufferNotify(channel, payload, connTx.BackendPID)
+		}
+	}
+	// pg_notification_queue_usage() reports the occupied fraction of the async
+	// queue (undelivered notifications across all listeners). M0118-0009.
+	if s.notify != nil {
+		ectx.NotifyQueueUsage = s.notify.QueueUsage
+	}
 	if connTx != nil {
 		ectx.ProcNum = connTx.ProcNum
 	}
@@ -466,7 +490,12 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			_, isCommit := stmt.(*parser.CommitStmt)
 			_, isRollback := stmt.(*parser.RollbackStmt)
 			_, isRollbackTo := stmt.(*parser.RollbackToSavepointStmt)
-			if !isCommit && !isRollback && !isRollbackTo {
+			// Two-phase-commit statements are also allowed through: PG's
+			// PREPARE TRANSACTION on an aborted block silently rolls back
+			// (no 25P02), and COMMIT/ROLLBACK PREPARED of a gid the failed
+			// connection never prepared reports "does not exist". Handled in
+			// execTwoPhaseStmt. M0118-0009 (prepared-transactions).
+			if !isCommit && !isRollback && !isRollbackTo && !isTwoPhaseStmt(stmt) {
 				return s.writeQueryError(w, "25P02",
 					"current transaction is aborted, commands ignored until end of transaction block")
 			}
@@ -707,6 +736,27 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				return s.writeQueryError(w, sqlstate.SystemError, err.Error())
 			}
 			ectx.Snap = snap2
+		} else if stmtTakesSnapshot(stmt) {
+			// RR/SSI: pin the transaction's snapshot at the FIRST snapshot-taking
+			// batched statement after a `BEGIN ISOLATION LEVEL …` that shares its
+			// simple-query message with following statements (PG-correct timing —
+			// PG defers the SSI/RR snapshot to the first statement that actually
+			// reads MVCC data, NOT to BEGIN and NOT to a utility statement like
+			// SET/SHOW/RESET). SnapshotFor pins firstSnap + registers the
+			// proc-array xmin on the first call and returns the pinned clone
+			// thereafter, so this is idempotent across the batch. Without it a
+			// batched `BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1;` never
+			// registers its xmin and OldestXmin/VACUUM ignore the session
+			// (horizons perm 4). Gating on stmtTakesSnapshot keeps a batched
+			// `BEGIN … SERIALIZABLE; SET debug_parallel_query = on;` from pinning
+			// the snapshot before the session's first real read
+			// (serializable-parallel). The lost-update hazard this earlier pin
+			// would otherwise expose is handled authoritatively in the
+			// EvalPlanQual write paths (epqXmaxSettled). Design 0118-0105.
+			snap2, err := s.cfg.TxnMgr.SnapshotFor(ectx.Tx)
+			if err == nil {
+				ectx.Snap = snap2
+			}
 		}
 		// Per-statement reset: clear the DML-CTE write fence and the regular-CTE
 		// row cache from any previous statement. The row cache is query-scoped:
@@ -718,6 +768,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		ectx.CTESelfModErr = nil
 		ectx.InDMLCTE = false
 		ectx.CTERowCache = nil
+		ectx.DeadlockVictim = false
 
 		// COPY inside a multi-statement simple-query batch (psql `\;`).
 		// Intercept before the plan-cache / executeOneSimpleStmt path —
@@ -747,7 +798,7 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		// plan, cache, then execute.
 		var precached planner.Node
 		var cacheKey string
-		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) {
+		if s.pc != nil && len(stmts) == 1 && !disablePlanCache && !isNotifyStmt(stmt) && !isTwoPhaseStmt(stmt) && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 			cacheKey = normalizeCompatSQL(sql)
 			if cached, ok := s.pc.Get(cacheKey); ok {
 				precached = cached
@@ -799,6 +850,13 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 				if !autoCommit && connTx != nil && connTx.InExplicit() {
 					connTx.Fail()
 					connTx.ReleasePinnedSnapshotOnFail(ectx.TxnMgr)
+					// A deadlock victim releases its XID at the abort, not at the
+					// eventual explicit ROLLBACK, so a peer blocked on its catalog
+					// tuple xmax unblocks immediately. M0118-0009 (design 0118-0115,
+					// intra-grant-inplace perm 8).
+					if ectx.DeadlockVictim {
+						connTx.AbortInPlaceOnFail(ectx.TxnMgr)
+					}
 				}
 				return nil
 			}
@@ -815,6 +873,21 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 			connTx.PendingCreatedEnums = ectx.PendingCreatedEnums
 			connTx.PendingCreatedComposites = ectx.PendingCreatedComposites
 		}
+		// Keep the savepoint-aware NOTIFY buffer in sync with the just-executed
+		// savepoint command so a later ROLLBACK TO SAVEPOINT discards the
+		// notifications queued since the savepoint and RELEASE merges them
+		// (PostgreSQL async.c per-subtransaction pendingNotifies). Runs only on
+		// success — an erroring statement returned above. M0118-0009.
+		if connTx != nil {
+			switch sp := stmt.(type) {
+			case *parser.SavepointStmt:
+				connTx.notifySavepoint(sp.Name)
+			case *parser.ReleaseSavepointStmt:
+				connTx.notifyReleaseSavepoint(sp.Name)
+			case *parser.RollbackToSavepointStmt:
+				connTx.notifyRollbackToSavepoint(sp.Name)
+			}
+		}
 	}
 	// Update pg_stat_activity to idle after successful execution.
 	if reg := s.cfg.Activity; reg != nil && connTx != nil {
@@ -827,6 +900,16 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 		executor.ReleaseAdvisoryTransactionLocks(advisoryReleaseTarget)
 		commit = true
 		maybeForceGCAfterCommit()
+		// NOTIFY becomes visible to listeners at the notifying transaction's
+		// commit; publish the buffer accumulated by this autocommit batch.
+		// M0118-0009.
+		s.publishPendingNotify(connTx)
+	}
+	// Deliver any notifications queued for this session (by this transaction's
+	// own NOTIFY and/or other backends) at the command boundary, before
+	// ReadyForQuery. M0118-0009 (async-notify).
+	if err := s.deliverNotifications(w, connTx); err != nil {
+		return err
 	}
 	return w.WriteReadyForQuery(protocol.TxStatusIdle)
 }
@@ -998,6 +1081,29 @@ func partitionDetachPending(base catalog.Catalog) bool {
 	}
 }
 
+// inheritanceChangePending reports whether the base catalog currently has an
+// ALTER TABLE … {NO} INHERIT deferred to COMMIT by an in-progress explicit
+// transaction. When true the cross-session plan cache must be bypassed: a query
+// scanning the inheritance parent must re-plan against the current (pre-commit)
+// child set rather than reuse a plan cached across the inheritance change — the
+// same constraint partitionDetachPending imposes for concurrent detach. Returns
+// false for any catalog that does not expose the check. Design 0118-0080
+// (M0118-0008 alter-table-4).
+func inheritanceChangePending(base catalog.Catalog) bool {
+	type checker interface{ HasPendingInheritanceChange() bool }
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if c, ok := base.(checker); ok {
+			return c.HasPendingInheritanceChange()
+		}
+		if u, ok := base.(unwrapper); ok {
+			base = u.Unwrap()
+		} else {
+			return false
+		}
+	}
+}
+
 // sessionPlanCatalog returns a search-path-aware catalog wrapper for use when
 // calling planner.Plan. The wrapper re-reads search_path dynamically so that
 // SET search_path changes take effect on the next statement. When sess is nil
@@ -1014,6 +1120,13 @@ func sessionPlanCatalog(sess *config.SessionRegistry, base catalog.Catalog) cata
 	// executor.sessionTempOwner: "s"+UniqueID(). Design 0118-0036 (inherit-temp).
 	if id := sess.UniqueID(); id != 0 {
 		wrapped.TempOwnerToken = "s" + strconv.FormatUint(id, 10)
+	}
+	// Carry the session's enable_seqscan toggle so the planner can promote an
+	// ordered covering index scan to an IndexOnlyScan when seqscan is disabled
+	// (PG-faithful, drops the Sort). Bool GUCs normalise to "on"/"off". Design
+	// 0118-0103 (M0118-0009 horizons enabler).
+	if _, eff, ok := sess.Get("enable_seqscan"); ok && strings.EqualFold(eff, "off") {
+		wrapped.DisableSeqScan = true
 	}
 	return wrapped
 }
@@ -1046,6 +1159,12 @@ func ctxPlanCatalog(ctx *executor.Context, base catalog.Catalog) catalog.Catalog
 	// while any detach is pending (partitionDetachPending), so this re-plans
 	// per statement against the live snapshot epoch. Design 0118-0059.
 	wrapped.SnapshotPartitionDetachEpoch = ctx.Snap.PartitionDetachEpoch
+	// Carry the session's enable_seqscan toggle (matches sessionPlanCatalog) so
+	// the planner promotes an ordered covering index scan to an IndexOnlyScan
+	// when seqscan is disabled. Design 0118-0103 (horizons).
+	if v, ok := getSetting("enable_seqscan"); ok && strings.EqualFold(v, "off") {
+		wrapped.DisableSeqScan = true
+	}
 	return wrapped
 }
 
@@ -1582,6 +1701,20 @@ func undoEnumDDLForRollback(connTx *connTxState, cat catalog.Catalog) {
 // cachedNode, when non-nil, is a pre-validated plan from the cross-session
 // plan cache — planner.Plan is skipped. M0098-0005.
 func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Context, stmt parser.Stmt, connTx *connTxState, autoCommitPtr *bool, cachedNode ...planner.Node) error {
+	// LISTEN / NOTIFY / UNLISTEN are handled at the server layer: the
+	// notification hub is cross-session server state, not an executor operator,
+	// and NOTIFY buffers until the transaction commits. Handle before planning
+	// (the planner has no node for them). M0118-0009 (async-notify).
+	if handled, err := s.execNotifyStmt(w, stmt, connTx); handled {
+		return err
+	}
+	// PREPARE TRANSACTION / COMMIT PREPARED / ROLLBACK PREPARED — two-phase
+	// commit. Handled at the server layer (the planner has no node for them);
+	// COMMIT/ROLLBACK PREPARED re-enter this function with a synthetic
+	// COMMIT/ROLLBACK so the canonical finalisation path runs. M0118-0009.
+	if handled, err := s.execTwoPhaseStmt(w, ctx, stmt, connTx, autoCommitPtr); handled {
+		return err
+	}
 	var node planner.Node
 	if len(cachedNode) > 0 && cachedNode[0] != nil {
 		node = cachedNode[0]
@@ -1643,6 +1776,15 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					}
 				}
 				connTx.Begin(ctx.Tx)
+				// connTx.Begin lazily creates the BasicSession; when BEGIN is the
+				// first statement of a multi-statement simple-query message the
+				// session did not exist at dispatch entry (ectx.Session was wired
+				// nil), so a later same-batch SAVEPOINT/transaction op would fail
+				// with "transaction statements require Session in Context". Re-wire
+				// the now-live session for the remainder of the batch. M0118-0009.
+				if sess := connTx.Session(); sess != nil {
+					ctx.Session = sess
+				}
 				// Propagate READ ONLY / READ WRITE mode from START TRANSACTION / BEGIN.
 				if connTx.Session() != nil {
 					connTx.Session().SetReadOnlyTxn(txNode.ReadOnly)
@@ -1730,6 +1872,24 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 							ssiFields...)
 					}
 				}
+				// M0118-0008: apply DROP INDEX removals deferred to COMMIT (the
+				// simple-query path bypasses execCommit). Must run BEFORE
+				// TxnMgr.Commit so the drop WAL precedes the commit record.
+				if sess := connTx.Session(); sess != nil {
+					executor.ApplyPendingIndexDrops(ctx, sess)
+					// M0118-0008: register ATTACH PARTITION deferred to COMMIT (the
+					// simple-query path bypasses execCommit).
+					executor.ApplyPendingPartitionAttaches(ctx, sess)
+					// M0118-0008: apply ALTER TABLE {NO} INHERIT deferred to COMMIT
+					// (the simple-query path bypasses execCommit).
+					executor.ApplyPendingInheritanceChanges(ctx, sess)
+					// M0118-0008 (alter-table-4 perm 3): apply DROP TABLE removals
+					// deferred to COMMIT (the simple-query path bypasses execCommit).
+					executor.ApplyPendingTableDrops(ctx, sess)
+					// M0118-0009 (`stats`): apply DROP FUNCTION removals deferred to
+					// COMMIT (the simple-query path bypasses execCommit).
+					executor.ApplyDeferredRoutineDrops(ctx, sess)
+				}
 				if err := s.cfg.TxnMgr.Commit(explicitTx); err != nil {
 					undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 					connTx.End()
@@ -1746,6 +1906,11 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				if sess := connTx.Session(); sess != nil {
 					sess.TakePendingRoutineDrops()
 				}
+				// Publish NOTIFYs buffered by this explicit transaction now that it
+				// has committed — BEFORE connTx.End() discards the buffer. Delivery
+				// to this session happens at the trailing ReadyForQuery via
+				// deliverNotifications. M0118-0009 (async-notify).
+				s.publishPendingNotify(connTx)
 				connTx.End()
 				if ctx.EndLocalTransaction != nil {
 					ctx.EndLocalTransaction()
@@ -1811,6 +1976,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 	}
 	if err := op.Open(ctx); err != nil {
 		_ = op.Close()
+		if errors.Is(err, executor.ErrSelfTerminate) {
+			return err
+		}
 		return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 	}
 
@@ -1851,6 +2019,9 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 		}
 		if err != nil {
 			_ = op.Close()
+			if errors.Is(err, executor.ErrSelfTerminate) {
+				return err
+			}
 			return s.writeQueryError(w, execErrCode(err), execErrMsg(err), execErrDetailFields(err)...)
 		}
 		if schema != nil {

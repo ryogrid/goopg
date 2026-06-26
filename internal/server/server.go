@@ -37,6 +37,7 @@ import (
 	"log/slog"
 	"net"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -323,16 +324,30 @@ type Server struct {
 	// auto-launcher (M0103-0002). nil when PubSub is unconfigured.
 	// Constructed in New, started in Run, drained on Run exit.
 	applyLauncher *ApplyLauncher
+
+	// notify is the cross-session LISTEN/NOTIFY hub (M0118-0009,
+	// async-notify). Always non-nil; channel registrations and queued
+	// notifications are keyed by each connection's stable SessionRegistry.
+	notify *notifyHub
+
+	// preparedXacts is the process-wide registry of detached prepared
+	// transactions, keyed by gid. A RC/RR PREPARE TRANSACTION parks its
+	// transaction here (off its originating backend) so a later COMMIT/ROLLBACK
+	// PREPARED can finalise it from ANY backend. Always non-nil. M0118-0009
+	// (stats — cross-backend two-phase commit).
+	preparedXacts *preparedXactStore
 }
 
 // New constructs a Server but does not start listening. Use Run to start.
 func New(cfg Config) *Server {
 	cfg.defaults()
 	s := &Server{
-		cfg:       cfg,
-		ready:     make(chan struct{}),
-		cancelReg: newCancelRegistry(),
-		roles:     map[string]struct{}{"postgres": {}},
+		cfg:           cfg,
+		ready:         make(chan struct{}),
+		cancelReg:     newCancelRegistry(),
+		roles:         map[string]struct{}{"postgres": {}},
+		notify:        newNotifyHub(),
+		preparedXacts: newPreparedXactStore(),
 	}
 	s.nextPID.Store(0)
 	// Initialize plan cache when storage handles are present (M0098-0005).
@@ -773,7 +788,7 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	// can call WaitEventStart(procNum, ...) atomically instead of acquiring
 	// the old Registry.mu on every wire frame.
 	pidStr := activity.PID(pid)
-	procNum := int32((pid - 1) % uint32(mvcc.DefaultProcArraySize))
+	procNum := int32((pid - 1) % uint32(mvcc.ConnSlotCount))
 	reg := s.cfg.Activity
 	if reg != nil {
 		clientAddr := raw.RemoteAddr().String()
@@ -866,6 +881,10 @@ func (s *Server) serveConn(ctx context.Context, raw net.Conn) {
 	}
 	cancelEntry := s.cancelReg.register(pid, secret)
 	defer s.cancelReg.unregister(pid)
+	// Wire the connection-termination function so a peer's pg_terminate_backend(pid)
+	// can tear this connection down (cancelling connCtx fires the FATAL path at the
+	// top of the serve loop). M0118-0009.
+	cancelEntry.setTerminate(cancel)
 
 	if err := s.sendStartupReply(w, sess, pid, secret); err != nil {
 		logger.Info("startup reply failed", "err", err)
@@ -1080,12 +1099,46 @@ func (s *Server) rollbackOpenTxnOnTeardown(connTx *connTxState, logger *slog.Log
 	}
 }
 
+// cleanupSessionTempObjects drops every temporary object owned by sess at
+// backend exit, mirroring PostgreSQL's RemoveTempRelations: the session's temp
+// tables (and their implicit composite rowtypes), the non-temp routines that
+// depend on those rowtypes (the same name-keyed cascade DISCARD TEMP uses, since
+// goopg has no OID-level pg_depend graph), and finally the temp namespace
+// registration itself (unlike DISCARD TEMP, which keeps the namespace for reuse).
+// A no-op for a session that never created a temporary object. The owner token
+// matches executor.sessionTempOwner ("s"+UniqueID). M0118-0009.
+func (s *Server) cleanupSessionTempObjects(sess *config.SessionRegistry) {
+	if sess == nil || s.cfg.Catalog == nil {
+		return
+	}
+	im, ok := s.cfg.Catalog.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	id := sess.UniqueID()
+	if id == 0 {
+		return
+	}
+	owner := "s" + strconv.FormatUint(id, 10)
+	// Capture the temp tables' names BEFORE dropping them: a temp table's
+	// implicit composite rowtype dies with it and cascades to any routine
+	// referencing that rowtype (e.g. the spec's uses_a_temp_type).
+	tempTypeNames := im.SessionTempTableNames(owner)
+	im.DropSessionTempObjects(owner)
+	if len(tempTypeNames) > 0 {
+		if rs := im.Routines(); rs != nil {
+			rs.DropRoutinesReferencingTypes(tempTypeNames)
+		}
+	}
+	im.DropTempNamespace(owner)
+}
+
 func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *protocol.FrameReader, w *protocol.FrameWriter, sess *config.SessionRegistry, logger *slog.Logger, isReplication bool, appName, dbName string, sessCtx *mctx.Context, pid uint32) {
 	extended := newExtendedState()
 	// Assign a ProcArray slot for this backend (M0107-0004). The slot is
 	// reused across all transactions on this connection; Begin clears and
 	// re-initialises it on each new transaction.
-	procNum := int32((pid - 1) % uint32(mvcc.DefaultProcArraySize))
+	procNum := int32((pid - 1) % uint32(mvcc.ConnSlotCount))
 	extended.ProcNum = procNum                                                                   // thread through to executeExtendedQueryViaExecutor
 	extended.DBName = dbName                                                                     // scopes pg_extension per database (M0110-0003 gap #7c)
 	connTx := &connTxState{SessCtx: sessCtx, ProcNum: procNum, DBName: dbName, AdvisoryID: sess} // per-connection explicit transaction state (M0096-0005); DBName scopes pg_extension (M0110-0003 gap #7c); AdvisoryID = stable advisory-lock owner identity (M0118-0003)
@@ -1097,6 +1150,19 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 	// connTxState.End() at COMMIT/ROLLBACK (and on teardown via
 	// rollbackOpenTxnOnTeardown).
 	connTx.LockBackendID = lockmgr.BackendID(s.nextBackendID.Add(1))
+	// LISTEN/NOTIFY identity: the backend PID is the source of NOTIFY deliveries
+	// and the SessionRegistry is the hub key. On teardown drop every channel
+	// registration and undelivered notification for this session, mirroring
+	// PostgreSQL freeing the listen state at backend exit. M0118-0009.
+	connTx.BackendPID = pid
+	connTx.NotifySession = sess
+	defer s.notify.RemoveSession(sess)
+	// Map this connection's transaction-scoped lock identity to its backend PID
+	// so transaction-scoped relation locks (LOCK TABLE / DDL / scan-read ACCESS
+	// SHARE) held on the executor's tableLockMgr surface in pg_locks with a PID
+	// that joins pg_stat_activity (design 0118-0070). Dropped at teardown.
+	executor.RegisterLockBackendPID(connTx.LockBackendID, pid)
+	defer executor.UnregisterLockBackendPID(connTx.LockBackendID)
 	// On connection teardown, release EVERY advisory lock this backend still
 	// holds — session-scoped as well as transaction-scoped. PostgreSQL frees all
 	// advisory locks at backend exit; without this a session-scoped
@@ -1106,6 +1172,15 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 	// (defers run LIFO) so the xact-scoped release there is a harmless no-op.
 	// M0118-0003.
 	defer executor.ReleaseAllAdvisoryLocks(sess)
+	// On connection teardown, drop this session's temporary objects (temp tables,
+	// their implicit composite rowtypes, the non-temp routines that depend on
+	// those rowtypes, and finally the temp namespace itself). PostgreSQL performs
+	// this at backend exit via RemoveTempRelations, and crucially BEFORE releasing
+	// session-level advisory locks — the temp-schema-cleanup spec relies on that
+	// ordering: a peer waiting on the same advisory lock only unblocks once the
+	// catalog is clean. Registered AFTER the advisory-release defer so LIFO runs
+	// it FIRST. M0118-0009 (temp-schema-cleanup process-exit permutation).
+	defer s.cleanupSessionTempObjects(sess)
 	// On connection teardown (client disconnect, EOF, read error, admin
 	// shutdown — every `return` from the loop below), roll back any still-open
 	// explicit transaction so its XID is released from the ProcArray and any
@@ -1207,6 +1282,17 @@ func (s *Server) runPostStartupLoop(ctx context.Context, entry *cancelEntry, r *
 			entry.clearQueryCancel()
 			queryCancel()
 			if err != nil {
+				if errors.Is(err, executor.ErrSelfTerminate) {
+					// pg_terminate_backend(pg_backend_pid()): the query targeted
+					// this backend. Emit the FATAL and close the connection,
+					// matching PostgreSQL's SIGTERM-at-CHECK_FOR_INTERRUPTS path
+					// (the client sees only the FATAL, no result row). The deferred
+					// teardown (temp-object cleanup, advisory-lock release, open-txn
+					// rollback) then runs before the socket closes. M0118-0009
+					// (temp-schema-cleanup process-exit permutation).
+					s.writeFatal(w, sqlstate.AdminShutdown, "terminating connection due to administrator command")
+					return
+				}
 				if errors.Is(err, errQueryErrorSent) {
 					// Error + ReadyForQuery already sent cleanly; keep connection.
 					// The client received the error and will send the next Query.

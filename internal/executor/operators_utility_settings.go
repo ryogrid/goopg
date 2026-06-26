@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
 )
@@ -123,6 +124,33 @@ func (o *utilitySettingsOp) Next() (TupleSlot, error) {
 				o.ctx.LastSeqSet = false
 				o.ctx.LastSeqVal = 0
 				o.ctx.LastSeqName = ""
+			}
+		}
+		// DISCARD TEMP / TEMPORARY (and DISCARD ALL) drop every temporary
+		// relation owned by the calling session. The session's temp namespace
+		// (pg_temp_<id>) itself persists — PostgreSQL keeps the namespace for the
+		// life of the backend and reuses it. A subsequent cross-session scan of
+		// pg_class WHERE relnamespace = pg_my_temp_schema() therefore finds no
+		// rows. M0118-0009 (temp-schema-cleanup, design 0118-0091).
+		if stmt.Mode == "TEMP" || stmt.Mode == "ALL" {
+			if o.ctx != nil {
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					owner := sessionTempOwner(o.ctx)
+					// Capture the temp tables' names before dropping them: a temp
+					// table's implicit composite rowtype is dropped with it, which
+					// cascades to any (possibly non-temp) routine that takes or
+					// returns that rowtype — e.g. the temp-schema-cleanup spec's
+					// uses_a_temp_type(just_give_me_a_type). PostgreSQL tracks this
+					// via pg_depend; goopg matches by the temp table's
+					// session-unique name. M0118-0009 (temp-schema-cleanup).
+					tempTypeNames := im.SessionTempTableNames(owner)
+					im.DropSessionTempObjects(owner)
+					if len(tempTypeNames) > 0 {
+						if rs := o.ctx.Catalog.Routines(); rs != nil {
+							rs.DropRoutinesReferencingTypes(tempTypeNames)
+						}
+					}
+				}
 			}
 		}
 		return nil, EOF

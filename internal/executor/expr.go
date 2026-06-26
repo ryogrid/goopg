@@ -9,6 +9,7 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
@@ -587,9 +588,25 @@ func evalExprSlot(e planner.Expr, slot SlotView, ctx *Context) (Datum, error) {
 		if strings.EqualFold(x.TargetType, "regclass") && ctx != nil && ctx.Catalog != nil {
 			switch v.Kind {
 			case KindInt:
+				// InvalidOid (0) renders as "-", matching PG's regclassout
+				// (src/backend/utils/adt/regproc.c). Without this guard a
+				// `reltoastrelid::regclass` for a table with no TOAST relation
+				// (reltoastrelid = 0) matches the first virtual relation whose
+				// OID is unset (also 0), e.g. information_schema.routines.
+				// M0118-0008 (reindex-concurrently-toast probing).
+				if v.Int == 0 {
+					return NewStringDatum("-"), nil
+				}
 				if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
 					if tbl, found := im.LookupTableByOID(uint32(v.Int)); found && tbl != nil {
 						return NewStringDatum(tbl.Name), nil
+					}
+					// Synthetic TOAST relation OIDs (parent OID + 100M) live only in
+					// the virtual pg_class builder, not c.tables, so reconstruct the
+					// schema-qualified pg_toast.pg_toast_<oid> name PG's regclassout
+					// would emit. M0118-0008 TOAST-exposure slice 2 (0118-0084).
+					if name, found := im.ToastRelName(uint32(v.Int)); found {
+						return NewStringDatum(name), nil
 					}
 				}
 				// Also resolve index OIDs to index names. M0097-0023.
@@ -1364,8 +1381,108 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 			result = !(aur[0] < bll[0] || bur[0] < all[0] || aur[1] < bll[1] || bur[1] < all[1])
 		}
 		return NewBoolDatum(result), nil
+	case parser.OpJSONGet, parser.OpJSONGetText:
+		// json/jsonb -> int|text  →  element/field (json), and ->> → text.
+		// goopg carries json/jsonb as KindString; NULL operands already
+		// returned NullDatum above. M0118-0009 (horizons enabler).
+		return evalJSONArrow(op, left, right, pos)
 	}
 	return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("unknown operator %s", op)}
+}
+
+// evalJSONArrow evaluates the JSON accessor operators -> and ->>.
+//
+//	json -> int   → array element at index (negative counts from the end), as json
+//	json -> text  → object field by key, as json
+//	json ->> int  → array element as text
+//	json ->> text → object field as text
+//
+// A non-array left operand with an int key, a non-object left operand with a
+// text key, or a missing index/key yields SQL NULL — matching PostgreSQL. The
+// left operand must be syntactically valid JSON (else 22P02). Numbers are
+// decoded via json.Number so integer/exponent formatting round-trips exactly
+// (e.g. the EXPLAIN-FORMAT-json "Heap Fetches" the horizons spec inspects).
+//
+// goopg has no distinct json vs jsonb storage, so -> re-encodes the navigated
+// element as canonical JSON (jsonb-style: whitespace-collapsed, keys sorted by
+// the encoder). The final scalar surface form is identical to PostgreSQL; only
+// object/array key-order fidelity of the `json` (text) type differs — noted in
+// design 0118-0100.
+func evalJSONArrow(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
+	ls, ok := datumAsString(left)
+	if !ok {
+		return Datum{}, &ExecError{Code: "42883", Pos: pos,
+			Message: fmt.Sprintf("operator %s requires a json left operand", op)}
+	}
+	dec := json.NewDecoder(strings.NewReader(ls))
+	dec.UseNumber()
+	var doc any
+	if err := dec.Decode(&doc); err != nil {
+		return Datum{}, &ExecError{Code: "22P02", Pos: pos,
+			Message: "invalid input syntax for type json"}
+	}
+
+	var elem any
+	var found bool
+	switch right.Kind {
+	case KindInt:
+		arr, isArr := doc.([]any)
+		if !isArr {
+			return NullDatum, nil
+		}
+		idx := int(right.Int)
+		if idx < 0 {
+			idx = len(arr) + idx
+		}
+		if idx < 0 || idx >= len(arr) {
+			return NullDatum, nil
+		}
+		elem, found = arr[idx], true
+	case KindString, KindBytes:
+		obj, isObj := doc.(map[string]any)
+		if !isObj {
+			return NullDatum, nil
+		}
+		key, _ := datumAsString(right)
+		elem, found = obj[key]
+	default:
+		// Any other key type: PG has no matching operator; treat as NULL.
+		return NullDatum, nil
+	}
+	if !found {
+		return NullDatum, nil
+	}
+
+	if op == parser.OpJSONGetText {
+		// ->> : a JSON null element is SQL NULL; scalars become their bare
+		// text; objects/arrays become their compact JSON text.
+		if elem == nil {
+			return NullDatum, nil
+		}
+		switch x := elem.(type) {
+		case string:
+			return NewStringDatum(x), nil
+		case json.Number:
+			return NewStringDatum(x.String()), nil
+		case bool:
+			if x {
+				return NewStringDatum("true"), nil
+			}
+			return NewStringDatum("false"), nil
+		default:
+			b, err := json.Marshal(x)
+			if err != nil {
+				return NullDatum, nil
+			}
+			return NewStringDatum(string(b)), nil
+		}
+	}
+	// -> : return the element re-encoded as JSON (a JSON null → the text "null").
+	b, err := json.Marshal(elem)
+	if err != nil {
+		return NullDatum, nil
+	}
+	return NewStringDatum(string(b)), nil
 }
 
 // datumAsString returns d's character payload as a Go string when
@@ -5838,6 +5955,22 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 		}
 		return NewIntDatum(0), nil
+	case "pg_my_temp_schema":
+		// pg_my_temp_schema() → oid: the OID of the current session's temporary
+		// namespace (pg_temp_<id>), or 0 (InvalidOid) if the session has not
+		// created a temporary object. goopg models the per-backend temp namespace
+		// in the shared catalog keyed by the session's temp-owner token; the
+		// namespace is established lazily on the first CREATE TEMPORARY object and
+		// persists until the session exits (matching PostgreSQL, which reuses
+		// pg_temp_N even after every temp object is dropped). M0118-0009
+		// (temp-schema-cleanup, design 0118-0091).
+		if ctx != nil {
+			if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+				oid := im.TempNamespaceOID(sessionTempOwner(ctx))
+				return NewIntDatum(int64(oid)), nil
+			}
+		}
+		return NewIntDatum(0), nil
 	case "pg_cancel_backend":
 		// pg_cancel_backend(pid int4) → bool: signal the backend whose
 		// pg_backend_pid() == pid to cancel its currently-executing query (the
@@ -5861,6 +5994,96 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			return NewBoolDatum(ctx.CancelBackend(int32(pidArg.Int))), nil
 		}
 		return NewBoolDatum(false), nil
+	case "pg_terminate_backend":
+		// pg_terminate_backend(pid int4) → bool: terminate the backend whose
+		// pg_backend_pid() == pid (the SQL analog of sending SIGTERM). When the
+		// target is THIS backend (pid == our own pg_backend_pid()), the query is
+		// aborted immediately via ErrSelfTerminate: the server emits the FATAL
+		// "terminating connection due to administrator command" ErrorResponse and
+		// closes the connection, so the client sees no result row — exactly as PG
+		// does, where the SIGTERM is processed at CHECK_FOR_INTERRUPTS inside the
+		// function and the connection dies before a value is returned. A peer pid
+		// goes through ctx.TerminateBackend (process-wide registry) and returns a
+		// bool. Strict: NULL arg → NULL. M0118-0009 (temp-schema-cleanup
+		// process-exit permutation).
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		pidArg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		if pidArg.IsNull() {
+			return NullDatum, nil
+		}
+		target := int32(pidArg.Int)
+		// Self-termination: abort the current query so the client receives only
+		// the FATAL + connection close. Resolve our own backend PID the same way
+		// pg_backend_pid() does.
+		if ctx != nil {
+			if selfStr := ctx.backendPID(); selfStr != "" {
+				if self, perr := strconv.ParseInt(selfStr, 10, 32); perr == nil && int32(self) == target {
+					return NullDatum, ErrSelfTerminate
+				}
+			}
+		}
+		if ctx != nil && ctx.TerminateBackend != nil {
+			return NewBoolDatum(ctx.TerminateBackend(target)), nil
+		}
+		return NewBoolDatum(false), nil
+	case "pg_notify":
+		// pg_notify(channel text, payload text) → void: the SQL-function form of
+		// the NOTIFY statement. Buffers a notification (delivered to LISTENers at
+		// the current transaction's commit) via ctx.QueueNotify, which the server
+		// wires to the connection's notify buffer. A NULL payload is treated as
+		// the empty payload (matching NOTIFY without a payload). A NULL/empty
+		// channel is a no-op here. Returns void (empty value). M0118-0009.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		chArg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil {
+			return NullDatum, err
+		}
+		if chArg.IsNull() {
+			return NullDatum, nil
+		}
+		payload := ""
+		if len(x.Args) >= 2 {
+			pArg, perr := evalExpr(x.Args[1], row, ctx)
+			if perr != nil {
+				return NullDatum, perr
+			}
+			if !pArg.IsNull() {
+				payload = pArg.StringValue()
+			}
+		}
+		if ctx != nil && ctx.QueueNotify != nil {
+			ctx.QueueNotify(chArg.StringValue(), payload)
+		}
+		// pg_notify returns void — a non-NULL empty value (like the advisory-lock
+		// builtins), so `count(pg_notify(...))` counts every row (PostgreSQL's
+		// async-notify `bignotify` step expects 1000, not 0 from count skipping
+		// NULLs). It still renders as an empty field in a scalar SELECT.
+		return NewStringDatum(""), nil
+	case "pg_notification_queue_usage":
+		// pg_notification_queue_usage() → float8 in [0, 1]: the fraction of the
+		// asynchronous notification queue currently occupied by notifications
+		// that have been committed but not yet delivered to every listener. The
+		// server wires ctx.NotifyQueueUsage to notifyHub.QueueUsage; absent it
+		// (unit/embedded contexts) the queue is reported empty. Rendered as a
+		// formatted float8 like random(), so a `> 0` comparison resolves
+		// correctly. M0118-0009 (async-notify).
+		usage := 0.0
+		if ctx != nil && ctx.NotifyQueueUsage != nil {
+			usage = ctx.NotifyQueueUsage()
+		}
+		// Format with the minimal 'g' representation so an empty queue renders as
+		// "0" (not "0.000000000000000"): a float8 string with a fractional part
+		// of only zeros compares incorrectly against an integer literal in
+		// goopg's text-vs-int comparison path, so `... > 0` would wrongly be true.
+		// "0" compares correctly. M0118-0009.
+		return NewStringDatum(strconv.FormatFloat(usage, 'g', -1, 64)), nil
 	case "current_database":
 		return NewStringDatum("postgres"), nil
 	case "current_schema":
@@ -9003,6 +9226,141 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	// against the stored *acl column. M0110-0001 / DU-002 slice 2.
 	case "acldefault":
 		return evalAclDefault(x, row, ctx)
+	// pg_stat_force_next_flush() → void: forces the next cumulative-statistics
+	// flush in the current backend to proceed unconditionally (upstream skips a
+	// flush if the rate-limit interval has not elapsed). goopg accumulates
+	// function-call stats in per-session pending counters; this flushes them
+	// into the shared, cluster-global store so the pg_stat_get_function_* getters
+	// (and other sessions) observe them. The `stats` isolation spec calls it
+	// between mutating and observing steps. Design 0118-0124 (M0118-0009 rung 2).
+	case "pg_stat_force_next_flush":
+		funcStats.flush(sessionStatsID(ctx))
+		relStats.flush(sessionStatsID(ctx))
+		return NewStringDatum(""), nil
+	// pg_stat_get_function_calls(oid) → bigint: number of times the function has
+	// been called (flushed), or NULL when no stats exist for it. Design 0118-0124.
+	case "pg_stat_get_function_calls":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		if c, found := fetchFuncStat(ctx, oid); found {
+			return NewIntDatum(c.calls), nil
+		}
+		return NullDatum, nil
+	// pg_stat_get_function_total_time(oid) → double precision: total wall time
+	// spent in the function (and the functions it called), in milliseconds, or
+	// NULL when no stats exist. Design 0118-0124.
+	case "pg_stat_get_function_total_time":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		if c, found := fetchFuncStat(ctx, oid); found {
+			return newNumericFromFloat(float64(c.totalTime.Nanoseconds()) / 1e6), nil
+		}
+		return NullDatum, nil
+	// pg_stat_get_function_self_time(oid) → double precision: wall time spent in
+	// the function itself excluding nested calls, in milliseconds, or NULL when
+	// no stats exist. goopg does not separate nested time, so self == total
+	// (the spec only checks > 0). Design 0118-0124.
+	case "pg_stat_get_function_self_time":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		if c, found := fetchFuncStat(ctx, oid); found {
+			return newNumericFromFloat(float64(c.selfTime.Nanoseconds()) / 1e6), nil
+		}
+		return NullDatum, nil
+	// pg_stat_reset_single_function_counters(oid) → void: drop the cumulative
+	// counters for one function. A non-existent OID is a silent no-op (matching
+	// PG, which only resets a present shared entry). Design 0118-0124.
+	case "pg_stat_reset_single_function_counters":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if ok {
+			funcStats.resetSingle(oid)
+		}
+		return NewStringDatum(""), nil
+	// pg_stat_reset() → void: reset all cumulative statistics for the current
+	// database. goopg currently tracks only function stats, so this clears the
+	// shared function-stats store. Design 0118-0124.
+	case "pg_stat_reset":
+		funcStats.resetAll()
+		relStats.resetAll()
+		return NewStringDatum(""), nil
+	// pg_stat_clear_snapshot() → void: discards the current transaction's cached
+	// statistics snapshot (used with stats_fetch_consistency = 'snapshot'/'cache')
+	// so subsequent reads consult live shared values again. M0118-0009.
+	case "pg_stat_clear_snapshot":
+		if sess, ok := ctx.Session.(*BasicSession); ok && sess != nil {
+			sess.ClearStatsSnapshot()
+		}
+		return NewStringDatum(""), nil
+	// Relation (table) cumulative-stats getters. Unlike the function-stats
+	// getters, these return 0 (not SQL NULL) for an OID with no flushed stats —
+	// matching PG, where pg_stat_get_numscans of a dropped/never-touched relation
+	// reads 0. Design 0118-0128 (M0118-0009 rung 6).
+	case "pg_stat_get_numscans",
+		"pg_stat_get_tuples_returned",
+		"pg_stat_get_tuples_fetched",
+		"pg_stat_get_tuples_inserted",
+		"pg_stat_get_tuples_updated",
+		"pg_stat_get_tuples_deleted",
+		"pg_stat_get_live_tuples",
+		"pg_stat_get_dead_tuples",
+		"pg_stat_get_vacuum_count":
+		oid, ok, err := statFuncOIDArg(x, row, ctx)
+		if err != nil {
+			return Datum{}, err
+		}
+		if !ok {
+			return NullDatum, nil
+		}
+		c, _ := relStats.get(oid)
+		var v int64
+		switch name {
+		case "pg_stat_get_numscans":
+			v = c.numScans
+		case "pg_stat_get_tuples_returned":
+			v = c.tuplesReturned
+		case "pg_stat_get_tuples_fetched":
+			// Index-scan fetched tuples are not yet tracked (no index-scan
+			// counting rung); report 0 as PG does before any index scan.
+			v = 0
+		case "pg_stat_get_tuples_inserted":
+			v = c.tuplesInserted
+		case "pg_stat_get_tuples_updated":
+			v = c.tuplesUpdated
+		case "pg_stat_get_tuples_deleted":
+			v = c.tuplesDeleted
+		case "pg_stat_get_live_tuples":
+			v = c.deltaLive
+			if v < 0 {
+				v = 0 // PG clamps live-tuple estimate to non-negative
+			}
+		case "pg_stat_get_dead_tuples":
+			v = c.deltaDead
+			if v < 0 {
+				v = 0
+			}
+		case "pg_stat_get_vacuum_count":
+			// No VACUUM-driven relation stats yet; PG reads 0 until first vacuum.
+			v = 0
+		}
+		return NewIntDatum(v), nil
 	}
 
 	// Function-style type casts: int4(x), float8(x), text(x), etc.

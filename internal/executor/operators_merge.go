@@ -528,7 +528,10 @@ func (o *mergeOp) Next() (TupleSlot, error) {
 
 			// BEFORE INSERT triggers (mirrors insertOp path). M0100-0005.
 			if len(insertTbl.Triggers) > 0 {
-				newRow, ok := fireTriggers(o.ctx, insertTbl, "before", "insert", nil, row)
+				newRow, ok, err := fireTriggers(o.ctx, insertTbl, "before", "insert", nil, row)
+				if err != nil {
+					return nil, err
+				}
 				if !ok {
 					break // trigger returned NULL — suppress insert
 				}
@@ -855,7 +858,10 @@ func mergeApplyUpdate(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 
 	// Fire BEFORE UPDATE trigger with the confirmed live row values. M0100-0005.
 	if tbl != nil && len(tbl.Triggers) > 0 {
-		retRow, ok := fireTriggers(ctx, tbl, "before", "update", tgtRow, newRow)
+		retRow, ok, err := fireTriggers(ctx, tbl, "before", "update", tgtRow, newRow)
+		if err != nil {
+			return err
+		}
 		if !ok {
 			return nil // trigger RETURN NULL — skip this row
 		}
@@ -971,7 +977,10 @@ func mergeApplyDelete(ctx *Context, rel storage.RelFileNode, tbl *catalog.Table,
 
 	// Fire BEFORE DELETE trigger with the confirmed live row values.
 	if tbl != nil && len(tbl.Triggers) > 0 {
-		_, ok := fireTriggers(ctx, tbl, "before", "delete", tgtRow, nil)
+		_, ok, err := fireTriggers(ctx, tbl, "before", "delete", tgtRow, nil)
+		if err != nil {
+			return err
+		}
 		if !ok {
 			return nil // trigger RETURN NULL — skip
 		}

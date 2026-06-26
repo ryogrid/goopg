@@ -171,6 +171,38 @@ type PrepareStmt struct {
 func (s *PrepareStmt) Pos() int  { return s.pos }
 func (s *PrepareStmt) stmtNode() {}
 
+// PrepareTransactionStmt — `PREPARE TRANSACTION 'gid'`.
+// M0118-0009 (prepared-transactions): the two-phase-commit prepare phase.
+// Distinct from PrepareStmt (the prepared-statement PREPARE) — they share the
+// PREPARE keyword but the TRANSACTION keyword disambiguates them in the parser.
+type PrepareTransactionStmt struct {
+	pos int
+	Gid string // the global transaction identifier (a string literal)
+}
+
+func (s *PrepareTransactionStmt) Pos() int  { return s.pos }
+func (s *PrepareTransactionStmt) stmtNode() {}
+
+// CommitPreparedStmt — `COMMIT PREPARED 'gid'`.
+// M0118-0009 (prepared-transactions): commits a previously prepared txn by gid.
+type CommitPreparedStmt struct {
+	pos int
+	Gid string
+}
+
+func (s *CommitPreparedStmt) Pos() int  { return s.pos }
+func (s *CommitPreparedStmt) stmtNode() {}
+
+// RollbackPreparedStmt — `ROLLBACK PREPARED 'gid'`.
+// M0118-0009 (prepared-transactions): rolls back a previously prepared txn.
+type RollbackPreparedStmt struct {
+	pos int
+	Gid string
+}
+
+func (s *RollbackPreparedStmt) Pos() int  { return s.pos }
+func (s *RollbackPreparedStmt) stmtNode() {}
+
 // ExecuteStmt — `EXECUTE name [(param, …)]`.
 // M0096-0006: executor retrieves and runs the named prepared statement.
 type ExecuteStmt struct {
@@ -451,6 +483,43 @@ type DiscardStmt struct {
 
 func (s *DiscardStmt) Pos() int  { return s.pos }
 func (s *DiscardStmt) stmtNode() {}
+
+// ListenStmt is `LISTEN channel` — registers the current session's interest in
+// asynchronous notifications on Channel. The channel is an identifier (or
+// double-quoted name); it is matched case-foldingly the same way PostgreSQL
+// folds an unquoted identifier. M0118-0009 (async-notify).
+type ListenStmt struct {
+	pos     int
+	Channel string
+}
+
+func (s *ListenStmt) Pos() int  { return s.pos }
+func (s *ListenStmt) stmtNode() {}
+
+// NotifyStmt is `NOTIFY channel [, 'payload']` — queues a notification that is
+// delivered to every session LISTENing on Channel when the notifying
+// transaction commits. HasPayload distinguishes an explicit empty payload from
+// none (both deliver an empty payload string; tracked for fidelity). M0118-0009.
+type NotifyStmt struct {
+	pos        int
+	Channel    string
+	Payload    string
+	HasPayload bool
+}
+
+func (s *NotifyStmt) Pos() int  { return s.pos }
+func (s *NotifyStmt) stmtNode() {}
+
+// UnlistenStmt is `UNLISTEN channel` or `UNLISTEN *` — removes one (or all, when
+// All is true) of the current session's channel registrations. M0118-0009.
+type UnlistenStmt struct {
+	pos     int
+	Channel string
+	All     bool
+}
+
+func (s *UnlistenStmt) Pos() int  { return s.pos }
+func (s *UnlistenStmt) stmtNode() {}
 
 // ResTarget is one entry in a SELECT target list: `expr [AS alias]`.
 type ResTarget struct {
@@ -1590,6 +1659,20 @@ type CompatNoopStmt struct {
 	ArgTypes  []string   // optional: arg types for operator compat registry (e.g. ["bigint","bigint"])
 	TableName ObjectName // optional: table name for rule compat registry
 	RuleKind  string     // optional: rule kind for COPY DML error messages (M0097-0140)
+	// DatabaseACL is set for a GRANT/REVOKE … ON DATABASE … statement. Such an
+	// ACL change takes no heavyweight lock in PostgreSQL — its lock is the
+	// pg_database tuple's xmax — so the executor records the writer XID
+	// (Catalog.SetDatabaseACLChangeXID) and a concurrent database-wide VACUUM
+	// waits on it before advancing datfrozenxid in place. Design 0118-0098.
+	DatabaseACL bool
+	// TableACL holds the relation name of a GRANT/REVOKE … ON [TABLE] <name>
+	// statement (the default object class for GRANT is TABLE). Like DatabaseACL,
+	// such an ACL change takes no heavyweight lock — its lock is the pg_class
+	// tuple's xmax — so the executor records the writer XID keyed by the table
+	// OID (Catalog.SetTableACLChangeXID) and a concurrent in-place pg_class update
+	// (ALTER TABLE ADD PRIMARY KEY setting relhasindex) waits on it. Empty when the
+	// grant targets a non-table object class. Design 0118-0109 (intra-grant-inplace).
+	TableACL string
 }
 
 func (s *DropCompatStmt) Pos() int  { return s.pos }

@@ -150,9 +150,31 @@ func (o *transactionOp) execCommit() error {
 		}
 		return ssiErr
 	}
+	// M0118-0008: apply DROP INDEX removals deferred to COMMIT (the index's
+	// pg_class row + lock were kept visible to other sessions until now). Must
+	// run BEFORE TxnMgr.Commit so the drop WAL precedes the commit record and
+	// the pg_class xmax stamp uses the still-live XID.
+	if sess, isBas := o.ctx.Session.(*BasicSession); isBas {
+		ApplyPendingIndexDrops(o.ctx, sess)
+		// M0118-0008: register ATTACH PARTITION deferred to COMMIT (the new
+		// partition was invisible to other sessions until now).
+		ApplyPendingPartitionAttaches(o.ctx, sess)
+		// M0118-0008: apply ALTER TABLE {NO} INHERIT deferred to COMMIT (the
+		// inheritance link change was invisible to other sessions until now).
+		ApplyPendingInheritanceChanges(o.ctx, sess)
+		// M0118-0008 (alter-table-4 perm 3): apply DROP TABLE removals deferred to
+		// COMMIT (the table's catalog row + the dropper's AccessExclusiveLock were
+		// kept visible to other sessions until now).
+		ApplyPendingTableDrops(o.ctx, sess)
+		// M0118-0009 (`stats`): apply DROP FUNCTION removals deferred to COMMIT
+		// (the routine + its cumulative function-stats were kept visible/callable
+		// to other sessions until now).
+		ApplyDeferredRoutineDrops(o.ctx, sess)
+	}
 	if err := o.ctx.TxnMgr.Commit(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
+	o.clearPgClassRowMarks(tx)
 	// M0102-0005: synchronous-replication wait. The xactMarker hook
 	// in initdb.Open writes the commit WAL record and flushes locally
 	// before TxnMgr.Commit returns; if SyncRep is configured and the
@@ -201,10 +223,25 @@ func (o *transactionOp) execRollback() error {
 				_, _ = rs.Create(r, true)
 			}
 		}
+		// M0118-0009 (`stats`): discard DROP FUNCTION drops deferred to COMMIT —
+		// the routines were never removed from the registry (kept visible until
+		// commit), so ROLLBACK only needs to drop the deferred entries.
+		sess.TakeDeferredRoutineDrops()
+		// fk-partitioned-1 (design 0118-0120): a deferred ATTACH PARTITION never
+		// registers on ROLLBACK, so drop any in-flight-attach FK markers it set
+		// (the partition stays unattached; a concurrent DELETE must not keep
+		// waiting on this aborted attach — IsXIDActive already guards that, but
+		// clear the markers eagerly to keep the map bounded).
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			for _, a := range sess.TakePendingPartitionAttaches() {
+				im.ClearPendingAttachXID(a.ChildOID)
+			}
+		}
 	}
 	if err := o.ctx.TxnMgr.Rollback(tx); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
+	o.clearPgClassRowMarks(tx)
 	o.ctx.Session.EndExplicitTransaction()
 	if o.ctx.EndLocalTransaction != nil {
 		o.ctx.EndLocalTransaction()
@@ -213,6 +250,21 @@ func (o *transactionOp) execRollback() error {
 	undoEnumDDLFromContext(o.ctx)
 	o.clearCtxTransaction()
 	return nil
+}
+
+// clearPgClassRowMarks drops any explicit pg_class rowmarks this transaction
+// recorded (SELECT … FROM pg_class … FOR …) now that it has finished, so a
+// later in-place catalog updater no longer sees them as held. Keyed by the
+// transaction's top-level id (the common case; savepoint sub-XID rowmarks, which
+// no current spec uses, are left behind but are harmless — WaitForXID returns
+// immediately once that sub-XID is no longer active). Harmless no-op when none
+// were recorded. Design 0118-0113 (intra-grant-inplace).
+func (o *transactionOp) clearPgClassRowMarks(tx mvcc.Transaction) {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok || tx.XID == storage.InvalidTransactionID {
+		return
+	}
+	im.ClearPgClassRowMarksForXID(uint32(tx.XID))
 }
 
 // rollbackDDLCreate undoes one CREATE TABLE or CREATE INDEX by removing the
@@ -277,6 +329,10 @@ func ProcessRollbackUndos(ctx *Context, sess *BasicSession) {
 			}
 		}
 	}
+	// Drop any ALTER TABLE {NO} INHERIT changes deferred to COMMIT — a ROLLBACK
+	// leaves the inheritance state untouched (and clears the catalog pending-change
+	// marks that bypass the plan cache). M0118-0008 (alter-table-4).
+	DiscardPendingInheritanceChanges(ctx, sess)
 }
 
 func (o *transactionOp) clearCtxTransaction() {
@@ -438,6 +494,27 @@ func (o *transactionOp) execRollbackTo() error {
 			im.RegisterTable(drop.Table)
 			for _, idx := range drop.Indexes {
 				im.RestoreIndex(idx)
+			}
+		}
+	}
+	// M0118-0008: discard DROP INDEX removals and ATTACH PARTITION registrations
+	// deferred inside the rolled-back savepoint so they are not applied at the
+	// outer COMMIT.
+	sess.CancelPendingIndexDropsToDepth(newDepth)
+	sess.CancelPendingPartitionAttachesToDepth(newDepth)
+	// Discard DROP TABLE removals deferred inside the rolled-back savepoint so
+	// they are not applied at the outer COMMIT. M0118-0008 (alter-table-4).
+	sess.CancelPendingTableDropsToDepth(newDepth)
+	// Discard DROP FUNCTION removals deferred inside the rolled-back savepoint so
+	// the function survives the outer COMMIT. M0118-0009 (`stats`).
+	sess.CancelDeferredRoutineDropsToDepth(newDepth)
+	// Discard deferred ALTER TABLE {NO} INHERIT changes recorded inside the
+	// rolled-back savepoint, clearing the matching catalog pending-change marks.
+	// M0118-0008 (alter-table-4).
+	if cancelled := sess.CancelPendingInheritanceChangesToDepth(newDepth); cancelled > 0 {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			for i := 0; i < cancelled; i++ {
+				im.UnmarkInheritanceChangePending()
 			}
 		}
 	}

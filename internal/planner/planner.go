@@ -193,7 +193,16 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 		// executor's explainOp now drives the inner plan
 		// through an instrumentation wrapper and reports actual
 		// rows/loops/timing per node.
-		inner, err := Plan(s.Inner, cat)
+		//
+		// EXPLAIN DECLARE c CURSOR FOR <query> explains the cursor's
+		// underlying query, mirroring PG's ExplainOneUtility →
+		// ExplainOneQuery dispatch for a DeclareCursorStmt. The cursor
+		// is never created; only its query is planned and rendered.
+		explainInner := s.Inner
+		if dc, ok := explainInner.(*parser.DeclareCursorStmt); ok {
+			explainInner = dc.Query
+		}
+		inner, err := Plan(explainInner, cat)
 		if err != nil {
 			return nil, err
 		}
@@ -1293,6 +1302,10 @@ func planSelect(s *parser.SelectStmt, cat catalog.Catalog) (Node, error) {
 	if len(s.Locking) == 0 {
 		if promoted := tryPromoteIndexOnlyScan(proj); promoted != proj {
 			out = promoted
+		} else if promoted := tryPromoteOrderedIndexOnlyScan(proj, cat); promoted != proj {
+			// `enable_seqscan = off` + ORDER BY on a covering index ⇒ ordered
+			// IndexOnlyScan, dropping the Sort. Design 0118-0103 (horizons).
+			out = promoted
 		}
 	}
 	if out == nil {
@@ -2200,7 +2213,12 @@ func planScanRangeVar(rv parser.RangeVar, cat catalog.Catalog, sourceIdx int16, 
 				// Use the child's own physical schema for the SeqScan so that
 				// physical column indices are correct for the child's row layout.
 				childScanSchema := tableSchemaWithSource(child, sourceIdx)
-				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema}
+				// SkipIfVanished: this child was identified before locking it; if a
+				// concurrent DROP of the child commits while the scan waits on its
+				// lock, skip the now-gone child instead of erroring. M0118-0008
+				// (alter-table-4 perm 3). InheritParentOID drives the post-lock
+				// type re-validation against the parent (alter-table-4 perm 4).
+				childScan := &SeqScan{pos: rv.Pos(), Table: child, Alias: rv.Alias, schema: childScanSchema, SkipIfVanished: true, InheritParentOID: tbl.OID}
 				var childNode Node = childScan
 				// If the child has a different column order than the parent,
 				// wrap the scan in a remap Project that emits columns in parent
@@ -2287,6 +2305,31 @@ func currentTempOwner(cat catalog.Catalog) string {
 			cat = u.Unwrap()
 		} else {
 			return ""
+		}
+	}
+}
+
+// currentSeqScanDisabled walks the catalog wrapper chain (peeling
+// SearchPathCatalog/etc. via Unwrap, like currentTempOwner) and reports whether
+// the querying session set `enable_seqscan = off`. Returns false when no carrier
+// is attached (internal/test contexts) so legacy rule-based plans are unchanged.
+// The single consumer is tryPromoteOrderedIndexOnlyScan, which uses it as the
+// gate to replace a Sort-over-SeqScan with an ordered covering IndexOnlyScan —
+// matching PG, which picks the IOS once the SeqScan is disabled. Design
+// 0118-0103 (M0118-0009 horizons enabler).
+func currentSeqScanDisabled(cat catalog.Catalog) bool {
+	type carrier interface{ SeqScanDisabled() bool }
+	type unwrapper interface{ Unwrap() catalog.Catalog }
+	for {
+		if c, ok := cat.(carrier); ok {
+			if c.SeqScanDisabled() {
+				return true
+			}
+		}
+		if u, ok := cat.(unwrapper); ok {
+			cat = u.Unwrap()
+		} else {
+			return false
 		}
 	}
 }
@@ -8730,6 +8773,10 @@ func exprType(e Expr) catalog.Type {
 		case "bt_index_check", "bt_index_parent_check":
 			// amcheck verification functions RETURN void (slice S4 of 0110-0008).
 			return catalog.Type{Name: "void"}
+		case "pg_my_temp_schema":
+			// Returns the OID of the session's temporary namespace (0 if none).
+			// M0118-0009 (temp-schema-cleanup).
+			return catalog.Type{Name: "oid"}
 		case "round", "ceil", "ceiling", "floor", "trunc", "sign":
 			// Preserve input numeric type; default to numeric when unknown.
 			if len(x.Args) > 0 {
@@ -9971,6 +10018,140 @@ func tryPromoteIndexOnlyScan(proj *Project) Node {
 		return filter
 	}
 	return ios
+}
+
+// tryPromoteOrderedIndexOnlyScan promotes a `Project(Sort(SeqScan))` plan to an
+// ordered IndexOnlyScan when a covering B-tree index already provides the
+// requested ORDER BY ordering — eliminating the Sort. This mirrors PostgreSQL,
+// which once a SeqScan is disabled (`enable_seqscan = off`) prefers an
+// index-only scan that satisfies the ORDER BY for free over a Sort. goopg's
+// planner is otherwise rule-based and ignores the planner-toggle GUCs, so this
+// promotion is GATED on the session's `enable_seqscan = off` (currentSeqScanDisabled)
+// to keep the blast radius to sessions that explicitly disabled seqscan — the
+// default-toggle case (TPC-H, pgbench, ordinary queries) is untouched.
+//
+// Conditions (conservative — only the shape the horizons spec needs):
+//  1. The session set enable_seqscan = off.
+//  2. proj.Child is a *Sort directly over a bare *SeqScan (no WHERE/Filter).
+//  3. Every projected target is a ColumnRef.
+//  4. Every ORDER BY key is a ColumnRef, ascending, NULLS LAST (the B-tree
+//     default ordering goopg's RangeScan produces).
+//  5. There is a non-partial B-tree index on the table whose leading key
+//     columns match the ORDER BY keys (same names, default ASC NULLS LAST) and
+//     whose key/INCLUDE columns cover every projected column.
+//
+// Returns the original proj unchanged if any condition fails. Design 0118-0103
+// (M0118-0009 horizons enabler).
+func tryPromoteOrderedIndexOnlyScan(proj *Project, cat catalog.Catalog) Node {
+	if proj == nil || cat == nil {
+		return proj
+	}
+	if !currentSeqScanDisabled(cat) {
+		return proj
+	}
+	sort, ok := proj.Child.(*Sort)
+	if !ok || len(sort.Keys) == 0 {
+		return proj
+	}
+	seqScan, ok := sort.Child.(*SeqScan)
+	if !ok || seqScan.Table == nil {
+		return proj
+	}
+	// Every ORDER BY key must be a plain column reference, ascending, NULLS LAST.
+	sortCols := make([]string, 0, len(sort.Keys))
+	for _, k := range sort.Keys {
+		cr, isCR := k.Expr.(*ColumnRef)
+		if !isCR || k.Desc || k.NullsFirst {
+			return proj
+		}
+		sortCols = append(sortCols, cr.Name)
+	}
+	// Every projected target must be a plain column reference.
+	projCols := make([]string, 0, len(proj.Targets))
+	for _, t := range proj.Targets {
+		cr, isCR := t.(*ColumnRef)
+		if !isCR {
+			return proj
+		}
+		projCols = append(projCols, cr.Name)
+	}
+	// Find a covering, ordering-providing index.
+	for _, idx := range cat.IndexesOnTable(seqScan.Table) {
+		if idx == nil || idx.DeclaredHash || idx.HasPredicate {
+			continue
+		}
+		if idx.Method != "" && idx.Method != "btree" {
+			continue
+		}
+		if len(idx.Columns) < len(sortCols) {
+			continue
+		}
+		// Leading key columns must match the ORDER BY keys in order, each
+		// ascending NULLS LAST (default index ordering). A non-default per-column
+		// ordering (ColDescending/ColNullsFirst set) disqualifies the index — the
+		// full-range RangeScan returns ascending NULLS-LAST order only.
+		ordered := true
+		for i, sc := range sortCols {
+			if idx.Columns[i] != sc {
+				ordered = false
+				break
+			}
+			if i < len(idx.ColDescending) && idx.ColDescending[i] {
+				ordered = false
+				break
+			}
+			if i < len(idx.ColNullsFirst) && idx.ColNullsFirst[i] {
+				ordered = false
+				break
+			}
+		}
+		if !ordered {
+			continue
+		}
+		// Index (key + INCLUDE columns) must cover every projected column.
+		idxColSet := make(map[string]bool, len(idx.Columns)+len(idx.IncludeColumns))
+		for _, c := range idx.Columns {
+			idxColSet[c] = true
+		}
+		for _, c := range idx.IncludeColumns {
+			idxColSet[c] = true
+		}
+		covered := make([]catalog.Column, 0, len(projCols))
+		ok := true
+		for _, pc := range projCols {
+			if !idxColSet[pc] {
+				ok = false
+				break
+			}
+			col, found := func() (catalog.Column, bool) {
+				for _, c := range seqScan.Table.Columns {
+					if c.Name == pc {
+						return c, true
+					}
+				}
+				return catalog.Column{}, false
+			}()
+			if !found {
+				ok = false
+				break
+			}
+			covered = append(covered, col)
+		}
+		if !ok || len(covered) == 0 {
+			continue
+		}
+		// Build the ordered full-range IOS. Nil Key/Keys/LowKey/HighKey ⇒ the
+		// executor RangeScans the whole index in ascending key order, so the
+		// Sort is unnecessary and is dropped along with the Project.
+		return &IndexOnlyScan{
+			pos:     seqScan.pos,
+			Table:   seqScan.Table,
+			Index:   idx,
+			Covered: covered,
+			schema:  proj.schema,
+		}
+	}
+	return proj
 }
 
 // shiftColumnRefsBy walks an expression tree and adds `delta` to

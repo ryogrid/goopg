@@ -70,15 +70,26 @@ func TestExplainAnalyzeJSONIncludesActualFields(t *testing.T) {
 	if err := json.Unmarshal([]byte(lines[0]), &top); err != nil {
 		t.Fatalf("invalid JSON: %v\n%s", err, lines[0])
 	}
+	// 0118-0102: the plan tree nests under a top-level "Plan" key
+	// (PG-faithful), with Planning/Execution Time as siblings.
 	root := top[0]
-	for _, key := range []string{"Actual Rows", "Actual Loops", "Actual Total Time", "Actual Startup Time", "Planning Time", "Execution Time"} {
+	plan, ok := root["Plan"].(map[string]any)
+	if !ok {
+		t.Fatalf("top[0] missing \"Plan\" object: %+v", root)
+	}
+	for _, key := range []string{"Actual Rows", "Actual Loops", "Actual Total Time", "Actual Startup Time"} {
+		if _, ok := plan[key]; !ok {
+			t.Errorf("Plan missing %q: %+v", key, plan)
+		}
+	}
+	for _, key := range []string{"Planning Time", "Execution Time"} {
 		if _, ok := root[key]; !ok {
 			t.Errorf("root missing %q: %+v", key, root)
 		}
 	}
 	// `SELECT 1` produces 1 row; verify the count actually
 	// flowed through the instrumentation.
-	if rows, ok := root["Actual Rows"].(float64); ok {
+	if rows, ok := plan["Actual Rows"].(float64); ok {
 		if rows != 1 {
 			t.Errorf("Actual Rows = %v, want 1", rows)
 		}
@@ -96,4 +107,3 @@ func TestExplainAnalyzeOnSelectOneRowsAccurate(t *testing.T) {
 		t.Errorf("rows=1 not found:\n%s", joined)
 	}
 }
-

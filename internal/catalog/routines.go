@@ -383,6 +383,138 @@ func (rs *Routines) DropRoutine(r *Routine) error {
 	return nil
 }
 
+// ResolveByName resolves the single routine matching a bare name (no argument
+// list) WITHOUT removing it — the read-only twin of DropByName. Used by deferred
+// DROP FUNCTION (M0118-0009 `stats`), which must identify the target routine at
+// statement time but defer its registry removal to COMMIT. Returns the same
+// error contract as DropByName: ErrRoutineNotFound / ErrRoutineAmbiguous. When
+// schema is empty, searches all schemas.
+func (rs *Routines) ResolveByName(name parser.ObjectName) (*Routine, error) {
+	schema := name.Schema
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	if schema == "" {
+		var allKeys []string
+		for nk, keys := range rs.byName {
+			if strings.HasSuffix(nk, "."+strings.ToLower(name.Name)) {
+				allKeys = append(allKeys, keys...)
+			}
+		}
+		switch len(allKeys) {
+		case 0:
+			return nil, fmt.Errorf("%w: %s", ErrRoutineNotFound, name.Name)
+		case 1:
+			return rs.byKey[allKeys[0]], nil
+		default:
+			return nil, fmt.Errorf("%w: %s", ErrRoutineAmbiguous, name.Name)
+		}
+	}
+	keys := rs.byName[nameKey(schema, name.Name)]
+	switch len(keys) {
+	case 0:
+		return nil, fmt.Errorf("%w: %s.%s", ErrRoutineNotFound, schema, name.Name)
+	case 1:
+		return rs.byKey[keys[0]], nil
+	default:
+		return nil, fmt.Errorf("%w: %s.%s has %d overloads", ErrRoutineAmbiguous, schema, name.Name, len(keys))
+	}
+}
+
+// ResolveBySig resolves the routine with the given schema+name+argtypes WITHOUT
+// removing it — the read-only twin of Drop, used by deferred DROP FUNCTION
+// (M0118-0009 `stats`). Returns ErrRoutineNotFound when the signature doesn't
+// resolve. When schema is empty, searches public then all schemas.
+func (rs *Routines) ResolveBySig(name parser.ObjectName, argTypes []Type) (*Routine, error) {
+	stub := &Routine{Name: name.Name, ArgTypes: argTypes}
+	signature := stub.Signature()
+	schema := name.Schema
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	if schema == "" {
+		if _, ok := rs.byKey[routineKey("public", name.Name, signature)]; ok {
+			schema = "public"
+		} else {
+			for _, r := range rs.byKey {
+				if strings.EqualFold(r.Name, name.Name) && r.Signature() == signature {
+					schema = r.Schema
+					break
+				}
+			}
+		}
+		if schema == "" {
+			return nil, fmt.Errorf("%w: %s%s", ErrRoutineNotFound, name.Name, signature)
+		}
+	}
+	r, ok := rs.byKey[routineKey(schema, name.Name, signature)]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s.%s%s", ErrRoutineNotFound, schema, name.Name, signature)
+	}
+	return r, nil
+}
+
+// DropRoutinesReferencingTypes drops every registered routine whose argument
+// or return type name matches one of typeNames (case-insensitive), returning
+// the dropped routines. It backs temporary-object cleanup (DISCARD TEMP /
+// backend exit): dropping a temporary table also drops its implicit composite
+// rowtype, which in PostgreSQL cascades (via pg_depend) to any function that
+// takes or returns that rowtype — e.g. the spec's
+// uses_a_temp_type(just_give_me_a_type). goopg has no OID-level type-dependency
+// graph, so the temp table's (session-unique) name is the dependency signal;
+// callers pass the names of the just-dropped temp tables. M0118-0009
+// (temp-schema-cleanup).
+func (rs *Routines) DropRoutinesReferencingTypes(typeNames []string) []*Routine {
+	if len(typeNames) == 0 {
+		return nil
+	}
+	want := make(map[string]bool, len(typeNames))
+	for _, n := range typeNames {
+		if n != "" {
+			want[strings.ToLower(n)] = true
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	var dropped []*Routine
+	for k, r := range rs.byKey {
+		if r == nil {
+			continue
+		}
+		referenced := want[strings.ToLower(r.ReturnType.Name)]
+		if !referenced {
+			for _, at := range r.ArgTypes {
+				if want[strings.ToLower(at.Name)] {
+					referenced = true
+					break
+				}
+			}
+		}
+		if !referenced {
+			continue
+		}
+		delete(rs.byKey, k)
+		schema := r.Schema
+		if schema == "" {
+			schema = "public"
+		}
+		nk := nameKey(schema, r.Name)
+		keys := rs.byName[nk]
+		for i, kk := range keys {
+			if kk == k {
+				rs.byName[nk] = append(keys[:i], keys[i+1:]...)
+				break
+			}
+		}
+		if len(rs.byName[nk]) == 0 {
+			delete(rs.byName, nk)
+		}
+		dropped = append(dropped, r)
+	}
+	return dropped
+}
+
 // List returns every registered routine in deterministic OID order.
 // Used by `pg_catalog.pg_proc`'s virtual-row provider.
 // LookupByOID returns the routine with the given OID, or nil if not found.

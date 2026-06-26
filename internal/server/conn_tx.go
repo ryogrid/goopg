@@ -25,6 +25,7 @@ import (
 	"sync"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/config"
 	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/mctx"
@@ -52,8 +53,17 @@ type connTxState struct {
 	mu     sync.Mutex
 	active bool
 	failed bool // 25P02: in_failed_sql_transaction
-	tx     mvcc.Transaction
-	sess   *executor.BasicSession // session state, non-nil when active
+	// preparedGid is the global transaction identifier set by
+	// `PREPARE TRANSACTION 'gid'`. While non-empty the connection's active
+	// transaction is "prepared": its writes, locks and SSI predicate-lock
+	// state persist (the transaction is kept open) until a matching
+	// `COMMIT PREPARED 'gid'` / `ROLLBACK PREPARED 'gid'` finalises it via the
+	// canonical commit/rollback path. Same-backend only — cross-backend commit
+	// of a prepared xact and the pg_prepared_xacts view are deferred.
+	// M0118-0009 (prepared-transactions).
+	preparedGid string
+	tx          mvcc.Transaction
+	sess        *executor.BasicSession // session state, non-nil when active
 	// SessCtx is the per-connection session-level mctx (M0107-0001).
 	// Wired by serveConn after creating the session context; stmt-level
 	// contexts are acquired as children in dispatchSimpleQueryViaExecutor.
@@ -118,6 +128,128 @@ type connTxState struct {
 	// executor.ReleaseTableLocks) on COMMIT/ROLLBACK. Assigned once at
 	// connection start in runPostStartupLoop. M0118-0003 (lock-nowait).
 	LockBackendID lockmgr.BackendID
+	// BackendPID is this connection's backend PID (the value in BackendKeyData /
+	// pg_backend_pid). Stamped once at connection start; used as the source PID
+	// of NOTIFY deliveries (the int32 of the 'A' NotificationResponse).
+	// M0118-0009 (async-notify).
+	BackendPID uint32
+	// NotifySession is the stable per-connection identity used as the
+	// LISTEN/NOTIFY hub key (same SessionRegistry as AdvisoryID, typed for
+	// direct hub calls). M0118-0009.
+	NotifySession *config.SessionRegistry
+	// pendingNotify is the savepoint-aware stack of NOTIFY messages emitted by
+	// the current transaction. PostgreSQL makes notifications visible only when
+	// the notifying transaction commits, so they are published to the hub at
+	// COMMIT and discarded at ROLLBACK. Each entry is one (sub)transaction
+	// level, mirroring async.c's per-subtransaction pendingNotifies list:
+	// pendingNotify[0] is the transaction top level (name ""), and a SAVEPOINT
+	// pushes a new level. ROLLBACK TO SAVEPOINT discards the notifications
+	// queued since that savepoint; RELEASE SAVEPOINT merges them into the
+	// enclosing level. Notifications are deduplicated by (channel,payload)
+	// across ALL active levels, the way async.c collapses duplicate
+	// same-transaction notifications. M0118-0009.
+	pendingNotify []notifyLevel
+}
+
+// notifyLevel holds one (sub)transaction level's buffered notifications.
+// name is the savepoint name that opened the level ("" for the transaction top
+// level). M0118-0009 (async-notify).
+type notifyLevel struct {
+	name   string
+	notifs []Notification
+}
+
+// bufferNotify queues one NOTIFY for publication at the current transaction's
+// commit, collapsing an exact (channel,payload) duplicate already buffered at
+// any active level of this transaction (PostgreSQL's async.c de-duplicates
+// identical notifications emitted within one transaction, across
+// subtransaction levels). The notification is appended to the current
+// (innermost) level so a later ROLLBACK TO SAVEPOINT can discard it.
+// M0118-0009.
+func (c *connTxState) bufferNotify(channel, payload string, srcPID uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, lvl := range c.pendingNotify {
+		for _, n := range lvl.notifs {
+			if n.Channel == channel && n.Payload == payload {
+				return
+			}
+		}
+	}
+	if len(c.pendingNotify) == 0 {
+		c.pendingNotify = append(c.pendingNotify, notifyLevel{})
+	}
+	top := len(c.pendingNotify) - 1
+	c.pendingNotify[top].notifs = append(c.pendingNotify[top].notifs,
+		Notification{PID: srcPID, Channel: channel, Payload: payload})
+}
+
+// notifySavepoint pushes a new (empty) notification level for a SAVEPOINT, so
+// notifications queued until the matching ROLLBACK TO / RELEASE are isolated to
+// it. M0118-0009.
+func (c *connTxState) notifySavepoint(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.pendingNotify) == 0 {
+		c.pendingNotify = append(c.pendingNotify, notifyLevel{})
+	}
+	c.pendingNotify = append(c.pendingNotify, notifyLevel{name: name})
+}
+
+// notifyReleaseSavepoint merges the named savepoint level (and any levels above
+// it) into the enclosing level, mirroring RELEASE SAVEPOINT keeping the
+// subtransaction's effects. A no-op if the name is not found. M0118-0009.
+func (c *connTxState) notifyReleaseSavepoint(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idx := c.findNotifyLevel(name)
+	if idx <= 0 {
+		return
+	}
+	for i := idx; i < len(c.pendingNotify); i++ {
+		c.pendingNotify[idx-1].notifs = append(c.pendingNotify[idx-1].notifs, c.pendingNotify[i].notifs...)
+	}
+	c.pendingNotify = c.pendingNotify[:idx]
+}
+
+// notifyRollbackToSavepoint discards every notification queued since the named
+// savepoint was established (the named level and anything above it), keeping
+// the savepoint itself active as the current level — mirroring ROLLBACK TO
+// SAVEPOINT aborting the subtransaction's pending notifies. A no-op if the name
+// is not found. M0118-0009.
+func (c *connTxState) notifyRollbackToSavepoint(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	idx := c.findNotifyLevel(name)
+	if idx <= 0 {
+		return
+	}
+	c.pendingNotify[idx].notifs = nil
+	c.pendingNotify = c.pendingNotify[:idx+1]
+}
+
+// findNotifyLevel returns the index of the topmost notification level opened by
+// the named savepoint, or -1 if absent. Caller holds c.mu. M0118-0009.
+func (c *connTxState) findNotifyLevel(name string) int {
+	for i := len(c.pendingNotify) - 1; i >= 1; i-- {
+		if c.pendingNotify[i].name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// takePendingNotify flattens every level into a single FIFO slice and clears
+// the buffer (called at COMMIT to publish; discards otherwise). M0118-0009.
+func (c *connTxState) takePendingNotify() []Notification {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []Notification
+	for _, lvl := range c.pendingNotify {
+		out = append(out, lvl.notifs...)
+	}
+	c.pendingNotify = nil
+	return out
 }
 
 // Begin marks an explicit transaction as active. tx is the TxnMgr
@@ -163,6 +295,39 @@ func (c *connTxState) ReleasePinnedSnapshotOnFail(mgr *mvcc.Manager) {
 	if c.sess != nil && c.sess.SavepointDepth() == 0 {
 		mgr.ReleasePinnedSnapshot(c.tx.Handle)
 	}
+}
+
+// AbortInPlaceOnFail releases this transaction's XID for the purpose of
+// WaitForXID / IsXIDActive the moment a top-level statement is aborted as a
+// deadlock victim, WITHOUT clearing its proc-array slot. This mirrors
+// PostgreSQL's AbortTransaction releasing the transaction's XID at the abort, so
+// a concurrent session blocked on this transaction's catalog-tuple xmax (the
+// intra-grant-inplace pg_class in-place wait) unblocks at the abort rather than
+// at the eventual explicit ROLLBACK. The slot stays open so the subsequent
+// COMMIT/ROLLBACK on this block still finalises it through the canonical path —
+// the victim is write-less (its statement errored before writing), so there is
+// nothing to make visible or roll back.
+//
+// Gated on SavepointDepth()==0 exactly like Fail()/ReleasePinnedSnapshotOnFail:
+// when a savepoint is open the error aborts only the subtransaction and ROLLBACK
+// TO SAVEPOINT resumes the same top-level XID, which must therefore stay active.
+// Used only when the executor flagged the statement as a deadlock victim
+// (Context.DeadlockVictim), so the blast radius is confined to the pg_class
+// in-place deadlock path. Design 0118-0115 (intra-grant-inplace perm 8).
+func (c *connTxState) AbortInPlaceOnFail(mgr *mvcc.Manager) {
+	if mgr == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sess == nil || c.sess.SavepointDepth() != 0 {
+		return
+	}
+	tx := c.tx
+	if curTx, _, ok := c.sess.CurrentTransaction(); ok {
+		tx = curTx
+	}
+	mgr.ReleaseXIDWaiters(tx.XID)
 }
 
 // ClearFailed clears the failed transaction state.  Used after ROLLBACK TO
@@ -251,12 +416,97 @@ func (c *connTxState) End() {
 	}
 	c.active = false
 	c.failed = false
+	c.preparedGid = ""
 	c.tx = mvcc.Transaction{}
 	c.PendingEnumValues = nil
 	c.PendingEnumRenames = nil
 	c.PendingCreatedEnums = nil
 	c.PendingCreatedComposites = nil
+	// Discard any NOTIFYs not yet published. On COMMIT the publish happens
+	// before End() is called; reaching here with a non-empty buffer means
+	// ROLLBACK (or commit-cleanup after publish), where the notifications must
+	// not be delivered. M0118-0009.
+	c.pendingNotify = nil
 	c.mu.Unlock()
+}
+
+// MarkPrepared records the two-phase-commit gid on the active transaction. The
+// transaction is kept open so its writes, locks and SSI state persist until a
+// matching COMMIT/ROLLBACK PREPARED finalises it. M0118-0009.
+func (c *connTxState) MarkPrepared(gid string) {
+	c.mu.Lock()
+	c.preparedGid = gid
+	c.mu.Unlock()
+}
+
+// PreparedGid returns the gid of the active prepared transaction, or "" when the
+// connection has no prepared transaction. M0118-0009.
+func (c *connTxState) PreparedGid() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.preparedGid
+}
+
+// ClearPrepared drops the prepared marker without ending the transaction. Called
+// just before the canonical COMMIT/ROLLBACK path finalises the prepared xact.
+// M0118-0009.
+func (c *connTxState) ClearPrepared() {
+	c.mu.Lock()
+	c.preparedGid = ""
+	c.mu.Unlock()
+}
+
+// DetachPrepared moves this connection's active transaction into a standalone
+// connTxState (for parking in the server's prepared-xact registry) and resets
+// the live connection to a free auto-commit state — preserving the
+// per-connection identities (ProcNum, lock/advisory backend identities, backend
+// PID, NOTIFY session) so the connection can run further transactions while the
+// prepared one awaits COMMIT/ROLLBACK PREPARED. newTx is the transaction after
+// it has been relocated to its dedicated proc slot. The parked session, its
+// deferred DROP FUNCTION drops, buffered NOTIFYs and pending enum DDL all travel
+// with the returned holder so the later finalisation reuses the canonical
+// commit/rollback path. M0118-0009 (stats — cross-backend two-phase commit).
+//
+// Note: the parked holder shares the originating connection's lock/advisory
+// backend identities, so xact-scoped heavyweight/advisory locks held by the
+// prepared transaction are released under the same identity the live connection
+// keeps using. The isolation specs that exercise cross-backend 2PC hold no such
+// locks across the PREPARE..finalise window, so this is sound for them; full
+// dummy-PGPROC lock hand-off is deferred.
+func (c *connTxState) DetachPrepared(gid string, newTx mvcc.Transaction) *connTxState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := &connTxState{
+		active:                   true,
+		failed:                   c.failed,
+		preparedGid:              gid,
+		tx:                       newTx,
+		sess:                     c.sess,
+		ProcNum:                  c.ProcNum,
+		DBName:                   c.DBName,
+		LockBackendID:            c.LockBackendID,
+		AdvisoryID:               c.AdvisoryID,
+		BackendPID:               c.BackendPID,
+		NotifySession:            c.NotifySession,
+		PendingEnumValues:        c.PendingEnumValues,
+		PendingEnumRenames:       c.PendingEnumRenames,
+		PendingCreatedEnums:      c.PendingCreatedEnums,
+		PendingCreatedComposites: c.PendingCreatedComposites,
+		pendingNotify:            c.pendingNotify,
+	}
+	// Reset the live connection to free/auto-commit, keeping the per-connection
+	// identities (left untouched above).
+	c.active = false
+	c.failed = false
+	c.preparedGid = ""
+	c.tx = mvcc.Transaction{}
+	c.sess = nil
+	c.PendingEnumValues = nil
+	c.PendingEnumRenames = nil
+	c.PendingCreatedEnums = nil
+	c.PendingCreatedComposites = nil
+	c.pendingNotify = nil
+	return p
 }
 
 type preparedStatementDef struct {

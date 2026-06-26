@@ -1949,6 +1949,14 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	tbl.Temp = s.Temporary
 	if s.Temporary {
 		tbl.TempOwner = sessionTempOwner(o.ctx)
+		// Lazily establish the session's per-backend temp namespace
+		// (pg_temp_<id>) so the relation renders in it and
+		// pg_my_temp_schema() resolves. M0118-0009 (temp-schema-cleanup).
+		if tbl.TempOwner != "" {
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				im.EnsureTempNamespace(tbl.TempOwner)
+			}
+		}
 	}
 	tbl.Fillfactor = fillfactor
 	tbl.ParallelWorkers = parallelWorkers
@@ -2939,6 +2947,11 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	tbl.Temp = s.Temporary
 	if s.Temporary {
 		tbl.TempOwner = sessionTempOwner(o.ctx)
+		if tbl.TempOwner != "" {
+			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+				im.EnsureTempNamespace(tbl.TempOwner)
+			}
+		}
 	}
 	// Persist the leaf partition's fillfactor so pg_class.reloptions surfaces it
 	// and pg_dump re-emits `WITH (fillfactor='N')`. DU-002 slice 191.
@@ -4103,9 +4116,17 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 						return err
 					}
 					childName := parser.ObjectName{Schema: child.Schema, Name: child.Name}
-					if err := o.dropTableByRef(childName, child); err != nil {
+					if err := o.dropTableByRef(childName, child, false); err != nil {
 						return err
 					}
+					// Record the cascade-dropped partition so a later EXPLICIT mention of
+					// the same partition in this multi-table DROP (e.g. teardown
+					// `DROP TABLE ppk, pfk, pfk1` where pfk1 is a partition of pfk) is
+					// skipped instead of raising "table ... does not exist". PostgreSQL
+					// resolves all DROP targets as one set, so a partition listed
+					// alongside its parent is dropped once, not twice. fk-partitioned-1.
+					cascadeDropped[childName.String()] = true
+					cascadeDropped[child.Name] = true
 				}
 				return nil
 			}
@@ -4164,7 +4185,7 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 						continue
 					}
 					cascadeDropped[childName.String()] = true
-					if err := o.dropTableByRef(childName, child); err != nil {
+					if err := o.dropTableByRef(childName, child, false); err != nil {
 						return err
 					}
 				}
@@ -4307,7 +4328,11 @@ func (o *ddlOp) execDropTable(s *parser.DropTableStmt) error {
 				}
 			}
 		}
-		if err := o.dropTableByRef(name, tbl); err != nil {
+		// Defer the leaf removal to COMMIT inside an explicit transaction
+		// (transactional-DDL visibility, alter-table-4 perm 3). CASCADE already
+		// removed dependents immediately above, so a deferred table would be
+		// inconsistent with its (gone) dependents — keep CASCADE immediate.
+		if err := o.dropTableByRef(name, tbl, s.Behavior != parser.DropCascade); err != nil {
 			return err
 		}
 	}
@@ -4423,7 +4448,88 @@ func routineCascadeDisplayName(r *catalog.Routine) string {
 }
 
 // dropTableByRef drops a single table by its catalog.Table reference.
-func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error {
+//
+// It first takes an AccessExclusiveLock on the relation (PG
+// RangeVarCallbackForDropRelation; transaction-scoped, a no-op in autocommit so
+// ordinary DROP TABLE keeps its historical non-blocking behaviour, held to
+// COMMIT/ROLLBACK inside an explicit transaction). When allowDefer is set and the
+// drop is a simple leaf (no partition/inheritance children, no pending-detach
+// state, no temp shadow) inside an explicit transaction, the catalog/relfile/WAL
+// removal is deferred to COMMIT via PendingTableDrop, so a concurrent reader that
+// identified this table (e.g. as an inheritance child of a parent it is scanning)
+// blocks on the lock and only sees the table vanish at commit — PG
+// transactional-DDL visibility (alter-table-4 perm 3). Cascade/partition recursion
+// passes allowDefer=false so dependent removal stays immediate and ordered.
+// M0118-0008.
+func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table, allowDefer bool) error {
+	// AccessExclusiveLock on the table being dropped (transaction-scoped).
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = name.Pos()
+		}
+		return err
+	}
+	// DROP also AccessExclusive-locks the table's TOAST relation, mirroring PG
+	// (performDeletion drops the toast rel under the same lock). The lock is
+	// observable to REINDEX … CONCURRENTLY pg_toast.<name>, which waits for
+	// toast-relation lockers, so an in-progress concurrent reindex blocks until
+	// this DROP's transaction commits or rolls back. M0118-0008
+	// (reindex-concurrently-toast, design 0118-0088).
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		if toastRel, has := im.ToastRelFileNode(o.ctx.Catalog.RelFileNode(tbl)); has {
+			if err := o.ctx.acquireDDLLockTxn(toastRel, lockmgr.AccessExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = name.Pos()
+				}
+				return err
+			}
+		}
+	}
+	if allowDefer {
+		if bsess, ok := o.ctx.Session.(*BasicSession); ok && bsess.InExplicitTransaction() {
+			if im, ok2 := o.ctx.Catalog.(*catalog.InMemory); ok2 &&
+				tbl.PartitionParentOID == 0 &&
+				tbl.DetachPendingEpoch == 0 &&
+				len(im.PartitionChildren(tbl.OID)) == 0 &&
+				len(im.InheritanceChildren(tbl.OID)) == 0 &&
+				!o.dropHasTempShadow(name) {
+				bsess.AddPendingTableDrop(PendingTableDrop{
+					Name:           name,
+					Table:          tbl,
+					SavepointDepth: bsess.SavepointDepth(),
+				})
+				// Record this deferred DROP as the pg_class tuple's delete xmax so a
+				// concurrent explicit rowmark (SELECT … FROM pg_class … FOR UPDATE)
+				// or in-place updater waits on it, exactly as PG's tuple lock waits
+				// on the delete xmax stamped by heap_delete. The XID must be
+				// materialised so the waiter can WaitForXID on it. Design 0118-0117
+				// (intra-grant-inplace perm 10).
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					im.SetTablePendingDropXID(tbl.OID, uint32(o.ctx.Tx.XID))
+				}
+				return nil
+			}
+		}
+	}
+	return o.dropTableByRefImmediate(name, tbl)
+}
+
+// dropHasTempShadow reports whether the named table is currently shadowing a
+// permanent table of the same name (so dropping it would restore the permanent
+// one). Deferring such a drop would leave the shadow/restore bookkeeping
+// inconsistent until COMMIT, so the deferral gate excludes it. M0118-0008.
+func (o *ddlOp) dropHasTempShadow(name parser.ObjectName) bool {
+	if o.ctx.TempTableShadows == nil {
+		return false
+	}
+	return o.ctx.TempTableShadows[strings.ToLower(name.Name)] != nil
+}
+
+// dropTableByRefImmediate performs the actual catalog/relfile/WAL removal for one
+// table. It is called directly by dropTableByRef (autocommit, cascade/partition
+// recursion, or a non-deferrable explicit-txn drop) and by ApplyPendingTableDrops
+// at COMMIT for drops that were deferred. M0118-0008.
+func (o *ddlOp) dropTableByRefImmediate(name parser.ObjectName, tbl *catalog.Table) error {
 	idxs := o.ctx.Catalog.IndexesOnTable(tbl)
 	idxRels := make([]storage.RelFileNode, 0, len(idxs))
 	idxOIDs := make([]uint32, 0, len(idxs))
@@ -4433,6 +4539,13 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error
 	}
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	relOID := tbl.OID
+	// Cumulative relation stats are removed with the relation (pgstat_drop_relation):
+	// after the drop the getters read 0 and any concurrent backend's stale pending
+	// counts for this OID are discarded rather than revived. This hook fires when
+	// the catalog entry is actually removed (immediately for autocommit DROP, and
+	// at commit for the deferred-drop path that funnels through here).
+	// M0118-0009 (`stats`, rung 6; design 0118-0128).
+	relStats.dropTable(relOID)
 	// Dropping a partition left in the incomplete-detach state
 	// (DetachPendingEpoch != 0) also grabs an AccessExclusiveLock on the parent,
 	// because the parent's partition descriptor still references it: upstream
@@ -4531,6 +4644,68 @@ func (o *ddlOp) dropTableByRef(name parser.ObjectName, tbl *catalog.Table) error
 	return nil
 }
 
+// ApplyPendingTableDrops performs the deferred catalog/relfile/WAL removal for
+// every DROP TABLE that dropTableByRef deferred to COMMIT (see PendingTableDrop).
+// It mirrors ApplyPendingIndexDrops: callers MUST invoke it from the commit paths
+// BEFORE TxnMgr.Commit so the drop's WAL precedes the commit record and the
+// pg_class xmax stamp uses the still-live transaction XID. A ROLLBACK never calls
+// this; EndExplicitTransaction discards the pending list. The AccessExclusiveLock
+// taken when the drop was deferred is still held and released at commit, so a
+// concurrent reader parked behind it now proceeds and finds the table gone.
+// M0118-0008 (alter-table-4 perm 3).
+func ApplyPendingTableDrops(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	drops := sess.TakePendingTableDrops()
+	if len(drops) == 0 {
+		return
+	}
+	op := &ddlOp{ctx: ctx}
+	im, _ := ctx.Catalog.(*catalog.InMemory)
+	for _, d := range drops {
+		// Best-effort: the table may already be gone (e.g. dropped by a
+		// cascade earlier in the same transaction). dropTableByRefImmediate is
+		// idempotent on a missing relation (DropTable / DropRelation guard); skip
+		// rather than abort an in-progress commit (mirrors ApplyPendingIndexDrops).
+		_ = op.dropTableByRefImmediate(d.Name, d.Table)
+		// The deferred DROP is now applied; clear its pg_class delete-xmax marker
+		// (a waiting rowmark already unblocks once the XID is no longer active, so
+		// this only keeps the map tidy). Design 0118-0117.
+		if im != nil && d.Table != nil {
+			im.ClearTablePendingDropXID(d.Table.OID)
+		}
+	}
+}
+
+// ApplyDeferredRoutineDrops performs the registry removal and cumulative
+// function-stats drop for every DROP FUNCTION that was deferred to COMMIT inside
+// the committing transaction (see DeferredRoutineDrop). Called from the commit
+// path before TxnMgr.Commit. ROLLBACK instead calls TakeDeferredRoutineDrops to
+// discard the entries (the routines were never removed). M0118-0009 (`stats`).
+func ApplyDeferredRoutineDrops(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	drops := sess.TakeDeferredRoutineDrops()
+	if len(drops) == 0 {
+		return
+	}
+	rs := ctx.Catalog.Routines()
+	for _, d := range drops {
+		if d.Routine == nil {
+			continue
+		}
+		// Best-effort: the routine may already be gone (e.g. an early-applied
+		// recreate in the same transaction). DropRoutine is idempotent on a
+		// missing routine; skip rather than abort an in-progress commit.
+		if rs != nil {
+			_ = rs.DropRoutine(d.Routine)
+		}
+		funcStats.dropFunction(d.Routine.OID)
+	}
+}
+
 func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: s.Pos(), Message: "CREATE INDEX requires Pool in Context"}
@@ -4590,6 +4765,12 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 				Message: fmt.Sprintf("access method \"%s\" does not support included columns", method)}
 		}
 	}
+	// goopg has no native hash access method: a hash index is built on the
+	// B-tree substrate. The catalog Method stays "btree" (pg_am / pg_dump
+	// unchanged), but remember the declared method so a SERIALIZABLE equality
+	// scan takes a bucket-grain SIREAD predicate lock (design 0118-0099); the
+	// flag is applied to the created index below.
+	declaredHash := method == "hash"
 	if method == "hash" {
 		method = "btree"
 	}
@@ -4669,6 +4850,15 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, resolvedPred); err != nil {
 		return err
 	}
+	if declaredHash {
+		// Record the declared hash access method on the freshly built index so a
+		// SERIALIZABLE equality scan uses bucket-grain predicate locking (design
+		// 0118-0099). Catalog Method stays "btree"; this flag is consulted only by
+		// the SSI scan/insert hooks.
+		if hidx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			hidx.DeclaredHash = true
+		}
+	}
 	// Store INCLUDE columns, partial index flag, predicate expression, and the
 	// per-column ASC/DESC + NULLS ordering. The ordering is recorded only when
 	// at least one column is non-default so a plain index keeps empty slices and
@@ -4702,13 +4892,111 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			}
 		}
 	}
+	// CREATE INDEX on a partitioned table recurses into every existing partition
+	// descendant, building a matching index on each and attaching it to the
+	// parent index (pg_inherits), exactly as PostgreSQL's DefineIndex does. The
+	// partition-key/leaf distinction is `tbl.PartitionMethod != ""`: a partitioned
+	// table fans out, a leaf builds an ordinary index. Each child is auto-named
+	// `<partition>_<col>_idx` (deduped to _idx1, _idx2, … on collision), so a
+	// two-level tree where two ancestor indexes both reach the same leaf yields
+	// `_id_idx` and `_id_idx1` — the names the partition-drop-index-locking
+	// isolation spec observes. M0118-0008.
+	if tbl.PartitionMethod != "" {
+		if parentIdx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
+			if err := o.createPartitionChildIndexes(s, tbl, parentIdx, resolvedPred); err != nil {
+				return err
+			}
+		}
+	}
 	// CREATE INDEX CONCURRENTLY: drain the transactions that were running when
 	// the build started (captured above). Once they finish, no snapshot that
 	// predates the new index remains. Two simultaneous concurrent builds do not
 	// deadlock here because each waits only on its own start-time snapshot.
 	if s.Concurrently && len(cicWaitSlots) > 0 && o.ctx.Ctx != nil {
 		if err := o.ctx.TxnMgr.WaitForSlotsToCommit(o.ctx.Ctx, cicWaitSlots); err != nil {
+			// A lock_timeout (or statement_timeout) that fired while parked
+			// waiting for the start-time snapshot set to drain must surface the
+			// matching cancellation message — "canceling statement due to lock
+			// timeout" — exactly like a heavyweight lock wait, so the
+			// prepared-transactions-cic isolation spec sees the right error
+			// (M0118-0009). Any other cancellation is a plain client/connection
+			// teardown of the concurrent build.
+			if ee := lockWaitTimeoutError(err); ee != nil {
+				ee.Pos = s.Pos()
+				return ee
+			}
 			return &ExecError{Code: "57014", Pos: s.Pos(), Message: "CREATE INDEX CONCURRENTLY cancelled"}
+		}
+	}
+	return nil
+}
+
+// createPartitionChildIndexes recursively materialises a matching index on
+// every partition descendant of a partitioned table when CREATE INDEX runs on
+// the parent. PostgreSQL's DefineIndex recurses into existing partitions: each
+// intermediate partitioned partition gets its own (storage-less in upstream)
+// index entry and recursion continues, each leaf gets an ordinary index, and
+// every child is attached to its *immediate* parent index via pg_inherits so
+// the whole tree drops and locks as a unit. Children are auto-named
+// `<partition>_<col>_idx`, deduped to `_idx1`/`_idx2`/… on collision, mirroring
+// upstream's ChooseRelationName. resolvedPred carries the (already const-folded)
+// partial-index predicate so each child filters identically. M0118-0008
+// (partition-drop-index-locking isolation spec).
+func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl *catalog.Table, parentIdx *catalog.Index, resolvedPred planner.Expr) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	// Naming mirrors the attach-time inheritance path: expression columns (empty
+	// name) contribute "expr" so two expression indexes on one child dedup to
+	// `_expr_idx` / `_expr_idx1`.
+	nameCols := make([]string, len(s.Columns))
+	for i, col := range s.Columns {
+		if col == "" {
+			nameCols[i] = "expr"
+		} else {
+			nameCols[i] = col
+		}
+	}
+	for _, childTbl := range im.PartitionChildren(parentTbl.OID) {
+		childIdxName := parser.ObjectName{
+			Schema: childTbl.Schema,
+			Name:   o.autoIndexNameWithIncludes(childTbl, nameCols, s.IncludeColumns, "idx"),
+		}
+		// resolvedPred is a nil planner.Expr when there is no partial predicate;
+		// createBTreeIndex treats a nil predExpr[0] as "no predicate".
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, childTbl, s.Columns, s.ColExprs, s.Unique, false, resolvedPred); err != nil {
+			return err
+		}
+		childIdx, ok2 := o.ctx.Catalog.LookupIndex(childIdxName)
+		if !ok2 {
+			continue
+		}
+		// Attach to the immediate parent index. pg_inherits then renders the
+		// child as inheriting from the parent index, so an external pg_dump
+		// recreates it implicitly via the parent CREATE INDEX (no standalone
+		// statement) and DROP/lock walks treat the tree as one object.
+		childIdx.PartitionParentOID = parentIdx.OID
+		im.RegisterIndexPartitionChild(parentIdx.OID, childIdx.OID)
+		// Carry the parent's partial-index / INCLUDE / expression metadata so the
+		// child's pg_get_indexdef renders identically.
+		if s.HasPredicate {
+			childIdx.HasPredicate = s.HasPredicate
+			childIdx.Predicate = s.Predicate
+			childIdx.PredicateString = parentIdx.PredicateString
+		}
+		childIdx.IncludeColumns = s.IncludeColumns
+		for i, str := range parentIdx.ColExprStrings {
+			if str != "" && i < len(childIdx.ColExprStrings) {
+				childIdx.ColExprStrings[i] = str
+			}
+		}
+		// Intermediate partitioned partition: recurse into its own children,
+		// rooting each grandchild at this level's index.
+		if childTbl.PartitionMethod != "" {
+			if err := o.createPartitionChildIndexes(s, childTbl, childIdx, resolvedPred); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -4747,6 +5035,23 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 		}
 	}
 
+	// Transactional-DDL visibility (M0118-0008, partition-drop-index-locking):
+	// a non-CONCURRENTLY DROP INDEX inside an explicit transaction defers the
+	// actual catalog/relfile/WAL removal until COMMIT. The AccessExclusiveLock
+	// taken by lockDropIndexTree below is already held to commit, so until the
+	// dropping transaction commits the index stays in the shared catalog and
+	// another session's `pg_locks JOIN pg_class` still observes its row and the
+	// dropper's lock — matching PG, which keeps the old catalog tuple visible to
+	// other snapshots until commit. In autocommit (no lock held, historical
+	// behaviour) the removal stays immediate. ApplyPendingIndexDrops performs
+	// the deferred removal; a ROLLBACK discards it via EndExplicitTransaction.
+	var deferSess *BasicSession
+	if !s.Concurrent && o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+		if bs, ok := o.ctx.Session.(*BasicSession); ok {
+			deferSess = bs
+		}
+	}
+
 	flagInval := false
 	droppedOIDs := make([]uint32, 0, len(s.Names))
 	for _, name := range s.Names {
@@ -4762,10 +5067,43 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 			}
 			return &ExecError{Code: "42704", Pos: s.Pos(), Message: fmt.Sprintf("index %q does not exist", name.String())}
 		}
+		// DROP INDEX (non-CONCURRENTLY) takes an AccessExclusiveLock on the
+		// index relation itself, then descends the index's table tree, then locks
+		// the descendant child indexes — mirroring PostgreSQL's
+		// RangeVarCallbackForDropRelation, which locks the target index, then
+		// acquires the table-tree lock so a concurrent reader holding ACCESS SHARE
+		// on a leaf partition blocks the DROP before it reaches the child indexes.
+		// The lock is transaction-scoped: a no-op in
+		// autocommit (TxnLockBackendID==0) so ordinary DROP INDEX keeps its
+		// historical non-blocking behaviour, and held to COMMIT/ROLLBACK inside an
+		// explicit transaction. CONCURRENTLY is excluded — it holds only
+		// ShareUpdateExclusive and must not block readers (drop-index-concurrently-1).
+		// M0118-0008 (partition-drop-index-locking isolation spec).
+		if !s.Concurrent {
+			if err := o.lockDropIndexTree(idx); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = s.Pos()
+				}
+				return err
+			}
+		}
 		rel := o.ctx.Catalog.IndexRelFileNode(idx)
 		dropOID := idx.OID
 		dropSchema := idx.Schema
 		dropName := idx.Name
+		// Explicit transaction: defer the real removal to COMMIT (see the
+		// transactional-DDL note above). M0118-0008.
+		if deferSess != nil {
+			deferSess.AddPendingIndexDrop(PendingIndexDrop{
+				Name:           name,
+				OID:            dropOID,
+				Schema:         dropSchema,
+				IdxName:        dropName,
+				Rel:            rel,
+				SavepointDepth: deferSess.SavepointDepth(),
+			})
+			continue
+		}
 		if err := o.ctx.Catalog.DropIndex(name); err != nil {
 			return &ExecError{Code: "XX000", Pos: s.Pos(), Message: err.Error()}
 		}
@@ -4814,6 +5152,315 @@ func (o *ddlOp) execDropIndex(s *parser.DropIndexStmt) error {
 				for _, oid := range droppedOIDs {
 					deleteCatalogRowsForOID(o.ctx, dbOid, oid, xmax)
 				}
+			}
+		}
+	}
+	return nil
+}
+
+// ApplyPendingIndexDrops performs the deferred catalog/relfile/WAL removal for
+// every DROP INDEX that execDropIndex deferred to COMMIT (see PendingIndexDrop).
+// It mirrors execDropIndex's immediate-removal path. Callers MUST invoke it from
+// the commit paths BEFORE TxnMgr.Commit so the drop's WAL precedes the commit
+// record and the pg_class xmax stamp uses the still-live transaction XID. A
+// ROLLBACK never calls this; EndExplicitTransaction discards the pending list.
+// M0118-0008.
+func ApplyPendingIndexDrops(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	drops := sess.TakePendingIndexDrops()
+	if len(drops) == 0 {
+		return
+	}
+	flagInval := false
+	droppedOIDs := make([]uint32, 0, len(drops))
+	for _, d := range drops {
+		if err := ctx.Catalog.DropIndex(d.Name); err != nil {
+			// Best-effort: the index may already be gone (e.g. a concurrent
+			// drop). Skip rather than abort an in-progress commit.
+			continue
+		}
+		flagInval = true
+		droppedOIDs = append(droppedOIDs, d.OID)
+		if ctx.Pool != nil {
+			ctx.Pool.InvalidateRel(d.Rel)
+			_ = ctx.Pool.Manager().DropRelation(d.Rel)
+			payload := wal.EncodeDropIndex(wal.DropIndexPayload{
+				OID:    d.OID,
+				Schema: d.Schema,
+				Name:   d.IdxName,
+			})
+			_, _ = ctx.Pool.LogChangeRecord(payload)
+		}
+	}
+	if flagInval && ctx.TxnMgr != nil {
+		ctx.TxnMgr.SetRelcacheInvalPending()
+	}
+	if catalogHeapSyncAvailable(ctx) {
+		if err := ctx.MaterializeWriterXID(); err == nil {
+			xmax := ctx.Tx.XID
+			for _, dbOid := range catalogDBOids(ctx) {
+				for _, oid := range droppedOIDs {
+					deleteCatalogRowsForOID(ctx, dbOid, oid, xmax)
+				}
+			}
+		}
+	}
+}
+
+// ApplyPendingPartitionAttaches performs the deferred catalog registration for
+// every ATTACH PARTITION that the AlterTableAttachPartition case deferred to
+// COMMIT (see PendingPartitionAttach). It sets the child's partition bounds and
+// registers the parent-child link, making the new partition routable/visible to
+// other sessions for the first time. Callers MUST invoke it from the commit paths
+// BEFORE TxnMgr.Commit, mirroring ApplyPendingIndexDrops. A ROLLBACK never calls
+// this; EndExplicitTransaction discards the pending list. M0118-0008.
+func ApplyPendingPartitionAttaches(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	attaches := sess.TakePendingPartitionAttaches()
+	if len(attaches) == 0 {
+		return
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	for _, a := range attaches {
+		childTbl, ok := im.LookupTableByOID(a.ChildOID)
+		if !ok {
+			// The child was dropped within the same transaction before commit;
+			// nothing to register.
+			continue
+		}
+		if a.Bounds != nil {
+			childTbl.PartitionBounds = a.Bounds
+		}
+		im.RegisterPartitionChild(a.ParentOID, a.ChildOID)
+		// fk-partitioned-1 (design 0118-0120): the partition is now registered
+		// (IsPartitionChild true), so a concurrent DELETE that was waiting on
+		// this attach can resolve via the normal committed-clone path; drop the
+		// in-flight marker.
+		im.ClearPendingAttachXID(a.ChildOID)
+	}
+}
+
+// ApplyPendingInheritanceChanges performs the deferred catalog mutation for every
+// ALTER TABLE … {NO} INHERIT the AlterTableInherit/AlterTableNoInherit cases
+// deferred to COMMIT (the inheritance link was kept at its pre-statement state so
+// concurrent sessions did not see the change until now). Must run BEFORE
+// TxnMgr.Commit, mirroring ApplyPendingPartitionAttaches. A ROLLBACK discards the
+// changes via DiscardPendingInheritanceChanges instead. Design 0118-0080
+// (M0118-0008 alter-table-4).
+func ApplyPendingInheritanceChanges(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	changes := sess.TakePendingInheritanceChanges()
+	if len(changes) == 0 {
+		return
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return
+	}
+	for _, ch := range changes {
+		if ch.NoInherit {
+			im.UnregisterInheritanceChild(ch.ParentOID, ch.ChildOID)
+		} else {
+			im.RegisterInheritanceChild(ch.ParentOID, ch.ChildOID)
+			// Copy parent columns the child doesn't already have, matching the
+			// immediate (autocommit) INHERIT path. In alter-table-4 the child
+			// already has matching columns so this is a no-op.
+			if childTbl, okc := im.LookupTableByOID(ch.ChildOID); okc {
+				if parentTbl, okp := im.LookupTableByOID(ch.ParentOID); okp {
+					childCols := make(map[string]bool, len(childTbl.Columns))
+					for _, c := range childTbl.Columns {
+						childCols[strings.ToLower(c.Name)] = true
+					}
+					for _, pc := range parentTbl.Columns {
+						if !childCols[strings.ToLower(pc.Name)] {
+							childTbl.Columns = append(childTbl.Columns, pc)
+						}
+					}
+				}
+			}
+		}
+		im.UnmarkInheritanceChangePending()
+	}
+}
+
+// DiscardPendingInheritanceChanges drops every deferred inheritance change without
+// applying it, clearing the matching catalog pending-counter marks. Called from
+// the rollback path (ProcessRollbackUndos) so a ROLLBACK leaves the inheritance
+// state untouched. Design 0118-0080 (M0118-0008).
+func DiscardPendingInheritanceChanges(ctx *Context, sess *BasicSession) {
+	if ctx == nil || sess == nil {
+		return
+	}
+	changes := sess.TakePendingInheritanceChanges()
+	if len(changes) == 0 {
+		return
+	}
+	if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+		for range changes {
+			im.UnmarkInheritanceChangePending()
+		}
+	}
+}
+
+// lockDropIndexTree acquires the full set of AccessExclusiveLocks that
+// PostgreSQL's DROP INDEX (non-CONCURRENTLY) takes, in PG's acquisition order:
+//  1. the target index relation itself (granted before any blocking),
+//  2. the index's table tree — sub-partitions and partitions, top-down — which
+//     blocks if a concurrent reader holds ACCESS SHARE on a leaf partition,
+//  3. the descendant child indexes (locked only after the table tree, i.e. after
+//     the DROP unblocks).
+//
+// The ordering is load-bearing for the partition-drop-index-locking isolation
+// spec: a pg_locks snapshot taken while the DROP is blocked must show the target
+// index granted and the child indexes absent (they are acquired post-unblock).
+// Each acquire is transaction-scoped via acquireDDLLockTxn (a no-op in autocommit
+// and for system catalogs). M0118-0008.
+func (o *ddlOp) lockDropIndexTree(idx *catalog.Index) error {
+	if err := o.lockDropIndexSelf(idx); err != nil {
+		return err
+	}
+	if err := o.lockDropIndexTableTree(idx); err != nil {
+		return err
+	}
+	return o.lockDropIndexChildren(idx)
+}
+
+// lockDropIndexSelf AccessExclusive-locks the index relation named in DROP INDEX.
+// PostgreSQL locks the target index before descending the table tree, so this
+// lock is granted (and visible in pg_locks) even while the DROP later blocks on a
+// leaf partition. M0118-0008.
+func (o *ddlOp) lockDropIndexSelf(idx *catalog.Index) error {
+	if idx == nil {
+		return nil
+	}
+	return o.ctx.acquireDDLLockTxn(o.ctx.Catalog.IndexRelFileNode(idx), lockmgr.AccessExclusiveLock)
+}
+
+// lockDropIndexChildren AccessExclusive-locks every partition-descendant child
+// index of idx (an index built on a partition child by CREATE INDEX recursion,
+// linked via Index.PartitionParentOID). PostgreSQL locks these after the table
+// tree, so they appear in pg_locks only once the DROP has unblocked. M0118-0008.
+func (o *ddlOp) lockDropIndexChildren(idx *catalog.Index) error {
+	if idx == nil {
+		return nil
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	visited := make(map[uint32]bool)
+	var rec func(parentOID uint32) error
+	rec = func(parentOID uint32) error {
+		for _, ci := range im.IndexPartitionChildren(parentOID) {
+			if ci == nil || visited[ci.OID] {
+				continue
+			}
+			visited[ci.OID] = true
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.IndexRelFileNode(ci), lockmgr.AccessExclusiveLock); err != nil {
+				return err
+			}
+			if err := rec(ci.OID); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return rec(idx.OID)
+}
+
+// lockDropIndexTableTree takes a transaction-scoped AccessExclusiveLock on the
+// table that owns idx and, recursively, on every partition descendant. This
+// mirrors PostgreSQL's DROP INDEX path, which locks all downward sub-partitions
+// and partitions before the indexes so a concurrent session holding ACCESS
+// SHARE on a leaf partition blocks the DROP. The lock is a no-op in autocommit
+// (acquireDDLLockTxn returns immediately when TxnLockBackendID==0) and for
+// system catalogs, confining the new blocking to explicit-transaction DROP
+// INDEX. M0118-0008 (partition-drop-index-locking).
+func (o *ddlOp) lockDropIndexTableTree(idx *catalog.Index) error {
+	if idx == nil || idx.Table == nil {
+		return nil
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	visited := make(map[uint32]bool)
+	return o.lockPartitionSubtreeAccessExcl(im, idx.Table, visited)
+}
+
+// lockPartitionSubtreeAccessExcl AccessExclusive-locks tbl then recurses into
+// its partition children (which may themselves be partitioned), top-down, the
+// way PostgreSQL descends the partition tree. visited guards against cycles /
+// re-locking. Each acquire is transaction-scoped via acquireDDLLockTxn.
+func (o *ddlOp) lockPartitionSubtreeAccessExcl(im *catalog.InMemory, tbl *catalog.Table, visited map[uint32]bool) error {
+	if tbl == nil || visited[tbl.OID] {
+		return nil
+	}
+	visited[tbl.OID] = true
+	if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+		return err
+	}
+	for _, child := range im.PartitionChildren(tbl.OID) {
+		if err := o.lockPartitionSubtreeAccessExcl(im, child, visited); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// lockDefaultPartitionForAttach takes a transaction-scoped AccessExclusiveLock
+// on the parent's existing DEFAULT partition (if any) before a new non-default
+// partition is attached, mirroring PostgreSQL ATExecAttachPartition:
+//
+//	defaultPartOid = get_default_oid_from_partdesc(RelationGetPartitionDesc(rel, true));
+//	if (OidIsValid(defaultPartOid))
+//	    LockRelationOid(defaultPartOid, AccessExclusiveLock);
+//
+// Attaching a new partition narrows the default partition's implicit
+// constraint, so PG locks it exclusively for the duration of the attaching
+// transaction. A concurrent INSERT that routes to the default
+// (RowExclusiveLock) then waits until the attach commits, after which the
+// default's tightened constraint can reject the routed rows. Transaction-scoped
+// via acquireDDLLockTxn (a no-op in autocommit / for system relations), so the
+// hot path and plain CREATE TABLE … PARTITION OF are unaffected.
+// inheritDeferSession returns the BasicSession to record a deferred-to-COMMIT
+// ALTER TABLE … {NO} INHERIT change against, or nil when the change must be
+// applied immediately. It returns non-nil only inside an explicit transaction
+// over an InMemory catalog (mirrors the ATTACH PARTITION deferral gate): in
+// autocommit the inheritance mutation is applied at statement time as before.
+// Design 0118-0080 (M0118-0008 alter-table-4).
+func (o *ddlOp) inheritDeferSession() *BasicSession {
+	if o.ctx == nil || o.ctx.Session == nil || !o.ctx.Session.InExplicitTransaction() {
+		return nil
+	}
+	bs, ok := o.ctx.Session.(*BasicSession)
+	if !ok {
+		return nil
+	}
+	if _, ok := o.ctx.Catalog.(*catalog.InMemory); !ok {
+		return nil
+	}
+	return bs
+}
+
+func (o *ddlOp) lockDefaultPartitionForAttach(parent *catalog.Table) error {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	for _, child := range im.PartitionChildren(parent.OID) {
+		for _, pb := range child.PartitionBounds {
+			if pb.IsDefault {
+				return o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(child), lockmgr.AccessExclusiveLock)
 			}
 		}
 	}
@@ -4945,6 +5592,25 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				oldName := s.Name.Name
 				newName := act.NewName
 				if RenameSequence(oldName, newName) || RenameSequence("public."+oldName, newName) {
+					return nil
+				}
+			}
+		}
+		// ALTER TABLE/INDEX pg_toast.<name> RENAME TO <new> — a synthetic TOAST
+		// relation or its unique btree index. These rows live only in the pg_class/
+		// pg_index virtual builders (not c.tables), so there is no real row to
+		// mutate; record a name override the builders + regclass + name→OID lookup
+		// consult. The reind_con_toast spec renames the toast rel/index to
+		// deterministic names so REINDEX … CONCURRENTLY can address them. Requires
+		// allow_system_table_mods in PostgreSQL; the spec sets it. M0118-0008
+		// TOAST-exposure slice 4 (design 0118-0087).
+		if im, okIM := o.ctx.Catalog.(*catalog.InMemory); okIM && strings.EqualFold(s.Name.Schema, "pg_toast") {
+			for _, act := range s.Actions {
+				if act.Kind != parser.AlterTableRenameTable {
+					continue
+				}
+				if toastOID, _, found := im.LookupToastRel(s.Name.Schema, s.Name.Name); found {
+					im.RenameToastRel(toastOID, act.NewName)
 					return nil
 				}
 			}
@@ -5137,17 +5803,50 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !ok {
 				break // child doesn't exist yet, skip
 			}
+			// Lock the parent's existing DEFAULT partition AccessExclusive for the
+			// attaching transaction — PG ATExecAttachPartition locks it first
+			// because the new partition narrows the default's constraint, so a
+			// concurrent INSERT routing to the default blocks until the attach
+			// commits (partition-concurrent-attach spec). Done before the
+			// conflict check, exactly as in PG.
+			if err := o.lockDefaultPartitionForAttach(tbl); err != nil {
+				return err
+			}
+			// Reject the attach if the parent's existing DEFAULT partition holds
+			// (committed/visible) rows that would now be claimed by the new
+			// partition — PostgreSQL's ATExecAttachPartition →
+			// check_default_partition_contents. goopg already enforces this on the
+			// CREATE TABLE … PARTITION OF path (validatePartitionChild); wire the
+			// same check into ALTER TABLE … ATTACH PARTITION (the path the
+			// partition-concurrent-attach spec exercises). Skipped for HASH (no
+			// default partitions) and for attaching the DEFAULT itself.
+			if !poc.Default && !poc.IsHash {
+				if err := checkDefaultPartitionDataConflict(childTbl.Name, tbl, poc, act.Pos(), o.ctx); err != nil {
+					return err
+				}
+			}
+			// Clone the parent partitioned table's foreign keys onto the new
+			// partition and validate its existing rows against the referenced
+			// table — PG ATExecAttachPartition → CloneForeignKeyConstraints. Runs
+			// at statement time (not deferred to commit) so the validation's
+			// FOR-KEY-SHARE wait on a concurrently-deleted referenced row renders
+			// as `<waiting ...>` and the eventual 23503 surfaces during the ALTER,
+			// exactly as upstream. No-op unless the parent has FKs. (fk-partitioned-1)
+			if err := cloneAndValidateAttachPartitionFKs(o.ctx, tbl, childTbl); err != nil {
+				return err
+			}
 			// Set partition metadata on the child.
 			// ATTACH PARTITION only establishes the parent-child relationship and
 			// partition bounds. The child's PartitionKey/Method are properties of its
 			// OWN PARTITION BY clause and must NOT be overwritten by the parent's values.
 			// Build partition bounds. M0097-0015 adds HASH.
 			var pb catalog.PartitionBound
+			var boundsToSet []catalog.PartitionBound
 			if poc.IsHash {
 				pb.IsHash = true
 				pb.Modulus = poc.Modulus
 				pb.Remainder = poc.Remainder
-				childTbl.PartitionBounds = []catalog.PartitionBound{pb}
+				boundsToSet = []catalog.PartitionBound{pb}
 			} else {
 				for _, e := range poc.InValues {
 					pb.InValues = append(pb.InValues, exprToString(e))
@@ -5170,11 +5869,58 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					pb.ToUnbounded, pb.ToUnboundMax = rangeBoundUnboundedFlags(poc.ToValues)
 				}
 				if len(pb.InValues) > 0 || pb.From != "" || pb.To != "" {
-					childTbl.PartitionBounds = []catalog.PartitionBound{pb}
+					boundsToSet = []catalog.PartitionBound{pb}
 				}
 			}
-			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				im.RegisterPartitionChild(tbl.OID, childTbl.OID)
+			// M0118-0008: ATTACH PARTITION inside an explicit transaction defers the
+			// catalog registration (partition bounds + parent-child link) to COMMIT,
+			// so a concurrent session does not see the new partition and an INSERT
+			// routing through the parent falls to the DEFAULT partition — where it
+			// blocks on the default-partition AccessExclusiveLock taken above. This
+			// mirrors PG transactional-DDL visibility: an uncommitted ATTACH is
+			// invisible to other snapshots (partition-concurrent-attach spec). In
+			// autocommit the registration stays immediate. The default-partition lock
+			// and the data-conflict check above always run at statement time, as in
+			// PG. The child's own indexes are still propagated immediately below
+			// (harmless: the child is not yet routable until commit).
+			var deferAttach *BasicSession
+			if o.ctx.Session != nil && o.ctx.Session.InExplicitTransaction() {
+				if bs, oks := o.ctx.Session.(*BasicSession); oks {
+					if _, okc := o.ctx.Catalog.(*catalog.InMemory); okc {
+						deferAttach = bs
+					}
+				}
+			}
+			if deferAttach != nil {
+				deferAttach.AddPendingPartitionAttach(PendingPartitionAttach{
+					ParentOID:      tbl.OID,
+					ChildOID:       childTbl.OID,
+					Bounds:         boundsToSet,
+					SavepointDepth: deferAttach.SavepointDepth(),
+				})
+				// fk-partitioned-1 concurrent Class B (design 0118-0120): when the
+				// parent carries a foreign key, the clone just placed on childTbl
+				// (cloneAndValidateAttachPartitionFKs above) referenced the parent
+				// table's rows under the equivalent of FOR KEY SHARE. Record this
+				// in-flight attach's XID so a concurrent DELETE of one of those
+				// referenced rows waits for the attach to commit before firing the
+				// referenced-side partition check — mirroring PG, where the attach
+				// holds the KEY SHARE locks to commit. Materialize the XID so the
+				// waiter has a real transaction id to block on.
+				if len(tbl.ForeignKeys) > 0 {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+							im.SetPendingAttachXID(childTbl.OID, uint32(o.ctx.Tx.XID))
+						}
+					}
+				}
+			} else {
+				if boundsToSet != nil {
+					childTbl.PartitionBounds = boundsToSet
+				}
+				if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+					im.RegisterPartitionChild(tbl.OID, childTbl.OID)
+				}
 			}
 			// Propagate parent unique/PK indexes to the newly attached child
 			// partition. In PostgreSQL, ATTACH PARTITION requires the child to
@@ -5535,6 +6281,15 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.InheritParent.String())}
 			}
+			// Take a transaction-scoped AccessExclusiveLock on the child being added
+			// to the inheritance tree, mirroring PG ATExecAddInherit. No-op in
+			// autocommit / for system catalogs. M0118-0008 (alter-table-4).
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = act.Pos()
+				}
+				return err
+			}
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
 				// Self-inheritance.
 				if parentTbl.OID == tbl.OID {
@@ -5553,6 +6308,20 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						return &ExecError{Code: "42710", Pos: act.Pos(),
 							Message: fmt.Sprintf("relation %q would be inherited from more than once", parentTbl.Name)}
 					}
+				}
+				// Inside an explicit transaction, defer the registration (and the
+				// column copy below) to COMMIT so the new inheritance link is
+				// invisible to concurrent sessions until commit — PG transactional-
+				// DDL visibility (alter-table-4). In autocommit, apply immediately.
+				if defSess := o.inheritDeferSession(); defSess != nil {
+					defSess.AddPendingInheritanceChange(PendingInheritanceChange{
+						ParentOID:      parentTbl.OID,
+						ChildOID:       tbl.OID,
+						NoInherit:      false,
+						SavepointDepth: defSess.SavepointDepth(),
+					})
+					im.MarkInheritanceChangePending()
+					break
 				}
 				im.RegisterInheritanceChild(parentTbl.OID, tbl.OID)
 			}
@@ -5574,9 +6343,34 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if !ok {
 				return &ExecError{Code: "42P01", Pos: act.Pos(), Message: fmt.Sprintf("relation %q does not exist", act.InheritParent.String())}
 			}
+			// Take a transaction-scoped AccessExclusiveLock on the child being
+			// removed from the inheritance tree, mirroring PG ATExecDropInherit, so
+			// a concurrent SELECT on the parent that still includes this child (the
+			// unlink is deferred to commit below) blocks on this lock until commit.
+			// No-op in autocommit / for system catalogs. M0118-0008 (alter-table-4).
+			if err := o.ctx.acquireDDLLockTxn(o.ctx.Catalog.RelFileNode(tbl), lockmgr.AccessExclusiveLock); err != nil {
+				if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+					ee.Pos = act.Pos()
+				}
+				return err
+			}
 			if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
-				// Silently ignore if not currently a child (matches PG behavior on repeated NO INHERIT).
-				im.UnregisterInheritanceChild(parentTbl.OID, tbl.OID)
+				// Inside an explicit transaction, defer the unregister to COMMIT so
+				// concurrent sessions keep seeing the child until commit (and a
+				// parent scan keeps including it, blocking on the lock above). In
+				// autocommit, unregister immediately. Silently ignores a relation
+				// that is not currently a child (matches PG on repeated NO INHERIT).
+				if defSess := o.inheritDeferSession(); defSess != nil {
+					defSess.AddPendingInheritanceChange(PendingInheritanceChange{
+						ParentOID:      parentTbl.OID,
+						ChildOID:       tbl.OID,
+						NoInherit:      true,
+						SavepointDepth: defSess.SavepointDepth(),
+					})
+					im.MarkInheritanceChangePending()
+				} else {
+					im.UnregisterInheritanceChild(parentTbl.OID, tbl.OID)
+				}
 			}
 		case parser.AlterTableSetStorage:
 			// SET STORAGE type — record on the catalog column AND rewrite the
@@ -6313,6 +7107,24 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 	if o.ctx.Pool == nil {
 		return &ExecError{Code: "XX000", Pos: act.Pos(), Message: "ALTER TABLE ADD PRIMARY KEY requires Pool in Context"}
 	}
+	// Creating the primary-key index sets relhasindex=true on the table's pg_class
+	// tuple — an in-place update in PostgreSQL (heap_inplace_update). It takes no
+	// heavyweight lock; it serialises only on the tuple's xmax. So if a concurrent
+	// uncommitted GRANT/REVOKE … ON <table> changed the same pg_class ACL row, this
+	// must wait for that transaction to finish before "rewriting" the tuple. goopg
+	// has no real pg_class heap tuple, so we replay that wait on the writer XID
+	// recorded by execCompatNoop. WaitForXID returns immediately when none is
+	// pending or it has already finished. Design 0118-0109 (intra-grant-inplace).
+	if ee := o.waitForTableACLChange(tbl); ee != nil {
+		return ee
+	}
+	// Likewise wait on any concurrent explicit rowmark of the same pg_class
+	// tuple (SELECT … FROM pg_class … FOR NO KEY UPDATE / SHARE / UPDATE) whose
+	// mode conflicts with this no-key in-place update. FOR KEY SHARE does not
+	// conflict and is skipped. Design 0118-0113 (intra-grant-inplace).
+	if ee := o.waitForPgClassRowMarks(tbl); ee != nil {
+		return ee
+	}
 	if o.ctx.Catalog.HasPrimaryKey(tbl) {
 		return &ExecError{Code: "42P16", Pos: act.Pos(), Message: fmt.Sprintf("multiple primary keys for table %q are not allowed", tbl.QualifiedName())}
 	}
@@ -6358,6 +7170,188 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		}
 	}
 	return nil
+}
+
+// waitForTableACLChange blocks until any uncommitted GRANT/REVOKE … ON <table>
+// transaction has committed or aborted, mirroring PostgreSQL's
+// heap_inplace_update waiting on the pg_class tuple's xmax before ALTER TABLE
+// ADD PRIMARY KEY flips relhasindex in place. The writer XID is recorded by
+// execCompatNoop. WaitForXID returns immediately when the recorded XID has
+// already finished (or none was recorded), so this is a no-op in the common
+// case. Design 0118-0109 (intra-grant-inplace).
+//
+// The wait is deadlock-aware: it registers a wait-for-graph edge so a cycle
+// with a concurrent GRANT that is itself awaiting this transaction's rowmark
+// is detected and reported as SQLSTATE 40P01 (intra-grant-inplace perm 8,
+// where `addk2` is the deadlock victim). Returns a non-nil *ExecError only on
+// a deadlock or lock-timeout; nil in the common (no-wait / clean-wait) case.
+func (o *ddlOp) waitForTableACLChange(tbl *catalog.Table) *ExecError {
+	if tbl == nil {
+		return nil
+	}
+	return waitTableACLChange(o.ctx, tbl.OID)
+}
+
+// waitTableACLChange is the shared core of waitForTableACLChange: it blocks
+// until any uncommitted GRANT/REVOKE … ON the table with OID tableOID has
+// committed or aborted (the pg_class-tuple "xmax" recorded by execCompatNoop).
+// Two callers serialise on the same recorded writer XID: an in-place catalog
+// update (ALTER TABLE ADD PRIMARY KEY → heap_inplace_update) and an explicit
+// pg_class rowmark (SELECT … FROM pg_class … FOR UPDATE/NO KEY UPDATE), which
+// must block behind a concurrent uncommitted ACL change exactly as PG's tuple
+// lock waits on the pg_class tuple xmax (intra-grant-inplace perm 9: sfu3's FOR
+// UPDATE on pg_class waits behind grant1). Deadlock-aware via
+// waitPgClassInplaceXID. Design 0118-0116 (intra-grant-inplace perm 9).
+func waitTableACLChange(ctx *Context, tableOID uint32) *ExecError {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || ctx.TxnMgr == nil || ctx.Ctx == nil {
+		return nil
+	}
+	return waitPgClassTupleXID(ctx, im.TableACLChangeXID(tableOID))
+}
+
+// waitTablePendingDrop blocks (deadlock-aware) until an in-flight `DROP TABLE …`
+// on the relation with OID tableOID, deferred to COMMIT, has committed or
+// aborted. The deferred DROP records its writer XID as the pg_class tuple's
+// delete xmax (Catalog.SetTablePendingDropXID); an explicit rowmark
+// (SELECT … FROM pg_class … FOR UPDATE) must wait on it exactly as PG's tuple
+// lock waits on the delete xmax stamped by heap_delete — intra-grant-inplace
+// perm 10 (sfu3 waits behind drop1, then finds the relation gone). Design
+// 0118-0117.
+func waitTablePendingDrop(ctx *Context, tableOID uint32) *ExecError {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || ctx.TxnMgr == nil || ctx.Ctx == nil {
+		return nil
+	}
+	return waitPgClassTupleXID(ctx, im.TablePendingDropXID(tableOID))
+}
+
+// waitPgClassTupleXID is the shared deadlock-aware core for the pg_class-tuple
+// xmax waits (ACL change and pending DROP). It blocks until xid commits/aborts,
+// returning nil for an invalid xid, our own xid, or a holder in our own
+// transaction tree (a savepoint). Returns SQLSTATE 40P01 on a detected deadlock
+// cycle. Design 0118-0117.
+func waitPgClassTupleXID(ctx *Context, xid storage.TransactionID) *ExecError {
+	if xid == storage.InvalidTransactionID || ctx.TxnMgr == nil || ctx.Ctx == nil {
+		return nil
+	}
+	// Materialise our writer XID so the edge we register is observable by a
+	// peer closing the deadlock cycle.
+	_ = ctx.MaterializeWriterXID()
+	if xid == ctx.Tx.XID {
+		return nil
+	}
+	// A holder in this transaction's own tree (a savepoint) never blocks us.
+	selfTop := ctx.TxnMgr.TopLevelXid(ctx.Tx.XID)
+	if selfTop != storage.InvalidTransactionID &&
+		ctx.TxnMgr.TopLevelXid(xid) == selfTop {
+		return nil
+	}
+	if dl, ee := waitPgClassInplaceXID(ctx, xid); ee != nil {
+		return ee
+	} else if dl {
+		return &ExecError{Code: "40P01", Message: "deadlock detected"}
+	}
+	return nil
+}
+
+// waitForPgClassRowMarks blocks until every conflicting explicit rowmark on
+// tbl's pg_class tuple held by another transaction has finished, mirroring
+// PostgreSQL's heap_inplace_update waiting on the tuple's xmax/multixact before
+// flipping relhasindex. A rowmark conflicts unless it is a FOR KEY SHARE lock.
+// Rowmarks held by this transaction's own tree are skipped (a same-xact rowmark
+// never blocks its own in-place update). WaitForXID returns immediately for an
+// already-finished holder, so a stale entry is harmless. Design 0118-0113
+// (intra-grant-inplace).
+//
+// The wait is deadlock-aware via the shared wait-for graph, so a GRANT/REVOKE
+// that calls this while a concurrent ADD PRIMARY KEY awaits the GRANT's own
+// ACL-change xmax detects the cycle and returns SQLSTATE 40P01. Returns a
+// non-nil *ExecError only on a deadlock or lock-timeout; nil otherwise.
+func (o *ddlOp) waitForPgClassRowMarks(tbl *catalog.Table) *ExecError {
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok || o.ctx.TxnMgr == nil || tbl == nil || o.ctx.Ctx == nil {
+		return nil
+	}
+	marks := im.PgClassRowMarks(tbl.OID)
+	if len(marks) == 0 {
+		return nil
+	}
+	// Materialise our writer XID so the edge we register is observable by a
+	// peer closing the deadlock cycle.
+	_ = o.ctx.MaterializeWriterXID()
+	selfTop := o.ctx.TxnMgr.TopLevelXid(o.ctx.Tx.XID)
+	for _, m := range marks {
+		if !m.ConflictsWithInplace || m.XID == uint32(o.ctx.Tx.XID) {
+			continue
+		}
+		mxid := storage.TransactionID(m.XID)
+		if selfTop != storage.InvalidTransactionID && o.ctx.TxnMgr.TopLevelXid(mxid) == selfTop {
+			continue // same transaction tree (e.g. a savepoint locker)
+		}
+		// Wait on the MARK's release, not the holder's whole transaction: a
+		// rowmark whose locker ends up locking no tuple (the relation's pg_class
+		// row was concurrently DELETEd) is retracted early, and PG lets a peer
+		// blocked behind it proceed at once rather than at the locker's commit/
+		// rollback (intra-grant-inplace perm 10). Design 0118-0117.
+		if dl, ee := waitPgClassRowMarkReleased(o.ctx, mxid, tbl.OID); ee != nil {
+			return ee
+		} else if dl {
+			return &ExecError{Code: "40P01", Message: "deadlock detected"}
+		}
+	}
+	return nil
+}
+
+// waitPgClassRowMarkReleased blocks until transaction holderXID's conflicting
+// explicit rowmark on relation relOID is released — either because the holder's
+// transaction ended (ClearPgClassRowMarksForXID) or because the holder locked no
+// tuple and retracted the mark early (ClearPgClassRowMark). Unlike WaitForXID,
+// which only wakes at transaction end, this polls the mark itself so an early
+// release unblocks the waiter (intra-grant-inplace perm 10: sfu3 finds the
+// relation gone and returns 0 rows, so revoke4 — blocked behind sfu3's mark —
+// proceeds before s3's ROLLBACK). Deadlock-aware: registers the wait-for edge
+// and walks for a cycle before polling, exactly like waitPgClassInplaceXID.
+// Design 0118-0117.
+func waitPgClassRowMarkReleased(ctx *Context, holderXID storage.TransactionID, relOID uint32) (deadlock bool, timeout *ExecError) {
+	if ctx == nil || ctx.TxnMgr == nil || ctx.Ctx == nil {
+		return false, nil
+	}
+	if holderXID == storage.InvalidTransactionID || holderXID == ctx.Tx.XID {
+		return false, nil
+	}
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return false, nil
+	}
+	if ctx.Tx.XID != storage.InvalidTransactionID {
+		if registerWFGAndCheckCycle(ctx.Tx.XID, holderXID) {
+			ctx.DeadlockVictim = true
+			return true, nil
+		}
+		defer deregisterWFG(ctx.Tx.XID)
+	}
+	const pollInterval = 5 * time.Millisecond
+	for {
+		held := false
+		for _, m := range im.PgClassRowMarks(relOID) {
+			if m.XID == uint32(holderXID) && m.ConflictsWithInplace {
+				held = true
+				break
+			}
+		}
+		if !held || !ctx.TxnMgr.IsXIDActive(holderXID) {
+			return false, nil
+		}
+		select {
+		case <-ctx.Ctx.Done():
+			if ee := lockWaitCancelError(ctx.Ctx.Err()); ee != nil {
+				return false, ee
+			}
+			return false, nil
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 // execAlterTableAddUnique handles ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)].
@@ -7823,6 +8817,17 @@ func (o *ddlOp) execCreateFunction(s *parser.CreateFunctionStmt) error {
 	if lang == "sql" {
 		extractRoutineDeps(r.Body, r.ArgDefaults, schema, r, o.ctx.Catalog)
 	}
+	// DROP-then-CREATE of the same signature inside one transaction: a deferred
+	// DROP FUNCTION (M0118-0009 `stats`) leaves the old routine in the registry
+	// until COMMIT, which would make this CREATE collide and would later drop the
+	// freshly created routine at COMMIT. Apply that deferred drop now (remove the
+	// old routine + its stats) so the recreate replaces it cleanly.
+	if bsess, ok := o.ctx.Session.(*BasicSession); ok {
+		if old := bsess.TakeDeferredRoutineDropMatching(r.Schema, r.Name, r.Signature()); old != nil {
+			_ = rs.DropRoutine(old)
+			funcStats.dropFunction(old.OID)
+		}
+	}
 	if _, err := rs.Create(r, s.OrReplace); err != nil {
 		// ErrRoutineExists → SQLSTATE 42723 (duplicate function).
 		if errors.Is(err, catalog.ErrRoutineExists) {
@@ -8741,18 +9746,59 @@ func (o *ddlOp) execDropFunction(s *parser.DropFunctionStmt) error {
 		}
 	}
 
-	var err error
-	if s.Args == nil {
-		err = rs.DropByName(s.Name)
-	} else {
-		argTypes := make([]catalog.Type, len(s.Args))
+	// Build the argument-type list once (used by both the immediate and the
+	// deferred paths).
+	var argTypes []catalog.Type
+	if s.Args != nil {
+		argTypes = make([]catalog.Type, len(s.Args))
 		for i, a := range s.Args {
 			argTypes[i] = catalog.Type{
 				Name: strings.ToLower(a.Type.Name),
 				Args: append([]int64(nil), a.Type.Args...),
 			}
 		}
-		err = rs.Drop(s.Name, argTypes)
+	}
+
+	// Inside an explicit transaction, DROP FUNCTION removal is deferred to
+	// COMMIT: the routine stays in the shared registry (and keeps its cumulative
+	// stats) so a concurrent session still resolves and calls it until the
+	// dropping transaction commits — PG transactional-DDL visibility, exercised
+	// by the `stats` isolation spec. The target is resolved now (so a missing /
+	// ambiguous function still errors at statement time), but the actual removal
+	// + pg_stat function-stats drop happen in ApplyDeferredRoutineDrops at COMMIT;
+	// ROLLBACK discards the entry. M0118-0009 (`stats`).
+	var err error
+	if bsess, ok := o.ctx.Session.(*BasicSession); ok && bsess.InExplicitTransaction() {
+		var target *catalog.Routine
+		if s.Args == nil {
+			target, err = rs.ResolveByName(s.Name)
+		} else {
+			target, err = rs.ResolveBySig(s.Name, argTypes)
+		}
+		if err == nil {
+			bsess.AddDeferredRoutineDrop(DeferredRoutineDrop{
+				Routine:        target,
+				SavepointDepth: bsess.SavepointDepth(),
+			})
+			return nil
+		}
+	} else {
+		// Autocommit: remove immediately AND drop the function's cumulative
+		// statistics (mirrors pgstat_drop_function on the implicit commit).
+		// Resolve first to obtain the OID for the stats drop, then remove by
+		// identity. Resolution mirrors DropByName/Drop, returning the same
+		// ErrRoutineNotFound / ErrRoutineAmbiguous sentinels handled below.
+		var target *catalog.Routine
+		if s.Args == nil {
+			target, err = rs.ResolveByName(s.Name)
+		} else {
+			target, err = rs.ResolveBySig(s.Name, argTypes)
+		}
+		if err == nil {
+			if err = rs.DropRoutine(target); err == nil {
+				funcStats.dropFunction(target.OID)
+			}
+		}
 	}
 	if err == nil {
 		return nil
@@ -10123,7 +11169,7 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 				}
 				return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("foreign table %q does not exist", name.String())}
 			}
-			if err := o.dropTableByRef(name, tbl); err != nil {
+			if err := o.dropTableByRef(name, tbl, false); err != nil {
 				return err
 			}
 		}
@@ -10678,6 +11724,64 @@ func (o *ddlOp) execDropCompat(s *parser.DropCompatStmt) error {
 // If the statement carries ObjType+ObjName, it registers the object in the compat
 // registry so subsequent DROP statements can verify its existence. M0097-drop_if_exists.
 func (o *ddlOp) execCompatNoop(s *parser.CompatNoopStmt) error {
+	// A GRANT/REVOKE … ON DATABASE changes the pg_database ACL. PostgreSQL takes
+	// no heavyweight lock for an ACL change — the lock IS the catalog tuple's
+	// xmax — so a concurrent in-place datfrozenxid update (a database-wide VACUUM)
+	// must wait for the ACL-change transaction to commit/abort. goopg has no real
+	// pg_database heap tuple, so we materialize this transaction's writer XID and
+	// record it as the database ACL-change xmax; vacuumOp waits on it via
+	// mvcc.WaitForXID. Design 0118-0098 (intra-grant-inplace-db).
+	if s.DatabaseACL {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.TxnMgr != nil {
+			if err := o.ctx.MaterializeWriterXID(); err == nil {
+				im.SetDatabaseACLChangeXID(o.ctx.Tx.XID)
+			}
+		}
+	}
+	// A GRANT/REVOKE … ON [TABLE] <name> changes the pg_class ACL. As with the
+	// database case above, the lock IS the pg_class tuple's xmax, so a concurrent
+	// in-place pg_class update (ALTER TABLE ADD PRIMARY KEY setting relhasindex)
+	// must wait for the ACL-change transaction to commit/abort. We record the
+	// writer XID keyed by the table OID; execAlterTableAddPrimaryKey waits on it
+	// via mvcc.WaitForXID. Design 0118-0109 (intra-grant-inplace).
+	if s.TableACL != "" {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok && o.ctx.TxnMgr != nil {
+			if tbl, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Name: s.TableACL}); ok && tbl != nil {
+				// Record this ACL change as the pg_class tuple xmax BEFORE waiting,
+				// so a concurrent ADD PRIMARY KEY that blocks behind us observes our
+				// XID and serialises after our commit (intra-grant-inplace perm 7).
+				if err := o.ctx.MaterializeWriterXID(); err == nil {
+					im.SetTableACLChangeXID(tbl.OID, uint32(o.ctx.Tx.XID))
+				}
+				// PostgreSQL's GRANT/REVOKE acquires a LockTuple on the pg_class
+				// row and then awaits the tuple's current xmax/multixact before its
+				// heap_update. Replay that: wait on any conflicting concurrent
+				// explicit rowmark (SELECT … FROM pg_class … FOR NO KEY UPDATE /
+				// SHARE / UPDATE) held by another transaction. The wait is
+				// deadlock-aware — perm 8 forms a cycle (GRANT awaits the rowmark
+				// while ADD PRIMARY KEY blocks behind GRANT) and surfaces 40P01.
+				// Design 0118-0114 (intra-grant-inplace perms 7-8).
+				if ee := o.waitForPgClassRowMarks(tbl); ee != nil {
+					return ee
+				}
+				// SearchSysCacheLocked1() semantics: PG's GRANT/REVOKE locked the
+				// pg_class tuple, then re-reads it after the wait. If a concurrent
+				// transaction committed a DELETE of that tuple while we waited
+				// (intra-grant-inplace perm 10: drop1 = DELETE FROM pg_class,
+				// committed at c1 while revoke4 blocked behind sfu3's rowmark), the
+				// tuple is gone and the lookup fails with the internal "cache lookup
+				// failed for relation <oid>" elog. The spec's DO block EXCEPTION
+				// handler catches it and re-raises a REDACTED WARNING. Design
+				// 0118-0117 (intra-grant-inplace perm 10).
+				if _, stillThere := im.LookupTableByOID(tbl.OID); !stillThere {
+					return &ExecError{
+						Code:    "XX000",
+						Message: fmt.Sprintf("cache lookup failed for relation %d", tbl.OID),
+					}
+				}
+			}
+		}
+	}
 	if s.ObjType == "" {
 		return nil // pure no-op (GRANT, REVOKE, COMMENT, etc.)
 	}
@@ -12397,7 +13501,16 @@ func lockRelationTransitively(ctx *Context, sess Session, dbOID uint32, mode str
 		return nil
 	}
 	visited[tbl.OID] = true
-	globalRelLockMgr.AddRelationLock(sess, dbOID, tbl.OID, mode)
+	// Dedup against the live tableLockMgr → pg_locks bridge (design 0118-0070):
+	// only register in the display-only globalRelLockMgr when this LOCK takes NO
+	// real heavyweight lock — i.e. in autocommit (TxnLockBackendID == 0, where
+	// acquireRelLockTxn is a no-op) or for an exotic/unparsable mode
+	// (lmMode == NoLock). An explicit-transaction LOCK TABLE with a parsable mode
+	// takes a real tableLockMgr lock, which the bridge already surfaces with a
+	// real PID; recording it here too would double it in pg_locks.
+	if lmMode == lockmgr.NoLock || ctx.TxnLockBackendID == 0 {
+		globalRelLockMgr.AddRelationLock(sess, dbOID, tbl.OID, mode)
+	}
 	if lmMode != lockmgr.NoLock {
 		rel := storage.RelFileNode{DBOid: dbOID, RelOid: tbl.OID}
 		if err := ctx.acquireRelLockTxn(rel, lmMode, nowait); err != nil {

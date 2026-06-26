@@ -395,6 +395,18 @@ type Context struct {
 	// Write operators register their output pointers in CTEWriteFence when this is set.
 	InDMLCTE bool
 
+	// DeadlockVictim is set by the pg_class in-place lock waits
+	// (waitPgClassInplaceXID) when this statement is chosen as a deadlock
+	// victim and raises SQLSTATE 40P01. The wire dispatch layer reads it on the
+	// failure path to abort this transaction's MVCC state in place — clearing
+	// its proc-array slot and waking any WaitForXID waiter — while keeping the
+	// transaction block open, mirroring PostgreSQL's AbortTransaction releasing
+	// the XID the moment the deadlock is reported (the winner blocked on the
+	// victim's catalog-tuple xmax must unblock at the abort, not at the victim's
+	// later explicit ROLLBACK). Reset per statement. Design 0118-0115
+	// (intra-grant-inplace perm 8).
+	DeadlockVictim bool
+
 	// PrepStmtsRows, when non-nil, is called by the valuesOp that backs
 	// pg_prepared_statements to return the session's current prepared
 	// statement rows (name, statement, parameter_types, result_types).
@@ -433,6 +445,32 @@ type Context struct {
 	// process-wide cancel registry; nil in unit/embedded contexts where no peer
 	// backends exist. M0118-0008 (detach-partition-concurrently-3/4 s1cancel).
 	CancelBackend func(pid int32) bool
+
+	// TerminateBackend, when non-nil, signals the backend identified by pid to
+	// terminate (close its connection) — the engine behind the
+	// pg_terminate_backend(pid) SQL function (the SQL analog of SIGTERM).
+	// Returns true if a backend with that pid is connected, false if the pid is
+	// unknown. The server wires this to its process-wide cancel registry, whose
+	// entries carry the connection's root-context cancel func; nil in
+	// unit/embedded contexts. Self-termination does NOT go through this callback
+	// (the expr layer returns ErrSelfTerminate instead, so the server can emit
+	// the FATAL and tear down its own connection cleanly). M0118-0009
+	// (temp-schema-cleanup process-exit permutation).
+	TerminateBackend func(pid int32) bool
+
+	// QueueNotify, when non-nil, buffers a notification (the engine behind the
+	// pg_notify(channel, payload) SQL function) into the connection's
+	// transaction so it is published to LISTENers at commit — exactly as the
+	// NOTIFY statement does. The server wires this to connTxState.bufferNotify;
+	// nil in unit/embedded contexts. M0118-0009 (async-notify).
+	QueueNotify func(channel, payload string)
+
+	// NotifyQueueUsage, when non-nil, returns the fraction (in [0, 1]) of the
+	// async-notification queue currently occupied by undelivered notifications —
+	// the engine behind the pg_notification_queue_usage() SQL function. The
+	// server wires this to notifyHub.QueueUsage; nil in unit/embedded contexts
+	// (treated as 0.0). M0118-0009 (async-notify).
+	NotifyQueueUsage func() float64
 
 	// MergeAction holds the current MERGE action for MergeActionExpr evaluation
 	// in a MERGE RETURNING clause. Set by mergeOp.collectReturningRow. M0100-0007.
@@ -765,6 +803,35 @@ func (c *Context) acquireScanReadLockTxn(rel storage.RelFileNode) error {
 	return c.acquireRelLockMaybeTransient(rel, lockmgr.AccessShareLock)
 }
 
+// acquireScanIndexReadLocksTxn takes a transaction-scoped ACCESS SHARE lock on
+// every index of tbl, mirroring PostgreSQL where the planner opens — and, for a
+// read, locks in AccessShare — ALL of a scanned relation's indexes regardless of
+// which scan method is finally chosen (get_relation_info → index_open with
+// AccessShareLock). A bare SELECT against a leaf partition therefore holds
+// AccessShare on the partition's own indexes too, so a concurrent DROP INDEX
+// (which AccessExclusive-locks the index relation tree, design 0118-0071) blocks
+// behind the still-open reader. This is the index-side companion to the
+// table-level acquireScanReadLockTxn and shares its confinement exactly: held to
+// end-of-transaction inside an explicit transaction block, acquired+released
+// transiently in autocommit, and system catalogs skipped (both via the
+// acquireScanReadLockTxn hook). AccessShare is self-compatible and conflicts
+// only with AccessExclusive, so concurrent reads never block on each other.
+// M0118-0008 (partition-drop-index-locking, blocker 2).
+func (c *Context) acquireScanIndexReadLocksTxn(tbl *catalog.Table) error {
+	if tbl == nil || c.Catalog == nil {
+		return nil
+	}
+	for _, idx := range c.Catalog.IndexesOnTable(tbl) {
+		if idx == nil {
+			continue
+		}
+		if err := c.acquireScanReadLockTxn(c.Catalog.IndexRelFileNode(idx)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // acquireWriteLockTxn takes a transaction-scoped ROW EXCLUSIVE heavyweight lock
 // on a relation a DML write (INSERT/UPDATE/DELETE) is about to modify, so a
 // concurrent CREATE TRIGGER / CREATE INDEX / ALTER TABLE (any acquirer of
@@ -791,7 +858,24 @@ func (c *Context) acquireWriteLockTxn(rel storage.RelFileNode) error {
 	// the table level — only a DDL-grade lock (Share/ShareRowExclusive/
 	// Exclusive/AccessExclusive) does, matching PostgreSQL. M0118-0008
 	// (detach-partition-concurrently-3, autocommit INSERT behind FINALIZE).
-	return c.acquireRelLockMaybeTransient(rel, lockmgr.RowExclusiveLock)
+	if err := c.acquireRelLockMaybeTransient(rel, lockmgr.RowExclusiveLock); err != nil {
+		return err
+	}
+	// A write to a toast-bearing table also locks that table's TOAST relation
+	// (PG opens the toast rel with RowExclusiveLock when it stores a toasted
+	// value). goopg stores toast inline, but the lock is observable: REINDEX …
+	// CONCURRENTLY pg_toast.<name> waits for toast-relation lockers, so a
+	// concurrent DML write must register one — whereas a bare LOCK TABLE on the
+	// parent must not (it never touches the toast rel). M0118-0008
+	// (reindex-concurrently-toast, design 0118-0088).
+	if im, ok := c.Catalog.(*catalog.InMemory); ok {
+		if toastRel, has := im.ToastRelFileNode(rel); has {
+			if err := c.acquireRelLockMaybeTransient(toastRel, lockmgr.RowExclusiveLock); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // acquireDDLLockTxn takes a transaction-scoped heavyweight lock in the requested

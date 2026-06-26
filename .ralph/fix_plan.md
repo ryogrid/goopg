@@ -175,6 +175,40 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       executor defaults the rest). Spec still deferred — remaining blockers:
       `VACUUM (TRUNCATE false)` option parse + `EXPLAIN DECLARE CURSOR` + cursor
       FETCH semantics.
+      **2026-06-25 (design 0118-0108, enabler — NOT a promotion):** cleared the
+      `VACUUM (TRUNCATE false)` parse blocker. `VACUUM (TRUNCATE false) <tbl>`
+      (documented PG syntax) was rejected `unrecognised VACUUM option (got
+      truncate)`: the option list had a `truncate` case but matched only via
+      `acceptIdentKeyword`, while the lexer classifies `TRUNCATE` as the
+      unreserved keyword `KwTruncate` (leads `TRUNCATE TABLE`), so it fell
+      through to `default`. Fix = also accept the keyword token
+      (`p.acceptKeyword(KwTruncate) || p.acceptIdentKeyword("truncate")`);
+      `TRUNCATE` is the only VACUUM option word that is also a SQL keyword.
+      `NoTruncate` is recorded for parity but `vacuumCore` never physically
+      truncates trailing empty pages, so both `TRUNCATE false/true` are no-ops
+      today. Cursor FETCH already works; re-probe shows the first divergence
+      moved to `s1_explain` (`EXPLAIN (COSTS OFF) DECLARE … CURSOR` — executor
+      rejects `*parser.DeclareCursorStmt`) and the spec's core requirement, the
+      `BitmapOr` bitmap-scan plan the EXPLAIN must render byte-for-byte. Both
+      remain Effort-L → spec stays deferred. `TestParseVacuumTruncateOption`.
+      **`index-only-bitmapscan` PROMOTED (2026-06-25, design 0118-0122):** the
+      `s1_explain` `DeclareCursorStmt` rejection was the SOLE remaining blocker.
+      `planner.Plan`'s `ExplainStmt` case now unwraps a `DeclareCursorStmt`
+      inner to its `.Query` before planning (PG `ExplainOneUtility`→
+      `ExplainOneQuery`; the cursor is never created, only its query explained).
+      The earlier "must render `BitmapOr` byte-for-byte" requirement was an
+      over-estimate: `normalizeIsoOutput` STRIPS the EXPLAIN plan block on both
+      sides (established plan-strategy policy, same as merge-join), so goopg
+      rendering no `BitmapOr` node is irrelevant — only the EXPLAIN's success +
+      the spec's real anomaly check (the FETCH row counts: `s1_fetch_1`→1 row,
+      `s1_fetch_all`→0 rows, verifying the second VACUUM didn't wrongly mark
+      dead pages all-visible) are compared, and goopg already produces those on
+      its existing index-scan + cursor + VACUUM machinery. Strict
+      `TestPort_IsolationIndexOnlyBitmapscan` + executor unit
+      `TestExplainDeclareCursorExplainsInnerQuery`. Group stays open:
+      `predicate-gin`/`predicate-gist` need real GIN/GiST AMs; `predicate-hash`
+      over-detects 40001 (coarse relation-grain SIREAD). Isolation tally now
+      117 pass / 4 failed.
 - [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
       All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
       nowait{,-2,-3,-4,-5}, lock-nowait,
@@ -288,7 +322,7 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       regenerated. **Still deferred:** UPDATE/DELETE conflict-wait-on-a-conflicting-
       locker (independent slice, ledger'd).
       (b) `deadlock-parallel` needs a lock-group abstraction goopg lacks — defer.
-- [ ] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
+- [x] **M0118-0005** — FK / referential-integrity concurrency: fk-contention,
       fk-deadlock{,2}, fk-partitioned-{1,2}, referential-integrity, ri-trigger,
       temporal-range-integrity. **PARTIAL (2026-06-22, design 0118-0023):** five
       specs promoted to pass-required (strict) with NO engine change —
@@ -296,12 +330,77 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `fk-contention`, `fk-deadlock2` already match PG 18.3 (FK KEY-SHARE-vs-non-key-
       UPDATE non-conflict rides the M0118-0003/0004 multixact lock-only producer; SSI
       specs ride the 40001 machinery). Switched 3 dedicated tests soft→`runIsoSpecStrict`
-      + added `TestPort_IsolationFk{Contention,Deadlock2}`. **Remaining (deferred,
-      ledger 2026-06-22):** `fk-deadlock` (goopg's FK-check KEY SHARE wait
-      over-conflicts — INSERT-into-child blocks where PG proceeds; needs a
-      non-conflicting KEY-SHARE join on the wait path), `ri-trigger` (user RI
-      constraint-trigger firing), `fk-partitioned-1/2` (`ALTER TABLE ATTACH
-      PARTITION` + partitioned-FK enforcement). Group stays open until those land.
+      + added `TestPort_IsolationFk{Contention,Deadlock2}`. **`fk-deadlock` PROMOTED
+      (2026-06-25, design 0118-0094):** the FK existence scan `scanRelForFKMatch`
+      was made FOR-KEY-SHARE-aware — it waits on a matched parent row's in-flight
+      `xmax` only when that `xmax` is a key-changing modification (key UPDATE with
+      `HEAP_KEYS_UPDATED`; structurally-detected DELETE via self-pointing/invalid
+      `t_ctid`; or a multixact updater member `StatusUpdate`) and treats a
+      concurrent no-key UPDATE (`StatusNoKeyUpdate`) as a clean match, so a child
+      INSERT no longer blocks where PG proceeds (sibling-paths fix vs `lockRowsOp`,
+      which already keyed its wait on `keysUpdated`); the only blocking left is the
+      two parent no-key UPDATEs serialising via the existing UPDATE-conflict path.
+      New helpers `fkXmaxIsKeyChanging` + `multixactUpdaterIsKeyChanging`; strict
+      `TestPort_IsolationFkDeadlock` 14/14 byte-identical. **`ri-trigger`
+      PROMOTED (2026-06-25, design 0118-0097):** trigger-based RI under
+      SERIALIZABLE now matches PG 18.3 byte-for-byte (all 10 perms, strict
+      `TestPort_IsolationRiTrigger`) after three plpgsql/trigger fixes: (1)
+      `fireTriggers` now returns `(Row,bool,error)` and PROPAGATES a trigger
+      body's `RAISE` (was silently swallowed at all ~21 INSERT/UPDATE/DELETE/
+      MERGE/upsert call sites — a real correctness bug: user-trigger constraints
+      were ignored), (2) `PERFORM` accepts a full query form (`PERFORM TRUE FROM
+      t WHERE …` runs as `SELECT <query>`; scalar `PERFORM foo()` fast path
+      kept), (3) `FOUND` implemented as a per-frame bool set from the last SQL
+      statement's row count. **Remaining (deferred, ledger 2026-06-22):**
+      `fk-partitioned-1/2` (`ALTER TABLE ATTACH PARTITION` + partitioned-FK
+      enforcement). Group stays open until those land.
+      **2026-06-25 enabler (design 0118-0118, NOT a promotion):** ATTACH PARTITION
+      of a partitioned parent carrying a FOREIGN KEY now clones the referencing FK
+      onto the attached partition and validates its EXISTING rows against the
+      referenced table (PG `ATExecAttachPartition`→`CloneForeignKeyConstraints`→
+      `RI_Initial_Check`) — new `cloneAndValidateAttachPartitionFKs` runs
+      `fullTableFKCheck` (per-row `assertParentExists`→wait-aware
+      `scanTableForMatchFKWait`, descends the referenced partitioned table and
+      BLOCKS on an in-flight referenced-row delete); `fkConstraintName` now honours
+      an explicit `fk.Name` so the clone carries the parent constraint name. Wired
+      at statement time so the FOR-KEY-SHARE wait renders `<waiting ...>` and the
+      23503 surfaces during the ALTER. All **Class A** `fk-partitioned-1`
+      permutations (referenced row deleted before/during attach →
+      `insert or update on table "pfk1" violates foreign key constraint
+      "pfk_a_fkey"`) byte-identical to PG 18.3; first divergence moved to the
+      first **Class B** perm. `fk-partitioned-1` stays `defer` — Class B
+      (referenced-side `pfk_a_fkey_1` restrict "on table pfk" + lock-held-to-commit
+      so a concurrent `delete from ppk1` `<waiting ...>` behind an uncommitted
+      attach) is the remaining slice (ledger 2026-06-25).
+      **`fk-partitioned-1` PROMOTED (2026-06-25, designs 0118-0119 + 0118-0120):**
+      committed Class B = new `enforceFKOnDeletePartitionAncestor` walks the
+      deleted leaf's partition-ancestor chain, skips committed per-partition FK
+      clones (`IsPartitionChild`) so the ROOT `pfk` names the violation, appends
+      the leaf's 1-based ordinal as `<fkname>_<N>` (`pfk_a_fkey_1`). Concurrent
+      Class B = the deferred ATTACH records its XID (`catalog.pendingAttachXID`,
+      set when the parent has FKs, cleared on COMMIT/ROLLBACK); a concurrent
+      `DELETE FROM ppk1` that finds a referencing row in a not-yet-registered
+      partition with an active pending-attach XID `WaitForXID`s it, refreshes the
+      snapshot, and re-evaluates (now the clone is skipped + ROOT named), so the
+      delete renders `<waiting ...>` then errors once the attach commits. All 18
+      active perms byte-identical to PG 18.3; strict `TestPort_IsolationFkPartitioned1`.
+      **`fk-partitioned-2` PROMOTED (2026-06-25, design 0118-0121) — GROUP CLOSED:**
+      FK referencing a partitioned table (`pfk(a) references ppk`, both list-
+      partitioned). Two gaps: (A) INSERT-side `scanTableForMatchFKWait` now raises
+      `40001 could not serialize access due to concurrent update` (not `23503`)
+      when the FOR-KEY-SHARE wait finds the parent row key-changed by a COMMITTED
+      concurrent xact under REPEATABLE READ / SERIALIZABLE (PG `heap_lock_tuple`
+      `HeapTupleUpdated`); (B) `DELETE FROM` the partitioned parent `ppk` (routed
+      to leaf `ppk1`) now names the per-partition clone — `enforceFKOnDelete`
+      routes the deleted row to its leaf via `routeToPartition`, skips the
+      parent-named NO ACTION/RESTRICT `assertNoChildRows` for a partition-leaf row
+      (the unconditional `fkChildWaitForInFlightInsert` still serialises), and runs
+      `enforceFKOnDeletePartitionAncestor` from the leaf so it reports
+      `pfk_a_fkey_1 on table pfk`. Follow-up: `fkDeleteAncestorPass` now honours
+      DEFERRABLE INITIALLY DEFERRED FKs (queues a deduped deferred check, no
+      immediate raise) so `fk-snapshot`'s delete+re-insert stays green. All six
+      perms byte-identical to PG 18.3; strict `TestPort_IsolationFkPartitioned2`.
+      **M0118-0005 group fully promoted to pass-required.**
 - [x] **M0118-0006** — MERGE & INSERT ON CONFLICT output parity: merge-{update,delete,
       insert-update,match-recheck,join}, insert-conflict-do-update-{2,3,4},
       insert-conflict-specconflict, insert-conflict-do-nothing-2. **COMPLETE
@@ -313,22 +412,59 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       now a red test, not a silent `t.Skip` as with `runIsoSpec`), and the ten
       dedicated `TestPort_IsolationMerge*` / `TestPort_IsolationInsertConflict*`
       functions were switched to it. D-002 CSV rationale updated.
-- [ ] **M0118-0007** — Planner / output-format blockers: eval-plan-qual (planner
+- [x] **M0118-0007** — Planner / output-format blockers: eval-plan-qual (planner
       RETURNING support), drop-index-concurrently-1 (EXPLAIN EXECUTE plan-format parity).
+      **COMPLETE (2026-06-25, design 0118-0106): `eval-plan-qual` PROMOTED — group
+      closed.** All three specs (drop-index-concurrently-1, eval-plan-qual-trigger,
+      eval-plan-qual) now strict-pass byte-for-byte vs PG 18.3. The last divergence was
+      the EPQ-over-join `selectresultforupdate` case: `SELECT … FOR UPDATE OF jt` over a
+      join whose locked `jt` is the inner index scan — goopg folded the index key
+      condition `jt.id = y` into the per-row EvalPlanQual recheck, but `y` is another
+      join input's column whose `ColumnRef.Index` lives in the join coordinate space,
+      misread against the 2-col jointest tuple as `jt.id = jt.data` → post-update row
+      wrongly dropped (0 rows). Fixed by only folding a row-local/constant index key into
+      the recheck (`exprRefsColumnOrOuter` guard); join/correlated keys excluded (CTID-
+      chain logic still catches key-column changes). Sibling fix: a lazy hash join now
+      preserves build-side heap ctids (`markJoinPreserveCTID`/`preserveCTIDRel`/
+      `lazyHashCTID`/`buildHashRightWithCTID`, stamped by `nextLazy`) so FOR UPDATE over
+      the hash-join variant recovers the locked TID after the build scan is drained+closed
+      (nil/no-op for queries without FOR UPDATE → TPC-H hash-join hot path untouched).
+      `TestPort_IsolationEvalPlanQual` strict 50/50; EPQ-trigger+row-lock regression PASS;
+      `-race` executor; TPC-H Q12/Q13 spot-check; pgbench smoke.
       **PARTIAL (2026-06-22, design 0118-0024):** `drop-index-concurrently-1` promoted
       to pass-required with NO engine change — it matches PG 18.3 byte-for-byte (DROP
       INDEX CONCURRENTLY two-phase invalidation + index→seqscan EXPLAIN plan-format
       fallback + READ COMMITTED visibility all already correct). Switched
-      `TestPort_IsolationDropIndexConcurrently1` soft→`runIsoSpecStrict`. **Remaining
-      (deferred, ledger 2026-06-22):** `eval-plan-qual` — a cross-table EvalPlanQual
-      recheck returns `(0 rows)` where PG re-projects the updated row after a concurrent
-      UPDATE (EPQ-over-join executor work, ~L1171 of expected). Group stays open.
-- [ ] **M0118-0008** — DDL / VACUUM / maintenance concurrency: alter-table-{1,2,3,4},
+      `TestPort_IsolationDropIndexConcurrently1` soft→`runIsoSpecStrict`.
+      **`eval-plan-qual-trigger` PROMOTED (2026-06-25, design 0118-0095):** the
+      harder half of the EPQ output-parity pair already matches PG 18.3 byte-for-byte
+      with NO engine change — all 38 active permutations stack BEFORE/AFTER row
+      triggers (plpgsql `trig_report`) on READ COMMITTED EPQ rechecks, key-update
+      CTID-chain following, ON CONFLICT DO UPDATE upserts, and REPEATABLE READ 40001
+      failures, all with RETURNING + NOTICE-emitting `noisy_oper()` WHERE quals;
+      goopg's EvalPlanQual re-projects through the trigger queue and the upsert
+      arbiter exactly as PG. Switched `TestPort_IsolationEvalPlanQualTrigger`
+      soft→`runIsoSpecStrict`. **Remaining (deferred, ledger 2026-06-22):**
+      `eval-plan-qual` — a cross-table EvalPlanQual recheck returns `(0 rows)` where
+      PG re-projects the updated row after a concurrent UPDATE (EPQ-over-join
+      executor + EXPLAIN/column-format work, ~L1171 of expected). Group stays open.
+- [x] **M0118-0008** — DDL / VACUUM / maintenance concurrency: alter-table-{1,2,3,4},
       detach-partition-concurrently-{1,2,3,4}, partition-concurrent-attach,
       partition-drop-index-locking, reindex-concurrently{,-toast}, reindex-schema,
       multiple-cic, vacuum-{concurrent-drop,conflict,no-cleanup-lock,skip-locked},
       truncate-conflict, sequence-ddl, cluster-conflict{,-partition}, create-trigger,
       inherit-temp, plpgsql-toast.
+      **COMPLETE (2026-06-24, loop #24).** All 25 specs are strict-promoted
+      (`runIsoSpecStrict`) and byte-for-byte vs PG 18.3 — `reindex-concurrently-toast`
+      (design 0118-0088) was the last, closing the TOAST-exposure epic. This loop
+      reconciled the lagging D-002 inventory: 34 strict-passing isolation specs
+      (the M0118-0008 group + earlier M0118-0005/0006/0007 promotions whose CSV rows
+      were never flipped) set `failed`→`pass` in
+      `postgres-oracle-target-inventory.csv`, regenerated
+      `upstream-isolation-coverage.md` + `postgres-oracle-target-inventory.md`.
+      Smoke-verified `Reindex­ConcurrentlyToast`/`AlterTable4`/`PlpgsqlToast` strict
+      PASS (24.6 s). Isolation tally now 101 pass / 20 failed (remaining 20 span
+      M0118-0002/0004/0005/0007/0009 — distinct unbuilt subsystems).
       **PARTIAL (2026-06-22, design 0118-0027):** probe-first ranked all 25 specs;
       none passed as-is (the group's hard tail). `create-trigger` promoted to
       pass-required — CREATE TRIGGER now takes a txn-scoped ShareRowExclusiveLock
@@ -805,6 +941,163 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       Gates: new `TestPlpgSQLSelectInto/sel_rec_field`; `go test ./internal/executor/`
       PASS; `TestPort_IsolationPlpgsqlToast` strict PASS (no regression); `go build`
       clean; pgbench smoke = pre-commit hook.
+      **2026-06-24 enabler (design 0118-0067, NOT a promotion): `DROP INDEX`
+      partition-tree locking.** Non-CONCURRENTLY `DROP INDEX` now takes a
+      txn-scoped `AccessExclusiveLock` on the index's table + recursively on
+      every partition descendant (top-down) before dropping, mirroring PG
+      `RangeVarCallbackForDropRelation`. New `execDropIndex` call (gated
+      `!s.Concurrent`) → `lockDropIndexTableTree` → `lockPartitionSubtreeAccessExcl`
+      (`idx.Table` + `im.PartitionChildren` recursion, `acquireDDLLockTxn` each),
+      riding the same `tableLockMgr` as `LOCK TABLE`. Lifts
+      `partition-drop-index-locking`'s first divergence: `s2drop`/`s2dropsub` now
+      `<waiting ...>` behind `s1`'s ACCESS SHARE on the leaf and complete on
+      `s1commit` (byte-match). No-op in autocommit (`TxnLockBackendID==0`) ⇒ zero
+      hot-path blast radius; CONCURRENTLY excluded (drop-index-concurrently-1 stays
+      green). **Still deferred (full promotion):** (1) `pg_locks`→real-`tableLockMgr`
+      bridge (per-backend granted/waiting + `BackendID→pid` for the
+      `pg_stat_activity` join — today `s3getlocks` returns 0 rows); (2)
+      partitioned-index child-index creation with PG auto-naming. Gates: live
+      probe (divergence advanced to `s3getlocks`); no regression across
+      DropIndexConcurrently1/ReindexConcurrently/DetachPartitionConcurrently3/
+      CreateTrigger/AlterTable1/InheritTemp/TruncateConflict/ClusterConflict;
+      `go test ./internal/executor/` PASS; `go build` clean; pgbench smoke = pre-commit.
+      **2026-06-24 enabler (design 0118-0075, NOT a promotion):
+      `partition-concurrent-attach`.** `ALTER TABLE … ATTACH PARTITION` now
+      enforces the default-partition conflict check (PG
+      `ATExecAttachPartition` → `check_default_partition_contents`): attaching a
+      non-default partition over rows already living in the parent's visible
+      DEFAULT raises `23P01 updated partition constraint for default partition
+      "X" would be violated by some row`. goopg enforced this only on the
+      `CREATE TABLE … PARTITION OF` path (`validatePartitionChild` →
+      `checkDefaultPartitionDataConflict`); wired the same check into the
+      `AlterTableAttachPartition` executor case (gated `!poc.Default &&
+      !poc.IsHash`) + made `checkDefaultPartitionDataConflict` name the LEAF
+      default (walks a sub-partitioned default's own default recursively, so the
+      message reads `tpart_default_default` not the intermediate
+      `tpart_default`; detection still scans the whole default subtree, only the
+      name refined ⇒ CREATE path's non-nested behaviour unchanged). Standalone,
+      plain-SQL-testable core of the spec; spec stays `defer` — remaining
+      blockers (deferred-until-commit ATTACH visibility so a concurrent INSERT
+      routes to the default; ATTACH AccessExclusiveLock on the default so that
+      INSERT `<waiting ...>`; constraint re-validation after the wait) are the
+      milestone-sized per-session MVCC-catalog work shared with `alter-table-4`
+      (ledger). Gates: new `attach_default_conflict_test.go`
+      (`TestAttachPartitionRejectsDefaultConflict`/`…NoConflictSucceeds`/
+      `…NestedDefaultNamesLeaf`); `go test ./internal/executor/` PASS;
+      `TestPort_IsolationDetachPartitionConcurrently1` strict PASS (shares attach
+      setup, no false positive); `go build ./...` clean; pgbench smoke = pre-commit.
+      **2026-06-24 promotion (design 0118-0079): `partition-concurrent-attach`
+      PROMOTED ⇒ all 3 permutations byte-for-byte** (strict
+      `TestPort_IsolationPartitionConcurrentAttach`), closing the spec on top of
+      enablers 0118-0075..0078. Two final gaps. **Gap 1 (INSERT routing-path lock,
+      perms 1 & 3):** PG `ExecInsert` opens every partition a tuple is routed into
+      in `RowExclusiveLock`; goopg locked only the NAMED INSERT target (`tpart`)
+      and nothing along the routing path, so an `INSERT INTO tpart` routing THROUGH
+      the intermediate DEFAULT `tpart_default` never contended with a concurrent
+      ATTACH's `AccessExclusiveLock` (0118-0076) on that default. New
+      `lockRoutingPathPartitions(ctx, named, leaf)` (operators_storage.go) walks
+      the parent chain from the routed leaf up to (excluding) the named target and
+      `RowExclusive`-locks each INTERMEDIATE partition via `acquireWriteLockTxn`,
+      wired into `insertOp.Next` right after routing resolves the leaf ⇒ locks
+      `tpart_default`: perm 1's `s2i` waits behind the ATTACH then (post-commit,
+      live catalog has `tpart_2`) `checkDefaultPartitionInsertConstraint` re-routes
+      onto it → 23514; perm 3's `s2i` holds the lock to commit so `s1a`'s
+      `lockDefaultPartitionForAttach` acquire waits. RowExclusive is
+      self-compatible/DML-grade ⇒ concurrent partitioned INSERTs never block each
+      other; single-level partitioned tables (leaf's parent IS the named target)
+      and non-partitioned INSERTs are a no-op. **Gap 2 (fresh snapshot for the
+      ATTACH re-scan, perm 3):** once `s1a` waits it is unblocked only after `s2c`
+      commits, but its statement snapshot predates the wait, so
+      `checkDefaultPartitionDataConflict`'s scan didn't see `s2`'s just-committed
+      rows (attach wrongly succeeded → 6 rows). PG's
+      `check_default_partition_contents` scans under the latest snapshot; the
+      conflict scan now refreshes `synthCtx.Snap = TxnMgr.SnapshotFor(ctx.Tx)`
+      before opening (mirrors detach-4 post-wait RI re-validation 0118-0064; a
+      fresh snapshot also sees the txn's own writes ⇒ synchronous CREATE/ATTACH
+      unaffected) ⇒ `s1a` finds the rows → 23P01 naming leaf default
+      `tpart_default_default`. Gates: strict PASS (3 perms); no regression across
+      DetachPartitionConcurrently1/2/3/4 + AlterTable1/2/3 + CreateTrigger +
+      InheritTemp + TruncateConflict + ClusterConflict{,Partition} + VacuumConflict
+      (14 strict PASS, single run); `go test ./internal/executor/` + `-race`
+      partition/insert paths; `go build ./...` clean; pgbench smoke = pre-commit.
+      **2026-06-24 enabler (design 0118-0080, NOT a promotion): `alter-table-4`
+      perms 1 & 2 byte-for-byte.** Inheritance DDL (`c1 NO INHERIT p`,
+      `c2 INHERIT p`) inside an explicit txn vs a concurrent `SELECT SUM(a) FROM p`:
+      PG identifies the parent's children from the reader's snapshot THEN locks
+      them, so the reader blocks on the writer's AccessExclusiveLock on `c1` and the
+      change is invisible until commit. goopg mutated the SHARED catalog
+      synchronously + took no lock ⇒ `s2sel` planned `{p}` and returned immediately.
+      The SELECT side already locks each child AccessShare
+      (`collectInheritanceDescendants`→per-child SeqScan→`acquireScanReadLockTxn`);
+      added the DDL-side pieces (mirror DROP INDEX 0118-0074 / ATTACH 0118-0077):
+      (1) `AlterTableInherit`/`AlterTableNoInherit` take a txn-scoped
+      AccessExclusiveLock on the child via `acquireDDLLockTxn`; (2) inside an
+      explicit txn (`(*ddlOp).inheritDeferSession()`) the register/unregister +
+      INHERIT column-copy is recorded in `BasicSession.pendingInheritChng`
+      (`PendingInheritanceChange` + Add/Take/CancelToDepth) and applied at commit by
+      `ApplyPendingInheritanceChanges` on BOTH commit paths (executor + dispatch),
+      discarded by `DiscardPendingInheritanceChanges` in `ProcessRollbackUndos` /
+      to-depth in `rollbackToSavepointOp` (validation still immediate); (3) new
+      `catalog.InMemory` O(1) counter `Has/Mark/UnmarkInheritanceChangePending`
+      bypasses the cross-session plan cache while pending (`inheritanceChangePending`
+      in both dispatch guards) so the 2nd `s2sel` re-plans → 1 (perm 1) / 101
+      (perm 2). Blast radius nil: deferral+lock only inside an explicit txn over
+      InMemory; autocommit unchanged; partitioning untouched
+      (`RegisterPartitionChild` is a separate path). **Spec stays `defer`** — perm 3
+      (`DROP c1`) needs deferred DROP TABLE + post-lock skip-of-vanished-child,
+      perm 4 (`ALTER COLUMN TYPE`) needs deferred column-type change + post-lock
+      parent-type re-validation error (ledger). Gates: probe perms 1&2 byte-match
+      (divergence → perm 3); new units `TestInheritanceChangePendingCounter` +
+      `TestPendingInheritanceChangeSession`; no regression across
+      InheritTemp/DetachPartitionConcurrently1..4/PartitionConcurrentAttach/
+      AlterTable1/AlterTable3/CreateTrigger/TruncateConflict; `go test
+      ./internal/{catalog,executor,server}/` + `-race`; `go build ./...` + `go vet`
+      clean; pgbench smoke = pre-commit.
+      **2026-06-24 promotion (design 0118-0082): `alter-table-4` PROMOTED ⇒ all 4
+      permutations byte-for-byte.** Closes the spec on top of 0118-0080 (perms 1-2)
+      + 0118-0081 (perm 3). Perm 4 runs `ALTER TABLE c1 ALTER COLUMN a TYPE float`
+      on the inheritance child while a concurrent `SELECT SUM(a) FROM p` waits on
+      `c1`'s lock; once `s1` commits, PG `make_inh_translation_list`
+      (`optimizer/util/appendinfo.c`) re-matches each parent attr to the child by
+      name and raises `attribute "a" of relation "c1" does not match parent's type`
+      (42611) because `a` is now float on c1 / integer on p. goopg mutates c1's type
+      in the SHARED catalog immediately so the post-lock child scan from 0118-0081
+      (which only skipped a vanished child) now also re-validates TYPES: new
+      `planner.SeqScan.InheritParentOID` (set beside `SkipIfVanished` on every
+      inheritance-child scan) drives `validateInheritedColumnTypes` in
+      `seqScanOp.Open` mirroring `make_inh_translation_list` (match each non-dropped
+      parent column to the child by name, compare canonical type class via new
+      `canonicalTypeClass` which collapses integer/int4 + double precision/float8/
+      float + resolves domains while ignoring typmod args ⇒ only a genuine base-type
+      change trips it). Runs only for inheritance-child scans AFTER the lock (so the
+      error appears post-`<... completed>`, not reordering `<waiting ...>`);
+      partition leaves (`LockParentOID`) + direct scans untouched ⇒ zero false
+      positives (confirmed: AlterTable1/AlterTable3/InheritTemp strict + full
+      executor unit suite unchanged). `TestPort_IsolationAlterTable4` strict PASS (4
+      perms); `go test ./internal/{executor,planner,catalog}/`; `go build ./...` +
+      gofmt clean; pgbench smoke = pre-commit.
+      **2026-06-24 enabler (design 0118-0076, NOT a promotion):
+      `partition-concurrent-attach` piece (b) — ATTACH locks the DEFAULT
+      partition.** `ALTER TABLE … ATTACH PARTITION` (non-default), inside an
+      explicit txn, now takes a transaction-scoped `AccessExclusiveLock` on the
+      parent's existing DEFAULT partition before the conflict check — PG
+      `ATExecAttachPartition` (`get_default_oid_from_partdesc` →
+      `LockRelationOid(defaultPartOid, AccessExclusiveLock)`), because the new
+      partition narrows the default's implicit constraint. New
+      `(*ddlOp).lockDefaultPartitionForAttach(parent)` (scans
+      `InMemory.PartitionChildren` for `PartitionBound.IsDefault`, locks via
+      `acquireDDLLockTxn` ⇒ no-op in autocommit / for system rels, held-to-commit
+      in an explicit txn). A concurrent INSERT routing to the default
+      (`RowExclusiveLock`) would then block behind the open attach. Spec stays
+      `defer` — the lock is only contended once piece (a) deferred-until-commit
+      attach visibility routes `s2`'s insert to the default (today the shared
+      catalog makes uncommitted `tpart_2` visible ⇒ insert routes there); (a)+(c)
+      remain the per-session MVCC-catalog milestone shared with `alter-table-4`.
+      Gates: new `attach_default_lock_test.go`
+      (`TestAttachPartitionLocksDefaultPartition`/`TestAttachPartitionNoDefaultNoLock`);
+      0118-0075 attach tests + full `go test ./internal/executor/` PASS;
+      `TestPort_IsolationDetachPartitionConcurrently1` strict PASS; `go build
+      ./...` clean; pgbench smoke = pre-commit.
       **2026-06-23 fourteenth promotion (design 0118-0046): `alter-table-2`
       PROMOTED ⇒ all 48 permutations byte-for-byte.** Two changes: (1) the
       `ALTER TABLE … ADD FOREIGN KEY …` parser now accepts the `NOT VALID`
@@ -944,11 +1237,471 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       the `NULL;` no-op statement (new `NullStmt` AST node + `parseStmt` case +
       no-op runtime arm). Dedicated test `TestPort_IsolationSubxidOverflow`; unit
       `TestParse{AcceptsBareReturn,NullStatement,ExceptionHandlerNullBody}`.
+      `async-notify` PASS (designs 0118-0089/0090). `temp-schema-cleanup` PASS
+      (designs 0118-0091 perm-1 + 0118-0092 cascade enabler + 0118-0093 perm-2
+      process-exit) — `pg_terminate_backend(pg_backend_pid())` self-termination
+      (`executor.ErrSelfTerminate` → FATAL "terminating connection due to
+      administrator command" + close) + backend-exit temp cleanup ordered before
+      advisory-lock release + `Context.TerminateBackend` peer path + harness
+      `lib/pq` connection-death rendering; promoted `runIsoSpecStrict`.
       **Remaining (deferred, ledger 2026-06-22):**
       (b) lock carry-forward on the non-HOT update paths (delete+insert /
       `UPDATE…FROM` / MERGE / upsert) — bounded follow-up, same narrow gate, not
       exercised by any current `port` spec. Plus the other M0118-0009 misc specs
-      untouched (async-notify [LISTEN/NOTIFY unimpl], horizons [dollar-quote lexer +
-      EXPLAIN JSON], intra-grant-inplace [catalog-row lock on GRANT tuple xmax],
-      stats [pg_stat_* infra], temp-schema-cleanup [pg_my_temp_schema + temp
-      cleanup], prepared-transactions [2PC]).
+      untouched (horizons [dollar-quote lexer + EXPLAIN JSON], intra-grant-inplace
+      [catalog-row lock on GRANT tuple xmax], stats [pg_stat_* infra],
+      prepared-transactions [2PC]).
+      **2026-06-25 enabler (design 0118-0096, NOT a promotion):** `pg_database`
+      virtual catalog now projects the standard `datfrozenxid` (= `DatFrozenXID()`
+      cluster-wide min relfrozenxid, bootstrap floor 2) + `datminmxid`
+      (FirstMultiXactId 1) columns — clears `intra-grant-inplace-db`'s `snap3`
+      `SELECT datfrozenxid FROM pg_database` 42703 first-divergence and serves real
+      `age(datfrozenxid)` monitoring queries (M0117-0008 catalog-surface alignment).
+      `intra-grant-inplace-db` still deferred (ledger 2026-06-25): the hard blocker
+      is a runtime shared-catalog MVCC-tuple lock — `VACUUM (FREEZE)` must
+      `<waiting ...>` behind an uncommitted `GRANT … ON DATABASE` row update on
+      `global/1262`; same capability gates `intra-grant-inplace` on `pg_class`.
+      Also reconciled a stale inventory row this loop: `fk-deadlock.spec` (promoted
+      in c59eb91d / design 0118-0094) had its suite-level CSV flipped but not the
+      per-spec inventory — set failed→pass + regen (isolation tally now 106 pass /
+      15 failed).
+      **2026-06-25 promotion (design 0118-0098): `intra-grant-inplace-db`
+      PROMOTED ⇒ single permutation byte-identical.** Closes the one behavioural
+      gap 0118-0096 left: `VACUUM (FREEZE)` must `<waiting ...>` behind an
+      uncommitted `GRANT TEMP ON DATABASE` and resume on commit. Upstream `GRANT …
+      ON DATABASE` takes NO heavyweight lock — its lock IS the `pg_database` tuple
+      `xmax` — and a database-wide VACUUM's in-place `datfrozenxid` update waits on
+      that xmax (`heap_inplace_update_scan` → `XactLockTableWait`). goopg serves
+      `pg_database` virtually (no real tuple/xmax), so the wait is REPLAYED: parser
+      flags `GRANT/REVOKE … ON DATABASE` (`CompatNoopStmt.DatabaseACL`);
+      `execCompatNoop` materializes the writer XID and stores it as the
+      database-ACL-change xmax (`InMemory.SetDatabaseACLChangeXID`, `atomic.Uint32`);
+      a database-wide VACUUM (`len(vs.Targets)==0` — the only case PG advances
+      datfrozenxid) calls `mvcc.WaitForXID` on it first (`vacuumOp.waitForDatabaseACLChange`).
+      Runner decides `<waiting>` by 300 ms timeout so the XID-block reproduces the
+      output exactly. Blast radius nil (targeted VACUUM never consults the marker;
+      no-ACL-change marker is 0 → instant; committed marker → instant; no
+      MVCC/storage/WAL surface). `TestPort_IsolationIntraGrantInplaceDb` strict
+      PASS; sibling Vacuum/Cluster/Truncate-conflict + CreateTrigger PASS
+      (`VacuumConcurrentDrop` fails identically on clean HEAD — pre-existing timing
+      flake, unrelated); parser/catalog/executor units; build+vet+gofmt clean;
+      pgbench smoke = pre-commit hook. Isolation tally now 107 pass / 14 failed.
+      **2026-06-25 promotion (design 0118-0099): `predicate-hash` PROMOTED ⇒
+      all 40 permutations byte-identical.** Page (bucket) level predicate locking
+      in a hash index. goopg has no native hash AM (hash index built on the
+      B-tree substrate, `Method` stays btree), so a SERIALIZABLE equality scan
+      took a relation-grain SIREAD → over-aborted (30 vs PG's 18 serialization
+      failures, the 12 different-bucket interleavings). New in-memory
+      `catalog.Index.DeclaredHash` marks `USING hash`; `ssiHashBucket` →
+      stable 31-bit FNV bucket of the encoded equality key;
+      `ssiRecordHashBucketRead` takes a `PageLockTag(db,indexOID,bucket)` SIREAD
+      on the index/index-only scan in place of the relation lock; per-tuple heap
+      reads switch to `ssiConflictOutTupleRead` (conflict-out only — no heap
+      SIREAD that would coarsen to a heap-page lock and re-introduce the false
+      positive); `ssiRecordHashIndexInsert` runs the bucket conflict-in on the
+      INSERT path. Blast radius bounded to SERIALIZABLE equality scans/INSERTs on
+      declared-hash indexes; the 6 pass-required btree/seqscan SSI specs +
+      predicate-lock-hot-tuple/partial-index/simple-write-skew PASS no
+      regression; executor/mvcc/planner/catalog units + `-race` SSI tests;
+      build+vet clean; pgbench smoke = pre-commit hook. Isolation failed-spec
+      count now 12 (was 13). Follow-ups: `predicate-gin`/`predicate-gist` need
+      AM-specific granularity; `DeclaredHash` not WAL-persisted (reverts to
+      relation-grain after restart); UPDATE/DELETE on a hash column not yet
+      bucket-locked.
+      **2026-06-25 (design 0118-0100, enabler — NOT a promotion):** added JSON
+      accessor operators `->`/`->>` (lexer 2-/3-char match + `OpJSONGet`/
+      `OpJSONGetText` at `precJSON=6` + executor `evalJSONArrow`). Previously a
+      hard lex error; broadly useful + clears `horizons`' first divergence. Spec
+      stays `failed` — re-probe shows the next blockers are plpgsql
+      `EXECUTE … INTO STRICT`, then `EXPLAIN (FORMAT json)` `Heap Fetches`
+      emission, then the Effort-L MVCC core (index-only-scan heap-fetch counts
+      reflecting pruning + prune/VACUUM respecting a concurrent older snapshot
+      for permanent vs temp tables). Ledger row recorded.
+      **2026-06-25 (design 0118-0101, enabler — NOT a promotion):** added plpgsql
+      `EXECUTE … INTO STRICT var` (the next horizons rung): `ExecuteStmt.Strict`
+      (AST) + optional `STRICT` after `INTO` in `parseExecute` + runtime row-count
+      enforcement (0 rows→P0002, >1→P0003, mirroring `SELECT … INTO STRICT`).
+      `horizons.spec`'s `explain_json` setup helper now creates + runs; re-probe
+      shows the divergence advanced to the EXPLAIN `Heap Fetches` pruning counts.
+      Spec stays `failed` — remaining blockers are the Effort-L EXPLAIN JSON
+      `Heap Fetches` emission + MVCC pruning-horizon core. Tests
+      `TestParseExecuteIntoStrict` + `TestPlpgSQLExecuteIntoStrict`. Ledger row.
+      **2026-06-25 (design 0118-0102, enabler — NOT a promotion):** EXPLAIN
+      infrastructure for the `Heap Fetches` rung — (1) `EXPLAIN (FORMAT JSON)`
+      now nests the plan tree under a top-level `"Plan"` key (PG-faithful;
+      `Planning/Execution Time` siblings) so `…->0->'Plan'->…` resolves (goopg
+      flattened it before); (2) IndexOnlyScan renders `Index Only Scan using
+      <idx> on <table>` (was the `%T` default); (3) EXPLAIN ANALYZE reports
+      `Heap Fetches` for IOS nodes (JSON key + text line), counted from the
+      operator's non-`ALL_VISIBLE` fallback (new `nodeStats.heapFetches` +
+      `heapFetchCounter` interface). 6 internal JSON tests updated for the
+      wrapper. **horizons re-probe isolates the residual blocker:** goopg's
+      planner emits `Sort → Seq Scan` (not an IOS) for `SELECT * … ORDER BY
+      data` and does NOT honor `enable_seqscan/indexscan/bitmapscan=false`, so
+      no IOS node exists → `Heap Fetches` NULL. NEXT (Effort-L): planner
+      GUC-honoring + ordered-full-index→IOS promotion, then the MVCC
+      pruning-horizon core. `TestExplainHeapFetchesIndexOnlyScan` PASS. Ledger.
+      **2026-06-25 (design 0118-0103, enabler — NOT a promotion):** ordered
+      full-index→IndexOnlyScan promotion gated on `enable_seqscan = off` (the
+      GUC `horizons`' `pruner` session sets). goopg's rule-based planner ignored
+      the planner-toggle GUCs and built `Project(Sort(SeqScan))` for an
+      ORDER-BY-only query, so `EXPLAIN (COSTS OFF) SELECT * FROM horizons_tst
+      ORDER BY data` showed `Sort → Seq Scan` not the expected `Index Only Scan
+      using horizons_tst_data_key on horizons_tst`. Three pieces: (1)
+      `dispatch.go` `sessionPlanCatalog`/`ctxPlanCatalog` thread `enable_seqscan`
+      into new `catalog.SearchPathCatalog.DisableSeqScan`; (2) planner
+      `currentSeqScanDisabled` walks the catalog wrapper chain (same `Unwrap()`
+      carrier pattern as `currentTempOwner`); (3) `tryPromoteOrderedIndexOnlyScan`
+      replaces `Project(Sort(SeqScan))` with an unbounded `IndexOnlyScan` (nil
+      Key/Keys/bounds → full-range `RangeScan` in ascending order, Sort dropped)
+      when a non-partial B-tree index's leading key columns match the
+      ASC/NULLS-LAST ORDER BY keys and its key+INCLUDE columns cover the
+      projection. PG-faithful gate (PG picks the IOS *because* SeqScan is
+      disabled) bounds blast radius to seqscan-disabled sessions — TPC-H/pgbench
+      never set it, so the branch no-ops and their plans are byte-identical.
+      Re-probe: IOS plan + `Heap Fetches` navigation now match; only 3 lines
+      differ — `L125` (temp prune-despite-older-snapshot expected 0/actual 2),
+      `L244`/`L254` (perm-table VACUUM-must-not-remove-still-visible expected
+      2/actual 0) — isolating the residual blocker to the Effort-L MVCC
+      pruning-horizon core (temp-always-prunable vs perm-respects-OldestXmin +
+      matching VACUUM cutoff). Tests `TestOrderedIndexOnlyScan{Promoted…,
+      NotPromotedByDefault,RequiresAscending}`; planner/catalog/executor/server
+      suites PASS; build+vet clean; pgbench smoke = pre-commit hook. Ledger row.
+      **2026-06-25 (design 0118-0104, enabler — NOT a promotion): the MVCC
+      pruning-horizon core, 4/5 horizons permutations now match PG 18.3.** Lands
+      the TEMPORARY half + no-vacuum permanent permutations: (1)
+      `mvcc.OldestXminForProc(procNum)` — session-local horizon
+      `min(nextXID, slot.xid, slot.xmin)` for one backend (falls back to global),
+      ignores other backends' snapshots but respects the owner's own in-progress
+      txn (keeps perm 3 "delete-in-open-txn" at Heap Fetches=2); (2)
+      `vacuum.VacuumOptions.Horizon` override + `operators_vacuum.go` passes the
+      session-local horizon for `tbl.Temp` targets → perm 5 temp VACUUM reclaims
+      rows (vacuumIndexes clears the B-tree entries) → 0; (3) IOS
+      `pruneTouchedTempPages` prunes the temp heap blocks the scan fetched at the
+      session-local horizon (reusing PageVacuumPrune + LogHeapPruneOpt) WITHOUT
+      setting VM ALL_VISIBLE (next scan stays on the fallback path, skips
+      reclaimed entries rather than resurrecting deleted rows) → perm 2 drops
+      2→0; (4) IOS counting rule (kill_prior_tuple analog) skips an index entry
+      whose root line pointer is LP_UNUSED/LP_DEAD without a Heap Fetches tally.
+      **horizons stays `failed`** — residual = perm 4 only (perm-table
+      VACUUM-respects-older-snapshot, Heap Fetches must stay 2): lifeline's
+      batched `BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1;` never registers
+      the RR tx's snapshot xmin (goopg captures an RR snapshot lazily at the
+      first SEPARATE-message statement); capturing it at the batched first
+      statement (PG-correct) was implemented in dispatch.go and REVERTED because
+      it regresses `eval-plan-qual-trigger` (same batched `BEGIN RR; SELECT 1`
+      shape) by exposing a latent goopg RR concurrent-update (40001) detection
+      gap. NEXT: fix that detection to be snapshot-timing-robust, then re-apply
+      the batched-BEGIN RR snapshot-pinning. Tests `TestPort_IsolationHorizons`
+      (soft 4/5) + `TestOldestXminForProc_SessionLocalIgnoresOtherSnapshots`;
+      `-race` mvcc/vacuum/storage + executor/server PASS; predicate-hash/
+      eval-plan-qual-trigger non-regression confirmed; build+vet+gofmt clean;
+      pgbench smoke = pre-commit hook. Ledger row.
+      `horizons` PROMOTED (loop #43, design 0118-0105). **Remaining M0118-0009:**
+      `intra-grant-inplace` (pg_class sibling — ALTER TABLE ADD PRIMARY KEY
+      `<waiting>` behind FOR KEY SHARE on pg_class; needs runtime shared-catalog
+      MVCC-tuple row locks — heavy), `stats` (pg_stat_force_next_flush + cumulative
+      function-stats + stats_fetch_consistency + 2PC interaction), `prepared-
+      transactions{,-cic}` (2PC PREPARE/COMMIT PREPARED — also gates the `stats`
+      spec's PREPARE TRANSACTION steps). All three remaining are genuinely Effort-L
+      unbuilt subsystems.
+      **2026-06-25 (design 0118-0106): `eval-plan-qual` PROMOTED — closes the
+      M0118-0007 planner/output-format group.** EPQ recheck over a join: the index
+      key fold into the per-row recheck was unsound when `ix.Key` is a join/
+      correlated reference (coordinate-space mismatch dropped the post-update row);
+      fold now gated on a row-local constant key (`exprRefsColumnOrOuter`). Sibling
+      latent fix: lazy hash join preserves build-side heap ctids for FOR UPDATE over
+      the hash-join variant. Detail in the M0118-0007 entry above.
+      **2026-06-25 (design 0118-0107): `timeouts` PROMOTED — pass-required via
+      `TestPort_IsolationTimeouts`.** `statement_timeout`/`lock_timeout` against
+      table-level (`LOCK TABLE`) and row-level (`DELETE` behind a concurrent
+      `UPDATE`) lock waits; all 8 permutations byte-identical to PG 18.3 with NO
+      engine change (the shorter of the two timeouts fires first → 57014 statement
+      timeout / 55P03 lock timeout; blocked steps `(*)`-marked upstream). Found via
+      a probe of remaining deferred specs — cheapest available promotion. Stable
+      across 8 runs. **Remaining M0118-0009 (all Effort-L unbuilt subsystems):**
+      `intra-grant-inplace{,-db only -db done}`, `stats`, `prepared-transactions{,-cic}`.
+      **2026-06-25 (design 0118-0109, enabler — NOT a promotion):**
+      `intra-grant-inplace` permutation 1 now byte-identical (first divergence
+      L17→L62). `ALTER TABLE … ADD PRIMARY KEY` (an in-place `relhasindex=true`
+      update on the `pg_class` tuple) must `<waiting ...>` behind a concurrent
+      uncommitted `GRANT SELECT ON <table>`; PG takes no heavyweight lock — its
+      lock IS the catalog tuple `xmax`. Replayed the `xmax` wait (the pg_class
+      sibling of 0118-0098's database case): parser resolves a table-target
+      GRANT/REVOKE into `CompatNoopStmt.TableACL` (`grantObjectName`/
+      `grantNonTableClass`); `execCompatNoop` records the writer XID keyed by
+      table OID (`InMemory.SetTableACLChangeXID`, mutex-guarded `map[oid]xid`);
+      `execAlterTableAddPrimaryKey` calls `waitForTableACLChange`→`mvcc.WaitForXID`
+      before building the index. Spec stays `defer` — perms 3,4,7–11 need
+      `pg_class` rowmark locking (`SELECT relhasindex … FOR NO KEY UPDATE`/`FOR
+      UPDATE`/`FOR KEY SHARE` + `DELETE FROM pg_class` taking a real tuple lock on
+      a virtual catalog row + `LockTuple` deadlock detection), the Effort-L runtime
+      shared-catalog MVCC-tuple-lock core. `TestParseGrantTableACL`; non-regression
+      IntraGrantInplaceDb + TruncateConflict strict PASS.
+      **2026-06-25 (design 0118-0110, enabler — NOT a promotion): same-backend
+      two-phase commit.** Adds the 2PC statements `prepared-transactions`,
+      `prepared-transactions-cic` and `stats` need. goopg had NO 2PC —
+      `PREPARE TRANSACTION 's1'` did not parse (mis-lexed as the prepared-
+      statement PREPARE), so every permutation diverged at the first prepare
+      step. New parser AST (`PrepareTransactionStmt`/`CommitPreparedStmt`/
+      `RollbackPreparedStmt`; `parsePrepare` branches on the `TRANSACTION`
+      keyword, `parseCommit`/`parseRollback` on the unreserved `PREPARED`
+      word) + same-backend executor (`internal/server/twophase.go`). Every
+      target spec PREPAREs and COMMIT/ROLLBACK PREPAREs the gid from the SAME
+      idle-in-between session, so goopg keeps the prepared txn OPEN as the
+      connection's active txn (writes/locks/SSI predicate locks persist),
+      records `connTxState.preparedGid`, and finalises COMMIT/ROLLBACK PREPARED
+      by re-entering `executeOneSimpleStmt` with a synthetic CommitStmt/
+      RollbackStmt — reusing the CANONICAL commit path verbatim (SSI pre-commit
+      check, deferred DDL, NOTIFY publish, connTx.End) so no parallel commit
+      path drifts and the SSI check fires at COMMIT PREPARED as upstream.
+      PREPARE TRANSACTION outside a txn block → 25P01; unknown gid → 42704.
+      `isTwoPhaseStmt` keeps them out of the plan-cache pre-plan. Blast radius
+      nil (handler returns handled=false for all other statements; no port spec
+      uses these). A prepared-transactions-cic probe confirms the held txn keeps
+      its MVCC slot active so CREATE INDEX CONCURRENTLY waits for it and unblocks
+      at COMMIT PREPARED — first divergence advanced from "parse error at p1" to
+      the final cic2/c1 timing; ONLY residual gap = goopg's CIC active-slot wait
+      doesn't honour `lock_timeout` (PG cancels with 55P03). Specs stay defer
+      pending (1) CIC lock_timeout, (2) full 1500-perm SSI verification of
+      prepared-transactions, (3) the pg_stat_* subsystem for stats. Tests
+      `TestParseTwoPhaseCommit` + `TestPort_TwoPhaseCommitSameBackend`
+      (commit-prepared visibility incl. cross-session isolation, rollback-
+      prepared discard, 25P01, 42704).
+      **2026-06-25 (design 0118-0111, PROMOTION): `prepared-transactions-cic`
+      PROMOTED to pass-required** (`runIsoSpecStrict` in
+      `TestPort_IsolationPreparedTransactionsCIC`, byte-identical to PG 18.3).
+      Closes the 0118-0110 residual gap: `mvcc.WaitForSlotsToCommit` now arms the
+      session `lock_timeout` carried on ctx (`lockwait.Timeout`) exactly like
+      `lockmgr.ProcSleep`, so a CREATE INDEX CONCURRENTLY parked waiting for a
+      still-running prepared txn's MVCC slot to drain is cancelled with
+      "canceling statement due to lock timeout" at the 10ms budget (CIC drain
+      site maps via the shared `lockWaitTimeoutError` helper — no sibling path).
+      Blast radius nil: byte-unchanged when lock_timeout=0; only caller is the CIC
+      drain. Gates: strict spec PASS + `-race ./internal/mvcc/...` green.
+      **2026-06-25 (design 0118-0112, PROMOTION): `prepared-transactions`
+      PROMOTED to pass-required** (`runIsoSpecStrict` in
+      `TestPort_IsolationPreparedTransactions`, all 1500 permutations
+      byte-identical to PG 18.3). The SSI dangerous-structure check now runs at
+      PREPARE TRANSACTION time (`Manager.PrepareCheckForSerializationFailure`)
+      and a PREPARED-but-not-committed peer is treated like a committed-first one
+      in the read/write conflict hooks (`SerializableXact.Prepared`/`PrepareSeqNo`
+      mirror `SXACT_FLAG_PREPARED`/`prepareSeqNo`): a dangerous structure whose
+      pivot is already prepared makes the preparer commit suicide (40001) while an
+      rw-edge to a prepared writer dooms the reader; PREPARE on an already-aborted
+      block silently rolls back (no 25P02, matching `PrepareTransactionBlock` on
+      `TBLOCK_ABORT`). Blast radius nil for non-2PC: every new branch is guarded by
+      `Prepared`, never set outside `PREPARE TRANSACTION`. Gates: strict spec PASS
+      (137s) + `-race ./internal/mvcc/...` green.
+      **2026-06-25 (design 0118-0113, enabler — NOT a promotion):**
+      `intra-grant-inplace` permutations 2–6 now byte-identical (first divergence
+      L62→L141). The `pg_class` **rowmark** half (the GRANT-`xmax` half was
+      0118-0109): an explicit `SELECT … FROM pg_class WHERE oid=<rel> FOR {KEY
+      SHARE|NO KEY UPDATE|SHARE|UPDATE}` takes a tuple lock that ADD PRIMARY KEY's
+      in-place `relhasindex` update must serialise behind (FOR KEY SHARE alone
+      does NOT conflict). goopg has no real pg_class heap tuple, so
+      `lockRowsOp.maybeRecordPgClassRowMark` (fires only when locked OID ==
+      `catalog.RelationRelationId`, OID from the `oid=<const>` filter) records
+      holder+conflict flag in a new catalog store (`pgClassRowMarks`;
+      `AddPgClassRowMark`/`PgClassRowMarks`/`ClearPgClassRowMarksForXID`);
+      `execAlterTableAddPrimaryKey`→`waitForPgClassRowMarks`→`mvcc.WaitForXID` on
+      conflicting other-tree holders (`TopLevelXid` skips same-xact/savepoint —
+      perms 5/6); commit/rollback clear the txn's marks. `TestPgClassRowMarks` +
+      non-regression IntraGrantInplaceDb/TruncateConflict + row-lock family PASS;
+      `-race` mvcc/catalog green. Spec stays `defer` — perms 7–10 need the
+      `GRANT`/`REVOKE`/`DELETE FROM pg_class` `LockTuple` + deadlock-detection
+      core (the Effort-L runtime shared-catalog MVCC-tuple-lock core).
+      **2026-06-25 (design 0118-0114, enabler — NOT a promotion):**
+      `intra-grant-inplace` permutations 1–7 now byte-identical AND perm 8's
+      deadlock line exact (first divergence L141→L184). Added the reverse-
+      direction wait + deadlock detection: (1) GRANT/REVOKE on a table now
+      AWAITS a conflicting concurrent `pg_class` rowmark — `execCompatNoop`'s
+      TableACL branch records its ACL-change `xmax` FIRST (so a peer ADD PRIMARY
+      KEY observes it and serialises after the GRANT's commit — perm 7's
+      load-bearing ordering) then calls `waitForPgClassRowMarks`; (2) deadlock
+      detection via a new shared helper `waitPgClassInplaceXID` that registers
+      `myXID→blockingXID` in the EXISTING process-global EPQ wait-for graph
+      (`registerWFGAndCheckCycle`) and walks for a cycle BEFORE blocking — perm 8
+      (`b2 sfnku2 b1 grant1 addk2`) forms `s1→s2→s1` so `addk2` (the `(*)`
+      victim) raises 40P01 "deadlock detected" synchronously. All three
+      `pg_class`-tuple waits route through the helper and now return `*ExecError`.
+      Spec stays `defer` — perm 8's ONLY residual is a grant1/c2 completion-order
+      swap (goopg keeps the deadlock victim's XID active until the explicit
+      COMMIT, so grant1 unblocks at c2 not at the abort — needs
+      AbortTransaction-releases-XID-but-block-open semantics); perm 9 needs
+      plpgsql-DO-block `REVOKE` parsing + lockRows-awaits-ACL; perm 10 needs
+      `DELETE FROM pg_class` virtual-tuple semantics. Non-regression
+      IntraGrantInplaceDb/TruncateConflict/TuplelockUpgradeNoDeadlock/DeadlockHard
+      strict PASS; `-race` lock/deadlock executor tests green.
+      **2026-06-25 (design 0118-0116, enabler — NOT a promotion):**
+      `intra-grant-inplace` permutation 9 now byte-identical (first divergence
+      L206→L235). Perm 9 (`b1 grant1 b3 sfu3 revoke4 c1 r3`) needed two fixes:
+      (1) the plpgsql body parser rejected a bare `REVOKE` inside `revoke4`'s
+      `DO $$ … $$` block (`GRANT`/`REVOKE` are not reserved keywords, so a leading
+      `REVOKE` fell through to `parseAssign` → `expected ':=' or '=' after
+      "revoke"` BEFORE the EXCEPTION handler could run) — added a leading
+      `grant`/`revoke`-ident case to `parseStmt` routing to `parseSQLStmt` (general
+      fix: GRANT/REVOKE work in any plpgsql function/DO body now;
+      `TestParseGrantRevokeEmbeddedSQL`); (2) `sfu3`'s `pg_class` rowmark
+      (`SELECT … FOR UPDATE`) completed immediately instead of `<waiting ...>`
+      behind grant1's uncommitted ACL change — refactored `waitForTableACLChange`
+      into the free `waitTableACLChange(ctx, oid)` and made
+      `lockRowsOp.maybeRecordPgClassRowMark` record the mark FIRST (so a peer
+      REVOKE blocks behind it) THEN await the table's ACL `xmax` (PG order:
+      acquire LockTuple, then await tuple xmax). Blast radius nil (rowmark wait
+      reached only for `pg_class` + `oid=<const>`; no-op with no pending ACL
+      change). Spec stays `defer` — perm 10 (`drop1` = `DELETE FROM pg_class`)
+      needs virtual-catalog tuple-delete + `SearchSysCacheLocked1` find-then-none.
+      **2026-06-25 (design 0118-0117): `intra-grant-inplace` PROMOTED — all 10
+      permutations byte-identical to PG 18.3; `TestPort_IsolationIntraGrantInplace`
+      strict.** Closed perm 10 (`b1 drop1 b3 sfu3 revoke4 c1 r3`) where `drop1` is
+      the locally-adapted `DELETE FROM pg_class WHERE relname = …` (virtual-catalog
+      tuple delete). Six pieces: (1) new `tablePendingDropXID` catalog store (the
+      `pg_class` delete xmax, mirrors `tableACLChangeXID`); (2)
+      `deleteOp.tryPgClassCatalogDelete` routes `DELETE FROM pg_class WHERE
+      {relname|oid}=…` in an explicit txn to a transaction-deferred table drop —
+      records the delete xmax + defers removal to COMMIT via `AddPendingTableDrop`
+      (relation stays visible until then); (3) `maybeRecordPgClassRowMark` also
+      `waitTablePendingDrop` (shared deadlock-aware core `waitPgClassTupleXID`) and
+      RETRACTS its rowmark when the post-wait scan yields 0 rows
+      (`Catalog.ClearPgClassRowMark`) — PG holds no tuple lock when it locks
+      nothing; (4) `waitForPgClassRowMarks` now waits on the MARK's release
+      (`waitPgClassRowMarkReleased` polls the mark + keeps WFG deadlock check) not
+      the holder's whole txn (`WaitForXID`), so revoke4 unblocks the instant sfu3
+      releases — before r3; (5) the REVOKE re-checks `LookupTableByOID` after the
+      wait → `XX000 cache lookup failed for relation <oid>` (PG's
+      `SearchSysCacheLocked1` find-then-none); (6) three latent **plpgsql EXCEPTION**
+      fixes — `parseTopBlock`/`parseNestedBlock` now set `ExceptionBlock.TryBody`
+      (handlers were DEAD before: body ran as siblings so an error aborted before
+      any handler), the handler binds `SQLERRM`/`SQLSTATE` frame vars, and
+      `RAISE WARNING` routes to `AddWarning` (WARNING severity not NOTICE) — so the
+      DO block catches the elog and re-raises the REDACTED WARNING. Blast radius
+      nil. Gates: strict 10/10; non-regression `IntraGrantInplaceDb`/`RiTrigger`/
+      `EvalPlanQualTrigger`/`DeadlockHard`/`TuplelockUpgradeNoDeadlock`/
+      `CreateTrigger`/`DeadlockSimple`/`DeadlockSoft`/`ReceiptReport`/
+      `ProjectManager` + plpgsql procedure/DO-txctl tests PASS; `-race`
+      executor/catalog/plpgsql green; CSV D-002 flipped failed→pass + md regen.
+      **2026-06-25 (design 0118-0123, enabler — NOT a promotion): `stats` rung 1.**
+      The last failed M0118-0009 spec, `stats`, exercises the `pgstat` cumulative-
+      statistics subsystem. Every permutation aborted in global `setup` at
+      `SELECT pg_stat_force_next_flush()` (`42883` — pg_proc seed has the rows but
+      `evalFuncCall` had no case → fell through to `evalStoredRoutineFuncCall`),
+      and the `SET track_functions/track_counts/stats_fetch_consistency` steps hit
+      unregistered GUCs. Landed three faithful low-blast pieces: (1) registered the
+      three GUCs (`track_counts` bool/on/SUSET; `track_functions` enum
+      none|pl|all/none/SUSET; `stats_fetch_consistency` enum
+      none|cache|snapshot/cache/USERSET) mirroring `guc_tables.c` + matching
+      `postgresql.conf.sample` lines (M0108 `TestSampleConfigCoversRegistry`
+      parity); (2) `pg_stat_force_next_flush()` → void no-op (goopg has no async
+      stats collector to flush); (3) `pg_stat_clear_snapshot()` → void no-op (no
+      per-txn stats snapshot cache). First divergence advanced from global-setup
+      failure (perm 0) → first permutation's `pg_stat_get_function_calls does not
+      exist`. Spec stays `defer`. Remaining rungs (each Effort-L): runner echo of a
+      setup query's result block; function-stats counters/getters +
+      `pg_stat_reset_single_function_counters`; relation tuple stats +
+      `pg_stat_get_xact_*`; `pg_stat_reset()`; real snapshot caching; 2PC stats
+      interaction (rides 0118-0110). Tests `TestPgStatFlushSnapshotVoidNoops`
+      (executor) + `TestStatsGUCs` (config).
+      **2026-06-25 (design 0118-0124, enabler — NOT a promotion): `stats` rung 2.**
+      Built the cumulative function-statistics subsystem + the runner setup-echo
+      needed to observe it; first divergence advanced **L4 → L449** (the first ≈8
+      permutations — function-stats counting, multi-connection accumulation,
+      cross-txn flush, `pg_stat_reset*` — now byte-identical to PG 18.3, counts and
+      `total_time>0`/`self_time>0` included). Pieces: (1) process-global
+      `functionStatsManager` (`internal/executor/pgstat_functions.go`) with
+      per-session `pending[sessionID][oid]` → cluster-global `shared[oid]` merged on
+      `pg_stat_force_next_flush()`; one server process per cluster + fresh server per
+      spec ⇒ store starts empty per cluster (like fresh initdb). (2) Counting hook in
+      `executeStoredRoutine` (split out `dispatchStoredRoutineByLanguage`), gated by
+      `track_functions` (all/pl/none; boot none ⇒ zero hot-path overhead); times the
+      dispatch, `self==total` (spec only checks `>0`, guaranteed by `pg_sleep(10µs)`
+      bodies). (3) `evalFuncCall` getters `pg_stat_get_function_calls/_total_time/
+      _self_time(oid)` (NULL when no flushed stats; ms as NUMERIC so `>0` compares) +
+      `pg_stat_reset_single_function_counters(oid)` + `pg_stat_reset()`;
+      `pg_stat_force_next_flush()` upgraded from no-op to flush. OIDs via
+      `'name'::regproc`→`Routine.OID`. (4) Runner: global setup blocks run via
+      `execConnSetupCapture`, the tuple-returning setup result (`SELECT
+      pg_stat_force_next_flush()`) echoed right after `starting permutation:` like
+      `isolationtester.c` (safe: a passing strict spec with a tuple setup would
+      already have diverged). Spec stays `defer` — new first divergence is the
+      **uncommitted `DROP FUNCTION` cross-session visibility** case (no per-session
+      MVCC catalog; same gap as alter-table-4). Tests `TestFunctionStatsManager` +
+      `TestShouldTrackFunction`.
+      **Remaining M0118-0009:** `stats` (pg_stat_* cumulative subsystem, Effort-L —
+      rungs 1+2 enablers landed 0118-0123/0124; remaining rungs: uncommitted-DROP
+      MVCC-catalog visibility, 2PC stat-drops, `stats_fetch_consistency` snapshot/
+      cache models, relation tuple stats + `pg_stat_get_xact_*`, SLRU stats).
+      **2026-06-25 (design 0118-0125, enabler — NOT a promotion): `stats` rung 3.**
+      Made DROP FUNCTION transactional + finished the function-stats lifecycle;
+      first divergence advanced **L449 → L1587**. (1) Deferred DROP FUNCTION
+      (mirrors deferred DROP TABLE): `DeferredRoutineDrop` + `BasicSession.
+      deferRoutineDrops`; in an explicit txn `execDropFunction` resolves the
+      target (read-only `Routines.ResolveByName`/`ResolveBySig`) but defers removal
+      to COMMIT (`ApplyDeferredRoutineDrops` on both `execCommit` + simple-query
+      dispatch), so a concurrent session still calls it until commit; ROLLBACK
+      discards, ROLLBACK TO cancels by depth. (2) Autocommit DROP now drops the
+      function's cumulative stats too (`funcStats.dropFunction`, mirrors
+      `pgstat_drop_function`). (3) `dropFunction(oid)` clears shared + every
+      session's pending; `resetSingle`/`resetAll` ZERO entries in place (getter
+      returns 0 not NULL; absent OID stays NULL). (4) DROP-then-CREATE same
+      signature in one txn handled by `TakeDeferredRoutineDropMatching` (applies
+      the deferred drop early). Known limitation (accepted, like deferred DROP
+      TABLE): dropping session sees its own dropped function until commit (no
+      per-session catalog MVCC). New first divergence L1587 =
+      `stats_fetch_consistency='cache'/'snapshot'` (per-txn stat caching), then
+      L2026 = 2PC `PREPARE TRANSACTION` stats. Tests `TestDeferredRoutineDropSession`
+      + `TestRoutinesResolveForDrop` + updated `TestFunctionStatsManager`.
+      **2026-06-25 (design 0118-0127, enabler — NOT a promotion): `stats` rung 5.**
+      Cross-backend two-phase commit for RC/RR; first divergence advanced
+      **L2036 → L2180**. The four "2PC handling of stat drops" permutations
+      (S1-prepares then S1 OR S2 commits/aborts prepared) now match byte-for-byte.
+      Prior 2PC (0118-0110) was same-backend only (prepared txn kept open on the
+      originating connection's slot). New mechanism (PG dummy-PGPROC analogue):
+      (1) `mvcc.Manager.DetachToDedicatedSlot(tx)` relocates an RC/RR txn off its
+      backend's proc slot to a fresh dedicated slot (same XID/iso/snapshot, stays
+      `inTxn=1` so writes stay visible-as-in-progress + committable from any
+      backend; `ErrUnsupportedDetach` for SERIALIZABLE — Handle-keyed SSI). (2)
+      Reserved proc-array region: top `ReservedPreparedSlots=64` slots
+      `[ConnSlotCount, DefaultProcArraySize)` for detached prepared txns; ALL
+      low-region allocators bounded to `ConnSlotCount` (server.go×2,
+      dispatch_extended.go, copy.go, Begin auto-assign) so no backend reusing a
+      `procNum=(pid-1)%size` clobbers a parked slot. (3) `preparedXactStore`
+      (gid→parked `*connTxState`) + `connTxState.DetachPrepared` (moves session +
+      deferred DROP FUNCTION drops + NOTIFYs + enum DDL into the holder, frees the
+      live connection) + `BasicSession.RelocateTransaction`. (4)
+      `execFinalizePrepared` retargets the executor context at the parked
+      session/tx and routes the synthetic COMMIT/ROLLBACK through the canonical
+      `executeOneSimpleStmt` path (reuses SSI check, ApplyDeferredRoutineDrops→
+      funcStats.dropFunction, NOTIFY publish, lock release). SERIALIZABLE keeps the
+      unchanged same-backend keep-open path. New first divergence L2180 = relation
+      tuple stats (`pg_stat_get_numscans`/`_tuples_*`/`_xact_*`), then SLRU.
+      Tests: `TestDetachToDedicatedSlot{,RejectsSerializable}` (mvcc, also -race);
+      regression `TestPort_TwoPhaseCommitSameBackend` +
+      `TestPort_IsolationPreparedTransactions{,CIC}` strict PASS.
+
+      **2026-06-25 (design 0118-0128, enabler — NOT a promotion): `stats` rung 6.**
+      Relation tuple statistics; first divergence advanced **L2180 → L2704**. All
+      seven non-2PC table-stats permutations (drop-removes-stats, `track_counts
+      off/on` access, cumulative seq-scan/DML counts) AND the 2PC COMMIT PREPARED
+      permutations now match PG 18.3 byte-for-byte. New
+      `internal/executor/pgstat_relations.go` mirrors the function-stats two-tier
+      shape: `relStats` with `shared[oid]` + per-session `pending[sessionID][oid]`;
+      `recordScan/Insert/Update/Delete` (INSERT +1 live/row; DELETE +1 dead −1
+      live/row; UPDATE +1 dead/row, live unchanged — no HOT); `flush` merges
+      pending→shared (via `pg_stat_force_next_flush()`); `get` returns 0 NOT NULL
+      for absent OID (PG relation-getter semantics); `dropTable(oid)` clears shared
+      + every session's pending (no revival on a peer's later flush). Getters in
+      expr.go: `pg_stat_get_numscans/_tuples_returned/_tuples_fetched/_tuples_{inserted,
+      updated,deleted}/_live_tuples/_dead_tuples/_vacuum_count` (live/dead clamp ≥0;
+      fetched/vacuum_count=0). Counting hooks (gated by `track_counts`, boot on):
+      `seqScanOp` (statReturned per tuple, record one scan in Close); `scanMatching`
+      gains `statOID` param (UPDATE/DELETE base scan; FK sites pass 0); insert/update/
+      deleteOp.Close per-statement rowsAffected; dropTableByRefImmediate drops stats.
+      Per-statement Close recording = "applied at commit" for the autocommit
+      simple-query path (no per-txn staging yet). New first divergence L2704 =
+      `s1_…_rollback_prepared_a`: transactional-counter abort/2PC reconciliation
+      (aborted insert/update → dead not live; `truncdropped` for in-txn TRUNCATE/DROP;
+      2PC handoff of staged rel counters). Then later: index-scan `tuples_fetched`,
+      VACUUM `vacuum_count`/live-dead recompute, SLRU stats. Tests:
+      `pgstat_relations_test.go` (accumulate/flush/get, update dead-delta,
+      drop-without-revival); `TestPort_IsolationStats` soft probe L2180→L2704.

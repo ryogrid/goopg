@@ -3,6 +3,8 @@ package framework
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -13,6 +15,35 @@ import (
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 )
+
+// backendTerminationMessage is the verbatim text libpq surfaces (and upstream
+// isolationtester prints) when the server sends a FATAL and closes the
+// connection mid-query — the server's primary error line followed by libpq's
+// standard connection-loss note. goopg's lib/pq driver collapses this into
+// driver.ErrBadConn (the FATAL ErrorResponse is dropped once the socket EOFs),
+// so the harness reconstructs it for the pg_terminate_backend self-termination
+// case (temp-schema-cleanup process-exit permutation). The trailing newline
+// reproduces the blank separator line upstream emits after the block.
+// M0118-0009.
+const backendTerminationMessage = "FATAL:  terminating connection due to administrator command\n" +
+	"server closed the connection unexpectedly\n" +
+	"\tThis probably means the server terminated abnormally\n" +
+	"\tbefore or while processing the request.\n"
+
+// isBackendTerminationError reports whether err indicates the server closed the
+// connection because the step terminated its own backend via
+// pg_terminate_backend(pg_backend_pid()). Gated on the step SQL so an unrelated
+// connection drop (a real crash) is NOT mislabelled as an administrator
+// termination. M0118-0009.
+func isBackendTerminationError(err error, sqlText string) bool {
+	if err == nil {
+		return false
+	}
+	if !strings.Contains(strings.ToLower(sqlText), "pg_terminate_backend") {
+		return false
+	}
+	return errors.Is(err, driver.ErrBadConn) || strings.Contains(err.Error(), "bad connection")
+}
 
 const (
 	// blockDetectWait is how long a step must run before we assume it is
@@ -117,6 +148,14 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		if len(setupBlocks) == 0 && spec.SetupSQL != "" {
 			setupBlocks = []string{spec.SetupSQL}
 		}
+		// PostgreSQL isolationtester.c (run_permutation) prints the result set of
+		// each global setup block whose final command returns tuples
+		// (PGRES_TUPLES_OK) — right after the "starting permutation:" line, before
+		// any step. e.g. stats.spec's setup ends with SELECT
+		// pg_stat_force_next_flush(), so its one-row block is echoed before every
+		// permutation. COMMAND_OK setups (CREATE TABLE / INSERT) print nothing.
+		// Capture that output here and hand it to runPermutation. M0118-0009.
+		var setupResult string
 		if len(setupBlocks) > 0 {
 			monitor, err := db.Conn(ctx)
 			if err != nil {
@@ -126,10 +165,12 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 				if strings.TrimSpace(blk) == "" {
 					continue
 				}
-				if err := execConn(ctx, monitor, blk); err != nil {
+				out, errText := execConnSetupCapture(ctx, monitor, blk)
+				if errText != "" {
 					_ = monitor.Close()
-					return "", fmt.Errorf("global setup (permutation %d): %w", i, err)
+					return "", fmt.Errorf("global setup (permutation %d): %s", i, errText)
 				}
+				setupResult += out
 			}
 			_ = monitor.Close()
 		}
@@ -138,7 +179,7 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		if i < len(spec.PermutationBlockers) {
 			permBlockers = spec.PermutationBlockers[i]
 		}
-		out, err := r.runPermutation(ctx, db, spec, perm, permBlockers)
+		out, err := r.runPermutation(ctx, db, spec, perm, permBlockers, setupResult)
 
 		// Global teardown runs after each permutation (mirrors isolationtester.c).
 		if spec.TeardownSQL != "" {
@@ -203,8 +244,78 @@ func (q *sessionNoticeQueue) drain() []string {
 	return n
 }
 
+// sessionNotifyQueue is a thread-safe FIFO of asynchronous notifications
+// ('A' NotificationResponse messages) received on one session's connection.
+// lib/pq's notification handler (set via pq.ConnectorWithNotificationHandler)
+// pushes here synchronously while reading a step's query response; the main
+// runner goroutine drains it after the step to emit the upstream
+// isolationtester notification lines. M0118-0009 (async-notify).
+type sessionNotifyQueue struct {
+	mu     sync.Mutex
+	notifs []pq.Notification
+}
+
+// push records one received notification.
+func (q *sessionNotifyQueue) push(n *pq.Notification) {
+	if n == nil {
+		return
+	}
+	q.mu.Lock()
+	q.notifs = append(q.notifs, *n)
+	q.mu.Unlock()
+}
+
+// drain returns and clears all collected notifications in arrival (FIFO) order.
+func (q *sessionNotifyQueue) drain() []pq.Notification {
+	q.mu.Lock()
+	n := append([]pq.Notification(nil), q.notifs...)
+	q.notifs = q.notifs[:0]
+	q.mu.Unlock()
+	return n
+}
+
+// backendPIDOf returns the backend PID of conn (SELECT pg_backend_pid()), used
+// to attribute captured notifications to their source session. Returns
+// (0, false) if the query fails or returns no row. M0118-0009.
+func backendPIDOf(ctx context.Context, conn *sql.Conn) (int, bool) {
+	row := conn.QueryRowContext(ctx, "SELECT pg_backend_pid()")
+	var pid int
+	if err := row.Scan(&pid); err != nil {
+		return 0, false
+	}
+	return pid, true
+}
+
+// drainAllNotifications drains every session's notification queue in
+// session-declaration order and writes one upstream isolationtester line per
+// notification:
+//
+//	<receiving-session>: NOTIFY "<channel>" with payload "<payload>" from <source-session>
+//
+// matching PostgreSQL's isolationtester, which after each step polls
+// PQnotifies() on every connection in session order and prints exactly this
+// format (notify->relname, notify->extra, and the session resolved from
+// notify->be_pid). The source session is resolved via pidToSession; an
+// unrecognized PID falls back to its numeric form. M0118-0009 (async-notify).
+func drainAllNotifications(sb *strings.Builder, sessionNames []string, queues map[string]*sessionNotifyQueue, pidToSession map[int]string) {
+	for _, sname := range sessionNames {
+		q := queues[sname]
+		if q == nil {
+			continue
+		}
+		for _, n := range q.drain() {
+			src, ok := pidToSession[n.BePid]
+			if !ok {
+				src = fmt.Sprintf("%d", n.BePid)
+			}
+			fmt.Fprintf(sb, "%s: NOTIFY %q with payload %q from %s\n",
+				sname, n.Channel, n.Extra, src)
+		}
+	}
+}
+
 // runPermutation executes one permutation using fresh session connections.
-func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec IsolationSpec, perm []string, permBlockers [][]StepBlocker) (string, error) {
+func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec IsolationSpec, perm []string, permBlockers [][]StepBlocker, setupResult string) (string, error) {
 	sessionNames := spec.Sessions
 	if len(sessionNames) == 0 {
 		sessionNames = []string{"s1"}
@@ -213,19 +324,34 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 	// Build a per-session pq connector with a notice handler so NOTICE messages
 	// emitted during step execution are captured. Uses pq.ConnectorWithNoticeHandler
 	// to attach the handler at DB-open time (works regardless of Go version).
+	//
+	// A notification handler is chained on top so asynchronous 'A'
+	// NotificationResponse messages (LISTEN/NOTIFY) delivered on a session's
+	// connection during a step's query read are captured per session. lib/pq
+	// invokes both handlers synchronously while reading the query response to
+	// ReadyForQuery, so by the time a step's goroutine returns, every
+	// notification the server delivered during that step is in the queue —
+	// mirroring upstream isolationtester, which polls PQnotifies() on every
+	// connection after each step completes. M0118-0009 (async-notify).
 	sessionQueues := make(map[string]*sessionNoticeQueue, len(sessionNames))
+	notifyQueues := make(map[string]*sessionNotifyQueue, len(sessionNames))
 	sessionDBs := make(map[string]*sql.DB, len(sessionNames))
 	for _, sname := range sessionNames {
 		q := &sessionNoticeQueue{}
 		sessionQueues[sname] = q
+		nq := &sessionNotifyQueue{}
+		notifyQueues[sname] = nq
 		base, err := pq.NewConnector(r.DSN)
 		if err == nil {
 			withNotice := pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
 				q.push(n.Severity, n.Message)
 			})
-			sessionDBs[sname] = sql.OpenDB(withNotice)
+			withNotify := pq.ConnectorWithNotificationHandler(withNotice, func(n *pq.Notification) {
+				nq.push(n)
+			})
+			sessionDBs[sname] = sql.OpenDB(withNotify)
 		} else {
-			// Fallback: use the shared db without notice capture.
+			// Fallback: use the shared db without notice/notification capture.
 			sessionDBs[sname] = db
 		}
 	}
@@ -302,6 +428,11 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "starting permutation: %s\n", strings.Join(perm, " "))
+	// Global setup result block (e.g. stats.spec's trailing SELECT
+	// pg_stat_force_next_flush()), echoed exactly as isolationtester does —
+	// immediately after the header, before per-session setup and steps. Empty
+	// for the vast majority of specs whose setup is pure DDL/DML. M0118-0009.
+	sb.WriteString(setupResult)
 
 	// Per-session setup: set application_name first so pg_locks queries
 	// filtered by application_name can identify sessions. M0100-0006b.
@@ -315,10 +446,19 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 	// the SET application_name (a goopg-only addition PG never runs) is executed
 	// uncaptured, then the spec's setup block is run with output captured and
 	// emitted in session order. M0118-0003.
+	// pidToSession maps each session's backend PID to its session name, so a
+	// captured notification (which carries the NOTIFYing backend's PID) can be
+	// attributed to the source session in the "from <session>" suffix, exactly
+	// as upstream isolationtester resolves notify->be_pid. Built once per
+	// permutation on the dedicated session connections. M0118-0009.
+	pidToSession := make(map[int]string, len(sessionNames))
 	for _, sname := range sessionNames {
 		appName := "isolation/" + specBase + "/" + sname
 		if err := execConn(ctx, conns[sname], "SET application_name = '"+appName+"'"); err != nil {
 			return "", fmt.Errorf("session %q set application_name: %w", sname, err)
+		}
+		if pid, ok := backendPIDOf(ctx, conns[sname]); ok {
+			pidToSession[pid] = sname
 		}
 		if setupSQL, ok := spec.SessionSetup[sname]; ok && setupSQL != "" {
 			out, errText := execConnSetupCapture(ctx, conns[sname], setupSQL)
@@ -494,6 +634,13 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			sb.WriteString(formatWaitingStepHeader(step.Name, step.SQL))
 			pending = append(pending, pendingStep{name: step.Name, sql: step.SQL, session: step.Session, outCh: outCh, queue: q, cancelFn: stepCancel, blockers: stepBlockers, baselines: stepBaselines})
 		}
+
+		// After the step completes, emit any asynchronous notifications delivered
+		// on any session's connection during it, in session-declaration order —
+		// the goopg analog of upstream isolationtester polling PQnotifies() on
+		// every connection at the end of try_complete_step. A no-op for every
+		// spec that does not use LISTEN/NOTIFY (all queues empty). M0118-0009.
+		drainAllNotifications(&sb, sessionNames, notifyQueues, pidToSession)
 	}
 
 	// Wait for all remaining blocked steps.
@@ -916,10 +1063,52 @@ func dollarOpener(sql string, i int) (string, int) {
 func execOneStatement(ctx context.Context, conn *sql.Conn, sqlText string) (oneResult, string) {
 	rows, err := conn.QueryContext(ctx, sqlText)
 	if err != nil {
+		if isBackendTerminationError(err, sqlText) {
+			return oneResult{}, backendTerminationMessage
+		}
 		return oneResult{}, formatPQError(err)
 	}
 	defer rows.Close()
+	return scanResultSet(rows)
+}
 
+// execMultiStatement executes a multi-statement step body as a SINGLE
+// simple-query message (one QueryContext call), so the statements run inside
+// one implicit transaction exactly as upstream isolationtester's PQexec does —
+// a prerequisite for transaction-scoped semantics like NOTIFY de-duplication
+// and ROLLBACK TO SAVEPOINT discard (async-notify), which a per-statement split
+// (each its own autocommit transaction) would defeat. Every result set the
+// batch produces is captured via database/sql's NextResultSet, preserving the
+// prior behavior of emitting one block per rows-bearing statement. M0118-0009.
+func execMultiStatement(ctx context.Context, conn *sql.Conn, sqlText string) ([]oneResult, string) {
+	rows, err := conn.QueryContext(ctx, sqlText)
+	if err != nil {
+		return nil, formatPQError(err)
+	}
+	defer rows.Close()
+	var results []oneResult
+	for {
+		rs, errText := scanResultSet(rows)
+		if errText != "" {
+			return nil, errText
+		}
+		if len(rs.rows) > 0 {
+			results = append(results, rs)
+		}
+		if !rows.NextResultSet() {
+			break
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, formatPQError(err)
+	}
+	return results, ""
+}
+
+// scanResultSet reads the current result set of rows into a oneResult. It does
+// not close rows (the caller owns the lifetime, so it can iterate further
+// result sets via NextResultSet). Returns ("", errText) on a scan error.
+func scanResultSet(rows *sql.Rows) (oneResult, string) {
 	cols, err := rows.Columns()
 	if err != nil {
 		return oneResult{}, formatPQError(err)
@@ -1003,6 +1192,36 @@ func execStep(ctx context.Context, conn *sql.Conn, sqlText, _ string) stepOutcom
 	stmts := splitSQLStatements(sqlText)
 	if len(stmts) == 0 {
 		stmts = []string{sqlText}
+	}
+	// PostgreSQL isolationtester sends each step's body verbatim as a single
+	// simple-query, so pg_stat_activity.query echoes the exact text the client
+	// sent — INCLUDING the trailing ';'. splitSQLStatements strips the
+	// terminator (it returns bare statements for execution). For a
+	// single-statement step, send the trimmed verbatim body instead so the
+	// query goopg stores matches PG byte-for-byte; this is what the
+	// partition-drop-index-locking spec's s3getlocks observes when it joins
+	// pg_locks to pg_stat_activity on s.query. Multi-statement steps keep the
+	// split form (goopg's simple-query path executes them one at a time).
+	// M0118-0008, design 0118-0073.
+	if len(stmts) == 1 {
+		if trimmed := strings.TrimSpace(sqlText); trimmed != "" {
+			stmts[0] = trimmed
+		}
+	}
+	// Multi-statement steps are sent as a single simple-query message so they
+	// execute in one implicit transaction (upstream isolationtester PQexec
+	// semantics), which transaction-scoped behaviors such as NOTIFY
+	// de-duplication and ROLLBACK TO SAVEPOINT discard depend on. A
+	// per-statement split would run each as its own autocommit transaction and
+	// defeat them. Single-statement steps keep the verbatim-body path so
+	// pg_stat_activity.query matches PG byte-for-byte (design 0118-0073).
+	// M0118-0009.
+	if len(stmts) > 1 {
+		results, errText := execMultiStatement(ctx, conn, strings.TrimSpace(sqlText))
+		if errText != "" {
+			return stepOutcome{errText: errText}
+		}
+		return stepOutcome{results: results}
 	}
 	var result stepOutcome
 	for _, stmt := range stmts {

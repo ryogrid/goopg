@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
@@ -135,6 +136,16 @@ type lockRowsOp struct {
 	// NOWAIT "could not obtain lock on row in relation \"%s\"" diagnostic with
 	// the upstream-canonical relation name. Resolved at Open from Locks[0].
 	lockRelName string
+
+	// pgClassRowMarkOID / pgClassRowMarkXID record the explicit pg_class rowmark
+	// this LockRows took up front in maybeRecordPgClassRowMark (so a concurrent
+	// GRANT/REVOKE blocks behind it during the wait). If the post-wait scan then
+	// yields no row — the relation's pg_class tuple was concurrently DELETEd and
+	// committed — PG holds no tuple lock, so we retract the mark immediately
+	// (ClearPgClassRowMark) and a peer waiting behind it proceeds without waiting
+	// for our transaction to end. Design 0118-0117 (intra-grant-inplace perm 10).
+	pgClassRowMarkOID uint32
+	pgClassRowMarkXID uint32
 }
 
 type pendingLockedRow struct {
@@ -224,6 +235,41 @@ func filterPredMaxColRef(expr planner.Expr) int {
 	}
 	walk(expr)
 	return max
+}
+
+// exprRefsColumnOrOuter reports whether expr references any column of a row
+// (ColumnRef) or an outer/correlated input (OuterColumnRef). An index scan's
+// key expression that satisfies this is a join/correlated lookup key rather
+// than a row-local constant, so it must not be folded into the per-row EPQ
+// recheck filter (its column indices live in a different coordinate space than
+// the locked table's own columns). M0118-0009.
+func exprRefsColumnOrOuter(expr planner.Expr) bool {
+	found := false
+	var walk func(planner.Expr)
+	walk = func(e planner.Expr) {
+		if e == nil || found {
+			return
+		}
+		switch x := e.(type) {
+		case *planner.ColumnRef:
+			found = true
+		case *planner.OuterColumnRef:
+			found = true
+		case *planner.BinaryOp:
+			walk(x.Left)
+			walk(x.Right)
+		case *planner.UnaryOp:
+			walk(x.Operand)
+		case *planner.CastExpr:
+			walk(x.Operand)
+		case *planner.FuncCall:
+			for _, a := range x.Args {
+				walk(a)
+			}
+		}
+	}
+	walk(expr)
+	return found
 }
 
 // currentTIDProvider is the interface a scan leaf implements to
@@ -355,6 +401,26 @@ func findScanLeafForRel(op Operator, targetRel storage.RelFileNode) currentTIDPr
 	}
 }
 
+// markJoinPreserveCTID walks the operator tree below a LockRows and tags every
+// joinOp with the relation whose heap ctid must survive the build-side drain
+// (M0118-0009, eval-plan-qual). Each tagged join decides at its own Open whether
+// targetRel actually lands on its build side; the tag is a harmless hint
+// otherwise. Recurses through Project / Filter wrappers and into both join
+// children so a join nested under another join is reached too.
+func markJoinPreserveCTID(op Operator, targetRel storage.RelFileNode) {
+	switch v := op.(type) {
+	case *projectOp:
+		markJoinPreserveCTID(v.child, targetRel)
+	case *filterOp:
+		markJoinPreserveCTID(v.child, targetRel)
+	case *joinOp:
+		rel := targetRel
+		v.preserveCTIDRel = &rel
+		markJoinPreserveCTID(v.left, targetRel)
+		markJoinPreserveCTID(v.right, targetRel)
+	}
+}
+
 func (o *lockRowsOp) Schema() planner.Schema { return o.plan.Output() }
 
 func (o *lockRowsOp) Open(ctx *Context) error {
@@ -432,6 +498,16 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 			return err
 		}
 	}
+	// M0118-0009 (eval-plan-qual): if the first locked relation can land on the
+	// BUILD side of a lazy hash join below, that scan is drained + closed at the
+	// join's Open and its currentTID is lost before drainAndStamp runs. Tell the
+	// join(s) to preserve that relation's heap ctid through the build so the
+	// emitted slot carries it (recovered via the ms.hasCTID fallback in
+	// drainAndStamp). Must run BEFORE o.child.Open builds the hash table.
+	if len(o.plan.Locks) > 0 && o.plan.Locks[0].Table != nil {
+		targetRel := ctx.Catalog.RelFileNode(o.plan.Locks[0].Table)
+		markJoinPreserveCTID(o.child, targetRel)
+	}
 	if err := o.child.Open(ctx); err != nil {
 		return err
 	}
@@ -472,7 +548,21 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 	// EvalPlanQual re-running the whole plan (index recheck included). The
 	// synthesised ref points at the indexed column's table ordinal, so it stays
 	// within filterCols; guard anyway for safety. M0118-0003.
-	if ix, ok := o.scan.(*indexScanOp); ok && ix.plan != nil && len(o.filterCols) > 0 {
+	// Fold the index key condition ONLY when its key expression is row-local —
+	// a constant such as `key = 1`. When the locked index scan is the inner of a
+	// join its key is a join/correlated reference (e.g. `jt.id = y` where y is
+	// another input's column), and indexScanPredicate emits that reference with
+	// a column index in the OUTER/join coordinate space. Re-applying it in
+	// epqRecheckFilter — which decodes only the locked table's own columns —
+	// silently misreads that index as a locked-table column (`jt.id = jt.data`)
+	// and wrongly drops the row (eval-plan-qual selectresultforupdate: the
+	// post-update jt row was discarded, returning 0 rows). filterPredMaxColRef
+	// can't catch this because the misaligned index happens to fall inside
+	// [0,len(filterCols)). For a non-key UPDATE the join key is preserved on the
+	// successor, so skipping its recheck is correct; key-column changes are still
+	// caught by the CTID-chain logic. M0118-0009 (docs/design/0118-0106).
+	if ix, ok := o.scan.(*indexScanOp); ok && ix.plan != nil && len(o.filterCols) > 0 &&
+		ix.plan.Key != nil && !exprRefsColumnOrOuter(ix.plan.Key) {
 		if idxPred := indexScanPredicate(ix.plan); idxPred != nil &&
 			filterPredMaxColRef(idxPred) < len(o.filterCols) {
 			if o.filterPred == nil {
@@ -507,7 +597,98 @@ func (o *lockRowsOp) Open(ctx *Context) error {
 			o.maxDrain = int(drain)
 		}
 	}
+	// intra-grant-inplace: a `SELECT … FROM pg_class WHERE oid = <rel> FOR …`
+	// takes an explicit row lock on the pg_class tuple. goopg has no real
+	// pg_class heap tuple, so the heap-stamping path above is a no-op for it;
+	// instead record the rowmark in the catalog so a concurrent in-place catalog
+	// update (ALTER TABLE ADD PRIMARY KEY → relhasindex) waits on it. Design
+	// 0118-0113.
+	if ee := o.maybeRecordPgClassRowMark(); ee != nil {
+		return ee
+	}
 	return nil
+}
+
+// maybeRecordPgClassRowMark records an explicit pg_class tuple lock when this
+// LockRows targets pg_class with a single `oid = <const>` predicate. A no-op
+// for every other relation, so the normal heap row-lock path is byte-unchanged.
+// Design 0118-0113 (intra-grant-inplace).
+//
+// After recording the mark it serialises behind any concurrent uncommitted
+// GRANT/REVOKE on the same table, mirroring PG: SELECT … FROM pg_class … FOR
+// UPDATE acquires the tuple lock (the rowmark, recorded first so a peer
+// GRANT/REVOKE blocks behind it) then waits on the pg_class tuple xmax held by
+// the in-flight ACL change (intra-grant-inplace perm 9: sfu3 waits behind
+// grant1). Design 0118-0116. Returns a non-nil *ExecError only on a deadlock /
+// lock-timeout during that wait.
+func (o *lockRowsOp) maybeRecordPgClassRowMark() *ExecError {
+	if len(o.plan.Locks) == 0 || o.plan.Locks[0].Table == nil {
+		return nil
+	}
+	if o.plan.Locks[0].Table.OID != catalog.RelationRelationId {
+		return nil
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	relOID, ok := o.pgClassFilterOID()
+	if !ok {
+		return nil
+	}
+	// The locker must hold a real (materialised) XID so the in-place updater can
+	// WaitForXID on it.
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return nil
+	}
+	xid := uint32(o.writerXID())
+	if xid == 0 {
+		return nil
+	}
+	// Every row-lock strength conflicts with a concurrent in-place pg_class
+	// update (heap_inplace_update's no-key update) except FOR KEY SHARE.
+	conflicts := o.plan.Locks[0].Strength != planner.LockStrengthForKeyShare
+	im.AddPgClassRowMark(relOID, xid, conflicts)
+	o.pgClassRowMarkOID = relOID
+	o.pgClassRowMarkXID = xid
+	// Now block behind any uncommitted ACL change on the same table — the
+	// rowmark is already recorded so a concurrent GRANT/REVOKE blocks behind us.
+	if ee := waitTableACLChange(o.ctx, relOID); ee != nil {
+		return ee
+	}
+	// Also block behind an uncommitted DROP TABLE deferred to COMMIT: PG's tuple
+	// lock waits on the pg_class delete xmax, then finds the tuple gone once the
+	// DROP commits. intra-grant-inplace perm 10 (sfu3 waits behind drop1). Design
+	// 0118-0117.
+	return waitTablePendingDrop(o.ctx, relOID)
+}
+
+// pgClassFilterOID extracts the relation OID from a `oid = <const>` equality in
+// the child scan's filter predicate (the shape every intra-grant-inplace rowmark
+// SELECT uses). Returns ok=false for any other predicate shape so the rowmark is
+// simply not recorded. Design 0118-0113.
+func (o *lockRowsOp) pgClassFilterOID() (uint32, bool) {
+	bo, ok := findFilterPred(o.child).(*planner.BinaryOp)
+	if !ok || bo.Op != parser.OpEq {
+		return 0, false
+	}
+	cr, ok := bo.Left.(*planner.ColumnRef)
+	constExpr := bo.Right
+	if !ok {
+		if cr, ok = bo.Right.(*planner.ColumnRef); !ok {
+			return 0, false
+		}
+		constExpr = bo.Left
+	}
+	if cr.Index < 0 || cr.Index >= len(o.filterCols) ||
+		!strings.EqualFold(o.filterCols[cr.Index].Name, "oid") {
+		return 0, false
+	}
+	d, err := evalExpr(constExpr, nil, o.ctx)
+	if err != nil || d.IsNull() || d.Kind != KindInt || d.Int <= 0 {
+		return 0, false
+	}
+	return uint32(d.Int), true
 }
 
 // Next implements the two-pass lock-then-yield protocol. First
@@ -644,6 +825,17 @@ func (o *lockRowsOp) drainAndStamp() error {
 		}
 		o.pending = append(o.pending, entry)
 		successCount++
+	}
+	// intra-grant-inplace perm 10: a pg_class rowmark recorded up front that ends
+	// up locking no tuple (the relation was concurrently DELETEd and committed
+	// during our wait, so the scan now yields 0 rows) holds no lock in PG —
+	// retract the mark so a peer GRANT/REVOKE blocked behind it proceeds at once.
+	// Design 0118-0117.
+	if len(o.pending) == 0 && o.pgClassRowMarkOID != 0 {
+		if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+			im.ClearPgClassRowMark(o.pgClassRowMarkOID, o.pgClassRowMarkXID)
+		}
+		o.pgClassRowMarkOID = 0
 	}
 	return nil
 }

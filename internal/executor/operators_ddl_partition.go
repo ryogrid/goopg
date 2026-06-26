@@ -1105,7 +1105,33 @@ func checkDefaultPartitionDataConflict(childName string, parent *catalog.Table, 
 		return nil
 	}
 	keyCol := `"` + parent.PartitionKey[0] + `"`
+	// Detect by scanning the whole default subtree via the immediate default
+	// partition (a partitioned default expands to all its descendants).
 	defName := `"` + defPart.Name + `"`
+	// Resolve the LEAF default partition (a sub-partitioned default's own
+	// default, recursively) for the error message: PostgreSQL's
+	// check_default_partition_contents recurses into a partitioned default and
+	// names the specific leaf default that would hold an offending row
+	// (e.g. tpart_default_default, not the intermediate tpart_default).
+	leafDef := defPart
+	for {
+		next := (*catalog.Table)(nil)
+		for _, sub := range im.PartitionChildren(leafDef.OID) {
+			for _, pb := range sub.PartitionBounds {
+				if pb.IsDefault {
+					next = sub
+					break
+				}
+			}
+			if next != nil {
+				break
+			}
+		}
+		if next == nil {
+			break
+		}
+		leafDef = next
+	}
 
 	var predicate string
 	switch {
@@ -1157,6 +1183,22 @@ func checkDefaultPartitionDataConflict(childName string, parent *catalog.Table, 
 		return nil
 	}
 	synthCtx := *ctx
+	// Use a FRESH snapshot for the conflict scan. An ALTER TABLE … ATTACH
+	// PARTITION that blocked on a concurrent INSERT routing to this default
+	// (RowExclusiveLock on the default vs the attach's AccessExclusiveLock,
+	// design 0118-0079) is unblocked only after that INSERT's transaction
+	// commits — but the attaching statement's own snapshot was taken at
+	// statement start, before the wait, so it cannot see the just-committed
+	// rows. PostgreSQL's check_default_partition_contents scans under the latest
+	// snapshot; mirror that so the offending rows are found
+	// (partition-concurrent-attach perm 3). A fresh snapshot also sees the
+	// transaction's own uncommitted writes, so the synchronous CREATE/ATTACH
+	// paths are unaffected.
+	if ctx.TxnMgr != nil && ctx.Tx.Handle != 0 {
+		if fresh, serr := ctx.TxnMgr.SnapshotFor(ctx.Tx); serr == nil {
+			synthCtx.Snap = fresh
+		}
+	}
 	if err := op.Open(&synthCtx); err != nil {
 		op.Close()
 		return nil
@@ -1166,7 +1208,7 @@ func checkDefaultPartitionDataConflict(childName string, parent *catalog.Table, 
 	op.Close()
 	if hasRow {
 		return &ExecError{Code: "23P01", Pos: pos,
-			Message: fmt.Sprintf("updated partition constraint for default partition %q would be violated by some row", defPart.Name)}
+			Message: fmt.Sprintf("updated partition constraint for default partition %q would be violated by some row", leafDef.Name)}
 	}
 	return nil
 }

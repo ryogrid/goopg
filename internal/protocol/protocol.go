@@ -75,6 +75,12 @@ const (
 	MsgPortalSuspended    byte = 's'
 	MsgNoData             byte = 'n'
 	MsgEmptyQueryResponse byte = 'I'
+	// MsgNotificationResponse ('A') carries an asynchronous LISTEN/NOTIFY
+	// delivery: int32 source-backend PID, channel name (C-string), payload
+	// (C-string). Sent to a backend that has an active LISTEN on the channel,
+	// at a CommandComplete/ReadyForQuery boundary (NOTIFY's effects become
+	// visible at the notifying transaction's commit). See WriteNotificationResponse.
+	MsgNotificationResponse byte = 'A'
 )
 
 // Frontend message type bytes recognised so far. The full set is in

@@ -26,7 +26,21 @@ type indexOnlyScanOp struct {
 	// M0092-0007: embedded slot reused across every Next() call
 	// so we don't allocate a fresh MaterializedSlot per emission.
 	slot MaterializedSlot
+	// heapFetchCount, when non-nil, is incremented once per index entry
+	// whose heap page was NOT ALL_VISIBLE and therefore required a heap
+	// fetch — the EXPLAIN ANALYZE "Heap Fetches" tally (design 0118-0102).
+	// Set by maybeInstrument only under EXPLAIN ANALYZE; nil otherwise.
+	heapFetchCount *int64
+	// touchedBlocks records the heap blocks visited on the non-ALL_VISIBLE
+	// fallback path; for a TEMPORARY relation they are opportunistically pruned
+	// after the scan so a subsequent index-only scan reflects PG's prune-on-read
+	// (horizons.spec, M0118-0009). nil keys are never inserted.
+	touchedBlocks map[storage.BlockNumber]struct{}
 }
+
+// setHeapFetchCounter implements the heapFetchCounter interface so EXPLAIN
+// ANALYZE can surface this scan's heap-fetch count (design 0118-0102).
+func (o *indexOnlyScanOp) setHeapFetchCounter(c *int64) { o.heapFetchCount = c }
 
 func newIndexOnlyScanOp(p *planner.IndexOnlyScan) *indexOnlyScanOp {
 	return &indexOnlyScanOp{plan: p}
@@ -56,7 +70,27 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		}
 		return err
 	}
+	// PostgreSQL locks every index of the scanned relation in AccessShare, not
+	// only the one this scan reads (get_relation_info opens them all). M0118-0008
+	// (partition-drop-index-locking).
+	if err := ctx.acquireScanIndexReadLocksTxn(o.plan.Table); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.plan.Pos()
+		}
+		return err
+	}
 
+	// M0118-0009 (design 0118-0099): a hash index supports only equality, and PG
+	// takes a PAGE-grain predicate lock on the probed bucket (PredicateLockPage in
+	// hash.c) rather than a relation-grain lock — so a concurrent INSERT into a
+	// DIFFERENT bucket forms no rw-conflict (predicate-hash "reduced false
+	// positives"). For a hash index we therefore SKIP the relation-grain SIREAD
+	// here and instead take the bucket-grain lock once the probe key is encoded
+	// (below); the per-tuple heap reads also switch to conflict-out-only so they
+	// do not coarsen into a heap-page lock that would re-introduce the false
+	// positive. DeclaredHash marks an index created `USING hash` (Method stays
+	// "btree" since goopg builds it on the B-tree substrate).
+	isHashIdx := o.plan.Index != nil && o.plan.Index.DeclaredHash
 	// M0118-0001: a SERIALIZABLE index-only scan takes a relation-level SIREAD
 	// predicate lock on the heap relation, exactly like the seq-scan and
 	// (heap-fetching) index-scan paths. Acquired BEFORE the probe-bound lookups
@@ -65,7 +99,7 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	// probe a non-existent key first, then both INSERT it). Gated to
 	// SERIALIZABLE inside ssiRecordRelationRead; temp / matview relations are
 	// excluded as PredicateLockingNeededForRelation requires.
-	if o.plan.Table == nil || (!o.plan.Table.Temp && !o.plan.Table.IsMatView) {
+	if !isHashIdx && (o.plan.Table == nil || (!o.plan.Table.Temp && !o.plan.Table.IsMatView)) {
 		ssiRecordRelationRead(ctx, heapRel)
 	}
 
@@ -120,6 +154,14 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		}
 	}
 
+	// Hash-index equality probe: take the bucket-grain SIREAD on the index
+	// (design 0118-0099) in place of the relation-grain lock skipped above.
+	// loBytes is the encoded probe key (== hiBytes for the single-column
+	// equality a hash index supports). No-op outside SERIALIZABLE.
+	if isHashIdx && len(loBytes) > 0 {
+		ssiRecordHashBucketRead(ctx, heapRel.DBOid, o.plan.Index.OID, loBytes)
+	}
+
 	scanFn := func(key []byte, ptr storage.ItemPointer) (bool, error) {
 		// Fast path: ALL_VISIBLE → decode from key, zero heap reads.
 		if ctx.VM != nil && ctx.VM.AllVisible(heapRel, ptr.Block) {
@@ -132,12 +174,36 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 			return true, nil
 		}
 
-		// Fallback: heap fetch + HOT chain + MVCC.
+		// Fallback: heap fetch + HOT chain + MVCC. The page was not ALL_VISIBLE.
 		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: ptr.Block})
 		if err != nil {
 			return false, err
 		}
 		slot.RLock()
+		// Peek the index entry's root line pointer first. If it was reclaimed
+		// (LP_UNUSED / LP_DEAD) by a prior prune — the goopg analog of an index
+		// entry PG's kill_prior_tuple would have marked LP_DEAD — this entry
+		// resolves to no heap tuple: it costs no heap fetch and yields no row.
+		// Skipping it here is what drops "Heap Fetches" to 0 on a re-scan after a
+		// temp relation's deleted rows are pruned (horizons.spec, M0118-0009).
+		if rootID, idErr := storage.PageGetItemID(slot.Page(), ptr.Offset); idErr == nil &&
+			(rootID.Flags == storage.ItemIDUnused || rootID.Flags == storage.ItemIDDead) {
+			slot.RUnlock()
+			ctx.Pool.Unpin(slot)
+			return true, nil
+		}
+		// A genuine heap fetch — count it for EXPLAIN ANALYZE "Heap Fetches"
+		// (design 0118-0102), mirroring upstream's ioss_HeapFetches++ which fires
+		// per visited entry regardless of the eventual visibility verdict.
+		if o.heapFetchCount != nil {
+			*o.heapFetchCount++
+		}
+		if o.plan.Table != nil && o.plan.Table.Temp {
+			if o.touchedBlocks == nil {
+				o.touchedBlocks = make(map[storage.BlockNumber]struct{})
+			}
+			o.touchedBlocks[ptr.Block] = struct{}{}
+		}
 		tuple, actualSlot, found := followHOTChain(slot.Page(), ptr.Offset, ctx.Snap, ctx.Tx.XID, ctx.MultiXact)
 		// M0118-0001: SSI phantom conflict-out for an index-only-scanned tuple
 		// present at this TID but invisible because a concurrent transaction
@@ -172,7 +238,15 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 		// SIREAD already held (ssiRecordRelationRead above). The page RLock/pin is
 		// released above, so a non-nil error (reader closed a dangerous structure
 		// to an already-committed writer) propagates as a mid-statement 40001.
-		if serr := ssiRecordTupleRead(ctx, heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); serr != nil {
+		if isHashIdx {
+			// Hash bucket page lock already covers the phantom (above); a heap
+			// tuple SIREAD here would coarsen to a heap-page lock and re-introduce
+			// the different-bucket false positive. Keep conflict-out only so the
+			// write-before-read same-bucket edge still forms (design 0118-0099).
+			if serr := ssiConflictOutTupleRead(ctx, tuple.Header.Xmin, tuple.Header.Xmax); serr != nil {
+				return false, serr
+			}
+		} else if serr := ssiRecordTupleRead(ctx, heapRel, ptr.Block, actualSlot, tuple.Header.Xmin, tuple.Header.Xmax); serr != nil {
 			return false, serr
 		}
 		row, err := o.decodeRowFromHeap(tuple)
@@ -186,7 +260,68 @@ func (o *indexOnlyScanOp) Open(ctx *Context) error {
 	if err := tree.RangeScan(loBytes, hiBytes, scanFn); err != nil {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
+
+	// Prune-on-read for TEMPORARY relations (horizons.spec, M0118-0009). PG
+	// opportunistically prunes a heap page whenever a scan visits it; for a temp
+	// relation that prune uses the session-local horizon (GlobalVisTempRels), so
+	// rows the owning backend deleted in a committed statement are reclaimed even
+	// while another session holds an older snapshot — that session cannot see the
+	// temp table at all. Permanent relations are deliberately NOT pruned here:
+	// their reclamation flows through VACUUM at the global horizon. We do NOT set
+	// the VM ALL_VISIBLE bit, so a subsequent scan stays on this heap-checking
+	// fallback path and skips the now-LP_UNUSED entries (see the root-line-pointer
+	// peek above) instead of trusting the index key, which would resurrect the
+	// deleted rows.
+	o.pruneTouchedTempPages(ctx, heapRel)
 	return nil
+}
+
+// pruneTouchedTempPages opportunistically reclaims dead tuples on the heap
+// blocks this index-only scan fetched, for a TEMPORARY relation only, using the
+// session-local horizon. Mirrors vacuumCore's reclamation kernel
+// (storage.PageVacuumPrune + the LogHeapPruneOpt WAL hook / MarkDirty fallback)
+// but takes no relation lock and never touches the Visibility Map. Best-effort:
+// any error leaves the page untouched rather than failing the read.
+func (o *indexOnlyScanOp) pruneTouchedTempPages(ctx *Context, heapRel storage.RelFileNode) {
+	if len(o.touchedBlocks) == 0 || ctx.Pool == nil || ctx.TxnMgr == nil {
+		return
+	}
+	if o.plan.Table == nil || !o.plan.Table.Temp {
+		return
+	}
+	horizon := ctx.TxnMgr.OldestXminForProc(int32(ctx.Tx.Handle) - 1)
+	if horizon == storage.InvalidTransactionID {
+		return
+	}
+	logPrune := ctx.Pool.LogHeapPruneOpt()
+	for blk := range o.touchedBlocks {
+		slot, err := ctx.Pool.Pin(storage.BufferTag{Rel: heapRel, Block: blk})
+		if err != nil {
+			continue
+		}
+		page := slot.Page()
+		if storage.IsNew(page) {
+			ctx.Pool.Unpin(slot)
+			continue
+		}
+		slot.Lock()
+		pr, _, perr := storage.PageVacuumPrune(page, horizon)
+		if perr != nil || (len(pr.Redirects) == 0 && len(pr.Unused) == 0) {
+			slot.Unlock()
+			ctx.Pool.Unpin(slot)
+			continue
+		}
+		if logPrune != nil {
+			blkCopy := blk
+			_ = ctx.Pool.MarkDirtyChangeRecord(slot, func() (storage.LSN, error) {
+				return logPrune(heapRel, blkCopy, pr.Redirects, pr.Unused)
+			})
+		} else {
+			ctx.Pool.MarkDirty(slot)
+		}
+		slot.Unlock()
+		ctx.Pool.Unpin(slot)
+	}
 }
 
 func (o *indexOnlyScanOp) Next() (TupleSlot, error) {

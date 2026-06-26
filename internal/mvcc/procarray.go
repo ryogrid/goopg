@@ -15,6 +15,18 @@ const DefaultProcArraySize = 1024
 
 const defaultProcArraySize = DefaultProcArraySize
 
+// ReservedPreparedSlots is the number of high proc-array slots reserved for
+// detached prepared transactions (DetachToDedicatedSlot). Connections and
+// internal auto-assigned transactions only use the low region [0, ConnSlotCount),
+// so a parked prepared transaction's slot is never clobbered by a backend that
+// reuses a procNum. M0118-0009 (stats — cross-backend two-phase commit).
+const ReservedPreparedSlots = 64
+
+// ConnSlotCount is the number of proc-array slots available to connections and
+// internal auto-assigned transactions (the low region). The reserved prepared-
+// transaction region is [ConnSlotCount, DefaultProcArraySize). M0118-0009.
+const ConnSlotCount = DefaultProcArraySize - ReservedPreparedSlots
+
 // procSlot holds per-backend transaction state. Layout is fixed at 64 bytes.
 //
 //	offset  0: xid       (8 B) — write-XID; 0 = no active write-xact

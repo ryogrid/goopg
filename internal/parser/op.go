@@ -67,6 +67,10 @@ const (
 	OpContainedBy // a <@ b  (a is contained by b)
 	OpContains    // a @> b  (a contains b)
 	OpOverlap     // a && b  (a overlaps b)
+
+	// JSON accessor operators (M0118-0009, horizons enabler)
+	OpJSONGet     // a -> b   (json array element / object field, returns json)
+	OpJSONGetText // a ->> b  (json array element / object field as text)
 )
 
 // ParseUnaryOp converts the token text the parser emits
@@ -151,6 +155,10 @@ func ParseBinaryOp(s string) OpCode {
 		return OpContains
 	case "&&":
 		return OpOverlap
+	case "->":
+		return OpJSONGet
+	case "->>":
+		return OpJSONGetText
 	}
 	return OpUnknown
 }
@@ -230,6 +238,10 @@ func (o OpCode) String() string {
 		return "@>"
 	case OpOverlap:
 		return "&&"
+	case OpJSONGet:
+		return "->"
+	case OpJSONGetText:
+		return "->>"
 	}
 	return "<unknown>"
 }

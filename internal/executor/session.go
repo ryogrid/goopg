@@ -2,6 +2,7 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -49,6 +50,99 @@ type DDLDropUndoEntry struct {
 	SavepointDepth int // subxactStack depth at time of drop
 }
 
+// PendingIndexDrop records a non-CONCURRENTLY DROP INDEX issued inside an
+// explicit transaction whose catalog removal is deferred until COMMIT. Until the
+// dropping transaction commits, the index stays in the shared catalog so other
+// sessions still observe its pg_class row and the dropper's AccessExclusiveLock
+// (PG transactional-DDL visibility; partition-drop-index-locking isolation
+// spec). The recorded fields are everything ApplyPendingIndexDrops needs to
+// perform the real removal at commit (catalog + relfile + WAL + pg_class xmax).
+// M0118-0008.
+type PendingIndexDrop struct {
+	Name           parser.ObjectName   // catalog lookup key passed to Catalog.DropIndex
+	OID            uint32              // index relation OID (WAL + pg_class xmax)
+	Schema         string              // index schema (WAL payload)
+	IdxName        string              // bare index name (WAL payload)
+	Rel            storage.RelFileNode // physical relfile to invalidate + drop
+	SavepointDepth int                 // savepoint depth at drop time (for ROLLBACK TO cancel)
+}
+
+// PendingPartitionAttach records an ALTER TABLE … ATTACH PARTITION issued inside
+// an explicit transaction whose catalog registration is deferred until COMMIT.
+// Until the attaching transaction commits, the new partition is NOT registered in
+// the shared catalog, so a concurrent session does not see it and an INSERT
+// routing through the parent falls to the parent's DEFAULT partition (PG
+// transactional-DDL visibility: an uncommitted ATTACH is invisible to other
+// snapshots, exactly what the partition-concurrent-attach isolation spec needs to
+// make s2's insert route to the default and block on the default-partition lock).
+// The recorded fields are everything ApplyPendingPartitionAttaches needs to
+// perform the real registration at commit. In autocommit the attach stays
+// immediate. M0118-0008.
+type PendingPartitionAttach struct {
+	ParentOID      uint32                   // partitioned parent table OID
+	ChildOID       uint32                   // attached child table OID
+	Bounds         []catalog.PartitionBound // child relpartbound (nil if none computed)
+	SavepointDepth int                      // savepoint depth at attach time (ROLLBACK TO cancel)
+}
+
+// PendingInheritanceChange records an ALTER TABLE … {NO} INHERIT issued inside an
+// explicit transaction whose catalog mutation (register/unregister the parent↔child
+// inheritance link) is deferred until COMMIT. Until the altering transaction
+// commits the shared catalog keeps the OLD inheritance state, so a concurrent
+// session scanning the parent still expands to the pre-change child set (and a
+// child being un-inherited stays scanned, blocking on the AccessExclusiveLock the
+// altering session holds on it) — PG transactional-DDL visibility, the
+// alter-table-4 isolation spec. In autocommit the mutation stays immediate.
+// ApplyPendingInheritanceChanges replays the recorded change at commit. M0118-0008.
+type PendingInheritanceChange struct {
+	ParentOID      uint32 // inheritance parent table OID
+	ChildOID       uint32 // inheritance child table OID
+	NoInherit      bool   // true = NO INHERIT (unregister); false = INHERIT (register)
+	SavepointDepth int    // savepoint depth at statement time (ROLLBACK TO cancel)
+}
+
+// PendingTableDrop records a DROP TABLE issued inside an explicit transaction
+// whose catalog/relfile/WAL removal is deferred until COMMIT. Until the dropping
+// transaction commits, the table stays in the shared catalog so a concurrent
+// session still expands the parent's inheritance tree to include it and blocks on
+// the AccessExclusiveLock the dropper holds on it (PG transactional-DDL
+// visibility, alter-table-4 isolation spec perm 3: `DROP TABLE c1` while a
+// concurrent `SELECT SUM(a) FROM p` runs — the reader identifies c1 as a child
+// before locking it, waits behind the drop, then skips the now-vanished child).
+// Deferral is gated narrowly (see dropTableByRef): only a leaf table with no
+// partition/inheritance children, no pending-detach state, and no temp shadow —
+// so cascade/partition removal keeps its immediate, ordered behaviour. In
+// autocommit the removal stays immediate. ApplyPendingTableDrops replays the
+// recorded removal at commit. Like the DROP INDEX deferral (PendingIndexDrop),
+// the dropping session itself also keeps seeing the table until commit — goopg's
+// shared catalog has no per-session MVCC visibility — a known limitation the
+// spec never exercises (s1 does not reference c1 after dropping it). M0118-0008.
+type PendingTableDrop struct {
+	Name           parser.ObjectName // catalog lookup key passed to dropTableByRefImmediate
+	Table          *catalog.Table    // resolved table (carries OID/Schema/Name for removal)
+	SavepointDepth int               // savepoint depth at drop time (for ROLLBACK TO cancel)
+}
+
+// DeferredRoutineDrop records a DROP FUNCTION issued inside an explicit
+// transaction whose registry removal AND cumulative function-stats drop are
+// deferred until COMMIT. Until the dropping transaction commits, the routine
+// stays in the shared registry so a concurrent session still resolves and calls
+// it (PG transactional-DDL visibility, `stats` isolation spec: s1 BEGINs, drops
+// test_stat_func, and s2 must still SELECT test_stat_func() until s1 commits;
+// the function's pg_stat_get_function_* counters likewise survive until then).
+// ApplyDeferredRoutineDrops performs the real removal at commit; ROLLBACK simply
+// discards the entry (the routine was never removed). Like PendingTableDrop, the
+// dropping session itself also keeps seeing the function until commit — goopg's
+// shared catalog has no per-session MVCC visibility — a limitation the spec
+// never exercises (s1 does not call test_stat_func after dropping it); a
+// CREATE FUNCTION of the same signature in the same transaction is handled by
+// TakeDeferredRoutineDropMatching (the deferred drop is applied early so the
+// recreate proceeds). M0118-0009 (`stats`).
+type DeferredRoutineDrop struct {
+	Routine        *catalog.Routine
+	SavepointDepth int
+}
+
 // relPageSnapshot captures the full page contents of one relation before
 // a TRUNCATE so that ROLLBACK can restore them.
 type relPageSnapshot struct {
@@ -72,21 +166,27 @@ type SeqRestoreEntry struct {
 // BasicSession is a minimal Session implementation for the v0
 // executor path.
 type BasicSession struct {
-	isolation        mvcc.IsolationLevel
-	inTx             bool
-	tx               mvcc.Transaction
-	snap             mvcc.Snapshot
-	pendingDDL          []DDLUndoEntry      // DDL creates pending rollback
-	pendingRoutineDrops []*catalog.Routine  // routines dropped in current tx, for rollback
-	pendingTruncates    []TruncateUndoEntry // heap/index page snapshots for TRUNCATE rollback
-	pendingSeqRestores  []SeqRestoreEntry   // sequence counter restores for RESTART IDENTITY rollback
-	savepointDDLDrops   []DDLDropUndoEntry  // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
-	subxactStack        mvcc.SubxactStack   // savepoint stack (M0050-0004)
-	currentSubXid       storage.TransactionID // 0 = use top-level tx.XID
-	txFailed            bool                // in_failed_sql_transaction (25P02)
-	txnReadOnly         bool                // true while inside a READ ONLY transaction (M0097-0024)
-	deferredFKChecks    []DeferredFKCheck   // INITIALLY DEFERRED FK checks (M0096-0011)
-	activeQueryTables   map[uint32]bool     // OIDs of tables currently in active DML (M0097-0023)
+	isolation           mvcc.IsolationLevel
+	inTx                bool
+	tx                  mvcc.Transaction
+	snap                mvcc.Snapshot
+	pendingDDL          []DDLUndoEntry             // DDL creates pending rollback
+	pendingRoutineDrops []*catalog.Routine         // routines dropped in current tx, for rollback
+	pendingTruncates    []TruncateUndoEntry        // heap/index page snapshots for TRUNCATE rollback
+	pendingSeqRestores  []SeqRestoreEntry          // sequence counter restores for RESTART IDENTITY rollback
+	savepointDDLDrops   []DDLDropUndoEntry         // DROP TABLE inside savepoints, for ROLLBACK TO (M0097-0023)
+	pendingIndexDrops   []PendingIndexDrop         // DROP INDEX deferred to COMMIT (M0118-0008)
+	pendingPartAttaches []PendingPartitionAttach   // ATTACH PARTITION deferred to COMMIT (M0118-0008)
+	pendingInheritChng  []PendingInheritanceChange // ALTER TABLE {NO} INHERIT deferred to COMMIT (M0118-0008)
+	pendingTableDrops   []PendingTableDrop         // DROP TABLE deferred to COMMIT (M0118-0008 alter-table-4)
+	deferRoutineDrops   []DeferredRoutineDrop      // DROP FUNCTION deferred to COMMIT (M0118-0009 stats)
+	subxactStack        mvcc.SubxactStack          // savepoint stack (M0050-0004)
+	currentSubXid       storage.TransactionID      // 0 = use top-level tx.XID
+	txFailed            bool                       // in_failed_sql_transaction (25P02)
+	txnReadOnly         bool                       // true while inside a READ ONLY transaction (M0097-0024)
+	deferredFKChecks    []DeferredFKCheck          // INITIALLY DEFERRED FK checks (M0096-0011)
+	activeQueryTables   map[uint32]bool            // OIDs of tables currently in active DML (M0097-0023)
+	statsSnapshot       *funcStatSnapshot          // per-txn cumulative-stats snapshot (M0118-0009 stats_fetch_consistency)
 }
 
 // NewBasicSession constructs an explicit-transaction session state
@@ -126,6 +226,18 @@ func (s *BasicSession) BeginExplicitTransaction(tx mvcc.Transaction, snap mvcc.S
 	s.inTx = true
 }
 
+// RelocateTransaction updates the session's cached transaction handle after the
+// transaction has been moved to a dedicated proc slot (PREPARE TRANSACTION
+// detach). The XID, snapshot and pending-work state are unchanged; only the
+// Handle (and thus the proc slot the later COMMIT/ROLLBACK PREPARED finalises)
+// differs. No-op outside an open explicit transaction. M0118-0009.
+func (s *BasicSession) RelocateTransaction(tx mvcc.Transaction) {
+	if !s.inTx {
+		return
+	}
+	s.tx = tx
+}
+
 // OnTopLevelXIDAssigned is invoked by Context.MaterializeWriterXID
 // after the top-level transaction's XID is lazily materialised
 // (M0093 Design B). It keeps the session's cached tx.XID in sync
@@ -152,12 +264,36 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.pendingTruncates = nil
 	s.pendingSeqRestores = nil
 	s.savepointDDLDrops = nil
+	s.pendingIndexDrops = nil
+	s.pendingPartAttaches = nil
+	s.pendingInheritChng = nil
+	s.pendingTableDrops = nil
+	s.deferRoutineDrops = nil
 	s.subxactStack = mvcc.SubxactStack{}
 	s.currentSubXid = 0
 	s.txFailed = false
 	s.deferredFKChecks = nil
 	s.activeQueryTables = nil
+	// Discard the per-transaction cumulative-stats snapshot — PG's AtEOXact_PgStat
+	// drops the stats snapshot at every transaction boundary so the next
+	// transaction reads live values again. M0118-0009 (stats_fetch_consistency).
+	s.statsSnapshot = nil
 }
+
+// ensureStatsSnapshot returns the session's per-transaction cumulative-stats
+// snapshot, allocating it on first use. Used by fetchFuncStat to honour
+// stats_fetch_consistency = 'cache'/'snapshot'. M0118-0009.
+func (s *BasicSession) ensureStatsSnapshot() *funcStatSnapshot {
+	if s.statsSnapshot == nil {
+		s.statsSnapshot = &funcStatSnapshot{perObject: make(map[uint32]cachedFuncStat)}
+	}
+	return s.statsSnapshot
+}
+
+// ClearStatsSnapshot discards the per-transaction cumulative-stats snapshot,
+// forcing the next stat read to consult live shared values. Invoked by
+// pg_stat_clear_snapshot(). M0118-0009.
+func (s *BasicSession) ClearStatsSnapshot() { s.statsSnapshot = nil }
 
 // AddDeferredFKCheck queues a FK constraint to be checked at COMMIT time.
 // M0096-0011.
@@ -325,6 +461,189 @@ func (s *BasicSession) TakePendingDDLDrops() []DDLDropUndoEntry {
 	out := s.savepointDDLDrops
 	s.savepointDDLDrops = nil
 	return out
+}
+
+// AddPendingIndexDrop records a DROP INDEX whose catalog removal is deferred
+// until COMMIT (see PendingIndexDrop). M0118-0008.
+func (s *BasicSession) AddPendingIndexDrop(e PendingIndexDrop) {
+	s.pendingIndexDrops = append(s.pendingIndexDrops, e)
+}
+
+// TakePendingIndexDrops drains and returns the deferred DROP INDEX entries.
+// Called from the commit paths (ApplyPendingIndexDrops) to perform the real
+// removal; a full ROLLBACK simply lets EndExplicitTransaction discard them.
+// M0118-0008.
+func (s *BasicSession) TakePendingIndexDrops() []PendingIndexDrop {
+	out := s.pendingIndexDrops
+	s.pendingIndexDrops = nil
+	return out
+}
+
+// CancelPendingIndexDropsToDepth discards deferred DROP INDEX entries recorded
+// at savepoint depth >= depth, so ROLLBACK TO SAVEPOINT before a deferred DROP
+// INDEX does not still remove the index at the outer COMMIT. Mirrors
+// RollbackDDLDropsToDepth's convention. M0118-0008.
+func (s *BasicSession) CancelPendingIndexDropsToDepth(depth int) {
+	keep := s.pendingIndexDrops[:0]
+	for _, e := range s.pendingIndexDrops {
+		if e.SavepointDepth < depth {
+			keep = append(keep, e)
+		}
+	}
+	s.pendingIndexDrops = keep
+}
+
+// AddPendingPartitionAttach records an ATTACH PARTITION whose catalog
+// registration is deferred until COMMIT (see PendingPartitionAttach). M0118-0008.
+func (s *BasicSession) AddPendingPartitionAttach(e PendingPartitionAttach) {
+	s.pendingPartAttaches = append(s.pendingPartAttaches, e)
+}
+
+// TakePendingPartitionAttaches drains and returns the deferred ATTACH PARTITION
+// entries. Called from the commit paths (ApplyPendingPartitionAttaches) to
+// perform the real registration; a full ROLLBACK simply lets
+// EndExplicitTransaction discard them. M0118-0008.
+func (s *BasicSession) TakePendingPartitionAttaches() []PendingPartitionAttach {
+	out := s.pendingPartAttaches
+	s.pendingPartAttaches = nil
+	return out
+}
+
+// CancelPendingPartitionAttachesToDepth discards deferred ATTACH PARTITION
+// entries recorded at savepoint depth >= depth, so ROLLBACK TO SAVEPOINT before a
+// deferred ATTACH does not still register the partition at the outer COMMIT.
+// Mirrors CancelPendingIndexDropsToDepth. M0118-0008.
+func (s *BasicSession) CancelPendingPartitionAttachesToDepth(depth int) {
+	keep := s.pendingPartAttaches[:0]
+	for _, e := range s.pendingPartAttaches {
+		if e.SavepointDepth < depth {
+			keep = append(keep, e)
+		}
+	}
+	s.pendingPartAttaches = keep
+}
+
+// AddPendingInheritanceChange records an ALTER TABLE … {NO} INHERIT whose catalog
+// mutation is deferred until COMMIT (see PendingInheritanceChange). M0118-0008.
+func (s *BasicSession) AddPendingInheritanceChange(e PendingInheritanceChange) {
+	s.pendingInheritChng = append(s.pendingInheritChng, e)
+}
+
+// TakePendingInheritanceChanges drains and returns the deferred inheritance
+// changes. Called from the commit paths (ApplyPendingInheritanceChanges) to apply
+// the real catalog mutation, and from the rollback path (via
+// DiscardPendingInheritanceChanges) to discard them. M0118-0008.
+func (s *BasicSession) TakePendingInheritanceChanges() []PendingInheritanceChange {
+	out := s.pendingInheritChng
+	s.pendingInheritChng = nil
+	return out
+}
+
+// CancelPendingInheritanceChangesToDepth discards deferred inheritance changes
+// recorded at savepoint depth >= depth and returns the count discarded, so the
+// caller can drop the matching catalog pending-counter marks. Mirrors
+// CancelPendingPartitionAttachesToDepth. M0118-0008.
+func (s *BasicSession) CancelPendingInheritanceChangesToDepth(depth int) int {
+	keep := s.pendingInheritChng[:0]
+	cancelled := 0
+	for _, e := range s.pendingInheritChng {
+		if e.SavepointDepth < depth {
+			keep = append(keep, e)
+		} else {
+			cancelled++
+		}
+	}
+	s.pendingInheritChng = keep
+	return cancelled
+}
+
+// AddPendingTableDrop records a DROP TABLE whose catalog/relfile removal is
+// deferred until COMMIT (see PendingTableDrop). M0118-0008 (alter-table-4).
+func (s *BasicSession) AddPendingTableDrop(e PendingTableDrop) {
+	s.pendingTableDrops = append(s.pendingTableDrops, e)
+}
+
+// TakePendingTableDrops drains and returns the deferred DROP TABLE entries.
+// Called from the commit paths (ApplyPendingTableDrops) to perform the real
+// removal; a full ROLLBACK simply lets EndExplicitTransaction discard them.
+// M0118-0008 (alter-table-4).
+func (s *BasicSession) TakePendingTableDrops() []PendingTableDrop {
+	out := s.pendingTableDrops
+	s.pendingTableDrops = nil
+	return out
+}
+
+// CancelPendingTableDropsToDepth discards deferred DROP TABLE entries recorded at
+// savepoint depth >= depth, so ROLLBACK TO SAVEPOINT before a deferred DROP TABLE
+// does not still remove the table at the outer COMMIT. Mirrors
+// CancelPendingIndexDropsToDepth. M0118-0008 (alter-table-4).
+func (s *BasicSession) CancelPendingTableDropsToDepth(depth int) {
+	keep := s.pendingTableDrops[:0]
+	for _, e := range s.pendingTableDrops {
+		if e.SavepointDepth < depth {
+			keep = append(keep, e)
+		}
+	}
+	s.pendingTableDrops = keep
+}
+
+// AddDeferredRoutineDrop records a DROP FUNCTION whose registry removal and
+// cumulative-stats drop are deferred until COMMIT (see DeferredRoutineDrop).
+// M0118-0009 (`stats`).
+func (s *BasicSession) AddDeferredRoutineDrop(e DeferredRoutineDrop) {
+	s.deferRoutineDrops = append(s.deferRoutineDrops, e)
+}
+
+// TakeDeferredRoutineDrops drains and returns the deferred DROP FUNCTION
+// entries. The commit path (ApplyDeferredRoutineDrops) performs the real
+// removal; ROLLBACK calls this only to discard them (the routines were never
+// removed, so there is nothing to undo). M0118-0009 (`stats`).
+func (s *BasicSession) TakeDeferredRoutineDrops() []DeferredRoutineDrop {
+	out := s.deferRoutineDrops
+	s.deferRoutineDrops = nil
+	return out
+}
+
+// CancelDeferredRoutineDropsToDepth discards deferred DROP FUNCTION entries
+// recorded at savepoint depth >= depth, so ROLLBACK TO SAVEPOINT before a
+// deferred DROP FUNCTION does not still remove the function at the outer COMMIT.
+// Mirrors CancelPendingTableDropsToDepth. M0118-0009 (`stats`).
+func (s *BasicSession) CancelDeferredRoutineDropsToDepth(depth int) {
+	keep := s.deferRoutineDrops[:0]
+	for _, e := range s.deferRoutineDrops {
+		if e.SavepointDepth < depth {
+			keep = append(keep, e)
+		}
+	}
+	s.deferRoutineDrops = keep
+}
+
+// TakeDeferredRoutineDropMatching removes and returns the deferred DROP FUNCTION
+// entry whose target routine matches the given schema, name, and signature, or
+// nil if none. CREATE FUNCTION calls this so that a DROP-then-CREATE of the same
+// signature inside one transaction proceeds cleanly: the deferred drop is
+// applied early (the old routine removed now) instead of dropping the freshly
+// created routine at COMMIT. M0118-0009 (`stats`).
+func (s *BasicSession) TakeDeferredRoutineDropMatching(schema, name, signature string) *catalog.Routine {
+	for i, e := range s.deferRoutineDrops {
+		r := e.Routine
+		if r == nil {
+			continue
+		}
+		rSchema := r.Schema
+		if rSchema == "" {
+			rSchema = "public"
+		}
+		wantSchema := schema
+		if wantSchema == "" {
+			wantSchema = "public"
+		}
+		if strings.EqualFold(rSchema, wantSchema) && strings.EqualFold(r.Name, name) && r.Signature() == signature {
+			s.deferRoutineDrops = append(s.deferRoutineDrops[:i], s.deferRoutineDrops[i+1:]...)
+			return r
+		}
+	}
+	return nil
 }
 
 // MarkTableActive marks a table OID as currently being mutated by a DML

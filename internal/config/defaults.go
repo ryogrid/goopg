@@ -588,6 +588,40 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextSuset,
 		Scope:   ScopeSession | ScopeTransaction,
 	}))
+	// track_counts — controls collection of per-relation row-count statistics
+	// (n_tup_ins/upd/del, seq_scan, etc.). PGC_SUSET, boot on (guc_tables.c).
+	// Registered for the isolation `stats` spec, which toggles it; goopg's
+	// cumulative-statistics subsystem is being built incrementally
+	// (M0118-0009 stats enabler) and consults this flag as it grows.
+	r.MustRegister(NewVariable(Variable{
+		Name: "track_counts", Type: TypeBool, BootVal: "on",
+		Context: ContextSuset,
+		Scope:   ScopeSession | ScopeTransaction,
+	}))
+	// track_functions — controls collection of per-function call statistics.
+	// PGC_SUSET, enum {none, pl, all}, boot "none" (guc_tables.c). "pl" tracks
+	// only procedural-language functions, "all" also C/SQL functions.
+	// Registered for the isolation `stats` spec (M0118-0009 stats enabler).
+	r.MustRegister(NewVariable(Variable{
+		Name: "track_functions", Type: TypeEnum, BootVal: "none",
+		EnumOptions: []string{"none", "pl", "all"},
+		Context:     ContextSuset,
+		Scope:       ScopeSession | ScopeTransaction,
+	}))
+	// stats_fetch_consistency — controls how repeated accesses to cumulative
+	// statistics within a transaction behave: "none" re-fetches each access,
+	// "cache" caches the first access until end-of-xact / pg_stat_clear_snapshot,
+	// "snapshot" caches all of a database's stats on first access. PGC_USERSET,
+	// enum, boot "cache" (guc_tables.c). goopg fetches cumulative stats directly
+	// (no async collector / snapshot cache), so the value is recognised but only
+	// the externally observable behaviour the `stats` spec checks is honoured as
+	// the subsystem is built out (M0118-0009 stats enabler).
+	r.MustRegister(NewVariable(Variable{
+		Name: "stats_fetch_consistency", Type: TypeEnum, BootVal: "cache",
+		EnumOptions: []string{"none", "cache", "snapshot"},
+		Context:     ContextUserset,
+		Scope:       ScopeSession | ScopeTransaction,
+	}))
 	// default_with_oids — removed in PG12, retained as a recognised no-op.
 	r.MustRegister(NewVariable(Variable{
 		Name: "default_with_oids", Type: TypeBool, BootVal: "off",

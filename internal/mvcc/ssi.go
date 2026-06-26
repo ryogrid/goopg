@@ -130,6 +130,29 @@ type SerializableXact struct {
 	// aborted with 40001). M0118-0001 (read-only-anomaly-3).
 	ReadOnly   bool
 	Deferrable bool
+
+	// Prepared mirrors PostgreSQL's SXACT_FLAG_PREPARED. It is set when a
+	// SERIALIZABLE transaction passes its pre-commit dangerous-structure check
+	// at PREPARE TRANSACTION time (same-backend 2PC, M0118-0009) and stays open
+	// awaiting COMMIT/ROLLBACK PREPARED. A still-in-flight pivot that is already
+	// Prepared cannot be doomed by a later committer (the pivot is durably
+	// committed-to-disk in upstream and may yet COMMIT PREPARED), so that
+	// committer must abort itself instead — see
+	// preCommitCheckForSerializationFailureLocked (predicate.c line ~4756,
+	// "Canceled on commit attempt with conflict in from prepared pivot").
+	// Only set on the PREPARE path; a normal COMMIT finishes immediately and is
+	// gated out by FinishedAt, so it never needs this flag.
+	Prepared bool
+
+	// PrepareSeqNo is the dense sequence stamp assigned when Prepared is set,
+	// drawn from the same nextCommitSeqNo counter as FinishedAt/BeginAt/
+	// SnapshotSeqNo. It mirrors PostgreSQL's SERIALIZABLEXACT.prepareSeqNo
+	// (predicate.c). For a *committed* xact upstream tracks prepareSeqNo and
+	// commitSeqNo separately; goopg collapses both into FinishedAt for the
+	// already-passing specs, so prepareSeqNo(sx) returns FinishedAt once the xact
+	// commits and PrepareSeqNo only while it is prepared-but-not-committed.
+	// InvalidCommitSeqNo until PREPARE TRANSACTION. M0118-0009.
+	PrepareSeqNo CommitSeqNo
 }
 
 // IsActive reports whether the SerializableXact is still in-flight.

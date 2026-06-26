@@ -102,6 +102,49 @@ func deregisterWFG(myXID storage.TransactionID) {
 	wfgMu.Unlock()
 }
 
+// waitPgClassInplaceXID is the deadlock-aware wait that the intra-grant-inplace
+// pg_class virtual-tuple locks serialise on. goopg has no real pg_class heap
+// tuple, so GRANT/REVOKE (the ACL-change "xmax"), explicit rowmarks
+// (SELECT … FROM pg_class … FOR …), and the in-place relhasindex update
+// (ALTER TABLE ADD PRIMARY KEY → heap_inplace_update) all serialise on a
+// recorded writer XID instead of a heavyweight tuple lock. Before blocking on
+// blockingXID we register the edge ctx.Tx.XID→blockingXID in the shared
+// wait-for graph and walk it for a cycle; a cycle is a deadlock (e.g.
+// intra-grant-inplace permutation `b2 sfnku2 b1 grant1 addk2`, where GRANT
+// awaits the rowmark's xmax while ADD PRIMARY KEY blocks behind GRANT) and the
+// caller raises SQLSTATE 40P01. Otherwise we block on WaitForXID until the
+// holder commits or aborts. The caller must have materialised its own writer
+// XID so the edge it registers is observable by the peer closing the cycle.
+// Design 0118-0114 (intra-grant-inplace perms 7-8).
+func waitPgClassInplaceXID(ctx *Context, blockingXID storage.TransactionID) (deadlock bool, timeout *ExecError) {
+	if ctx == nil || ctx.TxnMgr == nil || ctx.Ctx == nil {
+		return false, nil
+	}
+	if blockingXID == storage.InvalidTransactionID || blockingXID == ctx.Tx.XID {
+		return false, nil
+	}
+	if ctx.Tx.XID != storage.InvalidTransactionID {
+		if registerWFGAndCheckCycle(ctx.Tx.XID, blockingXID) {
+			// We are the deadlock victim. Flag the statement so the wire
+			// dispatch layer aborts this transaction's XID in place on the
+			// failure path, unblocking the peer that is waiting on our
+			// catalog-tuple xmax immediately rather than at our explicit
+			// ROLLBACK. Design 0118-0115 (intra-grant-inplace perm 8).
+			ctx.DeadlockVictim = true
+			return true, nil
+		}
+		defer deregisterWFG(ctx.Tx.XID)
+	}
+	if werr := ctx.TxnMgr.WaitForXID(ctx.Ctx, blockingXID); werr != nil {
+		if ee := lockWaitTimeoutError(werr); ee != nil {
+			return false, ee
+		}
+		// Plain cancellation (connection close / statement timeout via ctx):
+		// fall through; the caller proceeds as if the holder finished.
+	}
+	return false, nil
+}
+
 // epqWait detects deadlock cycles via the wait-for graph (WFG), blocks on
 // the holder XID, then refreshes the snapshot. Returns true if a deadlock
 // cycle is confirmed — caller must immediately escalate to SQLSTATE 40001.
@@ -167,6 +210,55 @@ func epqRecheckVisible(ctx *Context, rel storage.RelFileNode, blk storage.BlockN
 		return false, nil // page read error → treat as not visible
 	}
 	return mvcc.TupleVisible(tup.Header, ctx.Snap, ctx.Tx.XID, ctx.MultiXact), nil
+}
+
+// epqXmaxSettled classifies a concurrent modifier xid for an EvalPlanQual
+// recheck under REPEATABLE READ / SERIALIZABLE, using the transaction manager
+// authoritatively rather than the (frozen) snapshot's InProgress set. It must be
+// called only AFTER epqWait has returned, i.e. xmax is no longer running.
+//
+// The trap it closes: a transaction that began AFTER our frozen RR/SSI snapshot
+// is absent from snap.InProgress, so the legacy "absent ⇒ aborted" shortcut
+// (`!snap.HasInProgress(xmax)`) misclassifies a concurrently-COMMITTED updater
+// as aborted and proceeds with our write — a silent lost update where PG raises
+// SQLSTATE 40001. Consulting the manager makes the decision robust to the timing
+// at which the RR/SSI snapshot was pinned. 0118-0105.
+//
+// Returns aborted=true when xmax rolled back (caller proceeds with its write);
+// committed=true when xmax committed (caller raises 40001); both false when xmax
+// is still active (caller retries). When no manager is wired (unit-test paths)
+// both are false so callers fall back to their legacy snapshot heuristic.
+func epqXmaxSettled(ctx *Context, xmax storage.TransactionID) (aborted, committed bool) {
+	if ctx.TxnMgr == nil {
+		return false, false
+	}
+	if ctx.TxnMgr.HasAbortedXID(xmax) {
+		return true, false
+	}
+	if ctx.TxnMgr.IsXIDActive(xmax) {
+		return false, false
+	}
+	return false, true
+}
+
+// epqSerializationErr builds the SQLSTATE 40001 error for an EvalPlanQual abort,
+// distinguishing a concurrent DELETE from a concurrent UPDATE by the original
+// tuple's CTID: goopg leaves a DELETE'd tuple's CTID at the initial
+// {InvalidBlockNumber,0} (stampOldCtid only runs on UPDATE), so an
+// InvalidBlockNumber block means the row was deleted. 0118-0105.
+func epqSerializationErr(ctx *Context, rel storage.RelFileNode, blk storage.BlockNumber, slot uint16, pos int) *ExecError {
+	errMsg := "could not serialize access due to concurrent update"
+	if sp, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk}); perr == nil {
+		sp.RLock()
+		if ot, gerr := storage.PageGetHeapTuple(sp.Page(), slot); gerr == nil {
+			if ot.Header.CTID.Block == storage.InvalidBlockNumber {
+				errMsg = "could not serialize access due to concurrent delete"
+			}
+		}
+		sp.RUnlock()
+		ctx.Pool.Unpin(sp)
+	}
+	return &ExecError{Code: "40001", Pos: pos, Message: errMsg}
 }
 
 // epqFollowHOT follows the HOT chain from (rel, blk, slot) to find the
@@ -598,6 +690,19 @@ type seqScanOp struct {
 	// scan THROUGH the parent locks the parent too); 0 for a direct leaf scan.
 	lockParentOID uint32
 
+	// skipIfVanished is set on an inheritance-child scan: if the child relation
+	// was dropped by a concurrent committed transaction while this scan waited
+	// on its lock, skip it (zero rows) instead of erroring. M0118-0008
+	// (alter-table-4 perm 3).
+	skipIfVanished bool
+
+	// inheritParentOID is the inheritance parent this child scan was expanded
+	// from (0 for a non-inheritance scan). After the child's lock is acquired
+	// (a concurrent ALTER on the child has committed) the child's column types
+	// are re-validated against the parent's; a mismatch raises the upstream
+	// "does not match parent's type" error. M0118-0008 (alter-table-4 perm 4).
+	inheritParentOID uint32
+
 	ctx  *Context
 	cols []catalog.Column
 
@@ -649,6 +754,11 @@ type seqScanOp struct {
 	// consume / Materialize before the next Next() invocation.
 	slot MaterializedSlot
 
+	// statReturned counts visible tuples this scan has yielded; recorded into
+	// cumulative relation stats (numscans + tuples_returned) at Close.
+	// M0118-0009 (`stats`, rung 6; design 0118-0128).
+	statReturned int64
+
 	// enumTypes[i] is non-nil when cols[i] is a user-defined enum type.
 	// Used to convert KindString heap datums to KindEnum for correct ORDER BY. M0097-enum.
 	enumTypes []*catalog.EnumType
@@ -661,13 +771,93 @@ type seqScanOp struct {
 // latencies. A future loop turns this into a tunable GUC.
 const seqScanLookahead storage.BlockNumber = 4
 
+// validateInheritedColumnTypes mirrors PostgreSQL's make_inh_translation_list
+// (optimizer/util/appendinfo.c): for every parent column it finds the child
+// column of the same name and verifies the declared types still match. goopg
+// only produces a mismatch via a concurrent `ALTER TABLE child ALTER COLUMN c
+// TYPE …` (CREATE TABLE … INHERITS copies the parent's column types), so this
+// fires exactly when upstream does — after the child's lock is acquired during
+// inheritance expansion. A mismatch raises ERRCODE_INVALID_COLUMN_DEFINITION
+// (42611) with the parent attribute name and the child relation name, matching
+// upstream. Types are compared by canonical class so that equivalent aliases
+// (integer/int4, double precision/float8) never trip a false positive on a
+// legitimate inheritance scan. M0118-0008 (alter-table-4 perm 4).
+func validateInheritedColumnTypes(im *catalog.InMemory, parent, child *catalog.Table) error {
+	for _, pc := range parent.Columns {
+		if pc.Dropped {
+			continue
+		}
+		var cc *catalog.Column
+		for i := range child.Columns {
+			if child.Columns[i].Dropped {
+				continue
+			}
+			if strings.EqualFold(child.Columns[i].Name, pc.Name) {
+				cc = &child.Columns[i]
+				break
+			}
+		}
+		if cc == nil {
+			// A missing inherited column is a distinct (rare) failure mode handled
+			// elsewhere; do not synthesize a type-mismatch error for it.
+			continue
+		}
+		if canonicalTypeClass(im, pc.Type) != canonicalTypeClass(im, cc.Type) {
+			return &ExecError{
+				Code:    "42611",
+				Message: fmt.Sprintf("attribute %q of relation %q does not match parent's type", pc.Name, child.Name),
+			}
+		}
+	}
+	return nil
+}
+
+// canonicalTypeClass reduces a catalog type to a comparison token so that
+// equivalent spellings collapse to the same value (integer/int4/int → "int4",
+// double precision/float8/float → "float8", …), resolving domains to their base
+// type first. The array flag is folded in; the typmod args are intentionally NOT
+// compared (a coarser check than PostgreSQL's exact atttypmod) so the only thing
+// that can trip validateInheritedColumnTypes is a genuine base-type change.
+func canonicalTypeClass(im *catalog.InMemory, t catalog.Type) string {
+	name := strings.ToLower(t.Name)
+	if im != nil {
+		name = strings.ToLower(im.ResolveColumnType(name))
+	}
+	switch name {
+	case "int", "integer", "int4", "serial", "serial4":
+		name = "int4"
+	case "smallint", "int2", "smallserial", "serial2":
+		name = "int2"
+	case "bigint", "int8", "bigserial", "serial8":
+		name = "int8"
+	case "real", "float4":
+		name = "float4"
+	case "double precision", "double", "float8", "float":
+		name = "float8"
+	case "decimal", "numeric":
+		name = "numeric"
+	case "varchar", "character varying":
+		name = "varchar"
+	case "char", "character", "bpchar":
+		name = "bpchar"
+	case "bool", "boolean":
+		name = "bool"
+	}
+	if t.IsArray {
+		name += "[]"
+	}
+	return name
+}
+
 func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 	return &seqScanOp{
-		schema:        p.Output(),
-		tbl:           p.Table,
-		pos:           p.Pos(),
-		cols:          p.Table.Columns,
-		lockParentOID: p.LockParentOID,
+		schema:           p.Output(),
+		tbl:              p.Table,
+		pos:              p.Pos(),
+		cols:             p.Table.Columns,
+		lockParentOID:    p.LockParentOID,
+		skipIfVanished:   p.SkipIfVanished,
+		inheritParentOID: p.InheritParentOID,
 	}
 }
 
@@ -711,6 +901,49 @@ func (o *seqScanOp) Open(ctx *Context) error {
 		return err
 	}
 	if err := ctx.acquireScanReadLockTxn(o.rel); err != nil {
+		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+			ee.Pos = o.pos
+		}
+		return err
+	}
+	// M0118-0008 (alter-table-4 perm 3): an inheritance-child scan that waited on
+	// this child's lock may find the child gone — a concurrent transaction
+	// committed a DROP of it while we blocked. Mirror PostgreSQL's
+	// try_table_open → NULL during inheritance expansion: skip the child (zero
+	// rows) rather than recreating its relfile (NBlocks would O_CREATE it) or
+	// erroring. Only inheritance children set skipIfVanished; a direct scan of a
+	// dropped table still errors elsewhere.
+	if o.skipIfVanished && o.tbl != nil {
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if _, exists := im.LookupTableByOID(o.tbl.OID); !exists {
+				o.nBlocks = 0
+				o.curBlock = 0
+				return nil
+			}
+			// M0118-0008 (alter-table-4 perm 4): now that we hold the child's lock
+			// (any concurrent ALTER on it has committed), re-validate the child's
+			// column types against the inheritance parent's, exactly as PostgreSQL's
+			// make_inh_translation_list does after locking each child during
+			// inheritance expansion (optimizer/util/appendinfo.c). A column whose
+			// type no longer matches the parent's (e.g. a concurrent
+			// `ALTER COLUMN a TYPE float`) raises ERRCODE_INVALID_COLUMN_DEFINITION.
+			if o.inheritParentOID != 0 {
+				if parent, ok2 := im.LookupTableByOID(o.inheritParentOID); ok2 {
+					if err := validateInheritedColumnTypes(im, parent, o.tbl); err != nil {
+						if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
+							ee.Pos = o.pos
+						}
+						return err
+					}
+				}
+			}
+		}
+	}
+	// PostgreSQL locks every index of a scanned relation in AccessShare too
+	// (get_relation_info opens all indexes regardless of the chosen scan method),
+	// so a bare SELECT on a leaf partition blocks a concurrent DROP INDEX behind
+	// the open reader. M0118-0008 (partition-drop-index-locking).
+	if err := ctx.acquireScanIndexReadLocksTxn(o.tbl); err != nil {
 		if ee, ok := err.(*ExecError); ok && ee.Pos == 0 {
 			ee.Pos = o.pos
 		}
@@ -796,6 +1029,13 @@ func (o *seqScanOp) Close() error {
 	if o.sctx != nil {
 		o.sctx.Release()
 		o.sctx = nil
+	}
+	// Record this sequential scan into cumulative relation stats: one scan that
+	// read statReturned visible tuples (mirrors pgstat_count_heap_scan +
+	// pgstat_count_heap_getnext). Non-transactional, gated by track_counts.
+	// M0118-0009 (`stats`, rung 6; design 0118-0128).
+	if o.ctx != nil && o.tbl != nil {
+		recordRelScan(o.ctx, o.tbl.OID, o.statReturned)
 	}
 	return nil
 }
@@ -1025,6 +1265,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			o.slot.hasCTID = true
 			o.slot.ctidBlock = uint32(o.curBlock)
 			o.slot.ctidOff = uint16(o.curSlot - 1)
+			o.statReturned++ // cumulative relation stats (tuples_returned)
 			return &o.slot, nil
 		}
 		o.releasePinned()
@@ -1145,7 +1386,14 @@ func (o *insertOp) Open(ctx *Context) error {
 	return o.child.Open(ctx)
 }
 
-func (o *insertOp) Close() error { return o.child.Close() }
+func (o *insertOp) Close() error {
+	// Cumulative relation stats: count inserted tuples (one live tuple each),
+	// gated by track_counts. M0118-0009 (`stats`, rung 6; design 0118-0128).
+	if shouldTrackCounts(o.ctx) {
+		relStats.recordInsert(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
+	}
+	return o.child.Close()
+}
 
 // Next runs the insert as a one-shot side effect on first call. With
 // RETURNING (M0100-0005) the inserted rows are accumulated in o.retRows
@@ -1283,7 +1531,10 @@ func (o *insertOp) Next() (TupleSlot, error) {
 
 		// BEFORE INSERT triggers (M0096-0012).
 		if len(o.plan.Table.Triggers) > 0 {
-			newRow, ok := fireTriggers(o.ctx, o.plan.Table, "before", "insert", nil, row)
+			newRow, ok, err := fireTriggers(o.ctx, o.plan.Table, "before", "insert", nil, row)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue // trigger returned NULL — skip this row
 			}
@@ -1333,6 +1584,17 @@ func (o *insertOp) Next() (TupleSlot, error) {
 					return nil, &ExecError{Code: "23514", Pos: o.plan.Pos(),
 						Message: fmt.Sprintf("no partition of relation %q found for row", o.plan.Table.Name)}
 				}
+				// Lock every intermediate partition along the routing path (esp. a
+				// sub-partitioned DEFAULT) so a concurrent ATTACH PARTITION that holds
+				// ACCESS EXCLUSIVE on the default blocks this routed INSERT — and vice
+				// versa — until one transaction commits, then the live catalog is
+				// re-checked. partition-concurrent-attach (design 0118-0079).
+				if lerr := lockRoutingPathPartitions(o.ctx, o.plan.Table, routedPart); lerr != nil {
+					if ee, ok := lerr.(*ExecError); ok && ee.Pos == 0 {
+						ee.Pos = o.plan.Pos()
+					}
+					return nil, lerr
+				}
 			}
 		}
 
@@ -1353,6 +1615,15 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			// Partition children may have columns in a different order (ATTACH
 			// PARTITION allows mismatched column order). M0096-0013.
 			partRow := remapRowForPartition(o.plan.Table.Columns, partTable.Columns, row)
+			// Default-partition constraint (M0118-0008, design 0118-0078): a row
+			// routed to (or directly inserted into) a default partition must not
+			// belong to a non-default sibling. After a concurrent ATTACH PARTITION
+			// commits, the new sibling is visible by the time this INSERT's lock is
+			// granted, so re-routing claims the row and we raise 23514 —
+			// partition-concurrent-attach.
+			if cerr := checkDefaultPartitionInsertConstraint(o.ctx, partTable, partTable.Columns, partRow, o.plan.Pos()); cerr != nil {
+				return nil, cerr
+			}
 			// NOT NULL check at the leaf partition level (PG names the child table).
 			for i, col := range partTable.Columns {
 				if col.NotNull && i < len(partRow) && partRow[i].IsNull() {
@@ -1386,12 +1657,25 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
 				return nil, serr
 			}
+			// SSI hash-index bucket conflict-in (design 0118-0099): forms the
+			// rw-edge against a SERIALIZABLE reader holding the inserted value's
+			// bucket SIREAD on a hash index.
+			if serr := ssiRecordHashIndexInsert(o.ctx, partTable, partTable.Columns, partRow, targetRel.DBOid); serr != nil {
+				return nil, serr
+			}
 			maintainUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, ptr)
 			o.appendInsertRetRow(row)
 			o.rowsAffected++
 			continue
 		}
 		// No matching partition found (or non-partitioned) — write to parent.
+		// If the target is itself a (non-partitioned) partition child, enforce its
+		// partition constraint — a direct INSERT into a leaf default partition must
+		// not write a row owned by a non-default sibling (design 0118-0078). No-op
+		// for non-partition-child tables (the walk exits when there is no parent).
+		if cerr := checkDefaultPartitionInsertConstraint(o.ctx, o.plan.Table, cols, row, o.plan.Pos()); cerr != nil {
+			return nil, cerr
+		}
 		if uerr := checkUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, o.plan.Pos()); uerr != nil {
 			return nil, uerr
 		}
@@ -1410,10 +1694,18 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		if serr := ssiRecordTupleWrite(o.ctx, targetRel, ptr.Block, ptr.Offset); serr != nil {
 			return nil, serr
 		}
+		// SSI hash-index bucket conflict-in (design 0118-0099): forms the rw-edge
+		// against a SERIALIZABLE reader holding the inserted value's bucket SIREAD
+		// on a hash index.
+		if serr := ssiRecordHashIndexInsert(o.ctx, o.plan.Table, cols, row, targetRel.DBOid); serr != nil {
+			return nil, serr
+		}
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)
 		// AFTER INSERT triggers (M0097-0140).
 		if len(o.plan.Table.Triggers) > 0 {
-			fireTriggers(o.ctx, o.plan.Table, "after", "insert", nil, row)
+			if _, _, err := fireTriggers(o.ctx, o.plan.Table, "after", "insert", nil, row); err != nil {
+				return nil, err
+			}
 		}
 		o.appendInsertRetRow(row)
 		o.rowsAffected++
@@ -1755,6 +2047,176 @@ func routeToPartitionDepth(parent *catalog.Table, row Row, im *catalog.InMemory,
 		}
 	}
 	return child, nil
+}
+
+// checkDefaultPartitionInsertConstraint enforces a DEFAULT partition's partition
+// constraint at INSERT time: a row written into (or routed to) a default partition
+// must NOT belong to any of its non-default sibling partitions. PostgreSQL attaches
+// this implicit constraint (the negation of every sibling's bounds) to the default
+// partition and checks it on every insert — direct or partition-routed — via
+// ExecPartitionCheck. goopg has no per-row partition-constraint expression, so we
+// reconstruct the check from the live catalog: walk the leaf's partition ancestry
+// and, for every ancestor that is a DEFAULT partition, re-route the row's
+// corresponding parent partition-key value through the parent's scheme; if it lands
+// on a non-default sibling, the default's constraint is violated.
+//
+// This is what makes partition-concurrent-attach fail correctly: when a concurrent
+// ALTER TABLE … ATTACH PARTITION commits while this INSERT is blocked on the default
+// partition's lock, the newly attached non-default sibling is visible by the time
+// the lock is granted, so the re-routing now claims the row and we raise 23514 —
+// exactly as PG (design 0118-0078). leafCols/leafRow are in the routed leaf's column
+// order; a partition child always carries every ancestor partition-key column by
+// name, so an ancestor's key resolves directly from a leaf-ordered row. Returns nil
+// when no default ancestor claims the row (the normal case, including ordinary
+// routing to a default that legitimately owns the value).
+func checkDefaultPartitionInsertConstraint(ctx *Context, leaf *catalog.Table, leafCols []catalog.Column, leafRow Row, pos int) error {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	cur := leaf
+	for guard := 0; cur != nil && cur.PartitionParentOID != 0 && guard < 8; guard++ {
+		parent, ok := im.LookupTableByOID(cur.PartitionParentOID)
+		if !ok || parent == nil {
+			break
+		}
+		if isDefaultPartitionChild(cur) {
+			sib := routePartitionKeyToImmediateChild(parent, leafCols, leafRow, im, ctx)
+			if sib != nil && sib.OID != cur.OID {
+				return &ExecError{Code: "23514", Pos: pos,
+					Message: fmt.Sprintf("new row for relation %q violates partition constraint", cur.Name)}
+			}
+		}
+		cur = parent
+	}
+	return nil
+}
+
+// lockRoutingPathPartitions takes a transaction-scoped ROW EXCLUSIVE lock on every
+// INTERMEDIATE partition the router descended through on the way from the named
+// INSERT target down to the routed leaf — i.e. every node strictly between the two.
+// The named target itself is already locked in insertOp.Open and the leaf is the
+// heap-write target (its locking is unchanged), so this fills in only the
+// in-between partitions, mirroring PostgreSQL, where ExecInsert opens every
+// partition a tuple is routed into in RowExclusiveLock.
+//
+// The load-bearing case is an intermediate DEFAULT partition that is itself
+// sub-partitioned (partition-concurrent-attach): an INSERT INTO tpart whose row
+// routes tpart → tpart_default → tpart_default_default must hold ROW EXCLUSIVE on
+// tpart_default so a concurrent ALTER TABLE tpart ATTACH PARTITION — which holds
+// ACCESS EXCLUSIVE on the default partition (design 0118-0076) — blocks it until
+// the attach commits. Once the lock is granted, the just-committed sibling is
+// visible in the live catalog, so checkDefaultPartitionInsertConstraint re-routes
+// the row onto it and raises 23514 (perm 1/2). Symmetrically, when the INSERT
+// commits first, ATTACH's AccessExclusive acquire on the default waits behind this
+// ROW EXCLUSIVE until the INSERT's transaction ends, then the attach-side re-scan
+// (checkDefaultPartitionDataConflict) finds the rows and raises 23P01 (perm 3).
+//
+// RowExclusive is self-compatible and conflicts only with DDL-grade lock modes, so
+// ordinary concurrent partitioned INSERTs never block each other. A single-level
+// partitioned table (leaf's parent IS the named target) has no intermediates, so
+// this is a no-op there. M0118-0008 (design 0118-0079).
+func lockRoutingPathPartitions(ctx *Context, named, leaf *catalog.Table) error {
+	im, ok := ctx.Catalog.(*catalog.InMemory)
+	if !ok || named == nil || leaf == nil || leaf.PartitionParentOID == 0 {
+		return nil
+	}
+	cur, found := im.LookupTableByOID(leaf.PartitionParentOID)
+	for guard := 0; found && cur != nil && cur.OID != named.OID && guard < 8; guard++ {
+		if err := ctx.acquireWriteLockTxn(ctx.Catalog.RelFileNode(cur)); err != nil {
+			return err
+		}
+		if cur.PartitionParentOID == 0 {
+			break
+		}
+		cur, found = im.LookupTableByOID(cur.PartitionParentOID)
+	}
+	return nil
+}
+
+// isDefaultPartitionChild reports whether t is a DEFAULT partition.
+func isDefaultPartitionChild(t *catalog.Table) bool {
+	for _, pb := range t.PartitionBounds {
+		if pb.IsDefault {
+			return true
+		}
+	}
+	return false
+}
+
+// routePartitionKeyToImmediateChild routes a row to the IMMEDIATE partition child
+// of parent (no recursion into sub-partitions), reading parent's partition-key
+// columns by NAME from leafCols/leafRow. Returns nil for unsupported key shapes
+// (expression keys, HASH) so the caller never raises a false-positive constraint
+// violation.
+func routePartitionKeyToImmediateChild(parent *catalog.Table, leafCols []catalog.Column, leafRow Row, im *catalog.InMemory, ctx *Context) *catalog.Table {
+	if len(parent.PartitionKey) == 0 {
+		return nil // expression-key partitioning: out of scope, no false positive
+	}
+	resolve := func(name string) (Datum, bool) {
+		for idx, c := range leafCols {
+			if strings.EqualFold(c.Name, name) && idx < len(leafRow) {
+				return leafRow[idx], true
+			}
+		}
+		return NullDatum, false
+	}
+	switch parent.PartitionMethod {
+	case "RANGE":
+		keyStrs := make([]string, 0, len(parent.PartitionKey))
+		for _, kc := range parent.PartitionKey {
+			d, ok := resolve(kc)
+			if !ok {
+				return nil
+			}
+			keyStrs = append(keyStrs, partitionKeyDatumToRangeStr(d))
+		}
+		return im.FindRangePartitionForDatums(parent.OID, keyStrs)
+	case "LIST":
+		d, ok := resolve(parent.PartitionKey[0])
+		if !ok {
+			return nil
+		}
+		return im.FindPartitionForValue(parent.OID, partitionKeyDatumToListStr(d))
+	}
+	return nil
+}
+
+// partitionKeyDatumToRangeStr formats a datum the way FindRangePartitionForDatums
+// expects (mirrors the RANGE arm of routeToPartitionDepth).
+func partitionKeyDatumToRangeStr(d Datum) string {
+	switch d.Kind {
+	case KindInt:
+		return fmt.Sprintf("%d", d.Int)
+	case KindString, KindNumeric:
+		return d.StringValue()
+	default:
+		if d.IsNull() {
+			return "null"
+		}
+		return d.Format()
+	}
+}
+
+// partitionKeyDatumToListStr formats a datum the way FindPartitionForValue expects
+// (mirrors the LIST arm of routeToPartitionDepth).
+func partitionKeyDatumToListStr(d Datum) string {
+	switch d.Kind {
+	case KindInt:
+		return fmt.Sprintf("%d", d.Int)
+	case KindString:
+		return d.StringValue()
+	case KindBool:
+		if d.Int != 0 {
+			return "true"
+		}
+		return "false"
+	default:
+		if d.IsNull() {
+			return "null"
+		}
+		return d.Format()
+	}
 }
 
 // extractScanAndPredicate walks an Update/Delete child plan and pulls
@@ -2617,7 +3079,14 @@ func (o *updateOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *updateOp) Close() error { return nil }
+func (o *updateOp) Close() error {
+	// Cumulative relation stats: count updated tuples (each leaves a dead tuple;
+	// goopg has no HOT update). Gated by track_counts. M0118-0009 (`stats`, rung 6).
+	if shouldTrackCounts(o.ctx) {
+		relStats.recordUpdate(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
+	}
+	return nil
+}
 
 // updateViaIndex uses the B-tree to find the tuple to update (O(log n))
 // instead of scanning all pages. Falls back to the path in Next() when
@@ -2767,7 +3236,10 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		// actually be written. M0100-0005-merge-delete-fix.
 		trigFiredViaIdx := false
 		if len(idxTbl.Triggers) > 0 && !idxRowHasConcurrentXmax(o.ctx, rel, pu.blk, pu.slot) {
-			retRow, ok := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue // RETURN NULL — skip this row
 			}
@@ -2847,6 +3319,21 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 					visible, _ := epqRecheckVisible(o.ctx, rel, pu.blk, pu.slot)
 					if visible {
+						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+							// RR/SSI: classify xmax authoritatively, not by snapshot
+							// membership — a committer that started after our frozen
+							// snapshot is absent from snap.InProgress (0118-0105).
+							aborted, committed := epqXmaxSettled(o.ctx, xmax)
+							if aborted {
+								epqDoUpdate = true
+								continue
+							}
+							if committed {
+								return nil, epqSerializationErr(o.ctx, rel, pu.blk, pu.slot, o.plan.Pos())
+							}
+							continue // still active; retry
+						}
+						// RC (or no manager): legacy snapshot heuristic.
 						// xmax aborted; row still exists at original slot.
 						if !o.ctx.Snap.HasInProgress(xmax) {
 							// M0100-0005: mark as do-update and retry so the
@@ -2949,7 +3436,11 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 					trigFiredViaIdx = true
 					s.Unlock()
 					o.ctx.Pool.Unpin(s)
-					retRow, trigOK := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+					retRow, trigOK, trigErr := fireTriggers(o.ctx, idxTbl, "before", "update", pu.oldRow, pu.newRow)
+					if trigErr != nil {
+						// s already unlocked/unpinned above before firing.
+						return nil, trigErr
+					}
 					if !trigOK {
 						// RETURN NULL — skip this row
 						epqSkip = true
@@ -3121,7 +3612,9 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 			}
 			// AFTER UPDATE triggers (M0097-0140).
 			if len(idxTbl.Triggers) > 0 {
-				fireTriggers(o.ctx, idxTbl, "after", "update", pu.oldRow, pu.newRow)
+				if _, _, err := fireTriggers(o.ctx, idxTbl, "after", "update", pu.oldRow, pu.newRow); err != nil {
+					return nil, err
+				}
 			}
 			o.appendUpdateRetRow(pu.newRow)
 			o.rowsAffected++
@@ -3238,7 +3731,7 @@ func (o *updateOp) Next() (TupleSlot, error) {
 		if isInheritChild {
 			scanPred = nil
 		}
-		if err := scanMatching(o.ctx, scanRel, scanCols, scanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
+		if err := scanMatching(o.ctx, scanRel, scanTbl.OID, scanCols, scanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
 			// Clear multi-column subquery cache so each row gets a fresh evaluation.
 			clear(o.ctx.MultiAssignSubqCache)
 			evalRow := row
@@ -3328,33 +3821,26 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					}
 					visible, _ := epqRecheckVisible(o.ctx, captureRel, writeBlk, writeSlot)
 					if visible {
+						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+							// RR/SSI: classify xmax authoritatively, not by snapshot
+							// membership — a committer that started after our frozen
+							// snapshot is absent from snap.InProgress (0118-0105).
+							aborted, committed := epqXmaxSettled(o.ctx, xmax)
+							if aborted {
+								break // xmax aborted; row unchanged
+							}
+							if committed {
+								// frozen snapshot is stale; serialize-fail.
+								return epqSerializationErr(o.ctx, captureRel, writeBlk, writeSlot, o.plan.Pos())
+							}
+							continue // still active; retry
+						}
+						// RC (or no manager): legacy snapshot heuristic.
 						if !o.ctx.Snap.HasInProgress(xmax) {
 							break // xmax aborted; row unchanged
 						}
-						// RR/SSI: snapshot is frozen at BEGIN; HasInProgress may still
-						// return true for a xmax that has since settled globally.
-						if o.ctx.TxnMgr != nil {
-							if o.ctx.TxnMgr.HasAbortedXID(xmax) {
-								break // xmax globally aborted; row unchanged
-							}
-							if !o.ctx.TxnMgr.IsXIDActive(xmax) {
-								// xmax committed; frozen snapshot is stale. Raise 40001.
-								errMsg := "could not serialize access due to concurrent update"
-								if sp, perr := o.ctx.Pool.Pin(storage.BufferTag{Rel: captureRel, Block: writeBlk}); perr == nil {
-									sp.RLock()
-									if ot, gerr := storage.PageGetHeapTuple(sp.Page(), writeSlot); gerr == nil {
-										ctid := ot.Header.CTID
-										// goopg initial CTID is {InvalidBlockNumber,0}; stampOldCtid
-										// only runs on UPDATE. InvalidBlockNumber ⇒ deleted.
-										if ctid.Block == storage.InvalidBlockNumber {
-											errMsg = "could not serialize access due to concurrent delete"
-										}
-									}
-									sp.RUnlock()
-									o.ctx.Pool.Unpin(sp)
-								}
-								return &ExecError{Code: "40001", Pos: o.plan.Pos(), Message: errMsg}
-							}
+						if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
+							break // xmax globally aborted; row unchanged
 						}
 						continue
 					}
@@ -3411,7 +3897,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					continue
 				}
 				if len(scanTbl.Triggers) > 0 {
-					ret, ok := fireTriggers(o.ctx, scanTbl, "before", "update", oldRow, newRow)
+					ret, ok, err := fireTriggers(o.ctx, scanTbl, "before", "update", oldRow, newRow)
+					if err != nil {
+						return err
+					}
 					if !ok {
 						return nil // RETURN NULL — skip row
 					}
@@ -3470,7 +3959,10 @@ func (o *updateOp) Next() (TupleSlot, error) {
 			scanTblForTrig = tbl
 		}
 		if !pu.beforeFired && len(scanTblForTrig.Triggers) > 0 {
-			retRow, ok := fireTriggers(o.ctx, scanTblForTrig, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggers(o.ctx, scanTblForTrig, "before", "update", pu.oldRow, pu.newRow)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue // RETURN NULL — skip this row
 			}
@@ -3532,19 +4024,30 @@ func (o *updateOp) Next() (TupleSlot, error) {
 					// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 					visible, _ := epqRecheckVisible(o.ctx, puRel, pu.blk, pu.slot)
 					if visible {
-						// xmax aborted; row still exists.
+						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+							// RR/SSI: classify xmax authoritatively, not by snapshot membership —
+							// a committer that started after our frozen snapshot is absent from
+							// snap.InProgress (0118-0105).
+							aborted, committed := epqXmaxSettled(o.ctx, xmax)
+							if aborted {
+								epqDoUpdateSeq = true
+								continue // bypass EPQ on next iter; update code executes
+							}
+							if committed {
+								return nil, epqSerializationErr(o.ctx, puRel, pu.blk, pu.slot, o.plan.Pos())
+							}
+							continue // still active; retry
+						}
+						// RC (or no manager): legacy snapshot heuristic.
 						if !o.ctx.Snap.HasInProgress(xmax) {
 							epqDoUpdateSeq = true
 							continue // bypass EPQ on next iter; update code executes
 						}
-						// M0100-0011: RR/Serializable firstSnap is frozen at BEGIN;
-						// HasInProgress may still return true for an XID that has
-						// since aborted. Confirm via the manager's global abort list.
 						if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
 							epqDoUpdateSeq = true
-							continue
+							continue // bypass EPQ on next iter; update code executes
 						}
-						continue // still in-progress; retry
+						continue
 					}
 					// Concurrent tx committed — row was updated or deleted.
 					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
@@ -3655,7 +4158,12 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				// the EPQ refetch so OLD reflects the concurrent updater's
 				// committed changes.
 				if isCrossPartitionMove && pu.scanTbl != nil && len(pu.scanTbl.Triggers) > 0 {
-					_, ok := fireTriggers(o.ctx, pu.scanTbl, "before", "delete", pu.oldRow, nil)
+					_, ok, err := fireTriggers(o.ctx, pu.scanTbl, "before", "delete", pu.oldRow, nil)
+					if err != nil {
+						s.Unlock()
+						o.ctx.Pool.Unpin(s)
+						return nil, err
+					}
 					if !ok {
 						// RETURN NULL — suppress the row.
 						s.Unlock()
@@ -3780,7 +4288,9 @@ func (o *updateOp) Next() (TupleSlot, error) {
 				scanTblForAfterTrig = tbl
 			}
 			if len(scanTblForAfterTrig.Triggers) > 0 {
-				fireTriggers(o.ctx, scanTblForAfterTrig, "after", "update", pu.oldRow, pu.newRow)
+				if _, _, err := fireTriggers(o.ctx, scanTblForAfterTrig, "after", "update", pu.oldRow, pu.newRow); err != nil {
+					return nil, err
+				}
 			}
 			// Use parent-aligned retRow for RETURNING when available (inheritance
 			// children store a remapped row so RETURNING exprs work correctly). M0097-0078.
@@ -3824,6 +4334,99 @@ func newDeleteOp(p *planner.Delete) (*deleteOp, error) {
 		return nil, err
 	}
 	return &deleteOp{plan: p, scan: scan, pred: pred, idxScan: idxScan}, nil
+}
+
+// tryPgClassCatalogDelete handles `DELETE FROM pg_class WHERE { relname = '<rel>'
+// | oid = <n> }` as a transaction-deferred table drop (intra-grant-inplace perm
+// 10). PostgreSQL's heap_delete on the pg_class tuple stamps its delete xmax and
+// keeps the row visible until the deleting transaction commits; a concurrent
+// rowmark or in-place updater waits on that xmax, then finds the tuple gone once
+// the delete commits. goopg has no pg_class heap, so we record the deleting
+// transaction's writer XID as the pg_class delete xmax (a concurrent
+// SELECT … FOR UPDATE waits on it via waitTablePendingDrop) and defer the actual
+// catalog removal to COMMIT (the relation stays visible to other sessions until
+// then). Returns handled=true when the delete targeted pg_class and was applied
+// (or matched no live relation); false to fall through to the generic delete.
+// Design 0118-0117.
+func (o *deleteOp) tryPgClassCatalogDelete() (bool, error) {
+	if o.plan.Table == nil || o.plan.Table.OID != catalog.RelationRelationId {
+		return false, nil
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return false, nil
+	}
+	// Deferral requires an explicit transaction block — outside one (autocommit)
+	// no spec exercises this, so fall through to the generic (no-op) path rather
+	// than dropping the relation out from under the virtual catalog.
+	bsess, isBasic := o.ctx.Session.(*BasicSession)
+	if !isBasic || !bsess.InExplicitTransaction() {
+		return false, nil
+	}
+	oid, ok := o.pgClassDeleteTargetOID()
+	if !ok {
+		// Unsupported predicate shape, or the relname resolved to no relation:
+		// the delete matches no row. Treat as handled (0 rows) so we do not run
+		// the generic heap scan against the virtual catalog.
+		return true, nil
+	}
+	tbl, found := im.LookupTableByOID(oid)
+	if !found || tbl == nil {
+		return true, nil // already gone → 0 rows affected
+	}
+	if err := o.ctx.MaterializeWriterXID(); err != nil {
+		return false, err
+	}
+	// Record the pg_class delete xmax BEFORE deferring so a concurrent rowmark
+	// that records itself and then waits (waitTablePendingDrop) observes our XID.
+	im.SetTablePendingDropXID(tbl.OID, uint32(o.ctx.Tx.XID))
+	bsess.AddPendingTableDrop(PendingTableDrop{
+		Name:           parser.ObjectName{Schema: tbl.Schema, Name: tbl.Name},
+		Table:          tbl,
+		SavepointDepth: bsess.SavepointDepth(),
+	})
+	o.rowsAffected++
+	return true, nil
+}
+
+// pgClassDeleteTargetOID extracts the relation OID targeted by a single
+// `relname = '<name>'` or `oid = <n>` equality predicate over pg_class. Returns
+// ok=false for any other shape, or when a relname does not resolve to a live
+// relation. Design 0118-0117 (intra-grant-inplace perm 10).
+func (o *deleteOp) pgClassDeleteTargetOID() (uint32, bool) {
+	bo, ok := o.pred.(*planner.BinaryOp)
+	if !ok || bo.Op != parser.OpEq {
+		return 0, false
+	}
+	cr, ok := bo.Left.(*planner.ColumnRef)
+	constExpr := bo.Right
+	if !ok {
+		if cr, ok = bo.Right.(*planner.ColumnRef); !ok {
+			return 0, false
+		}
+		constExpr = bo.Left
+	}
+	cols := o.plan.Table.Columns
+	if cr.Index < 0 || cr.Index >= len(cols) {
+		return 0, false
+	}
+	d, err := evalExpr(constExpr, nil, o.ctx)
+	if err != nil || d.IsNull() {
+		return 0, false
+	}
+	switch strings.ToLower(cols[cr.Index].Name) {
+	case "oid":
+		if d.Kind == KindInt && d.Int > 0 {
+			return uint32(d.Int), true
+		}
+	case "relname":
+		if name := d.StringValue(); name != "" {
+			if tbl, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Name: name}); ok && tbl != nil {
+				return tbl.OID, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func (o *deleteOp) Schema() planner.Schema { return o.plan.ReturningSchema }
@@ -3879,7 +4482,14 @@ func (o *deleteOp) Open(ctx *Context) error {
 	return nil
 }
 
-func (o *deleteOp) Close() error { return nil }
+func (o *deleteOp) Close() error {
+	// Cumulative relation stats: count deleted tuples (each removes a live tuple
+	// and produces a dead one). Gated by track_counts. M0118-0009 (`stats`, rung 6).
+	if shouldTrackCounts(o.ctx) {
+		relStats.recordDelete(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
+	}
+	return nil
+}
 
 func (o *deleteOp) Next() (TupleSlot, error) {
 	if o.done {
@@ -3902,6 +4512,17 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		return o.deleteWithUsing()
 	}
 	o.done = true
+	// intra-grant-inplace perm 10: `DELETE FROM pg_class WHERE relname = '<rel>'`
+	// is a virtual-catalog tuple delete. goopg serves pg_class from the virtual
+	// builder (no heap), so the generic scan below would match nothing; handle it
+	// here as a transaction-deferred table drop that records the pg_class delete
+	// xmax a concurrent rowmark (SELECT … FROM pg_class … FOR UPDATE) waits on.
+	// Design 0118-0117.
+	if handled, herr := o.tryPgClassCatalogDelete(); herr != nil {
+		return nil, herr
+	} else if handled {
+		return nil, EOF
+	}
 	// M0093: DELETE is unconditionally a write — materialise the
 	// transaction's XID before the scan so foreign-lock checks see
 	// the real XID.
@@ -3958,7 +4579,7 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 		if isDelInheritChild {
 			delScanPred = nil // apply predicate manually after row remapping
 		}
-		if err := scanMatching(o.ctx, scanRel, scanTbl.Columns, delScanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
+		if err := scanMatching(o.ctx, scanRel, scanTbl.OID, scanTbl.Columns, delScanPred, func(blk storage.BlockNumber, slot uint16, row Row) error {
 			var retRow Row
 			if isDelInheritChild {
 				parentAligned := remapChildRowToParent(row, delInheritColMap)
@@ -4010,19 +4631,25 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					}
 					visible, _ := epqRecheckVisible(o.ctx, captureRel, deleteBlk, deleteSlot)
 					if visible {
+						if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+							// RR/SSI: classify xmax authoritatively, not by snapshot membership —
+							// a committer that started after our frozen snapshot is absent from
+							// snap.InProgress (0118-0105).
+							aborted, committed := epqXmaxSettled(o.ctx, xmax)
+							if aborted {
+								break // xmax aborted; row unchanged, proceed with delete
+							}
+							if committed {
+								return epqSerializationErr(o.ctx, captureRel, deleteBlk, deleteSlot, o.plan.Pos())
+							}
+							continue // still active; retry
+						}
+						// RC (or no manager): legacy snapshot heuristic.
 						if !o.ctx.Snap.HasInProgress(xmax) {
 							break // xmax aborted; row unchanged, proceed with delete
 						}
-						// RR/SSI: snapshot frozen at BEGIN; check global state.
-						if o.ctx.TxnMgr != nil {
-							if o.ctx.TxnMgr.HasAbortedXID(xmax) {
-								break // xmax globally aborted; row unchanged
-							}
-							if !o.ctx.TxnMgr.IsXIDActive(xmax) {
-								// xmax committed; frozen snapshot is stale. Raise 40001.
-								return &ExecError{Code: "40001", Pos: o.plan.Pos(),
-									Message: "could not serialize access due to concurrent update"}
-							}
+						if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
+							break // xmax aborted; row unchanged, proceed with delete
 						}
 						continue
 					}
@@ -4053,7 +4680,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 					trigTbl = tbl
 				}
 				if len(trigTbl.Triggers) > 0 {
-					_, ok := fireTriggers(o.ctx, trigTbl, "before", "delete", cloneRow(deleteRow), nil)
+					_, ok, err := fireTriggers(o.ctx, trigTbl, "before", "delete", cloneRow(deleteRow), nil)
+					if err != nil {
+						return err
+					}
 					if !ok {
 						return nil // trigger returned NULL — skip deletion
 					}
@@ -4076,7 +4706,10 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 			trigTbl = tbl
 		}
 		if !v.beforeFired && len(trigTbl.Triggers) > 0 {
-			_, ok := fireTriggers(o.ctx, trigTbl, "before", "delete", v.row, nil)
+			_, ok, err := fireTriggers(o.ctx, trigTbl, "before", "delete", v.row, nil)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue // trigger returned NULL — skip deletion
 			}
@@ -4139,19 +4772,30 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				// M0100-0004: EPQ chain-following for RC; 40001 for RR.
 				visible, _ := epqRecheckVisible(o.ctx, victimRel, v.blk, v.slot)
 				if visible {
-					// xmax aborted; row still exists.
+					if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted && o.ctx.TxnMgr != nil {
+						// RR/SSI: classify xmax authoritatively, not by snapshot membership —
+						// a committer that started after our frozen snapshot is absent from
+						// snap.InProgress (0118-0105).
+						aborted, committed := epqXmaxSettled(o.ctx, xmax)
+						if aborted {
+							epqDoDelete = true
+							continue // bypass EPQ on next iter; delete code executes
+						}
+						if committed {
+							return nil, epqSerializationErr(o.ctx, victimRel, v.blk, v.slot, o.plan.Pos())
+						}
+						continue // still active; retry
+					}
+					// RC (or no manager): legacy snapshot heuristic.
 					if !o.ctx.Snap.HasInProgress(xmax) {
 						epqDoDelete = true
 						continue // bypass EPQ on next iter; delete code executes
 					}
-					// M0100-0011: RR/Serializable firstSnap is frozen at BEGIN;
-					// HasInProgress may still return true for an XID that has
-					// since aborted. Confirm via the manager's global abort list.
 					if o.ctx.TxnMgr != nil && o.ctx.TxnMgr.HasAbortedXID(xmax) {
 						epqDoDelete = true
-						continue
+						continue // bypass EPQ on next iter; delete code executes
 					}
-					continue // still in-progress; retry
+					continue
 				}
 				// Concurrent tx committed — row was updated or deleted.
 				if o.ctx.Tx.Isolation != mvcc.IsolationReadCommitted {
@@ -4238,7 +4882,9 @@ func (o *deleteOp) Next() (TupleSlot, error) {
 				if v.retRow != nil {
 					delRow = v.retRow
 				}
-				fireTriggers(o.ctx, tbl, "after", "delete", delRow, nil)
+				if _, _, err := fireTriggers(o.ctx, tbl, "after", "delete", delRow, nil); err != nil {
+					return nil, err
+				}
 			}
 			// Use parent-aligned retRow for RETURNING when available (inheritance children). M0097-0078.
 			if v.retRow != nil {
@@ -4362,7 +5008,7 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 
 	for _, fst := range fromScanTargets {
 		fst := fst // capture
-		if err := scanMatching(o.ctx, fst.rel, fst.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
+		if err := scanMatching(o.ctx, fst.rel, 0, fst.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
 			// For inheritance children: remap raw child row to parent col positions so
 			// FromPred and SET exprs (which use parent ordinals) evaluate correctly. M0097-0078.
 			var tgtRow Row
@@ -4482,7 +5128,10 @@ func (o *updateOp) updateWithFrom(rel storage.RelFileNode, tgtCols []catalog.Col
 
 		// Fire BEFORE UPDATE triggers.
 		if len(o.plan.Table.Triggers) > 0 {
-			retRow, ok := fireTriggers(o.ctx, o.plan.Table, "before", "update", pu.oldRow, pu.newRow)
+			retRow, ok, err := fireTriggers(o.ctx, o.plan.Table, "before", "update", pu.oldRow, pu.newRow)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue
 			}
@@ -4774,7 +5423,7 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 
 	for _, ust := range usingScanTargets {
 		ust := ust // capture
-		if err := scanMatching(o.ctx, ust.rel, ust.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
+		if err := scanMatching(o.ctx, ust.rel, 0, ust.cols, nil, func(blk storage.BlockNumber, slot uint16, rawRow Row) error {
 			key := [2]uint64{uint64(blk), uint64(slot)}
 			if seen[key] {
 				return nil
@@ -4842,7 +5491,10 @@ func (o *deleteOp) deleteWithUsing() (TupleSlot, error) {
 		}
 		// Fire BEFORE DELETE triggers and enforce FK constraints.
 		if len(tbl.Triggers) > 0 {
-			_, ok := fireTriggers(o.ctx, tbl, "before", "delete", v.oldRow, nil)
+			_, ok, err := fireTriggers(o.ctx, tbl, "before", "delete", v.oldRow, nil)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue
 			}
@@ -4926,11 +5578,18 @@ func foreignLockOnly(h storage.HeapTupleHeader, currentXID storage.TransactionID
 	return storage.IsHeapTupleLockOnly(h.Infomask)
 }
 
-func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, pred planner.Expr, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
+// scanMatching sequentially scans `rel`, decoding every visible tuple, applying
+// `pred`, and invoking `fn` for each match. statOID is the catalog OID of the
+// relation for cumulative relation-stats accounting (0 = do not count, used by
+// internal FK-maintenance scans that PG does not attribute to the user table):
+// the whole call is one sequential scan reading every visible tuple, recorded
+// (numscans + tuples_returned) at clean completion. M0118-0009 (`stats`, rung 6).
+func scanMatching(ctx *Context, rel storage.RelFileNode, statOID uint32, cols []catalog.Column, pred planner.Expr, fn func(blk storage.BlockNumber, slot uint16, row Row) error) error {
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return err
 	}
+	var examined int64 // visible tuples read across all blocks (tuples_returned)
 	for blk := storage.BlockNumber(0); blk < nBlocks; blk++ {
 		s, err := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: blk})
 		if err != nil {
@@ -5022,6 +5681,7 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 		}
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
+		examined += int64(len(visible)) // tuples this scan returned (pre-qual)
 		// Process visible tuples one at a time: eval predicate then call fn
 		// immediately, so WHERE side-effects (NOTICE) and trigger NOTICEs
 		// interleave per-row rather than all predicates firing before all
@@ -5059,6 +5719,10 @@ func scanMatching(ctx *Context, rel storage.RelFileNode, cols []catalog.Column, 
 			}
 		}
 	}
+	// One sequential scan reading `examined` visible tuples (the UPDATE/DELETE
+	// base scan); recorded into cumulative relation stats, gated by track_counts.
+	// M0118-0009 (`stats`, rung 6; design 0118-0128).
+	recordRelScan(ctx, statOID, examined)
 	return nil
 }
 

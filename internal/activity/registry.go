@@ -262,10 +262,15 @@ func (r *ActivityRegistry) UpdateState(procNum int32, state, query string) {
 	if query != "" {
 		c.Query.Store(&query)
 		c.QueryStart.Store(now)
-	} else if state == "idle" {
-		// Clear query on return to idle.
-		c.Query.Store(nil)
 	}
+	// PG retains the text of the backend's most recent query in ALL
+	// non-active states: pg_stat_activity.query "shows the last query that
+	// was executed" once a backend goes idle / idle-in-transaction, and only
+	// clears to NULL when the backend has never run a statement. Do NOT clear
+	// Query on return to idle — an idle-in-transaction backend must keep
+	// exposing its last statement so pg_stat_activity joins observe it (the
+	// partition-drop-index-locking isolation spec's s3getlocks selects
+	// s.query for the idle s1 SELECT backend). M0118-0008, design 0118-0073.
 }
 
 // UpdateStateByPID is the backward-compat string-PID variant of UpdateState.

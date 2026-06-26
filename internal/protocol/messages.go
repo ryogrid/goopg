@@ -366,6 +366,21 @@ func (fw *FrameWriter) WriteEmptyQueryResponse() error {
 	return fw.WriteFrame(MsgEmptyQueryResponse, nil)
 }
 
+// WriteNotificationResponse emits 'A' (NotificationResponse): the int32 PID of
+// the notifying backend followed by the channel name and payload as C-strings.
+// Mirrors PostgreSQL's NotifyResponse wire shape (src/backend/commands/async.c
+// → pq_putmessage('A', ...)). The empty payload is the common case (NOTIFY with
+// no second argument) and is sent as a bare NUL terminator.
+func (fw *FrameWriter) WriteNotificationResponse(pid uint32, channel, payload string) error {
+	payloadBytes := make([]byte, 0, 4+len(channel)+1+len(payload)+1)
+	payloadBytes = appendUint32(payloadBytes, pid)
+	payloadBytes = append(payloadBytes, channel...)
+	payloadBytes = append(payloadBytes, 0)
+	payloadBytes = append(payloadBytes, payload...)
+	payloadBytes = append(payloadBytes, 0)
+	return fw.WriteFrame(MsgNotificationResponse, payloadBytes)
+}
+
 func appendUint16(b []byte, v uint16) []byte {
 	return append(b, byte(v>>8), byte(v))
 }

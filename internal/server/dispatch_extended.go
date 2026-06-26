@@ -50,7 +50,7 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	// The same parameterized query is shared across all 100 pgbench
 	// connections — one planning call serves them all.
 	var node planner.Node
-	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) {
+	if s.pc != nil && !sessionTempInheritanceActive(s.cfg.Catalog) && !partitionDetachPending(s.cfg.Catalog) && !inheritanceChangePending(s.cfg.Catalog) {
 		key := normalizeCompatSQL(query)
 		if cached, ok := s.pc.Get(key); ok {
 			node = cached
@@ -81,8 +81,8 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 	// Use an offset procNum to avoid overwriting the connection's own
 	// ProcArray slot when an explicit transaction is active. The offset
 	// mirrors the COPY transaction strategy in copy.go.
-	const halfSize = mvcc.DefaultProcArraySize / 2
-	autoCommitProcNum := (procNum + halfSize) % mvcc.DefaultProcArraySize
+	const halfSize = mvcc.ConnSlotCount / 2
+	autoCommitProcNum := (procNum + halfSize) % mvcc.ConnSlotCount
 	tx, err := s.cfg.TxnMgr.Begin(mvcc.IsolationReadCommitted, autoCommitProcNum)
 	if err != nil {
 		return nil, &extendedQueryError{Code: sqlstate.SystemError, Message: err.Error()}
@@ -165,6 +165,13 @@ func (s *Server) executeExtendedQueryViaExecutor(ctx context.Context, sess *conf
 			return false
 		}
 		return s.cancelReg.cancelByPID(uint32(pid))
+	}
+	// pg_terminate_backend(pid) sibling of the simple-query path. M0118-0009.
+	ectx.TerminateBackend = func(pid int32) bool {
+		if pid <= 0 {
+			return false
+		}
+		return s.cancelReg.terminateByPID(uint32(pid))
 	}
 
 	op, err := executor.Build(node)
