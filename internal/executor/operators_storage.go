@@ -3168,7 +3168,7 @@ func (o *updateOp) updateViaIndex(rel storage.RelFileNode, cols []catalog.Column
 		decRow, err = make(Row, len(cols)), nil
 		decNatts := int(tuple.Header.Infomask2 & 0x07FF)
 		if decErr := DecodeRowIntoMctxPGTuple(decRow, cols, tuple.Data, tuple.Bitmap, decNatts, nil); decErr != nil {
-			return false, decErr
+			return true, nil // skip undecodable tuple (consistent with scanMatching)
 		}
 		row := decRow
 
