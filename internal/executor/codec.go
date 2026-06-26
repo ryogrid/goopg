@@ -898,6 +898,24 @@ func pgRowHasVarWidth(cols []catalog.Column, row Row) bool {
 	return false
 }
 
+// pgRowHasExternal reports whether row contains at least one KindToastPointer
+// value, meaning the encoded heap tuple carries an external TOAST reference.
+// This drives the HEAP_HASEXTERNAL bit in the tuple infomask, mirroring PG's
+// heap_fill_tuple (postgres/src/backend/access/common/heaptuple.c:343) which
+// stamps the bit when a varlena value's storage is TOAST-external.
+func pgRowHasExternal(cols []catalog.Column, row Row) bool {
+	n := len(cols)
+	if len(row) < n {
+		n = len(row)
+	}
+	for i := 0; i < n; i++ {
+		if row[i].Kind == KindToastPointer {
+			return true
+		}
+	}
+	return false
+}
+
 func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) (Datum, int, error) {
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":

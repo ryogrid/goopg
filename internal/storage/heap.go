@@ -127,6 +127,12 @@ const (
 	// HEAP_HASVARWIDTH indicates the tuple has variable-width columns.
 	// Mirrors PG's HEAP_HASVARWIDTH (0x0002).
 	HeapHasVarWidth uint16 = 0x0002
+	// HEAP_HASEXTERNAL indicates the tuple has external stored attribute(s)
+	// (a VARATT_EXTERNAL / TOAST pointer varlena). PG's heap_fill_tuple stamps
+	// this bit so nocachegetattr and heap_deform_tuple skip the toast-pointer
+	// column correctly when computing attribute offsets. Mirrors PG's
+	// HEAP_HASEXTERNAL (0x0004).
+	HeapHasExternal uint16 = 0x0004
 	// HeapKeysUpdated is set in t_infomask2 when an UPDATE changes an indexed
 	// (key) column. FOR KEY SHARE only conflicts with xmax that has this bit
 	// set. Mirrors PostgreSQL's HEAP_KEYS_UPDATED (0x2000).
@@ -558,6 +564,51 @@ func PageGetHeapTupleNoCopy(p Page, slot uint16) (HeapTuple, error) {
 // pd_special bounds the tuple region: the new item is placed at
 // pd_upper - len(raw); if that would land below pd_special's start the
 // page is treated as full.
+// PageRemoveHeapTuple marks the 1-based slot as LP_UNUSED, freeing the line
+// pointer. If the slot is the last line pointer, pd_lower is decremented to
+// reclaim the array entry. The tuple body bytes in the upper region become
+// garbage; they are reclaimed by the next VACUUM / page compaction
+// (VacuumHeapPageBySlots). Returns ErrInvalidSlot for out-of-range slot
+// numbers and ErrUnsupportedItem if the slot is not LP_NORMAL.
+//
+// This is the inverse of PageAddHeapTuple for the orphan-cleanup path: when
+// tryApplyHOTUpdate writes a new tuple to the page but the subsequent old-slot
+// stamp fails (e.g. PagePruneOpt invalidated the old slot), the orphan
+// HEAP_ONLY_TUPLE must be removed to prevent unbounded line-pointer growth.
+func PageRemoveHeapTuple(p Page, slot uint16) error {
+	if slot == 0 {
+		return ErrInvalidSlot
+	}
+	count, err := PageLinePointerCount(p)
+	if err != nil {
+		return err
+	}
+	idx := int(slot) - 1
+	if idx < 0 || idx >= count {
+		return ErrInvalidSlot
+	}
+	item, err := readItemID(p, idx)
+	if err != nil {
+		return err
+	}
+	if item.Flags != ItemIDNormal {
+		return fmt.Errorf("%w: slot=%d flags=%d", ErrUnsupportedItem, slot, item.Flags)
+	}
+	// Zero the line pointer — mark slot LP_UNUSED so it is never read by
+	// PageGetHeapTuple (which rejects non-LP_NORMAL slots).
+	if err := writeItemID(p, idx, ItemID{Flags: ItemIDUnused}); err != nil {
+		return err
+	}
+	// If this was the last entry, shrink the line pointer array.
+	if idx == count-1 {
+		h := MustHeader(p)
+		h.SetLower(uint16(SizeOfPageHeaderData + idx*itemIDSize))
+	}
+	// Tuple body is NOT zeroed — the bytes in [pd_upper, pd_special) are
+	// garbage; VacuumHeapPageBySlots repacks survivors and reclaims the space.
+	return nil
+}
+
 func PageAddItemRaw(p Page, raw []byte) (uint16, error) {
 	h, err := Header(p)
 	if err != nil {

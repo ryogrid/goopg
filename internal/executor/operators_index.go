@@ -466,7 +466,7 @@ func (o *indexScanOp) Next() (TupleSlot, error) {
 		slot.RUnlock()
 		o.ctx.Pool.Unpin(slot)
 		if decErr != nil {
-			return nil, decErr
+			continue // skip undecodable tuple (consistent with scanMatching)
 		}
 		row := o.scanRow
 		// Convert KindString enum column values to KindEnum (sort order) so
