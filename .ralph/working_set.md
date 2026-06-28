@@ -1,32 +1,36 @@
-Task: (loop #9 — design 0117-0009) CLEARED the meta-blocker that made loops
-#7/#8 report BLOCKED. The mandated TPC-H spot-check gate infra-failed because
-goopg startup hung; fixed. Committed this loop.
+Task: (loop #10 — design 0117-0010) Made the mandated TPC-H spot-check gate
+ACTUALLY RUN. Loop #9 fixed startup-hang→readiness; this loop fixed the
+silent-SKIP so Q12/Q13 are compared for real. Committed this loop.
 
 What landed:
-- `EnablePGSLRUMirror` startup backfill no longer fsyncs once per XID (~1.5M
-  fsyncs → >6 min on WSL2). Now routes through the existing batched
-  `mirrorTerminalRangeBatchedUnlocked` (one fsync per segment, ≈2 total).
-  Byte-equivalent; live per-commit `mirrorToSLRUUnlocked` path untouched.
-- Files: internal/mvcc/clog.go (backfill block ~L839-862),
-  internal/mvcc/clog_dual_store_consistency_test.go (new
-  TestCLogEnableMirrorBackfillBatched), docs/design/0117-0009-*.md + README,
-  .ralph/fix_plan.md (M0117 enabler note).
-- Empirical proof: fresh `scripts/tpch-spotcheck.sh` start on the 2.2 GB bench
-  dir reached *ready* in ~35 s (was >6 min). Gate now runs past readiness.
+- `scripts/tpch-spotcheck.sh`: data-target fallback. The gate probed the
+  `user=tpch / db=tpch` HammerDB load identity, but goopg registers
+  CREATE ROLE/USER + CREATE DATABASE **in-memory only** (role_ddl.go), so the
+  tpch role/db DON'T survive the gate's fresh restart. The tables persist in the
+  **postgres** database (lineitem = 5,999,786). The `role "tpch" does not exist`
+  probe matched the table-missing SKIP heuristic → silent SKIP on a loaded dir.
+  Fix: on a `(role|database) ... does not exist` probe error, fall back to
+  superuser@postgres and re-probe; run the runner against the resolved target.
+- Files: scripts/tpch-spotcheck.sh, docs/design/0117-0010-*.md + README index,
+  .ralph/fix_plan.md (M0117 enabler note; corrects 0117-0009's "reload role" note
+  — data was never lost, only mis-probed).
+- Empirical proof: full gate, fresh start → falls back to postgres@postgres →
+  Q12: rows=2, Q13: rows=33 → RESULT=PASS (matches spotcheck_expected.env;
+  confirms HEAD has no row-count regression).
 
-Gates run: go build ./... PASS; go vet ./internal/mvcc PASS; go test -race
-./internal/mvcc/ ./internal/wal/ PASS; new regression PASS; make
-ralph-state-guard OK (self-repaired); pgbench pre-commit smoke (on commit).
+Gates run: bash -n scripts/tpch-spotcheck.sh OK; FULL scripts/tpch-spotcheck.sh
+RESULT=PASS (Q12=2/Q13=33); make ralph-state-guard OK (self-repaired); pgbench
+pre-commit smoke (on commit). No engine code touched (script + docs only).
 
-Next step (the gate is usable again):
-1. The bench data dir `bench/tpch/runtime_goopg/data` lacks the `tpch` role, so
-   the spotcheck SKIPs at the schema probe. Reload via
-   `bench/tpch/setup_goopg.sh` + `build_schema_goopg.sh` to restore the real
-   Q12/Q13 row-count run (re-pin Q13 after reload). THEN the populated-data gate
-   is fully runnable.
-2. With the gate runnable, a HUMAN/dedicated session can finally land the
-   deferred M0117 live-path slices: 0117-0006 Part B (CLOG store swap, per the
-   blueprint in design 0117-0006 §"Part B implementation blueprint") and
-   0117-0007 Part B (async commit), gating with race mvcc/wal + xlog_replay +
-   heterogeneous PG-standby E2E + fresh-server TPC-H Q12/Q13 + pgbench.
-3. Alternatively unpause M0110 (pg_dump TAP, incremental/self-promoting).
+Next step (autonomous priority band remains genuinely exhausted):
+1. With 0117-0009 + 0117-0010 the populated-data Q12/Q13 gate is now runnable,
+   so the deferred M0117 live-path slices (0117-0006 Part B CLOG store swap per
+   the blueprint in design 0117-0006 §"Part B implementation blueprint";
+   0117-0007 Part B async commit) can be done in a DEDICATED full-gate session —
+   they ALSO need heterogeneous PG-standby E2E + `-race` mvcc/wal + xlog_replay,
+   which still SKIP in the autonomous WSL2 loop, so they are NOT autonomous.
+2. M0118-0004 deadlock-parallel = infeasible (no lock-group abstraction).
+   M0095-0003 = blocked on logical decoding. M0110 = PAUSED by directive.
+3. Real goopg feature gap surfaced (not in any actionable band): durable
+   role/database persistence (in-memory v0 handlers). Would let the bench reload
+   land a persistent tpch role/db and let the gate use the configured identity.

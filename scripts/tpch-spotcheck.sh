@@ -142,14 +142,43 @@ fi
 
 # Quick schema probe: a started cluster without the tpch schema is "no data",
 # not a regression — SKIP rather than fail.
-if ! probe_err="$(PGDATABASE="${TPCH_DB}" PGUSER="${TPCH_USER}" PGPASSWORD="${TPCH_PASS}" \
-        psql -h "${PG_HOST}" -p "${PG_PORT}" -tA -c 'select 1 from lineitem limit 1' 2>&1 >/dev/null)"; then
-    if grep -qiE 'does not exist' <<<"${probe_err}"; then
+#
+# Target resolution (goopg-specific): goopg persists user-created ROLEs and
+# DATABASEs only in memory (internal/server/role_ddl.go; CREATE DATABASE is not
+# durably replayed for the bench dir), so the `tpch` role and `tpch` database
+# created during the HammerDB load DO NOT survive the fresh restart this script
+# performs. The loaded tables themselves persist — HammerDB writes them into the
+# `postgres` database (the only database goopg keeps across restart). So we probe
+# the configured tpch target first (forward-compatible if role/db persistence
+# ever lands), and on a "role/database does not exist" error fall back to the
+# superuser + `postgres` database where the data actually lives. A genuine
+# "relation lineitem does not exist" is the real not-loaded case → SKIP.
+GATE_DB="${TPCH_DB}"; GATE_USER="${TPCH_USER}"; GATE_PASS="${TPCH_PASS}"
+probe_lineitem() {  # args: db user pass — prints psql stderr on failure, returns rc
+    PGDATABASE="$1" PGUSER="$2" PGPASSWORD="$3" \
+        psql -h "${PG_HOST}" -p "${PG_PORT}" -tA -c 'select 1 from lineitem limit 1' 2>&1 >/dev/null
+}
+if ! probe_err="$(probe_lineitem "${GATE_DB}" "${GATE_USER}" "${GATE_PASS}")"; then
+    if grep -qiE '(role|database).*does not exist' <<<"${probe_err}"; then
+        # tpch role/db didn't survive the restart — fall back to the persistent
+        # superuser/postgres target before deciding "no data".
+        echo "tpch-spotcheck: tpch role/db absent post-restart (in-memory only); falling back to ${PG_SUPERUSER}@postgres"
+        GATE_DB="postgres"; GATE_USER="${PG_SUPERUSER}"; GATE_PASS="${PG_SUPERUSER_PASS}"
+        if ! probe_err="$(probe_lineitem "${GATE_DB}" "${GATE_USER}" "${GATE_PASS}")"; then
+            if grep -qiE 'does not exist' <<<"${probe_err}"; then
+                skip "cluster is up but lineitem is not loaded in any persistent database (${probe_err})"
+            fi
+            echo "tpch-spotcheck: FATAL — schema probe failed: ${probe_err}" >&2
+            exit 1
+        fi
+    elif grep -qiE 'does not exist' <<<"${probe_err}"; then
         skip "cluster is up but the tpch schema is not loaded (${probe_err})"
+    else
+        echo "tpch-spotcheck: FATAL — schema probe failed: ${probe_err}" >&2
+        exit 1
     fi
-    echo "tpch-spotcheck: FATAL — schema probe failed: ${probe_err}" >&2
-    exit 1
 fi
+echo "tpch-spotcheck: data target = ${GATE_USER}@${GATE_DB}"
 
 # ---------------------------------------------------------------------------
 # Run Q12 + Q13 via the canonical runner (same HammerDB SQL text as the
@@ -158,7 +187,7 @@ fi
 echo "tpch-spotcheck: running Q12 + Q13 (per-query timeout ${QUERY_TIMEOUT})"
 runner_out="$("${RUNNER_BIN}" \
     --host="${PG_HOST}" --port="${PG_PORT}" \
-    --db="${TPCH_DB}" --user="${TPCH_USER}" --password="${TPCH_PASS}" \
+    --db="${GATE_DB}" --user="${GATE_USER}" --password="${GATE_PASS}" \
     --queries=12,13 --per-query-timeout="${QUERY_TIMEOUT}" 2>&1)" || {
         echo "tpch-spotcheck: FATAL — tpch-runner failed:" >&2
         echo "${runner_out}" >&2

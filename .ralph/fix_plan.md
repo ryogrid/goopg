@@ -104,11 +104,28 @@ readiness window and infra-FAILED — the sole reason loops #7/#8 reported BLOCK
 and deferred the whole M0117 live-path tail. Fixed by routing the backfill
 through the existing batched `mirrorTerminalRangeBatchedUnlocked` (one fsync per
 segment, ≈2 total); byte-equivalent, live per-commit path untouched. A fresh
-spotcheck start now reaches *ready* in ~35 s (was >6 min). The Q12/Q13 row-count
-gate is usable again (data dir needs its `tpch` role reloaded via
-`bench/tpch/setup_goopg.sh`+`build_schema_goopg.sh` — a separate provisioning
-step), unblocking 0117-0006 Part B / 0117-0007 Part B for a dedicated full-gate
-session. Regression `TestCLogEnableMirrorBackfillBatched`.
+spotcheck start now reaches *ready* in ~35 s (was >6 min). Regression
+`TestCLogEnableMirrorBackfillBatched`.
+
+**2026-06-29 enabler (design 0117-0010, NOT a sub-task closure): TPC-H
+spot-check now actually RUNS (was silently SKIPping).** After 0117-0009 fixed
+readiness, the gate still never ran Q12/Q13: it probed the `user=tpch / db=tpch`
+HammerDB load identity, but goopg registers `CREATE ROLE`/`CREATE USER`
+**in-memory only** (`internal/server/role_ddl.go`) and the `tpch` database is
+likewise non-durable, so neither survives the gate's fresh restart — yet the
+loaded tables persist in the **`postgres`** database (`lineitem` = 5,999,786).
+The `role "tpch" does not exist` probe error matched the table-missing SKIP
+heuristic, masking a fully-loaded data dir (correcting 0117-0009's note that the
+data dir merely needed a role reload — the data was never lost, only mis-probed).
+Fix: `scripts/tpch-spotcheck.sh` falls back to the superuser + `postgres`
+database persistent target on a role/database-missing probe error. Verified
+end-to-end: fresh start → `postgres@postgres` → **Q12=2, Q13=33, RESULT=PASS**
+(matches `spotcheck_expected.env`; confirms HEAD has no row-count regression).
+With 0117-0009 + 0117-0010 the populated-data Q12/Q13 gate is now demonstrably
+runnable, unblocking 0117-0006 Part B / 0117-0007 Part B for a dedicated
+full-gate session (which still additionally need PG-standby E2E + `-race`
+mvcc/wal + crash-replay). Follow-up (not in any actionable band): durable
+role/database persistence is a real goopg feature gap.
 
 - [x] **M0117-0001..0005** — DONE (designs `0117-0001..0005`; branches pending human
       merge off clean HEAD): wraparound-safe `storage.XIDPrecedes` horizon comparison;
