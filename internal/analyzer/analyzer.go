@@ -1155,6 +1155,10 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{Name: "int2"}, nil
 		case "oidvector":
 			return catalog.Type{Name: "oid"}, nil
+		case "point":
+			// point[i] (0-based) returns the i-th coordinate as float8
+			// (point[0]=x, point[1]=y) — PostgreSQL geometric subscripting.
+			return catalog.Type{Name: "float8"}, nil
 		}
 		return catalog.Type{Name: "text"}, nil
 	case *parser.IndirectionStar:

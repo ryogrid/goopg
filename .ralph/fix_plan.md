@@ -209,6 +209,27 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `predicate-gin`/`predicate-gist` need real GIN/GiST AMs; `predicate-hash`
       over-detects 40001 (coarse relation-grain SIREAD). Isolation tally now
       117 pass / 4 failed.
+      **2026-06-29 (design 0118-0135, enabler — NOT a promotion): `predicate-gist`
+      read-step support.** Probe-first found the spec already runs (point type,
+      `point(x,y)`, `CREATE INDEX … USING gist`, SERIALIZABLE all present) but its
+      first read step errored on two gaps: (1) `p[0]` subscripting a point
+      char-subscripted the text form (`point(10,10)[0]`→`"("`), so `sum(p[0])`
+      failed `42804 sum() argument must be numeric` — now returns the 0/1
+      coordinate (0-based, PG geometric: `[0]`=X `[1]`=Y) as numeric, typed float8
+      by analyzer+planner; (2) `<<`/`>>` on points raised `42883 requires integer
+      operands` (parsed as bit-shift) — now `p << q`⇔`p.x<q.x`, `p >> q`⇔`p.x>q.x`
+      → bool. **A filtered probe confirms ZERO SSI divergences** — goopg's 40001
+      behaviour already matches PG byte-for-byte across all permutations
+      (relation/tuple-grain SIREAD happens to coincide with PG's gist page-level
+      locking for this spec's spatial data). The **sole** remaining divergence is
+      goopg's float8 *text output* (`2.23375e+06` vs PG `2233750`; `codec.go`
+      `FormatFloat(…,'g',-1,64)`), a cluster-wide display path deferred to a
+      dedicated `float8out` loop (ground-truth vs local PG + full regress-port
+      re-run required) — after which `predicate-gist` is expected to PROMOTE with
+      no further SSI work. `predicate-gin` independently needs `int4[]`-column
+      array typing (`array[1]`→int4[] collapses to int4 today) + a GIN AM.
+      Tests `TestPointStrictlyLeftRightOperators` (executor) +
+      `TestPort_PointGeometricRead` (end-to-end). Ledger row recorded.
 - [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
       All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
       nowait{,-2,-3,-4,-5}, lock-nowait,
