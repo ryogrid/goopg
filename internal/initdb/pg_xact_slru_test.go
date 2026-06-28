@@ -66,20 +66,27 @@ func TestBootstrapCLog_WritesPGCanonicalSLRU(t *testing.T) {
 		t.Errorf("segment 0 byte 0 = 0x%02x, want 0x00 (XIDs 0..2 are SLRU-bypassed)", raw[0])
 	}
 
-	// (4) goopg-legacy flat-file is still written (kept for M0030-0007
-	// internal-startup compatibility until M0106-0013 promotes the SLRU
-	// to canonical for goopg too). Bootstrap XIDs 1 and 2 land at indices
-	// 1 and 2 with TxnStatusCommitted (=1).
+	// (4) M0117-0006 Part B retires the goopg-legacy flat file: the
+	// PG-canonical pg_xact/ SLRU is now the single CLOG store (PG itself has no
+	// global/pg_xact file, and basebackup already excludes it). Bootstrap XIDs 1
+	// and 2 are SLRU-bypassed and resolved as committed by the
+	// TransactionLogFetch short-circuit, so bootstrap writes no flat file.
 	flatPath := filepath.Join(dataDir, "global", "pg_xact")
-	flat, err := os.ReadFile(flatPath)
+	if _, err := os.Stat(flatPath); !os.IsNotExist(err) {
+		t.Errorf("legacy flat file %q present (Part B should not write it): err=%v", flatPath, err)
+	}
+	// Reopening via the production recovery sequence must still resolve the
+	// bootstrap/frozen XIDs as committed (the short-circuit, with the SLRU as the
+	// live store).
+	c, err := mvcc.OpenCLog(flatPath)
 	if err != nil {
-		t.Fatalf("read %q: %v", flatPath, err)
+		t.Fatalf("OpenCLog: %v", err)
 	}
-	if len(flat) < 3 {
-		t.Fatalf("legacy flat file too short: len=%d", len(flat))
+	if err := c.EnablePGSLRUMirror(pgXactDir); err != nil {
+		t.Fatalf("EnablePGSLRUMirror: %v", err)
 	}
-	if flat[1] != byte(mvcc.TxnStatusCommitted) || flat[2] != byte(mvcc.TxnStatusCommitted) {
-		t.Errorf("flat file XID lanes = %v, want [_, Committed, Committed]", flat[:3])
+	if !c.DidCommit(mvcc.BootstrapTransactionID, nil) || !c.DidCommit(mvcc.FrozenTransactionID, nil) {
+		t.Errorf("bootstrap/frozen XIDs not resolved committed after reopen")
 	}
 }
 

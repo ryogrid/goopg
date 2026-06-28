@@ -88,14 +88,21 @@ func TestGroupCommitConcurrent(t *testing.T) {
 		}
 	}
 
-	// View 2: flat file reopened from disk (proves incremental pages landed).
+	// View 2: full production recovery reopen (OpenCLog + EnablePGSLRUMirror).
+	// Under M0117-0006 Part B the SLRU is the single durable store (the flat file
+	// is vestigial and was never fsynced), so the recovery path reconstructs every
+	// status from the fsynced SLRU segments — proving each incremental
+	// group-commit write landed durably across a restart.
 	reopened, err := OpenCLog(flatPath)
 	if err != nil {
 		t.Fatalf("re-OpenCLog: %v", err)
 	}
+	if err := reopened.EnablePGSLRUMirror(slruDir); err != nil {
+		t.Fatalf("re-EnablePGSLRUMirror: %v", err)
+	}
 	for xid, st := range want {
 		if got := reopened.GetStatus(xid); got != st {
-			t.Errorf("flat-reopened GetStatus(%d) = %d, want %d (incremental flush lost an update)", xid, got, st)
+			t.Errorf("recovery-reopened GetStatus(%d) = %d, want %d (durable incremental write lost)", xid, got, st)
 		}
 	}
 

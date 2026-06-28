@@ -1,8 +1,19 @@
 # 0117-0006 — CLOG SLRU buffer pool / 2-bit collapse (gap G6)
 
-Status: **accepted (Part A landed; Part B/C deferred)**
+Status: **accepted (Part A + Part B landed 2026-06-29; Part C deferred)**
 Milestone: M0117-0006
 Branch: `m0117-0006-clog-slru-buffer-pool` (off the M0117-0005 tip `5fcdb27b`)
+
+> **Part B LANDED 2026-06-29 (loop #11).** The buffer pool is now the live
+> in-memory CLOG store on the production path; see the "Part B — LANDED"
+> section below. The Part-B "deferred" reason on record across loops #7–#10 —
+> *"the mandatory gates SKIP in the autonomous WSL2 loop"* — was **empirically
+> disproven this loop**: the heterogeneous PG-standby E2E
+> (`TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart`,
+> `TestE2E_ChecksumStreamingGoopgToPG`), `-race ./internal/mvcc/... ./internal/wal/...`
+> (incl. `xlog_replay`), AND the TPC-H Q12/Q13 spot-check (runnable since
+> 0117-0009 + 0117-0010) all RUN and PASS here. Part C (drop the resident banks +
+> flat file) remains deferred.
 
 ## Problem (gap G6)
 
@@ -110,6 +121,75 @@ slice** (each is a known trap):
   its incremental-flush machinery (M0117-0005 Part A) become redundant with the
   SLRU; Part C removes them (the 2-bit "collapse" — dropping the 1-byte/XID
   store entirely).
+
+### Part B — LANDED (2026-06-29, loop #11)
+
+The buffer pool is the live in-memory CLOG store whenever the SLRU mirror is
+enabled (every production path). Implementation, matching the blueprint below
+with the deviations noted:
+
+- **Promotion point.** `CLog.pool` is an `atomic.Pointer[clogBufferPool]`
+  (race-free for the startup store vs concurrent commit-path loads), set by
+  `EnablePGSLRUMirror` **last** — after `loadFromSLRU` + the
+  `mirrorTerminalRangeBatchedUnlocked` backfill — so it faults pages from a
+  `pg_xact/` directory in which every terminal bank entry (incl. flat-file-only
+  ones) has already been projected. The `&CLog{}` unit-test path with no mirror
+  keeps `banks` (`pool == nil`).
+- **Reads/writes.** `GetStatus` → `pool.getStatus`; `setStatus` →
+  `pool.setStatus` (PG clear-then-set, idempotent no-op skips the group-commit
+  round-trip) then `groupUpdate`; bootstrap/frozen XIDs (`< FirstNormalTransactionID`)
+  keep their `pg_xact/0000` lanes zero, matching the legacy
+  `mirrorGroupToSLRULocked` short-circuit (basebackup byte-equality).
+- **Durability.** `applyGroupBatchLocked` → `pool.flushDirty()` (one fsync per
+  touched segment), **replacing both** `flushDirtyPagesLocked` (flat file) and
+  `mirrorGroupToSLRULocked` (bank→SLRU). The async-commit `flushWAL` barrier is
+  left nil this slice — synchronous commit flushes the commit WAL record before
+  `setStatus`, so no barrier is needed; wiring it is M0117-0007 Part B.
+- **Bulk callers re-pointed** (all run AFTER `EnablePGSLRUMirror` in
+  `initdb.Open`, so they MUST go through the single store):
+  `InitializeAsCommitted` / `MarkUnknownAsAborted` sweep via `pool.getStatus` +
+  `pool.setStatus` then one `pool.flushDirty()` (the M0117-0004 "only
+  Unknown→Aborted" guard is preserved, read through the pool);
+  `HighestKnownXID` → new `highestSLRUXID()` scans the on-disk segments
+  (descending, tail-first) for the maximum terminal lane, since the banks are
+  vestigial.
+- **Truncation.** `TruncateCLOG` keeps `truncateSLRUSegments(cutoffPage)` and
+  adds `pool.invalidateBelow(cutoffPage)` (drops resident pages below the cutoff
+  WITHOUT writeback — their segment file was just unlinked; compacts `slots`/
+  `pageMap` so freed slots are reused). The vestigial flat-file `flush()` is
+  skipped when the pool is live.
+- **Flat file retired.** With the pool live the goopg-legacy `global/pg_xact`
+  flat file is no longer written (it was never fsynced — the SLRU was always the
+  durable store; basebackup already excluded it, and PG itself has no such
+  file). `bootstrapCLog`'s SetCommitted(1)/(2) now no-op (SLRU-bypassed), so the
+  flat file is simply never created; `OpenCLog` already tolerates its absence and
+  `loadFromSLRU` repopulates from the authoritative SLRU. Two flat-file-reopen
+  test views (`TestGroupCommitConcurrent`, `TestCLogDualStoreConsistency`) and
+  the bootstrap flat-file assertion (`TestBootstrapCLog_WritesPGCanonicalSLRU`)
+  were updated to the production recovery path (`OpenCLog` + `EnablePGSLRUMirror`,
+  reconstructing from the SLRU) — strictly stronger than the flat-file-only
+  reopen they replaced.
+- **Pool sizing.** `EffectiveCLOGBuffers(c.clogBuffers, 0)`; `clogBuffers`
+  defaults to 0 (auto = 16 pages, bank-aligned) and is settable via
+  `SetCLOGBuffers` before `EnablePGSLRUMirror`. Wiring the `transaction_buffers`
+  GUC value into `SetCLOGBuffers` from `initdb.Open` is a small follow-up (auto
+  sizing is correctness-safe — eviction writes back + re-faults on demand — and
+  the TPC-H/pgbench working sets touch few CLOG pages, so 16 resident pages do
+  not thrash).
+
+Regression coverage: `clog_bufferpool_live_test.go`
+(`TestCLOGPoolIsLiveStore` — read/write/HighestKnownXID across pages+segments +
+recovery reopen; `TestCLOGPoolMarkUnknownAsAbortedThroughPool` — the recovery
+sweep preserves a committed lane; `TestCLOGPoolTruncateInvalidates` — segment
+removal + pool page invalidation).
+
+**Gates run (Part B):** `go build ./...` clean; `go test -race ./internal/mvcc/...`
++ `./internal/wal/...` (incl. `xlog_replay`) PASS; `internal/initdb` + `internal/server`
+full suites PASS; heterogeneous PG-standby E2E (`TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart`,
+`TestE2E_ChecksumStreamingGoopgToPG`) PASS — a real PG 18.3 standby reads the
+`pg_xact/` bytes the pool writes; **TPC-H Q12=2 / Q13=33 spot-check PASS** on the
+populated 6M-row data dir (visibility checks served by the pool); pgbench smoke
+on commit. `gofmt -l` / `go vet ./internal/mvcc/` clean.
 
 ### Part C — drop the resident banks + flat file (deferred)
 

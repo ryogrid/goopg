@@ -133,12 +133,23 @@ role/database persistence is a real goopg feature gap.
       `SUB_COMMITTED` (0x03) CLOG lane; incremental flush + group commit.
 - [ ] **M0117-0006 — SLRU buffer pool / 2-bit collapse (gap G6; Effort L).** Part A
       landed (`transaction_buffers` GUC + `clogBufferPool`, NOT wired to the live path —
-      blast radius nil). **Part B (DEFERRED, ledger 2026-06-15):** route `GetStatus`/
-      `setStatus` + bulk callers / `loadFromSLRU` / `TruncateCLOG` through the pool
-      (open Qs in design `0117-0006-*`: mirror-disabled fallback, OR-vs-clear-then-set
-      semantics, truncation-via-page-invalidation). **Part C (DEFERRED):** remove the
-      resident `banks` + `global/pg_xact` flat file (16× memory reduction). Re-init data
-      dir on the memory-model change.
+      blast radius nil). **Part B LANDED 2026-06-29 (loop #11, design `0117-0006-*`
+      "Part B — LANDED"):** the pool is now the live in-memory store
+      (`CLog.pool atomic.Pointer`, promoted by `EnablePGSLRUMirror` after the backfill);
+      `GetStatus`/`setStatus`, the group-commit leader (`applyGroupBatchLocked`→
+      `pool.flushDirty`), and the bulk callers (`InitializeAsCommitted`/
+      `MarkUnknownAsAborted`/`HighestKnownXID` via new `highestSLRUXID`/`TruncateCLOG`
+      via new `pool.invalidateBelow`) all route through it. The never-fsynced legacy
+      `global/pg_xact` flat file is retired (SLRU = single durable store; basebackup
+      already excluded it; PG has no such file). The deferral reason on record across
+      loops #7–#10 — *"the mandatory gates SKIP in the autonomous WSL2 loop"* — was
+      **empirically disproven**: standby-attach + checksum-streaming E2E, `-race`
+      mvcc/wal (incl. xlog_replay), and **TPC-H Q12=2/Q13=33 spot-check** all RUN+PASS.
+      Regression `clog_bufferpool_live_test.go`. **Part C (DEFERRED, ledger):** remove
+      the resident `banks` (16× memory reduction) once the no-mirror unit tests are
+      migrated; re-init data dir on the memory-model change. Box stays unchecked until
+      Part C lands. Follow-up: wire the `transaction_buffers` GUC value into
+      `CLog.SetCLOGBuffers` from `initdb.Open` (auto-16 default is correctness-safe).
 - [ ] **M0117-0007 — Async-commit LSN tracking (gap G8; Effort L).** Part A landed
       (per-LSN-group tracking + page-write WAL barrier on the M0117-0006 pool, not live).
       **Part B (DEFERRED):** live `synchronous_commit=off` — wire `flushWAL` to the WAL

@@ -1,36 +1,39 @@
-Task: (loop #10 — design 0117-0010) Made the mandated TPC-H spot-check gate
-ACTUALLY RUN. Loop #9 fixed startup-hang→readiness; this loop fixed the
-silent-SKIP so Q12/Q13 are compared for real. Committed this loop.
+Task: M0117-0006 Part B — wire the SLRU buffer pool as the LIVE in-memory CLOG
+store (replacing the resident per-XID banks). LANDED this loop (#11).
 
-What landed:
-- `scripts/tpch-spotcheck.sh`: data-target fallback. The gate probed the
-  `user=tpch / db=tpch` HammerDB load identity, but goopg registers
-  CREATE ROLE/USER + CREATE DATABASE **in-memory only** (role_ddl.go), so the
-  tpch role/db DON'T survive the gate's fresh restart. The tables persist in the
-  **postgres** database (lineitem = 5,999,786). The `role "tpch" does not exist`
-  probe matched the table-missing SKIP heuristic → silent SKIP on a loaded dir.
-  Fix: on a `(role|database) ... does not exist` probe error, fall back to
-  superuser@postgres and re-probe; run the runner against the resolved target.
-- Files: scripts/tpch-spotcheck.sh, docs/design/0117-0010-*.md + README index,
-  .ralph/fix_plan.md (M0117 enabler note; corrects 0117-0009's "reload role" note
-  — data was never lost, only mis-probed).
-- Empirical proof: full gate, fresh start → falls back to postgres@postgres →
-  Q12: rows=2, Q13: rows=33 → RESULT=PASS (matches spotcheck_expected.env;
-  confirms HEAD has no row-count regression).
+KEY META-FINDING (broke the loop #7–#10 block): the deferral reason on record —
+"the mandatory Part B gates SKIP in the autonomous WSL2 loop" — is FALSE. The
+PG binaries are present and the E2E tests only skip in `-short`. Verified RUN+PASS
+here: TestE2E_StandbyAttachRetainsUpstreamRowsAfterRestart (23s),
+TestE2E_ChecksumStreamingGoopgToPG, `-race ./internal/mvcc/... ./internal/wal/...`
+(incl xlog_replay), and the TPC-H Q12=2/Q13=33 spot-check (runnable since
+0117-0009+0117-0010). So Part B was actionable, not dedicated-session-only.
 
-Gates run: bash -n scripts/tpch-spotcheck.sh OK; FULL scripts/tpch-spotcheck.sh
-RESULT=PASS (Q12=2/Q13=33); make ralph-state-guard OK (self-repaired); pgbench
-pre-commit smoke (on commit). No engine code touched (script + docs only).
+What landed (single-store design, blueprint §Resolutions 1-7):
+- CLog.pool atomic.Pointer[clogBufferPool], promoted by EnablePGSLRUMirror AFTER
+  the flat-file→SLRU backfill (so it faults from a complete pg_xact/).
+- GetStatus→pool.getStatus; setStatus→pool.setStatus (PG clear-then-set; bootstrap
+  XIDs <FirstNormal kept zero); applyGroupBatchLocked→pool.flushDirty REPLACES
+  flushDirtyPagesLocked+mirrorGroupToSLRULocked.
+- Bulk callers re-pointed (all run AFTER EnablePGSLRUMirror in initdb.Open):
+  InitializeAsCommitted/MarkUnknownAsAborted sweep via pool + one flushDirty;
+  HighestKnownXID→new highestSLRUXID() (SLRU tail scan); TruncateCLOG→new
+  pool.invalidateBelow(cutoffPage) + skip the vestigial flat flush().
+- Legacy never-fsynced global/pg_xact flat file RETIRED (SLRU is single durable
+  store; basebackup already excluded it; PG has no such file). 3 flat-file-reopen
+  test views redirected to the production recovery reopen (OpenCLog+EnablePGSLRUMirror).
+- flushWAL barrier left nil (sync commit; async = M0117-0007 Part B). Pool auto-16.
 
-Next step (autonomous priority band remains genuinely exhausted):
-1. With 0117-0009 + 0117-0010 the populated-data Q12/Q13 gate is now runnable,
-   so the deferred M0117 live-path slices (0117-0006 Part B CLOG store swap per
-   the blueprint in design 0117-0006 §"Part B implementation blueprint";
-   0117-0007 Part B async commit) can be done in a DEDICATED full-gate session —
-   they ALSO need heterogeneous PG-standby E2E + `-race` mvcc/wal + xlog_replay,
-   which still SKIP in the autonomous WSL2 loop, so they are NOT autonomous.
-2. M0118-0004 deadlock-parallel = infeasible (no lock-group abstraction).
-   M0095-0003 = blocked on logical decoding. M0110 = PAUSED by directive.
-3. Real goopg feature gap surfaced (not in any actionable band): durable
-   role/database persistence (in-memory v0 handlers). Would let the bench reload
-   land a persistent tpch role/db and let the gate use the configured identity.
+Files: internal/mvcc/{clog.go, clog_bufferpool.go, clog_groupcommit.go,
+clog_bufferpool_live_test.go (new)}, clog_groupcommit_test.go,
+clog_dual_store_consistency_test.go, internal/initdb/pg_xact_slru_test.go,
+docs/design/0117-0006-*.md + README, fix_plan.md, deferral_ledger.md.
+
+Gates run (ALL PASS): build; -race mvcc+wal(+xlog_replay); initdb+server full
+suites; standby-attach + checksum-streaming E2E; TPC-H Q12=2/Q13=33; gofmt/vet
+clean; new clog_bufferpool_live_test.go. pgbench smoke on commit (pre-commit hook).
+
+Next step: COMMIT (done if you see this with a clean tree). Then M0117-0006
+Part C = remove the resident banks (dead-code once the &CLog{} no-mirror unit
+tests are migrated) — separate focused loop; re-init data dir. Small follow-up:
+wire transaction_buffers GUC → CLog.SetCLOGBuffers from initdb.Open.

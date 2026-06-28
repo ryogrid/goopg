@@ -107,6 +107,14 @@ func (c *CLog) runLeader(self *clogGroupNode) error {
 // applyGroupBatchLocked performs the two batched durable writes for a group.
 // The caller holds flushMu. M0117-0005.
 func (c *CLog) applyGroupBatchLocked(batch []*clogGroupNode) error {
+	// M0117-0006 Part B: when the buffer pool is the live store, each batch
+	// member's 2-bit lane was already written by setStatus (p.setStatus). One
+	// flushDirty writes every dirty resident page back with one fsync per touched
+	// segment — replacing BOTH the legacy flat-file page flush AND the
+	// bank→SLRU mirror, since the pool IS the SLRU store.
+	if p := c.pool.Load(); p != nil {
+		return p.flushDirty()
+	}
 	// 1. Flat file: replay only the dirty pages (the batch's setStatus calls
 	//    already recorded them via markFlatDirty).
 	if err := c.flushDirtyPagesLocked(); err != nil {

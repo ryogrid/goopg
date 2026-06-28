@@ -112,14 +112,20 @@ func TestCLogDualStoreConsistency(t *testing.T) {
 		}
 	}
 
-	// View 3: flat file reopened from disk.
+	// View 3: full production recovery reopen (OpenCLog + EnablePGSLRUMirror).
+	// Under M0117-0006 Part B the flat file is vestigial; recovery reconstructs
+	// status from the fsynced SLRU and re-promotes the buffer pool, exactly as a
+	// server restart does.
 	reopened, err := OpenCLog(flatPath)
 	if err != nil {
 		t.Fatalf("re-OpenCLog: %v", err)
 	}
+	if err := reopened.EnablePGSLRUMirror(slruDir); err != nil {
+		t.Fatalf("re-EnablePGSLRUMirror: %v", err)
+	}
 	for _, s := range set {
 		if got := reopened.GetStatus(s.xid); got != s.want {
-			t.Errorf("flat-file-reopened GetStatus(%d) = %d, want %d", s.xid, got, s.want)
+			t.Errorf("recovery-reopened GetStatus(%d) = %d, want %d", s.xid, got, s.want)
 		}
 	}
 
