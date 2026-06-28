@@ -187,6 +187,13 @@ func (s *Server) execPrepareTransaction(w *protocol.FrameWriter, ctx *executor.C
 	}
 	px := connTx.DetachPrepared(st.Gid, newTx)
 	s.preparedXacts.put(st.Gid, px)
+	// M0118-0009 (`stats`, rung 7; design 0118-0131): move the originating
+	// backend's staged relation-stat counters into a per-gid 2PC record so the
+	// later COMMIT/ROLLBACK PREPARED — from any backend — folds them into that
+	// backend's pending counters (AtPrepare_PgStat_Relations). The originating
+	// backend's already-pending non-transactional scan counters stay and report
+	// normally via its own flush.
+	executor.PrepareRelStats(ctx, st.Gid)
 	// The per-statement context's transaction-scoped pending enum state moved to
 	// the parked holder; clear it so the dispatch write-back does not re-attach it
 	// to the now-freed connection.
@@ -219,6 +226,9 @@ func (s *Server) abortForPrepareSSIFailure(w *protocol.FrameWriter, ctx *executo
 		}
 	}
 	_ = s.cfg.TxnMgr.Rollback(explicitTx)
+	// M0118-0009 (`stats`, rung 7): discard the failed transaction's staged
+	// relation-stat counters via abort math (this path bypasses execRollback).
+	executor.AbortRelStats(ctx)
 	undoEnumDDLForRollback(connTx, s.cfg.Catalog)
 	connTx.End()
 	if ctx != nil && ctx.EndLocalTransaction != nil {
@@ -265,6 +275,13 @@ func (s *Server) execFinalizePrepared(w *protocol.FrameWriter, ctx *executor.Con
 		return s.writeQueryError(w, sqlstate.UndefinedObject,
 			"prepared transaction with identifier \""+gid+"\" does not exist")
 	}
+	// M0118-0009 (`stats`, rung 7; design 0118-0131): fold the prepared 2PC
+	// relation-stat record into THIS (finalising) backend's pending counters using
+	// commit/abort math (pgstat_twophase_post{commit,abort}). ctx still carries the
+	// finalising connection's session identity (only ctx.Session is retargeted
+	// below), so the counts attach to the backend that flushes them next.
+	_, isCommit := finalize.(*parser.CommitStmt)
+	executor.FinalizePreparedRelStats(ctx, gid, isCommit)
 	sess := px.Session()
 	ctx.Session = sess
 	ctx.Tx = px.Tx()

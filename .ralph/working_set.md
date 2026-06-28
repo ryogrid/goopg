@@ -1,40 +1,43 @@
-Last landed (loop #75): `stats` rung 6 (M0118-0009, design 0118-0128) — relation
-tuple statistics. First divergence advanced **L2180 → L2704**. All 7 non-2PC
-table-stats permutations + the 2PC COMMIT PREPARED permutations match PG 18.3.
+Last landed (loop #2 / this session): `stats` rung 7 (M0118-0009, design 0118-0131)
+— transactional relation-counter staging + abort/TRUNCATE/2PC reconciliation.
+First divergence advanced **L2704 → L3072**. Every abort/`ROLLBACK PREPARED`,
+TRUNCATE-in-2PC, and cross-backend `COMMIT`/`ROLLBACK PREPARED` table-stats
+permutation now matches PG 18.3 byte-for-byte.
 
-Files: internal/executor/pgstat_relations.go (NEW: relationStatsManager `relStats`
-+ recordScan/Insert/Update/Delete + flush/get/dropTable/resetAll + shouldTrackCounts
-+ recordRelScan + tableOIDFromCatalog), internal/executor/pgstat_relations_test.go
-(NEW), internal/executor/expr.go (9 pg_stat_get_* relation getters; flush+reset
-also drive relStats), internal/executor/operators_storage.go (seqScanOp.statReturned
-+ Close record; scanMatching gains statOID param + 4 call sites; insert/update/
-deleteOp.Close record rowsAffected), internal/executor/operators_ddl.go
-(dropTableByRefImmediate → relStats.dropTable). Docs: design 0118-0128 + README row +
-fix_plan note.
+Files:
+- internal/executor/pgstat_relations.go — NEW staging tier (`relXactCounters` +
+  `staging`/`prepared` maps); recordInsert/Update/Delete now STAGE; new
+  recordTruncate/commitXact/abortXact/prepareXact/finalizePrepared/
+  applyXactToPending/saveTruncDropCounters; exported CommitRelStats/AbortRelStats/
+  PrepareRelStats/FinalizePreparedRelStats + recordRel{Insert,Update,Delete,
+  Truncate} autocommit-aware helpers; newRelationStatsManager().
+- internal/executor/operators_storage.go — insert/update/delete Close use helpers.
+- internal/executor/operators_ddl.go — execTruncate records truncate post-truncate.
+- internal/executor/operators_tx.go — execCommit folds (commit), execRollback (abort).
+- internal/server/twophase.go — detached PREPARE→PrepareRelStats; detached
+  finalize→FinalizePreparedRelStats; PREPARE-SSI-failure rollback→AbortRelStats.
+- internal/executor/pgstat_relations_test.go — staging/abort/truncate/2PC tests.
+- docs/design/0118-0131-*.md + README index row + fix_plan rung-7 note.
 
-Gates: go test ./internal/executor/ PASS; new pgstat_relations_test.go PASS;
-TestPort_IsolationStats soft probe L2180→L2704; build clean; pgbench smoke
-445305 txns 0 failed; tpch-spotcheck infra-FAIL (stale systemd scope, known WSL2
-issue — query output unchanged by counter-only hooks).
+Model: scans NON-transactional → pending immediately. tuples_ins/upd/del +
+live/dead deltas TRANSACTIONAL → staging, folded to pending at commit/abort math
+(AtEOXact_PgStat_Relations). TRUNCATE = truncDropped flag riding to flush (forgets
+live/dead). 2PC = staging→per-gid prepared at PREPARE, applied to FINALISING
+backend's pending at COMMIT/ROLLBACK PREPARED (sessionStatsID stays the issuing
+conn since only ctx.Session is retargeted, not ctx.AdvisorySessionIdentity).
 
-Key model: numscans/tuples_returned NON-transactional (counted as scans run);
-ins/upd/del + live/dead deltas recorded at op.Close (= "applied at commit" for the
-autocommit simple-query path). INSERT +1 live/row; DELETE +1 dead −1 live/row;
-UPDATE +1 dead/row, live unchanged (no HOT). Getters return 0 (not NULL) for absent
-OID. track_counts (boot on) gates all counting.
+Gates run: go test ./internal/executor/ ./internal/mvcc/ ./internal/server/ PASS;
+new pgstat_relations_test.go PASS; TestPort_TwoPhaseCommitSameBackend +
+TestPort_IsolationPreparedTransactions{,CIC} strict PASS; DML+commit/rollback
+strict isolation regression PASS; TestPort_IsolationStats soft probe L2704→L3072;
+build clean. pgbench smoke = pre-commit hook (commit pending).
 
-NEXT rung for `stats` (Effort-L; spec stays `defer`): **L2704 — transactional-counter
-abort/2PC reconciliation for relation stats.** The new first divergence is the
-`s1_begin … s1_prepare_a … s1_rollback_prepared_a` permutation (expected
-live=1/dead=8, current 3/6). Needs:
-- Stage tuples_inserted/_updated/_deleted + live/dead deltas PER TRANSACTION
-  (mirror PG_Stat_TableXactStatus), fold into shared at commit, and on
-  abort/ROLLBACK PREPARED: aborted insert+update tuples become DEAD (no live
-  increment); follow AtEOXact_PgStat_Relations rules incl. the `truncdropped` path
-  for in-txn TRUNCATE/DROP (later permutations L2775/L2815/L2861/L2901/L2947).
-- 2PC handoff of the staged relation counters to the prepared txn so cross-backend
-  COMMIT/ROLLBACK PREPARED applies them (mirror function-stats 2PC, design 0118-0127).
-- This requires replacing the op.Close "apply immediately" model with per-txn
-  staging for the transactional counters (non-transactional scan counters stay as-is).
-Then later: index-scan tuples_fetched, VACUUM vacuum_count/live-dead recompute, SLRU
-stats (pg_stat_slru).
+NEXT rung for `stats` (Effort-L; spec stays `defer`): **L3072 — SLRU statistics
+(`pg_stat_slru`).** New first divergence is `s1_slru_check_stats` /
+`SELECT blks_zeroed FROM pg_stat_slru WHERE name='notify'` — goopg has no
+`pg_stat_slru` view / per-SLRU `blks_zeroed`/`blks_hit`/… counters. Needs: a
+process-global SLRU-stats store (per-SLRU named bucket: notify/clog/subtrans/…),
+counting hooks in the SLRU page paths (zeroed/read/written/flushes), and the
+`pg_stat_slru` SRF. After SLRU lands, `stats` may finally promote to `pass`.
+Also still pending (later): sub-transaction (savepoint) staging tier for rel
+stats; index-scan `tuples_fetched`; VACUUM `vacuum_count`/live-dead recompute.

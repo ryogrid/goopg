@@ -1387,11 +1387,10 @@ func (o *insertOp) Open(ctx *Context) error {
 }
 
 func (o *insertOp) Close() error {
-	// Cumulative relation stats: count inserted tuples (one live tuple each),
-	// gated by track_counts. M0118-0009 (`stats`, rung 6; design 0118-0128).
-	if shouldTrackCounts(o.ctx) {
-		relStats.recordInsert(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
-	}
+	// Cumulative relation stats: stage inserted tuples (one live tuple each) for
+	// the current transaction, gated by track_counts. M0118-0009 (`stats`, rung 7;
+	// design 0118-0131). Autocommit statements fold to pending immediately.
+	recordRelInsert(o.ctx, tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
 	return o.child.Close()
 }
 
@@ -2797,13 +2796,13 @@ func tryApplyHOTUpdate(
 	tup.Header.Infomask |= storage.HeapXmaxInvalid
 	// HEAP_HASVARWIDTH: PG18 nocachegetattr crashes when this bit is
 	// missing on a TupleDesc with varlena attrs. Mirrors PG's
-	// heap_fill_tuple (heaptuple.c:326). M0118-0129.
+	// heap_fill_tuple (heaptuple.c:326). M0118-0131.
 	if pgRowHasVarWidth(cols, newRow) {
 		tup.Header.Infomask |= storage.HeapHasVarWidth
 	}
 	// HEAP_HASEXTERNAL: PG's heap_deform_tuple needs this bit to skip
 	// external TOAST pointers. Mirrors heap_fill_tuple (heaptuple.c:343).
-	// M0118-0129.
+	// M0118-0131.
 	if pgRowHasExternal(cols, newRow) {
 		tup.Header.Infomask |= storage.HeapHasExternal
 	}
@@ -2924,7 +2923,7 @@ func tryApplyHOTUpdate(
 		// (e.g. PagePruneOpt invalidated the old slot). Without
 		// cleanup the tuple persists as a live HEAP_ONLY_TUPLE
 		// with no CTID link, wasting space and inflating the
-		// line-pointer count. M0118-0129.
+		// line-pointer count. M0118-0131.
 		if remErr := storage.PageRemoveHeapTuple(s.Page(), newSlot); remErr != nil {
 			// Non-fatal: page is still structurally valid; the
 			// orphan wastes space until the next VACUUM repacks
@@ -3103,11 +3102,10 @@ func (o *updateOp) Open(ctx *Context) error {
 }
 
 func (o *updateOp) Close() error {
-	// Cumulative relation stats: count updated tuples (each leaves a dead tuple;
-	// goopg has no HOT update). Gated by track_counts. M0118-0009 (`stats`, rung 6).
-	if shouldTrackCounts(o.ctx) {
-		relStats.recordUpdate(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
-	}
+	// Cumulative relation stats: stage updated tuples (each leaves a dead tuple;
+	// goopg has no HOT update) for the current transaction. Gated by track_counts.
+	// M0118-0009 (`stats`, rung 7; design 0118-0131).
+	recordRelUpdate(o.ctx, tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
 	return nil
 }
 
@@ -4506,11 +4504,10 @@ func (o *deleteOp) Open(ctx *Context) error {
 }
 
 func (o *deleteOp) Close() error {
-	// Cumulative relation stats: count deleted tuples (each removes a live tuple
-	// and produces a dead one). Gated by track_counts. M0118-0009 (`stats`, rung 6).
-	if shouldTrackCounts(o.ctx) {
-		relStats.recordDelete(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
-	}
+	// Cumulative relation stats: stage deleted tuples (each removes a live tuple
+	// and produces a dead one) for the current transaction. Gated by track_counts.
+	// M0118-0009 (`stats`, rung 7; design 0118-0131).
+	recordRelDelete(o.ctx, tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
 	return nil
 }
 
@@ -6666,13 +6663,13 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// PG's heap_fill_tuple (postgres/src/backend/access/common/
 	// heaptuple.c:326). The PG-canonical sibling
 	// writeHeapRowReturningPG already sets this; the regular path was
-	// missing it. M0118-0129.
+	// missing it. M0118-0131.
 	if pgRowHasVarWidth(cols, row) {
 		tuple.Header.Infomask |= storage.HeapHasVarWidth
 	}
 	// HEAP_HASEXTERNAL: PG's heap_deform_tuple needs this bit to skip
 	// external TOAST pointers when computing attribute offsets.
-	// Mirrors PG's heap_fill_tuple (heaptuple.c:343). M0118-0129.
+	// Mirrors PG's heap_fill_tuple (heaptuple.c:343). M0118-0131.
 	if pgRowHasExternal(cols, row) {
 		tuple.Header.Infomask |= storage.HeapHasExternal
 	}
@@ -6915,7 +6912,7 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		tuple.Header.Infomask |= storage.HeapHasVarWidth
 	}
 	// HEAP_HASEXTERNAL: PG's heap_deform_tuple needs this bit
-	// for TOAST-external columns. M0118-0129.
+	// for TOAST-external columns. M0118-0131.
 	if pgRowHasExternal(cols, row) {
 		tuple.Header.Infomask |= storage.HeapHasExternal
 	}

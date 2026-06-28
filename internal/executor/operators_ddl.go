@@ -8481,6 +8481,14 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		}
 	}
 
+	// Cumulative relation stats: a TRUNCATE forgets the relation's live/dead
+	// counts and resets the in-transaction insert/update/delete counters
+	// (pgstat_count_truncate). Recorded after the physical truncate succeeds.
+	// M0118-0009 (`stats`, rung 7; design 0118-0131).
+	for _, entry := range tableSet {
+		recordRelTruncate(o.ctx, entry.tbl.OID)
+	}
+
 	// RESTART IDENTITY: reset sequences for all truncated tables.
 	if s.RestartIdentity {
 		sess, isBas := o.ctx.Session.(*BasicSession)

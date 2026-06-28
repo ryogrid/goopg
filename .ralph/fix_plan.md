@@ -1705,3 +1705,26 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       VACUUM `vacuum_count`/live-dead recompute, SLRU stats. Tests:
       `pgstat_relations_test.go` (accumulate/flush/get, update dead-delta,
       drop-without-revival); `TestPort_IsolationStats` soft probe L2180→L2704.
+      **2026-06-28 (design 0118-0131, enabler — NOT a promotion): `stats` rung 7.**
+      Made the relation insert/update/delete counters + live/dead deltas
+      **transactional**; first divergence advanced **L2704 → L3072** — every
+      abort/`ROLLBACK PREPARED`, TRUNCATE-in-2PC, and cross-backend
+      `COMMIT`/`ROLLBACK PREPARED` permutation now matches PG 18.3 byte-for-byte.
+      New **staging** tier (`relXactCounters` ≈ `PgStat_TableXactStatus`) in front
+      of `pending`: DML `op.Close` stages into `staging[sessionID][oid]` via
+      `recordRel{Insert,Update,Delete}`; `execCommit`/`execRollback` fold it into
+      `pending` with PG commit-vs-abort math (`AtEOXact_PgStat_Relations`: aborted
+      insert/update → dead, aborted delete = live/dead no-op, attempted `tuples_*`
+      always count); autocommit folds immediately. TRUNCATE (`recordRelTruncate` ≈
+      `pgstat_count_truncate`) saves pre-truncate counts, resets staged counters,
+      rides a `truncDropped` flag through `pending`→`shared` at flush (forgets
+      already-flushed live/dead). 2PC: `PrepareRelStats` moves staging into a
+      per-gid record at the detached PREPARE (`twophase.go`);
+      `FinalizePreparedRelStats` folds it into the FINALISING backend's pending at
+      COMMIT/ROLLBACK PREPARED (`pgstat_twophase_post{commit,abort}`). Scan
+      counters stay non-transactional. New first divergence L3072 = `pg_stat_slru`
+      SLRU stats (final rung). Known limitation: no sub-transaction (savepoint)
+      staging tier yet (top-level only). Tests: `pgstat_relations_test.go`
+      (staging+commit+flush, abort `1/8`, TRUNCATE `5/1/0/1/1`, 2PC commit/abort
+      cross-backend, drop clears staging/prepared); `TestPort_IsolationStats` soft
+      probe L2704→L3072; 2PC + DML+commit/rollback strict isolation regression PASS.
