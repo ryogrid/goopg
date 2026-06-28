@@ -1379,6 +1379,13 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		if !lok || !rok {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires box operands", op)}
 		}
+		// anyarray containment/overlap: when both operands are array literals
+		// ({...}) the operator carries set-membership semantics, not box
+		// geometry (predicate-gin, design 0118-0139). PG dispatches @>/<@/&&
+		// to arraycontains/arraycontained/arrayoverlap by operand type.
+		if isArrayLiteralText(ls) && isArrayLiteralText(rs) {
+			return NewBoolDatum(evalArraySetOp(op, ls, rs)), nil
+		}
 		aur, all, aok := parseBoxText(ls)
 		bur, bll, bok := parseBoxText(rs)
 		if !aok || !bok {
@@ -10846,6 +10853,59 @@ func pgQuoteIdent(s string) string {
 	// Must quote.
 	escaped := strings.ReplaceAll(s, `"`, `""`)
 	return `"` + escaped + `"`
+}
+
+// isArrayLiteralText reports whether s is a PostgreSQL array literal of the
+// canonical `{...}` form. Used to route the @>/<@/&& operators to anyarray
+// set semantics rather than geometric box semantics (design 0118-0139).
+func isArrayLiteralText(s string) bool {
+	return len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}'
+}
+
+// evalArraySetOp evaluates the anyarray containment/overlap operators on two
+// array literals, mirroring PG's arraycontains / arraycontained / arrayoverlap
+// (src/backend/utils/adt/arrayfuncs.c). Element equality uses the canonical
+// text rendering — adequate for the scalar element types goopg stores in array
+// columns (int2/4/8, float, bool, text), since both operands arrive in PG's
+// canonical output form. NULL elements never match (PG: array element equality
+// over NULL is unknown, so they are not considered contained).
+func evalArraySetOp(op parser.OpCode, ls, rs string) bool {
+	le := parseTextArray(ls)
+	re := parseTextArray(rs)
+	switch op {
+	case parser.OpContains:
+		// a @> b: every element of b is present in a.
+		return arrayElemsSubset(re, le)
+	case parser.OpContainedBy:
+		// a <@ b: every element of a is present in b.
+		return arrayElemsSubset(le, re)
+	case parser.OpOverlap:
+		// a && b: a and b share at least one element.
+		for _, x := range le {
+			for _, y := range re {
+				if x == y {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return false
+}
+
+// arrayElemsSubset reports whether every element of sub is present in super.
+// An empty sub is trivially contained (PG: '{}' <@ anything is true).
+func arrayElemsSubset(sub, super []string) bool {
+	set := make(map[string]struct{}, len(super))
+	for _, e := range super {
+		set[e] = struct{}{}
+	}
+	for _, e := range sub {
+		if _, ok := set[e]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // parseTextArray parses a PostgreSQL text array literal {elem1,"elem2",...}

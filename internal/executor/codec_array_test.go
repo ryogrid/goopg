@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestArrayCodecRoundTrip verifies that a user array column value (the text
@@ -63,5 +64,40 @@ func TestArrayCodecTextElementQuoting(t *testing.T) {
 	want := `{a,"b c","d,e"}`
 	if got.StringValue() != want {
 		t.Errorf("round-trip = %q, want %q", got.StringValue(), want)
+	}
+}
+
+// TestArraySetOps verifies the anyarray containment/overlap operators
+// (@> <@ &&) used by predicate-gin (design 0118-0139). These route to
+// set-membership semantics rather than the geometric box operators when both
+// operands are array literals.
+func TestArraySetOps(t *testing.T) {
+	cases := []struct {
+		op   parser.OpCode
+		a, b string
+		want bool
+	}{
+		// a @> b: a contains every element of b
+		{parser.OpContains, "{1,2,3}", "{1}", true},
+		{parser.OpContains, "{1,2,3}", "{1,3}", true},
+		{parser.OpContains, "{1,2,3}", "{4}", false},
+		{parser.OpContains, "{1,2,3}", "{}", true},
+		{parser.OpContains, "{1}", "{1,2}", false},
+		// a <@ b: every element of a is in b
+		{parser.OpContainedBy, "{1}", "{1,2,3}", true},
+		{parser.OpContainedBy, "{1,4}", "{1,2,3}", false},
+		{parser.OpContainedBy, "{}", "{1,2,3}", true},
+		// a && b: overlap
+		{parser.OpOverlap, "{1,2}", "{2,3}", true},
+		{parser.OpOverlap, "{1,2}", "{3,4}", false},
+		{parser.OpOverlap, "{}", "{1}", false},
+		// text elements
+		{parser.OpContains, "{a,b,c}", "{b}", true},
+		{parser.OpContains, `{a,"b c"}`, `{"b c"}`, true},
+	}
+	for _, c := range cases {
+		if got := evalArraySetOp(c.op, c.a, c.b); got != c.want {
+			t.Errorf("evalArraySetOp(%v, %q, %q) = %v, want %v", c.op, c.a, c.b, got, c.want)
+		}
 	}
 }

@@ -307,6 +307,27 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `box @> box`); (2) GIN page-grain SSI (reuse the 0118-0137 grid-cell
       primitive keyed on the GIN search key). Tests `TestArrayCodecRoundTrip` +
       `TestArrayCodecTextElementQuoting`.
+      **2026-06-29 enabler (design 0118-0139, NOT a promotion): `anyarray`
+      containment/overlap operators `@>` `<@` `&&`.** Read step `ra1`
+      (`select * from gin_tbl where p @> array[1]`) failed `operator @>: invalid
+      box value` — these symbols were implemented only as the geometric **box**
+      operators (`parseBoxText` on both operands). PG overloads them by operand
+      type (`anyarray @> anyarray` → `arraycontains`/`arraycontained`/
+      `arrayoverlap`). Fix: at the `OpContains`/`OpContainedBy`/`OpOverlap` case
+      in `evalBinaryOp` (expr.go), BEFORE box parsing, detect both operands as
+      array literals (`isArrayLiteralText`: `{`…`}`) and route to set-membership
+      (`evalArraySetOp`/`arrayElemsSubset`): `a @> b` = every elem of `b` in `a`;
+      `a <@ b` = every elem of `a` in `b`; `a && b` = shared elem; `{}` trivially
+      contained. Zero blast radius (fires only when BOTH operands are `{`…`}`).
+      First divergence advances from `ra1` (`invalid box value`) to a genuine SSI
+      granularity divergence: a disjoint perm (`ra1 ro2 wo1 c1 wb2 c2`: read key
+      1, insert key 2) returns correct rows but goopg over-aborts the writer
+      40001 (no native GIN AM → seq-scan relation-grain SIREAD). Spec stays
+      `failed`. Remaining blocker (ledgered): GIN key-grain SSI — reuse the
+      0118-0137 grid-cell primitive keyed on the GIN search key (array element),
+      `ssiRecordGinKeyRead` on the scan path + `ssiRecordGinIndexInsert` twin per
+      inserted element + the `fastupdate=on` whole-index sentinel-key case.
+      Test `TestArraySetOps`.
 - [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
       All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
       nowait{,-2,-3,-4,-5}, lock-nowait,
