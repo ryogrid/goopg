@@ -1979,3 +1979,60 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       SIREAD) and `deadlock-parallel` (M0118-0004: parallel-worker lock groups, no
       parallel query in goopg), each a genuinely Effort-L unbuilt subsystem.
       M0118-0009 checkbox ticked.
+
+## M0119 — Deferral-Ledger Backlog Consumption (filed 2026-06-29)
+
+Milestone: `docs/milestones/0119-deferral-ledger-backlog-consumption.md`
+(**living milestone** — tasks are appended over time; see below). Source of truth:
+`.ralph/deferral_ledger.md`. Goal: drive every open (`status = -`) ledger row to
+closure — implement the deferred scope, or verify it already landed and mark the
+row `resolved`.
+
+**Per-task rule (applies to every M0119 implementation task):** before
+implementation begins, the picking agent MUST (1) create a design doc at
+`docs/design/<source-id>-NNNN-*.md` and index it in `docs/design/README.md`, and
+(2) have that design doc pass an **agent review**. Implementation starts only
+after the reviewed design doc exists. (The M0119-0001 triage task is
+documentation-only and is exempt from the design-doc requirement.)
+
+- [ ] **M0119-0001 — Ledger triage pass (doc-only, no design doc).** Walk every
+      `status = -` row in `.ralph/deferral_ledger.md`. For each, determine whether
+      the deferred scope was already resolved (closed by a later ledger row, a
+      promotion, or current code — cite the evidence) vs genuinely open. Flip
+      resolved rows' `status` to `resolved`; leave genuinely-open rows `-`. The
+      remaining `-` rows define the actionable backlog that seeds M0119-0002+.
+- [ ] **M0119-0002 — CLOG store swap, Part B** (source: M0117-0006 / M0117-0007 /
+      M0117-0008; see M0117 section + ledger rows). Live CLOG store swap (pool
+      replaces banks) per the design-0117-0006 Part B blueprint. Highest blast
+      radius (Hard-won Rule #1): dedicated full-gate session (`-race` mvcc+wal,
+      xlog_replay, heterogeneous PG-standby E2E, fresh-server TPC-H Q12/Q13).
+- [ ] **M0119-0003 — initdb remaining options** (source: M0102-0010; see M0102
+      ledger rows). One option per design-doc-backed task, in `001_initdb.pl`
+      order: `--encoding`, `--locale`/`--lc-*`/`--locale-provider`/`--icu-locale`,
+      `--data-checksums` default-ON flip, `--allow-group-access`, `--auth*`/
+      `--pwfile`, `--sync-method`/`--no-sync-data-files`, `--set`/
+      `--text-search-config`.
+- [ ] **M0119-0004 — pg_dump 002–010 TAP** (source: M0110-0001; see M0110
+      section). Schema dump, dump/restore round-trip, parallel, filter-file,
+      connstr — advance the catalog-view parity battery slice-by-slice.
+- [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
+      section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
+      PG-decodable FPI/heap WAL (+ index AMs for the server tier).
+- [ ] **M0119-0006 — pg_amcheck server tier** (source: M0110-0003; see M0110
+      ledger rows). `002_nonesuch` … `005_opclass_damage`; `CREATE EXTENSION
+      amcheck` + `verify_heapam()` SRF on top of `internal/amcheck` + opclass
+      catalog parity.
+- [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003; see M0095
+      section). `030 recvlogical` — blocked on logical decoding (tracks the
+      logical-replication milestone / D-004).
+- [ ] **M0119-0008 — isolation residual** (source: M0118-0002 / M0118-0004). Verify
+      via triage first: predicate-gin / predicate-gist AM-grain SSI and
+      `deadlock-parallel`. Recent promotions may already cover predicate-gin/gist
+      (M0118-0002 group COMPLETE) — mark those rows `resolved` if so;
+      `deadlock-parallel` needs parallel-worker lock groups (no parallel query in
+      goopg yet).
+
+> This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
+> future deferral-ledger entry (any new `status = -` row) feed additional M0119
+> tasks over time. Finalize the themed-task set from the ledger's distinct open
+> task-ids; the milestone's living nature means it need not be complete at filing.
