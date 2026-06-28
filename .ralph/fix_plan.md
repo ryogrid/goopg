@@ -1728,3 +1728,39 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       (staging+commit+flush, abort `1/8`, TRUNCATE `5/1/0/1/1`, 2PC commit/abort
       cross-backend, drop clears staging/prepared); `TestPort_IsolationStats` soft
       probe L2704→L3072; 2PC + DML+commit/rollback strict isolation regression PASS.
+      **2026-06-28 (design 0118-0132, enabler — NOT a promotion): `stats` rung 8
+      (final).** Implemented the `pg_stat_slru` notify `blks_zeroed` counter + the
+      `block_size` preset GUC; first divergence advanced **L3072 → L3732** (the
+      spec's LAST permutation) — every SLRU permutation (own-/separate-/
+      uncommitted-transaction + all three `stats_fetch_consistency` models with
+      `pg_stat_clear_snapshot`) now matches PG 18.3 byte-for-byte. New
+      `internal/executor/pgstat_slru.go`: process-global `slruStatsManager` models
+      the notify SLRU by tracking a modelled queue head and counting 8192-byte
+      page crossings (the `SimpleLruZeroPage()` events upstream
+      `asyncQueueAddEntries()` records; goopg's notify queue is an in-memory inbox,
+      not an SLRU). Hook in `server/notify.go` `publishPendingNotify` (the single
+      COMMIT-time publish point) sums buffered notifications' modelled byte length
+      and calls `executor.RecordNotifyQueueWrite`, gated on a listener
+      (`hub.hasAnyListener()` — PG only writes the shared queue when a backend
+      LISTENs; counting at COMMIT yields `f` in-txn, `t` post-commit). SLRU joins
+      the per-transaction snapshot (`funcStatSnapshot.slruFrozen`/`slruCache`;
+      `ensureFullSnapshot` freezes both function + SLRU stores cross-kind under
+      `snapshot`). `valuesOp.Open` serves `pg_stat_slru` from snapshot-aware
+      `fetchSLRURows(ctx)`; static catalog `VirtualRows` fallback corrected to
+      PG-17+ names (`notify`/`commit_timestamp`/…/`other`). Registered `block_size
+      = 8192` (`PGC_INTERNAL` preset) so `current_setting('block_size')` resolves
+      (was NULL → empty payload → 3 notifications collapsed to one zero-length
+      entry, never crossing a page). **The ONE remaining blocker (L3732) is NOT
+      SLRU:** the spec's last permutation relies on `track_functions = 'all'`
+      LEAKING across permutations — upstream `isolationtester.c` opens one
+      connection per session ONCE and reuses it for all permutations, so session
+      GUCs persist; goopg's `IsolationRunner.runPermutation` reconnects per
+      permutation, resetting `track_functions` to boot `none`, so the post-clear
+      `pg_stat_get_function_calls` reads NULL not `1`. **Promoting `stats` to
+      `pass` needs the runner connection-reuse change** (hoist per-session conns to
+      spec scope, run only session `setup` per permutation) — shared test infra
+      touching ~117 strict specs, deferred to its own loop (ledger 2026-06-28).
+      Tests: `TestSLRUNotifyBlksZeroed` (executor) + `TestNotifyEntryBytes`/
+      `TestHasAnyListener` (server), all `-race`; `TestFetchFuncStatConsistency`/
+      `TestStatsGUCs` PASS; `stats.spec` probe L3072→L3732 + async-notify + 2PC
+      regression PASS.

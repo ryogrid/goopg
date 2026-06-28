@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"github.com/goopg/goopg/internal/config"
+	"github.com/goopg/goopg/internal/executor"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/protocol"
 )
@@ -231,9 +232,52 @@ func (s *Server) publishPendingNotify(connTx *connTxState) {
 	if connTx == nil {
 		return
 	}
-	for _, n := range connTx.takePendingNotify() {
+	pending := connTx.takePendingNotify()
+	// Model the async-queue SLRU page traffic: when a committing transaction
+	// writes notification entries with at least one listener present, upstream
+	// asyncQueueAddEntries() zeroes one or more pg_notify SLRU pages (counted by
+	// pg_stat_slru.blks_zeroed). goopg's queue is in-memory, so we report the
+	// entries' byte length to the SLRU-stats model, which counts page crossings.
+	// Gated on a listener because PostgreSQL only writes to the shared queue when
+	// a backend is listening. M0118-0009 (`stats`, SLRU rung).
+	if len(pending) > 0 && s.notify != nil && s.notify.hasAnyListener() {
+		var queueBytes int64
+		for _, n := range pending {
+			queueBytes += notifyEntryBytes(n.Channel, n.Payload)
+		}
+		executor.RecordNotifyQueueWrite(queueBytes)
+	}
+	for _, n := range pending {
 		s.notify.Notify(n.Channel, n.Payload, n.PID)
 	}
+}
+
+// notifyEntryBytes returns the modelled size of one async-queue entry: the
+// fixed AsyncQueueEntry header plus the NUL-terminated channel and payload,
+// MAXALIGN'd to 8 bytes — mirroring asyncQueueAddEntries' per-entry advance of
+// QUEUE_HEAD. The exact constant is unimportant; only that a large pg_notify
+// payload advances the modelled head across SLRU page boundaries. M0118-0009.
+func notifyEntryBytes(channel, payload string) int64 {
+	const headerBytes = 16 // offsetof(AsyncQueueEntry, data), approximately
+	n := headerBytes + len(channel) + 1 + len(payload) + 1
+	if rem := n % 8; rem != 0 { // MAXALIGN
+		n += 8 - rem
+	}
+	return int64(n)
+}
+
+// hasAnyListener reports whether at least one session is currently LISTENing on
+// any channel — the condition under which PostgreSQL writes committed
+// notifications to the shared async queue. M0118-0009.
+func (h *notifyHub) hasAnyListener() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, set := range h.listeners {
+		if len(set) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // deliverNotifications drains this session's pending notifications and writes one
