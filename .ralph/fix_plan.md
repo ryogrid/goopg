@@ -1224,7 +1224,7 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       neither waits nor sees the pre-change child set — the hard tail needs
       transactional-DDL cross-session visibility; others need parser support
       (`NOT VALID`/`VALIDATE CONSTRAINT`, `DETACH … CONCURRENTLY`).
-- [ ] **M0118-0009** — Misc / system-level specs: async-notify, timeouts, stats, horizons,
+- [x] **M0118-0009** — Misc / system-level specs: async-notify, timeouts, stats, horizons,
       freeze-the-dead, inplace-inval, intra-grant-inplace{,-db}, subxid-overflow,
       prepared-transactions{,-cic}, temp-schema-cleanup, multixact-no-forget,
       aborted-keyrevoke, delete-abort-savept{,-2}.
@@ -1851,3 +1851,18 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       the 117/4 tally), and `tuplelock-upgrade-no-deadlock` was a load-induced
       flake (passes solo). **`stats` is the LAST failed M0118-0009 spec — all
       M0118-0009 specs are now resolved.**
+      **2026-06-29 (loop #2, doc reconciliation — no engine change): M0118-0009
+      CLOSED + lagging per-spec inventory reconciled.** The stats promotion commit
+      998b9e97 (design 0118-0133) flipped only the suite-level
+      `postgres-oracle-port-status.csv` D-002 row; the per-spec
+      `postgres-oracle-target-inventory.csv` row for `stats.spec` was still `failed`,
+      so `upstream-isolation-coverage.md` + `postgres-oracle-target-inventory.md`
+      under-counted (117 pass / 4 failed). Re-verified `TestPort_IsolationStats`
+      strict PASS (3.0 s), flipped the inventory CSV row failed→pass (comma-free
+      rationale), regenerated both md via `gen-isolation-coverage` +
+      `gen-oracle-inventory`. Isolation tally now **118 pass / 3 failed**. The 3
+      remaining failed specs are NOT M0118-0009 — they are
+      `predicate-gin`/`predicate-gist` (M0118-0002: GIN/GiST AMs + GiST page-grain
+      SIREAD) and `deadlock-parallel` (M0118-0004: parallel-worker lock groups, no
+      parallel query in goopg), each a genuinely Effort-L unbuilt subsystem.
+      M0118-0009 checkbox ticked.

@@ -1,42 +1,37 @@
 (idle — nothing in flight)
 
-Last landed (loop #1, this block): M0118-0002 enabler 0118-0136 — PG-faithful
-`float4out`/`float8out` (`executor.PGFloatOut`). NOT a promotion.
+Last landed (loop #2): M0118-0009 doc reconciliation — flipped the lagging
+per-spec inventory row for `stats.spec` failed→pass + regenerated coverage docs.
+NOT an engine change. M0118-0009 checkbox ticked [x] (group fully closed).
 
-What landed:
-- New `executor.PGFloatOut(f, bitSize)`: shortest round-trip decimal (Ryu via
-  Go's `'e'` verb) + PG's fixed-vs-scientific display-exponent threshold
-  (`[-4,15)` float8, `[-4,6)` float4). `2233750::float8` → `2233750` not
-  `2.23375e+06`. Handles Infinity/-Infinity/NaN/-0.
-- Wired at ALL FOUR sibling sites: codec.go encodeValuePG (float4/float8),
-  dispatch.go appendFloatText/appendFloat8Text, dispatch_extended.go float
-  result columns, isolation_runner.go scanResultSet (scan OIDs 700/701 as
-  NullFloat64 → PGFloatOut).
-Files: internal/executor/codec.go + pgfloatout_test.go (new), internal/server/
-dispatch.go + dispatch_extended.go, internal/testport/framework/isolation_runner.go.
+What happened: the stats promotion commit 998b9e97 (design 0118-0133) updated only
+the suite-level `postgres-oracle-port-status.csv`; the per-spec
+`postgres-oracle-target-inventory.csv` `stats.spec` row was still `failed`, so the
+two generated md files under-counted (117 pass / 4 failed). Re-verified
+`TestPort_IsolationStats` strict PASS (3.0 s), flipped the CSV row (comma-free
+rationale — inventory rationale field is UNQUOTED, commas break the parser; see
+memory iso_test_harness note), regenerated `upstream-isolation-coverage.md` +
+`postgres-oracle-target-inventory.md` via `gen-isolation-coverage` /
+`gen-oracle-inventory`. Tally now 118 pass / 3 failed.
 
-KEY FINDING (corrects loop #6's claim): predicate-gist is NOT promotable. The
-prior "filtered probe → ZERO SSI divergences" was WRONG. With float output fixed,
-a full probe shows the first divergence is a GENUINE SSI OVER-DETECTION:
-  perm `rxy3 wx3 rxy4 c1 wy4 c2` — goopg raises 40001 on c2 commit; PG commits.
-  rxy3 reads p>>point(6000,6000) (X>6000), rxy4 reads p<<point(1000,1000)
-  (X<1000); wx3 inserts high-X, wy4 inserts low-X. PG's GiST PAGE-level
-  predicate locks see disjoint spatial regions (no dangerous cycle); goopg's
-  coarse relation/tuple-grain SIREAD locks the whole relation → false write-skew
-  → spurious 40001.
+Files: docs/test-port/postgres-oracle-target-inventory.csv (+ regenerated .md and
+upstream-isolation-coverage.md), .ralph/fix_plan.md (checkbox + note).
 
-  → NEXT for predicate-gist (Effort-L): GiST spatial page-grain / bounding-box /
-    grid-cell predicate locking — the granularity class predicate-hash solved
-    with bucket-grain SIREAD (FNV→PageLockTag, design 0118-0099 /
-    goopg_hash_index_ssi_bucket_locking). Reuse that pattern for 2D point space.
+REMAINING failed isolation specs (3, all genuinely Effort-L — pick one next loop):
+- predicate-gist (M0118-0002): GENUINE SSI over-detection. goopg's coarse
+  relation/tuple-grain SIREAD raises spurious 40001 where PG's GiST PAGE-level
+  predicate locks see disjoint spatial regions. Fix = GiST spatial page-grain /
+  bounding-box / grid-cell SIREAD — same granularity class predicate-hash solved
+  with bucket-grain SIREAD (FNV→PageLockTag, design 0118-0099 /
+  goopg_hash_index_ssi_bucket_locking). Read-step support already landed (0118-0135:
+  point subscript p[0], <<,>> operators) + float output fixed (0118-0136). Most
+  tractable of the three.
+- predicate-gin (M0118-0002): needs int4[]-column array typing (array[1]→int4[]
+  collapses to int4 today) + a real GIN AM.
+- deadlock-parallel (M0118-0004): parallel-worker lock groups — goopg has no
+  parallel query; not feasible without that subsystem.
 
-Other M0118 failed specs: predicate-gin (int4[]-column array typing + GIN AM),
-deadlock-parallel (parallel-worker lock groups — no parallel query in goopg).
-
-Gates this loop: TestPGFloatOut PASS; executor+server full pkg tests PASS;
-TestPort_PointGeometricRead PASS; full TestPort_RegressSuite TIMED OUT at 30m
-(wall-clock only, ZERO subtest failures — infra slowness on WSL2, worsened by
-orphaned clusters since cleaned); TPC-H spotcheck SKIPPED (known big-dataset
-startup hang, infra not regression — tpch_spotcheck_slru_backfill_startup_hang).
-pgbench smoke = pre-commit hook. No-regression argument: PGFloatOut is strictly
-MORE PG-faithful, so any previously-matching regress case still matches.
+Gates this loop: go build ./... clean; TestPort_IsolationStats strict PASS (3.0s);
+gen-isolation-coverage + gen-oracle-inventory regenerated clean; make
+ralph-state-guard OK (self-repaired progress marker). pgbench smoke = pre-commit
+hook (no engine change — docs/CSV only).
