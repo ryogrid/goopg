@@ -116,6 +116,89 @@ slice** (each is a known trap):
 Remove `clogBank`/`banks`/`flush`/`flushDirtyPagesLocked` once Part B routes all
 access through the pool, completing the 2-bit collapse (16× memory reduction).
 
+## Part B implementation blueprint (for the dedicated full-gate session)
+
+This section is the code-grounded execution plan derived for the dedicated
+session so it need not re-map the entanglement. It supersedes the bare
+"open questions" above with concrete resolutions.
+
+### Current entanglement (what Part B replaces)
+
+- **In-memory store** = `banks` (`clog.go`); `GetStatus`/`setStatus` read/write
+  `b.data[byteIdx(xid)]` (one byte/XID).
+- **Durability** is driven by the M0117-0005 group-commit leader:
+  `setStatus` → `markFlatDirty` + `groupUpdate` → `runLeader` →
+  `applyGroupBatchLocked`, which does **(1)** `flushDirtyPagesLocked` (flat file
+  `global/pg_xact`) and **(2)** `mirrorGroupToSLRULocked` (the `pg_xact/` SLRU
+  segments, batched one-fsync-per-segment, **reading the lane bytes from
+  `banks`**).
+- **OR semantics**: `mirrorGroupToSLRULocked`/`mirrorToSLRUUnlocked` OR the lane
+  in (never clear) to preserve a durable committed bit against a stale in-memory
+  abort (M0117-0004). The pool primitive is **clear-then-set** (PG-faithful).
+- **Reads** = `GetStatus(banks)`. **Bulk callers** =
+  `InitializeAsCommitted` / `MarkUnknownAsAborted` / `HighestKnownXID` /
+  `loadFromSLRU` / `distributeToBanks` / `TruncateCLOG`, all over `banks`.
+
+### Resolutions
+
+1. **Dual-path keyed on `slruDir` (resolves "mirror-disabled fallback").**
+   Production **always** sets `slruDir` (both `initdb.Open` and `initdb` call
+   `EnablePGSLRUMirror` right after `OpenCLog`), so create the pool in
+   `EnablePGSLRUMirror` (`c.pool = newCLOGBufferPool(dir, EffectiveCLOGBuffers(...))`)
+   and gate the live store on `c.pool != nil`. The no-`slruDir` path (only the
+   `&CLog{}` unit tests) keeps `banks`. This makes the pool the in-memory store
+   for the production path (Part B's deliverable) without a flat-file-backed pool
+   variant; banks are removed only in Part C, after the no-mirror tests are
+   migrated or dropped.
+2. **Writes.** When `c.pool != nil`, `setStatus` writes the lane via
+   `pool.setStatusWithLSN(xid, status, lsn)` and routes durability through
+   `pool.flushDirty()` called from the group-commit leader, **replacing both**
+   `flushDirtyPagesLocked` and `mirrorGroupToSLRULocked` in
+   `applyGroupBatchLocked` (the pool already does batched per-segment fsync + the
+   WAL barrier). Wire `pool.flushWAL = wal.Writer.FlushUpTo` here — this is the
+   **join point with M0117-0007 Part B** (async commit); until then inject a
+   barrier that flushes unconditionally (synchronous-commit semantics).
+3. **OR-vs-clear-then-set (the load-bearing correctness point).** The M0117-0004
+   hazard existed *because* two stores (banks + the separately-flushed mirror)
+   could disagree and a whole-file flush could clobber a durable commit with a
+   stale abort. With the pool as the **single** store there is no second store to
+   disagree, so clear-then-set is correct and PG-faithful. **Must verify** the
+   recovery sequence still holds: `loadFromSLRU` populates the pool, and
+   `MarkUnknownAsAborted` keeps its "only `Unknown`→`Aborted`" guard (read via
+   `pool.getStatus`) so it never clears a committed lane `loadFromSLRU` set.
+4. **Reads.** `GetStatus` → `pool.getStatus` when `c.pool != nil`, *after* the
+   CLog-layer short-circuits (`xid < FirstNormalTransactionID`, `OldestClogXid()`
+   truncation floor) that the pool deliberately does not do.
+5. **Bulk callers.** Re-point `InitializeAsCommitted` / `MarkUnknownAsAborted` /
+   `HighestKnownXID` / `loadFromSLRU` onto the pool; prefer the SLRU as the
+   authoritative load (`loadFromSLRU` already merges segments) and skip the
+   flat-file `distributeToBanks` load when the pool is live.
+6. **Truncation (resolves "truncation").** `TruncateCLOG` keeps
+   `truncateSLRUSegments(cutoffPage)` but replaces the bank-drop with **pool page
+   invalidation**: drop every `pool.slots`/`pageMap` entry whose `pageNo <
+   cutoffPage` (faulted back in as all-zero/in-progress if ever re-read, which the
+   `OldestClogXid` floor prevents).
+7. **Flat file.** Part B may keep `global/pg_xact` written (redundant) or stop the
+   flat-file replay; Part C removes `global/pg_xact` + `flushDirtyPagesLocked` +
+   `markFlatDirty` + `distributeToBanks`.
+
+### Mandatory gates (why this is a dedicated session, not an autonomous loop)
+
+A store swap in CLOG is the project's highest-blast-radius change (silent
+visibility/durability regression — Hard-won Rule #1). Validation **requires**:
+
+- `go test -race ./internal/mvcc/... ./internal/wal/...` — the equivalence test
+  (`TestCLOGBufferPoolEncodingMatchesSLRUMirror`) covers *encoding* only; it does
+  **not** cover the durability ordering or the OR→clear-then-set reconciliation.
+- crash-recovery replay (`internal/wal/xlog_replay_test.go`) — the
+  `loadFromSLRU`/`MarkUnknownAsAborted` repair path.
+- **heterogeneous PG-standby E2E** — a real PG standby reads the `pg_xact/` bytes
+  the pool writes via `SimpleLruReadPage_ReadOnly`; this is the only check that
+  the live SLRU byte stream + fsync ordering is standby-correct.
+- fresh-server **TPC-H Q12/Q13 spot-check on a populated data dir** (SKIPs without
+  data — not reliably available in the autonomous WSL2 loop) + pgbench smoke.
+- re-init the data dir for the Part C on-disk-model change.
+
 ## Why land Part A alone
 
 - The pack/unpack lane arithmetic, segment-file page I/O, and LRU eviction are
