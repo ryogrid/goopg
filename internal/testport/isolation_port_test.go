@@ -1943,18 +1943,21 @@ func TestPort_IsolationTuplelockUpgradeNoDeadlock(t *testing.T) {
 }
 
 // TestPort_IsolationStats drives the cumulative-statistics isolation spec
-// (pg_stat_* function/relation/SLRU stats). Soft (runIsoSpec) — the spec
-// exercises several pgstat subsystems still being built rung by rung
-// (M0118-0009); this anchor t.Skip()s with the first-divergence diff until the
-// whole spec matches PG 18.3 byte-for-byte. The function-statistics half plus
-// transactional DROP FUNCTION cross-session visibility (designs 0118-0123/0124
-// and the deferred-routine-drop rung) are landed.
+// (pg_stat_* function/relation/SLRU stats). Strict (runIsoSpecStrict) — the
+// spec matches PG 18.3 byte-for-byte across all permutations. The final rung
+// that promoted it was isolation-runner connection reuse: upstream
+// isolationtester opens one connection per session ONCE and reuses it for every
+// permutation, so a session GUC set by a step (e.g. SET track_functions='all')
+// persists forward; stats.spec's last permutations rely on track_functions set
+// by an earlier permutation still being in effect (design 0118-0133). The
+// pgstat subsystems (function/relation/SLRU stats, transactional DROP FUNCTION
+// cross-session visibility, 2PC stat drops) landed in designs 0118-0123..0132.
 func TestPort_IsolationStats(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_stats")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/stats.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/stats.spec")
 }
 
 // buildDSN constructs a lib/pq DSN for the given cluster.

@@ -1764,3 +1764,28 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `TestHasAnyListener` (server), all `-race`; `TestFetchFuncStatConsistency`/
       `TestStatsGUCs` PASS; `stats.spec` probe L3072→L3732 + async-notify + 2PC
       regression PASS.
+      **2026-06-28 (design 0118-0133, PROMOTION — the final rung): `stats` is now
+      `pass`/pass-required.** Implemented the isolation-runner connection-reuse
+      change flagged by rung 8 as the last blocker. `RunSpec` now opens one
+      persistent connection per session ONCE per spec (`sessionConns` +
+      `openSessionConns`) and reuses it across EVERY permutation — mirroring
+      upstream `isolationtester.c` `main()`. `runPermutation` no longer
+      opens/closes connections; it still re-runs each session's `setup` SQL per
+      permutation (so `SET stats_fetch_consistency='none'` re-applies) but never
+      resets the connection, so a step-set GUC like `SET track_functions='all'`
+      persists into later permutations exactly as upstream — fixing L3732
+      (`pg_stat_get_function_calls` now reads `1` not NULL). `application_name`
+      SET + backend-PID record done once (stable); `sc.drainQueues()` clears the
+      transient notice/notify queues per permutation (monotonic notice `total`
+      kept — `notices <n>` blockers are delta-vs-baseline). Robustness: a
+      post-permutation `sc.healthy(ctx)` (`SELECT 1`/session, 1 s deadline)
+      rebuilds the set if a timed-out step left a connection busy; `close()` is
+      3 s-bounded against a stuck lib/pq read. `TestPort_IsolationStats` flipped
+      to `runIsoSpecStrict` — PASS (byte-for-byte, all permutations); CSV `D-002`
+      rationale updated + md regenerated. Full `TestPort_Isolation*` strict suite
+      re-run (4 parallel batches): zero regressions from connection reuse — the
+      two failures observed (`vacuum-skip-locked`, `vacuum-concurrent-drop`) fail
+      identically at HEAD (pre-existing SKIP_LOCKED WARNING gap, the "4 failed" of
+      the 117/4 tally), and `tuplelock-upgrade-no-deadlock` was a load-induced
+      flake (passes solo). **`stats` is the LAST failed M0118-0009 spec — all
+      M0118-0009 specs are now resolved.**
