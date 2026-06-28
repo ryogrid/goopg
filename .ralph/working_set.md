@@ -1,37 +1,39 @@
 (idle — nothing in flight)
 
-Last landed (loop #2): M0118-0009 doc reconciliation — flipped the lagging
-per-spec inventory row for `stats.spec` failed→pass + regenerated coverage docs.
-NOT an engine change. M0118-0009 checkbox ticked [x] (group fully closed).
+Last landed (loop #3): M0118-0002 `predicate-gist` PROMOTED — GiST page-level
+predicate locking via grid-cell SIREAD (design 0118-0137). Engine change. Strict
+`TestPort_IsolationPredicateGist` PASS (36 perms byte-identical to PG 18.3).
+Isolation tally now 119 pass / 2 failed.
 
-What happened: the stats promotion commit 998b9e97 (design 0118-0133) updated only
-the suite-level `postgres-oracle-port-status.csv`; the per-spec
-`postgres-oracle-target-inventory.csv` `stats.spec` row was still `failed`, so the
-two generated md files under-counted (117 pass / 4 failed). Re-verified
-`TestPort_IsolationStats` strict PASS (3.0 s), flipped the CSV row (comma-free
-rationale — inventory rationale field is UNQUOTED, commas break the parser; see
-memory iso_test_harness note), regenerated `upstream-isolation-coverage.md` +
-`postgres-oracle-target-inventory.md` via `gen-isolation-coverage` /
-`gen-oracle-inventory`. Tally now 118 pass / 3 failed.
+What/why: goopg has NO native GiST AM (a `USING gist` index is catalog-only →
+spatial `p <</>>  point(k,k)` queries fall back to a seq scan), so the seq scan's
+relation-grain SIREAD over-aborted all 18 disjoint-region permutations. Fix
+emulates GiST leaf-page granularity with a synthetic grid: `ssiGistGridCell` =
+FNV-1a of `(floor(x/256),floor(y/256))`. A SERIALIZABLE seq scan of a
+GiST-indexed table takes a per-matching-tuple grid-cell SIREAD on the INDEX
+(`ssiRecordGistGridRead`) INSTEAD of the relation lock (suppressed at Open);
+INSERT conflicts-in on its point's cell (`ssiRecordGistIndexInsert`). Heap
+per-tuple SIREAD skipped (heap-page coarsening → false positives); invisible-tuple
+conflict-out gated by spatial match (`gistTupleMatches`). `Filter`-over-`SeqScan`
+predicate threaded in BOTH build paths (`Build` + live `buildRec`). All gated
+behind `gistSSIIdxOID != 0` (0 for every non-gist scan) → bounded blast radius.
 
-Files: docs/test-port/postgres-oracle-target-inventory.csv (+ regenerated .md and
-upstream-isolation-coverage.md), .ralph/fix_plan.md (checkbox + note).
+Files: internal/executor/ssi.go (helpers), operators_storage.go (seqScanOp +
+Next/Open + insert hooks), executor.go (build-path threading + unwrapSeqScanOp),
+internal/testport/isolation_port_test.go (test), docs/design/0118-0137-*.md +
+README, CSV/coverage regen, fix_plan.md.
 
-REMAINING failed isolation specs (3, all genuinely Effort-L — pick one next loop):
-- predicate-gist (M0118-0002): GENUINE SSI over-detection. goopg's coarse
-  relation/tuple-grain SIREAD raises spurious 40001 where PG's GiST PAGE-level
-  predicate locks see disjoint spatial regions. Fix = GiST spatial page-grain /
-  bounding-box / grid-cell SIREAD — same granularity class predicate-hash solved
-  with bucket-grain SIREAD (FNV→PageLockTag, design 0118-0099 /
-  goopg_hash_index_ssi_bucket_locking). Read-step support already landed (0118-0135:
-  point subscript p[0], <<,>> operators) + float output fixed (0118-0136). Most
-  tractable of the three.
+REMAINING failed isolation specs (2, both Effort-L):
 - predicate-gin (M0118-0002): needs int4[]-column array typing (array[1]→int4[]
-  collapses to int4 today) + a real GIN AM.
+  collapses to int4 today) + a real GIN AM. The grid-cell SSI primitive
+  (ssiGistGridCell / ssiRecordGistGridRead / ssiRecordGistIndexInsert) is
+  reusable once a GIN scan path + array typing exist.
 - deadlock-parallel (M0118-0004): parallel-worker lock groups — goopg has no
   parallel query; not feasible without that subsystem.
 
-Gates this loop: go build ./... clean; TestPort_IsolationStats strict PASS (3.0s);
-gen-isolation-coverage + gen-oracle-inventory regenerated clean; make
-ralph-state-guard OK (self-repaired progress marker). pgbench smoke = pre-commit
-hook (no engine change — docs/CSV only).
+Gates this loop: go build ./... clean; TestPort_IsolationPredicateGist strict
+PASS (7.5s); non-gist SSI regression batch PASS (47.8s); -race executor+mvcc +
+full executor/planner units PASS; pgbench smoke 0-failed (all 3 workloads);
+TPC-H spot-check infra-timed-out on WSL2 (known SLRU-backfill hang; gated path
+structurally unaffected); gen-isolation-coverage + gen-oracle-inventory regen
+clean; make ralph-state-guard OK (self-repaired).

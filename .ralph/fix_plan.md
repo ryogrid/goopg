@@ -256,6 +256,32 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       typing + a GIN AM. Tests `TestPGFloatOut` (28 float8 + 17 float4
       PG-captured goldens) + full `TestPort_RegressSuite` re-run + TPC-H
       Q12/Q13 spot-check. Ledger row recorded.
+      **`predicate-gist` PROMOTED (2026-06-29, design 0118-0137): GiST
+      page-level predicate locking via grid-cell SIREAD.** `failed`→`pass`, all
+      36 perms byte-identical to PG 18.3; strict `TestPort_IsolationPredicateGist`;
+      isolation tally now 119 pass / 2 failed. Closes the granularity gap the
+      0118-0135/0118-0136 enablers had isolated. goopg has no native GiST AM (a
+      `USING gist` index is catalog-only → spatial queries seq-scan), so the seq
+      scan's relation-grain SIREAD over-aborted all 18 disjoint-region perms. Fix
+      emulates GiST leaf-page granularity with a synthetic grid: `ssiGistGridCell`
+      = FNV-1a of `(floor(x/256),floor(y/256))` → 31-bit pseudo-page; a
+      SERIALIZABLE seq scan of a GiST-indexed table takes a per-matching-tuple
+      grid-cell SIREAD on the INDEX (`ssiRecordGistGridRead`) instead of the
+      relation lock (suppressed), and an INSERT conflicts-in on its point's cell
+      (`ssiRecordGistIndexInsert`, the `ssiRecordHashIndexInsert` twin). Heap
+      per-tuple SIREAD skipped (would coarsen to a heap-page lock → false
+      positives); invisible-tuple conflict-out gated by spatial match
+      (`gistTupleMatches`). `Filter`-over-`SeqScan` predicate threaded in BOTH
+      build paths (`Build` + live `buildRec`/`BuildFastIterator`). Blast radius
+      bounded behind `gistSSIIdxOID != 0` (0 for every non-gist scan); catalog
+      `Method`/pg_am/pg_dump/WAL unchanged. Gates: strict 36-perm PASS; non-gist
+      SSI regression (`predicate-hash`/`partial-index`/`index-only-scan`/
+      `simple-write-skew`/`project-manager`/`classroom-scheduling`/
+      `read-write-unique`) PASS; `-race` executor+mvcc + full executor/planner
+      units PASS; `go build ./...` clean; pgbench smoke 0 failed; TPC-H spot-check
+      infra-timed-out on WSL2 (gated path unaffected). **Remaining in M0118-0002:
+      `predicate-gin`** (needs `int4[]`-column array typing + a GIN AM) — group
+      stays open.
 - [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
       All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
       nowait{,-2,-3,-4,-5}, lock-nowait,

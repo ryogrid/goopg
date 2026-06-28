@@ -1273,6 +1273,27 @@ func TestPort_IsolationPredicateHash(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/predicate-hash.spec")
 }
 
+// TestPort_IsolationPredicateGist exercises predicate-gist: PAGE (leaf) level
+// predicate locking in a GiST index. Two SERIALIZABLE transactions each scan a
+// point column with a spatial half-plane filter (p << / >> point(k,k)) and
+// INSERT points. A scan and an insert that touch the SAME spatial region form an
+// rw-conflict (so an overlapping interleaving aborts the loser with 40001),
+// while a scan and an insert that touch DISJOINT regions must NOT conflict — the
+// reduced-false-positive half of the test. goopg has no native GiST AM (a
+// `USING gist` index is catalog-only), so these queries run as seq scans;
+// promoted to pass-required (M0118-0002, design 0118-0137) by switching that
+// scan from a relation-grain SIREAD to a per-matching-tuple grid-cell SIREAD on
+// the index (ssiRecordGistGridRead / ssiRecordGistIndexInsert), so goopg matches
+// PG 18.3 byte-for-byte across all 36 permutations (previously over-aborted the
+// 18 disjoint-region interleavings).
+func TestPort_IsolationPredicateGist(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_predicate_gist")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/predicate-gist.spec")
+}
+
 // TestPort_IsolationPartialIndex exercises partial-index: an UPDATE that moves a
 // row out of a partial index (CREATE INDEX ... WHERE val2 = 1) under SERIALIZABLE
 // must still create the read/write dependency a full-table read would, so any

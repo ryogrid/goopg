@@ -706,6 +706,24 @@ type seqScanOp struct {
 	ctx  *Context
 	cols []catalog.Column
 
+	// ssiGistPred is the spatial WHERE predicate of the Filter directly above
+	// this scan, handed down at build time (Build / buildRec). When the scan runs
+	// under SERIALIZABLE on a table carrying a GiST index on the predicate's point
+	// column, the scan takes per-matching-tuple grid-cell SIREAD predicate locks
+	// (design 0118-0137) instead of a relation-grain lock, reproducing PG's
+	// page-level GiST predicate locking (predicate-gist spec). nil for every
+	// non-gist scan (the common case) — pure no-op.
+	ssiGistPred planner.Expr
+	// gistSSIIdxOID / gistSSIColIdx are resolved in Open from ssiGistPred + the
+	// table's GiST index: the index OID used as the predicate-lock relation and
+	// the position of the indexed point column in cols. gistSSIIdxOID==0 disables
+	// the whole gist-SSI path (so the relation-grain lock + per-tuple heap SIREAD
+	// run as before). gistScratch is a reusable decode buffer for INVISIBLE
+	// tuples (concurrent-insert conflict-out), which the normal flow never decodes.
+	gistSSIIdxOID uint32
+	gistSSIColIdx int
+	gistScratch   Row
+
 	nBlocks  storage.BlockNumber
 	curBlock storage.BlockNumber
 	curSlot  uint16
@@ -863,6 +881,35 @@ func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 
 func (o *seqScanOp) Schema() planner.Schema { return o.schema }
 
+// gistRowMatches evaluates the GiST spatial-SSI predicate against an
+// already-decoded leaf-local row, returning whether the row matches the scan's
+// spatial filter. Used only in gist-SSI mode (gistSSIIdxOID != 0); returns false
+// on any eval error or non-boolean result. Design 0118-0137.
+func (o *seqScanOp) gistRowMatches(row Row) bool {
+	res, err := evalExpr(o.ssiGistPred, row, o.ctx)
+	if err != nil || res.Kind != KindBool {
+		return false
+	}
+	return res.BoolValue()
+}
+
+// gistTupleMatches decodes an INVISIBLE tuple into the reusable gist scratch row
+// and evaluates the spatial predicate. The normal scan flow never decodes
+// invisible tuples, so this path exists to gate the concurrent-insert
+// conflict-out by spatial match (design 0118-0137). MUST be called with the page
+// RLock held — tuple.Data views the page bytes. Returns false on decode/eval
+// failure.
+func (o *seqScanOp) gistTupleMatches(tuple storage.HeapTuple) bool {
+	if o.gistScratch == nil || len(o.gistScratch) != len(o.cols) {
+		o.gistScratch = make(Row, len(o.cols))
+	}
+	storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+	if err := DecodeRowIntoMctxPGTuple(o.gistScratch, o.cols, tuple.Data, tuple.Bitmap, storedNatts, o.sctx); err != nil {
+		return false
+	}
+	return o.gistRowMatches(o.gistScratch)
+}
+
 func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.pos, Message: "SeqScan requires storage handles in Context"}
@@ -886,12 +933,26 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	}
 	// Cache rel once — avoids the catalog RLock on every Next() call.
 	o.rel = ctx.Catalog.RelFileNode(o.tbl)
+	// M0118-0002 (design 0118-0137): GiST spatial-SSI mode. A SERIALIZABLE scan
+	// with a spatial filter on a GiST-indexed point column locks per-matching-
+	// tuple grid cells on the index (Next loop below) instead of the whole
+	// relation, reproducing PG's page-level GiST predicate locking and its reduced
+	// false positives (predicate-gist). Resolved here while ctx/catalog are in
+	// hand; gistSSIIdxOID==0 leaves the legacy relation-grain path untouched.
+	if o.ssiGistPred != nil && ssiActive(ctx) && (o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView)) {
+		if oid, colIdx, ok := ssiGistIndexForTable(ctx, o.tbl, o.cols); ok {
+			o.gistSSIIdxOID = oid
+			o.gistSSIColIdx = colIdx
+		}
+	}
 	// M0118-0001: a SERIALIZABLE seq scan takes a relation-level SIREAD
 	// predicate lock so a concurrent writer's INSERT of a matching row forms
 	// the rw-conflict (phantom). Mirrors PredicateLockRelation in upstream
 	// heap_beginscan; temp / matview relations are excluded exactly as
 	// PredicateLockingNeededForRelation does (system catalogs gated in the hook).
-	if o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView) {
+	// In GiST spatial-SSI mode the finer grid-cell locks replace this coarse lock
+	// (taking both would re-coarsen to the relation grain and over-abort).
+	if o.gistSSIIdxOID == 0 && (o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView)) {
 		ssiRecordRelationRead(ctx, o.rel)
 	}
 	if err := ctx.acquireRelLock(o.rel, lockmgr.AccessShareLock); err != nil {
@@ -1130,6 +1191,25 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				continue
 			}
 			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
+				// M0118-0002 (design 0118-0137): in GiST spatial-SSI mode the
+				// invisible-tuple conflict-out is gated by the spatial predicate —
+				// only a concurrent insert that MATCHES this scan's region forms the
+				// reader→inserter rw-edge (a relation-wide conflict-out would
+				// re-introduce the false positives the grid-cell locking removes).
+				// The decode reads tuple.Data, which views the page bytes, so it must
+				// happen before the RUnlock.
+				if o.gistSSIIdxOID != 0 {
+					gistMatch := o.gistTupleMatches(tuple)
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					if gistMatch {
+						if err := ssiRecordInvisibleTupleRead(o.ctx, rel, tuple.Header.Xmin); err != nil {
+							return nil, err
+						}
+					}
+					continue
+				}
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}
@@ -1171,11 +1251,17 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// structure to an already-committed writer and the reader must
 			// abort mid-statement (40001). Release the per-tuple page RLock
 			// before returning; Close()/the pin handles buffer release.
-			if err := ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
-				if o.pinned != nil {
-					o.pinned.RUnlock()
+			// M0118-0002 (design 0118-0137): in GiST spatial-SSI mode the heap
+			// per-tuple SIREAD is replaced by a grid-cell SIREAD on the index,
+			// taken below once the row is decoded (taking the heap lock here too
+			// would coarsen to a heap-page lock and re-introduce false positives).
+			if o.gistSSIIdxOID == 0 {
+				if err := ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					return nil, err
 				}
-				return nil, err
 			}
 			// M0054-0005a: decode into the reusable o.scanRow
 			// buffer. M0073-0004: route varchar / char / text /
@@ -1213,6 +1299,27 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 					continue // skip undetoastable tuple
 				}
 				row = detoasted
+			}
+			// M0118-0002 (design 0118-0137): GiST spatial-SSI read hook. A visible
+			// tuple matching the spatial predicate takes a grid-cell SIREAD on the
+			// GiST index (the phantom mechanism) plus the reader→writer conflict-out
+			// (the write-before-read edge). Done after decode so the point value is
+			// available; the page RLock is still held, so release it before any
+			// 40001 mid-statement abort, exactly like the heap hook above.
+			if o.gistSSIIdxOID != 0 && o.gistSSIColIdx < len(row) {
+				if o.gistRowMatches(row) {
+					if row[o.gistSSIColIdx].Kind == KindString {
+						if pt, pok := parsePointText(row[o.gistSSIColIdx].StringValue()); pok {
+							ssiRecordGistGridRead(o.ctx, o.rel.DBOid, o.gistSSIIdxOID, pt[0], pt[1])
+						}
+					}
+					if serr := ssiConflictOutTupleRead(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax); serr != nil {
+						if o.pinned != nil {
+							o.pinned.RUnlock()
+						}
+						return nil, serr
+					}
+				}
 			}
 			// M0100-0005 lock-committed-update fix: materialize the
 			// row (deep-copy arena-backed Datums into owned bytes)
@@ -1662,6 +1769,12 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if serr := ssiRecordHashIndexInsert(o.ctx, partTable, partTable.Columns, partRow, targetRel.DBOid); serr != nil {
 				return nil, serr
 			}
+			// SSI GiST grid-cell conflict-in (design 0118-0137): forms the rw-edge
+			// against a SERIALIZABLE reader holding the inserted point's grid-cell
+			// SIREAD on a GiST index.
+			if serr := ssiRecordGistIndexInsert(o.ctx, partTable, partTable.Columns, partRow, targetRel.DBOid); serr != nil {
+				return nil, serr
+			}
 			maintainUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, ptr)
 			o.appendInsertRetRow(row)
 			o.rowsAffected++
@@ -1697,6 +1810,12 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// against a SERIALIZABLE reader holding the inserted value's bucket SIREAD
 		// on a hash index.
 		if serr := ssiRecordHashIndexInsert(o.ctx, o.plan.Table, cols, row, targetRel.DBOid); serr != nil {
+			return nil, serr
+		}
+		// SSI GiST grid-cell conflict-in (design 0118-0137): forms the rw-edge
+		// against a SERIALIZABLE reader holding the inserted point's grid-cell
+		// SIREAD on a GiST index.
+		if serr := ssiRecordGistIndexInsert(o.ctx, o.plan.Table, cols, row, targetRel.DBOid); serr != nil {
 			return nil, serr
 		}
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)

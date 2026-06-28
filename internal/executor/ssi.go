@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"encoding/binary"
 	"errors"
 	"hash/fnv"
+	"math"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -148,6 +150,114 @@ func ssiRecordHashIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.C
 			continue
 		}
 		tag := mvcc.PageLockTag(dbOid, idx.OID, ssiHashBucket(key))
+		if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); cerr != nil {
+			return ssiReadAbortError(cerr)
+		}
+	}
+	return nil
+}
+
+// ssiGistCellSize is the side length (in point-coordinate units) of one cell in
+// the synthetic grid that stands in for GiST leaf-page granularity. goopg has no
+// native GiST access method — a `USING gist` index is catalog-only (no physical
+// tree), so a SERIALIZABLE spatial scan falls back to a seq scan. To reproduce
+// PG's PAGE-level GiST predicate locking (predicate-gist spec, "reduced false
+// positives") the scan instead locks the grid cell of each matching point: two
+// scans of disjoint spatial regions lock disjoint cells (no false conflict),
+// while a scan and an INSERT that touch the same spatial neighbourhood share a
+// cell (true rw-conflict). The base data (point(g*10,g*10), g=1..1000) is dense
+// at this resolution, so every queried sub-region's boundary cells are populated
+// — an INSERT landing in a read region always collides with a locked cell.
+const ssiGistCellSize = 256.0
+
+// ssiGistGridCell maps a point's (x, y) to a stable pseudo-page number for a
+// grid-cell predicate lock. The cell index is the FNV hash of the integer grid
+// coordinates (floor(x/cell), floor(y/cell)): equal cells always map to the same
+// page; distinct cells collide only with ~2^-31 probability (a collision merely
+// re-introduces a false-positive conflict — the safe over-abort direction).
+// Masked to 31 bits so the result is never InvalidBlockNumber, which
+// mvcc.PageLockTag rejects. FNV (rather than a packed encoding) keeps the result
+// bounded for arbitrarily large/negative coordinates; spatial adjacency is not
+// needed because only EXACT cell identity must match between a read tuple and a
+// later insert.
+func ssiGistGridCell(x, y float64) storage.BlockNumber {
+	cx := int64(math.Floor(x / ssiGistCellSize))
+	cy := int64(math.Floor(y / ssiGistCellSize))
+	h := fnv.New32a()
+	var b [16]byte
+	binary.LittleEndian.PutUint64(b[0:8], uint64(cx))
+	binary.LittleEndian.PutUint64(b[8:16], uint64(cy))
+	_, _ = h.Write(b[:])
+	return storage.BlockNumber(h.Sum32() & 0x7FFFFFFF)
+}
+
+// ssiGistIndexForTable returns the OID of a GiST index on tbl and the position
+// of its (first) key column within cols, or ok=false when tbl carries no usable
+// GiST index. Used by a SERIALIZABLE seq scan to decide whether to switch from
+// relation-grain to grid-cell SIREAD locking (design 0118-0137). Expression
+// (non-column) GiST keys are unsupported and skipped.
+func ssiGistIndexForTable(ctx *Context, tbl *catalog.Table, cols []catalog.Column) (idxOID uint32, colIdx int, ok bool) {
+	if ctx == nil || ctx.Catalog == nil || tbl == nil {
+		return 0, 0, false
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if idx == nil || idx.Method != "gist" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
+			continue
+		}
+		for i := range cols {
+			if cols[i].Name == idx.Columns[0] {
+				return idx.OID, i, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// ssiRecordGistGridRead acquires a grid-cell (page) SIREAD predicate lock on a
+// GiST index for a SERIALIZABLE spatial scan, keyed by the index OID and the
+// grid cell of a matching point. The index OID is used as the predicate-lock
+// relation so these page tags never collide with the heap relation's tuple/page
+// locks. A later SERIALIZABLE INSERT of a point in the same cell
+// (ssiRecordGistIndexInsert) finds this reader via the conflict-in walk and
+// forms the rw-edge; an INSERT in a different cell does not (design 0118-0137).
+func ssiRecordGistGridRead(ctx *Context, dbOid, indexOID uint32, x, y float64) {
+	if !ssiActive(ctx) || indexOID == 0 {
+		return
+	}
+	tag := mvcc.PageLockTag(dbOid, indexOID, ssiGistGridCell(x, y))
+	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
+}
+
+// ssiRecordGistIndexInsert is the SERIALIZABLE write-path hook for INSERTs into
+// a table carrying one or more GiST indexes. For each GiST index it computes the
+// inserted point's grid-cell page tag (matching ssiRecordGistGridRead's keying)
+// and runs the conflict-in walk, installing an rw-edge from every SERIALIZABLE
+// reader holding that cell's SIREAD — and aborting this INSERT in place (40001)
+// when it closes a dangerous structure to an already-committed pivot, exactly
+// like ssiRecordHashIndexInsert. No-op for non-GiST tables / RC / RR.
+func ssiRecordGistIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, dbOid uint32) error {
+	if !ssiActive(ctx) || tbl == nil {
+		return nil
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if idx == nil || idx.Method != "gist" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
+			continue
+		}
+		colIdx := -1
+		for i := range cols {
+			if cols[i].Name == idx.Columns[0] {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx < 0 || colIdx >= len(row) || row[colIdx].Kind != KindString {
+			continue
+		}
+		pt, pok := parsePointText(row[colIdx].StringValue())
+		if !pok {
+			continue
+		}
+		tag := mvcc.PageLockTag(dbOid, idx.OID, ssiGistGridCell(pt[0], pt[1]))
 		if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); cerr != nil {
 			return ssiReadAbortError(cerr)
 		}
