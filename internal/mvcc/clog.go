@@ -838,33 +838,24 @@ func (c *CLog) EnablePGSLRUMirror(dir string) error {
 
 	// Backfill any in-memory committed/aborted entries so an opened clog
 	// (which loaded data from the flat file but had no SLRU mirror) is
-	// projected to the SLRU on first enable. mirrorToSLRUUnlocked uses OR so
-	// it never clears bits already set by loadFromSLRU above.
+	// projected to the SLRU on first enable. Use the batched range writer
+	// (ONE fsync per segment) rather than the naive per-XID mirror: on a
+	// well-aged cluster the banks hold ~NextXID terminal entries, so the old
+	// per-XID path issued ~NextXID open+fsync+close cycles here — on WSL2's
+	// slow fsync that made startup take many minutes and infra-failed the
+	// TPC-H spot-check's 60 s readiness window (it is purely a re-projection
+	// of in-memory state, so a crash mid-backfill simply re-backfills next
+	// start — no per-XID durability barrier is required). The batched writer
+	// reads each XID's real status via GetStatus and ORs into the existing
+	// segment bytes, so it is byte-identical to the per-XID path it replaces.
+	// See design 0117-0009 and memory tpch_spotcheck_slru_backfill_startup_hang.
 	c.banksMu.RLock()
 	nBanks := len(c.banks)
 	c.banksMu.RUnlock()
-
-	for bi := 0; bi < nBanks; bi++ {
-		b := c.getBank(bi)
-		if b == nil {
-			continue
-		}
-		b.mu.RLock()
-		data := make([]byte, len(b.data))
-		copy(data, b.data)
-		b.mu.RUnlock()
-
-		for byt, v := range data {
-			st := TxnStatus(v)
-			if st == TxnStatusCommitted || st == TxnStatusAborted {
-				xid := storage.TransactionID(bi*xidsPerBank + byt)
-				if xid == 0 {
-					continue
-				}
-				if err := c.mirrorToSLRUUnlocked(xid, st); err != nil {
-					return err
-				}
-			}
+	if nBanks > 0 {
+		hi := storage.TransactionID(uint64(nBanks) * uint64(xidsPerBank))
+		if err := c.mirrorTerminalRangeBatchedUnlocked(FirstNormalTransactionID, hi); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -135,6 +135,83 @@ func TestCLogDualStoreConsistency(t *testing.T) {
 	}
 }
 
+// TestCLogEnableMirrorBackfillBatched pins the EnablePGSLRUMirror backfill path
+// (design 0117-0009): a CLog opened from the flat file with NO SLRU mirror yet
+// holds terminal statuses only in its banks. EnablePGSLRUMirror must project the
+// whole resident set into the pg_xact/ SLRU on first enable. This loop replaced
+// the naive per-XID backfill (one open+fsync+close per XID — minutes on WSL2's
+// slow fsync, which infra-failed the TPC-H spot-check's 60 s readiness window)
+// with the batched range writer (one fsync per segment). The two must be
+// byte-equivalent, so the SLRU-derived view after a backfill must match the
+// banks per-XID across a page boundary and across mixed committed/aborted/
+// sub-committed lanes — the same drift surface the dual-store test guards, but
+// reached via the backfill rather than the live per-commit mirror.
+func TestCLogEnableMirrorBackfillBatched(t *testing.T) {
+	dir := t.TempDir()
+	flatPath := filepath.Join(dir, "pg_xact_flat")
+	slruDir := filepath.Join(dir, "pg_xact")
+
+	// Open WITHOUT enabling the SLRU mirror, then write statuses: with slruDir
+	// empty, mirrorToSLRUUnlocked is a no-op, so these land only in the banks /
+	// flat file — exactly the "loaded from flat file, no mirror yet" state the
+	// backfill exists to project.
+	c, err := OpenCLog(flatPath)
+	if err != nil {
+		t.Fatalf("OpenCLog: %v", err)
+	}
+
+	const pageBoundary = storage.TransactionID(clogXactsPerPage) // 32768
+	set := []xidStatus{
+		{FirstNormalTransactionID, TxnStatusCommitted},
+		{4, TxnStatusAborted}, // adjacent lanes catch wrong bit-shift
+		{5, TxnStatusCommitted},
+		{6, TxnStatusSubCommitted},
+		{7, TxnStatusSubCommitted},
+		{100, TxnStatusAborted},
+		{1000, TxnStatusCommitted},
+		{pageBoundary - 1, TxnStatusCommitted}, // last XID of page 0
+		{pageBoundary, TxnStatusAborted},       // first XID of page 1 (crosses boundary)
+		{pageBoundary + 1, TxnStatusCommitted},
+		{pageBoundary + 2, TxnStatusSubCommitted},
+		{pageBoundary + 1234, TxnStatusAborted},
+	}
+	writeStatuses(t, c, set)
+
+	// No SLRU segment should exist yet (mirror disabled during the writes).
+	if _, err := os.Stat(filepath.Join(slruDir, "0000")); !os.IsNotExist(err) {
+		t.Fatalf("SLRU segment 0000 exists before EnablePGSLRUMirror (err=%v)", err)
+	}
+
+	// Enable the mirror — this triggers the batched backfill under test.
+	if err := c.EnablePGSLRUMirror(slruDir); err != nil {
+		t.Fatalf("EnablePGSLRUMirror: %v", err)
+	}
+
+	// The SLRU-derived view (the durable PG-compatible encoding a standby or
+	// crash recovery reads) must match every backfilled XID.
+	fresh := freshFromSLRU(t, slruDir)
+	for _, s := range set {
+		if got := fresh.GetStatus(s.xid); got != s.want {
+			t.Errorf("after backfill, SLRU-derived GetStatus(%d) = %d, want %d", s.xid, got, s.want)
+		}
+	}
+
+	// A terminal XID NOT in the set must remain Unknown in the mirror (the
+	// backfill must not stamp lanes it was never asked to).
+	if got := fresh.GetStatus(50000); got != TxnStatusUnknown {
+		t.Errorf("unwritten XID 50000 mirrored as %d, want Unknown(%d)", got, TxnStatusUnknown)
+	}
+
+	// Both pages of segment 0000 must be materialised (page 0 + page 1).
+	fi, err := os.Stat(filepath.Join(slruDir, "0000"))
+	if err != nil {
+		t.Fatalf("stat SLRU segment 0000: %v", err)
+	}
+	if minSize := int64(2) * int64(storage.BlockSize); fi.Size() < minSize {
+		t.Errorf("SLRU segment 0000 size = %d, want >= %d (must span 2 pages)", fi.Size(), minSize)
+	}
+}
+
 // TestCLogSubCommittedResolvesViaParent pins the DidCommit resolution of a
 // SUB_COMMITTED lane, mirroring PG transam.c TransactionIdDidCommit: a
 // sub-committed subtransaction is committed iff its top-level parent is

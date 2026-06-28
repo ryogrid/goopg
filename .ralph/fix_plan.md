@@ -96,6 +96,20 @@ prev-link fixes.
 Milestone doc `docs/milestones/0117-clog-postgresql-subsystem-alignment.md`. Goal:
 bring `pg_xact` (CLOG) + `pg_subtrans` to PG 18.3 parity.
 
+**2026-06-29 enabler (design 0117-0009, NOT a sub-task closure): TPC-H
+spot-check startup-hang cleared.** `EnablePGSLRUMirror`'s startup backfill
+fsync'd once per XID (~1.5M fsyncs on the bench dir → >6 min on WSL2), so the
+mandated executor/planner gate `scripts/tpch-spotcheck.sh` never reached its 60 s
+readiness window and infra-FAILED — the sole reason loops #7/#8 reported BLOCKED
+and deferred the whole M0117 live-path tail. Fixed by routing the backfill
+through the existing batched `mirrorTerminalRangeBatchedUnlocked` (one fsync per
+segment, ≈2 total); byte-equivalent, live per-commit path untouched. A fresh
+spotcheck start now reaches *ready* in ~35 s (was >6 min). The Q12/Q13 row-count
+gate is usable again (data dir needs its `tpch` role reloaded via
+`bench/tpch/setup_goopg.sh`+`build_schema_goopg.sh` — a separate provisioning
+step), unblocking 0117-0006 Part B / 0117-0007 Part B for a dedicated full-gate
+session. Regression `TestCLogEnableMirrorBackfillBatched`.
+
 - [x] **M0117-0001..0005** — DONE (designs `0117-0001..0005`; branches pending human
       merge off clean HEAD): wraparound-safe `storage.XIDPrecedes` horizon comparison;
       runtime CLOG-consulting visibility fallback; `pg_subtrans` restore-on-restart;
