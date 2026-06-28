@@ -724,6 +724,25 @@ type seqScanOp struct {
 	gistSSIColIdx int
 	gistScratch   Row
 
+	// ssiGinPred is the `<gincol> @> <const array>` WHERE predicate of the Filter
+	// directly above this scan, handed down at build time (same site as
+	// ssiGistPred). Under SERIALIZABLE on a table carrying a GIN index on the
+	// predicate's array column, the scan takes GIN key-grain SIREAD predicate locks
+	// on the search keys (design 0118-0140) instead of a relation-grain lock,
+	// reproducing PG's per-key GIN index predicate locking (predicate-gin spec).
+	// nil for every non-gin scan — pure no-op.
+	ssiGinPred planner.Expr
+	// ginSSIIdxOID / ginSSIColIdx are resolved in Open from ssiGinPred + the
+	// table's GIN index: the index OID used as the predicate-lock relation and the
+	// position of the indexed array column in cols. ginSSIIdxOID==0 disables the
+	// gin-SSI path (relation-grain lock + per-tuple heap SIREAD run as before).
+	// ginSSIFastUpdate is the index's fastupdate state at Open; ginSearchKeys are
+	// the extracted search keys (array elements of the @> right operand).
+	ginSSIIdxOID     uint32
+	ginSSIColIdx     int
+	ginSSIFastUpdate bool
+	ginSearchKeys    []string
+
 	nBlocks  storage.BlockNumber
 	curBlock storage.BlockNumber
 	curSlot  uint16
@@ -910,6 +929,29 @@ func (o *seqScanOp) gistTupleMatches(tuple storage.HeapTuple) bool {
 	return o.gistRowMatches(o.gistScratch)
 }
 
+// ginSearchKeys extracts the GIN search keys from this scan's
+// `<gincol> @> <const array>` predicate (o.ssiGinPred). Returns the
+// canonical-text elements of the constant array operand and ok=true only for the
+// supported `@>` form with the gin column on the contains side; any other shape
+// returns ok=false so the caller keeps relation-grain locking (never under-locks).
+// Design 0118-0140.
+func (o *seqScanOp) extractGinSearchKeys(colName string) ([]string, bool) {
+	bin, ok := o.ssiGinPred.(*planner.BinaryOp)
+	if !ok || bin.Op != parser.OpContains {
+		return nil, false
+	}
+	// `col @> array[...]`: Left is the gin column, Right is the constant array.
+	lc, lok := bin.Left.(*planner.ColumnRef)
+	if !lok || !strings.EqualFold(lc.Name, colName) {
+		return nil, false
+	}
+	d, err := evalExpr(bin.Right, nil, o.ctx)
+	if err != nil || d.Kind != KindString {
+		return nil, false
+	}
+	return parseTextArray(d.StringValue()), true
+}
+
 func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.pos, Message: "SeqScan requires storage handles in Context"}
@@ -945,14 +987,35 @@ func (o *seqScanOp) Open(ctx *Context) error {
 			o.gistSSIColIdx = colIdx
 		}
 	}
+	// M0118-0002 (design 0118-0140): GIN key-grain-SSI mode. A SERIALIZABLE
+	// `<arraycol> @> array[...]` scan on a GIN-indexed array column locks the
+	// posting-tree page of each search key on the index instead of the whole
+	// relation, reproducing PG's per-key GIN index predicate locking and its
+	// reduced false positives (predicate-gin). The key SIREADs are taken here
+	// (the search keys come from the constant @> right operand — independent of
+	// which tuples match, so a non-existing key still locks its page); the matching
+	// INSERT conflicts-in on each inserted element's page. ginSSIIdxOID==0 leaves
+	// the legacy relation-grain path untouched (including when the predicate shape
+	// is unsupported, so we never under-lock).
+	if o.gistSSIIdxOID == 0 && o.ssiGinPred != nil && ssiActive(ctx) && (o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView)) {
+		if oid, colIdx, fu, ok := ssiGinIndexForTable(ctx, o.tbl, o.cols); ok {
+			if keys, kok := o.extractGinSearchKeys(o.cols[colIdx].Name); kok {
+				o.ginSSIIdxOID = oid
+				o.ginSSIColIdx = colIdx
+				o.ginSSIFastUpdate = fu
+				o.ginSearchKeys = keys
+				ssiRecordGinKeyRead(ctx, o.rel.DBOid, oid, keys, fu)
+			}
+		}
+	}
 	// M0118-0001: a SERIALIZABLE seq scan takes a relation-level SIREAD
 	// predicate lock so a concurrent writer's INSERT of a matching row forms
 	// the rw-conflict (phantom). Mirrors PredicateLockRelation in upstream
 	// heap_beginscan; temp / matview relations are excluded exactly as
 	// PredicateLockingNeededForRelation does (system catalogs gated in the hook).
-	// In GiST spatial-SSI mode the finer grid-cell locks replace this coarse lock
-	// (taking both would re-coarsen to the relation grain and over-abort).
-	if o.gistSSIIdxOID == 0 && (o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView)) {
+	// In GiST/GIN index-SSI mode the finer index-page locks replace this coarse
+	// lock (taking both would re-coarsen to the relation grain and over-abort).
+	if o.gistSSIIdxOID == 0 && o.ginSSIIdxOID == 0 && (o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView)) {
 		ssiRecordRelationRead(ctx, o.rel)
 	}
 	if err := ctx.acquireRelLock(o.rel, lockmgr.AccessShareLock); err != nil {
@@ -1210,6 +1273,17 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 					}
 					continue
 				}
+				// M0118-0002 (design 0118-0140): in GIN key-grain-SSI mode the
+				// reader→inserter rw-edge is formed write-side (the INSERT
+				// conflicts-in on the search-key page), so the relation-wide
+				// invisible-tuple conflict-out is suppressed — it would re-introduce
+				// the false positives the per-key locking removes.
+				if o.ginSSIIdxOID != 0 {
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					continue
+				}
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}
@@ -1255,7 +1329,7 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// per-tuple SIREAD is replaced by a grid-cell SIREAD on the index,
 			// taken below once the row is decoded (taking the heap lock here too
 			// would coarsen to a heap-page lock and re-introduce false positives).
-			if o.gistSSIIdxOID == 0 {
+			if o.gistSSIIdxOID == 0 && o.ginSSIIdxOID == 0 {
 				if err := ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
 					if o.pinned != nil {
 						o.pinned.RUnlock()
@@ -1783,6 +1857,12 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if serr := ssiRecordGistIndexInsert(o.ctx, partTable, partTable.Columns, partRow, targetRel.DBOid); serr != nil {
 				return nil, serr
 			}
+			// SSI GIN key-grain conflict-in (design 0118-0140): forms the rw-edge
+			// against a SERIALIZABLE reader holding a matching search-key SIREAD on
+			// a GIN index.
+			if serr := ssiRecordGinIndexInsert(o.ctx, partTable, partTable.Columns, partRow, targetRel.DBOid); serr != nil {
+				return nil, serr
+			}
 			maintainUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, ptr)
 			o.appendInsertRetRow(row)
 			o.rowsAffected++
@@ -1824,6 +1904,12 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// against a SERIALIZABLE reader holding the inserted point's grid-cell
 		// SIREAD on a GiST index.
 		if serr := ssiRecordGistIndexInsert(o.ctx, o.plan.Table, cols, row, targetRel.DBOid); serr != nil {
+			return nil, serr
+		}
+		// SSI GIN key-grain conflict-in (design 0118-0140): forms the rw-edge
+		// against a SERIALIZABLE reader holding a matching search-key SIREAD on a
+		// GIN index.
+		if serr := ssiRecordGinIndexInsert(o.ctx, o.plan.Table, cols, row, targetRel.DBOid); serr != nil {
 			return nil, serr
 		}
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)

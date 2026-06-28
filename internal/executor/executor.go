@@ -102,6 +102,7 @@ func Build(plan planner.Node) (Operator, error) {
 		if _, ok := p.Child.(*planner.SeqScan); ok {
 			if so := unwrapSeqScanOp(child); so != nil {
 				so.ssiGistPred = p.Predicate
+				so.ssiGinPred = p.Predicate
 			}
 		}
 		// M0054-0005a-followup: filterOp is a pure pass-through
@@ -404,6 +405,7 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		if _, ok := p.Child.(*planner.SeqScan); ok {
 			if so, ok2 := tree.ops[childIdx].state.(*seqScanOp); ok2 {
 				so.ssiGistPred = p.Predicate
+				so.ssiGinPred = p.Predicate
 			}
 		}
 		// Phase C.3: predicate compiled into exprTreeSlab; filterState holds

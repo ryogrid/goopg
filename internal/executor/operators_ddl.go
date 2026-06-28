@@ -5578,6 +5578,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						}
 					}
 				}
+				if act.Kind == parser.AlterIndexSetReloptions {
+					// SET (param = value, …) on an index. Update the index's live
+					// catalog fields so pg_class.reloptions / pg_dump round-trip the
+					// change; only GIN fastupdate has runtime effect (toggles the
+					// predicate-gin SSI lock granularity between per-key and
+					// whole-index, design 0118-0140). Unrecognized options are
+					// accepted and ignored, matching the CREATE INDEX WITH path.
+					for name, val := range act.With {
+						if strings.EqualFold(name, "fastupdate") {
+							if b, ok := parseReloptionBool(val); ok {
+								idx.FastUpdate = &b
+							}
+						}
+					}
+				}
 			}
 			// Other ALTER actions on index: silently accept in v0.
 			return nil

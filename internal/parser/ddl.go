@@ -4622,6 +4622,21 @@ func (p *parser) parseAlter() (Stmt, error) {
 				}
 			}
 		}
+		// ALTER INDEX name SET (param = value, …) — index storage parameters.
+		// Only GIN fastupdate is acted on (drives predicate-gin SSI granularity,
+		// design 0118-0140); other options round-trip as accepted no-ops.
+		if p.acceptKeyword(KwSet) {
+			opts, err := p.parseWithOptions()
+			if err != nil {
+				return nil, err
+			}
+			stmt := &AlterTableStmt{pos: t.Pos, Name: idxName}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				Kind: AlterIndexSetReloptions,
+				With: opts,
+			})
+			return stmt, nil
+		}
 		// ALTER INDEX parent ATTACH PARTITION child — register index partition hierarchy.
 		if p.acceptIdentKeyword("attach") {
 			if !p.acceptKeyword(KwPartition) {

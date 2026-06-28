@@ -265,6 +265,133 @@ func ssiRecordGistIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.C
 	return nil
 }
 
+// ssiGinSentinelPage is the synthetic "whole index" page used for a GIN index
+// running with fastupdate=on. PG's GIN fastupdate buffers new entries in a single
+// pending list that is predicate-locked as one unit, so the engine cannot
+// distinguish individual keys: every read takes a lock covering the entire index
+// and every insert conflicts with it (predicate-gin spec, "With fastupdate = on
+// all index is under predicate lock. So we can't distinguish particular keys").
+// A fixed reserved page number (distinct from any FNV key page) stands in for
+// that whole-index lock.
+const ssiGinSentinelPage storage.BlockNumber = 0x7FFFFFFE
+
+// ssiGinKeyPage maps a single GIN search key (an array element in its canonical
+// PG text form) to a stable pseudo-page for a key-grain predicate lock. goopg has
+// no native GIN access method — a `USING gin` index is catalog-only (no physical
+// posting tree), so a SERIALIZABLE `p @> array[K]` scan falls back to a seq scan.
+// To reproduce PG's per-key (posting-tree page) GIN predicate locking the scan
+// instead locks the page of each search key K, and an INSERT conflicts-in on each
+// element of the inserted array: a scan for key K and an insert of key K' conflict
+// iff K==K' (predicate-gin spec's "same part of the index" vs "different parts").
+// FNV of the key text, masked to 31 bits so the result is never
+// InvalidBlockNumber (which mvcc.PageLockTag rejects) and never collides with the
+// sentinel page (a collision merely re-introduces a false-positive conflict — the
+// safe over-abort direction).
+func ssiGinKeyPage(key string) storage.BlockNumber {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	p := storage.BlockNumber(h.Sum32() & 0x7FFFFFFF)
+	if p == ssiGinSentinelPage {
+		p--
+	}
+	return p
+}
+
+// ssiGinIndexForTable returns the OID of a GIN index on tbl, the position of its
+// (first) key column within cols, and the index's current fastupdate state, or
+// ok=false when tbl carries no usable GIN index. Used by a SERIALIZABLE seq scan
+// to switch from relation-grain to GIN key-grain SIREAD locking (design 0118-0140).
+// fastupdate defaults to PG's ON when the reloption is unset; the predicate-gin
+// spec creates the index `WITH (fastupdate = off)` and toggles it via ALTER INDEX.
+func ssiGinIndexForTable(ctx *Context, tbl *catalog.Table, cols []catalog.Column) (idxOID uint32, colIdx int, fastUpdate bool, ok bool) {
+	if ctx == nil || ctx.Catalog == nil || tbl == nil {
+		return 0, 0, false, false
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if idx == nil || idx.Method != "gin" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
+			continue
+		}
+		for i := range cols {
+			if cols[i].Name == idx.Columns[0] {
+				fu := true // PG default fastupdate = on
+				if idx.FastUpdate != nil {
+					fu = *idx.FastUpdate
+				}
+				return idx.OID, i, fu, true
+			}
+		}
+	}
+	return 0, 0, false, false
+}
+
+// ssiRecordGinKeyRead acquires GIN key-grain SIREAD predicate locks for a
+// SERIALIZABLE `p @> array[...]` scan, keyed by the index OID and each search
+// key. With fastupdate=off each key gets its own page lock (so disjoint keys
+// never conflict); with fastupdate=on the whole index is one predicate unit, so a
+// single sentinel-page lock covers every key. The matching INSERT
+// (ssiRecordGinIndexInsert) conflicts-in on both the per-key pages and the
+// sentinel page, so it forms the rw-edge whichever locking the reader used. The
+// index OID is the predicate-lock relation so these page tags never collide with
+// the heap relation's tuple/page locks. Design 0118-0140.
+func ssiRecordGinKeyRead(ctx *Context, dbOid, indexOID uint32, keys []string, fastUpdate bool) {
+	if !ssiActive(ctx) || indexOID == 0 {
+		return
+	}
+	if fastUpdate {
+		tag := mvcc.PageLockTag(dbOid, indexOID, ssiGinSentinelPage)
+		ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
+		return
+	}
+	for _, k := range keys {
+		tag := mvcc.PageLockTag(dbOid, indexOID, ssiGinKeyPage(k))
+		ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
+	}
+}
+
+// ssiRecordGinIndexInsert is the SERIALIZABLE write-path hook for INSERTs into a
+// table carrying one or more GIN indexes. For each GIN index it conflicts-in on
+// every element of the inserted array's key pages AND on the whole-index sentinel
+// page, installing an rw-edge from every SERIALIZABLE reader holding a matching
+// key SIREAD (fastupdate=off reader) or the sentinel SIREAD (fastupdate=on
+// reader) — and aborting this INSERT in place (40001) when it closes a dangerous
+// structure to an already-committed pivot, exactly like ssiRecordGistIndexInsert.
+// No-op for non-GIN tables / RC / RR. Design 0118-0140.
+func ssiRecordGinIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, dbOid uint32) error {
+	if !ssiActive(ctx) || tbl == nil {
+		return nil
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if idx == nil || idx.Method != "gin" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
+			continue
+		}
+		colIdx := -1
+		for i := range cols {
+			if cols[i].Name == idx.Columns[0] {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx < 0 || colIdx >= len(row) || row[colIdx].Kind != KindString {
+			continue
+		}
+		// Conflict-in on each inserted key's page (matches a fastupdate=off reader's
+		// per-key SIREAD).
+		for _, e := range parseTextArray(row[colIdx].StringValue()) {
+			tag := mvcc.PageLockTag(dbOid, idx.OID, ssiGinKeyPage(e))
+			if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); cerr != nil {
+				return ssiReadAbortError(cerr)
+			}
+		}
+		// Conflict-in on the whole-index sentinel page (matches a fastupdate=on
+		// reader's sentinel SIREAD). No-op when no reader took the sentinel lock.
+		stag := mvcc.PageLockTag(dbOid, idx.OID, ssiGinSentinelPage)
+		if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, stag); cerr != nil {
+			return ssiReadAbortError(cerr)
+		}
+	}
+	return nil
+}
+
 // ssiRecordRelationRead is the executor-side hook for a SERIALIZABLE
 // *sequential* scan. Mirroring upstream heap_beginscan (heapam.c:1150-1171),
 // a seq scan in a serializable transaction acquires a relation-grain SIREAD

@@ -1894,6 +1894,13 @@ const (
 	// Registers child as a partition of parent in the index partition tree.
 	// ConstraintName holds the parent index name; ChildIndexName holds the child. M0097-0023.
 	AlterIndexAttachPartition
+	// AlterIndexSetReloptions — `ALTER INDEX name SET (param = value, …)`.
+	// Merges index-level storage parameters into the index's reloptions (e.g. GIN
+	// fastupdate, fillfactor). With holds the parsed name→value pairs. Only options
+	// goopg acts on take effect (GIN fastupdate drives predicate-gin SSI
+	// granularity, design 0118-0140); others are accepted and ignored. Resolved
+	// against catalog.Index (not catalog.Table) in the ALTER INDEX executor branch.
+	AlterIndexSetReloptions
 	// AlterTableSetReloptions — `ALTER TABLE name SET (param = value, …)`.
 	// Merges table-level storage parameters into the relation's reloptions
 	// (e.g. parallel_workers, fillfactor, autovacuum_enabled, toast_tuple_target).

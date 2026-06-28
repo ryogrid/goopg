@@ -148,9 +148,19 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       M0100 + real SSI 40001 dangerous-structure detector M0104); promoted the whole
       group from soft `runIsoSpec` to `runIsoSpecStrict` in their dedicated
       `TestPort_Isolation*` functions with NO engine change. D-002 CSV rationale updated.
-- [ ] **M0118-0002** — Predicate-lock granularity per access method / scan type:
+- [x] **M0118-0002** — Predicate-lock granularity per access method / scan type:
       predicate-gin, predicate-gist, predicate-hash, predicate-lock-hot-tuple,
       index-only-scan, index-only-bitmapscan, partial-index.
+      **GROUP COMPLETE (2026-06-29).** All seven specs strict-promoted to
+      pass-required and byte-identical to PG 18.3. `predicate-gin` was the last
+      (design 0118-0140): GIN per-key predicate locking via key-grain SIREAD
+      (`ssiGinKeyPage` FNV pseudo-page, `ssiRecordGinKeyRead` on the `@>` seq-scan
+      path replacing the relation-grain lock + `ssiRecordGinIndexInsert` twin
+      conflicting-in on each inserted element; `fastupdate=on` uses a whole-index
+      sentinel page toggled by the new `ALTER INDEX … SET (fastupdate=…)` parse +
+      executor). Isolation tally **120 pass / 1 failed** — the lone remaining
+      `failed` spec is `deadlock-parallel` (M0118-0004; needs a parallel-query
+      lock-group abstraction goopg has no subsystem for — infeasible).
       **PARTIAL (2026-06-22, design 0118-0026):** probe-first ranked all 7; three
       promoted to pass-required (strict) with NO engine change —
       `predicate-lock-hot-tuple`, `partial-index`, `index-only-scan` already match
