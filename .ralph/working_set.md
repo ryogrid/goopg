@@ -1,17 +1,29 @@
 (idle — nothing in flight)
 
-Last landed (loop #4): `stats` PROMOTED to pass-required (design 0118-0133) —
-the FINAL rung of M0118-0009 stats. Isolation-runner per-session connection
-reuse: RunSpec opens 1 persistent conn/session ONCE per spec (sessionConns +
-openSessionConns), reused across EVERY permutation (mirrors isolationtester.c
-main()); runPermutation re-runs only session `setup` SQL per permutation so a
-step-set GUC (SET track_functions='all') persists forward → fixed L3732.
-TestPort_IsolationStats now runIsoSpecStrict — PASS byte-for-byte.
+Last landed (loop #5): regression fix (design 0118-0134) — two pass-required
+isolation specs `vacuum-concurrent-drop` + `vacuum-skip-locked` had been silently
+RED since commit d1f40e28 (async-notify, design 0118-0090). Root cause found by
+git-bisecting `TestPort_IsolationVacuumConcurrentDrop`.
 
-`stats` was the LAST failed M0118-0009 spec → M0118-0009 group resolved.
+The specs' lock step is a single 2-statement step `{ BEGIN; LOCK part1 IN SHARE
+MODE; }`. The async-notify loop made the isolation runner send a multi-statement
+step as ONE simple-query message (`execMultiStatement`), exposing a latent server
+bug: `dispatchSimpleQueryViaExecutor` seeded `ectx.TxnLockBackendID` ONCE before
+the per-statement loop from the message-entry txn state (autocommit for
+`BEGIN; LOCK …`), so the later `LOCK` saw `TxnLockBackendID==0` →
+`acquireRelLockTxn` no-op (display-only) → no real ShareLock → concurrent
+ANALYZE/VACUUM never `<waiting>`-blocked → drop re-check WARNING never fired.
 
-Pre-existing (NOT this change, confirmed identical at HEAD): vacuum-skip-locked
-+ vacuum-concurrent-drop fail (goopg VACUUM SKIP_LOCKED doesn't emit the
-"skipping vacuum of X --- lock not available" WARNING) = the "4 failed" of the
-117/4 isolation tally. Candidate next task if a non-stats isolation item is
-wanted.
+Fix (internal/server/dispatch.go): refresh `ectx.TxnLockBackendID` at the top of
+the statement loop from the LIVE `connTx.InExplicit()` state, so a transaction-
+scoped lock following an in-message `BEGIN` is held to commit, matching upstream
+`exec_simple_query` (one PQexec = one transaction command list).
+
+Gates: strict `TestPort_IsolationVacuumConcurrentDrop`/`VacuumSkipLocked` PASS
+(were red at HEAD); FULL `TestPort_Isolation*` suite PASS (657s, exit 0, no
+regression); gofmt/vet clean; pgbench smoke = pre-commit hook.
+
+Note: M0118-0009's own specs are all resolved (stats was the final one, loop #4);
+the two specs fixed this loop belong to M0118-0008. No fix_plan item left open by
+this loop. Candidate next: confirm remaining open items (M0118-0002 predicate-gin/
+gist need real GIN/GiST AMs; M0118-0004 deadlock-parallel needs lock groups).

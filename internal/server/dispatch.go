@@ -481,6 +481,22 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	}
 
 	for i, stmt := range stmts {
+		// Keep the transaction-scoped lock identity in sync with the LIVE
+		// transaction state across statements in a single simple-query message.
+		// ectx.TxnLockBackendID is seeded once before this loop from the
+		// message-entry state, which is autocommit for a "BEGIN; LOCK ..." step
+		// (the upstream isolationtester sends such a step as one PQexec message).
+		// A BEGIN earlier in the SAME message opens the explicit block, so a
+		// later LOCK TABLE — or a transaction-scoped maintenance lock — in that
+		// message must be transaction-scoped too; without this refresh it would
+		// see TxnLockBackendID==0 and acquire a display-only no-op lock that no
+		// concurrent session blocks on (regressing vacuum-concurrent-drop /
+		// vacuum-skip-locked). M0118-0009.
+		if connTx != nil && connTx.InExplicit() {
+			ectx.TxnLockBackendID = connTx.LockBackendID
+		} else {
+			ectx.TxnLockBackendID = 0
+		}
 		// Check for failed transaction state (25P02) — reject all statements
 		// except COMMIT/ROLLBACK/ABORT/END that clear the failed state.
 		// PostgreSQL semantics: an error inside an explicit transaction block

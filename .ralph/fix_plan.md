@@ -454,6 +454,21 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       multiple-cic, vacuum-{concurrent-drop,conflict,no-cleanup-lock,skip-locked},
       truncate-conflict, sequence-ddl, cluster-conflict{,-partition}, create-trigger,
       inherit-temp, plpgsql-toast.
+      **2026-06-28 regression fix (design 0118-0134): `vacuum-concurrent-drop` +
+      `vacuum-skip-locked` restored to green.** Both pass-required specs had been
+      silently RED since commit d1f40e28 (design 0118-0090 async-notify), found by
+      git-bisecting `TestPort_IsolationVacuumConcurrentDrop`. Their lock step is a
+      single two-statement step `{ BEGIN; LOCK part1 IN SHARE MODE; }`; the
+      async-notify loop changed the isolation runner to send a multi-statement step
+      as ONE simple-query message (`execMultiStatement`). That exposed a latent
+      server bug: `dispatchSimpleQueryViaExecutor` seeded `ectx.TxnLockBackendID`
+      ONCE before the per-statement loop from the message-entry txn state (autocommit
+      for `BEGIN; LOCK …`), so when `LOCK` ran later in the same loop it saw
+      `TxnLockBackendID==0` and `acquireRelLockTxn` degraded to a display-only no-op
+      — no real ShareLock, so the concurrent ANALYZE/VACUUM never `<waiting>`-blocked
+      and the drop re-check WARNING never fired. Fix refreshes `ectx.TxnLockBackendID`
+      at the top of the statement loop from the LIVE `connTx.InExplicit()` state.
+      Strict `TestPort_IsolationVacuumConcurrentDrop`/`VacuumSkipLocked` PASS.
       **COMPLETE (2026-06-24, loop #24).** All 25 specs are strict-promoted
       (`runIsoSpecStrict`) and byte-for-byte vs PG 18.3 — `reindex-concurrently-toast`
       (design 0118-0088) was the last, closing the TOAST-exposure epic. This loop
