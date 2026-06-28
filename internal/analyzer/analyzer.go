@@ -2477,6 +2477,14 @@ func isAssignable(src, dst catalog.Type) bool {
 	if isUnknownType(src) {
 		return true
 	}
+	// An array column (e.g. `p int4[]`, dst.IsArray) accepts any array-typed
+	// source: the ARRAY[...] constructor (analyzed as "text[]") or another
+	// array column/expression. Element-type validation happens at runtime in
+	// the array codec, mirroring PG's reliance on array_in to reject bad
+	// element text. M0118-0002.
+	if dst.IsArray && (src.IsArray || strings.HasSuffix(src.Name, "[]")) {
+		return true
+	}
 	if strings.EqualFold(src.Name, dst.Name) {
 		return true
 	}

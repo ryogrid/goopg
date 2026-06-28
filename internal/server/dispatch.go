@@ -2012,9 +2012,16 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 	if schema != nil {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
+			oid := typeOIDFor(sc.Type.Name)
+			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
+			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
+			// rather than a scalar int4. M0118-0002.
+			if sc.Type.IsArray {
+				oid = catalog.ArrayOIDForBase(oid)
+			}
 			fields[i] = protocol.FieldDescription{
 				Name:         sc.Name,
-				TypeOID:      typeOIDFor(sc.Type.Name),
+				TypeOID:      oid,
 				TypeSize:     -1,
 				TypeModifier: -1,
 				Format:       0,
@@ -2517,9 +2524,16 @@ func (s *Server) executeFetch(_ context.Context, w *protocol.FrameWriter, ectx *
 	if schema != nil {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
+			oid := typeOIDFor(sc.Type.Name)
+			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
+			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
+			// rather than a scalar int4. M0118-0002.
+			if sc.Type.IsArray {
+				oid = catalog.ArrayOIDForBase(oid)
+			}
 			fields[i] = protocol.FieldDescription{
 				Name:         sc.Name,
-				TypeOID:      typeOIDFor(sc.Type.Name),
+				TypeOID:      oid,
 				TypeSize:     -1,
 				TypeModifier: -1,
 				Format:       0,

@@ -282,6 +282,31 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       infra-timed-out on WSL2 (gated path unaffected). **Remaining in M0118-0002:
       `predicate-gin`** (needs `int4[]`-column array typing + a GIN AM) — group
       stays open.
+      **2026-06-29 enabler (design 0118-0138, NOT a promotion): `int4[]` user
+      array column storage round-trip.** `predicate-gin.spec`'s global `setup`
+      (`create table gin_tbl(p int4[]); insert … select array[1] …`) failed at
+      the INSERT with `invalid input syntax for type integer: "{1}"` — a user
+      array column (`catalog.Type{Name:"int4", IsArray:true}`; Name is the
+      ELEMENT type, array-ness tracked separately) was treated as a scalar int4
+      at five `Type.Name`-only sites. New `internal/executor/codec_array.go`
+      stores array columns as PG-native `ArrayType` varlena blobs (1-D, no-NULL;
+      24-byte header + typalign-packed elements; int2/int4/int8/oid/float4/
+      float8/bool fixed + text/varchar/bpchar varlena) and decodes back to
+      canonical `"{1,2}"` text. Wired behind `if t.IsArray` at `encodeValuePG`,
+      `decodePhysicalPGValueMctx`, `physicalPGTypeAlign`; insertOp integer-range
+      coercion skips array cols (`operators_storage.go`); `isAssignable` accepts
+      an array source for an array dst (`analyzer.go`, fixes VALUES-path 42804);
+      BOTH simple+extended RowDescription loops advertise the array OID via
+      `catalog.ArrayOIDForBase` when `IsArray` (`server/dispatch.go`, sibling
+      paths — fixes client-side `strconv.ParseInt: parsing "{1}"`). Zero blast
+      radius outside array columns (every branch `IsArray`-gated; scalar paths
+      byte-identical). First divergence advanced from permutation-0 global setup
+      (blocked ALL perms) to the first read step `ra1` (`p @> array[1]` →
+      `operator @>: invalid box value`). Spec stays `failed`. Remaining blockers
+      (ledgered): (1) `@>` array-containment runtime (mis-dispatched to geometric
+      `box @> box`); (2) GIN page-grain SSI (reuse the 0118-0137 grid-cell
+      primitive keyed on the GIN search key). Tests `TestArrayCodecRoundTrip` +
+      `TestArrayCodecTextElementQuoting`.
 - [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
       All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
       nowait{,-2,-3,-4,-5}, lock-nowait,

@@ -253,6 +253,13 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 
 // encodeValuePG encodes a single datum in PG-native format.
 func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
+	// A user array column (e.g. `p int4[]`) carries Type.Name="int4" plus
+	// Type.IsArray=true; its value is the array text "{1,2}". Encode it as a
+	// PG-native ArrayType varlena blob BEFORE the element-type switch (which
+	// would otherwise try to parse "{1,2}" as a scalar int4). M0118-0002.
+	if t.IsArray {
+		return encodeArrayValuePG(t, d)
+	}
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":
 		if d.Kind != KindBool {
@@ -902,6 +909,11 @@ func alignPhysicalPGOffset(off, align int) int {
 }
 
 func physicalPGTypeAlign(t catalog.Type) int {
+	// All array columns store a varlena ArrayType blob → PG 'i' (4-byte) align.
+	// M0118-0002.
+	if t.IsArray {
+		return 4
+	}
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":
 		return 1
@@ -1007,6 +1019,12 @@ func pgRowHasExternal(cols []catalog.Column, row Row) bool {
 }
 
 func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) (Datum, int, error) {
+	// User array column: decode the ArrayType varlena blob back to the
+	// canonical "{1,2}" text (sibling of encodeValuePG's IsArray branch).
+	// M0118-0002.
+	if t.IsArray {
+		return decodeArrayValuePG(t, data)
+	}
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":
 		if len(data) < 1 {

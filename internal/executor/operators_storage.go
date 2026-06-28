@@ -1617,6 +1617,14 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if insertMissing[i] || row[i].IsNull() {
 				continue
 			}
+			// An array-typed column (e.g. `p int4[]`) carries Type.Name="int4"
+			// but Type.IsArray=true; its value is the array text literal "{1}"
+			// produced by array_construct, NOT a scalar. Coercing it to the
+			// element type would parse "{1}" as an int4 and raise 22P02
+			// (invalid input syntax). Leave array values untouched. M0118-0002.
+			if col.Type.IsArray {
+				continue
+			}
 			var coerced Datum
 			var cerr error
 			switch strings.ToLower(col.Type.Name) {
