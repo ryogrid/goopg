@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -2344,23 +2343,9 @@ func appendFloatText(dst []byte, d executor.Datum, bitSize int) []byte {
 			return append(dst, s...)
 		}
 	}
-	if math.IsInf(f, 1) {
-		return append(dst, "Infinity"...)
-	}
-	if math.IsInf(f, -1) {
-		return append(dst, "-Infinity"...)
-	}
-	if math.IsNaN(f) {
-		return append(dst, "NaN"...)
-	}
-	s := strconv.FormatFloat(f, 'g', -1, bitSize)
-	if idx := strings.IndexByte(s, 'e'); idx >= 0 {
-		exp, err := strconv.Atoi(s[idx+1:])
-		if err == nil && exp >= 1 && exp <= 14 {
-			s = strconv.FormatFloat(f, 'f', -1, bitSize)
-		}
-	}
-	return append(dst, s...)
+	// PostgreSQL float4out/float8out: shortest round-trip decimal with PG's
+	// fixed-vs-scientific exponent thresholds (differs per type — see PGFloatOut).
+	return append(dst, executor.PGFloatOut(f, bitSize)...)
 }
 
 // (e.g. 1.2345678901234e+200) matching PostgreSQL's float8out behavior. M0097-0003.
@@ -2390,28 +2375,10 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 			return append(dst, s...)
 		}
 	}
-	// PostgreSQL uses canonical names for special values, not Go's "+Inf"/"-Inf".
-	if math.IsInf(f, 1) {
-		return append(dst, "Infinity"...)
-	}
-	if math.IsInf(f, -1) {
-		return append(dst, "-Infinity"...)
-	}
-	if math.IsNaN(f) {
-		return append(dst, "NaN"...)
-	}
-	// PostgreSQL's float8out uses the shortest round-trip representation.
-	// Go's 'g',-1 uses scientific notation for exponents >= 1, but PostgreSQL
-	// uses decimal for exponents in [1,14] (equivalent to %.15g). Convert back
-	// to decimal in that range to match PostgreSQL's formatting.
-	s := strconv.FormatFloat(f, 'g', -1, 64)
-	if idx := strings.IndexByte(s, 'e'); idx >= 0 {
-		exp, err := strconv.Atoi(s[idx+1:])
-		if err == nil && exp >= 1 && exp <= 14 {
-			s = strconv.FormatFloat(f, 'f', -1, 64)
-		}
-	}
-	return append(dst, s...)
+	// PostgreSQL's float8out uses the shortest round-trip representation with
+	// PG's fixed-vs-scientific exponent thresholds; PGFloatOut also renders the
+	// canonical special-value names (Infinity/-Infinity/NaN).
+	return append(dst, executor.PGFloatOut(f, 64)...)
 }
 
 // appendTimeText formats a KindTime datum as a time-of-day string matching PostgreSQL's

@@ -230,6 +230,32 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       array typing (`array[1]`→int4[] collapses to int4 today) + a GIN AM.
       Tests `TestPointStrictlyLeftRightOperators` (executor) +
       `TestPort_PointGeometricRead` (end-to-end). Ledger row recorded.
+      **2026-06-29 (design 0118-0136, enabler — NOT a promotion): PG-faithful
+      `float4out`/`float8out`.** New `executor.PGFloatOut` reproduces PG's
+      `float8out`/`float4out`: shortest round-trip decimal (Ryu via Go's `'e'`
+      verb) + PG's fixed-vs-scientific *display-exponent* threshold (`[-4,15)`
+      float8, `[-4,6)` float4), so `2233750::float8`→`2233750` not
+      `2.23375e+06`. Wired at ALL FOUR sibling sites (encode↔wire-simple↔
+      wire-extended↔test-harness): `codec.go` `encodeValuePG`, `dispatch.go`
+      `appendFloatText`/`appendFloat8Text`, `dispatch_extended.go` float result
+      columns, `isolation_runner.go` `scanResultSet` (scan float OIDs 700/701 as
+      `NullFloat64`, render via `PGFloatOut`). Cluster-wide float text is now
+      byte-faithful to PG 18.3. **CORRECTION:** the prior "filtered probe →
+      ZERO SSI divergences" claim was WRONG. With float output fixed, a full
+      probe shows `predicate-gist`'s first divergence is a GENUINE SSI
+      **over-detection**: perm `rxy3 wx3 rxy4 c1 wy4 c2` — goopg raises `40001`
+      on `c2` commit where PG commits cleanly. `rxy3` reads `p>>point(6000,6000)`
+      (X>6000), `rxy4` reads `p<<point(1000,1000)` (X<1000); `wx3` inserts
+      high-X, `wy4` low-X — PG's GiST **page-level** predicate locks see disjoint
+      spatial regions (no dangerous cycle), goopg's coarse relation/tuple-grain
+      SIREAD locks the whole relation → false write-skew cycle → spurious
+      `40001`. **Remaining blocker (deferred):** GiST spatial page-grain (or
+      bounding-box/grid-cell) predicate locking — the granularity class
+      `predicate-hash` solved with bucket-grain SIREAD (FNV→`PageLockTag`, design
+      0118-0099); Effort-L. `predicate-gin` still needs `int4[]`-column array
+      typing + a GIN AM. Tests `TestPGFloatOut` (28 float8 + 17 float4
+      PG-captured goldens) + full `TestPort_RegressSuite` re-run + TPC-H
+      Q12/Q13 spot-check. Ledger row recorded.
 - [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
       All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
       nowait{,-2,-3,-4,-5}, lock-nowait,

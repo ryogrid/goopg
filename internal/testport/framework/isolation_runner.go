@@ -14,6 +14,8 @@ import (
 
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
+
+	"github.com/goopg/goopg/internal/executor"
 )
 
 // backendTerminationMessage is the verbatim text libpq surfaces (and upstream
@@ -1207,6 +1209,13 @@ func scanResultSet(rows *sql.Rows) (oneResult, string) {
 	numericCols := make([]string, len(cols))
 	boolCols := make([]bool, len(cols))
 	dateCols := make([]bool, len(cols))
+	// floatCols[i] is the float bit size (32 or 64) for float4/float8 columns,
+	// or 0 otherwise. lib/pq decodes the float OIDs (700/701) into a Go float64,
+	// and a sql.NullString scan would then let database/sql's convertAssign
+	// re-render it with Go's strconv 'g',-1 ("2.18875e+06") instead of
+	// PostgreSQL's float8out format ("2188750"). Scan such columns as a float
+	// and render via executor.PGFloatOut to match the golden pg_regress output.
+	floatCols := make([]int, len(cols))
 	for i := range cols {
 		numericCols[i] = "text"
 		if i < len(colTypes) {
@@ -1216,6 +1225,12 @@ func scanResultSet(rows *sql.Rows) (oneResult, string) {
 			}
 			if dbType == "BOOL" {
 				boolCols[i] = true
+			}
+			switch strings.ToUpper(dbType) {
+			case "FLOAT8", "DOUBLE PRECISION":
+				floatCols[i] = 64
+			case "FLOAT4", "REAL":
+				floatCols[i] = 32
 			}
 			// DATE columns: lib/pq decodes the date OID (1082) into a time.Time,
 			// which a NullString scan would then re-render as RFC3339
@@ -1238,11 +1253,15 @@ func scanResultSet(rows *sql.Rows) (oneResult, string) {
 	for rows.Next() {
 		vals := make([]sql.NullString, len(cols))
 		dateVals := make([]sql.NullTime, len(cols))
+		floatVals := make([]sql.NullFloat64, len(cols))
 		ptrs := make([]interface{}, len(cols))
 		for i := range cols {
-			if dateCols[i] {
+			switch {
+			case dateCols[i]:
 				ptrs[i] = &dateVals[i]
-			} else {
+			case floatCols[i] != 0:
+				ptrs[i] = &floatVals[i]
+			default:
 				ptrs[i] = &vals[i]
 			}
 		}
@@ -1251,16 +1270,21 @@ func scanResultSet(rows *sql.Rows) (oneResult, string) {
 		}
 		row := make([]string, len(cols))
 		for i := range cols {
-			if dateCols[i] {
+			switch {
+			case dateCols[i]:
 				if dateVals[i].Valid {
 					row[i] = dateVals[i].Time.Format("01-02-2006")
 				}
-				continue
-			}
-			if vals[i].Valid {
-				row[i] = vals[i].String
-				if boolCols[i] {
-					row[i] = normalizeBoolWireText(row[i])
+			case floatCols[i] != 0:
+				if floatVals[i].Valid {
+					row[i] = executor.PGFloatOut(floatVals[i].Float64, floatCols[i])
+				}
+			default:
+				if vals[i].Valid {
+					row[i] = vals[i].String
+					if boolCols[i] {
+						row[i] = normalizeBoolWireText(row[i])
+					}
 				}
 			}
 		}
