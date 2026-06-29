@@ -559,3 +559,42 @@ func TestParseAlterTableDetachPartition(t *testing.T) {
 		}
 	}
 }
+
+// TestParseAlterTableReplicaIdentity covers the REPLICA IDENTITY action in all
+// four forms (DEFAULT / FULL / NOTHING / USING INDEX name). The mode is stored
+// as the single-char relreplident code on ReplicaIdentityMode; the USING INDEX
+// form additionally captures the index name on ReplicaIdentityIndex. The parsed
+// action drives catalog.Table.ReplicaIdentity so pg_class.relreplident
+// round-trips through pg_dump. DU-002 slice 305.
+func TestParseAlterTableReplicaIdentity(t *testing.T) {
+	cases := []struct {
+		sql       string
+		wantMode  string
+		wantIndex string
+	}{
+		{"ALTER TABLE t REPLICA IDENTITY DEFAULT", "d", ""},
+		{"ALTER TABLE t REPLICA IDENTITY FULL", "f", ""},
+		{"ALTER TABLE t REPLICA IDENTITY NOTHING", "n", ""},
+		{"ALTER TABLE t REPLICA IDENTITY USING INDEX t_pkey", "i", "t_pkey"},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableReplicaIdentity {
+			t.Fatalf("Parse(%q): actions=%+v", tc.sql, at.Actions)
+		}
+		act := at.Actions[0]
+		if act.ReplicaIdentityMode != tc.wantMode {
+			t.Errorf("Parse(%q): mode=%q want %q", tc.sql, act.ReplicaIdentityMode, tc.wantMode)
+		}
+		if act.ReplicaIdentityIndex != tc.wantIndex {
+			t.Errorf("Parse(%q): index=%q want %q", tc.sql, act.ReplicaIdentityIndex, tc.wantIndex)
+		}
+	}
+}

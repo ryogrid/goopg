@@ -446,6 +446,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 	if isPartition && len(tbl.PartitionBounds) > 0 {
 		relpartbound = catalog.FormatPartitionBound(tbl.PartitionBounds[0])
 	}
+	replIdent := catalog.ReplIdentOrDefault(tbl.ReplicaIdentity) // 'd' default; FULL/NOTHING via ALTER, DU-002 slice 305
 	return Row{
 		NewIntDatum(int64(tbl.OID)),                                // oid
 		NewStringDatum(tbl.Name),                                   // relname (name)
@@ -473,7 +474,7 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewBoolDatum(false),                                        // relrowsecurity
 		NewBoolDatum(false),                                        // relforcerowsecurity
 		NewBoolDatum(true),                                         // relispopulated
-		NewStringDatum("n"),                                        // relreplident (REPLICA_IDENTITY_DEFAULT)
+		NewStringDatum(replIdent),                                  // relreplident ('d' default; FULL/NOTHING via ALTER, DU-002 slice 305)
 		NewBoolDatum(isPartition),                                  // relispartition
 		NewIntDatum(0),                                             // relrewrite
 		NewIntDatum(minFrozenXID),                                  // relfrozenxid

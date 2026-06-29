@@ -2723,6 +2723,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.qowned_seq OWNED BY public.owner_tbl.label"); err != nil {
 		t.Fatalf("create sequence qowned_seq (schema-qualified OWNED BY): %v", err)
 	}
+
+	// Slice 305: a table's REPLICA IDENTITY must round-trip. pg_dump emits an
+	// `ALTER TABLE ONLY <t> REPLICA IDENTITY {FULL|NOTHING}` clause whenever
+	// pg_class.relreplident != 'd' (REPLICA_IDENTITY_DEFAULT) for a regular,
+	// partitioned, or matview relation (pg_dump.c:17781). goopg HARDCODED
+	// relreplident to 'n' (REPLICA_IDENTITY_NOTHING) in the heap pg_class row
+	// builder pg_dump reads (buildUserPGClassRow), so EVERY dumped table got a
+	// spurious `... REPLICA IDENTITY NOTHING;` — a silent, pervasive divergence
+	// from real pg_dump (which emits nothing for a default-identity table). The
+	// fix defaults relreplident to 'd' and threads an actual
+	// `ALTER TABLE ... REPLICA IDENTITY {DEFAULT|FULL|NOTHING}` through the
+	// parser → catalog.Table.ReplicaIdentity → heap re-sync, so a non-default
+	// setting round-trips and a default table emits nothing. goopg has no
+	// logical replication; this is dump-fidelity only (like SET STORAGE). The
+	// USING INDEX form is parsed but deferred (needs pg_index.indisreplident
+	// wiring) — it raises 0A000, so it is not exercised here.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ri_full (id integer PRIMARY KEY, payload text)"); err != nil {
+		t.Fatalf("create table ri_full: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.ri_full REPLICA IDENTITY FULL"); err != nil {
+		t.Fatalf("alter table ri_full replica identity full: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ri_nothing (id integer PRIMARY KEY, payload text)"); err != nil {
+		t.Fatalf("create table ri_nothing: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.ri_nothing REPLICA IDENTITY NOTHING"); err != nil {
+		t.Fatalf("alter table ri_nothing replica identity nothing: %v", err)
+	}
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -7059,6 +7087,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// canonical `ALTER SEQUENCE public.qowned_seq OWNED BY public.owner_tbl.label;`.
 		if !strings.Contains(res.Stdout, "ALTER SEQUENCE public.qowned_seq OWNED BY public.owner_tbl.label;") {
 			t.Errorf("pg_dump dropped the schema-qualified OWNED BY sequence; missing the qowned_seq OWNED BY line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 305 (asserted):** REPLICA IDENTITY round-trip. A FULL/NOTHING
+		// override must surface as the exact `ALTER TABLE ONLY ... REPLICA
+		// IDENTITY ...` clause pg_dump emits when relreplident != 'd'.
+		for _, sub := range []string{
+			"ALTER TABLE ONLY public.ri_full REPLICA IDENTITY FULL;",
+			"ALTER TABLE ONLY public.ri_nothing REPLICA IDENTITY NOTHING;",
+		} {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a REPLICA IDENTITY override; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// A default-identity table (relreplident='d', the implicit value) must
+		// emit NO REPLICA IDENTITY clause. The legacy hardcoded 'n' produced a
+		// spurious `ALTER TABLE ONLY public.foo REPLICA IDENTITY NOTHING;` for
+		// EVERY dumped table — the core divergence this slice corrects. `foo`,
+		// `bar`, and the partitioned `part` carry no override, so none may appear.
+		for _, neg := range []string{
+			"ALTER TABLE ONLY public.foo REPLICA IDENTITY",
+			"ALTER TABLE ONLY public.bar REPLICA IDENTITY",
+			"ALTER TABLE ONLY public.part REPLICA IDENTITY",
+		} {
+			if strings.Contains(res.Stdout, neg) {
+				t.Errorf("pg_dump emitted a spurious REPLICA IDENTITY for a default-identity table: %q\n  full stdout=%q", neg, res.Stdout)
+			}
 		}
 		// **Slice 119 (asserted):** descending sequences must round-trip through
 		// pg_dump's descending-direction default suppression. A plain

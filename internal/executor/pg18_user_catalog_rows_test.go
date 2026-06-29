@@ -1756,3 +1756,48 @@ func TestAttGeneratedForStorageStrategy(t *testing.T) {
 		})
 	}
 }
+
+// TestUserPGClassRowReplicaIdentity verifies buildUserPGClassRow emits the
+// correct pg_class.relreplident code: PG's implicit default 'd' when the table
+// carries no override (NOT the legacy 'n', which made pg_dump emit a spurious
+// `ALTER TABLE ONLY ... REPLICA IDENTITY NOTHING;` for EVERY dumped table), and
+// the stored single-char code for an explicit `ALTER TABLE ... REPLICA IDENTITY
+// {FULL|NOTHING}`. DU-002 slice 305.
+func TestUserPGClassRowReplicaIdentity(t *testing.T) {
+	cols := pgClassColumnsPG18()
+	idx := -1
+	for i, c := range cols {
+		if c.Name == "relreplident" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		t.Fatal("relreplident column not found in pgClassColumnsPG18")
+	}
+	cases := []struct {
+		name     string
+		stored   string
+		wantCode string
+	}{
+		{"unset-default", "", "d"},
+		{"explicit-default", "d", "d"},
+		{"full", "f", "f"},
+		{"nothing", "n", "n"},
+	}
+	for _, tc := range cases {
+		tbl := &catalog.Table{
+			Schema:          "public",
+			Name:            "ri_tbl",
+			OID:             16500,
+			ReplicaIdentity: tc.stored,
+			Columns: []catalog.Column{
+				{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true, Ordinal: 0},
+			},
+		}
+		row := buildUserPGClassRow(nil, tbl)
+		if got := string(row[idx].Buf); got != tc.wantCode {
+			t.Errorf("%s: relreplident = %q, want %q", tc.name, got, tc.wantCode)
+		}
+	}
+}

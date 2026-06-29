@@ -5422,6 +5422,43 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			ConstraintName: identText(nameTok),
 		}, nil
 	}
+	// REPLICA IDENTITY { DEFAULT | FULL | NOTHING | USING INDEX name }.
+	// Records the table's relreplident on catalog.Table so pg_dump round-trips
+	// the `ALTER TABLE ONLY ... REPLICA IDENTITY ...` clause. DU-002 slice 305.
+	if p.acceptIdentKeyword("replica") {
+		pos := p.cur().Pos
+		if !p.acceptIdentKeyword("identity") {
+			return AlterTableAction{}, p.errAtCur("expected IDENTITY after REPLICA")
+		}
+		mode := ""
+		index := ""
+		switch {
+		case p.acceptKeyword(KwDefault) || p.acceptIdentKeyword("default"):
+			mode = "d"
+		case p.acceptKeyword(KwFull) || p.acceptIdentKeyword("full"):
+			mode = "f"
+		case p.acceptKeyword(KwNothing) || p.acceptIdentKeyword("nothing"):
+			mode = "n"
+		case p.acceptKeyword(KwUsing) || p.acceptIdentKeyword("using"):
+			if !(p.acceptKeyword(KwIndex) || p.acceptIdentKeyword("index")) {
+				return AlterTableAction{}, p.errAtCur("expected INDEX after USING")
+			}
+			idxTok, err := p.parseIdent()
+			if err != nil {
+				return AlterTableAction{}, err
+			}
+			mode = "i"
+			index = identText(idxTok)
+		default:
+			return AlterTableAction{}, p.errAtCur("expected DEFAULT, FULL, NOTHING or USING INDEX after REPLICA IDENTITY")
+		}
+		return AlterTableAction{
+			pos:                  pos,
+			Kind:                 AlterTableReplicaIdentity,
+			ReplicaIdentityMode:  mode,
+			ReplicaIdentityIndex: index,
+		}, nil
+	}
 	// DROP COLUMN name / DROP CONSTRAINT name in the multi-action loop.
 	// Both forms share this path so comma-separated "DROP COLUMN a, DROP COLUMN b"
 	// work correctly. M0097-0028.

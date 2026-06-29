@@ -6520,6 +6520,44 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+		case parser.AlterTableReplicaIdentity:
+			// REPLICA IDENTITY { DEFAULT | FULL | NOTHING | USING INDEX idx } —
+			// record the table's relreplident on the catalog AND rewrite the
+			// pg_class heap row so pg_dump observes it. pg_dump emits an
+			// `ALTER TABLE ONLY ... REPLICA IDENTITY {FULL|NOTHING}` clause
+			// whenever relreplident != 'd' (pg_dump.c dumpTableSchema). Like SET
+			// STORAGE (slice 182) the live in-memory virtual pg_class already
+			// reflects the field, but pg_dump reads the pg_class HEAP populated at
+			// CREATE TABLE, so the new value must be flushed through the same
+			// delete-old-rows + re-sync path or the stale heap row keeps reporting
+			// 'd' and the clause is silently dropped. goopg has no logical
+			// replication — dump-fidelity only. The USING INDEX ('i') form
+			// additionally requires marking the index's pg_index.indisreplident
+			// (pg_dump emits the clause at index-dump time); that index-side wiring
+			// is deferred, so reject it rather than silently lose the setting.
+			// DU-002 slice 305.
+			if act.ReplicaIdentityMode == "i" {
+				return &ExecError{Code: "0A000", Pos: s.Pos(),
+					Message: "REPLICA IDENTITY USING INDEX is not yet supported"}
+			}
+			mode := act.ReplicaIdentityMode
+			if mode == "" {
+				mode = "d"
+			}
+			if tbl.ReplicaIdentity != mode {
+				tbl.ReplicaIdentity = mode
+				if catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+			}
 		case parser.AlterTableSetReloptions:
 			// SET (param = value, …) — merge table-level storage parameters into the
 			// relation's reloptions. pg_class.reloptions is rendered from the live

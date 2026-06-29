@@ -2254,10 +2254,32 @@ documentation-only and is exempt from the design-doc requirement.)
       parser+executor+catalog suites PASS. Surfaced separate gap: `CREATE
       SEQUENCE … OWNED BY schema.table.column` mis-resolves a 3-part qualified
       owner (`sequence cannot be owned by relation "public"`).
-      **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery (further slices); `CREATE SEQUENCE … OWNED BY` 3-part owner;
-      extended-protocol commit-time deferral (architecturally entangled —
-      extended protocol is auto-commit-per-statement).
+      **2026-06-29 (loop #26, design 0119-0004-replica-identity, DU-002 slice
+      305): REPLICA IDENTITY round-trip in pg_dump — LANDED DEFAULT/FULL/NOTHING;
+      fixes a pervasive latent bug.** pg_dump emits `ALTER TABLE ONLY <t> REPLICA
+      IDENTITY {FULL|NOTHING}` whenever `pg_class.relreplident != 'd'`
+      (pg_dump.c:17781). goopg HARDCODED `relreplident='n'` (NOTHING) in the heap
+      pg_class row builder pg_dump reads (`buildUserPGClassRow`; comment
+      mislabelled it "DEFAULT"), so EVERY dumped table got a spurious `... REPLICA
+      IDENTITY NOTHING;` — latent because no slice asserted the clause's *absence*
+      and goopg never parsed `ALTER TABLE ... REPLICA IDENTITY`. Fix: (1) default
+      corrected to `'d'` via new `catalog.ReplIdentOrDefault` routed through both
+      the heap builder and the `catalog.go` VirtualRows sibling; (2) new
+      `catalog.Table.ReplicaIdentity` + `AlterTableReplicaIdentity` parser action
+      (`DEFAULT`/`FULL`/`NOTHING`/`USING INDEX`; FULL/NOTHING are keyword tokens →
+      both spellings accepted) → executor sets the field and flushes the pg_class
+      HEAP row via the delete-old-rows + `syncTableToCatalogHeap` path (same as SET
+      STORAGE/COMPRESSION). Dump-fidelity only (goopg has no logical replication).
+      USING INDEX deferred (keys on `pg_index.indisreplident` at index-dump time —
+      rejected with 0A000 to avoid silent loss; ledgered). Zero blast radius on
+      query/DML (the wrong `'n'` default → correct `'d'` removes spurious lines).
+      Tests `TestParseAlterTableReplicaIdentity` + `TestUserPGClassRowReplicaIdentity`
+      + slice 305 (`ri_full`→FULL, `ri_nothing`→NOTHING present; foo/bar/part
+      default → no clause) PASS vs real pg_dump 18.3; parser/catalog/executor PASS.
+      **Still open under M0119-0004:** REPLICA IDENTITY USING INDEX; the pg_dump
+      002–010 catalog-view parity battery (further slices); extended-protocol
+      commit-time deferral (architecturally entangled — extended protocol is
+      auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

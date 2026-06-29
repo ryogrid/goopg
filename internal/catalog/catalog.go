@@ -411,6 +411,16 @@ type Table struct {
 	Unlogged bool
 	Temp     bool
 
+	// ReplicaIdentity is the single-char pg_class.relreplident code set by
+	// `ALTER TABLE ... REPLICA IDENTITY {DEFAULT|FULL|NOTHING|USING INDEX idx}`:
+	// 'd' (DEFAULT, the implicit value), 'f' (FULL), 'n' (NOTHING), 'i' (USING
+	// INDEX). Empty is treated as 'd'. pg_dump emits an `ALTER TABLE ONLY ...
+	// REPLICA IDENTITY ...` clause whenever this is not 'd' (pg_dump.c
+	// dumpTableSchema). goopg has no logical replication, so this is round-trip
+	// fidelity only. Use ReplIdentOrDefault to resolve the effective code.
+	// DU-002 slice 305.
+	ReplicaIdentity string
+
 	// TempOwner identifies the session that owns this temporary relation. In
 	// PostgreSQL every backend has its own temp namespace (pg_temp_N); a temp
 	// relation is only part of *its* backend's catalog. goopg keeps all
@@ -861,6 +871,16 @@ func tableNeedsToastRelation(t *Table) bool {
 // virtual builder emits a relkind='t' TOAST row (and relkind='i' TOAST-index
 // row, slice 3) for exactly this set; toastBearingTables enumerates the same
 // set for the pg_index builder so the two catalogs never diverge.
+// ReplIdentOrDefault resolves a table's effective pg_class.relreplident code,
+// mapping an unset (empty) ReplicaIdentity to PG's implicit default 'd'
+// (REPLICA_IDENTITY_DEFAULT). DU-002 slice 305.
+func ReplIdentOrDefault(replIdent string) string {
+	if replIdent == "" {
+		return "d"
+	}
+	return replIdent
+}
+
 func tableHasToastRelation(t *Table) bool {
 	if len(t.ToastReloptions) > 0 {
 		return true
@@ -3486,6 +3506,7 @@ func (c *InMemory) registerSystemTables() {
 				relpages = strconv.Itoa(t.Stats.Pages)
 				reltuples = strconv.FormatInt(t.Stats.RowCount, 10)
 			}
+			replIdent := ReplIdentOrDefault(t.ReplicaIdentity) // relreplident (DU-002 slice 305)
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // 0:  oid
 				t.Name,                       // 1:  relname
@@ -3518,7 +3539,7 @@ func (c *InMemory) registerSystemTables() {
 				"f",         // 23: relrowsecurity
 				"f",         // 24: relforcerowsecurity
 				populated,   // 25: relispopulated
-				"d",         // 26: relreplident
+				replIdent,   // 26: relreplident
 				isPartition, // 27: relispartition
 				"0",         // 28: relrewrite
 				"0",         // 29: relfrozenxid

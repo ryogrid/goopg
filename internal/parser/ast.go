@@ -1944,6 +1944,16 @@ const (
 	// so it does not conflict with concurrent reads or writes. ConstraintName
 	// holds the constraint name. M0118-0008 (alter-table-1 isolation spec).
 	AlterTableValidateConstraint
+	// AlterTableReplicaIdentity — `REPLICA IDENTITY { DEFAULT | FULL | NOTHING |
+	// USING INDEX name }`. Records the table's replica-identity mode on
+	// catalog.Table.ReplicaIdentity so pg_class.relreplident round-trips through
+	// pg_dump (which emits `ALTER TABLE ONLY ... REPLICA IDENTITY {FULL|NOTHING}`
+	// when relreplident != 'd', pg_dump.c dumpTableSchema). goopg has no logical
+	// replication — this is dump-fidelity only, like SET STORAGE/COMPRESSION.
+	// ReplicaIdentityMode holds the single-char code ('d'/'f'/'n'/'i');
+	// ReplicaIdentityIndex holds the index name for the USING INDEX form.
+	// DU-002 slice 305.
+	AlterTableReplicaIdentity
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -2000,6 +2010,12 @@ type AlterTableAction struct {
 	// CompressionType is the TOAST compression method for AlterTableSetCompression.
 	// Values: "pglz", "lz4". DU-002 slice 183.
 	CompressionType string
+	// ReplicaIdentityMode is the single-char relreplident code for
+	// AlterTableReplicaIdentity: 'd' (DEFAULT), 'f' (FULL), 'n' (NOTHING),
+	// 'i' (USING INDEX). ReplicaIdentityIndex names the index for the 'i' form.
+	// DU-002 slice 305.
+	ReplicaIdentityMode  string
+	ReplicaIdentityIndex string
 	// DefaultExpr is the parsed DEFAULT expression for AlterTableSetDefault
 	// (`ALTER COLUMN name SET DEFAULT expr`). Nil for AlterTableDropDefault.
 	// DU-002 slice 269.
