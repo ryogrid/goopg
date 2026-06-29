@@ -1149,6 +1149,10 @@ type ForeignKey struct {
 	// rows were not checked, so pg_constraint.convalidated is 'f' until a
 	// VALIDATE CONSTRAINT runs. M0118-0008 (alter-table-1/2).
 	NotValid bool
+	// MatchFull is true for a `MATCH FULL` foreign key — pg_constraint.confmatchtype
+	// is 'f' and pg_get_constraintdef emits ` MATCH FULL`. MATCH SIMPLE (the
+	// default) leaves it false (confmatchtype='s'). DU-002 slice 309.
+	MatchFull bool
 }
 
 // fkActionChar maps a parsed FK referential action to the single-char code
@@ -4965,7 +4969,11 @@ func (c *InMemory) registerSystemTables() {
 				row[11] = fmt.Sprintf("%d", confrelid)
 				row[12] = string(fkActionChar(fk.OnUpdate)) // confupdtype
 				row[13] = string(fkActionChar(fk.OnDelete)) // confdeltype
-				row[14] = "s"                               // confmatchtype = MATCH SIMPLE
+				if fk.MatchFull {
+					row[14] = "f" // confmatchtype = MATCH FULL
+				} else {
+					row[14] = "s" // confmatchtype = MATCH SIMPLE (default)
+				}
 				row[15] = "t"                               // conislocal
 				row[16] = "0"                               // coninhcount
 				row[17] = "f"                               // connoinherit

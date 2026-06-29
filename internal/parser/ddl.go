@@ -2728,6 +2728,9 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				}
 				col.RefColumns = refCols
 			}
+			// Optional MATCH FULL | PARTIAL | SIMPLE, between the referenced column
+			// list and the ON DELETE/UPDATE clauses (PG gram.y key_match). DU-002 slice 309.
+			col.FKMatchFull = parseFKMatchType(p)
 			// Parse ON DELETE / ON UPDATE clauses. ON is KwOn (reserved).
 			for p.acceptKeyword(KwOn) {
 				isDelete := p.acceptKeyword(KwDelete)
@@ -3025,6 +3028,26 @@ func parseFKAction(p *parser) FKAction {
 		return FKActionSetDefault
 	}
 	return FKActionNoAction
+}
+
+// parseFKMatchType consumes an optional `MATCH FULL | MATCH PARTIAL | MATCH
+// SIMPLE` clause at the current token position and reports whether the match
+// type is FULL. It is positioned between the REFERENCES column list and the ON
+// DELETE / ON UPDATE clauses, mirroring PG's gram.y key_match production. MATCH
+// SIMPLE is the default (returns false); MATCH PARTIAL is accepted for grammar
+// completeness but, like upstream, is treated as non-FULL (PG itself errors at
+// constraint-creation time, not parse time). `MATCH` and `FULL`/`PARTIAL`/
+// `SIMPLE` are unreserved, so they are matched as plain identifiers. DU-002 slice 309.
+func parseFKMatchType(p *parser) bool {
+	if !p.acceptIdentKeyword("match") {
+		return false
+	}
+	if p.acceptKeyword(KwFull) || p.acceptIdentKeyword("full") {
+		return true
+	}
+	// MATCH PARTIAL / MATCH SIMPLE — consume the keyword, non-FULL.
+	_ = p.acceptIdentKeyword("partial") || p.acceptIdentKeyword("simple")
+	return false
 }
 
 // parseWithOptions parses `WITH ( name = value [, …] )`. Values are
@@ -3930,6 +3953,9 @@ func (p *parser) parseTableForeignKey(name string) (TableForeignKeyDef, error) {
 		}
 		fk.RefColumns = refCols
 	}
+	// Optional MATCH FULL | PARTIAL | SIMPLE, between the referenced column list
+	// and the ON DELETE/UPDATE clauses (PG gram.y key_match). DU-002 slice 309.
+	fk.MatchFull = parseFKMatchType(p)
 	// ON DELETE / ON UPDATE referential-action clauses. ON is KwOn (reserved).
 	for p.acceptKeyword(KwOn) {
 		isDelete := p.acceptKeyword(KwDelete)
@@ -5605,6 +5631,9 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 				return AlterTableAction{}, p.errAtCur("expected ')'")
 			}
 		}
+		// Optional MATCH FULL | PARTIAL | SIMPLE, between the referenced column
+		// list and the ON DELETE/UPDATE clauses (PG gram.y key_match). DU-002 slice 309.
+		matchFull := parseFKMatchType(p)
 		// Optional ON DELETE / ON UPDATE referential-action clauses, mirroring
 		// the inline column-FK path so actions survive into pg_constraint and
 		// pg_dump (DU-002 slice 52). ON is KwOn (reserved).
@@ -5655,6 +5684,7 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act.RefColumns = refCols
 		act.Deferrable = deferrable
 		act.NotValid = notValid
+		act.MatchFull = matchFull
 		act.OnDelete = onDelete
 		act.OnUpdate = onUpdate
 		return act, nil

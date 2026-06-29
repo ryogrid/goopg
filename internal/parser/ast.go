@@ -1051,6 +1051,11 @@ type ColumnDef struct {
 	OnUpdate            FKAction
 	FKDeferrable        bool
 	FKInitiallyDeferred bool
+	// FKMatchFull is true for an inline `REFERENCES … MATCH FULL` clause. MATCH
+	// SIMPLE (the default) and the unimplemented MATCH PARTIAL leave it false.
+	// Threaded into catalog.ForeignKey so pg_constraint.confmatchtype='f' and
+	// pg_get_constraintdef re-emit ` MATCH FULL`. DU-002 slice 309.
+	FKMatchFull bool
 
 	// CheckExpr holds the raw SQL expression for an inline CHECK constraint.
 	// M0097-0014.
@@ -1127,6 +1132,9 @@ type TableForeignKeyDef struct {
 	OnUpdate          FKAction   // referential action for ON UPDATE (default NO ACTION)
 	Deferrable        bool
 	InitiallyDeferred bool
+	// MatchFull is true for `… MATCH FULL`; MATCH SIMPLE (default) leaves it
+	// false. Threaded into catalog.ForeignKey for confmatchtype round-trip. DU-002 slice 309.
+	MatchFull bool
 }
 
 // CreateTableStmt — `CREATE [UNLOGGED] TABLE [IF NOT EXISTS] name
@@ -1976,6 +1984,7 @@ type AlterTableAction struct {
 	OnDelete   FKAction // referential action for ON DELETE (default NO ACTION)
 	OnUpdate   FKAction // referential action for ON UPDATE (default NO ACTION)
 	NotValid   bool     // true if `NOT VALID` (skip validation of existing rows)
+	MatchFull  bool     // true if `MATCH FULL`; MATCH SIMPLE (default) leaves it false. DU-002 slice 309.
 
 	// AttachPartitionOf is populated for AlterTableAttachPartition.
 	// It holds the child table name and partition bounds. M0096-0007.

@@ -2816,6 +2816,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("alter table nvc_tbl add check not valid: %v", err)
 	}
 
+	// Slice 309: a FOREIGN KEY declared with MATCH FULL must round-trip the match
+	// type. PG records pg_constraint.confmatchtype='f' (vs 's' for the MATCH
+	// SIMPLE default), and pg_get_constraintdef_worker (ruleutils.c) emits a
+	// ` MATCH FULL` clause BETWEEN the REFERENCES column list and the ON
+	// UPDATE/DELETE clauses. pg_dump's getConstraints renders the FK via
+	// pg_get_constraintdef, so the dumped
+	// `ALTER TABLE ONLY ... ADD CONSTRAINT mf_child_fk FOREIGN KEY (a, b)
+	// REFERENCES public.mf_ref(a, b) MATCH FULL;` carries the clause and the
+	// restored FK keeps MATCH FULL's all-or-nothing NULL semantics. The gap was
+	// twofold: the parser silently dropped the MATCH clause (it was never part of
+	// the FK grammar) and buildForeignKeyDefString never emitted ` MATCH FULL`,
+	// so a MATCH FULL FK silently degraded to MATCH SIMPLE on restore. goopg now
+	// parses MATCH FULL|PARTIAL|SIMPLE in all three FK forms, carries
+	// catalog.ForeignKey.MatchFull, projects confmatchtype='f', and re-emits the
+	// clause. Dump-fidelity only (goopg does not yet enforce FK matching). A
+	// multi-column FK exercises MATCH FULL's intended use (mixed-NULL keys).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.mf_ref (a integer, b integer, PRIMARY KEY (a, b))"); err != nil {
+		t.Fatalf("create table mf_ref: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.mf_child (a integer, b integer)"); err != nil {
+		t.Fatalf("create table mf_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.mf_child ADD CONSTRAINT mf_child_fk FOREIGN KEY (a, b) REFERENCES public.mf_ref (a, b) MATCH FULL"); err != nil {
+		t.Fatalf("alter table mf_child add fk match full: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -7199,6 +7225,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// would silently re-validate the constraint on restore.
 		if !strings.Contains(res.Stdout, "ADD CONSTRAINT nvc_chk CHECK ((val > 0)) NOT VALID;") {
 			t.Errorf("pg_dump dropped the NOT VALID suffix on an unvalidated CHECK; missing the nvc_chk line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 309 (asserted):** a MATCH FULL FOREIGN KEY round-trips the match
+		// type. pg_get_constraintdef emits ` MATCH FULL` between the REFERENCES
+		// column list and the (absent here) ON UPDATE/DELETE clauses for
+		// confmatchtype='f' (ruleutils.c). A regression dropping the clause would
+		// silently downgrade the restored FK to MATCH SIMPLE, changing mixed-NULL
+		// key semantics.
+		if !strings.Contains(res.Stdout, "ADD CONSTRAINT mf_child_fk FOREIGN KEY (a, b) REFERENCES public.mf_ref(a, b) MATCH FULL;") {
+			t.Errorf("pg_dump dropped the MATCH FULL clause on an FK; missing the mf_child_fk line\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 119 (asserted):** descending sequences must round-trip through
 		// pg_dump's descending-direction default suppression. A plain

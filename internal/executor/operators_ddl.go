@@ -2043,6 +2043,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				OnUpdate:          c.OnUpdate,
 				Deferrable:        c.FKDeferrable,
 				InitiallyDeferred: c.FKInitiallyDeferred,
+				MatchFull:         c.FKMatchFull,
 			}
 			// Check type compatibility between referencing and referenced column.
 			if err := checkFKColumnTypeCompatibility(o.ctx, tbl, fk, c.Type.Name, s.Pos()); err != nil {
@@ -2076,6 +2077,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			OnUpdate:          tfk.OnUpdate,
 			Deferrable:        tfk.Deferrable,
 			InitiallyDeferred: tfk.InitiallyDeferred,
+			MatchFull:         tfk.MatchFull,
 		}
 		tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 	}
@@ -5737,6 +5739,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				OnUpdate:   act.OnUpdate,
 				Deferrable: act.Deferrable,
 				NotValid:   act.NotValid,
+				MatchFull:  act.MatchFull,
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		case parser.AlterTableValidateConstraint:

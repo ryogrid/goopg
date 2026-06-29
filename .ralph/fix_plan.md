@@ -2301,10 +2301,18 @@ documentation-only and is exempt from the design-doc requirement.)
       `convalidated='f'`; `pg_get_constraintdef` CHECK branch appends ` NOT VALID`.
       pg_dump dumps it as a separate post-data `ALTER TABLE … ADD CONSTRAINT …
       CHECK ((val > 0)) NOT VALID;` (separate=!validated, pg_dump.c:9757). Design
-      `0119-0004-check-not-valid-roundtrip.md`. **Still open under M0119-0004:**
-      FK MATCH FULL round-trip; the pg_dump 002–010 catalog-view parity battery
-      (further slices); extended-protocol commit-time deferral (architecturally
-      entangled — extended protocol is auto-commit-per-statement).
+      `0119-0004-check-not-valid-roundtrip.md`. **Slice 309 (loop #30):** FK
+      `MATCH FULL` round-trip — new `parseFKMatchType` helper threads a
+      `MatchFull bool` through parser (all three FK forms), AST,
+      `catalog.ForeignKey`, the three executor FK-build sites, the `pg_constraint`
+      builder (`confmatchtype='f'` vs `'s'`), and `buildForeignKeyDefString`
+      (emits ` MATCH FULL` between the REFERENCES list and ON UPDATE/DELETE, per
+      ruleutils.c). pg_dump now re-emits `ADD CONSTRAINT mf_child_fk FOREIGN KEY
+      (a, b) REFERENCES public.mf_ref(a, b) MATCH FULL;`. Design
+      `0119-0004-fk-match-full-roundtrip.md`. **Still open under M0119-0004:**
+      the pg_dump 002–010 catalog-view parity battery (further slices);
+      extended-protocol commit-time deferral (architecturally entangled —
+      extended protocol is auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

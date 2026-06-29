@@ -4577,6 +4577,13 @@ func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) strin
 	}
 	def := "FOREIGN KEY (" + strings.Join(fk.Columns, ", ") + ") REFERENCES " +
 		refSchema + "." + refName + "(" + strings.Join(refCols, ", ") + ")"
+	// MATCH FULL is emitted between the REFERENCES column list and the ON
+	// UPDATE/DELETE clauses, mirroring pg_get_constraintdef_worker
+	// (ruleutils.c). MATCH SIMPLE (the default, confmatchtype='s') and the
+	// unimplemented MATCH PARTIAL produce no clause. DU-002 slice 309.
+	if fk.MatchFull {
+		def += " MATCH FULL"
+	}
 	if act := fkActionClause(fk.OnUpdate); act != "" {
 		def += " ON UPDATE " + act
 	}
