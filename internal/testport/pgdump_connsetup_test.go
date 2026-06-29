@@ -4085,6 +4085,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// recognises FUNCTION + its argument signature, and execCommentOn resolves
 		// the routine OID (Routines().Lookup) and keys it under pg_proc (1255).
 		"COMMENT ON FUNCTION public.add_one(integer) IS 'a function comment'",
+		// Slice 315: COMMENT ON STATISTICS must survive the dump now that the
+		// extended-statistics object itself round-trips (slice 314). goopg already
+		// parsed COMMENT ON STATISTICS (parser.go) and execCommentOn keys it under
+		// pg_statistic_ext (classoid 3381, via LookupStatistics) — but with no
+		// dumpable statistics object before slice 314 the collectComments path was
+		// never reachable, so this was untested. pg_dump's dumpStatisticsExt calls
+		// dumpComment for the stats object, which finds the pg_description row
+		// (classoid=3381, objoid=stxoid) and re-emits
+		// `COMMENT ON STATISTICS <nsp>.<name> IS '...'`.
+		"COMMENT ON STATISTICS public.statext_all IS 'a statistics comment'",
 	}
 	for _, sql := range miscComments {
 		if err := runSQLSimple(t, c, sql); err != nil {
@@ -6519,10 +6529,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// the signature via pg_get_function_identity_arguments and emits the
 			// comment keyed off pg_description (classoid=pg_proc).
 			"COMMENT ON FUNCTION public.add_one(integer) IS 'a function comment';",
+			// **Slice 315 (asserted):** COMMENT ON STATISTICS must round-trip. The
+			// extended-statistics object only became dumpable in slice 314, so the
+			// dumpStatisticsExt→dumpComment path that re-emits this line was never
+			// exercised before. pg_dump keys it off pg_description (classoid=3381,
+			// pg_statistic_ext) and renders the schema-qualified object name.
+			"COMMENT ON STATISTICS public.statext_all IS 'a statistics comment';",
 		}
 		for _, sub := range comments {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped a COMMENT; missing %q\n  full stdout=%q", sub, res.Stdout)
+			}
+		}
+		// **Slice 314 (asserted):** the CREATE STATISTICS objects themselves must
+		// round-trip. Slice 314 wired the parser→catalog→pg_get_statisticsobjdef
+		// path and created the two objects in the fixture, but never asserted the
+		// emitted DDL through pg_dump. dumpStatisticsExt runs
+		// pg_get_statisticsobjdef(oid) and emits the result verbatim + ';'. A
+		// default object (all three kinds, >1 column) emits no kinds clause; an
+		// explicit single-kind object emits `(ndistinct)`. Both forms are guarded
+		// here so a regression in BuildStatisticsObjDef (kinds suppression, column
+		// list, or schema qualification) is caught.
+		statExtDDL := []string{
+			"CREATE STATISTICS public.statext_all ON a, b FROM public.statext_t;",
+			"CREATE STATISTICS public.statext_nd (ndistinct) ON b, c FROM public.statext_t;",
+		}
+		for _, sub := range statExtDDL {
+			if !strings.Contains(res.Stdout, sub) {
+				t.Errorf("pg_dump dropped a CREATE STATISTICS object; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
 		}
 		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must
