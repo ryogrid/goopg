@@ -303,6 +303,128 @@ func TestNullsNotDistinctOnConflictDoUpdate(t *testing.T) {
 	}
 }
 
+// nndBuildAssert23505 asserts that a CREATE [UNIQUE] INDEX build raised the
+// could-not-create-unique-index duplicate-key error.
+func nndBuildAssert23505(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("expected 23505 build failure, got nil")
+	}
+	ee, ok := err.(*ExecError)
+	if !ok {
+		t.Fatalf("want *ExecError, got %T: %v", err, err)
+	}
+	if ee.Code != "23505" {
+		t.Fatalf("Code=%q want 23505 (err=%v)", ee.Code, err)
+	}
+	if !strings.Contains(ee.Message, "could not create unique index") {
+		t.Errorf("Message=%q missing 'could not create unique index'", ee.Message)
+	}
+}
+
+// TestNullsNotDistinctBuildAdmitsNullDefault: building an ordinary (non-unique)
+// index over a table that already contains NULL key values must SUCCEED. The
+// pre-0119-0004 build path raised `42804 "column is null and cannot be indexed"`,
+// rejecting CREATE INDEX over any NULL-containing column — a divergence from PG,
+// which admits NULLs in indexes (distinct by default). Design 0119-0004 sub (b).
+func TestNullsNotDistinctBuildAdmitsNullDefault(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE bnd1 (a int4, b int4)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		"INSERT INTO bnd1 VALUES (1, 10)",
+		"INSERT INTO bnd1 VALUES (NULL, 20)",
+		"INSERT INTO bnd1 VALUES (NULL, 30)",
+	} {
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX bnd1_a ON bnd1 (a)"); err != nil {
+		t.Fatalf("CREATE INDEX over NULL-containing column should succeed: %v", err)
+	}
+}
+
+// TestNullsNotDistinctBuildUniqueAdmitsDuplicateNulls: a default (NULLS DISTINCT)
+// UNIQUE index build admits multiple NULL-keyed rows (NULLs are distinct), so the
+// build succeeds even with two NULL keys present.
+func TestNullsNotDistinctBuildUniqueAdmitsDuplicateNulls(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE bnd2 (a int4, b int4)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		"INSERT INTO bnd2 VALUES (NULL, 1)",
+		"INSERT INTO bnd2 VALUES (NULL, 2)",
+		"INSERT INTO bnd2 VALUES (5, 3)",
+	} {
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := runDDL(t, ctx, "CREATE UNIQUE INDEX bnd2_a ON bnd2 (a)"); err != nil {
+		t.Fatalf("UNIQUE (NULLS DISTINCT) build with duplicate NULLs should succeed: %v", err)
+	}
+}
+
+// TestNullsNotDistinctBuildNNDRejectsDuplicateNulls: a NULLS NOT DISTINCT unique
+// index build over pre-existing duplicate-NULL rows must FAIL 23505 (PG rejects
+// "could not create unique index ... Key (a)=(null) is duplicated").
+func TestNullsNotDistinctBuildNNDRejectsDuplicateNulls(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE bnd3 (a int4, b int4)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		"INSERT INTO bnd3 VALUES (NULL, 1)",
+		"INSERT INTO bnd3 VALUES (NULL, 2)",
+	} {
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	nndBuildAssert23505(t, runDDL(t, ctx, "CREATE UNIQUE INDEX bnd3_a ON bnd3 (a) NULLS NOT DISTINCT"))
+}
+
+// TestNullsNotDistinctBuildNNDAdmitsDistinctTail: a multi-column NND unique build
+// over rows that share a NULL pattern but differ in their non-NULL tail must
+// SUCCEED — NND collapses NULLs only when the remaining key values are equal too.
+func TestNullsNotDistinctBuildNNDAdmitsDistinctTail(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	if err := runDDL(t, ctx, "CREATE TABLE bnd4 (a int4, b int4)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		"INSERT INTO bnd4 VALUES (NULL, 1)",
+		"INSERT INTO bnd4 VALUES (NULL, 2)",
+	} {
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	if err := runDDL(t, ctx, "CREATE UNIQUE INDEX bnd4_ab ON bnd4 (a, b) NULLS NOT DISTINCT"); err != nil {
+		t.Fatalf("NND build with distinct non-NULL tail should succeed: %v", err)
+	}
+	// But a genuine duplicate NULL pattern + equal tail is still rejected.
+	if err := runDDL(t, ctx, "CREATE TABLE bnd5 (a int4, b int4)"); err != nil {
+		t.Fatal(err)
+	}
+	for _, sql := range []string{
+		"INSERT INTO bnd5 VALUES (NULL, 7)",
+		"INSERT INTO bnd5 VALUES (NULL, 7)",
+	} {
+		if err := runDDL(t, ctx, sql); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	nndBuildAssert23505(t, runDDL(t, ctx, "CREATE UNIQUE INDEX bnd5_ab ON bnd5 (a, b) NULLS NOT DISTINCT"))
+}
+
 // TestNullsDistinctOnConflictControlInserts: the default (NULLS DISTINCT) arbiter
 // must keep PG semantics — a NULL key never conflicts, so DO NOTHING INSERTS the
 // new row. Proves the heap-scan fallback is strictly gated on idx.NullsNotDistinct.

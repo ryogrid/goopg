@@ -2087,10 +2087,25 @@ documentation-only and is exempt from the design-doc requirement.)
       DO UPDATE skips the pre-stamp self-conflict probe. 3 new upsert tests +
       `TestPort_IsolationInsertConflict*`/`Merge*` PASS; zero blast radius
       outside NND.
+      **2026-06-29 (loop #16, design 0119-0004 §9): NND CREATE [UNIQUE] INDEX
+      build over NULL-keyed data LANDED.** Both build paths
+      (`collectBTreeEntries`/`backfillBTree` via `encodeCompositeBTreeKey`,
+      operators_ddl.go) raised `42804 "column is null and cannot be indexed"` on
+      ANY NULL key column — rejecting CREATE INDEX over any NULL-containing
+      column (PG admits NULLs). `encodeCompositeBTreeKey` now returns
+      `hasNullKey` instead of erroring; default/non-unique builds SKIP NULL-keyed
+      rows (mirroring the runtime maintain path — no null bitmap), and a
+      `unique && nullsNotDistinct` build dedups null-bearing rows via a
+      build-local `seenNull`/`nndNullKeyDedupKey` map, raising 23505 on a
+      duplicate NULL pattern. NND flag threaded as a new `nullsNotDistinct`
+      param through `createBTreeIndex`→`bulkBuildBTree[WithPredicate]`→
+      `collectBTreeEntries`/`backfillBTree` (all 16 call sites; 5 NND-capable
+      forms forward the real flag, PK/non-unique pass false). 4 new build-path
+      tests; full executor suite + -race PASS; zero blast radius for default
+      indexes (NULL row now skipped not errored — strict improvement).
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
       battery; the **deferred-constraint-checking-at-COMMIT** engine gap; and the
-      NND **CREATE UNIQUE INDEX build** (42804) + **reordered-partition-leaf
-      arbiter** follow-ups (ledger 2026-06-29).
+      NND **reordered-partition-leaf arbiter** follow-up (ledger 2026-06-29).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

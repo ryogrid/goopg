@@ -1,8 +1,9 @@
 # 0119-0004 — `NULLS NOT DISTINCT` uniqueness *enforcement* at INSERT/UPDATE
 
-Status: **implemented** (plain INSERT/UPDATE — §1–§7 — and the ON CONFLICT /
-upsert-arbiter follow-up — §8 — landed; `CREATE UNIQUE INDEX` build over
-NULL-keyed data and the reordered-partition arbiter remain deferred, ledger)
+Status: **implemented** (plain INSERT/UPDATE — §1–§7 — the ON CONFLICT /
+upsert-arbiter follow-up — §8 — and the `CREATE [UNIQUE] INDEX` build over
+NULL-keyed data — §9 — landed; the reordered-partition arbiter remains
+deferred, ledger)
 Source task: M0119-0004 (deferral-ledger backlog consumption; surfaced by
 M0110-0001 / DU-002 slices 134–138). Milestone
 `docs/milestones/0119-deferral-ledger-backlog-consumption.md`.
@@ -281,3 +282,66 @@ PASS; `TestPort_IsolationInsertConflict*` + `TestPort_IsolationMerge*` (M0118-00
 group) PASS (58 s); zero blast radius outside NND indexes (every new branch
 gated on `idx.NullsNotDistinct`; non-NND `indexKeyColumnsChanged` returns the
 identical result as before). pgbench smoke via the pre-commit hook.
+
+## 9. Follow-up LANDED (2026-06-29) — `CREATE [UNIQUE] INDEX` build over NULL-keyed data
+
+Closes the P1 pre-existing divergence first listed in §2.1: both index-build
+paths (`collectBTreeEntries` / `backfillBTree` via `encodeCompositeBTreeKey`,
+`operators_ddl.go`) raised `42804 "column %q is null and cannot be indexed"` for
+**any** NULL key column. That rejected `CREATE INDEX`/`CREATE UNIQUE INDEX` over a
+table containing **any** NULL-valued key — a divergence from PG, which admits
+NULLs in indexes (distinct by default, allowing multiple NULLs) and only collides
+them under `NULLS NOT DISTINCT`.
+
+**Mechanism — mirror the runtime maintain path; no stored key change.** goopg's
+byte-key btree has no per-attribute null bitmap, and the runtime maintain path
+(`maintainUniqueIndexesForInsert`) already **never stores** a NULL-keyed row
+(`encodeIndexKeyFromCols` returns `nil`). The build is brought into line:
+
+* `encodeCompositeBTreeKey` now returns a third result `hasNullKey bool` instead
+  of raising `42804`. On the first NULL **value** key column it returns
+  `(nil, true, nil)`; the row is not stored. (Expression-only columns still
+  return `(nil, false, nil)` — the existing `key == nil` skip is preserved and
+  kept distinct from the NULL-value case.)
+* Both build loops, on `hasNullKey`:
+  * **default (NULLS DISTINCT) or non-unique** → skip the row (multiple NULLs
+    allowed); the index simply omits NULL-keyed rows, exactly as the maintain
+    path and as every equality/range scan expects (no NULL keys are ever probed).
+  * **`unique && nullsNotDistinct`** → dedup null-bearing rows among themselves
+    via a build-local `seenNull` map keyed by `nndNullKeyDedupKey` (a presence
+    byte `0x00`/`0x01` per key column + the btree column encoding for non-NULL
+    columns); a repeated NULL-pattern-plus-equal-non-NULL-values row raises
+    `23505 "could not create unique index"`. This key is **never stored in the
+    btree** (it exists only for build-time dedup), so the §2 "avoid sentinel keys
+    in stored/scanned keys" constraint is unaffected — sentinel aliasing against
+    real encodings is irrelevant for a build-local map.
+
+The `NullsNotDistinct` flag was previously set on the catalog index **after**
+`createBTreeIndex` built it, so the flag is now threaded as a new
+`nullsNotDistinct bool` parameter through `createBTreeIndex` →
+`bulkBuildBTree[WithPredicate]` → `collectBTreeEntries` / `backfillBTree`. All 16
+`createBTreeIndex` call sites pass it: the five NND-capable constraint/index
+forms forward the real flag (CREATE [UNIQUE] INDEX `s.NullsNotDistinct`, named
+constraint `nc.NullsNotDistinct`, inline column `c.UniqueNullsNotDistinct`,
+table-level `s.TableUniqueNullsNotDistinct[i]`, partition-child/LIKE
+`parentIdx.NullsNotDistinct`/`idx.NullsNotDistinct`); PK and non-unique forms
+pass `false`. The matview-rebuild `bulkBuildBTree` (operators_ddl.go) forwards
+`idx.NullsNotDistinct`.
+
+**Zero blast radius for default indexes.** Passing `nullsNotDistinct == false`
+(every existing index, all of TPC-H/pgbench) changes the build only in that a
+NULL-keyed row is now *skipped* instead of *erroring* — a strict improvement
+(building over NULL data now succeeds, matching PG and the runtime maintain
+path); no non-NULL row's key bytes or storage change. `seenNull` is `nil` for
+every non-NND build.
+
+**Tests:** `internal/executor/nulls_not_distinct_test.go` adds four build-path
+tests: `TestNullsNotDistinctBuildAdmitsNullDefault` (non-unique build over NULL
+data succeeds, no 42804), `…BuildUniqueAdmitsDuplicateNulls` (default-unique
+admits multiple NULLs), `…BuildNNDRejectsDuplicateNulls` (NND build over
+duplicate NULLs → 23505), `…BuildNNDAdmitsDistinctTail` (multi-col NND admits a
+distinct non-NULL tail, rejects an equal one). Full `internal/executor` suite +
+`-race` on Unique/Index/NullsNotDistinct/Upsert/Conflict/DDL/Partition PASS.
+
+**Scope deferred (ledger):** the reordered partition-leaf NND arbiter (§8) is the
+sole remaining NND follow-up under M0119-0004.
