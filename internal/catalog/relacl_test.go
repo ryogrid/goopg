@@ -242,6 +242,42 @@ func TestRelaclTextQuotedGrantee(t *testing.T) {
 	}
 }
 
+// TestRelaclTextMixedCaseGrantee verifies that a grantee spelled with a
+// case-significant (double-quoted) name preserves its exact case in relacl,
+// even though the ACL store keys privileges by the lower-cased name for
+// case-insensitive lookups. PostgreSQL role names are case-significant when
+// double-quoted; aclitemout renders the role's true name, and pg_dump's
+// getid/fmtId re-emit GRANT … TO "MixedCase". DU-002 slice 337.
+func TestRelaclTextMixedCaseGrantee(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16801
+
+	// A mixed-case name is all-alnum, so putid leaves it BARE in the aclitem
+	// (no double quotes) but must preserve the original case: MixedCase=r/...
+	c.GrantTablePrivilege(relOID, "MixedCase", "SELECT")
+	want := "{postgres=arwdDxtm/postgres,MixedCase=r/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after GRANT to mixed-case role = %q; want %q", got, want)
+	}
+
+	// A case-insensitive lookup still resolves the lower-cased key.
+	if !c.HasTablePrivilege(relOID, "mixedcase", "SELECT") {
+		t.Fatalf("HasTablePrivilege(mixedcase) = false; want true")
+	}
+	if !c.HasTablePrivilege(relOID, "MIXEDCASE", "SELECT") {
+		t.Fatalf("HasTablePrivilege(MIXEDCASE) = false; want true")
+	}
+	c.DropTableACL(relOID)
+
+	// Mixed case AND a quoting-required character compose: the name is both
+	// double-quoted (hyphen) and case-preserved.
+	c.GrantTablePrivilege(relOID, "Weird-Role", "SELECT")
+	want = `{postgres=arwdDxtm/postgres,"Weird-Role"=r/postgres}`
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after GRANT to quoted mixed-case role = %q; want %q", got, want)
+	}
+}
+
 // TestACLQuoteName unit-checks the putid emulation directly, including the
 // double-quote-doubling and multibyte (high-bit) cases that are awkward to drive
 // through a full GRANT.

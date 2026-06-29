@@ -2618,6 +2618,32 @@ documentation-only and is exempt from the design-doc requirement.)
       (`GrantTablePrivilege*` lower-cases the stored name). Still open: column-level
       (`pg_attribute.attacl`, heap re-sync)/database (`datacl`, needs `--create`)
       GRANT, REVOKE-of-default modelling.
+      **2026-06-30 (loop #60, design 0119-0004-grant-mixed-case-role-relacl-pgdump,
+      DU-002 slice 337):** `GRANT` to a case-significant (mixed-case quoted) role
+      round-trips. PG role names are case-significant when double-quoted;
+      `aclitemout` renders the role's TRUE name in `relacl` (`MixedCase=r/postgres`,
+      bare because all-alnum), and pg_dump re-quotes a mixed-case identifier via
+      `fmtId` → `TO "MixedCase"`. goopg's ACL store keys privileges by the
+      lower-cased name (case-insensitive `HasTablePrivilege`/`truncate-conflict`
+      lookups), so `relaclTextLockedFor` rendered `mixedcase` → pg_dump emitted
+      `TO mixedcase` (a different, nonexistent role) — the slice-336 deferred
+      limitation. Fix (rendering-only, catalog.go): new `roleACLDisplay`
+      map[lowerRole]→originalSpelling, populated in
+      `GrantTablePrivilegeWithGrantOption` (only when the spelling differs from its
+      lower-case — no all-lowercase fixture records one); `relaclTextLockedFor`
+      resolves the lower-cased key through it AFTER the PUBLIC→"" mapping and
+      BEFORE `aclQuoteName`, so mixed-case + special-char composes
+      (`"Weird-Role"=r/postgres`). No grant_ddl.go change (`handleQuery` passes the
+      raw original-case `matchable`; `splitGrantList` trims quotes → store gets
+      `MixedCase`). Zero blast radius (display map consulted only in rendering;
+      lookups read the lower-cased key, all-case-variants resolve). `CREATE ROLE`
+      case-folding is irrelevant (pg_dump doesn't emit CREATE ROLE; relacl carries
+      the grantee as text, no OID→pg_authid resolution). Tests
+      `TestRelaclTextMixedCaseGrantee` + slice-337 `TestPort_PgDumpConnectionSetup`
+      (`CREATE ROLE "MixedCase"` + `GRANT SELECT ON TABLE public.grant_mc TO
+      "MixedCase"`; byte-identical vs real pg_dump 18.3) PASS. Still open:
+      column-level (`pg_attribute.attacl`, heap re-sync)/database (`datacl`, needs
+      `--create`) GRANT, REVOKE-of-default modelling.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

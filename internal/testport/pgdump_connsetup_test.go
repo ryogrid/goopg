@@ -3259,6 +3259,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant select on grant_q to weird-role: %v", err)
 	}
 
+	// Slice 337: a GRANT to a role whose name is case-significant (double-quoted
+	// mixed case) must round-trip. PostgreSQL role names are case-significant
+	// when double-quoted, and aclitemout renders the role's TRUE name in
+	// pg_class.relacl. A mixed-case name like "MixedCase" is all-alnum, so putid
+	// leaves it bare in the aclitem (MixedCase=r/postgres), but pg_dump's
+	// getid/fmtId re-quote it client-side → GRANT … TO "MixedCase". goopg's ACL
+	// store keys privileges by the lower-cased name (case-insensitive lookups),
+	// so without preserving the original spelling it would render `mixedcase`
+	// and pg_dump would emit TO mixedcase (a different, nonexistent role).
+	if err := runSQLSimple(t, c, `CREATE ROLE "MixedCase"`); err != nil {
+		t.Fatalf("create role MixedCase: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grant_mc (a integer)"); err != nil {
+		t.Fatalf("create table grant_mc: %v", err)
+	}
+	if err := runSQLSimple(t, c, `GRANT SELECT ON TABLE public.grant_mc TO "MixedCase"`); err != nil {
+		t.Fatalf("grant select on grant_mc to MixedCase: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7114,6 +7133,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// byte-identical to real pg_dump 18.3.
 		if want := `GRANT SELECT ON TABLE public.grant_q TO "weird-role";`; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered quoted-role GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 337 (asserted):** a GRANT to a case-significant (double-quoted
+		// mixed-case) role round-trips. PG stores the role's true case in relacl
+		// (MixedCase=r/postgres, bare because all-alnum); pg_dump re-quotes it via
+		// fmtId → TO "MixedCase". goopg lower-cases the ACL store key but now
+		// preserves the original spelling for rendering. Verified byte-identical
+		// to real pg_dump 18.3.
+		if want := `GRANT SELECT ON TABLE public.grant_mc TO "MixedCase";`; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered mixed-case-role GRANT: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

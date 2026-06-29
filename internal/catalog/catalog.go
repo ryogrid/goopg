@@ -1986,6 +1986,17 @@ type InMemory struct {
 	// privilege granted". M0118-0008; grant-option DU-002 slice 332.
 	tableACLs map[uint32]map[string]map[string]bool
 
+	// roleACLDisplay preserves the original-case spelling of a grantee role
+	// name recorded in tableACLs (which is keyed by the lower-cased name so
+	// privilege lookups stay case-insensitive). Key: lower-cased role name →
+	// the exact case it was spelled in the GRANT. PostgreSQL role names are
+	// case-significant when double-quoted (CREATE ROLE "MixedCase"), and
+	// aclitemout renders the role's true name in pg_class.relacl, so pg_dump's
+	// getid/fmtId re-emit GRANT … TO "MixedCase". Without this, the lower-cased
+	// store would render `mixedcase` and pg_dump would emit TO mixedcase (a
+	// different, nonexistent role). DU-002 slice 337.
+	roleACLDisplay map[string]string
+
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
 	compatObjects map[string]map[string]struct{}
@@ -2375,6 +2386,7 @@ func NewInMemory() *InMemory {
 		roles:          make(map[string]uint32),
 		tempNamespaces: make(map[string]uint32),
 		tableACLs:      make(map[uint32]map[string]map[string]bool),
+		roleACLDisplay: make(map[string]string),
 		comments:       make(map[commentKey]string),
 		statisticsObjs: make(map[string]*StatisticsObject),
 		extensions:     make(map[string]*extensionRow),
@@ -8353,13 +8365,21 @@ func (c *InMemory) GrantTablePrivilege(relOID uint32, role, priv string) {
 // (matching PostgreSQL, which retains the grant option until REVOKE GRANT
 // OPTION FOR). See the Catalog interface doc. DU-002 slice 332.
 func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv string, withGrantOption bool) {
-	role = strings.ToLower(strings.TrimSpace(role))
+	display := strings.TrimSpace(role)
+	role = strings.ToLower(display)
 	priv = strings.ToUpper(strings.TrimSpace(priv))
 	if role == "" || priv == "" {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Remember the exact case the grantee was spelled with so relacl renders
+	// the role's true name (PostgreSQL role names are case-significant when
+	// double-quoted). Only record a non-identity spelling; the common
+	// all-lowercase case needs no override. DU-002 slice 337.
+	if display != role {
+		c.roleACLDisplay[role] = display
+	}
 	byRole := c.tableACLs[relOID]
 	if byRole == nil {
 		byRole = make(map[string]map[string]bool)
@@ -8550,6 +8570,11 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		grantee := role
 		if grantee == publicPseudoRole {
 			grantee = ""
+		} else if disp, ok := c.roleACLDisplay[role]; ok {
+			// Restore the original-case spelling so a quoted mixed-case role
+			// renders its true name in the aclitem (PostgreSQL stores the
+			// role's actual name, not a case-folded one). DU-002 slice 337.
+			grantee = disp
 		}
 		// A grantee name with characters outside [A-Za-z0-9_] (e.g. a hyphen, a
 		// space, or a multibyte char) must be double-quoted in the aclitem text,
