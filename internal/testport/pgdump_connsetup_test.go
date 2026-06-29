@@ -3219,6 +3219,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant select on grant_pub to public: %v", err)
 	}
 
+	// Slice 335: a GRANT … ON SCHEMA must round-trip through pg_dump. pg_dump's
+	// getNamespaces reads `n.nspacl` from pg_namespace, diffs it against
+	// acldefault('n', nspowner) = "{postgres=UC/postgres}" client-side in
+	// buildACLCommands, and dumpACL (objtype "SCHEMA") re-emits the diff as
+	// `GRANT … ON SCHEMA …`. Before this slice goopg projected nspacl as a
+	// constant NULL even after a GRANT (the grant_ddl recorder bailed on ON
+	// SCHEMA), so the privilege was silently lost on dump/restore. goopg now
+	// records the schema grant in the OID-keyed ACL store (schemas share it with
+	// relations) and renders nspacl with the schema privilege order (USAGE 'U' <
+	// CREATE 'C') / owner-default "UC". A dedicated schema keeps the grant
+	// isolated from the `s` schema asserted elsewhere.
+	if err := runSQLSimple(t, c, "CREATE SCHEMA grant_sch"); err != nil {
+		t.Fatalf("create schema grant_sch: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE schema_role"); err != nil {
+		t.Fatalf("create role schema_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON SCHEMA grant_sch TO schema_role"); err != nil {
+		t.Fatalf("grant usage on schema grant_sch: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7057,6 +7078,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// Verified byte-identical to real pg_dump 18.3.
 		if want := "GRANT SELECT ON TABLE public.grant_pub TO PUBLIC;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered GRANT TO PUBLIC: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 335 (asserted):** a GRANT … ON SCHEMA round-trips. pg_dump reads
+		// pg_namespace.nspacl, diffs it against acldefault('n', 10) =
+		// "{postgres=UC/postgres}", and dumpACL (objtype "SCHEMA") emits a single
+		// `GRANT USAGE ON SCHEMA grant_sch TO schema_role;`. Verified byte-identical
+		// to real pg_dump 18.3.
+		if want := "GRANT USAGE ON SCHEMA grant_sch TO schema_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered schema GRANT: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

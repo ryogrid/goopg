@@ -4306,10 +4306,10 @@ func (c *InMemory) registerSystemTables() {
 				continue // skip internal alias
 			}
 			out = append(out, []string{
-				strconv.Itoa(int(s.oid)), // oid
-				s.name,                   // nspname
-				"10",                     // nspowner
-				"",                       // nspacl
+				strconv.Itoa(int(s.oid)),  // oid
+				s.name,                    // nspname
+				"10",                      // nspowner
+				c.NamespaceACLText(s.oid), // nspacl (NULL until a schema GRANT, slice 335)
 			})
 		}
 		return out
@@ -8447,6 +8447,24 @@ const ownerSequenceACLString = "rwU"
 // rendered as the empty grantee in the materialized aclitem[]. DU-002 slice 334.
 const publicPseudoRole = "public"
 
+// schemaACLPrivOrder lists the schema (namespace) privileges in PostgreSQL's
+// canonical aclitemout bit order, taken from ACL_ALL_RIGHTS_STR ("arwdDxtXUCTc…"):
+// USAGE('U') precedes CREATE('C'). pg_dump diffs a namespace's nspacl against
+// acldefault('n', owner) client-side and re-emits `GRANT … ON SCHEMA …`, so
+// projecting the privilege set in this order matches the aclitem[] text PG
+// stores in pg_namespace.nspacl. DU-002 slice 335.
+var schemaACLPrivOrder = []aclPrivLetter{
+	{"USAGE", 'U'},
+	{"CREATE", 'C'},
+}
+
+// ownerSchemaACLString is the privilege-letter string for the owner's full set
+// of schema privileges, i.e. "UC". It matches acldefault('n', owner)
+// (ACL_ALL_RIGHTS_SCHEMA = USAGE|CREATE; schemas grant PUBLIC nothing by
+// default) so the owner's own entry produces no GRANT/REVOKE on round-trip.
+// DU-002 slice 335.
+const ownerSchemaACLString = "UC"
+
 // relaclTextLocked renders the materialized pg_class.relacl text — an aclitem[]
 // array literal such as `{postgres=arwdDxtm/postgres,grantee_role=r/postgres}` —
 // for relOID from the in-memory GRANT store, or "" (SQL NULL) when no
@@ -8473,6 +8491,19 @@ func (c *InMemory) relaclTextLocked(relOID uint32) string {
 // acldefault('s', owner). DU-002 slice 333. Caller must hold c.mu.
 func (c *InMemory) relaclTextLockedSeq(relOID uint32) string {
 	return c.relaclTextLockedFor(relOID, sequenceACLPrivOrder, ownerSequenceACLString)
+}
+
+// NamespaceACLText renders the materialized pg_namespace.nspacl text for the
+// schema identified by schemaOID, or "" (SQL NULL) when no privileges have been
+// granted away. Schemas share the OID-keyed ACL store with relations (goopg
+// mints schema OIDs from the same nextOID counter, so there is no collision),
+// and pg_dump diffs nspacl against acldefault('n', owner) client-side in
+// buildACLCommands, so projecting the correct aclitem[] text is sufficient for
+// the `GRANT … ON SCHEMA …` round-trip. DU-002 slice 335.
+func (c *InMemory) NamespaceACLText(schemaOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(schemaOID, schemaACLPrivOrder, ownerSchemaACLString)
 }
 
 // relaclTextLockedFor is the object-type-agnostic core of relaclTextLocked: it

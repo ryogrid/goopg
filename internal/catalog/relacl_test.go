@@ -126,6 +126,55 @@ func TestRelaclTextPublic(t *testing.T) {
 	}
 }
 
+// TestNamespaceACLText pins the pg_namespace.nspacl projection that lets a
+// GRANT … ON SCHEMA round-trip through pg_dump (DU-002 slice 335). A schema's
+// owner default is "UC" (USAGE/CREATE; schemas grant PUBLIC nothing by
+// default), which pg_dump diffs against via acldefault('n', owner); grantee
+// privileges render in canonical aclitemout order USAGE('U') < CREATE('C').
+// Schemas share the OID-keyed ACL store with relations, so the same
+// GrantTablePrivilege* recorders apply.
+func TestNamespaceACLText(t *testing.T) {
+	c := NewInMemory()
+	const schemaOID = 16800
+
+	// No grants → NULL nspacl (matches acldefault, so pg_dump emits no GRANT).
+	if got := c.NamespaceACLText(schemaOID); got != "" {
+		t.Fatalf("nspacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// GRANT USAGE materializes the owner entry (UC) plus the grantee ("U").
+	c.GrantTablePrivilege(schemaOID, "schema_role", "USAGE")
+	want := "{postgres=UC/postgres,schema_role=U/postgres}"
+	if got := c.NamespaceACLText(schemaOID); got != want {
+		t.Fatalf("nspacl after GRANT USAGE = %q; want %q", got, want)
+	}
+
+	// Multiple privileges render in canonical order USAGE('U') before CREATE('C');
+	// table/sequence-only privileges (e.g. SELECT) are not part of the schema
+	// order and are dropped from the rendering.
+	c.GrantTablePrivilege(schemaOID, "schema_role", "CREATE")
+	c.GrantTablePrivilege(schemaOID, "schema_role", "SELECT")
+	want = "{postgres=UC/postgres,schema_role=UC/postgres}"
+	if got := c.NamespaceACLText(schemaOID); got != want {
+		t.Fatalf("nspacl after multi-priv GRANT = %q; want %q", got, want)
+	}
+
+	// A grant-option schema privilege renders "<letter>*".
+	c.GrantTablePrivilegeWithGrantOption(schemaOID, "schema_role", "CREATE", true)
+	want = "{postgres=UC/postgres,schema_role=UC*/postgres}"
+	if got := c.NamespaceACLText(schemaOID); got != want {
+		t.Fatalf("nspacl after GRANT CREATE WITH GRANT OPTION = %q; want %q", got, want)
+	}
+
+	// GRANT … ON SCHEMA … TO PUBLIC materializes the empty grantee.
+	const pubSchemaOID = 16801
+	c.GrantTablePrivilege(pubSchemaOID, "PUBLIC", "USAGE")
+	want = "{postgres=UC/postgres,=U/postgres}"
+	if got := c.NamespaceACLText(pubSchemaOID); got != want {
+		t.Fatalf("nspacl after GRANT USAGE TO PUBLIC = %q; want %q", got, want)
+	}
+}
+
 // TestRelaclTextSequence pins the sequence relacl projection that lets a
 // GRANT … ON SEQUENCE round-trip through pg_dump (DU-002 slice 333). A
 // sequence's owner default is "rwU" (USAGE/SELECT/UPDATE), which pg_dump diffs

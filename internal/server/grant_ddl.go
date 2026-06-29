@@ -46,6 +46,10 @@ var allTablePrivileges = []string{
 // slice 333.
 var allSequencePrivileges = []string{"USAGE", "SELECT", "UPDATE"}
 
+// allSchemaPrivileges is the expansion of GRANT ALL [PRIVILEGES] ON a schema
+// (USAGE/CREATE — pg_dump renders these as "UC"). DU-002 slice 335.
+var allSchemaPrivileges = []string{"USAGE", "CREATE"}
+
 // tryRecordTableGrant parses a table-level GRANT and records its privileges in
 // the catalog ACL store. It is a best-effort side effect: on any form it does
 // not recognise it simply returns, leaving the statement as a successful no-op.
@@ -86,17 +90,25 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 		rolePart = strings.TrimSpace(rolePart[:i])
 	}
 
-	// Optional leading TABLE / SEQUENCE keyword on the object list. A SEQUENCE
-	// grant is recorded too (DU-002 slice 333) so it round-trips through
-	// pg_dump; its ALL expansion and rendered privilege letters differ.
+	// Optional leading TABLE / SEQUENCE keyword on the object list, or a required
+	// SCHEMA keyword for a namespace grant. A SEQUENCE grant is recorded too
+	// (DU-002 slice 333) and a SCHEMA grant (DU-002 slice 335) so each
+	// round-trips through pg_dump; their ALL expansions and rendered privilege
+	// letters differ.
 	isSequence := false
 	if rest, ok := cutLeadingKeyword(objPart, "table"); ok {
 		objPart = rest
 	} else if rest, ok := cutLeadingKeyword(objPart, "sequence"); ok {
 		objPart = rest
 		isSequence = true
+	} else if rest, ok := cutLeadingKeyword(objPart, "schema"); ok {
+		// GRANT … ON SCHEMA <names> TO <roles>. Schemas live in pg_namespace and
+		// share the OID-keyed ACL store with relations; record under each schema's
+		// OID so pg_dump's getNamespaces/dumpACL re-emits the GRANT from nspacl.
+		s.recordSchemaGrant(rest, rolePart, privPart, withGrantOption)
+		return
 	}
-	// Bail on non-table object classes (ON SCHEMA foo, ON DATABASE …, etc.).
+	// Bail on non-table object classes (ON DATABASE …, ON FUNCTION …, etc.).
 	if _, isNonTable := nonTableGrantObjects[firstWordLower(objPart)]; isNonTable {
 		return
 	}
@@ -120,6 +132,30 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 		for _, role := range roles {
 			for _, p := range privs {
 				s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(tbl.OID, role, p, withGrantOption)
+			}
+		}
+	}
+}
+
+// recordSchemaGrant records a `GRANT <privs> ON SCHEMA <names> TO <roles>` in
+// the catalog ACL store, keyed by each schema's pg_namespace OID. Unknown
+// schemas and an empty/unparseable privilege list are skipped, leaving the
+// statement as a successful no-op. DU-002 slice 335.
+func (s *Server) recordSchemaGrant(objPart, rolePart, privPart string, withGrantOption bool) {
+	privs := parseGrantPrivileges(privPart, allSchemaPrivileges)
+	if len(privs) == 0 {
+		return
+	}
+	schemas := splitGrantList(objPart)
+	roles := splitGrantList(rolePart)
+	for _, sc := range schemas {
+		oid := s.cfg.Catalog.SchemaOID(strings.Trim(strings.TrimSpace(sc), `"`))
+		if oid == 0 {
+			continue
+		}
+		for _, role := range roles {
+			for _, p := range privs {
+				s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(oid, role, p, withGrantOption)
 			}
 		}
 	}

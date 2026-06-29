@@ -2579,6 +2579,23 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_PgDumpConnectionSetup` (byte-identical vs real pg_dump 18.3) PASS.
       Still open: column-level (`pg_attribute.attacl`)/schema (`nspacl`)/database
       (`datacl`) GRANT, REVOKE-of-default modelling.
+      **2026-06-30 (loop #58, design 0119-0004-schema-grant-nspacl-pgdump, DU-002
+      slice 335):** `GRANT … ON SCHEMA` round-trips. pg_dump's getNamespaces reads
+      `pg_namespace.nspacl`, diffs it against `acldefault('n', 10)` =
+      `{postgres=UC/postgres}`, and dumpACL (objtype SCHEMA) emits a single
+      `GRANT USAGE ON SCHEMA grant_sch TO schema_role;`. goopg lost the grant two
+      ways: grant_ddl bailed on `schema` (no-op), and the pg_namespace builder
+      hard-coded `nspacl` to NULL. Fix (dump-fidelity only): schema OIDs come from
+      the same `nextOID` counter as relations (no collision) so schemas reuse the
+      OID-keyed ACL store + object-agnostic `relaclTextLockedFor`; catalog adds
+      `schemaACLPrivOrder` (USAGE 'U' < CREATE 'C') + `ownerSchemaACLString` "UC"
+      + `NamespaceACLText(oid)`, and pg_namespace projects it. server adds
+      `allSchemaPrivileges` {USAGE,CREATE} + `recordSchemaGrant` (resolves
+      `SchemaOID`). HasTablePrivilege/truncate-conflict untouched; system schemas
+      stay NULL; grant-option + TO PUBLIC ride the shared core. Tests
+      `TestNamespaceACLText` + slice-335 `TestPort_PgDumpConnectionSetup`
+      (byte-identical vs real pg_dump 18.3) PASS. Still open: column-level
+      (`pg_attribute.attacl`)/database (`datacl`) GRANT, REVOKE-of-default modelling.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
