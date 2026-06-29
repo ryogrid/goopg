@@ -320,6 +320,12 @@ func (p *parser) parseCreate() (Stmt, error) {
 	// DROP RULE can track rule existence.
 	case p.acceptIdentKeyword("rule"):
 		return p.parseCreateRuleTail(t.Pos)
+	// CREATE POLICY name ON table [AS {PERMISSIVE|RESTRICTIVE}] [FOR cmd]
+	// [TO role[, ...]] [USING (expr)] [WITH CHECK (expr)] — records a
+	// row-security policy so it round-trips through pg_dump (pg_policy →
+	// dumpPolicy). goopg does NOT enforce RLS. DU-002 slice 323.
+	case p.acceptIdentKeyword("policy"):
+		return p.parseCreatePolicyTail(t.Pos)
 	// CREATE SCHEMA [name] [AUTHORIZATION role] — register schema in catalog.
 	// Standalone CREATE SCHEMA is intercepted by dispatch.go before parsing; this
 	// case handles multi-statement batches where the SQL parser runs first.
@@ -3628,6 +3634,10 @@ func (p *parser) parseDrop() (Stmt, error) {
 	if p.acceptIdentKeyword("rule") {
 		return p.parseDropRuleTail(t.Pos)
 	}
+	// DROP POLICY [IF EXISTS] name ON table [CASCADE|RESTRICT] — DU-002 slice 323.
+	if p.acceptIdentKeyword("policy") {
+		return p.parseDropPolicyTail(t.Pos)
+	}
 	// DROP ROUTINE [IF EXISTS] name [(arg_types)] [CASCADE|RESTRICT].
 	// Semantically equivalent to DROP PROCEDURE but uses "routine" in error messages.
 	if p.acceptIdentKeyword("routine") {
@@ -4228,6 +4238,118 @@ func (p *parser) parseCheckExpr() (string, error) {
 	return "", p.errAtCur("unterminated CHECK expression")
 }
 
+// parseCreatePolicyTail picks up after CREATE POLICY. Grammar:
+//
+//	CREATE POLICY name ON table_name
+//	  [ AS { PERMISSIVE | RESTRICTIVE } ]
+//	  [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
+//	  [ TO { role_name | PUBLIC } [, ...] ]
+//	  [ USING ( using_expression ) ]
+//	  [ WITH CHECK ( check_expression ) ]
+//
+// goopg does not enforce row-level security; the statement is parsed and stored
+// so the policy round-trips through pg_dump (pg_policy → dumpPolicy). DU-002
+// slice 323.
+func (p *parser) parseCreatePolicyTail(pos int) (Stmt, error) {
+	nameTok, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	stmt := &CreatePolicyStmt{
+		pos:        pos,
+		Name:       identText(nameTok),
+		Permissive: true,  // PG default is PERMISSIVE
+		Command:    "all", // PG default is FOR ALL
+	}
+	if _, err := p.expectKeyword(KwOn); err != nil {
+		return nil, err
+	}
+	tblName, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	stmt.Table = tblName
+
+	// [ AS { PERMISSIVE | RESTRICTIVE } ]
+	if p.acceptKeyword(KwAs) {
+		switch {
+		case p.acceptIdentKeyword("permissive"):
+			stmt.Permissive = true
+		case p.acceptIdentKeyword("restrictive"):
+			stmt.Permissive = false
+		default:
+			return nil, p.errAtCur("expected PERMISSIVE or RESTRICTIVE after AS")
+		}
+	}
+
+	// [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
+	if p.acceptKeyword(KwFor) {
+		switch {
+		case p.acceptKeyword(KwAll):
+			stmt.Command = "all"
+		case p.acceptKeyword(KwSelect):
+			stmt.Command = "select"
+		case p.acceptKeyword(KwInsert):
+			stmt.Command = "insert"
+		case p.acceptKeyword(KwUpdate):
+			stmt.Command = "update"
+		case p.acceptKeyword(KwDelete):
+			stmt.Command = "delete"
+		default:
+			return nil, p.errAtCur("expected ALL, SELECT, INSERT, UPDATE, or DELETE after FOR")
+		}
+	}
+
+	// [ TO role [, ...] ] — PUBLIC and named roles both accepted as identifiers.
+	if p.acceptKeyword(KwTo) {
+		for {
+			roleTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Roles = append(stmt.Roles, identText(roleTok))
+			if !p.acceptSymbol(",") {
+				break
+			}
+		}
+	}
+
+	// [ USING ( expr ) ]
+	if p.acceptKeyword(KwUsing) {
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after USING")
+		}
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' after USING expression")
+		}
+		stmt.Using = expr
+	}
+
+	// [ WITH CHECK ( expr ) ]
+	if p.acceptKeyword(KwWith) {
+		if _, err := p.expectKeyword(KwCheck); err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected '(' after WITH CHECK")
+		}
+		expr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ')' after WITH CHECK expression")
+		}
+		stmt.WithCheck = expr
+	}
+
+	return stmt, nil
+}
+
 // parseCreateTriggerTail picks up after CREATE [CONSTRAINT] TRIGGER.
 // Grammar (simplified):
 // parseCreateSequenceTail picks up after CREATE [TEMP] SEQUENCE. M0097-0009.
@@ -4481,6 +4603,31 @@ func (p *parser) parseDropRuleTail(pos int) (Stmt, error) {
 	}
 	_ = p.acceptKeyword(KwCascade) || p.acceptKeyword(KwRestrict)
 	return &DropRuleStmt{pos: pos, Name: identText(nameTok), Table: tbl, IfExists: ifExists}, nil
+}
+
+// parseDropPolicyTail picks up after DROP POLICY.
+// Grammar: [IF EXISTS] name ON table [CASCADE|RESTRICT]. DU-002 slice 323.
+func (p *parser) parseDropPolicyTail(pos int) (Stmt, error) {
+	ifExists := false
+	if p.acceptKeyword(KwIf) {
+		if _, err := p.expectKeyword(KwExists); err != nil {
+			return nil, err
+		}
+		ifExists = true
+	}
+	nameTok, err := p.parseIdent()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKeyword(KwOn); err != nil {
+		return nil, err
+	}
+	tbl, err := p.parseObjectName()
+	if err != nil {
+		return nil, err
+	}
+	_ = p.acceptKeyword(KwCascade) || p.acceptKeyword(KwRestrict)
+	return &DropPolicyStmt{pos: pos, Name: identText(nameTok), Table: tbl, IfExists: ifExists}, nil
 }
 
 // parseDropTriggerTail picks up after DROP TRIGGER.

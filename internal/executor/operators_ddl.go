@@ -111,6 +111,10 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execDropProcedure(s)
 	case *parser.CreateTriggerStmt:
 		return nil, o.execCreateTrigger(s)
+	case *parser.CreatePolicyStmt:
+		return nil, o.execCreatePolicy(s)
+	case *parser.DropPolicyStmt:
+		return nil, o.execDropPolicy(s)
 	case *parser.DropRuleStmt:
 		return nil, o.execDropRule(s)
 	case *parser.DropTriggerStmt:
@@ -10775,6 +10779,93 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 		}
 	}
 	tbl.Triggers = append(filtered, trig)
+	return nil
+}
+
+// execCreatePolicy records a row-level security policy on its table so it
+// round-trips through pg_dump (pg_policy → dumpPolicy). goopg does NOT enforce
+// row-level security — this is schema fidelity only, mirroring the RLS ENABLE
+// flag landed in DU-002 slice 322. DU-002 slice 323.
+func (o *ddlOp) execCreatePolicy(s *parser.CreatePolicyStmt) error {
+	tbl, ok := o.ctx.Catalog.LookupTable(s.Table)
+	if !ok {
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
+	}
+	// A duplicate policy name on the same table is an error (PG: 42710).
+	for _, p := range tbl.Policies {
+		if p.Name == s.Name {
+			return &ExecError{Code: "42710", Pos: s.Pos(),
+				Message: fmt.Sprintf("policy %q for table %q already exists", s.Name, tbl.Name)}
+		}
+	}
+	// polcmd char (pg_policy.polcmd): '*' ALL, 'r' SELECT, 'a' INSERT,
+	// 'w' UPDATE, 'd' DELETE.
+	var cmd byte
+	switch s.Command {
+	case "select":
+		cmd = 'r'
+	case "insert":
+		cmd = 'a'
+	case "update":
+		cmd = 'w'
+	case "delete":
+		cmd = 'd'
+	default:
+		cmd = '*'
+	}
+	// polroles: PUBLIC (the default and the only form goopg has OIDs for) maps to
+	// {0}. A TO clause containing only PUBLIC is equivalent. Named roles cannot
+	// round-trip yet (goopg has no per-role OID registry) — reject them with a
+	// clear message rather than silently dropping the restriction.
+	roles := []uint32{0}
+	for _, r := range s.Roles {
+		if !strings.EqualFold(r, "public") {
+			return &ExecError{Code: "0A000", Pos: s.Pos(),
+				Message: fmt.Sprintf("CREATE POLICY ... TO %s (named roles) is not yet supported; only PUBLIC round-trips", r)}
+		}
+	}
+	pol := catalog.PolicyInfo{
+		Name:       s.Name,
+		OID:        o.ctx.Catalog.AllocOID(),
+		Command:    cmd,
+		Permissive: s.Permissive,
+		Roles:      roles,
+		Using:      s.Using,
+		WithCheck:  s.WithCheck,
+	}
+	tbl.Policies = append(tbl.Policies, pol)
+	return nil
+}
+
+// execDropPolicy removes a row-level security policy from its table. DU-002
+// slice 323.
+func (o *ddlOp) execDropPolicy(s *parser.DropPolicyStmt) error {
+	tbl, ok := o.ctx.Catalog.LookupTable(s.Table)
+	if !ok {
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("relation %q does not exist, skipping", s.Table.Name))
+			return nil
+		}
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
+	}
+	filtered := tbl.Policies[:0]
+	found := false
+	for _, p := range tbl.Policies {
+		if p.Name == s.Name {
+			found = true
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+	tbl.Policies = filtered
+	if !found {
+		if s.IfExists {
+			o.ctx.AddNotice(fmt.Sprintf("policy %q for relation %q does not exist, skipping", s.Name, s.Table.Name))
+			return nil
+		}
+		return &ExecError{Code: "42704", Pos: s.Pos(),
+			Message: fmt.Sprintf("policy %q for table %q does not exist", s.Name, s.Table.Name)}
+	}
 	return nil
 }
 

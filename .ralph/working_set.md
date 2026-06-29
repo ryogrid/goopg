@@ -1,38 +1,42 @@
 (idle — nothing in flight)
 
-Last loop (#44): M0119-0004 **`ALTER TABLE … ENABLE / FORCE ROW LEVEL SECURITY`
-round-trip in pg_dump** (DU-002 slice 322) — LANDED, committed.
+Last loop (#45): M0119-0004 **CREATE POLICY round-trip in pg_dump** (DU-002
+slice 323) — LANDED, committed.
 
-pg_dump emits RLS state from two pg_class cols: relrowsecurity → getPolicies
-(null-polname PolicyInfo) → dumpPolicy `ALTER TABLE <t> ENABLE ROW LEVEL
-SECURITY;`, and relforcerowsecurity → dumpTableSchema `ALTER TABLE ONLY <t>
-FORCE ROW LEVEL SECURITY;`. goopg hardcoded both to 'f' and swallowed ENABLE as
-a trigger no-op, so RLS was dropped and goopg couldn't restore its own dump.
+The per-policy half of RLS (the relrowsecurity ENABLE flag landed slice 322).
+pg_dump's getPolicies reads pg_policy and dumpPolicy re-emits CREATE POLICY.
+goopg had NO CREATE POLICY (parse error) + an empty pg_policy stub, so a policy
+was silently lost on dump. Feasible because slice 322's rls_t already proves
+getPolicies executes (0 rows) and a PUBLIC policy (polroles='{0}') short-circuits
+the lazy CASE before the risky pg_roles ARRAY subquery; pg_get_expr is a
+pass-through.
 
 Fix (dump-fidelity only — goopg enforces NO RLS):
-- ast.go: 4 new AlterTableActionKind (Enable/Disable/Force/NoForceRowSecurity).
-- ddl.go parseAlterTable: detect ENABLE/DISABLE ROW LEVEL SECURITY and [NO]
-  FORCE ROW LEVEL SECURITY by token-value lookahead BEFORE the trigger no-op arm.
-- catalog.go: Table.RowSecurity/ForceRowSecurity fields; new boolToPGChar helper;
-  virtual pg_class builder (registerSystemTables) projects them.
-- pg18_user_catalog_rows.go buildUserPGClassRow: emit the flags (heap path).
-- operators_ddl.go ALTER loop: 4 cases set flag + delete-old-rows +
-  syncTableToCatalogHeap (mirrors REPLICA IDENTITY slice 305).
+- ast.go: CreatePolicyStmt / DropPolicyStmt nodes.
+- ddl.go: parseCreatePolicyTail (USING/WITH CHECK via general parseExpr →
+  proper AST → idempotent re-dump) + parseDropPolicyTail; dispatch in
+  parseCreate/parseDrop.
+- catalog.go: PolicyInfo struct + Table.Policies; formatExprForAttrdef ColumnRef
+  case (was missing → Go pointer string); pg_policy polqual/polwithcheck retyped
+  text→pg_node_tree (empty cell → SQL NULL); VirtualRows projects Table.Policies
+  (fully-parenthesized polqual/polwithcheck → USING ((a > 0))).
+- operators_ddl.go: execCreatePolicy (dup→42710, named roles→0A000, OID via
+  AllocOID, no heap sync — pg_policy virtual) + execDropPolicy; dispatch.
+- planner.go: CreatePolicyStmt/DropPolicyStmt added to DDL passthrough.
 
-Files: internal/parser/ast.go, internal/parser/ddl.go,
-internal/catalog/catalog.go, internal/executor/pg18_user_catalog_rows.go,
-internal/executor/operators_ddl.go, internal/parser/alter_test.go
-(TestParseAlterTableRowSecurity), internal/executor/storage_ddl_test.go
-(TestDDLAlterTableRowSecurityRoundTrip),
-internal/testport/pgdump_connsetup_test.go (slice 322 fixture+assert),
-docs/design/0119-0004-row-level-security-enable.md (+README 0119-0004y).
+Files: internal/parser/{ast.go,ddl.go,policy_test.go},
+internal/catalog/catalog.go, internal/executor/{operators_ddl.go,
+storage_ddl_test.go}, internal/planner/planner.go,
+internal/testport/pgdump_connsetup_test.go (slice 323 fixture+assert),
+docs/design/0119-0004-create-policy-rls.md (+README 0119-0004z).
 
-Gates: parser/catalog/executor suites PASS; TestPort_PgDumpConnectionSetup PASS
-(real pg_dump 18.3, both ENABLE+FORCE clauses); go build clean; pgbench smoke =
-pre-commit hook.
+Gates: parser/catalog/planner/executor suites PASS; TestPort_PgDumpConnectionSetup
+PASS (real pg_dump 18.3, all 3 CREATE POLICY forms byte-identical); go build clean.
 
-NEXT loop — remaining pg_dump getter-battery gaps (the big multi-component
-features): CREATE POLICY (pg_policy — the per-policy half of RLS, now that the
-ENABLE flag round-trips), GRANT/ACL (relacl + dumpACL — needs real ACL storage,
-GRANT is a CompatNoopStmt today), CREATE RULE (pg_rewrite + pg_get_ruledef —
-CREATE RULE is a full no-op today). Pick one and scope a contained first slice.
+DEFERRED (ledgered): named-role `TO role` policies (no per-role OID registry;
+the pg_roles ARRAY-subquery path is unverified — PUBLIC short-circuits it).
+
+NEXT loop — remaining M0119-0004 pg_dump getter-battery gaps: GRANT/ACL (relacl +
+dumpACL — needs real ACL storage; GRANT is a CompatNoopStmt today), CREATE RULE
+(pg_rewrite + pg_get_ruledef — full no-op today), or named-role policies (needs a
+role-OID subsystem). Pick one and scope a contained first slice.

@@ -3049,6 +3049,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("force row level security on rls_t: %v", err)
 	}
 
+	// Slice 323: CREATE POLICY must round-trip through pg_dump. pg_dump's
+	// getPolicies reads pg_policy (polname, polcmd, polpermissive, polroles,
+	// pg_get_expr(polqual/polwithcheck)) and dumpPolicy re-emits the CREATE
+	// POLICY (pg_dump.c). Before this slice CREATE POLICY was a hard parse error
+	// and pg_policy was an empty stub, so a policy was silently lost on
+	// dump/restore. goopg now records catalog.Table.Policies and projects them
+	// through the pg_policy virtual catalog; polqual/polwithcheck render via the
+	// catalog-side pg_get_expr deparser (fully parenthesized), so pg_dump emits
+	// `USING ((expr))` / `WITH CHECK ((expr))` byte-identically. goopg enforces
+	// no RLS — dump fidelity only. `pol_t` carries one policy per command form
+	// (PERMISSIVE FOR ALL, RESTRICTIVE FOR SELECT, FOR INSERT WITH CHECK). All
+	// policies are TO PUBLIC ({0}); named-role policies are a follow-up slice.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pol_t (a integer, b text)"); err != nil {
+		t.Fatalf("create table pol_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.pol_t ENABLE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("enable row level security on pol_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE POLICY p_simple ON public.pol_t USING (a > 0)"); err != nil {
+		t.Fatalf("create policy p_simple: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE POLICY p_restr ON public.pol_t AS RESTRICTIVE FOR SELECT USING (a > 5)"); err != nil {
+		t.Fatalf("create policy p_restr: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE POLICY p_check ON public.pol_t FOR INSERT WITH CHECK (a < 100)"); err != nil {
+		t.Fatalf("create policy p_check: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -6740,6 +6768,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ALTER TABLE ONLY public.rls_t FORCE ROW LEVEL SECURITY;") {
 			t.Errorf("pg_dump dropped FORCE ROW LEVEL SECURITY for rls_t\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 323 (asserted):** CREATE POLICY must round-trip. pg_dump's
+		// getPolicies reads pg_policy and dumpPolicy re-emits the CREATE POLICY,
+		// wrapping the (already fully-parenthesized) pg_get_expr output in one
+		// more paren layer: `USING ((expr))` / `WITH CHECK ((expr))`. RESTRICTIVE
+		// emits ` AS RESTRICTIVE`; FOR SELECT/INSERT emit ` FOR SELECT`/` FOR
+		// INSERT`. All three policies are TO PUBLIC ({0}) so no TO clause is
+		// emitted. Verified byte-identical to real pg_dump 18.3.
+		for _, want := range []string{
+			"CREATE POLICY p_simple ON public.pol_t USING ((a > 0));",
+			"CREATE POLICY p_restr ON public.pol_t AS RESTRICTIVE FOR SELECT USING ((a > 5));",
+			"CREATE POLICY p_check ON public.pol_t FOR INSERT WITH CHECK ((a < 100));",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped or mis-rendered policy: want %q\n  full stdout=%q", want, res.Stdout)
+			}
 		}
 		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must
 		// round-trip. Slice 147 created public.add_one(integer) only as a COMMENT

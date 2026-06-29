@@ -2409,10 +2409,30 @@ documentation-only and is exempt from the design-doc requirement.)
       closed. Tests `TestParseAlterTableClusterOn` +
       `TestDDLAlterTableClusterOnRoundTrip` + slice-320 `TestPort_PgDumpConnectionSetup`
       PASS. Design `0119-0004-cluster-on-restore.md`.
+      **Slice 323 (loop #45):** `CREATE POLICY` round-trip in pg_dump — the
+      per-policy half of RLS (the ENABLE flag landed slice 322). pg_dump's
+      `getPolicies` reads `pg_policy` and `dumpPolicy` re-emits `CREATE POLICY …`;
+      goopg had NO CREATE POLICY (parse error) + an empty `pg_policy` stub, so a
+      policy was silently lost on dump. Feasible because slice 322's `rls_t`
+      proves `getPolicies` already executes (0 rows) and a PUBLIC policy
+      (`polroles='{0}'`) short-circuits the lazy `CASE` before the risky `pg_roles`
+      ARRAY subquery; `pg_get_expr` is a pass-through. New `CreatePolicyStmt`/
+      `DropPolicyStmt` (parsed with general `parseExpr` → idempotent re-dump),
+      `catalog.PolicyInfo`/`Table.Policies`, `formatExprForAttrdef` ColumnRef case,
+      `pg_policy.VirtualRows` (polqual/polwithcheck retyped `pg_node_tree` for NULL
+      semantics, fully-parenthesized via the catalog pg_get_expr deparser →
+      `USING ((a > 0))`), `execCreatePolicy`/`execDropPolicy` (virtual catalog, no
+      heap sync). Dump-fidelity only — goopg enforces no RLS. Tests
+      `TestParseCreatePolicy`/`TestParseDropPolicy` + `TestDDLCreatePolicyRoundTrip`
+      + slice-323 `TestPort_PgDumpConnectionSetup` (PERMISSIVE/RESTRICTIVE,
+      FOR ALL/SELECT/INSERT, USING + WITH CHECK; byte-identical vs real pg_dump
+      18.3) PASS. Design `0119-0004-create-policy-rls.md`. **Deferred:** named-role
+      `TO role` policies (no per-role OID registry; the `pg_roles` ARRAY subquery
+      path unverified).
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery (further slices: GRANT/ACL relacl, CREATE RULE, CREATE POLICY/RLS);
-      extended-protocol commit-time deferral (architecturally entangled —
-      extended protocol is auto-commit-per-statement).
+      battery (further slices: GRANT/ACL relacl, CREATE RULE, CREATE POLICY
+      named-role `TO`); extended-protocol commit-time deferral (architecturally
+      entangled — extended protocol is auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

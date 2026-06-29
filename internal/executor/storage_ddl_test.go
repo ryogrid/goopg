@@ -594,6 +594,92 @@ func TestDDLAlterTableRowSecurityRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDDLCreatePolicyRoundTrip pins that CREATE POLICY records a row-security
+// policy on its table and that the pg_policy virtual catalog projects it in the
+// shape pg_dump's getPolicies reads: polcmd, polpermissive, polroles ({0} for
+// PUBLIC), and the fully-parenthesized polqual / polwithcheck pg_get_expr
+// renders. goopg does NOT enforce RLS — this is dump fidelity only. DU-002
+// slice 323.
+func TestDDLCreatePolicyRoundTrip(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table t not in catalog")
+	}
+
+	if err := runDDL(t, ctx, "CREATE POLICY p_simple ON t USING (a > 0)"); err != nil {
+		t.Fatalf("CREATE POLICY p_simple: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE POLICY p_restr ON t AS RESTRICTIVE FOR SELECT USING (a > 5)"); err != nil {
+		t.Fatalf("CREATE POLICY p_restr: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE POLICY p_check ON t FOR INSERT WITH CHECK (a < 100)"); err != nil {
+		t.Fatalf("CREATE POLICY p_check: %v", err)
+	}
+	if len(tbl.Policies) != 3 {
+		t.Fatalf("got %d policies, want 3", len(tbl.Policies))
+	}
+
+	// Project through the virtual catalog and key the rows by polname.
+	pgPolicy, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_policy"})
+	if !ok {
+		t.Fatal("pg_policy not in catalog")
+	}
+	rows := map[string][]string{}
+	for _, r := range pgPolicy.VirtualRows() {
+		rows[r[1]] = r // r[1] = polname
+	}
+	if len(rows) != 3 {
+		t.Fatalf("pg_policy projected %d rows, want 3", len(rows))
+	}
+
+	// columns: oid, polname, polrelid, polcmd, polpermissive, polroles, polqual, polwithcheck
+	check := func(name string, cmd, perm, roles, qual, withcheck string) {
+		t.Helper()
+		r := rows[name]
+		if r == nil {
+			t.Fatalf("policy %q missing from pg_policy", name)
+		}
+		if r[3] != cmd {
+			t.Errorf("%s polcmd = %q, want %q", name, r[3], cmd)
+		}
+		if r[4] != perm {
+			t.Errorf("%s polpermissive = %q, want %q", name, r[4], perm)
+		}
+		if r[5] != roles {
+			t.Errorf("%s polroles = %q, want %q", name, r[5], roles)
+		}
+		if r[6] != qual {
+			t.Errorf("%s polqual = %q, want %q", name, r[6], qual)
+		}
+		if r[7] != withcheck {
+			t.Errorf("%s polwithcheck = %q, want %q", name, r[7], withcheck)
+		}
+	}
+	// pg_get_expr is a pass-through in goopg; polqual stores the fully
+	// parenthesized form so pg_dump emits `USING ((a > 0))`.
+	check("p_simple", "*", "t", "{0}", "(a > 0)", "")
+	check("p_restr", "r", "f", "{0}", "(a > 5)", "")
+	check("p_check", "a", "t", "{0}", "", "(a < 100)")
+
+	// DROP POLICY removes it.
+	if err := runDDL(t, ctx, "DROP POLICY p_restr ON t"); err != nil {
+		t.Fatalf("DROP POLICY p_restr: %v", err)
+	}
+	if len(tbl.Policies) != 2 {
+		t.Fatalf("after DROP: got %d policies, want 2", len(tbl.Policies))
+	}
+	// Named-role TO clause is not yet supported (no per-role OID registry).
+	if err := runDDL(t, ctx, "CREATE POLICY p_role ON t TO alice USING (a > 0)"); err == nil {
+		t.Errorf("CREATE POLICY ... TO alice should error (named roles unsupported)")
+	}
+}
+
 // TestDDLCreatePublicationEndToEnd pins the M0008 / 0008-0003 SQL
 // surface: `CREATE PUBLICATION p FOR TABLE t` parses, plans,
 // and executes against a Context whose PubSub registry is wired,

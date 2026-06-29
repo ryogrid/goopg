@@ -363,6 +363,37 @@ type DropTriggerStmt struct {
 func (s *DropTriggerStmt) Pos() int  { return s.pos }
 func (s *DropTriggerStmt) stmtNode() {}
 
+// CreatePolicyStmt — `CREATE POLICY name ON table [AS {PERMISSIVE|RESTRICTIVE}]
+// [FOR {ALL|SELECT|INSERT|UPDATE|DELETE}] [TO role [, ...]] [USING (expr)]
+// [WITH CHECK (expr)]`. Row-level security is NOT enforced by goopg's executor
+// (it has no RLS engine); CREATE POLICY exists so a row-security policy
+// round-trips through pg_dump (pg_policy → dumpPolicy). DU-002 slice 323.
+type CreatePolicyStmt struct {
+	pos        int
+	Name       string
+	Table      ObjectName
+	Permissive bool     // AS PERMISSIVE (default true) vs AS RESTRICTIVE
+	Command    string   // "all" | "select" | "insert" | "update" | "delete"
+	Roles      []string // TO role list; empty or contains "public" ⇒ PUBLIC
+	Using      Expr     // USING (expr); nil if absent
+	WithCheck  Expr     // WITH CHECK (expr); nil if absent
+}
+
+func (s *CreatePolicyStmt) Pos() int  { return s.pos }
+func (s *CreatePolicyStmt) stmtNode() {}
+
+// DropPolicyStmt — `DROP POLICY [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
+// DU-002 slice 323.
+type DropPolicyStmt struct {
+	pos      int
+	Name     string
+	Table    ObjectName
+	IfExists bool
+}
+
+func (s *DropPolicyStmt) Pos() int  { return s.pos }
+func (s *DropPolicyStmt) stmtNode() {}
+
 // ClusterStmt — `CLUSTER [VERBOSE] [tablename [USING indexname]]`.
 // M0095-0008: no-op executor stub.  When a table name is provided the
 // executor verifies the table exists; without a table it always succeeds.

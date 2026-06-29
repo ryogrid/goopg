@@ -449,6 +449,12 @@ type Table struct {
 	// slice 322.
 	ForceRowSecurity bool
 
+	// Policies holds the row-level security policies declared on this table via
+	// CREATE POLICY. goopg does NOT enforce RLS; the policies are recorded so
+	// they round-trip through pg_dump (the pg_policy virtual catalog →
+	// dumpPolicy). DU-002 slice 323.
+	Policies []PolicyInfo
+
 	// TempOwner identifies the session that owns this temporary relation. In
 	// PostgreSQL every backend has its own temp namespace (pg_temp_N); a temp
 	// relation is only part of *its* backend's catalog. goopg keeps all
@@ -1156,6 +1162,37 @@ type Trigger struct {
 	FuncName   string // function/procedure name (unschemed)
 	FuncSchema string
 	Args       []string // trigger function arguments (TG_ARGV)
+}
+
+// PolicyInfo describes one row-level security policy created with CREATE POLICY.
+// goopg does NOT enforce row-level security; the policy is recorded purely so it
+// round-trips through pg_dump (the pg_policy virtual catalog → dumpPolicy). The
+// field set mirrors the pg_policy columns pg_dump's getPolicies reads. DU-002
+// slice 323.
+type PolicyInfo struct {
+	// Name is pg_policy.polname; OID is pg_policy.oid (assigned from the catalog
+	// OID counter at CREATE POLICY time — a zero OID means the policy predates
+	// catalog tracking and is invisible to pg_dump).
+	Name string
+	OID  uint32
+	// Command is pg_policy.polcmd: '*' (ALL), 'r' (SELECT), 'a' (INSERT),
+	// 'w' (UPDATE), or 'd' (DELETE).
+	Command byte
+	// Permissive is pg_policy.polpermissive: true for AS PERMISSIVE (the
+	// default), false for AS RESTRICTIVE (pg_dump emits ` AS RESTRICTIVE`).
+	Permissive bool
+	// Roles is pg_policy.polroles: the role OIDs the policy applies to. The
+	// special value {0} means PUBLIC (pg_dump omits the TO clause). goopg has no
+	// per-role OID registry yet, so only PUBLIC ({0}) round-trips today; named
+	// roles are deferred to a follow-up slice.
+	Roles []uint32
+	// Using / WithCheck are the parsed USING / WITH CHECK expressions (nil when
+	// absent). They are rendered to pg_policy.polqual / polwithcheck via
+	// formatExprForAttrdef (the catalog-side pg_get_expr deparser), which fully
+	// parenthesizes every node like PG's pg_get_expr, so dumpPolicy re-emits
+	// ` USING ((expr))` / ` WITH CHECK ((expr))` byte-identically to real pg_dump.
+	Using     parser.Expr
+	WithCheck parser.Expr
 }
 
 // ForeignKey describes one referential integrity constraint stored on a
@@ -5605,9 +5642,14 @@ func (c *InMemory) registerSystemTables() {
 	}
 	c.tables["pg_catalog.pg_collation"] = pgCollation
 
-	// pg_policy — stores row-level security policies (OID 3256).
-	// Row-level security is not implemented in goopg v0; this stub lets psql
-	// \d+ meta-queries succeed instead of erroring. M0097-0023.
+	// pg_policy — stores row-level security policies (OID 3256). goopg does NOT
+	// enforce RLS, but a policy created via CREATE POLICY is recorded on its
+	// table (catalog.Table.Policies) and projected here so pg_dump's getPolicies
+	// reads it and dumpPolicy re-emits the CREATE POLICY (DU-002 slice 323).
+	// polqual / polwithcheck are pg_node_tree in real PG; declaring them so here
+	// gives the correct NULL semantics for a policy with no USING / WITH CHECK
+	// (an empty cell decodes to SQL NULL — see planner.TypedVirtualCell — and
+	// pg_get_expr(NULL,…) returns NULL, so dumpPolicy omits the clause).
 	pgPolicy := &Table{
 		Schema: "pg_catalog", Name: "pg_policy", Virtual: true,
 		Columns: []Column{
@@ -5617,12 +5659,69 @@ func (c *InMemory) registerSystemTables() {
 			{Name: "polcmd", Type: Type{Name: "char"}, Ordinal: 3},
 			{Name: "polpermissive", Type: Type{Name: "bool"}, Ordinal: 4},
 			{Name: "polroles", Type: Type{Name: "oid[]"}, Ordinal: 5},
-			{Name: "polqual", Type: Type{Name: "text"}, Ordinal: 6},
-			{Name: "polwithcheck", Type: Type{Name: "text"}, Ordinal: 7},
+			{Name: "polqual", Type: Type{Name: "pg_node_tree"}, Ordinal: 6},
+			{Name: "polwithcheck", Type: Type{Name: "pg_node_tree"}, Ordinal: 7},
 		},
 		OID: 3256,
 	}
-	pgPolicy.VirtualRows = func() [][]string { return nil }
+	pgPolicy.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var out [][]string
+		for _, tbl := range c.tables {
+			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Policies) == 0 {
+				continue
+			}
+			for _, pol := range tbl.Policies {
+				if pol.OID == 0 {
+					continue // predates OID tracking → invisible to pg_dump
+				}
+				// polroles: format the OID array as a PostgreSQL array literal.
+				// {0} is the PUBLIC sentinel; getPolicies maps it to a NULL TO
+				// clause via `CASE WHEN polroles = '{0}' THEN NULL …`.
+				roles := pol.Roles
+				if len(roles) == 0 {
+					roles = []uint32{0}
+				}
+				parts := make([]string, len(roles))
+				for i, r := range roles {
+					parts[i] = fmt.Sprintf("%d", r)
+				}
+				polroles := "{" + strings.Join(parts, ",") + "}"
+				// polqual / polwithcheck: render the parsed expression with the
+				// catalog-side pg_get_expr deparser, which fully parenthesizes
+				// every node so pg_dump emits `USING ((expr))` / `WITH CHECK
+				// ((expr))`. An absent expression stays "" (→ SQL NULL → pg_dump
+				// omits the clause).
+				var polqual, polwithcheck string
+				if pol.Using != nil {
+					polqual = formatExprForAttrdef(pol.Using)
+				}
+				if pol.WithCheck != nil {
+					polwithcheck = formatExprForAttrdef(pol.WithCheck)
+				}
+				cmd := pol.Command
+				if cmd == 0 {
+					cmd = '*'
+				}
+				permissive := "t"
+				if !pol.Permissive {
+					permissive = "f"
+				}
+				out = append(out, []string{
+					fmt.Sprintf("%d", pol.OID), // oid
+					pol.Name,                   // polname
+					fmt.Sprintf("%d", tbl.OID), // polrelid
+					string(cmd),                // polcmd
+					permissive,                 // polpermissive
+					polroles,                   // polroles
+					polqual,                    // polqual
+					polwithcheck,               // polwithcheck
+				})
+			}
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_policy"] = pgPolicy
 
 	// pg_wait_events — needs at least one row per type.
@@ -9563,6 +9662,14 @@ func formatExprForAttrdef(e parser.Expr) string {
 		return ""
 	}
 	switch v := e.(type) {
+	case *parser.ColumnRef:
+		// A bare column reference. PG's pg_get_expr deparses a column ref inside a
+		// single-relation context (CHECK predicate, policy USING/WITH CHECK,
+		// generated-column expression) as just the unqualified column name. A
+		// table/schema qualifier is dropped because the expression is already
+		// scoped to one relation. DU-002 slice 323. (Previously absent: a column
+		// ref fell through to fmt.Sprintf("%v"), emitting a Go pointer string.)
+		return v.Column
 	case *parser.IntegerConst:
 		return fmt.Sprintf("%d", v.Value)
 	case *parser.NumericConst:
