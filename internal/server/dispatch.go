@@ -1853,7 +1853,16 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 				// row satisfies the check even under REPEATABLE READ — matching
 				// PG's deferred-RI snapshot semantics (fk-snapshot). 0119-0004.
 				if sess := connTx.Session(); sess != nil {
-					if fkErr := executor.RunDeferredFKChecks(ctx, sess); fkErr != nil {
+					// Deferred FK checks first, then deferred UNIQUE/PK checks
+					// (0119-0004 deferred-unique). Both run under a fresh "latest"
+					// snapshot and roll the transaction back on a violation — FK with
+					// 23503, UNIQUE with 23505. The ExecError's own Code drives the
+					// SQLSTATE below, so a single rollback block serves both.
+					deferErr := executor.RunDeferredFKChecks(ctx, sess)
+					if deferErr == nil {
+						deferErr = executor.RunDeferredUniqueChecks(ctx, sess)
+					}
+					if deferErr != nil {
 						if rs := s.cfg.Catalog.Routines(); rs != nil {
 							for _, r := range sess.TakePendingRoutineDrops() {
 								_, _ = rs.Create(r, true)
@@ -1871,7 +1880,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 						ctx.PendingCreatedComposites = nil
 						code := sqlstate.ForeignKeyViolation
 						var fields []protocol.ErrorField
-						if ee, ok := fkErr.(*executor.ExecError); ok {
+						if ee, ok := deferErr.(*executor.ExecError); ok {
 							if ee.Code != "" {
 								code = sqlstate.Code(ee.Code)
 							}
@@ -1880,7 +1889,7 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 							}
 							return s.writeQueryError(w, code, ee.Message, fields...)
 						}
-						return s.writeQueryError(w, code, fkErr.Error())
+						return s.writeQueryError(w, code, deferErr.Error())
 					}
 				}
 				// M0104-0008: SSI pre-commit dangerous-structure check.

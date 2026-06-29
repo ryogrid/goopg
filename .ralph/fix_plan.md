@@ -2164,8 +2164,27 @@ documentation-only and is exempt from the design-doc requirement.)
       group PASS; new `TestPort_InitiallyDeferredFKCommit` (plain INITIALLY
       DEFERRED, no override — ordered commit + raise-at-COMMIT + orphan rollback);
       `TestPort_SetConstraintsDeferral` PASS; `-race` mvcc + executor PASS.
+      **2026-06-29 (loop #20, design 0119-0004-deferred-unique): deferred
+      UNIQUE/PK constraint checking LANDED.** A `UNIQUE`/`PRIMARY KEY` declared
+      `DEFERRABLE INITIALLY DEFERRED` (or deferred via `SET CONSTRAINTS …
+      DEFERRED`) now queues its uniqueness check to COMMIT instead of raising
+      immediately — `UPDATE t SET id = id+1` over a contiguous range succeeds;
+      a genuine duplicate surviving to COMMIT raises 23505 at COMMIT. New
+      `BasicSession.deferredUniqChecks` queue + `internal/executor/deferred_unique.go`
+      mirror the deferred-FK structure: `uniqueCheckDeferred(ctx, idx)` (analogue
+      of `fkCheckDeferred`, short-circuits on `!idx.Deferrable`) gates the enqueue
+      at `checkUniqueIndexes{ForInsert,ForUpdate}`; `RunDeferredUniqueChecks`
+      drains at COMMIT under `mvcc.Manager.FreshSnapshot()` and
+      `recheckDeferredUniqueKey` counts distinct-live btree tuples (≥2 = 23505).
+      Both commit chokepoints (`execCommit` + simple-query `dispatch.go`, sharing
+      one rollback block) + `SET CONSTRAINTS … IMMEDIATE` wired. Gated on
+      `idx.Deferrable` → zero blast radius (pgbench/TPC-H PK not deferrable). Tests
+      `TestPort_InitiallyDeferredUniqueCommit` + `TestPort_SetConstraintsUniqueDeferral`;
+      executor + `-race` + FK-deferral regression PASS. Catalog already carried
+      `Index.Deferrable`/`InitiallyDeferred` (no parser/catalog change).
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery; deferred UNIQUE/EXCLUDE; extended-protocol commit-time deferral.
+      battery; deferred EXCLUDE + NND-INITIALLY-DEFERRED; extended-protocol
+      commit-time deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

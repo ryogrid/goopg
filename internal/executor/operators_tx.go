@@ -135,6 +135,15 @@ func (o *transactionOp) execCommit() error {
 				return err
 			}
 		}
+		// Deferred UNIQUE/PK constraint checks (DEFERRABLE INITIALLY DEFERRED, or
+		// made deferred by SET CONSTRAINTS … DEFERRED). 0119-0004 (deferred-unique).
+		if err := RunDeferredUniqueChecks(o.ctx, sess); err != nil {
+			_ = o.ctx.TxnMgr.Rollback(tx)
+			o.ctx.Session.EndExplicitTransaction()
+			undoEnumDDLFromContext(o.ctx)
+			o.clearCtxTransaction()
+			return err
+		}
 	}
 	// M0104-0007: SSI pre-commit dangerous-structure check for SERIALIZABLE.
 	// Runs BEFORE TxnMgr.Commit so a detected rw-cycle can be translated to
@@ -612,10 +621,15 @@ func (o *setConstraintsOp) Next() (TupleSlot, error) {
 	} else {
 		sess.SetConstraintsNamed(o.stmt.Names, o.stmt.Deferred)
 	}
-	// IMMEDIATE: run any pending deferred FK checks the change makes immediate.
+	// IMMEDIATE: run any pending deferred FK + UNIQUE checks the change makes
+	// immediate right away, so a violation raises at this statement (PG semantics).
 	if !o.stmt.Deferred {
 		checks := sess.TakeDeferredFKChecksMatching(o.stmt.All, o.stmt.Names)
 		if err := runAllDeferredFKChecks(o.ctx, checks); err != nil {
+			return nil, err
+		}
+		uChecks := sess.TakeDeferredUniqueChecksMatching(o.stmt.All, o.stmt.Names)
+		if err := runAllDeferredUniqueChecks(o.ctx, uChecks); err != nil {
 			return nil, err
 		}
 	}

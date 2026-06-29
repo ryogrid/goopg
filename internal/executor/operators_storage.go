@@ -6496,6 +6496,13 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 			}
 			continue
 		}
+		// DEFERRABLE INITIALLY DEFERRED (or SET CONSTRAINTS … DEFERRED): queue the
+		// uniqueness re-probe for COMMIT instead of raising now. A transient
+		// duplicate is allowed mid-transaction. 0119-0004.
+		if uniqueCheckDeferred(ctx, idx) {
+			queueDeferredUniqueCheck(ctx, tbl, idx, cols, row, key)
+			continue
+		}
 		detail := buildUniqueConstraintDetail(idx, cols, row)
 		if raiseErr := uniqueCheckWithWait(ctx, rel, tree, key, idx.Name, detail, pos); raiseErr != nil {
 			return raiseErr
@@ -6592,6 +6599,12 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 					}
 				}
 			}
+			continue
+		}
+		// DEFERRABLE INITIALLY DEFERRED (or SET CONSTRAINTS … DEFERRED): queue the
+		// uniqueness re-probe for COMMIT instead of raising now. 0119-0004.
+		if uniqueCheckDeferred(ctx, idx) {
+			queueDeferredUniqueCheck(ctx, tbl, idx, cols, newRow, key)
 			continue
 		}
 		detail := buildUniqueConstraintDetail(idx, cols, newRow)

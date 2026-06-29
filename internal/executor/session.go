@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
@@ -185,6 +186,7 @@ type BasicSession struct {
 	txFailed            bool                       // in_failed_sql_transaction (25P02)
 	txnReadOnly         bool                       // true while inside a READ ONLY transaction (M0097-0024)
 	deferredFKChecks    []DeferredFKCheck          // INITIALLY DEFERRED FK checks (M0096-0011)
+	deferredUniqChecks  []DeferredUniqueCheck      // INITIALLY DEFERRED UNIQUE/PK checks (0119-0004)
 	constraintsAllMode  int8                       // SET CONSTRAINTS ALL: 0 unset, 1 DEFERRED, 2 IMMEDIATE (0119-0004)
 	constraintDeferral  map[string]bool            // SET CONSTRAINTS <name>: per-constraint override (0119-0004)
 	activeQueryTables   map[uint32]bool            // OIDs of tables currently in active DML (M0097-0023)
@@ -275,6 +277,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.currentSubXid = 0
 	s.txFailed = false
 	s.deferredFKChecks = nil
+	s.deferredUniqChecks = nil
 	// SET CONSTRAINTS settings last only for the current transaction (PG
 	// AfterTriggerEndXact resets the deferral state at every txn boundary). 0119-0004.
 	s.constraintsAllMode = 0
@@ -347,12 +350,14 @@ func (s *BasicSession) SetConstraintsNamed(names []string, deferred bool) {
 	}
 }
 
-// FKConstraintDeferred reports whether a foreign-key constraint's check should
-// be deferred to COMMIT given any in-effect SET CONSTRAINTS override and the
-// constraint's declared INITIALLY {DEFERRED|IMMEDIATE} default. A per-name
-// override wins over an ALL setting, which wins over the declared default.
-// Callers must have already established the constraint is DEFERRABLE. 0119-0004.
-func (s *BasicSession) FKConstraintDeferred(name string, initiallyDeferred bool) bool {
+// constraintDeferredByName resolves whether a DEFERRABLE constraint's check
+// should be deferred to COMMIT, honouring any in-effect SET CONSTRAINTS override
+// and the constraint's declared INITIALLY {DEFERRED|IMMEDIATE} default. A
+// per-name override wins over an ALL setting, which wins over the declared
+// default. The deferral state is constraint-kind-agnostic (PG's
+// AfterTriggerSetState applies equally to FK, UNIQUE and EXCLUDE constraints),
+// so FK and UNIQUE callers share it. 0119-0004.
+func (s *BasicSession) constraintDeferredByName(name string, initiallyDeferred bool) bool {
 	if name != "" && s.constraintDeferral != nil {
 		if v, ok := s.constraintDeferral[name]; ok {
 			return v
@@ -367,6 +372,20 @@ func (s *BasicSession) FKConstraintDeferred(name string, initiallyDeferred bool)
 	return initiallyDeferred
 }
 
+// FKConstraintDeferred reports whether a foreign-key constraint's check should
+// be deferred to COMMIT. Callers must have already established the constraint is
+// DEFERRABLE. 0119-0004.
+func (s *BasicSession) FKConstraintDeferred(name string, initiallyDeferred bool) bool {
+	return s.constraintDeferredByName(name, initiallyDeferred)
+}
+
+// UniqueConstraintDeferred reports whether a UNIQUE / PRIMARY KEY constraint's
+// uniqueness check should be deferred to COMMIT. Callers must have already
+// established the constraint is DEFERRABLE. 0119-0004 (deferred-unique).
+func (s *BasicSession) UniqueConstraintDeferred(name string, initiallyDeferred bool) bool {
+	return s.constraintDeferredByName(name, initiallyDeferred)
+}
+
 // ConstraintsOverrideActive reports whether a SET CONSTRAINTS override is in
 // effect for the current transaction (ALL mode set or any per-name override).
 // The simple-query COMMIT path uses this to decide whether to run the deferred
@@ -377,6 +396,64 @@ func (s *BasicSession) FKConstraintDeferred(name string, initiallyDeferred bool)
 // fk-snapshot — are a separate, pre-existing gap). 0119-0004.
 func (s *BasicSession) ConstraintsOverrideActive() bool {
 	return s.constraintsAllMode != 0 || len(s.constraintDeferral) > 0
+}
+
+// DeferredUniqueCheck records one UNIQUE / PRIMARY KEY constraint violation to
+// be re-verified at COMMIT time (a DEFERRABLE constraint deferred by INITIALLY
+// DEFERRED or by an in-effect SET CONSTRAINTS … DEFERRED). The encoded btree
+// Key identifies the candidate key whose uniqueness must hold once the
+// transaction's final row state is visible; Detail is the pre-rendered "Key
+// (...)=(...) already exists." text for the 23505 raised at COMMIT. 0119-0004.
+type DeferredUniqueCheck struct {
+	TableName string
+	IndexName string // == the UNIQUE/PK constraint name (SET CONSTRAINTS match key)
+	Key       []byte
+	Detail    string
+}
+
+// AddDeferredUniqueCheck queues a UNIQUE/PK constraint key to be re-verified at
+// COMMIT time. Deduplicates on (IndexName, Key): one re-probe per distinct key
+// suffices. 0119-0004.
+func (s *BasicSession) AddDeferredUniqueCheck(check DeferredUniqueCheck) {
+	for _, existing := range s.deferredUniqChecks {
+		if existing.IndexName == check.IndexName && bytes.Equal(existing.Key, check.Key) {
+			return
+		}
+	}
+	s.deferredUniqChecks = append(s.deferredUniqChecks, check)
+}
+
+// TakeDeferredUniqueChecks returns and clears the queued deferred UNIQUE/PK
+// checks. Called before TxnMgr.Commit on both commit paths. 0119-0004.
+func (s *BasicSession) TakeDeferredUniqueChecks() []DeferredUniqueCheck {
+	out := s.deferredUniqChecks
+	s.deferredUniqChecks = nil
+	return out
+}
+
+// TakeDeferredUniqueChecksMatching removes and returns the queued deferred
+// UNIQUE/PK checks made immediate by a `SET CONSTRAINTS … IMMEDIATE`, mirroring
+// TakeDeferredFKChecksMatching. The rest stay queued for COMMIT. 0119-0004.
+func (s *BasicSession) TakeDeferredUniqueChecksMatching(all bool, names []string) []DeferredUniqueCheck {
+	if all {
+		out := s.deferredUniqChecks
+		s.deferredUniqChecks = nil
+		return out
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var taken, kept []DeferredUniqueCheck
+	for _, c := range s.deferredUniqChecks {
+		if c.IndexName != "" && want[c.IndexName] {
+			taken = append(taken, c)
+		} else {
+			kept = append(kept, c)
+		}
+	}
+	s.deferredUniqChecks = kept
+	return taken
 }
 
 // TakeDeferredFKChecksMatching removes and returns the queued deferred FK
