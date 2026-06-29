@@ -2512,6 +2512,21 @@ documentation-only and is exempt from the design-doc requirement.)
       battery (further slices: GRANT/ACL relacl, richer CREATE RULE,
       reserved-keyword-named-role quoting); extended-protocol commit-time deferral
       (architecturally entangled — extended protocol is auto-commit-per-statement).
+      **2026-06-30 (loop #54, design 0119-0004-grant-relacl-pgdump, DU-002
+      slice 331):** table-level `GRANT … ON TABLE … TO <role>` round-trips. goopg
+      already recorded table grants (`Catalog.GrantTablePrivilege`,
+      `server/grant_ddl.go`) but always projected `pg_class.relacl` as NULL, so the
+      privilege was silently lost on dump/restore. New `InMemory.relaclTextLocked`
+      renders the GRANT store as the materialized `aclitem[]` text (owner full
+      `postgres=arwdDxtm/postgres` first, then each grantee with canonical
+      `ACL_ALL_RIGHTS_STR` privilege letters), wired into the `pg_class`
+      regular-table `VirtualRows` cell. pg_dump's `getTables` reads `c.relacl`
+      directly + `acldefault('r', owner)` (already implemented, slice 2) and
+      `buildACLCommands` emits the GRANT diff client-side — no new builtin. NULL
+      relacl when nothing granted → zero blast radius. Tests `TestRelaclText` +
+      slice-331 `TestPort_PgDumpConnectionSetup` (`GRANT SELECT ON TABLE
+      public.grant_t TO grantee_role;` byte-identical vs real pg_dump 18.3) PASS.
+      Still open: column-level/sequence/schema GRANT, `WITH GRANT OPTION`, REVOKE.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

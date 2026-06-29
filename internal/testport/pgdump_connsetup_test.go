@@ -3144,6 +3144,30 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create policy p_role: %v", err)
 	}
 
+	// Slice 331: a table-level GRANT must round-trip through pg_dump. pg_dump's
+	// getTables selects `c.relacl` directly and `acldefault('r', relowner)` as
+	// the baseline, then buildACLCommands (src/bin/pg_dump/dumputils.c) parses
+	// the aclitem[] text CLIENT-SIDE and emits the GRANT/REVOKE diff — no
+	// server-side aclexplode/aclitemout is involved. Before this slice goopg
+	// always projected relacl as NULL even after a GRANT, so the privilege was
+	// silently lost on dump/restore. goopg already records table grants in its
+	// catalog ACL store (Catalog.GrantTablePrivilege, server/grant_ddl.go); now
+	// the pg_class virtual builder renders that store as the materialized
+	// aclitem[] (owner full default first, grantor=postgres, then each grantee),
+	// matching what PostgreSQL stores once the first GRANT materializes relacl.
+	// pg_dump diffs it against acldefault('r', 10) so the owner entry cancels and
+	// only the grantee's `GRANT SELECT ON TABLE public.grant_t TO grantee_role;`
+	// is emitted.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grant_t (a integer)"); err != nil {
+		t.Fatalf("create table grant_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE grantee_role"); err != nil {
+		t.Fatalf("create role grantee_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.grant_t TO grantee_role"); err != nil {
+		t.Fatalf("grant select on grant_t: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -6951,6 +6975,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// the FOR clause and USING. Verified byte-identical to real pg_dump 18.3.
 		if want := "CREATE POLICY p_role ON public.pol_rt FOR SELECT TO pol_role USING ((a > 0));"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered named-role policy: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 331 (asserted):** a table-level GRANT round-trips. pg_dump reads
+		// the materialized pg_class.relacl, diffs it against acldefault('r', 10)
+		// (the owner's own entry cancels), and buildACLCommands emits a single
+		// `GRANT <priv> ON TABLE <nsp>.<name> TO <grantee>;`. Verified
+		// byte-identical to real pg_dump 18.3.
+		if want := "GRANT SELECT ON TABLE public.grant_t TO grantee_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered table GRANT: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

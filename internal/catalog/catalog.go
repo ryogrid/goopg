@@ -3925,6 +3925,11 @@ func (c *InMemory) registerSystemTables() {
 			if len(t.Triggers) > 0 {
 				relHasTriggers = "t"
 			}
+			// relacl — NULL until a GRANT records non-owner privileges, then the
+			// materialized aclitem[] (owner full + each grantee). pg_dump's
+			// getTables reads this directly and re-emits GRANTs (buildACLCommands,
+			// client-side). DU-002 slice 331.
+			relacl := c.relaclTextLocked(t.OID)
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // 0:  oid
 				t.Name,                       // 1:  relname
@@ -3962,7 +3967,7 @@ func (c *InMemory) registerSystemTables() {
 				"0",         // 28: relrewrite
 				"0",         // 29: relfrozenxid
 				"1",         // 30: relminmxid
-				"",          // 31: relacl (NULL)
+				relacl,      // 31: relacl (NULL until a table GRANT, slice 331)
 				reloptions,  // 32: reloptions ({fillfactor=N} or NULL)
 				partBound,   // 33: relpartbound
 			})
@@ -8369,6 +8374,78 @@ func (c *InMemory) DropTableACL(relOID uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.tableACLs, relOID)
+}
+
+// tableACLPrivOrder pairs each table-privilege keyword (as stored upper-cased
+// in tableACLs) with the single letter aclitemout prints for it, in
+// PostgreSQL's canonical ACL_ALL_RIGHTS_STR order for relkind 'r'
+// (src/include/utils/acl.h). Rendering grantee privilege sets in this order
+// matches the aclitem[] text PostgreSQL stores in pg_class.relacl, so pg_dump's
+// client-side buildACLCommands re-emits GRANTs byte-identically.
+var tableACLPrivOrder = []struct {
+	keyword string
+	letter  byte
+}{
+	{"INSERT", 'a'},
+	{"SELECT", 'r'},
+	{"UPDATE", 'w'},
+	{"DELETE", 'd'},
+	{"TRUNCATE", 'D'},
+	{"REFERENCES", 'x'},
+	{"TRIGGER", 't'},
+	{"MAINTAIN", 'm'},
+}
+
+// ownerTableACLString is the privilege-letter string for the owner's full set
+// of table privileges (every bit in tableACLPrivOrder), i.e. "arwdDxtm". It
+// matches acldefault('r', owner), the baseline pg_dump diffs relacl against, so
+// the owner's own entry produces no GRANT/REVOKE on round-trip.
+const ownerTableACLString = "arwdDxtm"
+
+// relaclTextLocked renders the materialized pg_class.relacl text — an aclitem[]
+// array literal such as `{postgres=arwdDxtm/postgres,grantee_role=r/postgres}` —
+// for relOID from the in-memory GRANT store, or "" (SQL NULL) when no
+// privileges have been granted away. PostgreSQL leaves relacl NULL until the
+// first GRANT, at which point it materializes the array with the owner's full
+// default privileges first (grantor = owner), followed by each grantee's
+// entry. goopg has the single bootstrap superuser "postgres" (OID 10) as every
+// table's owner and grantor, so the owner entry and each grantor are
+// "postgres". Grantee roles are emitted in a stable (sorted) order so the
+// projection is deterministic. Caller must hold c.mu (read or write).
+//
+// DU-002 slice 331 (GRANT/ACL relacl round-trip in pg_dump). pg_dump's
+// getTables selects c.relacl directly and parses the aclitem[] text
+// client-side in buildACLCommands (src/bin/pg_dump/dumputils.c) — no
+// server-side aclexplode/aclitemout is involved — so projecting the correct
+// text is sufficient for the round-trip.
+func (c *InMemory) relaclTextLocked(relOID uint32) string {
+	byRole := c.tableACLs[relOID]
+	if len(byRole) == 0 {
+		return "" // NULL relacl — matches acldefault, pg_dump emits no GRANT
+	}
+	items := []string{"postgres=" + ownerTableACLString + "/postgres"}
+	roles := make([]string, 0, len(byRole))
+	for role := range byRole {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	for _, role := range roles {
+		privs := byRole[role]
+		if len(privs) == 0 {
+			continue
+		}
+		var letters strings.Builder
+		for _, p := range tableACLPrivOrder {
+			if _, ok := privs[p.keyword]; ok {
+				letters.WriteByte(p.letter)
+			}
+		}
+		if letters.Len() == 0 {
+			continue
+		}
+		items = append(items, role+"="+letters.String()+"/postgres")
+	}
+	return "{" + strings.Join(items, ",") + "}"
 }
 
 // RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).
