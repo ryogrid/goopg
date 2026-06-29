@@ -122,15 +122,15 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 		// GRANT EXECUTE ON FUNCTION <signature> TO <roles>. Functions live in
 		// pg_proc and share the OID-keyed ACL store; record under each routine's
 		// OID so pg_dump's getFuncs/dumpACL re-emits the GRANT from proacl.
-		s.recordFunctionGrant(rest, rolePart, privPart)
+		s.recordFunctionGrant(rest, rolePart, privPart, withGrantOption)
 		return
 	} else if rest, ok := cutLeadingKeyword(objPart, "procedure"); ok {
 		// GRANT EXECUTE ON PROCEDURE … shares the routine ACL path with FUNCTION.
-		s.recordFunctionGrant(rest, rolePart, privPart)
+		s.recordFunctionGrant(rest, rolePart, privPart, withGrantOption)
 		return
 	} else if rest, ok := cutLeadingKeyword(objPart, "routine"); ok {
 		// GRANT EXECUTE ON ROUTINE … shares the routine ACL path with FUNCTION.
-		s.recordFunctionGrant(rest, rolePart, privPart)
+		s.recordFunctionGrant(rest, rolePart, privPart, withGrantOption)
 		return
 	}
 	// Bail on non-table object classes (ON DATABASE …, etc.).
@@ -338,10 +338,13 @@ func (s *Server) recordSchemaRevoke(objPart, rolePart, privPart string) {
 // proacl reproduces both default entries plus the grantee and pg_dump's
 // getFuncs/buildACLCommands diffs it against acldefault('f', 10) to re-emit
 // exactly the new grant. Unknown routines, a non-EXECUTE privilege list, or an
-// empty role list are skipped, leaving the statement a successful no-op. WITH
-// GRANT OPTION is not modelled for functions (the common case is a plain
-// EXECUTE grant). DU-002 slice 345.
-func (s *Server) recordFunctionGrant(objPart, rolePart, privPart string) {
+// empty role list are skipped, leaving the statement a successful no-op. When
+// withGrantOption is set the grantee's EXECUTE is recorded with the grant-option
+// flag so the materialized proacl renders "<grantee>=X*/postgres" and pg_dump
+// re-emits the trailing `WITH GRANT OPTION` (DU-002 slice 348). The implicit
+// owner/PUBLIC default entries are always plain (acldefault carries no grant
+// option). DU-002 slice 345.
+func (s *Server) recordFunctionGrant(objPart, rolePart, privPart string, withGrantOption bool) {
 	privs := parseGrantPrivileges(privPart, allFunctionPrivileges)
 	hasExecute := false
 	for _, p := range privs {
@@ -367,7 +370,7 @@ func (s *Server) recordFunctionGrant(objPart, rolePart, privPart string) {
 		// "PUBLIC" to the reserved pseudo-role and renders it as the empty grantee).
 		s.cfg.Catalog.GrantTablePrivilege(oid, "PUBLIC", "EXECUTE")
 		for _, role := range roles {
-			s.cfg.Catalog.GrantTablePrivilege(oid, role, "EXECUTE")
+			s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(oid, role, "EXECUTE", withGrantOption)
 		}
 	}
 }

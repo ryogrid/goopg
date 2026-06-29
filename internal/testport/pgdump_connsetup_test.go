@@ -3487,6 +3487,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("revoke execute on ownrevfn from postgres: %v", err)
 	}
 
+	// Slice 348: a function-level GRANT … WITH GRANT OPTION must round-trip
+	// through pg_dump from pg_proc.proacl, the routine analogue of the table
+	// grant-option slice 332. `GRANT EXECUTE ON FUNCTION public.gofn(integer) TO
+	// gofn_grantee WITH GRANT OPTION` materializes proacl as
+	// "{=X/postgres,postgres=X/postgres,gofn_grantee=X*/postgres}" — the grantee's
+	// EXECUTE carries the grant-option `*`. pg_dump's getFuncs diffs it against
+	// acldefault('f', 10) and buildACLCommands routes the grant-option privilege
+	// to its privswgo branch, emitting `GRANT ALL ON FUNCTION public.gofn(integer)
+	// TO gofn_grantee WITH GRANT OPTION;` (EXECUTE is the sole function privilege,
+	// so the grantee's full set renders as ALL; verified byte-identical to real
+	// pg_dump 18.3). Before this slice goopg recorded the function grantee with a
+	// plain GrantTablePrivilege, dropping the grant-option flag, so the restored
+	// grant silently lost WITH GRANT OPTION.
+	if err := runSQLSimple(t, c, "CREATE ROLE gofn_grantee NOLOGIN"); err != nil {
+		t.Fatalf("create role gofn_grantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.gofn(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function gofn: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT EXECUTE ON FUNCTION public.gofn(integer) TO gofn_grantee WITH GRANT OPTION"); err != nil {
+		t.Fatalf("grant execute on gofn to gofn_grantee with grant option: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7495,6 +7518,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if notWant := "REVOKE ALL ON FUNCTION public.ownrevfn(integer) FROM PUBLIC;"; strings.Contains(res.Stdout, notWant) {
 			t.Errorf("pg_dump wrongly revoked PUBLIC's surviving default EXECUTE on ownrevfn: unexpected %q\n  full stdout=%q", notWant, res.Stdout)
+		}
+		// **Slice 348 (asserted):** a function GRANT … WITH GRANT OPTION round-trips.
+		// `GRANT EXECUTE ON FUNCTION public.gofn(integer) TO gofn_grantee WITH GRANT
+		// OPTION` materializes proacl as "{=X/postgres,postgres=X/postgres,
+		// gofn_grantee=X*/postgres}"; pg_dump's buildACLCommands routes the
+		// grant-option EXECUTE to its privswgo branch and emits a single `GRANT ALL
+		// ON FUNCTION public.gofn(integer) TO gofn_grantee WITH GRANT OPTION;`
+		// (EXECUTE is the sole function privilege, so the grantee's full set renders
+		// as ALL). Verified byte-identical to real pg_dump 18.3. Before this slice
+		// goopg dropped the grant-option flag, emitting a plain `GRANT ALL …;`.
+		if want := "GRANT ALL ON FUNCTION public.gofn(integer) TO gofn_grantee WITH GRANT OPTION;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the function WITH GRANT OPTION: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

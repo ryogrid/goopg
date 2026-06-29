@@ -625,6 +625,27 @@ func TestProcACLText(t *testing.T) {
 	}
 }
 
+// TestProcACLGrantWithGrantOption pins the grant-option (`*`) projection for a
+// function-level GRANT … WITH GRANT OPTION (DU-002 slice 348). The grantee's
+// EXECUTE is recorded with the grant-option flag so the materialized proacl
+// renders "grantee_fn=X*/postgres"; the implicit owner/PUBLIC default entries
+// stay plain (acldefault carries no grant option). pg_dump's buildACLCommands
+// routes the grant-option privilege to its privswgo branch and re-emits the
+// trailing `WITH GRANT OPTION`. Verified byte-identical to real pg_dump 18.3.
+func TestProcACLGrantWithGrantOption(t *testing.T) {
+	c := NewInMemory()
+	const procOID = 131074 // a routine OID distinct from the other ProcACL tests
+
+	// Mirror recordFunctionGrant's WITH-GRANT-OPTION sequence: seed the implicit
+	// PUBLIC default plain, then grant the grantee EXECUTE with the grant option.
+	c.GrantTablePrivilege(procOID, "PUBLIC", "EXECUTE")
+	c.GrantTablePrivilegeWithGrantOption(procOID, "grantee_fn", "EXECUTE", true)
+	want := "{postgres=X/postgres,grantee_fn=X*/postgres,=X/postgres}"
+	if got := c.ProcACLText(procOID); got != want {
+		t.Fatalf("proacl after GRANT EXECUTE WITH GRANT OPTION = %q; want %q", got, want)
+	}
+}
+
 // TestProcACLRevokeFromPublic exercises the function-level REVOKE … FROM PUBLIC
 // primitive composition (DU-002 slice 346). A function's implicit default proacl
 // grants EXECUTE to BOTH the owner and PUBLIC; PostgreSQL leaves proacl NULL
