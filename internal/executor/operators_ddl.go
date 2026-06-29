@@ -2214,6 +2214,9 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 					// condeferrable/condeferred. Dump-fidelity only. DU-002 slice 143.
 					idx.Deferrable = nc.Deferrable
 					idx.InitiallyDeferred = nc.InitiallyDeferred
+					// Partial EXCLUDE WHERE predicate rides the backing index so the
+					// deparse re-emits ` WHERE (pred)`. DU-002 slice 310.
+					applyExclusionPredicate(idx, nc.ExclusionWhere)
 				}
 			} else {
 				// Other exclusion operators: stub catalog entry; no enforcement in v0.
@@ -2389,6 +2392,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				// condeferrable/condeferred. Dump-fidelity only. DU-002 slice 143.
 				idx.Deferrable = ec.Deferrable
 				idx.InitiallyDeferred = ec.InitiallyDeferred
+				// Partial EXCLUDE WHERE predicate rides the backing index. DU-002 slice 310.
+				applyExclusionPredicate(idx, ec.ExclusionWhere)
 			}
 		} else {
 			if err := o.createExclusionIndexStub(s.Pos(), idxName, tbl, ec); err != nil {
@@ -7658,6 +7663,20 @@ func addGroupByPKDeps(sel *parser.SelectStmt, cat catalog.Catalog, out *[]pkCons
 	}
 }
 
+// applyExclusionPredicate stores a partial-EXCLUDE `WHERE (pred)` on the backing
+// index so pg_get_constraintdef / pg_dump re-emit ` WHERE (pred)` (mirroring
+// pg_get_indexdef_worker, ruleutils.c:1564) and the restored constraint stays
+// partial. Dump-fidelity only — goopg does not yet filter exclusion enforcement
+// by the predicate (exclusion semantics are minimal in v0). DU-002 slice 310.
+func applyExclusionPredicate(idx *catalog.Index, pred parser.Expr) {
+	if idx == nil || pred == nil {
+		return
+	}
+	idx.HasPredicate = true
+	idx.Predicate = pred
+	idx.PredicateString = defaultExprToSQL(pred)
+}
+
 // createExclusionIndexStub registers an EXCLUDE USING constraint in the catalog
 // without type-validation or B-tree building. Exclusion semantics are not
 // enforced in v0; the stub exists so pg_constraint and pg_index queries return
@@ -7681,6 +7700,9 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	// / pg_constraint re-emit the clause on dump (no enforcement in v0). DU-002 slice 143.
 	idx.Deferrable = ec.Deferrable
 	idx.InitiallyDeferred = ec.InitiallyDeferred
+	// Partial EXCLUDE WHERE predicate rides the stub index so pg_get_constraintdef
+	// re-emits ` WHERE (pred)` on dump (no enforcement in v0). DU-002 slice 310.
+	applyExclusionPredicate(idx, ec.ExclusionWhere)
 	if sess, ok2 := o.ctx.Session.(*BasicSession); ok2 {
 		sess.RecordDDLCreate(DDLUndoEntry{Name: idxName, RelOID: idx.OID, IsIndex: true})
 	}

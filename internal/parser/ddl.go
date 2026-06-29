@@ -4034,6 +4034,18 @@ func (p *parser) parseExcludeConstraint() TableConstraintDef {
 			}
 		}
 	}
+	// Optional WHERE (predicate) — a partial EXCLUDE constraint. PG renders this
+	// after the operator/INCLUDE list and before DEFERRABLE in
+	// pg_get_constraintdef (via pg_get_indexdef_worker). Captured as an Expr so
+	// the executor can store it on the backing index's PredicateString and
+	// pg_dump re-emits ` WHERE (pred)`. Previously silently dropped, downgrading a
+	// partial exclusion to one applying to every row on restore. DU-002 slice 310.
+	if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwWhere {
+		p.advance()
+		if pred, err := p.parseExpr(); err == nil {
+			cdef.ExclusionWhere = pred
+		}
+	}
 	return cdef
 }
 

@@ -1117,6 +1117,13 @@ type TableConstraintDef struct {
 	// implemented (constraints are enforced per-row). DU-002 slice 140.
 	Deferrable        bool
 	InitiallyDeferred bool
+	// ExclusionWhere is the optional `WHERE (predicate)` of a partial EXCLUDE
+	// constraint (`EXCLUDE USING method (col WITH op) WHERE (pred)`, PG partial
+	// exclusion). nil when absent. Threads onto the backing index's
+	// catalog.Index.Predicate/PredicateString so pg_get_constraintdef /
+	// pg_dump re-emit ` WHERE (pred)` (pg_get_indexdef_worker, ruleutils.c:1564)
+	// and the restored constraint stays partial. DU-002 slice 310.
+	ExclusionWhere Expr
 }
 
 // TableForeignKeyDef describes a table-level FOREIGN KEY constraint, e.g.

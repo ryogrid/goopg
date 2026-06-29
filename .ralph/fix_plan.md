@@ -2309,9 +2309,19 @@ documentation-only and is exempt from the design-doc requirement.)
       (emits ` MATCH FULL` between the REFERENCES list and ON UPDATE/DELETE, per
       ruleutils.c). pg_dump now re-emits `ADD CONSTRAINT mf_child_fk FOREIGN KEY
       (a, b) REFERENCES public.mf_ref(a, b) MATCH FULL;`. Design
-      `0119-0004-fk-match-full-roundtrip.md`. **Still open under M0119-0004:**
-      the pg_dump 002–010 catalog-view parity battery (further slices);
-      extended-protocol commit-time deferral (architecturally entangled —
+      `0119-0004-fk-match-full-roundtrip.md`. **Slice 310 (loop #31):** partial
+      EXCLUDE constraint `WHERE` predicate round-trip — `parseExcludeConstraint`
+      never consumed a trailing `WHERE`, so a partial exclusion silently degraded
+      into an all-rows exclusion on restore. New `TableConstraintDef.ExclusionWhere`
+      (parsed via `p.parseExpr()`); executor `applyExclusionPredicate` threads it
+      onto the backing index's `PredicateString` (`defaultExprToSQL`) at all three
+      EXCLUDE build sites; `buildConstraintDefString` EXCLUDE branch appends
+      ` WHERE (pred)` after the operator/INCLUDE list and before DEFERRABLE
+      (mirroring `pg_get_indexdef_worker`, ruleutils.c:1564). pg_dump re-emits
+      `ADD CONSTRAINT pex_excl EXCLUDE USING btree (a WITH =) WHERE (b > 0);`.
+      Design `0119-0004-partial-exclude-where-roundtrip.md`. **Still open under
+      M0119-0004:** the pg_dump 002–010 catalog-view parity battery (further
+      slices); extended-protocol commit-time deferral (architecturally entangled —
       extended protocol is auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs

@@ -4495,6 +4495,15 @@ func buildConstraintDefString(idx *catalog.Index) string {
 		if len(idx.IncludeColumns) > 0 {
 			def += " INCLUDE (" + strings.Join(idx.IncludeColumns, ", ") + ")"
 		}
+		// Partial EXCLUDE WHERE predicate — pg_get_constraintdef renders the
+		// exclusion def via pg_get_indexdef_worker, which appends ` WHERE (%s)`
+		// (ruleutils.c:1564) after the operator/INCLUDE list and BEFORE the
+		// DEFERRABLE clauses that the shared tail adds. PredicateString already
+		// carries the fully-parenthesized predicate (defaultExprToSQL), matching
+		// PG's `WHERE (pred)`. DU-002 slice 310.
+		if idx.PredicateString != "" {
+			def += " WHERE " + idx.PredicateString
+		}
 		// DEFERRABLE [INITIALLY DEFERRED] — ruleutils.c appends ` DEFERRABLE` for a
 		// deferrable EXCLUDE constraint (after the WHERE predicate, which goopg does
 		// not yet emit) and ` INITIALLY DEFERRED` when initially deferred (INITIALLY

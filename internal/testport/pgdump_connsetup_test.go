@@ -2842,6 +2842,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("alter table mf_child add fk match full: %v", err)
 	}
 
+	// Slice 310: a PARTIAL EXCLUDE constraint (`EXCLUDE USING btree (a WITH =)
+	// WHERE (b > 0)`) must round-trip its WHERE predicate. PG renders the
+	// exclusion def via pg_get_indexdef_worker, which appends ` WHERE (%s)`
+	// (ruleutils.c:1564) after the operator/INCLUDE list and BEFORE the
+	// DEFERRABLE tail, so pg_get_constraintdef emits
+	// `EXCLUDE USING btree (a WITH =) WHERE (b > 0)` and pg_dump re-emits it as
+	// `ADD CONSTRAINT pex_excl EXCLUDE USING btree (a WITH =) WHERE (b > 0);`.
+	// The gap was at parse time: parseExcludeConstraint never consumed a trailing
+	// WHERE, so the predicate was silently dropped and a partial exclusion
+	// degraded on restore into one applying to EVERY row (a semantic change, not
+	// just a cosmetic one). goopg now parses the WHERE expression into
+	// TableConstraintDef.ExclusionWhere, threads it onto the backing index's
+	// PredicateString (defaultExprToSQL — fully parenthesized like PG), and the
+	// EXCLUDE branch of buildConstraintDefString appends ` WHERE (pred)` before
+	// DEFERRABLE. btree-equality EXCLUDE so goopg backs it with a real index
+	// (matching slice 143's form).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pex (a integer, b integer, CONSTRAINT pex_excl EXCLUDE USING btree (a WITH =) WHERE (b > 0))"); err != nil {
+		t.Fatalf("create table pex with partial exclude: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -7234,6 +7254,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// key semantics.
 		if !strings.Contains(res.Stdout, "ADD CONSTRAINT mf_child_fk FOREIGN KEY (a, b) REFERENCES public.mf_ref(a, b) MATCH FULL;") {
 			t.Errorf("pg_dump dropped the MATCH FULL clause on an FK; missing the mf_child_fk line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 310 (asserted):** a PARTIAL EXCLUDE constraint round-trips its
+		// WHERE predicate. pg_get_constraintdef (via pg_get_indexdef_worker) emits
+		// ` WHERE (b > 0)` after the operator list and before DEFERRABLE
+		// (ruleutils.c:1564). A regression dropping the clause would silently
+		// promote the partial exclusion to one applying to every row on restore.
+		if !strings.Contains(res.Stdout, "ADD CONSTRAINT pex_excl EXCLUDE USING btree (a WITH =) WHERE (b > 0);") {
+			t.Errorf("pg_dump dropped the WHERE predicate on a partial EXCLUDE; missing the pex_excl line\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 119 (asserted):** descending sequences must round-trip through
 		// pg_dump's descending-direction default suppression. A plain
