@@ -196,6 +196,17 @@ type OpenOptions struct {
 	// postgresql.conf to recover them. Runtime SET is not yet
 	// supported (M0093 candidate).
 	TrackIOTiming bool
+
+	// TransactionBuffers is the resident-page budget for the CLOG SLRU
+	// buffer pool (the live in-memory commit-log store since M0117-0006
+	// Part B). It maps to the `transaction_buffers` GUC; 0 means
+	// "auto-tune" (EffectiveCLOGBuffers floors it at one SLRU bank = 16
+	// pages), which is the boot default and is correctness-safe. A
+	// non-zero override is clamped to [16, 1GiB/BLCKSZ]. cmd/goopg start
+	// derives this from the GUC so postgresql.conf overrides flow through;
+	// tests leave it 0. Wired into CLog.SetCLOGBuffers before
+	// EnablePGSLRUMirror creates the pool (a no-op afterwards).
+	TransactionBuffers int
 }
 
 // Open prepares a Runtime against an existing data directory.
@@ -675,6 +686,12 @@ func Open(opts OpenOptions) (*Runtime, error) {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("goopg: open clog: %w", err)
 	}
+	// M0117-0006 Part B follow-up: size the live CLOG SLRU buffer pool from
+	// the transaction_buffers GUC before EnablePGSLRUMirror creates it. 0 (the
+	// boot default) keeps the auto-tuned 16-page floor; a non-zero override is
+	// honoured (clamped in EffectiveCLOGBuffers). Must precede the mirror call —
+	// SetCLOGBuffers is a no-op once the pool exists.
+	clog.SetCLOGBuffers(opts.TransactionBuffers)
 	// M0106-0010 batched-44: wire the PG-canonical pg_xact/ SLRU mirror so
 	// every commit/abort updates the SLRU segment that the basebackup-shipped
 	// standby reads via SimpleLruReadPage_ReadOnly. EnablePGSLRUMirror also

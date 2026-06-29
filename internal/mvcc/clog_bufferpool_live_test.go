@@ -136,3 +136,40 @@ func TestCLOGPoolTruncateInvalidates(t *testing.T) {
 		t.Errorf("retained high XID: got %d, want Committed", got)
 	}
 }
+
+// TestSetCLOGBuffersSizesPool pins the M0117-0006 Part B follow-up wiring: the
+// transaction_buffers GUC value (threaded via OpenOptions.TransactionBuffers →
+// SetCLOGBuffers in initdb.Open) actually sizes the live pool's resident-page
+// budget, resolved through EffectiveCLOGBuffers. 0 keeps the auto-tuned floor;
+// a non-zero override flows through. SetCLOGBuffers must precede the mirror.
+func TestSetCLOGBuffersSizesPool(t *testing.T) {
+	cases := []struct {
+		name       string
+		buffers    int
+		wantNslots int
+	}{
+		{name: "auto-tune floor", buffers: 0, wantNslots: EffectiveCLOGBuffers(0, 0)},
+		{name: "explicit 128", buffers: 128, wantNslots: 128},
+		{name: "below floor clamps to 16", buffers: 8, wantNslots: 16},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			c, err := OpenCLog(filepath.Join(dir, "pg_xact_flat"))
+			if err != nil {
+				t.Fatalf("OpenCLog: %v", err)
+			}
+			c.SetCLOGBuffers(tc.buffers)
+			if err := c.EnablePGSLRUMirror(filepath.Join(dir, "pg_xact")); err != nil {
+				t.Fatalf("EnablePGSLRUMirror: %v", err)
+			}
+			pool := c.pool.Load()
+			if pool == nil {
+				t.Fatal("pool not promoted to live store")
+			}
+			if pool.nslots != tc.wantNslots {
+				t.Errorf("pool.nslots = %d, want %d", pool.nslots, tc.wantNslots)
+			}
+		})
+	}
+}

@@ -171,11 +171,22 @@ with the deviations noted:
   reopen they replaced.
 - **Pool sizing.** `EffectiveCLOGBuffers(c.clogBuffers, 0)`; `clogBuffers`
   defaults to 0 (auto = 16 pages, bank-aligned) and is settable via
-  `SetCLOGBuffers` before `EnablePGSLRUMirror`. Wiring the `transaction_buffers`
-  GUC value into `SetCLOGBuffers` from `initdb.Open` is a small follow-up (auto
-  sizing is correctness-safe — eviction writes back + re-faults on demand — and
-  the TPC-H/pgbench working sets touch few CLOG pages, so 16 resident pages do
-  not thrash).
+  `SetCLOGBuffers` before `EnablePGSLRUMirror`. Auto sizing is correctness-safe —
+  eviction writes back + re-faults on demand — and the TPC-H/pgbench working sets
+  touch few CLOG pages, so 16 resident pages do not thrash.
+  - **Follow-up LANDED 2026-06-29 (loop #12):** the `transaction_buffers` GUC
+    value is now threaded into `SetCLOGBuffers` from `initdb.Open`. `cmd/goopg
+    start` reads the GUC (`intGUC(registry, "transaction_buffers", 0)`) into the
+    new `OpenOptions.TransactionBuffers` field; `Open` calls
+    `clog.SetCLOGBuffers(opts.TransactionBuffers)` immediately before
+    `EnablePGSLRUMirror` (a no-op once the pool exists). The boot default 0 keeps
+    the auto-16 floor (behaviour unchanged for every default deployment); a
+    non-zero `postgresql.conf` override now actually sizes the live pool instead
+    of being silently dropped. Regression coverage:
+    `cmd/goopg/main_test.go:TestTransactionBuffersFromGUC` (+ nil-registry) pins
+    the GUC read; `clog_bufferpool_live_test.go:TestSetCLOGBuffersSizesPool` pins
+    the `SetCLOGBuffers` → `pool.nslots = EffectiveCLOGBuffers(n,0)` end of the
+    wire (auto floor, explicit 128, below-floor clamp to 16).
 
 Regression coverage: `clog_bufferpool_live_test.go`
 (`TestCLOGPoolIsLiveStore` — read/write/HighestKnownXID across pages+segments +

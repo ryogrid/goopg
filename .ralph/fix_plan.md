@@ -148,8 +148,12 @@ role/database persistence is a real goopg feature gap.
       Regression `clog_bufferpool_live_test.go`. **Part C (DEFERRED, ledger):** remove
       the resident `banks` (16× memory reduction) once the no-mirror unit tests are
       migrated; re-init data dir on the memory-model change. Box stays unchecked until
-      Part C lands. Follow-up: wire the `transaction_buffers` GUC value into
-      `CLog.SetCLOGBuffers` from `initdb.Open` (auto-16 default is correctness-safe).
+      Part C lands. **Follow-up LANDED 2026-06-29 (loop #12):** the
+      `transaction_buffers` GUC value is now threaded into `CLog.SetCLOGBuffers`
+      from `initdb.Open` (new `OpenOptions.TransactionBuffers`, read in `cmd/goopg
+      start` via `intGUC`). Boot default 0 keeps the auto-16 floor (no behaviour
+      change); a non-zero `postgresql.conf` override now sizes the live pool.
+      Regression `TestTransactionBuffersFromGUC` + `TestSetCLOGBuffersSizesPool`.
 - [ ] **M0117-0007 — Async-commit LSN tracking (gap G8; Effort L).** Part A landed
       (per-LSN-group tracking + page-write WAL barrier on the M0117-0006 pool, not live).
       **Part B (DEFERRED):** live `synchronous_commit=off` — wire `flushWAL` to the WAL
