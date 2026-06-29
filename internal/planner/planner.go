@@ -180,7 +180,7 @@ func Plan(stmt parser.Stmt, cat catalog.Catalog) (Node, error) {
 	case *parser.VacuumStmt, *parser.AnalyzeStmt,
 		*parser.ShowStmt, *parser.SetStmt, *parser.ResetStmt,
 		*parser.ReindexStmt, *parser.ClusterStmt,
-		*parser.SetTransactionStmt,
+		*parser.SetTransactionStmt, *parser.SetConstraintsStmt,
 		*parser.PrepareStmt, *parser.ExecuteStmt, *parser.DeallocateStmt,
 		*parser.DiscardStmt:
 		return &Utility{pos: stmt.Pos(), Stmt: stmt}, nil

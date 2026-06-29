@@ -185,6 +185,8 @@ type BasicSession struct {
 	txFailed            bool                       // in_failed_sql_transaction (25P02)
 	txnReadOnly         bool                       // true while inside a READ ONLY transaction (M0097-0024)
 	deferredFKChecks    []DeferredFKCheck          // INITIALLY DEFERRED FK checks (M0096-0011)
+	constraintsAllMode  int8                       // SET CONSTRAINTS ALL: 0 unset, 1 DEFERRED, 2 IMMEDIATE (0119-0004)
+	constraintDeferral  map[string]bool            // SET CONSTRAINTS <name>: per-constraint override (0119-0004)
 	activeQueryTables   map[uint32]bool            // OIDs of tables currently in active DML (M0097-0023)
 	statsSnapshot       *funcStatSnapshot          // per-txn cumulative-stats snapshot (M0118-0009 stats_fetch_consistency)
 }
@@ -273,6 +275,10 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.currentSubXid = 0
 	s.txFailed = false
 	s.deferredFKChecks = nil
+	// SET CONSTRAINTS settings last only for the current transaction (PG
+	// AfterTriggerEndXact resets the deferral state at every txn boundary). 0119-0004.
+	s.constraintsAllMode = 0
+	s.constraintDeferral = nil
 	s.activeQueryTables = nil
 	// Discard the per-transaction cumulative-stats snapshot — PG's AtEOXact_PgStat
 	// drops the stats snapshot at every transaction boundary so the next
@@ -315,6 +321,88 @@ func (s *BasicSession) TakeDeferredFKChecks() []DeferredFKCheck {
 	out := s.deferredFKChecks
 	s.deferredFKChecks = nil
 	return out
+}
+
+// SetConstraintsAll records `SET CONSTRAINTS ALL { DEFERRED | IMMEDIATE }` for
+// the current transaction. ALL supersedes any prior per-constraint overrides.
+// 0119-0004.
+func (s *BasicSession) SetConstraintsAll(deferred bool) {
+	if deferred {
+		s.constraintsAllMode = 1
+	} else {
+		s.constraintsAllMode = 2
+	}
+	s.constraintDeferral = nil
+}
+
+// SetConstraintsNamed records `SET CONSTRAINTS name [, ...] { DEFERRED |
+// IMMEDIATE }`. A per-name setting overrides the ALL mode for that constraint.
+// 0119-0004.
+func (s *BasicSession) SetConstraintsNamed(names []string, deferred bool) {
+	if s.constraintDeferral == nil {
+		s.constraintDeferral = make(map[string]bool)
+	}
+	for _, n := range names {
+		s.constraintDeferral[n] = deferred
+	}
+}
+
+// FKConstraintDeferred reports whether a foreign-key constraint's check should
+// be deferred to COMMIT given any in-effect SET CONSTRAINTS override and the
+// constraint's declared INITIALLY {DEFERRED|IMMEDIATE} default. A per-name
+// override wins over an ALL setting, which wins over the declared default.
+// Callers must have already established the constraint is DEFERRABLE. 0119-0004.
+func (s *BasicSession) FKConstraintDeferred(name string, initiallyDeferred bool) bool {
+	if name != "" && s.constraintDeferral != nil {
+		if v, ok := s.constraintDeferral[name]; ok {
+			return v
+		}
+	}
+	switch s.constraintsAllMode {
+	case 1:
+		return true
+	case 2:
+		return false
+	}
+	return initiallyDeferred
+}
+
+// ConstraintsOverrideActive reports whether a SET CONSTRAINTS override is in
+// effect for the current transaction (ALL mode set or any per-name override).
+// The simple-query COMMIT path uses this to decide whether to run the deferred
+// FK checks it would otherwise leave to the (bypassed) executor commit path:
+// commit-time enforcement is activated for SET CONSTRAINTS-controlled
+// deferrals, while a plain INITIALLY DEFERRED constraint keeps its existing
+// behaviour (whose concurrent/partitioned-parent snapshot semantics —
+// fk-snapshot — are a separate, pre-existing gap). 0119-0004.
+func (s *BasicSession) ConstraintsOverrideActive() bool {
+	return s.constraintsAllMode != 0 || len(s.constraintDeferral) > 0
+}
+
+// TakeDeferredFKChecksMatching removes and returns the queued deferred FK
+// checks affected by a `SET CONSTRAINTS … IMMEDIATE` so they can be run now.
+// When all is true every queued check is taken; otherwise only those whose FK
+// constraint name is in names. The rest stay queued for COMMIT. 0119-0004.
+func (s *BasicSession) TakeDeferredFKChecksMatching(all bool, names []string) []DeferredFKCheck {
+	if all {
+		out := s.deferredFKChecks
+		s.deferredFKChecks = nil
+		return out
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var taken, kept []DeferredFKCheck
+	for _, c := range s.deferredFKChecks {
+		if c.FK.Name != "" && want[c.FK.Name] {
+			taken = append(taken, c)
+		} else {
+			kept = append(kept, c)
+		}
+	}
+	s.deferredFKChecks = kept
+	return taken
 }
 
 // EffectiveWriterXID returns the XID to stamp on new heap tuples.

@@ -2121,8 +2121,34 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_IsolationInsertConflict*`/`Merge*` PASS; zero blast radius
       outside NND. **All three NND enforcement sub-features (a)–(c) are now
       landed.**
+      **2026-06-29 (loop #18, design 0119-0004-set-constraints-deferred):
+      `SET CONSTRAINTS` runtime constraint-deferral control LANDED** (the second
+      general SQL-engine gap the triage surfaced under this task — the
+      deferred-constraint-checking-at-COMMIT engine gap). `SET CONSTRAINTS
+      { ALL | name [, …] } { DEFERRED | IMMEDIATE }` now parses
+      (`parser.SetConstraintsStmt`) and controls FK-deferral timing via session
+      state on `BasicSession` (`constraintsAllMode` + per-name `constraintDeferral`,
+      reset per txn) consumed by a new `fkCheckDeferred(ctx, fk)` helper that
+      replaces the four open-coded `Deferrable && InitiallyDeferred && inTx` sites
+      in operators_fk.go (byte-identical with no override). `… IMMEDIATE` runs the
+      now-immediate queued checks at the SET statement; the simple-query COMMIT
+      path (which bypasses `execCommit`) gained `executor.RunDeferredFKChecks`
+      **gated on `ConstraintsOverrideActive()`** so plain `INITIALLY DEFERRED`
+      keeps its prior simple-query behaviour (activating the commit check
+      unconditionally regressed the pass-required `fk-snapshot` spec — its
+      deferred-RI check needs a fresh "latest" snapshot to see a
+      concurrently-committed *partitioned* parent, a separate pre-existing gap).
+      Wired through query.go (simple) + extended no-op + `SET CONSTRAINTS` command
+      tag; removed the old `compatNoopCommandTag` no-op. Tests: parser
+      (4 shapes), executor session (precedence + matching), end-to-end
+      `TestPort_SetConstraintsDeferral` (control immediate-fail / deferred ordered
+      / raise-at-COMMIT / raise-at-IMMEDIATE). fk-snapshot + full FK isolation
+      group + executor/parser/server units PASS.
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery and the **deferred-constraint-checking-at-COMMIT** engine gap.
+      battery; the deferred-RI **fresh-snapshot** semantics needed to drop the
+      `ConstraintsOverrideActive` gate (so plain `INITIALLY DEFERRED` is also
+      enforced at commit on the simple-query path without regressing fk-snapshot);
+      deferred UNIQUE/EXCLUDE; extended-protocol deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

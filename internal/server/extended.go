@@ -477,6 +477,14 @@ func (s *Server) executeExtendedQuery(ctx context.Context, sess *config.SessionR
 			return nil, &extendedQueryError{Code: sqlstate.InvalidParameterValue, Message: err.Error()}
 		}
 		return &extendedQueryResult{CommandTag: "SET"}, nil
+	case strings.HasPrefix(upper, "SET CONSTRAINTS "):
+		// SET CONSTRAINTS is not a GUC. The extended fast path holds only the
+		// GUC SessionRegistry, not the executor BasicSession where FK-deferral
+		// state lives, so accept it here as a correctly-tagged no-op rather than
+		// mis-parsing it as a configuration parameter. Runtime deferral via
+		// SET CONSTRAINTS is supported on the simple-query protocol (the path
+		// psql and the isolation harness use). 0119-0004.
+		return &extendedQueryResult{CommandTag: "SET CONSTRAINTS"}, nil
 	case strings.HasPrefix(upper, "SET "):
 		body := matchable[len("SET "):]
 		name, value, ok := splitSet(body)

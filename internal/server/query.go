@@ -104,6 +104,20 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 			return err
 		}
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	// SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE } controls
+	// runtime constraint deferral, NOT a GUC — route through the parser-based
+	// executor (which builds a SetConstraintsStmt and updates the executor
+	// session's deferral state) before the generic "SET " GUC case, which would
+	// otherwise mis-read "CONSTRAINTS" as a configuration parameter. 0119-0004.
+	case strings.HasPrefix(upper, "SET CONSTRAINTS "):
+		if s.cfg.hasStorage() {
+			return s.dispatchSimpleQueryViaExecutor(ctx, r, w, sess, trimmed, connTx, prepStmts)
+		}
+		// No storage backend (bare protocol server): accept as a no-op.
+		if err := w.WriteCommandComplete("SET CONSTRAINTS"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	// SET LOCAL SESSION AUTHORIZATION name — must check before generic "SET LOCAL ".
 	case strings.HasPrefix(upper, "SET LOCAL SESSION AUTHORIZATION "),
 		upper == "SET LOCAL SESSION AUTHORIZATION":

@@ -72,6 +72,24 @@ func multixactUpdaterIsKeyChanging(mxs *multixact.Store, xmax storage.Transactio
 	return false
 }
 
+// fkCheckDeferred reports whether fk's enforcement should be queued to COMMIT
+// instead of run immediately. It honours both the constraint's declared
+// DEFERRABLE INITIALLY {DEFERRED|IMMEDIATE} mode and any in-effect
+// SET CONSTRAINTS override on the session (0119-0004). Only a DEFERRABLE
+// constraint inside an explicit transaction can ever be deferred. With no
+// SET CONSTRAINTS in effect this reproduces the prior
+// `fk.Deferrable && fk.InitiallyDeferred && InExplicitTransaction()` predicate
+// exactly.
+func fkCheckDeferred(ctx *Context, fk catalog.ForeignKey) bool {
+	if !fk.Deferrable || ctx.Session == nil || !ctx.Session.InExplicitTransaction() {
+		return false
+	}
+	if sess, ok := ctx.Session.(*BasicSession); ok {
+		return sess.FKConstraintDeferred(fk.Name, fk.InitiallyDeferred)
+	}
+	return fk.InitiallyDeferred
+}
+
 // checkFKInsert verifies all FK constraints on fkOwnerTbl for the given
 // inserted row. Returns a 23503 (foreign_key_violation) error when a
 // referenced parent row does not exist.
@@ -97,8 +115,9 @@ func checkFKInsertForConstraints(ctx *Context, fkOwnerTbl *catalog.Table, report
 		if allNull {
 			continue // NULL FK values are always allowed
 		}
-		// DEFERRABLE INITIALLY DEFERRED inside an explicit transaction: queue.
-		if fk.Deferrable && fk.InitiallyDeferred && ctx.Session != nil && ctx.Session.InExplicitTransaction() {
+		// DEFERRABLE constraint deferred (by INITIALLY DEFERRED or an in-effect
+		// SET CONSTRAINTS … DEFERRED) inside an explicit transaction: queue. 0119-0004.
+		if fkCheckDeferred(ctx, fk) {
 			if sess, ok := ctx.Session.(*BasicSession); ok {
 				sess.AddDeferredFKCheck(DeferredFKCheck{ChildTableName: fkOwnerTbl.Name, FK: fk})
 				continue
@@ -152,10 +171,11 @@ func enforceFKOnDelete(ctx *Context, parentTbl *catalog.Table, parentRow Row) er
 		// see.  Surfaces 40001 under RR/Serializable (mirrors upstream's
 		// RI_FKey_*_del crosscheck-snapshot serialization error) and
 		// refreshes the snapshot under RC so the scans below process the
-		// now-committed row normally.  Deferred FK checks (NO ACTION
-		// INITIALLY DEFERRED) skip this because they run at COMMIT time
-		// when no concurrent inserter can still be in-flight against us.
-		if !(fk.Deferrable && fk.InitiallyDeferred && ctx.Session != nil && ctx.Session.InExplicitTransaction()) {
+		// now-committed row normally.  Deferred FK checks (NO ACTION,
+		// deferred by INITIALLY DEFERRED or SET CONSTRAINTS … DEFERRED) skip
+		// this because they run at COMMIT time when no concurrent inserter can
+		// still be in-flight against us. 0119-0004.
+		if !fkCheckDeferred(ctx, fk) {
 			if err := fkChildWaitForInFlightInsert(ctx, ref.Child, fk.Columns, vals); err != nil {
 				return err
 			}
@@ -184,7 +204,7 @@ func enforceFKOnDelete(ctx *Context, parentTbl *catalog.Table, parentRow Row) er
 				}
 			}
 		default: // NO ACTION
-			if fk.Deferrable && fk.InitiallyDeferred && ctx.Session != nil && ctx.Session.InExplicitTransaction() {
+			if fkCheckDeferred(ctx, fk) {
 				if sess, ok := ctx.Session.(*BasicSession); ok {
 					sess.AddDeferredFKCheck(DeferredFKCheck{ChildTableName: ref.Child.Name, FK: fk})
 					continue
@@ -315,8 +335,9 @@ func fkDeleteAncestorPass(ctx *Context, im *catalog.InMemory, leafTbl *catalog.T
 			// COMMIT, not now — the referenced row may be re-inserted before commit
 			// (fk-snapshot's DELETE + re-INSERT in one txn). Queue the deferred
 			// check (deduped against the parent-keyed first-loop queue in
-			// enforceFKOnDelete) and skip the immediate raise. fk-snapshot.
-			if fk.Deferrable && fk.InitiallyDeferred && ctx.Session != nil && ctx.Session.InExplicitTransaction() {
+			// enforceFKOnDelete) and skip the immediate raise. fk-snapshot. The
+			// deferral honours SET CONSTRAINTS too (0119-0004).
+			if fkCheckDeferred(ctx, fk) {
 				if sess, ok := ctx.Session.(*BasicSession); ok {
 					sess.AddDeferredFKCheck(DeferredFKCheck{ChildTableName: ref.Child.Name, FK: fk})
 					continue
@@ -376,6 +397,23 @@ func fkDeleteAncestorPass(ctx *Context, im *catalog.InMemory, leafTbl *catalog.T
 // runAllDeferredFKChecks verifies every queued deferred FK constraint.
 // Called by execCommit before TxnMgr.Commit. Returns a 23503 error if
 // any constraint is violated.
+// RunDeferredFKChecks runs every FK constraint check queued during the current
+// transaction (DEFERRABLE constraints deferred by INITIALLY DEFERRED or by an
+// in-effect SET CONSTRAINTS … DEFERRED) and clears the queue. The simple-query
+// COMMIT path bypasses transactionOp.execCommit, so it must invoke this before
+// TxnMgr.Commit; a violation returns a 23503 *ExecError so the caller can roll
+// the transaction back. No-op when nothing is queued. 0119-0004 / M0096-0011.
+func RunDeferredFKChecks(ctx *Context, sess *BasicSession) error {
+	if sess == nil || ctx == nil || ctx.Pool == nil {
+		return nil
+	}
+	checks := sess.TakeDeferredFKChecks()
+	if len(checks) == 0 {
+		return nil
+	}
+	return runAllDeferredFKChecks(ctx, checks)
+}
+
 func runAllDeferredFKChecks(ctx *Context, checks []DeferredFKCheck) error {
 	im, ok := ctx.Catalog.(*catalog.InMemory)
 	if !ok {

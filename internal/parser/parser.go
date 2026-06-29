@@ -1483,6 +1483,36 @@ func (p *parser) parseSet() (Stmt, error) {
 	setTxDone:
 		return st, nil
 	}
+	// SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }.
+	// "constraints", "deferred" and "immediate" are unreserved keyword idents
+	// (matched with acceptIdentKeyword, the same way the INITIALLY DEFERRED
+	// constraint trailer is parsed); ALL is the reserved KwAll. 0119-0004.
+	if p.acceptIdentKeyword("constraints") {
+		sc := &SetConstraintsStmt{pos: t.Pos}
+		if p.acceptKeyword(KwAll) {
+			sc.All = true
+		} else {
+			for {
+				nm, err := p.parseQualifiedConstraintName()
+				if err != nil {
+					return nil, err
+				}
+				sc.Names = append(sc.Names, nm)
+				if !p.acceptSymbol(",") {
+					break
+				}
+			}
+		}
+		switch {
+		case p.acceptIdentKeyword("deferred"):
+			sc.Deferred = true
+		case p.acceptIdentKeyword("immediate"):
+			sc.Deferred = false
+		default:
+			return nil, p.errAtCur("expected DEFERRED or IMMEDIATE after SET CONSTRAINTS")
+		}
+		return sc, nil
+	}
 	name, err := p.parseGUCName()
 	if err != nil {
 		return nil, err
@@ -1935,6 +1965,26 @@ func (p *parser) parseGUCName() (string, error) {
 			return "", err
 		}
 		name = name + "." + identText(next)
+	}
+	return name, nil
+}
+
+// parseQualifiedConstraintName parses one constraint name for SET CONSTRAINTS.
+// PG accepts a schema-qualified name (schema.constraint); goopg matches the
+// queued deferred checks by the bare constraint name, so any leading schema
+// qualifier is parsed and discarded (the final component is returned). 0119-0004.
+func (p *parser) parseQualifiedConstraintName() (string, error) {
+	tok, err := p.parseIdent()
+	if err != nil {
+		return "", err
+	}
+	name := identText(tok)
+	for p.acceptSymbol(".") {
+		next, err := p.parseIdent()
+		if err != nil {
+			return "", err
+		}
+		name = identText(next)
 	}
 	return name, nil
 }

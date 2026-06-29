@@ -465,6 +465,20 @@ type SetStmt struct {
 func (s *SetStmt) Pos() int  { return s.pos }
 func (s *SetStmt) stmtNode() {}
 
+// SetConstraintsStmt — `SET CONSTRAINTS { ALL | name [, ...] }
+// { DEFERRED | IMMEDIATE }`. Controls the check timing of DEFERRABLE
+// constraints for the current transaction. Deferred=true → DEFERRED. When All
+// is true Names is empty. 0119-0004 (M0119-0004).
+type SetConstraintsStmt struct {
+	pos      int
+	All      bool
+	Names    []string
+	Deferred bool
+}
+
+func (s *SetConstraintsStmt) Pos() int  { return s.pos }
+func (s *SetConstraintsStmt) stmtNode() {}
+
 // ResetStmt — `RESET name | RESET ALL`.
 type ResetStmt struct {
 	pos  int

@@ -1239,8 +1239,6 @@ func compatNoopCommandTag(sql string) (string, bool) {
 		return "DROP DATABASE", true
 	case strings.HasPrefix(norm, "drop user "), strings.HasPrefix(norm, "drop role "):
 		return "DROP ROLE", true
-	case strings.HasPrefix(norm, "set constraints "):
-		return "SET CONSTRAINTS", true
 	case strings.HasPrefix(norm, "comment on "):
 		return "COMMENT", true
 	case strings.HasPrefix(norm, "security label "):
@@ -1843,6 +1841,47 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					return w.WriteCommandComplete("ROLLBACK")
 				}
 				explicitTx := connTx.Tx()
+				// Run FK constraint checks deferred to COMMIT under a
+				// SET CONSTRAINTS … DEFERRED override. The simple-query dispatch
+				// bypasses transactionOp.execCommit, so the checks queued on the
+				// session during INSERT/UPDATE/DELETE must be run here BEFORE
+				// TxnMgr.Commit; a violation aborts the transaction with 23503,
+				// exactly as PG raises a deferred constraint violation at COMMIT.
+				// Gated on an active SET CONSTRAINTS override so a plain
+				// DEFERRABLE INITIALLY DEFERRED constraint keeps its prior
+				// behaviour (its concurrent/partitioned-parent snapshot semantics
+				// — fk-snapshot — are a separate, pre-existing gap). 0119-0004.
+				if sess := connTx.Session(); sess != nil && sess.ConstraintsOverrideActive() {
+					if fkErr := executor.RunDeferredFKChecks(ctx, sess); fkErr != nil {
+						if rs := s.cfg.Catalog.Routines(); rs != nil {
+							for _, r := range sess.TakePendingRoutineDrops() {
+								_, _ = rs.Create(r, true)
+							}
+						}
+						_ = s.cfg.TxnMgr.Rollback(explicitTx)
+						undoEnumDDLForRollback(connTx, s.cfg.Catalog)
+						connTx.End()
+						if ctx.EndLocalTransaction != nil {
+							ctx.EndLocalTransaction()
+						}
+						ctx.PendingEnumValues = nil
+						ctx.PendingEnumRenames = nil
+						ctx.PendingCreatedEnums = nil
+						ctx.PendingCreatedComposites = nil
+						code := sqlstate.ForeignKeyViolation
+						var fields []protocol.ErrorField
+						if ee, ok := fkErr.(*executor.ExecError); ok {
+							if ee.Code != "" {
+								code = sqlstate.Code(ee.Code)
+							}
+							if ee.Detail != "" {
+								fields = append(fields, protocol.ErrorField{Code: protocol.FieldDetail, Value: ee.Detail})
+							}
+							return s.writeQueryError(w, code, ee.Message, fields...)
+						}
+						return s.writeQueryError(w, code, fkErr.Error())
+					}
+				}
 				// M0104-0008: SSI pre-commit dangerous-structure check.
 				// The executor's transactionOp.execCommit invokes this for
 				// COMMIT routed through the executor; the simple-query
@@ -2304,6 +2343,8 @@ func utilityTag(stmt parser.Stmt) string {
 		return "SHOW"
 	case *parser.SetStmt:
 		return "SET"
+	case *parser.SetConstraintsStmt:
+		return "SET CONSTRAINTS"
 	case *parser.ResetStmt:
 		return "RESET"
 	case *parser.DiscardStmt:

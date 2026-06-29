@@ -1,27 +1,34 @@
 (idle — nothing in flight)
 
-Last loop (#17): M0119-0004 NND **reordered partition-leaf arbiter** — LANDED +
-committed (design 0119-0004 §10). Closes sub-feature (c); **all NND enforcement
-sub-features (a)–(c) are now complete.**
-- `operators_upsert.go` upsert `Next`: the NND heap-scan fallback was guarded out
-  on reordered partition leaves (`if !conflicted && partLeaf == nil`), so a
-  duplicate NULL row was wrongly INSERTED where PG routes to the conflict action.
-- Root cause = row/column-order mismatch: `probeArbiterNND` /
-  `checkNullsNotDistinctViaHeapScan` / `rowHasNullKeyColumn` resolve key columns
-  by NAME against `cols` and read the candidate at the matching ordinal, so the
-  passed row must share `cols`' order. Fix = pass `insertedForLeaf` (already
-  leaf-ordered on the reordered path; == `inserted` on every non-reordered path)
-  and drop the guard. conflictRow stays leaf-decoded → downstream leaf→parent
-  remap unchanged. Zero blast radius outside NND.
-- Test `TestNullsNotDistinctOnConflictReorderedPartitionLeaf` (parent `(a,b,c)` /
-  leaf `(c,b,a)` / NND `(a,b)`; DO NOTHING skip + DO UPDATE target). Confirmed
-  RED→GREEN (2 rows → 1). `-race` Upsert/Conflict/Partition +
-  `TestPort_IsolationInsertConflict*`/`Merge*` PASS; `go build ./...` clean.
+Last loop (#18): M0119-0004 **`SET CONSTRAINTS` runtime constraint-deferral
+control** — LANDED + design `0119-0004-set-constraints-deferred`. Second general
+SQL-engine gap under M0119-0004 (the deferred-constraint-checking-at-COMMIT gap).
+- Parser `SetConstraintsStmt` (`SET CONSTRAINTS {ALL|name[,…]} {DEFERRED|IMMEDIATE}`)
+  → `planner.Utility` → `executor.setConstraintsOp`.
+- `BasicSession`: `constraintsAllMode int8` + per-name `constraintDeferral` map
+  (reset per txn); `FKConstraintDeferred(name, initiallyDeferred)` precedence
+  per-name > ALL > declared default; `TakeDeferredFKChecksMatching` (IMMEDIATE).
+- New `fkCheckDeferred(ctx, fk)` helper replaces the 4 open-coded
+  `Deferrable && InitiallyDeferred && inTx` sites in operators_fk.go
+  (byte-identical with no override).
+- IMMEDIATE runs queued checks at the SET stmt (setConstraintsOp). Simple-query
+  COMMIT path (bypasses execCommit) gained `executor.RunDeferredFKChecks`
+  **GATED on `ConstraintsOverrideActive()`** — plain INITIALLY DEFERRED keeps
+  prior behaviour (unconditional activation REGRESSED pass-required `fk-snapshot`:
+  its deferred-RI check needs a FRESH snapshot to see a concurrently-committed
+  *partitioned* parent; `fullTableFKCheck` uses txn `ctx.Snap` → false 23503).
+- query.go simple-query routing + extended no-op + `SET CONSTRAINTS` tag;
+  removed old compatNoopCommandTag entry.
+- Tests: parser(4 shapes), executor session(precedence/matching), e2e
+  `TestPort_SetConstraintsDeferral` (control/ordered/raise-at-COMMIT/
+  raise-at-IMMEDIATE via pinned `*sql.Conn`). fk-snapshot + full FK isolation
+  group + executor/parser/server units PASS; -race executor PASS; build clean.
 
-Remaining M0119 backlog (pick topmost actionable next loop):
-- M0119-0002 (CLOG Part C / 0007 Part B / 0008 Part B) — Effort-L full-gate
-  session (-race mvcc+wal, xlog_replay, PG-standby E2E, fresh TPC-H Q12/Q13).
-- M0119-0004 STILL OPEN (NND now fully closed): pg_dump 002–010 catalog-view
-  parity battery; deferred-constraint-checking-at-COMMIT engine gap.
-- M0119-0005 (pg_waldump WD-002), M0119-0006 (amcheck server tier — needs index
-  AMs), M0119-0007 (pg_basebackup recvlogical — blocked on logical decoding).
+NEXT loop — pick topmost actionable M0119:
+- M0119-0004 still open: pg_dump 002–010 catalog parity battery (slice-by-slice
+  via self-promoting `TestPort_PgDumpConnectionSetup` guard — currently GREEN,
+  add a fixture to find the next gap); **deferred-RI fresh-snapshot** to drop the
+  ConstraintsOverrideActive gate (ledger row, resume = fresh "latest" snapshot in
+  `fullTableFKCheck`/`assertParentExists`, verify fk-snapshot stays green).
+- M0119-0002 (CLOG store swap Part B) — highest blast radius, dedicated full-gate.
+- M0119-0005/0006/0007 blocked (index AMs / logical decoding).

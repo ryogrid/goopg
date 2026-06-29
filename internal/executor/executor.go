@@ -288,6 +288,9 @@ func Build(plan planner.Node) (Operator, error) {
 		if st, ok := p.Stmt.(*parser.SetTransactionStmt); ok {
 			return newSetTransactionOp(st), nil
 		}
+		if sc, ok := p.Stmt.(*parser.SetConstraintsStmt); ok {
+			return newSetConstraintsOp(sc), nil
+		}
 		if rs, ok := p.Stmt.(*parser.ReindexStmt); ok {
 			return newReindexOp(rs), nil
 		}

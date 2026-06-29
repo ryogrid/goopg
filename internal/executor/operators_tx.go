@@ -568,3 +568,56 @@ func (o *setTransactionOp) Next() (TupleSlot, error) {
 	}
 	return nil, EOF
 }
+
+// setConstraintsOp applies a SET CONSTRAINTS { ALL | name [, ...] }
+// { DEFERRED | IMMEDIATE } statement: it records the deferral override on the
+// session and, for an IMMEDIATE request, runs any already-queued deferred FK
+// checks the change makes immediate right away (so a violation raises at this
+// statement, as PG does). 0119-0004.
+type setConstraintsOp struct {
+	stmt *parser.SetConstraintsStmt
+	ctx  *Context
+	done bool
+}
+
+func newSetConstraintsOp(s *parser.SetConstraintsStmt) *setConstraintsOp {
+	return &setConstraintsOp{stmt: s}
+}
+
+func (o *setConstraintsOp) Schema() planner.Schema  { return nil }
+func (o *setConstraintsOp) Open(ctx *Context) error { o.ctx = ctx; return nil }
+func (o *setConstraintsOp) Close() error            { return nil }
+
+func (o *setConstraintsOp) Next() (TupleSlot, error) {
+	if o.done {
+		return nil, EOF
+	}
+	o.done = true
+	if o.ctx == nil || o.ctx.Session == nil {
+		return nil, EOF
+	}
+	sess, ok := o.ctx.Session.(*BasicSession)
+	if !ok {
+		return nil, EOF
+	}
+	// Outside an explicit transaction block the surrounding single-statement
+	// transaction ends immediately, so the override has no lasting effect — PG
+	// treats this as a near no-op. Record nothing to avoid leaking state across
+	// autocommit statements.
+	if !sess.InExplicitTransaction() {
+		return nil, EOF
+	}
+	if o.stmt.All {
+		sess.SetConstraintsAll(o.stmt.Deferred)
+	} else {
+		sess.SetConstraintsNamed(o.stmt.Names, o.stmt.Deferred)
+	}
+	// IMMEDIATE: run any pending deferred FK checks the change makes immediate.
+	if !o.stmt.Deferred {
+		checks := sess.TakeDeferredFKChecksMatching(o.stmt.All, o.stmt.Names)
+		if err := runAllDeferredFKChecks(o.ctx, checks); err != nil {
+			return nil, err
+		}
+	}
+	return nil, EOF
+}
