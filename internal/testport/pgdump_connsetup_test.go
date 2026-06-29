@@ -3240,6 +3240,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant usage on schema grant_sch: %v", err)
 	}
 
+	// Slice 336: a GRANT to a role whose name needs quoting must round-trip. PG's
+	// aclitemout (putid) double-quotes a grantee name containing any character
+	// outside [A-Za-z0-9_] (here a hyphen) in pg_class.relacl, and pg_dump's getid
+	// parser relies on those quotes to read the whole name; buildACLCommands then
+	// re-emits the GRANT through fmtId (also quoted). goopg previously rendered the
+	// grantee raw ("weird-role=r/postgres"), which pg_dump would mis-parse at the
+	// hyphen. (A reserved-keyword name like "user" needs no aclitem quoting — it is
+	// all-alnum, so putid leaves it bare and pg_dump's fmtId adds the quotes
+	// client-side; that case already round-trips.)
+	if err := runSQLSimple(t, c, `CREATE ROLE "weird-role"`); err != nil {
+		t.Fatalf("create role weird-role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grant_q (a integer)"); err != nil {
+		t.Fatalf("create table grant_q: %v", err)
+	}
+	if err := runSQLSimple(t, c, `GRANT SELECT ON TABLE public.grant_q TO "weird-role"`); err != nil {
+		t.Fatalf("grant select on grant_q to weird-role: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7086,6 +7105,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// to real pg_dump 18.3.
 		if want := "GRANT USAGE ON SCHEMA grant_sch TO schema_role;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered schema GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 336 (asserted):** a GRANT to a role whose name needs quoting
+		// round-trips. PG's aclitemout double-quotes the hyphenated grantee in
+		// relacl ("weird-role"=r/postgres); pg_dump parses the quoted name and
+		// re-emits it via fmtId (also quoted). goopg previously rendered the
+		// grantee raw, which pg_dump would mis-parse at the hyphen. Verified
+		// byte-identical to real pg_dump 18.3.
+		if want := `GRANT SELECT ON TABLE public.grant_q TO "weird-role";`; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered quoted-role GRANT: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

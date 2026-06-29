@@ -8551,9 +8551,45 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		if grantee == publicPseudoRole {
 			grantee = ""
 		}
-		items = append(items, grantee+"="+letters.String()+"/postgres")
+		// A grantee name with characters outside [A-Za-z0-9_] (e.g. a hyphen, a
+		// space, or a multibyte char) must be double-quoted in the aclitem text,
+		// exactly as PostgreSQL's aclitemout/putid renders it, or pg_dump's getid
+		// parser stops at the first unsafe char and mis-reads the grantee. The
+		// empty PUBLIC grantee and the all-alnum common case are returned
+		// unchanged. DU-002 slice 336.
+		items = append(items, aclQuoteName(grantee)+"="+letters.String()+"/postgres")
 	}
 	return "{" + strings.Join(items, ",") + "}"
+}
+
+// aclQuoteName reproduces PostgreSQL's putid (src/backend/utils/adt/acl.c): a
+// role name used inside an aclitem is double-quoted when any byte is not
+// "safe", where is_safe_acl_char(c, false) admits only ASCII alphanumerics and
+// underscore (a high-bit/multibyte byte is unsafe on output). An internal
+// double quote is doubled. The empty string (the PUBLIC pseudo-grantee) and an
+// all-safe name are returned verbatim. DU-002 slice 336.
+func aclQuoteName(s string) string {
+	safe := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' {
+			b.WriteByte('"')
+		}
+		b.WriteByte(s[i])
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // RegisterCompatObject records a noop-created object (e.g. CREATE CONVERSION as noop).

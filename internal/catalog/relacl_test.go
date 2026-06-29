@@ -213,3 +213,51 @@ func TestRelaclTextSequence(t *testing.T) {
 		t.Fatalf("seq relacl after GRANT UPDATE WITH GRANT OPTION = %q; want %q", got, want)
 	}
 }
+
+// TestRelaclTextQuotedGrantee pins the aclitemout/putid name-quoting that lets a
+// GRANT to a role whose name contains characters outside [A-Za-z0-9_] round-trip
+// through pg_dump (DU-002 slice 336). PostgreSQL double-quotes such a grantee in
+// the aclitem text (doubling an internal quote); pg_dump's getid parser relies on
+// that to read the whole name. An all-alnum/underscore name and the empty PUBLIC
+// grantee are emitted verbatim.
+func TestRelaclTextQuotedGrantee(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16800
+
+	// A hyphenated role name must be double-quoted: "weird-role"=r/postgres.
+	c.GrantTablePrivilege(relOID, "weird-role", "SELECT")
+	want := `{postgres=arwdDxtm/postgres,"weird-role"=r/postgres}`
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after GRANT to hyphenated role = %q; want %q", got, want)
+	}
+	c.DropTableACL(relOID)
+
+	// A plain alphanumeric/underscore name is never quoted; PUBLIC stays the
+	// (unquoted) empty grantee even though they sort/coexist.
+	c.GrantTablePrivilege(relOID, "plain_role", "INSERT")
+	c.GrantTablePrivilege(relOID, "PUBLIC", "SELECT")
+	want = "{postgres=arwdDxtm/postgres,plain_role=a/postgres,=r/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl with plain role + PUBLIC = %q; want %q", got, want)
+	}
+}
+
+// TestACLQuoteName unit-checks the putid emulation directly, including the
+// double-quote-doubling and multibyte (high-bit) cases that are awkward to drive
+// through a full GRANT.
+func TestACLQuoteName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},                      // PUBLIC pseudo-grantee
+		{"postgres", "postgres"},      // owner / common case
+		{"plain_role99", "plain_role99"},
+		{"weird-role", `"weird-role"`}, // hyphen
+		{"has space", `"has space"`},   // space
+		{`a"b`, `"a""b"`},              // internal quote doubled
+		{"café", `"café"`},             // multibyte (high-bit) byte → unsafe
+	}
+	for _, tc := range cases {
+		if got := aclQuoteName(tc.in); got != tc.want {
+			t.Errorf("aclQuoteName(%q) = %q; want %q", tc.in, got, tc.want)
+		}
+	}
+}

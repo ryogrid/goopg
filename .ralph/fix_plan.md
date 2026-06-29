@@ -2596,6 +2596,28 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestNamespaceACLText` + slice-335 `TestPort_PgDumpConnectionSetup`
       (byte-identical vs real pg_dump 18.3) PASS. Still open: column-level
       (`pg_attribute.attacl`)/database (`datacl`) GRANT, REVOKE-of-default modelling.
+      **2026-06-30 (loop #59, design 0119-0004-grant-quoted-role-relacl-pgdump,
+      DU-002 slice 336):** `GRANT` to a quoting-required role name round-trips. PG's
+      `aclitemout`/`putid` double-quotes a grantee whose name has any char outside
+      `[A-Za-z0-9_]` (hyphen/space/multibyte; internal `"` doubled) in `relacl`
+      (`"weird-role"=r/postgres`); pg_dump's `getid` relies on those quotes and
+      re-emits via `fmtId`. Slices 331–335 rendered grantees raw, so a hyphenated
+      role emitted `weird-role=r/postgres` → pg_dump mis-parsed at the hyphen. Fix
+      (rendering-only, catalog.go): new `aclQuoteName` reproduces `putid`;
+      `relaclTextLockedFor` wraps the grantee (after the PUBLIC→"" mapping). No
+      `grant_ddl.go` change (`splitGrantList` already trims quotes). A
+      reserved-keyword name (`user`) is all-alnum → bare in the aclitem, quoted
+      client-side by pg_dump's `fmtId` → already round-trips (closes the loop-#53
+      "reserved-keyword-named-role quoting" item by analysis). Zero blast radius
+      (`aclQuoteName` = identity for alnum/underscore + empty PUBLIC grantee;
+      `HasTablePrivilege`/`truncate-conflict` read the stored key). Tests
+      `TestRelaclTextQuotedGrantee` + `TestACLQuoteName` + slice-336
+      `TestPort_PgDumpConnectionSetup` (`CREATE ROLE "weird-role"` + `GRANT SELECT
+      ON TABLE public.grant_q TO "weird-role"`; byte-identical vs real pg_dump
+      18.3) PASS. **Deferred:** mixed-case quoted-role case preservation
+      (`GrantTablePrivilege*` lower-cases the stored name). Still open: column-level
+      (`pg_attribute.attacl`, heap re-sync)/database (`datacl`, needs `--create`)
+      GRANT, REVOKE-of-default modelling.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
