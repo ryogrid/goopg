@@ -2041,6 +2041,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				RefColumns:        c.RefColumns,
 				OnDelete:          c.OnDelete,
 				OnUpdate:          c.OnUpdate,
+				OnDeleteSetCols:   append([]string(nil), c.OnDeleteSetCols...),
 				Deferrable:        c.FKDeferrable,
 				InitiallyDeferred: c.FKInitiallyDeferred,
 				MatchFull:         c.FKMatchFull,
@@ -2075,6 +2076,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			RefColumns:        append([]string(nil), tfk.RefColumns...),
 			OnDelete:          tfk.OnDelete,
 			OnUpdate:          tfk.OnUpdate,
+			OnDeleteSetCols:   append([]string(nil), tfk.OnDeleteSetCols...),
 			Deferrable:        tfk.Deferrable,
 			InitiallyDeferred: tfk.InitiallyDeferred,
 			MatchFull:         tfk.MatchFull,
@@ -5735,16 +5737,17 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				fkName = tbl.Name + "_" + firstCol + "_fkey"
 			}
 			fk := catalog.ForeignKey{
-				Name:       fkName,
-				OID:        o.allocConstraintOID(fkName),
-				Columns:    append([]string(nil), act.Columns...),
-				RefTable:   act.RefTable.Name,
-				RefColumns: append([]string(nil), act.RefColumns...),
-				OnDelete:   act.OnDelete,
-				OnUpdate:   act.OnUpdate,
-				Deferrable: act.Deferrable,
-				NotValid:   act.NotValid,
-				MatchFull:  act.MatchFull,
+				Name:            fkName,
+				OID:             o.allocConstraintOID(fkName),
+				Columns:         append([]string(nil), act.Columns...),
+				RefTable:        act.RefTable.Name,
+				RefColumns:      append([]string(nil), act.RefColumns...),
+				OnDelete:        act.OnDelete,
+				OnUpdate:        act.OnUpdate,
+				OnDeleteSetCols: append([]string(nil), act.OnDeleteSetCols...),
+				Deferrable:      act.Deferrable,
+				NotValid:        act.NotValid,
+				MatchFull:       act.MatchFull,
 			}
 			tbl.ForeignKeys = append(tbl.ForeignKeys, fk)
 		case parser.AlterTableValidateConstraint:

@@ -1049,6 +1049,10 @@ type ColumnDef struct {
 	RefColumns          []string // empty = use parent PK
 	OnDelete            FKAction
 	OnUpdate            FKAction
+	// OnDeleteSetCols restricts an `ON DELETE SET NULL|DEFAULT` action to a
+	// subset of the FK's referencing columns (PG15 confdelsetcols). Empty = all
+	// columns. DU-002 slice 311.
+	OnDeleteSetCols     []string
 	FKDeferrable        bool
 	FKInitiallyDeferred bool
 	// FKMatchFull is true for an inline `REFERENCES … MATCH FULL` clause. MATCH
@@ -1137,6 +1141,9 @@ type TableForeignKeyDef struct {
 	RefColumns        []string   // referenced columns; empty = referenced table's PK
 	OnDelete          FKAction   // referential action for ON DELETE (default NO ACTION)
 	OnUpdate          FKAction   // referential action for ON UPDATE (default NO ACTION)
+	// OnDeleteSetCols restricts an `ON DELETE SET NULL|DEFAULT` action to a
+	// subset of Columns (PG15 confdelsetcols); empty = all columns. DU-002 slice 311.
+	OnDeleteSetCols   []string
 	Deferrable        bool
 	InitiallyDeferred bool
 	// MatchFull is true for `… MATCH FULL`; MATCH SIMPLE (default) leaves it
@@ -1990,8 +1997,11 @@ type AlterTableAction struct {
 	Deferrable bool     // true if `DEFERRABLE`; false (default) if NOT DEFERRABLE or omitted
 	OnDelete   FKAction // referential action for ON DELETE (default NO ACTION)
 	OnUpdate   FKAction // referential action for ON UPDATE (default NO ACTION)
-	NotValid   bool     // true if `NOT VALID` (skip validation of existing rows)
-	MatchFull  bool     // true if `MATCH FULL`; MATCH SIMPLE (default) leaves it false. DU-002 slice 309.
+	// OnDeleteSetCols restricts an `ON DELETE SET NULL|DEFAULT` action to a
+	// subset of Columns (PG15 confdelsetcols); empty = all columns. DU-002 slice 311.
+	OnDeleteSetCols []string
+	NotValid        bool // true if `NOT VALID` (skip validation of existing rows)
+	MatchFull       bool // true if `MATCH FULL`; MATCH SIMPLE (default) leaves it false. DU-002 slice 309.
 
 	// AttachPartitionOf is populated for AlterTableAttachPartition.
 	// It holds the child table name and partition bounds. M0096-0007.

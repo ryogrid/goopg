@@ -221,6 +221,86 @@ func TestForeignKeyMatchFullRoundTrip(t *testing.T) {
 	}
 }
 
+// TestForeignKeyOnDeleteSetColsRoundTrip verifies that an `ON DELETE SET NULL
+// (col)` action restricted to a column subset (PG15 confdelsetcols) survives
+// parsing, surfaces pg_constraint.confdelsetcols as the column attnum array, and
+// that pg_get_constraintdef re-emits the ` (col)` suffix after the ON DELETE
+// clause (ruleutils.c decompile_column_index_array). A plain `ON DELETE SET
+// NULL` (no column list) control confirms confdelsetcols stays NULL and no
+// suffix is emitted. DU-002 slice 311.
+func TestForeignKeyOnDeleteSetColsRoundTrip(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, `CREATE TABLE sref (id integer PRIMARY KEY)`); err != nil {
+		t.Fatalf("CREATE TABLE sref: %v", err)
+	}
+	// Restricted SET NULL: only column b is nulled on parent delete.
+	if err := runDDL(t, ctx, `CREATE TABLE sset (a integer, b integer)`); err != nil {
+		t.Fatalf("CREATE TABLE sset: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE sset ADD CONSTRAINT sset_fk `+
+		`FOREIGN KEY (b) REFERENCES sref (id) ON DELETE SET NULL (b)`); err != nil {
+		t.Fatalf("ALTER TABLE sset ADD FK SET NULL (b): %v", err)
+	}
+	// Plain SET NULL control (whole key) — no column list.
+	if err := runDDL(t, ctx, `CREATE TABLE splain (a integer, b integer)`); err != nil {
+		t.Fatalf("CREATE TABLE splain: %v", err)
+	}
+	if err := runDDL(t, ctx, `ALTER TABLE splain ADD CONSTRAINT splain_fk `+
+		`FOREIGN KEY (b) REFERENCES sref (id) ON DELETE SET NULL`); err != nil {
+		t.Fatalf("ALTER TABLE splain ADD FK SET NULL: %v", err)
+	}
+
+	ssetTbl, ok := cat.LookupTable(parser.ObjectName{Name: "sset"})
+	if !ok || len(ssetTbl.ForeignKeys) != 1 {
+		t.Fatalf("sset FK not captured: %+v", ssetTbl)
+	}
+	fkSet := ssetTbl.ForeignKeys[0]
+	if got := fkSet.OnDeleteSetCols; len(got) != 1 || got[0] != "b" {
+		t.Errorf("OnDeleteSetCols = %v, want [b]", got)
+	}
+	splainTbl, _ := cat.LookupTable(parser.ObjectName{Name: "splain"})
+	fkPlain := splainTbl.ForeignKeys[0]
+	if len(fkPlain.OnDeleteSetCols) != 0 {
+		t.Errorf("plain SET NULL OnDeleteSetCols = %v, want empty", fkPlain.OnDeleteSetCols)
+	}
+
+	// pg_constraint.confdelsetcols (row[23]) — attnum array for the restricted FK
+	// (b is the 2nd column of sset → {2}), NULL for the whole-key FK.
+	pgcon, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_constraint"})
+	if !ok || pgcon.VirtualRows == nil {
+		t.Fatal("pg_constraint virtual table not found")
+	}
+	delsetcols := map[string]string{}
+	for _, r := range pgcon.VirtualRows() {
+		if r[3] == "f" {
+			delsetcols[r[1]] = r[23]
+		}
+	}
+	if delsetcols["sset_fk"] != "{2}" {
+		t.Errorf("confdelsetcols for sset_fk = %q, want \"{2}\"", delsetcols["sset_fk"])
+	}
+	if delsetcols["splain_fk"] != "" {
+		t.Errorf("confdelsetcols for splain_fk = %q, want NULL/empty", delsetcols["splain_fk"])
+	}
+
+	// pg_get_constraintdef must append ` (b)` after ON DELETE SET NULL for the
+	// restricted FK, and emit no suffix for the plain one.
+	im, ok := cat.(*catalog.InMemory)
+	if !ok {
+		t.Fatal("catalog is not *InMemory")
+	}
+	if got, want := buildForeignKeyDefString(im, fkSet),
+		"FOREIGN KEY (b) REFERENCES public.sref(id) ON DELETE SET NULL (b)"; got != want {
+		t.Errorf("buildForeignKeyDefString(SET NULL (b)) = %q, want %q", got, want)
+	}
+	if got, want := buildForeignKeyDefString(im, fkPlain),
+		"FOREIGN KEY (b) REFERENCES public.sref(id) ON DELETE SET NULL"; got != want {
+		t.Errorf("buildForeignKeyDefString(plain SET NULL) = %q, want %q", got, want)
+	}
+}
+
 // TestCreateTableTableLevelCompositeForeignKey verifies that a table-level
 // (composite) FOREIGN KEY declared in the CREATE TABLE body — `FOREIGN KEY
 // (a, b) REFERENCES t (x, y)` — is captured rather than silently dropped. The

@@ -1143,6 +1143,11 @@ type ForeignKey struct {
 	RefColumns        []string // referenced columns (empty = use parent PK)
 	OnDelete          parser.FKAction
 	OnUpdate          parser.FKAction
+	// OnDeleteSetCols restricts an `ON DELETE SET NULL|DEFAULT` action to a
+	// subset of Columns — PG15 pg_constraint.confdelsetcols. Empty means the
+	// whole key. pg_get_constraintdef appends ` (col, …)` after the ON DELETE
+	// clause (ruleutils.c:2376). DU-002 slice 311.
+	OnDeleteSetCols   []string
 	Deferrable        bool
 	InitiallyDeferred bool
 	// NotValid is true when the constraint was added with NOT VALID — existing
@@ -4942,6 +4947,16 @@ func (c *InMemory) registerSystemTables() {
 						confkey = append(confkey, fmt.Sprintf("%d", ord))
 					}
 				}
+				// confdelsetcols (PG15): attnums of the columns an ON DELETE SET
+				// NULL|DEFAULT is restricted to. NULL when the action covers the
+				// whole key, matching PG (decompile_column_index_array emits the
+				// ` (col, …)` suffix only when this is non-null). DU-002 slice 311.
+				var confdelsetcols []string
+				for _, cn := range fk.OnDeleteSetCols {
+					if ord, ok := colOrd[strings.ToLower(cn)]; ok {
+						confdelsetcols = append(confdelsetcols, fmt.Sprintf("%d", ord))
+					}
+				}
 				row := make([]string, 26)
 				row[0] = fmt.Sprintf("%d", fk.OID) // oid
 				row[1] = fk.Name                   // conname
@@ -4980,6 +4995,9 @@ func (c *InMemory) registerSystemTables() {
 				row[18] = "f"                               // conperiod
 				row[19] = "{" + strings.Join(conkey, ",") + "}"
 				row[20] = "{" + strings.Join(confkey, ",") + "}"
+				if len(confdelsetcols) > 0 {
+					row[23] = "{" + strings.Join(confdelsetcols, ",") + "}" // confdelsetcols
+				}
 				row[25] = "t" // conenforced
 				out = append(out, row)
 			}

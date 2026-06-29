@@ -4598,6 +4598,14 @@ func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) strin
 	}
 	if act := fkActionClause(fk.OnDelete); act != "" {
 		def += " ON DELETE " + act
+		// PG15 confdelsetcols: an `ON DELETE SET NULL|DEFAULT` restricted to a
+		// column subset appends ` (col, …)` after the action keyword
+		// (ruleutils.c:2376, decompile_column_index_array). Only SET NULL / SET
+		// DEFAULT can carry it. DU-002 slice 311.
+		if len(fk.OnDeleteSetCols) > 0 &&
+			(fk.OnDelete == parser.FKActionSetNull || fk.OnDelete == parser.FKActionSetDefault) {
+			def += " (" + strings.Join(fk.OnDeleteSetCols, ", ") + ")"
+		}
 	}
 	if fk.Deferrable {
 		def += " DEFERRABLE"

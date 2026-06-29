@@ -2862,6 +2862,30 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create table pex with partial exclude: %v", err)
 	}
 
+	// Slice 311: a FOREIGN KEY whose `ON DELETE SET NULL` is restricted to a
+	// column subset (PG15 confdelsetcols) must round-trip the column list.
+	// pg_get_constraintdef (ruleutils.c:2376) appends ` (col, …)` after the
+	// `ON DELETE SET NULL` keyword via decompile_column_index_array when
+	// pg_constraint.confdelsetcols is non-null, so pg_dump emits
+	// `... ON DELETE SET NULL (b);`. The gap was at parse time: parseFKAction
+	// consumed `SET NULL`/`SET DEFAULT` but never the trailing column list, so a
+	// restricted action silently degraded into a whole-key SET NULL on restore
+	// (a SEMANTIC change — the other FK columns would also be nulled). goopg now
+	// parses the list into {Column,Table,AlterTable}…OnDeleteSetCols, threads it
+	// onto catalog.ForeignKey, projects pg_constraint.confdelsetcols (attnum
+	// array), and buildForeignKeyDefString re-emits ` (cols)` after the ON DELETE
+	// clause. A two-column referencing key makes the restriction observable
+	// (only sfk_b is nulled). The referenced table needs a UNIQUE/PK on (id).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.sfk_ref (id integer PRIMARY KEY)"); err != nil {
+		t.Fatalf("create table sfk_ref: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.sfk_child (a integer, b integer)"); err != nil {
+		t.Fatalf("create table sfk_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.sfk_child ADD CONSTRAINT sfk_child_fk FOREIGN KEY (b) REFERENCES public.sfk_ref (id) ON DELETE SET NULL (b)"); err != nil {
+		t.Fatalf("alter table sfk_child add fk on delete set null (b): %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -7262,6 +7286,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// promote the partial exclusion to one applying to every row on restore.
 		if !strings.Contains(res.Stdout, "ADD CONSTRAINT pex_excl EXCLUDE USING btree (a WITH =) WHERE (b > 0);") {
 			t.Errorf("pg_dump dropped the WHERE predicate on a partial EXCLUDE; missing the pex_excl line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 311 (asserted):** a FOREIGN KEY with `ON DELETE SET NULL`
+		// restricted to a column subset round-trips the column list (PG15
+		// confdelsetcols). pg_get_constraintdef appends ` (b)` after the ON DELETE
+		// SET NULL keyword (ruleutils.c:2376). A regression dropping the list would
+		// silently widen the action to the whole key on restore — a semantic change.
+		if !strings.Contains(res.Stdout, "ADD CONSTRAINT sfk_child_fk FOREIGN KEY (b) REFERENCES public.sfk_ref(id) ON DELETE SET NULL (b);") {
+			t.Errorf("pg_dump dropped the ON DELETE SET NULL column list; missing the sfk_child_fk line\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 119 (asserted):** descending sequences must round-trip through
 		// pg_dump's descending-direction default suppression. A plain

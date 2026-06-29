@@ -2737,9 +2737,13 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 				if !isDelete {
 					_ = p.acceptKeyword(KwUpdate)
 				}
-				action := parseFKAction(p)
+				action, setCols, aerr := parseFKAction(p)
+				if aerr != nil {
+					return ColumnDef{}, aerr
+				}
 				if isDelete {
 					col.OnDelete = action
+					col.OnDeleteSetCols = setCols
 				} else {
 					col.OnUpdate = action
 				}
@@ -3009,25 +3013,45 @@ func (p *parser) parseColumnType() (ColumnType, error) {
 // token position. Used by REFERENCES … ON DELETE / ON UPDATE parsing.
 // M0096-0011. Note: cascade/restrict/set are registered keywords;
 // "no" and "action" are plain identifiers.
-func parseFKAction(p *parser) FKAction {
+func parseFKAction(p *parser) (FKAction, []string, error) {
 	if p.acceptKeyword(KwCascade) {
-		return FKActionCascade
+		return FKActionCascade, nil, nil
 	}
 	if p.acceptKeyword(KwRestrict) {
-		return FKActionRestrict
+		return FKActionRestrict, nil, nil
 	}
 	if p.acceptIdentKeyword("no") {
 		_ = p.acceptIdentKeyword("action")
-		return FKActionNoAction
+		return FKActionNoAction, nil, nil
 	}
 	if p.acceptKeyword(KwSet) {
+		act := FKActionSetDefault
 		if p.acceptKeyword(KwNull) {
-			return FKActionSetNull
+			act = FKActionSetNull
+		} else {
+			_ = p.acceptKeyword(KwDefault)
 		}
-		_ = p.acceptKeyword(KwDefault)
-		return FKActionSetDefault
+		// PG15: an optional column list after SET NULL | SET DEFAULT restricts the
+		// action to a subset of the FK's referencing columns
+		// (pg_constraint.confdelsetcols). The grammar (gram.y key_action) permits
+		// the list after SET NULL/DEFAULT regardless of ON UPDATE vs ON DELETE; PG
+		// rejects it for ON UPDATE in parse-analysis (errcode 0A000), which the
+		// caller mirrors via its isDelete gate. pg_get_constraintdef appends it as
+		// ` (col1, col2)` after the ON DELETE clause (ruleutils.c:2376). DU-002 slice 311.
+		if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
+			p.advance()
+			cols, err := p.parseColumnNameList()
+			if err != nil {
+				return act, nil, err
+			}
+			if !p.acceptSymbol(")") {
+				return act, nil, p.errAtCur("expected ')'")
+			}
+			return act, cols, nil
+		}
+		return act, nil, nil
 	}
-	return FKActionNoAction
+	return FKActionNoAction, nil, nil
 }
 
 // parseFKMatchType consumes an optional `MATCH FULL | MATCH PARTIAL | MATCH
@@ -3962,9 +3986,13 @@ func (p *parser) parseTableForeignKey(name string) (TableForeignKeyDef, error) {
 		if !isDelete {
 			_ = p.acceptKeyword(KwUpdate)
 		}
-		action := parseFKAction(p)
+		action, setCols, aerr := parseFKAction(p)
+		if aerr != nil {
+			return TableForeignKeyDef{}, aerr
+		}
 		if isDelete {
 			fk.OnDelete = action
+			fk.OnDeleteSetCols = setCols
 		} else {
 			fk.OnUpdate = action
 		}
@@ -5650,14 +5678,19 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		// the inline column-FK path so actions survive into pg_constraint and
 		// pg_dump (DU-002 slice 52). ON is KwOn (reserved).
 		var onDelete, onUpdate FKAction
+		var onDeleteSetCols []string
 		for p.acceptKeyword(KwOn) {
 			isDelete := p.acceptKeyword(KwDelete)
 			if !isDelete {
 				_ = p.acceptKeyword(KwUpdate)
 			}
-			action := parseFKAction(p)
+			action, setCols, aerr := parseFKAction(p)
+			if aerr != nil {
+				return AlterTableAction{}, aerr
+			}
 			if isDelete {
 				onDelete = action
+				onDeleteSetCols = setCols
 			} else {
 				onUpdate = action
 			}
@@ -5699,6 +5732,7 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		act.MatchFull = matchFull
 		act.OnDelete = onDelete
 		act.OnUpdate = onUpdate
+		act.OnDeleteSetCols = onDeleteSetCols
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwCheck:
 		// ADD [CONSTRAINT name] CHECK (expr) — register the check constraint.
