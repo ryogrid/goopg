@@ -2270,15 +2270,29 @@ documentation-only and is exempt from the design-doc requirement.)
       both spellings accepted) → executor sets the field and flushes the pg_class
       HEAP row via the delete-old-rows + `syncTableToCatalogHeap` path (same as SET
       STORAGE/COMPRESSION). Dump-fidelity only (goopg has no logical replication).
-      USING INDEX deferred (keys on `pg_index.indisreplident` at index-dump time —
-      rejected with 0A000 to avoid silent loss; ledgered). Zero blast radius on
-      query/DML (the wrong `'n'` default → correct `'d'` removes spurious lines).
-      Tests `TestParseAlterTableReplicaIdentity` + `TestUserPGClassRowReplicaIdentity`
-      + slice 305 (`ri_full`→FULL, `ri_nothing`→NOTHING present; foo/bar/part
-      default → no clause) PASS vs real pg_dump 18.3; parser/catalog/executor PASS.
-      **Still open under M0119-0004:** REPLICA IDENTITY USING INDEX; the pg_dump
-      002–010 catalog-view parity battery (further slices); extended-protocol
-      commit-time deferral (architecturally entangled — extended protocol is
+      Zero blast radius on query/DML (the wrong `'n'` default → correct `'d'`
+      removes spurious lines).
+      **2026-06-29 (loop #27, design 0119-0004 slice 306): REPLICA IDENTITY USING
+      INDEX (`relreplident='i'`) — LANDED.** pg_dump emits `ALTER TABLE ONLY <t>
+      REPLICA IDENTITY USING INDEX <idx>` at INDEX-dump time keyed on
+      `pg_index.indisreplident` (pg_dump.c:18186), NOT at table-dump time. New
+      `catalog.Index.IsReplicaIdentity` projected to indisreplident in BOTH
+      pg_index builders (virtual `catalog.go` VirtualRows pg_dump reads + heap
+      `buildUserPGIndexRow` for restart durability). Executor
+      `resolveReplicaIdentityIndex` validates the named index per PG's
+      `check_replica_identity` (exists `42704`, unique `42809`, immediate `0A000`,
+      non-expression `0A000`, non-partial `0A000`, NOT-NULL keys `42809`), sets the
+      table to `'i'`, and — mirroring `relation_mark_replica_identity` — marks the
+      chosen index + clears every other index of the table, re-syncing each
+      changed index's pg_index heap row (`resyncIndexReplicaIdentHeap`,
+      stamp-old + writeHeapRowCanonical). Tests
+      `TestParseAlterTableReplicaIdentity` + `TestUserPGClassRowReplicaIdentity` +
+      `TestUserPGIndexRowReplicaIdentity` + slices 305/306 (`ri_full`→FULL,
+      `ri_nothing`→NOTHING, `ri_index`/`ri_uidx`→USING INDEX present; foo/bar/part
+      default → no clause) PASS vs real pg_dump 18.3; full executor + parser +
+      catalog suites PASS. **Still open under M0119-0004:** the pg_dump 002–010
+      catalog-view parity battery (further slices); extended-protocol commit-time
+      deferral (architecturally entangled — extended protocol is
       auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs

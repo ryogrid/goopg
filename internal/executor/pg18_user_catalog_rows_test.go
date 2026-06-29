@@ -1801,3 +1801,36 @@ func TestUserPGClassRowReplicaIdentity(t *testing.T) {
 		}
 	}
 }
+
+// TestUserPGIndexRowReplicaIdentity verifies buildUserPGIndexRow projects the
+// index's IsReplicaIdentity flag to pg_index.indisreplident. pg_dump reads this
+// to emit `ALTER TABLE ONLY <t> REPLICA IDENTITY USING INDEX <idx>` at
+// index-dump time, so a regression that hard-wired it false (as the legacy
+// builder did) would silently drop the USING INDEX clause. DU-002 slice 306.
+func TestUserPGIndexRowReplicaIdentity(t *testing.T) {
+	cols := pgIndexColumnsPG18()
+	col := -1
+	for i, c := range cols {
+		if c.Name == "indisreplident" {
+			col = i
+			break
+		}
+	}
+	if col < 0 {
+		t.Fatal("indisreplident column not found in pgIndexColumnsPG18")
+	}
+	tbl := &catalog.Table{
+		Schema: "public", Name: "ri_index", OID: 16600,
+		Columns: []catalog.Column{{Name: "id", Type: catalog.Type{Name: "int4"}, NotNull: true, Ordinal: 0}},
+	}
+	for _, want := range []bool{false, true} {
+		idx := &catalog.Index{
+			Schema: "public", Name: "ri_uidx", Table: tbl, OID: 16601,
+			Columns: []string{"id"}, Unique: true, IsReplicaIdentity: want,
+		}
+		row := buildUserPGIndexRow(idx)
+		if got := row[col].BoolValue(); got != want {
+			t.Errorf("IsReplicaIdentity=%v: indisreplident = %v, want %v", want, got, want)
+		}
+	}
+}

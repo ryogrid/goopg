@@ -1399,6 +1399,16 @@ type Index struct {
 	// `CREATE INDEX … WITH (autosummarize='on')`. goopg has no BRIN
 	// summarization, so this is advisory catalog/dump-only. DU-002 slice 223.
 	AutoSummarize *bool
+	// IsReplicaIdentity mirrors pg_index.indisreplident: true when this index
+	// was selected as the table's replica identity via `ALTER TABLE …
+	// REPLICA IDENTITY USING INDEX <idx>` (the table's relreplident becomes
+	// 'i'). pg_dump emits the `ALTER TABLE ONLY <t> REPLICA IDENTITY USING
+	// INDEX <idx>` clause at index-dump time keyed on this flag (pg_dump.c
+	// dumpIndex, NOT at table-dump time). At most one index per table carries
+	// it (relation_mark_replica_identity clears the others). goopg has no
+	// logical replication, so this is round-trip dump fidelity only.
+	// DU-002 slice 306.
+	IsReplicaIdentity bool
 }
 
 // reloptionList returns the index's storage parameters as ordered key=value
@@ -5158,7 +5168,7 @@ func (c *InMemory) registerSystemTables() {
 				"f",                              // indcheckxmin
 				"t",                              // indisready
 				"t",                              // indislive
-				"f",                              // indisreplident
+				boolStr(idx.IsReplicaIdentity),   // indisreplident (DU-002 slice 306)
 				indkey,                           // indkey
 				buildZeroVec(nkeyatts),           // indcollation
 				indclass,                         // indclass

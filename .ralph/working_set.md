@@ -1,48 +1,44 @@
 (idle — nothing in flight)
 
-Last loop (#26): M0119-0004 **REPLICA IDENTITY round-trip in pg_dump** —
-LANDED DEFAULT/FULL/NOTHING (DU-002 slice 305). Design
-`0119-0004-replica-identity.md`.
+Last loop (#27): M0119-0004 **REPLICA IDENTITY USING INDEX** (DU-002 slice 306)
+— LANDED. Completes the slice-305 deferral. Design `0119-0004-replica-identity.md`.
 
-Fixed a pervasive latent bug: the heap pg_class row builder pg_dump reads
-(`buildUserPGClassRow`, pg18_user_catalog_rows.go) HARDCODED
-`relreplident='n'` (NOTHING; comment mislabelled "DEFAULT"), so EVERY dumped
-table got a spurious `ALTER TABLE ONLY <t> REPLICA IDENTITY NOTHING;`. PG's
-implicit default is `'d'`. Fix:
-- catalog.go: new `ReplIdentOrDefault(s)` (empty→'d'); new
-  `catalog.Table.ReplicaIdentity` field. Both pg_class builders (heap +
-  VirtualRows sibling) route through it.
-- parser: `AlterTableReplicaIdentity` action + `ReplicaIdentityMode`/`Index`
-  fields parse `REPLICA IDENTITY {DEFAULT|FULL|NOTHING|USING INDEX name}`
-  (FULL/NOTHING are KEYWORD tokens → accept both keyword + ident spellings).
-- executor (operators_ddl.go): action sets tbl.ReplicaIdentity + flushes the
-  pg_class HEAP row via delete-old-rows + syncTableToCatalogHeap (same path as
-  SET STORAGE/COMPRESSION). USING INDEX ('i') REJECTED with 0A000 (deferred).
+pg_dump emits `ALTER TABLE ONLY <t> REPLICA IDENTITY USING INDEX <idx>` at
+INDEX-dump time keyed on `pg_index.indisreplident` (pg_dump.c:18186), NOT at
+table-dump time. Implementation:
+- catalog.go: new `catalog.Index.IsReplicaIdentity bool` field; projected to
+  indisreplident in the VIRTUAL pg_index builder (`VirtualRows`, the one pg_dump
+  reads) via `boolStr(idx.IsReplicaIdentity)`.
+- pg18_user_catalog_rows.go: same projection in the HEAP builder
+  `buildUserPGIndexRow` (restart durability / sibling-path law).
+- operators_ddl.go `AlterTableReplicaIdentity` case: the `'i'` form is now
+  accepted (was 0A000-rejected). `resolveReplicaIdentityIndex` validates per PG
+  `check_replica_identity` (exists 42704 / unique 42809 / immediate 0A000 /
+  non-expression 0A000 / non-partial 0A000 / NOT-NULL keys 42809). Sets
+  tbl.ReplicaIdentity='i'; marks the chosen index + clears every other index of
+  the table (relation_mark_replica_identity parity), re-syncing each changed
+  index's pg_index heap row via new `resyncIndexReplicaIdentHeap`
+  (stamp-old-row + writeHeapRowCanonical, the delete-old pattern from the table
+  path).
 
-Gates: TestParseAlterTableReplicaIdentity + TestUserPGClassRowReplicaIdentity +
-DU-002 slice 305 (ri_full→FULL, ri_nothing→NOTHING present; foo/bar/part
-default→no clause) PASS vs real pg_dump 18.3; parser/catalog/executor PASS;
-gofmt clean (hoisted long token to a `replIdent` local to avoid comment-column
-churn); state guard consistent.
+Gates: TestUserPGIndexRowReplicaIdentity + TestUserPGClassRowReplicaIdentity +
+TestParseAlterTableReplicaIdentity PASS; **DU-002 slices 305/306**
+(`ri_index`/`ri_uidx`→USING INDEX clause present, byte-identical to real
+pg_dump 18.3) PASS via TestPort_PgDumpConnectionSetup; full executor + catalog +
+parser suites PASS; build clean; pgbench smoke = pre-commit hook.
 
 NEXT loop — remaining open under M0119-0004:
-- **REPLICA IDENTITY USING INDEX** (relreplident='i'): pg_dump emits it at
-  index-dump time keyed on `pg_index.indisreplident`, NOT at table-dump time.
-  Resume = add `catalog.Index.IsReplicaIdentity`; set it (clear prior) in the
-  'i' executor branch; report at indisreplident sites
-  (pg18_user_catalog_rows.go:929 + catalog.go index VirtualRows ~5140/5176);
-  re-sync index pg_index heap row; slice asserts `... REPLICA IDENTITY USING
-  INDEX uidx;`. (deferral ledger has the full resume note.)
-- pg_dump 002–010 catalog-view parity battery (further slices — find next gap).
-- extended-protocol commit-time deferral (architecturally entangled).
+- pg_dump 002–010 catalog-view parity battery (further DU-002 slices — probe
+  TestPort_PgDumpConnectionSetup for the next getter-battery gap).
+- extended-protocol commit-time deferral (architecturally entangled — extended
+  protocol is auto-commit-per-statement; see memory).
 Other M0119: M0119-0002 (CLOG store swap Part B — highest blast radius,
 dedicated full-gate) / M0119-0005 (pg_waldump) / M0119-0006 (pg_amcheck).
 
-NOTE (sibling paths): there are TWO pg_class row builders — VIRTUAL
-(`catalog.go` VirtualRows) and HEAP (`buildUserPGClassRow`, pg18_user_catalog_
-rows.go, written via syncTableToCatalogHeap). Per-table pg_class fields
-(relpersistence/relpartbound/relreplident) must be carried in BOTH in sync;
-a passing pg_dump slice does NOT disambiguate which one pg_dump reads (the
-field drives both). Prior slice comments (166/167) claim pg_dump reads the
-heap; the older memory `goopg_pg_class_virtual_pg_attribute_heap.md` claims
-virtual — keep both builders consistent and the question is moot.
+NOTE (sibling paths): TWO pg_index row builders — VIRTUAL (`catalog.go`
+VirtualRows, what pg_dump SELECTs over the wire because `tbl.VirtualRows != nil`
+short-circuits the heap scan) and HEAP (`buildUserPGIndexRow`). Both projected
+indisreplident from `Index.IsReplicaIdentity`. The TOAST-index synthetic row
+(catalog.go ~5197) stays 'f'. `Index.IsReplicaIdentity` is in-memory only (like
+`DeclaredHash`) — NOT persisted to the index-DDL WAL record; the heap re-sync
+keeps a restart/standby read consistent.

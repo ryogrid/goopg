@@ -6532,17 +6532,35 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// delete-old-rows + re-sync path or the stale heap row keeps reporting
 			// 'd' and the clause is silently dropped. goopg has no logical
 			// replication — dump-fidelity only. The USING INDEX ('i') form
-			// additionally requires marking the index's pg_index.indisreplident
-			// (pg_dump emits the clause at index-dump time); that index-side wiring
-			// is deferred, so reject it rather than silently lose the setting.
-			// DU-002 slice 305.
-			if act.ReplicaIdentityMode == "i" {
-				return &ExecError{Code: "0A000", Pos: s.Pos(),
-					Message: "REPLICA IDENTITY USING INDEX is not yet supported"}
-			}
+			// additionally marks the chosen index's pg_index.indisreplident:
+			// pg_dump emits the `ALTER TABLE ONLY <t> REPLICA IDENTITY USING INDEX
+			// <idx>` clause at INDEX-dump time keyed on that flag (pg_dump.c
+			// dumpIndex), and relation_mark_replica_identity (tablecmds.c) clears
+			// the flag on every other index of the table. DU-002 slices 305/306.
 			mode := act.ReplicaIdentityMode
 			if mode == "" {
 				mode = "d"
+			}
+			var chosenIdx *catalog.Index
+			if mode == "i" {
+				idx, verr := resolveReplicaIdentityIndex(o.ctx, tbl, act.ReplicaIdentityIndex, s.Pos())
+				if verr != nil {
+					return verr
+				}
+				chosenIdx = idx
+			}
+			// Update the per-index indisreplident flags — set on the chosen index,
+			// clear on all others — and re-sync the pg_index heap row of any index
+			// whose flag actually changed (mirrors relation_mark_replica_identity's
+			// dirty-only update).
+			for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+				want := idx == chosenIdx
+				if idx.IsReplicaIdentity != want {
+					idx.IsReplicaIdentity = want
+					if err := resyncIndexReplicaIdentHeap(o.ctx, idx); err != nil {
+						return err
+					}
+				}
 			}
 			if tbl.ReplicaIdentity != mode {
 				tbl.ReplicaIdentity = mode
@@ -10402,6 +10420,101 @@ func syncTableToCatalogHeap(ctx *Context, tbl *catalog.Table) error {
 		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
 	}
 
+	return nil
+}
+
+// resolveReplicaIdentityIndex locates the index named by `REPLICA IDENTITY
+// USING INDEX <idx>` on tbl and validates it is suitable, mirroring PG's
+// ATExecReplicaIdentity / check_replica_identity (tablecmds.c): the index must
+// exist on the table, be UNIQUE, IMMEDIATE (not DEFERRABLE INITIALLY DEFERRED),
+// non-expression, non-partial, and every key column must be NOT NULL. The
+// SQLSTATE codes and messages match PG 18.3. Returns the *catalog.Index pointer
+// from IndexesOnTable so the caller can compare it by identity against the same
+// list. DU-002 slice 306.
+func resolveReplicaIdentityIndex(ctx *Context, tbl *catalog.Table, indexName string, pos int) (*catalog.Index, *ExecError) {
+	var idx *catalog.Index
+	for _, candidate := range ctx.Catalog.IndexesOnTable(tbl) {
+		if strings.EqualFold(candidate.Name, indexName) {
+			idx = candidate
+			break
+		}
+	}
+	if idx == nil {
+		return nil, &ExecError{Code: "42704", Pos: pos,
+			Message: fmt.Sprintf("index %q for table %q does not exist", indexName, tbl.Name)}
+	}
+	if !idx.Unique {
+		return nil, &ExecError{Code: "42809", Pos: pos,
+			Message: fmt.Sprintf("cannot use non-unique index %q as replica identity", idx.Name)}
+	}
+	if idx.InitiallyDeferred {
+		return nil, &ExecError{Code: "0A000", Pos: pos,
+			Message: fmt.Sprintf("cannot use non-immediate index %q as replica identity", idx.Name)}
+	}
+	for _, col := range idx.Columns {
+		if col == "" { // expression key column (Columns[i]=="" => ColExprs[i] set)
+			return nil, &ExecError{Code: "0A000", Pos: pos,
+				Message: fmt.Sprintf("cannot use expression index %q as replica identity", idx.Name)}
+		}
+	}
+	if idx.HasPredicate {
+		return nil, &ExecError{Code: "0A000", Pos: pos,
+			Message: fmt.Sprintf("cannot use partial index %q as replica identity", idx.Name)}
+	}
+	// Every key column must be NOT NULL (a nullable identity column would make
+	// the row's identity ambiguous). INCLUDE columns are not key columns and
+	// are not checked.
+	for _, colName := range idx.Columns {
+		for ci := range tbl.Columns {
+			if tbl.Columns[ci].Name == colName {
+				if !tbl.Columns[ci].NotNull {
+					return nil, &ExecError{Code: "42809", Pos: pos,
+						Message: fmt.Sprintf("index %q cannot be used as replica identity because column %q is nullable", idx.Name, colName)}
+				}
+				break
+			}
+		}
+	}
+	return idx, nil
+}
+
+// resyncIndexReplicaIdentHeap rewrites idx's pg_index heap row so a flag the
+// in-memory catalog.Index now carries (currently indisreplident) is reflected
+// in the heap that pg_dump / a restarting backend reads. It stamps the existing
+// pg_index row (matching indexrelid == idx.OID) as deleted across the catalog
+// databases, then writes a fresh canonical row — the delete-old-rows + re-sync
+// pattern syncTableToCatalogHeap uses for pg_class. No-op when catalog heap sync
+// is unavailable (the live virtual pg_index already reflects the flag).
+// DU-002 slice 306.
+func resyncIndexReplicaIdentHeap(ctx *Context, idx *catalog.Index) error {
+	if !catalogHeapSyncAvailable(ctx) {
+		return nil
+	}
+	if err := ctx.MaterializeWriterXID(); err == nil {
+		xmax := ctx.Tx.XID
+		for _, dbOid := range catalogDBOids(ctx) {
+			indexRel := storage.RelFileNode{
+				DBOid:  dbOid,
+				RelOid: catalog.IndexRelationId,
+				Fork:   storage.MainFork,
+			}
+			stampCatalogRows(ctx, indexRel, xmax, func(data []byte) bool {
+				row, derr := catalog.DecodePGIndexPhysicalRow(data)
+				return derr == nil && row.IndexRelid == idx.OID
+			})
+		}
+	}
+	pgIndexRel := storage.RelFileNode{
+		DBOid:  catalog.DefaultDBOid,
+		RelOid: catalog.IndexRelationId,
+		Fork:   storage.MainFork,
+	}
+	if _, err := writeHeapRowCanonical(ctx, pgIndexRel, pgIndexColumnsPG18(), buildUserPGIndexRow(idx)); err != nil {
+		return fmt.Errorf("pg_index replica-identity resync: %w", err)
+	}
+	if err := mirrorTouchedCatalogsToPostgresDB(ctx); err != nil {
+		return fmt.Errorf("mirror catalogs to postgres db: %w", err)
+	}
 	return nil
 }
 

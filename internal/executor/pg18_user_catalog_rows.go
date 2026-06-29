@@ -927,7 +927,7 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 		NewBoolDatum(false),                       // indcheckxmin
 		NewBoolDatum(true),                        // indisready
 		NewBoolDatum(true),                        // indislive
-		NewBoolDatum(false),                       // indisreplident
+		NewBoolDatum(idx.IsReplicaIdentity),       // indisreplident (DU-002 slice 306)
 		NewBytesDatum(pgInt2VectorBytes(attnums)), // indkey
 		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indcollation
 		NewBytesDatum(pgOIDVectorBytes(zeros32)),  // indclass

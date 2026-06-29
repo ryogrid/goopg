@@ -2737,8 +2737,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// parser → catalog.Table.ReplicaIdentity → heap re-sync, so a non-default
 	// setting round-trips and a default table emits nothing. goopg has no
 	// logical replication; this is dump-fidelity only (like SET STORAGE). The
-	// USING INDEX form is parsed but deferred (needs pg_index.indisreplident
-	// wiring) — it raises 0A000, so it is not exercised here.
+	// USING INDEX form is covered by slice 306 below.
 	if err := runSQLSimple(t, c, "CREATE TABLE public.ri_full (id integer PRIMARY KEY, payload text)"); err != nil {
 		t.Fatalf("create table ri_full: %v", err)
 	}
@@ -2750,6 +2749,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	}
 	if err := runSQLSimple(t, c, "ALTER TABLE public.ri_nothing REPLICA IDENTITY NOTHING"); err != nil {
 		t.Fatalf("alter table ri_nothing replica identity nothing: %v", err)
+	}
+
+	// Slice 306: REPLICA IDENTITY USING INDEX must round-trip. Unlike the
+	// FULL/NOTHING forms (which pg_dump emits at TABLE-dump time when
+	// relreplident != 'd'), pg_dump emits the USING INDEX clause at INDEX-dump
+	// time, keyed on pg_index.indisreplident for the chosen index (pg_dump.c
+	// dumpIndex:18186) — `ALTER TABLE ONLY public.ri_index REPLICA IDENTITY
+	// USING INDEX ri_uidx;`. goopg previously rejected the USING INDEX form with
+	// 0A000; it now (a) validates the index per PG's check_replica_identity
+	// (unique, immediate, non-expression, non-partial, NOT NULL key columns),
+	// (b) sets the table's relreplident to 'i', and (c) marks the chosen index's
+	// indisreplident (clearing any prior one) in BOTH the virtual pg_index
+	// builder pg_dump reads and the pg_index heap row (restart durability). The
+	// referenced index must be on a NOT NULL column and UNIQUE.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ri_index (id integer NOT NULL, payload text)"); err != nil {
+		t.Fatalf("create table ri_index: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE UNIQUE INDEX ri_uidx ON public.ri_index (id)"); err != nil {
+		t.Fatalf("create unique index ri_uidx: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.ri_index REPLICA IDENTITY USING INDEX ri_uidx"); err != nil {
+		t.Fatalf("alter table ri_index replica identity using index: %v", err)
 	}
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
@@ -7112,6 +7133,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if strings.Contains(res.Stdout, neg) {
 				t.Errorf("pg_dump emitted a spurious REPLICA IDENTITY for a default-identity table: %q\n  full stdout=%q", neg, res.Stdout)
 			}
+		}
+		// **Slice 306 (asserted):** REPLICA IDENTITY USING INDEX round-trip.
+		// pg_dump emits this at index-dump time keyed on the index's
+		// pg_index.indisreplident — the index name is unqualified in this
+		// syntax (pg_dump.c dumpIndex:18186). The clause must name ri_uidx.
+		if !strings.Contains(res.Stdout, "ALTER TABLE ONLY public.ri_index REPLICA IDENTITY USING INDEX ri_uidx;") {
+			t.Errorf("pg_dump dropped the REPLICA IDENTITY USING INDEX clause; missing the ri_index/ri_uidx line\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 119 (asserted):** descending sequences must round-trip through
 		// pg_dump's descending-direction default suppression. A plain
