@@ -5657,6 +5657,39 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 			ReplicaIdentityIndex: index,
 		}, nil
 	}
+	// CLUSTER ON index_name — mark the named index as the table's clustering
+	// index (pg_index.indisclustered). This is the exact form pg_dump EMITS for
+	// a clustered table, so goopg must accept it to restore its own dumps. The
+	// `CLUSTER <t> USING <idx>` statement records the same selection (slice 320).
+	// DU-002 slice 321.
+	if p.acceptKeyword(KwCluster) {
+		pos := p.cur().Pos
+		if !p.acceptKeyword(KwOn) {
+			return AlterTableAction{}, p.errAtCur("expected ON after CLUSTER")
+		}
+		idxTok, err := p.parseIdent()
+		if err != nil {
+			return AlterTableAction{}, err
+		}
+		return AlterTableAction{
+			pos:              pos,
+			Kind:             AlterTableClusterOn,
+			ClusterIndexName: identText(idxTok),
+		}, nil
+	}
+	// SET WITHOUT CLUSTER — clear the table's clustering selection (every index's
+	// pg_index.indisclustered → false). Distinct from `SET (reloptions)` below,
+	// which is the parenthesized form. DU-002 slice 321.
+	if cur := p.cur(); (cur.Kind == TokenKeyword && cur.Keyword == KwSet) &&
+		p.peek(1).Kind == TokenIdent && strings.EqualFold(p.peek(1).Value, "without") {
+		pos := cur.Pos
+		p.advance() // SET
+		p.advance() // WITHOUT
+		if !p.acceptKeyword(KwCluster) {
+			return AlterTableAction{}, p.errAtCur("expected CLUSTER after SET WITHOUT")
+		}
+		return AlterTableAction{pos: pos, Kind: AlterTableSetWithoutCluster}, nil
+	}
 	// DROP COLUMN name / DROP CONSTRAINT name in the multi-action loop.
 	// Both forms share this path so comma-separated "DROP COLUMN a, DROP COLUMN b"
 	// work correctly. M0097-0028.

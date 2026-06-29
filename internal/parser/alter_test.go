@@ -233,6 +233,52 @@ func TestParseAlterTableSetCompression(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableClusterOn covers `ALTER TABLE t CLUSTER ON idx` and
+// `ALTER TABLE t SET WITHOUT CLUSTER` (DU-002 slice 321). The CLUSTER ON form is
+// exactly what pg_dump emits for a clustered table, so goopg must accept it to
+// restore its own dumps; SET WITHOUT CLUSTER clears the selection.
+func TestParseAlterTableClusterOn(t *testing.T) {
+	// CLUSTER ON idx — index name captured.
+	stmts, err := Parse("ALTER TABLE t CLUSTER ON t_b_idx")
+	if err != nil {
+		t.Fatalf("Parse CLUSTER ON: %v", err)
+	}
+	at, ok := stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableClusterOn {
+		t.Fatalf("CLUSTER ON: actions=%+v", at.Actions)
+	}
+	if at.Actions[0].ClusterIndexName != "t_b_idx" {
+		t.Errorf("CLUSTER ON: ClusterIndexName=%q want %q", at.Actions[0].ClusterIndexName, "t_b_idx")
+	}
+
+	// SET WITHOUT CLUSTER — no index, distinct kind.
+	stmts, err = Parse("ALTER TABLE t SET WITHOUT CLUSTER")
+	if err != nil {
+		t.Fatalf("Parse SET WITHOUT CLUSTER: %v", err)
+	}
+	at, ok = stmts[0].(*AlterTableStmt)
+	if !ok {
+		t.Fatalf("got %T", stmts[0])
+	}
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetWithoutCluster {
+		t.Fatalf("SET WITHOUT CLUSTER: actions=%+v", at.Actions)
+	}
+
+	// SET (reloptions) must still parse as a reloptions action, not be shadowed
+	// by the SET WITHOUT CLUSTER branch.
+	stmts, err = Parse("ALTER TABLE t SET (fillfactor = 70)")
+	if err != nil {
+		t.Fatalf("Parse SET (reloptions): %v", err)
+	}
+	at, _ = stmts[0].(*AlterTableStmt)
+	if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableSetReloptions {
+		t.Fatalf("SET (reloptions): actions=%+v", at.Actions)
+	}
+}
+
 // TestParseAlterTableSetDropDefault covers `ALTER TABLE ... ALTER COLUMN c SET
 // DEFAULT <expr>` and `... DROP DEFAULT` (DU-002 slice 269). SET DEFAULT records
 // the parsed expression on DefaultExpr; DROP DEFAULT records the column with a

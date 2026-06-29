@@ -472,6 +472,78 @@ func newDDLFixture(t *testing.T) (*Context, catalog.Catalog, func()) {
 	return ctx, cat, cleanup
 }
 
+// TestDDLAlterTableClusterOnRoundTrip pins the restore side of the clustered-
+// index round-trip (DU-002 slice 321): pg_dump emits `ALTER TABLE <t> CLUSTER ON
+// <idx>` for a clustered table, so goopg must accept that exact clause to restore
+// its own dumps. The statement marks the named index's catalog.Index.IsClustered
+// (pg_index.indisclustered) and clears the flag on every other index of the
+// table, mirroring mark_index_clustered (cluster.c) — the same effect as
+// `CLUSTER <t> USING <idx>` (slice 320). `SET WITHOUT CLUSTER` then clears the
+// selection on every index.
+func TestDDLAlterTableClusterOnRoundTrip(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int PRIMARY KEY, b int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE INDEX t_b_idx ON t (b)"); err != nil {
+		t.Fatalf("CREATE INDEX: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table t not in catalog")
+	}
+
+	clusteredName := func() string {
+		for _, idx := range cat.IndexesOnTable(tbl) {
+			if idx.IsClustered {
+				return idx.Name
+			}
+		}
+		return ""
+	}
+
+	// Initially no index is clustered.
+	if got := clusteredName(); got != "" {
+		t.Fatalf("before CLUSTER ON: clustered index = %q, want none", got)
+	}
+
+	// ALTER TABLE t CLUSTER ON t_b_idx — the dump-emitted restore form.
+	if err := runDDL(t, ctx, "ALTER TABLE t CLUSTER ON t_b_idx"); err != nil {
+		t.Fatalf("ALTER TABLE CLUSTER ON: %v", err)
+	}
+	if got := clusteredName(); got != "t_b_idx" {
+		t.Errorf("after CLUSTER ON t_b_idx: clustered index = %q, want t_b_idx", got)
+	}
+
+	// Re-pointing to the PK index must clear the flag on t_b_idx (exactly one
+	// index is ever clustered, mark_index_clustered).
+	if err := runDDL(t, ctx, "ALTER TABLE t CLUSTER ON t_pkey"); err != nil {
+		t.Fatalf("ALTER TABLE CLUSTER ON t_pkey: %v", err)
+	}
+	if got := clusteredName(); got != "t_pkey" {
+		t.Errorf("after CLUSTER ON t_pkey: clustered index = %q, want t_pkey", got)
+	}
+
+	// CLUSTER ON an unknown index → 42704.
+	err := runDDL(t, ctx, "ALTER TABLE t CLUSTER ON nope")
+	if err == nil {
+		t.Fatal("CLUSTER ON nope: expected error, got nil")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("CLUSTER ON nope: err = %v, want SQLSTATE 42704", err)
+	}
+
+	// SET WITHOUT CLUSTER clears the selection entirely.
+	if err := runDDL(t, ctx, "ALTER TABLE t SET WITHOUT CLUSTER"); err != nil {
+		t.Fatalf("ALTER TABLE SET WITHOUT CLUSTER: %v", err)
+	}
+	if got := clusteredName(); got != "" {
+		t.Errorf("after SET WITHOUT CLUSTER: clustered index = %q, want none", got)
+	}
+}
+
 // TestDDLCreatePublicationEndToEnd pins the M0008 / 0008-0003 SQL
 // surface: `CREATE PUBLICATION p FOR TABLE t` parses, plans,
 // and executes against a Context whose PubSub registry is wired,

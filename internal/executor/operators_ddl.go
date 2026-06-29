@@ -6633,6 +6633,22 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+		case parser.AlterTableClusterOn:
+			// CLUSTER ON index_name — mark the named index as the table's
+			// clustering index (pg_index.indisclustered), clearing the flag on
+			// every other index. This is the exact clause pg_dump EMITS for a
+			// clustered table, so accepting it lets goopg restore its own dumps.
+			// Shares markTableClusterIndex with `CLUSTER <t> USING <idx>` (slice
+			// 320). Dump-fidelity only — no physical heap reorder. DU-002 slice 321.
+			if err := markTableClusterIndex(o.ctx, tbl, act.ClusterIndexName, s.Pos()); err != nil {
+				return err
+			}
+		case parser.AlterTableSetWithoutCluster:
+			// SET WITHOUT CLUSTER — clear the table's clustering selection on
+			// every index (pg_index.indisclustered → false). DU-002 slice 321.
+			if err := clearTableClusterIndex(o.ctx, tbl); err != nil {
+				return err
+			}
 		case parser.AlterTableSetReloptions:
 			// SET (param = value, …) — merge table-level storage parameters into the
 			// relation's reloptions. pg_class.reloptions is rendered from the live

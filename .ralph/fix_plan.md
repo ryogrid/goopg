@@ -2395,9 +2395,22 @@ documentation-only and is exempt from the design-doc requirement.)
       false → zero blast radius. Slice 320 in `TestPort_PgDumpConnectionSetup`
       (plain index = dumpIndex path; PK index = dumpConstraint path) PASS vs real
       pg_dump 18.3. Design `0119-0004-cluster-roundtrip.md`.
+      **Slice 321 (loop #43):** `ALTER TABLE … CLUSTER ON <idx>` / `SET WITHOUT
+      CLUSTER` restore form — slice 320 made the clustered index round-trip *out*
+      (pg_dump emits `ALTER TABLE <t> CLUSTER ON <idx>;`) but goopg could not
+      parse/execute that emitted clause, so it produced a dump it could not
+      restore into itself. New parser `AlterTableClusterOn` (`CLUSTER ON ident`)
+      + `AlterTableSetWithoutCluster` (`SET WITHOUT CLUSTER`, gated so it doesn't
+      shadow `SET (reloptions)`); executor shares `markTableClusterIndex` /
+      `clearTableClusterIndex` helpers (extracted from `clusterOp`) between the
+      `CLUSTER … USING` statement and the ALTER actions. Dump-fidelity only — sets
+      the same `IsClustered`/`indisclustered` state as 320, so output is
+      unchanged; only widens the accepted SQL surface. CLUSTER round-trip now
+      closed. Tests `TestParseAlterTableClusterOn` +
+      `TestDDLAlterTableClusterOnRoundTrip` + slice-320 `TestPort_PgDumpConnectionSetup`
+      PASS. Design `0119-0004-cluster-on-restore.md`.
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery (further slices: GRANT/ACL relacl, CREATE RULE, CREATE POLICY/RLS;
-      richer CLUSTER/ALTER TABLE CLUSTER ON/SET WITHOUT CLUSTER parse+restore);
+      battery (further slices: GRANT/ACL relacl, CREATE RULE, CREATE POLICY/RLS);
       extended-protocol commit-time deferral (architecturally entangled —
       extended protocol is auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110

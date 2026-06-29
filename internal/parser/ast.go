@@ -2025,6 +2025,19 @@ const (
 	// ReplicaIdentityIndex holds the index name for the USING INDEX form.
 	// DU-002 slice 305.
 	AlterTableReplicaIdentity
+	// AlterTableClusterOn — `CLUSTER ON index_name`. Marks the named index as
+	// the table's clustering index (pg_index.indisclustered), clearing the flag
+	// on every other index (mark_index_clustered, cluster.c). This is the exact
+	// form pg_dump EMITS for a clustered table (`ALTER TABLE <t> CLUSTER ON
+	// <idx>`, pg_dump.c dumpIndex/dumpConstraint), so goopg must accept it to
+	// restore its own dumps. The plain `CLUSTER <t> USING <idx>` statement form
+	// (ClusterStmt) records the same selection. ClusterIndexName holds the index
+	// name. DU-002 slice 321.
+	AlterTableClusterOn
+	// AlterTableSetWithoutCluster — `SET WITHOUT CLUSTER`. Clears the table's
+	// clustering selection: every index's pg_index.indisclustered is reset to
+	// false (tablecmds.c ATExecSetWithoutCluster). DU-002 slice 321.
+	AlterTableSetWithoutCluster
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -2091,6 +2104,9 @@ type AlterTableAction struct {
 	// DU-002 slice 305.
 	ReplicaIdentityMode  string
 	ReplicaIdentityIndex string
+	// ClusterIndexName is the index named in `CLUSTER ON index_name` for
+	// AlterTableClusterOn. DU-002 slice 321.
+	ClusterIndexName string
 	// DefaultExpr is the parsed DEFAULT expression for AlterTableSetDefault
 	// (`ALTER COLUMN name SET DEFAULT expr`). Nil for AlterTableDropDefault.
 	// DU-002 slice 269.
