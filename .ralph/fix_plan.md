@@ -2788,6 +2788,33 @@ documentation-only and is exempt from the design-doc requirement.)
       PASS; build clean. Still open under M0119-0004: column-level (`attacl`,
       heap re-sync) / database (`datacl`, `--create`-only) GRANT projection;
       extended-protocol commit-time deferral.
+
+      **2026-06-30 (loop #70, design 0119-0004-function-grant-proacl-pgdump, DU-002
+      slice 345):** function-level GRANT round-trip — the routine analogue of the
+      table/schema/sequence GRANT slices (331–344). goopg projected
+      `pg_proc.proacl = NULL` for every routine, silently dropping function GRANTs
+      from the dump. A function's `acldefault('f', 10)` =
+      `{=X/postgres,postgres=X/postgres}` grants EXECUTE to BOTH owner and PUBLIC,
+      so `GRANT EXECUTE ON FUNCTION public.grantfn(integer) TO func_grantee`
+      materializes `proacl = {=X/postgres,postgres=X/postgres,func_grantee=X/postgres}`;
+      pg_dump's getFuncs diffs against `acldefault('f', proowner)` and emits
+      `GRANT ALL ON FUNCTION public.grantfn(integer) TO func_grantee;` (EXECUTE is the
+      sole function priv → renders ALL). `pg_proc` is VIRTUAL (unlike heap-backed
+      pg_attribute), so this is a pure projection — no heap re-sync. Three pieces:
+      catalog `functionACLPrivOrder`(EXECUTE→X)+`ownerFunctionACLString="X"`+
+      `ProcACLText(procOID)` reusing the object-type-agnostic `relaclTextLockedFor`
+      core (routines share the OID-keyed `tableACLs` store; routine OIDs from a
+      disjoint `FirstRoutineOID=1<<17` range); server `recordFunctionGrant`
+      (`tryRecordTableGrant` function/procedure/routine branches) resolving the OID
+      via `Routines().Lookup`+unique-by-name fallback, paren-aware `splitFunctionList`,
+      seeding the implicit PUBLIC EXECUTE; `pg_proc_view.go` projects
+      `cat.ProcACLText(r.OID)` for user routines. Scope: GRANT only — function REVOKE
+      and WITH GRANT OPTION not modelled. Tests `TestProcACLText` (new) + slice-345
+      `TestPort_PgDumpConnectionSetup` (exact GRANT ALL ON FUNCTION line; byte-identical
+      vs real pg_dump 18.3) PASS; catalog+server+initdb suites PASS; build clean. Still
+      open under M0119-0004: column-level (`attacl`, heap re-sync) / database (`datacl`,
+      `--create`-only) GRANT projection; function/object REVOKE; extended-protocol
+      commit-time deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

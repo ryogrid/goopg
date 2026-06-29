@@ -3431,6 +3431,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant select on ownerzero_t to bob: %v", err)
 	}
 
+	// Slice 345: a function-level GRANT must round-trip through pg_dump from
+	// pg_proc.proacl, the routine analogue of the table relacl slices (331+).
+	// PostgreSQL's acldefault for a function grants EXECUTE to BOTH the owner and
+	// PUBLIC, so `GRANT EXECUTE ON FUNCTION public.grantfn(integer) TO func_grantee`
+	// materializes proacl as "{=X/postgres,postgres=X/postgres,func_grantee=X/postgres}".
+	// pg_dump's getFuncs reads proacl, diffs it against acldefault('f', 10), and
+	// buildACLCommands emits `GRANT ALL ON FUNCTION public.grantfn(integer) TO
+	// func_grantee;` (EXECUTE is the sole function privilege, so the grantee's
+	// full set renders as ALL). Before this slice goopg left proacl NULL for every
+	// routine, so the function GRANT was silently dropped from the dump.
+	if err := runSQLSimple(t, c, "CREATE ROLE func_grantee NOLOGIN"); err != nil {
+		t.Fatalf("create role func_grantee: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.grantfn(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function grantfn: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT EXECUTE ON FUNCTION public.grantfn(integer) TO func_grantee"); err != nil {
+		t.Fatalf("grant execute on grantfn to func_grantee: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7401,6 +7421,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// zero after REVOKE ALL; only bob has SELECT).
 		if strings.Contains(res.Stdout, "ownerzero_t TO postgres") {
 			t.Errorf("pg_dump re-granted privileges to the zeroed owner of ownerzero_t\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 345 (asserted):** a function-level GRANT round-trips from
+		// pg_proc.proacl (the routine analogue of slice 331's table relacl).
+		// `GRANT EXECUTE ON FUNCTION public.grantfn(integer) TO func_grantee`
+		// materializes proacl as "{=X/postgres,postgres=X/postgres,func_grantee=X/postgres}";
+		// pg_dump's getFuncs diffs it against acldefault('f', 10) and emits a single
+		// `GRANT ALL ON FUNCTION public.grantfn(integer) TO func_grantee;` (EXECUTE
+		// is the only function privilege, so the grantee's full set renders ALL).
+		// Verified byte-identical to real pg_dump 18.3. Before this slice goopg left
+		// every routine's proacl NULL, so the function GRANT was dropped.
+		if want := "GRANT ALL ON FUNCTION public.grantfn(integer) TO func_grantee;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the function GRANT: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

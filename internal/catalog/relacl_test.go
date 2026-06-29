@@ -589,3 +589,38 @@ func TestACLQuoteName(t *testing.T) {
 		}
 	}
 }
+
+// TestProcACLText pins the pg_proc.proacl projection that lets a function-level
+// GRANT round-trip through pg_dump (DU-002 slice 345). A function's acldefault
+// is "{=X/postgres,postgres=X/postgres}" — owner AND PUBLIC both hold EXECUTE —
+// so the recorder seeds the PUBLIC entry explicitly and the owner entry is
+// supplied by ownerFunctionACLString. pg_dump diffs the materialized proacl
+// against acldefault('f', 10) and re-emits the GRANT for the new grantee only.
+func TestProcACLText(t *testing.T) {
+	c := NewInMemory()
+	const procOID = 131072 // FirstRoutineOID
+
+	// No grants → NULL proacl (matches acldefault, so pg_dump emits no GRANT).
+	if got := c.ProcACLText(procOID); got != "" {
+		t.Fatalf("proacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// GRANT EXECUTE … TO a grantee seeds the implicit PUBLIC default plus the
+	// grantee; the owner entry is rendered from the owner-default string. The
+	// rendered order is owner first, then grantees sorted (grantee_fn before
+	// the empty PUBLIC grantee). pg_dump parses the array as a set, so this is
+	// equivalent to PostgreSQL's "{=X/postgres,postgres=X/postgres,grantee_fn=X/postgres}".
+	c.GrantTablePrivilege(procOID, "PUBLIC", "EXECUTE")
+	c.GrantTablePrivilege(procOID, "grantee_fn", "EXECUTE")
+	want := "{postgres=X/postgres,grantee_fn=X/postgres,=X/postgres}"
+	if got := c.ProcACLText(procOID); got != want {
+		t.Fatalf("proacl after GRANT EXECUTE TO grantee_fn = %q; want %q", got, want)
+	}
+
+	// A non-EXECUTE keyword is not a function privilege and renders nothing for
+	// that grantee (relaclTextLockedFor skips letters outside functionACLPrivOrder).
+	c.GrantTablePrivilege(procOID, "noise_role", "SELECT")
+	if got := c.ProcACLText(procOID); got != want {
+		t.Fatalf("proacl must ignore a non-function privilege: got %q; want %q", got, want)
+	}
+}

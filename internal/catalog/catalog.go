@@ -8603,6 +8603,24 @@ var schemaACLPrivOrder = []aclPrivLetter{
 // DU-002 slice 335.
 const ownerSchemaACLString = "UC"
 
+// functionACLPrivOrder lists the function (pg_proc) privileges in PostgreSQL's
+// canonical aclitemout order. A function has a single privilege, EXECUTE('X').
+// pg_dump's getFuncs diffs a routine's proacl against acldefault('f', proowner)
+// client-side in buildACLCommands and re-emits `GRANT … ON FUNCTION …`, so
+// projecting the privilege set in this order matches the aclitem[] text PG
+// stores in pg_proc.proacl. DU-002 slice 345.
+var functionACLPrivOrder = []aclPrivLetter{
+	{"EXECUTE", 'X'},
+}
+
+// ownerFunctionACLString is the privilege-letter string for the owner's full
+// set of function privileges, i.e. "X". The owner half of acldefault('f',
+// owner) is "postgres=X/postgres"; the other half is the implicit PUBLIC
+// EXECUTE grant ("=X/postgres"), which the function GRANT recorder seeds
+// explicitly so a materialized proacl reproduces both default entries. DU-002
+// slice 345.
+const ownerFunctionACLString = "X"
+
 // relaclTextLocked renders the materialized pg_class.relacl text — an aclitem[]
 // array literal such as `{postgres=arwdDxtm/postgres,grantee_role=r/postgres}` —
 // for relOID from the in-memory GRANT store, or "" (SQL NULL) when no
@@ -8642,6 +8660,23 @@ func (c *InMemory) NamespaceACLText(schemaOID uint32) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.relaclTextLockedFor(schemaOID, schemaACLPrivOrder, ownerSchemaACLString)
+}
+
+// ProcACLText renders the materialized pg_proc.proacl text for the routine
+// identified by procOID, or "" (SQL NULL) when no privileges have been granted
+// away. Routines share the OID-keyed ACL store with relations and schemas
+// (goopg mints routine OIDs from a disjoint range, so there is no collision).
+// A function's acldefault is "{=X/postgres,postgres=X/postgres}" — owner AND
+// PUBLIC both hold EXECUTE — so the function GRANT recorder seeds the PUBLIC
+// entry explicitly and the owner entry is supplied here by ownerFunctionACLString
+// (the owner branch of relaclTextLockedFor). pg_dump's getFuncs diffs proacl
+// against acldefault('f', proowner) client-side in buildACLCommands, so
+// projecting the correct aclitem[] text is sufficient for the
+// `GRANT … ON FUNCTION …` round-trip. DU-002 slice 345.
+func (c *InMemory) ProcACLText(procOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedFor(procOID, functionACLPrivOrder, ownerFunctionACLString)
 }
 
 // relaclTextLockedFor is the object-type-agnostic core of relaclTextLocked: it

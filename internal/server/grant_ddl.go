@@ -21,6 +21,7 @@ package server
 import (
 	"strings"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/parser"
 )
 
@@ -49,6 +50,11 @@ var allSequencePrivileges = []string{"USAGE", "SELECT", "UPDATE"}
 // allSchemaPrivileges is the expansion of GRANT ALL [PRIVILEGES] ON a schema
 // (USAGE/CREATE — pg_dump renders these as "UC"). DU-002 slice 335.
 var allSchemaPrivileges = []string{"USAGE", "CREATE"}
+
+// allFunctionPrivileges is the expansion of GRANT ALL [PRIVILEGES] ON a
+// function/procedure/routine. EXECUTE is the only function privilege, which
+// pg_dump renders as the aclitem letter "X". DU-002 slice 345.
+var allFunctionPrivileges = []string{"EXECUTE"}
 
 // aclOwnerRole is the object owner in goopg's single bootstrap-superuser model.
 // A REVOKE whose grantee is the owner is an owner-side revoke-of-default, which
@@ -112,8 +118,22 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 		// OID so pg_dump's getNamespaces/dumpACL re-emits the GRANT from nspacl.
 		s.recordSchemaGrant(rest, rolePart, privPart, withGrantOption)
 		return
+	} else if rest, ok := cutLeadingKeyword(objPart, "function"); ok {
+		// GRANT EXECUTE ON FUNCTION <signature> TO <roles>. Functions live in
+		// pg_proc and share the OID-keyed ACL store; record under each routine's
+		// OID so pg_dump's getFuncs/dumpACL re-emits the GRANT from proacl.
+		s.recordFunctionGrant(rest, rolePart, privPart)
+		return
+	} else if rest, ok := cutLeadingKeyword(objPart, "procedure"); ok {
+		// GRANT EXECUTE ON PROCEDURE … shares the routine ACL path with FUNCTION.
+		s.recordFunctionGrant(rest, rolePart, privPart)
+		return
+	} else if rest, ok := cutLeadingKeyword(objPart, "routine"); ok {
+		// GRANT EXECUTE ON ROUTINE … shares the routine ACL path with FUNCTION.
+		s.recordFunctionGrant(rest, rolePart, privPart)
+		return
 	}
-	// Bail on non-table object classes (ON DATABASE …, ON FUNCTION …, etc.).
+	// Bail on non-table object classes (ON DATABASE …, etc.).
 	if _, isNonTable := nonTableGrantObjects[firstWordLower(objPart)]; isNonTable {
 		return
 	}
@@ -294,6 +314,87 @@ func (s *Server) recordSchemaRevoke(objPart, rolePart, privPart string) {
 	}
 }
 
+// recordFunctionGrant records a `GRANT EXECUTE ON FUNCTION <signature> TO
+// <roles>` in the catalog ACL store, keyed by each routine's pg_proc OID.
+// PostgreSQL's acldefault for a function grants EXECUTE to BOTH the owner and
+// PUBLIC, so the first grant materializes proacl as
+// "{=X/postgres,postgres=X/postgres,<grantee>=X/postgres}". goopg seeds the
+// implicit PUBLIC EXECUTE entry explicitly (the owner entry is supplied by the
+// relacl renderer's owner branch via ownerFunctionACLString), so the projected
+// proacl reproduces both default entries plus the grantee and pg_dump's
+// getFuncs/buildACLCommands diffs it against acldefault('f', 10) to re-emit
+// exactly the new grant. Unknown routines, a non-EXECUTE privilege list, or an
+// empty role list are skipped, leaving the statement a successful no-op. WITH
+// GRANT OPTION is not modelled for functions (the common case is a plain
+// EXECUTE grant). DU-002 slice 345.
+func (s *Server) recordFunctionGrant(objPart, rolePart, privPart string) {
+	privs := parseGrantPrivileges(privPart, allFunctionPrivileges)
+	hasExecute := false
+	for _, p := range privs {
+		if p == "EXECUTE" {
+			hasExecute = true
+			break
+		}
+	}
+	if !hasExecute {
+		return
+	}
+	roles := splitGrantList(rolePart)
+	if len(roles) == 0 {
+		return
+	}
+	for _, sig := range splitFunctionList(objPart) {
+		oid := s.lookupFunctionOID(sig)
+		if oid == 0 {
+			continue
+		}
+		// Seed the implicit PUBLIC EXECUTE that acldefault('f', …) carries so the
+		// materialized proacl matches PostgreSQL's array (the catalog lower-cases
+		// "PUBLIC" to the reserved pseudo-role and renders it as the empty grantee).
+		s.cfg.Catalog.GrantTablePrivilege(oid, "PUBLIC", "EXECUTE")
+		for _, role := range roles {
+			s.cfg.Catalog.GrantTablePrivilege(oid, role, "EXECUTE")
+		}
+	}
+}
+
+// lookupFunctionOID resolves a routine signature token such as
+// "public.grantfn(integer)" to its pg_proc OID, returning 0 when it does not
+// resolve. It first tries an exact name+argument-type match (mirroring
+// COMMENT ON / DROP FUNCTION resolution); when the parenthesised arg-type
+// spelling differs from the stored canonical name it falls back to a unique
+// by-name match. DU-002 slice 345.
+func (s *Server) lookupFunctionOID(sig string) uint32 {
+	rs := s.cfg.Catalog.Routines()
+	if rs == nil {
+		return 0
+	}
+	name := strings.TrimSpace(sig)
+	var argTypes []catalog.Type
+	if lp := strings.IndexByte(name, '('); lp >= 0 {
+		argList := name[lp+1:]
+		name = strings.TrimSpace(name[:lp])
+		if rp := strings.LastIndexByte(argList, ')'); rp >= 0 {
+			argList = argList[:rp]
+		}
+		for _, a := range strings.Split(argList, ",") {
+			a = strings.TrimSpace(a)
+			if a == "" {
+				continue
+			}
+			argTypes = append(argTypes, catalog.Type{Name: strings.ToLower(a)})
+		}
+	}
+	on := objectNameFromIdent(name)
+	if r, ok := rs.Lookup(on, argTypes); ok && r != nil {
+		return r.OID
+	}
+	if cands := rs.LookupByName(on); len(cands) == 1 {
+		return cands[0].OID
+	}
+	return 0
+}
+
 // parseGrantPrivileges splits a comma-separated privilege list into upper-cased
 // keywords, expanding ALL [PRIVILEGES] to allPrivs (the full privilege set for
 // the object class being granted — table or sequence).
@@ -322,6 +423,38 @@ func splitGrantList(list string) []string {
 		if v != "" {
 			out = append(out, v)
 		}
+	}
+	return out
+}
+
+// splitFunctionList splits a comma-separated list of routine signatures while
+// respecting parentheses, so a multi-argument signature such as
+// `f(integer, text)` is kept intact instead of being torn at the inner comma.
+// Each element is trimmed of surrounding whitespace; empty elements are dropped.
+// DU-002 slice 345.
+func splitFunctionList(list string) []string {
+	out := make([]string, 0, 2)
+	depth := 0
+	start := 0
+	for i := 0; i < len(list); i++ {
+		switch list[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				if v := strings.TrimSpace(list[start:i]); v != "" {
+					out = append(out, v)
+				}
+				start = i + 1
+			}
+		}
+	}
+	if v := strings.TrimSpace(list[start:]); v != "" {
+		out = append(out, v)
 	}
 	return out
 }

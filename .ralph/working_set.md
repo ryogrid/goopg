@@ -1,23 +1,27 @@
 (idle — nothing in flight)
 
-Last landed: M0119-0004 DU-002 **slice 344** (owner-zero coexisting with a
-grantee — `{grantee=…/postgres}` round-trip in pg_dump). The follow-up the
-empty-array slices 341/342/343 deferred. After `REVOKE ALL ON TABLE ownerzero_t
-FROM postgres` empties relacl to `{}`, a later `GRANT SELECT … TO bob`
-re-materializes the array but PG keeps the owner at zero (absent):
-`relacl = {bob=r/postgres}`. pg_dump emits BOTH the owner `REVOKE ALL` and the
-grantee `GRANT`. Fix (catalog-only, internal/catalog/catalog.go):
-`relACLEmptied` re-interpreted as "owner explicitly zero (absent)";
-`GrantTablePrivilegeWithGrantOption` clears the flag only for an owner-side
-GRANT; `relaclTextLockedFor` suppresses the leading owner entry when the flag is
-set. Object-type-agnostic (OID-keyed). Tests:
-TestRevokeAllFromOwnerThenGrantGrantee (catalog/relacl_test.go) + slice-344
-fixture/assert in TestPort_PgDumpConnectionSetup. Gates: catalog+server suites +
-TestPort_PgDumpConnectionSetup PASS; build clean. Committed + pushed.
+Last landed: M0119-0004 DU-002 **slice 345** (function-level GRANT
+`pg_proc.proacl` round-trip in pg_dump). The routine analogue of the
+table/schema/sequence GRANT slices. `GRANT EXECUTE ON FUNCTION
+public.grantfn(integer) TO func_grantee` now materializes proacl =
+`{=X/postgres,postgres=X/postgres,func_grantee=X/postgres}` and pg_dump emits
+`GRANT ALL ON FUNCTION public.grantfn(integer) TO func_grantee;`. pg_proc is
+VIRTUAL → pure projection, no heap re-sync. Fix: catalog `functionACLPrivOrder`
++ `ProcACLText` (reuses `relaclTextLockedFor`); server `recordFunctionGrant`
+(function/procedure/routine branches in `tryRecordTableGrant`, seeds implicit
+PUBLIC EXECUTE, paren-aware `splitFunctionList`); `pg_proc_view.go` projects
+`cat.ProcACLText(r.OID)`. Tests: TestProcACLText (catalog/relacl_test.go) +
+slice-345 fixture/assert in TestPort_PgDumpConnectionSetup. Gates:
+catalog+server+initdb suites + TestPort_PgDumpConnectionSetup PASS; build clean;
+verified vs real PG 18.3 (postgres/local_install). Committed + pushed.
 
-NEXT M0119-0004 GRANT/ACL slices (the REVOKE-ALL-empty-array + owner-zero family
-is now complete; remaining are deeper):
-- column-level GRANT (`pg_attribute.attacl`, heap re-sync — the entangled one).
-- database GRANT (`datacl`, only dumped under `--create`).
+NEXT M0119-0004 GRANT/ACL slices (remaining are deeper):
+- function/object REVOKE (e.g. `REVOKE EXECUTE … FROM PUBLIC`) — the no-op path
+  still swallows it; mirror the table REVOKE recorder for pg_proc proacl.
+- column-level GRANT (`pg_attribute.attacl`, heap re-sync — the entangled one:
+  pg_attribute is HEAP-backed, needs delete-old-rows + syncTableToCatalogHeap,
+  which the server GRANT short-circuit cannot reach without executor routing).
+- database GRANT (`datacl`, only dumped under `--create`; the test harness runs
+  pg_dump with `--no-sync` only, so untestable there as-is).
 - Extended-protocol commit-time deferral stays architecturally entangled (see
   [[goopg_extended_protocol_autocommit]]).

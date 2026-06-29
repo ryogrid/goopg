@@ -385,7 +385,7 @@ func registerPgProcView(cat *catalog.InMemory) error {
 				typeNameToOIDStr(r.ReturnType.Name),
 				strings.Join(argOIDs, " "),
 				fmt.Sprintf("%d", len(r.ArgTypes)), // pronargs
-				"",                                 // proacl: NULL (default privileges)
+				cat.ProcACLText(r.OID),             // proacl: materialized from the GRANT store (NULL until first GRANT). DU-002 slice 345.
 				"10",                               // proowner: bootstrap superuser
 				r.Body,
 				volatile,
