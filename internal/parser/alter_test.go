@@ -480,6 +480,48 @@ func TestParseAlterTableSetStatistics(t *testing.T) {
 	}
 }
 
+
+// TestParseAlterStatisticsSetStatistics pins parsing of
+// `ALTER STATISTICS name SET STATISTICS n` into an AlterStatisticsStmt carrying
+// the target (DU-002 slice 317). -1 resets to the default.
+func TestParseAlterStatisticsSetStatistics(t *testing.T) {
+	for _, tc := range []struct {
+		sql        string
+		wantName   string
+		wantSchema string
+		wantTarget int
+		wantHas    bool
+	}{
+		{"ALTER STATISTICS s SET STATISTICS 100", "s", "", 100, true},
+		{"ALTER STATISTICS s SET STATISTICS 0", "s", "", 0, true},
+		{"ALTER STATISTICS s SET STATISTICS -1", "s", "", -1, true}, // reset
+		{"ALTER STATISTICS public.s SET STATISTICS 250", "s", "public", 250, true},
+		{"ALTER STATISTICS IF EXISTS s SET STATISTICS 5", "s", "", 5, true},
+		{"ALTER STATISTICS s RENAME TO s2", "s", "", 0, false}, // no-op form
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		as, ok := stmts[0].(*AlterStatisticsStmt)
+		if !ok {
+			t.Fatalf("Parse(%q): got %T", tc.sql, stmts[0])
+		}
+		if as.Name.Name != tc.wantName {
+			t.Errorf("Parse(%q): Name=%q want %q", tc.sql, as.Name.Name, tc.wantName)
+		}
+		if as.Name.Schema != tc.wantSchema {
+			t.Errorf("Parse(%q): Schema=%q want %q", tc.sql, as.Name.Schema, tc.wantSchema)
+		}
+		if as.HasTarget != tc.wantHas {
+			t.Errorf("Parse(%q): HasTarget=%v want %v", tc.sql, as.HasTarget, tc.wantHas)
+		}
+		if tc.wantHas && as.Target != tc.wantTarget {
+			t.Errorf("Parse(%q): Target=%d want %d", tc.sql, as.Target, tc.wantTarget)
+		}
+	}
+}
+
 // TestParseAlterTableSetColumnOptions verifies the per-column attribute-option
 // list (`ALTER COLUMN c SET (opt=value, …)`) is captured and normalized to PG's
 // stored `name=value` form for pg_attribute.attoptions round-trip. DU-002 slice 185.

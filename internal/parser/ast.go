@@ -1781,6 +1781,29 @@ type CreateStatisticsStmt struct {
 func (s *CreateStatisticsStmt) Pos() int  { return s.pos }
 func (s *CreateStatisticsStmt) stmtNode() {}
 
+// AlterStatisticsStmt represents `ALTER STATISTICS name SET STATISTICS n`. The
+// statistics target governs the sample size used for the extended-statistics
+// object; PG stores it in pg_statistic_ext.stxstattarget. Only the SET
+// STATISTICS form is modelled — other ALTER STATISTICS forms (RENAME / OWNER TO
+// / SET SCHEMA) parse to this node with HasTarget=false and are no-ops. The
+// value round-trips through pg_dump (dumpStatisticsExt emits the ALTER whenever
+// stxstattarget >= 0). DU-002 slice 317.
+type AlterStatisticsStmt struct {
+	pos      int
+	Name     ObjectName // statistics object name (possibly schema-qualified)
+	IfExists bool
+	// Target is the new statistics target. A negative value (-1) resets the
+	// object to the default (PG stores stxstattarget=NULL). Only meaningful when
+	// HasTarget is set.
+	Target int
+	// HasTarget reports the statement carried a SET STATISTICS clause (vs an
+	// unmodelled ALTER STATISTICS form parsed as a no-op).
+	HasTarget bool
+}
+
+func (s *AlterStatisticsStmt) Pos() int  { return s.pos }
+func (s *AlterStatisticsStmt) stmtNode() {}
+
 // LockTableRelation is one relation target inside a LOCK TABLE statement.
 type LockTableRelation struct {
 	Schema string

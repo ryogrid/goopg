@@ -2961,6 +2961,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE STATISTICS public.statext_mix ON a, (b + c) FROM public.statext_t"); err != nil {
 		t.Fatalf("create statistics statext_mix: %v", err)
 	}
+	// Slice 317: a non-default extended-statistics target must round-trip. pg_dump
+	// (getExtendedStatistics + dumpStatisticsExt) reads pg_statistic_ext.stxstattarget
+	// and emits `ALTER STATISTICS … SET STATISTICS <n>` after the CREATE whenever
+	// stxstattarget >= 0; the default (PG18 stores NULL → -1) emits nothing. goopg
+	// records the target on catalog.StatisticsObject.StatTarget via
+	// `ALTER STATISTICS … SET STATISTICS n`; the pg_statistic_ext virtual row now
+	// projects it (NULL when unset). `statext_nd` gets a target of 250 (must
+	// re-emit); `statext_all` stays default (must NOT emit an ALTER).
+	if err := runSQLSimple(t, c, "ALTER STATISTICS public.statext_nd SET STATISTICS 250"); err != nil {
+		t.Fatalf("alter statistics statext_nd set statistics: %v", err)
+	}
 
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
@@ -6582,6 +6593,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped a CREATE STATISTICS object; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// **Slice 317 (asserted):** a non-default extended-statistics target must
+		// re-emit as `ALTER STATISTICS … SET STATISTICS <n>` after the CREATE
+		// (pg_dump dumpStatisticsExt; fires when stxstattarget >= 0). `statext_nd`
+		// was set to 250.
+		if !strings.Contains(res.Stdout, "ALTER STATISTICS public.statext_nd SET STATISTICS 250;") {
+			t.Errorf("pg_dump dropped the ALTER STATISTICS … SET STATISTICS target\n  full stdout=%q", res.Stdout)
+		}
+		// The default-target objects must NOT emit an ALTER STATISTICS line.
+		if strings.Contains(res.Stdout, "ALTER STATISTICS public.statext_all SET STATISTICS") {
+			t.Errorf("pg_dump emitted a spurious ALTER STATISTICS for a default-target object\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must
 		// round-trip. Slice 147 created public.add_one(integer) only as a COMMENT

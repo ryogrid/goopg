@@ -1941,6 +1941,12 @@ type StatisticsObject struct {
 	// fallback), so the dump path declines to reconstruct the object. DU-002
 	// slices 314/316.
 	HasExpr bool
+	// StatTarget is the per-object statistics target set via
+	// `ALTER STATISTICS ... SET STATISTICS n` (pg_statistic_ext.stxstattarget).
+	// nil means unset — PG stores stxstattarget=NULL (the default), for which
+	// pg_dump emits no ALTER. A non-nil value >= 0 round-trips as an
+	// `ALTER STATISTICS ... SET STATISTICS <n>` after the CREATE. DU-002 slice 317.
+	StatTarget *int
 }
 
 // qualifiedKey returns the lowercase schema.name key used in statisticsObjs.
@@ -2220,6 +2226,29 @@ func (c *InMemory) LookupStatistics(name string) (*StatisticsObject, bool) {
 	}
 	obj, ok := c.statisticsObjs[key]
 	return obj, ok
+}
+
+
+// SetStatisticsTarget records the statistics target for the named extended
+// statistics object (ALTER STATISTICS ... SET STATISTICS n). A nil target
+// resets it to the default (PG stores stxstattarget=NULL). Returns false if no
+// such object exists. DU-002 slice 317.
+func (c *InMemory) SetStatisticsTarget(name string, target *int) bool {
+	key := strings.ToLower(name)
+	if !strings.Contains(key, ".") {
+		key = "public." + key
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statisticsObjs == nil {
+		return false
+	}
+	obj, ok := c.statisticsObjs[key]
+	if !ok {
+		return false
+	}
+	obj.StatTarget = target
+	return true
 }
 
 // AllStatistics returns a snapshot of all registered statistics objects. M0097-0023.
@@ -5461,7 +5490,19 @@ func (c *InMemory) registerSystemTables() {
 			row[2] = obj.Name                        // stxname
 			row[3] = nsOID                           // stxnamespace
 			row[4] = "10"                            // stxowner (bootstrap superuser)
-			row[5] = "-1"                            // stxstattarget (default)
+			// stxstattarget: PG18 stores NULL for the default (BKI_FORCE_NULL),
+			// which pg_dump's getExtendedStatistics maps to -1 → no ALTER. The
+			// string-based virtual-row machinery has no int NULL sentinel (an
+			// empty int4 cell parses as 0, which would spuriously dump
+			// `SET STATISTICS 0`), so the unset default is projected as the
+			// pg_dump-equivalent -1. A non-nil StatTarget (from ALTER STATISTICS
+			// ... SET STATISTICS n) projects its value so pg_dump re-emits the
+			// `ALTER STATISTICS ... SET STATISTICS <n>`. DU-002 slice 317.
+			if obj.StatTarget != nil {
+				row[5] = fmt.Sprintf("%d", *obj.StatTarget) // stxstattarget
+			} else {
+				row[5] = "-1" // default (pg_dump-equivalent of NULL → no ALTER)
+			}
 			row[6] = ""                              // stxkeys
 			row[7] = ""                              // stxexprs
 			row[8] = ""                              // stxkind

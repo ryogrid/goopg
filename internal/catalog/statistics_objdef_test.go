@@ -115,3 +115,55 @@ func TestBuildStatisticsObjDef(t *testing.T) {
 		})
 	}
 }
+
+
+// TestSetStatisticsTargetProjection pins ALTER STATISTICS ... SET STATISTICS n
+// onto pg_statistic_ext.stxstattarget so pg_dump round-trips the target
+// (DU-002 slice 317). Unset projects the pg_dump-equivalent default -1 (no
+// ALTER emitted); a value >= 0 projects verbatim; -1 resets to the default.
+func TestSetStatisticsTargetProjection(t *testing.T) {
+	c := NewInMemory()
+	const relOID = uint32(16400)
+	c.RegisterTable(&Table{Schema: "public", Name: "t", OID: relOID})
+	c.RegisterStatistics("public", "s", relOID)
+
+	stxRow := func() []string {
+		rows := c.tables["pg_catalog.pg_statistic_ext"].VirtualRows()
+		if len(rows) != 1 {
+			t.Fatalf("VirtualRows: got %d rows want 1", len(rows))
+		}
+		return rows[0]
+	}
+
+	// Default (unset) → stxstattarget projects -1.
+	if got := stxRow()[5]; got != "-1" {
+		t.Errorf("default stxstattarget=%q want %q", got, "-1")
+	}
+
+	// SET STATISTICS 250 → projects 250.
+	v := 250
+	if !c.SetStatisticsTarget("public.s", &v) {
+		t.Fatalf("SetStatisticsTarget(public.s, 250) returned false")
+	}
+	if got := stxRow()[5]; got != "250" {
+		t.Errorf("after SET STATISTICS 250: stxstattarget=%q want %q", got, "250")
+	}
+
+	// SET STATISTICS 0 (valid non-default; disables sampling) → projects 0.
+	zero := 0
+	c.SetStatisticsTarget("public.s", &zero)
+	if got := stxRow()[5]; got != "0" {
+		t.Errorf("after SET STATISTICS 0: stxstattarget=%q want %q", got, "0")
+	}
+
+	// Reset to default (nil) → back to -1.
+	c.SetStatisticsTarget("public.s", nil)
+	if got := stxRow()[5]; got != "-1" {
+		t.Errorf("after reset: stxstattarget=%q want %q", got, "-1")
+	}
+
+	// Unknown object → false, no panic.
+	if c.SetStatisticsTarget("public.nope", &v) {
+		t.Errorf("SetStatisticsTarget on unknown object returned true")
+	}
+}

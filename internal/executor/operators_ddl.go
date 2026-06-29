@@ -143,6 +143,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCommentOn(s)
 	case *parser.CreateStatisticsStmt:
 		return nil, o.execCreateStatistics(s)
+	case *parser.AlterStatisticsStmt:
+		return nil, o.execAlterStatistics(s)
 	case *parser.LockTableStmt:
 		return nil, o.execLockTable(s)
 	case *parser.DoStmt:
@@ -12389,6 +12391,34 @@ func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
 		exprs = append(exprs, defaultExprToSQL(e))
 	}
 	im.RegisterStatisticsFull(schema, s.Name.Name, tableOID, s.Kinds, s.Columns, exprs, s.HasExpr)
+	return nil
+}
+
+// execAlterStatistics applies `ALTER STATISTICS ... SET STATISTICS n` to an
+// extended-statistics object. The target is recorded on the catalog object
+// (pg_statistic_ext.stxstattarget) purely for pg_dump round-trip fidelity —
+// goopg does not sample extended statistics at this granularity. A negative
+// target (-1) resets to the default (NULL); pg_dump then emits no ALTER. Forms
+// other than SET STATISTICS (RENAME / OWNER TO / SET SCHEMA) parse to a node
+// with HasTarget=false and are no-ops. DU-002 slice 317.
+func (o *ddlOp) execAlterStatistics(s *parser.AlterStatisticsStmt) error {
+	if !s.HasTarget {
+		return nil
+	}
+	im, ok := o.ctx.Catalog.(*catalog.InMemory)
+	if !ok {
+		return nil
+	}
+	name := s.Name.Name
+	if s.Name.Schema != "" {
+		name = s.Name.Schema + "." + s.Name.Name
+	}
+	var target *int
+	if s.Target >= 0 {
+		v := s.Target
+		target = &v
+	}
+	im.SetStatisticsTarget(name, target)
 	return nil
 }
 

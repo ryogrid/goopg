@@ -4677,6 +4677,55 @@ func (p *parser) parseAlter() (Stmt, error) {
 			}
 		}
 	}
+	// ALTER STATISTICS name SET STATISTICS n — set the extended-statistics
+	// sample target (pg_statistic_ext.stxstattarget). Other ALTER STATISTICS
+	// forms (RENAME / OWNER TO / SET SCHEMA) are consumed as no-ops. The target
+	// round-trips through pg_dump's dumpStatisticsExt. DU-002 slice 317.
+	if p.acceptIdentKeyword("statistics") {
+		stmt := &AlterStatisticsStmt{pos: t.Pos}
+		if p.acceptKeyword(KwIf) {
+			if _, err := p.expectKeyword(KwExists); err != nil {
+				return nil, err
+			}
+			stmt.IfExists = true
+		}
+		name, err := p.parseObjectName()
+		if err != nil {
+			return nil, err
+		}
+		stmt.Name = name
+		// SET STATISTICS n — the only modelled form. `SET STATISTICS` here is the
+		// keyword KwSet (or the bare ident) followed by the unreserved "statistics".
+		if p.acceptKeyword(KwSet) || p.acceptIdentKeyword("set") {
+			if p.acceptIdentKeyword("statistics") {
+				neg := false
+				if (p.cur().Kind == TokenOperator || p.cur().Kind == TokenSymbol) && p.cur().Value == "-" {
+					neg = true
+					p.advance()
+				}
+				if p.cur().Kind == TokenIntLit {
+					n, err := strconv.Atoi(p.cur().Value)
+					if err != nil {
+						return nil, err
+					}
+					p.advance()
+					if neg {
+						n = -n
+					}
+					stmt.Target = n
+					stmt.HasTarget = true
+				}
+			}
+		}
+		// Consume any trailing tokens of an unmodelled form up to the terminator.
+		for p.cur().Kind != TokenEOF {
+			if p.cur().Kind == TokenSymbol && p.cur().Value == ";" {
+				break
+			}
+			p.advance()
+		}
+		return stmt, nil
+	}
 	// ALTER TYPE name ADD VALUE … — M0097-0017.
 	if p.acceptIdentKeyword("type") {
 		return p.parseAlterType(t.Pos)
