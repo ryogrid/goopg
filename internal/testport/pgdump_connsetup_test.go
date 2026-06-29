@@ -3510,6 +3510,34 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant execute on gofn to gofn_grantee with grant option: %v", err)
 	}
 
+	// Slice 349: a sequence-level GRANT … WITH GRANT OPTION must round-trip through
+	// pg_dump from the sequence's pg_class.relacl, the sequence analogue of the
+	// table grant-option slice 332 and the function grant-option slice 348. Unlike
+	// a function (whose sole privilege EXECUTE collapses to ALL), a sequence has
+	// three distinct privileges (USAGE/SELECT/UPDATE), so a single USAGE grant
+	// stays USAGE rather than rendering as ALL. `GRANT USAGE ON SEQUENCE
+	// public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION` materializes relacl as
+	// "{postgres=rwU/postgres,seq_wgo_role=U*/postgres}" — the grantee's USAGE
+	// carries the grant-option `*`. pg_dump's getTables diffs it against
+	// acldefault('s', 10) = "{postgres=rwU/postgres}" and buildACLCommands routes
+	// the grant-option USAGE to its privswgo branch, emitting `GRANT USAGE ON
+	// SEQUENCE public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION;` (verified
+	// byte-identical to real pg_dump 18.3). The grant-option `*` projection in the
+	// relacl renderer and the privswgo split are object-type-agnostic, so the
+	// sequence path needs no new engine work beyond slice 333's recorder plumbing
+	// (which already threads WITH GRANT OPTION through the shared relation ACL
+	// store). Before grant-option threading goopg dropped the flag, emitting a
+	// plain `GRANT USAGE …;`.
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.gowgo_seq"); err != nil {
+		t.Fatalf("create sequence gowgo_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE seq_wgo_role"); err != nil {
+		t.Fatalf("create role seq_wgo_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON SEQUENCE public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION"); err != nil {
+		t.Fatalf("grant usage on gowgo_seq to seq_wgo_role with grant option: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7530,6 +7558,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// goopg dropped the grant-option flag, emitting a plain `GRANT ALL …;`.
 		if want := "GRANT ALL ON FUNCTION public.gofn(integer) TO gofn_grantee WITH GRANT OPTION;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered the function WITH GRANT OPTION: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 349 (asserted):** a sequence GRANT … WITH GRANT OPTION round-trips.
+		// `GRANT USAGE ON SEQUENCE public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION`
+		// materializes relacl as "{postgres=rwU/postgres,seq_wgo_role=U*/postgres}";
+		// pg_dump's buildACLCommands routes the grant-option USAGE to its privswgo
+		// branch and emits a single `GRANT USAGE ON SEQUENCE public.gowgo_seq TO
+		// seq_wgo_role WITH GRANT OPTION;`. Unlike the function case (slice 348) the
+		// privilege stays USAGE — sequences expose three privileges so a single one
+		// does not collapse to ALL. Verified byte-identical to real pg_dump 18.3.
+		// Before grant-option threading goopg dropped the flag, emitting a plain
+		// `GRANT USAGE …;`.
+		if want := "GRANT USAGE ON SEQUENCE public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the sequence WITH GRANT OPTION: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints
