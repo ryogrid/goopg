@@ -10768,12 +10768,16 @@ func (o *ddlOp) createSeqCatalogTable(seqObjName parser.ObjectName, name string)
 // validateSeqOwnedBy checks OWNED BY table.column before the sequence is
 // registered/updated. Returns an error matching PostgreSQL's messages. M0097-0068.
 func (o *ddlOp) validateSeqOwnedBy(pos int, seqName, ownedBy string) error {
-	dot := strings.Index(ownedBy, ".")
-	if dot < 0 {
+	// The column is the LAST dotted component; everything before it is the
+	// (optionally schema-qualified) table. A first-dot split misreads
+	// "schema.table.column" as table="schema", col="table.column" and wrongly
+	// rejects a valid 3-part OWNED BY. Mirrors InMemory.dependVirtualRows.
+	lastDot := strings.LastIndex(ownedBy, ".")
+	if lastDot < 0 {
 		return &ExecError{Code: "42601", Pos: pos, Message: "invalid OWNED BY option"}
 	}
-	tblPart := ownedBy[:dot]
-	colPart := ownedBy[dot+1:]
+	tblPart := ownedBy[:lastDot]
+	colPart := ownedBy[lastDot+1:]
 
 	// Look up the table in the catalog.
 	tbl, ok := o.ctx.Catalog.LookupTable(parser.ObjectName{Name: tblPart})

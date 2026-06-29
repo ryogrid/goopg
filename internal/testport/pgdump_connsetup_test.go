@@ -2711,6 +2711,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.owned_seq OWNED BY owner_tbl.id"); err != nil {
 		t.Fatalf("create sequence owned_seq: %v", err)
 	}
+	// Slice 304: the SCHEMA-QUALIFIED 3-part OWNED BY form. Slice 118 above writes
+	// the unqualified `OWNED BY owner_tbl.id`; the equally-valid PG form
+	// `OWNED BY public.owner_tbl.id` (schema.table.column — exactly what pg_dump
+	// itself re-emits) previously errored at validateSeqOwnedBy with
+	// `sequence cannot be owned by relation "public"`: the owner string was split
+	// on the FIRST dot, so table="public" / column="owner_tbl.id". The column is
+	// the LAST dotted component (now split via strings.LastIndex, mirroring
+	// InMemory.dependVirtualRows), so the table resolves to public.owner_tbl. The
+	// dump must round-trip this byte-identically to the unqualified case.
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.qowned_seq OWNED BY public.owner_tbl.label"); err != nil {
+		t.Fatalf("create sequence qowned_seq (schema-qualified OWNED BY): %v", err)
+	}
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -7038,6 +7050,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, sub) {
 				t.Errorf("pg_dump dropped an OWNED BY sequence/owner; missing %q\n  full stdout=%q", sub, res.Stdout)
 			}
+		}
+		// **Slice 304 (asserted):** the schema-qualified 3-part OWNED BY
+		// (`public.owner_tbl.label`) must round-trip identically to the unqualified
+		// slice-118 form. Before the LastIndex split fix the CREATE SEQUENCE itself
+		// errored (`sequence cannot be owned by relation "public"`), so this string
+		// never appeared. pg_dump always re-qualifies, so the dumped form is the
+		// canonical `ALTER SEQUENCE public.qowned_seq OWNED BY public.owner_tbl.label;`.
+		if !strings.Contains(res.Stdout, "ALTER SEQUENCE public.qowned_seq OWNED BY public.owner_tbl.label;") {
+			t.Errorf("pg_dump dropped the schema-qualified OWNED BY sequence; missing the qowned_seq OWNED BY line\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 119 (asserted):** descending sequences must round-trip through
 		// pg_dump's descending-direction default suppression. A plain
