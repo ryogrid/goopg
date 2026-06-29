@@ -4544,7 +4544,8 @@ func buildConstraintDefString(idx *catalog.Index) string {
 // runs with search_path=” so the referenced relation is fully schema-qualified
 // (`REFERENCES public.foo(id)`). Referential actions other than NO ACTION and a
 // DEFERRABLE clause are appended; MATCH SIMPLE (the default) is omitted, as PG
-// does. DU-002 slice 51.
+// does. A trailing ` NOT VALID` is appended for an unvalidated FK
+// (convalidated='f'). DU-002 slices 51, 307.
 func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) string {
 	var refTbl *catalog.Table
 	for _, t := range im.AllTables() {
@@ -4587,6 +4588,14 @@ func buildForeignKeyDefString(im *catalog.InMemory, fk catalog.ForeignKey) strin
 		if fk.InitiallyDeferred {
 			def += " INITIALLY DEFERRED"
 		}
+	}
+	// A NOT-VALID FK (pg_constraint.convalidated='f') carries a trailing
+	// ` NOT VALID` in pg_get_constraintdef, appended after the DEFERRABLE
+	// clauses — the shared tail of pg_get_constraintdef_worker (ruleutils.c:2604).
+	// pg_dump re-emits this verbatim so the restored FK is likewise unvalidated.
+	// DU-002 slice 307.
+	if fk.NotValid {
+		def += " NOT VALID"
 	}
 	return def
 }

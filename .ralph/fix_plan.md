@@ -2290,7 +2290,12 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestUserPGIndexRowReplicaIdentity` + slices 305/306 (`ri_full`→FULL,
       `ri_nothing`→NOTHING, `ri_index`/`ri_uidx`→USING INDEX present; foo/bar/part
       default → no clause) PASS vs real pg_dump 18.3; full executor + parser +
-      catalog suites PASS. **Still open under M0119-0004:** the pg_dump 002–010
+      catalog suites PASS. **Slice 307 (loop #28):** `NOT VALID` FOREIGN KEY
+      round-trip — `buildForeignKeyDefString` now appends the ` NOT VALID` tail
+      (`pg_get_constraintdef_worker` ruleutils.c:2604) for `convalidated='f'`;
+      previously dumped without it → silent re-validate on restore. Design
+      `0119-0004-fk-not-valid-roundtrip.md`. **Still open under M0119-0004:**
+      CHECK NOT VALID + FK MATCH FULL round-trip; the pg_dump 002–010
       catalog-view parity battery (further slices); extended-protocol commit-time
       deferral (architecturally entangled — extended protocol is
       auto-commit-per-statement).

@@ -2772,6 +2772,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "ALTER TABLE public.ri_index REPLICA IDENTITY USING INDEX ri_uidx"); err != nil {
 		t.Fatalf("alter table ri_index replica identity using index: %v", err)
 	}
+
+	// Slice 307: a FOREIGN KEY added with NOT VALID must round-trip. PG records
+	// the unvalidated state in pg_constraint.convalidated='f', and
+	// pg_get_constraintdef_worker (ruleutils.c:2604) appends a trailing
+	// ` NOT VALID` to the constraint definition AFTER the DEFERRABLE clauses —
+	// the shared tail common to every constraint type. pg_dump's getConstraints
+	// renders the FK via pg_get_constraintdef, so the dumped
+	// `ALTER TABLE ONLY ... ADD CONSTRAINT nv_child_fk FOREIGN KEY (ref_id)
+	// REFERENCES public.nv_ref(id) NOT VALID;` carries the suffix and the restored
+	// FK is likewise unvalidated. goopg already tracks catalog.ForeignKey.NotValid
+	// (set at ALTER TABLE ADD CONSTRAINT ... NOT VALID time) and projects
+	// convalidated='f' in the pg_constraint virtual builder; the gap was purely
+	// buildForeignKeyDefString never emitting the ` NOT VALID` tail, so the dump
+	// silently re-validated the constraint (a restore would then enforce it on
+	// existing rows that NOT VALID was meant to grandfather). Dump-fidelity only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nv_ref (id integer PRIMARY KEY)"); err != nil {
+		t.Fatalf("create table nv_ref: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nv_child (id integer, ref_id integer)"); err != nil {
+		t.Fatalf("create table nv_child: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nv_child ADD CONSTRAINT nv_child_fk FOREIGN KEY (ref_id) REFERENCES public.nv_ref (id) NOT VALID"); err != nil {
+		t.Fatalf("alter table nv_child add fk not valid: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -7140,6 +7165,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// syntax (pg_dump.c dumpIndex:18186). The clause must name ri_uidx.
 		if !strings.Contains(res.Stdout, "ALTER TABLE ONLY public.ri_index REPLICA IDENTITY USING INDEX ri_uidx;") {
 			t.Errorf("pg_dump dropped the REPLICA IDENTITY USING INDEX clause; missing the ri_index/ri_uidx line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 307 (asserted):** a NOT-VALID FOREIGN KEY round-trips with the
+		// trailing ` NOT VALID` that pg_get_constraintdef appends for
+		// convalidated='f' (ruleutils.c:2604). A regression that dropped the
+		// suffix would silently re-validate the constraint on restore.
+		if !strings.Contains(res.Stdout, "ADD CONSTRAINT nv_child_fk FOREIGN KEY (ref_id) REFERENCES public.nv_ref(id) NOT VALID;") {
+			t.Errorf("pg_dump dropped the NOT VALID suffix on an unvalidated FK; missing the nv_child_fk line\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 119 (asserted):** descending sequences must round-trip through
 		// pg_dump's descending-direction default suppression. A plain
