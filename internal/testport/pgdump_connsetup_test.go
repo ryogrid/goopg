@@ -3184,6 +3184,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant select with grant option on grant_g: %v", err)
 	}
 
+	// Slice 333: a GRANT … ON SEQUENCE must round-trip through pg_dump. pg_dump's
+	// getTables selects relacl for sequences (relkind 'S') too and computes the
+	// baseline as acldefault('s', relowner) → "{postgres=rwU/postgres}" (USAGE/
+	// SELECT/UPDATE), and dumpTableSchema passes objtype "SEQUENCE" to dumpACL so
+	// the diff is re-emitted as `GRANT … ON SEQUENCE …`. Before this slice goopg's
+	// grant_ddl recorder bailed on ON SEQUENCE (no-op) and the sequence's relacl
+	// stayed NULL, silently dropping the privilege. goopg now records sequence
+	// grants in the shared relation ACL store and the pg_class virtual builder
+	// renders a sequence's relacl with the sequence privilege order / owner
+	// default "rwU".
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.grant_seq"); err != nil {
+		t.Fatalf("create sequence grant_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE seq_role"); err != nil {
+		t.Fatalf("create role seq_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE ON SEQUENCE public.grant_seq TO seq_role"); err != nil {
+		t.Fatalf("grant usage on grant_seq: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7006,6 +7026,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// `GRANT … WITH GRANT OPTION;`. Verified byte-identical to real pg_dump 18.3.
 		if want := "GRANT SELECT ON TABLE public.grant_g TO grantee2_role WITH GRANT OPTION;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered WITH GRANT OPTION: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 333 (asserted):** a GRANT … ON SEQUENCE round-trips. pg_dump
+		// reads the sequence's relacl, diffs it against acldefault('s', 10) =
+		// "{postgres=rwU/postgres}", and dumpACL (objtype "SEQUENCE") emits a
+		// single `GRANT USAGE ON SEQUENCE public.grant_seq TO seq_role;`. Verified
+		// byte-identical to real pg_dump 18.3.
+		if want := "GRANT USAGE ON SEQUENCE public.grant_seq TO seq_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered sequence GRANT: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

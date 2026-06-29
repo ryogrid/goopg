@@ -2544,6 +2544,23 @@ documentation-only and is exempt from the design-doc requirement.)
       slice-332 `TestPort_PgDumpConnectionSetup` (`GRANT SELECT ON TABLE
       public.grant_g TO grantee2_role WITH GRANT OPTION;` byte-identical vs real
       pg_dump 18.3) PASS. Still open: column-level/sequence/schema GRANT, REVOKE.
+      **2026-06-30 (loop #56, design 0119-0004-sequence-grant-relacl-pgdump, DU-002
+      slice 333):** `GRANT … ON SEQUENCE` round-trips. pg_dump treats sequences as
+      relations — `getTables` reads `c.relacl` for relkind 'S' and diffs against
+      `acldefault('s', owner)` = `{postgres=rwU/postgres}`, `dumpTableSchema` passes
+      objtype `"SEQUENCE"` to `dumpACL`. goopg lost it two ways: `grant_ddl.go`
+      bailed on `ON SEQUENCE` (no-op), and `relaclTextLocked` was hard-wired to the
+      table privilege order (would drop `USAGE`, wrong owner baseline). Fix:
+      catalog adds `sequenceACLPrivOrder` (`r`/`w`/`U`) + `ownerSequenceACLString`
+      "rwU", refactors `relaclTextLocked` into a core `relaclTextLockedFor` with a
+      `relaclTextLockedSeq` sibling, builder calls it when `t.IsSequence`; server
+      removes `sequence` from `nonTableGrantObjects`, strips a leading `SEQUENCE`
+      keyword, expands `ALL`→`allSequencePrivileges`, `parseGrantPrivileges` takes
+      the set as a param. Shared OID-keyed store → `truncate-conflict` untouched,
+      grant-option `*` shared. Tests `TestRelaclTextSequence` + slice-333
+      `TestPort_PgDumpConnectionSetup` (`GRANT USAGE ON SEQUENCE public.grant_seq
+      TO seq_role;` byte-identical vs real pg_dump 18.3) PASS. Still open:
+      column-level (`pg_attribute.attacl`)/schema/database GRANT, REVOKE-of-default.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

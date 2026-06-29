@@ -10,6 +10,13 @@ func relaclText(c *InMemory, relOID uint32) string {
 	return c.relaclTextLocked(relOID)
 }
 
+// relaclTextSeq is relaclText for a sequence (relkind 'S').
+func relaclTextSeq(c *InMemory, relOID uint32) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.relaclTextLockedSeq(relOID)
+}
+
 // TestRelaclText pins the pg_class.relacl projection that lets a table-level
 // GRANT round-trip through pg_dump (DU-002 slice 331). PostgreSQL leaves relacl
 // NULL until the first GRANT, then materializes an aclitem[] with the owner's
@@ -87,5 +94,44 @@ func TestRelaclTextGrantOption(t *testing.T) {
 	c.GrantTablePrivilege(relOID, "g_role", "SELECT")
 	if got := relaclText(c, relOID); got != want {
 		t.Fatalf("relacl after redundant plain GRANT = %q; want %q (option retained)", got, want)
+	}
+}
+
+// TestRelaclTextSequence pins the sequence relacl projection that lets a
+// GRANT … ON SEQUENCE round-trip through pg_dump (DU-002 slice 333). A
+// sequence's owner default is "rwU" (USAGE/SELECT/UPDATE), which pg_dump diffs
+// against via acldefault('s', owner); grantee privileges render in canonical
+// aclitemout order SELECT('r') < UPDATE('w') < USAGE('U').
+func TestRelaclTextSequence(t *testing.T) {
+	c := NewInMemory()
+	const seqOID = 16600
+
+	// No grants → NULL relacl.
+	if got := relaclTextSeq(c, seqOID); got != "" {
+		t.Fatalf("seq relacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// GRANT USAGE materializes the owner entry (rwU) plus the grantee ("U").
+	c.GrantTablePrivilege(seqOID, "seq_role", "USAGE")
+	want := "{postgres=rwU/postgres,seq_role=U/postgres}"
+	if got := relaclTextSeq(c, seqOID); got != want {
+		t.Fatalf("seq relacl after GRANT USAGE = %q; want %q", got, want)
+	}
+
+	// Multiple privileges render in canonical order: SELECT('r') before
+	// USAGE('U'); table-only privileges (e.g. INSERT) are not part of the
+	// sequence order and are dropped from the rendering.
+	c.GrantTablePrivilege(seqOID, "seq_role", "SELECT")
+	c.GrantTablePrivilege(seqOID, "seq_role", "INSERT")
+	want = "{postgres=rwU/postgres,seq_role=rU/postgres}"
+	if got := relaclTextSeq(c, seqOID); got != want {
+		t.Fatalf("seq relacl after multi-priv GRANT = %q; want %q", got, want)
+	}
+
+	// A grant-option sequence privilege renders "<letter>*".
+	c.GrantTablePrivilegeWithGrantOption(seqOID, "seq_role", "UPDATE", true)
+	want = "{postgres=rwU/postgres,seq_role=rw*U/postgres}"
+	if got := relaclTextSeq(c, seqOID); got != want {
+		t.Fatalf("seq relacl after GRANT UPDATE WITH GRANT OPTION = %q; want %q", got, want)
 	}
 }

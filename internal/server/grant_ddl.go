@@ -26,8 +26,10 @@ import (
 
 // tableObjectKeywords are the first words after ON that denote a non-table
 // object class we do not model; such grants are left to the no-op path.
+// `sequence` is NOT here: a sequence GRANT is recorded (DU-002 slice 333) so it
+// round-trips through pg_dump, sharing the relation ACL store keyed by OID.
 var nonTableGrantObjects = map[string]struct{}{
-	"schema": {}, "database": {}, "sequence": {}, "function": {},
+	"schema": {}, "database": {}, "function": {},
 	"procedure": {}, "routine": {}, "domain": {}, "type": {},
 	"tablespace": {}, "language": {}, "foreign": {}, "large": {},
 	"all": {}, "parameter": {},
@@ -38,6 +40,11 @@ var allTablePrivileges = []string{
 	"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE",
 	"REFERENCES", "TRIGGER", "MAINTAIN",
 }
+
+// allSequencePrivileges is the expansion of GRANT ALL [PRIVILEGES] ON a
+// sequence (USAGE/SELECT/UPDATE — pg_dump renders these as "rwU"). DU-002
+// slice 333.
+var allSequencePrivileges = []string{"USAGE", "SELECT", "UPDATE"}
 
 // tryRecordTableGrant parses a table-level GRANT and records its privileges in
 // the catalog ACL store. It is a best-effort side effect: on any form it does
@@ -79,16 +86,26 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 		rolePart = strings.TrimSpace(rolePart[:i])
 	}
 
-	// Optional leading TABLE keyword on the object list.
+	// Optional leading TABLE / SEQUENCE keyword on the object list. A SEQUENCE
+	// grant is recorded too (DU-002 slice 333) so it round-trips through
+	// pg_dump; its ALL expansion and rendered privilege letters differ.
+	isSequence := false
 	if rest, ok := cutLeadingKeyword(objPart, "table"); ok {
 		objPart = rest
+	} else if rest, ok := cutLeadingKeyword(objPart, "sequence"); ok {
+		objPart = rest
+		isSequence = true
 	}
-	// Bail on non-table object classes (ON SCHEMA foo, ON SEQUENCE …, etc.).
+	// Bail on non-table object classes (ON SCHEMA foo, ON DATABASE …, etc.).
 	if _, isNonTable := nonTableGrantObjects[firstWordLower(objPart)]; isNonTable {
 		return
 	}
 
-	privs := parseGrantPrivileges(privPart)
+	allPrivs := allTablePrivileges
+	if isSequence {
+		allPrivs = allSequencePrivileges
+	}
+	privs := parseGrantPrivileges(privPart, allPrivs)
 	if len(privs) == 0 {
 		return
 	}
@@ -109,8 +126,9 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 }
 
 // parseGrantPrivileges splits a comma-separated privilege list into upper-cased
-// keywords, expanding ALL [PRIVILEGES] to the full table privilege set.
-func parseGrantPrivileges(privPart string) []string {
+// keywords, expanding ALL [PRIVILEGES] to allPrivs (the full privilege set for
+// the object class being granted — table or sequence).
+func parseGrantPrivileges(privPart string, allPrivs []string) []string {
 	out := make([]string, 0, 4)
 	for _, raw := range strings.Split(privPart, ",") {
 		p := strings.ToUpper(strings.TrimSpace(raw))
@@ -118,7 +136,7 @@ func parseGrantPrivileges(privPart string) []string {
 			continue
 		}
 		if p == "ALL" || p == "ALL PRIVILEGES" {
-			return append([]string(nil), allTablePrivileges...)
+			return append([]string(nil), allPrivs...)
 		}
 		out = append(out, p)
 	}

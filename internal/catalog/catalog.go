@@ -3936,8 +3936,13 @@ func (c *InMemory) registerSystemTables() {
 			// relacl — NULL until a GRANT records non-owner privileges, then the
 			// materialized aclitem[] (owner full + each grantee). pg_dump's
 			// getTables reads this directly and re-emits GRANTs (buildACLCommands,
-			// client-side). DU-002 slice 331.
+			// client-side). DU-002 slice 331. Sequences (relkind 'S') render with
+			// the sequence privilege set / owner default "rwU" so a GRANT … ON
+			// SEQUENCE round-trips against acldefault('s', owner). DU-002 slice 333.
 			relacl := c.relaclTextLocked(t.OID)
+			if t.IsSequence {
+				relacl = c.relaclTextLockedSeq(t.OID)
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // 0:  oid
 				t.Name,                       // 1:  relname
@@ -8393,16 +8398,19 @@ func (c *InMemory) DropTableACL(relOID uint32) {
 	delete(c.tableACLs, relOID)
 }
 
-// tableACLPrivOrder pairs each table-privilege keyword (as stored upper-cased
-// in tableACLs) with the single letter aclitemout prints for it, in
-// PostgreSQL's canonical ACL_ALL_RIGHTS_STR order for relkind 'r'
-// (src/include/utils/acl.h). Rendering grantee privilege sets in this order
-// matches the aclitem[] text PostgreSQL stores in pg_class.relacl, so pg_dump's
-// client-side buildACLCommands re-emits GRANTs byte-identically.
-var tableACLPrivOrder = []struct {
+// aclPrivLetter pairs a privilege keyword (as stored upper-cased in tableACLs)
+// with the single letter aclitemout prints for it.
+type aclPrivLetter struct {
 	keyword string
 	letter  byte
-}{
+}
+
+// tableACLPrivOrder lists the table privileges in PostgreSQL's canonical
+// aclitemout order for relkind 'r' (the bit order in src/include/utils/acl.h).
+// Rendering grantee privilege sets in this order matches the aclitem[] text
+// PostgreSQL stores in pg_class.relacl, so pg_dump's client-side
+// buildACLCommands re-emits GRANTs byte-identically.
+var tableACLPrivOrder = []aclPrivLetter{
 	{"INSERT", 'a'},
 	{"SELECT", 'r'},
 	{"UPDATE", 'w'},
@@ -8413,11 +8421,26 @@ var tableACLPrivOrder = []struct {
 	{"MAINTAIN", 'm'},
 }
 
+// sequenceACLPrivOrder lists the sequence privileges (USAGE/SELECT/UPDATE) in
+// the same canonical aclitemout bit order: SELECT('r'), UPDATE('w'), USAGE('U').
+// pg_dump diffs a sequence's relacl against acldefault('s', owner) and re-emits
+// `GRANT … ON SEQUENCE …` for the grantee. DU-002 slice 333.
+var sequenceACLPrivOrder = []aclPrivLetter{
+	{"SELECT", 'r'},
+	{"UPDATE", 'w'},
+	{"USAGE", 'U'},
+}
+
 // ownerTableACLString is the privilege-letter string for the owner's full set
 // of table privileges (every bit in tableACLPrivOrder), i.e. "arwdDxtm". It
 // matches acldefault('r', owner), the baseline pg_dump diffs relacl against, so
 // the owner's own entry produces no GRANT/REVOKE on round-trip.
 const ownerTableACLString = "arwdDxtm"
+
+// ownerSequenceACLString is the owner's full set of sequence privileges, i.e.
+// "rwU". It matches acldefault('s', owner) so the owner's own entry produces no
+// GRANT/REVOKE on round-trip. DU-002 slice 333.
+const ownerSequenceACLString = "rwU"
 
 // relaclTextLocked renders the materialized pg_class.relacl text — an aclitem[]
 // array literal such as `{postgres=arwdDxtm/postgres,grantee_role=r/postgres}` —
@@ -8436,11 +8459,26 @@ const ownerTableACLString = "arwdDxtm"
 // server-side aclexplode/aclitemout is involved — so projecting the correct
 // text is sufficient for the round-trip.
 func (c *InMemory) relaclTextLocked(relOID uint32) string {
+	return c.relaclTextLockedFor(relOID, tableACLPrivOrder, ownerTableACLString)
+}
+
+// relaclTextLockedSeq is relaclTextLocked for a sequence (relkind 'S'): it
+// renders with the sequence privilege order (USAGE/SELECT/UPDATE) and the
+// sequence owner-default string "rwU", which is what pg_dump diffs against via
+// acldefault('s', owner). DU-002 slice 333. Caller must hold c.mu.
+func (c *InMemory) relaclTextLockedSeq(relOID uint32) string {
+	return c.relaclTextLockedFor(relOID, sequenceACLPrivOrder, ownerSequenceACLString)
+}
+
+// relaclTextLockedFor is the object-type-agnostic core of relaclTextLocked: it
+// renders the materialized aclitem[] for relOID using the given privilege order
+// and owner-default privilege-letter string. Caller must hold c.mu.
+func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter, ownerString string) string {
 	byRole := c.tableACLs[relOID]
 	if len(byRole) == 0 {
 		return "" // NULL relacl — matches acldefault, pg_dump emits no GRANT
 	}
-	items := []string{"postgres=" + ownerTableACLString + "/postgres"}
+	items := []string{"postgres=" + ownerString + "/postgres"}
 	roles := make([]string, 0, len(byRole))
 	for role := range byRole {
 		roles = append(roles, role)
@@ -8452,7 +8490,7 @@ func (c *InMemory) relaclTextLocked(relOID uint32) string {
 			continue
 		}
 		var letters strings.Builder
-		for _, p := range tableACLPrivOrder {
+		for _, p := range privOrder {
 			if withGrantOpt, ok := privs[p.keyword]; ok {
 				letters.WriteByte(p.letter)
 				if withGrantOpt {
