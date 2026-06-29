@@ -456,6 +456,31 @@ func (p *clogBufferPool) flushDirty() error {
 	return nil
 }
 
+// invalidateBelow drops every resident page whose pageNo < cutoffPage WITHOUT
+// writing it back — the backing segment file has just been unlinked by
+// TruncateCLOG, so a writeback would resurrect a truncated-away page. The slots
+// slice and pageMap are compacted in place so freed slots are reused by later
+// fault-ins (mirroring PG's SimpleLruTruncate invalidating buffers below the
+// cutoff). M0117-0006 Part B.
+func (p *clogBufferPool) invalidateBelow(cutoffPage int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	kept := p.slots[:0]
+	newMap := make(map[int64]int, len(p.pageMap))
+	for i := range p.slots {
+		s := p.slots[i]
+		if s.valid && s.pageNo < cutoffPage {
+			continue // drop: file unlinked, no writeback
+		}
+		if s.valid {
+			newMap[s.pageNo] = len(kept)
+		}
+		kept = append(kept, s)
+	}
+	p.slots = kept
+	p.pageMap = newMap
+}
+
 // residentPages returns the number of pages currently held in the pool. For
 // tests asserting the LRU bound is honored.
 func (p *clogBufferPool) residentPages() int {

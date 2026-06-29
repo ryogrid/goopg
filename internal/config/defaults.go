@@ -29,6 +29,15 @@ func BuildDefaultRegistry() *Registry {
 		Context: ContextInternal, Flags: FlagReport | FlagDisallowInFile,
 		Scope: ScopeServer,
 	}))
+	// block_size reports the data-page size (BLCKSZ) the cluster was built
+	// with. A read-only preset (PGC_INTERNAL) — not settable, not in
+	// postgresql.conf.sample. Exercised by current_setting('block_size') in the
+	// stats isolation spec (sizing a large pg_notify payload). M0118-0009.
+	r.MustRegister(NewVariable(Variable{
+		Name: "block_size", Type: TypeInt, BootVal: "8192",
+		Context: ContextInternal, Flags: FlagDisallowInFile,
+		Scope: ScopeServer,
+	}))
 	r.MustRegister(NewVariable(Variable{
 		Name: "client_encoding", Type: TypeString, BootVal: "UTF8",
 		Context: ContextUserset, Flags: FlagReport,

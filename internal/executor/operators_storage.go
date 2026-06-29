@@ -706,6 +706,43 @@ type seqScanOp struct {
 	ctx  *Context
 	cols []catalog.Column
 
+	// ssiGistPred is the spatial WHERE predicate of the Filter directly above
+	// this scan, handed down at build time (Build / buildRec). When the scan runs
+	// under SERIALIZABLE on a table carrying a GiST index on the predicate's point
+	// column, the scan takes per-matching-tuple grid-cell SIREAD predicate locks
+	// (design 0118-0137) instead of a relation-grain lock, reproducing PG's
+	// page-level GiST predicate locking (predicate-gist spec). nil for every
+	// non-gist scan (the common case) — pure no-op.
+	ssiGistPred planner.Expr
+	// gistSSIIdxOID / gistSSIColIdx are resolved in Open from ssiGistPred + the
+	// table's GiST index: the index OID used as the predicate-lock relation and
+	// the position of the indexed point column in cols. gistSSIIdxOID==0 disables
+	// the whole gist-SSI path (so the relation-grain lock + per-tuple heap SIREAD
+	// run as before). gistScratch is a reusable decode buffer for INVISIBLE
+	// tuples (concurrent-insert conflict-out), which the normal flow never decodes.
+	gistSSIIdxOID uint32
+	gistSSIColIdx int
+	gistScratch   Row
+
+	// ssiGinPred is the `<gincol> @> <const array>` WHERE predicate of the Filter
+	// directly above this scan, handed down at build time (same site as
+	// ssiGistPred). Under SERIALIZABLE on a table carrying a GIN index on the
+	// predicate's array column, the scan takes GIN key-grain SIREAD predicate locks
+	// on the search keys (design 0118-0140) instead of a relation-grain lock,
+	// reproducing PG's per-key GIN index predicate locking (predicate-gin spec).
+	// nil for every non-gin scan — pure no-op.
+	ssiGinPred planner.Expr
+	// ginSSIIdxOID / ginSSIColIdx are resolved in Open from ssiGinPred + the
+	// table's GIN index: the index OID used as the predicate-lock relation and the
+	// position of the indexed array column in cols. ginSSIIdxOID==0 disables the
+	// gin-SSI path (relation-grain lock + per-tuple heap SIREAD run as before).
+	// ginSSIFastUpdate is the index's fastupdate state at Open; ginSearchKeys are
+	// the extracted search keys (array elements of the @> right operand).
+	ginSSIIdxOID     uint32
+	ginSSIColIdx     int
+	ginSSIFastUpdate bool
+	ginSearchKeys    []string
+
 	nBlocks  storage.BlockNumber
 	curBlock storage.BlockNumber
 	curSlot  uint16
@@ -863,6 +900,58 @@ func newSeqScanOp(p *planner.SeqScan) *seqScanOp {
 
 func (o *seqScanOp) Schema() planner.Schema { return o.schema }
 
+// gistRowMatches evaluates the GiST spatial-SSI predicate against an
+// already-decoded leaf-local row, returning whether the row matches the scan's
+// spatial filter. Used only in gist-SSI mode (gistSSIIdxOID != 0); returns false
+// on any eval error or non-boolean result. Design 0118-0137.
+func (o *seqScanOp) gistRowMatches(row Row) bool {
+	res, err := evalExpr(o.ssiGistPred, row, o.ctx)
+	if err != nil || res.Kind != KindBool {
+		return false
+	}
+	return res.BoolValue()
+}
+
+// gistTupleMatches decodes an INVISIBLE tuple into the reusable gist scratch row
+// and evaluates the spatial predicate. The normal scan flow never decodes
+// invisible tuples, so this path exists to gate the concurrent-insert
+// conflict-out by spatial match (design 0118-0137). MUST be called with the page
+// RLock held — tuple.Data views the page bytes. Returns false on decode/eval
+// failure.
+func (o *seqScanOp) gistTupleMatches(tuple storage.HeapTuple) bool {
+	if o.gistScratch == nil || len(o.gistScratch) != len(o.cols) {
+		o.gistScratch = make(Row, len(o.cols))
+	}
+	storedNatts := int(tuple.Header.Infomask2 & 0x07FF)
+	if err := DecodeRowIntoMctxPGTuple(o.gistScratch, o.cols, tuple.Data, tuple.Bitmap, storedNatts, o.sctx); err != nil {
+		return false
+	}
+	return o.gistRowMatches(o.gistScratch)
+}
+
+// ginSearchKeys extracts the GIN search keys from this scan's
+// `<gincol> @> <const array>` predicate (o.ssiGinPred). Returns the
+// canonical-text elements of the constant array operand and ok=true only for the
+// supported `@>` form with the gin column on the contains side; any other shape
+// returns ok=false so the caller keeps relation-grain locking (never under-locks).
+// Design 0118-0140.
+func (o *seqScanOp) extractGinSearchKeys(colName string) ([]string, bool) {
+	bin, ok := o.ssiGinPred.(*planner.BinaryOp)
+	if !ok || bin.Op != parser.OpContains {
+		return nil, false
+	}
+	// `col @> array[...]`: Left is the gin column, Right is the constant array.
+	lc, lok := bin.Left.(*planner.ColumnRef)
+	if !lok || !strings.EqualFold(lc.Name, colName) {
+		return nil, false
+	}
+	d, err := evalExpr(bin.Right, nil, o.ctx)
+	if err != nil || d.Kind != KindString {
+		return nil, false
+	}
+	return parseTextArray(d.StringValue()), true
+}
+
 func (o *seqScanOp) Open(ctx *Context) error {
 	if ctx.Pool == nil || ctx.Catalog == nil {
 		return &ExecError{Code: "XX000", Pos: o.pos, Message: "SeqScan requires storage handles in Context"}
@@ -886,12 +975,47 @@ func (o *seqScanOp) Open(ctx *Context) error {
 	}
 	// Cache rel once — avoids the catalog RLock on every Next() call.
 	o.rel = ctx.Catalog.RelFileNode(o.tbl)
+	// M0118-0002 (design 0118-0137): GiST spatial-SSI mode. A SERIALIZABLE scan
+	// with a spatial filter on a GiST-indexed point column locks per-matching-
+	// tuple grid cells on the index (Next loop below) instead of the whole
+	// relation, reproducing PG's page-level GiST predicate locking and its reduced
+	// false positives (predicate-gist). Resolved here while ctx/catalog are in
+	// hand; gistSSIIdxOID==0 leaves the legacy relation-grain path untouched.
+	if o.ssiGistPred != nil && ssiActive(ctx) && (o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView)) {
+		if oid, colIdx, ok := ssiGistIndexForTable(ctx, o.tbl, o.cols); ok {
+			o.gistSSIIdxOID = oid
+			o.gistSSIColIdx = colIdx
+		}
+	}
+	// M0118-0002 (design 0118-0140): GIN key-grain-SSI mode. A SERIALIZABLE
+	// `<arraycol> @> array[...]` scan on a GIN-indexed array column locks the
+	// posting-tree page of each search key on the index instead of the whole
+	// relation, reproducing PG's per-key GIN index predicate locking and its
+	// reduced false positives (predicate-gin). The key SIREADs are taken here
+	// (the search keys come from the constant @> right operand — independent of
+	// which tuples match, so a non-existing key still locks its page); the matching
+	// INSERT conflicts-in on each inserted element's page. ginSSIIdxOID==0 leaves
+	// the legacy relation-grain path untouched (including when the predicate shape
+	// is unsupported, so we never under-lock).
+	if o.gistSSIIdxOID == 0 && o.ssiGinPred != nil && ssiActive(ctx) && (o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView)) {
+		if oid, colIdx, fu, ok := ssiGinIndexForTable(ctx, o.tbl, o.cols); ok {
+			if keys, kok := o.extractGinSearchKeys(o.cols[colIdx].Name); kok {
+				o.ginSSIIdxOID = oid
+				o.ginSSIColIdx = colIdx
+				o.ginSSIFastUpdate = fu
+				o.ginSearchKeys = keys
+				ssiRecordGinKeyRead(ctx, o.rel.DBOid, oid, keys, fu)
+			}
+		}
+	}
 	// M0118-0001: a SERIALIZABLE seq scan takes a relation-level SIREAD
 	// predicate lock so a concurrent writer's INSERT of a matching row forms
 	// the rw-conflict (phantom). Mirrors PredicateLockRelation in upstream
 	// heap_beginscan; temp / matview relations are excluded exactly as
 	// PredicateLockingNeededForRelation does (system catalogs gated in the hook).
-	if o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView) {
+	// In GiST/GIN index-SSI mode the finer index-page locks replace this coarse
+	// lock (taking both would re-coarsen to the relation grain and over-abort).
+	if o.gistSSIIdxOID == 0 && o.ginSSIIdxOID == 0 && (o.tbl == nil || (!o.tbl.Temp && !o.tbl.IsMatView)) {
 		ssiRecordRelationRead(ctx, o.rel)
 	}
 	if err := ctx.acquireRelLock(o.rel, lockmgr.AccessShareLock); err != nil {
@@ -1130,6 +1254,36 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 				continue
 			}
 			if !mvcc.TupleVisibleSubxact(tuple.Header, o.ctx.Snap, o.ctx.Tx.XID, o.ctx.TxnMgr, o.ctx.MultiXact) {
+				// M0118-0002 (design 0118-0137): in GiST spatial-SSI mode the
+				// invisible-tuple conflict-out is gated by the spatial predicate —
+				// only a concurrent insert that MATCHES this scan's region forms the
+				// reader→inserter rw-edge (a relation-wide conflict-out would
+				// re-introduce the false positives the grid-cell locking removes).
+				// The decode reads tuple.Data, which views the page bytes, so it must
+				// happen before the RUnlock.
+				if o.gistSSIIdxOID != 0 {
+					gistMatch := o.gistTupleMatches(tuple)
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					if gistMatch {
+						if err := ssiRecordInvisibleTupleRead(o.ctx, rel, tuple.Header.Xmin); err != nil {
+							return nil, err
+						}
+					}
+					continue
+				}
+				// M0118-0002 (design 0118-0140): in GIN key-grain-SSI mode the
+				// reader→inserter rw-edge is formed write-side (the INSERT
+				// conflicts-in on the search-key page), so the relation-wide
+				// invisible-tuple conflict-out is suppressed — it would re-introduce
+				// the false positives the per-key locking removes.
+				if o.ginSSIIdxOID != 0 {
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					continue
+				}
 				if o.pinned != nil {
 					o.pinned.RUnlock()
 				}
@@ -1171,11 +1325,17 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 			// structure to an already-committed writer and the reader must
 			// abort mid-statement (40001). Release the per-tuple page RLock
 			// before returning; Close()/the pin handles buffer release.
-			if err := ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
-				if o.pinned != nil {
-					o.pinned.RUnlock()
+			// M0118-0002 (design 0118-0137): in GiST spatial-SSI mode the heap
+			// per-tuple SIREAD is replaced by a grid-cell SIREAD on the index,
+			// taken below once the row is decoded (taking the heap lock here too
+			// would coarsen to a heap-page lock and re-introduce false positives).
+			if o.gistSSIIdxOID == 0 && o.ginSSIIdxOID == 0 {
+				if err := ssiRecordTupleRead(o.ctx, rel, o.curBlock, o.curSlot-1, tuple.Header.Xmin, tuple.Header.Xmax); err != nil {
+					if o.pinned != nil {
+						o.pinned.RUnlock()
+					}
+					return nil, err
 				}
-				return nil, err
 			}
 			// M0054-0005a: decode into the reusable o.scanRow
 			// buffer. M0073-0004: route varchar / char / text /
@@ -1213,6 +1373,27 @@ func (o *seqScanOp) Next() (TupleSlot, error) {
 					continue // skip undetoastable tuple
 				}
 				row = detoasted
+			}
+			// M0118-0002 (design 0118-0137): GiST spatial-SSI read hook. A visible
+			// tuple matching the spatial predicate takes a grid-cell SIREAD on the
+			// GiST index (the phantom mechanism) plus the reader→writer conflict-out
+			// (the write-before-read edge). Done after decode so the point value is
+			// available; the page RLock is still held, so release it before any
+			// 40001 mid-statement abort, exactly like the heap hook above.
+			if o.gistSSIIdxOID != 0 && o.gistSSIColIdx < len(row) {
+				if o.gistRowMatches(row) {
+					if row[o.gistSSIColIdx].Kind == KindString {
+						if pt, pok := parsePointText(row[o.gistSSIColIdx].StringValue()); pok {
+							ssiRecordGistGridRead(o.ctx, o.rel.DBOid, o.gistSSIIdxOID, pt[0], pt[1])
+						}
+					}
+					if serr := ssiConflictOutTupleRead(o.ctx, tuple.Header.Xmin, tuple.Header.Xmax); serr != nil {
+						if o.pinned != nil {
+							o.pinned.RUnlock()
+						}
+						return nil, serr
+					}
+				}
 			}
 			// M0100-0005 lock-committed-update fix: materialize the
 			// row (deep-copy arena-backed Datums into owned bytes)
@@ -1387,11 +1568,10 @@ func (o *insertOp) Open(ctx *Context) error {
 }
 
 func (o *insertOp) Close() error {
-	// Cumulative relation stats: count inserted tuples (one live tuple each),
-	// gated by track_counts. M0118-0009 (`stats`, rung 6; design 0118-0128).
-	if shouldTrackCounts(o.ctx) {
-		relStats.recordInsert(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
-	}
+	// Cumulative relation stats: stage inserted tuples (one live tuple each) for
+	// the current transaction, gated by track_counts. M0118-0009 (`stats`, rung 7;
+	// design 0118-0131). Autocommit statements fold to pending immediately.
+	recordRelInsert(o.ctx, tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
 	return o.child.Close()
 }
 
@@ -1509,6 +1689,14 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// bigint overflow from over-wide numeric literals).
 		for i, col := range cols {
 			if insertMissing[i] || row[i].IsNull() {
+				continue
+			}
+			// An array-typed column (e.g. `p int4[]`) carries Type.Name="int4"
+			// but Type.IsArray=true; its value is the array text literal "{1}"
+			// produced by array_construct, NOT a scalar. Coercing it to the
+			// element type would parse "{1}" as an int4 and raise 22P02
+			// (invalid input syntax). Leave array values untouched. M0118-0002.
+			if col.Type.IsArray {
 				continue
 			}
 			var coerced Datum
@@ -1663,6 +1851,18 @@ func (o *insertOp) Next() (TupleSlot, error) {
 			if serr := ssiRecordHashIndexInsert(o.ctx, partTable, partTable.Columns, partRow, targetRel.DBOid); serr != nil {
 				return nil, serr
 			}
+			// SSI GiST grid-cell conflict-in (design 0118-0137): forms the rw-edge
+			// against a SERIALIZABLE reader holding the inserted point's grid-cell
+			// SIREAD on a GiST index.
+			if serr := ssiRecordGistIndexInsert(o.ctx, partTable, partTable.Columns, partRow, targetRel.DBOid); serr != nil {
+				return nil, serr
+			}
+			// SSI GIN key-grain conflict-in (design 0118-0140): forms the rw-edge
+			// against a SERIALIZABLE reader holding a matching search-key SIREAD on
+			// a GIN index.
+			if serr := ssiRecordGinIndexInsert(o.ctx, partTable, partTable.Columns, partRow, targetRel.DBOid); serr != nil {
+				return nil, serr
+			}
 			maintainUniqueIndexesForInsert(o.ctx, partTable, partTable.Columns, partRow, ptr)
 			o.appendInsertRetRow(row)
 			o.rowsAffected++
@@ -1698,6 +1898,18 @@ func (o *insertOp) Next() (TupleSlot, error) {
 		// against a SERIALIZABLE reader holding the inserted value's bucket SIREAD
 		// on a hash index.
 		if serr := ssiRecordHashIndexInsert(o.ctx, o.plan.Table, cols, row, targetRel.DBOid); serr != nil {
+			return nil, serr
+		}
+		// SSI GiST grid-cell conflict-in (design 0118-0137): forms the rw-edge
+		// against a SERIALIZABLE reader holding the inserted point's grid-cell
+		// SIREAD on a GiST index.
+		if serr := ssiRecordGistIndexInsert(o.ctx, o.plan.Table, cols, row, targetRel.DBOid); serr != nil {
+			return nil, serr
+		}
+		// SSI GIN key-grain conflict-in (design 0118-0140): forms the rw-edge
+		// against a SERIALIZABLE reader holding a matching search-key SIREAD on a
+		// GIN index.
+		if serr := ssiRecordGinIndexInsert(o.ctx, o.plan.Table, cols, row, targetRel.DBOid); serr != nil {
 			return nil, serr
 		}
 		maintainUniqueIndexesForInsert(o.ctx, o.plan.Table, cols, row, ptr)
@@ -2797,13 +3009,13 @@ func tryApplyHOTUpdate(
 	tup.Header.Infomask |= storage.HeapXmaxInvalid
 	// HEAP_HASVARWIDTH: PG18 nocachegetattr crashes when this bit is
 	// missing on a TupleDesc with varlena attrs. Mirrors PG's
-	// heap_fill_tuple (heaptuple.c:326). M0118-0129.
+	// heap_fill_tuple (heaptuple.c:326). M0118-0131.
 	if pgRowHasVarWidth(cols, newRow) {
 		tup.Header.Infomask |= storage.HeapHasVarWidth
 	}
 	// HEAP_HASEXTERNAL: PG's heap_deform_tuple needs this bit to skip
 	// external TOAST pointers. Mirrors heap_fill_tuple (heaptuple.c:343).
-	// M0118-0129.
+	// M0118-0131.
 	if pgRowHasExternal(cols, newRow) {
 		tup.Header.Infomask |= storage.HeapHasExternal
 	}
@@ -2924,7 +3136,7 @@ func tryApplyHOTUpdate(
 		// (e.g. PagePruneOpt invalidated the old slot). Without
 		// cleanup the tuple persists as a live HEAP_ONLY_TUPLE
 		// with no CTID link, wasting space and inflating the
-		// line-pointer count. M0118-0129.
+		// line-pointer count. M0118-0131.
 		if remErr := storage.PageRemoveHeapTuple(s.Page(), newSlot); remErr != nil {
 			// Non-fatal: page is still structurally valid; the
 			// orphan wastes space until the next VACUUM repacks
@@ -3103,11 +3315,10 @@ func (o *updateOp) Open(ctx *Context) error {
 }
 
 func (o *updateOp) Close() error {
-	// Cumulative relation stats: count updated tuples (each leaves a dead tuple;
-	// goopg has no HOT update). Gated by track_counts. M0118-0009 (`stats`, rung 6).
-	if shouldTrackCounts(o.ctx) {
-		relStats.recordUpdate(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
-	}
+	// Cumulative relation stats: stage updated tuples (each leaves a dead tuple;
+	// goopg has no HOT update) for the current transaction. Gated by track_counts.
+	// M0118-0009 (`stats`, rung 7; design 0118-0131).
+	recordRelUpdate(o.ctx, tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
 	return nil
 }
 
@@ -4506,11 +4717,10 @@ func (o *deleteOp) Open(ctx *Context) error {
 }
 
 func (o *deleteOp) Close() error {
-	// Cumulative relation stats: count deleted tuples (each removes a live tuple
-	// and produces a dead one). Gated by track_counts. M0118-0009 (`stats`, rung 6).
-	if shouldTrackCounts(o.ctx) {
-		relStats.recordDelete(sessionStatsID(o.ctx), tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
-	}
+	// Cumulative relation stats: stage deleted tuples (each removes a live tuple
+	// and produces a dead one) for the current transaction. Gated by track_counts.
+	// M0118-0009 (`stats`, rung 7; design 0118-0131).
+	recordRelDelete(o.ctx, tableOIDFromCatalog(o.plan.Table), o.rowsAffected)
 	return nil
 }
 
@@ -6013,6 +6223,225 @@ func encodeExprIndexKey(ctx *Context, idx *catalog.Index, tbl *catalog.Table, ro
 	return out
 }
 
+// rowHasNullKeyColumn reports whether any of idx's key columns is NULL in the
+// candidate (cols/row). Gates the NULLS-NOT-DISTINCT heap-scan check: the normal
+// btree path already enforces uniqueness when every key column is non-NULL, so
+// the heap scan is needed only when a key column is actually NULL. Expression
+// key columns (idx.Columns[i]=="") never match a real column name and so do not
+// count as NULL here (NND on expression indexes is out of scope — design
+// 0119-0004 §2.1). Design 0119-0004.
+func rowHasNullKeyColumn(idx *catalog.Index, cols []catalog.Column, row Row) bool {
+	for _, idxColName := range idx.Columns {
+		if idxColName == "" {
+			continue
+		}
+		for i := range cols {
+			if strings.EqualFold(cols[i].Name, idxColName) && i < len(row) {
+				if row[i].IsNull() {
+					return true
+				}
+				break
+			}
+		}
+	}
+	return false
+}
+
+// nndKeyColumnsEqual reports whether two row versions carry an identical NULLS
+// NOT DISTINCT key: the same NULL pattern across the index key columns AND equal
+// encoded values for the non-NULL ones. A no-key-change UPDATE on such an index
+// cannot collide with the row it replaces, so the caller skips the uniqueness
+// probe (important on the ON CONFLICT DO UPDATE path, which runs the check
+// before stamping the old tuple dead). Returns false on any structural mismatch
+// (expression key, missing column) so the caller falls back to probing.
+func nndKeyColumnsEqual(idx *catalog.Index, cols []catalog.Column, oldRow, newRow Row) bool {
+	for _, idxColName := range idx.Columns {
+		if idxColName == "" {
+			return false // expression key — out of scope, treat as changed
+		}
+		ord := -1
+		var col *catalog.Column
+		for i := range cols {
+			if strings.EqualFold(cols[i].Name, idxColName) {
+				ord = i
+				col = &cols[i]
+				break
+			}
+		}
+		if ord < 0 || ord >= len(oldRow) || ord >= len(newRow) {
+			return false
+		}
+		oldNull := oldRow[ord].IsNull()
+		newNull := newRow[ord].IsNull()
+		if oldNull != newNull {
+			return false
+		}
+		if oldNull {
+			continue
+		}
+		oldKey, oerr := encodeBTreeKeyForColumn(oldRow[ord], col, 0)
+		newKey, nerr := encodeBTreeKeyForColumn(newRow[ord], col, 0)
+		if oerr != nil || nerr != nil || !bytes.Equal(oldKey, newKey) {
+			return false
+		}
+	}
+	return true
+}
+
+// nndDetail builds the 23505 DETAIL for a NULLS-NOT-DISTINCT conflict, rendering
+// a NULL key column as the literal `null` (PostgreSQL prints
+// `Key (a)=(null) already exists.`). Datum.Format() returns "" for KindNull, so
+// NULL columns are mapped explicitly rather than via Format(). Design 0119-0004.
+func nndDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
+	colNames := make([]string, 0, len(idx.Columns))
+	colVals := make([]string, 0, len(idx.Columns))
+	for _, idxCol := range idx.Columns {
+		colNames = append(colNames, idxCol)
+		val := "null"
+		for i, col := range cols {
+			if strings.EqualFold(col.Name, idxCol) && i < len(row) {
+				if !row[i].IsNull() {
+					val = row[i].Format()
+				}
+				break
+			}
+		}
+		colVals = append(colVals, val)
+	}
+	return fmt.Sprintf("Key (%s)=(%s) already exists.",
+		strings.Join(colNames, ", "), strings.Join(colVals, ", "))
+}
+
+// checkNullsNotDistinctViaHeapScan enforces NULLS NOT DISTINCT uniqueness for a
+// candidate row that has one or more NULL key columns on an NND index. Such rows
+// are never stored in the btree (encodeIndexKeyFromCols returns nil), so the
+// collision cannot be found by a btree probe; instead this seq-scans the heap
+// for a live tuple whose index-key columns match the candidate's NULL pattern
+// and non-NULL values exactly — NULL equals NULL, and a non-NULL column compares
+// byte-equal under the column's index encoding (encodeBTreeKeyForColumn), so the
+// comparison matches what the btree would consider equal. Returns the first
+// matching tuple's ItemPointer and true. The ItemPointer is surfaced for the
+// ON CONFLICT follow-up slice (design 0119-0004 §2.1); the plain INSERT/UPDATE
+// callers only consume the boolean. Mirrors the heap-scan pattern of
+// checkGistOverlapExclusion. Design 0119-0004.
+func checkNullsNotDistinctViaHeapScan(ctx *Context, tbl *catalog.Table, idx *catalog.Index, cols []catalog.Column, row Row, rel storage.RelFileNode) (storage.ItemPointer, bool) {
+	// Resolve, per index key column: the candidate NULL-ness / encoded key and
+	// the tbl.Columns ordinal used to read the decoded existing row.
+	type nndKeyCol struct {
+		tblOrd   int
+		col      *catalog.Column
+		candNull bool
+		candKey  []byte // encoded candidate key (nil when candNull)
+	}
+	keyCols := make([]nndKeyCol, 0, len(idx.Columns))
+	for _, idxColName := range idx.Columns {
+		if idxColName == "" {
+			return storage.ItemPointer{}, false // expression NND index — out of scope
+		}
+		var candVal Datum
+		foundCand := false
+		for i := range cols {
+			if strings.EqualFold(cols[i].Name, idxColName) && i < len(row) {
+				candVal = row[i]
+				foundCand = true
+				break
+			}
+		}
+		tblOrd := -1
+		var col *catalog.Column
+		for j := range tbl.Columns {
+			if strings.EqualFold(tbl.Columns[j].Name, idxColName) {
+				tblOrd = j
+				col = &tbl.Columns[j]
+				break
+			}
+		}
+		if !foundCand || tblOrd < 0 || col == nil {
+			return storage.ItemPointer{}, false
+		}
+		kc := nndKeyCol{tblOrd: tblOrd, col: col, candNull: candVal.IsNull()}
+		if !kc.candNull {
+			enc, eerr := encodeBTreeKeyForColumn(candVal, col, 0)
+			if eerr != nil {
+				return storage.ItemPointer{}, false
+			}
+			kc.candKey = enc
+		}
+		keyCols = append(keyCols, kc)
+	}
+
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return storage.ItemPointer{}, false
+	}
+	decRow := make(Row, len(tbl.Columns))
+	for b := storage.BlockNumber(0); b < nBlocks; b++ {
+		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: b})
+		if perr != nil {
+			continue
+		}
+		s.RLock()
+		page := s.Page()
+		if storage.IsNew(page) {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		count, cerr := storage.PageLinePointerCount(page)
+		if cerr != nil {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
+			tup, terr := storage.PageGetHeapTuple(page, slotIdx)
+			if terr != nil {
+				continue
+			}
+			if !isLiveForUniqueCheck(ctx, tup.Header.Xmin, tup.Header.Xmax) {
+				continue
+			}
+			storedNatts := int(tup.Header.Infomask2 & 0x07FF)
+			if decErr := DecodeRowIntoMctxPGTuple(decRow, tbl.Columns, tup.Data, tup.Bitmap, storedNatts, nil); decErr != nil {
+				continue
+			}
+			match := true
+			for _, kc := range keyCols {
+				if kc.tblOrd >= len(decRow) {
+					match = false
+					break
+				}
+				existVal := decRow[kc.tblOrd]
+				if kc.candNull {
+					if !existVal.IsNull() {
+						match = false
+						break
+					}
+					continue
+				}
+				if existVal.IsNull() {
+					match = false
+					break
+				}
+				existKey, eerr := encodeBTreeKeyForColumn(existVal, kc.col, 0)
+				if eerr != nil || !bytes.Equal(existKey, kc.candKey) {
+					match = false
+					break
+				}
+			}
+			if match {
+				ptr := storage.ItemPointer{Block: b, Offset: slotIdx}
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				return ptr, true
+			}
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+	}
+	return storage.ItemPointer{}, false
+}
+
 // checkUniqueIndexesForInsert enforces unique-constraint violations at INSERT
 // time. For each unique/primary btree index on `tbl`, it computes the
 // candidate key from `row` and probes the index for a matching live entry.
@@ -6048,6 +6477,23 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		}
 		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
 		if err != nil || key == nil {
+			// NULLS NOT DISTINCT: a candidate row with NULL key column(s) has no
+			// btree key (encodeIndexKeyFromCols returns nil) and is never stored
+			// in the index, yet under NND such NULLs collide with an existing
+			// NULL-keyed row. Fall back to a heap scan to detect that collision.
+			// Gated on idx.NullsNotDistinct + an actual NULL key column so every
+			// non-NND index and every non-NULL reason for a nil key (expression
+			// column, arity mismatch) keeps the existing skip. Design 0119-0004.
+			if err == nil && idx.NullsNotDistinct && rowHasNullKeyColumn(idx, cols, row) {
+				if _, found := checkNullsNotDistinctViaHeapScan(ctx, tbl, idx, cols, row, rel); found {
+					return &ExecError{
+						Code:    "23505",
+						Pos:     pos,
+						Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idx.Name),
+						Detail:  nndDetail(idx, cols, row),
+					}
+				}
+			}
 			continue
 		}
 		detail := buildUniqueConstraintDetail(idx, cols, row)
@@ -6066,7 +6512,21 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 func indexKeyColumnsChanged(idx *catalog.Index, cols []catalog.Column, oldRow, newRow Row, cat catalog.Catalog) bool {
 	oldKey, oerr := encodeIndexKeyFromCols(idx, cols, oldRow, cat)
 	newKey, nerr := encodeIndexKeyFromCols(idx, cols, newRow, cat)
-	if oerr != nil || nerr != nil || oldKey == nil || newKey == nil {
+	if oerr != nil || nerr != nil {
+		return true
+	}
+	if oldKey == nil || newKey == nil {
+		// A NULL key column makes encodeIndexKeyFromCols return nil. Under the
+		// default (NULLS DISTINCT) semantics such a row never collides, so treat
+		// it as "changed" to force the probe (which then no-ops). Under NULLS
+		// NOT DISTINCT the NULL columns DO form part of the key, so compare the
+		// NULL pattern + non-NULL values directly: a no-key-change NULL→NULL
+		// UPDATE is genuinely unchanged and must skip the probe to avoid
+		// self-conflicting with the not-yet-stamped old version (the ON CONFLICT
+		// DO UPDATE path checks before stamping). Design 0119-0004.
+		if idx.NullsNotDistinct {
+			return !nndKeyColumnsEqual(idx, cols, oldRow, newRow)
+		}
 		return true
 	}
 	return !bytes.Equal(oldKey, newKey)
@@ -6116,6 +6576,22 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 		}
 		key, err := encodeIndexKeyFromCols(idx, cols, newRow, ctx.Catalog)
 		if err != nil || key == nil {
+			// NULLS NOT DISTINCT: new version has NULL key column(s). The old
+			// version was already stamped xmax = effectiveWriterXID before this
+			// check (operators_storage.go old-tuple stamp sites), so
+			// isLiveForUniqueCheck classifies it as dead and the heap scan skips
+			// it — a no-key-change NULL→NULL UPDATE never self-conflicts.
+			// Design 0119-0004.
+			if err == nil && idx.NullsNotDistinct && rowHasNullKeyColumn(idx, cols, newRow) {
+				if _, found := checkNullsNotDistinctViaHeapScan(ctx, tbl, idx, cols, newRow, rel); found {
+					return &ExecError{
+						Code:    "23505",
+						Pos:     pos,
+						Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idx.Name),
+						Detail:  nndDetail(idx, cols, newRow),
+					}
+				}
+			}
 			continue
 		}
 		detail := buildUniqueConstraintDetail(idx, cols, newRow)
@@ -6666,13 +7142,13 @@ func writeHeapRowReturning(ctx *Context, rel storage.RelFileNode, cols []catalog
 	// PG's heap_fill_tuple (postgres/src/backend/access/common/
 	// heaptuple.c:326). The PG-canonical sibling
 	// writeHeapRowReturningPG already sets this; the regular path was
-	// missing it. M0118-0129.
+	// missing it. M0118-0131.
 	if pgRowHasVarWidth(cols, row) {
 		tuple.Header.Infomask |= storage.HeapHasVarWidth
 	}
 	// HEAP_HASEXTERNAL: PG's heap_deform_tuple needs this bit to skip
 	// external TOAST pointers when computing attribute offsets.
-	// Mirrors PG's heap_fill_tuple (heaptuple.c:343). M0118-0129.
+	// Mirrors PG's heap_fill_tuple (heaptuple.c:343). M0118-0131.
 	if pgRowHasExternal(cols, row) {
 		tuple.Header.Infomask |= storage.HeapHasExternal
 	}
@@ -6915,7 +7391,7 @@ func writeHeapRowReturningPG(ctx *Context, rel storage.RelFileNode, cols []catal
 		tuple.Header.Infomask |= storage.HeapHasVarWidth
 	}
 	// HEAP_HASEXTERNAL: PG's heap_deform_tuple needs this bit
-	// for TOAST-external columns. M0118-0129.
+	// for TOAST-external columns. M0118-0131.
 	if pgRowHasExternal(cols, row) {
 		tuple.Header.Infomask |= storage.HeapHasExternal
 	}

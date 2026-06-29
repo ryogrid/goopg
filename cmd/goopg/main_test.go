@@ -476,6 +476,44 @@ func TestPoolSlotsFromGUC_NilRegistry(t *testing.T) {
 	}
 }
 
+// TestTransactionBuffersFromGUC pins the postgresql.conf ->
+// transaction_buffers -> OpenOptions.TransactionBuffers wiring so a future
+// loop can't silently drop the override of the live CLOG SLRU pool size
+// (M0117-0006 Part B follow-up). The GUC is a unit-less BLCKSZ-buffer count
+// with boot default 0 (auto-tune to the 16-page bank floor); a non-zero value
+// flows verbatim into Open and is clamped in EffectiveCLOGBuffers.
+func TestTransactionBuffersFromGUC(t *testing.T) {
+	cases := []struct {
+		name string
+		set  string // value to Set; empty means leave at boot default
+		want int
+	}{
+		{name: "boot default auto-tune", want: 0},
+		{name: "128 override", set: "128", want: 128},
+		{name: "8 override (below floor, clamp deferred)", set: "8", want: 8},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := config.BuildDefaultRegistry()
+			if c.set != "" {
+				if err := r.Set("transaction_buffers", c.set, config.SourceConfigFile); err != nil {
+					t.Fatalf("Set transaction_buffers=%q: %v", c.set, err)
+				}
+			}
+			got := intGUC(r, "transaction_buffers", 0)
+			if got != c.want {
+				t.Errorf("intGUC(transaction_buffers) = %d, want %d", got, c.want)
+			}
+		})
+	}
+}
+
+func TestTransactionBuffersFromGUC_NilRegistry(t *testing.T) {
+	if got := intGUC(nil, "transaction_buffers", 0); got != 0 {
+		t.Errorf("nil registry: got %d, want 0 (Open auto-tunes)", got)
+	}
+}
+
 func TestParsePrimaryConninfoFull(t *testing.T) {
 	addr, appName, user := parsePrimaryConninfoFull(
 		"host=127.0.0.1 port=5544 user=ryo dbname=postgres application_name=standby_a")

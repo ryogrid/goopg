@@ -4472,16 +4472,22 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 3401,
 	}
+	// Static fallback rows in upstream slru_names[] order ("other" last). The
+	// executor serves live, snapshot-aware rows for pg_stat_slru (notify
+	// blks_zeroed) via fetchSLRURows; these all-zero rows only back non-executor
+	// readers (e.g. pg_dump) and must use the PG 17+ pg_stat_slru names (the
+	// SimpleLruInit name, not the on-disk directory). M0118-0009.
 	pgStatSlru.VirtualRows = func() [][]string {
 		reset := "2026-01-01 00:00:00+00"
 		return [][]string{
-			{"pg_notify", "0", "0", "0", "0", "0", "0", "0", reset},
-			{"pg_serial", "0", "0", "0", "0", "0", "0", "0", reset},
-			{"pg_subtrans", "0", "0", "0", "0", "0", "0", "0", reset},
-			{"pg_xact", "0", "0", "0", "0", "0", "0", "0", reset},
-			{"pg_multixact/members", "0", "0", "0", "0", "0", "0", "0", reset},
-			{"pg_multixact/offsets", "0", "0", "0", "0", "0", "0", "0", reset},
-			{"pg_commit_ts", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"commit_timestamp", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"multixact_member", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"multixact_offset", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"notify", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"serializable", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"subtransaction", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"transaction", "0", "0", "0", "0", "0", "0", "0", reset},
+			{"other", "0", "0", "0", "0", "0", "0", "0", reset},
 		}
 	}
 	c.tables["pg_catalog.pg_stat_slru"] = pgStatSlru

@@ -3,6 +3,7 @@ package executor
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -11,6 +12,95 @@ import (
 	"github.com/goopg/goopg/internal/mctx"
 	"github.com/goopg/goopg/internal/storage"
 )
+
+// PGFloatOut renders f exactly as PostgreSQL's float4out (bitSize==32) /
+// float8out (bitSize==64) would under the default extra_float_digits=1: the
+// shortest round-trip decimal (Ryu algorithm) combined with PG's
+// fixed-vs-scientific exponent thresholds. Go's strconv.FormatFloat(f,'g',-1,…)
+// produces the same shortest digits but switches to scientific notation at a
+// different (and type-independent) threshold than PostgreSQL, so values such as
+// 2233750 render as "2.23375e+06" instead of "2233750". This mirrors
+// postgres/src/common/{f2s,d2s}.c to_chars: fixed-point output when the display
+// exponent (position of the most-significant digit) is in [-4, sciExp) and
+// scientific output otherwise, where sciExp is 6 for float4 and 15 for float8.
+func PGFloatOut(f float64, bitSize int) string {
+	switch {
+	case math.IsNaN(f):
+		return "NaN"
+	case math.IsInf(f, 1):
+		return "Infinity"
+	case math.IsInf(f, -1):
+		return "-Infinity"
+	}
+
+	// fixed-point when the display exponent lies in [-4, sciExp).
+	sciExp := 15 // float8
+	if bitSize == 32 {
+		sciExp = 6 // float4
+	}
+
+	// Shortest round-trip scientific form: always "d[.ddd]e±NN" with a single
+	// leading digit, no trailing zeros, and an explicit exponent. From it we
+	// recover the significant digits and the display exponent.
+	sci := strconv.FormatFloat(math.Abs(f), 'e', -1, bitSize)
+	ePos := strings.IndexByte(sci, 'e')
+	mant := sci[:ePos]
+	exp, _ := strconv.Atoi(sci[ePos+1:])
+	digits := strings.Replace(mant, ".", "", 1)
+	olength := len(digits)
+
+	var b strings.Builder
+	if math.Signbit(f) {
+		// Preserve negative zero ("-0"), matching PostgreSQL.
+		b.WriteByte('-')
+	}
+
+	if exp >= -4 && exp < sciExp {
+		// Fixed-point. pointPos = number of digits before the decimal point.
+		pointPos := exp + 1
+		switch {
+		case pointPos <= 0:
+			// 0.000ddddd
+			b.WriteString("0.")
+			for i := 0; i < -pointPos; i++ {
+				b.WriteByte('0')
+			}
+			b.WriteString(digits)
+		case pointPos >= olength:
+			// ddddd000 (trailing zeros to reach the point)
+			b.WriteString(digits)
+			for i := 0; i < pointPos-olength; i++ {
+				b.WriteByte('0')
+			}
+		default:
+			// dddd.dddd
+			b.WriteString(digits[:pointPos])
+			b.WriteByte('.')
+			b.WriteString(digits[pointPos:])
+		}
+		return b.String()
+	}
+
+	// Scientific: d[.ddd]e±NN with the exponent zero-padded to >= 2 digits.
+	b.WriteByte(digits[0])
+	if olength > 1 {
+		b.WriteByte('.')
+		b.WriteString(digits[1:])
+	}
+	b.WriteByte('e')
+	if exp < 0 {
+		b.WriteByte('-')
+		exp = -exp
+	} else {
+		b.WriteByte('+')
+	}
+	es := strconv.Itoa(exp)
+	if len(es) < 2 {
+		b.WriteByte('0')
+	}
+	b.WriteString(es)
+	return b.String()
+}
 
 // EncodeRowPG encodes a row in PG-native physical tuple format
 // (M0105-0010). Used for catalog pages that PG must read directly,
@@ -163,6 +253,13 @@ func coerceTextLikeDatum(t catalog.Type, d Datum) (string, error) {
 
 // encodeValuePG encodes a single datum in PG-native format.
 func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
+	// A user array column (e.g. `p int4[]`) carries Type.Name="int4" plus
+	// Type.IsArray=true; its value is the array text "{1,2}". Encode it as a
+	// PG-native ArrayType varlena blob BEFORE the element-type switch (which
+	// would otherwise try to parse "{1,2}" as a scalar int4). M0118-0002.
+	if t.IsArray {
+		return encodeArrayValuePG(t, d)
+	}
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":
 		if d.Kind != KindBool {
@@ -428,7 +525,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 				return nil, &ExecError{Code: "22P02",
 					Message: fmt.Sprintf("invalid input syntax for type real: %q", raw)}
 			}
-			s = strconv.FormatFloat(f, 'g', -1, 32)
+			s = PGFloatOut(f, 32)
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as float4", d.Kind)
 		}
@@ -455,7 +552,7 @@ func encodeValuePG(t catalog.Type, d Datum) ([]byte, error) {
 				return nil, &ExecError{Code: "22P02",
 					Message: fmt.Sprintf("invalid input syntax for type double precision: %q", raw)}
 			}
-			s = strconv.FormatFloat(f, 'g', -1, 64)
+			s = PGFloatOut(f, 64)
 		default:
 			return nil, fmt.Errorf("kind %d cannot encode as float8", d.Kind)
 		}
@@ -812,6 +909,11 @@ func alignPhysicalPGOffset(off, align int) int {
 }
 
 func physicalPGTypeAlign(t catalog.Type) int {
+	// All array columns store a varlena ArrayType blob → PG 'i' (4-byte) align.
+	// M0118-0002.
+	if t.IsArray {
+		return 4
+	}
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":
 		return 1
@@ -917,6 +1019,12 @@ func pgRowHasExternal(cols []catalog.Column, row Row) bool {
 }
 
 func decodePhysicalPGValueMctx(t catalog.Type, data []byte, sctx *mctx.Context) (Datum, int, error) {
+	// User array column: decode the ArrayType varlena blob back to the
+	// canonical "{1,2}" text (sibling of encodeValuePG's IsArray branch).
+	// M0118-0002.
+	if t.IsArray {
+		return decodeArrayValuePG(t, data)
+	}
 	switch strings.ToLower(t.Name) {
 	case "bool", "boolean":
 		if len(data) < 1 {

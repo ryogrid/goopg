@@ -96,18 +96,64 @@ prev-link fixes.
 Milestone doc `docs/milestones/0117-clog-postgresql-subsystem-alignment.md`. Goal:
 bring `pg_xact` (CLOG) + `pg_subtrans` to PG 18.3 parity.
 
+**2026-06-29 enabler (design 0117-0009, NOT a sub-task closure): TPC-H
+spot-check startup-hang cleared.** `EnablePGSLRUMirror`'s startup backfill
+fsync'd once per XID (~1.5M fsyncs on the bench dir → >6 min on WSL2), so the
+mandated executor/planner gate `scripts/tpch-spotcheck.sh` never reached its 60 s
+readiness window and infra-FAILED — the sole reason loops #7/#8 reported BLOCKED
+and deferred the whole M0117 live-path tail. Fixed by routing the backfill
+through the existing batched `mirrorTerminalRangeBatchedUnlocked` (one fsync per
+segment, ≈2 total); byte-equivalent, live per-commit path untouched. A fresh
+spotcheck start now reaches *ready* in ~35 s (was >6 min). Regression
+`TestCLogEnableMirrorBackfillBatched`.
+
+**2026-06-29 enabler (design 0117-0010, NOT a sub-task closure): TPC-H
+spot-check now actually RUNS (was silently SKIPping).** After 0117-0009 fixed
+readiness, the gate still never ran Q12/Q13: it probed the `user=tpch / db=tpch`
+HammerDB load identity, but goopg registers `CREATE ROLE`/`CREATE USER`
+**in-memory only** (`internal/server/role_ddl.go`) and the `tpch` database is
+likewise non-durable, so neither survives the gate's fresh restart — yet the
+loaded tables persist in the **`postgres`** database (`lineitem` = 5,999,786).
+The `role "tpch" does not exist` probe error matched the table-missing SKIP
+heuristic, masking a fully-loaded data dir (correcting 0117-0009's note that the
+data dir merely needed a role reload — the data was never lost, only mis-probed).
+Fix: `scripts/tpch-spotcheck.sh` falls back to the superuser + `postgres`
+database persistent target on a role/database-missing probe error. Verified
+end-to-end: fresh start → `postgres@postgres` → **Q12=2, Q13=33, RESULT=PASS**
+(matches `spotcheck_expected.env`; confirms HEAD has no row-count regression).
+With 0117-0009 + 0117-0010 the populated-data Q12/Q13 gate is now demonstrably
+runnable, unblocking 0117-0006 Part B / 0117-0007 Part B for a dedicated
+full-gate session (which still additionally need PG-standby E2E + `-race`
+mvcc/wal + crash-replay). Follow-up (not in any actionable band): durable
+role/database persistence is a real goopg feature gap.
+
 - [x] **M0117-0001..0005** — DONE (designs `0117-0001..0005`; branches pending human
       merge off clean HEAD): wraparound-safe `storage.XIDPrecedes` horizon comparison;
       runtime CLOG-consulting visibility fallback; `pg_subtrans` restore-on-restart;
       `SUB_COMMITTED` (0x03) CLOG lane; incremental flush + group commit.
 - [ ] **M0117-0006 — SLRU buffer pool / 2-bit collapse (gap G6; Effort L).** Part A
       landed (`transaction_buffers` GUC + `clogBufferPool`, NOT wired to the live path —
-      blast radius nil). **Part B (DEFERRED, ledger 2026-06-15):** route `GetStatus`/
-      `setStatus` + bulk callers / `loadFromSLRU` / `TruncateCLOG` through the pool
-      (open Qs in design `0117-0006-*`: mirror-disabled fallback, OR-vs-clear-then-set
-      semantics, truncation-via-page-invalidation). **Part C (DEFERRED):** remove the
-      resident `banks` + `global/pg_xact` flat file (16× memory reduction). Re-init data
-      dir on the memory-model change.
+      blast radius nil). **Part B LANDED 2026-06-29 (loop #11, design `0117-0006-*`
+      "Part B — LANDED"):** the pool is now the live in-memory store
+      (`CLog.pool atomic.Pointer`, promoted by `EnablePGSLRUMirror` after the backfill);
+      `GetStatus`/`setStatus`, the group-commit leader (`applyGroupBatchLocked`→
+      `pool.flushDirty`), and the bulk callers (`InitializeAsCommitted`/
+      `MarkUnknownAsAborted`/`HighestKnownXID` via new `highestSLRUXID`/`TruncateCLOG`
+      via new `pool.invalidateBelow`) all route through it. The never-fsynced legacy
+      `global/pg_xact` flat file is retired (SLRU = single durable store; basebackup
+      already excluded it; PG has no such file). The deferral reason on record across
+      loops #7–#10 — *"the mandatory gates SKIP in the autonomous WSL2 loop"* — was
+      **empirically disproven**: standby-attach + checksum-streaming E2E, `-race`
+      mvcc/wal (incl. xlog_replay), and **TPC-H Q12=2/Q13=33 spot-check** all RUN+PASS.
+      Regression `clog_bufferpool_live_test.go`. **Part C (DEFERRED, ledger):** remove
+      the resident `banks` (16× memory reduction) once the no-mirror unit tests are
+      migrated; re-init data dir on the memory-model change. Box stays unchecked until
+      Part C lands. **Follow-up LANDED 2026-06-29 (loop #12):** the
+      `transaction_buffers` GUC value is now threaded into `CLog.SetCLOGBuffers`
+      from `initdb.Open` (new `OpenOptions.TransactionBuffers`, read in `cmd/goopg
+      start` via `intGUC`). Boot default 0 keeps the auto-16 floor (no behaviour
+      change); a non-zero `postgresql.conf` override now sizes the live pool.
+      Regression `TestTransactionBuffersFromGUC` + `TestSetCLOGBuffersSizesPool`.
 - [ ] **M0117-0007 — Async-commit LSN tracking (gap G8; Effort L).** Part A landed
       (per-LSN-group tracking + page-write WAL barrier on the M0117-0006 pool, not live).
       **Part B (DEFERRED):** live `synchronous_commit=off` — wire `flushWAL` to the WAL
@@ -148,9 +194,19 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       M0100 + real SSI 40001 dangerous-structure detector M0104); promoted the whole
       group from soft `runIsoSpec` to `runIsoSpecStrict` in their dedicated
       `TestPort_Isolation*` functions with NO engine change. D-002 CSV rationale updated.
-- [ ] **M0118-0002** — Predicate-lock granularity per access method / scan type:
+- [x] **M0118-0002** — Predicate-lock granularity per access method / scan type:
       predicate-gin, predicate-gist, predicate-hash, predicate-lock-hot-tuple,
       index-only-scan, index-only-bitmapscan, partial-index.
+      **GROUP COMPLETE (2026-06-29).** All seven specs strict-promoted to
+      pass-required and byte-identical to PG 18.3. `predicate-gin` was the last
+      (design 0118-0140): GIN per-key predicate locking via key-grain SIREAD
+      (`ssiGinKeyPage` FNV pseudo-page, `ssiRecordGinKeyRead` on the `@>` seq-scan
+      path replacing the relation-grain lock + `ssiRecordGinIndexInsert` twin
+      conflicting-in on each inserted element; `fastupdate=on` uses a whole-index
+      sentinel page toggled by the new `ALTER INDEX … SET (fastupdate=…)` parse +
+      executor). Isolation tally **120 pass / 1 failed** — the lone remaining
+      `failed` spec is `deadlock-parallel` (M0118-0004; needs a parallel-query
+      lock-group abstraction goopg has no subsystem for — infeasible).
       **PARTIAL (2026-06-22, design 0118-0026):** probe-first ranked all 7; three
       promoted to pass-required (strict) with NO engine change —
       `predicate-lock-hot-tuple`, `partial-index`, `index-only-scan` already match
@@ -209,6 +265,125 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       `predicate-gin`/`predicate-gist` need real GIN/GiST AMs; `predicate-hash`
       over-detects 40001 (coarse relation-grain SIREAD). Isolation tally now
       117 pass / 4 failed.
+      **2026-06-29 (design 0118-0135, enabler — NOT a promotion): `predicate-gist`
+      read-step support.** Probe-first found the spec already runs (point type,
+      `point(x,y)`, `CREATE INDEX … USING gist`, SERIALIZABLE all present) but its
+      first read step errored on two gaps: (1) `p[0]` subscripting a point
+      char-subscripted the text form (`point(10,10)[0]`→`"("`), so `sum(p[0])`
+      failed `42804 sum() argument must be numeric` — now returns the 0/1
+      coordinate (0-based, PG geometric: `[0]`=X `[1]`=Y) as numeric, typed float8
+      by analyzer+planner; (2) `<<`/`>>` on points raised `42883 requires integer
+      operands` (parsed as bit-shift) — now `p << q`⇔`p.x<q.x`, `p >> q`⇔`p.x>q.x`
+      → bool. **A filtered probe confirms ZERO SSI divergences** — goopg's 40001
+      behaviour already matches PG byte-for-byte across all permutations
+      (relation/tuple-grain SIREAD happens to coincide with PG's gist page-level
+      locking for this spec's spatial data). The **sole** remaining divergence is
+      goopg's float8 *text output* (`2.23375e+06` vs PG `2233750`; `codec.go`
+      `FormatFloat(…,'g',-1,64)`), a cluster-wide display path deferred to a
+      dedicated `float8out` loop (ground-truth vs local PG + full regress-port
+      re-run required) — after which `predicate-gist` is expected to PROMOTE with
+      no further SSI work. `predicate-gin` independently needs `int4[]`-column
+      array typing (`array[1]`→int4[] collapses to int4 today) + a GIN AM.
+      Tests `TestPointStrictlyLeftRightOperators` (executor) +
+      `TestPort_PointGeometricRead` (end-to-end). Ledger row recorded.
+      **2026-06-29 (design 0118-0136, enabler — NOT a promotion): PG-faithful
+      `float4out`/`float8out`.** New `executor.PGFloatOut` reproduces PG's
+      `float8out`/`float4out`: shortest round-trip decimal (Ryu via Go's `'e'`
+      verb) + PG's fixed-vs-scientific *display-exponent* threshold (`[-4,15)`
+      float8, `[-4,6)` float4), so `2233750::float8`→`2233750` not
+      `2.23375e+06`. Wired at ALL FOUR sibling sites (encode↔wire-simple↔
+      wire-extended↔test-harness): `codec.go` `encodeValuePG`, `dispatch.go`
+      `appendFloatText`/`appendFloat8Text`, `dispatch_extended.go` float result
+      columns, `isolation_runner.go` `scanResultSet` (scan float OIDs 700/701 as
+      `NullFloat64`, render via `PGFloatOut`). Cluster-wide float text is now
+      byte-faithful to PG 18.3. **CORRECTION:** the prior "filtered probe →
+      ZERO SSI divergences" claim was WRONG. With float output fixed, a full
+      probe shows `predicate-gist`'s first divergence is a GENUINE SSI
+      **over-detection**: perm `rxy3 wx3 rxy4 c1 wy4 c2` — goopg raises `40001`
+      on `c2` commit where PG commits cleanly. `rxy3` reads `p>>point(6000,6000)`
+      (X>6000), `rxy4` reads `p<<point(1000,1000)` (X<1000); `wx3` inserts
+      high-X, `wy4` low-X — PG's GiST **page-level** predicate locks see disjoint
+      spatial regions (no dangerous cycle), goopg's coarse relation/tuple-grain
+      SIREAD locks the whole relation → false write-skew cycle → spurious
+      `40001`. **Remaining blocker (deferred):** GiST spatial page-grain (or
+      bounding-box/grid-cell) predicate locking — the granularity class
+      `predicate-hash` solved with bucket-grain SIREAD (FNV→`PageLockTag`, design
+      0118-0099); Effort-L. `predicate-gin` still needs `int4[]`-column array
+      typing + a GIN AM. Tests `TestPGFloatOut` (28 float8 + 17 float4
+      PG-captured goldens) + full `TestPort_RegressSuite` re-run + TPC-H
+      Q12/Q13 spot-check. Ledger row recorded.
+      **`predicate-gist` PROMOTED (2026-06-29, design 0118-0137): GiST
+      page-level predicate locking via grid-cell SIREAD.** `failed`→`pass`, all
+      36 perms byte-identical to PG 18.3; strict `TestPort_IsolationPredicateGist`;
+      isolation tally now 119 pass / 2 failed. Closes the granularity gap the
+      0118-0135/0118-0136 enablers had isolated. goopg has no native GiST AM (a
+      `USING gist` index is catalog-only → spatial queries seq-scan), so the seq
+      scan's relation-grain SIREAD over-aborted all 18 disjoint-region perms. Fix
+      emulates GiST leaf-page granularity with a synthetic grid: `ssiGistGridCell`
+      = FNV-1a of `(floor(x/256),floor(y/256))` → 31-bit pseudo-page; a
+      SERIALIZABLE seq scan of a GiST-indexed table takes a per-matching-tuple
+      grid-cell SIREAD on the INDEX (`ssiRecordGistGridRead`) instead of the
+      relation lock (suppressed), and an INSERT conflicts-in on its point's cell
+      (`ssiRecordGistIndexInsert`, the `ssiRecordHashIndexInsert` twin). Heap
+      per-tuple SIREAD skipped (would coarsen to a heap-page lock → false
+      positives); invisible-tuple conflict-out gated by spatial match
+      (`gistTupleMatches`). `Filter`-over-`SeqScan` predicate threaded in BOTH
+      build paths (`Build` + live `buildRec`/`BuildFastIterator`). Blast radius
+      bounded behind `gistSSIIdxOID != 0` (0 for every non-gist scan); catalog
+      `Method`/pg_am/pg_dump/WAL unchanged. Gates: strict 36-perm PASS; non-gist
+      SSI regression (`predicate-hash`/`partial-index`/`index-only-scan`/
+      `simple-write-skew`/`project-manager`/`classroom-scheduling`/
+      `read-write-unique`) PASS; `-race` executor+mvcc + full executor/planner
+      units PASS; `go build ./...` clean; pgbench smoke 0 failed; TPC-H spot-check
+      infra-timed-out on WSL2 (gated path unaffected). **Remaining in M0118-0002:
+      `predicate-gin`** (needs `int4[]`-column array typing + a GIN AM) — group
+      stays open.
+      **2026-06-29 enabler (design 0118-0138, NOT a promotion): `int4[]` user
+      array column storage round-trip.** `predicate-gin.spec`'s global `setup`
+      (`create table gin_tbl(p int4[]); insert … select array[1] …`) failed at
+      the INSERT with `invalid input syntax for type integer: "{1}"` — a user
+      array column (`catalog.Type{Name:"int4", IsArray:true}`; Name is the
+      ELEMENT type, array-ness tracked separately) was treated as a scalar int4
+      at five `Type.Name`-only sites. New `internal/executor/codec_array.go`
+      stores array columns as PG-native `ArrayType` varlena blobs (1-D, no-NULL;
+      24-byte header + typalign-packed elements; int2/int4/int8/oid/float4/
+      float8/bool fixed + text/varchar/bpchar varlena) and decodes back to
+      canonical `"{1,2}"` text. Wired behind `if t.IsArray` at `encodeValuePG`,
+      `decodePhysicalPGValueMctx`, `physicalPGTypeAlign`; insertOp integer-range
+      coercion skips array cols (`operators_storage.go`); `isAssignable` accepts
+      an array source for an array dst (`analyzer.go`, fixes VALUES-path 42804);
+      BOTH simple+extended RowDescription loops advertise the array OID via
+      `catalog.ArrayOIDForBase` when `IsArray` (`server/dispatch.go`, sibling
+      paths — fixes client-side `strconv.ParseInt: parsing "{1}"`). Zero blast
+      radius outside array columns (every branch `IsArray`-gated; scalar paths
+      byte-identical). First divergence advanced from permutation-0 global setup
+      (blocked ALL perms) to the first read step `ra1` (`p @> array[1]` →
+      `operator @>: invalid box value`). Spec stays `failed`. Remaining blockers
+      (ledgered): (1) `@>` array-containment runtime (mis-dispatched to geometric
+      `box @> box`); (2) GIN page-grain SSI (reuse the 0118-0137 grid-cell
+      primitive keyed on the GIN search key). Tests `TestArrayCodecRoundTrip` +
+      `TestArrayCodecTextElementQuoting`.
+      **2026-06-29 enabler (design 0118-0139, NOT a promotion): `anyarray`
+      containment/overlap operators `@>` `<@` `&&`.** Read step `ra1`
+      (`select * from gin_tbl where p @> array[1]`) failed `operator @>: invalid
+      box value` — these symbols were implemented only as the geometric **box**
+      operators (`parseBoxText` on both operands). PG overloads them by operand
+      type (`anyarray @> anyarray` → `arraycontains`/`arraycontained`/
+      `arrayoverlap`). Fix: at the `OpContains`/`OpContainedBy`/`OpOverlap` case
+      in `evalBinaryOp` (expr.go), BEFORE box parsing, detect both operands as
+      array literals (`isArrayLiteralText`: `{`…`}`) and route to set-membership
+      (`evalArraySetOp`/`arrayElemsSubset`): `a @> b` = every elem of `b` in `a`;
+      `a <@ b` = every elem of `a` in `b`; `a && b` = shared elem; `{}` trivially
+      contained. Zero blast radius (fires only when BOTH operands are `{`…`}`).
+      First divergence advances from `ra1` (`invalid box value`) to a genuine SSI
+      granularity divergence: a disjoint perm (`ra1 ro2 wo1 c1 wb2 c2`: read key
+      1, insert key 2) returns correct rows but goopg over-aborts the writer
+      40001 (no native GIN AM → seq-scan relation-grain SIREAD). Spec stays
+      `failed`. Remaining blocker (ledgered): GIN key-grain SSI — reuse the
+      0118-0137 grid-cell primitive keyed on the GIN search key (array element),
+      `ssiRecordGinKeyRead` on the scan path + `ssiRecordGinIndexInsert` twin per
+      inserted element + the `fastupdate=on` whole-index sentinel-key case.
+      Test `TestArraySetOps`.
 - [x] **M0118-0003** — Row locking (FOR UPDATE/SHARE, SKIP LOCKED, NOWAIT): **COMPLETE.**
       All 20 specs PASS vs PG 18.3 (verified 2026-06-22): skip-locked{,-2,-3,-4},
       nowait{,-2,-3,-4,-5}, lock-nowait,
@@ -454,6 +629,21 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       multiple-cic, vacuum-{concurrent-drop,conflict,no-cleanup-lock,skip-locked},
       truncate-conflict, sequence-ddl, cluster-conflict{,-partition}, create-trigger,
       inherit-temp, plpgsql-toast.
+      **2026-06-28 regression fix (design 0118-0134): `vacuum-concurrent-drop` +
+      `vacuum-skip-locked` restored to green.** Both pass-required specs had been
+      silently RED since commit d1f40e28 (design 0118-0090 async-notify), found by
+      git-bisecting `TestPort_IsolationVacuumConcurrentDrop`. Their lock step is a
+      single two-statement step `{ BEGIN; LOCK part1 IN SHARE MODE; }`; the
+      async-notify loop changed the isolation runner to send a multi-statement step
+      as ONE simple-query message (`execMultiStatement`). That exposed a latent
+      server bug: `dispatchSimpleQueryViaExecutor` seeded `ectx.TxnLockBackendID`
+      ONCE before the per-statement loop from the message-entry txn state (autocommit
+      for `BEGIN; LOCK …`), so when `LOCK` ran later in the same loop it saw
+      `TxnLockBackendID==0` and `acquireRelLockTxn` degraded to a display-only no-op
+      — no real ShareLock, so the concurrent ANALYZE/VACUUM never `<waiting>`-blocked
+      and the drop re-check WARNING never fired. Fix refreshes `ectx.TxnLockBackendID`
+      at the top of the statement loop from the LIVE `connTx.InExplicit()` state.
+      Strict `TestPort_IsolationVacuumConcurrentDrop`/`VacuumSkipLocked` PASS.
       **COMPLETE (2026-06-24, loop #24).** All 25 specs are strict-promoted
       (`runIsoSpecStrict`) and byte-for-byte vs PG 18.3 — `reindex-concurrently-toast`
       (design 0118-0088) was the last, closing the TOAST-exposure epic. This loop
@@ -1162,7 +1352,7 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       neither waits nor sees the pre-change child set — the hard tail needs
       transactional-DDL cross-session visibility; others need parser support
       (`NOT VALID`/`VALIDATE CONSTRAINT`, `DETACH … CONCURRENTLY`).
-- [ ] **M0118-0009** — Misc / system-level specs: async-notify, timeouts, stats, horizons,
+- [x] **M0118-0009** — Misc / system-level specs: async-notify, timeouts, stats, horizons,
       freeze-the-dead, inplace-inval, intra-grant-inplace{,-db}, subxid-overflow,
       prepared-transactions{,-cic}, temp-schema-cleanup, multixact-no-forget,
       aborted-keyrevoke, delete-abort-savept{,-2}.
@@ -1705,3 +1895,254 @@ test → set its CSV row `status=pass` (rationale = the Go test func name) → r
       VACUUM `vacuum_count`/live-dead recompute, SLRU stats. Tests:
       `pgstat_relations_test.go` (accumulate/flush/get, update dead-delta,
       drop-without-revival); `TestPort_IsolationStats` soft probe L2180→L2704.
+      **2026-06-28 (design 0118-0131, enabler — NOT a promotion): `stats` rung 7.**
+      Made the relation insert/update/delete counters + live/dead deltas
+      **transactional**; first divergence advanced **L2704 → L3072** — every
+      abort/`ROLLBACK PREPARED`, TRUNCATE-in-2PC, and cross-backend
+      `COMMIT`/`ROLLBACK PREPARED` permutation now matches PG 18.3 byte-for-byte.
+      New **staging** tier (`relXactCounters` ≈ `PgStat_TableXactStatus`) in front
+      of `pending`: DML `op.Close` stages into `staging[sessionID][oid]` via
+      `recordRel{Insert,Update,Delete}`; `execCommit`/`execRollback` fold it into
+      `pending` with PG commit-vs-abort math (`AtEOXact_PgStat_Relations`: aborted
+      insert/update → dead, aborted delete = live/dead no-op, attempted `tuples_*`
+      always count); autocommit folds immediately. TRUNCATE (`recordRelTruncate` ≈
+      `pgstat_count_truncate`) saves pre-truncate counts, resets staged counters,
+      rides a `truncDropped` flag through `pending`→`shared` at flush (forgets
+      already-flushed live/dead). 2PC: `PrepareRelStats` moves staging into a
+      per-gid record at the detached PREPARE (`twophase.go`);
+      `FinalizePreparedRelStats` folds it into the FINALISING backend's pending at
+      COMMIT/ROLLBACK PREPARED (`pgstat_twophase_post{commit,abort}`). Scan
+      counters stay non-transactional. New first divergence L3072 = `pg_stat_slru`
+      SLRU stats (final rung). Known limitation: no sub-transaction (savepoint)
+      staging tier yet (top-level only). Tests: `pgstat_relations_test.go`
+      (staging+commit+flush, abort `1/8`, TRUNCATE `5/1/0/1/1`, 2PC commit/abort
+      cross-backend, drop clears staging/prepared); `TestPort_IsolationStats` soft
+      probe L2704→L3072; 2PC + DML+commit/rollback strict isolation regression PASS.
+      **2026-06-28 (design 0118-0132, enabler — NOT a promotion): `stats` rung 8
+      (final).** Implemented the `pg_stat_slru` notify `blks_zeroed` counter + the
+      `block_size` preset GUC; first divergence advanced **L3072 → L3732** (the
+      spec's LAST permutation) — every SLRU permutation (own-/separate-/
+      uncommitted-transaction + all three `stats_fetch_consistency` models with
+      `pg_stat_clear_snapshot`) now matches PG 18.3 byte-for-byte. New
+      `internal/executor/pgstat_slru.go`: process-global `slruStatsManager` models
+      the notify SLRU by tracking a modelled queue head and counting 8192-byte
+      page crossings (the `SimpleLruZeroPage()` events upstream
+      `asyncQueueAddEntries()` records; goopg's notify queue is an in-memory inbox,
+      not an SLRU). Hook in `server/notify.go` `publishPendingNotify` (the single
+      COMMIT-time publish point) sums buffered notifications' modelled byte length
+      and calls `executor.RecordNotifyQueueWrite`, gated on a listener
+      (`hub.hasAnyListener()` — PG only writes the shared queue when a backend
+      LISTENs; counting at COMMIT yields `f` in-txn, `t` post-commit). SLRU joins
+      the per-transaction snapshot (`funcStatSnapshot.slruFrozen`/`slruCache`;
+      `ensureFullSnapshot` freezes both function + SLRU stores cross-kind under
+      `snapshot`). `valuesOp.Open` serves `pg_stat_slru` from snapshot-aware
+      `fetchSLRURows(ctx)`; static catalog `VirtualRows` fallback corrected to
+      PG-17+ names (`notify`/`commit_timestamp`/…/`other`). Registered `block_size
+      = 8192` (`PGC_INTERNAL` preset) so `current_setting('block_size')` resolves
+      (was NULL → empty payload → 3 notifications collapsed to one zero-length
+      entry, never crossing a page). **The ONE remaining blocker (L3732) is NOT
+      SLRU:** the spec's last permutation relies on `track_functions = 'all'`
+      LEAKING across permutations — upstream `isolationtester.c` opens one
+      connection per session ONCE and reuses it for all permutations, so session
+      GUCs persist; goopg's `IsolationRunner.runPermutation` reconnects per
+      permutation, resetting `track_functions` to boot `none`, so the post-clear
+      `pg_stat_get_function_calls` reads NULL not `1`. **Promoting `stats` to
+      `pass` needs the runner connection-reuse change** (hoist per-session conns to
+      spec scope, run only session `setup` per permutation) — shared test infra
+      touching ~117 strict specs, deferred to its own loop (ledger 2026-06-28).
+      Tests: `TestSLRUNotifyBlksZeroed` (executor) + `TestNotifyEntryBytes`/
+      `TestHasAnyListener` (server), all `-race`; `TestFetchFuncStatConsistency`/
+      `TestStatsGUCs` PASS; `stats.spec` probe L3072→L3732 + async-notify + 2PC
+      regression PASS.
+      **2026-06-28 (design 0118-0133, PROMOTION — the final rung): `stats` is now
+      `pass`/pass-required.** Implemented the isolation-runner connection-reuse
+      change flagged by rung 8 as the last blocker. `RunSpec` now opens one
+      persistent connection per session ONCE per spec (`sessionConns` +
+      `openSessionConns`) and reuses it across EVERY permutation — mirroring
+      upstream `isolationtester.c` `main()`. `runPermutation` no longer
+      opens/closes connections; it still re-runs each session's `setup` SQL per
+      permutation (so `SET stats_fetch_consistency='none'` re-applies) but never
+      resets the connection, so a step-set GUC like `SET track_functions='all'`
+      persists into later permutations exactly as upstream — fixing L3732
+      (`pg_stat_get_function_calls` now reads `1` not NULL). `application_name`
+      SET + backend-PID record done once (stable); `sc.drainQueues()` clears the
+      transient notice/notify queues per permutation (monotonic notice `total`
+      kept — `notices <n>` blockers are delta-vs-baseline). Robustness: a
+      post-permutation `sc.healthy(ctx)` (`SELECT 1`/session, 1 s deadline)
+      rebuilds the set if a timed-out step left a connection busy; `close()` is
+      3 s-bounded against a stuck lib/pq read. `TestPort_IsolationStats` flipped
+      to `runIsoSpecStrict` — PASS (byte-for-byte, all permutations); CSV `D-002`
+      rationale updated + md regenerated. Full `TestPort_Isolation*` strict suite
+      re-run (4 parallel batches): zero regressions from connection reuse — the
+      two failures observed (`vacuum-skip-locked`, `vacuum-concurrent-drop`) fail
+      identically at HEAD (pre-existing SKIP_LOCKED WARNING gap, the "4 failed" of
+      the 117/4 tally), and `tuplelock-upgrade-no-deadlock` was a load-induced
+      flake (passes solo). **`stats` is the LAST failed M0118-0009 spec — all
+      M0118-0009 specs are now resolved.**
+      **2026-06-29 (loop #2, doc reconciliation — no engine change): M0118-0009
+      CLOSED + lagging per-spec inventory reconciled.** The stats promotion commit
+      998b9e97 (design 0118-0133) flipped only the suite-level
+      `postgres-oracle-port-status.csv` D-002 row; the per-spec
+      `postgres-oracle-target-inventory.csv` row for `stats.spec` was still `failed`,
+      so `upstream-isolation-coverage.md` + `postgres-oracle-target-inventory.md`
+      under-counted (117 pass / 4 failed). Re-verified `TestPort_IsolationStats`
+      strict PASS (3.0 s), flipped the inventory CSV row failed→pass (comma-free
+      rationale), regenerated both md via `gen-isolation-coverage` +
+      `gen-oracle-inventory`. Isolation tally now **118 pass / 3 failed**. The 3
+      remaining failed specs are NOT M0118-0009 — they are
+      `predicate-gin`/`predicate-gist` (M0118-0002: GIN/GiST AMs + GiST page-grain
+      SIREAD) and `deadlock-parallel` (M0118-0004: parallel-worker lock groups, no
+      parallel query in goopg), each a genuinely Effort-L unbuilt subsystem.
+      M0118-0009 checkbox ticked.
+
+## M0119 — Deferral-Ledger Backlog Consumption (filed 2026-06-29)
+
+Milestone: `docs/milestones/0119-deferral-ledger-backlog-consumption.md`
+(**living milestone** — tasks are appended over time; see below). Source of truth:
+`.ralph/deferral_ledger.md`. Goal: drive every open (`status = -`) ledger row to
+closure — implement the deferred scope, or verify it already landed and mark the
+row `resolved`.
+
+**Per-task rule (applies to every M0119 implementation task):** before
+implementation begins, the picking agent MUST (1) create a design doc at
+`docs/design/<source-id>-NNNN-*.md` and index it in `docs/design/README.md`, and
+(2) have that design doc pass an **agent review**. Implementation starts only
+after the reviewed design doc exists. (The M0119-0001 triage task is
+documentation-only and is exempt from the design-doc requirement.)
+
+- [x] **M0119-0001 — Ledger triage pass (doc-only, no design doc). DONE
+      2026-06-29 (loop #13).** Triaged all **224** open (`status = -`) ledger rows
+      against current HEAD (fix_plan promotions + `docs/test-port/*.csv` +
+      `git log` + code), via 6 parallel triage agents under a strict rule (a row
+      is `resolved` only if EVERY deliverable named in its `deferred` column has
+      landed). Result: **178 flipped `-`→`resolved`, 46 remain genuinely open.**
+      The 46 open rows cluster cleanly into the seeded backlog tasks below:
+      - **AC-003 amcheck server tier** (M0119-0006): ~29 rows — `003_check` /
+        `004_verify_heapam` MVCC+TOAST / `005_opclass_damage` need hash/gist/gin/
+        brin/spgist index AMs, `box`/`int4range`/`int4[]` types, STORAGE EXTERNAL
+        TOAST corruption, opclass parity, the heapallindexed heap-scan producer,
+        and the `datconnlimit = -2` invalid-DB filter (runtime shared-catalog write).
+      - **CLOG tail** (M0119-0002): M0117-0006 Part C (remove resident banks),
+        M0117-0007 Part B (live `synchronous_commit=off`), M0117-0008 Part B
+        (on-disk `datfrozenxid` persistence).
+      - **pg_dump 002–010 / DU-002** (M0119-0004): catalog-view parity umbrella,
+        plus two general SQL-engine gaps surfaced here — NULLS-NOT-DISTINCT
+        *enforcement* at INSERT/UPDATE (dump fidelity only today) and
+        deferred-constraint *checking at COMMIT* (goopg checks immediately).
+      - **pg_waldump WD-002** (M0119-0005); **pg_basebackup 011 in-place
+        tablespace + 030 recvlogical** (M0095-0003 / M0119-0007).
+      - **NEW open items not in the seeded list:** `M0118-0129` (HOT-update WAL
+        atomicity — grouped old+new WAL record + cross-page HOT + TOAST orphan
+        revert) and `M0118-0130` (B-tree buffer-pool concurrent pin/unpin
+        correctness → Lehman-Yao lock coupling / `splitMu` removal). Both are
+        deferred *improvements*, not failing specs.
+      Two seeded tasks are now **empty backlog** (mark before picking): **M0119-0003**
+      — the triage found every listed initdb option (`--encoding`,
+      `--locale`/`--lc-*`/`--locale-provider`/`--icu-locale`, `--allow-group-access`,
+      `--auth*`/`--pwfile`, `--sync-method`/`--no-sync-data-files`,
+      `--set`/`--text-search-config`) AND the `--data-checksums` default-ON flip
+      already landed on this branch (`internal/initdb/{encoding,locale}.go`,
+      `Options.{SyncMethod,NoSyncDataFiles,…}`, `cmd/goopg start` `fs.Bool("k", true)`);
+      ledger rows 18/22–27 are `resolved`. **M0119-0008** — predicate-gin/gist are
+      PROMOTED (M0118-0002 group COMPLETE); the only residual isolation `failed`
+      spec is `deadlock-parallel` (infeasible — no parallel-query lock groups), and
+      it has no open ledger row of its own.
+- [ ] **M0119-0002 — CLOG store swap, Part B** (source: M0117-0006 / M0117-0007 /
+      M0117-0008; see M0117 section + ledger rows). Live CLOG store swap (pool
+      replaces banks) per the design-0117-0006 Part B blueprint. Highest blast
+      radius (Hard-won Rule #1): dedicated full-gate session (`-race` mvcc+wal,
+      xlog_replay, heterogeneous PG-standby E2E, fresh-server TPC-H Q12/Q13).
+- [x] **M0119-0003 — initdb remaining options. RESOLVED by triage 2026-06-29
+      (M0119-0001), no separate impl loop needed.** Every listed option already
+      landed on this branch — `--encoding` (`internal/initdb/encoding.go`),
+      `--locale`/`--lc-*`/`--locale-provider`/`--icu-locale` (`locale.go` +
+      `Options.{Locale,LCCollate,…,LocaleProvider,ICULocale,ICURules}`),
+      `--allow-group-access`, `--auth*`/`--pwfile` (`auth_bootstrap.go`),
+      `--sync-method`/`--no-sync-data-files` (`Options.SyncMethod`/`NoSyncDataFiles`,
+      `syncfs_linux.go`), `--set`/`--text-search-config` (`Options.{ExtraGUC,
+      TextSearchConfig}`), and the `--data-checksums` **default-ON flip**
+      (`cmd/goopg start` `fs.Bool("k", true, …)`). All wired through
+      `initdb.Options` in `cmd/goopg/main.go`. Ledger rows 18/22–27 are `resolved`.
+      (If `001_initdb.pl` TAP assertions per option are later wanted, that is a
+      fresh D-001-scoped test-port task, not this implementation backlog.)
+- [ ] **M0119-0004 — pg_dump 002–010 TAP** (source: M0110-0001; see M0110
+      section). Schema dump, dump/restore round-trip, parallel, filter-file,
+      connstr — advance the catalog-view parity battery slice-by-slice.
+      **2026-06-29 (loop #14, design 0119-0004): NULLS-NOT-DISTINCT *enforcement*
+      sub-feature LANDED** (one of the two general SQL-engine gaps the triage
+      surfaced under this task). Runtime `NULLS NOT DISTINCT` uniqueness is now
+      enforced for plain INSERT/UPDATE — `checkUniqueIndexes{ForInsert,ForUpdate}`
+      fall back to a heap scan (`checkNullsNotDistinctViaHeapScan`) when a key
+      column is NULL on an `idx.NullsNotDistinct` index, raising 23505 for a
+      duplicate NULL pattern; btree/scan-probe/codec untouched, gated dead-code
+      for every non-NND index. Tests `internal/executor/nulls_not_distinct_test.go`.
+      **2026-06-29 (loop #15, design 0119-0004 §8): NND ON CONFLICT/upsert
+      arbiter follow-up LANDED** — a NULL-keyed `INSERT … ON CONFLICT (nndcol)
+      DO UPDATE/NOTHING` against an NND arbiter index now routes to the conflict
+      action instead of inserting a duplicate. New `probeArbiterNND`
+      (operators_upsert.go) reuses `checkNullsNotDistinctViaHeapScan`; the upsert
+      `Next` loop falls back to it after the btree arbiter probe on the
+      non-reordered path; `indexKeyColumnsChanged` made NND-aware
+      (`nndKeyColumnsEqual`, operators_storage.go) so a NULL→NULL no-key-change
+      DO UPDATE skips the pre-stamp self-conflict probe. 3 new upsert tests +
+      `TestPort_IsolationInsertConflict*`/`Merge*` PASS; zero blast radius
+      outside NND.
+      **2026-06-29 (loop #16, design 0119-0004 §9): NND CREATE [UNIQUE] INDEX
+      build over NULL-keyed data LANDED.** Both build paths
+      (`collectBTreeEntries`/`backfillBTree` via `encodeCompositeBTreeKey`,
+      operators_ddl.go) raised `42804 "column is null and cannot be indexed"` on
+      ANY NULL key column — rejecting CREATE INDEX over any NULL-containing
+      column (PG admits NULLs). `encodeCompositeBTreeKey` now returns
+      `hasNullKey` instead of erroring; default/non-unique builds SKIP NULL-keyed
+      rows (mirroring the runtime maintain path — no null bitmap), and a
+      `unique && nullsNotDistinct` build dedups null-bearing rows via a
+      build-local `seenNull`/`nndNullKeyDedupKey` map, raising 23505 on a
+      duplicate NULL pattern. NND flag threaded as a new `nullsNotDistinct`
+      param through `createBTreeIndex`→`bulkBuildBTree[WithPredicate]`→
+      `collectBTreeEntries`/`backfillBTree` (all 16 call sites; 5 NND-capable
+      forms forward the real flag, PK/non-unique pass false). 4 new build-path
+      tests; full executor suite + -race PASS; zero blast radius for default
+      indexes (NULL row now skipped not errored — strict improvement).
+      **2026-06-29 (loop #17, design 0119-0004 §10): NND reordered
+      partition-leaf arbiter LANDED — the final NND sub-feature (c).** An
+      `INSERT … ON CONFLICT (nndcol) DO UPDATE|NOTHING` routing to a partition
+      leaf whose column order differs from the parent (`partLeaf != nil`)
+      skipped the NND heap-scan fallback entirely (`if !conflicted && partLeaf
+      == nil`), wrongly inserting a duplicate NULL row where PG routes to the
+      conflict action. `probeArbiterNND`/`checkNullsNotDistinctViaHeapScan`
+      resolve key columns by NAME against `cols` and read the candidate at the
+      matching ordinal, so the passed row must share `cols`' order; the loop now
+      passes `insertedForLeaf` (already leaf-ordered on the reordered path, ==
+      `inserted` on every non-reordered path) and drops the guard. conflictRow
+      is decoded in leaf order as before, so the downstream leaf→parent remap is
+      unchanged. New test `TestNullsNotDistinctOnConflictReorderedPartitionLeaf`
+      (parent `(a,b,c)` / leaf `(c,b,a)` / NND `(a,b)`; DO NOTHING skip + DO
+      UPDATE target; confirmed RED→GREEN); `-race` Upsert/Conflict/Partition +
+      `TestPort_IsolationInsertConflict*`/`Merge*` PASS; zero blast radius
+      outside NND. **All three NND enforcement sub-features (a)–(c) are now
+      landed.**
+      **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
+      battery and the **deferred-constraint-checking-at-COMMIT** engine gap.
+- [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
+      section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
+      PG-decodable FPI/heap WAL (+ index AMs for the server tier).
+- [ ] **M0119-0006 — pg_amcheck server tier** (source: M0110-0003; see M0110
+      ledger rows). `002_nonesuch` … `005_opclass_damage`; `CREATE EXTENSION
+      amcheck` + `verify_heapam()` SRF on top of `internal/amcheck` + opclass
+      catalog parity.
+- [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003; see M0095
+      section). `030 recvlogical` — blocked on logical decoding (tracks the
+      logical-replication milestone / D-004).
+- [x] **M0119-0008 — isolation residual. RESOLVED by triage 2026-06-29
+      (M0119-0001) — no actionable backlog.** predicate-gin AND predicate-gist are
+      PROMOTED (M0118-0002 group COMPLETE; designs 0118-0137/0118-0140); their
+      ledger rows (227–235) are `resolved`. The ONLY remaining `failed` isolation
+      spec in the whole suite is `deadlock-parallel`, which is **infeasible** in
+      goopg today (needs a parallel-query worker lock-group abstraction goopg has
+      no subsystem for) and carries no open ledger row of its own. Nothing
+      actionable until parallel query lands.
+
+> This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
+> future deferral-ledger entry (any new `status = -` row) feed additional M0119
+> tasks over time. Finalize the themed-task set from the ledger's distinct open
+> task-ids; the milestone's living nature means it need not be complete at filing.

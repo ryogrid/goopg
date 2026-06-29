@@ -1155,6 +1155,10 @@ func analyzeExpr(e parser.Expr, ctx *scope) (catalog.Type, error) {
 			return catalog.Type{Name: "int2"}, nil
 		case "oidvector":
 			return catalog.Type{Name: "oid"}, nil
+		case "point":
+			// point[i] (0-based) returns the i-th coordinate as float8
+			// (point[0]=x, point[1]=y) — PostgreSQL geometric subscripting.
+			return catalog.Type{Name: "float8"}, nil
 		}
 		return catalog.Type{Name: "text"}, nil
 	case *parser.IndirectionStar:
@@ -2471,6 +2475,14 @@ func sameOrCompatible(a, b catalog.Type) bool {
 
 func isAssignable(src, dst catalog.Type) bool {
 	if isUnknownType(src) {
+		return true
+	}
+	// An array column (e.g. `p int4[]`, dst.IsArray) accepts any array-typed
+	// source: the ARRAY[...] constructor (analyzed as "text[]") or another
+	// array column/expression. Element-type validation happens at runtime in
+	// the array codec, mirroring PG's reliance on array_in to reject bad
+	// element text. M0118-0002.
+	if dst.IsArray && (src.IsArray || strings.HasSuffix(src.Name, "[]")) {
 		return true
 	}
 	if strings.EqualFold(src.Name, dst.Name) {

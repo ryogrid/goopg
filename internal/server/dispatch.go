@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -481,6 +480,22 @@ func (s *Server) dispatchSimpleQueryViaExecutor(ctx context.Context, r *protocol
 	}
 
 	for i, stmt := range stmts {
+		// Keep the transaction-scoped lock identity in sync with the LIVE
+		// transaction state across statements in a single simple-query message.
+		// ectx.TxnLockBackendID is seeded once before this loop from the
+		// message-entry state, which is autocommit for a "BEGIN; LOCK ..." step
+		// (the upstream isolationtester sends such a step as one PQexec message).
+		// A BEGIN earlier in the SAME message opens the explicit block, so a
+		// later LOCK TABLE — or a transaction-scoped maintenance lock — in that
+		// message must be transaction-scoped too; without this refresh it would
+		// see TxnLockBackendID==0 and acquire a display-only no-op lock that no
+		// concurrent session blocks on (regressing vacuum-concurrent-drop /
+		// vacuum-skip-locked). M0118-0009.
+		if connTx != nil && connTx.InExplicit() {
+			ectx.TxnLockBackendID = connTx.LockBackendID
+		} else {
+			ectx.TxnLockBackendID = 0
+		}
 		// Check for failed transaction state (25P02) — reject all statements
 		// except COMMIT/ROLLBACK/ABORT/END that clear the failed state.
 		// PostgreSQL semantics: an error inside an explicit transaction block
@@ -1997,9 +2012,16 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 	if schema != nil {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
+			oid := typeOIDFor(sc.Type.Name)
+			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
+			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
+			// rather than a scalar int4. M0118-0002.
+			if sc.Type.IsArray {
+				oid = catalog.ArrayOIDForBase(oid)
+			}
 			fields[i] = protocol.FieldDescription{
 				Name:         sc.Name,
-				TypeOID:      typeOIDFor(sc.Type.Name),
+				TypeOID:      oid,
 				TypeSize:     -1,
 				TypeModifier: -1,
 				Format:       0,
@@ -2328,23 +2350,9 @@ func appendFloatText(dst []byte, d executor.Datum, bitSize int) []byte {
 			return append(dst, s...)
 		}
 	}
-	if math.IsInf(f, 1) {
-		return append(dst, "Infinity"...)
-	}
-	if math.IsInf(f, -1) {
-		return append(dst, "-Infinity"...)
-	}
-	if math.IsNaN(f) {
-		return append(dst, "NaN"...)
-	}
-	s := strconv.FormatFloat(f, 'g', -1, bitSize)
-	if idx := strings.IndexByte(s, 'e'); idx >= 0 {
-		exp, err := strconv.Atoi(s[idx+1:])
-		if err == nil && exp >= 1 && exp <= 14 {
-			s = strconv.FormatFloat(f, 'f', -1, bitSize)
-		}
-	}
-	return append(dst, s...)
+	// PostgreSQL float4out/float8out: shortest round-trip decimal with PG's
+	// fixed-vs-scientific exponent thresholds (differs per type — see PGFloatOut).
+	return append(dst, executor.PGFloatOut(f, bitSize)...)
 }
 
 // (e.g. 1.2345678901234e+200) matching PostgreSQL's float8out behavior. M0097-0003.
@@ -2374,28 +2382,10 @@ func appendFloat8Text(dst []byte, d executor.Datum) []byte {
 			return append(dst, s...)
 		}
 	}
-	// PostgreSQL uses canonical names for special values, not Go's "+Inf"/"-Inf".
-	if math.IsInf(f, 1) {
-		return append(dst, "Infinity"...)
-	}
-	if math.IsInf(f, -1) {
-		return append(dst, "-Infinity"...)
-	}
-	if math.IsNaN(f) {
-		return append(dst, "NaN"...)
-	}
-	// PostgreSQL's float8out uses the shortest round-trip representation.
-	// Go's 'g',-1 uses scientific notation for exponents >= 1, but PostgreSQL
-	// uses decimal for exponents in [1,14] (equivalent to %.15g). Convert back
-	// to decimal in that range to match PostgreSQL's formatting.
-	s := strconv.FormatFloat(f, 'g', -1, 64)
-	if idx := strings.IndexByte(s, 'e'); idx >= 0 {
-		exp, err := strconv.Atoi(s[idx+1:])
-		if err == nil && exp >= 1 && exp <= 14 {
-			s = strconv.FormatFloat(f, 'f', -1, 64)
-		}
-	}
-	return append(dst, s...)
+	// PostgreSQL's float8out uses the shortest round-trip representation with
+	// PG's fixed-vs-scientific exponent thresholds; PGFloatOut also renders the
+	// canonical special-value names (Infinity/-Infinity/NaN).
+	return append(dst, executor.PGFloatOut(f, 64)...)
 }
 
 // appendTimeText formats a KindTime datum as a time-of-day string matching PostgreSQL's
@@ -2534,9 +2524,16 @@ func (s *Server) executeFetch(_ context.Context, w *protocol.FrameWriter, ectx *
 	if schema != nil {
 		fields := make([]protocol.FieldDescription, len(schema))
 		for i, sc := range schema {
+			oid := typeOIDFor(sc.Type.Name)
+			// Array column (e.g. `p int4[]`): advertise the array pg_type OID
+			// (_int4 = 1007) so the client parses the "{1,2}" text as an array
+			// rather than a scalar int4. M0118-0002.
+			if sc.Type.IsArray {
+				oid = catalog.ArrayOIDForBase(oid)
+			}
 			fields[i] = protocol.FieldDescription{
 				Name:         sc.Name,
-				TypeOID:      typeOIDFor(sc.Type.Name),
+				TypeOID:      oid,
 				TypeSize:     -1,
 				TypeModifier: -1,
 				Format:       0,

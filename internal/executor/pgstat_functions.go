@@ -150,6 +150,28 @@ type funcStatSnapshot struct {
 	full       bool                        // a 'snapshot'-mode full copy has been taken
 	allFlushed map[uint32]funcStatCounters // entire shared store frozen at first access (snapshot mode)
 	perObject  map[uint32]cachedFuncStat   // lazily cached single-object reads (cache mode)
+	// SLRU fixed-amount stats participate in the same per-transaction snapshot.
+	// slruFrozen is captured together with allFlushed when the 'snapshot'-mode
+	// full copy is taken (so a variable-amount access freezes SLRU too, and vice
+	// versa); slruCache holds the whole SLRU set cached on its first access under
+	// 'cache' mode (fixed-amount stats are cached as one unit, independent of
+	// function objects). M0118-0009 (`stats`, SLRU rung).
+	slruFrozen map[string]slruCounters // snapshot mode: SLRU frozen with the full copy
+	slruCache  map[string]slruCounters // cache mode: SLRU cached on first SLRU access
+}
+
+// ensureFullSnapshot builds the 'snapshot'-mode whole-store copy on the first
+// access to any cumulative statistic in the transaction, capturing BOTH the
+// function-stats store and the fixed-amount SLRU store at the same instant.
+// Mirrors pgstat_build_snapshot copying every stats kind at once, so a later
+// access to a different kind reads its frozen value. Idempotent. M0118-0009.
+func ensureFullSnapshot(snap *funcStatSnapshot) {
+	if snap.full {
+		return
+	}
+	snap.allFlushed = funcStats.copyAll()
+	snap.slruFrozen = slruStats.snapshotAll()
+	snap.full = true
 }
 
 // fetchFuncStat reads the cumulative counters for a function OID honouring the
@@ -180,10 +202,7 @@ func fetchFuncStat(ctx *Context, oid uint32) (funcStatCounters, bool) {
 		return c, found
 	case "snapshot":
 		snap := sess.ensureStatsSnapshot()
-		if !snap.full {
-			snap.allFlushed = funcStats.copyAll()
-			snap.full = true
-		}
+		ensureFullSnapshot(snap)
 		c, ok := snap.allFlushed[oid]
 		return c, ok
 	default: // "none"

@@ -93,6 +93,11 @@ func (o *valuesOp) Open(ctx *Context) error {
 			// database-scoped lister so an extension installed in one database
 			// is invisible in another. M0110-0003 (AC-002 gap #7c).
 			o.rows = rematerialiseVirtualRowsFromStrings(tbl, ctx.ExtensionRows())
+		} else if tbl.Name == "pg_stat_slru" && ctx != nil {
+			// pg_stat_slru reports live cumulative SLRU statistics (notify
+			// blks_zeroed) honouring the session's stats_fetch_consistency, which
+			// the static catalog VirtualRows fallback cannot do. M0118-0009.
+			o.rows = rematerialiseVirtualRowsFromStrings(tbl, fetchSLRURows(ctx))
 		} else if tbl.VirtualRows != nil {
 			o.rows = rematerialiseVirtualRows(o.plan)
 		}

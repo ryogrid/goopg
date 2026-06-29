@@ -8731,6 +8731,10 @@ func exprType(e Expr) catalog.Type {
 				if strings.HasPrefix(arrT.Name, "_") {
 					return catalog.Type{Name: arrT.Name[1:]}
 				}
+				// point[i] (0-based) yields the i-th coordinate as float8.
+				if strings.EqualFold(arrT.Name, "point") {
+					return catalog.Type{Name: "float8"}
+				}
 				// When base type is unknown (e.g. $N parameter or unresolved expr),
 				// return "unknown" so arithmetic on the subscript can proceed at runtime.
 				if arrT.Name == "" || arrT.Name == "unknown" {

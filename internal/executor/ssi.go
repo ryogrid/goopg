@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"encoding/binary"
 	"errors"
 	"hash/fnv"
+	"math"
 
 	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/mvcc"
@@ -149,6 +151,241 @@ func ssiRecordHashIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.C
 		}
 		tag := mvcc.PageLockTag(dbOid, idx.OID, ssiHashBucket(key))
 		if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); cerr != nil {
+			return ssiReadAbortError(cerr)
+		}
+	}
+	return nil
+}
+
+// ssiGistCellSize is the side length (in point-coordinate units) of one cell in
+// the synthetic grid that stands in for GiST leaf-page granularity. goopg has no
+// native GiST access method — a `USING gist` index is catalog-only (no physical
+// tree), so a SERIALIZABLE spatial scan falls back to a seq scan. To reproduce
+// PG's PAGE-level GiST predicate locking (predicate-gist spec, "reduced false
+// positives") the scan instead locks the grid cell of each matching point: two
+// scans of disjoint spatial regions lock disjoint cells (no false conflict),
+// while a scan and an INSERT that touch the same spatial neighbourhood share a
+// cell (true rw-conflict). The base data (point(g*10,g*10), g=1..1000) is dense
+// at this resolution, so every queried sub-region's boundary cells are populated
+// — an INSERT landing in a read region always collides with a locked cell.
+const ssiGistCellSize = 256.0
+
+// ssiGistGridCell maps a point's (x, y) to a stable pseudo-page number for a
+// grid-cell predicate lock. The cell index is the FNV hash of the integer grid
+// coordinates (floor(x/cell), floor(y/cell)): equal cells always map to the same
+// page; distinct cells collide only with ~2^-31 probability (a collision merely
+// re-introduces a false-positive conflict — the safe over-abort direction).
+// Masked to 31 bits so the result is never InvalidBlockNumber, which
+// mvcc.PageLockTag rejects. FNV (rather than a packed encoding) keeps the result
+// bounded for arbitrarily large/negative coordinates; spatial adjacency is not
+// needed because only EXACT cell identity must match between a read tuple and a
+// later insert.
+func ssiGistGridCell(x, y float64) storage.BlockNumber {
+	cx := int64(math.Floor(x / ssiGistCellSize))
+	cy := int64(math.Floor(y / ssiGistCellSize))
+	h := fnv.New32a()
+	var b [16]byte
+	binary.LittleEndian.PutUint64(b[0:8], uint64(cx))
+	binary.LittleEndian.PutUint64(b[8:16], uint64(cy))
+	_, _ = h.Write(b[:])
+	return storage.BlockNumber(h.Sum32() & 0x7FFFFFFF)
+}
+
+// ssiGistIndexForTable returns the OID of a GiST index on tbl and the position
+// of its (first) key column within cols, or ok=false when tbl carries no usable
+// GiST index. Used by a SERIALIZABLE seq scan to decide whether to switch from
+// relation-grain to grid-cell SIREAD locking (design 0118-0137). Expression
+// (non-column) GiST keys are unsupported and skipped.
+func ssiGistIndexForTable(ctx *Context, tbl *catalog.Table, cols []catalog.Column) (idxOID uint32, colIdx int, ok bool) {
+	if ctx == nil || ctx.Catalog == nil || tbl == nil {
+		return 0, 0, false
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if idx == nil || idx.Method != "gist" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
+			continue
+		}
+		for i := range cols {
+			if cols[i].Name == idx.Columns[0] {
+				return idx.OID, i, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// ssiRecordGistGridRead acquires a grid-cell (page) SIREAD predicate lock on a
+// GiST index for a SERIALIZABLE spatial scan, keyed by the index OID and the
+// grid cell of a matching point. The index OID is used as the predicate-lock
+// relation so these page tags never collide with the heap relation's tuple/page
+// locks. A later SERIALIZABLE INSERT of a point in the same cell
+// (ssiRecordGistIndexInsert) finds this reader via the conflict-in walk and
+// forms the rw-edge; an INSERT in a different cell does not (design 0118-0137).
+func ssiRecordGistGridRead(ctx *Context, dbOid, indexOID uint32, x, y float64) {
+	if !ssiActive(ctx) || indexOID == 0 {
+		return
+	}
+	tag := mvcc.PageLockTag(dbOid, indexOID, ssiGistGridCell(x, y))
+	ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
+}
+
+// ssiRecordGistIndexInsert is the SERIALIZABLE write-path hook for INSERTs into
+// a table carrying one or more GiST indexes. For each GiST index it computes the
+// inserted point's grid-cell page tag (matching ssiRecordGistGridRead's keying)
+// and runs the conflict-in walk, installing an rw-edge from every SERIALIZABLE
+// reader holding that cell's SIREAD — and aborting this INSERT in place (40001)
+// when it closes a dangerous structure to an already-committed pivot, exactly
+// like ssiRecordHashIndexInsert. No-op for non-GiST tables / RC / RR.
+func ssiRecordGistIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, dbOid uint32) error {
+	if !ssiActive(ctx) || tbl == nil {
+		return nil
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if idx == nil || idx.Method != "gist" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
+			continue
+		}
+		colIdx := -1
+		for i := range cols {
+			if cols[i].Name == idx.Columns[0] {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx < 0 || colIdx >= len(row) || row[colIdx].Kind != KindString {
+			continue
+		}
+		pt, pok := parsePointText(row[colIdx].StringValue())
+		if !pok {
+			continue
+		}
+		tag := mvcc.PageLockTag(dbOid, idx.OID, ssiGistGridCell(pt[0], pt[1]))
+		if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); cerr != nil {
+			return ssiReadAbortError(cerr)
+		}
+	}
+	return nil
+}
+
+// ssiGinSentinelPage is the synthetic "whole index" page used for a GIN index
+// running with fastupdate=on. PG's GIN fastupdate buffers new entries in a single
+// pending list that is predicate-locked as one unit, so the engine cannot
+// distinguish individual keys: every read takes a lock covering the entire index
+// and every insert conflicts with it (predicate-gin spec, "With fastupdate = on
+// all index is under predicate lock. So we can't distinguish particular keys").
+// A fixed reserved page number (distinct from any FNV key page) stands in for
+// that whole-index lock.
+const ssiGinSentinelPage storage.BlockNumber = 0x7FFFFFFE
+
+// ssiGinKeyPage maps a single GIN search key (an array element in its canonical
+// PG text form) to a stable pseudo-page for a key-grain predicate lock. goopg has
+// no native GIN access method — a `USING gin` index is catalog-only (no physical
+// posting tree), so a SERIALIZABLE `p @> array[K]` scan falls back to a seq scan.
+// To reproduce PG's per-key (posting-tree page) GIN predicate locking the scan
+// instead locks the page of each search key K, and an INSERT conflicts-in on each
+// element of the inserted array: a scan for key K and an insert of key K' conflict
+// iff K==K' (predicate-gin spec's "same part of the index" vs "different parts").
+// FNV of the key text, masked to 31 bits so the result is never
+// InvalidBlockNumber (which mvcc.PageLockTag rejects) and never collides with the
+// sentinel page (a collision merely re-introduces a false-positive conflict — the
+// safe over-abort direction).
+func ssiGinKeyPage(key string) storage.BlockNumber {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	p := storage.BlockNumber(h.Sum32() & 0x7FFFFFFF)
+	if p == ssiGinSentinelPage {
+		p--
+	}
+	return p
+}
+
+// ssiGinIndexForTable returns the OID of a GIN index on tbl, the position of its
+// (first) key column within cols, and the index's current fastupdate state, or
+// ok=false when tbl carries no usable GIN index. Used by a SERIALIZABLE seq scan
+// to switch from relation-grain to GIN key-grain SIREAD locking (design 0118-0140).
+// fastupdate defaults to PG's ON when the reloption is unset; the predicate-gin
+// spec creates the index `WITH (fastupdate = off)` and toggles it via ALTER INDEX.
+func ssiGinIndexForTable(ctx *Context, tbl *catalog.Table, cols []catalog.Column) (idxOID uint32, colIdx int, fastUpdate bool, ok bool) {
+	if ctx == nil || ctx.Catalog == nil || tbl == nil {
+		return 0, 0, false, false
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if idx == nil || idx.Method != "gin" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
+			continue
+		}
+		for i := range cols {
+			if cols[i].Name == idx.Columns[0] {
+				fu := true // PG default fastupdate = on
+				if idx.FastUpdate != nil {
+					fu = *idx.FastUpdate
+				}
+				return idx.OID, i, fu, true
+			}
+		}
+	}
+	return 0, 0, false, false
+}
+
+// ssiRecordGinKeyRead acquires GIN key-grain SIREAD predicate locks for a
+// SERIALIZABLE `p @> array[...]` scan, keyed by the index OID and each search
+// key. With fastupdate=off each key gets its own page lock (so disjoint keys
+// never conflict); with fastupdate=on the whole index is one predicate unit, so a
+// single sentinel-page lock covers every key. The matching INSERT
+// (ssiRecordGinIndexInsert) conflicts-in on both the per-key pages and the
+// sentinel page, so it forms the rw-edge whichever locking the reader used. The
+// index OID is the predicate-lock relation so these page tags never collide with
+// the heap relation's tuple/page locks. Design 0118-0140.
+func ssiRecordGinKeyRead(ctx *Context, dbOid, indexOID uint32, keys []string, fastUpdate bool) {
+	if !ssiActive(ctx) || indexOID == 0 {
+		return
+	}
+	if fastUpdate {
+		tag := mvcc.PageLockTag(dbOid, indexOID, ssiGinSentinelPage)
+		ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
+		return
+	}
+	for _, k := range keys {
+		tag := mvcc.PageLockTag(dbOid, indexOID, ssiGinKeyPage(k))
+		ctx.TxnMgr.AcquirePredicateLock(ctx.Tx.Handle, tag)
+	}
+}
+
+// ssiRecordGinIndexInsert is the SERIALIZABLE write-path hook for INSERTs into a
+// table carrying one or more GIN indexes. For each GIN index it conflicts-in on
+// every element of the inserted array's key pages AND on the whole-index sentinel
+// page, installing an rw-edge from every SERIALIZABLE reader holding a matching
+// key SIREAD (fastupdate=off reader) or the sentinel SIREAD (fastupdate=on
+// reader) — and aborting this INSERT in place (40001) when it closes a dangerous
+// structure to an already-committed pivot, exactly like ssiRecordGistIndexInsert.
+// No-op for non-GIN tables / RC / RR. Design 0118-0140.
+func ssiRecordGinIndexInsert(ctx *Context, tbl *catalog.Table, cols []catalog.Column, row Row, dbOid uint32) error {
+	if !ssiActive(ctx) || tbl == nil {
+		return nil
+	}
+	for _, idx := range ctx.Catalog.IndexesOnTable(tbl) {
+		if idx == nil || idx.Method != "gin" || len(idx.Columns) == 0 || idx.Columns[0] == "" {
+			continue
+		}
+		colIdx := -1
+		for i := range cols {
+			if cols[i].Name == idx.Columns[0] {
+				colIdx = i
+				break
+			}
+		}
+		if colIdx < 0 || colIdx >= len(row) || row[colIdx].Kind != KindString {
+			continue
+		}
+		// Conflict-in on each inserted key's page (matches a fastupdate=off reader's
+		// per-key SIREAD).
+		for _, e := range parseTextArray(row[colIdx].StringValue()) {
+			tag := mvcc.PageLockTag(dbOid, idx.OID, ssiGinKeyPage(e))
+			if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, tag); cerr != nil {
+				return ssiReadAbortError(cerr)
+			}
+		}
+		// Conflict-in on the whole-index sentinel page (matches a fastupdate=on
+		// reader's sentinel SIREAD). No-op when no reader took the sentinel lock.
+		stag := mvcc.PageLockTag(dbOid, idx.OID, ssiGinSentinelPage)
+		if cerr := ctx.TxnMgr.CheckForSerializableConflictInReportingFailure(ctx.Tx.Handle, stag); cerr != nil {
 			return ssiReadAbortError(cerr)
 		}
 	}

@@ -1273,6 +1273,49 @@ func TestPort_IsolationPredicateHash(t *testing.T) {
 	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/predicate-hash.spec")
 }
 
+// TestPort_IsolationPredicateGist exercises predicate-gist: PAGE (leaf) level
+// predicate locking in a GiST index. Two SERIALIZABLE transactions each scan a
+// point column with a spatial half-plane filter (p << / >> point(k,k)) and
+// INSERT points. A scan and an insert that touch the SAME spatial region form an
+// rw-conflict (so an overlapping interleaving aborts the loser with 40001),
+// while a scan and an insert that touch DISJOINT regions must NOT conflict — the
+// reduced-false-positive half of the test. goopg has no native GiST AM (a
+// `USING gist` index is catalog-only), so these queries run as seq scans;
+// promoted to pass-required (M0118-0002, design 0118-0137) by switching that
+// scan from a relation-grain SIREAD to a per-matching-tuple grid-cell SIREAD on
+// the index (ssiRecordGistGridRead / ssiRecordGistIndexInsert), so goopg matches
+// PG 18.3 byte-for-byte across all 36 permutations (previously over-aborted the
+// 18 disjoint-region interleavings).
+func TestPort_IsolationPredicateGist(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_predicate_gist")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/predicate-gist.spec")
+}
+
+// TestPort_IsolationPredicateGin exercises predicate-gin: PAGE (per-key) level
+// predicate locking in a GIN index. Two SERIALIZABLE transactions: s1 scans an
+// int4[] column with `p @> array[K]` then writes another table; s2 reads that
+// other table then INSERTs an array value. A scan for key K and an insert of key
+// K' form an rw-conflict iff K==K' (so an overlapping interleaving on the SAME
+// key aborts the loser with 40001), while DISJOINT keys must NOT conflict — the
+// reduced-false-positive half. With `fastupdate = on` the whole index is one
+// predicate unit, so every key conflicts. goopg has no native GIN AM (a `USING
+// gin` index is catalog-only), so these queries run as seq scans; promoted to
+// pass-required (M0118-0002, design 0118-0140) by switching that scan from a
+// relation-grain SIREAD to a per-search-key page SIREAD on the index
+// (ssiRecordGinKeyRead / ssiRecordGinIndexInsert, plus a whole-index sentinel
+// page for fastupdate=on), so goopg matches PG 18.3 byte-for-byte across all
+// permutations (previously over-aborted every disjoint-key interleaving).
+func TestPort_IsolationPredicateGin(t *testing.T) {
+	root := repoRoot(t)
+	c := newCluster(t, "iso_predicate_gin")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/predicate-gin.spec")
+}
+
 // TestPort_IsolationPartialIndex exercises partial-index: an UPDATE that moves a
 // row out of a partial index (CREATE INDEX ... WHERE val2 = 1) under SERIALIZABLE
 // must still create the read/write dependency a full-table read would, so any
@@ -1943,18 +1986,21 @@ func TestPort_IsolationTuplelockUpgradeNoDeadlock(t *testing.T) {
 }
 
 // TestPort_IsolationStats drives the cumulative-statistics isolation spec
-// (pg_stat_* function/relation/SLRU stats). Soft (runIsoSpec) — the spec
-// exercises several pgstat subsystems still being built rung by rung
-// (M0118-0009); this anchor t.Skip()s with the first-divergence diff until the
-// whole spec matches PG 18.3 byte-for-byte. The function-statistics half plus
-// transactional DROP FUNCTION cross-session visibility (designs 0118-0123/0124
-// and the deferred-routine-drop rung) are landed.
+// (pg_stat_* function/relation/SLRU stats). Strict (runIsoSpecStrict) — the
+// spec matches PG 18.3 byte-for-byte across all permutations. The final rung
+// that promoted it was isolation-runner connection reuse: upstream
+// isolationtester opens one connection per session ONCE and reuses it for every
+// permutation, so a session GUC set by a step (e.g. SET track_functions='all')
+// persists forward; stats.spec's last permutations rely on track_functions set
+// by an earlier permutation still being in effect (design 0118-0133). The
+// pgstat subsystems (function/relation/SLRU stats, transactional DROP FUNCTION
+// cross-session visibility, 2PC stat drops) landed in designs 0118-0123..0132.
 func TestPort_IsolationStats(t *testing.T) {
 	root := repoRoot(t)
 	c := newCluster(t, "iso_stats")
 	mustInitStart(t, c)
 	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
-	runIsoSpec(t, root, c, "postgres/src/test/isolation/specs/stats.spec")
+	runIsoSpecStrict(t, root, c, "postgres/src/test/isolation/specs/stats.spec")
 }
 
 // buildDSN constructs a lib/pq DSN for the given cluster.

@@ -1302,6 +1302,22 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		}
 		return NewStringDatum(ls + rs), nil
 	case parser.OpBitAnd, parser.OpBitOr, parser.OpBitXor, parser.OpBitShiftLeft, parser.OpBitShiftRight:
+		// Geometric point operators reuse the << / >> spellings: `point << point`
+		// (strictly left of) and `point >> point` (strictly right of) compare the
+		// X coordinates and yield bool. goopg backs `point` with its text form, so
+		// detect the literal shape of both operands here. Used by predicate-gist.
+		if op == parser.OpBitShiftLeft || op == parser.OpBitShiftRight {
+			if left.Kind == KindString && right.Kind == KindString {
+				if lp, lok := parsePointText(left.StringValue()); lok {
+					if rp, rok := parsePointText(right.StringValue()); rok {
+						if op == parser.OpBitShiftLeft {
+							return NewBoolDatum(lp[0] < rp[0]), nil
+						}
+						return NewBoolDatum(lp[0] > rp[0]), nil
+					}
+				}
+			}
+		}
 		// Bitwise operators: require integer operands. M0097-0003.
 		if left.Kind != KindInt || right.Kind != KindInt {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires integer operands", op)}
@@ -1362,6 +1378,13 @@ func evalBinary(op parser.OpCode, left, right Datum, pos int) (Datum, error) {
 		rs, rok := datumAsString(right)
 		if !lok || !rok {
 			return Datum{}, &ExecError{Code: "42883", Pos: pos, Message: fmt.Sprintf("operator %s requires box operands", op)}
+		}
+		// anyarray containment/overlap: when both operands are array literals
+		// ({...}) the operator carries set-membership semantics, not box
+		// geometry (predicate-gin, design 0118-0139). PG dispatches @>/<@/&&
+		// to arraycontains/arraycontained/arrayoverlap by operand type.
+		if isArrayLiteralText(ls) && isArrayLiteralText(rs) {
+			return NewBoolDatum(evalArraySetOp(op, ls, rs)), nil
 		}
 		aur, all, aok := parseBoxText(ls)
 		bur, bll, bok := parseBoxText(rs)
@@ -6335,6 +6358,23 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			}
 			n := idxDatum.Int
 			sv := arr.StringValue()
+			if len(sv) >= 2 && sv[0] == '(' {
+				// Geometric point "(x,y)": PostgreSQL subscripts a point
+				// 0-based, returning the i-th coordinate as float8
+				// (point[0]=x, point[1]=y). goopg backs `point` with its text
+				// representation, so detect the literal shape here. Only
+				// indices 0/1 are defined; anything else yields NULL.
+				if pt, ok := parsePointText(sv); ok {
+					if n == 0 || n == 1 {
+						s := strconv.FormatFloat(pt[n], 'f', -1, 64)
+						if m, sc, perr := parseNumeric(s); perr == nil {
+							return newNumeric(m, int(sc)), nil
+						}
+						return NewStringDatum(s), nil
+					}
+					return NullDatum, nil
+				}
+			}
 			if len(sv) < 2 || sv[0] != '{' {
 				// Not an array literal: a fixed-length pseudo-array type — most
 				// importantly `name` — is being subscripted. PostgreSQL indexes
@@ -10813,6 +10853,59 @@ func pgQuoteIdent(s string) string {
 	// Must quote.
 	escaped := strings.ReplaceAll(s, `"`, `""`)
 	return `"` + escaped + `"`
+}
+
+// isArrayLiteralText reports whether s is a PostgreSQL array literal of the
+// canonical `{...}` form. Used to route the @>/<@/&& operators to anyarray
+// set semantics rather than geometric box semantics (design 0118-0139).
+func isArrayLiteralText(s string) bool {
+	return len(s) >= 2 && s[0] == '{' && s[len(s)-1] == '}'
+}
+
+// evalArraySetOp evaluates the anyarray containment/overlap operators on two
+// array literals, mirroring PG's arraycontains / arraycontained / arrayoverlap
+// (src/backend/utils/adt/arrayfuncs.c). Element equality uses the canonical
+// text rendering — adequate for the scalar element types goopg stores in array
+// columns (int2/4/8, float, bool, text), since both operands arrive in PG's
+// canonical output form. NULL elements never match (PG: array element equality
+// over NULL is unknown, so they are not considered contained).
+func evalArraySetOp(op parser.OpCode, ls, rs string) bool {
+	le := parseTextArray(ls)
+	re := parseTextArray(rs)
+	switch op {
+	case parser.OpContains:
+		// a @> b: every element of b is present in a.
+		return arrayElemsSubset(re, le)
+	case parser.OpContainedBy:
+		// a <@ b: every element of a is present in b.
+		return arrayElemsSubset(le, re)
+	case parser.OpOverlap:
+		// a && b: a and b share at least one element.
+		for _, x := range le {
+			for _, y := range re {
+				if x == y {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return false
+}
+
+// arrayElemsSubset reports whether every element of sub is present in super.
+// An empty sub is trivially contained (PG: '{}' <@ anything is true).
+func arrayElemsSubset(sub, super []string) bool {
+	set := make(map[string]struct{}, len(super))
+	for _, e := range super {
+		set[e] = struct{}{}
+	}
+	for _, e := range sub {
+		if _, ok := set[e]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // parseTextArray parses a PostgreSQL text array literal {elem1,"elem2",...}

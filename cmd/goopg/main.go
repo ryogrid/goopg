@@ -417,6 +417,11 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 		// PG-default off; flip on via postgresql.conf when wait-event
 		// telemetry is needed.
 		trackIOTiming := boolGUC(registry, "track_io_timing", false)
+		// M0117-0006 Part B follow-up: honour an explicit transaction_buffers
+		// override for the live CLOG SLRU pool. 0 (boot default) keeps the
+		// auto-tuned 16-page floor; a non-zero value is clamped in
+		// EffectiveCLOGBuffers. Unit-less integer count of BLCKSZ buffers.
+		transactionBuffers := intGUC(registry, "transaction_buffers", 0)
 		var err error
 		rt, err = initdb.Open(initdb.OpenOptions{
 			DataDir:               *dataDir,
@@ -431,6 +436,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 			AIOWorkers:            aioWorkers,
 			AIOMaxConcurrency:     aioMax,
 			TrackIOTiming:         trackIOTiming,
+			TransactionBuffers:    transactionBuffers,
 		})
 		if err != nil {
 			fmt.Fprintf(stderr, "goopg start: %v\n", err)

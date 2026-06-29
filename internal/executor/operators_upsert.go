@@ -265,6 +265,27 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		if err != nil {
 			return nil, err
 		}
+		// M0119-0004 follow-up: NULLS NOT DISTINCT arbiter. A NULL conflict-key
+		// column yields a nil arbiter key (NULLs distinct by default), so the
+		// key probe above reports no conflict; for an NND arbiter index NULLs
+		// collide, so fall back to a heap scan to find the duplicate NULL row.
+		// probeArbiterNND resolves key columns by name against cols and reads the
+		// candidate at the matching ordinal, so the row must share cols' order:
+		// pass insertedForLeaf (leaf-order on a reordered partition leaf, == the
+		// parent-order inserted on every non-reordered path). The returned
+		// conflictRow is decoded in cols (leaf) order, matching the key-probe
+		// path, so the downstream partLeaf leaf→parent remap stays correct.
+		if !conflicted {
+			nndPtr, nndRow, nndFound, nerr := o.probeArbiterNND(rel, writeTbl, cols, insertedForLeaf)
+			if nerr != nil {
+				return nil, nerr
+			}
+			if nndFound {
+				conflicted = true
+				conflictPtr = nndPtr
+				conflictRow = nndRow
+			}
+		}
 		if !conflicted {
 			specPtr, err := o.applyInsert(rel, writeTbl, cols, insertedForLeaf, inserted)
 			if err != nil {
@@ -697,6 +718,53 @@ func (o *upsertOp) probeArbiterByKey(rel storage.RelFileNode, cols []catalog.Col
 		return storage.ItemPointer{}, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: scanErr.Error()}
 	}
 	return foundPtr, foundRow, found, nil
+}
+
+// probeArbiterNND handles the NULLS NOT DISTINCT arbiter case.  When a
+// conflict-key column of the proposed row is NULL, encodeArbiterKey returns a
+// nil key because the default (NULLS DISTINCT) semantics treat NULLs as never
+// colliding — so a plain INSERT … ON CONFLICT would wrongly insert a duplicate
+// NULL row.  For a NULLS NOT DISTINCT arbiter index NULLs DO collide, so we
+// fall back to a heap scan (checkNullsNotDistinctViaHeapScan, the same matcher
+// the plain INSERT/UPDATE unique check uses) that finds an existing live row
+// with the identical NULL/value key pattern and returns its ItemPointer plus
+// decoded row, so DO NOTHING skips and DO UPDATE targets it.
+//
+// Scope: cols and the passed row must share column order. The caller passes the
+// leaf-ordered candidate (insertedForLeaf), so this works on a reordered
+// partition leaf (cols/tbl are the leaf's, in leaf order) as well as every
+// non-reordered path. found=false (the caller proceeds with a plain insert) when
+// the arbiter index is not NND, no key column is NULL, or no live duplicate exists.
+func (o *upsertOp) probeArbiterNND(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, inserted Row) (storage.ItemPointer, Row, bool, error) {
+	idx := o.plan.OnConflict.ArbiterIndex
+	if idx == nil || !idx.NullsNotDistinct {
+		return storage.ItemPointer{}, nil, false, nil
+	}
+	if !rowHasNullKeyColumn(idx, cols, inserted) {
+		// No NULL key column — the normal key probe above already covered it.
+		return storage.ItemPointer{}, nil, false, nil
+	}
+	ptr, ok := checkNullsNotDistinctViaHeapScan(o.ctx, tbl, idx, cols, inserted, rel)
+	if !ok {
+		return storage.ItemPointer{}, nil, false, nil
+	}
+	// Decode the conflicting tuple so DO UPDATE can target it.
+	slot, err := o.ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: ptr.Block})
+	if err != nil {
+		return storage.ItemPointer{}, nil, false, err
+	}
+	slot.RLock()
+	tuple, terr := storage.PageGetHeapTuple(slot.Page(), ptr.Offset)
+	slot.RUnlock()
+	o.ctx.Pool.Unpin(slot)
+	if terr != nil {
+		return storage.ItemPointer{}, nil, false, &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: terr.Error()}
+	}
+	row, derr := DecodeHeapTupleRow(cols, tuple, nil)
+	if derr != nil {
+		return storage.ItemPointer{}, nil, false, derr
+	}
+	return ptr, row, true, nil
 }
 
 // probeArbiterWaiting wraps probeArbiter with row-wait semantics:

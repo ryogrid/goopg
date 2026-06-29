@@ -2177,7 +2177,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			if nc.ExclusionOp == "=" && strings.ToLower(nc.Method) == "btree" {
 				// btree equality exclusion == unique constraint: build a real btree
 				// so checkExclusionConstraintsForInsert can probe it at INSERT time.
-				if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, false, false); err != nil {
+				if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, false, false, false); err != nil {
 					return err
 				}
 				if idx, ok2 := o.ctx.Catalog.LookupIndex(idxName); ok2 {
@@ -2200,7 +2200,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			continue
 		}
 		primary := nc.IsPrimary
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, true, primary); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, nc.Columns, nil, true, primary, nc.NullsNotDistinct); err != nil {
 			return err
 		}
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -2267,7 +2267,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	}
 	if len(pkCols) > 0 && !namedPKCreated {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_pkey"}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, nil, true, true); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, pkCols, nil, true, true, false); err != nil {
 			// Propagate B-tree index errors (e.g. unsupported key type).
 			// This makes CREATE TABLE fail cleanly rather than silently creating
 			// a table without its primary key constraint.
@@ -2298,7 +2298,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				idxBaseName = c.UniqueConstraintName
 			}
 			idxName := parser.ObjectName{Schema: s.Name.Schema, Name: idxBaseName}
-			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false); err != nil {
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, []string{c.Name}, nil, true, false, c.UniqueNullsNotDistinct); err != nil {
 				return err
 			}
 			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -2321,7 +2321,8 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			inclCols = s.TableUniqueIncludes[i]
 		}
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: o.autoIndexNameWithIncludes(tbl, cols, inclCols, "key")}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, cols, nil, true, false); err != nil {
+		tableUniqueNND := i < len(s.TableUniqueNullsNotDistinct) && s.TableUniqueNullsNotDistinct[i]
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, cols, nil, true, false, tableUniqueNND); err != nil {
 			return err
 		}
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -2351,7 +2352,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		ec.Name = name
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: name}
 		if ec.ExclusionOp == "=" && strings.ToLower(ec.Method) == "btree" {
-			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false); err != nil {
+			if err := o.createBTreeIndex(s.Pos(), idxName, tbl, ec.Columns, nil, false, false, false); err != nil {
 				return err
 			}
 			if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -2374,7 +2375,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 	// Create btree indexes for LIKE INCLUDING INDEXES unique (non-PK) indexes.
 	for _, idx := range likeUniqueIndexes {
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + strings.Join(idx.Columns, "_") + "_key"}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, nil, true, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, nil, true, false, idx.NullsNotDistinct); err != nil {
 			return err
 		}
 	}
@@ -2401,7 +2402,7 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 			}
 		}
 		idxName := parser.ObjectName{Schema: s.Name.Schema, Name: o.autoIndexNameWithIncludes(tbl, nameCols, nil, "idx")}
-		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, colExprs, false, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), idxName, tbl, idx.Columns, colExprs, false, false, false); err != nil {
 			continue // skip indexes with unsupported expression types
 		}
 	}
@@ -3108,7 +3109,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 			}
 			childIdxName = parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + suffix}
 		}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct); err != nil {
 			return err
 		}
 	}
@@ -3117,7 +3118,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 	// M0097-0028.
 	for _, colName := range poc.UniqueColumns {
 		childIdxName := parser.ObjectName{Schema: s.Name.Schema, Name: tbl.Name + "_" + colName + "_key"}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, []string{colName}, nil, true, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, []string{colName}, nil, true, false, false); err != nil {
 			return err
 		}
 	}
@@ -3155,7 +3156,7 @@ func (o *ddlOp) execCreatePartitionChild(s *parser.CreateTableStmt) error {
 				}
 			}
 		}
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, colExprs, false, false); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, tbl, parentIdx.Columns, colExprs, false, false, false); err != nil {
 			return err
 		}
 		// Copy predicate (WHERE clause) and ColExprStrings from parent index.
@@ -4847,7 +4848,7 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 			resolvedPred = nil
 		}
 	}
-	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, resolvedPred); err != nil {
+	if err := o.createBTreeIndex(s.Pos(), idxName, tbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, resolvedPred); err != nil {
 		return err
 	}
 	if declaredHash {
@@ -4965,7 +4966,7 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 		}
 		// resolvedPred is a nil planner.Expr when there is no partial predicate;
 		// createBTreeIndex treats a nil predExpr[0] as "no predicate".
-		if err := o.createBTreeIndex(s.Pos(), childIdxName, childTbl, s.Columns, s.ColExprs, s.Unique, false, resolvedPred); err != nil {
+		if err := o.createBTreeIndex(s.Pos(), childIdxName, childTbl, s.Columns, s.ColExprs, s.Unique, false, s.NullsNotDistinct, resolvedPred); err != nil {
 			return err
 		}
 		childIdx, ok2 := o.ctx.Catalog.LookupIndex(childIdxName)
@@ -5578,6 +5579,21 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 						}
 					}
 				}
+				if act.Kind == parser.AlterIndexSetReloptions {
+					// SET (param = value, …) on an index. Update the index's live
+					// catalog fields so pg_class.reloptions / pg_dump round-trip the
+					// change; only GIN fastupdate has runtime effect (toggles the
+					// predicate-gin SSI lock granularity between per-key and
+					// whole-index, design 0118-0140). Unrecognized options are
+					// accepted and ignored, matching the CREATE INDEX WITH path.
+					for name, val := range act.With {
+						if strings.EqualFold(name, "fastupdate") {
+							if b, ok := parseReloptionBool(val); ok {
+								idx.FastUpdate = &b
+							}
+						}
+					}
+				}
 			}
 			// Other ALTER actions on index: silently accept in v0.
 			return nil
@@ -5963,7 +5979,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 					childIdxName = parser.ObjectName{Schema: childTbl.Schema, Name: childTbl.Name + suffix}
 				}
-				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary)
+				_ = o.createBTreeIndex(act.Pos(), childIdxName, childTbl, parentIdx.Columns, nil, parentIdx.Unique, parentIdx.Primary, parentIdx.NullsNotDistinct)
 			}
 		case parser.AlterTableDetachPartition:
 			// ALTER TABLE parent DETACH PARTITION child — remove child from parent's
@@ -7133,7 +7149,7 @@ func (o *ddlOp) execAlterTableAddPrimaryKey(tbl *catalog.Table, act parser.Alter
 		name = tbl.Name + "_pkey"
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true); err != nil {
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, true, false); err != nil {
 		return err
 	}
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -7365,7 +7381,7 @@ func (o *ddlOp) execAlterTableAddUnique(tbl *catalog.Table, act parser.AlterTabl
 		name = o.autoIndexNameWithIncludes(tbl, act.Columns, act.IncludeColumns, "key")
 	}
 	idxName := parser.ObjectName{Schema: tbl.Schema, Name: name}
-	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false); err != nil {
+	if err := o.createBTreeIndex(act.Pos(), idxName, tbl, act.Columns, nil, true, false, false); err != nil {
 		return err
 	}
 	if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
@@ -7595,7 +7611,7 @@ func (o *ddlOp) createExclusionIndexStub(pos int, idxName parser.ObjectName, tbl
 	return nil
 }
 
-func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, predExpr ...planner.Expr) error {
+func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalog.Table, columns []string, colExprs []parser.Expr, unique bool, primary bool, nullsNotDistinct bool, predExpr ...planner.Expr) error {
 	if len(columns) == 0 {
 		return &ExecError{Code: "42601", Pos: pos, Message: "index must have at least one key column"}
 	}
@@ -7646,9 +7662,9 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 	idxRel := o.ctx.Catalog.IndexRelFileNode(idx)
 	var buildErr error
 	if len(predExpr) > 0 && predExpr[0] != nil {
-		buildErr = o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, idxName.String(), pos, predExpr[0])
+		buildErr = o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos, predExpr[0])
 	} else {
-		buildErr = o.bulkBuildBTree(idxRel, tbl, cols, unique, idxName.String(), pos)
+		buildErr = o.bulkBuildBTree(idxRel, tbl, cols, unique, nullsNotDistinct, idxName.String(), pos)
 	}
 	if buildErr != nil {
 		_ = o.ctx.Catalog.DropIndex(idxName)
@@ -7706,12 +7722,12 @@ func (o *ddlOp) createBTreeIndex(pos int, idxName parser.ObjectName, tbl *catalo
 // btree.BulkCreate for a sort-then-build pass (M0047-0001). This replaces
 // the old Create+backfillBTree flow and is significantly faster for large
 // tables because it avoids per-key tree traversals and page splits.
-func (o *ddlOp) bulkBuildBTree(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) error {
-	return o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, indexName, pos, nil)
+func (o *ddlOp) bulkBuildBTree(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int) error {
+	return o.bulkBuildBTreeWithPredicate(idxRel, tbl, cols, unique, nullsNotDistinct, indexName, pos, nil)
 }
 
-func (o *ddlOp) bulkBuildBTreeWithPredicate(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int, predExpr planner.Expr) error {
-	entries, err := o.collectBTreeEntries(tbl, cols, unique, indexName, pos, predExpr)
+func (o *ddlOp) bulkBuildBTreeWithPredicate(idxRel storage.RelFileNode, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) error {
+	entries, err := o.collectBTreeEntries(tbl, cols, unique, nullsNotDistinct, indexName, pos, predExpr)
 	if err != nil {
 		return err
 	}
@@ -7724,13 +7740,17 @@ func (o *ddlOp) bulkBuildBTreeWithPredicate(idxRel storage.RelFileNode, tbl *cat
 
 // collectBTreeEntries scans the heap, decodes visible tuples, encodes
 // B-tree keys, enforces uniqueness, and returns the entries for bulk build.
-func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
+func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int, predExpr planner.Expr) ([]btree.BulkEntry, error) {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return nil, &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	var entries []btree.BulkEntry
+	// seenNull dedups null-bearing rows for a NULLS NOT DISTINCT unique index
+	// (NULLs collide). Lazily allocated; nil for every default index so non-NND
+	// builds are byte-for-byte unchanged.
+	var seenNull map[string]struct{}
 	var scanRow Row // M0054-0005c: reusable decode buffer (see comment below).
 	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
 	// Reset on page advance; Release on return.
@@ -7809,10 +7829,36 @@ func (o *ddlOp) collectBTreeEntries(tbl *catalog.Table, cols []*catalog.Column, 
 					continue
 				}
 			}
-			key, encErr := encodeCompositeBTreeKey(row, cols, pos)
+			key, hasNullKey, encErr := encodeCompositeBTreeKey(row, cols, pos)
 			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)
 				return nil, encErr
+			}
+			if hasNullKey {
+				// A NULL value key column: not storable in the byte-key btree
+				// (no null bitmap), matching the runtime maintain path. For a
+				// default (NULLS DISTINCT) index multiple NULLs are allowed, so
+				// skip. For a NULLS NOT DISTINCT unique index NULLs collide, so
+				// dedup null-bearing rows among themselves and raise 23505 on a
+				// duplicate NULL pattern (PG rejects building such an index over
+				// pre-existing duplicate-NULL data). Design 0119-0004 sub (b).
+				if unique && nullsNotDistinct {
+					ndk, nerr := nndNullKeyDedupKey(row, cols, pos)
+					if nerr != nil {
+						o.ctx.Pool.Unpin(slot)
+						return nil, nerr
+					}
+					if seenNull == nil {
+						seenNull = map[string]struct{}{}
+					}
+					if _, dup := seenNull[string(ndk)]; dup {
+						o.ctx.Pool.Unpin(slot)
+						return nil, &ExecError{Code: "23505", Pos: pos,
+							Message: fmt.Sprintf("could not create unique index %q", indexName)}
+					}
+					seenNull[string(ndk)] = struct{}{}
+				}
+				continue
 			}
 			if key == nil {
 				// All index columns are expression-based (cols[i]==nil); we
@@ -7870,13 +7916,14 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique bool, indexName string, pos int) error {
+func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*catalog.Column, unique, nullsNotDistinct bool, indexName string, pos int) error {
 	rel := o.ctx.Catalog.RelFileNode(tbl)
 	nBlocks, err := o.ctx.Pool.NBlocks(rel)
 	if err != nil {
 		return &ExecError{Code: "XX000", Pos: pos, Message: err.Error()}
 	}
 	seen := map[string]struct{}{}
+	var seenNull map[string]struct{} // null-bearing-row dedup for NULLS NOT DISTINCT
 	var scanRow Row // M0054-0005c: reusable decode buffer.
 	// M0074-0004 / M0107-0001: per-page mctx for varchar / char / text payloads.
 	// Resulting key is copied by caller (`seen[string(key)]` and `tree.Insert`),
@@ -7921,10 +7968,34 @@ func (o *ddlOp) backfillBTree(tree *btree.BTree, tbl *catalog.Table, cols []*cat
 				continue
 			}
 			row := scanRow
-			key, encErr := encodeCompositeBTreeKey(row, cols, pos)
+			key, hasNullKey, encErr := encodeCompositeBTreeKey(row, cols, pos)
 			if encErr != nil {
 				o.ctx.Pool.Unpin(slot)
 				return encErr
+			}
+			if hasNullKey {
+				// NULL value key column: not stored (no null bitmap). Skip for a
+				// default index; dedup null-bearing rows for NULLS NOT DISTINCT.
+				if unique && nullsNotDistinct {
+					ndk, nerr := nndNullKeyDedupKey(row, cols, pos)
+					if nerr != nil {
+						o.ctx.Pool.Unpin(slot)
+						return nerr
+					}
+					if seenNull == nil {
+						seenNull = map[string]struct{}{}
+					}
+					if _, dup := seenNull[string(ndk)]; dup {
+						o.ctx.Pool.Unpin(slot)
+						return &ExecError{Code: "23505", Pos: pos, Message: fmt.Sprintf("duplicate key value violates unique index %q", indexName)}
+					}
+					seenNull[string(ndk)] = struct{}{}
+				}
+				continue
+			}
+			if key == nil {
+				// Expression-only columns; nothing to insert from raw heap data.
+				continue
 			}
 			if unique {
 				if _, exists := seen[string(key)]; exists {
@@ -8003,7 +8074,16 @@ func parseReloptionBool(s string) (bool, bool) {
 // unambiguous without a separator.
 // nil entries in cols (expression index columns) are skipped — expression
 // columns must be evaluated separately via encodeArbiterKey.
-func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) ([]byte, *ExecError) {
+//
+// hasNullKey reports that a *value* key column was NULL. goopg's byte-key btree
+// has no per-attribute null bitmap, so a NULL-keyed row is never stored in the
+// index (matching the runtime maintain path, design 0119-0004 §3); the caller
+// skips it (default NULLS DISTINCT) or dedups it against other null-bearing rows
+// (NULLS NOT DISTINCT). A NULL key column is therefore NOT an error here — the
+// pre-0119-0004 `42804 "column is null and cannot be indexed"` raise was a
+// divergence that made CREATE INDEX over any NULL-containing column fail
+// (PostgreSQL admits NULLs in unique indexes, distinct by default).
+func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) (key []byte, hasNullKey bool, err *ExecError) {
 	var out []byte
 	for _, col := range cols {
 		if col == nil {
@@ -8013,11 +8093,44 @@ func encodeCompositeBTreeKey(row Row, cols []*catalog.Column, pos int) ([]byte, 
 		}
 		v := row[col.Ordinal]
 		if v.IsNull() {
-			return nil, &ExecError{Code: "42804", Pos: pos, Message: fmt.Sprintf("column %q is null and cannot be indexed", col.Name)}
+			// Any NULL value key column ⇒ the whole row is not indexable as a
+			// btree key (no null bitmap). Signal it; do not store a key.
+			return nil, true, nil
 		}
-		k, err := encodeBTreeKeyForColumn(v, col, pos)
-		if err != nil {
-			return nil, err
+		k, encErr := encodeBTreeKeyForColumn(v, col, pos)
+		if encErr != nil {
+			return nil, false, encErr
+		}
+		out = append(out, k...)
+	}
+	return out, false, nil
+}
+
+// nndNullKeyDedupKey builds an in-memory-only dedup key for a row that has at
+// least one NULL key column, used to validate NULLS NOT DISTINCT uniqueness
+// during index build. Each key column contributes a presence byte
+// (0x00 = NULL, 0x01 = value) followed, for a non-NULL column, by its btree
+// column encoding. Two null-bearing rows collide under NND iff they share the
+// NULL pattern AND have equal non-NULL values. This key is NEVER stored in the
+// btree (NULL keys are not indexed) — it exists only to dedup null-bearing rows
+// among themselves at build time, so sentinel aliasing against real btree
+// encodings is irrelevant (design 0119-0004 §2 "avoid key encoding entirely"
+// applies to stored keys; this key is build-local).
+func nndNullKeyDedupKey(row Row, cols []*catalog.Column, pos int) ([]byte, *ExecError) {
+	var out []byte
+	for _, col := range cols {
+		if col == nil {
+			continue // expression column — not part of NND null dedup
+		}
+		v := row[col.Ordinal]
+		if v.IsNull() {
+			out = append(out, 0x00)
+			continue
+		}
+		out = append(out, 0x01)
+		k, encErr := encodeBTreeKeyForColumn(v, col, pos)
+		if encErr != nil {
+			return nil, encErr
 		}
 		out = append(out, k...)
 	}
@@ -8479,6 +8592,14 @@ func (o *ddlOp) execTruncate(s *parser.TruncateStmt) error {
 		if err := o.truncateTableAndPartitions(entry.tbl, s.Pos(), entry.only); err != nil {
 			return err
 		}
+	}
+
+	// Cumulative relation stats: a TRUNCATE forgets the relation's live/dead
+	// counts and resets the in-transaction insert/update/delete counters
+	// (pgstat_count_truncate). Recorded after the physical truncate succeeds.
+	// M0118-0009 (`stats`, rung 7; design 0118-0131).
+	for _, entry := range tableSet {
+		recordRelTruncate(o.ctx, entry.tbl.OID)
 	}
 
 	// RESTART IDENTITY: reset sequences for all truncated tables.
@@ -10988,7 +11109,7 @@ func (o *ddlOp) materializeView(tbl *catalog.Table, selectPlan planner.Node) err
 				}
 			}
 			idxName := idx.QualifiedName()
-			if err := o.bulkBuildBTree(idxRel, tbl, cols, idx.Unique, idxName, 0); err != nil {
+			if err := o.bulkBuildBTree(idxRel, tbl, cols, idx.Unique, idx.NullsNotDistinct, idxName, 0); err != nil {
 				return err
 			}
 		}

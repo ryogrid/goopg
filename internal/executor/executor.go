@@ -94,6 +94,17 @@ func Build(plan planner.Node) (Operator, error) {
 		if err != nil {
 			return nil, err
 		}
+		// M0118-0002 (design 0118-0137): hand a Filter sitting directly above a
+		// SeqScan its spatial predicate so a SERIALIZABLE scan of a GiST-indexed
+		// table can take per-matching-tuple grid-cell SIREAD locks instead of a
+		// relation-grain lock. No-op unless the runtime scan resolves a GiST index
+		// (gistSSIIdxOID stays 0 otherwise). Mirrors the buildRec twin.
+		if _, ok := p.Child.(*planner.SeqScan); ok {
+			if so := unwrapSeqScanOp(child); so != nil {
+				so.ssiGistPred = p.Predicate
+				so.ssiGinPred = p.Predicate
+			}
+		}
 		// M0054-0005a-followup: filterOp is a pure pass-through
 		// — it returns its child's row unchanged. So filter's
 		// own borrow contract must MATCH its child's. We leave
@@ -359,6 +370,22 @@ func Run(op Operator, ctx *Context) ([]Row, error) {
 // hot tree. BuildFast now returns (*opTreeSlab, int32, error).
 // ---------------------------------------------------------------------------
 
+// unwrapSeqScanOp returns the concrete *seqScanOp behind an operator built for a
+// *planner.SeqScan, transparently peeling the maybeInstrument wrapper. Returns
+// nil for anything else. Used to hand a leaf Filter's spatial predicate to the
+// scan for GiST spatial-SSI locking (design 0118-0137).
+func unwrapSeqScanOp(op Operator) *seqScanOp {
+	switch o := op.(type) {
+	case *seqScanOp:
+		return o
+	case *instrumentedOp:
+		if so, ok := o.inner.(*seqScanOp); ok {
+			return so
+		}
+	}
+	return nil
+}
+
 // buildRec is the recursive tree builder for BuildFast.
 func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 	switch p := plan.(type) {
@@ -369,6 +396,17 @@ func (tree *opTreeSlab) buildRec(plan planner.Node) (int32, error) {
 		childIdx, err := tree.buildRec(p.Child)
 		if err != nil {
 			return noChild, err
+		}
+		// M0118-0002 (design 0118-0137): a Filter directly above a SeqScan hands
+		// the scan its spatial predicate so a SERIALIZABLE scan of a GiST-indexed
+		// table takes per-matching-tuple grid-cell SIREAD locks instead of a
+		// relation-grain lock. This is the LIVE server path (BuildFastIterator);
+		// Build has the twin. No-op unless the scan resolves a GiST index at Open.
+		if _, ok := p.Child.(*planner.SeqScan); ok {
+			if so, ok2 := tree.ops[childIdx].state.(*seqScanOp); ok2 {
+				so.ssiGistPred = p.Predicate
+				so.ssiGinPred = p.Predicate
+			}
 		}
 		// Phase C.3: predicate compiled into exprTreeSlab; filterState holds
 		// only the predIdx — no GC-traced planner.Expr reference needed.

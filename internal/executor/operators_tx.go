@@ -187,6 +187,12 @@ func (o *transactionOp) execCommit() error {
 		o.ctx.SyncCommitMode != wal.SyncRepOff && o.ctx.SyncRep.NeedsWait() {
 		_ = o.ctx.SyncRep.WaitForLSN(o.ctx.Ctx, o.ctx.WAL.WrittenLSN(), o.ctx.SyncCommitMode)
 	}
+	// M0118-0009 (`stats`, rung 7; design 0118-0131): fold this transaction's
+	// staged relation-stat counters (tuples_inserted/_updated/_deleted + live/dead
+	// deltas) into the backend's pending counters using commit math
+	// (AtEOXact_PgStat_Relations). Non-transactional scan counters were already
+	// applied at scan time. No-op for a transaction that staged nothing.
+	CommitRelStats(o.ctx)
 	o.ctx.Session.EndExplicitTransaction()
 	if o.ctx.EndLocalTransaction != nil {
 		o.ctx.EndLocalTransaction()
@@ -242,6 +248,12 @@ func (o *transactionOp) execRollback() error {
 		return &ExecError{Code: "XX000", Pos: o.plan.Pos(), Message: err.Error()}
 	}
 	o.clearPgClassRowMarks(tx)
+	// M0118-0009 (`stats`, rung 7; design 0118-0131): fold this transaction's
+	// staged relation-stat counters into pending using abort math — aborted
+	// inserts/updates become dead tuples; aborted deletes are a no-op on live/dead;
+	// attempted insert/update/delete totals still count
+	// (AtEOXact_PgStat_Relations, abort case).
+	AbortRelStats(o.ctx)
 	o.ctx.Session.EndExplicitTransaction()
 	if o.ctx.EndLocalTransaction != nil {
 		o.ctx.EndLocalTransaction()

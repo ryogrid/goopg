@@ -1,40 +1,27 @@
-Last landed (loop #75): `stats` rung 6 (M0118-0009, design 0118-0128) — relation
-tuple statistics. First divergence advanced **L2180 → L2704**. All 7 non-2PC
-table-stats permutations + the 2PC COMMIT PREPARED permutations match PG 18.3.
+(idle — nothing in flight)
 
-Files: internal/executor/pgstat_relations.go (NEW: relationStatsManager `relStats`
-+ recordScan/Insert/Update/Delete + flush/get/dropTable/resetAll + shouldTrackCounts
-+ recordRelScan + tableOIDFromCatalog), internal/executor/pgstat_relations_test.go
-(NEW), internal/executor/expr.go (9 pg_stat_get_* relation getters; flush+reset
-also drive relStats), internal/executor/operators_storage.go (seqScanOp.statReturned
-+ Close record; scanMatching gains statOID param + 4 call sites; insert/update/
-deleteOp.Close record rowsAffected), internal/executor/operators_ddl.go
-(dropTableByRefImmediate → relStats.dropTable). Docs: design 0118-0128 + README row +
-fix_plan note.
+Last loop (#17): M0119-0004 NND **reordered partition-leaf arbiter** — LANDED +
+committed (design 0119-0004 §10). Closes sub-feature (c); **all NND enforcement
+sub-features (a)–(c) are now complete.**
+- `operators_upsert.go` upsert `Next`: the NND heap-scan fallback was guarded out
+  on reordered partition leaves (`if !conflicted && partLeaf == nil`), so a
+  duplicate NULL row was wrongly INSERTED where PG routes to the conflict action.
+- Root cause = row/column-order mismatch: `probeArbiterNND` /
+  `checkNullsNotDistinctViaHeapScan` / `rowHasNullKeyColumn` resolve key columns
+  by NAME against `cols` and read the candidate at the matching ordinal, so the
+  passed row must share `cols`' order. Fix = pass `insertedForLeaf` (already
+  leaf-ordered on the reordered path; == `inserted` on every non-reordered path)
+  and drop the guard. conflictRow stays leaf-decoded → downstream leaf→parent
+  remap unchanged. Zero blast radius outside NND.
+- Test `TestNullsNotDistinctOnConflictReorderedPartitionLeaf` (parent `(a,b,c)` /
+  leaf `(c,b,a)` / NND `(a,b)`; DO NOTHING skip + DO UPDATE target). Confirmed
+  RED→GREEN (2 rows → 1). `-race` Upsert/Conflict/Partition +
+  `TestPort_IsolationInsertConflict*`/`Merge*` PASS; `go build ./...` clean.
 
-Gates: go test ./internal/executor/ PASS; new pgstat_relations_test.go PASS;
-TestPort_IsolationStats soft probe L2180→L2704; build clean; pgbench smoke
-445305 txns 0 failed; tpch-spotcheck infra-FAIL (stale systemd scope, known WSL2
-issue — query output unchanged by counter-only hooks).
-
-Key model: numscans/tuples_returned NON-transactional (counted as scans run);
-ins/upd/del + live/dead deltas recorded at op.Close (= "applied at commit" for the
-autocommit simple-query path). INSERT +1 live/row; DELETE +1 dead −1 live/row;
-UPDATE +1 dead/row, live unchanged (no HOT). Getters return 0 (not NULL) for absent
-OID. track_counts (boot on) gates all counting.
-
-NEXT rung for `stats` (Effort-L; spec stays `defer`): **L2704 — transactional-counter
-abort/2PC reconciliation for relation stats.** The new first divergence is the
-`s1_begin … s1_prepare_a … s1_rollback_prepared_a` permutation (expected
-live=1/dead=8, current 3/6). Needs:
-- Stage tuples_inserted/_updated/_deleted + live/dead deltas PER TRANSACTION
-  (mirror PG_Stat_TableXactStatus), fold into shared at commit, and on
-  abort/ROLLBACK PREPARED: aborted insert+update tuples become DEAD (no live
-  increment); follow AtEOXact_PgStat_Relations rules incl. the `truncdropped` path
-  for in-txn TRUNCATE/DROP (later permutations L2775/L2815/L2861/L2901/L2947).
-- 2PC handoff of the staged relation counters to the prepared txn so cross-backend
-  COMMIT/ROLLBACK PREPARED applies them (mirror function-stats 2PC, design 0118-0127).
-- This requires replacing the op.Close "apply immediately" model with per-txn
-  staging for the transactional counters (non-transactional scan counters stay as-is).
-Then later: index-scan tuples_fetched, VACUUM vacuum_count/live-dead recompute, SLRU
-stats (pg_stat_slru).
+Remaining M0119 backlog (pick topmost actionable next loop):
+- M0119-0002 (CLOG Part C / 0007 Part B / 0008 Part B) — Effort-L full-gate
+  session (-race mvcc+wal, xlog_replay, PG-standby E2E, fresh TPC-H Q12/Q13).
+- M0119-0004 STILL OPEN (NND now fully closed): pg_dump 002–010 catalog-view
+  parity battery; deferred-constraint-checking-at-COMMIT engine gap.
+- M0119-0005 (pg_waldump WD-002), M0119-0006 (amcheck server tier — needs index
+  AMs), M0119-0007 (pg_basebackup recvlogical — blocked on logical decoding).

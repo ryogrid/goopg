@@ -849,6 +849,40 @@ func TestParseAlterIndexAlterColumnSet(t *testing.T) {
 	}
 }
 
+// TestParseAlterIndexSetReloptions pins the ALTER INDEX SET (param = value, …)
+// parse branch (design 0118-0140): `ALTER INDEX name SET (...)` — a SET clause
+// directly after the index name (no ALTER COLUMN) — now emits a single
+// AlterIndexSetReloptions action carrying the parsed name→value pairs, instead of
+// silently falling into the no-op tail. The predicate-gin isolation spec toggles
+// GIN fastupdate via this form.
+func TestParseAlterIndexSetReloptions(t *testing.T) {
+	for _, tc := range []struct {
+		sql  string
+		want string
+	}{
+		{"ALTER INDEX ginidx SET (fastupdate = on)", "on"},
+		{"ALTER INDEX ginidx SET (fastupdate = off)", "off"},
+	} {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("%q: expected *AlterTableStmt, got %T", tc.sql, stmts[0])
+		}
+		if at.Name.Name != "ginidx" {
+			t.Errorf("%q: Name=%q, want ginidx", tc.sql, at.Name.Name)
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterIndexSetReloptions {
+			t.Fatalf("%q: actions=%+v, want one AlterIndexSetReloptions", tc.sql, at.Actions)
+		}
+		if got := at.Actions[0].With["fastupdate"]; got != tc.want {
+			t.Errorf("%q: fastupdate=%q, want %q", tc.sql, got, tc.want)
+		}
+	}
+}
+
 // TestParseColumnDefCompression verifies that COMPRESSION method is silently
 // ignored in column definitions (PG 14+). goopg v0 doesn't track compression.
 func TestParseColumnDefCompression(t *testing.T) {

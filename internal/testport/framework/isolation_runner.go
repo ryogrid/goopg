@@ -14,6 +14,8 @@ import (
 
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
+
+	"github.com/goopg/goopg/internal/executor"
 )
 
 // backendTerminationMessage is the verbatim text libpq surfaces (and upstream
@@ -113,6 +115,24 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		nSessions = 1
 	}
 
+	sessionNames := spec.Sessions
+	if len(sessionNames) == 0 {
+		sessionNames = []string{"s1"}
+	}
+	// Open one persistent connection per session, reused across ALL
+	// permutations — upstream isolationtester opens these once in main() and
+	// reuses them for every permutation, so a session-level GUC set by a step
+	// (e.g. SET track_functions='all') stays in effect in later permutations.
+	// stats.spec's final permutation relies on track_functions set by an
+	// earlier permutation still being active; reopening connections per
+	// permutation (the previous behavior) reset it to the boot default and
+	// diverged. M0118-0009.
+	sc, err := r.openSessionConns(ctx, spec, db, sessionNames)
+	if err != nil {
+		return "", err
+	}
+	defer sc.close()
+
 	// Collect all step names referenced by any permutation.
 	usedSteps := make(map[string]bool)
 	for _, perm := range spec.Permutations {
@@ -179,7 +199,11 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 		if i < len(spec.PermutationBlockers) {
 			permBlockers = spec.PermutationBlockers[i]
 		}
-		out, err := r.runPermutation(ctx, db, spec, perm, permBlockers, setupResult)
+		// Clear notices/notifications left over from the previous permutation so
+		// they are not attributed to this one. The connections (and thus their
+		// session GUCs) persist; only the transient message queues reset.
+		sc.drainQueues()
+		out, err := r.runPermutation(ctx, sc, spec, perm, permBlockers, setupResult)
 
 		// Global teardown runs after each permutation (mirrors isolationtester.c).
 		if spec.TeardownSQL != "" {
@@ -188,6 +212,19 @@ func (r *IsolationRunner) RunSpec(ctx context.Context, spec IsolationSpec) (stri
 				_ = execConn(ctx, monitor, spec.TeardownSQL)
 				_ = monitor.Close()
 			}
+		}
+
+		// A timed-out step can leave a goroutine still holding a session
+		// connection; if any connection is no longer idle, rebuild the set so
+		// the staleness does not contaminate the next permutation. In the common
+		// (healthy) case this is one trivial round-trip per session. M0118-0009.
+		if !sc.healthy(ctx) {
+			sc.close()
+			newSC, rebuildErr := r.openSessionConns(ctx, spec, db, sessionNames)
+			if rebuildErr != nil {
+				return "", fmt.Errorf("rebuild session conns after permutation %d: %w", i, rebuildErr)
+			}
+			sc = newSC
 		}
 
 		if err != nil {
@@ -314,33 +351,54 @@ func drainAllNotifications(sb *strings.Builder, sessionNames []string, queues ma
 	}
 }
 
-// runPermutation executes one permutation using fresh session connections.
-func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec IsolationSpec, perm []string, permBlockers [][]StepBlocker, setupResult string) (string, error) {
-	sessionNames := spec.Sessions
-	if len(sessionNames) == 0 {
-		sessionNames = []string{"s1"}
-	}
+// sessionConns holds the per-session connections, notice/notify queues, and
+// PID→session map for one spec run. Upstream isolationtester opens one
+// connection per session ONCE (in main) and reuses it for every permutation, so
+// session-level GUCs a step sets (e.g. SET track_functions='all') persist into
+// later permutations. goopg mirrors this by creating the set once per spec in
+// RunSpec and reusing it across all permutations, rather than reopening per
+// permutation (which reset GUCs to boot defaults and broke stats.spec's final
+// permutation). M0118-0009.
+type sessionConns struct {
+	names        []string
+	queues       map[string]*sessionNoticeQueue
+	notifyQueues map[string]*sessionNotifyQueue
+	dbs          map[string]*sql.DB
+	conns        map[string]*sql.Conn
+	pidToSession map[int]string
+	sharedDB     *sql.DB // for the no-connector fallback comparison in close()
+}
 
-	// Build a per-session pq connector with a notice handler so NOTICE messages
-	// emitted during step execution are captured. Uses pq.ConnectorWithNoticeHandler
-	// to attach the handler at DB-open time (works regardless of Go version).
-	//
-	// A notification handler is chained on top so asynchronous 'A'
-	// NotificationResponse messages (LISTEN/NOTIFY) delivered on a session's
-	// connection during a step's query read are captured per session. lib/pq
-	// invokes both handlers synchronously while reading the query response to
-	// ReadyForQuery, so by the time a step's goroutine returns, every
-	// notification the server delivered during that step is in the queue —
-	// mirroring upstream isolationtester, which polls PQnotifies() on every
-	// connection after each step completes. M0118-0009 (async-notify).
-	sessionQueues := make(map[string]*sessionNoticeQueue, len(sessionNames))
-	notifyQueues := make(map[string]*sessionNotifyQueue, len(sessionNames))
-	sessionDBs := make(map[string]*sql.DB, len(sessionNames))
+// openSessionConns opens one persistent connection per session.
+//
+// Each connection is opened through a pq connector carrying a NOTICE handler
+// (so NOTICE/WARNING messages emitted during a step are captured) and a chained
+// notification handler (so asynchronous 'A' NotificationResponse messages from
+// LISTEN/NOTIFY are captured per session). lib/pq invokes both handlers
+// synchronously while reading a query response to ReadyForQuery, so by the time
+// a step goroutine returns, every message the server delivered during that step
+// is queued — mirroring isolationtester polling PQnotifies() after each step.
+//
+// application_name is SET once here (not per permutation) so pg_locks /
+// pg_stat_activity queries can identify sessions, and each backend's PID is
+// recorded so a captured notification can be attributed to its source session
+// ("from <session>"). These are stable for the connection's lifetime, so doing
+// them once is sufficient and matches upstream (which never re-runs them).
+func (r *IsolationRunner) openSessionConns(ctx context.Context, spec IsolationSpec, sharedDB *sql.DB, sessionNames []string) (*sessionConns, error) {
+	sc := &sessionConns{
+		names:        sessionNames,
+		queues:       make(map[string]*sessionNoticeQueue, len(sessionNames)),
+		notifyQueues: make(map[string]*sessionNotifyQueue, len(sessionNames)),
+		dbs:          make(map[string]*sql.DB, len(sessionNames)),
+		conns:        make(map[string]*sql.Conn, len(sessionNames)),
+		pidToSession: make(map[int]string, len(sessionNames)),
+		sharedDB:     sharedDB,
+	}
 	for _, sname := range sessionNames {
 		q := &sessionNoticeQueue{}
-		sessionQueues[sname] = q
+		sc.queues[sname] = q
 		nq := &sessionNotifyQueue{}
-		notifyQueues[sname] = nq
+		sc.notifyQueues[sname] = nq
 		base, err := pq.NewConnector(r.DSN)
 		if err == nil {
 			withNotice := pq.ConnectorWithNoticeHandler(base, func(n *pq.Error) {
@@ -349,82 +407,127 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 			withNotify := pq.ConnectorWithNotificationHandler(withNotice, func(n *pq.Notification) {
 				nq.push(n)
 			})
-			sessionDBs[sname] = sql.OpenDB(withNotify)
+			sc.dbs[sname] = sql.OpenDB(withNotify)
 		} else {
 			// Fallback: use the shared db without notice/notification capture.
-			sessionDBs[sname] = db
+			sc.dbs[sname] = sharedDB
 		}
 	}
-	defer func() {
-		for sname, sdb := range sessionDBs {
-			if sdb != db {
-				_ = sdb.Close()
-			}
-			_ = sname
-		}
-	}()
 
-	// Open one dedicated connection per session.
-	conns := make(map[string]*sql.Conn, len(sessionNames))
-	for _, sname := range sessionNames {
-		conn, err := sessionDBs[sname].Conn(ctx)
-		if err != nil {
-			for _, c := range conns {
-				_ = c.Close()
-			}
-			return "", fmt.Errorf("open connection for session %q: %w", sname, err)
-		}
-		conns[sname] = conn
+	// Derive spec basename (e.g. "insert-conflict-specconflict") for the
+	// application_name used by pg_locks / pg_stat_activity queries.
+	specBase := spec.Path
+	if i := strings.LastIndex(specBase, "/"); i >= 0 {
+		specBase = specBase[i+1:]
 	}
-	// activeSteps tracks the cancel function and result channel for the
-	// most recently launched goroutine on each session's connection. The
-	// deferred cleanup cancels outstanding goroutines and closes
-	// connections without blocking — if a goroutine is stuck in IO wait
-	// (e.g. lib/pq doesn't interrupt pending reads on context cancel),
-	// we close the connections in a background goroutine so the
-	// permutation loop can advance to teardown.
+	specBase = strings.TrimSuffix(specBase, ".spec")
+
+	for _, sname := range sessionNames {
+		conn, err := sc.dbs[sname].Conn(ctx)
+		if err != nil {
+			sc.close()
+			return nil, fmt.Errorf("open connection for session %q: %w", sname, err)
+		}
+		sc.conns[sname] = conn
+		appName := "isolation/" + specBase + "/" + sname
+		if err := execConn(ctx, conn, "SET application_name = '"+appName+"'"); err != nil {
+			sc.close()
+			return nil, fmt.Errorf("session %q set application_name: %w", sname, err)
+		}
+		if pid, ok := backendPIDOf(ctx, conn); ok {
+			sc.pidToSession[pid] = sname
+		}
+	}
+	return sc, nil
+}
+
+// drainQueues discards any notices/notifications buffered on the session queues.
+// Called at the start of each permutation so leftover messages from the prior
+// permutation are not attributed to this one. The monotonic notice `total`
+// counter is intentionally NOT reset — "notices <n>" completion blockers compare
+// a delta against a per-step baseline, so accumulation across permutations is
+// harmless.
+func (sc *sessionConns) drainQueues() {
+	for _, q := range sc.queues {
+		q.drain()
+	}
+	for _, nq := range sc.notifyQueues {
+		nq.drain()
+	}
+}
+
+// healthy reports whether every session connection is idle and responsive. A
+// timed-out step can leave a goroutine holding a connection; a trivial
+// round-trip with a short deadline detects that (the QueryContext blocks on the
+// busy connection until the deadline fires). Returns false on the first
+// connection that errors or times out.
+func (sc *sessionConns) healthy(ctx context.Context) bool {
+	for _, c := range sc.conns {
+		hctx, cancel := context.WithTimeout(ctx, time.Second)
+		err := execConn(hctx, c, "SELECT 1")
+		cancel()
+		if err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// close closes all session connections and their backing *sql.DB handles.
+// Connections are closed in a background goroutine bounded to 3 seconds: if a
+// goroutine is stuck in a lib/pq pending read, c.Close() blocks, and the bound
+// lets the caller proceed regardless.
+func (sc *sessionConns) close() {
+	done := make(chan struct{})
+	connsCopy := make([]*sql.Conn, 0, len(sc.conns))
+	for _, c := range sc.conns {
+		connsCopy = append(connsCopy, c)
+	}
+	go func() {
+		for _, c := range connsCopy {
+			_ = c.Close()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+	}
+	for _, sdb := range sc.dbs {
+		if sdb != sc.sharedDB {
+			_ = sdb.Close()
+		}
+	}
+}
+
+// runPermutation executes one permutation against the persistent per-session
+// connections in sc (created once per spec by RunSpec and reused across every
+// permutation, mirroring upstream isolationtester connection reuse). M0118-0009.
+func (r *IsolationRunner) runPermutation(ctx context.Context, sc *sessionConns, spec IsolationSpec, perm []string, permBlockers [][]StepBlocker, setupResult string) (string, error) {
+	sessionNames := sc.names
+	sessionQueues := sc.queues
+	notifyQueues := sc.notifyQueues
+	conns := sc.conns
+	pidToSession := sc.pidToSession
+
+	// activeSteps tracks the cancel function and result channel for the most
+	// recently launched goroutine on each session's connection. The deferred
+	// cleanup cancels any still-running goroutine (e.g. one that timed out) so
+	// it stops using the shared connection, but does NOT close the connections —
+	// they are owned by RunSpec and reused across permutations. RunSpec rebuilds
+	// the set if a post-permutation health check finds a connection left busy.
 	type activeStep struct {
 		cancel context.CancelFunc
 		outCh  chan stepOutcome
 	}
 	activeSteps := make(map[string]*activeStep, len(sessionNames))
 	defer func() {
-		// Cancel all outstanding step goroutines.
 		for _, a := range activeSteps {
 			if a != nil && a.cancel != nil {
 				a.cancel()
 			}
 		}
-		// Close connections in a background goroutine with a 3-second
-		// deadline. If a goroutine is stuck in IO wait (lib/pq pending
-		// read) the Close() will block; the background goroutine lets
-		// us time-bound that wait so the permutation loop can proceed.
-		closeDone := make(chan struct{})
-		connsCopy := make([]*sql.Conn, 0, len(conns))
-		for _, c := range conns {
-			connsCopy = append(connsCopy, c)
-		}
-		go func() {
-			for _, c := range connsCopy {
-				_ = c.Close()
-			}
-			close(closeDone)
-		}()
-		select {
-		case <-closeDone:
-		case <-time.After(3 * time.Second):
-			// Connection close timed out; background goroutine will
-			// eventually finish when the server-side query completes.
-		}
 	}()
-
-	// Derive spec basename (e.g. "insert-conflict-specconflict") for
-	// the application_name used by pg_locks / pg_stat_activity queries.
-	specBase := spec.Path
-	if i := strings.LastIndex(specBase, "/"); i >= 0 {
-		specBase = specBase[i+1:]
-	}
-	specBase = strings.TrimSuffix(specBase, ".spec")
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "starting permutation: %s\n", strings.Join(perm, " "))
@@ -434,32 +537,20 @@ func (r *IsolationRunner) runPermutation(ctx context.Context, db *sql.DB, spec I
 	// for the vast majority of specs whose setup is pure DDL/DML. M0118-0009.
 	sb.WriteString(setupResult)
 
-	// Per-session setup: set application_name first so pg_locks queries
-	// filtered by application_name can identify sessions. M0100-0006b.
+	// Per-session setup runs at the start of EVERY permutation (mirrors
+	// isolationtester.c run_permutation), on the persistent session connection.
+	// Crucially this re-runs only the spec's `setup` block (e.g. stats.spec's
+	// `SET stats_fetch_consistency='none'`); it does NOT reset the connection,
+	// so a session GUC set by a step in an earlier permutation (e.g. SET
+	// track_functions='all') stays in effect — matching upstream.
 	//
-	// PostgreSQL isolationtester.c (run_permutation) prints a per-session
-	// setup block's result set at the top of every permutation — right after
-	// the "starting permutation:" line — when the block's final command returns
-	// tuples (PGRES_TUPLES_OK). e.g. lock-update-delete's s2 setup runs
-	// `SELECT pg_advisory_lock(0)` and PG emits its one-row result before any
-	// step. COMMAND_OK setups (BEGIN/SET/INSERT) print nothing. We mirror this:
-	// the SET application_name (a goopg-only addition PG never runs) is executed
-	// uncaptured, then the spec's setup block is run with output captured and
-	// emitted in session order. M0118-0003.
-	// pidToSession maps each session's backend PID to its session name, so a
-	// captured notification (which carries the NOTIFYing backend's PID) can be
-	// attributed to the source session in the "from <session>" suffix, exactly
-	// as upstream isolationtester resolves notify->be_pid. Built once per
-	// permutation on the dedicated session connections. M0118-0009.
-	pidToSession := make(map[int]string, len(sessionNames))
+	// isolationtester prints a per-session setup block's result set at the top
+	// of the permutation when its final command returns tuples (PGRES_TUPLES_OK)
+	// — e.g. lock-update-delete's s2 setup `SELECT pg_advisory_lock(0)`. We
+	// mirror that by capturing the setup output and emitting it in session
+	// order. (application_name and the pid→session map are established once in
+	// openSessionConns, not per permutation.)
 	for _, sname := range sessionNames {
-		appName := "isolation/" + specBase + "/" + sname
-		if err := execConn(ctx, conns[sname], "SET application_name = '"+appName+"'"); err != nil {
-			return "", fmt.Errorf("session %q set application_name: %w", sname, err)
-		}
-		if pid, ok := backendPIDOf(ctx, conns[sname]); ok {
-			pidToSession[pid] = sname
-		}
 		if setupSQL, ok := spec.SessionSetup[sname]; ok && setupSQL != "" {
 			out, errText := execConnSetupCapture(ctx, conns[sname], setupSQL)
 			if errText != "" {
@@ -1118,6 +1209,13 @@ func scanResultSet(rows *sql.Rows) (oneResult, string) {
 	numericCols := make([]string, len(cols))
 	boolCols := make([]bool, len(cols))
 	dateCols := make([]bool, len(cols))
+	// floatCols[i] is the float bit size (32 or 64) for float4/float8 columns,
+	// or 0 otherwise. lib/pq decodes the float OIDs (700/701) into a Go float64,
+	// and a sql.NullString scan would then let database/sql's convertAssign
+	// re-render it with Go's strconv 'g',-1 ("2.18875e+06") instead of
+	// PostgreSQL's float8out format ("2188750"). Scan such columns as a float
+	// and render via executor.PGFloatOut to match the golden pg_regress output.
+	floatCols := make([]int, len(cols))
 	for i := range cols {
 		numericCols[i] = "text"
 		if i < len(colTypes) {
@@ -1127,6 +1225,12 @@ func scanResultSet(rows *sql.Rows) (oneResult, string) {
 			}
 			if dbType == "BOOL" {
 				boolCols[i] = true
+			}
+			switch strings.ToUpper(dbType) {
+			case "FLOAT8", "DOUBLE PRECISION":
+				floatCols[i] = 64
+			case "FLOAT4", "REAL":
+				floatCols[i] = 32
 			}
 			// DATE columns: lib/pq decodes the date OID (1082) into a time.Time,
 			// which a NullString scan would then re-render as RFC3339
@@ -1149,11 +1253,15 @@ func scanResultSet(rows *sql.Rows) (oneResult, string) {
 	for rows.Next() {
 		vals := make([]sql.NullString, len(cols))
 		dateVals := make([]sql.NullTime, len(cols))
+		floatVals := make([]sql.NullFloat64, len(cols))
 		ptrs := make([]interface{}, len(cols))
 		for i := range cols {
-			if dateCols[i] {
+			switch {
+			case dateCols[i]:
 				ptrs[i] = &dateVals[i]
-			} else {
+			case floatCols[i] != 0:
+				ptrs[i] = &floatVals[i]
+			default:
 				ptrs[i] = &vals[i]
 			}
 		}
@@ -1162,16 +1270,21 @@ func scanResultSet(rows *sql.Rows) (oneResult, string) {
 		}
 		row := make([]string, len(cols))
 		for i := range cols {
-			if dateCols[i] {
+			switch {
+			case dateCols[i]:
 				if dateVals[i].Valid {
 					row[i] = dateVals[i].Time.Format("01-02-2006")
 				}
-				continue
-			}
-			if vals[i].Valid {
-				row[i] = vals[i].String
-				if boolCols[i] {
-					row[i] = normalizeBoolWireText(row[i])
+			case floatCols[i] != 0:
+				if floatVals[i].Valid {
+					row[i] = executor.PGFloatOut(floatVals[i].Float64, floatCols[i])
+				}
+			default:
+				if vals[i].Valid {
+					row[i] = vals[i].String
+					if boolCols[i] {
+						row[i] = normalizeBoolWireText(row[i])
+					}
 				}
 			}
 		}
