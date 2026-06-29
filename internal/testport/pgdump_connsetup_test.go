@@ -6605,6 +6605,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		if strings.Contains(res.Stdout, "ALTER STATISTICS public.statext_all SET STATISTICS") {
 			t.Errorf("pg_dump emitted a spurious ALTER STATISTICS for a default-target object\n  full stdout=%q", res.Stdout)
 		}
+		// **Slice 318 (asserted):** every extended-statistics object must round-trip
+		// its ownership as `ALTER STATISTICS <nsp>.<name> OWNER TO <role>;`. pg_dump
+		// builds the STATISTICS archive entry with `.owner = getRoleName(stxowner)`
+		// (pg_dump.c dumpStatisticsExt); the archiver's _printTocEntry then renders
+		// the OWNER TO line because "STATISTICS" is in _getObjectDescription's
+		// ALTER-able object list (pg_backup_archiver.c:3799). This exercises the
+		// goopg-specific pg_statistic_ext.stxowner projection (=10, the bootstrap
+		// superuser) end-to-end: if that cell regressed to NULL or a dangling OID,
+		// getRoleName would fail and the OWNER TO line would vanish (or pg_dump would
+		// error). Slices 314–317 dumped the CREATE/COMMENT/SET STATISTICS but never
+		// asserted ownership. The role name matches the table OWNER TO above, so the
+		// prefix is asserted (as with `ALTER TABLE public.foo OWNER TO`).
+		for _, stxName := range []string{"statext_all", "statext_nd", "statext_expr", "statext_mix"} {
+			want := "ALTER STATISTICS public." + stxName + " OWNER TO "
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped statistics ownership; missing %q\n  full stdout=%q", want, res.Stdout)
+			}
+		}
 		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must
 		// round-trip. Slice 147 created public.add_one(integer) only as a COMMENT
 		// target and asserted the COMMENT line; the CREATE FUNCTION body that

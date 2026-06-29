@@ -2346,11 +2346,22 @@ documentation-only and is exempt from the design-doc requirement.)
       (PG order). No `pg_statistic_ext` view change — `getExtendedStatistics`
       reads only oid/stxname/stxnamespace/stxowner/stxrelid/stxstattarget. Design
       `0119-0004-expression-statistics-roundtrip.md`.
-      **Still open under M0119-0004:** `ALTER STATISTICS … SET STATISTICS n`
-      (`stxstattarget`; needs ALTER STATISTICS support); the pg_dump 002–010
-      catalog-view parity battery (further slices); extended-protocol commit-time
-      deferral (architecturally entangled — extended protocol is
-      auto-commit-per-statement).
+      **Slice 317 (loop #39):** `ALTER STATISTICS … SET STATISTICS n` round-trip —
+      new parser `AlterStatisticsStmt` + `catalog.StatisticsObject.StatTarget *int`;
+      `pg_statistic_ext.stxstattarget` projects the value (else -1 = NULL-equiv);
+      `dumpStatisticsExt` re-emits the ALTER only when target >= 0. Design
+      `0119-0004-alter-statistics-set-statistics.md`.
+      **Slice 318 (loop #40):** extended-statistics ownership round-trip —
+      test-only guard asserting `ALTER STATISTICS <nsp>.<name> OWNER TO <role>;`
+      for all four fixture stats objects. pg_dump emits ownership from the TOC
+      archive entry (`dumpStatisticsExt` `.owner = getRoleName(stxowner)`;
+      `_printTocEntry` renders it because `"STATISTICS"` is in
+      `_getObjectDescription`'s ALTER-able list). Exercises the goopg
+      `pg_statistic_ext.stxowner = 10` projection end-to-end; no production code
+      changed (already worked). Design `0119-0004-statistics-owner-roundtrip.md`.
+      **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
+      battery (further slices); extended-protocol commit-time deferral
+      (architecturally entangled — extended protocol is auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

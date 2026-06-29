@@ -1,33 +1,29 @@
 (idle — nothing in flight)
 
-Last loop (#39): M0119-0004 **ALTER STATISTICS … SET STATISTICS round-trip in
-pg_dump** (DU-002 slice 317) — LANDED. Design
-`0119-0004-alter-statistics-set-statistics.md`.
+Last loop (#40): M0119-0004 **extended-statistics ownership round-trip in
+pg_dump** (DU-002 slice 318) — LANDED. Design
+`0119-0004-statistics-owner-roundtrip.md`. Test-only guard.
 
-goopg had NO `ALTER STATISTICS` statement (parse error) and the pg_statistic_ext
-virtual row hardcoded stxstattarget=-1, so a per-object statistics target could
-never be recorded and pg_dump never re-emitted the ALTER. Fix threads it
-end-to-end:
-- parser: new AlterStatisticsStmt (Name/IfExists/Target/HasTarget); ALTER
-  STATISTICS branch in parseAlter (IF EXISTS, schema-qualified name, SET
-  STATISTICS n incl. leading `-` for -1 reset; RENAME/OWNER/SET SCHEMA = no-ops).
-- catalog: StatisticsObject.StatTarget *int + lock-safe SetStatisticsTarget;
-  pg_statistic_ext virtual row projects the value (else default -1).
-- executor: execAlterStatistics — n>=0 → &n, -1 → nil.
-- planner: route AlterStatisticsStmt to DDL; ddlTag → "ALTER STATISTICS" (+ also
-  added "CREATE STATISTICS", was falling through to "OK").
-GOTCHA: default stays -1 NOT true int-NULL — TypedVirtualCell parses "" int4 cell
-as StringConst"" → pg_dump atoi("")=0 → spurious SET STATISTICS 0. -1 is
-byte-identical to NULL for pg_dump (getExtendedStatistics maps both to -1).
+pg_dump emits object ownership from the TOC archive entry, not the createStmt:
+`dumpStatisticsExt` sets `.owner = getRoleName(stxowner)` and `_printTocEntry`
+renders `ALTER STATISTICS <nsp>.<name> OWNER TO <role>;` because "STATISTICS" is
+in `_getObjectDescription`'s ALTER-able list (pg_backup_archiver.c:3799). Slices
+314–317 dumped CREATE/COMMENT/SET STATISTICS but never asserted ownership. This
+slice asserts the OWNER TO line for all four fixture stats objects
+(statext_all/nd/expr/mix). No production code changed — ownership already
+round-tripped via the `pg_statistic_ext.stxowner = 10` (bootstrap superuser)
+virtual-row projection (catalog.go pgStatisticExt VirtualRows). The guard
+protects against that cell regressing to NULL / a dangling OID (getRoleName would
+fail → OWNER TO silently vanishes).
 
-Gates: DU-002 slice 317 in TestPort_PgDumpConnectionSetup PASS vs real pg_dump
-18.3 (4.5s); TestParseAlterStatisticsSetStatistics; TestSetStatisticsTargetProjection;
-parser/catalog/planner/executor/server suites PASS; go build clean; pgbench smoke
-= pre-commit hook.
+Gates: TestPort_PgDumpConnectionSetup PASS vs real pg_dump 18.3 (4.3s);
+go build clean; pgbench smoke = pre-commit hook; ralph-state-guard OK.
 
 NEXT loop — next pg_dump getter-battery gap (M0110-0001 / DU-002). Candidates:
-- ALTER STATISTICS … OWNER TO / RENAME TO / SET SCHEMA (currently parsed as
-  no-ops; pg_dump emits OWNER via getRoleName, not asserted yet).
-- Other M0119: M0119-0002 (CLOG store swap Part B) / M0119-0005 (pg_waldump) /
-  M0119-0006 (pg_amcheck). Extended-protocol commit-time deferral is
-  architecturally entangled (see memory goopg_extended_protocol_autocommit).
+- The pg_dump 002–010 catalog-view parity battery (further slices) — pick a real
+  feature gap, not another assertion-only guard (statistics object dump is now
+  fully covered: CREATE/COMMENT/expr/SET STATISTICS/OWNER TO all round-trip).
+- Other M0119: M0119-0002 (CLOG store swap Part B — WAL/MVCC, needs race gate) /
+  M0119-0005 (pg_waldump) / M0119-0006 (pg_amcheck). Extended-protocol
+  commit-time deferral is architecturally entangled
+  (see memory goopg_extended_protocol_autocommit).
