@@ -1426,6 +1426,11 @@ type CreateIndexStmt struct {
 type IndexColOrder struct {
 	Descending bool
 	NullsFirst bool
+	// OpClass is the explicit per-column operator class name (e.g.
+	// "text_pattern_ops"), empty when the column uses its type's default
+	// operator class. Mirrors pg_index.indclass so pg_get_indexdef can re-emit a
+	// non-default opclass after the column (ruleutils.c get_opclass_name).
+	OpClass string
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }

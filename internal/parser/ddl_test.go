@@ -168,12 +168,12 @@ func TestParseCreateIndexColOrders(t *testing.T) {
 		in   string
 		want []IndexColOrder
 	}{
-		{"CREATE INDEX i ON t (a)", []IndexColOrder{{false, false}}},
-		{"CREATE INDEX i ON t (a DESC)", []IndexColOrder{{true, true}}},
-		{"CREATE INDEX i ON t (a ASC)", []IndexColOrder{{false, false}}},
-		{"CREATE INDEX i ON t (a DESC NULLS LAST)", []IndexColOrder{{true, false}}},
-		{"CREATE INDEX i ON t (a NULLS FIRST)", []IndexColOrder{{false, true}}},
-		{"CREATE INDEX i ON t (a DESC, b NULLS FIRST)", []IndexColOrder{{true, true}, {false, true}}},
+		{"CREATE INDEX i ON t (a)", []IndexColOrder{{Descending: false, NullsFirst: false}}},
+		{"CREATE INDEX i ON t (a DESC)", []IndexColOrder{{Descending: true, NullsFirst: true}}},
+		{"CREATE INDEX i ON t (a ASC)", []IndexColOrder{{Descending: false, NullsFirst: false}}},
+		{"CREATE INDEX i ON t (a DESC NULLS LAST)", []IndexColOrder{{Descending: true, NullsFirst: false}}},
+		{"CREATE INDEX i ON t (a NULLS FIRST)", []IndexColOrder{{Descending: false, NullsFirst: true}}},
+		{"CREATE INDEX i ON t (a DESC, b NULLS FIRST)", []IndexColOrder{{Descending: true, NullsFirst: true}, {Descending: false, NullsFirst: true}}},
 	}
 	for _, c := range cases {
 		stmts, err := Parse(c.in)
@@ -187,6 +187,39 @@ func TestParseCreateIndexColOrders(t *testing.T) {
 		for i, w := range c.want {
 			if ci.ColOrders[i] != w {
 				t.Errorf("Parse(%q): ColOrders[%d]=%+v want %+v", c.in, i, ci.ColOrders[i], w)
+			}
+		}
+	}
+}
+
+// TestParseCreateIndexColOpClass pins the per-column operator-class capture
+// (DU-002 slice 312). goopg previously parsed and discarded the opclass name, so
+// `CREATE INDEX ON t (a text_pattern_ops)` dumped as a plain `(a)` — silently
+// widening the index to the column type's default opclass on restore. The opclass
+// must land on ColOrders[i].OpClass; it also coexists with COLLATE and ASC/DESC.
+func TestParseCreateIndexColOpClass(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string // per-column OpClass
+	}{
+		{"CREATE INDEX i ON t (a)", []string{""}},
+		{"CREATE INDEX i ON t (a text_pattern_ops)", []string{"text_pattern_ops"}},
+		{"CREATE INDEX i ON t (a text_pattern_ops DESC)", []string{"text_pattern_ops"}},
+		{`CREATE INDEX i ON t (a COLLATE "C" text_pattern_ops)`, []string{"text_pattern_ops"}},
+		{"CREATE INDEX i ON t (a, b varchar_pattern_ops)", []string{"", "varchar_pattern_ops"}},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ci := stmts[0].(*CreateIndexStmt)
+		if len(ci.ColOrders) != len(c.want) {
+			t.Fatalf("Parse(%q): ColOrders=%+v want %d cols", c.in, ci.ColOrders, len(c.want))
+		}
+		for i, w := range c.want {
+			if ci.ColOrders[i].OpClass != w {
+				t.Errorf("Parse(%q): ColOrders[%d].OpClass=%q want %q", c.in, i, ci.ColOrders[i].OpClass, w)
 			}
 		}
 	}

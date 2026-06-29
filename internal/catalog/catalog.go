@@ -1355,6 +1355,12 @@ type Index struct {
 	// slice 56.
 	ColDescending []bool
 	ColNullsFirst []bool
+	// ColOpClasses captures the per-key-column explicit operator class name
+	// (parallel to Columns), e.g. "text_pattern_ops". It mirrors pg_index.indclass
+	// so BuildIndexDef (pg_get_indexdef) can re-emit a non-default operator class
+	// after the column. An empty entry (or empty slice) means the column uses its
+	// type's default operator class. DU-002 slice 312.
+	ColOpClasses  []string
 	IsConstraint  bool   // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
 	IsExclusion   bool   // true when index backs an EXCLUDE USING constraint
 	ExclusionOp   string // per-column exclusion operator (e.g. "=")
@@ -7994,6 +8000,16 @@ func BuildIndexDef(idx *Index) string {
 			}
 		} else {
 			sb.WriteString(col)
+		}
+		// Non-default per-column operator class, e.g. ` text_pattern_ops`.
+		// ruleutils.c get_opclass_name emits it after the column/expression (and
+		// after any COLLATE clause) and before the ASC/DESC ordering, suppressing
+		// the type's default opclass. goopg records only an explicitly-written
+		// opclass, so a non-empty entry is by construction non-default. DU-002
+		// slice 312.
+		if i < len(idx.ColOpClasses) && idx.ColOpClasses[i] != "" {
+			sb.WriteByte(' ')
+			sb.WriteString(idx.ColOpClasses[i])
 		}
 		// Per-column ASC/DESC + NULLS ordering, mirroring ruleutils.c
 		// pg_get_indexdef_worker: DESC defaults to NULLS FIRST (print NULLS LAST

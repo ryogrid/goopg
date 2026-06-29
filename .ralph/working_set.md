@@ -1,34 +1,36 @@
 (idle — nothing in flight)
 
-Last loop (#32): M0119-0004 **`ON DELETE SET NULL|DEFAULT (column_list)` round-trip
-in pg_dump** (DU-002 slice 311) — LANDED. Design
-`0119-0004-fk-on-delete-set-cols-roundtrip.md`.
+Last loop (#33): M0119-0004 **per-column operator class round-trip in pg_dump**
+(DU-002 slice 312) — LANDED. Design `0119-0004-index-column-opclass-roundtrip.md`.
 
-PG15 lets an `ON DELETE SET NULL/DEFAULT` action be restricted to a subset of the
-FK's referencing columns (`pg_constraint.confdelsetcols`); pg_get_constraintdef
-appends ` (col, …)` after the ON DELETE clause (ruleutils.c:2376). goopg's
-`parseFKAction` consumed SET NULL/DEFAULT but never the trailing column list →
-silently degraded into a whole-key SET NULL on restore (semantic change).
+A B-tree index column may declare a non-default opclass (`CREATE INDEX … (a
+text_pattern_ops)`); PG carries it via pg_index.indclass and re-emits it in
+pg_get_indexdef_worker (get_opclass_name) after the column/COLLATE, before
+ASC/DESC, suppressing the type default. goopg's parseIndexColumnList CONSUMED the
+bare opclass ident but DISCARDED it; catalog.Index had no per-column opclass field
+and BuildIndexDef emitted none → `(a text_pattern_ops)` dumped as `(a)` (semantic
+widen to default opclass on restore).
 
-Threaded end-to-end (mirroring slice-309 MATCH FULL):
-- ddl.go parseFKAction: now returns (FKAction, []string, error); parses optional
-  `(col_list)`, recorded only on isDelete branch. 3 callers updated.
-- ast.go: new OnDeleteSetCols []string on ColumnDef/TableForeignKeyDef/AlterTableAction.
-- catalog.go: ForeignKey.OnDeleteSetCols; pg_constraint builder projects
-  confdelsetcols (row[23], attnum array via colOrd; NULL when whole-key).
-- operators_ddl.go: 3 FK build sites copy the field.
-- expr.go buildForeignKeyDefString: append ` (cols)` after ON DELETE when SET
-  NULL/DEFAULT + non-empty list.
+Threaded (parallel to ColDescending/ColNullsFirst):
+- ast.go: new IndexColOrder.OpClass (parser captures the discarded name).
+- ddl.go parseIndexColumnList: assign colOpClass → order.OpClass.
+- catalog.go: Index.ColOpClasses []string; BuildIndexDef emits ` <opclass>` after
+  col, before DESC/NULLS, gated on non-empty entry.
+- operators_ddl.go: new indexHasOpClass guard ORs into the store-metadata gate;
+  copies ColOrders[i].OpClass → idx.ColOpClasses.
 
-Gates: DU-002 slice 311 in TestPort_PgDumpConnectionSetup (sfk_child_fk →
-`ON DELETE SET NULL (b);`) PASS vs real pg_dump 18.3 (4.65s); new unit
-TestForeignKeyOnDeleteSetColsRoundTrip PASS; parser+catalog+executor suites PASS;
-`go build ./...` clean; pgbench smoke = pre-commit hook.
+Records only EXPLICIT opclass (non-empty ⇒ non-default); explicit-default edge
+(user writes `text_ops`, PG drops) accepted, same as partition-key opclass slice
+300. Dump-fidelity only (goopg always builds default-comparison btree).
 
-NEXT loop — remaining open under M0119-0004 (probe TestPort_PgDumpConnectionSetup
-for the next getter-battery gap): pg_dump 002–010 catalog-view parity battery
-candidates — collation/opclass on index columns, comment round-trip via
-pg_description on more object types, GENERATED column STORED expr edge cases.
-Extended-protocol commit-time deferral is architecturally entangled (auto-commit-
-per-statement; see memory). Other M0119: M0119-0002 (CLOG store swap Part B —
-full-gate) / M0119-0005 (pg_waldump) / M0119-0006 (pg_amcheck).
+Gates: DU-002 slice 312 in TestPort_PgDumpConnectionSetup PASS vs real pg_dump
+18.3 (5.1s); new units TestBuildIndexDefColOpClass + TestParseCreateIndexColOpClass
+PASS; parser+catalog+executor suites PASS; `go build ./...` clean; pgbench smoke =
+pre-commit hook.
+
+NEXT loop — next pg_dump getter-battery gap. Strong sibling candidate: per-column
+COLLATE on an index column/expression (`CREATE INDEX … (a COLLATE "C")`) —
+BuildIndexDef emits NO COLLATE clause yet (parser already consumes+discards COLLATE
+the same way it did the opclass). Other M0119: M0119-0002 (CLOG store swap Part B
+full-gate) / M0119-0005 (pg_waldump) / M0119-0006 (pg_amcheck). Extended-protocol
+commit-time deferral is architecturally entangled (auto-commit-per-statement).

@@ -3413,9 +3413,13 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, []IndexColOrder, stri
 		// and not ',' or ')'). `NULLS` lexes as a bare TokenIdent, so guard
 		// against it here — otherwise `(col NULLS FIRST)` mis-reads NULLS as an
 		// opclass name and the trailing FIRST/LAST then fails to parse.
+		var colOpClass string
 		if p.cur().Kind == TokenIdent && !strings.EqualFold(p.cur().Value, "nulls") {
-			// This is the opclass name — capture it.
+			// This is the opclass name — capture it so pg_get_indexdef / pg_dump
+			// can re-emit a non-default operator class after the column. DU-002
+			// slice 312.
 			opClassName := p.cur().Value
+			colOpClass = opClassName
 			p.advance()
 			// Optional operator class options: (foo=1, bar=2).
 			// Most built-in operator classes have no options; presence here
@@ -3441,6 +3445,7 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, []IndexColOrder, stri
 		// LAST for ASC, so pre-resolve NullsFirst to the descending flag and let
 		// an explicit NULLS clause below override it (mirrors PG's indoption).
 		var order IndexColOrder
+		order.OpClass = colOpClass
 		if p.acceptKeyword(KwDesc) {
 			order.Descending = true
 		} else {

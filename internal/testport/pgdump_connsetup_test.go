@@ -2886,6 +2886,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("alter table sfk_child add fk on delete set null (b): %v", err)
 	}
 
+	// Slice 312: a CREATE INDEX with a non-default per-column operator class
+	// (`text_pattern_ops`) must round-trip the opclass. pg_get_indexdef_worker
+	// (ruleutils.c get_opclass_name) emits the opclass after the column — and
+	// after any COLLATE — and before ASC/DESC, suppressing only the type's default
+	// opclass. The gap was at parse time: parseIndexColumnList consumed the bare
+	// opclass ident but DISCARDED it, and catalog.Index had no per-column opclass
+	// field, so `CREATE INDEX … (a text_pattern_ops)` dumped as a plain `(a)` —
+	// silently widening the index back to the default opclass on restore (a
+	// semantic change: text_pattern_ops drives LIKE/prefix-range scans, the
+	// default text_ops does not). goopg now threads the opclass onto
+	// IndexColOrder.OpClass → catalog.Index.ColOpClasses → BuildIndexDef. A
+	// second key column with a default opclass confirms only the explicit one is
+	// emitted.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.opcidx (a text, b text)"); err != nil {
+		t.Fatalf("create table opcidx: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE INDEX opcidx_pat ON public.opcidx (a text_pattern_ops, b)"); err != nil {
+		t.Fatalf("create index opcidx_pat with opclass: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -7294,6 +7314,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// silently widen the action to the whole key on restore — a semantic change.
 		if !strings.Contains(res.Stdout, "ADD CONSTRAINT sfk_child_fk FOREIGN KEY (b) REFERENCES public.sfk_ref(id) ON DELETE SET NULL (b);") {
 			t.Errorf("pg_dump dropped the ON DELETE SET NULL column list; missing the sfk_child_fk line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 312 (asserted):** a CREATE INDEX with a non-default per-column
+		// operator class round-trips the opclass. pg_get_indexdef_worker emits
+		// ` text_pattern_ops` after the column (get_opclass_name, ruleutils.c) and
+		// suppresses the default opclass on the sibling column `b`. A regression
+		// dropping the opclass would silently widen the index to the default
+		// opclass on restore — a semantic change (text_pattern_ops vs text_ops).
+		if !strings.Contains(res.Stdout, "CREATE INDEX opcidx_pat ON public.opcidx USING btree (a text_pattern_ops, b);") {
+			t.Errorf("pg_dump dropped the index column operator class; missing the opcidx_pat line\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 119 (asserted):** descending sequences must round-trip through
 		// pg_dump's descending-direction default suppression. A plain

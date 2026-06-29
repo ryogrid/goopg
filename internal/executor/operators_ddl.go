@@ -4896,7 +4896,8 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// at least one column is non-default so a plain index keeps empty slices and
 	// dumps byte-identically. DU-002 slice 56.
 	nonDefaultOrder := indexHasNonDefaultOrder(s.ColOrders)
-	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
+	hasOpClass := indexHasOpClass(s.ColOrders)
+	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || hasOpClass || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.HasPredicate = s.HasPredicate
 			idx.Predicate = s.Predicate
@@ -4921,6 +4922,16 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 				}
 				idx.ColDescending = desc
 				idx.ColNullsFirst = nullsFirst
+			}
+			// Non-default per-column operator class (pg_index.indclass) so
+			// pg_get_indexdef / pg_dump re-emit ` text_pattern_ops` after the
+			// column. DU-002 slice 312.
+			if hasOpClass {
+				opc := make([]string, len(s.ColOrders))
+				for i, ord := range s.ColOrders {
+					opc[i] = ord.OpClass
+				}
+				idx.ColOpClasses = opc
 			}
 		}
 	}
@@ -5040,6 +5051,17 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 func indexHasNonDefaultOrder(orders []parser.IndexColOrder) bool {
 	for _, o := range orders {
 		if o.Descending || o.NullsFirst {
+			return true
+		}
+	}
+	return false
+}
+
+// indexHasOpClass reports whether any key column carries an explicit (non-default)
+// operator class, so the catalog records pg_index.indclass for pg_get_indexdef.
+func indexHasOpClass(orders []parser.IndexColOrder) bool {
+	for _, o := range orders {
+		if o.OpClass != "" {
 			return true
 		}
 	}
