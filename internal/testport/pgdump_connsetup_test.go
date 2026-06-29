@@ -3345,6 +3345,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("revoke trigger on ownrev_t from postgres: %v", err)
 	}
 
+	// Slice 341: a full owner-side REVOKE ALL must round-trip as the empty aclitem
+	// array. `REVOKE ALL ON TABLE ownrevall_t FROM postgres` strips the owner's
+	// implicit default privileges, leaving relacl = `{}` (a non-NULL but empty
+	// array, distinct from the NULL of a never-granted table). pg_dump's
+	// buildACLCommands diffs {} against acldefault('r', 10) and emits a bare
+	// `REVOKE ALL … FROM postgres;` with no re-GRANT (verified byte-identical to
+	// real pg_dump 18.3). Before this slice the owner REVOKE ALL reverted relacl
+	// to NULL (the owner entry was dropped entirely) so pg_dump emitted nothing,
+	// silently restoring the owner's default privileges on restore. goopg now
+	// records the emptied state (catalog.relACLEmptied) so relacl projects "{}".
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ownrevall_t (a integer, b text)"); err != nil {
+		t.Fatalf("create table ownrevall_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE ALL ON TABLE public.ownrevall_t FROM postgres"); err != nil {
+		t.Fatalf("revoke all on ownrevall_t from postgres: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7252,6 +7269,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// The revoked TRIGGER must NOT reappear in the owner re-GRANT.
 		if strings.Contains(res.Stdout, "TRIGGER ON TABLE public.ownrev_t TO postgres") {
 			t.Errorf("pg_dump re-granted the REVOKEd TRIGGER to the owner\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 341 (asserted):** a full owner-side REVOKE ALL round-trips as the
+		// empty aclitem array. `REVOKE ALL ON TABLE ownrevall_t FROM postgres`
+		// leaves relacl = `{}`, which pg_dump renders as a bare
+		// `REVOKE ALL … FROM postgres;` with NO re-GRANT (the owner retains
+		// nothing). Asserted byte-identical to real pg_dump 18.3. Before this slice
+		// the owner REVOKE ALL reverted relacl to NULL so pg_dump emitted nothing.
+		if want := "REVOKE ALL ON TABLE public.ownrevall_t FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the owner-side REVOKE ALL: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// No GRANT … ownrevall_t … TO postgres must follow (the owner holds no
+		// privileges after REVOKE ALL).
+		if strings.Contains(res.Stdout, "GRANT") && strings.Contains(res.Stdout, "ownrevall_t TO postgres") {
+			t.Errorf("pg_dump re-granted privileges to the owner after REVOKE ALL\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

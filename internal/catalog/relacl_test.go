@@ -374,6 +374,54 @@ func TestMaterializeOwnerACL(t *testing.T) {
 	}
 }
 
+// TestRevokeAllFromOwnerEmptyArray covers DU-002 slice 341: a
+// `REVOKE ALL … FROM owner` strips the owner's implicit default privileges and
+// leaves relacl as a non-NULL *empty* aclitem array {} (distinct from the NULL
+// state of a never-granted relation). pg_dump's buildACLCommands emits a bare
+// `REVOKE ALL …` for {} but nothing for NULL, so the two must render
+// differently. A subsequent GRANT re-materializes the array (clears {}), and a
+// second owner-side revoke after the array is empty must not resurrect the
+// owner's privileges.
+func TestRevokeAllFromOwnerEmptyArray(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16970
+	allTable := []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"}
+
+	// REVOKE ALL FROM postgres: materialize the owner default, then drop every
+	// privilege → relacl is the empty array "{}", NOT NULL.
+	c.MaterializeOwnerACL(relOID, "postgres", allTable)
+	for _, p := range allTable {
+		c.RevokeTablePrivilege(relOID, "postgres", p)
+	}
+	if got := relaclText(c, relOID); got != "{}" {
+		t.Fatalf("relacl after REVOKE ALL FROM postgres = %q; want %q (empty array, not NULL)", got, "{}")
+	}
+
+	// A second owner-side revoke after the array is empty is a no-op: the owner
+	// holds nothing, so MaterializeOwnerACL must not bring privileges back.
+	c.MaterializeOwnerACL(relOID, "postgres", allTable)
+	c.RevokeTablePrivilege(relOID, "postgres", "TRIGGER")
+	if got := relaclText(c, relOID); got != "{}" {
+		t.Fatalf("relacl after second owner revoke on empty array = %q; want %q", got, "{}")
+	}
+
+	// A relation that never had a grant stays NULL — the empty-array state must
+	// not leak across OIDs.
+	if got := relaclText(c, 16971); got != "" {
+		t.Fatalf("relacl of unrelated never-granted relation = %q; want \"\" (NULL)", got)
+	}
+
+	// Re-granting a privilege to the owner re-materializes a real aclitem and
+	// clears the empty-array state. (NB: a grant to a *non-owner* after an owner
+	// REVOKE ALL would in PostgreSQL keep the owner at zero, e.g. {bob=r/postgres};
+	// goopg's owner-default-fallback model renders the owner's full default
+	// instead — a documented follow-up beyond slice 341.)
+	c.GrantTablePrivilege(relOID, "postgres", "SELECT")
+	if got := relaclText(c, relOID); got != "{postgres=r/postgres}" {
+		t.Fatalf("relacl after owner re-GRANT following empty array = %q; want %q", got, "{postgres=r/postgres}")
+	}
+}
+
 // TestACLQuoteName unit-checks the putid emulation directly, including the
 // double-quote-doubling and multibyte (high-bit) cases that are awkward to drive
 // through a full GRANT.

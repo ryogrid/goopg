@@ -2014,6 +2014,16 @@ type InMemory struct {
 	// different, nonexistent role). DU-002 slice 337.
 	roleACLDisplay map[string]string
 
+	// relACLEmptied records relations whose ACL was explicitly materialized to an
+	// empty aclitem array {} — the state PostgreSQL leaves pg_class.relacl in after
+	// a `REVOKE ALL ON TABLE t FROM <owner>` (the owner's implicit default
+	// privileges are stripped, leaving a non-NULL but empty array). This is
+	// distinct from NULL (no GRANT ever recorded): pg_dump's buildACLCommands
+	// emits a bare `REVOKE ALL … FROM <owner>;` for {} but nothing for NULL. A
+	// later GRANT or owner re-materialize clears the flag. Key: relOID → present.
+	// DU-002 slice 341.
+	relACLEmptied map[uint32]bool
+
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
 	compatObjects map[string]map[string]struct{}
@@ -2404,6 +2414,7 @@ func NewInMemory() *InMemory {
 		tempNamespaces: make(map[string]uint32),
 		tableACLs:      make(map[uint32]map[string]map[string]bool),
 		roleACLDisplay: make(map[string]string),
+		relACLEmptied:  make(map[uint32]bool),
 		comments:       make(map[commentKey]string),
 		statisticsObjs: make(map[string]*StatisticsObject),
 		extensions:     make(map[string]*extensionRow),
@@ -8397,6 +8408,10 @@ func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv 
 	if display != role {
 		c.roleACLDisplay[role] = display
 	}
+	// A fresh GRANT re-materializes relacl with real aclitems, so it is no longer
+	// the empty array {} that an earlier owner-side REVOKE ALL produced. DU-002
+	// slice 341.
+	delete(c.relACLEmptied, relOID)
 	byRole := c.tableACLs[relOID]
 	if byRole == nil {
 		byRole = make(map[string]map[string]bool)
@@ -8439,6 +8454,17 @@ func (c *InMemory) RevokeTablePrivilege(relOID uint32, role, priv string) {
 		delete(byRole, role)
 	}
 	if len(byRole) == 0 {
+		// If the relation's last remaining aclitem was the owner's own entry, the
+		// owner has just revoked all of its implicit default privileges
+		// (REVOKE ALL … FROM owner). PostgreSQL leaves relacl as a non-NULL empty
+		// array {} in that case (distinct from NULL); record the emptied state so
+		// relaclTextLockedFor renders "{}" and pg_dump re-emits the bare
+		// `REVOKE ALL …`. A trailing grantee revoke (slice 338) instead returns
+		// relacl to NULL, which is what dropping the entry without this flag does.
+		// DU-002 slice 341.
+		if role == aclOwnerRole {
+			c.relACLEmptied[relOID] = true
+		}
 		delete(c.tableACLs, relOID)
 	}
 }
@@ -8456,6 +8482,9 @@ func (c *InMemory) MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs [
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.relACLEmptied[relOID] {
+		return // owner already revoked all privileges (relacl is {}); do not resurrect
+	}
 	byRole := c.tableACLs[relOID]
 	if byRole == nil {
 		byRole = make(map[string]map[string]bool)
@@ -8497,6 +8526,7 @@ func (c *InMemory) DropTableACL(relOID uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.tableACLs, relOID)
+	delete(c.relACLEmptied, relOID)
 }
 
 // aclPrivLetter pairs a privilege keyword (as stored upper-cased in tableACLs)
@@ -8613,6 +8643,13 @@ func (c *InMemory) NamespaceACLText(schemaOID uint32) string {
 func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter, ownerString string) string {
 	byRole := c.tableACLs[relOID]
 	if len(byRole) == 0 {
+		if c.relACLEmptied[relOID] {
+			// Owner revoked all of its implicit default privileges
+			// (REVOKE ALL … FROM owner): PostgreSQL stores a non-NULL empty
+			// aclitem array {} and pg_dump emits a bare `REVOKE ALL …`. DU-002
+			// slice 341.
+			return "{}"
+		}
 		return "" // NULL relacl — matches acldefault, pg_dump emits no GRANT
 	}
 	// The owner aclitem is always listed first. PostgreSQL leaves relacl NULL
