@@ -7064,6 +7064,12 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					if nc.NoInherit {
 						def += " NO INHERIT"
 					}
+					// pg_get_constraintdef_worker appends the shared ` NOT VALID`
+					// tail for convalidated='f'; pg_dump then emits the CHECK as a
+					// separate ALTER TABLE ADD CONSTRAINT. DU-002 slice 308.
+					if nc.NotValid {
+						def += " NOT VALID"
+					}
 					return NewStringDatum(def), nil
 				}
 			}

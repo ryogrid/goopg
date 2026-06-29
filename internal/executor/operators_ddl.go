@@ -5786,7 +5786,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			// (the latent virtual-table join crash was fixed in
 			// M0097-0023-loop34). M0097-0023.
 			if act.CheckExpr != "" {
-				tbl.AddCheck(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName))
+				tbl.AddCheckWithNotValid(act.ConstraintName, act.CheckExpr, o.allocConstraintOID(act.ConstraintName), act.NotValid)
 				// Propagate to partition children: merge if child already has the
 				// same constraint (locally defined), otherwise inherit it. M0097-0023.
 				if im3, ok3 := o.ctx.Catalog.(*catalog.InMemory); ok3 {

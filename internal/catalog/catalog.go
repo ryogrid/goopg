@@ -204,6 +204,7 @@ type NamedCheckConstraint struct {
 	NoInherit bool   // PG18: CHECK NO INHERIT — not propagated to child tables
 	IsLocal   bool   // conislocal: true if locally defined (not purely inherited)
 	InhCount  int    // coninhcount: number of direct parents this was inherited from
+	NotValid  bool   // convalidated='f': added NOT VALID, existing rows not checked yet
 }
 
 // NamedNotNullConstraint holds a NOT NULL constraint with a catalog-visible name.
@@ -234,6 +235,19 @@ func (t *Table) AddNotNull(name, colName string, oid uint32, noInherit bool, isL
 // the common unnamed case stays invisible in the catalog). M0097-0023.
 func (t *Table) AddCheck(name, expr string, oid uint32) {
 	t.AddCheckWithNoInherit(name, expr, oid, false)
+}
+
+// AddCheckWithNotValid is AddCheck for a CHECK added with NOT VALID
+// (pg_constraint.convalidated='f'): existing rows were not scanned, so the
+// constraint is enforced only for new writes until VALIDATE CONSTRAINT runs.
+// PG's pg_get_constraintdef_worker appends a trailing ` NOT VALID` for such a
+// constraint, and pg_dump dumps it as a separate ALTER TABLE ADD CONSTRAINT so
+// possibly-violating data loads before the constraint. DU-002 slice 308.
+func (t *Table) AddCheckWithNotValid(name, expr string, oid uint32, notValid bool) {
+	t.CheckConstraints = append(t.CheckConstraints, expr)
+	t.NamedChecks = append(t.NamedChecks, NamedCheckConstraint{
+		Name: name, Expr: expr, OID: oid, IsLocal: true, NotValid: notValid,
+	})
 }
 
 // AddCheckWithNoInherit is AddCheck for a CHECK that may carry NO INHERIT
@@ -4712,7 +4726,11 @@ func (c *InMemory) registerSystemTables() {
 				row[3] = "c"                        // contype = check
 				row[4] = "f"                        // condeferrable
 				row[5] = "f"                        // condeferred
-				row[6] = "t"                        // convalidated
+				if nc.NotValid {
+					row[6] = "f" // convalidated — added NOT VALID, not yet validated
+				} else {
+					row[6] = "t" // convalidated
+				}
 				row[7] = fmt.Sprintf("%d", tbl.OID) // conrelid
 				row[8] = "0"                        // contypid
 				row[9] = "0"                        // conindid

@@ -2797,6 +2797,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("alter table nv_child add fk not valid: %v", err)
 	}
 
+	// Slice 308: a CHECK constraint added with NOT VALID must round-trip with the
+	// same ` NOT VALID` tail. ` NOT VALID` is the SHARED final clause of
+	// pg_get_constraintdef_worker (ruleutils.c:2604), common to FK *and* CHECK;
+	// slice 307 wired the FK path, this wires CHECK. pg_dump reads convalidated
+	// for contype='c' rows and sets separate=!validated (pg_dump.c:9757), so an
+	// unvalidated CHECK is emitted AFTER data as a standalone
+	// `ALTER TABLE public.nvc_tbl\n    ADD CONSTRAINT nvc_chk CHECK ((val > 0)) NOT VALID;`
+	// rather than inline in CREATE TABLE — exactly so possibly-violating rows load
+	// first. goopg now carries catalog.NamedCheckConstraint.NotValid (set at
+	// ALTER TABLE ADD CONSTRAINT ... CHECK ... NOT VALID time), projects
+	// convalidated='f', and appends the ` NOT VALID` tail in pg_get_constraintdef's
+	// CHECK branch. Dump-fidelity only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.nvc_tbl (id integer, val integer)"); err != nil {
+		t.Fatalf("create table nvc_tbl: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.nvc_tbl ADD CONSTRAINT nvc_chk CHECK (val > 0) NOT VALID"); err != nil {
+		t.Fatalf("alter table nvc_tbl add check not valid: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -7172,6 +7191,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// suffix would silently re-validate the constraint on restore.
 		if !strings.Contains(res.Stdout, "ADD CONSTRAINT nv_child_fk FOREIGN KEY (ref_id) REFERENCES public.nv_ref(id) NOT VALID;") {
 			t.Errorf("pg_dump dropped the NOT VALID suffix on an unvalidated FK; missing the nv_child_fk line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 308 (asserted):** a NOT-VALID CHECK constraint round-trips with
+		// the same ` NOT VALID` tail. pg_dump emits an unvalidated CHECK as a
+		// separate ALTER TABLE ADD CONSTRAINT (separate=!validated, pg_dump.c:9757)
+		// so possibly-violating data loads first. A regression dropping the suffix
+		// would silently re-validate the constraint on restore.
+		if !strings.Contains(res.Stdout, "ADD CONSTRAINT nvc_chk CHECK ((val > 0)) NOT VALID;") {
+			t.Errorf("pg_dump dropped the NOT VALID suffix on an unvalidated CHECK; missing the nvc_chk line\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 119 (asserted):** descending sequences must round-trip through
 		// pg_dump's descending-direction default suppression. A plain

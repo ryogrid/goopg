@@ -5667,10 +5667,15 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		// Consume optional NOT VALID and/or [NOT] ENFORCED trailers (PG18+).
 		// Possible orderings: NOT VALID, ENFORCED, NOT ENFORCED, NOT VALID ENFORCED.
+		// NOT VALID must survive into pg_constraint.convalidated='f' so pg_dump
+		// re-emits the ` NOT VALID` tail and loads data before the constraint.
+		// DU-002 slice 308.
+		notValid := false
 		if p.acceptKeyword(KwNot) {
 			if !p.acceptIdentKeyword("valid") {
 				_ = p.acceptIdentKeyword("enforced") // NOT ENFORCED
 			} else {
+				notValid = true
 				// NOT VALID — also accept optional trailing [NOT] ENFORCED.
 				if p.acceptKeyword(KwNot) {
 					_ = p.acceptIdentKeyword("enforced")
@@ -5683,6 +5688,7 @@ func (p *parser) parseAlterTableAction() (AlterTableAction, error) {
 		}
 		act.Kind = AlterTableAddCheck
 		act.CheckExpr = expr
+		act.NotValid = notValid
 		return act, nil
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwUnique:
 		// ADD [CONSTRAINT name] UNIQUE (cols) [INCLUDE (incl)] — create a unique index.

@@ -2294,11 +2294,17 @@ documentation-only and is exempt from the design-doc requirement.)
       round-trip — `buildForeignKeyDefString` now appends the ` NOT VALID` tail
       (`pg_get_constraintdef_worker` ruleutils.c:2604) for `convalidated='f'`;
       previously dumped without it → silent re-validate on restore. Design
-      `0119-0004-fk-not-valid-roundtrip.md`. **Still open under M0119-0004:**
-      CHECK NOT VALID + FK MATCH FULL round-trip; the pg_dump 002–010
-      catalog-view parity battery (further slices); extended-protocol commit-time
-      deferral (architecturally entangled — extended protocol is
-      auto-commit-per-statement).
+      `0119-0004-fk-not-valid-roundtrip.md`. **Slice 308 (loop #29):** `NOT VALID`
+      CHECK constraint round-trip — new `catalog.NamedCheckConstraint.NotValid` +
+      `AddCheckWithNotValid`; parser now captures `act.NotValid` on `ADD CONSTRAINT
+      … CHECK … NOT VALID` (previously discarded); `pg_constraint` projects
+      `convalidated='f'`; `pg_get_constraintdef` CHECK branch appends ` NOT VALID`.
+      pg_dump dumps it as a separate post-data `ALTER TABLE … ADD CONSTRAINT …
+      CHECK ((val > 0)) NOT VALID;` (separate=!validated, pg_dump.c:9757). Design
+      `0119-0004-check-not-valid-roundtrip.md`. **Still open under M0119-0004:**
+      FK MATCH FULL round-trip; the pg_dump 002–010 catalog-view parity battery
+      (further slices); extended-protocol commit-time deferral (architecturally
+      entangled — extended protocol is auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
