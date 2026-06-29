@@ -56,3 +56,36 @@ func TestRelaclText(t *testing.T) {
 		t.Fatalf("relacl after DropTableACL = %q; want \"\" (NULL)", got)
 	}
 }
+
+// TestRelaclTextGrantOption pins the grant-option (`*`) projection that lets a
+// GRANT … WITH GRANT OPTION round-trip through pg_dump (DU-002 slice 332).
+// aclitemout renders a grant-option privilege as "<letter>*" (e.g. "r*" for
+// SELECT WITH GRANT OPTION); pg_dump's buildACLCommands splits those into a
+// separate `GRANT … WITH GRANT OPTION;`.
+func TestRelaclTextGrantOption(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16500
+
+	// SELECT WITH GRANT OPTION renders "r*".
+	c.GrantTablePrivilegeWithGrantOption(relOID, "g_role", "SELECT", true)
+	want := "{postgres=arwdDxtm/postgres,g_role=r*/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after GRANT SELECT WITH GRANT OPTION = %q; want %q", got, want)
+	}
+
+	// A plain GRANT of another privilege (no option) on the same grantee renders
+	// the new letter without a star; the option on SELECT is retained, and the
+	// letters keep canonical ACL order (INSERT 'a' before SELECT 'r*').
+	c.GrantTablePrivilege(relOID, "g_role", "INSERT")
+	want = "{postgres=arwdDxtm/postgres,g_role=ar*/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after mixed-option GRANT = %q; want %q", got, want)
+	}
+
+	// A later plain GRANT of an already-option privilege must NOT clear the
+	// option (PostgreSQL keeps it until REVOKE GRANT OPTION FOR).
+	c.GrantTablePrivilege(relOID, "g_role", "SELECT")
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after redundant plain GRANT = %q; want %q (option retained)", got, want)
+	}
+}

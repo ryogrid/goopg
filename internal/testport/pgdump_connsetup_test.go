@@ -3168,6 +3168,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant select on grant_t: %v", err)
 	}
 
+	// Slice 332: a GRANT … WITH GRANT OPTION must round-trip. aclitemout renders
+	// a grant-option privilege as "<letter>*" (here "r*" for SELECT WITH GRANT
+	// OPTION), and pg_dump's buildACLCommands splits grant-option privileges into
+	// a separate `GRANT … WITH GRANT OPTION;` (privswgo branch, dumputils.c).
+	// goopg now records the option flag in its catalog ACL store and renders the
+	// trailing `*` in pg_class.relacl, so the WITH GRANT OPTION clause survives.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grant_g (a integer)"); err != nil {
+		t.Fatalf("create table grant_g: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE grantee2_role"); err != nil {
+		t.Fatalf("create role grantee2_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.grant_g TO grantee2_role WITH GRANT OPTION"); err != nil {
+		t.Fatalf("grant select with grant option on grant_g: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -6983,6 +6999,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// byte-identical to real pg_dump 18.3.
 		if want := "GRANT SELECT ON TABLE public.grant_t TO grantee_role;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered table GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 332 (asserted):** a GRANT … WITH GRANT OPTION round-trips. The
+		// grantee's relacl entry carries "r*" (grant option), which pg_dump's
+		// buildACLCommands routes through the privswgo branch into a dedicated
+		// `GRANT … WITH GRANT OPTION;`. Verified byte-identical to real pg_dump 18.3.
+		if want := "GRANT SELECT ON TABLE public.grant_g TO grantee2_role WITH GRANT OPTION;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered WITH GRANT OPTION: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

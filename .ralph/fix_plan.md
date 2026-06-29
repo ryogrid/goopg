@@ -2527,6 +2527,23 @@ documentation-only and is exempt from the design-doc requirement.)
       slice-331 `TestPort_PgDumpConnectionSetup` (`GRANT SELECT ON TABLE
       public.grant_t TO grantee_role;` byte-identical vs real pg_dump 18.3) PASS.
       Still open: column-level/sequence/schema GRANT, `WITH GRANT OPTION`, REVOKE.
+      **2026-06-30 (loop #55, design 0119-0004-grant-option-relacl-pgdump, DU-002
+      slice 332):** `GRANT … WITH GRANT OPTION` round-trips. PG records the option
+      as a `*` suffix on the privilege letter (`aclitemout` -> `grantee2_role=r*/
+      postgres`); pg_dump's `buildACLCommands` splits each grantee's privileges
+      into `privs`/`privswgo` and emits the latter as a dedicated `GRANT … WITH
+      GRANT OPTION;`. Slice 331 dropped the option (grant_ddl.go stripped the
+      clause; ACL store had no slot). Fix: ACL store inner value `map[priv]struct{}`
+      -> `map[priv]bool` (bool = grant option; drop-in for the set-membership reads
+      so `truncate-conflict` enforcement is unaffected); new
+      `GrantTablePrivilegeWithGrantOption` (existing 3-arg method delegates with
+      false), OR-ing the flag so a later plain GRANT keeps an existing option;
+      `relaclTextLocked` appends `*`; `tryRecordTableGrant` passes
+      `withGrantOption = (WITH-tail == "grant option")`. Plain GRANT byte-identical
+      to slice 331 -> zero blast radius. Tests `TestRelaclTextGrantOption` +
+      slice-332 `TestPort_PgDumpConnectionSetup` (`GRANT SELECT ON TABLE
+      public.grant_g TO grantee2_role WITH GRANT OPTION;` byte-identical vs real
+      pg_dump 18.3) PASS. Still open: column-level/sequence/schema GRANT, REVOKE.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

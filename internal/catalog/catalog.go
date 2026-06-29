@@ -1748,6 +1748,12 @@ type Catalog interface {
 	// is matched case-insensitively. Minimal ACL store for the *-conflict
 	// isolation specs. M0118-0008 (design 0118-0039).
 	GrantTablePrivilege(relOID uint32, role, priv string)
+	// GrantTablePrivilegeWithGrantOption is GrantTablePrivilege plus a grant-
+	// option flag: when withGrantOption is true the privilege is recorded as
+	// GRANT … WITH GRANT OPTION, so the materialized relacl renders the privilege
+	// letter with a trailing `*` and pg_dump re-emits the WITH GRANT OPTION
+	// clause. DU-002 slice 332.
+	GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv string, withGrantOption bool)
 	// HasTablePrivilege reports whether role was granted priv on relOID.
 	HasTablePrivilege(relOID uint32, role, priv string) bool
 	// DropTableACL forgets all privileges recorded for relOID (called when the
@@ -1973,10 +1979,12 @@ type InMemory struct {
 	// tableACLs records per-relation privileges granted to non-owner roles, the
 	// minimal ACL store the *-conflict isolation specs need (currently only
 	// TRUNCATE — truncate-conflict, design 0118-0039). Keyed relOID →
-	// lower-cased role name → set of upper-cased privilege keywords
-	// ("TRUNCATE", "SELECT", …). The owning superuser bypasses this map
-	// entirely; an empty/absent entry means "no privilege granted". M0118-0008.
-	tableACLs map[uint32]map[string]map[string]struct{}
+	// lower-cased role name → upper-cased privilege keyword ("TRUNCATE",
+	// "SELECT", …) → grant-option flag (true = GRANT … WITH GRANT OPTION, so
+	// aclitemout renders the privilege letter with a trailing `*`). The owning
+	// superuser bypasses this map entirely; an empty/absent entry means "no
+	// privilege granted". M0118-0008; grant-option DU-002 slice 332.
+	tableACLs map[uint32]map[string]map[string]bool
 
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
@@ -2366,7 +2374,7 @@ func NewInMemory() *InMemory {
 		},
 		roles:          make(map[string]uint32),
 		tempNamespaces: make(map[string]uint32),
-		tableACLs:      make(map[uint32]map[string]map[string]struct{}),
+		tableACLs:      make(map[uint32]map[string]map[string]bool),
 		comments:       make(map[commentKey]string),
 		statisticsObjs: make(map[string]*StatisticsObject),
 		extensions:     make(map[string]*extensionRow),
@@ -8331,6 +8339,15 @@ func (c *InMemory) RoleOID(name string) (uint32, bool) {
 // Catalog interface doc. Role names are stored lower-cased and privilege
 // keywords upper-cased so lookups are case-insensitive. M0118-0008.
 func (c *InMemory) GrantTablePrivilege(relOID uint32, role, priv string) {
+	c.GrantTablePrivilegeWithGrantOption(relOID, role, priv, false)
+}
+
+// GrantTablePrivilegeWithGrantOption records priv for role on relOID, tracking
+// whether it was granted WITH GRANT OPTION. The grant-option flag is OR-ed in:
+// once a privilege carries the option a later plain GRANT does not clear it
+// (matching PostgreSQL, which retains the grant option until REVOKE GRANT
+// OPTION FOR). See the Catalog interface doc. DU-002 slice 332.
+func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv string, withGrantOption bool) {
 	role = strings.ToLower(strings.TrimSpace(role))
 	priv = strings.ToUpper(strings.TrimSpace(priv))
 	if role == "" || priv == "" {
@@ -8340,15 +8357,15 @@ func (c *InMemory) GrantTablePrivilege(relOID uint32, role, priv string) {
 	defer c.mu.Unlock()
 	byRole := c.tableACLs[relOID]
 	if byRole == nil {
-		byRole = make(map[string]map[string]struct{})
+		byRole = make(map[string]map[string]bool)
 		c.tableACLs[relOID] = byRole
 	}
 	privs := byRole[role]
 	if privs == nil {
-		privs = make(map[string]struct{})
+		privs = make(map[string]bool)
 		byRole[role] = privs
 	}
-	privs[priv] = struct{}{}
+	privs[priv] = privs[priv] || withGrantOption
 }
 
 // HasTablePrivilege reports whether role was granted priv on relOID. M0118-0008.
@@ -8436,8 +8453,15 @@ func (c *InMemory) relaclTextLocked(relOID uint32) string {
 		}
 		var letters strings.Builder
 		for _, p := range tableACLPrivOrder {
-			if _, ok := privs[p.keyword]; ok {
+			if withGrantOpt, ok := privs[p.keyword]; ok {
 				letters.WriteByte(p.letter)
+				if withGrantOpt {
+					// aclitemout renders a grant-option privilege as "<letter>*"
+					// (e.g. "r*" for SELECT WITH GRANT OPTION); pg_dump's
+					// buildACLCommands splits these into a separate
+					// `GRANT … WITH GRANT OPTION;`. DU-002 slice 332.
+					letters.WriteByte('*')
+				}
 			}
 		}
 		if letters.Len() == 0 {

@@ -64,8 +64,15 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 		return // column-level grant
 	}
 
-	// Strip a trailing WITH GRANT OPTION / GRANTED BY clause from the role list.
+	// Strip a trailing WITH GRANT OPTION / GRANTED BY clause from the role list,
+	// remembering whether WITH GRANT OPTION was present so the recorded ACL can
+	// render the privilege letter with a trailing `*` (DU-002 slice 332).
+	withGrantOption := false
 	if i := strings.Index(strings.ToLower(rolePart), " with "); i >= 0 {
+		tail := strings.ToLower(strings.TrimSpace(rolePart[i+len(" with "):]))
+		if tail == "grant option" {
+			withGrantOption = true
+		}
 		rolePart = strings.TrimSpace(rolePart[:i])
 	}
 	if i := strings.Index(strings.ToLower(rolePart), " granted by "); i >= 0 {
@@ -95,7 +102,7 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 		}
 		for _, role := range roles {
 			for _, p := range privs {
-				s.cfg.Catalog.GrantTablePrivilege(tbl.OID, role, p)
+				s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(tbl.OID, role, p, withGrantOption)
 			}
 		}
 	}
