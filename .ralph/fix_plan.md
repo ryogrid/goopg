@@ -2211,8 +2211,30 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_InitiallyDeferredNNDUniqueCommit` + `TestPort_DeferredNNDMultiColumn`
       + `TestPort_SetConstraintsNNDDeferral`; full executor + `-race` + prior
       deferred-unique/FK e2e PASS.
+      **2026-06-29 (loop #23, design 0119-0004-deferred-exclusion): deferred
+      EXCLUDE constraint checking LANDED — the last deferrable constraint kind.**
+      An `EXCLUDE … DEFERRABLE INITIALLY DEFERRED` (or deferred via SET
+      CONSTRAINTS) now tolerates a transient conflict mid-transaction and enforces
+      at COMMIT (23P01), mirroring deferred-unique one-for-one. New
+      `BasicSession.deferredExclChecks []DeferredExclusionCheck{TableName,
+      IndexName, ExclusionOp, Key, BoxStr, Detail}` + `ExclusionConstraintDeferred`
+      (wraps the shared `constraintDeferredByName`). New
+      `internal/executor/deferred_exclusion.go`: `excludeCheckDeferred` gates the
+      enqueue at the single INSERT chokepoint `checkExclusionConstraintsForInsert`
+      (queue + continue); `queueDeferredExclusionCheck` captures the `WITH =`
+      btree key or `WITH &&` box text; `RunDeferredExclusionChecks` drains at
+      COMMIT under `FreshSnapshot()` with the ≥2-live rule
+      (`recheckDeferredExclusionEq` btree count, `recheckDeferredExclusionOverlap`
+      box-overlap count). Wired at all three boundaries (execCommit + simple-query
+      dispatch + SET CONSTRAINTS IMMEDIATE) after FK + UNIQUE. Gated on
+      `idx.IsExclusion && idx.Deferrable` → zero blast radius; no parser/catalog
+      change (deferrable flags already populated). Oracle-grounded vs PG 18.3.
+      Tests `TestPort_InitiallyDeferredExclusionCommit` +
+      `TestPort_SetConstraintsExclusionDeferral`; full executor + `-race` +
+      prior deferred FK/UNIQUE/NND e2e + fk-snapshot PASS.
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery; deferred EXCLUDE; extended-protocol commit-time deferral.
+      battery; extended-protocol commit-time deferral (architecturally
+      entangled — extended protocol is auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

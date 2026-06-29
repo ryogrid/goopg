@@ -144,6 +144,15 @@ func (o *transactionOp) execCommit() error {
 			o.clearCtxTransaction()
 			return err
 		}
+		// Deferred EXCLUDE constraint checks (DEFERRABLE INITIALLY DEFERRED, or
+		// made deferred by SET CONSTRAINTS … DEFERRED). 0119-0004 (deferred-exclusion).
+		if err := RunDeferredExclusionChecks(o.ctx, sess); err != nil {
+			_ = o.ctx.TxnMgr.Rollback(tx)
+			o.ctx.Session.EndExplicitTransaction()
+			undoEnumDDLFromContext(o.ctx)
+			o.clearCtxTransaction()
+			return err
+		}
 	}
 	// M0104-0007: SSI pre-commit dangerous-structure check for SERIALIZABLE.
 	// Runs BEFORE TxnMgr.Commit so a detected rw-cycle can be translated to
@@ -630,6 +639,10 @@ func (o *setConstraintsOp) Next() (TupleSlot, error) {
 		}
 		uChecks := sess.TakeDeferredUniqueChecksMatching(o.stmt.All, o.stmt.Names)
 		if err := runAllDeferredUniqueChecks(o.ctx, uChecks); err != nil {
+			return nil, err
+		}
+		xChecks := sess.TakeDeferredExclusionChecksMatching(o.stmt.All, o.stmt.Names)
+		if err := runAllDeferredExclusionChecks(o.ctx, xChecks); err != nil {
 			return nil, err
 		}
 	}

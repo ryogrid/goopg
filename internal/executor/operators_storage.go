@@ -6681,6 +6681,13 @@ func checkExclusionConstraintsForInsert(ctx *Context, tbl *catalog.Table, cols [
 		if !idx.IsExclusion {
 			continue
 		}
+		// DEFERRABLE INITIALLY DEFERRED (or SET CONSTRAINTS … DEFERRED): queue the
+		// candidate for a COMMIT-time re-probe instead of raising now, so a
+		// transient conflict resolved before COMMIT is allowed. 0119-0004.
+		if excludeCheckDeferred(ctx, idx) {
+			queueDeferredExclusionCheck(ctx, tbl, idx, cols, row)
+			continue
+		}
 		switch idx.ExclusionOp {
 		case "=":
 			idxRel := ctx.Catalog.IndexRelFileNode(idx)

@@ -187,6 +187,7 @@ type BasicSession struct {
 	txnReadOnly         bool                       // true while inside a READ ONLY transaction (M0097-0024)
 	deferredFKChecks    []DeferredFKCheck          // INITIALLY DEFERRED FK checks (M0096-0011)
 	deferredUniqChecks  []DeferredUniqueCheck      // INITIALLY DEFERRED UNIQUE/PK checks (0119-0004)
+	deferredExclChecks  []DeferredExclusionCheck   // INITIALLY DEFERRED EXCLUDE checks (0119-0004)
 	constraintsAllMode  int8                       // SET CONSTRAINTS ALL: 0 unset, 1 DEFERRED, 2 IMMEDIATE (0119-0004)
 	constraintDeferral  map[string]bool            // SET CONSTRAINTS <name>: per-constraint override (0119-0004)
 	activeQueryTables   map[uint32]bool            // OIDs of tables currently in active DML (M0097-0023)
@@ -278,6 +279,7 @@ func (s *BasicSession) EndExplicitTransaction() {
 	s.txFailed = false
 	s.deferredFKChecks = nil
 	s.deferredUniqChecks = nil
+	s.deferredExclChecks = nil
 	// SET CONSTRAINTS settings last only for the current transaction (PG
 	// AfterTriggerEndXact resets the deferral state at every txn boundary). 0119-0004.
 	s.constraintsAllMode = 0
@@ -386,6 +388,13 @@ func (s *BasicSession) UniqueConstraintDeferred(name string, initiallyDeferred b
 	return s.constraintDeferredByName(name, initiallyDeferred)
 }
 
+// ExclusionConstraintDeferred reports whether an EXCLUDE constraint's check
+// should be deferred to COMMIT. Callers must have already established the
+// constraint is DEFERRABLE. 0119-0004 (deferred-exclusion).
+func (s *BasicSession) ExclusionConstraintDeferred(name string, initiallyDeferred bool) bool {
+	return s.constraintDeferredByName(name, initiallyDeferred)
+}
+
 // ConstraintsOverrideActive reports whether a SET CONSTRAINTS override is in
 // effect for the current transaction (ALL mode set or any per-name override).
 // The simple-query COMMIT path uses this to decide whether to run the deferred
@@ -487,6 +496,69 @@ func (s *BasicSession) TakeDeferredUniqueChecksMatching(all bool, names []string
 		}
 	}
 	s.deferredUniqChecks = kept
+	return taken
+}
+
+// DeferredExclusionCheck records one EXCLUDE constraint candidate to be
+// re-verified at COMMIT time (a DEFERRABLE constraint deferred by INITIALLY
+// DEFERRED or by an in-effect SET CONSTRAINTS … DEFERRED). For a `WITH =`
+// (btree) exclusion the encoded Key identifies the candidate key; for a
+// `USING gist … WITH &&` overlap exclusion BoxStr holds the candidate box text.
+// Detail is the pre-rendered "Key (...)=(...) conflicts with existing key
+// (...)=(...)." text for the 23P01 raised at COMMIT (built at recheck time for
+// the &&/overlap case, where the conflicting box is only known then). 0119-0004.
+type DeferredExclusionCheck struct {
+	TableName   string
+	IndexName   string // == the EXCLUDE constraint name (SET CONSTRAINTS match key)
+	ExclusionOp string // "=" (btree) or "&&" (gist overlap)
+	Key         []byte // encoded btree key for ExclusionOp == "="
+	BoxStr      string // candidate box text for ExclusionOp == "&&"
+	Detail      string
+}
+
+// AddDeferredExclusionCheck queues an EXCLUDE constraint candidate to be
+// re-verified at COMMIT time. Deduplicates on (IndexName, Key, BoxStr): one
+// re-probe per distinct candidate suffices. 0119-0004.
+func (s *BasicSession) AddDeferredExclusionCheck(check DeferredExclusionCheck) {
+	for _, existing := range s.deferredExclChecks {
+		if existing.IndexName == check.IndexName &&
+			bytes.Equal(existing.Key, check.Key) && existing.BoxStr == check.BoxStr {
+			return
+		}
+	}
+	s.deferredExclChecks = append(s.deferredExclChecks, check)
+}
+
+// TakeDeferredExclusionChecks returns and clears the queued deferred EXCLUDE
+// checks. Called before TxnMgr.Commit on both commit paths. 0119-0004.
+func (s *BasicSession) TakeDeferredExclusionChecks() []DeferredExclusionCheck {
+	out := s.deferredExclChecks
+	s.deferredExclChecks = nil
+	return out
+}
+
+// TakeDeferredExclusionChecksMatching removes and returns the queued deferred
+// EXCLUDE checks made immediate by a `SET CONSTRAINTS … IMMEDIATE`, mirroring
+// TakeDeferredUniqueChecksMatching. The rest stay queued for COMMIT. 0119-0004.
+func (s *BasicSession) TakeDeferredExclusionChecksMatching(all bool, names []string) []DeferredExclusionCheck {
+	if all {
+		out := s.deferredExclChecks
+		s.deferredExclChecks = nil
+		return out
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[n] = true
+	}
+	var taken, kept []DeferredExclusionCheck
+	for _, c := range s.deferredExclChecks {
+		if c.IndexName != "" && want[c.IndexName] {
+			taken = append(taken, c)
+		} else {
+			kept = append(kept, c)
+		}
+	}
+	s.deferredExclChecks = kept
 	return taken
 }
 

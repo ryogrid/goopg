@@ -1862,6 +1862,11 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					if deferErr == nil {
 						deferErr = executor.RunDeferredUniqueChecks(ctx, sess)
 					}
+					if deferErr == nil {
+						// Deferred EXCLUDE constraint checks (23P01). 0119-0004
+						// (deferred-exclusion). Same fresh-snapshot + rollback block.
+						deferErr = executor.RunDeferredExclusionChecks(ctx, sess)
+					}
 					if deferErr != nil {
 						if rs := s.cfg.Catalog.Routines(); rs != nil {
 							for _, r := range sess.TakePendingRoutineDrops() {
