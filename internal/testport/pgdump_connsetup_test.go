@@ -3120,6 +3120,30 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create policy p_check: %v", err)
 	}
 
+	// Slice 330: a named-role policy (`CREATE POLICY ... TO <role>`) must
+	// round-trip through pg_dump. Before this slice goopg had no per-role OID
+	// registry, so polroles could only hold the {0} PUBLIC sentinel and CREATE
+	// POLICY rejected any named role. Now CREATE ROLE mints a per-role OID
+	// (catalog.RegisterRole), pg_roles exposes it, and execCreatePolicy records
+	// the role's OID in pg_policy.polroles. pg_dump's getPolicies resolves the
+	// OID array back to the name via
+	// `array_to_string(ARRAY(SELECT quote_ident(rolname) FROM pg_roles
+	// WHERE oid = ANY(polroles)), ', ')`, so dumpPolicy emits ` TO pol_role`
+	// before the USING clause (pg_dump.c order: ON … [AS][FOR][TO][USING]).
+	// goopg enforces no RLS — dump fidelity only.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.pol_rt (a integer)"); err != nil {
+		t.Fatalf("create table pol_rt: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.pol_rt ENABLE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("enable row level security on pol_rt: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE pol_role"); err != nil {
+		t.Fatalf("create role pol_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE POLICY p_role ON public.pol_rt FOR SELECT TO pol_role USING (a > 0)"); err != nil {
+		t.Fatalf("create policy p_role: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -6920,6 +6944,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, want) {
 				t.Errorf("pg_dump dropped or mis-rendered policy: want %q\n  full stdout=%q", want, res.Stdout)
 			}
+		}
+		// **Slice 330 (asserted):** a named-role policy round-trips its TO clause.
+		// pg_dump's getPolicies resolves the polroles OID array back to the role
+		// name via the pg_roles view, and dumpPolicy emits ` TO pol_role` between
+		// the FOR clause and USING. Verified byte-identical to real pg_dump 18.3.
+		if want := "CREATE POLICY p_role ON public.pol_rt FOR SELECT TO pol_role USING ((a > 0));"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered named-role policy: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

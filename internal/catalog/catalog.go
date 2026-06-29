@@ -1740,6 +1740,9 @@ type Catalog interface {
 	RegisterRole(name string)
 	// UnregisterRole removes a role from the registry. M0097-drop_if_exists.
 	UnregisterRole(name string)
+	// RoleOID returns the OID minted for a registered role (or 10 for the seeded
+	// `postgres` superuser); the bool is false for an unknown role. DU-002 slice 330.
+	RoleOID(name string) (uint32, bool)
 	// GrantTablePrivilege records that role may exercise priv on the relation
 	// identified by relOID. priv is an upper-cased keyword ("TRUNCATE", …); role
 	// is matched case-insensitively. Minimal ACL store for the *-conflict
@@ -1958,10 +1961,14 @@ type InMemory struct {
 	// (DropTempNamespace). M0118-0009 (temp-schema-cleanup, design 0118-0091).
 	tempNamespaces map[string]uint32
 
-	// roles tracks user-created roles (CREATE ROLE / CREATE USER). Used by
-	// DROP ROLE IF EXISTS to produce proper "does not exist" notices.
-	// M0097-drop_if_exists.
-	roles map[string]struct{}
+	// roles tracks user-created roles (CREATE ROLE / CREATE USER), mapping the
+	// lower-cased role name to the OID minted for it at registration time. Used
+	// by DROP ROLE IF EXISTS to produce proper "does not exist" notices, and by
+	// pg_roles / CREATE POLICY ... TO <role> so named-role policies round-trip
+	// through pg_dump (the OID lands in pg_policy.polroles and pg_dump's
+	// getPolicies resolves it back to the name via pg_roles). M0097-drop_if_exists;
+	// per-role OID registry added DU-002 slice 330.
+	roles map[string]uint32
 
 	// tableACLs records per-relation privileges granted to non-owner roles, the
 	// minimal ACL store the *-conflict isolation specs need (currently only
@@ -2357,7 +2364,7 @@ func NewInMemory() *InMemory {
 			"information_schema": 99,
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
-		roles:          make(map[string]struct{}),
+		roles:          make(map[string]uint32),
 		tempNamespaces: make(map[string]uint32),
 		tableACLs:      make(map[uint32]map[string]map[string]struct{}),
 		comments:       make(map[commentKey]string),
@@ -4497,7 +4504,25 @@ func (c *InMemory) registerSystemTables() {
 	pgRoles.VirtualRows = func() [][]string {
 		// OID 10 = BOOTSTRAP_SUPERUSERID (postgres superuser),
 		// per postgres/src/include/catalog/pg_authid.dat.
-		return [][]string{{"10", "postgres", "t", "t"}}
+		out := [][]string{{"10", "postgres", "t", "t"}}
+		// User-created roles (CREATE ROLE / CREATE USER) follow, each with the
+		// OID minted at registration time, sorted by name for deterministic
+		// output. pg_dump's getPolicies resolves pg_policy.polroles OIDs back to
+		// names through this view, so named-role policies round-trip. DU-002
+		// slice 330.
+		c.mu.RLock()
+		names := make([]string, 0, len(c.roles))
+		for name := range c.roles {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			// rolsuper 'f', rolcanlogin 't' — goopg models no role attributes;
+			// only rolname/oid feed the pg_dump policy-role resolution.
+			out = append(out, []string{fmt.Sprintf("%d", c.roles[name]), name, "f", "t"})
+		}
+		c.mu.RUnlock()
+		return out
 	}
 	c.tables["pg_catalog.pg_roles"] = pgRoles
 
@@ -8259,11 +8284,19 @@ func (c *InMemory) RoleExists(name string) bool {
 	return ok
 }
 
-// RegisterRole records a user-created role. Called from CREATE ROLE/USER.
+// RegisterRole records a user-created role. Called from CREATE ROLE/USER. A
+// fresh OID is minted from the running catalog counter the first time a name is
+// seen; re-registering an existing name keeps its OID stable so a policy's
+// pg_policy.polroles entry stays valid across the session.
 func (c *InMemory) RegisterRole(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.roles[strings.ToLower(name)] = struct{}{}
+	key := strings.ToLower(name)
+	if _, ok := c.roles[key]; ok {
+		return
+	}
+	c.roles[key] = c.nextOID
+	c.nextOID++
 }
 
 // UnregisterRole removes a role from the registry. Called from DROP ROLE.
@@ -8271,6 +8304,22 @@ func (c *InMemory) UnregisterRole(name string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.roles, strings.ToLower(name))
+}
+
+// RoleOID returns the OID minted for a registered role, resolving the seeded
+// bootstrap superuser (`postgres`, OID 10 = BOOTSTRAP_SUPERUSERID) which is not
+// stored in the user-role map. The bool is false for an unknown role. Used by
+// CREATE POLICY ... TO <role> to record role OIDs in pg_policy.polroles.
+// DU-002 slice 330.
+func (c *InMemory) RoleOID(name string) (uint32, bool) {
+	key := strings.ToLower(name)
+	if key == "postgres" {
+		return 10, true
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	oid, ok := c.roles[key]
+	return oid, ok
 }
 
 // GrantTablePrivilege records that role may exercise priv on relOID. See the

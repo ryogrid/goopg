@@ -8379,8 +8379,13 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 			if err != nil || s.IsNull() {
 				return NullDatum, nil
 			}
-			escaped := strings.ReplaceAll(s.StringValue(), "\"", "\"\"")
-			return NewStringDatum("\"" + escaped + "\""), nil
+			// PG's quote_ident only adds double quotes when the identifier
+			// would not survive a re-parse unquoted (uppercase, special chars,
+			// leading digit, empty); a plain lowercase identifier is returned
+			// bare. pgQuoteIdent applies that rule — unconditional quoting here
+			// over-quoted e.g. role names in pg_dump's getPolicies TO-clause
+			// resolution. DU-002 slice 330.
+			return NewStringDatum(pgQuoteIdent(s.StringValue())), nil
 		}
 	case "regexp_replace":
 		// regexp_replace(text, pattern, replacement [, flags]) M0097-0011.

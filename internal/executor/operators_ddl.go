@@ -10851,16 +10851,28 @@ func (o *ddlOp) execCreatePolicy(s *parser.CreatePolicyStmt) error {
 	default:
 		cmd = '*'
 	}
-	// polroles: PUBLIC (the default and the only form goopg has OIDs for) maps to
-	// {0}. A TO clause containing only PUBLIC is equivalent. Named roles cannot
-	// round-trip yet (goopg has no per-role OID registry) — reject them with a
-	// clear message rather than silently dropping the restriction.
-	roles := []uint32{0}
+	// polroles: with no TO clause (or TO PUBLIC) the policy applies to PUBLIC,
+	// stored as the {0} sentinel that pg_dump maps to a NULL (omitted) TO clause.
+	// Named roles resolve to their per-role OIDs (DU-002 slice 330): pg_dump's
+	// getPolicies turns the polroles OID array back into `TO <name>` via the
+	// pg_roles view. A PUBLIC element anywhere collapses the whole list to {0},
+	// matching PG (PUBLIC subsumes every named grantee).
+	var roles []uint32
+	public := len(s.Roles) == 0
 	for _, r := range s.Roles {
-		if !strings.EqualFold(r, "public") {
-			return &ExecError{Code: "0A000", Pos: s.Pos(),
-				Message: fmt.Sprintf("CREATE POLICY ... TO %s (named roles) is not yet supported; only PUBLIC round-trips", r)}
+		if strings.EqualFold(r, "public") {
+			public = true
+			continue
 		}
+		oid, ok := o.ctx.Catalog.RoleOID(r)
+		if !ok {
+			return &ExecError{Code: "42704", Pos: s.Pos(),
+				Message: fmt.Sprintf("role %q does not exist", r)}
+		}
+		roles = append(roles, oid)
+	}
+	if public || len(roles) == 0 {
+		roles = []uint32{0}
 	}
 	pol := catalog.PolicyInfo{
 		Name:       s.Name,

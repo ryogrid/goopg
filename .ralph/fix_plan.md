@@ -2492,10 +2492,26 @@ documentation-only and is exempt from the design-doc requirement.)
       `0119-0004-trigger-when-condition.md`. **`pg_get_triggerdef` getter battery now
       complete.** Still open under M0119-0004: runtime WHEN evaluation; GRANT/ACL
       (`relacl`) + named-role policies; extended-protocol commit-time deferral.
+      **2026-06-30 (loop #53, design 0119-0004-named-role-policy-pgdump, DU-002
+      slice 330):** named-role `CREATE POLICY ... TO <role>` round-trips. Added a
+      per-role OID registry (`InMemory.roles` map[string]struct{}→map[string]uint32;
+      `RegisterRole` mints a catalog-counter OID idempotently; new
+      `Catalog.RoleOID` resolves a role, postgres→10); `pg_roles` `VirtualRows`
+      now exposes every registered role with its OID; `execCreatePolicy` resolves
+      each TO role → OID (42704 unknown, PUBLIC/empty→{0}) into `pg_policy.polroles`.
+      Fixed a latent bug: the `quote_ident` builtin unconditionally double-quoted,
+      so pg_dump's getPolicies resolver emitted ` TO "pol_role"` not ` TO pol_role`;
+      now delegates to the conditional-quoting `pgQuoteIdent`. The existing pg_policy
+      projection + goopg's `ARRAY(SELECT … = ANY(arr))`/`array_to_string`/`quote_ident`
+      stack already worked (PUBLIC fixtures exercised the `CASE … = '{0}'`
+      short-circuit). Tests `TestRoleOIDRegistry` + slice-330
+      `TestPort_PgDumpConnectionSetup` (`p_role FOR SELECT TO pol_role`,
+      byte-identical vs real pg_dump 18.3) PASS. **GRANT/ACL relacl now unblocked**
+      (registry available).
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery (further slices: GRANT/ACL relacl, CREATE RULE, CREATE POLICY
-      named-role `TO`); extended-protocol commit-time deferral (architecturally
-      entangled — extended protocol is auto-commit-per-statement).
+      battery (further slices: GRANT/ACL relacl, richer CREATE RULE,
+      reserved-keyword-named-role quoting); extended-protocol commit-time deferral
+      (architecturally entangled — extended protocol is auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

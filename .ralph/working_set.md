@@ -1,38 +1,38 @@
 (idle — nothing in flight)
 
-Last loop (#52): M0119-0004 **WHEN-condition trigger round-trip in pg_dump**
-(DU-002 slice 329) — LANDED, committed. This was the LAST `pg_get_triggerdef` gap;
-the getter battery (timing, OR-ed events, UPDATE OF, CONSTRAINT TRIGGER,
-REFERENCING, WHEN) is now complete.
+Last loop (#53): M0119-0004 **named-role `CREATE POLICY ... TO <role>` round-trip
+in pg_dump** (DU-002 slice 330) — LANDED, committed.
 
-pg_get_triggerdef_worker (ruleutils.c) reads pg_trigger.tgqual and emits
-`WHEN (<cond>) ` between FOR EACH and EXECUTE FUNCTION, building old/new-aliased
-RTEs + get_rule_expr(varprefix=true) so refs render `old.`/`new.` lowercased;
-prettyFlags=0 fully parenthesizes the OpExpr → `WHEN ((new.b <> old.b))`. goopg's
-parser recognised WHEN but DISCARDED the body (paren-balance token loop). Fix
-(dump-fidelity only — WHEN not evaluated at firing time):
-- parser ast.go/ddl.go: CreateTriggerStmt.WhenExpr; parseCreateTriggerTail parses
-  `WHEN '(' a_expr ')'` via p.parseExpr (lexer already lowercases unquoted NEW/OLD
-  qualifier onto each *ColumnRef → new.b/old.b).
-- catalog.go: Trigger.WhenExpr parser.Expr. tgqual projection left "" (pg_dump
-  drives off pg_get_triggerdef, never reads tgqual directly).
-- operators_ddl.go: execCreateTrigger copies WhenExpr.
-- expr.go: buildTriggerDefString emits `WHEN (defaultExprToSQL(WhenExpr)) ` —
-  chose defaultExprToSQL (executor twin) over formatExprForAttrdef because the
-  latter DROPS the ColumnRef qualifier; defaultExprToSQL preserves it AND fully
-  parenthesizes binary OpExprs (slice 298) = PG prettyFlags=0 output.
+Built the per-role OID registry (the prerequisite the working set flagged for both
+named-role policies AND GRANT/ACL relacl): `InMemory.roles` map[string]struct{} →
+map[string]uint32; `RegisterRole` mints a catalog-counter OID idempotently; new
+`Catalog.RoleOID(name)(uint32,bool)` (postgres→10). `pg_roles` VirtualRows now
+exposes every registered role. `execCreatePolicy` resolves each TO role → OID
+(42704 unknown; PUBLIC/empty → {0}) into pg_policy.polroles.
 
-Files: internal/parser/{ast.go,ddl.go,create_trigger_test.go},
-internal/catalog/catalog.go, internal/executor/{operators_ddl.go,expr.go,
-triggerdef_test.go}, internal/testport/pgdump_connsetup_test.go (trg_when +
-trg_whna fixtures+asserts), docs/design/0119-0004-trigger-when-condition.md
-(+README 0119-0004af).
+Also fixed a latent bug: the `quote_ident` SQL builtin (expr.go:8376)
+unconditionally double-quoted, so pg_dump's getPolicies ARRAY(SELECT quote_ident
+…) resolver emitted ` TO "pol_role"` not bare ` TO pol_role`; now delegates to the
+existing conditional-quoting `pgQuoteIdent`.
 
-Gates: parser/catalog/executor suites PASS; TestPort_PgDumpConnectionSetup PASS
-(real pg_dump 18.3, byte-identical, 5.6s); go build ./... clean; pgbench smoke via
-pre-commit hook.
+The pg_policy projection + goopg's ARRAY(SELECT … = ANY(arr))/array_to_string/
+quote_ident stack already worked (PUBLIC fixtures exercised the `CASE … = '{0}'`
+short-circuit), so only the registry + pg_roles exposure + quote_ident fix were
+missing.
 
-NEXT loop — pick the next M0119-0004 DU-002 surface from fix_plan: GRANT/ACL
-(`relacl`, needs per-role OID registry + the ARRAY(SELECT…)/quote_ident query
-stack), named-role policies, or extended-protocol commit-time deferral. Triggers
-WHEN runtime evaluation (not dump) is a separate non-DU task.
+Files: internal/catalog/catalog.go (roles map type, RegisterRole/RoleOID,
+pg_roles VirtualRows, interface), internal/executor/operators_ddl.go
+(execCreatePolicy), internal/executor/expr.go (quote_ident → pgQuoteIdent),
+internal/catalog/role_oid_test.go (new), internal/testport/pgdump_connsetup_test.go
+(slice-330 fixture+assert), docs/design/0119-0004-named-role-policy-pgdump.md
+(+README 0119-0004ag).
+
+Gates: catalog/executor/parser/server suites PASS; TestPort_PgDumpConnectionSetup
+PASS (real pg_dump 18.3, byte-identical, 4.7s); go build ./... clean; pgbench
+smoke via pre-commit hook.
+
+NEXT loop — **GRANT/ACL relacl** is now UNBLOCKED (per-role OID registry exists).
+pg_dump reads relacl as an aclitem[]; getTableAttrs/dumpACL needs per-relation ACL
+projection + the aclexplode/quote_ident name resolution. Or richer CREATE RULE
+(action deparse), or reserved-keyword-named-role quoting (needs a keyword table).
+Extended-protocol commit-time deferral stays architecturally entangled.
