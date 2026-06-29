@@ -339,6 +339,28 @@ type CreateTriggerStmt struct {
 func (s *CreateTriggerStmt) Pos() int  { return s.pos }
 func (s *CreateTriggerStmt) stmtNode() {}
 
+// CreateRuleStmt — `CREATE RULE name AS ON {INSERT|UPDATE|DELETE} TO table
+// DO [ALSO|INSTEAD] NOTHING`. goopg does NOT implement the query-rewrite system;
+// this node is produced ONLY for the unconditional DO-NOTHING form (no WHERE
+// qualification, no action command) so that such a rule round-trips through
+// pg_dump (pg_rewrite → pg_get_ruledef → dumpRule). Every other CREATE RULE
+// form (action commands, conditional WHERE, ON SELECT view rules) still parses
+// to a CompatNoopStmt, exactly as before. DU-002 slice 324.
+type CreateRuleStmt struct {
+	pos     int
+	Name    string
+	Event   string // "INSERT" | "UPDATE" | "DELETE"
+	Table   ObjectName
+	Instead bool // DO INSTEAD NOTHING (true) vs DO [ALSO] NOTHING (false)
+	// RuleKind carries the COPY-DML rule-kind string the CompatNoop path would
+	// have recorded (e.g. "DO INSTEAD NOTHING", "DO ALSO"), so execCreateRule can
+	// register it identically via RegisterTableRuleKind.
+	RuleKind string
+}
+
+func (s *CreateRuleStmt) Pos() int  { return s.pos }
+func (s *CreateRuleStmt) stmtNode() {}
+
 // DropRuleStmt — `DROP RULE [IF EXISTS] name ON table [CASCADE|RESTRICT]`.
 // Rules are not implemented; the executor emits "rule does not exist" always.
 type DropRuleStmt struct {

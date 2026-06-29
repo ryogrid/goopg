@@ -680,6 +680,95 @@ func TestDDLCreatePolicyRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDDLCreateRuleRoundTrip verifies an unconditional DO-NOTHING CREATE RULE
+// is recorded on its table, projected into pg_rewrite, reconstructed by
+// pg_get_ruledef byte-identically to real PG, and removed by DROP RULE. DU-002
+// slice 324.
+func TestDDLCreateRuleRoundTrip(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table t not in catalog")
+	}
+
+	if err := runDDL(t, ctx, "CREATE RULE r_noins AS ON INSERT TO t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_noins: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE r_also AS ON UPDATE TO t DO ALSO NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_also: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE r_del AS ON DELETE TO t DO NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_del: %v", err)
+	}
+	if len(tbl.Rules) != 3 {
+		t.Fatalf("got %d rules, want 3", len(tbl.Rules))
+	}
+
+	// Duplicate rule name on the same table is a 42710 error.
+	if err := runDDL(t, ctx, "CREATE RULE r_noins AS ON INSERT TO t DO INSTEAD NOTHING"); err == nil {
+		t.Errorf("duplicate CREATE RULE r_noins should error")
+	}
+
+	// Project through pg_rewrite and key rows by rulename.
+	pgRewrite, ok := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_rewrite"})
+	if !ok {
+		t.Fatal("pg_rewrite not in catalog")
+	}
+	rows := map[string][]string{}
+	for _, r := range pgRewrite.VirtualRows() {
+		rows[r[1]] = r // r[1] = rulename
+	}
+	if len(rows) != 3 {
+		t.Fatalf("pg_rewrite projected %d rows, want 3", len(rows))
+	}
+	// columns: oid, rulename, ev_class, ev_type, ev_enabled, is_instead, ev_qual, ev_action
+	check := func(name, evType, isInstead string) {
+		t.Helper()
+		r := rows[name]
+		if r == nil {
+			t.Fatalf("rule %q missing from pg_rewrite", name)
+		}
+		if r[3] != evType {
+			t.Errorf("%s ev_type = %q, want %q", name, r[3], evType)
+		}
+		if r[4] != "O" {
+			t.Errorf("%s ev_enabled = %q, want %q", name, r[4], "O")
+		}
+		if r[5] != isInstead {
+			t.Errorf("%s is_instead = %q, want %q", name, r[5], isInstead)
+		}
+	}
+	check("r_noins", "3", "t") // INSERT, INSTEAD
+	check("r_also", "2", "f")  // UPDATE, ALSO
+	check("r_del", "4", "f")   // DELETE, plain DO NOTHING
+
+	// pg_get_ruledef reconstruction is byte-identical to PG 18.3.
+	want := map[string]string{
+		"r_noins": "CREATE RULE r_noins AS\n    ON INSERT TO public.t DO INSTEAD NOTHING;",
+		"r_also":  "CREATE RULE r_also AS\n    ON UPDATE TO public.t DO NOTHING;",
+		"r_del":   "CREATE RULE r_del AS\n    ON DELETE TO public.t DO NOTHING;",
+	}
+	for _, r := range tbl.Rules {
+		got := buildRuleDefString(tbl, r)
+		if got != want[r.Name] {
+			t.Errorf("pg_get_ruledef(%s) =\n%q\nwant\n%q", r.Name, got, want[r.Name])
+		}
+	}
+
+	// DROP RULE removes it from both the compat registry and the dumped set.
+	if err := runDDL(t, ctx, "DROP RULE r_also ON t"); err != nil {
+		t.Fatalf("DROP RULE r_also: %v", err)
+	}
+	if len(tbl.Rules) != 2 {
+		t.Fatalf("after DROP: got %d rules, want 2", len(tbl.Rules))
+	}
+}
+
 // TestDDLCreatePublicationEndToEnd pins the M0008 / 0008-0003 SQL
 // surface: `CREATE PUBLICATION p FOR TABLE t` parses, plans,
 // and executes against a Context whose PubSub registry is wired,

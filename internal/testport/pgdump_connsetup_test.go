@@ -3077,6 +3077,30 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create policy p_check: %v", err)
 	}
 
+	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
+	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
+	// is_instead, ev_enabled) and dumpRule re-emits the rule from
+	// pg_get_ruledef(oid) verbatim (pg_dump.c). Before this slice CREATE RULE was
+	// a parse no-op and pg_rewrite was an empty stub, so a DO-NOTHING rule was
+	// silently lost on dump/restore. goopg now records catalog.Table.Rules,
+	// projects them through pg_rewrite, and reconstructs the CREATE RULE in its
+	// pg_get_ruledef handler byte-identically to PG's PRETTYFLAG_INDENT form.
+	// goopg does NOT implement the rewrite system — dump fidelity only. `rule_t`
+	// carries one rule per (event, instead/also) form. Conditional WHERE and
+	// action-command rules are a follow-up slice.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.rule_t (a integer, b text)"); err != nil {
+		t.Fatalf("create table rule_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE RULE r_noins AS ON INSERT TO public.rule_t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("create rule r_noins: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE RULE r_noupd AS ON UPDATE TO public.rule_t DO ALSO NOTHING"); err != nil {
+		t.Fatalf("create rule r_noupd: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE RULE r_nodel AS ON DELETE TO public.rule_t DO NOTHING"); err != nil {
+		t.Fatalf("create rule r_nodel: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -6783,6 +6807,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		} {
 			if !strings.Contains(res.Stdout, want) {
 				t.Errorf("pg_dump dropped or mis-rendered policy: want %q\n  full stdout=%q", want, res.Stdout)
+			}
+		}
+		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
+		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints
+		// pg_get_ruledef(oid) verbatim; the single-arg pg_get_ruledef uses
+		// PRETTYFLAG_INDENT, so the event line is broken onto a new line indented
+		// four spaces (`CREATE RULE r AS\n    ON <EVENT> TO public.rule_t DO
+		// [INSTEAD ]NOTHING;`). DO ALSO NOTHING and plain DO NOTHING both render
+		// without the INSTEAD keyword. Verified byte-identical to real pg_dump 18.3.
+		for _, want := range []string{
+			"CREATE RULE r_noins AS\n    ON INSERT TO public.rule_t DO INSTEAD NOTHING;",
+			"CREATE RULE r_noupd AS\n    ON UPDATE TO public.rule_t DO NOTHING;",
+			"CREATE RULE r_nodel AS\n    ON DELETE TO public.rule_t DO NOTHING;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped or mis-rendered rule: want %q\n  full stdout=%q", want, res.Stdout)
 			}
 		}
 		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must

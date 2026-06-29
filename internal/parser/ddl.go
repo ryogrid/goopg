@@ -779,14 +779,18 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 		ns.ObjName = ObjectName{Name: tok.Value}
 		p.advance()
 	}
-	// Scan for "TO <tablename>" and detect the rule kind (DO ALSO, DO INSTEAD NOTHING,
-	// multi-statement, conditional, or utility action). M0097-0140.
+	// Scan for "ON <event>", "TO <tablename>" and detect the rule kind (DO ALSO,
+	// DO INSTEAD NOTHING, multi-statement, conditional, or utility action).
+	// M0097-0140.
 	depth := 0
 	seenDo := false      // passed DO keyword at depth 0
 	seenInstead := false // passed INSTEAD keyword at depth 0 after DO
 	seenAlso := false    // DO ALSO detected
 	hasWhere := false    // WHERE clause present before DO
 	gotKind := false     // rule kind already determined
+	event := ""          // ON <event> captured before TO (DU-002 slice 324)
+	isNothing := false   // a NOTHING action was seen at depth 0 after DO
+	hasAction := false   // a non-NOTHING action token was seen after DO
 
 	for {
 		tok := p.cur()
@@ -803,6 +807,9 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 					ns.RuleKind = "multi-statement DO INSTEAD"
 					gotKind = true
 				}
+				if depth == 0 && seenDo {
+					hasAction = true
+				}
 				depth++
 				p.advance()
 				continue
@@ -815,6 +822,13 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 		if depth == 0 {
 			kw := strings.ToUpper(tok.Value)
 			switch {
+			case kw == "ON" && event == "" && !seenDo && ns.TableName.Name == "":
+				p.advance()
+				if ev := p.cur(); ev.Kind == TokenKeyword || ev.Kind == TokenIdent {
+					event = strings.ToUpper(ev.Value)
+					p.advance()
+				}
+				continue
 			case kw == "TO" && ns.TableName.Name == "" && !seenDo:
 				p.advance()
 				tname, _ := p.parseObjectName()
@@ -830,12 +844,16 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 				ns.RuleKind = "DO ALSO"
 				seenAlso = true
 				gotKind = true
-			case seenInstead && !gotKind && kw == "NOTHING":
-				ns.RuleKind = "DO INSTEAD NOTHING"
-				gotKind = true
+			case seenDo && kw == "NOTHING":
+				isNothing = true
+				if seenInstead && !gotKind {
+					ns.RuleKind = "DO INSTEAD NOTHING"
+					gotKind = true
+				}
 			case seenInstead && !gotKind && kw == "NOTIFY":
 				ns.RuleKind = "utility"
 				gotKind = true
+				hasAction = true
 			case seenInstead && !gotKind:
 				// First meaningful token after INSTEAD: not NOTHING, not (, not NOTIFY.
 				if hasWhere {
@@ -844,9 +862,29 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 					ns.RuleKind = "DO INSTEAD"
 				}
 				gotKind = true
+				hasAction = true
+			case seenDo && (seenAlso || (!seenInstead && !seenAlso)) && kw != "NOTHING":
+				// A command after DO / DO ALSO (e.g. DO INSERT …) — a real action.
+				hasAction = true
 			}
 		}
 		p.advance()
+	}
+
+	// DU-002 slice 324: the unconditional DO-NOTHING form (no WHERE, no action
+	// command) on an INSERT/UPDATE/DELETE event is modelled as a proper
+	// CreateRuleStmt so it round-trips through pg_dump. Every other form keeps
+	// the historical CompatNoopStmt behaviour untouched.
+	if isNothing && !hasWhere && !hasAction && ns.ObjName.Name != "" && ns.TableName.Name != "" &&
+		(event == "INSERT" || event == "UPDATE" || event == "DELETE") {
+		return &CreateRuleStmt{
+			pos:      pos,
+			Name:     ns.ObjName.Name,
+			Event:    event,
+			Table:    ns.TableName,
+			Instead:  seenInstead,
+			RuleKind: ns.RuleKind,
+		}, nil
 	}
 	return ns, nil
 }

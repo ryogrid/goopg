@@ -4732,6 +4732,34 @@ func buildTriggerDefString(tbl *catalog.Table, trig catalog.Trigger) string {
 	return b.String()
 }
 
+// buildRuleDefString reconstructs the CREATE RULE statement for an
+// unconditional DO-NOTHING rewrite rule, byte-identical to PostgreSQL's
+// single-argument pg_get_ruledef (PRETTYFLAG_INDENT) which pg_dump's dumpRule
+// emits verbatim. Only the DO-NOTHING form is modelled (see catalog.RuleInfo),
+// so there is never a WHERE qualification or an action command to deparse.
+// DU-002 slice 324.
+func buildRuleDefString(tbl *catalog.Table, r catalog.RuleInfo) string {
+	schema := tbl.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	var b strings.Builder
+	b.WriteString("CREATE RULE ")
+	b.WriteString(r.Name)
+	b.WriteString(" AS\n    ON ")
+	b.WriteString(strings.ToUpper(r.Event))
+	b.WriteString(" TO ")
+	b.WriteString(schema)
+	b.WriteByte('.')
+	b.WriteString(tbl.Name)
+	b.WriteString(" DO ")
+	if r.Instead {
+		b.WriteString("INSTEAD ")
+	}
+	b.WriteString("NOTHING;")
+	return b.String()
+}
+
 // evalMakeDate implements make_date(year, month, day) → date. M0097-0004.
 func evalMakeDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 3 {
@@ -7163,6 +7191,42 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					return NullDatum, nil
 				}
 				return NewStringDatum(def), nil
+			}
+		}
+		return NullDatum, nil
+
+	case "pg_get_ruledef", "pg_get_ruledef_ext":
+		// pg_get_ruledef(oid [, pretty bool]) → text — reconstructs the CREATE
+		// RULE statement. pg_dump's dumpRule selects pg_get_ruledef(r.oid) and
+		// emits the result verbatim with a trailing newline. Only unconditional
+		// DO-NOTHING rules are modelled (catalog.RuleInfo); they live in their
+		// owning table's Rules slice (no central rule registry), so scan all
+		// tables for the OID. DU-002 slice 324.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			for _, tbl := range im.AllTables() {
+				if tbl.Virtual || tbl.OID == 0 {
+					continue
+				}
+				for _, r := range tbl.Rules {
+					if r.OID == 0 || r.OID != targetOID {
+						continue
+					}
+					return NewStringDatum(buildRuleDefString(tbl, r)), nil
+				}
 			}
 		}
 		return NullDatum, nil

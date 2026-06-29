@@ -455,6 +455,12 @@ type Table struct {
 	// dumpPolicy). DU-002 slice 323.
 	Policies []PolicyInfo
 
+	// Rules holds the unconditional DO-NOTHING query-rewrite rules declared on
+	// this table via CREATE RULE. goopg does NOT implement the rewrite system;
+	// the rules are recorded so they round-trip through pg_dump (the pg_rewrite
+	// virtual catalog → pg_get_ruledef → dumpRule). DU-002 slice 324.
+	Rules []RuleInfo
+
 	// TempOwner identifies the session that owns this temporary relation. In
 	// PostgreSQL every backend has its own temp namespace (pg_temp_N); a temp
 	// relation is only part of *its* backend's catalog. goopg keeps all
@@ -1193,6 +1199,42 @@ type PolicyInfo struct {
 	// ` USING ((expr))` / ` WITH CHECK ((expr))` byte-identically to real pg_dump.
 	Using     parser.Expr
 	WithCheck parser.Expr
+}
+
+// RuleInfo describes one unconditional DO-NOTHING query-rewrite rule created
+// with CREATE RULE. goopg does NOT implement the rewrite system; the rule is
+// recorded purely so it round-trips through pg_dump (the pg_rewrite virtual
+// catalog → pg_get_ruledef → dumpRule). The field set mirrors the pg_rewrite
+// columns pg_dump's getRules reads. DU-002 slice 324.
+type RuleInfo struct {
+	// Name is pg_rewrite.rulename; OID is pg_rewrite.oid (assigned from the
+	// catalog OID counter at CREATE RULE time — a zero OID means the rule
+	// predates catalog tracking and is invisible to pg_dump).
+	Name string
+	OID  uint32
+	// Event is the firing event: "INSERT", "UPDATE" or "DELETE". pg_rewrite
+	// stores it as ev_type '3'/'2'/'4' (ON SELECT '1' view rules are not
+	// modelled here).
+	Event string
+	// Instead is pg_rewrite.is_instead: true for DO INSTEAD NOTHING, false for
+	// DO [ALSO] NOTHING.
+	Instead bool
+}
+
+// EvType maps the rule's firing event to its pg_rewrite.ev_type "char" code
+// (rewriteDefine.h: SELECT='1', UPDATE='2', INSERT='3', DELETE='4').
+func (r RuleInfo) EvType() string {
+	switch strings.ToUpper(r.Event) {
+	case "SELECT":
+		return "1"
+	case "UPDATE":
+		return "2"
+	case "INSERT":
+		return "3"
+	case "DELETE":
+		return "4"
+	}
+	return ""
 }
 
 // ForeignKey describes one referential integrity constraint stored on a
@@ -6652,7 +6694,48 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2618,
 	}
-	pgRewrite.VirtualRows = func() [][]string { return nil }
+	// A CREATE RULE … DO [INSTEAD] NOTHING rule is recorded on its table
+	// (catalog.Table.Rules) and projected here so pg_dump's getRules reads it and
+	// dumpRule re-emits the CREATE RULE (via pg_get_ruledef, reconstructed from
+	// the same RuleInfo). getRules selects only oid/rulename/ev_class/ev_type/
+	// is_instead/ev_enabled, so ev_qual/ev_action stay empty (→ SQL NULL); the
+	// rule text itself comes from the executor's pg_get_ruledef handler, not from
+	// these columns. View _RETURN rules (ev_type '1') are still absent — goopg
+	// has no stored user views feeding this dump path. DU-002 slice 324.
+	pgRewrite.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var out [][]string
+		for _, tbl := range c.tables {
+			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Rules) == 0 {
+				continue
+			}
+			for _, r := range tbl.Rules {
+				if r.OID == 0 {
+					continue // predates OID tracking → invisible to pg_dump
+				}
+				evType := r.EvType()
+				if evType == "" {
+					continue
+				}
+				isInstead := "f"
+				if r.Instead {
+					isInstead = "t"
+				}
+				out = append(out, []string{
+					fmt.Sprintf("%d", r.OID),   // oid
+					r.Name,                     // rulename
+					fmt.Sprintf("%d", tbl.OID), // ev_class
+					evType,                     // ev_type
+					"O",                        // ev_enabled (origin — the default)
+					isInstead,                  // is_instead
+					"",                         // ev_qual  (NULL — unconditional rule)
+					"",                         // ev_action (NULL — DO NOTHING)
+				})
+			}
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_rewrite"] = pgRewrite
 
 	// pg_largeobject_metadata — large-object ownership/ACL catalog (OID 2995).

@@ -115,6 +115,8 @@ func (o *ddlOp) Next() (TupleSlot, error) {
 		return nil, o.execCreatePolicy(s)
 	case *parser.DropPolicyStmt:
 		return nil, o.execDropPolicy(s)
+	case *parser.CreateRuleStmt:
+		return nil, o.execCreateRule(s)
 	case *parser.DropRuleStmt:
 		return nil, o.execDropRule(s)
 	case *parser.DropTriggerStmt:
@@ -10869,6 +10871,41 @@ func (o *ddlOp) execDropPolicy(s *parser.DropPolicyStmt) error {
 	return nil
 }
 
+// execCreateRule records an unconditional DO-NOTHING query-rewrite rule on its
+// table so it round-trips through pg_dump (pg_rewrite → pg_get_ruledef →
+// dumpRule). goopg does NOT implement the rewrite system — this is schema
+// fidelity only; the rule has no runtime effect beyond the COPY-DML rule-kind
+// bookkeeping the CompatNoop path also performed. DU-002 slice 324.
+func (o *ddlOp) execCreateRule(s *parser.CreateRuleStmt) error {
+	tbl, ok := o.ctx.Catalog.LookupTable(s.Table)
+	if !ok {
+		return &ExecError{Code: "42P01", Pos: s.Pos(), Message: fmt.Sprintf("relation %q does not exist", s.Table.Name)}
+	}
+	// A duplicate rule name on the same table is an error (PG: 42710).
+	for _, r := range tbl.Rules {
+		if r.Name == s.Name {
+			return &ExecError{Code: "42710", Pos: s.Pos(),
+				Message: fmt.Sprintf("rule %q for relation %q already exists", s.Name, tbl.Name)}
+		}
+	}
+	tbl.Rules = append(tbl.Rules, catalog.RuleInfo{
+		Name:    s.Name,
+		OID:     o.ctx.Catalog.AllocOID(),
+		Event:   s.Event,
+		Instead: s.Instead,
+	})
+	// Preserve the historical CompatNoop bookkeeping so DROP RULE existence
+	// checks and COPY-DML rule-kind handling behave exactly as before this slice
+	// modelled the DO-NOTHING form as a first-class statement.
+	if im, ok := o.ctx.Catalog.(*catalog.InMemory); ok {
+		im.RegisterCompatObject("rule", s.Name+"@"+s.Table.String())
+		if s.RuleKind != "" {
+			im.RegisterTableRuleKind(s.Table.Name, s.RuleKind)
+		}
+	}
+	return nil
+}
+
 // execDropTrigger removes a trigger from a table. M0096-0012.
 func (o *ddlOp) execDropTrigger(s *parser.DropTriggerStmt) error {
 	// Check schema-qualified table name for non-existent schema first.
@@ -10946,6 +10983,18 @@ func (o *ddlOp) execDropRule(s *parser.DropRuleStmt) error {
 		if im.DropCompatObject("rule", key) {
 			// Also remove the table rule kind so future COPY DML sees no rule. M0097-0140.
 			im.UnregisterTableRules(s.Table.Name)
+			// Drop any modelled DO-NOTHING RuleInfo so it stops being dumped via
+			// pg_rewrite → pg_get_ruledef. DU-002 slice 324.
+			if tbl, ok := o.ctx.Catalog.LookupTable(s.Table); ok && tbl != nil {
+				filtered := tbl.Rules[:0]
+				for _, r := range tbl.Rules {
+					if r.Name == s.Name {
+						continue
+					}
+					filtered = append(filtered, r)
+				}
+				tbl.Rules = filtered
+			}
 			return nil
 		}
 	}
