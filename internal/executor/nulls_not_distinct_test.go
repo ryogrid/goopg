@@ -425,6 +425,61 @@ func TestNullsNotDistinctBuildNNDAdmitsDistinctTail(t *testing.T) {
 	nndBuildAssert23505(t, runDDL(t, ctx, "CREATE UNIQUE INDEX bnd5_ab ON bnd5 (a, b) NULLS NOT DISTINCT"))
 }
 
+// nndIntCol returns the int value of column ord across the result rows, asserting
+// exactly one row and a non-NULL value at that column.
+func nndSingleIntCol(t *testing.T, rows []Row, ord int) int64 {
+	t.Helper()
+	if len(rows) != 1 {
+		t.Fatalf("want exactly 1 row, got %d: %+v", len(rows), rows)
+	}
+	if rows[0][ord].IsNull() {
+		t.Fatalf("col %d is NULL, want non-NULL: %+v", ord, rows[0])
+	}
+	return rows[0][ord].Int
+}
+
+// TestNullsNotDistinctOnConflictReorderedPartitionLeaf: an NND ON CONFLICT upsert
+// that routes to a partition leaf whose column order differs from the parent must
+// honour the NULLS-NOT-DISTINCT arbiter on the leaf. The proposed row is in parent
+// order while the heap-scan matcher (probeArbiterNND → checkNullsNotDistinctViaHeapScan)
+// resolves key columns by name against the *leaf* columns, so the caller passes the
+// leaf-ordered candidate (insertedForLeaf). Before design 0119-0004 §10 this path
+// was guarded out (`partLeaf == nil`), so a duplicate NULL row was wrongly inserted.
+// Covers both DO NOTHING (skip) and DO UPDATE (target + leaf→parent conflict-row
+// remap of the SET expression). Design 0119-0004 sub (c).
+func TestNullsNotDistinctOnConflictReorderedPartitionLeaf(t *testing.T) {
+	ctx, _, cleanup := newDDLFixture(t)
+	defer cleanup()
+	// Parent column order (a, b, c); leaf (c, b, a) is a reordered partition leaf.
+	for _, s := range []string{
+		"CREATE TABLE rpnnd (a int4, b int4, c int4, UNIQUE NULLS NOT DISTINCT (a, b)) PARTITION BY RANGE (b)",
+		"CREATE TABLE rpnnd1 (c int4, b int4, a int4)",
+		"ALTER TABLE rpnnd ATTACH PARTITION rpnnd1 FOR VALUES FROM (0) TO (100)",
+		"INSERT INTO rpnnd (a, b, c) VALUES (NULL, 5, 1)",
+	} {
+		if err := runDDL(t, ctx, s); err != nil {
+			t.Fatalf("%s: %v", s, err)
+		}
+	}
+
+	// DO NOTHING on the NULL (a) key must skip — no duplicate insert.
+	if err := runDDL(t, ctx, "INSERT INTO rpnnd (a, b, c) VALUES (NULL, 5, 2) ON CONFLICT (a, b) DO NOTHING"); err != nil {
+		t.Fatalf("DO NOTHING upsert: %v", err)
+	}
+	if got := nndSingleIntCol(t, runQueryRows(t, ctx, "SELECT c FROM rpnnd"), 0); got != 1 {
+		t.Fatalf("after DO NOTHING: c=%d want 1 (original row, no duplicate NULL insert)", got)
+	}
+
+	// DO UPDATE on the NULL (a) key must target the existing leaf row and apply the
+	// SET against the (leaf→parent remapped) conflict row.
+	if err := runDDL(t, ctx, "INSERT INTO rpnnd (a, b, c) VALUES (NULL, 5, 9) ON CONFLICT (a, b) DO UPDATE SET c = 99"); err != nil {
+		t.Fatalf("DO UPDATE upsert: %v", err)
+	}
+	if got := nndSingleIntCol(t, runQueryRows(t, ctx, "SELECT c FROM rpnnd"), 0); got != 99 {
+		t.Fatalf("after DO UPDATE: c=%d want 99 (existing NULL row updated, still one row)", got)
+	}
+}
+
 // TestNullsDistinctOnConflictControlInserts: the default (NULLS DISTINCT) arbiter
 // must keep PG semantics — a NULL key never conflicts, so DO NOTHING INSERTS the
 // new row. Proves the heap-scan fallback is strictly gated on idx.NullsNotDistinct.

@@ -1,9 +1,9 @@
 # 0119-0004 — `NULLS NOT DISTINCT` uniqueness *enforcement* at INSERT/UPDATE
 
 Status: **implemented** (plain INSERT/UPDATE — §1–§7 — the ON CONFLICT /
-upsert-arbiter follow-up — §8 — and the `CREATE [UNIQUE] INDEX` build over
-NULL-keyed data — §9 — landed; the reordered-partition arbiter remains
-deferred, ledger)
+upsert-arbiter follow-up — §8 — the `CREATE [UNIQUE] INDEX` build over
+NULL-keyed data — §9 — and the reordered partition-leaf NND arbiter — §10 —
+all landed; all NND enforcement sub-features (a)–(c) complete)
 Source task: M0119-0004 (deferral-ledger backlog consumption; surfaced by
 M0110-0001 / DU-002 slices 134–138). Milestone
 `docs/milestones/0119-deferral-ledger-backlog-consumption.md`.
@@ -262,13 +262,13 @@ still reported as changed and probed. This also makes the plain-UPDATE
 self-skip independent of stamp ordering (more robust; the §3-step-2 note about
 `indexKeyColumnsChanged` not protecting NULL→NULL is now obsolete).
 
-**Scope deferred (ledger):** a *reordered* partition leaf
-(`partLeaf != nil`, leaf column order ≠ parent) is skipped — the candidate row
-is in parent order while the heap-scan matcher needs leaf-order columns; an
-exotic NND-on-reordered-partition combination, ledgered for a later slice.
-Concurrent in-flight NULL-keyed NND conflicts (the spec/wait machinery) ride the
-single-session heap scan; full speculative-token integration for the NULL case
-is not attempted (the btree spec path never sees a NULL key).
+**Reordered partition leaf — now handled (§10).** A *reordered* partition leaf
+(`partLeaf != nil`, leaf column order ≠ parent) was initially skipped (the
+candidate row is in parent order while the heap-scan matcher reads leaf-order
+columns); §10 closes that gap. Concurrent in-flight NULL-keyed NND conflicts (the
+spec/wait machinery) ride the single-session heap scan; full speculative-token
+integration for the NULL case is not attempted (the btree spec path never sees a
+NULL key).
 
 **Touch points (follow-up):** `internal/executor/operators_upsert.go`
 (`probeArbiterNND` + `Next` fallback), `internal/executor/operators_storage.go`
@@ -343,5 +343,55 @@ duplicate NULLs → 23505), `…BuildNNDAdmitsDistinctTail` (multi-col NND admit
 distinct non-NULL tail, rejects an equal one). Full `internal/executor` suite +
 `-race` on Unique/Index/NullsNotDistinct/Upsert/Conflict/DDL/Partition PASS.
 
-**Scope deferred (ledger):** the reordered partition-leaf NND arbiter (§8) is the
-sole remaining NND follow-up under M0119-0004.
+## 10. Follow-up LANDED (2026-06-29) — reordered partition-leaf NND arbiter
+
+Closes the last NND follow-up deferred in §8: an `INSERT … ON CONFLICT (nndcol)
+DO UPDATE|NOTHING` whose row routes to a partition **leaf whose column order
+differs from the parent** (`partLeaf != nil`) skipped the NND heap-scan fallback
+entirely (`if !conflicted && partLeaf == nil`), so a NULL-keyed duplicate was
+**inserted** on a reordered leaf where PG routes to the conflict action.
+
+**Root cause — a row/column-order mismatch, not missing logic.** `probeArbiterNND`
+→ `checkNullsNotDistinctViaHeapScan` / `rowHasNullKeyColumn` resolve each index key
+column **by name** against the passed `cols` and read the candidate at the matching
+ordinal, so `cols` and the passed row must share column order. On the partitioned
+path `cols`/`writeTbl` are already the leaf's (leaf order), but the `Next` loop was
+passing `inserted` (parent order); on a reordered leaf those orders differ, so the
+matcher would read the wrong ordinal. The `partLeaf == nil` guard was a
+conservative stand-in for "row order matches cols order".
+
+**Fix — pass the leaf-ordered candidate, drop the guard.** `insertedForLeaf` is the
+candidate already remapped into leaf order on the reordered path (and is the *same
+slice* as `inserted` on every non-reordered path — non-partitioned, or same-order
+partition). Passing `insertedForLeaf` makes the matcher's by-name lookup read the
+correct ordinal on all paths, so the guard becomes unnecessary:
+
+```
+if !conflicted {
+    nndPtr, nndRow, nndFound := o.probeArbiterNND(rel, writeTbl, cols, insertedForLeaf)
+    if nndFound { conflicted = true; conflictPtr = nndPtr; conflictRow = nndRow }
+}
+```
+
+`probeArbiterNND` decodes the conflicting tuple with `cols` (leaf order), exactly as
+the key-probe path (`probeArbiterWaiting`) does, so the downstream `partLeaf` leaf→
+parent remap of `conflictRow` (for `evalUpdate`, which plans against the parent
+schema) stays correct with no further change. Zero blast radius outside NND: a
+non-NND arbiter returns `found=false` at the first gate as before, and on every
+non-reordered path `insertedForLeaf == inserted` so byte-identical behaviour holds.
+
+**Touch points:** `internal/executor/operators_upsert.go` (`Next` fallback row
+argument + guard removal; `probeArbiterNND` doc comment). **Test:**
+`internal/executor/nulls_not_distinct_test.go`
+`TestNullsNotDistinctOnConflictReorderedPartitionLeaf` — parent order `(a,b,c)`,
+leaf order `(c,b,a)`, NND arbiter `(a,b)`; verifies a NULL-keyed DO NOTHING skips
+(no duplicate) and a DO UPDATE targets the existing leaf row (SET applied through
+the leaf→parent remap). Confirmed RED before the fix (2 rows / duplicate NULL),
+GREEN after.
+
+**Gates:** `internal/executor` NND suite + `-race` on Upsert/Conflict/
+NullsNotDistinct/Partition/Arbiter PASS; `TestPort_IsolationInsertConflict*` +
+`TestPort_IsolationMerge*` PASS (58 s); `go build ./...` clean; pgbench smoke via
+the pre-commit hook. **M0119-0004's NND sub-features (a)–(c) are now all landed;
+the remaining open scope under M0119-0004 is the pg_dump 002–010 catalog-view
+parity battery and the deferred-constraint-checking-at-COMMIT engine gap.**

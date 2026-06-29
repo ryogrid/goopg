@@ -2103,9 +2103,26 @@ documentation-only and is exempt from the design-doc requirement.)
       forms forward the real flag, PK/non-unique pass false). 4 new build-path
       tests; full executor suite + -race PASS; zero blast radius for default
       indexes (NULL row now skipped not errored — strict improvement).
+      **2026-06-29 (loop #17, design 0119-0004 §10): NND reordered
+      partition-leaf arbiter LANDED — the final NND sub-feature (c).** An
+      `INSERT … ON CONFLICT (nndcol) DO UPDATE|NOTHING` routing to a partition
+      leaf whose column order differs from the parent (`partLeaf != nil`)
+      skipped the NND heap-scan fallback entirely (`if !conflicted && partLeaf
+      == nil`), wrongly inserting a duplicate NULL row where PG routes to the
+      conflict action. `probeArbiterNND`/`checkNullsNotDistinctViaHeapScan`
+      resolve key columns by NAME against `cols` and read the candidate at the
+      matching ordinal, so the passed row must share `cols`' order; the loop now
+      passes `insertedForLeaf` (already leaf-ordered on the reordered path, ==
+      `inserted` on every non-reordered path) and drops the guard. conflictRow
+      is decoded in leaf order as before, so the downstream leaf→parent remap is
+      unchanged. New test `TestNullsNotDistinctOnConflictReorderedPartitionLeaf`
+      (parent `(a,b,c)` / leaf `(c,b,a)` / NND `(a,b)`; DO NOTHING skip + DO
+      UPDATE target; confirmed RED→GREEN); `-race` Upsert/Conflict/Partition +
+      `TestPort_IsolationInsertConflict*`/`Merge*` PASS; zero blast radius
+      outside NND. **All three NND enforcement sub-features (a)–(c) are now
+      landed.**
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery; the **deferred-constraint-checking-at-COMMIT** engine gap; and the
-      NND **reordered-partition-leaf arbiter** follow-up (ledger 2026-06-29).
+      battery and the **deferred-constraint-checking-at-COMMIT** engine gap.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

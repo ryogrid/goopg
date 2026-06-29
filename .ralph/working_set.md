@@ -1,30 +1,27 @@
 (idle — nothing in flight)
 
-Last loop (#16): M0119-0004 NND **CREATE [UNIQUE] INDEX build over NULL-keyed
-data** follow-up — LANDED + committed (design 0119-0004 §9). Closes sub-feature
-(b) from the loop #15 ledger row.
-- `encodeCompositeBTreeKey` (operators_ddl.go) no longer raises 42804 on a NULL
-  key column — returns a new `hasNullKey bool`. Both build paths
-  (`collectBTreeEntries` + dead-but-compiled `backfillBTree`) SKIP NULL-keyed
-  rows for default/non-unique indexes (mirrors runtime maintain — no null
-  bitmap), and dedup null-bearing rows for `unique && nullsNotDistinct` via a
-  build-local `seenNull`/`nndNullKeyDedupKey` (presence-byte 0x00/0x01 + col
-  encoding) → 23505 on a duplicate NULL pattern.
-- NND flag threaded as new `nullsNotDistinct` param through `createBTreeIndex`→
-  `bulkBuildBTree[WithPredicate]`→`collectBTreeEntries`/`backfillBTree`; all 16
-  `createBTreeIndex` sites updated (5 NND-capable forward the real flag, rest
-  false), matview-rebuild `bulkBuildBTree` forwards `idx.NullsNotDistinct`.
-- Tests: 4 new build-path tests in nulls_not_distinct_test.go. Full executor
-  suite + -race (Unique/Index/NullsNotDistinct/Upsert/Conflict/DDL/Partition)
-  PASS. Zero blast radius for default indexes (NULL row skipped not errored).
+Last loop (#17): M0119-0004 NND **reordered partition-leaf arbiter** — LANDED +
+committed (design 0119-0004 §10). Closes sub-feature (c); **all NND enforcement
+sub-features (a)–(c) are now complete.**
+- `operators_upsert.go` upsert `Next`: the NND heap-scan fallback was guarded out
+  on reordered partition leaves (`if !conflicted && partLeaf == nil`), so a
+  duplicate NULL row was wrongly INSERTED where PG routes to the conflict action.
+- Root cause = row/column-order mismatch: `probeArbiterNND` /
+  `checkNullsNotDistinctViaHeapScan` / `rowHasNullKeyColumn` resolve key columns
+  by NAME against `cols` and read the candidate at the matching ordinal, so the
+  passed row must share `cols`' order. Fix = pass `insertedForLeaf` (already
+  leaf-ordered on the reordered path; == `inserted` on every non-reordered path)
+  and drop the guard. conflictRow stays leaf-decoded → downstream leaf→parent
+  remap unchanged. Zero blast radius outside NND.
+- Test `TestNullsNotDistinctOnConflictReorderedPartitionLeaf` (parent `(a,b,c)` /
+  leaf `(c,b,a)` / NND `(a,b)`; DO NOTHING skip + DO UPDATE target). Confirmed
+  RED→GREEN (2 rows → 1). `-race` Upsert/Conflict/Partition +
+  `TestPort_IsolationInsertConflict*`/`Merge*` PASS; `go build ./...` clean.
 
 Remaining M0119 backlog (pick topmost actionable next loop):
 - M0119-0002 (CLOG Part C / 0007 Part B / 0008 Part B) — Effort-L full-gate
   session (-race mvcc+wal, xlog_replay, PG-standby E2E, fresh TPC-H Q12/Q13).
-- M0119-0004 STILL OPEN: pg_dump 002–010 catalog-view parity; deferred-
-  constraint-checking-at-COMMIT engine gap; the LAST NND follow-up —
-  (c) reordered partition-leaf NND arbiter (`partLeaf != nil`: remap `inserted`
-  to leaf order then drop the `partLeaf == nil` guard in upsert Next +
-  probeArbiterNND). Ledgered 2026-06-29.
+- M0119-0004 STILL OPEN (NND now fully closed): pg_dump 002–010 catalog-view
+  parity battery; deferred-constraint-checking-at-COMMIT engine gap.
 - M0119-0005 (pg_waldump WD-002), M0119-0006 (amcheck server tier — needs index
   AMs), M0119-0007 (pg_basebackup recvlogical — blocked on logical decoding).

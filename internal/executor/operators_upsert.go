@@ -269,9 +269,14 @@ func (o *upsertOp) Next() (TupleSlot, error) {
 		// column yields a nil arbiter key (NULLs distinct by default), so the
 		// key probe above reports no conflict; for an NND arbiter index NULLs
 		// collide, so fall back to a heap scan to find the duplicate NULL row.
-		// Skipped on a reordered partition leaf (cols order != inserted order).
-		if !conflicted && partLeaf == nil {
-			nndPtr, nndRow, nndFound, nerr := o.probeArbiterNND(rel, writeTbl, cols, inserted)
+		// probeArbiterNND resolves key columns by name against cols and reads the
+		// candidate at the matching ordinal, so the row must share cols' order:
+		// pass insertedForLeaf (leaf-order on a reordered partition leaf, == the
+		// parent-order inserted on every non-reordered path). The returned
+		// conflictRow is decoded in cols (leaf) order, matching the key-probe
+		// path, so the downstream partLeaf leaf→parent remap stays correct.
+		if !conflicted {
+			nndPtr, nndRow, nndFound, nerr := o.probeArbiterNND(rel, writeTbl, cols, insertedForLeaf)
 			if nerr != nil {
 				return nil, nerr
 			}
@@ -725,10 +730,11 @@ func (o *upsertOp) probeArbiterByKey(rel storage.RelFileNode, cols []catalog.Col
 // with the identical NULL/value key pattern and returns its ItemPointer plus
 // decoded row, so DO NOTHING skips and DO UPDATE targets it.
 //
-// Scope: callers pass this only on the non-reordered path (cols order matches
-// the proposed-row order); a reordered partition leaf is skipped (ledgered).
-// found=false (the caller proceeds with a plain insert) when the arbiter index
-// is not NND, no key column is NULL, or no live duplicate exists.
+// Scope: cols and the passed row must share column order. The caller passes the
+// leaf-ordered candidate (insertedForLeaf), so this works on a reordered
+// partition leaf (cols/tbl are the leaf's, in leaf order) as well as every
+// non-reordered path. found=false (the caller proceeds with a plain insert) when
+// the arbiter index is not NND, no key column is NULL, or no live duplicate exists.
 func (o *upsertOp) probeArbiterNND(rel storage.RelFileNode, tbl *catalog.Table, cols []catalog.Column, inserted Row) (storage.ItemPointer, Row, bool, error) {
 	idx := o.plan.OnConflict.ArbiterIndex
 	if idx == nil || !idx.NullsNotDistinct {
