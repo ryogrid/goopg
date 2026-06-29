@@ -3027,6 +3027,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("cluster clus_pk using clus_pk_pkey: %v", err)
 	}
 
+	// Slice 322: ROW LEVEL SECURITY must round-trip through pg_dump. pg_dump's
+	// getPolicies probes pg_class.relrowsecurity and represents an RLS-enabled
+	// table with a null-polname PolicyInfo, which dumpPolicy emits as
+	// `ALTER TABLE <t> ENABLE ROW LEVEL SECURITY;` (pg_dump.c). dumpTableSchema
+	// separately emits `ALTER TABLE ONLY <t> FORCE ROW LEVEL SECURITY;` from
+	// relforcerowsecurity. Before this slice goopg hardcoded both pg_class
+	// columns to 'f' and silently consumed the ENABLE clause as a trigger no-op,
+	// so the RLS state was dropped from the dump (and goopg could not restore its
+	// own output). goopg now records catalog.Table.RowSecurity /
+	// ForceRowSecurity, projects them through both pg_class builders, and re-syncs
+	// the pg_class heap row pg_dump reads. goopg enforces no row-level security —
+	// dump-fidelity only. `rls_t` carries both flags; the two are independent.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.rls_t (a integer)"); err != nil {
+		t.Fatalf("create table rls_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.rls_t ENABLE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("enable row level security on rls_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.rls_t FORCE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("force row level security on rls_t: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -6706,6 +6728,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "ALTER TABLE public.clus_pk CLUSTER ON clus_pk_pkey;") {
 			t.Errorf("pg_dump dropped the CLUSTER ON for the PRIMARY KEY constraint index\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 322 (asserted):** ROW LEVEL SECURITY must round-trip. pg_dump's
+		// getPolicies reads pg_class.relrowsecurity and emits `ALTER TABLE <t>
+		// ENABLE ROW LEVEL SECURITY;` (via a null-polname PolicyInfo); dumpTableSchema
+		// reads relforcerowsecurity and emits `ALTER TABLE ONLY <t> FORCE ROW LEVEL
+		// SECURITY;`. Before this slice goopg hardcoded both pg_class columns to 'f'
+		// and consumed the ENABLE clause as a trigger no-op, dropping the RLS state.
+		if !strings.Contains(res.Stdout, "ALTER TABLE public.rls_t ENABLE ROW LEVEL SECURITY;") {
+			t.Errorf("pg_dump dropped ENABLE ROW LEVEL SECURITY for rls_t\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER TABLE ONLY public.rls_t FORCE ROW LEVEL SECURITY;") {
+			t.Errorf("pg_dump dropped FORCE ROW LEVEL SECURITY for rls_t\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must
 		// round-trip. Slice 147 created public.add_one(integer) only as a COMMENT

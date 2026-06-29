@@ -544,6 +544,56 @@ func TestDDLAlterTableClusterOnRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDDLAlterTableRowSecurityRoundTrip pins DU-002 slice 322: ENABLE/DISABLE
+// ROW LEVEL SECURITY toggles catalog.Table.RowSecurity (pg_class.relrowsecurity)
+// and [NO] FORCE ROW LEVEL SECURITY toggles ForceRowSecurity
+// (relforcerowsecurity). goopg enforces no RLS — these are recorded purely so
+// pg_dump can re-emit the clauses. The two flags are independent.
+func TestDDLAlterTableRowSecurityRoundTrip(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	tbl, ok := cat.LookupTable(parser.ObjectName{Name: "t"})
+	if !ok {
+		t.Fatal("table t not in catalog")
+	}
+
+	if tbl.RowSecurity || tbl.ForceRowSecurity {
+		t.Fatalf("fresh table: RowSecurity=%v ForceRowSecurity=%v, want both false", tbl.RowSecurity, tbl.ForceRowSecurity)
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE t ENABLE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("ENABLE ROW LEVEL SECURITY: %v", err)
+	}
+	if !tbl.RowSecurity || tbl.ForceRowSecurity {
+		t.Errorf("after ENABLE: RowSecurity=%v ForceRowSecurity=%v, want true/false", tbl.RowSecurity, tbl.ForceRowSecurity)
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE t FORCE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("FORCE ROW LEVEL SECURITY: %v", err)
+	}
+	if !tbl.RowSecurity || !tbl.ForceRowSecurity {
+		t.Errorf("after FORCE: RowSecurity=%v ForceRowSecurity=%v, want true/true", tbl.RowSecurity, tbl.ForceRowSecurity)
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE t NO FORCE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("NO FORCE ROW LEVEL SECURITY: %v", err)
+	}
+	if !tbl.RowSecurity || tbl.ForceRowSecurity {
+		t.Errorf("after NO FORCE: RowSecurity=%v ForceRowSecurity=%v, want true/false", tbl.RowSecurity, tbl.ForceRowSecurity)
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE t DISABLE ROW LEVEL SECURITY"); err != nil {
+		t.Fatalf("DISABLE ROW LEVEL SECURITY: %v", err)
+	}
+	if tbl.RowSecurity || tbl.ForceRowSecurity {
+		t.Errorf("after DISABLE: RowSecurity=%v ForceRowSecurity=%v, want both false", tbl.RowSecurity, tbl.ForceRowSecurity)
+	}
+}
+
 // TestDDLCreatePublicationEndToEnd pins the M0008 / 0008-0003 SQL
 // surface: `CREATE PUBLICATION p FOR TABLE t` parses, plans,
 // and executes against a Context whose PubSub registry is wired,

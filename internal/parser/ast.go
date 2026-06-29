@@ -2038,6 +2038,23 @@ const (
 	// clustering selection: every index's pg_index.indisclustered is reset to
 	// false (tablecmds.c ATExecSetWithoutCluster). DU-002 slice 321.
 	AlterTableSetWithoutCluster
+	// AlterTableEnableRowSecurity — `ENABLE ROW LEVEL SECURITY`. Sets
+	// pg_class.relrowsecurity true (tablecmds.c ATExecEnableRowSecurity). pg_dump
+	// emits `ALTER TABLE <t> ENABLE ROW LEVEL SECURITY;` for any table whose
+	// relrowsecurity is set (pg_dump.c getPolicies represents an RLS-enabled table
+	// by a PolicyInfo with a null polname). DU-002 slice 322.
+	AlterTableEnableRowSecurity
+	// AlterTableDisableRowSecurity — `DISABLE ROW LEVEL SECURITY`. Resets
+	// pg_class.relrowsecurity to false. The inverse of ENABLE. DU-002 slice 322.
+	AlterTableDisableRowSecurity
+	// AlterTableForceRowSecurity — `FORCE ROW LEVEL SECURITY`. Sets
+	// pg_class.relforcerowsecurity true, making RLS policies apply to the table
+	// owner too. pg_dump emits `ALTER TABLE ONLY <t> FORCE ROW LEVEL SECURITY;`
+	// whenever relforcerowsecurity is set (pg_dump.c dumpTableSchema). DU-002 slice 322.
+	AlterTableForceRowSecurity
+	// AlterTableNoForceRowSecurity — `NO FORCE ROW LEVEL SECURITY`. Resets
+	// pg_class.relforcerowsecurity to false. The inverse of FORCE. DU-002 slice 322.
+	AlterTableNoForceRowSecurity
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the

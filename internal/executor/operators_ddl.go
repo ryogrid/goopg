@@ -6649,6 +6649,47 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 			if err := clearTableClusterIndex(o.ctx, tbl); err != nil {
 				return err
 			}
+		case parser.AlterTableEnableRowSecurity, parser.AlterTableDisableRowSecurity,
+			parser.AlterTableForceRowSecurity, parser.AlterTableNoForceRowSecurity:
+			// {ENABLE|DISABLE} ROW LEVEL SECURITY → pg_class.relrowsecurity;
+			// {FORCE|NO FORCE} ROW LEVEL SECURITY → pg_class.relforcerowsecurity.
+			// goopg enforces no row-level security, so these only record the flag
+			// for schema fidelity: pg_dump re-emits `ALTER TABLE <t> ENABLE ROW
+			// LEVEL SECURITY;` (getPolicies, keyed on relrowsecurity) and
+			// `ALTER TABLE ONLY <t> FORCE ROW LEVEL SECURITY;` (dumpTableSchema,
+			// keyed on relforcerowsecurity). Like REPLICA IDENTITY (slice 305) the
+			// live virtual pg_class reflects the field immediately, but pg_dump
+			// reads the pg_class HEAP populated at CREATE TABLE, so the new value
+			// must be flushed through the delete-old-rows + re-sync path or the
+			// stale heap row keeps reporting 'f' and the clause is dropped. DU-002
+			// slice 322.
+			newRowSec := tbl.RowSecurity
+			newForceRowSec := tbl.ForceRowSecurity
+			switch act.Kind {
+			case parser.AlterTableEnableRowSecurity:
+				newRowSec = true
+			case parser.AlterTableDisableRowSecurity:
+				newRowSec = false
+			case parser.AlterTableForceRowSecurity:
+				newForceRowSec = true
+			case parser.AlterTableNoForceRowSecurity:
+				newForceRowSec = false
+			}
+			if newRowSec != tbl.RowSecurity || newForceRowSec != tbl.ForceRowSecurity {
+				tbl.RowSecurity = newRowSec
+				tbl.ForceRowSecurity = newForceRowSec
+				if catalogHeapSyncAvailable(o.ctx) {
+					if err := o.ctx.MaterializeWriterXID(); err == nil {
+						xmax := o.ctx.Tx.XID
+						for _, dbOid := range catalogDBOids(o.ctx) {
+							deleteCatalogRowsForOID(o.ctx, dbOid, tbl.OID, xmax)
+						}
+					}
+					if syncErr := syncTableToCatalogHeap(o.ctx, tbl); syncErr != nil {
+						return fmt.Errorf("DDL catalog sync: %w", syncErr)
+					}
+				}
+			}
 		case parser.AlterTableSetReloptions:
 			// SET (param = value, …) — merge table-level storage parameters into the
 			// relation's reloptions. pg_class.reloptions is rendered from the live

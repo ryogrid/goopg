@@ -279,6 +279,48 @@ func TestParseAlterTableClusterOn(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableRowSecurity covers `ALTER TABLE ... {ENABLE|DISABLE} ROW
+// LEVEL SECURITY` and `... [NO] FORCE ROW LEVEL SECURITY` (DU-002 slice 322).
+// Each must record a distinct action; ENABLE/DISABLE TRIGGER must still fall to
+// the no-op trigger arm (EnableDisableTrigger), not be captured as an action.
+func TestParseAlterTableRowSecurity(t *testing.T) {
+	cases := []struct {
+		sql  string
+		kind AlterTableActionKind
+	}{
+		{"ALTER TABLE t ENABLE ROW LEVEL SECURITY", AlterTableEnableRowSecurity},
+		{"ALTER TABLE t DISABLE ROW LEVEL SECURITY", AlterTableDisableRowSecurity},
+		{"ALTER TABLE t FORCE ROW LEVEL SECURITY", AlterTableForceRowSecurity},
+		{"ALTER TABLE t NO FORCE ROW LEVEL SECURITY", AlterTableNoForceRowSecurity},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse %q: %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("%q: got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != tc.kind {
+			t.Fatalf("%q: actions=%+v want kind=%d", tc.sql, at.Actions, tc.kind)
+		}
+	}
+
+	// ENABLE TRIGGER must still be the no-op trigger arm, not an RLS action.
+	stmts, err := Parse("ALTER TABLE t ENABLE TRIGGER trg")
+	if err != nil {
+		t.Fatalf("Parse ENABLE TRIGGER: %v", err)
+	}
+	at, _ := stmts[0].(*AlterTableStmt)
+	if len(at.Actions) != 0 {
+		t.Fatalf("ENABLE TRIGGER: expected no actions, got %+v", at.Actions)
+	}
+	if !at.EnableDisableTrigger {
+		t.Errorf("ENABLE TRIGGER: EnableDisableTrigger not set")
+	}
+}
+
 // TestParseAlterTableSetDropDefault covers `ALTER TABLE ... ALTER COLUMN c SET
 // DEFAULT <expr>` and `... DROP DEFAULT` (DU-002 slice 269). SET DEFAULT records
 // the parsed expression on DefaultExpr; DROP DEFAULT records the column with a

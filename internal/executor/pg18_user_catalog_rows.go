@@ -471,8 +471,8 @@ func buildUserPGClassRow(cat catalog.Catalog, tbl *catalog.Table) Row {
 		NewBoolDatum(false),                                        // relhasrules
 		NewBoolDatum(false),                                        // relhastriggers
 		NewBoolDatum(false),                                        // relhassubclass
-		NewBoolDatum(false),                                        // relrowsecurity
-		NewBoolDatum(false),                                        // relforcerowsecurity
+		NewBoolDatum(tbl.RowSecurity),                              // relrowsecurity (DU-002 slice 322)
+		NewBoolDatum(tbl.ForceRowSecurity),                         // relforcerowsecurity (DU-002 slice 322)
 		NewBoolDatum(true),                                         // relispopulated
 		NewStringDatum(replIdent),                                  // relreplident ('d' default; FULL/NOTHING via ALTER, DU-002 slice 305)
 		NewBoolDatum(isPartition),                                  // relispartition

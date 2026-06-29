@@ -5201,6 +5201,55 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return stmt, nil
 		}
 	}
+	// ENABLE/DISABLE ROW LEVEL SECURITY — real action: toggles
+	// pg_class.relrowsecurity, which pg_dump re-emits as `ALTER TABLE <t> ENABLE
+	// ROW LEVEL SECURITY;` (DU-002 slice 322). Detected before the trigger/rule
+	// no-op arm below so the row-security clause is captured as an action rather
+	// than silently consumed.
+	if (p.cur().Kind == TokenIdent && (strings.EqualFold(p.cur().Value, "enable") || strings.EqualFold(p.cur().Value, "disable"))) &&
+		strings.EqualFold(p.peek(1).Value, "row") &&
+		strings.EqualFold(p.peek(2).Value, "level") &&
+		strings.EqualFold(p.peek(3).Value, "security") {
+		isEnable := strings.EqualFold(p.cur().Value, "enable")
+		p.advance() // ENABLE/DISABLE
+		p.advance() // ROW
+		p.advance() // LEVEL
+		p.advance() // SECURITY
+		kind := AlterTableEnableRowSecurity
+		if !isEnable {
+			kind = AlterTableDisableRowSecurity
+		}
+		stmt.Actions = append(stmt.Actions, AlterTableAction{Kind: kind})
+		return stmt, nil
+	}
+	// [NO] FORCE ROW LEVEL SECURITY — real action: toggles
+	// pg_class.relforcerowsecurity, which pg_dump re-emits as `ALTER TABLE ONLY
+	// <t> FORCE ROW LEVEL SECURITY;` (DU-002 slice 322).
+	{
+		forceOff := strings.EqualFold(p.cur().Value, "no")
+		base := 0
+		if forceOff {
+			base = 1
+		}
+		if strings.EqualFold(p.peek(base).Value, "force") &&
+			strings.EqualFold(p.peek(base+1).Value, "row") &&
+			strings.EqualFold(p.peek(base+2).Value, "level") &&
+			strings.EqualFold(p.peek(base+3).Value, "security") {
+			if forceOff {
+				p.advance() // NO
+			}
+			p.advance() // FORCE
+			p.advance() // ROW
+			p.advance() // LEVEL
+			p.advance() // SECURITY
+			kind := AlterTableForceRowSecurity
+			if forceOff {
+				kind = AlterTableNoForceRowSecurity
+			}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{Kind: kind})
+			return stmt, nil
+		}
+	}
 	// ENABLE/DISABLE [REPLICA|ALWAYS] TRIGGER | RULE — semantic no-op in v0.
 	// The TRIGGER variant takes a ShareRowExclusiveLock in PostgreSQL, so flag
 	// it for the executor to acquire that transaction-scoped lock (alter-table-3
