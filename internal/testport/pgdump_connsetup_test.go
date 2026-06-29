@@ -3468,6 +3468,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("revoke execute on revokefn from public: %v", err)
 	}
 
+	// Slice 347: the owner-side function REVOKE, the counterpart of slice 346's
+	// PUBLIC-side one. A function's acldefault('f', 10) grants EXECUTE to BOTH the
+	// owner and PUBLIC, so `REVOKE EXECUTE ON FUNCTION public.ownrevfn(integer)
+	// FROM postgres` materializes proacl as "{=X/postgres}" — PUBLIC's implicit
+	// EXECUTE survives, the owner's is removed (distinct from a table/sequence,
+	// whose default grants only the owner, so an owner REVOKE ALL empties to {}).
+	// pg_dump's getFuncs diffs {=X/postgres} against acldefault('f', 10) and emits
+	// `REVOKE ALL ON FUNCTION public.ownrevfn(integer) FROM postgres;` (verified
+	// byte-identical to pg_dump 18.3). Before this slice goopg dropped the owner to
+	// {} or NULL — re-granting the owner's default EXECUTE on restore and losing
+	// PUBLIC's — because the function REVOKE recorder never materialized PUBLIC's
+	// implicit default and the renderer re-added the absent owner.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.ownrevfn(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function ownrevfn: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE EXECUTE ON FUNCTION public.ownrevfn(integer) FROM postgres"); err != nil {
+		t.Fatalf("revoke execute on ownrevfn from postgres: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7462,6 +7481,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// default EXECUTE on restore.
 		if want := "REVOKE ALL ON FUNCTION public.revokefn(integer) FROM PUBLIC;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered the function REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 347 (asserted):** the owner-side function REVOKE, counterpart of
+		// slice 346. `REVOKE EXECUTE ON FUNCTION public.ownrevfn(integer) FROM
+		// postgres` materializes proacl as "{=X/postgres}" (PUBLIC's implicit
+		// EXECUTE survives, the owner's is removed); pg_dump's getFuncs diffs it
+		// against acldefault('f', 10) and emits a single `REVOKE ALL ON FUNCTION
+		// public.ownrevfn(integer) FROM postgres;`. Verified byte-identical to real
+		// pg_dump 18.3. The dump must NOT also emit a `… FROM PUBLIC;` line (PUBLIC
+		// retains its default) — that would mean goopg emptied proacl to {}.
+		if want := "REVOKE ALL ON FUNCTION public.ownrevfn(integer) FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the owner-side function REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if notWant := "REVOKE ALL ON FUNCTION public.ownrevfn(integer) FROM PUBLIC;"; strings.Contains(res.Stdout, notWant) {
+			t.Errorf("pg_dump wrongly revoked PUBLIC's surviving default EXECUTE on ownrevfn: unexpected %q\n  full stdout=%q", notWant, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

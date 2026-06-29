@@ -1773,6 +1773,11 @@ type Catalog interface {
 	MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs []string)
 	// HasTablePrivilege reports whether role was granted priv on relOID.
 	HasTablePrivilege(relOID uint32, role, priv string) bool
+	// ProcACLText renders the materialized pg_proc.proacl text for a routine OID,
+	// or "" when proacl is still NULL (no GRANT/REVOKE recorded). The function
+	// REVOKE recorder uses the NULL result to decide whether to expand the
+	// implicit acldefault('f', …) on the first mutation. DU-002 slice 347.
+	ProcACLText(procOID uint32) string
 	// DropTableACL forgets all privileges recorded for relOID (called when the
 	// relation is dropped so a recycled OID does not inherit stale grants).
 	DropTableACL(relOID uint32)
@@ -2023,6 +2028,19 @@ type InMemory struct {
 	// later GRANT or owner re-materialize clears the flag. Key: relOID → present.
 	// DU-002 slice 341.
 	relACLEmptied map[uint32]bool
+
+	// relACLOwnerRevoked records relations whose owner's implicit default aclitem
+	// was explicitly revoked, regardless of whether other grantees survive. This
+	// is the broader signal relACLEmptied is a special case of: relACLEmptied
+	// fires only when the owner revoke also empties the array, but an object whose
+	// acldefault grants a *non-owner* implicit privilege (a function's PUBLIC
+	// EXECUTE) leaves a surviving aclitem after the owner is revoked
+	// (`REVOKE EXECUTE ON FUNCTION f FROM <owner>` → {=X/owner}). In that case
+	// relaclTextLockedFor must still suppress the leading owner entry (the owner is
+	// absent from the array) even though it is non-empty. An owner-side GRANT
+	// re-materializes the owner and clears the flag. Key: relOID → present.
+	// DU-002 slice 347.
+	relACLOwnerRevoked map[uint32]bool
 
 	// compatObjects tracks objects created via noop CompatNoopStmt (e.g. CREATE CONVERSION,
 	// CREATE OPERATOR). Key: objType (e.g. "conversion") → set of names. M0097-drop_if_exists.
@@ -2410,15 +2428,16 @@ func NewInMemory() *InMemory {
 			"information_schema": 99,
 			"pg_toast":           2200, // toast uses same OID as public in simplified model
 		},
-		roles:          make(map[string]uint32),
-		tempNamespaces: make(map[string]uint32),
-		tableACLs:      make(map[uint32]map[string]map[string]bool),
-		roleACLDisplay: make(map[string]string),
-		relACLEmptied:  make(map[uint32]bool),
-		comments:       make(map[commentKey]string),
-		statisticsObjs: make(map[string]*StatisticsObject),
-		extensions:     make(map[string]*extensionRow),
-		tablespaces:    make(map[string]*tablespaceRow),
+		roles:              make(map[string]uint32),
+		tempNamespaces:     make(map[string]uint32),
+		tableACLs:          make(map[uint32]map[string]map[string]bool),
+		roleACLDisplay:     make(map[string]string),
+		relACLEmptied:      make(map[uint32]bool),
+		relACLOwnerRevoked: make(map[uint32]bool),
+		comments:           make(map[commentKey]string),
+		statisticsObjs:     make(map[string]*StatisticsObject),
+		extensions:         make(map[string]*extensionRow),
+		tablespaces:        make(map[string]*tablespaceRow),
 	}
 	c.registerSystemTables()
 	return c
@@ -8418,6 +8437,7 @@ func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv 
 	// slices 341 / 344.
 	if role == aclOwnerRole {
 		delete(c.relACLEmptied, relOID)
+		delete(c.relACLOwnerRevoked, relOID)
 	}
 	byRole := c.tableACLs[relOID]
 	if byRole == nil {
@@ -8459,6 +8479,16 @@ func (c *InMemory) RevokeTablePrivilege(relOID uint32, role, priv string) {
 	delete(privs, priv)
 	if len(privs) == 0 {
 		delete(byRole, role)
+		if role == aclOwnerRole {
+			// The owner's implicit default aclitem has been fully revoked. Record
+			// this regardless of whether other grantees survive: an object whose
+			// acldefault grants a non-owner implicit privilege (a function's PUBLIC
+			// EXECUTE) leaves a surviving aclitem (`{=X/owner}`) after the owner
+			// revoke, and relaclTextLockedFor must still suppress the leading owner
+			// entry there. relACLEmptied (set below) is the narrower case where the
+			// owner revoke also empties the array. DU-002 slice 347.
+			c.relACLOwnerRevoked[relOID] = true
+		}
 	}
 	if len(byRole) == 0 {
 		// If the relation's last remaining aclitem was the owner's own entry, the
@@ -8489,8 +8519,8 @@ func (c *InMemory) MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs [
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.relACLEmptied[relOID] {
-		return // owner already revoked all privileges (relacl is {}); do not resurrect
+	if c.relACLEmptied[relOID] || c.relACLOwnerRevoked[relOID] {
+		return // owner already revoked its implicit default; do not resurrect it
 	}
 	byRole := c.tableACLs[relOID]
 	if byRole == nil {
@@ -8534,6 +8564,7 @@ func (c *InMemory) DropTableACL(relOID uint32) {
 	defer c.mu.Unlock()
 	delete(c.tableACLs, relOID)
 	delete(c.relACLEmptied, relOID)
+	delete(c.relACLOwnerRevoked, relOID)
 }
 
 // aclPrivLetter pairs a privilege keyword (as stored upper-cased in tableACLs)
@@ -8685,11 +8716,14 @@ func (c *InMemory) ProcACLText(procOID uint32) string {
 func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter, ownerString string) string {
 	byRole := c.tableACLs[relOID]
 	if len(byRole) == 0 {
-		if c.relACLEmptied[relOID] {
+		if c.relACLEmptied[relOID] || c.relACLOwnerRevoked[relOID] {
 			// Owner revoked all of its implicit default privileges
 			// (REVOKE ALL … FROM owner): PostgreSQL stores a non-NULL empty
 			// aclitem array {} and pg_dump emits a bare `REVOKE ALL …`. DU-002
-			// slice 341.
+			// slice 341. relACLOwnerRevoked also covers revoking every grantee
+			// of a multi-default object (function owner + PUBLIC) in one
+			// statement, which empties the array with a non-owner last revoke
+			// so relACLEmptied stays unset. DU-002 slice 347.
 			return "{}"
 		}
 		return "" // NULL relacl — matches acldefault, pg_dump emits no GRANT
@@ -8707,7 +8741,7 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 	// pg_dump diffs that against acldefault to re-emit the owner's `REVOKE ALL …`.
 	// Suppress the leading owner entry in that case. DU-002 slice 344.
 	var items []string
-	if !c.relACLEmptied[relOID] {
+	if !c.relACLEmptied[relOID] && !c.relACLOwnerRevoked[relOID] {
 		ownerLetters := ownerString
 		if ownerPrivs, ok := byRole[aclOwnerRole]; ok {
 			ownerLetters = renderACLLetters(ownerPrivs, privOrder)

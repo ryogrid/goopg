@@ -651,3 +651,54 @@ func TestProcACLRevokeFromPublic(t *testing.T) {
 		t.Fatalf("proacl after REVOKE EXECUTE FROM PUBLIC = %q; want %q", got, want)
 	}
 }
+
+// TestProcACLRevokeFromOwner pins the owner-side function REVOKE (DU-002 slice
+// 347). A function's acldefault('f', owner) grants EXECUTE to BOTH the owner and
+// PUBLIC, so revoking the owner's implicit default leaves PUBLIC's entry behind
+// ("{=X/postgres}", verified against PostgreSQL 18.3), distinct from a sequence
+// or table whose default grants only the owner (REVOKE ALL FROM owner → "{}").
+// Revoking BOTH the owner and PUBLIC empties the array to "{}".
+func TestProcACLRevokeFromOwner(t *testing.T) {
+	t.Run("owner_only_leaves_public", func(t *testing.T) {
+		c := NewInMemory()
+		const procOID = 131074 // distinct from the other proacl tests
+
+		// First mutation expands the implicit default {owner=X, =X}, then the
+		// owner-side revoke removes the owner — mirrors recordFunctionRevoke.
+		c.MaterializeOwnerACL(procOID, "postgres", []string{"EXECUTE"})
+		c.GrantTablePrivilege(procOID, "PUBLIC", "EXECUTE")
+		c.RevokeTablePrivilege(procOID, "postgres", "EXECUTE")
+		if want, got := "{=X/postgres}", c.ProcACLText(procOID); got != want {
+			t.Fatalf("proacl after REVOKE EXECUTE FROM postgres = %q; want %q", got, want)
+		}
+	})
+
+	t.Run("owner_and_public_empties", func(t *testing.T) {
+		c := NewInMemory()
+		const procOID = 131075
+
+		c.MaterializeOwnerACL(procOID, "postgres", []string{"EXECUTE"})
+		c.GrantTablePrivilege(procOID, "PUBLIC", "EXECUTE")
+		// Revoke PUBLIC last so relACLEmptied stays unset (the owner is not the
+		// final entry removed); relACLOwnerRevoked must still render "{}".
+		c.RevokeTablePrivilege(procOID, "postgres", "EXECUTE")
+		c.RevokeTablePrivilege(procOID, "PUBLIC", "EXECUTE")
+		if want, got := "{}", c.ProcACLText(procOID); got != want {
+			t.Fatalf("proacl after REVOKE EXECUTE FROM postgres,PUBLIC = %q; want %q", got, want)
+		}
+	})
+
+	t.Run("owner_grant_rematerializes", func(t *testing.T) {
+		c := NewInMemory()
+		const procOID = 131076
+
+		c.MaterializeOwnerACL(procOID, "postgres", []string{"EXECUTE"})
+		c.GrantTablePrivilege(procOID, "PUBLIC", "EXECUTE")
+		c.RevokeTablePrivilege(procOID, "postgres", "EXECUTE") // {=X/postgres}
+		// A later owner-side GRANT clears relACLOwnerRevoked and restores the owner.
+		c.GrantTablePrivilege(procOID, "postgres", "EXECUTE")
+		if want, got := "{postgres=X/postgres,=X/postgres}", c.ProcACLText(procOID); got != want {
+			t.Fatalf("proacl after re-GRANT to postgres = %q; want %q", got, want)
+		}
+	})
+}

@@ -406,12 +406,20 @@ func (s *Server) recordFunctionRevoke(objPart, rolePart, privPart string) {
 		if oid == 0 {
 			continue
 		}
-		// Materialize the owner's implicit default EXECUTE so proacl renders the
-		// owner entry once any privilege is revoked; the PUBLIC default is implicit
-		// and never stored, so revoking it just leaves the owner. The catalog
-		// lower-cases "PUBLIC" to the reserved pseudo-role, matching the grantee key
-		// the grant recorder seeds.
-		s.cfg.Catalog.MaterializeOwnerACL(oid, aclOwnerRole, allFunctionPrivileges)
+		// A function's acldefault('f', owner) grants EXECUTE to BOTH the owner and
+		// PUBLIC. PostgreSQL materializes that full array on the first GRANT/REVOKE,
+		// then mutates it — so an owner-side REVOKE leaves PUBLIC's `{=X/owner}`
+		// (slice 347) and a PUBLIC-side REVOKE leaves the owner's `{postgres=X/…}`
+		// (slice 346). Seed both implicit entries here, but only while proacl is
+		// still NULL (no prior mutation): ProcACLText returns "" for NULL. Re-seeding
+		// on a second REVOKE would resurrect an already-revoked grantee (e.g.
+		// `REVOKE … FROM PUBLIC` then `… FROM postgres` must reach `{}`, not
+		// `{=X/postgres}`). The catalog lower-cases "PUBLIC" to the reserved
+		// pseudo-role and renders it as the empty grantee, matching the grant recorder.
+		if s.cfg.Catalog.ProcACLText(oid) == "" {
+			s.cfg.Catalog.MaterializeOwnerACL(oid, aclOwnerRole, allFunctionPrivileges)
+			s.cfg.Catalog.GrantTablePrivilege(oid, "PUBLIC", "EXECUTE")
+		}
 		for _, role := range roles {
 			for _, p := range privs {
 				s.cfg.Catalog.RevokeTablePrivilege(oid, role, p)
