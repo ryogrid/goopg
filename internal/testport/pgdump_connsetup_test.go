@@ -3383,6 +3383,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("revoke all on schema ownrevall_sch from postgres: %v", err)
 	}
 
+	// Slice 343: a full owner-side REVOKE ALL ON SEQUENCE must round-trip as the
+	// empty relacl array — the sequence analogue of slice 341 (table) and slice 342
+	// (schema). `REVOKE ALL ON SEQUENCE ownrevall_seq FROM postgres` strips the
+	// owner's implicit default sequence privileges (USAGE, SELECT, UPDATE), leaving
+	// pg_class.relacl = `{}` (a non-NULL but empty array, distinct from the NULL of
+	// a never-granted sequence). pg_dump's buildACLCommands diffs {} against
+	// acldefault('s', 10) = "{postgres=rwU/postgres}" and (objtype "SEQUENCE")
+	// emits a bare `REVOKE ALL ON SEQUENCE public.ownrevall_seq FROM postgres;`
+	// with NO re-GRANT (verified byte-identical to real pg_dump 18.3 above). The
+	// server path needs NO new code: recordTableRevoke already passes
+	// allSequencePrivileges to Catalog.MaterializeOwnerACL for an owner-side
+	// `REVOKE … ON SEQUENCE … FROM postgres`, and the empty-array (relACLEmptied)
+	// state plus its relaclTextLockedSeq rendering are object-type-agnostic. This
+	// slice pins that end-to-end round-trip as a regression guard.
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.ownrevall_seq"); err != nil {
+		t.Fatalf("create sequence ownrevall_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE ALL ON SEQUENCE public.ownrevall_seq FROM postgres"); err != nil {
+		t.Fatalf("revoke all on sequence ownrevall_seq from postgres: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7318,6 +7339,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// holds no schema privileges after REVOKE ALL).
 		if strings.Contains(res.Stdout, "GRANT") && strings.Contains(res.Stdout, "ON SCHEMA ownrevall_sch TO postgres") {
 			t.Errorf("pg_dump re-granted schema privileges to the owner after REVOKE ALL\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 343 (asserted):** a full owner-side REVOKE ALL ON SEQUENCE round-trips
+		// as the empty relacl array (the sequence analogue of slices 341/342). `REVOKE
+		// ALL ON SEQUENCE ownrevall_seq FROM postgres` leaves relacl = `{}`, which
+		// pg_dump renders as a bare `REVOKE ALL ON SEQUENCE … FROM postgres;` with NO
+		// re-GRANT. Asserted byte-identical to real pg_dump 18.3. The server already
+		// wired this (recordTableRevoke passes allSequencePrivileges to
+		// MaterializeOwnerACL), so this guards against a regression that would revert
+		// the sequence relacl to NULL and silently restore the owner's default privs.
+		if want := "REVOKE ALL ON SEQUENCE public.ownrevall_seq FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the owner-side sequence REVOKE ALL: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// No GRANT … ownrevall_seq … TO postgres must follow (the owner holds no
+		// sequence privileges after REVOKE ALL).
+		if strings.Contains(res.Stdout, "GRANT") && strings.Contains(res.Stdout, "ON SEQUENCE public.ownrevall_seq TO postgres") {
+			t.Errorf("pg_dump re-granted sequence privileges to the owner after REVOKE ALL\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

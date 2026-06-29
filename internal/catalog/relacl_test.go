@@ -468,6 +468,56 @@ func TestRevokeAllFromSchemaOwnerEmptyArray(t *testing.T) {
 	}
 }
 
+// TestRevokeAllFromSequenceOwnerEmptyArray covers DU-002 slice 343: a
+// `REVOKE ALL … ON SEQUENCE … FROM owner` strips the owner's implicit default
+// sequence privileges (USAGE, SELECT, UPDATE) and leaves pg_class.relacl as a
+// non-NULL *empty* aclitem array {} (distinct from the NULL of a never-granted
+// sequence). This is the sequence analogue of TestRevokeAllFromOwnerEmptyArray
+// and TestRevokeAllFromSchemaOwnerEmptyArray: the empty-array (relACLEmptied)
+// state is object-type-agnostic, so the same MaterializeOwnerACL →
+// RevokeTablePrivilege sequence applies, rendered through relaclTextLockedSeq
+// (sequence privilege order, owner-default "rwU"). The server already wires this
+// path — recordTableRevoke passes allSequencePrivileges to MaterializeOwnerACL
+// for an owner-side `REVOKE … ON SEQUENCE … FROM postgres` — so this pins the
+// behaviour as a regression guard rather than introducing new code.
+func TestRevokeAllFromSequenceOwnerEmptyArray(t *testing.T) {
+	c := NewInMemory()
+	const seqOID = 16990
+	allSeq := []string{"USAGE", "SELECT", "UPDATE"}
+
+	// REVOKE ALL ON SEQUENCE FROM postgres: materialize the owner default (rwU),
+	// then drop every privilege → relacl is the empty array "{}", NOT NULL.
+	c.MaterializeOwnerACL(seqOID, "postgres", allSeq)
+	for _, p := range allSeq {
+		c.RevokeTablePrivilege(seqOID, "postgres", p)
+	}
+	if got := relaclTextSeq(c, seqOID); got != "{}" {
+		t.Fatalf("seq relacl after REVOKE ALL ON SEQUENCE FROM postgres = %q; want %q (empty array, not NULL)", got, "{}")
+	}
+
+	// A second owner-side revoke after the array is empty is a no-op: the owner
+	// holds nothing, so MaterializeOwnerACL must not bring the sequence privileges
+	// back.
+	c.MaterializeOwnerACL(seqOID, "postgres", allSeq)
+	c.RevokeTablePrivilege(seqOID, "postgres", "USAGE")
+	if got := relaclTextSeq(c, seqOID); got != "{}" {
+		t.Fatalf("seq relacl after second owner revoke on empty array = %q; want %q", got, "{}")
+	}
+
+	// A sequence that never had a grant stays NULL — the empty-array state must
+	// not leak across OIDs.
+	if got := relaclTextSeq(c, 16991); got != "" {
+		t.Fatalf("seq relacl of unrelated never-granted sequence = %q; want \"\" (NULL)", got)
+	}
+
+	// Re-granting a privilege to the owner re-materializes a real aclitem and
+	// clears the empty-array state.
+	c.GrantTablePrivilege(seqOID, "postgres", "USAGE")
+	if got := relaclTextSeq(c, seqOID); got != "{postgres=U/postgres}" {
+		t.Fatalf("seq relacl after owner re-GRANT following empty array = %q; want %q", got, "{postgres=U/postgres}")
+	}
+}
+
 // TestACLQuoteName unit-checks the putid emulation directly, including the
 // double-quote-doubling and multibyte (high-bit) cases that are awkward to drive
 // through a full GRANT.
