@@ -2429,6 +2429,20 @@ documentation-only and is exempt from the design-doc requirement.)
       18.3) PASS. Design `0119-0004-create-policy-rls.md`. **Deferred:** named-role
       `TO role` policies (no per-role OID registry; the `pg_roles` ARRAY subquery
       path unverified).
+      **Slice 326 (loop #49):** column-specific `UPDATE OF col1, col2` trigger
+      round-trip — slice 319 made the basic CREATE TRIGGER round-trip but skipped
+      the column-list form: `parseCreateTriggerTail` consumed only bare `UPDATE`,
+      so the `OF` token tripped the event loop and the clause was lost. Fix
+      (dump-fidelity only — `fireTriggers` ignores the restriction):
+      `CreateTriggerStmt.UpdateColumns`/`Trigger.UpdateColumns` capture the list;
+      `buildTriggerDefString` emits ` OF c1, c2` after UPDATE (each via
+      `pgQuoteIdent`, ruleutils.c order); `pg_trigger.tgattr` now projects the
+      1-based attnums (space-separated int2vector via `triggerUpdateColAttrs`).
+      Tests `TestParseCreateTriggerUpdateOf` + `TestBuildTriggerDefString`
+      (2 new cases) + slice-326 `TestPort_PgDumpConnectionSetup` (`trg_uof BEFORE
+      INSERT OR UPDATE OF a, b`; byte-identical vs real pg_dump 18.3) PASS.
+      Design `0119-0004-trigger-update-of-columns.md`. **Still open:** richer
+      trigger forms (WHEN/tgqual, REFERENCING transition tables, CONSTRAINT).
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
       battery (further slices: GRANT/ACL relacl, CREATE RULE, CREATE POLICY
       named-role `TO`); extended-protocol commit-time deferral (architecturally

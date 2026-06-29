@@ -2983,7 +2983,7 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	// pg_get_triggerdef. Two triggers exercise both timings/levels and the OR-ed
 	// event list: a BEFORE INSERT OR UPDATE row-level trigger and an AFTER DELETE
 	// statement-level trigger, both on public.trig_t.
-	if err := runSQLSimple(t, c, "CREATE TABLE public.trig_t (a integer)"); err != nil {
+	if err := runSQLSimple(t, c, "CREATE TABLE public.trig_t (a integer, b integer)"); err != nil {
 		t.Fatalf("create table trig_t: %v", err)
 	}
 	if err := runSQLSimple(t, c, "CREATE FUNCTION public.trig_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$"); err != nil {
@@ -2994,6 +2994,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	}
 	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_ad AFTER DELETE ON public.trig_t FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn()"); err != nil {
 		t.Fatalf("create trigger trg_ad: %v", err)
+	}
+	// Slice 326: a column-specific `UPDATE OF a, b` trigger. pg_get_triggerdef
+	// appends ` OF <cols>` right after the UPDATE event; before this slice the
+	// parser tripped on the `OF` keyword and the clause was dropped. Combine it
+	// with INSERT to exercise the OR-ed event list with the OF clause attached.
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_uof BEFORE INSERT OR UPDATE OF a, b ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_uof: %v", err)
 	}
 
 	// Slice 320: a clustered index must round-trip through pg_dump. pg_dump's
@@ -6782,6 +6789,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_ad AFTER DELETE ON public.trig_t FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn();") {
 			t.Errorf("pg_dump dropped/mangled the AFTER DELETE statement-level trigger\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 326 (asserted):** a column-specific `UPDATE OF a, b` trigger must
+		// round-trip. pg_get_triggerdef_worker appends ` OF <cols>` immediately
+		// after the UPDATE event (the OR-ed events stay in PG's fixed INSERT,
+		// DELETE, UPDATE order). Before this slice goopg's parser tripped on the
+		// `OF` keyword and the column list was dropped, so the dumped trigger fired
+		// on every column. Verified byte-identical to real pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_uof BEFORE INSERT OR UPDATE OF a, b ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the column-specific UPDATE OF trigger\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 320 (asserted):** a clustered index must round-trip. pg_dump's
 		// getIndexes reads pg_index.indisclustered and dumpIndex/dumpConstraint

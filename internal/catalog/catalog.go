@@ -1164,10 +1164,35 @@ type Trigger struct {
 	TableOID   uint32
 	Timing     TriggerTiming
 	Events     []string // "insert", "update", "delete", "truncate"
-	ForEachRow bool
-	FuncName   string // function/procedure name (unschemed)
-	FuncSchema string
-	Args       []string // trigger function arguments (TG_ARGV)
+	// UpdateColumns is the optional `UPDATE OF col1, col2` column list of a
+	// column-specific UPDATE trigger; empty for every other form. pg_dump's
+	// pg_get_triggerdef appends ` OF <cols>` right after the UPDATE event and
+	// pg_trigger.tgattr carries the column attnums. DU-002 slice 326.
+	UpdateColumns []string
+	ForEachRow    bool
+	FuncName      string // function/procedure name (unschemed)
+	FuncSchema    string
+	Args          []string // trigger function arguments (TG_ARGV)
+}
+
+// triggerUpdateColAttrs renders a column-specific UPDATE trigger's column list
+// as pg_trigger.tgattr, a space-separated int2vector of 1-based attnums (the
+// same text form pg_index.indkey uses). An unresolved column name is skipped;
+// an empty/absent list yields "". DU-002 slice 326.
+func triggerUpdateColAttrs(tbl *Table, cols []string) string {
+	if tbl == nil || len(cols) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(cols))
+	for _, name := range cols {
+		for _, col := range tbl.Columns {
+			if col.Name == name {
+				parts = append(parts, strconv.Itoa(col.Ordinal+1))
+				break
+			}
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // PolicyInfo describes one row-level security policy created with CREATE POLICY.
@@ -6670,7 +6695,10 @@ func (c *InMemory) registerSystemTables() {
 				row[11] = "f"                             // tgdeferrable
 				row[12] = "f"                             // tginitdeferred
 				row[13] = fmt.Sprintf("%d", len(trig.Args)) // tgnargs
-				row[14] = ""                              // tgattr (int2[]; UPDATE OF cols unsupported)
+				// tgattr (int2vector→int2[], space-separated like pg_index.indkey):
+				// the 1-based attnums of an `UPDATE OF col1, col2` column list, or
+				// empty for every non-column-specific trigger. DU-002 slice 326.
+				row[14] = triggerUpdateColAttrs(tbl, trig.UpdateColumns)
 				row[15] = ""                              // tgargs (bytea; def built from catalog.Trigger.Args)
 				row[16] = ""                              // tgqual (pg_node_tree; WHEN unsupported)
 				row[17] = ""                              // tgoldtable (name; REFERENCING unsupported)

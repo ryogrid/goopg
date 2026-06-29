@@ -4654,9 +4654,10 @@ func fkActionClause(a parser.FKAction) string {
 // Events are emitted in PG's fixed order (INSERT, DELETE, UPDATE, TRUNCATE)
 // regardless of the order they were declared. The target table and trigger
 // function are schema-qualified because pg_dump runs with search_path=''.
-// goopg's parser captures only the basic trigger form (no WHEN, REFERENCING,
-// UPDATE OF columns, or CONSTRAINT trigger), so none of those clauses are
-// emitted. DU-002 slice 319.
+// A column-specific `UPDATE OF col1, col2` list is reconstructed after the
+// UPDATE event (DU-002 slice 326). goopg's parser does not yet capture WHEN,
+// REFERENCING, or CONSTRAINT-trigger clauses, so none of those are emitted.
+// DU-002 slice 319.
 func buildTriggerDefString(tbl *catalog.Table, trig catalog.Trigger) string {
 	var b strings.Builder
 	b.WriteString("CREATE TRIGGER ")
@@ -4693,6 +4694,18 @@ func buildTriggerDefString(tbl *catalog.Table, trig catalog.Trigger) string {
 	}
 	if has["update"] {
 		emit("UPDATE")
+		// A column-specific UPDATE trigger appends ` OF col1, col2` right after
+		// the UPDATE event (ruleutils.c pg_get_triggerdef_worker). Column names
+		// are quoted only when required. DU-002 slice 326.
+		if len(trig.UpdateColumns) > 0 {
+			b.WriteString(" OF ")
+			for i, col := range trig.UpdateColumns {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				b.WriteString(pgQuoteIdent(col))
+			}
+		}
 	}
 	if has["truncate"] {
 		emit("TRUNCATE")

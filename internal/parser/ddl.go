@@ -4539,6 +4539,20 @@ func (p *parser) parseCreateTriggerTail(pos int) (Stmt, error) {
 			stmt.Events = append(stmt.Events, "insert")
 		case p.acceptKeyword(KwUpdate):
 			stmt.Events = append(stmt.Events, "update")
+			// Optional column-specific list: UPDATE OF col1, col2, …
+			// (only valid for the UPDATE event). DU-002 slice 326.
+			if p.acceptKeyword(KwOf) {
+				for {
+					colTok, err := p.parseIdent()
+					if err != nil {
+						return nil, err
+					}
+					stmt.UpdateColumns = append(stmt.UpdateColumns, identText(colTok))
+					if !p.acceptSymbol(",") {
+						break
+					}
+				}
+			}
 		case p.acceptKeyword(KwDelete):
 			stmt.Events = append(stmt.Events, "delete")
 		case p.acceptKeyword(KwTruncate) || p.acceptIdentKeyword("truncate"):

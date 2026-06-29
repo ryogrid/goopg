@@ -330,9 +330,13 @@ type CreateTriggerStmt struct {
 	Table      ObjectName
 	Timing     TriggerTiming
 	Events     []string // "insert", "update", "delete", "truncate"
-	ForEachRow bool     // true = ROW, false = STATEMENT
-	FuncName   ObjectName
-	FuncArgs   []string // trigger function arguments (EXECUTE PROCEDURE name('arg1', 'arg2'))
+	// UpdateColumns is the optional column list of an `UPDATE OF col1, col2`
+	// trigger (a column-specific UPDATE trigger). Empty for every other form.
+	// DU-002 slice 326.
+	UpdateColumns []string
+	ForEachRow    bool // true = ROW, false = STATEMENT
+	FuncName      ObjectName
+	FuncArgs      []string // trigger function arguments (EXECUTE PROCEDURE name('arg1', 'arg2'))
 	// IfNotExists: PostgreSQL 14+ only, not supported yet.
 }
 

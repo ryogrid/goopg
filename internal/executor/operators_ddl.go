@@ -10785,15 +10785,16 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 		return err
 	}
 	trig := catalog.Trigger{
-		Name:       s.Name,
-		OID:        o.ctx.Catalog.AllocOID(),
-		TableOID:   tbl.OID,
-		Timing:     catalog.TriggerTiming(s.Timing),
-		Events:     append([]string(nil), s.Events...),
-		ForEachRow: s.ForEachRow,
-		FuncName:   s.FuncName.Name,
-		FuncSchema: s.FuncName.Schema,
-		Args:       append([]string(nil), s.FuncArgs...),
+		Name:          s.Name,
+		OID:           o.ctx.Catalog.AllocOID(),
+		TableOID:      tbl.OID,
+		Timing:        catalog.TriggerTiming(s.Timing),
+		Events:        append([]string(nil), s.Events...),
+		UpdateColumns: append([]string(nil), s.UpdateColumns...),
+		ForEachRow:    s.ForEachRow,
+		FuncName:      s.FuncName.Name,
+		FuncSchema:    s.FuncName.Schema,
+		Args:          append([]string(nil), s.FuncArgs...),
 	}
 	// Remove any existing trigger with the same name on this table.
 	filtered := tbl.Triggers[:0]

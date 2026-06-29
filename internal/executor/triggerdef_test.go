@@ -47,6 +47,29 @@ func TestBuildTriggerDefString(t *testing.T) {
 			want: "CREATE TRIGGER trg_all AFTER INSERT OR DELETE OR UPDATE OR TRUNCATE ON public.t FOR EACH ROW EXECUTE FUNCTION public.h('a', 'b''c')",
 		},
 		{
+			// DU-002 slice 326: a column-specific UPDATE trigger appends
+			// ` OF col1, col2` right after the UPDATE event.
+			name: "update of columns",
+			trig: catalog.Trigger{
+				Name: "trg_uof", Timing: catalog.TriggerBefore,
+				Events: []string{"update"}, UpdateColumns: []string{"a", "b"},
+				ForEachRow: true, FuncSchema: "public", FuncName: "f",
+			},
+			want: "CREATE TRIGGER trg_uof BEFORE UPDATE OF a, b ON public.t FOR EACH ROW EXECUTE FUNCTION public.f()",
+		},
+		{
+			// The OF clause attaches to the UPDATE event even when combined with
+			// other events (which keep PG's fixed INSERT, DELETE, UPDATE order),
+			// and a column needing quoting is double-quoted.
+			name: "insert or update of quoted column",
+			trig: catalog.Trigger{
+				Name: "trg_iuof", Timing: catalog.TriggerAfter,
+				Events: []string{"insert", "update"}, UpdateColumns: []string{"Mixed"},
+				ForEachRow: false, FuncSchema: "public", FuncName: "g",
+			},
+			want: `CREATE TRIGGER trg_iuof AFTER INSERT OR UPDATE OF "Mixed" ON public.t FOR EACH STATEMENT EXECUTE FUNCTION public.g()`,
+		},
+		{
 			name: "instead of with empty func schema defaults to public",
 			trig: catalog.Trigger{
 				Name: "trg_io", Timing: catalog.TriggerInsteadOf,
