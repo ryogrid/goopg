@@ -2332,9 +2332,24 @@ documentation-only and is exempt from the design-doc requirement.)
       builtin. Expression statistics flagged + omitted (deparser follow-up). Also
       fixed a latent `IF NOT EXISTS` parse bug (`acceptIdentKeyword("if")` never
       matched the keyword token). Design `0119-0004-create-statistics-roundtrip.md`.
-      **Still open under M0119-0004:** expression extended statistics (deparse); the
-      pg_dump 002–010 catalog-view parity battery (further slices); extended-protocol
-      commit-time deferral (architecturally entangled — extended protocol is
+      **Slice 316 (loop #38):** expression extended-statistics round-trip —
+      slice 314 declined any `CREATE STATISTICS s ON (a + b) FROM t` (`HasExpr`
+      set → `BuildStatisticsObjDef` returned ""), so `dumpStatisticsExt` (which
+      emits `pg_get_statisticsobjdef(oid)` verbatim) silently dropped the object.
+      Parser now captures the ON-list expression via `p.parseExpr()` into
+      `CreateStatisticsStmt.Exprs []Expr` (tolerant `p.idx` rewind + skip on parse
+      error); executor deparses each via `defaultExprToSQL` (already parenthesizes
+      binary ops / leaves bare function calls unwrapped — matches ruleutils.c
+      `looks_like_function`) into `catalog.StatisticsObject.Exprs []string`;
+      `BuildStatisticsObjDef` declines only when `HasExpr && len(Exprs)==0`, counts
+      `ncolumns = len(Columns)+len(Exprs)`, and emits columns-then-expressions
+      (PG order). No `pg_statistic_ext` view change — `getExtendedStatistics`
+      reads only oid/stxname/stxnamespace/stxowner/stxrelid/stxstattarget. Design
+      `0119-0004-expression-statistics-roundtrip.md`.
+      **Still open under M0119-0004:** `ALTER STATISTICS … SET STATISTICS n`
+      (`stxstattarget`; needs ALTER STATISTICS support); the pg_dump 002–010
+      catalog-view parity battery (further slices); extended-protocol commit-time
+      deferral (architecturally entangled — extended protocol is
       auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs

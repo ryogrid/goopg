@@ -12379,7 +12379,16 @@ func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
 			schema = "public"
 		}
 	}
-	im.RegisterStatisticsFull(schema, s.Name.Name, tableOID, s.Kinds, s.Columns, s.HasExpr)
+	// Deparse any expression targets to their final SQL form. defaultExprToSQL
+	// already fully parenthesizes binary ops (`a + b` → `(a + b)`) and leaves a
+	// bare function call unparenthesized (`lower(a)` → `lower(a)`), which matches
+	// exactly what ruleutils.c pg_get_statisticsobj_worker emits for each
+	// expression element. DU-002 slice 316.
+	var exprs []string
+	for _, e := range s.Exprs {
+		exprs = append(exprs, defaultExprToSQL(e))
+	}
+	im.RegisterStatisticsFull(schema, s.Name.Name, tableOID, s.Kinds, s.Columns, exprs, s.HasExpr)
 	return nil
 }
 

@@ -2945,6 +2945,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE STATISTICS public.statext_nd (ndistinct) ON b, c FROM public.statext_t"); err != nil {
 		t.Fatalf("create statistics statext_nd: %v", err)
 	}
+	// Slice 316: expression extended-statistics objects must also round-trip.
+	// PG's grammar requires expression elements to be parenthesized; ruleutils.c
+	// pg_get_statisticsobj_worker emits all simple columns first, then each
+	// expression (parenthesized unless it is a bare function call), and suppresses
+	// the kinds clause when the object spans a single target. Before this slice
+	// goopg flagged HasExpr and BuildStatisticsObjDef declined, silently dropping
+	// the object. goopg now parses the ON-list expression into an AST and the
+	// executor deparses it (defaultExprToSQL already parenthesizes binary ops and
+	// leaves bare function calls unwrapped, matching ruleutils.c). `statext_expr`
+	// (single expression → no kinds clause); `statext_mix` (column + expression).
+	if err := runSQLSimple(t, c, "CREATE STATISTICS public.statext_expr ON (a + b) FROM public.statext_t"); err != nil {
+		t.Fatalf("create statistics statext_expr: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE STATISTICS public.statext_mix ON a, (b + c) FROM public.statext_t"); err != nil {
+		t.Fatalf("create statistics statext_mix: %v", err)
+	}
 
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
@@ -6553,6 +6569,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		statExtDDL := []string{
 			"CREATE STATISTICS public.statext_all ON a, b FROM public.statext_t;",
 			"CREATE STATISTICS public.statext_nd (ndistinct) ON b, c FROM public.statext_t;",
+			// **Slice 316 (asserted):** expression extended-statistics objects must
+			// round-trip. A single-expression object suppresses the kinds clause
+			// (it must be expression stats); a column+expression object lists the
+			// column first then the parenthesized expression. Mirrors ruleutils.c
+			// pg_get_statisticsobj_worker. Before slice 316 BuildStatisticsObjDef
+			// declined on HasExpr, so pg_dump dropped these objects entirely.
+			"CREATE STATISTICS public.statext_expr ON (a + b) FROM public.statext_t;",
+			"CREATE STATISTICS public.statext_mix ON a, (b + c) FROM public.statext_t;",
 		}
 		for _, sub := range statExtDDL {
 			if !strings.Contains(res.Stdout, sub) {

@@ -1766,13 +1766,15 @@ type CreateStatisticsStmt struct {
 	// pg_get_statisticsobjdef re-emits the clause only when not all kinds are
 	// enabled. DU-002 slice 314.
 	Kinds []string
-	// Columns holds the simple column names from the `ON a, b` list. Expression
-	// statistics targets are not captured here (HasExpr flags their presence so
-	// the dump path can decline to reconstruct). DU-002 slice 314.
+	// Columns holds the simple column names from the `ON a, b` list. DU-002 slice 314.
 	Columns []string
-	// HasExpr reports that the ON list contained a non-simple-column target
-	// (an expression), so Columns is incomplete and the object def cannot be
-	// faithfully reconstructed by the simple-column dump path.
+	// Exprs holds the parsed expression targets from the ON list (`ON (a + b)`),
+	// in order. The executor deparses them for pg_get_statisticsobjdef so an
+	// expression-statistics object round-trips through pg_dump. DU-002 slice 316.
+	Exprs []Expr
+	// HasExpr reports that the ON list contained a non-simple-column target (an
+	// expression). When set but Exprs is empty the expression could not be parsed
+	// (tolerant fallback), so the dump path declines to reconstruct the object.
 	HasExpr bool
 }
 

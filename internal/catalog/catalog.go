@@ -1930,8 +1930,16 @@ type StatisticsObject struct {
 	// Columns holds the simple column names from the ON list, in order. Used by
 	// pg_get_statisticsobjdef to reconstruct the ON clause. DU-002 slice 314.
 	Columns []string
-	// HasExpr reports the ON list contained an expression target (not captured),
-	// so Columns is incomplete. DU-002 slice 314.
+	// Exprs holds the deparsed expression targets from the ON list, each already
+	// rendered in its final SQL form (a non-function expression is parenthesized,
+	// e.g. "(a + b)"; a bare function call stays unparenthesized, e.g. "lower(a)")
+	// to mirror ruleutils.c pg_get_statisticsobj_worker. pg_get_statisticsobjdef
+	// appends these after the simple columns. DU-002 slice 316.
+	Exprs []string
+	// HasExpr reports the ON list contained an expression target. When it is set
+	// but Exprs is empty the expression could not be captured (e.g. a parse
+	// fallback), so the dump path declines to reconstruct the object. DU-002
+	// slices 314/316.
 	HasExpr bool
 }
 
@@ -2177,16 +2185,17 @@ func NewInMemory() *InMemory {
 // If a statistics object with the same schema-qualified name already exists it
 // is overwritten. M0097-0023.
 func (c *InMemory) RegisterStatistics(schema, name string, tableOID uint32) *StatisticsObject {
-	return c.RegisterStatisticsFull(schema, name, tableOID, nil, nil, false)
+	return c.RegisterStatisticsFull(schema, name, tableOID, nil, nil, nil, false)
 }
 
-// RegisterStatisticsFull registers a statistics object carrying its kinds and
-// column list so pg_get_statisticsobjdef can reconstruct the DDL. DU-002 slice 314.
-func (c *InMemory) RegisterStatisticsFull(schema, name string, tableOID uint32, kinds, columns []string, hasExpr bool) *StatisticsObject {
+// RegisterStatisticsFull registers a statistics object carrying its kinds, simple
+// column list, and deparsed expression targets so pg_get_statisticsobjdef can
+// reconstruct the DDL. DU-002 slices 314/316.
+func (c *InMemory) RegisterStatisticsFull(schema, name string, tableOID uint32, kinds, columns, exprs []string, hasExpr bool) *StatisticsObject {
 	if schema == "" {
 		schema = "public"
 	}
-	obj := &StatisticsObject{Name: name, Schema: schema, OID: c.AllocOID(), TableOID: tableOID, Kinds: kinds, Columns: columns, HasExpr: hasExpr}
+	obj := &StatisticsObject{Name: name, Schema: schema, OID: c.AllocOID(), TableOID: tableOID, Kinds: kinds, Columns: columns, Exprs: exprs, HasExpr: hasExpr}
 	key := obj.qualifiedKey()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2245,7 +2254,10 @@ func (c *InMemory) StatisticsByOID(oid uint32) (*StatisticsObject, bool) {
 // Returns "" when the object carries an expression target (not reconstructable by
 // this simple-column path). DU-002 slice 314.
 func (c *InMemory) BuildStatisticsObjDef(obj *StatisticsObject) string {
-	if obj == nil || obj.HasExpr {
+	// Decline only when the ON list had an expression target that could not be
+	// captured (HasExpr set but no deparsed Exprs) — reconstructing it would drop
+	// the expression and silently corrupt the object on restore. DU-002 slice 316.
+	if obj == nil || (obj.HasExpr && len(obj.Exprs) == 0) {
 		return ""
 	}
 	schema := obj.Schema
@@ -2275,7 +2287,9 @@ func (c *InMemory) BuildStatisticsObjDef(obj *StatisticsObject) string {
 		}
 	}
 	allEnabled := ndistinct && dependencies && mcv
-	ncolumns := len(obj.Columns)
+	// ncolumns counts both simple columns and expression targets, matching PG's
+	// pg_get_statisticsobj_worker (stxkeys.dim1 + list_length(exprs)).
+	ncolumns := len(obj.Columns) + len(obj.Exprs)
 	// Emit the kinds clause only when some kind is disabled and the object spans
 	// more than one column (a single-column object is an expression-stats object
 	// in PG, where the clause is omitted).
@@ -2303,11 +2317,25 @@ func (c *InMemory) BuildStatisticsObjDef(obj *StatisticsObject) string {
 	}
 
 	sb.WriteString(" ON ")
-	for i, col := range obj.Columns {
-		if i > 0 {
+	// PG emits all simple columns first (in stxkeys order) then all expression
+	// targets, regardless of their original ON-list order; colno spans both lists
+	// for comma separation. Mirrors pg_get_statisticsobj_worker (ruleutils.c).
+	colno := 0
+	for _, col := range obj.Columns {
+		if colno > 0 {
 			sb.WriteString(", ")
 		}
 		sb.WriteString(quoteCollationIdent(col))
+		colno++
+	}
+	for _, e := range obj.Exprs {
+		if colno > 0 {
+			sb.WriteString(", ")
+		}
+		// e is already rendered in its final form (parenthesized when not a bare
+		// function call) by the executor's deparser.
+		sb.WriteString(e)
+		colno++
 	}
 
 	// FROM relation, schema-qualified (pg_dump runs with an empty search_path so

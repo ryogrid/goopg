@@ -916,28 +916,39 @@ func (p *parser) parseCreateStatisticsTail(pos int) (Stmt, error) {
 				p.advance()
 				continue
 			}
-			// Anything else is an expression target. Mark it and skip to the next
-			// comma at paren-depth 0 or to FROM.
+			// Anything else is an expression target. PG's grammar requires
+			// expression statistics elements to be parenthesized (`ON (a + b)`),
+			// so parse it as a full expression and capture the AST so the dump
+			// path (pg_get_statisticsobjdef) can reconstruct it (DU-002 slice 316).
 			stmt.HasExpr = true
-			depth := 0
-			for {
-				t := p.cur()
-				if t.Kind == TokenEOF || (t.Kind == TokenSymbol && t.Value == ";") {
-					return stmt, nil
-				}
-				if t.Kind == TokenSymbol && t.Value == "(" {
-					depth++
-				} else if t.Kind == TokenSymbol && t.Value == ")" {
-					depth--
-				} else if depth == 0 {
-					if t.Kind == TokenSymbol && t.Value == "," {
-						break
+			exprStart := p.idx
+			if expr, err := p.parseExpr(); err == nil {
+				stmt.Exprs = append(stmt.Exprs, expr)
+			} else {
+				// Tolerant fallback: the expression did not parse. Leave Exprs
+				// empty (the dump path then declines to reconstruct) and skip to
+				// the next comma at paren-depth 0 or to FROM.
+				p.idx = exprStart
+				depth := 0
+				for {
+					t := p.cur()
+					if t.Kind == TokenEOF || (t.Kind == TokenSymbol && t.Value == ";") {
+						return stmt, nil
 					}
-					if t.Kind == TokenKeyword && t.Keyword == KwFrom {
-						break
+					if t.Kind == TokenSymbol && t.Value == "(" {
+						depth++
+					} else if t.Kind == TokenSymbol && t.Value == ")" {
+						depth--
+					} else if depth == 0 {
+						if t.Kind == TokenSymbol && t.Value == "," {
+							break
+						}
+						if t.Kind == TokenKeyword && t.Keyword == KwFrom {
+							break
+						}
 					}
+					p.advance()
 				}
-				p.advance()
 			}
 		}
 	}
