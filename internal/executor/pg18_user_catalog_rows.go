@@ -922,7 +922,7 @@ func buildUserPGIndexRow(idx *catalog.Index) Row {
 		NewBoolDatum(idx.Primary),                 // indisprimary
 		NewBoolDatum(false),                       // indisexclusion
 		NewBoolDatum(true),                        // indimmediate
-		NewBoolDatum(false),                       // indisclustered
+		NewBoolDatum(idx.IsClustered),             // indisclustered (DU-002 slice 320)
 		NewBoolDatum(true),                        // indisvalid
 		NewBoolDatum(false),                       // indcheckxmin
 		NewBoolDatum(true),                        // indisready

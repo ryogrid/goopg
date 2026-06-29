@@ -6614,7 +6614,7 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 				want := idx == chosenIdx
 				if idx.IsReplicaIdentity != want {
 					idx.IsReplicaIdentity = want
-					if err := resyncIndexReplicaIdentHeap(o.ctx, idx); err != nil {
+					if err := resyncIndexHeapRow(o.ctx, idx); err != nil {
 						return err
 					}
 				}
@@ -10552,15 +10552,13 @@ func resolveReplicaIdentityIndex(ctx *Context, tbl *catalog.Table, indexName str
 	return idx, nil
 }
 
-// resyncIndexReplicaIdentHeap rewrites idx's pg_index heap row so a flag the
-// in-memory catalog.Index now carries (currently indisreplident) is reflected
-// in the heap that pg_dump / a restarting backend reads. It stamps the existing
-// pg_index row (matching indexrelid == idx.OID) as deleted across the catalog
-// databases, then writes a fresh canonical row — the delete-old-rows + re-sync
-// pattern syncTableToCatalogHeap uses for pg_class. No-op when catalog heap sync
-// is unavailable (the live virtual pg_index already reflects the flag).
-// DU-002 slice 306.
-func resyncIndexReplicaIdentHeap(ctx *Context, idx *catalog.Index) error {
+// resyncIndexHeapRow rewrites the pg_index HEAP row for a single index from its
+// current catalog.Index state (buildUserPGIndexRow). pg_dump reads the pg_index
+// heap, not the live virtual catalog, so any per-index flag mutation done after
+// CREATE INDEX (replica-identity selection, clustering selection) must be
+// flushed through this path or the stale heap row keeps reporting the old value
+// and the corresponding ALTER TABLE clause is silently dropped from the dump.
+func resyncIndexHeapRow(ctx *Context, idx *catalog.Index) error {
 	if !catalogHeapSyncAvailable(ctx) {
 		return nil
 	}

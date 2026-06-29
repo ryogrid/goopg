@@ -2996,6 +2996,37 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create trigger trg_ad: %v", err)
 	}
 
+	// Slice 320: a clustered index must round-trip through pg_dump. pg_dump's
+	// getIndexes selects pg_index.indisclustered and dumpIndex/dumpConstraint
+	// append a trailing `ALTER TABLE <t> CLUSTER ON <idx>;` after the index's
+	// CREATE INDEX / ADD CONSTRAINT when the flag is set (pg_dump.c:18141 /
+	// :18483). Before this slice goopg's pg_index view hardcoded
+	// indisclustered='f' and CLUSTER was a pure no-op, so the clustering
+	// selection was silently dropped from the dump. goopg now records the
+	// selection on the chosen index (catalog.Index.IsClustered), clears it on
+	// the table's other indexes, and re-syncs the pg_index heap row pg_dump
+	// reads. Two surfaces are exercised: a plain secondary index marked via
+	// `CLUSTER <t> USING <idx>` (dumpIndex path) and a PRIMARY KEY constraint
+	// index marked the same way (dumpConstraint path).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.clus_t (a integer PRIMARY KEY, b integer)"); err != nil {
+		t.Fatalf("create table clus_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE INDEX clus_t_b_idx ON public.clus_t (b)"); err != nil {
+		t.Fatalf("create index clus_t_b_idx: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CLUSTER public.clus_t USING clus_t_b_idx"); err != nil {
+		t.Fatalf("cluster clus_t using clus_t_b_idx: %v", err)
+	}
+	// A second table clustered on its PRIMARY KEY index exercises the
+	// dumpConstraint CLUSTER-ON branch (constraint-backed index, not a plain
+	// CREATE INDEX). PG names the PK index <table>_pkey.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.clus_pk (a integer PRIMARY KEY, b integer)"); err != nil {
+		t.Fatalf("create table clus_pk: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CLUSTER public.clus_pk USING clus_pk_pkey"); err != nil {
+		t.Fatalf("cluster clus_pk using clus_pk_pkey: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -6660,6 +6691,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_ad AFTER DELETE ON public.trig_t FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn();") {
 			t.Errorf("pg_dump dropped/mangled the AFTER DELETE statement-level trigger\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 320 (asserted):** a clustered index must round-trip. pg_dump's
+		// getIndexes reads pg_index.indisclustered and dumpIndex/dumpConstraint
+		// append `ALTER TABLE <t> CLUSTER ON <idx>;` (index name unqualified)
+		// after the index's CREATE INDEX / ADD CONSTRAINT when the flag is set
+		// (pg_dump.c:18141 / :18483). Before this slice goopg hardcoded
+		// indisclustered='f' and CLUSTER was a no-op, so the clustering selection
+		// was silently dropped. goopg now records IsClustered on the chosen index
+		// and re-syncs the pg_index heap row. Assert both the plain-index
+		// (dumpIndex) and PRIMARY KEY constraint-index (dumpConstraint) surfaces.
+		if !strings.Contains(res.Stdout, "ALTER TABLE public.clus_t CLUSTER ON clus_t_b_idx;") {
+			t.Errorf("pg_dump dropped the CLUSTER ON for the plain secondary index\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "ALTER TABLE public.clus_pk CLUSTER ON clus_pk_pkey;") {
+			t.Errorf("pg_dump dropped the CLUSTER ON for the PRIMARY KEY constraint index\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must
 		// round-trip. Slice 147 created public.add_one(integer) only as a COMMENT

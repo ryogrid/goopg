@@ -2379,9 +2379,27 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_PgDumpConnectionSetup` (BEFORE INSERT OR UPDATE row-level +
       AFTER DELETE statement-level) PASS vs real pg_dump 18.3. Design
       `0119-0004-trigger-roundtrip.md`.
+      **Slice 320 (loop #42):** clustered-index round-trip — `CLUSTER <t> USING
+      <idx>` selects a table's clustering index (`pg_index.indisclustered`); pg_dump
+      re-emits `ALTER TABLE <t> CLUSTER ON <idx>;` after the index's CREATE INDEX
+      (dumpIndex, pg_dump.c:18141) or constraint ADD CONSTRAINT (dumpConstraint,
+      :18483). goopg's CLUSTER executor was a no-op that ignored USING, and both
+      pg_index builders hardcoded `indisclustered='f'`, so the selection was lost
+      on dump/restore. Fix mirrors REPLICA IDENTITY USING INDEX (slice 306): new
+      `catalog.Index.IsClustered` projected in BOTH pg_index builders (virtual +
+      heap `buildUserPGIndexRow`); `clusterOp.Next()` resolves the named index in
+      IndexesOnTable (42704 if absent), sets the flag + clears the table's other
+      indexes (mark_index_clustered), re-syncing each changed pg_index heap row.
+      `resyncIndexReplicaIdentHeap` renamed `resyncIndexHeapRow` (full-row rewrite,
+      now shared). Dump-fidelity only (no physical reorder); IsClustered defaults
+      false → zero blast radius. Slice 320 in `TestPort_PgDumpConnectionSetup`
+      (plain index = dumpIndex path; PK index = dumpConstraint path) PASS vs real
+      pg_dump 18.3. Design `0119-0004-cluster-roundtrip.md`.
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery (further slices); extended-protocol commit-time deferral
-      (architecturally entangled — extended protocol is auto-commit-per-statement).
+      battery (further slices: GRANT/ACL relacl, CREATE RULE, CREATE POLICY/RLS;
+      richer CLUSTER/ALTER TABLE CLUSTER ON/SET WITHOUT CLUSTER parse+restore);
+      extended-protocol commit-time deferral (architecturally entangled —
+      extended protocol is auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

@@ -9,7 +9,9 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/goopg/goopg/internal/catalog"
 	"github.com/goopg/goopg/internal/lockmgr"
 	"github.com/goopg/goopg/internal/parser"
 	"github.com/goopg/goopg/internal/planner"
@@ -79,7 +81,44 @@ func (o *clusterOp) Next() (TupleSlot, error) {
 				return nil, err
 			}
 		}
+		if o.stmt.IndexName != "" && tbl != nil {
+			// CLUSTER tbl USING idx — mark the chosen index as the table's
+			// clustering index and clear the flag on every other index
+			// (mark_index_clustered, cluster.c). goopg performs no physical
+			// index-ordered heap rewrite, but it must record the selection:
+			// pg_dump re-emits a trailing `ALTER TABLE <t> CLUSTER ON <idx>;`
+			// after the index's CREATE INDEX / ADD CONSTRAINT, keyed on
+			// pg_index.indisclustered (pg_dump.c dumpIndex / dumpConstraint).
+			// The flag lives on the in-memory catalog.Index and in the pg_index
+			// HEAP row pg_dump reads, so each changed index's heap row is
+			// re-synced (mirrors the REPLICA IDENTITY USING INDEX path).
+			// DU-002 slice 320.
+			var chosen *catalog.Index
+			for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+				if strings.EqualFold(idx.Name, o.stmt.IndexName) {
+					chosen = idx
+					break
+				}
+			}
+			if chosen == nil {
+				return nil, &ExecError{
+					Code:    "42704",
+					Pos:     o.stmt.Pos(),
+					Message: fmt.Sprintf("index %q for table %q does not exist", o.stmt.IndexName, tbl.Name),
+				}
+			}
+			for _, idx := range o.ctx.Catalog.IndexesOnTable(tbl) {
+				want := idx == chosen
+				if idx.IsClustered != want {
+					idx.IsClustered = want
+					if err := resyncIndexHeapRow(o.ctx, idx); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
 	}
-	// Table exists — no-op reorder.
+	// Table exists — no physical reorder; the clustering selection (if any)
+	// is recorded above for dump fidelity.
 	return nil, EOF
 }

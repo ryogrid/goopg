@@ -1449,6 +1449,15 @@ type Index struct {
 	// logical replication, so this is round-trip dump fidelity only.
 	// DU-002 slice 306.
 	IsReplicaIdentity bool
+	// IsClustered mirrors pg_index.indisclustered: true when this index was
+	// selected as the table's clustering index via `CLUSTER <t> USING <idx>`
+	// (or `ALTER TABLE <t> CLUSTER ON <idx>`). At most one index per table
+	// carries it (mark_index_clustered clears the others). pg_dump emits a
+	// trailing `ALTER TABLE <t> CLUSTER ON <idx>;` after the index's
+	// CREATE INDEX / ADD CONSTRAINT at index-dump time keyed on this flag
+	// (pg_dump.c dumpIndex / dumpConstraint). goopg performs no physical
+	// heap reorder, so this is round-trip dump fidelity only. DU-002 slice 320.
+	IsClustered bool
 }
 
 // reloptionList returns the index's storage parameters as ordered key=value
@@ -5408,7 +5417,7 @@ func (c *InMemory) registerSystemTables() {
 				boolStr(idx.Primary),             // indisprimary
 				boolStr(idx.IsExclusion),         // indisexclusion
 				"t",                              // indimmediate
-				"f",                              // indisclustered
+				boolStr(idx.IsClustered),         // indisclustered (DU-002 slice 320)
 				"t",                              // indisvalid
 				"f",                              // indcheckxmin
 				"t",                              // indisready

@@ -1,35 +1,37 @@
 (idle — nothing in flight)
 
-Last loop (#41): M0119-0004 **CREATE TRIGGER round-trip in pg_dump** (DU-002
-slice 319) — LANDED. Design `0119-0004-trigger-roundtrip.md`. Real feature gap
-(not a guard): user triggers were silently dropped from pg_dump.
+Last loop (#42): M0119-0004 **clustered-index round-trip in pg_dump** (DU-002
+slice 320) — LANDED, committed. Real feature gap: `CLUSTER <t> USING <idx>` was
+a pure no-op so the clustering selection was silently dropped on dump/restore.
 
-Three gaps fixed (the relhastriggers one was the load-bearing surprise):
-1. `pg_class.relhastriggers` hardcoded `'f'` → pg_dump's getTriggers
-   (pg_dump.c:8523) only adds a table's OID to its tbloids probe array when
-   `tbinfo->hastriggers`; so the table was NEVER queried against pg_trigger.
-   Now projects `'t'` when `len(t.Triggers)>0` in the VIRTUAL pg_class builder
-   (pg_class.VirtualRows, catalog.go ~3758 — the one pg_dump reads, NOT the heap
-   builder; sibling 'f' literals for sequences/views left untouched).
-2. `pg_trigger.VirtualRows` returned nil → now one row/trigger (tgtype bitmask,
-   tgfoid via Routines().LookupByName, tgenabled='O', tgisinternal='f',
-   tgparentid=0).
-3. `pg_get_triggerdef` registered in pg_proc but unimplemented → new
-   `evalFuncCall` case (expr.go) + `buildTriggerDefString` mirroring ruleutils.c
-   pg_get_triggerdef_worker. New `catalog.Trigger.OID` via AllocOID in
-   execCreateTrigger (operators_ddl.go).
+Fix (mirrors REPLICA IDENTITY USING INDEX, slice 306):
+- new `catalog.Index.IsClustered` (catalog.go ~1452), projected `indisclustered`
+  in BOTH pg_index builders: virtual `pgIndexCatalog` (catalog.go ~5411, the one
+  pg_dump's getIndexes reads) + heap `buildUserPGIndexRow`
+  (pg18_user_catalog_rows.go ~925).
+- `clusterOp.Next()` (operators_cluster.go): when `stmt.IndexName != ""`, resolve
+  the named index in `IndexesOnTable(tbl)` (42704 if absent), set IsClustered on
+  it + clear the table's other indexes (mark_index_clustered), re-sync each
+  changed pg_index heap row.
+- `resyncIndexReplicaIdentHeap` → renamed `resyncIndexHeapRow` (full-row rewrite
+  from buildUserPGIndexRow, now shared by replica-ident + cluster paths;
+  operators_ddl.go ~10555).
 
-Files: internal/catalog/catalog.go (Trigger.OID, relhastriggers, pg_trigger
-VirtualRows), internal/executor/operators_ddl.go (AllocOID), internal/executor/
-expr.go (case + buildTriggerDefString), internal/executor/triggerdef_test.go,
-internal/testport/pgdump_connsetup_test.go (slice 319 fixture+assert).
+Dump-fidelity only (no physical heap reorder); IsClustered defaults false → zero
+blast radius. pg_dump emits `ALTER TABLE <t> CLUSTER ON <idx>;` after CREATE INDEX
+(dumpIndex, pg_dump.c:18141) / ADD CONSTRAINT (dumpConstraint, :18483).
 
-Gates: TestBuildTriggerDefString + TestPort_PgDumpConnectionSetup PASS vs real
-pg_dump 18.3; catalog + executor suites PASS; go build clean; pgbench smoke =
-pre-commit hook; ralph-state-guard pending.
+Files: internal/catalog/catalog.go, internal/executor/pg18_user_catalog_rows.go,
+internal/executor/operators_cluster.go, internal/executor/operators_ddl.go
+(rename), internal/testport/pgdump_connsetup_test.go (slice 320 fixture+assert),
+docs/design/0119-0004-cluster-roundtrip.md (+README index 0119-0004w).
 
-NEXT loop — next pg_dump getter-battery gap. Uncovered features found this loop
-(grep of pgdump_connsetup_test.go): CREATE RULE (pg_rewrite/pg_get_ruledef),
-GRANT/ACL (relacl), CREATE POLICY / ROW LEVEL SECURITY (pg_policy), CLUSTER ON
-(pg_index.indisclustered). Pick one as a real feature gap. Richer trigger forms
-(WHEN/REFERENCING/UPDATE OF/CONSTRAINT) need parser+catalog fields first.
+Gates: DU-002 slice 320 in TestPort_PgDumpConnectionSetup (plain index=dumpIndex
+path + PK index=dumpConstraint path) PASS vs real pg_dump 18.3 (~4.5s);
+internal/catalog + internal/executor suites PASS; go build clean; pgbench smoke =
+pre-commit hook; ralph-state-guard OK.
+
+NEXT loop — next pg_dump getter-battery gap (uncovered, real feature gaps):
+GRANT/ACL (relacl + dumpACL), CREATE RULE (pg_rewrite/pg_get_ruledef),
+CREATE POLICY / ROW LEVEL SECURITY (pg_policy). Richer CLUSTER forms
+(ALTER TABLE CLUSTER ON / SET WITHOUT CLUSTER) need parser support first.
