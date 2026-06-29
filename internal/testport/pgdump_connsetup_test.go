@@ -3538,6 +3538,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant usage on gowgo_seq to seq_wgo_role with grant option: %v", err)
 	}
 
+	// Slice 350: a sequence GRANT followed by a partial REVOKE must round-trip,
+	// the sequence analogue of the table partial-REVOKE slice 338 and the schema
+	// partial-REVOKE slice 339. A sequence exposes three privileges
+	// (USAGE/SELECT/UPDATE), so `GRANT USAGE, SELECT ON SEQUENCE` then `REVOKE
+	// SELECT` clears only the SELECT bit, leaving pg_class.relacl as
+	// "{postgres=rwU/postgres,seqrev_role=U/postgres}" (the lone USAGE). pg_dump's
+	// getTables diffs that against acldefault('s', 10) = "{postgres=rwU/postgres}"
+	// and re-emits only `GRANT USAGE ON SEQUENCE public.seqrev_seq TO seqrev_role;`
+	// — NOT the revoked SELECT. Verified byte-identical to real pg_dump 18.3. The
+	// shared REVOKE recorder (tryRecordTableRevoke) already removes the bit from
+	// the sequence's relacl (sequences share the relation ACL store with tables),
+	// so this slice adds only a fixture + assert guarding against a regression
+	// that would let the revoked SELECT survive and over-emit `GRANT SELECT, USAGE`.
+	if err := runSQLSimple(t, c, "CREATE SEQUENCE public.seqrev_seq"); err != nil {
+		t.Fatalf("create sequence seqrev_seq: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE seqrev_role"); err != nil {
+		t.Fatalf("create role seqrev_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE, SELECT ON SEQUENCE public.seqrev_seq TO seqrev_role"); err != nil {
+		t.Fatalf("grant usage,select on seqrev_seq to seqrev_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE SELECT ON SEQUENCE public.seqrev_seq FROM seqrev_role"); err != nil {
+		t.Fatalf("revoke select on seqrev_seq from seqrev_role: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7571,6 +7597,22 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// `GRANT USAGE …;`.
 		if want := "GRANT USAGE ON SEQUENCE public.gowgo_seq TO seq_wgo_role WITH GRANT OPTION;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered the sequence WITH GRANT OPTION: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 350 (asserted):** a sequence GRANT followed by a partial REVOKE
+		// round-trips (the sequence analogue of slices 338/339). `GRANT USAGE, SELECT
+		// ON SEQUENCE … TO seqrev_role` then `REVOKE SELECT …` leaves relacl =
+		// "{postgres=rwU/postgres,seqrev_role=U/postgres}"; pg_dump diffs that against
+		// acldefault('s', 10) and re-emits only `GRANT USAGE ON SEQUENCE
+		// public.seqrev_seq TO seqrev_role;` — NOT the revoked SELECT. Verified
+		// byte-identical to real pg_dump 18.3. A regression that left SELECT in the
+		// relacl would over-emit `GRANT SELECT, USAGE …`.
+		if want := "GRANT USAGE ON SEQUENCE public.seqrev_seq TO seqrev_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the sequence partial REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// The revoked SELECT must NOT reappear (relacl must carry only USAGE for the
+		// grantee). pg_dump would render a surviving SELECT as `GRANT SELECT, USAGE`.
+		if notWant := "GRANT SELECT, USAGE ON SEQUENCE public.seqrev_seq TO seqrev_role;"; strings.Contains(res.Stdout, notWant) {
+			t.Errorf("pg_dump over-emitted the revoked SELECT on seqrev_seq: unexpected %q\n  full stdout=%q", notWant, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

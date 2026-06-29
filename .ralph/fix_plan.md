@@ -2845,6 +2845,26 @@ documentation-only and is exempt from the design-doc requirement.)
       byte-identical vs real pg_dump 18.3) PASS; catalog+server+initdb suites PASS; build
       clean. Still open under M0119-0004: column-level (`attacl`, heap re-sync) / database
       (`datacl`, `--create`-only) GRANT projection; extended-protocol commit-time deferral.
+
+      **2026-06-30 (loop #75, design 0119-0004-sequence-revoke-relacl-pgdump, DU-002
+      slice 350):** sequence partial REVOKE round-trip — the sequence analogue of the
+      table partial-REVOKE slice 338 / schema partial-REVOKE slice 339, and the REVOKE
+      counterpart of the sequence GRANT slices 333/349. A sequence exposes three
+      privileges (USAGE/SELECT/UPDATE), so `GRANT USAGE, SELECT ON SEQUENCE
+      public.seqrev_seq TO seqrev_role` then `REVOKE SELECT …` clears only the SELECT
+      bit, leaving relacl = `{postgres=rwU/postgres,seqrev_role=U/postgres}`; pg_dump's
+      getTables diffs against `acldefault('s', relowner)` = `{postgres=rwU/postgres}` and
+      re-emits only `GRANT USAGE ON SEQUENCE public.seqrev_seq TO seqrev_role;` — NOT the
+      revoked SELECT (verified byte-identical vs real pg_dump 18.3, relacl confirmed on
+      live PG 18.3). Test-only — NO engine change: the shared REVOKE recorder
+      `tryRecordTableRevoke` (slice 338) already clears the named bits from a sequence's
+      relacl (sequences share the OID-keyed relation ACL store with tables) and the
+      diff/render pipeline is object-type-agnostic for the `s` relkind. Adds fixture +
+      assert (incl. the negative: no `GRANT SELECT, USAGE …` over-emit) to the cumulative
+      `TestPort_PgDumpConnectionSetup` guard. Gates: connsetup slice 350 PASS; build
+      clean; pgbench smoke = pre-commit. Still open under M0119-0004: column-level
+      (`attacl`, heap re-sync) / database (`datacl`, `--create`-only) GRANT projection;
+      extended-protocol commit-time deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
