@@ -2068,6 +2068,18 @@ documentation-only and is exempt from the design-doc requirement.)
 - [ ] **M0119-0004 — pg_dump 002–010 TAP** (source: M0110-0001; see M0110
       section). Schema dump, dump/restore round-trip, parallel, filter-file,
       connstr — advance the catalog-view parity battery slice-by-slice.
+      **2026-06-29 (loop #14, design 0119-0004): NULLS-NOT-DISTINCT *enforcement*
+      sub-feature LANDED** (one of the two general SQL-engine gaps the triage
+      surfaced under this task). Runtime `NULLS NOT DISTINCT` uniqueness is now
+      enforced for plain INSERT/UPDATE — `checkUniqueIndexes{ForInsert,ForUpdate}`
+      fall back to a heap scan (`checkNullsNotDistinctViaHeapScan`) when a key
+      column is NULL on an `idx.NullsNotDistinct` index, raising 23505 for a
+      duplicate NULL pattern; btree/scan-probe/codec untouched, gated dead-code
+      for every non-NND index. Tests `internal/executor/nulls_not_distinct_test.go`.
+      **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
+      battery; the **deferred-constraint-checking-at-COMMIT** engine gap; and the
+      NND **ON CONFLICT/upsert** + **CREATE UNIQUE INDEX build** follow-ups
+      (ledger 2026-06-29).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

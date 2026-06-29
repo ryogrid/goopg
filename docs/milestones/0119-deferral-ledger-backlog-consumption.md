@@ -97,6 +97,11 @@ Added per task as work begins — **created and reviewed by the agent that picks
 the task, not pre-created in this milestone**. The triage task (M0119-0001) is
 documentation-only and is exempt from the design-doc requirement.
 
+- `docs/design/0119-0004-nulls-not-distinct-enforcement.md` (M0119-0004) —
+  `NULLS NOT DISTINCT` uniqueness enforcement at INSERT/UPDATE. Reviewed by an
+  agent before implementation (heap-scan fallback; upsert/CREATE-INDEX surfaces
+  deferred to a follow-up). Landed 2026-06-29 (loop #14).
+
 ## PostgreSQL References
 
 Per-task: cite the upstream file mirrored for each consumed deferral in that

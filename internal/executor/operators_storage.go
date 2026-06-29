@@ -6223,6 +6223,184 @@ func encodeExprIndexKey(ctx *Context, idx *catalog.Index, tbl *catalog.Table, ro
 	return out
 }
 
+// rowHasNullKeyColumn reports whether any of idx's key columns is NULL in the
+// candidate (cols/row). Gates the NULLS-NOT-DISTINCT heap-scan check: the normal
+// btree path already enforces uniqueness when every key column is non-NULL, so
+// the heap scan is needed only when a key column is actually NULL. Expression
+// key columns (idx.Columns[i]=="") never match a real column name and so do not
+// count as NULL here (NND on expression indexes is out of scope — design
+// 0119-0004 §2.1). Design 0119-0004.
+func rowHasNullKeyColumn(idx *catalog.Index, cols []catalog.Column, row Row) bool {
+	for _, idxColName := range idx.Columns {
+		if idxColName == "" {
+			continue
+		}
+		for i := range cols {
+			if strings.EqualFold(cols[i].Name, idxColName) && i < len(row) {
+				if row[i].IsNull() {
+					return true
+				}
+				break
+			}
+		}
+	}
+	return false
+}
+
+// nndDetail builds the 23505 DETAIL for a NULLS-NOT-DISTINCT conflict, rendering
+// a NULL key column as the literal `null` (PostgreSQL prints
+// `Key (a)=(null) already exists.`). Datum.Format() returns "" for KindNull, so
+// NULL columns are mapped explicitly rather than via Format(). Design 0119-0004.
+func nndDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
+	colNames := make([]string, 0, len(idx.Columns))
+	colVals := make([]string, 0, len(idx.Columns))
+	for _, idxCol := range idx.Columns {
+		colNames = append(colNames, idxCol)
+		val := "null"
+		for i, col := range cols {
+			if strings.EqualFold(col.Name, idxCol) && i < len(row) {
+				if !row[i].IsNull() {
+					val = row[i].Format()
+				}
+				break
+			}
+		}
+		colVals = append(colVals, val)
+	}
+	return fmt.Sprintf("Key (%s)=(%s) already exists.",
+		strings.Join(colNames, ", "), strings.Join(colVals, ", "))
+}
+
+// checkNullsNotDistinctViaHeapScan enforces NULLS NOT DISTINCT uniqueness for a
+// candidate row that has one or more NULL key columns on an NND index. Such rows
+// are never stored in the btree (encodeIndexKeyFromCols returns nil), so the
+// collision cannot be found by a btree probe; instead this seq-scans the heap
+// for a live tuple whose index-key columns match the candidate's NULL pattern
+// and non-NULL values exactly — NULL equals NULL, and a non-NULL column compares
+// byte-equal under the column's index encoding (encodeBTreeKeyForColumn), so the
+// comparison matches what the btree would consider equal. Returns the first
+// matching tuple's ItemPointer and true. The ItemPointer is surfaced for the
+// ON CONFLICT follow-up slice (design 0119-0004 §2.1); the plain INSERT/UPDATE
+// callers only consume the boolean. Mirrors the heap-scan pattern of
+// checkGistOverlapExclusion. Design 0119-0004.
+func checkNullsNotDistinctViaHeapScan(ctx *Context, tbl *catalog.Table, idx *catalog.Index, cols []catalog.Column, row Row, rel storage.RelFileNode) (storage.ItemPointer, bool) {
+	// Resolve, per index key column: the candidate NULL-ness / encoded key and
+	// the tbl.Columns ordinal used to read the decoded existing row.
+	type nndKeyCol struct {
+		tblOrd   int
+		col      *catalog.Column
+		candNull bool
+		candKey  []byte // encoded candidate key (nil when candNull)
+	}
+	keyCols := make([]nndKeyCol, 0, len(idx.Columns))
+	for _, idxColName := range idx.Columns {
+		if idxColName == "" {
+			return storage.ItemPointer{}, false // expression NND index — out of scope
+		}
+		var candVal Datum
+		foundCand := false
+		for i := range cols {
+			if strings.EqualFold(cols[i].Name, idxColName) && i < len(row) {
+				candVal = row[i]
+				foundCand = true
+				break
+			}
+		}
+		tblOrd := -1
+		var col *catalog.Column
+		for j := range tbl.Columns {
+			if strings.EqualFold(tbl.Columns[j].Name, idxColName) {
+				tblOrd = j
+				col = &tbl.Columns[j]
+				break
+			}
+		}
+		if !foundCand || tblOrd < 0 || col == nil {
+			return storage.ItemPointer{}, false
+		}
+		kc := nndKeyCol{tblOrd: tblOrd, col: col, candNull: candVal.IsNull()}
+		if !kc.candNull {
+			enc, eerr := encodeBTreeKeyForColumn(candVal, col, 0)
+			if eerr != nil {
+				return storage.ItemPointer{}, false
+			}
+			kc.candKey = enc
+		}
+		keyCols = append(keyCols, kc)
+	}
+
+	nBlocks, err := ctx.Pool.NBlocks(rel)
+	if err != nil {
+		return storage.ItemPointer{}, false
+	}
+	decRow := make(Row, len(tbl.Columns))
+	for b := storage.BlockNumber(0); b < nBlocks; b++ {
+		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: b})
+		if perr != nil {
+			continue
+		}
+		s.RLock()
+		page := s.Page()
+		if storage.IsNew(page) {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		count, cerr := storage.PageLinePointerCount(page)
+		if cerr != nil {
+			s.RUnlock()
+			ctx.Pool.Unpin(s)
+			continue
+		}
+		for slotIdx := uint16(1); slotIdx <= uint16(count); slotIdx++ {
+			tup, terr := storage.PageGetHeapTuple(page, slotIdx)
+			if terr != nil {
+				continue
+			}
+			if !isLiveForUniqueCheck(ctx, tup.Header.Xmin, tup.Header.Xmax) {
+				continue
+			}
+			storedNatts := int(tup.Header.Infomask2 & 0x07FF)
+			if decErr := DecodeRowIntoMctxPGTuple(decRow, tbl.Columns, tup.Data, tup.Bitmap, storedNatts, nil); decErr != nil {
+				continue
+			}
+			match := true
+			for _, kc := range keyCols {
+				if kc.tblOrd >= len(decRow) {
+					match = false
+					break
+				}
+				existVal := decRow[kc.tblOrd]
+				if kc.candNull {
+					if !existVal.IsNull() {
+						match = false
+						break
+					}
+					continue
+				}
+				if existVal.IsNull() {
+					match = false
+					break
+				}
+				existKey, eerr := encodeBTreeKeyForColumn(existVal, kc.col, 0)
+				if eerr != nil || !bytes.Equal(existKey, kc.candKey) {
+					match = false
+					break
+				}
+			}
+			if match {
+				ptr := storage.ItemPointer{Block: b, Offset: slotIdx}
+				s.RUnlock()
+				ctx.Pool.Unpin(s)
+				return ptr, true
+			}
+		}
+		s.RUnlock()
+		ctx.Pool.Unpin(s)
+	}
+	return storage.ItemPointer{}, false
+}
+
 // checkUniqueIndexesForInsert enforces unique-constraint violations at INSERT
 // time. For each unique/primary btree index on `tbl`, it computes the
 // candidate key from `row` and probes the index for a matching live entry.
@@ -6258,6 +6436,23 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 		}
 		key, err := encodeIndexKeyFromCols(idx, cols, row, ctx.Catalog)
 		if err != nil || key == nil {
+			// NULLS NOT DISTINCT: a candidate row with NULL key column(s) has no
+			// btree key (encodeIndexKeyFromCols returns nil) and is never stored
+			// in the index, yet under NND such NULLs collide with an existing
+			// NULL-keyed row. Fall back to a heap scan to detect that collision.
+			// Gated on idx.NullsNotDistinct + an actual NULL key column so every
+			// non-NND index and every non-NULL reason for a nil key (expression
+			// column, arity mismatch) keeps the existing skip. Design 0119-0004.
+			if err == nil && idx.NullsNotDistinct && rowHasNullKeyColumn(idx, cols, row) {
+				if _, found := checkNullsNotDistinctViaHeapScan(ctx, tbl, idx, cols, row, rel); found {
+					return &ExecError{
+						Code:    "23505",
+						Pos:     pos,
+						Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idx.Name),
+						Detail:  nndDetail(idx, cols, row),
+					}
+				}
+			}
 			continue
 		}
 		detail := buildUniqueConstraintDetail(idx, cols, row)
@@ -6326,6 +6521,22 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 		}
 		key, err := encodeIndexKeyFromCols(idx, cols, newRow, ctx.Catalog)
 		if err != nil || key == nil {
+			// NULLS NOT DISTINCT: new version has NULL key column(s). The old
+			// version was already stamped xmax = effectiveWriterXID before this
+			// check (operators_storage.go old-tuple stamp sites), so
+			// isLiveForUniqueCheck classifies it as dead and the heap scan skips
+			// it — a no-key-change NULL→NULL UPDATE never self-conflicts.
+			// Design 0119-0004.
+			if err == nil && idx.NullsNotDistinct && rowHasNullKeyColumn(idx, cols, newRow) {
+				if _, found := checkNullsNotDistinctViaHeapScan(ctx, tbl, idx, cols, newRow, rel); found {
+					return &ExecError{
+						Code:    "23505",
+						Pos:     pos,
+						Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idx.Name),
+						Detail:  nndDetail(idx, cols, newRow),
+					}
+				}
+			}
 			continue
 		}
 		detail := buildUniqueConstraintDetail(idx, cols, newRow)
