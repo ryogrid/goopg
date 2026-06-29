@@ -74,6 +74,18 @@ func (s *Server) handleQuery(ctx context.Context, r *protocol.FrameReader, w *pr
 		return w.WriteReadyForQuery(protocol.TxStatusIdle)
 	}
 
+	// A single-statement, autocommit REVOKE is recorded symmetrically so the
+	// materialized relacl drops the revoked privileges and pg_dump re-emits only
+	// what remains (DU-002 slice 338). Like GRANT it is left to the executor's
+	// no-op path inside an explicit transaction.
+	if strings.HasPrefix(upper, "REVOKE ") && (connTx == nil || !connTx.InExplicit()) {
+		s.tryRecordTableRevoke(matchable)
+		if err := w.WriteCommandComplete("REVOKE"); err != nil {
+			return err
+		}
+		return w.WriteReadyForQuery(protocol.TxStatusIdle)
+	}
+
 	switch {
 	case upper == "SHOW ALL":
 		return s.handleShowAll(w, sess)

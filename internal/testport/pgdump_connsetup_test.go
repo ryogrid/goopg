@@ -3278,6 +3278,28 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant select on grant_mc to MixedCase: %v", err)
 	}
 
+	// Slice 338: a GRANT followed by a partial REVOKE must round-trip. PostgreSQL
+	// REVOKE clears the named bits from the grantee's aclitem mask: GRANT SELECT,
+	// INSERT then REVOKE INSERT leaves pg_class.relacl as `grantee=r/postgres`
+	// (the lone SELECT), and pg_dump's buildACLCommands diffs that against
+	// acldefault and re-emits only `GRANT SELECT ON TABLE public.revoke_t TO
+	// revoke_role;` — NOT the revoked INSERT. goopg previously treated REVOKE as a
+	// pure no-op, so the relacl still carried INSERT and the dump over-emitted
+	// `GRANT INSERT, SELECT`. The REVOKE recorder (tryRecordTableRevoke) now
+	// removes the bit so the materialized relacl reflects only what remains.
+	if err := runSQLSimple(t, c, "CREATE ROLE revoke_role"); err != nil {
+		t.Fatalf("create role revoke_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.revoke_t (a integer)"); err != nil {
+		t.Fatalf("create table revoke_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT, INSERT ON TABLE public.revoke_t TO revoke_role"); err != nil {
+		t.Fatalf("grant select,insert on revoke_t to revoke_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE INSERT ON TABLE public.revoke_t FROM revoke_role"); err != nil {
+		t.Fatalf("revoke insert on revoke_t from revoke_role: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7142,6 +7164,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// to real pg_dump 18.3.
 		if want := `GRANT SELECT ON TABLE public.grant_mc TO "MixedCase";`; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered mixed-case-role GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 338 (asserted):** a GRANT … then partial REVOKE round-trips.
+		// GRANT SELECT, INSERT then REVOKE INSERT leaves relacl as
+		// revoke_role=r/postgres, so pg_dump re-emits only the surviving SELECT
+		// grant — NOT the revoked INSERT. goopg's REVOKE recorder now clears the
+		// privilege bit; previously REVOKE was a no-op and the dump over-emitted
+		// the INSERT. Verified byte-identical to real pg_dump 18.3.
+		if want := "GRANT SELECT ON TABLE public.revoke_t TO revoke_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the surviving SELECT grant after REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if bad := "INSERT ON TABLE public.revoke_t TO revoke_role"; strings.Contains(res.Stdout, bad) {
+			t.Errorf("pg_dump re-emitted the REVOKEd INSERT grant: unexpected %q\n  full stdout=%q", bad, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

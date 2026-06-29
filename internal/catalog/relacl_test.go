@@ -278,6 +278,59 @@ func TestRelaclTextMixedCaseGrantee(t *testing.T) {
 	}
 }
 
+// TestRevokeTablePrivilege pins the REVOKE recording that lets a GRANT followed
+// by a partial REVOKE round-trip through pg_dump (DU-002 slice 338). Revoking
+// one privilege of a multi-privilege grantee leaves the remaining letters; once
+// the grantee's set is empty its aclitem disappears, and once no grantees remain
+// the relacl falls back to NULL (matching acldefault, so pg_dump emits nothing).
+func TestRevokeTablePrivilege(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16900
+
+	// GRANT SELECT, INSERT → grantee carries both letters ("ar").
+	c.GrantTablePrivilege(relOID, "grantee_role", "SELECT")
+	c.GrantTablePrivilege(relOID, "grantee_role", "INSERT")
+	want := "{postgres=arwdDxtm/postgres,grantee_role=ar/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after GRANT SELECT,INSERT = %q; want %q", got, want)
+	}
+
+	// REVOKE INSERT drops 'a', leaving the lone SELECT ('r').
+	c.RevokeTablePrivilege(relOID, "grantee_role", "INSERT")
+	want = "{postgres=arwdDxtm/postgres,grantee_role=r/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after REVOKE INSERT = %q; want %q", got, want)
+	}
+	if c.HasTablePrivilege(relOID, "grantee_role", "INSERT") {
+		t.Fatalf("HasTablePrivilege(INSERT) after REVOKE = true; want false")
+	}
+	if !c.HasTablePrivilege(relOID, "grantee_role", "SELECT") {
+		t.Fatalf("HasTablePrivilege(SELECT) after REVOKE INSERT = false; want true")
+	}
+
+	// Revoking a privilege the role never held is a no-op (DELETE was never
+	// granted) — the relacl is unchanged.
+	c.RevokeTablePrivilege(relOID, "grantee_role", "DELETE")
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after no-op REVOKE = %q; want %q", got, want)
+	}
+
+	// REVOKE the last remaining privilege drops the grantee entry entirely, and
+	// with no grantees left the relacl returns to NULL.
+	c.RevokeTablePrivilege(relOID, "grantee_role", "SELECT")
+	if got := relaclText(c, relOID); got != "" {
+		t.Fatalf("relacl after REVOKE of last priv = %q; want \"\" (NULL)", got)
+	}
+
+	// A case-insensitive grantee resolves through the revoke too: GRANT under the
+	// original case, REVOKE under a different case removes it.
+	c.GrantTablePrivilege(relOID, "MixedCase", "SELECT")
+	c.RevokeTablePrivilege(relOID, "MIXEDCASE", "SELECT")
+	if got := relaclText(c, relOID); got != "" {
+		t.Fatalf("relacl after case-insensitive REVOKE = %q; want \"\" (NULL)", got)
+	}
+}
+
 // TestACLQuoteName unit-checks the putid emulation directly, including the
 // double-quote-doubling and multibyte (high-bit) cases that are awkward to drive
 // through a full GRANT.

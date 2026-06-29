@@ -1754,6 +1754,13 @@ type Catalog interface {
 	// letter with a trailing `*` and pg_dump re-emits the WITH GRANT OPTION
 	// clause. DU-002 slice 332.
 	GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv string, withGrantOption bool)
+	// RevokeTablePrivilege removes a single privilege (priv, upper-cased keyword)
+	// for role on relOID from the ACL store. When the role's privilege set
+	// becomes empty its entry is dropped entirely, so the materialized relacl no
+	// longer lists that grantee — matching PostgreSQL, which removes an aclitem
+	// once its mask is empty and lets the relacl fall back to the owner default.
+	// A revoke of a privilege the role never held is a no-op. DU-002 slice 338.
+	RevokeTablePrivilege(relOID uint32, role, priv string)
 	// HasTablePrivilege reports whether role was granted priv on relOID.
 	HasTablePrivilege(relOID uint32, role, priv string) bool
 	// DropTableACL forgets all privileges recorded for relOID (called when the
@@ -8391,6 +8398,39 @@ func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv 
 		byRole[role] = privs
 	}
 	privs[priv] = privs[priv] || withGrantOption
+}
+
+// RevokeTablePrivilege removes priv for role on relOID. If the role's privilege
+// set becomes empty its entry is dropped (so relaclTextLockedFor no longer
+// emits that grantee), and if the relation has no grantees left the whole entry
+// is removed (relacl returns to NULL, matching acldefault → pg_dump emits
+// nothing). A revoke of a privilege never held is a no-op. The grantee's
+// display-case override is intentionally retained: it is keyed by lower-cased
+// role and consulted only when that role still appears in some relacl, so a
+// stale entry is harmless and a later re-GRANT reuses it. DU-002 slice 338.
+func (c *InMemory) RevokeTablePrivilege(relOID uint32, role, priv string) {
+	role = strings.ToLower(strings.TrimSpace(role))
+	priv = strings.ToUpper(strings.TrimSpace(priv))
+	if role == "" || priv == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	byRole := c.tableACLs[relOID]
+	if byRole == nil {
+		return
+	}
+	privs := byRole[role]
+	if privs == nil {
+		return
+	}
+	delete(privs, priv)
+	if len(privs) == 0 {
+		delete(byRole, role)
+	}
+	if len(byRole) == 0 {
+		delete(c.tableACLs, relOID)
+	}
 }
 
 // HasTablePrivilege reports whether role was granted priv on relOID. M0118-0008.

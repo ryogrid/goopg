@@ -137,6 +137,83 @@ func (s *Server) tryRecordTableGrant(stmt string) {
 	}
 }
 
+// tryRecordTableRevoke parses an autocommit table/sequence-level REVOKE and
+// removes the named privileges from the catalog ACL store, mirroring
+// tryRecordTableGrant. Like the grant recorder it is best-effort: any form it
+// does not recognise (column-level, ON SCHEMA/DATABASE/FUNCTION/…, role
+// membership, REVOKE GRANT OPTION FOR) simply returns, leaving the statement as
+// a successful no-op. Recording the revoke keeps the materialized relacl in
+// sync so pg_dump re-emits only the privileges that actually remain. DU-002
+// slice 338.
+func (s *Server) tryRecordTableRevoke(stmt string) {
+	if s.cfg.Catalog == nil {
+		return
+	}
+	lower := strings.ToLower(stmt)
+	if !strings.HasPrefix(lower, "revoke ") {
+		return
+	}
+	onIdx := strings.Index(lower, " on ")
+	fromIdx := strings.LastIndex(lower, " from ")
+	if onIdx < 0 || fromIdx < 0 || fromIdx <= onIdx {
+		return
+	}
+	privPart := strings.TrimSpace(stmt[len("revoke "):onIdx])
+	objPart := strings.TrimSpace(stmt[onIdx+len(" on ") : fromIdx])
+	rolePart := strings.TrimSpace(stmt[fromIdx+len(" from "):])
+	if strings.ContainsRune(privPart, '(') {
+		return // column-level revoke
+	}
+	// We do not model REVOKE GRANT OPTION FOR (it only clears the grant-option
+	// flag, not the privilege); leave such a form to the no-op path.
+	if strings.HasPrefix(strings.ToLower(privPart), "grant option for") {
+		return
+	}
+	// Strip a trailing CASCADE / RESTRICT drop-behaviour keyword from the role
+	// list (REVOKE … FROM <roles> [CASCADE|RESTRICT]).
+	if i := strings.LastIndex(strings.ToLower(rolePart), " cascade"); i >= 0 {
+		rolePart = strings.TrimSpace(rolePart[:i])
+	} else if i := strings.LastIndex(strings.ToLower(rolePart), " restrict"); i >= 0 {
+		rolePart = strings.TrimSpace(rolePart[:i])
+	}
+
+	isSequence := false
+	if rest, ok := cutLeadingKeyword(objPart, "table"); ok {
+		objPart = rest
+	} else if rest, ok := cutLeadingKeyword(objPart, "sequence"); ok {
+		objPart = rest
+		isSequence = true
+	}
+	// Only table/sequence relacl is modelled here; bail on every other object
+	// class (ON SCHEMA/DATABASE/FUNCTION/…), matching the grant recorder's scope.
+	if _, isNonTable := nonTableGrantObjects[firstWordLower(objPart)]; isNonTable {
+		return
+	}
+
+	allPrivs := allTablePrivileges
+	if isSequence {
+		allPrivs = allSequencePrivileges
+	}
+	privs := parseGrantPrivileges(privPart, allPrivs)
+	if len(privs) == 0 {
+		return
+	}
+	tables := splitGrantList(objPart)
+	roles := splitGrantList(rolePart)
+	for _, t := range tables {
+		on := objectNameFromIdent(t)
+		tbl, ok := s.cfg.Catalog.LookupTable(on)
+		if !ok {
+			continue
+		}
+		for _, role := range roles {
+			for _, p := range privs {
+				s.cfg.Catalog.RevokeTablePrivilege(tbl.OID, role, p)
+			}
+		}
+	}
+}
+
 // recordSchemaGrant records a `GRANT <privs> ON SCHEMA <names> TO <roles>` in
 // the catalog ACL store, keyed by each schema's pg_namespace OID. Unknown
 // schemas and an empty/unparseable privilege list are skipped, leaving the

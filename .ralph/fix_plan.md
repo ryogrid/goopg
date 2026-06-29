@@ -2644,6 +2644,31 @@ documentation-only and is exempt from the design-doc requirement.)
       "MixedCase"`; byte-identical vs real pg_dump 18.3) PASS. Still open:
       column-level (`pg_attribute.attacl`, heap re-sync)/database (`datacl`, needs
       `--create`) GRANT, REVOKE-of-default modelling.
+      **2026-06-30 (loop #62, design 0119-0004-revoke-relacl-pgdump, DU-002 slice
+      338):** `GRANT … then partial REVOKE` round-trips. A `GRANT SELECT, INSERT …
+      TO revoke_role` then `REVOKE INSERT … FROM revoke_role` leaves
+      `pg_class.relacl` as `revoke_role=r/postgres` (lone SELECT), and pg_dump's
+      `buildACLCommands` diffs vs `acldefault` → re-emits only `GRANT SELECT ON
+      TABLE public.revoke_t TO revoke_role;`. goopg treated REVOKE as a pure no-op,
+      so the GRANT recorder's `ar` survived and the dump over-emitted the revoked
+      INSERT (silent ACL drift on restore). Fix: catalog new
+      `RevokeTablePrivilege(relOID, role, priv)` (removes the bit; drops the
+      grantee entry when its set empties, the whole relOID entry when no grantees
+      remain → relacl back to NULL; no-op for a never-held priv; retains the
+      slice-337 `roleACLDisplay` case override). server new `tryRecordTableRevoke`
+      mirrors `tryRecordTableGrant` (parses `REVOKE <privs> ON [TABLE|SEQUENCE]
+      <objs> FROM <roles> [CASCADE|RESTRICT]`, shares
+      `parseGrantPrivileges`/`splitGrantList`/`nonTableGrantObjects`; bails on
+      column-level/`GRANT OPTION FOR`/non-table classes). dispatch intercepts a
+      single-statement autocommit REVOKE symmetric with GRANT (record →
+      CommandComplete("REVOKE")); explicit-txn REVOKE still falls through to the
+      executor no-op. Zero blast radius (only ever removes bits → enforcement can
+      only become more correct; GRANT-with-no-REVOKE renders byte-identically to
+      331–337). Tests `TestRevokeTablePrivilege` + slice-338
+      `TestPort_PgDumpConnectionSetup` (emits the surviving SELECT, NOT the revoked
+      INSERT; byte-identical vs real pg_dump 18.3) PASS. Still open: column-level
+      (`pg_attribute.attacl`, heap re-sync)/database (`datacl`, needs `--create`)
+      GRANT, REVOKE-of-default (owner-side implicit-privilege) modelling.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
