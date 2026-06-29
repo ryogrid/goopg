@@ -2319,10 +2319,23 @@ documentation-only and is exempt from the design-doc requirement.)
       ` WHERE (pred)` after the operator/INCLUDE list and before DEFERRABLE
       (mirroring `pg_get_indexdef_worker`, ruleutils.c:1564). pg_dump re-emits
       `ADD CONSTRAINT pex_excl EXCLUDE USING btree (a WITH =) WHERE (b > 0);`.
-      Design `0119-0004-partial-exclude-where-roundtrip.md`. **Still open under
-      M0119-0004:** the pg_dump 002–010 catalog-view parity battery (further
-      slices); extended-protocol commit-time deferral (architecturally entangled —
-      extended protocol is auto-commit-per-statement).
+      Design `0119-0004-partial-exclude-where-roundtrip.md`. **Slice 314 (loop #35):**
+      CREATE STATISTICS round-trip — pg_dump's `dumpStatisticsExt` selects
+      `pg_get_statisticsobjdef(oid)`, but goopg's parser discarded the `(kinds)`
+      clause AND the `ON` column list, `catalog.StatisticsObject` carried neither,
+      and `pg_get_statisticsobjdef` was unimplemented (NULL) — so the object was
+      silently dropped from the dump. Threaded `Kinds`/`Columns`/`HasExpr` through
+      parser→`catalog.StatisticsObject` (`RegisterStatisticsFull`); new
+      `StatisticsByOID` + `BuildStatisticsObjDef` (mirrors ruleutils.c
+      `pg_get_statisticsobj_worker`: kinds clause suppressed when all three enabled
+      or single-column; schema-qualified FROM) + `pg_get_statisticsobjdef(oid)`
+      builtin. Expression statistics flagged + omitted (deparser follow-up). Also
+      fixed a latent `IF NOT EXISTS` parse bug (`acceptIdentKeyword("if")` never
+      matched the keyword token). Design `0119-0004-create-statistics-roundtrip.md`.
+      **Still open under M0119-0004:** expression extended statistics (deparse); the
+      pg_dump 002–010 catalog-view parity battery (further slices); extended-protocol
+      commit-time deferral (architecturally entangled — extended protocol is
+      auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

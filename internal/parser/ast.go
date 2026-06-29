@@ -1760,6 +1760,20 @@ type CreateStatisticsStmt struct {
 	Name        ObjectName // statistics object name (possibly schema-qualified)
 	FromTable   ObjectName // the table the statistics are defined on
 	IfNotExists bool
+	// Kinds holds the explicitly-requested statistics kinds from the optional
+	// `(ndistinct, dependencies, mcv)` clause, lowercased. Empty means the
+	// default (all kinds), matching PG which stores all three when unspecified.
+	// pg_get_statisticsobjdef re-emits the clause only when not all kinds are
+	// enabled. DU-002 slice 314.
+	Kinds []string
+	// Columns holds the simple column names from the `ON a, b` list. Expression
+	// statistics targets are not captured here (HasExpr flags their presence so
+	// the dump path can decline to reconstruct). DU-002 slice 314.
+	Columns []string
+	// HasExpr reports that the ON list contained a non-simple-column target
+	// (an expression), so Columns is incomplete and the object def cannot be
+	// faithfully reconstructed by the simple-column dump path.
+	HasExpr bool
 }
 
 func (s *CreateStatisticsStmt) Pos() int  { return s.pos }

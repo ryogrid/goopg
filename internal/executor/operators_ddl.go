@@ -12379,7 +12379,7 @@ func (o *ddlOp) execCreateStatistics(s *parser.CreateStatisticsStmt) error {
 			schema = "public"
 		}
 	}
-	im.RegisterStatistics(schema, s.Name.Name, tableOID)
+	im.RegisterStatisticsFull(schema, s.Name.Name, tableOID, s.Kinds, s.Columns, s.HasExpr)
 	return nil
 }
 

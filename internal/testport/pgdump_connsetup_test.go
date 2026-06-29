@@ -2925,6 +2925,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create index collidx_c with collation: %v", err)
 	}
 
+	// Slice 314: a CREATE STATISTICS extended-statistics object must round-trip.
+	// pg_dump's dumpStatisticsExt selects pg_get_statisticsobjdef(oid) and emits
+	// the result verbatim (plus a semicolon). Before this slice goopg's parser
+	// discarded the kinds clause AND the ON column list (only name + FROM table
+	// were captured), and pg_get_statisticsobjdef was unimplemented — so the
+	// statistics object was silently dropped from the dump. ruleutils.c
+	// pg_get_statisticsobj_worker suppresses the kinds clause when all three kinds
+	// (ndistinct/dependencies/mcv) are enabled (the default), so a plain
+	// `CREATE STATISTICS … ON a, b FROM t` dumps with no kinds clause; an explicit
+	// single-kind object dumps `(ndistinct)`. goopg now threads Kinds/Columns onto
+	// catalog.StatisticsObject → BuildStatisticsObjDef. Both forms are exercised.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.statext_t (a integer, b integer, c integer)"); err != nil {
+		t.Fatalf("create table statext_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE STATISTICS public.statext_all ON a, b FROM public.statext_t"); err != nil {
+		t.Fatalf("create statistics statext_all: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE STATISTICS public.statext_nd (ndistinct) ON b, c FROM public.statext_t"); err != nil {
+		t.Fatalf("create statistics statext_nd: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:

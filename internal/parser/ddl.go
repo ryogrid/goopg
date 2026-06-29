@@ -846,16 +846,17 @@ func (p *parser) parseCreateRuleTail(pos int) (Stmt, error) {
 }
 
 // parseCreateStatisticsTail parses CREATE STATISTICS after the STATISTICS keyword.
-// Grammar: [IF NOT EXISTS] name [(types)] ON expr_list FROM table_name
-// Only the name and FROM table are extracted; the ON clause is skipped. M0097-0023.
+// Grammar: [IF NOT EXISTS] name [(kinds)] ON expr_list FROM table_name
+// The optional kinds list and the ON column list are captured so pg_dump's
+// pg_get_statisticsobjdef can reconstruct the object. DU-002 slice 314.
 func (p *parser) parseCreateStatisticsTail(pos int) (Stmt, error) {
 	stmt := &CreateStatisticsStmt{pos: pos}
-	// IF NOT EXISTS
-	if p.acceptIdentKeyword("if") {
-		if !p.acceptIdentKeyword("not") {
+	// IF NOT EXISTS (IF/NOT/EXISTS all lex as keyword tokens).
+	if p.acceptKeyword(KwIf) {
+		if !p.acceptKeyword(KwNot) {
 			return p.parseSkipToSemicolon(pos)
 		}
-		if !p.acceptIdentKeyword("exists") {
+		if !p.acceptKeyword(KwExists) {
 			return p.parseSkipToSemicolon(pos)
 		}
 		stmt.IfNotExists = true
@@ -865,23 +866,83 @@ func (p *parser) parseCreateStatisticsTail(pos int) (Stmt, error) {
 		return p.parseSkipToSemicolon(pos)
 	}
 	stmt.Name = name
-	// Skip optional (statistics_kind, ...) type list.
+	// Optional (statistics_kind, ...) type list, e.g. `(ndistinct, mcv)`. Capture
+	// each kind ident (lowercased) so the dump path can re-emit a non-default
+	// kinds clause. A nested non-ident token (unexpected) bails to skip mode.
 	if p.acceptSymbol("(") {
-		depth := 1
-		for depth > 0 {
+		for {
 			tok := p.cur()
 			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+				return stmt, nil
+			}
+			if tok.Kind == TokenSymbol && tok.Value == ")" {
+				p.advance()
 				break
 			}
-			if tok.Kind == TokenSymbol && tok.Value == "(" {
-				depth++
-			} else if tok.Kind == TokenSymbol && tok.Value == ")" {
-				depth--
+			if tok.Kind == TokenIdent || tok.Kind == TokenKeyword {
+				stmt.Kinds = append(stmt.Kinds, strings.ToLower(tok.Value))
+				p.advance()
+			} else if tok.Kind == TokenSymbol && tok.Value == "," {
+				p.advance()
+			} else {
+				// Unexpected token inside the kinds list — fall back to the
+				// tolerant skip-to-FROM path so parsing never hard-fails.
+				p.advance()
 			}
-			p.advance()
 		}
 	}
-	// Skip tokens until FROM keyword.
+	// ON column list. Each target is either a simple column name or an
+	// expression. Capture simple column names; flag any expression so the dump
+	// path knows the column set is incomplete. The list runs until FROM.
+	if p.acceptKeyword(KwOn) {
+		for {
+			tok := p.cur()
+			if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {
+				return stmt, nil
+			}
+			if tok.Kind == TokenKeyword && tok.Keyword == KwFrom {
+				break
+			}
+			if tok.Kind == TokenSymbol && tok.Value == "," {
+				p.advance()
+				continue
+			}
+			// A simple column reference: a bare ident NOT immediately followed by
+			// '(' (which would start a function-call expression) and not '.'
+			// (a qualified reference, treated as an expression target here).
+			if tok.Kind == TokenIdent &&
+				!(p.peek(1).Kind == TokenSymbol && (p.peek(1).Value == "(" || p.peek(1).Value == ".")) {
+				stmt.Columns = append(stmt.Columns, identText(tok))
+				p.advance()
+				continue
+			}
+			// Anything else is an expression target. Mark it and skip to the next
+			// comma at paren-depth 0 or to FROM.
+			stmt.HasExpr = true
+			depth := 0
+			for {
+				t := p.cur()
+				if t.Kind == TokenEOF || (t.Kind == TokenSymbol && t.Value == ";") {
+					return stmt, nil
+				}
+				if t.Kind == TokenSymbol && t.Value == "(" {
+					depth++
+				} else if t.Kind == TokenSymbol && t.Value == ")" {
+					depth--
+				} else if depth == 0 {
+					if t.Kind == TokenSymbol && t.Value == "," {
+						break
+					}
+					if t.Kind == TokenKeyword && t.Keyword == KwFrom {
+						break
+					}
+				}
+				p.advance()
+			}
+		}
+	}
+	// Skip any remaining tokens until FROM keyword (defensive — the ON loop
+	// normally stops exactly at FROM).
 	for {
 		tok := p.cur()
 		if tok.Kind == TokenEOF || (tok.Kind == TokenSymbol && tok.Value == ";") {

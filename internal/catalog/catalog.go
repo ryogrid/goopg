@@ -1922,6 +1922,17 @@ type StatisticsObject struct {
 	Schema   string // schema name (empty = public)
 	OID      uint32
 	TableOID uint32 // stxrelid — the table the statistics are defined on
+	// Kinds holds the explicitly-requested statistics kinds (lowercased:
+	// "ndistinct"/"dependencies"/"mcv"). Empty means the default (all kinds).
+	// pg_get_statisticsobjdef re-emits a kinds clause only when not all are
+	// enabled and the object spans more than one column. DU-002 slice 314.
+	Kinds []string
+	// Columns holds the simple column names from the ON list, in order. Used by
+	// pg_get_statisticsobjdef to reconstruct the ON clause. DU-002 slice 314.
+	Columns []string
+	// HasExpr reports the ON list contained an expression target (not captured),
+	// so Columns is incomplete. DU-002 slice 314.
+	HasExpr bool
 }
 
 // qualifiedKey returns the lowercase schema.name key used in statisticsObjs.
@@ -2166,10 +2177,16 @@ func NewInMemory() *InMemory {
 // If a statistics object with the same schema-qualified name already exists it
 // is overwritten. M0097-0023.
 func (c *InMemory) RegisterStatistics(schema, name string, tableOID uint32) *StatisticsObject {
+	return c.RegisterStatisticsFull(schema, name, tableOID, nil, nil, false)
+}
+
+// RegisterStatisticsFull registers a statistics object carrying its kinds and
+// column list so pg_get_statisticsobjdef can reconstruct the DDL. DU-002 slice 314.
+func (c *InMemory) RegisterStatisticsFull(schema, name string, tableOID uint32, kinds, columns []string, hasExpr bool) *StatisticsObject {
 	if schema == "" {
 		schema = "public"
 	}
-	obj := &StatisticsObject{Name: name, Schema: schema, OID: c.AllocOID(), TableOID: tableOID}
+	obj := &StatisticsObject{Name: name, Schema: schema, OID: c.AllocOID(), TableOID: tableOID, Kinds: kinds, Columns: columns, HasExpr: hasExpr}
 	key := obj.qualifiedKey()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -2205,6 +2222,108 @@ func (c *InMemory) AllStatistics() []*StatisticsObject {
 		out = append(out, obj)
 	}
 	return out
+}
+
+// StatisticsByOID finds a statistics object by its pg_statistic_ext OID. DU-002 slice 314.
+func (c *InMemory) StatisticsByOID(oid uint32) (*StatisticsObject, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, obj := range c.statisticsObjs {
+		if obj.OID == oid {
+			return obj, true
+		}
+	}
+	return nil, false
+}
+
+// BuildStatisticsObjDef reconstructs the CREATE STATISTICS DDL for an extended
+// statistics object, mirroring ruleutils.c pg_get_statisticsobj_worker. pg_dump's
+// dumpStatisticsExt calls pg_get_statisticsobjdef(oid) and emits the result
+// verbatim (plus a trailing semicolon). The kinds clause is suppressed when all
+// three kinds are enabled (the default) or when the object spans a single column;
+// the FROM relation is schema-qualified to match pg_dump's empty search_path.
+// Returns "" when the object carries an expression target (not reconstructable by
+// this simple-column path). DU-002 slice 314.
+func (c *InMemory) BuildStatisticsObjDef(obj *StatisticsObject) string {
+	if obj == nil || obj.HasExpr {
+		return ""
+	}
+	schema := obj.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	var sb strings.Builder
+	sb.WriteString("CREATE STATISTICS ")
+	sb.WriteString(quoteCollationIdent(schema))
+	sb.WriteByte('.')
+	sb.WriteString(quoteCollationIdent(obj.Name))
+
+	// Decode requested kinds. An empty Kinds means the default (all enabled).
+	ndistinct, dependencies, mcv := false, false, false
+	if len(obj.Kinds) == 0 {
+		ndistinct, dependencies, mcv = true, true, true
+	} else {
+		for _, k := range obj.Kinds {
+			switch strings.ToLower(k) {
+			case "ndistinct":
+				ndistinct = true
+			case "dependencies":
+				dependencies = true
+			case "mcv":
+				mcv = true
+			}
+		}
+	}
+	allEnabled := ndistinct && dependencies && mcv
+	ncolumns := len(obj.Columns)
+	// Emit the kinds clause only when some kind is disabled and the object spans
+	// more than one column (a single-column object is an expression-stats object
+	// in PG, where the clause is omitted).
+	if !allEnabled && ncolumns > 1 {
+		sb.WriteString(" (")
+		gotone := false
+		if ndistinct {
+			sb.WriteString("ndistinct")
+			gotone = true
+		}
+		if dependencies {
+			if gotone {
+				sb.WriteString(", ")
+			}
+			sb.WriteString("dependencies")
+			gotone = true
+		}
+		if mcv {
+			if gotone {
+				sb.WriteString(", ")
+			}
+			sb.WriteString("mcv")
+		}
+		sb.WriteByte(')')
+	}
+
+	sb.WriteString(" ON ")
+	for i, col := range obj.Columns {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(quoteCollationIdent(col))
+	}
+
+	// FROM relation, schema-qualified (pg_dump runs with an empty search_path so
+	// generate_relation_name always qualifies).
+	sb.WriteString(" FROM ")
+	relSchema, relName := schema, ""
+	if tbl, ok := c.LookupTableByOID(obj.TableOID); ok {
+		relName = tbl.Name
+		if tbl.Schema != "" {
+			relSchema = tbl.Schema
+		}
+	}
+	sb.WriteString(quoteCollationIdent(relSchema))
+	sb.WriteByte('.')
+	sb.WriteString(quoteCollationIdent(relName))
+	return sb.String()
 }
 
 // SetComment stores a description for an object in pg_description.

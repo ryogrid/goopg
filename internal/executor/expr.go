@@ -7047,6 +7047,35 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 		}
 		return NullDatum, nil
 
+	case "pg_get_statisticsobjdef":
+		// pg_get_statisticsobjdef(oid) → text — reconstructs CREATE STATISTICS DDL.
+		// pg_dump's dumpStatisticsExt emits the result verbatim (plus a semicolon).
+		// DU-002 slice 314.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			if obj, ok := im.StatisticsByOID(targetOID); ok {
+				def := im.BuildStatisticsObjDef(obj)
+				if def == "" {
+					return NullDatum, nil
+				}
+				return NewStringDatum(def), nil
+			}
+		}
+		return NullDatum, nil
+
 	case "pg_get_constraintdef":
 		// pg_get_constraintdef(oid [, pretty bool]) → text
 		// Reconstructs the constraint definition DDL. M0097-0023.
