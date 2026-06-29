@@ -1,23 +1,23 @@
 (idle — nothing in flight)
 
-Last landed: M0119-0004 DU-002 **slice 345** (function-level GRANT
-`pg_proc.proacl` round-trip in pg_dump). The routine analogue of the
-table/schema/sequence GRANT slices. `GRANT EXECUTE ON FUNCTION
-public.grantfn(integer) TO func_grantee` now materializes proacl =
-`{=X/postgres,postgres=X/postgres,func_grantee=X/postgres}` and pg_dump emits
-`GRANT ALL ON FUNCTION public.grantfn(integer) TO func_grantee;`. pg_proc is
-VIRTUAL → pure projection, no heap re-sync. Fix: catalog `functionACLPrivOrder`
-+ `ProcACLText` (reuses `relaclTextLockedFor`); server `recordFunctionGrant`
-(function/procedure/routine branches in `tryRecordTableGrant`, seeds implicit
-PUBLIC EXECUTE, paren-aware `splitFunctionList`); `pg_proc_view.go` projects
-`cat.ProcACLText(r.OID)`. Tests: TestProcACLText (catalog/relacl_test.go) +
-slice-345 fixture/assert in TestPort_PgDumpConnectionSetup. Gates:
-catalog+server+initdb suites + TestPort_PgDumpConnectionSetup PASS; build clean;
-verified vs real PG 18.3 (postgres/local_install). Committed + pushed.
+Last landed: M0119-0004 DU-002 **slice 346** (function-level REVOKE
+`pg_proc.proacl` round-trip in pg_dump). The routine REVOKE analogue of the
+table REVOKE slices (338+); the follow-up slice 345 deferred. `REVOKE EXECUTE
+ON FUNCTION public.revokefn(integer) FROM PUBLIC` now materializes proacl =
+`{postgres=X/postgres}` and pg_dump emits `REVOKE ALL ON FUNCTION
+public.revokefn(integer) FROM PUBLIC;` (verified byte-identical vs real PG 18.3).
+Server-only fix (catalog primitives from slices 340/345 reused): `tryRecordTableRevoke`
+gains function/procedure/routine branches → `recordFunctionRevoke`
+(MaterializeOwnerACL owner EXECUTE first, then RevokeTablePrivilege per role;
+PUBLIC absent-entry no-op leaves owner-only). Tests: TestProcACLRevokeFromPublic
+(catalog/relacl_test.go) + slice-346 fixture/assert in
+TestPort_PgDumpConnectionSetup. Gates: catalog+server+initdb suites +
+TestPort_PgDumpConnectionSetup PASS; build clean; pgbench smoke (pre-commit).
 
 NEXT M0119-0004 GRANT/ACL slices (remaining are deeper):
-- function/object REVOKE (e.g. `REVOKE EXECUTE … FROM PUBLIC`) — the no-op path
-  still swallows it; mirror the table REVOKE recorder for pg_proc proacl.
+- function/object REVOKE from a named grantee leaving surviving privs (sequence
+  USAGE-style); or owner-side function REVOKE ALL → `{}` (generalized code
+  already handles it — just needs a pinned slice if wanted).
 - column-level GRANT (`pg_attribute.attacl`, heap re-sync — the entangled one:
   pg_attribute is HEAP-backed, needs delete-old-rows + syncTableToCatalogHeap,
   which the server GRANT short-circuit cannot reach without executor routing).

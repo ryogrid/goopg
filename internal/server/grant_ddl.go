@@ -214,6 +214,20 @@ func (s *Server) tryRecordTableRevoke(stmt string) {
 		// remove the named privileges from each schema's nspacl. DU-002 slice 339.
 		s.recordSchemaRevoke(rest, rolePart, privPart)
 		return
+	} else if rest, ok := cutLeadingKeyword(objPart, "function"); ok {
+		// REVOKE EXECUTE ON FUNCTION <signature> FROM <roles>. Mirror the grant
+		// recorder's FUNCTION branch: routines share the OID-keyed ACL store, so
+		// remove the named privileges from each routine's proacl. DU-002 slice 346.
+		s.recordFunctionRevoke(rest, rolePart, privPart)
+		return
+	} else if rest, ok := cutLeadingKeyword(objPart, "procedure"); ok {
+		// REVOKE EXECUTE ON PROCEDURE … shares the routine ACL path with FUNCTION.
+		s.recordFunctionRevoke(rest, rolePart, privPart)
+		return
+	} else if rest, ok := cutLeadingKeyword(objPart, "routine"); ok {
+		// REVOKE EXECUTE ON ROUTINE … shares the routine ACL path with FUNCTION.
+		s.recordFunctionRevoke(rest, rolePart, privPart)
+		return
 	}
 	// Only table/sequence relacl is modelled here; bail on every other object
 	// class (ON DATABASE/FUNCTION/…), matching the grant recorder's scope.
@@ -354,6 +368,54 @@ func (s *Server) recordFunctionGrant(objPart, rolePart, privPart string) {
 		s.cfg.Catalog.GrantTablePrivilege(oid, "PUBLIC", "EXECUTE")
 		for _, role := range roles {
 			s.cfg.Catalog.GrantTablePrivilege(oid, role, "EXECUTE")
+		}
+	}
+}
+
+// recordFunctionRevoke removes the named privileges from each routine's proacl
+// in the catalog ACL store, mirroring recordFunctionGrant. A function's implicit
+// default proacl grants EXECUTE to BOTH the owner and PUBLIC
+// (acldefault('f', proowner) = "{=X/postgres,postgres=X/postgres}"), and
+// PostgreSQL leaves proacl NULL until the first GRANT/REVOKE materializes it. A
+// REVOKE therefore materializes the owner's default entry first (the
+// type-agnostic MaterializeOwnerACL) so the surviving owner EXECUTE renders
+// explicitly; the PUBLIC half of the default is implicit and is simply omitted
+// once revoked. The common case `REVOKE EXECUTE … FROM PUBLIC` thus yields
+// proacl = "{postgres=X/postgres}", which pg_dump diffs against acldefault('f',
+// 10) to emit `REVOKE ALL ON FUNCTION … FROM PUBLIC;`. Unknown routines, a
+// non-EXECUTE privilege list, or an empty role list are skipped, leaving the
+// statement a successful no-op. DU-002 slice 346.
+func (s *Server) recordFunctionRevoke(objPart, rolePart, privPart string) {
+	privs := parseGrantPrivileges(privPart, allFunctionPrivileges)
+	hasExecute := false
+	for _, p := range privs {
+		if p == "EXECUTE" {
+			hasExecute = true
+			break
+		}
+	}
+	if !hasExecute {
+		return
+	}
+	roles := splitGrantList(rolePart)
+	if len(roles) == 0 {
+		return
+	}
+	for _, sig := range splitFunctionList(objPart) {
+		oid := s.lookupFunctionOID(sig)
+		if oid == 0 {
+			continue
+		}
+		// Materialize the owner's implicit default EXECUTE so proacl renders the
+		// owner entry once any privilege is revoked; the PUBLIC default is implicit
+		// and never stored, so revoking it just leaves the owner. The catalog
+		// lower-cases "PUBLIC" to the reserved pseudo-role, matching the grantee key
+		// the grant recorder seeds.
+		s.cfg.Catalog.MaterializeOwnerACL(oid, aclOwnerRole, allFunctionPrivileges)
+		for _, role := range roles {
+			for _, p := range privs {
+				s.cfg.Catalog.RevokeTablePrivilege(oid, role, p)
+			}
 		}
 	}
 }

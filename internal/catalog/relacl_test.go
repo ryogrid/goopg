@@ -624,3 +624,30 @@ func TestProcACLText(t *testing.T) {
 		t.Fatalf("proacl must ignore a non-function privilege: got %q; want %q", got, want)
 	}
 }
+
+// TestProcACLRevokeFromPublic exercises the function-level REVOKE … FROM PUBLIC
+// primitive composition (DU-002 slice 346). A function's implicit default proacl
+// grants EXECUTE to BOTH the owner and PUBLIC; PostgreSQL leaves proacl NULL
+// until the first GRANT/REVOKE. `REVOKE EXECUTE … FROM PUBLIC` on a never-granted
+// routine materializes the owner's default entry (the PUBLIC half is implicit and
+// simply omitted once revoked), yielding proacl = "{postgres=X/postgres}", which
+// pg_dump diffs against acldefault('f', 10) to emit `REVOKE ALL ON FUNCTION …
+// FROM PUBLIC;`. Verified byte-identical to real pg_dump 18.3.
+func TestProcACLRevokeFromPublic(t *testing.T) {
+	c := NewInMemory()
+	const procOID = 131073 // a routine OID distinct from TestProcACLText's
+
+	// No grants → NULL proacl.
+	if got := c.ProcACLText(procOID); got != "" {
+		t.Fatalf("proacl with no grants = %q; want \"\" (NULL)", got)
+	}
+
+	// REVOKE EXECUTE … FROM PUBLIC: materialize the owner default, then remove the
+	// (absent, implicit) PUBLIC EXECUTE. Mirrors recordFunctionRevoke's sequence.
+	c.MaterializeOwnerACL(procOID, "postgres", []string{"EXECUTE"})
+	c.RevokeTablePrivilege(procOID, "PUBLIC", "EXECUTE")
+	want := "{postgres=X/postgres}"
+	if got := c.ProcACLText(procOID); got != want {
+		t.Fatalf("proacl after REVOKE EXECUTE FROM PUBLIC = %q; want %q", got, want)
+	}
+}

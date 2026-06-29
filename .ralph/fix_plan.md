@@ -2815,6 +2815,36 @@ documentation-only and is exempt from the design-doc requirement.)
       open under M0119-0004: column-level (`attacl`, heap re-sync) / database (`datacl`,
       `--create`-only) GRANT projection; function/object REVOKE; extended-protocol
       commit-time deferral.
+      **2026-06-30 (loop #71, design 0119-0004-function-revoke-proacl-pgdump, DU-002
+      slice 346):** function-level REVOKE round-trip — the routine REVOKE analogue of the
+      table REVOKE slices (338+); the follow-up slice 345 deferred. `REVOKE EXECUTE …
+      FROM PUBLIC` is the most common real-world function ACL mutation, and goopg silently
+      dropped it (the REVOKE recorder bailed on the `function` object class), re-granting
+      PUBLIC's default EXECUTE on restore. A function's `acldefault('f', 10)` =
+      `{=X/postgres,postgres=X/postgres}` grants EXECUTE to BOTH owner and PUBLIC;
+      PostgreSQL leaves proacl NULL until the first GRANT/REVOKE. `REVOKE EXECUTE ON
+      FUNCTION public.revokefn(integer) FROM PUBLIC` on a never-granted routine
+      materializes `proacl = {postgres=X/postgres}` (owner only; PUBLIC's implicit EXECUTE
+      removed); pg_dump's getFuncs diffs against `acldefault('f', proowner)` and emits
+      `REVOKE ALL ON FUNCTION public.revokefn(integer) FROM PUBLIC;`. Fix (server-only —
+      catalog primitives from slices 340/345 already in place): `tryRecordTableRevoke`
+      gains function/procedure/routine branches → new `recordFunctionRevoke`, which
+      resolves the OID via the shared `lookupFunctionOID`/`splitFunctionList`,
+      MATERIALIZES the owner's implicit default EXECUTE first via the type-agnostic
+      `MaterializeOwnerACL(oid, "postgres", ["EXECUTE"])` so the surviving owner EXECUTE
+      renders explicitly, then `RevokeTablePrivilege(oid, role, "EXECUTE")` per role
+      (PUBLIC lower-cases to the reserved `public` pseudo-role; a never-granted PUBLIC is
+      an absent-entry no-op → owner-only array). `ProcACLText` (virtual pg_proc
+      projection) renders `{postgres=X/postgres}`. Generalizes to a grantee revoke (proacl
+      = acldefault as a set → pg_dump emits nothing) and to an owner-side revoke (empties
+      to `{}` via the shared `relACLEmptied` path). Scope: pinned case is `REVOKE … FROM
+      PUBLIC`; explicit-txn REVOKE still no-op; WITH GRANT OPTION/column/database open.
+      Near-zero blast radius (only removes bits; function GRANT with no REVOKE renders
+      identically to slice 345). Tests `TestProcACLRevokeFromPublic` (new) + slice-346
+      `TestPort_PgDumpConnectionSetup` (exact REVOKE ALL ON FUNCTION … FROM PUBLIC line;
+      byte-identical vs real pg_dump 18.3) PASS; catalog+server+initdb suites PASS; build
+      clean. Still open under M0119-0004: column-level (`attacl`, heap re-sync) / database
+      (`datacl`, `--create`-only) GRANT projection; extended-protocol commit-time deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

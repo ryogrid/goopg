@@ -3451,6 +3451,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant execute on grantfn to func_grantee: %v", err)
 	}
 
+	// Slice 346: a function-level REVOKE … FROM PUBLIC must round-trip through
+	// pg_dump from pg_proc.proacl, the routine REVOKE analogue of the table REVOKE
+	// slices (338+). A function's implicit default proacl grants EXECUTE to BOTH
+	// the owner and PUBLIC, so `REVOKE EXECUTE ON FUNCTION public.revokefn(integer)
+	// FROM PUBLIC` materializes proacl as "{postgres=X/postgres}" (owner only;
+	// PUBLIC's implicit EXECUTE removed). pg_dump's getFuncs diffs it against
+	// acldefault('f', 10) and emits `REVOKE ALL ON FUNCTION public.revokefn(integer)
+	// FROM PUBLIC;`. Before this slice goopg treated the function REVOKE as a pure
+	// no-op, leaving proacl NULL, so the dump silently re-granted PUBLIC's default
+	// EXECUTE on restore.
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.revokefn(integer) RETURNS integer LANGUAGE sql AS $$ SELECT $1 $$"); err != nil {
+		t.Fatalf("create function revokefn: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE EXECUTE ON FUNCTION public.revokefn(integer) FROM PUBLIC"); err != nil {
+		t.Fatalf("revoke execute on revokefn from public: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7433,6 +7450,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// every routine's proacl NULL, so the function GRANT was dropped.
 		if want := "GRANT ALL ON FUNCTION public.grantfn(integer) TO func_grantee;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered the function GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 346 (asserted):** a function-level REVOKE … FROM PUBLIC round-trips
+		// from pg_proc.proacl (the routine analogue of the table REVOKE slices 338+).
+		// `REVOKE EXECUTE ON FUNCTION public.revokefn(integer) FROM PUBLIC` materializes
+		// proacl as "{postgres=X/postgres}"; pg_dump's getFuncs diffs it against
+		// acldefault('f', 10) = "{=X/postgres,postgres=X/postgres}" and emits a single
+		// `REVOKE ALL ON FUNCTION public.revokefn(integer) FROM PUBLIC;`. Verified
+		// byte-identical to real pg_dump 18.3. Before this slice goopg treated the
+		// function REVOKE as a no-op (proacl NULL), silently restoring PUBLIC's
+		// default EXECUTE on restore.
+		if want := "REVOKE ALL ON FUNCTION public.revokefn(integer) FROM PUBLIC;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the function REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints
