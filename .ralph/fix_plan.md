@@ -2669,6 +2669,31 @@ documentation-only and is exempt from the design-doc requirement.)
       INSERT; byte-identical vs real pg_dump 18.3) PASS. Still open: column-level
       (`pg_attribute.attacl`, heap re-sync)/database (`datacl`, needs `--create`)
       GRANT, REVOKE-of-default (owner-side implicit-privilege) modelling.
+      **2026-06-30 (loop #64, design 0119-0004-schema-revoke-nspacl-pgdump, DU-002
+      slice 339):** `GRANT … ON SCHEMA` then partial `REVOKE` round-trips (the
+      `nspacl` analogue of slice 338). `GRANT USAGE, CREATE ON SCHEMA revoke_sch
+      TO revoke_sch_role` then `REVOKE CREATE … FROM …` leaves
+      `pg_namespace.nspacl` as `revoke_sch_role=U/postgres` (lone USAGE) → pg_dump
+      re-emits only `GRANT USAGE ON SCHEMA revoke_sch TO revoke_sch_role;`, NOT the
+      revoked CREATE. goopg's REVOKE recorder `tryRecordTableRevoke` modelled only
+      table/sequence `relacl` (schema is in `nonTableGrantObjects` → non-table
+      bail), so the slice-335 GRANT's CREATE survived in nspacl and the dump
+      over-emitted `GRANT CREATE, USAGE` (silent ACL drift on restore). Fix
+      (server-only): `tryRecordTableRevoke` gains an `ON SCHEMA` branch (mirror of
+      the grant recorder's slice-335 branch) dispatching to new `recordSchemaRevoke`
+      — the mirror of `recordSchemaGrant`: expands against `allSchemaPrivileges`
+      ({USAGE,CREATE}), resolves each schema via `Catalog.SchemaOID`, calls
+      `Catalog.RevokeTablePrivilege(oid, role, priv)` (slice 338, already correct
+      for schema OIDs — schemas share the OID-keyed `tableACLs` store, and the
+      revoke drops the grantee entry when its set empties / the whole entry when no
+      grantees remain → nspacl NULL). NO catalog change. Zero blast radius (only
+      removes bits already present; schema GRANT with no REVOKE renders identically
+      to slice 335; explicit-txn REVOKE still no-op). Tests
+      `TestRevokeTablePrivilege`/`Relacl` (reused) + slice-339
+      `TestPort_PgDumpConnectionSetup` (emits surviving USAGE, NOT revoked CREATE;
+      byte-identical vs real pg_dump 18.3) PASS. Still open: column-level
+      (`pg_attribute.attacl`)/database (`datacl`, needs `--create`) GRANT,
+      REVOKE-of-default modelling.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

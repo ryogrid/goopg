@@ -183,9 +183,15 @@ func (s *Server) tryRecordTableRevoke(stmt string) {
 	} else if rest, ok := cutLeadingKeyword(objPart, "sequence"); ok {
 		objPart = rest
 		isSequence = true
+	} else if rest, ok := cutLeadingKeyword(objPart, "schema"); ok {
+		// REVOKE … ON SCHEMA <names> FROM <roles>. Mirror the grant recorder's
+		// SCHEMA branch: schemas share the OID-keyed ACL store with relations, so
+		// remove the named privileges from each schema's nspacl. DU-002 slice 339.
+		s.recordSchemaRevoke(rest, rolePart, privPart)
+		return
 	}
 	// Only table/sequence relacl is modelled here; bail on every other object
-	// class (ON SCHEMA/DATABASE/FUNCTION/…), matching the grant recorder's scope.
+	// class (ON DATABASE/FUNCTION/…), matching the grant recorder's scope.
 	if _, isNonTable := nonTableGrantObjects[firstWordLower(objPart)]; isNonTable {
 		return
 	}
@@ -233,6 +239,31 @@ func (s *Server) recordSchemaGrant(objPart, rolePart, privPart string, withGrant
 		for _, role := range roles {
 			for _, p := range privs {
 				s.cfg.Catalog.GrantTablePrivilegeWithGrantOption(oid, role, p, withGrantOption)
+			}
+		}
+	}
+}
+
+// recordSchemaRevoke removes the named privileges from each schema's nspacl in
+// the catalog ACL store, mirroring recordSchemaGrant. Unknown schemas and an
+// empty/unparseable privilege list are skipped, leaving the statement as a
+// successful no-op. Keeping nspacl in sync lets pg_dump re-emit only the schema
+// privileges that actually remain after the revoke. DU-002 slice 339.
+func (s *Server) recordSchemaRevoke(objPart, rolePart, privPart string) {
+	privs := parseGrantPrivileges(privPart, allSchemaPrivileges)
+	if len(privs) == 0 {
+		return
+	}
+	schemas := splitGrantList(objPart)
+	roles := splitGrantList(rolePart)
+	for _, sc := range schemas {
+		oid := s.cfg.Catalog.SchemaOID(strings.Trim(strings.TrimSpace(sc), `"`))
+		if oid == 0 {
+			continue
+		}
+		for _, role := range roles {
+			for _, p := range privs {
+				s.cfg.Catalog.RevokeTablePrivilege(oid, role, p)
 			}
 		}
 	}

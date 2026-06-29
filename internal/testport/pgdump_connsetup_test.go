@@ -3300,6 +3300,31 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("revoke insert on revoke_t from revoke_role: %v", err)
 	}
 
+	// Slice 339: a schema GRANT followed by a partial REVOKE must round-trip. This
+	// is the nspacl analogue of slice 338: GRANT USAGE, CREATE ON SCHEMA then
+	// REVOKE CREATE leaves pg_namespace.nspacl as `revoke_sch_role=U/postgres` (the
+	// lone USAGE), and pg_dump's buildACLCommands diffs that against
+	// acldefault('n', owner) = "{postgres=UC/postgres}" and re-emits only `GRANT
+	// USAGE ON SCHEMA revoke_sch TO revoke_sch_role;` — NOT the revoked CREATE.
+	// goopg's REVOKE recorder (tryRecordTableRevoke) previously bailed on ON SCHEMA
+	// (only table/sequence relacl was modelled), so the revoked CREATE survived in
+	// nspacl and the dump over-emitted `GRANT CREATE, USAGE`. The recorder now
+	// routes ON SCHEMA to recordSchemaRevoke, the mirror of recordSchemaGrant, so
+	// the materialized nspacl reflects only what remains. A dedicated schema keeps
+	// the revoke isolated from grant_sch (slice 335) and the `s` schema.
+	if err := runSQLSimple(t, c, "CREATE SCHEMA revoke_sch"); err != nil {
+		t.Fatalf("create schema revoke_sch: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE revoke_sch_role"); err != nil {
+		t.Fatalf("create role revoke_sch_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT USAGE, CREATE ON SCHEMA revoke_sch TO revoke_sch_role"); err != nil {
+		t.Fatalf("grant usage,create on schema revoke_sch to revoke_sch_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE CREATE ON SCHEMA revoke_sch FROM revoke_sch_role"); err != nil {
+		t.Fatalf("revoke create on schema revoke_sch from revoke_sch_role: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7176,6 +7201,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if bad := "INSERT ON TABLE public.revoke_t TO revoke_role"; strings.Contains(res.Stdout, bad) {
 			t.Errorf("pg_dump re-emitted the REVOKEd INSERT grant: unexpected %q\n  full stdout=%q", bad, res.Stdout)
+		}
+		// **Slice 339 (asserted):** a schema GRANT … then partial REVOKE round-trips
+		// (the nspacl analogue of slice 338). GRANT USAGE, CREATE ON SCHEMA then
+		// REVOKE CREATE leaves nspacl as revoke_sch_role=U/postgres, so pg_dump
+		// re-emits only the surviving USAGE grant — NOT the revoked CREATE. goopg's
+		// REVOKE recorder now routes ON SCHEMA to recordSchemaRevoke and clears the
+		// privilege bit; previously the schema REVOKE was a no-op and the dump
+		// over-emitted CREATE. Verified byte-identical to real pg_dump 18.3.
+		if want := "GRANT USAGE ON SCHEMA revoke_sch TO revoke_sch_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the surviving USAGE grant after schema REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if bad := "CREATE ON SCHEMA revoke_sch TO revoke_sch_role"; strings.Contains(res.Stdout, bad) {
+			t.Errorf("pg_dump re-emitted the REVOKEd CREATE schema grant: unexpected %q\n  full stdout=%q", bad, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints
