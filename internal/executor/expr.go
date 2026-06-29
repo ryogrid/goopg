@@ -4742,6 +4742,23 @@ func buildTriggerDefString(tbl *catalog.Table, trig catalog.Trigger) string {
 			b.WriteString("IMMEDIATE ")
 		}
 	}
+	// REFERENCING transition tables (ruleutils.c pg_get_triggerdef_worker): the
+	// OLD/NEW statement-level row sets, emitted between the deferrability clause
+	// and FOR EACH ROW as `REFERENCING OLD TABLE AS <o> NEW TABLE AS <n> `.
+	// Either or both names may be present. DU-002 slice 328.
+	if trig.OldTransitionTable != "" || trig.NewTransitionTable != "" {
+		b.WriteString("REFERENCING ")
+		if trig.OldTransitionTable != "" {
+			b.WriteString("OLD TABLE AS ")
+			b.WriteString(pgQuoteIdent(trig.OldTransitionTable))
+			b.WriteByte(' ')
+		}
+		if trig.NewTransitionTable != "" {
+			b.WriteString("NEW TABLE AS ")
+			b.WriteString(pgQuoteIdent(trig.NewTransitionTable))
+			b.WriteByte(' ')
+		}
+	}
 	if trig.ForEachRow {
 		b.WriteString("FOR EACH ROW ")
 	} else {

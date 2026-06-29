@@ -104,6 +104,30 @@ func TestBuildTriggerDefString(t *testing.T) {
 			},
 			want: "CREATE CONSTRAINT TRIGGER trg_cd AFTER UPDATE ON public.t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.g()",
 		},
+		{
+			// DU-002 slice 328: a REFERENCING clause emits `REFERENCING OLD TABLE
+			// AS … NEW TABLE AS …` between the ON-table name and FOR EACH ROW.
+			name: "referencing new transition table",
+			trig: catalog.Trigger{
+				Name: "trg_nt", Timing: catalog.TriggerAfter,
+				Events: []string{"insert"}, ForEachRow: false,
+				NewTransitionTable: "nt",
+				FuncSchema:         "public", FuncName: "f",
+			},
+			want: "CREATE TRIGGER trg_nt AFTER INSERT ON public.t REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION public.f()",
+		},
+		{
+			// Both transition tables render OLD first, then NEW (PG's fixed order),
+			// and a name needing quoting is double-quoted.
+			name: "referencing old and new transition tables",
+			trig: catalog.Trigger{
+				Name: "trg_on", Timing: catalog.TriggerAfter,
+				Events: []string{"update"}, ForEachRow: false,
+				OldTransitionTable: "ot", NewTransitionTable: "New",
+				FuncSchema: "public", FuncName: "g",
+			},
+			want: `CREATE TRIGGER trg_on AFTER UPDATE ON public.t REFERENCING OLD TABLE AS ot NEW TABLE AS "New" FOR EACH STATEMENT EXECUTE FUNCTION public.g()`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

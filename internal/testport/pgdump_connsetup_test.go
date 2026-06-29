@@ -3013,6 +3013,16 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE CONSTRAINT TRIGGER trg_cdfr AFTER UPDATE ON public.trig_t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.trig_fn()"); err != nil {
 		t.Fatalf("create constraint trigger trg_cdfr: %v", err)
 	}
+	// Slice 328: a REFERENCING transition-table trigger. pg_get_triggerdef emits
+	// `REFERENCING OLD TABLE AS … NEW TABLE AS …` between the ON-table name and
+	// FOR EACH ROW (transition tables are an AFTER, statement-level feature).
+	// trg_ref carries both OLD and NEW; trg_refn carries NEW only.
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_ref AFTER UPDATE ON public.trig_t REFERENCING OLD TABLE AS ot NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_ref: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_refn AFTER INSERT ON public.trig_t REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_refn: %v", err)
+	}
 
 	// Slice 320: a clustered index must round-trip through pg_dump. pg_dump's
 	// getIndexes selects pg_index.indisclustered and dumpIndex/dumpConstraint
@@ -6824,6 +6834,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "CREATE CONSTRAINT TRIGGER trg_cdfr AFTER UPDATE ON public.trig_t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.trig_fn();") {
 			t.Errorf("pg_dump dropped/mangled the DEFERRABLE INITIALLY DEFERRED constraint trigger\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 328 (asserted):** a REFERENCING transition-table trigger must
+		// round-trip. pg_get_triggerdef (ruleutils.c pg_get_triggerdef_worker)
+		// reads pg_trigger.tgoldtable/tgnewtable and renders `REFERENCING OLD
+		// TABLE AS … NEW TABLE AS …` (OLD before NEW) between the ON-table name
+		// and FOR EACH ROW. Before this slice goopg's parser had no REFERENCING
+		// branch, so such a trigger failed to parse. Verified byte-identical to
+		// real pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_ref AFTER UPDATE ON public.trig_t REFERENCING OLD TABLE AS ot NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the REFERENCING OLD/NEW transition-table trigger\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_refn AFTER INSERT ON public.trig_t REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the REFERENCING NEW-only transition-table trigger\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 320 (asserted):** a clustered index must round-trip. pg_dump's
 		// getIndexes reads pg_index.indisclustered and dumpIndex/dumpConstraint

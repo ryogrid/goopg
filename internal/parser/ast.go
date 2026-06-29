@@ -341,7 +341,16 @@ type CreateTriggerStmt struct {
 	IsConstraint bool
 	Deferrable   bool
 	InitDeferred bool
-	ForEachRow   bool // true = ROW, false = STATEMENT
+	// OldTransitionTable / NewTransitionTable capture the REFERENCING clause's
+	// `OLD TABLE AS <name>` / `NEW TABLE AS <name>` transition-relation names
+	// (an AFTER trigger's statement-level row sets). Empty when absent. PG stores
+	// these in pg_trigger.tgoldtable / tgnewtable and pg_get_triggerdef emits
+	// `REFERENCING OLD TABLE AS … NEW TABLE AS …` between the ON-table name and
+	// FOR EACH ROW. goopg records them for dump fidelity only (the transition
+	// tables are not materialised for trigger execution). DU-002 slice 328.
+	OldTransitionTable string
+	NewTransitionTable string
+	ForEachRow         bool // true = ROW, false = STATEMENT
 	FuncName     ObjectName
 	FuncArgs     []string // trigger function arguments (EXECUTE PROCEDURE name('arg1', 'arg2'))
 	// IfNotExists: PostgreSQL 14+ only, not supported yet.

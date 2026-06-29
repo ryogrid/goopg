@@ -4586,6 +4586,42 @@ func (p *parser) parseCreateTriggerTail(pos int, isConstraint bool) (Stmt, error
 		p.parseConstraintDeferrable(&stmt.Deferrable, &stmt.InitDeferred)
 	}
 
+	// REFERENCING { OLD | NEW } TABLE [AS] name [ … ] — transition-table aliases
+	// for an AFTER trigger (the OLD/NEW statement-level row sets). Either or both
+	// clauses may appear, in either order; the AS keyword is optional. goopg
+	// records the names for pg_dump fidelity only. DU-002 slice 328.
+	if p.acceptIdentKeyword("referencing") {
+		for {
+			isOld := p.acceptIdentKeyword("old")
+			isNew := false
+			if !isOld {
+				isNew = p.acceptIdentKeyword("new")
+			}
+			if !isOld && !isNew {
+				return nil, p.errAtCur("expected OLD or NEW in REFERENCING clause")
+			}
+			if _, err := p.expectKeyword(KwTable); err != nil {
+				return nil, err
+			}
+			_ = p.acceptKeyword(KwAs) // AS is optional
+			nameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			if isOld {
+				stmt.OldTransitionTable = identText(nameTok)
+			} else {
+				stmt.NewTransitionTable = identText(nameTok)
+			}
+			// Another transition-table clause may follow with no separator.
+			next := p.cur()
+			if next.Kind != TokenIdent ||
+				(!strings.EqualFold(next.Value, "old") && !strings.EqualFold(next.Value, "new")) {
+				break
+			}
+		}
+	}
+
 	// FOR [EACH] ROW | STATEMENT
 	if p.acceptKeyword(KwFor) {
 		_ = p.acceptIdentKeyword("each")

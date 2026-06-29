@@ -129,3 +129,68 @@ func TestParseCreateConstraintTrigger(t *testing.T) {
 		})
 	}
 }
+
+// TestParseCreateTriggerReferencing pins capture of the REFERENCING clause's
+// `OLD TABLE AS <name>` / `NEW TABLE AS <name>` transition-relation names.
+// pg_get_triggerdef → pg_dump reconstruct `REFERENCING OLD TABLE AS … NEW TABLE
+// AS …` between the ON-table name and FOR EACH ROW from these (DU-002 slice 328).
+// Either or both clauses may appear, in any order, with an optional AS keyword.
+func TestParseCreateTriggerReferencing(t *testing.T) {
+	cases := []struct {
+		name    string
+		sql     string
+		wantOld string
+		wantNew string
+	}{
+		{
+			name:    "new table only",
+			sql:     "CREATE TRIGGER t1 AFTER INSERT ON tbl REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION f()",
+			wantNew: "nt",
+		},
+		{
+			name:    "old table only",
+			sql:     "CREATE TRIGGER t2 AFTER DELETE ON tbl REFERENCING OLD TABLE AS ot FOR EACH STATEMENT EXECUTE FUNCTION f()",
+			wantOld: "ot",
+		},
+		{
+			name:    "both old and new",
+			sql:     "CREATE TRIGGER t3 AFTER UPDATE ON tbl REFERENCING OLD TABLE AS ot NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION f()",
+			wantOld: "ot",
+			wantNew: "nt",
+		},
+		{
+			name:    "new before old (any order)",
+			sql:     "CREATE TRIGGER t4 AFTER UPDATE ON tbl REFERENCING NEW TABLE AS nt OLD TABLE AS ot FOR EACH STATEMENT EXECUTE FUNCTION f()",
+			wantOld: "ot",
+			wantNew: "nt",
+		},
+		{
+			name:    "optional AS keyword omitted",
+			sql:     "CREATE TRIGGER t5 AFTER INSERT ON tbl REFERENCING NEW TABLE nt FOR EACH STATEMENT EXECUTE FUNCTION f()",
+			wantNew: "nt",
+		},
+		{
+			name: "no referencing clause",
+			sql:  "CREATE TRIGGER t6 AFTER INSERT ON tbl FOR EACH ROW EXECUTE FUNCTION f()",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmts, err := Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.sql, err)
+			}
+			s, ok := stmts[0].(*CreateTriggerStmt)
+			if !ok {
+				t.Fatalf("got %T, want *CreateTriggerStmt", stmts[0])
+			}
+			if s.OldTransitionTable != tc.wantOld {
+				t.Errorf("OldTransitionTable = %q, want %q", s.OldTransitionTable, tc.wantOld)
+			}
+			if s.NewTransitionTable != tc.wantNew {
+				t.Errorf("NewTransitionTable = %q, want %q", s.NewTransitionTable, tc.wantNew)
+			}
+		})
+	}
+}

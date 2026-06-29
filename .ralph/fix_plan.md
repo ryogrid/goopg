@@ -2459,9 +2459,21 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestParseCreateConstraintTrigger` + `TestBuildTriggerDefString` (2 new
       cases) + slice-327 `TestPort_PgDumpConnectionSetup` (`trg_cdef` default +
       `trg_cdfr` DEFERRABLE INITIALLY DEFERRED; byte-identical vs real pg_dump
-      18.3) PASS. Design `0119-0004-constraint-trigger-pgdump.md`. **Still open:**
-      trigger `WHEN`/tgqual (needs OLD/NEW-qualified expr deparser), `REFERENCING`
-      transition tables.
+      18.3) PASS. Design `0119-0004-constraint-trigger-pgdump.md`.
+      **2026-06-30 (loop #51, design 0119-0004-trigger-referencing-transition-tables,
+      DU-002 slice 328):** REFERENCING transition-table trigger round-trips. parser
+      `CreateTriggerStmt.{OldTransitionTable,NewTransitionTable}` +
+      `parseCreateTriggerTail` `REFERENCING { OLD | NEW } TABLE [AS] <name>` branch
+      (any order, optional AS); catalog `Trigger.{OldTransitionTable,NewTransitionTable}`
+      → `pg_trigger.tgoldtable`/`tgnewtable`; executor `execCreateTrigger` copies;
+      `buildTriggerDefString` emits `REFERENCING OLD TABLE AS … NEW TABLE AS …`
+      (OLD first) between the deferrability clause and FOR EACH. Tests
+      `TestParseCreateTriggerReferencing` + `TestBuildTriggerDefString` (2 new
+      cases) + slice-328 `TestPort_PgDumpConnectionSetup` (`trg_ref` OLD+NEW,
+      `trg_refn` NEW-only; byte-identical vs real pg_dump 18.3) PASS. Design
+      `0119-0004-trigger-referencing-transition-tables.md`. **Still open:** trigger
+      `WHEN`/tgqual (last `pg_get_triggerdef` gap; needs OLD/NEW-qualified expr
+      deparser).
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
       battery (further slices: GRANT/ACL relacl, CREATE RULE, CREATE POLICY
       named-role `TO`); extended-protocol commit-time deferral (architecturally

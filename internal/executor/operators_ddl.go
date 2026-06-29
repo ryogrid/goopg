@@ -10785,19 +10785,21 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 		return err
 	}
 	trig := catalog.Trigger{
-		Name:          s.Name,
-		OID:           o.ctx.Catalog.AllocOID(),
-		TableOID:      tbl.OID,
-		Timing:        catalog.TriggerTiming(s.Timing),
-		Events:        append([]string(nil), s.Events...),
-		UpdateColumns: append([]string(nil), s.UpdateColumns...),
-		IsConstraint:  s.IsConstraint,
-		Deferrable:    s.Deferrable,
-		InitDeferred:  s.InitDeferred,
-		ForEachRow:    s.ForEachRow,
-		FuncName:      s.FuncName.Name,
-		FuncSchema:    s.FuncName.Schema,
-		Args:          append([]string(nil), s.FuncArgs...),
+		Name:               s.Name,
+		OID:                o.ctx.Catalog.AllocOID(),
+		TableOID:           tbl.OID,
+		Timing:             catalog.TriggerTiming(s.Timing),
+		Events:             append([]string(nil), s.Events...),
+		UpdateColumns:      append([]string(nil), s.UpdateColumns...),
+		IsConstraint:       s.IsConstraint,
+		Deferrable:         s.Deferrable,
+		InitDeferred:       s.InitDeferred,
+		OldTransitionTable: s.OldTransitionTable,
+		NewTransitionTable: s.NewTransitionTable,
+		ForEachRow:         s.ForEachRow,
+		FuncName:           s.FuncName.Name,
+		FuncSchema:         s.FuncName.Schema,
+		Args:               append([]string(nil), s.FuncArgs...),
 	}
 	// A CONSTRAINT TRIGGER carries an implicit pg_constraint row (contype 't');
 	// allocate its OID so pg_trigger.tgconstraint is non-zero and

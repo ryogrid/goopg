@@ -1180,10 +1180,18 @@ type Trigger struct {
 	Deferrable    bool
 	InitDeferred  bool
 	ConstraintOID uint32
-	ForEachRow    bool
-	FuncName      string // function/procedure name (unschemed)
-	FuncSchema    string
-	Args          []string // trigger function arguments (TG_ARGV)
+	// OldTransitionTable / NewTransitionTable are the REFERENCING clause's
+	// `OLD TABLE AS <name>` / `NEW TABLE AS <name>` transition-relation names.
+	// pg_dump's pg_get_triggerdef emits `REFERENCING OLD TABLE AS … NEW TABLE
+	// AS …` between the ON-table name and FOR EACH ROW; pg_trigger.tgoldtable /
+	// tgnewtable carry the names. goopg records them for dump fidelity only — the
+	// transition tables are not materialised. DU-002 slice 328.
+	OldTransitionTable string
+	NewTransitionTable string
+	ForEachRow         bool
+	FuncName           string // function/procedure name (unschemed)
+	FuncSchema         string
+	Args               []string // trigger function arguments (TG_ARGV)
 }
 
 // triggerUpdateColAttrs renders a column-specific UPDATE trigger's column list
@@ -6728,8 +6736,11 @@ func (c *InMemory) registerSystemTables() {
 				row[14] = triggerUpdateColAttrs(tbl, trig.UpdateColumns)
 				row[15] = ""                              // tgargs (bytea; def built from catalog.Trigger.Args)
 				row[16] = ""                              // tgqual (pg_node_tree; WHEN unsupported)
-				row[17] = ""                              // tgoldtable (name; REFERENCING unsupported)
-				row[18] = ""                              // tgnewtable (name)
+				// tgoldtable / tgnewtable — the REFERENCING transition-table names
+				// (`OLD TABLE AS …` / `NEW TABLE AS …`), empty when absent. DU-002
+				// slice 328.
+				row[17] = trig.OldTransitionTable        // tgoldtable (name)
+				row[18] = trig.NewTransitionTable        // tgnewtable (name)
 				out = append(out, row)
 			}
 		}

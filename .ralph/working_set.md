@@ -1,36 +1,34 @@
 (idle — nothing in flight)
 
-Last loop (#50): M0119-0004 **CONSTRAINT TRIGGER round-trip in pg_dump**
-(DU-002 slice 327) — LANDED, committed.
+Last loop (#51): M0119-0004 **REFERENCING transition-table trigger round-trip in
+pg_dump** (DU-002 slice 328) — LANDED, committed.
 
-pg_get_triggerdef_worker (ruleutils.c) renders `CREATE CONSTRAINT TRIGGER … AFTER
-<ev> ON <nsp>.<rel> [NOT ]DEFERRABLE INITIALLY {IMMEDIATE|DEFERRED} FOR EACH ROW
-…` — CONSTRAINT prefix gated on a valid tgconstraint, deferrability clause always
-spelled out in full. goopg's `CREATE CONSTRAINT TRIGGER` was a DEAD parse branch
-(matched via acceptIdentKeyword but CONSTRAINT is a reserved keyword token), so it
-failed to parse. Fix (dump-fidelity only — no deferred firing):
-- parser ast.go/ddl.go: CreateTriggerStmt.{IsConstraint,Deferrable,InitDeferred};
-  parseCreateTriggerTail(pos, isConstraint); CONSTRAINT case now matches
-  KwConstraint keyword token; reuses parseConstraintDeferrable after ON table.
-- catalog.go: Trigger.{IsConstraint,Deferrable,InitDeferred,ConstraintOID};
-  pg_trigger projects non-zero tgconstraint + tgdeferrable/tginitdeferred.
-- operators_ddl.go: execCreateTrigger copies flags + allocs ConstraintOID.
-- expr.go: buildTriggerDefString emits CREATE CONSTRAINT TRIGGER + deferrability
-  clause after the ON-table name.
+pg_get_triggerdef_worker (ruleutils.c) reads pg_trigger.tgoldtable/tgnewtable and
+emits `REFERENCING OLD TABLE AS <ot> NEW TABLE AS <nt> ` (OLD first, either/both
+present) between the ON-table/deferrability clause and FOR EACH. goopg's parser had
+no REFERENCING branch (parse error) and the deparser/projection were empty. Fix
+(dump-fidelity only — transition tables not materialised):
+- parser ast.go/ddl.go: CreateTriggerStmt.{OldTransitionTable,NewTransitionTable};
+  parseCreateTriggerTail parses `REFERENCING { OLD | NEW } TABLE [AS] <name> [ … ]`
+  (any order, optional AS, loops while next ident is OLD/NEW) after deferrability,
+  before FOR EACH. OLD/NEW/REFERENCING matched as case-insensitive idents.
+- catalog.go: Trigger.{OldTransitionTable,NewTransitionTable} → pg_trigger rows
+  17/18 (tgoldtable/tgnewtable).
+- operators_ddl.go: execCreateTrigger copies the two names.
+- expr.go: buildTriggerDefString emits the REFERENCING clause (OLD first,
+  pgQuoteIdent each) between deferrability and FOR EACH.
 
 Files: internal/parser/{ast.go,ddl.go,create_trigger_test.go},
 internal/catalog/catalog.go, internal/executor/{operators_ddl.go,expr.go,
-triggerdef_test.go}, internal/testport/pgdump_connsetup_test.go (trg_cdef +
-trg_cdfr fixtures+asserts), docs/design/0119-0004-constraint-trigger-pgdump.md
-(+README 0119-0004ad).
+triggerdef_test.go}, internal/testport/pgdump_connsetup_test.go (trg_ref + trg_refn
+fixtures+asserts), docs/design/0119-0004-trigger-referencing-transition-tables.md
+(+README 0119-0004ae).
 
 Gates: parser/catalog/executor suites PASS; TestPort_PgDumpConnectionSetup PASS
-(real pg_dump 18.3, byte-identical); go build/vet clean; pgbench smoke via
+(real pg_dump 18.3, byte-identical, 4.7s); go build clean; pgbench smoke via
 pre-commit hook.
 
-NEXT loop — remaining M0119-0004 trigger getter gaps. Best contained candidate:
-`REFERENCING … OLD/NEW TABLE AS` transition tables (tgoldtable/tgnewtable — just
-identifiers, no expr deparse; emitted before FOR EACH ROW). Then trigger
-`WHEN (condition)` (tgqual) — but that needs an OLD/NEW-qualified expression
-deparser (formatExprForAttrdef DROPS qualifiers, so NEW.b would render as just b;
-a dedicated trigger-WHEN deparser keeping lowercased new./old. is required).
+NEXT loop — the LAST `pg_get_triggerdef` gap: trigger `WHEN (condition)` (tgqual).
+Needs a dedicated OLD/NEW-qualified expression deparser — `formatExprForAttrdef`
+DROPS qualifiers so NEW.b would render as bare `b`; PG renders `WHEN ((new.b <>
+old.b))` with lowercased old./new. qualifiers. Higher-effort than slices 326-328.
