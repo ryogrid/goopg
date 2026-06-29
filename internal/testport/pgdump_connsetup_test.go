@@ -3204,6 +3204,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant usage on grant_seq: %v", err)
 	}
 
+	// Slice 334: a GRANT … TO PUBLIC must round-trip through pg_dump. PostgreSQL
+	// stores a grant to the PUBLIC pseudo-role with an EMPTY grantee in the
+	// aclitem (relacl entry "=r/postgres"), and pg_dump's buildACLCommands
+	// (dumputils.c) renders an empty grantee as the keyword PUBLIC, emitting
+	// `GRANT SELECT ON TABLE public.grant_pub TO PUBLIC;`. goopg records the
+	// grant under the reserved role name "public" (no real role may carry that
+	// name); the pg_class relacl projection maps it back to the empty grantee so
+	// pg_dump re-emits the TO PUBLIC clause.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grant_pub (a integer)"); err != nil {
+		t.Fatalf("create table grant_pub: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.grant_pub TO PUBLIC"); err != nil {
+		t.Fatalf("grant select on grant_pub to public: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7034,6 +7049,14 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// byte-identical to real pg_dump 18.3.
 		if want := "GRANT USAGE ON SEQUENCE public.grant_seq TO seq_role;"; !strings.Contains(res.Stdout, want) {
 			t.Errorf("pg_dump dropped or mis-rendered sequence GRANT: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// **Slice 334 (asserted):** a GRANT … TO PUBLIC round-trips. PostgreSQL
+		// stores the grant with an empty grantee in relacl ("=r/postgres"), and
+		// pg_dump's buildACLCommands renders the empty grantee as the keyword
+		// PUBLIC, emitting `GRANT SELECT ON TABLE public.grant_pub TO PUBLIC;`.
+		// Verified byte-identical to real pg_dump 18.3.
+		if want := "GRANT SELECT ON TABLE public.grant_pub TO PUBLIC;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered GRANT TO PUBLIC: want %q\n  full stdout=%q", want, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

@@ -8442,6 +8442,11 @@ const ownerTableACLString = "arwdDxtm"
 // GRANT/REVOKE on round-trip. DU-002 slice 333.
 const ownerSequenceACLString = "rwU"
 
+// publicPseudoRole is the lower-cased name goopg records a GRANT … TO PUBLIC
+// under (PostgreSQL reserves PUBLIC, so no real role can carry this name). It is
+// rendered as the empty grantee in the materialized aclitem[]. DU-002 slice 334.
+const publicPseudoRole = "public"
+
 // relaclTextLocked renders the materialized pg_class.relacl text — an aclitem[]
 // array literal such as `{postgres=arwdDxtm/postgres,grantee_role=r/postgres}` —
 // for relOID from the in-memory GRANT store, or "" (SQL NULL) when no
@@ -8505,7 +8510,17 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		if letters.Len() == 0 {
 			continue
 		}
-		items = append(items, role+"="+letters.String()+"/postgres")
+		// PUBLIC is a pseudo-role: PostgreSQL stores its grant with an empty
+		// grantee in the aclitem ("=<privs>/postgres"), and pg_dump's
+		// buildACLCommands renders an empty grantee as the keyword PUBLIC.
+		// goopg records the grant under the reserved role name "public" (no real
+		// role may be named that), so map it back to the empty grantee here.
+		// DU-002 slice 334.
+		grantee := role
+		if grantee == publicPseudoRole {
+			grantee = ""
+		}
+		items = append(items, grantee+"="+letters.String()+"/postgres")
 	}
 	return "{" + strings.Join(items, ",") + "}"
 }

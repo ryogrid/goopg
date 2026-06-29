@@ -97,6 +97,35 @@ func TestRelaclTextGrantOption(t *testing.T) {
 	}
 }
 
+// TestRelaclTextPublic pins the PUBLIC pseudo-role projection that lets a
+// GRANT … TO PUBLIC round-trip through pg_dump (DU-002 slice 334). PostgreSQL
+// stores a grant to PUBLIC with an empty grantee in the aclitem
+// ("=<privs>/postgres"), and pg_dump's buildACLCommands renders an empty
+// grantee as the keyword PUBLIC. goopg records the grant under the reserved
+// role name "public" (case-insensitively), which must materialize as the empty
+// grantee.
+func TestRelaclTextPublic(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16700
+
+	// GRANT SELECT TO PUBLIC materializes the owner entry plus an empty-grantee
+	// entry ("=r/postgres"), NOT "public=r/postgres".
+	c.GrantTablePrivilege(relOID, "PUBLIC", "SELECT")
+	want := "{postgres=arwdDxtm/postgres,=r/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after GRANT SELECT TO PUBLIC = %q; want %q", got, want)
+	}
+
+	// A named grantee and PUBLIC coexist; the named role keeps its name and
+	// PUBLIC stays the empty grantee. Sort order places "" (PUBLIC, stored as
+	// "public") after "named_role".
+	c.GrantTablePrivilege(relOID, "named_role", "INSERT")
+	want = "{postgres=arwdDxtm/postgres,named_role=a/postgres,=r/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl with PUBLIC + named grantee = %q; want %q", got, want)
+	}
+}
+
 // TestRelaclTextSequence pins the sequence relacl projection that lets a
 // GRANT … ON SEQUENCE round-trip through pg_dump (DU-002 slice 333). A
 // sequence's owner default is "rwU" (USAGE/SELECT/UPDATE), which pg_dump diffs

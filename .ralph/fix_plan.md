@@ -2561,6 +2561,24 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_PgDumpConnectionSetup` (`GRANT USAGE ON SEQUENCE public.grant_seq
       TO seq_role;` byte-identical vs real pg_dump 18.3) PASS. Still open:
       column-level (`pg_attribute.attacl`)/schema/database GRANT, REVOKE-of-default.
+      **2026-06-30 (loop #57, design 0119-0004-grant-public-relacl-pgdump, DU-002
+      slice 334):** `GRANT … TO PUBLIC` round-trips. PG stores a grant to the
+      PUBLIC pseudo-role with an EMPTY grantee in `relacl` (`=r/postgres`), and
+      pg_dump's `buildACLCommands` renders an empty grantee (`grantee->len == 0`)
+      as the keyword `PUBLIC` → `GRANT SELECT ON TABLE public.grant_pub TO
+      PUBLIC;`. Slices 331–333 rendered every grantee under its stored name, so a
+      grant to PUBLIC (recorded under the lower-cased reserved name `public`)
+      would have materialized `public=r/postgres` → pg_dump would emit `TO public`
+      (a nonexistent named role). Fix (rendering-only): catalog adds
+      `publicPseudoRole = "public"` and `relaclTextLockedFor` maps that role key to
+      the empty grantee `""`. No `grant_ddl.go` change (`TO PUBLIC` already records
+      under `public`). PG reserves PUBLIC so no real role is named `public`;
+      `HasTablePrivilege`/`truncate-conflict` read the stored key unchanged → zero
+      blast radius; grant-option/sequence grants to PUBLIC round-trip via the
+      shared path. Tests `TestRelaclTextPublic` + slice-334
+      `TestPort_PgDumpConnectionSetup` (byte-identical vs real pg_dump 18.3) PASS.
+      Still open: column-level (`pg_attribute.attacl`)/schema (`nspacl`)/database
+      (`datacl`) GRANT, REVOKE-of-default modelling.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
