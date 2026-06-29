@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/goopg/goopg/internal/catalog"
+	"github.com/goopg/goopg/internal/parser"
 )
 
 // TestBuildTriggerDefString verifies pg_get_triggerdef reconstruction matches
@@ -127,6 +128,37 @@ func TestBuildTriggerDefString(t *testing.T) {
 				FuncSchema: "public", FuncName: "g",
 			},
 			want: `CREATE TRIGGER trg_on AFTER UPDATE ON public.t REFERENCING OLD TABLE AS ot NEW TABLE AS "New" FOR EACH STATEMENT EXECUTE FUNCTION public.g()`,
+		},
+		{
+			// DU-002 slice 329: a WHEN qualification emits `WHEN (<condition>) `
+			// between FOR EACH and EXECUTE FUNCTION. get_rule_expr fully
+			// parenthesizes the boolean OpExpr and the WHEN wrapper adds the outer
+			// pair, so `NEW.b <> OLD.b` renders as `WHEN ((new.b <> old.b))` with
+			// the OLD/NEW qualifiers lowercased and preserved.
+			name: "when condition on new and old",
+			trig: catalog.Trigger{
+				Name: "trg_w", Timing: catalog.TriggerBefore,
+				Events: []string{"update"}, ForEachRow: true,
+				WhenExpr: &parser.BinaryOp{
+					Op:    parser.OpNe,
+					Left:  &parser.ColumnRef{Table: "new", Column: "b"},
+					Right: &parser.ColumnRef{Table: "old", Column: "b"},
+				},
+				FuncSchema: "public", FuncName: "f",
+			},
+			want: "CREATE TRIGGER trg_w BEFORE UPDATE ON public.t FOR EACH ROW WHEN ((new.b <> old.b)) EXECUTE FUNCTION public.f()",
+		},
+		{
+			// A WHEN testing a single bare NEW column (no top-level OpExpr) gets no
+			// extra parenthesization — only the WHEN wrapper's pair.
+			name: "when bare new column",
+			trig: catalog.Trigger{
+				Name: "trg_wb", Timing: catalog.TriggerAfter,
+				Events: []string{"insert"}, ForEachRow: true,
+				WhenExpr:   &parser.ColumnRef{Table: "new", Column: "active"},
+				FuncSchema: "public", FuncName: "g",
+			},
+			want: "CREATE TRIGGER trg_wb AFTER INSERT ON public.t FOR EACH ROW WHEN (new.active) EXECUTE FUNCTION public.g()",
 		},
 	}
 	for _, tc := range cases {

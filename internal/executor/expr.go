@@ -4764,6 +4764,20 @@ func buildTriggerDefString(tbl *catalog.Table, trig catalog.Trigger) string {
 	} else {
 		b.WriteString("FOR EACH STATEMENT ")
 	}
+	// A WHEN qualification deparses right after FOR EACH and before EXECUTE
+	// FUNCTION (ruleutils.c pg_get_triggerdef_worker): `WHEN (<condition>) `. PG
+	// builds OLD/NEW range-table entries so the condition's column references
+	// render with lowercased `old.`/`new.` qualifiers; goopg's parser already
+	// lowercases the unquoted qualifier onto the *ColumnRef, and defaultExprToSQL
+	// preserves it (unlike the bare-column catalog.formatExprForAttrdef twin).
+	// get_rule_expr (prettyFlags=0) fully parenthesizes the boolean OpExpr, so a
+	// comparison renders as `(new.b <> old.b)` and the WHEN wrapper adds the outer
+	// pair → `WHEN ((new.b <> old.b))`. DU-002 slice 329.
+	if trig.WhenExpr != nil {
+		b.WriteString("WHEN (")
+		b.WriteString(defaultExprToSQL(trig.WhenExpr))
+		b.WriteString(") ")
+	}
 	fnSchema := trig.FuncSchema
 	if fnSchema == "" {
 		fnSchema = "public"

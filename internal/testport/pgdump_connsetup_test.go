@@ -3024,6 +3024,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create trigger trg_refn: %v", err)
 	}
 
+	// Slice 329: a row-level trigger with a `WHEN (condition)` qualification.
+	// pg_get_triggerdef re-emits `WHEN (…)` between FOR EACH ROW and EXECUTE
+	// FUNCTION, building OLD/NEW range-table entries so the condition's column
+	// references render with lowercased `old.`/`new.` qualifiers and the boolean
+	// OpExpr is fully parenthesized (→ `WHEN ((new.b <> old.b))`). Before this
+	// slice the parser skipped the WHEN body entirely, so the condition was lost
+	// on dump. trg_when compares NEW vs OLD across an UPDATE; trg_whna tests a
+	// single NEW column against a constant (no top-level OpExpr-on-OpExpr nesting).
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_when BEFORE UPDATE ON public.trig_t FOR EACH ROW WHEN (NEW.b <> OLD.b) EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_when: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_whna BEFORE INSERT ON public.trig_t FOR EACH ROW WHEN (NEW.a > 0) EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_whna: %v", err)
+	}
+
 	// Slice 320: a clustered index must round-trip through pg_dump. pg_dump's
 	// getIndexes selects pg_index.indisclustered and dumpIndex/dumpConstraint
 	// append a trailing `ALTER TABLE <t> CLUSTER ON <idx>;` after the index's
@@ -6847,6 +6862,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_refn AFTER INSERT ON public.trig_t REFERENCING NEW TABLE AS nt FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn();") {
 			t.Errorf("pg_dump dropped/mangled the REFERENCING NEW-only transition-table trigger\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 329 (asserted):** a trigger with a `WHEN (condition)` must
+		// round-trip. pg_get_triggerdef (ruleutils.c pg_get_triggerdef_worker)
+		// reads pg_trigger.tgqual and renders `WHEN (…)` between FOR EACH ROW and
+		// EXECUTE FUNCTION, building OLD/NEW range-table entries so the column
+		// references deparse with lowercased `old.`/`new.` qualifiers and the
+		// boolean OpExpr is fully parenthesized (prettyFlags=0) → the comparison
+		// renders `WHEN ((new.b <> old.b))`. Before this slice goopg's parser
+		// skipped the WHEN body, so the condition was silently lost. Verified
+		// byte-identical to real pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_when BEFORE UPDATE ON public.trig_t FOR EACH ROW WHEN ((new.b <> old.b)) EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the WHEN-condition trigger (NEW vs OLD)\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_whna BEFORE INSERT ON public.trig_t FOR EACH ROW WHEN ((new.a > 0)) EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the WHEN-condition trigger (NEW vs constant)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 320 (asserted):** a clustered index must round-trip. pg_dump's
 		// getIndexes reads pg_index.indisclustered and dumpIndex/dumpConstraint

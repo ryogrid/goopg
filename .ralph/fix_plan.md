@@ -2474,6 +2474,24 @@ documentation-only and is exempt from the design-doc requirement.)
       `0119-0004-trigger-referencing-transition-tables.md`. **Still open:** trigger
       `WHEN`/tgqual (last `pg_get_triggerdef` gap; needs OLD/NEW-qualified expr
       deparser).
+      **2026-06-30 (loop #52, design 0119-0004-trigger-when-condition, DU-002
+      slice 329):** WHEN-condition trigger round-trips — the LAST
+      `pg_get_triggerdef` gap. parser `CreateTriggerStmt.WhenExpr` +
+      `parseCreateTriggerTail` now parses `WHEN '(' a_expr ')'` (was discarded via a
+      paren-balance token loop); catalog `Trigger.WhenExpr` (tgqual projection stays
+      empty — pg_dump drives off `pg_get_triggerdef`); executor `execCreateTrigger`
+      copies it; `buildTriggerDefString` emits `WHEN (<cond>) ` between FOR EACH and
+      EXECUTE FUNCTION via the executor twin `defaultExprToSQL` (preserves the
+      `ColumnRef` qualifier + fully parenthesizes OpExpr; `formatExprForAttrdef`
+      drops the qualifier so it was unusable). The lexer lowercases the unquoted
+      NEW/OLD qualifier so `NEW.b`→`new.b` matching PG's `get_rule_expr(varprefix)`;
+      `prettyFlags=0` → `WHEN ((new.b <> old.b))`. Tests `TestParseCreateTriggerWhen`
+      + `TestBuildTriggerDefString` (2 new cases) + slice-329
+      `TestPort_PgDumpConnectionSetup` (`trg_when` NEW-vs-OLD, `trg_whna`
+      NEW-vs-constant; byte-identical vs real pg_dump 18.3) PASS. Design
+      `0119-0004-trigger-when-condition.md`. **`pg_get_triggerdef` getter battery now
+      complete.** Still open under M0119-0004: runtime WHEN evaluation; GRANT/ACL
+      (`relacl`) + named-role policies; extended-protocol commit-time deferral.
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
       battery (further slices: GRANT/ACL relacl, CREATE RULE, CREATE POLICY
       named-role `TO`); extended-protocol commit-time deferral (architecturally

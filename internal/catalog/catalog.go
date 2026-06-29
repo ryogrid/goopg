@@ -1188,6 +1188,12 @@ type Trigger struct {
 	// transition tables are not materialised. DU-002 slice 328.
 	OldTransitionTable string
 	NewTransitionTable string
+	// WhenExpr is the parsed `WHEN (condition)` qualification (an OLD/NEW-aware
+	// boolean expression), nil when absent. pg_dump's pg_get_triggerdef re-emits
+	// `WHEN (…)` between FOR EACH and EXECUTE FUNCTION; PG stores it as a node tree
+	// in pg_trigger.tgqual. goopg keeps the parsed expression for dump fidelity
+	// only — the condition is not evaluated at trigger-firing time. DU-002 slice 329.
+	WhenExpr           parser.Expr
 	ForEachRow         bool
 	FuncName           string // function/procedure name (unschemed)
 	FuncSchema         string

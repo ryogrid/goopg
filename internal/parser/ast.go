@@ -351,6 +351,14 @@ type CreateTriggerStmt struct {
 	OldTransitionTable string
 	NewTransitionTable string
 	ForEachRow         bool // true = ROW, false = STATEMENT
+	// WhenExpr is the parsed `WHEN (condition)` qualification — a boolean
+	// expression evaluated before the trigger fires, typically comparing
+	// OLD.<col>/NEW.<col> values. nil when absent. PG stores it as a serialized
+	// node tree in pg_trigger.tgqual and pg_get_triggerdef re-emits `WHEN (…)`
+	// between FOR EACH and EXECUTE FUNCTION with the OLD/NEW qualifiers preserved
+	// (lowercased). goopg records it for dump fidelity (the condition is not yet
+	// evaluated at trigger-firing time). DU-002 slice 329.
+	WhenExpr     Expr
 	FuncName     ObjectName
 	FuncArgs     []string // trigger function arguments (EXECUTE PROCEDURE name('arg1', 'arg2'))
 	// IfNotExists: PostgreSQL 14+ only, not supported yet.

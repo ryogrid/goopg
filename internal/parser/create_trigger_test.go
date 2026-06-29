@@ -194,3 +194,54 @@ func TestParseCreateTriggerReferencing(t *testing.T) {
 		})
 	}
 }
+
+// TestParseCreateTriggerWhen pins capture of the optional `WHEN (condition)`
+// qualification into CreateTriggerStmt.WhenExpr. pg_get_triggerdef → pg_dump
+// reconstruct `WHEN (…)` between FOR EACH and EXECUTE FUNCTION from this
+// expression, preserving the OLD/NEW qualifiers on each *ColumnRef. Before DU-002
+// slice 329 the parser skipped the WHEN body entirely (raw paren-balanced token
+// consumption), so the condition was silently lost on dump. The unquoted OLD/NEW
+// qualifier must be lowercased onto the *ColumnRef.
+func TestParseCreateTriggerWhen(t *testing.T) {
+	const sql = "CREATE TRIGGER t1 BEFORE UPDATE ON tbl FOR EACH ROW WHEN (NEW.b <> OLD.b) EXECUTE FUNCTION f()"
+	stmts, err := Parse(sql)
+	if err != nil {
+		t.Fatalf("Parse(%q): %v", sql, err)
+	}
+	s, ok := stmts[0].(*CreateTriggerStmt)
+	if !ok {
+		t.Fatalf("got %T, want *CreateTriggerStmt", stmts[0])
+	}
+	if s.WhenExpr == nil {
+		t.Fatalf("WhenExpr is nil, want a parsed *BinaryOp")
+	}
+	bin, ok := s.WhenExpr.(*BinaryOp)
+	if !ok {
+		t.Fatalf("WhenExpr is %T, want *BinaryOp", s.WhenExpr)
+	}
+	left, ok := bin.Left.(*ColumnRef)
+	if !ok {
+		t.Fatalf("WhenExpr.Left is %T, want *ColumnRef", bin.Left)
+	}
+	// The unquoted NEW qualifier must be lowercased to match PG's pg_get_triggerdef
+	// which renders the trigger's NEW range-table alias as `new`.
+	if left.Table != "new" || left.Column != "b" {
+		t.Errorf("WhenExpr.Left = %s.%s, want new.b", left.Table, left.Column)
+	}
+	right, ok := bin.Right.(*ColumnRef)
+	if !ok {
+		t.Fatalf("WhenExpr.Right is %T, want *ColumnRef", bin.Right)
+	}
+	if right.Table != "old" || right.Column != "b" {
+		t.Errorf("WhenExpr.Right = %s.%s, want old.b", right.Table, right.Column)
+	}
+
+	// A trigger with no WHEN clause leaves WhenExpr nil.
+	noWhen, err := Parse("CREATE TRIGGER t2 AFTER INSERT ON tbl FOR EACH ROW EXECUTE FUNCTION f()")
+	if err != nil {
+		t.Fatalf("Parse(no-when): %v", err)
+	}
+	if s2 := noWhen[0].(*CreateTriggerStmt); s2.WhenExpr != nil {
+		t.Errorf("WhenExpr = %v, want nil for a trigger with no WHEN clause", s2.WhenExpr)
+	}
+}

@@ -10796,6 +10796,7 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 		InitDeferred:       s.InitDeferred,
 		OldTransitionTable: s.OldTransitionTable,
 		NewTransitionTable: s.NewTransitionTable,
+		WhenExpr:           s.WhenExpr,
 		ForEachRow:         s.ForEachRow,
 		FuncName:           s.FuncName.Name,
 		FuncSchema:         s.FuncName.Schema,

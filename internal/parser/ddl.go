@@ -4635,18 +4635,23 @@ func (p *parser) parseCreateTriggerTail(pos int, isConstraint bool) (Stmt, error
 		}
 	}
 
-	// Optional WHEN (condition) — skip for now.
+	// Optional WHEN ( condition ) — a boolean qualification (PG grammar:
+	// `WHEN '(' a_expr ')'`) evaluated before the trigger fires, usually comparing
+	// OLD.<col>/NEW.<col>. Parse it into an expression so pg_get_triggerdef can
+	// re-emit it; the OLD/NEW qualifiers are preserved on the *ColumnRef. goopg
+	// records it for dump fidelity only — it is not yet evaluated at firing time.
+	// DU-002 slice 329.
 	if p.acceptKeyword(KwWhen) {
-		if p.acceptSymbol("(") {
-			depth := 1
-			for depth > 0 && p.cur().Kind != TokenEOF {
-				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-					depth++
-				} else if p.cur().Kind == TokenSymbol && p.cur().Value == ")" {
-					depth--
-				}
-				p.advance()
-			}
+		if !p.acceptSymbol("(") {
+			return nil, p.errAtCur("expected ( after WHEN in trigger definition")
+		}
+		whenExpr, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		stmt.WhenExpr = whenExpr
+		if !p.acceptSymbol(")") {
+			return nil, p.errAtCur("expected ) to close WHEN condition in trigger definition")
 		}
 	}
 
