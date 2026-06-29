@@ -62,3 +62,70 @@ func TestParseCreateTriggerUpdateOf(t *testing.T) {
 		})
 	}
 }
+
+// TestParseCreateConstraintTrigger pins capture of CREATE CONSTRAINT TRIGGER and
+// the optional `[NOT] DEFERRABLE [INITIALLY {IMMEDIATE|DEFERRED}]` clause that
+// follows the ON-table name. pg_get_triggerdef → pg_dump reconstruct
+// `CREATE CONSTRAINT TRIGGER ... NOT DEFERRABLE INITIALLY IMMEDIATE` from these
+// flags (DU-002 slice 327). A plain (non-constraint) trigger must keep
+// IsConstraint=false.
+func TestParseCreateConstraintTrigger(t *testing.T) {
+	cases := []struct {
+		name             string
+		sql              string
+		wantConstraint   bool
+		wantDeferrable   bool
+		wantInitDeferred bool
+	}{
+		{
+			name:           "constraint trigger default deferrability",
+			sql:            "CREATE CONSTRAINT TRIGGER c1 AFTER INSERT ON tbl FOR EACH ROW EXECUTE FUNCTION f()",
+			wantConstraint: true,
+		},
+		{
+			name:           "constraint trigger explicit not deferrable",
+			sql:            "CREATE CONSTRAINT TRIGGER c2 AFTER UPDATE ON tbl NOT DEFERRABLE FOR EACH ROW EXECUTE FUNCTION f()",
+			wantConstraint: true,
+		},
+		{
+			name:             "constraint trigger deferrable initially deferred",
+			sql:              "CREATE CONSTRAINT TRIGGER c3 AFTER DELETE ON tbl DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION f()",
+			wantConstraint:   true,
+			wantDeferrable:   true,
+			wantInitDeferred: true,
+		},
+		{
+			name:           "constraint trigger deferrable initially immediate",
+			sql:            "CREATE CONSTRAINT TRIGGER c4 AFTER INSERT ON tbl DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION f()",
+			wantConstraint: true,
+			wantDeferrable: true,
+		},
+		{
+			name:           "plain trigger is not a constraint trigger",
+			sql:            "CREATE TRIGGER c5 AFTER INSERT ON tbl FOR EACH ROW EXECUTE FUNCTION f()",
+			wantConstraint: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stmts, err := Parse(tc.sql)
+			if err != nil {
+				t.Fatalf("Parse(%q): %v", tc.sql, err)
+			}
+			s, ok := stmts[0].(*CreateTriggerStmt)
+			if !ok {
+				t.Fatalf("got %T, want *CreateTriggerStmt", stmts[0])
+			}
+			if s.IsConstraint != tc.wantConstraint {
+				t.Errorf("IsConstraint = %v, want %v", s.IsConstraint, tc.wantConstraint)
+			}
+			if s.Deferrable != tc.wantDeferrable {
+				t.Errorf("Deferrable = %v, want %v", s.Deferrable, tc.wantDeferrable)
+			}
+			if s.InitDeferred != tc.wantInitDeferred {
+				t.Errorf("InitDeferred = %v, want %v", s.InitDeferred, tc.wantInitDeferred)
+			}
+		})
+	}
+}

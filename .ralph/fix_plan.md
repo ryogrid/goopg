@@ -2441,8 +2441,27 @@ documentation-only and is exempt from the design-doc requirement.)
       Tests `TestParseCreateTriggerUpdateOf` + `TestBuildTriggerDefString`
       (2 new cases) + slice-326 `TestPort_PgDumpConnectionSetup` (`trg_uof BEFORE
       INSERT OR UPDATE OF a, b`; byte-identical vs real pg_dump 18.3) PASS.
-      Design `0119-0004-trigger-update-of-columns.md`. **Still open:** richer
-      trigger forms (WHEN/tgqual, REFERENCING transition tables, CONSTRAINT).
+      Design `0119-0004-trigger-update-of-columns.md`.
+      **Slice 327 (loop #50):** CONSTRAINT TRIGGER round-trip — `CREATE
+      CONSTRAINT TRIGGER` could not even re-parse (the `parseCreate` CONSTRAINT
+      case matched via `acceptIdentKeyword("constraint")`, but CONSTRAINT is a
+      *reserved* keyword token, so the branch was dead). pg_get_triggerdef emits
+      `CREATE CONSTRAINT TRIGGER … [NOT ]DEFERRABLE INITIALLY {IMMEDIATE|DEFERRED}`
+      between the ON-table name and FOR EACH ROW (gated on a valid tgconstraint;
+      full clause always spelled out). Fix (dump-fidelity only — no deferred
+      firing): parser `CreateTriggerStmt.{IsConstraint,Deferrable,InitDeferred}`,
+      `parseCreateTriggerTail(pos, isConstraint)` matches `KwConstraint` and
+      reuses `parseConstraintDeferrable`; catalog
+      `Trigger.{IsConstraint,Deferrable,InitDeferred,ConstraintOID}` +
+      `pg_trigger.tgconstraint`/`tgdeferrable`/`tginitdeferred` projection;
+      executor `execCreateTrigger` allocs ConstraintOID; `buildTriggerDefString`
+      emits `CREATE CONSTRAINT TRIGGER` + the deferrability clause. Tests
+      `TestParseCreateConstraintTrigger` + `TestBuildTriggerDefString` (2 new
+      cases) + slice-327 `TestPort_PgDumpConnectionSetup` (`trg_cdef` default +
+      `trg_cdfr` DEFERRABLE INITIALLY DEFERRED; byte-identical vs real pg_dump
+      18.3) PASS. Design `0119-0004-constraint-trigger-pgdump.md`. **Still open:**
+      trigger `WHEN`/tgqual (needs OLD/NEW-qualified expr deparser), `REFERENCING`
+      transition tables.
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
       battery (further slices: GRANT/ACL relacl, CREATE RULE, CREATE POLICY
       named-role `TO`); extended-protocol commit-time deferral (architecturally

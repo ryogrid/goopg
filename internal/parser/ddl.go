@@ -128,7 +128,7 @@ func (p *parser) parseCreate() (Stmt, error) {
 		return p.parseCreateProcedureTail(t.Pos, orReplace)
 	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTrigger:
 		p.advance()
-		return p.parseCreateTriggerTail(t.Pos)
+		return p.parseCreateTriggerTail(t.Pos, false)
 	// CREATE SEQUENCE [IF NOT EXISTS] name [options…] (M0097-0009)
 	case p.acceptIdentKeyword("sequence"):
 		return p.parseCreateSequenceTail(t.Pos, unlogged)
@@ -142,11 +142,13 @@ func (p *parser) parseCreate() (Stmt, error) {
 	// CREATE DOMAIN name [AS] base_type [constraints] — M0097-0017.
 	case p.acceptIdentKeyword("domain"):
 		return p.parseCreateDomain(t.Pos)
-	// Accept CREATE CONSTRAINT TRIGGER (skip CONSTRAINT keyword then TRIGGER)
-	case p.acceptIdentKeyword("constraint"):
+	// CREATE CONSTRAINT TRIGGER (CONSTRAINT is a reserved keyword, so match the
+	// keyword token — acceptIdentKeyword never matches it). DU-002 slice 327.
+	case p.cur().Kind == TokenKeyword && p.cur().Keyword == KwConstraint:
+		p.advance()
 		if p.cur().Kind == TokenKeyword && p.cur().Keyword == KwTrigger {
 			p.advance()
-			return p.parseCreateTriggerTail(t.Pos)
+			return p.parseCreateTriggerTail(t.Pos, true)
 		}
 		return nil, p.errAtCur("expected TRIGGER after CREATE CONSTRAINT")
 	// CREATE AGGREGATE name (sfunc=F, basetype=T, stype=S [, ...]) — validate basetype.
@@ -4511,13 +4513,13 @@ func (p *parser) parseInt64() (int64, error) {
 //	EXECUTE {FUNCTION|PROCEDURE} funcname([]);
 //
 // M0096-0012.
-func (p *parser) parseCreateTriggerTail(pos int) (Stmt, error) {
+func (p *parser) parseCreateTriggerTail(pos int, isConstraint bool) (Stmt, error) {
 	// Trigger name
 	nameTok, err := p.parseIdent()
 	if err != nil {
 		return nil, err
 	}
-	stmt := &CreateTriggerStmt{pos: pos, Name: identText(nameTok)}
+	stmt := &CreateTriggerStmt{pos: pos, Name: identText(nameTok), IsConstraint: isConstraint}
 
 	// Timing: BEFORE | AFTER | INSTEAD OF
 	switch {
@@ -4574,6 +4576,15 @@ func (p *parser) parseCreateTriggerTail(pos int) (Stmt, error) {
 		return nil, err
 	}
 	stmt.Table = tblName
+
+	// CONSTRAINT-trigger deferrability: `[NOT] DEFERRABLE [INITIALLY
+	// {IMMEDIATE|DEFERRED}]` appears between ON table and FOR EACH ROW. PG only
+	// accepts this for CREATE CONSTRAINT TRIGGER; default is NOT DEFERRABLE
+	// INITIALLY IMMEDIATE. (The `FROM referenced_table` clause is FK-internal and
+	// not modelled here.) DU-002 slice 327.
+	if isConstraint {
+		p.parseConstraintDeferrable(&stmt.Deferrable, &stmt.InitDeferred)
+	}
 
 	// FOR [EACH] ROW | STATEMENT
 	if p.acceptKeyword(KwFor) {

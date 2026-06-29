@@ -1169,6 +1169,17 @@ type Trigger struct {
 	// pg_get_triggerdef appends ` OF <cols>` right after the UPDATE event and
 	// pg_trigger.tgattr carries the column attnums. DU-002 slice 326.
 	UpdateColumns []string
+	// IsConstraint marks a CREATE CONSTRAINT TRIGGER. pg_get_triggerdef emits
+	// `CREATE CONSTRAINT TRIGGER` (instead of `CREATE TRIGGER`) and a
+	// `[NOT ]DEFERRABLE INITIALLY {IMMEDIATE|DEFERRED}` clause after the ON-table
+	// name. ConstraintOID is the pg_constraint OID PG implicitly creates for the
+	// trigger (contype 't'); it feeds pg_trigger.tgconstraint so the trigger is
+	// recognised as a constraint trigger. goopg does NOT enforce constraint-
+	// trigger semantics — this is dump fidelity only. DU-002 slice 327.
+	IsConstraint  bool
+	Deferrable    bool
+	InitDeferred  bool
+	ConstraintOID uint32
 	ForEachRow    bool
 	FuncName      string // function/procedure name (unschemed)
 	FuncSchema    string
@@ -6691,9 +6702,25 @@ func (c *InMemory) registerSystemTables() {
 				row[7] = "f"                              // tgisinternal
 				row[8] = "0"                              // tgconstrrelid
 				row[9] = "0"                              // tgconstrindid
-				row[10] = "0"                             // tgconstraint
-				row[11] = "f"                             // tgdeferrable
-				row[12] = "f"                             // tginitdeferred
+				// tgconstraint / tgdeferrable / tginitdeferred — a CREATE CONSTRAINT
+				// TRIGGER carries a non-zero tgconstraint (the implicit pg_constraint
+				// OID) so pg_get_triggerdef emits `CREATE CONSTRAINT TRIGGER` plus the
+				// deferrability clause. DU-002 slice 327.
+				tgconstraint := "0"
+				tgdeferrable := "f"
+				tginitdeferred := "f"
+				if trig.IsConstraint {
+					tgconstraint = fmt.Sprintf("%d", trig.ConstraintOID)
+					if trig.Deferrable {
+						tgdeferrable = "t"
+					}
+					if trig.InitDeferred {
+						tginitdeferred = "t"
+					}
+				}
+				row[10] = tgconstraint   // tgconstraint
+				row[11] = tgdeferrable   // tgdeferrable
+				row[12] = tginitdeferred // tginitdeferred
 				row[13] = fmt.Sprintf("%d", len(trig.Args)) // tgnargs
 				// tgattr (int2vector→int2[], space-separated like pg_index.indkey):
 				// the 1-based attnums of an `UPDATE OF col1, col2` column list, or

@@ -3002,6 +3002,17 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_uof BEFORE INSERT OR UPDATE OF a, b ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn()"); err != nil {
 		t.Fatalf("create trigger trg_uof: %v", err)
 	}
+	// Slice 327: a CONSTRAINT TRIGGER. pg_get_triggerdef emits `CREATE CONSTRAINT
+	// TRIGGER` plus the `[NOT ]DEFERRABLE INITIALLY {IMMEDIATE|DEFERRED}` clause
+	// after the ON-table name. trg_cdef takes the default (NOT DEFERRABLE
+	// INITIALLY IMMEDIATE); trg_cdfr is explicitly DEFERRABLE INITIALLY DEFERRED.
+	// Constraint triggers are always AFTER / FOR EACH ROW (enforced by PG).
+	if err := runSQLSimple(t, c, "CREATE CONSTRAINT TRIGGER trg_cdef AFTER INSERT ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create constraint trigger trg_cdef: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE CONSTRAINT TRIGGER trg_cdfr AFTER UPDATE ON public.trig_t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create constraint trigger trg_cdfr: %v", err)
+	}
 
 	// Slice 320: a clustered index must round-trip through pg_dump. pg_dump's
 	// getIndexes selects pg_index.indisclustered and dumpIndex/dumpConstraint
@@ -6798,6 +6809,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// on every column. Verified byte-identical to real pg_dump 18.3.
 		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_uof BEFORE INSERT OR UPDATE OF a, b ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn();") {
 			t.Errorf("pg_dump dropped/mangled the column-specific UPDATE OF trigger\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 327 (asserted):** a CONSTRAINT TRIGGER must round-trip. pg_dump's
+		// getTriggers emits pg_get_triggerdef, which (ruleutils.c
+		// pg_get_triggerdef_worker, gated on a valid tgconstraint) renders
+		// `CREATE CONSTRAINT TRIGGER` plus the `[NOT ]DEFERRABLE INITIALLY
+		// {IMMEDIATE|DEFERRED}` clause between the ON-table name and FOR EACH ROW.
+		// Before this slice the parser's CONSTRAINT branch was dead (it matched via
+		// acceptIdentKeyword, but CONSTRAINT is a reserved keyword token) so
+		// `CREATE CONSTRAINT TRIGGER` failed to parse outright. Verified
+		// byte-identical to real pg_dump 18.3.
+		if !strings.Contains(res.Stdout, "CREATE CONSTRAINT TRIGGER trg_cdef AFTER INSERT ON public.trig_t NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the NOT DEFERRABLE constraint trigger\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE CONSTRAINT TRIGGER trg_cdfr AFTER UPDATE ON public.trig_t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the DEFERRABLE INITIALLY DEFERRED constraint trigger\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 320 (asserted):** a clustered index must round-trip. pg_dump's
 		// getIndexes reads pg_index.indisclustered and dumpIndex/dumpConstraint

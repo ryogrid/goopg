@@ -10791,10 +10791,20 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 		Timing:        catalog.TriggerTiming(s.Timing),
 		Events:        append([]string(nil), s.Events...),
 		UpdateColumns: append([]string(nil), s.UpdateColumns...),
+		IsConstraint:  s.IsConstraint,
+		Deferrable:    s.Deferrable,
+		InitDeferred:  s.InitDeferred,
 		ForEachRow:    s.ForEachRow,
 		FuncName:      s.FuncName.Name,
 		FuncSchema:    s.FuncName.Schema,
 		Args:          append([]string(nil), s.FuncArgs...),
+	}
+	// A CONSTRAINT TRIGGER carries an implicit pg_constraint row (contype 't');
+	// allocate its OID so pg_trigger.tgconstraint is non-zero and
+	// pg_get_triggerdef recognises the trigger as a constraint trigger. DU-002
+	// slice 327.
+	if s.IsConstraint {
+		trig.ConstraintOID = o.ctx.Catalog.AllocOID()
 	}
 	// Remove any existing trigger with the same name on this table.
 	filtered := tbl.Triggers[:0]

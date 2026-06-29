@@ -334,9 +334,16 @@ type CreateTriggerStmt struct {
 	// trigger (a column-specific UPDATE trigger). Empty for every other form.
 	// DU-002 slice 326.
 	UpdateColumns []string
-	ForEachRow    bool // true = ROW, false = STATEMENT
-	FuncName      ObjectName
-	FuncArgs      []string // trigger function arguments (EXECUTE PROCEDURE name('arg1', 'arg2'))
+	// IsConstraint marks a `CREATE CONSTRAINT TRIGGER`. Such triggers always fire
+	// AFTER, FOR EACH ROW, and carry a deferrability spec. Deferrable /
+	// InitDeferred capture `[NOT] DEFERRABLE [INITIALLY {IMMEDIATE|DEFERRED}]`
+	// (default: NOT DEFERRABLE INITIALLY IMMEDIATE). DU-002 slice 327.
+	IsConstraint bool
+	Deferrable   bool
+	InitDeferred bool
+	ForEachRow   bool // true = ROW, false = STATEMENT
+	FuncName     ObjectName
+	FuncArgs     []string // trigger function arguments (EXECUTE PROCEDURE name('arg1', 'arg2'))
 	// IfNotExists: PostgreSQL 14+ only, not supported yet.
 }
 

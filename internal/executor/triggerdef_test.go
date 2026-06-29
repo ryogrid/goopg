@@ -78,6 +78,32 @@ func TestBuildTriggerDefString(t *testing.T) {
 			},
 			want: "CREATE TRIGGER trg_io INSTEAD OF DELETE ON public.t FOR EACH ROW EXECUTE FUNCTION public.v()",
 		},
+		{
+			// DU-002 slice 327: a CONSTRAINT TRIGGER with the default deferrability
+			// emits `CREATE CONSTRAINT TRIGGER` and `NOT DEFERRABLE INITIALLY
+			// IMMEDIATE ` between the ON-table name and FOR EACH ROW.
+			name: "constraint trigger not deferrable",
+			trig: catalog.Trigger{
+				Name: "trg_c", Timing: catalog.TriggerAfter,
+				Events: []string{"insert"}, ForEachRow: true,
+				IsConstraint: true, ConstraintOID: 16600,
+				FuncSchema: "public", FuncName: "f",
+			},
+			want: "CREATE CONSTRAINT TRIGGER trg_c AFTER INSERT ON public.t NOT DEFERRABLE INITIALLY IMMEDIATE FOR EACH ROW EXECUTE FUNCTION public.f()",
+		},
+		{
+			// DEFERRABLE INITIALLY DEFERRED renders without the leading NOT and with
+			// DEFERRED in the INITIALLY slot.
+			name: "constraint trigger deferrable initially deferred",
+			trig: catalog.Trigger{
+				Name: "trg_cd", Timing: catalog.TriggerAfter,
+				Events: []string{"update"}, ForEachRow: true,
+				IsConstraint: true, ConstraintOID: 16601,
+				Deferrable: true, InitDeferred: true,
+				FuncSchema: "public", FuncName: "g",
+			},
+			want: "CREATE CONSTRAINT TRIGGER trg_cd AFTER UPDATE ON public.t DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.g()",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

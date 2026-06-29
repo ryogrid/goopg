@@ -4655,12 +4655,20 @@ func fkActionClause(a parser.FKAction) string {
 // regardless of the order they were declared. The target table and trigger
 // function are schema-qualified because pg_dump runs with search_path=''.
 // A column-specific `UPDATE OF col1, col2` list is reconstructed after the
-// UPDATE event (DU-002 slice 326). goopg's parser does not yet capture WHEN,
-// REFERENCING, or CONSTRAINT-trigger clauses, so none of those are emitted.
+// UPDATE event (DU-002 slice 326). A CONSTRAINT TRIGGER emits `CREATE CONSTRAINT
+// TRIGGER` plus a `[NOT ]DEFERRABLE INITIALLY {DEFERRED|IMMEDIATE}` clause after
+// the ON-table name (DU-002 slice 327). goopg's parser does not yet capture WHEN
+// or REFERENCING transition-table clauses, so neither is emitted.
 // DU-002 slice 319.
 func buildTriggerDefString(tbl *catalog.Table, trig catalog.Trigger) string {
 	var b strings.Builder
-	b.WriteString("CREATE TRIGGER ")
+	// A CONSTRAINT TRIGGER deparses as `CREATE CONSTRAINT TRIGGER` (ruleutils.c
+	// pg_get_triggerdef_worker, gated on a valid tgconstraint). DU-002 slice 327.
+	if trig.IsConstraint {
+		b.WriteString("CREATE CONSTRAINT TRIGGER ")
+	} else {
+		b.WriteString("CREATE TRIGGER ")
+	}
 	b.WriteString(trig.Name)
 	b.WriteByte(' ')
 	switch trig.Timing {
@@ -4719,6 +4727,21 @@ func buildTriggerDefString(tbl *catalog.Table, trig catalog.Trigger) string {
 	b.WriteByte('.')
 	b.WriteString(tbl.Name)
 	b.WriteByte(' ')
+	// A constraint trigger emits its deferrability right after the ON-table name
+	// (ruleutils.c pg_get_triggerdef_worker): `[NOT ]DEFERRABLE INITIALLY
+	// {DEFERRED|IMMEDIATE} `. PG always spells out the full clause even for the
+	// NOT DEFERRABLE INITIALLY IMMEDIATE default. DU-002 slice 327.
+	if trig.IsConstraint {
+		if !trig.Deferrable {
+			b.WriteString("NOT ")
+		}
+		b.WriteString("DEFERRABLE INITIALLY ")
+		if trig.InitDeferred {
+			b.WriteString("DEFERRED ")
+		} else {
+			b.WriteString("IMMEDIATE ")
+		}
+	}
 	if trig.ForEachRow {
 		b.WriteString("FOR EACH ROW ")
 	} else {
