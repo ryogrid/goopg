@@ -3564,6 +3564,32 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("revoke select on seqrev_seq from seqrev_role: %v", err)
 	}
 
+	// Slice 351 (setup): a table GRANT ALL collapses to the `ALL` keyword on
+	// round-trip. `GRANT ALL ON TABLE public.grantall_t TO grantall_role` gives the
+	// grantee every table privilege, so pg_class.relacl materializes as
+	// "{postgres=arwdDxtm/postgres,grantall_role=arwdDxtm/postgres}" (all eight
+	// letters, owner default unchanged). pg_dump's getTables diffs the grantee's
+	// full set against acldefault('r', 10) and, recognising it equals
+	// ACL_ALL_RIGHTS_RELATION, re-emits the single `GRANT ALL ON TABLE
+	// public.grantall_t TO grantall_role;` — the `ALL` collapse, not an eight-way
+	// privilege list. This is the table analogue of the function GRANT ALL (slice
+	// 345) and sequence (slice 333) collapses, completing the GRANT ALL coverage
+	// for the most-used object class. Verified byte-identical to real pg_dump 18.3
+	// (relacl + ACL line captured above). The shared grant recorder expands ALL to
+	// allTablePrivileges and renderACLLetters emits "arwdDxtm", so this slice adds
+	// only a fixture + assert guarding against a regression that would drop a
+	// privilege bit (then pg_dump would list the survivors explicitly instead of
+	// `ALL`).
+	if err := runSQLSimple(t, c, "CREATE TABLE public.grantall_t(id int)"); err != nil {
+		t.Fatalf("create table grantall_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE grantall_role"); err != nil {
+		t.Fatalf("create role grantall_role: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT ALL ON TABLE public.grantall_t TO grantall_role"); err != nil {
+		t.Fatalf("grant all on grantall_t to grantall_role: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7613,6 +7639,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// grantee). pg_dump would render a surviving SELECT as `GRANT SELECT, USAGE`.
 		if notWant := "GRANT SELECT, USAGE ON SEQUENCE public.seqrev_seq TO seqrev_role;"; strings.Contains(res.Stdout, notWant) {
 			t.Errorf("pg_dump over-emitted the revoked SELECT on seqrev_seq: unexpected %q\n  full stdout=%q", notWant, res.Stdout)
+		}
+		// **Slice 351 (asserted):** a table GRANT ALL collapses to the `ALL` keyword.
+		// `GRANT ALL ON TABLE public.grantall_t TO grantall_role` materializes relacl
+		// as "{postgres=arwdDxtm/postgres,grantall_role=arwdDxtm/postgres}" (the
+		// grantee holds every table privilege). pg_dump's buildACLCommands recognises
+		// the grantee's full set equals ACL_ALL_RIGHTS_RELATION and re-emits the
+		// single `GRANT ALL ON TABLE public.grantall_t TO grantall_role;` rather than
+		// an eight-way list. The table analogue of the function (slice 345) and
+		// sequence (slice 333) GRANT ALL collapses. Verified byte-identical to real
+		// pg_dump 18.3.
+		if want := "GRANT ALL ON TABLE public.grantall_t TO grantall_role;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped or mis-rendered the table GRANT ALL: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// A regression that dropped a privilege bit from the grantee's relacl would
+		// make pg_dump list the survivors explicitly (e.g. `GRANT INSERT, SELECT, …`)
+		// instead of collapsing to `ALL`; guard against the SELECT-led explicit form.
+		if notWant := "GRANT INSERT, SELECT"; strings.Contains(res.Stdout, notWant+" ON TABLE public.grantall_t") {
+			t.Errorf("pg_dump failed to collapse the table GRANT ALL to ALL: unexpected explicit list\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints
