@@ -1431,6 +1431,11 @@ type IndexColOrder struct {
 	// operator class. Mirrors pg_index.indclass so pg_get_indexdef can re-emit a
 	// non-default opclass after the column (ruleutils.c get_opclass_name).
 	OpClass string
+	// Collation is the explicit per-column collation name (e.g. "C"), empty when
+	// the column uses its type's default collation. Mirrors pg_index.indcollation
+	// so pg_get_indexdef can re-emit a non-default COLLATE clause after the
+	// column and before the opclass (ruleutils.c, generate_collation_name).
+	Collation string
 }
 
 func (s *CreateIndexStmt) Pos() int  { return s.pos }

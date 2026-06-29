@@ -3403,10 +3403,15 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, []IndexColOrder, stri
 			colName = identText(tok)
 		}
 
-		// Optional COLLATE "..." or COLLATE ident
+		// Optional COLLATE "..." or COLLATE ident. Capture the name so
+		// pg_get_indexdef / pg_dump can re-emit a non-default per-column COLLATE
+		// clause (after the column, before the opclass). parseCollationName
+		// accepts an optional schema qualifier (`pg_catalog."C"`) and returns the
+		// trailing component, matching pg_collation.collname. DU-002 slice 313.
+		var colCollation string
 		if p.acceptIdentKeyword("collate") {
-			// consume the collation name (quoted or plain ident)
-			_ = p.advance()
+			collName, _ := p.parseCollationName()
+			colCollation = collName
 		}
 
 		// Optional opclass name (bare ident that is not a known keyword
@@ -3446,6 +3451,7 @@ func (p *parser) parseIndexColumnList() ([]string, []Expr, []IndexColOrder, stri
 		// an explicit NULLS clause below override it (mirrors PG's indoption).
 		var order IndexColOrder
 		order.OpClass = colOpClass
+		order.Collation = colCollation
 		if p.acceptKeyword(KwDesc) {
 			order.Descending = true
 		} else {

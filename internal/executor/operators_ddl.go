@@ -4897,7 +4897,8 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 	// dumps byte-identically. DU-002 slice 56.
 	nonDefaultOrder := indexHasNonDefaultOrder(s.ColOrders)
 	hasOpClass := indexHasOpClass(s.ColOrders)
-	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || hasOpClass || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
+	hasCollation := indexHasCollation(s.ColOrders)
+	if s.HasPredicate || len(s.IncludeColumns) > 0 || s.Predicate != nil || nonDefaultOrder || hasOpClass || hasCollation || s.NullsNotDistinct || s.Fillfactor != 0 || s.DeduplicateItems != nil {
 		if idx, ok := o.ctx.Catalog.LookupIndex(idxName); ok {
 			idx.HasPredicate = s.HasPredicate
 			idx.Predicate = s.Predicate
@@ -4932,6 +4933,16 @@ func (o *ddlOp) execCreateIndex(s *parser.CreateIndexStmt) error {
 					opc[i] = ord.OpClass
 				}
 				idx.ColOpClasses = opc
+			}
+			// Non-default per-column collation (pg_index.indcollation) so
+			// pg_get_indexdef / pg_dump re-emit ` COLLATE "C"` after the column.
+			// DU-002 slice 313.
+			if hasCollation {
+				coll := make([]string, len(s.ColOrders))
+				for i, ord := range s.ColOrders {
+					coll[i] = ord.Collation
+				}
+				idx.ColCollations = coll
 			}
 		}
 	}
@@ -5051,6 +5062,17 @@ func (o *ddlOp) createPartitionChildIndexes(s *parser.CreateIndexStmt, parentTbl
 func indexHasNonDefaultOrder(orders []parser.IndexColOrder) bool {
 	for _, o := range orders {
 		if o.Descending || o.NullsFirst {
+			return true
+		}
+	}
+	return false
+}
+
+// indexHasCollation reports whether any key column carries an explicit (non-default)
+// collation, so the catalog records pg_index.indcollation for pg_get_indexdef.
+func indexHasCollation(orders []parser.IndexColOrder) bool {
+	for _, o := range orders {
+		if o.Collation != "" {
 			return true
 		}
 	}

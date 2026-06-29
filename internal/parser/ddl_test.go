@@ -225,6 +225,39 @@ func TestParseCreateIndexColOpClass(t *testing.T) {
 	}
 }
 
+// TestParseCreateIndexColCollation pins the per-column COLLATE capture
+// (DU-002 slice 313). The collation name lands on ColOrders[i].Collation (bare
+// last component, matching pg_collation.collname), coexisting with an opclass and
+// ASC/DESC. A plain column records "".
+func TestParseCreateIndexColCollation(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string // per-column Collation
+	}{
+		{"CREATE INDEX i ON t (a)", []string{""}},
+		{`CREATE INDEX i ON t (a COLLATE "C")`, []string{"C"}},
+		{`CREATE INDEX i ON t (a COLLATE "C" DESC)`, []string{"C"}},
+		{`CREATE INDEX i ON t (a COLLATE "C" text_pattern_ops)`, []string{"C"}},
+		{`CREATE INDEX i ON t (a COLLATE pg_catalog."C")`, []string{"C"}},
+		{`CREATE INDEX i ON t (a, b COLLATE "C")`, []string{"", "C"}},
+	}
+	for _, c := range cases {
+		stmts, err := Parse(c.in)
+		if err != nil {
+			t.Fatalf("Parse(%q): %v", c.in, err)
+		}
+		ci := stmts[0].(*CreateIndexStmt)
+		if len(ci.ColOrders) != len(c.want) {
+			t.Fatalf("Parse(%q): ColOrders=%+v want %d cols", c.in, ci.ColOrders, len(c.want))
+		}
+		for i, w := range c.want {
+			if ci.ColOrders[i].Collation != w {
+				t.Errorf("Parse(%q): ColOrders[%d].Collation=%q want %q", c.in, i, ci.ColOrders[i].Collation, w)
+			}
+		}
+	}
+}
+
 // TestParseCreateIndexNullsNotDistinct pins the PostgreSQL 15+ NULLS [NOT]
 // DISTINCT capture (DU-002 slice 134). goopg previously parsed and discarded the
 // clause, so a NULLS NOT DISTINCT unique index dumped as a plain one — a silent

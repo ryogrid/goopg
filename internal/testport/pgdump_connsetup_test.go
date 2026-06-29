@@ -2906,6 +2906,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create index opcidx_pat with opclass: %v", err)
 	}
 
+	// Slice 313: a CREATE INDEX with a non-default per-column COLLATE must
+	// round-trip the collation. pg_get_indexdef_worker (ruleutils.c) emits the
+	// collation after the column/expression and BEFORE the operator class (via
+	// generate_collation_name, which quotes the collname as an identifier),
+	// suppressing the type's default collation. The gap was the sibling of slice
+	// 312: parseIndexColumnList consumed the COLLATE name but DISCARDED it, and
+	// catalog.Index had no per-column collation field, so `CREATE INDEX … (a
+	// COLLATE "C")` dumped as a plain `(a)` — silently widening the index back to
+	// the default collation on restore. goopg now threads the collation onto
+	// IndexColOrder.Collation → catalog.Index.ColCollations → BuildIndexDef. A
+	// second key column with the default collation confirms only the explicit one
+	// is emitted.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.collidx (a text, b text)"); err != nil {
+		t.Fatalf("create table collidx: %v", err)
+	}
+	if err := runSQLSimple(t, c, `CREATE INDEX collidx_c ON public.collidx (a COLLATE "C", b)`); err != nil {
+		t.Fatalf("create index collidx_c with collation: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -7323,6 +7342,15 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// opclass on restore — a semantic change (text_pattern_ops vs text_ops).
 		if !strings.Contains(res.Stdout, "CREATE INDEX opcidx_pat ON public.opcidx USING btree (a text_pattern_ops, b);") {
 			t.Errorf("pg_dump dropped the index column operator class; missing the opcidx_pat line\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 313 (asserted):** a CREATE INDEX with a non-default per-column
+		// COLLATE round-trips the collation. pg_get_indexdef_worker emits
+		// ` COLLATE "C"` after the column and before the operator class
+		// (generate_collation_name, ruleutils.c) and suppresses the default
+		// collation on the sibling column `b`. A regression dropping the collation
+		// would silently widen the index back to the default collation on restore.
+		if !strings.Contains(res.Stdout, `CREATE INDEX collidx_c ON public.collidx USING btree (a COLLATE "C", b);`) {
+			t.Errorf("pg_dump dropped the index column collation; missing the collidx_c line\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 119 (asserted):** descending sequences must round-trip through
 		// pg_dump's descending-direction default suppression. A plain

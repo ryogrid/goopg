@@ -1360,7 +1360,13 @@ type Index struct {
 	// so BuildIndexDef (pg_get_indexdef) can re-emit a non-default operator class
 	// after the column. An empty entry (or empty slice) means the column uses its
 	// type's default operator class. DU-002 slice 312.
-	ColOpClasses  []string
+	ColOpClasses []string
+	// ColCollations captures the per-key-column explicit collation name (parallel
+	// to Columns), e.g. "C". It mirrors pg_index.indcollation so BuildIndexDef
+	// (pg_get_indexdef) can re-emit a non-default COLLATE clause after the column
+	// and before the opclass. An empty entry (or empty slice) means the column
+	// uses its type's default collation. DU-002 slice 313.
+	ColCollations []string
 	IsConstraint  bool   // true when index backs a named UNIQUE/PK constraint (not bare CREATE INDEX)
 	IsExclusion   bool   // true when index backs an EXCLUDE USING constraint
 	ExclusionOp   string // per-column exclusion operator (e.g. "=")
@@ -7956,6 +7962,36 @@ func (c *InMemory) IndexesOnTable(table *Table) []*Index {
 
 // BuildIndexDef reconstructs the CREATE INDEX DDL string for an index.
 // Used by pg_indexes.indexdef and pg_get_indexdef(). M0097-0023.
+// quoteCollationIdent renders a collation name the way ruleutils.c
+// generate_collation_name → quote_identifier does: a name is left bare only when
+// it would re-parse as itself (starts with a lowercase letter or underscore and
+// contains only lowercase letters, digits, and underscores); otherwise it is
+// double-quoted with embedded quotes doubled. So "C"/"POSIX" become "C"/"POSIX"
+// (quoted, uppercase) while "ucs_basic" stays bare — matching pg_dump's COLLATE
+// output. Reserved-word quoting is not reproduced (collation names are rarely
+// reserved words); the common collations are covered exactly.
+func quoteCollationIdent(s string) string {
+	if s == "" {
+		return `""`
+	}
+	safe := true
+	for i, c := range s {
+		if i == 0 {
+			if !((c >= 'a' && c <= 'z') || c == '_') {
+				safe = false
+				break
+			}
+		} else if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return s
+	}
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
 func BuildIndexDef(idx *Index) string {
 	var sb strings.Builder
 	sb.WriteString("CREATE ")
@@ -8000,6 +8036,16 @@ func BuildIndexDef(idx *Index) string {
 			}
 		} else {
 			sb.WriteString(col)
+		}
+		// Non-default per-column collation, e.g. ` COLLATE "C"`. ruleutils.c
+		// pg_get_indexdef_worker emits it after the column/expression and before
+		// the operator class, via generate_collation_name (which quotes the
+		// collname as an identifier), suppressing the type's default collation.
+		// goopg records only an explicitly-written collation, so a non-empty entry
+		// is by construction non-default. DU-002 slice 313.
+		if i < len(idx.ColCollations) && idx.ColCollations[i] != "" {
+			sb.WriteString(" COLLATE ")
+			sb.WriteString(quoteCollationIdent(idx.ColCollations[i]))
 		}
 		// Non-default per-column operator class, e.g. ` text_pattern_ops`.
 		// ruleutils.c get_opclass_name emits it after the column/expression (and
