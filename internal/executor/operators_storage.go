@@ -6247,6 +6247,47 @@ func rowHasNullKeyColumn(idx *catalog.Index, cols []catalog.Column, row Row) boo
 	return false
 }
 
+// nndKeyColumnsEqual reports whether two row versions carry an identical NULLS
+// NOT DISTINCT key: the same NULL pattern across the index key columns AND equal
+// encoded values for the non-NULL ones. A no-key-change UPDATE on such an index
+// cannot collide with the row it replaces, so the caller skips the uniqueness
+// probe (important on the ON CONFLICT DO UPDATE path, which runs the check
+// before stamping the old tuple dead). Returns false on any structural mismatch
+// (expression key, missing column) so the caller falls back to probing.
+func nndKeyColumnsEqual(idx *catalog.Index, cols []catalog.Column, oldRow, newRow Row) bool {
+	for _, idxColName := range idx.Columns {
+		if idxColName == "" {
+			return false // expression key — out of scope, treat as changed
+		}
+		ord := -1
+		var col *catalog.Column
+		for i := range cols {
+			if strings.EqualFold(cols[i].Name, idxColName) {
+				ord = i
+				col = &cols[i]
+				break
+			}
+		}
+		if ord < 0 || ord >= len(oldRow) || ord >= len(newRow) {
+			return false
+		}
+		oldNull := oldRow[ord].IsNull()
+		newNull := newRow[ord].IsNull()
+		if oldNull != newNull {
+			return false
+		}
+		if oldNull {
+			continue
+		}
+		oldKey, oerr := encodeBTreeKeyForColumn(oldRow[ord], col, 0)
+		newKey, nerr := encodeBTreeKeyForColumn(newRow[ord], col, 0)
+		if oerr != nil || nerr != nil || !bytes.Equal(oldKey, newKey) {
+			return false
+		}
+	}
+	return true
+}
+
 // nndDetail builds the 23505 DETAIL for a NULLS-NOT-DISTINCT conflict, rendering
 // a NULL key column as the literal `null` (PostgreSQL prints
 // `Key (a)=(null) already exists.`). Datum.Format() returns "" for KindNull, so
@@ -6471,7 +6512,21 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 func indexKeyColumnsChanged(idx *catalog.Index, cols []catalog.Column, oldRow, newRow Row, cat catalog.Catalog) bool {
 	oldKey, oerr := encodeIndexKeyFromCols(idx, cols, oldRow, cat)
 	newKey, nerr := encodeIndexKeyFromCols(idx, cols, newRow, cat)
-	if oerr != nil || nerr != nil || oldKey == nil || newKey == nil {
+	if oerr != nil || nerr != nil {
+		return true
+	}
+	if oldKey == nil || newKey == nil {
+		// A NULL key column makes encodeIndexKeyFromCols return nil. Under the
+		// default (NULLS DISTINCT) semantics such a row never collides, so treat
+		// it as "changed" to force the probe (which then no-ops). Under NULLS
+		// NOT DISTINCT the NULL columns DO form part of the key, so compare the
+		// NULL pattern + non-NULL values directly: a no-key-change NULL→NULL
+		// UPDATE is genuinely unchanged and must skip the probe to avoid
+		// self-conflicting with the not-yet-stamped old version (the ON CONFLICT
+		// DO UPDATE path checks before stamping). Design 0119-0004.
+		if idx.NullsNotDistinct {
+			return !nndKeyColumnsEqual(idx, cols, oldRow, newRow)
+		}
 		return true
 	}
 	return !bytes.Equal(oldKey, newKey)

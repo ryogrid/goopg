@@ -1,6 +1,8 @@
 # 0119-0004 — `NULLS NOT DISTINCT` uniqueness *enforcement* at INSERT/UPDATE
 
-Status: **proposed**
+Status: **implemented** (plain INSERT/UPDATE — §1–§7 — and the ON CONFLICT /
+upsert-arbiter follow-up — §8 — landed; `CREATE UNIQUE INDEX` build over
+NULL-keyed data and the reordered-partition arbiter remain deferred, ledger)
 Source task: M0119-0004 (deferral-ledger backlog consumption; surfaced by
 M0110-0001 / DU-002 slices 134–138). Milestone
 `docs/milestones/0119-deferral-ledger-backlog-consumption.md`.
@@ -216,3 +218,66 @@ goopg's byte-key btree has no per-attribute null bitmap.
   matches the btree path exactly (no new visibility logic).
 * Performance on a large NND table with frequent NULL-keyed writes — acceptable
   given rarity; documented as a future sentinel-key optimisation.
+
+## 8. Follow-up LANDED (2026-06-29, loop #15) — `ON CONFLICT` / upsert arbiter
+
+Closes the P0 behavioral divergence first listed in §2.1: a NULL-keyed
+`INSERT … ON CONFLICT (nndcol) DO UPDATE|NOTHING` against an NND arbiter index
+was **inserting a duplicate** (the arbiter probe saw `conflicted=false`) instead
+of routing to the conflict action.
+
+**Mechanism — reuse the §3 heap-scan, no new probe semantics.** `encodeArbiterKey`
+still returns a `nil` key on a NULL conflict-key column (NULLs distinct by
+default), so `probeArbiterWaiting` correctly reports no btree conflict. The
+upsert `Next` loop now adds one gated fallback right after that probe, on the
+non-reordered path (`partLeaf == nil`):
+
+```
+if !conflicted && partLeaf == nil {
+    nndPtr, nndRow, nndFound := o.probeArbiterNND(rel, writeTbl, cols, inserted)
+    if nndFound { conflicted = true; conflictPtr = nndPtr; conflictRow = nndRow }
+}
+```
+
+`probeArbiterNND` is gated on `idx.NullsNotDistinct && rowHasNullKeyColumn(...)`,
+calls the SAME `checkNullsNotDistinctViaHeapScan` matcher the plain
+INSERT/UPDATE check uses, and decodes the conflicting tuple (`PageGetHeapTuple` →
+`DecodeHeapTupleRow`) so the existing `DO NOTHING` (silent skip) and `DO UPDATE`
+(targets `conflictPtr`/`conflictRow`) branches work unchanged. `arbiterKey`
+stays `nil`; `findInProgressConflictKey(nil)` is already a no-op, so the DO
+UPDATE re-probe path is safe.
+
+**Self-conflict fix on the DO UPDATE branch.** Unlike a plain UPDATE, the upsert
+runs `checkUniqueIndexesForUpdate` **before** `applyUpdate` stamps the old tuple
+dead, so the §3-step-2 "xmax == selfXID ⇒ dead" trick does not yet apply and the
+NND heap scan would re-find the still-live old version → false `23505`. Fixed by
+making the existing unchanged-key skip NND-aware: `indexKeyColumnsChanged` now,
+when `encodeIndexKeyFromCols` returns a `nil` key on a `NullsNotDistinct` index,
+compares the NULL pattern + non-NULL values of the two versions directly (new
+`nndKeyColumnsEqual`) instead of unconditionally reporting "changed". A
+no-key-change NULL→NULL UPDATE therefore skips the probe (cannot self-collide),
+while a genuine key change (e.g. `5 → NULL` colliding with another NULL row) is
+still reported as changed and probed. This also makes the plain-UPDATE
+self-skip independent of stamp ordering (more robust; the §3-step-2 note about
+`indexKeyColumnsChanged` not protecting NULL→NULL is now obsolete).
+
+**Scope deferred (ledger):** a *reordered* partition leaf
+(`partLeaf != nil`, leaf column order ≠ parent) is skipped — the candidate row
+is in parent order while the heap-scan matcher needs leaf-order columns; an
+exotic NND-on-reordered-partition combination, ledgered for a later slice.
+Concurrent in-flight NULL-keyed NND conflicts (the spec/wait machinery) ride the
+single-session heap scan; full speculative-token integration for the NULL case
+is not attempted (the btree spec path never sees a NULL key).
+
+**Touch points (follow-up):** `internal/executor/operators_upsert.go`
+(`probeArbiterNND` + `Next` fallback), `internal/executor/operators_storage.go`
+(`indexKeyColumnsChanged` NND branch + `nndKeyColumnsEqual` helper),
+`internal/executor/nulls_not_distinct_test.go` (3 new tests:
+`TestNullsNotDistinctOnConflictDoNothing` / `…DoUpdate` /
+`TestNullsDistinctOnConflictControlInserts`).
+
+**Gates:** full `internal/executor` suite PASS + `-race` on NND/upsert/conflict
+PASS; `TestPort_IsolationInsertConflict*` + `TestPort_IsolationMerge*` (M0118-0006
+group) PASS (58 s); zero blast radius outside NND indexes (every new branch
+gated on `idx.NullsNotDistinct`; non-NND `indexKeyColumnsChanged` returns the
+identical result as before). pgbench smoke via the pre-commit hook.

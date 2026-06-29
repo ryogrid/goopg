@@ -2076,10 +2076,21 @@ documentation-only and is exempt from the design-doc requirement.)
       column is NULL on an `idx.NullsNotDistinct` index, raising 23505 for a
       duplicate NULL pattern; btree/scan-probe/codec untouched, gated dead-code
       for every non-NND index. Tests `internal/executor/nulls_not_distinct_test.go`.
+      **2026-06-29 (loop #15, design 0119-0004 §8): NND ON CONFLICT/upsert
+      arbiter follow-up LANDED** — a NULL-keyed `INSERT … ON CONFLICT (nndcol)
+      DO UPDATE/NOTHING` against an NND arbiter index now routes to the conflict
+      action instead of inserting a duplicate. New `probeArbiterNND`
+      (operators_upsert.go) reuses `checkNullsNotDistinctViaHeapScan`; the upsert
+      `Next` loop falls back to it after the btree arbiter probe on the
+      non-reordered path; `indexKeyColumnsChanged` made NND-aware
+      (`nndKeyColumnsEqual`, operators_storage.go) so a NULL→NULL no-key-change
+      DO UPDATE skips the pre-stamp self-conflict probe. 3 new upsert tests +
+      `TestPort_IsolationInsertConflict*`/`Merge*` PASS; zero blast radius
+      outside NND.
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
       battery; the **deferred-constraint-checking-at-COMMIT** engine gap; and the
-      NND **ON CONFLICT/upsert** + **CREATE UNIQUE INDEX build** follow-ups
-      (ledger 2026-06-29).
+      NND **CREATE UNIQUE INDEX build** (42804) + **reordered-partition-leaf
+      arbiter** follow-ups (ledger 2026-06-29).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
