@@ -422,6 +422,52 @@ func TestRevokeAllFromOwnerEmptyArray(t *testing.T) {
 	}
 }
 
+// TestRevokeAllFromSchemaOwnerEmptyArray covers DU-002 slice 342: a
+// `REVOKE ALL … ON SCHEMA … FROM owner` strips the owner's implicit default
+// schema privileges (USAGE, CREATE) and leaves pg_namespace.nspacl as a
+// non-NULL *empty* aclitem array {} (distinct from the NULL of a never-granted
+// schema). This is the namespace analogue of TestRevokeAllFromOwnerEmptyArray:
+// the empty-array (relACLEmptied) state is object-type-agnostic, so the same
+// MaterializeOwnerACL → RevokeTablePrivilege sequence applies, only with the
+// schema owner-default set ("UC") instead of the table set.
+func TestRevokeAllFromSchemaOwnerEmptyArray(t *testing.T) {
+	c := NewInMemory()
+	const schemaOID = 16980
+	allSchema := []string{"USAGE", "CREATE"}
+
+	// REVOKE ALL ON SCHEMA FROM postgres: materialize the owner default (UC), then
+	// drop every privilege → nspacl is the empty array "{}", NOT NULL.
+	c.MaterializeOwnerACL(schemaOID, "postgres", allSchema)
+	for _, p := range allSchema {
+		c.RevokeTablePrivilege(schemaOID, "postgres", p)
+	}
+	if got := c.NamespaceACLText(schemaOID); got != "{}" {
+		t.Fatalf("nspacl after REVOKE ALL ON SCHEMA FROM postgres = %q; want %q (empty array, not NULL)", got, "{}")
+	}
+
+	// A second owner-side revoke after the array is empty is a no-op: the owner
+	// holds nothing, so MaterializeOwnerACL must not bring the schema privileges
+	// back.
+	c.MaterializeOwnerACL(schemaOID, "postgres", allSchema)
+	c.RevokeTablePrivilege(schemaOID, "postgres", "USAGE")
+	if got := c.NamespaceACLText(schemaOID); got != "{}" {
+		t.Fatalf("nspacl after second owner revoke on empty array = %q; want %q", got, "{}")
+	}
+
+	// A schema that never had a grant stays NULL — the empty-array state must not
+	// leak across OIDs.
+	if got := c.NamespaceACLText(16981); got != "" {
+		t.Fatalf("nspacl of unrelated never-granted schema = %q; want \"\" (NULL)", got)
+	}
+
+	// Re-granting a privilege to the owner re-materializes a real aclitem and
+	// clears the empty-array state.
+	c.GrantTablePrivilege(schemaOID, "postgres", "USAGE")
+	if got := c.NamespaceACLText(schemaOID); got != "{postgres=U/postgres}" {
+		t.Fatalf("nspacl after owner re-GRANT following empty array = %q; want %q", got, "{postgres=U/postgres}")
+	}
+}
+
 // TestACLQuoteName unit-checks the putid emulation directly, including the
 // double-quote-doubling and multibyte (high-bit) cases that are awkward to drive
 // through a full GRANT.

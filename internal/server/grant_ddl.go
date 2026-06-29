@@ -276,6 +276,17 @@ func (s *Server) recordSchemaRevoke(objPart, rolePart, privPart string) {
 			continue
 		}
 		for _, role := range roles {
+			// An owner-side REVOKE (`REVOKE … FROM postgres`) materializes the
+			// owner's full default schema ACL first so the surviving privileges
+			// render explicitly; PostgreSQL leaves nspacl NULL until then.
+			// allSchemaPrivileges is the owner's full default set for a namespace
+			// (USAGE, CREATE), so a `REVOKE ALL … ON SCHEMA … FROM postgres` empties
+			// the materialized owner entry and the catalog records nspacl = {} (the
+			// type-agnostic relACLEmptied path), making pg_dump re-emit a bare
+			// `REVOKE ALL ON SCHEMA … FROM postgres;`. DU-002 slice 342.
+			if strings.EqualFold(role, aclOwnerRole) {
+				s.cfg.Catalog.MaterializeOwnerACL(oid, aclOwnerRole, allSchemaPrivileges)
+			}
 			for _, p := range privs {
 				s.cfg.Catalog.RevokeTablePrivilege(oid, role, p)
 			}

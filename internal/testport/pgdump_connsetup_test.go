@@ -3362,6 +3362,27 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("revoke all on ownrevall_t from postgres: %v", err)
 	}
 
+	// Slice 342: a full owner-side REVOKE ALL ON SCHEMA must round-trip as the
+	// empty nspacl array — the namespace analogue of slice 341. `REVOKE ALL ON
+	// SCHEMA ownrevall_sch FROM postgres` strips the owner's implicit default
+	// schema privileges (USAGE, CREATE), leaving pg_namespace.nspacl = `{}` (a
+	// non-NULL but empty array, distinct from the NULL of a never-granted schema).
+	// pg_dump's buildACLCommands diffs {} against acldefault('n', 10) =
+	// "{postgres=UC/postgres}" and emits a bare `REVOKE ALL ON SCHEMA … FROM
+	// postgres;` with no re-GRANT. Before this slice the schema REVOKE recorder
+	// (recordSchemaRevoke) only modelled grantees, so an owner-side revoke was
+	// silently dropped and nspacl stayed NULL → pg_dump emitted nothing, restoring
+	// the owner's default schema privileges. recordSchemaRevoke now materializes
+	// the owner's default schema ACL via Catalog.MaterializeOwnerACL before
+	// removing the revoked bits (the type-agnostic relACLEmptied path shared with
+	// slice 341).
+	if err := runSQLSimple(t, c, "CREATE SCHEMA ownrevall_sch"); err != nil {
+		t.Fatalf("create schema ownrevall_sch: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE ALL ON SCHEMA ownrevall_sch FROM postgres"); err != nil {
+		t.Fatalf("revoke all on schema ownrevall_sch from postgres: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7283,6 +7304,20 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// privileges after REVOKE ALL).
 		if strings.Contains(res.Stdout, "GRANT") && strings.Contains(res.Stdout, "ownrevall_t TO postgres") {
 			t.Errorf("pg_dump re-granted privileges to the owner after REVOKE ALL\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 342 (asserted):** a full owner-side REVOKE ALL ON SCHEMA round-trips
+		// as the empty nspacl array (the namespace analogue of slice 341). `REVOKE ALL
+		// ON SCHEMA ownrevall_sch FROM postgres` leaves nspacl = `{}`, which pg_dump
+		// renders as a bare `REVOKE ALL ON SCHEMA … FROM postgres;` with NO re-GRANT.
+		// Before this slice the owner schema REVOKE ALL was a no-op (nspacl stayed
+		// NULL) so pg_dump emitted nothing.
+		if want := "REVOKE ALL ON SCHEMA ownrevall_sch FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the owner-side schema REVOKE ALL: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// No GRANT … ON SCHEMA ownrevall_sch … TO postgres must follow (the owner
+		// holds no schema privileges after REVOKE ALL).
+		if strings.Contains(res.Stdout, "GRANT") && strings.Contains(res.Stdout, "ON SCHEMA ownrevall_sch TO postgres") {
+			t.Errorf("pg_dump re-granted schema privileges to the owner after REVOKE ALL\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

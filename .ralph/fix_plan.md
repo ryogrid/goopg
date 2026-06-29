@@ -2742,6 +2742,28 @@ documentation-only and is exempt from the design-doc requirement.)
       byte-identical vs real pg_dump 18.3) PASS. Still open: column-level
       (`attacl`)/database (`datacl`) GRANT, owner-zero-coexisting-with-grantee
       (`{bob=r/postgres}`) modelling, schema/sequence owner REVOKE ALL.
+
+      **2026-06-30 (loop #67, design 0119-0004-schema-owner-revoke-all-empty-nspacl-pgdump,
+      DU-002 slice 342):** the schema analogue of slice 341. `REVOKE ALL ON SCHEMA
+      ownrevall_sch FROM postgres` strips the owner's implicit default schema
+      privileges (USAGE, CREATE), leaving `pg_namespace.nspacl` = `{}` (non-NULL
+      empty array, distinct from a never-granted schema's NULL). pg_dump diffs `{}`
+      against `acldefault('n', 10)` = `{postgres=UC/postgres}` and emits a bare
+      `REVOKE ALL ON SCHEMA ownrevall_sch FROM postgres;` with NO re-GRANT. goopg's
+      `recordSchemaRevoke` (slice 339) modelled only grantees, so an owner-side
+      schema revoke found no entry → nspacl stayed NULL → pg_dump emitted nothing.
+      Fix (server-only — catalog primitives are already type-agnostic):
+      `recordSchemaRevoke` now mirrors the table path, calling
+      `MaterializeOwnerACL(oid, "postgres", allSchemaPrivileges)` before the
+      per-priv `RevokeTablePrivilege` when the role is the owner; `REVOKE ALL`
+      empties the materialized owner entry and the catalog records `nspacl = {}`
+      via the shared `relACLEmptied` path (rendered through `NamespaceACLText`).
+      No catalog change. Tests `TestRevokeAllFromSchemaOwnerEmptyArray` (new) +
+      reused `NamespaceACLText`/`RevokeAllFromOwnerEmptyArray`/`MaterializeOwnerACL`
+      + slice-342 `TestPort_PgDumpConnectionSetup` (exact `REVOKE ALL ON SCHEMA …`,
+      no owner re-GRANT; byte-identical vs real pg_dump 18.3) PASS. Still open:
+      column-level (`attacl`)/database (`datacl`) GRANT,
+      owner-zero-coexisting-with-grantee modelling, sequence owner REVOKE ALL.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
