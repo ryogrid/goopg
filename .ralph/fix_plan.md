@@ -2010,23 +2010,61 @@ implementation begins, the picking agent MUST (1) create a design doc at
 after the reviewed design doc exists. (The M0119-0001 triage task is
 documentation-only and is exempt from the design-doc requirement.)
 
-- [ ] **M0119-0001 — Ledger triage pass (doc-only, no design doc).** Walk every
-      `status = -` row in `.ralph/deferral_ledger.md`. For each, determine whether
-      the deferred scope was already resolved (closed by a later ledger row, a
-      promotion, or current code — cite the evidence) vs genuinely open. Flip
-      resolved rows' `status` to `resolved`; leave genuinely-open rows `-`. The
-      remaining `-` rows define the actionable backlog that seeds M0119-0002+.
+- [x] **M0119-0001 — Ledger triage pass (doc-only, no design doc). DONE
+      2026-06-29 (loop #13).** Triaged all **224** open (`status = -`) ledger rows
+      against current HEAD (fix_plan promotions + `docs/test-port/*.csv` +
+      `git log` + code), via 6 parallel triage agents under a strict rule (a row
+      is `resolved` only if EVERY deliverable named in its `deferred` column has
+      landed). Result: **178 flipped `-`→`resolved`, 46 remain genuinely open.**
+      The 46 open rows cluster cleanly into the seeded backlog tasks below:
+      - **AC-003 amcheck server tier** (M0119-0006): ~29 rows — `003_check` /
+        `004_verify_heapam` MVCC+TOAST / `005_opclass_damage` need hash/gist/gin/
+        brin/spgist index AMs, `box`/`int4range`/`int4[]` types, STORAGE EXTERNAL
+        TOAST corruption, opclass parity, the heapallindexed heap-scan producer,
+        and the `datconnlimit = -2` invalid-DB filter (runtime shared-catalog write).
+      - **CLOG tail** (M0119-0002): M0117-0006 Part C (remove resident banks),
+        M0117-0007 Part B (live `synchronous_commit=off`), M0117-0008 Part B
+        (on-disk `datfrozenxid` persistence).
+      - **pg_dump 002–010 / DU-002** (M0119-0004): catalog-view parity umbrella,
+        plus two general SQL-engine gaps surfaced here — NULLS-NOT-DISTINCT
+        *enforcement* at INSERT/UPDATE (dump fidelity only today) and
+        deferred-constraint *checking at COMMIT* (goopg checks immediately).
+      - **pg_waldump WD-002** (M0119-0005); **pg_basebackup 011 in-place
+        tablespace + 030 recvlogical** (M0095-0003 / M0119-0007).
+      - **NEW open items not in the seeded list:** `M0118-0129` (HOT-update WAL
+        atomicity — grouped old+new WAL record + cross-page HOT + TOAST orphan
+        revert) and `M0118-0130` (B-tree buffer-pool concurrent pin/unpin
+        correctness → Lehman-Yao lock coupling / `splitMu` removal). Both are
+        deferred *improvements*, not failing specs.
+      Two seeded tasks are now **empty backlog** (mark before picking): **M0119-0003**
+      — the triage found every listed initdb option (`--encoding`,
+      `--locale`/`--lc-*`/`--locale-provider`/`--icu-locale`, `--allow-group-access`,
+      `--auth*`/`--pwfile`, `--sync-method`/`--no-sync-data-files`,
+      `--set`/`--text-search-config`) AND the `--data-checksums` default-ON flip
+      already landed on this branch (`internal/initdb/{encoding,locale}.go`,
+      `Options.{SyncMethod,NoSyncDataFiles,…}`, `cmd/goopg start` `fs.Bool("k", true)`);
+      ledger rows 18/22–27 are `resolved`. **M0119-0008** — predicate-gin/gist are
+      PROMOTED (M0118-0002 group COMPLETE); the only residual isolation `failed`
+      spec is `deadlock-parallel` (infeasible — no parallel-query lock groups), and
+      it has no open ledger row of its own.
 - [ ] **M0119-0002 — CLOG store swap, Part B** (source: M0117-0006 / M0117-0007 /
       M0117-0008; see M0117 section + ledger rows). Live CLOG store swap (pool
       replaces banks) per the design-0117-0006 Part B blueprint. Highest blast
       radius (Hard-won Rule #1): dedicated full-gate session (`-race` mvcc+wal,
       xlog_replay, heterogeneous PG-standby E2E, fresh-server TPC-H Q12/Q13).
-- [ ] **M0119-0003 — initdb remaining options** (source: M0102-0010; see M0102
-      ledger rows). One option per design-doc-backed task, in `001_initdb.pl`
-      order: `--encoding`, `--locale`/`--lc-*`/`--locale-provider`/`--icu-locale`,
-      `--data-checksums` default-ON flip, `--allow-group-access`, `--auth*`/
-      `--pwfile`, `--sync-method`/`--no-sync-data-files`, `--set`/
-      `--text-search-config`.
+- [x] **M0119-0003 — initdb remaining options. RESOLVED by triage 2026-06-29
+      (M0119-0001), no separate impl loop needed.** Every listed option already
+      landed on this branch — `--encoding` (`internal/initdb/encoding.go`),
+      `--locale`/`--lc-*`/`--locale-provider`/`--icu-locale` (`locale.go` +
+      `Options.{Locale,LCCollate,…,LocaleProvider,ICULocale,ICURules}`),
+      `--allow-group-access`, `--auth*`/`--pwfile` (`auth_bootstrap.go`),
+      `--sync-method`/`--no-sync-data-files` (`Options.SyncMethod`/`NoSyncDataFiles`,
+      `syncfs_linux.go`), `--set`/`--text-search-config` (`Options.{ExtraGUC,
+      TextSearchConfig}`), and the `--data-checksums` **default-ON flip**
+      (`cmd/goopg start` `fs.Bool("k", true, …)`). All wired through
+      `initdb.Options` in `cmd/goopg/main.go`. Ledger rows 18/22–27 are `resolved`.
+      (If `001_initdb.pl` TAP assertions per option are later wanted, that is a
+      fresh D-001-scoped test-port task, not this implementation backlog.)
 - [ ] **M0119-0004 — pg_dump 002–010 TAP** (source: M0110-0001; see M0110
       section). Schema dump, dump/restore round-trip, parallel, filter-file,
       connstr — advance the catalog-view parity battery slice-by-slice.
@@ -2040,12 +2078,14 @@ documentation-only and is exempt from the design-doc requirement.)
 - [ ] **M0119-0007 — pg_basebackup recvlogical** (source: M0095-0003; see M0095
       section). `030 recvlogical` — blocked on logical decoding (tracks the
       logical-replication milestone / D-004).
-- [ ] **M0119-0008 — isolation residual** (source: M0118-0002 / M0118-0004). Verify
-      via triage first: predicate-gin / predicate-gist AM-grain SSI and
-      `deadlock-parallel`. Recent promotions may already cover predicate-gin/gist
-      (M0118-0002 group COMPLETE) — mark those rows `resolved` if so;
-      `deadlock-parallel` needs parallel-worker lock groups (no parallel query in
-      goopg yet).
+- [x] **M0119-0008 — isolation residual. RESOLVED by triage 2026-06-29
+      (M0119-0001) — no actionable backlog.** predicate-gin AND predicate-gist are
+      PROMOTED (M0118-0002 group COMPLETE; designs 0118-0137/0118-0140); their
+      ledger rows (227–235) are `resolved`. The ONLY remaining `failed` isolation
+      spec in the whole suite is `deadlock-parallel`, which is **infeasible** in
+      goopg today (needs a parallel-query worker lock-group abstraction goopg has
+      no subsystem for) and carries no open ledger row of its own. Nothing
+      actionable until parallel query lands.
 
 > This task list is **seeded, not exhaustive.** M0119-0001 triage plus every
 > future deferral-ledger entry (any new `status = -` row) feed additional M0119

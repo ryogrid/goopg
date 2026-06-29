@@ -1,29 +1,12 @@
-Task: M0117-0006 follow-up — wire the `transaction_buffers` GUC value into
-`CLog.SetCLOGBuffers` from `initdb.Open`. LANDED this loop (#12).
+(idle — nothing in flight)
 
-What landed (the noted small follow-up under M0117-0006 Part B):
-- New `OpenOptions.TransactionBuffers int` (internal/initdb/open.go). `Open` calls
-  `clog.SetCLOGBuffers(opts.TransactionBuffers)` immediately BEFORE
-  `EnablePGSLRUMirror` (a no-op once the pool is created).
-- `cmd/goopg start` reads `intGUC(registry, "transaction_buffers", 0)` and passes
-  it via the OpenOptions literal (cmd/goopg/main.go).
-- Boot default 0 → EffectiveCLOGBuffers(0,0)=16 (auto floor) → behaviour UNCHANGED
-  for every default deployment. A non-zero postgresql.conf override now actually
-  sizes the live CLOG SLRU pool instead of being silently dropped.
-
-Files: internal/initdb/open.go (OpenOptions field + SetCLOGBuffers call),
-cmd/goopg/main.go (GUC read + literal), cmd/goopg/main_test.go (new
-TestTransactionBuffersFromGUC + _NilRegistry), internal/mvcc/clog_bufferpool_live_test.go
-(new TestSetCLOGBuffersSizesPool), docs/design/0117-0006-*.md, fix_plan.md.
-
-Gates run (ALL PASS): go build cmd+initdb; gofmt -l clean; go vet mvcc+initdb+cmd
-clean; -race ./internal/mvcc/... ; cmd/goopg + internal/initdb full suites; new
-targeted tests. pgbench smoke on commit (pre-commit hook). NOT executor/planner/
-codec — startup-wiring only, default path byte-identical, so no TPC-H spot-check
-needed (hook pgbench exercises CLOG pool through TPC-B).
-
-Next step: COMMIT (done if you see this with a clean tree). Then the remaining
-M0117-0006 work is **Part C** = remove the resident `banks` (16× memory
-reduction) — separate focused loop: migrate every no-mirror `&CLog{}` unit test
-to the pool path first, re-init data dir on the memory-model change, high blast
-radius (memory + concurrency + recovery). Box stays unchecked until Part C lands.
+Last loop (#13): M0119-0001 ledger triage pass COMPLETE + committed. Triaged all
+224 open ledger rows → 178 flipped to `resolved`, 46 remain genuinely open.
+M0119-0003 (initdb options) and M0119-0008 (isolation residual) marked resolved
+by the triage (empty backlog). Remaining actionable M0119 backlog: M0119-0002
+(CLOG Part C / 0007 Part B / 0008 Part B — Effort-L full-gate), M0119-0004
+(pg_dump 002–010 + NULLS-enforcement + deferred-constraint-at-COMMIT), M0119-0005
+(pg_waldump WD-002), M0119-0006 (AC-003 amcheck server tier — needs index AMs),
+M0119-0007 (pg_basebackup 011/030), plus NEW: M0118-0129 (HOT-update WAL
+atomicity) and M0118-0130 (btree buffer-pool concurrency). Next loop: pick the
+topmost actionable item.
