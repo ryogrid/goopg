@@ -5435,6 +5435,43 @@ func (p *parser) parseAlter() (Stmt, error) {
 			return stmt, nil
 		}
 	}
+	// {ENABLE | DISABLE} [REPLICA | ALWAYS] RULE name — records the rule's
+	// pg_rewrite.ev_enabled so pg_dump's dumpRule re-emits the ALTER TABLE clause.
+	// goopg implements no query rewrite; this is schema fidelity only. Detected
+	// before the generic ENABLE/DISABLE no-op arm below (a RULE target is captured
+	// as a real action; TRIGGER and other variants still fall through). DU-002
+	// slice 325.
+	if p.cur().Kind == TokenIdent &&
+		(strings.EqualFold(p.cur().Value, "enable") || strings.EqualFold(p.cur().Value, "disable")) {
+		isEnable := strings.EqualFold(p.cur().Value, "enable")
+		// state = ev_enabled char; mod = peek index of the word that must be RULE.
+		state := byte('D')
+		mod := 1
+		if isEnable {
+			state = 'O'
+			switch {
+			case strings.EqualFold(p.peek(1).Value, "replica"):
+				state, mod = 'R', 2
+			case strings.EqualFold(p.peek(1).Value, "always"):
+				state, mod = 'A', 2
+			}
+		}
+		if strings.EqualFold(p.peek(mod).Value, "rule") {
+			for i := 0; i <= mod; i++ {
+				p.advance() // ENABLE/DISABLE [REPLICA|ALWAYS] RULE
+			}
+			ruleNameTok, err := p.parseIdent()
+			if err != nil {
+				return nil, err
+			}
+			stmt.Actions = append(stmt.Actions, AlterTableAction{
+				Kind:             AlterTableEnableDisableRule,
+				RuleName:         identText(ruleNameTok),
+				RuleEnabledState: state,
+			})
+			return stmt, nil
+		}
+	}
 	// ENABLE/DISABLE [REPLICA|ALWAYS] TRIGGER | RULE — semantic no-op in v0.
 	// The TRIGGER variant takes a ShareRowExclusiveLock in PostgreSQL, so flag
 	// it for the executor to acquire that transaction-scoped lock (alter-table-3

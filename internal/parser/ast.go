@@ -2108,6 +2108,15 @@ const (
 	// AlterTableNoForceRowSecurity — `NO FORCE ROW LEVEL SECURITY`. Resets
 	// pg_class.relforcerowsecurity to false. The inverse of FORCE. DU-002 slice 322.
 	AlterTableNoForceRowSecurity
+	// AlterTableEnableDisableRule — `{ENABLE | DISABLE} [REPLICA | ALWAYS] RULE
+	// name`. Sets pg_rewrite.ev_enabled for the named rule (ATExecEnableDisableRule,
+	// tablecmds.c): ENABLE→'O' (origin), DISABLE→'D', ENABLE REPLICA→'R', ENABLE
+	// ALWAYS→'A'. goopg implements no query rewrite, so this only records the flag
+	// for schema fidelity: pg_dump's dumpRule re-emits `ALTER TABLE <t>
+	// {ENABLE ALWAYS|ENABLE REPLICA|DISABLE} RULE <name>;` for any rule whose
+	// ev_enabled is not 'O' (pg_dump.c). RuleName names the target rule and
+	// RuleEnabledState carries the ev_enabled char. DU-002 slice 325.
+	AlterTableEnableDisableRule
 )
 
 // AlterTableAction is one clause inside ALTER TABLE. v0 covers the
@@ -2206,6 +2215,14 @@ type AlterTableAction struct {
 	// detach semantics can branch on it. The executor currently performs a
 	// synchronous detach regardless. M0118-0008.
 	DetachConcurrently bool
+
+	// RuleName is the target rule name for AlterTableEnableDisableRule
+	// (`{ENABLE|DISABLE} [REPLICA|ALWAYS] RULE name`). DU-002 slice 325.
+	RuleName string
+	// RuleEnabledState is the pg_rewrite.ev_enabled char set by
+	// AlterTableEnableDisableRule: 'O' (ENABLE / origin), 'D' (DISABLE),
+	// 'R' (ENABLE REPLICA), 'A' (ENABLE ALWAYS). DU-002 slice 325.
+	RuleEnabledState byte
 }
 
 func (a AlterTableAction) Pos() int { return a.pos }

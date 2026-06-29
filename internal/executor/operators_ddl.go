@@ -6696,6 +6696,28 @@ func (o *ddlOp) execAlterTable(s *parser.AlterTableStmt) error {
 					}
 				}
 			}
+		case parser.AlterTableEnableDisableRule:
+			// {ENABLE|DISABLE} [REPLICA|ALWAYS] RULE name → pg_rewrite.ev_enabled
+			// for the named rule (ATExecEnableDisableRule, tablecmds.c). goopg
+			// implements no query rewrite, so this only records the flag for schema
+			// fidelity: pg_dump's dumpRule re-emits `ALTER TABLE <t> {ENABLE
+			// ALWAYS|ENABLE REPLICA|DISABLE} RULE <name>;` for any rule whose
+			// ev_enabled is not 'O'. pg_rewrite is a fully virtual catalog built live
+			// from tbl.Rules (unlike the heap-backed pg_class RLS flags above), so
+			// mutating the RuleInfo in place is immediately visible to pg_dump — no
+			// heap re-sync required. DU-002 slice 325.
+			found := false
+			for i := range tbl.Rules {
+				if tbl.Rules[i].Name == act.RuleName {
+					tbl.Rules[i].Enabled = act.RuleEnabledState
+					found = true
+					break
+				}
+			}
+			if !found {
+				return &ExecError{Code: "42704", Pos: s.Pos(),
+					Message: fmt.Sprintf("rule %q for relation %q does not exist", act.RuleName, tbl.Name)}
+			}
 		case parser.AlterTableSetReloptions:
 			// SET (param = value, …) — merge table-level storage parameters into the
 			// relation's reloptions. pg_class.reloptions is rendered from the live

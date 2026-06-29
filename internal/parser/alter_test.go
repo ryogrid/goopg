@@ -321,6 +321,57 @@ func TestParseAlterTableRowSecurity(t *testing.T) {
 	}
 }
 
+// TestParseAlterTableEnableDisableRule covers `ALTER TABLE … {ENABLE|DISABLE}
+// [REPLICA|ALWAYS] RULE name` (DU-002 slice 325). Each form records a single
+// AlterTableEnableDisableRule action carrying the target rule name and the
+// pg_rewrite.ev_enabled char. ENABLE/DISABLE TRIGGER must still fall to the
+// no-op trigger arm, not be captured as a rule action.
+func TestParseAlterTableEnableDisableRule(t *testing.T) {
+	cases := []struct {
+		sql   string
+		name  string
+		state byte
+	}{
+		{"ALTER TABLE t ENABLE RULE r", "r", 'O'},
+		{"ALTER TABLE t DISABLE RULE r", "r", 'D'},
+		{"ALTER TABLE t ENABLE REPLICA RULE r", "r", 'R'},
+		{"ALTER TABLE t ENABLE ALWAYS RULE r", "r", 'A'},
+		{`ALTER TABLE t DISABLE RULE "MyRule"`, "MyRule", 'D'},
+	}
+	for _, tc := range cases {
+		stmts, err := Parse(tc.sql)
+		if err != nil {
+			t.Fatalf("Parse %q: %v", tc.sql, err)
+		}
+		at, ok := stmts[0].(*AlterTableStmt)
+		if !ok {
+			t.Fatalf("%q: got %T", tc.sql, stmts[0])
+		}
+		if len(at.Actions) != 1 || at.Actions[0].Kind != AlterTableEnableDisableRule {
+			t.Fatalf("%q: actions=%+v want one AlterTableEnableDisableRule", tc.sql, at.Actions)
+		}
+		if at.Actions[0].RuleName != tc.name {
+			t.Errorf("%q: RuleName=%q want %q", tc.sql, at.Actions[0].RuleName, tc.name)
+		}
+		if at.Actions[0].RuleEnabledState != tc.state {
+			t.Errorf("%q: RuleEnabledState=%q want %q", tc.sql, at.Actions[0].RuleEnabledState, tc.state)
+		}
+	}
+
+	// DISABLE TRIGGER must still be the no-op trigger arm, not a rule action.
+	stmts, err := Parse("ALTER TABLE t DISABLE TRIGGER trg")
+	if err != nil {
+		t.Fatalf("Parse DISABLE TRIGGER: %v", err)
+	}
+	at, _ := stmts[0].(*AlterTableStmt)
+	if len(at.Actions) != 0 {
+		t.Fatalf("DISABLE TRIGGER: expected no actions, got %+v", at.Actions)
+	}
+	if !at.EnableDisableTrigger {
+		t.Errorf("DISABLE TRIGGER: EnableDisableTrigger not set")
+	}
+}
+
 // TestParseAlterTableSetDropDefault covers `ALTER TABLE ... ALTER COLUMN c SET
 // DEFAULT <expr>` and `... DROP DEFAULT` (DU-002 slice 269). SET DEFAULT records
 // the parsed expression on DefaultExpr; DROP DEFAULT records the column with a

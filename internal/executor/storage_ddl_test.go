@@ -769,6 +769,84 @@ func TestDDLCreateRuleRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDDLAlterTableRuleEnabledState verifies `ALTER TABLE … {ENABLE|DISABLE}
+// [REPLICA|ALWAYS] RULE name` sets pg_rewrite.ev_enabled for the named rule
+// (origin 'O', disabled 'D', replica 'R', always 'A') so pg_dump's dumpRule
+// re-emits the ALTER TABLE clause, and that an unknown rule name errors 42704.
+// DU-002 slice 325.
+func TestDDLAlterTableRuleEnabledState(t *testing.T) {
+	ctx, cat, cleanup := newDDLFixture(t)
+	defer cleanup()
+
+	if err := runDDL(t, ctx, "CREATE TABLE t (a int)"); err != nil {
+		t.Fatalf("CREATE TABLE: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE r_ins AS ON INSERT TO t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_ins: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE r_upd AS ON UPDATE TO t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_upd: %v", err)
+	}
+	if err := runDDL(t, ctx, "CREATE RULE r_del AS ON DELETE TO t DO INSTEAD NOTHING"); err != nil {
+		t.Fatalf("CREATE RULE r_del: %v", err)
+	}
+	tbl, _ := cat.LookupTable(parser.ObjectName{Name: "t"})
+
+	// A freshly created rule is ev_enabled 'O' (EvEnabled maps the zero value).
+	for _, r := range tbl.Rules {
+		if r.EvEnabled() != 'O' {
+			t.Errorf("fresh rule %s EvEnabled=%q want 'O'", r.Name, r.EvEnabled())
+		}
+	}
+
+	if err := runDDL(t, ctx, "ALTER TABLE t DISABLE RULE r_ins"); err != nil {
+		t.Fatalf("DISABLE RULE r_ins: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER TABLE t ENABLE REPLICA RULE r_upd"); err != nil {
+		t.Fatalf("ENABLE REPLICA RULE r_upd: %v", err)
+	}
+	if err := runDDL(t, ctx, "ALTER TABLE t ENABLE ALWAYS RULE r_del"); err != nil {
+		t.Fatalf("ENABLE ALWAYS RULE r_del: %v", err)
+	}
+
+	// pg_rewrite.ev_enabled (column index 4) reflects the new states live.
+	pgRewrite, _ := cat.LookupTable(parser.ObjectName{Schema: "pg_catalog", Name: "pg_rewrite"})
+	enabled := map[string]string{}
+	for _, r := range pgRewrite.VirtualRows() {
+		enabled[r[1]] = r[4]
+	}
+	if enabled["r_ins"] != "D" {
+		t.Errorf("r_ins ev_enabled=%q want D", enabled["r_ins"])
+	}
+	if enabled["r_upd"] != "R" {
+		t.Errorf("r_upd ev_enabled=%q want R", enabled["r_upd"])
+	}
+	if enabled["r_del"] != "A" {
+		t.Errorf("r_del ev_enabled=%q want A", enabled["r_del"])
+	}
+
+	// ENABLE RULE restores 'O' (origin).
+	if err := runDDL(t, ctx, "ALTER TABLE t ENABLE RULE r_ins"); err != nil {
+		t.Fatalf("ENABLE RULE r_ins: %v", err)
+	}
+	enabled = map[string]string{}
+	for _, r := range pgRewrite.VirtualRows() {
+		enabled[r[1]] = r[4]
+	}
+	if enabled["r_ins"] != "O" {
+		t.Errorf("r_ins ev_enabled after ENABLE=%q want O", enabled["r_ins"])
+	}
+
+	// Unknown rule name → 42704.
+	err := runDDL(t, ctx, "ALTER TABLE t DISABLE RULE no_such_rule")
+	if err == nil {
+		t.Fatal("DISABLE RULE no_such_rule should error")
+	}
+	if ee, ok := err.(*ExecError); !ok || ee.Code != "42704" {
+		t.Errorf("DISABLE RULE no_such_rule err=%v want ExecError 42704", err)
+	}
+}
+
 // TestDDLCreatePublicationEndToEnd pins the M0008 / 0008-0003 SQL
 // surface: `CREATE PUBLICATION p FOR TABLE t` parses, plans,
 // and executes against a Context whose PubSub registry is wired,

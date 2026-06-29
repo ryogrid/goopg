@@ -1219,6 +1219,21 @@ type RuleInfo struct {
 	// Instead is pg_rewrite.is_instead: true for DO INSTEAD NOTHING, false for
 	// DO [ALSO] NOTHING.
 	Instead bool
+	// Enabled is pg_rewrite.ev_enabled set by `ALTER TABLE … {ENABLE|DISABLE}
+	// [REPLICA|ALWAYS] RULE`: 'O' (origin — the default), 'D' (disabled),
+	// 'R' (replica), 'A' (always). A zero value is treated as 'O'. pg_dump's
+	// dumpRule emits an `ALTER TABLE … {ENABLE ALWAYS|ENABLE REPLICA|DISABLE}
+	// RULE <name>;` whenever ev_enabled is not 'O'. DU-002 slice 325.
+	Enabled byte
+}
+
+// EvEnabled returns the rule's pg_rewrite.ev_enabled char, mapping a zero value
+// to the 'O' (origin) default. DU-002 slice 325.
+func (r RuleInfo) EvEnabled() byte {
+	if r.Enabled == 0 {
+		return 'O'
+	}
+	return r.Enabled
 }
 
 // EvType maps the rule's firing event to its pg_rewrite.ev_type "char" code
@@ -6727,7 +6742,7 @@ func (c *InMemory) registerSystemTables() {
 					r.Name,                     // rulename
 					fmt.Sprintf("%d", tbl.OID), // ev_class
 					evType,                     // ev_type
-					"O",                        // ev_enabled (origin — the default)
+					string(r.EvEnabled()),      // ev_enabled ('O' default; ALTER TABLE … RULE sets D/R/A)
 					isInstead,                  // is_instead
 					"",                         // ev_qual  (NULL — unconditional rule)
 					"",                         // ev_action (NULL — DO NOTHING)

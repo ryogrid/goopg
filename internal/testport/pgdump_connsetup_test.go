@@ -3101,6 +3101,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("create rule r_nodel: %v", err)
 	}
 
+	// Slice 325: a rule whose pg_rewrite.ev_enabled is not 'O' must round-trip the
+	// `ALTER TABLE … {ENABLE ALWAYS|ENABLE REPLICA|DISABLE} RULE` clause. pg_dump's
+	// dumpRule reads ev_enabled (getRules) and, for any non-'O' rule, emits the
+	// ALTER TABLE *in addition to* the CREATE RULE (pg_dump.c). Before this slice
+	// ALTER TABLE … RULE was a parse no-op and pg_rewrite hard-coded ev_enabled='O',
+	// so a disabled/replica/always rule restored as plain-enabled. goopg now records
+	// catalog.RuleInfo.Enabled and ATExecEnableDisableRule mutates it (pg_rewrite is
+	// virtual, so the change is immediately visible to pg_dump). goopg implements no
+	// rewrite system — dump fidelity only. Disable r_noupd, set r_nodel ENABLE
+	// ALWAYS; r_noins stays origin ('O', no ALTER TABLE emitted).
+	if err := runSQLSimple(t, c, "ALTER TABLE public.rule_t DISABLE RULE r_noupd"); err != nil {
+		t.Fatalf("disable rule r_noupd: %v", err)
+	}
+	if err := runSQLSimple(t, c, "ALTER TABLE public.rule_t ENABLE ALWAYS RULE r_nodel"); err != nil {
+		t.Fatalf("enable always rule r_nodel: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -6824,6 +6841,23 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, want) {
 				t.Errorf("pg_dump dropped or mis-rendered rule: want %q\n  full stdout=%q", want, res.Stdout)
 			}
+		}
+		// **Slice 325 (asserted):** a rule whose pg_rewrite.ev_enabled is not 'O'
+		// round-trips an `ALTER TABLE … RULE` clause emitted by dumpRule in addition
+		// to the CREATE RULE. r_noupd was DISABLEd ('D') and r_nodel set ENABLE
+		// ALWAYS ('A'); each yields the exact clause below. Verified byte-identical to
+		// real pg_dump 18.3.
+		for _, want := range []string{
+			"ALTER TABLE public.rule_t DISABLE RULE r_noupd;",
+			"ALTER TABLE public.rule_t ENABLE ALWAYS RULE r_nodel;",
+		} {
+			if !strings.Contains(res.Stdout, want) {
+				t.Errorf("pg_dump dropped ALTER TABLE … RULE clause: want %q\n  full stdout=%q", want, res.Stdout)
+			}
+		}
+		// r_noins stays origin ('O'); dumpRule emits NO ALTER TABLE … RULE for it.
+		if strings.Contains(res.Stdout, "RULE r_noins;") {
+			t.Errorf("pg_dump emitted a spurious ALTER TABLE … RULE r_noins (rule is origin-enabled)\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must
 		// round-trip. Slice 147 created public.add_one(integer) only as a COMMENT

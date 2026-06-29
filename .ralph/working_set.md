@@ -1,43 +1,37 @@
 (idle — nothing in flight)
 
-Last loop (#46): M0119-0004 **CREATE RULE (DO [INSTEAD] NOTHING) round-trip in
-pg_dump** (DU-002 slice 324) — LANDED, committed.
+Last loop (#47): M0119-0004 **ALTER TABLE … {ENABLE|DISABLE} [REPLICA|ALWAYS]
+RULE round-trip in pg_dump** (DU-002 slice 325) — LANDED, committed.
 
-pg_dump's getRules reads pg_rewrite and dumpRule re-emits each non-view rule via
-pg_get_ruledef(oid) verbatim. goopg parsed CREATE RULE only as a CompatNoopStmt
-(recorded nowhere) + empty pg_rewrite stub, so a rewrite rule was silently lost
-on dump. The query-rewrite system is out of scope (action deparse = full
-reverse-compiler), so this slice closed the contained DO-NOTHING subset.
+pg_dump's dumpRule emits a separate `ALTER TABLE <t> {ENABLE ALWAYS|ENABLE
+REPLICA|DISABLE} RULE <name>;` for any rule whose pg_rewrite.ev_enabled != 'O'.
+Slice 324 round-tripped DO-NOTHING CREATE RULE but hard-coded ev_enabled='O' and
+consumed `ALTER TABLE … RULE` through the generic ENABLE/DISABLE no-op arm, so a
+disabled/replica/always rule restored as plain-enabled. Fix (dump-fidelity only —
+goopg implements no query rewrite):
+- ast.go/ddl.go: new AlterTableEnableDisableRule kind + RuleName/RuleEnabledState
+  fields; token-value lookahead branch BEFORE the generic no-op arm maps
+  ENABLE→'O', DISABLE→'D', ENABLE REPLICA→'R', ENABLE ALWAYS→'A'. DISABLE TRIGGER
+  still falls through (no RULE lookahead match).
+- catalog.go: RuleInfo.Enabled byte + EvEnabled() (zero→'O'); pg_rewrite.VirtualRows
+  emits string(r.EvEnabled()). No heap sync — pg_rewrite is fully virtual.
+- operators_ddl.go: new action case sets tbl.Rules[i].Enabled; unknown rule → 42704.
 
-Fix (dump-fidelity only — goopg implements no query rewrite):
-- ast.go/ddl.go: CreateRuleStmt returned ONLY for the unconditional DO-NOTHING
-  form on INSERT/UPDATE/DELETE (isNothing && !hasWhere && !hasAction); every
-  other shape (action command, WHERE, ON SELECT) keeps the historical
-  CompatNoopStmt with the same RuleKind the COPY-DML path needs.
-- catalog.go: RuleInfo{Name,OID,Event,Instead} + Table.Rules + RuleInfo.EvType();
-  pg_rewrite.VirtualRows projects them (ev_enabled='O', ev_qual/ev_action NULL —
-  getRules never reads them).
-- operators_ddl.go: execCreateRule (dup→42710, OID via AllocOID, no heap sync;
-  PRESERVES the prior RegisterCompatObject + RegisterTableRuleKind bookkeeping)
-  + execDropRule removes the modelled rule from Table.Rules.
-- expr.go: pg_get_ruledef/pg_get_ruledef_ext builtin → buildRuleDefString
-  reconstructs PG's PRETTYFLAG_INDENT text
-  (`CREATE RULE n AS\n    ON EVENT TO schema.rel DO [INSTEAD ]NOTHING;`).
-- planner.go: CreateRuleStmt added to DDL passthrough.
+Files: internal/parser/{ast.go,ddl.go,alter_test.go},
+internal/catalog/catalog.go, internal/executor/{operators_ddl.go,storage_ddl_test.go},
+internal/testport/pgdump_connsetup_test.go (slice 325 fixture+assert),
+docs/design/0119-0004-alter-rule-enable-disable.md (+README 0119-0004ab).
 
-Files: internal/parser/{ast.go,ddl.go,rule_test.go},
-internal/catalog/catalog.go, internal/executor/{operators_ddl.go,expr.go,
-storage_ddl_test.go}, internal/planner/planner.go,
-internal/testport/pgdump_connsetup_test.go (slice 324 fixture+assert),
-docs/design/0119-0004-create-rule-rewrite.md (+README 0119-0004aa).
+Gates: parser/catalog/executor suites PASS; TestPort_PgDumpConnectionSetup PASS
+(real pg_dump 18.3 — DISABLE RULE / ENABLE ALWAYS RULE byte-identical, origin rule
+emits no clause); go build clean; pgbench smoke via pre-commit hook.
 
-Gates: parser/catalog/planner/executor suites PASS; TestPort_PgDumpConnectionSetup
-PASS (real pg_dump 18.3 — INSERT INSTEAD / UPDATE ALSO / DELETE plain byte-identical);
-go build clean. DEFERRED (ledgered): conditional WHERE rules (OLD/NEW qual
-deparse), action-command rules (full reverse-compiler), ALTER TABLE ENABLE/DISABLE
-RULE.
-
-NEXT loop — remaining M0119-0004 pg_dump getter-battery gaps: GRANT/ACL (relacl +
-dumpACL — needs real ACL storage; GRANT is a CompatNoopStmt today), named-role
-policies (needs a role-OID registry), or conditional/action CREATE RULE forms
-(WHERE-qual deparse is the smaller next step). Pick one and scope a contained slice.
+NEXT loop — remaining M0119-0004 pg_dump getter-battery gaps. The next big enabler
+is a **per-role OID registry** (roles map[string]struct{} → name→OID, surface in
+pg_roles VirtualRows with OIDs), which unblocks BOTH named-role CREATE POLICY (TO
+role) AND GRANT/ACL (relacl + dumpACL). BUT both also need an ARRAY(SELECT…) /
+array_to_string / quote_ident / ANY(oid[]) query stack that goopg does NOT have
+(confirmed grep: zero matches) — getPolicies' named-role ELSE branch and dumpACL
+both depend on it. So either (a) build that query stack first (Effort-L planner/
+executor work), or (b) pick another contained getter gap. Conditional/action
+CREATE RULE needs the query reverse-compiler (Effort-L too).
