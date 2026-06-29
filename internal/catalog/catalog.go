@@ -8408,10 +8408,17 @@ func (c *InMemory) GrantTablePrivilegeWithGrantOption(relOID uint32, role, priv 
 	if display != role {
 		c.roleACLDisplay[role] = display
 	}
-	// A fresh GRANT re-materializes relacl with real aclitems, so it is no longer
-	// the empty array {} that an earlier owner-side REVOKE ALL produced. DU-002
-	// slice 341.
-	delete(c.relACLEmptied, relOID)
+	// A GRANT to the owner re-materializes an explicit owner aclitem, so the
+	// owner is no longer the zero-privilege (absent) entry an earlier owner-side
+	// REVOKE ALL produced — clear the emptied flag. A GRANT to a *grantee*,
+	// however, leaves the owner at zero: PostgreSQL keeps relacl as
+	// `{grantee=…/postgres}` with NO owner entry, and pg_dump must still emit the
+	// owner's `REVOKE ALL …`. So only clear the flag for an owner-side GRANT;
+	// otherwise the owner stays absent and coexists with the grantee. DU-002
+	// slices 341 / 344.
+	if role == aclOwnerRole {
+		delete(c.relACLEmptied, relOID)
+	}
 	byRole := c.tableACLs[relOID]
 	if byRole == nil {
 		byRole = make(map[string]map[string]bool)
@@ -8652,17 +8659,26 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		}
 		return "" // NULL relacl — matches acldefault, pg_dump emits no GRANT
 	}
-	// The owner aclitem is always listed first. PostgreSQL leaves relacl NULL
+	// The owner aclitem is normally listed first. PostgreSQL leaves relacl NULL
 	// while the owner holds its implicit default set, rendering "postgres=<full>"
 	// once any grant materializes the array. An owner-side REVOKE materializes an
 	// explicit owner entry with a reduced privilege set (DU-002 slice 340); when
 	// present, render the owner's actual remaining privileges instead of the
 	// constant default, and skip the owner in the grantee loop below.
-	ownerLetters := ownerString
-	if ownerPrivs, ok := byRole[aclOwnerRole]; ok {
-		ownerLetters = renderACLLetters(ownerPrivs, privOrder)
+	//
+	// When the owner has been zeroed by a full REVOKE ALL (relACLEmptied set) and
+	// a later GRANT to a grantee re-materialized the array, the owner is absent
+	// entirely: PostgreSQL stores `{grantee=…/postgres}` with no owner entry, and
+	// pg_dump diffs that against acldefault to re-emit the owner's `REVOKE ALL …`.
+	// Suppress the leading owner entry in that case. DU-002 slice 344.
+	var items []string
+	if !c.relACLEmptied[relOID] {
+		ownerLetters := ownerString
+		if ownerPrivs, ok := byRole[aclOwnerRole]; ok {
+			ownerLetters = renderACLLetters(ownerPrivs, privOrder)
+		}
+		items = append(items, "postgres="+ownerLetters+"/postgres")
 	}
-	items := []string{"postgres=" + ownerLetters + "/postgres"}
 	roles := make([]string, 0, len(byRole))
 	for role := range byRole {
 		if role == aclOwnerRole {

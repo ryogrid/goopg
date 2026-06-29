@@ -412,10 +412,10 @@ func TestRevokeAllFromOwnerEmptyArray(t *testing.T) {
 	}
 
 	// Re-granting a privilege to the owner re-materializes a real aclitem and
-	// clears the empty-array state. (NB: a grant to a *non-owner* after an owner
-	// REVOKE ALL would in PostgreSQL keep the owner at zero, e.g. {bob=r/postgres};
-	// goopg's owner-default-fallback model renders the owner's full default
-	// instead — a documented follow-up beyond slice 341.)
+	// clears the empty-array state. (A grant to a *non-owner* after an owner
+	// REVOKE ALL keeps the owner at zero, e.g. {bob=r/postgres}; that
+	// owner-zero-coexists-with-grantee case is covered by
+	// TestRevokeAllFromOwnerThenGrantGrantee — DU-002 slice 344.)
 	c.GrantTablePrivilege(relOID, "postgres", "SELECT")
 	if got := relaclText(c, relOID); got != "{postgres=r/postgres}" {
 		t.Fatalf("relacl after owner re-GRANT following empty array = %q; want %q", got, "{postgres=r/postgres}")
@@ -515,6 +515,58 @@ func TestRevokeAllFromSequenceOwnerEmptyArray(t *testing.T) {
 	c.GrantTablePrivilege(seqOID, "postgres", "USAGE")
 	if got := relaclTextSeq(c, seqOID); got != "{postgres=U/postgres}" {
 		t.Fatalf("seq relacl after owner re-GRANT following empty array = %q; want %q", got, "{postgres=U/postgres}")
+	}
+}
+
+// TestRevokeAllFromOwnerThenGrantGrantee covers DU-002 slice 344: after a full
+// owner-side `REVOKE ALL … FROM owner` empties relacl to {}, a subsequent
+// `GRANT <priv> … TO <grantee>` re-materializes the array but the owner stays at
+// zero (absent) — PostgreSQL stores `{grantee=…/postgres}` with NO owner entry.
+// pg_dump diffs that against acldefault('r', 10) = {postgres=arwdDxtm/postgres}
+// and emits BOTH the owner's `REVOKE ALL …` and the grantee `GRANT …`. The
+// previous owner-default-fallback model wrongly re-inserted the owner's full
+// default ({postgres=arwdDxtm/postgres,bob=r/postgres}), which would drop the
+// owner REVOKE on round-trip and silently restore the owner default on restore.
+func TestRevokeAllFromOwnerThenGrantGrantee(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 17000
+	allTable := []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"}
+
+	// REVOKE ALL FROM postgres → empty array {}.
+	c.MaterializeOwnerACL(relOID, "postgres", allTable)
+	for _, p := range allTable {
+		c.RevokeTablePrivilege(relOID, "postgres", p)
+	}
+	if got := relaclText(c, relOID); got != "{}" {
+		t.Fatalf("relacl after REVOKE ALL FROM postgres = %q; want %q", got, "{}")
+	}
+
+	// GRANT SELECT TO bob → owner stays absent; only the grantee renders.
+	c.GrantTablePrivilege(relOID, "bob", "SELECT")
+	if got := relaclText(c, relOID); got != "{bob=r/postgres}" {
+		t.Fatalf("relacl after GRANT SELECT TO bob following owner REVOKE ALL = %q; want %q (owner absent)", got, "{bob=r/postgres}")
+	}
+
+	// A second grantee privilege still keeps the owner absent.
+	c.GrantTablePrivilege(relOID, "bob", "UPDATE")
+	if got := relaclText(c, relOID); got != "{bob=rw/postgres}" {
+		t.Fatalf("relacl after additional grantee GRANT = %q; want %q", got, "{bob=rw/postgres}")
+	}
+
+	// Revoking the grantee's last privilege drops back to the empty array {} —
+	// the owner is still zeroed (relACLEmptied survives the grantee removal).
+	c.RevokeTablePrivilege(relOID, "bob", "SELECT")
+	c.RevokeTablePrivilege(relOID, "bob", "UPDATE")
+	if got := relaclText(c, relOID); got != "{}" {
+		t.Fatalf("relacl after revoking the grantee back out = %q; want %q (owner still zeroed)", got, "{}")
+	}
+
+	// Now a GRANT to the *owner* re-materializes a real owner aclitem and clears
+	// the zeroed state, so a later grantee coexists with the owner entry.
+	c.GrantTablePrivilege(relOID, "postgres", "SELECT")
+	c.GrantTablePrivilege(relOID, "bob", "INSERT")
+	if got := relaclText(c, relOID); got != "{postgres=r/postgres,bob=a/postgres}" {
+		t.Fatalf("relacl after owner re-GRANT then grantee = %q; want %q", got, "{postgres=r/postgres,bob=a/postgres}")
 	}
 }
 

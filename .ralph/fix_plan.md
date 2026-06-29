@@ -2764,6 +2764,30 @@ documentation-only and is exempt from the design-doc requirement.)
       no owner re-GRANT; byte-identical vs real pg_dump 18.3) PASS. Still open:
       column-level (`attacl`)/database (`datacl`) GRANT,
       owner-zero-coexisting-with-grantee modelling, sequence owner REVOKE ALL.
+
+      **2026-06-30 (loop #69, design 0119-0004-owner-zero-coexists-grantee-relacl-pgdump,
+      DU-002 slice 344):** owner-zero coexisting with a grantee — the follow-up the
+      empty-array slices (341/342/343) deferred. After `REVOKE ALL ON TABLE
+      ownerzero_t FROM postgres` empties relacl to `{}`, a later `GRANT SELECT … TO
+      bob` re-materializes the array but PG keeps the owner at zero (absent):
+      `relacl = {bob=r/postgres}`, NOT `{postgres=arwdDxtm/postgres,bob=r/postgres}`.
+      pg_dump diffs that against `acldefault('r', 10)` and emits BOTH `REVOKE ALL ON
+      TABLE public.ownerzero_t FROM postgres;` AND `GRANT SELECT ON TABLE
+      public.ownerzero_t TO bob;`. goopg previously cleared `relACLEmptied` on any
+      GRANT and re-inserted the owner's full default whenever the owner key was
+      absent from a non-empty array → rendered the owner holding its default →
+      pg_dump dropped the REVOKE ALL, silently restoring owner privs on restore. Fix
+      (catalog-only): `relACLEmptied` re-interpreted as "owner explicitly zero
+      (absent)", subsuming the `{}` case. `GrantTablePrivilegeWithGrantOption` clears
+      the flag only for an owner-side GRANT (`role == aclOwnerRole`);
+      `relaclTextLockedFor` suppresses the leading owner entry when the flag is set,
+      rendering only grantees. Object-type-agnostic (OID-keyed). Tests
+      `TestRevokeAllFromOwnerThenGrantGrantee` (new) + slice-344
+      `TestPort_PgDumpConnectionSetup` (both lines asserted; no re-grant to the
+      zeroed owner; byte-identical vs real pg_dump 18.3) PASS; catalog+server suites
+      PASS; build clean. Still open under M0119-0004: column-level (`attacl`,
+      heap re-sync) / database (`datacl`, `--create`-only) GRANT projection;
+      extended-protocol commit-time deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

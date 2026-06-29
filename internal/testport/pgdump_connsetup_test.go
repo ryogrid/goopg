@@ -3404,6 +3404,33 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("revoke all on sequence ownrevall_seq from postgres: %v", err)
 	}
 
+	// Slice 344: owner-zero coexisting with a grantee. After a full owner-side
+	// `REVOKE ALL ON TABLE ownerzero_t FROM postgres` empties relacl to {}, a
+	// `GRANT SELECT … TO bob` re-materializes the array but the owner stays at
+	// zero (absent): PostgreSQL stores `{bob=r/postgres}` with NO owner entry.
+	// pg_dump's buildACLCommands diffs that against acldefault('r', 10) =
+	// "{postgres=arwdDxtm/postgres}" and emits BOTH the owner's
+	// `REVOKE ALL ON TABLE public.ownerzero_t FROM postgres;` AND
+	// `GRANT SELECT ON TABLE public.ownerzero_t TO bob;`. goopg previously
+	// re-inserted the owner's full default via the owner-default fallback
+	// ({postgres=arwdDxtm/postgres,bob=r/postgres}), dropping the owner REVOKE on
+	// round-trip and silently restoring the owner default on restore. The fix is
+	// catalog-only: a GRANT to a non-owner no longer clears relACLEmptied, and
+	// relaclTextLockedFor suppresses the leading owner entry when the owner is
+	// zeroed. This pins the end-to-end round-trip as a regression guard.
+	if err := runSQLSimple(t, c, "CREATE ROLE bob NOLOGIN"); err != nil {
+		t.Fatalf("create role bob: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ownerzero_t (a integer)"); err != nil {
+		t.Fatalf("create table ownerzero_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE ALL ON TABLE public.ownerzero_t FROM postgres"); err != nil {
+		t.Fatalf("revoke all on ownerzero_t from postgres: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.ownerzero_t TO bob"); err != nil {
+		t.Fatalf("grant select on ownerzero_t to bob: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7355,6 +7382,25 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		// sequence privileges after REVOKE ALL).
 		if strings.Contains(res.Stdout, "GRANT") && strings.Contains(res.Stdout, "ON SEQUENCE public.ownrevall_seq TO postgres") {
 			t.Errorf("pg_dump re-granted sequence privileges to the owner after REVOKE ALL\n  full stdout=%q", res.Stdout)
+		}
+		// **Slice 344 (asserted):** owner-zero coexisting with a grantee. After
+		// `REVOKE ALL ON TABLE ownerzero_t FROM postgres` then
+		// `GRANT SELECT … TO bob`, PostgreSQL stores relacl = `{bob=r/postgres}`
+		// (owner absent). pg_dump must emit BOTH the owner's REVOKE ALL and the
+		// grantee GRANT. Before this slice goopg's owner-default fallback rendered
+		// `{postgres=arwdDxtm/postgres,bob=r/postgres}`, so pg_dump saw the owner
+		// holding its full default and dropped the REVOKE ALL — silently restoring
+		// the owner privileges on restore.
+		if want := "REVOKE ALL ON TABLE public.ownerzero_t FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the owner REVOKE ALL when a grantee coexists: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if want := "GRANT SELECT ON TABLE public.ownerzero_t TO bob;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the grantee GRANT alongside the owner REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// The owner must NOT be re-granted any privilege on ownerzero_t (it holds
+		// zero after REVOKE ALL; only bob has SELECT).
+		if strings.Contains(res.Stdout, "ownerzero_t TO postgres") {
+			t.Errorf("pg_dump re-granted privileges to the zeroed owner of ownerzero_t\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

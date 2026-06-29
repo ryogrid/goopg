@@ -1,28 +1,22 @@
 (idle — nothing in flight)
 
-Last landed: M0119-0004 DU-002 **slice 343** (full owner-side `REVOKE ALL ON
-SEQUENCE` → empty `relacl` array `{}` round-trip in pg_dump). The sequence
-analogue of slice 341 (table) / 342 (schema). `REVOKE ALL ON SEQUENCE
-ownrevall_seq FROM postgres` strips the owner's implicit default sequence privs
-(USAGE, SELECT, UPDATE), leaving relacl = `{}` (non-NULL empty array). pg_dump
-emits a bare `REVOKE ALL ON SEQUENCE … FROM postgres;` with NO re-GRANT (verified
-byte-identical to real pg_dump 18.3 via local_install). This slice needed NO new
-production code: `recordTableRevoke` (internal/server/grant_ddl.go) already passes
-`allSequencePrivileges` to `MaterializeOwnerACL` for an owner-side ON SEQUENCE
-revoke, and the empty-array (`relACLEmptied`) state + its `relaclTextLockedSeq`
-rendering are object-type-agnostic. Pinned as regression guards:
-TestRevokeAllFromSequenceOwnerEmptyArray (catalog/relacl_test.go) +
-slice-343 fixture/assert in TestPort_PgDumpConnectionSetup. Gates: catalog suite +
+Last landed: M0119-0004 DU-002 **slice 344** (owner-zero coexisting with a
+grantee — `{grantee=…/postgres}` round-trip in pg_dump). The follow-up the
+empty-array slices 341/342/343 deferred. After `REVOKE ALL ON TABLE ownerzero_t
+FROM postgres` empties relacl to `{}`, a later `GRANT SELECT … TO bob`
+re-materializes the array but PG keeps the owner at zero (absent):
+`relacl = {bob=r/postgres}`. pg_dump emits BOTH the owner `REVOKE ALL` and the
+grantee `GRANT`. Fix (catalog-only, internal/catalog/catalog.go):
+`relACLEmptied` re-interpreted as "owner explicitly zero (absent)";
+`GrantTablePrivilegeWithGrantOption` clears the flag only for an owner-side
+GRANT; `relaclTextLockedFor` suppresses the leading owner entry when the flag is
+set. Object-type-agnostic (OID-keyed). Tests:
+TestRevokeAllFromOwnerThenGrantGrantee (catalog/relacl_test.go) + slice-344
+fixture/assert in TestPort_PgDumpConnectionSetup. Gates: catalog+server suites +
 TestPort_PgDumpConnectionSetup PASS; build clean. Committed + pushed.
 
-NEXT M0119-0004 GRANT/ACL slices (pick one next loop):
-- owner-zero-coexisting-with-grantee: after `REVOKE ALL FROM owner` then `GRANT
-  SELECT TO bob`, PG stores `{bob=r/postgres}` (owner absent = zero) and pg_dump
-  emits BOTH `REVOKE ALL … FROM postgres;` AND the grantee GRANT. goopg's
-  owner-default fallback renders `{postgres=...,bob=r/postgres}` and drops the
-  owner REVOKE. Needs a persistent "owner explicitly zero" present-but-empty entry
-  that coexists with grantees (deeper renderer change). This is the next real
-  code change (the three REVOKE-ALL-empty-array slices 341/342/343 are now done).
+NEXT M0119-0004 GRANT/ACL slices (the REVOKE-ALL-empty-array + owner-zero family
+is now complete; remaining are deeper):
 - column-level GRANT (`pg_attribute.attacl`, heap re-sync — the entangled one).
 - database GRANT (`datacl`, only dumped under `--create`).
 - Extended-protocol commit-time deferral stays architecturally entangled (see
