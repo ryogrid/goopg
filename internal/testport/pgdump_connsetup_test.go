@@ -2973,6 +2973,29 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("alter statistics statext_nd set statistics: %v", err)
 	}
 
+	// Slice 319: a CREATE TRIGGER must round-trip through pg_dump. pg_dump's
+	// getTriggers selects pg_get_triggerdef(t.oid, false) and dumpTrigger emits
+	// the result verbatim (plus a trailing semicolon). Before this slice goopg's
+	// pg_trigger view hardcoded zero rows (VirtualRows → nil) AND
+	// pg_get_triggerdef was unimplemented, so a user trigger was silently dropped
+	// from the dump. goopg now assigns each trigger an OID at CREATE TRIGGER time,
+	// projects it through pg_trigger, and reconstructs the statement via
+	// pg_get_triggerdef. Two triggers exercise both timings/levels and the OR-ed
+	// event list: a BEFORE INSERT OR UPDATE row-level trigger and an AFTER DELETE
+	// statement-level trigger, both on public.trig_t.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.trig_t (a integer)"); err != nil {
+		t.Fatalf("create table trig_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE FUNCTION public.trig_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$"); err != nil {
+		t.Fatalf("create trigger function trig_fn: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_biu BEFORE INSERT OR UPDATE ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_biu: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TRIGGER trg_ad AFTER DELETE ON public.trig_t FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn()"); err != nil {
+		t.Fatalf("create trigger trg_ad: %v", err)
+	}
+
 	// Slice 119: descending sequences exercise pg_dump's *descending-direction*
 	// default-bound suppression, the mirror of the ascending branch verified by
 	// slices 116/117. For a descending sequence PG stores seqmin=type_min (bigint:
@@ -6622,6 +6645,21 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			if !strings.Contains(res.Stdout, want) {
 				t.Errorf("pg_dump dropped statistics ownership; missing %q\n  full stdout=%q", want, res.Stdout)
 			}
+		}
+		// **Slice 319 (asserted):** a CREATE TRIGGER must round-trip. pg_dump's
+		// getTriggers selects pg_get_triggerdef(t.oid, false) and dumpTrigger emits
+		// the string verbatim with a trailing semicolon. Before this slice goopg's
+		// pg_trigger view returned zero rows and pg_get_triggerdef was unimplemented,
+		// so the trigger was silently dropped. The reconstruction mirrors ruleutils.c
+		// pg_get_triggerdef_worker: timing keyword, OR-joined events in PG's fixed
+		// order (INSERT, DELETE, UPDATE, TRUNCATE), schema-qualified table (pg_dump
+		// runs search_path=''), FOR EACH ROW/STATEMENT, and EXECUTE FUNCTION with the
+		// schema-qualified function. Assert the exact statements for both triggers.
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_biu BEFORE INSERT OR UPDATE ON public.trig_t FOR EACH ROW EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the BEFORE INSERT OR UPDATE row-level trigger\n  full stdout=%q", res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "CREATE TRIGGER trg_ad AFTER DELETE ON public.trig_t FOR EACH STATEMENT EXECUTE FUNCTION public.trig_fn();") {
+			t.Errorf("pg_dump dropped/mangled the AFTER DELETE statement-level trigger\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 148 (asserted + fixed):** the user FUNCTION definition itself must
 		// round-trip. Slice 147 created public.add_one(integer) only as a COMMENT

@@ -1,29 +1,35 @@
 (idle — nothing in flight)
 
-Last loop (#40): M0119-0004 **extended-statistics ownership round-trip in
-pg_dump** (DU-002 slice 318) — LANDED. Design
-`0119-0004-statistics-owner-roundtrip.md`. Test-only guard.
+Last loop (#41): M0119-0004 **CREATE TRIGGER round-trip in pg_dump** (DU-002
+slice 319) — LANDED. Design `0119-0004-trigger-roundtrip.md`. Real feature gap
+(not a guard): user triggers were silently dropped from pg_dump.
 
-pg_dump emits object ownership from the TOC archive entry, not the createStmt:
-`dumpStatisticsExt` sets `.owner = getRoleName(stxowner)` and `_printTocEntry`
-renders `ALTER STATISTICS <nsp>.<name> OWNER TO <role>;` because "STATISTICS" is
-in `_getObjectDescription`'s ALTER-able list (pg_backup_archiver.c:3799). Slices
-314–317 dumped CREATE/COMMENT/SET STATISTICS but never asserted ownership. This
-slice asserts the OWNER TO line for all four fixture stats objects
-(statext_all/nd/expr/mix). No production code changed — ownership already
-round-tripped via the `pg_statistic_ext.stxowner = 10` (bootstrap superuser)
-virtual-row projection (catalog.go pgStatisticExt VirtualRows). The guard
-protects against that cell regressing to NULL / a dangling OID (getRoleName would
-fail → OWNER TO silently vanishes).
+Three gaps fixed (the relhastriggers one was the load-bearing surprise):
+1. `pg_class.relhastriggers` hardcoded `'f'` → pg_dump's getTriggers
+   (pg_dump.c:8523) only adds a table's OID to its tbloids probe array when
+   `tbinfo->hastriggers`; so the table was NEVER queried against pg_trigger.
+   Now projects `'t'` when `len(t.Triggers)>0` in the VIRTUAL pg_class builder
+   (pg_class.VirtualRows, catalog.go ~3758 — the one pg_dump reads, NOT the heap
+   builder; sibling 'f' literals for sequences/views left untouched).
+2. `pg_trigger.VirtualRows` returned nil → now one row/trigger (tgtype bitmask,
+   tgfoid via Routines().LookupByName, tgenabled='O', tgisinternal='f',
+   tgparentid=0).
+3. `pg_get_triggerdef` registered in pg_proc but unimplemented → new
+   `evalFuncCall` case (expr.go) + `buildTriggerDefString` mirroring ruleutils.c
+   pg_get_triggerdef_worker. New `catalog.Trigger.OID` via AllocOID in
+   execCreateTrigger (operators_ddl.go).
 
-Gates: TestPort_PgDumpConnectionSetup PASS vs real pg_dump 18.3 (4.3s);
-go build clean; pgbench smoke = pre-commit hook; ralph-state-guard OK.
+Files: internal/catalog/catalog.go (Trigger.OID, relhastriggers, pg_trigger
+VirtualRows), internal/executor/operators_ddl.go (AllocOID), internal/executor/
+expr.go (case + buildTriggerDefString), internal/executor/triggerdef_test.go,
+internal/testport/pgdump_connsetup_test.go (slice 319 fixture+assert).
 
-NEXT loop — next pg_dump getter-battery gap (M0110-0001 / DU-002). Candidates:
-- The pg_dump 002–010 catalog-view parity battery (further slices) — pick a real
-  feature gap, not another assertion-only guard (statistics object dump is now
-  fully covered: CREATE/COMMENT/expr/SET STATISTICS/OWNER TO all round-trip).
-- Other M0119: M0119-0002 (CLOG store swap Part B — WAL/MVCC, needs race gate) /
-  M0119-0005 (pg_waldump) / M0119-0006 (pg_amcheck). Extended-protocol
-  commit-time deferral is architecturally entangled
-  (see memory goopg_extended_protocol_autocommit).
+Gates: TestBuildTriggerDefString + TestPort_PgDumpConnectionSetup PASS vs real
+pg_dump 18.3; catalog + executor suites PASS; go build clean; pgbench smoke =
+pre-commit hook; ralph-state-guard pending.
+
+NEXT loop — next pg_dump getter-battery gap. Uncovered features found this loop
+(grep of pgdump_connsetup_test.go): CREATE RULE (pg_rewrite/pg_get_ruledef),
+GRANT/ACL (relacl), CREATE POLICY / ROW LEVEL SECURITY (pg_policy), CLUSTER ON
+(pg_index.indisclustered). Pick one as a real feature gap. Richer trigger forms
+(WHEN/REFERENCING/UPDATE OF/CONSTRAINT) need parser+catalog fields first.

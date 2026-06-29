@@ -4641,6 +4641,97 @@ func fkActionClause(a parser.FKAction) string {
 	}
 }
 
+// buildTriggerDefString reconstructs the CREATE TRIGGER statement for a
+// row-/statement-level trigger, mirroring ruleutils.c
+// pg_get_triggerdef_worker. pg_dump's getTriggers selects
+// pg_get_triggerdef(t.oid, false) and emits the result verbatim (plus a
+// trailing semicolon), so the spacing must match PG exactly:
+//
+//	CREATE TRIGGER <name> {BEFORE|AFTER|INSTEAD OF} <ev>[ OR <ev>…]
+//	    ON <schema>.<table> FOR EACH {ROW|STATEMENT}
+//	    EXECUTE FUNCTION <schema>.<func>(<'arg'>…)
+//
+// Events are emitted in PG's fixed order (INSERT, DELETE, UPDATE, TRUNCATE)
+// regardless of the order they were declared. The target table and trigger
+// function are schema-qualified because pg_dump runs with search_path=''.
+// goopg's parser captures only the basic trigger form (no WHEN, REFERENCING,
+// UPDATE OF columns, or CONSTRAINT trigger), so none of those clauses are
+// emitted. DU-002 slice 319.
+func buildTriggerDefString(tbl *catalog.Table, trig catalog.Trigger) string {
+	var b strings.Builder
+	b.WriteString("CREATE TRIGGER ")
+	b.WriteString(trig.Name)
+	b.WriteByte(' ')
+	switch trig.Timing {
+	case catalog.TriggerBefore:
+		b.WriteString("BEFORE")
+	case catalog.TriggerInsteadOf:
+		b.WriteString("INSTEAD OF")
+	default:
+		b.WriteString("AFTER")
+	}
+	has := make(map[string]bool, len(trig.Events))
+	for _, ev := range trig.Events {
+		has[strings.ToLower(ev)] = true
+	}
+	first := true
+	emit := func(kw string) {
+		if first {
+			b.WriteByte(' ')
+			b.WriteString(kw)
+			first = false
+		} else {
+			b.WriteString(" OR ")
+			b.WriteString(kw)
+		}
+	}
+	if has["insert"] {
+		emit("INSERT")
+	}
+	if has["delete"] {
+		emit("DELETE")
+	}
+	if has["update"] {
+		emit("UPDATE")
+	}
+	if has["truncate"] {
+		emit("TRUNCATE")
+	}
+	schema := tbl.Schema
+	if schema == "" {
+		schema = "public"
+	}
+	b.WriteString(" ON ")
+	b.WriteString(schema)
+	b.WriteByte('.')
+	b.WriteString(tbl.Name)
+	b.WriteByte(' ')
+	if trig.ForEachRow {
+		b.WriteString("FOR EACH ROW ")
+	} else {
+		b.WriteString("FOR EACH STATEMENT ")
+	}
+	fnSchema := trig.FuncSchema
+	if fnSchema == "" {
+		fnSchema = "public"
+	}
+	b.WriteString("EXECUTE FUNCTION ")
+	b.WriteString(fnSchema)
+	b.WriteByte('.')
+	b.WriteString(trig.FuncName)
+	b.WriteByte('(')
+	for i, a := range trig.Args {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteByte('\'')
+		b.WriteString(strings.ReplaceAll(a, "'", "''"))
+		b.WriteByte('\'')
+	}
+	b.WriteByte(')')
+	return b.String()
+}
+
 // evalMakeDate implements make_date(year, month, day) → date. M0097-0004.
 func evalMakeDate(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 	if len(x.Args) != 3 {
@@ -7072,6 +7163,42 @@ func evalFuncCall(x *planner.FuncCall, row Row, ctx *Context) (Datum, error) {
 					return NullDatum, nil
 				}
 				return NewStringDatum(def), nil
+			}
+		}
+		return NullDatum, nil
+
+	case "pg_get_triggerdef":
+		// pg_get_triggerdef(oid [, pretty bool]) → text — reconstructs the
+		// CREATE TRIGGER statement. pg_dump's getTriggers selects
+		// pg_get_triggerdef(t.oid, false) and emits the result verbatim with a
+		// trailing semicolon. The trigger lives in its owning table's Triggers
+		// slice (no central trigger registry), so scan all tables for the OID.
+		// DU-002 slice 319.
+		if len(x.Args) < 1 {
+			return NullDatum, nil
+		}
+		arg, err := evalExpr(x.Args[0], row, ctx)
+		if err != nil || arg.IsNull() {
+			return NullDatum, nil
+		}
+		var targetOID uint32
+		if arg.Kind == KindInt {
+			targetOID = uint32(arg.Int)
+		} else {
+			v, _ := strconv.ParseUint(strings.TrimSpace(arg.StringValue()), 10, 32)
+			targetOID = uint32(v)
+		}
+		if im, ok := ctx.Catalog.(*catalog.InMemory); ok {
+			for _, tbl := range im.AllTables() {
+				if tbl.Virtual || tbl.OID == 0 {
+					continue
+				}
+				for _, trig := range tbl.Triggers {
+					if trig.OID == 0 || trig.OID != targetOID {
+						continue
+					}
+					return NewStringDatum(buildTriggerDefString(tbl, trig)), nil
+				}
 			}
 		}
 		return NullDatum, nil

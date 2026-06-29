@@ -2359,6 +2359,26 @@ documentation-only and is exempt from the design-doc requirement.)
       `_getObjectDescription`'s ALTER-able list). Exercises the goopg
       `pg_statistic_ext.stxowner = 10` projection end-to-end; no production code
       changed (already worked). Design `0119-0004-statistics-owner-roundtrip.md`.
+      **Slice 319 (loop #41):** CREATE TRIGGER round-trip — goopg executes user
+      triggers but they were invisible to pg_dump (lost on dump/restore). Three
+      gaps fixed: (1) `pg_class.relhastriggers` hardcoded `'f'` in the heap
+      pg_class builder, and pg_dump's getTriggers (pg_dump.c:8523) only probes
+      pg_trigger for tables whose relhastriggers is true — now projects `'t'`
+      when `len(t.Triggers)>0`; (2) `pg_trigger.VirtualRows` returned nil — now
+      projects one row per trigger (oid/tgrelid/tgname, PG tgtype bitmask, tgfoid
+      from routines, tgenabled='O', tgisinternal='f', tgparentid=0); (3)
+      `pg_get_triggerdef` registered in pg_proc but unimplemented — new
+      `evalFuncCall` case + `buildTriggerDefString` mirroring ruleutils.c
+      pg_get_triggerdef_worker (timing kw; OR-joined events in fixed
+      INSERT/DELETE/UPDATE/TRUNCATE order; schema-qualified table+func for
+      search_path=''; quoted args). New `catalog.Trigger.OID` via AllocOID at
+      CREATE TRIGGER. Scope = basic trigger form the parser captures (no
+      WHEN/REFERENCING/UPDATE OF/CONSTRAINT). Dump-fidelity only; zero blast
+      radius (relhastriggers='t' only for triggered tables; Trigger.OID
+      defaults 0). Tests `TestBuildTriggerDefString` + slice 319 in
+      `TestPort_PgDumpConnectionSetup` (BEFORE INSERT OR UPDATE row-level +
+      AFTER DELETE statement-level) PASS vs real pg_dump 18.3. Design
+      `0119-0004-trigger-roundtrip.md`.
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
       battery (further slices); extended-protocol commit-time deferral
       (architecturally entangled — extended protocol is auto-commit-per-statement).

@@ -10703,6 +10703,7 @@ func (o *ddlOp) execCreateTrigger(s *parser.CreateTriggerStmt) error {
 	}
 	trig := catalog.Trigger{
 		Name:       s.Name,
+		OID:        o.ctx.Catalog.AllocOID(),
 		TableOID:   tbl.OID,
 		Timing:     catalog.TriggerTiming(s.Timing),
 		Events:     append([]string(nil), s.Events...),

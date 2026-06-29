@@ -1119,7 +1119,12 @@ const (
 // Trigger describes one row-level or statement-level trigger on a table.
 // M0096-0012.
 type Trigger struct {
-	Name       string
+	Name string
+	// OID is the trigger's pg_trigger.oid, assigned from the catalog OID
+	// counter at CREATE TRIGGER time. pg_dump's getTriggers selects
+	// pg_get_triggerdef(t.oid, false), so a zero OID means the trigger is
+	// invisible to pg_dump (predates OID tracking). DU-002 slice 319.
+	OID        uint32
 	TableOID   uint32
 	Timing     TriggerTiming
 	Events     []string // "insert", "update", "delete", "truncate"
@@ -3728,6 +3733,14 @@ func (c *InMemory) registerSystemTables() {
 				reltuples = strconv.FormatInt(t.Stats.RowCount, 10)
 			}
 			replIdent := ReplIdentOrDefault(t.ReplicaIdentity) // relreplident (DU-002 slice 305)
+			// relhastriggers gates pg_dump's getTriggers: a table whose
+			// relhastriggers='f' is excluded from the tbloids array, so pg_dump
+			// never probes pg_trigger for it and the trigger is silently dropped.
+			// Project 't' whenever the table owns at least one trigger. DU-002 slice 319.
+			relHasTriggers := "f"
+			if len(t.Triggers) > 0 {
+				relHasTriggers = "t"
+			}
 			out = append(out, []string{
 				strconv.Itoa(int(t.OID)),     // 0:  oid
 				t.Name,                       // 1:  relname
@@ -3750,7 +3763,7 @@ func (c *InMemory) registerSystemTables() {
 				strconv.Itoa(len(t.Columns)), // 18: relnatts
 				strconv.Itoa(relchecks),      // 19: relchecks
 				"f",                          // 20: relhasrules
-				"f",                          // 21: relhastriggers
+				relHasTriggers,               // 21: relhastriggers
 				func() string {
 					if len(c.partitionChildren[t.OID]) > 0 {
 						return "t"
@@ -6360,9 +6373,16 @@ func (c *InMemory) registerSystemTables() {
 	//   pg_catalog.pg_trigger u ON (u.oid = t.tgparentid) WHERE ((NOT
 	//   t.tgisinternal AND t.tgparentid = 0) OR t.tgenabled != u.tgenabled)
 	//   ORDER BY t.tgrelid, t.tgname
-	// goopg has no user-defined triggers, so an empty view (0 rows) is correct,
-	// identical to a stock PG cluster with none. The unnest('{}') source is
-	// empty so the JOIN and pg_get_triggerdef are never evaluated. Schema
+	// DU-002 slice 319 wires VirtualRows to project goopg's user-defined
+	// triggers (catalog.Table.Triggers) so a plain CREATE TRIGGER round-trips
+	// through pg_dump. Each row carries the trigger oid/tgrelid/tgname plus the
+	// PG tgtype bitmask, tgfoid (resolved from the routine registry),
+	// tgenabled='O', tgisinternal='f', and tgparentid=0; pg_get_triggerdef(oid)
+	// (expr.go) reconstructs the CREATE TRIGGER statement that pg_dump emits
+	// verbatim. The unnest('{oids}') source carries the real table OIDs, the
+	// self-JOIN finds no parent (tgparentid=0 ≠ any oid) so the LEFT JOIN keeps
+	// the row, and the WHERE's first disjunct (NOT tgisinternal AND
+	// tgparentid=0) admits it. Schema
 	// matches PG's pg_trigger (pg_trigger.h): tgrelid oid, tgparentid oid,
 	// tgname name, tgfoid oid, tgtype int2, tgenabled "char", tgisinternal bool,
 	// tgconstrrelid oid, tgconstrindid oid, tgconstraint oid, tgdeferrable bool,
@@ -6394,7 +6414,83 @@ func (c *InMemory) registerSystemTables() {
 		},
 		OID: 2620,
 	}
-	pgTrigger.VirtualRows = func() [][]string { return nil }
+	pgTrigger.VirtualRows = func() [][]string {
+		c.mu.RLock()
+		defer c.mu.RUnlock()
+		var out [][]string
+		for _, tbl := range c.tables {
+			if tbl == nil || tbl.Virtual || tbl.OID == 0 || len(tbl.Triggers) == 0 {
+				continue
+			}
+			for _, trig := range tbl.Triggers {
+				if trig.OID == 0 {
+					continue // predates OID tracking → invisible to pg_dump
+				}
+				// tgtype bitmask (pg_trigger.h): ROW=1, BEFORE=2, INSERT=4,
+				// DELETE=8, UPDATE=16, TRUNCATE=32, INSTEAD=64. AFTER is the
+				// absence of the BEFORE and INSTEAD bits.
+				var tgtype int
+				if trig.ForEachRow {
+					tgtype |= 1 << 0
+				}
+				switch trig.Timing {
+				case TriggerBefore:
+					tgtype |= 1 << 1
+				case TriggerInsteadOf:
+					tgtype |= 1 << 6
+				}
+				for _, ev := range trig.Events {
+					switch strings.ToLower(ev) {
+					case "insert":
+						tgtype |= 1 << 2
+					case "delete":
+						tgtype |= 1 << 3
+					case "update":
+						tgtype |= 1 << 4
+					case "truncate":
+						tgtype |= 1 << 5
+					}
+				}
+				// tgfoid: resolve the trigger function's OID from the routine
+				// registry. pg_dump's getTriggers does not read tgfoid (it calls
+				// pg_get_triggerdef), so 0 (unresolved) is harmless, but project
+				// the real OID for catalog faithfulness.
+				var tgfoid uint32
+				fnSchema := trig.FuncSchema
+				if fnSchema == "" {
+					fnSchema = "public"
+				}
+				if c.routines != nil {
+					for _, r := range c.routines.LookupByName(parser.ObjectName{Schema: trig.FuncSchema, Name: trig.FuncName}) {
+						tgfoid = r.OID
+						break
+					}
+				}
+				row := make([]string, 19)
+				row[0] = fmt.Sprintf("%d", trig.OID)     // oid
+				row[1] = fmt.Sprintf("%d", trig.TableOID) // tgrelid
+				row[2] = "0"                              // tgparentid
+				row[3] = trig.Name                        // tgname
+				row[4] = fmt.Sprintf("%d", tgfoid)        // tgfoid
+				row[5] = fmt.Sprintf("%d", tgtype)        // tgtype
+				row[6] = "O"                              // tgenabled (origin/enabled)
+				row[7] = "f"                              // tgisinternal
+				row[8] = "0"                              // tgconstrrelid
+				row[9] = "0"                              // tgconstrindid
+				row[10] = "0"                             // tgconstraint
+				row[11] = "f"                             // tgdeferrable
+				row[12] = "f"                             // tginitdeferred
+				row[13] = fmt.Sprintf("%d", len(trig.Args)) // tgnargs
+				row[14] = ""                              // tgattr (int2[]; UPDATE OF cols unsupported)
+				row[15] = ""                              // tgargs (bytea; def built from catalog.Trigger.Args)
+				row[16] = ""                              // tgqual (pg_node_tree; WHEN unsupported)
+				row[17] = ""                              // tgoldtable (name; REFERENCING unsupported)
+				row[18] = ""                              // tgnewtable (name)
+				out = append(out, row)
+			}
+		}
+		return out
+	}
 	c.tables["pg_catalog.pg_trigger"] = pgTrigger
 
 	// pg_rewrite — rewrite-rule catalog (OID 2618). After getTriggers, pg_dump's
