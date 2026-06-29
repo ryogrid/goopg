@@ -2694,6 +2694,32 @@ documentation-only and is exempt from the design-doc requirement.)
       byte-identical vs real pg_dump 18.3) PASS. Still open: column-level
       (`pg_attribute.attacl`)/database (`datacl`, needs `--create`) GRANT,
       REVOKE-of-default modelling.
+
+      **2026-06-30 (loop #65, design 0119-0004-owner-revoke-relacl-pgdump, DU-002
+      slice 340):** owner-side `REVOKE`-of-default round-trips. PostgreSQL leaves
+      `pg_class.relacl` NULL while the owner holds its implicit default
+      privileges; the first owner-side REVOKE materializes relacl as the owner
+      default minus the revoked bits. `REVOKE TRIGGER ON TABLE public.ownrev_t
+      FROM postgres` → `{postgres=arwdDxm/postgres}`, and pg_dump's
+      `buildACLCommands` diffs that against `acldefault('r', relowner)` and
+      re-emits `REVOKE ALL … FROM postgres;` + `GRANT SELECT,INSERT,REFERENCES,
+      DELETE,TRUNCATE,MAINTAIN,UPDATE … TO postgres;` (TRIGGER omitted). goopg's
+      REVOKE recorder modelled only non-owner grantees (the owner is implicit),
+      so `REVOKE … FROM postgres` found no entry and left relacl NULL → pg_dump
+      dropped the change silently. Fix: catalog new `MaterializeOwnerACL(relOID,
+      owner, ownerPrivs)` (records an explicit owner aclitem = full default,
+      once, never clobbering a prior revoke) + renderer `relaclTextLockedFor`
+      special-cases the owner key (renders the owner's actual remaining privs via
+      the extracted `renderACLLetters` helper, owner still first); server
+      `tryRecordTableRevoke` calls it before `RevokeTablePrivilege` when the
+      grantee is the owner. Scope: single-priv owner revoke only (REVOKE ALL from
+      owner → NULL in goopg vs PG's empty `{}` array — follow-up); schema/sequence
+      owner-revoke unwired (primitive is type-agnostic). Tests
+      `TestMaterializeOwnerACL` (new) + reused `Relacl`/`Revoke`/`NamespaceACLText`
+      + slice-340 `TestPort_PgDumpConnectionSetup` (both REVOKE/GRANT lines exact,
+      no TRIGGER re-grant; byte-identical vs real pg_dump 18.3) PASS. Still open:
+      column-level (`pg_attribute.attacl`)/database (`datacl`, `--create`) GRANT,
+      owner revoke-ALL empty-array modelling.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

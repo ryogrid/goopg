@@ -3325,6 +3325,26 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("revoke create on schema revoke_sch from revoke_sch_role: %v", err)
 	}
 
+	// Slice 340: an owner-side REVOKE-of-default must round-trip. PostgreSQL leaves
+	// pg_class.relacl NULL while the owner holds its implicit default privileges;
+	// the first `REVOKE <priv> ON TABLE t FROM postgres` materializes relacl as the
+	// owner's full default set minus the revoked bits. `REVOKE TRIGGER ON TABLE
+	// ownrev_t FROM postgres` yields relacl `{postgres=arwdDxm/postgres}` (the full
+	// "arwdDxtm" minus 't'), and pg_dump's buildACLCommands diffs that against
+	// acldefault('r', 10) and re-emits the transform as
+	// `REVOKE ALL … FROM postgres;` + `GRANT <remaining> … TO postgres;` (verified
+	// byte-identical to real pg_dump 18.3). Before this slice goopg's REVOKE recorder
+	// only modelled non-owner grantees, so an owner revoke was silently dropped and
+	// relacl stayed NULL → pg_dump emitted nothing, losing the privilege change on
+	// restore. The recorder now materializes the owner's default ACL via
+	// Catalog.MaterializeOwnerACL before removing the revoked bits.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.ownrev_t (a integer, b text)"); err != nil {
+		t.Fatalf("create table ownrev_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE TRIGGER ON TABLE public.ownrev_t FROM postgres"); err != nil {
+		t.Fatalf("revoke trigger on ownrev_t from postgres: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7214,6 +7234,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		}
 		if bad := "CREATE ON SCHEMA revoke_sch TO revoke_sch_role"; strings.Contains(res.Stdout, bad) {
 			t.Errorf("pg_dump re-emitted the REVOKEd CREATE schema grant: unexpected %q\n  full stdout=%q", bad, res.Stdout)
+		}
+		// **Slice 340 (asserted):** an owner-side REVOKE-of-default round-trips.
+		// `REVOKE TRIGGER ON TABLE ownrev_t FROM postgres` materializes relacl as
+		// `{postgres=arwdDxm/postgres}` (the owner default minus 't'), which
+		// pg_dump's buildACLCommands renders as a `REVOKE ALL … FROM postgres;`
+		// followed by a `GRANT <remaining> … TO postgres;` whose privilege list
+		// omits TRIGGER. Both lines (and the exact privilege list) are asserted
+		// byte-identical to real pg_dump 18.3. Before this slice the owner revoke
+		// was a no-op (relacl stayed NULL) so neither line was emitted.
+		if want := "REVOKE ALL ON TABLE public.ownrev_t FROM postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped the owner-side REVOKE: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		if want := "GRANT SELECT,INSERT,REFERENCES,DELETE,TRUNCATE,MAINTAIN,UPDATE ON TABLE public.ownrev_t TO postgres;"; !strings.Contains(res.Stdout, want) {
+			t.Errorf("pg_dump dropped/mis-rendered the owner re-GRANT after revoke: want %q\n  full stdout=%q", want, res.Stdout)
+		}
+		// The revoked TRIGGER must NOT reappear in the owner re-GRANT.
+		if strings.Contains(res.Stdout, "TRIGGER ON TABLE public.ownrev_t TO postgres") {
+			t.Errorf("pg_dump re-granted the REVOKEd TRIGGER to the owner\n  full stdout=%q", res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

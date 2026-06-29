@@ -50,6 +50,11 @@ var allSequencePrivileges = []string{"USAGE", "SELECT", "UPDATE"}
 // (USAGE/CREATE — pg_dump renders these as "UC"). DU-002 slice 335.
 var allSchemaPrivileges = []string{"USAGE", "CREATE"}
 
+// aclOwnerRole is the object owner in goopg's single bootstrap-superuser model.
+// A REVOKE whose grantee is the owner is an owner-side revoke-of-default, which
+// must first materialize the owner's implicit default ACL. DU-002 slice 340.
+const aclOwnerRole = "postgres"
+
 // tryRecordTableGrant parses a table-level GRANT and records its privileges in
 // the catalog ACL store. It is a best-effort side effect: on any form it does
 // not recognise it simply returns, leaving the statement as a successful no-op.
@@ -213,6 +218,15 @@ func (s *Server) tryRecordTableRevoke(stmt string) {
 			continue
 		}
 		for _, role := range roles {
+			// An owner-side REVOKE (`REVOKE … FROM postgres`) materializes the
+			// owner's full default ACL first so the surviving privileges render
+			// explicitly; PostgreSQL leaves relacl NULL until then. allPrivs is the
+			// owner's full default set for the object class (table or sequence), so
+			// the subsequent RevokeTablePrivilege yields relacl = default − revoked.
+			// DU-002 slice 340.
+			if strings.EqualFold(role, aclOwnerRole) {
+				s.cfg.Catalog.MaterializeOwnerACL(tbl.OID, aclOwnerRole, allPrivs)
+			}
 			for _, p := range privs {
 				s.cfg.Catalog.RevokeTablePrivilege(tbl.OID, role, p)
 			}

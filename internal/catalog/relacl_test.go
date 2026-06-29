@@ -331,6 +331,49 @@ func TestRevokeTablePrivilege(t *testing.T) {
 	}
 }
 
+// TestMaterializeOwnerACL pins the owner-side revoke-of-default recording that
+// lets a `REVOKE <priv> ON TABLE t FROM postgres` round-trip through pg_dump
+// (DU-002 slice 340). PostgreSQL leaves relacl NULL while the owner holds its
+// implicit default privileges; the first owner-side REVOKE materializes the
+// owner's full default set, so the relacl renders the owner's default minus the
+// revoked bits and pg_dump re-emits the equivalent REVOKE/GRANT pair.
+func TestMaterializeOwnerACL(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16950
+
+	// No grants yet → NULL relacl.
+	if got := relaclText(c, relOID); got != "" {
+		t.Fatalf("relacl before any grant = %q; want \"\" (NULL)", got)
+	}
+
+	// REVOKE TRIGGER FROM postgres: materialize the owner's full table default
+	// ("arwdDxtm"), then drop TRIGGER ('t') → "arwdDxm".
+	c.MaterializeOwnerACL(relOID, "postgres", []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"})
+	c.RevokeTablePrivilege(relOID, "postgres", "TRIGGER")
+	want := "{postgres=arwdDxm/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after REVOKE TRIGGER FROM postgres = %q; want %q", got, want)
+	}
+
+	// A second owner-side REVOKE must NOT re-materialize (clobber) the first: the
+	// owner entry already exists, so MaterializeOwnerACL is a no-op and only the
+	// new privilege is dropped. REVOKE MAINTAIN ('m') → "arwdDx".
+	c.MaterializeOwnerACL(relOID, "postgres", []string{"SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER", "MAINTAIN"})
+	c.RevokeTablePrivilege(relOID, "postgres", "MAINTAIN")
+	want = "{postgres=arwdDx/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after second owner REVOKE = %q; want %q", got, want)
+	}
+
+	// A grantee added alongside the reduced owner entry still renders after the
+	// owner (owner is always first), and the owner's reduced set is preserved.
+	c.GrantTablePrivilege(relOID, "grantee_role", "SELECT")
+	want = "{postgres=arwdDx/postgres,grantee_role=r/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl with owner-revoke + grantee = %q; want %q", got, want)
+	}
+}
+
 // TestACLQuoteName unit-checks the putid emulation directly, including the
 // double-quote-doubling and multibyte (high-bit) cases that are awkward to drive
 // through a full GRANT.

@@ -1761,6 +1761,16 @@ type Catalog interface {
 	// once its mask is empty and lets the relacl fall back to the owner default.
 	// A revoke of a privilege the role never held is a no-op. DU-002 slice 338.
 	RevokeTablePrivilege(relOID uint32, role, priv string)
+	// MaterializeOwnerACL records an explicit owner aclitem for relOID holding
+	// exactly ownerPrivs (the owner's full default privilege set for the object
+	// type), but only when no explicit owner entry exists yet. PostgreSQL leaves
+	// relacl NULL while the owner holds its implicit default privileges; the
+	// first owner-side REVOKE materializes the owner's default set so the
+	// remaining privileges can be stored explicitly. Calling this before a
+	// RevokeTablePrivilege against the owner therefore yields the PG-accurate
+	// materialized relacl (owner default minus the revoked bits) instead of a
+	// NULL fallback. A no-op once an owner entry exists. DU-002 slice 340.
+	MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs []string)
 	// HasTablePrivilege reports whether role was granted priv on relOID.
 	HasTablePrivilege(relOID uint32, role, priv string) bool
 	// DropTableACL forgets all privileges recorded for relOID (called when the
@@ -8433,6 +8443,37 @@ func (c *InMemory) RevokeTablePrivilege(relOID uint32, role, priv string) {
 	}
 }
 
+// MaterializeOwnerACL records an explicit owner aclitem for relOID holding
+// exactly ownerPrivs, but only if no explicit owner entry exists yet. See the
+// Catalog interface doc. The owner privileges are stored without the grant
+// option (PostgreSQL prints the owner's self-grant with no "*" markers), so a
+// subsequent RevokeTablePrivilege against the owner renders the remaining
+// privileges as a plain letter string. DU-002 slice 340.
+func (c *InMemory) MaterializeOwnerACL(relOID uint32, owner string, ownerPrivs []string) {
+	owner = strings.ToLower(strings.TrimSpace(owner))
+	if owner == "" || len(ownerPrivs) == 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	byRole := c.tableACLs[relOID]
+	if byRole == nil {
+		byRole = make(map[string]map[string]bool)
+		c.tableACLs[relOID] = byRole
+	}
+	if _, ok := byRole[owner]; ok {
+		return // owner entry already materialized; do not clobber a prior revoke
+	}
+	privs := make(map[string]bool, len(ownerPrivs))
+	for _, p := range ownerPrivs {
+		p = strings.ToUpper(strings.TrimSpace(p))
+		if p != "" {
+			privs[p] = false
+		}
+	}
+	byRole[owner] = privs
+}
+
 // HasTablePrivilege reports whether role was granted priv on relOID. M0118-0008.
 func (c *InMemory) HasTablePrivilege(relOID uint32, role, priv string) bool {
 	role = strings.ToLower(strings.TrimSpace(role))
@@ -8574,9 +8615,22 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 	if len(byRole) == 0 {
 		return "" // NULL relacl — matches acldefault, pg_dump emits no GRANT
 	}
-	items := []string{"postgres=" + ownerString + "/postgres"}
+	// The owner aclitem is always listed first. PostgreSQL leaves relacl NULL
+	// while the owner holds its implicit default set, rendering "postgres=<full>"
+	// once any grant materializes the array. An owner-side REVOKE materializes an
+	// explicit owner entry with a reduced privilege set (DU-002 slice 340); when
+	// present, render the owner's actual remaining privileges instead of the
+	// constant default, and skip the owner in the grantee loop below.
+	ownerLetters := ownerString
+	if ownerPrivs, ok := byRole[aclOwnerRole]; ok {
+		ownerLetters = renderACLLetters(ownerPrivs, privOrder)
+	}
+	items := []string{"postgres=" + ownerLetters + "/postgres"}
 	roles := make([]string, 0, len(byRole))
 	for role := range byRole {
+		if role == aclOwnerRole {
+			continue // already rendered as the leading owner entry
+		}
 		roles = append(roles, role)
 	}
 	sort.Strings(roles)
@@ -8585,20 +8639,8 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		if len(privs) == 0 {
 			continue
 		}
-		var letters strings.Builder
-		for _, p := range privOrder {
-			if withGrantOpt, ok := privs[p.keyword]; ok {
-				letters.WriteByte(p.letter)
-				if withGrantOpt {
-					// aclitemout renders a grant-option privilege as "<letter>*"
-					// (e.g. "r*" for SELECT WITH GRANT OPTION); pg_dump's
-					// buildACLCommands splits these into a separate
-					// `GRANT … WITH GRANT OPTION;`. DU-002 slice 332.
-					letters.WriteByte('*')
-				}
-			}
-		}
-		if letters.Len() == 0 {
+		letters := renderACLLetters(privs, privOrder)
+		if letters == "" {
 			continue
 		}
 		// PUBLIC is a pseudo-role: PostgreSQL stores its grant with an empty
@@ -8622,9 +8664,31 @@ func (c *InMemory) relaclTextLockedFor(relOID uint32, privOrder []aclPrivLetter,
 		// parser stops at the first unsafe char and mis-reads the grantee. The
 		// empty PUBLIC grantee and the all-alnum common case are returned
 		// unchanged. DU-002 slice 336.
-		items = append(items, aclQuoteName(grantee)+"="+letters.String()+"/postgres")
+		items = append(items, aclQuoteName(grantee)+"="+letters+"/postgres")
 	}
 	return "{" + strings.Join(items, ",") + "}"
+}
+
+// aclOwnerRole is the lower-cased name of the object owner in goopg's single
+// bootstrap-superuser model. The owner aclitem is always listed first in a
+// materialized relacl/nspacl and, absent an explicit owner-side REVOKE, renders
+// the owner's full default privilege set. DU-002 slice 340.
+const aclOwnerRole = "postgres"
+
+// renderACLLetters renders a privilege set as the aclitemout letter string in
+// the given canonical bit order, appending "*" after each privilege held WITH
+// GRANT OPTION (DU-002 slice 332). Privileges absent from privOrder are skipped.
+func renderACLLetters(privs map[string]bool, privOrder []aclPrivLetter) string {
+	var letters strings.Builder
+	for _, p := range privOrder {
+		if withGrantOpt, ok := privs[p.keyword]; ok {
+			letters.WriteByte(p.letter)
+			if withGrantOpt {
+				letters.WriteByte('*')
+			}
+		}
+	}
+	return letters.String()
 }
 
 // aclQuoteName reproduces PostgreSQL's putid (src/backend/utils/adt/acl.c): a
