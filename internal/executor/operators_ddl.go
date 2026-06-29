@@ -700,19 +700,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 				serialTyp == "bigserial" || serialTyp == "serial8" ||
 				serialTyp == "smallserial" || serialTyp == "serial2"
 			cols = append(cols, catalog.Column{
-				Name:             c.Name,
-				Type:             catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...), IsArray: c.Type.IsArray},
-				DeclaredTypeName: declaredTypeName,
-				NotNull:          c.NotNull || c.IdentityColumn || isSerialCol,
-				GeneratedExpr:    c.GeneratedExpr,
-				GeneratedAlways:  c.GeneratedAlways,
-				GeneratedVirtual: c.GeneratedVirtual,
-				DefaultExpr:      c.DefaultExpr,
-				IdentityColumn:   c.IdentityColumn,
-				IdentityAlways:   c.IdentityAlways,
-				IdentityStart:    c.IdentityStart,
-				Compression:      c.Compression,
-				Collation:        c.Collation,
+				Name:              c.Name,
+				Type:              catalog.Type{Name: typeName, Args: append([]int64(nil), c.Type.Args...), IsArray: c.Type.IsArray},
+				DeclaredTypeName:  declaredTypeName,
+				NotNull:           c.NotNull || c.IdentityColumn || isSerialCol,
+				GeneratedExpr:     c.GeneratedExpr,
+				GeneratedAlways:   c.GeneratedAlways,
+				GeneratedVirtual:  c.GeneratedVirtual,
+				DefaultExpr:       c.DefaultExpr,
+				IdentityColumn:    c.IdentityColumn,
+				IdentityAlways:    c.IdentityAlways,
+				IdentityStart:     c.IdentityStart,
+				IdentityIncrement: c.IdentityIncrement,
+				IdentityMin:       c.IdentityMin,
+				IdentityMax:       c.IdentityMax,
+				IdentityCache:     c.IdentityCache,
+				IdentityCycle:     c.IdentityCycle,
+				Compression:       c.Compression,
+				Collation:         c.Collation,
 			})
 		}
 		for _, item := range s.BodyOrder {
@@ -2106,7 +2111,24 @@ func (o *ddlOp) execCreateTable(s *parser.CreateTableStmt) error {
 		if c.IdentityStart != 0 {
 			seqStart = c.IdentityStart
 		}
-		RegisterSequence(seqName, seqStart, 1, seqMin, seqMax, false)
+		// Honour the remaining identity sequence options (INCREMENT BY / MINVALUE /
+		// MAXVALUE / CACHE / CYCLE) so pg_dump's ADD GENERATED ... AS IDENTITY (...)
+		// round-trips the non-default values, not just START WITH. nil → type/PG
+		// default (serial columns never set these). DU-002 (pg_dump 002–010).
+		seqIncrement := int64(1)
+		if c.IdentityIncrement != nil {
+			seqIncrement = *c.IdentityIncrement
+		}
+		if c.IdentityMin != nil {
+			seqMin = *c.IdentityMin
+		}
+		if c.IdentityMax != nil {
+			seqMax = *c.IdentityMax
+		}
+		RegisterSequence(seqName, seqStart, seqIncrement, seqMin, seqMax, c.IdentityCycle)
+		if c.IdentityCache != nil {
+			SetSequenceCache(seqName, *c.IdentityCache)
+		}
 		// Set the data type so information_schema.sequences shows the correct type
 		// AND pg_dump computes the right default min/max. The base-integer aliases
 		// (int2/smallint, int8/bigint) only reach here for IDENTITY columns (serial

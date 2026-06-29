@@ -2232,9 +2232,32 @@ documentation-only and is exempt from the design-doc requirement.)
       Tests `TestPort_InitiallyDeferredExclusionCommit` +
       `TestPort_SetConstraintsExclusionDeferral`; full executor + `-race` +
       prior deferred FK/UNIQUE/NND e2e + fk-snapshot PASS.
+      **2026-06-29 (loop #24, design 0119-0004-identity-sequence-options, DU-002
+      slice 303): identity-column sequence options round-trip in pg_dump.** A
+      `GENERATED … AS IDENTITY (sequence_options)` column's backing sequence now
+      round-trips EVERY option (INCREMENT BY / MINVALUE / MAXVALUE / CACHE /
+      CYCLE), not just START WITH. The identity parser previously scanned the
+      parenthesised clause for ONLY the `start` keyword and the executor
+      hard-coded the backing sequence to `increment=1, cycle=false, cache=1,
+      type-default min/max` (`RegisterSequence(seqName, seqStart, 1, seqMin,
+      seqMax, false)`), so the other options were silently dropped — wrong
+      step/bounds on restore AND wrong runtime `nextval()` step. Fix: parse the
+      full sequence-option grammar (mirroring `parseCreateSequenceTail`) into new
+      `ColumnDef.Identity{Increment,Min,Max,Cache,Cycle}` (ast.go) + matching
+      `catalog.Column` fields (the registration loop iterates catalog columns),
+      threaded through the executor to `RegisterSequence` + `SetSequenceCache`.
+      The dump path is unchanged (slice 120 renders the block from `pg_sequence`).
+      Zero blast radius (serial columns never set the fields; new catalog fields
+      default nil/false; TPC-H/pgbench carry no identity columns). Slice 303
+      (`idrich` all options + CYCLE; `idbd` BY DEFAULT + explicit increment + `NO
+      MINVALUE/NO MAXVALUE`) pinned byte-for-byte vs real pg_dump 18.3;
+      parser+executor+catalog suites PASS. Surfaced separate gap: `CREATE
+      SEQUENCE … OWNED BY schema.table.column` mis-resolves a 3-part qualified
+      owner (`sequence cannot be owned by relation "public"`).
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery; extended-protocol commit-time deferral (architecturally
-      entangled — extended protocol is auto-commit-per-statement).
+      battery (further slices); `CREATE SEQUENCE … OWNED BY` 3-part owner;
+      extended-protocol commit-time deferral (architecturally entangled —
+      extended protocol is auto-commit-per-statement).
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

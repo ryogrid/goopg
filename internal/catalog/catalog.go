@@ -131,6 +131,15 @@ type Column struct {
 	IdentityAlways bool
 	// IdentityStart is the START WITH value from the sequence options (0 = use default=1).
 	IdentityStart int64
+	// IdentityIncrement/Min/Max/Cache hold the remaining identity sequence options
+	// (nil = type/PG default); IdentityCycle records CYCLE. Threaded to the backing
+	// sequence so pg_dump's ADD GENERATED ... AS IDENTITY (...) round-trips the
+	// non-default INCREMENT BY / MINVALUE / MAXVALUE / CACHE / CYCLE. DU-002.
+	IdentityIncrement *int64
+	IdentityMin       *int64
+	IdentityMax       *int64
+	IdentityCache     *int64
+	IdentityCycle     bool
 	// Dropped is true for columns removed via ALTER TABLE DROP COLUMN.
 	// The column's heap slot (Ordinal) is retained for tuple compatibility;
 	// dropped columns are invisible in SELECT *, RETURNING *, and column lookups.

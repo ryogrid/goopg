@@ -1026,6 +1026,17 @@ type ColumnDef struct {
 	// IdentityStart is the START WITH value from the sequence options clause, or 0
 	// to use the type-default start (1 for ascending sequences). M0097-0024.
 	IdentityStart int64
+	// IdentityIncrement/Min/Max/Cache hold the remaining sequence options from an
+	// identity column's `(sequence_options)` clause (nil = not given → type/PG
+	// default). IdentityCycle records the CYCLE flag. These thread to the backing
+	// sequence so pg_dump's `ADD GENERATED ... AS IDENTITY (...)` round-trips the
+	// non-default options (INCREMENT BY, MINVALUE, MAXVALUE, CACHE, CYCLE), not
+	// just START WITH. DU-002 (pg_dump 002–010).
+	IdentityIncrement *int64
+	IdentityMin       *int64
+	IdentityMax       *int64
+	IdentityCache     *int64
+	IdentityCycle     bool
 
 	// DefaultExpr holds the parsed AST of the column's DEFAULT clause when
 	// one was given (`col INT DEFAULT 0`). nil for columns without a DEFAULT.

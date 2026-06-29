@@ -2596,44 +2596,58 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			if p.acceptIdentKeyword("identity") {
 				col.IdentityColumn = true
 				col.IdentityAlways = isAlways
-				// Parse optional sequence options: (START WITH n INCREMENT BY m ...)
-				// We capture START WITH to initialize the sequence correctly.
-				if p.cur().Kind == TokenSymbol && p.cur().Value == "(" {
-					depth := 1
-					p.advance()
-					for depth > 0 && p.cur().Kind != TokenEOF {
-						if p.cur().Kind == TokenSymbol {
-							if p.cur().Value == "(" {
-								depth++
-							} else if p.cur().Value == ")" {
-								depth--
-								if depth == 0 {
-									p.advance()
-									break
-								}
-							}
-						}
-						// Capture START WITH value.
-						if depth == 1 && p.cur().Kind == TokenIdent &&
-							strings.EqualFold(p.cur().Value, "start") {
-							p.advance() // consume START
-							// WITH is a reserved keyword (KwWith), so accept both forms.
+				// Parse the optional `(sequence_options)` clause. Every option is
+				// threaded to the backing sequence so pg_dump's
+				// `ADD GENERATED ... AS IDENTITY (...)` re-emits the non-default
+				// INCREMENT BY / MINVALUE / MAXVALUE / CACHE / CYCLE, not just
+				// START WITH. The option grammar matches CREATE SEQUENCE
+				// (parseCreateSequenceTail). DU-002 (pg_dump 002–010).
+				if p.acceptSymbol("(") {
+					for !p.acceptSymbol(")") {
+						switch {
+						case p.acceptIdentKeyword("start"):
 							_ = p.acceptKeyword(KwWith) || p.acceptIdentKeyword("with")
-							neg := p.cur().Kind == TokenSymbol && p.cur().Value == "-"
-							if neg {
-								p.advance()
+							v, err := p.parseInt64()
+							if err != nil {
+								return ColumnDef{}, err
 							}
-							if p.cur().Kind == TokenIntLit {
-								if v, err2 := strconv.ParseInt(p.cur().Value, 10, 64); err2 == nil {
-									if neg {
-										col.IdentityStart = -v
-									} else {
-										col.IdentityStart = v
-									}
-								}
+							col.IdentityStart = v
+						case p.acceptIdentKeyword("increment"):
+							_ = p.acceptKeyword(KwBy)
+							v, err := p.parseInt64()
+							if err != nil {
+								return ColumnDef{}, err
 							}
+							col.IdentityIncrement = &v
+						case p.acceptIdentKeyword("minvalue"):
+							v, err := p.parseInt64()
+							if err != nil {
+								return ColumnDef{}, err
+							}
+							col.IdentityMin = &v
+						case p.acceptIdentKeyword("maxvalue"):
+							v, err := p.parseInt64()
+							if err != nil {
+								return ColumnDef{}, err
+							}
+							col.IdentityMax = &v
+						case p.acceptIdentKeyword("cache"):
+							v, err := p.parseInt64()
+							if err != nil {
+								return ColumnDef{}, err
+							}
+							col.IdentityCache = &v
+						case p.acceptIdentKeyword("cycle"):
+							col.IdentityCycle = true
+						case p.acceptIdentKeyword("no"):
+							// NO MINVALUE / NO MAXVALUE / NO CYCLE — leave the
+							// field nil/false so the type default applies.
+							_ = p.acceptIdentKeyword("minvalue") || p.acceptIdentKeyword("maxvalue") || p.acceptIdentKeyword("cycle")
+						case p.cur().Kind == TokenEOF:
+							return ColumnDef{}, p.errAtCur("unterminated identity sequence options")
+						default:
+							return ColumnDef{}, p.errAtCur("unrecognised identity sequence option")
 						}
-						p.advance()
 					}
 				}
 				continue
