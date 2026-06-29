@@ -6325,18 +6325,36 @@ func nndDetail(idx *catalog.Index, cols []catalog.Column, row Row) string {
 // callers only consume the boolean. Mirrors the heap-scan pattern of
 // checkGistOverlapExclusion. Design 0119-0004.
 func checkNullsNotDistinctViaHeapScan(ctx *Context, tbl *catalog.Table, idx *catalog.Index, cols []catalog.Column, row Row, rel storage.RelFileNode) (storage.ItemPointer, bool) {
-	// Resolve, per index key column: the candidate NULL-ness / encoded key and
-	// the tbl.Columns ordinal used to read the decoded existing row.
-	type nndKeyCol struct {
-		tblOrd   int
-		col      *catalog.Column
-		candNull bool
-		candKey  []byte // encoded candidate key (nil when candNull)
+	keyCols, ok := resolveNNDKeyColsFromRow(tbl, idx, cols, row)
+	if !ok {
+		return storage.ItemPointer{}, false
 	}
+	// Immediate check: the candidate row is not yet inserted, so the FIRST live
+	// matching tuple is the duplicate (stopAt=1).
+	count, ptr := scanNNDLiveMatches(ctx, tbl, rel, keyCols, 1)
+	return ptr, count >= 1
+}
+
+// nndKeyCol is one resolved index key column for a NULLS NOT DISTINCT heap scan:
+// the candidate's NULL-ness / encoded key plus the tbl.Columns ordinal used to
+// read the decoded existing row. 0119-0004 (lifted to package scope for the
+// deferred recheck path, 0119-0004-deferred-unique-nnd).
+type nndKeyCol struct {
+	tblOrd   int
+	col      *catalog.Column
+	candNull bool
+	candKey  []byte // encoded candidate key (nil when candNull)
+}
+
+// resolveNNDKeyColsFromRow builds the per-key-column descriptors for an NND heap
+// scan from a live candidate Row + its column layout. Returns ok=false on a
+// structural problem (expression key column, missing column, encode failure) so
+// the caller falls back to skipping the NND check. 0119-0004-deferred-unique-nnd.
+func resolveNNDKeyColsFromRow(tbl *catalog.Table, idx *catalog.Index, cols []catalog.Column, row Row) ([]nndKeyCol, bool) {
 	keyCols := make([]nndKeyCol, 0, len(idx.Columns))
 	for _, idxColName := range idx.Columns {
 		if idxColName == "" {
-			return storage.ItemPointer{}, false // expression NND index — out of scope
+			return nil, false // expression NND index — out of scope
 		}
 		var candVal Datum
 		foundCand := false
@@ -6347,33 +6365,48 @@ func checkNullsNotDistinctViaHeapScan(ctx *Context, tbl *catalog.Table, idx *cat
 				break
 			}
 		}
-		tblOrd := -1
-		var col *catalog.Column
-		for j := range tbl.Columns {
-			if strings.EqualFold(tbl.Columns[j].Name, idxColName) {
-				tblOrd = j
-				col = &tbl.Columns[j]
-				break
-			}
-		}
+		tblOrd, col := nndTableColumn(tbl, idxColName)
 		if !foundCand || tblOrd < 0 || col == nil {
-			return storage.ItemPointer{}, false
+			return nil, false
 		}
 		kc := nndKeyCol{tblOrd: tblOrd, col: col, candNull: candVal.IsNull()}
 		if !kc.candNull {
 			enc, eerr := encodeBTreeKeyForColumn(candVal, col, 0)
 			if eerr != nil {
-				return storage.ItemPointer{}, false
+				return nil, false
 			}
 			kc.candKey = enc
 		}
 		keyCols = append(keyCols, kc)
 	}
+	return keyCols, true
+}
 
+// nndTableColumn resolves an index key column name to its tbl.Columns ordinal
+// and *catalog.Column (case-insensitive), or (-1, nil) if absent.
+func nndTableColumn(tbl *catalog.Table, name string) (int, *catalog.Column) {
+	for j := range tbl.Columns {
+		if strings.EqualFold(tbl.Columns[j].Name, name) {
+			return j, &tbl.Columns[j]
+		}
+	}
+	return -1, nil
+}
+
+// scanNNDLiveMatches seq-scans rel and counts live heap tuples whose index key
+// columns match keyCols' NULL pattern + non-NULL encoded key bytes (NULL equals
+// NULL, a non-NULL column compares byte-equal under its index encoding). It stops
+// early once the count reaches stopAt. Returns the count and the first match's
+// ItemPointer. Shared by the immediate NND check (stopAt=1: any match is a dup)
+// and the deferred-at-COMMIT recheck (stopAt=2: the candidate row is itself one
+// match, so ≥2 is the violation). 0119-0004-deferred-unique-nnd.
+func scanNNDLiveMatches(ctx *Context, tbl *catalog.Table, rel storage.RelFileNode, keyCols []nndKeyCol, stopAt int) (int, storage.ItemPointer) {
 	nBlocks, err := ctx.Pool.NBlocks(rel)
 	if err != nil {
-		return storage.ItemPointer{}, false
+		return 0, storage.ItemPointer{}
 	}
+	matches := 0
+	var first storage.ItemPointer
 	decRow := make(Row, len(tbl.Columns))
 	for b := storage.BlockNumber(0); b < nBlocks; b++ {
 		s, perr := ctx.Pool.Pin(storage.BufferTag{Rel: rel, Block: b})
@@ -6430,16 +6463,21 @@ func checkNullsNotDistinctViaHeapScan(ctx *Context, tbl *catalog.Table, idx *cat
 				}
 			}
 			if match {
-				ptr := storage.ItemPointer{Block: b, Offset: slotIdx}
-				s.RUnlock()
-				ctx.Pool.Unpin(s)
-				return ptr, true
+				if matches == 0 {
+					first = storage.ItemPointer{Block: b, Offset: slotIdx}
+				}
+				matches++
+				if matches >= stopAt {
+					s.RUnlock()
+					ctx.Pool.Unpin(s)
+					return matches, first
+				}
 			}
 		}
 		s.RUnlock()
 		ctx.Pool.Unpin(s)
 	}
-	return storage.ItemPointer{}, false
+	return matches, first
 }
 
 // checkUniqueIndexesForInsert enforces unique-constraint violations at INSERT
@@ -6485,6 +6523,14 @@ func checkUniqueIndexesForInsert(ctx *Context, tbl *catalog.Table, cols []catalo
 			// non-NND index and every non-NULL reason for a nil key (expression
 			// column, arity mismatch) keeps the existing skip. Design 0119-0004.
 			if err == nil && idx.NullsNotDistinct && rowHasNullKeyColumn(idx, cols, row) {
+				// DEFERRABLE INITIALLY DEFERRED (or SET CONSTRAINTS … DEFERRED):
+				// queue the NULL-pattern recheck for COMMIT instead of raising now,
+				// so a transient NULL duplicate is tolerated mid-transaction.
+				// 0119-0004-deferred-unique-nnd.
+				if uniqueCheckDeferred(ctx, idx) {
+					queueDeferredNNDUniqueCheck(ctx, tbl, idx, cols, row)
+					continue
+				}
 				if _, found := checkNullsNotDistinctViaHeapScan(ctx, tbl, idx, cols, row, rel); found {
 					return &ExecError{
 						Code:    "23505",
@@ -6590,6 +6636,13 @@ func checkUniqueIndexesForUpdate(ctx *Context, tbl *catalog.Table, cols []catalo
 			// it — a no-key-change NULL→NULL UPDATE never self-conflicts.
 			// Design 0119-0004.
 			if err == nil && idx.NullsNotDistinct && rowHasNullKeyColumn(idx, cols, newRow) {
+				// DEFERRABLE INITIALLY DEFERRED (or SET CONSTRAINTS … DEFERRED):
+				// queue the NULL-pattern recheck for COMMIT instead of raising now.
+				// 0119-0004-deferred-unique-nnd.
+				if uniqueCheckDeferred(ctx, idx) {
+					queueDeferredNNDUniqueCheck(ctx, tbl, idx, cols, newRow)
+					continue
+				}
 				if _, found := checkNullsNotDistinctViaHeapScan(ctx, tbl, idx, cols, newRow, rel); found {
 					return &ExecError{
 						Code:    "23505",

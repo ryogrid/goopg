@@ -72,6 +72,45 @@ func queueDeferredUniqueCheck(ctx *Context, tbl *catalog.Table, idx *catalog.Ind
 	})
 }
 
+// queueDeferredNNDUniqueCheck enqueues a deferred NULLS-NOT-DISTINCT uniqueness
+// recheck for a candidate row that has one or more NULL key columns on an NND
+// index (no btree key, so the COMMIT recheck is a heap scan over the recorded
+// NULL pattern). It captures the candidate's per-key-column NULL-ness / encoded
+// value so no live catalog/Row pointers are held across statements. No-op when
+// the session is not a BasicSession or the key columns cannot be resolved (the
+// immediate path's rowHasNullKeyColumn guard already ensures a plain column key).
+// 0119-0004-deferred-unique-nnd.
+func queueDeferredNNDUniqueCheck(ctx *Context, tbl *catalog.Table, idx *catalog.Index, cols []catalog.Column, row Row) {
+	sess, ok := ctx.Session.(*BasicSession)
+	if !ok {
+		return
+	}
+	keyCols, ok := resolveNNDKeyColsFromRow(tbl, idx, cols, row)
+	if !ok {
+		return
+	}
+	nnd := make([]DeferredNNDKeyCol, 0, len(keyCols))
+	for i, kc := range keyCols {
+		// keyCols and idx.Columns are 1:1 in order (resolveNNDKeyColsFromRow
+		// iterates idx.Columns), so idx.Columns[i] is this column's name.
+		name := ""
+		if i < len(idx.Columns) {
+			name = idx.Columns[i]
+		}
+		nnd = append(nnd, DeferredNNDKeyCol{
+			ColName: name,
+			Null:    kc.candNull,
+			Key:     append([]byte(nil), kc.candKey...),
+		})
+	}
+	sess.AddDeferredUniqueCheck(DeferredUniqueCheck{
+		TableName:  tbl.Name,
+		IndexName:  idx.Name,
+		NNDKeyCols: nnd,
+		Detail:     nndDetail(idx, cols, row),
+	})
+}
+
 // RunDeferredUniqueChecks re-verifies every UNIQUE/PK constraint key queued
 // during the current transaction and clears the queue. Both commit paths invoke
 // it before TxnMgr.Commit (the executor's execCommit and the simple-query
@@ -118,8 +157,54 @@ func runAllDeferredUniqueChecks(ctx *Context, checks []DeferredUniqueCheck) erro
 		if idx == nil {
 			continue
 		}
+		if c.NNDKeyCols != nil {
+			// NULLS NOT DISTINCT candidate with NULL key column(s): no btree key,
+			// so re-scan the heap for its NULL pattern. 0119-0004-deferred-unique-nnd.
+			if err := recheckDeferredNNDUniqueKey(ctx, tbl, idx, c.NNDKeyCols, c.Detail); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := recheckDeferredUniqueKey(ctx, tbl, idx, c.Key, c.Detail); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// recheckDeferredNNDUniqueKey re-verifies a deferred NULLS-NOT-DISTINCT unique
+// check whose candidate had one or more NULL key columns. It rebuilds the
+// per-column scan descriptors from the queued NULL pattern (resolving each
+// column against the live table by name) and seq-scans the heap counting live
+// tuples that match. The candidate row is itself one such tuple at COMMIT, so
+// two or more live matches is the violation — exactly the ≥2 rule the btree path
+// uses. A no-key-change transient NULL duplicate resolved before COMMIT (e.g. a
+// DELETE or a key-changing UPDATE of one collider) leaves a single live match
+// and passes. 0119-0004-deferred-unique-nnd.
+func recheckDeferredNNDUniqueKey(ctx *Context, tbl *catalog.Table, idx *catalog.Index, nndCols []DeferredNNDKeyCol, detail string) error {
+	rel := ctx.Catalog.RelFileNode(tbl)
+	keyCols := make([]nndKeyCol, 0, len(nndCols))
+	for _, nc := range nndCols {
+		tblOrd, col := nndTableColumn(tbl, nc.ColName)
+		if tblOrd < 0 || col == nil {
+			// Column dropped within the transaction after the check was queued —
+			// nothing to enforce against it. Skip the whole recheck.
+			return nil
+		}
+		keyCols = append(keyCols, nndKeyCol{
+			tblOrd:   tblOrd,
+			col:      col,
+			candNull: nc.Null,
+			candKey:  nc.Key,
+		})
+	}
+	count, _ := scanNNDLiveMatches(ctx, tbl, rel, keyCols, 2)
+	if count >= 2 {
+		return &ExecError{
+			Code:    "23505",
+			Pos:     0,
+			Message: fmt.Sprintf("duplicate key value violates unique constraint %q", idx.Name),
+			Detail:  detail,
 		}
 	}
 	return nil

@@ -408,19 +408,53 @@ type DeferredUniqueCheck struct {
 	TableName string
 	IndexName string // == the UNIQUE/PK constraint name (SET CONSTRAINTS match key)
 	Key       []byte
-	Detail    string
+	// NNDKeyCols, when non-nil, marks a NULLS NOT DISTINCT check whose candidate
+	// has one or more NULL key columns: such a row has no btree Key (Key is nil),
+	// so the COMMIT recheck is a heap scan over the recorded NULL pattern instead
+	// of a btree RangeScan. nil for an ordinary (btree-keyed) deferred check.
+	// Design 0119-0004-deferred-unique-nnd.
+	NNDKeyCols []DeferredNNDKeyCol
+	Detail     string
+}
+
+// DeferredNNDKeyCol is one index key column's candidate value, captured at DML
+// time so a NULLS NOT DISTINCT deferred check can re-scan the heap at COMMIT
+// without holding live catalog/Row pointers across statements. Null records that
+// the candidate was NULL for this column; Key is the column's encoded btree key
+// when non-NULL (nil when Null). 0119-0004-deferred-unique-nnd.
+type DeferredNNDKeyCol struct {
+	ColName string
+	Null    bool
+	Key     []byte
 }
 
 // AddDeferredUniqueCheck queues a UNIQUE/PK constraint key to be re-verified at
-// COMMIT time. Deduplicates on (IndexName, Key): one re-probe per distinct key
-// suffices. 0119-0004.
+// COMMIT time. Deduplicates on (IndexName, Key, NNDKeyCols): one re-probe per
+// distinct candidate suffices — two distinct NULL patterns on the same NND index
+// (e.g. (null,1) and (null,2)) queue separately. 0119-0004.
 func (s *BasicSession) AddDeferredUniqueCheck(check DeferredUniqueCheck) {
 	for _, existing := range s.deferredUniqChecks {
-		if existing.IndexName == check.IndexName && bytes.Equal(existing.Key, check.Key) {
+		if existing.IndexName == check.IndexName && bytes.Equal(existing.Key, check.Key) &&
+			sameNNDKeyCols(existing.NNDKeyCols, check.NNDKeyCols) {
 			return
 		}
 	}
 	s.deferredUniqChecks = append(s.deferredUniqChecks, check)
+}
+
+// sameNNDKeyCols reports whether two NND candidate NULL-pattern descriptors are
+// identical (same columns, NULL flags, and encoded non-NULL key bytes). Used to
+// dedup deferred NND unique checks. 0119-0004-deferred-unique-nnd.
+func sameNNDKeyCols(a, b []DeferredNNDKeyCol) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].ColName != b[i].ColName || a[i].Null != b[i].Null || !bytes.Equal(a[i].Key, b[i].Key) {
+			return false
+		}
+	}
+	return true
 }
 
 // TakeDeferredUniqueChecks returns and clears the queued deferred UNIQUE/PK

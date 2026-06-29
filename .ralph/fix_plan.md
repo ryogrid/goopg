@@ -2182,9 +2182,37 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_InitiallyDeferredUniqueCommit` + `TestPort_SetConstraintsUniqueDeferral`;
       executor + `-race` + FK-deferral regression PASS. Catalog already carried
       `Index.Deferrable`/`InitiallyDeferred` (no parser/catalog change).
+      **2026-06-29 (loop #22, design 0119-0004-deferred-unique-nnd): deferred
+      UNIQUE with NULLS NOT DISTINCT (NULL-keyed rows) LANDED.** Composes the
+      deferred-unique queue (loop #20) with NND enforcement (loops #14–#17),
+      which previously did not interoperate: in
+      `checkUniqueIndexes{ForInsert,ForUpdate}` the `key == nil` arm (a NULL key
+      column on an NND index — found by heap scan, not the btree) ran the
+      **immediate** `checkNullsNotDistinctViaHeapScan` raise unconditionally,
+      never consulting `uniqueCheckDeferred`. So `UNIQUE NULLS NOT DISTINCT …
+      DEFERRABLE INITIALLY DEFERRED` wrongly raised 23505 immediately on a
+      transient NULL duplicate and never queued a COMMIT recheck. Fix: the NND
+      arm now defers when `uniqueCheckDeferred(ctx, idx)`, queuing a
+      `DeferredUniqueCheck` carrying the candidate's per-key-column NULL pattern
+      (new `NNDKeyCols []DeferredNNDKeyCol{ColName,Null,Key}` on the session
+      struct; dedup widened via `sameNNDKeyCols` so `(null,1)` vs `(null,2)`
+      queue separately). The immediate heap scanner's per-column descriptor
+      (`nndKeyCol`) is lifted to package scope and its scan loop extracted to
+      `scanNNDLiveMatches(…, stopAt)`; immediate path uses `stopAt=1` (candidate
+      not yet inserted, any match = dup), the new `recheckDeferredNNDUniqueKey`
+      uses `stopAt=2` (candidate is itself one live match at COMMIT, ≥2 = 23505),
+      both under the already-installed `FreshSnapshot()` + shared
+      `isLiveForUniqueCheck`. `runAllDeferredUniqueChecks` branches on
+      `c.NNDKeyCols != nil`; `SET CONSTRAINTS … IMMEDIATE` rides the same branch.
+      Gated on `idx.NullsNotDistinct && rowHasNullKeyColumn && uniqueCheckDeferred`
+      → zero blast radius. Oracle-grounded vs PG 18.3 (transient resolved →
+      commit; surviving dup → 23505 at COMMIT `Key (a)=(null) already exists.`;
+      distinct NULL patterns coexist; SET CONSTRAINTS path). Tests
+      `TestPort_InitiallyDeferredNNDUniqueCommit` + `TestPort_DeferredNNDMultiColumn`
+      + `TestPort_SetConstraintsNNDDeferral`; full executor + `-race` + prior
+      deferred-unique/FK e2e PASS.
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery; deferred EXCLUDE + NND-INITIALLY-DEFERRED; extended-protocol
-      commit-time deferral.
+      battery; deferred EXCLUDE; extended-protocol commit-time deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).
