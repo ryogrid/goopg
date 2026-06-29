@@ -2144,11 +2144,28 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_SetConstraintsDeferral` (control immediate-fail / deferred ordered
       / raise-at-COMMIT / raise-at-IMMEDIATE). fk-snapshot + full FK isolation
       group + executor/parser/server units PASS.
+      **2026-06-29 (loop #19, design 0119-0004-deferred-ri-fresh-snapshot):
+      deferred-RI fresh-snapshot LANDED — the `ConstraintsOverrideActive` gate is
+      DROPPED.** Plain `DEFERRABLE INITIALLY DEFERRED` FKs are now enforced at
+      `COMMIT` on the simple-query path (psql/lib/pq/isolation runner — bypasses
+      `execCommit`), not only under a `SET CONSTRAINTS … DEFERRED` override. New
+      exported `mvcc.Manager.FreshSnapshot()` (wraps `captureSnapshot()` → latest
+      committed state, CLOG + partition-detach epoch attached) mirrors PG's
+      `RI_FKey_check`/`ri_PerformCheck` `GetLatestSnapshot()` push;
+      `runAllDeferredFKChecks` saves `ctx.Snap`, installs the fresh snapshot for
+      the queued checks, restores via `defer` — one chokepoint covering BOTH the
+      `execCommit` and dispatch paths. This is what let the gate drop without
+      regressing `fk-snapshot`: a `REPEATABLE READ` session's pinned snapshot can't
+      see a concurrently-committed partitioned parent, but the fresh snapshot can.
+      Own uncommitted child rows stay visible (`TupleVisibleSubxact` self-check on
+      `ctx.Tx.XID`); zero blast radius on an empty deferred queue (early return →
+      no snapshot taken). `dispatch.go` gate `&& sess.ConstraintsOverrideActive()`
+      removed. Tests: `TestPort_IsolationFkSnapshot` (7 perms) + full FK isolation
+      group PASS; new `TestPort_InitiallyDeferredFKCommit` (plain INITIALLY
+      DEFERRED, no override — ordered commit + raise-at-COMMIT + orphan rollback);
+      `TestPort_SetConstraintsDeferral` PASS; `-race` mvcc + executor PASS.
       **Still open under M0119-0004:** the pg_dump 002–010 catalog-view parity
-      battery; the deferred-RI **fresh-snapshot** semantics needed to drop the
-      `ConstraintsOverrideActive` gate (so plain `INITIALLY DEFERRED` is also
-      enforced at commit on the simple-query path without regressing fk-snapshot);
-      deferred UNIQUE/EXCLUDE; extended-protocol deferral.
+      battery; deferred UNIQUE/EXCLUDE; extended-protocol commit-time deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

@@ -342,6 +342,26 @@ func (m *Manager) AssignXID(tx Transaction) (storage.TransactionID, error) {
 	return newXID, nil
 }
 
+// FreshSnapshot captures a brand-new "latest" MVCC snapshot reflecting every
+// transaction committed up to this instant, independent of any transaction's
+// isolation level or pinned statement snapshot.
+//
+// This mirrors PostgreSQL's deferred referential-integrity machinery: a
+// constraint trigger queued INITIALLY DEFERRED fires at COMMIT under a freshly
+// pushed snapshot (RI_FKey_check / ri_PerformCheck push GetLatestSnapshot before
+// running the check SPI query), NOT the firing statement's snapshot. Without
+// this a REPEATABLE READ transaction's pinned snapshot would fail to see a
+// concurrently-committed parent row that satisfies the constraint, raising a
+// spurious 23503 at COMMIT (see the fk-snapshot isolation spec, where s2's RR
+// snapshot cannot see s1's just-committed fk_parted_pk row but the deferred
+// check must still pass). Used only by the deferred FK check at COMMIT; the
+// snapshot still classifies the committing transaction's own XID as in-progress,
+// so own-write visibility continues to flow through the currentXID self-check in
+// TupleVisibleSubxact. 0119-0004 (deferred-ri-fresh-snapshot).
+func (m *Manager) FreshSnapshot() Snapshot {
+	return m.captureSnapshot()
+}
+
 // SnapshotFor returns the statement snapshot for tx.
 //
 // READ COMMITTED gets a fresh snapshot on every call.

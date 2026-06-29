@@ -1,34 +1,29 @@
 (idle — nothing in flight)
 
-Last loop (#18): M0119-0004 **`SET CONSTRAINTS` runtime constraint-deferral
-control** — LANDED + design `0119-0004-set-constraints-deferred`. Second general
-SQL-engine gap under M0119-0004 (the deferred-constraint-checking-at-COMMIT gap).
-- Parser `SetConstraintsStmt` (`SET CONSTRAINTS {ALL|name[,…]} {DEFERRED|IMMEDIATE}`)
-  → `planner.Utility` → `executor.setConstraintsOp`.
-- `BasicSession`: `constraintsAllMode int8` + per-name `constraintDeferral` map
-  (reset per txn); `FKConstraintDeferred(name, initiallyDeferred)` precedence
-  per-name > ALL > declared default; `TakeDeferredFKChecksMatching` (IMMEDIATE).
-- New `fkCheckDeferred(ctx, fk)` helper replaces the 4 open-coded
-  `Deferrable && InitiallyDeferred && inTx` sites in operators_fk.go
-  (byte-identical with no override).
-- IMMEDIATE runs queued checks at the SET stmt (setConstraintsOp). Simple-query
-  COMMIT path (bypasses execCommit) gained `executor.RunDeferredFKChecks`
-  **GATED on `ConstraintsOverrideActive()`** — plain INITIALLY DEFERRED keeps
-  prior behaviour (unconditional activation REGRESSED pass-required `fk-snapshot`:
-  its deferred-RI check needs a FRESH snapshot to see a concurrently-committed
-  *partitioned* parent; `fullTableFKCheck` uses txn `ctx.Snap` → false 23503).
-- query.go simple-query routing + extended no-op + `SET CONSTRAINTS` tag;
-  removed old compatNoopCommandTag entry.
-- Tests: parser(4 shapes), executor session(precedence/matching), e2e
-  `TestPort_SetConstraintsDeferral` (control/ordered/raise-at-COMMIT/
-  raise-at-IMMEDIATE via pinned `*sql.Conn`). fk-snapshot + full FK isolation
-  group + executor/parser/server units PASS; -race executor PASS; build clean.
+Last loop (#19): M0119-0004 **deferred-RI fresh-snapshot** — LANDED, the
+`ConstraintsOverrideActive` gate is DROPPED. Plain `DEFERRABLE INITIALLY
+DEFERRED` FKs now enforce at COMMIT on the simple-query path (psql/lib/pq/
+isolation runner, which bypasses `execCommit`), matching PG's deferred-RI
+`GetLatestSnapshot()` semantics. Design `0119-0004-deferred-ri-fresh-snapshot`.
+- `mvcc.Manager.FreshSnapshot()` (manager.go) = exported wrap of
+  `captureSnapshot()` (latest committed; CLOG + partition-detach epoch attached).
+- `runAllDeferredFKChecks` (operators_fk.go) saves `ctx.Snap`, installs
+  `FreshSnapshot()`, restores via `defer` — ONE chokepoint for BOTH execCommit
+  and dispatch paths. `fullTableFKCheck` child scan + `assertParentExists`→
+  `scanTableForMatchFKWait` parent probe both see post-snapshot commits.
+- dispatch.go TxCommit: removed `&& sess.ConstraintsOverrideActive()`.
+- Own uncommitted child rows still visible (TupleVisibleSubxact self-check on
+  ctx.Tx.XID); empty deferred queue → early return, no snapshot taken (zero
+  blast radius for TPC-H/pgbench/IMMEDIATE).
+- Tests: `TestPort_IsolationFkSnapshot` (7 perms) + full FK iso group PASS; new
+  `TestPort_InitiallyDeferredFKCommit` (ordered commit + raise-at-COMMIT + orphan
+  rollback); `TestPort_SetConstraintsDeferral` PASS; -race mvcc+executor PASS.
 
 NEXT loop — pick topmost actionable M0119:
-- M0119-0004 still open: pg_dump 002–010 catalog parity battery (slice-by-slice
-  via self-promoting `TestPort_PgDumpConnectionSetup` guard — currently GREEN,
-  add a fixture to find the next gap); **deferred-RI fresh-snapshot** to drop the
-  ConstraintsOverrideActive gate (ledger row, resume = fresh "latest" snapshot in
-  `fullTableFKCheck`/`assertParentExists`, verify fk-snapshot stays green).
-- M0119-0002 (CLOG store swap Part B) — highest blast radius, dedicated full-gate.
-- M0119-0005/0006/0007 blocked (index AMs / logical decoding).
+- M0119-0004 still open: pg_dump 002–010 catalog-view parity battery
+  (self-promoting `TestPort_PgDumpConnectionSetup` guard, currently GREEN — add a
+  fixture to surface the next gap); deferred UNIQUE/EXCLUDE (needs a
+  deferred-uniqueness queue parallel to the FK queue); extended-protocol
+  commit-time deferral (thread executor session into the extended utility fast
+  path so deferral works off the simple protocol).
+- Or M0119-0005 (pg_waldump server tier) / M0119-0006 (pg_amcheck server tier).

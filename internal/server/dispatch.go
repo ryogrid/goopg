@@ -1841,17 +1841,18 @@ func (s *Server) executeOneSimpleStmt(w *protocol.FrameWriter, ctx *executor.Con
 					return w.WriteCommandComplete("ROLLBACK")
 				}
 				explicitTx := connTx.Tx()
-				// Run FK constraint checks deferred to COMMIT under a
-				// SET CONSTRAINTS … DEFERRED override. The simple-query dispatch
-				// bypasses transactionOp.execCommit, so the checks queued on the
-				// session during INSERT/UPDATE/DELETE must be run here BEFORE
+				// Run FK constraint checks deferred to COMMIT (DEFERRABLE
+				// INITIALLY DEFERRED, or made deferred by SET CONSTRAINTS …
+				// DEFERRED). The simple-query dispatch bypasses
+				// transactionOp.execCommit, so the checks queued on the session
+				// during INSERT/UPDATE/DELETE must be run here BEFORE
 				// TxnMgr.Commit; a violation aborts the transaction with 23503,
 				// exactly as PG raises a deferred constraint violation at COMMIT.
-				// Gated on an active SET CONSTRAINTS override so a plain
-				// DEFERRABLE INITIALLY DEFERRED constraint keeps its prior
-				// behaviour (its concurrent/partitioned-parent snapshot semantics
-				// — fk-snapshot — are a separate, pre-existing gap). 0119-0004.
-				if sess := connTx.Session(); sess != nil && sess.ConstraintsOverrideActive() {
+				// RunDeferredFKChecks runs them under a fresh "latest" snapshot
+				// (mvcc.Manager.FreshSnapshot) so a concurrently-committed parent
+				// row satisfies the check even under REPEATABLE READ — matching
+				// PG's deferred-RI snapshot semantics (fk-snapshot). 0119-0004.
+				if sess := connTx.Session(); sess != nil {
 					if fkErr := executor.RunDeferredFKChecks(ctx, sess); fkErr != nil {
 						if rs := s.cfg.Catalog.Routines(); rs != nil {
 							for _, r := range sess.TakePendingRoutineDrops() {

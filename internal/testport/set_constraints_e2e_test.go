@@ -126,3 +126,79 @@ func TestPort_SetConstraintsDeferral(t *testing.T) {
 	}
 	_ = ex("ROLLBACK")
 }
+
+// TestPort_InitiallyDeferredFKCommit exercises a plain DEFERRABLE INITIALLY
+// DEFERRED foreign key — with NO SET CONSTRAINTS override — over the simple-query
+// COMMIT path. The simple-query dispatch bypasses transactionOp.execCommit, so
+// before loop #19 the deferred check queued at the INSERT was only run when a
+// SET CONSTRAINTS override was active; a plain INITIALLY DEFERRED constraint's
+// enforcement was effectively dead on this path. Dropping that gate (backed by a
+// fresh "latest" snapshot so concurrent commits are visible, fk-snapshot) makes
+// the constraint enforce at COMMIT exactly as PG does. 0119-0004
+// (deferred-ri-fresh-snapshot).
+func TestPort_InitiallyDeferredFKCommit(t *testing.T) {
+	c := newCluster(t, "initdeferredfk")
+	mustInitStart(t, c)
+	defer func() { _ = c.Stop(cluster.ShutdownImmediate) }()
+
+	if err := runSQLSimple(t, c, "CREATE TABLE dparent (id integer PRIMARY KEY)"); err != nil {
+		t.Fatalf("create parent: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE dchild (id integer PRIMARY KEY, pid integer "+
+		"REFERENCES dparent(id) DEFERRABLE INITIALLY DEFERRED)"); err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	db, conn := scConn(t, c, ctx)
+	defer db.Close()
+	defer conn.Close()
+
+	ex := func(q string) error {
+		_, err := conn.ExecContext(ctx, q)
+		return err
+	}
+	isFKErr := func(err error) bool {
+		return err != nil && strings.Contains(strings.ToLower(err.Error()), "foreign key")
+	}
+
+	// INITIALLY DEFERRED: child-before-parent in one txn succeeds — the check
+	// does NOT fire at the INSERT, and at COMMIT the now-present parent satisfies
+	// it. No SET CONSTRAINTS involved.
+	if err := ex("BEGIN"); err != nil {
+		t.Fatalf("begin ordered: %v", err)
+	}
+	if err := ex("INSERT INTO dchild VALUES (1, 10)"); err != nil {
+		t.Fatalf("deferred child insert (parent absent) should not fail at INSERT: %v", err)
+	}
+	if err := ex("INSERT INTO dparent VALUES (10)"); err != nil {
+		t.Fatalf("parent insert: %v", err)
+	}
+	if err := ex("COMMIT"); err != nil {
+		t.Fatalf("ordered commit: unexpected error %v", err)
+	}
+	rows := runSQL(t, c, "SELECT id, pid FROM dchild WHERE id = 1")
+	if len(rows) != 1 || rows[0][0] != "1" || rows[0][1] != "10" {
+		t.Fatalf("deferred row not committed: %v", rows)
+	}
+
+	// A parent still missing at COMMIT now raises 23503 at COMMIT — the enforcement
+	// the dropped gate previously suppressed on the simple-query path.
+	if err := ex("BEGIN"); err != nil {
+		t.Fatalf("begin unsatisfied: %v", err)
+	}
+	if err := ex("INSERT INTO dchild VALUES (2, 777)"); err != nil {
+		t.Fatalf("deferred insert should not fail at INSERT: %v", err)
+	}
+	if err := ex("COMMIT"); !isFKErr(err) {
+		t.Fatalf("unsatisfied INITIALLY DEFERRED: expected FK violation at COMMIT, got %v", err)
+	}
+	_ = ex("ROLLBACK")
+
+	// The failed COMMIT rolled the transaction back: the orphan child must be gone.
+	rows = runSQL(t, c, "SELECT id FROM dchild WHERE id = 2")
+	if len(rows) != 0 {
+		t.Fatalf("orphan child should have rolled back, got %v", rows)
+	}
+}

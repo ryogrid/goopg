@@ -419,6 +419,20 @@ func runAllDeferredFKChecks(ctx *Context, checks []DeferredFKCheck) error {
 	if !ok {
 		return nil
 	}
+	// PG runs deferred RI checks at COMMIT under a freshly pushed "latest"
+	// snapshot, not the firing statement's (possibly long-pinned) snapshot.
+	// Install one for the duration of these scans so the parent-existence probe
+	// (and the child-row scan in fullTableFKCheck) sees rows committed by
+	// concurrent transactions after this transaction's snapshot was taken — the
+	// fk-snapshot spec's s2 (REPEATABLE READ) must see s1's just-committed
+	// fk_parted_pk(2) at COMMIT. Own uncommitted writes stay visible because
+	// TupleVisibleSubxact classifies ctx.Tx.XID as self regardless of snapshot.
+	// 0119-0004 (deferred-ri-fresh-snapshot).
+	if ctx.TxnMgr != nil {
+		savedSnap := ctx.Snap
+		ctx.Snap = ctx.TxnMgr.FreshSnapshot()
+		defer func() { ctx.Snap = savedSnap }()
+	}
 	for _, check := range checks {
 		childTbl, ok := im.LookupTable(parser.ObjectName{Name: check.ChildTableName})
 		if !ok {
