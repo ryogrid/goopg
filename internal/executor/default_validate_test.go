@@ -164,11 +164,12 @@ func TestDefaultExprToSQLBinaryParen(t *testing.T) {
 			"(((qty + id) * mgr_id) > 0)",
 		},
 		{
-			// Unary minus is tagged OpUnaryNeg (NOT OpSub); a bare numeric operand
-			// renders `-N` (PG folds it to `'-N'::type`, deferred). DU-002 slice 302.
+			// Unary minus is tagged OpUnaryNeg (NOT OpSub); a bare numeric literal
+			// renders PG's folded `'-N'::type` cast form (get_const_expr). DU-002
+			// slice 364 (was the re-parseable `-1` before, slice 302).
 			"unary minus literal",
 			&parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: &parser.IntegerConst{Value: 1}},
-			"-1",
+			"'-1'::integer",
 		},
 		{
 			// Unary minus on a COMPOUND operand deparses `(- (operand))`,

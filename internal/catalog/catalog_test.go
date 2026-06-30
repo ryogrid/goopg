@@ -1266,13 +1266,14 @@ func TestFormatExprForAttrdefExpr(t *testing.T) {
 		},
 		{
 			// The parser tags unary minus with OpUnaryNeg (NOT OpSub — that is
-			// binary subtraction). A bare numeric operand renders `-N` (PG folds it
-			// to a `'-N'::type` Const, which is type-dependent and deferred). DU-002
-			// slice 302 fixed the opcode (was matching OpSub, so it fell through to a
+			// binary subtraction). A bare numeric literal renders PG's folded
+			// `'-N'::type` cast form (get_const_expr quotes any leading-'-' const +
+			// attaches a cast). DU-002 slice 364 (was the re-parseable `-1` per slice
+			// 302, which fixed the opcode — it had matched OpSub and fell through to a
 			// Go pointer string).
 			"unary minus literal",
 			&parser.UnaryOp{Op: parser.OpUnaryNeg, Operand: &parser.IntegerConst{Value: 1}},
-			"-1",
+			"'-1'::integer",
 		},
 		{
 			// Unary minus on a COMPOUND operand (an OpExpr PG does not fold):

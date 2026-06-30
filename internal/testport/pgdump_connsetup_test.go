@@ -4332,6 +4332,30 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE DOMAIN public.dchkfn AS text CHECK (length(VALUE) > 0)"); err != nil {
 		t.Fatalf("create domain dchkfn: %v", err)
 	}
+	// DU-002 slice 364: a unary minus applied DIRECTLY to a numeric literal — in a
+	// CHECK predicate, a column DEFAULT, an expression-index key, and a domain
+	// CHECK. PG's parser folds `-N` into a negative typed Const (gram.y doNegate)
+	// that ruleutils.c get_const_expr deparses as the quoted-value-plus-cast
+	// `'-N'::type` so it re-parses as ONE constant (not a constant-plus-operator):
+	// an integer literal whose negation fits int4 → `::integer`, a wider one →
+	// `::bigint`, a decimal → `::numeric`. The cast type is the LITERAL's own type,
+	// NOT the column type — a bigint column's `<> -100` still dumps `'-100'::integer`,
+	// and a bigint `DEFAULT -9000000000` dumps `'-9000000000'::bigint`. goopg
+	// previously emitted the re-parseable bare `-N` (slice 302 — semantically equal
+	// but byte-diverging), the deferred gap behind slices 302/360(a)/362(b)/363.
+	// parser.NegatedLiteralSQL now reproduces PG's exact form in BOTH deparse twins
+	// (catalog.formatExprForAttrdef + executor.defaultExprToSQL). Verified
+	// byte-identical against a throwaway real PG 18.3 cluster. negdef above keeps the
+	// COMPOUND `(- (1 + 2))` cases (PG does not fold those).
+	if err := runSQLSimple(t, c, "CREATE DOMAIN public.dchkneg AS integer CHECK (VALUE < -5)"); err != nil {
+		t.Fatalf("create domain dchkneg: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE TABLE public.neglit (a integer CHECK (a < -5), b numeric CHECK (b > -3.5), c bigint CHECK (c <> -100), d integer DEFAULT -7, e bigint DEFAULT -9000000000)"); err != nil {
+		t.Fatalf("create table neglit with negative-literal check/default: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE INDEX neglit_ix ON public.neglit ((a + -7))"); err != nil {
+		t.Fatalf("create index neglit_ix on negative-literal expression: %v", err)
+	}
 	// DU-002 slice 97: a `CHECK (VALUE IN (...))` over a text domain. goopg captures
 	// the membership list in CheckInValues (runtime validation) but previously emitted
 	// no pg_constraint row, so the check vanished from pg_dump. The executor now
@@ -9690,6 +9714,19 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			"CREATE DOMAIN public.dchkfn AS text",
 			"CONSTRAINT dchkfn_check CHECK ((length(VALUE) > 0))",
 			"dcf public.dchkfn",
+			// Slice 364: a unary minus on a numeric literal folds to PG's
+			// quoted-value-plus-cast `'-N'::type` Const form in CHECK predicates,
+			// column DEFAULTs, expression-index keys, and domain CHECKs. The cast type
+			// is the LITERAL's own type (a bigint column's `<> -100` → `'-100'::integer`;
+			// `DEFAULT -9000000000` → `'-9000000000'::bigint`). Byte-identical to real PG.
+			"CREATE DOMAIN public.dchkneg AS integer",
+			"CONSTRAINT dchkneg_check CHECK ((VALUE < '-5'::integer))",
+			"CONSTRAINT neglit_a_check CHECK ((a < '-5'::integer))",
+			"CONSTRAINT neglit_b_check CHECK ((b > '-3.5'::numeric))",
+			"CONSTRAINT neglit_c_check CHECK ((c <> '-100'::integer))",
+			"d integer DEFAULT '-7'::integer",
+			"e bigint DEFAULT '-9000000000'::bigint",
+			"CREATE INDEX neglit_ix ON public.neglit USING btree (((a + '-7'::integer)))",
 			// Slice 97: a `CHECK (VALUE IN (...))` over a text domain deparses to a
 			// ScalarArrayOpExpr — byte-identical to real pg_dump 18.3.
 			"CREATE DOMAIN public.colr AS text",

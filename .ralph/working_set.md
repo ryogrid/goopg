@@ -1,38 +1,39 @@
 (idle — nothing in flight)
 
-Loop #94 COMPLETE: M0119-0004 DU-002 slice 363 — compound/function-call GENERIC
-domain CHECK now dumps with PG's per-node parenthesization (resolves slice-362
-deferred-(a)). `CHECK (VALUE > 0 AND VALUE < 100)` → `CHECK (((VALUE > 0) AND
-(VALUE < 100)))`; `CHECK (length(VALUE) > 0)` → `CHECK ((length(VALUE) > 0))`,
-instead of the legacy token-text wrap `CHECK ((<raw>))`. New
-renderDomainCheckPredicate (domain twin of renderCheckPredicate) re-parses the
-stored raw text + deparses via the fully-parenthesizing defaultExprToSQL, same
-re-parse round-trip fallback guard. upcaseDomainValuePlaceholder walks the
-re-parsed tree and rewrites every bare `value` ColumnRef back to uppercase
-`VALUE` (lexer case-folds on re-parse; PG deparses CoerceToDomainValue uppercase).
-Dump site routes ONLY generic CHECKs through it; `VALUE IN (...)` form
-(len(d.CheckInValues)>0) keeps the legacy raw wrap (pre-synthesized byte-exact
-ScalarArrayOp deparse). Single-comparison slice-96 domains byte-unchanged.
-Byte-verified vs throwaway PG 18.3 (/tmp/du363_ref).
+Loop #95 COMPLETE: M0119-0004 DU-002 slice 364 — a unary minus applied DIRECTLY
+to a numeric literal now dumps as PG's folded `'-N'::type` Const form everywhere
+the two pg_dump deparse twins feed (CHECK table+domain, DEFAULT, expr-index key,
+partition-key, func-arg default). RESOLVES the long-recurring negative-literal
+deferral behind slices 302/360(a)/362(b)/363.
 
-Files: internal/executor/operators_ddl.go (renderDomainCheckPredicate +
-upcaseDomainValuePlaceholder, after renderCheckPredicate), internal/executor/
-expr.go (AllDomains dump branch routes generic vs VALUE-IN), internal/executor/
-check_predicate_render_test.go (TestRenderDomainCheckPredicate), internal/
-testport/pgdump_connsetup_test.go (slice 363 dchkand/dchkfn DDL + dom-table cols
-+ assertions), docs/design/0110-0001-pg-dump-tap-port.md (slice 363 entry),
-.ralph/deferral_ledger.md, .ralph/fix_plan.md.
+Key insight that unblocked it: the cast type is the LITERAL's own (negated)
+magnitude type (get_const_expr/make_const), NOT the column type — so NO
+operand-type threading was needed (the prior deferral's assumed blocker). bigint
+col `<> -100` → `'-100'::integer`; `DEFAULT -9000000000` → `'-9000000000'::bigint`;
+`DEFAULT -2147483648` (INT_MIN) → `'-2147483648'::integer` (boundary mag<=1<<31).
 
-Deferred (ledgered): negative literal in a domain CHECK (`VALUE < -5` → PG
-`'-5'::integer`) still byte-diverges — type-blind defaultExprToSQL emits bare
-`-5`; re-parse guard keeps it on the legacy fallback (no garbage). Same gap as
-slice-360(a)/362(b); needs operand-type threading into defaultExprToSQL.
+New shared helper `parser.NegatedLiteralSQL` (internal/parser/expr.go) renders
+`'-N'::{integer,bigint,numeric}` for a bare IntegerConst/NumericConst, "" else.
+Both twins (executor.defaultExprToSQL, catalog.formatExprForAttrdef) call it in
+their OpUnaryNeg arm; compound `(- (operand))` fallback unchanged (negdef.nb/nc).
 
-Gates run: TestRenderDomainCheckPredicate + TestRenderCheckPredicate{,Fallback}
-PASS; TestPort_PgDumpConnectionSetup PASS (5.6s); executor+parser+catalog unit
-PASS; go vet clean; pgbench smoke = pre-commit hook.
+Files: internal/parser/expr.go (+NegatedLiteralSQL +strconv import),
+internal/executor/operators_ddl.go (UnaryOp arm), internal/catalog/catalog.go
+(UnaryOp arm), internal/executor/default_validate_test.go +
+internal/catalog/catalog_test.go (unit `-1`→`'-1'::integer`),
+internal/testport/pgdump_connsetup_test.go (slice-364 dchkneg/neglit/neglit_ix
+fixture + assertions), docs/design/0110-0001-pg-dump-tap-port.md (Slice 364),
+.ralph/deferral_ledger.md (slice-363 row→resolved + slice-364 resolved row).
 
-Next loop: pick a fresh M0119-0004 pg_dump slice. Candidates: the typed-literal
-cast inside a CHECK/expression-index key (deferred 360(a)/362(b)/363 — needs
-operand-type threading); action-command CREATE RULE (milestone-sized reverse-
-compiler); reserved-keyword-named-role quoting; or another catalog-view gap.
+Gates run: parser+catalog+executor unit suites PASS; TestPort_PgDumpConnectionSetup
+PASS (5.9s, byte-identical vs real PG 18.3); go vet clean; pgbench smoke=pre-commit.
+
+Remaining negative-literal-adjacent gap STILL open: typed STRING-literal cast in
+an operator arg (`name || '_x'` → PG `'_x'::text`) — slices 360(a)/362(b) sub-(b);
+needs operator-arg type (a string literal does not self-describe its type the way
+a numeric does).
+
+Next loop: pick a fresh M0119-0004 pg_dump slice. Candidates: the typed
+string-literal cast in an operator arg (the now-isolated remaining gap);
+action-command CREATE RULE (milestone-sized reverse-compiler); reserved-keyword
+role quoting; or another catalog-view getter gap.

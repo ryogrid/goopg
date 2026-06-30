@@ -1,5 +1,7 @@
 package parser
 
+import "strconv"
+
 // Expr is implemented by every expression-tree node.
 type Expr interface {
 	Node
@@ -61,6 +63,40 @@ type NumericConst struct {
 
 func (e *NumericConst) Pos() int { return e.pos }
 func (*NumericConst) exprNode()  {}
+
+// NegatedLiteralSQL renders a unary minus applied DIRECTLY to a numeric literal
+// (`-5`, `-3.5`) the way PostgreSQL folds and deparses it, shared by the pg_dump
+// deparse twins (catalog.formatExprForAttrdef and executor.defaultExprToSQL).
+//
+// gram.y's doNegate folds the minus into the literal, producing a negative typed
+// Const; ruleutils.c get_const_expr then prints any constant whose text leads
+// with '-' as the quoted value plus an explicit `::type` cast, so the dump
+// re-parses as a single constant rather than a constant-plus-operator. The cast
+// type follows the LITERAL's own type — resolved from the (negated) magnitude the
+// way PG's make_const does, NOT from any surrounding column type: an integer
+// literal whose negation still fits int4 casts to `integer`, a wider one to
+// `bigint`, and a decimal/scientific literal to `numeric`. Empirically vs pg_dump
+// 18.3: `a < -5` → `(a < '-5'::integer)`, `c <> -100` on a bigint column →
+// `'-100'::integer` (literal type, not column type), `DEFAULT -2147483648` →
+// `'-2147483648'::integer` but `-2147483649` → `'-2147483649'::bigint`.
+//
+// Returns "" when operand is not a bare numeric literal; callers fall back to the
+// compound `(- (operand))` form get_rule_expr uses for a non-folded negation.
+func NegatedLiteralSQL(operand Expr) string {
+	switch lit := operand.(type) {
+	case *IntegerConst:
+		// PG types the NEGATED value: it fits int4 iff -Value >= math.MinInt32,
+		// i.e. Value <= 1<<31 (2147483648 = -INT_MIN); otherwise int8. Value holds
+		// the positive magnitude (the parser tags `-N` as UnaryOp over IntegerConst).
+		if lit.Value > 1<<31 {
+			return "'-" + strconv.FormatInt(lit.Value, 10) + "'::bigint"
+		}
+		return "'-" + strconv.FormatInt(lit.Value, 10) + "'::integer"
+	case *NumericConst:
+		return "'-" + lit.Value + "'::numeric"
+	}
+	return ""
+}
 
 // TypedStringLit represents the SQL-standard typed-string-literal
 // syntax — `<type> 'value'`. The two we care about for TPC-H:

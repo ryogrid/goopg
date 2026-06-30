@@ -8875,11 +8875,35 @@ column), so `upcaseDomainValuePlaceholder` walks the freshly-parsed tree and rew
 deparse (`domainInValuesCheckExpr`) that `defaultExprToSQL` cannot reproduce. Fixtures `dchkand`/`dchkfn` in
 `TestPort_PgDumpConnectionSetup` (slice 363) + unit `TestRenderDomainCheckPredicate` (executor pkg).
 
-> **Deferred (ledgered):** the **negative-literal cast** inside a domain CHECK (`VALUE < -5` dumps `'-5'::integer`, not the
-> bare `-5` goopg's type-blind `defaultExprToSQL` emits) is the same gap as the slice-360(a)/slice-362 typed-literal-cast
-> limitation — PG's parser folds a unary minus on a literal into a negative typed `Const` that `get_const_expr` quotes-and-
-> casts. The re-parse guard keeps such a form on the legacy fallback (so no garbage), but it still byte-diverges; closing it
-> needs operand-type threading into `defaultExprToSQL`.
+> **Deferred (ledgered) — RESOLVED in slice 364:** the **negative-literal cast** inside a domain CHECK (`VALUE < -5` dumps
+> `'-5'::integer`, not the bare `-5`) was the same gap as the slice-360(a)/slice-362 typed-literal-cast limitation. Slice 364
+> closes it without the operand-type threading once thought necessary — see below.
+
+### Slice 364 — **negative numeric literal** `-5` → `'-5'::integer` (PRODUCTION fix — both twins)
+
+PG's parser folds a unary minus applied **directly** to a numeric literal into a negative typed `Const` (gram.y `doNegate`);
+`ruleutils.c get_const_expr` then prints any constant whose output text leads with `-` as the **quoted value plus an explicit
+`::type` cast** — `'-5'::integer` — so the dump re-parses as a single constant rather than a constant-plus-operator
+(`get_const_expr` notes `(-nnn)` would be ambiguous for `INT_MIN`). The earlier deferral assumed matching this needed the
+*column/argument* type threaded into the deparser. The empirical finding that unblocked the slice: **the cast type is the
+literal's own type, not the column type.** A `bigint` column's `CHECK (c <> -100)` still dumps `'-100'::integer`, and the type
+is resolved purely from the (negated) literal magnitude exactly as PG's `make_const` does:
+
+- a literal whose negation fits `int4` → `'-N'::integer` (note `DEFAULT -2147483648` = `INT_MIN` → `::integer`, but
+  `-2147483649` → `::bigint`, so the boundary is `magnitude <= 1<<31`);
+- a wider integer literal → `'-N'::bigint`;
+- a decimal/scientific literal → `'-N'::numeric`.
+
+The fix is `parser.NegatedLiteralSQL(operand)` (one shared helper in `internal/parser/expr.go`, since both deparse twins
+import `parser` and the const node types live there — avoids the prior copy-paste drift). It returns the folded `'-N'::type`
+string for a bare `IntegerConst`/`NumericConst` operand and `""` otherwise; both twins (`executor.defaultExprToSQL`,
+`catalog.formatExprForAttrdef`) call it in their `OpUnaryNeg` arm and fall back to the compound `(- (operand))` form
+get_rule_expr uses for a non-folded negation (the slice-302 `negdef.nb`/`nc` cases stay byte-unchanged). This single helper
+fixes the `'-N'::type` form everywhere the two renderers feed: CHECK predicates (table + domain), column DEFAULTs,
+expression-index keys, partition-key expressions, and function-argument defaults. Verified byte-identical against a throwaway
+PG 18.3 cluster across all of those contexts. Fixtures `dchkneg`/`neglit`/`neglit_ix` in `TestPort_PgDumpConnectionSetup`
+(slice 364) + unit `TestDefaultExprToSQLBinaryParen` (executor) / `TestFormatExprForAttrdefExpr` (catalog), both updated from
+the old bare `-1` to `'-1'::integer`.
 
 ## Deferred (002–010) — catalog surface estimate
 

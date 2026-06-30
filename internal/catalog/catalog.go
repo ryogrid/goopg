@@ -10825,19 +10825,19 @@ func formatExprForAttrdef(e parser.Expr) string {
 		// a `DEFAULT -…` fell through to fmt.Sprintf("%v") and corrupted the dump
 		// with a Go pointer string (DU-002 slice 302). PG's parser folds a unary
 		// minus applied DIRECTLY to a numeric literal into a negative typed Const
-		// (gram.y doNegate), deparsed by pg_get_expr as `'-N'::type`; goopg is
-		// type-blind here so it emits the re-parseable `-N` for that case (matching
-		// the `'-N'::type` cast needs the column type — deferred). For a unary minus
-		// on a COMPOUND operand (an OpExpr PG does NOT fold), get_rule_expr deparses
-		// `(- (operand))`. Mirror the executor twin executor.defaultExprToSQL.
+		// (gram.y doNegate), deparsed by get_const_expr as the quoted-value-plus-cast
+		// `'-N'::type` so it re-parses as one constant. parser.NegatedLiteralSQL
+		// reproduces that exact form (and PG's literal-type resolution); it returns
+		// "" for a non-literal operand. For a unary minus on a COMPOUND operand (an
+		// OpExpr PG does NOT fold), get_rule_expr deparses `(- (operand))`. Mirror the
+		// executor twin executor.defaultExprToSQL. DU-002 slice 364 (resolves the
+		// slice 302/360(a)/362(b)/363 deferred `'-N'::type` gap).
 		switch v.Op {
 		case parser.OpUnaryNeg:
-			switch v.Operand.(type) {
-			case *parser.IntegerConst, *parser.NumericConst:
-				return "-" + formatExprForAttrdef(v.Operand)
-			default:
-				return "(- " + formatExprForAttrdef(v.Operand) + ")"
+			if neg := parser.NegatedLiteralSQL(v.Operand); neg != "" {
+				return neg
 			}
+			return "(- " + formatExprForAttrdef(v.Operand) + ")"
 		case parser.OpNot:
 			return "NOT " + formatExprForAttrdef(v.Operand)
 		}
