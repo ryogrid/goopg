@@ -2927,6 +2927,28 @@ documentation-only and is exempt from the design-doc requirement.)
       18.3). Blast radius nil for alphabetical sequences (byte-unchanged). Gates: catalog +
       executor + initdb suites PASS; connsetup slice 354 PASS; build clean; pgbench smoke =
       pre-commit.
+      **2026-06-30 (loop #80, design 0119-0004-regrant-after-revoke-order-relacl-pgdump,
+      DU-002 slice 355):** REVOKE-then-re-GRANT grant-order — end-to-end coverage for the
+      grant-order teardown + re-append path landed by slice 354. PostgreSQL's `aclupdate`
+      (acl.c) does NOT preserve a revoked grantee's slot: a full REVOKE deletes its aclitem
+      and a later GRANT to the same grantee APPENDS a fresh aclitem at the END, so the
+      re-granted grantee renders AFTER continuously-held grantees even though granted first
+      and sorting first. `GRANT SELECT TO rg_a; GRANT SELECT TO rg_b; REVOKE SELECT FROM
+      rg_a; GRANT INSERT TO rg_a` → relacl `{postgres=arwdDxtm/postgres,rg_b=r/postgres,
+      rg_a=a/postgres}` (b before a — verified vs real PG 18.3 in `./postgres/local_install`),
+      pg_dump emits the rg_b SELECT line before the rg_a INSERT line. Slice 354 covered only
+      fresh reverse-order grants; this exercises `catalog.dropTableACLOrderRole` (full-revoke
+      teardown) then a re-append. Test-only — NO engine change: `RevokeTablePrivilege`
+      already drops the grantee from `tableACLOrder` on full revoke and
+      `GrantTablePrivilegeWithGrantOption` re-appends it (fresh per-role map). Adds
+      `internal/catalog/relacl_test.go` → `TestRelaclTextRegrantAfterRevokeMovesToEnd` (unit)
+      + DU-002 slice 355 fixture (`regrant_t`/`rg_role_a`/`rg_role_b`) + `strings.Index`
+      b-before-a ordering assert in `TestPort_PgDumpConnectionSetup`, byte-identical vs real
+      pg_dump 18.3. Zero blast radius. Gates: `go test ./internal/catalog/ -run TestRelacl`
+      PASS; connsetup slice 355 PASS; build clean; pgbench smoke = pre-commit. Still open
+      under M0119-0004: column-level (`attacl`, heap re-sync) / database (`datacl`,
+      `--create`-only) / TYPE-DOMAIN (`typacl`, unmodelled) GRANT projection;
+      extended-protocol commit-time deferral.
 - [ ] **M0119-0005 — pg_waldump server tier** (source: M0110-0002; see M0110
       section). `002_save_fullpage` + per-rmgr/relation/block filtering; needs
       PG-decodable FPI/heap WAL (+ index AMs for the server tier).

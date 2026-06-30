@@ -3681,6 +3681,42 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 		t.Fatalf("grant select on ordergrant_t to og_role_a: %v", err)
 	}
 
+	// Slice 355: REVOKE-then-re-GRANT moves a grantee to the END of the relacl
+	// array. PostgreSQL's aclupdate (src/backend/utils/adt/acl.c) DELETES a
+	// fully-revoked grantee's aclitem; a later GRANT to that same grantee APPENDS
+	// a fresh aclitem at the end of the array — it does NOT restore the grantee's
+	// original slot. So granting SELECT to rg_role_a, then rg_role_b, then
+	// REVOKEing rg_role_a's only privilege (SELECT), then re-GRANTing INSERT to
+	// rg_role_a, materializes relacl as
+	// "{postgres=arwdDxtm/postgres,rg_role_b=r/postgres,rg_role_a=a/postgres}"
+	// (b before a, even though a was granted first AND sorts first — verified
+	// against PG 18.3 in ./postgres/local_install). This exercises the grant-order
+	// teardown + re-append path landed in slice 354 (catalog.dropTableACLOrderRole
+	// removes a on the full revoke, then the next GRANT re-appends it at the end);
+	// the pre-fix sort.Strings rendering — and any naive teardown that preserved
+	// a's original position — would both emit a before b, diverging from pg_dump.
+	if err := runSQLSimple(t, c, "CREATE TABLE public.regrant_t(id int)"); err != nil {
+		t.Fatalf("create table regrant_t: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE rg_role_a"); err != nil {
+		t.Fatalf("create role rg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "CREATE ROLE rg_role_b"); err != nil {
+		t.Fatalf("create role rg_role_b: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.regrant_t TO rg_role_a"); err != nil {
+		t.Fatalf("grant select on regrant_t to rg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT SELECT ON TABLE public.regrant_t TO rg_role_b"); err != nil {
+		t.Fatalf("grant select on regrant_t to rg_role_b: %v", err)
+	}
+	if err := runSQLSimple(t, c, "REVOKE SELECT ON TABLE public.regrant_t FROM rg_role_a"); err != nil {
+		t.Fatalf("revoke select on regrant_t from rg_role_a: %v", err)
+	}
+	if err := runSQLSimple(t, c, "GRANT INSERT ON TABLE public.regrant_t TO rg_role_a"); err != nil {
+		t.Fatalf("grant insert on regrant_t to rg_role_a: %v", err)
+	}
+
 	// Slice 324: an unconditional DO-NOTHING CREATE RULE must round-trip through
 	// pg_dump. pg_dump's getRules reads pg_rewrite (rulename, ev_class, ev_type,
 	// is_instead, ev_enabled) and dumpRule re-emits the rule from
@@ -7800,6 +7836,24 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			t.Errorf("pg_dump dropped a grant-order GRANT line: og_role_z present=%v og_role_a present=%v\n  full stdout=%q", ogZi >= 0, ogAi >= 0, res.Stdout)
 		} else if ogZi > ogAi {
 			t.Errorf("pg_dump emitted grantees out of grant order: og_role_z (granted first) must precede og_role_a, got z@%d a@%d\n  full stdout=%q", ogZi, ogAi, res.Stdout)
+		}
+		// **Slice 355 (asserted):** REVOKE-then-re-GRANT moves a grantee to the END
+		// of the relacl array. rg_role_a was granted SELECT first, then rg_role_b,
+		// then rg_role_a's SELECT was REVOKEd (deleting its aclitem) and INSERT
+		// re-GRANTed (appending a fresh aclitem at the end). So relacl is
+		// "{postgres=arwdDxtm/postgres,rg_role_b=r/postgres,rg_role_a=a/postgres}"
+		// and pg_dump fans the array out in order → the rg_role_b SELECT line
+		// precedes the rg_role_a INSERT line (b before a, the reverse of both
+		// alphabetical and original grant order). Both lines must be present AND in
+		// b-before-a order.
+		rgB := "GRANT SELECT ON TABLE public.regrant_t TO rg_role_b;"
+		rgA := "GRANT INSERT ON TABLE public.regrant_t TO rg_role_a;"
+		rgBi := strings.Index(res.Stdout, rgB)
+		rgAi := strings.Index(res.Stdout, rgA)
+		if rgBi < 0 || rgAi < 0 {
+			t.Errorf("pg_dump dropped a re-grant-order GRANT line: rg_role_b present=%v rg_role_a present=%v\n  full stdout=%q", rgBi >= 0, rgAi >= 0, res.Stdout)
+		} else if rgBi > rgAi {
+			t.Errorf("pg_dump emitted re-granted grantee out of order: rg_role_b (still-held SELECT) must precede rg_role_a (revoked+re-granted INSERT), got b@%d a@%d\n  full stdout=%q", rgBi, rgAi, res.Stdout)
 		}
 		// **Slice 324 (asserted):** an unconditional DO-NOTHING CREATE RULE must
 		// round-trip. pg_dump's getRules reads pg_rewrite and dumpRule prints

@@ -68,6 +68,45 @@ func TestRelaclText(t *testing.T) {
 	}
 }
 
+// TestRelaclTextRegrantAfterRevokeMovesToEnd pins the grant-order semantics of a
+// REVOKE that fully drops a grantee followed by a re-GRANT to that same grantee:
+// PostgreSQL's aclupdate (src/backend/utils/adt/acl.c) DELETES the revoked
+// grantee's aclitem, then a later GRANT APPENDS a fresh aclitem at the END of the
+// array — it does not restore the grantee's original slot. So the re-granted
+// grantee renders AFTER grantees that have held their privilege continuously,
+// even if it was granted first and sorts first. Verified against real PG 18.3:
+// GRANT SELECT TO a; GRANT SELECT TO b; REVOKE SELECT FROM a; GRANT INSERT TO a →
+// {postgres=arwdDxtm/postgres,b=r/postgres,a=a/postgres}. This guards the
+// dropTableACLOrderRole teardown + re-append path (DU-002 slice 354/355).
+func TestRelaclTextRegrantAfterRevokeMovesToEnd(t *testing.T) {
+	c := NewInMemory()
+	const relOID = 16600
+
+	c.GrantTablePrivilege(relOID, "rg_a", "SELECT")
+	c.GrantTablePrivilege(relOID, "rg_b", "SELECT")
+	// Both held continuously → grant order a, b.
+	want := "{postgres=arwdDxtm/postgres,rg_a=r/postgres,rg_b=r/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl before revoke = %q; want %q", got, want)
+	}
+
+	// Fully revoke rg_a's only privilege: its aclitem is deleted (dropped from the
+	// grant-order list), leaving rg_b alone.
+	c.RevokeTablePrivilege(relOID, "rg_a", "SELECT")
+	want = "{postgres=arwdDxtm/postgres,rg_b=r/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after revoke of rg_a = %q; want %q", got, want)
+	}
+
+	// Re-GRANT a different privilege to rg_a: a fresh aclitem is appended at the
+	// END, so rg_a now follows rg_b even though it was originally granted first.
+	c.GrantTablePrivilege(relOID, "rg_a", "INSERT")
+	want = "{postgres=arwdDxtm/postgres,rg_b=r/postgres,rg_a=a/postgres}"
+	if got := relaclText(c, relOID); got != want {
+		t.Fatalf("relacl after re-grant of rg_a = %q; want %q", got, want)
+	}
+}
+
 // TestRelaclTextGrantOption pins the grant-option (`*`) projection that lets a
 // GRANT … WITH GRANT OPTION round-trip through pg_dump (DU-002 slice 332).
 // aclitemout renders a grant-option privilege as "<letter>*" (e.g. "r*" for
