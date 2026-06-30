@@ -1,24 +1,28 @@
 (idle — nothing in flight)
 
-Loop #91 COMPLETE: M0119-0004 DU-002 slice 360 — a BARE FUNCTION-CALL
-expression-index key (`lower(name)`, `lpad(name, 5)`) now dumps WITHOUT the
-extra wrapping parens that the arithmetic key (slice 299) carries. PG's
-pg_get_indexdef_worker prints a COERCE_EXPLICIT_CALL FuncExpr key as-is and
-wraps every other expression in `(%s)`. Fix = catalog.indexKeyIsBareFuncCall
-(keyed on the parsed Index.ColExprs AST) gating the wrap in catalog.BuildIndexDef.
-Byte-identical vs real pg_dump 18.3. Committed.
+Loop #92 COMPLETE: M0119-0004 DU-002 slice 361 — a `CREATE INDEX … USING hash`
+index now dumps `USING hash (col)` instead of the B-tree substrate's
+`USING btree`. goopg has no native hash AM: a hash index routes through
+createBTreeIndex (catalog.Index.Method stays "btree"; only DeclaredHash records
+the declared method, design 0118-0099). Fix = catalog.BuildIndexDef renders
+"hash" when idx.DeclaredHash, mirroring pg_get_indexdef_worker's `USING %s`
+(pg_am.amname). Byte-verified vs a throwaway PG 18.3 cluster. Committed.
 
-Files: internal/catalog/catalog.go (helper + BuildIndexDef gate),
-internal/testport/pgdump_connsetup_test.go (slice 360 DDL + asserts),
-docs/design/0110-0001-pg-dump-tap-port.md (slice 360 entry), deferral ledger.
+Files: internal/catalog/catalog.go (BuildIndexDef DeclaredHash gate),
+internal/catalog/index_def_hash_test.go (new unit test),
+internal/testport/pgdump_connsetup_test.go (slice 361 DDL + indexDefs assert),
+docs/design/0110-0001-pg-dump-tap-port.md (slice 361 entry), deferral ledger.
 
-Deferred (ledgered): (a) typed string-literal cast inside a function-arg key —
-PG dumps `upper((name || '_x'::text))` but goopg's type-blind defaultExprToSQL
-renders `'_x'` with no cast/inner-parens (same gap as slice 302's `'-N'::type`);
-(b) restart persistence — ColExprs in-memory only + pg_index.indexprs dumps NULL.
+Deferred (ledgered): restart persistence — DeclaredHash is in-memory only, so a
+re-loaded hash index after a server restart would dump `USING btree` again
+(pg_am/pg_index access-method not durably persisted; same shared-catalog
+runtime-write gap as the other restart-durability slices).
+
+Gates run: catalog unit PASS; TestPort_PgDumpConnectionSetup PASS (4.9s);
+go build ./... clean; pgbench smoke = pre-commit hook.
 
 Next loop: pick a fresh M0119-0004 pg_dump slice. Candidate next surfaces:
-the deferred (a) typed-literal-in-funcarg cast (needs operand-type threading);
-USING hash index dump (goopg stores hash as btree — known gotcha); or another
-catalog-view gap. Heavier M0119 items: M0119-0002 (CLOG swap), M0119-0005/0006
-server tiers, M0119-0007 (logical decoding — not actionable).
+the deferred slice-360 (a) typed string-literal cast inside a function-arg key
+(needs operand-type threading); action-command / DO ALSO CREATE RULE forms
+(full query reverse-compiler — milestone-sized); reserved-keyword-named-role
+quoting; or another catalog-view gap.

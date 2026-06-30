@@ -9500,6 +9500,17 @@ func BuildIndexDef(idx *Index) string {
 	if method == "" {
 		method = "btree"
 	}
+	// goopg has no native hash access method: a `CREATE INDEX … USING hash`
+	// is built on the B-tree substrate, so catalog.Index.Method stays "btree"
+	// (it routes through createBTreeIndex) while DeclaredHash remembers the
+	// declared method (design 0118-0099). pg_get_indexdef_worker (ruleutils.c)
+	// prints `USING %s` from pg_am.amname, so real pg_dump 18.3 emits
+	// `USING hash (col)`; surface the declared method here so the dump
+	// round-trips byte-identically instead of the substrate's `USING btree`.
+	// DU-002 slice 361.
+	if idx.DeclaredHash {
+		method = "hash"
+	}
 	sb.WriteString(" USING ")
 	sb.WriteString(method)
 	sb.WriteString(" (")

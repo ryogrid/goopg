@@ -8792,6 +8792,29 @@ real pg_dump 18.3 (`/tmp/du_ref_pg`); fixtures `foo_lower_idx` + `foo_lpad_idx` 
 > `pg_index.indexprs` is dumped NULL, so a function-call index would not round-trip after a server restart (the
 > renderer falls back to the wrap when the AST is absent). Both unchanged by this slice.
 
+### Slice 361 — **`USING hash` index** `CREATE INDEX … USING hash (qty)` → `USING hash (qty)` (PRODUCTION fix)
+
+goopg has no native hash access method: a `CREATE INDEX … USING hash` is routed through `createBTreeIndex` and built on
+the B-tree substrate (`internal/executor/operators_ddl.go`, `declaredHash := method == "hash"; method = "btree"`). The
+catalog row keeps `Method = "btree"` (so `pg_am`/`pg_index` and the SSI bucket-grain predicate-lock path stay coherent),
+and only `catalog.Index.DeclaredHash` remembers the declared method (design `0118-0099`).
+
+PG's `pg_get_indexdef_worker` (`ruleutils.c`) prints `USING %s` from `pg_am.amname`, so a hash index's `amname='hash'`
+makes real pg_dump 18.3 emit `CREATE INDEX foo_qty_hash_idx ON public.foo USING hash (qty);` (verified byte-identical
+against a throwaway PG 18.3 cluster). Before this slice goopg's `catalog.BuildIndexDef` rendered the stored `btree`,
+emitting the divergent `USING btree (qty)` — a silent loss of the index's access method on restore (the restored index
+would be a real B-tree, not a hash index).
+
+The fix surfaces `DeclaredHash` in `BuildIndexDef`: when set, the `USING` method is rendered as `hash` regardless of the
+substrate's stored `btree`. Byte-verified against real pg_dump 18.3; fixture `foo_qty_hash_idx` in
+`TestPort_PgDumpConnectionSetup` (slice 361) + unit `TestBuildIndexDefDeclaredHash` (catalog pkg, pins the hash render
+plus a contrast plain-btree case).
+
+> **Deferred (ledgered):** **restart persistence** — `DeclaredHash` is in-memory only (set on the live
+> `catalog.Index` after the build), so after a server restart a re-loaded hash index would dump `USING btree` again. The
+> connsetup harness dumps in the same session as the CREATE, so this slice round-trips; durable `pg_am`/`pg_index`
+> access-method persistence is the same shared-catalog runtime-write gap that blocks the other restart-durability slices.
+
 ## Deferred (002–010) — catalog surface estimate
 
 The remaining five tests all block on the same gap: a faithful schema dump

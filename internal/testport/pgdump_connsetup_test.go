@@ -2501,6 +2501,18 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_lpad_idx ON public.foo (lpad(name, 5))"); err != nil {
 		t.Fatalf("create lpad() expression index: %v", err)
 	}
+	// Slice 361: a `CREATE INDEX … USING hash` index must dump `USING hash`, not
+	// the B-tree substrate's `USING btree`. goopg has no native hash access
+	// method, so a hash index routes through createBTreeIndex (catalog.Index
+	// .Method stays "btree") and only DeclaredHash remembers the declared method
+	// (design 0118-0099). pg_get_indexdef_worker (ruleutils.c) prints `USING %s`
+	// from pg_am.amname, so real pg_dump 18.3 emits `USING hash (qty)` (verified
+	// byte-identical against a throwaway PG 18.3 cluster). Before this slice
+	// BuildIndexDef rendered the stored "btree", emitting the divergent
+	// `USING btree (qty)`. The fix surfaces idx.DeclaredHash in BuildIndexDef.
+	if err := runSQLSimple(t, c, "CREATE INDEX foo_qty_hash_idx ON public.foo USING hash (qty)"); err != nil {
+		t.Fatalf("create hash index: %v", err)
+	}
 	// DESC NULLS LAST exercises the DESC branch with a non-default NULLS override.
 	if err := runSQLSimple(t, c, "CREATE INDEX foo_name_desc_idx ON public.foo (name DESC NULLS LAST)"); err != nil {
 		t.Fatalf("create DESC index: %v", err)
@@ -8410,6 +8422,13 @@ func TestPort_PgDumpConnectionSetup(t *testing.T) {
 			// above carries. Byte-identical to real pg_dump 18.3.
 			"CREATE INDEX foo_lower_idx ON public.foo USING btree (lower(name));",
 			"CREATE INDEX foo_lpad_idx ON public.foo USING btree (lpad(name, 5));",
+			// Slice 361: a `USING hash` index must dump `USING hash`, not the
+			// B-tree substrate's `USING btree`. goopg builds a hash index on the
+			// B-tree substrate (catalog.Index.Method stays "btree"; only
+			// DeclaredHash records the declared method), and BuildIndexDef now
+			// surfaces DeclaredHash so pg_get_indexdef_worker's `USING %s`
+			// (pg_am.amname) round-trips byte-identically to real pg_dump 18.3.
+			"CREATE INDEX foo_qty_hash_idx ON public.foo USING hash (qty);",
 			// DESC with a non-default NULLS LAST override
 			"CREATE INDEX foo_name_desc_idx ON public.foo USING btree (name DESC NULLS LAST);",
 			// DESC (default NULLS FIRST suppressed) + ASC NULLS FIRST override

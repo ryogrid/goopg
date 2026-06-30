@@ -3004,6 +3004,18 @@ documentation-only and is exempt from the design-doc requirement.)
       `TestPort_PgDumpConnectionSetup` PASS; parser/catalog/executor suites PASS. **Still open
       under M0119-0004:** action-command / `DO ALSO <stmt>` rules (full query reverse-compiler);
       reserved-keyword-named-role quoting; extended-protocol commit-time deferral.
+      **2026-06-30 (loop #92, design 0110-0001 slice 361): `USING hash` index dump.**
+      A `CREATE INDEX … USING hash (col)` now dumps `USING hash`, not the B-tree
+      substrate's `USING btree`. goopg has no native hash AM — a hash index routes
+      through `createBTreeIndex` (catalog `Index.Method` stays `"btree"`; only
+      `DeclaredHash` records the declared method, design 0118-0099). Fix =
+      `catalog.BuildIndexDef` renders `hash` when `idx.DeclaredHash` is set, mirroring
+      `pg_get_indexdef_worker`'s `USING %s` from `pg_am.amname`. Byte-verified vs a
+      throwaway PG 18.3 cluster. Tests `TestBuildIndexDefDeclaredHash` (catalog) +
+      slice-361 `TestPort_PgDumpConnectionSetup`. **Deferred (ledger):** restart
+      persistence — `DeclaredHash` is in-memory only, so a re-loaded hash index after
+      a server restart would dump `USING btree` (same shared-catalog runtime-write gap
+      as the other restart-durability slices).
 - [x] **M0119-0004-ACLHEAP — ACL re-sync from the GRANT path for heap-backed catalogs**
       **COMPLETE 2026-06-30 (loop #89):** both heap-backed user-facing ACL columns round-trip
       through real pg_dump 18.3 — `typacl` (TYPE/DOMAIN GRANT, loop #87) and now `attacl`
